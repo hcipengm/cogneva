@@ -49,6 +49,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cog_core::build_cache_readings::BuildCacheReadings;
 use cog_core::claim_footprint::{self, quantity_bytes, ClaimFootprint};
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::{ResourceEvent, ResourceEventKind, ResourceEventOutcome, SFResult, ShutdownSignal};
@@ -214,6 +215,84 @@ pub fn growth_target(peak_bytes: u64, declared_bytes: u64) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// The most a build cache may occupy of a claim it shares with the rest of a
+/// pod, or of the part of it that no co-tenant holds.
+///
+/// The same [`HEADROOM_PERCENT`] as [`growth_target`], read from the other side.
+/// That function keeps the claim one headroom above its peak, so a claim whose
+/// declaration is right is one the volume can still grow by a fifth into. A
+/// cache allowed to fill the declaration outright breaks that for itself: it
+/// reaches the number the claim may not exceed, the loop asks for a bigger one
+/// on the next pass, and where the claim already sits on an admission bound the
+/// ask is refused -- leaving a volume that reads as full with a request nobody
+/// can grant and a cap that was never what made it full. The declaration is the
+/// wall, so the share taken of it is the declaration divided by the headroom
+/// the declaration is required to keep.
+///
+/// A co-tenant's bytes come out first because they are not the cache's to
+/// spend: the claim has to hold the rest of the pod whether or not the cache
+/// wants the room.
+pub fn cache_share_of(declared_bytes: u64, co_tenant_bytes: u64) -> u64 {
+    declared_bytes.saturating_sub(co_tenant_bytes) * 100 / HEADROOM_PERCENT
+}
+
+/// The claim the build cache sits on: the innermost mounted claim whose path
+/// contains the cache's directory.
+///
+/// Innermost rather than the first match, because the mounts nest -- one claim
+/// holds `.../sandbox` and another holds `.../sandbox/src` -- so every ancestor
+/// of the cache's directory is a prefix of it and each one would answer for
+/// room the cache cannot use. The claim a directory is billed to is the
+/// smallest that contains it; the outer claim's declaration belongs to the
+/// sources and the workspaces that share it.
+pub fn cache_claim(cache: &BuildCacheReadings, targets: &[ClaimTarget]) -> Option<String> {
+    targets
+        .iter()
+        .filter(|t| cache.dir().starts_with(&t.dir))
+        .max_by_key(|t| t.dir.as_os_str().len())
+        .map(|t| t.claim.clone())
+}
+
+/// Tell the build cache how much of this claim it may fill, when the cache sits
+/// on this claim.
+///
+/// Both halves are readings this loop already has: the claim's declaration comes
+/// from the same API read that decides a raise, and what the claim holds beyond
+/// the cache is its walk's peak less the cache's own last walk. Nothing here is
+/// computed once and kept -- a claim raised on a later pass raises the cap on
+/// that pass, and a co-tenant that grows takes its bytes back on the next one.
+///
+/// Withheld until both readings exist. A gap between them would read as a share
+/// of a claim nobody measured, and a ceiling set from half a fact is one no
+/// reader can trace back to a number.
+fn offer_cache_ceiling(
+    cache: Option<&BuildCacheReadings>,
+    on_claim: Option<&str>,
+    target: &ClaimTarget,
+    state: &ClaimState,
+) {
+    let Some(cache) = cache else {
+        return;
+    };
+    if on_claim != Some(target.claim.as_str()) {
+        return;
+    }
+    let Some(declared) = state.declared else {
+        return;
+    };
+    let Some(cache_bytes) = cache
+        .measured()
+        .map(|layers| layers.values().copied().sum::<u64>())
+    else {
+        return;
+    };
+    let peak = state.peak.iter().copied().max().unwrap_or(0);
+    cache.set_cap_ceiling(Some(cache_share_of(
+        declared,
+        peak.saturating_sub(cache_bytes),
+    )));
 }
 
 /// The request in force for one claim, as the cluster holds it.
@@ -966,6 +1045,12 @@ async fn read_ceiling(ns: &str, own_request: u64) -> Option<Ceiling> {
 /// claims it cannot walk would be deciding from a criterion it does not hold.
 pub fn spawn_volume_capacity_loop(
     readings: std::sync::Arc<VolumeCapacityReadings>,
+    // The build cache on one of these claims, if this process has one. This
+    // loop is the only place that knows what a claim's declaration leaves, and
+    // the cache's own derivation can see nothing but the node's free space --
+    // on a directory-backed volume that is the whole host disk, several claims
+    // larger than the one the cache actually lives on.
+    cache: Option<std::sync::Arc<BuildCacheReadings>>,
     shutdown: ShutdownSignal,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let targets = targets_from_env();
@@ -985,6 +1070,7 @@ pub fn spawn_volume_capacity_loop(
     // measurement it took, so a task that died would leave a reading that says
     // the declaration is still fine rather than one that says nothing is being
     // measured. The liveness has to come from outside the loop for that reason.
+    let cache_claim = cache.as_deref().and_then(|c| cache_claim(c, &targets));
     Some(cog_core::loop_health::spawn(
         LOOP,
         cog_core::loop_health::Cadence::Periodic(Duration::from_secs(interval)),
@@ -993,6 +1079,8 @@ pub fn spawn_volume_capacity_loop(
             let shutdown = shutdown.clone();
             let readings = readings.clone();
             let targets = targets.clone();
+            let cache = cache.clone();
+            let cache_claim = cache_claim.clone();
             async move {
                 let mut states: HashMap<String, ClaimState> = HashMap::new();
                 let mut ticker = tokio::time::interval(Duration::from_secs(interval));
@@ -1019,6 +1107,12 @@ pub fn spawn_volume_capacity_loop(
                             );
                         }
                         readings.observe_ceiling(&target.claim, state.ceiling);
+                        offer_cache_ceiling(
+                            cache.as_deref(),
+                            cache_claim.as_deref(),
+                            target,
+                            state,
+                        );
                         readings.record(&target.claim, outcome);
                     }
                 }
@@ -1336,5 +1430,126 @@ mod tests {
         // The oldest sample has rolled out of the window, so the spike no
         // longer sizes a request.
         assert_eq!(*state.peak.iter().max().unwrap(), 1);
+    }
+
+    /// A cache's share is the declaration read from the other side of the
+    /// headroom the declaration is kept at, so the two rules cannot ask for
+    /// different things: whatever this returns, sizing a declaration that
+    /// covers it leaves the declaration where `growth_target` wants it.
+    #[test]
+    fn a_cache_may_not_fill_the_claim_its_declaration_is_sized_for() {
+        let declared = 192 * GIB;
+        let share = cache_share_of(declared, 0);
+        assert_eq!(share, declared * 100 / HEADROOM_PERCENT);
+        assert!(share < declared);
+        // The claim still has the room the declaration rule expects it to keep.
+        assert_eq!(growth_target(share, declared), None);
+        // Co-tenants come out before the share is taken: a claim shared with a
+        // pod's other mounts leaves the cache only what is left of it.
+        assert_eq!(
+            cache_share_of(declared, 32 * GIB),
+            160 * GIB * 100 / HEADROOM_PERCENT
+        );
+        assert!(cache_share_of(declared, 32 * GIB) < share);
+        // A claim nothing has been granted yet leaves nothing to spend.
+        assert_eq!(cache_share_of(0, 0), 0);
+        assert_eq!(cache_share_of(10 * GIB, 20 * GIB), 0);
+    }
+
+    /// The cache's cap follows the claim the cache actually sits on: a walk of
+    /// a neighbouring volume must not answer for room this cache cannot use,
+    /// and a claim nobody has declared yet leaves the cache unbounded rather
+    /// than bounded by a guess.
+    #[tokio::test]
+    async fn the_cache_is_capped_by_the_claim_it_sits_on_and_not_by_its_own_peak() {
+        let root = std::env::temp_dir().join(format!(
+            "cog-cache-ceiling-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let claim_dir = root.join("claim");
+        let target_dir = claim_dir.join("target");
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(target_dir.join("debug")).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(target_dir.join("debug").join("one"), vec![0u8; 4096]).unwrap();
+        std::fs::write(target_dir.join("debug").join("two"), vec![0u8; 4096]).unwrap();
+
+        let cache = BuildCacheReadings::new(&target_dir).with_auto_cap(300);
+        // The mounts nest the way this deployment's do: one claim holds the
+        // sandbox and another holds the source tree inside it.
+        let outer = ClaimTarget {
+            claim: "cogneva-evolution-pvc".to_string(),
+            dir: root.clone(),
+            exclude: Vec::new(),
+        };
+        let target = ClaimTarget {
+            claim: "cogneva-evolution-source-pvc".to_string(),
+            dir: claim_dir.clone(),
+            exclude: Vec::new(),
+        };
+        let elsewhere = ClaimTarget {
+            claim: "cogneva-registry-pvc".to_string(),
+            dir: elsewhere.clone(),
+            exclude: Vec::new(),
+        };
+        let targets = vec![outer.clone(), target.clone(), elsewhere.clone()];
+
+        // The innermost claim that contains the cache is the one it is billed
+        // to; every ancestor is also a prefix and answers for room this cache
+        // cannot use.
+        assert_eq!(
+            cache_claim(&cache, &targets).as_deref(),
+            Some("cogneva-evolution-source-pvc")
+        );
+
+        let mut state = ClaimState::new();
+        // A declaration smaller than the peak's headroom, so the claim is what
+        // binds -- the shape a claim on an admission bound is in.
+        state.declared = Some(4096);
+        state.observe(8192);
+
+        // No ceiling yet: the cap is the cache's own peak plus its headroom,
+        // which on this deployment is 228 GiB against a 192 GiB declaration.
+        cache.measure_and_enforce(None).await;
+        let by_peak = 8192 * HEADROOM_PERCENT / 100;
+        assert_eq!(cache.cap_bytes(), Some(by_peak));
+
+        // A ceiling offered for a claim the cache is not on changes nothing.
+        offer_cache_ceiling(
+            Some(&cache),
+            Some(elsewhere.claim.as_str()),
+            &target,
+            &state,
+        );
+        cache.measure_and_enforce(None).await;
+        assert_eq!(cache.cap_bytes(), Some(by_peak));
+
+        // On its own claim the declaration's share binds instead.
+        offer_cache_ceiling(Some(&cache), Some(target.claim.as_str()), &target, &state);
+        cache.measure_and_enforce(None).await;
+        let share = cache_share_of(4096, 0);
+        assert!(share < by_peak);
+        assert_eq!(cache.cap_bytes(), Some(share));
+
+        // A declaration raised on a later pass raises the cap on that pass,
+        // back up to what the peak alone allows.
+        state.declared = Some(192 * GIB);
+        offer_cache_ceiling(Some(&cache), Some(target.claim.as_str()), &target, &state);
+        cache.measure_and_enforce(None).await;
+        assert_eq!(cache.cap_bytes(), Some(by_peak));
+
+        // Nothing measured on the claim yet: no ceiling is asserted at all,
+        // rather than one computed from half a fact.
+        let unmeasured = BuildCacheReadings::new(&target_dir).with_auto_cap(300);
+        offer_cache_ceiling(
+            Some(&unmeasured),
+            Some(target.claim.as_str()),
+            &target,
+            &state,
+        );
+        assert_eq!(unmeasured.cap_bytes(), None);
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
