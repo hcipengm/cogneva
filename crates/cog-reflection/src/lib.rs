@@ -50,6 +50,7 @@ pub mod buildah_store;
 pub mod change_execution;
 pub mod change_pipeline;
 pub mod change_rework;
+pub(crate) mod cmd_timeout;
 pub mod config;
 pub mod crew;
 pub mod criteria_face;

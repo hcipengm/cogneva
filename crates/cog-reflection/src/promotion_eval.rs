@@ -475,7 +475,7 @@ pub(crate) async fn submit_and_wait(
             }
         }
         if Instant::now() >= deadline {
-            return Ok(Err(format!("timed out after {timeout_secs}s")));
+            return Ok(Err(crate::cmd_timeout::timed_out_after(timeout_secs)));
         }
         tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
     }

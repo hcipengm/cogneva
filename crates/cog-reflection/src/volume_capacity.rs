@@ -728,7 +728,7 @@ async fn kubectl(args: &[&str], timeout_secs: u64) -> Result<String, String> {
         tokio::process::Command::new("kubectl").args(args).output(),
     )
     .await
-    .map_err(|_| format!("kubectl {args:?} timed out after {timeout_secs}s"))?
+    .map_err(|_| crate::cmd_timeout::timed_out(&format!("kubectl {args:?}"), timeout_secs))?
     .map_err(|e| format!("kubectl {args:?} could not run: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);

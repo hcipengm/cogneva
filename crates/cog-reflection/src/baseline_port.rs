@@ -368,9 +368,9 @@ impl BaselinePorter {
         let output = tokio::time::timeout(GIT_COMMAND_TIMEOUT, fut)
             .await
             .map_err(|_| {
-                SFError::IO(format!(
-                    "{cmdline} timed out after {}s",
-                    GIT_COMMAND_TIMEOUT.as_secs()
+                SFError::IO(crate::cmd_timeout::timed_out(
+                    &cmdline,
+                    GIT_COMMAND_TIMEOUT.as_secs(),
                 ))
             })?
             .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?;
@@ -1268,7 +1268,7 @@ impl BaselinePorter {
         let fut = cmd.output();
         let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
             .await
-            .map_err(|_| SFError::IO(format!("{cmdline} timed out after {timeout_secs}s")))?
+            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
             .map_err(|e| SFError::IO(format!("failed to run cargo: {e}")))?;
         let combined = format!(
             "{}{}",

@@ -2285,7 +2285,8 @@ impl RolloutExecutor {
             // 是 apiserver 卡住、Pod 的网络栈坏了，还是配置根本没读进来。
             Err(_) => {
                 return Err(SFError::IO(format!(
-                    "{cmdline} timed out after {timeout_secs}s (kubectl was killed{}): {}",
+                    "{} (kubectl was killed{}): {}",
+                    crate::cmd_timeout::timed_out(&cmdline, timeout_secs),
                     if stderr.trim().is_empty() {
                         " before it wrote anything"
                     } else {

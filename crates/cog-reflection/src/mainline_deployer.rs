@@ -974,7 +974,7 @@ const CLUSTER_UNREACHABLE_PATTERNS: &[&str] = &[
     "no route to host",
     "i/o timeout",
     "Client.Timeout",
-    "timed out after",
+    crate::cmd_timeout::TIMED_OUT_AFTER,
 ];
 
 /// 错误文本是否是集群访问故障（而非版本缺陷）。纯函数：判据只认文本，
@@ -2713,7 +2713,7 @@ impl MainlineDeployer {
         let fut = cmd.output();
         let output = tokio::time::timeout(Duration::from_secs(timeout_secs), fut)
             .await
-            .map_err(|_| SFError::IO(format!("{cmdline} timed out after {timeout_secs}s")))?
+            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
             .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -6564,9 +6564,9 @@ impl MainlineDeployer {
         let output = tokio::time::timeout(Duration::from_secs(self.cfg.build_timeout_secs), fut)
             .await
             .map_err(|_| {
-                SFError::IO(format!(
-                    "{cmdline} timed out after {}s",
-                    self.cfg.build_timeout_secs
+                SFError::IO(crate::cmd_timeout::timed_out(
+                    &cmdline,
+                    self.cfg.build_timeout_secs,
                 ))
             })?
             .map_err(|e| SFError::IO(format!("failed to run cargo: {e}")))?;
@@ -7308,7 +7308,9 @@ impl MainlineDeployer {
         let output =
             tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
                 .await
-                .map_err(|_| SFError::IO(format!("kubectl apply timed out after {timeout_secs}s")))?
+                .map_err(|_| {
+                    SFError::IO(crate::cmd_timeout::timed_out("kubectl apply", timeout_secs))
+                })?
                 .map_err(|e| SFError::IO(format!("kubectl apply: {e}")))?;
         Ok((
             output.status.success(),
@@ -7349,7 +7351,9 @@ impl MainlineDeployer {
         let output =
             tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait_with_output())
                 .await
-                .map_err(|_| SFError::IO(format!("kubectl diff timed out after {timeout_secs}s")))?
+                .map_err(|_| {
+                    SFError::IO(crate::cmd_timeout::timed_out("kubectl diff", timeout_secs))
+                })?
                 .map_err(|e| SFError::IO(format!("kubectl diff: {e}")))?;
         Ok((
             output.status.code().unwrap_or(-1),

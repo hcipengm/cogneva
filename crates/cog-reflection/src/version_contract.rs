@@ -45,9 +45,9 @@ async fn git_out(git_dir: &str, args: &[&str], timeout_secs: u64) -> SFResult<St
     let output = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output())
         .await
         .map_err(|_| {
-            SFError::IO(format!(
-                "git {} timed out after {timeout_secs}s",
-                args.join(" ")
+            SFError::IO(crate::cmd_timeout::timed_out(
+                &format!("git {}", args.join(" ")),
+                timeout_secs,
             ))
         })?
         .map_err(|e| SFError::IO(format!("failed to run git: {e}")))?;

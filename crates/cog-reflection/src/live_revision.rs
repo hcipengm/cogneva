@@ -176,7 +176,7 @@ impl CommandRunner for Subprocess {
             .output();
         let out = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), fut)
             .await
-            .map_err(|_| SFError::IO(format!("{cmdline} timed out after {timeout_secs}s")))?
+            .map_err(|_| SFError::IO(crate::cmd_timeout::timed_out(&cmdline, timeout_secs)))?
             .map_err(|e| SFError::IO(format!("failed to run {program}: {e}")))?;
         if !out.status.success() {
             return Err(SFError::IO(format!(
