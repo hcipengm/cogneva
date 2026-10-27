@@ -284,6 +284,100 @@ fn the_cluster_verdicts_the_panel_knows_are_the_ones_the_gateway_declares() {
     assert_eq!(panel, declared, "面板与网关必须认识同一组集群判词");
 }
 
+/// 读数板的四个判词：端点按它说「要不要现在动手」，面板按它选颜色、配中文名。
+///
+/// 两处各写一份时，服务端多一个词，那一行落进 `?? 'var(--paper-dim)'` 与
+/// `?? verdict` 的兜底——灰点、英文原词，读起来像「一般般」；少一个词，面板为
+/// 一支永远不会到来的判词留着颜色与中文名。面板这一侧即便联合类型对了，把两张
+/// 表写成 `Record<string, string>` 也会让「缺一行」从编译错误退化成兜底色，所以
+/// 键类型本身也在这里钉住。
+#[test]
+fn the_reading_verdicts_the_board_knows_are_the_ones_the_endpoint_declares() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let body_start = source
+        .find("export interface ObservabilityReading {")
+        .expect("the reading type is gone; this gate reads its verdict through it");
+    let body = &source[body_start..];
+    let body_end = body.find("\n}").expect("the interface body is not closed");
+    let mut panel = union_words(&body[..body_end], "  verdict:");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "判词联合类型读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    let mut declared: Vec<String> = cog_gateway::readings::ReadingVerdict::ALL
+        .iter()
+        .map(|verdict| verdict.as_str().to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(panel, declared, "面板与端点必须认识同一组读数判词");
+
+    // 两张表都以判词为键：`Record<string, string>` 会让漏掉的一行退化成兜底
+    // 颜色，而这里要的是一行不落。
+    let board = repo_root().join("web/src/observability/ReadingsBoard.tsx");
+    let board =
+        std::fs::read_to_string(&board).unwrap_or_else(|e| panic!("{}: {e}", board.display()));
+    for table in ["VERDICT_TONE", "VERDICT_WORD"] {
+        assert!(
+            board.contains(&format!("const {table}: Record<VerdictWord, string> = {{")),
+            "{table} 不再以判词为键：缺一行只会画成兜底色，编译期不会红"
+        );
+    }
+    assert!(
+        board.contains("type VerdictWord = ObservabilityReading['verdict'];"),
+        "判词键类型必须来自端点类型本身，不能另写一份"
+    );
+}
+
+/// 一句发出去的话落定的五种结局：存储层按它写列、面板按它配那一行的话与颜色。
+///
+/// 多一个词：会话窗口把英文原词贴在灰字里，读起来像一句没人写过的说明；少一个
+/// 词：面板为一支永远不会写入的结局留着一句死文案。面板那张表写成
+/// `Record<string, …>` 时，缺一行只会落到兜底分支，编译期也不会红。
+#[test]
+fn the_send_outcomes_the_panel_knows_are_the_ones_the_store_writes() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let body_start = source
+        .find("export interface AgentConversationLine {")
+        .expect("the conversation line type is gone; this gate reads its outcome through it");
+    let body = &source[body_start..];
+    let body_end = body.find("\n}").expect("the interface body is not closed");
+    let mut panel = union_words(&body[..body_end], "  outcome:");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "结局联合类型读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    let mut declared: Vec<String> = cog_storage::SendOutcome::ALL
+        .iter()
+        .map(|outcome| outcome.as_str().to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(panel, declared, "面板与存储层必须认识同一组结局词");
+
+    let overlay = repo_root().join("web/src/overlay/AgentsOverlay.tsx");
+    let overlay =
+        std::fs::read_to_string(&overlay).unwrap_or_else(|e| panic!("{}: {e}", overlay.display()));
+    assert!(
+        overlay.contains(
+            "const OUTCOME_LABEL: Record<SendOutcomeWord, { text: string; className: string }> = {"
+        ),
+        "结局文案表不再以结局为键：缺一行只会贴出英文原词，编译期不会红"
+    );
+    assert!(
+        overlay.contains("type SendOutcomeWord = AgentConversationLine['outcome'];"),
+        "结局键类型必须来自端点类型本身，不能另写一份"
+    );
+}
+
 /// 对照：本门的判据认得出一个不是词的东西。少了这条，`TaskFilter::parse` 哪天
 /// 退化成「什么词都收」，上面那条仍然全绿。
 #[test]

@@ -19,7 +19,13 @@ function stamp(iso: string): string {
   });
 }
 
-const OUTCOME_LABEL: Record<string, { text: string; className: string }> = {
+/**
+ * 每种结局一句话。键取自端点类型本身：`Record<string, …>` 会让一种没配话的
+ * 结局退化成把英文原词贴在灰字里，读起来像一句没人写过的说明。
+ */
+type SendOutcomeWord = AgentConversationLine['outcome'];
+
+const OUTCOME_LABEL: Record<SendOutcomeWord, { text: string; className: string }> = {
   queued: { text: '已送达，等它自己回', className: 'text-slate-400' },
   replied: { text: '已回', className: 'text-emerald-400' },
   timed_out: { text: '没在等待窗口内回答', className: 'text-amber-400' },
@@ -28,10 +34,7 @@ const OUTCOME_LABEL: Record<string, { text: string; className: string }> = {
 };
 
 function Line({ line }: { line: AgentConversationLine }) {
-  const outcome = OUTCOME_LABEL[line.outcome] ?? {
-    text: line.outcome,
-    className: 'text-slate-400',
-  };
+  const outcome = OUTCOME_LABEL[line.outcome];
   return (
     <div className="border-t border-slate-800/60 py-2">
       <div className="flex items-baseline gap-2 text-xs">

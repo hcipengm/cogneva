@@ -42,6 +42,19 @@ pub enum SendOutcome {
 }
 
 impl SendOutcome {
+    /// Every outcome this vocabulary has, in the order a reader should see
+    /// them. The column's check constraint, [`Self::parse`] and the panel's
+    /// label map are all derived from this rather than spelling the words
+    /// again — a variant added to `as_str` alone would be a row this build
+    /// writes and cannot read back.
+    pub const ALL: [SendOutcome; 5] = [
+        SendOutcome::Queued,
+        SendOutcome::Replied,
+        SendOutcome::TimedOut,
+        SendOutcome::Refused,
+        SendOutcome::Failed,
+    ];
+
     /// The spelling the column's check constraint holds.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -56,14 +69,9 @@ impl SendOutcome {
     /// Read one back. A value outside the set is not an outcome this build can
     /// name; the reader reports it rather than folding it into one of these.
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "queued" => Some(SendOutcome::Queued),
-            "replied" => Some(SendOutcome::Replied),
-            "timed_out" => Some(SendOutcome::TimedOut),
-            "refused" => Some(SendOutcome::Refused),
-            "failed" => Some(SendOutcome::Failed),
-            _ => None,
-        }
+        Self::ALL
+            .into_iter()
+            .find(|outcome| outcome.as_str() == value)
     }
 }
 
@@ -348,17 +356,23 @@ mod tests {
     /// The stored spelling is what the column's check constraint admits, and
     /// the reader must accept exactly what the writer writes -- a name that
     /// parsed nowhere would make every row of that outcome unreadable.
+    /// Walking the declaration rather than a list written here: a variant that
+    /// stays out of `ALL` is one `parse` cannot read back, and a list repeated
+    /// in this test would not notice.
     #[test]
     fn every_outcome_round_trips_through_its_stored_spelling() {
-        for outcome in [
-            SendOutcome::Queued,
-            SendOutcome::Replied,
-            SendOutcome::TimedOut,
-            SendOutcome::Refused,
-            SendOutcome::Failed,
-        ] {
+        let mut words = std::collections::BTreeSet::new();
+        for outcome in SendOutcome::ALL {
+            assert!(
+                words.insert(outcome.as_str()),
+                "two outcomes share the spelling {:?}; the column would hold a word that parses back as the other",
+                outcome.as_str()
+            );
             assert_eq!(SendOutcome::parse(outcome.as_str()), Some(outcome));
         }
+        assert_eq!(words.len(), SendOutcome::ALL.len());
         assert_eq!(SendOutcome::parse("answered"), None);
+        // 大小写不同就不是这一列的拼写：check 约束只认这一个词。
+        assert_eq!(SendOutcome::parse("Queued"), None);
     }
 }

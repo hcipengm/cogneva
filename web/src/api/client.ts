@@ -816,7 +816,8 @@ export interface AgentConversationLine {
   to_unit: string;
   kind: string;
   body: string;
-  outcome: 'queued' | 'replied' | 'timed_out' | 'refused' | 'failed' | string;
+  /** 结局。闭集：存储层只写这几个词，面板按它选那一行的话与颜色。 */
+  outcome: 'queued' | 'replied' | 'timed_out' | 'refused' | 'failed';
   reply: string | null;
   outcome_detail: string | null;
   created_at: string;
@@ -1412,7 +1413,11 @@ export interface ObservabilityReading {
   produced_by: string;
   dashboard_uid: string | null;
   value: number | null;
-  verdict: 'ok' | 'warning' | 'critical' | 'unknown' | string;
+  /**
+   * 判词。闭集：`| string` 会把联合类型变成一句装饰——加了它，任何词都合法，
+   * 拼错的比较不会被类型检查拦下，落进色表与中文名的兜底分支，画成中性色。
+   */
+  verdict: 'ok' | 'warning' | 'critical' | 'unknown';
   unavailable_because?: string;
 }
 

@@ -137,6 +137,62 @@ pub const READINGS: [&ReadingSpec; 6] = [
     &UNREACHABLE,
 ];
 
+/// The word a reading carries about its own value.
+///
+/// The board colours a row by this word and prints a Chinese name beside it
+/// through a map keyed by the same word. Both of those fall back when the word
+/// is not one they know — the neutral colour, the word itself — so a verdict
+/// spelled somewhere else, or added here without telling the board, would show
+/// up as a value nobody acts on rather than as a disagreement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadingVerdict {
+    /// Within the warning threshold, or below every threshold this reading has.
+    Ok,
+    /// Past `warn`, not yet past `crit`.
+    Warning,
+    /// Past `crit`.
+    Critical,
+    /// No value: no series, no answer, no threshold to judge by. Kept apart
+    /// from `Ok` on purpose — one is a quiet system, the other is a blind spot.
+    Unknown,
+}
+
+impl ReadingVerdict {
+    /// Every word this vocabulary has, for readers that must cover all of them
+    /// rather than listing the variants a second time.
+    pub const ALL: [ReadingVerdict; 4] = [
+        ReadingVerdict::Ok,
+        ReadingVerdict::Warning,
+        ReadingVerdict::Critical,
+        ReadingVerdict::Unknown,
+    ];
+
+    /// The word this verdict travels as, and the key the board's maps use.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReadingVerdict::Ok => "ok",
+            ReadingVerdict::Warning => "warning",
+            ReadingVerdict::Critical => "critical",
+            ReadingVerdict::Unknown => "unknown",
+        }
+    }
+
+    /// Read a word back. The wire is the only place these words are not typed.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|verdict| verdict.as_str().eq_ignore_ascii_case(word))
+    }
+}
+
+/// Serialised through [`ReadingVerdict::as_str`] rather than a per-variant
+/// `#[serde(rename)]`, which would be a second place the word is written.
+impl serde::Serialize for ReadingVerdict {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Reading {
     #[serde(flatten)]
@@ -145,15 +201,15 @@ pub struct Reading {
     /// and a series reading zero lead to different actions — one is a broken
     /// exporter, the other is a quiet system.
     pub value: Option<f64>,
-    pub verdict: &'static str,
+    pub verdict: ReadingVerdict,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_because: Option<String>,
 }
 
 /// Judge one value against its spec.
-pub fn verdict_of(spec: &ReadingSpec, value: Option<f64>) -> &'static str {
+pub fn verdict_of(spec: &ReadingSpec, value: Option<f64>) -> ReadingVerdict {
     let Some(value) = value else {
-        return "unknown";
+        return ReadingVerdict::Unknown;
     };
     let at_or_past = |threshold: Option<f64>| match threshold {
         Some(threshold) if spec.higher_is_worse => value >= threshold,
@@ -162,11 +218,11 @@ pub fn verdict_of(spec: &ReadingSpec, value: Option<f64>) -> &'static str {
         None => false,
     };
     if at_or_past(spec.crit) {
-        "critical"
+        ReadingVerdict::Critical
     } else if at_or_past(spec.warn) {
-        "warning"
+        ReadingVerdict::Warning
     } else {
-        "ok"
+        ReadingVerdict::Ok
     }
 }
 
@@ -389,28 +445,61 @@ mod tests {
 
     #[test]
     fn a_reading_with_no_value_is_unknown_rather_than_ok() {
-        assert_eq!(verdict_of(&DISK_FREE, None), "unknown");
+        assert_eq!(verdict_of(&DISK_FREE, None), ReadingVerdict::Unknown);
         // 0 是一个真实的读数：剩余 0% 是 critical，不是 unknown。
-        assert_eq!(verdict_of(&DISK_FREE, Some(0.0)), "critical");
+        assert_eq!(verdict_of(&DISK_FREE, Some(0.0)), ReadingVerdict::Critical);
     }
 
     #[test]
     fn thresholds_point_the_way_the_reading_gets_worse() {
         // 剩余量越低越坏。
-        assert_eq!(verdict_of(&DISK_FREE, Some(0.5)), "ok");
-        assert_eq!(verdict_of(&DISK_FREE, Some(0.10)), "warning");
-        assert_eq!(verdict_of(&DISK_FREE, Some(0.05)), "critical");
+        assert_eq!(verdict_of(&DISK_FREE, Some(0.5)), ReadingVerdict::Ok);
+        assert_eq!(verdict_of(&DISK_FREE, Some(0.10)), ReadingVerdict::Warning);
+        assert_eq!(verdict_of(&DISK_FREE, Some(0.05)), ReadingVerdict::Critical);
         // 连接数越高越坏——同一组阈值、相反的方向。
-        assert_eq!(verdict_of(&PG_CONNECTIONS, Some(10.0)), "ok");
-        assert_eq!(verdict_of(&PG_CONNECTIONS, Some(90.0)), "warning");
-        assert_eq!(verdict_of(&PG_CONNECTIONS, Some(120.0)), "critical");
+        assert_eq!(verdict_of(&PG_CONNECTIONS, Some(10.0)), ReadingVerdict::Ok);
+        assert_eq!(
+            verdict_of(&PG_CONNECTIONS, Some(90.0)),
+            ReadingVerdict::Warning
+        );
+        assert_eq!(
+            verdict_of(&PG_CONNECTIONS, Some(120.0)),
+            ReadingVerdict::Critical
+        );
     }
 
     #[test]
     fn a_reading_without_a_threshold_reports_a_value_but_never_fires() {
         // 向量总数只有趋势意义：给它编一个上限，它就会在没人约定的时刻响。
-        assert_eq!(verdict_of(&QDRANT_VECTORS, Some(9.9e12)), "ok");
-        assert_eq!(verdict_of(&QDRANT_VECTORS, None), "unknown");
+        assert_eq!(
+            verdict_of(&QDRANT_VECTORS, Some(9.9e12)),
+            ReadingVerdict::Ok
+        );
+        assert_eq!(verdict_of(&QDRANT_VECTORS, None), ReadingVerdict::Unknown);
+    }
+
+    /// Every declared verdict travels as its own word, and no two share one.
+    ///
+    /// The board looks each word up in a colour map and a Chinese-name map; a
+    /// duplicate spelling would make one of the four unreachable on screen
+    /// while this side still counts it as covered.
+    #[test]
+    fn every_declared_verdict_reads_back_as_itself() {
+        let mut words = std::collections::BTreeSet::new();
+        for verdict in ReadingVerdict::ALL {
+            assert!(
+                words.insert(verdict.as_str()),
+                "two variants share the word {:?}; the board's maps would only ever reach one",
+                verdict.as_str()
+            );
+            assert_eq!(ReadingVerdict::parse(verdict.as_str()), Some(verdict));
+            assert_eq!(
+                serde_json::to_string(&verdict).unwrap(),
+                format!("\"{}\"", verdict.as_str())
+            );
+        }
+        assert_eq!(ReadingVerdict::parse("OK"), Some(ReadingVerdict::Ok));
+        assert_eq!(ReadingVerdict::parse("fine"), None);
     }
 
     #[test]
@@ -420,7 +509,7 @@ mod tests {
         let wire = serde_json::to_value(Reading {
             spec: QDRANT_VECTORS.clone(),
             value: None,
-            verdict: "unknown",
+            verdict: ReadingVerdict::Unknown,
             unavailable_because: None,
         })
         .unwrap();

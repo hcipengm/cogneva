@@ -16,27 +16,30 @@ import { Loading, ReadError, Table } from '@/ui/primitives';
  *    都带它那块面板的 uid，同时把「为什么这条点不过去」写出来。
  */
 
-const VERDICT_TONE: Record<string, string> = {
+/** 判词的键与 `ObservabilityReading['verdict']` 是同一组词：两张表都按它取行。 */
+type VerdictWord = ObservabilityReading['verdict'];
+
+const VERDICT_TONE: Record<VerdictWord, string> = {
   ok: 'var(--ok)',
   warning: 'var(--warn)',
   critical: 'var(--danger)',
   unknown: 'var(--muted)',
 };
 
-const VERDICT_WORD: Record<string, string> = {
+const VERDICT_WORD: Record<VerdictWord, string> = {
   ok: '正常',
   warning: '告警',
   critical: '严重',
   unknown: '无读数',
 };
 
-function Verdict({ verdict }: { verdict: string }) {
-  const color = VERDICT_TONE[verdict] ?? 'var(--paper-dim)';
+function Verdict({ verdict }: { verdict: VerdictWord }) {
+  const color = VERDICT_TONE[verdict];
   return (
     <span className="mono text-[11px] whitespace-nowrap" style={{ color }}>
       <span className="dot" style={{ background: color }} />
       {/* 判词之外再给中文：颜色不是唯一的身份。 */}
-      {verdict} · {VERDICT_WORD[verdict] ?? verdict}
+      {verdict} · {VERDICT_WORD[verdict]}
     </span>
   );
 }
