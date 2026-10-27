@@ -99,7 +99,11 @@ pub const DEEP_MIN_LINES: usize = 120;
 /// only a source dive can settle: an input nothing supplies leaves the tier
 /// cells that input alone could move sitting at zero — which is also exactly
 /// what a quiet day looks like.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// No serde form: the value is an index into a bitmask and never travels. Its
+/// only outward word is the metric label [`Self::as_str`] produces, and a
+/// derived spelling would have been a second one nobody compares with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclarationInput {
     /// Paths named in the goal text.
     GoalPaths,
@@ -318,7 +322,13 @@ pub fn change_tier(scale: DeclaredScale) -> Option<ChangeTier> {
 }
 
 /// Mode the PGE selector dispatches to for a given [`TaskProfile`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+///
+/// One name per mode, in [`Self::as_str`]. The serde impls below go through it
+/// rather than through the variant names, which spelled something else again
+/// (`Pipeline` beside `pipeline`, `PlanOnly` beside `plan_only`): a record
+/// written by one and counted by the other is a mode nobody selected, and a
+/// topology whose cell is always zero reads the same as one that never ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PgeMode {
     /// Linear Planner → Generator → Evaluator with no feedback loop.
     Pipeline,
@@ -373,14 +383,15 @@ impl PgeMode {
     /// 发生过的试验，而污染的表现是模型对真实模式越来越有把握。
     pub fn as_learnt_mode(&self) -> Option<&'static str> {
         match self {
-            PgeMode::Pipeline => Some("pipeline"),
-            PgeMode::Roundtable => Some("roundtable"),
-            PgeMode::Direct => Some("direct"),
+            // 分解路径没有做过选择，别记成一次试验。
             PgeMode::PlanOnly => None,
+            _ => Some(self.as_str()),
         }
     }
 
     /// 这个模式的名字，用于记录与日志。所有模式都有名字，`None` 只影响学习面。
+    ///
+    /// 这是这个枚举唯一一套拼写：字段、学习台账与序列化都从它取。
     pub fn as_str(&self) -> &'static str {
         match self {
             PgeMode::Pipeline => "pipeline",
@@ -388,6 +399,31 @@ impl PgeMode {
             PgeMode::Direct => "direct",
             PgeMode::PlanOnly => "plan_only",
         }
+    }
+
+    /// `name` 指的那个模式，或 `None`：不在 [`Self::ALL`] 上的名字不猜成某个模式。
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|mode| mode.as_str() == name)
+    }
+}
+
+impl serde::Serialize for PgeMode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// 认不出的名字是错误，不是某个默认模式：一个没见过的拓扑名，与"选了 Pipeline"
+/// 是两件事，折成后者就让词典不一致这条事实消失在一次成功的解析里。
+impl<'de> serde::Deserialize<'de> for PgeMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        Self::parse(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown pge mode {name:?}; declared modes are {:?}",
+                PgeMode::ALL.map(|mode| mode.as_str())
+            ))
+        })
     }
 }
 
@@ -549,6 +585,74 @@ pub fn derive_task_profile(task: &cog_core::Task) -> TaskProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 一个模式只有一个名字：写出去的、读回来的、记进学习台账的都是 `as_str`。
+    ///
+    /// 下面这个 match 是刻意穷尽的，新增一个模式会让它编译不过，逼着人回到这份
+    /// 断言，而不是只加变体、让 `ALL` 少一格——少的那一格在路由面上永远是零，
+    /// 读起来与"这条路没人走过"一样，而它真正的意思是"这个模式从没被发布过"。
+    #[test]
+    fn every_mode_has_one_name_and_it_survives_the_wire() {
+        let mut names = std::collections::BTreeSet::new();
+        for mode in [
+            PgeMode::Pipeline,
+            PgeMode::Roundtable,
+            PgeMode::PlanOnly,
+            PgeMode::Direct,
+        ] {
+            match mode {
+                PgeMode::Pipeline | PgeMode::Roundtable | PgeMode::PlanOnly | PgeMode::Direct => {}
+            }
+            assert!(
+                PgeMode::ALL.contains(&mode),
+                "{mode:?} 不在 ALL 上，路由面永远不会发布这一格"
+            );
+            assert!(
+                names.insert(mode.as_str()),
+                "两个模式共用一个名字 {:?}，台账上的两格会合并成一格",
+                mode.as_str()
+            );
+            let json = serde_json::to_string(&mode).expect("mode serializes");
+            assert_eq!(json, format!("\"{}\"", mode.as_str()));
+            assert_eq!(serde_json::from_str::<PgeMode>(&json).ok(), Some(mode));
+        }
+        // 变体名不是名字：这一套曾经同时出现在两条面上。
+        assert!(serde_json::from_str::<PgeMode>("\"Pipeline\"").is_err());
+        // 学习面不记分解路径，另外三个记的就是同一个名字。
+        assert_eq!(PgeMode::PlanOnly.as_learnt_mode(), None);
+        for mode in PgeMode::ALL {
+            if mode != PgeMode::PlanOnly {
+                assert_eq!(mode.as_learnt_mode(), Some(mode.as_str()));
+            }
+        }
+    }
+
+    /// 每种声明输入在指标面上有自己的标签，且都在 `ALL` 上。
+    #[test]
+    fn every_declaration_input_has_its_own_label_on_the_list() {
+        let mut labels = std::collections::BTreeSet::new();
+        for input in [
+            DeclarationInput::GoalPaths,
+            DeclarationInput::AffectedFiles,
+            DeclarationInput::Diff,
+        ] {
+            match input {
+                DeclarationInput::GoalPaths
+                | DeclarationInput::AffectedFiles
+                | DeclarationInput::Diff => {}
+            }
+            assert!(
+                DeclarationInput::ALL.contains(&input),
+                "{input:?} 不在 ALL 上，指标面永远不会发布这一格"
+            );
+            assert!(
+                labels.insert(input.as_str()),
+                "两种输入共用一个标签 {:?}",
+                input.as_str()
+            );
+        }
+        assert_eq!(labels.len(), DeclarationInput::ALL.len());
+    }
 
     #[test]
     fn default_profile_picks_pipeline() {
