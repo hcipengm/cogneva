@@ -538,14 +538,16 @@ const LANDING_LOG_COMMITS: usize = 2_000;
 /// history as undelivered -- which is the inversion the trailer exists to make
 /// impossible -- so both are accepted. Neither can name a row by accident: the
 /// id is matched against ledger ids, whose hash prefix no other commit knows.
-const CHANGE_ID_TRAILER: &str = "Change-Id: ";
+const CHANGE_ID_TRAILER: &str = "Change-Id";
 
 /// The change id a line names, if the line is a landing trailer.
 fn trailer_named_change(line: &str) -> Option<&str> {
-    let named = line
-        .trim()
-        .strip_prefix(cog_core::LANDING_TRAILER)
-        .or_else(|| line.trim().strip_prefix(CHANGE_ID_TRAILER))?;
+    let line = line.trim();
+    let named = line.strip_prefix(cog_core::LANDING_TRAILER).or_else(|| {
+        line.strip_prefix(CHANGE_ID_TRAILER)?
+            .strip_prefix(':')
+            .map(str::trim_start)
+    })?;
     let id = named.split_whitespace().next()?;
     (!id.is_empty()).then_some(id)
 }
