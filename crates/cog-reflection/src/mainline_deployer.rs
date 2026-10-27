@@ -55,16 +55,25 @@ use crate::version_contract::VersionReadings;
 ///
 /// 路径不在这里拼：它由 `sandbox::buildah_store_dir` 单独声明，因为消费它的
 /// 有两个动作——打镜像的那一步和回收它的那一步——两边各拼一次就会漂开。
+/// cargo 的 release 目录名。编译出来的二进制叫 `cog_core::paths::APP_BINARY_NAME`：
+/// 这两段拼成一个路径字面量时，改名只会让某个调用点去找一个没有被写出来的文件。
+const CARGO_RELEASE_SUBDIR: &str = "release";
+
+/// 前端产物的入口文档。缓存里「已经编好」与挂载目录里「已经拷好」判的是同一个
+/// 文件。
+const WEB_INDEX_FILE: &str = "index.html";
+
+/// 前端产物缓存在 state 目录下的那一级，按 `web/` 的内容摘要分目录。
+const WEB_DIST_CACHE_SUBDIR: &str = "web-dist";
+
 fn buildah_storage() -> String {
-    crate::sandbox::buildah_store_dir()
-        .join("storage")
+    crate::sandbox::buildah_storage_dir()
         .to_string_lossy()
         .into_owned()
 }
 
 fn buildah_runroot() -> String {
-    crate::sandbox::buildah_store_dir()
-        .join("run")
+    crate::sandbox::buildah_runroot_dir()
         .to_string_lossy()
         .into_owned()
 }
@@ -207,6 +216,21 @@ const STRIP_WALL_SECS: u64 = 60;
 /// 十五秒的粒度在十分钟的轮询节拍旁边几乎不花什么——它只换掉一个本来要等满
 /// 一轮才发生的结论。
 const JUDGEMENT_POLL_SECS: u64 = 15;
+
+/// 部署器这一轮愿意为一次判定等多久。
+///
+/// 判定的期限是它自己声明的那几段加起来，而其中两段发生在它碰集群**之前**：问一次上游
+/// CI，以及「还在跑」时等到判词的那段等待。这一轮的等待至少要把这两段盖住——比它短的
+/// 预算保证部署器先走，判词被推迟到下一轮，而下一轮是十分钟之后。界长了不算浪费：判定
+/// 在飞的时候这一轮本来也不会去追更新的 rev。
+fn judgement_wait_budget(soak_secs: u64, rollout_timeout_secs: u64) -> Duration {
+    Duration::from_secs(
+        soak_secs
+            + rollout_timeout_secs
+            + crate::mainline_rollout::CI_ASK_BUDGET_SECS
+            + crate::mainline_rollout::CI_PENDING_WAIT_SECS,
+    )
+}
 
 /// 打镜像每一步各自的墙钟上界。步名说的是这一步在干什么，不是 buildah 的子命令
 /// 名——同一个子命令在两条路径上的墙不同（`images --json` 要列整个库，`images -q`
@@ -2629,14 +2653,13 @@ impl MainlineDeployer {
     }
 
     fn save_state(&self, state: &MainlineState) -> SFResult<()> {
-        std::fs::create_dir_all(&self.cfg.state_dir)
-            .map_err(|e| SFError::IO(format!("create state dir {}: {e}", self.cfg.state_dir)))?;
-        let path = self.state_path();
-        let tmp = path.with_extension("json.tmp");
-        let text = serde_json::to_string_pretty(state)?;
-        std::fs::write(&tmp, text).map_err(|e| SFError::IO(format!("write state tmp: {e}")))?;
-        std::fs::rename(&tmp, &path).map_err(|e| SFError::IO(format!("rename state: {e}")))?;
-        Ok(())
+        // 部署器的状态是「这一版已经落到哪儿」的唯一记录：掉电后回到旧值，下一轮
+        // 会把已经做完的事再做一遍。所以这一处要断电也成立的那一档。
+        cog_core::atomic_write::write_json(
+            &self.state_path(),
+            state,
+            cog_core::atomic_write::Durability::SurvivesPowerLoss,
+        )
     }
 
     /// 构建串行锁：4C/7.5G 节点禁并发构建。锁陈旧（进程死/超构建超时）
@@ -2758,8 +2781,12 @@ impl MainlineDeployer {
         // 判定那一段也要算进来（见 `await_judgement`）：一轮要么在构建、要么在等
         // 判定，两者不叠加，所以声明取两者中更长的那个而不是求和。少算这一段，
         // 一个等在判定上的轮在存活面上与"停了"同形。
+        //
+        // 判定那一段取的是 [`judgement_wait_budget`]，与真正在等的那个数同源：两处各
+        // 算一遍，改了一处就等于让声明的界与实际在等的东西错开，而错开的方向永远是
+        // 「实际等得更久」——那一侧读出来叫停摆。
         (self.cfg.build_timeout_secs + STRIP_WALL_SECS + Self::buildah_max_step_wall_secs())
-            .max(self.cfg.soak_secs + self.cfg.rollout_timeout_secs)
+            .max(judgement_wait_budget(self.cfg.soak_secs, self.cfg.rollout_timeout_secs).as_secs())
     }
 
     /// 每一条**部署器自己的** kubectl 调用都从这里走，只在一条路上加了东西：
@@ -4919,7 +4946,7 @@ impl MainlineDeployer {
             return;
         };
         let store = crate::sandbox::buildah_store_dir();
-        let storage = store.join("storage");
+        let storage = crate::sandbox::buildah_storage_dir();
         let inventory = match self.buildah_step("list-store", &["images", "--json"]).await {
             Ok(body) => body,
             Err(e) => {
@@ -5587,9 +5614,11 @@ impl MainlineDeployer {
             // 14:25:13Z 才收敛），而同一版从拿到构建槽到 last_good 一共才 19 分钟。
             // 判定在跑时就地等它退出，把一段本来只受节拍限制的等待收进本轮。
             //
-            // 界的来源是判定自己声明的两段预算（soak 与单目标滚动），不是另写
-            // 一个数：正常的判定在这两段之内结束，超出的那一轮照旧回下一轮——
-            // 这里不改变"等不到怎么办"，只改变"等到了多久才被看见"。
+            // 界的来源是判定自己声明的那几段预算（soak、单目标滚动，以及它碰集群之前
+            // 问上游 CI 的那两段），不是另写一个数：正常的判定在这几段之内结束，超出
+            // 的那一轮照旧回下一轮——这里不改变"等不到怎么办"，只改变"等到了多久才被
+            // 看见"。少算碰集群之前那两段，就是让每一版都把判词多压一个节拍：那两段
+            // 现在占着一次判定的前十到二十分钟，而节拍是十分钟。
             if inflight.phase == Phase::Dispatched
                 && matches!(self.job_status(&job).await?, JobStatus::Running)
             {
@@ -5599,7 +5628,7 @@ impl MainlineDeployer {
                     "rollout images are on the target revision; waiting for the judgement to finish"
                 );
                 let budget =
-                    Duration::from_secs(self.cfg.soak_secs + self.cfg.rollout_timeout_secs);
+                    judgement_wait_budget(self.cfg.soak_secs, self.cfg.rollout_timeout_secs);
                 if !self
                     .await_judgement(&job, Duration::from_secs(JUDGEMENT_POLL_SECS), budget)
                     .await?
@@ -6530,7 +6559,10 @@ impl MainlineDeployer {
             )));
         }
         // strip 失败不致命（二进制可跑，只是体积大）。
-        let bin = self.target_dir().join("release/cogneva");
+        let bin = self
+            .target_dir()
+            .join(CARGO_RELEASE_SUBDIR)
+            .join(cog_core::paths::APP_BINARY_NAME);
         let _ = self
             .run_cmd(
                 "strip",
@@ -6639,7 +6671,10 @@ impl MainlineDeployer {
             );
         }
         let assets = self.asset_list().await;
-        let bin = self.target_dir().join("release/cogneva");
+        let bin = self
+            .target_dir()
+            .join(CARGO_RELEASE_SUBDIR)
+            .join(cog_core::paths::APP_BINARY_NAME);
         self.buildah_step(
             "copy-binary",
             &["copy", ctr, bin.to_str().unwrap(), OVERLAY_BINARY_DEST],
@@ -6744,7 +6779,7 @@ impl MainlineDeployer {
             .await
             .map_err(|e| SFError::IO(format!("digest {}: {e}", web_root.display())))?;
         let cache = self.web_dist_cache(&tree.digest);
-        if !cache.join("index.html").is_file() {
+        if !cache.join(WEB_INDEX_FILE).is_file() {
             self.build_web_bundle(&web_root, &cache).await?;
         }
         // 基底里那一份是旧构建的产物，先清掉再拷：不清的话，旧哈希名下的文件
@@ -6786,7 +6821,10 @@ impl MainlineDeployer {
     /// 删失败不算错：缓存本来就可以重建，留下的目录下一轮会再被扫到一次。
     /// 但**拷贝已经完成之后**才删，这样一轮失败永远不会把当下要用的那份删掉。
     fn prune_web_dist_cache(&self, keep: &str) {
-        prune_web_dist_cache(&Path::new(&self.cfg.state_dir).join("web-dist"), keep);
+        prune_web_dist_cache(
+            &Path::new(&self.cfg.state_dir).join(WEB_DIST_CACHE_SUBDIR),
+            keep,
+        );
     }
 
     /// 前端产物的缓存位置：按 `web/` 的内容摘要分目录。
@@ -6794,7 +6832,9 @@ impl MainlineDeployer {
     /// 摘要覆盖 `web/` 下每个文件的路径与字节，所以 `package-lock.json` 也算在内：
     /// 依赖变了同样重编。缓存落在 state 目录（PVC 上），Pod 重建后还在。
     fn web_dist_cache(&self, digest: &str) -> PathBuf {
-        Path::new(&self.cfg.state_dir).join("web-dist").join(digest)
+        Path::new(&self.cfg.state_dir)
+            .join(WEB_DIST_CACHE_SUBDIR)
+            .join(digest)
     }
 
     /// 在 node 构建容器里把 `web/dist` 编出来，落到 `cache`。
@@ -6881,7 +6921,7 @@ impl MainlineDeployer {
         let dist = Path::new(mount)
             .join(WEB_BUILD_SRC.trim_start_matches('/'))
             .join("dist");
-        if !dist.join("index.html").is_file() {
+        if !dist.join(WEB_INDEX_FILE).is_file() {
             return Err(SFError::Agent(format!(
                 "the web build produced no dist/index.html (looked in {})",
                 dist.display()
@@ -8246,15 +8286,12 @@ pub(crate) fn record_convergence(state_dir: &str, pin: &RevPin, now_unix: i64) -
         pinned_unix: pin.unix,
         converged_unix: now_unix,
     };
-    let path = Path::new(state_dir).join(CONVERGED_FILE);
-    let body = match serde_json::to_string_pretty(&record) {
-        Ok(body) => body,
-        Err(_) => return false,
-    };
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, body)
-        .and_then(|_| std::fs::rename(&tmp, &path))
-        .is_ok()
+    cog_core::atomic_write::write_json(
+        &Path::new(state_dir).join(CONVERGED_FILE),
+        &record,
+        cog_core::atomic_write::Durability::SameKernel,
+    )
+    .is_ok()
 }
 
 /// 钉没了就把落地记录一起删掉：留着它，下一份钉会继承上一次的时刻，而那个数会被
@@ -8264,14 +8301,12 @@ pub(crate) fn drop_convergence(state_dir: &str) {
 }
 
 pub(crate) fn write_pin(state_dir: &str, pin: &RevPin) -> SFResult<()> {
-    std::fs::create_dir_all(state_dir)
-        .map_err(|e| SFError::IO(format!("create state dir {state_dir}: {e}")))?;
-    let path = Path::new(state_dir).join(PIN_FILE);
-    let tmp = path.with_extension("json.tmp");
-    let text = serde_json::to_string_pretty(pin)?;
-    std::fs::write(&tmp, text).map_err(|e| SFError::IO(format!("write pin tmp: {e}")))?;
-    std::fs::rename(&tmp, &path).map_err(|e| SFError::IO(format!("rename pin: {e}")))?;
-    Ok(())
+    // 钉也是同一类东西：掉电后回到旧值，就等于把已经撤回的版本重新按上。
+    cog_core::atomic_write::write_json(
+        &Path::new(state_dir).join(PIN_FILE),
+        pin,
+        cog_core::atomic_write::Durability::SurvivesPowerLoss,
+    )
 }
 
 /// 撤回事件日志：一行一次决定的追加式记录，与钉文件同目录。
@@ -14698,6 +14733,50 @@ exec {real} "$@"
         }
     }
 
+    /// 这一轮必须活得比判定「还没碰集群」的那一段更久。
+    ///
+    /// 那一段是两次上游提问：问一次，以及答「还在跑」时等判词。两者都发生在第一个写
+    /// 动作之前，所以一段比它们短的预算保证部署器先走人——而它每走一次，判词就晚一节拍
+    /// 被读到，节拍是十分钟。少算这一段不会让任何东西报错：这一轮只是照旧回下一轮，
+    /// 看起来和「判定还在跑」一模一样。
+    #[test]
+    fn the_round_outlasts_what_the_judgement_spends_before_it_starts() {
+        use std::time::Duration;
+        let before_first_write = Duration::from_secs(
+            crate::mainline_rollout::CI_ASK_BUDGET_SECS
+                + crate::mainline_rollout::CI_PENDING_WAIT_SECS,
+        );
+        for (soak, rollout) in [(0u64, 0u64), (120, 300), (600, 900)] {
+            assert!(
+                judgement_wait_budget(soak, rollout) >= before_first_write,
+                "soak={soak}s rollout={rollout}s：这一轮等 {}s，而判定动手之前就能合法花掉 {}s",
+                judgement_wait_budget(soak, rollout).as_secs(),
+                before_first_write.as_secs()
+            );
+        }
+    }
+
+    /// 声明出去的一轮工期，必须盖住这一轮真正可能等的那一段。
+    ///
+    /// 存活面拿这个数分「还在干活」与「停了」：它比实际在等的那段短，一个正等在判定上
+    /// 的健康轮在读数里与停摆同形。两处各算一遍的时候，短的那一侧永远是实际等得更久的
+    /// 那一侧——所以这里判的是两者同源，不是判其中一个数值。
+    #[test]
+    fn the_declared_round_work_covers_the_wait_it_can_spend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let bare = root.join("repos/main.git");
+        let cfg = test_config(root, &bare, "/bin/true", "/bin/true");
+        let waiting = judgement_wait_budget(cfg.soak_secs, cfg.rollout_timeout_secs).as_secs();
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
+        assert!(
+            deployer.round_work_secs() >= waiting,
+            "声明的一轮工期 {}s 比这一轮可能等的那一段 {}s 还短：健康的一轮会被读成停摆",
+            deployer.round_work_secs(),
+            waiting
+        );
+    }
+
     /// 「等到界也没等到」与「问了一句还在跑」在 `state.json` 里必须是两句话。
     ///
     /// 判词是这一轮唯一会被下一轮读到的东西（这一轮的日志不会被任何消费者读），所以
@@ -17168,6 +17247,11 @@ exit 0
 
     /// 判定者还在跑时不算收敛。镜像到位比 Job 退出早，是因为 Job 在 apply 之后还要
     /// 走完 soak 与就绪走查——把这一段当成"已经收敛"，等于把还没给出的结论当成结论。
+    ///
+    /// 这一轮在判定跑完之前**不会返回**，所以这里不能等它：等的界是判定自己声明的
+    /// 那几段（soak、单目标滚动，加上碰集群之前问上游 CI 的两段），最长半小时出头。
+    /// 于是判据改成「5 秒内没有返回，而它等的时候什么都没推进」——比原来那句
+    /// 「返回之后状态没变」更强：返回本身才是这里不许发生的事。
     #[tokio::test]
     async fn a_rollout_waits_for_the_judge_before_it_converges() {
         let tmp = tempfile::tempdir().unwrap();
@@ -17193,7 +17277,12 @@ exit 0
             },
         );
 
-        deployer.poll_once().await.unwrap();
+        let round = tokio::time::timeout(std::time::Duration::from_secs(5), deployer.poll_once());
+        let timed_out = round.await.is_err();
+        assert!(
+            timed_out,
+            "判定还在跑，这一轮不该在判词出来之前返回（它等到的是判定自己的预算）"
+        );
 
         assert!(!buildah_built(&bin_dir), "判定者没跑完就不该推进浮动签");
         let state = read_state(&state_path);
