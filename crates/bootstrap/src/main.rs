@@ -3992,8 +3992,28 @@ mod profile_tests {
         ] {
             assert!(assets.contains(&required), "内嵌资产缺失: {required}");
         }
-        // 三个 profile 的渲染产物必须成套（38/39/37 量级，这里只断言下限防漏嵌）
-        for profile in ["k3s-single", "k3s-multi", "k8s-standard"] {
+        // 每个 profile 的渲染产物必须成套（38/39/37 量级，这里只断言下限防漏嵌）。
+        // 形态的集合从树里读：写死三个名字，新增的那一种漏嵌了也没人问——它不在
+        // 名单里，而「不在名单里」与「嵌齐了」在这里读起来一样。
+        let rendered = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("deploy/rendered");
+        let mut profiles: Vec<String> = std::fs::read_dir(&rendered)
+            .unwrap_or_else(|e| panic!("{}: {e}", rendered.display()))
+            .map(|entry| entry.expect("readable entry").path())
+            .filter(|path| path.is_dir())
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .collect();
+        profiles.sort();
+        assert!(
+            !profiles.is_empty(),
+            "{} 下一个形态目录都没有——这一趟什么都没验",
+            rendered.display()
+        );
+        for profile in &profiles {
             let n = assets
                 .iter()
                 .filter(|p| p.starts_with(&format!("deploy/rendered/{profile}/")))

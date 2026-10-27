@@ -97,7 +97,11 @@ check_file "${repo}/deploy/k3s/gateway-deployment.yaml"
 check_file "${repo}/deploy/k3s/sandbox-executor-deployment.yaml"
 check_file "${repo}/deploy/k3s/host-ledger-daemonset.yaml"
 check_file "${work}/chart.yaml"
-for profile in k3s-single k3s-multi k8s-standard; do
+# 形态的集合从树里读：新增的 profile 不在名单里就没有任何一个容器被这一趟看过，
+# 而「没看过」与「看过了且合规」在这里同形。
+for profile_dir in "${repo}"/deploy/rendered/*/; do
+  [ -d "${profile_dir}" ] || continue
+  profile="$(basename "${profile_dir}")"
   check_file "${repo}/deploy/rendered/${profile}/41-deployment-cogneva-registry.yaml"
   check_file "${repo}/deploy/rendered/${profile}/41-deployment-cogneva-security-gateway.yaml"
   check_file "${repo}/deploy/rendered/${profile}/41-deployment-cogneva-sandbox-executor.yaml"

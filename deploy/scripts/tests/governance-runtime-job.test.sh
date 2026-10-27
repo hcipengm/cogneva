@@ -98,10 +98,21 @@ sys.exit("no enabled deployer ConfigMap declaring a rollout job cpu limit")
 PYEOF
 }
 
-for profile in k3s-single k3s-multi; do
+# 形态的集合从树里读：判不判得出数值由门自己说（没有配额的那一种它印 GOVERNANCE
+# SKIP），这里只负责把每一种都交给它。写死几个名字，新增的形态就永远不会被交给门，
+# 而「不在名单里」与「判过了且干净」在这条测试里读起来一模一样。
+judged=0
+for profile_dir in "${repo}"/deploy/rendered/*/; do
+  [ -d "${profile_dir}" ] || continue
+  profile="$(basename "${profile_dir}")"
   dir="${repo}/deploy/rendered/${profile}"
   bash "${gate}" "${dir}" > "${work}/${profile}.out" 2>&1 \
     || fail "the gate is red on ${profile}: $(tail -3 "${work}/${profile}.out")"
+  if grep -q 'GOVERNANCE SKIP' "${work}/${profile}.out"; then
+    echo "OK: ${profile}: 没有配额可核，门自己印了 SKIP（这一种不验数值）"
+    continue
+  fi
+  judged=$((judged + 1))
 
   job_m="$(declared_cpu_m "${dir}")"
   read -r alone together < <(read_cpu "${work}/${profile}.out")
@@ -196,6 +207,8 @@ PYEOF
     || fail "${profile}: the runtime-inclusive line is still printed with the deployer disabled"
   echo "OK: ${profile}: rendered-set ${alone}m + judgement Job ${job_m}m = ${together}m, and the reading follows the declaration"
 done
+# 全跳就等于什么都没验：一个 SKIP 都没留下读数时，这条测试必须自己说出来。
+[ "${judged}" -ge 1 ] || fail "没有任何一种形态判出了数值——这一趟什么都没验"
 
 # A manifest-declared Job has to move the lower bound: the note has always claimed
 # concurrent Jobs count as 1, and until now the enumeration could not see any Job.
@@ -304,10 +317,17 @@ sys.exit("no ResourceQuota in the rendered set")
 PYEOF
 }
 
-for profile in k3s-single k3s-multi; do
+judged=0
+for profile_dir in "${repo}"/deploy/rendered/*/; do
+  [ -d "${profile_dir}" ] || continue
+  profile="$(basename "${profile_dir}")"
   dir="${repo}/deploy/rendered/${profile}"
   bash "${gate}" "${dir}" > "${work}/budget-${profile}.out" 2>&1 \
     || fail "the gate is red on ${profile}: $(tail -3 "${work}/budget-${profile}.out")"
+  if grep -q 'GOVERNANCE SKIP' "${work}/budget-${profile}.out"; then
+    continue
+  fi
+  judged=$((judged + 1))
 
   job_m="$(declared_cpu_m "${dir}")"
   bud_m="$(budget_cpu_m "${dir}")"
@@ -393,5 +413,6 @@ PYEOF
     || fail "${profile}: the over-budget verdict did not name the runtime-pod term"
   echo "OK: ${profile}: budget ${bud_m}m follows the annotation, absence is red"
 done
+[ "${judged}" -ge 1 ] || fail "没有任何一种形态判出了数值——这一趟什么都没验"
 
 echo "OK: governance runtime-job headroom gate"

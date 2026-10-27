@@ -22472,7 +22472,26 @@ exit 0
             4,
             "the default rollout set changed; this test walks all of it"
         );
-        for profile in ["k3s-single", "k3s-multi", "k8s-standard"] {
+        // The profile set is the directory listing: listed here instead, a
+        // profile added later would be walked by nothing and every assertion
+        // below would still pass over the remaining ones.
+        let rendered = root.join("deploy/rendered");
+        let mut profiles: Vec<String> = std::fs::read_dir(&rendered)
+            .unwrap_or_else(|e| panic!("{}: {e}", rendered.display()))
+            .map(|entry| entry.expect("readable entry").path())
+            .filter(|path| path.is_dir())
+            .filter_map(|path| {
+                path.file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+            })
+            .collect();
+        profiles.sort();
+        assert!(
+            !profiles.is_empty(),
+            "{} holds no rendered profile: this test would check nothing",
+            rendered.display()
+        );
+        for profile in &profiles {
             let dir = root.join("deploy/rendered").join(profile);
             let set = flat_set_from_disk(&dir);
             // 发布面就是目录自己的清单文件：产出侧新加一份，消费侧自动带上，

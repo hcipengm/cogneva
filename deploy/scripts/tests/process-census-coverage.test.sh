@@ -17,10 +17,14 @@ fixture() {
   rm -rf "${work}/crates" "${work}/deploy"
   mkdir -p "${work}/crates/cogneva/src" \
     "${work}/deploy/helm/cogneva/templates" \
-    "${work}/deploy/k3s" \
-    "${work}/deploy/rendered/k3s-single" \
-    "${work}/deploy/rendered/k3s-multi" \
-    "${work}/deploy/rendered/k8s-standard"
+    "${work}/deploy/k3s"
+  # 形态的集合从真树读。夹具自称「完整树」，而写死的三种在新增 profile 之后就不再
+  # 完整——负例 3（某一种没渲染出这份 DaemonSet）也就只覆盖得到老的那三种，新增的
+  # 那一种缺了它，门照样绿。
+  for real_profile in "${repo}"/deploy/rendered/*/; do
+    [ -d "${real_profile}" ] || continue
+    mkdir -p "${work}/deploy/rendered/$(basename "${real_profile}")"
+  done
 
   cat >"${work}/crates/cogneva/src/cli.rs" <<'EOF'
 const SUBCOMMANDS: [(&str, Command); 20] = [
@@ -50,7 +54,9 @@ spec:
       readOnly: true
 EOF
 
-  for profile in k3s-single k3s-multi k8s-standard; do
+  for profile_dir in "${work}"/deploy/rendered/*/; do
+    [ -d "${profile_dir}" ] || continue
+    profile="$(basename "${profile_dir}")"
     cat >"${work}/deploy/rendered/${profile}/40-daemonset-cogneva-process-census.yaml" <<'EOF'
 apiVersion: apps/v1
 kind: DaemonSet

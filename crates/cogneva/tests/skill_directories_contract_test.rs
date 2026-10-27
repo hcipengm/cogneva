@@ -23,13 +23,38 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// The main app's mount points, as all three rendered profiles declare them.
+/// The profiles the tree renders, taken from the tree.
+///
+/// Listed here instead, a profile added later would be read by nothing in this
+/// file while the rest kept passing — the same second declaration these tests
+/// exist to catch, one level up. Empty is a failure, not an empty pass.
+fn rendered_profiles() -> Vec<String> {
+    let dir = repo_root().join("deploy/rendered");
+    let mut out: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{} 读不到：{e}", dir.display()))
+        .map(|entry| entry.expect("目录项可读").path())
+        .filter(|path| path.is_dir())
+        .filter_map(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .collect();
+    out.sort();
+    assert!(
+        !out.is_empty(),
+        "{} 下一个形态目录都没有——这一趟什么都没验",
+        dir.display()
+    );
+    out
+}
+
+/// The main app's mount points, as every rendered profile declares them.
 /// Read rather than listed: the chart is where a mount is decided, and a copy of
 /// the list here would be the same kind of second declaration this gate exists
 /// to catch.
 fn main_app_mounts() -> Vec<String> {
     let mut out = Vec::new();
-    for profile in ["k3s-single", "k3s-multi", "k8s-standard"] {
+    for profile in rendered_profiles() {
         let path = repo_root().join(format!(
             "deploy/rendered/{profile}/41-deployment-cogneva.yaml"
         ));

@@ -77,8 +77,12 @@ echo "own image repository: ${own_csv}"
 
 # 额度是渲染集投影出来的（见 templates/resource-quota.yaml），这里不核治理，
 # 所以关掉它而不是传一份没有的投影产物。
-for profile in k3s-single k3s-multi k8s-standard; do
-  helm template cogneva "${chart}" -f "${chart}/profiles/${profile}.yaml" \
+# 形态的集合从 chart 的 profiles 目录读，不在测试里抄一份：新增的 profile 不在名单里
+# 就永远不会被渲染进这一趟，而「没渲染」与「渲染了且合规」在这里同形。
+for profile_file in "${chart}"/profiles/*.yaml; do
+  [ -e "${profile_file}" ] || continue
+  profile="$(basename "${profile_file}" .yaml)"
+  helm template cogneva "${chart}" -f "${profile_file}" \
     --set resourceGovernance.enabled=false \
     --namespace cogneva > "${work}/chart-${profile}.yaml"
 done
@@ -163,12 +167,15 @@ PYEOF
   echo "${out}"
 }
 
-check "chart k3s-single" 1 "${work}/chart-k3s-single.yaml"
-check "chart k3s-multi" 1 "${work}/chart-k3s-multi.yaml"
-check "chart k8s-standard" 1 "${work}/chart-k8s-standard.yaml"
+for profile_file in "${chart}"/profiles/*.yaml; do
+  [ -e "${profile_file}" ] || continue
+  profile="$(basename "${profile_file}" .yaml)"
+  check "chart ${profile}" 1 "${work}/chart-${profile}.yaml"
+done
 check "static deploy/k3s" 1 "${repo}"/deploy/k3s/*.yaml
-for profile in k3s-single k3s-multi k8s-standard; do
-  check "rendered ${profile}" 1 "${repo}/deploy/rendered/${profile}"/*.yaml
+for profile_dir in "${repo}"/deploy/rendered/*/; do
+  [ -d "${profile_dir}" ] || continue
+  check "rendered $(basename "${profile_dir}")" 1 "${profile_dir}"*.yaml
 done
 
 # Reverse control, all three sides. The same file with the policy set to Always
