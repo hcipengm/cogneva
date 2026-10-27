@@ -34,6 +34,18 @@ pub const LABEL_REASON: &str = "reason";
 /// 读数按「这一格处在哪个状态」归属时用的标签键。
 pub const LABEL_STATE: &str = "state";
 
+/// 读数按「哪位角色」归属时用的标签键。
+pub const LABEL_ROLE: &str = "role";
+
+/// 读数按「这份预算活多久」归属时用的标签键。
+pub const LABEL_LIFETIME: &str = "lifetime";
+
+/// 读数带上「为什么是这个结局」时用的标签键。
+pub const LABEL_CAUSE: &str = "cause";
+
+/// 读数按「哪个工具」归属时用的标签键。
+pub const LABEL_TOOL: &str = "tool";
+
 pub use archive::{HttpToolOutputArchive, ToolOutputArchive};
 pub use config::{AgentLoopConfig, AgentManagerConfig};
 

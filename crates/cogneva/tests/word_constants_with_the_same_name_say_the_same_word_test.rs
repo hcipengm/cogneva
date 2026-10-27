@@ -20,11 +20,12 @@
 //!    前缀 / `_LABEL` 后缀的名字算，所以 `LABEL_OUTCOME` 与 `OUTCOME_LABEL` 是
 //!    同一族——只比同名的话，这两拨声明各自内部一致、彼此差一个词，读数一样
 //!    读成空向量；
-//! 2. 任何一个 crate 把一个词声明成了常量，这个词就是这棵树认过的词汇：生产代码
-//!    不许再把它逐字写进标签键位置（`with_label(…)`、`labels.insert/get/remove`），
-//!    必须引用某个声明。不要求全树共用一个常量——每个写它的 crate 各自声明一份
-//!    即可：同一拼写在别处很可能是另一件事，强行共用会把两族不相干的读数焊在
-//!    一起。没人声明过的词不管；
+//! 2. 生产代码的标签键位置**不许出现字符串字面量**：`with_label(…)`、
+//!    `labels.insert/get/remove` 后面紧跟的那个键，只能是一个声明。不要求全树
+//!    共用一个常量——每个写它的 crate 各自声明一份即可：同一拼写在别处很可能是
+//!    另一件事，强行共用会把两族不相干的读数焊在一起。这条不留「没人声明过就
+//!    不管」的口子：裸拼本身就是第二个拼法，第一个是它下一次被写进另一个文件
+//!    的时候；
 //! 3. 普查本身要有下限：读得太少、「没有矛盾」就是个空承诺。
 //!
 //! 判不了什么：
@@ -36,10 +37,10 @@
 //!   这些形状也算进来，会连 SQL 列名（`row.try_get("outcome")`）与 serde 字段名
 //!   一起判成红，而它们确实是另一套词汇。树上这几处仍按字面量手工改掉了，只是
 //!   本门看不见；
-//! - **没有任何 crate 声明成常量**的词。树上还剩 276 处逐字写进标签位的拼写，
-//!   分布在 87 个没人声明过的词上（`role`、`stream`、`stage`、`tier`、`service`…）。
-//!   判据 2 对它们一律不管：没有声明就没有「正确的拼法」可对照，硬判只能靠人肉
-//!   挑一份白名单，而白名单会随人走。要管得先有人把它们变成常量。
+//! - 读侧写成 `self.base_labels.get("job")` 这种非 `labels.` 接收者的字面量键。
+//!   同一个文件里写侧引用常量、读侧拼字面量时，两处读的是同一个键，改名不会
+//!   出错，所以本门不管；但这也是「同一个词两种写法」，靠就地改齐（实测 16 个
+//!   文件里有这种写法，已逐个改成引用常量）。
 //!
 //! 为什么只限名字命中 [`word_family`] 的 `&str` 常量：同名的 `&str` 常量在别处
 //! **合法地**各不相同——`USAGE`、`CLAIM_ENV`、`ROOT_ENV`、`INSERT_SQL` 都是每个
@@ -58,7 +59,13 @@
 //! （cog-agent、cog-collaboration、cog-core、cog-gateway、cog-memory、
 //! cog-observability、cog-orchestrator、cog-reflection 各新增 1～5 个 `LABEL_*`
 //! 常量，`cog-reflection` 另有 3 处改指向本 crate 已有的 `DIR_LABEL` / `KIND_LABEL` /
-//! `STATE_LABEL`）。剩余 276 处属于没人声明过的词，见上一节。
+//! `STATE_LABEL`）。
+//!
+//! 剩下的 131 处在 67 个没人声明过的词上（`message` 13、`consumer` 7、`agent_id` 6、
+//! `tier` 6、`resource` 5…），把口径改成「字面量一律不许」之后一次做完：14 个 crate
+//! 各加一批 `LABEL_*` 常量（cog-observability 一次 29 个，cog-reflection 22 个），
+//! 全部发射点改成引用。做完再量，生产代码里标签位上的字面量是 0——这是本门从
+//! 「声明过的词不许裸拼」走到「裸拼本身就不许」的依据，不是反过来先立规矩再补现场。
 //!
 //! 消融（都在真实树上做，跑的是本门自己的测试二进制）：把 `cog-collaboration` 的
 //! 一处 `with_label(crate::LABEL_OUTCOME, …)` 改回字面量，本门红并点名该文件与行号、
@@ -72,6 +79,13 @@
 //! `crates/cog-agent/src/observable.rs` 第 684 行、列出声明了 `state` 的四个 crate
 //! （cog-agent、cog-orchestrator、cog-reflection、cog-storage）；改回绿。同一棵树
 //! 一测就还揪出一处漏网的（`cog-memory/src/ingestor.rs` 的 `"operation"`），已改。
+//!
+//! 口径收紧成「字面量一律不许」之后，两条分支各消融一次，探针放
+//! `crates/bootstrap/src/zz_ablation_probe.rs`（不被任何模块引用，不进编译，门照样读得
+//! 到）：第 3 行 `with_label("intent", …)` 红，点名文件与行号并列出声明了 `intent` 的
+//! cog-github、cog-reflection；第 4 行 `with_label("nobody_declared_this_word", …)` 同样
+//! 红，报错改成「还没有常量，先声明一个再引用」——旧口径下这一处是绿的，这正是收口
+//! 要挡的那一类。删掉探针，同一棵树 15 个用例全绿。
 //!
 //! 扫描面按 O(词 × 文件) 重读过一次全部文件，实测这套测试耗时 66 秒；改成每个文件
 //! 只解析一遍、再按词过滤之后同一台机器 6 秒，判据不变。
@@ -207,13 +221,13 @@ fn sources(root: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// 标签**键**位置的判据只管「已经被声明过」的词。
+/// 标签**键**位置的判据不区分「这个词有没有人声明过」。
 ///
-/// 只要有任何一个 crate 把某个词声明成了常量，这个词在生产代码里就不许再被逐字
-/// 写进标签键位置。声明这个动作本身就是「这是一套词汇」的决定——一旦有名字，裸拼
-/// 的那一处就是第二个拼法，改声明时它照旧发布旧名字，谁也不会红。每个写它的
-/// crate 各自声明一份即可，不要求共用一个常量：同一拼写在别处完全可能是另一件
-/// 事，强行共用会把两族不相干的读数焊在一起。没人声明过的词仍归读者判断。
+/// 谁声明过只是报错时多说一句「引用哪个常量」，不是判不判的条件。裸拼的词只要
+/// 出现在标签位上就算红：它本身就是第二个拼法，第一个是它下一次在另一个文件里被
+/// 再拼一遍的时候——那时两处版本各写各的、改一处不会有任何报错，读数面读到的是
+/// 一族空向量。声明的粒度也不要求全树共用一份：每个写它的 crate 各自声明即可，
+/// 同一拼写在别处完全可能是另一件事，强行共用会把两族不相干的读数焊在一起。
 
 /// 标签**键**位置上的调用。字面量紧跟在它们后面（中间允许换行与缩进），就是
 /// 在标签位上把词拼了一遍，而不是引用声明。
@@ -357,18 +371,23 @@ fn contradictions(root: &Path) -> Vec<String> {
         ));
     }
 
-    // 只要有 crate 把某个词声明成了常量，它就是这棵树认过的词汇：生产代码里
-    // 不许再把它逐字写进标签键位置。
+    // 标签键位置上不许有字面量：写标签时只能引用某个声明。
     for (where_, raw) in &files {
         for (line, word) in inline_label_sites(raw) {
-            let Some(krates) = crates_of_word.get(&word) else {
-                continue;
-            };
+            let declared = crates_of_word
+                .get(&word)
+                .map(|krates| {
+                    format!(
+                        "这个词在本树里已经声明成常量（{}），引用它即可",
+                        krates.iter().cloned().collect::<Vec<_>>().join("、")
+                    )
+                })
+                .unwrap_or_else(|| {
+                    "这个词在本树里还没有常量，先在本 crate 里声明一个再引用".into()
+                });
             complaints.push(format!(
-                "  `{where_}` 第 {line} 行把 `\"{word}\"` 直接写在标签位上。这个词已经\
-                 被声明成常量（{}），写标签时该引用声明：两处各自拼一遍，改一处不会有\
-                 任何报错，而读数面读到的是一族空向量",
-                krates.iter().cloned().collect::<Vec<_>>().join("、")
+                "  `{where_}` 第 {line} 行把 `\"{word}\"` 直接写在标签位上。{declared}：\
+                 两处各自拼一遍，改一处不会有任何报错，而读数面读到的是一族空向量"
             ));
         }
     }
@@ -492,7 +511,7 @@ fn a_shared_word_spelled_inline_in_a_label_slot_is_reported() {
 /// 声明过一次就够了：一个 crate 把某个词写成常量，就已经把它认成了词汇，
 /// 别处再逐字拼它就是第二个拼法。
 #[test]
-fn a_word_declared_in_one_crate_is_enough_to_police_it() {
+fn a_literal_label_key_is_reported_in_a_crate_that_declares_the_word_elsewhere() {
     let complaints = fixture_complaints(&[
         (ONE, "pub const KIND_LABEL: &str = \"kind\";\n"),
         (
@@ -508,10 +527,11 @@ fn a_word_declared_in_one_crate_is_enough_to_police_it() {
     );
 }
 
-/// 没人声明过的词不管：没有名字就没有可对照的拼法，裸拼是它唯一的拼法，
-/// 本门不该替读者决定什么词值得起名字。
+/// 没人声明过的词也一样报：裸拼本身就是第二个拼法——第一个拼法是它下一次被
+/// 写进另一个文件的时候。判据不再问「有没有人给它起过名字」，只问「这里是不是
+/// 拼了一遍」；本门也就在同一处告出门槛之外的现场该补什么（先声明，再引用）。
 #[test]
-fn a_word_no_one_declared_is_not_policed() {
+fn a_literal_label_key_is_reported_even_when_nothing_declares_it() {
     let complaints = fixture_complaints(&[
         (ONE, "pub const OTHER_WORD: &str = \"something_else\";\n"),
         (
@@ -519,7 +539,12 @@ fn a_word_no_one_declared_is_not_policed() {
             "pub fn publish(m: &mut M) { m.with_label(\"intent\", \"x\"); }\n",
         ),
     ]);
-    assert_eq!(complaints, Vec::<String>::new());
+    assert!(
+        complaints
+            .iter()
+            .any(|c| c.contains("\"intent\"") && c.contains("crates/three/src/c.rs")),
+        "{complaints:?}"
+    );
 }
 
 /// 同一个词的两种命名顺序归一族：只比「同名」的话，`LABEL_OUTCOME` 与

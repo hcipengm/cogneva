@@ -720,7 +720,7 @@ async fn publish_read(
     };
     let mut labels = std::collections::HashMap::new();
     labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
-    labels.insert("resource".to_string(), resource.to_string());
+    labels.insert(crate::LABEL_RESOURCE.to_string(), resource.to_string());
     let _ = backend
         .record_counter(cog_core::metric_names::CLUSTER_READ_TOTAL, value, labels)
         .await;

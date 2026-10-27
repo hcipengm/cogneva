@@ -130,6 +130,18 @@ pub const LABEL_SOURCE: &str = cog_core::build_cache::SOURCE_LABEL;
 
 /// 读数带上「为什么是这个值」时用的标签键。
 pub const LABEL_REASON: &str = "reason";
+
+/// 读数按「哪一档」归属时用的标签键。
+pub const LABEL_TIER: &str = "tier";
+
+/// 读数按「哪个连接池」归属时用的标签键。
+pub const LABEL_POOL: &str = "pool";
+
+/// 读数按「哪张表」归属时用的标签键。
+pub const LABEL_TABLE: &str = "table";
+
+/// 读数按「哪个消费方」归属时用的标签键。
+pub const LABEL_CONSUMER: &str = "consumer";
 #[cfg(feature = "redis")]
 pub use dlq::RedisDeadLetterQueue;
 

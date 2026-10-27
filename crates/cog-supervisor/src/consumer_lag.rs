@@ -50,7 +50,7 @@ pub async fn record_consumer_lag(
         return;
     };
     let mut labels = HashMap::new();
-    labels.insert("consumer".to_string(), consumer.to_string());
+    labels.insert(crate::LABEL_CONSUMER.to_string(), consumer.to_string());
     if let Err(e) = backend
         .record_counter(
             cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,

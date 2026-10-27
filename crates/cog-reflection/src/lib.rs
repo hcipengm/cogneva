@@ -199,6 +199,72 @@ pub const LABEL_REASON: &str = "reason";
 /// 读数按「哪一份存储」归属时用的标签键。
 pub const LABEL_STORE: &str = "store";
 
+/// 读数按「哪位在问」归属时用的标签键。
+pub const LABEL_ASKER: &str = "asker";
+
+/// 读数按「哪位角色」归属时用的标签键。
+pub const LABEL_ROLE: &str = "role";
+
+/// 读数按「哪个资源」归属时用的标签键。
+pub const LABEL_RESOURCE: &str = "resource";
+
+/// 读数按「哪个代码平台」归属时用的标签键。
+pub const LABEL_PLATFORM: &str = "platform";
+
+/// 读数按「哪个数据目录」归属时用的标签键。
+pub const LABEL_DATA_DIR: &str = "data_dir";
+
+/// 读数按「哪一条条款」归属时用的标签键。
+pub const LABEL_CLAUSE: &str = "clause";
+
+/// 读数按「这一格给出什么结局」归属时用的标签键。
+pub const LABEL_VERDICT: &str = "verdict";
+
+/// 读数按「哪个对象」归属时用的标签键。
+pub const LABEL_OBJECT: &str = "object";
+
+/// 读数按「哪一档」归属时用的标签键。
+pub const LABEL_TIER: &str = "tier";
+
+/// 读数按「哪份工作树」归属时用的标签键。
+pub const LABEL_WORKTREE: &str = "worktree";
+
+/// 读数按「哪个现场」归属时用的标签键。
+pub const LABEL_SITE: &str = "site";
+
+/// 读数按「哪个动作」归属时用的标签键。
+pub const LABEL_VERB: &str = "verb";
+
+/// 读数按「哪个发布」归属时用的标签键。
+pub const LABEL_RELEASE: &str = "release";
+
+/// 读数按「哪个版本」归属时用的标签键。
+pub const LABEL_VERSION: &str = "version";
+
+/// 读数按「哪份清单」归属时用的标签键。
+pub const LABEL_MANIFEST: &str = "manifest";
+
+/// 读数按「哪个维度」归属时用的标签键。
+pub const LABEL_DIMENSION: &str = "dimension";
+
+/// 读数按「哪个槽位」归属时用的标签键。
+pub const LABEL_SLOT: &str = "slot";
+
+/// 读数按「这一格装的是什么」时用的标签键。
+pub const LABEL_WHAT: &str = "what";
+
+/// 读数按「哪个资产」归属时用的标签键。
+pub const LABEL_ASSET: &str = "asset";
+
+/// 读数按「第几拍」归属时用的标签键。
+pub const LABEL_TICKS: &str = "ticks";
+
+/// 读数按「哪个版本号」归属时用的标签键。
+pub const LABEL_REV: &str = "rev";
+
+/// 读数按「哪条工作流」归属时用的标签键。
+pub const LABEL_WORKFLOW: &str = "workflow";
+
 pub mod platform_http;
 pub mod plugin;
 

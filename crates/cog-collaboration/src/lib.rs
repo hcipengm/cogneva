@@ -36,6 +36,36 @@ pub const LABEL_PART: &str = "part";
 /// 读数带上「为什么是这个值」时用的标签键。
 pub const LABEL_REASON: &str = "reason";
 
+/// 读数按「走到哪一步」归属时用的标签键。
+pub const LABEL_STAGE: &str = "stage";
+
+/// 读数按「按哪一条判据」归属时用的标签键。
+pub const LABEL_CRITERIA: &str = "criteria";
+
+/// 读数按「这一格给出什么结局」归属时用的标签键。
+pub const LABEL_VERDICT: &str = "verdict";
+
+/// 读数按「用哪种模式跑」归属时用的标签键。
+pub const LABEL_MODE: &str = "mode";
+
+/// 读数按「哪一档」归属时用的标签键。
+pub const LABEL_TIER: &str = "tier";
+
+/// 读数按「哪一路输入」归属时用的标签键。
+pub const LABEL_INPUT: &str = "input";
+
+/// 读数按「走哪条路线」归属时用的标签键。
+pub const LABEL_ROUTE: &str = "route";
+
+/// 读数按「哪一类对象」归属时用的标签键。
+pub const LABEL_CLASS: &str = "class";
+
+/// 读数按「哪个 agent」归属时用的标签键。
+pub const LABEL_AGENT_ID: &str = "agent_id";
+
+/// 读数按「哪个维度」归属时用的标签键。
+pub const LABEL_DIMENSION: &str = "dimension";
+
 pub use actors::{ModeratorDecision, ModeratorOutput};
 pub use collaboration_executor::CollaborationExecutor;
 pub use config::{

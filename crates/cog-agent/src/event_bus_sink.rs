@@ -148,7 +148,7 @@ async fn record_drop(metrics: &Option<Arc<dyn MetricsBackend>>, cause: &'static 
         return;
     };
     let mut labels = HashMap::new();
-    labels.insert("cause".to_string(), cause.to_string());
+    labels.insert(crate::LABEL_CAUSE.to_string(), cause.to_string());
     if let Err(e) = metrics
         .record_counter(cog_core::metric_names::EVENT_BUS_DROPPED_TOTAL, 1.0, labels)
         .await
@@ -311,7 +311,7 @@ mod tests {
             .lock()
             .unwrap()
             .iter()
-            .map(|(_, labels)| labels.get("cause").cloned().unwrap_or_default())
+            .map(|(_, labels)| labels.get(crate::LABEL_CAUSE).cloned().unwrap_or_default())
             .collect()
     }
 
@@ -414,7 +414,7 @@ mod tests {
             "读数要落在闭集里那条序列上"
         );
         assert_eq!(
-            recorded[0].1.get("cause").map(String::as_str),
+            recorded[0].1.get(crate::LABEL_CAUSE).map(String::as_str),
             Some("payload_rejected"),
             "成因必须在标签上"
         );

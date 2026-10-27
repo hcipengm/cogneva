@@ -127,7 +127,7 @@ impl TraceCollector {
         };
         let mut labels = std::collections::HashMap::new();
         labels.insert(
-            "consumer".to_string(),
+            crate::LABEL_CONSUMER.to_string(),
             LAG_CONSUMER_TRACE_COLLECTOR.to_string(),
         );
         if let Err(e) = metrics
@@ -802,7 +802,7 @@ impl cog_core::Observable for TraceTierMigrator {
                         TRACE_TIER_OVERDUE_METRIC,
                         slot.load(Ordering::Relaxed) as f64,
                     )
-                    .with_label("tier", tier.as_str()),
+                    .with_label(crate::LABEL_TIER, tier.as_str()),
                 );
             }
         }
@@ -1130,7 +1130,7 @@ mod tests {
         assert_eq!(overdue.len(), 2, "one per non-terminal tier");
         let hot = overdue
             .iter()
-            .find(|m| m.labels.get("tier").map(String::as_str) == Some("hot"))
+            .find(|m| m.labels.get(crate::LABEL_TIER).map(String::as_str) == Some("hot"))
             .expect("hot gauge");
         assert_eq!(
             hot.value, 1.0,
@@ -1138,7 +1138,7 @@ mod tests {
         );
         let warm = overdue
             .iter()
-            .find(|m| m.labels.get("tier").map(String::as_str) == Some("warm"))
+            .find(|m| m.labels.get(crate::LABEL_TIER).map(String::as_str) == Some("warm"))
             .expect("warm gauge");
         assert_eq!(
             warm.value, 0.0,

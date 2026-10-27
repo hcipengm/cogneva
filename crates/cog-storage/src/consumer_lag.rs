@@ -31,7 +31,7 @@ pub(crate) async fn record_consumer_lag(metrics: &Option<Arc<dyn MetricsBackend>
     };
     let mut labels = HashMap::new();
     labels.insert(
-        "consumer".to_string(),
+        crate::LABEL_CONSUMER.to_string(),
         LAG_CONSUMER_OBSERVABILITY_EVENT_STREAM.to_string(),
     );
     if let Err(e) = backend

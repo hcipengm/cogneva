@@ -144,7 +144,7 @@ pub(crate) async fn record_consumer_lag(
         return;
     };
     let mut labels = std::collections::HashMap::new();
-    labels.insert("consumer".to_string(), consumer.to_string());
+    labels.insert(crate::LABEL_CONSUMER.to_string(), consumer.to_string());
     if let Err(e) = backend
         .record_counter(
             cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
@@ -178,7 +178,7 @@ pub(crate) async fn record_consumer_consumed(
         return;
     };
     let mut labels = std::collections::HashMap::new();
-    labels.insert("consumer".to_string(), consumer.to_string());
+    labels.insert(crate::LABEL_CONSUMER.to_string(), consumer.to_string());
     if let Err(e) = backend
         .record_counter(
             cog_core::metric_names::EVENT_BUS_CONSUMED_TOTAL,
@@ -1514,9 +1514,9 @@ where
 
                     if let Some(ref mb) = metrics {
                         let mut labels = HashMap::new();
-                        labels.insert("method".into(), method.clone());
-                        labels.insert("endpoint".into(), endpoint.clone());
-                        labels.insert("status".into(), status.to_string());
+                        labels.insert(crate::LABEL_METHOD.into(), method.clone());
+                        labels.insert(crate::LABEL_ENDPOINT.into(), endpoint.clone());
+                        labels.insert(crate::LABEL_STATUS.into(), status.to_string());
                         if let Err(e) = mb
                             .record_counter(
                                 cog_core::metric_names::HTTP_REQUESTS_TOTAL,
@@ -1781,6 +1781,33 @@ pub const LABEL_NODE: &str = "node";
 
 /// 读数按「哪一步操作」归属时用的标签键。
 pub const LABEL_OPERATION: &str = "operation";
+
+/// 读数按「哪个消费方」归属时用的标签键。
+pub const LABEL_CONSUMER: &str = "consumer";
+
+/// 读数按「哪个 HTTP 方法」归属时用的标签键。
+pub const LABEL_METHOD: &str = "method";
+
+/// 读数按「哪个端点」归属时用的标签键。
+pub const LABEL_ENDPOINT: &str = "endpoint";
+
+/// 读数按「哪种结局」归属时用的标签键。
+pub const LABEL_STATUS: &str = "status";
+
+/// 读数按「哪个下游服务」归属时用的标签键。
+pub const LABEL_SERVICE: &str = "service";
+
+/// 读数按「哪一类」归属时用的标签键。
+pub const LABEL_KIND: &str = "kind";
+
+/// 读数按「哪个上游」归属时用的标签键。
+pub const LABEL_UPSTREAM: &str = "upstream";
+
+/// 读数按「哪个出口」归属时用的标签键。
+pub const LABEL_OUTLET: &str = "outlet";
+
+/// 读数按「哪个资源」归属时用的标签键。
+pub const LABEL_RESOURCE: &str = "resource";
 
 /// The series name the held-out reading is published under.
 ///

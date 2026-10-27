@@ -2668,7 +2668,7 @@ mod tests {
         );
         assert!(carried.ends_with('…'));
         assert!(
-            labels.get("original_input").is_none(),
+            labels.get(crate::LABEL_ORIGINAL_INPUT).is_none(),
             "the whole input must not survive as a label"
         );
     }

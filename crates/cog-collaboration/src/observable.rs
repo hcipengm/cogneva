@@ -1000,7 +1000,7 @@ impl Observable for CollaborationObservable {
                     let avg = latencies.iter().sum::<u64>() as f64 / latencies.len() as f64;
                     metrics.push(
                         RawMetric::new("collab_agent_turnaround_ms", avg)
-                            .with_label("agent_id", agent_id),
+                            .with_label(crate::LABEL_AGENT_ID, agent_id),
                     );
                 }
             }
@@ -1031,7 +1031,7 @@ impl Observable for CollaborationObservable {
                 let count = routes.get(route).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("ralph_failure_route_total", count as f64)
-                        .with_label("route", route),
+                        .with_label(crate::LABEL_ROUTE, route),
                 );
             }
             // Every cell of the yield, published at zero once one run has
@@ -1055,9 +1055,9 @@ impl Observable for CollaborationObservable {
             for ((stage, criteria, verdict), count) in reviews.iter() {
                 metrics.push(
                     RawMetric::new("self_review_verdict_total", *count as f64)
-                        .with_label("stage", stage)
-                        .with_label("criteria", criteria)
-                        .with_label("verdict", verdict),
+                        .with_label(crate::LABEL_STAGE, stage)
+                        .with_label(crate::LABEL_CRITERIA, criteria)
+                        .with_label(crate::LABEL_VERDICT, verdict),
                 );
             }
             let skips = self
@@ -1068,7 +1068,7 @@ impl Observable for CollaborationObservable {
             for ((stage, reason), count) in skips.iter() {
                 metrics.push(
                     RawMetric::new("self_review_skipped_total", *count as f64)
-                        .with_label("stage", stage)
+                        .with_label(crate::LABEL_STAGE, stage)
                         .with_label(crate::LABEL_REASON, reason),
                 );
             }
@@ -1081,7 +1081,7 @@ impl Observable for CollaborationObservable {
             for ((stage, outcome), count) in revisions.iter() {
                 metrics.push(
                     RawMetric::new("self_review_revision_total", *count as f64)
-                        .with_label("stage", stage)
+                        .with_label(crate::LABEL_STAGE, stage)
                         .with_label(crate::LABEL_OUTCOME, outcome),
                 );
             }
@@ -1199,8 +1199,8 @@ impl Observable for CollaborationObservable {
                     let count = decisions.get(&key).copied().unwrap_or(0);
                     metrics.push(
                         RawMetric::new("collab_route_decisions_total", count as f64)
-                            .with_label("stage", stage.as_str())
-                            .with_label("mode", mode.as_str()),
+                            .with_label(crate::LABEL_STAGE, stage.as_str())
+                            .with_label(crate::LABEL_MODE, mode.as_str()),
                     );
                 }
             }
@@ -1219,7 +1219,7 @@ impl Observable for CollaborationObservable {
                 let count = scales.get(label).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("collab_declared_scale_total", count as f64)
-                        .with_label("tier", label),
+                        .with_label(crate::LABEL_TIER, label),
                 );
             }
 
@@ -1237,7 +1237,7 @@ impl Observable for CollaborationObservable {
                 let count = inputs.get(input.as_str()).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("collab_declaration_inputs_total", count as f64)
-                        .with_label("input", input.as_str()),
+                        .with_label(crate::LABEL_INPUT, input.as_str()),
                 );
             }
 
@@ -1292,7 +1292,7 @@ impl Observable for CollaborationObservable {
                 let count = violations.get(dimension).copied().unwrap_or(0);
                 metrics.push(
                     RawMetric::new("collab_boundary_violation_total", count as f64)
-                        .with_label("dimension", dimension),
+                        .with_label(crate::LABEL_DIMENSION, dimension),
                 );
             }
 
@@ -1329,7 +1329,7 @@ impl Observable for CollaborationObservable {
                 }
                 metrics.push(
                     RawMetric::new("collab_classification_unreachable", 1.0)
-                        .with_label("class", class),
+                        .with_label(crate::LABEL_CLASS, class),
                 );
             }
         }
@@ -1501,9 +1501,9 @@ mod tests {
             reviews
                 .iter()
                 .find(|m| {
-                    m.labels.get("stage").map(String::as_str) == Some(stage)
-                        && m.labels.get("criteria").map(String::as_str) == Some(criteria)
-                        && m.labels.get("verdict").map(String::as_str) == Some(verdict)
+                    m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
+                        && m.labels.get(crate::LABEL_CRITERIA).map(String::as_str) == Some(criteria)
+                        && m.labels.get(crate::LABEL_VERDICT).map(String::as_str) == Some(verdict)
                 })
                 .map(|m| m.value)
                 .unwrap_or_else(|| panic!("{stage}/{criteria}/{verdict} is reported"))
@@ -1653,7 +1653,7 @@ mod tests {
             revisions
                 .iter()
                 .find(|m| {
-                    m.labels.get("stage").map(String::as_str) == Some(stage)
+                    m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
                         && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
                 })
                 .map(|m| m.value)
@@ -1760,7 +1760,7 @@ mod tests {
         metrics
             .iter()
             .filter(|m| m.name == "collab_classification_unreachable")
-            .filter_map(|m| m.labels.get("class").cloned())
+            .filter_map(|m| m.labels.get(crate::LABEL_CLASS).cloned())
             .collect()
     }
 
@@ -1804,8 +1804,11 @@ mod tests {
             .filter(|m| m.name == "collab_route_decisions_total")
             .map(|m| {
                 (
-                    m.labels.get("stage").cloned().unwrap_or_default(),
-                    m.labels.get("mode").cloned().unwrap_or_default(),
+                    m.labels
+                        .get(crate::LABEL_STAGE)
+                        .cloned()
+                        .unwrap_or_default(),
+                    m.labels.get(crate::LABEL_MODE).cloned().unwrap_or_default(),
                     m.value,
                 )
             })
@@ -1816,7 +1819,12 @@ mod tests {
         metrics
             .iter()
             .filter(|m| m.name == "collab_declared_scale_total")
-            .map(|m| (m.labels.get("tier").cloned().unwrap_or_default(), m.value))
+            .map(|m| {
+                (
+                    m.labels.get(crate::LABEL_TIER).cloned().unwrap_or_default(),
+                    m.value,
+                )
+            })
             .collect()
     }
 
@@ -1824,7 +1832,15 @@ mod tests {
         metrics
             .iter()
             .filter(|m| m.name == "collab_declaration_inputs_total")
-            .map(|m| (m.labels.get("input").cloned().unwrap_or_default(), m.value))
+            .map(|m| {
+                (
+                    m.labels
+                        .get(crate::LABEL_INPUT)
+                        .cloned()
+                        .unwrap_or_default(),
+                    m.value,
+                )
+            })
             .collect()
     }
 
@@ -2384,7 +2400,7 @@ mod tests {
         assert_eq!(written[0].0, CHANGE_DIFF_SOURCE_METRIC);
         assert_eq!(written[0].1, 1.0);
         assert_eq!(
-            written[0].2.get("source").map(String::as_str),
+            written[0].2.get(crate::LABEL_SOURCE).map(String::as_str),
             Some(CHANGE_DIFF_SOURCE_TREE)
         );
         assert!(CHANGE_DIFF_SOURCES.contains(&CHANGE_DIFF_SOURCE_TREE));

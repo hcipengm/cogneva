@@ -565,7 +565,7 @@ fn parse_alerts_response(
         if !marked && !mirror.include_unmarked {
             continue;
         }
-        let Some(rule) = labels.get("alertname").cloned() else {
+        let Some(rule) = labels.get(crate::LABEL_ALERTNAME).cloned() else {
             continue;
         };
         // Exclusions beat both selections: a name listed here is never an
@@ -579,7 +579,7 @@ fn parse_alerts_response(
         if own_rules.contains(rule.as_str()) || rule == EVAL_FAILURE_RULE || rule == MIRROR_SOURCE {
             continue;
         }
-        let severity = match labels.get("severity").map(String::as_str) {
+        let severity = match labels.get(crate::LABEL_SEVERITY).map(String::as_str) {
             Some("critical") => cog_core::AlertSeverity::Critical,
             Some("info") => cog_core::AlertSeverity::Info,
             _ => cog_core::AlertSeverity::Warning,
@@ -761,7 +761,7 @@ async fn mirror_report(alert: &MirroredAlert, key: &str, outlets: &InfraWatchOut
     if let Some(face) = &alert.face {
         labels.insert(ALERT_FACE_LABEL.into(), face.clone());
     }
-    labels.insert("message".into(), alert.message.clone());
+    labels.insert(crate::LABEL_MESSAGE.into(), alert.message.clone());
     labels.insert(crate::alerts::LABEL_SOURCE.into(), MIRROR_SOURCE.into());
     let row = NewAlert {
         rule: alert.rule.clone(),
@@ -1037,7 +1037,7 @@ fn alert_labels(sample: &SeriesSample, message: &str, face: &str) -> HashMap<Str
     if !face.is_empty() {
         labels.insert(ALERT_FACE_LABEL.into(), face.to_string());
     }
-    labels.insert("message".into(), message.to_string());
+    labels.insert(crate::LABEL_MESSAGE.into(), message.to_string());
     labels.insert(crate::alerts::LABEL_SOURCE.into(), "infra_watch".into());
     labels
 }
@@ -1896,7 +1896,7 @@ mod tests {
             "which pod is the victim must survive"
         );
         assert_eq!(
-            labels.get("message").map(String::as_str),
+            labels.get(crate::LABEL_MESSAGE).map(String::as_str),
             Some("backlog aged out")
         );
         assert_eq!(

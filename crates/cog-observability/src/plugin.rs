@@ -136,7 +136,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 crate::logs::LokiPushClient::new(&observability.loki.endpoint)
                     .with_max_retries(observability.loki.max_retries.max(1))
                     .with_timeout(observability.loki.timeout_secs)
-                    .with_label("service", &loki_service)
+                    .with_label(crate::LABEL_SERVICE, &loki_service)
                     .with_client(http_client.clone()),
             );
             let pusher = Arc::new(crate::logs::LokiBackgroundPusher::new(
@@ -959,31 +959,43 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             timestamp,
         } => {
             let mut labels = HashMap::new();
-            labels.insert("alert_type".into(), "llm_upstream_pool_down".into());
+            labels.insert(
+                crate::LABEL_ALERT_TYPE.into(),
+                "llm_upstream_pool_down".into(),
+            );
             // 两个数各占一个标签，名字自带口径：`suspect_count` 是**当刻还在嫌疑
             // 窗内**的家数（随窗到期自己变小），`pool_size` 才是池有多大。只报前
             // 者、还把它叫 `unavailable_count`，读的人会以为池就这么大。
-            labels.insert("suspect_count".into(), unavailable.len().to_string());
-            labels.insert("pool_size".into(), pool_size.to_string());
+            labels.insert(
+                crate::LABEL_SUSPECT_COUNT.into(),
+                unavailable.len().to_string(),
+            );
+            labels.insert(crate::LABEL_POOL_SIZE.into(), pool_size.to_string());
             // 第三个数：这条判定是按哪条界做出来的。池判定收在**容量**上之后，
             // "3 of 4 在嫌疑窗内"与"4 of 4"可以是同一个判定（声明要求两家时，
             // 剩两家就是够的），而只报前两个数的读者会把它读成"还剩一家在供，
             // 为什么派活停了"。界与它的来源一起给，值不是别处抄的。
             labels.insert(
-                "min_healthy".into(),
+                crate::LABEL_MIN_HEALTHY.into(),
                 cog_core::pool_floor(*pool_size, *declared_min_healthy).to_string(),
             );
             labels.insert(
-                "min_healthy_source".into(),
+                crate::LABEL_MIN_HEALTHY_SOURCE.into(),
                 cog_core::min_healthy_source(*declared_min_healthy).to_string(),
             );
             labels.insert(
-                "evidenced_recovery_unix".into(),
+                crate::LABEL_EVIDENCED_RECOVERY_UNIX.into(),
                 evidenced_recovery_unix.to_string(),
             );
-            labels.insert("next_attempt_unix".into(), next_attempt_unix.to_string());
-            labels.insert("quota_window_secs".into(), quota_window_secs.to_string());
-            labels.insert("unavailable".into(), unavailable.join(","));
+            labels.insert(
+                crate::LABEL_NEXT_ATTEMPT_UNIX.into(),
+                next_attempt_unix.to_string(),
+            );
+            labels.insert(
+                crate::LABEL_QUOTA_WINDOW_SECS.into(),
+                quota_window_secs.to_string(),
+            );
+            labels.insert(crate::LABEL_UNAVAILABLE.into(), unavailable.join(","));
             // 文案在契约层只写一次，共用它的消费者是**这两个**：这里的通知出口，
             // 和监督者那条进程内告警史（`cog-supervisor::alert_store`，容量
             // `ALERT_HISTORY_MAX`）。各写一遍就会漂移，而漂移是静默的——两句都读
@@ -996,7 +1008,7 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             // `/alerts` 那条读口会把同规则的两条合成一条，理由与挑哪一条见
             // `POOL_ALERT_RULE` 那段注释。
             labels.insert(
-                "message".into(),
+                crate::LABEL_MESSAGE.into(),
                 cog_core::pool_down_verdict(
                     *pool_size,
                     unavailable,
@@ -1021,7 +1033,7 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
         cog_core::SupervisorEvent::LlmUpstreamPoolRecovered { timestamp } => {
             let mut labels = HashMap::new();
             labels.insert(
-                "message".into(),
+                crate::LABEL_MESSAGE.into(),
                 "LLM upstream pool recovered; LLM-dependent tasks resumed".into(),
             );
             let inst = AlertInstance {
@@ -1069,9 +1081,9 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
                 ),
             };
             let mut labels = HashMap::new();
-            labels.insert("agent_id".into(), agent_id.clone());
-            labels.insert("alert_type".into(), "agent_unhealthy".into());
-            labels.insert("message".into(), msg);
+            labels.insert(crate::LABEL_AGENT_ID.into(), agent_id.clone());
+            labels.insert(crate::LABEL_ALERT_TYPE.into(), "agent_unhealthy".into());
+            labels.insert(crate::LABEL_MESSAGE.into(), msg);
             let inst = AlertInstance {
                 rule_name: "agent_unhealthy".into(),
                 labels,
@@ -1092,11 +1104,17 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             timestamp,
         } => {
             let mut labels = HashMap::new();
-            labels.insert("workspace_id".into(), workspace_id.clone());
-            labels.insert("alert_type".into(), "quota_threshold_breached".into());
-            labels.insert("scheduler_paused".into(), scheduler_paused.to_string());
+            labels.insert(crate::LABEL_WORKSPACE_ID.into(), workspace_id.clone());
             labels.insert(
-                "message".into(),
+                crate::LABEL_ALERT_TYPE.into(),
+                "quota_threshold_breached".into(),
+            );
+            labels.insert(
+                crate::LABEL_SCHEDULER_PAUSED.into(),
+                scheduler_paused.to_string(),
+            );
+            labels.insert(
+                crate::LABEL_MESSAGE.into(),
                 format!(
                     "Quota breached: remaining={remaining}, threshold={}, paused={scheduler_paused}",
                     threshold
@@ -1122,11 +1140,11 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             timestamp,
         } => {
             let mut labels = HashMap::new();
-            labels.insert("agent_id".into(), agent_id.clone());
-            labels.insert("metric".into(), metric.clone());
-            labels.insert("threshold".into(), threshold.to_string());
+            labels.insert(crate::LABEL_AGENT_ID.into(), agent_id.clone());
+            labels.insert(crate::LABEL_METRIC.into(), metric.clone());
+            labels.insert(crate::LABEL_THRESHOLD.into(), threshold.to_string());
             labels.insert(
-                "message".into(),
+                crate::LABEL_MESSAGE.into(),
                 format!("Resource alert: {metric}={current:.2}, threshold={threshold:.2}"),
             );
             let inst = AlertInstance {
@@ -1149,15 +1167,15 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             timestamp,
         } => {
             let mut labels = HashMap::new();
-            labels.insert("task_id".into(), task_id.clone());
+            labels.insert(crate::LABEL_TASK_ID.into(), task_id.clone());
             if let Some(aid) = agent_id {
-                labels.insert("agent_id".into(), aid.clone());
+                labels.insert(crate::LABEL_AGENT_ID.into(), aid.clone());
             }
             if let Some(cid) = crew_id {
-                labels.insert("crew_id".into(), cid.clone());
+                labels.insert(crate::LABEL_CREW_ID.into(), cid.clone());
             }
             labels.insert(
-                "message".into(),
+                crate::LABEL_MESSAGE.into(),
                 format!("Task sent to DLQ after {retry_count} retries"),
             );
             let inst = AlertInstance {
@@ -1179,10 +1197,10 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             ..
         } => {
             let mut labels = HashMap::new();
-            labels.insert("crew_id".into(), crew_id.clone());
+            labels.insert(crate::LABEL_CREW_ID.into(), crew_id.clone());
             labels.insert(crate::LABEL_REASON.into(), reason.clone());
             labels.insert(
-                "message".into(),
+                crate::LABEL_MESSAGE.into(),
                 format!("Squad respawn requested: {reason}"),
             );
             let inst = AlertInstance {
@@ -1209,9 +1227,9 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             timestamp,
         } => {
             let mut labels = HashMap::new();
-            labels.insert("agent_id".into(), agent_id.clone());
+            labels.insert(crate::LABEL_AGENT_ID.into(), agent_id.clone());
             labels.insert(
-                "message".into(),
+                crate::LABEL_MESSAGE.into(),
                 format!("Agent left the platform: {reason}"),
             );
             let inst = AlertInstance {
@@ -1231,8 +1249,8 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             timestamp,
         } => {
             let mut labels = HashMap::new();
-            labels.insert("agent_id".into(), agent_id.clone());
-            labels.insert("message".into(), "Agent recovered".into());
+            labels.insert(crate::LABEL_AGENT_ID.into(), agent_id.clone());
+            labels.insert(crate::LABEL_MESSAGE.into(), "Agent recovered".into());
             let inst = AlertInstance {
                 rule_name: "agent_unhealthy".into(),
                 labels,
@@ -1251,9 +1269,9 @@ fn supervisor_event_to_alert_events(event: &cog_core::SupervisorEvent) -> Vec<Al
             timestamp,
         } => {
             let mut labels = HashMap::new();
-            labels.insert("workspace_id".into(), workspace_id.clone());
+            labels.insert(crate::LABEL_WORKSPACE_ID.into(), workspace_id.clone());
             labels.insert(
-                "message".into(),
+                crate::LABEL_MESSAGE.into(),
                 format!("Quota recovered: remaining={remaining}"),
             );
             let inst = AlertInstance {
@@ -1601,7 +1619,7 @@ async fn run_alert_bridge(
                 if let Some(backend) = metrics.as_ref() {
                     let mut labels = std::collections::HashMap::new();
                     labels.insert(
-                        "consumer".to_string(),
+                        crate::LABEL_CONSUMER.to_string(),
                         LAG_CONSUMER_ALERT_BRIDGE.to_string(),
                     );
                     if let Err(e) = backend
@@ -1695,7 +1713,7 @@ fn owns_the_row(rule: &str) -> bool {
 /// `message` label (single source of truth for wording); this only falls back
 /// so a stored row never carries an empty message.
 fn alert_message(inst: &AlertInstance) -> String {
-    match inst.labels.get("message") {
+    match inst.labels.get(crate::LABEL_MESSAGE) {
         Some(text) if !text.is_empty() => text.clone(),
         _ => format!("{} {}", inst.rule_name, inst.state.as_str()),
     }

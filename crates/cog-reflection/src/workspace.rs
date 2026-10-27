@@ -1284,7 +1284,7 @@ mod tests {
         let samples = mb.query_gauge_latest(name).await.unwrap();
         samples
             .into_iter()
-            .find(|s| s.labels.get("worktree").map(String::as_str) == Some(worktree))
+            .find(|s| s.labels.get(crate::LABEL_WORKTREE).map(String::as_str) == Some(worktree))
             .unwrap_or_else(|| panic!("no {name} sample for worktree {worktree}"))
             .value
     }
@@ -1459,7 +1459,7 @@ mod tests {
         .await
         .unwrap()
         .into_iter()
-        .filter(|s| s.labels.get("worktree").map(String::as_str) == Some(worktree))
+        .filter(|s| s.labels.get(crate::LABEL_WORKTREE).map(String::as_str) == Some(worktree))
         .count()
     }
 

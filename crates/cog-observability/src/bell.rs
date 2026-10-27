@@ -401,7 +401,7 @@ mod tests {
             writes.iter().any(|(name, value, labels)| name
                 == cog_core::metric_names::ALERT_NOTIFICATIONS_TOTAL.as_str()
                 && *value == 1.0
-                && labels.get("channel")
+                && labels.get(crate::LABEL_CHANNEL)
                     == Some(&crate::alerts::CHANNEL_NOTIFICATION_CENTER.to_string())
                 && labels.get("outcome") == Some(&crate::alerts::OUTCOME_WRITE_FAILED.to_string())),
             "写失败要有一格：{writes:?}"
@@ -430,7 +430,7 @@ mod tests {
             writes.iter().any(|(name, value, labels)| name
                 == cog_core::metric_names::ALERT_NOTIFICATIONS_TOTAL.as_str()
                 && *value == 1.0
-                && labels.get("channel")
+                && labels.get(crate::LABEL_CHANNEL)
                     == Some(&crate::alerts::CHANNEL_NOTIFICATION_CENTER.to_string())
                 && labels.get("outcome") == Some(&crate::alerts::OUTCOME_DELIVERED.to_string())),
             "送达要记在同一个 family 上：{writes:?}"

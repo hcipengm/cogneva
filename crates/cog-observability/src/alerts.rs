@@ -505,7 +505,10 @@ mod tests {
                 .map(|(name, value, labels)| {
                     assert_eq!(name, "cogneva_alert_notifications_total");
                     (
-                        labels.get("channel").cloned().unwrap_or_default(),
+                        labels
+                            .get(crate::LABEL_CHANNEL)
+                            .cloned()
+                            .unwrap_or_default(),
                         labels.get("outcome").cloned().unwrap_or_default(),
                         *value,
                     )

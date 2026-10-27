@@ -146,7 +146,7 @@ impl Observable for BootFootprintObservable {
         Ok(marks()
             .into_iter()
             .map(|(phase, bytes)| {
-                RawMetric::new(BOOT_RSS_METRIC, bytes as f64).with_label("phase", phase)
+                RawMetric::new(BOOT_RSS_METRIC, bytes as f64).with_label(crate::LABEL_PHASE, phase)
             })
             .collect())
     }
@@ -242,7 +242,12 @@ mod tests {
         let phases: Vec<String> = metrics
             .iter()
             .filter(|m| m.name == BOOT_RSS_METRIC)
-            .map(|m| m.labels.get("phase").cloned().unwrap_or_default())
+            .map(|m| {
+                m.labels
+                    .get(crate::LABEL_PHASE)
+                    .cloned()
+                    .unwrap_or_default()
+            })
             .collect();
         assert_eq!(phases, vec!["process-start", "plugins-initialized"]);
         assert!(

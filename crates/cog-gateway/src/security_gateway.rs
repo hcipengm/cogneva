@@ -8253,7 +8253,7 @@ fn init_gateway_logging(
             LokiPushClient::new(&obs.loki.endpoint)
                 .with_max_retries(obs.loki.max_retries.max(1))
                 .with_timeout(obs.loki.timeout_secs)
-                .with_label("service", cog_core::topology::SECURITY_GATEWAY)
+                .with_label(crate::LABEL_SERVICE, cog_core::topology::SECURITY_GATEWAY)
                 .with_client(http_client.clone()),
         );
         // The loop is started by the caller once the flush loop's metric sink
@@ -9337,7 +9337,7 @@ mod tests {
             .expect("token reading");
         let input: f64 = tokens
             .iter()
-            .filter(|s| s.labels.get("kind").map(String::as_str) == Some("input"))
+            .filter(|s| s.labels.get(crate::LABEL_KIND).map(String::as_str) == Some("input"))
             .map(|s| s.value)
             .sum();
         assert_eq!(input, 11.0, "数字本身也要落账");
@@ -9445,7 +9445,10 @@ mod tests {
             .iter()
             .map(|s| {
                 (
-                    s.labels.get("upstream").cloned().unwrap_or_default(),
+                    s.labels
+                        .get(crate::LABEL_UPSTREAM)
+                        .cloned()
+                        .unwrap_or_default(),
                     s.labels.get("outcome").cloned().unwrap_or_default(),
                 )
             })
@@ -14463,7 +14466,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .map(|s| {
                 (
                     (
-                        s.labels.get("outlet").cloned().unwrap_or_default(),
+                        s.labels
+                            .get(crate::LABEL_OUTLET)
+                            .cloned()
+                            .unwrap_or_default(),
                         s.labels.get("outcome").cloned().unwrap_or_default(),
                     ),
                     s.value,

@@ -743,7 +743,7 @@ mod tests {
             .iter()
             .find(|sample| {
                 sample.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
-                    && sample.labels.get("node").map(String::as_str) == Some(node)
+                    && sample.labels.get(crate::LABEL_NODE).map(String::as_str) == Some(node)
             })
             .map(|sample| sample.value)
     }

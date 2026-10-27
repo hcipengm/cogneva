@@ -292,7 +292,7 @@ impl ToolOutputArchive for HttpToolOutputArchive {
 impl HttpToolOutputArchive {
     async fn record_failure(&self, tool: &str, cause: &str) {
         let mut labels = tool_labels(tool);
-        labels.insert("cause".to_string(), cause.to_string());
+        labels.insert(crate::LABEL_CAUSE.to_string(), cause.to_string());
         self.count(TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL, 1.0, labels)
             .await;
     }
@@ -483,11 +483,11 @@ mod tests {
             assert_eq!(recorded.len(), 1, "one attempt, one failure reading");
             assert_eq!(recorded[0].0, TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL);
             assert_eq!(
-                recorded[0].2.get("tool").map(String::as_str),
+                recorded[0].2.get(crate::LABEL_TOOL).map(String::as_str),
                 Some("run_command")
             );
             assert_eq!(
-                recorded[0].2.get("cause").map(String::as_str),
+                recorded[0].2.get(crate::LABEL_CAUSE).map(String::as_str),
                 Some(expected)
             );
         }
@@ -506,7 +506,7 @@ mod tests {
         assert!(c.calls.lock().unwrap().is_empty());
         let recorded = counters.0.lock().unwrap();
         assert_eq!(
-            recorded[0].2.get("cause").map(String::as_str),
+            recorded[0].2.get(crate::LABEL_CAUSE).map(String::as_str),
             Some(cause::UNCONFIGURED)
         );
     }
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(recorded[1].1, 4096.0, "字符量那一格加的是丢掉的字数");
         for (_, _, labels) in recorded.iter() {
             assert_eq!(
-                labels.get("tool").map(String::as_str),
+                labels.get(crate::LABEL_TOOL).map(String::as_str),
                 Some("run_command"),
                 "两格必须按同一个 tool 标签写，否则减不出落 Raw 比例"
             );
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].0, TOOL_OUTPUT_ARCHIVE_FAILED_TOTAL);
         assert_eq!(
-            recorded[0].2.get("cause").map(String::as_str),
+            recorded[0].2.get(crate::LABEL_CAUSE).map(String::as_str),
             Some(cause::UNKEYED)
         );
     }

@@ -41,8 +41,9 @@
 //! 实测（2026-10-27，全部 crate 的 `src/`）：733 个源文件、845 个短值声明；
 //! 连测试夹具一起读是 29 组同值异名，只看生产代码是 27 组。落地当天合并了
 //! 两组真重复（Secret 里那个 SSH 键、`cog-reflection` 的 `source` 标签），
-//! 其余 26 组逐条登记在 [`SAME_VALUE_DIFFERENT_THING`] 里。cog-agent 的 `state`
-//! 是后来把指标标签名收进常量时才出现的第 28 组：标签键与检查点键，同形不同事。
+//! 其余 27 组逐条登记在 [`SAME_VALUE_DIFFERENT_THING`] 里。cog-agent 的 `state`
+//! 与 `role` 是后来把指标标签名收进常量时才出现的第 28、29 组：标签键与检查点键，
+//! 同形不同事。
 //!
 //! 消融（真树）：往 `crates/cog-storage/src/` 放一个只写着
 //! `const ABLATION_PROBE: &str = "consumed";` 的文件——红，点名 cog-storage 与
@@ -61,6 +62,13 @@ use common::rust_production::production_text;
 /// 每一条写的是「为什么它们同形却不是一件事」。没有写进这里的重复一律当缺陷：
 /// 要么合并，要么在这里说明理由。
 const SAME_VALUE_DIFFERENT_THING: &[(&str, &str, &str)] = &[
+    (
+        "cog-agent",
+        "role",
+        "指标上的 `role` 标签与检查点 JSON 里的 `role` 键是两个通道：前者是别人\
+         按它选读数的一格，后者是重启后读回自己以哪个角色在跑。合并会让改一个\
+         指标标签去动检查点格式",
+    ),
     (
         "cog-agent",
         "state",

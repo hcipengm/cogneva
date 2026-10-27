@@ -414,8 +414,8 @@ pub struct LokiPushClient {
 impl LokiPushClient {
     pub fn new(endpoint: impl Into<String>) -> Self {
         let mut base_labels = HashMap::new();
-        base_labels.insert("job".into(), "cogneva".into());
-        base_labels.insert("service".into(), "cogneva".into());
+        base_labels.insert(crate::LABEL_JOB.into(), "cogneva".into());
+        base_labels.insert(crate::LABEL_SERVICE.into(), "cogneva".into());
         Self {
             endpoint: endpoint.into(),
             base_labels,
@@ -516,20 +516,20 @@ impl LokiPushClient {
             let level = entry.level.clone();
             let mut labels: BTreeMap<String, String> = BTreeMap::new();
             labels.insert(
-                "job".into(),
+                crate::LABEL_JOB.into(),
                 self.base_labels
-                    .get("job")
+                    .get(crate::LABEL_JOB)
                     .cloned()
                     .unwrap_or_else(|| "cogneva".to_string()),
             );
             labels.insert(
-                "service".into(),
+                crate::LABEL_SERVICE.into(),
                 self.base_labels
-                    .get("service")
+                    .get(crate::LABEL_SERVICE)
                     .cloned()
                     .unwrap_or_else(|| "cogneva".to_string()),
             );
-            labels.insert("level".into(), level.clone());
+            labels.insert(crate::LABEL_LEVEL.into(), level.clone());
             let timestamp_ns = format!("{}", entry.timestamp.timestamp_nanos_opt().unwrap_or(0));
             let mut line = format!(
                 "[{}] {} {}",
@@ -747,7 +747,8 @@ mod tests {
     /// （`map[level:…]` 形式的 `"stream"` 会 400 `Value looks like object`）。
     #[test]
     fn payload_stream_is_object_not_label_literal() {
-        let client = LokiPushClient::new("http://loki:3100").with_label("service", "probe");
+        let client =
+            LokiPushClient::new("http://loki:3100").with_label(crate::LABEL_SERVICE, "probe");
         let payload = client.build_payload(vec![entry("info", "hello")]);
 
         let streams = payload
@@ -761,11 +762,17 @@ mod tests {
             "stream must be a JSON object, got {stream}"
         );
         assert_eq!(
-            stream.get("service").and_then(|v| v.as_str()),
+            stream.get(crate::LABEL_SERVICE).and_then(|v| v.as_str()),
             Some("probe")
         );
-        assert_eq!(stream.get("level").and_then(|v| v.as_str()), Some("info"));
-        assert_eq!(stream.get("job").and_then(|v| v.as_str()), Some("cogneva"));
+        assert_eq!(
+            stream.get(crate::LABEL_LEVEL).and_then(|v| v.as_str()),
+            Some("info")
+        );
+        assert_eq!(
+            stream.get(crate::LABEL_JOB).and_then(|v| v.as_str()),
+            Some("cogneva")
+        );
 
         let values = streams[0]
             .get("values")
@@ -778,7 +785,8 @@ mod tests {
     /// 同一标签集合并成一条流，级别不同则分属不同流。
     #[test]
     fn payload_groups_entries_by_label_set() {
-        let client = LokiPushClient::new("http://loki:3100").with_label("service", "probe");
+        let client =
+            LokiPushClient::new("http://loki:3100").with_label(crate::LABEL_SERVICE, "probe");
         let payload = client.build_payload(vec![
             entry("info", "a"),
             entry("info", "b"),
@@ -793,7 +801,8 @@ mod tests {
     /// 它失败了，看不见是谁、为什么。
     #[test]
     fn payload_line_carries_the_events_fields() {
-        let client = LokiPushClient::new("http://loki:3100").with_label("service", "probe");
+        let client =
+            LokiPushClient::new("http://loki:3100").with_label(crate::LABEL_SERVICE, "probe");
         let mut with_fields = entry("warn", "LLM 上游探测仍失败，指数加窗");
         with_fields
             .context

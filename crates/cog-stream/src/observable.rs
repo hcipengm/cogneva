@@ -82,19 +82,19 @@ impl Observable for StreamReadObservable {
         for ((stream, group), family) in self.health.families(now) {
             out.push(
                 RawMetric::new(READ_LOOPS_METRIC, family.loops as f64)
-                    .with_label("stream", stream.as_str())
-                    .with_label("consumer_group", group.as_str()),
+                    .with_label(crate::LABEL_STREAM, stream.as_str())
+                    .with_label(crate::LABEL_CONSUMER_GROUP, group.as_str()),
             );
             out.push(
                 RawMetric::new(READ_SILENT_SECONDS_METRIC, family.silent_seconds as f64)
-                    .with_label("stream", stream.as_str())
-                    .with_label("consumer_group", group.as_str()),
+                    .with_label(crate::LABEL_STREAM, stream.as_str())
+                    .with_label(crate::LABEL_CONSUMER_GROUP, group.as_str()),
             );
             for refusal in ReadRefusal::ALL {
                 out.push(
                     RawMetric::new(READ_FAILURES_METRIC, family.failures_of(refusal) as f64)
-                        .with_label("stream", stream.as_str())
-                        .with_label("consumer_group", group.as_str())
+                        .with_label(crate::LABEL_STREAM, stream.as_str())
+                        .with_label(crate::LABEL_CONSUMER_GROUP, group.as_str())
                         .with_label(READ_FAILURE_REASON_LABEL, refusal.label()),
                 );
             }
@@ -247,7 +247,11 @@ mod tests {
                 })
                 .unwrap_or_else(|| panic!("no series under {}: {failures:?}", refusal.label()));
             assert!(
-                series.labels.get("consumer_group").map(String::as_str) == Some("worker"),
+                series
+                    .labels
+                    .get(crate::LABEL_CONSUMER_GROUP)
+                    .map(String::as_str)
+                    == Some("worker"),
                 "the cause is a second dimension, not a replacement for the \
                  consumer: {series:?}"
             );

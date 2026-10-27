@@ -2530,7 +2530,7 @@ mod tests {
             .unwrap();
         assert!(
             metrics.iter().any(|m| m.name == "ralph_failure_route_total"
-                && m.labels.get("route").map(String::as_str) == Some("degenerate_loop")
+                && m.labels.get(crate::LABEL_ROUTE).map(String::as_str) == Some("degenerate_loop")
                 && m.value > 0.0),
             "the route must be readable as ralph_failure_route_total{{route=\"degenerate_loop\"}}"
         );

@@ -2808,8 +2808,8 @@ impl MainlineDeployer {
             return;
         };
         let mut labels = std::collections::HashMap::new();
-        labels.insert("verb".to_string(), verb.to_string());
-        labels.insert("resource".to_string(), resource.to_string());
+        labels.insert(crate::LABEL_VERB.to_string(), verb.to_string());
+        labels.insert(crate::LABEL_RESOURCE.to_string(), resource.to_string());
         let _ = metrics
             .record_counter(
                 cog_core::metric_names::MAINLINE_KUBECTL_REFUSED_TOTAL,
@@ -2857,7 +2857,7 @@ impl MainlineDeployer {
             return;
         };
         let mut labels = std::collections::HashMap::new();
-        labels.insert("resource".to_string(), dimension.to_string());
+        labels.insert(crate::LABEL_RESOURCE.to_string(), dimension.to_string());
         let _ = metrics
             .record_counter(
                 cog_core::metric_names::MAINLINE_ADMISSION_HELD_TOTAL,
@@ -3101,7 +3101,7 @@ impl MainlineDeployer {
                 Verdict::Unreadable(_) => "unreadable",
             };
             labels.clear();
-            labels.insert("clause".to_string(), clause.as_str().to_string());
+            labels.insert(crate::LABEL_CLAUSE.to_string(), clause.as_str().to_string());
             let _ = metrics
                 .record_gauge(VERSION_CONTRACT_VIOLATIONS, count as f64, labels.clone())
                 .await;
@@ -3112,14 +3112,14 @@ impl MainlineDeployer {
         }
         if let Some((tag, distance)) = &readings.nearest_release {
             let mut labels = std::collections::HashMap::new();
-            labels.insert("release".to_string(), tag.clone());
+            labels.insert(crate::LABEL_RELEASE.to_string(), tag.clone());
             let _ = metrics
                 .record_gauge(VERSION_COMMITS_SINCE_RELEASE, *distance as f64, labels)
                 .await;
         }
         if let Some(declared) = &readings.declared {
             let mut labels = std::collections::HashMap::new();
-            labels.insert("version".to_string(), declared.clone());
+            labels.insert(crate::LABEL_VERSION.to_string(), declared.clone());
             let _ = metrics
                 .record_gauge(VERSION_DECLARED_INFO, 1.0, labels)
                 .await;
@@ -4097,7 +4097,7 @@ impl MainlineDeployer {
         };
         let mut labels = std::collections::HashMap::new();
         labels.insert(
-            "verdict".to_string(),
+            crate::LABEL_VERDICT.to_string(),
             match verdict {
                 Some(true) => "pass",
                 Some(false) => "fail",
@@ -4130,8 +4130,8 @@ impl MainlineDeployer {
             return;
         };
         let mut labels = std::collections::HashMap::new();
-        labels.insert("platform".to_string(), platform.to_string());
-        labels.insert("workflow".to_string(), workflow.to_string());
+        labels.insert(crate::LABEL_PLATFORM.to_string(), platform.to_string());
+        labels.insert(crate::LABEL_WORKFLOW.to_string(), workflow.to_string());
         let _ = metrics
             .record_counter(
                 cog_core::metric_names::MAINLINE_CI_CHECK_EXCLUDED_TOTAL,
@@ -4182,7 +4182,7 @@ impl MainlineDeployer {
         };
         for (platform, reason) in reasons {
             let mut labels = std::collections::HashMap::new();
-            labels.insert("platform".to_string(), (*platform).to_string());
+            labels.insert(crate::LABEL_PLATFORM.to_string(), (*platform).to_string());
             labels.insert(crate::LABEL_REASON.to_string(), reason.label().to_string());
             let _ = metrics
                 .record_counter(
@@ -6429,8 +6429,11 @@ impl MainlineDeployer {
             return;
         };
         let mut labels = std::collections::HashMap::new();
-        labels.insert("verb".to_string(), verb.to_string());
-        labels.insert("resource".to_string(), rbac_target(group, resource));
+        labels.insert(crate::LABEL_VERB.to_string(), verb.to_string());
+        labels.insert(
+            crate::LABEL_RESOURCE.to_string(),
+            rbac_target(group, resource),
+        );
         let _ = metrics
             .record_counter(
                 cog_core::metric_names::MAINLINE_PREFLIGHT_REFUSED_TOTAL,
@@ -13864,7 +13867,7 @@ exit 0
         let sample = counters
             .iter()
             .find(|s| {
-                s.labels.get("reason").map(String::as_str)
+                s.labels.get(crate::LABEL_REASON).map(String::as_str)
                     == Some(REVS_SKIPPED_SUPERSEDED_BEFORE_TICK)
             })
             .unwrap_or_else(|| panic!("没有 skipped 的计数：{counters:?}"));
@@ -13990,7 +13993,7 @@ exec {real} "$@"
         let sample = counters
             .iter()
             .find(|s| {
-                s.labels.get("reason").map(String::as_str)
+                s.labels.get(crate::LABEL_REASON).map(String::as_str)
                     == Some(REVS_SKIPPED_SUPERSEDED_BEFORE_TICK)
             })
             .unwrap_or_else(|| panic!("重试那一拍没有数出来：{counters:?}"));
@@ -15120,7 +15123,7 @@ exec {real} "$@"
             .unwrap();
         let value = |want: &str| {
             rows.iter()
-                .find(|r| r.labels.get("verdict").map(String::as_str) == Some(want))
+                .find(|r| r.labels.get(crate::LABEL_VERDICT).map(String::as_str) == Some(want))
                 .map(|r| r.value)
         };
         assert_eq!(value("pass"), Some(1.0), "{rows:?}");
@@ -15148,7 +15151,7 @@ exec {real} "$@"
             "有结论的轮不该产生原因行，没有结论的轮必须产生一行: {rows:?}"
         );
         assert_eq!(
-            rows[0].labels.get("reason").map(String::as_str),
+            rows[0].labels.get(crate::LABEL_REASON).map(String::as_str),
             Some("connect_failed"),
             "连不上这一支的主人在这条路上，不能被记成「上游还没跑完」: {rows:?}"
         );
@@ -15283,8 +15286,8 @@ exec {real} "$@"
         let count = |platform: &str, want: &str| -> f64 {
             rows.iter()
                 .filter(|r| {
-                    r.labels.get("platform").map(String::as_str) == Some(platform)
-                        && r.labels.get("reason").map(String::as_str) == Some(want)
+                    r.labels.get(crate::LABEL_PLATFORM).map(String::as_str) == Some(platform)
+                        && r.labels.get(crate::LABEL_REASON).map(String::as_str) == Some(want)
                 })
                 .map(|r| r.value)
                 .sum()
@@ -15301,10 +15304,10 @@ exec {real} "$@"
         assert_eq!(count("gitee", "connect_failed"), 1.0, "{rows:?}");
         let gitee: Vec<&str> = rows
             .iter()
-            .filter(|r| r.labels.get("platform").map(String::as_str) == Some("gitee"))
+            .filter(|r| r.labels.get(crate::LABEL_PLATFORM).map(String::as_str) == Some("gitee"))
             .map(|r| {
                 r.labels
-                    .get("reason")
+                    .get(crate::LABEL_REASON)
                     .map(String::as_str)
                     .unwrap_or("<没有 reason>")
             })
@@ -15317,7 +15320,8 @@ exec {real} "$@"
         // 兜底那一次读的 404 不许改写原因，否则主人就跟着最后一次失败跑了。
         assert!(
             rows.iter()
-                .all(|r| r.labels.get("reason").map(String::as_str) != Some("http_not_found")),
+                .all(|r| r.labels.get(crate::LABEL_REASON).map(String::as_str)
+                    != Some("http_not_found")),
             "{rows:?}"
         );
         // 七个 reason 各一行，加并行那一轮多出来的第二个平台，共八行。
@@ -15335,7 +15339,7 @@ exec {real} "$@"
             .unwrap();
         let no_evidence = verdict_rows
             .iter()
-            .find(|r| r.labels.get("verdict").map(String::as_str) == Some("no_evidence"))
+            .find(|r| r.labels.get(crate::LABEL_VERDICT).map(String::as_str) == Some("no_evidence"))
             .map(|r| r.value);
         assert_eq!(no_evidence, Some(7.0), "{verdict_rows:?}");
         let reason_total: f64 = rows.iter().map(|r| r.value).sum();
@@ -23604,7 +23608,9 @@ exit 0
         for (clause, value) in expected {
             let sample = gauges
                 .iter()
-                .find(|s| s.labels.get("clause").map(String::as_str) == Some(clause.as_str()))
+                .find(|s| {
+                    s.labels.get(crate::LABEL_CLAUSE).map(String::as_str) == Some(clause.as_str())
+                })
                 .unwrap_or_else(|| panic!("no violations reading for {}", clause.as_str()));
             assert_eq!(sample.value, value, "{}", clause.as_str());
         }
@@ -23617,7 +23623,7 @@ exit 0
         let outcome = |clause: &str| {
             counters
                 .iter()
-                .find(|s| s.labels.get("clause").map(String::as_str) == Some(clause))
+                .find(|s| s.labels.get(crate::LABEL_CLAUSE).map(String::as_str) == Some(clause))
                 .unwrap_or_else(|| panic!("no checks reading for {clause}"))
         };
         for (clause, expected_outcome) in [
@@ -23645,7 +23651,10 @@ exit 0
             .unwrap();
         assert_eq!(gauges.len(), 1);
         assert_eq!(
-            gauges[0].labels.get("release").map(String::as_str),
+            gauges[0]
+                .labels
+                .get(crate::LABEL_RELEASE)
+                .map(String::as_str),
             Some("v0.5.8")
         );
         assert_eq!(gauges[0].value, 0.0);
@@ -23656,7 +23665,10 @@ exit 0
             .unwrap();
         assert_eq!(declared.len(), 1);
         assert_eq!(
-            declared[0].labels.get("version").map(String::as_str),
+            declared[0]
+                .labels
+                .get(crate::LABEL_VERSION)
+                .map(String::as_str),
             Some("0.5.8")
         );
         assert_eq!(declared[0].value, 1.0);

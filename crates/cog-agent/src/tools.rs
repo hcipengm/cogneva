@@ -1157,7 +1157,7 @@ mod tests {
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].0, TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL);
         assert_eq!(
-            recorded[0].1.get("tool").map(String::as_str),
+            recorded[0].1.get(crate::LABEL_TOOL).map(String::as_str),
             Some("raw_fetch")
         );
     }
@@ -2542,7 +2542,7 @@ pub mod builtins {
                         // bounded read is visible outside the tool result.
                         if let Some(metrics) = metrics.as_ref() {
                             let mut labels = HashMap::new();
-                            labels.insert("tool".to_string(), "raw_fetch".to_string());
+                            labels.insert(crate::LABEL_TOOL.to_string(), "raw_fetch".to_string());
                             if let Err(e) = metrics
                                 .record_counter(
                                     TOOL_OUTPUT_FETCH_BUDGET_EXHAUSTED_TOTAL,

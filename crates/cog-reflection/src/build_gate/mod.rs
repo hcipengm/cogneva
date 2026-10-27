@@ -1103,7 +1103,7 @@ fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetr
             crate::evolution_queue_readings::DIR_LABEL,
             origin.dir.to_string(),
         )
-        .with_label("role", origin.role.to_string())
+        .with_label(crate::LABEL_ROLE, origin.role.to_string())
     };
     let mut out = vec![
         label(RawMetric::new(HOST_CPU_BUSY_CORES, reading.busy_cores)),
@@ -1124,7 +1124,7 @@ fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetr
     ] {
         out.push(
             label(RawMetric::new(HOST_PRESSURE_AVG60, value))
-                .with_label("resource", resource.to_string()),
+                .with_label(crate::LABEL_RESOURCE, resource.to_string()),
         );
     }
     if let Some(free) = reading.disk_free_bytes {
@@ -1139,7 +1139,7 @@ fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetr
                 BUILD_GATE_DIMENSION_CEILING,
                 factor.floor().max(1.0),
             ))
-            .with_label("dimension", dimension.to_string()),
+            .with_label(crate::LABEL_DIMENSION, dimension.to_string()),
         );
     }
     out
@@ -1162,12 +1162,12 @@ fn readings(
             crate::evolution_queue_readings::DIR_LABEL,
             origin.dir.to_string(),
         )
-        .with_label("role", origin.role.to_string())
+        .with_label(crate::LABEL_ROLE, origin.role.to_string())
     };
     let mut out = vec![
         label(RawMetric::new(BUILD_GATE_SLOTS, slots as f64)),
         label(RawMetric::new(BUILD_GATE_CEILING, ceiling as f64))
-            .with_label("dimension", dimension.to_string()),
+            .with_label(crate::LABEL_DIMENSION, dimension.to_string()),
         label(RawMetric::new(BUILD_GATE_OCCUPIED, occupied as f64)),
         label(RawMetric::new(BUILD_GATE_IN_FLIGHT, c.in_flight as f64)),
         label(RawMetric::new(BUILD_GATE_EXCLUDED, c.excluded as f64)),
@@ -1187,7 +1187,7 @@ fn readings(
                     c.refused[asker][wall.index()] as f64,
                 ))
                 .with_label(crate::LABEL_REASON, wall.as_str().to_string())
-                .with_label("asker", asker_label(asker).to_string()),
+                .with_label(crate::LABEL_ASKER, asker_label(asker).to_string()),
             );
         }
     }
@@ -1201,7 +1201,7 @@ fn readings(
                 BUILD_GATE_RESERVATION_LAPSED_TOTAL,
                 c.lapsed[asker] as f64,
             ))
-            .with_label("asker", asker_label(asker).to_string()),
+            .with_label(crate::LABEL_ASKER, asker_label(asker).to_string()),
         );
     }
     // The same closed set again: a work that never rewrote a claim it held has
@@ -1215,7 +1215,7 @@ fn readings(
                 BUILD_GATE_RESERVATION_RENEW_GAP_SECONDS,
                 c.renew_gap_seconds[asker] as f64,
             ))
-            .with_label("asker", asker_label(asker).to_string()),
+            .with_label(crate::LABEL_ASKER, asker_label(asker).to_string()),
         );
     }
     // The walk's two endings, on the same closed set: every cell and every
@@ -1230,7 +1230,7 @@ fn readings(
                     BUILD_GATE_WALK_YIELD_TOTAL,
                     c.walk_yield[asker][outcome.index()] as f64,
                 ))
-                .with_label("asker", asker_label(asker).to_string())
+                .with_label(crate::LABEL_ASKER, asker_label(asker).to_string())
                 .with_label(crate::LABEL_OUTCOME, outcome.as_str().to_string()),
             );
         }
@@ -2975,9 +2975,9 @@ fn holder_metrics(dir: &Path, slots: usize, origin: &Origin<'_>) -> Vec<RawMetri
                     crate::evolution_queue_readings::DIR_LABEL,
                     origin.dir.to_string(),
                 )
-                .with_label("role", origin.role.to_string())
-                .with_label("slot", slot.to_string())
-                .with_label("what", holder.what)
+                .with_label(crate::LABEL_ROLE, origin.role.to_string())
+                .with_label(crate::LABEL_SLOT, slot.to_string())
+                .with_label(crate::LABEL_WHAT, holder.what)
         })
         .collect()
 }
@@ -3889,7 +3889,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == BUILD_GATE_WALK_YIELD_TOTAL
-                        && m.labels.get("asker").map(String::as_str) == Some(asker)
+                        && m.labels.get(crate::LABEL_ASKER).map(String::as_str) == Some(asker)
                         && m.labels.get(crate::LABEL_OUTCOME).map(String::as_str) == Some(outcome)
                 })
                 .map(|m| m.value)
@@ -4019,12 +4019,12 @@ mod tests {
             .find(|m| m.name == BUILD_GATE_HOLDER_SECONDS)
             .expect("a taken slot is a hold, and a hold names its holder");
         assert_eq!(
-            row.labels.get("what").map(String::as_str),
+            row.labels.get(crate::LABEL_WHAT).map(String::as_str),
             Some("change verification"),
             "the holder's own words, not a label from a closed set"
         );
         assert_eq!(
-            row.labels.get("slot").map(String::as_str),
+            row.labels.get(crate::LABEL_SLOT).map(String::as_str),
             Some("0"),
             "which slot the hold is on"
         );
@@ -4791,7 +4791,7 @@ unevictable 28532736
         let ceiling = value(BUILD_GATE_CEILING).value as usize;
         let dimension = value(BUILD_GATE_CEILING)
             .labels
-            .get("dimension")
+            .get(crate::LABEL_DIMENSION)
             .cloned()
             .unwrap_or_default();
 
@@ -5858,8 +5858,8 @@ unevictable 28532736
             .iter()
             .filter(|m| m.name == BUILD_GATE_REFUSED_TOTAL)
             .filter_map(|m| {
-                let reason = m.labels.get("reason")?.as_str();
-                let asker = m.labels.get("asker")?.as_str();
+                let reason = m.labels.get(crate::LABEL_REASON)?.as_str();
+                let asker = m.labels.get(crate::LABEL_ASKER)?.as_str();
                 Some((reason, asker))
             })
             .collect();
@@ -5923,7 +5923,7 @@ unevictable 28532736
                 .iter()
                 .find(|m| {
                     m.name == BUILD_GATE_REFUSED_TOTAL
-                        && m.labels.get("asker").map(String::as_str) == Some(asker)
+                        && m.labels.get(crate::LABEL_ASKER).map(String::as_str) == Some(asker)
                 })
                 .map(|m| m.value)
         };
@@ -5956,7 +5956,7 @@ unevictable 28532736
                 metric.name
             );
             assert_eq!(
-                metric.labels.get("role").map(String::as_str),
+                metric.labels.get(crate::LABEL_ROLE).map(String::as_str),
                 Some(BUILD_GATE_ROLE_BUILDER),
                 "{} is not attributed to the role that published it",
                 metric.name
@@ -5970,7 +5970,7 @@ unevictable 28532736
                 metric.name
             );
             assert_eq!(
-                metric.labels.get("role").map(String::as_str),
+                metric.labels.get(crate::LABEL_ROLE).map(String::as_str),
                 Some(BUILD_GATE_ROLE_CONTROL_PLANE),
                 "{} must not read as a builder's row",
                 metric.name

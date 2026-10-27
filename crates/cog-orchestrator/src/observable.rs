@@ -266,42 +266,42 @@ impl Observable for StreamPendingObservable {
             }
             out.push(
                 RawMetric::new(STREAM_PENDING_COUNT_METRIC, state.count as f64)
-                    .with_label("stream", stream.as_str()),
+                    .with_label(crate::LABEL_STREAM, stream.as_str()),
             );
             out.push(
                 RawMetric::new(
                     STREAM_PENDING_UNRECLAIMED_METRIC,
                     state.unreclaimed_count as f64,
                 )
-                .with_label("stream", stream.as_str()),
+                .with_label(crate::LABEL_STREAM, stream.as_str()),
             );
             out.push(
                 RawMetric::new(
                     STREAM_PENDING_UNRECLAIMED_AGE_METRIC,
                     state.unreclaimed_oldest_idle_ms as f64 / 1000.0,
                 )
-                .with_label("stream", stream.as_str()),
+                .with_label(crate::LABEL_STREAM, stream.as_str()),
             );
             out.push(
                 RawMetric::new(
                     STREAM_PENDING_CLAIM_IDLE_METRIC,
                     state.claim_idle_ms as f64 / 1000.0,
                 )
-                .with_label("stream", stream.as_str()),
+                .with_label(crate::LABEL_STREAM, stream.as_str()),
             );
             out.push(
                 RawMetric::new(
                     STREAM_PENDING_MEASURE_INTERVAL_METRIC,
                     state.measure_interval_secs as f64,
                 )
-                .with_label("stream", stream.as_str()),
+                .with_label(crate::LABEL_STREAM, stream.as_str()),
             );
             out.push(
                 RawMetric::new(
                     STREAM_PENDING_MEASURE_LAST_METRIC,
                     state.last_measure_seconds as f64,
                 )
-                .with_label("stream", stream.as_str()),
+                .with_label(crate::LABEL_STREAM, stream.as_str()),
             );
             if state.measure_failures > 0 {
                 out.push(
@@ -309,7 +309,7 @@ impl Observable for StreamPendingObservable {
                         STREAM_PENDING_MEASURE_FAILURES_METRIC,
                         state.measure_failures as f64,
                     )
-                    .with_label("stream", stream.as_str()),
+                    .with_label(crate::LABEL_STREAM, stream.as_str()),
                 );
             }
         }
@@ -538,7 +538,9 @@ impl Observable for ClaimSlotsObservable {
                     state.hold_bound_seconds() as f64,
                 ),
             ] {
-                out.push(RawMetric::new(name, value).with_label("stream", stream.as_str()));
+                out.push(
+                    RawMetric::new(name, value).with_label(crate::LABEL_STREAM, stream.as_str()),
+                );
             }
         }
         Ok(out)
@@ -746,7 +748,7 @@ impl TaskGraphObservable {
             for (status, count) in counts {
                 out.push(
                     RawMetric::new(TASKS_CURRENT_METRIC, *count as f64)
-                        .with_label("status", *status),
+                        .with_label(crate::LABEL_STATUS, *status),
                 );
             }
             let rows: f64 = counts.iter().map(|(_, count)| *count as f64).sum();
@@ -757,7 +759,7 @@ impl TaskGraphObservable {
             for (agent, age) in &snapshot.oldest_by_agent {
                 out.push(
                     RawMetric::new(TASK_OLDEST_UNTOUCHED_METRIC, *age)
-                        .with_label("agent", agent.as_str()),
+                        .with_label(crate::LABEL_AGENT, agent.as_str()),
                 );
             }
             // Published per movable state even at zero: "no unowned work" and
@@ -766,7 +768,7 @@ impl TaskGraphObservable {
             for (status, count) in &snapshot.unowned_by_status {
                 out.push(
                     RawMetric::new(TASK_UNOWNED_ROWS_METRIC, *count as f64)
-                        .with_label("status", *status),
+                        .with_label(crate::LABEL_STATUS, *status),
                 );
             }
             out.push(RawMetric::new(
@@ -956,7 +958,10 @@ mod tests {
             STREAM_PENDING_MEASURE_LAST_METRIC,
         ] {
             let m = metric(&metrics, name).unwrap_or_else(|| panic!("{name} missing"));
-            assert_eq!(m.labels.get("stream").map(String::as_str), Some(STREAM));
+            assert_eq!(
+                m.labels.get(crate::LABEL_STREAM).map(String::as_str),
+                Some(STREAM)
+            );
         }
         assert_eq!(
             metric(&metrics, STREAM_PENDING_COUNT_METRIC).unwrap().value,
@@ -1162,7 +1167,10 @@ mod tests {
             TASK_ROUTER_CLAIM_HOLD_BOUND_SECONDS_METRIC,
         ] {
             let m = metric(&metrics, name).unwrap_or_else(|| panic!("{name} missing"));
-            assert_eq!(m.labels.get("stream").map(String::as_str), Some(STREAM));
+            assert_eq!(
+                m.labels.get(crate::LABEL_STREAM).map(String::as_str),
+                Some(STREAM)
+            );
         }
         assert_eq!(
             metric(&metrics, TASK_ROUTER_CLAIM_SLOTS_METRIC)
@@ -1466,7 +1474,7 @@ mod tests {
         assert!(
             metrics.iter().all(|m| m.name != TASK_UNOWNED_ROWS_METRIC
                 || matches!(
-                    m.labels.get("status").map(String::as_str),
+                    m.labels.get(crate::LABEL_STATUS).map(String::as_str),
                     Some("pending" | "scheduled" | "running")
                 )),
             "terminal states have no unowned bucket: those rows will not be picked up"

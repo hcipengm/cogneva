@@ -52,6 +52,42 @@ pub const LABEL_REASON: &str = "reason";
 /// 读数按「这一格处在哪个状态」归属时用的标签键。
 pub const LABEL_STATE: &str = "state";
 
+/// 读数按「哪条流」归属时用的标签键。
+pub const LABEL_STREAM: &str = "stream";
+
+/// 读数按「哪种结局」归属时用的标签键。
+pub const LABEL_STATUS: &str = "status";
+
+/// 读数按「哪个面」归属时用的标签键。
+pub const LABEL_FACE: &str = "face";
+
+/// 读数按「最初那一路输入」归属时用的标签键。
+pub const LABEL_ORIGINAL_INPUT: &str = "original_input";
+
+/// 读数按「哪个 agent」归属时用的标签键。
+pub const LABEL_AGENT: &str = "agent";
+
+/// 读数带上「为什么是这个结局」时用的标签键。
+pub const LABEL_CAUSE: &str = "cause";
+
+/// 读数按「哪个决定」归属时用的标签键。
+pub const LABEL_DECISION: &str = "decision";
+
+/// 读数按「哪一行池子读数」归属时用的标签键。
+pub const LABEL_POOL_READING: &str = "pool_reading";
+
+/// 读数按「哪一块」归属时用的标签键。
+pub const LABEL_BLOCK: &str = "block";
+
+/// 读数按「哪个项目」归属时用的标签键。
+pub const LABEL_PROJECT: &str = "project";
+
+/// 读数按「哪一列」归属时用的标签键。
+pub const LABEL_COLUMN: &str = "column";
+
+/// 读数按「这一格的结果」归属时用的标签键。
+pub const LABEL_RESULT: &str = "result";
+
 pub use action_planner::ActionPlanOrchestrator;
 pub use dag_executor::task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 pub use dag_executor::{

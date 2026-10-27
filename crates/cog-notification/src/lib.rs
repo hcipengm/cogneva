@@ -10,6 +10,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+/// 读数按「从哪个出口」归属时用的标签键。
+pub const LABEL_OUTLET: &str = "outlet";
+
+/// 读数按「投递结局」归属时用的标签键。
+pub const LABEL_RESULT: &str = "result";
+
 pub mod delivery;
 pub mod sign;
 

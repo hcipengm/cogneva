@@ -575,14 +575,14 @@ impl Observable for AgentObservable {
                     "agent_iteration_budget_exhausted",
                     calibration.exhausted_runs as f64,
                 )
-                .with_label("role", role),
+                .with_label(crate::LABEL_ROLE, role),
             );
             metrics.push(
                 RawMetric::new(
                     "agent_iteration_budget_exhausted_no_deliverable",
                     calibration.exhausted_no_deliverable_runs as f64,
                 )
-                .with_label("role", role),
+                .with_label(crate::LABEL_ROLE, role),
             );
             // A sibling series, not a label on either of the two above: those
             // count runs that needed more turns, this one counts runs a rule
@@ -593,7 +593,7 @@ impl Observable for AgentObservable {
                     "agent_guardrail_refused_runs",
                     calibration.refused_runs as f64,
                 )
-                .with_label("role", role),
+                .with_label(crate::LABEL_ROLE, role),
             );
         }
 
@@ -636,8 +636,8 @@ impl Observable for AgentObservable {
                     .unwrap_or((0, f64::NAN));
                 metrics.push(
                     RawMetric::new("agent_roster", count as f64)
-                        .with_label("role", role)
-                        .with_label("lifetime", lifetime),
+                        .with_label(crate::LABEL_ROLE, role)
+                        .with_label(crate::LABEL_LIFETIME, lifetime),
                 );
                 // Only while the role still holds something. An age with no
                 // object behind it would be a number left over from the last
@@ -647,8 +647,8 @@ impl Observable for AgentObservable {
                 if count > 0 {
                     metrics.push(
                         RawMetric::new("agent_roster_oldest_age_seconds", oldest_age)
-                            .with_label("role", role)
-                            .with_label("lifetime", lifetime),
+                            .with_label(crate::LABEL_ROLE, role)
+                            .with_label(crate::LABEL_LIFETIME, lifetime),
                     );
                 }
             }
@@ -666,8 +666,8 @@ impl Observable for AgentObservable {
             for ((role, task_scoped), count) in retired.iter() {
                 metrics.push(
                     RawMetric::new("agent_retired_total", *count as f64)
-                        .with_label("role", role)
-                        .with_label("lifetime", lifetime_label(*task_scoped)),
+                        .with_label(crate::LABEL_ROLE, role)
+                        .with_label(crate::LABEL_LIFETIME, lifetime_label(*task_scoped)),
                 );
             }
         }
@@ -679,8 +679,8 @@ impl Observable for AgentObservable {
             for ((role, task_scoped, was_busy), count) in timeouts.iter() {
                 metrics.push(
                     RawMetric::new("agent_retire_timeout_total", *count as f64)
-                        .with_label("role", role)
-                        .with_label("lifetime", lifetime_label(*task_scoped))
+                        .with_label(crate::LABEL_ROLE, role)
+                        .with_label(crate::LABEL_LIFETIME, lifetime_label(*task_scoped))
                         .with_label(crate::LABEL_STATE, if *was_busy { "busy" } else { "idle" }),
                 );
             }
@@ -840,12 +840,12 @@ mod tests {
             .iter()
             .find(|m| {
                 m.name == "agent_roster"
-                    && m.labels.get("role").map(String::as_str) == Some("planner")
+                    && m.labels.get(crate::LABEL_ROLE).map(String::as_str) == Some("planner")
             })
             .expect("the role is still reported after it emptied");
         assert_eq!(count.value, 0.0);
         assert_eq!(
-            count.labels.get("lifetime").map(String::as_str),
+            count.labels.get(crate::LABEL_LIFETIME).map(String::as_str),
             Some("task")
         );
         assert!(
@@ -874,9 +874,9 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "agent_roster"
-                        && m.labels.get("role").map(String::as_str) == Some(role)
+                        && m.labels.get(crate::LABEL_ROLE).map(String::as_str) == Some(role)
                 })
-                .and_then(|m| m.labels.get("lifetime").map(String::as_str))
+                .and_then(|m| m.labels.get(crate::LABEL_LIFETIME).map(String::as_str))
         };
         assert_eq!(lifetime_of("planner"), Some("task"));
         assert_eq!(lifetime_of("mode_selector"), Some("process"));
@@ -911,7 +911,7 @@ mod tests {
             .iter()
             .filter(|m| {
                 m.name == "agent_roster"
-                    && m.labels.get("role").map(String::as_str) == Some("planner")
+                    && m.labels.get(crate::LABEL_ROLE).map(String::as_str) == Some("planner")
             })
             .collect();
         assert_eq!(
@@ -921,7 +921,7 @@ mod tests {
         );
         let count = |lifetime: &str| {
             rows.iter()
-                .find(|m| m.labels.get("lifetime").map(String::as_str) == Some(lifetime))
+                .find(|m| m.labels.get(crate::LABEL_LIFETIME).map(String::as_str) == Some(lifetime))
                 .map(|m| m.value)
         };
         assert_eq!(
@@ -940,8 +940,8 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "agent_roster_oldest_age_seconds"
-                        && m.labels.get("role").map(String::as_str) == Some("planner")
-                        && m.labels.get("lifetime").map(String::as_str) == Some(lifetime)
+                        && m.labels.get(crate::LABEL_ROLE).map(String::as_str) == Some("planner")
+                        && m.labels.get(crate::LABEL_LIFETIME).map(String::as_str) == Some(lifetime)
                 })
                 .map(|m| m.value)
         };
@@ -983,10 +983,11 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == name
-                        && m.labels.get("role").map(String::as_str) == Some(role)
-                        && m.labels.get("lifetime").map(String::as_str) == Some(lifetime)
-                        && state.map(|s| m.labels.get("state").map(String::as_str) == Some(s))
-                            != Some(false)
+                        && m.labels.get(crate::LABEL_ROLE).map(String::as_str) == Some(role)
+                        && m.labels.get(crate::LABEL_LIFETIME).map(String::as_str) == Some(lifetime)
+                        && state.map(|s| {
+                            m.labels.get(crate::LABEL_STATE).map(String::as_str) == Some(s)
+                        }) != Some(false)
                 })
                 .map(|m| m.value)
         };
@@ -1174,7 +1175,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "agent_iteration_budget_exhausted"
-                        && m.labels.get("role").map(String::as_str) == Some(role)
+                        && m.labels.get(crate::LABEL_ROLE).map(String::as_str) == Some(role)
                 })
                 .map(|m| m.value)
                 .unwrap_or(-1.0)
@@ -1211,7 +1212,8 @@ mod tests {
             metrics
                 .iter()
                 .find(|m| {
-                    m.name == name && m.labels.get("role").map(String::as_str) == Some("generator")
+                    m.name == name
+                        && m.labels.get(crate::LABEL_ROLE).map(String::as_str) == Some("generator")
                 })
                 .map(|m| m.value)
                 .unwrap_or(-1.0)
@@ -1244,7 +1246,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "agent_guardrail_refused_runs"
-                        && m.labels.get("role").map(String::as_str) == Some(role)
+                        && m.labels.get(crate::LABEL_ROLE).map(String::as_str) == Some(role)
                 })
                 .map(|m| m.value)
                 .unwrap_or(-1.0)
@@ -1354,7 +1356,8 @@ mod tests {
         ] {
             for kind in INBOX_KINDS {
                 let found = metrics.iter().find(|m| {
-                    m.name == name && m.labels.get("kind").map(String::as_str) == Some(kind)
+                    m.name == name
+                        && m.labels.get(crate::LABEL_KIND).map(String::as_str) == Some(kind)
                 });
                 assert_eq!(found.map(|m| m.value), Some(0.0), "{name} kind={kind}");
             }
@@ -1362,7 +1365,7 @@ mod tests {
         for reason in INBOX_REFUSAL_REASONS {
             let found = metrics.iter().find(|m| {
                 m.name == "agent_inbox_refused_total"
-                    && m.labels.get("reason").map(String::as_str) == Some(reason)
+                    && m.labels.get(crate::LABEL_REASON).map(String::as_str) == Some(reason)
             });
             assert_eq!(found.map(|m| m.value), Some(0.0), "reason={reason}");
         }

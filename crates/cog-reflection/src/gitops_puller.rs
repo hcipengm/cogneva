@@ -2606,7 +2606,10 @@ mod tests {
         // 会在补面的同一笔里丢掉 gate。
         assert_eq!(labels.get("gate").and_then(|v| v.as_str()), Some("latency"));
         assert_eq!(labels.get("cluster").and_then(|v| v.as_str()), Some("prod"));
-        assert_eq!(labels.get("ticks").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(
+            labels.get(crate::LABEL_TICKS).and_then(|v| v.as_u64()),
+            Some(3)
+        );
     }
 
     /// 窗口求和语义下的错误率，就是改造前的「值本身相除」。

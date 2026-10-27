@@ -383,9 +383,9 @@ async fn record(
         return;
     };
     let mut labels = HashMap::new();
-    labels.insert("face".to_string(), face.to_string());
+    labels.insert(crate::LABEL_FACE.to_string(), face.to_string());
     if let Some(result) = result {
-        labels.insert("result".to_string(), result.to_string());
+        labels.insert(crate::LABEL_RESULT.to_string(), result.to_string());
     }
     if let Err(e) = metrics.record_counter(name, value, labels).await {
         warn!(error = %e, series = name.as_str(), "SOP dispatch: could not record");

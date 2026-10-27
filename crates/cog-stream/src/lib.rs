@@ -13,6 +13,15 @@ pub mod read_health;
 #[cfg(feature = "redis")]
 pub mod redis;
 
+/// 读数按「哪条流」归属时用的标签键。
+///
+/// 部署里的面板按它分组，代码在这里发射它；两处各拼一遍时，一处改名不会让
+/// 另一处报错，分组结果为空读起来与「这条流一直没动静」是同一个读数。
+pub const LABEL_STREAM: &str = "stream";
+
+/// 读数按「哪个消费组」归属时用的标签键。
+pub const LABEL_CONSUMER_GROUP: &str = "consumer_group";
+
 pub use observable::StreamReadObservable;
 pub use read_health::{ReadFamily, ReadGuard, ReadHealth, ReadRefusal};
 

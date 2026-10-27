@@ -221,12 +221,12 @@ impl Observable for HostLedgerObservable {
             readable += 1;
             out.push(
                 RawMetric::new(HOST_SLICE_ANON_BYTES_METRIC, anon)
-                    .with_label("slice", slice)
+                    .with_label(crate::LABEL_SLICE, slice)
                     .with_label(crate::LABEL_NODE, node),
             );
             out.push(
                 RawMetric::new(HOST_SLICE_FILE_BYTES_METRIC, file)
-                    .with_label("slice", slice)
+                    .with_label(crate::LABEL_SLICE, slice)
                     .with_label(crate::LABEL_NODE, node),
             );
         }
@@ -286,7 +286,13 @@ mod tests {
             .into_iter()
             .map(|m| {
                 (
-                    (m.name, m.labels.get("slice").cloned().unwrap_or_default()),
+                    (
+                        m.name,
+                        m.labels
+                            .get(crate::LABEL_SLICE)
+                            .cloned()
+                            .unwrap_or_default(),
+                    ),
                     m.value,
                 )
             })
@@ -429,7 +435,7 @@ mod tests {
         assert_eq!(readable.value, 0.0);
         for reading in &readings {
             assert_eq!(
-                reading.labels.get("node").map(String::as_str),
+                reading.labels.get(crate::LABEL_NODE).map(String::as_str),
                 Some(NODE),
                 "{} lost its node label",
                 reading.name
@@ -451,7 +457,7 @@ mod tests {
             .unwrap();
         for reading in &readings {
             assert_eq!(
-                reading.labels.get("node").map(String::as_str),
+                reading.labels.get(crate::LABEL_NODE).map(String::as_str),
                 Some(""),
                 "{} lost the node label when the name was unknown",
                 reading.name

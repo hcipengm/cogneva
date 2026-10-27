@@ -359,7 +359,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
         if let Some((ceiling, source)) = pg_pool_ceiling {
             for pool in ["users", "messages", "config", "explain"] {
                 let mut labels = std::collections::HashMap::new();
-                labels.insert("pool".to_string(), pool.to_string());
+                labels.insert(crate::LABEL_POOL.to_string(), pool.to_string());
                 labels.insert(crate::LABEL_SOURCE.to_string(), source.to_string());
                 if let Err(e) = metrics_backend
                     .record_gauge(

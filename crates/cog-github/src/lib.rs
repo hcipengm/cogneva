@@ -13,6 +13,15 @@
 
 #![deny(missing_docs)]
 
+/// 读数按「哪一类」归属时用的标签键。
+pub const LABEL_CATEGORY: &str = "category";
+
+/// 读数按「什么意图」归属时用的标签键。
+pub const LABEL_INTENT: &str = "intent";
+
+/// 读数按「这条需求走到哪儿了」归属时用的标签键。
+pub const LABEL_FATE: &str = "fate";
+
 pub mod change_funnel;
 pub mod ci_refusals;
 pub mod config;

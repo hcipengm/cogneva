@@ -644,7 +644,11 @@ mod tests {
             .into_iter()
             .map(|sample| {
                 (
-                    sample.labels.get("table").cloned().unwrap_or_default(),
+                    sample
+                        .labels
+                        .get(crate::LABEL_TABLE)
+                        .cloned()
+                        .unwrap_or_default(),
                     sample.value,
                 )
             })

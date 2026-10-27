@@ -373,7 +373,7 @@ impl Supervisor {
             return;
         };
         let mut labels = std::collections::HashMap::new();
-        labels.insert("pass".to_string(), pass.as_cell().to_string());
+        labels.insert(crate::LABEL_PASS.to_string(), pass.as_cell().to_string());
         labels.insert(
             crate::LABEL_OUTCOME.to_string(),
             if ok { "ok" } else { "failed" }.to_string(),

@@ -3090,7 +3090,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|s| s.labels.get("category").map(String::as_str) == Some(category))
+            .find(|s| s.labels.get(crate::LABEL_CATEGORY).map(String::as_str) == Some(category))
             .map(|s| s.value)
             .unwrap_or(0.0)
     }
@@ -3170,8 +3170,8 @@ mod tests {
             .unwrap()
             .into_iter()
             .find(|s| {
-                s.labels.get("intent").map(String::as_str) == Some("ci_fix")
-                    && s.labels.get("fate").map(String::as_str) == Some("landed")
+                s.labels.get(crate::LABEL_INTENT).map(String::as_str) == Some("ci_fix")
+                    && s.labels.get(crate::LABEL_FATE).map(String::as_str) == Some("landed")
             })
             .expect("the landed class is seeded and carries its count");
         assert_eq!(landed.value, 1.0);

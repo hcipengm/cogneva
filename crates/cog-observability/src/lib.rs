@@ -42,6 +42,97 @@ pub const LABEL_NODE: &str = "node";
 /// 读数带上「为什么是这个值」时用的标签键。
 pub const LABEL_REASON: &str = "reason";
 
+/// 读数带上「这一格说的是什么」时用的标签键。
+pub const LABEL_MESSAGE: &str = "message";
+
+/// 读数按「哪个下游服务」归属时用的标签键。
+pub const LABEL_SERVICE: &str = "service";
+
+/// 读数按「哪个 agent」归属时用的标签键。
+pub const LABEL_AGENT_ID: &str = "agent_id";
+
+/// 读数按「哪一类告警」归属时用的标签键。
+pub const LABEL_ALERT_TYPE: &str = "alert_type";
+
+/// 读数按「哪一档」归属时用的标签键。
+pub const LABEL_TIER: &str = "tier";
+
+/// 读数按「由什么触发」归属时用的标签键。
+pub const LABEL_TRIGGER: &str = "trigger";
+
+/// 读数按「走哪条通道」归属时用的标签键。
+pub const LABEL_CHANNEL: &str = "channel";
+
+/// 读数按「哪一片」归属时用的标签键。
+pub const LABEL_SLICE: &str = "slice";
+
+/// 读数带上「为什么是这个结局」时用的标签键。
+pub const LABEL_CAUSE: &str = "cause";
+
+/// 读数按「哪个工作区」归属时用的标签键。
+pub const LABEL_WORKSPACE_ID: &str = "workspace_id";
+
+/// 读数按「哪个班组」归属时用的标签键。
+pub const LABEL_CREW_ID: &str = "crew_id";
+
+/// 读数按「哪个消费方」归属时用的标签键。
+pub const LABEL_CONSUMER: &str = "consumer";
+
+/// 读数按「走到哪一步」归属时用的标签键。
+pub const LABEL_PHASE: &str = "phase";
+
+/// 读数按「哪个抓取任务」归属时用的标签键。
+pub const LABEL_JOB: &str = "job";
+
+/// 读数按「哪个指标」归属时用的标签键。
+pub const LABEL_METRIC: &str = "metric";
+
+/// 读数按「哪条任务」归属时用的标签键。
+pub const LABEL_TASK_ID: &str = "task_id";
+
+/// 读数按「哪个告警」归属时用的标签键。
+pub const LABEL_ALERTNAME: &str = "alertname";
+
+/// 读数按「严重到哪一级」归属时用的标签键。
+pub const LABEL_SEVERITY: &str = "severity";
+
+/// 读数按「日志级别」归属时用的标签键。
+pub const LABEL_LEVEL: &str = "level";
+
+/// 集群读数带上「这一格的账目」时用的标签键。
+///
+/// 下面这一组是集群读数自己写进同一批序列的第二类键：它们描述的不是
+/// 「谁发的」，而是「这一格当时算出了什么」——阈值、健康下限、下次重试
+/// 的时刻。按它们选读数的面板与写它们的地方一样多，所以同样只能有一份拼写。
+pub const LABEL_SUSPECT_COUNT: &str = "suspect_count";
+
+/// 集群读数带上「池子有多大」时用的标签键。
+pub const LABEL_POOL_SIZE: &str = "pool_size";
+
+/// 集群读数带上「健康下限」时用的标签键。
+pub const LABEL_MIN_HEALTHY: &str = "min_healthy";
+
+/// 集群读数带上「健康下限是从哪来的」时用的标签键。
+pub const LABEL_MIN_HEALTHY_SOURCE: &str = "min_healthy_source";
+
+/// 集群读数带上「上次自证恢复的时刻」时用的标签键。
+pub const LABEL_EVIDENCED_RECOVERY_UNIX: &str = "evidenced_recovery_unix";
+
+/// 集群读数带上「下次重试的时刻」时用的标签键。
+pub const LABEL_NEXT_ATTEMPT_UNIX: &str = "next_attempt_unix";
+
+/// 集群读数带上「配额窗口有多长」时用的标签键。
+pub const LABEL_QUOTA_WINDOW_SECS: &str = "quota_window_secs";
+
+/// 集群读数带上「这一格有没有不可用」时用的标签键。
+pub const LABEL_UNAVAILABLE: &str = "unavailable";
+
+/// 集群读数带上「调度器是否被暂停」时用的标签键。
+pub const LABEL_SCHEDULER_PAUSED: &str = "scheduler_paused";
+
+/// 集群读数带上「触发器设的阈值」时用的标签键。
+pub const LABEL_THRESHOLD: &str = "threshold";
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

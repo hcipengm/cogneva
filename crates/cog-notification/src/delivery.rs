@@ -152,8 +152,8 @@ impl Observable for DeliveryHealth {
             for result in ALL_RESULTS {
                 out.push(
                     RawMetric::new(DELIVERY_TOTAL, self.count(outlet, result) as f64)
-                        .with_label("outlet", outlet)
-                        .with_label("result", result.as_str()),
+                        .with_label(crate::LABEL_OUTLET, outlet)
+                        .with_label(crate::LABEL_RESULT, result.as_str()),
                 );
             }
         }

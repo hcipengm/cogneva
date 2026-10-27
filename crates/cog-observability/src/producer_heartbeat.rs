@@ -209,7 +209,7 @@ impl ProducerHeartbeatStore {
             .into_iter()
             .map(|r| ProducerHeartbeat {
                 source: r.get("source"),
-                trigger: r.get("trigger"),
+                trigger: r.get(crate::LABEL_TRIGGER),
                 pushed_at: r.get("pushed_at"),
                 period_seconds: r.get("period_seconds"),
             })
@@ -254,7 +254,7 @@ fn readings(rows: Vec<ProducerHeartbeat>) -> Vec<RawMetric> {
             out.push(
                 RawMetric::new(name, value)
                     .with_label(crate::alerts::LABEL_SOURCE, row.source.clone())
-                    .with_label("trigger", row.trigger.clone()),
+                    .with_label(crate::LABEL_TRIGGER, row.trigger.clone()),
             );
         }
     }
@@ -335,7 +335,7 @@ mod tests {
                 metric.name
             );
             assert_eq!(
-                metric.labels.get("trigger").map(String::as_str),
+                metric.labels.get(crate::LABEL_TRIGGER).map(String::as_str),
                 Some(ProducerTrigger::Timer.as_str()),
                 "{} carries no trigger label",
                 metric.name
@@ -378,7 +378,10 @@ mod tests {
             .filter(|m| m.name == PRODUCER_LAST_PUSH_TIMESTAMP)
             .map(|m| {
                 (
-                    m.labels.get("trigger").cloned().unwrap_or_default(),
+                    m.labels
+                        .get(crate::LABEL_TRIGGER)
+                        .cloned()
+                        .unwrap_or_default(),
                     m.value,
                 )
             })

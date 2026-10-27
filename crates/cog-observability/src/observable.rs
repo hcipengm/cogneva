@@ -153,7 +153,7 @@ impl Observable for ObservabilityObservable {
             for (cause, count) in self.evolution_change_rejected() {
                 metrics.push(
                     RawMetric::new("evolution_change_rejected_total", count as f64)
-                        .with_label("cause", cause.as_str()),
+                        .with_label(crate::LABEL_CAUSE, cause.as_str()),
                 );
             }
         }
@@ -207,7 +207,11 @@ mod rejection_counter_tests {
             .filter(|metric| metric.name == name)
             .map(|metric| {
                 (
-                    metric.labels.get("cause").cloned().unwrap_or_default(),
+                    metric
+                        .labels
+                        .get(crate::LABEL_CAUSE)
+                        .cloned()
+                        .unwrap_or_default(),
                     metric.value,
                 )
             })

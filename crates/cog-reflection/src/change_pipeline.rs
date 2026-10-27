@@ -1751,7 +1751,7 @@ impl ChangePipeline {
         {
             for tier in crate::criteria_face::Tier::ALL {
                 let mut labels = std::collections::HashMap::new();
-                labels.insert("tier".to_string(), tier.as_cell().to_string());
+                labels.insert(crate::LABEL_TIER.to_string(), tier.as_cell().to_string());
                 if let Err(e) = metrics
                     .record_counter(cog_core::metric_names::CHANGE_TIER_TOTAL, 0.0, labels)
                     .await
@@ -1761,7 +1761,10 @@ impl ChangePipeline {
             }
         }
         let mut labels = std::collections::HashMap::new();
-        labels.insert("tier".to_string(), tiering.tier.as_cell().to_string());
+        labels.insert(
+            crate::LABEL_TIER.to_string(),
+            tiering.tier.as_cell().to_string(),
+        );
         if let Err(e) = metrics
             .record_counter(cog_core::metric_names::CHANGE_TIER_TOTAL, 1.0, labels)
             .await

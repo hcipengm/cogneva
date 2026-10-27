@@ -343,9 +343,9 @@ mod tests {
             .iter()
             .find(|m| {
                 m.name == "self_review_verdict_total"
-                    && m.labels.get("stage").map(String::as_str) == Some(stage)
-                    && m.labels.get("criteria").map(String::as_str) == Some(criteria)
-                    && m.labels.get("verdict").map(String::as_str) == Some(verdict)
+                    && m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
+                    && m.labels.get(crate::LABEL_CRITERIA).map(String::as_str) == Some(criteria)
+                    && m.labels.get(crate::LABEL_VERDICT).map(String::as_str) == Some(verdict)
             })
             .map(|m| m.value)
             .unwrap_or(0.0)
@@ -361,7 +361,7 @@ mod tests {
             .iter()
             .find(|m| {
                 m.name == "self_review_skipped_total"
-                    && m.labels.get("stage").map(String::as_str) == Some(stage)
+                    && m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
                     && m.labels.get("reason").map(String::as_str) == Some(reason)
             })
             .map(|m| m.value)
@@ -378,7 +378,7 @@ mod tests {
             .iter()
             .find(|m| {
                 m.name == "self_review_revision_total"
-                    && m.labels.get("stage").map(String::as_str) == Some(stage)
+                    && m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
                     && m.labels.get("outcome").map(String::as_str) == Some(outcome)
             })
             .map(|m| m.value)

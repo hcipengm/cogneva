@@ -114,7 +114,7 @@ pub(crate) async fn report_eval_gate_outcome(
         crate::LABEL_OUTCOME.to_string(),
         outcome.as_cell().to_string(),
     );
-    labels.insert("site".to_string(), site.as_cell().to_string());
+    labels.insert(crate::LABEL_SITE.to_string(), site.as_cell().to_string());
     if let Err(e) = metrics
         .record_counter(
             cog_core::metric_names::EVAL_GATE_OUTCOMES_TOTAL,
@@ -150,7 +150,7 @@ pub(crate) async fn seed_eval_gate_site(
             crate::LABEL_OUTCOME.to_string(),
             outcome.as_cell().to_string(),
         );
-        labels.insert("site".to_string(), site.as_cell().to_string());
+        labels.insert(crate::LABEL_SITE.to_string(), site.as_cell().to_string());
         if let Err(e) = metrics
             .record_counter(
                 cog_core::metric_names::EVAL_GATE_OUTCOMES_TOTAL,

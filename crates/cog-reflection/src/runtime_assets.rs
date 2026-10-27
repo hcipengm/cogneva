@@ -459,7 +459,7 @@ impl Observable for AssetIdentityObservable {
         for (asset, verdict) in report.problems() {
             out.push(
                 RawMetric::new(RUNTIME_ASSET_STATE_METRIC, 1.0)
-                    .with_label("asset", asset.as_str())
+                    .with_label(crate::LABEL_ASSET, asset.as_str())
                     .with_label(crate::volume_capacity::STATE_LABEL, verdict.state()),
             );
         }

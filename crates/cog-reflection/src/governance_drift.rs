@@ -714,7 +714,7 @@ impl Observable for GovernanceDrift {
         {
             out.push(
                 RawMetric::new(GOVERNANCE_DRIFT_METRIC, *fields as f64)
-                    .with_label("object", object.clone()),
+                    .with_label(crate::LABEL_OBJECT, object.clone()),
             );
         }
         for (manifest, lines) in self
@@ -725,7 +725,7 @@ impl Observable for GovernanceDrift {
         {
             out.push(
                 RawMetric::new(OBSERVABILITY_DRIFT_METRIC, *lines as f64)
-                    .with_label("manifest", manifest.clone()),
+                    .with_label(crate::LABEL_MANIFEST, manifest.clone()),
             );
         }
         Ok(out)
@@ -980,7 +980,7 @@ mod tests {
             .expect("a checked object publishes its count even when the count is zero");
         assert_eq!(found.value, 0.0);
         assert_eq!(
-            found.labels.get("object").map(String::as_str),
+            found.labels.get(crate::LABEL_OBJECT).map(String::as_str),
             Some("resourcequota/cogneva-quota")
         );
         let failures = failures_of(&metrics);
@@ -1065,7 +1065,7 @@ mod tests {
             .find(|m| m.name == GOVERNANCE_DRIFT_METRIC)
             .expect("the ceiling was compared");
         assert_eq!(
-            ceiling.labels.get("object").map(String::as_str),
+            ceiling.labels.get(crate::LABEL_OBJECT).map(String::as_str),
             Some("resourcequota/cogneva-quota")
         );
         assert!(!ceiling.labels.contains_key("manifest"));
@@ -1075,7 +1075,10 @@ mod tests {
             .find(|m| m.name == OBSERVABILITY_DRIFT_METRIC)
             .expect("the manifest was compared");
         assert_eq!(
-            manifest.labels.get("manifest").map(String::as_str),
+            manifest
+                .labels
+                .get(crate::LABEL_MANIFEST)
+                .map(String::as_str),
             Some("10-loki.yaml")
         );
         assert!(
@@ -1091,7 +1094,10 @@ mod tests {
             .filter(|m| m.name == GOVERNANCE_CHECK_FAILURES_METRIC)
             .map(|m| {
                 (
-                    m.labels.get("reason").map(String::as_str).unwrap_or(""),
+                    m.labels
+                        .get(crate::LABEL_REASON)
+                        .map(String::as_str)
+                        .unwrap_or(""),
                     m.value,
                 )
             })

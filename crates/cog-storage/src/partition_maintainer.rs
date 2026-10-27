@@ -552,7 +552,7 @@ mod tests {
         let cell = |reason: &str| {
             totals
                 .iter()
-                .find(|s| s.labels.get("reason").map(String::as_str) == Some(reason))
+                .find(|s| s.labels.get(crate::LABEL_REASON).map(String::as_str) == Some(reason))
                 .map(|s| s.value)
         };
         assert_eq!(cell("window_behind"), Some(2.0));
@@ -589,7 +589,7 @@ mod tests {
             .await
             .unwrap();
         let missing = totals.iter().find(|s| {
-            s.labels.get("reason").map(String::as_str)
+            s.labels.get(crate::LABEL_REASON).map(String::as_str)
                 == Some(MaintenanceFailure::DefaultPartitionMissing.as_str())
         });
         assert_eq!(

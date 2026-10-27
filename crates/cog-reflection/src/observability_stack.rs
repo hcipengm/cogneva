@@ -1030,7 +1030,7 @@ mod tests {
             Some("/manifests")
         );
         assert_eq!(
-            labels.get("rev").and_then(|v| v.as_str()),
+            labels.get(crate::LABEL_REV).and_then(|v| v.as_str()),
             Some("0123456789ab")
         );
     }

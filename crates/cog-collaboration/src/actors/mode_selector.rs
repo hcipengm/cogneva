@@ -387,7 +387,7 @@ impl ModeSelectorActor {
         let s = match response {
             serde_json::Value::String(s) => s.clone(),
             val => val
-                .get("mode")
+                .get(crate::LABEL_MODE)
                 .or(val.get("response"))
                 .or(val.get("content"))
                 .and_then(|v| v.as_str())
@@ -636,8 +636,8 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "collab_route_decisions_total"
-                        && m.labels.get("stage").map(String::as_str) == Some(stage)
-                        && m.labels.get("mode").map(String::as_str) == Some(mode)
+                        && m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
+                        && m.labels.get(crate::LABEL_MODE).map(String::as_str) == Some(mode)
                 })
                 .map(|m| m.value)
                 .unwrap_or_default()
@@ -650,7 +650,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "collab_declared_scale_total"
-                        && m.labels.get("tier").map(String::as_str) == Some(label)
+                        && m.labels.get(crate::LABEL_TIER).map(String::as_str) == Some(label)
                 })
                 .map(|m| m.value)
                 .unwrap_or_default()
@@ -702,7 +702,7 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == "collab_declaration_inputs_total"
-                        && m.labels.get("input").map(String::as_str) == Some(input)
+                        && m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some(input)
                 })
                 .map(|m| m.value)
                 .unwrap_or_default()

@@ -60,6 +60,9 @@ pub use vector_summary_backend::{
 
 /// 读数按记忆命名空间归属时用的标签键。
 pub const LABEL_NAMESPACE: &str = "namespace";
+
+/// 读数按「哪个消费方」归属时用的标签键。
+pub const LABEL_CONSUMER: &str = "consumer";
 pub mod plugin;
 
 pub use config::{IngestConfig, MaintenanceConfig, MemoryConfig};

@@ -160,7 +160,7 @@ impl TierMigrator {
                 continue;
             }
             let mut labels = std::collections::HashMap::new();
-            labels.insert("tier".into(), tier.into());
+            labels.insert(crate::LABEL_TIER.into(), tier.into());
             if let Err(e) = mb
                 .record_counter(
                     cog_core::metric_names::TIER_MIGRATION_TOTAL,
@@ -177,7 +177,7 @@ impl TierMigrator {
     async fn emit_error_metric(&self) {
         let Some(ref mb) = self.metrics else { return };
         let mut labels = std::collections::HashMap::new();
-        labels.insert("tier".into(), "error".into());
+        labels.insert(crate::LABEL_TIER.into(), "error".into());
         let _ = mb
             .record_counter(cog_core::metric_names::TIER_MIGRATION_TOTAL, 1.0, labels)
             .await;

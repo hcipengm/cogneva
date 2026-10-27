@@ -825,7 +825,7 @@ impl MemoryIngestor {
         };
         let mut labels = HashMap::new();
         labels.insert(
-            "consumer".to_string(),
+            crate::LABEL_CONSUMER.to_string(),
             LAG_CONSUMER_MEMORY_INGESTOR.to_string(),
         );
         if let Err(e) = metrics

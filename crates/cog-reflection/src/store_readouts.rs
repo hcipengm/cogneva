@@ -155,7 +155,7 @@ impl StoreReadouts {
             let labels = |readout: &str| {
                 let mut labels = HashMap::new();
                 labels.insert(LABEL_READOUT.to_string(), readout.to_string());
-                labels.insert("data_dir".to_string(), data_dir.clone());
+                labels.insert(crate::LABEL_DATA_DIR.to_string(), data_dir.clone());
                 labels.insert(crate::LABEL_STORE.to_string(), name.clone());
                 labels
             };
@@ -203,7 +203,7 @@ impl StoreReadouts {
         ] {
             let mut labels = HashMap::new();
             labels.insert(LABEL_READOUT.to_string(), readout.to_string());
-            labels.insert("data_dir".to_string(), data_dir.clone());
+            labels.insert(crate::LABEL_DATA_DIR.to_string(), data_dir.clone());
             labels.insert(
                 crate::LABEL_STORE.to_string(),
                 META_LEARNING_POLICY.to_string(),
@@ -225,7 +225,7 @@ impl StoreReadouts {
         let labels_for = |store: &str, readout: &str| {
             let mut labels = HashMap::new();
             labels.insert(LABEL_READOUT.to_string(), readout.to_string());
-            labels.insert("data_dir".to_string(), data_dir.clone());
+            labels.insert(crate::LABEL_DATA_DIR.to_string(), data_dir.clone());
             labels.insert(crate::LABEL_STORE.to_string(), store.to_string());
             labels
         };
@@ -385,7 +385,11 @@ mod tests {
                 .get(LABEL_READOUT)
                 .cloned()
                 .unwrap_or_default(),
-            sample.labels.get("data_dir").cloned().unwrap_or_default(),
+            sample
+                .labels
+                .get(crate::LABEL_DATA_DIR)
+                .cloned()
+                .unwrap_or_default(),
             sample.labels.get("store").cloned().unwrap_or_default(),
         )
     }

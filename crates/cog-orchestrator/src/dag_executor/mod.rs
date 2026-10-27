@@ -605,8 +605,8 @@ impl DagExecutorRuntime {
             if let Some(metrics) = self.orchestrator.metrics_backend() {
                 for ((project, column), held) in column_holds {
                     let mut labels = HashMap::new();
-                    labels.insert("project".to_string(), project);
-                    labels.insert("column".to_string(), column.to_string());
+                    labels.insert(crate::LABEL_PROJECT.to_string(), project);
+                    labels.insert(crate::LABEL_COLUMN.to_string(), column.to_string());
                     drop(
                         metrics
                             .record_counter(
@@ -626,7 +626,7 @@ impl DagExecutorRuntime {
             if let Some(metrics) = self.orchestrator.metrics_backend() {
                 for (kind, held) in budget_holds {
                     let mut labels = HashMap::new();
-                    labels.insert("stream".to_string(), kind.to_string());
+                    labels.insert(crate::LABEL_STREAM.to_string(), kind.to_string());
                     labels.insert(
                         crate::LABEL_REASON.to_string(),
                         crate::ready_queue::BUDGET_SPENT_REASON.to_string(),
@@ -941,7 +941,7 @@ impl DagExecutorRuntime {
         let stream_kind = crate::ready_queue::stream_kind(stream, &self.config.workspace_id);
         let cell = |kind: &str| {
             let mut labels = HashMap::new();
-            labels.insert("stream".to_string(), stream_kind.to_string());
+            labels.insert(crate::LABEL_STREAM.to_string(), stream_kind.to_string());
             labels.insert(crate::LABEL_KIND.to_string(), kind.to_string());
             labels
         };
@@ -1019,7 +1019,7 @@ impl DagExecutorRuntime {
         }
         if held > 0 {
             let mut labels = HashMap::new();
-            labels.insert("stream".to_string(), stream_kind.to_string());
+            labels.insert(crate::LABEL_STREAM.to_string(), stream_kind.to_string());
             // The reason is the gate that said zero, not the gate that is
             // always named: an unavailable pool refuses work while its window
             // still pays for a job, and calling that `window_exhausted` sends
@@ -2325,11 +2325,11 @@ mod consumer_ack_tests {
         );
         assert_eq!(held[0].1, 1.0, "被拦下的是一条");
         assert_eq!(
-            held[0].2.get("column").map(String::as_str),
+            held[0].2.get(crate::LABEL_COLUMN).map(String::as_str),
             Some("scheduled")
         );
         assert_eq!(
-            held[0].2.get("project").map(String::as_str),
+            held[0].2.get(crate::LABEL_PROJECT).map(String::as_str),
             Some("goal-wip")
         );
     }
@@ -2793,7 +2793,7 @@ mod consumer_ack_tests {
             let metrics = observer.collect_metrics("D8").await.unwrap();
             if metrics
                 .iter()
-                .any(|m| m.labels.get("stream").map(String::as_str) == Some(stream))
+                .any(|m| m.labels.get(crate::LABEL_STREAM).map(String::as_str) == Some(stream))
             {
                 return metrics;
             }
@@ -2849,7 +2849,8 @@ mod consumer_ack_tests {
                 .iter()
                 .find(|m| {
                     m.name == name
-                        && m.labels.get("stream").map(String::as_str) == Some(stream.as_str())
+                        && m.labels.get(crate::LABEL_STREAM).map(String::as_str)
+                            == Some(stream.as_str())
                 })
                 .unwrap_or_else(|| panic!("{name} not published for {stream}"))
                 .value
@@ -3344,11 +3345,14 @@ mod consumer_ack_tests {
         assert_eq!(held.len(), 1, "这一拍只拦了一条：{writes:?}");
         assert_eq!(held[0].1, 1.0);
         assert_eq!(
-            held[0].2.get("reason").map(String::as_str),
+            held[0].2.get(crate::LABEL_REASON).map(String::as_str),
             Some("budget_spent"),
             "原因指到预算这道闸门，不是池窗口——修法完全不同"
         );
-        assert_eq!(held[0].2.get("stream").map(String::as_str), Some("shared"));
+        assert_eq!(
+            held[0].2.get(crate::LABEL_STREAM).map(String::as_str),
+            Some("shared")
+        );
     }
 
     /// 没有清点行不是「花完了」：清点写是尽力而为的，把它读成零会让一条写失败的
@@ -3889,7 +3893,7 @@ mod orphan_reconciler_tests {
         );
         assert!(carried.ends_with('…'));
         assert!(
-            draft.labels.get("original_input").is_none(),
+            draft.labels.get(crate::LABEL_ORIGINAL_INPUT).is_none(),
             "the whole input must not survive as a label"
         );
     }
