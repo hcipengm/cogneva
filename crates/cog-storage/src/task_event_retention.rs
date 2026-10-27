@@ -299,8 +299,8 @@ impl TaskEventRetention {
                          LIMIT $1
                      )
                      DELETE FROM {table} WHERE task_id IN (SELECT task_id FROM batch)",
-                    table = quote_ident(&self.table),
-                    checkpoints = quote_ident(&self.checkpoints),
+                    table = crate::relation_rows::quote_relation(&self.table),
+                    checkpoints = crate::relation_rows::quote_relation(&self.checkpoints),
                 ))
                 .bind(BATCH_STREAMS)
                 .bind(cutoff)
@@ -344,14 +344,7 @@ impl TaskEventRetention {
     }
 
     async fn row_count(&self) -> SFResult<i64> {
-        sqlx::query(&format!(
-            "SELECT count(*) AS n FROM {}",
-            quote_ident(&self.table)
-        ))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))
-        .map(|row| row.get::<i64, _>("n"))
+        crate::relation_rows::relation_rows(&self.pool, &self.table).await
     }
 
     /// How many task streams the archive holds.
@@ -363,7 +356,7 @@ impl TaskEventRetention {
     async fn stream_count(&self) -> SFResult<i64> {
         sqlx::query(&format!(
             "SELECT count(DISTINCT task_id) AS n FROM {}",
-            quote_ident(&self.table)
+            crate::relation_rows::quote_relation(&self.table)
         ))
         .fetch_one(&self.pool)
         .await
@@ -381,7 +374,7 @@ impl TaskEventRetention {
     async fn oldest_age_secs(&self) -> SFResult<i64> {
         sqlx::query(&format!(
             "SELECT EXTRACT(EPOCH FROM (NOW() - min(created_at)))::bigint AS age FROM {}",
-            quote_ident(&self.table)
+            crate::relation_rows::quote_relation(&self.table)
         ))
         .fetch_one(&self.pool)
         .await
@@ -445,25 +438,6 @@ impl TaskEventRetention {
     }
 }
 
-/// Quote a table name, allowing a schema-qualified one.
-///
-/// The name is never a value the sweep takes from a caller at runtime — it is
-/// this file's constant or a test's own table — but it is interpolated into the
-/// statement, so the shape is checked here rather than trusted: anything outside
-/// the identifier alphabet is dropped instead of being carried into the SQL.
-fn quote_ident(name: &str) -> String {
-    name.split('.')
-        .map(|part| {
-            let cleaned: String = part
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            format!("\"{cleaned}\"")
-        })
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
 /// The retention this process was told.
 ///
 /// `Some(0)` is a deployment saying it does not retire — it measures and leaves
@@ -523,14 +497,5 @@ mod tests {
         assert_eq!(sweep.keep(), None);
         assert_eq!(sweep.table, TABLE);
         assert_eq!(sweep.checkpoints, CHECKPOINTS_TABLE);
-    }
-
-    #[test]
-    fn a_qualified_table_name_is_quoted_part_by_part() {
-        assert_eq!(
-            quote_ident("probe.events"),
-            "\"probe\".\"events\"",
-            "quoting the whole dotted name would look for one table with a dot in it"
-        );
     }
 }

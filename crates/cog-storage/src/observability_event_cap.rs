@@ -438,14 +438,7 @@ impl EventLogCap {
     }
 
     async fn row_count(&self) -> SFResult<i64> {
-        let sql = format!(
-            "SELECT count(*) FROM {}",
-            crate::partition_maintainer::quote_ident(&self.table)
-        );
-        sqlx::query_scalar(&sql)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| SFError::Database(e.to_string()))
+        crate::relation_rows::relation_rows(&self.pool, &self.table).await
     }
 }
 
