@@ -6540,12 +6540,12 @@ impl MainlineDeployer {
         .env("CARGO_TARGET_DIR", self.target_dir())
         // build.rs 回退只嵌 7 位短 sha，叠层后的 --version 校验匹配 12
         // 位前缀会必败；显式注入完整 rev（与 swap-image 双保险同源）。
-        .env("COGNEVA_GIT_REVISION", rev)
+        .env(cog_core::env::GIT_REVISION, rev)
         // Injected from the same source as the rev: the source tree does have
         // a .git in the worktree, but passing it explicitly keeps the name
         // inside the image from depending on whether build.rs can find a tag
         // at the moment it runs.
-        .env("COGNEVA_VERSION_ID", &version_id)
+        .env(cog_core::env::VERSION_ID, &version_id)
         .kill_on_drop(true);
         let fut = cmd.output();
         let output = tokio::time::timeout(Duration::from_secs(self.cfg.build_timeout_secs), fut)

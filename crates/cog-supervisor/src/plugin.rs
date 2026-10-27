@@ -84,7 +84,7 @@ impl SupervisorPlugin {
             warn!("LLM pool guard disabled: no SupervisorEvent sender published");
             return;
         };
-        let interval_secs = std::env::var("COGNEVA_LLM_POOL_CHECK_SECS")
+        let interval_secs = std::env::var(cog_core::env::LLM_POOL_CHECK_SECS)
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30)

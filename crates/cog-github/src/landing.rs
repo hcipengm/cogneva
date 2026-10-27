@@ -2413,7 +2413,7 @@ fn proxy_route(base: &str, slug: &str, repo: &str) -> String {
 }
 
 fn git_proxy_base() -> Option<String> {
-    std::env::var("COGNEVA_GIT_PROXY_BASE")
+    std::env::var(cog_core::env::GIT_PROXY_BASE)
         .ok()
         .filter(|s| !s.is_empty())
 }

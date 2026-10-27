@@ -470,7 +470,7 @@ async fn read_file(path: &Path, rel: &str) -> Result<FileResponse, ApiError> {
 /// 推送的那个仓（裸仓路径，网关按卷挂进来）。它指向一个 URL 而不是本地路径时，
 /// 这个部署的网关手里没有那份字节，项目面就明确地说「没挂进来」，而不是回一棵空
 /// 树——空树会被读成「仓库里一个文件都没有」。
-const PROJECT_REPO_ENV: &str = "COGNEVA_GITOPS_REPO_URL";
+const PROJECT_REPO_ENV: &str = cog_core::env::GITOPS_REPO_URL;
 
 fn project_repo() -> Result<PathBuf, ApiError> {
     project_repo_from(non_empty_env(PROJECT_REPO_ENV))

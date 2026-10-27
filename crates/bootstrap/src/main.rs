@@ -3623,7 +3623,7 @@ async fn main() -> Result<()> {
         && !Path::new("deploy/helm/cogneva/Chart.yaml").is_file()
     {
         let assets = materialize_assets()?;
-        std::env::set_var("COGNEVA_REPO_ROOT", &assets);
+        std::env::set_var(REPO_ROOT_ENV, &assets);
         info!("部署资产已从二进制内嵌内容解包 → {}", assets.display());
     }
 

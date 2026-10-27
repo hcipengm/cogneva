@@ -11,6 +11,25 @@ use std::path::Path;
 
 use cog_core::{SFError, SFResult};
 
+use crate::registry_endpoint::{LOCAL_REGISTRY_ENV, REGISTRY_ENV};
+
+/// 读一格旋钮：名字在一次调用里只出现一次，`get` 用它读、出错时也用它点名。
+///
+/// 原来每一格都写成 `if let Some(v) = get("X") { self.f = parse("X", &v)?; }`：
+/// 同名字在一行里出现两遍，改一处不会报错，另一处继续按旧名字读——`get` 读不到
+/// 与「没配」在调用点上同形，旋钮就静默失效。键名只交给这里，第二遍无处可写。
+fn knob<T: std::str::FromStr>(
+    key: &str,
+    get: impl Fn(&str) -> Option<String>,
+) -> SFResult<Option<T>> {
+    let Some(raw) = get(key) else {
+        return Ok(None);
+    };
+    raw.parse::<T>()
+        .map(Some)
+        .map_err(|_| SFError::Config(format!("{key} 值非法: {raw:?}")))
+}
+
 /// 晋级门配置：
 /// change 闯过沙盒验证后，按触及文件决定晋级通道（L0 热更新 /
 /// L1 金丝雀自动 / L2 人工审批 / 黑名单拒收）。
@@ -175,58 +194,54 @@ impl PromotionGateConfig {
 
     /// env 覆盖。取值经 `get` 读取（测试可注入假 env）；非法值返回 Err。
     fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) -> SFResult<()> {
-        fn parse<T: std::str::FromStr>(key: &str, raw: &str) -> SFResult<T> {
-            raw.parse::<T>()
-                .map_err(|_| SFError::Config(format!("{key} 值非法: {raw:?}")))
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_PROMOTION_ENABLED", &get)? {
+            self.enabled = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_ENABLED") {
-            self.enabled = parse("COGNEVA_SELF_EVOLUTION_PROMOTION_ENABLED", &v)?;
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_PROMOTION_MAX_DIFF_LINES", &get)? {
+            self.max_diff_lines = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_MAX_DIFF_LINES") {
-            self.max_diff_lines = parse("COGNEVA_SELF_EVOLUTION_PROMOTION_MAX_DIFF_LINES", &v)?;
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_PROMOTION_QUOTA_PER_DAY", &get)? {
+            self.quota_per_day = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_QUOTA_PER_DAY") {
-            self.quota_per_day = parse("COGNEVA_SELF_EVOLUTION_PROMOTION_QUOTA_PER_DAY", &v)?;
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_PROMOTION_SOAK_SECS", &get)? {
+            self.soak_secs = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_SOAK_SECS") {
-            self.soak_secs = parse("COGNEVA_SELF_EVOLUTION_PROMOTION_SOAK_SECS", &v)?;
+        if let Some(v) = knob(
+            "COGNEVA_SELF_EVOLUTION_PROMOTION_AWAITING_REVIEW_TIMEOUT_SECS",
+            &get,
+        )? {
+            self.awaiting_review_timeout_secs = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_AWAITING_REVIEW_TIMEOUT_SECS") {
-            self.awaiting_review_timeout_secs = parse(
-                "COGNEVA_SELF_EVOLUTION_PROMOTION_AWAITING_REVIEW_TIMEOUT_SECS",
-                &v,
-            )?;
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_PROMOTION_ROLLBACK_BREAKER", &get)? {
+            self.rollback_breaker_threshold = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_ROLLBACK_BREAKER") {
-            self.rollback_breaker_threshold =
-                parse("COGNEVA_SELF_EVOLUTION_PROMOTION_ROLLBACK_BREAKER", &v)?;
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_PROMOTION_FAILURE_BREAKER", &get)? {
+            self.failure_breaker_threshold = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_FAILURE_BREAKER") {
-            self.failure_breaker_threshold =
-                parse("COGNEVA_SELF_EVOLUTION_PROMOTION_FAILURE_BREAKER", &v)?;
+        if let Some(v) = knob(
+            "COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_ENABLED",
+            &get,
+        )? {
+            self.trend_report_enabled = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_ENABLED") {
-            self.trend_report_enabled =
-                parse("COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_ENABLED", &v)?;
-        }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_INTERVAL_SECS") {
-            self.trend_report_interval_secs = parse(
-                "COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_INTERVAL_SECS",
-                &v,
-            )?;
+        if let Some(v) = knob(
+            "COGNEVA_SELF_EVOLUTION_PROMOTION_TREND_REPORT_INTERVAL_SECS",
+            &get,
+        )? {
+            self.trend_report_interval_secs = v;
         }
         let g = &mut self.gitops;
-        if let Some(v) = get("COGNEVA_GITOPS_ENABLED") {
-            g.enabled = parse("COGNEVA_GITOPS_ENABLED", &v)?;
+        if let Some(v) = knob("COGNEVA_GITOPS_ENABLED", &get)? {
+            g.enabled = v;
         }
-        if let Some(v) = get("COGNEVA_GITOPS_REPO_URL") {
+        if let Some(v) = get(cog_core::env::GITOPS_REPO_URL) {
             g.repo_url = v;
         }
         if let Some(v) = get("COGNEVA_GITOPS_BRANCH") {
             g.branch = v;
         }
-        if let Some(v) = get("COGNEVA_GITOPS_POLL_INTERVAL_SECS") {
-            g.poll_interval_secs = parse("COGNEVA_GITOPS_POLL_INTERVAL_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_GITOPS_POLL_INTERVAL_SECS", &get)? {
+            g.poll_interval_secs = v;
         }
         if let Some(v) = get("COGNEVA_GITOPS_REGISTRY") {
             g.registry = if v.is_empty() { None } else { Some(v) };
@@ -246,8 +261,8 @@ impl PromotionGateConfig {
         if let Some(v) = get("COGNEVA_GITOPS_CONTAINER") {
             g.container = v;
         }
-        if let Some(v) = get("COGNEVA_GITOPS_CANARY_WATCH_SECS") {
-            g.canary_watch_secs = parse("COGNEVA_GITOPS_CANARY_WATCH_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_GITOPS_CANARY_WATCH_SECS", &get)? {
+            g.canary_watch_secs = v;
         }
         if let Some(v) = get("COGNEVA_GITOPS_KUBECTL_BIN") {
             g.kubectl_bin = v;
@@ -255,19 +270,17 @@ impl PromotionGateConfig {
         if let Some(v) = get("COGNEVA_GITOPS_BUILDER_BIN") {
             g.builder_bin = v;
         }
-        if let Some(v) = get("COGNEVA_GITOPS_CANARY_ERROR_RATE_MULTIPLIER") {
-            g.canary_error_rate_multiplier =
-                parse("COGNEVA_GITOPS_CANARY_ERROR_RATE_MULTIPLIER", &v)?;
+        if let Some(v) = knob("COGNEVA_GITOPS_CANARY_ERROR_RATE_MULTIPLIER", &get)? {
+            g.canary_error_rate_multiplier = v;
         }
-        if let Some(v) = get("COGNEVA_GITOPS_CANARY_P99_MULTIPLIER") {
-            g.canary_p99_multiplier = parse("COGNEVA_GITOPS_CANARY_P99_MULTIPLIER", &v)?;
+        if let Some(v) = knob("COGNEVA_GITOPS_CANARY_P99_MULTIPLIER", &get)? {
+            g.canary_p99_multiplier = v;
         }
-        if let Some(v) = get("COGNEVA_GITOPS_CANARY_MIN_REQUESTS_FOR_RATE") {
-            g.canary_min_requests_for_rate =
-                parse("COGNEVA_GITOPS_CANARY_MIN_REQUESTS_FOR_RATE", &v)?;
+        if let Some(v) = knob("COGNEVA_GITOPS_CANARY_MIN_REQUESTS_FOR_RATE", &get)? {
+            g.canary_min_requests_for_rate = v;
         }
-        if let Some(v) = get("COGNEVA_GITOPS_PULLER_ENABLED") {
-            g.puller_enabled = parse("COGNEVA_GITOPS_PULLER_ENABLED", &v)?;
+        if let Some(v) = knob("COGNEVA_GITOPS_PULLER_ENABLED", &get)? {
+            g.puller_enabled = v;
         }
         if let Some(v) = get("COGNEVA_GITOPS_GIT_USER_NAME") {
             g.git_user_name = v;
@@ -378,22 +391,17 @@ impl ChangeJobConfig {
 
     /// env 覆盖。取值经 `get` 读取（测试可注入假 env）；非法值返回 Err。
     pub fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) -> SFResult<()> {
-        fn parse<T: std::str::FromStr>(key: &str, raw: &str) -> SFResult<T> {
-            raw.parse::<T>()
-                .map_err(|_| SFError::Config(format!("{key} 值非法: {raw:?}")))
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_ENABLED", &get)? {
+            self.enabled = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_ENABLED") {
-            self.enabled = parse("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_ENABLED", &v)?;
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL", &get)? {
+            self.max_parallel = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL") {
-            self.max_parallel = parse("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_MAX_PARALLEL", &v)?;
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_DEADLINE_SECS", &get)? {
+            self.deadline_secs = v;
         }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_DEADLINE_SECS") {
-            self.deadline_secs = parse("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_DEADLINE_SECS", &v)?;
-        }
-        if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_POLL_INTERVAL_SECS") {
-            self.poll_interval_secs =
-                parse("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_POLL_INTERVAL_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_POLL_INTERVAL_SECS", &get)? {
+            self.poll_interval_secs = v;
         }
         if let Some(v) = get("COGNEVA_SELF_EVOLUTION_CHANGE_JOB_CPU_REQUEST") {
             self.job_cpu_request = v;
@@ -479,12 +487,8 @@ impl GenerationLimits {
 
     /// env 覆盖。取值经 `get` 读取（测试可注入假 env）；非法值返回 Err。
     pub fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) -> SFResult<()> {
-        if let Some(v) = get("COGNEVA_GENERATION_MAX_CHANGED_LINES") {
-            self.max_changed_lines = v.parse().map_err(|_| {
-                SFError::Config(format!(
-                    "COGNEVA_GENERATION_MAX_CHANGED_LINES 值非法: {v:?}"
-                ))
-            })?;
+        if let Some(v) = knob("COGNEVA_GENERATION_MAX_CHANGED_LINES", &get)? {
+            self.max_changed_lines = v;
         }
         Ok(())
     }
@@ -548,18 +552,14 @@ impl BaselinePortConfig {
 
     /// env 覆盖。取值经 `get` 读取（测试可注入假 env）；非法值返回 Err。
     fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) -> SFResult<()> {
-        fn parse<T: std::str::FromStr>(key: &str, raw: &str) -> SFResult<T> {
-            raw.parse::<T>()
-                .map_err(|_| SFError::Config(format!("{key} 值非法: {raw:?}")))
+        if let Some(v) = knob("COGNEVA_BASELINE_PORT_ENABLED", &get)? {
+            self.enabled = v;
         }
-        if let Some(v) = get("COGNEVA_BASELINE_PORT_ENABLED") {
-            self.enabled = parse("COGNEVA_BASELINE_PORT_ENABLED", &v)?;
+        if let Some(v) = knob("COGNEVA_BASELINE_PORT_POLL_INTERVAL_SECS", &get)? {
+            self.poll_interval_secs = v;
         }
-        if let Some(v) = get("COGNEVA_BASELINE_PORT_POLL_INTERVAL_SECS") {
-            self.poll_interval_secs = parse("COGNEVA_BASELINE_PORT_POLL_INTERVAL_SECS", &v)?;
-        }
-        if let Some(v) = get("COGNEVA_BASELINE_PORT_RETRY_COOLDOWN_SECS") {
-            self.retry_cooldown_secs = parse("COGNEVA_BASELINE_PORT_RETRY_COOLDOWN_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_BASELINE_PORT_RETRY_COOLDOWN_SECS", &get)? {
+            self.retry_cooldown_secs = v;
         }
         Ok(())
     }
@@ -1045,15 +1045,11 @@ impl MainlineDeployerConfig {
 
     /// env 覆盖。取值经 `get` 读取（测试可注入假 env）；非法值返回 Err。
     pub fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) -> SFResult<()> {
-        fn parse<T: std::str::FromStr>(key: &str, raw: &str) -> SFResult<T> {
-            raw.parse::<T>()
-                .map_err(|_| SFError::Config(format!("{key} 值非法: {raw:?}")))
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_ENABLED", &get)? {
+            self.enabled = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ENABLED") {
-            self.enabled = parse("COGNEVA_MAINLINE_DEPLOYER_ENABLED", &v)?;
-        }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS") {
-            self.poll_interval_secs = parse("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_POLL_INTERVAL_SECS", &get)? {
+            self.poll_interval_secs = v;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BARE_REPO") {
             self.bare_repo = v;
@@ -1061,17 +1057,19 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BRANCH") {
             self.branch = v;
         }
-        if let Some(v) = get("COGNEVA_GIT_PROXY_BASE") {
+        if let Some(v) = get(cog_core::env::GIT_PROXY_BASE) {
             self.git_proxy_base = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_UPSTREAM_FETCH_TIMEOUT_SECS") {
-            self.upstream_fetch_timeout_secs =
-                parse("COGNEVA_MAINLINE_DEPLOYER_UPSTREAM_FETCH_TIMEOUT_SECS", &v)?;
+        if let Some(v) = knob(
+            "COGNEVA_MAINLINE_DEPLOYER_UPSTREAM_FETCH_TIMEOUT_SECS",
+            &get,
+        )? {
+            self.upstream_fetch_timeout_secs = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY") {
+        if let Some(v) = get(REGISTRY_ENV) {
             self.registry = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY") {
+        if let Some(v) = get(LOCAL_REGISTRY_ENV) {
             self.local_registry = v;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_NAMESPACE") {
@@ -1080,29 +1078,26 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STATE_DIR") {
             self.state_dir = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BUILD_TIMEOUT_SECS") {
-            self.build_timeout_secs = parse("COGNEVA_MAINLINE_DEPLOYER_BUILD_TIMEOUT_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_BUILD_TIMEOUT_SECS", &get)? {
+            self.build_timeout_secs = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS") {
-            self.cargo_build_jobs = parse("COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_CARGO_BUILD_JOBS", &get)? {
+            self.cargo_build_jobs = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS") {
-            self.soak_secs = parse("COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_SOAK_SECS", &get)? {
+            self.soak_secs = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_RESTART_THRESHOLD") {
-            self.restart_threshold = parse("COGNEVA_MAINLINE_DEPLOYER_RESTART_THRESHOLD", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_RESTART_THRESHOLD", &get)? {
+            self.restart_threshold = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS") {
-            self.failure_cooldown_secs =
-                parse("COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_FAILURE_COOLDOWN_SECS", &get)? {
+            self.failure_cooldown_secs = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_TIMEOUT_SECS") {
-            self.rollout_timeout_secs =
-                parse("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_TIMEOUT_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_TIMEOUT_SECS", &get)? {
+            self.rollout_timeout_secs = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS") {
-            self.startup_timeout_secs =
-                parse("COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STARTUP_TIMEOUT_SECS", &get)? {
+            self.startup_timeout_secs = v;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_CPU_REQUEST") {
             self.job_cpu_request = v;
@@ -1116,22 +1111,20 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_ROLLOUT_JOB_MEMORY_LIMIT") {
             self.job_memory_limit = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS") {
-            self.heartbeat_log_secs = parse("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_HEARTBEAT_LOG_SECS", &get)? {
+            self.heartbeat_log_secs = v;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_MANIFEST_DIR") {
             self.manifest_dir = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_DELIVER_MANIFESTS") {
-            self.deliver_manifests = parse("COGNEVA_MAINLINE_DEPLOYER_DELIVER_MANIFESTS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_DELIVER_MANIFESTS", &get)? {
+            self.deliver_manifests = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_ENABLED") {
-            self.observability_stack.enabled =
-                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_ENABLED", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_ENABLED", &get)? {
+            self.observability_stack.enabled = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS") {
-            self.observability_stack.interval_secs =
-                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_INTERVAL_SECS", &get)? {
+            self.observability_stack.interval_secs = v;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_MANIFEST_DIR") {
             self.observability_stack.manifest_dir = v;
@@ -1139,17 +1132,14 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_NAMESPACE") {
             self.observability_stack.namespace = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS") {
-            self.observability_stack.backends =
-                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_BACKENDS", &get)? {
+            self.observability_stack.backends = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS") {
-            self.observability_stack.apply_timeout_secs =
-                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_APPLY_TIMEOUT_SECS", &get)? {
+            self.observability_stack.apply_timeout_secs = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES") {
-            self.observability_stack.max_named_resources =
-                parse("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_STACK_MAX_NAMED_RESOURCES", &get)? {
+            self.observability_stack.max_named_resources = v;
         }
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_BUILDER_BIN") {
             self.builder_bin = v;
@@ -1160,29 +1150,28 @@ impl MainlineDeployerConfig {
         if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_KUBECTL_HOST_PATH") {
             self.kubectl_host_path = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_WALKER_PORT") {
-            self.registry_walker_port =
-                parse("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_WALKER_PORT", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_WALKER_PORT", &get)? {
+            self.registry_walker_port = v;
         }
         // 卷族的声明，不是本节的声明：走查边车照着它量，回收照着它判，两个
         // 消费面在同一份 env 上取同一个名字。
         if let Some(v) = get(crate::registry_footprint::CLAIM_ENV) {
             self.registry_claim = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_RETENTION") {
-            self.registry_retention = parse("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_RETENTION", &v)?;
+        if let Some(v) = knob("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_RETENTION", &get)? {
+            self.registry_retention = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_THRESHOLD") {
-            self.registry_maintenance_threshold = parse(
-                "COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_THRESHOLD",
-                &v,
-            )?;
+        if let Some(v) = knob(
+            "COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_THRESHOLD",
+            &get,
+        )? {
+            self.registry_maintenance_threshold = v;
         }
-        if let Some(v) = get("COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_COOLDOWN_SECS") {
-            self.registry_maintenance_cooldown_secs = parse(
-                "COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_COOLDOWN_SECS",
-                &v,
-            )?;
+        if let Some(v) = knob(
+            "COGNEVA_MAINLINE_DEPLOYER_REGISTRY_MAINTENANCE_COOLDOWN_SECS",
+            &get,
+        )? {
+            self.registry_maintenance_cooldown_secs = v;
         }
         // 启用部署器就必须知道往哪推、节点从哪拉。两条端点都是部署面的事实
         // （chart 从 clusterRegistry.port / nodePort 渲染），代码里没有默认值可退：
@@ -1190,11 +1179,8 @@ impl MainlineDeployerConfig {
         // 的旧端口上，都要早一步说清楚。
         if self.enabled {
             for (key, value) in [
-                ("COGNEVA_MAINLINE_DEPLOYER_REGISTRY", &self.registry),
-                (
-                    "COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY",
-                    &self.local_registry,
-                ),
+                (REGISTRY_ENV, &self.registry),
+                (LOCAL_REGISTRY_ENV, &self.local_registry),
             ] {
                 if value.trim().is_empty() {
                     return Err(SFError::Config(format!(

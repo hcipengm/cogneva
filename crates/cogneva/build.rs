@@ -10,6 +10,13 @@
 
 use std::fs;
 
+/// 构建来源的两个名字：本脚本既从这里读（构建机注入），也把它们写进
+/// `cargo:rustc-env`（源码编译期读）。两处若是各写一遍，改一处不会报错，另一处
+/// 继续按旧名字读，读不到就退回 `unknown`——而 `unknown` 与「这一版确实没带来源」
+/// 在读数上同形。
+const GIT_REVISION_ENV: &str = "COGNEVA_GIT_REVISION";
+const VERSION_ID_ENV: &str = "COGNEVA_VERSION_ID";
+
 fn main() {
     let cargo_toml = fs::read_to_string("Cargo.toml").expect("read Cargo.toml");
 
@@ -74,13 +81,13 @@ fn main() {
     // 嵌入构建来源：容器全量构建时源码树无 .git，由 Dockerfile ARG
     // GIT_REVISION 经 COGNEVA_GIT_REVISION 环境变量注入；本机构建直接查 git。
     // 线上镜像必须能回答"我跑的是哪个 commit"，浮动 tag :local 不携带该信息。
-    let revision = std::env::var("COGNEVA_GIT_REVISION")
+    let revision = std::env::var(GIT_REVISION_ENV)
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(git_revision)
         .unwrap_or_else(|| "unknown".to_string());
-    println!("cargo:rustc-env=COGNEVA_GIT_REVISION={revision}");
-    println!("cargo:rerun-if-env-changed=COGNEVA_GIT_REVISION");
+    println!("cargo:rustc-env={GIT_REVISION_ENV}={revision}");
+    println!("cargo:rerun-if-env-changed={GIT_REVISION_ENV}");
     println!("cargo:rerun-if-changed=.git/HEAD");
     // HEAD only moves when switching branches; a commit moves the file under
     // refs/heads. Without this line the stamp recompiled after a commit still
@@ -97,13 +104,13 @@ fn main() {
     // Injected by whoever builds into a tree without .git, exactly as the
     // revision is; the fallback says the distance could not be read rather than
     // claiming zero.
-    let version_id = std::env::var("COGNEVA_VERSION_ID")
+    let version_id = std::env::var(VERSION_ID_ENV)
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(git_version_id)
         .unwrap_or_else(|| format!("v{}-unknown", env!("CARGO_PKG_VERSION")));
-    println!("cargo:rustc-env=COGNEVA_VERSION_ID={version_id}");
-    println!("cargo:rerun-if-env-changed=COGNEVA_VERSION_ID");
+    println!("cargo:rustc-env={VERSION_ID_ENV}={version_id}");
+    println!("cargo:rerun-if-env-changed={VERSION_ID_ENV}");
     println!("cargo:rerun-if-changed=.git/refs/tags");
     println!("cargo:rerun-if-changed=.git/packed-refs");
 }

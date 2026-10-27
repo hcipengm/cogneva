@@ -1315,6 +1315,11 @@ fn pick_delimiter(content: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// 探针要量的那条环境变量：这里设置它、下面按同一个名字去容器输出里找它。
+    /// 两处各写一遍，改一处就变成「设的是 A、找的是 B」，而那在断言里表现为
+    /// 「宿主环境没漏进容器」——一个假绿。
+    const PROBE_ENV: &str = "COGNEVA_ISOLATION_PROBE";
     use super::*;
 
     /// 收进来的必须是**能匹配上的 ref**。实测里那份 `buildah images` 的输出长这样：
@@ -1604,7 +1609,7 @@ docker.m.daocloud.io/library/busybox:1.36
             .collect();
         runtime.exec(&setup).await.expect("建工作目录");
         // 探针要量的那条环境变量，先在**本进程**里设上：这样「容器里没有它」才是读出来的。
-        std::env::set_var("COGNEVA_ISOLATION_PROBE", "1");
+        std::env::set_var(PROBE_ENV, "1");
 
         let out = runtime
             .exec(&run_argv(
@@ -1623,7 +1628,7 @@ docker.m.daocloud.io/library/busybox:1.36
         let first = out.stdout.lines().next().unwrap_or_default().to_string();
         assert_ne!(first, host_net, "容器要有自己的 net 命名空间");
         assert!(
-            !out.stdout.contains("COGNEVA_ISOLATION_PROBE"),
+            !out.stdout.contains(PROBE_ENV),
             "宿主的进程环境不许漏进容器：{}",
             out.stdout
         );

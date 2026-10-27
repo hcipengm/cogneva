@@ -75,3 +75,73 @@ pub const BACKUP_PUBLISH_DIR: &str = "COGNEVA_BACKUP_PUBLISH_DIR";
 /// sides report that as "no passphrase given" — which is also how a run that
 /// should be encrypted but is not would look.
 pub const BACKUP_PACKAGE_KEY: &str = "COGNEVA_BACKUP_PACKAGE_KEY";
+
+/// The Redis the gateway keeps sessions and rate limits in.
+///
+/// The gateway dials it; the config loader maps this name to
+/// `dag_executor.redis_url` so the same declaration reaches the executor. A
+/// second spelling would let the loader document a variable the gateway no
+/// longer reads, and both sides answer a missing name with their own default --
+/// one process on a fresh server, the other on one holding nothing.
+pub const REDIS_URL: &str = "COGNEVA_REDIS_URL";
+
+/// How often the gateway refreshes a contributor's OAuth token, and how close to
+/// expiry it starts.
+///
+/// Read by the gateway that refreshes, and mapped to config keys by the loader
+/// that documents what is tunable. Two spellings would leave the knob listed as
+/// tunable while the refresh kept its built-in interval.
+pub const CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS: &str =
+    "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS";
+pub const CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS: &str =
+    "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS";
+
+/// The repository the GitOps side clones: the gateway serves it as the project
+/// repo, the puller reads it as its source of truth.
+pub const GITOPS_REPO_URL: &str = "COGNEVA_GITOPS_REPO_URL";
+
+/// The secret the platform's own webhook callers sign with.
+///
+/// Written by the gateway's secret writer, verified by the GitHub/Gitee plugin,
+/// and read by the gateway into its own config. Three readers that must agree on
+/// one name: a second spelling verifies against nothing, and every signature
+/// fails as "invalid signature" rather than as "this secret is not the one being
+/// written".
+pub const WEBHOOK_INTERNAL_SECRET: &str = "COGNEVA_WEBHOOK_INTERNAL_SECRET";
+
+/// The secret upstream webhooks are signed with, as the plugin declares it and
+/// the gateway reads it.
+pub const GITHUB_WEBHOOK_SECRET: &str = "COGNEVA_GITHUB_WEBHOOK_SECRET";
+
+/// How often the LLM upstream pool is checked for health.
+///
+/// The gateway reads it into its pool config; the supervisor's own pool check
+/// reads the same number. Two defaults would let the two checks drift to
+/// different intervals while both look configured.
+pub const LLM_POOL_CHECK_SECS: &str = "COGNEVA_LLM_POOL_CHECK_SECS";
+
+/// Where the git proxy in front of upstream hosting listens.
+///
+/// The reflection side resolves it when it clones through the proxy; the gateway
+/// serves it as the project repo endpoint. A second spelling would point one of
+/// them at an address nobody is serving.
+pub const GIT_PROXY_BASE: &str = "COGNEVA_GIT_PROXY_BASE";
+
+/// The commit a build was made from, and how far it sits from the last release.
+///
+/// Two binaries name these and neither can read the other's constant: the
+/// builder injects them into the compile of the main binary, and the deployer
+/// passes them into the build it starts. A second spelling would leave an image
+/// stamped with a name nobody set -- and an unstamped image answers `unknown`,
+/// which reads exactly like a build that genuinely had no `.git`.
+pub const GIT_REVISION: &str = "COGNEVA_GIT_REVISION";
+pub const VERSION_ID: &str = "COGNEVA_VERSION_ID";
+
+/// The log level the gateway's subscriber reads before falling back to
+/// `RUST_LOG`.
+///
+/// The gateway reads it; the config loader maps it to `app.log_level` so the
+/// same declaration reaches the main application. Two spellings would let the
+/// loader advertise a level variable the gateway no longer consults, and both
+/// sides answer "unset" by picking their own default.
+pub const LOG_LEVEL: &str = "COGNEVA_LOG_LEVEL";

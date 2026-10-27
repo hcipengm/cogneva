@@ -11,14 +11,22 @@
 //! 症状是 push 连不上，读起来像「buildah 坏了」。没声明就是没声明：调用方报错，
 //! 不拿约定补位。
 
+/// Pod 内 buildah 用的 Service 端点。设定方是 chart / 静态清单，读取方是本模块
+/// 与配置装载器——两边各拼一遍名字时，改名只改一处不会报错，另一处照旧读一个
+/// 再也没人设置的名字，而「读不到」与「没声明」在调用点上同形。
+pub(crate) const REGISTRY_ENV: &str = "COGNEVA_MAINLINE_DEPLOYER_REGISTRY";
+
+/// 节点上 kubelet 拉镜像用的 `localhost:<NodePort>`。同上。
+pub(crate) const LOCAL_REGISTRY_ENV: &str = "COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY";
+
 /// 集群内 registry 的 Service 端点（`host:port`，不带 scheme）。
 pub fn declared() -> Option<String> {
-    read("COGNEVA_MAINLINE_DEPLOYER_REGISTRY")
+    read(REGISTRY_ENV)
 }
 
 /// 节点侧引用同一个 registry 的端点（`localhost:<NodePort>`）。
 pub fn declared_local() -> Option<String> {
-    read("COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY")
+    read(LOCAL_REGISTRY_ENV)
 }
 
 fn read(key: &str) -> Option<String> {

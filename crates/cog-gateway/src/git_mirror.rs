@@ -50,6 +50,9 @@ pub(crate) fn default_ssh_key() -> std::path::PathBuf {
 /// SSH 目标前缀，拼在 `<owner>/<repo>.git` 前。scp 形式，与
 /// `pull-upstream-main.sh` 里 `git@github.com:hcipengm/cogneva.git` 同款。
 pub(crate) const DEFAULT_SSH_BASE: &str = "git@github.com:";
+/// 网关用自己的那把 SSH 私钥与目标前缀：镜像端与身份端各读一次，名字只写在这里。
+pub(crate) const GIT_SSH_KEY_ENV: &str = "COGNEVA_GATEWAY_GIT_SSH_KEY";
+pub(crate) const GIT_SSH_BASE_ENV: &str = "COGNEVA_GATEWAY_GIT_SSH_BASE";
 /// 镜像保鲜期：最后一次成功 fetch 在这个秒数内，才允许把它当基线发出去。
 /// 取得短是因为它同时是"兜底期基线能有多旧"的上界。
 pub(crate) const MIRROR_FRESHNESS_SECS: u64 = 30;
@@ -143,11 +146,10 @@ impl GitMirrorConfig {
         let enabled = std::env::var("COGNEVA_GATEWAY_GIT_MIRROR_ENABLED")
             .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
             .unwrap_or(true);
-        let key = env_nonempty("COGNEVA_GATEWAY_GIT_SSH_KEY")
+        let key = env_nonempty(GIT_SSH_KEY_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(default_ssh_key);
-        let ssh_base =
-            env_nonempty("COGNEVA_GATEWAY_GIT_SSH_BASE").unwrap_or_else(|| DEFAULT_SSH_BASE.into());
+        let ssh_base = env_nonempty(GIT_SSH_BASE_ENV).unwrap_or_else(|| DEFAULT_SSH_BASE.into());
         // 私钥不存在 = 兜底根本没配好。保持"未启用"而不是每次请求都去试一遍
         // 注定失败的 SSH：缺私钥是**部署事实**，不是瞬时故障，按故障节拍重试
         // 只会把每个请求都拖长。

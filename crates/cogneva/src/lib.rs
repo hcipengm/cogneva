@@ -7,6 +7,7 @@ pub mod assembly;
 pub mod backup;
 pub mod backup_crypto;
 pub mod bootstrap;
+pub mod build_info;
 pub mod claim_store;
 pub mod cli;
 pub mod config_loader;
@@ -81,8 +82,8 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         "Cogneva v{} (build {}, rev {}) starting",
         app_version,
-        env!("COGNEVA_VERSION_ID"),
-        env!("COGNEVA_GIT_REVISION")
+        crate::build_info::VERSION_ID,
+        crate::build_info::GIT_REVISION
     );
     // 解析 secret://env|file|vault 引用（审计 3.3）。
     config_loader::resolve_secret_refs(&mut config).await?;

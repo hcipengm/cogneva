@@ -576,7 +576,7 @@ fn case_task_id(request: &PlatformRequest) -> String {
         request.scaffold,
         request.seed,
         digest(&request.task),
-        env!("COGNEVA_VERSION_ID")
+        crate::build_info::VERSION_ID
     )
 }
 
@@ -897,7 +897,7 @@ mod tests {
     #[test]
     fn the_task_id_carries_every_coordinate_of_the_case() {
         let base = case_task_id(&request("a question", 7));
-        assert!(base.contains(env!("COGNEVA_VERSION_ID")), "{base}");
+        assert!(base.contains(crate::build_info::VERSION_ID), "{base}");
 
         let mut other = request("a question", 7);
         other.scaffold = "gepa".into();

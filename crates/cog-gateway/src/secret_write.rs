@@ -22,7 +22,7 @@ pub(crate) const SECRET_PATCH_PATH: &str = "/internal/secret-patch";
 /// 内部请求的签名头，与 webhook 转发同一个形状（`sha256=<hex>`）。
 pub(crate) const SIGNATURE_HEADER: &str = "x-cogneva-signature-256";
 /// 内部转发凭证的变量名。写入的转发与收端的校验各读一次，名字只在这里写。
-const WEBHOOK_INTERNAL_SECRET_ENV: &str = "COGNEVA_WEBHOOK_INTERNAL_SECRET";
+const WEBHOOK_INTERNAL_SECRET_ENV: &str = cog_core::env::WEBHOOK_INTERNAL_SECRET;
 
 pub(crate) fn sign(secret: &str, body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts any key");

@@ -939,7 +939,7 @@ fn run_checkpoint(
     material.push_str(&format!("benchmarks\t{}\n", args.benchmarks.join(",")));
     material.push_str(&format!("scaffolds\t{}\n", args.scaffolds.join(",")));
     material.push_str(&format!("seeds\t{:?}\n", args.seeds));
-    material.push_str(&format!("software\t{}\n", env!("COGNEVA_VERSION_ID")));
+    material.push_str(&format!("software\t{}\n", crate::build_info::VERSION_ID));
     if let Some(subset) = subset {
         material.push_str(&format!("subset\t{}\n", subset.source().sha256));
     }
@@ -1602,8 +1602,8 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
     // 同一条提交在两次派生里可能得到不同的距离数。
     out.push_str(&format!(
         "software\t{} (rev {})\n",
-        env!("COGNEVA_VERSION_ID"),
-        env!("COGNEVA_GIT_REVISION")
+        crate::build_info::VERSION_ID,
+        crate::build_info::GIT_REVISION
     ));
 
     out.push_str("\n## wiring\n");
@@ -2597,8 +2597,8 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("software\t"))
             .expect("a report that does not name its code cannot be paired with a registration");
-        assert!(line.contains(env!("COGNEVA_VERSION_ID")), "{line}");
-        assert!(line.contains(env!("COGNEVA_GIT_REVISION")), "{line}");
+        assert!(line.contains(crate::build_info::VERSION_ID), "{line}");
+        assert!(line.contains(crate::build_info::GIT_REVISION), "{line}");
         assert!(line.contains("(rev "), "{line}");
         let pins = text
             .split("\n## wiring")

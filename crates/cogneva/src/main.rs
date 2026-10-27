@@ -18,8 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 的 --help/--version/探针输出不变。
     eprintln!(
         "cogneva starting: version {} (rev {})",
-        env!("COGNEVA_VERSION_ID"),
-        env!("COGNEVA_GIT_REVISION")
+        cogneva::build_info::VERSION_ID,
+        cogneva::build_info::GIT_REVISION
     );
 
     // 容器入口即 PID 1，孤儿进程只会被落到这里；这是唯一能收集它们的进程
@@ -81,8 +81,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // makes two different code states answer to one name.
             println!(
                 "cogneva {} (rev {})",
-                env!("COGNEVA_VERSION_ID"),
-                env!("COGNEVA_GIT_REVISION")
+                cogneva::build_info::VERSION_ID,
+                cogneva::build_info::GIT_REVISION
             );
             Ok(())
         }
@@ -108,7 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             cog_gateway::security_gateway::run(
                 gateway_config,
-                Some(env!("COGNEVA_GIT_REVISION")),
+                Some(cogneva::build_info::GIT_REVISION),
                 http_client,
                 key_value,
             )

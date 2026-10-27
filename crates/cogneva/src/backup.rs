@@ -392,8 +392,8 @@ impl BackupConfig {
             ),
             data_dir: PathBuf::from(cog_core::paths::data_dir()),
             extra_data_roots: parse_extra_data_roots(
-                "COGNEVA_BACKUP_EXTRA_DATA_ROOTS",
-                std::env::var("COGNEVA_BACKUP_EXTRA_DATA_ROOTS").ok(),
+                BACKUP_EXTRA_DATA_ROOTS_ENV,
+                std::env::var(BACKUP_EXTRA_DATA_ROOTS_ENV).ok(),
             )?,
             keep_count: std::env::var("COGNEVA_BACKUP_KEEP")
                 .ok()
@@ -429,8 +429,12 @@ impl BackupConfig {
 
 /// 解析 `name=path[,name=path]`。
 ///
-/// 备份与恢复各读一个 env（`COGNEVA_BACKUP_EXTRA_DATA_ROOTS` /
-/// `COGNEVA_RESTORE_EXTRA_DATA_ROOTS`），形状同一条：恢复端面对的是一个包里已经
+/// 出包端与恢复端各读一个 env，名字只在这里各写一遍。
+const BACKUP_EXTRA_DATA_ROOTS_ENV: &str = "COGNEVA_BACKUP_EXTRA_DATA_ROOTS";
+const RESTORE_EXTRA_DATA_ROOTS_ENV: &str = "COGNEVA_RESTORE_EXTRA_DATA_ROOTS";
+
+/// 备份与恢复各读一个 env（[`BACKUP_EXTRA_DATA_ROOTS_ENV`] /
+/// [`RESTORE_EXTRA_DATA_ROOTS_ENV`]），形状同一条：恢复端面对的是一个包里已经
 /// 写下的根名，能不能给出目标路径是另一件事，所以两份表必须用同一个口径解析——
 /// 两份各写一遍解析只会在某一天分叉。`var` 只用于让错误点名是哪一份表坏了。
 ///
@@ -1922,7 +1926,7 @@ async fn run_backup_into(
 
     Ok(BackupManifest {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        revision: env!("COGNEVA_GIT_REVISION").to_string(),
+        revision: crate::build_info::GIT_REVISION.to_string(),
         instance_fingerprint: fingerprint,
         namespace: cfg.namespace.clone(),
         created_at: now_rfc3339(),
@@ -3193,7 +3197,7 @@ fn merge_bundle_ref(
 fn check_provenance(manifest: &BackupManifest) -> Result<(), Box<dyn std::error::Error>> {
     check_provenance_against(
         manifest,
-        env!("COGNEVA_GIT_REVISION"),
+        crate::build_info::GIT_REVISION,
         current_schema_version(),
         &RevAcceptance::from_env(),
     )
@@ -3322,8 +3326,8 @@ async fn restore_artifacts(
     }
     let mut targets: Vec<(String, PathBuf)> = vec![("app".to_string(), data_dir.to_path_buf())];
     targets.extend(parse_extra_data_roots(
-        "COGNEVA_RESTORE_EXTRA_DATA_ROOTS",
-        std::env::var("COGNEVA_RESTORE_EXTRA_DATA_ROOTS").ok(),
+        RESTORE_EXTRA_DATA_ROOTS_ENV,
+        std::env::var(RESTORE_EXTRA_DATA_ROOTS_ENV).ok(),
     )?);
     restore_artifacts_into(pkg_dir, manifest, &targets).await
 }

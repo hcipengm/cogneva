@@ -53,9 +53,9 @@ pub fn declare_cluster_registry() {
     // `*.svc.cluster.local` is a specimen of a deployment fact, and the census
     // that keeps those out of the crates would have to carve an exemption for
     // it. `registry.test` is obviously a fixture to a human reader too.
-    std::env::set_var("COGNEVA_MAINLINE_DEPLOYER_REGISTRY", "registry.test:5000");
+    std::env::set_var(crate::registry_endpoint::REGISTRY_ENV, "registry.test:5000");
     std::env::set_var(
-        "COGNEVA_MAINLINE_DEPLOYER_LOCAL_REGISTRY",
+        crate::registry_endpoint::LOCAL_REGISTRY_ENV,
         "localhost:30500",
     );
 }

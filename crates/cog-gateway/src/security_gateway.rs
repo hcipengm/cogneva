@@ -294,7 +294,7 @@ impl SecurityGatewayConfig {
             search_fallback_upstreams: crate::search_fallback::upstreams_from_env(),
             gitee_oauth_client_id: token("COGNEVA_GITEE_OAUTH_CLIENT_ID"),
             gitee_oauth_client_secret: token("COGNEVA_GITEE_OAUTH_CLIENT_SECRET"),
-            github_oauth_client_id: token("COGNEVA_GITHUB_OAUTH_CLIENT_ID"),
+            github_oauth_client_id: token(GITHUB_OAUTH_CLIENT_ID_ENV),
             github_oauth_client_secret: token("COGNEVA_GITHUB_OAUTH_CLIENT_SECRET"),
             webhook_port: env_u16("COGNEVA_SG_WEBHOOK_PORT", 8082),
             metrics_port: env_u16("COGNEVA_SG_METRICS_PORT", 9090),
@@ -308,27 +308,27 @@ impl SecurityGatewayConfig {
                 crate::document_egress::MAX_BODY_BYTES_ENV,
                 crate::document_egress::DEFAULT_MAX_AUDITED_BODY_BYTES,
             ),
-            github_webhook_secret: token("COGNEVA_GITHUB_WEBHOOK_SECRET"),
+            github_webhook_secret: token(cog_core::env::GITHUB_WEBHOOK_SECRET),
             gitee_webhook_token: token("COGNEVA_GITEE_WEBHOOK_TOKEN"),
             // 投递键由出口表生成：名字散在各处手写就多了一处会漂的地方。
             notification_dingtalk_secret: token(PlatformOutlet::DingTalk.secret_env()),
             notification_feishu_secret: token(PlatformOutlet::Feishu.secret_env()),
-            webhook_internal_secret: token("COGNEVA_WEBHOOK_INTERNAL_SECRET"),
+            webhook_internal_secret: token(cog_core::env::WEBHOOK_INTERNAL_SECRET),
             webhook_forward_url: std::env::var("COGNEVA_WEBHOOK_FORWARD_URL")
                 .unwrap_or_else(|_| "http://cogneva:9091".into()),
-            pool_check_secs: env_u64("COGNEVA_LLM_POOL_CHECK_SECS", 30).max(5),
+            pool_check_secs: env_u64(cog_core::env::LLM_POOL_CHECK_SECS, 30).max(5),
             // 同一个 env 名，读它的进程从主应用换成了这里：清单里那一行没动，
             // 而循环跟着 Secret 的读权走。
             contribution_oauth_refresh_interval_secs: env_u64(
-                "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS",
+                cog_core::env::CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS,
                 0,
             ),
             contribution_oauth_refresh_threshold_secs: env_u64(
-                "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS",
+                cog_core::env::CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS,
                 0,
             ),
             database_url: token(cog_core::env::DATABASE_URL),
-            redis_url: token("COGNEVA_REDIS_URL"),
+            redis_url: token(cog_core::env::REDIS_URL),
             // 配置文件缺失即默认全关，env 覆盖在 load() 内完成。
             observability: ObservabilityExportersConfig::load().unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "观测导出配置解析失败，按全部关闭处理");
@@ -385,6 +385,10 @@ fn upstreams_from_env() -> Vec<LlmUpstream> {
 /// 声明的冗余下限送进来的那个环境变量名。写成常量而不是散在读取点上的字面量：
 /// 同一个名字还要出现在两份部署清单里，三处各写一遍就等于让它们各自漂，而漂的结果
 /// 是「清单里接了、进程不读」或反过来——两边都不报错，只是判定一直按未声明走。
+/// GitHub OAuth 应用的两把钥匙：网关读一份进自己的配置，贡献管理面在显式参数
+/// 缺席时按同一个名字兜底。名字写两遍的后果是兜底永远落空——它读不到就当作没配，
+/// 而「没配」与「配在另一个拼法的名字下」在结果上同形。
+pub(crate) const GITHUB_OAUTH_CLIENT_ID_ENV: &str = "COGNEVA_GITHUB_OAUTH_CLIENT_ID";
 pub(crate) const LLM_POOL_MIN_HEALTHY_ENV: &str = "COGNEVA_LLM_POOL_MIN_HEALTHY";
 
 /// 声明的冗余下限：上面那个环境变量，与上游池同一次写入 Secret 的那个值
@@ -8237,7 +8241,7 @@ fn init_gateway_logging(
     obs: &ObservabilityExportersConfig,
     http_client: &Arc<dyn cog_core::HttpClient>,
 ) -> Option<Arc<LokiBackgroundPusher>> {
-    let level = std::env::var("COGNEVA_LOG_LEVEL")
+    let level = std::env::var(cog_core::env::LOG_LEVEL)
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".into());
     let format = if std::env::var("COGNEVA_LOG_FORMAT")

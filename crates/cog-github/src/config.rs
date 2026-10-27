@@ -185,7 +185,7 @@ impl Default for WebhookConfig {
     fn default() -> Self {
         Self {
             port: 9090,
-            secret_env: "COGNEVA_GITHUB_WEBHOOK_SECRET".into(),
+            secret_env: cog_core::env::GITHUB_WEBHOOK_SECRET.into(),
             path: "/webhooks/github".into(),
             gateway_verified: false,
         }

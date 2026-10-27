@@ -284,7 +284,7 @@ pub(crate) fn oauth_client_id(explicit: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
-        .or_else(|| std::env::var("COGNEVA_GITHUB_OAUTH_CLIENT_ID").ok())
+        .or_else(|| std::env::var(crate::security_gateway::GITHUB_OAUTH_CLIENT_ID_ENV).ok())
         .filter(|s| !s.trim().is_empty())
 }
 

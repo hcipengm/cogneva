@@ -59,7 +59,7 @@ fn default_env_mappings() -> HashMap<String, String> {
     // app
     m.insert("COGNEVA_APP_NAME".into(), "app.name".into());
     m.insert("COGNEVA_APP_VERSION".into(), "app.version".into());
-    m.insert("COGNEVA_LOG_LEVEL".into(), "app.log_level".into());
+    m.insert(cog_core::env::LOG_LEVEL.into(), "app.log_level".into());
     m.insert(cog_core::paths::DATA_DIR_ENV.into(), "app.data_dir".into());
     m.insert("COGNEVA_CONFIG_DIR".into(), "app.config_dir".into());
     m.insert(cog_core::paths::APP_DIR_ENV.into(), "app.app_dir".into());
@@ -83,7 +83,10 @@ fn default_env_mappings() -> HashMap<String, String> {
         "providers.wiki.provider".into(),
     );
     // dag_executor / gateway
-    m.insert("COGNEVA_REDIS_URL".into(), "dag_executor.redis_url".into());
+    m.insert(
+        cog_core::env::REDIS_URL.into(),
+        "dag_executor.redis_url".into(),
+    );
     m.insert("COGNEVA_NATS_URL".into(), "dag_executor.nats.urls.0".into());
     m.insert(
         "COGNEVA_NATS_USERNAME".into(),
@@ -452,11 +455,11 @@ fn default_env_mappings() -> HashMap<String, String> {
         "gateway.request_timeout_secs".into(),
     );
     m.insert(
-        "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS".into(),
+        cog_core::env::CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS.into(),
         "gateway.contribution_oauth_refresh_interval_secs".into(),
     );
     m.insert(
-        "COGNEVA_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS".into(),
+        cog_core::env::CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS.into(),
         "gateway.contribution_oauth_refresh_threshold_secs".into(),
     );
     m.insert(

@@ -591,7 +591,7 @@ impl cog_core::SystemPlugin for GitHubPlugin {
             if webhook_cfg.gateway_verified {
                 // 网关验签模式：平台签名在安全网关完成，本进程只验内部
                 // HMAC，GitHub 与 Gitee 事件共用同一入口。
-                match crate::webhook::resolve_secret("COGNEVA_WEBHOOK_INTERNAL_SECRET") {
+                match crate::webhook::resolve_secret(cog_core::env::WEBHOOK_INTERNAL_SECRET) {
                     Some(secret) => {
                         let state = crate::webhook::VerifiedWebhookState {
                             github_loop: github_shared.clone(),

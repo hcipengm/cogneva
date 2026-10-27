@@ -143,6 +143,18 @@ const EXEMPT: &[Exempt] = &[
         why: "`HOSTNAME` 读不到时给单元起的显示名，不是注册用的角色字段；\
               那条构造里角色读的是常量，显示名改了只换一个标签",
     },
+    Exempt {
+        file: "crates/cogneva/src/build_info.rs",
+        value: "COGNEVA_GIT_REVISION",
+        why: "构建期名字：`env!` 只接受字面量，读它的是编译器而不是运行期，\
+              所以这一处必须自己拼一遍；写它的是 `build.rs`（另一个程序），\
+              把名字换成读 `cog_core::env` 的常量在这里编译不过",
+    },
+    Exempt {
+        file: "crates/cogneva/src/build_info.rs",
+        value: "COGNEVA_VERSION_ID",
+        why: "同上：`env!` 的字面量要求",
+    },
 ];
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {

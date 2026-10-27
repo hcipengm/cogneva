@@ -132,10 +132,10 @@ impl IdentityConfig {
                 .unwrap_or_default()
                 .trim()
                 .to_string(),
-            key_path: nonempty("COGNEVA_GATEWAY_GIT_SSH_KEY")
+            key_path: nonempty(crate::git_mirror::GIT_SSH_KEY_ENV)
                 .map(PathBuf::from)
                 .unwrap_or_else(crate::git_mirror::default_ssh_key),
-            ssh_base: nonempty("COGNEVA_GATEWAY_GIT_SSH_BASE")
+            ssh_base: nonempty(crate::git_mirror::GIT_SSH_BASE_ENV)
                 .unwrap_or_else(|| crate::git_mirror::DEFAULT_SSH_BASE.to_string()),
             git_bin: crate::git_mirror::git_bin_from_env(),
             // 下界 60s：节拍读成 1 会让"等人输入 token"变成每秒一次 SSH 握手。
