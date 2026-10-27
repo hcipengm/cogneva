@@ -39,7 +39,10 @@ pub const ROOT_ENV: &str = "COGNEVA_PROCESS_CENSUS_ROOT";
 pub const DEFAULT_ROOT: &str = "/hostcgroup";
 /// 报给谁。与容器自报同一个端点：这是同一条通道、同一份账。
 pub const URL_ENV: &str = "COGNEVA_PROCESS_CENSUS_URL";
-pub const DEFAULT_URL: &str = "http://cogneva:8085/api/v1/cluster/process-report";
+/// 默认落点取自报那一份常量，不在这里再写一遍地址：同一个端口与路径存两份时，改一份
+/// 不会报错，另一份照旧把读数发到一个没人听的地址上——而「发不过去」在这条读数上与
+/// 「这台节点没有进程」同形。
+pub const DEFAULT_URL: &str = crate::process_report::DEFAULT_REPORT_URL;
 /// 自己跑在哪台节点上。空着照样报，但屏上就没有「这台节点有人在采」的活体。
 ///
 /// 名字声明在 cog-core：容器自报与宿主侧读数读的是同一个变量，两处各写一份时

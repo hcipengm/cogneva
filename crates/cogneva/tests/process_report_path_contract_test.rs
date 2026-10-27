@@ -25,10 +25,14 @@
 //! a live pod is a different question, answered by the topology reading itself.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize as _;
 use serde_yaml::Value;
+
+mod common;
+
+use common::rust_production::production_text;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -297,5 +301,101 @@ fn a_command_that_cannot_reach_the_internal_face_is_not_asked_to_report() {
         !reporting.contains("SandboxExecutor"),
         "沙箱执行器连不到 8085（它的出站策略只放行安全网关、DNS 与 443），\
          让它报就是每分钟发一次必被丢弃的请求"
+    );
+}
+
+/// 生产源码：`crates/*/src` 下的每个 `.rs`。
+fn production_sources(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for krate in std::fs::read_dir(root.join("crates"))
+        .expect("crates/")
+        .flatten()
+    {
+        let src = krate.path().join("src");
+        if src.is_dir() {
+            walk(&src, &mut out);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 自报地址只有一份写法：一个是写它的文件，其余都得引用它。
+///
+/// 采集器曾经在 `process_census.rs` 里把同一个 `http://…` 又写了一遍，两个常量谁也
+/// 不知道谁。改端口时改一处不会报错，另一处照旧把读数发到一个没人听的地址上——而
+/// 「发不过去」在读数面上与「这台节点没有进程」是同一种空白。
+#[test]
+fn the_report_address_is_spelled_in_one_production_file() {
+    // 规范化过的根：read_dir 走出来的路径带着 `../..`，判词里点名一个这样的路径没人
+    // 照着找得到文件。
+    let root = repo_root().canonicalize().expect("仓库根");
+    let report = read("crates/cogneva/src/process_report.rs");
+    let line = report
+        .find("DEFAULT_REPORT_URL")
+        .and_then(|start| report[start..].lines().next())
+        .expect("自报地址常量");
+    let url = line
+        .split('"')
+        .nth(1)
+        .expect("自报地址的字面量")
+        .to_string();
+    let literal = format!("\"{url}\"");
+
+    let sources = production_sources(&root);
+    assert!(
+        sources.len() > 20,
+        "只扫到 {} 个生产源文件——读取器坏了，这条判据会绿得没有意义",
+        sources.len()
+    );
+    assert!(
+        report.contains(&literal),
+        "自报模块自己没有写出 {literal}——读取器问错了文件"
+    );
+
+    let mut offenders = Vec::new();
+    for path in &sources {
+        if path.ends_with("crates/cogneva/src/process_report.rs") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if production_text(&text).contains(&literal) {
+            offenders.push(
+                path.strip_prefix(&root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "这些生产源文件把自报地址又写了一遍：{offenders:?}——同一个端口与路径存两份，\
+         改一处不会报错，另一处照旧把读数发到一个没人听的地址上"
+    );
+}
+
+#[test]
+fn the_census_reports_to_the_same_address_as_the_container_reporter() {
+    assert_eq!(
+        cogneva::process_census::DEFAULT_URL,
+        cogneva::process_report::DEFAULT_REPORT_URL,
+        "采集器的默认落点与容器自报不是同一个地址：采集器的读数会一直发到一个没人听的\
+         端点上，而那在这条读数上与「这台节点没有进程」同形"
     );
 }
