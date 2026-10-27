@@ -1,0 +1,130 @@
+# promtool 规则单测：代码欠账那一条判词**真的会 firing**，而且只在它该响的时候响。
+#
+# 为什么要有这一层：`max (cogneva_code_debt_rows) > 0` 这种「一个 gauge 比一个界」的形状，
+# 结构门只能判出「这条读了那序列」；形状对不代表会响。把界写成 `>= 0`（序列一直在、值常是 0）、
+# 把 `for:` 去掉（一拍抖动就报）、把 `max` 写成 `min`（一台读得干净的宿主替全队把嘴捂上）、
+# 把判据换成 `changes()`（值一变就把计时清零）——四种改法在结构门眼里全都合法，而它们分别
+# 意思是「永远响」「不值得报的也报」「永远不响」「一直有人在改登记表就永远不响」。
+#
+# 界是 0 行：登记表与树不一致的每一行都是一次没做的决定，两种修法都在同一处文件里，
+# 没有「等它自己好」的那一档。所以这份夹具的反向证据都不是「差一点越界」，而是
+# 「界上是 0 时不许响」与「越上去之后不许自己安静下来」。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/22-prometheusrule-code-debt.yaml \
+#         deploy/k3s/observability/tests/22-prometheusrule-code-debt.test.yaml
+rule_files:
+  - ../manifests/22-prometheusrule-code-debt.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、真不一致：`rows` 一直是 1，`for: 30m` 之前空、之后 firing。
+  # 反向证据在前半格——刚读到不一致就响，等于把「有人正在补那一行登记」报成事故。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_code_debt_rows{instance="host-a:9101"}'
+        values: '1x45'
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: CognevaCodeDebtRowDisagreesWithTree
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: CognevaCodeDebtRowDisagreesWithTree
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 二、一致的负对照：`rows` 一直是 0，全程不许响。没有这一格，界写成 `>= 0`
+  # 也能过上面那一格——而那种写法在树与登记表一致的时候照样常亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_code_debt_rows{instance="host-a:9101"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaCodeDebtRowDisagreesWithTree
+        exp_alerts: []
+
+  # 三、一拍的抖动：不一致只出现 10 分钟、随后一直是 0。
+  # 第 5 分钟那一格钉的是 `for:` 本身——把 `for:` 去掉（或写成 0m）它当场就亮了，而
+  # 「有人正在改那一行登记表」正是读数短暂非零的常态。第 60 分钟那一格钉的是「补完了就安静」：
+  # 告警不是一次性的，回到 0 之后不许再响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_code_debt_rows{instance="host-a:9101"}'
+        values: '1x10 0x51'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CognevaCodeDebtRowDisagreesWithTree
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: CognevaCodeDebtRowDisagreesWithTree
+        exp_alerts: []
+
+  # 四、两台宿主读数不同：一台 0、一台 2，同一份输入里一起断言。判据必须取最坏的那台
+  # ——写成 `min` 的话，只要还有一台读得干净就永远安静，而那台干净的可能根本没在判这棵树。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_code_debt_rows{instance="host-a:9101"}'
+        values: '0x45'
+      - series: 'cogneva_code_debt_rows{instance="host-b:9101"}'
+        values: '2x45'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: CognevaCodeDebtRowDisagreesWithTree
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 五、越界之后行数自己变了（3 行补到只剩 1 行）但一直没回到 0：计数一动手就重新等
+  # 30 分钟的写法（`changes()` / `resets()` 那一类）会让「有人在慢慢补」永远不报警，
+  # 而这里要的恰恰是「只要还没补完就一直响」。第 31 分钟必须已经 firing。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_code_debt_rows{instance="host-a:9101"}'
+        values: '3x21 1x25'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: CognevaCodeDebtRowDisagreesWithTree
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 六、树是脏的那一格不进判据（正方向）：`tree_dirty` 为 1、`rows` 也为 1 时照样要响。
+  # 脏树不是免责声明——不一致可能只是别人正在写的那一半，但「要不要现在动手」是处置问题，
+  # 不是「要不要报警」的问题。有人把 `tree_dirty == 0` 写进与条件时，这一格就红了。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_code_debt_rows{instance="host-a:9101"}'
+        values: '1x45'
+      - series: 'cogneva_code_debt_tree_dirty{instance="host-a:9101"}'
+        values: '1x45'
+    alert_rule_test:
+      - eval_time: 31m
+        alertname: CognevaCodeDebtRowDisagreesWithTree
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 七、树是脏的那一格不进判据（反方向）：`tree_dirty` 为 1、`rows` 为 0 时不许响。
+  # 单独一条 `tree_dirty` 是「有人正在提交」，那不是一笔欠账；把这条序列读进判据就会把
+  # 一天到晚的正常提交报成事故。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_code_debt_rows{instance="host-a:9101"}'
+        values: '0x60'
+      - series: 'cogneva_code_debt_tree_dirty{instance="host-a:9101"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaCodeDebtRowDisagreesWithTree
+        exp_alerts: []

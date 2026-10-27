@@ -50,3 +50,4 @@
 19-blackbox-exporter.yaml deliver # 可达性探针本体（ConfigMap + Deployment + Service）：入口、代码托管 API 与证书剩余天数在这里才有读数
 20-prometheusrule-process-census.yaml deliver # 进程采集器自己的活体：一台节点停了（按节点的上报计数不再增长）与一台都没通过（那一族里没有 node 非空的序列）分开判；采集器停了在拓扑面上只表现为每格写着「这一拍没有它」，没有别的会红
 21-prometheusrule-build-cache.yaml deliver # 构建缓存越过自己那个界的两个消费者：够不着（回收跑过、删完了仍高于界 ⇒ 改界或腾卷）与连续多趟没收回（槽一直被占、没人收）；此前这条读数只有面板，没有任何规则读它
+22-prometheusrule-code-debt.yaml deliver # 代码欠账登记与公开树分家的消费者：判的是另一棵仓的树，判决此前只挂在下一个要在这边提交的人身上——那个模块的作者从来跑不到这道门；三天里让三个不相干的人代付过

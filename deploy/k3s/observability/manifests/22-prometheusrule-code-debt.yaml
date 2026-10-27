@@ -1,0 +1,42 @@
+# 代码欠账登记表与公开树分家之后的告警。
+#
+# 为什么需要：`scripts/gates/check-code-debt.py` 判的是**另一棵树**（公开仓），判决本身挂在
+# 那边的提交门上。于是「源根里多了一个没登记的模块」这件事，第一个知道的人永远是下一个要在
+# 这棵树里提交的人——模块的作者提交的是公开仓，从构造上跑不到那道门。2026-10-26 至 10-28
+# 三天里触发三次，每次都要一个不相干的人先替作者做完判断，所有会话的提交才继续。
+#
+# 门留着：一笔落完的树不该与它的登记表分家，那是不变式。缺的是**发现**这一环：门只在下一个人
+# 提交时响，而这条序列每一拍都在响。规则读它，于是不一致在几分钟内自己走到告警面上，而不是
+# 让一个路过的人代付。
+#
+# 界是 0 行：这不是「落后多少算多」的问题。登记表与树不一致的每一行都是一次**没做的决定**
+# （该搬去实现 crate，还是该补一行登记），而两种修法都在同一个人手里、同一处文件里——没有
+# 「等它自己好」的那一档，所以界就是 0，`for` 只是把一拍抖动与一次真不一致分开。
+#
+# `for` 取 30 分钟：一条登记行的编辑窗口比它短，而这条序列的拍距由宿主读数通道决定（分钟级）。
+# 取更长会让「有人正在补登记」与「没人管」在读数上同形太久。
+#
+# `cogneva_code_debt_tree_dirty` 不进这条判据，但处置要读它：脏树上的不一致可能只是别人正在
+# 写的那一半（半截的模块目录、刚生成还没提交的文件），那种情况下动手的人应该等一等，而不是
+# 去改登记表。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-code-debt
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-code-debt
+      rules:
+        - alert: CognevaCodeDebtRowDisagreesWithTree
+          expr: max (cogneva_code_debt_rows) > 0
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 行代码欠账登记与公开树不一致"
+            description: "两条修法都在同一处：`crates/cog-core` 源根里有模块／目录不在两张名单上 ⇒ 决定它是契约（补一行登记）还是能力（搬去实现 crate）；名单里有而树里已经没有 ⇒ 删那一行（已偿还）。点名不需再跑命令：同一组标签的 `cogneva_code_debt_row{kind,subject}` 已经逐行列出。先看 `cogneva_code_debt_tree_dirty`：为 1 说明那棵树此刻有人正在写，等它提交完再看，别去改登记表。"
