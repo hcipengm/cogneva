@@ -2044,14 +2044,48 @@ mod tests {
 
         // Every label any metric declares. Scanned from source so a produced
         // label needs no second edit here.
+        //
+        // A crate writes a label's name in one of two shapes, and the scan reads
+        // both. It used to read only the first, and that made it blind exactly
+        // when the tree got better: on 2026-10-27 the crates moved their label
+        // names into constants one commit at a time, and the scan went on
+        // finding two names out of more than a hundred and forty -- so the check
+        // still passed on a workspace where it could not see the vocabulary the
+        // shipped rules are written against, until the assertion below caught it
+        // in CI, where it held the whole deployment.
+        //
+        // Which of the two shapes a call site uses is a style the tree is
+        // allowed to change; what cannot change is that a summary may only name
+        // a label some producer writes.
         let mut declared: BTreeSet<String> = BTreeSet::new();
         let mut files = 0;
         for entry in walk_rs_files(&root.join("crates")) {
             let text = std::fs::read_to_string(&entry).expect("read crate source");
             files += 1;
+            // Written at the call site: `.with_label("tier", ...)`.
             for rest in text.split(".with_label(\"").skip(1) {
                 if let Some(name) = rest.split('"').next() {
                     declared.insert(name.to_string());
+                }
+            }
+            // Bound once and referred to by name: `const LABEL_TIER: &str =
+            // "tier";`. Matched line by line because that is the shape a
+            // one-literal constant keeps under rustfmt; a declaration it wraps
+            // is not read, and the name it binds is then missing from the
+            // vocabulary, which the assertion below reports rather than a
+            // summary quietly escaping the check.
+            for line in text.lines() {
+                let Some(declaration) = line.find("const LABEL") else {
+                    continue;
+                };
+                let Some(binding) = line[declaration..].find("&str = \"") else {
+                    continue;
+                };
+                let literal = &line[declaration + binding + "&str = \"".len()..];
+                if let Some(name) = literal.split('"').next() {
+                    if !name.is_empty() {
+                        declared.insert(name.to_string());
+                    }
                 }
             }
         }

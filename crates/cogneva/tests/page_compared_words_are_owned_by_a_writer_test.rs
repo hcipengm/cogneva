@@ -49,6 +49,8 @@ const RUNTIME: &str = "crates/cog-agent/src/agent_kernel/runtime.rs";
 const AGENTS: &str = "crates/cog-gateway/src/agents.rs";
 const REFLECTION: &str = "crates/cog-core/src/contract/reflection.rs";
 const CONTRIBUTION: &str = "crates/cog-gateway/src/contribution_admin.rs";
+/// Where the gateway writes the two code-platform words down.
+const PLATFORM_WORDS: &str = "crates/cog-gateway/src/lib.rs";
 const LLM_ADMIN: &str = "crates/cog-gateway/src/llm_admin.rs";
 const PLATFORM: &str = "crates/cog-gateway/src/auth/platform.rs";
 const OAUTH_CALLBACK: &str = "docs/oauth-callback.html";
@@ -169,13 +171,19 @@ const OWNED: &[Owned] = &[
         words: &["ask"],
         source: Source::Writer(REFLECTION, "Self::Ask => \"ask\","),
     },
+    // The word moved from the match arms to the declarations the arms now
+    // dispatch on, and the registration moves with it. Pointed at the old arms
+    // this entry failed the moment the arms stopped spelling the word -- which
+    // is the check working, not a word that lost its writer: `"gitee" => {` no
+    // longer exists anywhere, and the sentence the page compares lives in one
+    // place now.
     Owned {
         words: &["gitee"],
-        source: Source::Writer(CONTRIBUTION, "\"gitee\" => {"),
+        source: Source::Writer(PLATFORM_WORDS, "GITEE_PLATFORM: &str = \"gitee\";"),
     },
     Owned {
         words: &["github"],
-        source: Source::Writer(CONTRIBUTION, "\"github\" => {"),
+        source: Source::Writer(PLATFORM_WORDS, "GITHUB_PLATFORM: &str = \"github\";"),
     },
     // ── 模型接入 ──
     Owned {
