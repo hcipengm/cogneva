@@ -61,7 +61,7 @@ pub async fn list_handler(
             (
                 StatusCode::OK,
                 Json(json!({
-                    "code": "ok",
+                    "code": crate::error::simple_code::OK,
                     "data": {
                         "name": name,
                         "count": rows.len(),
@@ -76,7 +76,7 @@ pub async fn list_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "code": "internal_error",
+                    "code": crate::error::simple_code::INTERNAL_ERROR,
                     "error": "catalog_read_failed",
                     "message": e.to_string(),
                 })),
@@ -97,7 +97,7 @@ pub async fn get_handler(
         Ok(Some(entry)) => (
             StatusCode::OK,
             Json(json!({
-                "code": "ok",
+                "code": crate::error::simple_code::OK,
                 "data": entry_json(&entry),
             })),
         )
@@ -105,7 +105,7 @@ pub async fn get_handler(
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({
-                "code": "not_found",
+                "code": crate::error::simple_code::NOT_FOUND,
                 "error": "dataset_version_not_found",
                 "name": name,
                 "version": version,
@@ -117,7 +117,7 @@ pub async fn get_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "code": "internal_error",
+                    "code": crate::error::simple_code::INTERNAL_ERROR,
                     "error": "catalog_read_failed",
                     "message": e.to_string(),
                 })),
@@ -215,7 +215,7 @@ pub async fn verify_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "code": "internal_error",
+                    "code": crate::error::simple_code::INTERNAL_ERROR,
                     "error": "catalog_verify_failed",
                     "message": e.to_string(),
                 })),
@@ -229,7 +229,7 @@ fn unavailable() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
-            "code": "service_unavailable",
+            "code": crate::error::simple_code::SERVICE_UNAVAILABLE,
             "error": "dataset_catalog_not_configured",
             "message": "No dataset catalog is configured on this deployment",
         })),

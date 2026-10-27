@@ -30,7 +30,7 @@ pub async fn upload_file_handler(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
-                    "code": "service_unavailable",
+                    "code": crate::error::simple_code::SERVICE_UNAVAILABLE,
                     "error": "dataset_catalog_not_configured",
                     "message": "File uploads need an object store and its catalog; one of them is missing"
                 })),
@@ -49,7 +49,7 @@ pub async fn upload_file_handler(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
-                    "code": "bad_request",
+                    "code": crate::error::simple_code::BAD_REQUEST,
                     "error": "multipart_parse_failed",
                     "message": e.to_string()
                 })),
@@ -66,7 +66,7 @@ pub async fn upload_file_handler(
                     return (
                         StatusCode::BAD_REQUEST,
                         Json(json!({
-                            "code": "bad_request",
+                            "code": crate::error::simple_code::BAD_REQUEST,
                             "error": "file_read_failed",
                             "message": e.to_string()
                         })),
@@ -81,7 +81,7 @@ pub async fn upload_file_handler(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "code": "bad_request",
+                "code": crate::error::simple_code::BAD_REQUEST,
                 "error": "missing_file",
                 "message": "No file field found in multipart upload"
             })),
@@ -114,7 +114,7 @@ pub async fn upload_file_handler(
             (
                 StatusCode::CREATED,
                 Json(json!({
-                    "code": "ok",
+                    "code": crate::error::simple_code::OK,
                     "data": {
                         "file_id": file_id,
                         "uri": key,
@@ -137,7 +137,7 @@ pub async fn upload_file_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "code": "internal_error",
+                    "code": crate::error::simple_code::INTERNAL_ERROR,
                     "error": "upload_failed",
                     "message": e.to_string()
                 })),
@@ -157,7 +157,7 @@ pub async fn get_file_handler(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
-                    "code": "service_unavailable",
+                    "code": crate::error::simple_code::SERVICE_UNAVAILABLE,
                     "error": "object_backend_not_configured",
                     "message": "File storage backend is not available"
                 })),
@@ -174,7 +174,7 @@ pub async fn get_file_handler(
             (
                 StatusCode::OK,
                 Json(json!({
-                    "code": "ok",
+                    "code": crate::error::simple_code::OK,
                     "data": {
                         "file_id": file_id,
                         "key": key,
@@ -187,7 +187,7 @@ pub async fn get_file_handler(
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({
-                "code": "not_found",
+                "code": crate::error::simple_code::NOT_FOUND,
                 "error": "file_not_found",
                 "file_id": file_id,
             })),
@@ -198,7 +198,7 @@ pub async fn get_file_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "code": "internal_error",
+                    "code": crate::error::simple_code::INTERNAL_ERROR,
                     "error": "check_failed",
                     "message": e.to_string()
                 })),
@@ -218,7 +218,7 @@ pub async fn delete_file_handler(
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
-                    "code": "service_unavailable",
+                    "code": crate::error::simple_code::SERVICE_UNAVAILABLE,
                     "error": "object_backend_not_configured",
                     "message": "File storage backend is not available"
                 })),
@@ -233,7 +233,7 @@ pub async fn delete_file_handler(
         Ok(()) => (
             StatusCode::OK,
             Json(json!({
-                "code": "ok",
+                "code": crate::error::simple_code::OK,
                 "data": {
                     "file_id": file_id,
                     "deleted_at": chrono::Utc::now().to_rfc3339(),
@@ -246,7 +246,7 @@ pub async fn delete_file_handler(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "code": "internal_error",
+                    "code": crate::error::simple_code::INTERNAL_ERROR,
                     "error": "delete_failed",
                     "message": e.to_string()
                 })),

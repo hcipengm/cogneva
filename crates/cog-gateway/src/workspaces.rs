@@ -38,7 +38,7 @@ pub async fn list_workspaces_handler(State(state): State<Arc<GatewayState>>) -> 
             return (
                 StatusCode::OK,
                 Json(json!({
-                    "code": "ok",
+                    "code": crate::error::simple_code::OK,
                     "data": {
                         "items": []
                     }
@@ -74,7 +74,7 @@ pub async fn list_workspaces_handler(State(state): State<Arc<GatewayState>>) -> 
     (
         StatusCode::OK,
         Json(json!({
-            "code": "ok",
+            "code": crate::error::simple_code::OK,
             "data": {
                 "items": items
             }
@@ -93,7 +93,7 @@ pub async fn get_workspace_handler(
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({
-                    "code": "not_found",
+                    "code": crate::error::simple_code::NOT_FOUND,
                     "error": "workspace_not_found",
                     "workspace_id": workspace_id,
                 })),
@@ -117,7 +117,7 @@ pub async fn get_workspace_handler(
         Some(w) => (
             StatusCode::OK,
             Json(json!({
-                "code": "ok",
+                "code": crate::error::simple_code::OK,
                 "data": {
                     "id": w.id,
                     "name": w.name,
@@ -134,7 +134,7 @@ pub async fn get_workspace_handler(
         None => (
             StatusCode::NOT_FOUND,
             Json(json!({
-                "code": "not_found",
+                "code": crate::error::simple_code::NOT_FOUND,
                 "error": "workspace_not_found",
                 "workspace_id": workspace_id,
             })),
@@ -153,7 +153,7 @@ pub async fn list_workspace_members_handler(
             return (
                 StatusCode::OK,
                 Json(json!({
-                    "code": "ok",
+                    "code": crate::error::simple_code::OK,
                     "data": {
                         "workspace_id": workspace_id,
                         "items": []
@@ -193,7 +193,7 @@ pub async fn list_workspace_members_handler(
     (
         StatusCode::OK,
         Json(json!({
-            "code": "ok",
+            "code": crate::error::simple_code::OK,
             "data": {
                 "workspace_id": workspace_id,
                 "items": members

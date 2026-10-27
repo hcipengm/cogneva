@@ -60,7 +60,7 @@ pub async fn list_notifications_handler(
             return (
                 StatusCode::OK,
                 Json(json!({
-                    "code": "ok",
+                    "code": crate::error::simple_code::OK,
                     "data": {
                         "items": [],
                         "unread_count": 0,
@@ -113,7 +113,7 @@ pub async fn list_notifications_handler(
     (
         StatusCode::OK,
         Json(json!({
-            "code": "ok",
+            "code": crate::error::simple_code::OK,
             "data": {
                 "items": json_items,
                 "unread_count": list.unread_count,
@@ -139,7 +139,7 @@ pub async fn mark_read_handler(
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({
-                    "code": "not_found",
+                    "code": crate::error::simple_code::NOT_FOUND,
                     "error": "notification_not_found",
                     "notification_id": notification_id,
                 })),
@@ -152,7 +152,7 @@ pub async fn mark_read_handler(
         Ok(true) => (
             StatusCode::OK,
             Json(json!({
-                "code": "ok",
+                "code": crate::error::simple_code::OK,
                 "data": {
                     "notification_id": notification_id,
                     "is_read": true,
@@ -164,7 +164,7 @@ pub async fn mark_read_handler(
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({
-                "code": "not_found",
+                "code": crate::error::simple_code::NOT_FOUND,
                 "error": "notification_not_found",
                 "notification_id": notification_id,
             })),
@@ -191,7 +191,7 @@ pub async fn mark_all_read_handler(
             return (
                 StatusCode::OK,
                 Json(json!({
-                    "code": "ok",
+                    "code": crate::error::simple_code::OK,
                     "data": {
                         "is_read": true,
                         "read_at": chrono::Utc::now().to_rfc3339(),
@@ -206,7 +206,7 @@ pub async fn mark_all_read_handler(
         Ok(_count) => (
             StatusCode::OK,
             Json(json!({
-                "code": "ok",
+                "code": crate::error::simple_code::OK,
                 "data": {
                     "is_read": true,
                     "read_at": chrono::Utc::now().to_rfc3339(),

@@ -83,7 +83,7 @@ pub async fn list_sessions_handler(
     (
         StatusCode::OK,
         Json(json!({
-            "code": "ok",
+            "code": crate::error::simple_code::OK,
             "data": {
                 "items": [],
                 "next_cursor": null,
@@ -102,7 +102,7 @@ pub async fn create_session_handler(
     (
         StatusCode::CREATED,
         Json(json!({
-            "code": "ok",
+            "code": crate::error::simple_code::OK,
             "data": {
                 "session_id": session_id,
                 "title": payload.title.unwrap_or_else(|| "新对话".to_string()),
@@ -122,7 +122,7 @@ pub async fn get_session_handler(
     (
         StatusCode::NOT_FOUND,
         Json(json!({
-            "code": "not_found",
+            "code": crate::error::simple_code::NOT_FOUND,
             "error": "session_not_found",
             "session_id": session_id,
         })),
@@ -138,7 +138,7 @@ pub async fn update_session_handler(
     (
         StatusCode::OK,
         Json(json!({
-            "code": "ok",
+            "code": crate::error::simple_code::OK,
             "data": {
                 "session_id": session_id,
                 "title": payload.title,
@@ -157,7 +157,7 @@ pub async fn delete_session_handler(
     (
         StatusCode::OK,
         Json(json!({
-            "code": "ok",
+            "code": crate::error::simple_code::OK,
             "data": {
                 "session_id": session_id,
                 "deleted_at": chrono::Utc::now(),
@@ -190,7 +190,7 @@ pub async fn list_messages_handler(
         return (
             StatusCode::OK,
             Json(json!({
-                "code": "ok",
+                "code": crate::error::simple_code::OK,
                 "data": {
                     "session_id": session_id,
                     "items": [],
@@ -223,7 +223,7 @@ pub async fn list_messages_handler(
             (
                 StatusCode::OK,
                 Json(json!({
-                    "code": "ok",
+                    "code": crate::error::simple_code::OK,
                     "data": {
                         "session_id": session_id,
                         "items": items,
@@ -255,7 +255,7 @@ pub async fn send_message_handler(
     (
         StatusCode::ACCEPTED,
         Json(json!({
-            "code": "ok",
+            "code": crate::error::simple_code::OK,
             "data": {
                 "message_id": message_id,
                 "session_id": session_id,
@@ -277,7 +277,7 @@ pub async fn regenerate_message_handler(
     (
         StatusCode::ACCEPTED,
         Json(json!({
-            "code": "ok",
+            "code": crate::error::simple_code::OK,
             "data": {
                 "session_id": session_id,
                 "source_message_id": message_id,

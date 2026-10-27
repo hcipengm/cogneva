@@ -5,6 +5,34 @@ use axum::{
 };
 use serde::Serialize;
 
+/// 另一种响应信封的粗粒度 `code`。
+///
+/// 网关上有两种信封，`code` 与 `error` 两个格的**含义正好相反**：
+///
+/// - [`ApiError`]：`error` 是粗类（`NotFound` / `Conflict`，由它挑状态码），
+///   `code` 是细标识（`not_found` / `owner_mismatch`）。
+/// - 下面这一套：处理函数直接拼 `json!`，`code` 是粗类（`ok` / `not_found` /
+///   `internal_error`），`error` 是细标识（`upload_failed` /
+///   `session_not_found`）。
+///
+/// 两套词都写在这个文件里，是为了让「同一个词在两个信封里意思不同」这件事
+/// 看得见：`not_found` 两边都出现，一个说的是粗类、一个说的是细标识；谁按
+/// 名字把它们当成同一个词，就会把两种不同的拒绝对到一起。拼在四十多处
+/// `json!` 里的字面量，改一处不会有任何报错，那一处的读者从此收到一个谁也不
+/// 认的码。
+pub mod simple_code {
+    /// 请求成功。
+    pub const OK: &str = "ok";
+    /// 被请求的东西不存在；细标识在 `error` 格里。
+    pub const NOT_FOUND: &str = "not_found";
+    /// 请求本身不成立；细标识在 `error` 格里。
+    pub const BAD_REQUEST: &str = "bad_request";
+    /// 这个部署现在回答不了；细标识在 `error` 格里。
+    pub const SERVICE_UNAVAILABLE: &str = "service_unavailable";
+    /// 平台自己出的错；细标识在 `error` 格里。
+    pub const INTERNAL_ERROR: &str = "internal_error";
+}
+
 /// 统一 API 错误响应体。
 ///
 /// 三个格子各管一件事：`error` 是粗粒度类别（映射到状态码），`code` 是稳定

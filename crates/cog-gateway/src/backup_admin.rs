@@ -419,7 +419,7 @@ pub async fn download_handler(Path(name): Path<String>) -> Response {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({ "code": "not_found", "message": format!("{name} 不在发布目录里") })),
+                Json(json!({ "code": crate::error::simple_code::NOT_FOUND, "message": format!("{name} 不在发布目录里") })),
             )
                 .into_response();
         }
@@ -476,7 +476,7 @@ pub async fn delete_handler(Path(name): Path<String>) -> Response {
         Ok(()) => (StatusCode::OK, Json(json!({ "deleted": name }))).into_response(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (
             StatusCode::NOT_FOUND,
-            Json(json!({ "code": "not_found", "message": format!("{name} 不在发布目录里") })),
+            Json(json!({ "code": crate::error::simple_code::NOT_FOUND, "message": format!("{name} 不在发布目录里") })),
         )
             .into_response(),
         Err(e) => (
