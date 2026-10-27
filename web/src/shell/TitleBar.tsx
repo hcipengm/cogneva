@@ -89,6 +89,28 @@ export function TitleBar() {
           />
           模型
         </button>
+        {/* 代码平台与上网以前只住在命令面板和设置页里：知道它们存在的人得先进
+            别处才找得到。它们是两条各自独立的对外通路，顶栏各给一格。 */}
+        <button
+          type="button"
+          onClick={overlays.openCredentials}
+          title="代码平台（GitHub / Gitee）令牌与 SSH 身份 · 点开配置"
+          aria-label="代码平台：令牌与 SSH 身份"
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--muted)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
+        >
+          <Icon name="scm" size={14} />
+          代码平台
+        </button>
+        <button
+          type="button"
+          onClick={overlays.openWebSearch}
+          title="上网检索与抓取的后备池 · 点开配置"
+          aria-label="上网：检索与抓取的后备池"
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--muted)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
+        >
+          <Icon name="search" size={14} />
+          上网
+        </button>
         <button
           type="button"
           onClick={() => setActivity('settings')}
