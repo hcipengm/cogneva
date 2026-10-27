@@ -376,13 +376,10 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
     // 3. 两个都没有：只显示申报量，并在界面上说明白，不画一条零线。
     // 读不到不是错误：这一面照样能画申报量，把它当成读失败会让一个没装 metrics-server
     // 的集群整天亮着一张红条。
-    let (usage, usage_source) = match client
-        .get_json(&format!(
-            "/apis/metrics.k8s.io/v1beta1/namespaces/{}/pods",
-            client.namespace()
-        ))
-        .await
-    {
+    // 用量与 Pod 都按整个集群读，与节点那一层同范围：采集器量的是整台宿主上的
+    // 每一个容器，这一面若只画自己命名空间里的，差出来的那些容器就只有进程读数、
+    // 没有格子（2026-10-27 实测 71 个容器里 22 个在本命名空间）。
+    let (usage, usage_source) = match client.get_json("/apis/metrics.k8s.io/v1beta1/pods").await {
         Ok(list) => (usage_by_pod(&list), Some(USAGE_FROM_METRICS.to_string())),
         Err(_) => match usage_from_kubelets(&client, &view.nodes).await {
             Some(usage) => (usage, Some(USAGE_FROM_KUBELET.to_string())),
@@ -413,7 +410,7 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         Err(_) => std::collections::HashMap::new(),
     };
 
-    let pods_path = format!("/api/v1/namespaces/{}/pods", client.namespace());
+    let pods_path = "/api/v1/pods".to_string();
     match client.get_json(&pods_path).await {
         Ok(pods) => {
             // 卷的实际占用来自平台自己的走查端：每台节点上都有一个 claim-store，
@@ -432,9 +429,10 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
                 .map(|items| items.iter().map(|pod| pod_view(pod, &sources)).collect())
                 .unwrap_or_default();
             place_pods(&mut view, parsed);
-            // 采集器读的是整台宿主，这一面按命名空间取 Pod：两者差出来的那些容器
-            // 有进程读数却没有格子。差读在 Pod 读成功之后——读不到 Pod 时不知道
-            // 谁被认领了，那时的差不是差，是不知道。
+            // 采集器读的是整台宿主上的每一个容器，这一面画的是每个有 Pod 的容器。
+            // 两者差出来的那些（宿主上的构建容器、不经 k8s 起的进程）有进程读数却没有
+            // 格子。差读在 Pod 读成功之后——读不到 Pod 时不知道谁被认领了，那时的差
+            // 不是差，是不知道。
             let claimed = claimed_container_ids(pods.get("items"));
             for node in &mut view.nodes {
                 if let Some((seen, unclaimed)) =
@@ -589,6 +587,16 @@ struct PodUsage {
     containers: std::collections::HashMap<String, (u64, u64)>,
 }
 
+/// 读数表按「命名空间/名字」索引。
+///
+/// Pod、卷声明、事件的对象名都只在各自的命名空间里唯一：这一面读整个集群之后，
+/// 两个命名空间各有一个 `redis-0` 是常态（平台自己就有一份，别的命名空间也可能有）。
+/// 按裸名字索引会让其中一个认领另一个的用量、事件、卷字节数——错得没有声音，
+/// 因为两行都填满了，只是填的是别人的数。
+fn namespaced_key(namespace: &str, name: &str) -> String {
+    format!("{namespace}/{name}")
+}
+
 fn usage_by_pod(list: &Value) -> std::collections::HashMap<String, PodUsage> {
     let mut usage = std::collections::HashMap::new();
     let Some(items) = list.get("items").and_then(Value::as_array) else {
@@ -598,6 +606,10 @@ fn usage_by_pod(list: &Value) -> std::collections::HashMap<String, PodUsage> {
         let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
             continue;
         };
+        let namespace = item
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let mut pod = PodUsage::default();
         for container in item
             .get("containers")
@@ -623,7 +635,7 @@ fn usage_by_pod(list: &Value) -> std::collections::HashMap<String, PodUsage> {
             pod.containers
                 .insert(container_name.to_string(), (cpu, memory));
         }
-        usage.insert(name.to_string(), pod);
+        usage.insert(namespaced_key(namespace, name), pod);
     }
     usage
 }
@@ -637,8 +649,12 @@ fn claims_by_name(list: &Value) -> std::collections::HashMap<String, ClaimView> 
         let Some(name) = item.pointer("/metadata/name").and_then(Value::as_str) else {
             continue;
         };
+        let namespace = item
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         claims.insert(
-            name.to_string(),
+            namespaced_key(namespace, name),
             ClaimView {
                 name: name.to_string(),
                 phase: item
@@ -765,10 +781,13 @@ async fn measured_claim_bytes(
         let Ok(text) = response.text().await else {
             continue;
         };
-        for claim in claims.keys() {
-            if let Some(bytes) = cog_core::claim_footprint::used_bytes_from_exposition(&text, claim)
+        for (key, claim) in claims {
+            // 暴露面上印的是卷声明自己的名字，不带命名空间；表里的键带命名空间。
+            // 拿键去匹配就一条都对不上，屏上每一块盘都是「没量到」。
+            if let Some(bytes) =
+                cog_core::claim_footprint::used_bytes_from_exposition(&text, &claim.name)
             {
-                measured.insert(claim.clone(), bytes);
+                measured.insert(key.clone(), bytes);
             }
         }
     }
@@ -947,7 +966,7 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
         .cloned()
         .unwrap_or_default();
 
-    let pod_usage = usage.get(&name);
+    let pod_usage = usage.get(&namespaced_key(&namespace, &name));
     let container_usage = pod_usage
         .map(|pod| pod.containers.clone())
         .unwrap_or_default();
@@ -1025,8 +1044,11 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
         .max()
         .unwrap_or(0);
 
-    let volumes = pod_volumes(pod, sources);
-    let pod_events = events.get(&name).cloned().unwrap_or_default();
+    let volumes = pod_volumes(pod, sources, &namespace);
+    let pod_events = events
+        .get(&namespaced_key(&namespace, &name))
+        .cloned()
+        .unwrap_or_default();
     let conditions = conditions_of(pod);
     let process_census_at = node.as_deref().and_then(crate::process_reports::census_at);
 
@@ -1155,7 +1177,7 @@ fn container_mounts(spec: &Value) -> Vec<MountView> {
 
 /// 卷的类型就是除 `name` 之外那个键。读不出来（投影卷、CSI 内联卷等）时写 `other`，
 /// 不猜一个名字——猜出来的类型会让读者去改错的东西。
-fn pod_volumes(pod: &Value, sources: &Sources) -> Vec<VolumeView> {
+fn pod_volumes(pod: &Value, sources: &Sources, namespace: &str) -> Vec<VolumeView> {
     pod.pointer("/spec/volumes")
         .and_then(Value::as_array)
         .map(|volumes| {
@@ -1173,7 +1195,9 @@ fn pod_volumes(pod: &Value, sources: &Sources) -> Vec<VolumeView> {
                         .get("persistentVolumeClaim")
                         .and_then(|claim| claim.get("claimName"))
                         .and_then(Value::as_str)
-                        .and_then(|claim_name| sources.claims.get(claim_name))
+                        .and_then(|claim_name| {
+                            sources.claims.get(&namespaced_key(namespace, claim_name))
+                        })
                         .map(|claim| ClaimView {
                             name: claim.name.clone(),
                             phase: claim.phase.clone(),
@@ -1181,7 +1205,10 @@ fn pod_volumes(pod: &Value, sources: &Sources) -> Vec<VolumeView> {
                             capacity_bytes: claim.capacity_bytes,
                             access_modes: claim.access_modes.clone(),
                             volume_name: claim.volume_name.clone(),
-                            measured_bytes: sources.measured.get(&claim.name).copied(),
+                            measured_bytes: sources
+                                .measured
+                                .get(&namespaced_key(namespace, &claim.name))
+                                .copied(),
                         });
                     Some(VolumeView { name, kind, claim })
                 })
@@ -1207,8 +1234,13 @@ fn events_by_object(list: &Value) -> std::collections::HashMap<String, Vec<Event
         let Some(name) = item.pointer("/involvedObject/name").and_then(Value::as_str) else {
             continue;
         };
+        let namespace = item
+            .pointer("/involvedObject/namespace")
+            .and_then(Value::as_str)
+            .or_else(|| item.pointer("/metadata/namespace").and_then(Value::as_str))
+            .unwrap_or("");
         grouped
-            .entry(name.to_string())
+            .entry(namespaced_key(namespace, name))
             .or_default()
             .push(EventView {
                 kind: item
@@ -2256,7 +2288,7 @@ mod topology_tests {
         let mut items = Vec::new();
         for minute in 1..=7 {
             items.push(json!({
-                "involvedObject": { "kind": "Pod", "name": "api-1" },
+                "involvedObject": { "kind": "Pod", "name": "api-1", "namespace": "cogneva" },
                 "type": "Warning",
                 "reason": "Unhealthy",
                 "message": "readiness probe failed",
@@ -2265,14 +2297,14 @@ mod topology_tests {
             }));
         }
         items.push(json!({
-            "involvedObject": { "kind": "Service", "name": "api-1" },
+            "involvedObject": { "kind": "Service", "name": "api-1", "namespace": "cogneva" },
             "type": "Normal",
             "reason": "EnsuredLoadBalancer",
             "message": "not a pod event"
         }));
 
         let grouped = events_by_object(&json!({ "items": items }));
-        let events = &grouped["api-1"];
+        let events = &grouped["cogneva/api-1"];
         assert_eq!(events.len(), 5, "每个对象最多留五条");
         assert_eq!(
             events[0].last_seen.as_deref(),
@@ -2304,7 +2336,7 @@ mod topology_tests {
         );
 
         let metrics = json!({ "items": [{
-            "metadata": { "name": "api-1" },
+            "metadata": { "name": "api-1", "namespace": "cogneva" },
             "containers": [{ "name": "api", "usage": { "cpu": "120m", "memory": "300Mi" } }]
         }]});
         let usage = usage_by_pod(&metrics);
@@ -2552,12 +2584,12 @@ mod topology_tests {
             "status": { "phase": "Running", "containerStatuses": [] }
         });
         let claims = claims_by_name(&json!({ "items": [{
-            "metadata": { "name": "app-data" },
+            "metadata": { "name": "app-data", "namespace": "cogneva" },
             "spec": { "storageClassName": "local-path" },
             "status": { "phase": "Bound", "capacity": { "storage": "10Gi" }, "accessModes": ["ReadWriteOnce"] }
         }]}));
         let mut measured = std::collections::HashMap::new();
-        measured.insert("app-data".to_string(), 3_221_225_472u64);
+        measured.insert("cogneva/app-data".to_string(), 3_221_225_472u64);
         let sources = Sources {
             claims,
             measured,
@@ -2579,7 +2611,7 @@ mod topology_tests {
             &pod,
             &Sources {
                 claims: claims_by_name(&json!({ "items": [{
-                    "metadata": { "name": "app-data" },
+                    "metadata": { "name": "app-data", "namespace": "cogneva" },
                     "status": { "phase": "Pending" }
                 }]})),
                 ..Sources::default()
@@ -2588,6 +2620,51 @@ mod topology_tests {
         assert_eq!(
             unmeasured.volumes[0].claim.as_ref().unwrap().measured_bytes,
             None
+        );
+    }
+
+    /// 这一面读的是整个集群的 Pod，于是别处也有 `redis-0` 是常态。
+    ///
+    /// 用量、事件、卷三张表原先按裸名字索引：两个命名空间里同名的对象会认领
+    /// 对方那一行，而屏上两行都填满了——错得没有声音。键改成「命名空间/名字」，
+    /// 这条测试就是那个不改就会红的地方。
+    #[test]
+    fn a_pod_in_another_namespace_does_not_inherit_its_namesakes_readings() {
+        let pod = |namespace: &str| {
+            json!({
+                "metadata": { "name": "redis-0", "namespace": namespace },
+                "spec": { "containers": [{ "name": "redis" }] },
+                "status": { "phase": "Running", "containerStatuses": [] }
+            })
+        };
+        let usage = usage_by_pod(&json!({ "items": [{
+            "metadata": { "name": "redis-0", "namespace": "cogneva" },
+            "containers": [{ "name": "redis", "usage": { "cpu": "12m", "memory": "64Mi" } }]
+        }]}));
+        let events = events_by_object(&json!({ "items": [{
+            "type": "Warning",
+            "reason": "BackOff",
+            "message": "restarting",
+            "involvedObject": { "kind": "Pod", "name": "redis-0", "namespace": "cogneva" }
+        }]}));
+        let sources = Sources {
+            usage,
+            events,
+            ..Sources::default()
+        };
+
+        let mine = pod_view(&pod("cogneva"), &sources);
+        assert_eq!(mine.cpu_used_millicores, Some(12));
+        assert_eq!(mine.events.len(), 1);
+
+        let theirs = pod_view(&pod("another-team"), &sources);
+        assert_eq!(
+            theirs.cpu_used_millicores, None,
+            "别的命名空间里的同名 Pod 没有用量读数，不是拿到了这一个的"
+        );
+        assert!(
+            theirs.events.is_empty(),
+            "别处的同 Pod 不该继承这个 Pod 的 BackOff"
         );
     }
 
@@ -2647,7 +2724,7 @@ mod topology_tests {
             "status": { "phase": "Running", "containerStatuses": [] }
         });
         let claims = claims_by_name(&json!({ "items": [{
-            "metadata": { "name": "app-data" },
+            "metadata": { "name": "app-data", "namespace": "cogneva" },
             "spec": { "storageClassName": "local-path", "volumeName": "pvc-1234" },
             "status": {
                 "phase": "Bound",

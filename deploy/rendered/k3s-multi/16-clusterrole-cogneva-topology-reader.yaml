@@ -6,11 +6,18 @@
 #
 # 这是这份清单里唯一的 ClusterRole：节点不属于任何命名空间，而「东西跑在哪台机器
 # 上、那台机器还剩多少」这一面必须读到节点的就绪条件、角色标签与可分配量
-# （`/api/v1/nodes` 的 status.allocatable）。Pod 那一层仍走上面那条命名空间 Role，
-# 不跟着一起扩到集群作用域。
+# （`/api/v1/nodes` 的 status.allocatable）。
+#
+# Pod 也在这一层读。范围不是凭空放宽的：进程采集器是一个 hostPID 的 DaemonSet，
+# 它读的是整台宿主上每一个容器的 cgroup——一台机器上有多少容器、各跑着多少进程，
+# 这个平台本来就已经全部看得到。只让 Pod 那一层留在本命名空间，屏上就只剩本命名
+# 空间的格子，差出来的那些（系统组件、监控、宿主上的构建容器）有进程读数却没有位置，
+# 而读者分不清「没有」和「没读」。读不到就画不出，画不出就不算全量。
 #
 # 只要 get 与 list：这一面按轮询读，不 watch；更没有任何写。加到 write 的那一天，
 # 就是「一个只读的图」变成了「能改集群的入口」，而这张清单上看不出来区别。
+# 事件与卷声明仍只读本命名空间（下面那条 Role）：它们是「这个 Pod 为什么没起来」
+# 的补充，不是这一面的骨架。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -29,6 +36,15 @@ rules:
   # 也不会因此报错——读不到用量是「没有数据源」，不是权限问题。
   - apiGroups: ["metrics.k8s.io"]
     resources: ["nodes"]
+    verbs: ["get", "list"]
+  # Pod 与它们的实际用量：与上面同一条理由——这一面画的是整个集群的容器，
+  # 不是本命名空间的容器。`pods` 同时覆盖了命名空间那条 Role 里的同名授权，
+  # 那条留着是因为它还有事件与卷声明要读。
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
     verbs: ["get", "list"]
   # 没有 metrics-server 时的用量来源：kubelet 自带的 summary 接口，经 apiserver
   # 代理读（`/api/v1/nodes/<节点>/proxy/stats/summary`）。apiserver 按路径把代理

@@ -614,15 +614,15 @@ function ClusterDetail({
       </div>
 
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">
-        Pod 只数这一个命名空间里的；节点是整台机器的。没被调度到任何节点的 {cluster.unscheduled.length} 个、
+        Pod 与节点都是整个集群的；事件与卷声明只读这一个命名空间。没被调度到任何节点的 {cluster.unscheduled.length} 个、
         写着在某个节点但这拍没读到那台的 {cluster.unplaced.length} 个，都不在上面这个数里。
         {censused.length > 0 && (
           <>
             {' '}
             进程采集器在 {censused.length}/{cluster.nodes.length} 台节点上看到{' '}
             <span className="mono">{censusSeen}</span> 个容器，其中{' '}
-            <span className="mono">{censusGap}</span> 个不在这个命名空间里——它们有进程读数，
-            这一面没有它们的位置。
+            <span className="mono">{censusGap}</span> 个没有任何 Pod 认领——它们有进程读数，
+            但没有 Pod 这一格。
           </>
         )}
       </p>
@@ -737,7 +737,7 @@ function NodeDetail({
           {node.unclaimed_containers != null && node.unclaimed_containers > 0 && (
             <>
               ，其中 <span className="mono">{node.unclaimed_containers}</span>{' '}
-              个不在这一面展示的命名空间里
+              个没有任何 Pod 认领
             </>
           )}
           。

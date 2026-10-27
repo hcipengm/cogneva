@@ -62,10 +62,12 @@ roleRef:
   name: cogneva-gitops-puller
   apiGroup: rbac.authorization.k8s.io
 ---
-# 拓扑面的节点读权限：集群作用域，因为节点不属于任何命名空间。
-# 这一面要读的是节点的就绪条件、角色标签与可分配量（status.allocatable）；
-# Pod 一层仍由上面那条命名空间 Role 授权，不跟着扩到集群作用域。
-# 只要 get 与 list：拓扑按轮询读，不 watch，也没有任何写。
+# 拓扑面的节点与 Pod 读权限：集群作用域。节点不属于任何命名空间；Pod 跟着一起
+# 扩到集群作用域，是因为进程采集器是一个 hostPID 的 DaemonSet，它读的就是整台
+# 宿主上每一个容器的 cgroup——只画本命名空间的 Pod，差出来的容器有进程读数却没有
+# 位置，读者分不清「没有」和「没读」。
+# 只要 get 与 list：拓扑按轮询读，不 watch，也没有任何写。事件与卷声明仍只读
+# 本命名空间（下面那条 Role）。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -80,6 +82,13 @@ rules:
   # 节点实际用量同样来自 metrics-server；没装时这条规则不会被用到。
   - apiGroups: ["metrics.k8s.io"]
     resources: ["nodes"]
+    verbs: ["get", "list"]
+  # Pod 与它们的实际用量，与上面同一条理由。
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
     verbs: ["get", "list"]
   # 没有 metrics-server 时的用量来源：kubelet 的 summary 接口经 apiserver 代理读，
   # apiserver 把 `/stats/*` 映射到 `nodes/stats` 子资源。只读；不给 `nodes/proxy`，
@@ -102,8 +111,8 @@ rules:
     resources: ["jobs", "cronjobs"]
     verbs: ["get", "list"]
 ---
-# 拓扑面在命名空间里额外要的三样：事件、卷声明、Pod 的实际用量。
-# pods 本身已由上面 gitops 看护那条 Role 授权，这里不重复。
+# 拓扑面在命名空间里额外要的两样：事件、卷声明。
+# pods 本身已由上面那条 ClusterRole 授权，这里不重复。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -115,9 +124,6 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["events", "persistentvolumeclaims"]
-    verbs: ["get", "list"]
-  - apiGroups: ["metrics.k8s.io"]
-    resources: ["pods"]
     verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

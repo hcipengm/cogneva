@@ -113,9 +113,9 @@ function ClusterRow({
       </header>
 
       <p className="px-4 pb-1 text-[10px] text-[var(--muted)]">
-        这一面读的是<span className="mono"> {cluster.namespace} </span>
-        这一个命名空间里的 Pod；节点是整台机器的。别的命名空间（系统组件、监控）要在
-        <span className="mono"> kubectl </span>里看，这里不装作读过。
+        Pod 与节点都是整个集群的：别的命名空间（系统组件、监控）也画在它的节点上。
+        事件与卷声明只读<span className="mono"> {cluster.namespace} </span>
+        这一个命名空间，别的命名空间里的 Pod 那两格是空的，不是没有。
       </p>
 
       {cluster.error && (
@@ -127,7 +127,7 @@ function ClusterRow({
       {cluster.nodes.length > 0 && (
         <div className="grid grid-cols-1 gap-px bg-[var(--line)] md:grid-cols-2 xl:grid-cols-3">
           {cluster.nodes.map((node) => (
-            <NodeCard key={node.name} node={node} namespace={cluster.namespace} />
+            <NodeCard key={node.name} node={node} />
           ))}
         </div>
       )}
@@ -232,7 +232,7 @@ function pressureWarnings(node: TopologyNode): string[] {
     );
 }
 
-function NodeCard({ node, namespace }: { node: TopologyNode; namespace: string }) {
+function NodeCard({ node }: { node: TopologyNode }) {
   const [open, setOpen] = useState(false);
   const cpuPercent = ratio(node.cpu_requested_millicores, node.cpu_allocatable_millicores);
   const memoryPercent = ratio(node.memory_requested_bytes, node.memory_allocatable_bytes);
@@ -299,13 +299,13 @@ function NodeCard({ node, namespace }: { node: TopologyNode; namespace: string }
         </p>
       )}
       {/* 「这台机器上的容器」与「屏上的容器」不是一个数。差多少要说出来——
-          不说的话，屏上看起来就是全量，而它按命名空间取的。 */}
+          不说的话，屏上看起来就是全量。这一面读的是整个集群的 Pod，所以差出来的
+          只剩不经 k8s 起的容器，而它们照样有进程读数。 */}
       {node.unclaimed_containers != null && node.unclaimed_containers > 0 && (
         <p className="px-3 pb-2 text-[10px] text-[var(--muted)]">
           采集器在这台机器上看到 <span className="mono">{node.census_containers}</span> 个容器，其中{' '}
-          <span className="mono">{node.unclaimed_containers}</span> 个不在命名空间{' '}
-          <span className="mono">{namespace}</span> 里：它们有进程读数，但这一面按命名空间取 Pod，
-          没有它们的位置。
+          <span className="mono">{node.unclaimed_containers}</span> 个没有任何 Pod 认领（构建容器、
+          宿主上直接起的进程）：它们有进程读数，但没有 Pod 这一格。
         </p>
       )}
     </div>
