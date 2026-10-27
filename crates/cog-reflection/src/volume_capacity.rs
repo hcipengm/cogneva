@@ -61,7 +61,14 @@ pub const OUTCOME_METRIC: &str = "cogneva_volume_capacity_outcome_total";
 pub const BYTES_METRIC: &str = "cogneva_volume_capacity_bytes";
 
 /// Label naming the claim a row is about.
-pub const CLAIM_LABEL: &str = "persistentvolumeclaim";
+///
+/// Declared in `cog_core::claim_footprint`, which the walker that publishes the
+/// footprint reads: the deployed rules divide one series by the other joined
+/// `on(namespace, persistentvolumeclaim)`, so the two emitters have to spell
+/// the label the same way. Spelled twice, the join matches nothing and the
+/// result is an empty series — which the rule reads as "no claim is over
+/// budget", not as "the join broke".
+pub const CLAIM_LABEL: &str = cog_core::claim_footprint::CLAIM_LABEL;
 
 /// Label naming which quantity a row carries: `declared` or `peak`.
 pub const STATE_LABEL: &str = "state";
