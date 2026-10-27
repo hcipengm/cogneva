@@ -81,9 +81,9 @@ const DASHBOARD_CONTRACT: &str = "crates/cogneva/tests/observability_dashboard_c
 const DASHBOARD_TABLE_OPENS: &str = "const PRODUCED: &[(&str, &[&str], &str)] = &[";
 
 /// Names that look like series and are not, so the scan below does not read
-/// them as a producer. Two, and each is a different kind of exception: one is
-/// not a series at all, the other is a series the tree publishes on purpose
-/// without any build being able to write it.
+/// them as a producer. Each is a different kind of exception: a table name, a
+/// label key, a prefix on its own, and fixtures the tree publishes on purpose
+/// without any build being able to write them.
 ///
 /// An entry here is an exclusion from the population, so the directions that
 /// can be checked are: the name has to be a literal the tree really carries,
@@ -102,6 +102,14 @@ const NOT_A_SERIES: &[(&str, &str)] = &[
     (
         "cogneva_no_such_series",
         "a fixture: `MetricName::for_tests_only` exists so a test can publish a name no build can produce, which is the reading the closed set's own liveness check needs",
+    ),
+    (
+        "cogneva_",
+        "the prefix on its own, spelled by a test helper that asks whether a string looks like one of this build's series names; it is the start of a name and never a name, and nothing scrapes it",
+    ),
+    (
+        "cogneva_thing",
+        "a fixture: the deployed-rule label test builds manifests in memory to prove the label check compares against values the code writes, and that scratch manifest needs a series name nothing can produce",
     ),
     (
         "cogneva_io_managed",

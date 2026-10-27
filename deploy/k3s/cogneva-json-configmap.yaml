@@ -2093,6 +2093,26 @@ data:
                   "face": "变更管理"
                 },
                 {
+                  "name": "project_audit_rows_not_landing",
+                  "promql": "max without (pod, container, instance, job) (increase(cogneva_project_audit_write_failures_total[1h])) / clamp_min(max without (pod, container, instance, job) (increase(cogneva_project_audit_writes_total[1h])), 1)",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "warning",
+                  "summary": "The share of project-audit writes that did not land in the last hour is {value}: a customer-visible change was made and the row that records it was lost. Read as a share rather than a count because the count alone cannot be judged -- three failed writes inside three is a project timeline that records nothing, and three inside thirty thousand is a database that blinked -- and both the numerator and the denominator are in the expression so neither is assumed. The bound is any share above zero, and that is not the usual event-versus-state argument: the audit row is written after the change has already happened and there is no retry, so a single failure is a permanent hole in that project's timeline rather than a tick of staleness that repairs itself on the next pass. What this does not see is a deployment with no audit sink at all: there the write is counted and the failure is not, so the ratio stays at zero and project_audit_has_no_writer is the rule that fires. Both counters are process-local and restart with the pod, which is right for the share -- numerator and denominator reset together -- but a rolled gateway reads zero here until the first write after it comes up.",
+                  "face": "变更管理"
+                },
+                {
+                  "name": "project_audit_has_no_writer",
+                  "promql": "max without (pod, container, instance, job) (cogneva_project_audit_unwired_total)",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "warning",
+                  "summary": "The gateway was asked to record a project change and this process has no audit log installed, so the change left no row anywhere -- {value} such write(s) since this pod started, and every one of them is a hole in the project's timeline rather than a delay. Read as presence, not as a rate: the wiring is fixed once per process, so once this is above zero it stays above zero until the pod is replaced, and a rate over it would fall back to zero as the window rolls past the writes and read a broken deployment as repaired. The repair is on the assemble side and not in the store: the audit log is published by whichever plugin holds the shared database and consumed in exactly one place at gateway startup, which logs the fact when the service is absent. A deployment that publishes no database at all has no project face to audit and writes nothing, so this rule staying silent there is the correct reading, not a blind spot. The sibling counter cogneva_project_audit_write_failures_total is the other half and a different repair: that one says the log was there and the write did not land.",
+                  "face": "变更管理"
+                },
+                {
                   "name": "llm_usage_upstream_silent",
                   "promql": "sum by (upstream) (increase(llm_usage_readings_total{outcome=\"absent\"}[1h])) > 0",
                   "condition": {

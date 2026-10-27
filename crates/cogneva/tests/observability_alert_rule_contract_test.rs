@@ -642,6 +642,23 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_project_control_unmeasured_total",
         "crates/cog-gateway/src/project_control.rs",
     ),
+    // The project face's audit outlet, in three counters: how many rows were
+    // asked for, how many of them did not land, and how many found no writer at
+    // all. Split because the repairs differ -- the store, the database, and the
+    // assembly -- and read together by the two rules above them, the ratio for
+    // the first two and the presence of the third.
+    (
+        "cogneva_project_audit_writes_total",
+        "crates/cog-gateway/src/project_audit.rs",
+    ),
+    (
+        "cogneva_project_audit_write_failures_total",
+        "crates/cog-gateway/src/project_audit.rs",
+    ),
+    (
+        "cogneva_project_audit_unwired_total",
+        "crates/cog-gateway/src/project_audit.rs",
+    ),
     (
         "cogneva_redis_info_interval_seconds",
         "deploy/helm/cogneva/templates/redis.yaml",
