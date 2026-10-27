@@ -79,9 +79,13 @@ CREATE TABLE IF NOT EXISTS cog_context_boards (
 -- The checkpoint sweep asks, for each candidate row, whether any board field
 -- names it; without this index that question is a sequential scan of every
 -- board per candidate. A field value is an opaque string, so the index is on
--- the value alone.
+-- the value alone -- and it has to be a hash index rather than a btree: a
+-- btree keeps the value itself in the entry and refuses anything past a third
+-- of a page, while boards do hold long values (one row of 11,456 bytes was
+-- measured 2026-10-27). The question asked of it is equality only, which is
+-- what a hash index answers.
 CREATE INDEX IF NOT EXISTS idx_cog_context_boards_field_value
-    ON cog_context_boards(field_value)
+    ON cog_context_boards USING hash (field_value)
 ;
 CREATE TABLE IF NOT EXISTS cog_dag_state (
                 workspace_id TEXT PRIMARY KEY,

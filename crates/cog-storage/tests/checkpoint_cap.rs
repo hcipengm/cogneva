@@ -367,3 +367,77 @@ async fn a_pass_with_pruning_off_deletes_nothing() {
 
     scratch.done().await;
 }
+
+/// The startup schema has to survive the rows the boards already hold.
+///
+/// A field value is an opaque string, and real boards carry long ones; a btree
+/// index keeps the value itself in every entry and refuses anything past a
+/// third of a page. When that refusal lands in `init_schema` the whole gateway
+/// refuses to start, and the rollout of that revision fails and rolls back --
+/// measured 2026-10-27 on a live table whose longest board value was 11,456
+/// bytes against a 2,704-byte ceiling.
+///
+/// The sweep only ever asks `field_value = <snapshot id>`, so the index that
+/// question needs is a hash index: it stores the hash rather than the value and
+/// has no length ceiling.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_startup_schema_holds_board_values_past_a_btree_entry() {
+    let scratch = Scratch::new("long_board_value").await;
+    let pool = scratch.pool();
+    for ddl in [
+        "CREATE TABLE cog_snapshots (
+             snapshot_id TEXT PRIMARY KEY,
+             task_id     TEXT NOT NULL,
+             timestamp   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+         )",
+        "CREATE TABLE cog_context_boards (
+             task_id     TEXT NOT NULL,
+             field_name  TEXT NOT NULL,
+             field_value TEXT NOT NULL,
+             updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+             PRIMARY KEY (task_id, field_name)
+         )",
+    ] {
+        sqlx::query(ddl)
+            .execute(&pool)
+            .await
+            .expect("scratch table");
+    }
+    // A value longer than a btree entry may be, already in the table before the
+    // startup schema runs -- which is the state a rollout finds itself in.
+    let long = "v".repeat(11_456);
+    sqlx::query(
+        "INSERT INTO cog_context_boards (task_id, field_name, field_value) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind("task-long")
+    .bind("blob")
+    .bind(&long)
+    .execute(&pool)
+    .await
+    .expect("insert a long board value");
+
+    sqlx::raw_sql(cog_storage::postgres::state_backend::DDL)
+        .execute(&pool)
+        .await
+        .expect("the startup schema must apply over rows a board already holds");
+
+    // And the index has to be one the equality question can use.
+    let method: String = sqlx::query(
+        "SELECT am.amname FROM pg_index i \
+         JOIN pg_class c ON c.oid = i.indexrelid \
+         JOIN pg_am am ON am.oid = c.relam \
+         WHERE c.relname = 'idx_cog_context_boards_field_value'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the sweep's index exists after the schema runs")
+    .get("amname");
+    assert_eq!(
+        method, "hash",
+        "the sweep asks field_value = <id>; a btree here refuses the long values"
+    );
+
+    scratch.done().await;
+}
