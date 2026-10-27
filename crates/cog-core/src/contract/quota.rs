@@ -4,8 +4,15 @@ use crate::SFResult;
 use serde::{Deserialize, Serialize};
 
 /// Scope levels for the 5-level quota hierarchy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// One name per level, in [`QuotaScope::as_str`] — the word the counters and the
+/// history keys are written under. The serde impls below go through it rather
+/// than through the variant names: the derive spelled `workspace` and
+/// `organization` while every stored quota key said `ws` and `org`, so a reader
+/// holding a serialized decision and the counter it came from had to translate
+/// between two vocabularies for one level — and a level whose two spellings do
+/// not meet reads as a level with no usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuotaScope {
     User,
     Workspace,
@@ -33,6 +40,33 @@ impl QuotaScope {
             QuotaScope::Organization => "org",
             QuotaScope::Global => "global",
         }
+    }
+
+    /// `name` 指的那一级，或 `None`：不在 [`Self::cascade_order`] 上的名字不猜。
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::cascade_order()
+            .into_iter()
+            .find(|scope| scope.as_str() == name)
+    }
+}
+
+impl Serialize for QuotaScope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// 认不出的层级名是错误，不是某一级：把它读成 `User` 会让一条来路不明的记录
+/// 落进用户级的计数里，而"这一级没有用量"与"这一级没人认得"从此同形。
+impl<'de> Deserialize<'de> for QuotaScope {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = <String as Deserialize>::deserialize(deserializer)?;
+        Self::parse(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown quota scope {name:?}; declared scopes are {:?}",
+                Self::cascade_order().map(|scope| scope.as_str())
+            ))
+        })
     }
 }
 
@@ -196,4 +230,49 @@ pub trait HierarchyManager: Send + Sync {
 #[async_trait::async_trait]
 pub trait WorkspaceQuotaSource: Send + Sync {
     async fn workspace_remaining(&self, workspace_id: &str) -> u64;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一级一个名字：键上写的、序列化写出去的、读回来的都是 `as_str`。
+    ///
+    /// 下面的 match 刻意穷尽，新增一级会让它编译不过——逼着人把新的一级同时
+    /// 放进层叠顺序，而不是只加变体、让 `cascade_order` 少一格：少的那一格在
+    /// 额度面上永远不发一档，"这一级没有限额"与"这一级没人检查"从此同形。
+    #[test]
+    fn every_scope_has_one_name_and_it_survives_the_wire() {
+        let mut names = std::collections::BTreeSet::new();
+        for scope in [
+            QuotaScope::User,
+            QuotaScope::Workspace,
+            QuotaScope::Team,
+            QuotaScope::Organization,
+            QuotaScope::Global,
+        ] {
+            match scope {
+                QuotaScope::User
+                | QuotaScope::Workspace
+                | QuotaScope::Team
+                | QuotaScope::Organization
+                | QuotaScope::Global => {}
+            }
+            assert!(
+                QuotaScope::cascade_order().contains(&scope),
+                "{scope:?} 不在层叠顺序里，这一级永远不会被检查"
+            );
+            assert!(
+                names.insert(scope.as_str()),
+                "两级共用一个名字 {:?}，额度键会互相覆盖",
+                scope.as_str()
+            );
+            let json = serde_json::to_string(&scope).expect("scope serializes");
+            assert_eq!(json, format!("\"{}\"", scope.as_str()));
+            assert_eq!(serde_json::from_str::<QuotaScope>(&json).ok(), Some(scope));
+        }
+        // 变体名不是名字：以前序列化写的是这一套，而键上写的是另一套。
+        assert!(serde_json::from_str::<QuotaScope>("\"Workspace\"").is_err());
+        assert!(serde_json::from_str::<QuotaScope>("\"organization\"").is_err());
+    }
 }

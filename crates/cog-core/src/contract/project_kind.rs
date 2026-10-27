@@ -30,8 +30,9 @@ use std::str::FromStr;
 ///
 /// One name for every project cogneva lands changes into, cogneva itself
 /// included, so the platform names no project and adding the next target is not
-/// a change here.
-pub const PROJECT_KIND_DOCUMENT: &str = "cogneva.json";
+/// a change here. The word itself is [`crate::paths::CONFIG_FILE_NAME`]: this
+/// reads it, it does not respell it.
+pub const PROJECT_KIND_DOCUMENT: &str = crate::paths::CONFIG_FILE_NAME;
 
 /// The one key read out of that document.
 pub const PROJECT_KIND_KEY: &str = "kind";

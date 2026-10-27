@@ -1205,7 +1205,7 @@ fn is_compiler_error_code(code: &str) -> bool {
 pub const PROTECTED_FILE_NAMES: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
-    "cogneva.json",
+    crate::paths::CONFIG_FILE_NAME,
     ".env",
     ".envrc",
     "Dockerfile",

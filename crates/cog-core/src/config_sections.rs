@@ -287,7 +287,9 @@ pub fn sections_missing_from_document(doc: &Value) -> Vec<&'static str> {
 /// the object moves on, the process keeps the document it read at start, and the
 /// delivery is otherwise reported as applied.
 pub const CONFIG_CONFIGMAP: &str = crate::topology::CONFIG_CONFIGMAP;
-pub const CONFIG_DOCUMENT_KEY: &str = "cogneva.json";
+/// 这个词只写一次，在 [`crate::paths::CONFIG_FILE_NAME`]：部署挂进容器的那份
+/// 文件、项目自己放的那份声明，是同一个文件。两处各写一遍时，改名只会成功一半。
+pub const CONFIG_DOCUMENT_KEY: &str = crate::paths::CONFIG_FILE_NAME;
 
 /// Where the alert rules live inside the document.
 ///
