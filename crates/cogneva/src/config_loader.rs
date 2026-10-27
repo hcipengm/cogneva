@@ -13,7 +13,7 @@
 //! 既保持了 `cog-core` 的纯净，又保留了 `cogneva.json` 的动态丰富配置能力。
 
 use cog_core::{Config, SFResult, SecretProvider};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Deref;
 
 /// Default system-wide config path (FHS).
@@ -44,7 +44,16 @@ impl Deref for AppConfig {
     }
 }
 
-/// Default env mappings — kept in one place so they are easy to audit.
+/// The built-in env mapping — the table used when no config document is found.
+///
+/// It is **not** the only spelling of this table: a deployment ships the same
+/// name→path table inside `cogneva.json` (`env`), and [`apply_env_overrides`]
+/// applies both. One table alone leaves whichever names the other one knows
+/// dead in the mode it does not cover — a manifest that sets
+/// `COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED=false` against a table that never
+/// heard of it changes nothing, and "the switch is off" reads exactly like
+/// "the switch does nothing". The tests below hold the three spellings (this
+/// one, the chart document, the published example) to one account of each name.
 fn default_env_mappings() -> HashMap<String, String> {
     let mut m = HashMap::new();
     // app
@@ -629,17 +638,19 @@ pub fn apply_env_overrides(config: &mut AppConfig) {
         Err(_) => return,
     };
 
-    // If the loaded config has no env mapping (e.g. base file missing), fall
-    // back to the binary's built-in mappings so env overrides still work.
-    let mappings: Vec<(String, String)> = if config.env.is_empty() {
-        default_env_mappings().into_iter().collect()
-    } else {
-        config
-            .env
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    };
+    // Both spellings of the table apply, not whichever one happens to be
+    // non-empty. A deployment ships its own map inside the config document, so
+    // taking that map *instead of* the built-in one silently kills every name
+    // only the built-in table knows: the manifest sets the variable, nothing
+    // reads it, and the only visible symptom is a setting that appears to have
+    // no effect. The document wins on a name both know, because it is the one
+    // the operator edits; the built-in table fills in the rest. Sorted so that
+    // two variables aimed at one path resolve the same way on every run.
+    let mut merged: BTreeMap<String, String> = default_env_mappings().into_iter().collect();
+    for (name, path) in &config.env {
+        merged.insert(name.clone(), path.clone());
+    }
+    let mappings: Vec<(String, String)> = merged.into_iter().collect();
 
     for (env_key, path) in mappings {
         if let Ok(env_val) = std::env::var(&env_key) {
@@ -1223,6 +1234,260 @@ mod tests {
         );
     }
 
+    /// The table is spelled more than once, and nothing joined the spellings.
+    ///
+    /// The built-in table, the `env` map inside the delivered document (the
+    /// chart's copy and the ConfigMap blob that carries it), and the map in the
+    /// example an operator copies are three hand-kept lists of the same fact.
+    /// They drifted: 126 entries against 113 against 95, and a name only one
+    /// copy knew did nothing in whichever mode read the other. The loader reads
+    /// both now; what still cannot stand is one name meaning two places, because
+    /// then where a variable writes is decided by which copy won.
+    ///
+    /// The floor on each copy is what keeps this from passing over an empty set:
+    /// a reader that stops seeing entries makes every comparison below agree.
+    #[test]
+    fn the_copies_of_the_env_table_agree_on_where_a_name_goes() {
+        let builtin = default_env_mappings();
+        assert!(
+            builtin.len() >= 100,
+            "built-in table parsed {} entries, floor 100 — suspect the reader",
+            builtin.len()
+        );
+        let documents = documents_with_an_env_map();
+        let mut conflicts: Vec<String> = Vec::new();
+        for (tag, document) in &documents {
+            let env = document["env"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{tag} carries no `env` map"));
+            let named = env.keys().filter(|k| k.starts_with("COGNEVA_")).count();
+            assert!(
+                named >= 85,
+                "{tag} parsed {named} COGNEVA_* entries, floor 85 — suspect the reader"
+            );
+            for (name, target) in env {
+                let Some(target) = target.as_str() else {
+                    continue;
+                };
+                if let Some(built_in_target) = builtin.get(name) {
+                    if built_in_target != target {
+                        conflicts.push(format!(
+                            "{name}: built-in -> {built_in_target}, {tag} -> {target}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            conflicts.is_empty(),
+            "one variable, two config paths — which one it writes becomes luck: {conflicts:?}"
+        );
+
+        // The example is the document an operator copies to start an install, so
+        // a name it carries and the delivered document does not is a setting
+        // that reads as configured and reaches nothing.
+        let env_of = |tag: &str| -> &serde_json::Map<String, serde_json::Value> {
+            documents
+                .iter()
+                .find(|(candidate, _)| *candidate == tag)
+                .and_then(|(_, document)| document["env"].as_object())
+                .unwrap_or_else(|| panic!("{tag} carries no `env` map"))
+        };
+        let delivered = env_of("chart");
+        // A join over nothing always agrees. The two tables share most of their
+        // names, so seeing far fewer than that means the comparison is reading
+        // an empty overlap rather than two copies of one table.
+        let shared = builtin
+            .keys()
+            .filter(|name| delivered.contains_key(*name))
+            .count();
+        assert!(
+            shared >= 80,
+            "只有 {shared} 个名字同时出现在内置表与交付文档里——比较没看到东西"
+        );
+        let invented: Vec<&String> = env_of("example")
+            .keys()
+            .filter(|name| name.starts_with("COGNEVA_") && !delivered.contains_key(*name))
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "the example invents variables the delivered document does not know: {invented:?}"
+        );
+    }
+
+    /// Every `COGNEVA_*` variable a shipped manifest injects has a reader.
+    ///
+    /// A manifest is the one place a knob can be set without the code ever
+    /// hearing about it: the YAML is valid, the pod starts, and the setting
+    /// applies to nothing. The name only has to be known somewhere — to one of
+    /// the tables above, or spelled by production source, since some values are
+    /// read straight off the environment rather than through the config tree.
+    #[test]
+    fn every_env_name_a_manifest_sets_is_readable_somewhere() {
+        let manifests = manifest_env_names();
+        assert!(
+            manifests.len() >= 80,
+            "read {} COGNEVA_* names out of the manifests, floor 80 — suspect the reader",
+            manifests.len()
+        );
+
+        let mut known: std::collections::BTreeSet<String> =
+            default_env_mappings().into_keys().collect();
+        for (_, document) in documents_with_an_env_map() {
+            if let Some(env) = document["env"].as_object() {
+                known.extend(env.keys().cloned());
+            }
+        }
+        let sources = production_sources_text();
+
+        let orphaned: Vec<String> = manifests
+            .into_iter()
+            .filter(|name| !known.contains(name) && !spelled_in_source(&sources, name))
+            .collect();
+        assert!(
+            orphaned.is_empty(),
+            "these variables are injected into a pod and nothing reads them: {orphaned:?}"
+        );
+    }
+
+    /// The env entries a manifest's text injects, read by shape.
+    ///
+    /// A name is injected when it opens an env entry — `- name: COGNEVA_...` —
+    /// and a `value:`/`valueFrom:` follows. A name that only appears in a
+    /// comment is not injected into anything, and counting it would let a
+    /// genuinely stranded variable hide behind a mention.
+    fn env_names_in_manifest_text(text: &str) -> std::collections::BTreeSet<String> {
+        let mut names = std::collections::BTreeSet::new();
+        // A name is an env entry only once the entry's value line confirms it.
+        // Counting at the `- name:` line would also count an entry that has no
+        // value and a name that opens some other list.
+        let mut pending: Option<String> = None;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("- name: ") {
+                let name = rest.trim();
+                pending = name.starts_with("COGNEVA_").then(|| name.to_string());
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            if let Some(name) = pending.take() {
+                if trimmed.starts_with("value:") || trimmed.starts_with("valueFrom:") {
+                    names.insert(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// The shape rule answers both ways, so the census above is not a loop that
+    /// agrees with itself: an injected name counts, a mention in a comment does
+    /// not, and a name that never gets a value does not.
+    #[test]
+    fn the_manifest_reader_counts_injected_names_only() {
+        let text = "\
+            # COGNEVA_MENTIONED_IN_A_COMMENT: nothing injects this\n\
+            spec:\n\
+              containers:\n\
+                - name: cogneva\n\
+                  env:\n\
+                    - name: COGNEVA_INJECTED\n\
+                      value: \"false\"\n\
+                    - name: OTHER_INJECTED\n\
+                      value: \"x\"\n\
+                    - name: COGNEVA_NO_VALUE_FOLLOWS\n";
+        let names = env_names_in_manifest_text(text);
+        assert!(
+            names.contains("COGNEVA_INJECTED"),
+            "注入的名字没被数进来：{names:?}"
+        );
+        assert_eq!(names.len(), 1, "只该数到注入的那一个：{names:?}");
+    }
+
+    /// Every `COGNEVA_*` name a shipped manifest sets as a container env entry.
+    fn manifest_env_names() -> std::collections::BTreeSet<String> {
+        fn yaml_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    yaml_files(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("yaml") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        yaml_files(&deploy_file("k3s"), &mut files);
+        yaml_files(&deploy_file("rendered"), &mut files);
+
+        let mut names = std::collections::BTreeSet::new();
+        for file in files {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            names.extend(env_names_in_manifest_text(&text));
+        }
+        names
+    }
+
+    /// Production source of every crate, concatenated — the same set of files a
+    /// reader of the environment could spell a name in.
+    fn production_sources_text() -> String {
+        fn walk(dir: &std::path::Path, out: &mut String) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        out.push_str(&text);
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        let mut out = String::new();
+        let crates = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../");
+        let Ok(entries) = std::fs::read_dir(&crates) else {
+            panic!(
+                "read {}: the source census cannot see the crates",
+                crates.display()
+            );
+        };
+        for entry in entries.flatten() {
+            let src = entry.path().join("src");
+            if src.is_dir() {
+                walk(&src, &mut out);
+            }
+        }
+        assert!(
+            out.len() > 100_000,
+            "the source census read {} bytes — suspect the reader",
+            out.len()
+        );
+        out
+    }
+
+    /// Whether `name` occurs in `text` as a whole word.
+    fn spelled_in_source(text: &str, name: &str) -> bool {
+        text.match_indices(name).any(|(start, _)| {
+            let bounded = |c: Option<char>| {
+                c.map(|c| !(c.is_alphanumeric() || c == '_'))
+                    .unwrap_or(true)
+            };
+            let before = text[..start].chars().next_back();
+            let after = text[start + name.len()..].chars().next();
+            bounded(before) && bounded(after)
+        })
+    }
+
     /// The deploy config is hand-edited JSON shipped in two forms: the chart's
     /// copy and the ConfigMap blob the in-cluster consumer applies. Nothing
     /// else in the pipeline parses them until a pod reads the file at startup,
@@ -1729,6 +1994,34 @@ mod tests {
         assert!(
             !config.self_evolution.executor_enabled,
             "EXECUTOR_ENABLED=false must reach self_evolution.executor_enabled"
+        );
+    }
+
+    /// A name only the built-in table knows still applies when the document
+    /// carries a table of its own.
+    ///
+    /// The test above passes either way: the default config has an empty `env`
+    /// map, so the built-in table is read through the fallback branch. A real
+    /// install ships a `cogneva.json` whose map is not empty, and that map is the
+    /// only one that used to be read — every name it did not list was dead while
+    /// the manifest went on setting it. This builds the map a deployment has
+    /// (non-empty, listing an unrelated name and no others) and asks the same
+    /// question: the control-plane override has to land.
+    #[test]
+    fn test_a_name_only_the_builtin_table_knows_still_applies() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::set("COGNEVA_SELF_EVOLUTION_EXECUTOR_ENABLED", "false");
+        let mut config = AppConfig::default();
+        config.core.env.clear();
+        config
+            .core
+            .env
+            .insert("COGNEVA_APP_NAME".into(), "app.name".into());
+        apply_env_overrides(&mut config);
+        assert!(
+            !config.self_evolution.executor_enabled,
+            "the document's table lacking a name must not make that name dead: \
+             EXECUTOR_ENABLED=false has to reach self_evolution.executor_enabled"
         );
     }
 
