@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # cogneva K3s 快速换版：增量构建 → buildah 叠层 → 版本 tag + :local 双标签 →
-# 导入 k3s → 四部署滚动 → 滚动后校验实际运行镜像。
+# 导入 k3s → 换镜像面滚动 → 滚动后校验实际运行镜像。
 #
 # 用法：
 #   deploy/k3s/swap-image.sh [版本号] [--prev <基镜像tag>] [--web] [--no-deploy]
-#   [--check-only]
+#   [--check-only] [--list-workloads]
 #   版本号缺省取 Cargo.toml workspace version（镜像版本与代码版本单一同源）。
 #   --check-only：只跑启动前校验（registry 的 :local vs 线上运行镜像），
 #   不构建、不 apply——校验本身要能在不动线上时被单独读一次。
+#   --list-workloads：只印出这一趟会滚哪些工作负载（kind/名字/容器），不构建、
+#   不碰集群。这一份是从交付树读出来的，所以它能被单独读一次、也能被单独测。
 #
 # 版本与标签不变式：
 #   - deploy yaml pin 的是集群内 registry 浮动签 localhost:30500/cogneva:local；
@@ -20,7 +22,7 @@
 #     绝不基于 :local 叠层——:local 一旦与运行版本脱节，叠层会把错误镜像
 #     当基底自我放大（2026-09-04 :local 指向一个多月前老镜像的事故根因）。
 #     脚本启动即校验 registry 里的 :local 与运行镜像一致，脱节则拒绝执行并给
-#     止血命令。判据必须读 registry 那一份：四个部署 pin 的是
+#     止血命令。判据必须读 registry 那一份：跑本镜像的工作负载 pin 的是
 #     localhost:30500/cogneva:local 且 imagePullPolicy: Always，kubelet 每次
 #     启动都从 registry 拉，节点本地 :local 只作暖缓存/离线回退，不在运行路径上
 #     ——按它判会把运行面已经对齐的换版拒掉，而印出的止血命令修的是那个不参与
@@ -37,6 +39,7 @@ PREV_TAG=""
 BUILD_WEB=0
 DO_DEPLOY=1
 CHECK_ONLY=0
+LIST_WORKLOADS=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -44,6 +47,7 @@ while [ $# -gt 0 ]; do
     --web) BUILD_WEB=1; shift ;;
     --no-deploy) DO_DEPLOY=0; shift ;;
     --check-only) CHECK_ONLY=1; DO_DEPLOY=0; shift ;;
+    --list-workloads) LIST_WORKLOADS=1; shift ;;
     # 头部注释区块整体就是帮助文本：按内容取，不按行号取
     -h|--help) awk 'NR>1 && /^set -euo/{exit} NR>1' "$0"; exit 0 ;;
     *) NEW_TAG="$1"; shift ;;
@@ -51,6 +55,61 @@ while [ $# -gt 0 ]; do
 done
 
 cd "$REPO_ROOT"
+
+# 换镜像面：哪些工作负载跑着本项目的二进制，由交付树回答，不在这里列名字。
+#
+# 镜像被不止四个 Deployment 用着：宿主账本 / 进程普查 / 声明仓是 DaemonSet，
+# 注册仓的卷走查是边车，redis 的 AOF 修复是 initContainer。写死一份四个名字的
+# 名单，它们不在这一趟滚动里，而脚本末尾的「均运行新镜像」照样成立——它们的
+# 「已更新」与「根本没查」在读数上分不开，于是旧二进制可以一直跑下去。
+#
+# 取的是**常驻容器**：initContainer 只在新 Pod 起来时跑一次，它跟着所属工作负载
+# 一起换，单独 set image 反而会为了一个不常驻的进程重启整个 StatefulSet（redis
+# 就是这样）。CronJob 也不进来：它每次起 Pod 都按浮动签 :local + Always 拉，
+# 下一次运行自然就是新镜像，没有要滚的东西。
+#
+# 输出：每行 `<kind>\t<名字>\t<容器>`；解析不了（读不到清单 / 不是 yaml）时非零退出。
+platform_image_workloads() {
+  python3 - "$REPO_ROOT/deploy/k3s" <<'PY'
+import os, sys, yaml
+
+root = sys.argv[1]
+REPOS = ("localhost:30500/cogneva", "localhost/cogneva")
+KINDS = ("Deployment", "DaemonSet", "StatefulSet")
+
+def repo_of(image):
+    image = image.split("@")[0]
+    last = image.rsplit("/", 1)[-1]
+    return image.rsplit(":", 1)[0] if ":" in last else image
+
+rows = []
+for name in sorted(os.listdir(root)):
+    if not name.endswith(".yaml"):
+        continue
+    with open(os.path.join(root, name)) as handle:
+        for doc in yaml.safe_load_all(handle):
+            if not isinstance(doc, dict) or doc.get("kind") not in KINDS:
+                continue
+            spec = ((doc.get("spec") or {}).get("template") or {}).get("spec") or {}
+            for container in spec.get("containers") or []:
+                if repo_of(container.get("image", "")) in REPOS:
+                    rows.append((doc["kind"],
+                                 (doc.get("metadata") or {}).get("name"),
+                                 container.get("name")))
+
+for kind, name, container in rows:
+    print("%s\t%s\t%s" % (kind, name, container))
+PY
+}
+
+if [ "$LIST_WORKLOADS" = 1 ]; then
+  WORKLOADS="$(platform_image_workloads)" || {
+    echo "读不出换镜像面的工作负载：deploy/k3s 下的清单解析失败" >&2; exit 2; }
+  [ -n "$WORKLOADS" ] || {
+    echo "deploy/k3s 下没有任何工作负载引用 ${IMAGE}——这一趟判不了该滚谁" >&2; exit 2; }
+  printf '%s\n' "$WORKLOADS"
+  exit 0
+fi
 
 # One source for the version: Cargo.toml's workspace.package.version, read only
 # through declared-version.sh
@@ -142,7 +201,7 @@ print(json.load(sys.stdin)["config"]["digest"].rsplit(":",1)[-1])
 # 启动前校验：registry 里的浮动 :local 与线上运行镜像一致；脱节直接拒绝
 # （apply/滚动会把线上打回旧版）。
 #
-# 判据面是 registry 那一份，不是节点本地 tag：四部署 pin localhost:30500/cogneva:local
+# 判据面是 registry 那一份，不是节点本地 tag：跑本镜像的工作负载 pin localhost:30500/cogneva:local
 # 且 imagePullPolicy: Always，kubelet 每次启动都从 registry 拉。节点本地 :local 只作
 # 暖缓存/离线回退，与运行镜像不一致不影响运行时；拿它当判据的方向是误报脱节——
 # 运行面已经对齐也照样拒绝换版，而印出的止血命令修的是那个不参与运行的面。
@@ -170,7 +229,7 @@ for p in d.get("items",[]):
     echo ":local 与线上运行镜像脱节！" >&2
     echo "  运行中: ${running_id:0:12}（版本 tag: ${running_tag:-未知}）" >&2
     echo "  registry :local: ${registry_id:0:12}" >&2
-    echo "四部署 pin 的是 localhost:30500/cogneva:local 且 imagePullPolicy: Always——" >&2
+    echo "跑本镜像的工作负载 pin 的是 localhost:30500/cogneva:local 且 imagePullPolicy: Always——" >&2
     echo "此刻任何 apply/rollout 都会把线上打回旧版。" >&2
     echo "止血后重跑本脚本：" >&2
     echo "  buildah push --tls-verify=false ${IMAGE}:${running_tag:-<运行版本tag>} localhost:30500/cogneva:local" >&2
@@ -369,18 +428,27 @@ if [ "$DO_DEPLOY" = 1 ]; then
   kubectl create configmap cogneva-prompts -n "$NS" \
     --from-file=prompts/ --dry-run=client -o yaml | kubectl apply -f -
 
-  # 四部署按拓扑约定 pin 集群内 registry 引用（localhost:30500），且
+  # 工作负载按拓扑约定 pin 集群内 registry 引用（localhost:30500），且
   # imagePullPolicy: Always——必须用 registry 引用滚动，写节点本地
   # localhost/cogneva:<tag> 会让 kubelet 去 https://localhost 拉取直接失败。
-  echo "==> 四部署滚动到 localhost:30500/cogneva:${NEW_TAG}"
-  kubectl set image -n "$NS" deployment/cogneva "cogneva=localhost:30500/cogneva:${NEW_TAG}"
-  kubectl set image -n "$NS" deployment/cogneva-evolution "cogneva=localhost:30500/cogneva:${NEW_TAG}"
-  kubectl set image -n "$NS" deployment/cogneva-security-gateway "security-gateway=localhost:30500/cogneva:${NEW_TAG}"
-  kubectl set image -n "$NS" deployment/cogneva-sandbox-executor "sandbox-executor=localhost:30500/cogneva:${NEW_TAG}"
-  kubectl rollout status -n "$NS" deployment/cogneva --timeout=180s
-  kubectl rollout status -n "$NS" deployment/cogneva-security-gateway --timeout=180s
-  kubectl rollout status -n "$NS" deployment/cogneva-evolution --timeout=300s
-  kubectl rollout status -n "$NS" deployment/cogneva-sandbox-executor --timeout=180s
+  workloads="$(platform_image_workloads)" || {
+    echo "读不出换镜像面的工作负载：deploy/k3s 下的清单解析失败" >&2; exit 1; }
+  [ -n "$workloads" ] || {
+    echo "deploy/k3s 下没有任何工作负载引用 ${IMAGE}——这一趟判不了该滚谁" >&2; exit 1; }
+  echo "==> 换镜像面滚动到 localhost:30500/cogneva:${NEW_TAG}（$(printf '%s\n' "$workloads" | wc -l) 个容器）"
+  while IFS=$'\t' read -r workload_kind workload_name container_name; do
+    [ -n "$workload_kind" ] || continue
+    kubectl set image -n "$NS" \
+      "$(printf '%s' "$workload_kind" | tr 'A-Z' 'a-z')/${workload_name}" \
+      "${container_name}=localhost:30500/cogneva:${NEW_TAG}"
+  done <<<"$workloads"
+  # 一个工作负载只等一次：同一份清单里两个容器指向同一对象时，第二条 rollout
+  # status 等的是同一个滚动，读起来却像是两个各自独立的证据。
+  while IFS=$'\t' read -r workload_kind workload_name; do
+    [ -n "$workload_kind" ] || continue
+    kubectl rollout status -n "$NS" \
+      "$(printf '%s' "$workload_kind" | tr 'A-Z' 'a-z')/${workload_name}" --timeout=300s
+  done < <(printf '%s\n' "$workloads" | cut -f1,2 | sort -u)
 
   echo "==> 校验新 Pod 实际运行镜像"
   # want 侧从 registry 取 NEW_TAG 的 manifest 折算 config digest；Pod imageID
@@ -393,52 +461,72 @@ import json,sys
 print(json.load(sys.stdin)["config"]["digest"].rsplit(":",1)[-1])
 ')"
   [ -n "$want_id" ] || { echo "registry 查询 localhost:30500/cogneva:${NEW_TAG} manifest 失败" >&2; exit 1; }
-  # 四部署逐一核对 Ready Pod 的镜像 id。同版本号重跑时 tag 字符串没变，
-  # set image 不触发滚动；只核对单个 Pod 会漏掉其余部署——主应用还可能因
-  # 前面 kubectl apply 结构变更偶然重建而"假通过"，evolution 等却仍跑旧
-  # 镜像。四个 component 标签唯一，必须全查。stdout 输出仍停留在旧镜像的
-  # component 列表（空 = 全部已更新），诊断信息走 stderr。
-  stale_deploys() {
-    local comp iid rid stale=""
-    for comp in gateway security-gateway evolution sandbox-executor; do
-      iid="$(kubectl -n "$NS" get pods -l "app.kubernetes.io/component=${comp}" -o json 2>/dev/null | python3 -c '
+  # 核对的是命名空间里**每一个**跑着本镜像的 Ready 常驻容器，不是四个
+  # component 标签：DaemonSet 与边车跑的是同一个二进制，按标签点名的四个看不见
+  # 它们，于是「四部署均运行」与「其余那些没查」在读数上分不开。同版本号重跑时
+  # tag 字符串没变，set image 不触发滚动，所以这里读的是容器实际在跑的 digest。
+  #
+  # 排掉两种 Pod：正在删除的（滚动收尾阶段旧 Pod 仍 Ready，读它会得到一份
+  # 已经过期的旧镜像读数），以及 Job 起的（CronJob 每次起 Pod 按浮动签拉，
+  # 它跑旧镜像不代表工作负载没换，把它算进来会触发一次没有理由的全量重启）。
+  # stdout 仍只留结果（空 = 全部已更新），逐行读数走 stderr。
+  running_image_digests() {
+    kubectl -n "$NS" get pods -o json 2>/dev/null | python3 -c '
 import json,sys
+REPOS=("localhost:30500/cogneva","localhost/cogneva")
+def repo_of(image):
+    image=image.split("@")[0]
+    last=image.rsplit("/",1)[-1]
+    return image.rsplit(":",1)[0] if ":" in last else image
+def job_owned(pod):
+    return any(ref.get("kind")=="Job" for ref in pod["metadata"].get("ownerReferences") or [])
 d=json.load(sys.stdin)
 for p in d.get("items",[]):
-    for cs in p.get("status",{}).get("containerStatuses",[]):
-        if cs.get("ready"):
-            print(cs.get("imageID",""))
-            sys.exit(0)
-')"
+    if p["metadata"].get("deletionTimestamp") or job_owned(p):
+        continue
+    for cs in p.get("status",{}).get("containerStatuses",[]) or []:
+        if cs.get("ready") and repo_of(cs.get("image","")) in REPOS:
+            print("%s\t%s\t%s" % (p["metadata"]["name"], cs.get("name"), cs.get("imageID","")))
+'
+  }
+  stale_containers() {
+    local pod container iid rid stale=""
+    while IFS=$'\t' read -r pod container iid; do
+      [ -n "$pod" ] || continue
       if [ -z "$iid" ]; then
         rid="MISSING"
       else
         rid="$(resolve_config_digest "$iid")"
         [ -n "$rid" ] || rid="UNRESOLVED"
       fi
-      printf '    %-18s %s\n' "$comp" "${rid:0:12}" >&2
-      [ "$rid" = "$want_id" ] || stale="${stale:+$stale }$comp"
-    done
+      printf '    %-30s %-18s %s\n' "$pod" "$container" "${rid:0:12}" >&2
+      [ "$rid" = "$want_id" ] || stale="${stale:+$stale }${pod}/${container}"
+    done < <(running_image_digests)
     printf '%s' "$stale"
   }
-  stale="$(stale_deploys)"
+  stale="$(stale_containers)"
   if [ -n "$stale" ]; then
     # 同版本号重跑（tag 字符串没变）时 set image 不触发滚动，Pod 仍跑旧镜像
-    # ID；强制重建让 :<tag> 解析到新 ID。
-    echo "==> 以下部署仍跑旧镜像（同版本重跑未触发滚动），强制重启：${stale}"
-    kubectl -n "$NS" rollout restart deployment/cogneva deployment/cogneva-evolution \
-      deployment/cogneva-security-gateway deployment/cogneva-sandbox-executor
-    kubectl rollout status -n "$NS" deployment/cogneva --timeout=180s
-    kubectl rollout status -n "$NS" deployment/cogneva-security-gateway --timeout=180s
-    kubectl rollout status -n "$NS" deployment/cogneva-evolution --timeout=300s
-    kubectl rollout status -n "$NS" deployment/cogneva-sandbox-executor --timeout=180s
-    stale="$(stale_deploys)"
+    # ID；强制重建让 :<tag> 解析到新 ID。重建面与滚动面是同一份从树里读出
+    # 来的集合——写死四个名字时，DaemonSet 上那份旧镜像永远不会被这条兜底救到。
+    echo "==> 以下容器仍跑旧镜像（同版本重跑未触发滚动），强制重启：${stale}"
+    while IFS=$'\t' read -r workload_kind workload_name; do
+      [ -n "$workload_kind" ] || continue
+      kubectl -n "$NS" rollout restart \
+        "$(printf '%s' "$workload_kind" | tr 'A-Z' 'a-z')/${workload_name}"
+    done < <(printf '%s\n' "$workloads" | cut -f1,2 | sort -u)
+    while IFS=$'\t' read -r workload_kind workload_name; do
+      [ -n "$workload_kind" ] || continue
+      kubectl rollout status -n "$NS" \
+        "$(printf '%s' "$workload_kind" | tr 'A-Z' 'a-z')/${workload_name}" --timeout=300s
+    done < <(printf '%s\n' "$workloads" | cut -f1,2 | sort -u)
+    stale="$(stale_containers)"
   fi
   if [ -n "$stale" ]; then
-    echo "滚动后仍有部署镜像不符（期望 ${want_id:0:12}）：${stale}" >&2
+    echo "滚动后仍有容器镜像不符（期望 ${want_id:0:12}）：${stale}" >&2
     exit 1
   fi
-  echo "==> 四部署均运行 localhost:30500/cogneva:${NEW_TAG}（${want_id:0:12}，rev ${GIT_REVISION}）"
+  echo "==> 换镜像面的容器均运行 localhost:30500/cogneva:${NEW_TAG}（${want_id:0:12}，rev ${GIT_REVISION}）"
 fi
 
 echo "==> 完成：${IMAGE}:${NEW_TAG}（节点与 registry 的 :local 均已同步，rev ${GIT_REVISION}）"
