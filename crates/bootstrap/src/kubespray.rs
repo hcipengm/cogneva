@@ -234,6 +234,26 @@ pub(crate) async fn ensure_container_runner() -> Result<String> {
     Ok("podman".into())
 }
 
+/// 每一处 ssh 调用共用的选项，只在这里写一次。
+///
+/// 四处各写过一遍，而且已经漂过一次：本机免密自检那一处少了 `ConnectTimeout`，
+/// 于是「自检通过」和「装机能连上」判的不是同一件事——自检会在一个装机会放弃的
+/// 目标上一直等着。非交互（BatchMode）、连接有界、接受尚未见过的 host key：这三条
+/// 是同一次零操作安装的三个前提，分开写就会分开变。
+pub(crate) const SSH_OPTIONS: [&str; 3] = [
+    "BatchMode=yes",
+    "ConnectTimeout=10",
+    "StrictHostKeyChecking=accept-new",
+];
+
+/// [`SSH_OPTIONS`] 展开成 `-o <option>` 的实参序列，接在 `ssh` 后面。
+pub(crate) fn base_ssh_args() -> Vec<String> {
+    SSH_OPTIONS
+        .iter()
+        .flat_map(|option| ["-o".to_string(), (*option).to_string()])
+        .collect()
+}
+
 /// The SSH invocation every remote call in this module shares: non-interactive
 /// (BatchMode, so a missing key fails instead of prompting), bounded by a
 /// connect timeout, and told to accept a host key it has not seen -- these are
@@ -241,14 +261,7 @@ pub(crate) async fn ensure_container_runner() -> Result<String> {
 /// install.
 fn ssh_args(target: &str, remote_cmd: &str) -> Vec<String> {
     let spec = parse_node("target", target);
-    let mut args: Vec<String> = vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ConnectTimeout=10".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
-    ];
+    let mut args = base_ssh_args();
     if let Some(p) = spec.port {
         args.push("-p".into());
         args.push(p.to_string());
@@ -353,15 +366,13 @@ async fn ensure_localhost_ssh() -> Result<()> {
     )
     .await?;
     // 验证免密自连。
+    // 自检用**同一批选项**：自检与装机判的是同一件事，两套选项时自检会在一台
+    // 装机其实连不上的机器上通过（这里原来就少一条 ConnectTimeout）。
+    let mut self_check_args = base_ssh_args();
+    self_check_args.push("root@127.0.0.1".into());
+    self_check_args.push("true".into());
     let ok = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            "root@127.0.0.1",
-            "true",
-        ])
+        .args(&self_check_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

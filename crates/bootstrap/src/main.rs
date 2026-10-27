@@ -1024,14 +1024,7 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
                 format!("{prep}{image_gc}{download} && {run_remote}")
             }
         };
-        let mut args: Vec<String> = vec![
-            "-o".into(),
-            "BatchMode=yes".into(),
-            "-o".into(),
-            "ConnectTimeout=10".into(),
-            "-o".into(),
-            "StrictHostKeyChecking=accept-new".into(),
-        ];
+        let mut args = crate::kubespray::base_ssh_args();
         if let Some(p) = port {
             args.push("-p".into());
             args.push(p);
@@ -1050,14 +1043,8 @@ async fn install_k3s_agents(agents: &[String]) -> Result<()> {
 /// install path uses (same options, so a node reachable there is reachable
 /// here). None covers every way the probe can fail: the reading is optional.
 async fn ssh_capture(ssh_target: &str, port: Option<&String>, command: &str) -> Option<String> {
-    let mut args: Vec<String> = vec![
-        "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
-        "ConnectTimeout=10".into(),
-        "-o".into(),
-        "StrictHostKeyChecking=accept-new".into(),
-    ];
+    // 与装机路径同一批 ssh 选项：两处各写一遍时，「那里连得上」不再推出「这里连得上」。
+    let mut args = crate::kubespray::base_ssh_args();
     if let Some(p) = port {
         args.push("-p".into());
         args.push(p.clone());
@@ -4779,6 +4766,138 @@ mod helm_delivery_single_writer_tests {
         assert_eq!(release_status_from_list_json(other), None);
         assert_eq!(release_status_from_list_json(b"[]"), None);
         assert_eq!(release_status_from_list_json(b"not json"), None);
+    }
+}
+
+#[cfg(test)]
+mod key_value_literal_tests {
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    /// 一个 `Key=value` 形状的字面量在这个 crate 的生产代码里只许写一遍。
+    ///
+    /// 这种字面量几乎都是「别人定的选项」：ssh 的 `-o` 选项、包管理器的环境开关。
+    /// 写第二遍的那一刻，两处就是两份约定，而漂移不会报错——它会以某一处**少一个
+    /// 选项**的形式发生。这里不是假设：ssh 选项曾经四处各写一遍，本机免密自检那一处
+    /// 少了 `ConnectTimeout`，于是自检通过而装机连不上，两侧读起来都正常。
+    fn literals_in(dir: &Path, out: &mut BTreeMap<String, Vec<String>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        paths.sort();
+        for path in paths {
+            if path.is_dir() {
+                literals_in(&path, out);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            // 测试夹具不在判据里：它们按定义是造场景，不是约定。
+            let text = match text.find("#[cfg(test)]") {
+                Some(at) => text[..at].to_string(),
+                None => text,
+            };
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            for line in text.lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                for value in quoted_key_values(line) {
+                    out.entry(value).or_default().push(name.clone());
+                }
+            }
+        }
+    }
+
+    /// 一行里所有 `"Key=value"` 形状的字面量。
+    fn quoted_key_values(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'"' {
+                j += 1;
+            }
+            let value = &line[start..j.min(line.len())];
+            let key = value.split('=').next().unwrap_or("");
+            let shaped = value.contains('=')
+                && !value.contains(' ')
+                && !key.is_empty()
+                && key
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.'));
+            if shaped {
+                out.push(value.to_string());
+            }
+            i = j + 1;
+        }
+        out
+    }
+
+    /// 对照：同一个字面量写两遍必须被报出来。少了这条，上面那条判据哪天读不到
+    /// 任何字面量也照样是绿的。
+    #[test]
+    fn a_key_value_literal_written_twice_is_reported() {
+        let dir = std::env::temp_dir().join(format!("bootstrap-kv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rs"),
+            "fn a() -> &'static str { \"BatchMode=yes\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.rs"),
+            "fn b() -> &'static str { \"BatchMode=yes\" }\n",
+        )
+        .unwrap();
+        let mut found = BTreeMap::new();
+        literals_in(&dir, &mut found);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            found.get("BatchMode=yes").map(|files| files.len()),
+            Some(2),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_key_value_literal_is_written_once() {
+        let mut found = BTreeMap::new();
+        literals_in(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(
+            found.len() > 3,
+            "只读到 {} 个 Key=value 字面量，这条判据没有题目",
+            found.len()
+        );
+        let repeated: Vec<String> = found
+            .iter()
+            .filter(|(_, files)| files.len() > 1)
+            .map(|(value, files)| format!("  {value:?}（{}）", files.join(", ")))
+            .collect();
+        assert!(
+            repeated.is_empty(),
+            "这些 Key=value 字面量写了不止一遍。第二处不会跟着第一处变，而漂移的\
+             表现是某一处少一个选项，两侧都读作正常：\n{}",
+            repeated.join("\n")
+        );
     }
 }
 
