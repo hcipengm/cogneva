@@ -170,20 +170,6 @@ export interface LlmPoolView {
   last_served_at: string | null;
 }
 
-export interface Session {
-  id: string;
-  title: string;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface Message {
-  id: string;
-  role: 'user' | 'assistant' | 'system';
-  content: string;
-  created_at: string;
-}
-
 export async function login(
   username: string,
   password: string
@@ -287,23 +273,6 @@ export function preferredPlatform(): PlatformProvider {
 
 export async function getClusterOverview(): Promise<ClusterOverview> {
   return api.get<ClusterOverview>('/api/v1/cluster/overview');
-}
-
-export async function listSessions(): Promise<Session[]> {
-  return api.get<Session[]>('/api/v1/sessions');
-}
-
-export async function createSession(title: string): Promise<Session> {
-  return api.post<Session>('/api/v1/sessions', { title });
-}
-
-export async function sendMessage(
-  sessionId: string,
-  content: string
-): Promise<Message> {
-  return api.post<Message>(`/api/v1/sessions/${sessionId}/messages`, {
-    content,
-  });
 }
 
 /** 一段对话里的一行，读回来的形状。 */
