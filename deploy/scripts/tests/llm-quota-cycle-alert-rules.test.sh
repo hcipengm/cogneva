@@ -38,7 +38,10 @@ bad() {
 work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
-run() { RULES_MANIFEST="$1" RULES_CASE="${2:-$case_file}" bash "$runner" >"${work}/out" 2>&1; rc=$?; }
+# stdin 关掉再跑：跑者与 promtool 在本机从终端跑时会去读标准输入，于是这一格
+# 不是红也不是绿，是挂在那里——本机测一次要等到外层超时，而「挂住」与「通过」
+# 在 `set -uo pipefail`（没有 `-e`）下面读起来一样安静。
+run() { RULES_MANIFEST="$1" RULES_CASE="${2:-$case_file}" bash "$runner" >"${work}/out" 2>&1 </dev/null; rc=$?; }
 
 # 把那一库的副本按一段 python 改坏。$1=输出文件 $2=规则名 $3=拿到 rule 后要执行的片段
 mutate() {
@@ -55,6 +58,16 @@ json.dump(config, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=2
 PY
 }
 
+# 改坏这一步本身就是一条判据：片段没命中时 python 抛异常、副本根本没写出来，
+# 而 `cmp -s` 把「文件不存在」读成「与真文件不同」，于是后面那一格拿一个不存在的
+# 清单去跑，跑者非零退出，这一格就被记成「夹具红了」——红的是缺文件，不是断言。
+# 2026-10-27 实测就踩到了：规则的活文本从 1800 改到 3600，第 3 处的片段再也命中不了，
+# 四格照样全绿。
+mutated() { # $1=副本 $2=规则名 $3=片段；写成了且与真文件不同才算改坏
+    mutate "$1" "$2" "$3" || return 1
+    [ -f "$1" ] && ! cmp -s "$config" "$1"
+}
+
 # 0) 真文件必须绿。
 run "$config"
 if [ "$rc" -eq 0 ]; then
@@ -65,55 +78,51 @@ else
 fi
 
 # 1) 删掉 idle 那条的排除腿：额度周期现场那一格必须红。
-mutate "${work}/no-unless.json" llm_pool_open_but_idle \
-    'rule["promql"] = rule["promql"].split(" unless on () ")[0]'
-if cmp -s "$config" "${work}/no-unless.json"; then
-    bad "删排除腿：副本没变（改不动）" "与真文件不同" "逐字相同"
-else
+if mutated "${work}/no-unless.json" llm_pool_open_but_idle \
+    'rule["promql"] = rule["promql"].split(" unless on () ")[0]'; then
     run "${work}/no-unless.json"
     [ "$rc" -ne 0 ] && ok "idle 那条丢了排除腿：额度周期那一格红了" \
         || bad "idle 那条丢了排除腿：仍然绿——夹具不判「同一件事不许两条规则抢着答」"
+else
+    bad "删排除腿：改坏当前规则文本的那一段没命中" "副本已写出且与真文件不同" "没写出来或逐字相同"
 fi
 
 # 2) 抬高新规则的界：firing 那一格必须红。
-mutate "${work}/threshold.json" llm_pool_down_on_a_quota_cycle \
-    'rule["condition"]={"greater_than": 1e9}'
-if cmp -s "$config" "${work}/threshold.json"; then
-    bad "界抬高：副本没变（改不动）" "与真文件不同" "逐字相同"
-else
+if mutated "${work}/threshold.json" llm_pool_down_on_a_quota_cycle \
+    'rule["condition"]={"greater_than": 1e9}'; then
     run "${work}/threshold.json"
     [ "$rc" -ne 0 ] && ok "新规则界抬到十亿：firing 那一格红了" || bad "界抬到十亿仍然绿——这条断言不判界"
+else
+    bad "界抬高：改坏当前规则文本的那一段没命中" "副本已写出且与真文件不同" "没写出来或逐字相同"
 fi
 
 # 3) 删掉「池不可用」那条腿：池可用那一格必须红。
-mutate "${work}/no-pool-leg.json" llm_pool_down_on_a_quota_cycle '
-leg = " and on () (max(llm_pool_available and ((time() - llm_pool_available_observed_timestamp_seconds) < 1800)) == 0)"
+if mutated "${work}/no-pool-leg.json" llm_pool_down_on_a_quota_cycle '
+leg = " and on () (max(llm_pool_available and ((time() - llm_pool_available_observed_timestamp_seconds) < 3600)) == 0)"
 assert leg in rule["promql"], "那条腿的文本变了，这条改坏不再有效"
 rule["promql"] = rule["promql"].replace(leg, "")'
-if cmp -s "$config" "${work}/no-pool-leg.json"; then
-    bad "删池不可用腿：副本没变（改不动）" "与真文件不同" "逐字相同"
-else
+then
     run "${work}/no-pool-leg.json"
     [ "$rc" -ne 0 ] && ok "新规则丢了池不可用腿：池可用那一格红了" || bad "删掉池不可用腿仍然绿——夹具不判第二条腿"
+else
+    bad "删池不可用腿：改坏当前规则文本的那一段没命中" "副本已写出且与真文件不同" "没写出来或逐字相同"
 fi
 
 # 4) 把新鲜度界放开：八小时前那一格必须红。
-mutate "${work}/no-freshness.json" llm_pool_down_on_a_quota_cycle \
-    'rule["promql"] = rule["promql"].replace("< 3600", "< 1000000000")'
-if cmp -s "$config" "${work}/no-freshness.json"; then
-    bad "放开新鲜度界：副本没变（改不动）" "与真文件不同" "逐字相同"
-else
+if mutated "${work}/no-freshness.json" llm_pool_down_on_a_quota_cycle \
+    'rule["promql"] = rule["promql"].replace("< 3600", "< 1000000000")'; then
     run "${work}/no-freshness.json"
     [ "$rc" -ne 0 ] && ok "新鲜度界放开到十亿秒：八小时前那一格红了" || bad "新鲜度界放开仍然绿——夹具不判写者是否还在写"
+else
+    bad "放开新鲜度界：改坏当前规则文本的那一段没命中" "副本已写出且与真文件不同" "没写出来或逐字相同"
 fi
 
 # 5) 删掉整条规则：夹具点名了库里没有的规则，跑者必须非零。
-mutate "${work}/dropped.json" llm_pool_down_on_a_quota_cycle 'rules.remove(rule)'
-if cmp -s "$config" "${work}/dropped.json"; then
-    bad "删规则：副本没变（改不动）" "与真文件不同" "逐字相同"
-else
+if mutated "${work}/dropped.json" llm_pool_down_on_a_quota_cycle 'rules.remove(rule)'; then
     run "${work}/dropped.json"
     [ "$rc" -ne 0 ] && ok "夹具点名的规则被删：跑者非零" || bad "规则被删仍然零——夹具的死指针没被抓住"
+else
+    bad "删规则：改坏当前规则文本的那一段没命中" "副本已写出且与真文件不同" "没写出来或逐字相同"
 fi
 
 printf '\n通过 %d，失败 %d\n' "$pass" "$fail"
