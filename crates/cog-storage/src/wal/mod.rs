@@ -404,6 +404,16 @@ pub fn confirmed_for_retirement(
 /// run must be able to see it run.
 pub const WAL_RETIRE_SWEEP_LOOP: &str = "storage_wal_retire_sweep";
 
+/// Every WAL list key starts with this, followed by the session id.
+///
+/// Written once because three sweeps walk the keyspace in Lua and cut the
+/// session id out of each key they find. A prefix spelled in the script as well
+/// as in Rust drifts without a sound: the scan matches nothing and the pass
+/// reports "no orphans", which is the same reading as a store where nothing is
+/// abandoned, so logs pile up unbounded — and a hardcoded offset would cut the
+/// id out of the wrong place and hand a live session's log to the reaper.
+pub const WAL_KEY_PREFIX: &str = "wal:";
+
 /// Redis-based WAL backend.
 /// Uses Redis Lists for ordered storage of WAL records per session.
 /// Each session maps to a Redis List key: `wal:{session_id}`.
@@ -500,8 +510,9 @@ impl RedisWalBackend {
                 local trimmed = 0
                 local released = 0
                 local keep = tonumber(ARGV[1])
+                local prefix = ARGV[2]
                 repeat
-                  local r = redis.call("SCAN", cur, "MATCH", "wal:*", "COUNT", 1000)
+                  local r = redis.call("SCAN", cur, "MATCH", prefix .. "*", "COUNT", 1000)
                   cur = r[1]
                   for i = 1, #r[2] do
                     local key = r[2][i]
@@ -518,6 +529,7 @@ impl RedisWalBackend {
             )
             .arg(0)
             .arg(keep)
+            .arg(WAL_KEY_PREFIX)
             .query_async::<(u64, u64)>(&mut conn)
             .await
             .map_err(|e| WalError::Backend(format!("Redis WAL cap sweep failed: {}", e)))?;
@@ -563,12 +575,13 @@ impl RedisWalBackend {
                 r#"
                 local cur = "0"
                 local out = {}
+                local prefix = ARGV[2]
                 repeat
-                  local r = redis.call("SCAN", cur, "MATCH", "wal:*", "COUNT", 1000)
+                  local r = redis.call("SCAN", cur, "MATCH", prefix .. "*", "COUNT", 1000)
                   cur = r[1]
                   for i = 1, #r[2] do
                     local key = r[2][i]
-                    local session = string.sub(key, 5)
+                    local session = string.sub(key, string.len(prefix) + 1)
                     if redis.call("EXISTS", ARGV[1] .. session) == 0 then
                       out[#out + 1] = key
                     end
@@ -579,6 +592,7 @@ impl RedisWalBackend {
             )
             .arg(0)
             .arg(crate::redis::registry::AGENT_KEY_PREFIX)
+            .arg(WAL_KEY_PREFIX)
             .query_async(&mut conn)
             .await
             .map_err(|e| WalError::Backend(format!("Redis WAL orphan scan failed: {}", e)))?;
@@ -619,10 +633,11 @@ impl RedisWalBackend {
                 r#"
                 local records = 0
                 local retired = 0
+                local prefix = ARGV[2]
                 for i = 1, #KEYS do
                   local key = KEYS[i]
-                  if string.sub(key, 1, 4) == "wal:" then
-                    local session = string.sub(key, 5)
+                  if string.sub(key, 1, string.len(prefix)) == prefix then
+                    local session = string.sub(key, string.len(prefix) + 1)
                     if redis.call("EXISTS", ARGV[1] .. session) == 0 then
                       records = records + (redis.call("LLEN", key) or 0)
                       redis.call("DEL", key)
@@ -636,6 +651,7 @@ impl RedisWalBackend {
             .arg(keys.len())
             .arg(keys)
             .arg(crate::redis::registry::AGENT_KEY_PREFIX)
+            .arg(WAL_KEY_PREFIX)
             .query_async(&mut conn)
             .await
             .map_err(|e| WalError::Backend(format!("Redis WAL retirement failed: {}", e)))?;
@@ -741,7 +757,7 @@ impl RedisWalBackend {
     }
 
     fn key(session_id: &str) -> String {
-        format!("wal:{}", session_id)
+        format!("{WAL_KEY_PREFIX}{session_id}")
     }
 }
 
@@ -933,6 +949,15 @@ mod tests {
 
     fn candidates(pairs: &[(&str, i64)]) -> Vec<(String, i64)> {
         pairs.iter().map(|(k, l)| (k.to_string(), *l)).collect()
+    }
+
+    /// 这条前缀是线上的事实：库里已经有按这个拼法存在的 list，三个 Lua 清扫
+    /// 脚本拿它扫键、按它的长度切出会话 id。这里钉的是拼法本身，不是「函数
+    /// 等于自己」——改它，库里那些日志就再也没有人扫得到。
+    #[test]
+    fn the_wal_key_prefix_does_not_drift() {
+        assert_eq!(WAL_KEY_PREFIX, "wal:");
+        assert_eq!(RedisWalBackend::key("s-1"), "wal:s-1");
     }
 
     #[test]
