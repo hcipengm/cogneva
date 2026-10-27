@@ -25,6 +25,15 @@
 //! `p.ghost_field`，本门红并点名它；还原后绿。临时树上另做了三条：多读一个字段要
 //! 红、把字段写进变体后要绿、`case` 写一个不存在的线上名字也要红（那一臂根本进不去）。
 //!
+//! 第二个客户端是嵌在网关二进制里的运维页（`takeover.html`）：它拿事件对象本身
+//! 去 `switch (msg.type)`，没有 `payload` 那一层绑定。它 12 条臂里的读法全部成立
+//! （实测：`state_change` 读 `to`、`react_step_start` 读 `iteration`、
+//! `message_update` 读 `assistant_event`、`tool_execution_end` 读 `is_error`，都对得上
+//! 变体）。真树消融：在那一页的 `state_change` 一臂里加 `msg.ghost_field`，本门红并
+//! 点名；还原后绿。同一个函数里还有一处 `switch (p.type)`——那是信封里聊天流的类型
+//! （`message.start` 之类），判到它只会得到一片假红，所以「被 switch 的变量自己是
+//! 从 `.payload` 解出来的」那一处不判。
+//!
 //! 认不出的地方一律跳过，不猜：变体名与线上名字的对应关系从
 //! `crates/cog-storage/src/event_filter.rs` 的 `event_type_name` 里读，不自己把
 //! `react_step_end` 拼成 `ReactStepEnd`（变体其实叫 `ReActStepEnd`）；文件里找不到
@@ -41,6 +50,15 @@ const WIRE: &str = "crates/cog-storage/src/event_filter.rs";
 
 /// 客户端。
 const WEB: &str = "web/src";
+
+/// 第二个客户端：嵌在网关二进制里的运维页。
+///
+/// 它把事件对象本身拿去 `switch (msg.type)`，每一臂直接读 `msg.<field>`，没有
+/// `const p = event.payload` 那一层。同一个函数里还有一处 `switch (p.type)`——那
+/// 是信封里那一层聊天流的类型（`message.start` 之类），不是 `AgentEvent` 的线上
+/// 名字，读的也不是变体字段，判到它只会得到一片假红。两者的区别写在代码里：被
+/// switch 的那个变量若自己就是从 `.payload` 里解出来的，这一处不判。
+const PAGE: &str = "crates/cog-gateway/src/takeover.html";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -366,6 +384,85 @@ fn arms(file: &str, source: &str) -> Vec<Arm> {
     out
 }
 
+/// 运维页那种写法：`switch (msg.type)`，臂里直接读 `msg.<field>`。
+///
+/// 只认「被 switch 的变量就是事件对象」这一种：从 `.payload` 里解出来的变量
+/// （`switch (p.type)`）不判——那一层是信封里的聊天流类型，不是 `AgentEvent`。
+/// 这个变量是不是自己就从 `.payload` 里解出来的（`const p = msg.payload;`）。
+///
+/// 是的话，`switch (p.type)` 判的是信封里那一层聊天流的类型，不是 `AgentEvent`。
+fn bound_from_payload(span: &str, var: &str) -> bool {
+    let needle = format!("const {var} =");
+    let mut cursor = 0;
+    while let Some(at) = span[cursor..].find(&needle) {
+        let start = cursor + at + needle.len();
+        let end = span[start..].find(';').map_or(span.len(), |n| start + n);
+        let rest = &span[start..end];
+        cursor = start;
+        if rest.contains(".payload") {
+            return true;
+        }
+    }
+    false
+}
+
+fn page_arms(file: &str, source: &str) -> Vec<Arm> {
+    let text = strip_comments(source);
+    let mut out = Vec::new();
+
+    let mut cursor = 0;
+    while let Some(at) = text[cursor..].find("switch (") {
+        let open = cursor + at + "switch (".len();
+        cursor = open;
+        let Some(close) = text[open..].find(')') else {
+            break;
+        };
+        let scrutinee = text[open..open + close].trim();
+        let Some(base) = scrutinee.strip_suffix(".type") else {
+            continue;
+        };
+        let base = base.trim();
+        let (start, end) = function_span(&text, open);
+        if bound_from_payload(&text[start..end], base) {
+            continue;
+        }
+        let Some(brace) = text[open + close..].find('{') else {
+            continue;
+        };
+        let body_start = open + close + brace + 1;
+        let body = &text[body_start..end];
+        let mut labels: Vec<(usize, String)> = Vec::new();
+        let mut label_cursor = 0;
+        while let Some(found) = body[label_cursor..].find("case '") {
+            let position = label_cursor + found;
+            let line_start = body[..position].rfind('\n').map_or(0, |n| n + 1);
+            if !body[line_start..position].trim().is_empty() {
+                label_cursor = position + "case '".len();
+                continue;
+            }
+            let name_start = position + "case '".len();
+            let Some(name_end) = body[name_start..].find('\'') else {
+                break;
+            };
+            labels.push((
+                position,
+                body[name_start..name_start + name_end].to_string(),
+            ));
+            label_cursor = name_start + name_end;
+        }
+        for (index, (position, wire)) in labels.iter().enumerate() {
+            let stop = labels.get(index + 1).map_or(body.len(), |(next, _)| *next);
+            out.push(Arm {
+                file: file.to_string(),
+                wire: wire.clone(),
+                fields: fields_read(&body[*position..stop], base),
+            });
+        }
+    }
+
+    out
+}
+
 /// 每一条读法都要落在它那一臂收到的变体上。
 fn contradictions(root: &Path) -> (Vec<String>, usize) {
     let wire = wire_names(&read(&root.join(WIRE)));
@@ -375,39 +472,45 @@ fn contradictions(root: &Path) -> (Vec<String>, usize) {
     let mut files = Vec::new();
     collect_ts(&root.join(WEB), &mut files);
     files.sort();
+    let mut found = Vec::new();
     for path in files {
         let name = path
             .strip_prefix(root.join(WEB))
             .unwrap_or(&path)
             .display()
             .to_string();
-        for arm in arms(&name, &read(&path)) {
-            let Some(variant) = wire.get(&arm.wire) else {
-                complaints.push(format!(
-                    "{}: case '{}' 不是任何事件变体的线上名字（{} 里没有它）：这一臂永远不会进，\
-                     写在这里的每一句都是死的",
-                    arm.file, arm.wire, WIRE
-                ));
-                continue;
-            };
-            let Some(carried) = variants.get(variant) else {
-                complaints.push(format!(
-                    "{} 的线上名字 {} 对到变体 {variant}，而 {EVENT} 里没有这个变体",
-                    arm.wire, variant
-                ));
-                continue;
-            };
-            judged += 1;
-            let extra: Vec<&String> = arm.fields.difference(carried).collect();
-            if !extra.is_empty() {
-                let mut names: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
-                names.sort_unstable();
-                complaints.push(format!(
-                    "{}: case '{}' 读 {names:?}，而 {variant} 只带 {:?}：那一帧没有这些字段，\
-                     读出来是 undefined——读法本身在编一个不存在的名字",
-                    arm.file, arm.wire, carried
-                ));
-            }
+        found.extend(arms(&name, &read(&path)));
+    }
+    let page = root.join(PAGE);
+    if page.exists() {
+        found.extend(page_arms(PAGE, &read(&page)));
+    }
+    for arm in found {
+        let Some(variant) = wire.get(&arm.wire) else {
+            complaints.push(format!(
+                "{}: case '{}' 不是任何事件变体的线上名字（{} 里没有它）：这一臂永远不会进，\
+                 写在这里的每一句都是死的",
+                arm.file, arm.wire, WIRE
+            ));
+            continue;
+        };
+        let Some(carried) = variants.get(variant) else {
+            complaints.push(format!(
+                "{} 的线上名字 {} 对到变体 {variant}，而 {EVENT} 里没有这个变体",
+                arm.wire, variant
+            ));
+            continue;
+        };
+        judged += 1;
+        let extra: Vec<&String> = arm.fields.difference(carried).collect();
+        if !extra.is_empty() {
+            let mut names: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+            names.sort_unstable();
+            complaints.push(format!(
+                "{}: case '{}' 读 {names:?}，而 {variant} 只带 {:?}：那一帧没有这些字段，\
+                 读出来是 undefined——读法本身在编一个不存在的名字",
+                arm.file, arm.wire, carried
+            ));
         }
     }
     (complaints, judged)
@@ -477,6 +580,97 @@ fn the_census_is_wide_enough_to_mean_something() {
         "只读到 {} 个不同的字段名，太少：判据没在看载荷读法",
         total_fields.len()
     );
+
+    let page = root.join(PAGE);
+    assert!(
+        page.exists(),
+        "{PAGE} 不在了：第二个客户端会一声不响地不再被判"
+    );
+    let page_judged = page_arms(PAGE, &read(&page)).len();
+    assert!(
+        page_judged >= 10,
+        "运维页只判到 {page_judged} 条臂，太少了：那一处的 switch 写法变了"
+    );
+}
+
+#[test]
+fn the_reader_follows_the_page_that_switches_on_the_event_itself() {
+    let source = "\
+function handleLiveMessage(data) {
+  let msg;
+  try { msg = JSON.parse(data); } catch { return; }
+  if (['agent_event', 'notification'].includes(msg.type) && msg.payload) {
+    const p = msg.payload;
+    switch (p.type) {
+      case 'message.start':
+        if (p.message_id) startMessage(p.message_id);
+        break;
+    }
+    return;
+  }
+  switch (msg.type) {
+    case 'state_change':
+      if (msg.agent_id) setStatus(msg.to);
+      break;
+    case 'agent_error':
+    case 'resource_alert':
+      if (msg.agent_id) setStatus('error');
+      break;
+  }
+}
+";
+    let found = page_arms("page.html", source);
+    // 信封里那一层 `switch (p.type)` 不判：它的词是聊天流的，不是 AgentEvent 的。
+    assert_eq!(found.len(), 3, "{found:#?}");
+    assert_eq!(found[0].wire, "state_change");
+    assert_eq!(
+        found[0].fields,
+        BTreeSet::from(["agent_id".to_string(), "to".to_string()])
+    );
+    // 叠在一起的两个 case 标签：前一条臂只到第二个标签为止，字段由后一条承接。
+    assert_eq!(found[1].wire, "agent_error");
+    assert!(found[1].fields.is_empty(), "{found:#?}");
+    assert_eq!(found[2].wire, "resource_alert");
+    assert_eq!(found[2].fields, BTreeSet::from(["agent_id".to_string()]));
+}
+
+#[test]
+fn a_page_read_of_a_field_its_variant_lacks_is_reported() {
+    let root = std::env::temp_dir().join(format!("cogneva-page-fields-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join(WEB)).expect("temp web");
+    std::fs::create_dir_all(root.join("crates/cog-core/src/types")).expect("temp core");
+    std::fs::create_dir_all(root.join("crates/cog-storage/src")).expect("temp storage");
+    std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("temp gateway");
+
+    std::fs::write(
+        root.join(EVENT),
+        "pub enum AgentEvent {\n    ToolExecutionEnd {\n        agent_id: String,\n        \
+         is_error: bool,\n    },\n}\n",
+    )
+    .expect("event");
+    std::fs::write(
+        root.join(WIRE),
+        "pub fn event_type_name(event: &AgentEvent) -> &str {\n    match event {\n        \
+         AgentEvent::ToolExecutionEnd { .. } => \"tool_execution_end\",\n    }\n}\n",
+    )
+    .expect("wire");
+    std::fs::write(
+        root.join(PAGE),
+        "function f(data) {\n  const msg = JSON.parse(data);\n  switch (msg.type) {\n    \
+         case 'tool_execution_end':\n      use(msg.agent_id, msg.tool_name);\n      break;\n  }\n}\n",
+    )
+    .expect("page");
+
+    let (complaints, judged) = contradictions(&root);
+    assert_eq!(judged, 1, "{complaints:?}");
+    assert_eq!(complaints.len(), 1, "{complaints:?}");
+    assert!(
+        complaints[0].contains("读 [\"tool_name\"]"),
+        "{complaints:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]
