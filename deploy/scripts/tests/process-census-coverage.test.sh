@@ -116,6 +116,20 @@ sed -i 's/readOnly: true/readOnly: false/' "${work}/deploy/k3s/process-census-da
 if out="$(run)"; then fail "cgroup 挂载可写时应当红却绿了"; fi
 grep -q "只读" <<<"${out}" || fail "报错没有点名只读：${out}"
 
+# 负例 6：多出一个 profile 目录，而它没有渲染出这份 DaemonSet。
+# 判据的 profile 集合若是在脚本里写死的，这个目录根本不会进判据——新增的拓扑装上就是
+# 没有采集器，而判词与「本来就没有这个 profile」一模一样。
+fixture
+mkdir -p "${work}/deploy/rendered/k3s-airgap"
+if out="$(run)"; then fail "新增的 profile 目录没有采集器时应当红却绿了"; fi
+grep -q "k3s-airgap" <<<"${out}" || fail "报错没有点名那个新 profile：${out}"
+
+# 负例 7：一个 profile 目录都没有。这读作「判不了」，不是「全过」。
+fixture
+rm -rf "${work}/deploy/rendered"
+if out="$(run)"; then fail "没有渲染产物时应当红却绿了"; fi
+grep -q "判不了" <<<"${out}" || fail "报错没有说明判不了：${out}"
+
 # 最后：真树必须绿。
 if ! out="$(cd "${repo}" && bash "${checker}")"; then
   fail "真树应当绿却红了：${out}"

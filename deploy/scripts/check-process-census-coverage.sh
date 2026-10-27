@@ -15,7 +15,10 @@
 #      ——没有它 `/proc` 里只有本容器自己，第三方容器一个都读不到；
 #   3. 它把宿主 cgroup 根**只读**挂进来——容器实例的边界只能从那里数出来；
 #   4. 它不给自己发 SA token（它不跟 apiserver 说话）；
-#   5. 三个 profile 的渲染产物里都有这份 DaemonSet，静态清单 `deploy/k3s/` 也有；
+#   5. **每个** profile 的渲染产物里都有这份 DaemonSet，静态清单 `deploy/k3s/` 也有
+#      ——profile 集合从 `deploy/rendered/` 的目录读，不在本脚本里抄一份名单：抄一份就
+#      会在新增 profile 时只漏那一个，而「漏掉的那一个」与「本来就没有这个 profile」
+#      从判词上看不出区别；
 #   6. 上报的落点仍是那条零凭证的内部面（网关的 `/api/v1/cluster/process-report`）。
 #
 # 用法：bash deploy/scripts/check-process-census-coverage.sh [仓库根目录]
@@ -106,7 +109,18 @@ if chart:
     if "readOnly: true" not in chart:
         problems.append("chart process-census.yaml: cgroup 挂载没有 readOnly")
 
-PROFILES = ["k3s-single", "k3s-multi", "k8s-standard"]
+# profile 的集合在这里是**读出来的**，不是写出来的：每一棵交付树都是 deploy/rendered/
+# 下的一个目录。写死一份名单，新增的那一个 profile 就会安静地从这条判据里消失——它装上
+# 有没有采集器，判词一个字节都不会变。
+RENDERED = os.path.join(ROOT, "deploy/rendered")
+PROFILES = sorted(
+    name for name in os.listdir(RENDERED) if os.path.isdir(os.path.join(RENDERED, name))
+) if os.path.isdir(RENDERED) else []
+if not PROFILES:
+    problems.append(
+        "deploy/rendered/ 下一个 profile 目录都没有：判不了「每个 profile 都有采集器」，"
+        "这不等于全过"
+    )
 for profile in PROFILES:
     rel = f"deploy/rendered/{profile}/40-daemonset-cogneva-process-census.yaml"
     path = os.path.join(ROOT, rel)
@@ -132,5 +146,6 @@ if problems:
         "而空格读作「里面没有进程」。"
     )
 
-print("ok：process-census 子命令、chart、三个 profile 的渲染产物与静态清单都在，hostPID 与只读 cgroup 挂载齐")
+print("ok：process-census 子命令、chart、%d 个 profile 的渲染产物与静态清单都在，hostPID 与只读 cgroup 挂载齐"
+      % len(PROFILES))
 PYEOF
