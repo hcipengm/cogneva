@@ -390,7 +390,14 @@ pub enum AgentEvent {
     /// `react_step_start`. One event with two names is invisible to half its
     /// readers — a client that subscribes by the stored name never sees the
     /// live frame, and nothing on either side looks broken.
-    #[serde(rename = "react_step_start")]
+    ///
+    /// The pinned name is also accepted under the spelling the pin replaced.
+    /// Traces already on disk were written while `rename_all` still had its
+    /// way, so a reader that only knows the pinned name cannot open them at
+    /// all: measured here, fifty-three hot traces sat past their tier's age
+    /// through every pass because the demotion could not deserialize what it
+    /// was asked to move, and nothing deletes a trace it cannot read.
+    #[serde(rename = "react_step_start", alias = "re_act_step_start")]
     ReActStepStart {
         agent_id: String,
         iteration: u32,
@@ -399,7 +406,12 @@ pub enum AgentEvent {
     },
     /// A ReAct (Reasoning + Acting) step completed.
     /// Emitted after the Observation phase of each cycle.
-    #[serde(rename = "react_step_end")]
+    ///
+    /// Accepts the pre-pin spelling for the same reason as
+    /// [`AgentEvent::ReActStepStart`]: a trace written before the pin is
+    /// unreadable to a reader that knows only the pinned name, and an
+    /// unreadable trace can be neither demoted nor deleted.
+    #[serde(rename = "react_step_end", alias = "re_act_step_end")]
     ReActStepEnd {
         agent_id: String,
         iteration: u32,
@@ -638,6 +650,48 @@ mod tests {
                 "a delta event grew beyond its own delta: {value}"
             );
         }
+    }
+
+    /// Traces already on disk carry the spelling the pin replaced, and the
+    /// tier demotion loads a trace before it can move it: a reader that knows
+    /// only the pinned name refuses them, so they stay in the tier they have
+    /// outgrown for good and nothing deletes what cannot be read. Measured on
+    /// this deployment, fifty-three hot traces were stuck that way, failing
+    /// every pass with `unknown variant re_act_step_start`.
+    #[test]
+    fn a_trace_written_under_the_pre_pin_name_still_reads() {
+        let written = serde_json::json!({
+            "type": "re_act_step_start",
+            "agent_id": "planner",
+            "iteration": 3,
+            "timestamp": "2026-10-25T04:14:57.003538150Z",
+        });
+        let event: AgentEvent = serde_json::from_value(written).unwrap();
+        assert!(
+            matches!(event, AgentEvent::ReActStepStart { iteration: 3, .. }),
+            "the pre-pin spelling has to read back as the pinned variant: {event:?}"
+        );
+        // Still written under the pinned name, so the alias cannot quietly
+        // become a second spelling on the write side.
+        assert_eq!(
+            serde_json::to_value(&event).unwrap()["type"],
+            serde_json::json!("react_step_start")
+        );
+
+        let ended = serde_json::json!({
+            "type": "re_act_step_end",
+            "agent_id": "planner",
+            "iteration": 3,
+            "thought": "why",
+            "tool_calls": [],
+            "observations": [],
+            "timestamp": "2026-10-25T04:14:58.003538150Z",
+        });
+        let event: AgentEvent = serde_json::from_value(ended).unwrap();
+        assert!(
+            matches!(event, AgentEvent::ReActStepEnd { iteration: 3, .. }),
+            "the pre-pin spelling has to read back as the pinned variant: {event:?}"
+        );
     }
 
     /// The runtime builds the assistant message by folding this stream, and
