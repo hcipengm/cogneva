@@ -149,18 +149,15 @@ const OWNED: &[Owned] = &[
     // ── 沙盒运行状态 ──
     Owned {
         words: &["idle"],
-        source: Source::Writer(RUNTIME, "RuntimeState::Idle => write!(f, \"idle\"),"),
+        source: Source::Writer(RUNTIME, "RuntimeState::Idle => \"idle\","),
     },
     Owned {
         words: &["complete"],
-        source: Source::Writer(
-            RUNTIME,
-            "RuntimeState::Complete => write!(f, \"complete\"),",
-        ),
+        source: Source::Writer(RUNTIME, "RuntimeState::Complete => \"complete\","),
     },
     Owned {
         words: &["error"],
-        source: Source::Writer(RUNTIME, "RuntimeState::Error => write!(f, \"error\"),"),
+        source: Source::Writer(RUNTIME, "RuntimeState::Error => \"error\","),
     },
     // ── 接口错误体 ──
     Owned {
