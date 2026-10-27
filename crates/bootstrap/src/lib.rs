@@ -21,21 +21,73 @@ pub enum Distro {
     Kubespray,
 }
 
+/// 三种部署 profile 的名字，各写一次。
+///
+/// 同一个名字同时是 Helm 的 `deploy/helm/cogneva/profiles/<name>.yaml`、CI 预渲染
+/// 的 `deploy/rendered/<name>/`、以及计划里部署分支的序列化值。这几处只要有一处
+/// 拼错，元启动就会按一个渲染器没产出过的名字去找目录：读出来是空的，而「目录不
+/// 存在」和「这个 profile 没有渲染产物」在调用点长得一样，于是它安静地退回默认
+/// 分支，部署到的是另一种形态的集群。
+pub const PROFILE_K3S_SINGLE: &str = "k3s-single";
+/// 见 [`PROFILE_K3S_SINGLE`]。
+pub const PROFILE_K3S_MULTI: &str = "k3s-multi";
+/// 见 [`PROFILE_K3S_SINGLE`]。
+pub const PROFILE_K8S_STANDARD: &str = "k8s-standard";
+
+/// 全部 profile 名，顺序即渲染器产出顺序。
+pub const PROFILE_NAMES: [&str; 3] = [PROFILE_K3S_SINGLE, PROFILE_K3S_MULTI, PROFILE_K8S_STANDARD];
+
 /// 部署分支（与 main.rs 的部署 profile 同名对齐）。它描述"往什么形态的集群上
 /// 部署应用"，序列化名与 Helm profile / 渲染目录一一对应：`k3s-single` /
 /// `k3s-multi` / `k8s-standard`。前两者由 K3s 供给产出，`K8sStandard` 由
 /// kubespray 新建的标准 K8s 或用户既有标准集群产出。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// 序列化走 [`PlanBranch::name`] 而不是 `#[serde(rename = …)]`：那个属性只能写字
+/// 面量，会和 [`PROFILE_NAMES`] 各自演进。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanBranch {
     /// K3s 单节点。
-    #[serde(rename = "k3s-single")]
     K3sSingle,
     /// K3s 多节点（server + agents）。
-    #[serde(rename = "k3s-multi")]
     K3sMulti,
     /// 标准 Kubernetes（kubeadm / kubespray / EKS 等）。
-    #[serde(rename = "k8s-standard")]
     K8sStandard,
+}
+
+impl PlanBranch {
+    /// 这条分支对应的 profile 名，也就是它在计划里序列化出来的字面量。
+    pub fn name(self) -> &'static str {
+        match self {
+            PlanBranch::K3sSingle => PROFILE_K3S_SINGLE,
+            PlanBranch::K3sMulti => PROFILE_K3S_MULTI,
+            PlanBranch::K8sStandard => PROFILE_K8S_STANDARD,
+        }
+    }
+
+    /// [`PlanBranch::name`] 的反向：认不出的名字返回 `None`，由调用点决定是拒绝
+    /// 还是回退。
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            PROFILE_K3S_SINGLE => Some(PlanBranch::K3sSingle),
+            PROFILE_K3S_MULTI => Some(PlanBranch::K3sMulti),
+            PROFILE_K8S_STANDARD => Some(PlanBranch::K8sStandard),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for PlanBranch {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+impl<'de> Deserialize<'de> for PlanBranch {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        PlanBranch::from_name(&raw)
+            .ok_or_else(|| serde::de::Error::unknown_variant(&raw, &PROFILE_NAMES))
+    }
 }
 
 /// 计划元信息。

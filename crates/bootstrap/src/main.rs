@@ -200,11 +200,13 @@ enum Profile {
 }
 
 impl Profile {
+    /// 渲染目录名。名字本身声明在 `lib.rs`：计划里的部署分支序列化成同一个字面
+    /// 量，两处各写一遍时改一处不报错，另一处会指向一个没人产出过的目录。
     fn dir_name(self) -> &'static str {
         match self {
-            Profile::K3sSingle => "k3s-single",
-            Profile::K3sMulti => "k3s-multi",
-            Profile::K8sStandard => "k8s-standard",
+            Profile::K3sSingle => cogneva_bootstrap::PROFILE_K3S_SINGLE,
+            Profile::K3sMulti => cogneva_bootstrap::PROFILE_K3S_MULTI,
+            Profile::K8sStandard => cogneva_bootstrap::PROFILE_K8S_STANDARD,
         }
     }
 }
@@ -3844,12 +3846,88 @@ mod namespace_tests {
 mod profile_tests {
     use super::Profile;
 
+    /// 名字的判据不在这里手抄一份：从磁盘上把 renderer 真正产出的三处读出来，
+    /// 与代码里那一份比较。改 profile 文件、改渲染目录、改 render-deploy.sh 的
+    /// PROFILES 而没改代码，这条会红——否则元启动会拿着一个没人产出过的目录名
+    /// 去找渲染产物，读到的空和「没渲染过」区分不开。
     #[test]
-    fn profile_dir_names_match_rendered_tree() {
-        // 目录名必须与 deploy/scripts/render-deploy.sh 的 PROFILES 一一对应。
-        assert_eq!(Profile::K3sSingle.dir_name(), "k3s-single");
-        assert_eq!(Profile::K3sMulti.dir_name(), "k3s-multi");
-        assert_eq!(Profile::K8sStandard.dir_name(), "k8s-standard");
+    fn the_declared_profile_names_are_the_ones_on_disk() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut declared: Vec<&str> = cogneva_bootstrap::PROFILE_NAMES.to_vec();
+        declared.sort_unstable();
+
+        let chart_profiles = root.join("deploy/helm/cogneva/profiles");
+        let mut on_chart: Vec<String> = std::fs::read_dir(&chart_profiles)
+            .unwrap_or_else(|e| panic!("{}: {e}", chart_profiles.display()))
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.extension()? != "yaml" {
+                    return None;
+                }
+                Some(path.file_stem()?.to_string_lossy().into_owned())
+            })
+            .collect();
+        on_chart.sort_unstable();
+        assert_eq!(
+            on_chart, declared,
+            "Helm profile 文件名与代码里的名字不一致"
+        );
+
+        let rendered = root.join("deploy/rendered");
+        let mut on_rendered: Vec<String> = std::fs::read_dir(&rendered)
+            .unwrap_or_else(|e| panic!("{}: {e}", rendered.display()))
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if !path.is_dir() {
+                    return None;
+                }
+                Some(path.file_name()?.to_string_lossy().into_owned())
+            })
+            .collect();
+        on_rendered.sort_unstable();
+        assert_eq!(
+            on_rendered, declared,
+            "预渲染目录名与代码里的名字不一致：提交前先跑 deploy/scripts/render-deploy.sh"
+        );
+
+        let script = root.join("deploy/scripts/render-deploy.sh");
+        let text = std::fs::read_to_string(&script)
+            .unwrap_or_else(|e| panic!("{}: {e}", script.display()));
+        let line = text
+            .lines()
+            .find(|line| line.trim_start().starts_with("PROFILES=("))
+            .expect("render-deploy.sh 里找不到 PROFILES=( … ) 这一行");
+        let mut in_script: Vec<&str> = line
+            .split_once('(')
+            .and_then(|(_, rest)| rest.rsplit_once(')'))
+            .map(|(list, _)| list.split_whitespace().collect())
+            .unwrap_or_default();
+        in_script.sort_unstable();
+        assert_eq!(
+            in_script, declared,
+            "render-deploy.sh 的 PROFILES 与代码里的名字不一致"
+        );
+    }
+
+    /// 计划里的分支名和渲染目录名是同一个字面量：驱动决策的那条分支序列化出来，
+    /// 必须正好是它要去读的目录。
+    #[test]
+    fn a_plan_branch_serializes_to_the_directory_it_reads() {
+        use cogneva_bootstrap::PlanBranch;
+        let pairs = [
+            (PlanBranch::K3sSingle, Profile::K3sSingle),
+            (PlanBranch::K3sMulti, Profile::K3sMulti),
+            (PlanBranch::K8sStandard, Profile::K8sStandard),
+        ];
+        for (branch, profile) in pairs {
+            let wire = serde_json::to_string(&branch).expect("branch serializes");
+            assert_eq!(
+                wire,
+                format!("\"{}\"", profile.dir_name()),
+                "{branch:?} 的序列化名与它要读的目录对不上"
+            );
+            assert_eq!(PlanBranch::from_name(profile.dir_name()), Some(branch));
+        }
     }
 
     #[test]
