@@ -974,6 +974,32 @@ rows:
     why: >-
       Room for one scrape's buffers. Not derived from anything.
 
+  # --- process census (per-node account of every container's processes) ------
+  - key: processCensus.resources.requests.cpu
+    source: override
+    why: >-
+      Each tick walks the cgroup tree and reads a few hundred small /proc files;
+      the resident and burst draw are noise next to one millicore. A derived pair
+      would read the census's own measured cost, and nothing collects it.
+
+  - key: processCensus.resources.requests.memory
+    source: override
+    why: >-
+      Sized to the resident cost of a reader that holds one container's process
+      list at a time. No measurement of it is published.
+
+  - key: processCensus.resources.limits.cpu
+    source: override
+    why: >-
+      Room for one full sweep of the tree. Not derived from anything: the tick
+      that paces the sweep is the loop's own interval, not a reading of this
+      bound.
+
+  - key: processCensus.resources.limits.memory
+    source: override
+    why: >-
+      Room for one sweep's buffers. Not derived from anything.
+
   # --- claim store (per-node account of claims and the image store) -----------
   - key: claimStore.port
     source: fixed
