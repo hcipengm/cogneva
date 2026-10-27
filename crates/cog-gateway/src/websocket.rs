@@ -134,25 +134,6 @@ async fn handle_type_message(
             };
             send_server_message(socket, &resp).await?;
         }
-        ClientMessage::Unsubscribe { channels, .. } => {
-            let mgr = state
-                .connection_manager
-                .as_ref()
-                .ok_or("connection manager not available")?;
-            let unsubscribed = mgr.unsubscribe(connection_id, &channels).await;
-            let resp = ServerMessage::Unsubscribed {
-                channels: unsubscribed,
-                server_time: now_iso(),
-            };
-            send_server_message(socket, &resp).await?;
-        }
-        ClientMessage::Ack { event_ids, .. } => {
-            let resp = ServerMessage::Acknowledged {
-                event_ids,
-                server_time: now_iso(),
-            };
-            send_server_message(socket, &resp).await?;
-        }
         ClientMessage::Typing { .. } => {
             // Typing indicator is accepted but produces no response.
         }

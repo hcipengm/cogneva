@@ -29,17 +29,19 @@ export interface WebSocketOptions {
   onError?: (error: Error) => void;
 }
 
+/**
+ * 服务端信封里客户端真会读的那几格。
+ *
+ * 服务端的 `ServerMessage` 还带着 `server_time`、`connection_id`、`missed_events`
+ * 等字段，这一页一格都不读——在这里声明它们，等于给下一个读者留一份会与 Rust 侧
+ * 悄悄分家的第二份字段表。`type` 保持 `string`：判它是哪一个信封的是下面几个
+ * 字面量分支，不是类型系统。
+ */
 export interface ServerMessage {
   type: string;
-  connection_id?: string;
-  server_time?: string;
-  missed_events?: string[];
   event_id?: string;
   session_id?: string;
-  task_id?: string;
   payload?: Record<string, unknown>;
-  code?: string;
-  message?: string;
 }
 
 export class EventStreamClient {
@@ -187,11 +189,6 @@ export class EventStreamClient {
         this.options.onChatFrame?.(chat);
         return;
       }
-      const event = normalizeAgentEvent(message.payload, message.event_id ?? message.payload.id as string);
-      if (event) {
-        this.options.onEvent(event);
-      }
-    } else if (message.type === 'task_update' && message.payload) {
       const event = normalizeAgentEvent(message.payload, message.event_id ?? message.payload.id as string);
       if (event) {
         this.options.onEvent(event);

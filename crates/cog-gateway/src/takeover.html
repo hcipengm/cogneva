@@ -3234,7 +3234,7 @@ checkLlmStatus();
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
     // Connection-level envelopes (chat stream, notifications).
-    if (['agent_event', 'task_update', 'notification'].includes(msg.type) && msg.payload) {
+    if (['agent_event', 'notification'].includes(msg.type) && msg.payload) {
       const p = msg.payload;
       const inner = p.payload || p;
       switch (p.type) {

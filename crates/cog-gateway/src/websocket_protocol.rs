@@ -11,6 +11,11 @@ pub const HOOKS_CHANNEL: &str = "hooks";
 pub const RESOURCE_CHANNEL_PREFIX: &str = "resource:";
 
 /// Client → Server WebSocket messages (type-based protocol).
+///
+/// 每个变体都要有客户端真发过，否则解析它的那条路和它带来的回执都是为一条不存在
+/// 的消息写的。曾经这里还有 `unsubscribe` 与 `ack` 两条：两个客户端都没有发过，
+/// `ack` 的处理器也只是把 id 原样回显，服务端从不使用。加新消息时把发送点在同一个
+/// 改动里写上。
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub enum ClientMessage {
@@ -23,18 +28,6 @@ pub enum ClientMessage {
     #[serde(rename = "subscribe")]
     Subscribe {
         channels: Vec<String>,
-        #[serde(default)]
-        timestamp: Option<String>,
-    },
-    #[serde(rename = "unsubscribe")]
-    Unsubscribe {
-        channels: Vec<String>,
-        #[serde(default)]
-        timestamp: Option<String>,
-    },
-    #[serde(rename = "ack")]
-    Ack {
-        event_ids: Vec<String>,
         #[serde(default)]
         timestamp: Option<String>,
     },
@@ -59,6 +52,11 @@ pub enum ClientMessage {
 }
 
 /// Server → Client WebSocket messages.
+///
+/// 每个变体都要有一处 `send_server_message` 走到它，否则客户端那边对应的分支就是
+/// 在等一个永远不会来的帧。曾经这里还有 `task_update` / `quota_warning` / `kick` /
+/// `error` 四个变体，全树没有一处构造它们，而客户端一直在等 `task_update`——那一支
+/// 从写下来那天起就没有进过。要发新的帧，把构造点在同一个改动里写上。
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
@@ -81,16 +79,6 @@ pub enum ServerMessage {
         channels: Vec<String>,
         server_time: String,
     },
-    #[serde(rename = "unsubscribed")]
-    Unsubscribed {
-        channels: Vec<String>,
-        server_time: String,
-    },
-    #[serde(rename = "acknowledged")]
-    Acknowledged {
-        event_ids: Vec<String>,
-        server_time: String,
-    },
     #[serde(rename = "agent_event")]
     AgentEvent {
         event_id: String,
@@ -101,39 +89,10 @@ pub enum ServerMessage {
         payload: serde_json::Value,
         server_time: String,
     },
-    #[serde(rename = "task_update")]
-    TaskUpdate {
-        event_id: String,
-        task_id: String,
-        payload: serde_json::Value,
-        server_time: String,
-    },
     #[serde(rename = "notification")]
     Notification {
         event_id: String,
         payload: serde_json::Value,
-        server_time: String,
-    },
-    #[serde(rename = "quota_warning")]
-    QuotaWarning {
-        event_id: String,
-        payload: serde_json::Value,
-        server_time: String,
-    },
-    #[serde(rename = "kick")]
-    Kick {
-        event_id: String,
-        payload: serde_json::Value,
-        server_time: String,
-    },
-    #[serde(rename = "error")]
-    Error {
-        #[serde(skip_serializing_if = "Option::is_none")]
-        event_id: Option<String>,
-        code: String,
-        message: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        retry_after: Option<u64>,
         server_time: String,
     },
 }
@@ -223,19 +182,6 @@ impl ConnectionManager {
             }
         }
         subscribed
-    }
-
-    pub async fn unsubscribe(&self, connection_id: &str, channels: &[String]) -> Vec<String> {
-        let mut conns = self.connections.write().await;
-        let mut unsubscribed = Vec::new();
-        if let Some(conn) = conns.get_mut(connection_id) {
-            for ch in channels {
-                if conn.subscribed_channels.remove(ch) {
-                    unsubscribed.push(ch.clone());
-                }
-            }
-        }
-        unsubscribed
     }
 
     /// Update the last_activity timestamp for a connection.
