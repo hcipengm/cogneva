@@ -16,8 +16,13 @@
 #
 # 只要 get 与 list：这一面按轮询读，不 watch；更没有任何写。加到 write 的那一天，
 # 就是「一个只读的图」变成了「能改集群的入口」，而这张清单上看不出来区别。
-# 事件与卷声明仍只读本命名空间（下面那条 Role）：它们是「这个 Pod 为什么没起来」
-# 的补充，不是这一面的骨架。
+#
+# 事件与卷声明也在这一层读，而且必须在**这一层**：一条命名空间的 Role 授不了
+# `/api/v1/events` 与 `/api/v1/persistentvolumeclaims`——那两条不带 `namespaces/<ns>`
+# 的集合读，apiserver 根本不去命名空间里找授权。曾经有的是「ClusterRole 授 Pod、
+# 下面那条 Role 授事件与卷声明」的分法，拓扑面把这两条读改成集群范围之后，Role
+# 还在、规则还在、看起来「事件与卷声明已经授过」，实际每一次都是 403，而读失败在
+# 屏上只是少了这一层信息。授权写在错误的范围里，比没有写更难发现。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -38,8 +43,7 @@ rules:
     resources: ["nodes"]
     verbs: ["get", "list"]
   # Pod 与它们的实际用量：与上面同一条理由——这一面画的是整个集群的容器，
-  # 不是本命名空间的容器。`pods` 同时覆盖了命名空间那条 Role 里的同名授权，
-  # 那条留着是因为它还有事件与卷声明要读。
+  # 不是本命名空间的容器。
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
@@ -72,4 +76,10 @@ rules:
   # batch 是另一个分组：Job 与 CronJob 不在 apps 里，只加 apps 那条读不到它们。
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+  # 事件（这个 Pod 为什么没起来）与卷声明（持久卷绑到了哪块盘）。读的是集合级的
+  # 两条路径，不是按 Pod 名去新闻命名空间里那两条——一次读全集群的集合，比每个
+  # Pod 一次请求便宜几十倍，而按对象分派由读回来的 owner 关系自己做。
+  - apiGroups: [""]
+    resources: ["events", "persistentvolumeclaims"]
     verbs: ["get", "list"]

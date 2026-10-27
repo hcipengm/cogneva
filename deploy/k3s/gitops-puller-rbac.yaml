@@ -66,8 +66,8 @@ roleRef:
 # 扩到集群作用域，是因为进程采集器是一个 hostPID 的 DaemonSet，它读的就是整台
 # 宿主上每一个容器的 cgroup——只画本命名空间的 Pod，差出来的容器有进程读数却没有
 # 位置，读者分不清「没有」和「没读」。
-# 只要 get 与 list：拓扑按轮询读，不 watch，也没有任何写。事件与卷声明仍只读
-# 本命名空间（下面那条 Role）。
+# 只要 get 与 list：拓扑按轮询读，不 watch，也没有任何写。事件与卷声明同样在这一层：
+# 那两条集合读不带 `namespaces/<ns>`，命名空间里的 Role 授不了它们，写了也只有 403。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -110,38 +110,11 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs", "cronjobs"]
     verbs: ["get", "list"]
----
-# 拓扑面在命名空间里额外要的两样：事件、卷声明。
-# pods 本身已由上面那条 ClusterRole 授权，这里不重复。
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: cogneva-topology-reader
-  namespace: cogneva
-  labels:
-    app.kubernetes.io/name: cogneva
-    app.kubernetes.io/component: gateway
-rules:
+  # 事件与卷声明：集合级的两条路径（`/api/v1/events`、`/api/v1/persistentvolumeclaims`），
+  # 一次读全集群，按对象分派由读回来的 owner 关系自己做。
   - apiGroups: [""]
     resources: ["events", "persistentvolumeclaims"]
     verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: cogneva-topology-reader
-  namespace: cogneva
-  labels:
-    app.kubernetes.io/name: cogneva
-    app.kubernetes.io/component: gateway
-subjects:
-  - kind: ServiceAccount
-    name: cogneva
-    namespace: cogneva
-roleRef:
-  kind: Role
-  name: cogneva-topology-reader
-  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

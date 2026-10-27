@@ -126,6 +126,68 @@ PATCH
 confirm "${work}/crates/cog-gateway/src/cluster.rs" "replicasets"
 expect_red "新增工种没授权限" "replicasets"
 
+# 5. 集群范围的读只写在命名空间 Role 里：必须红。这是 2026-10-27 第二次实测的形状——
+#    `pods` 授过，而 `/api/v1/events`、`/api/v1/persistentvolumeclaims` 也「授过」，
+#    只是授在了一条命名空间 Role 上；集合读不带 `namespaces/<ns>`，那条规则一次都没生效。
+#    同一份规则搬到 ClusterRole 里，同一条门必须绿——红与绿只差作用域这一个变量。
+add_cluster_read() {
+    python3 - "${work}/crates/cog-gateway/src/cluster.rs" <<'PATCH'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+src += '''
+async fn read_events(client: &Client) {
+    client.get_json("/api/v1/events").await;
+}
+'''
+open(path, "w", encoding="utf-8").write(src)
+PATCH
+    confirm "${work}/crates/cog-gateway/src/cluster.rs" '"/api/v1/events"'
+}
+
+fixture
+add_cluster_read
+for path in "${work}/deploy/rendered/k3s-single/16-clusterrole-cogneva-topology-reader.yaml" \
+    "${work}/deploy/k3s/gitops-puller-rbac.yaml"; do
+    cat >>"${path}" <<'EOF'
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: cogneva-topology-reader
+  namespace: cogneva
+rules:
+  - apiGroups: [""]
+    resources: ["events", "persistentvolumeclaims"]
+    verbs: ["get", "list"]
+EOF
+done
+expect_red "集群范围的读只授在命名空间 Role 上" "集群范围的读只有 ClusterRole 算数"
+
+# 6. 同一份规则搬进 ClusterRole：作用域对了就绿。
+fixture
+add_cluster_read
+for path in "${work}/deploy/rendered/k3s-single/16-clusterrole-cogneva-topology-reader.yaml" \
+    "${work}/deploy/k3s/gitops-puller-rbac.yaml"; do
+    python3 - "${path}" <<'PATCH'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+src = src.replace('''  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]''', '''  - apiGroups: ["batch"]
+    resources: ["jobs", "cronjobs"]
+    verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["events", "persistentvolumeclaims"]
+    verbs: ["get", "list"]''', 1)
+open(path, "w", encoding="utf-8").write(src)
+PATCH
+    confirm "${path}" '["events", "persistentvolumeclaims"]'
+done
+bash "${checker}" "${work}" >"${work}/scope-ok.out" 2>&1 \
+    || { cat "${work}/scope-ok.out" >&2; fail "规则搬进 ClusterRole：应当绿却红了"; }
+
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
 bash "${checker}" "${repo}" >"${work}/real.out" 2>&1 || got=$?
