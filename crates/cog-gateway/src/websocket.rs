@@ -1,6 +1,5 @@
 use axum::extract::ws::{Message as WsMessage, WebSocket};
 use futures::SinkExt;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -8,37 +7,6 @@ use crate::websocket_protocol::{event_channels, ClientMessage, ConnectionManager
 use crate::GatewayState;
 use cog_core::TraceContext;
 use cog_core::{RawContext, RawMeta, RawPayload, RawRecord};
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "cmd")]
-pub enum WsCommand {
-    #[serde(rename = "ping")]
-    Ping { id: Option<String> },
-    #[serde(rename = "abort")]
-    Abort { task_id: Option<String> },
-    #[serde(rename = "status")]
-    Status,
-    #[serde(rename = "list")]
-    List {
-        #[serde(default)]
-        status: Option<String>,
-        #[serde(default)]
-        task_type: Option<String>,
-        #[serde(default)]
-        agent_id: Option<String>,
-    },
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-pub enum WsResponse {
-    #[serde(rename = "pong")]
-    Pong { id: Option<String> },
-    #[serde(rename = "ack")]
-    Ack { cmd: String },
-    #[serde(rename = "error")]
-    Error { message: String },
-}
 
 fn websocket_record(
     stream: &str,
@@ -107,8 +75,10 @@ async fn handle_type_message(
     let client_msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(_) => {
-            // Not a type-based message; fall through silently so the
-            // caller can try cmd-based parsing.
+            // 不是这一族的上行消息。套接字上只有这一族：曾经还有一套 `{"cmd": …}`
+            // 的命令协议（ping / abort / status / list），两条路都在同一条连接上试，
+            // 而那一套没有任何客户端发过——它要的四个能力 REST 全有。留着它，就等于
+            // 让每条认不出的消息都多一次解析、多一条永远不会有人读的回执。
             return Err("not a type-based message".into());
         }
     };
@@ -154,122 +124,6 @@ async fn handle_type_message(
             tokio::spawn(async move {
                 crate::chat::run_chat_turn(state, out, session, content).await;
             });
-        }
-    }
-
-    Ok(())
-}
-
-async fn handle_command(
-    socket: &mut WebSocket,
-    state: &Arc<GatewayState>,
-    text: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let cmd: WsCommand = match serde_json::from_str(text) {
-        Ok(c) => c,
-        Err(_) => {
-            tracing::debug!("WebSocket text is not a command: {}", text);
-            return Ok(());
-        }
-    };
-
-    match cmd {
-        WsCommand::Ping { id } => {
-            let resp = WsResponse::Pong { id };
-            let json = serde_json::to_string(&resp)?;
-            socket.send(WsMessage::Text(json.into())).await?;
-        }
-        WsCommand::Status => {
-            let all = state.orchestrator.get_all_tasks().await;
-            let mut pending = 0usize;
-            let mut scheduled = 0usize;
-            let mut running = 0usize;
-            let mut completed = 0usize;
-            let mut failed = 0usize;
-            let mut cancelled = 0usize;
-            for task in &all {
-                match task.status {
-                    cog_core::TaskStatus::Pending => pending += 1,
-                    cog_core::TaskStatus::Scheduled => scheduled += 1,
-                    cog_core::TaskStatus::Running => running += 1,
-                    cog_core::TaskStatus::Completed => completed += 1,
-                    cog_core::TaskStatus::Failed => failed += 1,
-                    cog_core::TaskStatus::Cancelled => cancelled += 1,
-                }
-            }
-            let ready = state.orchestrator.get_ready_tasks().await.len();
-            let total = all.len();
-            let all_completed = !all.is_empty()
-                && all
-                    .iter()
-                    .all(|t| t.status == cog_core::TaskStatus::Completed);
-            let resp = serde_json::json!({
-                "type": "status_summary",
-                "total": total,
-                "pending": pending,
-                "scheduled": scheduled,
-                "running": running,
-                "completed": completed,
-                "failed": failed,
-                "cancelled": cancelled,
-                "ready": ready,
-                "all_completed": all_completed,
-            });
-            socket
-                .send(WsMessage::Text(resp.to_string().into()))
-                .await?;
-        }
-        WsCommand::List {
-            status,
-            task_type,
-            agent_id,
-        } => {
-            let mut tasks: Vec<crate::tasks::TaskView> = state
-                .orchestrator
-                .get_all_tasks()
-                .await
-                .into_iter()
-                .map(|t| t.into())
-                .collect();
-
-            if let Some(ref s) = status {
-                tasks.retain(|t| t.status == *s);
-            }
-            if let Some(ref tt) = task_type {
-                tasks.retain(|t| t.task_type == *tt);
-            }
-            if let Some(ref a) = agent_id {
-                tasks.retain(|t| t.agent_id.as_ref() == Some(a));
-            }
-
-            let resp = serde_json::json!({
-                "type": "task_list",
-                "tasks": tasks,
-            });
-            socket
-                .send(WsMessage::Text(resp.to_string().into()))
-                .await?;
-        }
-        WsCommand::Abort { task_id } => {
-            tracing::info!("WebSocket abort received: task_id={:?}", task_id);
-
-            if let Some(ref tid) = task_id {
-                if let Err(e) = state.orchestrator.cancel_task(tid).await {
-                    tracing::warn!("Abort failed to cancel task {}: {}", tid, e);
-                    let resp = WsResponse::Error {
-                        message: format!("abort failed: {}", e),
-                    };
-                    let json = serde_json::to_string(&resp)?;
-                    socket.send(WsMessage::Text(json.into())).await?;
-                    return Ok(());
-                }
-            }
-
-            let resp = WsResponse::Ack {
-                cmd: "abort".into(),
-            };
-            let json = serde_json::to_string(&resp)?;
-            socket.send(WsMessage::Text(json.into())).await?;
         }
     }
 
@@ -462,11 +316,11 @@ pub async fn handle_socket(
                             tracing::warn!("RawLogger write failed (inbound): {}", e);
                         }
 
-                        // Try type-based protocol first, then cmd-based.
-                        if handle_type_message(&mut socket, &state, &connection_id, &text, &out_tx).await.is_err() {
-                            if let Err(e) = handle_command(&mut socket, &state, &text).await {
-                                tracing::warn!("WebSocket command handling error: {}", e);
-                            }
+                        if let Err(e) =
+                            handle_type_message(&mut socket, &state, &connection_id, &text, &out_tx)
+                                .await
+                        {
+                            tracing::debug!("WebSocket message not handled: {}", e);
                         }
                     }
                     Some(Ok(WsMessage::Pong(_))) => {
