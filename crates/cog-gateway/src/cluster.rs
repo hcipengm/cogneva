@@ -1343,9 +1343,14 @@ pub struct ResourceReport {
 /// 会拿「0 个新版本」去回答「没滚上去」。
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkloadView {
-    /// 工种：Deployment / StatefulSet / DaemonSet / CronJob / Job。
+    /// 工种：Deployment / StatefulSet / DaemonSet / CronJob / Job / Pod。
     pub kind: String,
     pub name: String,
+    /// 裸 Pod 的相位（`Pending` / `Running` / `Succeeded` / `Failed`），别的工种为 `None`。
+    ///
+    /// 没有这一格，一个已经跑完的裸 Pod（评测剩下的、探针付完账留下的）在屏上就是
+    /// `0 / 1`——和「有副本起不来」同一个形状，读作坏了，而它其实只是结束了。
+    pub phase: Option<String>,
     pub ready: Option<u32>,
     pub desired: Option<u32>,
     pub updated: Option<u32>,
@@ -1679,6 +1684,13 @@ fn workload_from(kind: WorkloadKind, item: &Value) -> Option<WorkloadView> {
     Some(WorkloadView {
         kind: kind.as_str().to_string(),
         name: name.to_string(),
+        phase: match kind {
+            WorkloadKind::Pod => item
+                .pointer("/status/phase")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        },
         ready,
         desired,
         updated,
@@ -2793,18 +2805,39 @@ mod topology_tests {
                 },
                 "spec": {"containers": [{"name": "mainline", "image": "cogneva:1"}]},
                 "status": {"containerStatuses": [{"name": "mainline", "ready": true}]}
+            },
+            // 跑完的裸 Pod：就绪数是 0，光看 `0 / 1` 分不清「结束了」与「起不来」。
+            {
+                "metadata": {"name": "searxprobe2"},
+                "spec": {"containers": [{"name": "probe", "image": "probe:1"}]},
+                "status": {"phase": "Succeeded", "containerStatuses": [{"name": "probe", "ready": false}]}
             }
         ]});
         let pods = workloads_from(WorkloadKind::Pod, &list);
         assert_eq!(
             pods.len(),
-            1,
+            2,
             "有主的 Pod 由它的控制器数过一遍，不再列第二遍"
         );
-        assert_eq!(pods[0].kind, "Pod");
-        assert_eq!(pods[0].name, "eval-toolathlon-task-1");
-        assert_eq!(pods[0].ready, Some(1));
-        assert_eq!(pods[0].desired, Some(1), "它就是自己那一份副本");
-        assert_eq!(pods[0].images, vec!["eval-pack:1"]);
+        let live = pods
+            .iter()
+            .find(|pod| pod.name == "eval-toolathlon-task-1")
+            .expect("评测的裸 Pod 要在这一栏里");
+        assert_eq!(live.kind, "Pod");
+        assert_eq!(live.ready, Some(1));
+        assert_eq!(live.desired, Some(1), "它就是自己那一份副本");
+        assert_eq!(live.images, vec!["eval-pack:1"]);
+
+        // 结束的裸 Pod 与起不来的裸 Pod 在 `0 / 1` 上是同一行；只有相位能把它们分开。
+        let finished = pods
+            .iter()
+            .find(|pod| pod.name == "searxprobe2")
+            .expect("跑完的裸 Pod 也要看得见");
+        assert_eq!(finished.ready, Some(0));
+        assert_eq!(
+            finished.phase.as_deref(),
+            Some("Succeeded"),
+            "没有相位，`0 / 1` 读作「有一个起不来」，而它只是结束了"
+        );
     }
 }

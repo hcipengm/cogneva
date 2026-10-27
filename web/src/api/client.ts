@@ -2158,13 +2158,16 @@ export async function getResourceReport(): Promise<ResourceReport> {
 /**
  * 命名空间里的一个工作负载，不分工种。
  *
- * `kind` 是工种（Deployment / StatefulSet / DaemonSet / CronJob / Job）。一部分
- * 字段只对某些工种有意义，别的工种给 `null` 而不是 0——屏幕上「不适用」和「零个
- * 就绪」是两件事，写成 0 就把没这个概念读成了坏状态。
+ * `kind` 是工种（Deployment / StatefulSet / DaemonSet / CronJob / Job），以及没有
+ * 控制器拥有的裸 Pod（评测环境一道题一台 Pod）。一部分字段只对某些工种有意义，
+ * 别的工种给 `null` 而不是 0——屏幕上「不适用」和「零个就绪」是两件事，写成 0 就
+ * 把没这个概念读成了坏状态。
  */
 export interface WorkloadView {
   kind: string;
   name: string;
+  /** 裸 Pod 的相位；别的工种为 `null`。跑完的 Pod 是 `0 / 1` 但有相位，不是坏了。 */
+  phase: string | null;
   ready: number | null;
   desired: number | null;
   updated: number | null;

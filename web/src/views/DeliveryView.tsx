@@ -88,8 +88,11 @@ export function DeliveryView() {
             </Readings>
             <Table
               columns={[
-                { key: 'kind', title: '类型', width: '100px', render: (d) => (
-                  <span className="mono text-[11px] text-[var(--muted)]">{d.kind}</span>
+                { key: 'kind', title: '类型', width: '130px', render: (d) => (
+                  <span className="mono text-[11px] text-[var(--muted)]">
+                    {d.kind}
+                    {d.phase ? ` · ${d.phase}` : ''}
+                  </span>
                 ) },
                 { key: 'name', title: '工作负载', width: '190px', render: (d) => (
                   <span className="mono text-[11px]">{d.name}</span>
@@ -303,8 +306,11 @@ function Replicas({ workload }: { workload: WorkloadView }) {
     return <span className="mono text-[11px]">{workload.ready} 个 Job 在跑</span>;
   }
   const ready = workload.ready ?? 0;
+  // 结束的裸 Pod（Succeeded / Failed）就绪数必然是 0，那不是「差一个副本」——
+  // 涂成警告色等于把结算过的活读成正在坏的活。
+  const ended = workload.phase === 'Succeeded' || workload.phase === 'Failed';
   return (
-    <span className="mono text-[11px]" style={{ color: ready < workload.desired ? 'var(--warn)' : undefined }}>
+    <span className="mono text-[11px]" style={{ color: !ended && ready < workload.desired ? 'var(--warn)' : undefined }}>
       {ready} / {workload.desired}
     </span>
   );
