@@ -750,6 +750,27 @@ buildah:
 # hostPath 挂宿主的 cgroup 根（只读）。这不是特权面：memory.stat 本身是 0444，
 # 进程不需要任何 capability、不需要 hostPID、不碰设备——挂成只读也让"量一下"这件事
 # 不可能改到宿主。挂载点只在容器内取名，进程按 COGNEVA_HOST_CGROUP_ROOT 找它。
+# 进程采集器（process-census DaemonSet）：每节点一个，读宿主 cgroup 树，把每个容器
+# 实例里的进程表报给网关的 `/api/v1/cluster/process-report`。
+#
+# 它是「所有容器都要有进程表」这一条的实现：只靠容器自报时，第三方镜像（postgres、
+# nats、registry、评测环境）一格都填不上，而空格读作「里面没有进程」。
+#
+# 唯一的额外能力是 hostPID——没有它 `/proc` 里只有自己。挂载只读、不需要特权、
+# 不需要 root、不挂 SA token，所以它跟 host-ledger 分成两个 Pod：能力边界落在 Pod 上。
+processCensus:
+  enabled: true
+  hostPath: /sys/fs/cgroup
+  mountPath: /hostcgroup
+  resources:
+    # 每拍（60s）走一遍 cgroup 树、读几百个 /proc 小文件；常驻与尖峰都在噪声级。
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
 hostLedger:
   enabled: true
   # 宿主 cgroup v2 根。cgroup v1 宿主也照挂（目录存在），只是下面找不到 slice，

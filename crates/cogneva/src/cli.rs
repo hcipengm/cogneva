@@ -23,6 +23,7 @@ pub enum Command {
     SandboxExecutor,
     VolumeWalker,
     HostLedger,
+    ProcessCensus,
     ClaimStore,
     ValidateConfig,
     MainlineRollout,
@@ -43,11 +44,12 @@ pub enum Command {
 
 /// Subcommands, in the order they appear in [`USAGE`]. A command added here but
 /// not documented fails the usage test.
-const SUBCOMMANDS: [(&str, Command); 19] = [
+const SUBCOMMANDS: [(&str, Command); 20] = [
     ("security-gateway", Command::SecurityGateway),
     ("sandbox-executor", Command::SandboxExecutor),
     ("volume-walker", Command::VolumeWalker),
     ("host-ledger", Command::HostLedger),
+    ("process-census", Command::ProcessCensus),
     ("claim-store", Command::ClaimStore),
     ("validate-config", Command::ValidateConfig),
     ("mainline-rollout", Command::MainlineRollout),
@@ -108,6 +110,8 @@ COMMANDS:
     sandbox-executor       Run the sandbox executor only
     volume-walker          Walk a mounted volume and serve its footprint on /metrics
     host-ledger            Read the host's cgroup slices and serve their memory on /metrics
+    process-census         Report every container's process table on this node (hostPID, one
+                           DaemonSet pod per node; reads the read-only host cgroup mount)
     claim-store            Walk every claim directory on the node's storage root and serve
                            their footprints on /metrics
     validate-config        Validate configuration and dependencies, then exit non-zero on errors

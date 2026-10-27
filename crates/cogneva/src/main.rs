@@ -122,6 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 宿主账本的拆解面：每节点一个只读进程，把宿主 cgroup v2 的三个 slice 各按
         // anon / file 拆开（deploy/k3s/host-ledger-daemonset.yaml 的启动命令）。
         Command::HostLedger => cogneva::host_ledger::run_from_env().await,
+        // 进程采集器：每节点一个，带 hostPID 读宿主 cgroup 树，把**每个**容器实例
+        // 里跑着什么报给网关（deploy 里那条 process-census DaemonSet 的启动命令）。
+        // 没有它，第三方镜像容器的进程表就没人报，屏上那一格读作「里面没有进程」。
+        Command::ProcessCensus => cogneva::process_census::run_from_env().await,
         // 卷账的全集面：每节点一个进程，走查宿主存储根下的每个 claim 目录，把谁也
         // 没挂上的卷（数据库/缓存/队列/对象存储/监控自身的盘）也纳入账
         // （deploy/k3s/claim-store-daemonset.yaml 的启动命令）。

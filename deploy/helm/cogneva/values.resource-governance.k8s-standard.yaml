@@ -7,8 +7,8 @@ resourceGovernance:
     requestsCpu: "5"
     requestsMemory: 19Gi
     limitsCpu: "37"
-    limitsMemory: 70Gi
-    pods: "36"
+    limitsMemory: 71Gi
+    pods: "38"
     requestsStorage: 435Gi
   runtimeSum:
     limitsCpu: "2"

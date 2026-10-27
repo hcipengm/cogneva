@@ -34,7 +34,7 @@ fixture() {
   mkdir -p "${work}/web/src/api" "${work}/web/src/views" "${work}/crates/cog-gateway/src"
 
   cat >"${work}/crates/cog-gateway/src/cluster.rs" <<'EOF'
-pub enum WorkloadKind { Deployment, StatefulSet, DaemonSet, CronJob, Job }
+pub enum WorkloadKind { Deployment, StatefulSet, DaemonSet, CronJob, Job, Pod }
 
 impl WorkloadKind {
     fn list_path(self, namespace: &str) -> String {
@@ -44,6 +44,7 @@ impl WorkloadKind {
             WorkloadKind::DaemonSet => format!("/apis/apps/v1/namespaces/{namespace}/daemonsets"),
             WorkloadKind::CronJob => format!("/apis/batch/v1/namespaces/{namespace}/cronjobs"),
             WorkloadKind::Job => format!("/apis/batch/v1/namespaces/{namespace}/jobs"),
+            WorkloadKind::Pod => format!("/api/v1/namespaces/{namespace}/pods"),
         }
     }
     fn containers(self) -> &'static str {

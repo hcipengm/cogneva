@@ -32,6 +32,7 @@ resources:
   - buildah-daemonset.yaml
   - host-ledger-daemonset.yaml
   - host-ledger-service.yaml
+  - process-census-daemonset.yaml
   - claim-store-daemonset.yaml
   - claim-store-service.yaml
   - postgres-deployment.yaml

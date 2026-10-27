@@ -18,6 +18,10 @@
 #   6. 不适用的格子写「不适用」，不是空白；
 #   7. 旧的单一 Deployment 读法没有回来（`deployments_from` 这种按 Deployment 形状读
 #      全表的函数不能复活）；
+#   9. 没有控制器拥有的裸 Pod 也在清单里。评测环境（toolathlon 一道题一台 Pod）与宿主
+#      脚本直接 apply 的探针既不是 Deployment 也不是 Job，只读那五种时它们一条都不
+#      出现在屏上——评测正在跑，而工作负载那一栏看不出这件事在发生。
+#
 #   8. 判坏消息按条件的名字判。服务端给的是原样读数（`ok = 状态是 True`），方向和名字
 #      有关：Job 的 `Failed=True` 是失败、`Failed=False` 才是它该有的样子。一律按
 #      `!ok` 当坏消息，跑挂的 Job 会被画成绿点——和把 Succeeded 画成红点是同一个错误的
@@ -52,7 +56,7 @@ client = open(CLIENT, encoding="utf-8").read()
 view = open(VIEW, encoding="utf-8").read()
 
 # ── 1. 五种工种各有自己的接口 ──
-kinds = ["Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job"]
+kinds = ["Deployment", "StatefulSet", "DaemonSet", "CronJob", "Job", "Pod"]
 for kind in kinds:
     if not re.search(rf"WorkloadKind::{kind}\b", server):
         problems.append(f"服务端没有 WorkloadKind::{kind}——这一种工作负载进不了清单")
@@ -63,12 +67,23 @@ groups = {
     "cronjobs": "batch",
     "jobs": "batch",
 }
+# 核心组没有 `/apis` 前缀：Pod 那条路径是 `/api/v1/namespaces/…/pods`。
+CORE = {"pods": ""}
 for resource, group in groups.items():
     if not re.search(rf"apis/{group}/v1/namespaces/.*{resource}", server):
         problems.append(
             f"服务端没有问 /apis/{group}/v1/…/{resource}——这一种工作负载读不到，"
             "而屏上只会少一行，不会有任何东西变红"
         )
+
+for resource in CORE:
+    if not re.search(rf'"/api/v1/namespaces/\{{namespace\}}/{resource}"', server):
+        problems.append(
+            f"服务端没有问 /api/v1/namespaces/…/{resource}——裸 Pod（评测环境、一次性探针）"
+            "不在清单里，而评测跑起来的时候屏上看不出这件事在发生"
+        )
+if not re.search(r"WorkloadKind::Pod", server):
+    problems.append("服务端没有 WorkloadKind::Pod——没有控制器拥有的 Pod 进不了清单")
 
 # ── 2. 每个工种读自己那组状态字段 ──
 own_fields = {
@@ -156,7 +171,7 @@ if problems:
     sys.exit("构建与部署的清单不合格：\n  " + "\n  ".join(problems))
 
 print(
-    "ok：构建与部署列出全部五种工作负载（"
+    "ok：构建与部署列出全部六种工作负载（"
     + "、".join(kinds)
     + "），每种读自己的状态字段，不适用的格子写「不适用」"
 )

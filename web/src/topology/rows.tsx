@@ -27,10 +27,13 @@ export function Dot({ tone }: { tone: 'ok' | 'warn' | 'danger' | 'idle' }) {
 
 export function ContainerRow({
   container,
+  censusAt,
   open,
   onToggle,
 }: {
   container: TopologyContainer;
+  /** 这台节点上采集器最后一次报到的时刻（Pod 的 `process_census_at`）。 */
+  censusAt: string | null;
   open: boolean;
   onToggle: () => void;
 }) {
@@ -147,15 +150,13 @@ export function ContainerRow({
             </>
           )}
 
-          {/* 进程属于容器：它跑在自己的 PID 命名空间里，这一份 `/proc` 就是全部。
-              名字是容器自己推上来的——伸手进去读要一项执行命令的权限，而容器本来
-              就知道自己里面跑着什么。 */}
+          {/* 进程属于容器。名字来自节点上的采集器：它按宿主 cgroup 树找到这个容器，
+              把 `cgroup.procs` 里的 pid 逐个读出来——镜像是什么都读得到，所以第三方
+              容器也有这一格。跑本平台镜像的容器还会自己再报一份，两个来源落在同一张表上。 */}
           <dt className="text-[var(--muted)]">进程</dt>
           <dd className="mono flex max-h-40 flex-col overflow-y-auto text-[var(--paper-dim)]">
             {container.processes == null ? (
-              <span className="text-[var(--muted)]">
-                没有自报的进程表：只有跑本平台镜像的容器会报（第三方镜像不会），或者它刚起来还没报上来。
-              </span>
+              <span className="text-[var(--muted)]">{noProcessTable(container, censusAt)}</span>
             ) : (
               container.processes.map((process) => (
                 <span key={process.pid} className="break-all">
@@ -172,6 +173,24 @@ export function ContainerRow({
       )}
     </div>
   );
+}
+
+/**
+ * 这一格为什么是空的。三种现场、三种修法，不该读成同一句话：
+ *
+ * - 容器已经退出：进程随它一起没了，没有「现在的进程表」这回事；
+ * - 这台节点上没有采集器（`censusAt` 为空）：没人能读到它，装 DaemonSet 是集群的事；
+ * - 采集器在跑而这一拍没有它：刚起、或者正好落在两拍之间，等下一拍。
+ */
+function noProcessTable(container: TopologyContainer, censusAt: string | null): string {
+  if (container.state.startsWith('terminated')) {
+    return '容器已经退出，进程随它一起没了——一格里没有「现在的进程表」这回事。';
+  }
+  if (censusAt == null) {
+    return '这台节点上没有进程采集器（process-census），所以没人能读到它里面的进程。这是集群少了一个 DaemonSet，不是这个容器不报。';
+  }
+  const ageSec = Math.max(0, Math.round((Date.now() - new Date(censusAt).getTime()) / 1000));
+  return `采集器 ${ageSec} 秒前刚报过这台节点，但这一拍没有它：容器可能刚起（60 秒一拍），或者正好落在两拍之间。`;
 }
 
 export function VolumeRow({ volume }: { volume: TopologyVolume }) {

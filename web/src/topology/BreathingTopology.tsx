@@ -826,6 +826,7 @@ function PodDetail({ pod }: { pod: TopologyPod }) {
           <ContainerRow
             key={container.name}
             container={container}
+            censusAt={pod.process_census_at}
             open={openContainer === container.name}
             onToggle={() =>
               setOpenContainer((current) => (current === container.name ? null : container.name))

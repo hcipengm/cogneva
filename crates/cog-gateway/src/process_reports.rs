@@ -1,16 +1,22 @@
-//! 容器自报的进程表。
+//! 容器的进程表：谁在里面跑着什么。
 //!
-//! 进程表只有容器自己读得全：它跑在自己的 PID 命名空间里，`/proc` 就是它自己的
-//! 那一份。让网关伸手进去拿（exec 进容器跑 ps）要换一项对业务容器执行命令的权限，
-//! 而且每多一个读者就多敲一次命令；反过来，容器按一拍把自己那一份推上来，读数就
-//! 变成了事件流里的一帧，屏上开的几面读的是同一份。
+//! 有两个上报来源，落在同一个地方：
 //!
-//! 这条通道的边界是诚实的：只有我们自己的镜像会报（跑的是 `cogneva` 这个二进制），
-//! 第三方镜像（postgres、nats、registry）不会，那一格显示「不报」——不是「没有进程」。
+//! 1. **节点采集器**（每节点一个 DaemonSet，`cogneva process-census`）。它带着
+//!    hostPID 与宿主 cgroup 的只读挂载，按 `cri-containerd-*.scope` 把宿主上每一个
+//!    容器实例的 `cgroup.procs` 读出来，再按 pid 读 `/proc/<pid>/comm`。**第三方镜像
+//!    也报**——这一条不依赖容器里跑的是什么，它读的是宿主的账。
+//! 2. **容器自报**（跑本平台镜像的进程，逐拍把自己的 `/proc` 推上来）。留着它是因为
+//!    有的集群不给 hostPID（受管集群、受限命名空间），那种地方采集器起不来，平台
+//!    自己的容器仍然能报。
 //!
-//! 落点按**容器实例**（Pod 名 + 容器 id）存，不按容器名：报上来的那一方只能读到
-//! 自己的 cgroup，读不到自己叫什么名字；而 Pod 状态里每个容器都带着 `containerID`，
-//! 于是「谁报的」这件事在渲染那一步对得上，不需要给每个容器注入一个名字变量。
+//! 落点按**容器实例 id**存：Pod 状态里每个容器都带着 `containerID`，宿主 cgroup 路径
+//! 的末段也是同一个 id，两边不用交换名字就能对上。Pod 名与容器名只作参考，不参与
+//! 索引——采集器读得到 id，读不到名字。
+//!
+//! 采集器每拍还会报一次「这台节点我在」的活体，按节点记；于是「这一格没有进程表」
+//! 能分成两种：这台节点没有采集器（没有人能报），或者采集器在跑而这一格确实读不到
+//! （容器刚起、或者已经退出）。两种的修法相反，屏上不该读成同一句话。
 //!
 //! 自报端点挂在零凭证的集群内面（不是登录态后面，也不是浏览器能到的那一面）：
 //! 报的是发起方自己的进程表，最坏的结果是屏幕上多一行它自己写的假数据；要求它
@@ -51,37 +57,70 @@ pub struct Report {
     pub processes: Vec<ReportedProcess>,
 }
 
-/// 进程自报的落脚处。按 (Pod, 容器 id) 存最近一份——**最近一份就够**：这一面问的
+/// 进程表的落脚处。按**容器实例 id** 存最近一份——**最近一份就够**：这一面问的
 /// 是「现在它里面跑着什么」，历史在别处（如果哪天要历史，那是另一条读数，不是这一格）。
-static REPORTS: LazyLock<RwLock<HashMap<(String, String), Report>>> =
+///
+/// 键里没有 Pod 名：容器 id 全局唯一，而采集器读得到 id、读不到名字。两个来源报同一个
+/// 容器时，后到的那一份覆盖前一份——两边读的是同一份 `/proc`，没有谁更权威的问题。
+static REPORTS: LazyLock<RwLock<HashMap<String, Report>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// 每台节点上采集器最后一次报到的时刻。没有这一格，就没有「这台节点没人能报」与
+/// 「采集器在跑、这一格读不到」的区分。
+static CENSUS: LazyLock<RwLock<HashMap<String, DateTime<Utc>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
 /// 收下一份自报，回答「这张表跟上一份比变了吗」。没变就不必在总线上落帧：
 /// 一个容器每拍都报同一张表，而帧的意义是「屏上该重读了」。
-pub fn record(pod: &str, container_id: &str, report: Report) -> bool {
+pub fn record(container_id: &str, report: Report) -> bool {
     let mut reports = REPORTS.write().unwrap_or_else(|e| e.into_inner());
-    let key = (pod.to_string(), container_id.to_string());
     let changed = reports
-        .get(&key)
+        .get(container_id)
         .map(|previous| previous.processes != report.processes)
         .unwrap_or(true);
-    reports.insert(key, report);
+    reports.insert(container_id.to_string(), report);
     changed
 }
 
 /// 某个容器实例最近一份还没过期的自报。
-pub fn latest(pod: &str, container_id: &str) -> Option<Report> {
+pub fn latest(container_id: &str) -> Option<Report> {
     let reports = REPORTS.read().unwrap_or_else(|e| e.into_inner());
     reports
-        .get(&(pod.to_string(), container_id.to_string()))
-        .filter(|report| {
-            Utc::now()
-                .signed_duration_since(report.reported_at)
-                .to_std()
-                .map(|age| age <= FRESH_FOR)
-                .unwrap_or(false)
-        })
+        .get(container_id)
+        .filter(|report| fresh(report))
         .cloned()
+}
+
+fn fresh(report: &Report) -> bool {
+    Utc::now()
+        .signed_duration_since(report.reported_at)
+        .to_std()
+        .map(|age| age <= FRESH_FOR)
+        .unwrap_or(false)
+}
+
+/// 记一笔「这台节点的采集器这一拍在」。空节点名不记：那不是一个节点。
+pub fn record_census(node: &str) {
+    let node = node.trim();
+    if node.is_empty() {
+        return;
+    }
+    let mut census = CENSUS.write().unwrap_or_else(|e| e.into_inner());
+    census.insert(node.to_string(), Utc::now());
+}
+
+/// 这台节点上采集器最后一次报到的时刻；超过一个新鲜期就当作没有采集器。
+///
+/// 返回 `None` 读作「这台节点上没有活着的采集器」——不是「这台节点没有进程」。
+pub fn census_at(node: &str) -> Option<DateTime<Utc>> {
+    let census = CENSUS.read().unwrap_or_else(|e| e.into_inner());
+    census.get(node).copied().filter(|at| {
+        Utc::now()
+            .signed_duration_since(*at)
+            .to_std()
+            .map(|age| age <= FRESH_FOR)
+            .unwrap_or(false)
+    })
 }
 
 /// 把 Pod 状态里的 `containerd://<id>` 与自报里的 id 折成同一个形状：只要那串
@@ -113,12 +152,27 @@ pub fn sanitize(mut processes: Vec<ReportedProcess>) -> Vec<ReportedProcess> {
 
 #[derive(Debug, Deserialize)]
 pub struct ReportBody {
-    /// 报上来的那个 Pod。容器里那个变量就是 kubelet 写进去的主机名。
+    /// 报上来的那个 Pod。容器自报时就是 kubelet 写进去的主机名；节点采集器不知道
+    /// 名字，可以不填——落点按容器 id 索引，所以它只是参考。
+    #[serde(default)]
     pub pod: String,
     /// 报上来的那个容器实例（cgroup 里那串 id），与 Pod 状态里的
     /// `containerStatuses[].containerID` 对得上。
     pub container_id: String,
     pub processes: Vec<ReportedProcess>,
+}
+
+/// 节点采集器一拍报上来的一批：这台节点上每一个容器实例各一份，外加节点名本身。
+///
+/// 为什么是批而不是逐条发：一台节点上几十个容器，逐条发是几十次握手，而对屏来说
+/// 它们是**同一拍**的读数——分开到几十次请求里，读的一方就得自己拼「哪些是这一拍的」。
+#[derive(Debug, Deserialize)]
+pub struct CensusBody {
+    /// 报上来的那台节点。空着一批照样收，但这台节点就没有「采集器在」的活体。
+    #[serde(default)]
+    pub node: String,
+    #[serde(default)]
+    pub reports: Vec<ReportBody>,
 }
 
 /// 端点收到一份自报之后在指标上留下的两格。**closed set**，两格都在启动时写 0。
@@ -162,9 +216,38 @@ pub async fn publish_vocabulary(metrics: &Option<Arc<dyn cog_core::MetricsBacken
 /// 打开着的拓扑面立刻重读——读数由产生它的一方推上来，屏只负责把它画出来。
 pub async fn process_report_handler(
     State(state): State<Arc<GatewayState>>,
-    Json(body): Json<ReportBody>,
+    Json(body): Json<serde_json::Value>,
 ) -> axum::response::Response {
-    ingest(body, &state.event_tx, &state.metrics_backend).await
+    // 两种形状：一条自报（容器自报），或一拍一整批（节点采集器）。用一个端点承载，
+    // 因为这是同一条通道、同一份账；分成两条端点只会让「哪一条被网络策略挡了」
+    // 这个问题多出一个答案。
+    let parsed = if is_batch(&body) {
+        serde_json::from_value::<CensusBody>(body)
+    } else {
+        serde_json::from_value::<ReportBody>(body).map(|single| CensusBody {
+            node: String::new(),
+            reports: vec![single],
+        })
+    };
+    let batch = match parsed {
+        Ok(batch) => batch,
+        Err(error) => {
+            publish_ingest(&state.metrics_backend, INGEST_REFUSED, 1.0).await;
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("自报的形状不对：{error}") })),
+            )
+                .into_response();
+        }
+    };
+    ingest(batch, &state.event_tx, &state.metrics_backend).await
+}
+
+/// 一批还是一条：看的是有没有 `reports` 这一项，不是看能不能解析出来——一条自报的
+/// 形状在「批」那个反序列化里也能过（`reports` 有默认值），不先分就会把每一条都读成
+/// 一批空表，而空表是「这一拍什么都没读到」，不是「这条自报的形状」。
+fn is_batch(body: &serde_json::Value) -> bool {
+    body.get("reports").is_some()
 }
 
 /// 收口与作答，不碰 `GatewayState`：这样一条自报的完整处理（含它落下的那一格
@@ -174,39 +257,47 @@ pub async fn process_report_handler(
 /// 屏上都读作「这个容器没有进程表」。有这一格，才分得开「一份都没进来」（通道
 /// 断了）与「别人在报、它不报」（是那个容器的事）。
 async fn ingest(
-    body: ReportBody,
+    body: CensusBody,
     events: &tokio::sync::broadcast::Sender<cog_core::AgentEvent>,
     metrics: &Option<Arc<dyn cog_core::MetricsBackend>>,
 ) -> axum::response::Response {
-    let pod = body.pod.trim().to_string();
-    let container_id = container_id_of(&body.container_id).to_string();
-    if pod.is_empty() || container_id.is_empty() || container_id.len() > 128 {
-        publish_ingest(metrics, INGEST_REFUSED, 1.0).await;
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "自报要带 pod 与 container_id" })),
-        )
-            .into_response();
+    // 活体先记：一台节点的采集器连进来、但这一拍一个容器都没读到（节点刚起来），
+    // 与采集器根本没起来，在屏上是两种不同的空白。
+    record_census(&body.node);
+    let mut accepted = 0usize;
+    let mut refused: Vec<String> = Vec::new();
+    let mut changed = false;
+    for report in body.reports {
+        let container_id = container_id_of(&report.container_id).to_string();
+        if container_id.is_empty() || container_id.len() > 128 {
+            refused.push(format!("容器 id 不成立：`{}`", report.container_id));
+            continue;
+        }
+        let processes = sanitize(report.processes);
+        if processes.is_empty() {
+            refused.push(format!("{container_id}: 进程表是空的"));
+            continue;
+        }
+        accepted += 1;
+        changed |= record(
+            &container_id,
+            Report {
+                reported_at: Utc::now(),
+                processes,
+            },
+        );
     }
-    let processes = sanitize(body.processes);
-    if processes.is_empty() {
-        publish_ingest(metrics, INGEST_REFUSED, 1.0).await;
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "空的进程表：读 /proc 的进程自己就是一行，一行都没有说明没读成" })),
-        )
-            .into_response();
+    if accepted > 0 {
+        publish_ingest(metrics, INGEST_ACCEPTED, accepted as f64).await;
     }
-    let count = processes.len();
-    let changed = record(
-        &pod,
-        &container_id,
-        Report {
-            reported_at: Utc::now(),
-            processes,
-        },
-    );
-    publish_ingest(metrics, INGEST_ACCEPTED, 1.0).await;
+    if !refused.is_empty() {
+        publish_ingest(metrics, INGEST_REFUSED, refused.len() as f64).await;
+    }
+    let status = if accepted == 0 && !refused.is_empty() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::ACCEPTED
+    };
     // 变了才落帧。帧的意思是「屏上该重读了」，而一个安静的容器每拍报的是同一张
     // 表；按拍落帧，屏就按拍重读一次一模一样的快照。
     // 帧里也不带进程表本身：内容由读的一方重读，两处都发一遍，账就有两本了。
@@ -217,8 +308,13 @@ async fn ingest(
         });
     }
     (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "accepted": count, "changed": changed })),
+        status,
+        Json(serde_json::json!({
+            "accepted": accepted,
+            "changed": changed,
+            "refused": refused,
+            "census": !body.node.trim().is_empty(),
+        })),
     )
         .into_response()
 }
@@ -257,10 +353,9 @@ mod tests {
     #[test]
     fn a_report_older_than_the_window_is_not_the_current_state() {
         // 容器停了之后不会再有新的自报；旧的那一份不能一直当作现状显示。
-        let key = ("pod-old".to_string(), "container-old".to_string());
+        let container = "container-old";
         record(
-            &key.0,
-            &key.1,
+            container,
             Report {
                 reported_at: Utc::now() - chrono::Duration::seconds(FRESH_FOR.as_secs() as i64 + 5),
                 processes: vec![ReportedProcess {
@@ -271,18 +366,13 @@ mod tests {
                 }],
             },
         );
-        assert!(
-            latest(&key.0, &key.1).is_none(),
-            "过期的一份读作「没有读数」"
-        );
+        assert!(latest(container).is_none(), "过期的一份读作「没有读数」");
     }
 
     #[test]
     fn the_latest_report_wins() {
-        let pod = "pod-latest";
         let container = "c0ffee";
         record(
-            pod,
             container,
             Report {
                 reported_at: Utc::now() - chrono::Duration::seconds(1),
@@ -295,7 +385,6 @@ mod tests {
             },
         );
         record(
-            pod,
             container,
             Report {
                 reported_at: Utc::now(),
@@ -307,14 +396,13 @@ mod tests {
                 }],
             },
         );
-        let report = latest(pod, container).expect("新鲜的这一份");
+        let report = latest(container).expect("新鲜的这一份");
         assert_eq!(report.processes[0].command, "new");
     }
 
     #[test]
     fn only_a_changed_table_is_worth_a_frame() {
         // 一个安静的容器每拍报同一张表；每拍落帧就是让屏每拍重读同一份快照。
-        let pod = "pod-changed";
         let container = "beef";
         let table = vec![ReportedProcess {
             pid: 1,
@@ -324,7 +412,6 @@ mod tests {
         }];
         assert!(
             record(
-                pod,
                 container,
                 Report {
                     reported_at: Utc::now(),
@@ -335,7 +422,6 @@ mod tests {
         );
         assert!(
             !record(
-                pod,
                 container,
                 Report {
                     reported_at: Utc::now(),
@@ -346,7 +432,6 @@ mod tests {
         );
         assert!(
             record(
-                pod,
                 container,
                 Report {
                     reported_at: Utc::now(),
@@ -399,11 +484,34 @@ mod tests {
             .map(|sample| sample.value)
     }
 
-    fn body(pod: &str, container_id: &str, processes: Vec<ReportedProcess>) -> ReportBody {
+    fn body(pod: &str, container_id: &str, processes: Vec<ReportedProcess>) -> CensusBody {
+        CensusBody {
+            node: String::new(),
+            reports: vec![ReportBody {
+                pod: pod.to_string(),
+                container_id: container_id.to_string(),
+                processes,
+            }],
+        }
+    }
+
+    fn batch(node: &str, reports: Vec<ReportBody>) -> CensusBody {
+        CensusBody {
+            node: node.to_string(),
+            reports,
+        }
+    }
+
+    fn report(pod: &str, container_id: &str, command: &str) -> ReportBody {
         ReportBody {
             pod: pod.to_string(),
             container_id: container_id.to_string(),
-            processes,
+            processes: vec![ReportedProcess {
+                pid: 1,
+                parent_pid: 0,
+                command: command.to_string(),
+                rss_bytes: 4096,
+            }],
         }
     }
 
@@ -424,7 +532,7 @@ mod tests {
         let backend = as_backend(&metrics);
         let (events, _rx) = tokio::sync::broadcast::channel(8);
 
-        let response = ingest(body("pod-a", "aaaa", one_process()), &events, &backend).await;
+        let response = ingest(body("pod-a", "a1a1a1", one_process()), &events, &backend).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(cell(&metrics, INGEST_ACCEPTED).await, Some(1.0));
         assert_eq!(
@@ -432,7 +540,7 @@ mod tests {
             None,
             "收下的一份不该同时记在拒绝那一格里"
         );
-        assert_eq!(latest("pod-a", "aaaa").map(|r| r.processes.len()), Some(1));
+        assert_eq!(latest("a1a1a1").map(|r| r.processes.len()), Some(1));
     }
 
     #[tokio::test]
@@ -441,7 +549,7 @@ mod tests {
         let backend = as_backend(&metrics);
         let (events, _rx) = tokio::sync::broadcast::channel(8);
 
-        let response = ingest(body("pod-b", "bbbb", Vec::new()), &events, &backend).await;
+        let response = ingest(body("pod-b", "b2b2b2", Vec::new()), &events, &backend).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(cell(&metrics, INGEST_REFUSED).await, Some(1.0));
         assert_eq!(
@@ -449,7 +557,7 @@ mod tests {
             None,
             "被拒的那一份没有收下，不该记在收下那一格"
         );
-        assert!(latest("pod-b", "bbbb").is_none(), "拒收不落库");
+        assert!(latest("b2b2b2").is_none(), "拒收不落库");
     }
 
     #[tokio::test]
@@ -463,12 +571,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_batch_lands_every_container_on_the_node() {
+        // 没有这次改动就会红：采集器一拍报几十个容器，而端点只认单条形状时
+        // 整批被拒——屏上每一个第三方容器都读作「没有进程表」。
+        let (events, _rx) = tokio::sync::broadcast::channel(8);
+        let response = ingest(
+            batch(
+                "node-1",
+                vec![
+                    report("", "p1", "postgres"),
+                    report("", "p2", "nats-server"),
+                    report("", "p3", "redis-server"),
+                ],
+            ),
+            &events,
+            &None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(latest("p1").map(|r| r.processes.len()), Some(1));
+        assert_eq!(
+            latest("p2").expect("第二台也在").processes[0].command,
+            "nats-server"
+        );
+        assert_eq!(latest("p3").is_some(), true);
+        assert!(census_at("node-1").is_some(), "这一拍同时是这台节点的活体");
+    }
+
+    #[tokio::test]
+    async fn one_bad_report_does_not_take_the_whole_batch_down() {
+        // 一个容器读不到不该让同一台节点上另外几十个容器的读数一起消失。
+        let (events, _rx) = tokio::sync::broadcast::channel(8);
+        let response = ingest(
+            batch(
+                "node-2",
+                vec![
+                    report("", "g1", "kubelet"),
+                    ReportBody {
+                        pod: String::new(),
+                        container_id: String::new(),
+                        processes: one_process(),
+                    },
+                ],
+            ),
+            &events,
+            &None,
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::ACCEPTED,
+            "有一条坏的，其余照收"
+        );
+        assert!(latest("g1").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_node_without_a_census_is_not_a_node_without_processes() {
+        // 「没有采集器」与「采集器在跑、这一格读不到」是两个修法相反的现场，
+        // 靠这一格分开。
+        assert!(census_at("node-never-reported").is_none());
+        record_census("node-3");
+        assert!(census_at("node-3").is_some());
+        record_census("   ");
+        assert!(census_at("").is_none(), "空节点名不是一个节点");
+    }
+
+    #[tokio::test]
     async fn without_a_metrics_backend_the_report_still_lands() {
         // 指标是可选的：没有后端时这一格不存在，但自报照收——读数少一格不该
         // 变成功能少一格。
         let (events, _rx) = tokio::sync::broadcast::channel(8);
-        let response = ingest(body("pod-c", "cccc", one_process()), &events, &None).await;
+        let response = ingest(body("pod-c", "c3c3c3", one_process()), &events, &None).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
-        assert!(latest("pod-c", "cccc").is_some());
+        assert!(latest("c3c3c3").is_some());
     }
 }

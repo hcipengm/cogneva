@@ -169,6 +169,12 @@ pub struct NodeView {
     /// Ready / MemoryPressure / DiskPressure / PIDPressure。压力条件为真时是坏事，
     /// 与 Pod 的条件语义相反，界面按名字分开解读。
     pub conditions: Vec<ConditionView>,
+    /// 这台节点上的进程采集器最后一次报到的时刻。
+    ///
+    /// `None` 不是「这台节点没有进程」，而是**这台节点上没有活着的采集器**：它上面
+    /// 每一个容器的进程表都没有人能填。与「采集器在跑、这一格读不到」是两个现场，
+    /// 修法相反，所以这里必须分得开。
+    pub process_census_at: Option<chrono::DateTime<Utc>>,
     pub pods: Vec<PodView>,
 }
 
@@ -189,6 +195,11 @@ pub struct PodView {
     /// 跑 `ps`，那是对运行中的业务容器执行命令，不给读面这个权限。metrics-server
     /// 那条腿不报这个数，所以 `None` 说的是「这个来源量不到」，不是「没有进程」。
     pub processes: Option<u64>,
+    /// 这个 Pod 所在节点上的进程采集器最后一次报到的时刻。
+    ///
+    /// 从节点那一层抄到每一个 Pod 上，是因为读它的是「这一格为什么没有进程表」这句话，
+    /// 而那句话只在容器的展开面板里说。`None` ＝ 这台节点上没有活着的采集器。
+    pub process_census_at: Option<chrono::DateTime<Utc>>,
     pub containers: Vec<ContainerView>,
     pub conditions: Vec<ConditionView>,
     pub volumes: Vec<VolumeView>,
@@ -818,9 +829,11 @@ fn node_view(node: &Value) -> NodeView {
         .pointer("/status/allocatable")
         .or_else(|| node.pointer("/status/capacity"));
 
+    let process_census_at = crate::process_reports::census_at(&name);
     NodeView {
         name,
         ready,
+        process_census_at,
         roles,
         conditions: conditions_of(node),
         cpu_allocatable_millicores: allocatable
@@ -946,7 +959,7 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
                     .and_then(Value::as_str)
                     .map(crate::process_reports::container_id_of)
                     .filter(|id| !id.is_empty())
-                    .and_then(|id| crate::process_reports::latest(&name, id))
+                    .and_then(crate::process_reports::latest)
                     .map(|report| report.processes),
             }
         })
@@ -962,6 +975,7 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
     let volumes = pod_volumes(pod, sources);
     let pod_events = events.get(&name).cloned().unwrap_or_default();
     let conditions = conditions_of(pod);
+    let process_census_at = node.as_deref().and_then(crate::process_reports::census_at);
 
     PodView {
         namespace,
@@ -977,6 +991,7 @@ fn pod_view(pod: &Value, sources: &Sources) -> PodView {
         cpu_used_millicores: pod_usage.map(|pod| pod.cpu),
         memory_used_bytes: pod_usage.map(|pod| pod.memory),
         processes: pod_usage.and_then(|pod| pod.processes),
+        process_census_at,
         volumes,
         events: pod_events,
     }
@@ -1522,15 +1537,23 @@ pub enum WorkloadKind {
     DaemonSet,
     CronJob,
     Job,
+    /// 没有任何控制器拥有的 Pod：评测环境（toolathlon 的一道题就是一台 Pod）、
+    /// 一次性的探针、宿主脚本直接 apply 的那类。
+    ///
+    /// 它算工作负载，理由与另外五种一样：它是一条**在跑的东西**，有镜像、有副本数
+    /// （1），有它自己的就绪状态；而它不出现在这五张表里，就一条都不出现在屏上——
+    /// 评测环境跑起来的时候，工作负载那一栏看不出这件事在发生。
+    Pod,
 }
 
 impl WorkloadKind {
-    pub const ALL: [WorkloadKind; 5] = [
+    pub const ALL: [WorkloadKind; 6] = [
         WorkloadKind::Deployment,
         WorkloadKind::StatefulSet,
         WorkloadKind::DaemonSet,
         WorkloadKind::CronJob,
         WorkloadKind::Job,
+        WorkloadKind::Pod,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -1540,6 +1563,7 @@ impl WorkloadKind {
             WorkloadKind::DaemonSet => "DaemonSet",
             WorkloadKind::CronJob => "CronJob",
             WorkloadKind::Job => "Job",
+            WorkloadKind::Pod => "Pod",
         }
     }
 
@@ -1558,6 +1582,8 @@ impl WorkloadKind {
             WorkloadKind::DaemonSet => format!("/apis/apps/v1/namespaces/{namespace}/daemonsets"),
             WorkloadKind::CronJob => format!("/apis/batch/v1/namespaces/{namespace}/cronjobs"),
             WorkloadKind::Job => format!("/apis/batch/v1/namespaces/{namespace}/jobs"),
+            // 核心组没有 `/apis/<group>` 前缀，路径只有 `/api/v1`。
+            WorkloadKind::Pod => format!("/api/v1/namespaces/{namespace}/pods"),
         }
     }
 
@@ -1565,6 +1591,7 @@ impl WorkloadKind {
     fn containers(self) -> &'static str {
         match self {
             WorkloadKind::CronJob => "/spec/jobTemplate/spec/template/spec/containers",
+            WorkloadKind::Pod => "/spec/containers",
             _ => "/spec/template/spec/containers",
         }
     }
@@ -1581,6 +1608,17 @@ fn workloads_from(kind: WorkloadKind, list: &Value) -> Vec<WorkloadView> {
 }
 
 fn workload_from(kind: WorkloadKind, item: &Value) -> Option<WorkloadView> {
+    // 只有「没有控制器」的 Pod 是这一栏里的工作负载：有主的那些已经由它的 Job /
+    // ReplicaSet / StatefulSet 数过一遍，再列一次就是同一件事的两行。
+    if kind == WorkloadKind::Pod
+        && item
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array)
+            .map(|owners| !owners.is_empty())
+            .unwrap_or(false)
+    {
+        return None;
+    }
     let name = item.pointer("/metadata/name").and_then(Value::as_str)?;
     let count = |pointer: &str| {
         item.pointer(pointer)
@@ -1607,6 +1645,22 @@ fn workload_from(kind: WorkloadKind, item: &Value) -> Option<WorkloadView> {
         WorkloadKind::Job => (
             count("/status/succeeded"),
             count("/spec/completions").or(Some(1)),
+            None,
+            None,
+        ),
+        // 一台裸 Pod 的「副本」是它自己：就绪看容器，要几个看声明了几个容器。
+        WorkloadKind::Pod => (
+            item.pointer("/status/containerStatuses")
+                .and_then(Value::as_array)
+                .map(|statuses| {
+                    statuses
+                        .iter()
+                        .filter(|status| status.get("ready").and_then(Value::as_bool) == Some(true))
+                        .count() as u32
+                }),
+            item.pointer("/spec/containers")
+                .and_then(Value::as_array)
+                .map(|containers| containers.len() as u32),
             None,
             None,
         ),
@@ -1716,14 +1770,15 @@ pub async fn cluster_deployments_handler() -> Json<WorkloadsReport> {
         .iter()
         .map(|kind| kind.list_path(&namespace))
         .collect();
-    // 五个工种互不依赖，一起问。先后问的话一次页面刷新要串五次 apiserver，
+    // 六个工种互不依赖，一起问。先后问的话一次页面刷新要串六次 apiserver，
     // 其中 Job 那一列还是全命名空间最大的一列。
-    let (deployment, statefulset, daemonset, cronjob, job) = tokio::join!(
+    let (deployment, statefulset, daemonset, cronjob, job, pod) = tokio::join!(
         client.get_json(&paths[0]),
         client.get_json(&paths[1]),
         client.get_json(&paths[2]),
         client.get_json(&paths[3]),
         client.get_json(&paths[4]),
+        client.get_json(&paths[5]),
     );
 
     let mut workloads = Vec::new();
@@ -1734,11 +1789,12 @@ pub async fn cluster_deployments_handler() -> Json<WorkloadsReport> {
         (WorkloadKind::DaemonSet, daemonset),
         (WorkloadKind::CronJob, cronjob),
         (WorkloadKind::Job, job),
+        (WorkloadKind::Pod, pod),
     ];
     for (kind, result) in results {
         match result {
             Ok(list) => workloads.extend(workloads_from(kind, &list)),
-            // 一种读不到不该把另外四种也吞掉：报出是哪种，其余照列，
+            // 一种读不到不该把另外几种也吞掉：报出是哪种，其余照列，
             // 让人分得清「集群里没有 StatefulSet」和「StatefulSet 没读到」。
             Err(e) => errors.push(format!("读不到 {}：{e}", kind.as_str())),
         }
@@ -1858,8 +1914,8 @@ mod topology_tests {
                 rss_bytes: 1024,
             }],
         };
-        crate::process_reports::record("stack", "aaaa", report("cogneva-app"));
-        crate::process_reports::record("stack", "bbbb", report("cogneva-sidecar"));
+        crate::process_reports::record("aaaa", report("cogneva-app"));
+        crate::process_reports::record("bbbb", report("cogneva-sidecar"));
 
         let view = pod_view(&pod, &Sources::default());
         let app = view
@@ -1889,7 +1945,6 @@ mod topology_tests {
         // 第三方镜像不会报。这一格必须是「没有自报」，不是空数组——空数组在屏上
         // 会读成「里面没有进程」。
         crate::process_reports::record(
-            "quiet",
             "cccc",
             crate::process_reports::Report {
                 reported_at: Utc::now(),
@@ -2715,7 +2770,41 @@ mod topology_tests {
                 "/apis/apps/v1/namespaces/cogneva/daemonsets",
                 "/apis/batch/v1/namespaces/cogneva/cronjobs",
                 "/apis/batch/v1/namespaces/cogneva/jobs",
+                "/api/v1/namespaces/cogneva/pods",
             ]
         );
+    }
+
+    #[test]
+    fn only_a_pod_without_a_controller_is_a_workload_of_its_own() {
+        // 没有这次改动就会红：评测环境（toolathlon 一道题一台 Pod）与宿主脚本 apply
+        // 的探针既不是 Deployment 也不是 Job，工作负载那一栏里一条都不出现——跑起来
+        // 的时候屏上看不出这件事在发生。
+        let list = json!({"items": [
+            {
+                "metadata": {"name": "eval-toolathlon-task-1"},
+                "spec": {"containers": [{"name": "app", "image": "eval-pack:1"}]},
+                "status": {"containerStatuses": [{"name": "app", "ready": true}]}
+            },
+            {
+                "metadata": {
+                    "name": "cogneva-mainline-4bce6962bc33-abc",
+                    "ownerReferences": [{"kind": "Job", "name": "cogneva-mainline-4bce6962bc33"}]
+                },
+                "spec": {"containers": [{"name": "mainline", "image": "cogneva:1"}]},
+                "status": {"containerStatuses": [{"name": "mainline", "ready": true}]}
+            }
+        ]});
+        let pods = workloads_from(WorkloadKind::Pod, &list);
+        assert_eq!(
+            pods.len(),
+            1,
+            "有主的 Pod 由它的控制器数过一遍，不再列第二遍"
+        );
+        assert_eq!(pods[0].kind, "Pod");
+        assert_eq!(pods[0].name, "eval-toolathlon-task-1");
+        assert_eq!(pods[0].ready, Some(1));
+        assert_eq!(pods[0].desired, Some(1), "它就是自己那一份副本");
+        assert_eq!(pods[0].images, vec!["eval-pack:1"]);
     }
 }

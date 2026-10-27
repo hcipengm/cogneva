@@ -9,7 +9,7 @@ import { BarList, Strip, type StripSegment } from '@/ui/plots';
  * 构建与部署面：谁在跑第几版、滚动到哪一步；这轮构建过什么、每条怎么结束的。
  *
  * 上半页来自 apiserver 的五种工作负载对象——Deployment / StatefulSet / DaemonSet /
- * CronJob / Job，不是只有 Deployment。只读 Deployment 时 postgres、redis（StatefulSet）、
+ * CronJob / Job，不是只有 Deployment。也只读 Deployment 时 postgres、redis（StatefulSet）、
  * 节点级的常驻组件（DaemonSet）、备份（CronJob）、每次主线部署（Job）都在集群里跑着而
  * 页面上没有，而空白读起来像「本来就没有」。每行带工种列，工种之间不能通用的那一列
  * 显式写「不适用」，不写 0，也不留空白。
@@ -69,7 +69,7 @@ export function DeliveryView() {
           <Empty>这个命名空间里没有工作负载。</Empty>
         ) : (
           <>
-            <Readings from={workloads} source="GET /api/v1/cluster/deployments" caveat="「采集于」是服务端读 apiserver 的时刻；这份读数在两次轮询之间不会自己变。Deployment / StatefulSet / DaemonSet / CronJob / Job 五种都在这一份里。">
+            <Readings from={workloads} source="GET /api/v1/cluster/deployments" caveat="「采集于」是服务端读 apiserver 的时刻；这份读数在两次轮询之间不会自己变。Deployment / StatefulSet / DaemonSet / CronJob / Job 五种，加上没有控制器拥有的裸 Pod（评测环境就是这种），都在这一份里。">
             <div className="flex flex-wrap py-2">
               <Reading label="工作负载" value={rows.length} note={kindSummary(rows)} />
               <Reading

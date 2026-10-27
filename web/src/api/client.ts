@@ -1979,8 +1979,12 @@ export interface TopologyContainer {
   cpu_used_millicores: number | null;
   memory_used_bytes: number | null;
   /**
-   * 容器自己推上来的进程表。只有跑我们镜像的容器会报；`null` 是「这个容器不报」
-   * 或「这一拍还没到」，不是「里面没有进程」。
+   * 这个容器里的进程表。由节点上的采集器按宿主 cgroup 树读出来——镜像是什么都读得到，
+   * 所以第三方镜像（postgres、nats、registry）也有这一格；跑本平台镜像的容器还会
+   * 自己再报一份，两个来源落在同一张表上。
+   *
+   * `null` 不是「里面没有进程」：要么这台节点上没有采集器（看 Pod 的
+   * `process_census_at`），要么这一拍没读到（刚起、已经退出）。两种在现场的修法相反。
    */
   processes: TopologyProcess[] | null;
 }
@@ -2053,6 +2057,11 @@ export interface TopologyPod {
    * `null` 是「这个来源量不到」，不是「零个进程」。
    */
   processes: number | null;
+  /**
+   * 这个 Pod 所在的节点上，进程采集器最后一次报到的时刻（ISO 字符串）。
+   * `null` ＝ 这台节点上没有活着的采集器，于是它上面每个容器的进程表都没有人能填。
+   */
+  process_census_at: string | null;
   containers: TopologyContainer[];
   conditions: TopologyCondition[];
   volumes: TopologyVolume[];
@@ -2072,6 +2081,8 @@ export interface TopologyNode {
   memory_used_bytes: number | null;
   /** Ready / MemoryPressure / DiskPressure …：压力条件为 true 才是坏消息。 */
   conditions: TopologyCondition[];
+  /** 这台节点上进程采集器最后一次报到的时刻；`null` ＝ 这台节点上没有采集器。 */
+  process_census_at: string | null;
   pods: TopologyPod[];
 }
 

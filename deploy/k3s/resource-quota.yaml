@@ -22,8 +22,8 @@ spec:
     requests.cpu: "5"
     requests.memory: 19Gi
     limits.cpu: "38"
-    limits.memory: 72Gi
-    pods: "38"
+    limits.memory: 73Gi
+    pods: "40"
     requests.storage: 430Gi
 ---
 apiVersion: v1
