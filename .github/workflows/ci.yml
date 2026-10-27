@@ -89,10 +89,25 @@ jobs:
             # -- is on the lines after it. An annotation that stops at the line
             # number says which test broke and leaves the branch it took
             # unreadable, which is the shape a flake keeps.
-            grep --no-group-separator -A 4 -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
-              /tmp/cargo-test.log | grep -v '^[[:space:]]*$' | head -40 | while IFS= read -r line; do
-                printf '::error::%s\n' "$line"
-              done
+            #
+            # One annotation, not one per line: GitHub keeps at most ten error
+            # annotations per step and drops the rest without a word, so a
+            # per-line loop shows ten lines and cannot say whether any more
+            # exist. Measured on 2026-10-27: a run with more failing tests than
+            # that read as exactly ten red lines on both Test and Code Coverage,
+            # and the panel could not answer "is that all of them". The whole
+            # block goes into a single newline-escaped annotation whose first
+            # line is the count, because the number of failing tests -- not the
+            # number of lines that fit -- is what decides whether the branch is
+            # readable.
+            failed=$(grep -cE '^test .* FAILED$' /tmp/cargo-test.log || true)
+            {
+              echo "cargo test --workspace: ${failed} failing test(s)"
+              grep --no-group-separator -A 4 -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
+                /tmp/cargo-test.log | grep -v '^[[:space:]]*$' | head -400
+            } > /tmp/annotation.txt
+            body=$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':a;N;$!ba;s/\n/%0A/g' /tmp/annotation.txt)
+            printf '::error::%s\n' "$body"
             exit 1
           }
       # The keypair the contribution admin hands out is written by our own
@@ -1007,10 +1022,19 @@ jobs:
             # -- is on the lines after it. An annotation that stops at the line
             # number says which test broke and leaves the branch it took
             # unreadable, which is the shape a flake keeps.
-            grep --no-group-separator -A 4 -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
-              /tmp/coverage.log | grep -v '^[[:space:]]*$' | head -40 | while IFS= read -r line; do
-                printf '::error::%s\n' "$line"
-              done
+            #
+            # One annotation carrying the whole block, for the reason spelled
+            # out in the test job: ten error annotations per step is a hard cap,
+            # and a per-line loop that hits it says nothing about what it left
+            # out.
+            failed=$(grep -cE '^test .* FAILED$' /tmp/coverage.log || true)
+            {
+              echo "cargo llvm-cov --workspace: ${failed} failing test(s); this step also fails on line coverage below 40%"
+              grep --no-group-separator -A 4 -E "^(test .* FAILED|failures:|test result: FAILED|error(\[E[0-9]+\])?:)|panicked at" \
+                /tmp/coverage.log | grep -v '^[[:space:]]*$' | head -400
+            } > /tmp/annotation.txt
+            body=$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' -e ':a;N;$!ba;s/\n/%0A/g' /tmp/annotation.txt)
+            printf '::error::%s\n' "$body"
             exit 1
           }
       # 上传是给**第三方**的遥测，不是判据：判据在上面那一步（`--fail-under-lines 40`
