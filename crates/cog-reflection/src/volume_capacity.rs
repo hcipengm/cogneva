@@ -1510,7 +1510,7 @@ mod tests {
         state.observe(8192);
 
         // No ceiling yet: the cap is the cache's own peak plus its headroom,
-        // which on this deployment is 228 GiB against a 192 GiB declaration.
+        // which measured 228 GiB against a 192 GiB declaration here.
         cache.measure_and_enforce(None).await;
         let by_peak = 8192 * HEADROOM_PERCENT / 100;
         assert_eq!(cache.cap_bytes(), Some(by_peak));

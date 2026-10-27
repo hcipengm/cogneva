@@ -1593,9 +1593,9 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 // cache what its declaration leaves. Without this the cache's
                 // cap is derived from the peak it measured and from the node's
                 // free space, and on a directory-backed volume both of those
-                // are larger than the claim: measured here at 228 GiB against a
-                // 192 GiB declaration, so nothing was ever reclaimed while the
-                // claim read 0.99 full.
+                // are larger than the claim: measured 228 GiB against a 192 GiB
+                // declaration on this deployment, so nothing was ever
+                // reclaimed while the claim read 0.99 full.
                 self.build_cache.clone(),
                 shutdown,
             ));
