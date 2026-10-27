@@ -669,8 +669,13 @@ impl LokiBackgroundPusher {
         };
         let mut labels = HashMap::new();
         labels.insert(
-            "outcome".to_string(),
-            if delivered { "delivered" } else { "failed" }.to_string(),
+            crate::alerts::LABEL_OUTCOME.to_string(),
+            if delivered {
+                crate::alerts::OUTCOME_DELIVERED
+            } else {
+                crate::alerts::OUTCOME_FAILED
+            }
+            .to_string(),
         );
         if let Err(e) = metrics
             .record_counter(

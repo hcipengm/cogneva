@@ -15,6 +15,11 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::AsyncTransport;
 use lettre::{AsyncSmtpTransport, Tokio1Executor};
 
+/// The label every one of these outcomes is recorded under. Named once because
+/// the dispatch counter, the log flush counter and the analytics flush counter
+/// each write it, and a reader groups across all three.
+pub const LABEL_OUTCOME: &str = "outcome";
+
 /// The closed set of ways one dispatch to one channel can end, as recorded on
 /// [`cog_core::metric_names::ALERT_NOTIFICATIONS_TOTAL`]'s `outcome` label.
 pub const OUTCOME_DELIVERED: &str = "delivered";
@@ -339,7 +344,7 @@ async fn record_dispatch(
     let Some(backend) = metrics else { return };
     let labels = std::collections::HashMap::from([
         ("channel".to_string(), channel.to_string()),
-        ("outcome".to_string(), outcome.to_string()),
+        (LABEL_OUTCOME.to_string(), outcome.to_string()),
     ]);
     if let Err(e) = backend
         .record_counter(
