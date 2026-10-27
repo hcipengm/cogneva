@@ -1,0 +1,631 @@
+//! principle: feedback_no_hardcoding_config_surface
+//!
+//! An `AgentEvent` variant is a word spelled twice: once where it is declared,
+//! and once where somebody builds one. Everything between those two places —
+//! the bus filter, the WAL round trip, the websocket mapping, the WebUI panel —
+//! reads the variant and assumes it arrives. Nothing anywhere compares "we
+//! declare this" with "we emit this", so a variant that nobody constructs is a
+//! whole panel that renders exactly what it renders when nothing happens.
+//!
+//! 实测（2026-10-27）：20 个变体里 18 个在 `crates/*/src` 的生产半边有构造点，
+//! `SelfReview` 与 `ToolExecutionUpdate` 一个都没有。前者的消费端在等着：
+//! `web/src/store/streamStore.ts` 有一支 `case 'self_review'`，
+//! `crates/cog-reflection/src/detector.rs` 按它的 `status` 派生学习信号，
+//! `cog-observability` 拿它的 `agent_id` 归属；后者同样被
+//! `cog-gateway/src/websocket_protocol.rs`、`cog-storage` 的过滤与快照分类。
+//! 面板空白与「没有自我复盘发生」读起来一模一样——这正是这条线一直在打的形状。
+//!
+//! What it judges:
+//!
+//! * every variant declared in `AgentEvent` is constructed at least once in the
+//!   production half of some `crates/*/src` file, unless it is registered below
+//!   with the reason its producer is not in this tree;
+//! * each registration is still true: the day a producer appears, the row has to
+//!   go, or the registry becomes a place where a fixed gap keeps being announced.
+//!
+//! What it cannot judge:
+//!
+//! * whether the event is actually published. A construction that is dropped on
+//!   the floor counts here; reaching the bus is `emit_event`'s problem, not this
+//!   one's;
+//! * a construction written inside a macro this scanner does not follow. The
+//!   scanner skips `matches!` arguments (those are patterns) and knows nothing
+//!   about other macros, so a `macro_rules!` that builds events would read as no
+//!   producer at all — the direction that reddens rather than the direction that
+//!   goes quiet;
+//! * whether a construction is *reached*. A variant built on a branch nothing
+//!   takes counts as a producer here.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+mod common;
+
+use common::rust_production::production_text;
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+const ENUM_FILE: &str = "crates/cog-core/src/types/event.rs";
+const ENUM_NAME: &str = "AgentEvent";
+
+/// Variants with no producer in this tree, and why that is not a hole this gate
+/// can close.
+///
+/// Neither of these is a fixture that was left lying around: both have live
+/// consumers that read them and behave differently when they arrive. They are
+/// registered rather than fixed because the missing half is the agent's own
+/// runtime — the thing that would have to decide to emit a self-review or a
+/// partial tool result — and that is a product change, not a vocabulary one.
+/// Registering them here is what makes the gap readable on every run instead of
+/// only in the `else` branch of a renderer.
+const NO_PRODUCER_HERE: &[(&str, &str)] = &[
+    (
+        "SelfReview",
+        "本树没有构造点：自我复盘跑完后没有人把这一帧发上总线。消费端在等它——\
+         WebUI 的 `case 'self_review'` 面板、`detector` 的 NEED_REVISION 分支、\
+         观测网关的 agent 归属。树外 agent 可以经 gRPC `event_json` 推这种帧，\
+         但本树的 agent 运行时自己从不发",
+    ),
+    (
+        "ToolExecutionUpdate",
+        "本树没有构造点：`runtime` 只发 `ToolExecutionStart` 与 `ToolExecutionEnd`，\
+         工具的部分结果从不经总线发出。消费端在等它——`websocket_protocol` 的映射、\
+         `event_filter` 的分类、快照的归属",
+    ),
+];
+
+/// What may follow a `{ ... }` and still mean the braces were a pattern rather
+/// than a value: a match arm, an alternation, a guard, a `let` binding, an
+/// `else` clause.
+fn following_is_pattern(after: &str) -> bool {
+    let after = after.trim_start();
+    after.starts_with("=>")
+        || after.starts_with('|')
+        || after.starts_with("if ")
+        || after.starts_with("else")
+        // `let AgentEvent::X { .. } = event else` binds; `AgentEvent::X { .. } == y`
+        // would be a value, and there is no such comparison today.
+        || (after.starts_with('=') && !after.starts_with("=="))
+}
+
+/// The byte offset of the bracket that closes the one at `open`, ignoring
+/// brackets inside strings, character literals, raw strings and comments.
+fn matching(b: &[u8], open: usize, open_ch: u8, close_ch: u8) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    let mut block = 0usize;
+    let mut raw: Option<usize> = None;
+    while i < b.len() {
+        let c = b[i];
+        if block > 0 {
+            if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                block += 1;
+                i += 2;
+                continue;
+            }
+            if c == b'*' && b.get(i + 1) == Some(&b'/') {
+                block -= 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(hashes) = raw {
+            if c == b'"' {
+                let mut j = i + 1;
+                let mut seen = 0;
+                while seen < hashes && b.get(j) == Some(&b'#') {
+                    seen += 1;
+                    j += 1;
+                }
+                if seen == hashes {
+                    raw = None;
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            block = 1;
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'"' {
+                    break;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\'' {
+            // A character literal closes within a few bytes; a lifetime's quote
+            // does not, and a lifetime is not the opening of a literal.
+            let mut j = i + 1;
+            if b.get(j) == Some(&b'\\') {
+                j += 1;
+            }
+            let mut close = None;
+            while j < b.len() && j <= i + 5 {
+                if b[j] == b'\'' {
+                    close = Some(j);
+                    break;
+                }
+                j += 1;
+            }
+            i = match close {
+                Some(at) => at + 1,
+                None => i + 1,
+            };
+            continue;
+        }
+        if c == b'r'
+            && b.get(i.wrapping_sub(1))
+                .is_none_or(|p| !p.is_ascii_alphanumeric())
+        {
+            let mut j = i + 1;
+            let mut hashes = 0;
+            while b.get(j) == Some(&b'#') {
+                hashes += 1;
+                j += 1;
+            }
+            if b.get(j) == Some(&b'"') {
+                raw = Some(hashes);
+                i = j + 1;
+                continue;
+            }
+        }
+        if c == open_ch {
+            depth += 1;
+        } else if c == close_ch {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The spans of every `matches!(...)` argument list. A struct-shaped pattern
+/// there is followed by `)`, which on its own would read as a value.
+fn macro_argument_spans(text: &str, needle: &str) -> Vec<(usize, usize)> {
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find(needle) {
+        let mut i = from + at + needle.len();
+        from = i;
+        while i < b.len() && (b[i] as char).is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= b.len() || b[i] != b'(' {
+            continue;
+        }
+        if let Some(close) = matching(b, i, b'(', b')') {
+            out.push((i, close));
+        }
+    }
+    out
+}
+
+/// Whether one of the fields is a bare `..`.
+///
+/// Only a field of its own marks a rest pattern. `..Default::default()` is a
+/// struct update and belongs to a value being built — reading any `..` as the
+/// rest marker would call that construction a pattern, which is the wrong
+/// direction: it takes a producer away and reddens a correct tree.
+fn has_rest_pattern(body: &str) -> bool {
+    top_level_fields(body).contains(&"..")
+}
+
+/// The comma-separated fields of a struct literal or pattern, at depth zero.
+fn top_level_fields(body: &str) -> Vec<&str> {
+    let b = body.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut item_start = 0usize;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'{' || c == b'(' || c == b'[' {
+            depth += 1;
+        } else if c == b'}' || c == b')' || c == b']' {
+            depth -= 1;
+        } else if c == b'"' {
+            i += 1;
+            while i < b.len() {
+                if b[i] == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'"' {
+                    break;
+                }
+                i += 1;
+            }
+        } else if c == b',' && depth == 0 {
+            out.push(body[item_start..i].trim());
+            item_start = i + 1;
+        }
+        i += 1;
+    }
+    let tail = body[item_start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out.into_iter().filter(|field| !field.is_empty()).collect()
+}
+
+/// Every place a variant is named with a brace, and whether that brace holds a
+/// constructed value or a pattern.
+fn event_sites(text: &str) -> Vec<(String, bool)> {
+    const NEEDLE: &str = "AgentEvent::";
+    let b = text.as_bytes();
+    let macros = macro_argument_spans(text, "matches!");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(at) = text[from..].find(NEEDLE) {
+        let start = from + at;
+        from = start + NEEDLE.len();
+        let id_start = from;
+        let mut i = id_start;
+        while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+            i += 1;
+        }
+        if i == id_start {
+            continue;
+        }
+        let variant = text[id_start..i].to_string();
+        let mut j = i;
+        while j < b.len() && (b[j] as char).is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= b.len() || b[j] != b'{' {
+            continue;
+        }
+        let Some(close) = matching(b, j, b'{', b'}') else {
+            continue;
+        };
+        let body = &text[j + 1..close];
+        let after = &text[close + 1..];
+        let inside_macro = macros.iter().any(|(s, e)| start >= *s && close <= *e);
+        let pattern = has_rest_pattern(body) || inside_macro || following_is_pattern(after);
+        out.push((variant, !pattern));
+        from = close + 1;
+    }
+    out
+}
+
+/// The variants declared inside `pub enum AgentEvent`, in declaration order.
+fn declared_variants(root: &Path) -> Vec<String> {
+    let path = root.join(ENUM_FILE);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let needle = format!("pub enum {ENUM_NAME} {{");
+    let Some(at) = text.find(&needle) else {
+        panic!("{ENUM_FILE} 里没有 `{needle}`：枚举搬了家或改了名，这条门会在空集上假装绿");
+    };
+    let open = at + needle.len() - 1;
+    let b = text.as_bytes();
+    let close = matching(b, open, b'{', b'}').expect("enum body is not closed");
+    // 文档注释里的散文与 `{` 都不是声明：先剥注释再按顶层逗号切，否则
+    // 「一句带 `{` 的注释」会把后面的散文读成变体。
+    let body = strip_comments(&text[open + 1..close]);
+
+    let bytes = body.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut item_start = 0usize;
+    let split = |from: usize, to: usize, out: &mut Vec<String>| {
+        let piece = body[from..to].trim();
+        let name: String = piece
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            out.push(name);
+        }
+    };
+    for (i, c) in bytes.iter().enumerate() {
+        match c {
+            b'{' | b'(' => depth += 1,
+            b'}' | b')' => depth -= 1,
+            b',' if depth == 0 => {
+                split(item_start, i, &mut out);
+                item_start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    split(item_start, body.len(), &mut out);
+    out
+}
+
+/// The text with line and block comments removed, leaving byte offsets of the
+/// remaining text intact only in order (they are re-derived from the result).
+fn strip_comments(text: &str) -> String {
+    let b = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    let mut block = 0usize;
+    while i < b.len() {
+        let c = b[i];
+        if block > 0 {
+            if c == b'/' && b.get(i + 1) == Some(&b'*') {
+                block += 1;
+                i += 2;
+                continue;
+            }
+            if c == b'*' && b.get(i + 1) == Some(&b'/') {
+                block -= 1;
+                i += 2;
+                continue;
+            }
+            if c == b'\n' {
+                out.push('\n');
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            block = 1;
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            out.push('"');
+            i += 1;
+            while i < b.len() {
+                out.push(b[i] as char);
+                if b[i] == b'\\' {
+                    i += 1;
+                    if i < b.len() {
+                        out.push(b[i] as char);
+                    }
+                } else if b[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
+fn crate_src_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
+        .unwrap_or_else(|e| panic!("{}: {e}", root.join("crates").display()))
+        .flatten()
+        .map(|entry| entry.path().join("src"))
+        .filter(|src| src.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            source_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Every variant declared, and how many production sites construct one.
+fn census(root: &Path) -> (Vec<String>, BTreeMap<String, usize>) {
+    let variants = declared_variants(root);
+    let mut counts: BTreeMap<String, usize> =
+        variants.iter().map(|v| (v.clone(), 0usize)).collect();
+    let mut files = Vec::new();
+    for src in crate_src_dirs(root) {
+        source_files(&src, &mut files);
+    }
+    for path in &files {
+        let text =
+            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for (variant, constructed) in event_sites(&production_text(&text)) {
+            if !constructed {
+                continue;
+            }
+            if let Some(count) = counts.get_mut(&variant) {
+                *count += 1;
+            }
+        }
+    }
+    (variants, counts)
+}
+
+fn holes(counts: &BTreeMap<String, usize>, registered: &[(&str, &str)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (variant, count) in counts {
+        let entry = registered.iter().find(|(name, _)| name == variant);
+        match (count, entry) {
+            (0, None) => out.push(format!(
+                "`{variant}` 声明在 AgentEvent 里、有消费端在读它，但本树没有任何一处构造它：\
+                 这一帧永远不上总线，读它的面板与分支永远落在「没有发生」那一支"
+            )),
+            (0, Some(_)) => {}
+            (_, None) => {}
+            (_, Some(_)) => out.push(format!(
+                "`{variant}` 已经有 {count} 个生产构造点了，`NO_PRODUCER_HERE` 里那一行过期，删掉它"
+            )),
+        }
+    }
+    for (variant, _) in registered {
+        if !counts.contains_key(*variant) {
+            out.push(format!(
+                "`NO_PRODUCER_HERE` 里登记的 `{variant}` 已经不在 AgentEvent 里了，这条登记过期"
+            ));
+        }
+    }
+    out
+}
+
+#[test]
+fn every_declared_event_is_constructed_somewhere() {
+    let root = repo_root();
+    let (variants, counts) = census(&root);
+
+    // 抽取面自检：枚举读空、或扫描器一个构造点都看不见时，下面那条判据会在
+    // 空集上假装绿。
+    assert!(
+        variants.len() >= 15,
+        "只从 {ENUM_FILE} 里读到 {} 个变体，枚举解析本身坏了：{variants:?}",
+        variants.len()
+    );
+    for known in ["AgentStart", "SelfReview", "ToolExecutionUpdate"] {
+        assert!(
+            variants.iter().any(|v| v == known),
+            "枚举里读不到 `{known}`：解析坏了或它真的被删了"
+        );
+    }
+    let constructed = counts.values().filter(|n| **n > 0).count();
+    assert!(
+        constructed >= 15,
+        "生产半边只认出 {} 个变体的构造点，扫描器本身坏了：{counts:?}",
+        constructed
+    );
+
+    let found = holes(&counts, NO_PRODUCER_HERE);
+    assert!(
+        found.is_empty(),
+        "事件词表里有点了名却没有产出端的词：\n{}\n\
+         声明、消费、过滤三处都在，产出那一处不在——而这不会报错，\
+         读它的面板与分支安静地落在 else 上",
+        found.join("\n")
+    );
+}
+
+/// 判据自己也要有判据：一棵小树里造一个、只当模式用一个、登记一个，判出来的
+/// 必须正是没造的那个；给登记的那个补上构造点，它必须改口说过期。
+#[test]
+fn a_variant_nobody_constructs_is_reported() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let enum_dir = root.join("crates/cog-core/src/types");
+    std::fs::create_dir_all(&enum_dir).expect("enum dir");
+    std::fs::write(
+        enum_dir.join("event.rs"),
+        "pub enum AgentEvent {\n\
+             Produced { agent_id: String },\n\
+             OnlyMatched { agent_id: String },\n\
+             FromTheWire { agent_id: String },\n\
+         }\n",
+    )
+    .expect("enum");
+    let src = root.join("crates/cog-example/src");
+    std::fs::create_dir_all(&src).expect("src dir");
+    std::fs::write(
+        src.join("lib.rs"),
+        "fn emit(agent_id: String) -> AgentEvent {\n\
+             AgentEvent::Produced { agent_id }\n\
+         }\n\
+         \n\
+         fn classify(event: &AgentEvent) {\n\
+             match event {\n\
+                 AgentEvent::Produced { agent_id } | AgentEvent::OnlyMatched { agent_id } => drop(agent_id),\n\
+                 _ => {}\n\
+             }\n\
+             if let AgentEvent::OnlyMatched { agent_id } = event {\n\
+                 drop(agent_id);\n\
+             }\n\
+             if matches!(event, AgentEvent::FromTheWire { agent_id }) {\n\
+                 drop(agent_id);\n\
+             }\n\
+         }\n\
+         \n\
+         #[cfg(test)]\n\
+         mod tests {\n\
+             fn fixture() -> AgentEvent {\n\
+                 AgentEvent::OnlyMatched { agent_id: \"a\".into() }\n\
+             }\n\
+         }\n",
+    )
+    .expect("source");
+
+    let (variants, counts) = census(root);
+    assert_eq!(variants.len(), 3, "{variants:?}");
+    assert_eq!(counts["Produced"], 1, "{counts:?}");
+    // 只在测试模块里造的、只在模式位置出现的、只在 matches! 里出现的，都不算产出端。
+    assert_eq!(counts["OnlyMatched"], 0, "{counts:?}");
+    assert_eq!(counts["FromTheWire"], 0, "{counts:?}");
+
+    let registered = [("FromTheWire", "树外生产")];
+    let found = holes(&counts, &registered);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("OnlyMatched"), "{found:?}");
+
+    // 登记的那个真的有了产出端：这条登记必须过期，否则一个补好的洞会被一直念。
+    std::fs::write(
+        src.join("lib.rs"),
+        "fn emit(agent_id: String) -> AgentEvent {\n\
+             AgentEvent::Produced { agent_id: agent_id.clone() }\n\
+         }\n\
+         fn wire(agent_id: String) -> AgentEvent {\n\
+             AgentEvent::FromTheWire { agent_id }\n\
+         }\n\
+         fn only_matched(agent_id: String) -> AgentEvent {\n\
+             AgentEvent::OnlyMatched { agent_id }\n\
+         }\n",
+    )
+    .expect("source");
+    let (_, counts) = census(root);
+    let found = holes(&counts, &registered);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("过期"), "{found:?}");
+}
+
+/// 扫描面自己也要有判据，否则「读到零个构造点」与「真的没人造」不可分。
+#[test]
+fn the_scanner_reads_values_and_skips_patterns() {
+    let sites = event_sites(
+        "let a = AgentEvent::Made { agent_id };\n\
+         let b = AgentEvent::Made { agent_id: x.clone(), ..Default::default() };\n\
+         match e { AgentEvent::Armed { id } => 1, _ => 0 }\n\
+         let AgentEvent::Armed { id } = e else { return };\n\
+         if matches!(e, AgentEvent::Armed { id }) {}\n\
+         match e { AgentEvent::Armed { id } if ok => 1, _ => 0 }\n\
+         let c = |AgentEvent::Armed { id }| id;\n\
+         let d = AgentEvent::Made { agent_id: \"quoted } brace\".into() };\n",
+    );
+    let made = sites.iter().filter(|(v, c)| v == "Made" && *c).count();
+    let armed = sites.iter().filter(|(v, c)| v == "Armed" && *c).count();
+    assert_eq!(made, 3, "{sites:?}");
+    assert_eq!(armed, 0, "{sites:?}");
+}
