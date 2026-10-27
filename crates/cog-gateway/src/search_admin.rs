@@ -196,7 +196,7 @@ pub async fn search_fallback_config_handler(
             .into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "security_gateway_unreachable", "message": e})),
+            Json(json!({"error": crate::SECURITY_GATEWAY_UNREACHABLE, "message": e})),
         )
             .into_response(),
     }

@@ -1736,6 +1736,18 @@ fn render_held_series_readings(held: &[String], read: bool) -> String {
     out
 }
 
+/// The one word every handler answers with when the security gateway cannot be
+/// reached.
+///
+/// Two admin surfaces proxy through that gateway (`contribution_admin` and
+/// `search_admin`), and each of them spells the answer out in three places: as
+/// the `error` of a 502, and twice as a `note` inside the "we could not read
+/// the configuration" body. The word is the operator's only way to tell
+/// "misconfigured" from "unreachable", so five spellings of it and nothing
+/// comparing them means one edited copy silently starts describing a different
+/// fault.
+pub const SECURITY_GATEWAY_UNREACHABLE: &str = "security_gateway_unreachable";
+
 /// The series name the held-out reading is published under.
 ///
 /// It is declared here rather than in the registry: the reading is rendered

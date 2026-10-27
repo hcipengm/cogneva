@@ -815,7 +815,7 @@ pub(crate) async fn persist_connected(
             .into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "security_gateway_unreachable", "message": e})),
+            Json(json!({"error": crate::SECURITY_GATEWAY_UNREACHABLE, "message": e})),
         )
             .into_response(),
     }
@@ -1149,9 +1149,9 @@ fn unreachable_status_json(state: &crate::GatewayState, error: &str) -> serde_js
     json!({
         "configured": false,
         "provider": "none",
-        "note": "security_gateway_unreachable",
+        "note": crate::SECURITY_GATEWAY_UNREACHABLE,
         "read_error": error,
-        "git_identity": {"state": crate::git_identity::IdentityState::Unknown.as_str(), "note": "security_gateway_unreachable"},
+        "git_identity": {"state": crate::git_identity::IdentityState::Unknown.as_str(), "note": crate::SECURITY_GATEWAY_UNREACHABLE},
         "github_app_configured": false,
         "gitee_oauth_secret_configured": false,
         "github_oauth_secret_configured": false,
@@ -1388,7 +1388,7 @@ pub async fn github_app_discover_handler(
             .into_response(),
         Err(e) => (
             StatusCode::BAD_GATEWAY,
-            Json(json!({"error": "security_gateway_unreachable", "message": e})),
+            Json(json!({"error": crate::SECURITY_GATEWAY_UNREACHABLE, "message": e})),
         )
             .into_response(),
     }
