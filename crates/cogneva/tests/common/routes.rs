@@ -200,13 +200,30 @@ pub fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
 /// verb reader and the request-body reader cannot disagree about what a
 /// `.route(…)` call means.
 pub fn route_entries(root: &Path) -> Vec<Route> {
-    let constants = core_path_constants(root);
     let mut files = Vec::new();
     walk(&root.join("crates/cog-gateway/src"), &["rs"], &mut files);
     files.sort();
+    route_entries_in(root, &files, false)
+}
+
+/// [`route_entries`] over an explicit file list.
+///
+/// `production_only` drops `#[cfg(test)]` bodies. A route registered inside a
+/// test is served by no process, so a reader that answers "does the code this
+/// container runs serve this path" must not count it. The gateway-wide reader
+/// leaves them in: its question is whether *anything* serves the path a client
+/// sends, where an extra served path only makes the answer more lenient, and
+/// changing that would change what those gates judge.
+pub fn route_entries_in(root: &Path, files: &[PathBuf], production_only: bool) -> Vec<Route> {
+    let constants = core_path_constants(root);
     let mut routes = Vec::new();
     for path in files {
-        let text = read(&path);
+        let text = read(path);
+        let text = if production_only {
+            super::rust_production::production_text(&text)
+        } else {
+            text
+        };
         let mut cursor = 0;
         while let Some(at) = text[cursor..].find(".route(") {
             let call = cursor + at;
