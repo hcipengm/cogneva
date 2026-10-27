@@ -519,7 +519,7 @@ impl WorkspaceManager {
             warn!(worktree = %id, "index sample: cannot resolve the git dir");
             return;
         };
-        let labels = HashMap::from([("worktree".to_string(), id.to_string())]);
+        let labels = HashMap::from([(crate::LABEL_WORKTREE.to_string(), id.to_string())]);
         // 存在性先报：它只要一次 stat，后面两条 git 读数都失败时这一条仍然前进。
         // 但"这一条还在前进"只说得清文件在不在，说不清采样取没取到数——索引在、
         // 却读不出来时它照样报 1，而另一笔读数停在上一笔值上。采样停摆由下面单独
@@ -597,7 +597,7 @@ impl WorkspaceManager {
             metrics,
             WORKTREE_INDEX_SAMPLE_INCOMPLETE_METRIC,
             if incomplete { 1.0 } else { 0.0 },
-            &HashMap::from([("worktree".to_string(), id.to_string())]),
+            &HashMap::from([(crate::LABEL_WORKTREE.to_string(), id.to_string())]),
         )
         .await;
     }

@@ -143,7 +143,7 @@ pub fn spawn_collaboration_listener(
         // does not erase it.
         if let Some(backend) = state.metrics_backend.as_ref() {
             let labels = std::collections::HashMap::from([(
-                "consumer".to_string(),
+                crate::LABEL_CONSUMER.to_string(),
                 crate::LAG_CONSUMER_COLLABORATION_LISTENER.to_string(),
             )]);
             if let Err(e) = backend

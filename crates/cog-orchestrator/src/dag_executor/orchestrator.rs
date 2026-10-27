@@ -940,7 +940,7 @@ impl DagExecutor {
             return;
         };
         for kind in Self::TASK_EVENT_KINDS {
-            let labels = HashMap::from([("kind".to_string(), kind.to_string())]);
+            let labels = HashMap::from([(crate::LABEL_KIND.to_string(), kind.to_string())]);
             if let Err(e) = backend
                 .record_counter(cog_core::metric_names::EVENT_BUS_EMITTED_TOTAL, 0.0, labels)
                 .await
@@ -968,8 +968,10 @@ impl DagExecutor {
     async fn emit_event(&self, event: cog_core::TaskEvent) {
         if let Some(ref tx) = self.event_tx {
             if let Some(backend) = self.metrics_backend() {
-                let labels =
-                    HashMap::from([("kind".to_string(), Self::event_kind(&event).to_string())]);
+                let labels = HashMap::from([(
+                    crate::LABEL_KIND.to_string(),
+                    Self::event_kind(&event).to_string(),
+                )]);
                 if let Err(e) = backend
                     .record_counter(cog_core::metric_names::EVENT_BUS_EMITTED_TOTAL, 1.0, labels)
                     .await

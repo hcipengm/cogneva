@@ -22,6 +22,12 @@ pub const LABEL_INTENT: &str = "intent";
 /// 读数按「这条需求走到哪儿了」归属时用的标签键。
 pub const LABEL_FATE: &str = "fate";
 
+/// 读数按「漏斗的哪一段」归属时用的标签键。
+pub const LABEL_STAGE: &str = "stage";
+
+/// 读数带上「为什么是这个结局」时用的标签键。
+pub const LABEL_REASON: &str = "reason";
+
 pub mod change_funnel;
 pub mod ci_refusals;
 pub mod config;

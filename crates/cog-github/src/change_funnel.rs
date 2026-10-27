@@ -251,8 +251,11 @@ impl crate::landing::MainChannel {
             return;
         };
         let labels = HashMap::from([
-            ("intent".to_string(), intent_of(change).as_str().to_string()),
-            ("fate".to_string(), fate.as_str().to_string()),
+            (
+                crate::LABEL_INTENT.to_string(),
+                intent_of(change).as_str().to_string(),
+            ),
+            (crate::LABEL_FATE.to_string(), fate.as_str().to_string()),
         ]);
         if let Err(e) = metrics
             .record_counter(CHANGE_FATE_METRIC, 1.0, labels)
@@ -297,8 +300,8 @@ impl crate::landing::MainChannel {
         {
             for (intent, fate) in fate_domain() {
                 let labels = HashMap::from([
-                    ("intent".to_string(), intent.as_str().to_string()),
-                    ("fate".to_string(), fate.as_str().to_string()),
+                    (crate::LABEL_INTENT.to_string(), intent.as_str().to_string()),
+                    (crate::LABEL_FATE.to_string(), fate.as_str().to_string()),
                 ]);
                 if let Err(e) = metrics
                     .record_counter(CHANGE_FATE_METRIC, 0.0, labels)
@@ -357,8 +360,8 @@ impl crate::landing::MainChannel {
                 continue;
             }
             let labels = HashMap::from([
-                ("intent".to_string(), key.0.clone()),
-                ("stage".to_string(), key.1.clone()),
+                (crate::LABEL_INTENT.to_string(), key.0.clone()),
+                (crate::LABEL_STAGE.to_string(), key.1.clone()),
             ]);
             if let Err(e) = metrics
                 .record_gauge(CHANGE_FUNNEL_METRIC, point.count as f64, labels)

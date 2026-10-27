@@ -535,7 +535,8 @@ async fn record_rule_counts(
         cells.push(("declared", declared as f64));
     }
     for (state, value) in cells {
-        let labels = std::collections::HashMap::from([("state".to_string(), state.to_string())]);
+        let labels =
+            std::collections::HashMap::from([(crate::LABEL_STATE.to_string(), state.to_string())]);
         if let Err(e) = backend
             .record_gauge(cog_core::metric_names::ALERT_RULE_COUNT, value, labels)
             .await
@@ -548,7 +549,7 @@ async fn record_rule_counts(
     // one cell still never reads "fine" out of an unmeasured comparison.
     let agrees = matches!(verdict, LoadedRuleSet::Agree { .. });
     let labels = std::collections::HashMap::from([
-        ("state".to_string(), "agrees".to_string()),
+        (crate::LABEL_STATE.to_string(), "agrees".to_string()),
         (
             crate::alerts::LABEL_READOUT.to_string(),
             RULE_SET_READOUT.to_string(),
@@ -627,8 +628,8 @@ async fn set_row(
         Ok(AlertTransition::Fired) => {
             let now = Utc::now();
             let labels = HashMap::from([
-                ("source".to_string(), source.to_string()),
-                ("message".to_string(), message.to_string()),
+                (crate::alerts::LABEL_SOURCE.to_string(), source.to_string()),
+                (crate::LABEL_MESSAGE.to_string(), message.to_string()),
             ]);
             let events = [AlertEvent::Firing(AlertInstance {
                 rule_name: rule.to_string(),

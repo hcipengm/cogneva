@@ -354,7 +354,7 @@ async fn record_dispatch(
 ) {
     let Some(backend) = metrics else { return };
     let labels = std::collections::HashMap::from([
-        ("channel".to_string(), channel.to_string()),
+        (crate::LABEL_CHANNEL.to_string(), channel.to_string()),
         (LABEL_OUTCOME.to_string(), outcome.to_string()),
     ]);
     if let Err(e) = backend

@@ -333,7 +333,7 @@ async fn publish_census(metrics: Option<&Arc<dyn MetricsBackend>>, census: &Prin
         // per-state reading is addressable without teaching the roster a selector.
         let reading = ["principle_ledger_", state].concat();
         let labels = HashMap::from([
-            ("state".to_string(), state.to_string()),
+            (crate::LABEL_STATE.to_string(), state.to_string()),
             (crate::LABEL_READOUT.to_string(), reading),
         ]);
         if let Err(e) = metrics

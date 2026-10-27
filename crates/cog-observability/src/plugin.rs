@@ -1332,7 +1332,7 @@ async fn publish_alert_channels(
     // over the family answers "yes" whether or not an outlet exists, so the
     // distinction has to survive in the labels, not only in the prose.
     let verdict = HashMap::from([
-        ("state".to_string(), "verdict".to_string()),
+        (crate::LABEL_STATE.to_string(), "verdict".to_string()),
         (
             crate::alerts::LABEL_READOUT.to_string(),
             ALERT_CHANNEL_NONE_READOUT.to_string(),
@@ -1364,8 +1364,8 @@ async fn publish_alert_channels(
     }
     for outlet in outlets {
         let labels = HashMap::from([
-            ("state".to_string(), "configured".to_string()),
-            ("channel".to_string(), (*outlet).to_string()),
+            (crate::LABEL_STATE.to_string(), "configured".to_string()),
+            (crate::LABEL_CHANNEL.to_string(), (*outlet).to_string()),
         ]);
         if let Err(e) = metrics
             .record_gauge(

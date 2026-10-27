@@ -52,6 +52,9 @@ pub const LABEL_PASS: &str = "pass";
 /// 读数按「哪个消费方」归属时用的标签键。
 pub const LABEL_CONSUMER: &str = "consumer";
 
+/// 读数按「交接走到哪一段」归属时用的标签键。
+pub const LABEL_STAGE: &str = "stage";
+
 pub use alert_store::{Alert, AlertStore};
 pub use autonomous::{AutonomousCollaborator, AutonomousConfig};
 pub use behavior_monitor::{ActionOutcome, ActionType, BehaviorMonitor};

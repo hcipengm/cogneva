@@ -706,7 +706,10 @@ impl MainChannel {
         let Some(metrics) = self.metrics.get().cloned() else {
             return;
         };
-        let labels = HashMap::from([("category".to_string(), category.as_str().to_string())]);
+        let labels = HashMap::from([(
+            crate::LABEL_CATEGORY.to_string(),
+            category.as_str().to_string(),
+        )]);
         if let Err(e) = metrics
             .record_counter(LANDING_FAILURES_METRIC, 1.0, labels)
             .await
@@ -747,7 +750,8 @@ impl MainChannel {
         let Some(metrics) = self.metrics.get().cloned() else {
             return;
         };
-        let labels = HashMap::from([("reason".to_string(), reason.as_str().to_string())]);
+        let labels =
+            HashMap::from([(crate::LABEL_REASON.to_string(), reason.as_str().to_string())]);
         if let Err(e) = metrics
             .record_counter(crate::redrive_budget::REDRIVE_REFUSALS_METRIC, 1.0, labels)
             .await

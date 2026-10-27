@@ -303,7 +303,7 @@ impl HttpToolOutputArchive {
 /// keyed by different things -- three series that disagree about their labels
 /// cannot be subtracted from one another, and the landed share is a subtraction.
 fn tool_labels(tool: &str) -> HashMap<String, String> {
-    HashMap::from([("tool".to_string(), tool.to_string())])
+    HashMap::from([(crate::LABEL_TOOL.to_string(), tool.to_string())])
 }
 
 /// How long one archive POST may take before it is abandoned.

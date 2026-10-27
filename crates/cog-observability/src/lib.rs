@@ -39,6 +39,9 @@ pub use logs::{init_subscriber, install_early_subscriber, LogFilterHandle};
 /// 声明一次，模块里的常量引用它，编译器就替门把这几处绑在一起。
 pub const LABEL_NODE: &str = "node";
 
+/// 读数按「这一格处在哪个状态」归属时用的标签键。
+pub const LABEL_STATE: &str = "state";
+
 /// 读数带上「为什么是这个值」时用的标签键。
 pub const LABEL_REASON: &str = "reason";
 

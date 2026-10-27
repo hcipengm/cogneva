@@ -568,7 +568,7 @@ async fn publish_removals(
     deployment: Option<&str>,
 ) {
     for (table, removed) in outcome.per_table() {
-        let mut labels = HashMap::from([("table".to_string(), table.to_string())]);
+        let mut labels = HashMap::from([(crate::LABEL_TABLE.to_string(), table.to_string())]);
         if let Some(deployment) = deployment {
             labels.insert(DEPLOYMENT_LABEL.to_string(), deployment.to_string());
         }

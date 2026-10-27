@@ -26,17 +26,23 @@
 //!    另一件事，强行共用会把两族不相干的读数焊在一起。这条不留「没人声明过就
 //!    不管」的口子：裸拼本身就是第二个拼法，第一个是它下一次被写进另一个文件
 //!    的时候；
-//! 3. 普查本身要有下限：读得太少、「没有矛盾」就是个空承诺。
+//! 3. 同一批词若被逐字写进 `HashMap::from([...])` / `BTreeMap::from([...])` 的
+//!    **键**位，也是第二个拼法，照报。这里只认已经声明成常量的词：HTTP 头、JSON
+//!    字段名、SQL 列名走的是同一个形状，它们是另一套词汇，门不替它们立规矩；
+//! 4. 普查本身要有下限：读得太少、「没有矛盾」就是个空承诺。
 //!
 //! 判不了什么：
 //!
 //! - 标签名与它被用在哪个指标上对不对。把 `outcome` 记到 `state` 那一格，
 //!   本门看不出来；
-//! - 标签键拼进 map 构造器的元组里（`HashMap::from([("outcome", …)])`、
-//!   `slots.push(("outcome", …))`）、`.cell("outcome", …)` 这类测试辅助。实测把
-//!   这些形状也算进来，会连 SQL 列名（`row.try_get("outcome")`）与 serde 字段名
-//!   一起判成红，而它们确实是另一套词汇。树上这几处仍按字面量手工改掉了，只是
-//!   本门看不见；
+//! - 标签键拼进别的元组形状里（`slots.push(("outcome", …))`）、`.cell("outcome",
+//!   …)` 这类测试辅助。实测把「任意元组」都算进来，会连 SQL 列名
+//!   （`row.try_get("outcome")`）与 serde 字段名一起判成红，而它们确实是另一套
+//!   词汇。**map 构造器的键**例外，已经判了：`HashMap::from([("outcome", …)])` /
+//!   `BTreeMap::from([...])` 里键位上是本树已声明的词就报——判据是「这个词有名字」，
+//!   没声明过的字符串在那个位置上太常见（HTTP 头、JSON 字段名），不判。这个补丁
+//!   是树上真有一处漏网才写的：`cog-agent/src/archive.rs` 的 `tool_labels` 写端
+//!   还是 `"tool"`，读端两处已经引用 `LABEL_TOOL`；
 //! - 读侧写成 `self.base_labels.get("job")` 这种非 `labels.` 接收者的字面量键。
 //!   同一个文件里写侧引用常量、读侧拼字面量时，两处读的是同一个键，改名不会
 //!   出错，所以本门不管；但这也是「同一个词两种写法」，靠就地改齐（实测 16 个
@@ -228,9 +234,9 @@ fn sources(root: &Path) -> Vec<PathBuf> {
 /// 再拼一遍的时候——那时两处版本各写各的、改一处不会有任何报错，读数面读到的是
 /// 一族空向量。声明的粒度也不要求全树共用一份：每个写它的 crate 各自声明即可，
 /// 同一拼写在别处完全可能是另一件事，强行共用会把两族不相干的读数焊在一起。
-
-/// 标签**键**位置上的调用。字面量紧跟在它们后面（中间允许换行与缩进），就是
-/// 在标签位上把词拼了一遍，而不是引用声明。
+///
+/// 下面这四个是「标签**键**位置上的调用」——字面量紧跟在它们后面（中间允许换行
+/// 与缩进），就是在标签位上把词拼了一遍，而不是引用声明。
 const LABEL_KEY_MARKERS: [&str; 4] = [
     "with_label(",
     "labels.insert(",
@@ -271,6 +277,72 @@ fn inline_label_sites(text: &str) -> Vec<(usize, String)> {
         let site = (line, word.to_string());
         if !out.contains(&site) {
             out.push(site);
+        }
+    }
+    out
+}
+
+/// 一个文件里，被逐字写成 `HashMap::from([...])` / `BTreeMap::from([...])` 条目
+/// 键的词，连同它在文件里的行号。
+///
+/// 这一扫补的是 [`inline_label_sites`] 判不了的那个形状：标签集是在 map 构造器的
+/// 元组里逐条拼出来的（`HashMap::from([("tool".to_string(), tool.to_string())])`）。
+/// 它长得和 HTTP 头、JSON 字段名、SQL 列名一样，所以这里**只认已经在本树里声明成
+/// 常量的词**——没声明过的词照旧归读者判断，但只要是某处 `LABEL_*` 的取值，它在
+/// map 里裸写就是第二个拼法：读回端按常量取键，写端按字面量放键，改常量不会有
+/// 任何报错，读数面读到的是一族空向量。实测这一形状在树上真有一处
+/// （`cog-agent/src/archive.rs` 的 `tool_labels`，读端已经改成 `LABEL_TOOL` 而写端
+/// 还是字面量），是本门在此之前漏掉的。
+///
+/// 只看每条目的**键**（元组的第一个位置），值里出现的字符串不算；字符串字面量
+/// 整体跳过，所以值里带括号不会把层数算错。
+fn map_literal_keys(text: &str) -> Vec<(usize, String)> {
+    let production = production_text(text);
+    let numbers = production_line_numbers(text);
+    let bytes = production.as_bytes();
+    let mut out = Vec::new();
+    for marker in ["HashMap::from([", "BTreeMap::from(["] {
+        for (start, _) in production.match_indices(marker) {
+            // `([` 之后就是第一条目所在的层数。
+            let mut depth = 2i32;
+            let mut expecting_key = false;
+            let mut i = start + marker.len();
+            while i < bytes.len() {
+                match bytes[i] as char {
+                    '"' => {
+                        let Some(end) = production[i + 1..].find('"') else {
+                            break;
+                        };
+                        if expecting_key {
+                            let word = production[i + 1..i + 1 + end].to_string();
+                            let index = production[..i].matches('\n').count();
+                            let line = numbers.get(index).copied().unwrap_or(index + 1);
+                            let site = (line, word);
+                            if !out.contains(&site) {
+                                out.push(site);
+                            }
+                        }
+                        expecting_key = false;
+                        i += end + 2;
+                        continue;
+                    }
+                    '(' => {
+                        // 元组在构造器这一层打开：下一个非空字符若是字符串，它就是键。
+                        expecting_key = depth == 2;
+                        depth += 1;
+                    }
+                    ')' => depth -= 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth < 2 {
+                            break;
+                        }
+                    }
+                    c if !c.is_whitespace() => expecting_key = false,
+                    _ => {}
+                }
+                i += 1;
+            }
         }
     }
     out
@@ -388,6 +460,23 @@ fn contradictions(root: &Path) -> Vec<String> {
             complaints.push(format!(
                 "  `{where_}` 第 {line} 行把 `\"{word}\"` 直接写在标签位上。{declared}：\
                  两处各自拼一遍，改一处不会有任何报错，而读数面读到的是一族空向量"
+            ));
+        }
+    }
+
+    // 标签集在 map 构造器里逐条拼出来的形状：键位上是已经声明过的词，就是第二个
+    // 拼法。只认声明过的词——没声明过的字符串在同一个位置上太常见（HTTP 头、
+    // JSON 字段名），一律判红的话这条判据会被正当用法淹没。
+    for (where_, raw) in &files {
+        for (line, word) in map_literal_keys(raw) {
+            let Some(krates) = crates_of_word.get(&word) else {
+                continue;
+            };
+            complaints.push(format!(
+                "  `{where_}` 第 {line} 行在 map 构造器里把 `\"{word}\"` 直接写成键。\
+                 这个词已经声明成常量（{}）：读回端按常量取键、写端按字面量放键，\
+                 改声明不会有任何报错，读数面读到的是一族空向量",
+                krates.iter().cloned().collect::<Vec<_>>().join("、")
             ));
         }
     }
@@ -545,6 +634,41 @@ fn a_literal_label_key_is_reported_even_when_nothing_declares_it() {
             .any(|c| c.contains("\"intent\"") && c.contains("crates/three/src/c.rs")),
         "{complaints:?}"
     );
+}
+
+/// 标签集在 map 构造器里逐条拼出来的形状，`with_label` 一族看不见；这里按键位
+/// 上的词判，只要它已经在本树里声明成常量就报。
+#[test]
+fn a_declared_word_spelled_as_a_map_key_is_reported() {
+    let complaints = fixture_complaints(&[
+        (ONE, "pub const LABEL_TOOL: &str = \"tool\";\n"),
+        (
+            "crates/three/src/c.rs",
+            "pub fn labels(tool: &str) -> Map {\n    \
+             HashMap::from([(\"tool\".to_string(), tool.to_string())])\n}\n",
+        ),
+    ]);
+    assert!(
+        complaints
+            .iter()
+            .any(|c| c.contains("\"tool\"") && c.contains("crates/three/src/c.rs")),
+        "{complaints:?}"
+    );
+}
+
+/// 同一个位置上没声明过的词不判：HTTP 头、JSON 字段名都从这个形状里过，一律判红
+/// 的话这条判据会被正当用法淹没。
+#[test]
+fn an_undeclared_word_as_a_map_key_is_not_policed() {
+    let complaints = fixture_complaints(&[
+        (ONE, "pub const LABEL_TOOL: &str = \"tool\";\n"),
+        (
+            "crates/three/src/c.rs",
+            "pub fn headers() -> Map {\n    \
+             HashMap::from([(\"Retry-After\".to_string(), \"45\".to_string())])\n}\n",
+        ),
+    ]);
+    assert_eq!(complaints, Vec::<String>::new());
 }
 
 /// 同一个词的两种命名顺序归一族：只比「同名」的话，`LABEL_OUTCOME` 与

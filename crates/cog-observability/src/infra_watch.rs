@@ -1106,8 +1106,11 @@ fn eval_failure_labels(
 ) -> HashMap<String, String> {
     let mut labels = HashMap::from([
         ("watched_rule".to_string(), rule_name.to_string()),
-        ("message".to_string(), message.to_string()),
-        ("source".to_string(), "infra_watch".to_string()),
+        (crate::LABEL_MESSAGE.to_string(), message.to_string()),
+        (
+            crate::alerts::LABEL_SOURCE.to_string(),
+            "infra_watch".to_string(),
+        ),
     ]);
     // The rule that could not be evaluated is watched by the same face that
     // would act on it firing: to that face the two are one thing -- a reading it
@@ -1241,7 +1244,8 @@ async fn resolve_from(key: &str, outlets: &InfraWatchOutlets, source: &str) -> b
         match store.set_alert(false, &alert).await {
             Ok(AlertTransition::Resolved) => {
                 info!(key = %key, "infra alert resolved");
-                let labels = HashMap::from([("source".to_string(), source.to_string())]);
+                let labels =
+                    HashMap::from([(crate::alerts::LABEL_SOURCE.to_string(), source.to_string())]);
                 let inst = AlertInstance {
                     rule_name: alert.rule.clone(),
                     labels,

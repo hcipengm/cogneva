@@ -4234,8 +4234,14 @@ async fn publish_dispatch_verdict(
         for pool in PoolReading::ALL {
             let holds = decision == state.decision && pool == state.pool;
             let mut labels = HashMap::new();
-            labels.insert("decision".to_string(), decision.as_str().to_string());
-            labels.insert("pool_reading".to_string(), pool.as_str().to_string());
+            labels.insert(
+                crate::LABEL_DECISION.to_string(),
+                decision.as_str().to_string(),
+            );
+            labels.insert(
+                crate::LABEL_POOL_READING.to_string(),
+                pool.as_str().to_string(),
+            );
             if let Err(e) = metrics
                 .record_gauge(
                     metric_names::CHANGE_DISPATCH_VERDICT,
@@ -4689,7 +4695,7 @@ async fn publish_face_reading(
     value: f64,
 ) -> SFResult<()> {
     let mut labels = HashMap::new();
-    labels.insert("block".to_string(), block.as_str().to_string());
+    labels.insert(crate::LABEL_BLOCK.to_string(), block.as_str().to_string());
     labels.insert(crate::LABEL_READING.to_string(), reading.to_string());
     metrics
         .record_gauge(metric_names::CHANGE_BLOCK_CENSUS, value, labels)
@@ -9512,12 +9518,12 @@ mod tests {
         for sample in &samples {
             let decision = sample
                 .labels
-                .get("decision")
+                .get(crate::LABEL_DECISION)
                 .expect("every cell names its decision")
                 .clone();
             let pool = sample
                 .labels
-                .get("pool_reading")
+                .get(crate::LABEL_POOL_READING)
                 .expect("every cell names its pool reading")
                 .clone();
             assert!(

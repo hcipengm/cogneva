@@ -86,8 +86,8 @@ pub async fn record_handoff(
     };
     for (stage, count) in [("taken", taken), ("attempted", attempted)] {
         let labels = HashMap::from([
-            ("consumer".to_string(), consumer.to_string()),
-            ("stage".to_string(), stage.to_string()),
+            (crate::LABEL_CONSUMER.to_string(), consumer.to_string()),
+            (crate::LABEL_STAGE.to_string(), stage.to_string()),
         ]);
         if let Err(e) = backend
             .record_counter(
