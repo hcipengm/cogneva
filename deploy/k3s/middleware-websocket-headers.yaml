@@ -1,5 +1,5 @@
 # Middleware — traefik 的请求/响应头改写，由 ingress.yaml 按名字引用
-# （`cogneva-websocket-headers@kubernetescrd`）。
+# （`websocket-headers@kubernetescrd`）。
 #
 # 只对 traefik 输出：nginx ingress 原生支持 WebSocket Upgrade，不需要这一层。
 # 目标集群没有 traefik CRD 时这条 apply 会报错，这是有意的——静默跳过会让引用它的

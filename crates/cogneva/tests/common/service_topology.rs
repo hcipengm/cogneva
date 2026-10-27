@@ -398,6 +398,106 @@ pub fn selector_matches(
         .all(|(key, value)| labels.get(key) == Some(value))
 }
 
+/// 一个 NetworkPolicy 的 subject 选择器：这份策略管哪些 Pod。
+pub struct NetworkPolicySubject {
+    pub manifest: String,
+    pub name: String,
+    pub namespace: String,
+    /// `matchLabels` 读成全等对；`matchExpressions` 这里不解释，只用
+    /// `uses_expressions` 说明「这个选择器读不全」。
+    pub selector: BTreeMap<String, String>,
+    pub uses_expressions: bool,
+}
+
+/// 这些树里每份 NetworkPolicy 的 subject。只读 subject：对端选择器与端口由
+/// `deploy/scripts/check-control-plane-reachability.sh` 判（它读的是同一个面，
+/// 而且要在两棵交付树上各判一遍）。
+pub fn network_policies(root: &Path) -> Vec<NetworkPolicySubject> {
+    let mut out = Vec::new();
+    for (manifest, value) in documents(root) {
+        if text_at(&value, "kind") != Some("NetworkPolicy") {
+            continue;
+        }
+        let Some(selector) = value
+            .get("spec")
+            .and_then(|s| s.get("podSelector"))
+            .and_then(|s| s.as_mapping())
+        else {
+            continue;
+        };
+        let selector: BTreeMap<String, String> = selector
+            .get("matchLabels")
+            .and_then(|m| m.as_mapping())
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        Some((
+                            key.as_str()?.to_string(),
+                            value.as_str().unwrap_or_default().to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let uses_expressions = value
+            .get("spec")
+            .and_then(|s| s.get("podSelector"))
+            .and_then(|s| s.get("matchExpressions"))
+            .and_then(|e| e.as_sequence())
+            .is_some_and(|list| !list.is_empty());
+        out.push(NetworkPolicySubject {
+            manifest,
+            name: scalar_at(&value, &["metadata", "name"]),
+            namespace: scalar_at(&value, &["metadata", "namespace"]),
+            selector,
+            uses_expressions,
+        });
+    }
+    out
+}
+
+/// 一份清单文档里的 Pod 模板：工作负载、Job 与 CronJob 都算。策略与选择器选中的
+/// 是「一组 Pod」，不是「一组 Deployment」——只看 Deployment 会让定时任务的 Pod
+/// 在读选择器的那一侧不存在。
+pub fn pod_template_of(value: &serde_yaml::Value) -> Option<&serde_yaml::Value> {
+    let spec = value.get("spec")?;
+    match text_at(value, "kind").unwrap_or_default() {
+        "Deployment" | "StatefulSet" | "DaemonSet" | "Job" => spec.get("template"),
+        "CronJob" => spec.get("jobTemplate")?.get("spec")?.get("template"),
+        _ => None,
+    }
+}
+
+/// 这棵树里每个 Pod 模板带的标签，连同它落在哪个命名空间。选择器命不命中，只能对着
+/// 这一份名单说——而选择器只在同一个命名空间里比，所以命名空间要跟着一起读出来。
+pub fn pod_labels(root: &Path) -> Vec<(String, BTreeMap<String, String>)> {
+    let mut out = Vec::new();
+    for (_, value) in documents(root) {
+        let Some(template) = pod_template_of(&value) else {
+            continue;
+        };
+        let labels = template
+            .get("metadata")
+            .and_then(|m| m.get("labels"))
+            .and_then(|l| l.as_mapping())
+            .map(|labels| {
+                labels
+                    .iter()
+                    .filter_map(|(key, value)| {
+                        Some((
+                            key.as_str()?.to_string(),
+                            value.as_str().unwrap_or_default().to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push((scalar_at(&value, &["metadata", "namespace"]), labels));
+    }
+    out
+}
+
 /// 本项目镜像的仓库名（不含 tag），取自 chart values。
 pub fn our_image(root: &Path) -> Option<String> {
     let text = std::fs::read_to_string(root.join(CHART_VALUES)).ok()?;

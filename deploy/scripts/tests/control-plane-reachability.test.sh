@@ -20,7 +20,21 @@
 #   8. rendered 目录为空 -> 2（判不了，不是 0）；
 #   9. **交付树**（`deploy/k3s`）里的 Service selector 改到没人带的标签 -> 红，判词
 #      点名的是交付树那条路径（两条路径各自被判，一条绿不掩盖另一条）；
-#   10. `kustomization.yaml` 列了一个不存在的文件 -> 2（读不出交付对象集，不是全过）。
+#   10. `kustomization.yaml` 列了一个不存在的文件 -> 2（读不出交付对象集，不是全过）；
+#   11. NetworkPolicy 的同命名空间对端选不中任何工作负载 -> 红，点名那条放行；
+#   12. 跨命名空间对端按名字指了一个 deploy/ 没声明过的 namespace -> 红，点名那个名字；
+#   13. 出站放行端口拼错（没有 Pod 声明、配置里也没拼过） -> 红，点名端口；
+#   14. 入站放行端口拼错（端口落在被选中的 Pod 上，与来源无关） -> 红；
+#   15. 整条策略一个 Pod 都不管（subject 与同命名空间对端一起选不中） -> 红；
+#   16. 3306 这条放行只有配置里的 endpoint 端口保着：改掉配置 -> 红（证明那个第二来源
+#       真的在判，不是摆设）；
+#   17. 定时任务的 Pod 模板也在判（以前 Job/CronJob 的 Pod 一条都不判）；
+#   18. 写了某方向的规则而 policyTypes 里没有那个方向 -> 红（规则一条都不生效）；
+#   19. Pod 的 serviceAccountName 在树里没声明 -> 红（Pod 会拿到 default 身份）；
+#   20. RoleBinding 的 roleRef 指向不存在的角色 -> 红（授予落在空集上）；
+#   21. 绑定的主体是一个没人拥有的 ServiceAccount -> 红；
+#   22. Ingress 注解里的中间件名在树里没有同名对象 -> 红（traefik 只是不套这层中间件）；
+#   23. 中间件注解少了 provider 后缀 -> 红（这条引用同样不生效）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -162,4 +176,118 @@ set -e
 printf '%s' "${out}" | grep -Fq "判不了" || fail "kustomization-ghost: 输出里没有「判不了」；输出：${out}"
 echo "ok   kustomization-ghost：交付对象集读不出来时退出码 2（不是 0）"
 
-echo "control-plane-reachability.test.sh: 10 用例全过"
+# 11. NetworkPolicy 的同命名空间对端选不中任何 Pod。
+expect_red "peer-selector-miss" "egress 目的对端 podSelector" '
+def mutate(d):
+    d["spec"]["egress"][0]["to"][0]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] = "security-gatewy"
+edit("50-networkpolicy-cogneva-evolution-deny-egress.yaml", mutate)
+'
+
+# 12. 跨命名空间对端按名字指了一个不存在的 namespace。
+expect_red "namespace-name-miss" "按名字指 namespace 'monitering'" '
+def mutate(d):
+    for rule in d["spec"]["egress"]:
+        for peer in rule.get("to") or []:
+            ns = (peer.get("namespaceSelector") or {}).get("matchLabels") or {}
+            if "kubernetes.io/metadata.name" in ns:
+                ns["kubernetes.io/metadata.name"] = "monitering"
+edit("50-networkpolicy-cogneva-evolution-deny-egress.yaml", mutate)
+'
+
+# 13. 出站放行端口拼错：没有 Pod 声明过它，配置里也没有 endpoint 用它。
+expect_red "egress-port-miss" "放行端口 6739" '
+def mutate(d):
+    for rule in d["spec"]["egress"]:
+        for port in rule.get("ports") or []:
+            if port.get("port") == 6379:
+                port["port"] = 6739
+edit("50-networkpolicy-cogneva-evolution-deny-egress.yaml", mutate)
+'
+
+# 14. 入站放行端口拼错：端口落在被策略选中的 Pod 上，与来源无关，照样判。
+expect_red "ingress-port-miss" "放行端口 8086" '
+def mutate(d):
+    d["spec"]["ingress"][1]["ports"][0]["port"] = 8086
+edit("50-networkpolicy-cogneva-internal-ingress.yaml", mutate)
+'
+
+# 15. 整条策略一个 Pod 都不管：subject 与所有同命名空间对端一起选不中。
+expect_red "dead-policy" "这份策略谁都不管" '
+def mutate(d):
+    d["spec"]["podSelector"]["matchLabels"]["app.kubernetes.io/component"] = "gatewy"
+    for rule in d["spec"]["ingress"]:
+        for peer in rule.get("from") or []:
+            labels = (peer.get("podSelector") or {}).get("matchLabels") or {}
+            if "app.kubernetes.io/component" in labels:
+                labels["app.kubernetes.io/component"] = "gatewy"
+            if labels.get("app.kubernetes.io/name") == "cogneva":
+                labels["app.kubernetes.io/name"] = "cogneva-typo"
+edit("50-networkpolicy-cogneva-internal-ingress.yaml", mutate)
+'
+
+# 16. 3306 这条放行今天只有配置保着：把 `providers.db.options.port` 改掉，它就得红。
+expect_red "config-endpoint-gone" "放行端口 3306" '
+def mutate(d):
+    d["data"] = {k: v.replace("\"port\": 3306", "\"port\": 3307")
+                  for k, v in (d.get("data") or {}).items()}
+edit("10-configmap-cogneva-json.yaml", mutate)
+'
+
+# 17. 定时任务的 Pod 模板也吃第 3～5 族（以前 Job/CronJob 的 Pod 一条都不判）。
+expect_red "cronjob-template-judged" "CronJob cogneva-backup 的容器 backup" '
+def mutate(d):
+    container = d["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    container.setdefault("envFrom", []).append({"configMapRef": {"name": "no-such-cm"}})
+edit("90-cronjob-cogneva-backup.yaml", mutate)
+'
+
+# 18. 写了某个方向的规则，policyTypes 里却没有那个方向：规则一条都不生效。
+expect_red "policy-type-omits-rules" "policyTypes 里却没有 Egress" '
+def mutate(d):
+    d["spec"]["policyTypes"] = ["Ingress"]
+edit("50-networkpolicy-cogneva-security-gateway.yaml", mutate)
+'
+
+# 19. Pod 指名的工作负载身份在树里没有声明：Pod 会拿到 default 身份。
+expect_red "service-account-miss" "serviceAccountName 'cogneva-typo'" '
+def mutate(d):
+    d["spec"]["template"]["spec"]["serviceAccountName"] = "cogneva-typo"
+edit("41-deployment-cogneva.yaml", mutate)
+'
+
+# 20. RoleBinding 的 roleRef 指向不存在的角色：绑定照建，授予的东西落在空集上。
+expect_red "role-ref-miss" "roleRef 指向 Role 'cogneva-evolution-typo'" '
+def mutate(d):
+    d["roleRef"]["name"] = "cogneva-evolution-typo"
+edit("17-rolebinding-cogneva-evolution.yaml", mutate)
+'
+
+# 21. 绑定的主体是一个没人拥有的身份。
+expect_red "binding-subject-miss" "主体 ServiceAccount 'cogneva-evolution-typo'" '
+def mutate(d):
+    d["subjects"][0]["name"] = "cogneva-evolution-typo"
+edit("17-rolebinding-cogneva-evolution.yaml", mutate)
+'
+
+# 22. Ingress 注解按名字引用的 Middleware 在树里没有同名对象：注解是字符串、对象是
+#     另一份清单，指不到时 traefik 不报错、只是不套这层中间件。
+expect_red "middleware-name-miss" "里没有这个 Middleware" '
+def mutate(d):
+    if d.get("kind") != "Ingress":
+        return
+    d["metadata"]["annotations"]["traefik.ingress.kubernetes.io/router.middlewares"] = \
+        "websocket-headers-typo@kubernetescrd"
+edit("60-ingress-cogneva.yaml", mutate)
+'
+
+# 23. 中间件注解少了 provider 后缀：traefik 解析不出 provider，这条引用同样不生效。
+expect_red "middleware-no-provider" "没有 provider 后缀" '
+def mutate(d):
+    if d.get("kind") != "Ingress":
+        return
+    d["metadata"]["annotations"]["traefik.ingress.kubernetes.io/router.middlewares"] = \
+        "websocket-headers"
+edit("60-ingress-cogneva.yaml", mutate)
+'
+
+echo "control-plane-reachability.test.sh: 23 用例全过"

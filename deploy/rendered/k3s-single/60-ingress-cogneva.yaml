@@ -15,7 +15,7 @@ metadata:
     app.kubernetes.io/component: gateway
   annotations:
     traefik.ingress.kubernetes.io/router.entrypoints: web
-    traefik.ingress.kubernetes.io/router.middlewares: "cogneva-websocket-headers@kubernetescrd"
+    traefik.ingress.kubernetes.io/router.middlewares: "websocket-headers@kubernetescrd"
 spec:
   ingressClassName: traefik
   rules:

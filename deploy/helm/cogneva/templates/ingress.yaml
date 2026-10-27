@@ -1,4 +1,8 @@
 {{- if .Values.ingress.enabled }}
+{{- /* WebSocket 中间件的名字只在这里写一遍：注解里的 `<name>@kubernetescrd` 与下面
+       Middleware 对象的 metadata.name 是同一个名字，分两处写就会漂——注解指不到时
+       traefik 不会让 Ingress 失败，它只是不套这层中间件，响应头悄悄消失。 */}}
+{{- $middleware := "websocket-headers" }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -10,7 +14,7 @@ metadata:
   annotations:
   {{- if eq .Values.ingress.className "traefik" }}
     traefik.ingress.kubernetes.io/router.entrypoints: web
-    traefik.ingress.kubernetes.io/router.middlewares: "{{ include "cogneva.namespace" . }}-websocket-headers@kubernetescrd"
+    traefik.ingress.kubernetes.io/router.middlewares: "{{ $middleware }}@kubernetescrd"
   {{- else }}
     # nginx 原生支持 WebSocket Upgrade，加长读写超时避免长连接被掐断
     nginx.ingress.kubernetes.io/proxy-read-timeout: {{ .Values.ingress.proxyTimeoutSecs | int | quote }}
@@ -42,7 +46,7 @@ spec:
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
-  name: websocket-headers
+  name: {{ $middleware }}
   namespace: {{ include "cogneva.namespace" . }}
 spec:
   headers:
