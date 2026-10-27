@@ -1091,6 +1091,34 @@ fn eval_failure_text(rule_name: &str, streak: u32, error: &str) -> String {
     format!("infra watch rule \"{rule_name}\" query failed {streak} times in a row: {error}")
 }
 
+/// The labels an eval-failure row and its notification are both built from.
+///
+/// One helper because the two must be the same row: the sighting writes the
+/// alert instance a reader selects by `watched_rule`, and the notification is
+/// what a person receives about that same instance. Built separately, a rename
+/// on one side leaves the notification describing a rule no stored row carries
+/// -- and a selector matching nothing reads the same as "this rule never
+/// failed".
+fn eval_failure_labels(
+    rule_name: &str,
+    message: &str,
+    face: Option<&str>,
+) -> HashMap<String, String> {
+    let mut labels = HashMap::from([
+        ("watched_rule".to_string(), rule_name.to_string()),
+        ("message".to_string(), message.to_string()),
+        ("source".to_string(), "infra_watch".to_string()),
+    ]);
+    // The rule that could not be evaluated is watched by the same face that
+    // would act on it firing: to that face the two are one thing -- a reading it
+    // owns is not being produced -- and a self-alert nobody owns is the very
+    // failure this row reports.
+    if let Some(face) = face.filter(|f| !f.is_empty()) {
+        labels.insert(ALERT_FACE_LABEL.to_string(), face.to_string());
+    }
+    labels
+}
+
 /// Raise the watcher's self-alert for a rule whose query keeps failing. Goes
 /// through the same persistent state machine as infrastructure alerts so the
 /// observation gap becomes a signal self-discovery can consume.
@@ -1109,18 +1137,7 @@ async fn sight_eval_failure(
 ) {
     let Some(store) = &outlets.store else { return };
     let message = eval_failure_text(rule_name, streak, error);
-    let mut labels = HashMap::from([
-        ("watched_rule".to_string(), rule_name.to_string()),
-        ("message".to_string(), message.clone()),
-        ("source".to_string(), "infra_watch".to_string()),
-    ]);
-    // The rule that could not be evaluated is watched by the same face that
-    // would act on it firing: to that face the two are one thing -- a reading it
-    // owns is not being produced -- and a self-alert nobody owns is the very
-    // failure this row reports.
-    if let Some(face) = face.filter(|f| !f.is_empty()) {
-        labels.insert(ALERT_FACE_LABEL.to_string(), face.to_string());
-    }
+    let labels = eval_failure_labels(rule_name, &message, face);
     let alert = NewAlert {
         rule: EVAL_FAILURE_RULE.to_string(),
         dedup_key: key.to_string(),
@@ -1148,14 +1165,7 @@ async fn notify_eval_failure(
     outlets: &InfraWatchOutlets,
 ) {
     let message = eval_failure_text(rule_name, streak, error);
-    let mut labels = HashMap::from([
-        ("watched_rule".to_string(), rule_name.to_string()),
-        ("message".to_string(), message),
-        ("source".to_string(), "infra_watch".to_string()),
-    ]);
-    if let Some(face) = face.filter(|f| !f.is_empty()) {
-        labels.insert(ALERT_FACE_LABEL.to_string(), face.to_string());
-    }
+    let labels = eval_failure_labels(rule_name, &message, face);
     let now = Utc::now();
     let inst = AlertInstance {
         rule_name: EVAL_FAILURE_RULE.to_string(),
