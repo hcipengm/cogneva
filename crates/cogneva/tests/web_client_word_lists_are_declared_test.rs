@@ -152,6 +152,40 @@ fn the_git_identity_states_the_panel_knows_are_the_ones_the_gateway_reports() {
     );
 }
 
+/// 项目行上的 `kind` 同理：面板按它决定这一行能不能点进任务图，所以它是响应的
+/// 意思的一部分，不是标签。服务端多一个词，那一行就点不进去；少一个词，面板指着
+/// 一个永远不会到来的种类留着一支死分支。
+#[test]
+fn the_project_kinds_the_panel_knows_are_the_ones_the_gateway_reports() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    // `kind:` also names unions in other interfaces, so the field is read
+    // inside `ProjectRow`'s own body rather than by the first match in the file.
+    let body_start = source
+        .find("export interface ProjectRow {")
+        .expect("the project row type is gone; this gate reads its kind through it");
+    let body = &source[body_start..];
+    let body_end = body.find("\n}").expect("the interface body is not closed");
+    let mut panel = union_words(&body[..body_end], "  kind:");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "the project kind union was read as {panel:?}; that is too short to be a parse of it"
+    );
+
+    let mut declared: Vec<String> = cog_gateway::projects::ProjectKind::ALL
+        .iter()
+        .map(|kind| kind.as_str().to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(
+        panel, declared,
+        "the panel and the gateway must know the same project kinds"
+    );
+}
+
 /// 对照：本门的判据认得出一个不是词的东西。少了这条，`TaskFilter::parse` 哪天
 /// 退化成「什么词都收」，上面那条仍然全绿。
 #[test]

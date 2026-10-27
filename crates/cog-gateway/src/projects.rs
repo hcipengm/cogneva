@@ -30,6 +30,50 @@ use crate::GatewayState;
 /// 把无归属的任务悄悄排除，全部项目加起来会小于总数，而那个差没有任何地方会说。
 pub const UNGROUPED: &str = cog_core::UNGROUPED_PROJECT;
 
+/// What a row of the project listing is.
+///
+/// The panel prints one of these words and decides from it whether the row
+/// opens a task graph, so the word is part of the response's meaning rather
+/// than a label: a row called something the client does not know draws with no
+/// way into its tasks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectKind {
+    /// A goal root: the id is the submission's `message_id`.
+    Goal,
+    /// The named bucket for tasks submitted outside any goal.
+    Ungrouped,
+}
+
+impl ProjectKind {
+    /// Every kind, so a gate or a client can cover the set.
+    pub const ALL: [ProjectKind; 2] = [ProjectKind::Goal, ProjectKind::Ungrouped];
+
+    /// The word this response carries.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProjectKind::Goal => "goal",
+            ProjectKind::Ungrouped => UNGROUPED,
+        }
+    }
+
+    /// Read a kind back from its word.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.as_str() == word)
+    }
+
+    /// Which kind a project id stands for.
+    ///
+    /// The bucket's name is [`UNGROUPED`], the same constant the id is built
+    /// from -- a second literal here would be a second thing to rename.
+    pub fn of(id: &str) -> Self {
+        if id == UNGROUPED {
+            ProjectKind::Ungrouped
+        } else {
+            ProjectKind::Goal
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Source {
     /// 读的载体。项目面没有自己的表，读的是任务图。
@@ -437,7 +481,7 @@ fn build_project_rows(
             }
             ProjectRow {
                 id: id.clone(),
-                kind: if id == UNGROUPED { "ungrouped" } else { "goal" },
+                kind: ProjectKind::of(id).as_str(),
                 tasks: rows.len(),
                 executables: rows.iter().filter(|t| t.is_executable).count(),
                 by_status: status_counts(rows),
