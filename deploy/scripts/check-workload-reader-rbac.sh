@@ -23,8 +23,10 @@
 #    形状——它只认 `/…/namespaces/{namespace}/…`，而集群范围的读根本不长这样。
 #
 # 判据：`crates/cog-gateway/src/cluster.rs` 里每一条 apiserver 路径的 (作用域, group,
-# resource, 动词)，在两个投递路径的读权限里都满足：
-#   1. `deploy/rendered/k3s-single/`（chart 渲染产物，helm 安装的那套集群读它）；
+# resource, 动词)，在**每一条**投递路径的读权限里都满足：
+#   1. `deploy/rendered/<profile>/`（chart 渲染产物，helm 安装的那套集群读它）——profile
+#      的集合从目录读，不在这里写名单：写死一份名单，新增的那一个 profile 的 RBAC 就
+#      安静地不判，而「它缺权限」与「它本来就不在这条判据里」在判词上一样；
 #   2. `deploy/k3s/`（静态清单，集群内 GitOps 拉取端 apply 它）。
 #
 # 作用域决定谁能满足它：
@@ -58,10 +60,16 @@ SERVER = os.path.join(ROOT, "crates/cog-gateway/src/cluster.rs")
 ROLE = "cogneva-topology-reader"
 # 命名空间里的那几个 Role 都可能替拓扑面授权（拉取端与它自己的那条）。
 NAMESPACED_ROLES = {"cogneva-topology-reader", "cogneva-gitops-puller"}
-CARRIERS = [
-    "deploy/rendered/k3s-single",
-    "deploy/k3s",
-]
+RENDERED = os.path.join(ROOT, "deploy/rendered")
+RENDERED_TREES = sorted(
+    name for name in os.listdir(RENDERED) if os.path.isdir(os.path.join(RENDERED, name))
+) if os.path.isdir(RENDERED) else []
+CARRIERS = [f"deploy/rendered/{name}" for name in RENDERED_TREES] + ["deploy/k3s"]
+if not RENDERED_TREES:
+    sys.exit(
+        "读不到 deploy/rendered/ 下任何一个 profile 目录——判不了每条投递路径的读权限，"
+        "这不等于全过"
+    )
 
 if not os.path.isfile(SERVER):
     sys.exit(f"读不到 {os.path.relpath(SERVER, ROOT)}——这一面要问哪几条路径无从知道")
@@ -186,6 +194,7 @@ print(
         f"({','.join(sorted(verbs))})"
         for (scope, group, resource), verbs in sorted(wanted.items())
     )
-    + " 在两个投递路径上都授了"
+    + " 在每一条投递路径上都授了（读了 %d 个：%s）"
+    % (len(CARRIERS), "、".join(CARRIERS))
 )
 PYEOF

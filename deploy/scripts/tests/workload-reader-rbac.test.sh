@@ -6,9 +6,10 @@
 # 坏法，是实测的现场读数（2026-10-27，见下面这条门的注释）。
 #
 # 判据：`crates/cog-gateway/src/cluster.rs` 里每种工作负载问的那条 (group, resource)，
-# 在两个投递路径的 ClusterRole `cogneva-topology-reader` 里都必须带 `list`——
-# 渲染产物（chart）与静态清单（集群内 GitOps 拉取端）各一份，少哪一份都在某一种
-# 安装形态下读不到。
+# 在**每一条**投递路径的 ClusterRole `cogneva-topology-reader` 里都必须带 `list`——
+# 每个 profile 的渲染产物（chart）各一份、静态清单（集群内 GitOps 拉取端）一份，
+# 少哪一份都在某一种安装形态下读不到。投递路径的集合是 `deploy/rendered/` 下的目录，
+# 不是脚本里的一份名单：名单会漏掉新增的那一个 profile。
 #   - 静态清单少授一种    → apply 安装的那套集群上，那一种读不到
 #   - 渲染产物少授一种    → helm 安装的那套集群上，那一种读不到
 #   - 动词从 list 变 get  → 集合级读取被拒（按名读的规则替代不了它）
@@ -187,6 +188,23 @@ PATCH
 done
 bash "${checker}" "${work}" >"${work}/scope-ok.out" 2>&1 \
     || { cat "${work}/scope-ok.out" >&2; fail "规则搬进 ClusterRole：应当绿却红了"; }
+
+# 7. 多出一个 profile 的渲染产物，而它的 ClusterRole 少授一种。判据的投递路径若在
+#    脚本里写死，这个目录根本不会进判据——新拓扑上那一种读不到，判词一个字节都不变。
+fixture
+mkdir -p "${work}/deploy/rendered/k8s-airgap"
+cp "${work}/deploy/rendered/k3s-single/16-clusterrole-cogneva-topology-reader.yaml" \
+  "${work}/deploy/rendered/k8s-airgap/16-clusterrole-cogneva-topology-reader.yaml"
+sed -i 's/"deployments", "statefulsets", "daemonsets"/"deployments", "daemonsets"/' \
+  "${work}/deploy/rendered/k8s-airgap/16-clusterrole-cogneva-topology-reader.yaml"
+confirm "${work}/deploy/rendered/k8s-airgap/16-clusterrole-cogneva-topology-reader.yaml" \
+  '"deployments", "daemonsets"'
+expect_red "新增 profile 少授 StatefulSet" "k8s-airgap"
+
+# 8. 一个 profile 的渲染产物都没有：判不了，不是全过。
+fixture
+rm -rf "${work}/deploy/rendered"
+expect_red "没有渲染产物" "判不了"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
