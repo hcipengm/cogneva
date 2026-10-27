@@ -176,6 +176,12 @@ const SAME_VALUE_DIFFERENT_THING: &[(&str, &str, &str)] = &[
     ),
     (
         "cog-reflection",
+        "release",
+        "读数按「哪个发布」归属时用的标签键与 cargo 的 `release` 目录是两件事：\
+         改一处发布标签的拼写不该让构建去另一个目录找二进制",
+    ),
+    (
+        "cog-reflection",
         "unmeasured",
         "`DIM_UNMEASURED` 是资源维度那一格的取值，`OUTCOME_UNMEASURED` 是读数\
          结局那一格的取值：两族读数各自的「没量过」，谁也不读对方的",
