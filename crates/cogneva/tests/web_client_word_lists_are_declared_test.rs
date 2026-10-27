@@ -10,12 +10,19 @@
 //! identity state union against the gateway's `IdentityState`, the project kinds
 //! against `ProjectKind`, the backend health words against `BackendState` (plus
 //! their colour map), and the cluster verdict against `cog_core::ClusterHealth`.
+//! The board is the same shape three times over: its column names, its column
+//! labels and its move branches are each a copy of `cog_core::TaskStatus`.
 //!
 //! 实测（2026-10-27）：修前 `web/src/views/TasksView.tsx` 的 `ready` 标签把
 //! `status=ready` 发给服务端，而 `TaskStatus` 里没有这个词，标签恒空——表头却
 //! 数着「就绪待领 N」。消融对照两条：把 `running` 改成 `running_now`，本门红并
 //! 点名该文件与该词；把 `IdentityState::Ready` 的词改成 `configured`，《状态词》
 //! 那条红并点名前端联合类型；各自改回即绿。
+//!
+//! 实测（2026-10-27，看板那三条）：把 `BOARD_COLUMNS` 的 `scheduled` 写成
+//! `planned`，列名那条红并列出两组词；删掉 `nextColumns` 的 `case 'failed'`
+//! 分支，挪卡那条红并点名 `failed`——那张卡从此一个按钮都画不出来，而屏幕上
+//! 它与「这张卡没有合法下一列」一模一样。各自改回即绿。
 
 use std::path::PathBuf;
 
@@ -589,6 +596,139 @@ fn the_acceptance_check_rejects_a_word_no_row_carries() {
             Some(state),
             "{} is declared but not readable",
             state.as_str()
+        );
+    }
+}
+
+/// The keys of a `const X: Record<...> = {` table, one per line, up to `};`.
+fn table_keys(source: &str, start: &str) -> Vec<String> {
+    let from = source
+        .find(start)
+        .unwrap_or_else(|| panic!("{start:?} is gone; this gate reads the table through it"))
+        + start.len();
+    let rest = &source[from..];
+    let end = rest.find("\n};").expect("the object literal is not closed");
+    rest[..end]
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let key: String = line
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            (line[key.len()..].trim_start().starts_with(':') && !key.is_empty()).then_some(key)
+        })
+        .collect()
+}
+
+/// 看板那六列就是 `TaskStatus` 的六个拼写，客户端把它们又抄了一遍：列名一份
+/// (`BOARD_COLUMNS`，决定 `moveTask` 把哪个词发给服务端)、列标题一份
+/// (`COLUMN_LABEL`)。两处都没有形状让编译器去比对——多一个词，服务端没有那一
+/// 列，挪卡发出去的是一个它不认识的状态；少一个词，那个状态的卡片落在没有标题
+/// 的一列，画出来与「这一列本来就是空的」一模一样。
+#[test]
+fn the_board_columns_are_the_task_statuses_the_server_stores() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let mut columns = array_words(&source, "export const BOARD_COLUMNS = [");
+    columns.sort();
+    assert!(
+        columns.len() >= 4,
+        "看板列名读出来是 {columns:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    let mut declared: Vec<String> = cog_core::TaskStatus::ALL
+        .iter()
+        .map(|status| status.as_str().to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(
+        columns, declared,
+        "看板的列名与任务状态必须是同一组词：列名就是 `moveTask` 发给服务端的那个词"
+    );
+
+    let board_path = repo_root().join("web/src/projects/projectWrite.tsx");
+    let board = std::fs::read_to_string(&board_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", board_path.display()));
+    let mut labelled = table_keys(&board, "const COLUMN_LABEL: Record<string, string> = {");
+    labelled.sort();
+    assert_eq!(
+        labelled, declared,
+        "列标题表与任务状态必须是同一组词：缺一行时那一列没有中文名，"
+    );
+}
+
+/// 挪卡的准入是同一套词的第三份抄写：`nextColumns` 的 `switch` 按状态给出下一列。
+/// `default: return []` 让「不认识的词」与「终态」长得一样——卡片上一个按钮都不
+/// 画，读作「这张卡不能挪」。所以这里两个方向都问：每个 `case` 词必须是任务状态，
+/// 每个任务状态必须有分支（除了 `NO_NEXT` 里写明理由的两个终态）。
+#[test]
+fn the_board_moves_are_spelled_with_the_task_statuses() {
+    const NO_NEXT: &[(&str, &str)] = &[
+        (
+            "completed",
+            "完成了就没有下一列：再往下要么是一条新任务，要么是重开",
+        ),
+        (
+            "cancelled",
+            "取消了就没有下一列：要复活是新建一条，不是把这张卡挪回去",
+        ),
+    ];
+
+    let board_path = repo_root().join("web/src/projects/projectWrite.tsx");
+    let board = std::fs::read_to_string(&board_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", board_path.display()));
+    let start = board
+        .find("export function nextColumns(")
+        .expect("nextColumns 不在了；本门通过它读挪卡的准入");
+    let body = &board[start..];
+    let end = body.find("\n}\n").expect("nextColumns 的函数体没有闭合");
+    let body = &body[..end];
+
+    let mut arms: Vec<String> = Vec::new();
+    let mut from = 0;
+    while let Some(at) = body[from..].find("case '") {
+        let start = from + at + "case '".len();
+        from = start;
+        let word: String = body[start..].chars().take_while(|c| *c != '\'').collect();
+        arms.push(word);
+    }
+    arms.sort();
+    arms.dedup();
+    assert!(
+        arms.len() >= 3,
+        "nextColumns 只认出 {arms:?} 这几个分支；这么少说明解析变了"
+    );
+
+    let mut declared: Vec<String> = cog_core::TaskStatus::ALL
+        .iter()
+        .map(|status| status.as_str().to_string())
+        .collect();
+    declared.sort();
+
+    for arm in &arms {
+        assert!(
+            declared.contains(arm),
+            "nextColumns 认一个不是任务状态的词 {arm:?}：这条分支永远不会被走到"
+        );
+    }
+    for word in &declared {
+        if NO_NEXT.iter().any(|(terminal, _)| terminal == word) {
+            continue;
+        }
+        assert!(
+            arms.contains(word),
+            "状态 {word:?} 在 nextColumns 里没有分支：这个状态的卡片一个按钮都画不出来，\
+             而「没有合法下一列」与「代码里没写这一支」在屏幕上是同一个样子"
+        );
+    }
+    // 登记的两个词确实还没有下一列：`nextColumns` 对它们只走 default。
+    for (terminal, reason) in NO_NEXT {
+        assert!(
+            !arms.contains(&terminal.to_string()),
+            "{terminal:?} 已经有分支了，这条登记（{reason}）该删掉"
         );
     }
 }
