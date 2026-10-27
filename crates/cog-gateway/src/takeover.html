@@ -1086,11 +1086,22 @@ async function loadMetrics() {
 }
 
 // ── Change table ──
+// The row's status is one of the words `EvolutionStatus` serialises:
+// awaiting_review, compile_error, validation_failed, … Spelling a word
+// differently here matches nothing, and a branch that never fires looks
+// exactly like a status that needs no handling.
+function isAwaitingReview(s) {
+  return (s || '').toLowerCase() === 'awaiting_review';
+}
+
 function statusPillClass(s) {
   const v = (s || '').toLowerCase();
-  if (v === 'awaitingreview') return 'warn';
-  if (v === 'active' || v === 'applied' || v === 'deployed') return 'ok';
-  if (v === 'rejected' || v === 'failed' || v === 'rolledback') return 'err';
+  if (isAwaitingReview(v)) return 'warn';
+  // `unrecorded` is the status saying no record says what became of this
+  // change; it must not read like one nobody thought about.
+  if (v === 'unrecorded') return 'warn';
+  if (v === 'active') return 'ok';
+  if (v === 'rejected' || v === 'validation_failed' || v === 'compile_error') return 'err';
   return '';
 }
 
@@ -1104,7 +1115,7 @@ function actionButtons(p, sizeCls) {
     b.onclick = (e) => { e.stopPropagation(); act(path, label + ' ' + p.id); };
     wrap.appendChild(b);
   };
-  const awaiting = (p.status || '').toLowerCase() === 'awaitingreview';
+  const awaiting = isAwaitingReview(p.status);
   const isPolicy = p.kind === 'policy_update';
   if (awaiting) mk(t('approve'), `/api/v1/evolution/changes/${p.id}/approve`);
   if (!isPolicy) {
