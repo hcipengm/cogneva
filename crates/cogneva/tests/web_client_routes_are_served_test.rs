@@ -45,7 +45,7 @@ use std::path::Path;
 
 mod common;
 use common::routes::{
-    core_path_constants, normalize, read, repo_root, served_paths, strip_comments, walk,
+    normalize, read, repo_root, served_methods, served_paths, strip_comments, walk,
 };
 
 /// The paths the shipped clients ask for, keyed by shape, with the files that
@@ -285,93 +285,6 @@ fn client_requests(root: &Path) -> BTreeMap<(String, String), BTreeSet<String>> 
         }
     }
     found
-}
-
-/// The verbs each registered path answers.
-fn served_methods(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
-    const VERBS: &[&str] = &[
-        "get", "post", "put", "patch", "delete", "head", "options", "any",
-    ];
-    let constants = core_path_constants(root);
-    let mut files = Vec::new();
-    walk(&root.join("crates/cog-gateway/src"), &["rs"], &mut files);
-    files.sort();
-    let mut served: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for path in files {
-        let text = read(&path);
-        let mut cursor = 0;
-        while let Some(at) = text[cursor..].find(".route(") {
-            let call = cursor + at;
-            cursor = call + ".route(".len();
-            let argument = text[cursor..].trim_start();
-            let shape = if let Some(literal) = argument.strip_prefix('"') {
-                literal.find('"').map(|end| normalize(&literal[..end]))
-            } else {
-                let qualified: String = argument
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
-                    .collect();
-                let name = qualified.rsplit("::").next().unwrap_or(qualified.as_str());
-                constants.get(name).map(|value| normalize(value))
-            };
-            let Some(shape) = shape else {
-                continue;
-            };
-            // The handler expression runs from the opening paren of `.route(` to
-            // its closing one; the verbs are whichever combinators appear in it.
-            let open = cursor - 1;
-            let Some(close) = matching_paren(text.as_bytes(), open) else {
-                continue;
-            };
-            let expression = &text[open + 1..close];
-            let verbs = served.entry(shape).or_default();
-            for verb in VERBS {
-                let needle = format!("{verb}(");
-                let mut from = 0;
-                while let Some(found_at) = expression[from..].find(&needle) {
-                    let at = from + found_at;
-                    from = at + needle.len();
-                    let boundary = expression[..at]
-                        .chars()
-                        .next_back()
-                        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-                    if boundary {
-                        verbs.insert((*verb).to_string());
-                    }
-                }
-            }
-        }
-    }
-    served
-}
-
-/// The offset of the paren closing the one at `open`.
-fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }
 
 /// Every client request whose verb the route does not answer.

@@ -140,40 +140,164 @@ pub fn core_path_constants(root: &Path) -> BTreeMap<String, String> {
     constants
 }
 
-/// The paths the gateway registers.
-pub fn served_paths(root: &Path) -> BTreeSet<String> {
+/// One `.route(path, ...)` registration: the shape, the verbs it answers, and
+/// the handler functions wired to each verb.
+#[derive(Debug, Clone)]
+pub struct Route {
+    pub shape: String,
+    pub verbs: BTreeSet<String>,
+    pub handlers: BTreeSet<String>,
+}
+
+/// The verbs axum's combinators spell. A route whose handler expression is not
+/// one of these shapes (`any(...)` is, `nest` is not) contributes no verb, and
+/// the callers that compare verbs treat the route as unjudgeable rather than as
+/// answering everything.
+pub const VERBS: &[&str] = &[
+    "get", "post", "put", "patch", "delete", "head", "options", "any",
+];
+
+/// The offset of the bracket closing the one at `open`.
+pub fn matching_delimiter(bytes: &[u8], open: usize, opening: u8, closing: u8) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            c if c == opening => depth += 1,
+            c if c == closing => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The offset of the paren closing the one at `open`.
+pub fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
+    matching_delimiter(bytes, open, b'(', b')')
+}
+
+/// The offset of the brace closing the one at `open`.
+pub fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
+    matching_delimiter(bytes, open, b'{', b'}')
+}
+
+/// Every route the gateway registers, read once here so the path reader, the
+/// verb reader and the request-body reader cannot disagree about what a
+/// `.route(…)` call means.
+pub fn route_entries(root: &Path) -> Vec<Route> {
     let constants = core_path_constants(root);
     let mut files = Vec::new();
     walk(&root.join("crates/cog-gateway/src"), &["rs"], &mut files);
     files.sort();
-    let mut served = BTreeSet::new();
+    let mut routes = Vec::new();
     for path in files {
         let text = read(&path);
-        // The path is on the same line as `.route(` about as often as it is on
-        // the next one, so the argument is read across the whitespace rather
-        // than line by line.
-        let mut rest = text.as_str();
-        while let Some(at) = rest.find(".route(") {
-            rest = &rest[at + ".route(".len()..];
-            let argument = rest.trim_start();
-            if let Some(literal) = argument.strip_prefix('"') {
-                if let Some(end) = literal.find('"') {
-                    served.insert(normalize(&literal[..end]));
-                }
+        let mut cursor = 0;
+        while let Some(at) = text[cursor..].find(".route(") {
+            let call = cursor + at;
+            let open = call + ".route".len();
+            cursor = open + 1;
+            let argument = text[cursor..].trim_start();
+            let shape = if let Some(literal) = argument.strip_prefix('"') {
+                literal.find('"').map(|end| normalize(&literal[..end]))
+            } else {
+                // A route registered from a declaration resolves through that
+                // declaration. Only a bare or module-qualified name is read; a
+                // call of any other shape contributes no route, which shows up
+                // as a client path with nothing serving it rather than as a
+                // quiet pass.
+                let qualified: String = argument
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                    .collect();
+                let name = qualified.rsplit("::").next().unwrap_or(qualified.as_str());
+                constants.get(name).map(|value| normalize(value))
+            };
+            let Some(shape) = shape else {
                 continue;
+            };
+            let Some(close) = matching_paren(text.as_bytes(), open) else {
+                continue;
+            };
+            let expression = &text[open + 1..close];
+            let mut verbs = BTreeSet::new();
+            let mut handlers = BTreeSet::new();
+            for verb in VERBS {
+                let needle = format!("{verb}(");
+                let mut from = 0;
+                while let Some(found_at) = expression[from..].find(&needle) {
+                    let hits = from + found_at;
+                    from = hits + needle.len();
+                    let boundary = expression[..hits]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+                    if !boundary {
+                        continue;
+                    }
+                    verbs.insert((*verb).to_string());
+                    // The handler is the callee's last path segment. A closure
+                    // or a nested expression names no function, and then the
+                    // route simply carries no handler for this verb.
+                    let callee: String = expression[from..]
+                        .trim_start()
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+                        .collect();
+                    let name = callee.rsplit("::").next().unwrap_or(callee.as_str());
+                    if !name.is_empty() && !name.starts_with(|c: char| c.is_ascii_digit()) {
+                        handlers.insert(name.to_string());
+                    }
+                }
             }
-            // A route registered from a declaration resolves through that
-            // declaration. Only a bare or module-qualified name is read; a call
-            // of any other shape contributes no route, which shows up as a
-            // client path with nothing serving it rather than as a quiet pass.
-            let qualified: String = argument
-                .chars()
-                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
-                .collect();
-            let name = qualified.rsplit("::").next().unwrap_or(qualified.as_str());
-            if let Some(value) = constants.get(name) {
-                served.insert(normalize(value));
-            }
+            routes.push(Route {
+                shape,
+                verbs,
+                handlers,
+            });
+        }
+    }
+    routes
+}
+
+/// The paths the gateway registers.
+pub fn served_paths(root: &Path) -> BTreeSet<String> {
+    route_entries(root).into_iter().map(|r| r.shape).collect()
+}
+
+/// The verbs each registered path answers.
+pub fn served_methods(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    let mut served: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for route in route_entries(root) {
+        served.entry(route.shape).or_default().extend(route.verbs);
+    }
+    served
+}
+
+/// The handler functions each `(verb, shape)` is wired to.
+pub fn served_handlers(root: &Path) -> BTreeMap<(String, String), BTreeSet<String>> {
+    let mut served: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for route in route_entries(root) {
+        for verb in &route.verbs {
+            served
+                .entry((verb.to_uppercase(), route.shape.clone()))
+                .or_default()
+                .extend(route.handlers.iter().cloned());
         }
     }
     served
