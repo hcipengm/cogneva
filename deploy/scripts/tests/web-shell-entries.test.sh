@@ -29,6 +29,8 @@ export function TitleBar() {
       <button onClick={overlays.openLlmSetup} title={`模型 · 读于 ${readAt}`}>
         {configured ? '已配置' : '未配置'}
       </button>
+      <button onClick={overlays.openCredentials} title="代码平台">代码平台</button>
+      <button onClick={overlays.openWebSearch} title="上网">上网</button>
       <button onClick={() => setActivity('settings')} title="设置">设置</button>
       <button onClick={() => setPalette('help')} title="去哪找什么">?</button>
     </header>
@@ -169,6 +171,18 @@ fixture
 sed -i "/id: 'settings'/d" "${work}/web/src/shell/ActivityBar.tsx"
 if grep -q "settings" "${work}/web/src/shell/ActivityBar.tsx"; then fail "设置项没被删掉"; fi
 expect_red "活动栏没有设置" "活动栏里没有设置这一项"
+
+# 10. 代码平台只留在命令面板里，顶栏没有。
+fixture
+sed -i "/openCredentials/d" "${work}/web/src/shell/TitleBar.tsx"
+if grep -q "openCredentials" "${work}/web/src/shell/TitleBar.tsx"; then fail "代码平台入口没被剪掉"; fi
+expect_red "顶栏没有代码平台" "顶栏没有打开「GitHub / Gitee 令牌与 SSH 身份」的入口"
+
+# 11. 上网那一格只剩一个图标：认得它的人不用找，不认得的人永远不知道那是什么。
+fixture
+sed -i 's#>上网</button>#><i /></button>#' "${work}/web/src/shell/TitleBar.tsx"
+confirm "${work}/web/src/shell/TitleBar.tsx" "><i /></button>"
+expect_red "上网只有图标" "顶栏那一格没有写出「上网」"
 
 # 真树必须绿。
 got=0
