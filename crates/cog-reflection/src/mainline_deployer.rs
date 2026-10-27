@@ -3555,7 +3555,64 @@ impl MainlineDeployer {
     /// 一条检查都没有）时，原因就是内容说的那个；那一次失败时，原因就是它的失败形状。
     /// 兜底那条 status 接口自己的失败**不**改写原因——两处都没有结论时，先问的那个
     /// 更接近真相（"上游还在跑"与"这条路不通"是两种话，后者才需要动作）。
+    ///
+    /// **连接被拒要复问**，见 [`Self::CI_ASK_RETRY_DELAYS_MS`]：一个刚起来的 Pod 的第一
+    /// 个请求可能落在安全网关的入站策略生效之前，那一问没有发生，但它是可等的。其余
+    /// 原因不复问——上游答了 404 或者答了「还在跑」，再问一次答案还是那一句。
     pub(crate) async fn platform_ci_verdict(
+        api_base: &str,
+        repo: &str,
+        rev: &str,
+    ) -> (
+        Option<bool>,
+        Option<CiNoVerdictReason>,
+        Vec<String>,
+        Vec<(String, String)>,
+    ) {
+        let mut attempt = 0usize;
+        loop {
+            let answer = Self::platform_ci_verdict_once(api_base, repo, rev).await;
+            let refused = answer.0.is_none() && answer.1 == Some(CiNoVerdictReason::ConnectFailed);
+            if !refused {
+                return answer;
+            }
+            let Some(&delay_ms) = Self::CI_ASK_RETRY_DELAYS_MS.get(attempt) else {
+                return answer;
+            };
+            attempt += 1;
+            warn!(
+                api_base,
+                repo,
+                rev,
+                attempt,
+                delay_ms,
+                "the CI question was refused at the connection; asking again — a pod's first \
+                 request can reach the gateway before its ingress policy has this pod's address"
+            );
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+
+    /// 连接被拒之后隔多久再问（毫秒），用完仍被拒就把「没问到」如实报上去。
+    ///
+    /// 网络策略不是配置好就立即对**新 Pod** 生效的：kube-router 按 Pod 事件把源地址写进
+    /// 网关入站策略的 ipset，而定长跑的 Pod 与刚刚起来的 Pod 之间隔着的正是这一两秒。
+    /// 实测（2026-10-27，单节点 k3s）：新建 Pod 在容器起来后的第一个请求被
+    /// `icmp-port-unreachable` 拒掉，1~3 秒后同样的请求得到 404/200；挂着滚动侧出站
+    /// 策略标签的 Pod 慢一秒左右。这一个窗口把主线卡了整整两小时——滚动侧每轮都是一个
+    /// 新 Job Pod，判词都在容器起来的那一秒里写下 `connect_failed`，两个 Job 的生命都
+    /// 不到一秒，于是「等下一轮」永远等不到一次没被拒的提问。
+    ///
+    /// 这一格与「上游不可达」必须分开处置：拒在连接上说明这一问**没有发生**，它是
+    /// 可等的；而网关整个不在（副本正在被换、真断网）时，这几秒之后仍然拒，那时再
+    /// 按 `connect_failed` 报上去，判据不变。
+    ///
+    /// 四次复问把覆盖拉到容器起来后约 7 秒：实测窗口在 1~3 秒之间，留一倍余量是因为
+    /// 那条窗口的宽度由策略面的调度决定，不是我们能钉住的一个数。
+    const CI_ASK_RETRY_DELAYS_MS: [u64; 4] = [500, 1_000, 2_000, 4_000];
+
+    /// 问一次，按这一次的回答给出结论（复问的循环在上面那一层）。
+    async fn platform_ci_verdict_once(
         api_base: &str,
         repo: &str,
         rev: &str,
@@ -14038,6 +14095,117 @@ exec {real} "$@"
     }
 
     const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+
+    /// 假平台 API：按序应答，`None` 表示「收下连接就 RST」；返回 base 与**已接受的
+    /// 连接数**。
+    ///
+    /// 数连接数而不是等应答脚本跑完：脚本跑不完正是「没人再问」的形状，等它等于让
+    /// 测试挂在那里等一个不会来的连接。计数在 accept 那一刻加一，所以客户端拿到最后
+    /// 一个应答时，这个数已经是终值。
+    ///
+    /// 用 RST 而不是「先不监听」来表达被拒，是为了不赌端口：留一个空档再复用同一个
+    /// 端口，别的进程可能正好把它抢走，那时绿的是运气不是判据。RST 与真实现场里
+    /// 网关那侧 `icmp-port-unreachable` 落进同一个原因格（读失败 ⇒ `Transport`）。
+    ///
+    /// RST 的做法是**带着未读数据关连接**：只读走一个字节，剩下的留在接收缓冲里。
+    /// 这样客户端那次读一定拿到错误；不读就关的话，内核发的是 FIN，客户端读到 0 字节，
+    /// 那是 `UnusableBody`——一个坏掉的响应，不是一条被拒的连接。
+    async fn fake_platform(
+        responses: Vec<Option<String>>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        tokio::spawn(async move {
+            for resp in responses {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    continue;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                // 请求内容不必看：这一层只判「问了几次、每次拿到什么」。
+                match resp {
+                    Some(r) => {
+                        let mut buf = vec![0u8; 8192];
+                        let _ = sock.read(&mut buf).await;
+                        let _ = sock.write_all(r.as_bytes()).await;
+                        let _ = sock.shutdown().await;
+                    }
+                    None => {
+                        let mut one = [0u8; 1];
+                        let _ = sock.read(&mut one).await;
+                        drop(sock);
+                    }
+                }
+            }
+        });
+        (format!("127.0.0.1:{port}"), asked)
+    }
+
+    /// 新 Pod 的第一个请求可能落在安全网关入站策略生效之前，网关那侧直接拒连接。
+    /// 这一问**没有发生**，但它是可等的：同一句话隔一秒再问就到了。
+    ///
+    /// 必须复问，是因为滚动侧每轮都是一个新 Job Pod：不复问，每一轮都栽在同一个
+    /// 一两秒的窗口里，「等下一轮」就永远等不到一次没被拒的提问（2026-10-27 主线
+    /// 两小时停在这里，两个 Job 的生命都不到一秒）。
+    #[tokio::test]
+    async fn a_question_refused_at_the_connection_is_asked_again() {
+        // 一问由两次读组成（check-runs，再兜底问提交状态），所以「被拒一次」在这里是
+        // 一个连接被 RST + 一次兜底读。第二轮的第一个连接给一版全绿的检查。
+        let (endpoint, asked) = fake_platform(vec![
+            None,
+            Some(http_200("{}")),
+            Some(http_200(
+                r#"{"check_runs":[{"conclusion":"success","name":"ci"}]}"#,
+            )),
+        ])
+        .await;
+        let (verdict, reason, failed, _excluded) = MainlineDeployer::platform_ci_verdict(
+            &format!("http://{endpoint}/github"),
+            "o/r",
+            "abc",
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            Some(true),
+            "第一次被拒之后必须再问一次（原因 {reason:?}，失败项 {failed:?}）"
+        );
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "被拒一次就复问一次；不复问时第三个连接根本不会发生"
+        );
+    }
+
+    /// 反面：404 是一个**已经发生**的回答，说的是「这条路通，只是这里没有东西」。
+    /// 复问它不是等策略生效，是拿一次巧合换掉一次落地的回答。
+    #[tokio::test]
+    async fn an_answer_that_arrived_is_not_asked_again() {
+        let (endpoint, asked) = fake_platform(vec![
+            Some(HTTP_404.to_string()),
+            Some(http_200("{}")),
+            Some(http_200(
+                r#"{"check_runs":[{"conclusion":"success","name":"ci"}]}"#,
+            )),
+        ])
+        .await;
+        let (verdict, reason, ..) = MainlineDeployer::platform_ci_verdict(
+            &format!("http://{endpoint}/github"),
+            "o/r",
+            "abc",
+        )
+        .await;
+        assert_eq!(verdict, None, "404 不能被复问成一次全绿");
+        assert_eq!(reason, Some(CiNoVerdictReason::Http(404)));
+        assert_eq!(
+            asked.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "404 之后只该再问一次兜底的提交状态，不该重问 check-runs"
+        );
+    }
 
     #[test]
     fn http_base_splits_scheme_host_port_and_prefix() {
