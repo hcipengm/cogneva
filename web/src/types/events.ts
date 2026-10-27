@@ -163,6 +163,21 @@ const CHAT_FRAME_KINDS: Record<string, ChatFrameKind> = {
   'message.goal': 'goal',
 };
 
+/**
+ * 一句话是谁说的。
+ *
+ * 只有这两个词。写者一共两处，都只写这两个：聊天套接字的 `message.start` 帧
+ * （`crates/cog-gateway/src/chat.rs` 的 `emit_message_start`，三处调用分别传
+ * `"user"` 与 `"assistant"`），以及落盘的对话行 `ChatTurnRole`（`user` /
+ * `assistant`，库里的 check 约束也是这两个）。
+ *
+ * 曾经这里还有一个 `system`：`cog_core::Message::role()` 会返回它，但那条路是
+ * 模型请求里的消息角色，不经过这两个写者；聊天面上它一格都到不了，于是「系统」
+ * 那个分支从写下来那天起就没亮过。一个没有写者的词与一个拼错的词在界面上是同
+ * 一种表现：永远不匹配。所以这里不摆它，真出现了第三个角色，写者那一侧先红。
+ */
+export type ChatRole = 'user' | 'assistant';
+
 export interface ChatFrame {
   id: string;
   /** 这段对话的身份。多段对话各有一条流，帧必须带着它自己的那一条。 */
@@ -171,7 +186,7 @@ export interface ChatFrame {
   messageId: string;
   kind: ChatFrameKind;
   /** 只有 `start` 带着角色；其余帧从这条消息已有的角色继承。 */
-  role: 'user' | 'assistant' | 'system' | null;
+  role: ChatRole | null;
   /** 只有 `*_delta` 带着增量。 */
   delta: string | null;
   /** 只有 `goal` 帧带着：这句话被受理成的那道目标。 */
@@ -206,8 +221,7 @@ export function normalizeChatFrame(
     sessionId: sessionId && sessionId.trim() ? sessionId : 'default',
     messageId,
     kind,
-    role:
-      role === 'user' || role === 'assistant' || role === 'system' ? role : null,
+    role: role === 'user' || role === 'assistant' ? role : null,
     delta: typeof inner.delta === 'string' ? inner.delta : null,
     goalId: typeof inner.goal_id === 'string' ? inner.goal_id : null,
     timestamp:

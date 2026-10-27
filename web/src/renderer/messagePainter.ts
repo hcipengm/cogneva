@@ -4,12 +4,12 @@ import {
   computeTightWidth,
   type Prepared,
 } from '@/layout/textEngine';
-import type { MessageRole } from '@/store/streamStore';
+import type { ChatRole } from '@/types/events';
 import { font, token, tokenAlpha } from '@/renderer/theme';
 
 export interface RenderMessage {
   id: string;
-  role: MessageRole;
+  role: ChatRole;
   text: string;
   prepared?: Prepared;
 }

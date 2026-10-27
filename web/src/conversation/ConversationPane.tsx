@@ -23,7 +23,7 @@ function stamp(iso: string): string {
 function Turn({ message }: { message: ChatMessage }) {
   const [showThinking, setShowThinking] = useState(false);
   const streaming = message.status === 'streaming' || message.status === 'sending';
-  const who = message.role === 'user' ? '你' : message.role === 'system' ? '系统' : '执行者';
+  const who = message.role === 'user' ? '你' : '执行者';
 
   return (
     <article className="group relative pl-4">

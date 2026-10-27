@@ -5,8 +5,8 @@ import {
   describeEvent,
   useStreamStore,
   type FrameSink,
-  type MessageRole,
 } from '@/store/streamStore';
+import type { ChatRole } from '@/types/events';
 import { useChatStore } from '@/store/chatStore';
 import { agentFrame } from '@/store/liveAgents';
 import { alertFrame } from '@/store/liveAlerts';
@@ -196,7 +196,7 @@ export function useEventStream(options: UseEventStreamOptions = {}): {
           if (!agentId) break;
           const id = `${agentId}:${event.timestamp}`;
           const role = ((p.message as { role?: string } | undefined)?.role ??
-            'assistant') as MessageRole;
+            'assistant') as ChatRole;
           streaming.current.set(agentId, id);
           startMessage(id, agentId, role);
           changedState = true;

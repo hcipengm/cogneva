@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { getSessionMessages } from '@/api/client';
-import type { ChatFrame } from '@/types/events';
+import type { ChatFrame, ChatRole } from '@/types/events';
+
+export type { ChatRole };
 
 /**
  * 对话面的账。
@@ -14,8 +16,6 @@ import type { ChatFrame } from '@/types/events';
  * - **服务端的回声按身份接上，不另起一条**。回声到达时把本地那一条换成服务端的
  *   消息 id，后面的增量才接得上；不接就是把同一句话显示两遍。
  */
-
-export type ChatRole = 'user' | 'assistant' | 'system';
 
 /**
  * 一条消息的四个状态。

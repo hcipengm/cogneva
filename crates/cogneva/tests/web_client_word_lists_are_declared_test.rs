@@ -13,7 +13,10 @@
 //! The board is the same shape three times over: its column names, its column
 //! labels and its move branches are each a copy of `cog_core::TaskStatus`. The
 //! roster's state cell is `AgentState`'s wire spelling plus the three words the
-//! client derives from lifecycle frames itself.
+//! client derives from lifecycle frames itself. The shortest list of all -- who
+//! said a line -- is held in both directions: the client's `ChatRole` against
+//! the roles the chat socket puts on `message.start` frames and the roles the
+//! stored transcript can carry.
 //!
 //! 实测（2026-10-27）：修前 `web/src/views/TasksView.tsx` 的 `ready` 标签把
 //! `status=ready` 发给服务端，而 `TaskStatus` 里没有这个词，标签恒空——表头却
@@ -29,6 +32,16 @@
 //! 实测（2026-10-27，在岗名单那一格）：`AgentState` 没有 `ALL`，词表按枚举源码的
 //! 变体名加 `rename_all = "snake_case"` 折出来，所以核心加一个状态也会红。把
 //! `STATE_LABEL` 的 `suspect` 删掉，本门红并列出两侧的词。
+//!
+//! 实测（2026-10-27，谁说的那一句）：这张表在客户端被抄了四遍，其中三份还带着
+//! `system`——`cog_core::Message::role()` 会返回它，可聊天套接字与落盘对话行
+//! 两个写者都只写 `user`/`assistant`，界面那支「系统」从写下来起一次都没亮过。
+//! 现在只剩 `types/events.ts` 一处声明，另外三处改成从它取。消融对照两条：
+//! 把 `'system'` 加回联合类型，本门红并列出两侧的词；把 `chat.rs` 里一处
+//! `"user"` 改成 `"system"`，帧与落盘那张表先红——写者能说、存不下的角色，
+//! 重开这段对话时会换一种身份回来。各自改回即绿。
+
+mod common;
 
 use std::path::PathBuf;
 
@@ -823,5 +836,154 @@ fn the_agent_states_the_roster_labels_are_the_ones_the_core_serialises() {
     assert_eq!(
         labelled, expected,
         "状态格的中文名必须正好盖住 `AgentState` 的线上写法加客户端自己翻出来的三个词"
+    );
+}
+
+/// 一段文本里每次 `callee(…)` 的括号内容，声明那一处不算。
+///
+/// 按括号配平读，不按行：三个调用点目前都写在一行里，但一条只认单行的规则在
+/// 换行排版那天就会悄悄少读一个调用——少读的那个角色会被当成「没人写」。
+///
+/// 声明本身也要跳过：`async fn emit_message_start(` 的形参表长得和调用一模一样，
+/// 把它当成一次调用会读出一个 `role: &str`。
+fn call_arguments<'a>(text: &'a str, callee: &str, out: &mut Vec<&'a str>) {
+    let bytes = text.as_bytes();
+    let mut cursor = 0;
+    while let Some(at) = text[cursor..].find(callee) {
+        let name_at = cursor + at;
+        let start = name_at + callee.len();
+        cursor = start;
+        if bytes.get(start) != Some(&b'(') {
+            continue;
+        }
+        let mut depth = 0i32;
+        let mut i = start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        if !text[..name_at].trim_end().ends_with("fn") {
+            out.push(&text[start + 1..i.min(bytes.len())]);
+        }
+        cursor = (i + 1).min(bytes.len());
+    }
+}
+
+/// 实参表里的最后一格（顶层的逗号才分隔实参）。
+fn last_argument(args: &str) -> &str {
+    let mut depth = 0i32;
+    let mut last = 0usize;
+    for (i, ch) in args.char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => last = i + 1,
+            _ => {}
+        }
+    }
+    args[last..].trim()
+}
+
+/// 一段代码里出现的带引号字面量。
+fn quoted(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('"') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('"') else { break };
+        words.push(after[..close].to_string());
+        rest = &after[close + 1..];
+    }
+    words
+}
+
+/// 「这句话是谁说的」是全平台最短的一张词表，而它被写了四遍：聊天帧的联合类型、
+/// 落盘对话行的 `ChatTurnRole`、聊天套接字 `message.start` 帧的实参，以及界面
+/// 按角色选称呼的那几支。第四份就写在客户端里，也就是本门读的这一份。
+///
+/// 三个可能的写者里有两个是真写者：套接字帧（`emit_message_start`）与落盘行
+/// （`ChatTurnRole::as_str`）。第三处 `cog_core::Message::role()` 也能返回角色，
+/// 但它服务的是模型请求的组装，聊天面上一格都到不了——它的 `"tool"` 从来没在
+/// 这两个通道上出现过，所以不在这张表里；真有一天到了，写者那一侧先红。
+///
+/// 这里曾经多一个 `system`：三个人各自抄了一遍联合类型，都把 `Message::role()`
+/// 的词表当成了聊天面的词表。聊天帧上它一格都到不了，界面那支「系统」永远不亮。
+#[test]
+fn the_chat_roles_the_client_names_are_the_roles_the_writers_write() {
+    let events_path = repo_root().join("web/src/types/events.ts");
+    let events = std::fs::read_to_string(&events_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", events_path.display()));
+    let mut client = union_words(&events, "export type ChatRole =");
+    client.sort();
+    assert!(
+        client.len() >= 2,
+        "ChatRole 读出来是 {client:?}：词表解析坏了，不是词变少了"
+    );
+
+    // 写者一：聊天套接字上 `message.start` 帧里的角色。
+    let chat_path = repo_root().join("crates/cog-gateway/src/chat.rs");
+    let chat = std::fs::read_to_string(&chat_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", chat_path.display()));
+    let production = common::rust_production::production_text(&chat);
+    let mut calls = Vec::new();
+    call_arguments(&production, "emit_message_start", &mut calls);
+    assert!(
+        calls.len() >= 2,
+        "`emit_message_start` 只读到 {} 处调用：这条判据靠它的实参枚举角色，\
+         少读一处就等于把一个角色裁掉",
+        calls.len()
+    );
+    let mut frames: Vec<String> = Vec::new();
+    for call in calls {
+        let role = last_argument(call);
+        let word = role
+            .strip_prefix('"')
+            .and_then(|r| r.strip_suffix('"'))
+            .unwrap_or_else(|| {
+                panic!(
+                    "`emit_message_start` 的角色实参 {role:?} 不是字面量：本门看不见它写的是什么词，\
+                     写者换成变量就得给这里加一条读法，而不是让判据空转"
+                )
+            });
+        frames.push(word.to_string());
+    }
+    frames.sort();
+    frames.dedup();
+
+    // 写者二：落盘的一行是谁说的。
+    let store_path = repo_root().join("crates/cog-storage/src/postgres/chat_turn_store.rs");
+    let store = std::fs::read_to_string(&store_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", store_path.display()));
+    let at = store
+        .find("pub fn as_str(self)")
+        .expect("`ChatTurnRole::as_str` 不在了；本门通过它读落盘对话行的角色词");
+    let body = &store[at..];
+    let end = body
+        .find("\n    }")
+        .expect("`ChatTurnRole::as_str` 的函数体没有闭合");
+    let mut stored: Vec<String> = quoted(&body[..end])
+        .into_iter()
+        .filter(|word| !word.is_empty())
+        .collect();
+    stored.sort();
+
+    assert_eq!(
+        frames, stored,
+        "聊天帧上的角色与落盘对话行的角色不是同一组词：帧说得出、存不下的角色，\
+         重开这段对话时那一行会按另一种角色回来"
+    );
+    assert_eq!(
+        client, frames,
+        "客户端认的角色与写者写的不是同一组词：多一个＝为永远不会到来的词留着一支\
+         从没跑过的显示；少一个＝那个角色的消息落到兜底分支，与「谁都没说」一样"
     );
 }

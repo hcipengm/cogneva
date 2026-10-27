@@ -1,7 +1,5 @@
 import { create } from 'zustand';
-import type { AgentEvent } from '@/types/events';
-
-export type MessageRole = 'user' | 'assistant' | 'system';
+import type { AgentEvent, ChatRole } from '@/types/events';
 
 /** 活动流保留的行数。连着看的是「刚才发生了什么」，不是审计——翻更早的用任务与 trace。 */
 export const ACTIVITY_LIMIT = 300;
@@ -185,7 +183,7 @@ export interface Message {
   id: string;
   /** 谁在说。总线上的消息按 agent 分，少了这一列就没法把它归到某一次运行。 */
   agent: string | null;
-  role: MessageRole;
+  role: ChatRole;
   text: string;
   status: 'streaming' | 'done' | 'error';
 }
@@ -307,7 +305,7 @@ export interface StreamState {
   noteFrame: (point: TimelinePoint) => void;
   noteUnrecorded: (type: string) => void;
   clearTimeline: () => void;
-  startMessage: (id: string, agent: string | null, role: MessageRole) => void;
+  startMessage: (id: string, agent: string | null, role: ChatRole) => void;
   appendDelta: (messageId: string, delta: string) => void;
   endMessage: (messageId: string) => void;
   /**

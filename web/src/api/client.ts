@@ -1,3 +1,5 @@
+import type { ChatRole } from '@/types/events';
+
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? '';
 
 export interface ApiError {
@@ -278,7 +280,7 @@ export async function getClusterOverview(): Promise<ClusterOverview> {
 /** 一段对话里的一行，读回来的形状。 */
 export interface ChatTranscriptLine {
   id: string;
-  role: 'user' | 'assistant';
+  role: ChatRole;
   content: string;
   /** 这一轮没有答案的原因。有值就是「问过，但没答上来」。 */
   failure: string | null;
@@ -2232,6 +2234,18 @@ export interface TopologyNode {
   conditions: TopologyCondition[];
   /** 这台节点上进程采集器最后一次报到的时刻；`null` ＝ 这台节点上没有采集器。 */
   process_census_at: string | null;
+  /**
+   * 采集器在这台机器上看到几个容器的进程表（整台宿主的 cgroup 树）。
+   * `null` ＝ 这台节点上没有活着的采集器：没人能报，不是零个。
+   */
+  census_containers: number | null;
+  /**
+   * 上面那些容器里，有几个是这一面读不到的：它们跑在别的命名空间里，这一面按
+   * 命名空间取 Pod，于是有进程读数却没有一格能显示它们。为 `null` 同理。
+   *
+   * 这个数不为 0 时，「这台机器上的容器」比屏上的多——多多少只能由它说出来。
+   */
+  unclaimed_containers: number | null;
   pods: TopologyPod[];
 }
 
