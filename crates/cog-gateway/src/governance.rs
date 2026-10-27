@@ -41,9 +41,10 @@ pub struct DriftResponse {
 }
 
 fn store(state: &GatewayState) -> Result<&Arc<dyn cog_core::GovernanceStore>, ApiError> {
-    state.governance_store.as_ref().ok_or_else(|| ApiError {
-        error: "ServiceUnavailable".into(),
-        message: "no shared database is published, so there is no face graph to read".into(),
+    state.governance_store.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "no shared database is published, so there is no face graph to read",
+        )
     })
 }
 
@@ -202,9 +203,10 @@ const REFUSED_PAGE: usize = 50;
 const REFUSED_READ_CAP: usize = 10_000;
 
 fn principles(state: &GatewayState) -> Result<&Arc<dyn cog_core::PrincipleLedgerStore>, ApiError> {
-    state.principle_ledger.as_ref().ok_or_else(|| ApiError {
-        error: "ServiceUnavailable".into(),
-        message: "no shared database is published, so there is no principle ledger to read".into(),
+    state.principle_ledger.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "no shared database is published, so there is no principle ledger to read",
+        )
     })
 }
 
@@ -332,9 +334,10 @@ pub struct ChangeLedgerRowView {
 const OUTSTANDING_PAGE: usize = 100;
 
 fn changes(state: &GatewayState) -> Result<&Arc<dyn cog_core::ChangeLedgerStore>, ApiError> {
-    state.change_ledger.as_ref().ok_or_else(|| ApiError {
-        error: "ServiceUnavailable".into(),
-        message: "no shared database is published, so there is no change ledger to read".into(),
+    state.change_ledger.as_ref().ok_or_else(|| {
+        ApiError::service_unavailable(
+            "no shared database is published, so there is no change ledger to read",
+        )
     })
 }
 
@@ -445,12 +448,10 @@ const TIMELINE_MAX: usize = 200;
 /// the ledger answered.
 fn timeline_identity(query: &ChangeTimelineQuery) -> Result<cog_core::ChangeIdentity, ApiError> {
     if query.kind.trim().is_empty() || query.scope.trim().is_empty() {
-        return Err(ApiError {
-            error: "BadRequest".into(),
-            message: "kind and scope are what the identity is keyed by; an empty one matches rows \
-                      that were never named that way"
-                .into(),
-        });
+        return Err(ApiError::bad_request(
+            "kind and scope are what the identity is keyed by; an empty one matches rows \
+             that were never named that way",
+        ));
     }
     // An empty literal is legitimate: some checks name a whole scope and no
     // literal at all, and refusing those would make their history unreadable.
