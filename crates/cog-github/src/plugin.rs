@@ -68,7 +68,7 @@ fn spawn_polling_loop(
     shutdown: cog_core::shutdown::ShutdownSignal,
 ) -> tokio::task::JoinHandle<()> {
     let interval = std::time::Duration::from_secs(interval_secs.max(30));
-    let name = if platform == "gitee" {
+    let name = if platform == crate::GITEE_PLATFORM {
         GITEE_DISCOVERY_POLL_LOOP
     } else {
         GITHUB_DISCOVERY_POLL_LOOP

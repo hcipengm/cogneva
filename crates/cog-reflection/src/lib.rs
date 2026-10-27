@@ -167,6 +167,19 @@ pub use squad::DefaultSquadReflection;
 pub use store_readouts::{ExpectedStore, RestoreExpectation, StoreReadouts, META_LEARNING_POLICY};
 pub use types::*;
 
+/// The words this crate calls the two code platforms by.
+///
+/// `CodePlatform::slug()` puts one of them in the git passthrough path segment
+/// (`/git/{slug}/`), in the local upstream refs and in the labels of the
+/// per-upstream readings. The gateway matches the same word when it routes that
+/// path, and `cog-github` reports it as each provider's platform kind; the three
+/// crates do not depend on each other, so each declares the pair under the same
+/// identifiers and a gate compares the spellings.
+pub const GITHUB_PLATFORM: &str = "github";
+
+/// The word this crate calls Gitee by. See [`GITHUB_PLATFORM`].
+pub const GITEE_PLATFORM: &str = "gitee";
+
 pub mod platform_http;
 pub mod plugin;
 

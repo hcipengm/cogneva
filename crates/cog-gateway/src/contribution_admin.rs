@@ -693,7 +693,7 @@ pub async fn refresh_gitee_token(refresh_token: &str) -> Result<GiteeTokenSet, S
 async fn verify_token(provider: &str, token: &str) -> Result<String, String> {
     let client = http_client()?;
     match provider {
-        "github" => {
+        crate::GITHUB_PLATFORM => {
             let resp = client
                 .execute(
                     HttpRequest::get(format!("{GITHUB_API}/user"))
@@ -715,7 +715,7 @@ async fn verify_token(provider: &str, token: &str) -> Result<String, String> {
                 .unwrap_or("github-user")
                 .to_string())
         }
-        "gitee" => {
+        crate::GITEE_PLATFORM => {
             let url = format!(
                 "{GITEE_API}/user?{}",
                 encode_query(&[("access_token", token)])
@@ -748,7 +748,7 @@ async fn upload_public_key(provider: &str, token: &str, public_line: &str) -> Re
     let client = http_client()?;
     let title = "cogneva-contribution";
     match provider {
-        "github" => {
+        crate::GITHUB_PLATFORM => {
             let request = HttpRequest::post(format!("{GITHUB_API}/user/keys"))
                 .header("Authorization", format!("Bearer {token}"))
                 .header("Accept", "application/vnd.github+json")
@@ -762,7 +762,7 @@ async fn upload_public_key(provider: &str, token: &str, public_line: &str) -> Re
                 Err(format!("GitHub 上传公钥返回 HTTP {}", resp.status))
             }
         }
-        "gitee" => {
+        crate::GITEE_PLATFORM => {
             let url = format!(
                 "{GITEE_API}/user/keys?{}",
                 encode_query(&[("access_token", token)])
@@ -898,7 +898,7 @@ pub(crate) async fn connect_contribution(
     let keypair = generate_ssh_keypair("cogneva-contribution");
     let ssh_result = upload_public_key(provider, token, &keypair.public_line).await;
 
-    let token_key = if provider == "gitee" {
+    let token_key = if provider == crate::GITEE_PLATFORM {
         SECRET_GITEE_TOKEN
     } else {
         SECRET_GITHUB_TOKEN
@@ -1043,9 +1043,9 @@ pub(crate) async fn status_block_json() -> serde_json::Value {
         && has(SECRET_GITHUB_APP_INSTALLATION_ID)
         && has(SECRET_GITHUB_APP_KEY);
     let provider = if github {
-        "github"
+        crate::GITHUB_PLATFORM
     } else if gitee {
-        "gitee"
+        crate::GITEE_PLATFORM
     } else {
         "none"
     };
@@ -1056,8 +1056,8 @@ pub(crate) async fn status_block_json() -> serde_json::Value {
     json!({
         "configured": github || gitee,
         "provider": provider,
-        "github": {"configured": github},
-        "gitee": {"configured": gitee},
+        crate::GITHUB_PLATFORM: {"configured": github},
+        crate::GITEE_PLATFORM: {"configured": gitee},
         "ssh": {"key_present": ssh},
         // 网关自己的 git 身份：装机时没人给它配密钥，所以它自举；
         // 这一块告诉面板走到了哪一步、缺什么。
@@ -1532,7 +1532,7 @@ pub async fn contribution_config_handler(
     Json(req): Json<ContributionConfigRequest>,
 ) -> Response {
     let provider = req.provider.trim();
-    if provider != "github" && provider != "gitee" {
+    if provider != crate::GITHUB_PLATFORM && provider != crate::GITEE_PLATFORM {
         return (
             StatusCode::BAD_REQUEST,
             Json(
@@ -1704,7 +1704,7 @@ pub async fn device_poll_handler(
 
     match parse_device_token(&body) {
         DevicePoll::Token(token) => {
-            let account = match verify_token("github", &token).await {
+            let account = match verify_token(crate::GITHUB_PLATFORM, &token).await {
                 Ok(login) => login,
                 Err(message) => {
                     return (
@@ -1714,7 +1714,7 @@ pub async fn device_poll_handler(
                         .into_response();
                 }
             };
-            persist_connected("github", &token, &account, None).await
+            persist_connected(crate::GITHUB_PLATFORM, &token, &account, None).await
         }
         DevicePoll::Pending(interval) => (
             StatusCode::OK,
@@ -1814,7 +1814,7 @@ async fn complete_gitee_oauth(state: &str, code: &str) -> Result<GiteeOAuthMater
     let redirect_uri =
         take_oauth_state(state).ok_or("授权链接已过期或已使用，请回到接管台重新发起授权")?;
     let set = exchange_gitee_code(code, &redirect_uri).await?;
-    let account = verify_token("gitee", &set.access_token).await?;
+    let account = verify_token(crate::GITEE_PLATFORM, &set.access_token).await?;
     Ok((set, account))
 }
 
@@ -1834,7 +1834,13 @@ pub async fn gitee_oauth_exchange_handler(
     };
     match complete_gitee_oauth(&req.state, &code).await {
         Ok((set, account)) => {
-            persist_connected("gitee", &set.access_token, &account, Some(&set)).await
+            persist_connected(
+                crate::GITEE_PLATFORM,
+                &set.access_token,
+                &account,
+                Some(&set),
+            )
+            .await
         }
         Err(message) => (
             StatusCode::BAD_GATEWAY,
@@ -1885,7 +1891,13 @@ pub async fn gitee_oauth_callback_handler(Query(q): Query<GiteeOAuthCallbackQuer
     };
     match complete_gitee_oauth(&state, &code).await {
         Ok((set, account)) => {
-            let resp = persist_connected("gitee", &set.access_token, &account, Some(&set)).await;
+            let resp = persist_connected(
+                crate::GITEE_PLATFORM,
+                &set.access_token,
+                &account,
+                Some(&set),
+            )
+            .await;
             if resp.status().is_success() {
                 oauth_result_page(
                     "授权成功",
@@ -2094,8 +2106,8 @@ pub async fn contribution_disconnect_handler(
 /// the literal that could drift from it.
 fn oauth_app_secret_key(provider: &str) -> Option<(&'static str, &'static str)> {
     match provider.trim().to_ascii_lowercase().as_str() {
-        "gitee" => Some(("gitee", SECRET_GITEE_OAUTH_CLIENT_SECRET)),
-        "github" => Some(("github", SECRET_GITHUB_OAUTH_CLIENT_SECRET)),
+        crate::GITEE_PLATFORM => Some((crate::GITEE_PLATFORM, SECRET_GITEE_OAUTH_CLIENT_SECRET)),
+        crate::GITHUB_PLATFORM => Some((crate::GITHUB_PLATFORM, SECRET_GITHUB_OAUTH_CLIENT_SECRET)),
         _ => None,
     }
 }
@@ -2331,7 +2343,7 @@ async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
     };
     let config_raw = decode(SECRET_CONTRIB_CONFIG).unwrap_or_default();
     let config: serde_json::Value = serde_json::from_str(&config_raw).unwrap_or_else(|_| json!({}));
-    if config.get("provider").and_then(|v| v.as_str()) != Some("gitee")
+    if config.get("provider").and_then(|v| v.as_str()) != Some(crate::GITEE_PLATFORM)
         || config.get("mode").and_then(|v| v.as_str()) != Some("oauth")
     {
         return Ok(());
@@ -2357,7 +2369,7 @@ async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
         .unwrap_or("gitee-user")
         .to_string();
     let new_config = serde_json::to_string(&json!({
-        "provider": "gitee",
+        "provider": crate::GITEE_PLATFORM,
         "mode": "oauth",
         "account": account,
         "obtained_at": set.obtained_at,
@@ -2462,7 +2474,7 @@ mod tests {
     fn policy_merge_keeps_the_rest_of_the_document_and_refuses_to_invent_one() {
         // 读到既有文档：只动 policy，别的字段原样留着。
         let existing = json!({
-            "provider": "gitee",
+            "provider": crate::GITEE_PLATFORM,
             "mode": "oauth",
             "account": "hcipengm",
             "expires_in": 86400,

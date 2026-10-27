@@ -6430,6 +6430,19 @@ enum CodePlatform {
     Gitee,
 }
 
+impl CodePlatform {
+    /// 这个平台在路由段、凭证选择与上报里共用的词。
+    ///
+    /// 一处声明而不是三处各写一遍 `match`：三份同样的映射里改一份不会报错，
+    /// 那条路径从此按一个别的名字去挑上游或拼路径，读数是「这个平台没人用」。
+    fn as_str(self) -> &'static str {
+        match self {
+            CodePlatform::GitHub => crate::GITHUB_PLATFORM,
+            CodePlatform::Gitee => crate::GITEE_PLATFORM,
+        }
+    }
+}
+
 async fn github_passthrough(
     State(state): State<AppState>,
     req: axum::extract::Request,
@@ -6691,10 +6704,7 @@ async fn code_platform_forward(
     req: axum::extract::Request,
     platform: CodePlatform,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let name = match platform {
-        CodePlatform::GitHub => "github",
-        CodePlatform::Gitee => "gitee",
-    };
+    let name = platform.as_str();
     // GitHub 出口优先 App installation token（App bot 身份），回退静态 token；
     // Gitee 无 App 概念，用静态 token 以 access_token 注入。
     let token = match platform {
@@ -7249,10 +7259,7 @@ async fn git_forward(
     req: axum::extract::Request,
     platform: CodePlatform,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let name = match platform {
-        CodePlatform::GitHub => "github",
-        CodePlatform::Gitee => "gitee",
-    };
+    let name = platform.as_str();
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     let prefix = format!("/git/{name}");
@@ -7442,10 +7449,7 @@ async fn git_https_forward(
     body: &[u8],
     is_get: bool,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let name = match platform {
-        CodePlatform::GitHub => "github",
-        CodePlatform::Gitee => "gitee",
-    };
+    let name = platform.as_str();
     let base = match platform {
         CodePlatform::GitHub => "https://github.com",
         CodePlatform::Gitee => "https://gitee.com",

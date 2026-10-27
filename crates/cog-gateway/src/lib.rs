@@ -1748,6 +1748,25 @@ fn render_held_series_readings(held: &[String], read: bool) -> String {
 /// fault.
 pub const SECURITY_GATEWAY_UNREACHABLE: &str = "security_gateway_unreachable";
 
+/// The words the gateway calls the two code platforms by.
+///
+/// Each is a routing key on several surfaces at once: the contribution admin
+/// picks an API base and a token by it, the OAuth entry point picks a redirect
+/// and an exchange by it, the code-platform passthrough builds a URL path out
+/// of it, and the stored contribution config carries it as `provider` for a
+/// reader that later asks which platform is configured. `cog-github` reports
+/// the same words as each provider's platform kind.
+///
+/// The two crates do not depend on each other, so each declares the pair under
+/// the same identifiers and a gate compares the spellings. One edited copy
+/// does not fail loudly: a request for a platform no branch matches falls into
+/// whichever arm is the fallback, and the reading afterwards is a platform with
+/// no members rather than an error.
+pub const GITHUB_PLATFORM: &str = "github";
+
+/// The word the gateway calls Gitee by. See [`GITHUB_PLATFORM`].
+pub const GITEE_PLATFORM: &str = "gitee";
+
 /// The series name the held-out reading is published under.
 ///
 /// It is declared here rather than in the registry: the reading is rendered

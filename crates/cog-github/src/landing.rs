@@ -70,16 +70,6 @@ pub use cog_core::metric_names::LANDING_CI_FAILURE_INHERITED_TOTAL as LANDING_CI
 /// another host, behind by every commit since the refusal.
 pub use cog_core::metric_names::MIRROR_PUSH_FAILURES_TOTAL as MIRROR_PUSH_FAILURES_METRIC;
 
-/// The path segment the gateway's git routes use for GitHub.
-///
-/// Same word the deployer builds its upstream refs from, and the same one the
-/// gateway's route table matches on: a mirror's URL and its label both come
-/// from here, so the two cannot name different hosts.
-const GITHUB_SLUG: &str = "github";
-
-/// The path segment the gateway's git routes use for Gitee.
-const GITEE_SLUG: &str = "gitee";
-
 /// Why a landing call failed, as a closed set the metric labels.
 ///
 /// Decided where the failure happens — which step failed names the category —
@@ -420,7 +410,7 @@ impl PushTarget {
     pub fn github(config: &GitHubIntegrationConfig) -> Self {
         Self {
             remote: "origin".into(),
-            slug: GITHUB_SLUG.into(),
+            slug: crate::GITHUB_PLATFORM.into(),
             repo: config.repo.clone(),
             base: config.base_branch.clone(),
         }
@@ -429,8 +419,8 @@ impl PushTarget {
     /// The same repository on Gitee.
     pub fn gitee(config: &GiteeIntegrationConfig) -> Self {
         Self {
-            remote: GITEE_SLUG.into(),
-            slug: GITEE_SLUG.into(),
+            remote: crate::GITEE_PLATFORM.into(),
+            slug: crate::GITEE_PLATFORM.into(),
             repo: config.repo.clone(),
             base: config.base_branch.clone(),
         }
@@ -1208,7 +1198,7 @@ impl MainChannel {
             return Err(refused(format!(
                 "{} is not behind {}: it holds {tip}, which is not an ancestor of {head}",
                 target.label(),
-                GITHUB_SLUG
+                crate::GITHUB_PLATFORM
             )));
         }
         self.push_to(&self.workdir, target, head).await
@@ -2397,7 +2387,7 @@ async fn set_remote(dir: &Path, name: &str, url: &str) -> Result<()> {
 /// anonymous URL builds a remote that cannot be pushed to, and a fan-out that
 /// counts a host it can never reach is the state this replaced.
 fn mirror_url(target: &PushTarget, token: Option<&str>) -> Option<String> {
-    if target.slug == GITHUB_SLUG {
+    if target.slug == crate::GITHUB_PLATFORM {
         return None;
     }
     if let Some(base) = git_proxy_base() {
@@ -2444,7 +2434,7 @@ fn select_remote_url_for(
     target_repo: &str,
 ) -> String {
     if let Some(base) = proxy_base {
-        return proxy_route(base, GITHUB_SLUG, target_repo);
+        return proxy_route(base, crate::GITHUB_PLATFORM, target_repo);
     }
     if use_ssh {
         return format!("ssh://git@github.com:22/{target_repo}.git");

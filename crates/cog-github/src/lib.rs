@@ -32,6 +32,21 @@ pub mod redrive_budget;
 pub mod triage;
 pub mod webhook;
 
+/// The word this crate calls GitHub by, in every place the word is a value.
+///
+/// It is a routing key: the provider reports it as its platform kind, the
+/// landing targets carry it as the remote and the slug, the gateway puts it in
+/// a URL path and in the stored contribution config. Nothing compares those
+/// spellings, and a changed copy does not fail loudly -- it selects a platform
+/// nobody else names, which reads as "this provider was never asked".
+///
+/// The gateway keeps its own copy under the same identifier (the two crates do
+/// not depend on each other); a gate compares the spellings.
+pub const GITHUB_PLATFORM: &str = "github";
+
+/// The word this crate calls Gitee by. See [`GITHUB_PLATFORM`].
+pub const GITEE_PLATFORM: &str = "gitee";
+
 pub use error::{CogGitHubError, Result};
 pub use webhook::{run_webhook_server, verify_signature, webhook_router, WebhookState};
 

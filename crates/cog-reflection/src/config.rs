@@ -670,8 +670,8 @@ pub enum CodePlatform {
 impl CodePlatform {
     pub fn slug(self) -> &'static str {
         match self {
-            CodePlatform::Github => "github",
-            CodePlatform::Gitee => "gitee",
+            CodePlatform::Github => crate::GITHUB_PLATFORM,
+            CodePlatform::Gitee => crate::GITEE_PLATFORM,
         }
     }
 }

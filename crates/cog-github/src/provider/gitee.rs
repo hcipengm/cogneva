@@ -175,7 +175,7 @@ const OPEN_LIST_QUERY: [(&str, &str); 4] = [
 #[async_trait]
 impl CodePlatformProvider for GiteeProvider {
     fn platform_kind(&self) -> &'static str {
-        "gitee"
+        crate::GITEE_PLATFORM
     }
 
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {

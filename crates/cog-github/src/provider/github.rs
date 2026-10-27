@@ -220,7 +220,7 @@ impl GitHubProvider {
 #[async_trait]
 impl CodePlatformProvider for GitHubProvider {
     fn platform_kind(&self) -> &'static str {
-        "github"
+        crate::GITHUB_PLATFORM
     }
 
     async fn list_open_issues(&self) -> Result<Vec<PlatformIssue>> {

@@ -45,7 +45,7 @@ pub async fn fetch_platform_profile(
 ) -> Result<PlatformProfile, String> {
     let client = contrib::http_client()?;
     let body: serde_json::Value = match provider {
-        "github" => {
+        crate::GITHUB_PLATFORM => {
             let resp = client
                 .execute(
                     cog_core::HttpRequest::get(format!("{}/user", contrib::GITHUB_API))
@@ -62,7 +62,7 @@ pub async fn fetch_platform_profile(
             }
             resp.json().map_err(|e| e.to_string())?
         }
-        "gitee" => {
+        crate::GITEE_PLATFORM => {
             let url = format!(
                 "{}/user?{}",
                 contrib::GITEE_API,
@@ -269,11 +269,15 @@ pub async fn platform_login_handler(
     Json(req): Json<PlatformLoginRequest>,
 ) -> Response {
     let provider = req.provider.trim().to_lowercase();
-    if provider != "github" && provider != "gitee" {
+    if provider != crate::GITHUB_PLATFORM && provider != crate::GITEE_PLATFORM {
         return json_err(
             StatusCode::BAD_REQUEST,
             "invalid_provider",
-            "provider 必须是 github 或 gitee",
+            format!(
+                "provider 必须是 {} 或 {}",
+                crate::GITHUB_PLATFORM,
+                crate::GITEE_PLATFORM
+            ),
         );
     }
     let token = req.access_token.trim();
@@ -335,7 +339,7 @@ pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response
         Err(r) => return r,
     };
     let authorize_redirect = match provider.as_str() {
-        "gitee" => effective_redirect(
+        crate::GITEE_PLATFORM => effective_redirect(
             &redirect_uri,
             contrib::gitee_oauth_redirect_override().as_deref(),
         ),
@@ -343,7 +347,7 @@ pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response
     };
     let state = contrib::new_oauth_state(&authorize_redirect);
     let url = match provider.as_str() {
-        "gitee" => {
+        crate::GITEE_PLATFORM => {
             let Some(client_id) = contrib::gitee_oauth_client_id().await else {
                 return json_err(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -353,7 +357,7 @@ pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response
             };
             contrib::build_gitee_authorize_url(&client_id, &authorize_redirect, &state)
         }
-        "github" => {
+        crate::GITHUB_PLATFORM => {
             let Some(client_id) = contrib::oauth_client_id(None) else {
                 return json_err(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -371,7 +375,11 @@ pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response
             return json_err(
                 StatusCode::BAD_REQUEST,
                 "invalid_provider",
-                "provider 必须是 github 或 gitee",
+                format!(
+                    "provider 必须是 {} 或 {}",
+                    crate::GITHUB_PLATFORM,
+                    crate::GITEE_PLATFORM
+                ),
             )
         }
     };
@@ -452,11 +460,11 @@ async fn exchange_code(
     let redirect_uri =
         contrib::take_oauth_state(state).ok_or("授权链接已过期或已使用，请重新发起登录")?;
     match provider {
-        "gitee" => {
+        crate::GITEE_PLATFORM => {
             let set = contrib::exchange_gitee_code(&code, &redirect_uri).await?;
             Ok((set.access_token, set.refresh_token))
         }
-        "github" => exchange_github_code(&code, &redirect_uri)
+        crate::GITHUB_PLATFORM => exchange_github_code(&code, &redirect_uri)
             .await
             .map(|t| (t, None)),
         other => Err(format!("未知平台: {other}")),
@@ -470,11 +478,15 @@ pub async fn oauth_exchange_handler(
     Json(req): Json<OAuthExchangeRequest>,
 ) -> Response {
     let provider = req.provider.trim().to_lowercase();
-    if provider != "github" && provider != "gitee" {
+    if provider != crate::GITHUB_PLATFORM && provider != crate::GITEE_PLATFORM {
         return json_err(
             StatusCode::BAD_REQUEST,
             "invalid_provider",
-            "provider 必须是 github 或 gitee",
+            format!(
+                "provider 必须是 {} 或 {}",
+                crate::GITHUB_PLATFORM,
+                crate::GITEE_PLATFORM
+            ),
         );
     }
     match exchange_code(

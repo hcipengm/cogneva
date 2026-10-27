@@ -11,7 +11,8 @@
 //! 读数。
 //!
 //! 所以这里按名字判：**同名即同词**。两个 crate 里都叫 `OUTCOME_LABEL` 的常量，
-//! 必须都写着 `"outcome"`。
+//! 必须都写着 `"outcome"`。代码平台的词一样：`GITHUB_PLATFORM` 在网关与
+//! `cog-github` 各声明一份，两份之间没有任何东西比较。
 //!
 //! 判不了什么：
 //!
@@ -20,18 +21,26 @@
 //! - 标签名与它被用在哪个指标上对不对。把 `outcome` 记到 `state` 那一格，
 //!   本门看不出来；
 //! - 非 `const` 的写法（`let label = "outcome";`、直接写进 `with_label`）。
+//!   这一族在树上确实存在：把「声明的词不许再被逐字拼一遍」当判据试过，实测
+//!   命中五十多处，其中大多是同名的另一种东西（`"kind"` 是 k8s 清单字段、
+//!   `"namespace"` 是 k8s 字段、`"deployment"` 是 kubectl 的资源名），所以本门
+//!   不判这一面。
 //!
-//! 为什么只限名字里带 `LABEL` 且类型是 `&str` 的：同名的 `&str` 常量在别处
-//! **合法地**各不相同——`USAGE`、`CLAIM_ENV`、`ROOT_ENV`、`INSERT_SQL` 都是
+//! 为什么只限名字命中 [`is_word_constant`] 的 `&str` 常量：同名的 `&str` 常量
+//! 在别处**合法地**各不相同——`USAGE`、`CLAIM_ENV`、`ROOT_ENV`、`INSERT_SQL` 都是
 //! 每个模块自己那一份，名字撞上而词不同是正当的（实测 30 组这样同名不同词）。
-//! 标签名不是：同一个标签名在两处必须是同一个词，否则读数合不到一起。
+//! 标签名与平台名不是：它们在两处必须是同一个词，否则读数合不到一起、路由挑不中。
 //!
-//! 实测（2026-10-27）：生产代码里 51 个名字带 `LABEL` 的 `&str` 常量、36 个不同
-//! 名字，其中 5 个名字被声明了不止一次（`OUTCOME_LABEL` 8 次、
-//! `DEPLOYMENT_LABEL` 6 次、`SOURCE_LABEL` 2 次、`DIR_LABEL` 2 次、
-//! `NODE_LABEL` 2 次），每一个都是同一个词，一处矛盾也没有。
+//! 实测（2026-10-27）：生产代码里 63 个命中该判据的 `&str` 常量、41 个不同名字，
+//! 其中 9 个名字被声明了不止一次（`OUTCOME_LABEL` 8 次、`DEPLOYMENT_LABEL` 6 次、
+//! `GITHUB_PLATFORM` 3 次、`GITEE_PLATFORM` 3 次、`LABEL_READOUT` 3 次、
+//! `SOURCE_LABEL` 2 次、`DIR_LABEL` 2 次、`NODE_LABEL` 2 次、`CHANGE_ID_TRAILER`
+//! 2 次），落地之前每一个都是同一个词，一处矛盾也没有——除了 `CHANGE_ID_TRAILER`，
+//! 它在收进本门时就已经分成 `"Change-Id"` 与 `"Change-Id: "` 两半，那一笔把它改回
+//! 一个词。
 //! 消融：把 `cog-memory` 的 `OUTCOME_LABEL` 改成 `"result"`，编译通过、本门红并
-//! 点名 `OUTCOME_LABEL`；改回绿。
+//! 点名 `OUTCOME_LABEL`；改回绿。把 `cog-gateway` 的 `GITEE_PLATFORM` 改成
+//! `"gitee2"`，编译通过、本门红并点名 `GITEE_PLATFORM`；改回绿。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -41,16 +50,34 @@ mod common;
 use common::routes::{repo_root, walk};
 use common::rust_production::production_text;
 
-/// 一个常量声明的名字必须含这个词才归本门管。
-const NAME_MARKER: &str = "LABEL";
+/// 这个常量名是不是在宣称「我是某个词的正身」。
+///
+/// 名字里带 `LABEL`：指标标签名。两个 crate 里都叫 `OUTCOME_LABEL` 的常量必须都
+/// 写着 `"outcome"`，否则按旧名字汇总的面板读到一个空向量。
+///
+/// 名字以 `_PLATFORM` 结尾：代码平台的词。两个 crate 各声明一份，路由、存储的配置
+/// 与上报都按它挑分支；改一处会让那条路径落到兜底分支上。
+///
+/// 名字以 `_TRAILER` 结尾：写进提交信息的 git trailer 键。写出端与读回端在两个
+/// crate 里，读回端读不到就当作「这条提交没有 trailer」——提交照样落地，只是台账
+/// 从此对不上。这一族不是假想的：`CHANGE_ID_TRAILER` 在被本门收进来之前就已经
+/// 分成两半，一处写 `"Change-Id"`、一处写 `"Change-Id: "`，而没有任何东西在比较。
+///
+/// 只判名字，是因为「这是同一个词的两份声明」在代码里没有别的形状可认。为什么不是
+/// 所有同名 `&str` 常量：标签族之外同名不同词是正当的（见文件头实测）。为什么是
+/// 后缀而不是 `PLATFORM` 子串：`PLATFORM_BASE_ENV`、`PLATFORM_REGISTRY_FILES` 这类
+/// 前缀命名是各模块自己的环境变量名与路径，撞名而不同值是正当的。
+fn is_word_constant(name: &str) -> bool {
+    name.contains("LABEL") || name.ends_with("_PLATFORM") || name.ends_with("_TRAILER")
+}
 
-/// 一段生产代码里所有名字带 `LABEL`、类型是 `&str` 的常量。
+/// 一段生产代码里所有命中 [`is_word_constant`]、类型是 `&str` 的常量。
 ///
 /// 类型不是 `&str` 的跳过（`ALERT_LABEL_VALUE_MAX_CHARS: usize` 就是一个名字
 /// 撞上的数常量，它不是一个词）。类型对、值读不出来的按错误返回，不静默跳过：
 /// 一处漏读就是一处不比较，而「少读了一个」与「那个常量没有矛盾」在结果上
 /// 分不开。
-fn label_constants(source: &str) -> Result<Vec<(String, String)>, String> {
+fn word_constants(source: &str) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     let mut cursor = 0;
     while let Some(offset) = source[cursor..].find("const ") {
@@ -70,7 +97,7 @@ fn label_constants(source: &str) -> Result<Vec<(String, String)>, String> {
             .collect();
         // 不是「`const` 后面跟一个名字」的那些出现：`as *const ()` 这样的类型
         // 转换、`macro_rules!` 里的 `pub const $ident`。它们不是声明，跳过。
-        if name.is_empty() || !name.contains(NAME_MARKER) {
+        if name.is_empty() || !is_word_constant(&name) {
             continue;
         }
         let Some(colon) = source[at..].find(':').map(|o| at + o) else {
@@ -144,7 +171,7 @@ fn contradictions(root: &Path) -> Vec<String> {
             continue;
         };
         let text = production_text(&raw);
-        let declarations = match label_constants(&text) {
+        let declarations = match word_constants(&text) {
             Ok(declarations) => declarations,
             Err(complaint) => {
                 complaints.push(format!("  `{where_}`：{complaint}"));
@@ -171,9 +198,10 @@ fn contradictions(root: &Path) -> Vec<String> {
             .map(|(word, sites)| format!("`{word}`（{}）", sites.join("、")))
             .collect();
         complaints.push(format!(
-            "  `{name}` 被声明了 {} 次，写出了 {} 个不同的词：{}。\n    同一个标签名在两处 \
-             必须是同一个词，否则那一族指标会把自己归到一个别人不写的标签名下——读数面上，\
-             它与「这一族什么都没发生」是同一个空向量",
+            "  `{name}` 被声明了 {} 次，写出了 {} 个不同的词：{}。\n    这个名字的两处声明 \
+             必须是同一个词：标签名不同则那一族指标归到别人不写的标签名下，读数面上与\
+             「这一族什么都没发生」是同一个空向量；平台名不同则那条路径落到兜底分支；\
+             trailer 键不同则读回端当作没有这条 trailer，台账从此对不上",
             words.values().map(Vec::len).sum::<usize>(),
             words.len(),
             spellings.join("；")
@@ -182,7 +210,7 @@ fn contradictions(root: &Path) -> Vec<String> {
 
     if declared < 30 || by_name.len() < 20 {
         complaints.push(format!(
-            "普查只读到 {declared} 个名字带 `LABEL` 的 `&str` 常量、{} 个不同名字：读得太少，\
+            "普查只读到 {declared} 个命中本门判据的 `&str` 常量、{} 个不同名字：读得太少，\
              本门判不了这一棵树，按红处理",
             by_name.len()
         ));
@@ -195,7 +223,7 @@ fn a_label_constant_declared_twice_says_the_same_word_both_times() {
     let complaints = contradictions(&repo_root());
     assert!(
         complaints.is_empty(),
-        "同名标签常量必须写着同一个词；它们是各文件各写一遍的，编译器不比较，改一处不会有\
+        "同名常量必须写着同一个词；它们是各文件各写一遍的，编译器不比较，改一处不会有\
          任何报错。\n{}",
         complaints.join("\n")
     );
@@ -280,6 +308,47 @@ fn a_re_export_of_another_constant_is_not_a_second_spelling() {
         (TWO, "pub const CLAIM_LABEL: &str = \"claim\";\n"),
     ]);
     assert_eq!(complaints, Vec::<String>::new());
+}
+
+/// 代码平台的词一样按名字判：两处同名而词不同就是红。
+#[test]
+fn a_platform_word_renamed_in_one_crate_is_reported() {
+    let complaints = fixture_complaints(&[
+        (ONE, "pub const GITEE_PLATFORM: &str = \"gitee\";\n"),
+        (TWO, "pub const GITEE_PLATFORM: &str = \"gitee2\";\n"),
+    ]);
+    assert!(
+        complaints
+            .iter()
+            .any(|c| c.contains("GITEE_PLATFORM") && c.contains("gitee2")),
+        "{complaints:?}"
+    );
+}
+
+/// 以 `PLATFORM_` 开头的常量是各模块自己的环境变量名与路径，不是某个词的正身：
+/// 撞名而不同值是正当的，不许把它读成红。
+#[test]
+fn a_platform_prefixed_setting_is_not_a_word() {
+    let complaints = fixture_complaints(&[
+        (ONE, "pub const PLATFORM_REGISTRY_FILES: &str = \"*.rs\";\n"),
+        (TWO, "pub const PLATFORM_REGISTRY_FILES: &str = \"*.go\";\n"),
+    ]);
+    assert_eq!(complaints, Vec::<String>::new());
+}
+
+/// 提交信息上的 trailer 键一样按名字判：写出端与读回端各声明一份。
+#[test]
+fn a_trailer_key_renamed_in_one_crate_is_reported() {
+    let complaints = fixture_complaints(&[
+        (ONE, "const CHANGE_ID_TRAILER: &str = \"Change-Id\";\n"),
+        (TWO, "const CHANGE_ID_TRAILER: &str = \"Change-Id: \";\n"),
+    ]);
+    assert!(
+        complaints
+            .iter()
+            .any(|c| c.contains("CHANGE_ID_TRAILER") && c.contains("Change-Id: ")),
+        "{complaints:?}"
+    );
 }
 
 /// 名字撞上但不是词的常量（数上限、切片）不归本门管，也不许把它读成红。
