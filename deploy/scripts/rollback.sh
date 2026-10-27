@@ -25,9 +25,11 @@
 #     is a change to the platform, and changes go through review, not through
 #     this script;
 #   - a revision with no deploy/rendered/<profile>/ — there is nothing there to
-#     put back, and applying an empty directory would report success;
-#   - an unknown profile: the three profiles are the closed set the chart
-#     renders.
+#     put back, and applying an empty directory would report success; this is
+#     also how an unknown profile is refused, since the profiles that exist are
+#     the directories under deploy/rendered/ in that revision, not a list kept
+#     here;
+#   - a profile name outside [a-z0-9-] — it is pasted into a path.
 #
 # Usage:
 #   bash deploy/scripts/rollback.sh --to <rev> [--profile k3s-single] [--apply] [--wait]
@@ -49,7 +51,8 @@ namespace="cogneva"
 wait_secs="${COGNEVA_ROLLBACK_WAIT_SECS:-300}"
 
 usage() {
-    printf 'usage: bash %s --to <rev> [--profile k3s-single|k3s-multi|k8s-standard] [--apply] [--wait] [--repo <path>] [--namespace <ns>]\n' "${BASH_SOURCE[0]}" >&2
+    printf 'usage: bash %s --to <rev> [--profile <名字>] [--apply] [--wait] [--repo <path>] [--namespace <ns>]\n' "${BASH_SOURCE[0]}" >&2
+    printf '       <名字> 是那一版 deploy/rendered/ 下的一个目录（默认 k3s-single）\n' >&2
 }
 
 while [ $# -gt 0 ]; do
@@ -65,9 +68,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# profile 的闭集不在这里列：闭集是目标那一版的 `deploy/rendered/` 下真实存在的目录，
+# 下面那条 ls-tree 判的就是它。写死几个名字，新增的 profile 回滚时会被拒绝，理由还
+# 说成「不认识」——而那一版的树明明在。这里只判名字的形状，因为它要拼进路径。
 case "$profile" in
-    k3s-single|k3s-multi|k8s-standard) ;;
-    *) printf 'rollback: 不认识的 profile 「%s」——闭集是 k3s-single / k3s-multi / k8s-standard\n' "$profile" >&2; exit 2 ;;
+    ""|*[!a-z0-9-]*|-*)
+        printf 'rollback: profile 名字只认 [a-z0-9-] 且不以 - 开头（它要拼进 deploy/rendered/<名字>/）：%s\n' "$profile" >&2
+        exit 2 ;;
 esac
 
 if [ -z "$rev" ]; then

@@ -48,6 +48,10 @@ git -C "$FIX" init -q
 git -C "$FIX" config user.email t@example.com
 git -C "$FIX" config user.name t
 printf 'kind: ConfigMap\nmetadata:\n  name: old\n' > "$FIX/deploy/rendered/k3s-single/10-configmap.yaml"
+# 第二棵树：它不在任何名单里。用例 9c 用它证明 profile 的闭集是这一版
+# `deploy/rendered/` 下的目录，而不是脚本里抄的那三个名字。
+mkdir -p "$FIX/deploy/rendered/k3s-airgap"
+printf 'kind: ConfigMap\nmetadata:\n  name: airgap\n' > "$FIX/deploy/rendered/k3s-airgap/10-configmap.yaml"
 git -C "$FIX" add -A && git -C "$FIX" commit -qm one
 old_rev="$(git -C "$FIX" rev-parse HEAD)"
 printf 'kind: ConfigMap\nmetadata:\n  name: new\n' > "$FIX/deploy/rendered/k3s-single/10-configmap.yaml"
@@ -160,13 +164,33 @@ else
 fi
 git -C "$FIX" checkout -q master 2>/dev/null || git -C "$FIX" checkout -q main
 
-# 9. 不认识的 profile ⇒ 拒绝（闭集之外不猜）。
+# 9. 目标那一版没有这个 profile 的树 ⇒ 拒绝。profile 的闭集是那一版
+# `deploy/rendered/` 下的目录，不是脚本里的一份名单：名字对不对由树回答。
 out="$(run --repo "$FIX" --to "$old_rev" --profile k8s-weird)"
 rc=$?
-if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q '不认识的 profile'; then
-    ok "profile 闭集之外被拒"
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q '没有 deploy/rendered/k8s-weird/'; then
+    ok "目标那一版没有的 profile 被拒，且判词说的是缺那棵树"
 else
-    bad "不认识的 profile 没被拒（rc=$rc）：$(printf '%s' "$out" | tr '\n' ' ')"
+    bad "不存在的 profile 没被正确拒绝（rc=$rc）：$(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# 9b. 名字不合法 ⇒ 拒绝。它要拼进路径，越界的形状放过去就是拼出一条别的路径。
+out="$(run --repo "$FIX" --to "$old_rev" --profile ../k3s-single)"
+rc=$?
+if [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q '只认 \[a-z0-9-\]'; then
+    ok "越界的 profile 名字被拒在拼路径之前"
+else
+    bad "越界的 profile 名字没被拒（rc=$rc）：$(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# 9c. 目标那一版**有**这棵树，而名字从来没在任何名单里 ⇒ 放行。
+# 名单时代这里会被拒（「不认识」），而那一版的清单明明在。
+out="$(run --repo "$FIX" --to "$old_rev" --profile k3s-airgap)"
+rc=$?
+if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q 'profile=k3s-airgap'; then
+    ok "闭集是从树里读的：名单没提过的 profile 只要那一版有树就能回滚"
+else
+    bad "树里存在的 profile 被名单拒了（rc=$rc）：$(printf '%s' "$out" | tr '\n' ' ')"
 fi
 
 # 10. 不传 --to ⇒ 用法错（不是在当前版本上瞎滚）。
