@@ -49,10 +49,18 @@ scratch() {
 
 # No rustup on PATH unless a case puts one there: the structural cases must not
 # depend on what this machine happens to have installed.
+#
+# HOME moves too, and it has to: after PATH the gate looks in `~/.cargo/bin`,
+# so a runner that answers with its own preinstalled stable is reached through
+# HOME even when PATH was emptied. Measured on 2026-10-27: case 1 passed on
+# every author machine and failed on the CI runner, which is the same defect
+# the gate itself has — the question "is the author's compiler current" being
+# answered by whichever machine runs the gate. The fixture owns HOME so the
+# answer can only come from what the case put there.
 run_gate() {
     local dir="$1"
     shift
-    env -u GITHUB_ACTIONS PATH="${PATH_OVERRIDE:-/usr/bin:/bin}" "$@" \
+    env -u GITHUB_ACTIONS HOME="${dir}/home" PATH="${PATH_OVERRIDE:-/usr/bin:/bin}" "$@" \
         bash "${dir}/deploy/scripts/check-toolchain-matches-ci.sh"
 }
 
@@ -103,4 +111,17 @@ fi
 printf '%s' "${out}" | grep -q 'SKIP' \
     || fail "跳过要留下那一行，不能静默绿：${out}"
 
-echo "toolchain-matches-ci：四支各判一次，干净树绿"
+# 5) rustup is not on PATH but lives where the gate looks second: `~/.cargo/bin`,
+#    which is how this build host installs it. That copy is the author's, so it
+#    must be read — a case that emptied PATH and stopped there would let the gate
+#    answer "current" for a machine that never asked.
+d="$(scratch behind-in-home)"
+mkdir -p "${d}/home/.cargo/bin"
+cp "${fake}/rustup" "${d}/home/.cargo/bin/rustup"
+if out="$(run_gate "${d}" 2>&1)"; then
+    fail "本机 ~/.cargo/bin 里的 stable 落后时这条门应当红：${out}"
+fi
+printf '%s' "${out}" | grep -q 'update available' \
+    || fail "红的时候要带出 rustup 说的那句话：${out}"
+
+echo "toolchain-matches-ci：五支各判一次，干净树绿"
