@@ -21,10 +21,16 @@ tests:
     input_series:
       - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
         values: '2110x400'
+      - series: 'cogneva_change_dispatch_readouts_observed_timestamp_seconds{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '0+60x400'
       - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
         values: '1x400'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0+60x400'
       - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="proceed",pool_reading="available"}'
         values: '0x400'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.44:8080",decision="proceed",pool_reading="available"}'
+        values: '0+60x400'
     alert_rule_test:
       - eval_time: 359m
         alertname: CognevaChangeLedgerStoppedMoving
@@ -43,10 +49,16 @@ tests:
     input_series:
       - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
         values: '2110x720'
+      - series: 'cogneva_change_dispatch_readouts_observed_timestamp_seconds{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '0+60x720'
       - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
         values: '0x721'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0+60x721'
       - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="proceed",pool_reading="available"}'
         values: '1x721'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.44:8080",decision="proceed",pool_reading="available"}'
+        values: '0+60x721'
     alert_rule_test:
       - eval_time: 12h
         alertname: CognevaChangeLedgerStoppedMoving
@@ -59,8 +71,12 @@ tests:
     input_series:
       - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
         values: '0x721'
+      - series: 'cogneva_change_dispatch_readouts_observed_timestamp_seconds{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '0+60x721'
       - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
         values: '1x721'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0+60x721'
     alert_rule_test:
       - eval_time: 12h
         alertname: CognevaChangeLedgerStoppedMoving
@@ -73,8 +89,12 @@ tests:
     input_series:
       - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
         values: '2110x721'
+      - series: 'cogneva_change_dispatch_readouts_observed_timestamp_seconds{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '0+60x721'
       - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
         values: '1x121 0x600'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0+60x121 0'
     alert_rule_test:
       - eval_time: 100m
         alertname: CognevaChangeLedgerStoppedMoving
@@ -89,12 +109,20 @@ tests:
     input_series:
       - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
         values: '0x400'
+      - series: 'cogneva_change_dispatch_readouts_observed_timestamp_seconds{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '0+60x400'
       - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.45:8080",readout="change_ledger_pending"}'
         values: '2110x400'
+      - series: 'cogneva_change_dispatch_readouts_observed_timestamp_seconds{instance="10.42.0.45:8080",readout="change_ledger_pending"}'
+        values: '0+60x400'
       - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
         values: '0x400'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0+60x400'
       - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.45:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
         values: '1x400'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.45:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0+60x400'
     alert_rule_test:
       - eval_time: 361m
         alertname: CognevaChangeLedgerStoppedMoving
@@ -103,3 +131,47 @@ tests:
               severity: warning
               cogneva_io_managed: "true"
               cogneva_io_face: "变更管理"
+
+  # 六、写者停在待派发那一侧：读数还冻着「2110 条在等」，它自己的伴生钟不再动；判词那一族
+  # 的钟还在走（那一侧的写者假设活着）。这一条必须静——共享表会把最后一笔值永久送出去，靠一个
+  # 冻结的样本点亮的规则没有任何修法能熄灭它，读者第二次看见它就不会再看。该响的是写者本身
+  # （`background_loop_stalled` / `cogneva_loop_tick_age_seconds`）。
+  # 前半格（第 100 分钟）钉的是「还没到 for 的界」，后半格（第 12 小时）钉的才是年龄界。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '2110x721'
+      - series: 'cogneva_change_dispatch_readouts_observed_timestamp_seconds{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '0x721'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '1x721'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0+60x721'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts: []
+      - eval_time: 12h
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts: []
+
+  # 七、写者停在判词那一侧：判词那一格还冻着 1，待派发那一族的钟还在走。同样必须静。
+  # 这一格与上一格分开，是因为两半各有一个年龄界，缺哪一条都只有对应的那一格能看见：
+  # 合成一格会让「只删掉了一半的界」照样绿。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_readouts{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '2110x721'
+      - series: 'cogneva_change_dispatch_readouts_observed_timestamp_seconds{instance="10.42.0.44:8080",readout="change_ledger_pending"}'
+        values: '0+60x721'
+      - series: 'cogneva_change_dispatch_verdict{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '1x721'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{instance="10.42.0.44:8080",decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
+        values: '0x721'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts: []
+      - eval_time: 12h
+        alertname: CognevaChangeLedgerStoppedMoving
+        exp_alerts: []

@@ -26,6 +26,18 @@
 #
 # 为什么不一起读 `cogneva_change_dispatch_readouts{readout="held_back"}`：那是这一趟自己
 # 让出去的行数，随 pass 的切片大小变，与「账本动不动」不是一个问题。
+#
+# 为什么两半都带写者的年龄界：这两族都由共享表服务，写者停下时序列不会缺席，只会把最后
+# 一笔值永久送出去。一个死在点火那一侧的 pass 会让这条规则永远亮着——账本里那 2110 行还是
+# 2110 行、判词还是 paused，谁也没法把它灭掉，因为它读的已经不是账本了。所以每一处取值都要
+# 与自己的伴生钟 `_observed_timestamp_seconds` 取交：`time() - 钟 < 3600`。界取一小时是写者
+# 节律的两倍以上（实测两次 pass 相隔 2 到 14 分钟），健康写者在两次自己写入之间不会被读成
+# 停下。写者真停下时这一条自己静下来，那一格该响的是写者本身
+# （`background_loop_stalled` / `cogneva_loop_tick_age_seconds`），不是这条后果规则。
+#
+# 判词那半也要这一界，哪怕 `== 1` 看着像阈值：比对的另一边是个常量，所以左边的 gauge 就是
+# 被判的那个量；写者停下时那一格永远停在 1，这条规则跟着永远亮。阈值位指的是「拿 gauge 当
+# 界去判别的东西」，例如 `max(x) > <gauge>`——这一条里一个也没有。
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -39,9 +51,9 @@ spec:
       rules:
         - alert: CognevaChangeLedgerStoppedMoving
           expr: |
-            max (cogneva_change_dispatch_readouts{readout="change_ledger_pending"}) > 0
+            max (cogneva_change_dispatch_readouts{readout="change_ledger_pending"} and ((time() - cogneva_change_dispatch_readouts_observed_timestamp_seconds) < 3600)) > 0
               and on()
-            max (cogneva_change_dispatch_verdict{decision="paused_llm_pool_unavailable"}) == 1
+            max (cogneva_change_dispatch_verdict{decision="paused_llm_pool_unavailable"} and ((time() - cogneva_change_dispatch_verdict_observed_timestamp_seconds) < 3600)) == 1
           for: 6h
           labels:
             cogneva_io_managed: "true"
