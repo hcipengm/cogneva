@@ -893,8 +893,8 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
         TaskType::Custom(DISPATCH_TASK_KIND.into()),
         serde_json::json!({
             "goal": dispatch_goal(row),
-            "evolution_mode": "generate_change",
-            "task_kind": DISPATCH_TASK_KIND,
+            (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
+            (cog_core::INPUT_TASK_KIND): DISPATCH_TASK_KIND,
             "change_identity": {
                 "kind": row.identity.kind,
                 "scope": row.identity.scope,

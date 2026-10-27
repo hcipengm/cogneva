@@ -1484,7 +1484,7 @@ impl GitHubDiscoveryLoop {
                         "log_tail": l.log_tail,
                     }))
                     .collect::<Vec<_>>(),
-                "evolution_mode": "generate_change",
+                (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
             }),
         );
 
@@ -2021,7 +2021,7 @@ impl GitHubDiscoveryLoop {
                 "issue_labels": issue.labels,
                 "issue_url": issue.url,
                 "conversation": history,
-                "evolution_mode": "generate_change",
+                (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
             }),
         );
 
@@ -2120,7 +2120,7 @@ impl GitHubDiscoveryLoop {
                 "pr_body": pr.body,
                 "pr_labels": pr.labels,
                 "pr_url": pr.url,
-                "evolution_mode": "generate_change",
+                (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
             }),
         );
 

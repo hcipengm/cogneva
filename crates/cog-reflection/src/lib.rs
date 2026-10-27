@@ -835,8 +835,8 @@ impl ReflectionEngine {
             cog_core::TaskType::Custom("change_rework".into()),
             serde_json::json!({
                 "goal": goal,
-                "evolution_mode": "generate_change",
-                "task_kind": "change_rework",
+                (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
+                (cog_core::INPUT_TASK_KIND): "change_rework",
                 "learning_id": l.id,
                 "rejection_cause": l.rejection_cause.map(|c| c.as_str()),
                 // The two things the main flow needs, as fields rather than only

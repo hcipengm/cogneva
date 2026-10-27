@@ -1870,7 +1870,7 @@ async fn redrive(
             "reverted_rev": record.landed_rev,
             "base_branch": record.base,
             "failure_log": log,
-            "evolution_mode": "generate_change",
+            (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
         }),
     );
     match orchestrator.submit_goal_auto(&goal, vec![task]).await {

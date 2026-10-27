@@ -2107,7 +2107,7 @@ fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog_cor
         cog_core::TaskType::Custom("capability_discovery".into()),
         serde_json::json!({
             "goal": goal,
-            "task_kind": "capability_discovery",
+            (cog_core::INPUT_TASK_KIND): "capability_discovery",
             // 这道探针是**哪一个组合**的一次尝试，按生成器过滤用的那个串写出来。
             // 它随工作一起走，因为下游只有这一条路能知道：从 `tools` 反推只复现得出
             // 配对那一种语法（`tool:a+b`），另外三种（参数 / 迁移 / 边界）反推不出来，

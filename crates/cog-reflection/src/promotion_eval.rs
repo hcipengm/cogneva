@@ -387,8 +387,8 @@ impl PromotionEval {
             task_id.clone(),
             TaskType::Custom("promotion_eval".into()),
             serde_json::json!({
-                "evolution_mode": "promotion",
-                "task_kind": "promotion_eval",
+                (cog_core::INPUT_EVOLUTION_MODE): "promotion",
+                (cog_core::INPUT_TASK_KIND): "promotion_eval",
                 "change_id": change_id,
                 "rev": source.rev,
                 "repo": source.repo.display().to_string(),

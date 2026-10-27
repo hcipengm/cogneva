@@ -714,8 +714,8 @@ async fn submit_intent(
                 TaskType::Custom(task_kind.into()),
                 serde_json::json!({
                     "goal": goal,
-                    "evolution_mode": "generate_change",
-                    "task_kind": task_kind,
+                    (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
+                    (cog_core::INPUT_TASK_KIND): task_kind,
                     "signal": detail,
                 }),
             );
@@ -816,8 +816,11 @@ async fn tick(
         if task.status != TaskStatus::Failed || task.updated_at < window_start {
             continue;
         }
-        let is_evolution =
-            task.input.get("evolution_mode").and_then(|v| v.as_str()) == Some("generate_change");
+        let is_evolution = task
+            .input
+            .get(cog_core::INPUT_EVOLUTION_MODE)
+            .and_then(|v| v.as_str())
+            == Some(cog_core::EVOLUTION_MODE_GENERATE_CHANGE);
         if !is_evolution {
             continue;
         }

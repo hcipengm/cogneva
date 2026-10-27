@@ -142,7 +142,8 @@ impl PlannerActor {
         let is_self_evolution = task.is_self_evolution();
 
         if is_self_evolution {
-            contract["evolution_mode"] = serde_json::json!("generate_change");
+            contract[cog_core::INPUT_EVOLUTION_MODE] =
+                serde_json::json!(cog_core::EVOLUTION_MODE_GENERATE_CHANGE);
             contract["response_format"] = serde_json::json!("json");
             contract["output_schema"] = serde_json::json!({
                 "summary": "string: concise plan summary",

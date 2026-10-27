@@ -27,5 +27,6 @@ pub use self_review::{SelfReviewConfig, SelfReviewRecord, SelfReviewResult};
 pub use task::{
     ActionPlannerMeta, ActionPlannerSource, DagMessage, EvolutionIntent, GoalClass,
     GoalClassSource, GoalMessage, GoalSource, Task, TaskDAG, TaskFilter, TaskKindRecord,
-    TaskPayload, TaskPlan, TaskStatus, TaskStatusCounts, TaskType, UNGROUPED_PROJECT,
+    TaskPayload, TaskPlan, TaskStatus, TaskStatusCounts, TaskType, EVOLUTION_MODE_GENERATE_CHANGE,
+    INPUT_EVOLUTION_MODE, INPUT_TASK_KIND, UNGROUPED_PROJECT,
 };

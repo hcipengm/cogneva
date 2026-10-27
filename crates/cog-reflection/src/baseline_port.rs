@@ -574,8 +574,8 @@ impl BaselinePorter {
             task_id.clone(),
             TaskType::Custom("baseline_port_absorb_check".into()),
             serde_json::json!({
-                "evolution_mode": "baseline_port",
-                "task_kind": "baseline_port_absorb_check",
+                (cog_core::INPUT_EVOLUTION_MODE): "baseline_port",
+                (cog_core::INPUT_TASK_KIND): "baseline_port_absorb_check",
                 "change_id": change.change_id,
                 "baseline_tag": new_tag,
             }),
@@ -990,8 +990,8 @@ impl BaselinePorter {
             task_id.clone(),
             TaskType::Custom("baseline_port_resolve".into()),
             serde_json::json!({
-                "evolution_mode": "baseline_port",
-                "task_kind": "baseline_port_resolve",
+                (cog_core::INPUT_EVOLUTION_MODE): "baseline_port",
+                (cog_core::INPUT_TASK_KIND): "baseline_port_resolve",
                 "change_id": change.change_id,
                 "baseline_tag": new_tag,
                 "round": round,
@@ -1073,8 +1073,8 @@ impl BaselinePorter {
             ),
             TaskType::Custom("baseline_port_rework".into()),
             serde_json::json!({
-                "evolution_mode": "generate_change",
-                "task_kind": "baseline_port_rework",
+                (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
+                (cog_core::INPUT_TASK_KIND): "baseline_port_rework",
                 "change_id": change.change_id,
                 "baseline_tag": new_tag,
                 "intent": intent,
@@ -1223,8 +1223,8 @@ impl BaselinePorter {
             task_id.clone(),
             TaskType::Custom("baseline_port_eval".into()),
             serde_json::json!({
-                "evolution_mode": "baseline_port",
-                "task_kind": "baseline_port_eval",
+                (cog_core::INPUT_EVOLUTION_MODE): "baseline_port",
+                (cog_core::INPUT_TASK_KIND): "baseline_port_eval",
                 "change_id": change.change_id,
                 "baseline_tag": new_tag,
                 "round": round,

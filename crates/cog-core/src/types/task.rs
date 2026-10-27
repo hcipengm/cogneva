@@ -703,6 +703,24 @@ pub struct TaskPayload {
     pub priority: i32,
 }
 
+// ─── Self-evolution markers on a task's own input ──────────────────────────
+//
+// These live on `task.input`, which is free-form JSON: producers in other
+// crates write them and this crate decides what they mean. Spelling them by
+// hand on both sides makes the reader's copy authoritative over nothing — the
+// writer keeps filling in the old word, the reader keeps comparing against the
+// new one, and every task quietly stops being recognised. Nothing fails; the
+// flow just degrades into ordinary output.
+
+/// The `task.input` key that marks a task as part of the self-evolution flow.
+pub const INPUT_EVOLUTION_MODE: &str = "evolution_mode";
+
+/// The `evolution_mode` value that selects the change-generation flow.
+pub const EVOLUTION_MODE_GENERATE_CHANGE: &str = "generate_change";
+
+/// The `task.input` key that names which entry point submitted the task.
+pub const INPUT_TASK_KIND: &str = "task_kind";
+
 impl Task {
     pub fn new(id: impl Into<String>, task_type: TaskType, input: serde_json::Value) -> Self {
         let now = Utc::now();
@@ -832,7 +850,11 @@ impl Task {
     /// degrades into ordinary narrative output.
     pub fn is_self_evolution(&self) -> bool {
         matches!(&self.task_type, TaskType::Custom(s) if s == "self_evolution")
-            || self.input.get("evolution_mode").and_then(|v| v.as_str()) == Some("generate_change")
+            || self
+                .input
+                .get(INPUT_EVOLUTION_MODE)
+                .and_then(|v| v.as_str())
+                == Some(EVOLUTION_MODE_GENERATE_CHANGE)
     }
 
     /// Which entry point submitted this self-evolution task, or `None` for a
@@ -852,7 +874,7 @@ impl Task {
         }
         let kind = self
             .input
-            .get("task_kind")
+            .get(INPUT_TASK_KIND)
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .or(match &self.task_type {

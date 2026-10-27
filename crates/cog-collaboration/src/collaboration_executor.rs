@@ -1110,7 +1110,8 @@ impl CollaborationExecutor {
         // Only mark the mode; generator/evaluator add their own role-specific
         // schemas. Putting detailed change instructions here leaks into the
         // planner and makes it emit XML/artifact markup instead of a plan.
-        base["evolution_mode"] = serde_json::json!("generate_change");
+        base[cog_core::INPUT_EVOLUTION_MODE] =
+            serde_json::json!(cog_core::EVOLUTION_MODE_GENERATE_CHANGE);
         if base.get("goal").is_none() {
             base["goal"] = serde_json::json!(goal);
         }
