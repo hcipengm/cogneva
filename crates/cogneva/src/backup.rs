@@ -1755,7 +1755,7 @@ async fn finish_backup(
             // 唯一那份声明。打包之后就算不出来了——staging 已经删掉。
             let coverage = package_coverage(&manifest);
             let manifest_json = serde_json::to_string_pretty(&manifest)?;
-            std::fs::write(staging.join("manifest.json"), format!("{manifest_json}\n"))?;
+            std::fs::write(staging.join(MANIFEST_FILE), format!("{manifest_json}\n"))?;
             let package = cfg.backup_dir.join(package_name(now));
             tar_package_with_key(staging, staging_name, &package, key.as_ref())?;
             std::fs::remove_dir_all(staging)?;
@@ -1822,7 +1822,7 @@ async fn run_backup_into(
         &cfg.secrets_dir,
         &cfg.oob_secrets_dir,
         &cfg.namespace,
-        &staging.join("secrets"),
+        &staging.join(SECRETS_DIR),
         sealed,
     )?;
 
@@ -1834,7 +1834,7 @@ async fn run_backup_into(
     segments.push(segment_stamp("postgres"));
 
     let qdrant = QdrantHttp::new(&cfg.qdrant_http_url);
-    let qdrant_dir = staging.join("qdrant");
+    let qdrant_dir = staging.join(QDRANT_DIR);
     std::fs::create_dir_all(&qdrant_dir)?;
     let mut collections = Vec::new();
     for name in qdrant.collection_names().await? {
@@ -1849,7 +1849,7 @@ async fn run_backup_into(
     // `lossy_surfaces` 点名，不能安静地记成 0 个文件。
     let objects_dir = local_objects_dir(&cfg.data_dir);
     let (files, bytes) = match &objects_dir {
-        Some(src) => copy_tree(src, &staging.join("objects").join("storage"))?,
+        Some(src) => copy_tree(src, &staging.join(PACKAGE_OBJECTS_DIR).join(OBJECTS_SUBDIR))?,
         None => (0, 0),
     };
     segments.push(segment_stamp("objects"));
@@ -1862,7 +1862,7 @@ async fn run_backup_into(
     // 在 manifest 里留下读数，恢复端才知道该把哪一份种回去。
     let evolution_bundle = match bundle_evolution(
         cfg.git_remote_dir.as_deref(),
-        &staging.join("git"),
+        &staging.join(GIT_DIR),
     ) {
         Ok(report) => report,
         Err(e) => {
@@ -1925,6 +1925,23 @@ async fn run_backup_into(
     })
 }
 
+/// 备份包的目录布局。出包、核包、恢复与演练各读一遍这些名字；各写一份字面量时，
+/// 改名只会让其中一侧找不到东西，而「找不到」在几处读起来就是「这个包没有这一段」。
+const MANIFEST_FILE: &str = "manifest.json";
+const SECRETS_DIR: &str = "secrets";
+const QDRANT_DIR: &str = "qdrant";
+const ARTIFACTS_DIR: &str = "artifacts";
+const GIT_DIR: &str = "git";
+const EVOLUTION_BUNDLE_FILE: &str = "evolution.bundle";
+
+/// 数据根下装对象的那一级。
+const OBJECTS_SUBDIR: &str = "storage";
+
+/// 包里对象层的那一层。与 [`OBJECTS_SUBDIR`] 同名同构：恢复端按同一个相对布局
+/// 把整棵抄回去，两边各写一份字面量只会在改名之后让恢复把对象放到别处——那边
+/// 没有读者会报错，只是从此读不到对象。
+const PACKAGE_OBJECTS_DIR: &str = "objects";
+
 /// 对象层的本地子树，**只有它真在盘上**才算这个包该带走的东西。
 ///
 /// 备份进程只拿得到数据根，读不到 `providers.storage.options.base_path`，所以按
@@ -1932,7 +1949,7 @@ async fn run_backup_into(
 /// 不存在的源返回 `(0, 0)`——「一个对象都没带」与「本来就没有对象」在清单上同形，
 /// 所以缺席要进 `lossy_surfaces`，不在这里安静地返回一个空结果。
 fn local_objects_dir(data_dir: &Path) -> Option<PathBuf> {
-    let dir = data_dir.join("storage");
+    let dir = data_dir.join(OBJECTS_SUBDIR);
     dir.is_dir().then_some(dir)
 }
 
@@ -2143,7 +2160,7 @@ fn bundle_evolution(
         return Ok(None);
     }
     std::fs::create_dir_all(out_dir)?;
-    let bundle = out_dir.join("evolution.bundle");
+    let bundle = out_dir.join(EVOLUTION_BUNDLE_FILE);
     let partial = out_dir.join("evolution.bundle.partial");
     let _ = std::fs::remove_file(&partial);
     let partial_s = partial
@@ -2258,7 +2275,7 @@ async fn export_decision_stats(pool: &PgPool, staging: &Path, report: &mut Artif
     };
 
     let staged = staging
-        .join("artifacts")
+        .join(ARTIFACTS_DIR)
         .join("app")
         .join(cog_reflection::DATA_SUBDIR)
         .join(cog_reflection::DECISION_STATS_FILE);
@@ -2408,7 +2425,7 @@ async fn collect_artifact_root(
     if policies_src.is_dir() {
         report.policies_present = true;
         let dst = staging
-            .join("artifacts")
+            .join(ARTIFACTS_DIR)
             .join(root)
             .join(cog_reflection::POLICIES_SUBDIR);
         copy_policy_tree(&policies_src, &dst)?;
@@ -2418,7 +2435,7 @@ async fn collect_artifact_root(
     let stats_src = cog_reflection::decision_stats_path(dir);
     if stats_src.is_file() {
         let dst = staging
-            .join("artifacts")
+            .join(ARTIFACTS_DIR)
             .join(root)
             .join(cog_reflection::DATA_SUBDIR);
         std::fs::create_dir_all(&dst)?;
@@ -2439,7 +2456,7 @@ async fn collect_artifact_root(
     let workspace_src = cog_gateway::ide::workspace_root(dir);
     if workspace_src.is_dir() {
         let dst = staging
-            .join("artifacts")
+            .join(ARTIFACTS_DIR)
             .join(root)
             .join(cog_gateway::ide::WORKSPACE_SUBDIR);
         let (files, bytes) = copy_tree(&workspace_src, &dst)?;
@@ -2701,7 +2718,7 @@ fn verify_package_against_manifest(
     // qdrant：声明的集合集与包内 `qdrant/<集合>.snapshot` 集相等。快照的
     // 服务端名字（`snapshot`）落进文件后无从复算，只核文件在不在。
     if !manifest.qdrant.is_empty() {
-        let qdrant_dir = pkg_dir.join("qdrant");
+        let qdrant_dir = pkg_dir.join(QDRANT_DIR);
         let mut found: BTreeMap<String, ()> = BTreeMap::new();
         if qdrant_dir.is_dir() {
             for entry in std::fs::read_dir(&qdrant_dir)? {
@@ -2731,7 +2748,7 @@ fn verify_package_against_manifest(
     // objects：声明的文件数与字节数与包内实测一致。两个数都为 0 视作没有这一段
     // （旧格式），跳过——不然一个真有对象的包会拿默认值去撞一次误报。
     if manifest.objects.files != 0 || manifest.objects.bytes != 0 {
-        let (files, bytes) = measure_tree(&pkg_dir.join("objects").join("storage"))?;
+        let (files, bytes) = measure_tree(&pkg_dir.join(PACKAGE_OBJECTS_DIR).join(OBJECTS_SUBDIR))?;
         if files != manifest.objects.files || bytes != manifest.objects.bytes {
             problems.push(format!(
                 "objects: manifest declares {} file(s)/{} byte(s), package holds {files}/{bytes}",
@@ -2743,7 +2760,7 @@ fn verify_package_against_manifest(
     // secrets：声明里每个键都属于某个对象，包内该对象的 `<对象名>.yaml` 必须在。
     // 只核对象粒度——键的内容是 base64，写进 manifest 的只有键名清单。
     if !manifest.secrets_keys.is_empty() {
-        let secrets_dir = pkg_dir.join("secrets");
+        let secrets_dir = pkg_dir.join(SECRETS_DIR);
         let mut declared_objects: BTreeMap<String, ()> = BTreeMap::new();
         for key in &manifest.secrets_keys {
             if let Some((object, _)) = key.split_once('/') {
@@ -2763,7 +2780,7 @@ fn verify_package_against_manifest(
     // 与「文件不在」是两种不同的坏，分开说。内容能不能打开由种子那一步用
     // `git bundle verify` 判——那是唯一会真正消费它的地方。
     if let Some(bundle) = &manifest.evolution_bundle {
-        let path = pkg_dir.join("git").join("evolution.bundle");
+        let path = pkg_dir.join(GIT_DIR).join(EVOLUTION_BUNDLE_FILE);
         match std::fs::metadata(&path) {
             Ok(meta) if meta.len() == bundle.bytes => {}
             Ok(meta) => problems.push(format!(
@@ -2812,7 +2829,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
         None => pkg.to_path_buf(),
     };
 
-    let manifest_path = pkg_dir.join("manifest.json");
+    let manifest_path = pkg_dir.join(MANIFEST_FILE);
     if !manifest_path.exists() {
         return Err(format!("{} missing manifest.json", pkg_dir.display()).into());
     }
@@ -2848,7 +2865,7 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let qdrant_dir = pkg_dir.join("qdrant");
+    let qdrant_dir = pkg_dir.join(QDRANT_DIR);
     if qdrant_dir.exists() {
         let qdrant_http_url = std::env::var(QDRANT_HTTP_URL_ENV)
             .map_err(|_| "package has qdrant snapshots but COGNEVA_QDRANT_HTTP_URL is unset")?;
@@ -2866,9 +2883,9 @@ pub async fn run_restore(pkg: &Path) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let objects_src = pkg_dir.join("objects").join("storage");
+    let objects_src = pkg_dir.join(PACKAGE_OBJECTS_DIR).join(OBJECTS_SUBDIR);
     if objects_src.exists() {
-        let (files, bytes) = copy_tree(&objects_src, &data_dir.join("storage"))?;
+        let (files, bytes) = copy_tree(&objects_src, &data_dir.join(OBJECTS_SUBDIR))?;
         tracing::info!(files, bytes, "objects restored");
     }
 
@@ -2905,7 +2922,7 @@ fn seed_evolution_bundle(
     let Some(report) = &manifest.evolution_bundle else {
         return Ok(());
     };
-    let bundle = pkg_dir.join("git").join("evolution.bundle");
+    let bundle = pkg_dir.join(GIT_DIR).join(EVOLUTION_BUNDLE_FILE);
     let target = match std::env::var("COGNEVA_RESTORE_GIT_REMOTE_DIR") {
         Ok(value) if !value.trim().is_empty() => PathBuf::from(value),
         _ => {
@@ -3318,7 +3335,7 @@ async fn restore_artifact_root(
     target: &Path,
     readings: &mut Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let base = pkg_dir.join("artifacts").join(&root.root);
+    let base = pkg_dir.join(ARTIFACTS_DIR).join(&root.root);
     std::fs::create_dir_all(target)?;
     let scratch = target.join(format!(".restore-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&scratch)?;
@@ -4230,7 +4247,7 @@ fn plaintext_package_carrying_credentials(pkg: &Path) -> std::io::Result<Option<
         let path = entry.path()?;
         let in_secrets_dir = path
             .components()
-            .any(|c| c.as_os_str() == std::ffi::OsStr::new("secrets"));
+            .any(|c| c.as_os_str() == std::ffi::OsStr::new(SECRETS_DIR));
         let is_manifest = path
             .extension()
             .is_some_and(|e| e == std::ffi::OsStr::new("yaml"));
@@ -4316,7 +4333,7 @@ async fn drill_once(
     let pkg_dir = untar_package(&package, &extract_root)?;
 
     let manifest: BackupManifest =
-        serde_json::from_str(&std::fs::read_to_string(pkg_dir.join("manifest.json"))?)?;
+        serde_json::from_str(&std::fs::read_to_string(pkg_dir.join(MANIFEST_FILE))?)?;
     tracing::info!(
         package = %package.display(),
         created_at = %manifest.created_at,
@@ -4382,7 +4399,7 @@ async fn verify_artifact_stores(
     drill: &mut BackupDrillRecord,
 ) {
     for root in &manifest.artifacts {
-        let base = pkg_dir.join("artifacts").join(&root.root);
+        let base = pkg_dir.join(ARTIFACTS_DIR).join(&root.root);
         if root.policies_present {
             let store = cog_reflection::PolicyStore::new(cog_reflection::policies_path(&base));
             for reported in &root.policy_stores {
