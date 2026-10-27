@@ -630,6 +630,12 @@ pub enum LoopSeverity {
 /// variant carries its own note at its declaration. A list of subscribers
 /// written up here goes stale the moment one is added, and reads the same
 /// whether it is still true or not.
+///
+/// The `type` tag below is the only name a variant has. It is what a serialized
+/// event carries, and a name accessor beside it would be the same vocabulary
+/// written a second time by hand — one that keeps compiling after the two drift
+/// apart, and whose stale word would make a filter match nothing while reading
+/// exactly like an event that never fired.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 #[allow(clippy::large_enum_variant)]
@@ -955,37 +961,6 @@ fn rfc3339(unix: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(unix, 0)
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(|| format!("unix {unix}"))
-}
-
-impl SupervisorEvent {
-    /// Return the supervisor event type name for filtering.
-    pub fn name(&self) -> &'static str {
-        match self {
-            SupervisorEvent::Tick { .. } => "tick",
-            SupervisorEvent::AgentUnhealthy { .. } => "agent_unhealthy",
-            SupervisorEvent::AgentRecovered { .. } => "agent_recovered",
-            SupervisorEvent::AgentKilled { .. } => "agent_killed",
-            SupervisorEvent::AgentRestarted { .. } => "agent_restarted",
-            SupervisorEvent::CheckpointRequested { .. } => "checkpoint_requested",
-            SupervisorEvent::CrewRetried { .. } => "crew_retried",
-            SupervisorEvent::AgentTasksReclaimed { .. } => "agent_tasks_reclaimed",
-            SupervisorEvent::SquadRespawnRequested { .. } => "squad_respawn_requested",
-            SupervisorEvent::SquadRespawnExecuted { .. } => "squad_respawn_executed",
-            SupervisorEvent::QuotaThresholdBreached { .. } => "quota_threshold_breached",
-            SupervisorEvent::QuotaRecovered { .. } => "quota_recovered",
-            SupervisorEvent::LlmUpstreamPoolDown { .. } => "llm_upstream_pool_down",
-            SupervisorEvent::LlmUpstreamPoolRecovered { .. } => "llm_upstream_pool_recovered",
-            SupervisorEvent::Rebalance { .. } => "rebalance",
-            SupervisorEvent::AgentRuntimeDetected { .. } => "agent_loop_detected",
-            SupervisorEvent::TaskHandOff { .. } => "task_hand_off",
-            SupervisorEvent::TaskRetry { .. } => "task_retry",
-            SupervisorEvent::AgentResourceAlert { .. } => "agent_resource_alert",
-            SupervisorEvent::TaskDeadLetter { .. } => "task_dead_letter",
-            SupervisorEvent::EventAggregated { .. } => "event_aggregated",
-            SupervisorEvent::ScaleRecommendation { .. } => "scale_recommendation",
-            SupervisorEvent::AgentEventReported { .. } => "agent_event_reported",
-        }
-    }
 }
 
 #[cfg(test)]
