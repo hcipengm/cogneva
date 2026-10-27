@@ -1919,6 +1919,29 @@ rows:
       sharing the database stays out of the deletion; negative and unreadable
       values fall back to 30.
 
+  - key: llmUsageRetention.keepDays
+    source: override
+    why: >-
+      Days the token ledger keeps its per-call rows. gateway_llm_usage is one row
+      per upstream call -- tokens in and out, the latency, the task it was bought
+      for -- and nothing had ever removed a row from it: on 2026-10-27 it held
+      312,803 rows over 32 days, 80 MB, about 9,800 rows a day, and the count
+      follows call volume, which has no ceiling of its own. Age is the wrong
+      cutoff on its own, because the hourly fold beside it (cog_llm_usage_rollup)
+      is a derivation of this ledger: a row that no window summed is the only
+      copy of that spend, so deleting it would leave the aggregate reporting the
+      hour as quiet forever with nothing to recompute it from. The sweep
+      therefore deletes only what is both past this age and inside the fold's own
+      range, and publishes the rows it cannot touch as
+      cogneva_llm_usage_uncovered_rows with their oldest age beside it; the rule
+      fires when that pair says the fold has stopped reaching back past the
+      retention, which is the state where the table stops being bounded by
+      anything. What the reader loses at this age is the per-call detail -- which
+      task bought which tokens -- while the hourly sums stay indefinitely.
+      Values below 1, and values that cannot be read, fall back to 30: a
+      retention of zero would empty the per-call detail on every pass, which
+      reads as a sweep that works while the table is empty by construction.
+
   - key: checkpointStore.readWindowSeconds
     source: override
     why: >-

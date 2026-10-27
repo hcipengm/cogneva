@@ -234,6 +234,31 @@ metric_names! {
     LLM_EXCHANGE_BYTES => "gateway_llm_exchange_bytes",
     LLM_EXCHANGE_SWEEP_FAILED => "gateway_llm_exchange_sweep_failed",
 
+    // cog-observability — the token ledger's retention, and what it may not
+    // retire.
+    //
+    // `gateway_llm_usage` is one row per upstream call; nothing ever removed a
+    // row from it, and the count follows call volume, which has no ceiling of
+    // its own.
+    // Measured on 2026-10-27 on this deployment: 312,803 rows over 32 days, 80 MB.
+    //
+    // Age alone cannot be the cutoff. The hourly fold is a *derivation* of this
+    // ledger, so a row no window covered is the only copy of that spend:
+    // deleting it would leave the fold reporting the hour as quiet forever,
+    // with nothing to recompute it from. The sweep therefore reads both halves
+    // — past the retention, and below the fold's own floor — and the pair
+    // `uncovered_rows` / `uncovered_oldest_age_seconds` is what says the second
+    // half has stopped holding: rows exist that the retention cannot touch, and
+    // they are already past the age the deployment promised. A count without
+    // the age cannot tell a fold catching up by an hour from a ledger that has
+    // been unbounded for a month.
+    LLM_USAGE_ROWS => "cogneva_llm_usage_rows",
+    LLM_USAGE_OLDEST_AGE_SECONDS => "cogneva_llm_usage_oldest_age_seconds",
+    LLM_USAGE_KEEP_SECONDS => "cogneva_llm_usage_keep_seconds",
+    LLM_USAGE_UNCOVERED_ROWS => "cogneva_llm_usage_uncovered_rows",
+    LLM_USAGE_UNCOVERED_OLDEST_AGE_SECONDS => "cogneva_llm_usage_uncovered_oldest_age_seconds",
+    LLM_USAGE_SWEEP_FAILED => "cogneva_llm_usage_sweep_failed",
+
     // cog-storage — the monthly partition maintenance loop's per-round outcome.
     //
     // The loop keeps every time-series parent's window open ahead of the clock

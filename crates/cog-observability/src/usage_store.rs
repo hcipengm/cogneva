@@ -536,6 +536,47 @@ pub fn windows_to_roll(
     windows
 }
 
+/// The windows just below `first_folded`, oldest first, down to `floor`.
+///
+/// The head catch-up only ever lands windows after the newest one folded, so a
+/// deployment whose first run was bounded by the lookback has a stretch of
+/// ledger that no window has ever summed. That stretch is not merely unread —
+/// it makes the rows in it undeletable, because deleting them would destroy the
+/// only copy of spend the fold never counted. This is the other direction of
+/// the same cursor: at most `max_windows` per call, so a backfill over months
+/// of ledger is a series of passes rather than one statement that looks like a
+/// stopped loop, and never below `floor`, which is the oldest row the ledger
+/// still holds.
+///
+/// Snapped to the same grid as [`windows_to_roll`]: a window boundary is a
+/// function of the epoch, not of when a process happened to look, which is what
+/// lets the backfill and the head catch-up meet without overlapping or leaving
+/// a hole between them.
+pub fn windows_before(
+    first_folded: DateTime<Utc>,
+    floor: DateTime<Utc>,
+    window_secs: i64,
+    max_windows: usize,
+) -> Vec<RollupWindow> {
+    let w = window_secs.max(1);
+    let grid = |t: DateTime<Utc>| t.timestamp() - t.timestamp().rem_euclid(w);
+    let mut end = grid(first_folded);
+    let lowest = grid(floor);
+    let mut windows = Vec::new();
+    while windows.len() < max_windows && end - w >= lowest {
+        let (Some(s), Some(e)) = (
+            DateTime::from_timestamp(end - w, 0),
+            DateTime::from_timestamp(end, 0),
+        ) else {
+            break;
+        };
+        windows.push(RollupWindow { start: s, end: e });
+        end -= w;
+    }
+    windows.reverse();
+    windows
+}
+
 /// PostgreSQL usage store.
 /// 台账的两个闭集，按各自声明的全部取值铺成模板槽位。
 ///
@@ -1473,6 +1514,34 @@ impl LlmUsageStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.and_then(|r| r.get::<Option<DateTime<Utc>>, _>("last")))
+    }
+
+    /// Start of the oldest window already folded, or `None` when the rollup
+    /// table is empty.
+    ///
+    /// This is the lower bound of what the fold has answered for. A ledger row
+    /// before it was never summed by any window, so it is the only record of
+    /// that spend; the backfill reaches downward from here, and the retention
+    /// may not delete below it. One reading serves both because they must never
+    /// disagree: a deletion that ran below what the fold covered would remove
+    /// the last copy of a number the rollup never had.
+    pub async fn first_rolled_window_start(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let row = sqlx::query(&format!(
+            "SELECT MIN(window_start) AS first FROM {ROLLUP_TABLE}"
+        ))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| r.get::<Option<DateTime<Utc>>, _>("first")))
+    }
+
+    /// The oldest row the ledger holds, or `None` when it is empty. The
+    /// backfill walks down to this: everything the ledger still keeps is what
+    /// the fold has to be able to answer for before any of it is retired.
+    pub async fn oldest_ledger_ts(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
+        let row = sqlx::query(&format!("SELECT MIN(ts) AS oldest FROM {LEDGER_TABLE}"))
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.and_then(|r| r.get::<Option<DateTime<Utc>>, _>("oldest")))
     }
 
     /// Token spend per `(actor, origin, upstream, api_style)` over the closed windows

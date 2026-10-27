@@ -2293,6 +2293,36 @@
           "face": "资源泄漏与长稳"
         },
         {
+          "name": "llm_usage_retention_behind",
+          "promql": "(min_over_time(((max without (pod, container, instance) (cogneva_llm_usage_oldest_age_seconds)) and ((time() - (max without (pod, container, instance) (cogneva_llm_usage_oldest_age_seconds_observed_timestamp_seconds))) < 1800))[30m:1m]) > 2 * max without (pod, container, instance) (cogneva_llm_usage_keep_seconds and ((time() - cogneva_llm_usage_keep_seconds_observed_timestamp_seconds) < 1800))) and (count_over_time(max without (pod, container, instance) (cogneva_llm_usage_oldest_age_seconds)[1h:1m]) > count_over_time(max without (pod, container, instance) (cogneva_llm_usage_oldest_age_seconds)[30m:1m]))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The token ledger reaches back {value} second(s), more than twice the retention the publishing process says it enforces, so per-call rows are not being retired at the age this deployment promises. The ledger is one row per upstream call and the hourly fold beside it keeps the sums indefinitely, so what the retention bounds is the per-call detail -- which task bought which tokens -- rather than the account itself. Both sides of this comparison are the loop's own readings rather than numbers written here, so a deployment that shortens what it keeps moves its own judgement with it. Twice rather than once because the sweep runs on a period and a healthy ledger is allowed to sit at its retention between two passes; the second clause requires the excess to have survived that whole window rather than to have appeared in one scrape.",
+          "face": "资源泄漏与长稳"
+        },
+        {
+          "name": "llm_usage_fold_behind",
+          "promql": "(max without (pod, container, instance) (cogneva_llm_usage_uncovered_rows and ((time() - cogneva_llm_usage_uncovered_rows_observed_timestamp_seconds) < 1800)) > 0) and (max without (pod, container, instance) (cogneva_llm_usage_uncovered_oldest_age_seconds and ((time() - cogneva_llm_usage_uncovered_oldest_age_seconds_observed_timestamp_seconds) < 1800)) > max without (pod, container, instance) (cogneva_llm_usage_keep_seconds and ((time() - cogneva_llm_usage_keep_seconds_observed_timestamp_seconds) < 1800)))",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The token ledger holds {value} row(s) past the retention that the sweep may not retire, because the hourly fold has never reached back to them. The fold is a derivation of this ledger: a row no window summed is the only copy of that spend, so deleting it would leave the aggregate reporting the hour as quiet forever, with nothing left to recompute it from. The sweep therefore asks two questions -- past the retention, and inside what the fold covers -- and this rule fires when the second has stopped holding for longer than the retention itself, which is the state where the table stops being bounded by anything. A fold that is merely catching up also reports uncovered rows; the age is what separates the two, which is why the rule requires both readings rather than the count alone.",
+          "face": "资源泄漏与长稳"
+        },
+        {
+          "name": "llm_usage_retention_pass_failed",
+          "promql": "(max without (pod, container, instance) (max_over_time(cogneva_llm_usage_sweep_failed[30m]) and ((time() - cogneva_llm_usage_sweep_failed_observed_timestamp_seconds) < 1800))) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The token ledger's retention pass could not be completed at some attempt in the last half hour, {value} being the highest outcome those attempts recorded. A pass deletes in batches up to the cutoff and then measures what is left; the row count, the age, the retention and the uncovered counts are stamped only once it returns, so a pass that fails leaves every one of them at its last value -- a ledger that cannot be swept and one that is not growing would otherwise read the same on every surface that looks at it.",
+          "face": "资源泄漏与长稳"
+        },
+        {
           "name": "memory_decay_passes_all_failed",
           "promql": "(max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome=\"failed\"}[6h])) > 0) unless on() (max without (pod, container, instance, job) (increase(cogneva_memory_decay_total{outcome!=\"failed\"}[6h])) > 0)",
           "condition": {

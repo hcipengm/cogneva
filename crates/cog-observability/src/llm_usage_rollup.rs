@@ -23,7 +23,7 @@ use std::time::Duration;
 use chrono::Utc;
 use tracing::{info, warn};
 
-use crate::usage_store::{windows_to_roll, LlmUsageStore};
+use crate::usage_store::{windows_before, windows_to_roll, LlmUsageStore};
 
 /// The loop, as the liveness readings name it. A loop whose whole job is to run
 /// on a period has no other way to say it is still doing so.
@@ -53,14 +53,52 @@ pub const PERIOD: Duration = Duration::from_secs(600);
 /// window is exactly the hole the fold exists to prevent.
 pub const LOOKBACK_SECS: i64 = 7 * 24 * 3600;
 
-/// Roll every window that has closed since the last one folded. Returns the
-/// number of rows written, 0 when there was nothing to do.
+/// How many windows one pass may add to the *older* end of the fold.
+///
+/// The lookback bounds a first run, which leaves the ledger's older history
+/// unsummed by any window; the backfill walks down to it a batch at a time.
+/// A day per pass keeps the loop's own work bounded while still converging on
+/// an archive that grew for months before the fold existed — measured on this
+/// deployment on 2026-10-27, the ledger reached back 32 days while the fold
+/// covered 24 of them. The number is windows rather than rows because the
+/// cost of a window is set by how many combinations it carries, which is a
+/// property of the deployment rather than of the backlog.
+pub const BACKFILL_WINDOWS_PER_PASS: usize = 24;
+
+/// Fold the windows that have closed since the last fold, then carry the fold's
+/// older end down toward the ledger's oldest row.
+///
+/// Returns the number of rows written, 0 when there was nothing to do.
 ///
 /// Exposed so the loop's one decision — which windows to fold — can be driven
 /// from a test without a running tokio task.
 pub async fn run_once(store: &LlmUsageStore) -> anyhow::Result<u64> {
     let last = store.last_rolled_window_end().await?;
     let windows = windows_to_roll(last, Utc::now(), WINDOW_SECS, LOOKBACK_SECS);
+    let mut written = store.rollup_windows(&windows).await?;
+    written += backfill_once(store).await?;
+    Ok(written)
+}
+
+/// Carry the fold one batch further back, toward the oldest row the ledger
+/// still holds.
+///
+/// The fold's older end is itself the resume point: the backfill asks where the
+/// fold starts and lands the windows immediately below it, so nothing is
+/// remembered outside the rollup table and a restart resumes where the table
+/// says. A window with no traffic still lands its zero rows for every
+/// combination the ledger knows, which is what keeps the boundary moving
+/// through a quiet stretch instead of stalling on it.
+async fn backfill_once(store: &LlmUsageStore) -> anyhow::Result<u64> {
+    let Some(first) = store.first_rolled_window_start().await? else {
+        // Nothing folded yet: the head catch-up above is what creates the first
+        // windows, and there is no boundary to walk down from.
+        return Ok(0);
+    };
+    let Some(floor) = store.oldest_ledger_ts().await? else {
+        return Ok(0);
+    };
+    let windows = windows_before(first, floor, WINDOW_SECS, BACKFILL_WINDOWS_PER_PASS);
     store.rollup_windows(&windows).await
 }
 
@@ -207,5 +245,88 @@ mod tests {
     #[test]
     fn the_period_is_shorter_than_a_window() {
         assert!(PERIOD.as_secs() < WINDOW_SECS as u64);
+    }
+
+    /// A backfill lands the windows immediately below the fold and stops at the
+    /// ledger's oldest row: below that there is nothing to sum, and the batch
+    /// ends where the fold currently starts so the two meet without a hole.
+    #[test]
+    fn a_backfill_reaches_from_the_fold_down_to_the_ledger_floor() {
+        let windows = windows_before(t(2026, 10, 10, 0, 0), t(2026, 10, 1, 0, 0), 3600, 10_000);
+        assert_eq!(windows.len(), 9 * 24);
+        assert_eq!(windows.first().unwrap().start, t(2026, 10, 1, 0, 0));
+        assert_eq!(
+            windows.last().unwrap().end,
+            t(2026, 10, 10, 0, 0),
+            "the last window ends where the fold starts, not after it"
+        );
+    }
+
+    /// One pass moves the boundary by the batch size and no more: a backfill
+    /// over a month of ledger is many passes, which is what keeps each pass
+    /// readable as work rather than as a stopped loop.
+    #[test]
+    fn a_backfill_batch_moves_the_boundary_by_its_size_and_no_more() {
+        let first = windows_before(t(2026, 10, 10, 0, 0), t(2026, 9, 1, 0, 0), 3600, 24);
+        assert_eq!(first.len(), 24);
+        assert_eq!(first.last().unwrap().end, t(2026, 10, 10, 0, 0));
+        assert_eq!(first.first().unwrap().start, t(2026, 10, 9, 0, 0));
+
+        // The next pass resumes from where this one stopped, and the two are
+        // adjacent: no window folded twice, none skipped.
+        let second = windows_before(first[0].start, t(2026, 9, 1, 0, 0), 3600, 24);
+        assert_eq!(second.last().unwrap().end, first[0].start);
+        assert_eq!(second.len(), 24);
+    }
+
+    /// The ledger's floor lands inside a window rather than on its boundary, and
+    /// the window holding it is still folded: a row at the floor is a row the
+    /// fold has to answer for, so stopping above it would leave exactly the
+    /// oldest row unsummed and undeletable.
+    #[test]
+    fn the_window_holding_the_ledger_floor_is_included() {
+        let windows = windows_before(t(2026, 10, 2, 0, 0), t(2026, 10, 1, 23, 30), 3600, 10_000);
+        assert_eq!(windows.first().unwrap().start, t(2026, 10, 1, 23, 0));
+        assert_eq!(windows.first().unwrap().end, t(2026, 10, 2, 0, 0));
+    }
+
+    /// Nothing below the fold: the head catch-up already starts where the
+    /// ledger does, and a backfill that ran anyway would rewrite windows that
+    /// are already summed.
+    #[test]
+    fn a_fold_that_already_reaches_the_floor_has_no_backfill() {
+        assert!(windows_before(t(2026, 10, 1, 0, 0), t(2026, 10, 1, 0, 0), 3600, 24).is_empty());
+        assert!(
+            windows_before(t(2026, 10, 1, 0, 0), t(2026, 10, 2, 0, 0), 3600, 24).is_empty(),
+            "a ledger floor above the fold means the fold is already older, \
+             and walking up from it would fold the same hours twice"
+        );
+    }
+
+    /// Repeated passes walk the boundary all the way down without leaving a gap
+    /// between what one pass folded and what the next one takes.
+    #[test]
+    fn repeated_passes_reach_the_floor_without_a_gap() {
+        let floor = t(2026, 9, 30, 6, 0);
+        let mut cursor = t(2026, 10, 3, 0, 0);
+        let mut seen_start = cursor;
+        for _ in 0..20 {
+            let batch = windows_before(cursor, floor, 3600, 24);
+            if batch.is_empty() {
+                break;
+            }
+            assert_eq!(
+                batch.last().unwrap().end,
+                cursor,
+                "each batch ends where the previous one began"
+            );
+            cursor = batch[0].start;
+            seen_start = cursor;
+        }
+        assert_eq!(
+            seen_start,
+            t(2026, 9, 30, 6, 0),
+            "the walk stopped at the grid point holding the oldest row"
+        );
     }
 }

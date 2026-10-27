@@ -340,6 +340,22 @@ jobs:
         run: cargo test -p cog-storage --test task_event_retention -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The per-call token ledger is the one archive here whose rows are a
+      # derivation's input: the hourly fold keeps the sums, so a row the fold
+      # never reached is the only copy of that spend. The sweep therefore
+      # deletes on a pair of conditions -- past the retention *and* inside what
+      # the fold covers -- and only the server can say which rows a WHERE kept.
+      # Drop the second half and the statement still deletes, still reports a
+      # count and still shrinks the table; what disappears is the record of an
+      # hour the aggregate now reports as quiet forever, with nothing left to
+      # recompute it from. The floor also has to follow the fold down on its own,
+      # because the backfill walks the fold's oldest window backwards toward the
+      # ledger's oldest row: a sweep that read the floor once would stop retiring
+      # anything the moment the fold started catching up.
+      - name: Live-DB LLM usage retention
+        run: cargo test -p cog-observability --test usage_retention -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Which replica may act is decided by one statement, and the acceptance
       # for it is a question about two processes: two asks landing at once leave
       # exactly one holder, and a holder that stops renewing loses the role to

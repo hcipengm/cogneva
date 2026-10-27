@@ -49,7 +49,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: d3912ede1025b21da5a56ae6120c7e58ce07bf01b4a275c7573ff6afe8393210
+        checksum/config: 66402d177a89313a7cafefd969a0d531a92c057a40eda93710cf716f42260e0b
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -157,6 +157,15 @@ spec:
             # 这个数发布成 cogneva_task_events_keep_seconds，告警拿它和最老一行比，所以界
             # 跟着这里走。0 = 本部署只量不删；负数退回 30。
             - name: COGNEVA_TASK_EVENT_KEEP_DAYS
+              value: "30"
+            # token 账（gateway_llm_usage）的逐次调用明细保留天数。这张表每次上游调用
+            # 一行，每小时的折叠面把窗口汇总一次并长期保留——按时间封顶的是「哪次调用
+            # 花了多少」这层明细。清理只删折叠面已覆盖到的行：折叠面是这个账的派生，删掉
+            # 没被任何窗口汇总过的行等于抹掉那份花费的唯一副本，聚合会永远把那小时报成
+            # 静默、也没有东西能重算。折叠面下界不够老时，清理把删不动的那部分发布成
+            # cogneva_llm_usage_uncovered_rows，告警拿它和最老那行的年龄配对判。
+            # 1 以下退回 30。
+            - name: COGNEVA_LLM_USAGE_KEEP_DAYS
               value: "30"
             # 本进程的花费属于哪个环境。token 账按这条轴回答「哪个环境烧的」，
             # 与 actor 轴（哪个组件烧的）正交——同一个组件在多个环境里跑，两个

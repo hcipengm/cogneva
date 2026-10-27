@@ -28,6 +28,7 @@ pub mod skip_store;
 pub mod snapshot;
 pub mod spend_verdict;
 pub mod traces;
+pub mod usage_retention;
 pub mod usage_store;
 
 pub use logs::{init_subscriber, install_early_subscriber, LogFilterHandle};

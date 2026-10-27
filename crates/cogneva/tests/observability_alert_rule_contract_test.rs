@@ -4427,6 +4427,10 @@ const UNREAD: &[(&str, Unread)] = &[
         "gateway_llm_exchange_rows",
         Unread::Gap("how many prompt-and-response bodies the archive holds. Its two sibling readings are read -- llm_exchange_retention_behind compares the oldest body's age against the retention the loop publishes -- and this one has nothing to be compared with: the archive is bounded by age, so the body count follows the call volume and how large a body is, and no budget for either is declared. It is published because the table reached 307 MB before any retention ran, and the backup drill is sized from it"),
     ),
+    (
+        "cogneva_llm_usage_rows",
+        Unread::Gap("how many per-call token rows the ledger holds. Everything that can be judged about this table is judged from age instead: llm_usage_retention_behind compares the oldest surviving row against the retention the loop publishes, and llm_usage_fold_behind compares the rows the hourly fold never reached against what the sweep is allowed to delete. Neither is a statement about how many rows is too many -- one call writes one row whatever the task was doing, so the count tracks call volume rather than the sweep, and no row budget for it is declared anywhere in the tree. It is published because the table reached 312,803 rows and 32 days' worth of history with no reading at all until 2026-10-27, and the nightly backup's budget is sized from it"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -4668,7 +4672,7 @@ const UNREAD: &[(&str, Unread)] = &[
 /// debts is the same order the write-window record and the principle account
 /// used -- publish the reading first, argue about the threshold after -- and it
 /// is what makes the growth visible while the policy is still undecided.
-const GAPS_AT_CENSUS: usize = 32;
+const GAPS_AT_CENSUS: usize = 33;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

@@ -117,5 +117,15 @@ llm_exchange_retention_pass_failed	gateway_llm_exchange_sweep_failed,gateway_llm
 task_event_archive_behind	cogneva_task_events_oldest_age_seconds,cogneva_task_events_oldest_age_seconds_observed_timestamp_seconds,cogneva_task_events_keep_seconds,cogneva_task_events_keep_seconds_observed_timestamp_seconds	code_not_deployed	Both sides of the comparison come from the retention loop, which is only in git today -- the age of the oldest row and the retention the process enforces are published by the same pass, each with its own companion clock.
 task_event_archive_pass_failed	cogneva_task_events_sweep_failed,cogneva_task_events_sweep_failed_observed_timestamp_seconds	code_not_deployed	The pass-outcome cell is written by the same retention loop, only in git today.
 
+# --- code_not_deployed: the token ledger's retention of 2026-10-27 -------------
+# Same shape as the two archives above, with one difference that is why three
+# rows are needed rather than two: this ledger's hourly fold is what decides how
+# far back a row may be deleted, so the sweep publishes a pair of readings about
+# the rows the fold has not reached yet. Both rules read those; the third reads
+# the pass outcome. All five cells arrive with the next rollout.
+llm_usage_retention_behind	cogneva_llm_usage_oldest_age_seconds,cogneva_llm_usage_oldest_age_seconds_observed_timestamp_seconds,cogneva_llm_usage_keep_seconds,cogneva_llm_usage_keep_seconds_observed_timestamp_seconds	code_not_deployed	Both sides of the comparison come from the retention loop, which is only in git today -- the age of the oldest row and the retention the process enforces are published by the same pass, each with its own companion clock.
+llm_usage_fold_behind	cogneva_llm_usage_uncovered_rows,cogneva_llm_usage_uncovered_rows_observed_timestamp_seconds,cogneva_llm_usage_uncovered_oldest_age_seconds,cogneva_llm_usage_uncovered_oldest_age_seconds_observed_timestamp_seconds,cogneva_llm_usage_keep_seconds,cogneva_llm_usage_keep_seconds_observed_timestamp_seconds	code_not_deployed	The uncovered pair and the retention are all published by the same sweep; the fold's coverage is what it measures, so this rule has no reading until the sweep runs.
+llm_usage_retention_pass_failed	cogneva_llm_usage_sweep_failed,cogneva_llm_usage_sweep_failed_observed_timestamp_seconds	code_not_deployed	The pass-outcome cell is written by the same retention loop, only in git today.
+
 # --- lazy_counter ---------------------------------------------------------
 mainline_admission_held	cogneva_mainline_admission_held_total	lazy_counter	cog-reflection/src/mainline_deployer.rs records this labelled counter only on a pass where admission actually held the rollout, so the family is created by the first hold. A deployment that never waited has no series, and the rule fires the moment one appears.

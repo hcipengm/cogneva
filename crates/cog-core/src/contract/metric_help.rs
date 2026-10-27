@@ -1576,6 +1576,55 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          Written on every pass",
     ),
     (
+        "cogneva_llm_usage_rows",
+        "Rows currently held in the token ledger, one per upstream call. The \
+         count follows call volume, which has no ceiling of its own, so it is \
+         read beside cogneva_llm_usage_keep_seconds rather than against a budget \
+         of its own: the retention bounds how far back the rows reach, and the \
+         hourly fold keeps the sums after they are gone",
+    ),
+    (
+        "cogneva_llm_usage_oldest_age_seconds",
+        "Age of the oldest row in the token ledger, in seconds; zero for an \
+         empty ledger. The retention seen from the reader's side: whatever the \
+         deployment promises, this is how far back the per-call detail actually \
+         reaches. Zero rather than absent, so a rule comparing it to the \
+         retention is silent about a clean table and never about a missing \
+         series",
+    ),
+    (
+        "cogneva_llm_usage_keep_seconds",
+        "The retention the publishing process enforces on the token ledger, in \
+         seconds. Published so the rule comparing the ledger's age to it derives \
+         its threshold from the loop's own declaration rather than from a \
+         constant in the rules file",
+    ),
+    (
+        "cogneva_llm_usage_uncovered_rows",
+        "Rows in the token ledger that are older than the hourly fold's own \
+         floor and may therefore not be retired, however far past the retention \
+         they are. The fold is a derivation of this ledger, so deleting a row no \
+         window covered would destroy the only copy of that spend. Non-zero \
+         while the backfill catches up, and non-zero forever if it stops -- \
+         which is why it is read with the age below rather than alone",
+    ),
+    (
+        "cogneva_llm_usage_uncovered_oldest_age_seconds",
+        "Age of the oldest row the retention may not touch, in seconds; zero \
+         when every row is inside the fold. Read as a pair with \
+         cogneva_llm_usage_uncovered_rows: a count alone cannot tell a fold that \
+         is an hour behind and catching up from a ledger whose retention has \
+         stopped being kept",
+    ),
+    (
+        "cogneva_llm_usage_sweep_failed",
+        "Whether the last token-ledger retention pass could not be completed, 1 \
+         or 0. Every other reading in this family is stamped only once a pass \
+         returns, so a failed pass leaves them at their last values -- a ledger \
+         that cannot be swept and one that is not growing would otherwise look \
+         identical. Written on every pass",
+    ),
+    (
         "metrics_retired_rows_removed",
         "Rows of retired metric names the last release pass deleted, labelled \
          by the table they came from and by the deployment that ran the pass. \

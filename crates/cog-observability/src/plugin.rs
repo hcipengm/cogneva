@@ -633,6 +633,29 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             drop(Arc::new(sweep).spawn(shutdown));
         }
 
+        // ── Token ledger retention ──
+        // The ledger's rows are what the fold above sums, so the sweep may only
+        // retire what the fold already covered: a row no window summed is the
+        // only copy of that spend, and deleting it would leave the aggregate
+        // reporting the hour as quiet forever. The sweep reads the fold's own
+        // older end each pass and publishes what it could not touch, so a
+        // backfill that stops shows up as rows past the retention that stay.
+        if let Some(store) = self.usage_store.clone() {
+            let shutdown = ctx
+                .consume::<cog_core::ShutdownSignal>()
+                .map(|s| (*s).clone())
+                .unwrap_or_default();
+            let keep = std::time::Duration::from_secs(
+                crate::usage_retention::keep_days_from_env() as u64 * 86_400,
+            );
+            let mut sweep = crate::usage_retention::UsageRetention::new(store.pool().clone(), keep)
+                .with_deployment(crate::usage_retention::deployment_name());
+            if let Some(mb) = ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                sweep = sweep.with_metrics(mb);
+            }
+            drop(Arc::new(sweep).spawn(shutdown));
+        }
+
         // ── Spend verdict fold ──
         // Runs here for the same reason the fold above does, and after it in
         // the same process: a verdict is read against the ledger directly
