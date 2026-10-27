@@ -294,7 +294,12 @@ impl GitOpsPublisher {
         match read {
             Ok(out) => match live_revision::deployed_main_rev(&out) {
                 Some(rev) => {
-                    let base = format!("{endpoint}/cogneva:main-{rev}");
+                    // 前缀从它自己的声明处取：读端（`live_revision`）就是按那个
+                    // 前缀把 tag 剥成 rev 的，这里再拼一遍就成了第二条规则。
+                    let base = format!(
+                        "{endpoint}/cogneva:{}{rev}",
+                        crate::mainline_deployer::MAIN_TAG_PREFIX
+                    );
                     info!(base = %base, "canary overlay base resolved from deployed main tag");
                     base
                 }

@@ -107,17 +107,37 @@ pub const CLAIM_ENV: &str = "COGNEVA_REGISTRY_CLAIM";
 /// This loop's name in the liveness census.
 pub const WATCH_LOOP: &str = "registry_footprint_watch";
 
+/// The media type this tree's own manifests are written as.
+///
+/// Named because it is re-published rather than chosen on the spot: copied
+/// manifests carry whatever content type the source answered with, and when the
+/// answer carries none this is the type the copy declares. A second spelling of
+/// it in the copying code would be a manifest filed under a type the walker
+/// does not recognise, which it reads as a layer count of zero.
+pub const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+
 /// Media types a manifest request accepts, one per tag and per index child.
 ///
 /// The registry refuses to serve an OCI manifest to a client that did not say it
 /// understands one (`MANIFEST_UNKNOWN: OCI manifest found, but accept header
 /// does not support OCI manifests`), and these images are OCI.
 pub const MANIFEST_ACCEPTS: &[&str] = &[
-    "application/vnd.oci.image.manifest.v1+json",
+    OCI_MANIFEST_MEDIA_TYPE,
     "application/vnd.oci.image.index.v1+json",
     "application/vnd.docker.distribution.manifest.v2+json",
     "application/vnd.docker.distribution.manifest.list.v2+json",
 ];
+
+/// The registry's `v2` path for `rest` inside `repository`.
+///
+/// One spelling of the shape because both the deploying half and the
+/// footprint-walking half address the same server with it. A second spelling
+/// does not fail loudly: the registry answers a path it does not serve with a
+/// 404, and a 404 is read here as "no such tag", which is what an image that
+/// was never pushed looks like.
+pub(crate) fn repo_path_of(repository: &str, rest: &str) -> String {
+    format!("/v2/{repository}/{rest}")
+}
 
 /// How deep an index may nest before this walk gives up on the shape.
 ///
@@ -555,15 +575,15 @@ fn unix_now() -> u64 {
 }
 
 fn tags_path() -> String {
-    format!("/v2/{IMAGE_REPOSITORY}/tags/list")
+    repo_path_of(IMAGE_REPOSITORY, "tags/list")
 }
 
 fn tag_manifest_path(tag: &str) -> String {
-    format!("/v2/{IMAGE_REPOSITORY}/manifests/{tag}")
+    repo_path_of(IMAGE_REPOSITORY, &format!("manifests/{tag}"))
 }
 
 fn manifest_path(digest: &str) -> String {
-    format!("/v2/{IMAGE_REPOSITORY}/manifests/{digest}")
+    repo_path_of(IMAGE_REPOSITORY, &format!("manifests/{digest}"))
 }
 
 #[cfg(test)]

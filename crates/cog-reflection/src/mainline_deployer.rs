@@ -494,7 +494,7 @@ fn decode_chunked(body: &[u8]) -> Option<Vec<u8>> {
 /// registry API 里本仓库的路径前缀。仓库名只此一处：tag 写入、tag 读取、容量
 /// 回收走的都是这条路径，第二个拼法会让某一条静默指向一个空仓库。
 fn repo_path(rest: &str) -> String {
-    repo_path_of(IMAGE_REPOSITORY, rest)
+    crate::registry_footprint::repo_path_of(IMAGE_REPOSITORY, rest)
 }
 
 fn prune_web_dist_cache(root: &Path, keep: &str) {
@@ -519,12 +519,6 @@ fn prune_web_dist_cache(root: &Path, keep: &str) {
             keep, "dropped web bundle caches from earlier revisions"
         );
     }
-}
-
-/// 同一个 registry 上别的仓库的路径。构建器镜像不在主仓库里，但走同一条
-/// 客户端、同一个端点，只是仓库名不同。
-fn repo_path_of(repository: &str, rest: &str) -> String {
-    format!("/v2/{repository}/{rest}")
 }
 
 /// 响应头里取值（名字大小写不敏感）。
@@ -4294,7 +4288,7 @@ impl MainlineDeployer {
             )));
         }
         let media_type = header_value(&headers, "content-type")
-            .unwrap_or_else(|| "application/vnd.oci.image.manifest.v1+json".to_string());
+            .unwrap_or_else(|| crate::registry_footprint::OCI_MANIFEST_MEDIA_TYPE.to_string());
         let target = repo_path(&format!("manifests/{tag}"));
         let (status, _, body) = self
             .registry_request(
@@ -6704,7 +6698,7 @@ impl MainlineDeployer {
     /// 缺的是哪面、该跑哪条脚本报错，而不是让 buildah 的拉取错误一轮一轮滚，
     /// 既看不出这是安装前置条件，也盖住了真正的原因。
     async fn ensure_web_builder_present(&self) -> SFResult<()> {
-        let path = repo_path_of(
+        let path = crate::registry_footprint::repo_path_of(
             WEB_BUILDER_REPOSITORY,
             &format!("manifests/{}", WEB_BUILDER_TAG),
         );
