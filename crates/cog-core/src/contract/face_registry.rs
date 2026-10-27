@@ -436,6 +436,13 @@ pub enum OwnerSource {
     Measured,
 }
 
+impl OwnerSource {
+    /// Every source a reading can carry. Readers that print one word per answer
+    /// -- the panel says "声明" or "实测" and nothing else -- walk this rather
+    /// than mapping everything they do not recognise onto one of the two.
+    pub const ALL: [OwnerSource; 2] = [OwnerSource::Declared, OwnerSource::Measured];
+}
+
 /// What a face's owner has been seen doing, gathered by the caller.
 ///
 /// The caller owns the reads; this type exists so the rules are one function

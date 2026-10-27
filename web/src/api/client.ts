@@ -940,7 +940,8 @@ export interface FaceDriftReading {
     | 'deputy_overlap'
     | 'unread';
   owner: string | null;
-  owner_source: 'declared' | 'measured' | string;
+  /** 这一格的所有者是怎么来的。闭集：面板只给这两种各一句话。 */
+  owner_source: 'declared' | 'measured';
   red_rules: string[];
   yellow_rules: string[];
   cause: string | null;

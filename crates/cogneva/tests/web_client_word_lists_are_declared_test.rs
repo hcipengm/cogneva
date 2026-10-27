@@ -439,6 +439,69 @@ fn the_drift_verdicts_the_panel_colours_are_the_ones_the_registry_declares() {
     }
 }
 
+/// 所有者的两个来源：注册表说这一格是声明的还是量出来的。
+///
+/// 面板原来写 `source === 'declared' ? '声明' : '实测'`，联合类型又是 `| string`：
+/// 认不出的来源一律读作「实测」——把「没人报过这个名字」说成「有人量过」。
+/// 现在这一列只认声明的两个词，各有一句话，多一个词就落到没有句子的分支。
+#[test]
+fn the_owner_sources_the_panel_names_are_the_ones_the_registry_declares() {
+    use cog_core::contract::face_registry::OwnerSource;
+
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let body_start = source
+        .find("export interface FaceDriftReading {")
+        .expect("the drift reading type is gone; this gate reads its owner source through it");
+    let body = &source[body_start..];
+    let body_end = body.find("\n}").expect("the interface body is not closed");
+    let mut panel = union_words(&body[..body_end], "  owner_source:");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "来源联合类型读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    // 词取自 serde 自己，不在这条测试里再写一遍：面板要匹配的就是线上的拼写。
+    let mut declared: Vec<String> = OwnerSource::ALL
+        .iter()
+        .map(|source| {
+            serde_json::to_value(source)
+                .expect("an owner source must be serialisable")
+                .as_str()
+                .expect("the wire form is a plain word")
+                .to_string()
+        })
+        .collect();
+    declared.sort();
+    assert_eq!(panel, declared, "面板与注册表必须认识同一组所有者来源");
+
+    // 穷尽 match：新增一个来源而没加进 `ALL`，这里就编译不过——`ALL` 与变体
+    // 集合的同步由编译器看着，不靠人记得。
+    fn every_variant_is_in_all(source: OwnerSource) -> bool {
+        match source {
+            OwnerSource::Declared => OwnerSource::ALL.contains(&source),
+            OwnerSource::Measured => OwnerSource::ALL.contains(&source),
+        }
+    }
+    for source in OwnerSource::ALL {
+        assert!(every_variant_is_in_all(source), "{source:?} 不在 ALL 里");
+    }
+
+    let view = repo_root().join("web/src/views/GovernanceView.tsx");
+    let view = std::fs::read_to_string(&view).unwrap_or_else(|e| panic!("{}: {e}", view.display()));
+    assert!(
+        view.contains("const OWNER_SOURCE_WORD: Record<OwnerSourceWord, string> = {"),
+        "来源文案表不再以来源为键：认不出的一律落到兜底句子，编译期不会红"
+    );
+    assert!(
+        view.contains("type OwnerSourceWord = FaceDriftReading['owner_source'];"),
+        "来源键类型必须来自端点类型本身，不能另写一份"
+    );
+}
+
 /// 对照：本门的判据认得出一个不是词的东西。少了这条，`TaskFilter::parse` 哪天
 /// 退化成「什么词都收」，上面那条仍然全绿。
 #[test]

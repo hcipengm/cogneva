@@ -1,4 +1,9 @@
-import { getGovernanceDrift, getGovernanceFaces, getGovernancePrinciples } from '@/api/client';
+import {
+  type FaceDriftReading,
+  getGovernanceDrift,
+  getGovernanceFaces,
+  getGovernancePrinciples,
+} from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
@@ -11,6 +16,18 @@ import { BarList, Strip, type StripSegment, type Tone } from '@/ui/plots';
  * 「谁在守」取的是声明与实测两说：`owner_source` 写明这一格的所有者是声明的还是
  * 量出来的——两者不一致时，界面要能看出分歧出在哪一侧，而不是给一个折中的名字。
  */
+/**
+ * 所有者怎么来的，各一句话。键取自端点类型本身：写成 `Record<string, …>` 再配一个
+ * `?? '实测'` 的兜底，等于把所有认不出的来源都读成「量出来的」——那正是这一列要
+ * 分辨的两件事之一。
+ */
+type OwnerSourceWord = FaceDriftReading['owner_source'];
+
+const OWNER_SOURCE_WORD: Record<OwnerSourceWord, string> = {
+  declared: '声明',
+  measured: '实测',
+};
+
 export function GovernanceView() {
   const faces = useResource('面的清单', getGovernanceFaces, 60_000);
   const drift = useResource('面的漂移', getGovernanceDrift, 60_000);
@@ -127,7 +144,7 @@ export function GovernanceView() {
               return (
                 <span className="text-[11px]">
                   <span className="mono">{owner ?? '—'}</span>
-                  {source && <span className="ml-1 text-[var(--muted)]">（{source === 'declared' ? '声明' : '实测'}）</span>}
+                  {source && <span className="ml-1 text-[var(--muted)]">（{OWNER_SOURCE_WORD[source]}）</span>}
                 </span>
               );
             } },
