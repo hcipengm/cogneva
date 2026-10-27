@@ -40,6 +40,12 @@
 //! 把 `'system'` 加回联合类型，本门红并列出两侧的词；把 `chat.rs` 里一处
 //! `"user"` 改成 `"system"`，帧与落盘那张表先红——写者能说、存不下的角色，
 //! 重开这段对话时会换一种身份回来。各自改回即绿。
+//!
+//! 实测（2026-10-27，两处抄件）：网关身份状态那组词在界面里还有第二份
+//! （凭据浮层的 `STATE_LABEL`），它不读联合类型、只把词抄了一遍；在岗名单的
+//! 两张色表是第三、第四份，稀疏但必须落在状态词里、且两张说的是同一组词。
+//! 消融对照两条：浮层把 `pending` 写成 `unconfirmed`，身份那条红并列出两组词；
+//! `STATE_TONE` 加一个 `zombie`，在岗名单那条红并点名这个词。各自改回即绿。
 
 mod common;
 
@@ -177,6 +183,19 @@ fn the_git_identity_states_the_panel_knows_are_the_ones_the_gateway_reports() {
     assert_eq!(
         panel, declared,
         "the panel and the gateway must know the same identity states"
+    );
+
+    // 同一组词在界面里还有第二份：凭据浮层的 `STATE_LABEL` 按状态给出那一句
+    // 中文。它不读那个联合类型，只把词抄了一遍，所以联合类型改了它不会跟着改——
+    // 改漏的那个状态在浮层上落到兜底，读者看到的是另一个词的意思。
+    let overlay_path = repo_root().join("web/src/overlay/ContributionOverlay.tsx");
+    let overlay = std::fs::read_to_string(&overlay_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", overlay_path.display()));
+    let mut labelled = table_keys(&overlay, "const STATE_LABEL: Record<string, string> = {");
+    labelled.sort();
+    assert_eq!(
+        labelled, declared,
+        "凭据浮层的状态说法必须正好盖住网关声明的状态词"
     );
 }
 
@@ -836,6 +855,34 @@ fn the_agent_states_the_roster_labels_are_the_ones_the_core_serialises() {
     assert_eq!(
         labelled, expected,
         "状态格的中文名必须正好盖住 `AgentState` 的线上写法加客户端自己翻出来的三个词"
+    );
+
+    // 两张色表是稀疏的：只给需要区分的状态上色，其余走兜底，所以这里要求的是
+    // 键落在状态词里、不是盖满。键留着一个已经不存在（或被改名）的状态，那一格
+    // 就是一支永远上不了的色；两张表说的不是同一组词，同一个状态在状态格与
+    // 分布条上就会是两种颜色，而颜色正是这两张表唯一的作用。
+    let tone = table_keys(&view, "const STATE_TONE: Record<string, string> = {");
+    let plot = table_keys(&view, "const STATE_PLOT_TONE: Record<string, Tone> = {");
+    for (table, keys) in [("STATE_TONE", &tone), ("STATE_PLOT_TONE", &plot)] {
+        assert!(
+            !keys.is_empty(),
+            "{table} 一个键都没读到：解析坏了，不是表空了"
+        );
+        for key in keys {
+            assert!(
+                expected.contains(key),
+                "{table} 里的 `{key}` 不是一个状态词：色表为一个永远到不了的状态\
+                 留着一支从没上过的色，而真到了的那个状态走兜底——两者画出来一样"
+            );
+        }
+    }
+    let mut tone_sorted = tone.clone();
+    let mut plot_sorted = plot.clone();
+    tone_sorted.sort();
+    plot_sorted.sort();
+    assert_eq!(
+        tone_sorted, plot_sorted,
+        "状态格与分布条必须是同一组词：同一个状态在两张图上不同色，读者会当成两种处境"
     );
 }
 
