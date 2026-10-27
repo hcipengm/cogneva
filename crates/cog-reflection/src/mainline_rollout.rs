@@ -39,9 +39,9 @@ use crate::mainline_deployer::{
     bounded, carries_deployment, config_consumer_jsonpath, exit_code, failure_signature, field,
     is_admission_policy_denied, is_authorization_denied, is_cluster_unreachable,
     is_observation_tool_failure, namespace_docs, primary_message, render_docs, sample_fields,
-    split_docs, target_manifest_key, workload_kind, workload_kind_of_resource, ConfigConsumer,
-    FailureClass, FailureLocus, MainlineDeployer, PodSample, RolloutTarget, WaitingState,
-    WorkloadKind, CLUSTER_UNREACHABLE_MARKER, FATAL_WAITING_REASONS,
+    split_docs, target_manifest_key, workload_kind, workload_kind_of_resource, CiNoVerdictReason,
+    ConfigConsumer, FailureClass, FailureLocus, MainlineDeployer, PodSample, RolloutTarget,
+    WaitingState, WorkloadKind, CLUSTER_UNREACHABLE_MARKER, FATAL_WAITING_REASONS,
     IMAGE_SOURCE_UNAVAILABLE_MARKER, OBSERVATION_TOOL_MARKER, ROLLOUT_EXIT_ENVIRONMENT,
     ROLLOUT_PRECHECK_STAGE, SUPPORT_CAUSE_MESSAGE_CHARS, SUPPORT_CAUSE_SEPARATOR, WORKLOAD_KINDS,
 };
@@ -62,8 +62,8 @@ pub(crate) const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImageP
 
 /// 「落地之前复问一次上游 CI」这一段的墙钟上界（秒）。
 ///
-/// 两头都要用它：这一侧拿它包住整段提问（超时按"读不到"放行），派发侧把它加进
-/// Job 的 `activeDeadlineSeconds`——只封一头，另一头的界就名不副实。
+/// 两头都要用它：这一侧拿它包住整段提问（超时按「没问到」扣住这一轮），派发侧把它
+/// 加进 Job 的 `activeDeadlineSeconds`——只封一头，另一头的界就名不副实。
 pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 
 /// The workload kinds this rollout waits for after the apply: every kind whose
@@ -2123,6 +2123,20 @@ pub(crate) struct UpstreamCiTarget {
     pub repo: String,
 }
 
+/// 落地前复问的结论：这一轮为什么不能滚。
+///
+/// 三种都给同一个动作——**一个字节都不写，等下一轮再问**——但落点不同，落点决定
+/// 归属与升级路径：判红是这一版的属性（等人写代码），另外两种不是。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CiHoldKind {
+    /// 上游给出了明确的失败结论。
+    Red,
+    /// 上游有检查，至少一条还没跑完：这一版有没有判词，此刻还没产生。
+    Pending,
+    /// 这一问没发生：连不上、body 读不出、预算内没答。
+    Unasked,
+}
+
 impl RolloutExecutor {
     pub fn new(
         kubectl: impl Into<String>,
@@ -3678,7 +3692,8 @@ impl RolloutExecutor {
         failed
     }
 
-    /// 落地之前复问上游 CI：`Some(reason)` = 至少一个上游给出了明确的失败结论。
+    /// 落地之前复问上游 CI：`Some((flavor, reason))` = 这一轮不能滚，`flavor` 说
+    /// 是哪一种不能滚。
     ///
     /// 判据不在这里另写一份：每个上游的结论都交给
     /// [`MainlineDeployer::platform_ci_verdict`]——同一个函数服务派发侧那两次提问，
@@ -3687,12 +3702,12 @@ impl RolloutExecutor {
     ///
     /// 返回的原因里带着报失败的检查名：只说「有一项红」时，定位要绕到仓库外去问，
     /// 而名字在这一次读里本来就有。
-    async fn upstream_ci_hold(&self) -> Option<String> {
+    async fn upstream_ci_hold(&self) -> Option<(CiHoldKind, String)> {
         let ask = self.ci_ask.as_ref()?;
         // 整段提问有自己的上界：每次 HTTP 读自带 30 秒连接 + 60 秒读，而上游可以
         // 有多个、报失败的检查还要逐条问工作流身份，不封顶就会被一次慢网关把
         // Job 的期限吃光——那时失败会以"被判进程没跑完"的形状出现，谁也看不出
-        // 是这一步。超时按"读不到"处理：放行，与其余读失败同一条判据。
+        // 是这一步。超时按「没问到」处置：这一轮不滚，下一轮再问。
         match tokio::time::timeout(
             Duration::from_secs(CI_ASK_BUDGET_SECS),
             self.ask_upstreams(ask),
@@ -3704,17 +3719,30 @@ impl RolloutExecutor {
                 warn!(
                     rev = %ask.rev,
                     budget_secs = CI_ASK_BUDGET_SECS,
-                    "the pre-apply CI question did not answer within its budget; continuing as \
-                     if there were no verdict"
+                    "the pre-apply CI question did not answer within its budget; holding this \
+                     rollout, the next round asks again"
                 );
-                None
+                Some((
+                    CiHoldKind::Unasked,
+                    format!(
+                        "upstream CI did not answer within {CI_ASK_BUDGET_SECS}s for {}; \
+                         nothing is applied this round",
+                        ask.rev
+                    ),
+                ))
             }
         }
     }
 
-    pub(crate) async fn ask_upstreams(&self, ask: &UpstreamCiAsk) -> Option<String> {
-        let mut verdicts: Vec<bool> = Vec::new();
+    /// 这一版在上游各平台的 CI 结论，折成「能不能滚」。`None` = 每一个上游都答了
+    /// 放行（或这一版根本没有东西可判），可以滚。
+    pub(crate) async fn ask_upstreams(&self, ask: &UpstreamCiAsk) -> Option<(CiHoldKind, String)> {
+        let mut failures: usize = 0;
+        // 判词是失败、但上游没有逐条给名字的那几条（结论来自提交状态兜底）。
         let mut failed: Vec<String> = Vec::new();
+        // 问了、但这一轮不能放行的两种：上游还在跑，以及这一问根本没有发生。
+        let mut still_running: Vec<String> = Vec::new();
+        let mut not_asked: Vec<String> = Vec::new();
         for up in &ask.upstreams {
             let (verdict, reason, names, excluded) =
                 MainlineDeployer::platform_ci_verdict(&up.api_base, &up.repo, &ask.rev).await;
@@ -3733,35 +3761,78 @@ impl RolloutExecutor {
                 );
             }
             match verdict {
-                Some(v) => verdicts.push(v),
-                None => info!(
-                    rev = %ask.rev,
-                    platform = %up.platform,
-                    reason = %reason.map(|r| r.label()).unwrap_or("unknown"),
-                    "upstream CI gave no verdict for this revision; letting the rollout continue"
-                ),
-            }
-            if verdict == Some(false) {
-                failed.extend(names.into_iter().map(|n| format!("{}:{n}", up.platform)));
+                Some(false) => {
+                    failures += 1;
+                    failed.extend(names.into_iter().map(|n| format!("{}:{n}", up.platform)));
+                }
+                Some(true) => {}
+                None => {
+                    // 「没有判词」不是一个结论，是三种现场：还在跑、问到了没有东西、没
+                    // 问到。第三种与「绿」之间没有任何共同点，把它读成放行，就是
+                    // 2026-10-27 那次带红上线的形状：安全网关正被同一个滚动换副本，两个
+                    // 平台的 CI 接口都连不上（`connect_failed`），判据把「一次都没问到」
+                    // 读成了「问了、没问题」，于是那个 rev 滚上去了，二十分钟后 CI 红，
+                    // 而没有任何东西会在落地之后再把它撤下来。
+                    match reason {
+                        Some(CiNoVerdictReason::Pending) => still_running.push(up.platform.clone()),
+                        Some(r) if r.is_absent_answer() => {
+                            not_asked.push(format!("{}:{}", up.platform, r.label()))
+                        }
+                        other => info!(
+                            rev = %ask.rev,
+                            platform = %up.platform,
+                            reason = %other.map(|r| r.label()).unwrap_or("unknown"),
+                            "upstream CI answered and has nothing to judge this revision; letting the rollout continue"
+                        ),
+                    }
+                }
             }
         }
-        if !verdicts.iter().any(|v| !*v) {
+        if failures > 0 {
+            let reason = if failed.is_empty() {
+                // 结论来自提交状态兜底时没有可命名的检查——那是"这个平台不逐条给名字"，
+                // 不是"没有失败项"。
+                format!(
+                    "upstream CI reports a failure for {} (no check runs named the failure)",
+                    ask.rev
+                )
+            } else {
+                format!(
+                    "upstream CI reports a failure for {}: {}",
+                    ask.rev,
+                    failed.join(",")
+                )
+            };
+            return Some((CiHoldKind::Red, reason));
+        }
+        if still_running.is_empty() && not_asked.is_empty() {
             return None;
         }
-        Some(if failed.is_empty() {
-            // 结论来自提交状态兜底时没有可命名的检查——那是"这个平台不逐条给名字"，
-            // 不是"没有失败项"。
-            format!(
-                "upstream CI reports a failure for {} (no check runs named the failure)",
-                ask.rev
-            )
+        // 没判红但也没放行。两种现场可能同时发生（一个平台还在跑、另一个连不上），
+        // 所以合成一句话说完：分成两段返回会把另一半现场丢掉。
+        let mut why: Vec<String> = Vec::new();
+        if !not_asked.is_empty() {
+            why.push(format!("could not be asked ({})", not_asked.join(",")));
+        }
+        if !still_running.is_empty() {
+            why.push(format!("still running on {}", still_running.join(",")));
+        }
+        // 归属取在场的那一种里**此刻有人能动手**的那一种：连不上要修那条出网的路，
+        // 还在跑只能等。两者同时在时按前者归，后者写在这句话里，不丢。
+        let flavor = if not_asked.is_empty() {
+            CiHoldKind::Pending
         } else {
+            CiHoldKind::Unasked
+        };
+        Some((
+            flavor,
             format!(
-                "upstream CI reports a failure for {}: {}",
+                "upstream CI has no verdict for {} yet: {}; nothing is applied this round, the \
+                 next round asks again",
                 ask.rev,
-                failed.join(",")
-            )
-        })
+                why.join("; ")
+            ),
+        ))
     }
 
     /// 先落地支撑清单（如随镜像下发），再按计划顺序滚动四部署，逐部署等
@@ -3777,18 +3848,30 @@ impl RolloutExecutor {
         // 第一条红线在那之前 2 分 19 秒就已经存在）。所以在这个进程里、在第一处
         // 写动作之前再问一次；派发侧那一次答不出来，不代表落地时也答不出来。
         //
-        // 只扣 `Some(false)`：读不到结论（平台抖动、检查还在跑、仓库没有 check
-        // runs）照常滚，理由与派发侧同一条——一次平台抖动不该停掉整条主线。
-        if let Some(reason) = self.upstream_ci_hold().await {
+        // 三种回答都扣住这一轮，但落点不同。
+        //
+        // 只有「上游判了红」是这一版的属性；另外两种（还在跑、根本没问到）说不出这一版
+        // 的任何事，可它们同样不该被读成放行——**放行的代价不对称**：把「问到了没有
+        // 东西」读成放行，滚上去的版本仍然是上游如实答过的；把「一次都没问到」读成
+        // 放行，滚上去的是一个没人核对过的版本，而落地之后没有任何东西会把它撤下来。
+        // 2026-10-27 就是后者：安全网关正被同一个滚动换副本，两个平台的 CI 接口都
+        // `connect_failed`，判据把「问不到」与「绿」并成一句，二十分钟后 CI 红。
+        if let Some((flavor, reason)) = self.upstream_ci_hold().await {
             warn!(
                 reason = %reason,
-                "mainline rollout: holding this rollout before it starts; upstream CI reports a \
-                 failure for this revision, so nothing is applied and the next round asks again"
+                flavor = ?flavor,
+                "mainline rollout: holding this rollout before it starts; nothing is applied and \
+                 the next round asks again"
             );
+            let locus = match flavor {
+                CiHoldKind::Red => FailureLocus::UpstreamCi,
+                CiHoldKind::Pending => FailureLocus::UpstreamCiPending,
+                CiHoldKind::Unasked => FailureLocus::UpstreamCiUnasked,
+            };
             return Err(RolloutFailure::at(
                 ROLLOUT_PRECHECK_STAGE,
                 "",
-                FailureLocus::UpstreamCi,
+                locus,
                 true,
                 SFError::Config(reason),
             ));

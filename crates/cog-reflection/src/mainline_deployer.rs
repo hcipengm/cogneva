@@ -1156,7 +1156,30 @@ pub(crate) enum FailureLocus {
     ///
     /// 它与 [`FailureLocus::Reference`] 位置相邻、类别相反，理由正是两句话不同：
     /// 「集群缺一个它该有的对象」是环境，「上游判了这一版红」是版本。
+    ///
+    /// 同一处提问的另外两种回答（还在跑、根本没问到）见
+    /// [`FailureLocus::UpstreamCiPending`] 与 [`FailureLocus::UpstreamCiUnasked`]：
+    /// 它们也扣住这一轮，但说不出版本的任何事，所以按环境类——扣住是同一个动作，
+    /// 归属与升级路径完全不同。
     UpstreamCi,
+    /// 落地前复问时上游**还在跑**：这一版有没有判词，此刻还没产生。
+    ///
+    /// 与 [`FailureLocus::UpstreamCi`] 分开，因为这是两句话：那一支是「上游判了红」，
+    /// 这一支是「还没判」。合起来之后，「扣住」这件事在读数面上只剩一个主人，而这一支
+    /// 的主人不是写代码的人，是时间。按**环境类**处置，与那一支相反：等下一轮就有答案，
+    /// 不是这一版的属性。
+    UpstreamCiPending,
+    /// 落地前复问**根本没发生**：连不上、body 读不出、预算内没答。
+    ///
+    /// 这条落点是 2026-10-27 那次带红上线留下的：安全网关正被同一个滚动换副本，两个
+    /// 平台的 CI 接口都连不上（`connect_failed`），判据把「一次都没问到」读成了「问了、
+    /// 没问题」，一个 CI 二十分钟后判红的 rev 滚上了生产——而落地之后没有任何东西会
+    /// 把它撤下来。与 [`FailureLocus::UpstreamCiPending`] 分开，因为处置不同：那一支
+    /// 等下一轮就有答案，这一支要先修好那条出网的路。
+    ///
+    /// 同样按环境类：判成版本类会让一次网关换副本在读数上看起来像上游判了红，并走上
+    /// 同一条升级路（同一处坏复现 → 停下等人写代码），而这里没有人需要写代码。
+    UpstreamCiUnasked,
     /// 其余按"观测到的版本缺陷"论，含回滚过的那一支。
     Observed,
 }
@@ -1189,7 +1212,7 @@ impl KilledReason {
 
 impl FailureLocus {
     /// 全部落点，供读回签名时校验值域用。
-    const ALL: [FailureLocus; 15] = [
+    const ALL: [FailureLocus; 17] = [
         FailureLocus::Unreachable,
         FailureLocus::Admission,
         FailureLocus::Reference,
@@ -1204,6 +1227,8 @@ impl FailureLocus {
         FailureLocus::Killed(KilledReason::Deadline),
         FailureLocus::Killed(KilledReason::Unreadable),
         FailureLocus::UpstreamCi,
+        FailureLocus::UpstreamCiPending,
+        FailureLocus::UpstreamCiUnasked,
         FailureLocus::Observed,
     ];
 
@@ -1220,6 +1245,8 @@ impl FailureLocus {
             FailureLocus::NeverRan => "never-ran",
             FailureLocus::Killed(reason) => reason.as_str(),
             FailureLocus::UpstreamCi => "upstream-ci",
+            FailureLocus::UpstreamCiPending => "upstream-ci-pending",
+            FailureLocus::UpstreamCiUnasked => "upstream-ci-unasked",
             FailureLocus::Observed => "observed",
         }
     }
@@ -1268,6 +1295,8 @@ impl FailureLocus {
                     | FailureLocus::ClusterConfig
                     | FailureLocus::ImageSource
                     | FailureLocus::NeverRan
+                    | FailureLocus::UpstreamCiPending
+                    | FailureLocus::UpstreamCiUnasked
             )
         };
         if environment {
@@ -1323,6 +1352,27 @@ pub(crate) fn upstream_ci_hold_signature() -> String {
         "",
         FailureLocus::UpstreamCi,
     )
+}
+
+/// 「这一问没有判词」的另两种签名：还在跑、根本没问到。
+///
+/// 与 [`upstream_ci_hold_signature`] 一样由两段事实拼出来，不是在别处手抄一个字符串：
+/// 读回端只认签名，而签名只在 [`failure_signature`] 一个地方成形。
+pub(crate) fn upstream_ci_no_verdict_signatures() -> [String; 2] {
+    [
+        failure_signature(
+            FailureClass::Environment,
+            ROLLOUT_PRECHECK_STAGE,
+            "",
+            FailureLocus::UpstreamCiPending,
+        ),
+        failure_signature(
+            FailureClass::Environment,
+            ROLLOUT_PRECHECK_STAGE,
+            "",
+            FailureLocus::UpstreamCiUnasked,
+        ),
+    ]
 }
 
 /// 「上游判了这一版红」这条待办的行 id：一版一份、一天一份。
@@ -2210,6 +2260,23 @@ pub(crate) enum CiNoVerdictReason {
 }
 
 impl CiNoVerdictReason {
+    /// **这一问根本没有发生。** 与「问到了、没有可判的东西」（[`Self::NoRuns`] /
+    /// [`Self::StatusUnreadable`] / [`Self::BadApiBase`]）不是一回事，与「问到了、还在
+    /// 跑」（[`Self::Pending`]）也不是：前两者都是上游给了一个可读的回答，只是那个回答
+    /// 里没有判词；这一支连回答都没有。
+    ///
+    /// 分开判是因为**放行的代价不对称**：把「没有可判的东西」读成放行，滚上去的版本
+    /// 仍然是上游如实答过的；把「一次都没问到」读成放行，滚上去的版本是**没人核对过**
+    /// 的。2026-10-27 就是后者：安全网关正在被同一个滚动换副本，两个平台的 CI 接口都
+    /// `connect_failed`，`ask_upstreams` 把「问不到」与「绿」并成同一句 `None`，
+    /// 于是一个 CI 二十分钟后判红的 rev 滚上了生产。
+    pub(crate) fn is_absent_answer(self) -> bool {
+        matches!(
+            self,
+            Self::ConnectFailed | Self::UnusableBody | Self::Http(_)
+        )
+    }
+
     /// 读数的标签取值域：闭集，每个取值对着一个可做动作的主人。
     pub(crate) fn label(self) -> &'static str {
         match self {
@@ -3708,8 +3775,11 @@ impl MainlineDeployer {
     /// 有东西）两格，一次读失败都没有；而轮首到派发之间隔着的那段构建，足够
     /// 让那次检查跑出结论。
     ///
-    /// 读不到结论一律放行（只有 `Some(false)` 才扣）：拿一次平台抖动停掉整条
-    /// 主线跟踪，代价比偶尔滚一个恰好红的 rev 更大。
+    /// 这一个提问点上读不到结论一律放行（只有 `Some(false)` 才扣）：拿一次平台抖动
+    /// 停掉整条主线跟踪，代价比停下来等更大。**「放行」在这里不等于「不核对」**：
+    /// 真正的最后一扇门在 Job 里、在第一处写动作之前，那一侧对「还在跑」与「没问到」
+    /// 都扣住（见 `RolloutExecutor::ask_upstreams`）。两处判据因此不同而不是矛盾：
+    /// 这一处决定要不要花一整段构建，那一处决定要不要动集群。
     ///
     /// 这条判据也把**扣了多久**发出去。只记"扣没扣"（状态文件与心跳那一格）答不了
     /// 时长，而时长正是要判的那件事：一段扣住是三分钟还是三小时，其余读数上完全
@@ -5566,17 +5636,36 @@ impl MainlineDeployer {
                     let failure = self.job_failure(&job_name(&inflight.rev)).await;
                     let class = failure.class;
                     // 扣住发生在 Job 里时，这一侧唯一读得到的就是终止消息里那条
-                    // 签名。把它也记进判词计数器：两次提问都答"放行"、而 Job 在
-                    // 落地前复问时答"红"的那一版，在某些计数面上与一直没问题的
-                    // 那一版同形——区别全在这一次复问，不记就只剩日志。
-                    if failure.signature.as_deref() == Some(upstream_ci_hold_signature().as_str()) {
-                        self.record_ci_verdict_reading(Some(false)).await;
-                        warn!(
-                            rev = %rev12(&inflight.rev),
-                            "the rollout job held this revision before it touched the cluster: \
-                             upstream CI reports a failure that was still running when the job \
-                             was dispatched"
-                        );
+                    // 签名。
+                    let ci_no_verdict = upstream_ci_no_verdict_signatures();
+                    match failure.signature.as_deref() {
+                        // 「上游判了红」要记进判词计数器：两次提问都答"放行"、而 Job
+                        // 在落地前复问时答"红"的那一版，在某些计数面上与一直没问题的
+                        // 那一版同形——区别全在这一次复问，不记就只剩日志。
+                        Some(sig) if sig == upstream_ci_hold_signature() => {
+                            self.record_ci_verdict_reading(Some(false)).await;
+                            warn!(
+                                rev = %rev12(&inflight.rev),
+                                "the rollout job held this revision before it touched the cluster: \
+                                 upstream CI reports a failure that was still running when the job \
+                                 was dispatched"
+                            );
+                        }
+                        // 另外两种扣住不是"上游说红"。**不记进 `ci_verdict`**：那一格
+                        // 答的是"上游有没有判这一版红"，把「没问到」记进去就成了另一个
+                        // 谎言，而且是读数面上唯一能区分「上游判红」与「我们没问成」的
+                        // 那一格。它们仍要留一行话：这一版为什么没落地，读日志的人要能
+                        // 看出等的是时间或一条出网的路，不是有人写代码。
+                        Some(sig) if ci_no_verdict.iter().any(|s| s == sig) => {
+                            warn!(
+                                rev = %rev12(&inflight.rev),
+                                signature = %sig,
+                                "the rollout job held this revision before it touched the cluster: \
+                                 upstream CI gave no verdict for it (still running, or the platform \
+                                 could not be asked); nothing was applied"
+                            );
+                        }
+                        _ => {}
                     }
                     let same_rev = state.failed_rev.as_deref() == Some(inflight.rev.as_str());
                     if !same_rev {
@@ -9716,8 +9805,8 @@ mod tests {
         settle_jsonpath, stage_rollout_manifest, staged_manifest_path, summarize_events,
         summarize_pod_states, support_pod_causes, support_pod_selector, support_settled,
         terminating_pods, unresolved_configmaps, unschedulable_pods, write_termination_message,
-        ClusterConfigSources, ProbeCycle, RefSnapshots, ReplicaSetFailure, RewrittenRef,
-        RolloutExecutor, RolloutPlan, SupportCause, SupportWorkload, UpstreamCiAsk,
+        CiHoldKind, ClusterConfigSources, ProbeCycle, RefSnapshots, ReplicaSetFailure,
+        RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause, SupportWorkload, UpstreamCiAsk,
         UpstreamCiTarget, ADMISSION_DENIED_MARKER, IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG,
         NEW_REVISION_NEVER_RAN_MARKER, PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN,
         SUPPORT_CAUSE_POD_LIMIT,
@@ -14266,6 +14355,29 @@ exec {real} "$@"
         assert_eq!(FailureLocus::UpstreamCi.class(false), FailureClass::Version);
     }
 
+    /// 同一处提问的另外两种回答各有自己的落点，而且**都能穿过终止通道被读回**：
+    /// 读不回就退回「落点不明」，两种扣住又并成一个说不清的东西。
+    ///
+    /// 两种都按环境类：它们说不出这一版的任何事，等的是时间或是一条出网的路，
+    /// 不是有人写代码。判成版本类会让一次网关换副本在读数上看起来像上游判了红。
+    #[test]
+    fn the_other_two_ci_answers_have_their_own_loci() {
+        for locus in [
+            FailureLocus::UpstreamCiPending,
+            FailureLocus::UpstreamCiUnasked,
+        ] {
+            let sig =
+                failure_signature(FailureClass::Environment, ROLLOUT_PRECHECK_STAGE, "", locus);
+            assert_eq!(
+                parse_failure_signature(&format!("{sig}\n")),
+                Some(sig.clone())
+            );
+            assert_eq!(locus.class(true), FailureClass::Environment);
+            assert_eq!(locus.class(false), FailureClass::Environment);
+            assert_ne!(sig, upstream_ci_hold_signature());
+        }
+    }
+
     /// 派发时答"还在跑"的那一版，落地之前必须再问一次：2–3 分钟的构建窗口足够
     /// 一条检查跑出结论，而这条通道上此后再没有人复读。这里证明 Job 侧的复问
     /// 真的会扣住，而且回的是哪一个上游、哪一条检查。
@@ -14303,10 +14415,14 @@ exec {real} "$@"
         );
     }
 
-    /// 只扣明确的失败：还在跑、读不到，一律放行。一次平台抖动不该停掉整条主线——
-    /// 这条与派发侧那两次提问是同一条判据，只是提问点不同。
+    /// 还在跑 = 这一版有没有判词还没产生。**扣住**，下一轮再问：判词迟早会来，而
+    /// 现在滚上去的是一个还没被核对过的版本。
+    ///
+    /// 这条原先判的是「放行」，理由是「一次平台抖动不该停掉整条主线」。改的理由是
+    /// 代价不对称：扣一轮只花一个轮询间隔，放行的代价是带着未判的版本落地，而落地
+    /// 之后没有任何东西会把它撤下来。2026-10-27 那次带红上线走的正是这条路。
     #[tokio::test]
-    async fn a_pending_check_does_not_hold_the_rollout() {
+    async fn a_pending_check_holds_the_rollout_until_it_concludes() {
         let (endpoint, _handle) =
             fake_registry(vec![http_200(r#"{"check_runs":[{"conclusion":null}]}"#)]).await;
         let executor = RolloutExecutor::new("kubectl", "cogneva", 0, 1, 1, 1);
@@ -14318,7 +14434,13 @@ exec {real} "$@"
                 repo: "owner/repo".into(),
             }],
         };
-        assert_eq!(executor.ask_upstreams(&ask).await, None);
+        let (flavor, reason) = executor.ask_upstreams(&ask).await.expect("必须扣住");
+        assert_eq!(flavor, CiHoldKind::Pending);
+        assert!(reason.contains("still running"), "{reason}");
+        assert!(
+            reason.contains("github"),
+            "要说清是哪一个上游还没给结论：{reason}"
+        );
         // 一个上游都没有时连问都不问：没有清单就没有可问的东西。
         assert_eq!(
             executor
@@ -14328,6 +14450,40 @@ exec {real} "$@"
                 })
                 .await,
             None
+        );
+    }
+
+    /// 「一次都没问到」不是「问了、没问题」。这一条就是 2026-10-27 那次带红上线的
+    /// 判据：安全网关正被同一个滚动换副本，两个平台的 CI 接口都连不上，而判据把
+    /// 「问不到」与「绿」并成同一句 `None`，于是那个 rev 滚上去了。
+    #[tokio::test]
+    async fn an_unreachable_upstream_holds_the_rollout_instead_of_rolling_blind() {
+        let executor = RolloutExecutor::new("kubectl", "cogneva", 0, 1, 1, 1);
+        // 本机一个必然没人监听的端口：连接被拒，与那次网关换副本在读数上同形
+        // （`connect_failed`）而不用等一次真超时。
+        let ask = UpstreamCiAsk {
+            rev: "abc123".into(),
+            upstreams: vec![UpstreamCiTarget {
+                platform: "github".into(),
+                api_base: "http://127.0.0.1:1/github".into(),
+                repo: "owner/repo".into(),
+            }],
+        };
+        let (flavor, reason) = executor.ask_upstreams(&ask).await.expect("必须扣住");
+        assert_eq!(flavor, CiHoldKind::Unasked);
+        assert!(
+            reason.contains("github:connect_failed"),
+            "扣住的原因要名到哪一个上游、怎么没问到：{reason}"
+        );
+        // 落点决定归属：这一支说不出这一版的任何事，按环境类——它要的不是有人
+        // 写代码，是那条出网的路恢复。
+        assert_eq!(
+            FailureLocus::UpstreamCiUnasked.class(true),
+            FailureClass::Environment
+        );
+        assert_eq!(
+            FailureLocus::UpstreamCiPending.class(true),
+            FailureClass::Environment
         );
     }
 
