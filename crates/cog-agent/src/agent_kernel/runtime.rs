@@ -133,18 +133,50 @@ pub enum RuntimeState {
     Error,
 }
 
+impl RuntimeState {
+    /// Every variant, so the word table and the lookup that reads it back are
+    /// checked against the enum instead of against a hand-copied list.
+    pub const ALL: [RuntimeState; 8] = [
+        RuntimeState::Idle,
+        RuntimeState::Thinking,
+        RuntimeState::Calling,
+        RuntimeState::Acting,
+        RuntimeState::Observing,
+        RuntimeState::Updating,
+        RuntimeState::Complete,
+        RuntimeState::Error,
+    ];
+
+    /// The word this state is checkpointed under.
+    ///
+    /// One spelling, in one place. `Display` prints it and `parse` accepts it, so
+    /// the word `save` writes into a checkpoint and the word `restore` reads back
+    /// out of one cannot come to disagree: the checkpoint says "observing", the
+    /// restore matches none of its arms, and the agent comes back idle with
+    /// nothing anywhere saying a word was dropped.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RuntimeState::Idle => "idle",
+            RuntimeState::Thinking => "thinking",
+            RuntimeState::Calling => "calling",
+            RuntimeState::Acting => "acting",
+            RuntimeState::Observing => "observing",
+            RuntimeState::Updating => "updating",
+            RuntimeState::Complete => "complete",
+            RuntimeState::Error => "error",
+        }
+    }
+
+    /// The state a checkpointed word names; `None` for a word this build does not
+    /// know.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.as_str() == word)
+    }
+}
+
 impl std::fmt::Display for RuntimeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RuntimeState::Idle => write!(f, "idle"),
-            RuntimeState::Thinking => write!(f, "thinking"),
-            RuntimeState::Calling => write!(f, "calling"),
-            RuntimeState::Acting => write!(f, "acting"),
-            RuntimeState::Observing => write!(f, "observing"),
-            RuntimeState::Updating => write!(f, "updating"),
-            RuntimeState::Complete => write!(f, "complete"),
-            RuntimeState::Error => write!(f, "error"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -719,17 +751,11 @@ impl AgentRuntime {
 
         // Restore loop state from agent_state JSON
         if let Some(state_str) = snapshot.agent_state.get("state").and_then(|v| v.as_str()) {
-            self.state = match state_str {
-                "idle" => RuntimeState::Idle,
-                "thinking" => RuntimeState::Thinking,
-                "calling" => RuntimeState::Calling,
-                "acting" => RuntimeState::Acting,
-                "observing" => RuntimeState::Observing,
-                "updating" => RuntimeState::Updating,
-                "complete" => RuntimeState::Complete,
-                "error" => RuntimeState::Error,
-                _ => RuntimeState::Idle,
-            };
+            // A word this build does not know still lands on `Idle` -- restoring is
+            // not a judgement. What changed is that the words are no longer spelled
+            // here: `RuntimeState::parse` answers with the same table `Display`
+            // printed from, so there is no second list that can fall behind it.
+            self.state = RuntimeState::parse(state_str).unwrap_or(RuntimeState::Idle);
         }
 
         // Optionally restore role if present and different
@@ -2503,6 +2529,22 @@ mod tests {
     use super::*;
     use cog_core::SkillConfig;
     use serde_json::json;
+
+    /// A state word is spelled once: what `Display` prints is what `as_str`
+    /// returns, and `parse` reads it back to the same state.
+    ///
+    /// These were two hand-written `match` blocks -- one in `Display`, one inline
+    /// in `restore` -- and the compiler compares neither. Renaming a word on one
+    /// side alone compiled, and `restore` then matched nothing and quietly came
+    /// back idle, which is indistinguishable from an agent that was idle.
+    #[test]
+    fn every_state_word_survives_the_trip_through_a_checkpoint() {
+        for state in RuntimeState::ALL {
+            assert_eq!(state.to_string(), state.as_str());
+            assert_eq!(RuntimeState::parse(&state.to_string()), Some(state));
+        }
+        assert_eq!(RuntimeState::parse("no-such-state"), None);
+    }
 
     /// A reset clears the run's context and keeps everything the instance was
     /// built with.
