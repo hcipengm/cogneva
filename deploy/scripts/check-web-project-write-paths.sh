@@ -32,7 +32,7 @@ import sys
 ROOT = sys.argv[1]
 WEB = os.path.join(ROOT, "web/src")
 CLIENT = os.path.join(WEB, "api/client.ts")
-WRITE = os.path.join(WEB, "views/projectWrite.tsx")
+WRITE = os.path.join(WEB, "projects/projectWrite.tsx")
 VIEW = os.path.join(WEB, "views/ProjectsView.tsx")
 GATEWAY = os.path.join(ROOT, "crates/cog-gateway/src/lib.rs")
 PROJECTS_RS = os.path.join(ROOT, "crates/cog-gateway/src/projects.rs")

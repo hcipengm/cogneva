@@ -33,7 +33,7 @@ trap 'rm -rf "${work}"' EXIT
 # ── 夹具：一条从取数到路由的完整链 ──
 fixture() {
   rm -rf "${work}/web" "${work}/crates" "${work}/deploy"
-  mkdir -p "${work}/web/src/api" "${work}/web/src/views" \
+  mkdir -p "${work}/web/src/api" "${work}/web/src/views" "${work}/web/src/projects" \
     "${work}/crates/cog-gateway/src" "${work}/deploy/scripts"
   # 门自己会被按路径引用（A16 的 check 里点了它的名字），夹具里放一份同样的文件名。
   cat >"${work}/deploy/scripts/check-web-project-write-paths.sh" <<'EOF'
@@ -74,7 +74,7 @@ export async function downloadProjectCsv(id: string): Promise<unknown> {
 }
 EOF
 
-  cat >"${work}/web/src/views/projectWrite.tsx" <<'EOF'
+  cat >"${work}/web/src/projects/projectWrite.tsx" <<'EOF'
 import { createProject, createProjectTask, updateTask, saveTaskPlan, moveTask } from '@/api/client';
 
 export function NewProjectForm({ onCreated }: { onCreated: () => void }) {
@@ -139,7 +139,7 @@ import {
   NewTaskForm,
   PlanButton,
   ReparentControl,
-} from '@/views/projectWrite';
+} from '@/projects/projectWrite';
 
 export function ProjectsView({ columns }: { columns: { cards: { id: string }[] }[] }) {
   return (
@@ -214,7 +214,7 @@ cut "${work}/web/src/api/client.ts" \
   "取数函数少了声明（挪卡）"
 fixture
 
-cut "${work}/web/src/views/projectWrite.tsx" \
+cut "${work}/web/src/projects/projectWrite.tsx" \
   'await createProjectTask(' 'createProjectTask;void (0 as unknown);(' \
   "组件 import 了却不调用"
 fixture
@@ -224,7 +224,7 @@ cut "${work}/web/src/views/ProjectsView.tsx" \
   "视图 import 了不渲染"
 fixture
 
-cut "${work}/web/src/views/projectWrite.tsx" \
+cut "${work}/web/src/projects/projectWrite.tsx" \
   'await moveTask('"'"'t'"'"', '"'"'scheduled'"'"');
     onDone();' 'await moveTask('"'"'t'"'"', '"'"'scheduled'"'"');' \
   "写完不调回调"

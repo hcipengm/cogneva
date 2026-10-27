@@ -21,7 +21,7 @@ import {
   NewTaskForm,
   PlanButton,
   ReparentControl,
-} from '@/views/projectWrite';
+} from '@/projects/projectWrite';
 import { useResource } from '@/hooks/useResource';
 import { useFrameDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey, ticksFor } from '@/store/frameTick';
