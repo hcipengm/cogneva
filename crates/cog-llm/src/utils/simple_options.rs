@@ -1,5 +1,22 @@
 use crate::{ChatOptions, Model, ThinkingLevel};
 
+/// `CompleteOptions` → `ChatOptions`：四个字段在这里映射一次。
+///
+/// 六个 provider 各抄过一遍这张表（routing 与五个 provider 的
+/// `complete_stream`）。抄的好处是每处都看得见自己在传什么；代价是给
+/// `CompleteOptions` 加一个字段不会有任何一处编译失败——它们都带
+/// `..Default::default()`，新字段在**每一个** provider 上静默变成默认值，
+/// 调用方却以为自己传进去了。加到这里，六处一起动。
+pub fn chat_options_from(options: &crate::CompleteOptions) -> ChatOptions {
+    ChatOptions {
+        model: options.model.clone(),
+        temperature: options.temperature,
+        max_tokens: options.max_tokens,
+        api_key: options.api_key.clone(),
+        ..Default::default()
+    }
+}
+
 /// Build base options from simple options and model defaults.
 pub fn build_base_options(options: &ChatOptions, model: &Model) -> ChatOptions {
     ChatOptions {

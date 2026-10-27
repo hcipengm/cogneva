@@ -1163,13 +1163,7 @@ impl LLMProvider for OpenAIProvider {
         prompt: &str,
         options: &CompleteOptions,
     ) -> SFResult<AssistantMessageEventStream> {
-        let chat_options = ChatOptions {
-            model: options.model.clone(),
-            temperature: options.temperature,
-            max_tokens: options.max_tokens,
-            api_key: options.api_key.clone(),
-            ..Default::default()
-        };
+        let chat_options = crate::utils::simple_options::chat_options_from(options);
         self.chat_stream(&[Message::user(prompt)], &chat_options)
             .await
     }
