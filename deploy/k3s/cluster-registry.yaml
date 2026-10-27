@@ -44,6 +44,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: cluster-registry
+        app.kubernetes.io/version: "0.5.10"
     spec:
       initContainers:
         # 回收。`garbage-collect -m` 删的是"没有任何 tag 指向的 manifest 及其独占层"，

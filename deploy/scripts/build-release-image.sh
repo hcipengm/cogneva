@@ -5,8 +5,9 @@
 # 下载不可用时才回退源码构建（1-3 小时）。
 #
 # 版本单一同源：VERSION 取 Cargo.toml workspace.package.version；镜像 tag、
-# helm appVersion、清单 version label、release 标签全部派生自它，构建前
-# 强制一致性门禁，任何一处漂移直接失败。
+# helm appVersion、清单 version label、release 标签全部派生自它，构建前由
+# deploy/scripts/check-release-version-consistency.sh 强制一致性门禁（它从树里
+# 读出「哪些地方写着版本」，不维护名单），任何一处漂移直接失败。
 #
 # 用法：
 #   deploy/scripts/build-release-image.sh          # 官方源构建
@@ -52,26 +53,9 @@ case "$VERSION_ID" in
     "v${VERSION}-unknown") fail "检出里没有可达的 release tag，标签退化成 $VERSION_ID" ;;
     *) fail "派生标签 $VERSION_ID 的声明版本不是 $VERSION" ;;
 esac
-grep -m1 '^appVersion:' deploy/helm/cogneva/Chart.yaml | grep -q "\"$VERSION\"" \
-    || fail "deploy/helm/cogneva/Chart.yaml appVersion != $VERSION"
-grep -m1 '^version:' deploy/helm/cogneva/Chart.yaml | grep -q "$VERSION" \
-    || fail "deploy/helm/cogneva/Chart.yaml version != $VERSION"
-python3 - "$VERSION" <<'EOF' || exit 1
-import re, sys
-want = sys.argv[1]
-text = open("deploy/helm/cogneva/values.yaml").read()
-m = re.search(r"^image:\s*\n(?:\s+[^\n]*\n)*?\s+tag:\s*\"([^\"]+)\"", text, re.M)
-if not m or m.group(1) != want:
-    sys.exit(f"values.yaml image.tag != {want} (got {m.group(1) if m else 'missing'})")
-for f in ("deployment", "gateway-deployment", "sandbox-executor-deployment", "evolution-deployment"):
-    t = open(f"deploy/k3s/{f}.yaml").read()
-    if f'app.kubernetes.io/version: "{want}"' not in t:
-        sys.exit(f"deploy/k3s/{f}.yaml 缺 version label {want}")
-cfg = open("deploy/k3s/configmap.yaml").read()
-if f'COGNEVA_APP_VERSION: "{want}"' not in cfg:
-    sys.exit(f"deploy/k3s/configmap.yaml COGNEVA_APP_VERSION != {want}")
-print(f"    chart appVersion/version、values tag、k3s 清单 label 均为 {want}")
-EOF
+# 交付物里写着版本的每一处都对一遍。集合由那份门自己从树里读（chart 与 values、
+# deploy/k3s 下每个本平台工作负载的 Pod 模板、configmap），这里不抄第二份名单。
+bash deploy/scripts/check-release-version-consistency.sh "$REPO_ROOT" || exit 1
 
 # 预渲染产物（元启动 apply 主路径，覆盖 k3s 单/多节点与 k8s 标准三 profile）
 # 必须与 chart 同源新鲜，否则发出去的 release 带的是旧拓扑/旧版本

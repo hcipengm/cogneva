@@ -44,6 +44,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: process-census
+        app.kubernetes.io/version: "0.5.10"
     spec:
       # 宿主 PID 命名空间：没有它，`/proc` 里只有本容器自己，第三方容器一个都读不到。
       hostPID: true

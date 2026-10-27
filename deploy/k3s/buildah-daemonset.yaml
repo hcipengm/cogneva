@@ -22,6 +22,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: image-builder
+        app.kubernetes.io/version: "0.5.10"
     spec:
       hostPID: true
       containers:

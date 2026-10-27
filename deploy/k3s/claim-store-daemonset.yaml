@@ -40,6 +40,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: claim-store
+        app.kubernetes.io/version: "0.5.10"
     spec:
       # 不挂 ServiceAccount token：这个进程只读宿主文件，从不与 apiserver 说话，
       # 一份它用不到的集群凭证只会把「跑成 root」的后果放大。

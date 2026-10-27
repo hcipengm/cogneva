@@ -799,6 +799,15 @@ jobs:
       - name: Check every container has someone who can report its processes
         run: bash deploy/scripts/check-process-census-coverage.sh
 
+      # 发布版本在交付物里写着好几处：chart 的 version/appVersion、values 的
+      # image.tag、每个本平台工作负载的 Pod 模板标签、configmap 的
+      # COGNEVA_APP_VERSION。它们原先靠一份写死的四文件名单来对，而树里另外五个跑
+      # 本平台镜像的工作负载不在名单上——标签停在上一版也没有任何人说话，偏偏
+      # `kubectl get pods -L app.kubernetes.io/version` 那一列正是从它读的。这一关从树
+      # 里读出「哪几处写着版本」，逐处与 Cargo.toml 声明的那个比。
+      - name: Check every place that states the release version agrees with it
+        run: bash deploy/scripts/check-release-version-consistency.sh
+
       # 设置里「代码平台与凭据」的成品是「GitHub 连没连、Gitee 连没连，并能在这一页
       # 贴一段令牌」。只有一个「已连接平台」格子时，两家都连上只报得下其中一家；粘贴
       # 令牌只写在浮层里时，这页读得到状态而写不进去。门判的是按平台的两份读数、下拉
