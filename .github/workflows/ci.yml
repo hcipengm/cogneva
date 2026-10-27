@@ -1123,6 +1123,12 @@ jobs:
       # 从 chart 与静态清单里一起删掉，上面两道都不会红。
       - name: Check config checksum wiring
         run: bash deploy/scripts/check-config-checksum-wiring.sh
+      # 门禁的载体：deploy/scripts 下的每个 check-* 都要有东西真的跑它（CI 作业、
+      # 集群内 install-*、别的脚本或测试点名），或者就地写一行 `# carrier:` 说明谁跑。
+      # 两边都是名单，而中间没有任何东西比较它们——新加一个门禁忘了登记，它不会红，
+      # 因为从不执行，而「从不执行」与「一直绿」在 CI 上一模一样。
+      - name: Check every gate has a carrier
+        run: python3 deploy/scripts/check-gate-carriers.py
       # git 身份自举的接线：Secret 写权的宿主必须带基线仓库 env，且全集群同值。
       # 这类缺陷在渲染期没有症状（清单合法、parity 也绿），只有这条判据盯得住。
       - name: Check git identity wiring
