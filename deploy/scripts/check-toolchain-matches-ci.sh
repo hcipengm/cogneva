@@ -60,10 +60,24 @@ rustup_bin="$(command -v rustup 2>/dev/null || true)"
 [ -n "$rustup_bin" ] || rustup_bin="$HOME/.cargo/bin/rustup"
 [ -x "$rustup_bin" ] || rustup_bin=""
 
+# 这一格只在作者机器上有读者。CI 的 runner 自己预装了一个 stable，它落后于上游
+# 是那张镜像的属性，与在跑的这笔改动无关——在这里问，红的是 runner 的镜像历史，
+# 而修法（`rustup update`）在 runner 上不成立，也没人能做。上面的两条结构判据
+# 在 CI 里照跑：那两条判的是 yml 与 toml 有没有各说一套，与装了什么无关。
+#
+# 2026-10-27 实测：这条门在 CI 上红了整整一步（`Repo Conventions` 的最后一格），
+# 部署器因此每轮持单，而同一棵树在本机全绿——两条读数差在一件与提交无关的事上。
+CI_SKIP_LOCAL_VERSION=0
+if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    CI_SKIP_LOCAL_VERSION=1
+    echo "SKIP 在 CI 上：这一格核对的是作者机器上的 stable，runner 预装的版本不是它"
+fi
 # 判据读的是输出，不是退出码：`rustup check` 发现「有更新可用」时退的是 100，
 # 按退出码判会把「有更新」读成「问不到」，于是这条门在它唯一该红的时候静默放行。
 checked=0
-if [ -n "$rustup_bin" ]; then
+if [ "$CI_SKIP_LOCAL_VERSION" -eq 1 ]; then
+    : # 原因上面那一行已经印过；这里再印一句「没有 rustup」会把跳过说成缺工具
+elif [ -n "$rustup_bin" ]; then
     check_out="$(timeout 60 "$rustup_bin" check 2>&1 || true)"
     behind="$(printf '%s\n' "$check_out" | grep -E '^stable[^ ]*( |$).*update available' || true)"
     current="$(printf '%s\n' "$check_out" | grep -E '^stable[^ ]*( |$).*(up to date|unchanged)' || true)"
