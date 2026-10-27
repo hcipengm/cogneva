@@ -549,7 +549,10 @@ async fn record_rule_counts(
     let agrees = matches!(verdict, LoadedRuleSet::Agree { .. });
     let labels = std::collections::HashMap::from([
         ("state".to_string(), "agrees".to_string()),
-        ("readout".to_string(), RULE_SET_READOUT.to_string()),
+        (
+            crate::alerts::LABEL_READOUT.to_string(),
+            RULE_SET_READOUT.to_string(),
+        ),
     ]);
     if let Err(e) = backend
         .record_gauge(
@@ -1068,7 +1071,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter_map(|(_, _, labels)| labels.get("readout").cloned())
+                .filter_map(|(_, _, labels)| labels.get(crate::alerts::LABEL_READOUT).cloned())
                 .collect()
         }
     }

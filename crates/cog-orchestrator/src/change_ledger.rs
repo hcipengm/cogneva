@@ -4055,7 +4055,10 @@ async fn publish_dispatch_rows(
             }
         };
         let mut labels = HashMap::new();
-        labels.insert("readout".to_string(), readout.as_str().to_string());
+        labels.insert(
+            crate::LABEL_READOUT.to_string(),
+            readout.as_str().to_string(),
+        );
         if let Err(e) = metrics
             .record_gauge(metric_names::CHANGE_DISPATCH_READOUTS, value as f64, labels)
             .await
@@ -4130,7 +4133,10 @@ async fn publish_handover_readback(
             HandoverReadout::Unreadable => readback.unreadable,
         };
         let mut labels = HashMap::new();
-        labels.insert("readout".to_string(), readout.as_str().to_string());
+        labels.insert(
+            crate::LABEL_READOUT.to_string(),
+            readout.as_str().to_string(),
+        );
         if let Err(e) = metrics
             .record_gauge(metric_names::CHANGE_DISPATCH_READOUTS, value as f64, labels)
             .await
@@ -4342,7 +4348,10 @@ async fn publish_write_windows(
     };
     for readout in WriteWindowReadout::ALL {
         let mut labels = HashMap::new();
-        labels.insert("readout".to_string(), readout.as_str().to_string());
+        labels.insert(
+            crate::LABEL_READOUT.to_string(),
+            readout.as_str().to_string(),
+        );
         if let Err(e) = metrics
             .record_gauge(
                 metric_names::CHANGE_WRITE_WINDOWS,
@@ -8703,7 +8712,9 @@ mod tests {
             .expect("the reading face is readable");
         samples
             .iter()
-            .find(|sample| sample.labels.get("readout").map(String::as_str) == Some(readout))
+            .find(|sample| {
+                sample.labels.get(crate::LABEL_READOUT).map(String::as_str) == Some(readout)
+            })
             .unwrap_or_else(|| panic!("this pass published no cell for {readout}"))
             .value
     }
@@ -8722,7 +8733,9 @@ mod tests {
             .expect("the reading face is readable");
         samples
             .iter()
-            .find(|sample| sample.labels.get("readout").map(String::as_str) == Some(readout))
+            .find(|sample| {
+                sample.labels.get(crate::LABEL_READOUT).map(String::as_str) == Some(readout)
+            })
             .map(|sample| sample.value)
     }
 
@@ -9278,7 +9291,7 @@ mod tests {
             );
             let readout = sample
                 .labels
-                .get("readout")
+                .get(crate::LABEL_READOUT)
                 .expect("every cell names its readout")
                 .clone();
             assert!(
@@ -9485,7 +9498,7 @@ mod tests {
             .expect("the reading face is readable");
         let names: Vec<String> = samples
             .iter()
-            .filter_map(|sample| sample.labels.get("readout").cloned())
+            .filter_map(|sample| sample.labels.get(crate::LABEL_READOUT).cloned())
             .collect();
         assert!(
             names.iter().all(|name| !name.starts_with("owed_")

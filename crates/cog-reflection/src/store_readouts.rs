@@ -27,6 +27,14 @@ use crate::{MetaLearningEngine, PolicyStore};
 /// 三处各写一份字面量就会在改名那天分成两半。
 pub const META_LEARNING_POLICY: &str = "meta_learning.mode";
 
+/// 这些读数靠哪个标签名区分彼此。
+///
+/// 同一个指标名下发布好几格读数，读它们的人只能按这个名字把一格挑出来。
+/// `cog-observability` 与 `cog-orchestrator` 写的是同一个标签，所以三个 crate
+/// 各声明一次、用同一个标识符，由门比较写出的词——其中一处改词，别的选择器
+/// 就从「有数」变成「空向量」，而空向量与「这一族从没跑过」是同一个读数。
+pub const LABEL_READOUT: &str = "readout";
+
 /// 恢复端写进数据根的交接单：包里的 ACTIVE 版本与决策证据规模。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreExpectation {
@@ -146,7 +154,7 @@ impl StoreReadouts {
         for (name, store) in &self.stores {
             let labels = |readout: &str| {
                 let mut labels = HashMap::new();
-                labels.insert("readout".to_string(), readout.to_string());
+                labels.insert(LABEL_READOUT.to_string(), readout.to_string());
                 labels.insert("data_dir".to_string(), data_dir.clone());
                 labels.insert("store".to_string(), name.clone());
                 labels
@@ -194,7 +202,7 @@ impl StoreReadouts {
             ("decision_trials", trials as f64),
         ] {
             let mut labels = HashMap::new();
-            labels.insert("readout".to_string(), readout.to_string());
+            labels.insert(LABEL_READOUT.to_string(), readout.to_string());
             labels.insert("data_dir".to_string(), data_dir.clone());
             labels.insert("store".to_string(), META_LEARNING_POLICY.to_string());
             self.record(labels, value).await;
@@ -213,7 +221,7 @@ impl StoreReadouts {
         let data_dir = self.data_dir.display().to_string();
         let labels_for = |store: &str, readout: &str| {
             let mut labels = HashMap::new();
-            labels.insert("readout".to_string(), readout.to_string());
+            labels.insert(LABEL_READOUT.to_string(), readout.to_string());
             labels.insert("data_dir".to_string(), data_dir.clone());
             labels.insert("store".to_string(), store.to_string());
             labels
@@ -311,7 +319,7 @@ impl StoreReadouts {
             .await
         {
             tracing::warn!(
-                readout = labels.get("readout").map(String::as_str).unwrap_or(""),
+                readout = labels.get(LABEL_READOUT).map(String::as_str).unwrap_or(""),
                 error = %e,
                 "policy store reading could not be published"
             );
@@ -369,7 +377,11 @@ mod tests {
 
     fn labels_of(sample: &cog_core::MetricSample) -> (String, String, String) {
         (
-            sample.labels.get("readout").cloned().unwrap_or_default(),
+            sample
+                .labels
+                .get(LABEL_READOUT)
+                .cloned()
+                .unwrap_or_default(),
             sample.labels.get("data_dir").cloned().unwrap_or_default(),
             sample.labels.get("store").cloned().unwrap_or_default(),
         )

@@ -1316,7 +1316,7 @@ async fn publish_alert_channels(
     let verdict = HashMap::from([
         ("state".to_string(), "verdict".to_string()),
         (
-            "readout".to_string(),
+            crate::alerts::LABEL_READOUT.to_string(),
             ALERT_CHANNEL_NONE_READOUT.to_string(),
         ),
     ]);
@@ -1828,7 +1828,7 @@ mod tests {
                 .iter()
                 .filter_map(|(_, value, labels)| {
                     labels
-                        .get("readout")
+                        .get(crate::alerts::LABEL_READOUT)
                         .map(|readout| (readout.clone(), *value))
                 })
                 .collect()
@@ -1983,7 +1983,7 @@ mod tests {
         let calls = backend.calls.lock().unwrap();
         let verdict_row = calls
             .iter()
-            .find(|(_, _, labels)| labels.contains_key("readout"))
+            .find(|(_, _, labels)| labels.contains_key(crate::alerts::LABEL_READOUT))
             .expect("the verdict row was not written");
         assert!(
             !verdict_row.2.contains_key("channel"),

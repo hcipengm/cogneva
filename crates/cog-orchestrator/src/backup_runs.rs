@@ -689,7 +689,10 @@ async fn publish_account_once(
                 continue;
             };
             let mut labels = HashMap::new();
-            labels.insert("readout".to_string(), readout.as_str().to_string());
+            labels.insert(
+                crate::LABEL_READOUT.to_string(),
+                readout.as_str().to_string(),
+            );
             if let Err(e) = metrics
                 .record_gauge(metric_names::BACKUP_RUN_READINGS, value, labels)
                 .await
@@ -901,8 +904,8 @@ mod tests {
     /// Read one selector block's `readout` selectors into `selectors`.
     fn collect_readout_selectors(block: &str, promql: &str, selectors: &mut ReadoutSelectors) {
         let mut rest = block;
-        while let Some(at) = rest.find("readout") {
-            rest = &rest[at + "readout".len()..];
+        while let Some(at) = rest.find(crate::LABEL_READOUT) {
+            rest = &rest[at + crate::LABEL_READOUT.len()..];
             let trimmed = rest.trim_start();
             let Some((operator, after)) = SELECTOR_OPERATORS.iter().find_map(|operator| {
                 trimmed

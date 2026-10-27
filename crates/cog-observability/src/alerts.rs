@@ -20,6 +20,13 @@ use lettre::{AsyncSmtpTransport, Tokio1Executor};
 /// each write it, and a reader groups across all three.
 pub const LABEL_OUTCOME: &str = "outcome";
 
+/// The label that names which reading a sample is: the counter or gauge family
+/// writes its own name here, and every reader picks the samples of one family
+/// out of the shared store by it. `cog-orchestrator` and `cog-reflection` write
+/// the same label, so this name is declared once per crate under the same
+/// identifier and a gate compares the spellings.
+pub const LABEL_READOUT: &str = "readout";
+
 /// The closed set of ways one dispatch to one channel can end, as recorded on
 /// [`cog_core::metric_names::ALERT_NOTIFICATIONS_TOTAL`]'s `outcome` label.
 pub const OUTCOME_DELIVERED: &str = "delivered";

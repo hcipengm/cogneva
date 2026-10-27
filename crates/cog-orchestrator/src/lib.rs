@@ -20,6 +20,17 @@ pub mod subscribe_backoff;
 pub mod task_executor_router;
 pub mod wbs;
 
+/// The label that names which reading a sample is.
+///
+/// The ledgers in this crate publish several readings under one metric name and
+/// tell them apart only by this label; a reader selects one reading out of the
+/// shared store by it. `cog-observability` and `cog-reflection` write the same
+/// label, so it is declared once per crate under the same identifier and a gate
+/// compares the spellings -- one edited copy would publish a family that every
+/// existing selector reads as empty, which is indistinguishable from that family
+/// never having run.
+pub const LABEL_READOUT: &str = "readout";
+
 pub use action_planner::ActionPlanOrchestrator;
 pub use dag_executor::task_phase::{ExitCriteria, PhaseTransitionRules, PhasedTask, TaskPhase};
 pub use dag_executor::{

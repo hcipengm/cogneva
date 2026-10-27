@@ -752,7 +752,7 @@ impl TaskGraphObservable {
             let rows: f64 = counts.iter().map(|(_, count)| *count as f64).sum();
             out.push(
                 RawMetric::new(TASKS_READINGS_METRIC, rows)
-                    .with_label("readout", TASKS_ROWS_READOUT),
+                    .with_label(crate::LABEL_READOUT, TASKS_ROWS_READOUT),
             );
             for (agent, age) in &snapshot.oldest_by_agent {
                 out.push(
@@ -1420,7 +1420,7 @@ mod tests {
             labeled(
                 &metrics,
                 TASKS_READINGS_METRIC,
-                "readout",
+                crate::LABEL_READOUT,
                 TASKS_ROWS_READOUT
             )
             .value,

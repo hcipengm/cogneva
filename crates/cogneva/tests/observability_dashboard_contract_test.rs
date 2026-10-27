@@ -631,7 +631,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     // governance face table owes this reading under.
     (
         "cogneva_alert_rule_count",
-        &["state", "readout"],
+        &["state", cog_observability::alerts::LABEL_READOUT],
         "crates/cog-observability/src/config_delivery.rs",
     ),
     // What the self-discovery watcher does with each round's signals. No panel

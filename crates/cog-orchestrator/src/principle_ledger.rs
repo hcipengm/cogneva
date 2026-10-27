@@ -334,7 +334,7 @@ async fn publish_census(metrics: Option<&Arc<dyn MetricsBackend>>, census: &Prin
         let reading = ["principle_ledger_", state].concat();
         let labels = HashMap::from([
             ("state".to_string(), state.to_string()),
-            ("readout".to_string(), reading),
+            (crate::LABEL_READOUT.to_string(), reading),
         ]);
         if let Err(e) = metrics
             .record_gauge(metric_names::PRINCIPLE_LEDGER_ROWS, count as f64, labels)
@@ -371,7 +371,7 @@ async fn publish_refusals(metrics: Option<&Arc<dyn MetricsBackend>>, rows: &[Pri
         let labels = HashMap::from([
             ("slug".to_string(), row.slug.clone()),
             (
-                "readout".to_string(),
+                crate::LABEL_READOUT.to_string(),
                 "principle_ledger_refusals".to_string(),
             ),
         ]);
@@ -2128,7 +2128,7 @@ mod tests {
             .map(|(_, value, labels)| {
                 (
                     labels
-                        .get("readout")
+                        .get(crate::LABEL_READOUT)
                         .map(String::as_str)
                         .unwrap_or("<no readout>"),
                     *value,
@@ -2206,7 +2206,8 @@ mod tests {
             .iter()
             .filter(|(name, _, _)| name == metric_names::PRINCIPLE_REFUSALS.as_str())
             .filter(|(_, _, labels)| {
-                labels.get("readout").map(String::as_str) != Some("principle_ledger_refusals")
+                labels.get(crate::LABEL_READOUT).map(String::as_str)
+                    != Some("principle_ledger_refusals")
             })
             .count();
         assert_eq!(
