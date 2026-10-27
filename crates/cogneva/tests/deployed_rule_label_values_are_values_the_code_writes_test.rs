@@ -30,17 +30,21 @@
 //!   vocabulary, the label name in the metric helper), so requiring them side by
 //!   side would redden on correct code. A value moved to another label passes
 //!   here and is caught by nothing;
-//! * a value that survives only in a test fixture. Fixtures are not separated
-//!   out, because the shape that separates them — truncating a file at its first
-//!   `#[cfg(test)]` — silently drops the production half of every large file
-//!   that has an inline test module, which would make this gate red on correct
-//!   code;
+//! * a value that survives only in a test fixture. Fixtures are separated out:
+//!   the census reads the production half of each file, so a value that a rule
+//!   and no shipped code still spell is reported. The split is per item rather
+//!   than "everything before the first `#[cfg(test)]`", which would leave the
+//!   production tail of every file that carries an inline test module unread;
 //! * a query that selects a value this test's selector parser fails to see. That
 //!   is why the extracted set is asserted to be large and to contain values
 //!   known to be in the documents.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+mod common;
+
+use common::rust_production::production_lines;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -290,10 +294,15 @@ fn wanted_and_missing(root: &Path) -> (BTreeSet<Selection>, Vec<Selection>) {
     for src in &crates {
         source_files(src, &mut files);
     }
+    // The production half of each file: a word that survives only in a fixture
+    // is not a word the series is written with, and reading the fixtures as
+    // well would let a renamed emitter pass on the strength of its own tests.
     let sources: Vec<String> = files
         .iter()
         .map(|path| {
-            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            let text =
+                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            production_lines(&text).join("\n")
         })
         .collect();
 
@@ -405,9 +414,17 @@ fn a_value_no_source_spells_is_reported_missing() {
     .expect("dashboard");
     let src = root.join("crates/cog-example/src");
     std::fs::create_dir_all(&src).expect("src dir");
+    // `renamed` appears only inside a test module: the emitter was renamed, the
+    // fixture still says the old word. Reading fixtures as production would
+    // call this clean on the strength of the very test that outlived the code.
     std::fs::write(
         src.join("lib.rs"),
-        "fn label() -> &'static str { \"written\" }\n",
+        "fn label() -> &'static str { \"written\" }\n\
+         \n\
+         #[cfg(test)]\n\
+         mod tests {\n\
+             fn old_word() -> &'static str { \"renamed\" }\n\
+         }\n",
     )
     .expect("source");
 
