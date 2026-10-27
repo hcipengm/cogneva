@@ -171,7 +171,7 @@ async fn test_gateway_cluster_overview() {
     // 记账一次运行 ≠ 多出一个任务：任务数来自任务状态面，不是运行账本。
     assert_eq!(overview.total_tasks, Some(0));
     assert_eq!(overview.avg_task_duration_ms, Some(1000));
-    assert_eq!(overview.cluster_health, "unknown");
+    assert_eq!(overview.cluster_health, cog_core::ClusterHealth::Unknown);
 }
 
 #[tokio::test]

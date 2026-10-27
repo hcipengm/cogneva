@@ -57,6 +57,76 @@ pub struct RawLogIndex {
     pub created_at: DateTime<Utc>,
 }
 
+/// The verdict a cluster overview carries over its alert evidence.
+///
+/// One declaration: the gateway decides it, both storage backends default to
+/// it, and the panel colours it. Every one of those reads these words instead
+/// of spelling the same three strings again — a word spelled by hand at a
+/// consumer is a value no producer emits, and it reads on screen exactly like
+/// "the source said nothing".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterHealth {
+    /// The alert source answered and nothing was firing.
+    Healthy,
+    /// The source answered and something was firing.
+    Degraded,
+    /// No source answered. "I did not look" — kept apart from "nothing is
+    /// firing" on purpose.
+    Unknown,
+}
+
+impl ClusterHealth {
+    /// Every word this vocabulary has. Readers that must cover all of them
+    /// iterate this rather than listing the variants again.
+    pub const ALL: [ClusterHealth; 3] = [
+        ClusterHealth::Healthy,
+        ClusterHealth::Degraded,
+        ClusterHealth::Unknown,
+    ];
+
+    /// The word this verdict travels as, on the wire and in the panel.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClusterHealth::Healthy => "healthy",
+            ClusterHealth::Degraded => "degraded",
+            ClusterHealth::Unknown => "unknown",
+        }
+    }
+
+    /// Read a word back. Case-insensitive, because the wire is the only place
+    /// these words are not already typed.
+    pub fn parse(word: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|health| health.as_str().eq_ignore_ascii_case(word))
+    }
+}
+
+/// Serialised through [`ClusterHealth::as_str`] rather than through a
+/// `#[serde(rename)]` on each variant: a rename attribute is a second place the
+/// word is written, and the two can part company without the compiler saying
+/// so.
+impl Serialize for ClusterHealth {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// A word outside [`ClusterHealth::ALL`] is an error, not a silent `Unknown`:
+/// the two mean opposite things, and folding them together would report a
+/// vocabulary mismatch as "nobody looked".
+impl<'de> Deserialize<'de> for ClusterHealth {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        Self::parse(&word).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unknown cluster health {word:?}; declared words are {:?}",
+                ClusterHealth::ALL.map(|health| health.as_str())
+            ))
+        })
+    }
+}
+
 /// Cluster-wide observability overview.
 ///
 /// Every count here is `Option`: `None` means the backend could not produce
@@ -78,7 +148,7 @@ pub struct ClusterOverview {
     /// source answered at all. The scope is exactly that evidence — a
     /// "healthy" here claims nothing is firing, not that every component was
     /// verified working.
-    pub cluster_health: String,
+    pub cluster_health: ClusterHealth,
     pub timestamp: DateTime<Utc>,
     pub total_squads: Option<usize>,
     pub active_squads: Option<usize>,

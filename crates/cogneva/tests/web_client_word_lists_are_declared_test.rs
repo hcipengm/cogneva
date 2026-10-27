@@ -5,9 +5,11 @@
 //! the empty answer, which is what "nothing there" looks like -- so the operator
 //! reads a broken panel as a quiet system.
 //!
-//! Two lists are checked here against their declarations: the task view's
-//! filter tabs against `cog_core::TaskFilter`, and the git identity state union
-//! against the gateway's `IdentityState`.
+//! Every list a panel selects on is read here against the declaration the server
+//! keeps: the task view's filter tabs against `cog_core::TaskFilter`, the git
+//! identity state union against the gateway's `IdentityState`, the project kinds
+//! against `ProjectKind`, the backend health words against `BackendState` (plus
+//! their colour map), and the cluster verdict against `cog_core::ClusterHealth`.
 //!
 //! 实测（2026-10-27）：修前 `web/src/views/TasksView.tsx` 的 `ready` 标签把
 //! `status=ready` 发给服务端，而 `TaskStatus` 里没有这个词，标签恒空——表头却
@@ -186,6 +188,102 @@ fn the_project_kinds_the_panel_knows_are_the_ones_the_gateway_reports() {
     );
 }
 
+/// 后端健康矩阵的状态词：面板按它选颜色，网关按它说「有没有东西坏了」。两边
+/// 各自写一份时，服务端多一个词，那一行落进通用分支（灰色，与「没探出结论」
+/// 同形）；少一个词，面板为一支永远不会到来的结论留着一支死分支。
+///
+/// 实测（2026-10-27）：修前探针把失败文本拼进状态词（`"down: connection
+/// refused"`），面板的 `=== 'up'` 与色表都认不出它，那一行读作中性。消融对照：
+/// 把 `BackendState::Down` 的词改成 `down!`，本门红并点名前端联合类型。
+#[test]
+fn the_backend_states_the_panel_knows_are_the_ones_the_gateway_reports() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let mut declared: Vec<String> = cog_gateway::backend_health::BackendState::ALL
+        .iter()
+        .map(|state| state.as_str().to_string())
+        .collect();
+    declared.sort();
+
+    for (interface, field) in [
+        ("export interface BackendHealth {", "  status:"),
+        ("export interface BackendHealthMatrix {", "  overall:"),
+    ] {
+        let body_start = source
+            .find(interface)
+            .unwrap_or_else(|| panic!("{interface} is gone; this gate reads its union through it"));
+        let body = &source[body_start..];
+        let body_end = body.find("\n}").expect("the interface body is not closed");
+        let mut panel = union_words(&body[..body_end], field);
+        panel.sort();
+        assert!(
+            panel.len() >= 2,
+            "{interface} 的 {field} 读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+        );
+        assert_eq!(
+            panel, declared,
+            "面板与网关必须认识同一组后端状态词（{interface}）"
+        );
+    }
+
+    // 每个声明的词在状态色表里都要有一格：缺一格时那一行画成中性的「一般般」，
+    // 与「没探出结论」同色，读的人分不出这两种。
+    let primitives = repo_root().join("web/src/ui/primitives.tsx");
+    let source = std::fs::read_to_string(&primitives)
+        .unwrap_or_else(|e| panic!("{}: {e}", primitives.display()));
+    let start = source
+        .find("const TONES: Record<string, string> = {")
+        .expect("the status colour map is gone; this gate reads the tones through it");
+    let tones = &source[start..];
+    let end = tones.find("\n};").expect("the tone map is not closed");
+    let tones = &tones[..end];
+    assert!(
+        tones.len() > 100,
+        "色表只读出 {} 字节，这不是它",
+        tones.len()
+    );
+    for state in cog_gateway::backend_health::BackendState::ALL {
+        assert!(
+            tones.contains(&format!("\n  {}: '", state.as_str())),
+            "状态词 {:?} 在色表里没有颜色：那一行会画成中性的，与「没探出结论」同形",
+            state.as_str()
+        );
+    }
+}
+
+/// 集群判词的三个词：网关决定它、两个存储后端默认答它、面板按它选颜色并决定
+/// 要不要报一条问题。三处各写一份时，服务端多一个词，状态栏与问题列表都落进
+/// 「不是 healthy 也不是 degraded」的分支——状态栏画成告警色、问题列表给它
+/// `error`，读起来像一个从没验证过的结论；少一个词，面板为一支永远不会到来的
+/// 判词留着一支死分支。
+#[test]
+fn the_cluster_verdicts_the_panel_knows_are_the_ones_the_gateway_declares() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let body_start = source
+        .find("export interface ClusterOverview {")
+        .expect("the cluster overview type is gone; this gate reads its verdict through it");
+    let body = &source[body_start..];
+    let body_end = body.find("\n}").expect("the interface body is not closed");
+    let mut panel = union_words(&body[..body_end], "  cluster_health:");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "判词联合类型读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    let mut declared: Vec<String> = cog_core::ClusterHealth::ALL
+        .iter()
+        .map(|health| health.as_str().to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(panel, declared, "面板与网关必须认识同一组集群判词");
+}
+
 /// 对照：本门的判据认得出一个不是词的东西。少了这条，`TaskFilter::parse` 哪天
 /// 退化成「什么词都收」，上面那条仍然全绿。
 #[test]
@@ -218,6 +316,22 @@ fn the_acceptance_check_rejects_a_word_no_row_carries() {
             Some(filter),
             "{} is declared but not readable",
             filter.as_str()
+        );
+    }
+    // 修前探针写的就是这一种：状态词后面拼着失败文本。
+    for word in ["down: connection refused", "connected", "Up "] {
+        assert_eq!(
+            cog_gateway::backend_health::BackendState::parse(word),
+            None,
+            "{word:?} is not a declared backend state"
+        );
+    }
+    for state in cog_gateway::backend_health::BackendState::ALL {
+        assert_eq!(
+            cog_gateway::backend_health::BackendState::parse(state.as_str()),
+            Some(state),
+            "{} is declared but not readable",
+            state.as_str()
         );
     }
 }

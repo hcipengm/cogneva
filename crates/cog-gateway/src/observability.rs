@@ -45,11 +45,11 @@ const FIRING_PROBE_LIMIT: i64 = 1;
 /// nothing was firing, not that every component was verified working. Severity
 /// plays no part — the alert vocabulary spends `info` on resolutions, so any
 /// row still firing is a claim that something is wrong.
-fn cluster_health_of(firing: &[cog_core::PersistedAlert]) -> &'static str {
+fn cluster_health_of(firing: &[cog_core::PersistedAlert]) -> cog_core::ClusterHealth {
     if firing.is_empty() {
-        "healthy"
+        cog_core::ClusterHealth::Healthy
     } else {
-        "degraded"
+        cog_core::ClusterHealth::Degraded
     }
 }
 
@@ -70,7 +70,7 @@ async fn apply_alert_verdict(
     let Some(firing) = source.list_active_alerts(FIRING_PROBE_LIMIT).await else {
         return;
     };
-    overview.cluster_health = cluster_health_of(&firing).to_string();
+    overview.cluster_health = cluster_health_of(&firing);
 }
 
 /// Fill the agent counts from the registry that actually holds presence.
@@ -708,7 +708,7 @@ mod tests {
         }
     }
 
-    fn overview(health: &str) -> cog_core::observability::ClusterOverview {
+    fn overview(health: cog_core::ClusterHealth) -> cog_core::observability::ClusterOverview {
         cog_core::observability::ClusterOverview {
             total_agents: None,
             active_agents: None,
@@ -717,7 +717,7 @@ mod tests {
             queued_tasks: None,
             failed_tasks: None,
             avg_task_duration_ms: None,
-            cluster_health: health.into(),
+            cluster_health: health,
             timestamp: chrono::Utc::now(),
             total_squads: None,
             active_squads: None,
@@ -752,9 +752,9 @@ mod tests {
         let source: Arc<dyn ActiveAlertSource> = Arc::new(StubSource {
             firing: Some(vec![]),
         });
-        let mut o = overview("unknown");
+        let mut o = overview(cog_core::ClusterHealth::Unknown);
         apply_alert_verdict(&mut o, Some(&source)).await;
-        assert_eq!(o.cluster_health, "healthy");
+        assert_eq!(o.cluster_health, cog_core::ClusterHealth::Healthy);
     }
 
     // A firing row is the claim that something is wrong, whatever its severity
@@ -765,9 +765,13 @@ mod tests {
             let source: Arc<dyn ActiveAlertSource> = Arc::new(StubSource {
                 firing: Some(vec![firing(severity)]),
             });
-            let mut o = overview("unknown");
+            let mut o = overview(cog_core::ClusterHealth::Unknown);
             apply_alert_verdict(&mut o, Some(&source)).await;
-            assert_eq!(o.cluster_health, "degraded", "severity {severity}");
+            assert_eq!(
+                o.cluster_health,
+                cog_core::ClusterHealth::Degraded,
+                "severity {severity}"
+            );
         }
     }
 
@@ -775,9 +779,9 @@ mod tests {
     // "never looked" and "looked, all clear" arrive as the same string.
     #[tokio::test]
     async fn without_a_source_the_verdict_stays_unknown() {
-        let mut o = overview("unknown");
+        let mut o = overview(cog_core::ClusterHealth::Unknown);
         apply_alert_verdict(&mut o, None).await;
-        assert_eq!(o.cluster_health, "unknown");
+        assert_eq!(o.cluster_health, cog_core::ClusterHealth::Unknown);
     }
 
     // A source whose query errored is not evidence of quiet either. This is the
@@ -786,9 +790,9 @@ mod tests {
     #[tokio::test]
     async fn a_source_that_could_not_read_leaves_the_verdict_unknown() {
         let source: Arc<dyn ActiveAlertSource> = Arc::new(StubSource { firing: None });
-        let mut o = overview("unknown");
+        let mut o = overview(cog_core::ClusterHealth::Unknown);
         apply_alert_verdict(&mut o, Some(&source)).await;
-        assert_eq!(o.cluster_health, "unknown");
+        assert_eq!(o.cluster_health, cog_core::ClusterHealth::Unknown);
     }
 
     /// The endpoints on the wire are the range the rollup answered for.

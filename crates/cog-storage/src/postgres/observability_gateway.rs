@@ -608,7 +608,7 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
             // The storage layer holds no alert evidence, so it cannot answer.
             // The surface that can — the process holding the alert source —
             // fills this in before delivering the overview.
-            cluster_health: "unknown".into(),
+            cluster_health: cog_core::ClusterHealth::Unknown,
             timestamp: Utc::now(),
             total_squads,
             active_squads,

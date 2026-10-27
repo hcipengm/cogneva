@@ -1527,7 +1527,7 @@ impl ObservabilityGateway for MemoryObservabilityGateway {
             avg_task_duration_ms: avg_duration,
             // No alert evidence lives here; the surface that has it fills this
             // in before delivery.
-            cluster_health: "unknown".into(),
+            cluster_health: cog_core::ClusterHealth::Unknown,
             timestamp: Utc::now(),
             total_squads: Some(total_squads),
             active_squads: Some(active_squads),

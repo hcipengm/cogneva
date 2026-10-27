@@ -1,5 +1,5 @@
 use chrono::{NaiveDate, Utc};
-use cog_core::{ClusterOverview, EventFilter, LogEntry, RawLogIndex, TaskMetrics};
+use cog_core::{ClusterHealth, ClusterOverview, EventFilter, LogEntry, RawLogIndex, TaskMetrics};
 
 #[test]
 fn test_event_filter_default() {
@@ -70,7 +70,7 @@ fn test_cluster_overview_serialization() {
         queued_tasks: Some(5),
         failed_tasks: Some(2),
         avg_task_duration_ms: Some(1500),
-        cluster_health: "healthy".into(),
+        cluster_health: ClusterHealth::Healthy,
         timestamp: Utc::now(),
         total_squads: Some(6),
         active_squads: Some(4),
@@ -91,7 +91,7 @@ fn test_cluster_overview_serialization() {
         queued_tasks: None,
         failed_tasks: None,
         avg_task_duration_ms: None,
-        cluster_health: "unknown".into(),
+        cluster_health: ClusterHealth::Unknown,
         timestamp: Utc::now(),
         total_squads: None,
         active_squads: None,
@@ -101,6 +101,45 @@ fn test_cluster_overview_serialization() {
     assert_eq!(recovered.total_tasks, None);
     assert_eq!(recovered.avg_task_duration_ms, None);
     assert_ne!(recovered.total_tasks, Some(0));
+}
+
+/// Every declared verdict survives the wire as its own word, and no other word
+/// is accepted on the way back.
+///
+/// A reader that selected rows by these words (`healthy`, `degraded`,
+/// `unknown`) was comparing against three strings written at each site; a third
+/// spelling that drifted would still parse as a valid overview and simply draw
+/// nothing. So the round trip covers every word the declaration has, and a word
+/// outside it is an error rather than a fallback — folding an unknown word into
+/// `unknown` would report "nobody has this word" as "nobody looked".
+#[test]
+fn every_cluster_verdict_survives_the_wire_and_no_other_word_does() {
+    for health in ClusterHealth::ALL {
+        let json = serde_json::to_string(&health).unwrap();
+        assert_eq!(json, format!("\"{}\"", health.as_str()));
+        let recovered: ClusterHealth = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered, health);
+        assert_eq!(ClusterHealth::parse(health.as_str()), Some(health));
+    }
+
+    // Distinct words: two variants sharing a spelling would make `parse` pick
+    // whichever came first and silently retire the other.
+    let words: std::collections::BTreeSet<&str> =
+        ClusterHealth::ALL.iter().map(|h| h.as_str()).collect();
+    assert_eq!(words.len(), ClusterHealth::ALL.len());
+
+    assert_eq!(
+        ClusterHealth::parse("HEALTHY"),
+        Some(ClusterHealth::Healthy)
+    );
+    assert_eq!(ClusterHealth::parse("ok"), None);
+    assert_eq!(ClusterHealth::parse("healthy "), None);
+
+    let err = serde_json::from_str::<ClusterHealth>("\"ok\"").unwrap_err();
+    assert!(
+        err.to_string().contains("unknown cluster health"),
+        "a word outside the vocabulary must name itself: {err}"
+    );
 }
 
 // ─── traceparent: the id that survives a process boundary ──────────────────
