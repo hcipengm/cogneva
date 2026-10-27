@@ -617,14 +617,22 @@ impl AlertmanagerConfig {
     /// than re-tested: the announcement and the registration cannot disagree
     /// when one is the other's shadow.
     pub fn channel_names(&self) -> Vec<&'static str> {
-        self.channels()
-            .iter()
-            .map(|channel| match channel {
-                AlertChannel::Webhook { .. } => ALERT_CHANNEL_WEBHOOK,
-                AlertChannel::Email { .. } => ALERT_CHANNEL_EMAIL,
-                AlertChannel::Slack { .. } => ALERT_CHANNEL_SLACK,
-            })
-            .collect()
+        self.channels().iter().map(channel_name).collect()
+    }
+}
+
+/// The word one channel reports under.
+///
+/// Three places ask a channel its name -- the registration that announces which
+/// outlets a deployment built, the config path table, and the `channel` label on
+/// the delivery counters -- and they are one vocabulary read three times. A
+/// channel registered as `slack` whose deliveries are labelled `slack_v2` is a
+/// series nothing joins, and neither half looks wrong on its own.
+pub fn channel_name(channel: &AlertChannel) -> &'static str {
+    match channel {
+        AlertChannel::Webhook { .. } => ALERT_CHANNEL_WEBHOOK,
+        AlertChannel::Email { .. } => ALERT_CHANNEL_EMAIL,
+        AlertChannel::Slack { .. } => ALERT_CHANNEL_SLACK,
     }
 }
 

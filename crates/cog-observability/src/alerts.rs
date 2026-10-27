@@ -50,11 +50,7 @@ enum Delivery {
 /// A webhook URL carries its own credential (Slack's does), and an email
 /// channel carries recipients, so neither may reach a label or a log field.
 fn channel_kind(channel: &AlertChannel) -> &'static str {
-    match channel {
-        AlertChannel::Webhook { .. } => "webhook",
-        AlertChannel::Email { .. } => "email",
-        AlertChannel::Slack { .. } => "slack",
-    }
+    crate::config::channel_name(channel)
 }
 
 pub struct AlertManager {
