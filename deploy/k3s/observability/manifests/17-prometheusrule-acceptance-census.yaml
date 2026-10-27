@@ -115,4 +115,4 @@ spec:
             severity: warning
           annotations:
             summary: "有 {{ $value }} 条验收项，规格说它已经落了，而它的判据跑不出判词"
-            description: "判据自身的问题，不是代码：散文当判据（unjudged）、判据没给出命令（no-command）、或判据点名的脚本不存在（missing-script）。跑 `bash scripts/host/cogneva-acceptance-census-reading.sh` 看 `landed_unjudgeable` 那一格，再按普查快照里 `verdict` 为这三种的条目逐条点名；修法是把那一条的 check 写成能跑的命令，或者把它的状态改回未落。"
+            description: "判据自身的问题，不是代码：散文当判据（unjudged）、判据没给出命令（no-command）、或判据点名的脚本不存在（missing-script）。点名不用再跑一遍普查：快照最后一行（`census.jsonl`）的 `unjudgeable` 已经逐条列出 `spec`、`id`、`verdict`、`detail`；超过上限时 `unjudgeable_truncated` 为 true，剩下的按同一格式再读一次快照。修法是把那一条的 check 写成能跑的命令，或者把它的状态改回未落。"
