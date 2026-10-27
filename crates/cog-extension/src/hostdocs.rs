@@ -1648,17 +1648,14 @@ impl HostDocs {
                 dir.display()
             ))
         })?;
-        let body = serde_json::to_vec_pretty(record)
-            .map_err(|e| SFError::Config(format!("cannot serialize a staged plan: {e}")))?;
         let published = dir.join(format!("{}.json", record.staged_id));
-        let tmp = dir.join(format!("{}.json.tmp", record.staged_id));
-        tokio::fs::write(&tmp, body).await.map_err(|e| {
-            SFError::Config(format!(
-                "cannot write the staged plan at {}: {e}",
-                tmp.display()
-            ))
-        })?;
-        tokio::fs::rename(&tmp, &published).await.map_err(|e| {
+        cog_core::atomic_write::write_json_async(
+            &published,
+            record,
+            cog_core::atomic_write::Durability::SameKernel,
+        )
+        .await
+        .map_err(|e| {
             SFError::Config(format!(
                 "cannot publish the staged plan at {}: {e}",
                 published.display()

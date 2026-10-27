@@ -34,6 +34,8 @@ pub const REFLECTION_NAMESPACE: &str = "reflection";
 /// 与「一轮评审能跑多久」无关。
 pub const SELF_REVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+// 整份替换一份文件的规则与网关、主线共用一份实现，见 `cog_core::atomic_write`。
+pub use cog_core::atomic_write;
 pub mod auto_promoter;
 pub mod baseline_port;
 // The readings and the rules of the shared build cache live in cog-core: two

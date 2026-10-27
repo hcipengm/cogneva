@@ -13,13 +13,11 @@
 //!   （"拒绝无统计显著的改动"）。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::{DateTime, Utc};
 use cog_core::{SFError, SFResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 
 /// 策略产物的一个版本。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,57 +71,18 @@ pub struct PolicyStore {
     dir: PathBuf,
 }
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// 原子写：临时文件 → fsync 文件 → rename → fsync 目录。
+/// 原子写：见 [`crate::atomic_write`]。版本文件与 ACTIVE 都走这里。
 ///
-/// 版本文件与 ACTIVE 都走这里。只 rename 不 fsync 目录时，掉电后目录项可能丢，
-/// 于是「版本文件已经落盘」只是进程视角，恢复时可能读到 ACTIVE 指向一个不存在的
-/// 版本。文件先持久化，再写 ACTIVE，顺序也不能反。
+/// 只 rename 不 fsync 目录时，掉电后目录项可能丢，于是「版本文件已经落盘」只是
+/// 进程视角，恢复时可能读到 ACTIVE 指向一个不存在的版本。文件先持久化，再写
+/// ACTIVE，顺序也不能反——所以这一处要 [`Durability::SurvivesPowerLoss`]。
 async fn write_atomic(path: &Path, contents: impl AsRef<[u8]>) -> SFResult<()> {
-    let contents = contents.as_ref();
-    let dir = path
-        .parent()
-        .ok_or_else(|| SFError::IO(format!("no parent directory for {}", path.display())))?;
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|e| SFError::IO(format!("create {}: {e}", dir.display())))?;
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("policy");
-    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{name}.{}.{seq}.tmp", std::process::id()));
-    {
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)
-            .await
-            .map_err(|e| SFError::IO(format!("open {}: {e}", tmp.display())))?;
-        file.write_all(contents)
-            .await
-            .map_err(|e| SFError::IO(format!("write {}: {e}", tmp.display())))?;
-        file.sync_all()
-            .await
-            .map_err(|e| SFError::IO(format!("fsync {}: {e}", tmp.display())))?;
-    }
-    tokio::fs::rename(&tmp, path).await.map_err(|e| {
-        SFError::IO(format!(
-            "rename {} -> {}: {e}",
-            tmp.display(),
-            path.display()
-        ))
-    })?;
-    let dir_file = tokio::fs::File::open(dir)
-        .await
-        .map_err(|e| SFError::IO(format!("open dir {}: {e}", dir.display())))?;
-    dir_file
-        .sync_all()
-        .await
-        .map_err(|e| SFError::IO(format!("fsync dir {}: {e}", dir.display())))?;
-    Ok(())
+    crate::atomic_write::write_bytes_async(
+        path,
+        contents.as_ref(),
+        crate::atomic_write::Durability::SurvivesPowerLoss,
+    )
+    .await
 }
 
 impl PolicyStore {

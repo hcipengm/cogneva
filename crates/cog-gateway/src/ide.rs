@@ -736,21 +736,16 @@ async fn write_file(path: &Path, text: &str) -> Result<u64, ApiError> {
             .map_err(|e| ApiError::bad_request(format!("cannot create parent directory: {e}")))?;
     }
 
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| ApiError::bad_request("path must end in a file name"))?;
-    let tmp = path.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-    tokio::fs::write(&tmp, bytes)
-        .await
-        .map_err(|e| ApiError::internal(format!("cannot write: {e}")))?;
-    match tokio::fs::rename(&tmp, path).await {
-        Ok(()) => Ok(bytes.len() as u64),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            Err(ApiError::internal(format!("cannot replace file: {e}")))
-        }
-    }
+    // 临时文件怎么起名、写在哪、失败时怎么清，都在那一处：编辑器的保存与主线
+    // 的状态、策略库的版本是同一条规则，读者都是「目录列出来就得是完整的」。
+    cog_core::atomic_write::write_bytes_async(
+        path,
+        bytes,
+        cog_core::atomic_write::Durability::SameKernel,
+    )
+    .await
+    .map_err(|e| ApiError::internal(format!("cannot replace file: {e}")))?;
+    Ok(bytes.len() as u64)
 }
 
 /// 一次工作区的用量读数。

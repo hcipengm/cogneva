@@ -302,9 +302,12 @@ pub fn publish_metrics(
     report: &RepairReport,
     pass_unix_seconds: u64,
 ) -> std::io::Result<()> {
-    let staging = path.with_extension("prom.tmp");
-    fs::write(&staging, report.metrics(pass_unix_seconds))?;
-    fs::rename(&staging, path)
+    cog_core::atomic_write::write_bytes(
+        path,
+        report.metrics(pass_unix_seconds).as_bytes(),
+        cog_core::atomic_write::Durability::SameKernel,
+    )
+    .map_err(std::io::Error::other)
 }
 
 /// Number of 0x00 bytes at the end of `path`, counting back in [`SCAN_CHUNK`]

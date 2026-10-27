@@ -1,4 +1,5 @@
 pub mod admission;
+pub mod atomic_write;
 pub mod audit;
 pub mod build_cache;
 pub mod build_cache_readings;

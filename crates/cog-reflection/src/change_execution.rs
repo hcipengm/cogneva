@@ -385,22 +385,7 @@ impl ChangeExecutionOutcome {
 /// 不 fsync：写端与读端在同一个内核上（共享卷是同节点的一个目录），rename 当场对
 /// 另一个进程可见，耐用性边界不是断电。
 pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> SFResult<()> {
-    let body = serde_json::to_vec_pretty(value)
-        .map_err(|e| SFError::IO(format!("serialize {}: {e}", path.display())))?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| SFError::IO(format!("create {}: {e}", parent.display())))?;
-    }
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, &body)
-        .map_err(|e| SFError::IO(format!("write {}: {e}", tmp.display())))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
-        SFError::IO(format!(
-            "rename {} -> {}: {e}",
-            tmp.display(),
-            path.display()
-        ))
-    })
+    crate::atomic_write::write_json(path, value, crate::atomic_write::Durability::SameKernel)
 }
 
 /// 读回一份 JSON。读不到就报错——缺席不是「没有结论」，它是「这份读数不存在」，

@@ -63,21 +63,12 @@ impl DecisionStatsSnapshot {
         &self,
         stats: &HashMap<(DecisionCategory, DecisionGroupKey), DecisionStatistics>,
     ) -> SFResult<()> {
-        if let Some(parent) = self.path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| SFError::IO(format!("create {}: {}", parent.display(), e)))?;
-        }
-        let body = serde_json::to_string(&SnapshotFile::from_map(stats))
-            .map_err(SFError::Serialization)?;
-        let tmp = self.path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, body.as_bytes())
-            .await
-            .map_err(|e| SFError::IO(format!("write {}: {}", tmp.display(), e)))?;
-        tokio::fs::rename(&tmp, &self.path)
-            .await
-            .map_err(|e| SFError::IO(format!("rename to {}: {}", self.path.display(), e)))?;
-        Ok(())
+        crate::atomic_write::write_json_async(
+            &self.path,
+            &SnapshotFile::from_map(stats),
+            crate::atomic_write::Durability::SameKernel,
+        )
+        .await
     }
 }
 
@@ -1111,7 +1102,15 @@ mod tests {
             .unwrap();
 
         assert!(path.exists());
-        assert!(!path.with_extension("json.tmp").exists());
+        // 临时文件的名字由写的那一处决定（带 pid 与序号），所以判据不是某一个
+        // 固定的名字，而是「写完这个目录里只剩要的那一份」。
+        let leftovers: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "decision_stats.json")
+            .collect();
+        assert!(leftovers.is_empty(), "残留：{leftovers:?}");
     }
 
     #[tokio::test]

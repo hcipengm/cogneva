@@ -75,9 +75,14 @@ pub fn store_report(dir: &Path, id: &str, report_json: &str) -> std::io::Result<
         attempt += 1;
         final_id = format!("{id}-{attempt}");
     };
-    let tmp = dir.join(format!(".{final_id}.json.tmp"));
-    std::fs::write(&tmp, report_json)?;
-    std::fs::rename(&tmp, &path)?;
+    // 报告能重跑，不 fsync：读者与写者同内核，rename 当场可见就够了。临时文件怎么
+    // 起名由那一处决定——本函数只负责挑一个还不存在的 id。
+    cog_core::atomic_write::write_bytes(
+        &path,
+        report_json.as_bytes(),
+        cog_core::atomic_write::Durability::SameKernel,
+    )
+    .map_err(std::io::Error::other)?;
     Ok((final_id, path))
 }
 
