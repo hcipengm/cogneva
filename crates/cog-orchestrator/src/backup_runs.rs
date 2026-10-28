@@ -797,6 +797,7 @@ pub fn spawn_backup_runs_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use std::collections::{BTreeMap, BTreeSet};
 
     /// The shipped rules, by name, as the chart holds them.
@@ -805,7 +806,7 @@ mod tests {
     /// profiles are generated from it, so a rule renamed in the rendered copies
     /// and not here would be a rule the deployment does not have.
     fn shipped_rules() -> BTreeMap<String, String> {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         let path = root.join("deploy/helm/cogneva/files/cogneva.json");
         let text = std::fs::read_to_string(&path).expect("read the chart's cogneva.json");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("chart JSON parses");

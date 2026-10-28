@@ -1408,6 +1408,7 @@ impl CollaborationExecutor {
 #[cfg(test)]
 mod tests {
     use super::CollaborationExecutor;
+    use crate::checkout::repo_root;
     use cog_core::{Observable, Task, TaskType};
 
     /// Keeps the envelopes the archive is handed, so a test can read back how a
@@ -2492,7 +2493,7 @@ mod tests {
     /// is extracted the way the delivery check extracts it.
     #[test]
     fn the_estimator_reaches_every_token_budget_the_shipped_configs_declare() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         let k3s_configmap = format!(
             "deploy/k3s/{}-configmap.yaml",
             cog_core::topology::CONFIG_CONFIGMAP

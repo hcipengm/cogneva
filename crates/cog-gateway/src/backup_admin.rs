@@ -490,6 +490,7 @@ pub async fn delete_handler(Path(name): Path<String>) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     fn cronjob() -> Value {
         json!({
@@ -649,7 +650,7 @@ mod tests {
     /// 上面那条消息就变成一句谎话——而它正好是在人最没空核对的时候被读到。
     #[test]
     fn the_manifest_the_message_names_still_grants_this_workload_the_right() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         let manifest = std::fs::read_to_string(root.join(EXPORT_RBAC_MANIFEST))
             .unwrap_or_else(|e| panic!("判词点名的清单读不到（{EXPORT_RBAC_MANIFEST}）：{e}"));
         let deployment = std::fs::read_to_string(root.join("deploy/k3s/deployment.yaml"))

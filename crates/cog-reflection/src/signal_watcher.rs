@@ -1396,6 +1396,7 @@ pub fn spawn_signal_watcher_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     #[test]
     fn error_signature_strips_digits_and_collapses_space() {
@@ -2284,9 +2285,7 @@ mod tests {
     }
 
     fn shipped_document(path: &str) -> serde_json::Value {
-        let full = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(path);
+        let full = repo_root().join(path);
         let text = std::fs::read_to_string(&full)
             .unwrap_or_else(|e| panic!("{} is unreadable: {e}", full.display()));
         serde_json::from_str(&text)

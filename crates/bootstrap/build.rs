@@ -8,9 +8,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
+
 fn main() {
-    let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let repo_root = manifest_dir.join("../..");
+    let repo_root = repo_root();
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
 
     // (相对仓库根的路径, 是否递归目录)

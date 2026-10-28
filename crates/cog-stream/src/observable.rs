@@ -114,6 +114,7 @@ impl Observable for StreamReadObservable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     /// The shape the staleness rule reads: one series per consumer, naming the
     /// stream and group it belongs to, and a bound expressed in seconds.
@@ -270,8 +271,7 @@ mod tests {
     /// shipped configuration, which is what the watcher actually evaluates.
     #[test]
     fn the_shipped_rule_reads_these_metrics() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let path = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
         let text = std::fs::read_to_string(&path).expect("read the chart's cogneva.json");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("chart JSON parses");
         let rules = parsed["observability"]["infra_watch"]["rules"]

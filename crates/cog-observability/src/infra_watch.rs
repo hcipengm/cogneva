@@ -1569,6 +1569,7 @@ fn side_of(expr: &str) -> Side {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use std::collections::BTreeSet;
 
     /// A close that did not go through must leave the key believed, because the
@@ -2078,7 +2079,7 @@ mod tests {
     /// reaching the reader as `{stram}`.
     #[test]
     fn shipped_rule_summaries_only_name_value_or_a_label_that_exists() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
 
         // Every label any metric declares. Scanned from source so a produced
         // label needs no second edit here.
@@ -2197,7 +2198,7 @@ mod tests {
     /// 随 chart 发出去的，改坏了在这里红，而不是等它装载、每拍求值、然后静默一整天。
     #[test]
     fn no_shipped_rule_compares_a_labelled_side_with_an_unlabelled_one() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         let path = root.join("deploy/helm/cogneva/files/cogneva.json");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));

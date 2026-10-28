@@ -2499,3 +2499,12 @@ mod tests {
         (engine, submissions, goals)
     }
 }
+
+/// 这棵树的根：一份算法，全仓共用。
+///
+/// `tests/` 之外，`src/` 里的单测也要问「这棵树在哪」。声明在这里而不是每个单测
+/// 模块各写一条 `#[path]`：`#[path]` 的基准目录会随所在内联模块的嵌套层数变化，
+/// 挪一次模块就得改一次路径；crate 根这一处的基准固定是 `src/`。
+#[cfg(test)]
+#[path = "../../cogneva/tests/common/root.rs"]
+pub(crate) mod checkout;

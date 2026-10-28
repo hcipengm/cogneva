@@ -490,6 +490,7 @@ pub fn run_from_args() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     fn write_file(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let path = dir.join(name);
@@ -844,8 +845,7 @@ mod tests {
     /// half is still held to the same statement.
     #[test]
     fn the_deployed_rule_reads_the_published_gauge_as_a_presence_statement() {
-        let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
         let text = fs::read_to_string(&chart)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
         let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");

@@ -844,6 +844,7 @@ impl cog_core::Observable for TraceTierMigrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use cog_core::{Observable, TraceStore};
     use std::sync::Mutex;
 
@@ -1164,8 +1165,7 @@ mod tests {
     /// rules are pinned against the metric names this module publishes.
     #[test]
     fn deployed_rules_query_the_metrics_this_module_publishes() {
-        let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
         let text = std::fs::read_to_string(&chart)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
         let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");

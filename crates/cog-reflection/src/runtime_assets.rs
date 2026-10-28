@@ -478,6 +478,7 @@ impl Observable for AssetIdentityObservable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     fn entry(from: &str, to: &str) -> AssetEntry {
         AssetEntry {
@@ -762,11 +763,9 @@ mod tests {
     /// names a state nothing produces never fires, and never says so.
     #[test]
     fn the_rules_select_on_states_this_module_produces() {
-        let config = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../deploy/helm/cogneva/files/cogneva.json"),
-        )
-        .expect("read the chart's cogneva.json");
+        let config =
+            std::fs::read_to_string(repo_root().join("deploy/helm/cogneva/files/cogneva.json"))
+                .expect("read the chart's cogneva.json");
         let parsed: serde_json::Value = serde_json::from_str(&config).expect("chart JSON parses");
         let rules = parsed["observability"]["infra_watch"]["rules"]
             .as_array()

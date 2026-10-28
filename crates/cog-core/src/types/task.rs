@@ -912,6 +912,7 @@ impl Task {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     /// 状态字符串必须双向可逆：写进 `status` 列的那套拼写，是所有按状态数行
     /// 的查询唯一的依据，往一个方向漂了就会去数另一套拼写写下的行——计数看着
@@ -1157,7 +1158,7 @@ mod tests {
     /// entry point added later is visible rather than absorbed.
     #[test]
     fn every_declared_task_kind_classifies_to_a_named_entry_point() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         let declared: &[(&str, &[&str], EvolutionIntent)] = &[
             (
                 "self_signal",

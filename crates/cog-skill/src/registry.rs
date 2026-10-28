@@ -602,6 +602,7 @@ impl SkillRegistryImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use cog_core::{
         DateTime, ExternalSkillRegistry, HistogramTotals, MetricName, MetricSample, MetricType,
         MetricsBackend, SFResult, Utc,
@@ -721,7 +722,7 @@ mod tests {
     /// 完整解析：SKILL.md 正文 + output_schema.json 资源。
     #[tokio::test]
     async fn builtin_pge_skills_resolve() {
-        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../prompts/skills");
+        let dir = repo_root().join("prompts/skills");
         if !dir.is_dir() {
             // 仓库布局变化时静默跳过，避免误报。
             return;

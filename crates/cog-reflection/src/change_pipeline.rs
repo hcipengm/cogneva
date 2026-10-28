@@ -3053,6 +3053,8 @@ fn names_same_or_nested(target: &str, anchor: &str) -> bool {
 mod tests {
     use super::*;
 
+    use crate::checkout::repo_root;
+
     /// [`one_change_wall_secs`] 加的是哪几段活、`FMT_SEGMENT_WALL_SECS` 那个数
     /// 乘的是哪几趟命令，都是数着源码里的调用点写下来的。加一条 gated 命令、
     /// 或让 `run_cargo_fmt` 多跑一趟，界就少算一段——而界少了的症状是停摆告警
@@ -5817,7 +5819,8 @@ index 1111111..2222222 100644\n\
     }
 
     /// The workflow whose gating jobs the verification stage answers for.
-    const CI_WORKFLOW: &str = "../../.github/workflows/ci.yml";
+    /// 仓库根下的这一条；根由 [`repo_root`] 算。
+    const CI_WORKFLOW: &str = ".github/workflows/ci.yml";
 
     /// The job the stage's built-in linter answers.
     ///
@@ -5882,7 +5885,7 @@ index 1111111..2222222 100644\n\
     /// accepts is the job's business, membership is the claim.
     #[test]
     fn the_stages_linter_is_the_ci_jobs_linter() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(CI_WORKFLOW);
+        let path = repo_root().join(CI_WORKFLOW);
         let workflow = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
         let block = ci_lint_job_block(&workflow);

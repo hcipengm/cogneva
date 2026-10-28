@@ -3725,9 +3725,10 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod namespace_tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     fn tree() -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+        repo_root()
     }
 
     /// 三条投递路径交付的是同一份声明：每套渲染清单里的 Namespace 对象必须就是
@@ -3843,6 +3844,7 @@ mod namespace_tests {
 #[cfg(test)]
 mod profile_tests {
     use super::Profile;
+    use crate::checkout::repo_root;
 
     /// 名字的判据不在这里手抄一份：从磁盘上把 renderer 真正产出的三处读出来，
     /// 与代码里那一份比较。改 profile 文件、改渲染目录、改 render-deploy.sh 的
@@ -3850,7 +3852,7 @@ mod profile_tests {
     /// 去找渲染产物，读到的空和「没渲染过」区分不开。
     #[test]
     fn the_declared_profile_names_are_the_ones_on_disk() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         let mut declared: Vec<&str> = cogneva_bootstrap::PROFILE_NAMES.to_vec();
         declared.sort_unstable();
 
@@ -3993,9 +3995,7 @@ mod profile_tests {
         // 每个 profile 的渲染产物必须成套（38/39/37 量级，这里只断言下限防漏嵌）。
         // 形态的集合从树里读：写死三个名字，新增的那一种漏嵌了也没人问——它不在
         // 名单里，而「不在名单里」与「嵌齐了」在这里读起来一样。
-        let rendered = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("deploy/rendered");
+        let rendered = repo_root().join("deploy/rendered");
         let mut profiles: Vec<String> = std::fs::read_dir(&rendered)
             .unwrap_or_else(|e| panic!("{}: {e}", rendered.display()))
             .map(|entry| entry.expect("readable entry").path())
@@ -4921,3 +4921,12 @@ mod registry_port_tests {
         assert!(parse_declared_port("", what).is_err());
     }
 }
+
+/// 这棵树的根：一份算法，全仓共用。
+///
+/// `tests/` 之外，`src/` 里的单测也要问「这棵树在哪」。声明在这里而不是每个单测
+/// 模块各写一条 `#[path]`：`#[path]` 的基准目录会随所在内联模块的嵌套层数变化，
+/// 挪一次模块就得改一次路径；crate 根这一处的基准固定是 `src/`。
+#[cfg(test)]
+#[path = "../../cogneva/tests/common/root.rs"]
+pub(crate) mod checkout;

@@ -438,6 +438,7 @@ pub async fn run_image_store_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use std::fs;
 
     const NODE: &str = "node-a";
@@ -553,8 +554,7 @@ mod tests {
     }
 
     fn chart_rule(name: &str) -> serde_json::Value {
-        let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
         let text = std::fs::read_to_string(&chart)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
         let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");

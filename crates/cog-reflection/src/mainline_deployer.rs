@@ -9927,6 +9927,7 @@ impl ConfigConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     // 滚动侧已搬去 `mainline_rollout`：本模块的用例仍直接调它们，所以只在测试面
     // 把它们带进来。产出面两个模块互不调用这一点不为此放宽——这里带进来的每一项，
@@ -10444,9 +10445,8 @@ exit 1
     /// 写明理由的「刷不了」表。
     #[test]
     fn every_asset_the_image_bakes_is_refreshed_by_the_overlay_or_declared_unreachable() {
-        let dockerfile =
-            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dockerfile"))
-                .expect("read workspace Dockerfile");
+        let dockerfile = std::fs::read_to_string(repo_root().join("Dockerfile"))
+            .expect("read workspace Dockerfile");
 
         let baked = image_baked_destinations(&dockerfile);
         // 解析器自身得先站得住：run 阶段既拷二进制（来自构建产物）又拷 skills
@@ -10497,9 +10497,8 @@ exit 1
             "the built-asset list is empty; if the overlay really refreshes nothing, delete \
              the list and this test instead of leaving a declaration with no subject"
         );
-        let dockerfile =
-            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Dockerfile"))
-                .expect("read workspace Dockerfile");
+        let dockerfile = std::fs::read_to_string(repo_root().join("Dockerfile"))
+            .expect("read workspace Dockerfile");
         let baked = image_baked_destinations(&dockerfile);
         for dest in OVERLAY_BUILT_ASSETS {
             assert!(
@@ -10516,8 +10515,7 @@ exit 1
     #[test]
     fn the_provisioning_script_pushes_the_image_the_deployer_asks_for() {
         let script = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../deploy/scripts/provision-web-builder-image.sh"),
+            repo_root().join("deploy/scripts/provision-web-builder-image.sh"),
         )
         .expect("read the web builder provisioning script");
         assert!(
@@ -10578,7 +10576,7 @@ exit 1
     /// 存在」——表是仓库的一部分，仓库里没有就永远拷不到。
     #[test]
     fn every_overlay_asset_source_exists_in_the_checkout() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         for entry in crate::runtime_assets::embedded_asset_list() {
             let src = root.join(&entry.from);
             assert!(
@@ -21519,7 +21517,7 @@ exit 0
     /// 资源静默过期。
     #[test]
     fn the_shipped_manifests_pass_the_dialect_gate() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         // `deploy/k3s` 是部署器默认读的发布集；预渲染目录也在内，因为发布集目录
         // 是配置面（`manifest_dir`），把它指到任一预渲染目录是受支持的用法，
         // 那些文件同样会被重排后再 apply。
@@ -22686,10 +22684,6 @@ exit 0
         .unwrap();
         assert_eq!(bundle.targets.len(), 1);
         assert_eq!(bundle.targets[0].deployment, "cogneva");
-    }
-
-    fn repo_root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
     /// The repository a delivered directory uses for this application, read off

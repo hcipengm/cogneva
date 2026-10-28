@@ -4004,6 +4004,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
 #[cfg(test)]
 mod config_consumer_tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     fn blob(json: &str) -> String {
         format!(
@@ -4292,7 +4293,7 @@ spec:
     /// indistinguishable from one that was not needed.
     #[test]
     fn the_shipped_manifests_name_their_config_consumers() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         let mut found = Vec::new();
         let mut files = 0;
         for entry in std::fs::read_dir(root.join("deploy/k3s")).expect("deploy/k3s readable") {

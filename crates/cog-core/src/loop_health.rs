@@ -727,6 +727,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use std::time::Duration;
 
     fn metric(metrics: &[RawMetric], name: &str, label: &str) -> Option<f64> {
@@ -1488,8 +1489,7 @@ mod tests {
     }
 
     fn chart_rules() -> Vec<(String, String)> {
-        let chart = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
         let text = std::fs::read_to_string(&chart)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
         let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");

@@ -389,6 +389,7 @@ pub fn spawn_watchers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use std::fs;
 
     fn scratch(name: &str) -> PathBuf {
@@ -656,8 +657,7 @@ mod tests {
     /// signal silently absent, so the two are pinned against each other here.
     #[test]
     fn deployed_rule_queries_the_metric_this_module_publishes() {
-        let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
         let text = fs::read_to_string(&chart)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
         let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
@@ -689,8 +689,7 @@ mod tests {
     /// join keys is what keeps the two readings collapsing into one.
     #[test]
     fn rollout_overlap_cannot_break_the_volume_rule() {
-        let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
         let text = fs::read_to_string(&chart).expect("chart config readable");
         let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
         let rule = root

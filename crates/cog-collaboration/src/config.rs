@@ -202,6 +202,7 @@ impl BoundaryConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     #[test]
     fn boundary_config_default_has_no_rules() {
@@ -504,7 +505,7 @@ mod tests {
 
     #[test]
     fn shipped_config_templates_track_every_section_surface() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         let mut seen = 0;
         for (file, doc) in shipped_configs(&root) {
             assert_sections_match(&file, &doc);
@@ -520,7 +521,7 @@ mod tests {
     /// with no reading saying which one a pod got.
     #[test]
     fn the_embedders_ship_one_and_the_same_config() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         let mut configs = shipped_configs(&root)
             .into_iter()
             .filter(|(file, _)| !file.ends_with("cogneva.example.json"));

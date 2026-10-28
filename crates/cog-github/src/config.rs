@@ -610,6 +610,7 @@ impl GiteeIntegrationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
 
     /// 发现循环属主开关：默认必须是开的。默认若跟成关，单部署安装升级后会静默
     /// 失去发现能力——这正是新增开关最容易造成的退化。置位的是部署（进化 Pod
@@ -763,7 +764,7 @@ mod tests {
 
     #[test]
     fn shipped_config_templates_track_the_field_surface() {
-        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = repo_root();
         assert_surface_matches(&root.join("cogneva.example.json"));
         assert_surface_matches(&root.join("deploy/helm/cogneva/files/cogneva.json"));
     }

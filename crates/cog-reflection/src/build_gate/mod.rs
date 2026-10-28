@@ -3450,6 +3450,7 @@ impl Observable for BuildGate {
 
 #[cfg(test)]
 mod tests {
+    use crate::checkout::repo_root;
 
     /// 这套部署出厂声明的那份读数。测试拿它当「这台机器」，要证明某个数
     /// 是被读出来的就换掉其中一项，而不是再写一份同样的数。
@@ -6393,8 +6394,7 @@ unevictable 28532736
     }
 
     fn chart_rules() -> Vec<(String, String)> {
-        let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
         let text = fs::read_to_string(&chart)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
         let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");

@@ -889,6 +889,7 @@ impl Drop for EnvGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use std::io::Write;
 
     #[test]
@@ -1110,9 +1111,7 @@ mod tests {
     /// is the same dead knob one step earlier.
     fn documents_with_an_env_map() -> Vec<(&'static str, serde_json::Value)> {
         let mut docs = shipped_documents();
-        let example_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("cogneva.example.json");
+        let example_path = repo_root().join("cogneva.example.json");
         let raw = std::fs::read_to_string(&example_path)
             .unwrap_or_else(|e| panic!("read {}: {e}", example_path.display()));
         let example = serde_json::from_str(&raw)
@@ -1717,10 +1716,7 @@ mod tests {
     }
 
     fn deploy_file(relative: &str) -> std::path::PathBuf {
-        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join("deploy")
-            .join(relative)
+        repo_root().join("deploy").join(relative)
     }
 
     /// Content of a literal YAML block scalar, keyed by its `data` entry name.

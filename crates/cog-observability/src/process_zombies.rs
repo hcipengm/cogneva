@@ -228,8 +228,8 @@ impl Observable for ProcessZombieObservable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use std::fs;
-    use std::path::Path;
 
     #[test]
     fn stat_fields_start_after_the_last_paren() {
@@ -268,8 +268,7 @@ mod tests {
     /// silently absent, so the two are pinned against each other here.
     #[test]
     fn deployed_rule_queries_the_metric_this_module_publishes() {
-        let chart = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../deploy/helm/cogneva/files/cogneva.json");
+        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
         let text = fs::read_to_string(&chart)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
         let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");

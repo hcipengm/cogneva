@@ -131,11 +131,12 @@ impl HumanEvalLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use std::path::PathBuf;
 
     /// The shard as it is vendored in this repository.
     fn vendored_shard() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../eval_datasets/humaneval.jsonl")
+        repo_root().join("eval_datasets/humaneval.jsonl")
     }
 
     /// The shipped file parses, completely, and every problem carries what the

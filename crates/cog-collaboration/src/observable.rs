@@ -1348,6 +1348,7 @@ impl Observable for CollaborationObservable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkout::repo_root;
     use cog_core::observability::Observable;
 
     fn metric(metrics: &[RawMetric], name: &str) -> Option<RawMetric> {
@@ -1949,11 +1950,9 @@ mod tests {
         const RULE: &str = ROUTING_DECLARATION_FACE_GONE_RULE;
         const METRIC: &str = "collab_declared_scale_total";
 
-        let config = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../deploy/helm/cogneva/files/cogneva.json"),
-        )
-        .expect("read the chart's cogneva.json");
+        let config =
+            std::fs::read_to_string(repo_root().join("deploy/helm/cogneva/files/cogneva.json"))
+                .expect("read the chart's cogneva.json");
         let parsed: serde_json::Value = serde_json::from_str(&config).expect("chart JSON parses");
         let rule = parsed["observability"]["infra_watch"]["rules"]
             .as_array()
