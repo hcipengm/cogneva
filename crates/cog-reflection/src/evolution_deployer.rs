@@ -399,10 +399,12 @@ impl EvolutionDeployer {
         // away — so a process the kernel will not reap costs a reading, not the
         // build.
         let peak_rss_bytes = match watcher {
-            Some(handle) => match tokio::time::timeout(Duration::from_secs(5), handle).await {
-                Ok(Ok(peak)) => peak.map(|p| p.bytes),
-                _ => None,
-            },
+            Some(handle) => {
+                match tokio::time::timeout(crate::build_rss_peak::DRAIN_WAIT, handle).await {
+                    Ok(Ok(peak)) => peak.map(|p| p.bytes),
+                    _ => None,
+                }
+            }
             None => None,
         };
         // Handed to the gate before the arms below, because a build the budget

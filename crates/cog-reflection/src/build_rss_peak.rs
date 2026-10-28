@@ -40,6 +40,16 @@ use std::time::Duration;
 /// rounding error against the compile it is watching.
 pub const SAMPLE_PERIOD: Duration = Duration::from_millis(500);
 
+/// How long a caller waits for the sampler to report after the process it was
+/// watching has ended.
+///
+/// The loop stops within one [`SAMPLE_PERIOD`] of the tree going away, so this
+/// is a wall no healthy host reaches: it exists for the process the kernel will
+/// not reap, where waiting for the reading would cost the build. Named rather
+/// than written at the call site because it is a wall with a reason, and a bare
+/// number in a `Duration` constructor is one nothing can be asked about.
+pub const DRAIN_WAIT: Duration = Duration::from_secs(5);
+
 /// A bound on the tree walk, so a `/proc` that is misbehaving (a name cycle, a
 /// pid reused mid-walk) costs a sample rather than the build.
 const MAX_TREE: usize = 4096;

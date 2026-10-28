@@ -391,10 +391,16 @@ crates/cog-reflection/src/build_gate/mod.rs	CEILING_DEAD_BAND	0.15	bound	a fall 
 crates/cog-reflection/src/build_gate/mod.rs	EVENT_RING_CAPACITY	256	bound	ring depth for a consumer ticking every few minutes; drops are counted, not lost
 crates/cog-reflection/src/build_gate/mod.rs	GATE_DIR_MODE	0o1777	bound	Modes that make the gate directory usable by every builder on the host.
 crates/cog-reflection/src/build_gate/mod.rs	GATE_FILE_MODE	0o666	bound	Mode a gate file is created with. World-writable on purpose: every user that builds on this host has to be able to record a verdict, and the mode is about who may write, not about who may read.
+crates/cog-reflection/src/build_gate/mod.rs	MEASURED_BUILD_COST_AGREEMENT	0.10	bound	measured builds must agree within 10% of their median before the divisor moves; a bound on how much scatter is noise
+crates/cog-reflection/src/build_gate/mod.rs	MEASURED_BUILD_COST_DEAD_BAND	0.20	bound	how far a measured divisor must sit from the declared one before it replaces it; the dead band the ceiling has, one level down -- below this the label would flip on noise
+crates/cog-reflection/src/build_gate/mod.rs	MEASURED_BUILD_COST_SAMPLES	3	bound	consecutive agreeing builds required before the divisor moves; one build cannot make "they agree" a claim about a sequence
 crates/cog-reflection/src/build_gate/mod.rs	POLL_INTERVAL	500ms	bound	how promptly a waiter rechecks a freed slot; builds last minutes, so this is only responsiveness
 crates/cog-reflection/src/build_gate/mod.rs	SWITCH_FIELD_WAIT	3600s	bound	等构建场空出来再做进程切换的上限：1 小时。
 crates/cog-reflection/src/build_gate/mod.rs	TURN_STAND_DOWN_SECS	3600	bound	longer than any asker's own round, so a grievance outlives the call that raised it
 crates/cog-reflection/src/build_gate/mod.rs	WALK_YIELD_LIMIT	2	bound	turns a walk stands down before taking the field; a policy for two failure directions
+crates/cog-reflection/src/build_rss_peak.rs	DRAIN_WAIT	5s	bound	how long a caller waits for the sampler after the process ends; the loop stops within one sample period, so only a process the kernel will not reap reaches it
+crates/cog-reflection/src/build_rss_peak.rs	MAX_TREE	4096	bound	walk budget so a /proc cycle or a reused pid costs one sample rather than the build
+crates/cog-reflection/src/build_rss_peak.rs	SAMPLE_PERIOD	500ms	bound	sampling cadence: fine enough to see a spike that lasts, coarse enough that the sampler is a rounding error against the compile
 crates/cog-reflection/src/change_execution.rs	EXIT_PASSED	0	bound	执行到位并给出了判定：变更通过，产物在结果文件里。
 crates/cog-reflection/src/change_execution.rs	EXIT_REFUSED	1	bound	执行到位并给出了判定：变更被拒，判词与原因在结果文件里。
 crates/cog-reflection/src/change_execution.rs	EXIT_UNAVAILABLE	75	bound	没能做出判定：工作树、git、cargo 或构建闸门没能让这次执行跑完。
