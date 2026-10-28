@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::lex::{strip, Dialect};
+use common::lex::{split_top_level, strip, Dialect};
 
 use common::routes::repo_root;
 
@@ -399,32 +399,17 @@ fn declared_variants(root: &Path, file: &str, name: &str) -> Vec<String> {
     // 「一句带 `{` 的注释」会把后面的散文读成变体。
     let body = strip(&text[open + 1..close], Dialect::Rust);
 
-    let bytes = body.as_bytes();
     let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut item_start = 0usize;
-    let split = |from: usize, to: usize, out: &mut Vec<String>| {
-        let piece = body[from..to].trim();
-        let name: String = piece
+    for part in split_top_level(&body, Dialect::Rust) {
+        let name: String = part
+            .trim()
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
         if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             out.push(name);
         }
-    };
-    for (i, c) in bytes.iter().enumerate() {
-        match c {
-            b'{' | b'(' => depth += 1,
-            b'}' | b')' => depth -= 1,
-            b',' if depth == 0 => {
-                split(item_start, i, &mut out);
-                item_start = i + 1;
-            }
-            _ => {}
-        }
     }
-    split(item_start, body.len(), &mut out);
     out
 }
 

@@ -48,6 +48,7 @@ mod common;
 
 use common::rust_text::trailing_identifier;
 
+use common::lex::{split_top_level, Dialect};
 use common::routes::{matching_brace, repo_root};
 use common::rust_production::{
     crate_tree_sources, production_text, relative_name, sources_of_crate_tree,
@@ -97,7 +98,7 @@ fn enum_variants(file: &str, source: &str) -> Result<BTreeSet<String>, String> {
     let close = matching_brace(source.as_bytes(), open)
         .ok_or_else(|| format!("  `{file}` 的 `enum {ENUM}` 括号不闭合：读不出来按红处理"))?;
     let mut variants = BTreeSet::new();
-    for part in split_items(&source[open + 1..close]) {
+    for part in split_top_level(&source[open + 1..close], Dialect::Rust) {
         let mut part = part.trim();
         while part.starts_with("#[") {
             let Some(end) = part.find(']') else { break };
@@ -139,38 +140,6 @@ fn as_str_body(file: &str, source: &str) -> Result<String, String> {
     let end = matching_brace(body.as_bytes(), brace)
         .ok_or_else(|| format!("  `{file}` 的 `{ENUM}::as_str` 括号不闭合：读不出来按红处理"))?;
     Ok(body[brace + 1..end].to_string())
-}
-
-/// 顶层逗号切分（字符串里的逗号不算）。
-fn split_items(body: &str) -> Vec<&str> {
-    let bytes = body.as_bytes();
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(&body[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    parts.push(&body[start..]);
-    parts
 }
 
 /// 从 `text` 的第一个 `"` 起读到收尾的那个，返回词。

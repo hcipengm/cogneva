@@ -49,7 +49,8 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::lex::{split_top_level, Dialect};
+use common::routes::{matching_paren, repo_root};
 
 /// The quoted words inside the first `[...]` that follows `start`.
 fn array_words(source: &str, start: &str) -> Vec<String> {
@@ -899,41 +900,13 @@ fn call_arguments<'a>(text: &'a str, callee: &str, out: &mut Vec<&'a str>) {
         if bytes.get(start) != Some(&b'(') {
             continue;
         }
-        let mut depth = 0i32;
-        let mut i = start;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'(' => depth += 1,
-                b')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            i += 1;
-        }
+        // 配平的括号是共享的那一份，不在这里重数。
+        let end = matching_paren(bytes, start).unwrap_or(bytes.len());
         if !text[..name_at].trim_end().ends_with("fn") {
-            out.push(&text[start + 1..i.min(bytes.len())]);
+            out.push(&text[start + 1..end]);
         }
-        cursor = (i + 1).min(bytes.len());
+        cursor = (end + 1).min(bytes.len());
     }
-}
-
-/// 实参表里的最后一格（顶层的逗号才分隔实参）。
-fn last_argument(args: &str) -> &str {
-    let mut depth = 0i32;
-    let mut last = 0usize;
-    for (i, ch) in args.char_indices() {
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            ',' if depth == 0 => last = i + 1,
-            _ => {}
-        }
-    }
-    args[last..].trim()
 }
 
 /// 一段代码里出现的带引号字面量。
@@ -987,7 +960,9 @@ fn the_chat_roles_the_client_names_are_the_roles_the_writers_write() {
     );
     let mut frames: Vec<String> = Vec::new();
     for call in calls {
-        let role = last_argument(call);
+        // 顶层逗号只有一处切法（`lex`），方言是 Rust——这些调用写在 `chat.rs` 里。
+        let parts = split_top_level(call, Dialect::Rust);
+        let role = parts.last().map_or("", |part| part.trim());
         let word = role
             .strip_prefix('"')
             .and_then(|r| r.strip_suffix('"'))

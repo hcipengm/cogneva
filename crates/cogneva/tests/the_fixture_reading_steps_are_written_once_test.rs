@@ -97,7 +97,7 @@ const JS_HOME: &str = "crates/cogneva/tests/common/js_literal.rs";
 /// 那一份收 `bytes: &[u8]`；相对名那一份在一处抄件里连名字都改成了 `relative`。签名
 /// 按抄件当时的形状写下去，下一个抄的人换一种参数类型就漏了。这一串名字是 `common`
 /// 导出的，别处再出现一次定义按构造就是第二份实现。
-const COPIED_FORMS: [&str; 14] = [
+const COPIED_FORMS: [&str; 17] = [
     "fn read(path: &Path) -> String",
     "fn read(rel: &str) -> String",
     "fn read(relative: &str) -> String",
@@ -112,6 +112,9 @@ const COPIED_FORMS: [&str; 14] = [
     "fn top_level_keys(",
     "fn quoted_word(",
     "fn object_keys(",
+    "fn last_argument(",
+    "fn split_items(",
+    "fn first_arguments(",
 ];
 
 /// 取相对名还有**内联**的形状：不写成函数，直接把那一串方法调用摊在调用点上。

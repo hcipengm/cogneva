@@ -35,6 +35,7 @@ use std::collections::BTreeSet;
 
 mod common;
 
+use common::lex::{split_top_level, Dialect};
 use common::routes::repo_root;
 
 use common::rust_production::{production_line_mask, production_sources, relative_name};
@@ -274,31 +275,20 @@ fn word_at(chars: &[char], i: usize, needle: &[char]) -> bool {
 }
 
 /// The first `n` comma-separated arguments of an already unparenthesised body.
-fn first_arguments(body: &[char], n: usize) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut depth = 0i32;
-    let mut cur = String::new();
-    for &c in body {
-        match c {
-            '(' | '[' | '{' => {
-                depth += 1;
-                cur.push(c);
-            }
-            ')' | ']' | '}' => {
-                depth -= 1;
-                cur.push(c);
-            }
-            ',' if depth == 0 => {
-                args.push(std::mem::take(&mut cur));
-                if args.len() == n {
-                    return args;
-                }
-            }
-            _ => cur.push(c),
-        }
-    }
-    if !cur.trim().is_empty() {
-        args.push(cur);
+///
+/// 切法不在这里：顶层逗号只有 `lex` 一处切法，方言由调用方说。这个函数只为把
+/// 一个 `&[char]` 的读者接到那份 `&str` 的切法上。
+fn leading_arguments(body: &[char], n: usize) -> Vec<String> {
+    // 顶层逗号只有一处切法（`lex`），方言是 Rust：读到的都是 Rust 调用。
+    let text: String = body.iter().collect();
+    let mut args: Vec<String> = split_top_level(&text, Dialect::Rust)
+        .into_iter()
+        .take(n)
+        .map(str::to_string)
+        .collect();
+    // 以逗号收尾的实参表会多切出一格空白，那不是一格实参。
+    if args.last().is_some_and(|arg| arg.trim().is_empty()) {
+        args.pop();
     }
     args
 }
@@ -362,7 +352,7 @@ fn call_sites(code: &str, name: &str, arity: usize) -> Vec<(usize, Vec<String>)>
         }
         let open = pos + name.chars().count() - 1;
         let line = chars[..pos].iter().filter(|c| **c == '\n').count() + 1;
-        out.push((line, first_arguments(call_body(&chars, open), arity)));
+        out.push((line, leading_arguments(call_body(&chars, open), arity)));
     }
     out
 }
