@@ -23,14 +23,14 @@
 //! `/api/v1/trace`，本门红并点名；改回即绿。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod common;
-use common::routes::{normalize, read, repo_root, served_paths, walk};
+use common::routes::{normalize, read, repo_root, served_paths};
 use common::rust_production::production_text;
+use common::rust_production::{crate_files_of, production_sources, relative_name};
 
 const API_ROOT: &str = "/api/v1/";
-const CRATES: &str = "crates";
 const SERVER: &str = "crates/cog-gateway/";
 const DECLARATIONS: &str = "crates/cog-core/";
 
@@ -50,24 +50,16 @@ fn asked_paths(text: &str) -> BTreeSet<String> {
     paths
 }
 
-fn callers(root: &Path) -> (BTreeMap<String, BTreeSet<String>>, usize) {
-    let mut files = Vec::new();
-    walk(&root.join(CRATES), &["rs"], &mut files);
-    files.sort();
+fn callers(root: &Path, files: &[PathBuf]) -> (BTreeMap<String, BTreeSet<String>>, usize) {
     let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut scanned = 0;
     for path in files {
-        let label = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if !label.contains("/src/") || label.starts_with(SERVER) || label.starts_with(DECLARATIONS)
-        {
+        let label = relative_name(root, path);
+        if label.starts_with(SERVER) || label.starts_with(DECLARATIONS) {
             continue;
         }
         scanned += 1;
-        let paths = asked_paths(&production_text(&read(&path)));
+        let paths = asked_paths(&production_text(&read(path)));
         if !paths.is_empty() {
             found.insert(label, paths);
         }
@@ -75,9 +67,9 @@ fn callers(root: &Path) -> (BTreeMap<String, BTreeSet<String>>, usize) {
     (found, scanned)
 }
 
-fn contradictions(root: &Path) -> (Vec<String>, usize) {
+fn contradictions(root: &Path, files: &[PathBuf]) -> (Vec<String>, usize) {
     let served = served_paths(root);
-    let (found, _) = callers(root);
+    let (found, _) = callers(root, files);
     let mut complaints = Vec::new();
     let mut judged = 0;
     for (file, paths) in &found {
@@ -96,7 +88,8 @@ fn contradictions(root: &Path) -> (Vec<String>, usize) {
 
 #[test]
 fn every_path_an_internal_caller_asks_for_is_a_route_the_gateway_serves() {
-    let (complaints, judged) = contradictions(&repo_root());
+    let root = repo_root();
+    let (complaints, judged) = contradictions(&root, &production_sources(&root));
     assert!(judged > 0, "一条内部调用都没判到，这条判据没有题目");
     assert!(
         complaints.is_empty(),
@@ -109,7 +102,7 @@ fn every_path_an_internal_caller_asks_for_is_a_route_the_gateway_serves() {
 #[test]
 fn the_census_is_wide_enough_to_mean_something() {
     let root = repo_root();
-    let (found, scanned) = callers(&root);
+    let (found, scanned) = callers(&root, &production_sources(&root));
     assert!(scanned >= 20, "只扫到 {scanned} 个源文件，读取器看错地方了");
     // 今天只有一处：评估面。记忆面的调用走 `cog_core` 里的路径常量，字面量不在
     // 调用方这一侧——那不是漏读，是那份词表本来就只有一处。
@@ -181,7 +174,7 @@ fn a_caller_path_the_gateway_does_not_serve_is_reported() {
     )
     .expect("caller");
 
-    let (complaints, judged) = contradictions(&root);
+    let (complaints, judged) = contradictions(&root, &crate_files_of(&root));
     assert_eq!(judged, 2, "{complaints:?}");
     assert_eq!(complaints.len(), 1, "{complaints:?}");
     assert!(complaints[0].contains("/api/v1/trace"), "{complaints:?}");
@@ -191,7 +184,7 @@ fn a_caller_path_the_gateway_does_not_serve_is_reported() {
         "fn f() { let _ = \"/api/v1/tasks\"; }\n",
     )
     .expect("caller");
-    let (complaints, _) = contradictions(&root);
+    let (complaints, _) = contradictions(&root, &crate_files_of(&root));
     assert!(complaints.is_empty(), "{complaints:?}");
 
     let _ = std::fs::remove_dir_all(&root);

@@ -52,10 +52,12 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_text;
+use common::routes::repo_root;
+use common::rust_production::{
+    production_sources, production_text, relative_name, sources_of_tree,
+};
 
 /// 同一个 crate 里同值异名、但不是同一件东西的那些组。
 ///
@@ -280,36 +282,26 @@ fn declaration_on(line: &str) -> Option<(String, String)> {
 }
 
 /// 一棵树里所有生产代码的声明。
-fn declarations(root: &Path) -> Vec<Declaration> {
-    let crates_dir = root.join("crates");
-    let Ok(entries) = std::fs::read_dir(&crates_dir) else {
-        return Vec::new();
-    };
+fn declarations(root: &Path, files: &[PathBuf]) -> Vec<Declaration> {
     let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let krate = entry.file_name().to_string_lossy().into_owned();
-        let src = entry.path().join("src");
-        if !src.is_dir() {
+    for path in files {
+        let rel = relative_name(root, path);
+        let Some(krate) = rel.split('/').nth(1) else {
             continue;
-        }
-        let mut files = Vec::new();
-        walk(&src, &["rs"], &mut files);
-        files.sort();
-        for path in files {
-            let text = common::routes::read(&path);
-            for line in production_text(&text).lines() {
-                let Some((name, value)) = declaration_on(line) else {
-                    continue;
-                };
-                if !is_word(&value) {
-                    continue;
-                }
-                out.push(Declaration {
-                    krate: krate.clone(),
-                    name,
-                    value,
-                });
+        };
+        let text = common::routes::read(path);
+        for line in production_text(&text).lines() {
+            let Some((name, value)) = declaration_on(line) else {
+                continue;
+            };
+            if !is_word(&value) {
+                continue;
             }
+            out.push(Declaration {
+                krate: krate.to_string(),
+                name,
+                value,
+            });
         }
     }
     out
@@ -319,8 +311,8 @@ fn declarations(root: &Path) -> Vec<Declaration> {
 type Duplicate = (String, String, BTreeSet<String>);
 
 /// 同一 crate 里同一个值被写成了不止一个名字的那些组，以及读过几处声明、几个 crate。
-fn duplicates(root: &Path) -> (Vec<Duplicate>, usize, usize) {
-    let declared = declarations(root);
+fn duplicates(root: &Path, files: &[PathBuf]) -> (Vec<Duplicate>, usize, usize) {
+    let declared = declarations(root, files);
     let krates: BTreeSet<&str> = declared.iter().map(|d| d.krate.as_str()).collect();
     let mut by_group: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     for declaration in &declared {
@@ -346,7 +338,7 @@ fn registered(krate: &str, value: &str) -> bool {
 #[test]
 fn one_value_has_one_name_inside_its_crate() {
     let root = repo_root();
-    let (dups, declared, krates) = duplicates(&root);
+    let (dups, declared, krates) = duplicates(&root, &production_sources(&root));
     assert!(
         declared >= MIN_DECLARATIONS,
         "只读到 {declared} 处短值声明（下限 {MIN_DECLARATIONS}）：读得太少，\
@@ -379,7 +371,7 @@ fn one_value_has_one_name_inside_its_crate() {
 #[test]
 fn a_registration_that_no_longer_matches_a_duplicate_is_stale() {
     let root = repo_root();
-    let (dups, _, _) = duplicates(&root);
+    let (dups, _, _) = duplicates(&root, &production_sources(&root));
     let stale: Vec<&str> = SAME_VALUE_DIFFERENT_THING
         .iter()
         .filter(|(krate, value, _)| {
@@ -409,7 +401,7 @@ fn a_duplicate_inside_one_crate_is_reported() {
          pub(crate) const SECRET_SSH_PRIVATE_KEY: &str = \"git-ssh-private-key\";\n",
     )
     .expect("write");
-    let (dups, declared, krates) = duplicates(tmp.path());
+    let (dups, declared, krates) = duplicates(tmp.path(), &sources_of_tree(tmp.path()));
     assert_eq!(declared, 2);
     assert_eq!(krates, 1);
     assert_eq!(dups.len(), 1, "{dups:?}");
@@ -433,7 +425,7 @@ fn the_same_word_in_two_crates_is_not_reported_here() {
         )
         .expect("write");
     }
-    let (dups, declared, _) = duplicates(tmp.path());
+    let (dups, declared, _) = duplicates(tmp.path(), &sources_of_tree(tmp.path()));
     assert_eq!(declared, 2);
     assert!(dups.is_empty(), "{dups:?}");
 }
@@ -451,7 +443,7 @@ fn a_commented_out_declaration_is_not_a_declaration() {
          pub const INBOX_ORPHAN_STATE_CONSUMED: &str = \"consumed\";\n",
     )
     .expect("write");
-    let (dups, declared, _) = duplicates(tmp.path());
+    let (dups, declared, _) = duplicates(tmp.path(), &sources_of_tree(tmp.path()));
     assert_eq!(declared, 1);
     assert!(dups.is_empty(), "{dups:?}");
 }
@@ -471,7 +463,7 @@ fn a_duplicate_inside_a_test_module_is_not_production() {
          }\n",
     )
     .expect("write");
-    let (dups, declared, _) = duplicates(tmp.path());
+    let (dups, declared, _) = duplicates(tmp.path(), &sources_of_tree(tmp.path()));
     assert_eq!(declared, 1);
     assert!(dups.is_empty(), "{dups:?}");
 }

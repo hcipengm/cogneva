@@ -25,10 +25,11 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use common::routes::{repo_root, walk};
+use common::routes::repo_root;
 use common::rust_production::production_lines;
+use common::rust_production::{production_sources, relative_name};
 
 /// 这张表被认出来的标志：从 `CompleteOptions` 搬字段的那几份才有这一行。
 ///
@@ -95,16 +96,13 @@ fn production_text(path: &Path) -> String {
 }
 
 fn census(root: &Path) -> (usize, Vec<(String, String)>) {
-    let mut files = Vec::new();
-    walk(&root.join("crates/cog-llm/src"), &["rs"], &mut files);
-    files.sort();
+    let files: Vec<PathBuf> = production_sources(root)
+        .into_iter()
+        .filter(|path| relative_name(root, path).starts_with("crates/cog-llm/src/"))
+        .collect();
     let mut found = Vec::new();
     for path in &files {
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let file = relative_name(root, path);
         for block in tables_in(&production_text(path)) {
             found.push((file.clone(), block));
         }

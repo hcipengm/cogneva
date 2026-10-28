@@ -31,7 +31,7 @@
 //! .enabled` 的 serde 名改成 `enable`（报 `enabled ← crates/cog-gateway/src/takeover.html`）。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod common;
 use common::js_literal::{is_identifier, quoted_word, split_top_level, top_level_keys};
@@ -39,10 +39,11 @@ use common::routes::{
     matching_brace, matching_paren, normalize, read, repo_root, route_entries, served_handlers,
     strip_comments, walk, VERBS,
 };
-use common::rust_production::production_text;
+use common::rust_production::{
+    production_sources, production_text, relative_name, sources_of_tree,
+};
 
 const WEB: &str = "web/src";
-const CRATES: &str = "crates";
 const GATEWAY: &str = "crates/cog-gateway/";
 /// The verbs that carry a request body. A GET with a body is not a thing the
 /// client does here, and judging one would only report axum's own quirks.
@@ -305,17 +306,10 @@ fn serde_key_in(attribute: &str, key: &str) -> bool {
 ///
 /// Read from production text only: a fixture struct with the same name would
 /// answer for the real one, and the gate would then be judging the specimen.
-fn request_structs(root: &Path) -> BTreeMap<String, Fields> {
-    let mut files = Vec::new();
-    walk(&root.join(CRATES), &["rs"], &mut files);
-    files.sort();
+fn request_structs(files: &[PathBuf]) -> BTreeMap<String, Fields> {
     let mut structs: BTreeMap<String, Fields> = BTreeMap::new();
     for path in files {
-        let label = path.to_string_lossy().replace('\\', "/");
-        if !label.contains("/src/") {
-            continue;
-        }
-        let text = production_text(&read(&path));
+        let text = production_text(&read(path));
         let mut cursor = 0;
         while let Some(at) = text[cursor..].find("struct ") {
             let start = cursor + at;
@@ -451,13 +445,14 @@ fn request_structs(root: &Path) -> BTreeMap<String, Fields> {
 }
 
 /// The `Json<T>` type each gateway handler deserializes.
-fn handler_types(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
-    let mut files = Vec::new();
-    walk(&root.join(GATEWAY).join("src"), &["rs"], &mut files);
-    files.sort();
+fn handler_types(root: &Path, files: &[PathBuf]) -> BTreeMap<String, BTreeSet<String>> {
+    let prefix = format!("{GATEWAY}src/");
     let mut handlers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for path in files {
-        let text = production_text(&read(&path));
+    for path in files
+        .iter()
+        .filter(|p| relative_name(root, p).starts_with(&prefix))
+    {
+        let text = production_text(&read(path));
         let mut cursor = 0;
         while let Some(at) = text[cursor..].find("fn ") {
             let start = cursor + at;
@@ -513,9 +508,9 @@ struct Census {
     calls_with_unknown_struct: usize,
 }
 
-fn contradictions(root: &Path) -> (Vec<String>, Census) {
-    let structs = request_structs(root);
-    let handlers = handler_types(root);
+fn contradictions(root: &Path, files: &[PathBuf]) -> (Vec<String>, Census) {
+    let structs = request_structs(files);
+    let handlers = handler_types(root, files);
     let served = served_handlers(root);
     let mut census = Census::default();
     let mut complaints = Vec::new();
@@ -590,7 +585,8 @@ fn contradictions(root: &Path) -> (Vec<String>, Census) {
 
 #[test]
 fn every_key_a_client_sends_is_one_the_handler_parses() {
-    let (complaints, census) = contradictions(&repo_root());
+    let root = repo_root();
+    let (complaints, census) = contradictions(&root, &production_sources(&root));
     assert!(
         complaints.is_empty(),
         "客户端发了处理函数不认的键。serde 不会为它报错，只会把它丢掉：\
@@ -603,7 +599,8 @@ fn every_key_a_client_sends_is_one_the_handler_parses() {
 
 #[test]
 fn the_census_is_wide_enough_to_mean_something() {
-    let (_, census) = contradictions(&repo_root());
+    let root = repo_root();
+    let (_, census) = contradictions(&root, &production_sources(&root));
     assert!(
         census.bodies_read >= 30,
         "只判到 {} 个请求体，读取器看错地方了：{census:?}",
@@ -684,7 +681,7 @@ mod tests {
 ",
     )
     .expect("structs");
-    let structs = request_structs(root);
+    let structs = request_structs(&sources_of_tree(root));
     assert_eq!(
         structs.get("Renamed").map(|f| f.names.clone()),
         Some(BTreeSet::from([
@@ -787,7 +784,7 @@ pub async fn rename(Json(body): Json<RenameBody>) -> String { body.from }
     )
     .expect("client");
 
-    let (complaints, census) = contradictions(root);
+    let (complaints, census) = contradictions(root, &sources_of_tree(root));
     assert_eq!(census.bodies_read, 1, "{census:?}");
     assert_eq!(census.keys_judged, 2, "{census:?}");
     assert!(complaints.is_empty(), "{complaints:?}");
@@ -805,7 +802,7 @@ pub async fn rename(Json(body): Json<RenameBody>) -> String { body.source }
 ",
     )
     .expect("handler");
-    let (complaints, census) = contradictions(root);
+    let (complaints, census) = contradictions(root, &sources_of_tree(root));
     assert_eq!(census.bodies_read, 1, "{census:?}");
     assert_eq!(complaints.len(), 1, "{complaints:?}");
     assert!(complaints[0].contains("`from`"), "{complaints:?}");

@@ -25,10 +25,11 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use common::routes::{repo_root, walk};
+use common::routes::repo_root;
 use common::rust_production::production_lines;
+use common::rust_production::{production_sources, relative_name};
 
 /// 被判据认作「超时」的那一段。裸串：生产者写的是 `"{cmdline} timed out after
 /// {secs}s"`，这段嵌在里面，带引号数就数不到它——那正是要拦的形状。
@@ -43,18 +44,15 @@ const MIN_FILES: usize = 40;
 
 /// 生产行里这句话作为字面量出现的全部落点。
 fn sites(root: &Path) -> (usize, Vec<(String, String)>) {
-    let mut files = Vec::new();
-    walk(&root.join("crates/cog-reflection/src"), &["rs"], &mut files);
-    files.sort();
+    let files: Vec<PathBuf> = production_sources(root)
+        .into_iter()
+        .filter(|path| relative_name(root, path).starts_with("crates/cog-reflection/src/"))
+        .collect();
     let mut found = Vec::new();
     for path in &files {
         let text =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let file = relative_name(root, path);
         for line in production_lines(&text) {
             if line.contains(SENTENCE) {
                 found.push((file.clone(), line.trim().to_string()));

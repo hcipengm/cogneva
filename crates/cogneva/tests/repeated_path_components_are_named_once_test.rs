@@ -33,10 +33,11 @@
 mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use common::routes::{repo_root, walk};
+use common::routes::repo_root;
 use common::rust_production::production_text;
+use common::rust_production::{production_sources, relative_name, sources_of_tree};
 
 /// 同一个 crate 里同形的路径组件、却不是同一段路径的那些组。
 ///
@@ -115,47 +116,41 @@ fn path_components(text: &str) -> Vec<String> {
 type Repeat = (String, usize, BTreeSet<String>);
 
 /// 每个 crate 里重复的路径组件，以及读过几个组件、几个 crate。
-fn repeats(root: &Path) -> (Vec<(String, Repeat)>, usize, usize) {
-    let crates_dir = root.join("crates");
-    let Ok(entries) = std::fs::read_dir(&crates_dir) else {
-        return (Vec::new(), 0, 0);
-    };
+fn repeats(root: &Path, files: &[PathBuf]) -> (Vec<(String, Repeat)>, usize, usize) {
     let mut out = Vec::new();
     let mut total = 0usize;
-    let mut crates = 0usize;
-    for entry in entries.flatten() {
-        let krate = entry.file_name().to_string_lossy().into_owned();
-        let src = entry.path().join("src");
-        if !src.is_dir() {
+    let mut crates: BTreeSet<String> = BTreeSet::new();
+    let mut seen_by_crate: BTreeMap<String, BTreeMap<String, (usize, BTreeSet<String>)>> =
+        BTreeMap::new();
+    for path in files {
+        let rel = relative_name(root, path);
+        let Some(krate) = rel.split('/').nth(1) else {
             continue;
+        };
+        crates.insert(krate.to_string());
+        let text = common::routes::read(path);
+        let production = production_text(&text);
+        let prefix = format!("crates/{krate}/src/");
+        let name = rel.strip_prefix(&prefix).unwrap_or(&rel).to_string();
+        for component in path_components(&production) {
+            total += 1;
+            let slot = seen_by_crate
+                .entry(krate.to_string())
+                .or_default()
+                .entry(component)
+                .or_default();
+            slot.0 += 1;
+            slot.1.insert(name.clone());
         }
-        crates += 1;
-        let mut files = Vec::new();
-        walk(&src, &["rs"], &mut files);
-        files.sort();
-        let mut seen: BTreeMap<String, (usize, BTreeSet<String>)> = BTreeMap::new();
-        for path in files {
-            let text = common::routes::read(&path);
-            let production = production_text(&text);
-            for component in path_components(&production) {
-                total += 1;
-                let slot = seen.entry(component).or_default();
-                slot.0 += 1;
-                let name = path
-                    .strip_prefix(&src)
-                    .unwrap_or(&path)
-                    .to_string_lossy()
-                    .into_owned();
-                slot.1.insert(name);
-            }
-        }
+    }
+    for (krate, seen) in seen_by_crate {
         for (value, (count, files)) in seen {
             if count > 1 {
                 out.push((krate.clone(), (value, count, files)));
             }
         }
     }
-    (out, total, crates)
+    (out, total, crates.len())
 }
 
 fn registered(krate: &str, value: &str) -> bool {
@@ -167,7 +162,7 @@ fn registered(krate: &str, value: &str) -> bool {
 #[test]
 fn repeated_path_components_are_named_once() {
     let root = repo_root();
-    let (repeats_found, total, crates) = repeats(&root);
+    let (repeats_found, total, crates) = repeats(&root, &production_sources(&root));
     assert!(
         total >= MIN_COMPONENTS,
         "只读到 {total} 个路径组件（下限 {MIN_COMPONENTS}）：读得太少，「没有重复」就是个空承诺"
@@ -199,7 +194,7 @@ fn repeated_path_components_are_named_once() {
 #[test]
 fn a_registration_that_no_longer_matches_a_repeat_is_stale() {
     let root = repo_root();
-    let (repeats_found, _, _) = repeats(&root);
+    let (repeats_found, _, _) = repeats(&root, &production_sources(&root));
     let stale: Vec<&str> = SAME_PATH_DIFFERENT_THING
         .iter()
         .filter(|(krate, value, _)| {
@@ -229,7 +224,7 @@ fn a_component_written_twice_is_reported() {
          fn b(d: &Path) { d.join(\"journal.json\"); }\n",
     )
     .expect("write");
-    let (found, total, _) = repeats(tmp.path());
+    let (found, total, _) = repeats(tmp.path(), &sources_of_tree(tmp.path()));
     assert_eq!(total, 2);
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].1 .0, "journal.json");
@@ -249,7 +244,7 @@ fn a_whole_path_written_twice_is_reported() {
          fn b() -> bool { PathBuf::from(\"/dev/kvm\").exists() }\n",
     )
     .expect("write");
-    let (found, total, _) = repeats(tmp.path());
+    let (found, total, _) = repeats(tmp.path(), &sources_of_tree(tmp.path()));
     assert_eq!(total, 2);
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].1 .0, "/dev/kvm");
@@ -268,7 +263,7 @@ fn a_string_join_is_not_a_path_component() {
          fn b(v: &[String]) -> String { v.join(\", \") }\n",
     )
     .expect("write");
-    let (found, total, _) = repeats(tmp.path());
+    let (found, total, _) = repeats(tmp.path(), &sources_of_tree(tmp.path()));
     assert_eq!(total, 0);
     assert!(found.is_empty(), "{found:?}");
 }
@@ -289,7 +284,7 @@ fn a_repeat_inside_a_test_module_is_not_production() {
          }\n",
     )
     .expect("write");
-    let (found, total, _) = repeats(tmp.path());
+    let (found, total, _) = repeats(tmp.path(), &sources_of_tree(tmp.path()));
     assert_eq!(total, 1);
     assert!(found.is_empty(), "{found:?}");
 }
@@ -307,7 +302,7 @@ fn the_same_component_in_two_crates_is_not_reported_here() {
         )
         .expect("write");
     }
-    let (found, total, _) = repeats(tmp.path());
+    let (found, total, _) = repeats(tmp.path(), &sources_of_tree(tmp.path()));
     assert_eq!(total, 2);
     assert!(found.is_empty(), "{found:?}");
 }
