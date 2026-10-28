@@ -26,6 +26,20 @@
 //! twelve seconds), and an unbounded walk that had to finish before `bind`
 //! could not be told apart from a process that never started: the only answer
 //! the platform has for that is a restart, which begins the same walk again.
+//!
+//! Readiness stops short of the image stores' walks for the same reason, and
+//! it is the image stores that make it matter: the node's podman store holds
+//! 2.57 million entries and took ten of the twelve minutes one rollout spent
+//! waiting on this pod. What readiness waits for there is the *listing* -- one
+//! `read_dir` per store, which is what separates a store with no parts from
+//! one not yet listed -- and the sizes follow it from the cadence loop. Until
+//! the first walk completes, a store publishes only the age of that walk,
+//! which counts from process start: sizes and the coverage pair (parts and
+//! readable) arrive together with the walk that measured them, because a
+//! coverage pair written before one would accuse every part of being
+//! unreadable. A deployment that waits for readiness is waiting for this
+//! process to have looked, not for the disk to have been walked, and until
+//! this split it waited for the disk.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -224,7 +238,11 @@ async fn live() -> Response {
     text(StatusCode::OK, "ok")
 }
 
-/// Ready only once a walk has been attempted -- succeeded or not.
+/// Ready once every store has been listed and this node's claims walked --
+/// attempted, not necessarily successfully. The image stores' byte walks are
+/// not part of it: their parts are named by the listing, and a probe that
+/// waited for the sizes would keep this pod out of its own target list for the
+/// minutes the walk costs on every start.
 async fn ready(State(state): State<StoreState>) -> Response {
     if state.first_sweep.load(Ordering::Relaxed) {
         text(StatusCode::OK, "ok")
@@ -241,6 +259,13 @@ async fn metrics(State(state): State<StoreState>) -> Response {
     // from "this node has not looked yet". Answering nothing at all is the one
     // answer that does not lie, and the scrape target does not exist until
     // readiness turns, so this only reaches a reader who came looking directly.
+    //
+    // Past that point the image stores may still be on their first walk, and
+    // what they publish in that state is the walk's age per store and nothing
+    // else: the sizes and the coverage pair arrive together with the first
+    // completed walk, because a coverage pair written before one would say
+    // every part was unreadable. The age is the reading that says the store
+    // exists and its first walk has not finished.
     if !state.first_sweep.load(Ordering::Relaxed) {
         return text(StatusCode::SERVICE_UNAVAILABLE, SWEEP_PENDING);
     }
@@ -343,20 +368,23 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
             ),
         }
 
-        // The image store is walked once for the same reason: a first scrape
-        // with no part in it is indistinguishable from a node whose store is
-        // empty, and the walk that would tell them apart is minutes away.
+        // Each image store is *listed* once, not walked: a first scrape with no
+        // part in it is indistinguishable from a node whose store is empty, and
+        // the read that tells them apart is one `read_dir` of the root. The
+        // walk that measures those parts is minutes on a node with a real image
+        // history -- 2.57 million entries and ten of those minutes on the
+        // podman store alone -- and it is not what a probe should wait for: the
+        // parts' names are the whole reading until the sizes arrive, and the
+        // cadence loop started below fills them in on its first tick.
         for store in &sweeping_images {
-            match store.scan_blocking().await {
-                image_store::Scan::Completed(report) => tracing::info!(
+            match store.enumerate_blocking().await {
+                image_store::Listing::Listed(parts) => tracing::info!(
                     store = store.name(),
                     root = %store.root().display(),
-                    parts = report.parts,
-                    readable = report.readable,
-                    files = report.files,
-                    "image store walked"
+                    parts,
+                    "image store listed; the walk runs behind readiness"
                 ),
-                image_store::Scan::RootUnreadable => tracing::error!(
+                image_store::Listing::RootUnreadable => tracing::error!(
                     env = image_store::ROOTS_ENV,
                     store = store.name(),
                     root = %store.root().display(),
@@ -364,7 +392,7 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
                 ),
             }
         }
-        // Every store has been walked, readable or not. That is what readiness
+        // Every store has been listed, readable or not. That is what readiness
         // was waiting for: the readings that follow are measurements, and a
         // node whose root could not be read says so through its coverage
         // series rather than by withholding the target.
@@ -390,11 +418,9 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
-    use axum::http::Request;
+    use crate::test_support::scrape;
     use std::fs;
     use std::path::Path;
-    use tower::ServiceExt;
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -428,16 +454,6 @@ mod tests {
         images: Vec<Arc<ImageStoreObservable>>,
     ) -> Router {
         router(observable, images, Arc::new(AtomicBool::new(true)))
-    }
-
-    async fn scrape(app: Router, path: &str) -> (StatusCode, String) {
-        let response = app
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
     /// A blank root must not resolve to the working directory: the process would
@@ -601,6 +617,63 @@ mod tests {
             "io.containerd.content.v1.content",
         ] {
             assert!(body.contains(expected), "{expected} missing from:\n{body}");
+        }
+    }
+
+    /// Readiness is about the listing, not the measurement: a store that has
+    /// been listed and not yet walked is on a scrape that answers OK.
+    ///
+    /// The walk behind it is what a deployment was actually waiting for --
+    /// 2.57 million entries and ten minutes on this node's podman store, which
+    /// one rollout spent 749 of its 900 seconds inside. What the scrape
+    /// carries in that state is the walk's age and nothing else from the
+    /// store: a size published before a walk would be a zero claiming the part
+    /// is empty, and the coverage pair would say every part was one the walker
+    /// could not read.
+    #[tokio::test]
+    async fn readiness_turns_on_the_listing_and_the_sizes_arrive_behind_it() {
+        let root = scratch("listed-not-walked");
+        let images_root = scratch("listed-not-walked-images");
+        fs::create_dir_all(images_root.join("snap")).unwrap();
+        fs::write(images_root.join("snap").join("blob"), vec![0u8; 512]).unwrap();
+
+        let images = Arc::new(ImageStoreObservable::new(
+            &images_root,
+            "node-a",
+            image_store::DEFAULT_STORE,
+        ));
+        assert_eq!(
+            images.enumerate(),
+            image_store::Listing::Listed(1),
+            "the listing must name the store's parts"
+        );
+        let app = served(
+            Arc::new(ClaimStoreObservable::new(&root, "node-a")),
+            vec![images],
+        );
+
+        let (status, body) = scrape(app.clone(), "/health/ready").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "readiness waited for a walk it does not need: {body}"
+        );
+        let (status, body) = scrape(app, "/metrics").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("cogneva_image_store_age_seconds{node=\"node-a\",store=\"containerd\"}"),
+            "the walk that has not finished is not visible at all:\n{body}"
+        );
+        for absent in [
+            "cogneva_image_store_bytes",
+            "cogneva_image_store_parts",
+            "cogneva_image_store_readable",
+        ] {
+            assert!(
+                !body.contains(absent),
+                "{absent} was published before any walk ran, so it says a part is empty \
+                 or unreadable when the walk simply has not reached it:\n{body}"
+            );
         }
     }
 

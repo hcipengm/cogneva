@@ -119,6 +119,21 @@ pub enum Scan {
     RootUnreadable,
 }
 
+/// What listing the store found, before any of it was measured.
+///
+/// A separate answer from [`Scan`] because the two steps cost different things
+/// and one of them can be waited for: a listing is one `read_dir` of the store
+/// root, while the walk behind it reads every entry the store holds -- 2.57
+/// million on this node's podman store, minutes of wall clock. A caller that
+/// has to answer a readiness probe waits for the listing and lets the walk run
+/// behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listing {
+    /// The root listed this many top-level entries.
+    Listed(usize),
+    RootUnreadable,
+}
+
 struct Store {
     /// One footprint per top-level entry, keyed by the entry's name.
     ///
@@ -126,6 +141,17 @@ struct Store {
     /// must leave the last measurement in place rather than publish a zero.
     parts: BTreeMap<String, Arc<ClaimFootprint>>,
     readable: usize,
+    /// Whether a walk has run at all, completed or not.
+    ///
+    /// The coverage series are withheld until it has: `parts` names how many
+    /// entries were found and `readable` how many of them a walk got through,
+    /// so publishing them before the first walk would report every part as one
+    /// the walker could not read -- the reading `image_store_incomplete` fires
+    /// on, saying ownership or a broken mount when the truth is that the walk
+    /// has not reached them yet. The age is published either way; it counts
+    /// from process start before the first walk, which is what makes a walker
+    /// that never finishes visible.
+    walked: bool,
     last_scan: Instant,
 }
 
@@ -147,6 +173,7 @@ impl ImageStoreObservable {
             store: Mutex::new(Store {
                 parts: BTreeMap::new(),
                 readable: 0,
+                walked: false,
                 last_scan: Instant::now(),
             }),
             scans: AtomicU64::new(0),
@@ -176,11 +203,25 @@ impl ImageStoreObservable {
         self.store.lock().unwrap().last_scan.elapsed()
     }
 
-    /// Walk the store root once.
+    /// List the store's top-level entries into the part map, measuring none.
     ///
-    /// Blocking, and called from the blocking pool: the walk costs what the store
-    /// holds, so it must never run on a runtime thread a scrape is waiting on.
-    pub fn scan(&self) -> Scan {
+    /// What makes a store's readings honest from the first scrape: the names of
+    /// its parts are known after one `read_dir`, and a part with no value yet
+    /// publishes no size rather than a zero. Everything the walk adds comes
+    /// later; this is what a probe can wait for.
+    pub fn enumerate(&self) -> Listing {
+        match self.parts_on_disk() {
+            Some(work) => Listing::Listed(work.len()),
+            None => Listing::RootUnreadable,
+        }
+    }
+
+    /// The store's top-level entries, paired with the footprint that measures
+    /// each, after retiring the ones the root no longer holds.
+    ///
+    /// `None` when the root cannot be listed, which the caller reports as a
+    /// store that could not be read rather than as one that is empty.
+    fn parts_on_disk(&self) -> Option<Vec<(String, PathBuf, Arc<ClaimFootprint>)>> {
         let entries = match std::fs::read_dir(&self.root) {
             Ok(entries) => entries,
             Err(e) => {
@@ -189,7 +230,7 @@ impl ImageStoreObservable {
                     error = %e,
                     "image store root unreadable; keeping the last walk and letting its age grow"
                 );
-                return Scan::RootUnreadable;
+                return None;
             }
         };
 
@@ -211,12 +252,14 @@ impl ImageStoreObservable {
         // The store is held for the bookkeeping only, never for the walk: this
         // tree is the largest thing the process touches, a scrape asks for the
         // map on every request, and a walk that held the map would leave the pod
-        // unreadable for the minutes it takes -- including its own probes.
-        let work: Vec<_> = {
-            let mut store = self.store.lock().unwrap();
-            // Retire what the root no longer holds before walking what it does: a
-            // part deleted from disk must not be read back out of this process.
-            store.parts.retain(|key, _| found.contains_key(key));
+        // unreadable for the minutes it takes -- including its own probes. The
+        // lock is taken here and released when this function returns, which is
+        // before the caller walks anything.
+        let mut store = self.store.lock().unwrap();
+        // Retire what the root no longer holds before walking what it does: a
+        // part deleted from disk must not be read back out of this process.
+        store.parts.retain(|key, _| found.contains_key(key));
+        Some(
             found
                 .iter()
                 .map(|(name, path)| {
@@ -231,10 +274,26 @@ impl ImageStoreObservable {
                             ))
                         })
                         .clone();
-                    (name, path, footprint)
+                    (name.clone(), path.clone(), footprint)
                 })
-                .collect()
+                .collect(),
+        )
+    }
+
+    /// Walk the store root once.
+    ///
+    /// Blocking, and called from the blocking pool: the walk costs what the store
+    /// holds, so it must never run on a runtime thread a scrape is waiting on.
+    pub fn scan(&self) -> Scan {
+        let Some(work) = self.parts_on_disk() else {
+            // A walk that could not start its own listing has still been
+            // attempted: the coverage series mean "found and not walked", and
+            // publishing them for a root nobody could list is the case the
+            // stale rule's summary describes as the unreadable-root one.
+            self.store.lock().unwrap().walked = true;
+            return Scan::RootUnreadable;
         };
+        let found_len = work.len();
 
         let mut readable = 0usize;
         let mut files = 0usize;
@@ -281,6 +340,7 @@ impl ImageStoreObservable {
         {
             let mut store = self.store.lock().unwrap();
             store.readable = readable;
+            store.walked = true;
             store.last_scan = Instant::now();
         }
         self.scans.fetch_add(1, Ordering::Relaxed);
@@ -293,13 +353,13 @@ impl ImageStoreObservable {
         if vanished > 0 {
             tracing::warn!(
                 vanished,
-                parts = found.len(),
+                parts = found_len,
                 "the image store was pruned while it was walked; the totals are the store as it stood at the end"
             );
         }
 
         Scan::Completed(ScanReport {
-            parts: found.len(),
+            parts: found_len,
             readable,
             files,
         })
@@ -311,6 +371,16 @@ impl ImageStoreObservable {
         tokio::task::spawn_blocking(move || this.scan())
             .await
             .unwrap_or(Scan::RootUnreadable)
+    }
+
+    /// List on the blocking pool. Cheap next to the walk, but it is still a
+    /// syscall on a directory the runtime knows nothing about, and the caller
+    /// that runs it is the one holding a readiness answer.
+    pub async fn enumerate_blocking(self: &Arc<Self>) -> Listing {
+        let this = Arc::clone(self);
+        tokio::task::spawn_blocking(move || this.enumerate())
+            .await
+            .unwrap_or(Listing::RootUnreadable)
     }
 }
 
@@ -337,21 +407,30 @@ impl Observable for ImageStoreObservable {
         }
         let parts = store.parts.len() as f64;
         let readable = store.readable as f64;
+        let walked = store.walked;
         let age = store.last_scan.elapsed().as_secs_f64();
         drop(store);
 
         let node = self.node.as_str();
         let store = self.name.as_str();
-        out.push(
-            RawMetric::new(PARTS_METRIC, parts)
-                .with_label(STORE_LABEL, store)
-                .with_label(NODE_LABEL, node),
-        );
-        out.push(
-            RawMetric::new(READABLE_METRIC, readable)
-                .with_label(STORE_LABEL, store)
-                .with_label(NODE_LABEL, node),
-        );
+        // The pair is a statement about a walk: how many parts were found and
+        // how many it got through. Published before one has run it would say
+        // every part was unreadable, which is a different accusation than "the
+        // walk is still on its first pass" -- so it is withheld until a walk
+        // has run at all, and the age beside it is what says the walk exists
+        // and has not finished.
+        if walked {
+            out.push(
+                RawMetric::new(PARTS_METRIC, parts)
+                    .with_label(STORE_LABEL, store)
+                    .with_label(NODE_LABEL, node),
+            );
+            out.push(
+                RawMetric::new(READABLE_METRIC, readable)
+                    .with_label(STORE_LABEL, store)
+                    .with_label(NODE_LABEL, node),
+            );
+        }
         out.push(
             RawMetric::new(AGE_METRIC, age)
                 .with_label(STORE_LABEL, store)
@@ -415,7 +494,19 @@ pub async fn run_image_store_scan(
                         _ = shutdown.wait() => break,
                         _ = ticker.tick() => {
                             for observable in &observables {
+                                // The first walk is the one a person waits for,
+                                // so it is logged at the level an operator reads;
+                                // every walk after it is a repeat of the same
+                                // line and belongs at debug.
+                                let first = observable.scans() == 0;
                                 match observable.scan_blocking().await {
+                                    Scan::Completed(report) if first => tracing::info!(
+                                        store = observable.name(),
+                                        parts = report.parts,
+                                        readable = report.readable,
+                                        files = report.files,
+                                        "image store walked"
+                                    ),
                                     Scan::Completed(report) => tracing::debug!(
                                         store = observable.name(),
                                         parts = report.parts,
@@ -517,6 +608,59 @@ mod tests {
         assert_eq!(value_of(&out, PARTS_METRIC, None), Some(2.0));
         assert_eq!(value_of(&out, READABLE_METRIC, None), Some(2.0));
         assert!(value_of(&out, AGE_METRIC, None).is_some());
+    }
+
+    /// Listing names the parts and measures none of them, and a store that has
+    /// only been listed publishes its age and no coverage: the pair means
+    /// "found and got through", and written before a walk it would accuse every
+    /// part of being unreadable.
+    ///
+    /// The split exists because the two steps cost different things -- one
+    /// `read_dir` against every entry under the root -- and a caller with a
+    /// readiness probe needs the cheap one to finish first.
+    #[tokio::test]
+    async fn a_listing_names_the_parts_and_a_walk_is_what_publishes_the_coverage() {
+        let root = scratch("listed");
+        write(&root.join("content").join("blob"), 4096);
+        write(&root.join("snapshots").join("1").join("fs"), 8192);
+
+        let observable = ImageStoreObservable::new(&root, NODE, STORE);
+        assert_eq!(observable.enumerate(), Listing::Listed(2));
+
+        let out = readings(&observable).await;
+        assert!(value_of(&out, AGE_METRIC, None).is_some());
+        for name in [BYTES_METRIC, PARTS_METRIC, READABLE_METRIC] {
+            assert!(
+                value_of(&out, name, None).is_none(),
+                "{name} was published before any walk ran"
+            );
+        }
+
+        observable.scan();
+        let out = readings(&observable).await;
+        assert_eq!(value_of(&out, PARTS_METRIC, None), Some(2.0));
+        assert_eq!(value_of(&out, READABLE_METRIC, None), Some(2.0));
+        assert_eq!(value_of(&out, BYTES_METRIC, Some("content")), Some(4096.0));
+    }
+
+    /// A root that cannot be listed is the one case where the coverage pair is
+    /// published without a walk having measured anything: the walk ran and found
+    /// nothing to measure, which is a different statement from a walk that has
+    /// not run. `image_store_scan_stale` says so in its summary -- both at zero
+    /// is the unreadable-root reading -- so this one keeps publishing it.
+    #[tokio::test]
+    async fn an_unlistable_store_still_publishes_withheld_coverage_as_zero() {
+        let observable = ImageStoreObservable::new(scratch("unlistable").join("nope"), NODE, STORE);
+        assert_eq!(observable.enumerate(), Listing::RootUnreadable);
+        assert!(
+            value_of(&readings(&observable).await, PARTS_METRIC, None).is_none(),
+            "a listing that failed is not a walk that ran"
+        );
+
+        assert_eq!(observable.scan(), Scan::RootUnreadable);
+        let out = readings(&observable).await;
+        assert_eq!(value_of(&out, PARTS_METRIC, None), Some(0.0));
+        assert_eq!(value_of(&out, READABLE_METRIC, None), Some(0.0));
     }
 
     /// A part that is deleted from disk stops being reported: a series that
