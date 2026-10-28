@@ -32,8 +32,10 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_text;
+use common::routes::repo_root;
+use common::rust_production::{
+    crate_tree_sources, production_text, relative_name, sources_of_crate_tree,
+};
 
 /// 一段源码里所有 `enum <Name> { … }` 的变体。
 fn enums_in(file: &str, source: &str) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
@@ -322,37 +324,18 @@ fn own_variants(init: &str, name: &str) -> BTreeSet<String> {
     variants
 }
 
-fn rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    walk(&root.join("crates"), &["rs"], &mut files);
-    // 只读生产代码：`tests/` 里的夹具也是 `enum`，对着它们判只会读出假红。
-    files.retain(|path| {
-        !path.components().any(|c| c.as_os_str() == "tests")
-            && !path.components().any(|c| c.as_os_str() == "target")
-    });
-    files.sort();
-    files
-}
-
-fn relative_name(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn contradictions(root: &Path) -> Vec<String> {
+fn contradictions(root: &Path, sources: &[PathBuf]) -> Vec<String> {
     let mut complaints = Vec::new();
     let mut enums = 0usize;
     let mut lists = 0usize;
     let mut variants = 0usize;
-    for path in rust_files(root) {
-        let relative = relative_name(root, &path);
+    for path in sources {
+        let relative = relative_name(root, path);
         // `target/` 之类的构建产物不是这棵树的一部分。
         if relative.contains("/target/") {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+        let Ok(raw) = std::fs::read_to_string(path) else {
             complaints.push(format!("  `{relative}` 读不出来：读不出来按红处理"));
             continue;
         };
@@ -402,7 +385,7 @@ fn contradictions(root: &Path) -> Vec<String> {
 
 #[test]
 fn every_enumeration_names_every_variant_its_enum_declares() {
-    let complaints = contradictions(&repo_root());
+    let complaints = contradictions(&repo_root(), &crate_tree_sources(&repo_root()));
     assert!(
         complaints.is_empty(),
         "`pub const ALL` 是读的人当成全集的那一份，而编译器只拿它的长度对数组字面量、\
@@ -452,7 +435,7 @@ fn fixture_complaints(source: &str) -> Vec<String> {
     let dir = tempfile::tempdir().expect("temp dir");
     write_tree(dir.path(), source);
     // 夹具只有 3 处 `ALL`，普查下限按真树定，所以这里只取「缺变体」那一类判断。
-    contradictions(dir.path())
+    contradictions(dir.path(), &sources_of_crate_tree(dir.path()))
         .into_iter()
         .filter(|c| c.contains("少了"))
         .collect()
@@ -507,7 +490,7 @@ fn an_unparsable_enum_is_reported() {
         dir.path(),
         "pub enum Broken {\n    A,\n\nimpl Broken {\n    pub const ALL: [Broken; 1] = [Self::A];\n}\n",
     );
-    let complaints = contradictions(dir.path());
+    let complaints = contradictions(dir.path(), &sources_of_crate_tree(dir.path()));
     assert!(
         complaints.iter().any(|c| c.contains("读不出来")),
         "{complaints:?}"

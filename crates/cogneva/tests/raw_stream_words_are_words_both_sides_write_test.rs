@@ -46,8 +46,10 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::routes::{matching_brace, repo_root, walk};
-use common::rust_production::production_text;
+use common::routes::{matching_brace, repo_root};
+use common::rust_production::{
+    crate_tree_sources, production_text, relative_name, sources_of_crate_tree,
+};
 
 const DECLARATION: &str = "crates/cog-observability/src/lib.rs";
 const ENUM: &str = "RawStreamName";
@@ -282,24 +284,6 @@ fn read_words(file: &str, source: &str) -> Result<BTreeSet<String>, String> {
     Ok(words)
 }
 
-fn rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    walk(&root.join("crates"), &["rs"], &mut files);
-    files.retain(|path| {
-        !path.components().any(|c| c.as_os_str() == "tests")
-            && !path.components().any(|c| c.as_os_str() == "target")
-    });
-    files.sort();
-    files
-}
-
-fn relative_name(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
 /// 这个文件是不是生产者：它拼过 `RawMeta {`（声明本身不算）。
 fn is_producer(source: &str) -> bool {
     source
@@ -307,7 +291,7 @@ fn is_producer(source: &str) -> bool {
         .contains("RawMeta {")
 }
 
-fn contradictions(root: &Path) -> Vec<String> {
+fn contradictions(root: &Path, sources: &[PathBuf]) -> Vec<String> {
     let mut complaints = Vec::new();
     let declaration_path = root.join(DECLARATION);
     let declaration_raw = match std::fs::read_to_string(&declaration_path) {
@@ -332,9 +316,9 @@ fn contradictions(root: &Path) -> Vec<String> {
     let mut writes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut reads: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut producers = BTreeSet::new();
-    for path in rust_files(root) {
-        let relative = relative_name(root, &path);
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+    for path in sources {
+        let relative = relative_name(root, path);
+        let Ok(raw) = std::fs::read_to_string(path) else {
             complaints.push(format!("  `{relative}` 读不出来：读不出来按红处理"));
             continue;
         };
@@ -413,7 +397,7 @@ fn contradictions(root: &Path) -> Vec<String> {
 
 #[test]
 fn every_raw_stream_word_is_a_word_both_sides_write() {
-    let complaints = contradictions(&repo_root());
+    let complaints = contradictions(&repo_root(), &crate_tree_sources(&repo_root()));
     assert!(
         complaints.is_empty(),
         "原始流水的流名写在 `{ENUM}` 的 `as_str` 里，而生产者在自己的 crate 里手打字符串\
@@ -470,7 +454,7 @@ fn fixture_complaints(declaration: &str, writer: &str, reader: &str) -> Vec<Stri
     let dir = tempfile::tempdir().expect("temp dir");
     write_fixture(dir.path(), declaration, writer, reader);
     // 夹具只有两个词，普查下限按真树定，所以这里只取「词对不上」那一类判断。
-    contradictions(dir.path())
+    contradictions(dir.path(), &sources_of_crate_tree(dir.path()))
         .into_iter()
         .filter(|c| !c.contains("普查只读到"))
         .collect()

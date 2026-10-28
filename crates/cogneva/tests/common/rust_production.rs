@@ -68,6 +68,52 @@ pub fn sources_of_tree(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// `crates/` 下每一个 `.rs`，夹具目录与构建产物除外。
+///
+/// 比 [`production_sources`] 宽：`tests/` 之外的一切都在内，`examples/` 与 `benches/`
+/// 也在内——它们同样被编译，一个词在示例里写死了，下次改词时示例照旧编译失败与否，
+/// 取决于有人去跑它。用这一份的门问的是「这棵工作树的 crate 代码里还写不写这个词」，
+/// 不是「产出的镜像里有没有它」；后者用 [`production_sources`]。
+///
+/// `target/` 与 `.git` 在递归里跳过：它们不是源，而且会把这棵树读成几万个文件。
+pub fn crate_tree_sources(root: &Path) -> Vec<PathBuf> {
+    let out = sources_of_crate_tree(root);
+    assert!(
+        out.len() >= MIN_PRODUCTION_FILES,
+        "只读到 {} 个 crate 源文件（下限 {MIN_PRODUCTION_FILES}）：这棵树的 crate 代码\
+         一个都没读到，任何「再没有第二处」的断言在空集上都成立",
+        out.len()
+    );
+    out
+}
+
+/// 同一份遍历，不设下限：给测试自己搭的那棵树用，理由同 [`sources_of_tree`]。
+pub fn sources_of_crate_tree(root: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "tests" || n == "target" || n == ".git")
+                {
+                    continue;
+                }
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&root.join("crates"), &mut out);
+    out.sort();
+    out
+}
+
 /// 一个文件在树里的名字：repo 相对、`/` 分隔。
 ///
 /// 口径只有这一份。两套写法（`./a/b.rs` 与 `a/b.rs`）在读者眼里是同一个文件，在

@@ -31,22 +31,12 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::rust_production::{production_sources, relative_name};
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
 }
 
 /// Labels the scrape surface attaches, keyed to the reason this tree does not
@@ -288,9 +278,11 @@ fn references_a_declaration_of(root: &Path, file: &str, label: &str) -> bool {
     else {
         return false;
     };
-    let src = root.join("crates").join(krate).join("src");
-    let mut files = Vec::new();
-    walk(&src, &mut files);
+    let prefix = format!("crates/{krate}/src/");
+    let files: Vec<PathBuf> = production_sources(root)
+        .into_iter()
+        .filter(|path| relative_name(root, path).starts_with(&prefix))
+        .collect();
     let mut names = Vec::new();
     for path in &files {
         let Ok(text) = std::fs::read_to_string(path) else {

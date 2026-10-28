@@ -46,8 +46,10 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_text;
+use common::routes::repo_root;
+use common::rust_production::{
+    crate_tree_sources, production_text, relative_name, sources_of_crate_tree,
+};
 
 const READER_FNS: [&str; 2] = ["from_str", "parse"];
 
@@ -561,25 +563,7 @@ fn read_words(body: &str) -> Vec<(String, String)> {
     arms
 }
 
-fn rust_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    walk(&root.join("crates"), &["rs"], &mut files);
-    files.retain(|path| {
-        !path.components().any(|c| c.as_os_str() == "tests")
-            && !path.components().any(|c| c.as_os_str() == "target")
-    });
-    files.sort();
-    files
-}
-
-fn relative_name(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn contradictions(root: &Path) -> Vec<String> {
+fn contradictions(root: &Path, files: &[PathBuf]) -> Vec<String> {
     let mut complaints = Vec::new();
     // 类型名 → 两份词表。一个类型的 `as_str` 与读方可以在不同的 `impl` 里，也可以在同
     // 一个，所以按类型名合。
@@ -587,9 +571,9 @@ fn contradictions(root: &Path) -> Vec<String> {
     let mut derived: BTreeSet<String> = BTreeSet::new();
     let mut duplicated: BTreeSet<String> = BTreeSet::new();
     let mut sources: Vec<(String, String)> = Vec::new();
-    for path in rust_files(root) {
-        let relative = relative_name(root, &path);
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+    for path in files {
+        let relative = relative_name(root, path);
+        let Ok(raw) = std::fs::read_to_string(path) else {
             complaints.push(format!("  `{relative}` 读不出来：读不出来按红处理"));
             continue;
         };
@@ -768,7 +752,7 @@ fn contradictions(root: &Path) -> Vec<String> {
 
 #[test]
 fn every_word_written_out_is_the_word_the_type_reads_back() {
-    let complaints = contradictions(&repo_root());
+    let complaints = contradictions(&repo_root(), &crate_tree_sources(&repo_root()));
     assert!(
         complaints.is_empty(),
         "`as_str` 写出去的词必须能被同一类型的 `from_str`／`parse` 读回同一个变体；两个 \
@@ -820,7 +804,7 @@ fn fixture_complaints(source: &str) -> Vec<String> {
     let path = dir.path().join("crates/demo/src/lib.rs");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
     std::fs::write(path, source).expect("write");
-    contradictions(dir.path())
+    contradictions(dir.path(), &sources_of_crate_tree(dir.path()))
         .into_iter()
         .filter(|c| !c.contains("普查只读到"))
         .collect()
