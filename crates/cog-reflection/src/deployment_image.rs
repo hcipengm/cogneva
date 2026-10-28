@@ -51,6 +51,15 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    /// 普查的覆盖率下限：少于这么多源文件，这把尺子就没量到东西。
+    ///
+    /// 判据本身是「某句话只出现在一处」，而**一处都没有**的时候它同样成立——
+    /// 走错目录、改过 crate 名、`read_dir` 出错，读出来的是空集，断言全绿。
+    /// 所以下限长在 `collect` 里而不是长在调用点上：调用点上的下限只管得住那
+    /// 一次调用，而这条下限要管的是「以后谁再加一份普查」。下限取实测文件数的
+    /// 七成，删掉几个文件不会误报，整个目录读空一定报。
+    const MIN_FILES: usize = 50;
+
     /// 空读数不许变成一个镜像。
     #[test]
     fn an_empty_reading_is_not_an_image() {
@@ -114,11 +123,6 @@ mod tests {
         let mut files = Vec::new();
         let mut sites = Vec::new();
         collect(&src, &mut files, &mut sites, needle);
-        assert!(
-            files.len() >= 20,
-            "只读到 {} 个源文件：读得太少，「只写一处」就不算读数",
-            files.len()
-        );
         let expected = "cog-reflection/src/deployment_image.rs";
         assert_eq!(
             sites,
@@ -153,6 +157,23 @@ mod tests {
 
     fn collect(dir: &Path, files: &mut Vec<String>, sites: &mut Vec<String>, needle: &str) {
         collect_from(dir, dir, files, sites, needle);
+        assert!(
+            files.len() >= MIN_FILES,
+            "只读到 {} 个源文件（下限 {MIN_FILES}）：这把尺子没量到东西，\
+             「只写一处」对空集同样成立，所以这次读不算读数",
+            files.len()
+        );
+    }
+
+    /// 对照：读空必须报出来。少了这条，`collect` 哪天退化成什么都不读，
+    /// 上面那条仍然全绿——而它绿的原因恰恰是它没读到任何东西。
+    #[test]
+    #[should_panic(expected = "这把尺子没量到东西")]
+    fn a_census_that_reads_almost_nothing_is_refused() {
+        let empty = Path::new("/nonexistent-directory-for-the-census");
+        let mut files = Vec::new();
+        let mut sites = Vec::new();
+        collect(empty, &mut files, &mut sites, "containers[?(@.name==");
     }
 
     fn collect_from(
