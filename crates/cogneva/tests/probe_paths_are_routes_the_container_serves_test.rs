@@ -52,6 +52,7 @@ use std::path::{Path, PathBuf};
 use common::routes::repo_root;
 use common::rust_production::{production_sources, sources_of_tree};
 use common::service_topology::{container_routes, our_image, routes_of, workloads};
+use common::temp_tree;
 
 fn complaints(root: &Path, files: &[PathBuf]) -> Vec<String> {
     let mut out = Vec::new();
@@ -142,13 +143,7 @@ fn a_probe_path_is_a_route_the_container_serves() {
 // ── 夹具：临时树里放一份 chart values、一张子命令表、一份分发表与一份清单 ──
 
 fn fixture(files: &[(&str, &str)]) -> Vec<String> {
-    let dir = tempfile::tempdir().expect("temp dir");
-    for (path, body) in files {
-        let full = dir.path().join(path);
-        std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
-        std::fs::write(full, body).expect("write");
-    }
-    complaints(dir.path(), &sources_of_tree(dir.path()))
+    temp_tree::judge(files, |root| complaints(root, &sources_of_tree(root)))
 }
 
 const VALUES: &str = "image:\n  repository: registry.example/cogneva\n  tag: local\n";

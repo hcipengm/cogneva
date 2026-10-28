@@ -69,6 +69,7 @@ use common::service_topology::{
     container_routes, declared_namespaces, monitors, our_image, routes_of, selector_matches,
     services, workloads, ContainerSpec, Monitor,
 };
+use common::temp_tree;
 
 const MANIFESTS: &str = "deploy/k3s/observability/manifests";
 const DISPOSITIONS: &str = "delivery-dispositions.txt";
@@ -369,13 +370,7 @@ fn a_scrape_target_names_a_port_and_path_the_workload_provides() {
 // ── 夹具：临时树里放一份 chart values、一张处置表、若干监视器与工作负载 ──
 
 fn fixture(files: &[(&str, &str)]) -> Vec<String> {
-    let dir = tempfile::tempdir().expect("temp dir");
-    for (path, body) in files {
-        let full = dir.path().join(path);
-        std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
-        std::fs::write(full, body).expect("write");
-    }
-    complaints(dir.path(), &sources_of_tree(dir.path()))
+    temp_tree::judge(files, |root| complaints(root, &sources_of_tree(root)))
 }
 
 const VALUES: &str = "image:\n  repository: registry.example/cogneva\n  tag: local\n";

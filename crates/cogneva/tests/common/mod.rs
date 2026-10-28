@@ -9,4 +9,5 @@ pub mod routes;
 pub mod rust_production;
 pub mod rust_text;
 pub mod service_topology;
+pub mod temp_tree;
 pub mod yaml;
