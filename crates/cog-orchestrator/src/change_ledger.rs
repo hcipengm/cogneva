@@ -7984,6 +7984,15 @@ mod tests {
     /// A landed row the running revision does not carry is named, and one it
     /// does carry is not: the same tree, the same account, two rows, and the
     /// second face is the only thing that tells them apart.
+    ///
+    /// This is what "it landed" and "it is running" are told apart by, and a
+    /// migration is the case that costs the most when they are confused: the
+    /// file is in the tree, every tree-side reading is green, and the database
+    /// is still shaped by the image the workloads actually run. The account
+    /// asks it of every landed row rather than of the ones that look like a
+    /// migration, because nothing in a row says which of them carries one.
+    ///
+    /// principle: feedback_a_change_carrying_a_migration_lands_only_when_the_mainline_moves
     #[tokio::test]
     async fn a_landed_row_the_running_revision_does_not_carry_is_named() {
         let (dir, first, second) = two_revision_repo();
