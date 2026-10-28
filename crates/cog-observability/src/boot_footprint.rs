@@ -31,6 +31,13 @@
 //!   that died before serving — is absent rather than zero, because zero would
 //!   read as "this phase allocates nothing" instead of "this process never got
 //!   there".
+//! - **A phase is printed as it is marked, not only published.** The series
+//!   reaches a reader through the process's own exposition, and a boot that
+//!   stalls before `serving` is exactly the boot whose exposition does not
+//!   exist yet: the reading that would say where it stopped is served by the
+//!   step it never reached. A log line at the moment of the mark is the only
+//!   account of the stall that survives it, and the last phase named before a
+//!   silent stretch is the phase to look at.
 //!
 //! The phase set is a closed list for the same reason a label is ever closed:
 //! the series' cardinality is decided by it, and a free-form phase name would
@@ -69,9 +76,18 @@ static MARKS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 
 /// Records this process's resident memory at `phase`.
 ///
-/// Silently does nothing when `phase` is not in [`PHASES`] or has already been
-/// marked — but says so at debug level, because a phase that never lands is a
-/// snapshot the reader will wait for and never get.
+/// Does nothing when `phase` is not in [`PHASES`] or has already been marked.
+/// Both are said at debug level, because neither is startup progress: the first
+/// is a caller naming a phase that has no series, the second is the same phase
+/// arriving twice.
+///
+/// A phase that does land is announced at info level, before anything else can
+/// go wrong with the snapshot. The published series cannot stand in for this
+/// line: it is served over the HTTP endpoint, so a boot stuck earlier in
+/// startup has no series at all, and the log is then the only place the last
+/// phase reached is written down. When the resident read fails the phase is
+/// still announced -- where a boot got to is worth knowing even without the
+/// number.
 pub fn mark(phase: &'static str) {
     if !PHASES.contains(&phase) {
         tracing::debug!(
@@ -80,13 +96,6 @@ pub fn mark(phase: &'static str) {
         );
         return;
     }
-    let Some(rss) = resident_bytes() else {
-        tracing::debug!(
-            phase,
-            "boot footprint: resident memory is not readable here"
-        );
-        return;
-    };
     let mut marks = match MARKS.lock() {
         Ok(m) => m,
         Err(e) => e.into_inner(),
@@ -94,9 +103,19 @@ pub fn mark(phase: &'static str) {
     if marks.iter().any(|(p, _)| *p == phase) {
         return;
     }
-    marks.push((phase, rss));
-    marks.sort_by_key(|(p, _)| PHASES.iter().position(|x| x == p).unwrap_or(usize::MAX));
-    tracing::debug!(phase, rss, "boot footprint: marked");
+    match resident_bytes() {
+        Some(rss) => {
+            marks.push((phase, rss));
+            marks.sort_by_key(|(p, _)| PHASES.iter().position(|x| x == p).unwrap_or(usize::MAX));
+            tracing::info!(phase, rss, "boot footprint: phase reached");
+        }
+        None => {
+            tracing::info!(
+                phase,
+                "boot footprint: phase reached, but resident memory could not be read here"
+            );
+        }
+    }
 }
 
 /// The snapshots taken so far, in phase order.
@@ -165,6 +184,7 @@ impl Observable for BootFootprintObservable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     /// The registry is one per process, so tests that mark have to take turns:
     /// otherwise each one reads the marks another one left behind.
@@ -208,6 +228,97 @@ mod tests {
         // A phase outside the closed set does not become a series of its own.
         mark("not-a-phase");
         assert_eq!(marks(), first);
+        clear_for_tests();
+    }
+
+    /// One event as it reaches a log backend: its level and the phase it named.
+    #[derive(Clone, Debug)]
+    struct Logged {
+        level: tracing::Level,
+        phase: Option<String>,
+    }
+
+    /// A log backend that only records what it was handed.
+    struct Capture(Arc<Mutex<Vec<Logged>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for Capture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _context: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut logged = Logged {
+                level: *event.metadata().level(),
+                phase: None,
+            };
+            let mut fields = PhaseField(&mut logged.phase);
+            event.record(&mut fields);
+            self.0
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(logged);
+        }
+    }
+
+    struct PhaseField<'a>(&'a mut Option<String>);
+
+    impl tracing::field::Visit for PhaseField<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "phase" {
+                *self.0 = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "phase" {
+                *self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    #[test]
+    fn a_phase_that_is_reached_is_announced_at_the_level_a_log_keeps() {
+        use tracing_subscriber::prelude::*;
+
+        let _guard = one_at_a_time();
+        clear_for_tests();
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&logged)));
+        tracing::subscriber::with_default(subscriber, || {
+            mark("embedding-dense");
+            // A phase outside the closed set is a caller's mistake, not startup
+            // progress: it must stay at debug rather than read as a phase the
+            // boot actually reached.
+            mark("not-a-phase");
+        });
+
+        let events = logged.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let reached: Vec<&Logged> = events
+            .iter()
+            .filter(|e| e.phase.as_deref() == Some("embedding-dense"))
+            .collect();
+        assert_eq!(
+            reached.len(),
+            1,
+            "reaching a phase printed {} lines naming it: {events:?}",
+            reached.len()
+        );
+        assert_eq!(
+            reached[0].level,
+            tracing::Level::INFO,
+            "a phase the boot reached has to survive the level a deployment logs at; \
+             the series that carries it is served by the endpoint a stall prevents, \
+             so a debug line is a progress report nobody receives"
+        );
+
+        let refused: Vec<&Logged> = events
+            .iter()
+            .filter(|e| e.phase.as_deref() == Some("not-a-phase"))
+            .collect();
+        assert!(
+            refused.iter().all(|e| e.level == tracing::Level::DEBUG),
+            "a phase outside the closed set reached the log at {refused:?}"
+        );
         clear_for_tests();
     }
 
