@@ -102,13 +102,11 @@ async fn insert_counter_series(pool: &PgPool, table: &str, series: i64, rows: i6
 }
 
 async fn count_named(pool: &PgPool, table: &str, name: &str) -> i64 {
-    sqlx::query_scalar(&format!(
-        "SELECT common::count(*) FROM {table} WHERE name = $1"
-    ))
-    .bind(name)
-    .fetch_one(pool)
-    .await
-    .unwrap()
+    sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE name = $1"))
+        .bind(name)
+        .fetch_one(pool)
+        .await
+        .unwrap()
 }
 
 fn cap(pool: PgPool, table: &str, budget: u64) -> SampleLogCap {
@@ -284,7 +282,7 @@ async fn every_series_keeps_its_newest_row_even_when_the_budget_is_below_that() 
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT common::count(*) FROM (
+            "SELECT count(*) FROM (
                  SELECT DISTINCT ON (labels) id FROM {table} ORDER BY labels, timestamp DESC
              ) heads"
         ))
