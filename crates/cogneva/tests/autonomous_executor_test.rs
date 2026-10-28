@@ -35,47 +35,9 @@ struct AutonomousTestState {
     mock_llm: Arc<MockLLMProvider>,
 }
 
-/// Redis endpoint for the suite. CI supplies one through a service container;
-/// a developer machine usually has one on the default port.
-fn test_redis_url() -> String {
-    std::env::var("COGNEVA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
-}
-
-/// Connect to the store the quota manager needs, or return `None` when none
-/// is reachable so the test can skip.
-async fn open_test_redis() -> Option<redis::aio::ConnectionManager> {
-    open_test_redis_at(&test_redis_url()).await
-}
-
-/// The endpoint is a parameter so the skip rule can be checked without
-/// mutating the environment the parallel tests read.
-async fn open_test_redis_at(redis_url: &str) -> Option<redis::aio::ConnectionManager> {
-    let client = match redis::Client::open(redis_url) {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("SKIP: unusable Redis url ({e})");
-            return None;
-        }
-    };
-    match cog_redis::connect(&client).await {
-        Ok(conn) => Some(conn),
-        Err(e) => {
-            eprintln!("SKIP: no Redis reachable ({e})");
-            None
-        }
-    }
-}
-
-/// The sandbox has no Redis. A connection failure there has to read as "not
-/// applicable" rather than as a broken quota store, or the verdict says which
-/// services happened to be up instead of whether the change is sound.
 #[tokio::test]
 async fn unreachable_redis_skips_instead_of_panicking() {
-    let conn = open_test_redis_at("redis://127.0.0.1:1").await;
-    assert!(
-        conn.is_none(),
-        "an unreachable Redis must skip, not connect"
-    );
+    common::redis::assert_unreachable_skips().await;
 }
 
 async fn build_test_state() -> Option<AutonomousTestState> {
@@ -146,7 +108,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
     // mock; the suite also runs inside the evolution sandbox, which has no
     // Redis, and a red run there would be a statement about the sandbox
     // rather than about the change under test.
-    let redis_conn = open_test_redis().await?;
+    let redis_conn = common::redis::open().await?;
     let quota_manager = Arc::new(cog_quota::QuotaManager::new(
         Arc::new(cog_storage::RedisKeyValueStore::new(redis_conn)),
         1_000_000_000,

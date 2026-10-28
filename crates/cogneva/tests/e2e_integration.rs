@@ -7,6 +7,8 @@
 //! (except for the transient raw-log temp dir). Redis backs the quota manager
 //! and has no in-memory stand-in, so a test skips when none is reachable.
 
+mod common;
+
 use axum::{
     body::{to_bytes, Body},
     http::{Request, StatusCode},
@@ -52,47 +54,9 @@ struct TestApp {
     _migrator: Option<tokio::task::JoinHandle<()>>,
 }
 
-/// Redis endpoint for the suite. CI supplies one through a service container;
-/// a developer machine usually has one on the default port.
-fn test_redis_url() -> String {
-    std::env::var("COGNEVA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
-}
-
-/// Connect to the store the quota manager needs, or return `None` when none
-/// is reachable so the test can skip.
-async fn open_test_redis() -> Option<redis::aio::ConnectionManager> {
-    open_test_redis_at(&test_redis_url()).await
-}
-
-/// The endpoint is a parameter so the skip rule can be checked without
-/// mutating the environment the parallel tests read.
-async fn open_test_redis_at(redis_url: &str) -> Option<redis::aio::ConnectionManager> {
-    let client = match redis::Client::open(redis_url) {
-        Ok(client) => client,
-        Err(e) => {
-            eprintln!("SKIP: unusable Redis url ({e})");
-            return None;
-        }
-    };
-    match cog_redis::connect(&client).await {
-        Ok(conn) => Some(conn),
-        Err(e) => {
-            eprintln!("SKIP: no Redis reachable ({e})");
-            None
-        }
-    }
-}
-
-/// The sandbox has no Redis. A connection failure there has to read as "not
-/// applicable" rather than as a broken quota store, or the verdict says which
-/// services happened to be up instead of whether the change is sound.
 #[tokio::test]
 async fn unreachable_redis_skips_instead_of_panicking() {
-    let conn = open_test_redis_at("redis://127.0.0.1:1").await;
-    assert!(
-        conn.is_none(),
-        "an unreachable Redis must skip, not connect"
-    );
+    common::redis::assert_unreachable_skips().await;
 }
 
 async fn spawn_app(
@@ -110,7 +74,7 @@ async fn spawn_app_full(
     // Redis is required for the quota manager. The suite also runs inside the
     // evolution sandbox, which has no Redis; a red run there would be a
     // statement about the sandbox rather than about the change under test.
-    let redis_conn = open_test_redis().await?;
+    let redis_conn = common::redis::open().await?;
 
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
@@ -595,7 +559,7 @@ async fn e2e_a_management_call_is_not_refused_by_the_token_allowance() {
 
     let user_id = uuid::Uuid::new_v4().to_string();
     {
-        let Some(mut conn) = open_test_redis().await else {
+        let Some(mut conn) = common::redis::open().await else {
             return;
         };
         let key = format!("quota:remaining:{}", user_id);

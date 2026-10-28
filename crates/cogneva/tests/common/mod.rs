@@ -3,6 +3,7 @@ pub mod harness;
 pub mod js_literal;
 pub mod lex;
 pub mod mocks;
+pub mod redis;
 pub mod root;
 pub mod routes;
 pub mod rust_production;
