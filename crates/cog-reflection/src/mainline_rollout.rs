@@ -407,6 +407,23 @@ pub(crate) fn readiness_overdue(
         .unwrap_or(false)
 }
 
+/// 判词里附着的现场采样，接在分隔符**之后**。
+///
+/// 这一段是集群写的：Pod 的相位、事件原文、容器留下的终止消息。判据只读分隔符
+/// 之前那一段（见 [`primary_message`]），所以它必须整个待在后面——接在前面时，
+/// 新 Pod 探针报的那句 `connection refused`（它只是应用还没开始监听）会被
+/// [`is_cluster_unreachable`] 读成"我们看不到集群"，于是这一版被归成环境类：
+/// 不回滚、不记账、无限重试。判词本身仍带着现场，剥掉的只是参与判据的那一段。
+pub(crate) fn scene_suffix(diagnosis: &str) -> String {
+    if diagnosis.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from(SUPPORT_CAUSE_SEPARATOR);
+    text.push_str("pods: ");
+    text.push_str(diagnosis);
+    text
+}
+
 /// 把事件行折成诊断，只留与本次部署相关的最近几条。
 ///
 /// 全命名空间的事件绝大多数与这次滚动无关，不过滤就会把真正的
@@ -3202,11 +3219,7 @@ impl RolloutExecutor {
                 // 超时才采样：正常路径一次 kubectl 都不多花。
                 let replicasets = self.sample_replicaset_failures(t).await;
                 let diagnosis = self.rollout_diagnosis(t, &replicasets).await;
-                let suffix = if diagnosis.is_empty() {
-                    String::new()
-                } else {
-                    format!("; pods: {diagnosis}")
-                };
+                let suffix = scene_suffix(&diagnosis);
                 // 排不上队与准入被拒：都只有"这次上线没动放置面"才归环境。
                 let blocked = self.sample_unschedulable_pods(t).await;
                 let now_shape = self.current_placement_shape(t).await.ok();
@@ -3603,7 +3616,7 @@ impl RolloutExecutor {
         if diagnosis.is_empty() {
             SFError::Agent(msg)
         } else {
-            SFError::Agent(format!("{msg}; pods: {diagnosis}"))
+            SFError::Agent(format!("{msg}{}", scene_suffix(&diagnosis)))
         }
     }
 
@@ -4898,3 +4911,46 @@ pub(crate) fn admission_hold_dimension(message: &str) -> Option<&'static str> {
 // 一份用例，与构建侧的用例共用夹具（伪造的 kubectl、临时清单目录、`RolloutExecutor`
 // 的搭台），按主题交错排布，逐条断的是「跑起来是什么样」——按模块切开反而会把一份场景
 // 拆成两半。搬迁保的是**产出面**的边界，没有动用例的住处。
+//
+// 例外只留给**不搭台**的纯函数：判据全靠输入文本与返回值，借不到共用的夹具也就
+// 没有"一份场景被拆开"的风险（见下面 `scene_suffix` 的两条）。
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 判词里贴上的现场采样，只能待在分隔符**之后**。
+    ///
+    /// 它带着集群自己的原话：新 Pod 还没开始监听时，探针报的就是
+    /// `connect: connection refused`。接在分隔符之前，[`is_cluster_unreachable`]
+    /// 会把这次超时读成"我们看不到集群"——环境类不回滚、不记账、无限重试，
+    /// 而这次失败说的恰恰是这个版本自己起不来。
+    #[test]
+    fn a_scene_attached_to_a_verdict_stays_out_of_the_text_the_class_is_read_from() {
+        let diagnosis = "cogneva-55cd8bfdff-qkpvj Running not-ready; events: Unhealthy: \
+                         Startup probe failed: Get \"http://10.42.0.99:8080/health/live\": \
+                         dial tcp 10.42.0.99:8080: connect: connection refused";
+        let msg = format!(
+            "rollout of deployment/cogneva did not complete within 300s (last: 1|1|1|1|1|1{})",
+            scene_suffix(diagnosis)
+        );
+
+        assert!(
+            !primary_message(&msg).contains("connection refused"),
+            "the scene decided the class: {msg}"
+        );
+        assert!(
+            !is_cluster_unreachable(primary_message(&msg)),
+            "a pod that has not started listening is not an unreachable cluster: {msg}"
+        );
+        // 剥掉的只是参与判据的那一半：判词本身仍带着现场，读日志的人看得到。
+        assert!(msg.contains("connection refused"), "{msg}");
+        assert!(msg.contains("Startup probe failed"), "{msg}");
+    }
+
+    /// 没有现场时判词保持原样：不许多出一个空的分隔段。
+    #[test]
+    fn an_empty_scene_leaves_the_verdict_untouched() {
+        assert!(scene_suffix("").is_empty());
+    }
+}
