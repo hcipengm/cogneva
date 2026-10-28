@@ -2737,26 +2737,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
     async fn adoption_and_retirement_reach_rows_past_the_old_read_limit() {
-        use std::str::FromStr;
-
-        use sqlx::postgres::PgConnectOptions;
-        use sqlx::{Connection, PgConnection, PgPool};
-
         let url = cog_test_support::database_url();
-        let schema = format!("alert_adopt_{}", uuid::Uuid::new_v4().simple());
-        let mut admin = PgConnection::connect(&url)
-            .await
-            .expect("the throwaway database is reachable");
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&mut admin)
-            .await
-            .expect("the probe schema is created");
-        let options = PgConnectOptions::from_str(&url)
-            .expect("the test database URL parses")
-            .options([("search_path", schema.as_str())]);
-        let pool = PgPool::connect_with(options)
-            .await
-            .expect("the probe schema is reachable");
+        let schema = cog_test_support::own_schema(&url, "alert_adopt").await;
+        let pool = cog_test_support::schema_pool(&url, &schema).await;
         let store = PostgresAlertStore::new(pool.clone());
         store
             .init_schema()
@@ -2828,9 +2811,6 @@ mod tests {
              never be settled"
         );
 
-        sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-            .execute(&mut admin)
-            .await
-            .expect("the probe schema is dropped");
+        cog_test_support::drop_schema(&url, &schema).await;
     }
 }

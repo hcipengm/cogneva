@@ -8,3 +8,5 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# 一次性 schema 的那几个入口要建 schema、连池。它是 dev-only 的 crate：没有产出物链接它。
+sqlx = { workspace = true }

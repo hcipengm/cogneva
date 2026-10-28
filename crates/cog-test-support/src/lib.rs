@@ -1,12 +1,15 @@
 //! 跨 crate 的夹具约定：同一个外部服务、同一条读取规则，不要在每个 crate 里各写一遍。
 //!
 //! 这里的每一条都曾经是散在各 crate 的 `tests/` 里的抄件。它们不是「各自的测试数据」——
-//! 它们说的是同一件事：这台机器上用哪个 PostgreSQL、哪个 Redis，以及没有的时候是停还是
-//! 跳过。抄件之间没有东西比较，一边改了措辞或改了「没有就停 / 没有就跳过」这条规矩，
-//! 另一边不会红：两边都还是绿的，只是绿的来源不同。
+//! 它们说的是同一件事：这台机器上用哪个 PostgreSQL、哪个 Redis，没有的时候是停还是跳过，
+//! 以及一个用例怎么从那个库里切出一块只属于自己、用完就删的空间。抄件之间没有东西比较，
+//! 一边改了措辞或改了「没有就停 / 没有就跳过」这条规矩，另一边不会红：两边都还是绿的，
+//! 只是绿的来源不同。
 //!
 //! 判据在 `crates/cogneva/tests/the_fixture_reading_steps_are_written_once_test.rs`：
 //! 这份文件里定义过的函数体，不许在任何一份夹具里再出现一遍。
+
+use sqlx::Connection as _;
 
 /// 下面那几个入口读的名字。一条名字只在这里拼写一次。
 ///
@@ -39,4 +42,63 @@ pub fn redis_url() -> String {
 pub fn redis_url_required() -> String {
     std::env::var(REDIS_URL_ENV)
         .expect("set COGNEVA_TEST_REDIS_URL to a throwaway Redis before running this test")
+}
+
+/// 一次用例独占的那个 schema：名字由 `label` 加上本次的进程号与纳秒数拼成。
+///
+/// `label` 由调用方说，它只是这个名字的前半截——谁建的 schema 谁按名字删它，所以这个
+/// 标签是调用方自己的事实，不在这里替它们编一个。它会被直接拼进 DDL，因此必须是合法的
+/// 标识符片段（全小写字母与下划线）。
+pub async fn own_schema(url: &str, label: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let schema = format!("{label}_{}_{nanos}", std::process::id());
+    let mut admin = sqlx::PgConnection::connect(url)
+        .await
+        .expect("the throwaway database is reachable");
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&mut admin)
+        .await
+        .expect("the probe schema is created");
+    schema
+}
+
+/// 删掉 [`own_schema`] 建的那一个。
+///
+/// 删不掉不算失败：用例的结论说的是被测代码，不是收尾时数据库还在不在。
+pub async fn drop_schema(url: &str, schema: &str) {
+    if let Ok(mut admin) = sqlx::PgConnection::connect(url).await {
+        sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+            .execute(&mut admin)
+            .await
+            .ok();
+    }
+}
+
+/// 连到 `schema` 上的池，`search_path` 指过去，所以用例里的表名不用带前缀。
+pub async fn schema_pool(url: &str, schema: &str) -> sqlx::PgPool {
+    sqlx::PgPool::connect_with(schema_options(url, schema))
+        .await
+        .expect("the throwaway database is reachable")
+}
+
+/// 同上，但连接数由调用方给。
+///
+/// 单独一个入口而不给 [`schema_pool`] 加参数：要同时占住多个连接的用例（判锁的那几个）
+/// 关心的是「还差一个连接时会怎样」，不关心这件事的用例不该为了签名齐整去写一个默认值。
+pub async fn schema_pool_with(url: &str, schema: &str, max_connections: u32) -> sqlx::PgPool {
+    sqlx::pool::PoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(schema_options(url, schema))
+        .await
+        .expect("the throwaway database is reachable")
+}
+
+fn schema_options(url: &str, schema: &str) -> sqlx::postgres::PgConnectOptions {
+    use std::str::FromStr as _;
+    sqlx::postgres::PgConnectOptions::from_str(url)
+        .expect("the test database URL parses")
+        .options([("search_path", schema)])
 }

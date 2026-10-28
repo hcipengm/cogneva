@@ -28,10 +28,7 @@
 //! a race on two counts, over the rows in it and over the catalogue entries for
 //! it, and a database is left as it was found either way.
 
-use std::str::FromStr;
-
 use chrono::{DateTime, Duration, SubsecRound, Utc};
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -46,7 +43,7 @@ use cog_storage::PostgresTasteIntentStore;
 /// deployment's.
 const PROBE_SUBMITTER: &str = "probe-taste-intent-store";
 
-use cog_test_support::database_url;
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 
 fn preference_says_prefer(preferred: &str) -> TasteIntentPayload {
     TasteIntentPayload::DirectionPreference(DirectionPreferenceIntent {
@@ -79,14 +76,6 @@ fn submission(subject: &str, at: DateTime<Utc>) -> TasteIntent {
     }
 }
 
-/// Where one case's copy of the table lives. Naming it per case is what makes
-/// each reading here about this case's own rows: pointed at one table the cases
-/// are one another's writers, and a sibling's cleanup mid-assertion deletes
-/// submissions this case has just written.
-fn schema_of(case: &str) -> String {
-    format!("probe_taste_{case}")
-}
-
 /// An empty schema holding the store's own table, and the store over it.
 ///
 /// `CREATE TABLE IF NOT EXISTS` is a check followed by a create, so two cases
@@ -95,41 +84,19 @@ fn schema_of(case: &str) -> String {
 /// this suite reported, and it is not one a case can retry its way out of
 /// without reading rows it did not write. Separate schemas remove the check
 /// both ways: the rows and the catalogue entries are this case's alone.
-async fn probe(case: &str) -> (PgPool, PostgresTasteIntentStore) {
-    let schema = schema_of(case);
-    // The schema has to exist before a connection can name it as its search
-    // path, and the store creates its table in whatever schema the path
-    // selects — a path naming nothing would leave it with nowhere to build.
-    let setup = PgPool::connect(&database_url()).await.unwrap();
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&setup)
-        .await
-        .unwrap();
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&setup)
-        .await
-        .unwrap();
-    setup.close().await;
-
-    let options = PgConnectOptions::from_str(&database_url())
-        .expect("COGNEVA_TEST_DATABASE_URL is not a PostgreSQL URL")
-        .options([("search_path", schema.as_str())]);
-    let pool = PgPoolOptions::new().connect_with(options).await.unwrap();
+async fn probe(case: &str) -> (PgPool, PostgresTasteIntentStore, String) {
+    let url = database_url();
+    let schema = own_schema(&url, &format!("probe_taste_{case}")).await;
+    let pool = schema_pool(&url, &schema).await;
     let store = PostgresTasteIntentStore::new(pool.clone());
     store.init_schema().await.unwrap();
-    (pool, store)
+    (pool, store, schema)
 }
 
 /// Hand the schema back with everything in it, so a live database is left as it
 /// was found.
-async fn done(case: &str) {
-    let schema = schema_of(case);
-    let pool = PgPool::connect(&database_url()).await.unwrap();
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(&pool)
-        .await
-        .unwrap();
-    pool.close().await;
+async fn done(schema: &str) {
+    drop_schema(&database_url(), schema).await;
 }
 
 /// A submission is readable while nothing has claimed it, and reading it back
@@ -138,7 +105,7 @@ async fn done(case: &str) {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_submission_is_pending_until_something_claims_it() {
     let case = "pending_until_claimed";
-    let (_pool, store) = probe(case).await;
+    let (_pool, store, schema) = probe(case).await;
 
     let submitted = submission("which retry policy", Utc::now());
     store.submit(&submitted).await.unwrap();
@@ -152,7 +119,7 @@ async fn a_submission_is_pending_until_something_claims_it() {
     );
     assert_eq!(pending[0].intent.payload.kind(), submitted.payload.kind());
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// Filing is what takes a submission out of the queue, and the task it names
@@ -162,7 +129,7 @@ async fn a_submission_is_pending_until_something_claims_it() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_filed_submission_leaves_the_queue_and_carries_its_task() {
     let case = "filed_leaves_queue";
-    let (_pool, store) = probe(case).await;
+    let (_pool, store, schema) = probe(case).await;
 
     let submitted = submission("which retry policy", Utc::now());
     store.submit(&submitted).await.unwrap();
@@ -183,7 +150,7 @@ async fn a_filed_submission_leaves_the_queue_and_carries_its_task() {
     assert_eq!(filed[0].intent.id, submitted.id);
     assert_eq!(filed[0].task_id.as_deref(), Some("task-42"));
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// The first decision about a submission is the one that stands. A claimer
@@ -193,7 +160,7 @@ async fn a_filed_submission_leaves_the_queue_and_carries_its_task() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_second_disposition_does_not_overwrite_the_first() {
     let case = "second_disposition";
-    let (_pool, store) = probe(case).await;
+    let (_pool, store, schema) = probe(case).await;
 
     let submitted = submission("which retry policy", Utc::now());
     store.submit(&submitted).await.unwrap();
@@ -217,7 +184,7 @@ async fn a_second_disposition_does_not_overwrite_the_first() {
     );
     assert_eq!(filed[0].task_id.as_deref(), Some("task-42"));
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// Disposing an id nobody submitted is not an error and writes nothing: the
@@ -226,7 +193,7 @@ async fn a_second_disposition_does_not_overwrite_the_first() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn disposing_an_unknown_id_writes_nothing() {
     let case = "unknown_id";
-    let (_pool, store) = probe(case).await;
+    let (_pool, store, schema) = probe(case).await;
 
     store
         .dispose(Uuid::new_v4(), TasteDisposition::Filed, Some("task-42"))
@@ -239,7 +206,7 @@ async fn disposing_an_unknown_id_writes_nothing() {
         .unwrap()
         .is_empty());
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// The filed window is what keeps a reader from re-reading the whole history
@@ -257,7 +224,7 @@ async fn disposing_an_unknown_id_writes_nothing() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn the_filed_window_follows_when_the_work_was_handed_over() {
     let case = "filed_window";
-    let (pool, store) = probe(case).await;
+    let (pool, store, schema) = probe(case).await;
 
     let now = Utc::now();
     // Submitted long before the window opens, filed inside it.
@@ -289,7 +256,7 @@ async fn the_filed_window_follows_when_the_work_was_handed_over() {
         "窗口要跟着「活交出去的时刻」，不是「提交的时刻」"
     );
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// The filed read is oldest filing first, so the reader's order is the order the
@@ -298,7 +265,7 @@ async fn the_filed_window_follows_when_the_work_was_handed_over() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn filed_submissions_come_back_in_the_order_they_were_handed_over() {
     let case = "filed_order";
-    let (_pool, store) = probe(case).await;
+    let (_pool, store, schema) = probe(case).await;
 
     let now = Utc::now();
     // Submitted newest-first, so an implementation ordering by submission would
@@ -326,7 +293,7 @@ async fn filed_submissions_come_back_in_the_order_they_were_handed_over() {
         .collect();
     assert_eq!(subjects, vec!["filed first", "filed second"]);
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// A re-sent submission keeps the first one's words. The submitter is answered
@@ -336,7 +303,7 @@ async fn filed_submissions_come_back_in_the_order_they_were_handed_over() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn re_submitting_the_same_id_keeps_the_first_words() {
     let case = "resend";
-    let (_pool, store) = probe(case).await;
+    let (_pool, store, schema) = probe(case).await;
 
     let first = submission("which retry policy", Utc::now());
     let mut second = first.clone();
@@ -348,7 +315,7 @@ async fn re_submitting_the_same_id_keeps_the_first_words() {
     assert_eq!(pending.len(), 1, "one id is one submission");
     assert_eq!(pending[0].intent.payload, first.payload);
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// Oldest first, and the cap counts the rows handed over rather than the rows
@@ -357,7 +324,7 @@ async fn re_submitting_the_same_id_keeps_the_first_words() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn pending_submissions_come_back_oldest_first_within_the_cap() {
     let case = "pending_cap";
-    let (_pool, store) = probe(case).await;
+    let (_pool, store, schema) = probe(case).await;
 
     let now = Utc::now();
     // Submitted out of order, so an implementation ordering by insertion would
@@ -377,7 +344,7 @@ async fn pending_submissions_come_back_oldest_first_within_the_cap() {
     assert_eq!(capped.len(), 1);
     assert_eq!(capped[0].intent.subject, "oldest");
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// A payload that no longer parses is one unreadable row, not a failed batch:
@@ -387,7 +354,7 @@ async fn pending_submissions_come_back_oldest_first_within_the_cap() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn an_unreadable_payload_does_not_take_the_rest_of_the_batch_with_it() {
     let case = "unreadable_payload";
-    let (pool, store) = probe(case).await;
+    let (pool, store, schema) = probe(case).await;
 
     let readable = submission("readable", Utc::now());
     store.submit(&readable).await.unwrap();
@@ -411,7 +378,7 @@ async fn an_unreadable_payload_does_not_take_the_rest_of_the_batch_with_it() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].intent.id, readable.id);
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// The verdict vocabulary crosses the storage boundary as its own tag, not as
@@ -421,7 +388,7 @@ async fn an_unreadable_payload_does_not_take_the_rest_of_the_batch_with_it() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn each_kind_comes_back_as_the_kind_it_was_submitted_as() {
     let case = "kind_roundtrip";
-    let (_pool, store) = probe(case).await;
+    let (_pool, store, schema) = probe(case).await;
 
     let now = Utc::now();
     let verdict = TasteIntent {
@@ -447,7 +414,7 @@ async fn each_kind_comes_back_as_the_kind_it_was_submitted_as() {
     assert_eq!(pending[1].intent.payload, preference.payload);
     assert_eq!(pending[1].intent.payload.kind(), "direction_preference");
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// The material a judgement was made against survives the round trip, on the
@@ -461,7 +428,7 @@ async fn each_kind_comes_back_as_the_kind_it_was_submitted_as() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_submission_keeps_the_material_it_named() {
     let case = "material_roundtrip";
-    let (_pool, store) = probe(case).await;
+    let (_pool, store, schema) = probe(case).await;
 
     let mut submitted = submission("which retry policy", Utc::now());
     submitted.evidence_refs = vec![
@@ -478,7 +445,7 @@ async fn a_submission_keeps_the_material_it_named() {
     );
     assert_eq!(pending[0].intent, submitted);
 
-    done(case).await;
+    done(&schema).await;
 }
 
 /// A table that predates the column is brought forward by the same call that
@@ -493,7 +460,7 @@ async fn a_submission_keeps_the_material_it_named() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_row_from_before_the_column_reads_back_without_materials() {
     let case = "pre_column_row";
-    let (pool, store) = probe(case).await;
+    let (pool, store, schema) = probe(case).await;
 
     // Take the table back to the shape it had before the column, then let the
     // store bring it forward the way a rollout would.
@@ -529,5 +496,5 @@ async fn a_row_from_before_the_column_reads_back_without_materials() {
         "a row that named no material must read as having named none"
     );
 
-    done(case).await;
+    done(&schema).await;
 }

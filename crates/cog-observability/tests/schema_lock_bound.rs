@@ -27,58 +27,17 @@
 //! Every run works inside its own schema and drops it at the end, so the
 //! statements' unqualified table name cannot reach a table another run uses.
 
-use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{Connection, PgConnection, PgPool};
+use sqlx::PgPool;
 
 use cog_observability::analytics::PostgresAnalyticsBackend;
 
-use cog_test_support::database_url;
-
-async fn schema_pool(url: &str, schema: &str) -> PgPool {
-    let options = PgConnectOptions::from_str(url)
-        .expect("the test database URL parses")
-        .options([("search_path", schema)]);
-    PgPoolOptions::new()
-        .max_connections(6)
-        .connect_with(options)
-        .await
-        .expect("the throwaway database is reachable")
-}
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
 
 /// Open a schema of this run's own and hand back its name.
-async fn own_schema(url: &str) -> String {
-    let schema = format!("schemabound_{}", std::process::id());
-    let schema = format!(
-        "{schema}_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    );
-    let mut admin = PgConnection::connect(url)
-        .await
-        .expect("the throwaway database is reachable");
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&mut admin)
-        .await
-        .expect("the probe schema is created");
-    schema
-}
-
-async fn drop_schema(url: &str, schema: &str) {
-    if let Ok(mut admin) = PgConnection::connect(url).await {
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-            .execute(&mut admin)
-            .await
-            .ok();
-    }
-}
-
 /// Hold a write open on `table` until `stop` is raised, then roll back.
 ///
 /// A write, not a read: the statements this crate runs at startup create
@@ -136,8 +95,8 @@ fn release_after(stop: Arc<AtomicBool>, after: Duration) {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_store_schema_names_the_table_it_could_not_lock_instead_of_hanging() {
     let url = database_url();
-    let schema = own_schema(&url).await;
-    let pool = schema_pool(&url, &schema).await;
+    let schema = own_schema(&url, "schemabound").await;
+    let pool = schema_pool_with(&url, &schema, 6).await;
     let table = "events_probe";
     let store = PostgresAnalyticsBackend::new(pool.clone()).with_table(table);
     store
@@ -183,8 +142,8 @@ async fn a_store_schema_names_the_table_it_could_not_lock_instead_of_hanging() {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_store_schema_takes_its_lock_once_the_writer_commits() {
     let url = database_url();
-    let schema = own_schema(&url).await;
-    let pool = schema_pool(&url, &schema).await;
+    let schema = own_schema(&url, "schemabound").await;
+    let pool = schema_pool_with(&url, &schema, 6).await;
     let table = "events_probe";
     let store = PostgresAnalyticsBackend::new(pool.clone()).with_table(table);
     store

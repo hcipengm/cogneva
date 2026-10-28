@@ -27,16 +27,14 @@
 //! the sweep is never pointed at a renamed table and the shared database's own
 //! `cog_events` is never in reach.
 
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use cog_storage::TaskEventRetention;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
-use cog_test_support::database_url;
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
 
 /// One case's own schema, holding the two tables the sweep reads.
 struct Scratch {
@@ -45,33 +43,14 @@ struct Scratch {
 
 impl Scratch {
     async fn new(case: &str) -> Self {
-        // The schema name carries the process and the case, so two runs of this
-        // suite do not drop each other's tables mid-test.
-        let schema = format!("probe_task_events_{case}_{}", std::process::id());
-        let setup = PgPool::connect(&database_url())
-            .await
-            .expect("connect to the test database");
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-            .execute(&setup)
-            .await
-            .expect("clear a schema left by an earlier run");
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&setup)
-            .await
-            .expect("create the case's schema");
-        setup.close().await;
+        let schema = own_schema(&database_url(), &format!("probe_task_events_{case}")).await;
         Self { schema }
     }
 
     /// A pool whose search path is this case's schema alone, so the sweep's
     /// unqualified table names land there and nowhere else.
-    fn pool(&self) -> PgPool {
-        let options = PgConnectOptions::from_str(&database_url())
-            .expect("COGNEVA_TEST_DATABASE_URL is not a PostgreSQL URL")
-            .options([("search_path", self.schema.as_str())]);
-        PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy_with(options)
+    async fn pool(&self) -> PgPool {
+        schema_pool_with(&database_url(), &self.schema, 2).await
     }
 
     /// Append one event to a task's stream, `age` before now.
@@ -128,14 +107,7 @@ impl Scratch {
     }
 
     async fn done(&self) {
-        let pool = PgPool::connect(&database_url())
-            .await
-            .expect("connect to the test database");
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema))
-            .execute(&pool)
-            .await
-            .expect("drop the case's schema");
-        pool.close().await;
+        drop_schema(&database_url(), &self.schema).await;
     }
 }
 
@@ -147,7 +119,7 @@ impl Scratch {
 /// be a statement about this file.
 async fn scratch(case: &str) -> (Scratch, PgPool) {
     let scratch = Scratch::new(case).await;
-    let pool = scratch.pool();
+    let pool = scratch.pool().await;
     // The store's own schema, not a copy of it: a hand-written pair of tables
     // would let this suite pass against an index production never declares, and
     // the sweep's candidate query is only cheap because that index exists.

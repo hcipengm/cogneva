@@ -44,7 +44,7 @@ use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore, LEDGER_TABLE
 /// can never touch a row it did not write.
 const PROBE_MODEL: &str = "verdict-probe-model";
 
-use cog_test_support::database_url;
+use cog_test_support::{database_url, drop_schema, own_schema};
 
 /// A schema of this test's own, reached by putting `search_path` in the URL.
 ///
@@ -63,19 +63,10 @@ struct Probe {
 }
 
 impl Probe {
-    /// Connect to `schema`, recreated empty, with every store URL pointed at it.
-    async fn open(schema: &str) -> Self {
+    /// Connect to a schema of this run's own, with every store URL pointed at it.
+    async fn open(label: &str) -> Self {
         let base = database_url();
-        let admin = PgPool::connect(&base).await.expect("connecting");
-        for statement in [
-            format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
-            format!("CREATE SCHEMA {schema}"),
-        ] {
-            sqlx::query(&statement)
-                .execute(&admin)
-                .await
-                .expect("preparing the probe schema");
-        }
+        let schema = own_schema(&base, label).await;
         let sep = if base.contains('?') { '&' } else { '?' };
         let url = format!("{base}{sep}options=-csearch_path%3D{schema}");
         // One connection proves the option was taken: a server that ignored it
@@ -100,12 +91,7 @@ impl Probe {
 
     /// Leave nothing behind: the schema goes with everything in it.
     async fn close(self) {
-        let base = database_url();
-        let admin = PgPool::connect(&base).await.expect("connecting");
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema))
-            .execute(&admin)
-            .await
-            .expect("dropping the probe schema");
+        drop_schema(&database_url(), &self.schema).await;
     }
 }
 

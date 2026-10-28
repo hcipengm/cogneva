@@ -20,23 +20,9 @@
 //! Every run gets its own schema and drops it at the end, so the statements'
 //! unqualified `alerts` name cannot reach a table another run is using.
 
-use std::str::FromStr;
-
-use sqlx::postgres::PgConnectOptions;
-use sqlx::{Connection, PgConnection, PgPool};
-
 use cog_observability::alert_store::{AlertTransition, NewAlert, PostgresAlertStore};
 
-use cog_test_support::database_url;
-
-async fn schema_pool(url: &str, schema: &str) -> PgPool {
-    let options = PgConnectOptions::from_str(url)
-        .expect("the test database URL parses")
-        .options([("search_path", schema)]);
-    PgPool::connect_with(options)
-        .await
-        .expect("the throwaway database is reachable")
-}
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 
 fn probe_alert() -> NewAlert {
     NewAlert {
@@ -52,15 +38,7 @@ fn probe_alert() -> NewAlert {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn the_mark_lands_and_a_new_episode_clears_it() {
     let url = database_url();
-    let schema = format!("alert_schema_{}", uuid::Uuid::new_v4().simple());
-
-    let mut admin = PgConnection::connect(&url)
-        .await
-        .expect("the throwaway database is reachable");
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&mut admin)
-        .await
-        .expect("the probe schema is created");
+    let schema = own_schema(&url, "alert_schema").await;
 
     let pool = schema_pool(&url, &schema).await;
     // The table as it stood before the mark existed. Replaying the DDL against
@@ -174,8 +152,5 @@ async fn the_mark_lands_and_a_new_episode_clears_it() {
     );
 
     pool.close().await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&mut admin)
-        .await
-        .expect("the probe schema is dropped");
+    drop_schema(&url, &schema).await;
 }

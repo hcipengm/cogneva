@@ -1960,6 +1960,9 @@ dependencies = [
 [[package]]
 name = "cog-test-support"
 version = "0.5.10"
+dependencies = [
+ "sqlx",
+]
 
 [[package]]
 name = "cog-wiki"

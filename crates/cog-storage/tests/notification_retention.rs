@@ -21,28 +21,14 @@
 //! `search_path` is what keeps this run's rows away from any other table that
 //! happens to have those names.
 
-use std::str::FromStr;
-
 use chrono::{Duration, Utc};
-use sqlx::postgres::PgConnectOptions;
-use sqlx::{Connection, PgConnection, PgPool};
 
 use cog_core::{Notification, NotificationStore, NotificationType};
 use cog_storage::PostgresNotificationStore;
 
 const KEEP_DAYS: i64 = 90;
 
-use cog_test_support::database_url;
-
-/// A pool whose every connection resolves unqualified names inside `schema`.
-async fn schema_pool(url: &str, schema: &str) -> PgPool {
-    let options = PgConnectOptions::from_str(url)
-        .expect("the test database URL parses")
-        .options([("search_path", schema)]);
-    PgPool::connect_with(options)
-        .await
-        .expect("the throwaway database is reachable")
-}
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 
 /// One notification for `user`, `age_days` old, already read or not.
 fn notification_for(user: &str, age_days: i64, read: bool) -> Notification {
@@ -63,15 +49,7 @@ fn notification_for(user: &str, age_days: i64, read: bool) -> Notification {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn read_rows_expire_and_unread_rows_do_not() {
     let url = database_url();
-    let schema = format!("notification_retention_{}", uuid::Uuid::new_v4().simple());
-
-    let mut admin = PgConnection::connect(&url)
-        .await
-        .expect("the throwaway database is reachable");
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&mut admin)
-        .await
-        .expect("the probe schema is created");
+    let schema = own_schema(&url, "notification_retention").await;
 
     let pool = schema_pool(&url, &schema).await;
     // The notifications table carries a foreign key to the users table, so the
@@ -133,8 +111,5 @@ async fn read_rows_expire_and_unread_rows_do_not() {
     }
 
     pool.close().await;
-    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
-        .execute(&mut admin)
-        .await
-        .expect("the probe schema is dropped");
+    drop_schema(&url, &schema).await;
 }

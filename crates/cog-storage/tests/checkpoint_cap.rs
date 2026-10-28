@@ -27,17 +27,15 @@
 //! the sweep is never pointed at a renamed table and the shared database's own
 //! `cog_snapshots` is never in reach.
 
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use cog_storage::CheckpointCap;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
-use cog_test_support::database_url;
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
 
 /// One case's own schema, holding the two tables the sweep reads.
 struct Scratch {
@@ -46,31 +44,14 @@ struct Scratch {
 
 impl Scratch {
     async fn new(case: &str) -> Self {
-        let schema = format!("probe_checkpoint_cap_{case}");
-        let setup = PgPool::connect(&database_url())
-            .await
-            .expect("connect to the test database");
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-            .execute(&setup)
-            .await
-            .expect("clear a schema left by an earlier run");
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&setup)
-            .await
-            .expect("create the case's schema");
-        setup.close().await;
+        let schema = own_schema(&database_url(), &format!("probe_checkpoint_cap_{case}")).await;
         Self { schema }
     }
 
     /// A pool whose search path is this case's schema alone, so the store's
     /// unqualified table names land there and nowhere else.
-    fn pool(&self) -> PgPool {
-        let options = PgConnectOptions::from_str(&database_url())
-            .expect("COGNEVA_TEST_DATABASE_URL is not a PostgreSQL URL")
-            .options([("search_path", self.schema.as_str())]);
-        PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy_with(options)
+    async fn pool(&self) -> PgPool {
+        schema_pool_with(&database_url(), &self.schema, 2).await
     }
 
     /// Put one snapshot `age` before now.
@@ -115,14 +96,7 @@ impl Scratch {
     }
 
     async fn done(&self) {
-        let pool = PgPool::connect(&database_url())
-            .await
-            .expect("connect to the test database");
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema))
-            .execute(&pool)
-            .await
-            .expect("drop the case's schema");
-        pool.close().await;
+        drop_schema(&database_url(), &self.schema).await;
     }
 }
 
@@ -130,7 +104,7 @@ impl Scratch {
 /// ones in the columns it touches.
 async fn scratch(case: &str) -> (Scratch, PgPool) {
     let scratch = Scratch::new(case).await;
-    let pool = scratch.pool();
+    let pool = scratch.pool().await;
     // Two statements rather than one string: sqlx prepares what it is given,
     // and a prepared statement carries exactly one command.
     for ddl in [
@@ -379,7 +353,7 @@ async fn a_pass_with_pruning_off_deletes_nothing() {
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn the_startup_schema_holds_board_values_past_a_btree_entry() {
     let scratch = Scratch::new("long_board_value").await;
-    let pool = scratch.pool();
+    let pool = scratch.pool().await;
     for ddl in [
         "CREATE TABLE cog_snapshots (
              snapshot_id TEXT PRIMARY KEY,

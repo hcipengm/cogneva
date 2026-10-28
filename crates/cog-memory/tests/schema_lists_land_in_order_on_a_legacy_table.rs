@@ -25,50 +25,9 @@
 //! Every run works inside its own schema and drops it, so the statements'
 //! unqualified table name cannot reach a table another run uses.
 
-use std::str::FromStr;
-
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
-use sqlx::{Connection, PgConnection, PgPool};
-
 use cog_memory::{PostgresEntryStore, PostgresSchemaBackend};
 
-use cog_test_support::database_url;
-
-async fn own_schema(url: &str) -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let schema = format!("memorder_{}_{nanos}", std::process::id());
-    let mut admin = PgConnection::connect(url)
-        .await
-        .expect("the throwaway database is reachable");
-    sqlx::query(&format!("CREATE SCHEMA {schema}"))
-        .execute(&mut admin)
-        .await
-        .expect("the probe schema is created");
-    schema
-}
-
-async fn schema_pool(url: &str, schema: &str) -> PgPool {
-    let options = PgConnectOptions::from_str(url)
-        .expect("the test database URL parses")
-        .options([("search_path", schema)]);
-    PgPoolOptions::new()
-        .max_connections(4)
-        .connect_with(options)
-        .await
-        .expect("the throwaway database is reachable")
-}
-
-async fn drop_schema(url: &str, schema: &str) {
-    if let Ok(mut admin) = PgConnection::connect(url).await {
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-            .execute(&mut admin)
-            .await
-            .ok();
-    }
-}
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
 
 /// The table as it stood before `observed_by`, `first_seen` and `last_seen`
 /// meant anything: the two timestamps are there but empty, and the observer
@@ -98,8 +57,8 @@ VALUES ('old', 'file', 'old', 'old', 'src/old.rs', 'v1');
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn the_lists_fill_a_table_that_predates_its_columns_and_are_safe_to_repeat() {
     let url = database_url();
-    let schema = own_schema(&url).await;
-    let pool = schema_pool(&url, &schema).await;
+    let schema = own_schema(&url, "memorder").await;
+    let pool = schema_pool_with(&url, &schema, 4).await;
 
     sqlx::raw_sql(LEGACY_SCHEMA_ENTRIES)
         .execute(&pool)
@@ -159,8 +118,8 @@ async fn the_lists_fill_a_table_that_predates_its_columns_and_are_safe_to_repeat
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn the_summary_store_also_writes_its_rows_outside_the_shape() {
     let url = database_url();
-    let schema = own_schema(&url).await;
-    let pool = schema_pool(&url, &schema).await;
+    let schema = own_schema(&url, "memorder").await;
+    let pool = schema_pool_with(&url, &schema, 4).await;
 
     PostgresEntryStore::from_pool(pool.clone())
         .init_table()

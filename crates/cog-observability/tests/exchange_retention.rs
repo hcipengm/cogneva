@@ -42,15 +42,11 @@ struct Scratch {
 
 impl Scratch {
     async fn new(pool: PgPool) -> Self {
-        let schema = format!("exchange_retention_test_{}", uuid::Uuid::new_v4().simple());
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
-            .execute(&pool)
-            .await
-            .expect("a leftover schema from an earlier run must be removable");
-        sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
-            .execute(&pool)
-            .await
-            .expect("the scratch schema must be creatable");
+        let schema = cog_test_support::own_schema(
+            &cog_test_support::database_url(),
+            "exchange_retention_test",
+        )
+        .await;
         sqlx::query(&format!(
             "CREATE TABLE \"{schema}\".gateway_llm_exchange (
                  id BIGSERIAL PRIMARY KEY,
@@ -72,13 +68,7 @@ impl Scratch {
     }
 
     async fn done(self) {
-        sqlx::query(&format!(
-            "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
-            self.schema
-        ))
-        .execute(&self.pool)
-        .await
-        .expect("the scratch schema must be droppable");
+        cog_test_support::drop_schema(&cog_test_support::database_url(), &self.schema).await;
     }
 }
 

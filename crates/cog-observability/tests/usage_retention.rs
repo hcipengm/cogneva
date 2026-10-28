@@ -25,16 +25,14 @@
 //!   cargo test -p cog-observability --test usage_retention -- --ignored
 //! ```
 
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use cog_observability::usage_retention::UsageRetention;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
-use cog_test_support::database_url;
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
 
 /// One case's own schema, holding the ledger and the fold.
 struct Scratch {
@@ -43,33 +41,14 @@ struct Scratch {
 
 impl Scratch {
     async fn new(case: &str) -> Self {
-        // The name carries the process and the case, so two runs do not drop
-        // each other's tables mid-test.
-        let schema = format!("probe_usage_{case}_{}", std::process::id());
-        let setup = PgPool::connect(&database_url())
-            .await
-            .expect("connect to the test database");
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-            .execute(&setup)
-            .await
-            .expect("clear a schema left by an earlier run");
-        sqlx::query(&format!("CREATE SCHEMA {schema}"))
-            .execute(&setup)
-            .await
-            .expect("create the case's schema");
-        setup.close().await;
+        let schema = own_schema(&database_url(), &format!("probe_usage_{case}")).await;
         Self { schema }
     }
 
     /// A pool whose search path is this case's schema alone, so the sweep's
     /// unqualified table names land there and nowhere else.
-    fn pool(&self) -> PgPool {
-        let options = PgConnectOptions::from_str(&database_url())
-            .expect("COGNEVA_TEST_DATABASE_URL is not a PostgreSQL URL")
-            .options([("search_path", self.schema.as_str())]);
-        PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy_with(options)
+    async fn pool(&self) -> PgPool {
+        schema_pool_with(&database_url(), &self.schema, 2).await
     }
 
     /// One call in the ledger, `age` before now.
@@ -129,14 +108,7 @@ impl Scratch {
     }
 
     async fn done(&self) {
-        let pool = PgPool::connect(&database_url())
-            .await
-            .expect("connect to the test database");
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS {} CASCADE", self.schema))
-            .execute(&pool)
-            .await
-            .expect("drop the case's schema");
-        pool.close().await;
+        drop_schema(&database_url(), &self.schema).await;
     }
 }
 
@@ -147,7 +119,7 @@ impl Scratch {
 /// statements name columns a subset would not have.
 async fn scratch(case: &str) -> (Scratch, PgPool) {
     let scratch = Scratch::new(case).await;
-    let pool = scratch.pool();
+    let pool = scratch.pool().await;
     sqlx::raw_sql(&cog_observability::usage_store::ddl())
         .execute(&pool)
         .await

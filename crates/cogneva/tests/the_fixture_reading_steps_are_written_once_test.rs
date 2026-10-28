@@ -136,10 +136,14 @@ const SUPPORT_HOME: &str = "crates/cog-test-support/src/lib.rs";
 /// 它挡的是上一族留下的那种空转：`support_copies` 判的是「夹具里没有第二份」，而一份
 /// 定义被删空的支撑 crate 让这条判据永远成立——判据只证明了「别处没有」，没证明「这里
 /// 有」。
-const SUPPORT_ENTRY_POINTS: [&str; 3] = [
+const SUPPORT_ENTRY_POINTS: [&str; 7] = [
     "pub fn database_url()",
     "pub fn redis_url()",
     "pub fn redis_url_required()",
+    "pub async fn own_schema(",
+    "pub async fn drop_schema(",
+    "pub async fn schema_pool(",
+    "pub async fn schema_pool_with(",
 ];
 
 /// 支撑 crate 负责的那两个环境变量：`crates/` 里除了 `SUPPORT_HOME`，不许再有一处代码
@@ -147,7 +151,7 @@ const SUPPORT_ENTRY_POINTS: [&str; 3] = [
 /// 红：`env::var` 读一个没人设置的名字，与「本来就没配」在调用点上完全同形。
 const SUPPORT_ENV_NAMES: [&str; 2] = ["COGNEVA_TEST_DATABASE_URL", "COGNEVA_TEST_REDIS_URL"];
 
-/// 够到支撑 crate 的调用点下限。今天 70 处。这一面判的是「没有第二处在读」，把调用点
+/// 够到支撑 crate 的调用点下限。今天 69 处。这一面判的是「没有第二处在读」，把调用点
 /// 全删了它也一样绿，所以另一头要有底：这些人真的在用那个 crate。
 const MIN_SUPPORT_CALLSITES: usize = 60;
 
@@ -415,6 +419,9 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         for form in [
             "cog_test_support::database_url",
             "cog_test_support::redis_url",
+            "cog_test_support::own_schema",
+            "cog_test_support::drop_schema",
+            "cog_test_support::schema_pool",
         ] {
             support_callsites += text.matches(form).count();
         }
