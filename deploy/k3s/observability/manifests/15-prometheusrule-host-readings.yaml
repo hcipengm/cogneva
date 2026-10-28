@@ -690,6 +690,31 @@ spec:
             summary: "有 {{ $value }} 面的第一条读数没有任何读者"
             description: "面表（`scripts/data/faces.tsv`）第 10 列点名的那条序列，在公开仓 `deploy/`、`crates/`、`scripts/`、`.github/` 与宿主 `scripts/` 里一处都没有被点名——没有规则读它，没有面板画它，没有代码按它取值。逐面点名读 `face_first_reading_consumer{face=…} == 0`，跑 `bash scripts/host/cogneva-face-first-reading-consumers-reading.sh` 会连同它属于哪个生产者一起印出来。修法只有两种：给这条序列立一个会做决定的读者（一条规则、一块面板、或按它取值的代码），或者把这一面的第一读数换成一条真有读者的读数——换哪一种都要改面表那一格。**不许**用「在注释里提一句」「在登记表里写一遍」充数：那两种都不算读者，普查已经把它们排掉了。"
 
+        # 构建闸管的是**发数**与**每发多宽**，但只管得住走 `cogneva-build.sh` 的那些。
+        # 会话里直接起的一发不取槽、不受宽度约束，却和闸里的构建抢同一批核；闸的水位只
+        # 数得到闸里的，于是「这台机器被谁压着」在任何读数上都没有答案。2026-10-28 实测
+        # 就是这么过的：闸自报 2 发在跑，宿主上另有直接起在会话里的 `cargo test`，load1 到
+        # 37（24 核）。
+        #
+        # 为什么判据是两半同时成立：只有「存在闸外的构建」几乎常亮——人工跑一次 cargo 就是，
+        # 那不是事故。它成为事件的时刻是宿主**已经开始不够用**（load1 超过核数的一半，界在
+        # 生产者里，不在这条规则里写死），而闸外那一发还在跑。那时修法是确定的：把它挪进闸，
+        # 或者等它跑完再起别的。
+        #
+        # 为什么留 30 分钟：短命的一发（几分钟的 `cargo check`）撞上忙碌时段是常态，喊它只是
+        # 把常亮换成一个更长的常亮。半小时还在跑的闸外构建，已经和闸里的构建抢了半小时的核，
+        # 而它自己不会因此停下来。
+        - alert: CognevaBuildOutsideTheGate
+          expr: max(build_containment_saturated_uncontained) == 1
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "资源管理"
+            severity: warning
+          annotations:
+            summary: "宿主已被压着，而构建闸外还有 {{ $value }} 发构建在跑"
+            description: "宿主上跑那条 containment 读数（脚本名 `cogneva-host-build-containment-reading.sh`，不在本仓，在值守用的另一棵树里，以 cogneva 用户跑）看两件事：`build_containment_builds{containment=\"outside\"}` 是闸外几发，`build_containment_outside_names` 把每一发往上走到底的那条父链点出来——`systemd<tmux: server<claude<bash<timeout<cargo` 这样的链就是「某个会话里直接敲的」。修法二选一：那一发改用同一棵树里的构建闸包装 `cogneva-build.sh cargo …` 起（取槽、按界分宽度），或者等它跑完再起闸里的活。**不要**抬闸的界——闸外的构建根本不看那个界。"
+
         # 任务面的两个发布者对不上：同一批任务，两条路径报出来的状态不同。判据是它们
         # 应当一致（同一份正本的两个投影），所以不一致本身就是缺陷，不需要等某个阈值。
         - alert: CognevaTasksPublishersDisagree
