@@ -18,7 +18,9 @@
 #     for: a `.md` path inside code (a string the program means, not a citation)
 #     and an external standard (`RFC 7230 §4.1` -- a document the reader can
 #     obtain, and the only way to cite the grammar a wire format follows);
-#   - one clean file to keep the fixtures from being green for the wrong reason.
+#   - one clean file to keep the fixtures from being green for the wrong reason;
+#   - one path the checker cannot read at all, which must be red: a failed read
+#     hands back zero hits, the same output a clean file gives.
 # Every fixture is a real file with a real extension handed to the checker by
 # path, so what is exercised is the reading, not a stub.
 set -euo pipefail
@@ -71,6 +73,17 @@ expect md_path_in_code 0 'fn main() {
 expect external_standard 0 'fn main() {
     /// 分块传输的解码（RFC 7230 §4.1）
 }'
+
+# A path the checker cannot read is not a clean file. The read discards its own
+# failures unless they are asked for, and the discarded failure hands back zero
+# hits -- the same output a clean file gives. A directory is unreadable for
+# every caller, so this case does not depend on who runs the test.
+mkdir -p "${work}/not-a-file"
+if out="$("${checker}" "${work}/not-a-file" 2>&1)"; then
+  fail "读不动的路径应当红，实际绿：${out}"
+fi
+printf '%s' "${out}" | grep -q '读不出这些文件' \
+  || fail "红的时候要说清是读不出来，不是有引用：${out}"
 
 # The default path -- the one CI runs -- must be green on the tree itself, and it
 # has to read something: an empty file set would make the check pass by reading

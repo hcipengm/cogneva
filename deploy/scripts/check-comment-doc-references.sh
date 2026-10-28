@@ -51,8 +51,19 @@ else
 fi
 [ "${#files[@]}" -gt 0 ] || fail "no Rust source to read"
 
+# 读不出来不是「没有引用」：这一条判的是命中的存在，而一个读不出的文件交出来的
+# 是零命中——与「这个文件干净」在输出上完全同形。所以先把 grep 自己的退出码收下：
+# 大于 1 是它读不动（权限、路径是目录、名字不存在），按红算；退出码 1 才是「没有
+# 命中」，那正是这条门要找的绿。
+comment_lines=""
+grep_status=0
+comment_lines="$(grep -nH -E '^[[:space:]]*(//|/\*|\*)' "${files[@]}" 2>&1)" || grep_status=$?
+if [ "${grep_status}" -gt 1 ]; then
+  fail "读不出这些文件（grep 退出 ${grep_status}）：${comment_lines}——没读到就判不了「有没有引用」"
+fi
+
 hits="$(
-  grep -nH -E '^[[:space:]]*(//|/\*|\*)' "${files[@]}" 2>/dev/null \
+  printf '%s\n' "${comment_lines}" \
     | sed -E 's@\b(RFC|ISO|IEEE|ECMA)[ -]?[0-9A-Za-z._-]*[[:space:]]*§[0-9A-Za-z._-]*@ @g' \
     | grep -E 'internal-docs|[0-9]{4}-[0-9]{2}-[0-9]{2}_[^ ]*\.md|§' || true
 )"
