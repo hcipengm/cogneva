@@ -71,6 +71,18 @@ fn pause_before(attempt: u32) -> Duration {
 /// SQLSTATE `lock_not_available`, which is what a `lock_timeout` expiry raises.
 const LOCK_NOT_AVAILABLE: &str = "55P03";
 
+/// The name an attempt gives its session for as long as it runs, so the
+/// relations it is waiting on can be read out of `pg_locks` without guessing
+/// which of the pool's sessions is ours.
+///
+/// Without it the sampler has to decide by lock mode, and the mode is exactly
+/// what differs between two statements that stall the same way: an `ALTER`
+/// waits for ACCESS EXCLUSIVE, a `CREATE INDEX` for ShareLock, and a sampler
+/// written for one of them reports "nothing was waiting" for the other.
+fn attempt_tag(attempt: u32) -> String {
+    format!("cog_ddl_{}_{}", std::process::id(), attempt)
+}
+
 /// Run one store's schema. The text may hold several statements; the driver's
 /// simple-query path is what makes that legal, and it is also why this is not
 /// a prepared statement.
@@ -98,7 +110,7 @@ pub async fn apply(pool: &PgPool, schema: &str) -> SFResult<()> {
                 Attempt::Failed(message) => Err(SFError::Database(message)),
             };
         }
-        match attempt_once(pool, schema).await {
+        match attempt_once(pool, schema, &attempt_tag(attempt)).await {
             Attempt::Ok => return Ok(()),
             Attempt::LockWait(_) => tokio::time::sleep(pause_before(attempt)).await,
             Attempt::Failed(message) => return Err(SFError::Database(message)),
@@ -117,8 +129,8 @@ enum Attempt {
     Failed(String),
 }
 
-async fn attempt_once(pool: &PgPool, schema: &str) -> Attempt {
-    match apply_once(pool, schema).await {
+async fn attempt_once(pool: &PgPool, schema: &str, tag: &str) -> Attempt {
+    match apply_once(pool, schema, tag).await {
         Ok(()) => Attempt::Ok,
         Err(e) if is_lock_wait_expiry(&e) => Attempt::LockWait(e),
         Err(e) => Attempt::Failed(e.to_string()),
@@ -133,15 +145,19 @@ async fn attempt_once(pool: &PgPool, schema: &str) -> Attempt {
 /// and it is the answer an operator needs: which table is being held, not
 /// merely that something was.
 async fn watched_attempt(pool: &PgPool, schema: &str) -> (Attempt, Vec<String>) {
+    // `watched_attempt` is only ever the last attempt, so the tag its worker
+    // uses is the one the caller's loop would have given that attempt.
+    let tag = attempt_tag(ATTEMPTS);
     let worker = {
         let pool = pool.clone();
         let schema = schema.to_string();
-        tokio::spawn(async move { attempt_once(&pool, &schema).await })
+        let tag = tag.clone();
+        tokio::spawn(async move { attempt_once(&pool, &schema, &tag).await })
     };
 
     let mut waited_on: Vec<String> = Vec::new();
     while !worker.is_finished() {
-        for relation in unheld_access_exclusive(pool).await {
+        for relation in unheld_locks(&tag, pool).await {
             if !waited_on.contains(&relation) {
                 waited_on.push(relation);
             }
@@ -156,16 +172,23 @@ async fn watched_attempt(pool: &PgPool, schema: &str) -> (Attempt, Vec<String>) 
     (outcome, waited_on)
 }
 
-/// The relations an ACCESS EXCLUSIVE request is currently queued on, which --
-/// during one of this module's attempts -- is the relation it is waiting for.
-async fn unheld_access_exclusive(pool: &PgPool) -> Vec<String> {
+/// The relations the tagged attempt is currently queued on -- which, while it
+/// is running, is what it is waiting for.
+///
+/// The filter is the session tag rather than a lock mode, so whatever the
+/// statement asked for is what comes back; and it is the tag rather than "any
+/// ungranted request in the database", so a relation another transaction is
+/// stuck on cannot be reported as this one's.
+async fn unheld_locks(tag: &str, pool: &PgPool) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT coalesce(c.relname, 'a lock on a dropped relation')
            FROM pg_locks l
+           JOIN pg_stat_activity a ON a.pid = l.pid
            LEFT JOIN pg_class c ON c.oid = l.relation
-          WHERE l.mode = 'AccessExclusiveLock' AND NOT l.granted
+          WHERE NOT l.granted AND a.application_name = $1
           LIMIT 3",
     )
+    .bind(tag)
     .fetch_all(pool)
     .await
     .unwrap_or_default()
@@ -180,7 +203,7 @@ pub async fn apply_all(pool: &PgPool, schemas: &[&str]) -> SFResult<()> {
     Ok(())
 }
 
-async fn apply_once(pool: &PgPool, schema: &str) -> Result<(), sqlx::Error> {
+async fn apply_once(pool: &PgPool, schema: &str, tag: &str) -> Result<(), sqlx::Error> {
     // `SET LOCAL` goes first in the same message, and no `BEGIN` is written:
     // a multi-statement simple query is already one implicit transaction, so
     // the wait is scoped to this statement list and cannot follow the
@@ -198,7 +221,14 @@ async fn apply_once(pool: &PgPool, schema: &str) -> Result<(), sqlx::Error> {
     //
     // The duration is interpolated rather than bound because `SET` takes no
     // parameters, and it is a constant, not anything a caller supplies.
-    let text = format!("SET LOCAL lock_timeout = '{LOCK_WAIT}';\n{schema}");
+    //
+    // `application_name` is set the same way and for the same reason: scoped to
+    // this statement list, gone before the connection returns to the pool, and
+    // visible in `pg_stat_activity` while the statement is waiting, which is
+    // the only window in which the relation it is stuck on can be read.
+    let text = format!(
+        "SET LOCAL lock_timeout = '{LOCK_WAIT}';\nSET LOCAL application_name = '{tag}';\n{schema}"
+    );
     sqlx::raw_sql(&text).execute(pool).await?;
     Ok(())
 }

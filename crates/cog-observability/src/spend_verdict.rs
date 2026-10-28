@@ -532,7 +532,9 @@ impl SpendVerdictStore {
     }
 
     pub async fn init_schema(&self) -> anyhow::Result<()> {
-        sqlx::raw_sql(DDL).execute(&self.pool).await?;
+        cog_storage::schema_ddl::apply(&self.pool, DDL)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())
     }
 

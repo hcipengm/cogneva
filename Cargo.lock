@@ -1717,6 +1717,7 @@ dependencies = [
  "bytes",
  "chrono",
  "cog-core",
+ "cog-storage",
  "futures",
  "lettre",
  "libc",
