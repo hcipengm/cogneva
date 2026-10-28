@@ -310,6 +310,19 @@ def main():
 
     ledger, ledger_problems = subdir_ledger()
     census = census_subdirs(mount_path, args.live)
+    # 普查面读空了：四条来源（代码里 data_dir 拼出来的段、cogneva.json 里的路径、
+    # 渲染清单里的挂载、--live 的实盘）一条都没交回东西。这时未分类自然是空集，
+    # 判词与「每个子目录都已分类」一字不差——它绿了，却什么都没看。配置路径改了、
+    # 渲染物挂载换了名字、代码里 `data_dir.join` 换了写法，都会落在这里。
+    if not census:
+        print(
+            f"数据根子目录的普查面一条都没读到（代码 `data_dir` 的 join、"
+            f"cogneva.json 里的 {mount_path}/* 路径、渲染清单的挂载、--live 的实盘，"
+            "四条来源全空）。空普查与「每个子目录都已分类」在判词上同形——"
+            "两句都是「未分类 0 个」，所以这里判「没看成」而不是绿",
+            file=sys.stderr,
+        )
+        return 2
     unclassified = sorted(set(census) - set(ledger))
     stale = sorted(set(ledger) - set(census))
     if ledger_problems or unclassified:

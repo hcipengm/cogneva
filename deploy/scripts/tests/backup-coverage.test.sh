@@ -136,4 +136,22 @@ out="$(run_gate)" && fail "常量指向的未登记子目录应当红，实际�
 grep -q "const-tree" <<<"${out}" || fail "红时没有点名常量解析出来的目录：${out}"
 grep -q "NEW_SUBDIR" <<<"${out}" && fail "把常量名当成了目录名：${out}"
 
-echo "backup-coverage: 7 个用例全绿"
+# 8) 普查面四条来源全空：不许把「未分类 0 个」读成绿。
+# 反例按最坏的那种摆：claim 覆盖那一半本来就绿（挂载与备份都齐全），只是没有任何
+# 一处写着 `<数据根>/<段>`、代码里也没有 `data_dir.join(...)`。旧版此时印
+# 「普查 0 个，已分类 0 条 · 绿」并退 0——它一个子目录都没看见，却说都已分类。
+rm -rf "${work}/bare"
+mkdir -p "${work}/bare/deploy/rendered/k3s-single" \
+         "${work}/bare/deploy/helm/cogneva/files" \
+         "${work}/bare/deploy/scripts" "${work}/bare/crates/demo/src"
+cp "${repo}/deploy/scripts/check-backup-coverage.sh" "${work}/bare/deploy/scripts/"
+printf '# 空分类表\n' > "${work}/bare/${ledger}"
+printf '{}\n' > "${work}/bare/deploy/helm/cogneva/files/cogneva.json"
+: > "${work}/bare/crates/demo/src/lib.rs"
+cp "${work}/root/deploy/rendered/k3s-single/app.yaml" "${work}/bare/deploy/rendered/k3s-single/"
+cp "${work}/root/deploy/rendered/k3s-single/backup.yaml" "${work}/bare/deploy/rendered/k3s-single/"
+out="$(bash "${work}/bare/deploy/scripts/check-backup-coverage.sh" "${work}/bare" 2>&1)" \
+    && fail "普查面为空应当判「没看成」，实际绿：${out}"
+grep -q "普查面一条都没读到" <<<"${out}" || fail "红时没有说是普查面读空了：${out}"
+
+echo "backup-coverage: 8 个用例全绿"
