@@ -65,34 +65,60 @@ log() { printf '%s\n' "$*"; }
 
 hits=0
 
-# 报一条判据。参数：判据名；已经筛好的 `文件:行:内容` 行走 stdin。
-# 用进程替换而不是管道调用它：管道会把函数放进子壳，`hits` 的自增就丢了，
+# 报一条判据。参数：判据名、已经筛好的 `文件:行:内容` 行。
+# 不用进程替换 / 管道调用它：管道会把函数放进子壳，`hits` 的自增就丢了，
 # 于是门在有命中时仍然退出 0 —— 一条永远绿的门。
 report() {
-  local name="$1" body
-  body="$(cat)"
+  local name="$1" body="$2"
   [ -n "${body}" ] || return 0
   log "${name}："
   printf '%s\n' "${body}"
   hits=1
 }
 
-git_grep() { git -C "$ROOT" grep -n "$@" -- "${SCAN_PATHS[@]}" || true; }
+# 扫一次扫描面。**必须在父壳里调用**（命令替换而不是进程替换）：读失败时这里要
+# 能让整条门停下，而进程替换里的 `exit` 只结束那个子壳，父壳照旧往下走到「没有
+# 厂商身份面」。`git grep` 的 1 是「一条没中」，>1 才是「没扫成」——后者与前者
+# 在输出上完全同形，而这条门的每一条判据都只认命中。
+grep_lines() {
+  local status=0 out=""
+  out="$(git -C "$ROOT" grep -n "$@" -- "${SCAN_PATHS[@]}")" || status=$?
+  if [ "${status}" -gt 1 ]; then
+    log "LLM 平等门：扫描面读不出来（git grep 退出 ${status}）——没扫到与扫过且干净同形，这一跑什么都没证明"
+    exit 3
+  fi
+  [ -n "${out}" ] && printf '%s\n' "${out}"
+  return 0
+}
 
 main() {
+  # 扫描面本身要先数出来：路径都在而一个文件也没有时（`deploy/` 被搬走、检出是空的），
+  # 下面四条判据一条都不会命中，末句照样印「没有厂商身份面」。下限取 1 而不是今天的
+  # 457：这条门要能判一棵只有一份清单的夹具树，所以它只能说「至少扫了一份」。
+  local scanned
+  scanned="$(git -C "$ROOT" ls-files -- "${SCAN_PATHS[@]}" 2>/dev/null | wc -l)" || scanned=0
+  if [ "${scanned}" -lt 1 ]; then
+    log "LLM 平等门：扫描面（deploy/ 除 deploy/scripts、cogneva.example.json）里一个文件都没有读到——"
+    log "零个文件与「全都干净」在输出上同形，这一跑什么都没证明"
+    return 3
+  fi
+
   # 1. 厂商凭证 env 名。结构判据：不管厂商叫什么都拦得住。
   report "厂商凭证 env（<VENDOR>_API_KEY 形态的环境变量名）" \
-    < <(git_grep -E '[A-Z][A-Z0-9_]*_API_KEY')
+    "$(grep_lines -E '[A-Z][A-Z0-9_]*_API_KEY')"
 
   # 2. 非网关的 /v1 端点。先把 /v1 URL 抽出来（不带文件名就分不出哪一行），再筛掉网关。
-  report "非网关的 /v1 端点（业务侧只允许指 ${ALLOWED_ENDPOINT_HOST}）" \
-    < <(git_grep -HoE 'https?://[A-Za-z0-9._:-]+/v1' | grep -vE -- "://${ALLOWED_ENDPOINT_HOST}${ALLOWED_ENDPOINT_HOST_SEPARATORS}")
+  #    第二段 grep 的 1 是「筛完一个不剩」，那是正常结果，所以这里保留 `|| true`。
+  local v1_all v1_bad
+  v1_all="$(grep_lines -HoE 'https?://[A-Za-z0-9._:-]+/v1')"
+  v1_bad="$(printf '%s\n' "${v1_all}" | grep -vE -- "://${ALLOWED_ENDPOINT_HOST}${ALLOWED_ENDPOINT_HOST_SEPARATORS}" || true)"
+  report "非网关的 /v1 端点（业务侧只允许指 ${ALLOWED_ENDPOINT_HOST}）" "${v1_bad}"
 
   # 3. 厂商域名闭集。
-  report "厂商域名" < <(git_grep -iE "${VENDOR_DOMAINS}")
+  report "厂商域名" "$(grep_lines -iE "${VENDOR_DOMAINS}")"
 
   # 4. 厂商身份词闭集。
-  report "厂商身份词" < <(git_grep -iwE "${VENDOR_TOKENS}")
+  report "厂商身份词" "$(grep_lines -iwE "${VENDOR_TOKENS}")"
 
   if [ "${hits}" -ne 0 ]; then
     log ""
@@ -100,7 +126,7 @@ main() {
     log "（${ALLOWED_ENDPOINT_HOST} 后面的那一份），业务侧只声明协议方言。"
     return 1
   fi
-  log "LLM 平等门：业务侧清单/配置里没有厂商身份面（方言词 openai/anthropic 是协议名，不算）。"
+  log "LLM 平等门：业务侧清单/配置（${scanned} 个文件）里没有厂商身份面（方言词 openai/anthropic 是协议名，不算）。"
 }
 
 main

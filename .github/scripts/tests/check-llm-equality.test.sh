@@ -165,6 +165,19 @@ git -C "${fixture}" add deploy/k3s/model.yaml
 run_gate 0 '没有厂商身份面' "${work}/abl4.sh" "${fixture}"
 drop deploy/k3s/model.yaml
 
+# --- 扫不到东西 != 扫过且干净 ---
+# 四条判据都只认命中，所以「一个文件也没扫到」时它们一条都不会响，门会印出与
+# 「全都干净」相同的那句话。两种扫不到各钉一格：
+#   a) 仓库在、扫描面是空的（deploy/ 被搬走、检出没落地）；
+#   b) 根目录根本不是 git 仓库（git grep 退出 >1，命中为空）。
+empty_repo="${work}/empty-repo"
+git -C "${work}" init -q empty-repo
+run_gate 3 '一个文件都没有读到' "${gate}" "${empty_repo}"
+
+not_a_repo="${work}/not-a-repo"
+mkdir -p "${not_a_repo}/deploy"
+run_gate 3 '一个文件都没有读到' "${gate}" "${not_a_repo}"
+
 # --- 真树 —— 这棵仓库今天必须绿 ---
 # 夹具全绿而真树红，说明这条门在测自己；两边都绿，才说明它今天在守东西。
 run_gate 0 '没有厂商身份面' "${gate}" "${repo}"
