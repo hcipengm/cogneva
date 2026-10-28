@@ -5692,7 +5692,7 @@ data:
         let registry = "      - name: registry\n        image: a\n        env:\n        - name: A\n          value: '1'\n";
         let walker = "      - name: walker\n        image: b\n";
         // 前面插了一个元素：registry 的下标从 0 变成 1，它自己一个字都没少。
-        let previous = with_containers(&registry);
+        let previous = with_containers(registry);
         let current = with_containers(&format!("{walker}{registry}"));
         assert!(
             objects_that_lost_fields(&previous, &current, "cogneva").is_empty(),
