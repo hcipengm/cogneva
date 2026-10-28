@@ -13,6 +13,7 @@
 #   3. 登记表里有一行单元里已经没有了 -> 红，点名那条陈旧登记；
 #   4. 单元里用 Environment= 写 RESTIC_PASSWORD 字面量 -> 红；
 #   5. 渲染物里出现 RESTIC_PASSWORD -> 红（业务 Pod 零凭证的边界）；
+#   5b. 部署面读不到 / 一个文件都没读到 -> 红：零命中与「一个引用都没有」同形；
 #   6. 安装脚本加密的名字与单元要的名字对不上 -> 红；
 #   7. ExecStart 指向的脚本不在树里 -> 红（指针锈了）；
 #   8a. --live 且单元没装、通道也从没配过 -> 不适用，绿（不判成违约）；
@@ -221,4 +222,15 @@ out="$(PATH="${work}/bin-ok:${PATH}" run_gate_live)" || fail "空夹具应当绿
 grep -q "除本仓 deploy/systemd 外没有一个带凭证指令" <<<"${out}" \
     || fail "--live 在差集为空时没有明确报出「没有一个」：${out}"
 
-echo "host-credential-surface: 15 个用例全绿"
+# 5b) 部署面读不到，与「部署面里零 RESTIC_PASSWORD」印的是同一句话
+mirror
+rm -rf "${work}/root/deploy/helm"
+out="$(run_gate)" && fail "chart 目录不在时应当红，实际绿：${out}"
+grep -q "不在树里" <<<"${out}" || fail "红时没有说清目录不在：${out}"
+
+mirror
+find "${work}/root/deploy/rendered" -type f -delete
+out="$(run_gate)" && fail "部署面零个文件时应当红，实际绿：${out}"
+grep -q "只读到 0 个文件" <<<"${out}" || fail "红时没有说清读到零个文件：${out}"
+
+echo "host-credential-surface: 17 个用例全绿"

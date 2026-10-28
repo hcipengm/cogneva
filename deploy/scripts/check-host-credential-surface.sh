@@ -58,6 +58,9 @@ import sys
 LIVE = sys.argv[1] == "1"
 UNIT_DIR = "deploy/systemd"
 REGISTRY = "deploy/systemd/credential-holders.tsv"
+# 部署面（渲染物 + chart + k3s 清单）的文件数下限。这条面判的是「这些文件里没有
+# RESTIC_PASSWORD」，而一份没读到的部署面与一份干净的同形；真树今天 4 百多个文件。
+SURFACE_FILES_FLOOR = 100
 INSTALLER = "deploy/scripts/install-backup-offsite.sh"
 PROFILES = "deploy/rendered"
 
@@ -139,9 +142,26 @@ def check_literal_secrets():
 
 
 def check_no_password_in_rendered():
+    # 部署面一个文件都没读到的时候，grep 的「零命中」与「部署面里没有这个变量」印的是
+    # 同一句话。grep 自己的退出码要先收下：>1 是它读不动（目录不在、权限），1 才是没有
+    # 命中——那正是这条判据要找的绿。
+    surface = ["deploy/rendered", "deploy/helm", "deploy/k3s"]
+    missing = [d for d in surface if not os.path.isdir(d)]
+    if missing:
+        fail(f"{missing} 不在树里：没读到部署面就判不了它里面有没有 RESTIC_PASSWORD")
+        return
+    files = sum(len(names) for root in surface for _, _, names in os.walk(root))
+    if files < SURFACE_FILES_FLOOR:
+        fail(f"部署面只读到 {files} 个文件（下限 {SURFACE_FILES_FLOOR}）：零个文件与"
+             "「没有一个引用 RESTIC_PASSWORD」在输出上同形，这一跑什么都没判")
+        return
     hits = subprocess.run(
-        ["grep", "-rln", "RESTIC_PASSWORD", "deploy/rendered", "deploy/helm", "deploy/k3s"],
+        ["grep", "-rln", "RESTIC_PASSWORD", *surface],
         capture_output=True, text=True)
+    if hits.returncode > 1:
+        fail(f"读不出部署面（grep 退出 {hits.returncode}）：{hits.stderr.strip()}——"
+             "没读到就判不了里面有没有 RESTIC_PASSWORD")
+        return
     for line in hits.stdout.splitlines():
         fail(f"{line} 引用了 RESTIC_PASSWORD：业务 Pod 零凭证的边界在这里被破")
 
