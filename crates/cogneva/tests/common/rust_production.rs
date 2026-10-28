@@ -89,9 +89,15 @@ pub fn all_crate_files(root: &Path) -> Vec<PathBuf> {
 /// `crates/` 下每一个 `.rs`，不设下限：给测试自己搭的树用。
 pub fn crate_files_of(root: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
+        // 读不出来就 panic：递归遍历里跳过一个子目录不会让任何断言变红，而剩下的那份
+        // 普查往往仍高于下限——「少读了一块」与「那一块都合规」在判词上分不开。
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+            panic!(
+                "{} 读不出来（{e}）：这棵树的普查面少了一块，而用剩下的那份判出来的\
+                 结论与「整片区都合规」同形",
+                dir.display()
+            )
+        });
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -195,9 +201,15 @@ fn sources_of_crate(crate_dir: &Path) -> Vec<PathBuf> {
 }
 
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+    // 读不出来就 panic：递归遍历里跳过一个子目录不会让任何断言变红，而剩下的那份
+    // 普查往往仍高于下限——「少读了一块」与「那一块都合规」在判词上分不开。
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "{} 读不出来（{e}）：这棵树的普查面少了一块，而用剩下的那份判出来的\
+             结论与「整片区都合规」同形",
+            dir.display()
+        )
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
