@@ -29,8 +29,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::routes::repo_root;
-use common::rust_production::production_text;
+use common::routes::{matching_brace, repo_root};
+use common::rust_production::{production_text, relative_name};
 
 const SUPERVISOR: &str = "crates/cog-supervisor/src/alert_store.rs";
 const FACE_MAP: &str = "crates/cog-observability/src/plugin.rs";
@@ -96,7 +96,7 @@ fn mapped_words(source: &str) -> Result<BTreeMap<String, String>, String> {
             "  `{FACE_MAP}` 的 `{FACE_FN}` 没有函数体：读不出来按红处理"
         ));
     };
-    let close = matching_brace(source, open)
+    let close = matching_brace(source.as_bytes(), open)
         .ok_or_else(|| format!("  `{FACE_MAP}` 的 `{FACE_FN}` 括号不闭合：读不出来按红处理"))?;
     let body = &source[open + 1..close];
     let mut mapped = BTreeMap::new();
@@ -152,42 +152,6 @@ fn literals(text: &str) -> Vec<String> {
     out
 }
 
-fn matching_brace(text: &str, open: usize) -> Option<usize> {
-    let bytes = text.as_bytes();
-    let mut depth = 0i32;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-fn relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
 fn contradictions(root: &Path) -> Vec<String> {
     let mut complaints = Vec::new();
     let supervisor_path = root.join(SUPERVISOR);
@@ -203,7 +167,7 @@ fn contradictions(root: &Path) -> Vec<String> {
         Err(_) => {
             complaints.push(format!(
                 "  `{}` 读不出来：读不出来按红处理",
-                relative(root, &supervisor_path)
+                relative_name(root, &supervisor_path)
             ));
             BTreeSet::new()
         }
@@ -219,7 +183,7 @@ fn contradictions(root: &Path) -> Vec<String> {
         Err(_) => {
             complaints.push(format!(
                 "  `{}` 读不出来：读不出来按红处理",
-                relative(root, &face_path)
+                relative_name(root, &face_path)
             ));
             BTreeMap::new()
         }

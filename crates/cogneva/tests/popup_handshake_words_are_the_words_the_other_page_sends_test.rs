@@ -37,7 +37,7 @@ mod common;
 
 use common::js_literal::{is_identifier, split_top_level};
 use common::routes::{matching_brace, matching_paren, read, repo_root, walk};
-use common::rust_production::production_text;
+use common::rust_production::{production_text, relative_name};
 
 const OPERATOR: &str = "crates/cog-gateway/src/takeover.html";
 const CALLBACK: &str = "docs/oauth-callback.html";
@@ -582,13 +582,6 @@ fn client_files(root: &Path) -> Vec<PathBuf> {
     files.sort();
     files.dedup();
     files
-}
-
-fn relative_name(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 fn join(files: &BTreeSet<String>) -> String {

@@ -1,22 +1,32 @@
-//! 「怎么读一个文件」「怎么走一棵树」「怎么去掉注释」各只许有一份实现。
+//! 「怎么读一个文件」「怎么走一棵树」「怎么去掉注释」「怎么配平括号」「怎么取仓库
+//! 相对名」各只许有一份实现。
 //!
-//! 这三条规则短到看起来不值得共享，所以它们在夹具里被抄了十二遍、两遍和六遍——连同
-//! 那句解释「读不出来就 panic」的注释一起抄。抄的人不是懒：每个测试二进制都是一棵
-//! 独立的 crate，`common` 不是自动可见的，手边最快的一条路就是复制。去注释那一条抄得
-//! 更没声：六份里三种写法（按字节 / 按字符 / 数嵌套层数），谁抄的都不算错，错的是
-//! 它们从此各走各的——Rust 的块注释**可以嵌套**，数层数的那一份与只看第一个 `*/`
-//! 的那一份，对同一段源码给出的「代码」不是同一段。
+//! 这几条规则短到看起来不值得共享，所以它们在夹具里被抄了十二遍、两遍、六遍、两遍和
+//! 两遍——连同那句解释「读不出来就 panic」的注释一起抄。抄的人不是懒：每个测试二进制
+//! 都是一棵独立的 crate，`common` 不是自动可见的，手边最快的一条路就是复制。去注释
+//! 那一条抄得更没声：六份里三种写法（按字节 / 按字符 / 数嵌套层数），谁抄的都不算错，
+//! 错的是它们从此各走各的——Rust 的块注释**可以嵌套**，数层数的那一份与只看第一个
+//! `*/` 的那一份，对同一段源码给出的「代码」不是同一段。
 //!
 //! 代价落在**改的时候**：`fsio::walk` 里那句「读不出来就 panic」是这条规则的全部
 //! 价值（跳过一个读不出来的子目录不会让任何断言变红，剩下的那份普查往往仍高于下限，
 //! 「少读了一块」与「那一块都合规」在判词上分不开），而抄件里那句话是注释，不是机制。
 //! 谁要是在其中一份里把 `unwrap_or_else(panic!)` 换成 `flatten()` 或 `else { continue }`，
-//! 另外十三份不会跟着变，也不会有任何东西发现它们已经不同——这正是这一族缺陷的样子：
+//! 另外十几份不会跟着变，也不会有任何东西发现它们已经不同——这正是这一族缺陷的样子：
 //! **同一份规则被写多遍，而没有任何东西比较它们**。
 //!
-//! 判据按**签名**判，不按出现次数：被抄的那几份的形状是固定的——
+//! 配平括号与取相对名这两条抄得更隐蔽：抄件并不逐字相同，所以谁抄的时候都没觉得自己
+//! 在抄。括号那一份有人按字符数、有人按字节数（网关源码里全是中文，两者是不同的数），
+//! 有人跳过 `"…"` 里的括号、有人不跳；相对名那一份有人折叠开头的 `./`、有人不折。
+//! 两种写法对同一段源码给出的答案不同，而两个方向都没有任何东西会红——落点全在
+//! 「这一处读到的和那一处读到的不是同一个东西」这种只有改的时候才显形的地方。
+//!
+//! 判据分两种形状：逐字相同的那几份按**签名**判——
 //! `fn read(path: &Path) -> String`、`fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>)`
-//! 与 `fn strip_comments(text: &str) -> String`。
+//! 与 `fn strip_comments(text: &str) -> String`；名字唯一的那些按**定义名**判——
+//! `fn matching_brace(`、`fn matching_paren(` 与 `fn relative_name(`，因为这三个名字
+//! 本来就是 `common` 导出给全仓用的，定义名在别处出现按构造就是第二份实现，比签名更
+//! 不容易漏（实测：这三种抄件的返回类型、参数类型、甚至函数名都各变过一次）。
 //! 这比「凡 `read_dir` 即红」窄得多，是量过的：夹具与产出面里有几十份文件自己走目录，
 //! 其中绝大多数是不同形状（只下一层、带着自己的过滤与解析、返回相对名字），那些不是
 //! 这条规则的副本。这里只抓逐字抄过去的那一种。
@@ -33,14 +43,28 @@ use common::rust_production::relative_name;
 /// 读文件、走目录这两条的唯一定义。
 const THE_ONE: &str = "crates/cogneva/tests/common/fsio.rs";
 
-/// 去注释那一条的定义在 `routes` 里——它要读同一批源码，和注册路线的读法住在一起。
-const STRIP_COMMENTS_HOME: &str = "crates/cogneva/tests/common/routes.rs";
+/// 去注释、配平括号这两条的定义在 `routes` 里——它们要读同一批源码，和注册路线的
+/// 读法住在一起。
+const ROUTES_HOME: &str = "crates/cogneva/tests/common/routes.rs";
 
-/// 被抄走的签名，逐字。前两个在 `fsio.rs`，第三个在 `routes.rs`。
-const COPIED_SIGNATURES: [&str; 3] = [
+/// 取仓库相对名那一条的定义在 `rust_production` 里：它先是「读一棵生产源码树」的一
+/// 部分，后来才被别处借去用。
+const PRODUCTION_HOME: &str = "crates/cogneva/tests/common/rust_production.rs";
+
+/// 被抄走的那几行，逐字。前三个是**整条签名**（这三条规则的参数与返回类型在全仓只有
+/// 一种写法，所以签名是最窄也最准的形状）；后三个只到**定义名**为止。
+///
+/// 为什么后三个不用整条签名：括号那一份在两处抄件里被写成了 `text: &str`，而共享的
+/// 那一份收 `bytes: &[u8]`；相对名那一份在一处抄件里连名字都改成了 `relative`。签名
+/// 按抄件当时的形状写下去，下一个抄的人换一种参数类型就漏了。这三个名字是 `common`
+/// 导出的，别处再出现一次定义按构造就是第二份实现。
+const COPIED_FORMS: [&str; 6] = [
     "fn read(path: &Path) -> String",
     "fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>)",
     "fn strip_comments(text: &str) -> String",
+    "fn matching_paren(",
+    "fn matching_brace(",
+    "fn relative_name(",
 ];
 
 /// 这条门自己。它把签名当字符串写着（判据要看的就是那几行），所以在真树上会被
@@ -102,7 +126,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     let mut copies = Vec::new();
     let mut files = 0usize;
     let (mut readers, mut walkers, mut strippers) = (0usize, 0usize, 0usize);
-    let shared = [THE_ONE, STRIP_COMMENTS_HOME];
+    let shared = [THE_ONE, ROUTES_HOME, PRODUCTION_HOME];
     for path in files_in {
         let name = relative_name(root, path);
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -127,9 +151,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
                 continue;
             }
             if !shared.contains(&name.as_str())
-                && COPIED_SIGNATURES
-                    .iter()
-                    .any(|signature| line.contains(signature))
+                && COPIED_FORMS.iter().any(|form| line.contains(form))
             {
                 copies.push((name.clone(), index + 1, line.trim().to_string()));
             }
@@ -171,9 +193,10 @@ fn the_fixture_reading_steps_are_written_once() {
         .filter(|(file, _, _)| file == THE_PREDICATE)
         .collect();
     assert!(
-        own.len() >= 3,
-        "这条门自己至少写着三份标本（三个签名各一行），读到 {} 处：{:?}。\
-         一处都读不到说明判据已经瞎了，那么把它摘掉就只是在掩盖它",
+        own.len() >= COPIED_FORMS.len(),
+        "这条门自己至少写着 {} 份标本（每一种形状各一行），读到 {} 处：{:?}。\
+         少一份说明判据对那种形状已经瞎了，那么把它摘掉就只是在掩盖它",
+        COPIED_FORMS.len(),
         own.len(),
         own
     );
@@ -185,11 +208,12 @@ fn the_fixture_reading_steps_are_written_once() {
         .collect();
     assert!(
         elsewhere.is_empty(),
-        "这些地方又抄了一份共享的读取 / 遍历 / 去注释：{elsewhere:?}\n\
-         改用 `common::routes::read`、`common::routes::walk` 与 \
-         `common::routes::strip_comments`。抄件的注释里也写着「读不出来就 panic」，\
-         但那是注释不是机制——把它换成 `else {{ continue }}` 的那一份不会红，\
-         也不会有人发现另外几份已经和它不一样了。"
+        "这些地方又抄了一份共享的读取 / 遍历 / 去注释 / 配平括号 / 取相对名：{elsewhere:?}\n\
+         改用 `common::routes::read`、`common::routes::walk`、\
+         `common::routes::strip_comments`、`common::routes::matching_brace`（或 \
+         `matching_paren`）与 `common::rust_production::relative_name`。抄件的注释里\
+         也写着「读不出来就 panic」，但那是注释不是机制——把它换成 `else {{ continue }}` \
+         的那一份不会红，也不会有人发现另外几份已经和它不一样了。"
     );
 
     // 反过来问：被指认的那一处真的还在干这件事吗。少了这一问，把它换成空壳之后
@@ -205,17 +229,42 @@ fn the_fixture_reading_steps_are_written_once() {
         "{THE_ONE} 里的遍历不再 panic：读不出来时安静地少读一块，判出来的结论与\
          「那一块都合规」同形"
     );
-    let strip_home =
-        std::fs::read_to_string(root.join(STRIP_COMMENTS_HOME)).expect("共享去注释读得到");
+    let routes_home = std::fs::read_to_string(root.join(ROUTES_HOME)).expect("共享去注释读得到");
     assert!(
-        strip_home.contains("pub fn strip_comments(text: &str) -> String"),
-        "{STRIP_COMMENTS_HOME} 里不再定义 `strip_comments`：「只有一处」就是指着这份\
+        routes_home.contains("pub fn strip_comments(text: &str) -> String"),
+        "{ROUTES_HOME} 里不再定义 `strip_comments`：「只有一处」就是指着这份\
          不干这件事的文件"
     );
     assert!(
-        strip_home.contains("depth") && strip_home.contains("chars[i] == '\\n'"),
-        "{STRIP_COMMENTS_HOME} 里的去注释不再按嵌套层数走：Rust 的块注释可以嵌套，\
+        routes_home.contains("depth") && routes_home.contains("chars[i] == '\\n'"),
+        "{ROUTES_HOME} 里的去注释不再按嵌套层数走：Rust 的块注释可以嵌套，\
          只看第一个 `*/` 会把后半截注释当成代码读"
+    );
+    // 括号那一份：两条入口都还在，而且都还走在同一个数层数的实现上。少这一问，
+    // 把某一条改成「找最近的 `}`」之后，本判据只证明了「没有第二份」，不证明这一份对。
+    assert!(
+        routes_home.contains("pub fn matching_paren(bytes: &[u8], open: usize)")
+            && routes_home.contains("pub fn matching_brace(bytes: &[u8], open: usize)"),
+        "{ROUTES_HOME} 里不再定义这两条括号读取：「只有一处」就是指着这份不干这件事的文件"
+    );
+    assert!(
+        routes_home.contains("fn matching_delimiter(")
+            && routes_home.contains("matching_delimiter(bytes, open, b'{', b'}')"),
+        "{ROUTES_HOME} 里两条括号读取不再走同一个数层数的实现：两条各写一遍，就是\
+         这份文件内部又长出了第二份规则——同一条缺陷换了个位置"
+    );
+    // 相对名那一份：抄件缺的正是这行 `./` 折叠，所以共享的这一份必须还带着它。
+    let production_home =
+        std::fs::read_to_string(root.join(PRODUCTION_HOME)).expect("共享取相对名读得到");
+    assert!(
+        production_home.contains("pub fn relative_name(root: &Path, path: &Path) -> String"),
+        "{PRODUCTION_HOME} 里不再定义 `relative_name`：「只有一处」就是指着这份\
+         不干这件事的文件"
+    );
+    assert!(
+        production_home.contains("strip_prefix(\"./\")"),
+        "{PRODUCTION_HOME} 里的相对名不再折叠开头的 `./`：同一条路径在表里记成 \
+         `crates/x.rs` 还是在比对时读成 `./crates/x.rs`，是两种答案，而两种都不会红"
     );
 
     assert!(
@@ -271,17 +320,18 @@ fn a_copy_on_disk_is_reported() {
         found.copies
     );
 
-    // 逐字抄过去的那三份，都要点名，且要带能翻到的行号。
+    // 抄过去的那几份，都要点名，且要带能翻到的行号。括号那一份与相对名那一份按抄件
+    // 当时的样子写：参数是 `&str`，名字是 `relative_name`——判据要认的是这些形状。
     std::fs::write(
         dir.join("copy.rs"),
-        "fn read(path: &Path) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n\nfn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, out);\n}\n\nfn strip_comments(text: &str) -> String {\n    text.to_string()\n}\n",
+        "fn read(path: &Path) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n\nfn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, out);\n}\n\nfn strip_comments(text: &str) -> String {\n    text.to_string()\n}\n\nfn matching_brace(text: &str, open: usize) -> Option<usize> {\n    let _ = (text, open);\n    None\n}\n\nfn relative_name(root: &Path, path: &Path) -> String {\n    let _ = root;\n    path.display().to_string()\n}\n",
     )
-    .expect("three copies");
+    .expect("five copies");
     let found = census(&root, &all_files(&root));
     assert_eq!(
         found.copies.len(),
-        3,
-        "三份抄件都要数得出来：{:?}",
+        5,
+        "五份抄件都要数得出来：{:?}",
         found.copies
     );
     assert!(
@@ -298,6 +348,22 @@ fn a_copy_on_disk_is_reported() {
             .iter()
             .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 9),
         "去注释那一份也要点名（第 9 行）：{:?}",
+        found.copies
+    );
+    assert!(
+        found
+            .copies
+            .iter()
+            .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 13),
+        "括号那一份也要点名（第 13 行）：{:?}",
+        found.copies
+    );
+    assert!(
+        found
+            .copies
+            .iter()
+            .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 18),
+        "相对名那一份也要点名（第 18 行）：{:?}",
         found.copies
     );
 

@@ -56,11 +56,7 @@
 
 mod common;
 
-use common::routes::strip_comments;
-
-use common::routes::{read, walk};
-
-use common::routes::repo_root;
+use common::routes::{matching_brace, read, repo_root, strip_comments, walk};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -337,33 +333,6 @@ fn client_query_names(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
     out
 }
 
-/// `open` is a byte index into `text` (the gateway's sources are full of
-/// Chinese, so a char index and a byte index are different numbers).
-fn matching_brace(text: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut quote: Option<char> = None;
-    for (index, c) in text.char_indices().skip_while(|(index, _)| *index < open) {
-        if let Some(q) = quote {
-            if c == q {
-                quote = None;
-            }
-            continue;
-        }
-        match c {
-            '"' | '\'' => quote = Some(c),
-            '{' => depth += 1,
-            '}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(index);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
 /// The attribute lines immediately above a `struct` keyword: derive/serde/doc
 /// lines, stopping at the first line that is none of those.
 fn attribute_block(text: &str, struct_at: usize) -> String {
@@ -434,7 +403,7 @@ fn struct_fields(text: &str, name: &str) -> Option<Vec<String>> {
         from = hit + needle.len();
     };
     let open = text[at..].find('{').map(|i| i + at)?;
-    let close = matching_brace(text, open)?;
+    let close = matching_brace(text.as_bytes(), open)?;
     let body = &text[open + 1..close];
     let attrs = attribute_block(text, at);
     let style = attrs

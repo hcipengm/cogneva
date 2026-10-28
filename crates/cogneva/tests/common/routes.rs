@@ -219,12 +219,18 @@ pub fn matching_delimiter(bytes: &[u8], open: usize, opening: u8, closing: u8) -
     None
 }
 
-/// The offset of the paren closing the one at `open`.
+/// The offset of the paren closing the one at `open`, skipping spans inside
+/// `"…"` because a bracket in a string is not a bracket.
+///
+/// `open` and the answer are both **byte** offsets: the sources these readers
+/// walk are full of Chinese, so a char index and a byte index are different
+/// numbers and slicing by the wrong one cuts a character in half.
 pub fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
     matching_delimiter(bytes, open, b'(', b')')
 }
 
-/// The offset of the brace closing the one at `open`.
+/// The offset of the brace closing the one at `open`; byte offsets, as
+/// [`matching_paren`].
 pub fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
     matching_delimiter(bytes, open, b'{', b'}')
 }

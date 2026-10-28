@@ -4,7 +4,9 @@
 //! a series one of them refuses to extract is a series that side of the
 //! contract silently stops checking. Included with `#[path]` rather than
 //! through `common/mod.rs` so a test that only wants this does not have to
-//! compile the harness and mocks alongside it.
+//! compile the harness and mocks alongside it — though every caller mounts
+//! `common` anyway, which is why the bracket reader comes from there instead of
+//! being written a second time here.
 
 // Three test binaries include this module and each asks a different subset of
 // what it answers; compiled whole into each of them, the rest is dead code and
@@ -15,6 +17,8 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeSet;
+
+use crate::common::routes::matching_paren;
 
 /// Aggregation operators and keywords that look like identifiers but name no
 /// series.
@@ -292,7 +296,7 @@ fn operand_close(s: &str, operator_end: usize) -> Option<usize> {
             j += 1;
         }
         if j < bytes.len() && bytes[j] as char == '(' {
-            j = matching_paren(s, j)? + 1;
+            j = matching_paren(s.as_bytes(), j)? + 1;
         }
     }
     while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
@@ -301,7 +305,7 @@ fn operand_close(s: &str, operator_end: usize) -> Option<usize> {
     if j >= bytes.len() || bytes[j] as char != '(' {
         return None;
     }
-    matching_paren(s, j)
+    matching_paren(s.as_bytes(), j)
 }
 
 /// The index of the `(` matching the `)` at `close`, if the text balances.
@@ -315,25 +319,6 @@ fn open_of_close(s: &str, close: usize) -> Option<usize> {
                 depth -= 1;
                 if depth == 0 {
                     return Some(index);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// The index of the `)` matching the `(` at `open`, if the text balances.
-fn matching_paren(s: &str, open: usize) -> Option<usize> {
-    let bytes = s.as_bytes();
-    let mut depth = 0usize;
-    for (offset, byte) in bytes[open..].iter().enumerate() {
-        match byte {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + offset);
                 }
             }
             _ => {}
@@ -1278,7 +1263,7 @@ pub fn existence_only_reads(expr: &str, gated: &BTreeSet<String>) -> BTreeSet<St
         .match_indices(MARKER)
         .filter_map(|(at, marker)| {
             let open = at + marker.len() - 1;
-            matching_paren(&stripped, open).map(|close| (open, close))
+            matching_paren(stripped.as_bytes(), open).map(|close| (open, close))
         })
         .collect();
     if spans.is_empty() {
