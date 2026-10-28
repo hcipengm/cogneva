@@ -2487,6 +2487,25 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          comes back would otherwise show four unlabelled numbers in one cell.",
     ),
     (
+        crate::metric_names::PRINCIPLE_LEDGER_CHECK_KIND_ROWS.as_str(),
+        "How many rows the principle account holds, by the tier each carrier \
+         declared with `check_kind`: `tree` for a principle one walk of the tree \
+         settles, `live` for one only a reading off the running system settles, \
+         `shape` for one a session-side check refuses before the act, \
+         `judgement` for one no machine decides, and `undeclared` for the rows \
+         whose carrier never said which of the four it is. Every value of the \
+         closed set is written on every pass, zero included. Read it beside \
+         `cogneva_principle_ledger_rows`, never instead of it: that one counts \
+         the same population by state, so the two families overlap and summing \
+         across them doubles the corpus. `undeclared` is the cell worth \
+         watching -- those rows are counted as debt by the state census without \
+         anybody having said what a gate for them would even look like, and \
+         paying that part of the debt starts with a sentence, not with a test. \
+         Each cell carries its own reading name (`readout=principle_ledger_\
+         check_kind_<cell>`), so one cell can be named and returns one number: \
+         naming the family as a whole would return five series under one name.",
+    ),
+    (
         crate::metric_names::PRINCIPLE_REFUSALS.as_str(),
         "How many times a gate has refused work because of one principle, by \
          `slug`. Cumulative and monotone: the value is the account's own count, \

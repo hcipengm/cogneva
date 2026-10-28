@@ -4498,6 +4498,16 @@ const UNREAD: &[(&str, Unread)] = &[
     // doing its job, and the same principle refused for a week is a rule that is
     // not being internalized. A threshold invented here would page on the
     // policy, so the entry stays a debt until someone states it.
+    // The same account counted the other way, by the tier each carrier said its
+    // principle would be checked at. No rule reads it, and the reason is not
+    // that the reading is unimportant: the cell worth watching is `undeclared`,
+    // the rows the state census counts as debt while nobody has said what a gate
+    // for them would even look like, and any bound on how many of those a corpus
+    // may hold is a policy about how much unfinished thinking is normal. Growth
+    // is the one non-arbitrary signal, and it is not a fault by itself -- a
+    // corpus that gains principles gains undeclared rows with them until someone
+    // writes the sentence. Its reader is the panel beside the state census,
+    // which shows the composition without inventing a threshold.
     (
         "cogneva_principle_refusals",
         Unread::Gap("how many times a gate has refused work because of one principle, by slug. The account stored the count per row already; what was missing was a surface outside a query, and this series is that surface. What is still missing is a declared bound: one refusal is a gate doing its job, the same principle refused for a week is a rule the corpus is not internalizing, and where between those two a page belongs is a policy decision rather than a number a producer can know. The host script `scripts/host/cogneva-principle-refusal-reading.sh` reads the same fact straight from the database today, which is why the absence of a rule is not the absence of a reader -- but that reader lives outside this repository and cannot be named here as a series name"),
@@ -4768,6 +4778,16 @@ const UNREAD: &[(&str, Unread)] = &[
 /// debts is the same order the write-window record and the principle account
 /// used -- publish the reading first, argue about the threshold after -- and it
 /// is what makes the growth visible while the policy is still undecided.
+///
+/// It stayed at 33 in the pass that published the principle account's tier
+/// census. That census had been computed on every pass since the tiers were
+/// introduced and only ever printed, so it arrived with everything a reading
+/// needs except a reader -- and it arrived with one, because the account's
+/// composition is one picture: the panel draws both partitions side by side,
+/// and the state partition had no curve either, since the freshness rule over
+/// it answers "is anyone still counting" and not "what does the count say". A
+/// series published with its reader adds no debt, which is what this number is
+/// for: it counts the ones that were left.
 const GAPS_AT_CENSUS: usize = 33;
 
 #[test]

@@ -76,6 +76,15 @@ pub const PRINCIPLE_LEDGER_ROLE: &str = "principle_ledger";
 /// (`6 * period`), so changing it changes that threshold.
 pub const PRINCIPLE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
+/// What the tier census calls a row whose carrier never declared one.
+///
+/// The column is allowed to be empty, and empty is not a fifth tier: it is the
+/// absence of an answer, and it is the reason the reading has five cells rather
+/// than four. Grouped under its own word here so the published label is written
+/// once -- a label spelled at the call site is a label that drifts from the one
+/// a panel was written against.
+const CHECK_KIND_UNDECLARED: &str = "undeclared";
+
 /// How many outstanding rows one round reads for its own census line.
 ///
 /// The round exists for one thing: to make "the account is readable, and this is
@@ -285,10 +294,13 @@ async fn read_pass(store: &dyn PrincipleLedgerStore, metrics: Option<&Arc<dyn Me
     // `unenforced` there; only this reading tells them apart, and the number work
     // can move is the debt with the `judgement` rows subtracted.
     match store.check_kind_census().await {
-        Ok(census) => info!(
-            check_kind = %check_kind_summary(&census),
-            "principle ledger check-kind census"
-        ),
+        Ok(census) => {
+            info!(
+                check_kind = %check_kind_summary(&census),
+                "principle ledger check-kind census"
+            );
+            publish_check_kind_census(metrics, &census).await;
+        }
         Err(e) => warn!(
             error = %e,
             "principle ledger: the check-kind census could not be read"
@@ -344,6 +356,66 @@ async fn publish_census(metrics: Option<&Arc<dyn MetricsBackend>>, census: &Prin
                 error = %e,
                 state,
                 "principle ledger: the census could not be published"
+            );
+        }
+    }
+}
+
+/// One series per check tier, the fifth being the rows whose carrier never said.
+///
+/// The state census above answers how much of the corpus is gated; this answers
+/// how the corpus says it *would* be checked, and the two are separate readings
+/// rather than one with two labels because they partition the same population:
+/// on one family, summing across the labels counts the corpus twice.
+///
+/// The cell that earns this reading is `undeclared`. A row reads `unenforced`
+/// whether its carrier said a walk of the tree would settle it or said nothing
+/// at all, and those two debts are paid in different coins -- the first with a
+/// gate written, the second with a sentence first and a gate after. Without the
+/// split, the larger half of the debt is the half nobody can see, and every
+/// attempt to pay it starts by guessing what that principle wanted.
+///
+/// Zeroes are written for the same reason the state census writes them: a tier
+/// the corpus holds none of and a tier nothing counted are both absent from a
+/// series that only appears once it is non-zero.
+async fn publish_check_kind_census(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    census: &PrincipleCheckKindCensus,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    let cells: [(&str, u64); 5] = [
+        (PrincipleCheckKind::Shape.as_str(), census.shape),
+        (PrincipleCheckKind::Tree.as_str(), census.tree),
+        (PrincipleCheckKind::Live.as_str(), census.live),
+        (PrincipleCheckKind::Judgement.as_str(), census.judgement),
+        (CHECK_KIND_UNDECLARED, census.undeclared),
+    ];
+
+    for (check_kind, count) in cells {
+        // One reading name per cell, as the state census writes them: the roster
+        // prints whatever a named reading returns, and a single name shared by
+        // five series would arrive there as five unlabelled numbers in one cell.
+        // `undeclared` is the cell worth naming on its own -- it is the debt no
+        // state cell can show.
+        let reading = ["principle_ledger_check_kind_", check_kind].concat();
+        let labels = HashMap::from([
+            (crate::LABEL_CHECK_KIND.to_string(), check_kind.to_string()),
+            (crate::LABEL_READOUT.to_string(), reading),
+        ]);
+        if let Err(e) = metrics
+            .record_gauge(
+                metric_names::PRINCIPLE_LEDGER_CHECK_KIND_ROWS,
+                count as f64,
+                labels,
+            )
+            .await
+        {
+            warn!(
+                error = %e,
+                check_kind,
+                "principle ledger: the check-kind census could not be published"
             );
         }
     }
@@ -1962,6 +2034,8 @@ mod tests {
         census: PrincipleCensus,
         /// What this store says the account holds with `refusals > 0`.
         refused: Vec<(String, i64)>,
+        /// What this store says the corpus declares about how it is checked.
+        check_kinds: PrincipleCheckKindCensus,
     }
 
     #[async_trait::async_trait]
@@ -2040,13 +2114,7 @@ mod tests {
             })
         }
         async fn check_kind_census(&self) -> cog_core::SFResult<PrincipleCheckKindCensus> {
-            Ok(PrincipleCheckKindCensus {
-                shape: 0,
-                tree: 0,
-                live: 0,
-                judgement: 0,
-                undeclared: 0,
-            })
+            Ok(self.check_kinds)
         }
         async fn report_refusals(
             &self,
@@ -2083,6 +2151,7 @@ mod tests {
                 retired: 0,
             },
             refused: Vec::new(),
+            check_kinds: PrincipleCheckKindCensus::default(),
         };
 
         read_pass(&store, Some(&(metrics.clone() as Arc<dyn MetricsBackend>))).await;
@@ -2146,6 +2215,123 @@ mod tests {
         );
     }
 
+    /// The tier census reaches the series under a family of its own, with the
+    /// undeclared cell written like any other.
+    ///
+    /// The state census and this one count the same rows, so the two cannot be
+    /// one family: a reader summing across the labels would double the corpus
+    /// and read the double as growth. What the split buys is the one cell the
+    /// state census cannot show -- rows the debt counts while nobody has said
+    /// what a gate for them would look like -- and that cell is worth nothing
+    /// if the reader has to guess which label carries it, hence the assertion
+    /// on both the value and its name.
+    ///
+    /// The numbers are the account as read on 2026-10-28, both partitions
+    /// summing to the same 3,221 rows. That equality is the point rather than a
+    /// coincidence of the sample: two partitions of one population add up to
+    /// the same total, so a publisher that counted a cell twice or dropped one
+    /// is visible here as a total that moved.
+    #[tokio::test]
+    async fn a_pass_publishes_the_tier_census_in_a_family_of_its_own() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let store = CensusStore {
+            census: PrincipleCensus {
+                enforced: 595,
+                unenforced: 1849,
+                unmeasured: 763,
+                retired: 14,
+            },
+            refused: Vec::new(),
+            check_kinds: PrincipleCheckKindCensus {
+                shape: 245,
+                tree: 865,
+                live: 263,
+                judgement: 842,
+                undeclared: 1006,
+            },
+        };
+
+        read_pass(&store, Some(&(metrics.clone() as Arc<dyn MetricsBackend>))).await;
+
+        let gauges = metrics.gauges.lock().unwrap();
+        let tiers: HashMap<&str, f64> = gauges
+            .iter()
+            .filter(|(name, _, _)| name == metric_names::PRINCIPLE_LEDGER_CHECK_KIND_ROWS.as_str())
+            .map(|(_, value, labels)| {
+                (
+                    labels
+                        .get("check_kind")
+                        .map(String::as_str)
+                        .unwrap_or("<no check_kind>"),
+                    *value,
+                )
+            })
+            .collect();
+        assert_eq!(
+            tiers.len(),
+            5,
+            "the tier census published {} cells, not five: {:?}",
+            tiers.len(),
+            tiers.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(tiers.get("shape"), Some(&245.0));
+        assert_eq!(tiers.get("tree"), Some(&865.0));
+        assert_eq!(tiers.get("live"), Some(&263.0));
+        assert_eq!(tiers.get("judgement"), Some(&842.0));
+        assert_eq!(
+            tiers.get("undeclared"),
+            Some(&1006.0),
+            "the rows whose carrier never said how they are checked are the half \
+             of the debt that no state cell shows"
+        );
+
+        // Two partitions of one population, so the totals are the same number:
+        // a cell counted twice, or one left out, shows up here as a total that
+        // moved even when every individual cell still looks plausible.
+        let states: f64 = gauges
+            .iter()
+            .filter(|(name, _, _)| name == metric_names::PRINCIPLE_LEDGER_ROWS.as_str())
+            .map(|(_, value, _)| *value)
+            .sum();
+        let tiered: f64 = tiers.values().sum();
+        assert_eq!(
+            states, tiered,
+            "the two census families partition one population and came out \
+             {states} and {tiered}"
+        );
+
+        // The two families are separate names, not two label values on one: the
+        // same rows are counted by both, and a shared name would let a reader
+        // add the two partitions together.
+        assert!(
+            !gauges.iter().any(|(name, _, labels)| name
+                == metric_names::PRINCIPLE_LEDGER_ROWS.as_str()
+                && labels.contains_key("check_kind")),
+            "a tier cell was published into the state census family"
+        );
+        // One reading name per cell, and five distinct ones: the roster prints
+        // whatever a named reading returns, so a name shared by the family would
+        // arrive there as five unlabelled numbers in one cell.
+        let readings: std::collections::BTreeSet<&str> = gauges
+            .iter()
+            .filter(|(name, _, _)| name == metric_names::PRINCIPLE_LEDGER_CHECK_KIND_ROWS.as_str())
+            .filter_map(|(_, _, labels)| labels.get(crate::LABEL_READOUT).map(String::as_str))
+            .collect();
+        assert_eq!(
+            readings.len(),
+            5,
+            "the tier cells name {} readings between them: {:?}",
+            readings.len(),
+            readings
+        );
+        assert!(
+            readings.contains("principle_ledger_check_kind_undeclared"),
+            "the cell that is the debt no state cell shows has no reading of its \
+             own: {:?}",
+            readings
+        );
+    }
+
     /// The refusals are published as one series per slug the account holds with
     /// `refusals > 0`, and only for those.
     ///
@@ -2169,6 +2355,7 @@ mod tests {
                 ("feedback_numbering_and_plain_language".to_string(), 887),
                 ("principle-gate.sh:self-fault:drill".to_string(), 7),
             ],
+            check_kinds: PrincipleCheckKindCensus::default(),
         };
 
         read_pass(&store, Some(&(metrics.clone() as Arc<dyn MetricsBackend>))).await;

@@ -206,6 +206,15 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
     // number, so an aggregate over them multiplies one fact by the number of
     // reporters. `max` is the only aggregate that keeps the number honest.
     ("cogneva_task_unowned_rows", MetricDerivation::Store),
+    // The principle account's two censuses: row counts the pass reads out of
+    // one table and republishes whole, so whichever process holds the pass
+    // renders the same numbers. A panel that adds the copies counts the corpus
+    // once per publisher, which is why its expressions reduce to one.
+    ("cogneva_principle_ledger_rows", MetricDerivation::Store),
+    (
+        "cogneva_principle_ledger_check_kind_rows",
+        MetricDerivation::Store,
+    ),
     ("llm_upstream_healthy", MetricDerivation::Store),
     // Today's spend and the age of that sum are written through the same durable
     // funnel as `llm_upstream_healthy`: every process renders the store's newest

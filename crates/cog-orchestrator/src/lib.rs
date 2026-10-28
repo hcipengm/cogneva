@@ -52,6 +52,12 @@ pub const LABEL_REASON: &str = "reason";
 /// 读数按「这一格处在哪个状态」归属时用的标签键。
 pub const LABEL_STATE: &str = "state";
 
+/// 读数按「这条原则说它该怎么被查」归属时用的标签键。
+///
+/// 与 [`LABEL_STATE`] 是同一总体的两个分区，各用各的键而不是挤在一个键的不同取值里：
+/// 两个分区相加会把语料算两遍，而读者按一个键选行时，两族共键就分不开谁是谁。
+pub const LABEL_CHECK_KIND: &str = "check_kind";
+
 /// 读数按「哪条流」归属时用的标签键。
 pub const LABEL_STREAM: &str = "stream";
 

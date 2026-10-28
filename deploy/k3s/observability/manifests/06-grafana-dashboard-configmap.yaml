@@ -2668,6 +2668,101 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 64,
+          "title": "Principle Account: Gated, Owed, and What the Corpus Says Would Check It",
+          "description": "The principle account holds two censuses of the same rows, and until this panel drew them together only one of them had a reader: the state census is watched for silence by an absent-over-time rule, while the tier census -- what each carrier said about how its principle would be checked -- was computed on every pass and printed to a log line that dies with the pod. The state lines answer how much of the corpus is gated. The tier lines answer how the corpus says it would be checked, which the state census cannot show because a row reads unenforced either way. The cell that earns the second reading is the last line: the rows whose carrier never said. Those are counted as debt while nobody has written down what a gate for them would even look like, and that half of the debt is paid starting with a sentence rather than a test -- so a plan that only counts unenforced rows sends its work after the half that is ready and leaves the other half unnamed. The two parts are separate families rather than one with more labels, because they partition one population: in one family a reader summing across the labels would count the corpus twice and read the double as growth. That is also why a test asserts the two published partitions add up to the same total -- the total is the arithmetic as a reading, and a cell counted twice or left out shows up as a total that moved while every individual line still looks plausible. Every cell of both sets is written on every pass, zero included, so a missing line means a stopped pass and not a cell that is rightly empty; the freshness rule over the state family is what turns that silence into an alarm, and this panel is what shows what the alarm was about. Every target takes its whole snapshot from one publisher rather than giving each cell its own maximum: the numbers are whole-account counts, and during a rollout two processes publish a complete snapshot each, so a per-cell maximum would draw a composition nobody reported -- five cells from two different moments, adding up to a total the account never held -- while a plain sum over the copies would count the corpus twice. So each target reduces the cells within a publisher, adds them into that publisher's total, keeps the publisher with the largest total, and draws that one's cell. No rule reads the tier lines, and that is deliberate: the one non-arbitrary signal in them is growth, growth is not a fault -- a corpus that gains principles gains undeclared rows with them -- and any fixed bound on the undeclared line would be a policy about how much unfinished thinking is normal that nothing in the tree states. Read the composition; the act it calls for is writing the sentence a cell is missing.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 24,
+            "x": 0,
+            "y": 304
+          },
+          "targets": [
+            {
+              "expr": "cogneva_principle_ledger_rows{state=\"enforced\"} and on (instance) topk (1, sum by (instance) (max by (state, instance) (cogneva_principle_ledger_rows)))",
+              "legendFormat": "enforced",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_principle_ledger_rows{state=\"unenforced\"} and on (instance) topk (1, sum by (instance) (max by (state, instance) (cogneva_principle_ledger_rows)))",
+              "legendFormat": "owed a gate",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_principle_ledger_rows{state=\"unmeasured\"} and on (instance) topk (1, sum by (instance) (max by (state, instance) (cogneva_principle_ledger_rows)))",
+              "legendFormat": "owed, nothing looked",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_principle_ledger_rows{state=\"retired\"} and on (instance) topk (1, sum by (instance) (max by (state, instance) (cogneva_principle_ledger_rows)))",
+              "legendFormat": "retired",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_principle_ledger_check_kind_rows{check_kind=\"undeclared\"} and on (instance) topk (1, sum by (instance) (max by (check_kind, instance) (cogneva_principle_ledger_check_kind_rows)))",
+              "legendFormat": "never said how it would be checked",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_principle_ledger_check_kind_rows{check_kind=\"tree\"} and on (instance) topk (1, sum by (instance) (max by (check_kind, instance) (cogneva_principle_ledger_check_kind_rows)))",
+              "legendFormat": "says a walk of the tree",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_principle_ledger_check_kind_rows{check_kind=\"live\"} and on (instance) topk (1, sum by (instance) (max by (check_kind, instance) (cogneva_principle_ledger_check_kind_rows)))",
+              "legendFormat": "says a reading off the running system",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_principle_ledger_check_kind_rows{check_kind=\"shape\"} and on (instance) topk (1, sum by (instance) (max by (check_kind, instance) (cogneva_principle_ledger_check_kind_rows)))",
+              "legendFormat": "says a session-side check",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_principle_ledger_check_kind_rows{check_kind=\"judgement\"} and on (instance) topk (1, sum by (instance) (max by (check_kind, instance) (cogneva_principle_ledger_check_kind_rows)))",
+              "legendFormat": "says no machine decides",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

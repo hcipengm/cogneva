@@ -1274,6 +1274,22 @@ metric_names! {
     // publishing rather than that this account holds none of that answer.
     PRINCIPLE_LEDGER_ROWS => "cogneva_principle_ledger_rows",
 
+    // cog-orchestrator — the same account counted the other way: by the tier
+    // each carrier said its principle would be checked at.
+    //
+    // A separate name rather than a second label on the census above, because
+    // the two are different partitions of one population: labelled together,
+    // `sum()` over the family would count the corpus twice, and the obvious
+    // reading of a total that is wrong by exactly a factor of two is a corpus
+    // that doubled. The tier census was computed on every pass and only ever
+    // printed, and the question it answers is not the census's: a row reading
+    // `unenforced` is in the same bucket whether its carrier said a walk of the
+    // tree would settle it or said nothing at all, and those two debts are paid
+    // in different coins -- one needs a gate written, the other first needs
+    // somebody to say what the gate would look like. `undeclared` is the cell
+    // that names the second.
+    PRINCIPLE_LEDGER_CHECK_KIND_ROWS => "cogneva_principle_ledger_check_kind_rows",
+
     // cog-orchestrator — how many times a gate has refused work because of one
     // principle, by `slug`.
     //
