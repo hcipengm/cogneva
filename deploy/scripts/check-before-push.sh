@@ -131,21 +131,32 @@ done
 # 要先把整个 `cogneva` 连同它的测试 harness 链出来——同一棵树上实测 55 秒（判定本身
 # 只占 2.7 秒）。直接把这个**同一个文件**编成测试 harness 跑，1 秒编译 + 3 秒判定，
 # 判据仍只有一份，两条路喂给同一条判据。
+#
+# 快路有前提：这个文件自己不带外来的依赖。它现在从 `tests/common` 取仓库根与产出面
+# 清单，那条路要用 `cog_core`、`serde_json` 这些 crate，裸 `rustc` 没有 `--extern`
+# 解析不了，于是快路编不出来——那不等于判据红，只是这条路走不通。所以编不出来时退回
+# `cargo test` 跑**同一个文件**：判据仍只有一份，代价是多花一分钟，比让这一格从此
+# 永远红着、把真正的红淹掉便宜。
 capreg_src="crates/cogneva/tests/rust_capacity_constants_registry_test.rs"
 capreg_rustc="$(command -v rustc || true)"
 [ -n "${capreg_rustc}" ] || [ ! -x "${HOME}/.cargo/bin/rustc" ] || capreg_rustc="${HOME}/.cargo/bin/rustc"
+capreg_cargo="$(command -v cargo || true)"
+[ -n "${capreg_cargo}" ] || [ ! -x "${HOME}/.cargo/bin/cargo" ] || capreg_cargo="${HOME}/.cargo/bin/cargo"
 capreg_bin="${TMPDIR:-/tmp}/cogneva-capreg.$$"
-if [ -z "${capreg_rustc}" ]; then
-    # 与 pwsh 那一格同一条规矩：跑不了要说出来，不能安静跳过。
-    echo "SKIP  容量登记表：本机没有 rustc（CI 的 Test 会跑这一步）"
-elif CARGO_MANIFEST_DIR="${root}/crates/cogneva" "${capreg_rustc}" --test --edition 2021 \
-        -o "${capreg_bin}" "${capreg_src}"; then
+capreg_compiled=no
+if [ -n "${capreg_rustc}" ] && CARGO_MANIFEST_DIR="${root}/crates/cogneva" \
+        "${capreg_rustc}" --test --edition 2021 -o "${capreg_bin}" "${capreg_src}"; then
+    capreg_compiled=yes
+fi
+if [ "${capreg_compiled}" = yes ]; then
     run_step "容量登记表（${capreg_src}，经 rustc 直接编）" "${capreg_bin}"
     rm -f "${capreg_bin}"
+elif [ -n "${capreg_cargo}" ]; then
+    run_step "容量登记表（${capreg_src}，经 cargo test：这份测试带 tests/common 的依赖，rustc 直接编找不到）" \
+        "${capreg_cargo}" test -p cogneva --test rust_capacity_constants_registry_test
 else
-    # 编不出来同样是红：那是「这条判据在本机跑不起来」，不是「判据过了」。
-    echo "RED   容量登记表：这份测试编不出来，本机跑不了它" >&2
-    failures=$((failures + 1))
+    # 与 pwsh 那一格同一条规矩：跑不了要说出来，不能安静跳过。
+    echo "SKIP  容量登记表：本机既没有可用的 rustc 也没有 cargo（CI 的 Test 会跑这一步）"
 fi
 
 # ShellCheck：清单同样由 git 推出来，与 CI 同一条命令。
