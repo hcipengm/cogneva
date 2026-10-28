@@ -158,7 +158,10 @@ fn scan(root: &Path, floor: usize) -> Vec<String> {
             .unwrap_or(file)
             .to_string_lossy()
             .replace('\\', "/");
-        let text = std::fs::read_to_string(file).unwrap_or_default();
+        // 读不出来就报错：把读失败当成空文件，等于让这份文件悄悄退出人口，
+        // 而「它干净」与「没读到它」在结果上同形。
+        let text = std::fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("{} 读不出来：{e}", file.display()));
         for (line_no, line) in violations_in(&text) {
             problems.push(format!("{rel}:{line_no}: {line}"));
         }

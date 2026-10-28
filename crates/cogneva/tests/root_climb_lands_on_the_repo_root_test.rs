@@ -151,7 +151,10 @@ fn climbs(root: &Path) -> Vec<Climb> {
             .unwrap_or(&file)
             .to_string_lossy()
             .replace('\\', "/");
-        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        // 读不出来就报错：当成空文件等于让这份脚本悄悄退出人口，而「它没上溯」
+        // 与「没读到它」在结果上同形。
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{} 读不出来：{e}", file.display()));
         let Some(dir) = file.parent() else {
             continue;
         };
