@@ -14,7 +14,15 @@
 
 use std::path::{Path, PathBuf};
 
-use super::fsio::walk_files;
+// This file is read two ways: as a sibling of `fsio` inside `tests/common/`,
+// and straight onto a crate root through `#[path]` by `cog-reflection/src`,
+// `bootstrap/src` and a handful of integration fixtures -- where `super` is the
+// crate root and there is no `fsio` to find. Naming the file relative to this
+// one compiles in both places, and keeps `walk_files` the only recursion.
+#[path = "fsio.rs"]
+mod fsio;
+
+use self::fsio::walk_files;
 
 /// 一次普查至少该读到多少个生产源文件。
 ///
@@ -257,8 +265,16 @@ pub fn brace_shapes(text: &str) -> Vec<BraceShape> {
             if c == b'\\' {
                 // A backslash that ends the line continues the string: let the
                 // newline below emit the line boundary, or every later line's
-                // shape is reported one line early.
-                if b.get(i + 1) == Some(&b'\n') || b.get(i + 2) == Some(&b'\n') {
+                // shape is reported one line early. `\` + CR + LF is the same
+                // continuation.
+                //
+                // What decides is the byte *after* the backslash, never the one
+                // after that: a backslash always escapes exactly the character
+                // next to it. Reading a byte further out swallows an escaped
+                // quote that ends a line (`value: \"1\"`), and the `"` right
+                // there is then taken for the string's end -- every line below
+                // it is read as code, braces and quotes included.
+                if b.get(i + 1) == Some(&b'\n') || b.get(i + 1) == Some(&b'\r') {
                     i += 1;
                 } else {
                     i += 2;
@@ -289,9 +305,14 @@ pub fn brace_shapes(text: &str) -> Vec<BraceShape> {
                 continue;
             }
             b'\'' => {
+                // Past the backslash an escape covers **two** bytes, the
+                // backslash and the character it escapes: stopping after the
+                // backslash leaves `j` sitting on the escaped quote, so a
+                // literal like `'\''` closes on its own escape and every quote
+                // or brace after it on the same line reads as code.
                 let mut j = i + 1;
                 if b.get(j) == Some(&b'\\') {
-                    j += 1;
+                    j += 2;
                 }
                 let mut close = None;
                 while j < b.len() && j <= i + 5 {
@@ -674,6 +695,115 @@ mod tests {
         assert!(
             with_comments.contains("fn real_work") && !with_comments.contains("fn tweak"),
             "保留注释的那一版边界变了：{with_comments}"
+        );
+    }
+
+    /// 行尾的被转义引号（`value: \"1\"`）不是字符串的结束符。
+    ///
+    /// 反斜杠只转义**紧邻的那一个**字符，所以判续行时只能看反斜杠后第一个字节。
+    /// 旧写法看到的是后第二个字节：`\` + `"` + 换行 时它看见了换行，续行判对了，
+    /// 可那个被转义的 `"` 却留在原地被当成闭合引号——从下一行起整个文件按代码读，
+    /// `#[cfg(test)] mod tests` 的括号账提前归零，模块之后的产出整段消失。
+    #[test]
+    fn an_escaped_quote_at_a_line_end_does_not_close_the_string() {
+        let source = r#"pub fn real_work() {
+    call_me();
+}
+
+#[cfg(test)]
+mod tests {
+    fn fixture() {
+        let yaml = "\
+            value: \"1\"
+        ";
+        let _ = yaml;
+    }
+}
+
+pub fn real_work_after_the_module() {
+    call_me();
+}
+"#;
+        let production = production_text(source);
+        assert!(
+            production.contains("fn real_work_after_the_module"),
+            "掩码把字符串提前收了尾，模块之后的产出整段被吞掉：{production}"
+        );
+        assert!(
+            production.contains("fn real_work"),
+            "模块之前的产出也不该丢：{production}"
+        );
+        assert!(
+            !production.contains("let yaml"),
+            "夹具正文被当成产出读了：{production}"
+        );
+    }
+
+    /// 同一个判据的 CRLF 那一支：`\` + CR + LF 也是续行。
+    ///
+    /// 判据看的是反斜杠后第一个字节，所以 `\r` 与 `\n` 都得算。少了这一条，把条件
+    /// 「简化」成只认 `\n` 不会有任何一条门变红，直到有人在 CRLF 检出上跑这套普查。
+    #[test]
+    fn a_crlf_continuation_keeps_the_string_open() {
+        let source = "#[cfg(test)]\r\nmod tests {\r\n    fn fixture() {\r\n        \
+                      let yaml = \"\\\r\n            value: 1\r\n        \";\r\n        \
+                      let _ = yaml;\r\n    }\r\n}\r\n\r\n\
+                      pub fn real_after_the_module() {\r\n    call_me();\r\n}\r\n";
+        let production = production_text(source);
+        assert!(
+            production.contains("fn real_after_the_module"),
+            "CRLF 的续行让字符串提前收了尾：{production}"
+        );
+        assert!(
+            !production.contains("let yaml"),
+            "CRLF 那份夹具被当成产出读了：{production}"
+        );
+    }
+
+    /// 字符字面量里的转义引号不许把同一行后面的 `'{'` 顶成真括号。
+    ///
+    /// `'\''` 里被转义的那个 `'` 是**内容**，闭合在它后面一个。只跳过反斜杠会让内容
+    /// 自己当上闭合，i 于是落在 `'` 与 `,` 之间重新开一个字面量，把 `'{'` 读成代码。
+    /// 这一支在模块外，影响的是本行 delta（真实现里在 `mainline_deployer.rs:9815`），
+    /// 与上面那条合起来才是全树 31 份文件漏读的全部原因。
+    #[test]
+    fn an_escaped_quote_in_a_char_literal_is_content_not_a_terminator() {
+        let source = "fn f() {\n    if v.starts_with(['\"', '\\'', '|', '{']) {\n        \
+                      call_me();\n    }\n}\n";
+        let shapes = brace_shapes(source);
+        assert_eq!(
+            shapes[1].delta, 1,
+            "这一行只有一个真括号，读到的是 {}（多出来的是字面量里的那个）：{:?}",
+            shapes[1].delta, source
+        );
+    }
+
+    /// 真实现里的那份标本：`mainline_deployer.rs` 的测试模块有五千余行，掩码一旦提前
+    /// 收尾，它们整段被当成产出，十几份源码扫描普查同时红。
+    ///
+    /// 合成样例只钉规则；这一格钉的是**这一份文件上的实际后果**，因为规则的错法
+    /// 不止一种，而它们都长成「读到的产出比真的多」。
+    #[test]
+    fn the_fixtures_below_a_multiline_string_stay_out_of_production() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cog-reflection/src/mainline_deployer.rs");
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "读不到标本 {}（{e}）：这一格判的就是它，读不到就不算判过",
+                path.display()
+            )
+        });
+        // 标本还在吗。名字改了就让这一格红着提醒换标本——空断言通过比没有这一格更坏。
+        const SPECIMEN: &str = "fn fake_kubectl_field_removal_under_an_image_bump";
+        assert!(
+            text.contains(SPECIMEN),
+            "标本 {SPECIMEN} 已经不在 {} 里了，换一个测试模块深处的名字",
+            path.display()
+        );
+        let production = production_text(&text);
+        assert!(
+            !production.contains(SPECIMEN),
+            "测试模块深处的夹具被当成产出读了：掩码在它之前就收了尾"
         );
     }
 }
