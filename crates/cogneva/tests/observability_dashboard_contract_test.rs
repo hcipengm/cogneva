@@ -226,6 +226,16 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["dimension", "dir", "role"],
         "crates/cog-reflection/src/build_gate/mod.rs",
     ),
+    // The numbers the ceiling above is computed with, one series per input, and
+    // where each value came from. The ceiling and the dimension name the wall
+    // that is tightest; neither says what the wall was computed with, so a bound
+    // held down by a divisor nobody has re-measured reads exactly like a bound
+    // held down by a busy host. `source` is the word the frozen half was missing.
+    (
+        "cogneva_build_gate_tuning",
+        &["dir", "role", "input", "source"],
+        "crates/cog-core/src/contract/build_gate.rs",
+    ),
     // The growth loop's own inputs, per claim: the declaration in force and the
     // highest usage measured against it. Neither is derivable from the account's
     // other side, which is why the pair is drawn rather than a ratio.

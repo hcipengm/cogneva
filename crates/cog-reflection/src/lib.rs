@@ -259,6 +259,15 @@ pub const LABEL_MANIFEST: &str = "manifest";
 /// 读数按「哪个维度」归属时用的标签键。
 pub const LABEL_DIMENSION: &str = "dimension";
 
+/// Which of a family's inputs a series is about, when the family publishes one
+/// series per input rather than one per reading.
+///
+/// Separate from [`LABEL_DIMENSION`] on purpose: a dimension is a way the host
+/// is measured, and an input is a number the arithmetic is done with. On the
+/// build gate the same series family carries both, and a reader that could not
+/// tell which axis a row sat on would compare a cost with a ceiling.
+pub const LABEL_INPUT: &str = "input";
+
 /// 读数按「哪个槽位」归属时用的标签键。
 pub const LABEL_SLOT: &str = "slot";
 

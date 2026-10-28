@@ -2865,6 +2865,37 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 67,
+          "title": "Build Gate: The Numbers the Ceiling Is Computed With",
+          "description": "Every number the builder process divides its host readings by, with a label saying where each value came from. The ceiling and the dimension beside it say which wall is tightest; these say what the wall was computed with, and that is the half no other series carries: when the assumption that one build costs its calibrated share of cores stops being true, the ceiling goes on dividing by it and every series that moves looks the way it looks when the host is fine. `calibrated` is the value this build ships, measured once on the host it was derived on and frozen since; `configured` is one the deployment's values replaced. The criterion this panel is read against: a ceiling that sits still while all three pressure readings stay below their own calm lines, with every input here still reading `calibrated`, is a stale model rather than a control law holding back -- the control law only keeps a bound down while the host is busy, so a bound that stays down while it is calm has an input that no longer describes the machine. Which input it is follows from the dimension that set the ceiling: cores per build divides the cpu line, peak RSS divides the memory line, the memory floor is what the memory line may not eat into, the io stall budget is the pressure above which the disk dimension refuses another build, and the three calm percentages are the lines below which a dimension is allowed back up.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 320
+          },
+          "targets": [
+            {
+              "expr": "cogneva_build_gate_tuning{role=\"builder\"}",
+              "legendFormat": "{{input}} ({{source}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

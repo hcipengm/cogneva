@@ -77,6 +77,34 @@ pub const BUILD_GATE_SLOTS: &str = "cogneva_build_gate_slots";
 /// fact from a bound of one because the memory floor is in sight, or because the
 /// container's own limit is, and the number alone cannot tell them apart.
 pub const BUILD_GATE_CEILING: &str = "cogneva_build_gate_ceiling";
+/// The numbers the ceiling is computed with, as a gauge, labelled by which one
+/// (`input`) and by where it came from (`source`).
+///
+/// The ceiling is derived from the host's readings, and the arithmetic that
+/// turns those readings into a number of builds is made of these: what one
+/// build costs, how much memory it may not eat into, and how quiet the host has
+/// to be before the bound is allowed back up. Every one of them is a claim about
+/// the machine, and until this series existed none of them was on any face.
+///
+/// That absence is what this series is for, and the shape it hides is worth
+/// stating. A bound that sits still while the host moves underneath it reads, on
+/// the ceiling and dimension series alone, exactly like a bound that is right:
+/// the dimension names which wall is tightest, not what the wall was computed
+/// with. When the assumption "one build costs 4.1 cores" stops being true, the
+/// ceiling goes on dividing by it, and nothing on the exposition says the divisor
+/// was never re-measured. Naming the input and its source is the word a frozen
+/// calibration was missing.
+///
+/// `source` is `shipped` when the value is the calibration this build carries and
+/// `override` when the deployment's configuration replaced it. The two are not
+/// the same reading with a different value: `shipped` says nobody has looked at
+/// this number since it was measured, and `override` says somebody has, which is
+/// the difference between a number that is merely old and one that was chosen.
+///
+/// Published only by a process that enforces a bound: a process that runs no
+/// builds takes no slot and derives nothing, and a tuning series from it would
+/// describe a derivation that is not happening.
+pub const BUILD_GATE_TUNING: &str = "cogneva_build_gate_tuning";
 /// Builds that have taken a slot, as a counter.
 pub const BUILD_GATE_ACQUIRED_TOTAL: &str = "cogneva_build_gate_acquired_total";
 /// Builds that were refused a slot, as a counter, by `reason`: the wall that

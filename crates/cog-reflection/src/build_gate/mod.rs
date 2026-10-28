@@ -1189,6 +1189,91 @@ fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetr
     out
 }
 
+/// The numbers the ceiling is computed with: the `Tuning` field each one comes
+/// from, the configuration key a reader sees it under, and its value in the
+/// units the configuration writes.
+///
+/// The published name is the configuration key rather than the field name
+/// because the reader's next step after seeing one of these is to compare it
+/// with what the deployment declares, and a name matching neither side would
+/// make that a lookup. The field name travels beside it so the census below can
+/// hold this table to the struct: a field added, renamed or removed without a
+/// row here fails that test instead of going quiet.
+fn model_inputs(t: &Tuning) -> Vec<(&'static str, &'static str, f64)> {
+    vec![
+        (
+            "build_demand_cores",
+            "build_demand_cores",
+            t.build_demand_cores,
+        ),
+        (
+            "build_peak_rss_bytes",
+            "build_peak_rss_mib",
+            (t.build_peak_rss_bytes >> 20) as f64,
+        ),
+        (
+            "mem_floor_bytes",
+            "mem_floor_mib",
+            (t.mem_floor_bytes >> 20) as f64,
+        ),
+        (
+            "io_stall_budget_pct",
+            "io_stall_budget_pct",
+            t.io_stall_budget_pct,
+        ),
+        ("cpu_calm_pct", "cpu_calm_pct", t.cpu_calm_pct),
+        ("io_calm_pct", "io_calm_pct", t.io_calm_pct),
+        ("mem_calm_pct", "mem_calm_pct", t.mem_calm_pct),
+    ]
+}
+
+/// The value is the calibration this build carries: measured once on a host and
+/// written down. `calibrated` rather than `derived`, because `derived` already
+/// means "computed from a measurement taken now" in this crate's label
+/// vocabulary, and this one is exactly the case where no such measurement is
+/// being taken.
+const SOURCE_CALIBRATED: &str = "calibrated";
+
+/// The model inputs as series, one per input, labelled by which one it is and
+/// by where the value came from.
+///
+/// A bound that sits still while the host moves under it reads, on the ceiling
+/// and dimension series alone, exactly like a bound that is right: those say
+/// which wall is tightest, never what the wall was computed with. Publishing the
+/// inputs is what lets a reader see that the divisor has not been re-measured,
+/// and the `source` label is the word for it — `calibrated` is a number nobody
+/// has looked at since it was taken, `configured` is one somebody chose.
+fn tuning_readings(t: &Tuning, origin: Origin<'_>) -> Vec<RawMetric> {
+    let shipped = model_inputs(&Tuning::shipped());
+    let label = |m: RawMetric| {
+        m.with_label(
+            crate::evolution_queue_readings::DIR_LABEL,
+            origin.dir.to_string(),
+        )
+        .with_label(crate::LABEL_ROLE, origin.role.to_string())
+    };
+    model_inputs(t)
+        .into_iter()
+        .map(|(field, key, value)| {
+            // A field with no shipped row cannot happen while the census holds
+            // this table to `Tuning`, and reading it as the shipped value is the
+            // fail-safe direction: it says "unchanged" about a number the table
+            // could not compare.
+            let source = match shipped.iter().find(|(f, _, _)| *f == field) {
+                Some((_, _, s)) if (*s - value).abs() > f64::EPSILON => {
+                    crate::verification_budget::SOURCE_CONFIGURED
+                }
+                _ => SOURCE_CALIBRATED,
+            };
+            label(
+                RawMetric::new(BUILD_GATE_TUNING, value)
+                    .with_label(crate::LABEL_INPUT, key.to_string())
+                    .with_label(crate::LABEL_SOURCE, source.to_string()),
+            )
+        })
+        .collect()
+}
+
 /// The whole series set, in one place: a reader that has to tell "no bound here"
 /// from "this deployment never reported" cannot do it if the two sources of the
 /// set can drift.
@@ -3434,6 +3519,11 @@ impl Observable for BuildGate {
         // names the same holder, because the refusal only exists for an ask that
         // happened to be made while the hold was in force.
         metrics.extend(holder_metrics(&self.dir, slots, &origin));
+        // The numbers the ceiling above was computed with. A reader that sees
+        // the ceiling move can tell from these whether the host moved or the
+        // assumption it is divided by did, and `source` says whether anyone has
+        // looked at that assumption since it was measured.
+        metrics.extend(tuning_readings(&self.tuning, origin));
         Ok(metrics)
     }
 
@@ -3456,6 +3546,120 @@ mod tests {
     /// 是被读出来的就换掉其中一项，而不是再写一份同样的数。
     fn shipped() -> Tuning {
         Tuning::shipped()
+    }
+
+    /// 喂进 ceiling 的模型输入必须每一条都有一条序列，否则「界是算出来的」
+    /// 这件事只在因果的上半段成立：读者看得到界动了，看不出它除以的那个数
+    /// 从标定那天起就没再量过。判据读的是 `Tuning` 的字段表本身——新加一格
+    /// 而不发布、或不声明它为什么不是模型输入，这里就红，而不是等下一次有人
+    /// 翻代码才发现。
+    #[test]
+    fn every_tuning_field_is_a_published_model_input_or_a_declared_clock() {
+        /// 我们的钟，不是机器的事实：它们是这条循环自己的节奏，改它们不改变
+        /// 「一台构建要多少」这个判断，所以不进模型输入那一族。
+        const CLOCKS: &[(&str, &str)] = &[
+            (
+                "bound_window",
+                "控制律一拍的长度：它决定多久重新判一次，不决定判出来的数",
+            ),
+            (
+                "cpu_sample_gap",
+                "两次 cpu 采样之间隔多久：它是采样密度，不是被采到的量",
+            ),
+            (
+                "reserve_fresh",
+                "认领的有效期：它是我们给认领定的寿命，不是宿主的事实",
+            ),
+        ];
+
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("struct Tuning {")
+            .expect("Tuning 的定义变了，这条判据会扫到一个空字段表");
+        let end = start + source[start..].find("\n}").expect("Tuning 的花括号没闭合");
+        let body = &source[start..end];
+        let mut fields: Vec<&str> = Vec::new();
+        for line in body.lines().skip(1) {
+            let line = line.trim();
+            if line.starts_with("//") || line.is_empty() {
+                continue;
+            }
+            let Some((name, _)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name.trim();
+            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                fields.push(name);
+            }
+        }
+        // 分母：字段表读空了，「没有缺的」就只是空话。
+        assert!(
+            fields.len() >= 10,
+            "从 Tuning 里只读出了 {fields:?}，这条判据在空转"
+        );
+
+        let clocks: std::collections::BTreeSet<&str> = CLOCKS.iter().map(|(n, _)| *n).collect();
+        // 豁免要指着还在的字段：改个名，原来的豁免就在给空气放行。
+        for (name, why) in CLOCKS {
+            assert!(
+                fields.contains(name),
+                "豁免表里的 `{name}` 已经不是 Tuning 的字段（理由：{why}）"
+            );
+            assert!(!why.trim().is_empty(), "`{name}` 的豁免没写理由");
+        }
+
+        let model: std::collections::BTreeSet<&str> = fields
+            .iter()
+            .copied()
+            .filter(|f| !clocks.contains(f))
+            .collect();
+        let published: std::collections::BTreeSet<&str> = model_inputs(&shipped())
+            .into_iter()
+            .map(|(field, _, _)| field)
+            .collect();
+        assert_eq!(
+            model, published,
+            "Tuning 里喂进 ceiling 的字段与已发布的模型输入对不上：\
+             左边是字段表，右边是 `model_inputs`。新加一格要么发布它，\
+             要么在 CLOCKS 里说清它为什么只是我们的钟"
+        );
+    }
+
+    /// 被运维改过的模型输入要自己说自己是改过的：分不出「标定值」与
+    /// 「有人选过」的读数，等于把一个人的判断读成一次测量。
+    #[test]
+    fn a_model_input_that_differs_from_the_shipped_one_names_itself_configured() {
+        let cfg = BuildGateConfig {
+            build_demand_cores: 8.0,
+            ..BuildGateConfig::default()
+        };
+        let tuned = Tuning::from_config(&cfg);
+        let origin = Origin {
+            dir: "d",
+            role: BUILD_GATE_ROLE_BUILDER,
+        };
+        let series = tuning_readings(&tuned, origin);
+        let demand = series
+            .iter()
+            .find(|m| {
+                m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("build_demand_cores")
+            })
+            .expect("改过的 build_demand_cores 没有出现在这一族里");
+        assert_eq!(demand.value, 8.0);
+        assert_eq!(
+            demand.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+            Some(crate::verification_budget::SOURCE_CONFIGURED)
+        );
+        // 同一份读法下没被改过的那几条仍是标定值：整族都翻成 configured
+        // 就等于这个标签什么都没说。
+        let calm = series
+            .iter()
+            .find(|m| m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("cpu_calm_pct"))
+            .expect("cpu_calm_pct 没有出现在这一族里");
+        assert_eq!(
+            calm.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+            Some(SOURCE_CALIBRATED)
+        );
     }
 
     /// 一台「什么都不忙、内存充足、没有容器内存上限」的宿主，用给定的那份
