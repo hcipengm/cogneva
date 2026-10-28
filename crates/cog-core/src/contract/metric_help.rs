@@ -787,9 +787,12 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          rather than a kind of failure: a gate whose conclusion could not be \
          read is not a gate that said no, and counting the two together hides \
          exactly the case that lets an unverified revision through. Counted per \
-         question rather than per revision: a round asks before the build and \
-         again before the dispatch, so a revision that reads the same way twice \
-         adds two",
+         question rather than per revision: a round asks at its head, again \
+         before the build and again before the dispatch, so a revision that \
+         reads the same way three times adds three. The ask label says which \
+         question heard it, because the three cost different things: a fail at \
+         the round head costs nothing, the same fail before the build saves a \
+         build, and one heard only at dispatch has already paid for the build",
     ),
     (
         "cogneva_mainline_poll_cycles_total",
