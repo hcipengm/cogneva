@@ -30,7 +30,7 @@
 //! 一半：一处按点分段、一处整体加引号，两种都「能跑」，遇到带 schema 的名字就
 //! 只有一种是对的。
 //!
-//! 判据（普查的是 `crates/cog-storage/src` 的生产行）：
+//! 判据（普查的是整棵树里会随产物跑的 Rust 源码）：
 //!
 //! 1. [`SPELT_ONCE`] 里每一条写法在该 crate 的生产代码里**恰好出现一次**。
 //!    第二次出现要么改为引用那一处，要么在这里说明它为什么是同形而不同的东西。
@@ -42,8 +42,9 @@
 //!
 //! - 含义相同但写法不同的两条语句（`SELECT state` 与 `SELECT *`）。本门按写法
 //!   判，不按语义判；能拦住的是抄写，不是重写。
-//! - 结构体在别的 crate 里的构造（`cog-core` 的类型定义、`crates/*/tests/` 的
-//!   夹具）：那不是「读一行」，也不该被同一条判据管。
+//! - 类型定义本身：`pub struct TaskCheckpoint {` 是一个类型，不是一次构造，所以
+//!   构造那一条钉的是构造点的写法而不是类型名；`crates/*/tests/` 的夹具同理，
+//!   它们不是生产行。
 //! - 列顺序本身。判据钉的是「这句话只有一处」，它读得出两处、读不出一处写错了
 //!   列——那一半由 `state_reads` 自己的单元测试与恢复测试覆盖。
 
@@ -52,8 +53,8 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_lines;
+use common::routes::repo_root;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// 只许出现一次的写法，以及它是哪一件事。
 ///
@@ -68,7 +69,9 @@ const SPELT_ONCE: &[(&str, &str)] = &[
         "SELECT snapshot_id, event_offset, timestamp FROM cog_checkpoints",
         "一个 task 的检查点怎么读",
     ),
-    ("TaskCheckpoint {", "一行检查点怎么变成结构体"),
+    // 钉的是构造点，不是类型定义：`pub struct TaskCheckpoint {` 也是这几个字符，
+    // 但它不构造任何东西。整棵树里这条写法只许有一处。
+    ("Ok(TaskCheckpoint {", "一行检查点怎么变成结构体"),
     (
         "AgentState = serde_json::from_str",
         "一份存下来的状态文档怎么解码",
@@ -79,10 +82,6 @@ const SPELT_ONCE: &[(&str, &str)] = &[
     ),
     ("SELECT count(*) FROM {}", "一条关系里有多少行"),
 ];
-
-/// 普查下限：测到的那一天该目录有 60 余个源文件。低于下限说明本门读得太少，
-/// 而这时的「恰好一次」什么也不证明。
-const MIN_FILES: usize = 30;
 
 /// 生产行里 `needle` 出现的次数。一行写两次也算两次，跨行写的算零次——
 /// 零次会被「恰好一次」判红，方向是对的：本门读不到，就不许说它只有一处。
@@ -96,22 +95,15 @@ fn occurrences(text: &str, needle: &str) -> usize {
 /// 该 crate 生产代码里每条写法的全部落点，按文件与行记下来。
 type Sites = BTreeMap<&'static str, Vec<(String, String)>>;
 
-fn census(root: &Path) -> (usize, Sites) {
-    let mut files = Vec::new();
-    walk(&root.join("crates/cog-storage/src"), &["rs"], &mut files);
-    files.sort();
+fn census(root: &Path) -> Sites {
     let mut sites: Sites = SPELT_ONCE
         .iter()
         .map(|(needle, _)| (*needle, Vec::new()))
         .collect();
-    for path in &files {
+    for path in production_sources(root) {
         let text =
-            std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let file = relative_name(root, &path);
         for line in production_lines(&text) {
             for (needle, hits) in sites.iter_mut() {
                 for _ in 0..line.matches(needle).count() {
@@ -120,16 +112,12 @@ fn census(root: &Path) -> (usize, Sites) {
             }
         }
     }
-    (files.len(), sites)
+    sites
 }
 
 #[test]
 fn a_shared_read_is_spelt_once() {
-    let (files, sites) = census(&repo_root());
-    assert!(
-        files >= MIN_FILES,
-        "只读到 {files} 个源文件（下限 {MIN_FILES}），这条判据没有题目"
-    );
+    let sites = census(&repo_root());
 
     let mut findings: Vec<String> = Vec::new();
     for (needle, what) in SPELT_ONCE {

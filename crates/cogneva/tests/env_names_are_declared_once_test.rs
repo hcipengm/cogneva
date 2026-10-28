@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_lines;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -80,20 +80,6 @@ const BUILD_TIME: &[(&str, &[&str])] = &[
         ],
     ),
 ];
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
-}
 
 /// Whether a value is shaped like an environment variable name the platform
 /// owns: an all-caps word under the project prefix.
@@ -187,58 +173,24 @@ fn spelled_names(line: &str) -> Vec<&str> {
     }
     names
 }
-
 /// Every production line that spells an env name, grouped by that name.
 ///
 /// Build scripts are read too: they spell names at compile time, and a version
 /// that arrives as an empty string is the same silent default as a missing
 /// runtime variable.
 fn literal_sites(root: &Path) -> BTreeMap<String, Vec<(String, String)>> {
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .expect("crates/ 不在仓库里")
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
-    crates.sort();
     let mut sites: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-    for krate in crates {
-        let src = krate.join("src");
-        if !src.is_dir() {
-            continue;
-        }
-        let mut files = Vec::new();
-        walk(&src, &mut files);
-        let build_script = krate.join("build.rs");
-        if build_script.is_file() {
-            files.push(build_script);
-        }
-        files.sort();
-        for path in files {
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let file = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let lines = if file.ends_with("build.rs") {
-                // 构建脚本没有测试项，只有注释要跳过。
-                text.lines()
-                    .filter(|line| {
-                        let t = line.trim_start();
-                        !t.starts_with("//") && !t.starts_with("/*") && !t.starts_with('*')
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                production_lines(&text)
-            };
-            for line in lines {
-                for name in spelled_names(line) {
-                    sites
-                        .entry(name.to_string())
-                        .or_default()
-                        .push((file.clone(), line.trim().to_string()));
-                }
+    for path in production_sources(root) {
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let file = relative_name(root, &path);
+        // 构建脚本没有测试项，`production_lines` 在它上面就是「跳过注释」。
+        for line in production_lines(&text) {
+            for name in spelled_names(line) {
+                sites
+                    .entry(name.to_string())
+                    .or_default()
+                    .push((file.clone(), line.trim().to_string()));
             }
         }
     }

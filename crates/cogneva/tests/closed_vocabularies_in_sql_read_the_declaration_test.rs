@@ -21,24 +21,10 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_text;
+use common::rust_production::{production_sources, production_text, relative_name};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
 }
 
 fn parses_as_task_status(word: &str) -> bool {
@@ -459,48 +445,29 @@ struct Hit {
 }
 
 fn hits(root: &Path) -> (Vec<Hit>, usize) {
-    let mut files: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .expect("crates/ 不在仓库里")
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
-    files.sort();
     let mut found = Vec::new();
     let mut compared = 0usize;
-    for krate in files {
-        let src = krate.join("src");
-        if !src.is_dir() {
-            continue;
-        }
-        let mut paths = Vec::new();
-        walk(&src, &mut paths);
-        paths.sort();
-        for path in paths {
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let production = production_text(&text);
-            let file = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            for vocabulary in VOCABULARIES {
-                if vocabulary.except_in.contains(&file.as_str()) {
-                    continue;
-                }
-                for (context, words) in predicates(&production, vocabulary.subjects) {
-                    compared += 1;
-                    for word in words {
-                        if !(vocabulary.parses)(&word) {
-                            continue;
-                        }
-                        found.push(Hit {
-                            file: file.clone(),
-                            home: vocabulary.home,
-                            word,
-                            context: context.clone(),
-                        });
+    for path in production_sources(root) {
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let production = production_text(&text);
+        let file = relative_name(root, &path);
+        for vocabulary in VOCABULARIES {
+            if vocabulary.except_in.contains(&file.as_str()) {
+                continue;
+            }
+            for (context, words) in predicates(&production, vocabulary.subjects) {
+                compared += 1;
+                for word in words {
+                    if !(vocabulary.parses)(&word) {
+                        continue;
                     }
+                    found.push(Hit {
+                        file: file.clone(),
+                        home: vocabulary.home,
+                        word,
+                        context: context.clone(),
+                    });
                 }
             }
         }

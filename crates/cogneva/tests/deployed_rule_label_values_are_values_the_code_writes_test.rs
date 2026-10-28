@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_lines;
+use common::rust_production::{production_lines, production_sources, sources_of_tree};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -250,24 +250,9 @@ fn ours(selection: &Selection) -> bool {
             .any(|(metric, _)| *metric == selection.metric)
 }
 
-fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            source_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 /// The values the rules select on, and the ones no file under `crates/*/src`
 /// spells any more.
-fn wanted_and_missing(root: &Path) -> (BTreeSet<Selection>, Vec<Selection>) {
+fn wanted_and_missing(root: &Path, files: &[PathBuf]) -> (BTreeSet<Selection>, Vec<Selection>) {
     let mut wanted: BTreeSet<Selection> = BTreeSet::new();
     for (file, key) in DOCUMENTS {
         let path = root.join(file);
@@ -283,17 +268,6 @@ fn wanted_and_missing(root: &Path) -> (BTreeSet<Selection>, Vec<Selection>) {
         }
     }
 
-    let mut files: Vec<PathBuf> = Vec::new();
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .unwrap_or_else(|e| panic!("{}: {e}", root.join("crates").display()))
-        .flatten()
-        .map(|entry| entry.path().join("src"))
-        .filter(|src| src.is_dir())
-        .collect();
-    crates.sort();
-    for src in &crates {
-        source_files(src, &mut files);
-    }
     // The production half of each file: a word that survives only in a fixture
     // is not a word the series is written with, and reading the fixtures as
     // well would let a renamed emitter pass on the strength of its own tests.
@@ -334,7 +308,7 @@ fn metrics_selected(root: &Path) -> BTreeSet<String> {
 #[test]
 fn every_value_a_rule_selects_on_is_a_value_the_tree_writes() {
     let root = repo_root();
-    let (wanted, missing) = wanted_and_missing(&root);
+    let (wanted, missing) = wanted_and_missing(&root, &production_sources(&root));
     // 抽取面自检：解析读空了的时候，下面那条判据会在空集上假装绿。
     assert!(
         wanted.len() >= 150,
@@ -428,7 +402,7 @@ fn a_value_no_source_spells_is_reported_missing() {
     )
     .expect("source");
 
-    let (wanted, missing) = wanted_and_missing(root);
+    let (wanted, missing) = wanted_and_missing(root, &sources_of_tree(root));
     // 两份文档、三个选择器：值相同的那两个合成一条。
     assert_eq!(wanted.len(), 2, "{wanted:?}");
     assert_eq!(

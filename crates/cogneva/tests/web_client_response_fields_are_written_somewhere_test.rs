@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_text;
+use common::rust_production::{production_sources, production_text, sources_of_tree};
 
 /// The client module whose interfaces are the response shapes.
 const CLIENT: &str = "web/src/api/client.ts";
@@ -50,20 +50,6 @@ fn repo_root() -> PathBuf {
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-fn walk(dir: &Path, extension: &str, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, extension, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some(extension) {
-            out.push(path);
-        }
-    }
 }
 
 /// Every `export interface X {` in a module, with the plain fields declared at
@@ -123,21 +109,14 @@ fn interfaces(source: &str) -> Vec<(String, Vec<String>)> {
 
 /// The production Rust of the whole tree, as one text.
 ///
-/// Only `crates/*/src/` is read. A gate's own fixtures spell the names it is
-/// looking for — this file's registry names `refreshToken` in order to allow it —
-/// so reading `tests/` would let the gate satisfy its own census and pass over a
-/// field nobody writes.
-fn server_text(root: &Path) -> String {
-    let mut files = Vec::new();
-    let Ok(crates) = std::fs::read_dir(root.join("crates")) else {
-        return String::new();
-    };
-    for entry in crates.flatten() {
-        walk(&entry.path().join("src"), "rs", &mut files);
-    }
+/// The sources that ship, and nothing else. A gate's own fixtures spell the names
+/// it is looking for — this file's registry names `refreshToken` in order to allow
+/// it — so reading `tests/` would let the gate satisfy its own census and pass
+/// over a field nobody writes.
+fn server_text(sources: &[PathBuf]) -> String {
     let mut text = String::new();
-    for path in files {
-        text.push_str(&production_text(&read(&path)));
+    for path in sources {
+        text.push_str(&production_text(&read(path)));
         text.push('\n');
     }
     text
@@ -183,7 +162,7 @@ fn snake_case(name: &str) -> String {
 fn every_field_the_client_declares_is_a_field_the_tree_spells() {
     let root = repo_root();
     let client = read(&root.join(CLIENT));
-    let server = server_text(&root);
+    let server = server_text(&production_sources(&root));
     let missing = unwritten(&client, &server);
 
     for (interface, field, mapping) in RENAMED {
@@ -246,7 +225,7 @@ fn the_census_is_wide_enough_to_mean_something() {
         parsed.len()
     );
     assert!(
-        !server_text(&root).is_empty(),
+        !server_text(&production_sources(&root)).is_empty(),
         "no production Rust was read at all; every field would then be reported and the gate \
          would fail for the wrong reason"
     );
@@ -274,7 +253,10 @@ fn a_field_no_writer_spells_is_reported() {
     .expect("lib");
 
     assert_eq!(
-        unwritten(&read(&root.join(CLIENT)), &server_text(&root)),
+        unwritten(
+            &read(&root.join(CLIENT)),
+            &server_text(&sources_of_tree(&root))
+        ),
         vec!["Row.ghost_field".to_string()]
     );
 
@@ -286,7 +268,11 @@ fn a_field_no_writer_spells_is_reported() {
          Inner,\n}\n",
     )
     .expect("lib");
-    assert!(unwritten(&read(&root.join(CLIENT)), &server_text(&root)).is_empty());
+    assert!(unwritten(
+        &read(&root.join(CLIENT)),
+        &server_text(&sources_of_tree(&root))
+    )
+    .is_empty());
 
     let _ = std::fs::remove_dir_all(&root);
 }

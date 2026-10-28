@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_lines;
+use common::rust_production::{production_lines, production_sources};
 use common::service_topology::{
     network_policies, pod_labels, selector_matches, NetworkPolicySubject,
 };
@@ -45,20 +45,6 @@ const FOREIGN_STACK: &str = "deploy/k3s/observability/";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
 }
 
 /// The component values a crate declares as a string constant. The name has to say
@@ -87,18 +73,8 @@ fn constants_in(text: &str) -> BTreeSet<String> {
 }
 
 fn component_constants(root: &Path) -> BTreeSet<String> {
-    let mut sources = Vec::new();
-    let Ok(crates) = std::fs::read_dir(root.join("crates")) else {
-        return BTreeSet::new();
-    };
-    for krate in crates.flatten() {
-        let src = krate.path().join("src");
-        if src.is_dir() {
-            walk(&src, &mut sources);
-        }
-    }
     let mut out = BTreeSet::new();
-    for path in sources {
+    for path in production_sources(root) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };

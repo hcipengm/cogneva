@@ -101,8 +101,10 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_text;
+use common::routes::repo_root;
+use common::rust_production::{
+    production_sources, production_text, relative_name, sources_of_tree,
+};
 
 /// 这个常量名属于哪一族词——同一族的声明必须写着同一个词。
 ///
@@ -202,29 +204,6 @@ fn word_constants(source: &str) -> Result<Vec<(String, String)>, String> {
         out.push((name, rest[1..close].to_string()));
     }
     Ok(out)
-}
-
-fn relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-/// `crates/*/src` 下的每一个 Rust 文件。
-fn sources(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root.join("crates")) else {
-        return files;
-    };
-    for entry in entries.flatten() {
-        let src = entry.path().join("src");
-        if src.is_dir() {
-            walk(&src, &["rs"], &mut files);
-        }
-    }
-    files.sort();
-    files
 }
 
 /// 标签**键**位置的判据不区分「这个词有没有人声明过」。
@@ -374,14 +353,14 @@ fn crate_of(where_: &str) -> Option<&str> {
     where_.strip_prefix("crates/")?.split('/').next()
 }
 
-fn contradictions(root: &Path) -> Vec<String> {
+fn contradictions(root: &Path, sources: &[PathBuf]) -> Vec<String> {
     let mut complaints = Vec::new();
     let mut declarations: Vec<(String, String, String)> = Vec::new();
     let mut files: Vec<(String, String)> = Vec::new();
 
-    for path in sources(root) {
-        let where_ = relative(root, &path);
-        let Ok(raw) = std::fs::read_to_string(&path) else {
+    for path in sources {
+        let where_ = relative_name(root, path);
+        let Ok(raw) = std::fs::read_to_string(path) else {
             complaints.push(format!("  `{where_}` 读不出来：读不出来按红处理"));
             continue;
         };
@@ -486,7 +465,7 @@ fn contradictions(root: &Path) -> Vec<String> {
 
 #[test]
 fn a_label_constant_declared_twice_says_the_same_word_both_times() {
-    let complaints = contradictions(&repo_root());
+    let complaints = contradictions(&repo_root(), &production_sources(&repo_root()));
     assert!(
         complaints.is_empty(),
         "同名常量必须写着同一个词；它们是各文件各写一遍的，编译器不比较，改一处不会有\
@@ -504,7 +483,7 @@ fn fixture_complaints(files: &[(&str, &str)]) -> Vec<String> {
         std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
         std::fs::write(full, body).expect("write");
     }
-    contradictions(dir.path())
+    contradictions(dir.path(), &sources_of_tree(dir.path()))
         .into_iter()
         .filter(|c| !c.contains("普查只读到"))
         .collect()
@@ -748,7 +727,7 @@ fn a_tree_that_declares_nothing_is_not_green() {
     let full = dir.path().join(ONE);
     std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
     std::fs::write(full, "pub fn nothing() {}\n").expect("write");
-    let complaints = contradictions(dir.path());
+    let complaints = contradictions(dir.path(), &sources_of_tree(dir.path()));
     assert!(
         complaints.iter().any(|c| c.contains("普查只读到")),
         "{complaints:?}"

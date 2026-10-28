@@ -34,6 +34,25 @@ pub const MIN_PRODUCTION_FILES: usize = 500;
 /// 集合都会是空的，断言全部成立，二十份门一起变成 vacuous 而没有任何一份会红。
 /// 放在这里，调用点免费继承。
 pub fn production_sources(root: &Path) -> Vec<PathBuf> {
+    let out = sources_of_tree(root);
+    assert!(
+        out.len() >= MIN_PRODUCTION_FILES,
+        "只读到 {} 个生产源文件（下限 {MIN_PRODUCTION_FILES}）：这份普查没有一个题目，\
+         任何「树上再没有第二处」的断言在空集上都成立",
+        out.len()
+    );
+    out
+}
+
+/// 同一棵树里的生产源文件，不设下限。
+///
+/// 只给「测试自己搭的那棵树」用。假树的文件数是测试自己写下的那几行，下限在这里
+/// 挡不住走错路的遍历，只会让每一个拿假树问问题的对照测试在 helper 里 panic——那样
+/// 红的是 helper，不是被问的那条判据。
+///
+/// 判真树的门一律用 [`production_sources`]：下限的意义是「这棵树真的被读到了」，
+/// 而那句话只有对真树才成立。
+pub fn sources_of_tree(root: &Path) -> Vec<PathBuf> {
     let crates = root.join("crates");
     let entries = std::fs::read_dir(&crates)
         .unwrap_or_else(|e| panic!("{}: {e}——普查的前提是这棵树有 crates/", crates.display()));
@@ -46,12 +65,6 @@ pub fn production_sources(root: &Path) -> Vec<PathBuf> {
         out.extend(sources_of_crate(&crate_dir));
     }
     out.sort();
-    assert!(
-        out.len() >= MIN_PRODUCTION_FILES,
-        "只读到 {} 个生产源文件（下限 {MIN_PRODUCTION_FILES}）：这份普查没有一个题目，\
-         任何「树上再没有第二处」的断言在空集上都成立",
-        out.len()
-    );
     out
 }
 
@@ -403,6 +416,32 @@ mod tests {
             relative_name(root, Path::new("/tree/crates/a/src/b.rs")),
             relative_name(root, &Path::new("/tree/crates").join("a/src/b.rs"))
         );
+    }
+
+    /// 下限只保护「判真树的普查」这一种读者。
+    ///
+    /// 测试自己搭的树有几个文件由测试说了算，下限在那里挡不住走错路的遍历，只会让
+    /// 拿假树问问题的对照测试在 helper 里 panic——红的是 helper，不是被判的那条规则。
+    /// 两条入口的差别就是这一条：同一棵树，带下限的那条拒读，不带的那条照读。
+    #[test]
+    fn the_floor_belongs_to_the_census_not_to_the_tree() {
+        let root = std::env::temp_dir().join(format!("census-fresh-tree-{}", std::process::id()));
+        let crate_dir = root.join("crates/only");
+        std::fs::create_dir_all(crate_dir.join("src")).expect("a scratch crate");
+        std::fs::write(crate_dir.join("src/lib.rs"), "pub fn f() {}\n").expect("a source file");
+
+        assert_eq!(
+            sources_of_tree(&root)
+                .iter()
+                .map(|p| relative_name(&root, p))
+                .collect::<Vec<_>>(),
+            vec!["crates/only/src/lib.rs"],
+            "不带下限的入口要把这棵树里有的文件都读出来"
+        );
+        let refused = std::panic::catch_unwind(|| production_sources(&root));
+        assert!(refused.is_err(), "同一棵树走判真树的那条入口，下限必须拒读");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// 构建脚本算生产源码：它在编译期跑，读的是同一份环境变量。今天四个 crate 有

@@ -25,14 +25,14 @@
 //! a live pod is a different question, answered by the topology reading itself.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize as _;
 use serde_yaml::Value;
 
 mod common;
 
-use common::rust_production::production_text;
+use common::rust_production::{production_sources, production_text};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -304,35 +304,6 @@ fn a_command_that_cannot_reach_the_internal_face_is_not_asked_to_report() {
     );
 }
 
-/// 生产源码：`crates/*/src` 下的每个 `.rs`。
-fn production_sources(root: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    for krate in std::fs::read_dir(root.join("crates"))
-        .expect("crates/")
-        .flatten()
-    {
-        let src = krate.path().join("src");
-        if src.is_dir() {
-            walk(&src, &mut out);
-        }
-    }
-    out.sort();
-    out
-}
-
 /// 自报地址只有一份写法：一个是写它的文件，其余都得引用它。
 ///
 /// 采集器曾经在 `process_census.rs` 里把同一个 `http://…` 又写了一遍，两个常量谁也
@@ -356,11 +327,6 @@ fn the_report_address_is_spelled_in_one_production_file() {
     let literal = format!("\"{url}\"");
 
     let sources = production_sources(&root);
-    assert!(
-        sources.len() > 20,
-        "只扫到 {} 个生产源文件——读取器坏了，这条判据会绿得没有意义",
-        sources.len()
-    );
     assert!(
         report.contains(&literal),
         "自报模块自己没有写出 {literal}——读取器问错了文件"

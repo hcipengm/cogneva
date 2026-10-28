@@ -16,11 +16,11 @@
 //! 一条报 `reranker` 没有任何调用点；改回来即绿。
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod common;
 
-use common::rust_production::production_lines;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -69,36 +69,11 @@ fn phase_of(argument: &str) -> Option<&str> {
 }
 
 fn sources() -> Vec<(String, String)> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
     let root = repo_root();
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(root.join("crates")).expect("crates/ 不在仓库里") {
-        let src = entry.expect("可读目录项").path().join("src");
-        if src.is_dir() {
-            walk(&src, &mut files);
-        }
-    }
-    files.sort();
-    files
+    production_sources(&root)
         .into_iter()
         .map(|path| {
-            let rel = path
-                .strip_prefix(&root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = relative_name(&root, &path);
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             (rel, text)

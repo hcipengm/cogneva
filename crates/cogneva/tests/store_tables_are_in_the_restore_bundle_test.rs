@@ -45,7 +45,9 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_text;
+use common::rust_production::{
+    production_sources, production_text, relative_name, sources_of_tree,
+};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -238,60 +240,29 @@ fn tables_created(production: &str) -> Vec<String> {
         .collect()
 }
 
-fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            source_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 /// Every production file that creates a table, as `(repo-relative path, names)`.
-fn table_creators(root: &Path) -> Vec<(String, BTreeSet<String>)> {
-    let mut files = Vec::new();
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .unwrap_or_else(|e| panic!("{}: {e}", root.join("crates").display()))
-        .flatten()
-        .map(|entry| entry.path().join("src"))
-        .filter(|src| src.is_dir())
-        .collect();
-    crates.sort();
-    for src in crates {
-        source_files(&src, &mut files);
-    }
+fn table_creators(root: &Path, sources: &[PathBuf]) -> Vec<(String, BTreeSet<String>)> {
     let mut out = Vec::new();
-    for path in files {
-        let text = read(&path);
+    for path in sources {
+        let text = read(path);
         let statements = tables_created(&production_text(&text));
         if statements.is_empty() {
             continue;
         }
         let tables: BTreeSet<String> = statements.into_iter().filter(|n| !n.is_empty()).collect();
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .to_string();
-        out.push((rel, tables));
+        out.push((relative_name(root, path), tables));
     }
     out
 }
 
-fn disagreements(root: &Path, registered: &[(&str, &str)]) -> Vec<String> {
+fn disagreements(root: &Path, registered: &[(&str, &str)], sources: &[PathBuf]) -> Vec<String> {
     let mut out = Vec::new();
     let bundle = read(&root.join(BUNDLE));
     let bundled = bundled_files(&bundle);
     let named: BTreeSet<&str> = bundled.iter().map(String::as_str).collect();
     let mut seen: BTreeSet<String> = BTreeSet::new();
 
-    for (file, tables) in table_creators(root) {
+    for (file, tables) in table_creators(root, sources) {
         seen.insert(file.clone());
         if named.contains(file.as_str()) {
             continue;
@@ -334,7 +305,7 @@ fn every_store_that_creates_a_table_is_in_the_restore_bundle() {
     let root = repo_root();
     // 抽取面自检：一个文件都没扫到、或 bundle 一个文件都没读到时，下面那条
     // 判据会在两张空表上相等而假装绿。
-    let creators = table_creators(&root);
+    let creators = table_creators(&root, &production_sources(&root));
     assert!(
         creators.len() >= 15,
         "生产半边只认出 {} 个建表的文件，扫描器本身坏了",
@@ -356,7 +327,7 @@ fn every_store_that_creates_a_table_is_in_the_restore_bundle() {
         );
     }
 
-    let found = disagreements(&root, NOT_IN_THE_BUNDLE);
+    let found = disagreements(&root, NOT_IN_THE_BUNDLE, &production_sources(&root));
     assert!(
         found.is_empty(),
         "有 store 在库里建表，而恢复用的 bundle 不知道：\n{}\n\
@@ -401,7 +372,7 @@ fn a_store_outside_the_bundle_is_reported() {
 
     // bundle 自己建「表」是因为拿它当针，登记掉。
     let registered = [("crates/cogneva/src/schema_bundle.rs", "针")];
-    let found = disagreements(root, &registered);
+    let found = disagreements(root, &registered, &sources_of_tree(root));
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("forgotten.rs"), "{found:?}");
     assert!(found[0].contains("forgotten"), "{found:?}");
@@ -415,7 +386,10 @@ fn a_store_outside_the_bundle_is_reported() {
         ),
     )
     .expect("bundle");
-    assert_eq!(disagreements(root, &registered), Vec::<String>::new());
+    assert_eq!(
+        disagreements(root, &registered, &sources_of_tree(root)),
+        Vec::<String>::new()
+    );
 
     // 被 bundle 列着的文件不再建表了：这条登记过期。
     std::fs::write(
@@ -423,7 +397,7 @@ fn a_store_outside_the_bundle_is_reported() {
         "pub const DDL: &str = \"SELECT 1\";\n",
     )
     .expect("kept");
-    let stale = disagreements(root, &registered);
+    let stale = disagreements(root, &registered, &sources_of_tree(root));
     assert_eq!(stale.len(), 1, "{stale:?}");
     assert!(stale[0].contains("过期"), "{stale:?}");
 }

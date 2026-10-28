@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_text;
+use common::rust_production::{production_sources, production_text, sources_of_tree};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -489,32 +489,6 @@ fn strip_comments(text: &str) -> String {
     out
 }
 
-fn crate_src_dirs(root: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .unwrap_or_else(|e| panic!("{}: {e}", root.join("crates").display()))
-        .flatten()
-        .map(|entry| entry.path().join("src"))
-        .filter(|src| src.is_dir())
-        .collect();
-    dirs.sort();
-    dirs
-}
-
-fn source_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            source_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 /// Each enum's name and the variants it declares, in declaration order.
 type Declared = Vec<(String, Vec<String>)>;
 
@@ -523,7 +497,7 @@ type Constructed = BTreeMap<(String, String), usize>;
 
 /// Every variant declared in each of `enums`, in declaration order, and how
 /// many production sites construct one.
-fn census_of(root: &Path, enums: &[(&str, &str)]) -> (Declared, Constructed) {
+fn census_of(root: &Path, enums: &[(&str, &str)], sources: &[PathBuf]) -> (Declared, Constructed) {
     let declared: Declared = enums
         .iter()
         .map(|(file, name)| (name.to_string(), declared_variants(root, file, name)))
@@ -534,11 +508,7 @@ fn census_of(root: &Path, enums: &[(&str, &str)]) -> (Declared, Constructed) {
             counts.insert((name.clone(), variant.clone()), 0);
         }
     }
-    let mut files = Vec::new();
-    for src in crate_src_dirs(root) {
-        source_files(&src, &mut files);
-    }
-    for path in &files {
+    for path in sources {
         let text =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let production = production_text(&text);
@@ -558,7 +528,7 @@ fn census_of(root: &Path, enums: &[(&str, &str)]) -> (Declared, Constructed) {
 
 fn census(root: &Path) -> (Declared, Constructed) {
     let enums: Vec<(&str, &str)> = WIRE_ENUMS.iter().map(|e| (e.file, e.name)).collect();
-    census_of(root, &enums)
+    census_of(root, &enums, &production_sources(root))
 }
 
 fn holes(counts: &Constructed, registered: &[(&str, &str, &str)]) -> Vec<String> {
@@ -687,7 +657,7 @@ fn a_variant_nobody_constructs_is_reported() {
     .expect("source");
 
     let enums = [("crates/cog-core/src/types/event.rs", "AgentEvent")];
-    let (declared, counts) = census_of(root, &enums);
+    let (declared, counts) = census_of(root, &enums, &sources_of_tree(root));
     assert_eq!(declared.len(), 1, "{declared:?}");
     assert_eq!(declared[0].1, ["Produced", "OnlyMatched", "FromTheWire"]);
     let key = |name: &str| ("AgentEvent".to_string(), name.to_string());
@@ -715,7 +685,7 @@ fn a_variant_nobody_constructs_is_reported() {
          }\n",
     )
     .expect("source");
-    let (_, counts) = census_of(root, &enums);
+    let (_, counts) = census_of(root, &enums, &sources_of_tree(root));
     let found = holes(&counts, &registered);
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("过期"), "{found:?}");

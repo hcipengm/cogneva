@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_lines;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -67,12 +67,19 @@ struct Exempt {
     why: &'static str,
 }
 
-/// Same spelling, different thing.
+/// Same spelling, mostly a different thing.
 ///
-/// Each of these names something that is not the declared string: a field of a
+/// Most of these name something that is not the declared string: a field of a
 /// structured payload, a container name inside a pod, a command a person types.
-/// Reading the declaration here would be a coupling nobody asked for, which is
+/// Reading the declaration there would be a coupling nobody asked for, which is
 /// why they are written down rather than quietly skipped.
+///
+/// The build-time names are the exception: same thing, written by a program
+/// that cannot read the declaration. A build script and the compile that reads
+/// its `env!` output are two programs; linking the contract crate into either
+/// would put its whole dependency tree in front of every build. The spelling is
+/// still held — the env-name census pins each of those files by name — so a
+/// rename turns both gates red rather than one.
 const EXEMPT: &[Exempt] = &[
     Exempt {
         file: "crates/cog-agent/src/agent_kernel/runtime.rs",
@@ -144,6 +151,19 @@ const EXEMPT: &[Exempt] = &[
               那条构造里角色读的是常量，显示名改了只换一个标签",
     },
     Exempt {
+        file: "crates/cogneva/build.rs",
+        value: "COGNEVA_GIT_REVISION",
+        why: "构建期名字的写这一侧：构建脚本是宿主程序，链接 cog-core 会把整棵契约\
+              依赖树编到每一次构建前面。名字在这里声明一次、经 `cargo:rustc-env`\
+              注入，读回它的是 build_info.rs 那两处 `env!` 字面量——三处任一改名，\
+              这两条豁免与构建期名字的普查同时过期",
+    },
+    Exempt {
+        file: "crates/cogneva/build.rs",
+        value: "COGNEVA_VERSION_ID",
+        why: "同上：构建脚本注入、编译期读回，两个程序各自需要这个名字",
+    },
+    Exempt {
         file: "crates/cogneva/src/build_info.rs",
         value: "COGNEVA_GIT_REVISION",
         why: "构建期名字：`env!` 只接受字面量，读它的是编译器而不是运行期，\
@@ -156,27 +176,6 @@ const EXEMPT: &[Exempt] = &[
         why: "同上：`env!` 的字面量要求",
     },
 ];
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
-}
-
-fn relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
 
 /// A value worth holding to one spelling: long enough and shaped like a path,
 /// an env name, a metric, a header or a label rather than a word two unrelated
@@ -198,16 +197,24 @@ struct Declaration {
 
 /// The `pub const NAME: &str = "value"` declarations in the declaring crates.
 fn declarations(root: &Path) -> Vec<Declaration> {
-    let mut files = Vec::new();
-    for dir in DECLARATION_DIRS {
-        walk(&root.join(dir), &mut files);
-    }
+    let mut files: Vec<PathBuf> = production_sources(root)
+        .into_iter()
+        .filter(|path| {
+            DECLARATION_DIRS
+                .iter()
+                .any(|dir| path.starts_with(root.join(dir)))
+        })
+        .collect();
     files.sort();
+    assert!(
+        !files.is_empty(),
+        "声明目录 {DECLARATION_DIRS:?} 下一个源文件都没有：这些值没人声明了，本门没有题目"
+    );
     let mut out = Vec::new();
     for path in files {
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let file = relative(root, &path);
+        let file = relative_name(root, &path);
         for line in text.lines() {
             let Some(at) = line.find("pub const ") else {
                 continue;
@@ -298,41 +305,26 @@ fn marker_hits(root: &Path) -> Vec<Hit> {
         .filter(|declaration| marker_name(&declaration.name) && structural(&declaration.value))
         .map(|declaration| (declaration.file, declaration.value))
         .collect();
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .expect("crates/ 不在仓库里")
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
-    crates.sort();
     let mut hits = Vec::new();
-    for krate in crates {
-        let src = krate.join("src");
-        if !src.is_dir() {
-            continue;
-        }
-        let mut files = Vec::new();
-        walk(&src, &mut files);
-        files.sort();
-        for path in files {
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let file = relative(root, &path);
-            for line in production_lines(&text) {
-                let written = literals(line);
-                for (declared_in, marker) in &markers {
-                    if &file == declared_in {
-                        continue;
-                    }
-                    if written
-                        .iter()
-                        .any(|literal| literal.starts_with(marker.as_str()))
-                    {
-                        hits.push(Hit {
-                            file: file.clone(),
-                            value: marker.clone(),
-                            line: line.trim().to_string(),
-                        });
-                    }
+    for path in production_sources(root) {
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let file = relative_name(root, &path);
+        for line in production_lines(&text) {
+            let written = literals(line);
+            for (declared_in, marker) in &markers {
+                if &file == declared_in {
+                    continue;
+                }
+                if written
+                    .iter()
+                    .any(|literal| literal.starts_with(marker.as_str()))
+                {
+                    hits.push(Hit {
+                        file: file.clone(),
+                        value: marker.clone(),
+                        line: line.trim().to_string(),
+                    });
                 }
             }
         }
@@ -372,40 +364,25 @@ fn retypes(root: &Path, values: &BTreeMap<String, BTreeSet<String>>) -> Vec<Hit>
             .insert(owning_crate(&declaration.file).to_string());
     }
 
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .expect("crates/ 不在仓库里")
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
-    crates.sort();
     let mut hits = Vec::new();
-    for krate in crates {
-        let src = krate.join("src");
-        if !src.is_dir() {
-            continue;
-        }
-        let mut files = Vec::new();
-        walk(&src, &mut files);
-        files.sort();
-        for path in files {
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let file = relative(root, &path);
-            let krate_dir = owning_crate(&file);
-            for line in production_lines(&text) {
-                if let Some(value) = retyped_value(line, &quoted) {
-                    let owned_here = declaring
-                        .get(value)
-                        .is_some_and(|crates| crates.contains(krate_dir));
-                    if owned_here {
-                        continue;
-                    }
-                    hits.push(Hit {
-                        file: file.clone(),
-                        value: value.clone(),
-                        line: line.trim().to_string(),
-                    });
+    for path in production_sources(root) {
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let file = relative_name(root, &path);
+        let krate_dir = owning_crate(&file);
+        for line in production_lines(&text) {
+            if let Some(value) = retyped_value(line, &quoted) {
+                let owned_here = declaring
+                    .get(value)
+                    .is_some_and(|crates| crates.contains(krate_dir));
+                if owned_here {
+                    continue;
                 }
+                hits.push(Hit {
+                    file: file.clone(),
+                    value: value.clone(),
+                    line: line.trim().to_string(),
+                });
             }
         }
     }
