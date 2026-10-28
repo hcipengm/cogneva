@@ -5,5 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/root/omc_workspace/cogneva/deploy/k3s/pull-upstream-main.sh
+# 检出位置逐机不同（旧机 /root/omc_workspace、新机 ~/work/…），所以单元里不写死。
+# 装机时把 COGNEVA_CHECKOUT=<检出根> 写进 /etc/cogneva/host.conf；没写就让启动
+# 以一句点名该变量的错误失败——写一个只在某一台机器上存在的路径，失败信息指向的
+# 是一个根本不该存在的目录，读起来跟「这台机器没装好」是两回事，实际是同一个。
+Environment=COGNEVA_CHECKOUT=
+EnvironmentFile=-/etc/cogneva/host.conf
+ExecStart=/bin/sh -c 'exec "${COGNEVA_CHECKOUT:?COGNEVA_CHECKOUT 未设置：检出位置见本单元注释}/deploy/k3s/pull-upstream-main.sh"'
 Nice=10

@@ -12,8 +12,8 @@
 # 不会自己从 GitHub 拉取——公版 main 前进后没有任何环节把它带进集群。
 # 当时的补法是在宿主补一个定时器；现在这条源头搬进了集群内。
 #
-# 手动用法（仅在集群内跟踪不可用时）：
-#   /root/omc_workspace/cogneva/deploy/k3s/pull-upstream-main.sh
+# 手动用法（仅在集群内跟踪不可用时），在检出目录里直接跑：
+#   deploy/k3s/pull-upstream-main.sh [源仓库] [bare 仓库]
 # 配套 timer 已于 2026-09-19 停用（systemctl disable --now
 # cogneva-upstream-pull.timer）；本脚本只是手动通道，别再把 timer 装回去。
 #
@@ -21,11 +21,17 @@
 # 被墙、SSH 通）；任何失败只记日志不致命。
 set -euo pipefail
 
-SRC_REPO="${1:-/root/omc_workspace/cogneva}"
+# 源仓库默认就是本脚本所在的那棵树：脚本住在 <检出>/deploy/k3s/ 里，往上两级
+# 即检出根。检出位置逐机不同（旧机 /root/omc_workspace、新机 ~/work/…），写成字面量
+# 的那一份只在一台机器上成立，换机后它以「源仓库不存在」退出——和「根本没配」分不开。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_REPO="${1:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 BARE="${2:-/var/lib/cogneva-data/git-remote}"
-DEPLOY_KEY="${COGNEVA_DEPLOY_KEY:-/root/omc_workspace/backups/keys/cogneva_deploy_key}"
+# deploy key 没有可推导的位置（它不在检出里、也不该进检出），所以不给默认值：
+# 空串让下面那条存在性检查以「未设置」的措辞失败，而不是指向某台机器上的路径。
+DEPLOY_KEY="${COGNEVA_DEPLOY_KEY:-}"
 UPSTREAM_URL="${COGNEVA_UPSTREAM_URL:-git@github.com:hcipengm/cogneva.git}"
-SYNC_SCRIPT="$(dirname "$0")/sync-git-remote.sh"
+SYNC_SCRIPT="$SCRIPT_DIR/sync-git-remote.sh"
 
 # flock 防重入：上一轮 fetch/推送还没跑完时跳过。
 LOCK="/tmp/cogneva-upstream-pull.lock"
@@ -39,6 +45,7 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 [ -d "$SRC_REPO/.git" ] || { log "源仓库不存在: $SRC_REPO" >&2; exit 1; }
 [ -f "$BARE/HEAD" ] || { log "bare 仓库不存在: $BARE（bootstrap 未 seed？）" >&2; exit 1; }
+[ -n "$DEPLOY_KEY" ] || { log "未设置 COGNEVA_DEPLOY_KEY（指向 GitHub 的 SSH deploy key）" >&2; exit 1; }
 [ -f "$DEPLOY_KEY" ] || { log "deploy key 不存在: $DEPLOY_KEY" >&2; exit 1; }
 
 # GIT_CONFIG_GLOBAL=/dev/null：绕开宿主全局 git 配置里的 HTTPS 重写/署名，

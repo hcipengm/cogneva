@@ -14,7 +14,10 @@
 # 安全约束：只快进（--no-force）；分叉即报错留人工处置，绝不强推覆盖。
 set -euo pipefail
 
-SRC_REPO="${1:-/root/omc_workspace/cogneva}"
+# 源仓库默认就是本脚本所在的那棵树：脚本住在 <检出>/deploy/k3s/ 里，往上两级
+# 即检出根。检出位置逐机不同，写成字面量的那一份只在某一台机器上成立。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SRC_REPO="${1:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
 BARE="${2:-/var/lib/cogneva-data/git-remote}"
 
 [ -d "$SRC_REPO/.git" ] || { echo "源仓库不存在: $SRC_REPO" >&2; exit 1; }
