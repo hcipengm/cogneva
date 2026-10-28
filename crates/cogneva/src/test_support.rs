@@ -12,7 +12,7 @@ use tower::ServiceExt;
 /// 请求 `app` 的 `path`，读回 `(状态码, 正文)`。
 ///
 /// 走的是真的路由器而不是直接调处理函数：读的判据是「一个 scrape 能拿到什么」，
-/// 路由挂没挂、路径对不对，都只有从这里才看得见。正文最多读到 1 MiB——超过这个
+/// 路由挂没挂、路径对不对，都只有从这里才看得见。正文默认最多读到 1 MiB——超过这个
 /// 量的正文本身就说明这一面在无限长，而不是这一条断言写错了。
 pub(crate) async fn scrape(app: Router, path: &str) -> (StatusCode, String) {
     let response = app
