@@ -19,6 +19,12 @@ use std::path::{Path, PathBuf};
 // `bootstrap/src` and a handful of integration fixtures -- where `super` is the
 // crate root and there is no `fsio` to find. Naming the file relative to this
 // one compiles in both places, and keeps `walk_files` the only recursion.
+//
+// Inside `tests/common/` that naming mounts a second copy of a file the harness
+// already mounts as `common::fsio`. The copy is the price of compiling here
+// without a sibling, and it is inert: the module is free functions over paths,
+// with no state and no type whose identity two copies could split.
+#[allow(clippy::duplicate_mod)]
 #[path = "fsio.rs"]
 mod fsio;
 
