@@ -29,6 +29,8 @@
 
 mod common;
 
+use common::routes::read;
+
 use common::routes::repo_root;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -124,10 +126,6 @@ struct Published {
 struct Proof {
     file: String,
     test: String,
-}
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 fn registry() -> Registry {

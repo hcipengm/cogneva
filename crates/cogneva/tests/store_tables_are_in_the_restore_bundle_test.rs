@@ -45,6 +45,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::routes::read;
+
 use common::routes::repo_root;
 
 use common::rust_production::{
@@ -68,10 +70,6 @@ const NOT_IN_THE_BUNDLE: &[(&str, &str)] = &[
         "分区：父表由迁移建，分区是装进表里的数据，不是空库接纳行所需的形状",
     ),
 ];
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// The files the bundle's `include_str!` block names, as repo-relative paths.
 ///

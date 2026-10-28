@@ -44,6 +44,8 @@
 
 mod common;
 
+use common::routes::read;
+
 use common::routes::repo_root;
 
 use std::collections::BTreeSet;
@@ -54,10 +56,6 @@ const CLIENT: &str = "web/src/api/client.ts";
 
 /// The directory whose files count as callers.
 const WEB: &str = "web/src";
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// Drop `//` and `/* */` comments, keep string literals.
 ///

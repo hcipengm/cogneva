@@ -56,38 +56,12 @@
 
 mod common;
 
+use common::routes::{read, walk};
+
 use common::routes::repo_root;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
-
-fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
-    // 读不出来就 panic：递归遍历里跳过一个子目录不会让任何断言变红，而剩下的那份
-    // 普查往往仍高于下限——「少读了一块」与「那一块都合规」在判词上分不开。
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{} 读不出来（{e}）：这棵树的普查面少了一块，而用剩下的那份判出来的\
-             结论与「整片区都合规」同形",
-            dir.display()
-        )
-    });
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, extensions, out);
-        } else if path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| extensions.contains(&e))
-        {
-            out.push(path);
-        }
-    }
-}
+use std::path::Path;
 
 /// Comments dropped, string literals kept. Both sides quote names in prose — a
 /// doc comment saying "reads `?limit=`" is not a reader — and both sides spell

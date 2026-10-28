@@ -35,9 +35,11 @@
 //! 消融对照：在临时树上给一个接口加 `ghost_field`，本门红并点名 `接口名.字段`；
 //! 把这个名字写进 Rust 侧，同一棵树转绿。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod common;
+
+use common::routes::read;
 
 use common::routes::repo_root;
 
@@ -45,10 +47,6 @@ use common::rust_production::{production_sources, production_text, sources_of_tr
 
 /// The client module whose interfaces are the response shapes.
 const CLIENT: &str = "web/src/api/client.ts";
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// Every `export interface X {` in a module, with the plain fields declared at
 /// the top level of its body.

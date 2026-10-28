@@ -23,6 +23,8 @@
 
 mod common;
 
+use common::routes::read;
+
 use common::routes::repo_root;
 
 use std::path::{Path, PathBuf};
@@ -48,10 +50,6 @@ const QUOTA_KEYS: [&str; 6] = [
 ];
 
 const LIMIT_RANGE_KEYS: [&str; 3] = ["maxCpu", "maxMemory", "pvcMaxStorage"];
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// The generated file for a profile, by the same rule `render-deploy.sh` and
 /// `bootstrap` use: the profile's own file stem.

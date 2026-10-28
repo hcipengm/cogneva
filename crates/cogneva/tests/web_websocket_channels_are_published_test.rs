@@ -17,18 +17,16 @@
 
 mod common;
 
+use common::routes::{read, walk};
+
 use common::routes::repo_root;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const PROTOCOL: &str = "crates/cog-gateway/src/websocket_protocol.rs";
 const WEB: &str = "web/src";
 const TAKEOVER: &str = "crates/cog-gateway/src/takeover.html";
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 fn strip_comments(text: &str) -> String {
     let bytes = text.as_bytes();
@@ -153,7 +151,7 @@ fn matches(subscription: &str, family: &str) -> bool {
 
 fn all_subscribed(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
     let mut files = Vec::new();
-    collect(&root.join(WEB), &mut files);
+    walk(&root.join(WEB), &["ts", "tsx"], &mut files);
     let page = root.join(TAKEOVER);
     if page.exists() {
         files.push(page);
@@ -171,29 +169,6 @@ fn all_subscribed(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
         }
     }
     out
-}
-
-fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
-    // 读不出来就 panic：递归遍历里跳过一个子目录不会让任何断言变红，而剩下的那份
-    // 普查往往仍高于下限——「少读了一块」与「那一块都合规」在判词上分不开。
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{} 读不出来（{e}）：这棵树的普查面少了一块，而用剩下的那份判出来的\
-             结论与「整片区都合规」同形",
-            dir.display()
-        )
-    });
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect(&path, out);
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("ts") | Some("tsx")
-        ) {
-            out.push(path);
-        }
-    }
 }
 
 fn contradictions(root: &Path) -> (Vec<String>, usize) {

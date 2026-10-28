@@ -43,6 +43,8 @@
 
 mod common;
 
+use common::routes::read;
+
 use common::routes::repo_root;
 
 use std::collections::BTreeMap;
@@ -53,10 +55,6 @@ use std::path::{Path, PathBuf};
 const WEB_ROOT: &str = "web/src";
 const LANDING: &str = "crates/cog-gateway/src/auth/platform.rs";
 const TAKEOVER: &str = "crates/cog-gateway/src/takeover.html";
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 fn web_files(dir: &Path, out: &mut Vec<PathBuf>) {
     // 读不出来就 panic：递归里跳过一个子目录不会让任何断言变红，而剩下的两份

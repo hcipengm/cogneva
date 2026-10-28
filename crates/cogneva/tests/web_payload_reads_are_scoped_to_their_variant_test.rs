@@ -41,6 +41,8 @@
 
 mod common;
 
+use common::routes::read;
+
 use common::routes::repo_root;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,10 +65,6 @@ const WEB: &str = "web/src";
 /// 名字，读的也不是变体字段，判到它只会得到一片假红。两者的区别写在代码里：被
 /// switch 的那个变量若自己就是从 `.payload` 里解出来的，这一处不判。
 const PAGE: &str = "crates/cog-gateway/src/takeover.html";
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// 去掉 `//` 与 `/* */` 注释，保留字符串。
 ///

@@ -49,6 +49,8 @@
 
 mod common;
 
+use common::routes::read;
+
 use common::routes::repo_root;
 
 use std::path::{Path, PathBuf};
@@ -173,10 +175,6 @@ const CLIENT_ONLY: &[(&str, &str, &str)] = &[
     ("status", "streaming", "对话气泡的流式状态，客户端自己写"),
     ("status", "done", "对话气泡收尾后的状态，客户端自己写自己读"),
 ];
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// 客户端源码文件数下限。普查面是这条判据的**题目**：读不出来的目录会让文件表
 /// 悄悄变短，而变短之后「每一处都登记过」这句话与「一处都没读到」完全同形。

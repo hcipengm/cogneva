@@ -38,6 +38,8 @@
 
 mod common;
 
+use common::routes::read;
+
 use common::routes::repo_root;
 
 use std::collections::BTreeMap;
@@ -96,10 +98,6 @@ struct Row {
     sites: usize,
     kind: Kind,
     why: String,
-}
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 /// The file names under [`TEMPLATES`], sorted so the census is reproducible.

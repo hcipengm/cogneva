@@ -37,6 +37,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::routes::read;
+
 use common::routes::repo_root;
 
 use common::rust_production::{all_crate_files, crate_files_of};
@@ -70,10 +72,6 @@ const IGNORED: &[(&str, &str)] = &[
         "订阅回执：客户端订阅之后不等确认就开始收帧，缺这个回执只说明订阅发丢了，而那时收不到帧的现象本身就是信号",
     ),
 ];
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// 去掉 `//` 与 `/* */` 注释，保留字符串。
 fn strip_comments(text: &str) -> String {
