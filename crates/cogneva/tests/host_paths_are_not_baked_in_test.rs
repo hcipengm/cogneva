@@ -71,9 +71,15 @@ fn text_files(root: &Path) -> Vec<PathBuf> {
     }
     let mut stack = vec![root.join("deploy")];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
+        // 读不出来就 panic：递归里跳过一个子目录不会让断言变红，而剩下的人口
+        // 仍高于 MIN_FILES——「少读了一块」与「那一块没有硬编码路径」同形。
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+            panic!(
+                "{} 读不出来（{e}）：deploy/ 的普查面少了一块，而用剩下的那份数出来的\
+                 文件数仍撑得住下限",
+                dir.display()
+            )
+        });
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -284,4 +290,20 @@ fn fixture_directories_are_not_the_root_of_any_machine() {
     assert!(panicked, "扫不到文件时必须报错，不能静默通过");
 
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// 普查面里有一块读不出来时必须炸。
+///
+/// 递归遍历里跳过一个子目录不会让任何断言变红：剩下的人口仍高于 `MIN_FILES`，
+/// 于是「deploy/ 下这一块没读到」与「这一块没有硬编码路径」印出同一句话。
+#[test]
+fn a_directory_that_cannot_be_read_is_refused() {
+    let missing =
+        std::env::temp_dir().join(format!("cogneva-host-paths-absent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing);
+    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| text_files(&missing)));
+    assert!(
+        got.is_err(),
+        "deploy/ 不在时交回了一张空表——那与「一份都没硬编码路径」同形"
+    );
 }

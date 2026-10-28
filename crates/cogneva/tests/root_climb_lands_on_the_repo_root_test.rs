@@ -90,9 +90,15 @@ fn candidate_files(root: &Path) -> Vec<PathBuf> {
     for top in CENSUS_ROOTS {
         let mut stack = vec![root.join(top)];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                continue;
-            };
+            // 读不出来就 panic：递归里跳过一个子目录不会让任何断言变红，而剩下的
+            // 那份普查往往仍高于下限——「少读了一块」与「那一块没有上溯」同形。
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+                panic!(
+                    "{} 读不出来（{e}）：这份普查的面少了一块，而用剩下的那份数出来的\
+                     上溯条数仍撑得住下限",
+                    dir.display()
+                )
+            });
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
@@ -388,6 +394,9 @@ fn a_file_that_moved_is_the_shape_this_gate_exists_for() {
         std::fs::create_dir_all(path.parent().expect("有父目录")).expect("建目录");
         std::fs::write(&path, body).expect("写文件");
     };
+    // 普查的两个根都在这棵假树里：`CENSUS_ROOTS` 是这条门自己声明的人口，
+    // 缺一个根与「那个根下没有上溯」在读数上是同一件事，读者按前者 panic。
+    std::fs::create_dir_all(scratch.join(".github/scripts")).expect("建目录");
     let line = r#"ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 "#;
     // 深度 2 的两级上溯：落点是假树根，对。
@@ -434,4 +443,24 @@ fn a_file_that_moved_is_the_shape_this_gate_exists_for() {
     );
 
     let _ = std::fs::remove_dir_all(&scratch);
+}
+
+/// 普查的根读不出来时必须炸。
+///
+/// 递归里跳过一块不会让任何断言变红：剩下的那份普查往往仍数得出 `MIN_CLIMBS`
+/// 条上溯，而「这一块没读到」与「这一块没有上溯」在判词上是同一件事。
+#[test]
+fn a_census_root_that_cannot_be_read_is_refused() {
+    let scratch = std::env::temp_dir().join(format!(
+        "cogneva-root-climb-absent-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).expect("建目录");
+    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| candidate_files(&scratch)));
+    assert!(
+        got.is_err(),
+        "两个普查根都不在时交回了一张空表——那与「一处上溯都没有」同形"
+    );
 }
