@@ -1812,7 +1812,21 @@ const GAUGE_HELP: &[(&str, &str)] = &[
         "Tokens one whole job was measured to need (the 75th percentile over \
          the last 30 days of finished tasks), the block the gate keeps free so \
          a job is admitted whole or not at all. It is a property of the work, \
-         not of the pool: the same number applies whichever upstream serves",
+         not of the pool: the same number applies whichever upstream serves. \
+         The 30 days are the window the percentile is taken over, not the \
+         population it rests on: read it with llm_pool_reserve_population, \
+         because a percentile over three finished jobs and one over three \
+         hundred return the same shape of number",
+    ),
+    (
+        "llm_pool_reserve_population",
+        "How many finished jobs llm_pool_reserve_tokens was measured over. It \
+         travels beside the value because solidity is not visible in the value: \
+         with a small population the reserve is one or two jobs' spend rather \
+         than the work's typical size, and headroom computed from it is off in \
+         whichever direction those jobs happened to fall. Zero means the reserve \
+         has no population behind it and is published as zero -- a fresh \
+         installation, not a free pool",
     ),
     (
         "llm_budget_spent_tokens",

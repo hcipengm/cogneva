@@ -1668,6 +1668,11 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     cog_core::metric_names::LLM_UPSTREAM_QUOTA_RESET_UNIX,
     cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES,
     cog_core::metric_names::LLM_UPSTREAM_REFUSAL_KIND,
+    // 同一拍里说清"池和少算了谁"的两条。它们比进程活得久的理由与额度那几条
+    // 相同：没进和的成员在每一把尺子上都与"这一家没有额度"同形，而这个区分
+    // 只能从这两条里读出来，随 Pod 换代消失就等于每一代都要重新盲一次。
+    cog_core::metric_names::LLM_POOL_UPSTREAM_WITH_RULER,
+    cog_core::metric_names::LLM_POOL_UPSTREAMS_WITHOUT_RULER,
     // 同一个循环里按面写的答复。它比进程活得久的理由与 `face_serving` 相同：
     // 一个厂商悄悄下掉一个面是件漫水的事，读数要能被回头比对，而不是随 Pod
     // 换代消失。
@@ -3972,6 +3977,13 @@ async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReadin
         (
             cog_core::metric_names::LLM_POOL_RESERVE_TOKENS,
             pace.reserve_tokens as f64,
+        ),
+        // 预留在和里是一个数，在读者眼里却要先问它有多实：分位数在三件任务上和
+        // 在三百件任务上印出来同形，把后者读成前者会让 headroom 差出好几倍。
+        // 人口与值同一拍写下去，就是为了不让任何一个只看其中一条。
+        (
+            cog_core::metric_names::LLM_POOL_RESERVE_POPULATION,
+            pace.reserve_population as f64,
         ),
         (
             cog_core::metric_names::LLM_POOL_PACED_UPSTREAMS,
@@ -15050,6 +15062,38 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                  读它的告警窗口不会被要求长于写者心跳"
             );
         }
+    }
+
+    /// 预留的人口必须与预留的值同一拍落到读数面。
+    ///
+    /// 预留是个分位数，而分位数在三件任务上与在三百件任务上印出来同形：只发值，
+    /// 读者会把后者的稳度安在前者头上，算出来的 headroom 与真正的余量差出几倍，
+    /// 而这在任何一条现有序列上都看不出来——值本身没有瑕疵，它只是没说清它有多实。
+    /// 判据是发布函数真的把人口写下去：只登记名字不发，等于一条永远缺席的读数。
+    #[tokio::test]
+    async fn the_job_size_reserve_is_published_beside_the_population_it_rests_on() {
+        let state = test_state(Vec::new());
+        let reading = WindowPaceReading {
+            pool: cog_core::LlmWindowPace {
+                allowance_tokens: 100_000,
+                spent_tokens: 1_000,
+                reserve_tokens: 4_000,
+                reserve_population: 5,
+                measured_upstreams: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        publish_window_pace_gauges(&state, &reading).await;
+        let text = String::from_utf8(state.pool_obs.metrics.encode().unwrap()).unwrap();
+        assert!(
+            text.contains("llm_pool_reserve_tokens 4000"),
+            "预留的值没有落到读数面上：\n{text}"
+        );
+        assert!(
+            text.contains("llm_pool_reserve_population 5"),
+            "预设的人口没有与它同拍落下去，读者只剩一个不知道有多实的分位数：\n{text}"
+        );
     }
 
     /// 从 `(` 起的一段平衡括号文本，含两端的括号。找不到闭合时返回 `None`。

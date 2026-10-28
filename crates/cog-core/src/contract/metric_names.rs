@@ -1211,6 +1211,14 @@ metric_names! {
     LLM_POOL_ALLOWANCE_TOKENS => "llm_pool_allowance_tokens",
     LLM_POOL_SPENT_TOKENS => "llm_pool_spent_tokens",
     LLM_POOL_RESERVE_TOKENS => "llm_pool_reserve_tokens",
+    // How many finished jobs the reserve above was measured over. The reserve is
+    // a percentile, and a percentile over three jobs returns a number of the same
+    // shape as one over three hundred; the cost alone cannot say which, so every
+    // reader that turns it into headroom is trusting a quantity whose solidity is
+    // on no other series. The two travel together in the contract payload for the
+    // same reason, and this publishes the population on the face the value is
+    // already on.
+    LLM_POOL_RESERVE_POPULATION => "llm_pool_reserve_population",
     LLM_POOL_PACED_UPSTREAMS => "llm_pool_paced_upstreams",
     // The pool gauges above sum only the members whose window was **measured**,
     // and the request path's `blocked` decides for the whole pool from that sum.

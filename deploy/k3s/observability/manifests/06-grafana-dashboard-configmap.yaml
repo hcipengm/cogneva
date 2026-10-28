@@ -2763,6 +2763,100 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 65,
+          "title": "LLM Pool Budget: Allowance, Spend and the Job-Size Reserve",
+          "description": "What this window has allowed by now, what it has served, and the block the gate keeps free for one whole job. Allowance is the window's own ramp rather than a rate: it grows from the window's start toward the capacity the pace measured, so spend above allowance is what the gate holds work back for. The reserve is a property of the work, not of the pool -- the same block applies whichever member serves -- and it is a percentile, so read it together with the panel beside this one: the value says how large a job is, the population there says how many finished jobs that answer rests on.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 312
+          },
+          "targets": [
+            {
+              "expr": "llm_pool_allowance_tokens and ((time() - llm_pool_allowance_tokens_observed_timestamp_seconds) < 3600)",
+              "legendFormat": "allowed by now this window",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "llm_pool_spent_tokens and ((time() - llm_pool_spent_tokens_observed_timestamp_seconds) < 3600)",
+              "legendFormat": "served since the window started",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "llm_pool_reserve_tokens and ((time() - llm_pool_reserve_tokens_observed_timestamp_seconds) < 3600)",
+              "legendFormat": "kept free for one whole job",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 66,
+          "title": "How Solid That Reserve Is, and Who the Sum Leaves Out",
+          "description": "How solid the reserve beside this panel is, and how much of the pool the sum it feeds actually covers. reserve_population counts the finished jobs the job-size percentile was measured over: three jobs and three hundred print the same shape of number, and headroom computed from a thin population is off in whichever direction those few jobs happened to fall. paced_upstreams counts the members whose window this pass measured; upstreams_without_ruler counts the members it could not measure, and those are missing from every token gauge in the family -- a member with no ruler is summed as an allowance of zero, which reads exactly like a member whose window is spent while it is repaired in the opposite direction. Zero here with a configured pool means the pass did not run.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 312
+          },
+          "targets": [
+            {
+              "expr": "llm_pool_reserve_population and ((time() - llm_pool_reserve_population_observed_timestamp_seconds) < 3600)",
+              "legendFormat": "finished jobs the reserve was measured over",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "llm_pool_paced_upstreams and ((time() - llm_pool_paced_upstreams_observed_timestamp_seconds) < 3600)",
+              "legendFormat": "upstreams whose window this pass measured",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "llm_pool_upstreams_without_ruler and ((time() - llm_pool_upstreams_without_ruler_observed_timestamp_seconds) < 3600)",
+              "legendFormat": "upstreams it could not measure",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
