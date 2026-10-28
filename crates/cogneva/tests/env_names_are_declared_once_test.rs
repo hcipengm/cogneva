@@ -48,7 +48,6 @@ const FOREIGN: &[(&str, &str)] = &[
     ("HOSTNAME", "容器运行时给的名字，平台只是读者"),
     ("RUST_LOG", "标准日志过滤串，由 tracing 生态定义"),
     ("OUT_DIR", "构建脚本由工具链注入的目录，每个 crate 各读各的"),
-    ("CARGO_MANIFEST_DIR", "构建期由工具链注入"),
 ];
 
 /// Names that cross the build boundary: a build script emits them with
