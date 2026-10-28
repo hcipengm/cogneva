@@ -95,6 +95,7 @@ const WRITTEN_BY_CODE: &[(&str, &str)] = &[
     ("role", "crates/cog-reflection/src/build_gate/mod.rs"),
     ("service", "crates/cog-observability/src/logs.rs"),
     ("side", "crates/cog-github/src/landing.rs"),
+    ("slug", "crates/cog-orchestrator/src/principle_ledger.rs"),
     ("slot", "crates/cog-reflection/src/build_gate/mod.rs"),
     (
         "source",

@@ -25,7 +25,7 @@ pub(crate) fn chart_rule(name: &str) -> serde_json::Value {
     let text = std::fs::read_to_string(&chart)
         .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
     let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
-    root.pointer("/observability/infra_watch/rules")
+    root.pointer(cog_core::config_sections::ALERT_RULES_POINTER)
         .and_then(|v| v.as_array())
         .expect("infra_watch.rules present")
         .iter()

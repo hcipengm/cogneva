@@ -1211,6 +1211,14 @@ const FOREIGN: &[(&str, &str)] = &[
         "同一生产者（这一拍从 `kube_pod_container_resource_limits` 读回来的声明上限）。它跟着读数一起走而不是由规则侧另配一份：分母与分子必须来自同一次回放、同一个容器，否则滚动重叠那几分钟会把比值读错一半（同命名空间里进化 Pod 的容器同名、上限 16Gi，选择器不钉死就会取到它）",
     ),
     (
+        "cogneva_debt_edge_verdicts",
+        "宿主读数 `scripts/host/cogneva-debt-edge-reading.sh`（不在本仓，在值守用的另一棵树里）：依赖边账上每一类结局各有几条，`kind=\"unmeasured\"` 是钩子判不了、把提交放过去的那一路。本仓印不出它：账本与写它的提交门都住在另一棵树。规则 `CognevaDependencyEdgeHookCannotJudge` 读的就是这个格子——钩子判不了不拦（一条坏掉的钩子不该让所有人提交不了），代价是判不了的时候每一次提交仍然绿，唯一的痕迹是账上多这一行，没人去看它就不存在",
+    ),
+    (
+        "cogneva_debt_edge_malformed",
+        "同一生产者（`scripts/host/cogneva-debt-edge-reading.sh`）：账上读不出来的行数。坏行不会被丢掉，所以这个数只增不减，规则 `CognevaDependencyEdgeLedgerUnparsable` 因此拿 `> 0` 而不是窗口判它：它是持续状态，清走或教读者认那个形状才会消失，加地平线等于到点就不再提它",
+    ),
+    (
         "cogneva_code_debt_rows",
         "宿主读数 `scripts/host/cogneva-code-debt-reading.sh`（不在本仓，登记行 `code_debt`）：代码欠账登记表与它所判的那棵树之间，此刻有几行对不上。它在公开仓里只能是外来序列，因为**生产者与判决住在这个仓看不见的另一棵树**——`check-code-debt.py` 判的是本仓的源码布局，而它由私有仓的提交门驱动；规则读这一条，是为了让「登记表与树分家」在下一拍就被说出来，而不是等下一个在这边提交的人撞上那道门（此前三天里让三个不相干的人代付过）",
     ),
