@@ -136,18 +136,29 @@ grep -qE 'caches=[1-9]' <<<"${out}" \
 # version asserted that every tree gets its turn before the floor is reached,
 # which is the opposite of the property under test and passed or failed by
 # readdir order alone (it passed here and failed in CI).
-# The release that ends the pass is the one that leaves the count at one, and
-# what that rules out is the run sweeping every tree regardless of the floor.
+# The release that ends the pass is the one that leaves the count one short of
+# what it started at, and what that rules out is the run sweeping every tree
+# regardless of the floor.
+#
+# The injected reading counts the whole candidate set -- every tree carrying the
+# signed cache tag -- and not a pair of tree names. It used to name two of the
+# three, which made the verdict depend on the order the candidates are sorted
+# in: a release that took the third tree left the reading above the floor, the
+# run carried on, and a second artifact went. That is the whole of the
+# "passes alone, red in the suite" shape this test had (diagnosed 2026-10-29 by
+# the session watching the rollout, which reproduced neither verdict).
+signed=("${tagged}" "${byname}" "${byopen}")
+signed_list="${tagged} ${byname} ${byopen}"
 reader="${work}/reader"
 cat >"${reader}" <<EOF
 #!/usr/bin/env bash
-# Above the trigger while both trees still carry their stale artifact, below the
-# floor as soon as one of them has lost it.
+# Above the trigger while every candidate still carries its stale artifact, below
+# the floor as soon as one of them has lost it.
 n=0
-for tree in "${tagged}" "${byname}"; do
+for tree in ${signed_list}; do
   if [ -e "\${tree}/debug/deps/libstale.rlib" ]; then n=\$((n + 1)); fi
 done
-if [ "\${n}" -ge 2 ]; then echo '800000 80'; else echo '400000 40'; fi
+if [ "\${n}" -ge ${#signed[@]} ]; then echo '800000 80'; else echo '400000 40'; fi
 EOF
 chmod +x "${reader}"
 out="$(run_gc COGNEVA_TARGET_GC_DISK_READER="${reader}" \
@@ -157,12 +168,12 @@ grep -q 'after=40%' <<<"${out}" || fail "释放后的读数是注入的 40%，�
 grep -q 'not from the filesystem' <<<"${out}" \
   || fail "换过读数来源没有说明；用替代读数做的判定会和真读数长得一样：${out}"
 remaining=0
-for tree in "${tagged}" "${byname}"; do
+for tree in "${signed[@]}"; do
   if [ -f "${tree}/debug/deps/libstale.rlib" ]; then remaining=$((remaining + 1)); fi
 done
-[ "${remaining}" -eq 1 ] \
-  || fail "两棵树里剩 ${remaining} 份过期产物，应为 1：够到地板后还在往下删，或者第一档一份都没删掉"
-for tree in "${tagged}" "${byname}"; do
+[ "${remaining}" -eq "$((${#signed[@]} - 1))" ] \
+  || fail "${#signed[@]} 棵候选树里剩 ${remaining} 份过期产物，应为 $((${#signed[@]} - 1))：够到地板后还在往下删，或者第一档一份都没删掉"
+for tree in "${signed[@]}"; do
   [ -f "${tree}/debug/deps/libfresh.rlib" ] \
     || fail "第一档删掉了刚写过的产物（${tree}）；这会把下一次构建变成全量重编"
   [ -d "${tree}/debug/incremental" ] \
