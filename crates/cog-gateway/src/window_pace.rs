@@ -443,7 +443,6 @@ pub fn upstreams_without_ruler(rulers: impl IntoIterator<Item = Ruler>) -> usize
 /// `LLM_POOL_UPSTREAMS_WITHOUT_RULER`) rather than declared here: the gateway
 /// records gauges through a registered name, because a series whose name lives
 /// only at a call site is one nothing else in the workspace can find.
-
 #[cfg(test)]
 mod tests {
     use super::*;
