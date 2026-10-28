@@ -59,10 +59,16 @@ fn read(path: &Path) -> String {
 }
 
 fn web_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
+    // 读不出来就 panic：递归里跳过一个子目录不会让任何断言变红，而剩下的两份
+    // 整篇文档单独就能让调用点下限成立——「客户端那一块没读到」与「那一块没有
+    // 存储调用」在判词上分不开。
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "{} 读不出来（{e}）：web/src 的普查面少了一块，而剩下两篇文档就能把\
+             调用点下限顶住",
+            dir.display()
+        )
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -308,6 +314,17 @@ fn every_storage_key_is_declared_once_and_used() {
         calls >= 10,
         "只在三处文档里读到 {calls} 个存储调用点，扫描器本身坏了"
     );
+    // 下限要落在**题目**上：调用点是答案，落地页与接管页两篇整文件就能交够十条，
+    // 而客户端那一半一个文件都没读到时，它们照样把上面那条顶住。
+    let web_scanned = scans
+        .iter()
+        .filter(|s| s.file.starts_with(WEB_ROOT))
+        .count();
+    assert!(
+        web_scanned >= 100,
+        "web/src 下只读到 {web_scanned} 个 .ts/.tsx（下限 100）：客户端整块没进普查，\
+         剩下的两篇文档单独就能让调用点下限成立"
+    );
     let mut names: Vec<&String> = scans.iter().flat_map(|s| s.declared.keys()).collect();
     names.sort();
     names.dedup();
@@ -454,5 +471,24 @@ fn the_reader_sees_keys_and_ignores_comparisons() {
             ("TOKEN_KEY".to_string(), "cogneva_token".to_string()),
             ("LANG_KEY".to_string(), "cogneva_lang".to_string()),
         ]
+    );
+}
+
+/// 客户端目录读不出来时必须炸。
+///
+/// 旧写法把它 `return` 成空表：剩下的落地页与接管页两篇整文件照样交得出十条
+/// 调用点，判据在「客户端一个文件都没读」的树上照旧绿。
+#[test]
+fn a_client_directory_that_cannot_be_read_is_refused() {
+    let missing =
+        std::env::temp_dir().join(format!("cogneva-web-storage-absent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&missing);
+    let mut files = Vec::new();
+    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        web_files(&missing, &mut files)
+    }));
+    assert!(
+        got.is_err(),
+        "web/src 不在时交回了一张空表——那与「客户端没有任何存储调用」同形"
     );
 }
