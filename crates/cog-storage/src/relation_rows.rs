@@ -6,9 +6,10 @@
 //! 里任一份被改动——比如加上 `WHERE` 只数某一分区——另外两条不会失败，面板上
 //! 只是有一条线的口径悄悄变了，而「这类日志比那一类多」这句话从此不成立。
 //!
-//! 表名拼进语句之前引一遍。名字来自各文件自己的常量、不是运行时输入，但拼进
-//! SQL 的形状在这里检查，而不是靠「它来自常量」这个约定。
+//! 表名拼进语句之前的引号由 [`cog_core::sql::quote_relation`] 给：那是每个把名字
+//! 写进 SQL 的地方共用的同一份拼法，不在这里再写一遍。
 
+use cog_core::sql::quote_relation;
 use cog_core::{SFError, SFResult};
 use sqlx::PgPool;
 
@@ -22,40 +23,4 @@ pub(crate) async fn relation_rows(pool: &PgPool, relation: &str) -> SFResult<i64
         .fetch_one(pool)
         .await
         .map_err(|e| SFError::Database(e.to_string()))
-}
-
-/// 把一个表名引成标识符，允许 `schema.table` 这种限定写法。
-///
-/// 字母表之外的字符被丢弃而不是带进语句。丢弃对正确名字是无损的（名字来自
-/// 常量），对一个被写坏的名字则是把它变成另一张表——调用方那一侧的表名清单
-/// 与这里的分段规则是同一条约定的两半，改一边要两边一起改。
-pub(crate) fn quote_relation(name: &str) -> String {
-    name.split('.')
-        .map(|part| {
-            let cleaned: String = part
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            format!("\"{cleaned}\"")
-        })
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_schema_qualified_name_is_quoted_in_parts() {
-        assert_eq!(
-            quote_relation("public.cog_events"),
-            "\"public\".\"cog_events\""
-        );
-    }
-
-    #[test]
-    fn a_plain_name_is_one_quoted_identifier() {
-        assert_eq!(quote_relation("cog_checkpoints"), "\"cog_checkpoints\"");
-    }
 }

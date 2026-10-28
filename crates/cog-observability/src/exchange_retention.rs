@@ -216,7 +216,7 @@ impl ExchangeRetention {
                 "DELETE FROM {table} WHERE id IN (
                      SELECT id FROM {table} WHERE ts < $2 ORDER BY ts LIMIT $1
                  )",
-                table = quote_ident(&self.table),
+                table = cog_core::sql::quote_relation(&self.table),
             ))
             .bind(BATCH_ROWS)
             .bind(cutoff)
@@ -243,7 +243,7 @@ impl ExchangeRetention {
     async fn row_count(&self) -> SFResult<i64> {
         sqlx::query(&format!(
             "SELECT count(*) AS n FROM {}",
-            quote_ident(&self.table)
+            cog_core::sql::quote_relation(&self.table)
         ))
         .fetch_one(&self.pool)
         .await
@@ -261,7 +261,7 @@ impl ExchangeRetention {
     async fn oldest_age_secs(&self) -> SFResult<i64> {
         sqlx::query(&format!(
             "SELECT EXTRACT(EPOCH FROM (NOW() - min(ts)))::bigint AS age FROM {}",
-            quote_ident(&self.table)
+            cog_core::sql::quote_relation(&self.table)
         ))
         .fetch_one(&self.pool)
         .await
@@ -332,25 +332,6 @@ impl ExchangeRetention {
             warn!(error = %e, metric = %name, "LLM exchange retention gauge emit failed");
         }
     }
-}
-
-/// Quote a table name, allowing a schema-qualified one.
-///
-/// The name is never a value the sweep takes from a caller at runtime — it is
-/// this file's constant or a test's own table — but it is interpolated into the
-/// statement, so the shape is checked here rather than trusted: anything outside
-/// the identifier alphabet is dropped instead of being carried into the SQL.
-fn quote_ident(name: &str) -> String {
-    name.split('.')
-        .map(|part| {
-            let cleaned: String = part
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-                .collect();
-            format!("\"{cleaned}\"")
-        })
-        .collect::<Vec<_>>()
-        .join(".")
 }
 
 /// The retention this process was told, or the default.

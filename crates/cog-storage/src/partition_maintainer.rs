@@ -235,8 +235,8 @@ impl PartitionMaintainer {
     async fn ensure_default(&self, table: &PartitionedTable) -> SFResult<()> {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {default} PARTITION OF {parent} DEFAULT",
-            default = quote_ident(&default_name(table)),
-            parent = quote_ident(&table.parent),
+            default = cog_core::sql::quote_relation(&default_name(table)),
+            parent = cog_core::sql::quote_relation(&table.parent),
         );
         sqlx::query(&sql)
             .execute(&self.pool)
@@ -279,8 +279,8 @@ impl PartitionMaintainer {
     ) -> SFResult<()> {
         let sql = format!(
             "CREATE TABLE IF NOT EXISTS {name} PARTITION OF {parent} FOR VALUES FROM ('{start}') TO ('{end}')",
-            name = quote_ident(name),
-            parent = quote_ident(&table.parent),
+            name = cog_core::sql::quote_relation(name),
+            parent = cog_core::sql::quote_relation(&table.parent),
             start = start,
             end = end,
         );
@@ -311,31 +311,31 @@ impl PartitionMaintainer {
         for sql in [
             format!(
                 "ALTER TABLE {parent} DETACH PARTITION {default}",
-                parent = quote_ident(&table.parent),
-                default = quote_ident(&default),
+                parent = cog_core::sql::quote_relation(&table.parent),
+                default = cog_core::sql::quote_relation(&default),
             ),
             format!(
                 "CREATE TABLE IF NOT EXISTS {name} PARTITION OF {parent} FOR VALUES FROM ('{start}') TO ('{end}')",
-                name = quote_ident(name),
-                parent = quote_ident(&table.parent),
+                name = cog_core::sql::quote_relation(name),
+                parent = cog_core::sql::quote_relation(&table.parent),
             ),
             // Re-inserting through the parent routes each row to the partition
             // that now covers it.
             format!(
                 "INSERT INTO {parent} SELECT * FROM {default} WHERE {key} >= '{start}'::date AND {key} < '{end}'::date",
-                parent = quote_ident(&table.parent),
-                default = quote_ident(&default),
-                key = quote_ident(&table.key),
+                parent = cog_core::sql::quote_relation(&table.parent),
+                default = cog_core::sql::quote_relation(&default),
+                key = cog_core::sql::quote_relation(&table.key),
             ),
             format!(
                 "DELETE FROM {default} WHERE {key} >= '{start}'::date AND {key} < '{end}'::date",
-                default = quote_ident(&default),
-                key = quote_ident(&table.key),
+                default = cog_core::sql::quote_relation(&default),
+                key = cog_core::sql::quote_relation(&table.key),
             ),
             format!(
                 "ALTER TABLE {parent} ATTACH PARTITION {default} DEFAULT",
-                parent = quote_ident(&table.parent),
-                default = quote_ident(&default),
+                parent = cog_core::sql::quote_relation(&table.parent),
+                default = cog_core::sql::quote_relation(&default),
             ),
         ] {
             sqlx::query(&sql)
@@ -373,8 +373,8 @@ impl PartitionMaintainer {
     ) -> SFResult<bool> {
         let sql = format!(
             "SELECT EXISTS (SELECT 1 FROM ONLY {default} WHERE {key} >= $1::date AND {key} < $2::date)",
-            default = quote_ident(&default_name(table)),
-            key = quote_ident(&table.key),
+            default = cog_core::sql::quote_relation(&default_name(table)),
+            key = cog_core::sql::quote_relation(&table.key),
         );
         let row = sqlx::query_scalar::<_, bool>(&sql)
             .bind(start)
@@ -390,7 +390,7 @@ impl PartitionMaintainer {
     async fn report_default_backlog(&self, table: &PartitionedTable) -> SFResult<()> {
         let sql = format!(
             "SELECT count(*) FROM ONLY {default}",
-            default = quote_ident(&default_name(table)),
+            default = cog_core::sql::quote_relation(&default_name(table)),
         );
         let backlog: i64 = match sqlx::query_scalar(&sql).fetch_one(&self.pool).await {
             Ok(n) => n,
@@ -450,13 +450,6 @@ fn month_bounds(month: i32) -> (NaiveDate, NaiveDate) {
 fn month_start(year: i32, month_of_year: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(year, month_of_year, 1)
         .expect("partition month falls inside the representable date range")
-}
-
-/// Quote an identifier for splicing into generated DDL. Identifiers here come
-/// from the constants above and from integer month arithmetic, never from
-/// input, but quoting keeps the generated SQL honest.
-pub(crate) fn quote_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 #[cfg(test)]

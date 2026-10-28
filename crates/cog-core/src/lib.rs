@@ -19,6 +19,7 @@ pub mod paths;
 pub mod reading_cadence;
 pub mod roles;
 pub mod secrets;
+pub mod sql;
 pub mod token_estimate;
 pub mod topology;
 pub mod types;

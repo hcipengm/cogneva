@@ -474,8 +474,8 @@ pub fn delete_surplus_sql(table: &str, boards: &str) -> String {
              ORDER BY s.timestamp, s.snapshot_id
              LIMIT $1
          )",
-        table = crate::partition_maintainer::quote_ident(table),
-        boards = crate::partition_maintainer::quote_ident(boards),
+        table = cog_core::sql::quote_relation(table),
+        boards = cog_core::sql::quote_relation(boards),
     )
 }
 

@@ -288,7 +288,7 @@ impl MetricsRetirement {
     async fn delete_by_name(&self, table: &str) -> SFResult<u64> {
         let sql = format!(
             "DELETE FROM {} WHERE name = ANY($1)",
-            crate::partition_maintainer::quote_ident(table)
+            cog_core::sql::quote_relation(table)
         );
         Ok(sqlx::query(&sql)
             .bind(self.names())
@@ -307,7 +307,7 @@ impl MetricsRetirement {
                  ORDER BY id
                  LIMIT $2
              )",
-            table = crate::partition_maintainer::quote_ident(&self.samples),
+            table = cog_core::sql::quote_relation(&self.samples),
         );
         Ok(sqlx::query(&sql)
             .bind(self.names())
@@ -328,7 +328,7 @@ impl MetricsRetirement {
             ShapeClock::ViaSums => format!(
                 "(SELECT _clock.updated_at FROM {sums} _clock \
                  WHERE _clock.name = {row}.name AND _clock.labels = {row}.labels)",
-                sums = crate::partition_maintainer::quote_ident(&self.histogram_sums),
+                sums = cog_core::sql::quote_relation(&self.histogram_sums),
             ),
         }
     }
@@ -360,7 +360,7 @@ impl MetricsRetirement {
             .iter()
             .map(|(_, l)| (*l).to_string())
             .collect();
-        let table = crate::partition_maintainer::quote_ident(table);
+        let table = cog_core::sql::quote_relation(table);
         let mine = self.clock_expr("t", clock);
         let sibling = self.clock_expr("s", clock);
         let legs = format!(

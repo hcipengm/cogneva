@@ -299,8 +299,8 @@ impl TaskEventRetention {
                          LIMIT $1
                      )
                      DELETE FROM {table} WHERE task_id IN (SELECT task_id FROM batch)",
-                    table = crate::relation_rows::quote_relation(&self.table),
-                    checkpoints = crate::relation_rows::quote_relation(&self.checkpoints),
+                    table = cog_core::sql::quote_relation(&self.table),
+                    checkpoints = cog_core::sql::quote_relation(&self.checkpoints),
                 ))
                 .bind(BATCH_STREAMS)
                 .bind(cutoff)
@@ -356,7 +356,7 @@ impl TaskEventRetention {
     async fn stream_count(&self) -> SFResult<i64> {
         sqlx::query(&format!(
             "SELECT count(DISTINCT task_id) AS n FROM {}",
-            crate::relation_rows::quote_relation(&self.table)
+            cog_core::sql::quote_relation(&self.table)
         ))
         .fetch_one(&self.pool)
         .await
@@ -374,7 +374,7 @@ impl TaskEventRetention {
     async fn oldest_age_secs(&self) -> SFResult<i64> {
         sqlx::query(&format!(
             "SELECT EXTRACT(EPOCH FROM (NOW() - min(created_at)))::bigint AS age FROM {}",
-            crate::relation_rows::quote_relation(&self.table)
+            cog_core::sql::quote_relation(&self.table)
         ))
         .fetch_one(&self.pool)
         .await

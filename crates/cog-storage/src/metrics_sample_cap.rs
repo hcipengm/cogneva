@@ -609,7 +609,7 @@ pub fn delete_surplus_sql(table: &str) -> String {
              ORDER BY c.timestamp, c.id
              LIMIT $1
          )",
-        table = crate::partition_maintainer::quote_ident(table),
+        table = cog_core::sql::quote_relation(table),
         gauge = cog_core::MetricType::Gauge.as_str(),
     )
 }
