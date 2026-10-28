@@ -230,3 +230,251 @@ fn the_scanner_sees_the_config_default_shape() {
         );
     }
 }
+
+// ---- 第三份声明：脚本里的命令行默认值 ----
+
+/// 脚本里同一个名字的第三份声明。前两份（chart 的 `global.namespace`、进程内那一个
+/// 编译默认值）由上面几条判据钉住；这一份是 `NS="${COGNEVA_NS:-cogneva}"` 这类默认值，
+/// `--set global.namespace=...` 搬不动它。搬不动的后果不是报错，是**读空**：装到另一个
+/// 命名空间之后，`kubectl -n <旧名字> get` 照样退 0 并读回空表，脚本接着按「什么都没有」
+/// 往下走，装完报成功。
+///
+/// 人口是三个目录下的一层 `.sh`（`deploy/scripts`、`deploy/k3s`、`.github/scripts`）。
+/// `deploy/k3s/observability/` 不在人口里：那套观测栈声明的是自己的命名空间
+/// （chart values 里另有一行），拿平台的名字去判它，红的是它的正当声明。
+const SCRIPT_DIRS: &[&str] = &["deploy/scripts", "deploy/k3s", ".github/scripts"];
+
+/// 人口下限。少到这个数以下说明扫描本身指错了地方——那与「全都一致」在输出上分不开。
+const SCRIPT_FLOOR: usize = 8;
+
+/// 变量名里哪几种算「这个脚本的命名空间」：`NS`、`NAMESPACE`、以及 `*_NS`。
+/// `VENDOR_DOMAINS`、`QUOTA_NAME` 这些也是大写、也以 NS/NAME 收尾，但它们不是命名空间，
+/// 按名字放进来只会把门变成一处误报。
+fn is_namespace_var(upper: &str) -> bool {
+    upper == "NS" || upper == "NAMESPACE" || upper.ends_with("_NS")
+}
+
+/// 一个命名空间名的样子：DNS 标签，小写字母、数字、`-` 与 `.`。
+///
+/// 这一条挡的是另一类误报：脚本里嵌着的 Python 片段（`ns = doc["metadata"].get("namespace")`、
+/// `os.environ.get('X') or 'cogneva'`）也以 `ns=`/`NAMESPACE=` 开头，但它们的右边不是一个
+/// 名字，而是一段代码。名字写不成那样。
+fn looks_like_a_namespace(candidate: &str) -> bool {
+    !candidate.is_empty()
+        && !candidate.starts_with(['$', '<', '{'])
+        && candidate
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+}
+
+/// `at` 之后的第一个词：引号里的取引号内，否则取到空白或分隔符为止。
+fn literal_after(line: &str, at: usize) -> Option<String> {
+    let rest = line[at..].trim_start_matches(|c: char| c == '=' || c.is_whitespace());
+    let token: String = match rest.chars().next() {
+        Some(quote @ ('"' | '\'')) => rest[1..].chars().take_while(|c| *c != quote).collect(),
+        _ => rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && !"\"'|;&)".contains(*c))
+            .collect(),
+    };
+    if token.chars().all(|c| c.is_ascii_digit()) || !looks_like_a_namespace(&token) {
+        return None;
+    }
+    Some(token)
+}
+
+/// `${X:-cogneva}` / `${2-cogneva}` / `"cogneva"` 里的那个默认值。
+fn default_of(value: &str) -> Option<String> {
+    let unquoted = value.trim().trim_matches(['"', '\'']);
+    let inner = if unquoted.starts_with("${") && unquoted.ends_with('}') {
+        let body = &unquoted[2..unquoted.len() - 1];
+        match body.split_once(":-").or_else(|| body.split_once('-')) {
+            Some((_, fallback)) => fallback,
+            None => return None,
+        }
+    } else {
+        unquoted
+    };
+    let literal = inner.trim().trim_matches(['"', '\'']);
+    if literal.chars().all(|c| c.is_ascii_digit()) || !looks_like_a_namespace(literal) {
+        return None;
+    }
+    Some(literal.to_string())
+}
+
+/// 一行脚本里的命名空间字面量：`(写法, 字面量)`。
+///
+/// 三种写法都读：`--namespace X`（含 `=`）、`-n X`、以及 `NS=` 这类赋值默认值。
+/// 刻意不收的：注释行（用法示例里常写着同样的命令，它不是在执行）；`-n` 出现在
+/// `sudo -n`、`head -n`、`grep -n` 里（那是那个命令自己的选项）；值写成变量或占位符
+/// （`$NS`、`<ns>`）——那不是又抄了一份，是读了那一份。
+fn script_literals_in(line: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if line.trim_start().starts_with('#') {
+        return out;
+    }
+
+    let mut from = 0;
+    while let Some(found) = line[from..].find("--namespace") {
+        let at = from + found + "--namespace".len();
+        from = at;
+        if let Some(literal) = literal_after(line, at) {
+            out.push(("--namespace".to_string(), literal));
+        }
+    }
+
+    if line.contains("kubectl") || line.contains("helm") {
+        let bytes = line.as_bytes();
+        let mut from = 0;
+        while let Some(found) = line[from..].find("-n") {
+            let at = from + found;
+            from = at + 2;
+            let before_ok = at > 0
+                && !matches!(bytes[at - 1], b'-' | b'.' | b'_')
+                && !bytes[at - 1].is_ascii_alphanumeric();
+            if !before_ok {
+                continue;
+            }
+            // 这个 `-n` 归谁：往上取紧挨着的那一串字母。用 `split_whitespace` 取不出来——
+            // `${COGNEVA_KUBECTL:-sudo -n k3s kubectl}` 里紧挨着的是 `:-sudo`，
+            // 「这是 sudo 自己的短选项」要按字母读，不按空格读。
+            let owner: String = line[..at]
+                .trim_end()
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<char>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if matches!(
+                owner.as_str(),
+                "sudo"
+                    | "grep"
+                    | "head"
+                    | "tail"
+                    | "sed"
+                    | "awk"
+                    | "curl"
+                    | "ssh"
+                    | "docker"
+                    | "env"
+            ) {
+                continue;
+            }
+            if let Some(literal) = literal_after(line, at + 2) {
+                out.push(("-n".to_string(), literal));
+            }
+        }
+    }
+
+    let trimmed = line.trim_start();
+    if let Some((name, value)) = trimmed.split_once('=') {
+        let name = name.trim();
+        let looks_like_identifier =
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if looks_like_identifier && is_namespace_var(&name.to_ascii_uppercase()) {
+            if let Some(literal) = default_of(value) {
+                out.push((name.to_string(), literal));
+            }
+        }
+    }
+
+    out
+}
+
+/// 脚本里的每一个默认值都必须是 chart 声明的那一个名字。
+#[test]
+fn every_script_default_is_the_namespace_the_chart_declares() {
+    let root = repo_root();
+    let namespace = declared_namespace();
+    let mut found = 0usize;
+    let mut off = Vec::new();
+    for dir in SCRIPT_DIRS {
+        let path = root.join(dir);
+        let entries = std::fs::read_dir(&path)
+            .unwrap_or_else(|e| panic!("{} 读不出来：脚本人口无从数起（{e}）", path.display()));
+        for entry in entries.flatten() {
+            let file = entry.path();
+            if file.extension().and_then(|e| e.to_str()) != Some("sh") {
+                continue;
+            }
+            let rel = file
+                .strip_prefix(&root)
+                .unwrap_or(&file)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("{} 读不出来：{e}", file.display()));
+            for (index, line) in text.lines().enumerate() {
+                for (form, literal) in script_literals_in(line) {
+                    found += 1;
+                    if literal != namespace {
+                        off.push(format!(
+                            "{rel}:{}: {form} 默认成 {literal}，chart 声明的是 {namespace}",
+                            index + 1
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        found >= SCRIPT_FLOOR,
+        "只数出 {found} 处脚本里的命名空间默认值（下限 {SCRIPT_FLOOR}）：扫描塌了，\
+         这条判据此刻什么都没证明"
+    );
+    assert!(
+        off.is_empty(),
+        "这些脚本的命名空间与 chart 的 global.namespace 不是同一个名字——\
+         `--set global.namespace` 搬不动它们，读的时候退 0 而表是空的：\n{}",
+        off.join("\n")
+    );
+}
+
+/// 判据按形状读：三种写法都认，`sudo -n`、`head -n`、注释、变量值都不认。
+#[test]
+fn the_script_scanner_reads_the_defaults_and_only_those() {
+    let shapes = |line: &str| -> Vec<String> {
+        script_literals_in(line)
+            .into_iter()
+            .map(|(_, literal)| literal)
+            .collect()
+    };
+    assert_eq!(shapes(r#"NS="${COGNEVA_NS:-cogneva}""#), vec!["cogneva"]);
+    assert_eq!(shapes(r#"NS="${2:-cogneva}""#), vec!["cogneva"]);
+    assert_eq!(shapes("NS=cogneva"), vec!["cogneva"]);
+    assert_eq!(shapes(r#"namespace="cogneva""#), vec!["cogneva"]);
+    assert_eq!(
+        shapes("helm template cogneva deploy/helm/cogneva --namespace cogneva"),
+        vec!["cogneva"]
+    );
+    assert_eq!(shapes("kubectl -n cogneva get pods"), vec!["cogneva"]);
+
+    // 不是这一族的：别人的短选项、注释里的示例命令、变量、占位符。
+    assert_eq!(
+        shapes(r#"KUBECTL="${COGNEVA_KUBECTL:-sudo -n k3s kubectl}""#),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        shapes("kubectl get pods | head -n 5"),
+        Vec::<String>::new(),
+        "`head -n` 不是命名空间参数"
+    );
+    assert_eq!(
+        shapes("# kubectl -n cogneva edit secret 后滚动"),
+        Vec::<String>::new(),
+        "注释里的示例命令不是在执行"
+    );
+    assert_eq!(shapes(r#"kubectl -n "$NS" get pods"#), Vec::<String>::new());
+    assert_eq!(
+        shapes(r#"kubectl -n <ns> get pods"#),
+        Vec::<String>::new(),
+        "占位符不是又抄了一份名字"
+    );
+    assert_eq!(
+        shapes(r#"QUOTA_NAME="${COGNEVA_QUOTA:-cogneva-quota}""#),
+        Vec::<String>::new(),
+        "配额名不是命名空间"
+    );
+}
