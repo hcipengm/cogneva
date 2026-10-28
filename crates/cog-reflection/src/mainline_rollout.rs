@@ -749,7 +749,11 @@ pub(crate) fn locate_before_any_change(msg: &str) -> FailureLocus {
     let msg = primary_message(msg);
     // 配置缺失排在不可达之前：它自己的措辞里也可能带着 `connection refused`
     // （判词是 us 拼的，但我们同时把 kubectl 原文附在后面），而两者修法不同。
-    if is_cluster_config_missing(msg) {
+    if is_field_removal_not_taken(msg) {
+        // 排在不可达之前：这条判词是我们自己拼的，后面附着的 apply 原文里可能
+        // 带任何东西，但它说的是「这次删除没写进去」，修法完全不同。
+        FailureLocus::FieldRemoval
+    } else if is_cluster_config_missing(msg) {
         FailureLocus::ClusterConfig
     } else if is_cluster_unreachable(msg) {
         FailureLocus::Unreachable
@@ -1089,6 +1093,157 @@ fn at_path<'a>(v: &'a serde_yaml::Value, path: &str) -> Option<&'a serde_yaml::V
         cur = cur.get(seg)?;
     }
     Some(cur)
+}
+
+/// 一份清单里某个对象相对上一版**少了字段**：删除本该在这次 apply 落到活对象上。
+///
+/// 只比对象自己的 `spec` 子树：`status` 由控制器写、`metadata` 上有别人加的注解与
+/// 标签，拿它们做对照会让这条判据被别的写者点亮，而它要回答的只有一句——这一版
+/// 声明要删的东西，集群收到没有。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct FieldRemoval {
+    /// `kubectl get` 认的那个资源名（小写 kind，带组时是 `kind.group`）。
+    pub resource: String,
+    pub namespace: String,
+    pub name: String,
+    /// 相对上一版少掉的字段路径，`spec` 起算，例如 `.spec.headers.customRequestHeaders`。
+    pub paths: Vec<String>,
+}
+
+/// server-side apply 只删「本次声明过、并且由本 field manager 拥有」的字段：清单里
+/// **没写**的字段它根本不碰。于是「从清单里删掉一个字段」在 apply 之后可能一条都没
+/// 落——而 apply 退 0、回 `serverside-applied`、`kubectl diff` 输出为空，三项读起来
+/// 都像成功。2026-10-22 实测：从 chart 的 traefik `Middleware` 删掉
+/// `spec.headers.customRequestHeaders`，主线滚动报健康完成，那个对象的
+/// `metadata.generation` 还停在旧值上，一条改动都没上线。
+///
+/// 判据因此只能问对象自己：清单里少了字段的对象，`metadata.generation` 必须变。
+/// 它变，说明这一轮写进去的东西让控制器看见了一份新 spec；它不变而清单里明明少了
+/// 字段，就是这次删除没落。
+pub(crate) const FIELD_REMOVAL_NOT_TAKEN_MARKER: &str =
+    "a field this revision removed is still in the live object";
+
+pub(crate) fn is_field_removal_not_taken(msg: &str) -> bool {
+    msg.contains(FIELD_REMOVAL_NOT_TAKEN_MARKER)
+}
+
+/// 清单文档的身份与 spec。`resource` 由 kind 与 apiVersion 的组拼出来：
+/// `kubectl get` 认 `middleware.traefik.io`、`deployment.apps` 这种写法，而裸
+/// kind 在小写之后与它同形，所以两条都用同一种拼法。
+fn manifest_identity(doc: &serde_yaml::Value) -> Option<(String, String, Option<String>)> {
+    let kind = doc.get("kind")?.as_str()?.to_string();
+    let api = doc.get("apiVersion")?.as_str()?.to_string();
+    let group = api.split_once('/').map(|(g, _)| g);
+    let mut resource = kind.to_ascii_lowercase();
+    if let Some(group) = group {
+        resource.push('.');
+        resource.push_str(group);
+    }
+    let name = doc.get("metadata")?.get("name")?.as_str()?.to_string();
+    let namespace = doc
+        .get("metadata")
+        .and_then(|m| m.get("namespace"))
+        .and_then(|n| n.as_str())
+        .map(str::to_string);
+    Some((resource, name, namespace))
+}
+
+/// 旧文档有、新文档没有的字段路径。值变了不算删除——那是「写上了」，代数是会动的。
+/// 整棵子树没了只记一层：路径再往下每一行都是同一件事的重复。
+fn removed_field_paths(
+    old: &serde_yaml::Value,
+    new: &serde_yaml::Value,
+    path: &str,
+    out: &mut Vec<String>,
+) {
+    match (old, new) {
+        (serde_yaml::Value::Mapping(o), serde_yaml::Value::Mapping(n)) => {
+            for (k, ov) in o {
+                let key = match k.as_str() {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+                match n.get(k) {
+                    Some(nv) => removed_field_paths(ov, nv, &format!("{path}.{key}"), out),
+                    None => out.push(format!("{path}.{key}")),
+                }
+            }
+        }
+        (serde_yaml::Value::Sequence(o), serde_yaml::Value::Sequence(n)) => {
+            for (i, ov) in o.iter().enumerate() {
+                match n.get(i) {
+                    Some(nv) => removed_field_paths(ov, nv, &format!("{path}[{i}]"), out),
+                    None => out.push(format!("{path}[{i}]")),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 相对上一版，清单里哪些对象的 `spec` 少了字段。
+///
+/// 只认两版都有、名字相同的对象：新出现的对象没有「删除」可言，消失的对象由别的
+/// 路径管（它不在这一版要 apply 的东西里）。
+pub(crate) fn objects_that_lost_fields(
+    previous: &str,
+    current: &str,
+    namespace: &str,
+) -> Vec<FieldRemoval> {
+    let Ok(old_docs) = split_docs(previous, "previous bundle") else {
+        return Vec::new();
+    };
+    let Ok(new_docs) = split_docs(current, "support.yaml") else {
+        return Vec::new();
+    };
+    let new_by_id: BTreeMap<(String, String), &serde_yaml::Value> = new_docs
+        .iter()
+        .filter_map(|d| {
+            let (resource, name, _) = manifest_identity(d)?;
+            Some(((resource, name), d))
+        })
+        .collect();
+    let mut out = Vec::new();
+    for old in &old_docs {
+        let Some((resource, name, ns)) = manifest_identity(old) else {
+            continue;
+        };
+        let Some(new) = new_by_id.get(&(resource.clone(), name.clone())) else {
+            continue;
+        };
+        let (Some(old_spec), Some(new_spec)) = (old.get("spec"), new.get("spec")) else {
+            continue;
+        };
+        let mut paths = Vec::new();
+        removed_field_paths(old_spec, new_spec, ".spec", &mut paths);
+        if paths.is_empty() {
+            continue;
+        }
+        out.push(FieldRemoval {
+            resource,
+            namespace: ns.unwrap_or_else(|| namespace.to_string()),
+            name,
+            paths,
+        });
+    }
+    out
+}
+
+/// 哪些「删了字段」的对象**没有变**：事前事后都一样，说明这次删除没落。
+///
+/// 判不出来的一律放过：读不到代数（对象不存在、权限不够、查询超时）不是「没变」的
+/// 证据，把没有证据写成失败会让这条判据在别的故障上误报。只有「两次都读到了、而且
+/// 没有增加」才算数。
+pub(crate) fn removals_that_did_not_land(
+    seen: &[(FieldRemoval, Option<i64>, Option<i64>)],
+) -> Vec<FieldRemoval> {
+    seen.iter()
+        .filter(|(_, before, after)| match (before, after) {
+            (Some(b), Some(a)) => a <= b,
+            _ => false,
+        })
+        .map(|(r, _, _)| r.clone())
+        .collect()
 }
 
 /// 沿一串键取一个字符串字段，缺一层或不是字符串都给 `None`。
@@ -2934,6 +3089,119 @@ impl RolloutExecutor {
         Ok(out)
     }
 
+    /// 上一版发布的支撑清单原文。取**最新的、内容与本次不同的那一份**：包按 rev
+    /// 各存一份、保留若干代，所以「上一版」不需要谁告诉它，读第二新的那一份就是。
+    /// 内容相同的不算上一版——一份没变的清单说不出任何一次删除。
+    ///
+    /// 「读不到」与「没有上一版」分得开：前者把错误交回调用方留一条日志，后者是
+    /// 首装。两者都不改变这一轮的去向——集群里连包都列不出来时拦下每一次滚动，
+    /// 代价比这条判据挡不住那一次大——但它们在日志里必须是两句话。
+    async fn previous_support_bundle(&self, current: &str) -> SFResult<Option<String>> {
+        let text = self
+            .probe(
+                &[
+                    "get",
+                    "configmap",
+                    "-l",
+                    &format!("{}=mainline-manifests", cog_core::topology::LABEL_COMPONENT),
+                    "-o",
+                    "json",
+                ],
+                60,
+                self.rollout_timeout_secs,
+            )
+            .await?;
+        let listing: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| SFError::IO(format!("manifest bundle listing: {e}")))?;
+        let Some(items) = listing["items"].as_array() else {
+            return Ok(None);
+        };
+        let mut items: Vec<(&str, &str)> = items
+            .iter()
+            .filter_map(|item| {
+                let created = item["metadata"]["creationTimestamp"].as_str()?;
+                let yaml = item["data"]["support.yaml"].as_str()?;
+                Some((created, yaml))
+            })
+            .collect();
+        items.sort_by(|a, b| b.0.cmp(a.0));
+        Ok(items
+            .into_iter()
+            .map(|(_, yaml)| yaml)
+            .find(|yaml| *yaml != current)
+            .map(str::to_string))
+    }
+
+    /// 这次 apply 要删字段的对象，连同它们此刻的代数。取在 apply **之前**：事后
+    /// 没有对照，「删没落」与「本来就长这样」就分不开了。
+    async fn field_removals_to_verify(&self, current: &str) -> Vec<(FieldRemoval, Option<i64>)> {
+        let previous = match self.previous_support_bundle(current).await {
+            Ok(Some(previous)) => previous,
+            // 没有上一版：首装，没有「相对上一版删掉了什么」可言。
+            Ok(None) => return Vec::new(),
+            // 读不到上一版：这一轮照滚（列不出包就拦下每一次滚动的代价更大），
+            // 但这一次"没查"要留在日志里，不能与"查过、没有删除"同形。
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "mainline rollout: cannot read the previous manifest bundle; this apply's \
+                     field removals are not verified"
+                );
+                return Vec::new();
+            }
+        };
+        let removals = objects_that_lost_fields(&previous, current, &self.ns);
+        if removals.is_empty() {
+            return Vec::new();
+        }
+        info!(
+            objects = %removals
+                .iter()
+                .map(|r| format!("{}/{}", r.resource, r.name))
+                .collect::<Vec<_>>()
+                .join(","),
+            "mainline rollout: this apply removes fields from live objects; their generation must move"
+        );
+        let mut out = Vec::new();
+        for r in removals {
+            let before = self.generation_of(&r).await;
+            out.push((r, before));
+        }
+        out
+    }
+
+    /// 一个对象的 `metadata.generation`。读不到就是读不到——`None` 与「代数为 0」
+    /// 在判据上必须分得开。
+    async fn generation_of(&self, r: &FieldRemoval) -> Option<i64> {
+        let text = self
+            .probe(
+                &[
+                    "get",
+                    &r.resource,
+                    &r.name,
+                    "-n",
+                    &r.namespace,
+                    "-o",
+                    "jsonpath={.metadata.generation}",
+                ],
+                30,
+                self.rollout_timeout_secs,
+            )
+            .await
+            .ok()?;
+        text.trim().parse::<i64>().ok()
+    }
+
+    /// apply 之后再读一次代数，挑出「清单里删了字段、对象却没变」的那些。
+    async fn removals_not_taken(&self, seen: &[(FieldRemoval, Option<i64>)]) -> Vec<FieldRemoval> {
+        let mut reread = Vec::new();
+        for (r, before) in seen {
+            let after = self.generation_of(r).await;
+            reread.push((r.clone(), *before, after));
+        }
+        removals_that_did_not_land(&reread)
+    }
+
     /// 等这次 apply 动过的支撑工作负载回到就绪。等不到（或读不到集群）都把错误
     /// 交回调用方按落点分类：读不到集群是环境类，能读却一直起不来是这份发布集的
     /// 事（支撑清单也在本次下发的内容里），此时一个镜像都还没动，谈不上回滚。
@@ -4194,6 +4462,11 @@ impl RolloutExecutor {
                             .snapshot_rewritten_refs(&text, "support.yaml")
                             .await
                             .map_err(|e| classify_before_any_change("ref-snapshot", "", e))?;
+                        // 这一版在清单里删掉字段的对象，以及它们此刻的代数：server-side
+                        // apply 删不掉「本次没声明、由别的写者拥有」的字段，而那种删除
+                        // 失败退 0、回 serverside-applied，事后只能靠代数看出来一个字都
+                        // 没写进去。快照必须取在 apply 之前——它是唯一的对照。
+                        let field_removals = self.field_removals_to_verify(&text).await;
                         info!(
                             source = %support.display(),
                             manifest = %support_arg,
@@ -4245,6 +4518,38 @@ impl RolloutExecutor {
                             self.wait_support_settled(&restarted)
                                 .await
                                 .map_err(|e| classify_before_any_change("support-settle", "", e))?;
+                        }
+                        // 删字段的对象代数没动：这次 apply 说自己成功，而它要删的那几个
+                        // 字段还在。判健康会把「一条改动都没上线」写成「上线完成」，
+                        // 之后没有任何东西会再看它一眼——这正是 2026-10-22 那一轮。
+                        let not_taken = self.removals_not_taken(&field_removals).await;
+                        if !not_taken.is_empty() {
+                            let detail = not_taken
+                                .iter()
+                                .map(|r| {
+                                    format!(
+                                        "{}/{} ({} : {})",
+                                        r.resource,
+                                        r.name,
+                                        r.paths.join(", "),
+                                        r.namespace
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            return Err(classify_before_any_change(
+                                "field-removal",
+                                "",
+                                SFError::Agent(format!(
+                                    "{FIELD_REMOVAL_NOT_TAKEN_MARKER}: this revision's support \
+                                     manifest no longer declares {detail}, but the live object's \
+                                     generation did not move — server-side apply only deletes \
+                                     fields this field manager owns, so the deletion was never \
+                                     written and the cluster still carries them; remove them \
+                                     with a json patch instead of by leaving them out of the \
+                                     manifest"
+                                )),
+                            ));
                         }
                         // 配置改动走不了"按代数认人"这条路：apply 一份 ConfigMap 不改
                         // 任何工作负载的 spec，代数不动，逐目标滚动与支撑等待都不会碰
@@ -5155,6 +5460,122 @@ mod tests {
         // 空文件、没有 processor 行的 cpuinfo 同样是读不到。
         std::fs::write(&cpuinfo, "model name\t: x\n").unwrap();
         assert!(read_host_run_queue(&loadavg, &cpuinfo).is_none());
+    }
+
+    /// 「这一版删掉了哪个字段」只从两版清单的 `spec` 子树差出来：值变了不算删除，
+    /// 新出现的对象没有删除可言，`metadata`/`status` 上的差是别的写者的动作。
+    #[test]
+    fn a_field_that_is_gone_from_the_manifest_is_the_one_this_apply_has_to_delete() {
+        let previous = "\
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: cogneva-strip
+spec:
+  headers:
+    customRequestHeaders:
+      X-Frame-Options: DENY
+    customResponseHeaders:
+      X-Frame-Options: DENY
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cogneva-config
+data:
+  a: '1'
+";
+        let current = "\
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: cogneva-strip
+  labels:
+    added-by: someone-else
+spec:
+  headers:
+    customResponseHeaders:
+      X-Frame-Options: SAMEORIGIN
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cogneva-config
+data:
+  a: '2'
+";
+        let removals = objects_that_lost_fields(previous, current, "cogneva");
+        assert_eq!(
+            removals,
+            vec![FieldRemoval {
+                resource: "middleware.traefik.io".into(),
+                namespace: "cogneva".into(),
+                name: "cogneva-strip".into(),
+                paths: vec![".spec.headers.customRequestHeaders".into()],
+            }],
+            "only the dropped key is a deletion: a changed value or a new label is not"
+        );
+
+        // 新对象不是删除；对象消失也不在这条判据里（它不在这一版要 apply 的东西里）。
+        let grown =
+            format!("{current}---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: new\n");
+        assert!(objects_that_lost_fields(current, &grown, "cogneva").is_empty());
+        assert!(objects_that_lost_fields(current, previous, "cogneva").is_empty());
+        // 文档读不出来时给空集，不是给一个"全都删了"的结论。
+        assert!(objects_that_lost_fields("kind: [torn", current, "cogneva").is_empty());
+    }
+
+    /// 判断「删没落」只认两次都读到的代数：读不到不是「没变」的证据，把没有证据
+    /// 写成失败会让这条判据在别的故障上误报。
+    #[test]
+    fn a_generation_that_did_not_move_is_the_only_proof_the_deletion_was_never_written() {
+        let removed = FieldRemoval {
+            resource: "middleware.traefik.io".into(),
+            namespace: "cogneva".into(),
+            name: "cogneva-strip".into(),
+            paths: vec![".spec.headers.customRequestHeaders".into()],
+        };
+        // 代数没动：这次删除没写进去。
+        assert_eq!(
+            removals_that_did_not_land(&[(removed.clone(), Some(7), Some(7))]),
+            vec![removed.clone()]
+        );
+        // 代数退回去也是"没往前动"——对象被别的写者改回旧 spec 同样是这一版没落地。
+        assert_eq!(
+            removals_that_did_not_land(&[(removed.clone(), Some(7), Some(6))]),
+            vec![removed.clone()]
+        );
+        // 代数前进：这次 apply 写进去了，不是失败。
+        assert!(removals_that_did_not_land(&[(removed.clone(), Some(7), Some(8))]).is_empty());
+        // 任何一侧读不到都放过。
+        assert!(removals_that_did_not_land(&[(removed.clone(), None, Some(7))]).is_empty());
+        assert!(removals_that_did_not_land(&[(removed.clone(), Some(7), None)]).is_empty());
+        assert!(removals_that_did_not_land(&[(removed.clone(), None, None)]).is_empty());
+    }
+
+    /// 这条失败是**这一版的属性**：它发生在镜像一个都没动之前，却说得清「这一版的
+    /// 清单没在集群上生效」。判环境类会让同一份清单每过一个冷却窗重试一次，永远
+    /// 停不下来，读数上还像「集群还没就绪」。
+    #[test]
+    fn a_field_removal_that_did_not_land_blames_the_revision_at_both_stages() {
+        let msg = format!(
+            "{FIELD_REMOVAL_NOT_TAKEN_MARKER}: this revision's support manifest no longer \
+             declares middleware.traefik.io/cogneva-strip (.spec.headers.customRequestHeaders \
+             : cogneva), but the live object's generation did not move"
+        );
+        let locus = locate_before_any_change(&msg);
+        assert_eq!(locus, FailureLocus::FieldRemoval);
+        assert_eq!(locus.class(true), FailureClass::Version);
+        assert_eq!(locus.class(false), FailureClass::Version);
+        // 现场采样里那些环境类的措辞不能把它盖掉：判据只读分隔符之前那一段。
+        let with_scene = format!(
+            "{msg}{SUPPORT_CAUSE_SEPARATOR}Error from server (Forbidden): middlewares.traefik.io \
+             is forbidden; dial tcp 10.43.0.1:443: connect: connection refused"
+        );
+        assert_eq!(
+            locate_before_any_change(&with_scene),
+            FailureLocus::FieldRemoval
+        );
     }
 
     /// 宿主排队这条判词必须穿过两种读法：类别从它读出来，而现场采样里那句

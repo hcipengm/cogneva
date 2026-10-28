@@ -1212,6 +1212,17 @@ pub(crate) enum FailureLocus {
     /// 同样按环境类：判成版本类会让一次网关换副本在读数上看起来像上游判了红，并走上
     /// 同一条升级路（同一处坏复现 → 停下等人写代码），而这里没有人需要写代码。
     UpstreamCiUnasked,
+    /// 这一版在清单里删掉了一个字段，而它没被删掉：server-side apply 只删「本次
+    /// 声明了、并且由这个 field manager 拥有」的字段，一个由别的写者拥有的字段
+    /// 留在原地，而 apply 自己的回答是**成功**（退 0、`serverside-applied`、
+    /// 空 diff）。判健康就等于把「这次一条改动都没上线」写成「上线完成」，之后
+    /// 没有任何东西会再回头看它一眼。
+    ///
+    /// 与 [`FailureLocus::Observed`] 分开，因为它不是「观测到的版本缺陷」的一种：
+    /// 证据不是 Pod 的行为，而是目标对象的代数没动——判据在改动落地的那一步，
+    /// 不在等待那一步。两句话的处置也不同：这一条要的不是再等一轮，是换一种删除
+    /// 方式（把字段从清单里拿掉在 SSA 下不是删除动作）。
+    FieldRemoval,
     /// 其余按"观测到的版本缺陷"论，含回滚过的那一支。
     Observed,
 }
@@ -1244,7 +1255,7 @@ impl KilledReason {
 
 impl FailureLocus {
     /// 全部落点，供读回签名时校验值域用。
-    const ALL: [FailureLocus; 18] = [
+    const ALL: [FailureLocus; 19] = [
         FailureLocus::Unreachable,
         FailureLocus::Admission,
         FailureLocus::Reference,
@@ -1262,6 +1273,7 @@ impl FailureLocus {
         FailureLocus::UpstreamCi,
         FailureLocus::UpstreamCiPending,
         FailureLocus::UpstreamCiUnasked,
+        FailureLocus::FieldRemoval,
         FailureLocus::Observed,
     ];
 
@@ -1281,6 +1293,7 @@ impl FailureLocus {
             FailureLocus::UpstreamCi => "upstream-ci",
             FailureLocus::UpstreamCiPending => "upstream-ci-pending",
             FailureLocus::UpstreamCiUnasked => "upstream-ci-unasked",
+            FailureLocus::FieldRemoval => "field-removal",
             FailureLocus::Observed => "observed",
         }
     }
@@ -1307,6 +1320,11 @@ impl FailureLocus {
     /// 这一版吃得多，而代价不对称——判不准就往停下的一侧取，误停只是等一个新 rev。
     /// 它的可读部分因此不放在类别上，放在落点里（原因跟落点走，见 [`KilledReason`]）。
     ///
+    /// 「清单删掉的字段没被删掉」同样两个阶段都按版本类。它发生在镜像一个都还没动
+    /// 之前，但**说得出版本的事**：这一版的清单没能在集群上生效，是这一版的属性，
+    /// 下一轮拿到同一份清单只会得到同一个结果。判成环境类会让它每过一个冷却窗就重试
+    /// 一次，永远停不下来，而读数上看起来像「集群还没就绪」。
+    ///
     /// 「上游已判红」同样两个阶段都按版本类。`before_any_change` 那一支默认把
     /// 非 Observed 的落点全判成环境类——那是给"动手之前就说不清"的那些落点
     /// （集群不可达、集群缺对象、工具起不来）定的；这一支恰恰相反：它说不出新
@@ -1316,7 +1334,10 @@ impl FailureLocus {
         let environment = if before_any_change {
             !matches!(
                 self,
-                FailureLocus::Observed | FailureLocus::Killed(_) | FailureLocus::UpstreamCi
+                FailureLocus::Observed
+                    | FailureLocus::Killed(_)
+                    | FailureLocus::UpstreamCi
+                    | FailureLocus::FieldRemoval
             )
         } else {
             matches!(
@@ -9950,17 +9971,18 @@ mod tests {
         bundle_declared_containers, changed_configmaps, changed_workloads,
         classify_before_any_change, config_change_needs_restart, config_consumers, defined_objects,
         deployment_surges, environment_class, image_pull_blocked, is_admission_denied,
-        is_cluster_config_missing, is_host_loaded, is_image_source_unavailable,
-        is_placement_blocked, is_rollout_target, locate_before_any_change,
-        normalize_placement_shape, parse_rollout_args, pod_samples, pod_selector,
-        pod_template_limits, pod_waiting_states, readiness_overdue, replicaset_failures,
-        rollout_converged, rollout_pods_fatal, rollout_pods_ready, settle_jsonpath,
-        stage_rollout_manifest, staged_manifest_path, summarize_events, summarize_pod_states,
-        support_pod_causes, support_pod_selector, support_settled, terminating_pods,
-        unresolved_configmaps, unschedulable_pods, write_termination_message, CiHoldKind,
-        ClusterConfigSources, HostRunQueue, ProbeCycle, RefSnapshots, ReplicaSetFailure,
-        RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause, SupportWorkload, UpstreamCiAsk,
-        UpstreamCiTarget, ADMISSION_DENIED_MARKER, CI_PENDING_WAIT_SECS, HOST_LOADED_MARKER,
+        is_cluster_config_missing, is_field_removal_not_taken, is_host_loaded,
+        is_image_source_unavailable, is_placement_blocked, is_rollout_target,
+        locate_before_any_change, normalize_placement_shape, parse_rollout_args, pod_samples,
+        pod_selector, pod_template_limits, pod_waiting_states, readiness_overdue,
+        replicaset_failures, rollout_converged, rollout_pods_fatal, rollout_pods_ready,
+        settle_jsonpath, stage_rollout_manifest, staged_manifest_path, summarize_events,
+        summarize_pod_states, support_pod_causes, support_pod_selector, support_settled,
+        terminating_pods, unresolved_configmaps, unschedulable_pods, write_termination_message,
+        CiHoldKind, ClusterConfigSources, HostRunQueue, ProbeCycle, RefSnapshots,
+        ReplicaSetFailure, RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause,
+        SupportWorkload, UpstreamCiAsk, UpstreamCiTarget, ADMISSION_DENIED_MARKER,
+        CI_PENDING_WAIT_SECS, FIELD_REMOVAL_NOT_TAKEN_MARKER, HOST_LOADED_MARKER,
         IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG, NEW_REVISION_NEVER_RAN_MARKER,
         PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN, SUPPORT_CAUSE_POD_LIMIT,
     };
@@ -19646,6 +19668,144 @@ echo "||1"
         );
     }
 
+    /// server-side apply 只删「本次声明过、并且由这个 field manager 拥有」的字段。
+    /// 从清单里拿掉一个字段，apply 退 0、回 `serverside-applied`、diff 为空——三项都
+    /// 像成功，而对象一个字都没变。
+    ///
+    /// 判据只能问对象自己：清单里少了字段的那个对象，`metadata.generation` 必须动。
+    /// 假 kubectl 把 apply 之后那一次读数钉在旧值上，于是这一轮必须被拒绝；而失败
+    /// 分类要落在**这一版**上（清单没生效是这一版的属性），不能读成"集群还没就绪"。
+    #[tokio::test]
+    async fn a_removal_the_apply_did_not_write_stops_the_rollout_as_the_revisions_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) = fake_kubectl_field_removal(&bin_dir, false);
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        let err = executor.run(&plan).await.unwrap_err();
+
+        assert_eq!(err.class, FailureClass::Version, "{err:?}");
+        assert_eq!(err.signature, "version:field-removal::field-removal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(FIELD_REMOVAL_NOT_TAKEN_MARKER),
+            "the marker is what a log reader greps for: {msg}"
+        );
+        assert!(is_field_removal_not_taken(&msg), "{msg}");
+        // 判词要点名是哪个对象、少了哪个字段：不说这两样，翻日志的人得回集群自己找。
+        assert!(
+            msg.contains("middleware.traefik.io/cogneva-strip"),
+            "the object has to be named: {msg}"
+        );
+        assert!(
+            msg.contains(".spec.headers.customRequestHeaders"),
+            "the dropped field has to be named: {msg}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("set image "),
+            "an apply whose deletion never landed must not roll on to the targets: {calls}"
+        );
+    }
+
+    /// 反向对照：同一条清单、同一套假 kubectl，只要 apply 之后代数真的前进了，
+    /// 这一轮照常滚完。少了这一半，上面那条用例在"见到删字段就判死"的实现下也是绿的，
+    /// 而那会让每一次正常的字段删除都拦下主线。
+    #[tokio::test]
+    async fn a_removal_the_apply_did_write_lets_the_rollout_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) = fake_kubectl_field_removal(&bin_dir, true);
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        executor.run(&plan).await.unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("set image "),
+            "a deletion that did land must not hold the rollout: {calls}"
+        );
+        assert!(calls.contains(".metadata.generation"), "{calls}");
+    }
+
+    /// 假 kubectl：这一版的 `support.yaml` 相对上一版少了一个字段（那个对象由
+    /// 上一版的清单包给出，包留在集群里若干代），`metadata.generation` 在 apply
+    /// 之后**不动**——除非 `generation_moves`，那是反过来的一半。
+    fn fake_kubectl_field_removal(dir: &Path, generation_moves: bool) -> (PathBuf, PathBuf) {
+        let previous = "\
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: cogneva-strip
+spec:
+  headers:
+    customRequestHeaders:
+      X-Frame-Options: DENY
+    customResponseHeaders:
+      X-Frame-Options: DENY
+---
+kind: ConfigMap
+metadata:
+  name: cogneva-config
+";
+        let current = "\
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: cogneva-strip
+spec:
+  headers:
+    customResponseHeaders:
+      X-Frame-Options: DENY
+---
+kind: ConfigMap
+metadata:
+  name: cogneva-config
+";
+        // 上一版的清单包：这一版包还在，所以上一版读得到。
+        let bundle = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "cogneva-manifests-previous",
+                    "creationTimestamp": "2026-10-22T09:00:00Z",
+                },
+                "data": {"support.yaml": previous},
+            }],
+        })
+        .to_string();
+        let after = if generation_moves { "4" } else { "3" };
+        let extra = format!(
+            "  *\"get configmap -l \"*) printf '%s\\n' '{bundle}' ;;\n  \
+             *\"get middleware.traefik.io cogneva-strip\"*)\n    \
+             if [ -f '{{{{applied}}}}' ]; then echo {after}; else echo 3; fi ;;\n"
+        );
+        fake_kubectl_support_settle_with(dir, 2, true, current, &extra)
+    }
+
     /// 现场读数读不到（这里是 apiserver 拒绝：选择器读不出来）时，判词如实写"读不到"，
     /// 而**判据不变**：拒绝原文里的 `cannot get resource` 正是授权拒绝的措辞，若它
     /// 参与判决，一个真坏的版本会被记成环境类、不记账、无限重滚。
@@ -19692,18 +19852,35 @@ echo "||1"
         settle_at: u32,
         cause_readable: bool,
     ) -> (PathBuf, PathBuf) {
+        fake_kubectl_support_settle_with(
+            dir,
+            settle_at,
+            cause_readable,
+            "kind: ConfigMap\nmetadata:\n  name: cogneva-config\n",
+            "",
+        )
+    }
+
+    /// 同上，外加两个可替换件：这一版 `support.yaml` 的正文，以及插在 `case` 最前面
+    /// 的几条应答（要抢在下面的通配之前命中）。
+    fn fake_kubectl_support_settle_with(
+        dir: &Path,
+        settle_at: u32,
+        cause_readable: bool,
+        support_yaml: &str,
+        extra_cases: &str,
+    ) -> (PathBuf, PathBuf) {
         let manifests = dir.join("manifests");
         std::fs::create_dir_all(&manifests).unwrap();
-        std::fs::write(
-            manifests.join("support.yaml"),
-            "kind: ConfigMap\nmetadata:\n  name: cogneva-config\n",
-        )
-        .unwrap();
+        std::fs::write(manifests.join("support.yaml"), support_yaml).unwrap();
 
         let log = dir.join("kubectl.log");
         let applied = dir.join("applied.marker");
         let settled = dir.join("settled.marker");
         let count = dir.join("settle.count");
+        // 插进来的应答要说「apply 之前 / 之后」时用这一处：它指向的文件由上面这条
+        // `apply -f` 分支落地。
+        let extra_cases = extra_cases.replace("{{applied}}", &applied.display().to_string());
         // 判死那一刻的现场：主容器好、走查边车反复退出（这正是 2026-09-27 那两轮
         // 滚动被判失败的形状）。`-o json` 是这套读数用的打印机，与 jsonpath 一样
         // 是真实 kubectl 支持的那一种。
@@ -19723,7 +19900,7 @@ for a in "$@"; do
   prev="$a"
 done
 case "$*" in
-  *"apply -f "*)
+{extra_cases}  *"apply -f "*)
     touch '{applied}'
     echo "configmap/cogneva-config configured" ;;
   # 支撑工作负载表：apply 之后 registry 的代数前进，其余没动。
@@ -19772,7 +19949,8 @@ exit 0
             settled = settled.display(),
             count = count.display(),
             settle_at = settle_at,
-            cause_readable = if cause_readable { "yes" } else { "no" }
+            cause_readable = if cause_readable { "yes" } else { "no" },
+            extra_cases = extra_cases
         );
         write_fake_bin(dir, "fake-kubectl", &script);
         (manifests, log)
