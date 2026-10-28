@@ -1,0 +1,84 @@
+# promtool 规则单测：`CognevaFaceFirstReadingUnread` 真的会 firing，而且只在它要抓的局面里。
+#
+# 为什么要有这一层：这条规则读的是「每一面的第一条读数有没有读者」那个计数，而这个计数
+# 今天恰好是 0——一个恒不成立的表达式与一条「今天没问题」的规则，在结构门上完全同形。
+# 把界写成 `>= 0`（恒真）、把 `for:` 写成 `15y`（永不亮）、把 `max()` 去掉（报信者的
+# 标签进了身份、一台机器一个告警），三种坏法都过得了结构门。这里让 Prometheus 自己的
+# 规则引擎跑一遍，每一格带一份反向证据。
+#
+# 反向证据分三种：
+#   * 没有面缺读者（0/13）——常态，不是「这一条先别响」；
+#   * 这一族序列整条缺席——生产者没跑或读不到。缺席不是 0：缺席说明这一跑什么都没量，
+#     而「没量」由 `CognevaHostReadingSeriesVanished` 按账本判，不是这一条的事；
+#   * 多个实例同时报（一台 1、一台 0）——判的仍是「有没有面缺读者」，不是「几台机器缺」。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/15-prometheusrule-host-readings.yaml \
+#         deploy/k3s/observability/tests/15-prometheusrule-face-consumers.test.yaml
+#
+# `rule_files` 这一行由跑者重写：promtool 只认裸的 `groups:`，不认 PrometheusRule 这个
+# CRD。它从**清单本身**抽出 `spec.groups` 再改指过去——规则只有一份，测试读的就是它。
+rule_files:
+  - ../manifests/15-prometheusrule-host-readings.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、有面无读者 ⇒ `for: 2h` 之前不响，之后必须响。输入带上真序列的两片报信者标签
+  # （`job`／`instance`），因为「它们进没进身份」正是这格要钉的其中一件事。
+  - interval: 1m
+    input_series:
+      - series: 'face_first_reading_consumers_unread{job="cogneva-host-readings",instance="cogneva"}'
+        values: '1x200'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: CognevaFaceFirstReadingUnread
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: CognevaFaceFirstReadingUnread
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "读数正确性"
+
+  # 二、负对照：每一面都有读者（0/13）。这一格抓的是界被写成 `>= 0`——没有它，
+  # 「今天没问题」与「永远在响」在夹具上分不开。
+  - interval: 1m
+    input_series:
+      - series: 'face_first_reading_consumers_unread{job="cogneva-host-readings",instance="cogneva"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: CognevaFaceFirstReadingUnread
+        exp_alerts: []
+
+  # 三、负对照：这一族序列整条缺席（生产者没跑／读不到）。缺席不等于 0，也不等于缺口：
+  # 这一格抓的是「用 `absent()` 或默认 0 把那件事补出来」的写法——那样一次抓取失败
+  # 会被报成「有面缺读者」，而真正该报的是「这一跑没量」。
+  - interval: 1m
+    input_series:
+      - series: 'face_first_reading_consumers_faces{job="cogneva-host-readings",instance="cogneva"}'
+        values: '13x200'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: CognevaFaceFirstReadingUnread
+        exp_alerts: []
+
+  # 四、两片报信者各报一个数（一台 1、一台 0）⇒ 仍然只响**一条**，且只带声明的那三个
+  # 标签。这一格抓的是把 `max()` 去掉：去掉之后要么响两条、要么把 `instance`／`job`
+  # 带进身份，两种都在这里红。
+  - interval: 1m
+    input_series:
+      - series: 'face_first_reading_consumers_unread{job="cogneva-host-readings",instance="cogneva"}'
+        values: '1x200'
+      - series: 'face_first_reading_consumers_unread{job="cogneva-host-readings",instance="cogneva-2"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: CognevaFaceFirstReadingUnread
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "读数正确性"

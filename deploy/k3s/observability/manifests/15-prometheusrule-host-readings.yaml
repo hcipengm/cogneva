@@ -667,6 +667,29 @@ spec:
             summary: "有 {{ $value }} 面声明要读的读数按名字取不到"
             description: "面表（`scripts/host/cogneva-reading-witness-reading.sh` 读的那份名册）里逐面写了这一面欠哪个读数，而那个读数名在宿主端点上取不到值。逐面点名读 `reading_witness_face_resolved{face=…} == 0`。修的是面表那一行的名字或那一面的生产者，不是读数本身——同一条链上「读数没有」与「面表写错了」是两件事，这一条只管后者。"
 
+        # 每一面的**第一条读数**有没有读者。读数长出来、每拍都在印、却没有任何规则、面板或
+        # 代码读它——这样的读数在读数面上与「这一面压根没写生产者」逐字同形：都是一条决定
+        # 也不产生。这一环此前没有任何机器可读的答案，2026-10-28 实测 13 面里 2 面无读者
+        # （共用评测臂那两条序列），而已判数在 0/198 上停了八天，读数面一个字都没报。
+        #
+        # 为什么界是 `> 0` 而不是「涨到几以上」：分母只有 13，欠账从 0 变 1 就是一个整面
+        # 没人服务；给它留一个容差，就是把最该抓的那一次留成静默。今天实测 0/13，所以它
+        # 现在不红，只在「新面带着一条没人读的读数上线」时响——那一天正是要有人的那一天。
+        #
+        # 为什么不在这一条里判「读数没了」：这条读数登记在账本里，序列整体消失由
+        # `CognevaHostReadingSeriesVanished` 管；读不到时不印序列（不是印 0），所以这里
+        # 表达式为空集、不响，那是对的——「这一跑没量」不是「没有缺口」。
+        - alert: CognevaFaceFirstReadingUnread
+          expr: max(face_first_reading_consumers_unread) > 0
+          for: 2h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "读数正确性"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 面的第一条读数没有任何读者"
+            description: "面表（`scripts/data/faces.tsv`）第 10 列点名的那条序列，在公开仓 `deploy/`、`crates/`、`scripts/`、`.github/` 与宿主 `scripts/` 里一处都没有被点名——没有规则读它，没有面板画它，没有代码按它取值。逐面点名读 `face_first_reading_consumer{face=…} == 0`，跑 `bash scripts/host/cogneva-face-first-reading-consumers-reading.sh` 会连同它属于哪个生产者一起印出来。修法只有两种：给这条序列立一个会做决定的读者（一条规则、一块面板、或按它取值的代码），或者把这一面的第一读数换成一条真有读者的读数——换哪一种都要改面表那一格。**不许**用「在注释里提一句」「在登记表里写一遍」充数：那两种都不算读者，普查已经把它们排掉了。"
+
         # 任务面的两个发布者对不上：同一批任务，两条路径报出来的状态不同。判据是它们
         # 应当一致（同一份正本的两个投影），所以不一致本身就是缺陷，不需要等某个阈值。
         - alert: CognevaTasksPublishersDisagree
