@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_text::{raw_string_end, trailing_identifier};
+use common::rust_text::{raw_string_end, split_top_level, trailing_identifier};
 
 use common::routes::repo_root;
 use common::rust_production::{
@@ -231,42 +231,6 @@ fn match_body(body: &str) -> String {
     body.to_string()
 }
 
-/// 顶层逗号切分（字符串、括号里的逗号不算）。
-fn split_arms(body: &str) -> Vec<&str> {
-    let bytes = body.as_bytes();
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if let Some(end) = raw_string_end(bytes, i) {
-            i = end;
-            continue;
-        }
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(&body[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    parts.push(&body[start..]);
-    parts
-}
-
 fn literals(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
     let mut found = Vec::new();
@@ -398,7 +362,7 @@ fn written_words(
 ) -> Result<Vec<(String, String)>, String> {
     let mut arms = Vec::new();
     let arms_body = match_body(body);
-    for arm in split_arms(&arms_body) {
+    for arm in split_top_level(&arms_body) {
         let Some(arrow) = arm.find("=>") else {
             continue;
         };
@@ -442,7 +406,7 @@ fn is_plain_word(word: &str) -> bool {
 /// 臂算数——`write!(f, "state {} / {}", a, b)` 那种不是词表，读不出词就不看它。
 fn display_words(body: &str) -> Vec<(String, String)> {
     let mut arms = Vec::new();
-    for arm in split_arms(&match_body(body)) {
+    for arm in split_top_level(&match_body(body)) {
         let Some(arrow) = arm.find("=>") else {
             continue;
         };
@@ -499,7 +463,7 @@ fn explicit_arms(source: &str, owner: &str) -> Vec<(String, String)> {
 fn read_words(body: &str) -> Vec<(String, String)> {
     let mut arms = Vec::new();
     let arms_body = match_body(body);
-    for arm in split_arms(&arms_body) {
+    for arm in split_top_level(&arms_body) {
         let Some(arrow) = arm.find("=>") else {
             continue;
         };

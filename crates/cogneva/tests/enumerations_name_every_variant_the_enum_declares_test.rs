@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_text::raw_string_end;
+use common::rust_text::{raw_string_end, split_top_level};
 
 use common::routes::repo_root;
 use common::rust_production::{
@@ -76,7 +76,7 @@ fn enums_in(file: &str, source: &str) -> Result<BTreeMap<String, BTreeSet<String
 /// 枚举体里的变体名：按顶层逗号切，去掉开头的属性。
 fn variants_of(body: &str) -> BTreeSet<String> {
     let mut variants = BTreeSet::new();
-    for part in split_items(body) {
+    for part in split_top_level(body) {
         let mut part = part.trim();
         while part.starts_with("#[") {
             let Some(close) = part.find(']') else { break };
@@ -91,42 +91,6 @@ fn variants_of(body: &str) -> BTreeSet<String> {
         }
     }
     variants
-}
-
-/// 按顶层的逗号切（括号、方括号、花括号与字符串里的逗号不算）。
-fn split_items(body: &str) -> Vec<&str> {
-    let bytes = body.as_bytes();
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if let Some(end) = raw_string_end(bytes, i) {
-            i = end;
-            continue;
-        }
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(&body[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    parts.push(&body[start..]);
-    parts
 }
 
 /// 从 `open`（一个 `{`）开始找到配对的那个。字符串、字符字面量与生命周期都不算

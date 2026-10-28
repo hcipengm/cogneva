@@ -82,6 +82,22 @@ pub fn published_by_this_build(foreign: &[(&'static str, &str)]) -> Vec<&'static
     found
 }
 
+/// The invariant as an assertion: no name filed as foreign is one this build
+/// publishes.
+///
+/// Two readers hold a foreign table and each wrote this assertion out; the body
+/// is the same and so is the sentence it prints, which is why the sentence
+/// belongs here — a copy that drifts says less than the one that did not, at
+/// the moment someone is reading it to find out what went wrong.
+pub fn assert_no_foreign_name_is_ours(foreign: &[(&'static str, &str)]) {
+    let filed_here = published_by_this_build(foreign);
+    assert!(
+        filed_here.is_empty(),
+        "这些名字被登记成外来序列，却是本仓库闭集里的产出名——登记成外来它就不再被查产出点:\n{}",
+        filed_here.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

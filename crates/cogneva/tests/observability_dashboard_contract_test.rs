@@ -1147,13 +1147,7 @@ fn every_series_the_table_claims_is_produced_is_named_by_its_producer() {
 /// it, and why the reverse direction cannot be decided by text.
 #[test]
 fn no_foreign_name_is_one_the_closed_set_publishes() {
-    let filed_here = closed_set::published_by_this_build(FOREIGN);
-
-    assert!(
-        filed_here.is_empty(),
-        "这些名字被登记成外来序列，却是本仓库闭集里的产出名——登记成外来它就不再被查产出点:\n{}",
-        filed_here.join("\n")
-    );
+    closed_set::assert_no_foreign_name_is_ours(FOREIGN);
 }
 
 #[test]
