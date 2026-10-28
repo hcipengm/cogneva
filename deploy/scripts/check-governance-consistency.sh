@@ -95,7 +95,19 @@ workloads = [d for k in ('Deployment', 'StatefulSet', 'DaemonSet', 'CronJob', 'J
 
 
 if not quotas and not limits:
-    print(f"GOVERNANCE SKIP [{PROFILE}]：未渲染 ResourceQuota/LimitRange（resourceGovernance.enabled=false），无数值可核")
+    # 「profile 关掉了治理」（k8s-standard 默认 enabled=false）与「这一份渲染什么都没
+    # 产出」在产物上是同一种形状：没有这两类对象。区别在于后者连工作负载都没有。
+    # 不分开的话，渲染塌成空目录时本脚本印的是一句 SKIP、退 0，读起来与「治理关了、
+    # 没必要核」一模一样，而下游拿到的是空清单。
+    if not workloads and not claims:
+        sys.exit(
+            f"GOVERNANCE 校验失败 [{PROFILE}]：{DIR} 里一个工作负载、一条卷声明都没有读到——"
+            f"这是渲染没产出东西，与「profile 关掉了治理」不是一回事"
+        )
+    print(
+        f"GOVERNANCE SKIP [{PROFILE}]：未渲染 ResourceQuota/LimitRange（resourceGovernance.enabled=false），"
+        f"无数值可核；渲染集里的 {len(workloads)} 个工作负载与 {len(claims)} 条卷声明本轮没有天花板"
+    )
     sys.exit(0)
 if len(quotas) > 1 or len(limits) > 1:
     sys.exit(f"GOVERNANCE 校验失败 [{PROFILE}]：命名空间治理对象应各至多一个，实得 quota={len(quotas)} limitrange={len(limits)}")

@@ -109,7 +109,11 @@ for profile_dir in "${repo}"/deploy/rendered/*/; do
   bash "${gate}" "${dir}" > "${work}/${profile}.out" 2>&1 \
     || fail "the gate is red on ${profile}: $(tail -3 "${work}/${profile}.out")"
   if grep -q 'GOVERNANCE SKIP' "${work}/${profile}.out"; then
-    echo "OK: ${profile}: 没有配额可核，门自己印了 SKIP（这一种不验数值）"
+    # SKIP 也得说清放下了多少：只印一句「无数值可核」时，读者不知道被略过的是
+    # 18 个工作负载还是 0 个。
+    grep -q '个工作负载' "${work}/${profile}.out" \
+      || fail "${profile}: SKIP 没交代这一轮有多少工作负载没有天花板可核"
+    echo "OK: ${profile}: 没有配额可核，门自己印了 SKIP（这一种不验数值，但要说清略过了多少）"
     continue
   fi
   judged=$((judged + 1))
@@ -209,6 +213,20 @@ PYEOF
 done
 # 全跳就等于什么都没验：一个 SKIP 都没留下读数时，这条测试必须自己说出来。
 [ "${judged}" -ge 1 ] || fail "没有任何一种形态判出了数值——这一趟什么都没验"
+
+# 空目录不是 SKIP：门读的是渲染产物，「这个 profile 关掉了治理」与「渲染塌成空目录」
+# 在产物上同形（都没有 ResourceQuota/LimitRange），靠「连工作负载都没有」分开。
+# 不分开时，渲染一步失败、产物空着，本门印一句 SKIP 退 0，下游拿到空清单。
+empty="${work}/empty"
+mkdir -p "${empty}"
+rc=0
+missing="$(bash "${gate}" "${empty}" 2>&1)" || rc=$?
+[ "${rc}" -ne 0 ] || fail "empty rendered tree: 空目录上退了 0 —— ${missing}"
+case "${missing}" in
+  *"都没有读到"*) ;;
+  *) fail "empty rendered tree: 判词没说是渲染没产出 —— ${missing}" ;;
+esac
+echo "OK: empty rendered tree: 渲染塌成空目录是红的，不是 SKIP"
 
 # A manifest-declared Job has to move the lower bound: the note has always claimed
 # concurrent Jobs count as 1, and until now the enumeration could not see any Job.
