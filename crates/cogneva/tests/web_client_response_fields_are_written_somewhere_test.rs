@@ -39,6 +39,8 @@ use std::path::PathBuf;
 
 mod common;
 
+use common::rust_text::snake_case;
+
 use common::routes::read;
 
 use common::routes::repo_root;
@@ -138,21 +140,6 @@ fn unwritten(client: &str, server: &str) -> Vec<String> {
 /// mapping is right there in the module, and the wire key it reads has to be
 /// spelled in the tree.
 const RENAMED: &[(&str, &str, &str)] = &[("LoginResponse", "refreshToken", "res.refresh_token")];
-
-fn snake_case(name: &str) -> String {
-    let mut out = String::new();
-    for (i, ch) in name.char_indices() {
-        if ch.is_uppercase() {
-            if i > 0 {
-                out.push('_');
-            }
-            out.extend(ch.to_lowercase());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
 
 #[test]
 fn every_field_the_client_declares_is_a_field_the_tree_spells() {

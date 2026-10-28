@@ -51,6 +51,8 @@
 
 mod common;
 
+use common::rust_text::is_lower_word;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -240,14 +242,6 @@ struct Declaration {
 /// 判据是「一个词」的形状：小写字母、数字与 `_ . - /`，不超过 40 字节。整句文案
 /// 与带空格的字符串不进这条判据——它们同值异名时，两处的措辞差异本身就是信号，
 /// 不需要本门去登记。
-fn is_word(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 40
-        && value.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-' | b'/')
-        })
-}
-
 /// 一行里的声明，`None` 表示这行不是（或读不全）声明。
 fn declaration_on(line: &str) -> Option<(String, String)> {
     let at = line.find("const ")?;
@@ -294,7 +288,7 @@ fn declarations(root: &Path, files: &[PathBuf]) -> Vec<Declaration> {
             let Some((name, value)) = declaration_on(line) else {
                 continue;
             };
-            if !is_word(&value) {
+            if !is_lower_word(&value) {
                 continue;
             }
             out.push(Declaration {

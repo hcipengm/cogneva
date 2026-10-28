@@ -46,6 +46,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::rust_text::{raw_string_end, trailing_identifier};
+
 use common::routes::repo_root;
 use common::rust_production::{
     crate_tree_sources, production_text, relative_name, sources_of_crate_tree,
@@ -89,43 +91,6 @@ fn open_brace_after(text: &str, from: usize) -> Option<usize> {
             _ => {}
         }
         i += 1;
-    }
-    None
-}
-
-/// 从 `i` 开始的原始字符串（`r"…"`、`r#"…"#`、`br#"…"#`）到哪结束。正则里的花括号
-/// 不是括号，不认它整段就会错位。
-fn raw_string_end(bytes: &[u8], i: usize) -> Option<usize> {
-    let mut j = i;
-    if matches!(bytes.get(j), Some(b'b') | Some(b'c')) && bytes.get(j + 1) == Some(&b'r') {
-        j += 1;
-    }
-    if bytes.get(j) != Some(&b'r') {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0;
-    while bytes.get(j) == Some(&b'#') {
-        hashes += 1;
-        j += 1;
-    }
-    if bytes.get(j) != Some(&b'"') {
-        return None;
-    }
-    j += 1;
-    while j < bytes.len() {
-        if bytes[j] == b'"' {
-            let mut k = j + 1;
-            let mut seen = 0;
-            while seen < hashes && bytes.get(k) == Some(&b'#') {
-                seen += 1;
-                k += 1;
-            }
-            if seen == hashes {
-                return Some(k);
-            }
-        }
-        j += 1;
     }
     None
 }
@@ -326,17 +291,6 @@ fn literals(text: &str) -> Vec<String> {
         i += 1;
     }
     found
-}
-
-fn trailing_identifier(text: &str) -> String {
-    text.trim_end()
-        .chars()
-        .rev()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect()
 }
 
 /// `Self::X`／`X::Y::Z`／`Ok(Self::X)` 里那个大写开头的变体名。

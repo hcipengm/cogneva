@@ -39,6 +39,8 @@ use std::path::Path;
 
 mod common;
 
+use common::rust_text::snake_case;
+
 use common::routes::{matching_brace, read, repo_root, strip_comments};
 use common::rust_production::production_text;
 
@@ -103,21 +105,6 @@ const SUBJECTS: &[(&str, Spoken)] = &[
 
 /// `CompileChecked` → `compile_checked`, the shape `rename_all = "snake_case"`
 /// gives a variant on the wire.
-fn snake_case(name: &str) -> String {
-    let mut out = String::new();
-    for (i, ch) in name.char_indices() {
-        if ch.is_uppercase() {
-            if i > 0 {
-                out.push('_');
-            }
-            out.extend(ch.to_lowercase());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
 /// The words an enum serialises, or `None` when the declaration is not one this
 /// reader can trust: no `snake_case` rename, a variant it cannot parse, or no
 /// enum at all. `None` is a red result, never an empty word list — a vocabulary

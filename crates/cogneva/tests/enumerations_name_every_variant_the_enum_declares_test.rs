@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::rust_text::raw_string_end;
+
 use common::routes::repo_root;
 use common::rust_production::{
     crate_tree_sources, production_text, relative_name, sources_of_crate_tree,
@@ -125,43 +127,6 @@ fn split_items(body: &str) -> Vec<&str> {
     }
     parts.push(&body[start..]);
     parts
-}
-
-/// 从 `i` 开始的原始字符串（`r"…"`、`r#"…"#`、`br#"…"#`）到哪结束。原始字符串里
-/// 的花括号不是括号（正则里遍地都是），不认它就整段错位。
-fn raw_string_end(bytes: &[u8], i: usize) -> Option<usize> {
-    let mut j = i;
-    if matches!(bytes.get(j), Some(b'b') | Some(b'c')) && bytes.get(j + 1) == Some(&b'r') {
-        j += 1;
-    }
-    if bytes.get(j) != Some(&b'r') {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0;
-    while bytes.get(j) == Some(&b'#') {
-        hashes += 1;
-        j += 1;
-    }
-    if bytes.get(j) != Some(&b'"') {
-        return None;
-    }
-    j += 1;
-    while j < bytes.len() {
-        if bytes[j] == b'"' {
-            let mut k = j + 1;
-            let mut seen = 0;
-            while seen < hashes && bytes.get(k) == Some(&b'#') {
-                seen += 1;
-                k += 1;
-            }
-            if seen == hashes {
-                return Some(k);
-            }
-        }
-        j += 1;
-    }
-    None
 }
 
 /// 从 `open`（一个 `{`）开始找到配对的那个。字符串、字符字面量与生命周期都不算

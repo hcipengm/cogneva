@@ -27,6 +27,8 @@ use std::path::Path;
 
 mod common;
 
+use common::rust_text::snake_case;
+
 use common::js_literal::split_top_level;
 use common::routes::{matching_brace, read, repo_root, strip_comments};
 use common::rust_production::production_text;
@@ -42,21 +44,6 @@ const CLIENTS: &[&str] = &[
 
 /// 客户端给「从载荷里解出来的那个事件对象」起的名字，都直接从这些词旁边绑出来。
 const CARRIERS: &[&str] = &["assistant_event", "assistantEvent"];
-
-fn snake_case(name: &str) -> String {
-    let mut out = String::new();
-    for (i, ch) in name.char_indices() {
-        if ch.is_uppercase() {
-            if i > 0 {
-                out.push('_');
-            }
-            out.extend(ch.to_lowercase());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
 
 /// 枚举序列化出去的标签，或 `None`：没有 `snake_case` 重命名、有变体解析不了、或者
 /// 根本没有这个枚举。`None` 是红，不是空词表——空词表会让每个标签都像缺陷，

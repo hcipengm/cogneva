@@ -46,6 +46,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::rust_text::trailing_identifier;
+
 use common::routes::{matching_brace, repo_root};
 use common::rust_production::{
     crate_tree_sources, production_text, relative_name, sources_of_crate_tree,
@@ -169,17 +171,6 @@ fn split_items(body: &str) -> Vec<&str> {
     }
     parts.push(&body[start..]);
     parts
-}
-
-fn trailing_identifier(text: &str) -> String {
-    text.trim_end()
-        .chars()
-        .rev()
-        .take_while(|c| c.is_alphanumeric() || *c == '_')
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect()
 }
 
 /// 从 `text` 的第一个 `"` 起读到收尾的那个，返回词。

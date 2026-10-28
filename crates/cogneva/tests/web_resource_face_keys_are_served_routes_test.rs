@@ -27,24 +27,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 mod common;
-use common::routes::{read, repo_root, served_paths, strip_comments, walk};
+use common::routes::{read, repo_root, served_prefixes, strip_comments, walk};
 
 const WEB: &str = "web/src";
-
-/// 服务端认得的前缀：路由表里 `/api/v1/<段>` 的第一段。
-fn served_prefixes(root: &Path) -> BTreeSet<String> {
-    let mut prefixes = BTreeSet::new();
-    for path in served_paths(root) {
-        let Some(rest) = path.strip_prefix("/api/v1/") else {
-            continue;
-        };
-        let segment = rest.split('/').next().unwrap_or("");
-        if !segment.is_empty() && segment != "{}" {
-            prefixes.insert(segment.to_string());
-        }
-    }
-    prefixes
-}
 
 /// 客户端写下的面名：`resourceKey('…')` 里的那个字面量。
 fn face_keys(text: &str) -> BTreeSet<String> {

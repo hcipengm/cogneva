@@ -38,7 +38,19 @@
 //! 体里同时出现 `read_dir` 与它自己的名字**。那正是「这棵树怎么走」这条规则的形状，
 //! 而它只该有一个答案，所以判据直接认这个形状：夹具里不许再有第二处自走的递归。
 //!
-//! 断言各自单独会长回来：副本为零、递归只有一处、共享模块还在真干活、还有人在用它。
+//! 还有**第三种形状**，前两种都看不见它：抄的人把函数名也换了。`is_word` 与
+//! `is_component` 是同一个判据的两个名字，`split_arms` 与 `split_items` 也是；
+//! 按签名判要求参数类型相同，按定义名判要求名字相同，而抄件两样都可以不同。它们
+//! 唯一共有的是**函数体**：去掉注释、折叠空白之后逐字相同。所以这一面按体判——
+//! 两个夹具里出现同一段体（哪怕叫法不同）就是同一条规则的第二份。
+//!
+//! 体相同的那几条今天多半已经搬进 `common::rust_text`（`snake_case`、`raw_string_end`、
+//! `trailing_identifier`、`is_lower_word`）。剩下没搬的那些记在
+//! `KNOWN_DUPLICATED_BODIES` 里，那张表只能变短：合并掉一条就删一行，留着会让
+//! 「每一条都还数得出来」的断言先红。
+//!
+//! 断言各自单独会长回来：副本为零、递归只有一处、没有新的同体、共享模块还在真干活、
+//! 还有人在用它。
 
 mod common;
 
@@ -91,6 +103,35 @@ const COPIED_FORMS: [&str; 10] = [
 /// 不着它。跨类边界不是副本。
 const INLINE_FORMS: [&str; 1] = [r#".replace('\\', "/")"#];
 
+/// 已经数出来、但还没合并的那些同体函数：按**函数体**比，不看名字。
+///
+/// 这一族抄件的名字最不可靠：`is_word` 与 `is_component` 是同一个判据的两个名字，
+/// `split_arms` 与 `split_items` 也是。按签名、按定义名判的判据全都看不见它们，
+/// 只有「两段函数体去掉空白之后逐字相同」这件事看得见。
+///
+/// 这张表只能变短。`KNOWN_CEILING` 是它今天的上界，往里加一条就要同时抬这个数，
+/// 而抬数的那一行会在评审里被看见；合并掉一条则要把它从那表里删掉——留着会让
+/// 下面「每一条都还数得出来」的断言先红，那份红就是催着删的信号。
+const KNOWN_DUPLICATED_BODIES: [&str; 14] = [
+    "make_orchestrator",
+    "manifest_rules",
+    "no_foreign_name_is_one_the_closed_set_publishes",
+    "make_raw",
+    "yaml_docs",
+    "workflow",
+    "scan",
+    "test_redis_url",
+    "open_test_redis_at",
+    "registration",
+    "split_arms",
+    "split_items",
+    "unreachable_redis_skips_instead_of_panicking",
+    "fixture",
+];
+
+/// `KNOWN_DUPLICATED_BODIES` 的上界。今天 14。
+const KNOWN_CEILING: usize = 14;
+
 /// 这条门自己。它把签名当字符串写着（判据要看的就是那几行），所以在真树上会被
 /// 自己点名——**只摘这一面**：下面要求它至少还认得出自己的几份标本，判据哪天退化成
 /// 什么都认不出，这一条先红，而不是让摘除悄悄掩盖掉一个瞎了的判据。
@@ -123,6 +164,8 @@ struct Census {
     readers: usize,
     walkers: usize,
     strippers: usize,
+    /// 函数体逐字相同、却定义在不止一个夹具文件里的那些：名字 →（文件:行, 名字）。
+    duplicate_bodies: Vec<(String, Vec<String>)>,
 }
 
 /// 这个文件里有哪些函数自己在往下走目录：函数体里同时出现 `read_dir` 与它自己的名字。
@@ -182,6 +225,61 @@ fn recursions_in(file: &str, text: &str) -> Vec<(String, usize, String)> {
     out
 }
 
+/// 这份文件里每个**自由函数**的函数体指纹：`(名字, 行号, 去掉空白后的函数体)`。
+///
+/// 只看行首顶格的 `fn`：`impl` 里的方法缩进着，它们各自实现同一个 trait 的不同部分，
+/// 是「这个 mock 该长什么样」而不是「这条规则该怎么写」，搬不动也不该搬。
+///
+/// 空白折叠掉，是因为抄的人会重新排版：缩进、换行、参数折行都会变，规则本身不变。
+fn free_function_bodies(text: &str) -> Vec<(String, usize, String)> {
+    let code = strip_comments(text);
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    let mut line_start = 0usize;
+    for (index, line) in code.split('\n').enumerate() {
+        let this_line = line_start;
+        line_start += line.len() + 1;
+        let rest = ["fn ", "pub fn ", "async fn ", "pub async fn "]
+            .iter()
+            .find_map(|head| line.strip_prefix(head));
+        let Some(rest) = rest else {
+            continue;
+        };
+        let lead = line.len() - rest.len();
+        let Some(params) = rest.find('(') else {
+            continue;
+        };
+        let called = rest[..params].trim();
+        if called.is_empty()
+            || !called
+                .chars()
+                .all(|c| c == '_' || c.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        let Some(closed) = matching_paren(bytes, this_line + lead + params) else {
+            continue;
+        };
+        let Some(body_at) = code[closed..].find('{').map(|at| closed + at) else {
+            continue;
+        };
+        let Some(body_end) = matching_brace(bytes, body_at) else {
+            continue;
+        };
+        let body = code[body_at..body_end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        // 太短的（`fn x() { 1 }`、转发用的壳）不算一条规则：它们撞在一起是巧合，
+        // 而共享一个两行的壳换不来任何一致性。
+        if body.len() < 80 {
+            continue;
+        }
+        out.push((called.to_string(), index + 1, body));
+    }
+    out
+}
+
 /// 这份文件从哪个 `::{…}` 里导入了哪些名字。
 ///
 /// 跨行的导入也要读得到：夹具里常见的是
@@ -210,6 +308,9 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     let mut recursions = Vec::new();
     let mut files = 0usize;
     let (mut readers, mut walkers, mut strippers) = (0usize, 0usize, 0usize);
+    // 函数体 → 出现它的「文件:行 名字」。按体分组，所以同一个体换了名字也照样并到一起。
+    let mut bodies: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     let shared = [THE_ONE, ROUTES_HOME, PRODUCTION_HOME];
     for path in files_in {
         let name = relative_name(root, path);
@@ -226,6 +327,19 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         // 这个形状由下面那条消融单独证明。
         if name.contains("/tests/") && name != THE_PREDICATE && name != THE_ONE {
             recursions.extend(recursions_in(&name, &text));
+            // 同体只在**本 crate 的夹具**之间比。跨 crate 的抄件（`database_url` 在四个
+            // crate 的二十几份夹具里，`migrate_once` 在三份里）确实也是同一族，但它们
+            // 够不着 `cogneva/tests/common`——那不是夹具内部可搬的重复，而是要另开一个
+            // 跨 crate 的测试支撑 crate，是另一笔。这里先把「同一棵树内、可搬而未搬」
+            // 的那一半钉住，那一半今天一个也没钉。
+            if name.starts_with("crates/cogneva/tests/") {
+                for (function, line, body) in free_function_bodies(&text) {
+                    bodies
+                        .entry(body)
+                        .or_default()
+                        .push(format!("{name}:{line} {function}"));
+                }
+            }
         }
         let imported = imported_names(&text);
         if name != THE_ONE {
@@ -256,6 +370,17 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
             }
         }
     }
+    // 只在**不同文件**之间算重复：同一份文件里两个同体的小函数不是「规则写了两遍」。
+    let duplicate_bodies = bodies
+        .into_iter()
+        .filter(|(_, at)| {
+            let files: std::collections::BTreeSet<&str> = at
+                .iter()
+                .map(|one| one.split(':').next().unwrap_or(one))
+                .collect();
+            files.len() >= 2
+        })
+        .collect();
     Census {
         copies,
         recursions,
@@ -263,6 +388,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         readers,
         walkers,
         strippers,
+        duplicate_bodies,
     }
 }
 
@@ -329,6 +455,47 @@ fn the_fixture_reading_steps_are_written_once() {
          而「读不出来就 panic」这句话在各自的抄件里都只是一句注释。",
         recursions = found.recursions
     );
+
+    // 函数体这一面：两段体去掉空白之后逐字相同、却写在两个夹具文件里，就是同一条规则
+    // 的第二份。这一族抄件按名字判全瞎——`is_word` 与 `is_component` 是同一个判据的
+    // 两个名字，`split_arms` 与 `split_items` 也是；抄的人顺手改名，按定义名找永远找不全。
+    let known = KNOWN_DUPLICATED_BODIES;
+    assert!(
+        known.len() <= KNOWN_CEILING,
+        "已知同体表涨到 {} 条（上界 {KNOWN_CEILING}）：这张表只能变短，加一条要同时抬\
+         上界，好让它是评审里看得见的一行",
+        known.len()
+    );
+    let name_of = |site: &str| site.rsplit(' ').next().unwrap_or(site).to_string();
+    let mut unknown: Vec<(&Vec<String>, &String)> = Vec::new();
+    for (body, at) in &found.duplicate_bodies {
+        if at
+            .iter()
+            .all(|site| known.contains(&name_of(site).as_str()))
+        {
+            continue;
+        }
+        unknown.push((at, body));
+    }
+    assert!(
+        unknown.is_empty(),
+        "这些地方把同一段函数体写了两遍（去掉空白后逐字相同）：{unknown:?}\n\
+         搬进 `common/` 里对应的一份（读 Rust 文本的那几条在 `common::rust_text`，\
+         走目录 / 读文件在 `common::routes`，普查产出的在 `common::rust_production`）。\
+         名字不可靠：抄的人顺手改名，所以这条判据按体判、不按名字判。"
+    );
+    // 反过来问：表里每一条都还数得出来吗。合并掉之后忘了删表，这一问先红——那张表
+    // 留着旧名字，下一次真的长回来时就会被它悄悄放过去。
+    for name in known {
+        assert!(
+            found
+                .duplicate_bodies
+                .iter()
+                .any(|(_, at)| at.iter().any(|site| name_of(site) == name)),
+            "`{name}` 已经不在「两个夹具各写一遍」的清单里了：合并完就从 \
+             KNOWN_DUPLICATED_BODIES 里删掉它，并且在 KNOWN_CEILING 上把余量收起一行"
+        );
+    }
 
     // 反过来问：被指认的那一处真的还在干这件事吗。少了这一问，把它换成空壳之后
     // 本判据照绿——它只证明了「别处没有」。
@@ -627,6 +794,77 @@ fn a_recursion_on_disk_is_reported() {
             "collect_yaml".to_string()
         ),
         "要点名到文件和行号，且报出那个自己调自己的函数名（它按定义名判不出来）"
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 判据自检：**同一段函数体写在两个夹具里**这个形状认不认得出。
+///
+/// 真树上今天只剩 `KNOWN_DUPLICATED_BODIES` 里那几条，而「一条新的都没有」与「判据
+/// 瞎了」同形。这里搭一棵树，把该点名的那一种和三种不该点名的混在一起：借共享的、
+/// 同一份文件里写两遍的、以及 `impl` 里缩进着的方法。抄的人会顺手改名，所以两份
+/// 标本故意用两个不同的函数名。
+#[test]
+fn a_body_written_twice_is_reported() {
+    let root = std::env::temp_dir().join(format!("census-bodies-{}", std::process::id()));
+    let dir = root.join("crates/cogneva/tests");
+    std::fs::create_dir_all(&dir).expect("a scratch tests directory");
+
+    // 借共享的：一份定义都没有，不该点名。
+    std::fs::write(
+        dir.join("borrower.rs"),
+        "use common::rust_text::snake_case;\nfn fold(names: &[String]) -> Vec<String> {\n    names.iter().map(|n| snake_case(n)).collect()\n}\n",
+    )
+    .expect("a borrower");
+    // 同一份文件里写两遍：不是「规则写了两遍」，是这份文件里两个同名的形状。
+    std::fs::write(
+        dir.join("twice_in_one_file.rs"),
+        "fn first(text: &str) -> String {\n    let mut out = String::new();\n    for (i, ch) in text.char_indices() {\n        if i > 0 { out.push('_'); }\n        out.push(ch);\n    }\n    out\n}\n\nfn second(text: &str) -> String {\n    let mut out = String::new();\n    for (i, ch) in text.char_indices() {\n        if i > 0 { out.push('_'); }\n        out.push(ch);\n    }\n    out\n}\n",
+    )
+    .expect("two copies in one file");
+    // `impl` 里缩进着的方法：各实现各的 trait，搬不动也不该搬。
+    std::fs::write(
+        dir.join("mock.rs"),
+        "struct Mock;\nimpl Quota for Mock {\n    async fn get_user_summary(&self, id: &str) -> Summary {\n        Summary { target_id: id.to_string(), target_type: \"user\".into(), total: u64::MAX }\n    }\n}\n",
+    )
+    .expect("a trait impl");
+
+    let found = census(&root, &all_files(&root));
+    assert!(
+        found.duplicate_bodies.is_empty(),
+        "借共享的、同一份文件里两遍的、`impl` 里的那三种都不该点名：{:?}",
+        found.duplicate_bodies
+    );
+
+    // 一份长同一段体、两个不同的文件、两个不同的名字——按定义名判的判据全看不见它。
+    let body = "    let mut out = Vec::new();\n    for line in text.lines() {\n        let trimmed = line.trim();\n        if trimmed.is_empty() || trimmed.starts_with('#') {\n            continue;\n        }\n        out.push(trimmed.to_string());\n    }\n    out\n";
+    std::fs::write(
+        dir.join("first.rs"),
+        format!("fn kept_lines(text: &str) -> Vec<String> {{\n{body}}}\n"),
+    )
+    .expect("the first copy");
+    std::fs::write(
+        dir.join("second.rs"),
+        format!("fn meaningful(text: &str) -> Vec<String> {{\n{body}}}\n"),
+    )
+    .expect("the second copy");
+
+    let found = census(&root, &all_files(&root));
+    assert_eq!(
+        found.duplicate_bodies.len(),
+        1,
+        "只该点名那一对（换了名字的同一段体）：{:?}",
+        found.duplicate_bodies
+    );
+    let (_, at) = &found.duplicate_bodies[0];
+    assert!(
+        at.iter()
+            .any(|site| site.ends_with("first.rs:1 kept_lines"))
+            && at
+                .iter()
+                .any(|site| site.ends_with("second.rs:1 meaningful")),
+        "两份都要点名到文件与行号，哪怕它们的函数名不一样：{at:?}"
     );
 
     std::fs::remove_dir_all(&root).ok();

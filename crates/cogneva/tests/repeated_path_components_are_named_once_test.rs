@@ -28,9 +28,11 @@
 //! - 拼接起来才成形的那一段（`join("deploy/rendered")`），按它写成的那个字符串
 //!   判，不拆开。
 //! - 字符串的 `Vec::join`（`.join(", ")`）：只认「一个词」的形状，见
-//!   [`is_component`]。
+//!   [`is_lower_word`]。
 
 mod common;
+
+use common::rust_text::is_lower_word;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -55,14 +57,6 @@ const MIN_CRATES: usize = 12;
 /// 这道判据把 `.join(", ")`、`.join(" ")`、`.join(" | ")` 这些**字符串**的
 /// 连接挡在外面——它们同样是 `join(`，但拼出来的不是路径。带空格的路径组件
 /// 不进这道门：那种字面量在树上没有，一旦出现会体现为普查数下降。
-fn is_component(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 40
-        && value.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'.' | b'-' | b'/')
-        })
-}
-
 /// 三种把一段路径写进代码的拼法。`join` 是接在一段后面的组件，`Path::new` /
 /// `PathBuf::from` 是整段：同一个词无论从哪一种写出来，写两遍就是两处。
 const PATH_FORMS: [&str; 3] = [".join(", "Path::new(", "PathBuf::from("];
@@ -103,7 +97,7 @@ fn path_components(text: &str) -> Vec<String> {
                 break;
             }
             let value = std::str::from_utf8(&b[start..k]).unwrap_or("");
-            if !escaped && is_component(value) {
+            if !escaped && is_lower_word(value) {
                 out.push(value.to_string());
             }
             i = k + 1;
