@@ -12,11 +12,11 @@
 //! 反证：声明之前，这道门在 `cog-gateway/src/lib.rs` 报 7 行、在
 //! `cog-observability/src/traces.rs` 报 3 行——那 10 行正是当时树上各自写了一遍的头名。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod common;
 
-use common::rust_production::production_lines;
+use common::rust_production::{production_lines, production_sources};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -62,38 +62,7 @@ fn offences(text: &str) -> Vec<String> {
 
 #[test]
 fn every_hop_spells_the_trace_headers_from_the_declaration() {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(repo_root().join("crates"))
-        .expect("crates/ 不在仓库里")
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
-    crates.sort();
-
-    let mut sources = Vec::new();
-    for krate in crates {
-        let src = krate.join("src");
-        if src.is_dir() {
-            walk(&src, &mut sources);
-        }
-    }
-    assert!(
-        sources.len() > 100,
-        "只找到 {} 个源文件，这条判据没有题目",
-        sources.len()
-    );
+    let sources = production_sources(&repo_root());
 
     let mut hits = Vec::new();
     for path in sources {

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_lines;
+use common::rust_production::{production_lines, production_sources};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -29,20 +29,6 @@ fn repo_root() -> PathBuf {
 
 /// Where the names are declared, relative to the repository root.
 const HOME: &str = "crates/cog-core/src/roles.rs";
-
-fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
-}
 
 /// Every complete string literal on the line, with the text before it.
 ///
@@ -100,22 +86,9 @@ fn registered_elsewhere(file: &str, value: &str) -> bool {
 }
 
 fn sites(root: &Path, names: &[&str]) -> BTreeMap<String, Vec<String>> {
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(root.join("crates"))
-        .expect("crates/ 不在仓库里")
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
-    crates.sort();
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for krate in crates {
-        let src = krate.join("src");
-        if !src.is_dir() {
-            continue;
-        }
-        let mut files = Vec::new();
-        walk(&src, &mut files);
-        files.sort();
-        for path in files {
+    {
+        for path in production_sources(root) {
             let file = path
                 .strip_prefix(root)
                 .unwrap_or(&path)

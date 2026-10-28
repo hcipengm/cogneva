@@ -31,7 +31,7 @@ use std::path::PathBuf;
 
 mod common;
 
-use common::rust_production::production_text;
+use common::rust_production::{production_sources, production_text};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -185,37 +185,6 @@ fn every_product_object_the_manifests_create_is_declared() {
 }
 
 /// Every `*.rs` file under `crates/*/src`, relative to the repo root.
-fn rust_sources() -> Vec<PathBuf> {
-    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(repo_root().join("crates"))
-        .expect("crates/ 不在仓库里")
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
-    crates.sort();
-    let mut out = Vec::new();
-    for krate in crates {
-        let src = krate.join("src");
-        if src.is_dir() {
-            walk(&src, &mut out);
-        }
-    }
-    out.sort();
-    out
-}
-
 /// The kinds that make a bare product name a *workload* reference. `service` is
 /// not in the list on purpose: `service="cogneva"` is the tracing resource
 /// label, not a Service, and a gate that cannot tell them apart reddens on
@@ -273,7 +242,7 @@ fn only_the_declaration_names_an_object() {
         .filter(|name| *name != main)
         .collect();
     let mut offenders: Vec<(String, String)> = Vec::new();
-    for path in rust_sources() {
+    for path in production_sources(&repo_root()) {
         let rel = path
             .strip_prefix(repo_root())
             .unwrap_or(&path)

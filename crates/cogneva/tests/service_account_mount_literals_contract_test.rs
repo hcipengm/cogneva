@@ -20,44 +20,13 @@ use std::path::PathBuf;
 
 mod common;
 
-use common::rust_production::production_lines;
+use common::rust_production::{production_lines, production_sources};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 /// Every `*.rs` file under `crates/*/src`, relative to the repo root.
-fn rust_sources() -> Vec<PathBuf> {
-    fn walk(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(repo_root().join("crates"))
-        .expect("crates/ 不在仓库里")
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
-    crates.sort();
-    let mut out = Vec::new();
-    for krate in crates {
-        let src = krate.join("src");
-        if src.is_dir() {
-            walk(&src, &mut out);
-        }
-    }
-    out.sort();
-    out
-}
-
 /// The one file allowed to spell the mount.
 const DECLARATION: &str = "crates/cog-core/src/topology.rs";
 
@@ -69,7 +38,7 @@ const MOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 #[test]
 fn only_the_declaration_spells_the_service_account_mount() {
     let mut hits = Vec::new();
-    for path in rust_sources() {
+    for path in production_sources(&repo_root()) {
         let rel = path
             .strip_prefix(repo_root())
             .unwrap_or(&path)

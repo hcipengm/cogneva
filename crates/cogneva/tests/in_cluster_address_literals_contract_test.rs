@@ -25,11 +25,13 @@
 //! not a fact the process runs on.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod common;
 
-use common::rust_production::{brace_delta, opens_test_module, production_lines};
+use common::rust_production::{
+    brace_delta, opens_test_module, production_lines, production_sources,
+};
 
 /// The register this census is read against.
 const REGISTER: &str = "crates/cogneva/tests/data/in-cluster-address-literals.tsv";
@@ -63,38 +65,6 @@ fn read(rel: &str) -> String {
 }
 
 /// Every `*.rs` file under `crates/*/src`, relative to the repo root.
-fn rust_sources() -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    let root = repo_root().join("crates");
-    let mut crates: Vec<PathBuf> = std::fs::read_dir(&root)
-        .unwrap_or_else(|e| panic!("{}: {e}", root.display()))
-        .flatten()
-        .map(|entry| entry.path())
-        .collect();
-    crates.sort();
-    let mut out = Vec::new();
-    for krate in crates {
-        let src = krate.join("src");
-        if src.is_dir() {
-            walk(&src, &mut out);
-        }
-    }
-    out.sort();
-    out
-}
-
 /// The cluster-DNS addresses written on one line.
 fn addresses_on(line: &str) -> Vec<String> {
     let chars: Vec<char> = line.chars().collect();
@@ -140,7 +110,7 @@ fn addresses_on(line: &str) -> Vec<String> {
 /// Every hit of one predicate in the production half of the tree.
 fn census_with(scan: fn(&str) -> Vec<String>) -> BTreeSet<Found> {
     let mut out = BTreeSet::new();
-    for path in rust_sources() {
+    for path in production_sources(&repo_root()) {
         let rel = path
             .strip_prefix(repo_root())
             .unwrap_or(&path)

@@ -35,10 +35,11 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use common::routes::{repo_root, walk};
+use common::routes::repo_root;
 use common::rust_production::production_text;
+use common::rust_production::{production_sources, relative_name};
 
 /// 唯一的那一处实现。
 const IMPLEMENTATION: &str = "cog-core/src/atomic_write.rs";
@@ -191,30 +192,12 @@ fn creation_before(window: &str, name: &str) -> bool {
 }
 
 /// 每个 crate 的源码里所有 rename 调用点。
-fn all_sites(crates_dir: &Path) -> Vec<Site> {
-    let Ok(entries) = std::fs::read_dir(crates_dir) else {
-        return Vec::new();
-    };
+fn all_sites(root: &Path) -> Vec<Site> {
     let mut out = Vec::new();
-    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    dirs.sort();
-    for dir in dirs {
-        let src = dir.join("src");
-        if !src.is_dir() {
-            continue;
-        }
-        let mut files = Vec::new();
-        walk(&src, &["rs"], &mut files);
-        files.sort();
-        for path in files {
-            let rel = path
-                .strip_prefix(crates_dir)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let production = production_text(&common::routes::read(&path));
-            out.extend(sites_in(&rel, &production));
-        }
+    for path in production_sources(root) {
+        let rel = relative_name(root, &path).replace("crates/", "");
+        let production = production_text(&common::routes::read(&path));
+        out.extend(sites_in(&rel, &production));
     }
     out
 }
@@ -228,7 +211,7 @@ fn registered(file: &str, source: &str) -> bool {
 #[test]
 fn a_file_is_replaced_atomically_in_one_place() {
     let root = repo_root();
-    let sites = all_sites(&root.join("crates"));
+    let sites = all_sites(&root);
     assert!(
         sites.len() >= MIN_SITES,
         "只读到 {} 处 rename 调用点（下限 {MIN_SITES}）：读得太少，「一处都没有手写」就是个空承诺",
@@ -260,7 +243,7 @@ fn a_file_is_replaced_atomically_in_one_place() {
 #[test]
 fn a_registration_that_no_longer_matches_a_site_is_stale() {
     let root = repo_root();
-    let sites = all_sites(&root.join("crates"));
+    let sites = all_sites(&root);
     let stale: Vec<&str> = REGISTERED
         .iter()
         .filter(|(file, source, _)| {
