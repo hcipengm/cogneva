@@ -164,6 +164,18 @@ jobs:
         run: cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # A schema statement's wait for its locks is a fact about the server's
+      # lock queue across two sessions, so nothing that runs without a server
+      # can see any of it: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes
+      # ACCESS EXCLUSIVE before it checks whether the column is already there,
+      # and once it is waiting, every later read of that table queues behind
+      # it. That is the shape a rolling restart walks into -- the incoming
+      # replica's schema sweep freezing the outgoing replica that is still
+      # serving -- and it is only visible as one session blocking another.
+      - name: Live-DB schema lock bounds
+        run: cargo test -p cog-storage --test schema_ddl_lock -- --ignored --test-threads=1
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The decision counters are a sum the database keeps, and the one read a
       # DB-free test cannot take is two writers counting into the same cell at
       # once: a store that reads, adds and writes back loses an increment, while

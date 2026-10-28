@@ -81,11 +81,12 @@ impl PostgresEntryStore {
 
     /// Apply the table + index DDL idempotently.
     pub async fn init_table(&self) -> SFResult<()> {
-        sqlx::raw_sql(SUMMARY_ENTRIES_DDL)
-            .execute(&self.pool)
+        // Shared runner for the same reason as the schema table: an ALTER
+        // takes its lock before it checks whether it has anything to do, and
+        // an unbounded wait queues the outgoing replica's readers behind it.
+        cog_storage::schema_ddl::apply(&self.pool, SUMMARY_ENTRIES_DDL)
             .await
-            .map_err(|e| SFError::Agent(format!("PostgresEntryStore init_table failed: {}", e)))?;
-        Ok(())
+            .map_err(|e| SFError::Agent(format!("PostgresEntryStore init_table failed: {}", e)))
     }
 
     fn row_to_entry(row: &PgRow) -> SFResult<SummaryEntry> {

@@ -150,13 +150,14 @@ impl PostgresSchemaBackend {
     /// Apply the table + index DDL.  Safe to call repeatedly (uses
     /// `CREATE ... IF NOT EXISTS`).
     pub async fn init_table(&self) -> SFResult<()> {
-        sqlx::raw_sql(SCHEMA_ENTRIES_DDL)
-            .execute(&self.pool)
+        // Through the shared runner, not `raw_sql` directly: this list holds
+        // ALTERs, and an ALTER takes its lock before it checks whether it has
+        // anything to do, so on a restart it queues behind the replica that is
+        // still reading `schema_entries`. The runner bounds that wait instead
+        // of letting the newcomer freeze the replica it replaces.
+        cog_storage::schema_ddl::apply(&self.pool, SCHEMA_ENTRIES_DDL)
             .await
-            .map_err(|e| {
-                SFError::Agent(format!("PostgresSchemaBackend init_table failed: {}", e))
-            })?;
-        Ok(())
+            .map_err(|e| SFError::Agent(format!("PostgresSchemaBackend init_table failed: {}", e)))
     }
 
     fn row_to_entry(row: &PgRow) -> SFResult<SchemaEntry> {
