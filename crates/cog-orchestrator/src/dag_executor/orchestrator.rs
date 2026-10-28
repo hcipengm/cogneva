@@ -1090,12 +1090,17 @@ impl DagExecutor {
         // Phase 1: collect new tasks and their dependencies, skipping duplicates
         let mut validated: Vec<(String, HashSet<String>, Task)> = Vec::new();
         let mut reused: Vec<String> = Vec::new();
+        let mut promotions: Vec<Task> = Vec::new();
         let plan_shaped = tasks.iter().any(|t| !t.blocked_by.is_empty());
         for task in tasks {
             let task_id = task.id.clone();
             if let Some(held) = inner.tasks.get(&task_id) {
                 if plan_shaped && !may_be_skipped(held, &task) {
                     reused.push(reused_id_note(held, &task));
+                    continue;
+                }
+                if !missing_enrichment(held, &task).is_empty() {
+                    promotions.push(task);
                 }
                 continue; // Idempotent skip of a redelivery
             }
@@ -1104,6 +1109,11 @@ impl DagExecutor {
         }
         if !reused.is_empty() {
             return Err(reused_ids_refusal(&reused));
+        }
+        for incoming in promotions {
+            if let Some(held) = inner.tasks.get_mut(&incoming.id) {
+                carry_enrichment(held, &incoming);
+            }
         }
 
         // Insert dependency edges into the combined graph (existing + new)
@@ -1364,11 +1374,16 @@ impl DagExecutor {
 
         let mut validated = Vec::new();
         let mut reused: Vec<String> = Vec::new();
+        let mut promotions: Vec<Task> = Vec::new();
         let plan_shaped = tasks.iter().any(|t| !t.blocked_by.is_empty());
         for task in tasks {
             if let Some(held) = held_by_id.get(task.id.as_str()) {
                 if plan_shaped && !may_be_skipped(held, &task) {
                     reused.push(reused_id_note(held, &task));
+                    continue;
+                }
+                if !missing_enrichment(held, &task).is_empty() {
+                    promotions.push(task);
                 }
                 continue; // 幂等跳过：同一份工作的重投
             }
@@ -1377,6 +1392,12 @@ impl DagExecutor {
         }
         if !reused.is_empty() {
             return Err(reused_ids_refusal(&reused));
+        }
+        for incoming in promotions {
+            if let Some(mut held) = existing.iter().find(|t| t.id == incoming.id).cloned() {
+                carry_enrichment(&mut held, &incoming);
+                be.dag_set_task(&self.workspace_id, &held.id, &held).await?;
+            }
         }
         if let Some(cycle) = detect_cycle_graph(&graph) {
             return Err(cog_core::SFError::Validation(format!(
@@ -3641,6 +3662,97 @@ fn may_be_skipped(held: &Task, incoming: &Task) -> bool {
     held.task_type == incoming.task_type && held.input == incoming.input
 }
 
+/// What the held row is missing that this submission carries.
+///
+/// A batch is idempotent by id: an id the graph already holds is dropped rather
+/// than written. That is right for a redelivery of the same work and wrong for a
+/// row that was persisted first and promoted second -- a caller that wanted a
+/// row to read back before submitting it, and then submits a row carrying the
+/// goal, the parent, the answer's carrier and the planner's verdict. The row's
+/// existence is exactly the reason the promotion does not run, so the second
+/// phase silently does nothing and the row stays half-written: it answers
+/// `tasks/get`, it just never says which goal it serves or where its answer
+/// lands. Nothing downstream can tell that apart from a submission whose
+/// promotion is still in flight.
+///
+/// Only the fields a caller can fill *after* the row exists are listed, and only
+/// to fill an absence: a held row that already carries a value keeps it, so a
+/// re-drive of a decomposition cannot overwrite where the last one put the
+/// answer. Writing over an existing value is a different decision -- who owns
+/// this row -- and it is not made here.
+fn missing_enrichment(held: &Task, incoming: &Task) -> Vec<&'static str> {
+    let mut missing = Vec::new();
+    if held.goal_id.is_none() && incoming.goal_id.is_some() {
+        missing.push("goal_id");
+    }
+    if held.parent_task_id.is_none() && incoming.parent_task_id.is_some() {
+        missing.push("parent_task_id");
+    }
+    if held.sink_task_id.is_none() && incoming.sink_task_id.is_some() {
+        missing.push("sink_task_id");
+    }
+    if held.action_planner_meta.is_none() && incoming.action_planner_meta.is_some() {
+        missing.push("action_planner_meta");
+    }
+    if held.face_id.is_none() && incoming.face_id.is_some() {
+        missing.push("face_id");
+    }
+    if held.owner_unit.is_none() && incoming.owner_unit.is_some() {
+        missing.push("owner_unit");
+    }
+    if held.bound_by_handover_id.is_none() && incoming.bound_by_handover_id.is_some() {
+        missing.push("bound_by_handover_id");
+    }
+    if held.acceptance.is_empty() && !incoming.acceptance.is_empty() {
+        missing.push("acceptance");
+    }
+    // One direction only. A promotion may turn a row into a placeholder -- it
+    // is the row the goal hangs under, and the row `sink_task_id` names answers
+    // for it -- but never the other way round: making a placeholder executable
+    // would put a row whose `input` is the goal text, not an instruction, in
+    // front of an executor.
+    if held.is_executable && !incoming.is_executable {
+        missing.push("is_executable");
+    }
+    missing
+}
+
+/// Fill what the held row lacks from the submission that carried it. Absences
+/// only -- see [`missing_enrichment`] for why this never overwrites.
+fn carry_enrichment(held: &mut Task, incoming: &Task) {
+    if held.goal_id.is_none() {
+        held.goal_id = incoming.goal_id.clone();
+    }
+    if held.parent_task_id.is_none() {
+        held.parent_task_id = incoming.parent_task_id.clone();
+    }
+    if held.sink_task_id.is_none() {
+        held.sink_task_id = incoming.sink_task_id.clone();
+    }
+    if held.action_planner_meta.is_none() {
+        held.action_planner_meta = incoming.action_planner_meta.clone();
+    }
+    if held.face_id.is_none() {
+        held.face_id = incoming.face_id.clone();
+    }
+    if held.owner_unit.is_none() {
+        held.owner_unit = incoming.owner_unit.clone();
+    }
+    if held.bound_by_handover_id.is_none() {
+        held.bound_by_handover_id = incoming.bound_by_handover_id.clone();
+    }
+    if held.acceptance.is_empty() {
+        held.acceptance = incoming.acceptance.clone();
+    }
+    if !incoming.is_executable {
+        held.is_executable = false;
+    }
+    // The row did change, so its timestamp has to move with it: a reader that
+    // sorts by `updated_at` would otherwise show a promoted row as untouched
+    // since the day it was persisted.
+    held.updated_at = chrono::Utc::now();
+}
+
 /// One line per reused id: whose row holds it and what state that row is in.
 /// The first question a reader has is which plan this submission would have
 /// started depending on.
@@ -4277,6 +4389,124 @@ mod tests {
         verdict.status = TaskStatus::Failed;
         let queued = dag.add_tasks_batch(vec![verdict]).await.unwrap();
         assert!(queued.is_empty(), "the verdict is held: {queued:?}");
+    }
+
+    /// A row persisted before it is promoted: the second submission carries the
+    /// goal, the parent and the row that answers for it, and the id is already
+    /// in the graph. Skipping it because "the row is already there" leaves the
+    /// row exactly as empty as the pre-placed one — it answers `tasks/get` and
+    /// never says which goal it serves or where its answer lands, which reads
+    /// downstream as work still in flight.
+    ///
+    /// principle: feedback_an_idempotent_batch_skips_the_row_that_was_supposed_to_carry_the_new_fields
+    #[tokio::test]
+    async fn a_row_persisted_before_its_promotion_is_promoted_rather_than_skipped() {
+        let dag = DagExecutor::new("ws-promote".into());
+        let pre_placed = Task::new(
+            "goal-1",
+            TaskType::Generator,
+            serde_json::json!({"goal": "pay the invoices"}),
+        );
+        dag.add_tasks_batch(vec![pre_placed]).await.unwrap();
+
+        let mut promoted = Task::new(
+            "goal-1",
+            TaskType::Generator,
+            serde_json::json!({"goal": "pay the invoices"}),
+        );
+        promoted.goal_id = Some("g-1".into());
+        promoted.sink_task_id = Some("sink-1".into());
+        promoted.is_executable = false;
+        let queued = dag.add_tasks_batch(vec![promoted]).await.unwrap();
+        assert!(queued.is_empty(), "nothing new is queued: {queued:?}");
+
+        let held = dag
+            .get_task("goal-1")
+            .await
+            .expect("the row is still there");
+        assert_eq!(
+            held.goal_id.as_deref(),
+            Some("g-1"),
+            "the promotion's goal has to reach the row it was written for"
+        );
+        assert_eq!(
+            held.sink_task_id.as_deref(),
+            Some("sink-1"),
+            "without the carrier declaration the row never publishes an answer"
+        );
+        assert!(
+            !held.is_executable,
+            "the promotion also says this row is a placeholder, not work"
+        );
+        assert_eq!(
+            dag.get_all_tasks().await.len(),
+            1,
+            "the promotion writes the held row instead of adding a second one"
+        );
+    }
+
+    /// The same on the store path, where "the row is already there" is a read of
+    /// the backend rather than of memory — the path every pod actually takes.
+    #[tokio::test]
+    async fn the_store_path_promotes_a_pre_placed_row_too() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-promote-fg".into()).with_state_backend(backend);
+        dag.add_tasks_batch(vec![Task::new(
+            "goal-2",
+            TaskType::Generator,
+            serde_json::json!({"goal": "close the books"}),
+        )])
+        .await
+        .unwrap();
+
+        let mut promoted = Task::new(
+            "goal-2",
+            TaskType::Generator,
+            serde_json::json!({"goal": "close the books"}),
+        );
+        promoted.goal_id = Some("g-2".into());
+        promoted.sink_task_id = Some("sink-2".into());
+        dag.add_tasks_batch(vec![promoted]).await.unwrap();
+
+        let held = dag
+            .get_task("goal-2")
+            .await
+            .expect("the row is still there");
+        assert_eq!(held.goal_id.as_deref(), Some("g-2"));
+        assert_eq!(held.sink_task_id.as_deref(), Some("sink-2"));
+        assert_eq!(dag.get_all_tasks().await.len(), 1, "no second row appears");
+    }
+
+    /// The other half, so the fix cannot be "always overwrite": a re-drive that
+    /// names a different carrier must not move where the first answer went.
+    #[tokio::test]
+    async fn a_promotion_never_moves_a_value_the_row_already_carries() {
+        let dag = DagExecutor::new("ws-promote-keep".into());
+        let mut first = Task::new(
+            "goal-3",
+            TaskType::Generator,
+            serde_json::json!({"goal": "ship it"}),
+        );
+        first.goal_id = Some("g-3".into());
+        first.sink_task_id = Some("sink-first".into());
+        dag.add_tasks_batch(vec![first]).await.unwrap();
+
+        let mut again = Task::new(
+            "goal-3",
+            TaskType::Generator,
+            serde_json::json!({"goal": "ship it"}),
+        );
+        again.goal_id = Some("g-3".into());
+        again.sink_task_id = Some("sink-second".into());
+        dag.add_tasks_batch(vec![again]).await.unwrap();
+
+        let held = dag.get_task("goal-3").await.unwrap();
+        assert_eq!(
+            held.sink_task_id.as_deref(),
+            Some("sink-first"),
+            "which row carries the answer is decided once; a re-drive that \
+             quietly repointed it would leave the first answer nowhere"
+        );
     }
 
     #[tokio::test]
