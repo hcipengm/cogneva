@@ -47,7 +47,7 @@ use std::path::Path;
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use common::rust_production::{production_sources, production_text, relative_name};
 
@@ -100,11 +100,6 @@ const OTHER_PRINCIPALS: &[(&str, &str)] = &[
     ),
 ];
 
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
-
 /// One file the `SCANNED` list names, read by path.
 ///
 /// Not by position: the list is the set of sources that speak under this
@@ -117,7 +112,7 @@ fn scanned(relative: &str) -> String {
         SCANNED.contains(&relative),
         "{relative} is not in SCANNED, so nothing here judges it"
     );
-    read(relative)
+    read_repo(relative)
 }
 
 /// The shipped half of a file: a fixture that writes an argv is not a command,
@@ -215,7 +210,7 @@ impl RoleFile {
 }
 
 fn roles_in(relative: &str) -> RoleFile {
-    let text = read(relative);
+    let text = read_repo(relative);
     let mut roles: Vec<Role> = Vec::new();
     let mut bindings: Vec<Binding> = Vec::new();
 
@@ -849,7 +844,7 @@ fn obligations(
 }
 
 fn needed_for(file: &'static str, used: &mut BTreeSet<&'static str>) -> Vec<Obligation> {
-    let src = read(file);
+    let src = read_repo(file);
     let body = production_source(&src);
     let mut needed = Vec::new();
     for cmd in commands_in(file, &body) {
@@ -947,7 +942,7 @@ fn the_scan_sees_the_commands_it_is_supposed_to() {
     let mut resolved: BTreeSet<(&'static str, &'static str)> = BTreeSet::new();
     let mut used = BTreeSet::new();
     for file in SCANNED {
-        let src = read(file);
+        let src = read_repo(file);
         let body = production_source(&src);
         for cmd in commands_in(file, &body) {
             *seen.entry(cmd.verb.clone()).or_default() += 1;
@@ -1056,7 +1051,7 @@ fn the_job_specs_and_the_role_name_the_same_principal() {
 /// Keeps the walk honest about what it read, not about where files happen to be.
 #[test]
 fn the_role_file_is_the_one_the_parity_gate_holds() {
-    let guards = read("deploy/scripts/check-deploy-parity.sh");
+    let guards = read_repo("deploy/scripts/check-deploy-parity.sh");
     assert!(
         guards.contains("RoleBinding") && guards.contains("role_rules"),
         "跨载体 parity 不再比权限面：这条判据读的是 deploy/k3s 这一个载体"
@@ -1078,7 +1073,7 @@ fn the_role_file_is_the_one_the_parity_gate_holds() {
 /// 判据就会因为读不到字面量而静默变成空读数。
 fn declared_name(reference: &str) -> Option<String> {
     let name = reference.trim().strip_prefix("cog_core::topology::")?;
-    let topology = read("crates/cog-core/src/topology.rs");
+    let topology = read_repo("crates/cog-core/src/topology.rs");
     let needle = format!("pub const {name}: &str = \"");
     let start = topology.find(&needle)? + needle.len();
     let end = topology[start..].find('"')? + start;
@@ -1147,7 +1142,7 @@ fn quoted(src: &str, needle: &str) -> Option<String> {
 /// ——「拿不到授权」与「集群里确实还是浮动 tag」在判决里同形。
 #[test]
 fn every_identity_that_can_publish_can_read_the_canary_base_names() {
-    let revision = read("crates/cog-reflection/src/live_revision.rs");
+    let revision = read_repo("crates/cog-reflection/src/live_revision.rs");
     let names = const_string_list(&revision, "BASE_DEPLOYMENTS");
     assert_eq!(
         names.len(),
@@ -1161,7 +1156,7 @@ fn every_identity_that_can_publish_can_read_the_canary_base_names() {
 
     // 名单只此一份：推送端引用它，自己不再留一份。两份会各自漂，而漂掉的那份不报错，
     // 它只会让某个读者少认一个名字——那时这条判据读的还是那份没人用的。
-    let publisher = read("crates/cog-reflection/src/gitops_publisher.rs");
+    let publisher = read_repo("crates/cog-reflection/src/gitops_publisher.rs");
     assert!(
         publisher.contains("live_revision::read_base_deployments"),
         "推送端不再引用现役 rev 那一份读法：两份名单意味着有一个读者会少认一个名字"
@@ -1172,7 +1167,7 @@ fn every_identity_that_can_publish_can_read_the_canary_base_names() {
     );
 
     let app = env_value(
-        &read("deploy/k3s/deployment.yaml"),
+        &read_repo("deploy/k3s/deployment.yaml"),
         "COGNEVA_GITOPS_ENABLED",
     );
     assert_eq!(
@@ -1182,7 +1177,7 @@ fn every_identity_that_can_publish_can_read_the_canary_base_names() {
          若它是有意关掉的，把这个身份从这里去掉，别让它继续假装被覆盖"
     );
     let evolution = configmap_value(
-        &read("deploy/k3s/evolution-configmap.yaml"),
+        &read_repo("deploy/k3s/evolution-configmap.yaml"),
         "COGNEVA_GITOPS_ENABLED",
     );
     assert_eq!(

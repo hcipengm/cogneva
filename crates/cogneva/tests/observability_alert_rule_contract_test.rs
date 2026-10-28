@@ -32,7 +32,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -1786,16 +1786,11 @@ fn pending_complaints(
     out
 }
 
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
-
 /// The deploy config the rules live in, parsed. Read through one function so a
 /// gate that needs a value other than the rules reads the same document the
 /// rules came from.
 fn chart_json() -> serde_json::Value {
-    serde_json::from_str(&read(CHART_CONFIG)).expect("chart config is not valid JSON")
+    serde_json::from_str(&read_repo(CHART_CONFIG)).expect("chart config is not valid JSON")
 }
 
 /// Every rule in the chart, name to promql, in file order.
@@ -2168,11 +2163,11 @@ fn the_pod_label_an_alert_rule_reads_through_is_allowlisted_in_every_profile() {
     for (profile, values) in [
         (
             "default",
-            read("deploy/k3s/observability/helm/kube-prometheus-stack-values.yaml"),
+            read_repo("deploy/k3s/observability/helm/kube-prometheus-stack-values.yaml"),
         ),
         (
             "small",
-            read("deploy/k3s/observability/helm/kube-prometheus-stack-values-small.yaml"),
+            read_repo("deploy/k3s/observability/helm/kube-prometheus-stack-values-small.yaml"),
         ),
     ] {
         let allowed = values
@@ -4974,7 +4969,7 @@ fn an_elsewhere_entry_that_names_a_reader_no_rule_has_is_reported() {
 /// is empty while the code around it looks complete.
 #[test]
 fn the_puller_is_handed_the_persistent_alert_sink() {
-    let plugin = read("crates/cog-reflection/src/plugin.rs");
+    let plugin = read_repo("crates/cog-reflection/src/plugin.rs");
     let construct = plugin
         .find("GitOpsPuller::new(")
         .expect("plugin.rs no longer constructs the GitOps puller here");
@@ -5018,7 +5013,7 @@ fn the_puller_is_handed_the_persistent_alert_sink() {
 /// paths and a write behind those returns would be gated exactly when it matters.
 #[test]
 fn the_gitops_puller_publishes_each_polls_outcome() {
-    let plugin = read("crates/cog-reflection/src/plugin.rs");
+    let plugin = read_repo("crates/cog-reflection/src/plugin.rs");
     let construct = plugin
         .find("GitOpsPuller::new(")
         .expect("plugin.rs no longer constructs the GitOps puller here");
@@ -5039,7 +5034,7 @@ fn the_gitops_puller_publishes_each_polls_outcome() {
         "拉取端拿到了 store 但没有交给自己（构造完之后必须 with_metrics）"
     );
 
-    let puller = read("crates/cog-reflection/src/gitops_puller.rs");
+    let puller = read_repo("crates/cog-reflection/src/gitops_puller.rs");
     let shell = puller
         .find("pub async fn poll_once(")
         .expect("GitOpsPuller::poll_once 没了");

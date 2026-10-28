@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::read_repo;
 
 use std::collections::BTreeSet;
 
@@ -33,11 +33,6 @@ const TEMPLATE: &str = "deploy/helm/cogneva/templates/app-config.yaml";
 /// The line that opens the table, and the line that closes it.
 const TABLE_OPEN: &str = "$portage := dict";
 const TABLE_CLOSE: &str = "-}}";
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// One piece of a substitution pattern: a literal, or a hole a deployment fills.
 #[derive(Debug, PartialEq, Eq)]
@@ -231,9 +226,9 @@ fn addresses(text: &str) -> BTreeSet<String> {
 
 #[test]
 fn every_address_in_the_app_config_is_rewritten_by_the_chart() {
-    let template = read(TEMPLATE);
+    let template = read_repo(TEMPLATE);
     let patterns = table_literals(&template);
-    let found = addresses(&read(JSON));
+    let found = addresses(&read_repo(JSON));
 
     assert!(
         !found.is_empty(),

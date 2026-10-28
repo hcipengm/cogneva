@@ -46,7 +46,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -61,15 +61,10 @@ use promql::unguarded_store_reading_complaints;
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 const RULE_MANIFESTS_DIR: &str = "deploy/k3s/observability/manifests";
 
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
-
 /// Every rule the chart renders, name to expression, in file order.
 fn chart_rules() -> Vec<(String, String)> {
     let value: serde_json::Value =
-        serde_json::from_str(&read(CHART_CONFIG)).expect("chart config is not valid JSON");
+        serde_json::from_str(&read_repo(CHART_CONFIG)).expect("chart config is not valid JSON");
     value["observability"]["infra_watch"]["rules"]
         .as_array()
         .expect("observability.infra_watch.rules is not an array")

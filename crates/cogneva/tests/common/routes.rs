@@ -33,6 +33,13 @@ pub use super::root::repo_root;
 #[allow(unused_imports)]
 pub use super::fsio::{read, walk, walk_all, walk_files};
 
+/// 仓库相对名的一条读取：`read` 收的是 `&Path`，而夹具手里大多只有一个表里写着
+/// 相对名的字符串，于是十来份夹具各自写了一遍 `repo_root().join(rel)` 加同一条
+/// panic——那正是「怎么读一个文件」这条规则的第二份，只是参数类型不同。
+pub fn read_repo(rel: &str) -> String {
+    read(&repo_root().join(rel))
+}
+
 /// One path reduced to the shape both sides can be compared by.
 ///
 /// `$` and `{}` are handled in one pass because a `${...}` may carry a nested

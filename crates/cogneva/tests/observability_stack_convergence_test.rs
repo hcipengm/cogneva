@@ -21,7 +21,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -38,11 +38,6 @@ const RBAC_FILE: &str = "12-stack-convergence-rbac.yaml";
 const K3S_CONFIGMAP: &str = "deploy/k3s/evolution-configmap.yaml";
 const VALUES_YAML: &str = "deploy/helm/cogneva/values.yaml";
 const PLUGIN_RS: &str = "crates/cog-reflection/src/plugin.rs";
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
 
 fn manifest_dir() -> PathBuf {
     repo_root().join(MANIFEST_DIR)
@@ -170,7 +165,7 @@ fn the_disposition_table_is_the_manifest_directory_inventory() {
 /// ClickHouse 凭证要先于它的清单。名字出现在这里是为了排序，不是为了决定交付。
 #[test]
 fn the_install_script_consults_the_table_instead_of_carrying_its_own_list() {
-    let script = read(INSTALL_SH);
+    let script = read_repo(INSTALL_SH);
     assert!(
         script.contains(DISPOSITIONS_FILE),
         "{INSTALL_SH} 没有读 {DISPOSITIONS_FILE}"
@@ -206,7 +201,7 @@ fn the_install_script_consults_the_table_instead_of_carrying_its_own_list() {
 /// 请求」逐字同形。这一格钉住形状：名字还是那个名字，kind 必须按 Pod 抓。
 #[test]
 fn the_traefik_scrape_target_follows_the_pod_port_because_the_service_has_none() {
-    let text = read(&format!("{MANIFEST_DIR}/18-servicemonitor-ingress.yaml"));
+    let text = read_repo(&format!("{MANIFEST_DIR}/18-servicemonitor-ingress.yaml"));
     let traefik = text
         .split("---\n")
         .find(|doc| doc.contains("name: cogneva-ingress-traefik"))
@@ -229,13 +224,13 @@ fn the_traefik_scrape_target_follows_the_pod_port_because_the_service_has_none()
 /// 循环得真被挂上，结论得进持久化告警面。
 #[test]
 fn the_convergence_loop_is_wired_and_persists_its_verdict() {
-    let lib = read("crates/cog-reflection/src/lib.rs");
+    let lib = read_repo("crates/cog-reflection/src/lib.rs");
     assert!(
         lib.contains("pub mod observability_stack;"),
         "收敛模块没有在 lib.rs 里挂出来"
     );
 
-    let plugin = read(PLUGIN_RS);
+    let plugin = read_repo(PLUGIN_RS);
     let start = plugin
         .find("observability_stack.enabled")
         .expect("plugin.rs 里没有按配置开关起收敛循环");
@@ -269,7 +264,7 @@ fn the_convergence_loop_is_wired_and_persists_its_verdict() {
 /// 里分得开。
 #[test]
 fn the_short_circuit_names_the_convergence_it_also_skips() {
-    let plugin = read(PLUGIN_RS);
+    let plugin = read_repo(PLUGIN_RS);
     let start = plugin
         .find("if !self.porter_armed")
         .expect("plugin.rs 里没有 porter_armed 那道短路门");
@@ -303,7 +298,7 @@ fn the_grant_covers_exactly_the_documents_the_loop_will_apply() {
     // 交付面：交付文件里所有会被 apply 的文档。
     let mut needed: BTreeMap<(&str, &str), BTreeSet<String>> = BTreeMap::new();
     for file in &plan.deliver {
-        let text = read(&format!("{MANIFEST_DIR}/{file}"));
+        let text = read_repo(&format!("{MANIFEST_DIR}/{file}"));
         for kind in declared_kinds(&text) {
             if classify_doc(&kind) != DocFate::Deliver {
                 continue;
@@ -321,7 +316,7 @@ fn the_grant_covers_exactly_the_documents_the_loop_will_apply() {
         "交付面里没有一个需要授权的对象，这个门禁是空的"
     );
 
-    let rbac_text = read(&format!("{MANIFEST_DIR}/{RBAC_FILE}"));
+    let rbac_text = read_repo(&format!("{MANIFEST_DIR}/{RBAC_FILE}"));
     let grants = role_grants(&rbac_text);
     let api_group_lines = rbac_text
         .lines()
@@ -381,7 +376,7 @@ fn the_loop_never_delivers_the_authority_or_secret_surface() {
     assert_eq!(classify_doc("ServiceMonitor"), DocFate::Deliver);
 
     // 授权面文件自己就得落在这个被挡住的面上（它只由安装期交付）。
-    let rbac_text = read(&format!("{MANIFEST_DIR}/{RBAC_FILE}"));
+    let rbac_text = read_repo(&format!("{MANIFEST_DIR}/{RBAC_FILE}"));
     for kind in declared_kinds(&rbac_text) {
         assert_ne!(
             classify_doc(&kind),
@@ -416,7 +411,7 @@ fn the_deploy_surfaces_and_the_code_default_agree_on_where_the_stack_lives() {
     assert_eq!(install_dir, code_dir);
 
     // 命名空间：清单自己声明的那个（01-namespace.yaml），不是另写一份。
-    let ns = read(&format!("{MANIFEST_DIR}/01-namespace.yaml"));
+    let ns = read_repo(&format!("{MANIFEST_DIR}/01-namespace.yaml"));
     let declared = ns
         .lines()
         .skip_while(|l| !l.starts_with("kind: Namespace"))
@@ -429,7 +424,7 @@ fn the_deploy_surfaces_and_the_code_default_agree_on_where_the_stack_lives() {
     );
 
     // k3s profile 的部署清单：路径与命名空间都得与代码默认同源。
-    let cm = read(K3S_CONFIGMAP);
+    let cm = read_repo(K3S_CONFIGMAP);
     assert!(
         cm.contains(&format!(
             "COGNEVA_MAINLINE_DEPLOYER_STACK_MANIFEST_DIR: \"{MANIFEST_DIR}\""
@@ -444,7 +439,7 @@ fn the_deploy_surfaces_and_the_code_default_agree_on_where_the_stack_lives() {
     );
 
     // chart 是拓扑的权威源：values.yaml 里也要有这两项，且指向同一处。
-    let values = read(VALUES_YAML);
+    let values = read_repo(VALUES_YAML);
     let block = yaml_block(&values, "  observabilityStack:");
     let expected_dir = format!("\"{MANIFEST_DIR}\"");
     assert_eq!(

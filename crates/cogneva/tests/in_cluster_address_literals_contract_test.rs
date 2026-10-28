@@ -28,7 +28,7 @@ use std::collections::BTreeSet;
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use common::rust_production::{
     brace_delta, opens_test_module, production_lines, production_sources, relative_name,
@@ -54,11 +54,6 @@ const SUFFIX: &str = ".svc.cluster.local";
 struct Found {
     file: String,
     address: String,
-}
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 /// Every `*.rs` file under `crates/*/src`, relative to the repo root.
@@ -130,7 +125,7 @@ fn census() -> BTreeSet<Found> {
 
 /// The register's rows, as `(file, address)`.
 fn register() -> Vec<(String, String)> {
-    read(REGISTER)
+    read_repo(REGISTER)
         .lines()
         .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
         .filter(|line| !line.starts_with("file\t"))
@@ -384,7 +379,7 @@ fn node_port_census() -> BTreeSet<Found> {
 #[test]
 fn every_image_pulled_from_a_node_port_is_a_registered_decision() {
     let found = node_port_census();
-    let rows: Vec<(String, String)> = read(NODE_PORT_REGISTER)
+    let rows: Vec<(String, String)> = read_repo(NODE_PORT_REGISTER)
         .lines()
         .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
         .filter(|line| !line.starts_with("file\t"))

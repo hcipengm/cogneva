@@ -60,7 +60,7 @@ use std::path::PathBuf;
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use common::rust_production::all_crate_files;
 
@@ -304,6 +304,18 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_owner_leases",
         Unread::NotAReading("the Postgres table the owner-lease rows live in, not a series: the same constant is also listed in NOT_A_SERIES so the literal scan does not read it as a producer"),
     ),
+    // Published on 2026-10-28 by the change that started timing each startup
+    // phase instead of only weighing it. Its sibling `cogneva_boot_rss_bytes`
+    // has a face -- the rule that fires when a phase grows past its own 3-day
+    // baseline -- and the elapsed series next to it has none, which is the
+    // shape this table exists to catch: the phase that got slower is the one a
+    // reader wants to see *before* the memory moves, and nothing draws it. A
+    // threshold is derivable here, so the face owed is a rule rather than a
+    // population reader.
+    (
+        "cogneva_boot_phase_elapsed_seconds",
+        Unread::Gap("how long each startup phase took, one series per phase. Its sibling on the same label has a rule (a phase growing past its own baseline), and the elapsed series carries the earlier warning that rule can only give after memory has moved. The face owed is a rule of the same shape on the duration, not a population reader: a single boot answers nothing, two boots apart are what a baseline is made of"),
+    ),
     // Two names that had a `Gap` here until panels were written to carry them,
     // and the reason they came off this table is the reason the debts were real:
     //   `cogneva_volume_capacity_bytes` -- the growth loop's `declared` and
@@ -381,7 +393,14 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// after are what took both entries off this table -- one drawing the growth
 /// loop's `declared` against its `peak` per claim, one drawing the four
 /// dimension ceilings against the ceiling in force.
-const GAPS_AT_SCRAPE_CENSUS: usize = 13;
+///
+/// Fourteen, and the one that took it up is `cogneva_boot_phase_elapsed_seconds`:
+/// timing each startup phase landed the evening this count was last held, the
+/// sibling series on the same label already had a rule, and the new one was
+/// rendered with nothing reading it. It was raised rather than exempted because
+/// the face owed is a rule of the same shape as the sibling's, which is a reader
+/// someone can write -- see the entry for what it says.
+const GAPS_AT_SCRAPE_CENSUS: usize = 14;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
@@ -774,7 +793,7 @@ const RULE_MANIFESTS_DIR: &str = "deploy/k3s/observability/manifests";
 /// skipped -- skipping would drop that document's rules and leave this face
 /// quietly smaller, which reads as coverage.
 fn rule_expressions() -> Vec<String> {
-    let text = read(CHART_CONFIG);
+    let text = read_repo(CHART_CONFIG);
     let value: serde_json::Value =
         serde_json::from_str(&text).expect("chart config is not valid JSON");
     let mut expressions: Vec<String> = value["observability"]["infra_watch"]["rules"]
@@ -851,7 +870,7 @@ fn table_names(rel: &str, opens: &str) -> BTreeSet<String> {
 /// the quoted entries pair up by position; anything else is a shape this
 /// reader does not know how to pair and it panics rather than guessing.
 fn table_entries(rel: &str, opens: &str) -> Vec<(String, String)> {
-    let text = read(rel);
+    let text = read_repo(rel);
     let start = text
         .find(opens)
         .unwrap_or_else(|| panic!("{rel} 里找不到产出表 `{opens}`，这张面读不到了"));
@@ -896,7 +915,7 @@ fn names_produced_outside_crates() -> BTreeSet<String> {
         if source.starts_with("crates/") {
             continue;
         }
-        let text = read(&source);
+        let text = read_repo(&source);
         assert!(
             spells_series(&text, &name),
             "{name} 的产出表写着它由 `{source}` 产出，可那个文件里读不到这条名字——注册还在，产出方却改了名或被删了"
@@ -1026,11 +1045,6 @@ fn series_name_literals(text: &str) -> Vec<String> {
         from = name_end.max(name_start);
     }
     found
-}
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
 }
 
 #[cfg(test)]

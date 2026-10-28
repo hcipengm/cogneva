@@ -19,14 +19,9 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::read_repo;
 
 use std::collections::{BTreeMap, BTreeSet};
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// Where the variants and their fields are written.
 const SERVER: &str = "crates/cog-core/src/types/event.rs";
@@ -164,8 +159,8 @@ fn unknown_fields(shape: &BTreeSet<String>, variant: &Variant) -> Vec<String> {
 
 #[test]
 fn every_field_the_client_reads_is_one_the_server_writes() {
-    let server = server_variants(&read(SERVER));
-    let shapes = client_shapes(&read(CLIENT));
+    let server = server_variants(&read_repo(SERVER));
+    let shapes = client_shapes(&read_repo(CLIENT));
 
     assert!(
         server.len() > 15,

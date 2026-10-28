@@ -39,7 +39,7 @@ use std::path::Path;
 
 mod common;
 
-use common::routes::{repo_root, walk};
+use common::routes::{read_repo, repo_root, walk};
 
 use common::rust_production::{all_crate_files, relative_name};
 
@@ -53,11 +53,6 @@ struct CodeFace {
     line: usize,
     value: String,
     shape: &'static str,
-}
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
 }
 
 fn read_at(path: &Path) -> String {
@@ -75,7 +70,7 @@ const MIN_MANIFESTS: usize = 10;
 fn declared_faces() -> BTreeSet<String> {
     let mut faces = BTreeSet::new();
 
-    let chart = read("deploy/helm/cogneva/files/cogneva.json");
+    let chart = read_repo("deploy/helm/cogneva/files/cogneva.json");
     let cfg: serde_json::Value =
         serde_json::from_str(&chart).expect("chart config is not valid JSON");
     let rules = cfg["observability"]["infra_watch"]["rules"]

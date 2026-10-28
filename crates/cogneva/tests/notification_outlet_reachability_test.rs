@@ -42,7 +42,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::read_repo;
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -67,15 +67,10 @@ const ALERT_POD_TEMPLATES: [&str; 2] = [
     "deploy/helm/cogneva/templates/evolution.yaml",
 ];
 
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
-
 /// 配置文档自己的 `env` 映射：环境变量名 -> 点分路径。
 fn env_map() -> BTreeMap<String, String> {
     let doc: serde_json::Value =
-        serde_json::from_str(&read(CHART_DOC)).expect("chart 的 cogneva.json 不是合法 JSON");
+        serde_json::from_str(&read_repo(CHART_DOC)).expect("chart 的 cogneva.json 不是合法 JSON");
     doc["env"]
         .as_object()
         .expect("配置文档带 env 映射")
@@ -221,8 +216,8 @@ struct AlertWiring {
 /// `COGNEVA_ALERTMANAGER_*`），所以这一条少一跳，形状也少一环：有 ConfigMap 行就
 /// 一路查到 values 键，没有就得是 Pod 上的 Secret 取值——两者都没有，这个键谁都不送。
 fn alert_wiring() -> Vec<AlertWiring> {
-    let template = read(CHART_CONFIGMAP);
-    let values = nested_values(&read(VALUES_YAML), ALERT_VALUES_BLOCK);
+    let template = read_repo(CHART_CONFIGMAP);
+    let values = nested_values(&read_repo(VALUES_YAML), ALERT_VALUES_BLOCK);
 
     ALERT_CHANNEL_CONFIG_PATHS
         .iter()
@@ -268,7 +263,7 @@ fn alert_wiring() -> Vec<AlertWiring> {
                 None => {
                     let keys: Vec<String> = ALERT_POD_TEMPLATES
                         .iter()
-                        .filter_map(|t| secret_key_ref(&read(t), &env_name))
+                        .filter_map(|t| secret_key_ref(&read_repo(t), &env_name))
                         .collect();
                     assert!(
                         !keys.is_empty(),
@@ -305,8 +300,8 @@ struct OutletWiring {
 /// 因为「配得上地址」与「地址被放行」判的是同一件事的两个面，各自抄一遍必然分叉。
 fn outlet_wiring() -> Vec<OutletWiring> {
     let env = env_map();
-    let template = read(CHART_CONFIGMAP);
-    let values = yaml_block(&read(VALUES_YAML), VALUES_BLOCK);
+    let template = read_repo(CHART_CONFIGMAP);
+    let values = yaml_block(&read_repo(VALUES_YAML), VALUES_BLOCK);
 
     OUTLET_ADDRESS_PATHS
         .iter()
@@ -524,14 +519,14 @@ fn the_smtp_credential_arrives_through_a_secret_in_every_pod_that_sends_alerts()
         names.len()
     );
     let env_name = names[0];
-    let template = read(CHART_CONFIGMAP);
+    let template = read_repo(CHART_CONFIGMAP);
     assert!(
         !template.contains(&format!("{env_name}:")),
         "{CHART_CONFIGMAP} 里出现了 {env_name}：ConfigMap 装的是所有人都读得到的值，口令不该在这"
     );
     let keys: Vec<String> = ALERT_POD_TEMPLATES
         .iter()
-        .filter_map(|t| secret_key_ref(&read(t), env_name))
+        .filter_map(|t| secret_key_ref(&read_repo(t), env_name))
         .collect();
     assert!(
         !keys.is_empty(),
@@ -543,7 +538,7 @@ fn the_smtp_credential_arrives_through_a_secret_in_every_pod_that_sends_alerts()
         "两个 Pod 从不同的 Secret 键取同一个口令：{keys:?}"
     );
     assert!(
-        !nested_values(&read(VALUES_YAML), ALERT_VALUES_BLOCK)
+        !nested_values(&read_repo(VALUES_YAML), ALERT_VALUES_BLOCK)
             .iter()
             .any(|(_, v)| v == &secret_key),
         "{VALUES_YAML} 里写着口令（Secret 键名 {secret_key}）：它只能由集群侧写入 Secret"
@@ -551,7 +546,7 @@ fn the_smtp_credential_arrives_through_a_secret_in_every_pod_that_sends_alerts()
 
     for template in ALERT_POD_TEMPLATES {
         assert_eq!(
-            secret_key_ref(&read(template), env_name).as_deref(),
+            secret_key_ref(&read_repo(template), env_name).as_deref(),
             Some(secret_key.as_str()),
             "{template} 没有把 {env_name} 从 Secret 的 {secret_key} 送进 Pod：这个 Pod 上的告警\
              邮件出口发不出去，而它与没有出口长得一样"
@@ -566,8 +561,8 @@ fn the_smtp_credential_arrives_through_a_secret_in_every_pod_that_sends_alerts()
 /// 部署里写的那一行没人认。
 #[test]
 fn every_alertmanager_env_key_reaches_a_deployment() {
-    let template = read(CHART_CONFIGMAP);
-    let values = nested_values(&read(VALUES_YAML), ALERT_VALUES_BLOCK);
+    let template = read_repo(CHART_CONFIGMAP);
+    let values = nested_values(&read_repo(VALUES_YAML), ALERT_VALUES_BLOCK);
     let mut checked = 0;
 
     for (env_name, path) in OBS_ENV {
@@ -595,7 +590,7 @@ fn every_alertmanager_env_key_reaches_a_deployment() {
 
         let delivered = ALERT_POD_TEMPLATES
             .iter()
-            .any(|t| secret_key_ref(&read(t), env_name).is_some());
+            .any(|t| secret_key_ref(&read_repo(t), env_name).is_some());
         assert!(
             delivered,
             "{env_name}（{path}）没有部署面来源：既不在 {CHART_CONFIGMAP} 里，也不在任何 \
@@ -689,7 +684,7 @@ fn every_outlet_the_plugin_can_register_is_reachable_from_the_deploy_surface() {
 /// 一起进来配：拆成两份配对逻辑就会有一份先漂移，而症状只是"某个出口悄悄不通"。
 #[test]
 fn the_egress_allow_list_pairs_one_to_one_with_the_configured_addresses() {
-    let allowed = egress_entries(&read(VALUES_YAML));
+    let allowed = egress_entries(&read_repo(VALUES_YAML));
 
     let mut configured: BTreeMap<String, (&'static str, u16)> = BTreeMap::new();
     for w in outlet_wiring() {
@@ -703,7 +698,7 @@ fn the_egress_allow_list_pairs_one_to_one_with_the_configured_addresses() {
         );
     }
 
-    let alert_values = nested_values(&read(VALUES_YAML), ALERT_VALUES_BLOCK);
+    let alert_values = nested_values(&read_repo(VALUES_YAML), ALERT_VALUES_BLOCK);
     let alert_configured = |key: &str| -> Option<String> {
         alert_values
             .get(key)
@@ -823,7 +818,7 @@ fn a_url_without_a_port_uses_its_scheme_default() {
 /// 白名单，放行落到别的策略上等于没放。
 #[test]
 fn the_egress_entries_reach_the_evolution_egress_policy() {
-    let template = read(CHART_NETPOL);
+    let template = read_repo(CHART_NETPOL);
     let evolution = template
         .split("name: cogneva-evolution-deny-egress")
         .nth(1)

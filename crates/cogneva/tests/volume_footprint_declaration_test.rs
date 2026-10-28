@@ -43,7 +43,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -139,11 +139,6 @@ struct Declaration {
     mounts: Vec<(String, String)>,
     /// Claim named by the claim variable, which names no path of its own.
     claim: Option<String>,
-}
-
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
 }
 
 /// Walk a YAML document for every mapping that is a pod spec.
@@ -362,7 +357,7 @@ fn every_declaring_workload_is_one_a_producer_measures() {
 #[test]
 fn every_producer_row_still_names_a_call_that_builds_the_producer() {
     for (workload, file, marker) in PRODUCERS {
-        let source = read(file);
+        let source = read_repo(file);
         assert!(
             source.contains(marker),
             "{workload}: {file} no longer contains {marker:?}, so the producer this row stands \
@@ -610,7 +605,7 @@ fn every_api_measured_claim_is_a_volume_that_delivery_declares_mounts_and_walks(
 #[test]
 fn every_api_measured_row_still_names_the_call_that_builds_the_producer() {
     for (workload, file, marker) in API_MEASURED {
-        let source = read(file);
+        let source = read_repo(file);
         assert!(
             source.contains(marker),
             "{workload}: {file} no longer contains {marker:?}, so the producer this row stands for \

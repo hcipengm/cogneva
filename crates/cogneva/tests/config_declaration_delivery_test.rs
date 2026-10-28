@@ -13,12 +13,7 @@
 
 mod common;
 
-use common::routes::repo_root;
-
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
+use common::routes::{read_repo, repo_root};
 
 /// The reference side is the document the deployment delivers.
 ///
@@ -27,7 +22,7 @@ fn read(relative: &str) -> String {
 /// would drift, and a drift here reports differences that are not there.
 #[test]
 fn the_reference_document_is_the_one_the_deployment_delivers() {
-    let source = read("crates/cog-observability/src/config.rs");
+    let source = read_repo("crates/cog-observability/src/config.rs");
     let needle = r#"include_str!("../../../deploy/helm/cogneva/files/cogneva.json")"#;
     assert!(
         source.contains(needle),
@@ -49,7 +44,7 @@ fn the_reference_document_is_the_one_the_deployment_delivers() {
 /// document rather than only on fixtures.
 #[test]
 fn the_k3s_carrier_is_the_declared_document() {
-    let carrier = read("deploy/k3s/cogneva-json-configmap.yaml");
+    let carrier = read_repo("deploy/k3s/cogneva-json-configmap.yaml");
     let (_, body) = carrier
         .split_once("cogneva.json: |")
         .expect("k3s 清单里没有 cogneva.json 块标量");
@@ -65,7 +60,7 @@ fn the_k3s_carrier_is_the_declared_document() {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let declared = read("deploy/helm/cogneva/files/cogneva.json");
+    let declared = read_repo("deploy/helm/cogneva/files/cogneva.json");
     assert_eq!(
         cog_core::config_sections::judge_delivery(Some(&document), &declared),
         cog_core::config_sections::DocumentDelivery::Matches,
@@ -80,13 +75,13 @@ fn the_k3s_carrier_is_the_declared_document() {
 /// running configuration is something else entirely.
 #[test]
 fn the_judged_path_is_the_one_the_process_reads() {
-    let source = read("crates/cog-observability/src/config.rs");
+    let source = read_repo("crates/cog-observability/src/config.rs");
     assert!(source.contains("pub fn config_path()"));
     assert!(
         source.contains("Self::load_from(&config_path())"),
         "配置加载不再走与投递判据同一个 path 解析"
     );
-    let delivery = read("crates/cog-observability/src/config_delivery.rs");
+    let delivery = read_repo("crates/cog-observability/src/config_delivery.rs");
     assert!(
         delivery.contains("crate::config::config_path()"),
         "投递判据自己解析路径，而没走加载器用的那一处"
@@ -99,7 +94,7 @@ fn the_judged_path_is_the_one_the_process_reads() {
 /// covered there is whether anything calls it, which is what this link is.
 #[test]
 fn the_plugin_runs_the_check_and_persists_its_verdict() {
-    let plugin = read("crates/cog-observability/src/plugin.rs");
+    let plugin = read_repo("crates/cog-observability/src/plugin.rs");
     assert!(
         plugin.contains("run_config_declaration_check("),
         "插件不再启动投递判据：文档没到这件事重新变得无人观测"
@@ -132,7 +127,7 @@ fn the_plugin_runs_the_check_and_persists_its_verdict() {
 /// 拿得到停机信号（否则它只能等到进程被杀才停）。
 #[test]
 fn a_firing_verdict_keeps_reporting_itself() {
-    let delivery = read("crates/cog-observability/src/config_delivery.rs");
+    let delivery = read_repo("crates/cog-observability/src/config_delivery.rs");
     assert!(
         delivery.contains("keep_the_row_sighted("),
         "判词落成 firing 之后不再复述：这一行会在十五分钟后被读成没有写者维持"
@@ -141,7 +136,7 @@ fn a_firing_verdict_keeps_reporting_itself() {
         delivery.contains("refresh_firing("),
         "复述要推进存活钟，而不是重写判词（重写会把别人关掉的行重新点亮）"
     );
-    let plugin = read("crates/cog-observability/src/plugin.rs");
+    let plugin = read_repo("crates/cog-observability/src/plugin.rs");
     let call = plugin
         .split_once("run_config_declaration_check(")
         .map(|(_, rest)| rest.split_once("));").map(|(args, _)| args).unwrap_or(rest))
@@ -160,7 +155,7 @@ fn a_firing_verdict_keeps_reporting_itself() {
 /// the producer side is wired, not a name list on the consumer side.
 #[test]
 fn the_alert_store_is_published_to_the_surface_that_serves_it() {
-    let plugin = read("crates/cog-observability/src/plugin.rs");
+    let plugin = read_repo("crates/cog-observability/src/plugin.rs");
     assert!(
         plugin.contains("ctx.publish_service(source)") && plugin.contains("ActiveAlertSource"),
         "alert store 不再作为 ActiveAlertSource 发布，持久化的行到不了人看的那一面"

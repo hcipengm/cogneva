@@ -20,7 +20,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::read_repo;
 // 产出面（去掉用例体与 `#[cfg(test)]` 项）只有一处算法，不在这里再写一份：
 // 自己切「第一处 `#[cfg(test)]`」在文件中间有一个 test-only 项时会把后面的产出
 // 整段丢掉，那时读不到与没有问题在判词上是同一句话。
@@ -36,11 +36,6 @@ const PRODUCER_LOOP_FILE: &str = "crates/cog-orchestrator/src/plugin.rs";
 const AGENT_MANAGER: &str = "crates/cog-agent/src/runtime/manager.rs";
 const ID_VOCABULARY: &str = "crates/cog-core/src/types/agent_state.rs";
 
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
-
 /// The calls that build a task's agent. Assembled at compile time so this file
 /// never contains the text it forbids (it scans itself among the rest).
 const CREATES: &str = concat!(".create_", "agent(");
@@ -48,7 +43,7 @@ const RESTORING_CREATES: &str = concat!("create_role_", "agent(");
 
 #[test]
 fn every_agent_a_squad_runs_is_created_through_the_restoring_constructor() {
-    let source = read(SQUAD_EXECUTOR);
+    let source = read_repo(SQUAD_EXECUTOR);
     let production = production_text(&source);
 
     assert!(
@@ -65,7 +60,7 @@ fn every_agent_a_squad_runs_is_created_through_the_restoring_constructor() {
 
 #[test]
 fn the_agent_pool_hands_its_agents_the_checkpoint_store() {
-    let production = production_text(&read(AGENT_MANAGER));
+    let production = production_text(&read_repo(AGENT_MANAGER));
     let attach = concat!("with_checkpoint_", "store(");
     assert!(
         production.contains(attach),
@@ -76,7 +71,7 @@ fn the_agent_pool_hands_its_agents_the_checkpoint_store() {
 
     // The builder has to be reached from the plugin that owns the pool, or the
     // field exists and nothing ever sets it.
-    let plugin = production_text(&read("crates/cog-agent/src/plugin.rs"));
+    let plugin = production_text(&read_repo("crates/cog-agent/src/plugin.rs"));
     assert!(
         plugin.contains(attach),
         "the checkpoint store is not attached to the pool at construction"
@@ -85,7 +80,7 @@ fn the_agent_pool_hands_its_agents_the_checkpoint_store() {
 
 #[test]
 fn neither_end_of_the_chain_spells_the_vocabulary_itself() {
-    let vocabulary = read(ID_VOCABULARY);
+    let vocabulary = read_repo(ID_VOCABULARY);
     for definition in [
         concat!("CHECKPOINT_FIELD_", "PREFIX"),
         concat!("SQUAD_ID_", "PREFIX"),
@@ -98,7 +93,7 @@ fn neither_end_of_the_chain_spells_the_vocabulary_itself() {
     }
 
     for file in [RESUME_CONSUMER, CHECKPOINT_PRODUCER] {
-        let production = production_text(&read(file));
+        let production = production_text(&read_repo(file));
         for literal in [concat!("\"checkpoint", ":"), concat!("\"squad", ":")] {
             assert!(
                 !production.contains(literal),
@@ -144,7 +139,7 @@ fn the_two_ends_agree_on_which_agents_belong_to_a_task() {
 /// behaviour itself would notice.
 #[test]
 fn the_producer_deletes_the_checkpoint_a_new_one_replaces() {
-    let production = production_text(&read(CHECKPOINT_PRODUCER));
+    let production = production_text(&read_repo(CHECKPOINT_PRODUCER));
     let forget = concat!("for", "get(");
     assert!(
         production.contains(forget),
@@ -158,19 +153,19 @@ fn the_producer_deletes_the_checkpoint_a_new_one_replaces() {
 /// by both cannot tell "nothing needed resuming" from "resuming never worked".
 #[test]
 fn the_chain_has_a_reading_on_both_ends() {
-    let producer = production_text(&read(PRODUCER_READING));
+    let producer = production_text(&read_repo(PRODUCER_READING));
     assert!(
         producer.contains(concat!("TASK_", "CHECKPOINT")),
         "the producer records no reading; a chain that silently stops writing looks like one \
          with nothing to write"
     );
-    let consumer = production_text(&read(RESUME_CONSUMER));
+    let consumer = production_text(&read_repo(RESUME_CONSUMER));
     assert!(
         consumer.contains("record_resume"),
         "the dispatcher records no reading; a resume point that could not be restored would \
          only exist as a log line"
     );
-    let observable_source = read("crates/cog-collaboration/src/observable.rs");
+    let observable_source = read_repo("crates/cog-collaboration/src/observable.rs");
     let observable = production_text(&observable_source);
     assert!(
         observable.contains("RESUME_OUTCOMES"),
@@ -189,17 +184,17 @@ fn the_chain_has_a_reading_on_both_ends() {
 /// off by configuration must not leave a series behind reading zero.
 #[test]
 fn the_producer_publishes_its_vocabulary_before_it_has_work() {
-    let producer = production_text(&read(CHECKPOINT_PRODUCER));
+    let producer = production_text(&read_repo(CHECKPOINT_PRODUCER));
     assert!(
         producer.contains("CHECKPOINT_OUTCOMES"),
         "the producer's outcomes are not a closed set, so nothing can publish them at zero"
     );
-    let reading = production_text(&read(PRODUCER_READING));
+    let reading = production_text(&read_repo(PRODUCER_READING));
     assert!(
         reading.contains("CHECKPOINT_OUTCOMES"),
         "the producer's reading side does not publish the outcomes it never observed"
     );
-    let loop_source = read(PRODUCER_LOOP_FILE);
+    let loop_source = read_repo(PRODUCER_LOOP_FILE);
     assert!(
         loop_source.contains("publish_checkpoint_outcomes"),
         "the checkpoint loop never publishes the vocabulary, so an idle deployment shows no \

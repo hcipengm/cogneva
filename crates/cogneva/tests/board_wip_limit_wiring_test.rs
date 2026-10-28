@@ -23,7 +23,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::read_repo;
 
 const CHART_CONFIGMAP: &str = "deploy/helm/cogneva/templates/configmap.yaml";
 const VALUES_YAML: &str = "deploy/helm/cogneva/values.yaml";
@@ -31,14 +31,9 @@ const K3S_CONFIGMAP: &str = "deploy/k3s/configmap.yaml";
 const VALUES_BLOCK: &str = "board:";
 const VALUES_KEY: &str = "wipLimits:";
 
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
-
 /// `values.yaml` 里 `board:` 段的 `wipLimits` 值（去掉引号与行尾注释）。
 fn values_wip_limits() -> Option<String> {
-    let values = read(VALUES_YAML);
+    let values = read_repo(VALUES_YAML);
     let mut inside = false;
     for line in values.lines() {
         if line.starts_with(VALUES_BLOCK) {
@@ -65,7 +60,7 @@ fn values_wip_limits() -> Option<String> {
 #[test]
 fn the_chart_delivers_the_env_name_from_values() {
     let name = cog_core::config::BOARD_WIP_LIMITS_ENV;
-    let template = read(CHART_CONFIGMAP);
+    let template = read_repo(CHART_CONFIGMAP);
     let line = template
         .lines()
         .find(|line| line.trim_start().starts_with(&format!("{name}:")));
@@ -94,7 +89,7 @@ fn the_values_key_exists_and_defaults_to_no_limit() {
 #[test]
 fn the_k3s_static_configmap_carries_the_same_name() {
     let name = cog_core::config::BOARD_WIP_LIMITS_ENV;
-    let static_manifest = read(K3S_CONFIGMAP);
+    let static_manifest = read_repo(K3S_CONFIGMAP);
     assert!(
         static_manifest
             .lines()

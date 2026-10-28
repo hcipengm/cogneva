@@ -30,14 +30,9 @@ use std::collections::BTreeSet;
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::read_repo;
 
 use common::rust_production::production_lines;
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// The names the server writes on the `type` tag.
 ///
@@ -129,8 +124,8 @@ fn only_in(left: &BTreeSet<String>, right: &BTreeSet<String>) -> Vec<String> {
 
 #[test]
 fn every_event_the_server_writes_is_one_the_client_keeps() {
-    let (server, wildcard) = server_names(&read(SERVER));
-    let text = read(CLIENT);
+    let (server, wildcard) = server_names(&read_repo(SERVER));
+    let text = read_repo(CLIENT);
     let union = client_union(&text);
     let known = client_known(&text);
 
@@ -163,8 +158,8 @@ fn every_event_the_server_writes_is_one_the_client_keeps() {
 
 #[test]
 fn every_event_the_client_keeps_is_one_the_server_writes() {
-    let server = server_names(&read(SERVER)).0;
-    let text = read(CLIENT);
+    let server = server_names(&read_repo(SERVER)).0;
+    let text = read_repo(CLIENT);
     let union = client_union(&text);
     let known = client_known(&text);
 
@@ -191,7 +186,7 @@ fn every_event_the_client_keeps_is_one_the_server_writes() {
 
 #[test]
 fn the_client_does_not_keep_the_vocabulary_twice() {
-    let text = read(CLIENT);
+    let text = read_repo(CLIENT);
     let union = client_union(&text);
     let known = client_known(&text);
     assert_eq!(
@@ -306,8 +301,8 @@ fn client_chat_frames(text: &str) -> BTreeSet<String> {
 
 #[test]
 fn every_chat_frame_the_gateway_sends_is_one_the_client_maps() {
-    let server = server_chat_frames(&read(CHAT_SERVER));
-    let client = client_chat_frames(&read(CLIENT));
+    let server = server_chat_frames(&read_repo(CHAT_SERVER));
+    let client = client_chat_frames(&read_repo(CLIENT));
 
     assert!(
         server.len() >= 5,

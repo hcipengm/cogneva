@@ -19,7 +19,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -48,11 +48,6 @@ const EXEMPT: &[(&str, &str)] = &[(
      settings name the same address, so the release's values file is the place \
      that would have to change with it.",
 )];
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// One Service the observability stack declares.
 #[derive(Debug, Clone)]
@@ -152,7 +147,7 @@ fn value_at<'a>(root: &'a serde_yaml::Value, path: &str) -> Option<&'a serde_yam
 #[test]
 fn the_chart_points_at_the_ports_the_stack_opens() {
     let values: serde_yaml::Value =
-        serde_yaml::from_str(&read(VALUES)).unwrap_or_else(|e| panic!("{VALUES}: {e}"));
+        serde_yaml::from_str(&read_repo(VALUES)).unwrap_or_else(|e| panic!("{VALUES}: {e}"));
     let services = services();
     assert!(
         !services.is_empty(),

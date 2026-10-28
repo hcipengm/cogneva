@@ -37,7 +37,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use std::collections::BTreeSet;
 
@@ -91,17 +91,11 @@ const CONSUMERS: &[(&str, &[&str])] = &[
 /// scraped on one face and unreadable on another.
 const UNREAD: &[(&str, &str, &str)] = &[];
 
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("unreadable at {}: {e}", path.display()))
-}
-
 /// The narrowing the scrape endpoint is configured with, as deployed. Empty
 /// means no narrowing: every bounded dimension every producer declares.
 fn configured_narrowing() -> Vec<String> {
     let value: serde_json::Value =
-        serde_json::from_str(&read(CHART_CONFIG)).expect("chart config is not valid JSON");
+        serde_json::from_str(&read_repo(CHART_CONFIG)).expect("chart config is not valid JSON");
     value["metrics"]["scrape_dimensions"]
         .as_array()
         .unwrap_or_else(|| panic!("{CHART_CONFIG} has no metrics.scrape_dimensions array"))
@@ -188,7 +182,7 @@ fn an_unread_entry_is_still_declared_and_still_unread() {
 #[test]
 fn a_recorded_producer_still_declares_what_the_table_claims() {
     for (file, dims) in PRODUCERS {
-        let source = read(file);
+        let source = read_repo(file);
         for (dim, bounded) in *dims {
             let constructor = if *bounded { "::bounded" } else { "::unbounded" };
             assert!(
@@ -204,7 +198,7 @@ fn a_recorded_producer_still_declares_what_the_table_claims() {
 #[test]
 fn a_recorded_consumer_still_asks_what_the_table_claims() {
     for (file, dims) in CONSUMERS {
-        let source = read(file);
+        let source = read_repo(file);
         for dim in *dims {
             assert!(
                 source.contains(dim),
@@ -259,7 +253,7 @@ fn every_declared_dimension_is_recorded_in_the_table() {
         }
         scanned.push(rel.clone());
 
-        for line in read(&rel).lines() {
+        for line in read_repo(&rel).lines() {
             // A commented-out declaration is not one the build makes.
             if line.trim_start().starts_with("//") {
                 continue;

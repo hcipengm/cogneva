@@ -460,7 +460,7 @@ fn accepted_names(root: &Path) -> BTreeMap<String, String> {
     let texts: Vec<(String, String)> = files
         .iter()
         .map(|path| {
-            let rel = relative_name(root, &path);
+            let rel = relative_name(root, path);
             (rel, strip_comments(&read(path)))
         })
         .collect();

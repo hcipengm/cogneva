@@ -32,13 +32,9 @@ use serde_yaml::Value;
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use common::rust_production::{production_sources, production_text};
-
-fn read(rel: &str) -> String {
-    std::fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("读不到 {rel}：{e}"))
-}
 
 /// All documents in the static manifests of the k3s profile.
 ///
@@ -96,7 +92,7 @@ fn parse_report_url(url: &str) -> (String, u16, String) {
 
 #[test]
 fn the_reporter_posts_to_the_service_the_manifests_publish() {
-    let source = read("crates/cogneva/src/process_report.rs");
+    let source = read_repo("crates/cogneva/src/process_report.rs");
     let start = source.find("DEFAULT_REPORT_URL").expect("自报地址常量");
     let line = source[start..].lines().next().expect("一行");
     let url = line
@@ -138,12 +134,12 @@ fn the_reporter_posts_to_the_service_the_manifests_publish() {
 
 #[test]
 fn the_report_path_is_published_on_the_internal_router_and_nowhere_else() {
-    let source = read("crates/cogneva/src/process_report.rs");
+    let source = read_repo("crates/cogneva/src/process_report.rs");
     let start = source.find("DEFAULT_REPORT_URL").expect("自报地址常量");
     let url = source[start..].lines().next().expect("一行");
     let (_service, _port, path) = parse_report_url(url.split('"').nth(1).expect("字面量"));
 
-    let gateway = read("crates/cog-gateway/src/lib.rs");
+    let gateway = read_repo("crates/cog-gateway/src/lib.rs");
     let internal_start = gateway
         .find("pub fn create_internal_router")
         .expect("内部面的路由器");
@@ -171,7 +167,7 @@ fn the_report_path_is_published_on_the_internal_router_and_nowhere_else() {
 
 #[test]
 fn the_ingress_admits_this_platforms_own_pods_on_the_internal_port() {
-    let source = read("crates/cogneva/src/process_report.rs");
+    let source = read_repo("crates/cogneva/src/process_report.rs");
     let start = source.find("DEFAULT_REPORT_URL").expect("自报地址常量");
     let url = source[start..].lines().next().expect("一行");
     let (_service, port, _path) = parse_report_url(url.split('"').nth(1).expect("字面量"));
@@ -245,7 +241,7 @@ fn the_ingress_admits_this_platforms_own_pods_on_the_internal_port() {
 /// The set is the arm of the `if matches!(` that guards the spawn call — that
 /// guard is the one place that decides which workloads report.
 fn reporting_commands() -> BTreeSet<String> {
-    let source = read("crates/cogneva/src/main.rs");
+    let source = read_repo("crates/cogneva/src/main.rs");
     let start = source
         .find("process_report::spawn()")
         .expect("main.rs 里启动自报循环");
@@ -312,7 +308,7 @@ fn the_report_address_is_spelled_in_one_production_file() {
     // 规范化过的根：read_dir 走出来的路径带着 `../..`，判词里点名一个这样的路径没人
     // 照着找得到文件。
     let root = repo_root().canonicalize().expect("仓库根");
-    let report = read("crates/cogneva/src/process_report.rs");
+    let report = read_repo("crates/cogneva/src/process_report.rs");
     let line = report
         .find("DEFAULT_REPORT_URL")
         .and_then(|start| report[start..].lines().next())

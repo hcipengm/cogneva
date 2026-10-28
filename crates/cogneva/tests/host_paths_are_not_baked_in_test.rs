@@ -170,7 +170,7 @@ fn scan(root: &Path, floor: usize) -> Vec<String> {
     );
     let mut problems = Vec::new();
     for file in &files {
-        let rel = relative_name(root, &file);
+        let rel = relative_name(root, file);
         // 读不出来就报错：把读失败当成空文件，等于让这份文件悄悄退出人口，
         // 而「它干净」与「没读到它」在结果上同形。
         let text = std::fs::read_to_string(file)

@@ -16,16 +16,11 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::read_repo;
 
 use common::rust_production::production_text;
 
 const DEPLOYER: &str = "crates/cog-reflection/src/mainline_deployer.rs";
-
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
 
 /// The shipped half of a file: a fixture that dispatches a Job is not a
 /// dispatch site, and a test may name anything it likes.
@@ -64,7 +59,7 @@ const GUARD_DEF: &str = "async fn roll_out(";
 
 #[test]
 fn no_rollout_is_dispatched_without_passing_the_guard() {
-    let source = read(DEPLOYER);
+    let source = read_repo(DEPLOYER);
     let production = production_source(&source);
 
     let sites: Vec<usize> = production.match_indices(DISPATCH).map(|(i, _)| i).collect();
@@ -93,7 +88,7 @@ fn no_rollout_is_dispatched_without_passing_the_guard() {
 
 #[test]
 fn every_path_that_starts_a_rollout_asks_the_guard() {
-    let source = read(DEPLOYER);
+    let source = read_repo(DEPLOYER);
     let production = production_source(&source);
     // Four paths reach a dispatch: the registry fast path, the build path, the
     // re-dispatch an external apply forces, and the rollback a withdrawal
@@ -110,7 +105,7 @@ fn every_path_that_starts_a_rollout_asks_the_guard() {
 
 #[test]
 fn only_the_withdrawal_skips_the_ci_verdict() {
-    let source = read(DEPLOYER);
+    let source = read_repo(DEPLOYER);
     let production = production_source(&source);
     // The guard takes a `withdrawal` flag that skips the CI gate: that gate asks
     // whether the revision being rolled has a failing check, and an operator's
@@ -136,7 +131,7 @@ fn only_the_withdrawal_skips_the_ci_verdict() {
 
 #[test]
 fn both_answers_the_guard_gives_are_published() {
-    let source = read(DEPLOYER);
+    let source = read_repo(DEPLOYER);
     let production = production_source(&source);
     assert!(
         production.contains(concat!("MAINLINE_SUPERSEDED_", "ROLLOUT_TOTAL")),

@@ -24,18 +24,13 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use cog_reflection::workload_kind;
 use serde::Deserialize;
-
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
 
 /// Every document in `text`, or a panic naming the file. A document that does
 /// not parse is a failure, not a skip: dropping it silently would drop the
@@ -187,7 +182,7 @@ fn a_document_that_does_not_parse_is_a_failure_not_a_skip() {
 
 #[test]
 fn every_secret_an_apply_path_workload_reads_is_created_by_the_install_face() {
-    let created = created_secret_names(&read("deploy/scripts/init-secrets.sh"));
+    let created = created_secret_names(&read_repo("deploy/scripts/init-secrets.sh"));
 
     let dir = repo_root().join("deploy/k3s");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)

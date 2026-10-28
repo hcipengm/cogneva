@@ -15,7 +15,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,11 +29,6 @@ const MANIFEST_DIR: &str = "deploy/k3s/observability/manifests";
 const INSTALL_SH: &str = "deploy/k3s/observability/scripts/install.sh";
 const CLUSTER_DOMAIN: &str = ".svc.cluster.local";
 const PROMETHEUS_PATH: [&str; 3] = ["prometheus", "prometheusSpec", "additionalScrapeConfigs"];
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
 
 fn yaml_docs(text: &str, what: &str) -> Vec<serde_yaml::Value> {
     serde_yaml::Deserializer::from_str(text)
@@ -154,7 +149,7 @@ fn declared_services() -> BTreeMap<(String, String), BTreeSet<u64>> {
 /// 是 Deployment 卷上点名的那个名字。两者对不上时，exporter 用默认配置起来，探什么
 /// 都回 400——模块名全对也没用。
 fn exporter_modules() -> BTreeSet<String> {
-    let text = read(&format!("{MANIFEST_DIR}/19-blackbox-exporter.yaml"));
+    let text = read_repo(&format!("{MANIFEST_DIR}/19-blackbox-exporter.yaml"));
     let docs = yaml_docs(&text, "19-blackbox-exporter.yaml");
 
     let mut configmaps: BTreeMap<(String, String), String> = BTreeMap::new();
@@ -290,7 +285,7 @@ fn address_replacements(job: &serde_yaml::Value) -> Vec<String> {
 #[test]
 fn the_base_and_small_values_carry_no_probe_job() {
     for file in [BASE_VALUES, SMALL_VALUES] {
-        let text = read(&format!("{HELM_DIR}/{file}"));
+        let text = read_repo(&format!("{HELM_DIR}/{file}"));
         let docs = yaml_docs(&text, file);
         let jobs: Vec<&serde_yaml::Value> = docs.iter().flat_map(scrape_configs).collect();
         assert!(
@@ -326,7 +321,7 @@ fn every_probe_job_dials_a_service_the_manifests_declare() {
 
     let mut checked = 0usize;
     for file in profiles() {
-        let text = read(&format!("{HELM_DIR}/{file}"));
+        let text = read_repo(&format!("{HELM_DIR}/{file}"));
         let docs = yaml_docs(&text, &file);
         let jobs: Vec<&serde_yaml::Value> = docs.iter().flat_map(scrape_configs).collect();
         assert!(!jobs.is_empty(), "{file} 里一条探测作业都没有");
@@ -374,7 +369,7 @@ fn every_probe_module_is_defined_by_the_exporter_it_dials() {
     let defined = exporter_modules();
 
     for file in profiles() {
-        let text = read(&format!("{HELM_DIR}/{file}"));
+        let text = read_repo(&format!("{HELM_DIR}/{file}"));
         let docs = yaml_docs(&text, &file);
         for job in docs.iter().flat_map(scrape_configs) {
             let name = job_name(job);
@@ -401,7 +396,7 @@ fn every_probe_module_is_defined_by_the_exporter_it_dials() {
 /// 都不可达」——把配置缺席读成了事故。
 #[test]
 fn every_reachability_profile_is_wired_into_the_installer() {
-    let install = read(INSTALL_SH);
+    let install = read_repo(INSTALL_SH);
     for file in profiles() {
         assert!(
             install.contains(&file),

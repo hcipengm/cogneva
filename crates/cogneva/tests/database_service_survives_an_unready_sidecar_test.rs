@@ -27,7 +27,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::read_repo;
 
 /// Every carrier of the database Service: the chart template that is the
 /// authority, the static copy the in-cluster puller applies, and the three
@@ -39,11 +39,6 @@ const CARRIERS: &[&str] = &[
     "deploy/rendered/k3s-multi/30-service-postgres.yaml",
     "deploy/rendered/k8s-standard/30-service-postgres.yaml",
 ];
-
-fn read(rel: &str) -> String {
-    let path = repo_root().join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
 
 /// The YAML documents in a file, split the way `kubectl apply` splits them.
 fn documents(text: &str) -> Vec<&str> {
@@ -72,7 +67,7 @@ fn the_database_service_publishes_not_ready_addresses_in_every_carrier() {
     let mut found = 0;
     let mut failures = Vec::new();
     for carrier in CARRIERS {
-        let text = read(carrier);
+        let text = read_repo(carrier);
         let services: Vec<&str> = documents(&text)
             .into_iter()
             .filter(|doc| is_postgres_service(doc))

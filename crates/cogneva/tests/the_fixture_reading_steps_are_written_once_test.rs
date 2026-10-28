@@ -58,15 +58,21 @@ const ROUTES_HOME: &str = "crates/cogneva/tests/common/routes.rs";
 /// 部分，后来才被别处借去用。
 const PRODUCTION_HOME: &str = "crates/cogneva/tests/common/rust_production.rs";
 
-/// 被抄走的那几行，逐字。前三个是**整条签名**（这三条规则的参数与返回类型在全仓只有
-/// 一种写法，所以签名是最窄也最准的形状）；后五个只到**定义名**为止。
+/// 被抄走的那几行，逐字。前四个是**整条签名**（这几条规则的参数与返回类型在全仓只有
+/// 这两种写法，所以签名是最窄也最准的形状）；后六个只到**定义名**为止。
 ///
-/// 为什么后五个不用整条签名：括号那一份在两处抄件里被写成了 `text: &str`，而共享的
+/// 读文件占两个签名，因为这条规则被抄成了两种入口：收 `&Path` 的那条，和收「表里写着
+/// 的相对名」的那条（`read(rel)` / `read(relative)`，二十三个夹具各写一遍
+/// `repo_root().join(rel)` 加同一条 panic）。拷贝只在参数名上变过，所以两种都写上。
+///
+/// 为什么后六个不用整条签名：括号那一份在两处抄件里被写成了 `text: &str`，而共享的
 /// 那一份收 `bytes: &[u8]`；相对名那一份在一处抄件里连名字都改成了 `relative`。签名
-/// 按抄件当时的形状写下去，下一个抄的人换一种参数类型就漏了。这五个名字是 `common`
+/// 按抄件当时的形状写下去，下一个抄的人换一种参数类型就漏了。这六个名字是 `common`
 /// 导出的，别处再出现一次定义按构造就是第二份实现。
-const COPIED_FORMS: [&str; 8] = [
+const COPIED_FORMS: [&str; 10] = [
     "fn read(path: &Path) -> String",
+    "fn read(rel: &str) -> String",
+    "fn read(relative: &str) -> String",
     "fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>)",
     "fn strip_comments(text: &str) -> String",
     "fn matching_paren(",
@@ -440,14 +446,14 @@ fn a_copy_on_disk_is_reported() {
     // 当时的样子写：参数是 `&str`，名字是 `relative_name`——判据要认的是这些形状。
     std::fs::write(
         dir.join("copy.rs"),
-        "fn read(path: &Path) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n\nfn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, out);\n}\n\nfn strip_comments(text: &str) -> String {\n    text.to_string()\n}\n\nfn matching_brace(text: &str, open: usize) -> Option<usize> {\n    let _ = (text, open);\n    None\n}\n\nfn relative_name(root: &Path, path: &Path) -> String {\n    let _ = root;\n    path.display().to_string()\n}\n\nfn inline(root: &Path, path: &Path) -> String {\n    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\\\', \"/\")\n}\n\nfn walk_all(dir: &Path, out: &mut Vec<PathBuf>) {\n    let _ = (dir, out);\n}\n\nfn walk_files(dir: &Path, extensions: &[&str], skip: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, skip, out);\n}\n",
+        "fn read(path: &Path) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n\nfn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, out);\n}\n\nfn strip_comments(text: &str) -> String {\n    text.to_string()\n}\n\nfn matching_brace(text: &str, open: usize) -> Option<usize> {\n    let _ = (text, open);\n    None\n}\n\nfn relative_name(root: &Path, path: &Path) -> String {\n    let _ = root;\n    path.display().to_string()\n}\n\nfn inline(root: &Path, path: &Path) -> String {\n    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\\\', \"/\")\n}\n\nfn walk_all(dir: &Path, out: &mut Vec<PathBuf>) {\n    let _ = (dir, out);\n}\n\nfn walk_files(dir: &Path, extensions: &[&str], skip: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, skip, out);\n}\n\nfn read(rel: &str) -> String {\n    let _ = rel;\n    String::new()\n}\n\nfn read(relative: &str) -> String {\n    let _ = relative;\n    String::new()\n}\n",
     )
-    .expect("eight copies");
+    .expect("ten copies");
     let found = census(&root, &all_files(&root));
     assert_eq!(
         found.copies.len(),
-        8,
-        "八份抄件都要数得出来：{:?}",
+        10,
+        "十份抄件都要数得出来：{:?}",
         found.copies
     );
     assert!(
@@ -506,6 +512,23 @@ fn a_copy_on_disk_is_reported() {
             .iter()
             .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 31),
         "`walk_files` 那一份也要点名（第 31 行）：{:?}",
+        found.copies
+    );
+    assert!(
+        found
+            .copies
+            .iter()
+            .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 35),
+        "收相对名的那一份 `read(rel)` 也要点名（第 35 行）：它只是参数名换了，\
+         按 `&Path` 那条签名判的判据看不见它：{:?}",
+        found.copies
+    );
+    assert!(
+        found
+            .copies
+            .iter()
+            .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 40),
+        "`read(relative)` 那一份也要点名（第 40 行）：抄的人连参数名都换过一遍：{:?}",
         found.copies
     );
 

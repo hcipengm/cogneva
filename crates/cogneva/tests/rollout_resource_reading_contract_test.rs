@@ -14,17 +14,12 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::read_repo;
 use common::rust_production::production_text;
 
 const DEPLOYER: &str = "crates/cog-reflection/src/mainline_deployer.rs";
 const ROLLOUT: &str = "crates/cog-reflection/src/mainline_rollout.rs";
 const READING: &str = "crates/cog-reflection/src/rollout_resources.rs";
-
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
 
 /// 产出面由 `common::rust_production` 一处算，不在这里再写一遍。
 ///
@@ -41,7 +36,7 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
 /// 最典型的一轮（跑通、但一直被 CPU 限流）恰好什么都不留，而它正是这条读数存在的理由。
 #[test]
 fn the_judgement_leaves_its_reading_on_the_way_out_of_both_outcomes() {
-    let source = read(ROLLOUT);
+    let source = read_repo(ROLLOUT);
     let production = production_text(&source);
     assert_eq!(
         occurrences(&production, "report_termination_message("),
@@ -63,7 +58,7 @@ fn the_judgement_leaves_its_reading_on_the_way_out_of_both_outcomes() {
 /// 退出、Job 失败退出。少读一个分支，那种结局下这一轮的读数就永远不进观测面。
 #[test]
 fn the_deployer_reads_the_reading_wherever_the_run_ends() {
-    let source = read(DEPLOYER);
+    let source = read_repo(DEPLOYER);
     let production = production_text(&source);
     assert_eq!(
         occurrences(&production, "self.report_rollout_resources("),
@@ -84,7 +79,7 @@ fn the_deployer_reads_the_reading_wherever_the_run_ends() {
 /// `lines().next()`——两行一旦调换，落点读回端见到的就是一段陌生文本。
 #[test]
 fn the_locus_is_written_before_the_reading() {
-    let production = production_text(&read(ROLLOUT));
+    let production = production_text(&read_repo(ROLLOUT));
     let Some(body) = production.split("fn write_termination_message(").nth(1) else {
         panic!("终止消息的写入器不在了")
     };
@@ -104,7 +99,7 @@ fn the_locus_is_written_before_the_reading() {
 /// 那一行的形状由产出侧一个模块定，读回端只认它。标记与版本都在那里，不在这里。
 #[test]
 fn the_line_shape_lives_in_one_place() {
-    let reading = production_text(&read(READING));
+    let reading = production_text(&read_repo(READING));
     assert!(
         reading.contains("pub const TAG") && reading.contains("FORMAT_VERSION"),
         "行标记与格式版本不再是产出侧声明的常量：读回端只能猜，而猜错的形状会被当成一条读数"
