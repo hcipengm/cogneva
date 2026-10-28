@@ -1,0 +1,29 @@
+# What `main` requires before a commit may sit on it.
+#
+# One check-run name per line, spelled exactly as the workflow publishes it --
+# including the platform suffix a matrix job appends. This file is the
+# declaration; the copy that enforces is stored in the repository's branch
+# protection settings, and only a token carrying `administration` scope can
+# read or write that copy.
+#
+# The two halves fail differently and both have failed:
+#
+#   - a name here that no workflow produces can never be reported, so the
+#     requirement is unsatisfiable and everyone who can push is pushing through
+#     a bypass while the push still echoes "N of M required status checks are
+#     expected". `deploy/scripts/check-required-checks.py` refuses that name.
+#   - a name here that the settings do not carry is a requirement nobody
+#     enforces. Nothing in this tree can read the settings, so that direction is
+#     caught only by whatever pushes this file to GitHub -- which is why the
+#     push is a named step rather than an assumption.
+#
+# Changing this list without changing the settings only moves the drift.
+Check
+Test
+Format
+Clippy
+Entry Scripts Lint
+Code Coverage
+Bootstrap Cross-Platform Check (ubuntu-latest)
+Bootstrap Cross-Platform Check (windows-latest)
+Bootstrap Cross-Platform Check (macos-latest)

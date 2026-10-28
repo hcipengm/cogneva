@@ -841,6 +841,15 @@ jobs:
       - name: Check the compiler that will judge this tree is the one the author ran
         run: bash deploy/scripts/check-toolchain-matches-ci.sh
 
+      # main 的必需检查是一串字符串，而检查是什么由各 workflow 的 job 名决定。两边
+      # 从来没有对过：2026-10-28 九条必需上下文里有三条写的是 `Bootstrap Check (…)`，
+      # 而 job 叫 `Bootstrap Cross-Platform Check`，那三条永远报不上 ⇒ 这套要求谁也
+      # 满足不了，能推上去的全靠管理员绕过，红与绿在入口处读起来一样。这条门判的是
+      # 声明的每个名字都有一个会发它的 job；读设置的那一半没有 admin scope，只能由
+      # 把这份声明推上去的那个人核。
+      - name: Check every required check is one a workflow can report
+        run: python3 deploy/scripts/check-required-checks.py
+
   # 上面那条门证的是**消费面**（从入口沿 import 图可达、被一格渲染出来、那一屏读
   # 覆盖端点），它结构上证明不了 `web/` 编得过：类型错、装不上的依赖、打包不进
   # bundle，三条它一条也看不见。构建这一半必须自己有一个作业，否则「新增功能不得
