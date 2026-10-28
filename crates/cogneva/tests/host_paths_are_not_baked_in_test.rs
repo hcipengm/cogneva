@@ -24,10 +24,14 @@
 //!     相对片段，前面紧邻的是字母。判据只看前面不是字母、数字、下划线、`$`、`}`
 //!     或 `/` 的那种绝对路径。
 //!
+//! 判据看不见什么，也写清楚：它只认 `deploy/`（外加两份入口脚本）里**以 home
+//! 目录开头的绝对路径**。检出若落在 `/srv/…` 或 `/opt/…` 这类地方，字面量今天不会
+//! 被拦——`/opt/cogneva` 与 `/srv/cogneva/models` 在树里是**目标侧**的正当路径
+//! （装好的应用根、宿主上的模型缓存），把它们一起拦掉会误伤。真正兜底的是下一条：
+//! 救援脚本必须留下那句从自身位置出发的推算，这样「地址写死」与「什么都没配」
+//! 都不会再是同一个沉默。
+//!
 //! 这份文件自己也在人口之外（它不在 `deploy/` 下），所以可以原样举出上面那些标本。
-//! 清单里每条路径都必须真的还在算根：字面量删干净了、却把推算也一起删掉，让脚本
-//! 静默落到空串，那不是修好而是把同一个地址换成了「什么都没配」，所以两条救援
-//! 脚本各要求一句从自身位置出发的推算。
 
 use std::path::{Path, PathBuf};
 
@@ -53,8 +57,18 @@ const RESCUE_SCRIPTS: &[(&str, &str)] = &[
     ("deploy/k3s/sync-git-remote.sh", "BASH_SOURCE"),
 ];
 
+/// 人口里 `deploy/` 之外的那两份：元启动的两个入口。它们在目标主机上被跑起来，
+/// 也同样需要知道自己在哪儿，所以和部署脚本是同一个问题。
+const ENTRY_SCRIPTS: &[&str] = &["bootstrap.sh", "bootstrap.ps1"];
+
 fn text_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
+    for rel in ENTRY_SCRIPTS {
+        let path = root.join(rel);
+        if path.is_file() {
+            out.push(path);
+        }
+    }
     let mut stack = vec![root.join("deploy")];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
