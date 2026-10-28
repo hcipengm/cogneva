@@ -50,6 +50,7 @@
 mod common;
 
 use common::routes::repo_root;
+use common::rust_production::relative_name;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -414,11 +415,7 @@ fn reachable(roots: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
 
 /// A path as the report spells it: relative to the repository root, with `/`.
 fn repo_relative(path: &Path) -> String {
-    let root = repo_root();
-    path.strip_prefix(&root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
+    relative_name(&repo_root(), path)
 }
 
 /// Every `.rs` the repository carries under a workspace member's `src/` reaches a build

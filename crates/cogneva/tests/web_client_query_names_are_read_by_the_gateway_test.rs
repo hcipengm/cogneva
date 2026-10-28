@@ -57,6 +57,7 @@
 mod common;
 
 use common::routes::{matching_brace, read, repo_root, strip_comments, walk};
+use common::rust_production::relative_name;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -304,11 +305,7 @@ fn client_query_names(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
         out.entry(name).or_default().insert(where_.to_string());
     };
     for path in files {
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(root, &path);
         let text = strip_comments(&read(&path));
         for body in string_bodies(&text) {
             let starts_a_request = matches!(body.chars().next(), Some('/') | Some('?') | Some('&'));
@@ -463,11 +460,7 @@ fn accepted_names(root: &Path) -> BTreeMap<String, String> {
     let texts: Vec<(String, String)> = files
         .iter()
         .map(|path| {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = relative_name(root, &path);
             (rel, strip_comments(&read(path)))
         })
         .collect();

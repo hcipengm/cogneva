@@ -31,7 +31,7 @@ mod common;
 use common::routes::repo_root;
 
 use common::rust_production::{
-    brace_delta, opens_test_module, production_lines, production_sources,
+    brace_delta, opens_test_module, production_lines, production_sources, relative_name,
 };
 
 /// The register this census is read against.
@@ -108,11 +108,7 @@ fn addresses_on(line: &str) -> Vec<String> {
 fn census_with(scan: fn(&str) -> Vec<String>) -> BTreeSet<Found> {
     let mut out = BTreeSet::new();
     for path in production_sources(&repo_root()) {
-        let rel = path
-            .strip_prefix(repo_root())
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(&repo_root(), &path);
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         for line in production_lines(&text) {

@@ -41,6 +41,7 @@ use std::path::{Path, PathBuf};
 mod common;
 
 use common::routes::repo_root;
+use common::rust_production::relative_name;
 
 /// 人口的根。`deploy/` 是部署脚本，`.github/scripts/` 是 CI 自己的门——两处的
 /// 「仓库根」指同一个目录，错法也一样。
@@ -230,11 +231,7 @@ fn climb(dir: &Path, levels: usize) -> Option<PathBuf> {
 fn climbs(root: &Path) -> Vec<Climb> {
     let mut out = Vec::new();
     for file in candidate_files(root) {
-        let rel = file
-            .strip_prefix(root)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(root, &file);
         // 读不出来就报错：当成空文件等于让这份脚本悄悄退出人口，而「它没上溯」
         // 与「没读到它」在结果上同形。
         let text = std::fs::read_to_string(&file)

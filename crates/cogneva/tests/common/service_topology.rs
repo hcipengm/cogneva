@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use super::routes::{route_entries_in, walk};
-use super::rust_production::production_text;
+use super::rust_production::{production_text, relative_name};
 
 /// 唯一声明本项目镜像名的地方。
 pub const CHART_VALUES: &str = "deploy/helm/cogneva/values.yaml";
@@ -170,11 +170,7 @@ fn documents(root: &Path) -> Vec<(String, serde_yaml::Value)> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let manifest = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let manifest = relative_name(root, &path);
         for document in serde_yaml::Deserializer::from_str(&text) {
             if let Ok(value) = serde_yaml::Value::deserialize(document) {
                 out.push((manifest.clone(), value));

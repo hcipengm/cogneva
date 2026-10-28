@@ -47,6 +47,7 @@ mod common;
 use common::routes::{
     normalize, read, repo_root, served_methods, served_paths, strip_comments, walk,
 };
+use common::rust_production::relative_name;
 
 /// The paths the shipped clients ask for, keyed by shape, with the files that
 /// ask. Two clients ship in the image: the WebUI under `web/src`, and the
@@ -59,11 +60,7 @@ fn client_paths(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
     files.sort();
     let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for path in files {
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(root, &path);
         let text = read(&path);
         let mut rest = text.as_str();
         while let Some(at) = rest.find("/api/") {
@@ -223,11 +220,7 @@ fn client_requests(root: &Path) -> BTreeMap<(String, String), BTreeSet<String>> 
     files.sort();
     let mut found: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
     for path in files {
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(root, &path);
         let text = strip_comments(&read(&path));
         let mut from = 0;
         while let Some(at) = text[from..].find("/api/") {

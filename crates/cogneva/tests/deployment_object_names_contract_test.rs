@@ -33,7 +33,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{production_sources, production_text};
+use common::rust_production::{production_sources, production_text, relative_name};
 
 /// The one place an object's name may be written.
 const DECLARATION: &str = "crates/cog-core/src/topology.rs";
@@ -241,11 +241,7 @@ fn only_the_declaration_names_an_object() {
         .collect();
     let mut offenders: Vec<(String, String)> = Vec::new();
     for path in production_sources(&repo_root()) {
-        let rel = path
-            .strip_prefix(repo_root())
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(&repo_root(), &path);
         if rel == DECLARATION {
             continue;
         }

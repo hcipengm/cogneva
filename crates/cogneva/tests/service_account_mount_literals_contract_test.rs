@@ -20,7 +20,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{production_lines, production_sources};
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// Every `*.rs` file under `crates/*/src`, relative to the repo root.
 /// The one file allowed to spell the mount.
@@ -35,11 +35,7 @@ const MOUNT: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 fn only_the_declaration_spells_the_service_account_mount() {
     let mut hits = Vec::new();
     for path in production_sources(&repo_root()) {
-        let rel = path
-            .strip_prefix(repo_root())
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(&repo_root(), &path);
         if rel == DECLARATION {
             continue;
         }

@@ -23,7 +23,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{production_lines, production_sources};
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// Where the names are declared, relative to the repository root.
 const HOME: &str = "crates/cog-core/src/roles.rs";
@@ -87,11 +87,7 @@ fn sites(root: &Path, names: &[&str]) -> BTreeMap<String, Vec<String>> {
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
     {
         for path in production_sources(root) {
-            let file = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let file = relative_name(root, &path);
             if file == HOME {
                 continue;
             }

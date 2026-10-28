@@ -1,8 +1,9 @@
 //! 「怎么读一个文件」「怎么走一棵树」「怎么去掉注释」「怎么配平括号」「怎么取仓库
 //! 相对名」各只许有一份实现。
 //!
-//! 这几条规则短到看起来不值得共享，所以它们在夹具里被抄了十二遍、两遍、六遍、两遍和
-//! 两遍——连同那句解释「读不出来就 panic」的注释一起抄。抄的人不是懒：每个测试二进制
+//! 这几条规则短到看起来不值得共享，所以它们在夹具里被抄了十二遍、两遍、六遍、两遍、
+//! 两遍，取相对名那一条还额外被内联摊了十六处——连同那句解释「读不出来就 panic」的
+//! 注释一起抄。抄的人不是懒：每个测试二进制
 //! 都是一棵独立的 crate，`common` 不是自动可见的，手边最快的一条路就是复制。去注释
 //! 那一条抄得更没声：六份里三种写法（按字节 / 按字符 / 数嵌套层数），谁抄的都不算错，
 //! 错的是它们从此各走各的——Rust 的块注释**可以嵌套**，数层数的那一份与只看第一个
@@ -66,6 +67,15 @@ const COPIED_FORMS: [&str; 6] = [
     "fn matching_brace(",
     "fn relative_name(",
 ];
+
+/// 取相对名还有**内联**的形状：不写成函数，直接把那一串方法调用摊在调用点上。
+/// 这是这一族抄得最多的一种——十六个夹具各摊一遍，谁都不觉得自己在抄，所以按定义名
+/// 判的判据一个也看不见。
+///
+/// 只在**夹具**面上判：同一串 `.replace('\\', "/")` 在产出码里有十来处，那是把路径
+/// 变成线上/日志里的名字，各有各的上下文，而共享的这份住在测试 harness 里——产出码够
+/// 不着它。跨类边界不是副本。
+const INLINE_FORMS: [&str; 1] = [r#".replace('\\', "/")"#];
 
 /// 这条门自己。它把签名当字符串写着（判据要看的就是那几行），所以在真树上会被
 /// 自己点名——**只摘这一面**：下面要求它至少还认得出自己的几份标本，判据哪天退化成
@@ -145,14 +155,19 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         if !shared.contains(&name.as_str()) && text.contains("strip_comments") {
             strippers += 1;
         }
+        // 内联那一种只在夹具面上判：`crates/<crate>/src/` 里的同一串字节是另一件事。
+        let in_fixtures = name.contains("/tests/");
         for (index, line) in text.lines().enumerate() {
             // 注释行跳过：说明里写着这个签名，不等于又抄了一份。
             if line.trim_start().starts_with("//") {
                 continue;
             }
-            if !shared.contains(&name.as_str())
-                && COPIED_FORMS.iter().any(|form| line.contains(form))
-            {
+            if shared.contains(&name.as_str()) {
+                continue;
+            }
+            let copied = COPIED_FORMS.iter().any(|form| line.contains(form))
+                || (in_fixtures && INLINE_FORMS.iter().any(|form| line.contains(form)));
+            if copied {
                 copies.push((name.clone(), index + 1, line.trim().to_string()));
             }
         }
@@ -192,11 +207,11 @@ fn the_fixture_reading_steps_are_written_once() {
         .iter()
         .filter(|(file, _, _)| file == THE_PREDICATE)
         .collect();
+    let shapes = COPIED_FORMS.len() + INLINE_FORMS.len();
     assert!(
-        own.len() >= COPIED_FORMS.len(),
-        "这条门自己至少写着 {} 份标本（每一种形状各一行），读到 {} 处：{:?}。\
+        own.len() >= shapes,
+        "这条门自己至少写着 {shapes} 份标本（每一种形状各一行），读到 {} 处：{:?}。\
          少一份说明判据对那种形状已经瞎了，那么把它摘掉就只是在掩盖它",
-        COPIED_FORMS.len(),
         own.len(),
         own
     );
@@ -324,14 +339,14 @@ fn a_copy_on_disk_is_reported() {
     // 当时的样子写：参数是 `&str`，名字是 `relative_name`——判据要认的是这些形状。
     std::fs::write(
         dir.join("copy.rs"),
-        "fn read(path: &Path) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n\nfn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, out);\n}\n\nfn strip_comments(text: &str) -> String {\n    text.to_string()\n}\n\nfn matching_brace(text: &str, open: usize) -> Option<usize> {\n    let _ = (text, open);\n    None\n}\n\nfn relative_name(root: &Path, path: &Path) -> String {\n    let _ = root;\n    path.display().to_string()\n}\n",
+        "fn read(path: &Path) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n\nfn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, out);\n}\n\nfn strip_comments(text: &str) -> String {\n    text.to_string()\n}\n\nfn matching_brace(text: &str, open: usize) -> Option<usize> {\n    let _ = (text, open);\n    None\n}\n\nfn relative_name(root: &Path, path: &Path) -> String {\n    let _ = root;\n    path.display().to_string()\n}\n\nfn inline(root: &Path, path: &Path) -> String {\n    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\\\', \"/\")\n}\n",
     )
-    .expect("five copies");
+    .expect("six copies");
     let found = census(&root, &all_files(&root));
     assert_eq!(
         found.copies.len(),
-        5,
-        "五份抄件都要数得出来：{:?}",
+        6,
+        "六份抄件都要数得出来：{:?}",
         found.copies
     );
     assert!(
@@ -366,6 +381,15 @@ fn a_copy_on_disk_is_reported() {
         "相对名那一份也要点名（第 18 行）：{:?}",
         found.copies
     );
+    assert!(
+        found
+            .copies
+            .iter()
+            .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 24),
+        "内联那一份也要点名（第 24 行：摊开的那一行，不是函数头）：按定义名判的\
+         判据看不见它：{:?}",
+        found.copies
+    );
 
     // 抄件长在 `src/` 的单测模块里也要点名：这一族抄件的上一轮就长在那儿
     // （`startup_guard.rs` 的三行 shim），只扫夹具的判据对它一声不响。
@@ -383,6 +407,24 @@ fn a_copy_on_disk_is_reported() {
             .iter()
             .any(|(file, line, _)| file == "crates/probe/src/unit.rs" && *line == 1),
         "`src/` 里的抄件也要数得出来，否则这份门只看得见夹具：{:?}",
+        found.copies
+    );
+
+    // 同一串内联字节长在 `src/` 里就不算：那是产出码把路径变成线上的名字，各用
+    // 各的上下文，而共享的这份住在测试 harness 里，产出码够不着它。判据若把这一类
+    // 也算上，它会红在没人能改对的地方。
+    std::fs::write(
+        src.join("inline.rs"),
+        "pub fn wire(path: &std::path::Path) -> String {\n    path.display().to_string().replace('\\\\', \"/\")\n}\n",
+    )
+    .expect("production byte, not a copy");
+    let found = census(&root, &all_files(&root));
+    assert!(
+        !found
+            .copies
+            .iter()
+            .any(|(file, _, _)| file == "crates/probe/src/inline.rs"),
+        "产出码里的 posix 折叠不是这一族的副本：{:?}",
         found.copies
     );
 

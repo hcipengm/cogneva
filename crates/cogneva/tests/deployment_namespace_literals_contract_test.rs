@@ -29,7 +29,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{production_sources, production_text};
+use common::rust_production::{production_sources, production_text, relative_name};
 
 /// The namespace the chart declares. Read, not written down here — that is the
 /// whole point of the gate.
@@ -95,11 +95,7 @@ fn census() -> Vec<Hit> {
     let wanted = shapes(&namespace);
     let mut hits = Vec::new();
     for path in production_sources(&repo_root()) {
-        let rel = path
-            .strip_prefix(repo_root())
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(&repo_root(), &path);
         if rel == DECLARATION {
             continue;
         }
@@ -399,11 +395,7 @@ fn every_script_default_is_the_namespace_the_chart_declares() {
             if file.extension().and_then(|e| e.to_str()) != Some("sh") {
                 continue;
             }
-            let rel = file
-                .strip_prefix(&root)
-                .unwrap_or(&file)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = relative_name(&root, &file);
             let text = std::fs::read_to_string(&file)
                 .unwrap_or_else(|e| panic!("{} 读不出来：{e}", file.display()));
             for (index, line) in text.lines().enumerate() {

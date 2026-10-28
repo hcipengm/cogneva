@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 mod common;
 
 use common::routes::repo_root;
+use common::rust_production::relative_name;
 
 /// `deploy/` 下按文本判的扩展名。`.md` 不在其中：那里的路径讲的是目标主机。
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -93,11 +94,7 @@ fn text_files(root: &Path) -> Vec<PathBuf> {
             if !keeps {
                 continue;
             }
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let rel = relative_name(root, &path);
             if rel.starts_with(FIXTURES) {
                 continue;
             }
@@ -173,11 +170,7 @@ fn scan(root: &Path, floor: usize) -> Vec<String> {
     );
     let mut problems = Vec::new();
     for file in &files {
-        let rel = file
-            .strip_prefix(root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(root, &file);
         // 读不出来就报错：把读失败当成空文件，等于让这份文件悄悄退出人口，
         // 而「它干净」与「没读到它」在结果上同形。
         let text = std::fs::read_to_string(file)

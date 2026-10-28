@@ -16,7 +16,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{production_lines, production_sources};
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// The one file allowed to spell the header names.
 const DECLARATION: &str = "crates/cog-core/src/contract/observability.rs";
@@ -62,11 +62,7 @@ fn every_hop_spells_the_trace_headers_from_the_declaration() {
 
     let mut hits = Vec::new();
     for path in sources {
-        let rel = path
-            .strip_prefix(repo_root())
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(&repo_root(), &path);
         if rel == DECLARATION {
             continue;
         }

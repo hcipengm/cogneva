@@ -42,6 +42,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use common::routes::{repo_root, walk};
+use common::rust_production::relative_name;
 
 const CONSTANTS: &str = "crates/cog-observability/src/lib.rs";
 const PUSH_CLIENT: &str = "crates/cog-observability/src/logs.rs";
@@ -98,11 +99,7 @@ fn deployed_selectors(root: &Path) -> Vec<(String, String, String, usize)> {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let where_ = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let where_ = relative_name(root, &path);
         for (line, query) in expressions(&text) {
             let trimmed = query.trim_start();
             // 只有以 `{` 开头的才是 LogQL 流选择器：前面挂着指标名的是 PromQL，

@@ -520,11 +520,7 @@ fn contradictions(root: &Path, files: &[PathBuf]) -> (Vec<String>, Census) {
     walk(&root.join(GATEWAY).join("src"), &["html"], &mut files);
     files.sort();
     for path in files {
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let file = relative_name(root, &path);
         let text = strip_comments(&read(&path));
         let (bodies, opaque) = if file.ends_with(".html") {
             (page_bodies(&text, &file), 0)

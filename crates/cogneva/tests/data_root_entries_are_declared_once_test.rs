@@ -22,7 +22,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{production_lines, production_sources};
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// Every `*.rs` file under `crates/*/src`, relative to the repo root.
 /// The declared entries, read from the consts themselves.
@@ -61,11 +61,7 @@ fn offences(text: &str) -> Vec<String> {
 fn only_the_declarations_spell_a_data_root_entry() {
     let mut hits = Vec::new();
     for path in production_sources(&repo_root()) {
-        let rel = path
-            .strip_prefix(repo_root())
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let rel = relative_name(&repo_root(), &path);
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         hits.extend(
