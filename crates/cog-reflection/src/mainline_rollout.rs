@@ -509,6 +509,88 @@ fn is_new_revision_never_ran(msg: &str) -> bool {
     msg.contains(NEW_REVISION_NEVER_RAN_MARKER)
 }
 
+/// 整段预算里这台宿主的运行队列一直比它本身宽：那个正在启动的 Pod 拿到的是排队，
+/// 不是 CPU。
+///
+/// 与上面几条同族：它说的不是这一版的好坏。容器起来之后，启动是一件纯计算的活
+/// （读模型、建索引、跑迁移、起插件），而机器上还有别的东西在跑；预算按墙上时间
+/// 记，宿主不给时间，预算就只是在测别人的负载。
+///
+/// 2026-10-28 那次滚动的读数：24 核宿主，apply 那一刻 load1 21.9（还没越界），
+/// 45 秒后 98，再一分半 140，判死那一刻 161；CPU 95% 忙、dm-0 98.8% 占用、
+/// PSI io some 54%。那一版的新 Pod 整段只拿到 0.01–0.09 核、CFS 限流 0.0%
+/// （压它的东西在 k8s 的 cgroup 之外）、工作集三分钟一格没涨、端口三百秒没开。
+/// 同一张镜像四十分钟前在 load1 15 / CPU 51% 的宿主上启动只用了 31 秒；同一个
+/// 滚动后来在 load1 一直低于核数的一小时里从调度到 Ready 用了 207 秒。判成版本类
+/// 就是把这台机器的负载记成了代码缺陷，并回滚一份本来会自己起来的版本。
+pub(crate) const HOST_LOADED_MARKER: &str = "the host's run queue stayed wider than its core count";
+
+pub(crate) fn is_host_loaded(msg: &str) -> bool {
+    msg.contains(HOST_LOADED_MARKER)
+}
+
+/// 宿主这一刻的运行队列：`load1` 与核数。
+///
+/// 两处读的都是 `/proc`，而 `/proc/loadavg` 与 `/proc/cpuinfo` 不随命名空间切片
+/// （被切开的只有 PID 号与 cgroup 视图），所以判定 Job 里读到的是**整机**在排多少
+/// 活。这正是要的读数：被压住的不是判定进程，是那个正在启动的 Pod，而它分不分得到
+/// CPU 取决于整机有多少东西在抢——那件事在它的 cgroup 里读不到（实测它自己的 CFS
+/// 限流是 0%，它不是被自己的配额压住的）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct HostRunQueue {
+    /// 一分钟平均的可运行任务数（含不可中断睡眠，即等 I/O 的那些）。
+    pub load1: f64,
+    /// 宿主的 CPU 数。
+    pub cores: f64,
+}
+
+impl HostRunQueue {
+    /// 队列比机器宽，就说明有活在等：一个 Pod 的启动在这个窗口里拿到的是排队时间。
+    ///
+    /// 界取「每核一个」是因为它就是这台机器的宽度本身——再引一个可调的数，就成了
+    /// 第二个要有人去校准的旋钮，而这个判据要回答的只是「有没有东西在等」。
+    pub(crate) fn is_loaded(self) -> bool {
+        self.load1 > self.cores
+    }
+}
+
+pub(crate) const LOADAVG_PATH: &str = "/proc/loadavg";
+pub(crate) const CPUINFO_PATH: &str = "/proc/cpuinfo";
+
+/// `/proc/loadavg` 的第一列。
+fn load1_of(text: &str) -> Option<f64> {
+    text.split_whitespace().next()?.parse().ok()
+}
+
+/// `/proc/cpuinfo` 里 `processor` 的行数。
+fn core_count_of(text: &str) -> Option<f64> {
+    let cores = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("processor"))
+        .count();
+    (cores > 0).then_some(cores as f64)
+}
+
+/// 读一次宿主的运行队列。读不到就是读不到（返回 `None`），不折成 0：一个读不到的
+/// 读数与一台空闲的机器在判据上必须分得开，否则一次读失败会把「没有证据」写成
+/// 「宿主很空」。
+pub(crate) fn read_host_run_queue(loadavg: &Path, cpuinfo: &Path) -> Option<HostRunQueue> {
+    let load1 = load1_of(&std::fs::read_to_string(loadavg).ok()?)?;
+    let cores = core_count_of(&std::fs::read_to_string(cpuinfo).ok()?)?;
+    Some(HostRunQueue { load1, cores })
+}
+
+/// 进程里那一口：读这台机器的两个 `/proc` 文件。
+fn read_host_run_queue_now() -> Option<HostRunQueue> {
+    read_host_run_queue(Path::new(LOADAVG_PATH), Path::new(CPUINFO_PATH))
+}
+
+/// 用例里的默认读数：没有读数。判据读不到宿主就不改判，所以用例停在这条
+/// 旧路径上，用哪一份宿主读数由用例自己指定。
+fn no_host_reading() -> Option<HostRunQueue> {
+    None
+}
+
 /// 「这个进程手里一份集群配置都没有」的标记。
 ///
 /// 与 [`CLUSTER_UNREACHABLE_MARKER`] 分成两条判据：那一条说的是**集群那边**此刻
@@ -2183,6 +2265,10 @@ pub struct RolloutExecutor {
     /// 动手之前要复问的上游 CI。`None` = 这一趟没有上游清单（派发侧没配上游
     /// 或它是旧版二进制），此时不提问、也不假装问过。
     ci_ask: Option<UpstreamCiAsk>,
+    /// 读宿主运行队列的那一口。生产里是 [`read_host_run_queue`]，用例里换成固定
+    /// 读数：这条判据读的是**跑用例的那台机器**的负载，不换掉，同一份用例在空闲的
+    /// 笔记本上与一台正在编译的 CI 机上会给出两种类别。
+    host_run_queue: fn() -> Option<HostRunQueue>,
 }
 
 /// 一次「落地之前再问一次 CI」的全部输入：要问的 rev，以及问哪些上游。
@@ -2235,12 +2321,27 @@ impl RolloutExecutor {
             rollout_timeout_secs,
             startup_timeout_secs,
             ci_ask: None,
+            // 用例里不读跑用例这台机器的负载：同一条判据在一台空闲的机器上与一台
+            // 正在编译的机器上会给出两种类别，而这份用例要锁的是判据本身。要用一个
+            // 固定的宿主读数，用例显式调 `with_host_run_queue`。
+            host_run_queue: if cfg!(test) {
+                no_host_reading
+            } else {
+                read_host_run_queue_now
+            },
         }
     }
 
     /// 挂上"动手之前复问上游 CI"这一趟。只有从命令行起的 Job 会调它。
     pub(crate) fn with_ci_ask(mut self, ask: UpstreamCiAsk) -> Self {
         self.ci_ask = Some(ask);
+        self
+    }
+
+    /// 换掉宿主运行队列的读数来源。只给用例用。
+    #[cfg(test)]
+    pub(crate) fn with_host_run_queue(mut self, read: fn() -> Option<HostRunQueue>) -> Self {
+        self.host_run_queue = read;
         self
     }
 
@@ -3116,6 +3217,12 @@ impl RolloutExecutor {
         // 现场（Pod 等待原因、RS 拒绝条件）全是**旧版本**的，下面那几条环境判据
         // 一条都够不着——预算到期只会走到最后的通用分支，被记成"这一版坏了"。
         let mut new_pod_seen = false;
+        // 整段预算里宿主排队排了多久、最挤的一刻有多挤。只在预算到期判死时用它
+        // 回答一个问题：这段时间到底是这一版没起来，还是这台机器没给它时间。
+        // 正常路径上它只是每轮一次 `/proc` 读，不进日志。
+        let mut host_polls = 0u32;
+        let mut queued_polls = 0u32;
+        let mut loaded_peak: Option<HostRunQueue> = None;
         loop {
             // 拿不到观测时沿用当前相位计预算：还没进就绪阶段就仍然是启动阶段。
             let mut starting = readiness_deadline.is_none();
@@ -3203,6 +3310,18 @@ impl RolloutExecutor {
                 Err(e) => return Err(e),
             }
             let now = std::time::Instant::now();
+            // 判死那一刻的读数只说明最后一秒，而这段预算要回答的是「整段里有没有
+            // 给过它时间」，所以要记下排队的**采样点占比**，不是一次尖峰：一次
+            // 尖峰压不住一段启动，半程以上都在排队才是这台机器没给时间。
+            if let Some(rq) = (self.host_run_queue)() {
+                host_polls += 1;
+                if rq.is_loaded() {
+                    queued_polls += 1;
+                    if loaded_peak.is_none_or(|p| rq.load1 / rq.cores > p.load1 / p.cores) {
+                        loaded_peak = Some(rq);
+                    }
+                }
+            }
             // 就绪预算从首次进入该阶段起算，启动阶段的耗时不算在内。
             let (budget, phase) = if starting {
                 (self.startup_timeout_secs, "startup")
@@ -3274,6 +3393,20 @@ impl RolloutExecutor {
                          the new revision was ever created, so this timeout says nothing about \
                          it (last: {note}{suffix})",
                         t.deployment, budget
+                    ))
+                } else if let Some(rq) =
+                    loaded_peak.filter(|_| queued_polls.saturating_mul(2) >= host_polls)
+                {
+                    // 半程以上的采样点都在排队：这段时间测的是别人的负载，不是
+                    // 这一版的启动。留在集群上不回滚，宿主松下来它自己会起来。
+                    SFError::IO(format!(
+                        "{HOST_LOADED_MARKER}: rollout of deployment/{} did not complete \
+                         within {}s ({phase} phase) — the host's run queue was past one task per \
+                         core on {queued_polls} of {host_polls} samples, peaking at load1 {:.2} \
+                         against {} cores, so the new pod spent the budget queued behind work \
+                         that is not part of this revision instead of running, and this timeout \
+                         says nothing about the revision (last: {note}{suffix})",
+                        t.deployment, budget, rq.load1, rq.cores
                     ))
                 } else if starting {
                     SFError::Agent(format!(
@@ -4405,6 +4538,23 @@ impl RolloutExecutor {
                 e,
             ));
         }
+        if is_host_loaded(primary) {
+            warn!(
+                error = %e,
+                "the host's run queue stayed wider than its core count for the whole budget, \
+                 so the new pod was queued instead of running; keeping the new revision (no \
+                 rollback) — the revision left in place starts on its own once the host is \
+                 quiet again, and rolling back would book this machine's load as a defect of \
+                 the code"
+            );
+            return Err(RolloutFailure::at(
+                stage,
+                target,
+                FailureLocus::HostLoaded,
+                false,
+                e,
+            ));
+        }
         if is_observation_tool_failure(primary) {
             warn!(
                 error = %e,
@@ -4952,5 +5102,83 @@ mod tests {
     #[test]
     fn an_empty_scene_leaves_the_verdict_untouched() {
         assert!(scene_suffix("").is_empty());
+    }
+
+    /// 每核一个可运行任务是这条判据的界：等于宽度算不上排队，越过一格才是。
+    #[test]
+    fn the_run_queue_is_wide_only_past_one_task_per_core() {
+        let at_capacity = HostRunQueue {
+            load1: 24.0,
+            cores: 24.0,
+        };
+        assert!(!at_capacity.is_loaded(), "a full machine is not a queue");
+        let queued = HostRunQueue {
+            load1: 98.0,
+            cores: 24.0,
+        };
+        assert!(queued.is_loaded(), "four tasks per core is a queue");
+    }
+
+    /// 两个 `/proc` 读数的解析：`loadavg` 取第一列，`cpuinfo` 数 `processor` 行。
+    #[test]
+    fn the_host_reading_comes_out_of_the_two_proc_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let loadavg = dir.path().join("loadavg");
+        let cpuinfo = dir.path().join("cpuinfo");
+        std::fs::write(&loadavg, "140.73 61.02 22.11 12/3456 789012\n").unwrap();
+        std::fs::write(
+            &cpuinfo,
+            "processor\t: 0\nmodel name\t: x\n\nprocessor\t: 1\nmodel name\t: y\n",
+        )
+        .unwrap();
+
+        let rq = read_host_run_queue(&loadavg, &cpuinfo).expect("both files are readable");
+        assert_eq!(rq.load1, 140.73);
+        assert_eq!(rq.cores, 2.0);
+        assert!(rq.is_loaded());
+    }
+
+    /// 读不到的读数不许折成「宿主很空」：那会把「没有证据」写成「没有负载」，
+    /// 而这条判据的全部作用就是把这两种情况分开。
+    #[test]
+    fn an_unreadable_host_says_nothing_rather_than_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let loadavg = dir.path().join("loadavg");
+        let cpuinfo = dir.path().join("cpuinfo");
+        std::fs::write(&loadavg, "0.31 0.28 0.11 1/100 4242\n").unwrap();
+        std::fs::write(&cpuinfo, "processor\t: 0\n").unwrap();
+        assert!(read_host_run_queue(&loadavg, &cpuinfo).is_some());
+        assert!(
+            read_host_run_queue(&dir.path().join("missing"), &cpuinfo).is_none(),
+            "a missing file is not a quiet host"
+        );
+        // 空文件、没有 processor 行的 cpuinfo 同样是读不到。
+        std::fs::write(&cpuinfo, "model name\t: x\n").unwrap();
+        assert!(read_host_run_queue(&loadavg, &cpuinfo).is_none());
+    }
+
+    /// 宿主排队这条判词必须穿过两种读法：类别从它读出来，而现场采样里那句
+    /// `connection refused`（新 Pod 还没监听时探针的原话）不能把它盖成「集群
+    /// 不可达」——两条判据的修法不同，一条去查 apiserver，一条等宿主的队列。
+    #[test]
+    fn a_queued_host_is_its_own_reading_and_the_scene_cannot_override_it() {
+        let note = "1|1|1|1|1|1";
+        let scene = "cogneva-55cd8bfdff-qkpvj Running not-ready; events: Unhealthy: \
+                     Startup probe failed: Get \"http://10.42.0.99:8080/health/live\": \
+                     dial tcp 10.42.0.99:8080: connect: connection refused";
+        let msg = format!(
+            "{HOST_LOADED_MARKER}: rollout of deployment/cogneva did not complete within 300s \
+             (last: {note}{})",
+            scene_suffix(scene)
+        );
+
+        let primary = primary_message(&msg);
+        assert!(is_host_loaded(primary), "the marker survived: {msg}");
+        assert!(
+            !is_cluster_unreachable(primary),
+            "the pod's own connect refusal is not an unreachable cluster: {msg}"
+        );
+        // 判词本身仍带着现场，翻日志的人看得到这一次跑成了什么样。
+        assert!(msg.contains("connect: connection refused"), "{msg}");
     }
 }

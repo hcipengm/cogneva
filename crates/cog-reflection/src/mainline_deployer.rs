@@ -1162,6 +1162,14 @@ pub(crate) enum FailureLocus {
     AuthDenied,
     /// 镜像源没供上镜像：新副本卡在拉取上，一次都没跑起来。
     ImageSource,
+    /// 整段预算里这台宿主的运行队列一直比它本身宽：新 Pod 拿到的是排队，不是 CPU。
+    ///
+    /// 这一档与 [`FailureLocus::Placement`] 是同一句话的两个层次：那一条是调度器
+    /// 排不上（Pod 连节点都没落），这一条是 Pod 落了、容器起来了、却在抢 CPU 的
+    /// 队列里走不动。两者都只说**这台机器此刻给不出**，不是这一版的属性——判环境类、
+    /// 不回滚：宿主的负载与我们无关，退回去的旧镜像一样起不来，而留在原地的这一版
+    /// 在宿主松下来之后自己会起来（见 HOST_LOADED_MARKER）。
+    HostLoaded,
     /// 这一版**一个 Pod 都没建成**：整段预算里 `updatedReplicas` 一直是 0，看不到
     /// 任何属于新版本的现场（没有 Pod 可看等待原因、没有 RS 条件可看拒绝原因）。
     /// 控制器来不及建——旧副本还没退场、或它自己没轮到——都不是这一版的属性：
@@ -1236,11 +1244,12 @@ impl KilledReason {
 
 impl FailureLocus {
     /// 全部落点，供读回签名时校验值域用。
-    const ALL: [FailureLocus; 17] = [
+    const ALL: [FailureLocus; 18] = [
         FailureLocus::Unreachable,
         FailureLocus::Admission,
         FailureLocus::Reference,
         FailureLocus::Placement,
+        FailureLocus::HostLoaded,
         FailureLocus::Tool,
         FailureLocus::ClusterConfig,
         FailureLocus::AuthDenied,
@@ -1262,6 +1271,7 @@ impl FailureLocus {
             FailureLocus::Admission => "admission",
             FailureLocus::Reference => "reference",
             FailureLocus::Placement => "placement",
+            FailureLocus::HostLoaded => "host-loaded",
             FailureLocus::Tool => "tool",
             FailureLocus::ClusterConfig => "cluster-config",
             FailureLocus::AuthDenied => "auth",
@@ -1315,6 +1325,7 @@ impl FailureLocus {
                     | FailureLocus::Admission
                     | FailureLocus::Reference
                     | FailureLocus::Placement
+                    | FailureLocus::HostLoaded
                     | FailureLocus::Tool
                     | FailureLocus::ClusterConfig
                     | FailureLocus::ImageSource
@@ -9939,19 +9950,37 @@ mod tests {
         bundle_declared_containers, changed_configmaps, changed_workloads,
         classify_before_any_change, config_change_needs_restart, config_consumers, defined_objects,
         deployment_surges, environment_class, image_pull_blocked, is_admission_denied,
-        is_cluster_config_missing, is_image_source_unavailable, is_placement_blocked,
-        is_rollout_target, locate_before_any_change, normalize_placement_shape, parse_rollout_args,
-        pod_samples, pod_selector, pod_template_limits, pod_waiting_states, readiness_overdue,
-        replicaset_failures, rollout_converged, rollout_pods_fatal, rollout_pods_ready,
-        settle_jsonpath, stage_rollout_manifest, staged_manifest_path, summarize_events,
-        summarize_pod_states, support_pod_causes, support_pod_selector, support_settled,
-        terminating_pods, unresolved_configmaps, unschedulable_pods, write_termination_message,
-        CiHoldKind, ClusterConfigSources, ProbeCycle, RefSnapshots, ReplicaSetFailure,
+        is_cluster_config_missing, is_host_loaded, is_image_source_unavailable,
+        is_placement_blocked, is_rollout_target, locate_before_any_change,
+        normalize_placement_shape, parse_rollout_args, pod_samples, pod_selector,
+        pod_template_limits, pod_waiting_states, readiness_overdue, replicaset_failures,
+        rollout_converged, rollout_pods_fatal, rollout_pods_ready, settle_jsonpath,
+        stage_rollout_manifest, staged_manifest_path, summarize_events, summarize_pod_states,
+        support_pod_causes, support_pod_selector, support_settled, terminating_pods,
+        unresolved_configmaps, unschedulable_pods, write_termination_message, CiHoldKind,
+        ClusterConfigSources, HostRunQueue, ProbeCycle, RefSnapshots, ReplicaSetFailure,
         RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause, SupportWorkload, UpstreamCiAsk,
-        UpstreamCiTarget, ADMISSION_DENIED_MARKER, CI_PENDING_WAIT_SECS,
+        UpstreamCiTarget, ADMISSION_DENIED_MARKER, CI_PENDING_WAIT_SECS, HOST_LOADED_MARKER,
         IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG, NEW_REVISION_NEVER_RAN_MARKER,
         PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN, SUPPORT_CAUSE_POD_LIMIT,
     };
+
+    /// 用例里的宿主读数：两种，都是实测到的那一刻。
+    fn a_queued_host() -> Option<HostRunQueue> {
+        // 2026-10-28 判死那一刻：24 核上 load1 140.73。
+        Some(HostRunQueue {
+            load1: 140.73,
+            cores: 24.0,
+        })
+    }
+
+    fn a_calm_host() -> Option<HostRunQueue> {
+        // 同一张镜像成功那一次的量级：24 核上 load1 15.21。
+        Some(HostRunQueue {
+            load1: 15.21,
+            cores: 24.0,
+        })
+    }
 
     /// 盘上那一格与状态行上的那一格是同一个词，旧写法仍读得动。
     ///
@@ -11193,6 +11222,37 @@ exit 0
             FailureClass::Environment
         );
         assert_eq!(FailureLocus::ImageSource.as_str(), "image-source");
+    }
+
+    /// 宿主排队自成一类：它的判词里可能贴着「新 Pod 的端口没开」，而那正是
+    /// 版本类失败的同一种现场。标记必须先把这次超时认下来，否则一台被别处
+    /// 压满的机器会以「这一版坏」的形状回滚、并记进版本账。
+    #[test]
+    fn the_host_loaded_marker_is_its_own_class() {
+        let e = format!(
+            "{HOST_LOADED_MARKER}: rollout of deployment/x did not complete within 300s \
+             (startup phase) — the host's 1-minute run queue peaked at 140.73 against 24 cores"
+        );
+        assert!(is_host_loaded(&e));
+        assert!(!is_cluster_unreachable(&e));
+        assert!(!is_placement_blocked(&e));
+        assert!(!is_admission_denied(&e));
+        assert!(!is_observation_tool_failure(&e));
+        assert!(!is_image_source_unavailable(&e));
+        assert!(!e.contains(NEW_REVISION_NEVER_RAN_MARKER));
+        assert!(!is_host_loaded(&format!("{PLACEMENT_BLOCKED_MARKER}: x")));
+
+        // 环境类两个阶段都是：宿主的负载与这一版无关，回滚换不掉它。
+        assert_eq!(
+            FailureLocus::HostLoaded.class(false),
+            FailureClass::Environment
+        );
+        assert_eq!(
+            FailureLocus::HostLoaded.class(true),
+            FailureClass::Environment
+        );
+        assert_eq!(FailureLocus::HostLoaded.as_str(), "host-loaded");
+        assert!(FailureLocus::ALL.contains(&FailureLocus::HostLoaded));
     }
 
     /// 判定进程被杀这一档：类别口径**不变**（两个阶段都按版本类靠——容器里装的
@@ -20544,6 +20604,83 @@ exit 0
             ),
             "{err}"
         );
+    }
+
+    /// 一段没收敛的预算，宿主给过时间与没给过时间必须分开处置。
+    ///
+    /// 宿主的负载不是这一版的属性：整段都在排队时，回滚既救不回它（旧镜像一样
+    /// 排不上），又会把一台机器别人的负载记成代码缺陷；而留在原地的这一版在宿主
+    /// 松下来之后自己会起来。
+    #[tokio::test]
+    async fn a_budget_spent_queued_on_a_loaded_host_says_nothing_about_the_revision() {
+        let (tmp, kubectl, plan) = never_converging_rollout();
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 0, 1, 0, 300)
+            .with_host_run_queue(a_queued_host);
+
+        let err = executor.run(&plan).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains(HOST_LOADED_MARKER), "{msg}");
+        // 判词里带着读数与占比，翻日志的人不必再去查监控。
+        assert!(msg.contains("140.73"), "{msg}");
+        assert!(msg.contains("cores"), "{msg}");
+        assert_eq!(err.class, FailureClass::Environment);
+        assert!(err.signature.contains("host-loaded"), "{}", err.signature);
+        let calls = std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap();
+        // 回滚那一笔就是「set image …=main-old」；new 那一笔是正向 apply，两回事。
+        assert!(
+            !calls.contains("sandbox-executor=localhost:30500/cogneva:main-old"),
+            "a budget spent queued must not roll the revision back: {calls}"
+        );
+    }
+
+    /// 反面：同样的清单、同样的预算，宿主安静时这条超时仍然是这一版的结论——
+    /// 不加这一半，上面那条判据会把所有起不来的版本都读成「机器忙」。
+    #[tokio::test]
+    async fn the_same_budget_on_a_calm_host_is_still_a_verdict_about_the_revision() {
+        let (tmp, kubectl, plan) = never_converging_rollout();
+        let executor =
+            RolloutExecutor::new(kubectl, "cogneva", 0, 1, 0, 300).with_host_run_queue(a_calm_host);
+
+        let err = executor.run(&plan).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains(HOST_LOADED_MARKER), "{msg}");
+        assert_eq!(err.class, FailureClass::Version);
+        let calls = std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap();
+        assert!(
+            calls.contains("sandbox-executor=localhost:30500/cogneva:main-old"),
+            "a revision that did not come up on a quiet host must be rolled back: {calls}"
+        );
+    }
+
+    /// 一份永远不收敛的滚动：新 Pod 建出来了、一直没 ready、不在任何致命等待态。
+    /// 端点由用例自己换（宿主读数、预算），这份夹具只负责把判词逼到「通用超时」
+    /// 那一条出口上。
+    fn never_converging_rollout() -> (tempfile::TempDir, String, RolloutPlan) {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"initContainers"*) ;;
+  *"generation"*) echo "1|1|1|1|0|1" ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let kubectl = bin_dir.join("fake-kubectl").to_string_lossy().to_string();
+        (
+            tmp,
+            kubectl,
+            sandbox_executor_plan("localhost:30500/cogneva:main-new"),
+        )
     }
 
     /// init 容器拉不到镜像时主容器只报 PodInitializing：这一档必须能读到（判据
