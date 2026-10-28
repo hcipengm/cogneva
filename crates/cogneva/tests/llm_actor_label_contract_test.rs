@@ -31,7 +31,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::all_crate_files;
+use common::rust_production::{all_crate_files, production_text};
 
 use cog_gateway::actor_labels::{declared, ACTOR_LABELS, ACTOR_LABEL_PREFIXES, UNKNOWN_ACTOR};
 
@@ -121,21 +121,6 @@ enum Site {
     /// An expression the census cannot evaluate; its file has to be in
     /// `THREADED`.
     Unresolved(String),
-}
-
-/// The file's text up to its first `#[cfg(test)]` item.
-///
-/// A unit-test fixture builds a request with the actor header to exercise the
-/// reader, and it names the actor it is testing with. Counting that as a writer
-/// would put the production file into the inventory of writers on the strength
-/// of its own tests, and the inventory's question -- who stamps an actor onto a
-/// real call -- would be answered with a file that only reads the header.
-/// Integration tests under `tests/` carry no such attribute and are read whole.
-fn without_test_items(text: &str) -> &str {
-    match text.find("#[cfg(test)]") {
-        Some(at) => &text[..at],
-        None => text,
-    }
 }
 
 /// Every site in one file's text that writes an actor value.
@@ -249,10 +234,14 @@ fn census(root: &Path) -> BTreeMap<String, Vec<Site>> {
         if EXCLUDED.iter().any(|(path, _)| *path == rel) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&file) else {
-            continue;
-        };
-        let sites = sites_in(without_test_items(&text));
+        // 读不出来就 panic：一个读不到的文件与「这个文件里没有写 actor 的调用点」
+        // 在这张名单上是同一件事，而这张名单的结论正是「谁写了 actor」。
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", file.display()));
+        // 产出面（用例体与 `#[cfg(test)]` 项都去掉）由 `common::rust_production` 一处算：
+        // 自己切「第一处 `#[cfg(test)]` 之前」会漏掉文件中间那个 test-only 项之后的全部产出，
+        // 而「那里没有写 actor 的调用点」与「那块文件没读」在这张名单上是同一件事。
+        let sites = sites_in(&production_text(&text));
         if !sites.is_empty() {
             found.insert(rel, sites);
         }

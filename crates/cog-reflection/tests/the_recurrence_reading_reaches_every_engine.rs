@@ -41,17 +41,14 @@ mod root;
 
 use root::repo_root;
 
-/// Everything up to the first test-only item. Occurrences inside test modules
-/// are fixtures, not the plugin's production wiring.
-fn production_source(text: &str) -> &str {
-    let cut = text
-        .match_indices("#[cfg(test)]")
-        .chain(text.match_indices("mod tests"))
-        .map(|(i, _)| i)
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
-}
+/// The production cut is the same one every other gate uses. Writing it out again
+/// here is a second answer: this copy stops at the first `#[cfg(test)]` anywhere,
+/// so one test-only item in the middle of a file silently drops every production
+/// line after it -- and "nothing there" then reads like "nothing wrong".
+#[path = "../../cogneva/tests/common/rust_production.rs"]
+mod rust_production;
+
+use rust_production::production_text;
 
 /// The argument text of the `nth` call to `call` in `source`: everything between
 /// its opening parenthesis and the one that closes it.
@@ -90,7 +87,7 @@ fn call_args(source: &str, call: &str, nth: usize) -> Option<String> {
 fn plugin_production() -> String {
     let path = repo_root().join(PLUGIN);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{PLUGIN}: {e}"));
-    production_source(&text).to_owned()
+    production_text(&text)
 }
 
 /// The plugin builds its engine on one of two branches and the deployment picks

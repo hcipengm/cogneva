@@ -3052,6 +3052,7 @@ fn names_same_or_nested(target: &str, anchor: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rust_production::production_text;
 
     use crate::checkout::repo_root;
 
@@ -3064,11 +3065,10 @@ mod tests {
     fn the_one_change_wall_counts_every_call_site_it_names() {
         const PIPELINE: &str = include_str!("change_pipeline.rs");
         const DEPLOYER: &str = include_str!("evolution_deployer.rs");
-        // 只看 `#[cfg(test)]` 之前那一段：这个测试自己的源码里也写着下面这些
-        // 模式串，整份数会把测试自己数进去。本文件的测试模块在文件末尾。
-        let before_tests = |src: &'static str| src.split("#[cfg(test)]").next().unwrap_or(src);
-        let pipeline = before_tests(PIPELINE);
-        let deployer = before_tests(DEPLOYER);
+        // 只看产出那一段：这个测试自己的源码里也写着下面这些模式串，整份数会把
+        // 测试自己数进去。边界由共享算法算，不按「第一处 `#[cfg(test)]`」切。
+        let pipeline = production_text(PIPELINE);
+        let deployer = production_text(DEPLOYER);
 
         // 每条 gated 命令**函数**里恰好一次 acquire：测试与 clippy 两条在流水线里，
         // 发布构建一条在部署器里。

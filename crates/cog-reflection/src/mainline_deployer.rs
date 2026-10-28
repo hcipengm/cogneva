@@ -9960,6 +9960,7 @@ impl ConfigConsumer {
 mod tests {
     use super::*;
     use crate::checkout::repo_root;
+    use crate::rust_production::production_text;
 
     // 滚动侧已搬去 `mainline_rollout`：本模块的用例仍直接调它们，所以只在测试面
     // 把它们带进来。产出面两个模块互不调用这一点不为此放宽——这里带进来的每一项，
@@ -25805,10 +25806,7 @@ exit 0
     /// 在这里红。
     #[test]
     fn every_buildah_call_takes_its_wall_from_the_table() {
-        let production = include_str!("mainline_deployer.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("the file has a production half");
+        let production = production_text(include_str!("mainline_deployer.rs"));
 
         // 唯一的 `self.buildah(` 就是包装自己那一跳。
         assert_eq!(

@@ -408,6 +408,54 @@ pub fn brace_delta(line: &str) -> i32 {
 /// which is the one failure a gate cannot have, because "I never looked there"
 /// and "I looked and found nothing" are the same reading.
 pub fn production_lines(text: &str) -> Vec<&str> {
+    production_numbered_lines(text)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect()
+}
+
+/// The production half with its comments left in.
+///
+/// Same boundary, one projection different: a gate that reads a marker out of a
+/// comment (to find the branch the comment sits above) cannot use the
+/// comment-stripped projection, because the marker is simply gone -- and the
+/// failure reads as "the branch is gone". Keeping both projections here means
+/// the boundary is still computed once: a caller picks what it reads, never
+/// where the test half starts.
+pub fn production_lines_keeping_comments(text: &str) -> Vec<&str> {
+    production_numbered_impl(text, true)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect()
+}
+
+/// One flag per line: true when that line is production.
+///
+/// The projection for a caller that blanks the test half in place instead of
+/// dropping it -- dropping shifts every offset after the first cut, and a gate
+/// that reads a byte offset cannot use a shorter text.
+pub fn production_line_mask(text: &str) -> Vec<bool> {
+    let total = text.lines().count();
+    let mut mask = vec![false; total];
+    for (number, _) in production_numbered_impl(text, true) {
+        if let Some(slot) = mask.get_mut(number - 1) {
+            *slot = true;
+        }
+    }
+    mask
+}
+
+/// The production half with the file's own line numbers kept.
+///
+/// A gate that reports `file:line` cannot use a filtered list: dropping a line
+/// renumbers everything after it and the finding points at the wrong statement.
+/// Same boundary as [`production_lines`], only the projection differs -- the
+/// caller picks what it reads, never where the test half starts.
+pub fn production_numbered_lines(text: &str) -> Vec<(usize, &str)> {
+    production_numbered_impl(text, false)
+}
+
+fn production_numbered_impl(text: &str, keep_comments: bool) -> Vec<(usize, &str)> {
     let lines: Vec<&str> = text.lines().collect();
     let shapes = brace_shapes(text);
     let mut out = Vec::new();
@@ -438,10 +486,10 @@ pub fn production_lines(text: &str) -> Vec<&str> {
                 skipping = Some((0, false));
                 waiting = 0;
             } else {
-                if trimmed.starts_with("//") {
+                if trimmed.starts_with("//") && !keep_comments {
                     continue;
                 }
-                out.push(line);
+                out.push((index + 1, line));
                 continue;
             }
         }
@@ -478,6 +526,11 @@ pub fn production_lines(text: &str) -> Vec<&str> {
 /// between, which is the point.
 pub fn production_text(text: &str) -> String {
     production_lines(text).join("\n")
+}
+
+/// The production half of one file, comments included, joined back into text.
+pub fn production_text_keeping_comments(text: &str) -> String {
+    production_lines_keeping_comments(text).join("\n")
 }
 
 #[cfg(test)]
@@ -639,5 +692,31 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 文件中间的一个 `#[cfg(test)]` 项不许把后面的产出整段截掉。
+    ///
+    /// 这是这条切口唯一会**静默**错的方式：按「第一处 `#[cfg(test)]` 之前」切的人
+    /// 看不见后面那一段，而「没读到」与「那里什么都没有」在判词上是同一句话。实际
+    /// 发生过：`mainline_rollout.rs` 里一个只给用例换读数来源的 setter 带着
+    /// `#[cfg(test)]`，切在它那里就把两千行产出丢掉，三处调用点一处都读不到。
+    #[test]
+    fn a_test_only_item_in_the_middle_does_not_truncate_the_tail() {
+        let source = "impl Thing {\n    #[cfg(test)]\n    fn tweak(&mut self) {\n        self.x = 1;\n    }\n\n    fn real_work(&self) {\n        call_me();\n    }\n}\n";
+        let production = production_text(source);
+        assert!(
+            production.contains("fn real_work"),
+            "门装的 setter 之后的产出被整段丢掉了：{production}"
+        );
+        assert!(
+            !production.contains("fn tweak"),
+            "被 `#[cfg(test)]` 装点的项本身仍然算进了产出面：{production}"
+        );
+        // 注释是另一条独立的投影：要读注释里那句话的人用它，边界仍是同一个。
+        let with_comments = production_text_keeping_comments(source);
+        assert!(
+            with_comments.contains("fn real_work") && !with_comments.contains("fn tweak"),
+            "保留注释的那一版边界变了：{with_comments}"
+        );
     }
 }

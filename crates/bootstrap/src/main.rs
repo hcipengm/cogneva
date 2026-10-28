@@ -4754,8 +4754,20 @@ mod helm_delivery_single_writer_tests {
     }
 }
 
+// 产出面的边界（用例体与被 `#[cfg(test)]` 装点的项都去掉）只由这一份算法算。
+// 自己按「第一处 `#[cfg(test)]` 之前」切，会在文件中间有一个 test-only 项时把
+// 它之后的全部产出丢掉——「那里没有」与「那里没读」在判词上是同一句话。
+//
+// 挂在本文件顶层、而不是挂进下面的测试模块：`#[path]` 写在内联模块块里时按
+// 「本文件的目录 ＋ 内联模块名」解析，而 `src/<模块名>/` 这条虚拟路径上的中间
+// 目录并不存在，往上退几级就取不到文件。
+#[cfg(test)]
+#[path = "../../cogneva/tests/common/rust_production.rs"]
+mod rust_production;
+
 #[cfg(test)]
 mod key_value_literal_tests {
+    use super::rust_production::production_text;
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
 
@@ -4780,11 +4792,8 @@ mod key_value_literal_tests {
                 continue;
             }
             let text = std::fs::read_to_string(&path).expect("read source");
-            // 测试夹具不在判据里：它们按定义是造场景，不是约定。
-            let text = match text.find("#[cfg(test)]") {
-                Some(at) => text[..at].to_string(),
-                None => text,
-            };
+            // 测试夹具不在判据里：它们按定义是造场景，不是约定。边界由共享算法算。
+            let text = production_text(&text);
             let name = path
                 .file_name()
                 .unwrap_or_default()

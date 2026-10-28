@@ -42,21 +42,18 @@ mod root;
 
 use root::repo_root;
 
+/// The production cut is the same one every other gate uses. Writing it out again
+/// here is a second answer: this copy stops at the first `#[cfg(test)]` anywhere,
+/// so one test-only item in the middle of a file silently drops every production
+/// line after it -- and "nothing there" then reads like "nothing wrong".
+#[path = "../../cogneva/tests/common/rust_production.rs"]
+mod rust_production;
+
+use rust_production::production_text_keeping_comments;
+
 fn plugin_source() -> String {
     let path = repo_root().join(PLUGIN);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
-}
-
-/// Everything up to the first test-only item: occurrences inside test modules
-/// are fixtures, not the plugin's production wiring.
-fn production_source(text: &str) -> &str {
-    let cut = text
-        .match_indices("#[cfg(test)]")
-        .chain(text.match_indices("mod tests"))
-        .map(|(i, _)| i)
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
 }
 
 /// The body of the function whose signature starts with `signature`, cut at the
@@ -77,7 +74,7 @@ fn fn_body(source: &str, signature: &str) -> String {
 #[test]
 fn the_loop_no_longer_takes_its_ownership_from_the_change_executor_flag() {
     let source = plugin_source();
-    let body = fn_body(production_source(&source), LOOP_FN);
+    let body = fn_body(&production_text_keeping_comments(&source), LOOP_FN);
 
     // 形参里不许再有那个布尔：留着它就等于留着「谁执行变更」这道门。
     let signature = body
@@ -102,7 +99,7 @@ fn the_signal_watcher_still_takes_its_ownership_from_the_change_executor_flag() 
     // 负对照。上面那条一旦被读成「把这个开关删掉」，这一格会红：signal watcher
     // 提交的是**变更执行**意图，它的属主本来就该是 executor_enabled。
     let source = plugin_source();
-    let production = production_source(&source);
+    let production = production_text_keeping_comments(&source);
 
     assert!(
         production.contains(&format!("let {FLAG_LOCAL} = ctx.config().{EXECUTOR_FLAG};")),
@@ -129,8 +126,8 @@ fn the_signal_watcher_still_takes_its_ownership_from_the_change_executor_flag() 
 #[test]
 fn the_loop_holds_a_role_and_asks_it_every_round() {
     let source = plugin_source();
-    let production = production_source(&source);
-    let body = fn_body(production, LOOP_FN);
+    let production = production_text_keeping_comments(&source);
+    let body = fn_body(&production, LOOP_FN);
 
     assert!(
         production.contains(ROLE_HOLD),
@@ -160,7 +157,7 @@ fn the_loop_holds_a_role_and_asks_it_every_round() {
 #[test]
 fn a_held_round_is_readable_and_its_stretch_has_an_end() {
     let source = plugin_source();
-    let body = fn_body(production_source(&source), LOOP_FN);
+    let body = fn_body(&production_text_keeping_comments(&source), LOOP_FN);
 
     for message in [
         "discovery round held off: the LLM pool gate is closed",
@@ -221,7 +218,7 @@ fn a_held_round_is_readable_and_its_stretch_has_an_end() {
 #[test]
 fn a_closed_pool_gate_releases_the_role_instead_of_holding_through_it() {
     let source = plugin_source();
-    let body = fn_body(production_source(&source), LOOP_FN);
+    let body = fn_body(&production_text_keeping_comments(&source), LOOP_FN);
 
     let gate = body
         .find("pool_gate.llm_paused()")
@@ -267,7 +264,7 @@ fn a_closed_pool_gate_releases_the_role_instead_of_holding_through_it() {
 #[test]
 fn the_rounds_beat_is_not_behind_either_gate() {
     let source = plugin_source();
-    let body = fn_body(production_source(&source), LOOP_FN);
+    let body = fn_body(&production_text_keeping_comments(&source), LOOP_FN);
 
     let loop_at = body
         .find("loop {")

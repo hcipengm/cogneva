@@ -31,6 +31,10 @@
 mod common;
 
 use common::routes::repo_root;
+// 产出面去掉用例那一半，规则只有 `common::rust_production` 一处：自己切
+// 「第一处 `#[cfg(test)]`」在文件中间有一个 test-only 项时会把后面的产出整段
+// 丢掉——那时「没有这条路径」与「没读到这块文件」是同一句判词。
+use common::rust_production::production_text;
 
 use cog_core::TaskStatus;
 use std::path::Path;
@@ -108,18 +112,6 @@ const REVISITED: &[Revisited] = &[
     },
 ];
 
-/// Everything up to the first test-only item: a call inside a test module is not
-/// production reachability.
-fn production_source(text: &str) -> &str {
-    let cut = text
-        .match_indices("#[cfg(test)]")
-        .chain(text.match_indices("mod tests"))
-        .map(|(i, _)| i)
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
-}
-
 /// Whether this source defines `name` as a function.
 fn defines(production: &str, name: &str) -> bool {
     production.contains(&format!("fn {name}("))
@@ -160,7 +152,7 @@ fn the_scan_reads_what_it_claims_to() {
     assert!(calls("dag.find_ready_tasks().await", "find_ready_tasks"));
     // A call in a test module is not production reachability.
     assert!(!calls(
-        production_source("fn f() {}\nmod tests { fn t() { dag.find_ready_tasks().await; } }"),
+        &production_text("fn f() {}\nmod tests { fn t() { dag.find_ready_tasks().await; } }"),
         "find_ready_tasks"
     ));
 
@@ -168,7 +160,7 @@ fn the_scan_reads_what_it_claims_to() {
     for row in REVISITED {
         let def = source_at(&root, row.defined_in);
         assert!(
-            defines(production_source(&def), row.reviser),
+            defines(&production_text(&def), row.reviser),
             "{}: no `fn {}` here, so nothing revisits `{}` any more",
             row.defined_in,
             row.reviser,
@@ -176,7 +168,7 @@ fn the_scan_reads_what_it_claims_to() {
         );
         let caller = source_at(&root, row.called_from);
         assert!(
-            calls(production_source(&caller), row.reviser),
+            calls(&production_text(&caller), row.reviser),
             "{} does not call {} outside of tests, so `{}` is left with no reviser in \
              production",
             row.called_from,
@@ -201,7 +193,7 @@ fn pending_rows_a_settled_predecessor_can_never_release_have_an_owner() {
         &root,
         "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",
     );
-    let production = production_source(&definitions);
+    let production = production_text(&definitions);
     // `defines` looks for `fn name(`; a generic function writes `fn name<`, so
     // this check allows both rather than forcing a signature change onto the
     // production code for the sake of the scan.
@@ -217,7 +209,7 @@ fn pending_rows_a_settled_predecessor_can_never_release_have_an_owner() {
     }
     let caller = source_at(&root, "crates/cog-orchestrator/src/plugin.rs");
     assert!(
-        calls(production_source(&caller), "reclaim_unblockable_dependents"),
+        calls(&production_text(&caller), "reclaim_unblockable_dependents"),
         "plugin.rs does not call reclaim_unblockable_dependents outside of tests, so the \
          rows a settled predecessor can never release rest in Pending forever"
     );

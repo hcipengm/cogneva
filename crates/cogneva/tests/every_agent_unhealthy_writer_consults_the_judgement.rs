@@ -61,7 +61,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{production_sources, relative_name};
+use common::rust_production::{production_numbered_lines, production_sources, relative_name};
 
 /// Every production site that constructs `SupervisorEvent::AgentUnhealthy`,
 /// as `path::enclosing_function`.
@@ -77,25 +77,6 @@ const DECLARED_WRITERS: &[&str] = &[
 /// The one function that decides whether a verdict is news. A file that writes
 /// the event without ever naming it is writing without asking.
 const JUDGEMENT: &str = "announces(";
-
-/// The lines before this file's first `#[cfg(test)]`, which is where test
-/// fixtures start. Test modules built with `#[path]` or a separate file have no
-/// marker here, so their fixtures are not counted either.
-///
-/// Deliberately not the shared `production_lines`: this one keeps every line it
-/// keeps, in order, because the callers look up the index a construction sits on
-/// to name the function around it. The shared cut drops comment lines, which
-/// would shift those indices and rename the function a finding points at.
-fn lines_before_fixtures(source: &str) -> Vec<&str> {
-    let mut lines: Vec<&str> = Vec::new();
-    for line in source.lines() {
-        if line.trim_start().starts_with("#[cfg(test)]") {
-            break;
-        }
-        lines.push(line);
-    }
-    lines
-}
 
 /// The nearest function above `line_index`, which is where the construction
 /// sits. `None` if the line is not inside one.
@@ -129,7 +110,12 @@ fn writers_in(path: &Path) -> Vec<String> {
         Ok(s) => s,
         Err(e) => panic!("{} unreadable: {e}", path.display()),
     };
-    let lines = lines_before_fixtures(&source);
+    // 边界由共享扫描器算：它按**项**跳过测试，而不是在第一个标记处截断——
+    // 文件中间的一个 test-only 项后面还有产出，截在那里就把那一段判成「没有」。
+    let lines: Vec<&str> = production_numbered_lines(&source)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect();
     let mut sites = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         // Only the qualified form is a construction. The variant's own
@@ -199,7 +185,11 @@ fn a_file_that_writes_the_event_also_asks_whether_it_may_announce() {
         }
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        let production = lines_before_fixtures(&source).join("\n");
+        let production = production_numbered_lines(&source)
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
         if !production.contains(JUDGEMENT) {
             ungated.push(relative_name(&repo_root(), &path));
         }

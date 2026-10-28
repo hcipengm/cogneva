@@ -49,6 +49,7 @@ pub fn container_image(output: &str, deployment: &str, container: &str) -> SFRes
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rust_production::production_text;
     use std::path::Path;
 
     /// 普查的覆盖率下限：少于这么多源文件，这把尺子就没量到东西。
@@ -114,8 +115,9 @@ mod tests {
 
     /// 生产代码里这句话只许出现一次：任何一处再抄一遍，就是第二份会各自漂的约定。
     ///
-    /// 判不了什么：文件里 `#[cfg(test)]` 之后的代码不读（测试自己会写这句话来造
-    /// 标本），所以判据的上限是「生产代码里一处」。
+    /// 判不了什么：用例那一半不读（测试自己会写这句话来造标本），所以判据的上限是
+    /// 「生产代码里一处」。切在哪儿由共享切口算，不按「第一处 `#[cfg(test)]`」切——
+    /// 那条更弱的规则会在文件中间有 test-only 项时把后面全部产出算成用例。
     #[test]
     fn the_question_is_written_once() {
         let needle = "containers[?(@.name==";
@@ -213,10 +215,7 @@ mod tests {
         sites: &mut Vec<String>,
     ) {
         files.push(name.to_string());
-        let production = match text.find("#[cfg(test)]") {
-            Some(at) => &text[..at],
-            None => text,
-        };
+        let production = production_text(text);
         if production.contains(needle) {
             sites.push(name.to_string());
         }

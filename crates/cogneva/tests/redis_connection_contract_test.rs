@@ -39,6 +39,10 @@
 mod common;
 
 use common::routes::repo_root;
+// 产出面（去掉用例体与 `#[cfg(test)]` 项）只有一处算法，不在这里再写一份：
+// 自己切「第一处 `#[cfg(test)]`」在文件中间有一个 test-only 项时会把后面的产出
+// 整段丢掉，那时「没有这条路径」与「没读到这块文件」是同一句判词。
+use common::rust_production::production_text;
 
 use common::rust_production::{relative_name, src_and_test_sources};
 
@@ -80,18 +84,6 @@ const SUBSCRIBER_BLOCK_BASE: &str = concat!("read_block_ms.max(self.", "resume_b
 /// The rule, as a pure function of one file's text.
 fn read_deadline_clears_the_block(source: &str) -> bool {
     source.contains(SUBSCRIBER_DEADLINE) && source.contains(SUBSCRIBER_BLOCK_BASE)
-}
-
-/// Everything up to the first test-only item, for the rule that is about
-/// production code.
-fn production_source(text: &str) -> &str {
-    let cut = text
-        .match_indices("#[cfg(test)]")
-        .chain(text.match_indices("mod tests"))
-        .map(|(i, _)| i)
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
 }
 
 /// The bare-type rule, as a pure function of one source file's text.
@@ -148,7 +140,7 @@ fn the_detectors_see_both_shapes_and_leave_the_other_ones_alone() {
     )));
     // The cut stops at the test module, so a fixture inside a production file is
     // not a finding.
-    assert!(!holds_a_bare_connection(production_source(concat!(
+    assert!(!holds_a_bare_connection(&production_text(concat!(
         "let conn = make();\n#[cfg(test)]\nmod tests { fn f(c: Multiplexed",
         "Connection) {} }"
     ))));
@@ -198,7 +190,7 @@ fn the_subscriber_connection_bounds_a_read_by_its_own_block_period() {
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{SUBSCRIBER_FILE} unreadable: {e}"));
     assert!(
-        read_deadline_clears_the_block(production_source(&text)),
+        read_deadline_clears_the_block(&production_text(&text)),
         "{SUBSCRIBER_FILE} no longer widens its connection's response deadline past the \
          block period it reads with. A read that blocks is answered at the end of that \
          period; a deadline at or below it turns every idle read into a counted refusal \
@@ -233,7 +225,7 @@ fn no_production_source_holds_a_bare_multiplexed_connection() {
         if is_integration_test(&relative) {
             continue;
         }
-        if holds_a_bare_connection(production_source(&text)) {
+        if holds_a_bare_connection(&production_text(&text)) {
             bare.push(relative);
         }
     }

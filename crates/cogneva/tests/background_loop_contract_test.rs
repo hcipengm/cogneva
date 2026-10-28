@@ -37,6 +37,10 @@
 mod common;
 
 use common::routes::repo_root;
+// 产出面（去掉用例体与 `#[cfg(test)]` 项）只有一处算法，不在这里再写一份：
+// 自己切「第一处 `#[cfg(test)]`」在文件中间有一个 test-only 项时会把后面的产出
+// 整段丢掉，那时「没有这条路径」与「没读到这块文件」是同一句判词。
+use common::rust_production::production_text;
 
 use common::rust_production::{relative_name, src_and_test_sources};
 
@@ -89,18 +93,6 @@ const NOT_REGISTERED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Everything up to the first test-only item: fixtures are short-lived by
-/// construction, so a ticker inside one is not a loop of the process.
-fn production_source(text: &str) -> &str {
-    let cut = text
-        .match_indices("#[cfg(test)]")
-        .chain(text.match_indices("mod tests"))
-        .map(|(i, _)| i)
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
-}
-
 /// Whether this source starts cadence-driven work.
 fn starts_cadence_driven_work(production: &str) -> bool {
     production.contains(MARKER)
@@ -114,9 +106,9 @@ fn registers_a_loop(production: &str) -> bool {
 /// Whether this file starts work that nothing can observe: cadence-driven, not
 /// registered, and not exempted with a reason.
 fn is_unobservable_work(relative: &str, text: &str) -> bool {
-    let production = production_source(text);
-    starts_cadence_driven_work(production)
-        && !registers_a_loop(production)
+    let production = production_text(text);
+    starts_cadence_driven_work(&production)
+        && !registers_a_loop(&production)
         && !NOT_REGISTERED.iter().any(|(path, _)| *path == relative)
 }
 
@@ -161,7 +153,7 @@ fn the_scan_sees_the_work_and_the_registrations() {
     )));
     // A ticker inside a test module is not a loop of the process: the cut has to
     // hide it from the rule.
-    assert!(!starts_cadence_driven_work(production_source(concat!(
+    assert!(!starts_cadence_driven_work(&production_text(concat!(
         "fn f() {}\n#[cfg(test)]\nmod tests { fn g() { let mut t = tokio::time::",
         "interval(d); } }"
     ))));
@@ -215,7 +207,7 @@ fn every_cadence_driven_file_is_registered_or_listed_with_a_reason() {
     let mut unlisted = Vec::new();
     let mut registered = 0usize;
     for (relative, text) in scan() {
-        if registers_a_loop(production_source(&text)) {
+        if registers_a_loop(&production_text(&text)) {
             registered += 1;
             continue;
         }
@@ -244,13 +236,13 @@ fn every_exemption_is_current_and_says_what_kind_it_is() {
         let Some((_, text)) = sources.iter().find(|(p, _)| p == path) else {
             panic!("{path} is exempted from the loop gate but does not exist; remove the entry");
         };
-        let production = production_source(text);
+        let production = production_text(text);
         assert!(
-            starts_cadence_driven_work(production),
+            starts_cadence_driven_work(&production),
             "{path} is exempted but no longer starts cadence-driven work; remove the entry"
         );
         assert!(
-            !registers_a_loop(production),
+            !registers_a_loop(&production),
             "{path} is exempted but now registers its loop; remove the entry"
         );
         let (kind, why) = reason.split_once(':').unwrap_or_else(|| {
@@ -275,7 +267,7 @@ fn every_registration_names_a_declared_loop() {
     let mut names: Vec<(String, String)> = Vec::new();
     let mut anonymous = Vec::new();
     for (relative, text) in scan() {
-        let production = production_source(&text);
+        let production = &production_text(&text);
         for marker in REGISTRATIONS {
             let mut from = 0usize;
             while let Some(offset) = production[from..].find(marker) {

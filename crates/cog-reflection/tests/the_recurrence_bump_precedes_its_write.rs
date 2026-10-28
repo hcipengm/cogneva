@@ -21,7 +21,7 @@ use std::path::PathBuf;
 #[path = "../../cogneva/tests/common/rust_production.rs"]
 mod rust_production;
 
-use rust_production::{production_sources, relative_name};
+use rust_production::{production_numbered_lines, production_sources, relative_name};
 
 /// The statement that must never follow `record_learning`.
 const BUMP: &str = "update_recurrence(";
@@ -48,24 +48,6 @@ fn source_files() -> Vec<PathBuf> {
         .collect()
 }
 
-/// Everything up to the first test-only item. A fixture that stores a learning
-/// and bumps it in a different order is not a call site the engine runs.
-///
-/// Not the shared `production_text`: that one drops comment lines and fixture
-/// items, which shifts every line number after the first one -- and this gate
-/// reports `file:line`, so a finding would point at the wrong statement. A slice
-/// keeps the numbering, so the two cannot share, and the name says which one
-/// this is.
-fn up_to_the_first_fixture(text: &str) -> &str {
-    let cut = text
-        .match_indices("#[cfg(test)]")
-        .chain(text.match_indices("mod tests"))
-        .map(|(i, _)| i)
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
-}
-
 /// The 1-based line numbers where a `record_learning` call is immediately
 /// followed by an `update_recurrence` call -- the order that drops the bump.
 ///
@@ -73,11 +55,14 @@ fn up_to_the_first_fixture(text: &str) -> &str {
 /// invariant names both calls, and pairing off a doc comment would make every
 /// correctly written site look like a defect.
 fn bump_after_write_lines(text: &str) -> Vec<usize> {
-    let code: Vec<(usize, &str)> = up_to_the_first_fixture(text)
-        .lines()
-        .enumerate()
-        .map(|(i, line)| (i + 1, line.trim()))
-        .filter(|(_, line)| !line.is_empty() && !line.starts_with("//"))
+    // The boundary and both projections come from the shared scanner: it keeps
+    // the file's own line numbers (this gate reports `file:line`, so a filtered
+    // list would point at the wrong statement) and drops fixture items wherever
+    // they sit, not only after the last one.
+    let code: Vec<(usize, &str)> = production_numbered_lines(text)
+        .into_iter()
+        .map(|(no, line)| (no, line.trim()))
+        .filter(|(_, line)| !line.is_empty())
         .collect();
 
     let mut offenders = Vec::new();

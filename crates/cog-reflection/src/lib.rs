@@ -2508,3 +2508,10 @@ mod tests {
 #[cfg(test)]
 #[path = "../../cogneva/tests/common/root.rs"]
 pub(crate) mod checkout;
+
+///
+/// 产出面那条切口同理：`src/` 里的单测要问「这一半是不是会随产物跑」，而它只该
+/// 有一份实现。
+#[cfg(test)]
+#[path = "../../cogneva/tests/common/rust_production.rs"]
+pub(crate) mod rust_production;

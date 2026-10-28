@@ -37,7 +37,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{production_sources, relative_name};
+use common::rust_production::{production_line_mask, production_sources, relative_name};
 
 /// A call that writes rows into a namespace, and the argument positions that
 /// name it. `upsert` carries the namespace second because it takes the store
@@ -210,39 +210,22 @@ fn blank_comments(src: &str) -> String {
 /// in would let a fixture stand in as the producer for a production read, which
 /// is the very pairing this gate is about.
 fn production_code(src: &str) -> String {
-    let chars: Vec<char> = blank_comments(src).chars().collect();
-    let mut out = chars.clone();
-    let mut search = 0;
-    while let Some(pos) = find_from(&chars, "#[cfg(test)]", search) {
-        let mut i = pos + "#[cfg(test)]".chars().count();
-        let mut depth = 0i32;
-        let mut end = chars.len().saturating_sub(1);
-        while i < chars.len() {
-            match chars[i] {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = i;
-                        break;
-                    }
-                }
-                ';' if depth == 0 => {
-                    end = i;
-                    break;
-                }
-                _ => {}
-            }
-            i += 1;
-        }
-        for slot in out.iter_mut().take(end + 1).skip(pos) {
-            if *slot != '\n' {
-                *slot = ' ';
+    // 哪一行是产出由共享扫描器算（`production_line_mask`）：它按**项**跳过测试，
+    // 而不是在第一个标记处截断——文件中间的一个 test-only 项后面还有产出，截在
+    // 那里就把那一段判成「没有」。这里只是把非产出的行原地涂白，保留偏移。
+    let blanked = blank_comments(src);
+    let mask = production_line_mask(src);
+    let mut out = String::with_capacity(blanked.len());
+    for (index, segment) in blanked.split_inclusive('\n').enumerate() {
+        if mask.get(index).copied().unwrap_or(true) {
+            out.push_str(segment);
+        } else {
+            for c in segment.chars() {
+                out.push(if c == '\n' || c == '\r' { c } else { ' ' });
             }
         }
-        search = end + 1;
     }
-    out.into_iter().collect()
+    out
 }
 
 /// The text between the parentheses of the call opening at `open`.

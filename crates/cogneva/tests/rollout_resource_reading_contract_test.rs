@@ -15,6 +15,7 @@
 mod common;
 
 use common::routes::repo_root;
+use common::rust_production::production_text;
 
 const DEPLOYER: &str = "crates/cog-reflection/src/mainline_deployer.rs";
 const ROLLOUT: &str = "crates/cog-reflection/src/mainline_rollout.rs";
@@ -25,17 +26,13 @@ fn read(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
 }
 
-/// 第一处 `#[cfg(test)]` 之前的部分：测试自己可以随便写结论，它不是产出点。
-fn production_source(text: &str) -> &str {
-    let cut = text
-        .match_indices("#[cfg(test)]")
-        .chain(text.match_indices("mod tests"))
-        .map(|(i, _)| i)
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
-}
-
+/// 产出面由 `common::rust_production` 一处算，不在这里再写一遍。
+///
+/// 这里原先自己切「第一处 `#[cfg(test)]` 之前」——那是一份**更弱**的规则：它假设
+/// 测试全在文件末尾。`mainline_rollout.rs` 里有一个 `#[cfg(test)]` 装点的 setter
+/// 在文件三分之一处（只给用例换宿主队列读数来源），于是这条切口把后面两千多行
+/// 产出整段丢掉：三处 `report_termination_message(` 一处都读不到，判词却说
+/// 「结束的两种结局都留读数」——没读与没问题在读数上是同一句话。
 fn occurrences(haystack: &str, needle: &str) -> usize {
     haystack.matches(needle).count()
 }
@@ -45,9 +42,9 @@ fn occurrences(haystack: &str, needle: &str) -> usize {
 #[test]
 fn the_judgement_leaves_its_reading_on_the_way_out_of_both_outcomes() {
     let source = read(ROLLOUT);
-    let production = production_source(&source);
+    let production = production_text(&source);
     assert_eq!(
-        occurrences(production, "report_termination_message("),
+        occurrences(&production, "report_termination_message("),
         3,
         "写终止消息的调用点不是「定义 + 成功一支 + 失败一支」这三处。少一处就是有一类结局\
          不留读数：只写失败那一支时，跑通却被限流的一轮什么都不留"
@@ -67,9 +64,9 @@ fn the_judgement_leaves_its_reading_on_the_way_out_of_both_outcomes() {
 #[test]
 fn the_deployer_reads_the_reading_wherever_the_run_ends() {
     let source = read(DEPLOYER);
-    let production = production_source(&source);
+    let production = production_text(&source);
     assert_eq!(
-        occurrences(production, "self.report_rollout_resources("),
+        occurrences(&production, "self.report_rollout_resources("),
         3,
         "收读数的调用点不是三个终局分支（收敛 / Job Complete / Job Failed）各一处"
     );
@@ -87,7 +84,7 @@ fn the_deployer_reads_the_reading_wherever_the_run_ends() {
 /// `lines().next()`——两行一旦调换，落点读回端见到的就是一段陌生文本。
 #[test]
 fn the_locus_is_written_before_the_reading() {
-    let production = production_source(&read(ROLLOUT)).to_string();
+    let production = production_text(&read(ROLLOUT));
     let Some(body) = production.split("fn write_termination_message(").nth(1) else {
         panic!("终止消息的写入器不在了")
     };
@@ -107,7 +104,7 @@ fn the_locus_is_written_before_the_reading() {
 /// 那一行的形状由产出侧一个模块定，读回端只认它。标记与版本都在那里，不在这里。
 #[test]
 fn the_line_shape_lives_in_one_place() {
-    let reading = production_source(&read(READING)).to_string();
+    let reading = production_text(&read(READING));
     assert!(
         reading.contains("pub const TAG") && reading.contains("FORMAT_VERSION"),
         "行标记与格式版本不再是产出侧声明的常量：读回端只能猜，而猜错的形状会被当成一条读数"
