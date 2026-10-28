@@ -38,18 +38,34 @@ fn manifest_dir() -> PathBuf {
 
 fn forbidden_names(root: &Path) -> Vec<String> {
     let mut names: Vec<String> = NAMED_IN_THE_DESIGN.iter().map(|s| s.to_string()).collect();
-    if let Ok(entries) = std::fs::read_dir(root.join("src/scaffolds")) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let stem = path.file_stem().unwrap().to_string_lossy().to_lowercase();
-            if stem != "mod" {
-                names.push(stem);
-            }
+    let dir = root.join("src/scaffolds");
+    // 自动那一半是这张表能自己长大的原因，也是它唯一的失效方式：目录读不出来（改名、
+    // 空、权限）时若只是「一个也没长出来」，表退回设计里点名的那几条，检查照旧绿——
+    // 而它变弱这件事没有任何症状。所以读不出来是 panic，长出来零条也是 panic。
+    let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+        panic!(
+            "{} 读不出来（{e}）：外壳名自动进表的那一半没了，这条判据会悄悄变弱",
+            dir.display()
+        )
+    });
+    let mut grown = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        let stem = path.file_stem().unwrap().to_string_lossy().to_lowercase();
+        if stem != "mod" {
+            names.push(stem);
+            grown += 1;
         }
     }
+    assert!(
+        grown > 0,
+        "{} 里一个外壳文件都没读到：自动那一半禁用表是空的，\
+         这张表只剩设计里点名的那几条——它不再自己长大了，而这件事不会让检查变红",
+        dir.display()
+    );
     names
 }
 
@@ -89,4 +105,43 @@ fn the_check_would_catch_a_rigged_rig() {
         caught.len() >= 2,
         "这条判据抓不住明显被污染的实现，它就是个假门：{caught:?}"
     );
+}
+
+/// 自动那一半长不出来时必须炸：它是这张表不会随新增外壳而过期的唯一原因，
+/// 而「一条也没长出来」在读数上是「设计里点名的都在、也都合规」。
+///
+/// 拿临时目录造三种树：有外壳（读到它），只有 `mod.rs`（一条也长不出来），
+/// 目录不在（读不出来）。后两种都必须是 panic，不是一张变短的表。
+#[test]
+fn a_table_that_cannot_grow_is_refused_not_silently_shorter() {
+    let base = std::env::temp_dir().join(format!("cog-eval-scaffolds-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+
+    let with_a_shell = base.join("with");
+    std::fs::create_dir_all(with_a_shell.join("src/scaffolds")).unwrap();
+    std::fs::write(with_a_shell.join("src/scaffolds/reflex.rs"), "").unwrap();
+    let names = forbidden_names(&with_a_shell);
+    assert!(
+        names.iter().any(|n| n == "reflex"),
+        "外壳目录里的文件名没有进禁用表：{names:?}"
+    );
+
+    let only_mod = base.join("only-mod");
+    std::fs::create_dir_all(only_mod.join("src/scaffolds")).unwrap();
+    std::fs::write(only_mod.join("src/scaffolds/mod.rs"), "").unwrap();
+    let quiet = std::panic::catch_unwind(|| forbidden_names(&only_mod));
+    assert!(
+        quiet.is_err(),
+        "只有 mod.rs 时禁用表退回了设计里那几条，判据会在变弱的同时保持绿"
+    );
+
+    let missing = base.join("missing");
+    std::fs::create_dir_all(&missing).unwrap();
+    let unreadable = std::panic::catch_unwind(|| forbidden_names(&missing));
+    assert!(
+        unreadable.is_err(),
+        "外壳目录读不出来时判据仍然出了一张表——它没读到任何外壳，却宣布合规"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
 }
