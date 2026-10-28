@@ -285,11 +285,7 @@ async fn probe_nodes() -> usize {
 fn host_mem_total_mb() -> u64 {
     std::fs::read_to_string("/proc/meminfo")
         .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("MemTotal:"))
-                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-        })
+        .and_then(|s| cogneva_bootstrap::mem_total_kb(&s))
         .map(|kb| kb / 1024)
         .unwrap_or(0)
 }
@@ -1068,12 +1064,7 @@ async fn ssh_capture(ssh_target: &str, port: Option<&String>, command: &str) -> 
 /// memory and CPU count.
 async fn remote_qos_config(ssh_target: &str, port: Option<&String>) -> Option<String> {
     // MemTotal is in kB; nproc is the CPU count the kubelet will see.
-    let out = ssh_capture(
-        ssh_target,
-        port,
-        "awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo; nproc",
-    )
-    .await?;
+    let out = ssh_capture(ssh_target, port, cogneva_bootstrap::NODE_CAPACITY_PROBE).await?;
     let readings = cogneva_bootstrap::parse_node_readings(&out)?;
     Some(cogneva_bootstrap::k3s_qos_config_yaml(
         &cogneva_bootstrap::node_qos(readings.mem_total_mb, readings.cpu_cores),
@@ -2139,13 +2130,7 @@ async fn sha256_file(path: &str) -> Result<String> {
 /// 按物理内存给 cargo 并行度：≤6G 返回 Some(2)，更大内存返回 None（按核数自动）。
 fn cargo_jobs_for_memory() -> Option<usize> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let kb: u64 = meminfo
-        .lines()
-        .find_map(|l| l.strip_prefix("MemTotal:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()?;
+    let kb = cogneva_bootstrap::mem_total_kb(&meminfo)?;
     (kb / 1024 / 1024 <= 6).then_some(2)
 }
 

@@ -770,6 +770,37 @@ pub fn parse_node_readings(out: &str) -> Option<NodeReadings> {
     })
 }
 
+/// The command that produces the two readings above on a node reached over SSH.
+///
+/// One constant because two install shapes ask the same node the same question
+/// -- the kubespray inventory walk and the K3s agent's first start -- and each
+/// answer becomes a QoS account on that node. Spelt twice, a change to one copy
+/// (a different `/proc` field, a different divisor, one extra line before the
+/// numbers) leaves the other shape reading nodes differently, and nothing in
+/// the tree compares the two: the install simply reserves a different share,
+/// with no reading that says so.
+pub const NODE_CAPACITY_PROBE: &str = "awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo; nproc";
+
+/// Total memory in KiB, read out of the text of `/proc/meminfo`.
+///
+/// The one place this host's own memory total is parsed from the kernel. Every
+/// caller derives from it -- the dirty-page watermarks, the cargo job count --
+/// so the field read and its unit are decided once.
+///
+/// `None` when the line is missing or its number does not parse. A caller that
+/// cannot read the total has to say so: zero is a number the arithmetic below
+/// accepts, and it would mean "this machine has no memory" rather than "the
+/// reading did not happen".
+pub fn mem_total_kb(meminfo: &str) -> Option<u64> {
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// A node's memory account as the cluster reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeMemoryAccount {
@@ -1343,6 +1374,30 @@ mod tests {
         assert_eq!(parse_node_readings("64199\n"), None);
         assert_eq!(parse_node_readings("sh: awk: not found\n24\n"), None);
         assert_eq!(parse_node_readings("0\n0\n"), None);
+    }
+
+    /// `/proc/meminfo` carries the total in kB with a unit suffix; the caller
+    /// wants KiB, and every caller divides from there. So the suffix is the
+    /// parser's job, not each caller's: `"65496336 kB".parse::<u64>()` fails,
+    /// and a caller that strips the wrong field reads the unit as the number.
+    #[test]
+    fn the_memory_total_is_the_first_number_on_the_memtotal_line() {
+        let meminfo = "MemTotal:       65496336 kB\nMemFree:         1234567 kB\n";
+        assert_eq!(mem_total_kb(meminfo), Some(65_496_336));
+
+        // The field the kernel puts after the number is a unit, not a reading,
+        // and a line with nothing after the colon is not a reading either.
+        assert_eq!(mem_total_kb("MemTotal: 1048576\n"), Some(1_048_576));
+        assert_eq!(mem_total_kb("MemTotal:\n"), None);
+
+        // Missing, or a value that does not parse, is "did not read" -- not
+        // zero, which the watermarks would accept as a real memory total.
+        assert_eq!(mem_total_kb("MemFree: 1234567 kB\n"), None);
+        assert_eq!(mem_total_kb("MemTotal: lots kB\n"), None);
+        assert_eq!(mem_total_kb(""), None);
+
+        // A same-prefix neighbour is not the total.
+        assert_eq!(mem_total_kb("MemTotalFoo: 999 kB\n"), None);
     }
 
     #[test]
