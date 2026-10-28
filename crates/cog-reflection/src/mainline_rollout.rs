@@ -2956,6 +2956,11 @@ impl RolloutExecutor {
                     // serverside-applied，删除没落地与落地在账上同形。支撑面一
                     // 直在回读，目标面此前没有——于是从目标清单里拿掉一个字段，
                     // 这一轮照样报健康完成。
+                    //
+                    // 这里查的只是「清单里少写了」那一类。暂存副本上另有一支
+                    // `clear_superseded_env_values` 拿掉过时的 env，它走的是显式
+                    // json patch，本来就会真删掉；它删的那些不在这个集合里，别把
+                    // 两件事读成同一扇门。
                     let field_removals = self.field_removals_to_verify(&key, &text).await;
                     let outcome = async {
                         self.clear_superseded_env_values(&staged_path).await?;
