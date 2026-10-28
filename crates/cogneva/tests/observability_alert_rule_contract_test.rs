@@ -32,7 +32,7 @@
 
 mod common;
 
-use common::routes::{read_repo, repo_root};
+use common::routes::{matching_paren, read_repo, repo_root};
 use common::service_topology;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -5123,30 +5123,14 @@ fn split_set_operator(expr: &str) -> Option<(&'static str, &str, &str)> {
 /// Strip one layer of balanced parentheses wrapping the whole expression.
 fn strip_outer_parens(expr: &str) -> &str {
     let mut cur = expr.trim();
-    loop {
-        if !(cur.starts_with('(') && cur.ends_with(')')) {
-            return cur;
-        }
-        let mut depth = 0i32;
-        let bytes = cur.as_bytes();
-        for (i, b) in bytes.iter().enumerate() {
-            match *b as char {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    // The opening paren closed before the end: not a wrapper.
-                    if depth == 0 && i + 1 != bytes.len() {
-                        return cur;
-                    }
-                }
-                _ => {}
-            }
-        }
-        if depth != 0 {
-            return cur;
-        }
+    // 配平的括号只有一处读法：开头那个 `(` 一直配到末尾，才算一层包装。
+    while cur.starts_with('(')
+        && cur.ends_with(')')
+        && matching_paren(cur.as_bytes(), 0) == Some(cur.len() - 1)
+    {
         cur = cur[1..cur.len() - 1].trim();
     }
+    cur
 }
 
 /// The range a leaf expression reports, or `None` when this cannot tell.
@@ -5407,28 +5391,6 @@ fn set_operators_decide_which_side_supplies_the_value() {
 
 // ── 时长承诺读的是不是窗口里的每一个样本 ─────────────────────────────────────
 
-/// Index of the `)` closing a group that is already open, or `None` when the
-/// expression ends first. `open` points just past the opening parenthesis.
-fn matching_paren_end(expr: &str, open: usize) -> Option<usize> {
-    let bytes = expr.as_bytes();
-    let mut depth = 1i32;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] as char {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
 /// The operand of every `min_over_time` / `max_over_time` call in an expression,
 /// with the name of the aggregate it belongs to. The range selector is dropped:
 /// `[30m:1m]` says which samples are read, not what they are read from.
@@ -5447,7 +5409,7 @@ fn range_aggregate_operands(expr: &str) -> Vec<(&'static str, &str)> {
                 continue;
             }
             let inner_start = from + open + 1;
-            let Some(inner_end) = matching_paren_end(expr, inner_start) else {
+            let Some(inner_end) = matching_paren(expr.as_bytes(), inner_start - 1) else {
                 continue;
             };
             let arg = expr[inner_start..inner_end].trim();
@@ -5577,7 +5539,7 @@ fn set_operand_expression(operand: &str) -> &str {
             rest.starts_with('(').then_some(rest)
         });
     let expr = match rest {
-        Some(rest) => match matching_paren_end(rest, 1) {
+        Some(rest) => match matching_paren(rest.as_bytes(), 0) {
             Some(end) => rest[end + 1..].trim_start(),
             None => t,
         },
