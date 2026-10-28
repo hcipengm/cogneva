@@ -434,3 +434,87 @@ done
 [ "${judged}" -ge 1 ] || fail "没有任何一种形态判出了数值——这一趟什么都没验"
 
 echo "OK: governance runtime-job headroom gate"
+
+# 天花板缺一半时，缺的那一半让对应判据整段跳过，而判词照旧印 OK。模板把
+# `type: Container` 与 `type: PersistentVolumeClaim` 两项都无条件写出来，所以
+# 产物里少一项是这份产物被改过，不是「这一类的边界不存在」。
+half="${work}/ceiling-half"
+mkdir -p "${half}"
+cat > "${half}/10-quota.yaml" <<'YAML'
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: cogneva-quota
+  annotations:
+    cogneva.io/runtime-pods-limits-cpu: "0"
+    cogneva.io/runtime-pods-limits-memory: "0"
+spec:
+  hard:
+    limits.cpu: "8"
+    requests.storage: 10Gi
+YAML
+cat > "${half}/11-limits.yaml" <<'YAML'
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: cogneva-limits
+spec:
+  limits:
+    - type: PersistentVolumeClaim
+      max:
+        storage: 80Gi
+YAML
+cat > "${half}/20-claim.yaml" <<'YAML'
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: a-claim
+spec:
+  resources:
+    requests:
+      storage: 5Gi
+YAML
+cat > "${half}/30-deploy.yaml" <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: an-app
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: c
+          image: example.invalid/x:1
+YAML
+rc=0
+half_out="$(bash "${gate}" "${half}" 2>&1)" || rc=$?
+[ "${rc}" -eq 1 ] || fail "ceiling 缺 type: Container 时退了 ${rc}：容器那条不等式整段跳过，判词却是 OK —— ${half_out}"
+case "${half_out}" in
+  *"没有 type: Container"*) ;;
+  *) fail "ceiling 缺 Container 项的判词没点名缺的是哪一项 —— ${half_out}" ;;
+esac
+echo "OK: a LimitRange without type: Container is red and names the missing half"
+
+# 反过来：有卷声明、天花板里没有装它们的那一项。
+cat > "${half}/11-limits.yaml" <<'YAML'
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: cogneva-limits
+spec:
+  limits:
+    - type: Container
+      max:
+        cpu: "4"
+      min:
+        cpu: 10m
+YAML
+rc=0
+half_out="$(bash "${gate}" "${half}" 2>&1)" || rc=$?
+[ "${rc}" -eq 1 ] || fail "有卷声明但 LimitRange 没有 PVC 项时退了 ${rc} —— ${half_out}"
+case "${half_out}" in
+  *"没有 type: PersistentVolumeClaim"*) ;;
+  *) fail "缺 PVC 项的判词没点名缺的是哪一项 —— ${half_out}" ;;
+esac
+echo "OK: a LimitRange without type: PersistentVolumeClaim is red when claims are declared"

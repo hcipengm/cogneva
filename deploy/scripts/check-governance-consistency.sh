@@ -145,6 +145,22 @@ declarations = [(n, raw) for n, raw in declarations if raw is not None]
 for doc in workloads:
     declarations.extend(workload_claim_storage(doc))
 
+# 天花板的两项各是一批判据的输入：`type: Container` 给判据 3 与判据 4 的「没显式
+# 声明的容器按默认值算」，`type: PersistentVolumeClaim` 给卷声明的单卷上下限。
+# 模板把这两项无条件写出来，所以少一项不是「这一类没有边界」，而是这份产物少了
+# 半张天花板——而缺的那一半让对应判据整段 `continue`，印出来的却是「自洽」。
+# 判据 4 尤其如此：容器不写 requests 时它按 LimitRange 的默认值补，补不上的 Pod
+# 记成 0，和偏小而绿，正是实例里那次「头寸看着还有、准入已经拒人」的方向。
+if workloads and lr_container is None:
+    errors.append(
+        "LimitRange 里没有 type: Container 那一项：容器的上下限没得比，"
+        "判据 3 与判据 4 的默认值回填整段跳过——没写 requests 的容器会被算成 0，"
+        "头寸偏大而判词照旧说自洽")
+if declarations and lr_pvc is None:
+    errors.append(
+        f"LimitRange 里没有 type: PersistentVolumeClaim 那一项：{len(declarations)} 条"
+        "卷声明没有单卷上下限可比，判据 1 整段跳过")
+
 total_storage, largest = 0.0, None
 if declarations:
     for name, raw in declarations:
