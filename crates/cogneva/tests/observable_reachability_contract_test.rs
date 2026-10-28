@@ -25,6 +25,10 @@
 
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::rust_production::{all_crate_files, relative_name};
+
 /// Every `async fn <name>(` body in `text` that belongs to an impl, paired with
 /// the body.
 ///
@@ -96,26 +100,6 @@ fn method_bodies(text: &str, name: &str) -> Vec<String> {
     out
 }
 
-fn rust_sources(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![root.join("crates")];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -127,12 +111,7 @@ fn workspace_root() -> PathBuf {
 #[test]
 fn no_observable_is_published_from_a_plugin_start() {
     let root = workspace_root();
-    let files = rust_sources(&root);
-    assert!(
-        files.len() > 50,
-        "scanned {} source files, which is too few to be the workspace",
-        files.len()
-    );
+    let files = all_crate_files(&root);
 
     let mut starts = 0usize;
     let mut init_publishes = 0usize;
@@ -144,7 +123,7 @@ fn no_observable_is_published_from_a_plugin_start() {
         for body in method_bodies(&text, "start") {
             starts += 1;
             if body.contains("publish_observable") {
-                offenders.push(path.display().to_string());
+                offenders.push(relative_name(&root, path));
             }
         }
         for body in method_bodies(&text, "init") {

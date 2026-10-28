@@ -36,6 +36,10 @@
 
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::rust_production::{relative_name, src_and_test_sources};
+
 /// The call that starts cadence-driven work.
 const MARKER: &str = concat!("tokio::time::", "interval(");
 /// The calls that make such work watchable: the supervised shape only.
@@ -137,53 +141,22 @@ fn registration_name(production: &str, at: usize) -> &str {
         .unwrap_or("")
 }
 
-fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|n| n == "target") {
-                continue;
-            }
-            rust_sources(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 /// Every `.rs` file under `crates/<crate>/{src,tests}`, keyed by
 /// workspace-relative path.
+///
+/// The fixtures are in and the examples are out: a fixture stands in for an
+/// outside client or a second loop, so it builds the same connection and runs
+/// the same cadence -- only its lifetime is the test's. An example is not part
+/// of any process.
 fn scan() -> Vec<(String, String)> {
     let root = workspace_root();
-    let mut found = Vec::new();
-    for crate_dir in std::fs::read_dir(root.join("crates"))
-        .expect("workspace has a crates directory")
-        .flatten()
-    {
-        for sub in ["src", "tests"] {
-            let dir = crate_dir.path().join(sub);
-            if !dir.is_dir() {
-                continue;
-            }
-            let mut sources = Vec::new();
-            rust_sources(&dir, &mut sources);
-            for path in sources {
-                let Ok(text) = std::fs::read_to_string(&path) else {
-                    continue;
-                };
-                let relative = path
-                    .strip_prefix(&root)
-                    .expect("scanned path is under the workspace root")
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                found.push((relative, text));
-            }
-        }
-    }
-    found
+    src_and_test_sources(&root)
+        .into_iter()
+        .filter_map(|path| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            Some((relative_name(&root, &path), text))
+        })
+        .collect()
 }
 
 #[test]

@@ -57,6 +57,10 @@
 
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::rust_production::{production_sources, relative_name};
+
 /// Every production site that constructs `SupervisorEvent::AgentUnhealthy`,
 /// as `path::enclosing_function`.
 ///
@@ -76,54 +80,15 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Every `.rs` file under `crates/*/src/`, recursively.
-fn production_sources() -> Vec<PathBuf> {
-    let crates_dir = repo_root().join("crates");
-    let mut out = Vec::new();
-    let mut stack = vec![crates_dir];
-    while let Some(dir) = stack.pop() {
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(e) => panic!("{} unreadable: {e}", dir.display()),
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let src = path.join("src");
-                if src.is_dir() {
-                    collect_rs(&src, &mut out);
-                }
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
-fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries =
-        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()));
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_rs(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
-}
-
-fn relative(path: &Path) -> String {
-    path.strip_prefix(repo_root())
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned()
-}
-
 /// The lines before this file's first `#[cfg(test)]`, which is where test
 /// fixtures start. Test modules built with `#[path]` or a separate file have no
 /// marker here, so their fixtures are not counted either.
-fn production_lines(source: &str) -> Vec<&str> {
+///
+/// Deliberately not the shared `production_lines`: this one keeps every line it
+/// keeps, in order, because the callers look up the index a construction sits on
+/// to name the function around it. The shared cut drops comment lines, which
+/// would shift those indices and rename the function a finding points at.
+fn lines_before_fixtures(source: &str) -> Vec<&str> {
     let mut lines: Vec<&str> = Vec::new();
     for line in source.lines() {
         if line.trim_start().starts_with("#[cfg(test)]") {
@@ -166,7 +131,7 @@ fn writers_in(path: &Path) -> Vec<String> {
         Ok(s) => s,
         Err(e) => panic!("{} unreadable: {e}", path.display()),
     };
-    let lines = production_lines(&source);
+    let lines = lines_before_fixtures(&source);
     let mut sites = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         // Only the qualified form is a construction. The variant's own
@@ -189,11 +154,15 @@ fn writers_in(path: &Path) -> Vec<String> {
         let function = enclosing_function(&lines, i).unwrap_or_else(|| {
             panic!(
                 "{}:{}: writer with no enclosing function",
-                relative(path),
+                relative_name(&repo_root(), path),
                 i + 1
             )
         });
-        sites.push(format!("{}::{}", relative(path), function));
+        sites.push(format!(
+            "{}::{}",
+            relative_name(&repo_root(), path),
+            function
+        ));
     }
     sites
 }
@@ -201,7 +170,7 @@ fn writers_in(path: &Path) -> Vec<String> {
 #[test]
 fn every_writer_of_agent_unhealthy_is_the_one_that_was_reviewed() {
     let mut found = Vec::new();
-    for path in production_sources() {
+    for path in production_sources(&repo_root()) {
         found.extend(writers_in(&path));
     }
     found.sort();
@@ -226,15 +195,15 @@ fn every_writer_of_agent_unhealthy_is_the_one_that_was_reviewed() {
 #[test]
 fn a_file_that_writes_the_event_also_asks_whether_it_may_announce() {
     let mut ungated = Vec::new();
-    for path in production_sources() {
+    for path in production_sources(&repo_root()) {
         if writers_in(&path).is_empty() {
             continue;
         }
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        let production = production_lines(&source).join("\n");
+        let production = lines_before_fixtures(&source).join("\n");
         if !production.contains(JUDGEMENT) {
-            ungated.push(relative(&path));
+            ungated.push(relative_name(&repo_root(), &path));
         }
     }
     assert!(

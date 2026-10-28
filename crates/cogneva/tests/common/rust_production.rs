@@ -135,6 +135,35 @@ pub fn sources_of_crate_tree(root: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// `crates/<crate>/{src,tests}` 下的每一个 `.rs`，带下限。
+///
+/// 第三种人口：夹具在内，示例与基准不在内。用它的是「这条规则对生产代码和夹具
+/// 都成立吗」这一类门——夹具是替身客户端、替身循环，它一样建连接、一样起循环，
+/// 只是寿命由测试决定，所以同一条判据要看它；示例与基准不是任何进程的一部分。
+pub fn src_and_test_sources(root: &Path) -> Vec<PathBuf> {
+    let out = sources_of_src_and_tests(root);
+    assert!(
+        out.len() >= MIN_PRODUCTION_FILES,
+        "只读到 {} 个 src/ 与 tests/ 下的源文件（下限 {MIN_PRODUCTION_FILES}）：这条门\
+         一条都没读到就会在空集上通过",
+        out.len()
+    );
+    out
+}
+
+/// 同一份人口，不设下限：给测试自己搭的那棵树用，理由同 [`sources_of_tree`]。
+pub fn sources_of_src_and_tests(root: &Path) -> Vec<PathBuf> {
+    crate_files_of(root)
+        .into_iter()
+        .filter(|path| {
+            matches!(
+                relative_name(root, path).split('/').nth(2),
+                Some("src") | Some("tests")
+            )
+        })
+        .collect()
+}
+
 /// 一个文件在树里的名字：repo 相对、`/` 分隔。
 ///
 /// 口径只有这一份。两套写法（`./a/b.rs` 与 `a/b.rs`）在读者眼里是同一个文件，在
@@ -511,13 +540,13 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// 工作树那两份普查只差一处：夹具。示例、基准、构建脚本都留在里面。
+    /// 工作树的几份普查之间只差那几个减法：夹具、示例、构建脚本各留一份。
     ///
-    /// 钉的是它们之间那个减法。写宽了（比如顺手把 `examples/` 也排除）不会有任何
-    /// 一条门变红——它们的断言在更小的集合上照样成立，只是从此看不见示例里写死的
-    /// 第二份拼法；夹具那一侧同理，读进去了就是把测试数据当成部署事实。
+    /// 钉的就是这些减法。写宽了（比如顺手把 `examples/` 也排除）不会有任何一条门
+    /// 变红——它们的断言在更小的集合上照样成立，只是从此看不见示例里写死的第二份
+    /// 拼法；夹具那一侧同理，读进去了就是把测试数据当成部署事实。
     #[test]
-    fn the_working_tree_census_keeps_everything_but_the_fixtures() {
+    fn the_working_tree_censuses_differ_by_exactly_their_cuts() {
         let root = std::env::temp_dir().join(format!("census-crate-files-{}", std::process::id()));
         let crate_dir = root.join("crates/only");
         for (path, body) in [
@@ -559,9 +588,18 @@ mod tests {
             ],
             "去掉夹具之后，示例、基准、构建脚本都还在这一份里"
         );
+        assert_eq!(
+            names(sources_of_src_and_tests(&root)),
+            vec!["crates/only/src/lib.rs", "crates/only/tests/a.rs"],
+            "只要 src 与 tests 的那一份：夹具在内，示例、基准、构建脚本都不在"
+        );
         assert!(
             std::panic::catch_unwind(|| crate_tree_sources(&root)).is_err(),
             "带下限的那条入口在同一棵树上必须拒读"
+        );
+        assert!(
+            std::panic::catch_unwind(|| src_and_test_sources(&root)).is_err(),
+            "第三种人口的下限同样在真树上生效，假树照读"
         );
 
         std::fs::remove_dir_all(&root).ok();

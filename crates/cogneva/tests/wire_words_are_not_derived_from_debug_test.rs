@@ -22,28 +22,14 @@
 //! `crates/cog-gateway/src/processes.rs` 里一句改回
 //! `format!("{:?}", t.task_type).to_lowercase()`，本门红并点名该文件与该行。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod common;
 
-use common::rust_production::production_text;
+use common::rust_production::{production_sources, production_text, relative_name};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rust_sources(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
 }
 
 /// Whether the `format!` starting at `at` has `.to_lowercase()` applied to it.
@@ -97,29 +83,12 @@ fn line_of(text: &str, at: usize) -> usize {
 
 #[test]
 fn no_wire_word_is_derived_from_debug_formatting() {
-    // Only each crate's `src`: a test file is nothing but fixtures, and a
-    // fixture that spells the pattern on purpose is the check beside this one,
-    // not an offence.
-    let crates = repo_root().join("crates");
-    let mut files = Vec::new();
-    for entry in std::fs::read_dir(&crates)
-        .expect("the crates directory")
-        .flatten()
-    {
-        let src = entry.path().join("src");
-        if src.is_dir() {
-            rust_sources(&src, &mut files);
-        }
-    }
-    assert!(
-        files.len() > 100,
-        "read {} Rust files under {}; that is too few for the walk to be working",
-        files.len(),
-        crates.display()
-    );
-
+    // Only each crate's `src` and its build script: a test file is nothing but
+    // fixtures, and a fixture that spells the pattern on purpose is the check
+    // beside this one, not an offence.
+    let root = repo_root();
     let mut offenders = Vec::new();
-    for path in files {
+    for path in production_sources(&root) {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
         };
@@ -127,7 +96,7 @@ fn no_wire_word_is_derived_from_debug_formatting() {
         for at in debug_lowercase_spots(&text) {
             offenders.push(format!(
                 "{}:{}",
-                path.strip_prefix(repo_root()).unwrap_or(&path).display(),
+                relative_name(&root, &path),
                 line_of(&text, at)
             ));
         }

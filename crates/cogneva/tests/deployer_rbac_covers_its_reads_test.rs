@@ -47,7 +47,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::production_text;
+use common::rust_production::{production_sources, production_text, relative_name};
 
 use cog_reflection::{workload_kind_of_resource, WORKLOAD_KINDS};
 use serde::Deserialize;
@@ -952,32 +952,19 @@ fn every_file_that_talks_to_the_cluster_is_named() {
         );
     }
 
+    let root = repo_root();
+    let prefix = format!("{CRATE_SRC}/");
     let mut found: BTreeSet<String> = BTreeSet::new();
-    let mut stack = vec![repo_root().join(CRATE_SRC)];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()))
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let rel = path
-                .strip_prefix(repo_root())
-                .expect("crate source below the repo root")
-                .to_string_lossy()
-                .replace('\\', "/");
-            if !commands_in(&rel, &production_source(&text)).is_empty() {
-                found.insert(rel);
-            }
+    for path in production_sources(&root)
+        .into_iter()
+        .filter(|path| relative_name(&root, path).starts_with(&prefix))
+    {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let rel = relative_name(&root, &path);
+        if !commands_in(&rel, &production_source(&text)).is_empty() {
+            found.insert(rel);
         }
     }
 
