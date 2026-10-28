@@ -2244,6 +2244,111 @@ async fn cleanup(pool: &PgPool, marker: &str) {
     tx.commit().await.expect("commit the cleanup");
 }
 
+/// A declaration one fold has claimed is not handed to another fold.
+///
+/// `folded_at IS NULL` is a look, not a reservation: two folders reading it at
+/// once both match the same rows, and the writes each of them makes are separate
+/// orderings of the same batch. A document that corrects what it declares
+/// re-queues the declaration, so one key can carry two readings of two different
+/// texts -- and the slower folder then writes the older reading over the newer
+/// one, marks the row folded, and the account cites what the document said
+/// before it was corrected while every reading stays green.
+///
+/// The first folder is simulated by a transaction holding the row the way a fold
+/// holds it. The assertion is about the row rather than the fold's count: the
+/// fold is allowed to take whatever else is queued, so the only stable fact is
+/// that this declaration is still unfolded when the fold returns. Once the claim
+/// is released the next pass takes it -- a claim that never expired would stop
+/// the fold rather than order it.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_declaration_claimed_by_one_fold_is_not_taken_by_another() {
+    let _folder_lock = folder_lock().await;
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "claimed");
+
+    store
+        .declare(&[ChangeReading {
+            identity: id.clone(),
+            title: Some("a change the probe declares".into()),
+            assertion: Some("the probe's assertion".into()),
+            source: ChangeSource {
+                doc: format!("docs/{marker}.md"),
+                verdict: Some("undecided".to_string()),
+                priority: ChangePriority::Unstated,
+                block: ChangeBlock::NONE,
+            },
+        }])
+        .await
+        .unwrap();
+
+    // The first folder, holding its batch for as long as it is folding it.
+    let mut holder = pool
+        .acquire()
+        .await
+        .expect("acquire the claiming connection");
+    let mut claim = holder.begin().await.expect("open the claim");
+    let claimed: Vec<String> = sqlx::query_scalar(
+        "SELECT scope FROM change_ledger_declared \
+         WHERE folded_at IS NULL AND scope = $1 FOR UPDATE",
+    )
+    .bind(&id.scope)
+    .fetch_all(&mut *claim)
+    .await
+    .expect("claim the declaration");
+    assert_eq!(claimed.len(), 1, "the probe's declaration is queued");
+
+    // The bound is on the wrong behaviour rather than on the right one: a fold
+    // that skips returns in the time two statements take, while a fold that does
+    // not skip waits for the claim -- and a fold that waits forever fails by
+    // wedging the pass, which is not a shape a test can assert after the fact.
+    // Thirty seconds is two orders of magnitude above the honest path.
+    let _folded = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        store.fold_declarations(100, Some("probe-rev")),
+    )
+    .await
+    .expect(
+        "the fold waited on a declaration another folder had claimed instead of \
+             skipping it, so two folders are separate orderings of one row and the \
+             slower one decides what the account cites",
+    )
+    .expect("fold whatever is left");
+
+    let unfolded = |pool: PgPool, scope: String| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM change_ledger_declared \
+             WHERE folded_at IS NULL AND scope = $1",
+        )
+        .bind(scope)
+        .fetch_one(&pool)
+        .await
+        .expect("read the declaration back")
+    };
+    assert_eq!(
+        unfolded(pool.clone(), id.scope.clone()).await,
+        1,
+        "a fold took a declaration another folder had claimed: the two are then \
+         separate orderings of one row, and the slower one decides what the \
+         account cites"
+    );
+
+    claim.rollback().await.expect("release the claim");
+    drop(holder);
+    store
+        .fold_declarations(100, Some("probe-rev"))
+        .await
+        .expect("fold once the claim is released");
+    assert_eq!(
+        unfolded(pool.clone(), id.scope.clone()).await,
+        0,
+        "a claim that outlived the transaction would stop the fold rather than \
+         order it"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 /// The one-folder rule is a lock, and a lock nobody remembers to take is a
 /// comment. Everything else in this file is `#[ignore]`d behind a live
 /// database, so the concurrency they guard against is invisible on every run

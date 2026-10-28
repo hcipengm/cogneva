@@ -238,9 +238,28 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
     }
 
     async fn fold_declarations(&self, limit: usize) -> SFResult<PrincipleFold> {
+        // Everything from taking the batch to marking the readings folded rides
+        // in one transaction, for two reasons. The drift reading: the writes are
+        // idempotent, so repeating them costs nothing, but the *difference* is
+        // not, because this fold replaces the hash it compares against -- run in
+        // separate transactions and interrupted in between, the next pass reads a
+        // stored hash that the interrupted pass already overwrote, finds no
+        // difference, and the fact that this rule's text moved away from what its
+        // gate was measured against is never said by anything. And the taking
+        // itself: `folded_at IS NULL` is a look, not a reservation, so two
+        // folders reading it at once match the same rows and the slower one can
+        // write its reading over the newer one and mark it folded. `FOR UPDATE
+        // SKIP LOCKED` in `FOLD_SELECT_SQL` turns the read into a claim, and a
+        // claim is only worth anything inside the transaction that spends it.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("open the fold: {e}")))?;
+
         let rows = sqlx::query(FOLD_SELECT_SQL)
             .bind(limit as i64)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| SFError::Database(format!("read readings to fold: {e}")))?;
         let readings: Vec<PrincipleReading> = rows
@@ -250,22 +269,6 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         if readings.is_empty() {
             return Ok(PrincipleFold::default());
         }
-
-        // Everything from reading the held hashes to marking the readings folded
-        // rides in one transaction, and the reason is the drift reading rather
-        // than the writes. The writes are idempotent, so repeating them costs
-        // nothing; the *difference* is not, because this fold replaces the hash
-        // it compares against. Run in separate transactions and interrupted in
-        // between, the next pass reads a stored hash that the interrupted pass
-        // already overwrote, finds no difference, and the fact that this rule's
-        // text moved away from what its gate was measured against is never said
-        // by anything. One commit covers the comparison and the overwrite it
-        // depends on, so the two are either both in or both out.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| SFError::Database(format!("open the fold: {e}")))?;
 
         // What the account already holds for these slugs, read before anything
         // is written: the carrier hash whose difference from the pushed one is
@@ -908,18 +911,26 @@ WHERE (COALESCE(EXCLUDED.lead, principle_ledger_declared.lead),
        principle_ledger_declared.where_red, principle_ledger_declared.check_kind,
        principle_ledger_declared.priority)";
 
-/// The readings one fold takes, oldest first.
+/// The readings one fold takes, oldest first, claimed as they are read.
 ///
 /// The slug breaks ties on `declared_at` because a batch queued in one statement
 /// shares a timestamp, and without the tiebreak which of them a half-full fold
 /// takes would follow whatever order the scan returned -- a different set on the
 /// next run, and a different one again on the other dialect.
+///
+/// `FOR UPDATE SKIP LOCKED` is what makes this a claim rather than a look: two
+/// folders reading `folded_at IS NULL` at once both match the same rows, and the
+/// slower one can then write its older reading over the newer one and mark the
+/// row folded, leaving the account citing text the carrier no longer holds with
+/// every reading green. Locking the rows inside the transaction that writes and
+/// marks them makes the second folder skip them instead.
 const FOLD_SELECT_SQL: &str = "\
 SELECT slug, source, lead, carrier_path, carrier_sha256, host_gate, where_red, check_kind, priority
 FROM principle_ledger_declared
 WHERE folded_at IS NULL
 ORDER BY declared_at ASC, slug ASC, source ASC
-LIMIT $1";
+LIMIT $1
+FOR UPDATE SKIP LOCKED";
 
 /// What the account holds for the slugs one fold is about to write.
 const HELD_HASHES_SQL: &str = "\

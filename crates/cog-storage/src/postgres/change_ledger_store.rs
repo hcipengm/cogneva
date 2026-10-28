@@ -684,19 +684,32 @@ INSERT INTO change_ledger_declared (kind, scope, literal, doc, title, assertion,
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (kind, scope, literal, doc) DO NOTHING";
 
-/// The declarations one fold takes, oldest first.
+/// The declarations one fold takes, oldest first, claimed as they are read.
 ///
 /// The identity parts break ties on `declared_at` because a batch queued in one
 /// statement shares a timestamp, and without the tiebreak which of them a
 /// half-full fold takes would follow whatever order the scan returned -- a
 /// different set on the next run, and a different one again on the other
 /// dialect.
+///
+/// `FOR UPDATE SKIP LOCKED` is what makes this a claim rather than a look.
+/// `folded_at IS NULL` is not a reservation: two folders reading it at once both
+/// match the same rows, and the writes each of them makes are separate orderings
+/// of the same batch. A document that corrects what it declares re-queues the
+/// declaration, so the same key can carry two readings of two different texts --
+/// and the slower folder can then write the older reading over the newer one,
+/// mark the row folded, and leave the account citing what the document said
+/// before it was corrected, with every reading green. Locking the rows inside
+/// the transaction that writes and marks them makes the second folder skip them
+/// instead: it takes the declarations the first one did not, and the pass that
+/// comes after takes whatever is still unfolded.
 const FOLD_SELECT_SQL: &str = "\
 SELECT kind, scope, literal, doc, title, assertion, verdict, priority, block
 FROM change_ledger_declared
 WHERE folded_at IS NULL
 ORDER BY declared_at ASC, kind ASC, scope ASC, literal ASC, doc ASC
-LIMIT $1";
+LIMIT $1
+FOR UPDATE SKIP LOCKED";
 
 /// Mark one declaration folded, and only if it is still unfolded.
 ///
@@ -749,6 +762,42 @@ fn parse_state(name: Option<String>) -> SFResult<Option<ChangeState>> {
 const PENDING_RETIRE_SQL: &str =
     "SELECT count(*) AS n FROM change_ledger_retired WHERE folded_at IS NULL";
 
+/// Write one reading into the account, on whatever executor the caller has.
+///
+/// Takes an executor rather than the pool because the fold writes inside the
+/// transaction that claimed the declaration: a version bound to the pool could
+/// only be called outside it, and the claim is worth nothing if the write it
+/// guards has already been committed or has yet to start.
+async fn write_reading<'e, E>(
+    exec: E,
+    reading: &ChangeReading,
+    first_seen_rev: Option<&str>,
+) -> SFResult<()>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    sqlx::query(&fill_vocabulary(RECORD_READING_SQL_TEMPLATE))
+        .bind(&reading.identity.kind)
+        .bind(&reading.identity.scope)
+        .bind(&reading.identity.literal)
+        .bind(&reading.title)
+        .bind(&reading.assertion)
+        .bind(&reading.source.doc)
+        .bind(&reading.source.verdict)
+        .bind(reading.source.priority.as_str())
+        .bind(reading.source.block.as_str())
+        .bind(first_seen_rev)
+        .execute(exec)
+        .await
+        .map_err(|e| {
+            SFError::Database(format!(
+                "record reading for {}: {e}",
+                reading.identity.as_key()
+            ))
+        })?;
+    Ok(())
+}
+
 #[async_trait]
 impl ChangeLedgerStore for PostgresChangeLedgerStore {
     async fn record_readings(
@@ -759,25 +808,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         let mut stored = 0usize;
         for reading in readings {
             check_reading(reading).map_err(SFError::Validation)?;
-            sqlx::query(&fill_vocabulary(RECORD_READING_SQL_TEMPLATE))
-                .bind(&reading.identity.kind)
-                .bind(&reading.identity.scope)
-                .bind(&reading.identity.literal)
-                .bind(&reading.title)
-                .bind(&reading.assertion)
-                .bind(&reading.source.doc)
-                .bind(&reading.source.verdict)
-                .bind(reading.source.priority.as_str())
-                .bind(reading.source.block.as_str())
-                .bind(first_seen_rev)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| {
-                    SFError::Database(format!(
-                        "record reading for {}: {e}",
-                        reading.identity.as_key()
-                    ))
-                })?;
+            write_reading(&self.pool, reading, first_seen_rev).await?;
             stored += 1;
         }
         Ok(stored)
@@ -815,9 +846,18 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         limit: usize,
         first_seen_rev: Option<&str>,
     ) -> SFResult<usize> {
+        // The whole fold rides in one transaction, and the read is inside it
+        // rather than before it: the locks `FOLD_SELECT_SQL` takes are released
+        // at commit, so a read outside the transaction would claim nothing.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("open the fold: {e}")))?;
+
         let rows = sqlx::query(FOLD_SELECT_SQL)
             .bind(limit as i64)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| SFError::Database(format!("read declarations to fold: {e}")))?;
         let readings: Vec<ChangeReading> = rows
@@ -832,7 +872,10 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // leaves the declarations unfolded and repeats this work on the next
         // pass, which the reading path absorbs as an idempotent upsert; the
         // other order would drop the change instead, and nothing would say so.
-        self.record_readings(&readings, first_seen_rev).await?;
+        for reading in &readings {
+            check_reading(reading).map_err(SFError::Validation)?;
+            write_reading(&mut *tx, reading, first_seen_rev).await?;
+        }
 
         let mut folded = 0usize;
         for reading in &readings {
@@ -841,7 +884,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 .bind(&reading.identity.scope)
                 .bind(&reading.identity.literal)
                 .bind(&reading.source.doc)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| {
                     SFError::Database(format!(
@@ -851,6 +894,10 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 })?;
             folded += 1;
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(format!("commit the fold: {e}")))?;
         Ok(folded)
     }
 
