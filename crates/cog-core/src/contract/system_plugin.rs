@@ -1693,6 +1693,11 @@ mod pin_tests {
         assert_eq!(wiring[0].consumers[0].owner, Some("reader"));
     }
 
+    /// 这条读数是「生产里接没接」那一问的判据之一：登记面上的插件，一个 pin 都没发时
+    /// 仍带着 0 出场——没有它，一个「在表上、编得过、init 跑过、但什么都没发」的插件
+    /// 与「压根没接进来」在读数上同形，而这两件事的修法完全不同。
+    ///
+    /// principle: feedback_production_wiring_is_read_from_the_generated_plugin_table_not_a_grep_for_the_constructor
     #[test]
     fn a_plugin_that_publishes_nothing_is_named_with_its_zero() {
         // The one shape nothing else can see: a plugin that is on the descriptor
