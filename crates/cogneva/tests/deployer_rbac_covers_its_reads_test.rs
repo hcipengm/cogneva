@@ -610,6 +610,19 @@ enum Words {
     WorkloadRows,
     /// Words the expression lowers to itself (a kind name made lowercase).
     Literal(&'static [&'static str]),
+    /// Words this gate cannot enumerate without writing a second copy of a rule
+    /// that already has an owner. The expression addresses whatever that owner
+    /// covers, and the owner is named as (file, test) rather than described: the
+    /// test is looked up by name, so renaming or deleting it turns this row into
+    /// a failure instead of a standing trust.
+    ///
+    /// The ceiling, stated: this row checks that the owner still exists, not
+    /// what it asserts. An owner weakened to "nothing is required" would leave
+    /// this row vouching for it.
+    Delegated {
+        owner_file: &'static str,
+        owner_test: &'static str,
+    },
 }
 
 const COMPUTED: &[Computed] = &[
@@ -642,6 +655,24 @@ const COMPUTED: &[Computed] = &[
         expr: "&workload.kind_arg()",
         words: Words::Literal(&["deployment", "statefulset", "daemonset", "job"]),
         guard: "kind_arg",
+    },
+    // Reading back a field this revision removed: `kubectl get <kind>` on an
+    // object the previous bundle itself applied. The reachable words are the
+    // delivery face, not this crate's argv, and that face already owes
+    // `get`/`create`/`patch` per document -- `apply -f` cannot run without all
+    // three. Its owner walks every deliverable tree through the loop's own
+    // filter and demands exactly that, so the population is covered here by
+    // being covered there. Walking those trees again in this file would mean a
+    // second copy of a filter that drops Roles and Secrets; two copies can
+    // disagree while both stay green, which is the shape this file exists to
+    // refuse.
+    Computed {
+        expr: "&r.resource",
+        words: Words::Delegated {
+            owner_file: "crates/cog-reflection/src/mainline_deployer.rs",
+            owner_test: "the_evolution_role_covers_every_document_the_loop_will_apply",
+        },
+        guard: "objects_that_lost_fields(",
     },
 ];
 
@@ -744,6 +775,21 @@ fn slot_words(
                 .iter()
                 .map(|w| resolve_word(w))
                 .collect::<Result<Vec<_>, _>>(),
+            Words::Delegated {
+                owner_file,
+                owner_test,
+            } => {
+                let owner = std::fs::read_to_string(repo_root().join(owner_file))
+                    .unwrap_or_else(|e| panic!("{owner_file} unreadable: {e}"));
+                if !owner.contains(&format!("fn {owner_test}(")) {
+                    return Err(format!(
+                        "槽位 {:?} 的入口 {owner_file} 里没有 {owner_test}：它不再判那张人口，\
+                         这一行就是在替一个不存在的判据背书",
+                        slot
+                    ));
+                }
+                Ok(Vec::new())
+            }
         };
     }
     Err(format!(
