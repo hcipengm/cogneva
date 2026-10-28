@@ -24,6 +24,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 [ "${1:-}" = "" ] || ROOT="$1"
 
 fail=0
+# 判过的量：两份 README 各读到了没有、里面认出几块成员表。两个都可能是零，而零与
+# 「每一块都对得上」印出的是同一句话。
+docs_read=0
+blocks=0
 
 # 从 Rust 源里取出 `<trait>` 的成员名。只认 `pub trait X ... {` 到顶格 `}` 之间、且不以
 # `//` 开头的行——注释里写到一个方法名不算它是成员。
@@ -67,6 +71,7 @@ check_file() { # <README 文件名，相对 ROOT>
             *example*|*示例*)    label=example ;;
             *) continue ;;
         esac
+        blocks=$((blocks + 1))
         if [ "${path}" = "${trait}" ] || [ ! -f "${ROOT}/${path}" ]; then
             echo "READMEGATE ${doc}:${ln} 标为 Trait ${label}，但括号里的源路径定不到：${path}"
             fail=1
@@ -102,6 +107,7 @@ check_file() { # <README 文件名，相对 ROOT>
 
 for doc in README.md README.zh-CN.md; do
     [ -f "${ROOT}/${doc}" ] || continue
+    docs_read=$((docs_read + 1))
     check_file "${doc}"
 done
 
@@ -109,4 +115,15 @@ if [ "${fail}" -ne 0 ]; then
     echo "readme-trait-members: 标为「定义」的成员表必须与源一致（示例可以不齐）。" >&2
     exit 1
 fi
-echo "readme-trait-members: README 里标为 Trait 定义的成员表与源一致；示例块的缺项只作读数。"
+
+# 零与「都对得上」在输出上同形：一份 README 都没找到（换了文件名、检出没落地），
+# 或者两份里一处 Trait 成员表都没有（标签写法变了），本门都会印下面那句绿。
+if [ "${docs_read}" -eq 0 ]; then
+    echo "readme-trait-members: ${ROOT} 下 README.md 与 README.zh-CN.md 一份都没读到——没读到就判不了成员表" >&2
+    exit 3
+fi
+if [ "${blocks}" -eq 0 ]; then
+    echo "readme-trait-members: ${docs_read} 份 README 里一处 Trait 成员表都没有认出——零处与「每一处都对得上」在输出上同形" >&2
+    exit 3
+fi
+echo "readme-trait-members: ${docs_read} 份 README 里 ${blocks} 块 Trait 成员表与源一致；示例块的缺项只作读数。"
