@@ -2469,7 +2469,7 @@ data:
           "id": 58,
           "title": "Volume Capacity: Declaration, Granted and Measured Peak",
           "description": "The three numbers the growth loop decides from, per claim, drawn side by side: the declaration in force, what the storage side gave back (`granted`, the claim status capacity), and the highest usage ever measured against them. The `ceiling` line appears only while a claim is actually clamped, and its legend names the object that set it -- `limit_range` or `quota` -- so the wall and its owner arrive together rather than being inferred. The loop raises a declaration once the peak no longer fits, so on a healthy volume the peak line stays below the declared one and the gap is the headroom the loop is working with. A granted line below the declared one is an expansion that was asked for and never handed back -- on a class that cannot carry one it stays below forever, and the volume has no real bound at all. A peak above the granted line is data already on disk past what the volume was given. Neither number is derivable from the other side of the account -- the declaration is a request, the granted size is an answer, and the peak is a measurement -- which is why they are drawn rather than reduced to one ratio.",
-
+    
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -2932,6 +2932,136 @@ data:
               "custom": {
                 "drawStyle": "line",
                 "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 69,
+          "title": "Plugin Wiring: How Many Pins Are in a State Nothing Was Written For",
+          "description": "Five counts from the startup pin census, summed over the processes that publish them: reads of a pin nothing published, publishes of a pin nothing read, pins published by more than one party, init-time reads whose order against their publish no `requires` edge declares, and the size of the descriptor set the last four are taken over. Both halves of every family are published and only the count is drawn here -- the names are on the panel beside this one -- because a count alone stays the same when the population changes underneath it and the names alone cannot tell an empty family from an unwired reading. What none of these numbers is, is a verdict: a pin published for a reader in another process lands in the unsatisfied family beside a pin with no reader anywhere, an optional read is expected to go unsatisfied, and the audit cannot tell those apart. So there is no threshold on this panel and no rule reads one -- what a person reads here is which direction the population moved since the last time they looked, and the question the readings can answer: which types, and how many. A zero in the fourth count is three different facts (every edge declared, no init reads at all, or the census never ran) and the last of those is read elsewhere: the census reports nothing until the runner has started every plugin, so a process whose scrape precedes that shows these counts absent rather than zero.",
+          "type": "stat",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 328
+          },
+          "targets": [
+            {
+              "expr": "sum(cogneva_plugin_pin_unsatisfied_count)",
+              "legendFormat": "pins read, never published",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum(cogneva_plugin_pin_unconsumed_count)",
+              "legendFormat": "pins published, never read",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum(cogneva_plugin_pin_multi_published_count)",
+              "legendFormat": "pins with more than one publisher",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum(cogneva_plugin_pin_unordered_init_read_count)",
+              "legendFormat": "init reads with no declared order",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "sum(cogneva_plugin_publishes_count)",
+              "legendFormat": "plugins in the descriptor set",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "value": 0,
+                    "color": "text"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": 70,
+          "title": "Plugin Wiring: Which Pins, and What Each Plugin Published",
+          "description": "The names behind the counts beside this panel. Every member family here is one series per pin at value 1, so the line says nothing and the legend says everything: a flat line whose label is a type name is the reading, and it appears only while that state holds -- the census is re-taken from the process's own graph, so a pin that stops being unsatisfied disappears from the legend. The fifth query is the other shape: one series per plugin in the descriptor set, valued by how many pins it published, zeros included -- the legend names the plugin and the line's height is the count, since no label carries the number -- because the four anomaly families can only name a plugin that appears in the wiring and a plugin that produced no pin appears in none of them -- a pure reader and a config-disabled plugin both publish nothing and read the same 0 here, which the label does not claim to explain. Read a pin's name in this panel and look for it in the commit that added its `publish` or its `requires` edge: this is the surface the startup log line would have given, kept where it survives the process.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 328
+          },
+          "targets": [
+            {
+              "expr": "cogneva_plugin_pin_unsatisfied",
+              "legendFormat": "{{pin}} read by {{reader}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_plugin_pin_unconsumed",
+              "legendFormat": "{{pin}} published by {{publisher}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_plugin_pin_multi_published",
+              "legendFormat": "{{pin}} published more than once, by {{publisher}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_plugin_pin_unordered_init_read",
+              "legendFormat": "{{pin}} read by {{reader}} before {{publisher}} published",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_plugin_publishes",
+              "legendFormat": "{{plugin}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 1,
+                "fillOpacity": 0
               }
             }
           }

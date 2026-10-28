@@ -868,6 +868,67 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["week", "outcome"],
         "crates/cog-reflection/src/promotion_trend.rs",
     ),
+    // The startup pin census, all five families. Each is a count that always
+    // answers beside one series per member, and both halves are drawn because
+    // neither alone is a reading: the count stays the same when the population
+    // changes underneath it, and the members make an empty family and an
+    // unwired one look alike. The panel draws the counts summed and the members
+    // with their names in the legend, which is the sentence the scrape census
+    // owed this family -- a reader of the population, not a rule. No rule is
+    // written on any of them and none can be: a pin published for a reader in
+    // another process lands in the unsatisfied family beside a pin with no
+    // reader anywhere, and a plugin that published nothing is either a pure
+    // reader or config-disabled, which no label tells apart.
+    (
+        "cogneva_plugin_pin_unsatisfied",
+        &["pin", "reader"],
+        "crates/cogneva/src/pin_census.rs",
+    ),
+    (
+        "cogneva_plugin_pin_unsatisfied_count",
+        &[],
+        "crates/cogneva/src/pin_census.rs",
+    ),
+    (
+        "cogneva_plugin_pin_unconsumed",
+        &["pin", "publisher"],
+        "crates/cogneva/src/pin_census.rs",
+    ),
+    (
+        "cogneva_plugin_pin_unconsumed_count",
+        &[],
+        "crates/cogneva/src/pin_census.rs",
+    ),
+    (
+        "cogneva_plugin_pin_multi_published",
+        &["pin", "publisher"],
+        "crates/cogneva/src/pin_census.rs",
+    ),
+    (
+        "cogneva_plugin_pin_multi_published_count",
+        &[],
+        "crates/cogneva/src/pin_census.rs",
+    ),
+    (
+        "cogneva_plugin_pin_unordered_init_read",
+        &["pin", "reader", "publisher"],
+        "crates/cogneva/src/pin_census.rs",
+    ),
+    (
+        "cogneva_plugin_pin_unordered_init_read_count",
+        &[],
+        "crates/cogneva/src/pin_census.rs",
+    ),
+    (
+        "cogneva_plugin_publishes",
+        &["plugin"],
+        "crates/cogneva/src/pin_census.rs",
+    ),
+    (
+        "cogneva_plugin_publishes_count",
+        &[],
+        "crates/cogneva/src/pin_census.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

@@ -162,61 +162,19 @@ const DERIVED_SUFFIXES: &[&str] = &["_bucket", "_sum", "_count", "_observed_time
 /// no rows to compare against a retired list, so the recording surface for it
 /// is exactly this table.
 const UNREGISTERED: &[(&str, Unread)] = &[
-    // The pin census's four families, published as the reading surface for a
-    // family whose only other surface was an `info!` line. Each family is a
-    // count that always answers plus one series per member. The module says in
-    // as many words that no threshold belongs on them -- a pin published for a
-    // reader in another process lands in the same family as one with no reader
-    // anywhere, and an optional read is expected to go unsatisfied -- so what
-    // is owed is a reader of the population, not a rule. What makes it a debt
-    // rather than a decision is the module's own history: the family grew to
-    // thirty-one pins with no reading ever disagreeing, which is a size nobody
-    // was watching.
-    (
-        "cogneva_plugin_pin_unsatisfied",
-        Unread::Gap("one series per plugin pin whose read nothing satisfies, carrying the pin, its publisher and its reader. No threshold is derivable on it -- the module says a member is not by itself a fault -- so the face owed is a reader of the population rather than a rule, and there is none: this family exists because it grew to thirty-one pins with nobody noticing"),
-    ),
-    (
-        "cogneva_plugin_pin_unsatisfied_count",
-        Unread::Gap("how many pins are in that state, published so that a family of zero and an absent family read differently -- a count derivable with `count()` is still published on its own because only its presence separates an empty family from an unwired one. It is the denominator of the family above and carries no verdict of its own, so it is owed the reader that family is owed"),
-    ),
-    (
-        "cogneva_plugin_pin_unconsumed",
-        Unread::Gap("one series per plugin pin published with nothing consuming it. The parties of a member are a label rather than a series each, so a pin with two publishers stays one pin -- which means this series is the only place the population is visible, and no face carries it"),
-    ),
-    (
-        "cogneva_plugin_pin_unconsumed_count",
-        Unread::Gap("how many pins nothing consumes, as the always-answering half of the family above. The count alone stays the same when the population changes underneath it and the members alone make an empty family and an unwired reading look alike, which is why both halves are published; the pair is carried by no face"),
-    ),
-    (
-        "cogneva_plugin_pin_multi_published",
-        Unread::Gap("one series per plugin pin published by more than one party. The count of parties is not derivable from the other families -- a pin with two publishers is one member here and one member of the unconsumed family -- so nothing else states how wide the duplication is"),
-    ),
-    (
-        "cogneva_plugin_pin_multi_published_count",
-        Unread::Gap("how many pins are published more than once, as the always-answering half of the family above. The module's point is that this is the reading that says the wiring is doing something a single publisher would not; no rule, panel or table names it"),
-    ),
-    (
-        "cogneva_plugin_pin_unordered_init_read",
-        Unread::Gap("one series per read that happens at init with no declared order between it and the publish it depends on, so the publisher's layer alone decides whether the read is in time. Nothing carries the population, and a member here is a finding the startup log prints one line per at warn -- a reader is owed"),
-    ),
-    (
-        "cogneva_plugin_pin_unordered_init_read_count",
-        Unread::Gap("how many such reads a missing `requires` edge left unordered, as the always-answering half of the family above. The first reading of this family is also what found its own defect: the number was one larger than the series any query could count, because a read registered twice at init is one series on the exposition. That half is closed now -- the members are collapsed where the series are built, so the size and the series agree -- and what remains owed is the reader nothing has given it"),
-    ),
-    // The fifth pin family, and the only one whose members are not anomalies.
-    // The four above can name a plugin only through the wiring, so the plugin
-    // that started and published no pin had no reading at all: absent from
-    // every family, present on the descriptor table, and named by the startup
-    // log only as "start plugin". These two publish the population instead.
-    (
-        "cogneva_plugin_publishes",
-        Unread::Gap("one series per plugin in the descriptor set, valued by how many pins it published, zeros included. It is the inverse of the four families above: they name what went wrong among the pins that exist, and this names the plugin that produced none of them, which no pin-shaped reading can reach because a pin nobody published is not a pin. A zero is not by itself a fault -- a pure reader and a config-disabled plugin both publish nothing -- so what is owed is a reader of the population, not a rule"),
-    ),
-    (
-        "cogneva_plugin_publishes_count",
-        Unread::Gap("how many plugins the descriptor set holds, as the always-answering half of the family above. It is the denominator rather than a verdict: it stays the same when the composition changes underneath it and only the per-plugin series moves, which is exactly the pair the module keeps for its other families. No face reads the pair yet"),
-    ),
+    // A name that had ten `Gap` entries here until two panels were written to
+    // read the pin census: the four pin families with their counts and the
+    // plugin population with its count. Each entry said what was owed was a
+    // reader of the population rather than a rule -- no threshold is derivable
+    // on them, since a pin published for a reader in another process lands in
+    // the unsatisfied family beside one with no reader anywhere -- and the
+    // panels now carry both halves: the counts summed into a stat and the
+    // members drawn with the pin, reader and publisher names in the legend.
+    // The entries are gone and `GAPS_AT_SCRAPE_CENSUS` came down by ten. What
+    // the panels do not settle is a bound, and one was never owed here: the
+    // fourth count alone is three different facts (every edge declared, no init
+    // reads at all, or the census never ran) and the last of those is read from
+    // the absence of the family rather than from the number.
     // A series a build publishes with nothing anywhere reading it, found by a
     // scan rather than by a reader: the count of observables registered for
     // scraping. Its producer spelled the name inline in the exposition body,
@@ -397,7 +355,19 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// rendered with nothing reading it. It was raised rather than exempted because
 /// the face owed is a rule of the same shape as the sibling's, which is a reader
 /// someone can write -- see the entry for what it says.
-const GAPS_AT_SCRAPE_CENSUS: usize = 14;
+///
+/// Down to four when the pin census got its panels: the four pin families and
+/// the plugin population, each published as a count plus one series per member,
+/// sat here as ten `Gap` entries whose reason was the same sentence in ten
+/// spellings -- the face owed is a reader of the population, not a rule, and
+/// there was none. Two panels pay all ten at once, because the reader those
+/// entries asked for is one reader of the whole census: the counts summed into
+/// a stat, the members drawn with their names in the legend. Ten came off in one
+/// pass, which is the largest single step this ratchet has taken; it is also the
+/// one most worth checking afterwards, since a handful of names can leave a
+/// table in a single edit and nothing but the panels drawing them keeps them
+/// read.
+const GAPS_AT_SCRAPE_CENSUS: usize = 4;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
