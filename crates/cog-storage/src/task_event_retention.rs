@@ -372,9 +372,9 @@ impl TaskEventRetention {
     /// comparing it to the retention go silent exactly while the archive is
     /// clean.
     async fn oldest_age_secs(&self) -> SFResult<i64> {
-        sqlx::query(&format!(
-            "SELECT EXTRACT(EPOCH FROM (NOW() - min(created_at)))::bigint AS age FROM {}",
-            cog_core::sql::quote_relation(&self.table)
+        sqlx::query(&cog_core::sql::relation_oldest_age_sql(
+            &self.table,
+            "created_at",
         ))
         .fetch_one(&self.pool)
         .await

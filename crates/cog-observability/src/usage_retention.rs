@@ -269,13 +269,11 @@ impl UsageRetention {
     /// Zero for an empty ledger rather than an absent series: a table nobody
     /// has written to is not a retention that has fallen behind.
     async fn oldest_age_secs(&self) -> SFResult<i64> {
-        sqlx::query(&format!(
-            "SELECT EXTRACT(EPOCH FROM (NOW() - MIN(ts)))::bigint AS age FROM {LEDGER_TABLE}"
-        ))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))
-        .map(|row| row.get::<Option<i64>, _>("age").unwrap_or(0))
+        sqlx::query(&cog_core::sql::relation_oldest_age_sql(LEDGER_TABLE, "ts"))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))
+            .map(|row| row.get::<Option<i64>, _>("age").unwrap_or(0))
     }
 
     /// Rows below the fold's floor, and the age of the oldest of them.

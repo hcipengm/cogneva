@@ -54,6 +54,23 @@ pub fn relation_rows_sql(relation: &str) -> String {
 /// 拿到 NULL 时自己给出带名字的错误。
 pub const RELATION_BYTES_SQL: &str = "SELECT pg_total_relation_size(to_regclass($1))";
 
+/// 一条关系里最老的一行有多旧，单位秒；空表读成 NULL。
+///
+/// 与上面两把尺子同一族：任务事件归档、交换归档与用量账各发布一条「最新的东西
+/// 排到多久以前」，三条线并排比着看，比的是一场保留策略在这张表上还剩多少真。
+/// 时间列各表不同（写入口起的名），所以它是参数；除此之外一个字都不许改——
+/// 换成 `avg`、加一个 `WHERE`、把 NULL 换成 0（0 秒是「刚刚」），三条线就不再
+/// 量同一件事，而它们各自照旧读得通。
+///
+/// NULL 留给调用方：空表没有最老一行，那不是一个年龄，也不该被算成一个。
+pub fn relation_oldest_age_sql(relation: &str, time_column: &str) -> String {
+    format!(
+        "SELECT EXTRACT(EPOCH FROM (NOW() - min({})))::bigint AS age FROM {}",
+        quote_relation(time_column),
+        quote_relation(relation)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +107,25 @@ mod tests {
         assert_eq!(
             relation_rows_sql("archive.cog_events"),
             "SELECT count(*) FROM \"archive\".\"cog_events\""
+        );
+    }
+
+    /// 年龄那把尺子只换时间列，其余照旧：列名也走同一层引号。
+    #[test]
+    fn the_age_reading_varies_only_in_the_time_column() {
+        assert_eq!(
+            relation_oldest_age_sql("cog_task_events", "created_at"),
+            "SELECT EXTRACT(EPOCH FROM (NOW() - min(\"created_at\")))::bigint AS age \
+             FROM \"cog_task_events\""
+        );
+        // 同一个问题在另一张表上只差名字：语句的其余部分是同一串字符。
+        let a = relation_oldest_age_sql("cog_task_events", "created_at");
+        let b = relation_oldest_age_sql("gateway_llm_exchange", "ts");
+        assert_eq!(
+            a.replace("\"cog_task_events\"", "")
+                .replace("\"created_at\"", ""),
+            b.replace("\"gateway_llm_exchange\"", "")
+                .replace("\"ts\"", "")
         );
     }
 

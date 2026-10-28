@@ -259,14 +259,11 @@ impl ExchangeRetention {
     /// comparing it to the retention go silent exactly while the archive is
     /// clean.
     async fn oldest_age_secs(&self) -> SFResult<i64> {
-        sqlx::query(&format!(
-            "SELECT EXTRACT(EPOCH FROM (NOW() - min(ts)))::bigint AS age FROM {}",
-            cog_core::sql::quote_relation(&self.table)
-        ))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))
-        .map(|row| row.get::<Option<i64>, _>("age").unwrap_or(0))
+        sqlx::query(&cog_core::sql::relation_oldest_age_sql(&self.table, "ts"))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))
+            .map(|row| row.get::<Option<i64>, _>("age").unwrap_or(0))
     }
 
     /// What the archive costs on disk, in bytes.
