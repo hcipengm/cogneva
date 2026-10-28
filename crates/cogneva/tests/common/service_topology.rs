@@ -689,21 +689,16 @@ pub fn routes_of(root: &Path, files: &[PathBuf]) -> BTreeSet<String> {
         .collect()
 }
 
-/// 整棵树注册的路径。主应用的路由由插件在运行时装配，静态读不到「谁挂了哪条」，
-/// 所以对那份代码只问「这棵树里有没有」。
-pub fn every_route(root: &Path) -> BTreeSet<String> {
-    let mut files = Vec::new();
-    walk(&root.join("crates"), &["rs"], &mut files);
-    files.retain(|path| path.to_string_lossy().contains("/src/"));
-    files.sort();
-    routes_of(root, &files)
-}
-
 /// 一个容器起的那份代码注册的路径。
 ///
-/// 不带子命令的那个容器是主应用，返回 [`every_route`]——它的路由由插件在运行时
+/// 不带子命令的那个容器是主应用，返回 `every`——它的路由由插件在运行时
 /// 装配，静态读不到「哪个插件挂了哪条路由」，这一档比别的宽，宽在哪儿由调用方在
 /// 自己的判据里写明。
+///
+/// `every` 由调用方按共享的生产普查（[`super::rust_production::production_sources`]）
+/// 算出来再传进来：
+/// 这里曾经自己走一遍 `crates/` 再按 `/src/` 筛，那是同一份人口定义的第二种写法，
+/// 筛掉什么、留下什么只有与普查对读才知道。
 pub fn container_routes(
     root: &Path,
     subcommand: Option<&str>,

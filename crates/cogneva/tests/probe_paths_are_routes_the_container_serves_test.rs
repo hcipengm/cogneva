@@ -47,12 +47,13 @@
 
 mod common;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use common::routes::repo_root;
-use common::service_topology::{container_routes, every_route, our_image, workloads};
+use common::rust_production::{production_sources, sources_of_tree};
+use common::service_topology::{container_routes, our_image, routes_of, workloads};
 
-fn complaints(root: &Path) -> Vec<String> {
+fn complaints(root: &Path, files: &[PathBuf]) -> Vec<String> {
     let mut out = Vec::new();
     let Some(image) = our_image(root) else {
         out.push(format!(
@@ -61,7 +62,7 @@ fn complaints(root: &Path) -> Vec<String> {
         ));
         return out;
     };
-    let every = every_route(root);
+    let every = routes_of(root, files);
     if every.is_empty() {
         out.push(
             "  这棵树的 `crates/*/src` 里一条 `.route(\"…\")` 都没读到：读不出来按红处理"
@@ -128,7 +129,8 @@ fn complaints(root: &Path) -> Vec<String> {
 
 #[test]
 fn a_probe_path_is_a_route_the_container_serves() {
-    let found = complaints(&repo_root());
+    let root = repo_root();
+    let found = complaints(&root, &production_sources(&root));
     assert!(
         found.is_empty(),
         "静态清单里每个探针路径都必须是那个容器起的代码注册过的路由；这两处各自写一遍，\
@@ -146,7 +148,7 @@ fn fixture(files: &[(&str, &str)]) -> Vec<String> {
         std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
         std::fs::write(full, body).expect("write");
     }
-    complaints(dir.path())
+    complaints(dir.path(), &sources_of_tree(dir.path()))
 }
 
 const VALUES: &str = "image:\n  repository: registry.example/cogneva\n  tag: local\n";

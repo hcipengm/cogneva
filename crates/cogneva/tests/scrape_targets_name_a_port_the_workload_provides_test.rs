@@ -59,13 +59,14 @@
 mod common;
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cog_reflection::observability_stack::{read_dispositions_from, Disposition};
 
 use common::routes::repo_root;
+use common::rust_production::{production_sources, sources_of_tree};
 use common::service_topology::{
-    container_routes, declared_namespaces, every_route, monitors, our_image, selector_matches,
+    container_routes, declared_namespaces, monitors, our_image, routes_of, selector_matches,
     services, workloads, ContainerSpec, Monitor,
 };
 
@@ -104,12 +105,12 @@ fn is_our_image(image: Option<&String>, container: &ContainerSpec) -> bool {
     image.is_some_and(|our| container.image.starts_with(our))
 }
 
-fn complaints(root: &Path) -> Vec<String> {
+fn complaints(root: &Path, files: &[PathBuf]) -> Vec<String> {
     let mut out = Vec::new();
     let workloads = workloads(root);
     let services = services(root);
     let declared = declared_namespaces(root);
-    let every = every_route(root);
+    let every = routes_of(root, files);
     let image = our_image(root);
     let exempt = match exempt_files(root) {
         Ok(exempt) => exempt,
@@ -355,7 +356,8 @@ where
 
 #[test]
 fn a_scrape_target_names_a_port_and_path_the_workload_provides() {
-    let found = complaints(&repo_root());
+    let root = repo_root();
+    let found = complaints(&root, &production_sources(&root));
     assert!(
         found.is_empty(),
         "监视器指向的端口名与路径必须是工作负载真的提供的那一个；这三处各自写一遍，\
@@ -373,7 +375,7 @@ fn fixture(files: &[(&str, &str)]) -> Vec<String> {
         std::fs::create_dir_all(full.parent().expect("parent")).expect("dir");
         std::fs::write(full, body).expect("write");
     }
-    complaints(dir.path())
+    complaints(dir.path(), &sources_of_tree(dir.path()))
 }
 
 const VALUES: &str = "image:\n  repository: registry.example/cogneva\n  tag: local\n";

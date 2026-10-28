@@ -52,7 +52,7 @@ mod common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{all_crate_files, crate_files_of};
+use common::rust_production::{production_sources, sources_of_tree};
 
 /// Where the registry lives, relative to the workspace root.
 const REGISTRY: &str = "crates/cogneva/tests/data/rust-capacity-constants.tsv";
@@ -78,7 +78,8 @@ struct Row {
     note: String,
 }
 
-/// Every `const NAME: <numeric type> = <initializer starting with a digit>;`.
+/// Every `const NAME: <numeric type> = <initializer starting with a digit>;`
+/// in `files`.
 ///
 /// Deliberately syntactic. A number computed from other constants at compile
 /// time (`const SIXTY: u64 = SECS * 60;`) is not a written number and is not an
@@ -86,6 +87,12 @@ struct Row {
 /// no measurement will move it. The initializer's first character is the whole
 /// test -- parsing expressions would mean half-reading them, and a half-read
 /// expression in a registry reads as a decision.
+///
+/// The population is the caller's: shipping sources, and a fixture's numbers
+/// are the fixture's business. This used to decide that for itself by keeping
+/// paths that contain `/src/` -- a second answer to a question the census
+/// already answers, and one that reads a caller's mistaken list as a complete
+/// register rather than as a short one.
 fn scan(root: &Path, files: &[PathBuf]) -> Vec<Row> {
     let mut rows = Vec::new();
     for entry in files {
@@ -94,11 +101,6 @@ fn scan(root: &Path, files: &[PathBuf]) -> Vec<Row> {
             .unwrap_or(entry)
             .to_string_lossy()
             .to_string();
-        // A crate's own `tests/`, `benches/` and `examples/` are not shipped
-        // bounds: a fixture's numbers are the fixture's business.
-        if !rel.contains("/src/") {
-            continue;
-        }
         let Ok(text) = std::fs::read_to_string(entry) else {
             continue;
         };
@@ -363,7 +365,7 @@ fn write_registry(root: &Path, scanned: &[Row], existing: &[Row]) {
 #[test]
 fn every_capacity_number_in_rust_says_where_it_comes_from() {
     let root = repo_root();
-    let scanned = scan(&root, &all_crate_files(&root));
+    let scanned = scan(&root, &production_sources(&root));
     let existing = read_registry(&root);
     if std::env::var("COGNEVA_CAPACITY_REGISTRY_WRITE").as_deref() == Ok("1") {
         write_registry(&root, &scanned, &existing);
@@ -447,7 +449,7 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
 #[test]
 fn the_scan_sees_production_constants_and_not_fixtures() {
     let root = repo_root();
-    let scanned = scan(&root, &all_crate_files(&root));
+    let scanned = scan(&root, &production_sources(&root));
     assert!(
         scanned.len() > 100,
         "the scan found {} constants, far below what crates/*/src holds: the walk is \
@@ -498,7 +500,7 @@ const PLAIN: u64 = 30;
     )
     .unwrap();
     let value_of = |name: &str| {
-        scan(&root, &crate_files_of(&root))
+        scan(&root, &sources_of_tree(&root))
             .into_iter()
             .find(|r| r.name == name)
             .map(|r| r.value)
@@ -542,7 +544,7 @@ const AFTER: u64 = 45;
 "#,
     )
     .unwrap();
-    let names: Vec<String> = scan(&root, &crate_files_of(&root))
+    let names: Vec<String> = scan(&root, &sources_of_tree(&root))
         .into_iter()
         .map(|row| row.name)
         .collect();
@@ -603,7 +605,10 @@ fn scan_bare_literals(root: &Path, files: &[PathBuf]) -> BTreeMap<(String, Strin
             .unwrap_or(entry)
             .to_string_lossy()
             .to_string();
-        if !rel.contains("/src/") || DECLARATION_FILES.contains(&rel.as_str()) {
+        // The population (shipping sources only) is the caller's, the same one
+        // `scan` gets. A declaration is excluded here because it is a named
+        // number, not a written one.
+        if DECLARATION_FILES.contains(&rel.as_str()) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(entry) else {
@@ -913,7 +918,7 @@ fn write_bare_literals(root: &Path, scanned: &BTreeMap<(String, String), usize>)
 #[test]
 fn a_number_at_the_point_of_use_is_counted_where_it_is_used() {
     let root = repo_root();
-    let scanned = scan_bare_literals(&root, &all_crate_files(&root));
+    let scanned = scan_bare_literals(&root, &production_sources(&root));
     let existing = read_bare_literals(&root);
     if std::env::var("COGNEVA_BARE_LITERAL_REGISTRY_WRITE").as_deref() == Ok("1") {
         write_bare_literals(&root, &scanned);
@@ -995,7 +1000,18 @@ fn below_the_module() -> Duration {
 "##,
     )
     .unwrap();
-    let scanned = scan_bare_literals(&root, &crate_files_of(&root));
+    // A gate file in the same crate, with the same number typed into it. It is
+    // not shipped, so it is not debt -- and this file is what makes the
+    // assertion below able to fail: with only the src file present, "every row
+    // came from src/" holds no matter how the population is read.
+    let tests = root.join("crates/probe/tests");
+    std::fs::create_dir_all(&tests).unwrap();
+    std::fs::write(
+        tests.join("a_gate.rs"),
+        "fn a_case() {\n    tokio::time::sleep(Duration::from_secs(3600)).await;\n}\n",
+    )
+    .unwrap();
+    let scanned = scan_bare_literals(&root, &sources_of_tree(&root));
     let row = scanned
         .get(&(
             "crates/probe/src/production.rs".to_string(),
@@ -1009,7 +1025,8 @@ fn below_the_module() -> Duration {
     );
     assert!(
         scanned.keys().all(|(file, _)| file.contains("/src/")),
-        "a test or fixture file was counted as production hardcoding"
+        "a test or fixture file was counted as production hardcoding: {:?}",
+        scanned.keys().collect::<Vec<_>>()
     );
     std::fs::remove_dir_all(&root).ok();
 }
