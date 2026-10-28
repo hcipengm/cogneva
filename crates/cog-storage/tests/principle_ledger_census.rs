@@ -34,6 +34,8 @@
 //! The counts are of the whole table, so every case here asserts a **delta**
 //! rather than a number, and cleans up the rows it filed.
 
+mod common;
+
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
@@ -49,7 +51,7 @@ use cog_test_support::database_url;
 
 async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
     let url = database_url();
-    migrate_once(&url).await;
+    common::migrate_once(&url, 97_002).await;
     let pool = PgPool::connect(&url)
         .await
         .expect("connect to the database");
@@ -59,27 +61,6 @@ async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
         pool,
         format!("probe-principle-census:{}", uuid::Uuid::new_v4()),
     )
-}
-
-async fn migrate_once(url: &str) {
-    let pool = PgPool::connect(url)
-        .await
-        .expect("connect to take the lock");
-    let mut conn = pool.acquire().await.expect("acquire the schema lock");
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(97_002_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("take the schema lock");
-    cog_storage::migrate::Migrator::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .run(url)
-        .await
-        .expect("apply the migrations to the throwaway database");
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(97_002_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("release the schema lock");
 }
 
 /// One refusal as a gate reports it, at an instant of this run.

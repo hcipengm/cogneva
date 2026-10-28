@@ -17,6 +17,8 @@
 //! database is left as it was found. Each test gets its own table because the
 //! tests share one database and run in parallel.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,13 +52,6 @@ async fn fresh_probe(pool: &PgPool, table: &str) {
     .execute(pool)
     .await
     .unwrap();
-}
-
-async fn drop_probe(pool: &PgPool, table: &str) {
-    sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
-        .execute(pool)
-        .await
-        .unwrap();
 }
 
 /// Insert `rows` rows of one series, each `age` old.
@@ -106,19 +101,14 @@ async fn insert_counter_series(pool: &PgPool, table: &str, series: i64, rows: i6
     .unwrap();
 }
 
-async fn count(pool: &PgPool, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-        .fetch_one(pool)
-        .await
-        .unwrap()
-}
-
 async fn count_named(pool: &PgPool, table: &str, name: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE name = $1"))
-        .bind(name)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_scalar(&format!(
+        "SELECT common::count(*) FROM {table} WHERE name = $1"
+    ))
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 fn cap(pool: PgPool, table: &str, budget: u64) -> SampleLogCap {
@@ -147,7 +137,7 @@ async fn wait_for_held(health: &LoopHealth, want: f64, limit: Duration) -> Optio
 async fn wait_for_rows(pool: &PgPool, table: &str, want: i64, limit: Duration) -> i64 {
     let started = Instant::now();
     loop {
-        let held = count(pool, table).await;
+        let held = common::count(pool, table).await;
         if held <= want || started.elapsed() >= limit {
             return held;
         }
@@ -210,8 +200,8 @@ async fn a_log_over_budget_is_brought_back_to_it_oldest_first() {
     assert_eq!(outcome.held, 12);
     assert_eq!(outcome.budget, Some(12));
     assert!(!outcome.floor_held);
-    assert_eq!(count(&pool, table).await, 12);
-    drop_probe(&pool, table).await;
+    assert_eq!(common::count(&pool, table).await, 12);
+    common::drop_probe(&pool, table).await;
 }
 
 /// A log already inside its budget is left alone: the sweep deletes the
@@ -229,8 +219,8 @@ async fn a_log_inside_budget_removes_nothing() {
     assert_eq!(outcome.removed, 0);
     assert_eq!(outcome.held, 7);
     assert!(!outcome.floor_held);
-    assert_eq!(count(&pool, table).await, 7);
-    drop_probe(&pool, table).await;
+    assert_eq!(common::count(&pool, table).await, 7);
+    common::drop_probe(&pool, table).await;
 }
 
 /// An overshoot larger than one statement has to be drained by the loop, not
@@ -247,8 +237,8 @@ async fn an_overshoot_larger_than_one_statement_is_drained_completely() {
 
     assert_eq!(outcome.removed, 44_995);
     assert_eq!(outcome.held, 5);
-    assert_eq!(count(&pool, table).await, 5);
-    drop_probe(&pool, table).await;
+    assert_eq!(common::count(&pool, table).await, 5);
+    common::drop_probe(&pool, table).await;
 }
 
 /// A zero budget turns pruning off rather than deleting everything, which is
@@ -265,8 +255,8 @@ async fn a_zero_budget_prunes_nothing() {
 
     assert_eq!(outcome.removed, 0);
     assert_eq!(outcome.budget, None);
-    assert_eq!(count(&pool, table).await, 9);
-    drop_probe(&pool, table).await;
+    assert_eq!(common::count(&pool, table).await, 9);
+    common::drop_probe(&pool, table).await;
 }
 
 /// The floor is the point of the whole exercise: a budget tight enough to run
@@ -294,7 +284,7 @@ async fn every_series_keeps_its_newest_row_even_when_the_budget_is_below_that() 
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT count(*) FROM (
+            "SELECT common::count(*) FROM (
                  SELECT DISTINCT ON (labels) id FROM {table} ORDER BY labels, timestamp DESC
              ) heads"
         ))
@@ -304,7 +294,7 @@ async fn every_series_keeps_its_newest_row_even_when_the_budget_is_below_that() 
         series,
         "every series must still be readable through its newest row"
     );
-    drop_probe(&pool, table).await;
+    common::drop_probe(&pool, table).await;
 }
 
 /// The floor is about which kinds are read through the log, not about being a
@@ -335,7 +325,7 @@ async fn only_a_gauge_series_keeps_a_row() {
     assert_eq!(outcome.removed, 7);
     assert_eq!(outcome.held, 1);
     assert!(!outcome.floor_held);
-    drop_probe(&pool, table).await;
+    common::drop_probe(&pool, table).await;
 }
 
 /// A counter keyed on an object id mints a label set per object and never
@@ -359,7 +349,7 @@ async fn a_counter_whose_series_do_not_repeat_can_be_brought_under_budget() {
         !outcome.floor_held,
         "nothing in a counter's log is a value any reader reaches it through"
     );
-    drop_probe(&pool, table).await;
+    common::drop_probe(&pool, table).await;
 }
 
 /// The same floor must not block a sweep that the budget can actually meet.
@@ -378,7 +368,7 @@ async fn the_floor_does_not_stop_a_sweep_the_budget_can_meet() {
     assert_eq!(outcome.held, 40);
     assert_eq!(outcome.removed, 210);
     assert!(!outcome.floor_held);
-    drop_probe(&pool, table).await;
+    common::drop_probe(&pool, table).await;
 }
 
 /// A sweep that reaches the budget is not a sweep the floor stopped, even when
@@ -435,7 +425,7 @@ async fn a_sweep_that_reaches_the_budget_is_not_a_sweep_the_floor_stopped() {
         "a pass that took every row it was asked to did not stop at the floor: \
          the count above the budget is the writes, not the heads"
     );
-    drop_probe(&pool, table).await;
+    common::drop_probe(&pool, table).await;
     // The trigger outlives the table it was attached to, so the function is
     // dropped only once nothing depends on it.
     sqlx::query(&format!("DROP FUNCTION IF EXISTS {table}_writer()"))
@@ -516,7 +506,7 @@ async fn the_role_is_taken_only_by_the_deployments_that_prune() {
     shutdown.trigger();
     running.await.unwrap();
     assert_eq!(
-        count(&pool, table).await,
+        common::count(&pool, table).await,
         20,
         "a zero budget must leave every row whether or not a role was available"
     );
@@ -554,7 +544,7 @@ async fn the_role_is_taken_only_by_the_deployments_that_prune() {
     shutdown.trigger();
     running.await.unwrap();
     assert_eq!(
-        count(&pool, table).await,
+        common::count(&pool, table).await,
         20,
         "a process that does not hold the role must not prune"
     );
@@ -584,7 +574,7 @@ async fn the_role_is_taken_only_by_the_deployments_that_prune() {
     running.await.unwrap();
 
     clear_role(&pool).await;
-    drop_probe(&pool, table).await;
+    common::drop_probe(&pool, table).await;
 }
 
 /// What the loop publishes says which deployment published it.
@@ -672,5 +662,5 @@ async fn the_readings_name_the_deployment_that_published_them() {
         "a blank deployment name is no name, not an empty one"
     );
 
-    drop_probe(&pool, table).await;
+    common::drop_probe(&pool, table).await;
 }

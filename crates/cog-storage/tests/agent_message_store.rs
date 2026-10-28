@@ -18,6 +18,8 @@
 //! Every row this test writes carries a per-run peer name and is deleted at the
 //! end.
 
+mod common;
+
 use sqlx::PgPool;
 
 use cog_storage::{AgentMessageStore, NewAgentMessage, PostgresAgentMessageStore, SendOutcome};
@@ -35,7 +37,7 @@ struct Probe {
 
 async fn probe() -> Probe {
     let url = database_url();
-    migrate_once(&url).await;
+    common::migrate_once(&url, 97_004).await;
     let pool = PgPool::connect(&url)
         .await
         .expect("connect to the throwaway database");
@@ -46,29 +48,6 @@ async fn probe() -> Probe {
         left: format!("probe-left-{run}"),
         right: format!("probe-right-{run}"),
     }
-}
-
-/// Apply the migrations under a session advisory lock, so concurrent test
-/// binaries do not race on the same DDL.
-async fn migrate_once(url: &str) {
-    let pool = PgPool::connect(url)
-        .await
-        .expect("connect to take the lock");
-    let mut conn = pool.acquire().await.expect("acquire the schema lock");
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(97_004_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("take the schema lock");
-    cog_storage::migrate::Migrator::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .run(url)
-        .await
-        .expect("apply the migrations to the throwaway database");
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(97_004_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("release the schema lock");
 }
 
 async fn cleanup(probe: &Probe) {

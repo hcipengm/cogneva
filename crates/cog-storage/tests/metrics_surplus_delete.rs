@@ -32,6 +32,8 @@
 //!   cargo test -p cog-storage --test metrics_surplus_delete -- --ignored
 //! ```
 
+mod common;
+
 use std::collections::HashSet;
 
 use serde_json::Value;
@@ -87,13 +89,6 @@ async fn fresh_probe(pool: &PgPool, table: &str) {
     .execute(pool)
     .await
     .unwrap();
-}
-
-async fn drop_probe(pool: &PgPool, table: &str) {
-    sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
-        .execute(pool)
-        .await
-        .unwrap();
 }
 
 /// The shapes the live log holds, in the order a sweep meets them: a histogram
@@ -186,13 +181,6 @@ fn ranked_form(table: &str, limit: i64) -> String {
 
 async fn ids(pool: &PgPool, statement: &str) -> Vec<i32> {
     sqlx::query_scalar(statement).fetch_all(pool).await.unwrap()
-}
-
-async fn count(pool: &PgPool, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-        .fetch_one(pool)
-        .await
-        .unwrap()
 }
 
 /// The plan of the statement the sweep runs, built from the producer's own text
@@ -300,7 +288,7 @@ async fn a_pass_takes_the_same_rows_the_ranked_statement_took() {
     fresh_probe(&pool, ROWS_PROBE).await;
     seed(&pool, ROWS_PROBE, 2_000).await;
 
-    let held = count(&pool, ROWS_PROBE).await;
+    let held = common::count(&pool, ROWS_PROBE).await;
     assert!(
         held > TAKEN + 500,
         "the fixture has no surplus to prune: {held} rows held, {TAKEN} asked for"
@@ -363,7 +351,7 @@ async fn a_pass_takes_the_same_rows_the_ranked_statement_took() {
         "the pass did not take the rows the ranked statement took"
     );
 
-    drop_probe(&pool, ROWS_PROBE).await;
+    common::drop_probe(&pool, ROWS_PROBE).await;
 }
 
 #[tokio::test]
@@ -389,7 +377,7 @@ async fn a_batch_costs_the_batch_and_not_the_log_it_is_cut_from() {
             .unwrap();
     }
     assert_eq!(
-        count(&pool, BIG_PROBE).await,
+        common::count(&pool, BIG_PROBE).await,
         BIG_ROWS + 2_366,
         "the large fixture is not the size the cost question is asked of"
     );
@@ -454,6 +442,6 @@ async fn a_batch_costs_the_batch_and_not_the_log_it_is_cut_from() {
          over {SMALL_ROWS}, so its cost follows the log rather than the batch"
     );
 
-    drop_probe(&pool, BIG_PROBE).await;
-    drop_probe(&pool, SMALL_PROBE).await;
+    common::drop_probe(&pool, BIG_PROBE).await;
+    common::drop_probe(&pool, SMALL_PROBE).await;
 }

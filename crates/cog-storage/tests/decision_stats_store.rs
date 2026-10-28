@@ -25,6 +25,8 @@
 //!
 //! The tests here run one at a time, under [`CELLS`], for the same reason.
 
+mod common;
+
 use std::sync::Arc;
 
 use sqlx::PgPool;
@@ -84,7 +86,7 @@ impl Probe {
 async fn probe() -> (tokio::sync::MutexGuard<'static, ()>, Probe) {
     let guard = CELLS.lock().await;
     let url = database_url();
-    migrate_once(&url).await;
+    common::migrate_once(&url, 97_004).await;
     let pool = PgPool::connect(&url)
         .await
         .expect("connect to the database");
@@ -95,30 +97,6 @@ async fn probe() -> (tokio::sync::MutexGuard<'static, ()>, Probe) {
     };
     cleanup(&probe).await;
     (guard, probe)
-}
-
-/// Apply the migrations under a session advisory lock, the same way the other
-/// store tests do: the DDL is mutually exclusive, so a second caller waits for
-/// the first and then finds every version already applied.
-async fn migrate_once(url: &str) {
-    let pool = PgPool::connect(url)
-        .await
-        .expect("connect to take the lock");
-    let mut conn = pool.acquire().await.expect("acquire the schema lock");
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(97_004_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("take the schema lock");
-    cog_storage::migrate::Migrator::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .run(url)
-        .await
-        .expect("apply the migrations to the throwaway database");
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(97_004_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("release the schema lock");
 }
 
 async fn cleanup(probe: &Probe) {

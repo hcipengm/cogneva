@@ -44,6 +44,10 @@
 //! 唯一共有的是**函数体**：去掉注释、折叠空白之后逐字相同。所以这一面按体判——
 //! 两个夹具里出现同一段体（哪怕叫法不同）就是同一条规则的第二份。
 //!
+//! 这一面扫**每个 crate** 的 `tests/`，按 crate 分组比较：一处抄件最近的搬法是它自己
+//! crate 的 `tests/common/`。跨 crate 的那一半归支撑 crate 那一面判（`cog-test-support`
+//! 里定义过的体，任何夹具里都不许再出现）。
+//!
 //! 体相同的那几条今天多半已经搬进 `common::rust_text`（`snake_case`、`raw_string_end`、
 //! `trailing_identifier`、`is_lower_word`）。剩下没搬的那些记在
 //! `KNOWN_DUPLICATED_BODIES` 里，那张表只能变短：合并掉一条就删一行，留着会让
@@ -151,6 +155,10 @@ const SUPPORT_ENTRY_POINTS: [&str; 7] = [
 /// 红：`env::var` 读一个没人设置的名字，与「本来就没配」在调用点上完全同形。
 const SUPPORT_ENV_NAMES: [&str; 2] = ["COGNEVA_TEST_DATABASE_URL", "COGNEVA_TEST_REDIS_URL"];
 
+/// 「两个夹具写同一段体」这一面今天真数过的函数体个数：2026-10-29 实测 2544。测法：
+/// 把下面的下限临时调到一个够不着的数，红的那句会印出当天的读数。
+const MIN_BODY_SITES: usize = 2000;
+
 /// 够到支撑 crate 的调用点下限。今天 69 处。这一面判的是「没有第二处在读」，把调用点
 /// 全删了它也一样绿，所以另一头要有底：这些人真的在用那个 crate。
 const MIN_SUPPORT_CALLSITES: usize = 60;
@@ -194,6 +202,9 @@ struct Census {
     strippers: usize,
     /// 函数体逐字相同、却定义在不止一个夹具文件里的那些：名字 →（文件:行, 名字）。
     duplicate_bodies: Vec<(String, Vec<String>)>,
+    /// 这一面真数过的函数体个数（≥80 字符、顶格定义）。空树与「一条同体都没有」在
+    /// 判词上同形，所以它要有底。
+    body_sites: usize,
     /// 支撑 crate 里已经有一份、夹具里又写了一遍的：（文件:行 名字, 支撑 crate 里的名字）。
     support_copies: Vec<(String, String)>,
     /// 支撑 crate 之外，直接读它负责的那两个环境变量的地方：`文件:行 这一行`。
@@ -346,12 +357,15 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     let mut recursions = Vec::new();
     let mut env_reads: Vec<String> = Vec::new();
     let mut support_callsites = 0usize;
+    let mut body_sites = 0usize;
     let mut control_builds: Vec<String> = Vec::new();
     let mut orchestrator_callsites = 0usize;
     let mut files = 0usize;
     let (mut readers, mut walkers, mut strippers) = (0usize, 0usize, 0usize);
-    // 函数体 → 出现它的「文件:行 名字」。按体分组，所以同一个体换了名字也照样并到一起。
-    let mut bodies: std::collections::BTreeMap<String, Vec<String>> =
+    // (crate 根, 函数体) → 出现它的「文件:行 名字」。按体分组，所以同一个体换了名字也
+    // 照样并到一起；带上 crate 根，是因为「同一份规则写两遍」的最小搬法是 crate 内的
+    // `tests/common/`，跨 crate 的那一半归 `support_copies` 判。
+    let mut bodies: std::collections::BTreeMap<(String, String), Vec<String>> =
         std::collections::BTreeMap::new();
     // 支撑 crate 那一面的两半：它自己定义了哪些体（体 → 名字），以及别的夹具都写了
     // 哪些体（「文件:行 名字」, 体）。两半都在这一趟里收，收完再配对——这样判据读的
@@ -380,15 +394,17 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         }
         if name.contains("/tests/") && name != THE_PREDICATE && name != THE_ONE {
             recursions.extend(recursions_in(&name, &text));
-            // 同体只在**本 crate 的夹具**之间比。跨 crate 的抄件（`database_url` 曾经在
-            // 四个 crate 的四十二份夹具里，`migrate_once` 在三份里）是同一族，但它们的
-            // 搬法不是「挪进别人的 `common`」，而是**另开一个跨 crate 的支撑 crate**
-            // ——那一半由下面 `support_copies` 那一面判：支撑 crate 里定义过的体，夹具里
-            // 不许再出现一遍。所以这里只管「同一棵树内、可搬而未搬」的那一半。
-            if name.starts_with("crates/cogneva/tests/") {
+            // 同体只在**同一个 crate 的夹具**之间比：一处抄件的就近搬法是这个 crate 的
+            // `tests/common/`，不是别人的 `common`。跨 crate 的抄件是同一族，但它们的搬
+            // 法是**另开一个跨 crate 的支撑 crate**——那一半由下面 `support_copies` 那一
+            // 面判：支撑 crate 里定义过的体，夹具里不许再出现一遍。两半合起来才是「同一
+            // 份规则写在两个地方而没有任何东西比较它们」的全部地盘。
+            if let Some(at) = name.find("/tests/") {
+                let crate_root = name[..at].to_string();
                 for (function, line, body) in free_function_bodies(&text) {
+                    body_sites += 1;
                     bodies
-                        .entry(body)
+                        .entry((crate_root.clone(), body))
                         .or_default()
                         .push(format!("{name}:{line} {function}"));
                 }
@@ -474,7 +490,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         .filter_map(|(site, body)| Some((site, support_bodies.get(&body)?.clone())))
         .collect();
     // 只在**不同文件**之间算重复：同一份文件里两个同体的小函数不是「规则写了两遍」。
-    let duplicate_bodies = bodies
+    let duplicate_bodies: Vec<(String, Vec<String>)> = bodies
         .into_iter()
         .filter(|(_, at)| {
             let files: std::collections::BTreeSet<&str> = at
@@ -483,6 +499,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
                 .collect();
             files.len() >= 2
         })
+        .map(|((_crate, body), at)| (body, at))
         .collect();
     Census {
         copies,
@@ -492,6 +509,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         walkers,
         strippers,
         duplicate_bodies,
+        body_sites,
         support_copies,
         env_reads,
         support_callsites,
@@ -574,6 +592,14 @@ fn the_fixture_reading_steps_are_written_once() {
          而不是登记一笔",
         known.len()
     );
+    // 另一头：这一面真数过多少个函数体。判据是「一条同体都没有」，而一棵读不出来的
+    // 树、或一个把顶格定义全都漏掉的提取器，给出的也是「一条都没有」。
+    assert!(
+        found.body_sites >= MIN_BODY_SITES,
+        "这一面只数出 {} 个函数体（下限 {MIN_BODY_SITES}）：那么「一条同体都没有」说的是\
+         这棵树，还是说提取器什么也没读出来",
+        found.body_sites
+    );
     let name_of = |site: &str| site.rsplit(' ').next().unwrap_or(site).to_string();
     let mut unknown: Vec<(&Vec<String>, &String)> = Vec::new();
     for (body, at) in &found.duplicate_bodies {
@@ -588,8 +614,8 @@ fn the_fixture_reading_steps_are_written_once() {
     assert!(
         unknown.is_empty(),
         "这些地方把同一段函数体写了两遍（去掉空白后逐字相同）：{unknown:?}\n\
-         搬进 `common/` 里对应的一份（读 Rust 文本的那几条在 `common::rust_text`，\
-         走目录 / 读文件在 `common::routes`，普查产出的在 `common::rust_production`）。\
+         搬进**这个 crate** 的 `tests/common/` 里的一份（cogneva 的那几族已经在 \
+         `common::rust_text` / `common::routes` / `common::rust_production` 里）。\
          名字不可靠：抄的人顺手改名，所以这条判据按体判、不按名字判。"
     );
     // 反过来问：表里每一条都还数得出来吗。合并掉之后忘了删表，这一问先红——那张表

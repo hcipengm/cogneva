@@ -13,6 +13,8 @@
 //!   cargo test -p cog-storage --test dataset_catalog -- --ignored
 //! ```
 
+mod common;
+
 use chrono::{TimeZone, Utc};
 use sqlx::PgPool;
 
@@ -30,7 +32,7 @@ struct Probe {
 
 async fn probe() -> Probe {
     let url = database_url();
-    migrate_once(&url).await;
+    common::migrate_once(&url, 97_004).await;
     let pool = PgPool::connect(&url)
         .await
         .expect("connect to the throwaway database");
@@ -40,27 +42,6 @@ async fn probe() -> Probe {
         pool,
         name,
     }
-}
-
-async fn migrate_once(url: &str) {
-    let pool = PgPool::connect(url)
-        .await
-        .expect("connect to take the lock");
-    let mut conn = pool.acquire().await.expect("acquire the schema lock");
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(97_004_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("take the schema lock");
-    cog_storage::migrate::Migrator::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .run(url)
-        .await
-        .expect("apply the migrations to the throwaway database");
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(97_004_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("release the schema lock");
 }
 
 async fn cleanup(probe: &Probe) {

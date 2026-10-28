@@ -35,6 +35,8 @@
 //!
 //! [`read_account`]: cog_core::BackupRunStore::read_account
 
+mod common;
+
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
 
@@ -181,7 +183,7 @@ fn failed_closing(error: &str) -> BackupRunClosing {
 async fn probe() -> (tokio::sync::MutexGuard<'static, ()>, Probe) {
     let guard = ACCOUNT.lock().await;
     let url = database_url();
-    migrate_once(&url).await;
+    common::migrate_once(&url, 97_003).await;
     let pool = PgPool::connect(&url)
         .await
         .expect("connect to the database");
@@ -193,30 +195,6 @@ async fn probe() -> (tokio::sync::MutexGuard<'static, ()>, Probe) {
     };
     cleanup(&probe).await;
     (guard, probe)
-}
-
-/// Apply the migrations under a session advisory lock. The lock makes the DDL
-/// mutually exclusive, so a second caller waits for the first and then finds
-/// every version already applied.
-async fn migrate_once(url: &str) {
-    let pool = PgPool::connect(url)
-        .await
-        .expect("connect to take the lock");
-    let mut conn = pool.acquire().await.expect("acquire the schema lock");
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(97_003_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("take the schema lock");
-    cog_storage::migrate::Migrator::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .run(url)
-        .await
-        .expect("apply the migrations to the throwaway database");
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(97_003_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("release the schema lock");
 }
 
 /// Delete every row this test wrote. The table is append-only in production and

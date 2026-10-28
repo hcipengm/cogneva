@@ -10,8 +10,7 @@
 //! Asserted through the tree, because the damage is a git state: a workspace
 //! left holding a change that was never verified.
 
-use std::path::Path;
-use std::process::Command;
+mod common;
 
 use cog_core::config::BuildGateConfig;
 use cog_reflection::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
@@ -21,29 +20,15 @@ use cog_reflection::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
 /// below would come from the wrong gate and prove nothing.
 const SEED: &str = "pub fn answer() -> i32 {\n    41\n}\n";
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 #[tokio::test]
 async fn a_refused_slot_keeps_the_change_alive_and_the_tree_clean() {
     let root = tempfile::tempdir().unwrap();
-    git(root.path(), &["init", "-q"]);
-    git(
+    common::git(root.path(), &["init", "-q"]);
+    common::git(
         root.path(),
         &["config", "user.email", "gates@example.invalid"],
     );
-    git(root.path(), &["config", "user.name", "gates"]);
+    common::git(root.path(), &["config", "user.name", "gates"]);
     std::fs::write(
         root.path().join("Cargo.toml"),
         "[package]\nname = \"slot-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
@@ -51,8 +36,8 @@ async fn a_refused_slot_keeps_the_change_alive_and_the_tree_clean() {
     .unwrap();
     std::fs::create_dir_all(root.path().join("src")).unwrap();
     std::fs::write(root.path().join("src/lib.rs"), SEED).unwrap();
-    git(root.path(), &["add", "-A"]);
-    git(root.path(), &["commit", "-q", "-m", "seed"]);
+    common::git(root.path(), &["add", "-A"]);
+    common::git(root.path(), &["commit", "-q", "-m", "seed"]);
 
     let change = EvolutionResult {
         kind: EvolutionKind::CodeChange,
@@ -107,7 +92,7 @@ async fn a_refused_slot_keeps_the_change_alive_and_the_tree_clean() {
         "a change that was never verified must not be left in the workspace for the next run to judge"
     );
     assert_eq!(
-        git(root.path(), &["rev-list", "--count", "HEAD"]),
+        common::git(root.path(), &["rev-list", "--count", "HEAD"]),
         "1",
         "a refusal is not a reason to commit"
     );

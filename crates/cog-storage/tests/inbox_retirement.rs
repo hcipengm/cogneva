@@ -21,6 +21,8 @@
 //! Every agent id here starts with [`PROBE`], which no deployment uses, so a run
 //! pointed at a live Redis never touches an inbox an agent is still reading.
 
+mod common;
+
 use chrono::Utc;
 
 use cog_core::{AgentRegistration, AgentRegistry, ResourceInfo};
@@ -31,13 +33,8 @@ use cog_test_support::redis_url;
 /// Every agent this file creates starts here.
 const PROBE: &str = "probe_inbox_retirement";
 
-async fn raw_conn() -> redis::aio::ConnectionManager {
-    let client = redis::Client::open(redis_url()).expect("redis url");
-    cog_redis::connect(&client).await.expect("connection")
-}
-
 async fn pass() -> InboxRetirement {
-    InboxRetirement::new(raw_conn().await)
+    InboxRetirement::new(common::raw_conn().await)
 }
 
 /// Remove what a test made.
@@ -47,7 +44,7 @@ async fn pass() -> InboxRetirement {
 /// is what keeps a run against a live Redis from leaving a key nobody will ever
 /// read and no sweep will ever take.
 async fn clear(agent_id: &str) {
-    let mut conn = raw_conn().await;
+    let mut conn = common::raw_conn().await;
     let _: () = redis::cmd("DEL")
         .arg(cog_core::agent_inbox_stream(agent_id))
         .query_async(&mut conn)
@@ -56,7 +53,7 @@ async fn clear(agent_id: &str) {
 }
 
 async fn key(agent_id: &str) -> String {
-    let mut conn = raw_conn().await;
+    let mut conn = common::raw_conn().await;
     clear(agent_id).await;
     let _: () = redis::cmd("XGROUP")
         .arg("CREATE")
@@ -71,7 +68,7 @@ async fn key(agent_id: &str) -> String {
 }
 
 async fn publish(agent_id: &str, body: &str) {
-    let mut conn = raw_conn().await;
+    let mut conn = common::raw_conn().await;
     let _: String = redis::cmd("XADD")
         .arg(cog_core::agent_inbox_stream(agent_id))
         .arg("*")
@@ -88,7 +85,7 @@ async fn publish(agent_id: &str, body: &str) {
 async fn read_and_ack(agent_id: &str) -> usize {
     let k = cog_core::agent_inbox_stream(agent_id);
     let group = format!("agent-{agent_id}");
-    let mut conn = raw_conn().await;
+    let mut conn = common::raw_conn().await;
     let entries: Vec<(String, Vec<String>)> = redis::cmd("XRANGE")
         .arg(&k)
         .arg("-")

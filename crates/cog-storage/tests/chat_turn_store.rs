@@ -18,6 +18,8 @@
 //!
 //! Every row carries a per-run session id and is deleted at the end.
 
+mod common;
+
 use sqlx::PgPool;
 
 use cog_storage::{
@@ -35,7 +37,7 @@ struct Probe {
 
 async fn probe() -> Probe {
     let url = database_url();
-    migrate_once(&url).await;
+    common::migrate_once(&url, 97_003).await;
     let pool = PgPool::connect(&url)
         .await
         .expect("connect to the throwaway database");
@@ -45,29 +47,6 @@ async fn probe() -> Probe {
         pool,
         session,
     }
-}
-
-/// Apply the migrations under a session advisory lock, so concurrent test
-/// binaries do not race on the same DDL.
-async fn migrate_once(url: &str) {
-    let pool = PgPool::connect(url)
-        .await
-        .expect("connect to take the lock");
-    let mut conn = pool.acquire().await.expect("acquire the schema lock");
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(97_003_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("take the schema lock");
-    cog_storage::migrate::Migrator::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .run(url)
-        .await
-        .expect("apply the migrations to the throwaway database");
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(97_003_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("release the schema lock");
 }
 
 async fn cleanup(probe: &Probe) {

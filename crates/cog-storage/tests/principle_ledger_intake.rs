@@ -40,6 +40,8 @@
 //! The throwaway database starts empty, so the migrations are applied first, and
 //! every row carries a per-run marker in its slug and is deleted at the end.
 
+mod common;
+
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
@@ -60,7 +62,7 @@ use cog_test_support::database_url;
 
 async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
     let url = database_url();
-    migrate_once(&url).await;
+    common::migrate_once(&url, 97_002).await;
     let pool = PgPool::connect(&url)
         .await
         .expect("connect to the database");
@@ -70,35 +72,6 @@ async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
         pool,
         format!("probe-principle-intake:{}", uuid::Uuid::new_v4()),
     )
-}
-
-/// Apply the migrations under a session advisory lock.
-///
-/// The tests in this file run in parallel and each calls this, whose
-/// `CREATE TABLE IF NOT EXISTS` statements race on a fresh database -- the loser
-/// hits `pg_type_typname_nsp_index`. The lock makes the DDL mutually exclusive:
-/// the second caller waits for the first and then finds every version already
-/// applied. The lock is held on a connection separate from the migrator's own
-/// pool, so it stays held while the migrator runs.
-async fn migrate_once(url: &str) {
-    let pool = PgPool::connect(url)
-        .await
-        .expect("connect to take the lock");
-    let mut conn = pool.acquire().await.expect("acquire the schema lock");
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(97_002_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("take the schema lock");
-    cog_storage::migrate::Migrator::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .run(url)
-        .await
-        .expect("apply the migrations to the throwaway database");
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(97_002_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("release the schema lock");
 }
 
 /// The reading one source pushes. Everything a later case does not change is
@@ -127,16 +100,6 @@ async fn queued(pool: &PgPool, slug: &str) -> bool {
         .fetch_one(pool)
         .await
         .expect("read the queue row")
-}
-
-async fn cleanup(pool: &PgPool, marker: &str) {
-    for table in ["principle_ledger", "principle_ledger_declared"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE slug LIKE $1"))
-            .bind(format!("{marker}/%"))
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("clean up {table}: {e}"));
-    }
 }
 
 /// A reading that carries something the queued one did not re-queues, and the
@@ -206,7 +169,7 @@ async fn a_later_reading_that_declares_a_tier_re_queues_and_the_fold_carries_it_
         "the account has to end on the reading that was pushed last"
     );
 
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// A re-push that says nothing new writes no row, before and after a fold.
@@ -249,7 +212,7 @@ async fn a_reading_that_says_nothing_new_writes_no_row_and_leaves_the_mark_alone
         "the fold's mark has to survive a repeat of the reading it folded"
     );
 
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// A reading that declares no tier takes back a tier that was declared earlier,
@@ -327,7 +290,7 @@ async fn a_reading_that_declares_no_tier_takes_back_the_one_the_account_holds() 
         "and it may not leave the row re-queued for the next fold"
     );
 
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// A reading that carries nothing for a field neither clears it nor counts as a
@@ -388,5 +351,5 @@ async fn a_reading_that_carries_nothing_for_a_field_neither_clears_it_nor_re_que
     );
     assert_eq!(row.carrier_path.as_deref(), Some("memory/probe-intake.md"));
 
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }

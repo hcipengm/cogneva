@@ -45,6 +45,8 @@
 //! The throwaway database starts empty, so the migrations are applied first, and
 //! every row carries a per-run marker in its slug and is deleted at the end.
 
+mod common;
+
 use sqlx::PgPool;
 use tokio::sync::Mutex;
 
@@ -72,7 +74,7 @@ use cog_test_support::database_url;
 
 async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
     let url = database_url();
-    migrate_once(&url).await;
+    common::migrate_once(&url, 97_003).await;
     let pool = PgPool::connect(&url)
         .await
         .expect("connect to the database");
@@ -96,35 +98,6 @@ async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
     )
 }
 
-/// Apply the migrations under a session advisory lock.
-///
-/// The tests in this file run in parallel and each calls this, whose
-/// `CREATE TABLE IF NOT EXISTS` statements race on a fresh database -- the loser
-/// hits `pg_type_typname_nsp_index`. The lock makes the DDL mutually exclusive:
-/// the second caller waits for the first and then finds every version already
-/// applied. The lock is held on a connection separate from the migrator's own
-/// pool, so it stays held while the migrator runs.
-async fn migrate_once(url: &str) {
-    let pool = PgPool::connect(url)
-        .await
-        .expect("connect to take the lock");
-    let mut conn = pool.acquire().await.expect("acquire the schema lock");
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(97_003_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("take the schema lock");
-    cog_storage::migrate::Migrator::new(concat!(env!("CARGO_MANIFEST_DIR"), "/migrations"))
-        .run(url)
-        .await
-        .expect("apply the migrations to the throwaway database");
-    sqlx::query("SELECT pg_advisory_unlock($1)")
-        .bind(97_003_i64)
-        .execute(&mut *conn)
-        .await
-        .expect("release the schema lock");
-}
-
 fn reading(slug: &str, tier: PrincipleCheckKind) -> PrincipleReading {
     PrincipleReading {
         slug: slug.to_string(),
@@ -136,16 +109,6 @@ fn reading(slug: &str, tier: PrincipleCheckKind) -> PrincipleReading {
         where_red: None,
         check_kind: Some(tier),
         priority: None,
-    }
-}
-
-async fn cleanup(pool: &PgPool, marker: &str) {
-    for table in ["principle_ledger", "principle_ledger_declared"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE slug LIKE $1"))
-            .bind(format!("{marker}/%"))
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("clean up {table}: {e}"));
     }
 }
 
@@ -207,7 +170,7 @@ async fn a_held_row_does_not_crowd_a_settleable_one_out_of_the_pass() {
         "a pass with room for two must spend one of them on the row it can settle; \
          got {looked:?}"
     );
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// Settle a row as `enforced`, recording `gate` as the platform-side file, which
@@ -278,7 +241,7 @@ async fn a_gate_the_platform_gains_reopens_a_row_a_look_had_settled() {
         looked.contains(&slug),
         "the row a pass is meant to judge is not in its set"
     );
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// Push one reading through the queue and fold it into the account.
@@ -401,7 +364,7 @@ async fn a_host_gate_the_fold_writes_reopens_the_row_a_look_had_answered() {
         reopened.measured_at, None,
         "nor is it still stamped as looked at against the old column"
     );
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// A row recorded as enforced with no gate in either registry is asked again.
@@ -453,7 +416,7 @@ async fn an_enforced_row_with_no_gate_recorded_is_asked_again() {
         !looked.contains(&gated),
         "a row whose state and readings agree must not be re-asked; got {looked:?}"
     );
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// A declaration removed from a `judgement` row re-opens it like any other.
@@ -490,7 +453,7 @@ async fn a_declaration_removed_from_a_judgement_row_reopens_it() {
         row.state, None,
         "the tier's answer has to be asked again, not left settled"
     );
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// A row whose recorded gate is what the registry says is not touched: the
@@ -521,7 +484,7 @@ async fn a_row_whose_recorded_gate_already_matches_is_left_alone() {
         .expect("read the row")
         .expect("the row exists");
     assert_eq!(row.state, Some(cog_core::PrincipleState::Enforced));
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// The rows a person holds stay in the set when there is room, because the pass
@@ -553,7 +516,7 @@ async fn the_rows_a_person_holds_are_still_in_the_set() {
             "{slug} is not in the set a pass with room would look at; got {looked:?}"
         );
     }
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// File one row of tier `tier` whose host column carries `host_gate`, and return
@@ -641,7 +604,7 @@ async fn a_retired_row_leaves_the_pass_and_returns_when_its_carrier_does() {
         looked.contains(&slug),
         "a row whose carrier returned must be measured again; got {looked:?}"
     );
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// A retirement reading for a `judgement` row is not buried by the debt ahead of
@@ -682,7 +645,7 @@ async fn a_retirement_reading_is_not_buried_by_the_debt_ahead_of_it() {
         "a pass with room for two must reach the row that is waiting to leave; \
          got {looked:?}"
     );
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// What the sweep lane offers this fixture, in the lane's own order.
@@ -756,7 +719,7 @@ async fn a_never_looked_held_row_is_offered_even_when_the_debt_fills_the_pass() 
         "the look is what takes it out of the lane"
     );
 
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// A row looked at before the verdict read its host column keeps an empty state
@@ -820,7 +783,7 @@ async fn a_stamped_held_row_whose_host_column_names_a_gate_is_asked_again() {
         "a settled row is not asked again"
     );
 
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }
 
 /// A held row carrying the one state its tier cannot write is asked again.
@@ -874,5 +837,5 @@ async fn a_held_row_holding_the_state_its_tier_cannot_write_is_asked_again() {
         "a held row the tier has answered is not asked again"
     );
 
-    cleanup(&pool, &marker).await;
+    common::cleanup_ledger(&pool, &marker).await;
 }

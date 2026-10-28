@@ -16,6 +16,8 @@
 //! Every session name here starts with [`PROBE`], which no deployment uses, so
 //! a run pointed at a live Redis never touches a log an agent is still writing.
 
+mod common;
+
 use chrono::Utc;
 
 use cog_core::wal::{WalEventType, WalRecord};
@@ -35,11 +37,6 @@ async fn backend() -> RedisWalBackend {
     RedisWalBackend::from_connection(conn)
 }
 
-async fn raw_conn() -> redis::aio::ConnectionManager {
-    let client = redis::Client::open(redis_url()).expect("redis url");
-    cog_redis::connect(&client).await.expect("connection")
-}
-
 fn record(session: &str, seq: u64) -> WalRecord {
     WalRecord {
         seq,
@@ -54,7 +51,7 @@ fn record(session: &str, seq: u64) -> WalRecord {
 /// Write `count` records the way the appender does, so the length the scan
 /// reports is a length the real store would have.
 async fn plant(session: &str, count: usize) {
-    let mut conn = raw_conn().await;
+    let mut conn = common::raw_conn().await;
     let key = format!("wal:{session}");
     for seq in 0..count as u64 {
         let line = record(session, seq)

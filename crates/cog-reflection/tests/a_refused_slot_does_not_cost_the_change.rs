@@ -16,8 +16,7 @@
 //! installs is the only one this binary has, so a second test holding it would
 //! make whichever ran second refuse for the wrong reason.
 
-use std::path::Path;
-use std::process::Command;
+mod common;
 
 use cog_core::observability::Observable;
 use cog_core::types::task::EvolutionIntent;
@@ -25,32 +24,18 @@ use cog_reflection::evolution_build_readings::{
     EvolutionBuildReadings, BUILD_LAST_SECONDS_METRIC, BUILD_OUTCOMES_TOTAL_METRIC,
 };
 
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap_or_else(|e| panic!("git {args:?}: {e}"));
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 #[tokio::test]
 async fn a_refused_slot_leaves_the_tree_uncommitted() {
     let repo = tempfile::tempdir().unwrap();
-    git(repo.path(), &["init", "-q"]);
-    git(
+    common::git(repo.path(), &["init", "-q"]);
+    common::git(
         repo.path(),
         &["config", "user.email", "gates@example.invalid"],
     );
-    git(repo.path(), &["config", "user.name", "gates"]);
+    common::git(repo.path(), &["config", "user.name", "gates"]);
     std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
-    git(repo.path(), &["add", "-A"]);
-    git(repo.path(), &["commit", "-q", "-m", "base"]);
+    common::git(repo.path(), &["add", "-A"]);
+    common::git(repo.path(), &["commit", "-q", "-m", "base"]);
 
     // The change, applied and sitting in the tree, which is the state the
     // deployer is handed.
@@ -86,11 +71,11 @@ async fn a_refused_slot_leaves_the_tree_uncommitted() {
     );
 
     assert_eq!(
-        git(repo.path(), &["rev-list", "--count", "HEAD"]),
+        common::git(repo.path(), &["rev-list", "--count", "HEAD"]),
         "1",
         "a refusal is not a reason to commit"
     );
-    let status = git(repo.path(), &["status", "--porcelain"]);
+    let status = common::git(repo.path(), &["status", "--porcelain"]);
     assert!(
         status.contains("b.txt"),
         "the change is untouched and unjudged: {status}"
