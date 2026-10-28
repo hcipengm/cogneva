@@ -27,14 +27,11 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_lines;
+use common::routes::repo_root;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// 这条读法唯一允许被写下来的地方。
 const DECLARED_IN: &str = "crates/cog-core/src/retention.rs";
-
-/// 普查下限。测到的那一天 `crates/*/src` 有 700 余个源文件。
-const MIN_FILES: usize = 300;
 
 const FALL_BACK: &str = "keep_days_or_default";
 const DISABLE: &str = "keep_days_or_disable";
@@ -78,37 +75,24 @@ fn policies_in(text: &str) -> BTreeSet<&'static str> {
 }
 
 /// 每个用到这条读法的文件，以及它用的是哪几种。
-fn census(root: &Path) -> (usize, BTreeMap<String, BTreeSet<&'static str>>) {
-    let mut files = Vec::new();
-    for crate_dir in std::fs::read_dir(root.join("crates")).expect("crates/") {
-        let path = crate_dir.expect("a crate directory").path();
-        walk(&path.join("src"), &["rs"], &mut files);
-    }
-    files.sort();
+fn census(root: &Path) -> BTreeMap<String, BTreeSet<&'static str>> {
+    let files = production_sources(root);
     let mut sites = BTreeMap::new();
     for path in &files {
         let text =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let found = policies_in(&text);
         if !found.is_empty() {
-            let file = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let file = relative_name(root, path);
             sites.insert(file, found);
         }
     }
-    (files.len(), sites)
+    sites
 }
 
 #[test]
 fn every_retention_knob_says_what_zero_means_and_says_it_the_same_way_in_the_table() {
-    let (files, sites) = census(&repo_root());
-    assert!(
-        files >= MIN_FILES,
-        "只读到 {files} 个源文件（下限 {MIN_FILES}），这条判据没有题目"
-    );
+    let sites = census(&repo_root());
 
     // 声明处必须真的还声明着两边：只剩一边，登记表里另一半就成了空话。
     let declared = sites.get(DECLARED_IN).unwrap_or_else(|| {

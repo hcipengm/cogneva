@@ -35,8 +35,8 @@ mod common;
 
 use std::path::Path;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_lines;
+use common::routes::repo_root;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// 允许存在的 `quote…` 函数：文件、函数名、以及它为什么不是同一份拼法。
 const REGISTERED: &[(&str, &str, &str)] = &[(
@@ -44,9 +44,6 @@ const REGISTERED: &[(&str, &str, &str)] = &[(
     "quote_relation",
     "把关系名写进 SQL 的那一份——树上唯一的拼法，别的 crate 引用它",
 )];
-
-/// 普查下限。测到的那一天 `crates/*/src` 有 700 余个源文件。
-const MIN_FILES: usize = 300;
 
 /// 一处定义：文件与该文件的函数名。
 type Site = (String, String);
@@ -69,35 +66,21 @@ fn quoters_in(file: &str, text: &str) -> Vec<Site> {
     found
 }
 
-fn census(root: &Path) -> (usize, Vec<Site>) {
-    let mut files = Vec::new();
-    for crate_dir in std::fs::read_dir(root.join("crates")).expect("crates/") {
-        let path = crate_dir.expect("a crate directory").path();
-        walk(&path.join("src"), &["rs"], &mut files);
-    }
-    files.sort();
+fn census(root: &Path) -> Vec<Site> {
+    let files = production_sources(root);
     let mut found = Vec::new();
     for path in &files {
         let text =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let file = relative_name(root, path);
         found.extend(quoters_in(&file, &text));
     }
-    (files.len(), found)
+    found
 }
 
 #[test]
 fn a_relation_name_is_quoted_in_one_place() {
-    let (files, found) = census(&repo_root());
-    assert!(
-        files >= MIN_FILES,
-        "只读到 {files} 个源文件（下限 {MIN_FILES}），这条判据没有题目"
-    );
-
+    let found = census(&repo_root());
     let unregistered: Vec<&Site> = found
         .iter()
         .filter(|(file, name)| !REGISTERED.iter().any(|(f, n, _)| f == file && n == name))

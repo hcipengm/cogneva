@@ -26,8 +26,8 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_lines;
+use common::routes::repo_root;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// 已经分叉过一次的那五个词，以及它们各自该被声明在哪。
 const VOCABULARY: &[(&str, &str)] = &[
@@ -64,9 +64,6 @@ const REGISTERED_SECOND_SITES: &[(&str, &str)] = &[(
     "判的是「卡在拉镜像、可以清掉」而不是「这个版本坏了」；引导器不依赖 cog-reflection",
 )];
 
-/// 普查下限。测到的那一天 `crates/*/src` 有 700 余个源文件。
-const MIN_FILES: usize = 300;
-
 /// 一个文件的生产行里提到这些词的次数，按词记。
 fn mentions_in(text: &str) -> BTreeMap<&'static str, usize> {
     let mut found: BTreeMap<&'static str, usize> =
@@ -80,13 +77,8 @@ fn mentions_in(text: &str) -> BTreeMap<&'static str, usize> {
 }
 
 /// 每个词在生产代码里的全部落点。
-fn census(root: &Path) -> (usize, BTreeMap<&'static str, Vec<String>>) {
-    let mut files = Vec::new();
-    for crate_dir in std::fs::read_dir(root.join("crates")).expect("crates/") {
-        let path = crate_dir.expect("a crate directory").path();
-        walk(&path.join("src"), &["rs"], &mut files);
-    }
-    files.sort();
+fn census(root: &Path) -> BTreeMap<&'static str, Vec<String>> {
+    let files = production_sources(root);
     let mut sites: BTreeMap<&'static str, Vec<String>> = VOCABULARY
         .iter()
         .map(|(word, _)| (*word, Vec::new()))
@@ -94,11 +86,7 @@ fn census(root: &Path) -> (usize, BTreeMap<&'static str, Vec<String>>) {
     for path in &files {
         let text =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let file = relative_name(root, path);
         for (word, count) in mentions_in(&text) {
             for _ in 0..count {
                 sites
@@ -108,16 +96,12 @@ fn census(root: &Path) -> (usize, BTreeMap<&'static str, Vec<String>>) {
             }
         }
     }
-    (files.len(), sites)
+    sites
 }
 
 #[test]
 fn a_waiting_reason_is_declared_once_and_in_the_set_it_belongs_to() {
-    let (files, sites) = census(&repo_root());
-    assert!(
-        files >= MIN_FILES,
-        "只读到 {files} 个源文件（下限 {MIN_FILES}），这条判据没有题目"
-    );
+    let sites = census(&repo_root());
 
     let allowed: Vec<&str> = REGISTERED_SECOND_SITES.iter().map(|(f, _)| *f).collect();
     let mut findings = Vec::new();

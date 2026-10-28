@@ -39,14 +39,11 @@ mod common;
 
 use std::path::Path;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_lines;
+use common::routes::repo_root;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// 这两把尺子唯一允许被写成 SQL 的地方。
 const DECLARED_IN: &str = "crates/cog-core/src/sql.rs";
-
-/// 普查下限。测到的那一天 `crates/*/src` 有 700 余个源文件。
-const MIN_FILES: usize = 300;
 
 /// 登记在案的「同形不同物」：同一个形状，答的是另一件事。
 const REGISTERED_OTHER_QUESTIONS: &[(&str, &str)] = &[
@@ -102,13 +99,8 @@ fn age_reads(text: &str) -> usize {
 }
 
 /// 每个文件里这两把尺子的落点。
-fn census(root: &Path) -> (usize, Vec<(String, usize, usize, usize)>) {
-    let mut files = Vec::new();
-    for crate_dir in std::fs::read_dir(root.join("crates")).expect("crates/") {
-        let path = crate_dir.expect("a crate directory").path();
-        walk(&path.join("src"), &["rs"], &mut files);
-    }
-    files.sort();
+fn census(root: &Path) -> Vec<(String, usize, usize, usize)> {
+    let files = production_sources(root);
     let mut sites = Vec::new();
     for path in &files {
         let text =
@@ -117,24 +109,16 @@ fn census(root: &Path) -> (usize, Vec<(String, usize, usize, usize)>) {
         let bytes = byte_reads(&text);
         let ages = age_reads(&text);
         if rows > 0 || bytes > 0 || ages > 0 {
-            let file = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let file = relative_name(root, path);
             sites.push((file, rows, bytes, ages));
         }
     }
-    (files.len(), sites)
+    sites
 }
 
 #[test]
 fn a_relation_is_measured_with_one_statement_wherever_it_is_measured() {
-    let (files, sites) = census(&repo_root());
-    assert!(
-        files >= MIN_FILES,
-        "只读到 {files} 个源文件（下限 {MIN_FILES}），这条判据没有题目"
-    );
+    let sites = census(&repo_root());
 
     let declared = sites.iter().find(|(file, _, _, _)| file == DECLARED_IN);
     let declared = declared.unwrap_or_else(|| {

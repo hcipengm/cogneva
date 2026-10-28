@@ -28,14 +28,11 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_lines;
+use common::routes::repo_root;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// 这份读法唯一允许出现的地方。
 const DECLARED_IN: &str = "crates/bootstrap/src/lib.rs";
-
-/// 普查下限。测到的那一天 `crates/*/src` 有 700 余个源文件。
-const MIN_FILES: usize = 300;
 
 /// 每个文件的生产行里提到 `MemTotal:` 的次数。
 fn mentions(text: &str) -> usize {
@@ -45,38 +42,25 @@ fn mentions(text: &str) -> usize {
         .sum()
 }
 
-/// 遍历 `crates/*/src`，返回（读到的文件数，按文件记的落点）。
-fn census(root: &Path) -> (usize, BTreeMap<String, usize>) {
-    let mut files = Vec::new();
-    for crate_dir in std::fs::read_dir(root.join("crates")).expect("crates/") {
-        let path = crate_dir.expect("a crate directory").path();
-        walk(&path.join("src"), &["rs"], &mut files);
-    }
-    files.sort();
+/// 每个文件里这条读法的落点。
+fn census(root: &Path) -> BTreeMap<String, usize> {
+    let files = production_sources(root);
     let mut sites = BTreeMap::new();
     for path in &files {
         let text =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         let found = mentions(&text);
         if found > 0 {
-            let file = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .replace('\\', "/");
+            let file = relative_name(root, path);
             sites.insert(file, found);
         }
     }
-    (files.len(), sites)
+    sites
 }
 
 #[test]
 fn the_host_memory_total_is_read_out_of_one_place() {
-    let (files, sites) = census(&repo_root());
-    assert!(
-        files >= MIN_FILES,
-        "只读到 {files} 个源文件（下限 {MIN_FILES}），这条判据没有题目"
-    );
+    let sites = census(&repo_root());
     assert!(
         sites.contains_key(DECLARED_IN),
         "{DECLARED_IN} 里一处 `MemTotal:` 都没有了：这一份读法被搬走或改名，本门没有题目"

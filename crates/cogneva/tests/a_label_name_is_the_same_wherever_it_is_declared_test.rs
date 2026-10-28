@@ -29,8 +29,8 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use common::routes::{repo_root, walk};
-use common::rust_production::production_lines;
+use common::routes::repo_root;
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// 普查下限。测到的那一天，生产代码里名字带 `LABEL` 的字符串常量有 40 余处。
 const MIN_DECLARATIONS: usize = 20;
@@ -57,22 +57,13 @@ fn declaration(line: &str) -> Option<(String, String)> {
 }
 
 fn census(root: &Path) -> (usize, Spellings) {
-    let mut files = Vec::new();
-    for crate_dir in std::fs::read_dir(root.join("crates")).expect("crates/") {
-        let path = crate_dir.expect("a crate directory").path();
-        walk(&path.join("src"), &["rs"], &mut files);
-    }
-    files.sort();
+    let files = production_sources(root);
     let mut spellings: Spellings = BTreeMap::new();
     let mut declarations = 0;
     for path in &files {
         let text =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let file = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let file = relative_name(root, path);
         for line in production_lines(&text) {
             if let Some((name, value)) = declaration(line) {
                 declarations += 1;
