@@ -1,12 +1,11 @@
+mod common;
+
+use common::orchestrator::control;
+
 use chrono::Duration as ChronoDuration;
-use cog_core::{OrchestratorControl, Task, TaskType};
+use cog_core::{Task, TaskType};
 use cog_supervisor::{AgentRegistry, CrewInfo, Respawner};
 use std::sync::Arc;
-
-fn make_orchestrator() -> Arc<dyn OrchestratorControl> {
-    let dag = Arc::new(cog_orchestrator::DagExecutor::new("ws".into()));
-    Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag))
-}
 
 fn fake_registered_crew(reg: &AgentRegistry, crew_id: &str, agent_id: &str, tasks: &[&str]) {
     let mut crew = CrewInfo::new(crew_id);
@@ -30,7 +29,7 @@ fn fake_registered_crew(reg: &AgentRegistry, crew_id: &str, agent_id: &str, task
 #[tokio::test]
 async fn no_dead_agents_returns_empty_report() {
     let reg = Arc::new(AgentRegistry::new());
-    let orch = make_orchestrator();
+    let orch = control("ws");
     let respawner = Respawner::new(reg, orch);
     let report = respawner.handle_dead_agents(&[]).await.unwrap();
     assert!(report.retried_crews.is_empty());
@@ -40,7 +39,7 @@ async fn no_dead_agents_returns_empty_report() {
 #[tokio::test]
 async fn dead_agent_with_retryable_tasks_triggers_retry() {
     let reg = Arc::new(AgentRegistry::new());
-    let orch = make_orchestrator();
+    let orch = control("ws");
     fake_registered_crew(&reg, "crew-1", "agent-1", &["t-1", "t-2"]);
 
     let t1 = Task::new("t-1", TaskType::Planner, serde_json::json!({}));
@@ -77,7 +76,7 @@ async fn dead_agent_with_retryable_tasks_triggers_retry() {
 #[tokio::test]
 async fn crew_with_no_tasks_requests_respawn() {
     let reg = Arc::new(AgentRegistry::new());
-    let orch = make_orchestrator();
+    let orch = control("ws");
     fake_registered_crew(&reg, "crew-1", "agent-1", &[]);
 
     let respawner = Respawner::new(reg.clone(), orch);
@@ -94,7 +93,7 @@ async fn crew_with_no_tasks_requests_respawn() {
 #[tokio::test]
 async fn retryable_failed_tasks_trigger_crew_retry() {
     let reg = Arc::new(AgentRegistry::new());
-    let orch = make_orchestrator();
+    let orch = control("ws");
     fake_registered_crew(&reg, "crew-1", "agent-1", &["t-1"]);
 
     let task = Task::new("t-1", TaskType::Planner, serde_json::json!({}));

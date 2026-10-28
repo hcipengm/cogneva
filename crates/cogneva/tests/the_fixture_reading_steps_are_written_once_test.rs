@@ -115,13 +115,10 @@ const INLINE_FORMS: [&str; 1] = [r#".replace('\\', "/")"#];
 /// `split_arms` 与 `split_items` 也是。按签名、按定义名判的判据全都看不见它们，
 /// 只有「两段函数体去掉空白之后逐字相同」这件事看得见。
 ///
-/// 这张表只能变短。`KNOWN_CEILING` 是它今天的上界，往里加一条就要同时抬这个数，
-/// 而抬数的那一行会在评审里被看见；合并掉一条则要把它从那表里删掉——留着会让
-/// 下面「每一条都还数得出来」的断言先红，那份红就是催着删的信号。
-const KNOWN_DUPLICATED_BODIES: [&str; 1] = ["make_orchestrator"];
-
-/// `KNOWN_DUPLICATED_BODIES` 的上界。今天 1。
-const KNOWN_CEILING: usize = 1;
+/// 这张表只能变短，今天已经空了：这一族清干净，一格余量也没有。往后新长出来的同体
+/// 直接红；真要豁免，就得往表里写名字、同时把下面「表必须是空的」那条断言改掉——
+/// 两处改动都在评审里看得见，而不是悄悄多一行。
+const KNOWN_DUPLICATED_BODIES: [&str; 0] = [];
 
 /// 这条门自己。它把签名当字符串写着（判据要看的就是那几行），所以在真树上会被
 /// 自己点名——**只摘这一面**：下面要求它至少还认得出自己的几份标本，判据哪天退化成
@@ -452,9 +449,9 @@ fn the_fixture_reading_steps_are_written_once() {
     // 两个名字，`split_arms` 与 `split_items` 也是；抄的人顺手改名，按定义名找永远找不全。
     let known = KNOWN_DUPLICATED_BODIES;
     assert!(
-        known.len() <= KNOWN_CEILING,
-        "已知同体表涨到 {} 条（上界 {KNOWN_CEILING}）：这张表只能变短，加一条要同时抬\
-         上界，好让它是评审里看得见的一行",
+        known.is_empty(),
+        "已知同体表又长回了 {} 条：这一族今天一条不剩，新长出来的同体应该搬进 `common/`，\
+         而不是登记一笔",
         known.len()
     );
     let name_of = |site: &str| site.rsplit(' ').next().unwrap_or(site).to_string();

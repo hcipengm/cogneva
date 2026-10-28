@@ -1,3 +1,7 @@
+mod common;
+
+use common::orchestrator::control;
+
 use chrono::{Duration as ChronoDuration, Utc};
 use cog_core::{
     MetricsBackend, ObservabilityGateway, OrchestratorControl, StateBackend, SupervisorEvent, Task,
@@ -13,11 +17,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, watch};
-
-fn make_orchestrator() -> Arc<dyn OrchestratorControl> {
-    let dag = Arc::new(cog_orchestrator::DagExecutor::new("ws".into()));
-    Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag))
-}
 
 fn fake_quota_source(remaining: u64) -> Arc<dyn cog_core::WorkspaceQuotaSource> {
     struct StaticQuota(AtomicU64);
@@ -98,7 +97,7 @@ fn build_supervisor_with_config_rx(
 async fn health_pass_emits_unhealthy_event() {
     let registry = Arc::new(AgentRegistry::new());
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
-    let orchestrator = make_orchestrator();
+    let orchestrator = control("ws");
     let gateway: Arc<dyn ObservabilityGateway> =
         Arc::new(MemoryObservabilityGateway::new(backend.clone()));
     let gate = Arc::new(SchedulerGate::new());
@@ -155,7 +154,7 @@ async fn health_pass_emits_unhealthy_event() {
 async fn health_pass_reaps_agents_dead_past_the_grace() {
     let registry = Arc::new(AgentRegistry::new());
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
-    let orchestrator = make_orchestrator();
+    let orchestrator = control("ws");
     let gateway: Arc<dyn ObservabilityGateway> =
         Arc::new(MemoryObservabilityGateway::new(backend.clone()));
     let gate = Arc::new(SchedulerGate::new());
@@ -226,7 +225,7 @@ async fn health_pass_reaps_agents_dead_past_the_grace() {
 async fn quota_pass_pauses_scheduler_on_breach() {
     let registry = Arc::new(AgentRegistry::new());
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
-    let orchestrator = make_orchestrator();
+    let orchestrator = control("ws");
     let gateway: Arc<dyn ObservabilityGateway> =
         Arc::new(MemoryObservabilityGateway::new(backend.clone()));
     let gate = Arc::new(SchedulerGate::new());
@@ -249,7 +248,7 @@ async fn quota_pass_pauses_scheduler_on_breach() {
 async fn rebalance_pass_emits_event_when_ready_tasks_exist() {
     let registry = Arc::new(AgentRegistry::new());
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
-    let orchestrator = make_orchestrator();
+    let orchestrator = control("ws");
     orchestrator
         .submit_goal(
             "g",
@@ -290,7 +289,7 @@ async fn rebalance_pass_emits_event_when_ready_tasks_exist() {
 async fn config_reload_updates_state() {
     let registry = Arc::new(AgentRegistry::new());
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
-    let orchestrator = make_orchestrator();
+    let orchestrator = control("ws");
     let gateway: Arc<dyn ObservabilityGateway> =
         Arc::new(MemoryObservabilityGateway::new(backend.clone()));
     let gate = Arc::new(SchedulerGate::new());
@@ -399,7 +398,7 @@ fn build_measured_supervisor(
 async fn every_loop_arm_reports_its_rounds() {
     let registry = Arc::new(AgentRegistry::new());
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
-    let orchestrator = make_orchestrator();
+    let orchestrator = control("ws");
     let gateway: Arc<dyn ObservabilityGateway> =
         Arc::new(MemoryObservabilityGateway::new(backend.clone()));
     let gate = Arc::new(SchedulerGate::new());

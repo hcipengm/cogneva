@@ -1,16 +1,15 @@
+mod common;
+
+use common::orchestrator::control;
+
 use chrono::Utc;
-use cog_core::{AgentState, OrchestratorControl, StateBackend, Task, TaskCheckpoint, TaskType};
+use cog_core::{AgentState, StateBackend, Task, TaskCheckpoint, TaskType};
 use cog_storage::MemoryStateBackend;
 use cog_supervisor::lifecycle_coordinator::RecoveredCheckpoint;
 use cog_supervisor::registry::{AgentInfo, AgentRegistry};
 use cog_supervisor::task_rebalancer::{TaskRebalancer, TaskRebalancerConfig};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-fn make_orchestrator() -> Arc<dyn OrchestratorControl> {
-    let dag = Arc::new(cog_orchestrator::DagExecutor::new("ws".into()));
-    Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag))
-}
 
 fn make_agent(id: &str) -> AgentInfo {
     let now = Utc::now();
@@ -30,7 +29,7 @@ fn make_agent(id: &str) -> AgentInfo {
 async fn empty_orchestrator_yields_empty_plan() {
     let reg = Arc::new(AgentRegistry::new());
     let backend = Arc::new(MemoryStateBackend::new());
-    let orch = make_orchestrator();
+    let orch = control("ws");
     let rebalancer = TaskRebalancer::new(reg, backend, orch, TaskRebalancerConfig::default());
     let plan = rebalancer.plan().await.unwrap();
     assert!(plan.is_empty());
@@ -53,7 +52,7 @@ async fn ready_tasks_get_distributed_across_agents() {
         .await
         .unwrap();
 
-    let orch = make_orchestrator();
+    let orch = control("ws");
     let mut tasks = Vec::new();
     for i in 0..4 {
         tasks.push(Task::new(
@@ -90,7 +89,7 @@ async fn dead_agent_is_skipped() {
         .await
         .unwrap();
 
-    let orch = make_orchestrator();
+    let orch = control("ws");
     orch.submit_goal(
         "g",
         vec![Task::new("t-1", TaskType::Planner, serde_json::json!({}))],
@@ -116,7 +115,7 @@ async fn overloaded_agent_is_flagged() {
         .await
         .unwrap();
 
-    let orch = make_orchestrator();
+    let orch = control("ws");
     let mut tasks = Vec::new();
     for i in 0..6 {
         let mut t = Task::new(format!("t-{i}"), TaskType::Planner, serde_json::json!({}));
@@ -143,7 +142,7 @@ async fn overloaded_agent_is_flagged() {
 async fn recovery_plan_includes_relevant_checkpoints() {
     let reg = Arc::new(AgentRegistry::new());
     let backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
-    let orch = make_orchestrator();
+    let orch = control("ws");
     orch.submit_goal(
         "g",
         vec![
