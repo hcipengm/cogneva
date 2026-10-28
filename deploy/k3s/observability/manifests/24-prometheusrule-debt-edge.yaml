@@ -1,0 +1,59 @@
+# 依赖边钩子自己失效时，谁来说话。
+#
+# 为什么需要：`30-dependency-edges.sh` 判的是「这一笔要落的索引里，有没有一条没登记的 crate
+# 依赖边」。它与同目录另外两份同一个立场：**判不了不拦**——没有 python3、抽不出索引、门自己
+# 退 3、`cargo metadata` 跑不动，都只印一行就把提交放过去。那个立场是对的（一条坏掉的钩子
+# 不该让所有人提交不了），代价是：钩子失效的时候，每一次提交仍然绿，而唯一的痕迹是账上多出
+# 一行 `unmeasured`。
+#
+# 门留着、读数也留着，缺的是**有人不看着它的时候它自己会响**。宿主读数
+# `cogneva-debt-edge-reading.sh` 每拍都在算这个数，而读数要有人去看才叫读数——这不成立：
+# 这条判据存在的全部理由，就是「红要落在看得见的地方」。
+#
+# 为什么 `unmeasured` 用窗口、不是 `> 0`：这本账只追加、不轮转，计数降不回去。写成
+# `> 0` 的话，一次瞬时失败（比如某一次 `cargo metadata` 超时）会让这条告警从此常亮，
+# 而常亮的告警一天之内就会被人关掉——那时真的失效来了也没人看得见。`increase(...[6h])`
+# 是同一个事实加一个地平线：响起来，六小时后自己安静，期间再失败就继续响。
+# 序列本身**零也印**（`kind="unmeasured"` 一直在，值常是 0），所以第一次失败就有前一个
+# 样本可比，不会像「只在非零时出现」的计数器那样漏掉第一次。
+#
+# 为什么 `malformed` 是 `> 0`、不给地平线：认不得的行会一直留在文件里，不会自己消失。
+# 它是一个**持续状态**（账的形状漂了，或者读者不认新写的词），加上地平线等于到点就不再
+# 提它，而这正是这件事唯一不该发生的方向。它清掉的方式只有两种：把文件里那几行清走，
+# 或者教读者认那个形状——两种都要人动手。
+#
+# 两条都不读「挡了几笔」（`kind="unregistered_edge"`／`kind="repaid_edge"`）：被挡的那一笔
+# 的提交者当场就看见拒词、当场就能改，那不是需要另外叫人的事。把正常的两态也做成告警，
+# 会让这条通道在几天内变成没有人看的东西。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-debt-edge
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-debt-edge
+      rules:
+        - alert: CognevaDependencyEdgeHookCannotJudge
+          expr: sum (increase(cogneva_debt_edge_verdicts{kind="unmeasured"}[6h])) > 0
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "依赖边钩子近 6 小时有 {{ $value }} 次判不了、把提交放过去了"
+            description: "这盏灯已经灭着：加边的那一笔不会再被点名，而下一道读它的门（不在本仓，脚本名 `check-code-debt`）只会在别人的提交上亮。原因是逐条印在 `cogneva_debt_edge_unmeasured_by_reason{reason}` 上——最常见的是没有 python3、抽不出索引、门自己退 3、`cargo metadata` 跑不动。修好之后账上那一行不会消失（这本账只追加），告警会随窗口自己安静；要立刻清掉就修原因，不要清账。"
+
+        - alert: CognevaDependencyEdgeLedgerUnparsable
+          expr: max (cogneva_debt_edge_malformed) > 0
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "依赖边账上有 {{ $value }} 行读不出来"
+            description: "写者按 `epoch\\t结局\\t主体\\t细节` 四列追加，读者只认这四列与门自己的词表（`judged`／`unregistered_edge`／`repaid_edge`／`unmeasured`）。读不出来的行不会被丢掉，所以这个数只增不减：账的形状漂了，或者有人加了新词而读者还没认。坏在哪印在 `debt_edge_malformed_top` 上（`bash scripts/host/cogneva-debt-edge-reading.sh` 的 kv 出口）。这一条没有地平线：它不是事件，是持续状态。"

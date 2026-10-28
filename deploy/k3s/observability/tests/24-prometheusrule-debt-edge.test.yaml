@@ -1,0 +1,135 @@
+# promtool 规则单测：依赖边钩子的两条判词**真的会 firing**，而且只在它该响的时候响。
+#
+# 为什么要有这一层：`sum (increase(...[6h])) > 0` 与 `max (...) > 0` 这种形状，结构门只判得出
+# 「这条读了那序列」；形状对不代表会响，也不代表会停。四种改法在结构门眼里全都合法：
+#   * `> 0` 写成 `>= 0`：序列一直在、值常是 0 ⇒ 永远响；
+#   * 写死 `for:` 永不到期：永远不响；
+#   * 把 `[6h]` 拉到无穷：响一次之后永不安静（这条判据只追加、不轮转，计数降不回去）；
+#   * `kind="unmeasured"` 写成 `kind="judged"`：分母被当成判词，而那一路永远不为零。
+# 所以下面每一格都配了反向证据，红的落点是「该响没响」与「该安静没安静」两种。
+#
+# `unmeasured` 用窗口而不是 `> 0`，是这份夹具最要紧的一格：第四组（清场）证明响过之后
+# 会自己安静。`> 0` 的版本在那一格会红——它会一直亮到有人清账，而常亮的告警一天之内
+# 就会被人关掉，那时真的失效来了也没人看得见。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/24-prometheusrule-debt-edge.yaml \
+#         deploy/k3s/observability/tests/24-prometheusrule-debt-edge.test.yaml
+rule_files:
+  - ../manifests/24-prometheusrule-debt-edge.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、钩子判不了：`unmeasured` 从 0 长到 1。
+  # 反向证据在前半格——刚长上去就响，等于把一次瞬时失败报成事故（`for: 30m` 就是这一档）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_debt_edge_verdicts{kind="unmeasured",instance="host-a:9101"}'
+        values: '0x20 1x40'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaDependencyEdgeHookCannotJudge
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: CognevaDependencyEdgeHookCannotJudge
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 二、干净的负对照：一次都没判不了，全程不许响。
+  # 没有这一格，界写成 `>= 0`（或读 `kind="judged"`）也照样绿。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_debt_edge_verdicts{kind="unmeasured",instance="host-a:9101"}'
+        values: '0x400'
+      - series: 'cogneva_debt_edge_verdicts{kind="judged",instance="host-a:9101"}'
+        values: '5x400'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaDependencyEdgeHookCannotJudge
+        exp_alerts: []
+      - eval_time: 399m
+        alertname: CognevaDependencyEdgeHookCannotJudge
+        exp_alerts: []
+
+  # 三、另一台宿主判不了：`max`/`sum` 要盖住全部实例，别让干净的那台把嘴捂上。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_debt_edge_verdicts{kind="unmeasured",instance="host-a:9101"}'
+        values: '0x20 1x40'
+      - series: 'cogneva_debt_edge_verdicts{kind="unmeasured",instance="host-b:9101"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: CognevaDependencyEdgeHookCannotJudge
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 四、清场：响过之后、六小时窗口把那次增量滚出去 ⇒ **自己安静**。
+  # 这一格就是「不能写成 `> 0`」的证据：计数只增不减，界写成 `> 0` 会在这格红。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_debt_edge_verdicts{kind="unmeasured",instance="host-a:9101"}'
+        values: '0x20 1x500'
+    alert_rule_test:
+      - eval_time: 100m
+        alertname: CognevaDependencyEdgeHookCannotJudge
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+      - eval_time: 400m
+        alertname: CognevaDependencyEdgeHookCannotJudge
+        exp_alerts: []
+
+  # 五、账上有读不出来的行：`malformed` 一直 2，`for: 30m` 之前空、之后 firing。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_debt_edge_malformed{instance="host-a:9101"}'
+        values: '2x60'
+    alert_rule_test:
+      - eval_time: 29m
+        alertname: CognevaDependencyEdgeLedgerUnparsable
+        exp_alerts: []
+      - eval_time: 31m
+        alertname: CognevaDependencyEdgeLedgerUnparsable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 六、干净的负对照：一行都没坏，全程不许响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_debt_edge_malformed{instance="host-a:9101"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: CognevaDependencyEdgeLedgerUnparsable
+        exp_alerts: []
+
+  # 七、这一条是持续状态、不是事件：坏行被清走之后必须立刻安静，不许赖着。
+  # 反向证据在别处：它没有地平线（见清单头），所以「坏着」的那一段必须始终亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_debt_edge_malformed{instance="host-a:9101"}'
+        values: '2x60 0x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaDependencyEdgeLedgerUnparsable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+      - eval_time: 70m
+        alertname: CognevaDependencyEdgeLedgerUnparsable
+        exp_alerts: []

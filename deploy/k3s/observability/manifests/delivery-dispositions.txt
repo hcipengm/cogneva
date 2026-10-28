@@ -52,3 +52,4 @@
 21-prometheusrule-build-cache.yaml deliver # 构建缓存越过自己那个界的两个消费者：够不着（回收跑过、删完了仍高于界 ⇒ 改界或腾卷）与连续多趟没收回（槽一直被占、没人收）；此前这条读数只有面板，没有任何规则读它
 22-prometheusrule-code-debt.yaml deliver # 代码欠账登记与公开树分家的消费者：判的是另一棵仓的树，判决此前只挂在下一个要在这边提交的人身上——那个模块的作者从来跑不到这道门；三天里让三个不相干的人代付过
 23-prometheusrule-change-dispatch.yaml deliver # 变更账本停摆的消费者：派发那一格此前只有面板读，2026-10-27 起它连续十几个小时判 paused、两千多条待派发一条没动，而告警面上只看得见池子自己；池子恢复后闩住的判词仍会让它停着，那一态没有任何规则看得见
+24-prometheusrule-debt-edge.yaml deliver # 依赖边钩子自己失效时的消费者：那道钩子判不了就放行（没有 python3／抽不出索引／门退 3／cargo metadata 跑不动），于是钩子坏掉的时候每一次提交仍然绿，唯一痕迹是账上多一行 unmeasured；判不了用 6h 窗口而不是 >0（账只追加、计数降不回去，>0 会常亮到有人清账，而常亮的告警一天之内就会被关掉），坏行用 >0（持续状态，清走才消失）；夹具让 Prometheus 规则引擎真跑一遍（deploy/scripts/tests/debt-edge-alert-rules.test.sh）
