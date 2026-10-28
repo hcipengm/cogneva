@@ -482,6 +482,16 @@ for node in sorted((set(anon) | set(file_min)) - set(memtotal)):
     unreadable.append(f"节点 {node} 有 host_slice 序列但没有 node_memory_MemTotal_bytes"
                       f"（node-exporter 对这个节点没读数），判据 2 的分母不在")
 
+# 分母一条都没有时，判据 2 的循环一次也不进，而它印出来的东西与「每个节点都还装得下」
+# 完全一样。这不是「节点都合规」，是三层的那一行根本没有被摆出来——Prometheus 里
+# node-exporter 一条 MemTotal 都没有，或这三条查询的名字一起改坏了，都是这个症状。
+if not memtotal:
+    unreadable.append(
+        "node_memory_MemTotal_bytes 一条序列都没读到：判据 2 的分母不在，"
+        f"这一跑一个节点都没摆到三层那一行上（anon {len(anon)} 条、"
+        f"file_min {len(file_min)} 条、MemTotal {len(memtotal)} 条）——"
+        "零个节点与「每个节点都还装得下」在判词上同形")
+
 # ---- 判据 2：每节点 Σanon + file 的 7 天最小 < MemTotal ----
 for node in sorted(memtotal):
     total = memtotal[node]

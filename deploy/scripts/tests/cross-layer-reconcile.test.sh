@@ -13,6 +13,8 @@
 #   5. 某节点没有 anon 序列 -> 2（缺席不是 0，是判不了）；
 #   6. 某节点的 7 天窗口里没有 file 样本 -> 2；
 #   7. 判据 2 绿但 PSI full 在计秒 -> 0，并且把「不一致本身就是结论」印出来；
+#   8b. 三层读数一条序列都没有 -> 2：判据 2 的循环一次也不进，而它印出来的东西与
+#      「每个节点都还装得下」完全一样；
 #  10. 准入余量装不下部署器滚动 Job -> 1，点名判据 3 与资源名（used 含运行期自建
 #      Pod，声明和仍装得进配额）；
 #  11. evolution ConfigMap 里没有滚动 Job 的上限 -> 2（缺席不是「装得下」）；
@@ -324,6 +326,14 @@ state["nodes"]["items"].append({
     "status": {"allocatable": {"cpu": "8000m", "memory": "16777216Ki"}}})
 state["prom"]["anon"].append({"metric": {"node": "node-b", "slice": "kubepods.slice"},
                               "value": [0, str(int(2 * Gi))]})
+'
+
+# 8b. 三份读数一条序列都没有：判据 2 的循环一次也不进，而判词照旧印「三层在同一行上
+#     仍彼此装得下」。零个节点摆上桌不是绿，是这一跑什么都没判。
+expect no-host-series-at-all 2 "判据 2 的分母不在" '
+state["prom"]["anon"] = []
+state["prom"]["file_min"] = []
+state["prom"]["memtotal"] = []
 '
 
 # 9. 配额里没有 requests.memory：判据 1 的左边读不出来。
