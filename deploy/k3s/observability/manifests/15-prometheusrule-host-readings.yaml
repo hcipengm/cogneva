@@ -713,7 +713,7 @@ spec:
             severity: warning
           annotations:
             summary: "宿主已被压着，而构建闸外还有构建在跑（几发看 `build_containment_builds{containment=\"outside\"}`）"
-            description: "宿主上跑那条 containment 读数（脚本名 `cogneva-host-build-containment-reading.sh`，不在本仓，在值守用的另一棵树里，以 cogneva 用户跑）看两件事：`build_containment_builds{containment=\"outside\"}` 是闸外几发，`build_containment_outside_names` 把每一发往上走到底的那条父链点出来——`systemd<tmux: server<claude<bash<timeout<cargo` 这样的链就是「某个会话里直接敲的」。修法二选一：那一发改用同一棵树里的构建闸包装 `cogneva-build.sh cargo …` 起（取槽、按界分宽度），或者等它跑完再起闸里的活。**不要**抬闸的界——闸外的构建根本不看那个界。"
+            description: "宿主上跑那条 containment 读数（脚本名 `cogneva-host-build-containment-reading.sh`，不在本仓，在值守用的另一棵树里，以 cogneva 用户跑）看两件事：`build_containment_builds{containment=\"outside\"}` 是闸外几发，`build_containment_outside_names` 把每一发往上走到底的那条父链点出来——`systemd<tmux: server<agent-cli<bash<timeout<cargo` 这样的链就是「某个会话里直接敲的」。修法二选一：那一发改用同一棵树里的构建闸包装 `cogneva-build.sh cargo …` 起（取槽、按界分宽度），或者等它跑完再起闸里的活。**不要**抬闸的界——闸外的构建根本不看那个界。"
 
         # 构建在 slice 里，而那个 slice 没有配额。这一条比「没人在 slice 里」更该响：
         # slice 存在、构建在里面、`systemd-cgls` 也指着它，读起来像「有界」，而
