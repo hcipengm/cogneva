@@ -608,6 +608,21 @@ pub struct PinAudit {
     /// Pairs of the same type attached to an `unsatisfied` read and an
     /// `unconsumed` publish — one break, reported the two ways it shows up.
     pub identity_mismatches: Vec<PinIdentityMismatch>,
+    /// How many pins each descriptor in the set published during this startup,
+    /// in descriptor order.
+    ///
+    /// Every descriptor is present, including the ones that published nothing.
+    /// A plugin that started, ran `init`, and published no pin leaves no other
+    /// trace: it is on the table, it compiled, it logged its own start line, and
+    /// the pin graph says nothing about it because a pin it never published is
+    /// not a pin.  Dropping the zeros makes this list read exactly like the
+    /// list of plugins that published something — the two are distinguished
+    /// only by what is missing from a line an operator has no second copy of.
+    ///
+    /// The count is observed rather than declared on purpose: a `provides`
+    /// field on [`PluginDescriptor`] would be a second, hand-kept copy of what
+    /// the plugin's code already does, free to disagree with it silently.
+    pub publishes_by_plugin: Vec<(&'static str, usize)>,
     /// Distinct pins observed, and the totals behind them.
     pub pins: usize,
     pub publishes: usize,
@@ -624,6 +639,23 @@ impl PinAudit {
             reads: wiring.iter().map(|w| w.consumers.len()).sum(),
             ..Default::default()
         };
+
+        // Seeded from the descriptor set, not from the wiring: a plugin that
+        // published nothing has no entry in `wiring` to be counted from, and it
+        // is the one this exists to make visible.
+        let mut published: HashMap<&'static str, usize> =
+            descriptors.iter().map(|d| (d.name, 0)).collect();
+        for w in wiring {
+            for publisher in w.publishers.iter().flatten() {
+                if let Some(count) = published.get_mut(publisher) {
+                    *count += 1;
+                }
+            }
+        }
+        audit.publishes_by_plugin = descriptors
+            .iter()
+            .map(|d| (d.name, published[d.name]))
+            .collect();
 
         for w in wiring {
             if w.publishers.is_empty() {
@@ -734,6 +766,23 @@ impl PinAudit {
                 m.read.name(),
                 m.published.name()
             );
+        }
+        // Printed at `info`, unlike the healthy aggregate below, and printed on
+        // every startup rather than only when a count is zero.  The aggregate
+        // says how many publishes happened; it cannot say who did none, and a
+        // plugin that ran and published nothing is otherwise indistinguishable
+        // from one that was never wired in.  This is the only place that
+        // difference shows up, so it is a fact an operator has to be able to
+        // read at the verbosity the process actually runs at -- a line that
+        // appears only in the state it is meant to report gives absence two
+        // meanings.
+        if !self.publishes_by_plugin.is_empty() {
+            let counts: Vec<String> = self
+                .publishes_by_plugin
+                .iter()
+                .map(|(name, count)| format!("{name}={count}"))
+                .collect();
+            tracing::info!("pins published per plugin: {}", counts.join(", "));
         }
         // Every family is named in its own slot rather than folded into one
         // total. A total is what let the largest family go unread: `unconsumed`
@@ -1642,6 +1691,32 @@ mod pin_tests {
         assert_eq!(wiring[0].publishers, vec![Some("publisher")]);
         assert_eq!(wiring[0].consumers.len(), 1);
         assert_eq!(wiring[0].consumers[0].owner, Some("reader"));
+    }
+
+    #[test]
+    fn a_plugin_that_publishes_nothing_is_named_with_its_zero() {
+        // The one shape nothing else can see: a plugin that is on the descriptor
+        // table, compiles, runs `init`, and publishes no pin.  It contributes no
+        // entry to the wiring, so a per-plugin count taken from the wiring alone
+        // simply does not mention it -- and a list that omits a plugin reads
+        // like a list of the plugins that were wired.
+        let descriptors = [
+            descriptor("publisher", &[]),
+            descriptor("reader", &["publisher"]),
+        ];
+        let mut runner = PluginRunner::from_descriptors(&descriptors).expect("descriptors");
+        let ctx = ctx();
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(runner.init_all(&ctx))
+            .expect("init");
+
+        let audit = PinAudit::evaluate(&ctx.pin_wiring(), &descriptors);
+        assert_eq!(
+            audit.publishes_by_plugin,
+            vec![("publisher", 1), ("reader", 0)],
+            "every descriptor is counted, including the one that published nothing"
+        );
     }
 
     #[test]

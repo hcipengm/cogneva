@@ -206,6 +206,19 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_plugin_pin_unordered_init_read_count",
         Unread::Gap("how many such reads a missing `requires` edge left unordered, as the always-answering half of the family above. The first reading of this family is also what found its own defect: the number was one larger than the series any query could count, because a read registered twice at init is one series on the exposition. That half is closed now -- the members are collapsed where the series are built, so the size and the series agree -- and what remains owed is the reader nothing has given it"),
     ),
+    // The fifth pin family, and the only one whose members are not anomalies.
+    // The four above can name a plugin only through the wiring, so the plugin
+    // that started and published no pin had no reading at all: absent from
+    // every family, present on the descriptor table, and named by the startup
+    // log only as "start plugin". These two publish the population instead.
+    (
+        "cogneva_plugin_publishes",
+        Unread::Gap("one series per plugin in the descriptor set, valued by how many pins it published, zeros included. It is the inverse of the four families above: they name what went wrong among the pins that exist, and this names the plugin that produced none of them, which no pin-shaped reading can reach because a pin nobody published is not a pin. A zero is not by itself a fault -- a pure reader and a config-disabled plugin both publish nothing -- so what is owed is a reader of the population, not a rule"),
+    ),
+    (
+        "cogneva_plugin_publishes_count",
+        Unread::Gap("how many plugins the descriptor set holds, as the always-answering half of the family above. It is the denominator rather than a verdict: it stays the same when the composition changes underneath it and only the per-plugin series moves, which is exactly the pair the module keeps for its other families. No face reads the pair yet"),
+    ),
     // A series a build publishes with nothing anywhere reading it, found by a
     // scan rather than by a reader: the count of observables registered for
     // scraping. Its producer spelled the name inline in the exposition body,
@@ -367,7 +380,7 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// after are what took both entries off this table -- one drawing the growth
 /// loop's `declared` against its `peak` per claim, one drawing the four
 /// dimension ceilings against the ceiling in force.
-const GAPS_AT_SCRAPE_CENSUS: usize = 11;
+const GAPS_AT_SCRAPE_CENSUS: usize = 13;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

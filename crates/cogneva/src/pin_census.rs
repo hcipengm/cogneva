@@ -11,14 +11,24 @@
 //! family whose size nobody notices changing: it grew to thirty-one pins
 //! without a single reading ever disagreeing.
 //!
-//! Four families, each published the same way: a count that always answers, and
-//! one series per member carrying the names. Both halves are needed. The count
-//! alone stays the same when the population changes underneath it; the names
-//! alone make "this family is empty" and "this reading is not wired up" look
-//! alike on the exposition. The count is derivable from the per-member series
-//! with `count()`, and is still published on its own: an absent family and a
-//! family of zero are different readings, and only one of them means "nothing
-//! is left in this state".
+//! Four anomaly families, each published the same way: a count that always
+//! answers, and one series per member carrying the names. Both halves are
+//! needed. The count alone stays the same when the population changes
+//! underneath it; the names alone make "this family is empty" and "this reading
+//! is not wired up" look alike on the exposition. The count is derivable from
+//! the per-member series with `count()`, and is still published on its own: an
+//! absent family and a family of zero are different readings, and only one of
+//! them means "nothing is left in this state".
+//!
+//! A fifth pair is not an anomaly family and is shaped differently: one series
+//! per plugin in the descriptor set, carrying how many pins it published, zeros
+//! included. The four above can only name a plugin that appears in the wiring,
+//! and a plugin that produced no pin appears nowhere in it -- so "this plugin
+//! published nothing" had no reading at all, and the descriptor table plus the
+//! startup log on their own cannot tell it apart from a plugin that is simply
+//! wired to something. Its members are the whole population rather than a
+//! subset, which is why its count is the size of that population and not the
+//! size of a fault.
 //!
 //! A member is its label set, so the count is the number of distinct members: a
 //! plugin that reads the same pin twice while initialising is one member, not
@@ -84,6 +94,30 @@ pub const PUBLISHER_LABEL: &str = "publisher";
 
 /// The label carrying whoever read the pin.
 pub const READER_LABEL: &str = "reader";
+
+/// How many plugins the descriptor set holds.
+///
+/// Not the number of plugins that published something: this is the population
+/// the next metric is taken over, and it answers even when nothing published.
+pub const PIN_CENSUS_PUBLISHES_COUNT_METRIC: &str = "cogneva_plugin_publishes_count";
+
+/// One series per plugin, value = how many pins it published, label `plugin`.
+///
+/// The only family here whose value is not 1, and the only one whose members
+/// include plugins that produced nothing. That is the point: a plugin with no
+/// pin is absent from every other family, so without this line the question
+/// "did this plugin publish anything at all" has no reading anywhere -- the
+/// descriptor table says it exists, the startup log says it was started, and
+/// the pin graph says nothing, because a pin it never published is not a pin.
+///
+/// A value of 0 is a fact and not by itself a fault: a plugin that only reads
+/// pins, or one disabled by config, publishes nothing for two different
+/// reasons and reads the same here. The label says which plugin; it does not
+/// claim to say why.
+pub const PIN_CENSUS_PUBLISHES_METRIC: &str = "cogneva_plugin_publishes";
+
+/// The label carrying a plugin's name.
+pub const PLUGIN_LABEL: &str = "plugin";
 
 /// What the census says when no plugin stood in the role. The pin audit uses
 /// the same spelling for the same case, so a reader of both sees one token.
@@ -233,6 +267,19 @@ impl Observable for PinCensusObservable {
                 ]
             }),
         );
+
+        // Published in full, zeros included, and it is the one family whose
+        // members are not anomalies.
+        out.push(RawMetric::new(
+            PIN_CENSUS_PUBLISHES_COUNT_METRIC,
+            audit.publishes_by_plugin.len() as f64,
+        ));
+        for (plugin, published) in &audit.publishes_by_plugin {
+            out.push(
+                RawMetric::new(PIN_CENSUS_PUBLISHES_METRIC, *published as f64)
+                    .with_label(PLUGIN_LABEL, plugin.to_string()),
+            );
+        }
 
         Ok(out)
     }
@@ -388,6 +435,69 @@ mod tests {
             label_of(named[0], PUBLISHER_LABEL),
             "cog-thing",
             "and the other names who published it"
+        );
+    }
+
+    /// A descriptor the census only reads the name of. The factory is never
+    /// called: what is counted here is who published, and that comes from the
+    /// observed wiring and the names in the set.
+    fn unused_factory() -> Box<dyn cog_core::SystemPlugin> {
+        unreachable!("the census reads descriptor names, never factories")
+    }
+
+    fn descriptor(name: &'static str) -> cog_core::PluginDescriptor {
+        cog_core::PluginDescriptor {
+            name,
+            requires: &[],
+            optional_requires: &[],
+            factory: unused_factory,
+        }
+    }
+
+    /// The one reading that survives a plugin publishing nothing.
+    ///
+    /// Every other family is built out of the wiring, and a plugin that
+    /// published no pin leaves no entry in it. So the plugin that is on the
+    /// table, starts, and wires up nothing is the one case none of the other
+    /// series can name -- and it reads exactly like a plugin that was never
+    /// there, which is the mistake this reading exists to make impossible.
+    #[tokio::test]
+    async fn a_plugin_that_published_no_pin_appears_with_its_zero() {
+        let descriptors = [
+            descriptor("cog-publisher"),
+            descriptor("cog-idle"),
+            descriptor("cog-other"),
+        ];
+        let audit = PinAudit::evaluate(
+            &[PinWiring {
+                pin: Pin::of::<NothingReadsThis>(),
+                publishers: vec![Some("cog-publisher")],
+                consumers: vec![reader("cog-other")],
+            }],
+            &descriptors,
+        );
+
+        let observable = PinCensusObservable::new();
+        observable.record(audit).await;
+        let metrics = observable.collect_metrics("").await.unwrap();
+
+        assert_eq!(
+            value_of(&metrics, PIN_CENSUS_PUBLISHES_COUNT_METRIC),
+            Some(3.0),
+            "the count is the size of the descriptor set, not of the fault"
+        );
+        let published: Vec<(&str, f64)> = members(&metrics, PIN_CENSUS_PUBLISHES_METRIC)
+            .into_iter()
+            .map(|m| (label_of(m, PLUGIN_LABEL), m.value))
+            .collect();
+        assert_eq!(
+            published,
+            vec![
+                ("cog-publisher", 1.0),
+                ("cog-idle", 0.0),
+                ("cog-other", 0.0),
+            ],
+            "every plugin is a series, and the ones that published nothing say zero"
         );
     }
 
