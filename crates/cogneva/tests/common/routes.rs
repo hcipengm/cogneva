@@ -40,6 +40,21 @@ pub fn read_repo(rel: &str) -> String {
     read(&repo_root().join(rel))
 }
 
+/// 这棵树里每份源文件的相对名与全文，一次读齐。
+///
+/// 两份夹具各写过一遍同样的三行；两处都用 `ok()?` 把读失败丢掉了——于是读不到的
+/// 那一份悄悄退出人口，剩下的那份普查照样断言「没有违规」，而「它有违规但没读到」
+/// 与「它干净」在判词上同形。这里读不出来就 panic。
+pub fn source_texts(root: &Path) -> Vec<(String, String)> {
+    super::rust_production::src_and_test_sources(root)
+        .into_iter()
+        .map(|path| {
+            let text = read(&path);
+            (super::rust_production::relative_name(root, &path), text)
+        })
+        .collect()
+}
+
 /// One path reduced to the shape both sides can be compared by.
 ///
 /// `$` and `{}` are handled in one pass because a `${...}` may carry a nested

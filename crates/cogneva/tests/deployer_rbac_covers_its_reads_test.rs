@@ -48,11 +48,11 @@ use std::path::Path;
 mod common;
 
 use common::routes::{read_repo, repo_root};
+use common::yaml::docs;
 
 use common::rust_production::{production_sources, production_text, relative_name};
 
 use cog_reflection::{workload_kind_of_resource, WORKLOAD_KINDS};
-use serde::Deserialize;
 
 /// The Role the in-cluster deployer runs under. Both Job specs it writes name
 /// this ServiceAccount, and the parity gate holds this file, the chart template
@@ -149,23 +149,6 @@ struct Rule {
     names: Vec<String>,
 }
 
-/// `text` 里的每一篇文档，或者一次带文件名的 panic。解析不出来的文档是**失败**，
-/// 不是跳过：丢掉它就把它带的规则一起丢掉了，闸门会在一片它从没读过的输入上报绿。
-/// （`serde_yaml` 在文档反序列化失败时不推进游标，所以这里把错误丢掉不只是有损。）
-fn yaml_docs(text: &str, file: &str) -> Vec<serde_yaml::Value> {
-    let mut out: Vec<serde_yaml::Value> = Vec::new();
-    for doc in serde_yaml::Deserializer::from_str(text) {
-        match serde_yaml::Value::deserialize(doc) {
-            Ok(v) if v.is_null() => {}
-            Ok(v) => out.push(v),
-            Err(e) => panic!(
-                "{file}: 有一篇文档解析不出来（{e}）：解析不了是判据的形态问题，不能当它不存在"
-            ),
-        }
-    }
-    out
-}
-
 fn strings(value: Option<&serde_yaml::Value>) -> Vec<String> {
     value
         .and_then(|v| v.as_sequence())
@@ -214,7 +197,7 @@ fn roles_in(relative: &str) -> RoleFile {
     let mut roles: Vec<Role> = Vec::new();
     let mut bindings: Vec<Binding> = Vec::new();
 
-    for doc in yaml_docs(&text, relative) {
+    for doc in docs(&text, relative) {
         let kind = doc.get("kind").and_then(|k| k.as_str()).unwrap_or("");
         match kind {
             // 两类都是「一张规则表」，只差作用域。丢下 ClusterRole 的规则会让
@@ -1227,7 +1210,7 @@ fn every_identity_that_can_publish_can_read_the_canary_base_names() {
 #[should_panic(expected = "解析不出来")]
 fn a_document_that_does_not_parse_is_a_failure_not_a_skip() {
     // 未闭合的 flow sequence：一处真实的畸形形态（比如没渲染完的模板落到这里）。
-    let _ = yaml_docs(
+    let _ = docs(
         "apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\nrules: [\n",
         "torn.yaml",
     );

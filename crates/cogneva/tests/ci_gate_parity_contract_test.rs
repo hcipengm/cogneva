@@ -34,7 +34,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read_repo, repo_root};
 
 use std::collections::BTreeSet;
 
@@ -187,9 +187,7 @@ fn gating_jobs(workflow: &str) -> BTreeSet<String> {
 /// Missing the file is not a pass: a contract that reads nothing agrees with
 /// everything.
 fn workflow() -> String {
-    let path = repo_root().join(WORKFLOW);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
+    read_repo(WORKFLOW)
 }
 
 /// The names the base branch goes by, in the order they are tried.

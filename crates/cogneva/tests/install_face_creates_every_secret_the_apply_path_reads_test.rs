@@ -25,31 +25,12 @@
 mod common;
 
 use common::routes::{read_repo, repo_root};
+use common::yaml::docs;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use cog_reflection::workload_kind;
-use serde::Deserialize;
-
-/// Every document in `text`, or a panic naming the file. A document that does
-/// not parse is a failure, not a skip: dropping it silently would drop the
-/// Secret references it carries and turn a torn manifest green. (`serde_yaml`'s
-/// per-document iterator does not advance past a document that failed to
-/// deserialize, so a `filter_map(..ok())` here is not merely lossy.)
-fn yaml_docs(text: &str, file: &str) -> Vec<serde_yaml::Value> {
-    let mut out: Vec<serde_yaml::Value> = Vec::new();
-    for doc in serde_yaml::Deserializer::from_str(text) {
-        match serde_yaml::Value::deserialize(doc) {
-            Ok(v) if v.is_null() => {}
-            Ok(v) => out.push(v),
-            Err(e) => panic!(
-                "{file}: 有一篇文档解析不出来（{e}）：解析不了是判据的形态问题，不能当它不存在"
-            ),
-        }
-    }
-    out
-}
 
 fn at_path<'a>(v: &'a serde_yaml::Value, path: &str) -> Option<&'a serde_yaml::Value> {
     let mut cur = v;
@@ -160,7 +141,7 @@ fn the_walk_and_the_script_parse_both_name_the_reads_and_the_creates() {
     // Every by-name Secret read a pod template can carry, on a CronJob so the
     // template is reached through jobTemplate.
     let doc = "kind: CronJob\nmetadata:\n  name: c\nspec:\n  jobTemplate:\n    spec:\n      template:\n        spec:\n          containers:\n            - name: x\n              env:\n                - valueFrom:\n                    secretKeyRef:\n                      name: a\n              envFrom:\n                - secretRef:\n                    name: b\n          volumes:\n            - secret:\n                secretName: d\n            - projected:\n                sources:\n                  - secret:\n                      name: e\n";
-    let mut names = secret_references(&yaml_docs(doc, "fixture")[0]);
+    let mut names = secret_references(&docs(doc, "fixture")[0]);
     names.sort();
     assert_eq!(names, vec!["a", "b", "d", "e"]);
 
@@ -177,7 +158,7 @@ fn the_walk_and_the_script_parse_both_name_the_reads_and_the_creates() {
 #[should_panic(expected = "解析不出来")]
 fn a_document_that_does_not_parse_is_a_failure_not_a_skip() {
     // 未闭合的 flow mapping：一处真实的畸形形态（比如没渲染完的模板落到这里）。
-    let _ = yaml_docs("kind: Deployment\nmetadata: {name: torn\n", "torn.yaml");
+    let _ = docs("kind: Deployment\nmetadata: {name: torn\n", "torn.yaml");
 }
 
 #[test]
@@ -200,7 +181,7 @@ fn every_secret_an_apply_path_workload_reads_is_created_by_the_install_face() {
     for file in &files {
         let text = std::fs::read_to_string(file)
             .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
-        for doc in yaml_docs(&text, &file.display().to_string()) {
+        for doc in docs(&text, &file.display().to_string()) {
             referenced.extend(secret_references(&doc));
         }
     }

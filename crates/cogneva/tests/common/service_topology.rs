@@ -15,9 +15,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
-use super::routes::{route_entries_in, walk};
+use super::routes::{read, route_entries_in, walk};
 use super::rust_production::{production_text, relative_name};
 
 /// 唯一声明本项目镜像名的地方。
@@ -159,6 +157,10 @@ pub fn manifest_trees(root: &Path) -> Vec<PathBuf> {
 }
 
 /// 这些树里的每一份 YAML 文档，连同它所在的相对路径。
+///
+/// 读不出来、或者有一篇解析不出来，就停：这里原先两者都 `continue`／`if let Ok`，
+/// 于是一份清单读不进来只是从人口里少一行，而少一行与「这一份都对得上」在判词上
+/// 同形。
 fn documents(root: &Path) -> Vec<(String, serde_yaml::Value)> {
     let mut files = Vec::new();
     for tree in manifest_trees(root) {
@@ -167,14 +169,9 @@ fn documents(root: &Path) -> Vec<(String, serde_yaml::Value)> {
     files.sort();
     let mut out = Vec::new();
     for path in files {
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
         let manifest = relative_name(root, &path);
-        for document in serde_yaml::Deserializer::from_str(&text) {
-            if let Ok(value) = serde_yaml::Value::deserialize(document) {
-                out.push((manifest.clone(), value));
-            }
+        for value in super::yaml::docs(&read(&path), &manifest) {
+            out.push((manifest.clone(), value));
         }
     }
     out

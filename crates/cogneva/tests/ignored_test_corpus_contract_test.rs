@@ -34,7 +34,7 @@
 
 mod common;
 
-use common::routes::{repo_root, walk_files};
+use common::routes::{read_repo, repo_root, walk_files};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -260,9 +260,7 @@ fn ignored_steps(workflow: &str) -> Vec<Step> {
 /// Missing the file is not a pass: a contract that reads nothing agrees with
 /// everything.
 fn workflow() -> String {
-    let path = repo_root().join(WORKFLOW);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
+    read_repo(WORKFLOW)
 }
 
 /// The crate directory a `-p <crate>` names.

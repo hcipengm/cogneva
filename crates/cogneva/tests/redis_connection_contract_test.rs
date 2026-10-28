@@ -38,13 +38,11 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, source_texts};
 // 产出面（去掉用例体与 `#[cfg(test)]` 项）只有一处算法，不在这里再写一份：
 // 自己切「第一处 `#[cfg(test)]`」在文件中间有一个 test-only 项时会把后面的产出
 // 整段丢掉，那时「没有这条路径」与「没读到这块文件」是同一句判词。
 use common::rust_production::production_text;
-
-use common::rust_production::{relative_name, src_and_test_sources};
 
 /// The bare connection type, and the constructor that hands one out.
 const BARE_TYPE: &str = concat!("Multiplexed", "Connection");
@@ -111,15 +109,12 @@ fn is_integration_test(relative: &str) -> bool {
 /// outside client or a second loop, so it builds the same connection and runs
 /// the same cadence -- only its lifetime is the test's. An example is not part
 /// of any process.
+///
+/// The reading itself is [`source_texts`]: a file that cannot be read stops the
+/// run instead of dropping out of the population, because a census that lost a
+/// file and a tree that is clean print the same sentence.
 fn scan() -> Vec<(String, String)> {
-    let root = repo_root();
-    src_and_test_sources(&root)
-        .into_iter()
-        .filter_map(|path| {
-            let text = std::fs::read_to_string(&path).ok()?;
-            Some((relative_name(&root, &path), text))
-        })
-        .collect()
+    source_texts(&repo_root())
 }
 
 #[test]
