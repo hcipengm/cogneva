@@ -1110,6 +1110,14 @@ pub(crate) struct FieldRemoval {
     pub paths: Vec<Vec<FieldStep>>,
 }
 
+/// 一次回读的结局。两者都不等于「删掉了」：一个说字段还在，另一个说这次没量成。
+pub(crate) struct RemovalReadback {
+    /// 清单里删了、对象上还挂着的（路径只留仍在的那几条）。
+    pub not_taken: Vec<FieldRemoval>,
+    /// 读不回来的对象：没量成，不是没删掉，也不是删掉了。
+    pub unreadable: Vec<FieldRemoval>,
+}
+
 /// 字段路径上的一步：一个映射的键，或者一个列表里按 `name` 认出来的那一个元素。
 ///
 /// 列表不按下标比：前面插进一个元素之后，后面每一项的下标都错位，按下标比会把一串
@@ -1182,7 +1190,9 @@ pub(crate) fn paths_still_live(
 /// 落——而 apply 退 0、回 `serverside-applied`、`kubectl diff` 输出为空，三项读起来
 /// 都像成功。2026-10-22 实测：从 chart 的 traefik `Middleware` 删掉
 /// `spec.headers.customRequestHeaders`，主线滚动报健康完成，那个对象的
-/// `metadata.generation` 还停在旧值上，一条改动都没上线。
+/// `metadata.generation` 还停在旧值上，一条改动都没上线。判它落没落只能读回对象看
+/// 那条路径在不在：代数只说明「spec 有变化」，支撑工作负载每版都换镜像 tag，它涨了
+/// 也不代表这次删的那个字段落了。
 pub(crate) const FIELD_REMOVAL_NOT_TAKEN_MARKER: &str =
     "a field this revision removed is still in the live object";
 
@@ -3246,7 +3256,7 @@ impl RolloutExecutor {
 
     /// 一个对象的全文。读不到就是读不到——`None` 与「读回来了、字段不在」在判据上
     /// 必须分得开。
-    async fn live_object(&self, r: &FieldRemoval) -> Option<serde_json::Value> {
+    async fn live_object(&self, r: &FieldRemoval) -> SFResult<serde_json::Value> {
         let text = self
             .probe(
                 &[
@@ -3261,32 +3271,55 @@ impl RolloutExecutor {
                 30,
                 self.rollout_timeout_secs,
             )
-            .await
-            .ok()?;
-        serde_json::from_str(&text).ok()
+            .await?;
+        serde_json::from_str(&text).map_err(|e| {
+            SFError::IO(format!(
+                "{}/{} (namespace {}) readback: {e}",
+                r.resource, r.name, r.namespace
+            ))
+        })
     }
 
     /// apply 之后把对象读回来，挑出「清单里删了字段、对象上还挂着」的那些，路径
     /// 只留仍在的那几条。
     ///
-    /// 读不回来（对象不在了、查不动）的不算数：那不是「没删掉」的证据，把没有证据
-    /// 写成失败会让这条判据在别的故障上误报。
-    async fn removals_not_taken(&self, seen: &[FieldRemoval]) -> Vec<FieldRemoval> {
-        let mut out = Vec::new();
+    /// 读不回来（对象不在了、查不动）既不是「删掉了」也不是「没删掉」，是一次没量成：
+    /// 把它当成跳过，一次 RBAC 故障或一次超时就会让这一版跳过全部校验、然后报健康
+    /// 完成，读数面上与「字段都删干净了」一模一样——门恰好在最需要它的那次故障上不
+    /// 出声。所以它要单独带出来，由调用方说出声并写进这一轮的结算旁注。不拦这一轮：
+    /// 读不到集群时拦下每一次滚动的代价，比漏掉一次校验更大。
+    async fn read_back_removals(&self, seen: &[FieldRemoval]) -> RemovalReadback {
+        let mut not_taken = Vec::new();
+        let mut unreadable = Vec::new();
         for r in seen {
-            let Some(live) = self.live_object(r).await else {
-                continue;
-            };
-            let still = paths_still_live(&live, &r.paths);
-            if still.is_empty() {
-                continue;
+            match self.live_object(r).await {
+                Ok(live) => {
+                    let still = paths_still_live(&live, &r.paths);
+                    if still.is_empty() {
+                        continue;
+                    }
+                    not_taken.push(FieldRemoval {
+                        paths: still,
+                        ..r.clone()
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        resource = %r.resource,
+                        name = %r.name,
+                        namespace = %r.namespace,
+                        error = %e,
+                        "mainline rollout: cannot read an object back whose manifest dropped \
+                         fields; this apply's field removals on it are not verified"
+                    );
+                    unreadable.push(r.clone());
+                }
             }
-            out.push(FieldRemoval {
-                paths: still,
-                ..r.clone()
-            });
         }
-        out
+        RemovalReadback {
+            not_taken,
+            unreadable,
+        }
     }
 
     /// 等这次 apply 动过的支撑工作负载回到就绪。等不到（或读不到集群）都把错误
@@ -4462,6 +4495,9 @@ impl RolloutExecutor {
         }
         // 这次 apply 会改写的整组引用，两个面各一份，回滚按同一组还原。
         let mut refs = RefSnapshots::default();
+        // 清单里删了字段、而对象读不回来的一次次「没量成」。带到这里是为了写进收尾
+        // 那句健康读数：读不到集群不是失败，但读数面上不能与「校验过了」同形。
+        let mut unverified_removals: Vec<String> = Vec::new();
         // 引用面门：这次 apply 会引用的 ConfigMap 必须要么随本次 apply 一起来、要么
         // 集群里已经在，缺一个就在这里扣住。位置必须在**第一处 apply 之前**——支撑清单
         // 是这条通道上的第一个写动作，过了它集群就不再是原样，回滚也回不到"一个字节
@@ -4549,10 +4585,10 @@ impl RolloutExecutor {
                             .snapshot_rewritten_refs(&text, "support.yaml")
                             .await
                             .map_err(|e| classify_before_any_change("ref-snapshot", "", e))?;
-                        // 这一版在清单里删掉字段的对象，以及它们此刻的代数：server-side
-                        // apply 删不掉「本次没声明、由别的写者拥有」的字段，而那种删除
-                        // 失败退 0、回 serverside-applied，事后只能靠代数看出来一个字都
-                        // 没写进去。快照必须取在 apply 之前——它是唯一的对照。
+                        // 这一版在清单里删掉字段的对象：server-side apply 删不掉「本次
+                        // 没声明、由别的写者拥有」的字段，而那种删除失败退 0、回
+                        // serverside-applied，读起来像成功。它到底落没落，只能在 apply
+                        // 之后把对象读回来看那个字段还在不在。
                         let field_removals = self.field_removals_to_verify(&text).await;
                         info!(
                             source = %support.display(),
@@ -4606,12 +4642,18 @@ impl RolloutExecutor {
                                 .await
                                 .map_err(|e| classify_before_any_change("support-settle", "", e))?;
                         }
-                        // 删字段的对象代数没动：这次 apply 说自己成功，而它要删的那几个
-                        // 字段还在。判健康会把「一条改动都没上线」写成「上线完成」，
-                        // 之后没有任何东西会再看它一眼——这正是 2026-10-22 那一轮。
-                        let not_taken = self.removals_not_taken(&field_removals).await;
-                        if !not_taken.is_empty() {
-                            let detail = not_taken
+                        // 回读：这次 apply 说自己成功，而它要删的那几个字段还在。判健康
+                        // 会把「一条改动都没上线」写成「上线完成」，之后没有任何东西会
+                        // 再看它一眼——这正是 2026-10-22 那一轮。
+                        let readback = self.read_back_removals(&field_removals).await;
+                        unverified_removals = readback
+                            .unreadable
+                            .iter()
+                            .map(|r| format!("{}/{}", r.resource, r.name))
+                            .collect();
+                        if !readback.not_taken.is_empty() {
+                            let detail = readback
+                                .not_taken
                                 .iter()
                                 .map(|r| {
                                     format!(
@@ -4818,7 +4860,18 @@ impl RolloutExecutor {
                     .await;
             }
         }
-        info!(tag = %plan.tag, "mainline rollout complete and healthy");
+        if !unverified_removals.is_empty() {
+            warn!(
+                objects = %unverified_removals.join(","),
+                "mainline rollout: completed, but this apply's field removals on these objects \
+                 were never verified"
+            );
+        }
+        info!(
+            tag = %plan.tag,
+            unverified_field_removals = %unverified_removals.join(","),
+            "mainline rollout complete and healthy"
+        );
         Ok(())
     }
 
@@ -5683,9 +5736,47 @@ data:
         .is_empty());
     }
 
-    /// 「删没落」的证据是**对象的内容**，不是它的代数：代数在任何 spec 变化时都会
-    /// 前进，而支撑工作负载本来就每版都换镜像 tag。一个对象这一版既删了字段又换了
-    /// 镜像时，代数照涨——拿代数判会把一次没落地的删除读成落上了。
+    /// 读不回来既不是「删掉了」也不是「没删掉」，是一次没量成。把它并进跳过，一次
+    /// RBAC 故障或一次超时就会让这一版跳过全部校验、然后报健康完成，读数面上与
+    /// 「字段都删干净了」一模一样——门恰好在最需要它的那次故障上不出声。所以它要
+    /// 被单独带出来：只有带出来，收尾那句健康读数才写得出是哪几个对象没量成。
+    #[tokio::test]
+    async fn an_object_that_cannot_be_read_back_is_unverified_not_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kubectl = crate::test_support::write_executable(
+            tmp.path(),
+            "fake-kubectl",
+            "#!/bin/sh\necho 'Error from server (Forbidden): middlewares.traefik.io is forbidden' >&2\nexit 1\n",
+        );
+        let executor =
+            RolloutExecutor::new(kubectl.to_string_lossy().as_ref(), "cogneva", 1, 1, 60, 60);
+        let removal = FieldRemoval {
+            resource: "middleware.traefik.io".into(),
+            namespace: "cogneva".into(),
+            name: "cogneva-strip".into(),
+            paths: vec![vec![
+                FieldStep::Key("spec".into()),
+                FieldStep::Key("headers".into()),
+                FieldStep::Key("customRequestHeaders".into()),
+            ]],
+        };
+        let readback = executor
+            .read_back_removals(std::slice::from_ref(&removal))
+            .await;
+        assert!(readback.not_taken.is_empty(), "{:?}", readback.not_taken);
+        assert_eq!(readback.unreadable.len(), 1, "{:?}", readback.unreadable);
+        assert_eq!(readback.unreadable[0].name, "cogneva-strip");
+        assert_eq!(
+            readback.unreadable[0].paths, removal.paths,
+            "the paths it was never able to check have to travel with it"
+        );
+    }
+
+    /// 「删没落」的证据是**对象的内容**：一个对象这一版既删了字段又换了镜像 tag
+    /// 时，`metadata.generation` 照涨，任何「对象变了没有」的读数都会把一次没落地
+    /// 的删除读成落上了。所以判据只问那个字段本身还在不在。
+    ///
+    /// principle: feedback_a_server_side_apply_cannot_delete_a_field_another_writer_owns
     #[test]
     fn a_field_still_on_the_live_object_is_the_proof_the_deletion_never_landed() {
         let path = vec![
