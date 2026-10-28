@@ -3910,11 +3910,12 @@ impl MainlineDeployer {
 
     /// 上游 CI 已经给出明确的失败结论就扣住这个 rev；`Ok(true)` = 扣住了。
     ///
-    /// 这条判据一轮里问两次，因为它挡的那段窗口在两次提问之间：轮首那次决定
-    /// 要不要花一整段冷构建，派 Job 之前那次决定这份刚编好的镜像要不要进集群。
-    /// 只问轮首那次等于让这扇门在最需要它的地方闭着眼——实测的原因分布正是
-    /// 这样：`no_evidence` 全部落在 `pending`（上游还在跑）与 `no_runs`（还没
-    /// 有东西）两格，一次读失败都没有；而轮首到派发之间隔着的那段构建，足够
+    /// 这条判据一轮里问三次，因为它挡的那段窗口从轮首一直开到派发：轮首那次决定
+    /// 要不要开始这一轮，拿构建槽之前那次决定要不要花一整段冷构建，派 Job 之前那次
+    /// 决定这份刚编好的镜像要不要进集群。只问轮首那次等于让这扇门在最需要它的地方
+    /// 闭着眼——实测的原因分布正是这样：`no_evidence` 全部落在 `pending`（上游还在
+    /// 跑）与 `no_runs`（还没有东西）两格，一次读失败都没有；而轮首到拿槽之间隔着
+    /// 回收、收敛判定与排队（实测 587 秒），拿槽到派发之间隔着整段构建，两段都足够
     /// 让那次检查跑出结论。
     ///
     /// 这一个提问点上读不到结论一律放行（只有 `Some(false)` 才扣）：拿一次平台抖动
@@ -5970,8 +5971,9 @@ impl MainlineDeployer {
         // 滚动门禁：上游 CI 已经给出明确的失败结论就不滚这个 rev。bare 的
         // main 在上面就推进过了（它只是一份镜像副本，推进无害），所以这里挡
         // 的是"把红 CI 的代码送进集群"，不是"跟踪上游"——上游修好或下一个 rev
-        // 追上来，这条路径自己恢复。这里问的是第一次；第二次在真要派 Job 之前
-        // （见 `roll_out`），中间隔着的那段构建正是它要补上的窗口。
+        // 追上来，这条路径自己恢复。这里问的是第一次；第二次在拿构建槽之前
+        // （构建跑完才发现红，白跑的是十六分钟的槽），第三次在真要派 Job 之前
+        // （见 `roll_out`），每两次之间隔着的那段正是它要补上的窗口。
         if self.hold_if_ci_reports_failure(&mut state, &bare).await? {
             // 被 CI 扣住的轮同样「还在等构建场」，只是走不到下面的被拒分支。
             self.renew_advance_reservation(&mut state)?;
@@ -6073,6 +6075,31 @@ impl MainlineDeployer {
                 tip = %rev12(&tip),
                 "upstream moved past this revision before the build started; building it anyway and taking the new tip next round"
             );
+        }
+
+        // 构建之前再问一次上游 CI，而且是**同一道门**（`hold_if_ci_reports_failure`），
+        // 判据不在这里另写一份。
+        //
+        // 轮首那次问的是一版刚落上来的 rev，上游的检查多半还没跑完。最近六小时的
+        // 判词分布是 `fail` 26 / `no_evidence` 34 / `pass` 2：轮首几乎从来拿不到结论，
+        // 十六次派发只落地一次。而从轮首到这里隔着回收、收敛判定与等构建槽（实测
+        // 一次 587 秒），这段时间足够一条要红的检查跑出结论——不开这道门，红要等到
+        // 构建跑完、`roll_out` 里那次复问才被看见，白跑的是那一整段构建。
+        //
+        // 只扣**这一版的明确红**。这一支与上面那段「上游又落一笔不让位」不冲突也不
+        // 重复：那说的是 tip 变了（每一轮都会命中），这里问的是 `bare` 自己红没红
+        // （说不出版本的事就照旧往下走）。「还在跑」「没问到」在这里照旧放行——它们
+        // 说不出这一版的好坏，让位只会把每一轮都变成空轮；扣住它们的门在 Job 里、
+        // 在第一处写动作之前。
+        //
+        // 位置在拿槽**之前**：读 git 与问 CI 都不是构建，那个槽的契约只罩真要构建的
+        // 那一段。扣住时什么都还没写下来，直接回下一轮。
+        if self.hold_if_ci_reports_failure(&mut state, &bare).await? {
+            // 与轮首那一支同样走不到被拒分支：还挂着的换手请求要在这里续上，
+            // 否则一次「等到了却在这一问问出红」会让预留自己过期，读数面上
+            // 这一段等待与「没有在等」同形。
+            self.renew_advance_reservation(&mut state)?;
+            return Ok(());
         }
 
         // 宿主构建闸只界**真要构建**的那一段，所以它在这里才拿，并且在镜像推完
@@ -13330,6 +13357,69 @@ exit 0
             serde_json::from_str(&std::fs::read_to_string(root.join("state/state.json")).unwrap())
                 .unwrap();
         assert_eq!(state.in_flight.unwrap().phase, Phase::Dispatched);
+    }
+
+    /// 判词在轮首之后、构建之前到达时，这一段构建不该开始。
+    ///
+    /// 轮首问的是一版刚落上来的 rev，上游的检查多半还没跑完：实测最近六小时的判词
+    /// 分布是 `fail` 26 / `no_evidence` 34 / `pass` 2，十六次派发只落地一次。轮首
+    /// 到这里之间隔着回收、收敛判定与等构建槽（实测 587 秒），那条要红的检查常常
+    /// 已经跑出结论——构建跑完之后 `roll_out` 里那道复问才发现红，白跑的是唯一的
+    /// 宿主构建槽。
+    ///
+    /// 这一格用两次回答分开两种实现：第一次绿、第二次红。只有构建前那道门会把红
+    /// 接住；没有它，这一轮照样构建（`buildah_built` 会亮）。反过来，若这道门被挪
+    /// 到轮首，它拿到的会是绿，构建照样开始——所以「没构建」＋「扣住的是这一版」
+    /// 两件事一起，才说得清红是在哪一问上被接住的。
+    #[tokio::test]
+    async fn a_red_verdict_that_arrives_before_the_build_keeps_the_build_slot() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, rev12(&rev_b));
+        let kubectl = fake_kubectl(&bin_dir, "reg.local:5000/cogneva:local");
+        let ws = test_workspaces(root, &bare);
+        fake_cargo(&bin_dir, ws.target_dir());
+        fake_strip(&bin_dir);
+
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"conclusion":"success"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+        ])
+        .await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.upstreams = vec![crate::config::UpstreamTrackConfig {
+            platform: crate::config::CodePlatform::Github,
+            repo: "owner/repo".into(),
+            api_base: Some(format!("http://{endpoint}/github")),
+        }];
+        let deployer = MainlineDeployer::new(cfg, ws);
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
+        deployer.poll_once().await.unwrap();
+        std::env::set_var("PATH", old_path);
+        handle.abort();
+
+        assert!(
+            !buildah_built(&bin_dir),
+            "轮首之后才判红的这一版，构建一个字节都不该开始"
+        );
+        let state: MainlineState =
+            serde_json::from_str(&std::fs::read_to_string(root.join("state/state.json")).unwrap())
+                .unwrap();
+        let hold = state
+            .ci_hold
+            .expect("扣住这一版要落到状态里，否则下一轮读不到它");
+        assert_eq!(hold.rev, rev_b, "扣住的必须是这一轮要构建的那一版");
+        assert_eq!(
+            state.last_ci_verdict.map(|v| v.verdict),
+            Some("fail".to_string()),
+            "落到盘上的判词要是第二次那一份（红），不是轮首那份绿"
+        );
     }
 
     /// 读不到容器镜像不许被读成「还没迁移到主线镜像」。
