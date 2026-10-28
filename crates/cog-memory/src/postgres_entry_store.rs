@@ -15,14 +15,16 @@ use cog_core::{SourceRef, SummaryEntry};
 
 /// SQL DDL applied by [`PostgresEntryStore::init_table`].
 ///
-/// The final statement is a one-time correction, not a schema change. Rows
-/// written before absence had a representation carry a run of zeros in
-/// `embedding` and a real model name in `embedding_model`, which reads as a
-/// vector that matched nothing rather than as no vector at all; the index then
-/// rebuilt from them and every search returned an arbitrary tie at score 0.0.
-/// The predicate makes it idempotent and non-destructive: it only rewrites a
-/// vector that carries no information by construction, and matches nothing
-/// once every such row has been converted.
+/// The shape only. The correction that used to sit at the end of this text is
+/// [`SUMMARY_ENTRIES_REPAIR`], and it is a separate statement list because of
+/// what sharing one would cost: every statement here takes a lock that keeps
+/// readers out, a multi-statement simple query is one implicit transaction, so
+/// a correction appended here runs while this list still holds the table
+/// `ACCESS EXCLUSIVE` -- for as long as walking the rows takes. Measured on a
+/// rolling restart: the two `ADD COLUMN`s were done in twelve seconds and the
+/// correction then kept the table closed for another twenty-six. Run on its
+/// own, the same correction asks only for `ROW EXCLUSIVE`, which no reader
+/// waits behind.
 pub const SUMMARY_ENTRIES_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS summary_entries (
     id                TEXT        PRIMARY KEY,
@@ -44,6 +46,22 @@ CREATE TABLE IF NOT EXISTS summary_entries (
 CREATE INDEX IF NOT EXISTS idx_summary_entries_ns_raw_uri ON summary_entries(namespace, raw_uri);
 ALTER TABLE summary_entries ADD COLUMN IF NOT EXISTS retrieval_count BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE summary_entries ADD COLUMN IF NOT EXISTS last_retrieved_at TIMESTAMPTZ;
+"#;
+
+/// A one-time correction, not a schema change, applied after
+/// [`SUMMARY_ENTRIES_DDL`] and in its own transaction.
+///
+/// Rows written before absence had a representation carry a run of zeros in
+/// `embedding` and a real model name in `embedding_model`, which reads as a
+/// vector that matched nothing rather than as no vector at all; the index then
+/// rebuilt from them and every search returned an arbitrary tie at score 0.0.
+/// The predicate makes it idempotent and non-destructive: it only rewrites a
+/// vector that carries no information by construction, and matches nothing
+/// once every such row has been converted -- measured on the deployment's own
+/// table, it matched zero of 5212 rows and still took 1.4 s, because the
+/// predicate builds an array per row to compare against. That second is the
+/// reason it cannot share the DDL's transaction.
+pub const SUMMARY_ENTRIES_REPAIR: &str = r#"
 UPDATE summary_entries
    SET embedding = '{}', embedding_model = ''
  WHERE cardinality(embedding) > 0
@@ -79,12 +97,18 @@ impl PostgresEntryStore {
         &self.pool
     }
 
-    /// Apply the table + index DDL idempotently.
+    /// Apply the table + index DDL idempotently, then the correction.
+    ///
+    /// Two calls, not one text: see [`SUMMARY_ENTRIES_DDL`] for what merging
+    /// them costs the readers of this table.
     pub async fn init_table(&self) -> SFResult<()> {
         // Shared runner for the same reason as the schema table: an ALTER
         // takes its lock before it checks whether it has anything to do, and
         // an unbounded wait queues the outgoing replica's readers behind it.
         cog_storage::schema_ddl::apply(&self.pool, SUMMARY_ENTRIES_DDL)
+            .await
+            .map_err(|e| SFError::Agent(format!("PostgresEntryStore init_table failed: {}", e)))?;
+        cog_storage::schema_ddl::apply(&self.pool, SUMMARY_ENTRIES_REPAIR)
             .await
             .map_err(|e| SFError::Agent(format!("PostgresEntryStore init_table failed: {}", e)))
     }

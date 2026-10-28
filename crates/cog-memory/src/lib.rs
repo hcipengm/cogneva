@@ -50,8 +50,10 @@ pub use isolation::{BenchmarkIsolation, BenchmarkRefusal};
 pub use metrics_instrumented::MetricsInstrumentedMemoryBackend;
 pub use noop_backends::{NoopMetricsBackend, NoopVectorBackend};
 pub use observable::MemoryObservable;
-pub use postgres_entry_store::{PostgresEntryStore, SUMMARY_ENTRIES_DDL};
-pub use postgres_schema::{PostgresSchemaBackend, SCHEMA_ENTRIES_DDL};
+pub use postgres_entry_store::{PostgresEntryStore, SUMMARY_ENTRIES_DDL, SUMMARY_ENTRIES_REPAIR};
+pub use postgres_schema::{
+    PostgresSchemaBackend, SCHEMA_ENTRIES_AFTER_REPAIR, SCHEMA_ENTRIES_DDL, SCHEMA_ENTRIES_REPAIR,
+};
 pub use reranker::FastEmbedRerankerProvider;
 pub use schema_backend::MemorySchemaBackend;
 pub use vector_summary_backend::{

@@ -18,6 +18,16 @@ use cog_core::{merge_schema_observation, SchemaBackend};
 use cog_core::{SFError, SFResult};
 
 /// SQL DDL applied by [`PostgresSchemaBackend::init_table`].
+///
+/// The shape only, and not the whole of it: three statements that fill rows
+/// sit between this text and [`SCHEMA_ENTRIES_AFTER_REPAIR`], because
+/// `SET NOT NULL` can only run once the rows are filled and the filling is the
+/// expensive part. Anything that walks the rows belongs in the repair, not
+/// here -- this list holds `ACCESS EXCLUSIVE` from its first `ALTER` to its
+/// last statement, so a table walk appended to it keeps readers out for the
+/// whole walk. Measured on a rolling restart of the entry store, which merges
+/// what this list keeps apart: twelve seconds for the `ALTER`s, then
+/// twenty-six more for the correction that shared their transaction.
 pub const SCHEMA_ENTRIES_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_entries (
     id                TEXT        PRIMARY KEY,
@@ -45,16 +55,39 @@ ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS first_seen  TIMESTAMPTZ;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS last_seen   TIMESTAMPTZ;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS retrieval_count BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE schema_entries ADD COLUMN IF NOT EXISTS last_retrieved_at TIMESTAMPTZ;
+"#;
 
--- Rows written before the observer list existed name their one origin in
--- `raw_uri`. Seeding the list from that column is what keeps them answerable
--- by `schema_for_raw`: an entry whose list stays empty looks unextracted, and
--- the reconciliation pass would extract every one of them again on each sweep.
--- Idempotent, and repeated at every startup so a stale writer's rows are
--- picked up too.
+/// The rows [`SCHEMA_ENTRIES_DDL`] leaves unset, filled in its own transaction.
+///
+/// Rows written before the observer list existed name their one origin in
+/// `raw_uri`. Seeding the list from that column is what keeps them answerable
+/// by `schema_for_raw`: an entry whose list stays empty looks unextracted, and
+/// the reconciliation pass would extract every one of them again on each sweep.
+/// Idempotent, and repeated at every startup so a stale writer's rows are
+/// picked up too.
+///
+/// Separate from the DDL because it walks the table, and the DDL's list holds
+/// the table `ACCESS EXCLUSIVE` until its last statement ends. A writer asks
+/// only for `ROW EXCLUSIVE`, which is the strongest lock a reader never waits
+/// behind.
+pub const SCHEMA_ENTRIES_REPAIR: &str = r#"
 UPDATE schema_entries SET observed_by = ARRAY[raw_uri] WHERE cardinality(observed_by) = 0;
 UPDATE schema_entries SET first_seen = extracted_at WHERE first_seen IS NULL;
 UPDATE schema_entries SET last_seen  = extracted_at WHERE last_seen  IS NULL;
+"#;
+
+/// What can only be said once the rows are filled: the two columns the repair
+/// guarantees are non-null, and the indexes over the table.
+///
+/// This has to come after [`SCHEMA_ENTRIES_REPAIR`] -- `SET NOT NULL` on a
+/// column the repair has not filled fails outright -- and it is a third list
+/// rather than a tail of the first for the same reason the repair is a second:
+/// it takes `ACCESS EXCLUSIVE` again for the two `SET NOT NULL`s. That costs
+/// what it costs once, on the first start after the columns appeared; on every
+/// start after it is a catalog read, measured at 0.6 ms on a column that is
+/// already non-null (and 400k rows beside it), because a satisfied constraint
+/// needs no scan.
+pub const SCHEMA_ENTRIES_AFTER_REPAIR: &str = r#"
 ALTER TABLE schema_entries ALTER COLUMN first_seen SET NOT NULL;
 ALTER TABLE schema_entries ALTER COLUMN last_seen  SET NOT NULL;
 
@@ -149,15 +182,28 @@ impl PostgresSchemaBackend {
 
     /// Apply the table + index DDL.  Safe to call repeatedly (uses
     /// `CREATE ... IF NOT EXISTS`).
+    ///
+    /// Three lists, in this order: the shape, the rows, and what depends on
+    /// the rows. Each is its own transaction, so the table is closed to readers
+    /// for the length of the shape and no longer.
     pub async fn init_table(&self) -> SFResult<()> {
         // Through the shared runner, not `raw_sql` directly: this list holds
         // ALTERs, and an ALTER takes its lock before it checks whether it has
         // anything to do, so on a restart it queues behind the replica that is
         // still reading `schema_entries`. The runner bounds that wait instead
         // of letting the newcomer freeze the replica it replaces.
-        cog_storage::schema_ddl::apply(&self.pool, SCHEMA_ENTRIES_DDL)
-            .await
-            .map_err(|e| SFError::Agent(format!("PostgresSchemaBackend init_table failed: {}", e)))
+        for schema in [
+            SCHEMA_ENTRIES_DDL,
+            SCHEMA_ENTRIES_REPAIR,
+            SCHEMA_ENTRIES_AFTER_REPAIR,
+        ] {
+            cog_storage::schema_ddl::apply(&self.pool, schema)
+                .await
+                .map_err(|e| {
+                    SFError::Agent(format!("PostgresSchemaBackend init_table failed: {}", e))
+                })?;
+        }
+        Ok(())
     }
 
     fn row_to_entry(row: &PgRow) -> SFResult<SchemaEntry> {

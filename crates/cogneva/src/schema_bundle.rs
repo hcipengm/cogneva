@@ -48,7 +48,10 @@ pub fn statements() -> Vec<String> {
             cog_observability::analytics::DEFAULT_TABLE,
         ),
         cog_memory::postgres_schema::SCHEMA_ENTRIES_DDL.to_string(),
+        cog_memory::postgres_schema::SCHEMA_ENTRIES_REPAIR.to_string(),
+        cog_memory::postgres_schema::SCHEMA_ENTRIES_AFTER_REPAIR.to_string(),
         cog_memory::postgres_entry_store::SUMMARY_ENTRIES_DDL.to_string(),
+        cog_memory::postgres_entry_store::SUMMARY_ENTRIES_REPAIR.to_string(),
     ];
     // The notification indexes are per-query rather than per-table, so they are
     // a separate list in the store that owns them.

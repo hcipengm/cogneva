@@ -48,25 +48,68 @@ use std::time::Duration;
 /// this statement for longer than a quarter second at a time.
 const LOCK_WAIT: &str = "250ms";
 
+/// How long the last attempt may wait -- twenty times what the others get.
+///
+/// The two jobs of this number pull in opposite directions from `LOCK_WAIT`,
+/// and the last attempt is the only place where they stop pulling: there is no
+/// next attempt to give the locks back for, so waiting longer costs the
+/// outgoing replica nothing it has not already paid, while it turns the
+/// attempt from "one more quarter second" into an actual last chance.
+///
+/// It is also the only attempt that can explain itself, and explaining needs
+/// the relation to still be there when it is read: the request is released the
+/// moment the statement gives up, so the reading has to happen while it waits.
+/// At a quarter second the sampler got about a dozen chances and was measured
+/// reporting "no relation could be sampled" on roughly one run in four; five
+/// seconds gives it two hundred and fifty, and the same for the holder to let
+/// go.
+const FINAL_WAIT: &str = "5s";
+
 /// Attempts one schema may make before the store is told it is blocked.
 ///
 /// A schema is idempotent, so an attempt that gave its locks back costs
 /// nothing to replay; the cap exists to turn "someone holds this table" into a
-/// named failure instead of a start that never finishes. Sixteen attempts of a
-/// quarter second plus the growing pauses below is about eleven seconds --
-/// inside a container's startup budget, so the caller still gets to report
-/// *why* it could not start rather than being killed mid-silence.
+/// named failure instead of a start that never finishes. Fifteen attempts of a
+/// quarter second, their growing pauses, and the last attempt's longer wait
+/// come to about sixteen seconds -- inside a container's startup budget, so
+/// the caller still gets to report *why* it could not start rather than being
+/// killed mid-silence.
 ///
 /// The attempts have to span more than one cycle of a periodic reader: the
 /// observed collision was a reader on a ten second poll, and a set of attempts
 /// that all landed inside the same poll would all hit the same lock.
 const ATTEMPTS: u32 = 16;
 
+/// How long the first replay waits before trying the schema again.
+///
+/// The collisions this exists for are a replica serving a table, not a lock
+/// taken for milliseconds, so the first pause is already long enough to matter
+/// to it; starting shorter would spend attempts inside the same reader's
+/// window.
+const FIRST_PAUSE_MS: u64 = 200;
+
+/// How much longer each replay waits than the one before it.
+///
+/// The attempts have to spread across a reader's cycle rather than march in
+/// step: with a fixed pause, sixteen attempts fit inside one ten second poll
+/// and every one of them lands on the same lock.
+const PAUSE_GROWTH_MS: u64 = 50;
+
 /// The pause before attempt `n`, which grows so the attempts spread out
 /// instead of landing together in one reader's window.
 fn pause_before(attempt: u32) -> Duration {
-    Duration::from_millis(200).saturating_add(Duration::from_millis(50) * (attempt - 1))
+    Duration::from_millis(FIRST_PAUSE_MS)
+        .saturating_add(Duration::from_millis(PAUSE_GROWTH_MS) * (attempt - 1))
 }
+
+/// How often the last attempt's outstanding lock requests are sampled.
+///
+/// The request is released the moment the statement gives up, so the only
+/// window in which the relation can be read is while it waits. Twenty
+/// milliseconds puts two hundred and fifty readings inside `FINAL_WAIT` and
+/// about a dozen inside a plain `LOCK_WAIT`; finer would spend more of the
+/// wait reading the catalog than waiting.
+const LOCK_SAMPLE_MS: u64 = 20;
 
 /// SQLSTATE `lock_not_available`, which is what a `lock_timeout` expiry raises.
 const LOCK_NOT_AVAILABLE: &str = "55P03";
@@ -81,6 +124,13 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// written for one of them reports "nothing was waiting" for the other.
 fn attempt_tag(attempt: u32) -> String {
     format!("cog_ddl_{}_{}", std::process::id(), attempt)
+}
+
+/// The same tag as a SQL comment, which the server has from the moment it
+/// receives the message rather than from the moment the `SET` before the
+/// schema has run.
+fn mark(tag: &str) -> String {
+    format!("/*{tag}*/")
 }
 
 /// Run one store's schema. The text may hold several statements; the driver's
@@ -102,15 +152,15 @@ pub async fn apply(pool: &PgPool, schema: &str) -> SFResult<()> {
             // The last attempt is the one that gets to explain itself: a lock
             // wait's relation can only be read while the request is still
             // outstanding, and after this one gives up there is nothing left
-            // to look at.
+            // to look at. It also waits longer -- see `FINAL_WAIT`.
             let (outcome, waited_on) = watched_attempt(pool, schema).await;
             return match outcome {
                 Attempt::Ok => Ok(()),
-                Attempt::LockWait(e) => Err(blocked(attempt, &waited_on, e)),
+                Attempt::LockWait(e) => Err(blocked(&waited_on, e)),
                 Attempt::Failed(message) => Err(SFError::Database(message)),
             };
         }
-        match attempt_once(pool, schema, &attempt_tag(attempt)).await {
+        match attempt_once(pool, schema, &attempt_tag(attempt), LOCK_WAIT).await {
             Attempt::Ok => return Ok(()),
             Attempt::LockWait(_) => tokio::time::sleep(pause_before(attempt)).await,
             Attempt::Failed(message) => return Err(SFError::Database(message)),
@@ -129,8 +179,8 @@ enum Attempt {
     Failed(String),
 }
 
-async fn attempt_once(pool: &PgPool, schema: &str, tag: &str) -> Attempt {
-    match apply_once(pool, schema, tag).await {
+async fn attempt_once(pool: &PgPool, schema: &str, tag: &str, wait: &str) -> Attempt {
+    match apply_once(pool, schema, tag, wait).await {
         Ok(()) => Attempt::Ok,
         Err(e) if is_lock_wait_expiry(&e) => Attempt::LockWait(e),
         Err(e) => Attempt::Failed(e.to_string()),
@@ -152,17 +202,23 @@ async fn watched_attempt(pool: &PgPool, schema: &str) -> (Attempt, Vec<String>) 
         let pool = pool.clone();
         let schema = schema.to_string();
         let tag = tag.clone();
-        tokio::spawn(async move { attempt_once(&pool, &schema, &tag).await })
+        tokio::spawn(async move { attempt_once(&pool, &schema, &tag, FINAL_WAIT).await })
     };
 
     let mut waited_on: Vec<String> = Vec::new();
-    while !worker.is_finished() {
+    // Sampled before the first `is_finished` check, and again after each pause:
+    // a loop that tests the condition first can exit having read nothing, and
+    // then a failure that did have a reason reports that it could not find one.
+    loop {
         for relation in unheld_locks(&tag, pool).await {
             if !waited_on.contains(&relation) {
                 waited_on.push(relation);
             }
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        if worker.is_finished() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(LOCK_SAMPLE_MS)).await;
     }
 
     let outcome = match worker.await {
@@ -179,16 +235,25 @@ async fn watched_attempt(pool: &PgPool, schema: &str) -> (Attempt, Vec<String>) 
 /// statement asked for is what comes back; and it is the tag rather than "any
 /// ungranted request in the database", so a relation another transaction is
 /// stuck on cannot be reported as this one's.
+///
+/// The tag is looked for twice, because the two ways of finding the session do
+/// not fail at the same moment. The comment carries it from the instant the
+/// server parses the message; the session name only from the instant the `SET`
+/// before the schema has run. Reading either is enough, and the first version
+/// -- the name alone -- was measured reporting "no relation could be sampled"
+/// on roughly one run in four.
 async fn unheld_locks(tag: &str, pool: &PgPool) -> Vec<String> {
     sqlx::query_scalar(
         "SELECT coalesce(c.relname, 'a lock on a dropped relation')
            FROM pg_locks l
            JOIN pg_stat_activity a ON a.pid = l.pid
            LEFT JOIN pg_class c ON c.oid = l.relation
-          WHERE NOT l.granted AND a.application_name = $1
+          WHERE NOT l.granted
+            AND (a.application_name = $1 OR a.query LIKE $2)
           LIMIT 3",
     )
     .bind(tag)
+    .bind(format!("%{}%", mark(tag)))
     .fetch_all(pool)
     .await
     .unwrap_or_default()
@@ -203,7 +268,7 @@ pub async fn apply_all(pool: &PgPool, schemas: &[&str]) -> SFResult<()> {
     Ok(())
 }
 
-async fn apply_once(pool: &PgPool, schema: &str, tag: &str) -> Result<(), sqlx::Error> {
+async fn apply_once(pool: &PgPool, schema: &str, tag: &str, wait: &str) -> Result<(), sqlx::Error> {
     // `SET LOCAL` goes first in the same message, and no `BEGIN` is written:
     // a multi-statement simple query is already one implicit transaction, so
     // the wait is scoped to this statement list and cannot follow the
@@ -227,7 +292,8 @@ async fn apply_once(pool: &PgPool, schema: &str, tag: &str) -> Result<(), sqlx::
     // visible in `pg_stat_activity` while the statement is waiting, which is
     // the only window in which the relation it is stuck on can be read.
     let text = format!(
-        "SET LOCAL lock_timeout = '{LOCK_WAIT}';\nSET LOCAL application_name = '{tag}';\n{schema}"
+        "{} \nSET LOCAL lock_timeout = '{wait}';\nSET LOCAL application_name = '{tag}';\n{schema}",
+        mark(tag)
     );
     sqlx::raw_sql(&text).execute(pool).await?;
     Ok(())
@@ -239,15 +305,15 @@ fn is_lock_wait_expiry(e: &sqlx::Error) -> bool {
 
 /// Say what is holding the schema up, because the caller's alternative is a
 /// container that is killed on a startup probe and reports nothing at all.
-fn blocked(attempts: u32, waited_on: &[String], cause: sqlx::Error) -> SFError {
+fn blocked(waited_on: &[String], cause: sqlx::Error) -> SFError {
     let what = if waited_on.is_empty() {
         "no relation could be sampled while the last attempt waited".to_string()
     } else {
         waited_on.join(", ")
     };
     SFError::Database(format!(
-        "schema did not get its locks in {attempts} attempts of {LOCK_WAIT} \
-         (waiting on: {what}); a replica still serving these tables holds them \
+        "schema did not get its locks in {ATTEMPTS} attempts of {LOCK_WAIT} \
+         (the last {FINAL_WAIT}; waiting on: {what}); a replica still serving these tables holds them \
          open, and the start is reported instead of being killed at a startup \
          probe with no reason. Last error: {cause}"
     ))
