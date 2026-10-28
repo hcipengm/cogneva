@@ -108,6 +108,13 @@ for step in "${ci_steps[@]}"; do
 done
 printf '== 从 %s 取到 %d 步，跳过 %d 步（多行脚本块 / 装依赖），认不出 %d 步\n' \
     "${ci}" "${ran}" "${skipped}" "${unrecognised}"
+# 一步都没跑与几步都过了印的是同一句「全绿」。取到的东西全是跳过的，说明这两个作业
+# 的写法变了，而这条门正自称跑过 CI 的那一段——它没跑，只是没说。
+if [ "${ran}" -eq 0 ]; then
+    echo "RED  从 ${ci} 取到的 ${#ci_steps[@]} 步里一步都没跑起来（可跑的 0 步，跳过 ${skipped} 步）：" >&2
+    echo "     这条门唯一不能犯的错就是「它绿了，CI 却红了」——现在是它绿了，它自己什么都没跑" >&2
+    failures=$((failures + 1))
+fi
 
 # 脚本测试：CI 用同一个 glob 跑，这里照抄它的形状而不是列名字。
 mapfile -t script_tests < <(printf '%s\n' deploy/scripts/tests/*.test.sh .github/scripts/tests/*.test.sh)
@@ -143,8 +150,17 @@ fi
 
 # ShellCheck：清单同样由 git 推出来，与 CI 同一条命令。
 mapfile -t shell_scripts < <(git ls-files '*.sh')
-run_step "shellcheck -S warning（${#shell_scripts[@]} 个脚本）" \
-    shellcheck -S warning "${shell_scripts[@]}"
+# 零个脚本时 shellcheck 没有参数，它读 stdin、读到空、退 0——「一个脚本都没读到」
+# 与「每个脚本都过了」在退出码上同形，而前者意味着 `git ls-files` 没在仓库里跑或
+# 索引是空的，那正是最该红的一刻。
+if [ "${#shell_scripts[@]}" -eq 0 ]; then
+    echo "RED  git ls-files '*.sh' 一个脚本都没读到：shellcheck 会读 stdin 退 0，" >&2
+    echo "     那句话与「每个脚本都过了」同形——多半是没在仓库根跑，或索引是空的" >&2
+    failures=$((failures + 1))
+else
+    run_step "shellcheck -S warning（${#shell_scripts[@]} 个脚本）" \
+        shellcheck -S warning "${shell_scripts[@]}"
+fi
 
 # PowerShell 那一步只在装了 pwsh 的机器上可跑。跑不了要**说出来**，不能安静跳过——
 # 跳过的绿与通过过的绿在读数上一模一样，而这正是这条门要防的那类假绿。
