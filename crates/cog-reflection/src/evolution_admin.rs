@@ -1100,6 +1100,7 @@ mod tests {
             "change-9",
             Some(cog_core::EvolutionIntent::IssueFix),
             crate::evolution_build_readings::BuildEnding::Built(std::time::Duration::from_secs(7)),
+            None,
         );
         let wired = crate::EvolutionAdminService::new(
             Arc::new(engine()),

@@ -422,6 +422,15 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["intent", "outcome"],
         "crates/cog-reflection/src/evolution_build_readings.rs",
     ),
+    // The observed counterpart of the sizing constant the build gate divides
+    // by: the same quantity (summed VmRSS over the build's process tree) taken
+    // again, so a frozen divisor that has stopped describing the builds is a
+    // difference a reader can see rather than a bound nobody can explain.
+    (
+        "cogneva_evolution_build_last_peak_rss_bytes",
+        &["intent"],
+        "crates/cog-reflection/src/evolution_build_readings.rs",
+    ),
     // The corpus-accumulation reading: every consultation of a recurrence
     // threshold, bucketed by the count it was consulted on. A distribution
     // pinned in the `1` bucket is a corpus that is not accumulating -- the same

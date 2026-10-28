@@ -26,6 +26,18 @@ pub struct BuildArtifact {
     pub build_duration_secs: u64,
 }
 
+/// What the last build reported: how it ended, and how much resident memory it
+/// peaked at while it ran.
+///
+/// One struct rather than two fields because these are one attempt. The peak is
+/// optional and the ending is not: a build nothing could sample still ended a
+/// particular way, and that is a different statement from "no build ran".
+#[derive(Debug, Clone, Copy)]
+struct BuildReport {
+    ending: BuildEnding,
+    peak_rss_bytes: Option<u64>,
+}
+
 /// Deployer that turns tested source changes into a staged release binary.
 #[derive(Debug, Clone)]
 pub struct EvolutionDeployer {
@@ -44,11 +56,14 @@ pub struct EvolutionDeployer {
     /// Where the builds this deployer runs report what they cost. Absent for a
     /// deployer nothing observes.
     build_readings: Option<Arc<EvolutionBuildReadings>>,
-    /// 最近一次构建的结局。判定在这里做出——只有跑到 cargo 的那段代码知道它是被
-    /// 预算杀的、自己失败的、还是压根没起来——所以读数也留在这里，由调用方取走。
-    /// 执行搬进一个一过性 Job 之后，调用方就是那条边界上的回程：不把它留出来，
-    /// 搬到别的进程里的构建就没有任何结局可记。
-    last_ending: std::sync::Arc<std::sync::Mutex<Option<BuildEnding>>>,
+    /// 最近一次构建的结局，连同它的内存峰值。判定在这里做出——只有跑到 cargo 的
+    /// 那段代码知道它是被预算杀的、自己失败的、还是压根没起来——所以读数也留在这里，
+    /// 由调用方取走。执行搬进一个一过性 Job 之后，调用方就是那条边界上的回程：
+    /// 不把它留出来，搬到别的进程里的构建就没有任何结局可记。
+    ///
+    /// 两半放在一个槽里、而不是各占一个：读的人会把「这次怎么结束的」和「它花了
+    /// 多少内存」配成一行，两个槽就会在两个构建并发时配出一次并不存在的尝试。
+    last_report: std::sync::Arc<std::sync::Mutex<Option<BuildReport>>>,
 }
 
 impl EvolutionDeployer {
@@ -68,7 +83,7 @@ impl EvolutionDeployer {
             target_dir: None,
             budget: None,
             build_readings: None,
-            last_ending: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            last_report: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -109,18 +124,39 @@ impl EvolutionDeployer {
     /// 最近一次构建的结局；这条部署器还没构建过就是 `None`。`None` 与
     /// 「构建过但结局未知」不是一回事，所以这里不拿某个默认结局顶上。
     pub fn last_build_ending(&self) -> Option<BuildEnding> {
-        self.last_ending
+        self.last_report
             .lock()
-            .map(|slot| *slot)
+            .map(|slot| slot.map(|report| report.ending))
             .unwrap_or_default()
     }
 
-    fn record_build(&self, change_id: &str, intent: Option<EvolutionIntent>, ending: BuildEnding) {
-        if let Ok(mut slot) = self.last_ending.lock() {
-            *slot = Some(ending);
+    /// The peak the same build reported, when something could measure it.
+    ///
+    /// Read out of the same slot as the ending rather than a second one: the
+    /// two are one attempt, and a reader pairing them must not be able to pair
+    /// the ending of one build with the memory of another.
+    pub fn last_build_peak_rss_bytes(&self) -> Option<u64> {
+        self.last_report
+            .lock()
+            .map(|slot| slot.and_then(|report| report.peak_rss_bytes))
+            .unwrap_or_default()
+    }
+
+    fn record_build(
+        &self,
+        change_id: &str,
+        intent: Option<EvolutionIntent>,
+        ending: BuildEnding,
+        peak_rss_bytes: Option<u64>,
+    ) {
+        if let Ok(mut slot) = self.last_report.lock() {
+            *slot = Some(BuildReport {
+                ending,
+                peak_rss_bytes,
+            });
         }
         if let Some(readings) = &self.build_readings {
-            readings.record(change_id, intent, ending);
+            readings.record(change_id, intent, ending, peak_rss_bytes);
         }
     }
 
@@ -198,7 +234,7 @@ impl EvolutionDeployer {
                     error = %e,
                     "Release build got no slot; commit kept, nothing judged"
                 );
-                self.record_build(change_id, intent, BuildEnding::Unstarted);
+                self.record_build(change_id, intent, BuildEnding::Unstarted, None);
                 return Err(e);
             }
         };
@@ -330,51 +366,93 @@ impl EvolutionDeployer {
         }
         let started = Instant::now();
         let budget_secs = self.build_budget_secs();
-        let output =
-            match tokio::time::timeout(Duration::from_secs(budget_secs), cmd.output()).await {
-                Ok(result) => {
-                    let output = match result {
-                        Ok(output) => output,
-                        Err(e) => {
-                            // cargo could not be spawned at all, so no build
-                            // happened: same class as a build the gate refused,
-                            // and no duration is reported for it.
-                            self.record_build(change_id, intent, BuildEnding::Unstarted);
-                            return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
-                        }
-                    };
-                    if let Some(budget) = &self.budget {
-                        budget.record_run(
-                            crate::verification_budget::KIND_BUILD,
-                            started.elapsed().as_secs(),
-                        );
+        // Spawned rather than handed to `output()`: the pid is what the memory
+        // sampler watches, and there is no way to learn it from a call that
+        // waits for the process to end. The pipes are attached here so the
+        // failure text below is the build's own, and `kill_on_drop` keeps the
+        // budget arm's kill: dropping the wait future drops the child.
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // cargo could not be spawned at all, so no build happened: same
+                // class as a build the gate refused, and no duration is
+                // reported for it.
+                self.record_build(change_id, intent, BuildEnding::Unstarted, None);
+                return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
+            }
+        };
+        let watcher = child.id().map(|pid| {
+            tokio::spawn(crate::build_rss_peak::watch(
+                PathBuf::from("/proc"),
+                pid,
+                crate::build_rss_peak::SAMPLE_PERIOD,
+            ))
+        });
+        let waited =
+            tokio::time::timeout(Duration::from_secs(budget_secs), child.wait_with_output()).await;
+        // Read before the arms below, because two of them return: the number
+        // belongs to this build and there is no later point at which it could
+        // be attributed to this one rather than to whatever runs next. The wait
+        // is bounded — the sampler stops within one period of the tree going
+        // away — so a process the kernel will not reap costs a reading, not the
+        // build.
+        let peak_rss_bytes = match watcher {
+            Some(handle) => match tokio::time::timeout(Duration::from_secs(5), handle).await {
+                Ok(Ok(peak)) => peak.map(|p| p.bytes),
+                _ => None,
+            },
+            None => None,
+        };
+        let output = match waited {
+            Ok(result) => {
+                let output = match result {
+                    Ok(output) => output,
+                    Err(e) => {
+                        self.record_build(change_id, intent, BuildEnding::Unstarted, None);
+                        return Err(SFError::IO(format!("Failed to run cargo build: {}", e)));
                     }
-                    output
-                }
-                Err(_) => {
-                    // An unbounded release build outlives the pod's own
-                    // resources long before it is useful; give up and let the
-                    // caller roll the commit back.
-                    if let Some(budget) = &self.budget {
-                        budget.record_timeout(crate::verification_budget::KIND_BUILD);
-                    }
-                    // The host time this build spent is the budget it was cut
-                    // off at, and it is reported as such rather than as a
-                    // measurement of the work.
-                    self.record_build(
-                        change_id,
-                        intent,
-                        BuildEnding::TimedOut(Duration::from_secs(budget_secs)),
+                };
+                if let Some(budget) = &self.budget {
+                    budget.record_run(
+                        crate::verification_budget::KIND_BUILD,
+                        started.elapsed().as_secs(),
                     );
-                    return Err(SFError::IO(format!(
-                        "cargo build --release exceeded the {}s deployment budget and was killed",
-                        budget_secs
-                    )));
                 }
-            };
+                output
+            }
+            Err(_) => {
+                // An unbounded release build outlives the pod's own resources
+                // long before it is useful; give up and let the caller roll the
+                // commit back.
+                if let Some(budget) = &self.budget {
+                    budget.record_timeout(crate::verification_budget::KIND_BUILD);
+                }
+                // The host time this build spent is the budget it was cut off
+                // at, and it is reported as such rather than as a measurement
+                // of the work. What it took in memory before it was cut off is
+                // still a real measurement, so it is reported.
+                self.record_build(
+                    change_id,
+                    intent,
+                    BuildEnding::TimedOut(Duration::from_secs(budget_secs)),
+                    peak_rss_bytes,
+                );
+                return Err(SFError::IO(format!(
+                    "cargo build --release exceeded the {}s deployment budget and was killed",
+                    budget_secs
+                )));
+            }
+        };
 
         if !output.status.success() {
-            self.record_build(change_id, intent, BuildEnding::Failed(started.elapsed()));
+            self.record_build(
+                change_id,
+                intent,
+                BuildEnding::Failed(started.elapsed()),
+                peak_rss_bytes,
+            );
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SFError::Agent(format!(
@@ -382,7 +460,12 @@ impl EvolutionDeployer {
                 stdout, stderr
             )));
         }
-        self.record_build(change_id, intent, BuildEnding::Built(started.elapsed()));
+        self.record_build(
+            change_id,
+            intent,
+            BuildEnding::Built(started.elapsed()),
+            peak_rss_bytes,
+        );
         Ok(())
     }
 

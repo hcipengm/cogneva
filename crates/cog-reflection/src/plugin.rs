@@ -3873,8 +3873,12 @@ async fn collect_dispatched_job(
     if let Some(ending) = outcome.build_ending {
         // 结局只有跑在 Job 里的构建自己知道，变更身份只有这一侧知道：两边
         // 拼起来才是「哪条变更的这一次尝试」这一行。
-        deps.build_readings
-            .record(&change.artifact_id, intent, ending);
+        deps.build_readings.record(
+            &change.artifact_id,
+            intent,
+            ending,
+            outcome.build_peak_rss_bytes,
+        );
     }
 
     let result = match outcome.apply_result() {

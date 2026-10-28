@@ -292,6 +292,11 @@ pub struct ChangeExecutionOutcome {
     /// 在那边记进同一个族。`None` 表示这次执行没有走到构建那一步。
     #[serde(default)]
     pub build_ending: Option<crate::evolution_build_readings::BuildEnding>,
+    /// 这次构建的进程树在跑的时候峰到多少字节。与结局同一趟搬：判定在哪一侧
+    /// 做出，量就在哪一侧，而读它的人要的是「这一次尝试」，不是两个各自最新的数。
+    /// `None` 表示这次执行采不到数（没走到构建，或那一段 `/proc` 读不出来）。
+    #[serde(default)]
+    pub build_peak_rss_bytes: Option<u64>,
     /// 判定已出但没有产物，因为这条变更在等人工批准：管线按 `auto_apply` /
     /// `manual_approve` 把树回滚了，这条路上本来就没有构建。它与「该有产物却没有」
     /// 是两回事，所以显式记一笔——读回时缺产物必须能与坏读分开。
@@ -325,6 +330,7 @@ impl ChangeExecutionOutcome {
             artifact: None,
             unavailable: None,
             build_ending: None,
+            build_peak_rss_bytes: None,
             held_for_approval: false,
             test: RunReading::default(),
             build: RunReading::default(),
@@ -662,6 +668,7 @@ async fn run_in(
         Ok(artifact) => {
             outcome.build = RunReading::of(&budget, KIND_BUILD);
             outcome.build_ending = deployer.last_build_ending();
+            outcome.build_peak_rss_bytes = deployer.last_build_peak_rss_bytes();
             outcome.artifact = Some(ExecutedArtifact {
                 commit_hash: artifact.commit_hash,
                 new_binary_path: artifact.new_binary_path,
@@ -673,6 +680,7 @@ async fn run_in(
         Err(e) => {
             outcome.build = RunReading::of(&budget, KIND_BUILD);
             outcome.build_ending = deployer.last_build_ending();
+            outcome.build_peak_rss_bytes = deployer.last_build_peak_rss_bytes();
             outcome.unavailable = Some(Unavailable {
                 cause: if e.is_build_slot_refused() {
                     UnavailableCause::NoBuildSlot

@@ -2896,6 +2896,45 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 68,
+          "title": "Build Memory: What a Build Took Against What the Bound Assumes",
+          "description": "The measured peak resident memory of the last build of each change kind, drawn beside the constant the memory dimension divides by. These are the same quantity taken the same way -- the summed VmRSS over the build's process tree -- which is what makes the gap between them mean something: the constant was measured once and frozen, and nothing re-took it, so a bound computed from it reads exactly like a bound computed from a correct one. The criterion this panel is read against: a measured line sitting above the assumption while the memory dimension is the one setting the ceiling means the constant understates what a build costs, and the ceiling is admitting a build into room that does not exist -- the failure that shows up later as a cgroup OOM kill of a build, which counts against the change rather than against the constant. A measured line below it means the ceiling is keeping the host at fewer builds than it could run, which costs queue time and nothing else. A kind with no measured build is absent rather than zero: no line is 'not measured yet', and a zero line would read as builds that use no memory.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 320
+          },
+          "targets": [
+            {
+              "expr": "cogneva_evolution_build_last_peak_rss_bytes",
+              "legendFormat": "{{intent}} measured",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_build_gate_tuning{role=\"builder\", input=\"build_peak_rss_mib\"} * 1048576",
+              "legendFormat": "assumed per build ({{source}})",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

@@ -52,6 +52,22 @@ pub const BUILD_LAST_SECONDS_METRIC: &str = "cogneva_evolution_build_last_second
 /// How many builds of each kind have ended each way since this process started.
 pub const BUILD_OUTCOMES_TOTAL_METRIC: &str = "cogneva_evolution_build_outcomes_total";
 
+/// How much resident memory the last build of each kind that could be measured
+/// peaked at, in bytes.
+///
+/// The observed counterpart of the sizing constant the build gate divides its
+/// memory dimension by. That constant is a frozen measurement and this is the
+/// same quantity taken again, on the same host, from the same tree of
+/// processes, so the two can be subtracted: a constant that has stopped
+/// describing the builds is then a difference a reader can see rather than a
+/// bound nobody can explain.
+///
+/// Absent — not zero — for a kind with no measured build yet, and for builds
+/// whose process tree could not be read at all. The two absences are the same
+/// row here and are told apart by the attempt counter next to it: a build that
+/// ran and went unmeasured is visible as an attempt with no peak.
+pub const BUILD_LAST_PEAK_RSS_BYTES_METRIC: &str = "cogneva_evolution_build_last_peak_rss_bytes";
+
 /// The change-kind label: the same spelling the landing funnel uses.
 pub const INTENT_LABEL: &str = "intent";
 
@@ -145,6 +161,15 @@ struct IntentRow {
     seconds: BTreeMap<&'static str, u64>,
     /// The last build that ended on its own; absent until one does.
     last_secs: Option<u64>,
+    /// The peak resident memory of the last build that could be measured.
+    ///
+    /// Kept apart from `last_secs` because they answer different questions and
+    /// stop being reportable for different reasons: a build the budget killed
+    /// has a duration that measures the budget rather than the work, so it does
+    /// not become `last_secs` — but what it took in memory before it was killed
+    /// is a real measurement, and on a build killed for memory it is the one
+    /// reading worth having.
+    last_peak_bytes: Option<u64>,
     /// Attempts per outcome.
     counts: BTreeMap<&'static str, u64>,
 }
@@ -178,7 +203,18 @@ impl EvolutionBuildReadings {
     /// recorded under the `unattributed` value the enum already has for exactly
     /// this, so the time it spent is still on the reading and the producer that
     /// failed to name its change is visible.
-    pub fn record(&self, change_id: &str, intent: Option<EvolutionIntent>, ending: BuildEnding) {
+    ///
+    /// `peak_rss_bytes` is what the build's process tree was measured at while
+    /// it ran; `None` is a build nothing could sample. It travels with the
+    /// ending rather than in a second call, so "which build was the last one"
+    /// cannot differ between the duration and the memory row.
+    pub fn record(
+        &self,
+        change_id: &str,
+        intent: Option<EvolutionIntent>,
+        ending: BuildEnding,
+        peak_rss_bytes: Option<u64>,
+    ) {
         let key = intent.unwrap_or(EvolutionIntent::Unattributed).as_str();
         // A reading must not be the thing that breaks a build: a poisoned lock
         // means some other thread panicked while holding it, and the counter
@@ -191,6 +227,9 @@ impl EvolutionBuildReadings {
         }
         if ending.measures_the_work() {
             row.last_secs = ending.host_seconds();
+        }
+        if peak_rss_bytes.is_some() {
+            row.last_peak_bytes = peak_rss_bytes;
         }
         drop(rows);
 
@@ -254,6 +293,16 @@ impl Observable for EvolutionBuildReadings {
             if let Some(last) = row.and_then(|r| r.last_secs) {
                 out.push(
                     RawMetric::new(BUILD_LAST_SECONDS_METRIC, last as f64)
+                        .with_label(INTENT_LABEL, key),
+                );
+            }
+            // Absent rather than zero for a kind nothing has measured yet, the
+            // same way the duration row is: a zero peak would read as a build
+            // that used no memory, and would subtract from the sizing constant
+            // as "the constant is too big".
+            if let Some(bytes) = row.and_then(|r| r.last_peak_bytes) {
+                out.push(
+                    RawMetric::new(BUILD_LAST_PEAK_RSS_BYTES_METRIC, bytes as f64)
                         .with_label(INTENT_LABEL, key),
                 );
             }
@@ -359,6 +408,7 @@ mod tests {
             "change-ci",
             Some(EvolutionIntent::CiFix),
             BuildEnding::Built(Duration::from_secs(90)),
+            None,
         );
         assert_eq!(
             outcome_reading(&readings, BUILD_OUTCOMES_TOTAL_METRIC, "ci_fix", "built").await,
@@ -395,6 +445,7 @@ mod tests {
             "change-audit",
             Some(EvolutionIntent::SelfAudit),
             BuildEnding::TimedOut(Duration::from_secs(3600)),
+            None,
         );
         assert_eq!(
             outcome_reading(
@@ -432,6 +483,7 @@ mod tests {
             "change-fix",
             Some(EvolutionIntent::IssueFix),
             BuildEnding::Unstarted,
+            None,
         );
         assert_eq!(
             outcome_reading(
@@ -469,6 +521,7 @@ mod tests {
             "change-anon",
             None,
             BuildEnding::Failed(Duration::from_secs(30)),
+            None,
         );
         assert_eq!(
             outcome_reading(
@@ -508,6 +561,7 @@ mod tests {
                 "change-evolve",
                 Some(EvolutionIntent::SelfEvolution),
                 ending,
+                None,
             );
         }
         let mut named: Vec<&str> = endings.iter().map(|e| e.outcome()).collect();
@@ -543,11 +597,13 @@ mod tests {
             "change-1",
             Some(EvolutionIntent::IssueFix),
             BuildEnding::Failed(Duration::from_secs(12)),
+            None,
         );
         readings.record(
             "change-1",
             Some(EvolutionIntent::IssueFix),
             BuildEnding::Built(Duration::from_secs(40)),
+            None,
         );
         let runs = readings.recent_runs(10);
         assert_eq!(runs.len(), 2, "two attempts are two rows");
@@ -566,6 +622,7 @@ mod tests {
             "change-2",
             Some(EvolutionIntent::CiFix),
             BuildEnding::Unstarted,
+            None,
         );
         let runs = readings.recent_runs(10);
         assert_eq!(runs.len(), 1);
@@ -582,6 +639,7 @@ mod tests {
             "change-3",
             None,
             BuildEnding::Failed(Duration::from_secs(5)),
+            None,
         );
         let runs = readings.recent_runs(10);
         assert_eq!(runs[0].intent, EvolutionIntent::Unattributed.as_str());
@@ -598,6 +656,7 @@ mod tests {
                 &format!("change-{i}"),
                 Some(EvolutionIntent::SelfEvolution),
                 BuildEnding::Built(Duration::from_secs(1)),
+                None,
             );
         }
         let runs = readings.recent_runs(usize::MAX);
@@ -611,5 +670,93 @@ mod tests {
             "the oldest attempt is the one the window drops"
         );
         assert_eq!(readings.recent_runs(3).len(), 3);
+    }
+
+    /// The peak is published for a kind that has one, and absent — not zero —
+    /// for a kind that has not been measured. A zero would be read as "this
+    /// kind's builds use no memory", which is the one wrong answer a reader
+    /// comparing it against the sizing constant would believe.
+    #[tokio::test]
+    async fn a_measured_peak_is_published_and_an_unmeasured_one_is_absent() {
+        let readings = EvolutionBuildReadings::new();
+        readings.record(
+            "change-m",
+            Some(EvolutionIntent::CiFix),
+            BuildEnding::Built(Duration::from_secs(60)),
+            Some(5 * 1024 * 1024 * 1024),
+        );
+        assert_eq!(
+            reading(&readings, BUILD_LAST_PEAK_RSS_BYTES_METRIC, "ci_fix").await,
+            Some(5.0 * 1024.0 * 1024.0 * 1024.0)
+        );
+        assert_eq!(
+            reading(&readings, BUILD_LAST_PEAK_RSS_BYTES_METRIC, "self_audit").await,
+            None,
+            "a kind nothing has built is absent, not zero"
+        );
+
+        readings.record(
+            "change-n",
+            Some(EvolutionIntent::IssueFix),
+            BuildEnding::Built(Duration::from_secs(10)),
+            None,
+        );
+        assert_eq!(
+            reading(&readings, BUILD_LAST_PEAK_RSS_BYTES_METRIC, "issue_fix").await,
+            None,
+            "a build nothing could sample leaves the row absent"
+        );
+    }
+
+    /// A build the budget killed does not become "how long a build takes", but
+    /// the memory it had reached when it was killed is a real measurement — and
+    /// on a build killed for its memory it is the reading worth having.
+    #[tokio::test]
+    async fn a_killed_build_still_reports_what_it_took() {
+        let readings = EvolutionBuildReadings::new();
+        readings.record(
+            "change-k",
+            Some(EvolutionIntent::SelfAudit),
+            BuildEnding::TimedOut(Duration::from_secs(3600)),
+            Some(7 * 1024 * 1024 * 1024),
+        );
+        assert_eq!(
+            reading(&readings, BUILD_LAST_SECONDS_METRIC, "self_audit").await,
+            None,
+            "a killed build is not a measurement of the work"
+        );
+        assert_eq!(
+            reading(&readings, BUILD_LAST_PEAK_RSS_BYTES_METRIC, "self_audit").await,
+            Some(7.0 * 1024.0 * 1024.0 * 1024.0)
+        );
+    }
+
+    /// A build that never reached cargo reports no peak, and must not erase the
+    /// peak of the last build that did: the row is "the last measured build",
+    /// and an attempt that never ran is not a measurement of zero.
+    #[tokio::test]
+    async fn an_unstarted_attempt_does_not_erase_the_last_peak() {
+        let readings = EvolutionBuildReadings::new();
+        readings.record(
+            "change-p",
+            Some(EvolutionIntent::SelfEvolution),
+            BuildEnding::Built(Duration::from_secs(60)),
+            Some(3 * 1024 * 1024 * 1024),
+        );
+        readings.record(
+            "change-q",
+            Some(EvolutionIntent::SelfEvolution),
+            BuildEnding::Unstarted,
+            None,
+        );
+        assert_eq!(
+            reading(
+                &readings,
+                BUILD_LAST_PEAK_RSS_BYTES_METRIC,
+                "self_evolution"
+            )
+            .await,
+            Some(3.0 * 1024.0 * 1024.0 * 1024.0)
+        );
     }
 }
