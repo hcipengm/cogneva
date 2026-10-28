@@ -564,6 +564,16 @@ def main():
         targets.append((args.write_quota, quota_document(p)))
 
     if args.check:
+        # 零份比对与「两份都与渲染集一致」印的是同一句话。`--check` 单独跑（没给
+        # --write-values/--write-quota）时 targets 是空表，下面的循环一次也不进，
+        # drift 自然是空的，于是这一跑什么都没证明却印 OK。判 3：没判成，不是通过。
+        if not targets:
+            print(
+                "FAIL: --check 没有可比对的投影产物：既没给 --write-values 也没给 "
+                "--write-quota，零份文件与「全部一致」在输出上同形",
+                file=sys.stderr,
+            )
+            return 3
         drift = []
         for path, text in targets:
             if not os.path.exists(path):
