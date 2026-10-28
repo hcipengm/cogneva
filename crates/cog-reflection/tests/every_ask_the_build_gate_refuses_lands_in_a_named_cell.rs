@@ -30,7 +30,6 @@
 //! principle: feedback_a_refusal_counter_without_labels_cannot_name_the_asker_it_starved
 
 use std::fs;
-use std::path::{Path, PathBuf};
 
 use cog_reflection::build_gate::{BUILD_GATE_ASKERS, BUILD_GATE_ASKER_UNNAMED};
 
@@ -76,14 +75,11 @@ const ASKING_CALLS: [&str; 4] = [
 /// word this table lists -- and that check is what makes the copy stay true.
 const OUTSIDE_TREE_ASKS: [&str; 1] = ["host build"];
 
-/// The workspace root: the crates directory's parent.
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives at <root>/crates/cog-reflection")
-        .to_path_buf()
-}
+/// The workspace root, from the one algorithm the whole tree shares.
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
 
 /// The words each production call site in `text` asks under.
 ///
@@ -111,7 +107,7 @@ fn every_ask_the_build_gate_refuses_lands_in_a_named_cell() {
     // The denominator is the census's own: production_sources refuses a tree it
     // read almost none of, so a walk that silently found nothing cannot reach
     // the assertions below.
-    let files = production_sources(&workspace_root());
+    let files = production_sources(&repo_root());
 
     let named: Vec<&str> = BUILD_GATE_ASKERS.iter().map(|(words, _)| *words).collect();
     assert!(

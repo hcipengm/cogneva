@@ -18,8 +18,6 @@
 //! must be published — a handle handed to an engine but never published is a
 //! series no scrape can reach, which is the same silence one layer further out.
 
-use std::path::{Path, PathBuf};
-
 const PLUGIN: &str = "crates/cog-reflection/src/plugin.rs";
 
 /// The constructor that builds the in-memory engine without anywhere to report
@@ -37,13 +35,11 @@ const SELF_EVOLUTION_CTOR: &str = "new_self_evolution(";
 /// The handle both constructors are handed, and the one the scrape reads.
 const HANDLE: &str = "recurrence_readings";
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives at <root>/crates/cog-reflection")
-        .to_path_buf()
-}
+/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
 
 /// Everything up to the first test-only item. Occurrences inside test modules
 /// are fixtures, not the plugin's production wiring.
@@ -92,7 +88,7 @@ fn call_args(source: &str, call: &str, nth: usize) -> Option<String> {
 }
 
 fn plugin_production() -> String {
-    let path = workspace_root().join(PLUGIN);
+    let path = repo_root().join(PLUGIN);
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{PLUGIN}: {e}"));
     production_source(&text).to_owned()
 }

@@ -28,7 +28,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
 
 #[path = "../../cogneva/tests/common/rust_production.rs"]
 mod rust_production;
@@ -66,15 +65,14 @@ const COUNTED: &[(&str, usize)] = &[
     ("crates/cogneva/src/backup.rs", 1),
 ];
 
-fn workspace_root() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("cog-net lives in crates/, so ../.. is the workspace root")
-}
+/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
 
 fn counted_sites() -> BTreeMap<String, usize> {
-    let root = workspace_root();
+    let root = repo_root();
 
     let mut counts = BTreeMap::new();
     for path in production_sources(&root) {

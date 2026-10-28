@@ -31,13 +31,11 @@ const SCANNED_EXTENSIONS: &[&str] = &[
 /// control internals, orchestration state, and vendored frontend trees.
 const SKIPPED_DIRECTORIES: &[&str] = &["target", ".git", ".omc", "node_modules", "dist", ".venv"];
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("cog-core lives two levels under the workspace root")
-        .to_path_buf()
-}
+/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
 
 /// Every readable text file under `root`, as paths relative to it.
 ///
@@ -82,7 +80,7 @@ fn scanned_files(root: &Path) -> Vec<PathBuf> {
 
 #[test]
 fn a_retired_name_is_spelled_out_in_exactly_one_place() {
-    let root = workspace_root();
+    let root = repo_root();
     let declaration = std::fs::read_to_string(root.join(DECLARATION))
         .unwrap_or_else(|e| panic!("cannot read {DECLARATION}: {e}"));
 

@@ -10,10 +10,16 @@
 //! 唯一载体。目录被删或改名，用户侧的表现是模型又开始瞎猜版本号——没有这条断言，
 //! 没有人会把它和一次目录整理联系起来。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
 
 fn shipped_skills_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills")
+    repo_root().join("skills")
 }
 
 #[tokio::test]
@@ -123,7 +129,7 @@ async fn web_research_skill_tells_the_model_how_to_search_without_paid_apis() {
 async fn the_design_skill_is_the_upstream_text_verbatim_and_the_local_notes_live_beside_it() {
     use sha2::{Digest, Sha256};
 
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let root = repo_root();
 
     let stray = root.join(".claude/skills");
     assert!(

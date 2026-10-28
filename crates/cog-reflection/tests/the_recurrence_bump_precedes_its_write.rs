@@ -29,17 +29,15 @@ const BUMP: &str = "update_recurrence(";
 /// The only writer of `recurrence_count`.
 const WRITE: &str = "record_learning(";
 
-fn workspace_root() -> PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives at <root>/crates/cog-reflection")
-        .to_path_buf()
-}
+/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
 
 /// This crate's shipping sources: the shared census, cut down to the crate.
 fn source_files() -> Vec<PathBuf> {
-    let root = workspace_root();
+    let root = repo_root();
     let prefix = format!(
         "{}/",
         relative_name(&root, &root.join("crates/cog-reflection/src"))

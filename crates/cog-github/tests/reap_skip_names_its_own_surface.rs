@@ -17,21 +17,17 @@
 //! itself is *not* loosened — a partial listing must still skip the reap, since
 //! reaping against a partial view drops verdicts of live intents.
 
-use std::path::{Path, PathBuf};
-
 const SOURCE: &str = "crates/cog-github/src/discovery_loop.rs";
 
 /// The reap block, bounded by the two comments that open and close it.
 const OPEN: &str = "// Reap verdicts of intents";
 const CLOSE: &str = "// A2A 交叉验证";
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives at <root>/crates/cog-github")
-        .to_path_buf()
-}
+/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
 
 /// The reap block, cut at its two markers.
 ///
@@ -40,7 +36,7 @@ fn workspace_root() -> PathBuf {
 /// 421, well above the loop, so that cut would take the production code with
 /// it. Each marker below occurs exactly once in the file.
 fn reap_block() -> String {
-    let path = workspace_root().join(SOURCE);
+    let path = repo_root().join(SOURCE);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let start = text

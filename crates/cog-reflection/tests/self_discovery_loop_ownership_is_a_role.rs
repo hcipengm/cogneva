@@ -22,8 +22,6 @@
 //! the arbiter the other seven roles already use. Both directions are asserted
 //! here, plus the negative control that would catch "so just delete the flag".
 
-use std::path::{Path, PathBuf};
-
 const PLUGIN: &str = "crates/cog-reflection/src/plugin.rs";
 
 /// The loop's entry point, as it appears in the plugin's production source.
@@ -38,16 +36,14 @@ const ROLE_ASK: &str = "hold.may_act()";
 const EXECUTOR_FLAG: &str = "self_evolution.executor_enabled";
 const FLAG_LOCAL: &str = "owns_self_discovery";
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives at <root>/crates/cog-reflection")
-        .to_path_buf()
-}
+/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
 
 fn plugin_source() -> String {
-    let path = workspace_root().join(PLUGIN);
+    let path = repo_root().join(PLUGIN);
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
 }
 

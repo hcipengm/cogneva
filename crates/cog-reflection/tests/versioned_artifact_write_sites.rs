@@ -95,16 +95,14 @@ const WRITE_SITES: &[WriteSite] = &[
     },
 ];
 
-fn workspace_root() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives at <root>/crates/cog-reflection")
-        .to_path_buf()
-}
+/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
 
 fn files_calling_the_write_api() -> BTreeSet<String> {
-    let root = workspace_root();
+    let root = repo_root();
     let mut found = BTreeSet::new();
     for path in production_sources(&root) {
         let Ok(text) = std::fs::read_to_string(&path) else {
@@ -138,7 +136,7 @@ fn every_versioned_artifact_write_site_is_classified() {
     );
 
     // Each classification has to still be backed by its evidence symbol.
-    let root = workspace_root();
+    let root = repo_root();
     for site in WRITE_SITES {
         let text = std::fs::read_to_string(root.join(site.file))
             .unwrap_or_else(|e| panic!("{}: {e}", site.file));

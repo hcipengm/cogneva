@@ -20,6 +20,12 @@ use cog_agent::ToolRegistry;
 use cog_core::SkillRegistry;
 use std::sync::Arc;
 
+/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
+
+use root::repo_root;
+
 /// Whether calling `tool` can change the workspace, answered by what the tool
 /// is rather than by a list of names.
 ///
@@ -144,7 +150,7 @@ fn production_registry() -> ToolRegistry {
 
 /// The shipped skills, loaded the way the running server loads them.
 fn shipped_skills() -> SkillRegistry {
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../skills");
+    let dir = repo_root().join("skills");
     let mut skills = SkillRegistry::new();
     skills
         .load_skills_from_dir(&dir)

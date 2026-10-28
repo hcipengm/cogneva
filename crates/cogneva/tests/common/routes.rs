@@ -18,10 +18,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// 这棵树的根（`crates/cogneva` 往上两级）。
-pub fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+/// 这棵树的根。算法在 [`super::root`]——一份，全仓共用，别的 crate 的测试也编它。
+///
+/// `allow(unused_imports)` 是因为这一句要按「每个测试二进制」各判一次：任何一份
+/// 测试文件写 `mod common;` 都会把这里编进去，而其中只有一部分真的会问根在哪。
+/// 把它删掉让消费者改走 `common::root::repo_root`，等于让 75 个文件各写一条路径，
+/// 而这里的一行恰恰是它们只写一条路径的原因。
+#[allow(unused_imports)]
+pub use super::root::repo_root;
 
 pub fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
