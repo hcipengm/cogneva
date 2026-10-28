@@ -91,48 +91,13 @@ pub fn raw_string_end(bytes: &[u8], i: usize) -> Option<usize> {
 /// 一段文字结尾的那个标识符（`Self::X` 收 `X`，`foo(...)` 收空串）。
 ///
 /// 两份夹具都拿它从 `=>` 左边、赋值右边取出被写的那个名字。取法只有一种：
-/// 一份连 `::` 一起收进来、另一份不收，两边的词表就永远对不上，而红的是
-/// 顶层逗号切分：括号里、字符串里、原始字符串里的逗号都不算。
+/// 一份连 `::` 一起收进来、另一份不收，两边的词表就永远对不上。
 ///
-/// 两个读者各写过一遍同一个函数（一个叫 `split_arms`，一个叫 `split_items`），
-/// 因为「切枚举变体」和「切 match 臂」看起来是两件事——同一段体，同一套跳过规则。
-/// 跳过规则抄歪的那一份不会红：它只是把一条变体切成两条，或者把两条并成一条，
-/// 而两条判据都会照着自己那份读下去。
-pub fn split_top_level(body: &str) -> Vec<&str> {
-    let bytes = body.as_bytes();
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        if let Some(end) = raw_string_end(bytes, i) {
-            i = end;
-            continue;
-        }
-        match bytes[i] {
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(&body[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    parts.push(&body[start..]);
-    parts
-}
-
+/// 它原来和「按顶层逗号切分」住在一起：切枚举变体与切 match 臂看起来是两件事，抄的
+/// 人各写一遍 `split_arms` / `split_items`，而抄歪的那一份不会红——它只是把一条变体
+/// 切成两条、或者把两条并成一条，两条判据都会照着自己那份读下去。切法现在在
+/// [`super::lex`]：认引号的那台状态机只该有一份，调用点说明方言是 Rust。
+///
 /// 「树上写错了」，不是「两把尺子不一样长」。
 pub fn trailing_identifier(text: &str) -> String {
     text.trim_end()

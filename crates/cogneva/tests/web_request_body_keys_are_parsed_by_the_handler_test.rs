@@ -34,7 +34,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 mod common;
-use common::js_literal::{is_identifier, quoted_word, split_top_level, top_level_keys};
+use common::js_literal::{is_identifier, quoted_word, top_level_keys, KeyWords};
+use common::lex::{split_top_level, Dialect};
 use common::routes::{
     matching_brace, matching_paren, normalize, read, repo_root, route_entries, served_handlers,
     strip_comments, walk, VERBS,
@@ -121,7 +122,7 @@ fn client_bodies(text: &str, file: &str) -> (Vec<Body>, usize) {
         let Some(body_end) = matching_brace(remainder.as_bytes(), 0) else {
             continue;
         };
-        let Some(keys) = top_level_keys(&remainder[1..body_end]) else {
+        let Some(keys) = top_level_keys(&remainder[1..body_end], KeyWords::Identifiers) else {
             opaque += 1;
             continue;
         };
@@ -159,7 +160,7 @@ fn page_bodies(text: &str, file: &str) -> Vec<Body> {
                 break;
             };
             cursor = close + 1;
-            let arguments = split_top_level(&text[open + 1..close]);
+            let arguments = split_top_level(&text[open + 1..close], Dialect::JavaScript);
             let Some(path) = arguments.first().and_then(|p| quoted_word(p)) else {
                 continue;
             };
@@ -191,7 +192,7 @@ fn page_bodies(text: &str, file: &str) -> Vec<Body> {
                     };
                     let mut method: Option<String> = None;
                     let mut body: Option<String> = None;
-                    for option in split_top_level(inner) {
+                    for option in split_top_level(inner, Dialect::JavaScript) {
                         let option = option.trim();
                         if let Some(rest) = option.strip_prefix("method:") {
                             method = quoted_word(rest);
@@ -221,7 +222,7 @@ fn page_bodies(text: &str, file: &str) -> Vec<Body> {
             let Some(inner) = inner.strip_suffix('}') else {
                 continue;
             };
-            let Some(keys) = top_level_keys(inner) else {
+            let Some(keys) = top_level_keys(inner, KeyWords::Identifiers) else {
                 continue;
             };
             bodies.push(Body {
@@ -618,7 +619,10 @@ fn the_census_is_wide_enough_to_mean_something() {
 #[test]
 fn the_body_reader_sees_shorthand_pairs_and_spreads() {
     assert_eq!(
-        top_level_keys(" from, to: target, 'message': msg, nested: { a: 1, b: 2 }"),
+        top_level_keys(
+            " from, to: target, 'message': msg, nested: { a: 1, b: 2 }",
+            KeyWords::Identifiers
+        ),
         Some(BTreeSet::from([
             "from".to_string(),
             "to".to_string(),
@@ -627,9 +631,15 @@ fn the_body_reader_sees_shorthand_pairs_and_spreads() {
         ]))
     );
     // 展开与计算键代表这个读取器看不见的键：整条对象都不判，而不是判剩下那些。
-    assert_eq!(top_level_keys(" path, ...rest"), None);
-    assert_eq!(top_level_keys(" [key]: 1"), None);
-    assert_eq!(top_level_keys(""), Some(BTreeSet::new()));
+    assert_eq!(
+        top_level_keys(" path, ...rest", KeyWords::Identifiers),
+        None
+    );
+    assert_eq!(top_level_keys(" [key]: 1", KeyWords::Identifiers), None);
+    assert_eq!(
+        top_level_keys("", KeyWords::Identifiers),
+        Some(BTreeSet::new())
+    );
 }
 
 #[test]

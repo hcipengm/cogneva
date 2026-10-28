@@ -35,7 +35,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::js_literal::{is_identifier, split_top_level};
+use common::js_literal::is_identifier;
+use common::lex::{split_top_level, Dialect};
 use common::routes::{matching_brace, matching_paren, read, repo_root, walk};
 use common::rust_production::{production_text, relative_name};
 
@@ -476,7 +477,7 @@ fn listened_types(file: &str, source: &str) -> Result<BTreeSet<String>, String> 
         })?;
         cursor = close + 1;
         let args = &source[open + 1..close];
-        let parts = split_top_level(args);
+        let parts = split_top_level(args, Dialect::JavaScript);
         let Some(event) = parts.first() else { continue };
         let event = event.trim().trim_matches(|c| c == '\'' || c == '"');
         if event != "message" {

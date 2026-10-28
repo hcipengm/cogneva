@@ -284,6 +284,42 @@ pub fn blank(text: &str, dialect: Dialect) -> String {
     scan(text, dialect).blanked
 }
 
+/// 顶层逗号切分：括号里、字符串里、字符字面量与原始字符串里的逗号都不算。
+///
+/// 这条规则和上面那台状态机是同一件事的两半——「哪里是一段字符串」只有这一个答案，
+/// 而要不要切在某处逗号上，问的正是它。所以切分不自己认引号：层数在 `blank` 过的
+/// 那份正文上数，逗号在它上面找，字节却从原文上切，字面量因此逐字留在每一段里。
+///
+/// 以前这条规则有四份：`js_literal::split_top_level` 认 `"` `'` 反引号与转义，
+/// `rust_text::split_top_level` 认原始字符串，`llm_spend_verdict_contract_test` 里
+/// 还有一份只认 `"` 的。四份对同一个字节可以给出四个答案，而没有东西比较它们——
+/// 认错了引号的那一份不会红，它只是把一条实参切成两条、或者把两条并成一条，各自的
+/// 判据照着自己那份读下去，结论仍然是一句「全都合规」。
+pub fn split_top_level(text: &str, dialect: Dialect) -> Vec<&str> {
+    let blanked = blank(text, dialect);
+    // `scan` 的每个分支都把每个源字符恰好落成 `blanked` 里的一个字符，所以这两份
+    // 逐字符对齐；`starts` 给每个字符记下它在原文里的字节位置。
+    let mut starts: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+    starts.push(text.len());
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (index, c) in blanked.chars().enumerate() {
+        let Some(&at) = starts.get(index) else { break };
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&text[starts[start]..at]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[starts[start]..]);
+    parts
+}
+
 /// 只要一行（或一段没有换行的文本）的括号增减，给扫描器自己的用例用。
 pub fn brace_delta(line: &str, dialect: Dialect) -> i32 {
     scan(line, dialect)

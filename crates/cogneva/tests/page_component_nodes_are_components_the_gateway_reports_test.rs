@@ -27,7 +27,8 @@ use std::path::Path;
 
 mod common;
 
-use common::js_literal::split_top_level;
+use common::js_literal::{top_level_keys, KeyWords};
+use common::lex::{split_top_level, Dialect};
 use common::routes::{matching_brace, matching_delimiter, read, repo_root, strip_comments};
 use common::rust_production::production_text;
 
@@ -98,14 +99,18 @@ fn reported(root: &Path) -> Option<BTreeSet<String>> {
     // different vocabulary that happens to sit in the same tuple.
     let body = table.split("= &[").nth(1)?;
     let body = &body[..body.rfind(']')?];
-    for item in split_top_level(body) {
+    for item in split_top_level(body, Dialect::Rust) {
         let item = item.trim();
         if item.is_empty() {
             continue;
         }
         let item = item.strip_prefix('(')?.trim();
         let item = item.strip_suffix(')').unwrap_or(item).trim();
-        let first = split_top_level(item).into_iter().next()?.trim().to_string();
+        let first = split_top_level(item, Dialect::Rust)
+            .into_iter()
+            .next()?
+            .trim()
+            .to_string();
         let name = first.rsplit("topology::").next()?;
         if name == first {
             return None;
@@ -121,44 +126,6 @@ fn reported(root: &Path) -> Option<BTreeSet<String>> {
     Some(ids)
 }
 
-/// The keys of an object literal body, quoted or bare. A quoted key may be any
-/// word the page can name a component by — `security-gateway` is not an
-/// identifier, and the shared reader (built for request bodies) drops those.
-fn object_keys(body: &str) -> Option<BTreeSet<String>> {
-    let mut keys = BTreeSet::new();
-    for part in split_top_level(body) {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        if part.starts_with("...") || part.starts_with('[') {
-            return None;
-        }
-        if part.starts_with('"') || part.starts_with('\'') {
-            let quote = &part[..1];
-            let rest = &part[1..];
-            let end = rest.find(quote)?;
-            if !rest[end + 1..].trim_start().starts_with(':') {
-                continue;
-            }
-            keys.insert(rest[..end].to_string());
-            continue;
-        }
-        let name: String = part
-            .chars()
-            .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
-            .collect();
-        if name.is_empty() {
-            continue;
-        }
-        let after = part[name.len()..].trim_start();
-        if after.is_empty() || after.starts_with(':') {
-            keys.insert(name);
-        }
-    }
-    Some(keys)
-}
-
 /// The component ids the page writes into its map and reads back out of it.
 /// `None` when the map cannot be enumerated — a spread or a computed key stands
 /// for ids this reader never sees, and guessing them is how a ghost id passes.
@@ -167,7 +134,9 @@ fn drawn(root: &Path) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
     let at = page.find(&format!("let {NODES} = {{"))?;
     let brace = at + page[at..].find('{')?;
     let end = matching_brace(page.as_bytes(), brace)?;
-    let written = object_keys(&page[brace + 1..end])?;
+    // 这张表的键就是组件 id：`security-gateway` 这类带横杠的词不是标识符，而这里
+    // 正是它们住的地方——所以方言由调用点说明，读取器只有一份。
+    let written = top_level_keys(&page[brace + 1..end], KeyWords::Any)?;
 
     let mut read_back = BTreeSet::new();
     let mut cursor = end;

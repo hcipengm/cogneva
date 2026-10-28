@@ -208,6 +208,22 @@ pub fn opens_test_module(line: &str) -> bool {
         || trimmed.starts_with("pub mod tests")
 }
 
+/// Whether this line opens a **braced** test module: the marker and the `mod`
+/// on one line, or `mod tests {` on its own.
+///
+/// The difference from [`opens_test_module`] is the difference between "this is
+/// a specimen" and "everything from here to the matching brace is a specimen".
+/// A marker line on its own opens nothing yet -- the item it decorates is on a
+/// later line -- and reading it as a module start puts the production that
+/// follows a `#[cfg(test)]` setter inside the test half, which is the cut this
+/// module exists to get right once.
+pub fn opens_test_module_block(line: &str) -> bool {
+    let trimmed = line.trim();
+    opens_test_module(trimmed)
+        && trimmed.ends_with('{')
+        && trimmed.split_whitespace().any(|word| word == "mod")
+}
+
 /// Per-line brace shapes for a whole file, carrying string, character-literal
 /// and comment state across the newlines.
 ///

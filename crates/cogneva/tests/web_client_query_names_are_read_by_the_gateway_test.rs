@@ -56,6 +56,7 @@
 
 mod common;
 
+use common::js_literal::{top_level_keys, KeyWords};
 use common::routes::{matching_brace, read, repo_root, strip_comments, walk};
 use common::rust_production::relative_name;
 
@@ -137,58 +138,6 @@ fn binding_before(text: &str, at: usize) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// The keys of an object literal starting at `{`, one identifier per item.
-/// `open` is a byte index (the text has Chinese in it, so char and byte indices
-/// differ).
-fn object_keys(text: &str, open: usize) -> Vec<String> {
-    let mut depth = 0usize;
-    let mut end = None;
-    for (index, c) in text.char_indices().skip_while(|(index, _)| *index < open) {
-        match c {
-            '{' => depth += 1,
-            '}' if depth > 0 => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(index);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let Some(end) = end else {
-        return Vec::new();
-    };
-    let body = &text[open + 1..end];
-    let mut out = Vec::new();
-    let mut depth = 0i32;
-    let mut item = String::new();
-    for c in body.chars() {
-        match c {
-            '{' | '(' | '[' => depth += 1,
-            '}' | ')' | ']' => depth -= 1,
-            ',' if depth == 0 => {
-                out.push(item.clone());
-                item.clear();
-                continue;
-            }
-            _ => {}
-        }
-        item.push(c);
-    }
-    out.push(item);
-    out.into_iter()
-        .filter_map(|item| {
-            let item = item.trim();
-            let name: String = item
-                .chars()
-                .take_while(|c| ident_char(*c) || *c == '$')
-                .collect();
-            (!name.is_empty()).then_some(name)
-        })
-        .collect()
-}
-
 /// One `URLSearchParams` binding: the name it is assigned to, every name it is
 /// read back through (`query.toString()` stored in `suffix` is still `query`),
 /// the stretch of text that is its own (up to the next binding), and the names
@@ -234,9 +183,19 @@ fn search_params_of(text: &str) -> Vec<Binding> {
 
         let mut names = Vec::new();
         if let Some(open) = text[after..].find('{').map(|i| i + after) {
-            // An object literal has to be the first thing inside the call.
+            // An object literal has to be the first thing inside the call. Neither half of
+            // reading it is written here: the closing brace comes from
+            // `routes::matching_brace` and the top-level cut from `lex`. The reader this
+            // replaced counted braces itself and knew nothing about strings, so a key like
+            // `'page-size'` was cut down to `page` and read as a name that is not there.
+            //
+            // A query name is any word the client quotes, dashed or not.
             if text[after..open].trim().is_empty() {
-                names = object_keys(text, open);
+                if let Some(end) = matching_brace(text.as_bytes(), open) {
+                    names = top_level_keys(&text[open + 1..end], KeyWords::Any)
+                        .map(|keys| keys.into_iter().collect())
+                        .unwrap_or_default();
+                }
             }
         }
         if names.is_empty() {
@@ -713,9 +672,11 @@ fn the_readers_see_the_shapes_this_tree_writes() {
         bindings.iter().map(|b| &b.var).collect::<Vec<_>>()
     );
     assert_eq!(bindings[0].var, "query");
+    // 共享读取器回的是一张集合，所以这里是它的顺序不是源里的顺序——这一侧只拿这批名字
+    // 跟网关读的那些比，顺序从来不参与判词。
     assert_eq!(
         bindings[0].names,
-        vec!["kind".to_string(), "scope".to_string(), "limit".to_string()]
+        vec!["kind".to_string(), "limit".to_string(), "scope".to_string()]
     );
     assert_eq!(bindings[1].var, "params");
     assert_eq!(bindings[1].names, vec!["from".to_string()]);

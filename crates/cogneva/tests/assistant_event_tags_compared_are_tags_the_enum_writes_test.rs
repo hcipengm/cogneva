@@ -29,7 +29,8 @@ mod common;
 
 use common::rust_text::snake_case;
 
-use common::js_literal::split_top_level;
+use common::js_literal::quoted_word;
+use common::lex::{split_top_level, Dialect};
 use common::routes::{matching_brace, read, repo_root, strip_comments};
 use common::rust_production::production_text;
 
@@ -63,7 +64,7 @@ fn enum_tags(source: &str, name: &str) -> Option<BTreeSet<String>> {
     let end = matching_brace(source.as_bytes(), brace)?;
     let mut tags = BTreeSet::new();
     // 按顶层逗号切：变体自己的结构体字段、属性里的括号都留在同一片里。
-    for part in split_top_level(&source[brace + 1..end]) {
+    for part in split_top_level(&source[brace + 1..end], Dialect::Rust) {
         let mut part = part.trim();
         if part.is_empty() {
             continue;
@@ -118,18 +119,6 @@ fn carriers(text: &str) -> BTreeSet<String> {
     names
 }
 
-/// 紧跟着的一个带引号单词（引号可以是 ' / " / `），跳过前导空白。
-fn quoted_word_after(text: &str) -> Option<String> {
-    let text = text.trim_start();
-    let quote = text.chars().next()?;
-    if quote != '\'' && quote != '"' && quote != '`' {
-        return None;
-    }
-    let rest = &text[1..];
-    let end = rest.find(quote)?;
-    Some(rest[..end].to_string())
-}
-
 /// `<名字>.type` 与某个词比较时写的词，包括 `switch (<名字>.type)` 上的 `case` 标签。
 ///
 /// 两种写法都算：直接比较是这一路最常见的样子，`case` 是把同一个词表铺开写的样子。
@@ -146,7 +135,7 @@ fn compared_tags(text: &str, names: &BTreeSet<String>) -> BTreeSet<String> {
                 .into_iter()
                 .find(|op| rest.starts_with(op));
             if let Some(op) = op {
-                if let Some(word) = quoted_word_after(&rest[op.len()..]) {
+                if let Some(word) = quoted_word(&rest[op.len()..]) {
                     tags.insert(word);
                 }
             }
@@ -173,7 +162,7 @@ fn compared_tags(text: &str, names: &BTreeSet<String>) -> BTreeSet<String> {
                     if before.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '$') {
                         continue;
                     }
-                    if let Some(word) = quoted_word_after(&body[inner..]) {
+                    if let Some(word) = quoted_word(&body[inner..]) {
                         tags.insert(word);
                     }
                 }

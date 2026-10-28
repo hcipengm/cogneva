@@ -34,6 +34,7 @@
 
 mod common;
 
+use common::lex::{split_top_level, Dialect};
 use common::routes::repo_root;
 
 use std::collections::BTreeSet;
@@ -304,7 +305,7 @@ fn call_arguments(text: &str, call: &str) -> Vec<Vec<String>> {
         let Some(close) = argument_list_end(rest) else {
             continue;
         };
-        let args: Vec<String> = split_top_level(&rest[..close])
+        let args: Vec<String> = split_top_level(&rest[..close], Dialect::Rust)
             .into_iter()
             .map(|a| a.trim().to_string())
             .collect();
@@ -339,38 +340,6 @@ fn argument_list_end(rest: &str) -> Option<usize> {
         }
     }
     None
-}
-
-/// An argument list split on the commas that are not inside a call or a string.
-fn split_top_level(args: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    let mut start = 0usize;
-    for (i, c) in args.char_indices() {
-        if in_string {
-            match (escaped, c) {
-                (true, _) => escaped = false,
-                (false, '\\') => escaped = true,
-                (false, '"') => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&args[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&args[start..]);
-    parts
 }
 
 /// The reverse control: a reader that cannot tell a covered actor from an

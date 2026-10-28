@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::js_literal::{top_level_keys, KeyWords};
 use common::routes::strip_comments;
 
 use common::routes::read;
@@ -519,62 +520,6 @@ fn variant_fields(text: &str, header: &str) -> BTreeMap<String, BTreeSet<String>
     fields
 }
 
-/// 一个对象字面量体（两个花括号之间）在**顶层**的那些键。
-///
-/// 按顶层逗号切开，每段取开头那个 `名字:`。嵌套的对象、数组、模板串都在深度里，
-/// 不会漏进来——`channels: ['agent:*']` 里的引号内容不是一个键。
-fn top_level_keys(body: &str) -> BTreeSet<String> {
-    let bytes = body.as_bytes();
-    let mut keys = BTreeSet::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    let mut i = 0usize;
-    let mut parts: Vec<&str> = Vec::new();
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => {
-                let quote = bytes[i];
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == quote {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                continue;
-            }
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => depth -= 1,
-            b',' if depth == 0 => {
-                parts.push(&body[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    parts.push(&body[start.min(bytes.len())..]);
-    for part in parts {
-        let trimmed = part.trim_start();
-        let key: String = trimmed
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if !key.is_empty()
-            && key.starts_with(|c: char| c.is_ascii_alphabetic())
-            && trimmed[key.len()..].trim_start().starts_with(':')
-        {
-            keys.insert(key);
-        }
-    }
-    keys
-}
-
 /// 一个 `send( … )` 实参里带 `type: '<名字>'` 的那些对象字面量：名字与它的键。
 ///
 /// 只认真正带 `type` 的那一层：`send(payload)` 这种把整条消息交给上层拼的写法
@@ -606,9 +551,11 @@ fn sent_objects_in(args: &str) -> Vec<(String, BTreeSet<String>)> {
             b'}' => {
                 if let Some(open) = stack.pop() {
                     let inner = &args[open + 1..i];
-                    let keys = top_level_keys(inner);
-                    if let Some(wire) = quoted_type(inner) {
-                        out.push((wire, keys));
+                    // 带展开或计算键的对象：这个读取器看不见全部键，这一条跳过而不是猜。
+                    if let Some(keys) = top_level_keys(inner, KeyWords::Identifiers) {
+                        if let Some(wire) = quoted_type(inner) {
+                            out.push((wire, keys));
+                        }
                     }
                 }
             }

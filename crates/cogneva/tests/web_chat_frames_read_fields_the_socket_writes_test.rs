@@ -28,7 +28,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 mod common;
-use common::js_literal::{quoted_word, split_top_level, top_level_keys};
+use common::js_literal::{quoted_word, top_level_keys, KeyWords};
+use common::lex::{split_top_level, Dialect};
 use common::routes::{matching_brace, matching_paren, read, repo_root, strip_comments};
 use common::rust_production::production_text;
 
@@ -65,7 +66,7 @@ fn emitted_frames(text: &str) -> BTreeMap<String, BTreeSet<String>> {
             break;
         };
         cursor = close + 1;
-        let arguments = split_top_level(&text[open + 1..close]);
+        let arguments = split_top_level(&text[open + 1..close], Dialect::JavaScript);
         let Some(name) = arguments.get(2).and_then(|a| quoted_word(a)) else {
             continue;
         };
@@ -81,7 +82,7 @@ fn emitted_frames(text: &str) -> BTreeMap<String, BTreeSet<String>> {
             let Some(end) = matching_brace(payload.as_bytes(), brace) else {
                 continue;
             };
-            if let Some(keys_in) = top_level_keys(&payload[brace + 1..end]) {
+            if let Some(keys_in) = top_level_keys(&payload[brace + 1..end], KeyWords::Identifiers) {
                 keys.extend(keys_in);
             }
         }

@@ -46,7 +46,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_text::{raw_string_end, split_top_level, trailing_identifier};
+use common::lex::{split_top_level, Dialect};
+use common::rust_text::{raw_string_end, trailing_identifier};
 
 use common::routes::repo_root;
 use common::rust_production::{
@@ -362,7 +363,7 @@ fn written_words(
 ) -> Result<Vec<(String, String)>, String> {
     let mut arms = Vec::new();
     let arms_body = match_body(body);
-    for arm in split_top_level(&arms_body) {
+    for arm in split_top_level(&arms_body, Dialect::Rust) {
         let Some(arrow) = arm.find("=>") else {
             continue;
         };
@@ -406,7 +407,7 @@ fn is_plain_word(word: &str) -> bool {
 /// 臂算数——`write!(f, "state {} / {}", a, b)` 那种不是词表，读不出词就不看它。
 fn display_words(body: &str) -> Vec<(String, String)> {
     let mut arms = Vec::new();
-    for arm in split_top_level(&match_body(body)) {
+    for arm in split_top_level(&match_body(body), Dialect::Rust) {
         let Some(arrow) = arm.find("=>") else {
             continue;
         };
@@ -463,7 +464,7 @@ fn explicit_arms(source: &str, owner: &str) -> Vec<(String, String)> {
 fn read_words(body: &str) -> Vec<(String, String)> {
     let mut arms = Vec::new();
     let arms_body = match_body(body);
-    for arm in split_top_level(&arms_body) {
+    for arm in split_top_level(&arms_body, Dialect::Rust) {
         let Some(arrow) = arm.find("=>") else {
             continue;
         };

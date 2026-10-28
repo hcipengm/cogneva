@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_text::{raw_string_end, split_top_level};
+use common::lex::{split_top_level, Dialect};
+use common::rust_text::raw_string_end;
 
 use common::routes::repo_root;
 use common::rust_production::{
@@ -76,7 +77,7 @@ fn enums_in(file: &str, source: &str) -> Result<BTreeMap<String, BTreeSet<String
 /// 枚举体里的变体名：按顶层逗号切，去掉开头的属性。
 fn variants_of(body: &str) -> BTreeSet<String> {
     let mut variants = BTreeSet::new();
-    for part in split_top_level(body) {
+    for part in split_top_level(body, Dialect::Rust) {
         let mut part = part.trim();
         while part.starts_with("#[") {
             let Some(close) = part.find(']') else { break };

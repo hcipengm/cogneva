@@ -60,9 +60,10 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::lex::{blank, brace_delta, strip, Dialect};
+use common::js_literal::{quoted_word, top_level_keys, KeyWords};
+use common::lex::{blank, brace_delta, split_top_level, strip, Dialect};
 use common::routes::{matching_brace, matching_paren, repo_root};
-use common::rust_production::relative_name;
+use common::rust_production::{opens_test_module, opens_test_module_block, relative_name};
 
 /// 读文件、走目录这两条的唯一定义。
 const THE_ONE: &str = "crates/cogneva/tests/common/fsio.rs";
@@ -80,18 +81,23 @@ const LEX_HOME: &str = "crates/cogneva/tests/common/lex.rs";
 /// 部分，后来才被别处借去用。
 const PRODUCTION_HOME: &str = "crates/cogneva/tests/common/rust_production.rs";
 
-/// 被抄走的那几行，逐字。前四个是**整条签名**（这几条规则的参数与返回类型在全仓只有
-/// 这两种写法，所以签名是最窄也最准的形状）；后六个只到**定义名**为止。
+/// 「一个对象字面量的顶层键」这一条的定义在 `js_literal` 里：请求体判据与页面组件
+/// 判据都在读同一种字面量，而它们对「哪个词算键」的词表不一样——差别写成一个参数，
+/// 不写成两份读取器。
+const JS_HOME: &str = "crates/cogneva/tests/common/js_literal.rs";
+
+/// 被抄走的那几行，逐字。开头几条是**整条签名**（这几条规则的参数与返回类型在全仓只有
+/// 这两种写法，所以签名是最窄也最准的形状）；其余只到**定义名**为止。
 ///
 /// 读文件占两个签名，因为这条规则被抄成了两种入口：收 `&Path` 的那条，和收「表里写着
 /// 的相对名」的那条（`read(rel)` / `read(relative)`，二十三个夹具各写一遍
 /// `repo_root().join(rel)` 加同一条 panic）。拷贝只在参数名上变过，所以两种都写上。
 ///
-/// 为什么后六个不用整条签名：括号那一份在两处抄件里被写成了 `text: &str`，而共享的
+/// 为什么其余的不写整条签名：括号那一份在两处抄件里被写成了 `text: &str`，而共享的
 /// 那一份收 `bytes: &[u8]`；相对名那一份在一处抄件里连名字都改成了 `relative`。签名
-/// 按抄件当时的形状写下去，下一个抄的人换一种参数类型就漏了。这六个名字是 `common`
+/// 按抄件当时的形状写下去，下一个抄的人换一种参数类型就漏了。这一串名字是 `common`
 /// 导出的，别处再出现一次定义按构造就是第二份实现。
-const COPIED_FORMS: [&str; 10] = [
+const COPIED_FORMS: [&str; 14] = [
     "fn read(path: &Path) -> String",
     "fn read(rel: &str) -> String",
     "fn read(relative: &str) -> String",
@@ -102,6 +108,10 @@ const COPIED_FORMS: [&str; 10] = [
     "fn relative_name(",
     "fn walk_files(",
     "fn walk_all(",
+    "fn split_top_level(",
+    "fn top_level_keys(",
+    "fn quoted_word(",
+    "fn object_keys(",
 ];
 
 /// 取相对名还有**内联**的形状：不写成函数，直接把那一串方法调用摊在调用点上。
@@ -353,20 +363,14 @@ fn test_module_function_bodies(text: &str) -> Vec<(String, usize, String)> {
         let this_line = line_start;
         line_start += line.len() + 1;
         let trimmed = line.trim();
-        // `#[cfg(test)]` 与 `mod tests {` 可以在同一行，也可以隔一行；两种都要认。
-        let mut rest_of_line = trimmed;
-        if let Some(after) = trimmed.strip_prefix("#[cfg(test)]") {
-            pending_cfg_test = true;
-            rest_of_line = after.trim();
-        }
-        if pending_cfg_test && !rest_of_line.is_empty() {
+        // 标记与 `mod tests {` 可以在同一行，也可以隔一行；两种都要认。哪一行算开了
+        // 一个测试模块不在这里算——`rust_production` 是那件事唯一的一处，这里只问它。
+        if opens_test_module_block(trimmed) {
+            test_mod_depth = Some(depth + 1);
+        } else if pending_cfg_test && !trimmed.is_empty() {
             pending_cfg_test = false;
-            let head = rest_of_line
-                .strip_prefix("pub mod ")
-                .or_else(|| rest_of_line.strip_prefix("mod "));
-            if head.is_some() && rest_of_line.ends_with('{') {
-                test_mod_depth = Some(depth + 1);
-            }
+        } else if opens_test_module(trimmed) {
+            pending_cfg_test = true;
         }
         if let Some(want) = test_mod_depth {
             if depth == want {
@@ -448,7 +452,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     let mut support_bodies: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut fixture_bodies: Vec<(String, String)> = Vec::new();
-    let shared = [THE_ONE, ROUTES_HOME, PRODUCTION_HOME];
+    let shared = [THE_ONE, ROUTES_HOME, PRODUCTION_HOME, LEX_HOME, JS_HOME];
     for path in files_in {
         let name = relative_name(root, path);
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -812,6 +816,76 @@ fn the_fixture_reading_steps_are_written_once() {
          原始字符串里可以有任意括号，只看第一个 `*/` 或 `\"` 会把后半截读反，\
          而读反的那一半在判词上与「那里没有」同形"
     );
+    // 切分这一条也住在这里，而且必须**真的按方言分岔**：同一段字节在两种语言里对
+    // 「哪里是一段字面量」给出不同答案。下面三条读的是行为不是字面——有人把切分换回
+    // 一套写死的引号集合时，这三条里至少有一条先红，而不是等某份夹具把一条实参切成
+    // 两条之后，结论照旧是「全都合规」。
+    assert!(
+        lex_home.contains("pub fn split_top_level(text: &str, dialect: Dialect) -> Vec<&str>"),
+        "{LEX_HOME} 里不再定义 `split_top_level`：「顶层逗号只有一处切法」就指着这份\
+         不切任何东西的文件"
+    );
+    assert_eq!(
+        split_top_level("'a,b', c", Dialect::JavaScript).len(),
+        2,
+        "JavaScript 的单引号字符串里的逗号不算顶层逗号"
+    );
+    assert_eq!(
+        split_top_level("'a,b', c", Dialect::Rust).len(),
+        2,
+        "Rust 的字符字面量里的逗号不算顶层逗号：认不出它，一条实参就被切成两条"
+    );
+    assert_eq!(
+        split_top_level("r#\",\"#, x", Dialect::Rust).len(),
+        2,
+        "Rust 的原始字符串里的逗号不算顶层逗号：认不出它，一段源码就被从中间切开"
+    );
+    // 同一段字节，两种方言给出不同的答案。这不是两条规则的差别，是「哪一半算代码」的
+    // 差别；方言说错了不会红，只会把后面的代码整段读成字符串。
+    assert_eq!(
+        split_top_level("&'a str, x", Dialect::Rust).len(),
+        2,
+        "Rust 的 `&'a str` 里那个 `'` 是生命周期，不是一段字符串的开头"
+    );
+    assert_eq!(
+        split_top_level("&'a str, x", Dialect::JavaScript).len(),
+        1,
+        "同一段字节在 JavaScript 里，`'` 开的那段字符串没有收尾，后面的代码全读成字符串"
+    );
+    // 键这一条也住在这里，而且两套词表必须**真的分岔**：带横杠的词在结构体那一面读
+    // 不出字段名，在组件 id 那一面正是键本身。两套读成一样，就是把「哪个词算键」
+    // 写死了两次，而两次都绿。
+    let js_home = std::fs::read_to_string(root.join(JS_HOME)).expect("共享字面量读取读得到");
+    assert!(
+        js_home.contains("pub fn top_level_keys(body: &str, words: KeyWords)"),
+        "{JS_HOME} 里不再定义 `top_level_keys`：「一个对象的顶层键只有一处读法」就指着\
+         这份不读任何字面量的文件"
+    );
+    assert_eq!(
+        top_level_keys("'security-gateway': x", KeyWords::Any).map(|keys| keys.len()),
+        Some(1),
+        "组件 id 那一面必须收下带横杠的键：这不是标识符，却是这张表里的真键"
+    );
+    assert_eq!(
+        top_level_keys("'security-gateway': x", KeyWords::Identifiers).map(|keys| keys.len()),
+        Some(0),
+        "结构体字段那一面必须丢下带横杠的键：它不是任何字段名，收下它只会造出假缺口"
+    );
+    // 引号里那个词也一样：JavaScript 的三种引号必须由同一份读法认出来。曾经是两份，
+    // 一份只认 `"` 与 `'`，另一份认三种——两份对同一段字节给出不同答案，谁也不红。
+    assert!(
+        js_home.contains("pub fn quoted_word(piece: &str) -> Option<String>"),
+        "{JS_HOME} 里不再定义 `quoted_word`：「引号里那个词只有一处读法」就指着这份\
+         不读任何字面量的文件"
+    );
+    for piece in ["'POST'", "\"POST\"", "`POST`"] {
+        assert_eq!(
+            quoted_word(piece),
+            Some("POST".to_string()),
+            "`{piece}` 里的那个词读不出来：少认一种引号的那一份不会红，它只是让这一路上\
+             的一个词读不到，而「读不到」与「树上没写」在判词上同形"
+        );
+    }
     // 括号那一份：两条入口都还在，而且都还走在同一个数层数的实现上。少这一问，
     // 把某一条改成「找最近的 `}`」之后，本判据只证明了「没有第二份」，不证明这一份对。
     assert!(
