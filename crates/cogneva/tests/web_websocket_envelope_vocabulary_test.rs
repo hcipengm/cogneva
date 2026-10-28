@@ -37,14 +37,13 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::rust_production::{all_crate_files, crate_files_of};
+
 /// 服务端→客户端的信封。
 const PROTOCOL: &str = "crates/cog-gateway/src/websocket_protocol.rs";
 
 /// 客户端的收帧处。
 const CLIENT: &str = "web/src/transport/websocket.ts";
-
-/// 生产 Rust 的根：判定「有没有人构造」只看它。
-const SERVER_SRC: &str = "crates";
 
 /// 网关内嵌的那份兜底客户端。它是第二个客户端，同一套名字再拼一遍。
 const TAKEOVER: &str = "crates/cog-gateway/src/takeover.html";
@@ -180,12 +179,14 @@ fn dispatched(text: &str) -> BTreeSet<String> {
 }
 
 /// 生产 Rust 里出现过 `ServerMessage::<变体>` 的那些变体。
-fn constructed(root: &Path) -> BTreeSet<String> {
+///
+/// 人口是整棵工作树的 crate 代码（`crates/` 下每个 `.rs`，夹具在内）：这一条问的
+/// 是「这棵树里还有没有第二处构造」，不是「发出去的镜像里有没有」——夹具里构造一份
+/// 同样是这个判据要认的现场。
+fn constructed(files: &[PathBuf]) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
-    let mut files = Vec::new();
-    rust_files(&root.join(SERVER_SRC), &mut files);
     for path in files {
-        let text = read(&path);
+        let text = read(path);
         let mut cursor = 0;
         while let Some(at) = text[cursor..].find("ServerMessage::") {
             let start = cursor + at + "ServerMessage::".len();
@@ -202,22 +203,8 @@ fn constructed(root: &Path) -> BTreeSet<String> {
     found
 }
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-            out.push(path);
-        }
-    }
-}
-
 /// 一份树上的全部判词。`judged` 是判过的变体数，用来防「一条都没判」。
-fn contradictions(root: &Path) -> (Vec<String>, usize) {
+fn contradictions(root: &Path, files: &[PathBuf]) -> (Vec<String>, usize) {
     let variants = enum_variants(&read(&root.join(PROTOCOL)), "pub enum ServerMessage");
     let mut complaints = Vec::new();
     let client_path = root.join(CLIENT);
@@ -226,7 +213,7 @@ fn contradictions(root: &Path) -> (Vec<String>, usize) {
     }
     let client = read(&client_path);
     let waits = dispatched(&client);
-    let builds = constructed(root);
+    let builds = constructed(files);
 
     for wire in &waits {
         if !variants.values().any(|name| name == wire) {
@@ -480,7 +467,8 @@ fn a_sent_key_its_variant_does_not_parse_is_reported() {
 
 #[test]
 fn the_envelope_vocabulary_is_the_same_on_both_ends() {
-    let (complaints, judged) = contradictions(&repo_root());
+    let root = repo_root();
+    let (complaints, judged) = contradictions(&root, &all_crate_files(&root));
     assert!(judged > 0, "一个变体都没判到，这条判据没有题目");
     assert!(
         complaints.is_empty(),
@@ -902,7 +890,7 @@ fn the_census_is_wide_enough_to_mean_something() {
          这条判据就会靠「找不到题目」通过",
         waits.len()
     );
-    let builds = constructed(&root);
+    let builds = constructed(&all_crate_files(&root));
     assert!(
         builds.len() >= 5,
         "只找到 {} 处 ServerMessage 构造，太少：构造普查没在看生产代码",
@@ -973,7 +961,7 @@ fn a_wait_nothing_sends_and_a_frame_nobody_reads_are_both_reported() {
     )
     .expect("client");
 
-    let (complaints, judged) = contradictions(&root);
+    let (complaints, judged) = contradictions(&root, &crate_files_of(&root));
     assert_eq!(judged, 3, "{complaints:?}");
     let joined = complaints.join("\n");
     // 客户端在等一个不存在的名字。
@@ -988,7 +976,7 @@ fn a_wait_nothing_sends_and_a_frame_nobody_reads_are_both_reported() {
          if (message.type === 'agent_event') return;\n  if (message.type === 'kick') return;\n}\n",
     )
     .expect("client");
-    let (complaints, _) = contradictions(&root);
+    let (complaints, _) = contradictions(&root, &crate_files_of(&root));
     let joined = complaints.join("\n");
     assert!(!joined.contains("task_update"), "{joined}");
     assert!(
@@ -1003,7 +991,7 @@ fn a_wait_nothing_sends_and_a_frame_nobody_reads_are_both_reported() {
          pub fn c() -> ServerMessage {\n    ServerMessage::Kick { reason: String::new() }\n}\n",
     )
     .expect("lib");
-    let (complaints, _) = contradictions(&root);
+    let (complaints, _) = contradictions(&root, &crate_files_of(&root));
     assert!(
         complaints.join("\n").contains("永远不会来的帧"),
         "{complaints:?}"

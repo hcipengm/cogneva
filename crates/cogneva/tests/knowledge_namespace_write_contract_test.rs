@@ -34,6 +34,10 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+mod common;
+
+use common::rust_production::{production_sources, relative_name};
+
 /// A call that writes rows into a namespace, and the argument positions that
 /// name it. `upsert` carries the namespace second because it takes the store
 /// first; every other writer names it first.
@@ -96,50 +100,22 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Every `.rs` file under `crates/*/src`, as (repo-relative path, text).
+/// Every source file that ships, as (repo-relative path, text).
+///
+/// The population is the shared production census: `crates/*/src` plus each
+/// crate's build script. A build script is a host program compiled and run at
+/// build time, so a namespace it spells is written just as surely as one in
+/// `src/` -- and it is the one file the hand-rolled walk here used to miss.
 fn crate_sources() -> Vec<(String, String)> {
-    let crates = repo_root().join("crates");
-    let mut out = Vec::new();
-    let mut crate_dirs: Vec<PathBuf> = std::fs::read_dir(&crates)
-        .unwrap_or_else(|e| panic!("{} unreadable: {e}", crates.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.is_dir())
-        .collect();
-    crate_dirs.sort();
-    for dir in crate_dirs {
-        let src = dir.join("src");
-        if src.is_dir() {
-            collect_rs(&src, &mut out);
-        }
-    }
-    assert!(
-        !out.is_empty(),
-        "no sources found under {}",
-        crates.display()
-    );
-    out
-}
-
-fn collect_rs(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .collect();
-    entries.sort();
-    for path in entries {
-        if path.is_dir() {
-            collect_rs(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
+    let root = repo_root();
+    production_sources(&root)
+        .into_iter()
+        .map(|path| {
             let text = std::fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-            let rel = path
-                .strip_prefix(repo_root())
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            out.push((rel, text));
-        }
-    }
+            (relative_name(&root, &path), text)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

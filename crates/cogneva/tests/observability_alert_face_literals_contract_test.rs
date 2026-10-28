@@ -37,6 +37,10 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::rust_production::{all_crate_files, relative_name};
+
 /// This file's own name, so the scan does not report the strings it parses
 /// with as the literals it is looking for.
 const SELF_FILE: &str = "observability_alert_face_literals_contract_test.rs";
@@ -228,20 +232,15 @@ fn writes_the_alert_face(text: &str) -> bool {
 }
 
 fn code_faces() -> Vec<CodeFace> {
-    let mut sources = Vec::new();
-    files_with_extension(&repo_root().join("crates"), "rs", &mut sources);
-    sources.sort();
+    let root = repo_root();
     let mut found = Vec::new();
-    for path in sources {
+    for path in all_crate_files(&root) {
         // This file spells both the label and the shapes it parses, so it would
         // otherwise report itself as the writer it is looking for.
         if path.file_name().is_some_and(|n| n == SELF_FILE) {
             continue;
         }
-        let rel = path
-            .strip_prefix(repo_root())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| path.display().to_string());
+        let rel = relative_name(&root, &path);
         let text = read_at(&path);
         if !writes_the_alert_face(&text) {
             continue;
