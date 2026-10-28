@@ -643,7 +643,7 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
 #[tokio::test]
 #[ignore = "needs a live database: COGNEVA_TEST_DATABASE_URL"]
 async fn two_drills_at_once_do_not_drop_each_others_database() {
-    let url = std::env::var("COGNEVA_TEST_DATABASE_URL").expect("COGNEVA_TEST_DATABASE_URL");
+    let url = database_url();
     use sqlx::Connection as _;
     let first = claim_drill_lock(&url)
         .await

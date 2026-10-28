@@ -1833,6 +1833,7 @@ dependencies = [
 name = "cog-redis"
 version = "0.5.10"
 dependencies = [
+ "cog-test-support",
  "redis",
  "tokio",
  "tracing",

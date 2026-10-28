@@ -142,6 +142,15 @@ const SUPPORT_ENTRY_POINTS: [&str; 3] = [
     "pub fn redis_url_required()",
 ];
 
+/// 支撑 crate 负责的那两个环境变量：`crates/` 里除了 `SUPPORT_HOME`，不许再有一处代码
+/// 直接读它们。把名字收进常量不算搬走——常量指向的还是同一个名字，而一处拼错的地方不会
+/// 红：`env::var` 读一个没人设置的名字，与「本来就没配」在调用点上完全同形。
+const SUPPORT_ENV_NAMES: [&str; 2] = ["COGNEVA_TEST_DATABASE_URL", "COGNEVA_TEST_REDIS_URL"];
+
+/// 够到支撑 crate 的调用点下限。今天 70 处。这一面判的是「没有第二处在读」，把调用点
+/// 全删了它也一样绿，所以另一头要有底：这些人真的在用那个 crate。
+const MIN_SUPPORT_CALLSITES: usize = 60;
+
 // 普查面：`crates/**/*.rs`，夹具与产出面一起算。
 //
 // `src/` 必须在里面：这一族抄件上一轮就长在 `src/` 的单测模块里（`startup_guard.rs`
@@ -172,6 +181,10 @@ struct Census {
     duplicate_bodies: Vec<(String, Vec<String>)>,
     /// 支撑 crate 里已经有一份、夹具里又写了一遍的：（文件:行 名字, 支撑 crate 里的名字）。
     support_copies: Vec<(String, String)>,
+    /// 支撑 crate 之外，直接读它负责的那两个环境变量的地方：`文件:行 这一行`。
+    env_reads: Vec<String>,
+    /// 够到支撑 crate 的调用点（含 `use`），判据人口的下限靠它。
+    support_callsites: usize,
 }
 
 /// 这个文件里有哪些函数自己在往下走目录：函数体里同时出现 `read_dir` 与它自己的名字。
@@ -312,6 +325,8 @@ fn imported_names(text: &str) -> Vec<String> {
 fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     let mut copies = Vec::new();
     let mut recursions = Vec::new();
+    let mut env_reads: Vec<String> = Vec::new();
+    let mut support_callsites = 0usize;
     let mut files = 0usize;
     let (mut readers, mut walkers, mut strippers) = (0usize, 0usize, 0usize);
     // 函数体 → 出现它的「文件:行 名字」。按体分组，所以同一个体换了名字也照样并到一起。
@@ -363,6 +378,28 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
             for (function, line, body) in free_function_bodies(&text) {
                 fixture_bodies.push((format!("{name}:{line} {function}"), body));
             }
+        }
+        // 支撑 crate 负责的那两个名字：别处直接读它就是要红的那一处。这一面按**读的
+        // 形状**判（`env::var("名字")`），不按名字出现在哪一行判——`expect` 的消息里
+        // 写着同一个名字是在告诉人怎么设它，不是第二处在读。
+        if name != SUPPORT_HOME {
+            for (index, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if SUPPORT_ENV_NAMES
+                    .iter()
+                    .any(|var| line.contains(&format!("env::var(\"{var}\")")))
+                {
+                    env_reads.push(format!("{name}:{} {}", index + 1, line.trim()));
+                }
+            }
+        }
+        for form in [
+            "cog_test_support::database_url",
+            "cog_test_support::redis_url",
+        ] {
+            support_callsites += text.matches(form).count();
         }
         let imported = imported_names(&text);
         if name != THE_ONE {
@@ -417,6 +454,8 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         strippers,
         duplicate_bodies,
         support_copies,
+        env_reads,
+        support_callsites,
     }
 }
 
@@ -536,6 +575,21 @@ fn the_fixture_reading_steps_are_written_once() {
     );
     // 反过来问：支撑 crate 真的还定义着那个入口吗。它空了、或者被删成一个转发壳，
     // 上面那条就永远绿——判据只是证明了「别处没有」，没证明「这里有」。
+    // 同一条规则的另一种形状：不写成函数、直接内联在用例里。按函数体判的那一面看不
+    // 见它，而它恰恰是最容易长回来的那种——写的人不觉得自己在「定义一份夹具」。
+    assert!(
+        found.env_reads.is_empty(),
+        "这些地方绕开了支撑 crate，直接读它负责的环境变量：{:?}\n\
+         改成 `use cog_test_support::…`：第二处读同一个名字的时候，改了支撑 crate 里的\
+         写法不会红，两边只是各读各的。",
+        found.env_reads
+    );
+    assert!(
+        found.support_callsites >= MIN_SUPPORT_CALLSITES,
+        "只有 {} 处够到 `cog_test_support`（下限 {MIN_SUPPORT_CALLSITES}）：那么「夹具里\
+         不许再写一遍」那几条读的是一个没人用的 crate，绿得没有题目",
+        found.support_callsites
+    );
     let support = std::fs::read_to_string(root.join(SUPPORT_HOME)).expect("支撑 crate 读得到");
     let missing: Vec<&str> = SUPPORT_ENTRY_POINTS
         .iter()

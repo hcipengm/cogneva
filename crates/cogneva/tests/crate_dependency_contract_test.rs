@@ -117,6 +117,7 @@ const ALLOWED_DEV: &[Row] = &[
     ("cog-memory", "cog-test-support", ""),
     ("cog-observability", "cog-test-support", ""),
     ("cog-orchestrator", "cog-storage", ""),
+    ("cog-redis", "cog-test-support", ""),
     ("cog-reflection", "cog-prompt", ""),
     ("cog-reflection", "cog-storage", ""),
     ("cog-storage", "cog-test-support", ""),

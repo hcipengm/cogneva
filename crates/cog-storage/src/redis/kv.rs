@@ -307,8 +307,7 @@ mod tests {
     /// reachable redis the same construction reads back what it wrote.
     #[tokio::test]
     async fn a_reachable_store_gives_a_working_face() {
-        let url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let url = cog_test_support::redis_url();
         let store =
             RedisKeyValueStore::on_demand_with_budget(&url, budget()).expect("a well-formed url");
         let key = "cog-storage:kv:on-demand";

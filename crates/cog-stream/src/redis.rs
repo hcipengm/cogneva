@@ -850,8 +850,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_redis_publish_and_subscribe() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let backend = match RedisMessageBackend::new(&redis_url).await {
             Ok(b) => b,
             Err(_) => {
@@ -888,8 +887,7 @@ mod tests {
         // Regression: ack was an inherent method while the trait supplied a
         // no-op default, so calls through `dyn MessageBackend` compiled fine
         // but never issued XACK — pending messages were redelivered forever.
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -966,8 +964,7 @@ mod tests {
     /// 没有 maxmemory 来兜底。队列长度要表示「还没做完的活」，就得有人把做完的删掉。
     #[tokio::test]
     async fn acked_entries_leave_the_stream() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1016,8 +1013,7 @@ mod tests {
     /// 没有内容可读了。
     #[tokio::test]
     async fn an_unacked_entry_keeps_the_newer_acked_ones() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1074,8 +1070,7 @@ mod tests {
     /// （`>` 只投递最后投递号之后的条目）。
     #[tokio::test]
     async fn a_group_that_has_not_read_keeps_the_history_alive() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1146,8 +1141,7 @@ mod tests {
         // The count alone cannot tell a message being processed from one a dead
         // consumer left behind; only the idle threshold can, so the reading is
         // asserted against two thresholds over the same PEL.
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1236,8 +1230,7 @@ mod tests {
         // Regression: subscriptions shared one multiplexed connection, and a
         // blocked XREADGROUP on an empty stream stalled every other consumer
         // on the same connection until its block expired.
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1317,8 +1310,7 @@ mod tests {
     /// this crate sees in the field.
     #[tokio::test]
     async fn a_live_refusal_is_filed_by_the_servers_own_error_code() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1441,8 +1433,7 @@ mod tests {
     /// its stream key is exactly the shape a redis restart leaves behind.
     #[tokio::test]
     async fn a_group_lost_with_its_stream_is_put_back_by_the_recovery() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1525,8 +1516,7 @@ mod tests {
     /// never recovers delivers none of them.
     #[tokio::test]
     async fn a_live_loop_recovers_the_group_it_lost() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1595,8 +1585,7 @@ mod tests {
     /// surviving loop keeps counting after its sibling is dropped.
     #[tokio::test]
     async fn two_live_loops_on_one_name_are_counted_together_and_outlive_each_other() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1684,8 +1673,7 @@ mod tests {
         // whose consumer group simply had not been created yet. A group that
         // does not exist holds nothing pending; that is Ok(None), not a
         // backend fault.
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1732,8 +1720,7 @@ mod tests {
     /// 队伍里就不是丢了，重投一份只是把队伍再加长一格。
     #[tokio::test]
     async fn stream_lag_counts_what_the_group_has_not_been_handed() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1812,8 +1799,7 @@ mod tests {
     /// 组不存在时没有「还欠多少条」可报：那是这个后端答不出，不是零。
     #[tokio::test]
     async fn stream_lag_without_a_group_is_not_a_reading() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
         let mut raw = match raw_client.get_multiplexed_async_connection().await {
             Ok(c) => c,
@@ -1855,8 +1841,7 @@ mod tests {
     /// stream keep pending ids that point at nothing.
     #[tokio::test]
     async fn a_deleted_stream_takes_its_entries_and_groups_with_it() {
-        let redis_url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let redis_url = cog_test_support::redis_url();
         let backend = match RedisMessageBackend::new(&redis_url).await {
             Ok(b) => b,
             Err(_) => {

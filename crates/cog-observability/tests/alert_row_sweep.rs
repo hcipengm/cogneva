@@ -56,10 +56,7 @@ async fn state_of(pool: &PgPool, dedup_key: &str) -> String {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_row_no_live_pass_refreshes_is_closed_and_a_fresh_one_is_not() {
-    let url = std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running this test with --ignored",
-    );
+    let url = cog_test_support::database_url();
     let pool = PgPool::connect(&url)
         .await
         .expect("database must be reachable");

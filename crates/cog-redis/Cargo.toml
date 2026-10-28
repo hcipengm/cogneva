@@ -12,4 +12,5 @@ redis = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+cog-test-support = { path = "../cog-test-support" }
 tokio = { workspace = true }

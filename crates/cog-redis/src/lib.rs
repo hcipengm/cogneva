@@ -479,8 +479,7 @@ mod tests {
     /// that answers, so the bound did not buy itself correctness.
     #[tokio::test]
     async fn a_reachable_redis_gives_a_working_connection() {
-        let url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let url = cog_test_support::redis_url();
         let client = redis::Client::open(url).expect("a well-formed url");
         let Ok(mut connection) = connect_with(&client, budget()).await else {
             eprintln!("SKIP: no redis reachable for the happy path");
@@ -577,8 +576,7 @@ mod tests {
     /// rather than reopened.
     #[tokio::test]
     async fn a_channel_reaches_redis_once_the_peer_answers() {
-        let url = std::env::var("COGNEVA_TEST_REDIS_URL")
-            .unwrap_or_else(|_| "redis://127.0.0.1:6379".into());
+        let url = cog_test_support::redis_url();
         let client = redis::Client::open(url).expect("a well-formed url");
         let upstream = match client.get_connection_info().addr {
             redis::ConnectionAddr::Tcp(ref host, port) => format!("{host}:{port}"),

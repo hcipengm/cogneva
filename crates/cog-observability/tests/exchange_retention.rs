@@ -85,10 +85,7 @@ impl Scratch {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_pass_retires_every_row_past_the_retention_and_only_those() {
-    let url = std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running this test with --ignored",
-    );
+    let url = cog_test_support::database_url();
     let pool = PgPool::connect(&url)
         .await
         .expect("database must be reachable");
@@ -165,10 +162,7 @@ async fn a_pass_retires_every_row_past_the_retention_and_only_those() {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn an_empty_archive_answers_zero_rather_than_nothing() {
-    let url = std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running this test with --ignored",
-    );
+    let url = cog_test_support::database_url();
     let pool = PgPool::connect(&url)
         .await
         .expect("database must be reachable");

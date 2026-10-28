@@ -2742,8 +2742,7 @@ mod tests {
         use sqlx::postgres::PgConnectOptions;
         use sqlx::{Connection, PgConnection, PgPool};
 
-        let url = std::env::var("COGNEVA_TEST_DATABASE_URL")
-            .expect("set COGNEVA_TEST_DATABASE_URL to a throwaway database");
+        let url = cog_test_support::database_url();
         let schema = format!("alert_adopt_{}", uuid::Uuid::new_v4().simple());
         let mut admin = PgConnection::connect(&url)
             .await
