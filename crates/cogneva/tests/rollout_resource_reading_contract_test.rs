@@ -12,15 +12,13 @@
 //! 最后一条断言的是行布局：终止消息这条窄通道上与失败落点共用，落点必须还在第一行，否则
 //! 读落点的那一端（只认第一行）会把读数当成一段陌生文本，那一轮失败从此判不出坏在哪一处。
 
-use std::path::PathBuf;
+mod common;
+
+use common::routes::repo_root;
 
 const DEPLOYER: &str = "crates/cog-reflection/src/mainline_deployer.rs";
 const ROLLOUT: &str = "crates/cog-reflection/src/mainline_rollout.rs";
 const READING: &str = "crates/cog-reflection/src/rollout_resources.rs";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);

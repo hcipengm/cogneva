@@ -14,15 +14,11 @@
 //! The predicate is the root string, in the production half of every crate. The
 //! one file allowed to contain it is the declaration itself.
 
-use std::path::PathBuf;
-
 mod common;
 
-use common::rust_production::{production_sources, production_text};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_sources, production_text};
 
 /// The declaration file: the only place the root may be written.
 const DECLARATION: &str = "crates/cog-core/src/paths.rs";

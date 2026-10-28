@@ -47,16 +47,13 @@
 //! principle: feedback_a_change_lands_only_if_it_reaches_a_build_target
 //! principle: feedback_a_gate_that_forbids_a_shape_must_judge_what_the_repository_carries
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// The workspace root, derived from this crate's own manifest so the test does not
-/// depend on the working directory it is run from.
-fn workspace_root() -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    std::fs::canonicalize(&root).unwrap_or(root)
-}
 
 /// The workspace members under `crates/`, each with the source files cargo is told to
 /// start compiling it from.
@@ -68,7 +65,7 @@ fn workspace_root() -> PathBuf {
 /// because that is the universe this gate is about — a target compiled from outside
 /// `src/` has no `src/`-relative module tree to check.
 fn member_roots() -> BTreeMap<PathBuf, BTreeSet<PathBuf>> {
-    let root = workspace_root();
+    let root = repo_root();
     let manifest = root.join("Cargo.toml");
     let out = Command::new(env!("CARGO"))
         .args([
@@ -151,7 +148,7 @@ fn member_roots() -> BTreeMap<PathBuf, BTreeSet<PathBuf>> {
 /// what the repository carries, and an untracked file is a probe or a scratch file that
 /// has not landed. See the module header for the shape this is protecting.
 fn carried_sources() -> BTreeSet<PathBuf> {
-    let root = workspace_root();
+    let root = repo_root();
     let out = Command::new("git")
         .arg("-C")
         .arg(&root)
@@ -417,7 +414,7 @@ fn reachable(roots: &BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
 
 /// A path as the report spells it: relative to the repository root, with `/`.
 fn repo_relative(path: &Path) -> String {
-    let root = workspace_root();
+    let root = repo_root();
     path.strip_prefix(&root)
         .unwrap_or(path)
         .to_string_lossy()

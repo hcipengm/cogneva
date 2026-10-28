@@ -21,17 +21,15 @@
 //! 默认值也在这里判：`wipLimits: ""` 就是「没配」。写成一个具体数等于替所有人选
 //! 了一条准入闸门，而这条闸门会真的拦住派发。
 
-use std::path::PathBuf;
+mod common;
+
+use common::routes::repo_root;
 
 const CHART_CONFIGMAP: &str = "deploy/helm/cogneva/templates/configmap.yaml";
 const VALUES_YAML: &str = "deploy/helm/cogneva/values.yaml";
 const K3S_CONFIGMAP: &str = "deploy/k3s/configmap.yaml";
 const VALUES_BLOCK: &str = "board:";
 const VALUES_KEY: &str = "wipLimits:";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);

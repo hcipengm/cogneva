@@ -41,12 +41,12 @@
 //!   Nothing in the tree does that, and the scan would not follow it — the
 //!   direction that goes quiet, not the direction that reddens.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 /// Documents that own browser storage. `web/src` is walked; the other two are
 /// read whole, because each is a single document that cannot import anything.

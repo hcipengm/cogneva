@@ -51,11 +51,9 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::{production_sources, production_text, sources_of_tree};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_sources, production_text, sources_of_tree};
 
 struct WireEnum {
     file: &'static str,

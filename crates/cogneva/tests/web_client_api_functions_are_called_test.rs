@@ -42,6 +42,10 @@
 //! 本门红并点名它；把调用方写成从别的模块 import 同名函数，本门仍旧红——证明
 //! 判据认的是 import 的模块，不是出现过这个词。
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -50,10 +54,6 @@ const CLIENT: &str = "web/src/api/client.ts";
 
 /// The directory whose files count as callers.
 const WEB: &str = "web/src";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))

@@ -33,11 +33,9 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::rust_production::{production_sources, relative_name};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_sources, relative_name};
 
 /// Labels the scrape surface attaches, keyed to the reason this tree does not
 /// write them.

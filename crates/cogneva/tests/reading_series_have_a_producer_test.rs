@@ -20,11 +20,11 @@
 //! pinned image (the commands are in its header) and carries the tag it was
 //! measured on.
 
-use std::path::{Path, PathBuf};
+mod common;
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::routes::repo_root;
+
+use std::path::{Path, PathBuf};
 
 /// What the pinned exporter image actually does, measured rather than assumed.
 struct Inventory {

@@ -34,15 +34,13 @@
 //! 只能跨三个二进制各写一次，见 [`BUILD_TIME`]。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
 
-use common::rust_production::{production_lines, production_sources, relative_name};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// Names this tree does not own, so it does not get to declare them either.
 const FOREIGN: &[(&str, &str)] = &[

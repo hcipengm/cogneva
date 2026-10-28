@@ -28,8 +28,12 @@
 //! state terminal is a real answer only when the reason says why nothing has to
 //! return to it; that is what the prose in the tables is for.
 
+mod common;
+
+use common::routes::repo_root;
+
 use cog_core::TaskStatus;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A state that nothing has to revisit, with why it is an end.
 const TERMINAL: &[(TaskStatus, &str)] = &[
@@ -104,14 +108,6 @@ const REVISITED: &[Revisited] = &[
     },
 ];
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives at <root>/crates/cogneva")
-        .to_path_buf()
-}
-
 /// Everything up to the first test-only item: a call inside a test module is not
 /// production reachability.
 fn production_source(text: &str) -> &str {
@@ -168,7 +164,7 @@ fn the_scan_reads_what_it_claims_to() {
         "find_ready_tasks"
     ));
 
-    let root = workspace_root();
+    let root = repo_root();
     for row in REVISITED {
         let def = source_at(&root, row.defined_in);
         assert!(
@@ -200,7 +196,7 @@ fn the_scan_reads_what_it_claims_to() {
 /// would certify a reviser that cannot terminate the rows it is credited with.
 #[test]
 fn pending_rows_a_settled_predecessor_can_never_release_have_an_owner() {
-    let root = workspace_root();
+    let root = repo_root();
     let definitions = source_at(
         &root,
         "crates/cog-orchestrator/src/dag_executor/orchestrator.rs",

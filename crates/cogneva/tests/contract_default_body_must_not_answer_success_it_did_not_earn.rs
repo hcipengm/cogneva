@@ -34,11 +34,13 @@
 //!
 //! principle: feedback_a_trait_default_body_is_where_a_missing_capability_hides_as_success
 
-use std::path::Path;
+mod common;
+
+use common::routes::repo_root;
 
 /// The trait, and the file that declares it, named relative to this crate's
 /// manifest.
-const TRAIT_FILE: &str = "../cog-core/src/contract/stream.rs";
+const TRAIT_FILE: &str = "crates/cog-core/src/contract/stream.rs";
 const TRAIT_DECL: &str = "pub trait MessageBackend";
 
 /// The capabilities the design names for this trait. A floor rather than a
@@ -67,7 +69,7 @@ struct Method {
 }
 
 fn source() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(TRAIT_FILE);
+    let path = repo_root().join(TRAIT_FILE);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
 }

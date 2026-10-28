@@ -20,6 +20,10 @@
 //! names. A variant added to the enum without a specimen fails the census
 //! below; a name the read table lacks fails the round trip.
 
+mod common;
+
+use common::routes::repo_root;
+
 use cog_agent::{AgentRuntime, AgentWal};
 use cog_core::{
     AgentEvent, AssistantMessageEvent, ErrorSeverity, Message, RuntimeConfig, ToolCall,
@@ -27,12 +31,7 @@ use cog_core::{
 use cog_storage::wal::MemoryWalBackend;
 use serde_json::json;
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::Arc;
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 /// The variant names the enum itself declares, read from the source text.
 ///

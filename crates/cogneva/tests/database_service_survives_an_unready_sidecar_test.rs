@@ -25,7 +25,9 @@
 //! reaches the render is a different way to have the same outage. The template
 //! is read too, because a re-render must not drop the field back out.
 
-use std::path::{Path, PathBuf};
+mod common;
+
+use common::routes::repo_root;
 
 /// Every carrier of the database Service: the chart template that is the
 /// authority, the static copy the in-cluster puller applies, and the three
@@ -37,13 +39,6 @@ const CARRIERS: &[&str] = &[
     "deploy/rendered/k3s-multi/30-service-postgres.yaml",
     "deploy/rendered/k8s-standard/30-service-postgres.yaml",
 ];
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("workspace root")
-}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);

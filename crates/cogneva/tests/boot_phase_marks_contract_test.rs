@@ -16,15 +16,12 @@
 //! 一条报 `reranker` 没有任何调用点；改回来即绿。
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 mod common;
 
-use common::rust_production::{production_lines, production_sources, relative_name};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// The call the marks are made with, as it appears in the source.
 const CALL: &str = "boot_footprint::mark(";

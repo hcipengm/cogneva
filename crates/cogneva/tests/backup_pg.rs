@@ -21,6 +21,10 @@
 //! package its neighbour's probe tables and then find some of them gone. The
 //! failure lands in the fixture, never in the code under test.
 
+mod common;
+
+use common::routes::repo_root;
+
 use sqlx::PgPool;
 
 use cogneva::backup::{backup_postgres, claim_drill_lock, discover_tables, restore_postgres};
@@ -502,8 +506,7 @@ async fn pg_restore_loads_a_package_written_before_the_schema_moved_on() {
 
     // 目标库必须是**这个镜像**自己的结构，而不是备份那一刻的结构：恢复只做
     // TRUNCATE + COPY，空库的形状先由迁移与各 store 的 DDL 立出来。
-    let migrations =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cog-storage/migrations");
+    let migrations = repo_root().join("crates/cog-storage/migrations");
     cog_storage::migrate::Migrator::new(&migrations)
         .run(&url)
         .await
@@ -555,8 +558,7 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
     use cog_storage::PostgresBackupRunStore;
 
     let (_probe, url) = own_database("drill").await;
-    let migrations =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../cog-storage/migrations");
+    let migrations = repo_root().join("crates/cog-storage/migrations");
     cog_storage::migrate::Migrator::new(&migrations)
         .run(&url)
         .await

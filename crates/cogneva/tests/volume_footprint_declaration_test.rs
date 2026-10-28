@@ -41,8 +41,11 @@
 //! volume that cannot fill up. The claim also may not be walked *twice*, which
 //! would publish two different byte counts under one claim name.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -54,10 +57,6 @@ use serde::Deserialize;
 /// a copy of it -- a tree missing from one reader's copy is a reader that
 /// judges a set which no longer ships, and a walk over a smaller set passes.
 use cog_reflection::DELIVERABLE_MANIFEST_TREES as DELIVERED;
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 /// Workloads whose process measures the volumes it declares, and the evidence.
 ///

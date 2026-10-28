@@ -49,11 +49,7 @@
 
 mod common;
 
-use std::path::PathBuf;
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::routes::repo_root;
 
 /// The quoted words inside the first `[...]` that follows `start`.
 fn array_words(source: &str, start: &str) -> Vec<String> {

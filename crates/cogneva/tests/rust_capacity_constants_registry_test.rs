@@ -50,6 +50,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::routes::repo_root;
+
 use common::rust_production::{all_crate_files, crate_files_of};
 
 /// Where the registry lives, relative to the workspace root.
@@ -74,16 +76,6 @@ struct Row {
     value: String,
     source: String,
     note: String,
-}
-
-fn workspace_root() -> PathBuf {
-    // The test binary runs from the workspace root under `cargo test`; walking
-    // up from the manifest is what makes it work from a subdirectory too.
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/cogneva sits two levels below the workspace root")
-        .to_path_buf()
 }
 
 /// Every `const NAME: <numeric type> = <initializer starting with a digit>;`.
@@ -370,7 +362,7 @@ fn write_registry(root: &Path, scanned: &[Row], existing: &[Row]) {
 #[allow(clippy::absurd_extreme_comparisons)]
 #[test]
 fn every_capacity_number_in_rust_says_where_it_comes_from() {
-    let root = workspace_root();
+    let root = repo_root();
     let scanned = scan(&root, &all_crate_files(&root));
     let existing = read_registry(&root);
     if std::env::var("COGNEVA_CAPACITY_REGISTRY_WRITE").as_deref() == Ok("1") {
@@ -454,7 +446,7 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
 /// pay.
 #[test]
 fn the_scan_sees_production_constants_and_not_fixtures() {
-    let root = workspace_root();
+    let root = repo_root();
     let scanned = scan(&root, &all_crate_files(&root));
     assert!(
         scanned.len() > 100,
@@ -920,7 +912,7 @@ fn write_bare_literals(root: &Path, scanned: &BTreeMap<(String, String), usize>)
 #[allow(clippy::absurd_extreme_comparisons)]
 #[test]
 fn a_number_at_the_point_of_use_is_counted_where_it_is_used() {
-    let root = workspace_root();
+    let root = repo_root();
     let scanned = scan_bare_literals(&root, &all_crate_files(&root));
     let existing = read_bare_literals(&root);
     if std::env::var("COGNEVA_BARE_LITERAL_REGISTRY_WRITE").as_deref() == Ok("1") {

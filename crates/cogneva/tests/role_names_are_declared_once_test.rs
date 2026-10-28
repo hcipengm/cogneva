@@ -17,15 +17,13 @@
 //! renames something.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
 
-use common::rust_production::{production_lines, production_sources};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_lines, production_sources};
 
 /// Where the names are declared, relative to the repository root.
 const HOME: &str = "crates/cog-core/src/roles.rs";

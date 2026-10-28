@@ -15,11 +15,12 @@
 //! checked, so a second declaration cannot pass by agreeing with the first
 //! while disagreeing with the expression that consumes it.
 
-use std::path::PathBuf;
+mod common;
+
+use common::routes::repo_root;
 
 fn rules_document() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../deploy/helm/cogneva/files/cogneva.json");
+    let path = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 

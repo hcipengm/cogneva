@@ -25,15 +25,11 @@
 //!
 //! Test modules are not scanned: a fixture may name whatever it likes.
 
-use std::path::PathBuf;
-
 mod common;
 
-use common::rust_production::{production_sources, production_text};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_sources, production_text};
 
 /// The namespace the chart declares. Read, not written down here — that is the
 /// whole point of the gate.

@@ -14,6 +14,8 @@
 
 use std::collections::BTreeSet;
 
+pub use crate::common::routes::repo_root;
+
 use crate::promql::metric_names_in;
 
 /// The chart-rendered Grafana manifest. The copy under `deploy/k3s/observability/`
@@ -140,10 +142,6 @@ pub fn text() -> String {
     let path = repo_root().join(DASHBOARD);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("dashboard manifest unreadable at {}: {e}", path.display()))
-}
-
-pub fn repo_root() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 #[cfg(test)]

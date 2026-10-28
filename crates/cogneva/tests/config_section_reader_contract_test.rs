@@ -35,12 +35,12 @@
 //! joined to the pointer's spelling in the source, so "a key no type has a
 //! field for" stays a finding rather than becoming an allowance.
 
-use serde_json::{Map, Value};
-use std::path::{Path, PathBuf};
+mod common;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::routes::repo_root;
+
+use serde_json::{Map, Value};
+use std::path::Path;
 
 /// One section's reader: the type that decides what the section may contain,
 /// and where the code spells the section out.

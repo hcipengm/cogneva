@@ -20,9 +20,9 @@
 //! none in the process that does not. A test that only says "the function
 //! exists" would have passed throughout the window in which it was never called.
 
-use std::path::PathBuf;
-
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::production_text;
 
@@ -45,10 +45,6 @@ const LOOPS: &[(&str, &str)] = &[
         "reads the mounted deploy key and writes the newly registered public key into the out-of-band slice",
     ),
 ];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn production(relative: &str) -> String {
     let path = repo_root().join(relative);

@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 
 #[path = "common/closed_set.rs"]
 mod closed_set;
+mod common;
 #[path = "common/derivation.rs"]
 mod derivation;
 #[path = "common/producer.rs"]

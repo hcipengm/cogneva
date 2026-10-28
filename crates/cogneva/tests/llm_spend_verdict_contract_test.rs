@@ -32,18 +32,17 @@
 //! actor-label census: the text bounds the vocabulary, the runtime reading
 //! shows the omissions.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 use cog_gateway::actor_labels::{ACTOR_LABELS, ACTOR_LABEL_PREFIXES, UNKNOWN_ACTOR};
 use cog_observability::spend_verdict::{
     skip_stage_is_declared, skip_stage_is_read, REGISTERED_SITES, UNREAD_SKIP_STAGES,
     UNREGISTERED_SITES,
 };
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 /// The two entry points a skipping call site goes through, and which argument
 /// of the call is the stage.

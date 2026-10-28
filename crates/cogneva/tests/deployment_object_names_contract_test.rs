@@ -31,11 +31,9 @@ use std::path::PathBuf;
 
 mod common;
 
-use common::rust_production::{production_sources, production_text};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_sources, production_text};
 
 /// The one place an object's name may be written.
 const DECLARATION: &str = "crates/cog-core/src/topology.rs";

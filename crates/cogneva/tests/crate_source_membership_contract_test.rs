@@ -18,14 +18,9 @@ use std::process::Command;
 
 mod common;
 
-use common::rust_production::all_crate_files;
+use common::routes::repo_root;
 
-/// The repository root, derived from this crate's own manifest so the test does
-/// not depend on the working directory it is run from.
-fn workspace_root() -> PathBuf {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    std::fs::canonicalize(&root).unwrap_or(root)
-}
+use common::rust_production::all_crate_files;
 
 /// The directories `cargo metadata` resolves as workspace members.
 ///
@@ -34,7 +29,7 @@ fn workspace_root() -> PathBuf {
 /// all live outside the `members` array a text scan would look at — and the
 /// question here is about the build, not about a table.
 fn member_roots() -> BTreeSet<PathBuf> {
-    let manifest = workspace_root().join("Cargo.toml");
+    let manifest = repo_root().join("Cargo.toml");
     let out = Command::new(env!("CARGO"))
         .args([
             "metadata",
@@ -79,7 +74,7 @@ fn member_roots() -> BTreeSet<PathBuf> {
 /// Every `.rs` under `crates/`, as a repo-relative path.
 /// The crate root a source file under `crates/<dir>/...` belongs to.
 fn crate_root_of(path: &Path) -> Option<PathBuf> {
-    let root = workspace_root();
+    let root = repo_root();
     let rel = path.strip_prefix(&root).ok()?;
     let mut parts = rel.components();
     let crates_dir = parts.next()?;
@@ -108,7 +103,7 @@ fn every_rust_source_under_crates_is_compiled_by_a_workspace_member() {
          source to be checked against and this gate would pass on nothing"
     );
 
-    let sources = all_crate_files(&workspace_root());
+    let sources = all_crate_files(&repo_root());
     // Every crate member under `crates/` is a directory with at least one source
     // file, so a walk that is working finds at least as many sources as there are
     // such members. A walk that silently stopped early, or a manifest that moved
@@ -116,7 +111,7 @@ fn every_rust_source_under_crates_is_compiled_by_a_workspace_member() {
     // leaving a bare "more than zero" check green.
     let crate_roots = roots
         .iter()
-        .filter(|root| root.starts_with(workspace_root().join("crates")))
+        .filter(|root| root.starts_with(repo_root().join("crates")))
         .count();
     assert!(
         sources.len() >= crate_roots,

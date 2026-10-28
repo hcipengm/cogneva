@@ -19,6 +19,10 @@
 //! 归置函数算出交付面，再与 Role 比对。所以 [`cog_reflection::classify_doc`] 是
 //! 公开的，本文件用它而不是自己复制一份 kind 表。
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -34,10 +38,6 @@ const RBAC_FILE: &str = "12-stack-convergence-rbac.yaml";
 const K3S_CONFIGMAP: &str = "deploy/k3s/evolution-configmap.yaml";
 const VALUES_YAML: &str = "deploy/helm/cogneva/values.yaml";
 const PLUGIN_RS: &str = "crates/cog-reflection/src/plugin.rs";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);

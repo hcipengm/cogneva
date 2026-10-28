@@ -11,11 +11,9 @@
 //! reaches the alert row. A check missing any of them reports nothing while
 //! looking installed.
 
-use std::path::PathBuf;
+mod common;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::routes::repo_root;
 
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);

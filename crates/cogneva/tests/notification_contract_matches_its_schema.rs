@@ -18,8 +18,12 @@
 //! so does a gap that quietly closes while this list still names it. The list is
 //! empty, which is a reading too: it says the two sides agree today.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::Utc;
 
@@ -37,8 +41,7 @@ const COLUMNS_THE_CONTRACT_CANNOT_SUPPLY: &[&str] = &[];
 /// The migration that creates the table, found by name rather than by number so
 /// a renumbering does not turn this into a test about a missing file.
 fn notification_migration() -> PathBuf {
-    let dir =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates/cog-storage/migrations/postgres");
+    let dir = repo_root().join("crates/cog-storage/migrations/postgres");
     let mut found: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("migration directory {} is unreadable: {e}", dir.display()))
         .filter_map(|entry| entry.ok().map(|e| e.path()))

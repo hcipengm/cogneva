@@ -22,20 +22,15 @@
 //! failure, not a skip -- a check that cannot run must not report "nothing to
 //! see".
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use cog_reflection::workload_kind;
 use serde::Deserialize;
-
-/// `crates/cogneva/tests/<file>` -> the workspace root.
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crates/cogneva has a grandparent")
-        .to_path_buf()
-}
 
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);

@@ -21,6 +21,10 @@
 //!   single-node projection, so the applied copy and the rendered copy are the
 //!   same derivation rather than two that happen to agree today.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -44,10 +48,6 @@ const QUOTA_KEYS: [&str; 6] = [
 ];
 
 const LIMIT_RANGE_KEYS: [&str; 3] = ["maxCpu", "maxMemory", "pvcMaxStorage"];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))

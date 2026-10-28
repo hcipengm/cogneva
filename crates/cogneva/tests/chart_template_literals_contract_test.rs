@@ -36,8 +36,12 @@
 //! range (`8080-8081`). The register carries the judgement; the census only
 //! insists that every number reaches it.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The directory whose files the census reads.
 const TEMPLATES: &str = "deploy/helm/cogneva/templates";
@@ -92,10 +96,6 @@ struct Row {
     sites: usize,
     kind: Kind,
     why: String,
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn read(path: &Path) -> String {

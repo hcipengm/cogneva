@@ -25,17 +25,15 @@
 //! counter shows the omissions.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::all_crate_files;
 
 use cog_gateway::actor_labels::{declared, ACTOR_LABELS, ACTOR_LABEL_PREFIXES, UNKNOWN_ACTOR};
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 /// Files that write the actor header, and the actor each reports under. Kept as
 /// an inventory rather than derived, so that adding a call site is a decision

@@ -35,8 +35,11 @@
 //! Unclassified fails. The failure mode here is silence, and silence is what a
 //! forgotten classification looks like.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 
@@ -87,10 +90,6 @@ const CONSUMERS: &[(&str, &[&str])] = &[
 /// deliberate rather than a gap. Keyed by producer because the same name can be
 /// scraped on one face and unreadable on another.
 const UNREAD: &[(&str, &str, &str)] = &[];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);

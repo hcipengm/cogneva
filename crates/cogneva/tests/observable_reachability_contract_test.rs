@@ -23,9 +23,9 @@
 //! call and not its reachability -- a publish inside a helper called from
 //! `start()` is beyond it.
 
-use std::path::{Path, PathBuf};
-
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::{all_crate_files, relative_name};
 
@@ -100,17 +100,9 @@ fn method_bodies(text: &str, name: &str) -> Vec<String> {
     out
 }
 
-fn workspace_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/cogneva sits two levels under the workspace root")
-        .to_path_buf()
-}
-
 #[test]
 fn no_observable_is_published_from_a_plugin_start() {
-    let root = workspace_root();
+    let root = repo_root();
     let files = all_crate_files(&root);
 
     let mut starts = 0usize;
@@ -164,7 +156,7 @@ fn no_observable_is_published_from_a_plugin_start() {
 /// deliberately, instead of silently turning the rule above into lore.
 #[test]
 fn the_observable_snapshot_is_taken_during_init_not_start() {
-    let path = workspace_root().join("crates/cog-gateway/src/plugin.rs");
+    let path = repo_root().join("crates/cog-gateway/src/plugin.rs");
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let consume = "consume_all_services::<dyn cog_core::Observable>";

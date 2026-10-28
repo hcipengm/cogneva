@@ -30,6 +30,10 @@
 //! Anything unclassified fails, because the failure mode here is silence, and
 //! silence is what a forgotten classification looks like.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -1767,10 +1771,6 @@ fn pending_complaints(
         }
     }
     out
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn read(rel: &str) -> String {

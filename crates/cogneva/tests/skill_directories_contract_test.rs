@@ -17,11 +17,11 @@
 //! process's home — the last for the out-of-container case, where the binary
 //! runs from a checkout and nothing is mounted at all.
 
-use std::path::{Path, PathBuf};
+mod common;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::routes::repo_root;
+
+use std::path::{Path, PathBuf};
 
 /// The profiles the tree renders, taken from the tree.
 ///

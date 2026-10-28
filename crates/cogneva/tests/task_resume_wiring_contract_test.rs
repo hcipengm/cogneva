@@ -18,7 +18,9 @@
 //! comparison rather than a text match, because that agreement is the one thing
 //! a rename in either crate would silently break.
 
-use std::path::PathBuf;
+mod common;
+
+use common::routes::repo_root;
 
 const SQUAD_EXECUTOR: &str = "crates/cog-collaboration/src/squad/executor.rs";
 const RESUME_CONSUMER: &str = "crates/cog-collaboration/src/resume.rs";
@@ -29,10 +31,6 @@ const PRODUCER_READING: &str = "crates/cog-orchestrator/src/dag_executor/orchest
 const PRODUCER_LOOP_FILE: &str = "crates/cog-orchestrator/src/plugin.rs";
 const AGENT_MANAGER: &str = "crates/cog-agent/src/runtime/manager.rs";
 const ID_VOCABULARY: &str = "crates/cog-core/src/types/agent_state.rs";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);

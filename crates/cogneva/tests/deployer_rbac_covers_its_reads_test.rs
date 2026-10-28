@@ -43,9 +43,11 @@
 //! arrive unnoticed.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::{production_sources, production_text, relative_name};
 
@@ -97,10 +99,6 @@ const OTHER_PRINCIPALS: &[(&str, &str)] = &[
          which is its only production caller today)",
     ),
 ];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);

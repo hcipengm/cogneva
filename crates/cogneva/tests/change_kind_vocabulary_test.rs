@@ -30,15 +30,18 @@
 //! private repository that feeds the account. That gap is named on the file
 //! itself rather than papered over.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 use cog_orchestrator::change_measure::{
     ABSENCE_KINDS, EXISTS_KIND, GONE_KIND, GREP_KIND, JUDGEABLE_KINDS, RETIRED_KINDS,
 };
 
 /// The vocabulary's written-down form, relative to this crate.
-const VOCABULARY_FILE: &str = "contracts/change-kinds.tsv";
+const VOCABULARY_FILE: &str = "crates/cogneva/contracts/change-kinds.tsv";
 
 /// Direction: the check demands the artifact be there.
 const PRESENT: &str = "present";
@@ -57,7 +60,7 @@ struct Row {
 }
 
 fn vocabulary_text() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(VOCABULARY_FILE);
+    let path = repo_root().join(VOCABULARY_FILE);
     std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "the kind vocabulary is missing at {}: {e}. It is the one written-down \

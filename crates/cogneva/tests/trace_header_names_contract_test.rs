@@ -12,15 +12,11 @@
 //! 反证：声明之前，这道门在 `cog-gateway/src/lib.rs` 报 7 行、在
 //! `cog-observability/src/traces.rs` 报 3 行——那 10 行正是当时树上各自写了一遍的头名。
 
-use std::path::PathBuf;
-
 mod common;
 
-use common::rust_production::{production_lines, production_sources};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_lines, production_sources};
 
 /// The one file allowed to spell the header names.
 const DECLARATION: &str = "crates/cog-core/src/contract/observability.rs";

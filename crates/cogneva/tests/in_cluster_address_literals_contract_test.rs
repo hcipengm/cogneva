@@ -25,9 +25,10 @@
 //! not a fact the process runs on.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::{
     brace_delta, opens_test_module, production_lines, production_sources,
@@ -53,10 +54,6 @@ const SUFFIX: &str = ".svc.cluster.local";
 struct Found {
     file: String,
     address: String,
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn read(rel: &str) -> String {

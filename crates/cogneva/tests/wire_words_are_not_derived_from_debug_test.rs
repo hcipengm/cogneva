@@ -22,15 +22,11 @@
 //! `crates/cog-gateway/src/processes.rs` 里一句改回
 //! `format!("{:?}", t.task_type).to_lowercase()`，本门红并点名该文件与该行。
 
-use std::path::PathBuf;
-
 mod common;
 
-use common::rust_production::{production_sources, production_text, relative_name};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_sources, production_text, relative_name};
 
 /// Whether the `format!` starting at `at` has `.to_lowercase()` applied to it.
 ///

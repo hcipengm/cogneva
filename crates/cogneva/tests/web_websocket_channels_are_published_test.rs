@@ -15,16 +15,16 @@
 //! 两个方向都判：订了却没人发的频道族是白等，发了却没人订的频道族是白发。
 //! 「发」只看 `event_channels`：那是唯一决定一帧落到哪条通道上的地方。
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 const PROTOCOL: &str = "crates/cog-gateway/src/websocket_protocol.rs";
 const WEB: &str = "web/src";
 const TAKEOVER: &str = "crates/cog-gateway/src/takeover.html";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))

@@ -17,6 +17,10 @@
 //! [`EXEMPT`] with the reason, so that "not checked" is a decision on the page
 //! rather than a gap.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -44,10 +48,6 @@ const EXEMPT: &[(&str, &str)] = &[(
      settings name the same address, so the release's values file is the place \
      that would have to change with it.",
 )];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);

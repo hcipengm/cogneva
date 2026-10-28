@@ -32,8 +32,11 @@
 //! made and can be reviewed. A job that is missing is a decision nobody made.
 //! Those are different failures, and only the second one is silent.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
 
 /// The workflow whose `release-tag` job declares the gating set.
 const WORKFLOW: &str = ".github/workflows/ci.yml";
@@ -146,10 +149,6 @@ const NOT_ENFORCED: &[(&str, &str)] = &[
     ),
 ];
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 /// The job names `DECLARING_JOB` needs, read from the workflow.
 ///
 /// Returns them unparsed-but-checked: callers assert on the set, and the
@@ -188,7 +187,7 @@ fn gating_jobs(workflow: &str) -> BTreeSet<String> {
 /// Missing the file is not a pass: a contract that reads nothing agrees with
 /// everything.
 fn workflow() -> String {
-    let path = workspace_root().join(WORKFLOW);
+    let path = repo_root().join(WORKFLOW);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
 }
@@ -214,7 +213,7 @@ const BASE_NAMES: &[&str] = &["origin/main", "main", "upstream/main", "local/mai
 /// Not resolving it is a failure rather than a fallback to the tree under
 /// judgment: a contract that reads nothing agrees with everything.
 fn base_workflow() -> String {
-    let root = workspace_root();
+    let root = repo_root();
     for name in BASE_NAMES {
         let out = std::process::Command::new("git")
             .current_dir(&root)

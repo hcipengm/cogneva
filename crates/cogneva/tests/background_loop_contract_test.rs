@@ -34,9 +34,9 @@
 //! Note on the literals: they are assembled at compile time, so this file never
 //! contains the text it forbids (it is itself one of the sources scanned).
 
-use std::path::{Path, PathBuf};
-
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::{relative_name, src_and_test_sources};
 
@@ -88,14 +88,6 @@ const NOT_REGISTERED: &[(&str, &str)] = &[
          a series of its own would be a second answer to that one question",
     ),
 ];
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives at <root>/crates/cogneva")
-        .to_path_buf()
-}
 
 /// Everything up to the first test-only item: fixtures are short-lived by
 /// construction, so a ticker inside one is not a loop of the process.
@@ -149,7 +141,7 @@ fn registration_name(production: &str, at: usize) -> &str {
 /// the same cadence -- only its lifetime is the test's. An example is not part
 /// of any process.
 fn scan() -> Vec<(String, String)> {
-    let root = workspace_root();
+    let root = repo_root();
     src_and_test_sources(&root)
         .into_iter()
         .filter_map(|path| {

@@ -36,9 +36,10 @@
 //! pins only that the two exist.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::all_crate_files;
 
@@ -125,13 +126,6 @@ const SERVER_CONSTRUCTORS: &[(&str, &str)] = &[
     ("crates/cog-protocol/src/mcp.rs", "capabilities_json()"),
     ("crates/cog-gateway/src/a2a.rs", "pub const ADVERTISED"),
 ];
-
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("the repository root is two levels above this crate")
-}
 
 /// Every `.rs` file under `dir`, recursively. Test helpers and build scripts are
 /// `.rs` too, and a declaration written in one of those is still a declaration.

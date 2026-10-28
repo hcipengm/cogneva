@@ -27,15 +27,12 @@
 //! 正向红；把服务端 `resource_changed` 那一臂改掉，反向红。
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 mod common;
 
-use common::rust_production::production_lines;
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::production_lines;
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);

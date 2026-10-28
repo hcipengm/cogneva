@@ -39,6 +39,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::routes::repo_root;
+
 use common::rust_production::{all_crate_files, relative_name};
 
 /// This file's own name, so the scan does not report the strings it parses
@@ -51,10 +53,6 @@ struct CodeFace {
     line: usize,
     value: String,
     shape: &'static str,
-}
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn read(rel: &str) -> String {

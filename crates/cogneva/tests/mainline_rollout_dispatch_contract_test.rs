@@ -14,17 +14,13 @@
 //! absent, the "nothing was superseded" case and the "no guard is wired" case
 //! are the same series.
 
-use std::path::PathBuf;
-
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::production_text;
 
 const DEPLOYER: &str = "crates/cog-reflection/src/mainline_deployer.rs";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(relative: &str) -> String {
     let path = repo_root().join(relative);

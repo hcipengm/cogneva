@@ -32,9 +32,10 @@
 //! over the code that calls the entry point. See [`ARCHIVE_ARMS`].
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::{production_sources, relative_name};
 
@@ -95,10 +96,6 @@ const EXTERNAL_WRITERS: &[ExternalWriter] = &[
         )],
     },
 ];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 /// Every source file that ships, as (repo-relative path, text).
 ///

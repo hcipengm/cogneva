@@ -36,9 +36,9 @@
 //! file — which is itself one of the sources scanned — never contains the text it
 //! forbids. Otherwise the gate's first finding would be itself.
 
-use std::path::{Path, PathBuf};
-
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::{relative_name, src_and_test_sources};
 
@@ -82,14 +82,6 @@ fn read_deadline_clears_the_block(source: &str) -> bool {
     source.contains(SUBSCRIBER_DEADLINE) && source.contains(SUBSCRIBER_BLOCK_BASE)
 }
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .expect("crate lives at <root>/crates/cogneva")
-        .to_path_buf()
-}
-
 /// Everything up to the first test-only item, for the rule that is about
 /// production code.
 fn production_source(text: &str) -> &str {
@@ -128,7 +120,7 @@ fn is_integration_test(relative: &str) -> bool {
 /// the same cadence -- only its lifetime is the test's. An example is not part
 /// of any process.
 fn scan() -> Vec<(String, String)> {
-    let root = workspace_root();
+    let root = repo_root();
     src_and_test_sources(&root)
         .into_iter()
         .filter_map(|path| {
@@ -202,7 +194,7 @@ fn the_read_deadline_detector_sees_the_wired_shape_and_not_a_constant() {
 
 #[test]
 fn the_subscriber_connection_bounds_a_read_by_its_own_block_period() {
-    let path = workspace_root().join(SUBSCRIBER_FILE);
+    let path = repo_root().join(SUBSCRIBER_FILE);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{SUBSCRIBER_FILE} unreadable: {e}"));
     assert!(
@@ -220,7 +212,7 @@ fn the_recorded_evidence_file_still_exists() {
     // The exemption for the unbounded constructor is narrow, and this is what
     // keeps it narrow: the file it names has to be there, and has to actually
     // contain the thing it is exempted for.
-    let path = workspace_root().join(RECORDING_FILE);
+    let path = repo_root().join(RECORDING_FILE);
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("{RECORDING_FILE} is exempted but unreadable: {e}"));
     assert!(

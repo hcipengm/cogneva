@@ -13,8 +13,11 @@
 //! 要解析到 Deployment 真挂上的那份 ConfigMap 里真定义的模块，基础档里一条探测作业
 //! 都不许有。任何一条不成立，装的这套探针在每个集群上都只是「安静」。
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use serde::Deserialize;
 
@@ -26,10 +29,6 @@ const MANIFEST_DIR: &str = "deploy/k3s/observability/manifests";
 const INSTALL_SH: &str = "deploy/k3s/observability/scripts/install.sh";
 const CLUSTER_DOMAIN: &str = ".svc.cluster.local";
 const PROMETHEUS_PATH: [&str; 3] = ["prometheus", "prometheusSpec", "additionalScrapeConfigs"];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);

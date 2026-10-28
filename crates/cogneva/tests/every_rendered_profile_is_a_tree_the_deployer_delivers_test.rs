@@ -15,12 +15,12 @@
 //! `deploy/rendered/` is a deliverable tree, and every Helm profile is one of
 //! those directories.
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+mod common;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::routes::repo_root;
+
+use std::collections::BTreeSet;
+use std::path::Path;
 
 fn entries(dir: &Path, want_dir: bool) -> BTreeSet<String> {
     std::fs::read_dir(dir)

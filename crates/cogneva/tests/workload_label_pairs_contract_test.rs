@@ -26,11 +26,9 @@ use serde::Deserialize;
 
 mod common;
 
-use common::rust_production::{production_lines, production_sources, relative_name};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// The `(name, component)` pairs the code selects a workload's pods by.
 fn declared_pairs() -> Vec<(&'static str, &'static str)> {

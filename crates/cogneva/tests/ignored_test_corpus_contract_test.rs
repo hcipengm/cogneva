@@ -32,6 +32,10 @@
 //! named by a step, or that no longer holds an ignored test, fails as well -- a
 //! list that only ever licenses is a list that stops describing the tree.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -251,16 +255,12 @@ fn ignored_steps(workflow: &str) -> Vec<Step> {
     steps
 }
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
 /// The workflow, or a failure naming why it could not be read.
 ///
 /// Missing the file is not a pass: a contract that reads nothing agrees with
 /// everything.
 fn workflow() -> String {
-    let path = workspace_root().join(WORKFLOW);
+    let path = repo_root().join(WORKFLOW);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
 }
@@ -380,7 +380,7 @@ fn crate_dirs(root: &Path) -> Vec<String> {
 /// skipped: a scan that silently under-reads is a scan whose census is wrong in
 /// the direction that looks like a pass.
 fn ignored_sites() -> Vec<Ignored> {
-    let root = workspace_root();
+    let root = repo_root();
     let mut sites = Vec::new();
     let mut unreadable = Vec::new();
     for krate in crate_dirs(&root) {
@@ -486,7 +486,7 @@ fn the_marker_counts_only_in_attribute_position() {
 /// test in it, is a step that passes having run nothing.
 #[test]
 fn every_ignored_step_runs_something_that_is_still_ignored() {
-    let root = workspace_root();
+    let root = repo_root();
     let steps = ignored_steps(&workflow());
     assert!(
         !steps.is_empty(),

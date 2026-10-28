@@ -16,15 +16,11 @@
 //! explaining where the value comes from; a test module may name whatever it
 //! likes to build a specimen.
 
-use std::path::PathBuf;
-
 mod common;
 
-use common::rust_production::{production_lines, production_sources};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_lines, production_sources};
 
 /// Every `*.rs` file under `crates/*/src`, relative to the repo root.
 /// The one file allowed to spell the mount.

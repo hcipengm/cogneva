@@ -18,15 +18,11 @@
 //! also a word in prose and an ordinary field name, and a gate that reddens on
 //! those teaches people to rename their prose.
 
-use std::path::PathBuf;
-
 mod common;
 
-use common::rust_production::{production_lines, production_sources};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_lines, production_sources};
 
 /// Every `*.rs` file under `crates/*/src`, relative to the repo root.
 /// The declared entries, read from the consts themselves.

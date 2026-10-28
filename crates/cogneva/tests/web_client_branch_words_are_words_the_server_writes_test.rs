@@ -47,11 +47,11 @@
 //!   case line, so pairing it with a word would mean following a variable
 //!   through the function — a parser this gate does not have.
 
-use std::path::{Path, PathBuf};
+mod common;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::routes::repo_root;
+
+use std::path::{Path, PathBuf};
 
 /// The payload fields this gate holds. A comparison on any other field is out
 /// of scope, not an exemption — see the module note for why each is out.

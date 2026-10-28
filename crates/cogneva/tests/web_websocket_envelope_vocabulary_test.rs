@@ -37,6 +37,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::routes::repo_root;
+
 use common::rust_production::{all_crate_files, crate_files_of};
 
 /// 服务端→客户端的信封。
@@ -68,10 +70,6 @@ const IGNORED: &[(&str, &str)] = &[
         "订阅回执：客户端订阅之后不等确认就开始收帧，缺这个回执只说明订阅发丢了，而那时收不到帧的现象本身就是信号",
     ),
 ];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))

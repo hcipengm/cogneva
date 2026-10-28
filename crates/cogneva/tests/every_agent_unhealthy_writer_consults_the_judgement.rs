@@ -55,9 +55,11 @@
 //! refactor that moves a construction out of the shape this test reads fails
 //! loudly instead of passing on an empty population.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::{production_sources, relative_name};
 
@@ -75,10 +77,6 @@ const DECLARED_WRITERS: &[&str] = &[
 /// The one function that decides whether a verdict is news. A file that writes
 /// the event without ever naming it is writing without asking.
 const JUDGEMENT: &str = "announces(";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 /// The lines before this file's first `#[cfg(test)]`, which is where test
 /// fixtures start. Test modules built with `#[path]` or a separate file have no

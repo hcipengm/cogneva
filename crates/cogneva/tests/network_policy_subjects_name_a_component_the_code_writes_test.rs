@@ -31,9 +31,11 @@
 //! is nothing in the tree to compare against. The skip is counted, not implied.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
+
+use common::routes::repo_root;
 
 use common::rust_production::{production_lines, production_sources};
 use common::service_topology::{
@@ -42,10 +44,6 @@ use common::service_topology::{
 
 /// 子树：它的 Pod 由别的栈提供，树里没有可比的清单。
 const FOREIGN_STACK: &str = "deploy/k3s/observability/";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 /// The component values a crate declares as a string constant. The name has to say
 /// COMPONENT: the value of `const TIMEOUT_SECS` is not a component, and a scan that

@@ -59,6 +59,8 @@ use std::path::PathBuf;
 
 mod common;
 
+use common::routes::repo_root;
+
 use common::rust_production::all_crate_files;
 
 use serde::Deserialize;
@@ -1010,11 +1012,6 @@ fn series_name_literals(text: &str) -> Vec<String> {
         from = name_end.max(name_start);
     }
     found
-}
-
-/// Every `.rs` under `crates/`, as a path.
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
 fn read(rel: &str) -> String {

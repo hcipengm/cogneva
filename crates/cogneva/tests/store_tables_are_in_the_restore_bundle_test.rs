@@ -45,13 +45,11 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::routes::repo_root;
+
 use common::rust_production::{
     production_sources, production_text, relative_name, sources_of_tree,
 };
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 const BUNDLE: &str = "crates/cogneva/src/schema_bundle.rs";
 

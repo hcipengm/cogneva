@@ -40,8 +40,11 @@
 //! 少一跳。缺的那一跳由 `every_alertmanager_env_key_reaches_a_deployment` 按生产面的
 //! 表反向兜住：`OBS_ENV` 里的每个键都得有一个部署面来源。
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use cog_notification::plugin::OUTLET_ADDRESS_PATHS;
 use cog_observability::config::{
@@ -63,10 +66,6 @@ const ALERT_POD_TEMPLATES: [&str; 2] = [
     "deploy/helm/cogneva/templates/gateway.yaml",
     "deploy/helm/cogneva/templates/evolution.yaml",
 ];
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);

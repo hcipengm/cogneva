@@ -44,6 +44,10 @@
 //!
 //! [`DURABLE_POOL_GAUGE_HEARTBEAT`]: cog_gateway::security_gateway::DURABLE_GAUGE_HEARTBEAT
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -56,10 +60,6 @@ use promql::unguarded_store_reading_complaints;
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 const RULE_MANIFESTS_DIR: &str = "deploy/k3s/observability/manifests";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);

@@ -39,14 +39,12 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::routes::repo_root;
+
 use common::rust_production::{production_sources, production_text, sources_of_tree};
 
 /// The client module whose interfaces are the response shapes.
 const CLIENT: &str = "web/src/api/client.ts";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))

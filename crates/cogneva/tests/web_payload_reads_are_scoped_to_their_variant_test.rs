@@ -39,6 +39,10 @@
 //! `react_step_end` 拼成 `ReactStepEnd`（变体其实叫 `ReActStepEnd`）；文件里找不到
 //! `payload` 绑定的 switch 或守卫不判。
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -59,10 +63,6 @@ const WEB: &str = "web/src";
 /// 名字，读的也不是变体字段，判到它只会得到一片假红。两者的区别写在代码里：被
 /// switch 的那个变量若自己就是从 `.payload` 里解出来的，这一处不判。
 const PAGE: &str = "crates/cog-gateway/src/takeover.html";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))

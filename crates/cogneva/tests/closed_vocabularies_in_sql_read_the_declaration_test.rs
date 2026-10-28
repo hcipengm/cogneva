@@ -17,15 +17,13 @@
 //! half of every crate and fails on a comparison against one of these columns
 //! whose operand spells a word the vocabulary's own parser accepts.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
 
-use common::rust_production::{production_sources, production_text, relative_name};
+use common::routes::repo_root;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
+use common::rust_production::{production_sources, production_text, relative_name};
 
 fn parses_as_task_status(word: &str) -> bool {
     cog_core::TaskStatus::parse(word).is_some()

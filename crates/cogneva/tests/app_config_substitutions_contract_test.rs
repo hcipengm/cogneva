@@ -18,8 +18,11 @@
 //! namespace- and values-shaped patterns need. Coverage is the only judgement
 //! here -- what the address should be is the row's business, not this test's.
 
+mod common;
+
+use common::routes::repo_root;
+
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 /// The document whose addresses must all be deployment-owned.
 const JSON: &str = "deploy/helm/cogneva/files/cogneva.json";
@@ -30,10 +33,6 @@ const TEMPLATE: &str = "deploy/helm/cogneva/templates/app-config.yaml";
 /// The line that opens the table, and the line that closes it.
 const TABLE_OPEN: &str = "$portage := dict";
 const TABLE_CLOSE: &str = "-}}";
-
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
 
 fn read(rel: &str) -> String {
     let path = repo_root().join(rel);
