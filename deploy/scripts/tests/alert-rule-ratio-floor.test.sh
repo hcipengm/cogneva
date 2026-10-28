@@ -18,7 +18,8 @@
 #   - 普通阈值规则（`x > 90`）⇒ 不判，但计入 unjudged，因为「没判」与「判过且通过」
 #     在汇总行上必须分开；
 #   - 两套库都在判：只在清单里判、漏掉进程内规则，等于一半的门；
-#   - 读不到规则库 ⇒ 3，不是 0。
+#   - 读不到规则库 ⇒ 3，不是 0；**读到了但零条规则** ⇒ 也是 3：零条与「全都合规」
+#     在汇总行上同形（`rules=0 ... violations=0`）。
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,9 +38,13 @@ ck_hasnt() { if printf '%s\n' "$2" | grep -qF -- "$3"; then bad "$1（不该含 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-seed() { # 两套库都在：只用清单的格子也要有一份可读的进程内规则库，否则判的是「读不到」
+# 两套库都在，且各自至少一条规则：门按「每套库都必须读到至少一条」判（读到零条与
+# 「全都合规」在汇总行上同形），所以只用清单的格子也要往进程内库放一条不判的占位规则，
+# 只用进程内库的格子也要往清单里放。占位规则是普通阈值，不进 ratio 家族。
+seed() {
   mkdir -p "$1/deploy/k3s/observability/manifests" "$1/deploy/helm/cogneva/files"
-  printf '' | json_rules "$1"
+  printf 'PlaceholderJSON|max(node_inodes_pct) > 85\n' | json_rules "$1"
+  yaml_rule "$1" PlaceholderYAML 'max(node_inodes_pct) > 85'
 }
 
 json_rules() { # $1=树，stdin 每行 name|promql
@@ -81,12 +86,18 @@ run() { # $1=树 [args...]
                   "$tree/deploy/k3s/observability/manifests" "$@" 2>&1
 }
 
-empty_tree() { seed "$1"; printf '' | json_rules "$1"; }
+empty_tree() { seed "$1"; printf '' | json_rules "$1"; rm -f "$1"/deploy/k3s/observability/manifests/*.yaml; }
 
-# 1. 没有规则：绿，且汇总行说得出「一条比值规则都没判」
-t="$work/empty"; empty_tree "$t"
-out="$(run "$t")"; ck_rc "1. 没有规则 ⇒ 0" 0 "$?"
+# 1. 有规则但没有一条是比值规则：绿，且汇总行说得出「一条比值规则都没判」
+t="$work/empty"; seed "$t"
+yaml_rule "$t" Plain 'max(node_inodes_pct) > 85'
+out="$(run "$t")"; ck_rc "1. 没有比值规则 ⇒ 0" 0 "$?"
 ck_has "1b. 汇总行把 0 条判过的也印出来" "$out" "ratio_rules=0"
+
+# 1c. 两套库各自读到零条 ⇒ 3：零条与「全都合规」在汇总行上同形（rules=0 ... violations=0）
+t="$work/nothing"; empty_tree "$t"
+out="$(run "$t")"; ck_rc "1c. 库读到零条 ⇒ 3" 3 "$?"
+ck_has "1d. 说清是没读到规则" "$out" "一条规则都没有读到"
 
 # 2. 速率 + 倍数 + 下限 ⇒ 绿
 t="$work/ok"; seed "$t"
