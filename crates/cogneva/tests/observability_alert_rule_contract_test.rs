@@ -1192,6 +1192,30 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主读数 `scripts/host/cogneva-code-debt-reading.sh`（不在本仓，登记行 `code_debt`）：代码欠账登记表与它所判的那棵树之间，此刻有几行对不上。它在公开仓里只能是外来序列，因为**生产者与判决住在这个仓看不见的另一棵树**——`check-code-debt.py` 判的是本仓的源码布局，而它由私有仓的提交门驱动；规则读这一条，是为了让「登记表与树分家」在下一拍就被说出来，而不是等下一个在这边提交的人撞上那道门（此前三天里让三个不相干的人代付过）",
     ),
     (
+        "eval_bench_cases",
+        "宿主读数 `scripts/host/eval-evidence-reading.sh`（不在本仓，私有仓的登记行 `eval_evidence`）：这一臂此刻印得出来的用例数——检查点里读过几行，0 也是量出来的 0。它在本仓只能是外来序列：读的是宿主机上评测臂的检查点与运行日志，本仓没有任何进程能印出它。规则拿它当**在场证明**（`max(eval_bench_cases) > 0`），因为同一份文件按基准分的几条格是条件型的：一次都没跑出来时那些序列根本不存在，「缺席」与「这一臂干净」在读数上同形，只有这条恒在的计数能把两种情形分开。同族其余四条（`eval_bench_unattributed`、`eval_judged_cases`、`eval_judged_remaining`、`eval_pool_available`）出自同一个脚本、同一份登记行",
+    ),
+    (
+        "eval_bench_unattributed",
+        "同一生产者（`scripts/host/eval-evidence-reading.sh`，登记行 `eval_evidence`）：检查点里那些归不到任何基准的行数，不进任何基准的得分、也不进任何基准的失败。两个方向都看不见，所以它必须单独印出来与 `eval_bench_cases` 相除；归并落空通常来自基准名的写法不一致（改名、大小写、前缀），而那件事在库表里与「这一臂只跑了一个基准」同形",
+    ),
+    (
+        "eval_judged_cases",
+        "同一生产者（`scripts/host/eval-evidence-reading.sh`，登记行 `eval_evidence`）：已经判过的用例数，分母是它。面表里「商用交付」面欠的就是这条恒在的计数——它不为 0 才谈得上「判到第几例」",
+    ),
+    (
+        "eval_judged_remaining",
+        "同一生产者（`scripts/host/eval-evidence-reading.sh`，登记行 `eval_evidence`）：这一轮还欠多少例没判。与 `eval_judged_cases` 成对读：单看已判数看不出这一臂是跑完了还是刚起步",
+    ),
+    (
+        "eval_pool_available",
+        "同一生产者（`scripts/host/eval-evidence-reading.sh`，登记行 `eval_evidence`）：评测臂此刻能用的上游数，从宿主那一侧的池里读回来。它回答的是「这支臂为什么不动」里的一半——池是空的与臂是卡住的不需要同一个人去修，而两条在别的读数上都表现为「没有进展」",
+    ),
+    (
+        "face_first_reading_consumers_unread",
+        "宿主读数 `scripts/host/cogneva-face-first-reading-consumers-reading.sh`（不在本仓，私有仓的登记行 `face_first_reading_consumers`）：这一拍里「第一面（第一条读数）没有任何读者」的面数。它必须外来：三处读者面里有两处（宿主 `scripts/`、面表与登记表）住在本仓看不见的那棵树里，作者也在那边；本仓只能看见 `crates/` 与 `deploy/` 这一侧，自己印不出一个完整的计数",
+    ),
+    (
         "a2a_conformance_drift_cells",
         "宿主读数 `scripts/host/cogneva-a2a-conformance-reading.sh`（不在本仓，登记行 `a2a_conformance`）：这一拍里答得不是协议说的那样的格数，每拍真打十五个请求量出来。它与 `a2a_conformance_cells` 一起印，是因为没有分母的 0 证不了「比过」——生产者读不到时两条一起缺席，那种「没量」由宿主读数的生产者契约报，不在这里另立一条规则",
     ),
