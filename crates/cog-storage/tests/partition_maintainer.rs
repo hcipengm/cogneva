@@ -22,12 +22,7 @@ use cog_core::{RawFileFormat, RawLogIndexEntry, RawLogIndexStore, RawLogQuery, S
 use cog_storage::partition_maintainer::{PartitionMaintainer, PartitionedTable};
 use cog_storage::PostgresRawLogIndexStore;
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// The probe is partitioned by `ts` and named so that its partition prefix
 /// differs from its own name, exercising the prefix field. Each test gets its

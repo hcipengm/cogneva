@@ -30,6 +30,7 @@ fastembed = "5.13"
 anyhow = { workspace = true }
 
 [dev-dependencies]
+cog-test-support = { path = "../cog-test-support" }
 tempfile = "3"
 cog-stream = { workspace = true }
 tracing-subscriber = { workspace = true }

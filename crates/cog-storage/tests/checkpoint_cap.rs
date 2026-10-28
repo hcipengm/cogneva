@@ -37,12 +37,7 @@ use cog_storage::CheckpointCap;
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgPool, Row};
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// One case's own schema, holding the two tables the sweep reads.
 struct Scratch {

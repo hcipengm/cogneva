@@ -19,12 +19,7 @@ use sqlx::PgPool;
 use cog_core::SFError;
 use cog_storage::{DatasetCatalog, NewDataset, PostgresDatasetCatalog};
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before running these \
-         tests",
-    )
-}
+use cog_test_support::database_url;
 
 struct Probe {
     catalog: PostgresDatasetCatalog,

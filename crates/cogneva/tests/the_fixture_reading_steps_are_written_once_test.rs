@@ -126,6 +126,11 @@ const KNOWN_DUPLICATED_BODIES: [&str; 0] = [];
 const THE_PREDICATE: &str =
     "crates/cogneva/tests/the_fixture_reading_steps_are_written_once_test.rs";
 
+/// 跨 crate 的夹具支撑：几个 crate 的夹具都要的同一件事（哪个 PostgreSQL、哪个
+/// Redis、没有的时候停还是跳过）。它判的是「这份文件里定义过的体，夹具里不许再写一
+/// 遍」——所以它的位置本身就是判据的一部分：搬进它，就要先从所有夹具里删干净。
+const SUPPORT_HOME: &str = "crates/cog-test-support/src/lib.rs";
+
 // 普查面：`crates/**/*.rs`，夹具与产出面一起算。
 //
 // `src/` 必须在里面：这一族抄件上一轮就长在 `src/` 的单测模块里（`startup_guard.rs`
@@ -154,6 +159,8 @@ struct Census {
     strippers: usize,
     /// 函数体逐字相同、却定义在不止一个夹具文件里的那些：名字 →（文件:行, 名字）。
     duplicate_bodies: Vec<(String, Vec<String>)>,
+    /// 支撑 crate 里已经有一份、夹具里又写了一遍的：（文件:行 名字, 支撑 crate 里的名字）。
+    support_copies: Vec<(String, String)>,
 }
 
 /// 这个文件里有哪些函数自己在往下走目录：函数体里同时出现 `read_dir` 与它自己的名字。
@@ -299,6 +306,12 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     // 函数体 → 出现它的「文件:行 名字」。按体分组，所以同一个体换了名字也照样并到一起。
     let mut bodies: std::collections::BTreeMap<String, Vec<String>> =
         std::collections::BTreeMap::new();
+    // 支撑 crate 那一面的两半：它自己定义了哪些体（体 → 名字），以及别的夹具都写了
+    // 哪些体（「文件:行 名字」, 体）。两半都在这一趟里收，收完再配对——这样判据读的
+    // 就是**这棵树**里的两份，而不是从盘上另取一份可能不存在的东西。
+    let mut support_bodies: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let mut fixture_bodies: Vec<(String, String)> = Vec::new();
     let shared = [THE_ONE, ROUTES_HOME, PRODUCTION_HOME];
     for path in files_in {
         let name = relative_name(root, path);
@@ -313,13 +326,18 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         //
         // 这份门自己写着标本（那些字符串里也有 `fn …`），所以它自己也摘出去；它认得
         // 这个形状由下面那条消融单独证明。
+        if name == SUPPORT_HOME {
+            for (function, _, body) in free_function_bodies(&text) {
+                support_bodies.insert(body, function);
+            }
+        }
         if name.contains("/tests/") && name != THE_PREDICATE && name != THE_ONE {
             recursions.extend(recursions_in(&name, &text));
-            // 同体只在**本 crate 的夹具**之间比。跨 crate 的抄件（`database_url` 在四个
-            // crate 的二十几份夹具里，`migrate_once` 在三份里）确实也是同一族，但它们
-            // 够不着 `cogneva/tests/common`——那不是夹具内部可搬的重复，而是要另开一个
-            // 跨 crate 的测试支撑 crate，是另一笔。这里先把「同一棵树内、可搬而未搬」
-            // 的那一半钉住，那一半今天一个也没钉。
+            // 同体只在**本 crate 的夹具**之间比。跨 crate 的抄件（`database_url` 曾经在
+            // 四个 crate 的四十二份夹具里，`migrate_once` 在三份里）是同一族，但它们的
+            // 搬法不是「挪进别人的 `common`」，而是**另开一个跨 crate 的支撑 crate**
+            // ——那一半由下面 `support_copies` 那一面判：支撑 crate 里定义过的体，夹具里
+            // 不许再出现一遍。所以这里只管「同一棵树内、可搬而未搬」的那一半。
             if name.starts_with("crates/cogneva/tests/") {
                 for (function, line, body) in free_function_bodies(&text) {
                     bodies
@@ -327,6 +345,12 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
                         .or_default()
                         .push(format!("{name}:{line} {function}"));
                 }
+            }
+            // 支撑 crate 那一面：任何 crate 的夹具都算。跨 crate 的抄件正是要在这里红，
+            // 它们的共同点是「两边都已经够得着同一份」——只差没人去够。配对放在这一趟
+            // 走完之后：支撑 crate 排在遍历里的哪一位都好使。
+            for (function, line, body) in free_function_bodies(&text) {
+                fixture_bodies.push((format!("{name}:{line} {function}"), body));
             }
         }
         let imported = imported_names(&text);
@@ -358,6 +382,10 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
             }
         }
     }
+    let support_copies: Vec<(String, String)> = fixture_bodies
+        .into_iter()
+        .filter_map(|(site, body)| Some((site, support_bodies.get(&body)?.clone())))
+        .collect();
     // 只在**不同文件**之间算重复：同一份文件里两个同体的小函数不是「规则写了两遍」。
     let duplicate_bodies = bodies
         .into_iter()
@@ -377,6 +405,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         walkers,
         strippers,
         duplicate_bodies,
+        support_copies,
     }
 }
 
@@ -481,9 +510,27 @@ fn the_fixture_reading_steps_are_written_once() {
                 .iter()
                 .any(|(_, at)| at.iter().any(|site| name_of(site) == name)),
             "`{name}` 已经不在「两个夹具各写一遍」的清单里了：合并完就从 \
-             KNOWN_DUPLICATED_BODIES 里删掉它，并且在 KNOWN_CEILING 上把余量收起一行"
+             KNOWN_DUPLICATED_BODIES 里删掉它，那张表今天应该是空的"
         );
     }
+
+    // 跨 crate 那一面：支撑 crate 里已经有一份的规则，夹具里不许再写一遍。这一面没有
+    // 豁免表——它今天一条也没有，而且每一份抄件都够得着同一个 `cog_test_support`，
+    // 不存在「搬不动」的那种。
+    assert!(
+        found.support_copies.is_empty(),
+        "这些函数在 `{SUPPORT_HOME}` 里已经有一份，夹具里又写了一遍：{:?}\n\
+         改成 `use cog_test_support::…`：两份之间没有任何东西比较，一边改了另一边不会红。",
+        found.support_copies
+    );
+    // 反过来问：支撑 crate 真的还定义着那个入口吗。它空了、或者被删成一个转发壳，
+    // 上面那条就永远绿——判据只是证明了「别处没有」，没证明「这里有」。
+    let support = std::fs::read_to_string(root.join(SUPPORT_HOME)).expect("支撑 crate 读得到");
+    assert!(
+        support.contains("pub fn database_url()"),
+        "{SUPPORT_HOME} 里不再定义 `database_url`：那么「夹具里不许再写一遍」就是指着\
+         一份空文件说的"
+    );
 
     // 反过来问：被指认的那一处真的还在干这件事吗。少了这一问，把它换成空壳之后
     // 本判据照绿——它只证明了「别处没有」。

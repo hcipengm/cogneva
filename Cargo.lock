@@ -1658,6 +1658,7 @@ dependencies = [
  "cog-observability",
  "cog-storage",
  "cog-stream",
+ "cog-test-support",
  "fastembed",
  "futures",
  "schemars",
@@ -1718,6 +1719,7 @@ dependencies = [
  "chrono",
  "cog-core",
  "cog-storage",
+ "cog-test-support",
  "futures",
  "lettre",
  "libc",
@@ -1895,6 +1897,7 @@ dependencies = [
  "clap",
  "cog-core",
  "cog-redis",
+ "cog-test-support",
  "etcd-client",
  "futures",
  "hex",
@@ -1953,6 +1956,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cog-test-support"
+version = "0.5.10"
+
+[[package]]
 name = "cog-wiki"
 version = "0.5.10"
 dependencies = [
@@ -2004,6 +2011,7 @@ dependencies = [
  "cog-storage",
  "cog-stream",
  "cog-supervisor",
+ "cog-test-support",
  "cog-wiki",
  "dirs 5.0.1",
  "filetime",

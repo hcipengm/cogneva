@@ -40,12 +40,7 @@ use cog_storage::{MemoryStateBackend, PostgresStateBackend};
 /// The task this binary writes, and the events it appends to it.
 const TASK: &str = "events-payload-probe-round-trip";
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// The payload an event carries. Distinctive in both directions: a reader that
 /// returned the envelope would not equal it, and it carries a nested object so

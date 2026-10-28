@@ -44,12 +44,7 @@ use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore, LEDGER_TABLE
 /// can never touch a row it did not write.
 const PROBE_MODEL: &str = "verdict-probe-model";
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// A schema of this test's own, reached by putting `search_path` in the URL.
 ///

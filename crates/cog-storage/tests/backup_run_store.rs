@@ -49,12 +49,7 @@ static ACCOUNT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// their own and say so.
 const DEADLINE_SECONDS: i32 = 3600;
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 struct Probe {
     store: PostgresBackupRunStore,

@@ -63,12 +63,7 @@ const PAGE: i64 = 10;
 /// a race the server settles by failing one of them.
 static SCHEMA_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// The backend, and the pool beside it for the readings taken of the table
 /// itself.

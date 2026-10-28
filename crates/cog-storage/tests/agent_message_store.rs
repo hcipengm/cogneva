@@ -22,12 +22,7 @@ use sqlx::PgPool;
 
 use cog_storage::{AgentMessageStore, NewAgentMessage, PostgresAgentMessageStore, SendOutcome};
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// Names no other run shares, so the trim bound is measured on this test's rows
 /// alone.

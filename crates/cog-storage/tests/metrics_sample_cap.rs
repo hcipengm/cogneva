@@ -30,12 +30,7 @@ use cog_core::{MetricsBackend, Observable, OwnerLeaseBroker, ShutdownSignal};
 use cog_storage::metrics_sample_cap::{DEPLOYMENT_LABEL, LOOP, LOOP_PERIOD, ROLE};
 use cog_storage::{MemoryMetricsBackend, PgOwnerLeaseBroker, SampleLogCap, LEASE_TABLE};
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 async fn fresh_probe(pool: &PgPool, table: &str) {
     sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))

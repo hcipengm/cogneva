@@ -24,12 +24,7 @@ use cog_storage::{
     ChatTurn, ChatTurnRole, ChatTurnStore, PostgresChatTurnStore, ROWS_KEPT_PER_SESSION,
 };
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 struct Probe {
     store: PostgresChatTurnStore,

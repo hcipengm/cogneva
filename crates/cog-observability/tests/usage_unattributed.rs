@@ -28,12 +28,7 @@ use chrono::{TimeZone, Utc};
 use cog_observability::usage_store::LlmUsageStore;
 use sqlx::PgPool;
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// 一行账。身份由调用方给：`None` 是没声明，`Some` 是声明了。
 async fn ledger_row(pool: &PgPool, task: Option<&str>, tokens: i64) {

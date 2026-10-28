@@ -26,12 +26,7 @@ use cog_storage::MetricsRetirement;
 const RETIRED: &str = "retired_probe_total";
 const LIVE: &str = "live_probe_total";
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// The four probe tables, named after the suffix of the store each stands in
 /// for, so one test run gets its own set and two tests never share one.

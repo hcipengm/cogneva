@@ -26,6 +26,7 @@ members = [
     "crates/cog-gateway",
     "crates/cog-supervisor",
     "crates/cog-github",
+    "crates/cog-test-support",
     "crates/bootstrap",
 ]
 resolver = "2"

@@ -29,12 +29,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use cog_storage::EventLogCap;
 use sqlx::{PgPool, Row};
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// A table shaped like the event log in the two columns the sweep reads.
 struct Scratch {

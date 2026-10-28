@@ -29,12 +29,7 @@ use cog_core::StateBackend;
 use cog_storage::{PostgresObservabilityGateway, PostgresStateBackend};
 use sqlx::PgPool;
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// A finished row in one workspace, with the queue time and the work time kept
 /// apart: it waited `queued_days` for a worker and then ran `worked_secs`.

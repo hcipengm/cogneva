@@ -39,4 +39,5 @@ libc = "0.2"
 lettre = { version = "0.11", default-features = false, features = ["smtp-transport", "tokio1-rustls-tls", "builder", "hostname"] }
 
 [dev-dependencies]
+cog-test-support = { path = "../cog-test-support" }
 tokio-test = "0.4"

@@ -36,12 +36,7 @@ use cog_storage::{PgOwnerLeaseBroker, LEASE_TABLE};
 /// interrupted run is recognisable as one of these tests'.
 const PROBE: &str = "probe_owner_lease";
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 async fn connect() -> PgPool {
     PgPool::connect(&database_url()).await.unwrap()

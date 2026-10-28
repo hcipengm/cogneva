@@ -68,12 +68,7 @@ const SMALL_PROBE: &str = "cap_probe_surplus_small";
 /// of them. Both tests need the schema to clone, so they take turns.
 static SCHEMA_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// Create `table` with the backend's own columns and indexes.
 async fn fresh_probe(pool: &PgPool, table: &str) {

@@ -68,12 +68,7 @@ static PASS: Mutex<()> = Mutex::const_new(());
 /// pass, and the number the pass uses lives in another crate.
 const PASS_BOUND: usize = 200;
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
     let url = database_url();

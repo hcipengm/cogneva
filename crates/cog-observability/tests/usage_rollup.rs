@@ -22,12 +22,7 @@ use chrono::{DateTime, Duration, Utc};
 use cog_observability::usage_store::{LlmUsageRecord, LlmUsageStore, RollupWindow};
 use sqlx::PgPool;
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// Create the shared ledger and rollup tables under a session advisory lock.
 ///

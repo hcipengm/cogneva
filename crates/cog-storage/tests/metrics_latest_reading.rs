@@ -52,12 +52,7 @@ const METRIC: &str = "probe_gauge_latest";
 const SERIES: i64 = 8;
 const ROWS: i64 = 15_000;
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// Seed `SERIES` label sets of one gauge, oldest first, with the row's index as
 /// its value. The newest row of series `s` is then the one whose value is `s`,

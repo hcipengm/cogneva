@@ -84,6 +84,7 @@ serde_yaml = "0.9"
 windows-service = "0.7"
 
 [dev-dependencies]
+cog-test-support = { path = "../cog-test-support" }
 cog-redis = { workspace = true }
 tempfile = "3"
 filetime = "0.2"

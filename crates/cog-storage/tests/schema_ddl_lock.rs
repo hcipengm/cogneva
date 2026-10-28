@@ -37,12 +37,7 @@ fn marker() -> String {
     format!("sddl_{}_{}", std::process::id(), nanos)
 }
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 async fn pool() -> PgPool {
     PgPoolOptions::new()

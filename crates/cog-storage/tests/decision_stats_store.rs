@@ -35,12 +35,7 @@ use cog_storage::PostgresDecisionStatsStore;
 /// Serializes the tests that read or write the table. See the module note.
 static CELLS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 /// One test's cell factory, so every key it writes is its own.
 struct Probe {

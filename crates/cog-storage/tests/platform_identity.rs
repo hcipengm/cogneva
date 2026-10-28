@@ -24,12 +24,7 @@ use cog_core::contract::auth::{PlatformIdentityStore, UserStore, UserType};
 use cog_storage::PostgresUserStore;
 use sqlx::PgPool;
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]

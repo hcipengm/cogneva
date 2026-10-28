@@ -32,12 +32,7 @@ use sqlx::{Connection, PgConnection, PgPool};
 
 use cog_memory::{PostgresEntryStore, PostgresSchemaBackend};
 
-fn database_url() -> String {
-    std::env::var("COGNEVA_TEST_DATABASE_URL").expect(
-        "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
-         running these tests",
-    )
-}
+use cog_test_support::database_url;
 
 async fn own_schema(url: &str) -> String {
     let nanos = std::time::SystemTime::now()
