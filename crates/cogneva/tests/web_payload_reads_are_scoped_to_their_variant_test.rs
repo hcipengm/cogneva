@@ -516,10 +516,19 @@ fn contradictions(root: &Path) -> (Vec<String>, usize) {
     (complaints, judged)
 }
 
+/// 客户端源码文件数下限。`judged > 0` 只保证「判到了几条读法」，而运维页
+/// （`takeover.html`）单独就能交十几条——整片 `web/src` 读不出来时它照旧成立。
+/// 所以题目要先按文件数数一遍。
+const MIN_CLIENT_FILES: usize = 100;
+
 fn collect_ts(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "{} 读不出来（{e}）：客户端的读法普查面少了一块，而少读的文件与\
+             「那些文件都没有越界读法」在判词上分不开",
+            dir.display()
+        )
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -562,6 +571,12 @@ fn the_census_is_wide_enough_to_mean_something() {
 
     let mut files = Vec::new();
     collect_ts(&root.join(WEB), &mut files);
+    assert!(
+        files.len() >= MIN_CLIENT_FILES,
+        "{WEB} 下只读到 {} 个 .ts/.tsx（下限 {MIN_CLIENT_FILES}）：普查面缩了，\
+         后面的臂数与字段数都是在残表上量的",
+        files.len()
+    );
     let mut total_arms = 0;
     let mut total_fields = BTreeSet::new();
     for path in files {
@@ -769,4 +784,21 @@ fn a_field_outside_the_case_variant_is_reported() {
     );
 
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// 普查面本身也要有判据：读法目录读不出来时必须炸。旧写法读不出来就 `return`，
+/// 运维页那十几条臂足以让 `judged > 0` 照旧成立——题目少了一整片，判词不变。
+#[test]
+fn a_reading_directory_that_cannot_be_read_is_refused() {
+    let missing =
+        std::env::temp_dir().join(format!("cogneva-web-payload-absent-{}", std::process::id()));
+    let mut files = Vec::new();
+    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        collect_ts(&missing, &mut files)
+    }));
+    assert!(
+        got.is_err(),
+        "web/src 读不出来时读法普查面为空，而这一跑照旧会印「每一臂读的字段\
+         都是那个变体带着的」"
+    );
 }

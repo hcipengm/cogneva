@@ -64,10 +64,19 @@ fn read_at(path: &Path) -> String {
     std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
 }
 
+/// 载体清单文件数下限。声明面是两处载体并起来的：chart 里的进程内规则与
+/// `PrometheusRule` 清单。后一半读不出来时，并集还剩 chart 的 15 个面，
+/// `declared.len() > 10` 照旧成立——一半载体消失不会让任何一句判词变红。
+const MIN_MANIFESTS: usize = 10;
+
 fn files_with_extension(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "{} 读不出来（{e}）：声明面少了一整个载体，剩下的那一半与\
+             「所有载体都读过」在判词上分不开",
+            dir.display()
+        )
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         match entry.file_type() {
@@ -104,6 +113,12 @@ fn declared_faces() -> BTreeSet<String> {
         &repo_root().join("deploy/k3s/observability/manifests"),
         "yaml",
         &mut manifests,
+    );
+    assert!(
+        manifests.len() >= MIN_MANIFESTS,
+        "deploy/k3s/observability/manifests 下只读到 {} 份 .yaml（下限 {MIN_MANIFESTS}）：\
+         声明面的清单那一半没了，chart 里的 15 个面单独就能让下面的下限成立",
+        manifests.len()
     );
     for path in manifests {
         for value in label_values(&read_at(&path), "cogneva_io_face:") {
@@ -324,6 +339,26 @@ mod tests {
                  而那意味着这一格对它是瞎的；把新形状加进 code_faces() 再让它绿"
             );
         }
+    }
+
+    /// 载体那一半读不出来时必须炸。旧写法读不出来就 `return`，清单那一半
+    /// 悄悄变空，而 chart 的 15 个面单独就把 `declared.len() > 10` 顶住了——
+    /// 正是这条判据最怕的那种「变弱但照旧绿」。
+    #[test]
+    fn a_manifest_directory_that_cannot_be_read_is_refused() {
+        let missing = std::env::temp_dir().join(format!(
+            "cogneva-face-manifests-absent-{}",
+            std::process::id()
+        ));
+        let mut files = Vec::new();
+        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            files_with_extension(&missing, "yaml", &mut files)
+        }));
+        assert!(
+            got.is_err(),
+            "清单目录不存在时载体解析交了一张空表——声明面只剩 chart 那一半，\
+             判据照旧绿，而它想守的那一半已经没人读了"
+        );
     }
 
     /// A face literal carries no surrounding space. A trailing space is how a
