@@ -1297,17 +1297,28 @@ impl LlmUsageStore {
     /// the window (a fresh deployment, or a build that predates the column):
     /// no reading, so no reserve, which is the same fail-open the missing
     /// capacity reading gets.
+    ///
+    /// The answer is `(cost, jobs, oldest_unix)`. The window handed in is a
+    /// parameter, not a measurement: a deployment three hours old asked for the
+    /// last thirty days gets a percentile over three hours of work and a number
+    /// of exactly the same shape as one over the full month. `jobs` is how many
+    /// tasks stand behind it and `oldest_unix` is when the earliest of them ran,
+    /// so a reader can see that the span it claims is not the span it has. Both
+    /// come from the same subquery as the percentile, so none of the three can
+    /// describe a different population than the others.
     pub async fn task_cost_quantile(
         &self,
         days: i64,
         quantile: f64,
-    ) -> anyhow::Result<Option<(u64, u64)>> {
+    ) -> anyhow::Result<Option<(u64, u64, i64)>> {
         let ok_word = UsageResult::Ok.as_str();
         let row = sqlx::query(&format!(
             r#"
             SELECT PERCENTILE_CONT($2) WITHIN GROUP (ORDER BY total) AS cost,
-                   COUNT(*)::BIGINT AS jobs
-              FROM (SELECT task_id, SUM(tokens_input + tokens_output)::BIGINT AS total
+                   COUNT(*)::BIGINT AS jobs,
+                   COALESCE(EXTRACT(EPOCH FROM MIN(oldest))::BIGINT, 0) AS oldest_unix
+              FROM (SELECT task_id, SUM(tokens_input + tokens_output)::BIGINT AS total,
+                           MIN(ts) AS oldest
                       FROM {LEDGER_TABLE}
                      WHERE result = '{ok_word}' AND task_id IS NOT NULL
                        AND ts > NOW() - make_interval(days => $1)
@@ -1321,12 +1332,14 @@ impl LlmUsageStore {
         // The population travels with the percentile: `PERCENTILE_CONT` answers
         // with a plausible number over three jobs exactly as it does over three
         // hundred, and a reader handed the cost alone cannot tell which one it
-        // is looking at. `COUNT(*)` over the same subquery is the same
-        // measurement, taken in the same statement so the two cannot disagree.
+        // is looking at. `COUNT(*)` and `MIN(ts)` over the same subquery are the
+        // same measurement, taken in the same statement so the three cannot
+        // disagree.
         let jobs = row.get::<i64, _>("jobs").max(0) as u64;
+        let oldest_unix = row.get::<i64, _>("oldest_unix");
         Ok(row
             .get::<Option<f64>, _>("cost")
-            .map(|v| (v.max(0.0) as u64, jobs)))
+            .map(|v| (v.max(0.0) as u64, jobs, oldest_unix)))
     }
 
     /// The window's token composition, grouped by `(actor, origin, upstream,

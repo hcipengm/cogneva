@@ -1219,6 +1219,12 @@ metric_names! {
     // same reason, and this publishes the population on the face the value is
     // already on.
     LLM_POOL_RESERVE_POPULATION => "llm_pool_reserve_population",
+    // When the earliest of those jobs ran, unix seconds. The population says how
+    // many tasks the percentile rests on and this says whether they reach back
+    // across the window it is asked for: a deployment three hours old consults a
+    // thirty-day quantile and gets an answer over three hours of work, with no
+    // evidence of the difference anywhere in the value.
+    LLM_POOL_RESERVE_SINCE_UNIX => "llm_pool_reserve_since_unix",
     LLM_POOL_PACED_UPSTREAMS => "llm_pool_paced_upstreams",
     // The pool gauges above sum only the members whose window was **measured**,
     // and the request path's `blocked` decides for the whole pool from that sum.

@@ -2814,7 +2814,7 @@ data:
         {
           "id": 66,
           "title": "How Solid That Reserve Is, and Who the Sum Leaves Out",
-          "description": "How solid the reserve beside this panel is, and how much of the pool the sum it feeds actually covers. reserve_population counts the finished jobs the job-size percentile was measured over: three jobs and three hundred print the same shape of number, and headroom computed from a thin population is off in whichever direction those few jobs happened to fall. paced_upstreams counts the members whose window this pass measured; upstreams_without_ruler counts the members it could not measure, and those are missing from every token gauge in the family -- a member with no ruler is summed as an allowance of zero, which reads exactly like a member whose window is spent while it is repaired in the opposite direction. Zero here with a configured pool means the pass did not run.",
+          "description": "How solid the reserve beside this panel is, and how much of the pool the sum it feeds actually covers. reserve_population counts the finished jobs the job-size percentile was measured over: three jobs and three hundred print the same shape of number, and headroom computed from a thin population is off in whichever direction those few jobs happened to fall. paced_upstreams counts the members whose window this pass measured; upstreams_without_ruler counts the members it could not measure, and those are missing from every token gauge in the family -- a member with no ruler is summed as an allowance of zero, which reads exactly like a member whose window is spent while it is repaired in the opposite direction. The last line asks the same question in time rather than in count: how many days back the earliest of those finished jobs ran, against the 30 days the percentile is asked for -- a parameter the query carries, not a span it was answered from. Zero here with a configured pool means the pass did not run.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -2842,6 +2842,14 @@ data:
             {
               "expr": "llm_pool_upstreams_without_ruler and ((time() - llm_pool_upstreams_without_ruler_observed_timestamp_seconds) < 3600)",
               "legendFormat": "upstreams it could not measure",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "(time() - ((llm_pool_reserve_since_unix and ((time() - llm_pool_reserve_since_unix_observed_timestamp_seconds) < 3600)) > 0)) / 86400",
+              "legendFormat": "days of finished jobs behind the reserve",
               "datasource": {
                 "type": "prometheus",
                 "uid": "${datasource}"

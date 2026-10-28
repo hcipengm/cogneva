@@ -1837,6 +1837,13 @@ struct WindowPaceReading {
     /// 池和只加进 `by_upstream` 里的成员，`blocked()` 却拿这个和判整池，所以一个
     /// 没进和的成员对和的贡献是 0，读上去与「它没有额度」同形。
     rulers: Vec<(String, crate::window_pace::Ruler)>,
+    /// 预留那个分位数所依据的最早一件任务落在什么时候（unix 秒），0 = 没有人口。
+    ///
+    /// 与 `pool.reserve_*` 同一拍算出来，但**不进**池快照契约：那一份是给请求路
+    /// 判定用的，它不需要知道这把尺子有多老；而这个数唯一的读者是读数面，它要
+    /// 回答的正是"30 天这个窗口是参数还是实测"。放在这里而不是 `LlmWindowPace`
+    /// 里，是因为契约结构每加一格都要重编全部 crate，而这一格没有任何判据会读。
+    reserve_since_unix: i64,
 }
 
 #[derive(Clone)]
@@ -3985,6 +3992,13 @@ async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReadin
             cog_core::metric_names::LLM_POOL_RESERVE_POPULATION,
             pace.reserve_population as f64,
         ),
+        // 人口说"几件任务"，这一格说"那几件是谁的时候的"。少了它，"30 天口径"
+        // 与"今天到现在"仍然同形：一个装了三小时的新部署问 30 天窗口，分位数
+        // 照样给一个像模像样的数。
+        (
+            cog_core::metric_names::LLM_POOL_RESERVE_SINCE_UNIX,
+            reading.reserve_since_unix as f64,
+        ),
         (
             cog_core::metric_names::LLM_POOL_PACED_UPSTREAMS,
             pace.measured_upstreams as f64,
@@ -4103,17 +4117,17 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
     // 没有读数的界不许凭空写一个数，那样拦下来的会是"一半的任务"。
     // 样本量与成本同一个读数出来：分位函数在三件任务上也返回一个像模像样的数，
     // 只给成本，读者分不出这个界是量出来的还是猜出来的。
-    let (reserve, reserve_population) = match store
+    let (reserve, reserve_population, reserve_since_unix) = match store
         .task_cost_quantile(WINDOW_PACE_RESERVE_DAYS, WINDOW_PACE_RESERVE_QUANTILE)
         .await
     {
-        Ok(value) => value.unwrap_or((0, 0)),
+        Ok(value) => value.unwrap_or((0, 0, 0)),
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "窗口配速：量不出一件任务的成本，这一拍不预留整块"
             );
-            (0, 0)
+            (0, 0, 0)
         }
     };
     let mut pace = cog_core::LlmWindowPace {
@@ -4193,6 +4207,7 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
         pool: pace,
         by_upstream,
         rulers,
+        reserve_since_unix,
     }
 }
 
@@ -15082,6 +15097,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 measured_upstreams: 1,
                 ..Default::default()
             },
+            reserve_since_unix: 1_700_000_000,
             ..Default::default()
         };
         publish_window_pace_gauges(&state, &reading).await;
@@ -15093,6 +15109,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(
             text.contains("llm_pool_reserve_population 5"),
             "预设的人口没有与它同拍落下去，读者只剩一个不知道有多实的分位数：\n{text}"
+        );
+        assert!(
+            text.contains("llm_pool_reserve_since_unix 1700000000"),
+            "人口最早那件任务的时刻没有落下去，读者分不出「30 天窗口」与「今天到现在」：\n{text}"
         );
     }
 

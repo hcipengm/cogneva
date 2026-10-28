@@ -514,6 +514,36 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
             .is_some(),
         "with a completed job on the ledger the reserve has a reading"
     );
+    // The third half of that answer is when the population starts. The window is
+    // a parameter the query carries, so a deployment younger than thirty days
+    // asks for a month and is answered over a day -- and the cost and the count
+    // are the same shape either way. Only the earliest task's instant separates
+    // them, and it has to move when the oldest row moves.
+    let aged = format!("ledger-test-aged:{}", uuid::Uuid::new_v4());
+    store
+        .record(&record(aged.clone(), 0, None, Some(&aged), None))
+        .await
+        .expect("record a call for a job that ran weeks ago");
+    sqlx::query(
+        "UPDATE gateway_llm_usage SET ts = NOW() - make_interval(days => 20) WHERE actor = $1",
+    )
+    .bind(&aged)
+    .execute(&pool)
+    .await
+    .expect("place that job two thirds of the window back");
+    let (_, jobs, oldest) = store
+        .task_cost_quantile(30, 0.75)
+        .await
+        .expect("measure a job's cost")
+        .expect("with finished jobs on the ledger the reserve has a reading");
+    let now_unix = chrono::Utc::now().timestamp();
+    assert!(jobs >= 1, "the population is at least the job just placed");
+    assert!(
+        oldest <= now_unix - 19 * 86_400,
+        "the earliest finished job ran 20 days ago, but the reading says {oldest} \
+         (now {now_unix}) -- this column is not reporting how far back the \
+         population reaches"
+    );
 
     // A window whose end the upstream named can be measured before the ledger
     // carries a labelled refusal: the sum runs against two fixed instants, so
@@ -651,7 +681,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .await
         .expect("clean up the window probe rows");
 
-    for actor in [&before, &after, &unpriced, &refusal] {
+    for actor in [&before, &after, &unpriced, &refusal, &aged] {
         sqlx::query("DELETE FROM gateway_llm_usage WHERE actor = $1")
             .bind(actor)
             .execute(&pool)

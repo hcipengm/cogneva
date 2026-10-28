@@ -1829,6 +1829,16 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          installation, not a free pool",
     ),
     (
+        "llm_pool_reserve_since_unix",
+        "When the earliest of those finished jobs ran, as a Unix timestamp; \
+         zero when the reserve has no population. The percentile is asked for \
+         over the last 30 days, but that is the window it is asked for and not \
+         the span it was answered from: a deployment three hours old gets a \
+         number over three hours of work, of exactly the same shape. Read \
+         beside llm_pool_reserve_population -- one says how many jobs, this one \
+         says how far back the earliest of them goes",
+    ),
+    (
         "llm_budget_spent_tokens",
         "Tokens the ledger says were spent since the start of the UTC day, over \
          every row and not only successful calls: tokens an upstream answered \
