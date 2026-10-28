@@ -674,8 +674,13 @@ async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
         ])
         .await
         .expect("queue three declarations");
+    // The fold takes the account's oldest unfolded declarations up to its
+    // bound, so a bound sized to the three rows above is a bound on the queue
+    // rather than on this test: another binary holding older unfolded rows
+    // leaves this test's rows further down the queue, unfolded, and a row that
+    // was never folded is not in the read at all.
     store
-        .fold_declarations(100, Some("probe-rev"))
+        .fold_declarations(10_000, Some("probe-rev"))
         .await
         .expect("fold the declarations");
 
@@ -750,6 +755,78 @@ async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
     );
 
     for id in [&unstated, &quiet, &urgent] {
+        withdraw_declaration(&pool, id, &doc(id)).await;
+    }
+    cleanup(&pool, &marker).await;
+}
+
+/// Rows that tie on every band key come back in one order, and it is the
+/// identity's rather than whichever one the scan produced.
+///
+/// The band order runs out of keys before it runs out of ties: a fold writes
+/// everything it takes inside one transaction, and `now()` is the transaction's
+/// start, so a batch of declarations shares a single `first_seen_at`; two rows
+/// in the same band then agree on the band, on the absence of a measurement and
+/// on the arrival stamp. What decided the rest was the plan, which is a ranking
+/// that cannot be reproduced -- measured 2026-10-28, the same three rows came
+/// back in two different orders minutes apart and reded a test on two
+/// revisions that changed nothing here.
+///
+/// The rows are declared in the order that opposes their identities: an order
+/// that follows the arrival stamp, or the heap that follows the insert, answers
+/// the other way round.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn rows_that_tie_on_every_band_key_come_back_in_identity_order() {
+    let _folder_lock = folder_lock().await;
+    let (store, pool, marker) = store().await;
+    let early = identity(&marker, "aaa-declared-second");
+    let late = identity(&marker, "zzz-declared-first");
+    let doc = |id: &ChangeIdentity| format!("docs/{}.md", id.scope.replace('/', "-"));
+    let reading = |id: &ChangeIdentity| ChangeReading {
+        identity: id.clone(),
+        title: Some("a tie probe declares".into()),
+        assertion: None,
+        source: ChangeSource {
+            doc: doc(id),
+            verdict: Some("unlanded".into()),
+            priority: ChangePriority::Unstated,
+            block: ChangeBlock::NONE,
+        },
+    };
+
+    // The identity that sorts first goes in last, so arriving first and coming
+    // back first are two different answers.
+    store
+        .declare(&[reading(&late), reading(&early)])
+        .await
+        .expect("queue the two declarations");
+    store
+        .fold_declarations(10_000, Some("probe-rev"))
+        .await
+        .expect("fold them in one transaction");
+
+    let order = |rows: Vec<cog_core::ChangeLedgerRow>| -> Vec<String> {
+        rows.into_iter()
+            .filter(|row| row.identity.scope.starts_with(&marker))
+            .map(|row| row.identity.scope)
+            .collect()
+    };
+    let expected = vec![early.scope.clone(), late.scope.clone()];
+    let first = order(store.outstanding(10_000).await.expect("read the work"));
+    assert_eq!(
+        first, expected,
+        "the tie is broken by the identity, not by the order the two entered in"
+    );
+    let second = order(store.outstanding(10_000).await.expect("read it again"));
+    assert_eq!(
+        second, first,
+        "two reads of an unchanged set answer in one order; an order the plan \
+         decides is not a ranking, and a caller paging through the queue sees \
+         work handed out twice or skipped"
+    );
+
+    for id in [&early, &late] {
         withdraw_declaration(&pool, id, &doc(id)).await;
     }
     cleanup(&pool, &marker).await;

@@ -1062,6 +1062,18 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // not work -- its question is answered -- and leaving it in would hand a
         // fixture identity back to the tree, whose check would only overwrite the
         // retirement with the unsettled answer it was retired to stop repeating.
+        //
+        // Both orderings end on the identity, and that is not decoration. Every
+        // row a fold writes in one transaction shares one `now()`, so a batch of
+        // declarations arrives at a single `first_seen_at`; two rows in the same
+        // band therefore tie on every key above. A tie left to the planner is an
+        // order that can differ between two reads of an unchanged set, which for
+        // a caller that pages through the queue shows up as work that is owed
+        // twice or skipped, and for the account it is a ranking that cannot be
+        // reproduced. Measured 2026-10-28: the read handed back `/quiet,
+        // /urgent, /unstated` where the same rows had been `/quiet, /unstated,
+        // /urgent` minutes earlier, reding a test on two revisions that changed
+        // nothing in this crate.
         Self::entries(
             sqlx::query(&read_sql(
                 "FROM (\
@@ -1073,12 +1085,14 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                              SELECT l.*, \
                                     row_number() OVER (\
                                         ORDER BY l.measured_at ASC NULLS FIRST, \
-                                                 l.first_seen_at ASC) AS by_age, \
+                                                 l.first_seen_at ASC, \
+                                                 l.kind ASC, l.scope ASC, l.literal ASC) AS by_age, \
                                     row_number() OVER (\
                                         ORDER BY (l.delivered_rev IS NOT NULL) DESC, \
                                                  l.priority_rank DESC, \
                                                  l.measured_at ASC NULLS FIRST, \
-                                                 l.first_seen_at ASC) AS by_band \
+                                                 l.first_seen_at ASC, \
+                                                 l.kind ASC, l.scope ASC, l.literal ASC) AS by_band \
                                FROM change_ledger l \
                               WHERE l.state NOT IN ('{state:landed}', '{state:retired}')\
                        ) ranked \
