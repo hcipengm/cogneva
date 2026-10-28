@@ -405,6 +405,13 @@ impl EvolutionDeployer {
             },
             None => None,
         };
+        // Handed to the gate before the arms below, because a build the budget
+        // killed still measured what it took: the divisor is about what a build
+        // costs, and a build that ran out of time cost that much regardless of
+        // how it ended.
+        if let Some(bytes) = peak_rss_bytes {
+            crate::build_gate::observe_build_memory(bytes);
+        }
         let output = match waited {
             Ok(result) => {
                 let output = match result {

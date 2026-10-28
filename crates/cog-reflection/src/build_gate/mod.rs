@@ -444,6 +444,19 @@ pub fn global() -> Option<Arc<BuildGate>> {
     GLOBAL.get().cloned()
 }
 
+/// Records the peak resident memory of a build this process ran.
+///
+/// A free function rather than a method reached through the deployer, because
+/// the deployer does not hold the gate: the process-wide one is the object that
+/// derives the bound, and handing the deployer a second gate would be a second
+/// place for the divisor to live. Nothing is recorded when no gate is installed,
+/// which is the same state in which nothing is bounded.
+pub fn observe_build_memory(bytes: u64) {
+    if let Some(gate) = global() {
+        gate.observe_build_peak_rss(bytes);
+    }
+}
+
 /// The host-wide build gate, handed to the cache pass as its exclusion.
 ///
 /// The wrapper rather than a bare `Arc<BuildGate>` because `CacheSlot` is
@@ -1199,6 +1212,55 @@ fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetr
 /// make that a lookup. The field name travels beside it so the census below can
 /// hold this table to the struct: a field added, renamed or removed without a
 /// row here fails that test instead of going quiet.
+/// How many measured builds the divisor has to agree over before it is used.
+///
+/// One build can be unrepresentative in either direction — a link-only rebuild
+/// touches a fraction of the workspace, a build a cold cache follows touches
+/// all of it — and the number this replaces is the divisor of a bound that
+/// decides how many builds run at once. Three is the smallest count at which
+/// "they agree" can be true of a sequence rather than of a pair.
+const MEASURED_BUILD_COST_SAMPLES: usize = 3;
+
+/// How close the measured builds must be to each other, as a fraction of their
+/// median, before they count as agreeing.
+const MEASURED_BUILD_COST_AGREEMENT: f64 = 0.10;
+
+/// How far the measured divisor must be from the declared one before it is used
+/// in its place, as a fraction of the declared one.
+///
+/// Without this the label would flip between `calibrated` and `derived` on
+/// differences smaller than the measurement's own noise, and every flip would
+/// be a bound move: the same square wave the ceiling's dead band exists to
+/// stop, one level down.
+const MEASURED_BUILD_COST_DEAD_BAND: f64 = 0.20;
+
+/// The divisor the measurements have earned, if they have earned one.
+///
+/// `None` means "keep the declared number": not enough measurements yet, they
+/// do not agree with each other, or they agree with the declaration closely
+/// enough that replacing it would only relabel it.
+fn settled_build_cost(samples: &std::collections::VecDeque<u64>, declared: u64) -> Option<u64> {
+    if samples.len() < MEASURED_BUILD_COST_SAMPLES || declared == 0 {
+        return None;
+    }
+    let mut sorted: Vec<u64> = samples.iter().copied().filter(|b| *b > 0).collect();
+    if sorted.len() < MEASURED_BUILD_COST_SAMPLES {
+        return None;
+    }
+    sorted.sort_unstable();
+    let median = sorted[sorted.len() / 2];
+    let agree =
+        |v: u64| (v as f64 - median as f64).abs() / median as f64 <= MEASURED_BUILD_COST_AGREEMENT;
+    if !sorted.iter().all(|v| agree(*v)) {
+        return None;
+    }
+    let drift = (median as f64 - declared as f64).abs() / declared as f64;
+    if drift <= MEASURED_BUILD_COST_DEAD_BAND {
+        return None;
+    }
+    Some(median)
+}
+
 fn model_inputs(t: &Tuning) -> Vec<(&'static str, &'static str, f64)> {
     vec![
         (
@@ -1243,7 +1305,7 @@ const SOURCE_CALIBRATED: &str = "calibrated";
 /// inputs is what lets a reader see that the divisor has not been re-measured,
 /// and the `source` label is the word for it — `calibrated` is a number nobody
 /// has looked at since it was taken, `configured` is one somebody chose.
-fn tuning_readings(t: &Tuning, origin: Origin<'_>) -> Vec<RawMetric> {
+fn tuning_readings(t: &Tuning, measured_peak: Option<u64>, origin: Origin<'_>) -> Vec<RawMetric> {
     let shipped = model_inputs(&Tuning::shipped());
     let label = |m: RawMetric| {
         m.with_label(
@@ -1260,6 +1322,13 @@ fn tuning_readings(t: &Tuning, origin: Origin<'_>) -> Vec<RawMetric> {
             // fail-safe direction: it says "unchanged" about a number the table
             // could not compare.
             let source = match shipped.iter().find(|(f, _, _)| *f == field) {
+                // The measured divisor is neither of the other two: nobody
+                // chose it and it was not frozen at build time. It says which
+                // input the loop moved on its own, which is the one thing the
+                // other two words cannot say.
+                Some(_) if field == "build_peak_rss_bytes" && measured_peak.is_some() => {
+                    crate::verification_budget::SOURCE_DERIVED
+                }
                 Some((_, _, s)) if (*s - value).abs() > f64::EPSILON => {
                     crate::verification_budget::SOURCE_CONFIGURED
                 }
@@ -1744,6 +1813,13 @@ pub struct BuildGate {
     dimension: Mutex<&'static str>,
     /// The sample that derivation was made from, published beside it.
     host: Mutex<Option<HostReading>>,
+    /// What the last few builds of this process were measured at, in bytes.
+    ///
+    /// Only the last few: this is the divisor of a bound, and one averaged over
+    /// every build the process ever ran would follow the workspace into
+    /// whatever it was weeks ago. The claim being made is "the recent builds
+    /// agree", which needs a short window by construction.
+    measured_build_cost: Mutex<VecDeque<u64>>,
     /// When the bound was last moved. A build is a tens-of-minutes event, so the
     /// window only has to damp the derivation against its own samples.
     window: Mutex<Option<Instant>>,
@@ -1873,6 +1949,7 @@ impl BuildGate {
             held_ceiling: AtomicU64::new(0),
             dimension: Mutex::new(DIM_UNMEASURED),
             host: Mutex::new(None),
+            measured_build_cost: Mutex::new(VecDeque::new()),
             window: Mutex::new(None),
             controller: AtomicBool::new(false),
             controller_retry: Mutex::new(None),
@@ -1894,6 +1971,51 @@ impl BuildGate {
             walk_yield_streak: Mutex::new(std::collections::HashMap::new()),
             events: Mutex::new(VecDeque::new()),
             events_dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Records what one build of this process peaked at, in resident bytes.
+    ///
+    /// A zero is dropped rather than stored: "nothing could be measured" and
+    /// "a build that used no memory" are different statements, and a zero in
+    /// this window would pull the median down and, on a quiet workspace, be the
+    /// measurement that earns a smaller divisor.
+    pub fn observe_build_peak_rss(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut samples = self
+            .measured_build_cost
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        samples.push_back(bytes);
+        while samples.len() > MEASURED_BUILD_COST_SAMPLES {
+            samples.pop_front();
+        }
+    }
+
+    /// The tuning in force, and the measured divisor when one is in force.
+    ///
+    /// The declared number is not overwritten: the substitution is made on a
+    /// copy, so a run of builds that stops agreeing falls back to what the
+    /// deployment declares without anything having to remember to undo it.
+    fn tuning_in_force(&self) -> (Tuning, Option<u64>) {
+        let measured = {
+            let samples = self
+                .measured_build_cost
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            settled_build_cost(&samples, self.tuning.build_peak_rss_bytes)
+        };
+        match measured {
+            Some(peak) => (
+                Tuning {
+                    build_peak_rss_bytes: peak,
+                    ..self.tuning
+                },
+                Some(peak),
+            ),
+            None => (self.tuning, None),
         }
     }
 
@@ -2119,7 +2241,8 @@ impl BuildGate {
                 }
             }
         }
-        let Some(load) = HostLoad::measure(&self.dir, self.tuning).await else {
+        let (tuning, _) = self.tuning_in_force();
+        let Some(load) = HostLoad::measure(&self.dir, tuning).await else {
             // No move rather than a move to a default: a host this process
             // cannot read is not a host it may size a bound for.
             tracing::debug!(
@@ -3523,7 +3646,8 @@ impl Observable for BuildGate {
         // the ceiling move can tell from these whether the host moved or the
         // assumption it is divided by did, and `source` says whether anyone has
         // looked at that assumption since it was measured.
-        metrics.extend(tuning_readings(&self.tuning, origin));
+        let (tuning, measured_peak) = self.tuning_in_force();
+        metrics.extend(tuning_readings(&tuning, measured_peak, origin));
         Ok(metrics)
     }
 
@@ -3638,7 +3762,7 @@ mod tests {
             dir: "d",
             role: BUILD_GATE_ROLE_BUILDER,
         };
-        let series = tuning_readings(&tuned, origin);
+        let series = tuning_readings(&tuned, None, origin);
         let demand = series
             .iter()
             .find(|m| {
@@ -3659,6 +3783,112 @@ mod tests {
         assert_eq!(
             calm.labels.get(crate::LABEL_SOURCE).map(String::as_str),
             Some(SOURCE_CALIBRATED)
+        );
+    }
+
+    /// 一次测量不换除数。一次构建要么只链了个二进制、要么吃了个冷缓存，
+    /// 两个方向都不代表一个工作区的成本，而这个数是一个界的除数。
+    #[test]
+    fn one_measured_build_never_moves_the_divisor() {
+        let declared = 4481u64 << 20;
+        let mut samples = VecDeque::from(vec![declared * 3, declared * 3]);
+        assert_eq!(settled_build_cost(&samples, declared), None);
+        samples.push_back(declared * 3);
+        assert_eq!(settled_build_cost(&samples, declared), Some(declared * 3));
+    }
+
+    /// 三次互不相同时没有「它们一致」这件事可说，哪怕中位数离声明很远。
+    #[test]
+    fn measurements_that_disagree_earn_nothing() {
+        let declared = 1000u64;
+        let samples = VecDeque::from(vec![3000u64, 1000, 9000]);
+        assert_eq!(settled_build_cost(&samples, declared), None);
+    }
+
+    /// 量出来的数与声明只差一点点时不换：换了也只是把标签从 calibrated 改成
+    /// derived，界却跟着噪声上下动——那正是界自己的死区存在的那个方波。
+    #[test]
+    fn a_measurement_inside_the_dead_band_leaves_the_declaration_alone() {
+        let declared = 1000u64;
+        let samples = VecDeque::from(vec![1100u64, 1090, 1110]);
+        assert_eq!(settled_build_cost(&samples, declared), None);
+    }
+
+    /// 采不到数的构建被丢掉，而不是当成 0 参与其中：一个 0 会把中位数拉下来，
+    /// 而拉下来的方向恰好是「这台机器上的一次构建更便宜」。
+    #[test]
+    fn a_build_that_measured_nothing_is_not_a_sample() {
+        let declared = 1000u64;
+        let samples = VecDeque::from(vec![0u64, 0, 0, 3000, 3000, 3000]);
+        assert_eq!(settled_build_cost(&samples, declared), Some(3000));
+    }
+
+    /// 三次一致的测量一旦成立，界用的就是量出来的那个数，而这一族读数把
+    /// 除数标成 derived——它是这个环自己走出来的，不是谁选的、也不是出厂冻结的。
+    #[test]
+    fn three_agreeing_builds_move_the_divisor_and_the_label_says_where_it_came_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = BuildGate::new(&BuildGateConfig {
+            lock_dir: dir.path().to_string_lossy().to_string(),
+            ..BuildGateConfig::default()
+        });
+        let declared = Tuning::shipped().build_peak_rss_bytes;
+        let (before, measured) = gate.tuning_in_force();
+        assert_eq!(measured, None);
+        assert_eq!(before.build_peak_rss_bytes, declared);
+
+        let heavier = declared * 2;
+        for _ in 0..MEASURED_BUILD_COST_SAMPLES {
+            gate.observe_build_peak_rss(heavier);
+        }
+        let (tuning, measured) = gate.tuning_in_force();
+        assert_eq!(measured, Some(heavier));
+        assert_eq!(tuning.build_peak_rss_bytes, heavier);
+
+        let origin = Origin {
+            dir: "d",
+            role: BUILD_GATE_ROLE_BUILDER,
+        };
+        let series = tuning_readings(&tuning, measured, origin);
+        let peak = series
+            .iter()
+            .find(|m| {
+                m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("build_peak_rss_mib")
+            })
+            .expect("build_peak_rss_mib 没有出现在这一族里");
+        assert_eq!(
+            peak.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+            Some(crate::verification_budget::SOURCE_DERIVED),
+            "量出来的除数必须自己说它是量出来的"
+        );
+    }
+
+    /// 同一个界用更小的除数算出更多的构建：这一步要证明的是「量出来的数真的
+    /// 进了界」，而不只是它进了标签。
+    #[test]
+    fn a_measured_divisor_changes_the_ceiling_it_is_used_for() {
+        // 一个内存刚好紧张、其余都闲的宿主：这样位子上限由内存那一维决定，
+        // 换除数就一定会换界，而不是被 cpu 或 io 那两维的钳位吃掉。
+        let host = |peak: u64| {
+            let mut load = host_with(Tuning {
+                build_peak_rss_bytes: peak,
+                ..Tuning::shipped()
+            });
+            // 出厂地板是 24 GiB，所以可用的那一格要在地板之上才量得出差：
+            // 地板之下两根除数都塌到 1，测的就不是除数了。
+            load.pressure.mem_available_bytes = 32 << 30;
+            load
+        };
+        let declared = 4u64 << 30;
+        let lighter = 2u64 << 30;
+        let declared_ceiling = host(declared).ceiling();
+        let measured_ceiling = host(lighter).ceiling();
+        assert_eq!(declared_ceiling.1, "memory");
+        assert!(
+            measured_ceiling.0 > declared_ceiling.0,
+            "一个更便宜的构建必须让位子上限更高：{} 对 {}",
+            measured_ceiling.0,
+            declared_ceiling.0
         );
     }
 
