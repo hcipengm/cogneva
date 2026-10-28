@@ -35,6 +35,7 @@ rule_files:
 # rule: llm_call_without_declared_actor
 # rule: llm_cached_tokens_exceed_input
 # rule: llm_upstream_reading_outlives_its_pool_entry
+# rule: llm_pool_paced_on_a_subset_of_its_members
 
 evaluation_interval: 1m
 
@@ -890,4 +891,116 @@ tests:
     alert_rule_test:
       - eval_time: 120m
         alertname: llm_upstream_reading_outlives_its_pool_entry
+        exp_alerts: []
+
+  # 池里有一个成员没有尺子，而**一个都没量过**：`paced_upstreams == 0`，请求路的
+  # `blocked()` 于是恒假，工作不限速地往外走 —— 这是「两天烧完两天的额度、然后停到
+  # 窗口重置」的形状。没有池掉线（available=1），所以不掉进「池下线」那一族。响一格，
+  # 理由由逐成员的读数带来。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_upstream_with_ruler{upstream="u1",reason="no_window_reported"}'
+        values: '0x60'
+      - series: 'llm_pool_upstream_with_ruler_observed_timestamp_seconds{upstream="u1",reason="no_window_reported"}'
+        values: '3500x60'
+      - series: 'llm_pool_upstreams_without_ruler'
+        values: '1x60'
+      - series: 'llm_pool_upstreams_without_ruler_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_ready_admission_readings{kind="ready"}'
+        values: '2x60'
+      - series: 'cogneva_ready_admission_readings_observed_timestamp_seconds{kind="ready"}'
+        values: '3500x60'
+      - series: 'llm_pool_paced_upstreams'
+        values: '0x60'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '1x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: llm_pool_paced_on_a_subset_of_its_members
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: no_window_reported
+
+  # 一半量过、一半没有：求和只走了量过的那一半，而那一半的窗口已经烧到底
+  # （90 + 20 > 100）。请求路据此判整池被挡，可没量过的那家也许还有额度 ——
+  # 这次拒绝是缺尺子的产物，不是预算的。响一格，点名的是没量过的那家的理由；
+  # `measured` 那一格值 0，不响。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_upstream_with_ruler{upstream="u1",reason="measured"}'
+        values: '1x60'
+      - series: 'llm_pool_upstream_with_ruler_observed_timestamp_seconds{upstream="u1",reason="measured"}'
+        values: '3500x60'
+      - series: 'llm_pool_upstream_with_ruler{upstream="u2",reason="spend_unreadable"}'
+        values: '0x60'
+      - series: 'llm_pool_upstream_with_ruler_observed_timestamp_seconds{upstream="u2",reason="spend_unreadable"}'
+        values: '3500x60'
+      - series: 'llm_pool_upstreams_without_ruler'
+        values: '1x60'
+      - series: 'llm_pool_upstreams_without_ruler_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_ready_admission_readings{kind="ready"}'
+        values: '3x60'
+      - series: 'cogneva_ready_admission_readings_observed_timestamp_seconds{kind="ready"}'
+        values: '3500x60'
+      - series: 'llm_pool_paced_upstreams'
+        values: '1x60'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_allowance_tokens'
+        values: '100x60'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_spent_tokens'
+        values: '90x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_reserve_tokens'
+        values: '20x60'
+      - series: 'llm_pool_reserve_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '1x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: llm_pool_paced_on_a_subset_of_its_members
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: spend_unreadable
+
+  # 池自己下线：缺尺子不是这一句要修的东西，池那一族有自己的规则说它。静。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_upstream_with_ruler{upstream="u1",reason="no_window_reported"}'
+        values: '0x60'
+      - series: 'llm_pool_upstream_with_ruler_observed_timestamp_seconds{upstream="u1",reason="no_window_reported"}'
+        values: '3500x60'
+      - series: 'llm_pool_upstreams_without_ruler'
+        values: '1x60'
+      - series: 'llm_pool_upstreams_without_ruler_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_ready_admission_readings{kind="ready"}'
+        values: '3x60'
+      - series: 'cogneva_ready_admission_readings_observed_timestamp_seconds{kind="ready"}'
+        values: '3500x60'
+      - series: 'llm_pool_paced_upstreams'
+        values: '0x60'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_available'
+        values: '0x60'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x60'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: llm_pool_paced_on_a_subset_of_its_members
         exp_alerts: []
