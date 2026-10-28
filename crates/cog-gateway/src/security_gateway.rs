@@ -1685,6 +1685,18 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     // 必须长于写者心跳。
     cog_core::metric_names::LLM_BUDGET_SPENT_TOKENS,
     cog_core::metric_names::LLM_BUDGET_MEASURED_AT_UNIX,
+    // 额度那一族本身：和、它的两个减数、人口与人口的最早时刻、以及分母。它们一直
+    // 在耐久面上写，只是过去写在一个数组循环里，本文件的字面量扫描看不见，于是既
+    // 不在清单里、读它们的窗口也就没被要求宽过心跳。登记它们的理由比上面几条更
+    // 硬：这几条在一段健康窗口里是**常量**（跑满之后的 allowance、规模固定的池的
+    // paced_upstreams），存储确实只在心跳上重写它们，一拍一读会把健康的写者读成
+    // 停了。
+    cog_core::metric_names::LLM_POOL_ALLOWANCE_TOKENS,
+    cog_core::metric_names::LLM_POOL_SPENT_TOKENS,
+    cog_core::metric_names::LLM_POOL_RESERVE_TOKENS,
+    cog_core::metric_names::LLM_POOL_RESERVE_POPULATION,
+    cog_core::metric_names::LLM_POOL_RESERVE_SINCE_UNIX,
+    cog_core::metric_names::LLM_POOL_PACED_UPSTREAMS,
 ];
 
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
@@ -3972,40 +3984,60 @@ fn pace_for_upstream(
 /// `llm_pool_paced_upstreams` 与它们同拍写，读余量的判据必须同时要求它大于 0。
 async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReading) {
     let pace = reading.pool;
-    for (name, value) in [
-        (
-            cog_core::metric_names::LLM_POOL_ALLOWANCE_TOKENS,
-            pace.allowance_tokens as f64,
-        ),
-        (
-            cog_core::metric_names::LLM_POOL_SPENT_TOKENS,
-            pace.spent_tokens as f64,
-        ),
-        (
-            cog_core::metric_names::LLM_POOL_RESERVE_TOKENS,
-            pace.reserve_tokens as f64,
-        ),
-        // 预留在和里是一个数，在读者眼里却要先问它有多实：分位数在三件任务上和
-        // 在三百件任务上印出来同形，把后者读成前者会让 headroom 差出好几倍。
-        // 人口与值同一拍写下去，就是为了不让任何一个只看其中一条。
-        (
-            cog_core::metric_names::LLM_POOL_RESERVE_POPULATION,
-            pace.reserve_population as f64,
-        ),
-        // 人口说"几件任务"，这一格说"那几件是谁的时候的"。少了它，"30 天口径"
-        // 与"今天到现在"仍然同形：一个装了三小时的新部署问 30 天窗口，分位数
-        // 照样给一个像模像样的数。
-        (
-            cog_core::metric_names::LLM_POOL_RESERVE_SINCE_UNIX,
-            reading.reserve_since_unix as f64,
-        ),
-        (
-            cog_core::metric_names::LLM_POOL_PACED_UPSTREAMS,
-            pace.measured_upstreams as f64,
-        ),
-    ] {
-        record_gauge(state, name, value, &[]).await;
-    }
+    // 六条各写各的调用点，不进数组循环。耐久面那一份是无条件写的（`record_gauge`
+    // 先把值交给进程内注册表，再写共享表），所以这六条本来就和别的池读数一样活得
+    // 比进程久；但 `durable_pool_gauges_is_exactly_what_the_funnel_is_called_with`
+    // 按 `record_gauge(` 的平衡括号找名字字面量，循环变量在它眼里什么都不是——写成
+    // 一个数组，六条就一起从「读它的窗口必须宽过写者心跳」的判据里消失，而且是
+    // 静默地消失。展开成六个调用点，清单和调用点才对得上。
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_ALLOWANCE_TOKENS,
+        pace.allowance_tokens as f64,
+        &[],
+    )
+    .await;
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_SPENT_TOKENS,
+        pace.spent_tokens as f64,
+        &[],
+    )
+    .await;
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_RESERVE_TOKENS,
+        pace.reserve_tokens as f64,
+        &[],
+    )
+    .await;
+    // 预留在和里是一个数，在读者眼里却要先问它有多实：分位数在三件任务上和
+    // 在三百件任务上印出来同形，把后者读成前者会让 headroom 差出好几倍。
+    // 人口与值同一拍写下去，就是为了不让任何一个只看其中一条。
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_RESERVE_POPULATION,
+        pace.reserve_population as f64,
+        &[],
+    )
+    .await;
+    // 人口说"几件任务"，这一格说"那几件是谁的时候的"。少了它，"30 天口径"
+    // 与"今天到现在"仍然同形：一个装了三小时的新部署问 30 天窗口，分位数
+    // 照样给一个像模像样的数。
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_RESERVE_SINCE_UNIX,
+        reading.reserve_since_unix as f64,
+        &[],
+    )
+    .await;
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_PACED_UPSTREAMS,
+        pace.measured_upstreams as f64,
+        &[],
+    )
+    .await;
     // 上面四个和只加进量到窗口的成员，而请求路的 `blocked()` 拿它们判整池。少了
     // 谁、以及那一家为什么少，只有下面这一对说得出来：一个没有尺子的成员在和的
     // 读数上与「它没有额度」逐字同形，可一个要等窗口复位、一个要先给它接尺子。
