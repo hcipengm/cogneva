@@ -27,12 +27,46 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::mainline_deployer::FATAL_WAITING_REASONS;
 use crate::GitOpsConfig;
 use cog_core::{
     PromotionLedger, PromotionRecord, PromotionStatus, SFError, SFResult,
     COUNTER_SEMANTICS_CUMULATIVE, COUNTER_SEMANTICS_MARKER,
 };
 use tracing::{debug, info, warn};
+
+/// 一行 `restartCount ready waitingReason` 的判定：`Some(理由)` 即这一行算病。
+///
+/// 判死的那组词读的是滚动侧同一份声明 [`FATAL_WAITING_REASONS`]，镜像拉取失败
+/// **不在**其中。这里曾经另抄一份五词的清单，把 `ErrImagePull` 与
+/// `ImagePullBackOff` 也判死——滚动侧早就把这两个词单独收成一组并写明理由：拉取
+/// 失败可能只是 registry 此刻在重启，判死就会 undo 掉一份完好的版本（线上实测过
+/// 一次）。持续拉不到镜像不会因此被放过：宽限期一过 `ready` 仍不是 `true`，第二条
+/// 会判败，而 `line` 里带着等待原因，病名不会丢。
+///
+/// 抽成纯函数是为了能判：这条判据读的是词表与软硬两个界，三者都要在没有集群的
+/// 时候能钉住。
+fn canary_pod_verdict(line: &str, allow_pending: bool) -> Option<String> {
+    let mut parts = line.split_whitespace();
+    let restarts: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let ready = parts.next().unwrap_or("false");
+    let waiting_reason = parts.next().unwrap_or("");
+    if FATAL_WAITING_REASONS.contains(&waiting_reason) {
+        return Some(format!(
+            "pod in fatal waiting state {waiting_reason} during canary: {line}"
+        ));
+    }
+    if ready != "true" && !allow_pending {
+        return Some(format!("pod not ready during canary: {line}"));
+    }
+    // 金丝雀新副本 restart > 0 说明新代码崩过。
+    if restarts > 1 {
+        return Some(format!(
+            "pod restarting during canary ({restarts} restarts)"
+        ));
+    }
+    None
+}
 
 /// Rule name for this process's own alert: a canary metric gate spent a whole
 /// watch without a reading, for a reason that traffic does not explain.
@@ -1285,7 +1319,8 @@ impl GitOpsPuller {
 
     /// k8s 信号：deployment 任一 pod 处于非 Ready/重启次数上升即异常。
     /// `allow_pending` 为宽限期标志：true 时容忍 not-ready（容器还在拉起），
-    /// 但致命等待态（拉不到镜像、配置错误）无论是否在宽限期都立即异常。
+    /// 但无自救可能的等待态（镜像引用非法、挂载/配置错误、反复崩溃）无论是否在
+    /// 宽限期都立即异常。判死的那组词与滚动侧是同一份声明，不在这里另抄。
     async fn check_pods_healthy(&self, allow_pending: bool) -> SFResult<()> {
         // Pod 标签是 app.kubernetes.io/name=<deployment>；此前误用 app=<deployment>
         // 匹配零个 Pod，看护空转通过（2026-08-07 双集群实测）。
@@ -1318,32 +1353,8 @@ impl GitOpsPuller {
             ));
         }
         for line in out.lines() {
-            let mut parts = line.split_whitespace();
-            let restarts: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let ready = parts.next().unwrap_or("false");
-            let waiting_reason = parts.next().unwrap_or("");
-            if matches!(
-                waiting_reason,
-                "ImagePullBackOff"
-                    | "ErrImagePull"
-                    | "InvalidImageName"
-                    | "CreateContainerConfigError"
-                    | "CrashLoopBackOff"
-            ) {
-                return Err(SFError::Agent(format!(
-                    "pod in fatal waiting state {waiting_reason} during canary: {line}"
-                )));
-            }
-            if ready != "true" && !allow_pending {
-                return Err(SFError::Agent(format!(
-                    "pod not ready during canary: {line}"
-                )));
-            }
-            // 金丝雀新副本 restart > 0 说明新代码崩过。
-            if restarts > 1 {
-                return Err(SFError::Agent(format!(
-                    "pod restarting during canary ({restarts} restarts)"
-                )));
+            if let Some(why) = canary_pod_verdict(line, allow_pending) {
+                return Err(SFError::Agent(why));
             }
         }
         Ok(())
@@ -2593,6 +2604,52 @@ fn mounters_of_config(manifest: &str) -> SFResult<Vec<(&'static str, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 拉取失败不是「这个版本坏」：registry 此刻在重启也会写成 `ErrImagePull`，
+    /// 宽限期内把它判死，undo 掉的是一份完好的版本。滚动侧为这件事写过一段
+    /// 实测（一次 support apply 让 registry 与四个后端一起重启，目标 Pod 四秒后
+    /// 被判版本类失败）。金丝雀这一侧原先是另抄的五词清单，两个拉取类的词也在
+    /// 里面——这条断言就是那次分叉的钉子。
+    #[test]
+    fn an_image_pull_failure_inside_the_grace_is_not_a_canary_fault() {
+        for reason in crate::mainline_rollout::IMAGE_PULL_WAITING_REASONS {
+            let line = format!("0 false {reason}");
+            assert_eq!(
+                canary_pod_verdict(&line, true),
+                None,
+                "{reason} 是拉取失败，不是版本坏：宽限期内不判死"
+            );
+            // 宽限期过了仍不是 ready，那就是真病了——判据不会因此放过一个永远
+            // 拉不到镜像的版本。
+            assert!(
+                canary_pod_verdict(&line, false).is_some(),
+                "{reason} 在宽限期后仍不对就是判败"
+            );
+        }
+    }
+
+    /// 无自救可能的等待态不等宽限期：出现即判败。
+    #[test]
+    fn a_waiting_state_that_never_heals_is_fatal_even_inside_the_grace() {
+        for reason in crate::mainline_deployer::FATAL_WAITING_REASONS {
+            let line = format!("0 false {reason}");
+            let verdict = canary_pod_verdict(&line, true).expect("判死");
+            assert!(
+                verdict.contains(reason),
+                "判词要点名是哪种等待态：{verdict}"
+            );
+        }
+    }
+
+    /// 重启次数与 ready 是另外两条界，与那张词表无关。
+    #[test]
+    fn restarts_and_readiness_are_judged_on_their_own_bounds() {
+        assert!(canary_pod_verdict("2 true ", false).is_some());
+        assert_eq!(canary_pod_verdict("1 true ", false), None);
+        assert!(canary_pod_verdict("0 false ", false).is_some());
+        assert_eq!(canary_pod_verdict("0 false ", true), None);
+        assert_eq!(canary_pod_verdict("0 true ", false), None);
+    }
 
     /// 灰度判据瞎了那一行，必须自己说出该谁动。它不是规则库里的规则，没有配置
     /// 可以申报面，所以这一格只能在代码里，且只能由这条断言看着——删掉那一行
