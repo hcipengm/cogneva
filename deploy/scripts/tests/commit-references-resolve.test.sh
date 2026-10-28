@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# A push may not add a `crate::<name>` reference its own tree cannot answer.
+# A push may not add a reference or a module declaration its own tree cannot answer.
 #
 # The failure this pins is invisible to every local reading: on 2026-10-29 a
 # commit carried `use crate::test_support::scrape;` while the file that defines
@@ -10,12 +10,18 @@
 #
 # Both directions are load-bearing. A gate that never fires leaves the rule
 # unenforced; a gate that fires on a legitimate commit blocks every push until
-# someone deletes it. So the fixtures pin the red case and the four shapes that
-# must stay green: a module file added alongside its reference, a path quoted in
-# prose and in a string literal, a root item, and a re-exported module reached
-# through `pub use`. The census that preceded this gate (200 commits, one hit --
-# the break above) is what says the resolver knows those shapes; this test is
-# what says it keeps knowing them.
+# someone deletes it. So the fixtures pin the red cases and the shapes that must
+# stay green: a module file added alongside its reference, a path quoted in prose
+# and in a string literal, a root item, a re-exported module reached through
+# `pub use`, a `#[path]` declaration pointing elsewhere, and a `mod x;` written
+# beside a file that sits in a subdirectory.
+#
+# The declarations are the second half, and the first draft of the gate got them
+# exactly backwards: it read `mod x;` as the proof that `crate::x` resolves, so a
+# push that added `mod orphan;` and no `orphan.rs` was green, and so was a push
+# that added `crate::orphan` together with the declaration that was supposed to
+# answer it. Both compile nowhere. They are pinned below (found 2026-10-29 by the
+# session watching the rollout, with fixtures).
 #
 # An unasked question is never green: a range that does not resolve must exit 2,
 # not 0.
@@ -111,12 +117,88 @@ git add crates
 reexport="$(commit 'reach a re-export and a root item')"
 out="$("${checker}" --base "${prose}" --head "${reexport}" 2>&1)" || fail "root item / re-export stayed red"$'\n'"${out}"
 
-# 5. An unasked question is never green.
-if "${checker}" --base does-not-exist --head "${reexport}" >/dev/null 2>&1; then
+# 5. Red: a declaration alone is a promise the tree has to keep. Taking it as
+#    proof of itself is what made the first draft blind to this shape.
+cat >crates/demo/src/lib.rs <<'RS'
+pub mod alpha;
+pub mod beta;
+pub mod orphan;
+pub fn f() {
+    crate::alpha::g();
+}
+RS
+git add crates
+orphan="$(commit 'declare a module whose file is still in the working tree')"
+out="$("${checker}" --base "${reexport}" --head "${orphan}" 2>&1)" && status=0 || status=$?
+[ "${status}" -eq 1 ] || fail "a declaration with no file exited ${status}, wanted 1"$'\n'"${out}"
+grep -q 'mod orphan' <<<"${out}" || fail "the red did not name mod orphan"$'\n'"${out}"
+
+# 6. Red: the reference and the declaration that is supposed to answer it, both
+#    added, neither backed by a file. The declaration must not discharge itself.
+cat >crates/demo/src/lib.rs <<'RS'
+pub mod alpha;
+pub mod beta;
+pub mod ghost;
+pub fn f() {
+    crate::alpha::g();
+    crate::ghost::g();
+}
+RS
+git add crates
+ghost="$(commit 'declare and call a module, ship no file')"
+out="$("${checker}" --base "${orphan}" --head "${ghost}" 2>&1)" && status=0 || status=$?
+[ "${status}" -eq 1 ] || fail "a self-answering declaration exited ${status}, wanted 1"$'\n'"${out}"
+grep -q 'mod ghost' <<<"${out}" || fail "the red did not name mod ghost"$'\n'"${out}"
+
+# 7. Green: `#[path]` decides where the file is, even outside the module tree.
+mkdir -p crates/demo/src/elsewhere
+cat >crates/demo/src/lib.rs <<'RS'
+pub mod alpha;
+pub mod beta;
+pub mod ghost;
+#[path = "elsewhere/relocated.rs"]
+pub mod relocated;
+pub fn f() {
+    crate::alpha::g();
+    crate::ghost::g();
+}
+RS
+echo 'pub fn g() {}' >crates/demo/src/elsewhere/relocated.rs
+git add crates
+relocated="$(commit 'point #[path] at a file outside the module tree')"
+out="$("${checker}" --base "${ghost}" --head "${relocated}" 2>&1)" || fail "#[path] was read as a missing file"$'\n'"${out}"
+
+# 8. Green: a `mod x;` written beside a file in a subdirectory. Rust looks in a
+#    directory of the module's name, so a check that insisted on the declaring
+#    file's own directory would red this legitimate shape.
+mkdir -p crates/demo/src/nested
+cat >crates/demo/src/nested/inline.rs <<'RS'
+pub mod leaf;
+RS
+echo 'pub fn g() {}' >crates/demo/src/nested/leaf.rs
+cat >crates/demo/src/lib.rs <<'RS'
+pub mod alpha;
+pub mod beta;
+pub mod ghost;
+#[path = "elsewhere/relocated.rs"]
+pub mod relocated;
+pub mod nested;
+pub fn f() {
+    crate::alpha::g();
+    crate::ghost::g();
+}
+RS
+echo 'pub mod inline;' >crates/demo/src/nested/mod.rs
+git add crates
+nested="$(commit 'declare a module under a directory of its own name')"
+out="$("${checker}" --base "${relocated}" --head "${nested}" 2>&1)" || fail "a nested mod was read as missing"$'\n'"${out}"
+
+# 9. An unasked question is never green.
+if "${checker}" --base does-not-exist --head "${nested}" >/dev/null 2>&1; then
   fail "an unresolvable base exited 0"
 fi
 status=0
-"${checker}" --base does-not-exist --head "${reexport}" >/dev/null 2>&1 || status=$?
+"${checker}" --base does-not-exist --head "${nested}" >/dev/null 2>&1 || status=$?
 [ "${status}" -eq 2 ] || fail "an unresolvable base exited ${status}, wanted 2"
 
 echo "PASS commit-references-resolve"
