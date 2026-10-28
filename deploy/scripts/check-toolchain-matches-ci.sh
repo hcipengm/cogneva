@@ -14,7 +14,8 @@
 #   1. `rust-toolchain.toml` 在，通道是 stable——版本号钉死会让「能不能过」变成
 #      「某个编译器能不能过」，本机装的是另一个；
 #   2. `.github/workflows/` 里每一处 `dtolnay/rust-toolchain@X` 的 X 都是 stable，
-#      没有一处写死版本号（写死的那一处就是下一个分叉点）；
+#      没有一处写死版本号（写死的那一处就是下一个分叉点）；**且至少要读到一处**——
+#      读到零处时这一条什么都证明不了，与「一处都没写死」在输出上同形；
 #   3. 本机 stable 不落后于已发布的 stable（`rustup check`）。离线时打一行 SKIP
 #      然后放行：问不到不等于问过了红，也不等于没问过绿。
 #
@@ -46,11 +47,28 @@ PY
 fi
 
 # 工作流里不许出现带版本号的 rust-toolchain：那一处就是下一个分叉点。
-while IFS= read -r hit; do
-    [ -n "$hit" ] || continue
-    problems+=("$hit 写死了工具链版本——它绕过了 $TOML，stable 发布时这一处不会跟着动")
-done < <(grep -rEo 'dtolnay/rust-toolchain@[^[:space:]]+' .github/workflows/ 2>/dev/null \
-         | grep -v 'dtolnay/rust-toolchain@stable' | sed 's/^/形如 /')
+#
+# 读到的条数本身就是判据：这一条问的是「有没有写死的版本号」，而读到零处与
+# 「没有写死不认识」在输出上同形——目录没进仓库、名字改了、工作流换了装 rust 的
+# 方式，都会让这一条一声不响地绿。所以零处按红的算，并说清零的是哪一个读数；
+# 读失败（权限、路径是文件）同样算问题，不当作「没匹配」。
+# 文件名留在命中里（`-o` 不带 `-h`），红的时候才能点出是哪一份工作流。
+refs=""
+refs_status=0
+refs="$(grep -rEo 'dtolnay/rust-toolchain@[^[:space:]]+' .github/workflows/ 2>&1)" || refs_status=$?
+if [ "$refs_status" -gt 1 ]; then
+    problems+=("读 .github/workflows/ 失败（grep 退出 ${refs_status}）：${refs}——这一条判据没有读到任何工作流")
+elif [ -z "$refs" ]; then
+    problems+=(".github/workflows/ 里一处 dtolnay/rust-toolchain@ 都没有读到——零处与「没有写死的版本号」在输出上同形，这条判据此刻什么都没证明")
+else
+    while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        if [ "${hit##*:}" = "dtolnay/rust-toolchain@stable" ]; then
+            continue
+        fi
+        problems+=("$hit 写死了工具链版本——它绕过了 $TOML，stable 发布时这一处不会跟着动")
+    done <<<"$refs"
+fi
 
 # 本机 stable 是否落后。离线放行，但要留下那一行。
 #

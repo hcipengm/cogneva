@@ -19,7 +19,9 @@
 # What this test pins, one case per leg:
 #   1. the clean tree passes;
 #   2. a pinned channel in the toml is refused;
-#   3. a pinned version in a workflow is refused;
+#   3. a pinned version in a workflow is refused — and so is a workflow set the
+#      gate could not read at all (zero references, or no directory), because an
+#      empty reading and a clean reading print the same "no pinned versions";
 #   4. a machine whose stable is behind is refused — but the same machine under
 #      GITHUB_ACTIONS is not. Case 4 is the one that goes red if the CI half is
 #      ever folded back in, and it needs no network and no real rustup.
@@ -87,6 +89,26 @@ fi
 printf '%s' "${out}" | grep -q 'dtolnay/rust-toolchain@1.99.0' \
     || fail "红的时候要点名那一处，实际：${out}"
 
+# 3b) 一处都没读到：零处与「一处都没写死」在输出上完全同形，所以零处要红，
+#     并且说清是「没读到」而不是「写死了什么」。
+d="$(scratch empty-population)"
+printf 'jobs:\n  x:\n    steps:\n      - uses: actions/checkout@v4\n' \
+    > "${d}/.github/workflows/ci.yml"
+if out="$(run_gate "${d}" 2>&1)"; then
+    fail "工作流里一处 rust-toolchain 都没有时这条门应当红（否则它把「没读到」印成绿）：${out}"
+fi
+printf '%s' "${out}" | grep -q '一处 dtolnay/rust-toolchain@ 都没有读到' \
+    || fail "零处的时候要说明清的是「没读到」：${out}"
+
+# 3c) 目录根本不在：读失败也是红，不能当作「没匹配」。
+d="$(scratch no-workflows-dir)"
+rm -rf "${d}/.github/workflows"
+if out="$(run_gate "${d}" 2>&1)"; then
+    fail ".github/workflows/ 不存在时这条门应当红，实际绿：${out}"
+fi
+printf '%s' "${out}" | grep -q '读 .github/workflows/ 失败' \
+    || fail "读失败要单独说一句：${out}"
+
 # 4a) a machine whose stable is behind: still the case this gate exists for
 fake="${work}/fakebin"
 mkdir -p "${fake}"
@@ -124,4 +146,4 @@ fi
 printf '%s' "${out}" | grep -q 'update available' \
     || fail "红的时候要带出 rustup 说的那句话：${out}"
 
-echo "toolchain-matches-ci：五支各判一次，干净树绿"
+echo "toolchain-matches-ci：七支各判一次，干净树绿"
