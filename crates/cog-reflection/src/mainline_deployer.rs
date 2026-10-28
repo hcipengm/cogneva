@@ -21271,6 +21271,112 @@ exit 0
         assert!(err.to_string().contains("stuck in startup phase"), "{err}");
     }
 
+    /// 单个不带 init 容器的目标：主应用。就绪阶段从 apply 起算，没有启动阶段。
+    fn main_app_plan(tag: &str) -> RolloutPlan {
+        RolloutPlan {
+            tag: tag.to_string(),
+            targets: vec![RolloutTarget {
+                deployment: "cogneva".into(),
+                container: "cogneva".into(),
+                component: "cogneva".into(),
+                name: "cogneva".into(),
+            }],
+            traceparent: None,
+            manifests_dir: None,
+        }
+    }
+
+    /// 假 kubectl：主应用的新副本一直没就绪，Pod 采样里的容器启动时刻取
+    /// `age_secs` 秒之前——传 0 就是「每次采样时它都刚刚重启」，传一个远大于
+    /// 就绪预算的数就是「这个容器已经跑完了它自己的整段预算」。第 4 轮收敛
+    /// 且该副本就绪；`converges = false` 则永远不收敛。
+    fn fake_kubectl_restarting_pod(dir: &Path, age_secs: u64, converges: bool) -> String {
+        let log = dir.join("kubectl.log");
+        let count = dir.join("poll.count");
+        let converge_cond = if converges {
+            r#"[ "$n" -ge 4 ]"#
+        } else {
+            "false"
+        };
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+n=$(cat '{count}' 2>/dev/null || echo 0)
+case "$*" in
+  *"initContainers"*) echo "" ;;
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"generation"*)
+    n=$((n+1)); echo "$n" > '{count}'
+    if {converge_cond}; then echo "1|1|1|1|1|"; else echo "1|1|1|1|0|1"; fi
+    ;;
+  *"deletionTimestamp"*)
+    started=$(date -u -d '-{age} sec' +%Y-%m-%dT%H:%M:%SZ)
+    if {converge_cond}; then echo "p-new|Running|true|||$started|"; else echo "p-new|Running|false|||$started|"; fi
+    ;;
+  *"restartCount"*)
+    if {converge_cond}; then echo "1 true "; else echo "1 false "; fi
+    ;;
+  *"waiting.reason"*) ;;
+  *"get pods"*) ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = count.display(),
+            converge_cond = converge_cond,
+            age = age_secs
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
+    /// 容器中途退出重来，不能让新容器替上一次的启动买单。
+    ///
+    /// 墙钟上的就绪预算从 apply 起算，而容器被杀重来后只跑了几十秒：真实现场是
+    /// 启动时抢不到 schema 锁（仍在服务的旧副本占着），容器退出、重启、四分钟后
+    /// 才 ready，判词却写成「就绪阶段超时」。预算 5 秒、每轮采样里容器都是刚起
+    /// 的，只有按容器自己的启动时刻重算才可能等到第 4 轮的就绪。
+    #[tokio::test]
+    async fn a_container_that_kept_restarting_is_not_judged_at_the_wall_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_restarting_pod(&bin_dir, 0, true);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 5, 300);
+        let plan = main_app_plan("localhost:30500/cogneva:main-new");
+
+        executor
+            .run(&plan)
+            .await
+            .expect("a restart inside the boot must not be charged to the new container");
+    }
+
+    /// 重算不等于无限等：一个跑满自己整段预算仍未就绪的容器照旧判败。
+    #[tokio::test]
+    async fn a_container_past_its_own_budget_still_fails_at_the_wall_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let kubectl = fake_kubectl_restarting_pod(&bin_dir, 600, false);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 5, 300);
+        let plan = main_app_plan("localhost:30500/cogneva:main-new");
+
+        let err = executor.run(&plan).await.unwrap_err();
+        assert!(
+            err.to_string().contains("did not complete within 5s"),
+            "{err}"
+        );
+    }
+
     /// 假 kubectl：第一轮轮询里选择器匹配到的还是旧 Pod（它的 init 早已结束），
     /// 新 Pod 的 init 从第二轮起才在跑，第三轮滚动收敛。
     fn fake_kubectl_old_pod_outlives_the_new_pod_init(dir: &Path) -> String {

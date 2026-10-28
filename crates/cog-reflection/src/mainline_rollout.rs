@@ -407,6 +407,30 @@ pub(crate) fn readiness_overdue(
         .unwrap_or(false)
 }
 
+/// 就绪预算到期时，按**最新副本自己的容器启动时刻**再看一次该不该判死。
+///
+/// 返回应当延到的时刻；没有未就绪的副本、它自己的预算已经用尽、或者它压根还
+/// 没有启动时刻（还在调度与拉镜像，那一段由启动预算兜底）时返回 None。
+///
+/// 这一问存在的理由是一次重启：容器退出重来会重置 kubelet 自己的判定周期，
+/// 而外层预算是从**进入就绪阶段**起算的墙钟，重启前那段时间也记在新容器头上。
+/// 启动时抢不到 schema 锁（仍在服务的旧副本占着）就会走这一条：容器被杀、
+/// 重来、四分钟后才 ready，而墙钟早就到点了——判词写着「就绪阶段超时」，
+/// 新容器实际只跑了几十秒。按容器自己的起点重算不会让崩循环无限等：调用方
+/// 拿启动预算封顶，重启再多次也到不了那里。
+pub(crate) fn readiness_rearm(
+    samples: &[PodSample],
+    budget: Duration,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let anchor = readiness_anchor(samples)?;
+    let ran = now.signed_duration_since(anchor).to_std().ok()?;
+    if ran >= budget {
+        return None;
+    }
+    Some(anchor + chrono::Duration::from_std(budget).ok()?)
+}
+
 /// 判词里附着的现场采样，接在分隔符**之后**。
 ///
 /// 这一段是集群写的：Pod 的相位、事件原文、容器留下的终止消息。判据只读分隔符
@@ -3785,12 +3809,31 @@ impl RolloutExecutor {
             } else {
                 (self.rollout_timeout_secs, "readiness")
             };
-            let deadline = if starting {
+            let mut deadline = if starting {
                 startup_deadline
             } else {
                 *readiness_deadline
                     .get_or_insert_with(|| now + Duration::from_secs(self.rollout_timeout_secs))
             };
+            // 到期不等于判死：容器中途退出重来会把墙钟上重启前的那段也记到新
+            // 容器头上。先按最新副本自己的启动时刻重算一次，够预算就把这一次的
+            // 到期时刻往后推；整段仍由启动预算封顶，崩循环到不了那里。
+            if now >= deadline && !starting {
+                let samples = self.sample_rollout_pods(t).await;
+                if let Some(rearmed) = readiness_rearm(
+                    &samples,
+                    Duration::from_secs(self.rollout_timeout_secs),
+                    Utc::now(),
+                ) {
+                    if let Ok(rem) = rearmed.signed_duration_since(Utc::now()).to_std() {
+                        let until = (now + rem).min(startup_deadline);
+                        if until > now {
+                            readiness_deadline = Some(until);
+                            deadline = until;
+                        }
+                    }
+                }
+            }
             if now >= deadline {
                 // 超时才采样：正常路径一次 kubectl 都不多花。
                 let replicasets = self.sample_replicaset_failures(t).await;
