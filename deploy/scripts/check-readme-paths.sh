@@ -29,15 +29,32 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../.." && pwd)"
 
 files=("$@")
+defaulted=0
 if [ "${#files[@]}" -eq 0 ]; then
   files=("${repo}/README.md" "${repo}/README.zh-CN.md")
+  defaulted=1
 fi
+
+# 判过多少处「像路径」的串。自己选人口时（两份 README），零处与「每一处都还在」
+# 在输出上同形：正则写坏了、README 被换成一段没有路径的简介，都印「绿」。
+path_floor=5
+judged=0
 
 bad=0
 for f in "${files[@]}"; do
   [ -f "${f}" ] || { echo "check-readme-paths: 没有这个文件：${f}" >&2; exit 2; }
+  # 读失败（grep 退出 >1）不是「这个文件里没有路径」：文件在而读不出来时，
+  # 这一份就是零命中，零命中在下面与「全都还在」走同一条路。
+  hits=""
+  grep_status=0
+  hits="$(grep -noE '`[^`]+`' "${f}")" || grep_status=$?
+  if [ "${grep_status}" -gt 1 ]; then
+    echo "check-readme-paths: 读不出 ${f}（grep 退出 ${grep_status}）——没读到就判不了里面的路径" >&2
+    exit 2
+  fi
   # grep -o 会丢掉行号，判词要指到行才可修，所以用 -n 并在这里拆。
   while IFS= read -r hit; do
+    [ -n "${hit}" ] || continue
     lineno="${hit%%:*}"
     token="${hit#*:}"
     token="${token//\`/}"
@@ -46,14 +63,24 @@ for f in "${files[@]}"; do
     esac
     case "${token}" in */*) ;; *) continue ;; esac
     case "${token##*/}" in *.*) ;; *) continue ;; esac
+    judged=$((judged + 1))
     [ -e "${repo}/${token}" ] && continue
     [ -e "${repo}/crates/${token}" ] && continue
     printf '%s:%s: 点名的路径不在这棵树里：%s\n' "${f}" "${lineno}" "${token}" >&2
     bad=1
-  done < <(grep -noE '`[^`]+`' "${f}" || true)
+  done <<<"${hits}"
 done
 
 if [ "${bad}" -ne 0 ]; then
   echo "改法：把路径改成它今天真实的位置（或把文件放回被点名的那一处）。" >&2
   exit 1
+fi
+
+# 只有门自己挑人口时才要求下限：调用方点名一份文档时，那份文档里没有路径就是它
+# 今天的实情；而两份 README 是这个门服务的对外承诺，里面一处路径都认不出来，说明
+# 认路径的那一步坏了，不是文档变干净了。
+if [ "${defaulted}" -eq 1 ] && [ "${judged}" -lt "${path_floor}" ]; then
+  echo "check-readme-paths: 两份 README 里只认出 ${judged} 处像路径的串（下限 ${path_floor}）——" >&2
+  echo "零处与「每一处都还在」印出来一模一样，这一跑什么都没证明。" >&2
+  exit 3
 fi

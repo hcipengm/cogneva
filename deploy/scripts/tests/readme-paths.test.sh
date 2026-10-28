@@ -74,11 +74,50 @@ case "${out}" in
   *) fail "lineno: 判词没有指到第 2 行 —— ${out}" ;;
 esac
 
-# 真文件：仓库根的两份 README 今天必须绿。
+# 读不出来不等于「里面没有路径」：这是「一个存在的普通文件，但 grep 读不动」的形状，
+# 用 /proc/self/mem 是因为它对 root 也一样读不动（chmod 000 对 root 无效，夹具会在
+# 某些宿主上假绿）。旧脚本把它当零命中，印绿。
+if [ -e /proc/self/mem ]; then
+  got=0
+  out="$(bash "${checker}" /proc/self/mem 2>&1)" || got=$?
+  [ "${got}" -eq 2 ] || fail "unreadable: exit ${got}, wanted 2 —— ${out}"
+  case "${out}" in
+    *读不出*) ;;
+    *) fail "unreadable: 判词没说清是读不出来 —— ${out}" ;;
+  esac
+fi
+
+# 门自己挑人口时（不给参数 ⇒ 两份 README），一处路径都认不出来 ⇒ 3：零处与
+# 「每一处都还在」在输出上同形。用一个自己的小树测，否则要动真 README。
+tree="${work}/tree"
+mkdir -p "${tree}/deploy/scripts"
+cp "${checker}" "${tree}/deploy/scripts/check-readme-paths.sh"
+printf '# 项目简介\n\n一段话，一个反引号也没有。\n' >"${tree}/README.md"
+printf '# 项目简介\n\n一段话，一个反引号也没有。\n' >"${tree}/README.zh-CN.md"
+got=0
+out="$(cd "${tree}" && bash "${tree}/deploy/scripts/check-readme-paths.sh" 2>&1)" || got=$?
+[ "${got}" -eq 3 ] || fail "collapsed: exit ${got}, wanted 3 —— ${out}"
+case "${out}" in
+  *"下限"*) ;;
+  *) fail "collapsed: 判词没说是人口塌了 —— ${out}" ;;
+esac
+
+# 调用方点名一份没有路径的文档 ⇒ 仍绿：那份文档里没有路径就是它今天的实情，
+# 门不该为了自己的下限去逼文档写路径。
+printf '# 简介\n\n没有反引号。\n' >"${work}/plain.md"
+got=0
+out="$(bash "${checker}" "${work}/plain.md" 2>&1)" || got=$?
+[ "${got}" -eq 0 ] || fail "plain_doc: exit ${got}, wanted 0 —— ${out}"
+
+# 真文件：仓库根的两份 README 今天必须绿——给文件与不给文件两条路都走一遍，
+# 后者走的就是带下限的那条。
 for f in "${repo}/README.md" "${repo}/README.zh-CN.md"; do
   got=0
   out="$(bash "${checker}" "${f}" 2>&1)" || got=$?
   [ "${got}" -eq 0 ] || fail "$(basename "${f}") 里有死指针：${out}"
 done
+got=0
+out="$(bash "${checker}" 2>&1)" || got=$?
+[ "${got}" -eq 0 ] || fail "no-arg run on the real tree: exit ${got} —— ${out}"
 
 echo "readme-paths.test: all checks passed"
