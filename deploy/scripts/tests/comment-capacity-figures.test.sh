@@ -7,6 +7,7 @@
 #   3. 基线里的老账 ⇒ 绿，且只许缩：新加一条不在基线里的 ⇒ 照样红。
 #   4. 代码里的容量常量（非注释）不读——那不是散文，是配置。
 #   5. `--stock` 只报不判，退 0。
+#   6. 读不动的路径 ⇒ 红：读失败交回来零命中，与「这行干净」同形。
 set -uo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 gate="$(cd "$here/.." && pwd)/check-comment-capacity-figures.sh"
@@ -135,6 +136,13 @@ fi
 out=$(cd / && bash "$gen/deploy/scripts/check-comment-capacity-figures.sh" 2>&1); rc=$?
 ck_rc "从别的目录跑（不带参数）照样判得出红" 1 "$rc"
 ck_has "点名手写清单那一行" "deploy/k3s/y.yaml" "$out"
+
+# 9. 读不动的路径不是「这一行干净」：读失败交回来零命中，而这条门的绿正是零命中。
+#    目录对任何调用者都读不动，所以这一条不取决于谁在跑。
+mkdir -p "$tmp/not-a-file"
+out=$(run "$tmp/not-a-file" 2>&1); rc=$?
+ck_rc "读不动的路径 ⇒ 红" 1 "$rc"
+ck_has "说清是读不出来，不是没有容量数字" "读不出这些文件" "$out"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

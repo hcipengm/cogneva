@@ -98,12 +98,29 @@ done
 # 归属标记：说清这个数是谁的——实测/本机/默认/例如，或一个日期。
 unit='(KiB|MiB|GiB|TiB|PiB|KB|MB|GB|TB|PB|Ki|Mi|Gi|Ti)'
 provenance='实测|本机|这台|该机|本地|默认|例如|如 |[0-9]{4}-[0-9]{2}-[0-9]{2}|measured|on this host|by default|e\.g\.'
+# 读不出来的文件不是「这行干净」：一条读失败交回来零命中，与一份没有容量数字的
+# 文件在输出上完全同形，而这条门的绿正是「零命中」。所以 grep 自己的退出码要收下：
+# 大于 1 是它读不动（权限、路径是目录、名字不存在），按红算；退出码 1 才是没有命中。
+comment_lines=""
+grep_status=0
+comment_lines="$(grep -nH -E "^[[:space:]]*(#|//|/\*|\*)" "${files[@]}" 2>&1)" || grep_status=$?
+if [ "$grep_status" -gt 1 ]; then
+    echo "FAIL: 读不出这些文件（grep 退出 ${grep_status}）：${comment_lines}——没读到就判不了里面有没有容量数字" >&2
+    exit 1
+fi
+annotation_lines=""
+if [ "${#yaml_files[@]}" -gt 0 ]; then
+    annotation_lines="$(grep -nH -E "^[[:space:]]*(summary|description|message|title):" "${yaml_files[@]}" 2>&1)" || grep_status=$?
+    if [ "$grep_status" -gt 1 ]; then
+        echo "FAIL: 读不出这些 YAML（grep 退出 ${grep_status}）：${annotation_lines}——没读到就判不了告警注解里的容量数字" >&2
+        exit 1
+    fi
+fi
+
 hits="$(
     {
-        grep -nH -E "^[[:space:]]*(#|//|/\*|\*)" "${files[@]}" 2>/dev/null
-        if [ "${#yaml_files[@]}" -gt 0 ]; then
-            grep -nH -E "^[[:space:]]*(summary|description|message|title):" "${yaml_files[@]}" 2>/dev/null
-        fi
+        printf '%s\n' "$comment_lines"
+        printf '%s\n' "$annotation_lines"
     } | grep -E "[0-9]+(\.[0-9]+)?[[:space:]]*${unit}([^A-Za-z0-9]|$)" \
       | grep -vE "$provenance" || true
 )"
