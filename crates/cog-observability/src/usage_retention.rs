@@ -253,12 +253,15 @@ impl UsageRetention {
         .map(|row| row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("floor"))
     }
 
+    /// Rows in the ledger, through the same statement the capacity sweeps use:
+    /// this count and theirs are read side by side on one panel, so the two
+    /// must be the same measurement rather than two that happen to agree today.
     async fn row_count(&self) -> SFResult<i64> {
-        sqlx::query(&format!("SELECT count(*) AS n FROM {LEDGER_TABLE}"))
+        let sql = cog_core::sql::relation_rows_sql(LEDGER_TABLE);
+        sqlx::query_scalar(&sql)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| SFError::Database(e.to_string()))
-            .map(|row| row.get::<i64, _>("n"))
     }
 
     /// The age of the oldest row in the ledger, in seconds.

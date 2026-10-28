@@ -661,7 +661,7 @@ pub async fn backup_postgres(
 
     for table in &tables {
         validate_table_name(table)?;
-        let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{table}\""))
+        let rows: i64 = sqlx::query_scalar(&cog_core::sql::relation_rows_sql(table))
             .fetch_one(&mut *tx)
             .await?;
         let path = out_dir.join(format!("public.{table}.csv"));
@@ -4813,7 +4813,7 @@ async fn restore_and_compare(
             continue;
         }
         validate_table_name(&table.name)?;
-        let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM \"{}\"", table.name))
+        let rows: i64 = sqlx::query_scalar(&cog_core::sql::relation_rows_sql(&table.name))
             .fetch_one(&mut *conn)
             .await?;
         rows_restored += rows;

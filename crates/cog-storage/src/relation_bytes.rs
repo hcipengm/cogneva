@@ -19,7 +19,11 @@ use sqlx::PgPool;
 ///
 /// 这是一个**读数**，不是决策的输入：`DELETE` 腾出来的空间要等 vacuum 才归还，
 /// 所以它比行数回落得慢，按它决定删多少就会在真空之前反复删同一批。
-pub const RELATION_BYTES_SQL: &str = "SELECT pg_total_relation_size(to_regclass($1))";
+///
+/// 语句本身在 [`cog_core::sql::RELATION_BYTES_SQL`]：同一张面板上的交换归档清扫
+/// 量的是同一件事，两处各写一份 SQL 就是两条口径，而 SQL 只要改一个字就不再是
+/// 同一把尺子。这里只重新导出，让既有调用点继续读这个名字。
+pub use cog_core::sql::RELATION_BYTES_SQL;
 
 /// 那条读数，或者「这张表还不存在」——两者不许同形。
 pub(crate) async fn relation_bytes(pool: &PgPool, relation: &str) -> SFResult<i64> {

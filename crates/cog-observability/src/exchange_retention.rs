@@ -240,15 +240,15 @@ impl ExchangeRetention {
         })
     }
 
+    /// Rows in the archive, read with the same statement as the capacity sweeps'
+    /// own count: the two land on the same panel, and a second spelling of "how
+    /// many rows does this relation hold" is a second unit on that panel.
     async fn row_count(&self) -> SFResult<i64> {
-        sqlx::query(&format!(
-            "SELECT count(*) AS n FROM {}",
-            cog_core::sql::quote_relation(&self.table)
-        ))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| SFError::Database(e.to_string()))
-        .map(|row| row.get::<i64, _>("n"))
+        let sql = cog_core::sql::relation_rows_sql(&self.table);
+        sqlx::query_scalar(&sql)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))
     }
 
     /// The age of the oldest row in the archive, in seconds.
@@ -270,13 +270,25 @@ impl ExchangeRetention {
     }
 
     /// What the archive costs on disk, in bytes.
+    ///
+    /// The statement is the contract's, because the capacity sweeps measure the
+    /// same thing on the same panel. It reads a missing relation as NULL rather
+    /// than raising, so `None` here is a named answer: this table is not in the
+    /// database. Reporting that as a bare database error would make "the
+    /// archive has no size yet" and "the name does not resolve" the same
+    /// reading.
     async fn table_bytes(&self) -> SFResult<i64> {
-        sqlx::query("SELECT pg_total_relation_size($1::regclass)::bigint AS bytes")
+        let bytes: Option<i64> = sqlx::query_scalar(cog_core::sql::RELATION_BYTES_SQL)
             .bind(&self.table)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| SFError::Database(e.to_string()))
-            .map(|row| row.get::<i64, _>("bytes"))
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        bytes.ok_or_else(|| {
+            SFError::Database(format!(
+                "relation {} is not in the database, so its size was not read",
+                self.table
+            ))
+        })
     }
 
     /// Publish what the archive holds, how far back it reaches, and what that

@@ -1,4 +1,4 @@
-//! 把一个名字写进 SQL 时的那一层引号。
+//! 把一个名字写进 SQL 时的那一层引号，以及量一条关系的那两把尺子（行数与字节）。
 //!
 //! 这个平台上不止一个 crate 会把自己的表名拼进语句：容量清扫器量行数、量字节，
 //! 分区维护器按表名建分区，可观测面的交换归档清扫自己那张表。每处都自己写一遍
@@ -28,6 +28,32 @@ pub fn quote_relation(name: &str) -> String {
         .join(".")
 }
 
+/// 一条关系里有多少行。
+///
+/// 这是容量面与归档面共用的那把尺子：三个容量清扫器、交换归档清扫与用量账清扫
+/// 都按它读「这张表还剩多少」，读到的数并排出现在同一个面板上。各写一份的时候，
+/// 分叉不会让任何一处失败——有人加一个 `WHERE`（只数某一段时间）、把 `count(*)`
+/// 换成估算、或忘了引号，面板上只是那一条线的量纲悄悄变了，「这张表比那张表长得
+/// 快」这句话从此不成立，且没有任何东西会说不成立。
+///
+/// 拼法本身没有参数以外的自由度：表名经 [`quote_relation`] 加引号，其余一个字
+/// 都不许改。要数别的（默认分区、带条件的子集），那是另一个问题，写在自己那里
+/// 并说明为什么不是这一把尺子。
+pub fn relation_rows_sql(relation: &str) -> String {
+    format!("SELECT count(*) FROM {}", quote_relation(relation))
+}
+
+/// 一条关系在盘上占多少字节：索引与 TOAST 都算在内。
+///
+/// 与 [`relation_rows_sql`] 同一个理由，另加一处更容易分叉的地方：**表不存在时
+/// 会发生什么**。`to_regclass($1)` 把不认识的名字读成 NULL，于是
+/// `pg_total_relation_size(NULL)` 也是 NULL——调用方拿到的是「没有这个数」，可以
+/// 把名字写进错误里说清楚少的是哪张表。`$1::regclass` 在同一种情形下抛的是数据库
+/// 自己的错，读数是同一件事，说出来的话却不是。两边量的既然是同一张表，缺表这件
+/// 事的形状也只能有一种：所以这里用 `to_regclass`，调用方按 `Option<i64>` 解，
+/// 拿到 NULL 时自己给出带名字的错误。
+pub const RELATION_BYTES_SQL: &str = "SELECT pg_total_relation_size(to_regclass($1))";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,5 +77,26 @@ mod tests {
     fn a_name_carrying_a_quote_is_escaped_not_rewritten() {
         assert_eq!(quote_relation("a\"b"), "\"a\"\"b\"");
         assert_ne!(quote_relation("a\"b"), "\"ab\"");
+    }
+
+    /// 行数那一把尺子除了表名之外没有自由度：同一个名字每次都读出同一句，限定名
+    /// 按段加引号。少一个引号或多一个 `WHERE`，都让这条线量的是另一个数。
+    #[test]
+    fn the_row_count_reads_one_relation_and_nothing_else() {
+        assert_eq!(
+            relation_rows_sql("cog_checkpoints"),
+            "SELECT count(*) FROM \"cog_checkpoints\""
+        );
+        assert_eq!(
+            relation_rows_sql("archive.cog_events"),
+            "SELECT count(*) FROM \"archive\".\"cog_events\""
+        );
+    }
+
+    /// 缺表是一个值（NULL），不是数据库自己的异常：调用方要能在错误里点出名字。
+    #[test]
+    fn the_byte_reading_treats_a_missing_relation_as_a_value() {
+        assert!(RELATION_BYTES_SQL.contains("to_regclass($1)"));
+        assert!(!RELATION_BYTES_SQL.contains("$1::regclass"));
     }
 }
