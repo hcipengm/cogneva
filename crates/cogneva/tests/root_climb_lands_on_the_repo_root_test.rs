@@ -1,6 +1,6 @@
 //! 脚本里「往上数几级就是仓库根」那行，数出来的必须是仓库根。
 //!
-//! `deploy/` 与 `.github/scripts/` 下一共五十余处同一个写法：
+//! `deploy/` 与 `.github/scripts/` 下一共六十余处同一个写法：
 //!
 //! ```text
 //! ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,9 +24,17 @@
 //! 目录」，而是这一个检出——落点就是 `repo_root()` 算出来的那个目录。落点在
 //! `deploy/`、落在根的上一级、或者文件挪了位置，都会红，并把算出来的落点写出来。
 //!
+//! 同一个意思有第二种落笔：先 `here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)`，
+//! 再从变量上溯（`"$here/../.."`）。两种都收，第二种多一道前提——那一份文件必须
+//! 真的把那个变量赋成了自身目录，否则「从变量数几级」的前提就不成立。
+//!
 //! 刻意不收的形状：注释行（用法说明里常写着同样的命令，它不是在执行）；`.md`
-//! （那不是能被跑起来的代码）。收进来的形状里没有一处在今天例外——五十余处
-//! 全部落在根上，所以这条门不需要豁免名单，也就不会因为豁免名单过期而变瞎。
+//! （那不是能被跑起来的代码）；从**不认识**的变量上溯（它从哪儿来，这条门不知道，
+//! 猜错的方向是悄无声息地少判一处）。
+//!
+//! 六十余处里有一处上溯的落点故意不是根：`deploy/scripts/tests/` 里的夹具退一级去
+//! 找同级的门脚本。这类现场走 [`NOT_ROOT`] 逐条登记，落点也钉死——文件挪了位置
+//! 许可就过期，门会红；反方向也查，许可没有对应的上溯时同样红。
 
 use std::path::{Path, PathBuf};
 
@@ -38,9 +46,21 @@ use common::routes::repo_root;
 /// 「仓库根」指同一个目录，错法也一样。
 const CENSUS_ROOTS: &[&str] = &["deploy", ".github"];
 
-/// 人口下限：四处来源（deploy 的 .sh/.py、.github 的 .sh/.py）合起来是五十余处。
+/// 人口下限：四处来源（deploy 的 .sh/.py、.github 的 .sh/.py）合起来是六十余处。
 /// 少到这个数以下，说明扫描本身出了毛病——那与「全都正确」在输出上分不开。
-const MIN_CLIMBS: usize = 40;
+const MIN_CLIMBS: usize = 50;
+
+/// 上溯到**子目录**而不上溯到根的现场许可：`(文件, 几级, 应落到的相对路径, 为什么)`。
+///
+/// 填一条不是给自己开后门，是把「我不想数到根」这个意图写在一个读得到的地方——
+/// 门槛就在这儿，别人加同款时会看见它、要么照抄理由、要么发现自己其实该数到根。
+/// 落点也一并钉住：文件挪了位置，落点变了，这条许可就过期，门会红。
+const NOT_ROOT: &[(&str, usize, &str, &str)] = &[(
+    "deploy/scripts/tests/comment-capacity-figures.test.sh",
+    1,
+    "deploy/scripts",
+    "夹具要的是同级的门脚本所在的目录（deploy/scripts），不是仓库根",
+)];
 
 /// 一处上溯：哪个文件第几行、数了几级、算出来的落点。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +69,21 @@ struct Climb {
     line: usize,
     levels: usize,
     landing: PathBuf,
+    /// 上溯是从一个变量数起的：那个变量在这一份文件里是不是真的指向本脚本的目录。
+    /// `None` 表示写的是 `dirname "${BASH_SOURCE[0]}"` 本身，不需要再核。
+    base_is_script_dir: Option<bool>,
 }
+
+/// 一处上溯在文本里的样子：数几级、从哪个变量数起（若有）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Shape {
+    levels: usize,
+    via: Option<String>,
+}
+
+/// 被当作「本脚本所在目录」的变量名。只认这几个：别的变量可能指向别处，
+/// 从它往上数几级证明不了什么，那属于这条门不猜的范围。
+const SCRIPT_DIR_VARS: &[&str] = &["here", "HERE", "script_dir", "SCRIPT_DIR", "self_dir"];
 
 fn candidate_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -83,35 +117,61 @@ fn candidate_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// 这一行里各处的上溯级数。
+/// 一串 `/..` 的级数，从 `at` 开始数。
+fn segment_count(line: &str, at: usize) -> usize {
+    let mut levels = 0usize;
+    let mut cursor = at;
+    while line[cursor..].starts_with("/..") {
+        // `/..` 之后必须是行尾、引号、斜杠或空白，否则那是 `/..x` 这样的词。
+        let next = cursor + 3;
+        let boundary = line[next..]
+            .chars()
+            .next()
+            .is_none_or(|c| c == '"' || c == '/' || c == ' ' || c == ')' || c == '\t');
+        if !boundary {
+            break;
+        }
+        levels += 1;
+        cursor = next;
+    }
+    levels
+}
+
+/// 这一行里各处的上溯。
 ///
-/// shell 的形状是 `"$(dirname "${BASH_SOURCE[0]}")/../.."`——`")` 之后连着若干
-/// `/..`；Python 的形状是 `parents[2]`。两种都只认**裸的**字面级数：写成
-/// `parents[n]` 或 `$(dirname "$d")/..` 里用变量的，这条门不猜。
-fn climb_levels(line: &str) -> Vec<usize> {
+/// shell 有三种写法，前两种是同一件事的两种落笔：
+///
+///   - `"$(dirname "${BASH_SOURCE[0]}")/../.."` —— `")` 之后连着若干 `/..`；
+///   - `"$here/../.."` —— 从脚本自身目录的变量数起，变量名须在
+///     [`SCRIPT_DIR_VARS`] 里，且这一份文件真的把它赋成了自身目录（见 [`climbs`]）；
+///   - Python 的 `parents[2]`。
+///
+/// 只认裸的字面级数：`parents[n]`、`"$unknown/../.."` 都不猜——猜错的方向是
+/// 「悄无声息地少判一处」，那正是这条门要防的东西。
+fn climbs_in(line: &str) -> Vec<Shape> {
     let mut out = Vec::new();
-    let bytes = line.as_bytes();
     let mut from = 0usize;
     while let Some(found) = line[from..].find("\")") {
         let at = from + found + 2;
         from = at;
-        let mut levels = 0usize;
-        let mut cursor = at;
-        while line[cursor..].starts_with("/..") {
-            // `/..` 之后必须是行尾、引号、斜杠或空白，否则是 `/../x` 之外的词。
-            let next = cursor + 3;
-            let boundary = line[next..]
-                .chars()
-                .next()
-                .is_none_or(|c| c == '"' || c == '/' || c == ' ' || c == ')' || c == '\t');
-            if !boundary {
-                break;
-            }
-            levels += 1;
-            cursor = next;
-        }
+        let levels = segment_count(line, at);
         if levels > 0 {
-            out.push(levels);
+            out.push(Shape { levels, via: None });
+        }
+    }
+    for var in SCRIPT_DIR_VARS {
+        let token = format!("\"${var}");
+        let mut from = 0usize;
+        while let Some(found) = line[from..].find(&token) {
+            let at = from + found + token.len();
+            from = at;
+            let levels = segment_count(line, at);
+            if levels > 0 {
+                out.push(Shape {
+                    levels,
+                    via: Some((*var).to_string()),
+                });
+            }
         }
     }
     let mut from = 0usize;
@@ -124,11 +184,29 @@ fn climb_levels(line: &str) -> Vec<usize> {
         from = start;
         if line[start + digits.len()..].starts_with(']') {
             if let Ok(levels) = digits.parse::<usize>() {
-                out.push(levels);
+                out.push(Shape { levels, via: None });
             }
         }
     }
-    let _ = bytes;
+    out
+}
+
+/// 这一份文件里被赋成「本脚本所在目录」的变量名。
+///
+/// 赋值必须在一行里同时出现变量名、`=` 与 `dirname "${BASH_SOURCE[0]}"`。这一条
+/// 是上一条判据的前提：`"$here/../.."` 只有在 `here` 真是本脚本目录时才等价于
+/// 从自身位置出发；谁把 `here` 改成别的目录，这里就查不出来，那个上溯也不再被认。
+fn script_dir_vars(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        for var in SCRIPT_DIR_VARS {
+            let assign = format!("{var}=");
+            if trimmed.starts_with(&assign) && line.contains("dirname \"${BASH_SOURCE[0]}\"") {
+                out.push((*var).to_string());
+            }
+        }
+    }
     out
 }
 
@@ -158,16 +236,22 @@ fn climbs(root: &Path) -> Vec<Climb> {
         let Some(dir) = file.parent() else {
             continue;
         };
+        let script_dirs = script_dir_vars(&text);
         for (index, line) in text.lines().enumerate() {
             if line.trim_start().starts_with('#') {
                 continue;
             }
-            for levels in climb_levels(line) {
+            for shape in climbs_in(line) {
+                let base_is_script_dir = shape
+                    .via
+                    .as_ref()
+                    .map(|var| script_dirs.iter().any(|bound| bound == var));
                 out.push(Climb {
                     file: rel.clone(),
                     line: index + 1,
-                    levels,
-                    landing: climb(dir, levels).unwrap_or_default(),
+                    levels: shape.levels,
+                    landing: climb(dir, shape.levels).unwrap_or_default(),
+                    base_is_script_dir,
                 });
             }
         }
@@ -175,7 +259,15 @@ fn climbs(root: &Path) -> Vec<Climb> {
     out
 }
 
-/// 真树：每一处上溯都落在仓库根上，且这样的行多到能说明扫描真的在看东西。
+/// 一处上溯是否被 [`NOT_ROOT`] 里的一条许可放过，且落点与许可写的一致。
+fn licensed(root: &Path, climb: &Climb) -> bool {
+    NOT_ROOT.iter().any(|(file, levels, landing, _)| {
+        climb.file == *file && climb.levels == *levels && climb.landing == root.join(landing)
+    })
+}
+
+/// 真树：每一处上溯都落在仓库根上（或在许可里钉死的那一个子目录上），且这样的行
+/// 多到能说明扫描真的在看东西。
 #[test]
 fn every_climb_lands_on_the_repo_root() {
     let root = repo_root();
@@ -187,16 +279,24 @@ fn every_climb_lands_on_the_repo_root() {
     );
     let off: Vec<String> = found
         .iter()
-        .filter(|c| c.landing != root)
-        .map(|c| {
-            format!(
+        .filter_map(|c| {
+            if c.base_is_script_dir == Some(false) {
+                return Some(format!(
+                    "{}:{}: 从变量上溯，但这一份文件没有把那个变量赋成本脚本目录，落点无从推起",
+                    c.file, c.line
+                ));
+            }
+            if c.landing == root || licensed(&root, c) {
+                return None;
+            }
+            Some(format!(
                 "{}:{}: 往上 {} 级落到 {}，不是仓库根 {}",
                 c.file,
                 c.line,
                 c.levels,
                 c.landing.display(),
                 root.display()
-            )
+            ))
         })
         .collect();
     assert!(
@@ -206,32 +306,71 @@ fn every_climb_lands_on_the_repo_root() {
     );
 }
 
+/// 许可的另一个方向：每条许可都得真的压着一处上溯。现场没了就收回，否则它会在
+/// 下一个同名现场出现时替对方挡下这条门。
+#[test]
+fn a_licence_whose_site_is_gone_is_reported() {
+    let root = repo_root();
+    let found = climbs(&root);
+    let stale: Vec<&str> = NOT_ROOT
+        .iter()
+        .filter(|(file, levels, landing, _)| {
+            !found
+                .iter()
+                .any(|c| c.file == *file && c.levels == *levels && c.landing == root.join(landing))
+        })
+        .map(|(file, _, _, _)| *file)
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "这些许可已经不对应任何一处上溯了（文件挪了、级数改了、或者那行被删了）：{stale:?}"
+    );
+}
+
+fn levels(shapes: &[Shape]) -> Vec<usize> {
+    shapes.iter().map(|s| s.levels).collect()
+}
+
 /// 判据按形状读，不按裸子串读。
 #[test]
 fn the_predicate_reads_climbs_and_not_their_neighbours() {
     assert_eq!(
-        climb_levels(r#"ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)""#),
+        levels(&climbs_in(
+            r#"ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)""#
+        )),
         vec![2]
     );
     assert_eq!(
-        climb_levels(r#"ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)""#),
+        levels(&climbs_in(
+            r#"ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)""#
+        )),
         vec![3]
     );
     assert_eq!(
-        climb_levels("root = Path(__file__).resolve().parents[2]"),
+        levels(&climbs_in("root = Path(__file__).resolve().parents[2]")),
+        vec![2]
+    );
+    // 经变量的那一种：`"$here/../.."`。
+    assert_eq!(
+        levels(&climbs_in(r#"root=$(cd "$here/../.." && pwd)"#)),
         vec![2]
     );
     // 目录名里带 `..` 不是上溯：`a/..b` 的下一段不是 `..`，`parents[n]` 里写变量
-    // 也不猜。
+    // 也不猜，不认识的变量同样不猜。
     assert_eq!(
-        climb_levels(r#"cp x "$(dirname "$0")/..b/""#),
+        levels(&climbs_in(r#"cp x "$(dirname "$0")/..b/""#)),
         Vec::<usize>::new()
     );
     assert_eq!(
-        climb_levels("root = Path(__file__).parents[depth]"),
+        levels(&climbs_in("root = Path(__file__).parents[depth]")),
         Vec::<usize>::new()
     );
-    assert_eq!(climb_levels(r#"ROOT="$(pwd)""#), Vec::<usize>::new());
+    assert_eq!(levels(&climbs_in(r#"ROOT="$(pwd)""#)), Vec::<usize>::new());
+    assert_eq!(
+        levels(&climbs_in(r#"cd "$scratch/../.." && pwd"#)),
+        Vec::<usize>::new(),
+        "只有认识的脚本目录变量才数：别的变量从哪儿来，这条门不知道"
+    );
 }
 
 /// 假树上的对照：挪一层、数多半级、数少半级都要红；位置对的不许红。
@@ -265,12 +404,22 @@ fn a_file_that_moved_is_the_shape_this_gate_exists_for() {
         "deploy/scripts/sub/moved.py",
         "root = Path(__file__).resolve().parents[2]\n",
     );
+    // 经变量的那一种：`here` 真赋成了自身目录、深度 2、数两级——对。
+    write(
+        "deploy/scripts/via_ok.sh",
+        "here=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\nroot=$(cd \"$here/../..\" && pwd)\n",
+    );
+    // 同一个写法，但这一份文件从没把 `here` 赋成自身目录：落点无从推起，错。
+    write(
+        "deploy/scripts/via_unbound.sh",
+        "root=$(cd \"$here/../..\" && pwd)\n",
+    );
 
     let found = climbs(&scratch);
-    assert_eq!(found.len(), 4, "四处上溯都该被数出来：{found:?}");
+    assert_eq!(found.len(), 6, "六处上溯都该被数出来：{found:?}");
     let off: Vec<&str> = found
         .iter()
-        .filter(|c| c.landing != scratch)
+        .filter(|c| c.landing != scratch || c.base_is_script_dir == Some(false))
         .map(|c| c.file.as_str())
         .collect();
     assert_eq!(
@@ -278,9 +427,10 @@ fn a_file_that_moved_is_the_shape_this_gate_exists_for() {
         vec![
             "deploy/scripts/deep.sh",
             "deploy/scripts/sub/moved.py",
-            "deploy/scripts/sub/moved.sh"
+            "deploy/scripts/sub/moved.sh",
+            "deploy/scripts/via_unbound.sh"
         ],
-        "只有位置对的那一份不该红：{found:?}"
+        "只有位置对的那两份不该红：{found:?}"
     );
 
     let _ = std::fs::remove_dir_all(&scratch);
