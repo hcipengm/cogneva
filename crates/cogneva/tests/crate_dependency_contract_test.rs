@@ -120,6 +120,7 @@ const ALLOWED_DEV: &[Row] = &[
     ("cog-reflection", "cog-prompt", ""),
     ("cog-reflection", "cog-storage", ""),
     ("cog-storage", "cog-test-support", ""),
+    ("cog-stream", "cog-test-support", ""),
     ("cogneva", "cog-redis", ""),
     ("cogneva", "cog-test-support", ""),
 ];

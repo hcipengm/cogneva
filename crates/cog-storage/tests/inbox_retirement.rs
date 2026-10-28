@@ -26,13 +26,10 @@ use chrono::Utc;
 use cog_core::{AgentRegistration, AgentRegistry, ResourceInfo};
 use cog_storage::inbox_retirement::InboxRetirement;
 use cog_storage::RedisAgentRegistry;
+use cog_test_support::redis_url;
 
 /// Every agent this file creates starts here.
 const PROBE: &str = "probe_inbox_retirement";
-
-fn redis_url() -> String {
-    std::env::var("COGNEVA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
-}
 
 async fn raw_conn() -> redis::aio::ConnectionManager {
     let client = redis::Client::open(redis_url()).expect("redis url");

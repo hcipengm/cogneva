@@ -131,6 +131,17 @@ const THE_PREDICATE: &str =
 /// 遍」——所以它的位置本身就是判据的一部分：搬进它，就要先从所有夹具里删干净。
 const SUPPORT_HOME: &str = "crates/cog-test-support/src/lib.rs";
 
+/// 支撑 crate 里必须真有的入口：每搬一族进来，就在这上面加一个名字。
+///
+/// 它挡的是上一族留下的那种空转：`support_copies` 判的是「夹具里没有第二份」，而一份
+/// 定义被删空的支撑 crate 让这条判据永远成立——判据只证明了「别处没有」，没证明「这里
+/// 有」。
+const SUPPORT_ENTRY_POINTS: [&str; 3] = [
+    "pub fn database_url()",
+    "pub fn redis_url()",
+    "pub fn redis_url_required()",
+];
+
 // 普查面：`crates/**/*.rs`，夹具与产出面一起算。
 //
 // `src/` 必须在里面：这一族抄件上一轮就长在 `src/` 的单测模块里（`startup_guard.rs`
@@ -526,10 +537,15 @@ fn the_fixture_reading_steps_are_written_once() {
     // 反过来问：支撑 crate 真的还定义着那个入口吗。它空了、或者被删成一个转发壳，
     // 上面那条就永远绿——判据只是证明了「别处没有」，没证明「这里有」。
     let support = std::fs::read_to_string(root.join(SUPPORT_HOME)).expect("支撑 crate 读得到");
+    let missing: Vec<&str> = SUPPORT_ENTRY_POINTS
+        .iter()
+        .copied()
+        .filter(|entry| !support.contains(entry))
+        .collect();
     assert!(
-        support.contains("pub fn database_url()"),
-        "{SUPPORT_HOME} 里不再定义 `database_url`：那么「夹具里不许再写一遍」就是指着\
-         一份空文件说的"
+        missing.is_empty(),
+        "{SUPPORT_HOME} 里不再定义 {missing:?}：那么「夹具里不许再写一遍」就是指着\
+         一份不干这件事的文件说的"
     );
 
     // 反过来问：被指认的那一处真的还在干这件事吗。少了这一问，把它换成空壳之后

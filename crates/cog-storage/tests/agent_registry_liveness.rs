@@ -24,6 +24,7 @@ use redis::AsyncCommands;
 
 use cog_core::{generate_agent_id, AgentRegistration, AgentRegistry, ResourceInfo};
 use cog_storage::RedisAgentRegistry;
+use cog_test_support::redis_url;
 
 /// Every name in this file starts here, so a leftover from an interrupted run
 /// is recognisable as one of these tests'.
@@ -39,10 +40,6 @@ const PROBE: &str = "probe_agent_registry_liveness";
 /// behaviour being global while the tests were not. Measured in CI on
 /// 2026-10-26: this file passed alone and failed in the suite.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-fn redis_url() -> String {
-    std::env::var("COGNEVA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
-}
 
 fn registration(name: &str, beaten_at: chrono::DateTime<Utc>) -> AgentRegistration {
     AgentRegistration {

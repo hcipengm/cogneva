@@ -1,5 +1,8 @@
 //! 测试怎么找到 Redis，以及连不上时读成「不适用」而不是失败。
 //!
+//! 地址本身（读哪个环境变量、没设时回落到哪个端口）不在这里：那是跨 crate 的夹具
+//! 约定，在 `cog_test_support` 里只有一份。
+//!
 //! 两套集成测试各抄了一遍这段：环境变量拿地址、回落默认端口、连不上就 `eprintln!`
 //! 跳过。抄件的分歧不会红——一套跳过、另一套往下跑并失败，而失败的那一条说的是
 //! 「这台机器上没起 Redis」，不是「这次改动有问题」。所以「跳过」这件事本身也放在
@@ -12,14 +15,9 @@
 // 它编进来却一条都不调。去掉这个 allow 等于要求每份夹具都写一遍自己的 redis 读取。
 #![allow(dead_code)]
 
-/// 测试用的 Redis 地址：CI 由 service container 提供，开发机通常是默认端口。
-pub fn test_url() -> String {
-    std::env::var("COGNEVA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
-}
-
 /// 连上配额管理器要用的那个 store，或者在没有可达实例时返回 `None` 让用例跳过。
 pub async fn open() -> Option<redis::aio::ConnectionManager> {
-    open_at(&test_url()).await
+    open_at(&cog_test_support::redis_url()).await
 }
 
 /// 同上，但地址由调用方给。

@@ -1929,6 +1929,7 @@ dependencies = [
  "chrono",
  "cog-core",
  "cog-redis",
+ "cog-test-support",
  "futures",
  "redis",
  "serde",

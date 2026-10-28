@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use cog_core::MessageBackend;
 use cog_stream::RedisMessageBackend;
+use cog_test_support::redis_url;
 use futures::StreamExt;
 use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
@@ -68,10 +69,6 @@ impl CuttableProxy {
             let _ = cut.send(());
         }
     }
-}
-
-fn redis_url() -> String {
-    std::env::var("COGNEVA_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".into())
 }
 
 /// Address of the redis the tests may use, or None when there is none — the

@@ -39,6 +39,7 @@
 
 use cog_core::{WalBackend, WalEventType, WalRecord};
 use cog_storage::wal::RedisWalBackend;
+use cog_test_support::redis_url_required;
 
 /// Small enough that twelve appends cross it.
 const CAP: usize = 5;
@@ -47,13 +48,6 @@ const CAP: usize = 5;
 /// the only way its count means anything is if nothing else is writing one
 /// while it runs.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-fn redis_url() -> String {
-    std::env::var("COGNEVA_TEST_REDIS_URL").expect(
-        "set COGNEVA_TEST_REDIS_URL to a throwaway Redis before running this test; \
-         it deletes only keys under its own per-run session ids",
-    )
-}
 
 fn record(seq: u64, session: &str) -> WalRecord {
     WalRecord::new(
@@ -92,7 +86,7 @@ async fn delete(backend_key: &str, session: &str) {
 #[ignore = "needs COGNEVA_TEST_REDIS_URL pointing at a throwaway Redis"]
 async fn a_log_past_the_cap_keeps_the_newest_records_and_their_own_numbers() {
     let _serial = SERIAL.lock().await;
-    let url = redis_url();
+    let url = redis_url_required();
     let session = session_id();
     let backend = RedisWalBackend::new(&url)
         .await
@@ -145,7 +139,7 @@ async fn a_log_past_the_cap_keeps_the_newest_records_and_their_own_numbers() {
 #[ignore = "needs COGNEVA_TEST_REDIS_URL pointing at a throwaway Redis"]
 async fn a_pass_brings_a_log_that_stopped_being_appended_to_under_the_cap() {
     let _serial = SERIAL.lock().await;
-    let url = redis_url();
+    let url = redis_url_required();
     let over = session_id();
     let under = format!("{}-under", session_id());
 
@@ -199,7 +193,7 @@ async fn a_pass_brings_a_log_that_stopped_being_appended_to_under_the_cap() {
 #[ignore = "needs COGNEVA_TEST_REDIS_URL pointing at a throwaway Redis"]
 async fn a_cut_lands_on_the_record_that_holds_the_requested_number() {
     let _serial = SERIAL.lock().await;
-    let url = redis_url();
+    let url = redis_url_required();
     let session = session_id();
     let backend = RedisWalBackend::new(&url).await.expect("open backend");
 
