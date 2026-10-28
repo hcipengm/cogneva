@@ -286,7 +286,7 @@ pub struct Declarations {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredTwice {
     pub slug: String,
-    /// The file the map kept, which is the last one in tree order.
+    /// The file the map kept: the smallest path that claims the slug.
     pub kept: String,
     /// The file whose claim the map overwrote.
     pub dropped: String,
@@ -319,12 +319,33 @@ impl Declarations {
             };
             let slug = rest.trim();
             if is_slug(slug) {
-                if let Some(dropped) = gates.insert(slug.to_string(), path.clone()) {
-                    duplicates.push(DeclaredTwice {
+                // Two files claiming one slug: the one the account records is
+                // the smaller path, not the one that arrived last. Arrival order
+                // is git's walk, so keeping the last would make the recorded
+                // carrier a function of that walk -- the same tree, read twice
+                // through different listings, would name different files, and a
+                // reconciliation that compares the recorded file against the
+                // registry's would reopen the row on the difference. Sorting the
+                // path out of the pair costs one comparison and makes the answer
+                // depend on the set of files, which is the thing the tree
+                // actually holds.
+                match gates.get(slug) {
+                    None => {
+                        gates.insert(slug.to_string(), path.clone());
+                    }
+                    Some(held) if path < held => {
+                        duplicates.push(DeclaredTwice {
+                            slug: slug.to_string(),
+                            kept: path.clone(),
+                            dropped: held.clone(),
+                        });
+                        gates.insert(slug.to_string(), path.clone());
+                    }
+                    Some(held) => duplicates.push(DeclaredTwice {
                         slug: slug.to_string(),
-                        kept: path.clone(),
-                        dropped,
-                    });
+                        kept: held.clone(),
+                        dropped: path.clone(),
+                    }),
                 }
             } else {
                 unreadable.push((path.clone(), text.trim().to_string()));
@@ -557,6 +578,32 @@ mod tests {
                 .map(|(path, text)| (path.to_string(), text.to_string()))
                 .collect::<Vec<_>>(),
         )
+    }
+
+    /// Two files claiming one slug: the account records the same one whichever
+    /// order the lines arrive in. The order is git's walk, so keeping whichever
+    /// came last would make the recorded carrier move with the listing rather
+    /// than with the tree -- and the reconciliation against the registry would
+    /// then reopen the row over a difference nothing in the tree changed.
+    #[test]
+    fn a_slug_claimed_twice_records_the_same_file_in_either_order() {
+        let first = ("crates/x/tests/a.rs", "/// principle: feedback_x");
+        let second = ("crates/x/tests/b.rs", "/// principle: feedback_x");
+        let forward = declarations(&[first, second]);
+        let backward = declarations(&[second, first]);
+
+        assert_eq!(
+            forward.gate_for("feedback_x"),
+            Some("crates/x/tests/a.rs"),
+            "the smaller path is the one recorded"
+        );
+        assert_eq!(
+            forward.gate_for("feedback_x"),
+            backward.gate_for("feedback_x"),
+            "the recorded carrier is a function of the files, not of the walk"
+        );
+        assert_eq!(forward.duplicate_count(), 1);
+        assert_eq!(backward.duplicate_count(), 1);
     }
 
     /// The two registries are asked, not the prose: a `-` in the host column
@@ -808,9 +855,13 @@ mod tests {
             .all(|(path, _)| path.starts_with("crates/x/tests/")));
     }
 
-    /// Two files claiming one slug: the map keeps the last in tree order and
-    /// loses the first, and the lost one is named rather than silently dropped.
-    /// Without this the account records one carrier where the tree has two.
+    /// Two files claiming one slug: the map keeps one of them and loses the
+    /// other, and the lost one is named rather than silently dropped. Without
+    /// this the account records one carrier where the tree has two.
+    ///
+    /// Which one it keeps is the smaller path, so the answer does not depend on
+    /// the order the lines arrived in -- see
+    /// [`super::tests::a_slug_claimed_twice_records_the_same_file_in_either_order`].
     #[test]
     fn a_second_file_claiming_one_slug_is_named_not_folded() {
         let registry = declarations(&[
@@ -823,12 +874,12 @@ mod tests {
             registry.duplicates(),
             &[DeclaredTwice {
                 slug: "feedback_x".to_string(),
-                kept: "crates/x/tests/b.rs".to_string(),
-                dropped: "crates/x/tests/a.rs".to_string(),
+                kept: "crates/x/tests/a.rs".to_string(),
+                dropped: "crates/x/tests/b.rs".to_string(),
             }]
         );
         // The unique declaration is not a duplicate, and the map still answers.
-        assert_eq!(registry.gate_for("feedback_x"), Some("crates/x/tests/b.rs"));
+        assert_eq!(registry.gate_for("feedback_x"), Some("crates/x/tests/a.rs"));
         assert_eq!(registry.gate_for("feedback_y"), Some("crates/x/tests/c.rs"));
     }
 

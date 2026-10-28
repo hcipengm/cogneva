@@ -789,7 +789,7 @@ async fn measure_pass(
             duplicate_declarations,
             duplicates = %duplicate_summary(declarations.duplicates()),
             "principle ledger: more than one file declares the same principle, so the account \
-             records only the last one in tree order"
+             records only the smallest path that claims it"
         );
     }
 
