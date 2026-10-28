@@ -1825,6 +1825,13 @@ struct WindowPaceReading {
     pool: cog_core::LlmWindowPace,
     /// 逐上游一条，键与健康表同形（`base_url|model`）。
     by_upstream: std::collections::HashMap<String, (cog_core::LlmWindowPace, f64)>,
+    /// 每一个配置过的上游这一拍进没进池和，按 `readings` 的顺序、与它一一对应。
+    ///
+    /// 与 `by_upstream` 不是同一件事：那张表只留量到窗口的成员，缺席即「不配速
+    /// 拦它」，是**闸门**那一侧的正确形状；这一列要的是**报表**那一侧缺了谁——
+    /// 池和只加进 `by_upstream` 里的成员，`blocked()` 却拿这个和判整池，所以一个
+    /// 没进和的成员对和的贡献是 0，读上去与「它没有额度」同形。
+    rulers: Vec<(String, crate::window_pace::Ruler)>,
 }
 
 #[derive(Clone)]
@@ -3973,6 +3980,25 @@ async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReadin
     ] {
         record_gauge(state, name, value, &[]).await;
     }
+    // 上面四个和只加进量到窗口的成员，而请求路的 `blocked()` 拿它们判整池。少了
+    // 谁、以及那一家为什么少，只有下面这一对说得出来：一个没有尺子的成员在和的
+    // 读数上与「它没有额度」逐字同形，可一个要等窗口复位、一个要先给它接尺子。
+    for (key, ruler) in &reading.rulers {
+        record_gauge(
+            state,
+            cog_core::metric_names::LLM_POOL_UPSTREAM_WITH_RULER,
+            if ruler.contributes() { 1.0 } else { 0.0 },
+            &[("upstream", key.as_str()), ("reason", ruler.label())],
+        )
+        .await;
+    }
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_UPSTREAMS_WITHOUT_RULER,
+        crate::window_pace::upstreams_without_ruler(reading.rulers.iter().map(|(_, r)| *r)) as f64,
+        &[],
+    )
+    .await;
 }
 
 /// 一次账本求和的等待上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
@@ -4050,7 +4076,15 @@ async fn publish_spend_reading_gauges(state: &AppState, reading: &crate::spend_r
 /// 一份，用一家的尺子关掉另一家，就是把"没量到"读成"没有"。
 async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> WindowPaceReading {
     let Some(store) = state.pool_obs.usage.clone() else {
-        return WindowPaceReading::default();
+        // 没有用量账本可读：整池这一拍都不配速。每一家都记成同一个原因，而不是
+        // 留一张空表——空表reads as "配置里没有上游"，而那是一个不相干的故障。
+        return WindowPaceReading {
+            rulers: readings
+                .iter()
+                .map(|r| (r.key.clone(), crate::window_pace::Ruler::NoUsageLedger))
+                .collect(),
+            ..Default::default()
+        };
     };
     let now_unix = chrono::Utc::now().timestamp();
     // 一件任务的成本按**跑完的**任务量，用的是账本自己的任务轴。量不出来就不预留：
@@ -4076,8 +4110,16 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
         ..Default::default()
     };
     let mut by_upstream = std::collections::HashMap::new();
+    let mut rulers = Vec::with_capacity(readings.len());
     for reading in readings {
+        // 每一个 `continue` 都是一家的额度没进池和。记下它是哪一种缺席：三处的
+        // 修法在三个地方（去要窗口长度／等它撞一次墙／修账本查询），合成一个值
+        // 会让读的人全去改同一处。
         let Some(window_secs) = reading.quota_window_secs.filter(|w| *w > 0) else {
+            rulers.push((
+                reading.key.clone(),
+                crate::window_pace::Ruler::NoWindowReported,
+            ));
             continue;
         };
         let Some(measured) = measure_window(
@@ -4090,6 +4132,10 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
         )
         .await
         else {
+            rulers.push((
+                reading.key.clone(),
+                crate::window_pace::Ruler::WindowUnmeasurable,
+            ));
             continue;
         };
         let window_start = measured.window_start_at(now_unix);
@@ -4101,9 +4147,14 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
                     error = %e,
                     "窗口配速：读不出本窗口的用量，这一家不进这一拍的判定"
                 );
+                rulers.push((
+                    reading.key.clone(),
+                    crate::window_pace::Ruler::SpendUnreadable,
+                ));
                 continue;
             }
         };
+        rulers.push((reading.key.clone(), crate::window_pace::Ruler::Measured));
         pace.measured_upstreams += 1;
         pace.allowance_tokens = pace
             .allowance_tokens
@@ -4129,6 +4180,7 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
     WindowPaceReading {
         pool: pace,
         by_upstream,
+        rulers,
     }
 }
 

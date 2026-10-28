@@ -366,6 +366,84 @@ pub fn allowance_rate(capacity_tokens: u64, window_secs: u64) -> f64 {
     }
 }
 
+/// Whether one pool member's allowance went into the pool sum this beat, and if
+/// not, which measurement was missing.
+///
+/// The pool gauges (`llm_pool_allowance_tokens`, `llm_pool_spent_tokens`,
+/// `llm_pool_paced_upstreams`) add up the members that were **measured**, and
+/// the request path's `LlmWindowPace::blocked` decides for the whole pool from
+/// that sum. So a member with no ruler contributes zero, and on every one of
+/// those gauges a contribution of zero is the same bytes as "this member has no
+/// allowance left".
+///
+/// Those two call for opposite repairs. A spent window is waited out; a missing
+/// ruler is given one, and no amount of waiting produces it. The per-member
+/// pacing table already treats a member with no ruler as "not paced here",
+/// which is the fail-open direction; the pool report is fail-closed on the same
+/// absence, and until this verdict is published nothing on the reading side
+/// says which members are on which side of that.
+///
+/// The closed set is about *which measurement is missing*, not about how bad
+/// the state is: the three missing cases are repaired in three different
+/// places, and a single "no ruler" would send every reader to the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ruler {
+    /// Measured: this member's allowance and spend are in the pool sum.
+    Measured,
+    /// The upstream has never stated a quota window length, so there is
+    /// nothing to spread a capacity over. Giving it a ruler means getting that
+    /// length out of it, not waiting.
+    NoWindowReported,
+    /// The length is known but the capacity is not: the ledger holds no
+    /// settled burn for this member and no live observation of a boundary
+    /// pins one. Waiting produces the ledger row only if the upstream refuses.
+    WindowUnmeasurable,
+    /// The window is measured but this window's spend could not be read. The
+    /// ruler exists; the ledger query is what has to come back.
+    SpendUnreadable,
+    /// There is no usage ledger to read at all, so nothing can be paced. Not a
+    /// property of any member -- the whole pool is in this state together --
+    /// but it is reported per member so that the count below has a population.
+    NoUsageLedger,
+}
+
+impl Ruler {
+    /// The value of the `reason` label. A closed set of five, one per variant.
+    pub fn label(self) -> &'static str {
+        match self {
+            Ruler::Measured => "measured",
+            Ruler::NoWindowReported => "no_window_reported",
+            Ruler::WindowUnmeasurable => "window_unmeasurable",
+            Ruler::SpendUnreadable => "spend_unreadable",
+            Ruler::NoUsageLedger => "no_usage_ledger",
+        }
+    }
+
+    /// Whether this member's allowance is in the pool sum.
+    pub fn contributes(self) -> bool {
+        matches!(self, Ruler::Measured)
+    }
+}
+
+/// How many pool members contributed nothing to the pool sum this beat.
+///
+/// Published as its own gauge rather than left to `pool_size - paced`: the pool
+/// size is not on the metric face, so the subtraction needs a number nothing
+/// publishes. This is that number, and it is the one that says "the sum the
+/// request path refuses on is smaller than the pool it stands for".
+pub fn upstreams_without_ruler(rulers: impl IntoIterator<Item = Ruler>) -> usize {
+    rulers
+        .into_iter()
+        .filter(|ruler| !ruler.contributes())
+        .count()
+}
+
+/// The two series this verdict is published as are registered in
+/// `cog_core::metric_names` (`LLM_POOL_UPSTREAM_WITH_RULER` and
+/// `LLM_POOL_UPSTREAMS_WITHOUT_RULER`) rather than declared here: the gateway
+/// records gauges through a registered name, because a series whose name lives
+/// only at a call site is one nothing else in the workspace can find.
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,5 +955,54 @@ mod tests {
         let rate = allowance_rate(m.capacity_tokens, m.window_secs);
         let wait = wait_secs(&pace, rate, m.burned_at_unix).expect("blocked, so it names a wait");
         assert!((wait as i64 - DAY / 2).abs() <= 5, "waited {wait}s");
+    }
+
+    /// 池和只加进量到窗口的成员，而请求路的 `blocked()` 拿这个和判整池：一个没
+    /// 有尺子的成员在读数上与「额度为零」同形。这条守住「同形」被拆开——没进和
+    /// 的成员必须被数出来，而进和的那一个不能被算成缺席。
+    #[test]
+    fn a_member_without_a_ruler_is_counted_and_the_measured_one_is_not() {
+        let verdicts = [
+            Ruler::Measured,
+            Ruler::NoWindowReported,
+            Ruler::WindowUnmeasurable,
+            Ruler::SpendUnreadable,
+        ];
+        assert_eq!(upstreams_without_ruler(verdicts), 3);
+        // 全都有尺子时是 0 而不是「没有这一族」：0 也是一个要被印出来的答案，
+        // 而缺席只在生产者没跑时出现。
+        assert_eq!(upstreams_without_ruler([Ruler::Measured]), 0);
+        assert_eq!(upstreams_without_ruler([]), 0);
+    }
+
+    /// 五个值两张脸必须一一对上：`contributes()` 是 `1`／`0` 的取值，
+    /// `label()` 是 `reason` 标签。两者错开一位，读数上就会出现一条「值为 0 而
+    /// reason 说 measured」的序列，而那正是这一族要拆开的那个混淆。
+    #[test]
+    fn the_verdict_label_and_the_value_cannot_disagree() {
+        for ruler in [
+            Ruler::Measured,
+            Ruler::NoWindowReported,
+            Ruler::WindowUnmeasurable,
+            Ruler::SpendUnreadable,
+            Ruler::NoUsageLedger,
+        ] {
+            assert_eq!(
+                ruler.label() == "measured",
+                ruler.contributes(),
+                "{ruler:?} 的标签与贡献方向对不上"
+            );
+        }
+    }
+
+    /// 没配用量账本时整池一起没有尺子，而原因与「成员没自报窗口」不同：前者的
+    /// 修法是配账本，后者是去要窗口长度。合成一个值会把两种修法混成一种。
+    #[test]
+    fn no_ledger_is_its_own_reason_not_a_member_without_a_window() {
+        assert_ne!(
+            Ruler::NoUsageLedger.label(),
+            Ruler::NoWindowReported.label()
+        );
+        assert!(!Ruler::NoUsageLedger.contributes());
     }
 }

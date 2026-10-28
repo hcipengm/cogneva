@@ -1840,6 +1840,38 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          or it will name an unmeasured pool as an idle one",
     ),
     (
+        "llm_pool_upstreams_without_ruler",
+        "How many configured pool members contributed nothing to the pool \
+         gauges this pass, because no window was measured for them. The four \
+         token gauges sum only the measured members and the request path's \
+         `blocked` decides for the whole pool from that sum, so a member with \
+         no ruler is counted there as an allowance of zero -- which is the same \
+         reading as a member whose window is spent, and the two are repaired in \
+         opposite directions: one by waiting, one by getting a ruler onto it. \
+         Published as its own count rather than left to `pool_size - \
+         llm_pool_paced_upstreams` because the pool's size is on no other \
+         series. Written every pass, zeros included, so that 'every member is \
+         paced' and 'the pacing pass did not run' are not the same absence",
+    ),
+    (
+        "llm_pool_upstream_with_ruler",
+        "One series per configured pool member: 1 when this pass's pool gauges \
+         include its allowance, 0 when they do not, with a `reason` label naming \
+         which measurement is missing. The reason is a closed set of five and \
+         they are repaired in five different places: `measured` (in the sum), \
+         `no_window_reported` (the upstream has never stated a quota window \
+         length, so the fix is getting that length out of it), \
+         `window_unmeasurable` (the length is known but no settled burn and no \
+         live boundary pins a capacity, so only a refusal produces one), \
+         `spend_unreadable` (the ruler exists and this window's usage query \
+         failed), and `no_usage_ledger` (nothing can be paced at all, which is \
+         a property of the deployment rather than of any member). Collapsing \
+         these into one 'no ruler' would send every reader to the same repair. \
+         The label value follows the verdict, so a member moving between them \
+         opens a series per state it passed through -- read it as an event, not \
+         as a series whose history is comparable",
+    ),
+    (
         "cogneva_version_commits_since_release",
         "First-parent commits between the tracked main and the newest release \
          tag reachable from it. The published artifact is built from the tag, \

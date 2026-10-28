@@ -1201,6 +1201,18 @@ metric_names! {
     LLM_POOL_SPENT_TOKENS => "llm_pool_spent_tokens",
     LLM_POOL_RESERVE_TOKENS => "llm_pool_reserve_tokens",
     LLM_POOL_PACED_UPSTREAMS => "llm_pool_paced_upstreams",
+    // The pool gauges above sum only the members whose window was **measured**,
+    // and the request path's `blocked` decides for the whole pool from that sum.
+    // A member with no ruler therefore contributes zero, and on every one of
+    // those gauges that is the same bytes as "this member has no allowance
+    // left" -- while one of the two is repaired by waiting and the other by
+    // getting a ruler onto the member. These two name which member, and why it
+    // is not in the sum: one series per configured member (1 measured, 0 not,
+    // `reason` naming the missing measurement), and the count of members that
+    // are not. The count is published on its own rather than left to
+    // `pool_size - paced` because the pool's size is on no metric face.
+    LLM_POOL_UPSTREAM_WITH_RULER => "llm_pool_upstream_with_ruler",
+    LLM_POOL_UPSTREAMS_WITHOUT_RULER => "llm_pool_upstreams_without_ruler",
     LLM_POOL_SIGNAL_CONNECTED => "llm_pool_signal_connected",
     // What the ledger says was spent since the start of the UTC day, and which
     // tick that sum came from. Two series because neither is a reading alone:
