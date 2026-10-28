@@ -30,17 +30,32 @@
 # 那里正是宿主读数通道的告警（生产者 down / 读不到输入 / 端点抓不到 / 凭证面）住的地方。
 # 只看 chart 会让「新规则落在 manifest 里」成为一条静默绕过这条门禁的路。
 #
-# 用法：bash deploy/scripts/check-alert-rule-subjects.sh [cogneva.json 路径] [manifest 目录]
+# 用法：bash deploy/scripts/check-alert-rule-subjects.sh [cogneva.json 路径] [manifest 目录 | --chart-only]
+#
+# 点名了 manifest 目录就必须读得到（不存在退 3）：目录改名或没检出时若退 0 并印「manifest
+# 未检查」，那句话与「manifest 里每一条规则都合规」在输出上同形。只判 chart 那一份要显式
+# 说 --chart-only——那是选择，不是「恰好没读到」。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CONFIG="${1:-${ROOT}/deploy/helm/cogneva/files/cogneva.json}"
-MANIFESTS="${2:-${ROOT}/deploy/k3s/observability/manifests}"
+CHART_ONLY=0
+if [ "${2:-}" = "--chart-only" ]; then
+    # 只判 chart 那一份规则的口子。它是显式选的，不是「目录恰好没读到」——
+    # 后者与「manifest 那一半每条都合规」印的是同一句话。
+    CHART_ONLY=1
+    MANIFESTS=""
+else
+    MANIFESTS="${2:-${ROOT}/deploy/k3s/observability/manifests}"
+fi
 [ -f "${CONFIG}" ] || { echo "找不到规则文件：${CONFIG}" >&2; exit 2; }
 
 command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
-python3 - "${CONFIG}" "${MANIFESTS}" <<'PYEOF'
+python3 - "${CONFIG}" "${MANIFESTS}" "${CHART_ONLY}" <<'PYEOF'
 import glob, json, os, re, sys
+
+CHART_ONLY = sys.argv[3] == '1'
+
 
 def find(o):
     if isinstance(o, dict):
@@ -433,13 +448,20 @@ def scrape_jobs_without_pod(dir_path):
     return jobs
 
 
-def manifest_rules(dir_path):
-    """manifest 目录里的 (文件名, alert 或 record 名, expr)。目录不在就返回 None——
-    这份脚本要能只拿一份规则文件用（定向测试就是这么用的），不能因为旁边没有
-    集群清单就拒绝干活。返回的名字里 alert 与 record 都收：record 规则的输出
-    会被告警再读一次，它的标签集同样是「这条规则讲谁」的那一半。"""
-    if not os.path.isdir(dir_path):
+def manifest_rules(dir_path, chart_only):
+    """manifest 目录里的 (文件名, alert 或 record 名, expr)。只判 chart 那一份规则时
+    返回 None——那是调用方显式要的（`--chart-only`），不是「目录恰好没读到」。
+    返回的名字里 alert 与 record 都收：record 规则的输出会被告警再读一次，它的
+    标签集同样是「这条规则讲谁」的那一半。"""
+    if chart_only:
         return None, []
+    if not os.path.isdir(dir_path):
+        # 点名了一个目录就必须读得到。目录改名/没检出时退 0 并印「manifest 未检查」，
+        # 与「manifest 里每一条规则都合规」在判词上是同一句话——而那 78 条规则正是
+        # 这条门最近才把射程扩到的地方。
+        print(f'FAIL: manifest 目录 {dir_path} 不存在 —— 点名了就必须读得到；'
+              f'只判 chart 那一份请显式用 --chart-only', file=sys.stderr)
+        sys.exit(3)
     try:
         import yaml
     except ImportError:
@@ -535,7 +557,7 @@ def main(path, manifests_dir):
     # 与 chart 同一套判词。区别只在于这里没有控制集（控制集钉的是 chart 那 18 条），
     # 豁免表照旧按名字匹配；名字与 chart 撞车另算一条——同一个告警名两个来源，身份去重
     # 与冷却记账都分不开它们。
-    files, m_rules = manifest_rules(manifests_dir)
+    files, m_rules = manifest_rules(manifests_dir, CHART_ONLY)
     no_pod_ok = bool(files) and HOST_READING_JOB in scrape_jobs_without_pod(manifests_dir)
     m_unreduced = m_unpaired = 0
     waived = set()
@@ -561,7 +583,9 @@ def main(path, manifests_dir):
             problems.append(f'{src}: {name}：比较的两侧配不上，这条规则产不出序列 -- {paired_bad}')
 
     names_in_manifest = {n for _, n, _ in m_rules}
-    for n in (NO_POD_REPORTER if files is not None else ()):
+    # 一条规则都没认出来（`m_rules` 空）：这一圈只会把同一个零读出来的噪声
+    # 记成 problem，所以整段跳过，由下面那格判 3。
+    for n in (NO_POD_REPORTER if m_rules else ()):
         if n not in names_in_manifest:
             problems.append(f'免聚合表里的 {n} 不在这批 manifest 规则里（豁免跟着规则一起过期）')
         elif files is not None and not no_pod_ok and n not in exempt:
@@ -574,7 +598,7 @@ def main(path, manifests_dir):
           f'已停用 {len(retired)} 条，摘要点名停用名 {prose_hits} 处',
           flush=True)
     if files is None:
-        print(f'manifest 未检查：{manifests_dir} 不存在', flush=True)
+        print(f'manifest 未检查：只判了 {path} 那一份规则（--chart-only）', flush=True)
     else:
         print(f'manifest 规则 {len(m_rules)} 条（{len(files)} 份 PrometheusRule），'
               f'未收敛 {m_unreduced} 条（其中无 pod 维可聚合 {len(waived)} 条），'
@@ -583,6 +607,13 @@ def main(path, manifests_dir):
         for p in problems:
             print('FAIL: ' + p, file=sys.stderr)
         return 1
+    if files is not None and not m_rules:
+        # 目录在、读得动，却一条 PrometheusRule 规则都没认出来：与「后一半每一条都
+        # 合规」印的是同一句话。零条不是通过，是没判成。
+        print(f'FAIL: {manifests_dir} 下 {len(files)} 份清单里一条 PrometheusRule 规则'
+              '都没读到——零条与「每一条都合规」在输出上同形，这一跑的后半边什么都没判',
+              file=sys.stderr)
+        return 3
     print('ALERT SUBJECT OK：每条规则的身份维都是它讲的那个对象')
     return 0
 

@@ -143,7 +143,9 @@ PYEOF
 
 run() { # run <config> [manifest 目录] -> 打印合并输出，回传退出码
   local out
-  if out="$(bash "${gate}" "$1" "${2:-${work}/no-manifests}" 2>&1)"; then
+  # 只判 chart 那一份规则用显式的 `--chart-only`：点名了一个不存在的清单目录是
+  # 依赖错误（退 3），不是「manifest 那一半不适用」。
+  if out="$(bash "${gate}" "$1" "${2:---chart-only}" 2>&1)"; then
     printf '%s\n' "${out}"; return 0
   else
     printf '%s\n' "${out}"; return 1
@@ -277,5 +279,26 @@ grep -q 'CognevaHostReadingProducerDown' <<<"${out}" || fail "前提消失时没
 if bash "${gate}" "${work}/does-not-exist.json" >/dev/null 2>&1; then
   fail "文件不存在却当成功返回"
 fi
+
+# 11. 清单目录读不到 / 一条规则都没读到：与「manifest 那一半每条都合规」印的是同一句话。
+#     目录改名（或没检出）是最常见的一种。
+if out="$(bash "${gate}" "${config}" "${work}/no-such-manifests" 2>&1)"; then
+  fail "点名了不存在的 manifest 目录却判绿：${out}"
+fi
+rc=0
+out="$(bash "${gate}" "${config}" "${work}/no-such-manifests" 2>&1)" || rc=$?
+[ "${rc}" -eq 3 ] || fail "清单目录读不到时 rc=${rc}，应为 3 —— ${out}"
+grep -q '不存在' <<<"${out}" || fail "没有说清是目录不存在：${out}"
+
+mkdir -p "${work}/empty-manifests"
+printf 'apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x}\n' >"${work}/empty-manifests/only-configmap.yaml"
+rc=0
+out="$(bash "${gate}" "${config}" "${work}/empty-manifests" 2>&1)" || rc=$?
+[ "${rc}" -eq 3 ] || fail "清单里一条 PrometheusRule 都没有时 rc=${rc}，应为 3 —— ${out}"
+grep -q '一条 PrometheusRule 规则' <<<"${out}" || fail "没有说清是一条规则都没读到：${out}"
+
+# 显式的 --chart-only 仍然是合法的：那是调用方选的，不是目录恰好没读到。
+out="$(bash "${gate}" "${config}" --chart-only 2>&1)" || fail "--chart-only 应当绿：${out}"
+grep -q 'manifest 未检查' <<<"${out}" || fail "--chart-only 要说明只判了 chart 那一份：${out}"
 
 echo "ALERT SUBJECT GATE TESTS OK"
