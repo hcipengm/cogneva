@@ -1981,6 +1981,43 @@ struct CiHoldEnd {
     reasons: Vec<String>,
 }
 
+/// 一轮里问上游 CI 的那几个点位，只用来给判词读数贴标签。
+///
+/// 同一个 rev 在一轮里会被问三次，三次的结论可以不同：轮首那次问的是一版刚落上
+/// 来的 rev（上游的检查常常还在跑），拿构建槽之前那次多了回收、收敛判定与排队的
+/// 几分钟，派 Job 之前那次又多了一整段构建。同样的「红」在这三个时刻被接住，
+/// 省下的东西完全不同——轮首扣住是一轮没开始，构建前扣住是一整段冷构建，
+/// 派发前扣住是一趟集群内滚动。计数器不贴这个标签时，「红在第二问才被接住」与
+/// 「一直问到第三问才发现」在读数面上是同一行，于是这道门到底省下了什么，读
+/// 不出来。
+///
+/// `JobTermination` 是第四格：那一问不在部署器里，Job 自己复问、把结论随终止
+/// 消息带回来，部署器只读到一条签名。它记进同一个计数器，因为它同样是「这一版
+/// 被判红了」，而它付掉的价钱是整趟 Job。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CiAsk {
+    /// 轮首：决定要不要开始这一轮。
+    RoundHead,
+    /// 拿构建槽之前：决定要不要花一整段冷构建。
+    BeforeBuild,
+    /// 派 Job 之前：决定这份刚编好的镜像要不要进集群。
+    PreDispatch,
+    /// Job 在落地前复问、随终止消息带回来的那一次。
+    JobTermination,
+}
+
+impl CiAsk {
+    /// 闭集取值，逐个点名。读的人按这个字符串筛序列。
+    fn label(self) -> &'static str {
+        match self {
+            CiAsk::RoundHead => "round_head",
+            CiAsk::BeforeBuild => "before_build",
+            CiAsk::PreDispatch => "pre_dispatch",
+            CiAsk::JobTermination => "job_termination",
+        }
+    }
+}
+
 /// 扣住结束这件事的读数字面量：日志、盘上状态与变更面共用同一个名字。
 const CI_HOLD_ENDED_EVENT: &str = "ci_hold_ended";
 
@@ -3855,6 +3892,7 @@ impl MainlineDeployer {
     async fn ci_verdict_with_failures(
         &self,
         rev: &str,
+        ask: CiAsk,
     ) -> (Option<bool>, Vec<String>, Vec<String>, Vec<String>) {
         let mut verdicts = Vec::new();
         let mut failed: Vec<String> = Vec::new();
@@ -3896,7 +3934,7 @@ impl MainlineDeployer {
         } else {
             Some(true)
         };
-        self.record_ci_verdict_reading(verdict).await;
+        self.record_ci_verdict_reading(verdict, ask).await;
         if verdict.is_none() {
             self.record_ci_verdict_reason_reading(&reasons).await;
         }
@@ -3933,9 +3971,10 @@ impl MainlineDeployer {
         &self,
         state: &mut MainlineState,
         rev: &str,
+        ask: CiAsk,
     ) -> SFResult<bool> {
         let (verdict, failed_checks, reasons, excluded_checks) =
-            self.ci_verdict_with_failures(rev).await;
+            self.ci_verdict_with_failures(rev, ask).await;
         self.record_ci_verdict_in_state(
             state,
             rev,
@@ -3960,6 +3999,9 @@ impl MainlineDeployer {
         }
         warn!(
             rev = %rev12(rev),
+            // 三次提问写的是同一句话，扣住的是哪一问只有这个字段说得出来——
+            // 而「红在第二问才被接住」正是这道门省下构建的证据。
+            ask = ask.label(),
             // 只说「有一项」的日志把定位推到仓库外去问；名字在这一次读里就有。
             // 空列表是「结论来自提交状态兜底」，不是「没有失败项」。
             failed_checks = %if failed_checks.is_empty() {
@@ -4165,18 +4207,28 @@ impl MainlineDeployer {
     /// "this round could not read them at all" both end in the same dispatch.
     /// The log line that used to be the only trace dies with the pod that wrote
     /// it. One of the three labels gains a count each time the question is
-    /// asked, and a round asks it twice -- before the build and again before the
-    /// dispatch -- so a round that reads a verdict for a revision and rolls it
-    /// adds two. All three missing means neither call site is there.
+    /// asked, and a round asks it three times -- at the round head, before the
+    /// build, and again before the dispatch -- so a round that reads a verdict
+    /// for a revision and rolls it adds three. All three missing means none of
+    /// the call sites is there.
     ///
     /// The counters answer "how often", not "which revision": they are
     /// cumulative and carry no rev, so per-revision attribution comes from the
     /// state file's [`CiVerdictRecord`], written at the same call.
-    async fn record_ci_verdict_reading(&self, verdict: Option<bool>) {
+    ///
+    /// The `ask` label is what keeps the three questions apart. They are the
+    /// same criterion but not the same decision: a `fail` heard at the round
+    /// head costs nothing, the same `fail` heard before the build saves a whole
+    /// cold build, and heard before the dispatch it saves a rollout. Without
+    /// the label a run of holds reads as one number and cannot say whether the
+    /// gate is catching revisions for the first time at the point where it
+    /// matters.
+    async fn record_ci_verdict_reading(&self, verdict: Option<bool>, ask: CiAsk) {
         let Some(metrics) = &self.metrics else {
             return;
         };
         let mut labels = std::collections::HashMap::new();
+        labels.insert(crate::LABEL_ASK.to_string(), ask.label().to_string());
         labels.insert(
             crate::LABEL_VERDICT.to_string(),
             match verdict {
@@ -5791,7 +5843,8 @@ impl MainlineDeployer {
                         // 在落地前复问时答"红"的那一版，在某些计数面上与一直没问题的
                         // 那一版同形——区别全在这一次复问，不记就只剩日志。
                         Some(sig) if sig == upstream_ci_hold_signature() => {
-                            self.record_ci_verdict_reading(Some(false)).await;
+                            self.record_ci_verdict_reading(Some(false), CiAsk::JobTermination)
+                                .await;
                             warn!(
                                 rev = %rev12(&inflight.rev),
                                 "the rollout job held this revision before it touched the cluster: \
@@ -5974,7 +6027,10 @@ impl MainlineDeployer {
         // 追上来，这条路径自己恢复。这里问的是第一次；第二次在拿构建槽之前
         // （构建跑完才发现红，白跑的是十六分钟的槽），第三次在真要派 Job 之前
         // （见 `roll_out`），每两次之间隔着的那段正是它要补上的窗口。
-        if self.hold_if_ci_reports_failure(&mut state, &bare).await? {
+        if self
+            .hold_if_ci_reports_failure(&mut state, &bare, CiAsk::RoundHead)
+            .await?
+        {
             // 被 CI 扣住的轮同样「还在等构建场」，只是走不到下面的被拒分支。
             self.renew_advance_reservation(&mut state)?;
             return Ok(());
@@ -6094,7 +6150,10 @@ impl MainlineDeployer {
         //
         // 位置在拿槽**之前**：读 git 与问 CI 都不是构建，那个槽的契约只罩真要构建的
         // 那一段。扣住时什么都还没写下来，直接回下一轮。
-        if self.hold_if_ci_reports_failure(&mut state, &bare).await? {
+        if self
+            .hold_if_ci_reports_failure(&mut state, &bare, CiAsk::BeforeBuild)
+            .await?
+        {
             // 与轮首那一支同样走不到被拒分支：还挂着的换手请求要在这里续上，
             // 否则一次「等到了却在这一问问出红」会让预留自己过期，读数面上
             // 这一段等待与「没有在等」同形。
@@ -6377,7 +6436,11 @@ impl MainlineDeployer {
         // 撤回不问这一问：它问的是「要滚的这一版当时红没红」，而撤回不是对这个问题
         // 的回答。而且这一次问出去之后没有任何东西会再问一遍——一个旧的判词会把撤回
         // 永远按在原地，而按住的形态与「已经撤回去了」在读数上同形。
-        if !withdrawal && self.hold_if_ci_reports_failure(state, rev).await? {
+        if !withdrawal
+            && self
+                .hold_if_ci_reports_failure(state, rev, CiAsk::PreDispatch)
+                .await?
+        {
             state.in_flight = None;
             self.save_state(state)?;
             return Ok(false);
@@ -14558,7 +14621,10 @@ exec {real} "$@"
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
         assert_eq!(
-            deployer.ci_verdict_with_failures("abc123").await.0,
+            deployer
+                .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+                .await
+                .0,
             Some(false)
         );
 
@@ -14586,8 +14652,9 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, _excluded) =
-            deployer.ci_verdict_with_failures("abc123").await;
+        let (verdict, failed, _reasons, _excluded) = deployer
+            .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+            .await;
         assert_eq!(verdict, Some(false));
         // 只有报失败的那一条，且带平台前缀；成功的那条不进这一列。
         assert_eq!(failed, vec!["github:Clippy".to_string()]);
@@ -14740,7 +14807,7 @@ exec {real} "$@"
         let mut state = MainlineState::default();
         assert!(
             deployer
-                .hold_if_ci_reports_failure(&mut state, "abc123")
+                .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
                 .await
                 .unwrap(),
             "a completed failure holds the rollout"
@@ -14785,7 +14852,7 @@ exec {real} "$@"
         let mut state = MainlineState::default();
         for _ in 0..2 {
             assert!(deployer
-                .hold_if_ci_reports_failure(&mut state, "abc123")
+                .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
                 .await
                 .unwrap());
         }
@@ -14819,7 +14886,7 @@ exec {real} "$@"
 
         let mut state = MainlineState::default();
         assert!(!deployer
-            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
             .await
             .unwrap());
         assert!(planner.submissions().is_empty());
@@ -15176,8 +15243,9 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) =
-            deployer.ci_verdict_with_failures("abc123").await;
+        let (verdict, failed, _reasons, excluded) = deployer
+            .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+            .await;
         assert_eq!(verdict, Some(true), "被排掉的那条不判这棵树，另一条是绿的");
         assert!(failed.is_empty(), "{failed:?}");
         assert_eq!(
@@ -15220,8 +15288,9 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) =
-            deployer.ci_verdict_with_failures("abc123").await;
+        let (verdict, failed, _reasons, excluded) = deployer
+            .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+            .await;
         assert_eq!(
             verdict,
             Some(true),
@@ -15260,8 +15329,9 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) =
-            deployer.ci_verdict_with_failures("abc123").await;
+        let (verdict, failed, _reasons, excluded) = deployer
+            .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+            .await;
         assert_eq!(verdict, Some(false));
         assert_eq!(failed, vec!["github:Test".to_string()]);
         assert!(excluded.is_empty(), "{excluded:?}");
@@ -15287,8 +15357,9 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) =
-            deployer.ci_verdict_with_failures("abc123").await;
+        let (verdict, failed, _reasons, excluded) = deployer
+            .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+            .await;
         assert_eq!(verdict, Some(false));
         assert_eq!(failed, vec!["github:deploy".to_string()]);
         assert!(excluded.is_empty(), "{excluded:?}");
@@ -15315,8 +15386,9 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) =
-            deployer.ci_verdict_with_failures("abc123").await;
+        let (verdict, failed, _reasons, excluded) = deployer
+            .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+            .await;
         assert_eq!(verdict, Some(false));
         assert_eq!(failed, vec!["github:deploy".to_string()]);
         assert!(excluded.is_empty(), "{excluded:?}");
@@ -15337,7 +15409,13 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        assert_eq!(deployer.ci_verdict_with_failures("abc123").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
 
         // 检查还在跑时问不出结论，于是退到提交状态兜底这条路径上。
         let reqs = handle.await.unwrap();
@@ -15356,14 +15434,26 @@ exec {real} "$@"
         // 没配基址：不发请求，也不判失败。
         let cfg = upstream_config(root, Path::new("/nonexistent"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
-        assert_eq!(deployer.ci_verdict_with_failures("abc123").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
 
         // 配了但连不上：同样按没证据处理。
         let mut cfg = upstream_config(root, Path::new("/nonexistent"));
         cfg.upstreams.truncate(1);
         cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
-        assert_eq!(deployer.ci_verdict_with_failures("abc123").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
     }
 
     /// 扣住的时长是这条读数的全部内容。
@@ -15406,7 +15496,7 @@ exec {real} "$@"
         // 上游说这条 rev 红：扣住，起点落盘。
         let mut state = deployer.load_state();
         assert!(deployer
-            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
             .await
             .unwrap());
         let held = deployer.load_state().ci_hold.expect("扣住了就要有起点");
@@ -15430,7 +15520,7 @@ exec {real} "$@"
         });
         deployer.save_state(&state).unwrap();
         assert!(deployer
-            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
             .await
             .unwrap());
         let aged = read().await.unwrap();
@@ -15442,7 +15532,7 @@ exec {real} "$@"
         // 上游不再说红：这一支放行，并把这一格读回 0。清掉状态里的起点是
         // `poll_once` 那一侧的事（`take()`），这里只管读数。
         assert!(!deployer
-            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
             .await
             .unwrap());
         assert_eq!(
@@ -15474,7 +15564,7 @@ exec {real} "$@"
 
         let mut state = deployer.load_state();
         assert!(!deployer
-            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
             .await
             .unwrap());
         let recorded = deployer
@@ -15513,7 +15603,7 @@ exec {real} "$@"
 
         let mut state = deployer.load_state();
         assert!(deployer
-            .hold_if_ci_reports_failure(&mut state, "abc123")
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
             .await
             .unwrap());
         let recorded = deployer.load_state().last_ci_verdict.expect("判红要留判词");
@@ -15524,6 +15614,66 @@ exec {real} "$@"
             "失败检查名要跟着判词落盘，且只带报失败的那几条"
         );
         handle.await.unwrap();
+    }
+
+    /// 一条判词要说出它是**哪一问**问出来的。
+    ///
+    /// 三次提问用的是同一条判据，但价钱完全不同：轮首那次答红是一轮没开始，拿
+    /// 构建槽之前答红省下一整段冷构建，派发之前答红省下一趟集群内滚动。计数器
+    /// 不带 `ask` 时这三种在读数面上是同一行——于是「这道门到底省下了构建没有」
+    /// 读不出来，而省构建正是加第三问的原因。同一版先问到绿、再问到红的一轮就是
+    /// 那个形状：要留下两行，且红的那行写在第二问名下。
+    #[tokio::test]
+    async fn the_verdict_reading_names_which_ask_heard_it() {
+        use cog_core::metric_names::MAINLINE_CI_VERDICT_TOTAL;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"conclusion":"success"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        let mut state = MainlineState::default();
+        assert!(!deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::BeforeBuild)
+            .await
+            .unwrap());
+        let _ = handle.await.unwrap();
+
+        let rows = metrics
+            .query_counter_totals(MAINLINE_CI_VERDICT_TOTAL.as_str())
+            .await
+            .unwrap();
+        let value = |ask: &str, verdict: &str| {
+            rows.iter()
+                .find(|r| {
+                    r.labels.get(crate::LABEL_ASK).map(String::as_str) == Some(ask)
+                        && r.labels.get(crate::LABEL_VERDICT).map(String::as_str) == Some(verdict)
+                })
+                .map(|r| r.value)
+        };
+        assert_eq!(value("round_head", "pass"), Some(1.0), "{rows:?}");
+        assert_eq!(
+            value("before_build", "fail"),
+            Some(1.0),
+            "构建前那一问答出的红，要写在那一问名下，否则就与轮首那次同形: {rows:?}"
+        );
+        assert_eq!(
+            rows.len(),
+            2,
+            "两问答了两个不同的结论，就该是两行: {rows:?}"
+        );
     }
 
     /// 三支判定各自留下的是哪一支。
@@ -15551,7 +15701,13 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
-        assert_eq!(deployer.ci_verdict_with_failures("aaa").await.0, Some(true));
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("aaa", CiAsk::RoundHead)
+                .await
+                .0,
+            Some(true)
+        );
         handle.await.unwrap();
 
         // 读到一条判死的。
@@ -15565,7 +15721,10 @@ exec {real} "$@"
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
         assert_eq!(
-            deployer.ci_verdict_with_failures("bbb").await.0,
+            deployer
+                .ci_verdict_with_failures("bbb", CiAsk::RoundHead)
+                .await
+                .0,
             Some(false)
         );
         handle.await.unwrap();
@@ -15576,7 +15735,13 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some("http://127.0.0.1:1/github".into());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
-        assert_eq!(deployer.ci_verdict_with_failures("ccc").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("ccc", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
 
         let rows = metrics
             .query_counter_totals(MAINLINE_CI_VERDICT_TOTAL.as_str())
@@ -15686,14 +15851,26 @@ exec {real} "$@"
         ])
         .await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_with_failures("aaa").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("aaa", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
         handle.await.unwrap();
 
         // 问到了、一条检查都没有：这是"没有东西"，不是"没问到"。
         let (endpoint, handle) =
             fake_registry(vec![http_200(r#"{"check_runs":[]}"#), HTTP_404.to_string()]).await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_with_failures("bbb").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("bbb", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
         handle.await.unwrap();
 
         // 兜底那条接口也答不出可判的东西：两处都没结论，这一格比"没有检查"更贴近实情。
@@ -15703,14 +15880,26 @@ exec {real} "$@"
         ])
         .await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_with_failures("ccc").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("ccc", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
         handle.await.unwrap();
 
         // 凭证被拒（403 也含二级限流）：主人是网关那一侧的凭证。
         let (endpoint, handle) =
             fake_registry(vec![http_status(403, "Forbidden"), HTTP_404.to_string()]).await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_with_failures("ddd").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("ddd", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
         handle.await.unwrap();
 
         // 200 回来了、body 不是 JSON：响应在途中被弄坏了，主人在代理这一段。
@@ -15720,12 +15909,24 @@ exec {real} "$@"
         ])
         .await;
         let deployer = asks(&format!("http://{endpoint}/github"), &metrics);
-        assert_eq!(deployer.ci_verdict_with_failures("eee").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("eee", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
         handle.await.unwrap();
 
         // 配了这个上游却没给基址：一个请求都不会发出去，主人是配置面。
         let deployer = asks("   ", &metrics);
-        assert_eq!(deployer.ci_verdict_with_failures("fff").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("fff", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
 
         // 一轮里两条上游都没说话：原因各记一次，各带自己的平台。这个倍数是可核的，
         // 但只自上游列表最后一次变更起成立。
@@ -15734,7 +15935,13 @@ exec {real} "$@"
         cfg.upstreams[1].api_base = Some("http://127.0.0.1:1/gitee".into());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
-        assert_eq!(deployer.ci_verdict_with_failures("ggg").await.0, None);
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("ggg", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
 
         let rows = metrics
             .query_counter_totals(MAINLINE_CI_NO_VERDICT_REASON_TOTAL.as_str())

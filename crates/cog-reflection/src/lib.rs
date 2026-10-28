@@ -228,6 +228,10 @@ pub const LABEL_CLAUSE: &str = "clause";
 /// 读数按「这一格给出什么结局」归属时用的标签键。
 pub const LABEL_VERDICT: &str = "verdict";
 
+/// 读数按「在哪一问上得出」归属时用的标签键：同一个判据一轮里被问好几次，
+/// 每次的价钱不同，所以同一条判词要说出是哪一问。
+pub const LABEL_ASK: &str = "ask";
+
 /// 读数按「哪个对象」归属时用的标签键。
 pub const LABEL_OBJECT: &str = "object";
 
