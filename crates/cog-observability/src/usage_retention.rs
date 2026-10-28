@@ -373,10 +373,13 @@ pub fn keep_days_from_env() -> i64 {
 
 /// [`keep_days_from_env`] against an explicit value, so the fallback can be
 /// tested without a process environment.
+///
+/// Zero falls back to the default: the ledger answers what was spent and by
+/// which agent, and a ledger swept to nothing every pass reads as a deployment
+/// that spent nothing rather than one that stopped keeping the books. Nothing
+/// downstream can tell those apart, so `0` is treated as a misconfiguration.
 pub fn keep_days_from(raw: Option<&str>) -> i64 {
-    raw.and_then(|s| s.trim().parse::<i64>().ok())
-        .filter(|days| *days >= MIN_KEEP_DAYS)
-        .unwrap_or(DEFAULT_KEEP_DAYS)
+    cog_core::retention::keep_days_or_default(raw, DEFAULT_KEEP_DAYS, MIN_KEEP_DAYS)
 }
 
 /// The deployment this process runs in, for the readings below.

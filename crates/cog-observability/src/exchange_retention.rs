@@ -354,10 +354,13 @@ pub fn keep_days_from_env() -> i64 {
 }
 
 /// See [`keep_days_from_env`].
+///
+/// Zero falls back to the default rather than meaning "stop sweeping": a
+/// zero-day retention would empty the archive every pass, and an empty table
+/// reads the same as one the policy is keeping bounded. There is no reading in
+/// which "keep nothing" is what a deployment meant by `0`.
 pub fn keep_days_from(raw: Option<&str>) -> i64 {
-    raw.and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|d| *d >= MIN_KEEP_DAYS)
-        .unwrap_or(DEFAULT_KEEP_DAYS)
+    cog_core::retention::keep_days_or_default(raw, DEFAULT_KEEP_DAYS, MIN_KEEP_DAYS)
 }
 
 /// The deployment this process belongs to, as the platform names it.

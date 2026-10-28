@@ -450,12 +450,16 @@ pub fn keep_days_from_env() -> Option<i64> {
 }
 
 /// See [`keep_days_from_env`].
+///
+/// Zero means **stop sweeping**, not "sweep everything": the readers replay a
+/// task's events from offset zero, so a retired prefix is answered as a gap that
+/// looks exactly like the start of the run. That is a state worth being able to
+/// ask for on purpose, so it is the [`keep_days_or_disable`] reading rather than
+/// the fall-back one.
+///
+/// [`keep_days_or_disable`]: cog_core::retention::keep_days_or_disable
 pub fn keep_days_from(raw: Option<&str>) -> Option<i64> {
-    match raw.and_then(|v| v.trim().parse::<i64>().ok()) {
-        Some(0) => None,
-        Some(days) if days >= MIN_KEEP_DAYS => Some(days),
-        _ => Some(DEFAULT_KEEP_DAYS),
-    }
+    cog_core::retention::keep_days_or_disable(raw, DEFAULT_KEEP_DAYS, MIN_KEEP_DAYS)
 }
 
 /// The deployment this process belongs to, as the platform names it.
