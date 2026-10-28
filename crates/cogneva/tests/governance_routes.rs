@@ -13,6 +13,8 @@
 //! and whether the write face consults the store is visible in the answer it
 //! gives to a name the store does not have.
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
@@ -26,6 +28,7 @@ use cog_core::{
     SFResult, Task, TaskStatus, User, UserStatus, UserType,
 };
 use cog_gateway::{create_router, GatewayState};
+use common::orchestrator::control;
 
 /// A roster with no table behind it: the face rows it is handed, and nothing else.
 ///
@@ -229,8 +232,7 @@ fn state_with(
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(cog_storage::MemoryRawLogger::new());
-    let dag_executor = Arc::new(cog_orchestrator::DagExecutor::new("test-workspace".into()));
-    let orchestrator = Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag_executor));
+    let orchestrator = control("test-workspace");
 
     Arc::new(GatewayState {
         data_dir: "/tmp".into(),

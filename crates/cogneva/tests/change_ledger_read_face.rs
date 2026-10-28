@@ -14,6 +14,8 @@
 //! what is checked here is the route: which cells it promises, where it takes
 //! its totals from, and what it says when there is no account at all.
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
@@ -28,6 +30,7 @@ use cog_core::{
     QuotaManager, QuotaSummary, SFResult, User, UserStatus, UserType,
 };
 use cog_gateway::{create_router, GatewayState};
+use common::orchestrator::control;
 
 /// An account holding rows the cases below describe, with every write path
 /// unimplemented on purpose: a read route that writes is a route this stand-in
@@ -336,8 +339,7 @@ fn state(change_ledger: Option<Arc<FakeLedger>>) -> Arc<GatewayState> {
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(cog_storage::MemoryRawLogger::new());
-    let dag_executor = Arc::new(cog_orchestrator::DagExecutor::new("test-workspace".into()));
-    let orchestrator = Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag_executor));
+    let orchestrator = control("test-workspace");
     let state_backend: Arc<dyn cog_core::StateBackend> =
         Arc::new(cog_storage::MemoryStateBackend::new());
 

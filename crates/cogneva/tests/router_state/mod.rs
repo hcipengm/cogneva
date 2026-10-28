@@ -20,6 +20,18 @@
 //! A suite that needs a store, an agent pool or a message backend is not this
 //! fixture's caller; it builds its own state around the thing it is judging.
 
+// 建执行器、包一层控制面这两行只该写在 `tests/common/orchestrator.rs` 里一处。这里按
+// 路径只引那一个文件，而不是把 `common` 整棵摘进来：这个模块会被几十个测试二进制各编
+// 一次，多摘十几个模块是白花的编译时间。
+// 引用它的二进制里有的已经自己 `mod common;`，于是这一个文件在那几个目标里会被编两次
+// ——clippy 因此报 `duplicate_mod`。它建议的改法（留一个 `mod`、其余改成 `use`）在这里
+// 不成立：另一份在别的模块树里，`use` 够不着。编两次在这里是安全的，因为这个文件只返回
+// `cog_core` 里的 trait 对象，自己不定义任何类型——两份之间没有「同一个名字指两个类型」
+// 的可能。加进这个文件的任何东西都得继续满足这一点。
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/orchestrator.rs"]
+mod orchestrator;
+
 use std::sync::Arc;
 
 use tokio::sync::broadcast;
@@ -198,8 +210,7 @@ fn build(
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(cog_storage::MemoryRawLogger::new());
-    let dag_executor = Arc::new(cog_orchestrator::DagExecutor::new("test-workspace".into()));
-    let orchestrator = Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag_executor));
+    let orchestrator = orchestrator::control("test-workspace");
 
     Arc::new(GatewayState {
         data_dir,

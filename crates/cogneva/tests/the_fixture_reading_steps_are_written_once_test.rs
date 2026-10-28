@@ -151,6 +151,17 @@ const SUPPORT_ENV_NAMES: [&str; 2] = ["COGNEVA_TEST_DATABASE_URL", "COGNEVA_TEST
 /// 全删了它也一样绿，所以另一头要有底：这些人真的在用那个 crate。
 const MIN_SUPPORT_CALLSITES: usize = 60;
 
+/// 夹具里造控制面的那两行只该写在它这里：建一个 `DagExecutor`、再包一层控制面。
+///
+/// 六份夹具各写了一遍，而这些夹具问的是「同一个控制面对同一个 workspace 怎么答」。
+/// 一边把标签换掉、或者补上了事件总线而另一边没补，两份就不再描述同一个对象——而两份
+/// 都还是绿的，因为没人比较它们。产出码不在这一面里：`cog-orchestrator` 自己造它是
+/// 它的本职，跨类边界不是副本。
+const ORCHESTRATOR_HOME: &str = "crates/cogneva/tests/common/orchestrator.rs";
+
+/// 走它的调用点下限。今天 9 处。
+const MIN_ORCHESTRATOR_CALLSITES: usize = 8;
+
 // 普查面：`crates/**/*.rs`，夹具与产出面一起算。
 //
 // `src/` 必须在里面：这一族抄件上一轮就长在 `src/` 的单测模块里（`startup_guard.rs`
@@ -185,6 +196,10 @@ struct Census {
     env_reads: Vec<String>,
     /// 够到支撑 crate 的调用点（含 `use`），判据人口的下限靠它。
     support_callsites: usize,
+    /// 夹具里自己造控制面的地方：`文件:行 这一行`。
+    control_builds: Vec<String>,
+    /// 走 `ORCHESTRATOR_HOME` 的调用点（含 `use`）。
+    orchestrator_callsites: usize,
 }
 
 /// 这个文件里有哪些函数自己在往下走目录：函数体里同时出现 `read_dir` 与它自己的名字。
@@ -327,6 +342,8 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     let mut recursions = Vec::new();
     let mut env_reads: Vec<String> = Vec::new();
     let mut support_callsites = 0usize;
+    let mut control_builds: Vec<String> = Vec::new();
+    let mut orchestrator_callsites = 0usize;
     let mut files = 0usize;
     let (mut readers, mut walkers, mut strippers) = (0usize, 0usize, 0usize);
     // 函数体 → 出现它的「文件:行 名字」。按体分组，所以同一个体换了名字也照样并到一起。
@@ -401,6 +418,21 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         ] {
             support_callsites += text.matches(form).count();
         }
+        // 造控制面：只在夹具面上判，产出码里它是本职。这一面按**构造**判——两份抄件
+        // 的变量名、缩进都可以不一样，但「在这里 new 一个控制面」这件事是一样的。
+        // 这份门自己写着标本（那串判据里就有 `OrchestratorControlImpl::new`），
+        // 所以它自己也摘出去——和上面那一族同一个理由。
+        if name.contains("/tests/") && name != ORCHESTRATOR_HOME && name != THE_PREDICATE {
+            for (index, line) in text.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                if line.contains("OrchestratorControlImpl::new") {
+                    control_builds.push(format!("{name}:{} {}", index + 1, line.trim()));
+                }
+            }
+        }
+        orchestrator_callsites += text.matches("orchestrator::control").count();
         let imported = imported_names(&text);
         if name != THE_ONE {
             if imported.contains(&"read".to_string()) || text.contains("routes::read") {
@@ -456,6 +488,8 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         support_copies,
         env_reads,
         support_callsites,
+        control_builds,
+        orchestrator_callsites,
     }
 }
 
@@ -589,6 +623,22 @@ fn the_fixture_reading_steps_are_written_once() {
         "只有 {} 处够到 `cog_test_support`（下限 {MIN_SUPPORT_CALLSITES}）：那么「夹具里\
          不许再写一遍」那几条读的是一个没人用的 crate，绿得没有题目",
         found.support_callsites
+    );
+    // 同一条规则的第三种形状：不是读地址，是**造对象**。六份夹具各写过一遍「建执行器、
+    // 包一层控制面」，而它们问的是同一个控制面在同一个 workspace 上怎么答——其中一份
+    // 补了事件总线、另一份没补，两份就描述的不是同一个对象了，而两份都还是绿的。
+    assert!(
+        found.control_builds.is_empty(),
+        "这些夹具自己造了控制面：{:?}\n\
+         改成 `use common::orchestrator::…`：两份写在两处的时候，改了其中一份的另一半\
+         不会红。",
+        found.control_builds
+    );
+    assert!(
+        found.orchestrator_callsites >= MIN_ORCHESTRATOR_CALLSITES,
+        "只有 {} 处走 `ORCHESTRATOR_HOME`（下限 {MIN_ORCHESTRATOR_CALLSITES}）：那么\
+         「夹具里不许自己造」读的是一个没人用的构造函数",
+        found.orchestrator_callsites
     );
     let support = std::fs::read_to_string(root.join(SUPPORT_HOME)).expect("支撑 crate 读得到");
     let missing: Vec<&str> = SUPPORT_ENTRY_POINTS

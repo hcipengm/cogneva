@@ -96,8 +96,7 @@ async fn spawn_app_full(
 
     let index_store = Arc::new(MemoryRawLogIndexStore::new());
 
-    let dag_executor = Arc::new(cog_orchestrator::DagExecutor::new("test-workspace".into()));
-    let orchestrator = Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag_executor));
+    let orchestrator = common::orchestrator::control("test-workspace");
 
     let (task_event_tx, _task_event_rx) = broadcast::channel::<cog_core::TaskEvent>(16);
 

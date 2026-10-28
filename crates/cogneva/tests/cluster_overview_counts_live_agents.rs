@@ -11,6 +11,8 @@
 //! replace the storage layer's answer, and an absent registry must leave the
 //! cells empty rather than letting a zero stand as a reading.
 
+mod common;
+
 use std::sync::Arc;
 
 use axum::body::{to_bytes, Body};
@@ -25,6 +27,7 @@ use cog_core::{
 };
 use cog_gateway::{create_router, GatewayState};
 use cog_storage::{MemoryAgentRegistry, MemoryObservabilityGateway, MemoryStateBackend};
+use common::orchestrator::control;
 
 /// The quota store the state has a slot for, with no store behind it.
 ///
@@ -129,8 +132,7 @@ fn state_with(
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(cog_storage::MemoryRawLogger::new());
-    let dag_executor = Arc::new(cog_orchestrator::DagExecutor::new("test-workspace".into()));
-    let orchestrator = Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag_executor));
+    let orchestrator = control("test-workspace");
     let state_backend: Arc<dyn StateBackend> = Arc::new(MemoryStateBackend::new());
 
     Arc::new(GatewayState {

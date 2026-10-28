@@ -94,11 +94,8 @@ async fn build_test_state() -> Option<AutonomousTestState> {
         hook_engine.register(h).await;
     }
 
-    let dag_executor = Arc::new(
-        cog_orchestrator::DagExecutor::new("test-workspace".into())
-            .with_event_tx(task_event_tx.clone()),
-    );
-    let orchestrator = Arc::new(cog_orchestrator::OrchestratorControlImpl::new(dag_executor));
+    let orchestrator =
+        common::orchestrator::control_with_events("test-workspace", task_event_tx.clone());
 
     let jwt_manager: Arc<dyn cog_core::AuthProvider> = Arc::new(cog_auth::JwtManager::new(
         cog_auth::jwt::JwtConfig::default(),
