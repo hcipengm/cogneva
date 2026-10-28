@@ -1175,6 +1175,19 @@ const PRODUCED: &[(&str, &str)] = &[
 /// Listing them keeps the check honest: an unlisted foreign series fails the
 /// test rather than being silently ignored.
 const FOREIGN: &[(&str, &str)] = &[
+    // 这两条出自与 `build_containment_builds` 等四条同一个宿主读数
+    // （`cogneva-host-build-containment-reading.sh`，在值守用的另一棵树里，以
+    // cogneva 用户跑）。规则读的是**状态**而不是计数：闸外有几发、里头几发，与
+    // 「此刻该不该出声」是两个数，前两个放在 description 里给人翻，规则必须有一个
+    // 恒在的 0／1 才能不靠人比对两条读数。生产者不在本仓，所以本仓只能登记。
+    (
+        "build_containment_saturated_uncontained",
+        "宿主读数 `cogneva-host-build-containment-reading.sh`（不在本仓，在值守用的另一棵树里，以 cogneva 用户跑）：宿主已经压着、而构建闸外仍有构建在跑时为 1。规则 `CognevaBuildOutsideTheGate` 读它，是为了让「压着的时候还有闸外的活在抢核」成为一条规则；几发与每一发的父链在同一个读数的 `build_containment_builds{containment=\"outside\"}` 与 `build_containment_outside_names` 里，规则侧不必再拆",
+    ),
+    (
+        "build_containment_slice_unbounded",
+        "同一生产者：构建所在的那个 slice 自称有界、`cpu.max` 却是 max 时为 1。它读那个 slice 自己的 `cpu.max`，不是包装脚本对自己账目的复述——量到「里头有构建、账上没总量」才置 1。与同族的 `build_containment_slice_builds` 分开印：后者只说里头有几发，装在真有界的 slice 里与装在无界 slice 里读数一样",
+    ),
     (
         "container_memory_rss",
         "cadvisor（kubelet 内置）。判内存余量读的是**不可回收**的那部分：工作集把可回收的页缓存算进分子，在这棵树上足以把每一个大容器都推到上限（app／沙箱／进化三族的 usage 峰值都在 0.9998–1.0000 of limit，而 rss 是 0.78／0.59／0.24–0.39），所以拿工作集当分子时「顶到上限」不携带信息。工作集名字本身仍在别的面板上被读，但**没有任何告警规则读它**，按 the_tables_hold_no_series_that_no_rule_reads 不能留在本表",
