@@ -31,7 +31,7 @@ pub use super::root::repo_root;
 /// 所以 `src/` 的单测也能按 `#[path]` 编它。这里只是把它们原样再导一次：消费者
 /// 写的是 `common::routes::read`，一处都不用改，而定义仍然只有一份。
 #[allow(unused_imports)]
-pub use super::fsio::{read, walk};
+pub use super::fsio::{read, walk, walk_all, walk_files};
 
 /// One path reduced to the shape both sides can be compared by.
 ///

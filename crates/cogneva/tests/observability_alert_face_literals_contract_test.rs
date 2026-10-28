@@ -35,11 +35,11 @@
 //! passing with an empty population.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, walk};
 
 use common::rust_production::{all_crate_files, relative_name};
 
@@ -69,24 +69,6 @@ fn read_at(path: &Path) -> String {
 /// `declared.len() > 10` 照旧成立——一半载体消失不会让任何一句判词变红。
 const MIN_MANIFESTS: usize = 10;
 
-fn files_with_extension(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{} 读不出来（{e}）：声明面少了一整个载体，剩下的那一半与\
-             「所有载体都读过」在判词上分不开",
-            dir.display()
-        )
-    });
-    for entry in entries.flatten() {
-        let path = entry.path();
-        match entry.file_type() {
-            Ok(t) if t.is_dir() => files_with_extension(&path, ext, out),
-            Ok(t) if t.is_file() && path.extension().is_some_and(|e| e == ext) => out.push(path),
-            _ => {}
-        }
-    }
-}
-
 /// The faces the two rule carriers declare: the chart's in-process rules (a
 /// `face` field per rule) and the PrometheusRule manifests (the label the rule
 /// carries, which the mirror copies into the row).
@@ -109,9 +91,9 @@ fn declared_faces() -> BTreeSet<String> {
     }
 
     let mut manifests = Vec::new();
-    files_with_extension(
+    walk(
         &repo_root().join("deploy/k3s/observability/manifests"),
-        "yaml",
+        &["yaml"],
         &mut manifests,
     );
     assert!(
@@ -352,7 +334,7 @@ mod tests {
         ));
         let mut files = Vec::new();
         let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            files_with_extension(&missing, "yaml", &mut files)
+            walk(&missing, &["yaml"], &mut files)
         }));
         assert!(
             got.is_err(),

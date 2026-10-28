@@ -45,37 +45,16 @@ mod common;
 
 use common::routes::read;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, walk};
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Documents that own browser storage. `web/src` is walked; the other two are
 /// read whole, because each is a single document that cannot import anything.
 const WEB_ROOT: &str = "web/src";
 const LANDING: &str = "crates/cog-gateway/src/auth/platform.rs";
 const TAKEOVER: &str = "crates/cog-gateway/src/takeover.html";
-
-fn web_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    // 读不出来就 panic：递归里跳过一个子目录不会让任何断言变红，而剩下的两份
-    // 整篇文档单独就能让调用点下限成立——「客户端那一块没读到」与「那一块没有
-    // 存储调用」在判词上分不开。
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{} 读不出来（{e}）：web/src 的普查面少了一块，而剩下两篇文档就能把\
-             调用点下限顶住",
-            dir.display()
-        )
-    });
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            web_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "ts" || e == "tsx") {
-            out.push(path);
-        }
-    }
-}
 
 /// The text as the scan should see it: line comments dropped, so a call quoted
 /// in a comment is not read as a call.
@@ -204,7 +183,7 @@ fn scan(file: String, text: &str) -> SurfaceScan {
 fn surfaces(root: &Path) -> Vec<SurfaceScan> {
     let mut out = Vec::new();
     let mut files = Vec::new();
-    web_files(&root.join(WEB_ROOT), &mut files);
+    walk(&root.join(WEB_ROOT), &["ts", "tsx"], &mut files);
     files.sort();
     for path in files {
         let rel = path
@@ -483,7 +462,7 @@ fn a_client_directory_that_cannot_be_read_is_refused() {
     let _ = std::fs::remove_dir_all(&missing);
     let mut files = Vec::new();
     let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        web_files(&missing, &mut files)
+        walk(&missing, &["ts", "tsx"], &mut files)
     }));
     assert!(
         got.is_err(),

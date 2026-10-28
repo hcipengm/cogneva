@@ -38,12 +38,12 @@
 
 mod common;
 
-use common::routes::read;
+use common::routes::{read, walk_all};
 
 use common::routes::repo_root;
+use common::rust_production::relative_name;
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 /// The directory whose files the census reads.
 const TEMPLATES: &str = "deploy/helm/cogneva/templates";
@@ -102,26 +102,13 @@ struct Row {
 
 /// The file names under [`TEMPLATES`], sorted so the census is reproducible.
 fn template_files() -> Vec<String> {
-    fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
-        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-        for entry in entries {
-            let entry = entry.expect("a directory entry");
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = entry.path();
-            let rel = if prefix.is_empty() {
-                name
-            } else {
-                format!("{prefix}/{name}")
-            };
-            if entry.file_type().expect("a file type").is_dir() {
-                walk(&path, &rel, out);
-            } else {
-                out.push(rel);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(&repo_root().join(TEMPLATES), "", &mut out);
+    let root = repo_root().join(TEMPLATES);
+    let mut paths = Vec::new();
+    walk_all(&root, &mut paths);
+    let mut out: Vec<String> = paths
+        .iter()
+        .map(|path| relative_name(&root, path))
+        .collect();
     out.sort();
     out
 }

@@ -41,7 +41,7 @@ use common::routes::strip_comments;
 
 use common::routes::read;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, walk};
 
 use common::rust_production::{all_crate_files, crate_files_of};
 
@@ -636,7 +636,7 @@ fn quoted_type(body: &str) -> Option<String> {
 fn all_sent_objects(root: &Path) -> Vec<(String, BTreeSet<String>)> {
     let mut found = Vec::new();
     let mut files = Vec::new();
-    collect_ts(&root.join("web/src"), &mut files);
+    walk(&root.join("web/src"), &["ts", "tsx"], &mut files);
     for path in files {
         found.extend(sent_objects(&read(&path)));
     }
@@ -676,7 +676,7 @@ fn sent_objects(text: &str) -> Vec<(String, BTreeSet<String>)> {
 fn all_sent(root: &Path) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     let mut files = Vec::new();
-    collect_ts(&root.join("web/src"), &mut files);
+    walk(&root.join("web/src"), &["ts", "tsx"], &mut files);
     for path in files {
         names.extend(sent_types(&read(&path)));
     }
@@ -685,29 +685,6 @@ fn all_sent(root: &Path) -> BTreeSet<String> {
         names.extend(sent_types(&read(&page)));
     }
     names
-}
-
-fn collect_ts(dir: &Path, out: &mut Vec<PathBuf>) {
-    // 读不出来就 panic：递归遍历里跳过一个子目录不会让任何断言变红，而剩下的那份
-    // 普查往往仍高于下限——「少读了一块」与「那一块都合规」在判词上分不开。
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{} 读不出来（{e}）：这棵树的普查面少了一块，而用剩下的那份判出来的\
-             结论与「整片区都合规」同形",
-            dir.display()
-        )
-    });
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_ts(&path, out);
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("ts") | Some("tsx")
-        ) {
-            out.push(path);
-        }
-    }
 }
 
 #[test]

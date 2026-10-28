@@ -32,13 +32,19 @@
 //! 其中绝大多数是不同形状（只下一层、带着自己的过滤与解析、返回相对名字），那些不是
 //! 这条规则的副本。这里只抓逐字抄过去的那一种。
 //!
-//! 断言各自单独会长回来：副本为零、共享模块还在真干活、还有人在用它。
+//! 走目录还有**第二种形状**，上面那些按签名 / 定义名判的判据全都看不见它：抄的人把
+//! 函数改了名、换了参数、还各自带着自己的过滤与解析，于是十几份「递归下目录、顺手把
+//! 文件收进表里」的实现各自成立，谁也不逐字像谁。它们共有的只有一件事——**一个函数
+//! 体里同时出现 `read_dir` 与它自己的名字**。那正是「这棵树怎么走」这条规则的形状，
+//! 而它只该有一个答案，所以判据直接认这个形状：夹具里不许再有第二处自走的递归。
+//!
+//! 断言各自单独会长回来：副本为零、递归只有一处、共享模块还在真干活、还有人在用它。
 
 mod common;
 
 use std::path::PathBuf;
 
-use common::routes::repo_root;
+use common::routes::{matching_brace, matching_paren, repo_root, strip_comments};
 use common::rust_production::relative_name;
 
 /// 读文件、走目录这两条的唯一定义。
@@ -53,19 +59,21 @@ const ROUTES_HOME: &str = "crates/cogneva/tests/common/routes.rs";
 const PRODUCTION_HOME: &str = "crates/cogneva/tests/common/rust_production.rs";
 
 /// 被抄走的那几行，逐字。前三个是**整条签名**（这三条规则的参数与返回类型在全仓只有
-/// 一种写法，所以签名是最窄也最准的形状）；后三个只到**定义名**为止。
+/// 一种写法，所以签名是最窄也最准的形状）；后五个只到**定义名**为止。
 ///
-/// 为什么后三个不用整条签名：括号那一份在两处抄件里被写成了 `text: &str`，而共享的
+/// 为什么后五个不用整条签名：括号那一份在两处抄件里被写成了 `text: &str`，而共享的
 /// 那一份收 `bytes: &[u8]`；相对名那一份在一处抄件里连名字都改成了 `relative`。签名
-/// 按抄件当时的形状写下去，下一个抄的人换一种参数类型就漏了。这三个名字是 `common`
+/// 按抄件当时的形状写下去，下一个抄的人换一种参数类型就漏了。这五个名字是 `common`
 /// 导出的，别处再出现一次定义按构造就是第二份实现。
-const COPIED_FORMS: [&str; 6] = [
+const COPIED_FORMS: [&str; 8] = [
     "fn read(path: &Path) -> String",
     "fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>)",
     "fn strip_comments(text: &str) -> String",
     "fn matching_paren(",
     "fn matching_brace(",
     "fn relative_name(",
+    "fn walk_files(",
+    "fn walk_all(",
 ];
 
 /// 取相对名还有**内联**的形状：不写成函数，直接把那一串方法调用摊在调用点上。
@@ -93,20 +101,79 @@ const THE_PREDICATE: &str =
 /// 引用共享读取的文件下限。今天 18 份，取一半。
 const MIN_READERS: usize = 8;
 
-/// 引用共享遍历的文件下限。今天 2 份——真数，不是估的；`walk` 只服务那两处「按扩展名
-/// 收一棵子树」的普查，别的夹具走的是别的形状。这个数再往下掉就说明有人在搬走它。
-const MIN_WALKERS: usize = 2;
+/// 引用共享遍历的文件下限。今天 17 份，取一半。这个数原来只有 2：那时共享的 `walk`
+/// 只服务两处「按扩展名收一棵子树」的普查，其余十几份各写各的递归——判据看不见它们，
+/// 下限也就跟着那个缺口一起小。递归收敛到一份之后，这个数就是「还有人在用它」的真读数。
+const MIN_WALKERS: usize = 8;
 
 /// 引用共享去注释的文件下限。今天 15 份。
 const MIN_STRIPPERS: usize = 8;
 
-/// 一次普查：副本、读文件数、三种消费者各几份。
+/// 一次普查：副本、自走的递归、读文件数、三种消费者各几份。
 struct Census {
     copies: Vec<(String, usize, String)>,
+    recursions: Vec<(String, usize, String)>,
     files: usize,
     readers: usize,
     walkers: usize,
     strippers: usize,
+}
+
+/// 这个文件里有哪些函数自己在往下走目录：函数体里同时出现 `read_dir` 与它自己的名字。
+///
+/// 按**函数体**判而不是按函数头判，是因为这一族抄件连名字、参数、过滤条件都换过——
+/// 它们的定义行谁都不像谁，只有「我调我自己、而且我在列举目录」这件事是一样的。
+/// 函数体的起点在行首的 `fn`（容忍前面的 `pub`）：那是一条定义的位置，而函数名出现
+/// 在字符串里的时候，它前面不会是行首。
+///
+/// 括号与花括号的配平走共享的那两条：注释里写着签名不算，字符串里的 `{` 也不算。
+fn recursions_in(file: &str, text: &str) -> Vec<(String, usize, String)> {
+    let code = strip_comments(text);
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    let mut lineno = 0usize;
+    let mut line_start = 0usize;
+    for line in code.split('\n') {
+        lineno += 1;
+        let this_line = line_start;
+        line_start += line.len() + 1;
+        let trimmed = line.trim_start();
+        let (lead, rest) = match trimmed.strip_prefix("fn ") {
+            Some(rest) => (line.len() - trimmed.len(), rest),
+            None => match trimmed
+                .strip_prefix("pub ")
+                .and_then(|r| r.strip_prefix("fn "))
+            {
+                Some(rest) => (line.len() - trimmed.len() + 4, rest),
+                None => continue,
+            },
+        };
+        let Some(params) = rest.find('(') else {
+            continue;
+        };
+        let called = rest[..params].trim();
+        if called.is_empty()
+            || !called
+                .chars()
+                .all(|c| c == '_' || c.is_ascii_alphanumeric())
+        {
+            continue;
+        }
+        let Some(closed) = matching_paren(bytes, this_line + lead + 3 + params) else {
+            continue;
+        };
+        let Some(body_at) = code[closed..].find('{').map(|at| closed + at) else {
+            continue;
+        };
+        let Some(body_end) = matching_brace(bytes, body_at) else {
+            continue;
+        };
+        let body = &code[body_at..body_end];
+        if body.contains("read_dir") && body.contains(&format!("{called}(")) {
+            out.push((file.to_string(), lineno, called.to_string()));
+        }
+    }
+    out
 }
 
 /// 这份文件从哪个 `::{…}` 里导入了哪些名字。
@@ -134,6 +201,7 @@ fn imported_names(text: &str) -> Vec<String> {
 
 fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     let mut copies = Vec::new();
+    let mut recursions = Vec::new();
     let mut files = 0usize;
     let (mut readers, mut walkers, mut strippers) = (0usize, 0usize, 0usize);
     let shared = [THE_ONE, ROUTES_HOME, PRODUCTION_HOME];
@@ -143,6 +211,16 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
             continue;
         };
         files += 1;
+        // 递归只该住在共享的遍历里——**在夹具里**。面裁在这里不是图省事：产出码够不着
+        // 测试 harness，那些遍历各带着自己的领域逻辑（拷贝备份树、收配置片段、找模板
+        // 文件），把它们也算上就是让这条门红在没人能改对的地方——跨类边界不是副本。
+        // 夹具则相反：同一个 crate 的夹具共享一个 `common`，第二处递归按构造就是可搬的。
+        //
+        // 这份门自己写着标本（那些字符串里也有 `fn …`），所以它自己也摘出去；它认得
+        // 这个形状由下面那条消融单独证明。
+        if name.contains("/tests/") && name != THE_PREDICATE && name != THE_ONE {
+            recursions.extend(recursions_in(&name, &text));
+        }
         let imported = imported_names(&text);
         if name != THE_ONE {
             if imported.contains(&"read".to_string()) || text.contains("routes::read") {
@@ -174,6 +252,7 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     }
     Census {
         copies,
+        recursions,
         files,
         readers,
         walkers,
@@ -231,6 +310,20 @@ fn the_fixture_reading_steps_are_written_once() {
          的那一份不会红，也不会有人发现另外几份已经和它不一样了。"
     );
 
+    // 递归这一面：整个普查面上只该有 `fsio` 那一处自走目录。剩下的实现都在它上面
+    // 铺（按扩展名收、跳过某些目录、顺手解析），各有各的过滤，但「怎么往下走」只有
+    // 一个答案。第二处一旦长出来，读不出来的子目录在一份里 panic、在另一份里被跳过，
+    // 而两份都绿。
+    assert!(
+        found.recursions.is_empty(),
+        "这些地方自己写了递归下目录的遍历（函数体里同时出现 `read_dir` 与自己的名字）：\
+         {recursions:?}\n改用 `common::routes::walk`（按扩展名收）或 \
+         `common::routes::walk_files`（要不收某个目录就传 `skip`）——递归本身只该有 \
+         `{THE_ONE}` 里那一份。它们谁都不逐字像谁，所以按签名判的那几条对它们是瞎的，\
+         而「读不出来就 panic」这句话在各自的抄件里都只是一句注释。",
+        recursions = found.recursions
+    );
+
     // 反过来问：被指认的那一处真的还在干这件事吗。少了这一问，把它换成空壳之后
     // 本判据照绿——它只证明了「别处没有」。
     let the_one = std::fs::read_to_string(root.join(THE_ONE)).expect("共享遍历读得到");
@@ -243,6 +336,14 @@ fn the_fixture_reading_steps_are_written_once() {
         the_one.contains("panic!") && the_one.contains("read_dir"),
         "{THE_ONE} 里的遍历不再 panic：读不出来时安静地少读一块，判出来的结论与\
          「那一块都合规」同形"
+    );
+    // 而且只能有一处 `read_dir`：这一份文件里再长出一个递归，就是同一条规则在
+    // 「唯一的那一份」内部又抄了一次——普查面上看不见它，因为这一份本来就被摘出去。
+    assert_eq!(
+        the_one.matches("read_dir").count(),
+        1,
+        "{THE_ONE} 里有不止一处 `read_dir`：共享的遍历自己又长出了第二个递归，\
+         而它落在被摘出去的那份文件里，普查面上永远看不见"
     );
     let routes_home = std::fs::read_to_string(root.join(ROUTES_HOME)).expect("共享去注释读得到");
     assert!(
@@ -339,14 +440,14 @@ fn a_copy_on_disk_is_reported() {
     // 当时的样子写：参数是 `&str`，名字是 `relative_name`——判据要认的是这些形状。
     std::fs::write(
         dir.join("copy.rs"),
-        "fn read(path: &Path) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n\nfn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, out);\n}\n\nfn strip_comments(text: &str) -> String {\n    text.to_string()\n}\n\nfn matching_brace(text: &str, open: usize) -> Option<usize> {\n    let _ = (text, open);\n    None\n}\n\nfn relative_name(root: &Path, path: &Path) -> String {\n    let _ = root;\n    path.display().to_string()\n}\n\nfn inline(root: &Path, path: &Path) -> String {\n    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\\\', \"/\")\n}\n",
+        "fn read(path: &Path) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n\nfn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, out);\n}\n\nfn strip_comments(text: &str) -> String {\n    text.to_string()\n}\n\nfn matching_brace(text: &str, open: usize) -> Option<usize> {\n    let _ = (text, open);\n    None\n}\n\nfn relative_name(root: &Path, path: &Path) -> String {\n    let _ = root;\n    path.display().to_string()\n}\n\nfn inline(root: &Path, path: &Path) -> String {\n    path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\\\', \"/\")\n}\n\nfn walk_all(dir: &Path, out: &mut Vec<PathBuf>) {\n    let _ = (dir, out);\n}\n\nfn walk_files(dir: &Path, extensions: &[&str], skip: &[&str], out: &mut Vec<PathBuf>) {\n    let _ = (dir, extensions, skip, out);\n}\n",
     )
-    .expect("six copies");
+    .expect("eight copies");
     let found = census(&root, &all_files(&root));
     assert_eq!(
         found.copies.len(),
-        6,
-        "六份抄件都要数得出来：{:?}",
+        8,
+        "八份抄件都要数得出来：{:?}",
         found.copies
     );
     assert!(
@@ -390,6 +491,23 @@ fn a_copy_on_disk_is_reported() {
          判据看不见它：{:?}",
         found.copies
     );
+    assert!(
+        found
+            .copies
+            .iter()
+            .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 27),
+        "`walk_all` 那一份也要点名（第 27 行）：新长出来的第二个入口，按签名判的\
+         判据认不出它：{:?}",
+        found.copies
+    );
+    assert!(
+        found
+            .copies
+            .iter()
+            .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 31),
+        "`walk_files` 那一份也要点名（第 31 行）：{:?}",
+        found.copies
+    );
 
     // 抄件长在 `src/` 的单测模块里也要点名：这一族抄件的上一轮就长在那儿
     // （`startup_guard.rs` 的三行 shim），只扫夹具的判据对它一声不响。
@@ -426,6 +544,66 @@ fn a_copy_on_disk_is_reported() {
             .any(|(file, _, _)| file == "crates/probe/src/inline.rs"),
         "产出码里的 posix 折叠不是这一族的副本：{:?}",
         found.copies
+    );
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// 判据自检：**自走的递归**这个形状认不认得出。
+///
+/// 真树上今天一处都没有（递归只住在 `fsio` 里，而那一份被摘出去），而「一处都没有」
+/// 与「判据瞎了」同形。这里搭一棵树，把三种容易混淆的写法放进去：借共享的、只下一层
+/// 的、和整段注释掉的——它们都不该点名；只有自己调自己的那一个该点名。
+#[test]
+fn a_recursion_on_disk_is_reported() {
+    let root = std::env::temp_dir().join(format!("census-recursion-{}", std::process::id()));
+    let dir = root.join("crates/probe/tests");
+    std::fs::create_dir_all(&dir).expect("a scratch tests directory");
+
+    std::fs::write(
+        dir.join("borrower.rs"),
+        "use common::routes::walk;\nfn files(root: &Path, out: &mut Vec<PathBuf>) {\n    walk(&root.join(\"web\"), &[\"ts\", \"tsx\"], out);\n}\n",
+    )
+    .expect("a borrower");
+    std::fs::write(
+        dir.join("shallow.rs"),
+        "fn declarations(dir: &Path, out: &mut Vec<PathBuf>) {\n    for entry in std::fs::read_dir(dir).expect(\"list\").flatten() {\n        let path = entry.path();\n        if path.extension().is_some_and(|e| e == \"yaml\") {\n            out.push(path);\n        }\n    }\n}\n",
+    )
+    .expect("a one-level listing");
+    std::fs::write(
+        dir.join("commented.rs"),
+        "// fn collect_yaml(dir: &Path, out: &mut Vec<PathBuf>) {\n//     std::fs::read_dir(dir).expect(\"list\");\n//     collect_yaml(dir, out);\n// }\n",
+    )
+    .expect("a commented-out recursion");
+
+    let found = census(&root, &all_files(&root));
+    assert!(
+        found.recursions.is_empty(),
+        "借共享的、只下一层的、注释掉的那三种都不该点名：{:?}",
+        found.recursions
+    );
+
+    // 自己调自己，名字、参数、过滤条件全换过——这一份必须点名，且要带得回行号。
+    std::fs::write(
+        dir.join("walker.rs"),
+        "fn collect_yaml(dir: &Path, out: &mut Vec<PathBuf>) {\n    for entry in std::fs::read_dir(dir).expect(\"list\") {\n        let path = entry.expect(\"entry\").path();\n        if path.is_dir() {\n            collect_yaml(&path, out);\n        } else if path.extension().is_some_and(|e| e == \"yaml\") {\n            out.push(path);\n        }\n    }\n}\n",
+    )
+    .expect("a hand-rolled recursion");
+    let found = census(&root, &all_files(&root));
+    assert_eq!(
+        found.recursions.len(),
+        1,
+        "只该点名自己调自己的那一个：{:?}",
+        found.recursions
+    );
+    assert_eq!(
+        found.recursions[0],
+        (
+            "crates/probe/tests/walker.rs".to_string(),
+            1,
+            "collect_yaml".to_string()
+        ),
+        "要点名到文件和行号，且报出那个自己调自己的函数名（它按定义名判不出来）"
     );
 
     std::fs::remove_dir_all(&root).ok();

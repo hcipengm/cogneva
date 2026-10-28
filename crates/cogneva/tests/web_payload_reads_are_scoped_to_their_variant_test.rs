@@ -45,10 +45,10 @@ use common::routes::strip_comments;
 
 use common::routes::read;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, walk};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// 变体与字段。
 const EVENT: &str = "crates/cog-core/src/types/event.rs";
@@ -421,7 +421,7 @@ fn contradictions(root: &Path) -> (Vec<String>, usize) {
     let mut complaints = Vec::new();
     let mut judged = 0;
     let mut files = Vec::new();
-    collect_ts(&root.join(WEB), &mut files);
+    walk(&root.join(WEB), &["ts", "tsx"], &mut files);
     files.sort();
     let mut found = Vec::new();
     for path in files {
@@ -472,27 +472,6 @@ fn contradictions(root: &Path) -> (Vec<String>, usize) {
 /// 所以题目要先按文件数数一遍。
 const MIN_CLIENT_FILES: usize = 100;
 
-fn collect_ts(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{} 读不出来（{e}）：客户端的读法普查面少了一块，而少读的文件与\
-             「那些文件都没有越界读法」在判词上分不开",
-            dir.display()
-        )
-    });
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_ts(&path, out);
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("ts") | Some("tsx")
-        ) {
-            out.push(path);
-        }
-    }
-}
-
 #[test]
 fn every_payload_field_is_one_the_variant_under_that_case_carries() {
     let (complaints, judged) = contradictions(&repo_root());
@@ -521,7 +500,7 @@ fn the_census_is_wide_enough_to_mean_something() {
     assert_eq!(variants.len(), 20, "只读出 {} 个变体", variants.len());
 
     let mut files = Vec::new();
-    collect_ts(&root.join(WEB), &mut files);
+    walk(&root.join(WEB), &["ts", "tsx"], &mut files);
     assert!(
         files.len() >= MIN_CLIENT_FILES,
         "{WEB} 下只读到 {} 个 .ts/.tsx（下限 {MIN_CLIENT_FILES}）：普查面缩了，\
@@ -745,7 +724,7 @@ fn a_reading_directory_that_cannot_be_read_is_refused() {
         std::env::temp_dir().join(format!("cogneva-web-payload-absent-{}", std::process::id()));
     let mut files = Vec::new();
     let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        collect_ts(&missing, &mut files)
+        walk(&missing, &["ts", "tsx"], &mut files)
     }));
     assert!(
         got.is_err(),

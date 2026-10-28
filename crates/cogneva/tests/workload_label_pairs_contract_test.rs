@@ -20,13 +20,13 @@
 //! annotation key from the declaration.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use serde::Deserialize;
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, walk};
 
 use common::rust_production::{production_lines, production_sources, relative_name};
 
@@ -40,29 +40,6 @@ fn declared_pairs() -> Vec<(&'static str, &'static str)> {
         (t::EVOLUTION, t::COMPONENT_EVOLUTION),
         (t::WORKLOAD_NAME, t::COMPONENT_REGISTRY),
     ]
-}
-
-fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    // 读不出来就 panic：递归遍历里跳过一个子目录不会让任何断言变红，而剩下的那份
-    // 普查往往仍高于下限——「少读了一块」与「那一块都合规」在判词上分不开。
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{} 读不出来（{e}）：这棵树的普查面少了一块，而用剩下的那份判出来的\
-             结论与「整片区都合规」同形",
-            dir.display()
-        )
-    });
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            yaml_files(&path, out);
-        } else if matches!(
-            path.extension().and_then(|e| e.to_str()),
-            Some("yaml") | Some("yml")
-        ) {
-            out.push(path);
-        }
-    }
 }
 
 /// One label value out of a workload document's Pod template.
@@ -127,7 +104,7 @@ fn every_pair_the_code_selects_on_is_one_the_manifests_carry() {
     let declared = declared_pairs();
     for profile in profiles {
         let mut files = Vec::new();
-        yaml_files(&profile, &mut files);
+        walk(&profile, &["yaml", "yml"], &mut files);
         let mut carried = BTreeSet::new();
         let mut templates = 0;
         for path in &files {

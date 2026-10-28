@@ -22,9 +22,9 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, walk};
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// What the pinned exporter image actually does, measured rather than assumed.
 struct Inventory {
@@ -252,31 +252,8 @@ fn the_board_names_the_same_producer_for_its_postgres_panels() {
 /// dashboard would then have to be done twice, and the copy nobody edits is the
 /// one that decides whether the link works.
 fn provisioned_dashboards() -> std::collections::BTreeMap<String, String> {
-    fn manifests(dir: &Path, out: &mut Vec<PathBuf>) {
-        // 读不出来就 panic：递归遍历里跳过一个子目录不会让任何断言变红，而剩下的那份
-        // 普查往往仍高于下限——「少读了一块」与「那一块都合规」在判词上分不开。
-        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-            panic!(
-                "{} 读不出来（{e}）：这棵树的普查面少了一块，而用剩下的那份判出来的\
-                 结论与「整片区都合规」同形",
-                dir.display()
-            )
-        });
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                manifests(&path, out);
-            } else if matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("yaml" | "yml")
-            ) {
-                out.push(path);
-            }
-        }
-    }
-
     let mut paths = Vec::new();
-    manifests(&repo_root().join("deploy"), &mut paths);
+    walk(&repo_root().join("deploy"), &["yaml", "yml"], &mut paths);
     assert!(
         !paths.is_empty(),
         "no manifests found under deploy/ — this gate would be vacuous"

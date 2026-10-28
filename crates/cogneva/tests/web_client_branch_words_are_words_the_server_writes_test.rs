@@ -51,7 +51,7 @@ mod common;
 
 use common::routes::read;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, walk};
 
 use std::path::{Path, PathBuf};
 
@@ -180,24 +180,6 @@ const CLIENT_ONLY: &[(&str, &str, &str)] = &[
 /// 悄悄变短，而变短之后「每一处都登记过」这句话与「一处都没读到」完全同形。
 const MIN_CLIENT_FILES: usize = 100;
 
-fn client_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{} 读不出来（{e}）：客户端分支的普查面少了一块，缩水的普查与\
-             「每一处都登记过」在判词上分不开",
-            dir.display()
-        )
-    });
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            client_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "ts" || e == "tsx") {
-            out.push(path);
-        }
-    }
-}
-
 /// Every `field === 'word'` in the client, as `(field, word)`.
 ///
 /// `typeof x === 'string'` is not a branch on a word — the right side names a
@@ -298,7 +280,7 @@ fn disagreements(
     let mut out = Vec::new();
 
     let mut files: Vec<PathBuf> = Vec::new();
-    client_files(&root.join("web/src"), &mut files);
+    walk(&root.join("web/src"), &["ts", "tsx"], &mut files);
     files.sort();
     let mut seen: Vec<(String, String)> = Vec::new();
     for file in &files {
@@ -353,7 +335,7 @@ fn every_word_the_client_branches_on_is_a_word_the_server_writes() {
     let root = repo_root();
     // 先数题目再判卷：文件表为空或异常短时，下面那句「一个都没漏」是空话。
     let mut files = Vec::new();
-    client_files(&root.join("web/src"), &mut files);
+    walk(&root.join("web/src"), &["ts", "tsx"], &mut files);
     assert!(
         files.len() >= MIN_CLIENT_FILES,
         "web/src 下只读到 {} 个 .ts/.tsx（下限 {MIN_CLIENT_FILES}）：分支普查面缩了，\
@@ -470,7 +452,7 @@ fn a_client_directory_that_cannot_be_read_is_refused() {
         std::env::temp_dir().join(format!("cogneva-web-branch-absent-{}", std::process::id()));
     let mut files = Vec::new();
     let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        client_files(&missing, &mut files)
+        walk(&missing, &["ts", "tsx"], &mut files)
     }));
     assert!(
         got.is_err(),

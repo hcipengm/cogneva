@@ -29,12 +29,12 @@
 
 mod common;
 
-use common::routes::read;
+use common::routes::{read, walk_all};
 
 use common::routes::repo_root;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use cog_core::build_cache_readings::{
     BuildCacheReadings, CapSource, BUILD_TARGET_CAP_METRIC, SOURCE_LABEL,
@@ -895,33 +895,27 @@ const DEPLOY_SCRIPTS: &str = "deploy/scripts";
 
 /// Every dotted path a template reads through `.Values.`.
 fn paths_the_templates_read() -> BTreeSet<String> {
-    fn walk(dir: &Path, out: &mut BTreeSet<String>) {
-        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-        for entry in entries {
-            let entry = entry.expect("a template directory entry");
-            let path = entry.path();
-            if entry.file_type().expect("a file type").is_dir() {
-                walk(&path, out);
-                continue;
-            }
-            let text = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let mut rest = text.as_str();
-            while let Some(at) = rest.find(".Values.") {
-                rest = &rest[at + ".Values.".len()..];
-                let path: String = rest
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
-                    .collect();
-                let path = path.trim_end_matches('.').to_string();
-                if !path.is_empty() {
-                    out.insert(path);
-                }
+    let mut files = Vec::new();
+    walk_all(
+        &repo_root().join("deploy/helm/cogneva/templates"),
+        &mut files,
+    );
+    let mut out = BTreeSet::new();
+    for path in files {
+        let text = read(&path);
+        let mut rest = text.as_str();
+        while let Some(at) = rest.find(".Values.") {
+            rest = &rest[at + ".Values.".len()..];
+            let leaf: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                .collect();
+            let leaf = leaf.trim_end_matches('.').to_string();
+            if !leaf.is_empty() {
+                out.insert(leaf);
             }
         }
     }
-    let mut out = BTreeSet::new();
-    walk(&repo_root().join("deploy/helm/cogneva/templates"), &mut out);
     out
 }
 

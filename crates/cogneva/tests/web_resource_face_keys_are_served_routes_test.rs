@@ -24,32 +24,12 @@
 //! 读会把嵌套路由读漏，读漏的方向是假红。宁可少判一条，不判错的。
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 mod common;
-use common::routes::{read, repo_root, served_paths, strip_comments};
+use common::routes::{read, repo_root, served_paths, strip_comments, walk};
 
 const WEB: &str = "web/src";
-
-fn files_under(dir: &Path, ext: &str, out: &mut Vec<PathBuf>) {
-    // 读不出来就 panic：递归遍历里跳过一个子目录不会让任何断言变红，而剩下的那份
-    // 普查往往仍高于下限——「少读了一块」与「那一块都合规」在判词上分不开。
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
-        panic!(
-            "{} 读不出来（{e}）：这棵树的普查面少了一块，而用剩下的那份判出来的\
-             结论与「整片区都合规」同形",
-            dir.display()
-        )
-    });
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            files_under(&path, ext, out);
-        } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
-            out.push(path);
-        }
-    }
-}
 
 /// 服务端认得的前缀：路由表里 `/api/v1/<段>` 的第一段。
 fn served_prefixes(root: &Path) -> BTreeSet<String> {
@@ -84,8 +64,7 @@ fn face_keys(text: &str) -> BTreeSet<String> {
 
 fn all_face_keys(root: &Path) -> BTreeSet<String> {
     let mut files = Vec::new();
-    files_under(&root.join(WEB), "ts", &mut files);
-    files_under(&root.join(WEB), "tsx", &mut files);
+    walk(&root.join(WEB), &["ts", "tsx"], &mut files);
     let mut keys = BTreeSet::new();
     for path in files {
         keys.extend(face_keys(&read(&path)));

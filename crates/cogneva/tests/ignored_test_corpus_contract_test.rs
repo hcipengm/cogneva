@@ -34,7 +34,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{repo_root, walk_files};
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -287,25 +287,18 @@ fn crate_dir(root: &Path, krate: &str) -> PathBuf {
 /// A directory that cannot be listed fails rather than being skipped: a subtree
 /// this cannot read is a subtree whose ignored tests are missing from the
 /// census, and the census is the only thing that says a test is unread.
-fn collect_rs(dir: &Path, rel: &mut Vec<String>, out: &mut Vec<(PathBuf, Vec<String>)>) {
-    let entries =
-        std::fs::read_dir(dir).unwrap_or_else(|e| panic!("could not list {}: {e}", dir.display()));
-    for entry in entries {
-        let entry =
-            entry.unwrap_or_else(|e| panic!("could not read an entry of {}: {e}", dir.display()));
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name == "target" {
-            continue;
-        }
-        let path = entry.path();
-        rel.push(name.clone());
-        if path.is_dir() {
-            collect_rs(&path, rel, out);
-        } else if name.ends_with(".rs") {
-            out.push((path, rel.clone()));
-        }
-        rel.pop();
-    }
+fn collect_rs(dir: &Path, out: &mut Vec<(PathBuf, Vec<String>)>) {
+    let mut files = Vec::new();
+    walk_files(dir, &["rs"], &["target"], &mut files);
+    out.extend(files.into_iter().map(|path| {
+        let rel = path
+            .strip_prefix(dir)
+            .unwrap_or(&path)
+            .components()
+            .map(|part| part.as_os_str().to_string_lossy().to_string())
+            .collect();
+        (path, rel)
+    }));
 }
 
 /// Whether a file that was just found by a directory walk carries the marker.
@@ -386,7 +379,7 @@ fn ignored_sites() -> Vec<Ignored> {
     for krate in crate_dirs(&root) {
         let dir = root.join("crates").join(&krate);
         let mut files = Vec::new();
-        collect_rs(&dir, &mut Vec::new(), &mut files);
+        collect_rs(&dir, &mut files);
         for (path, rel) in files {
             if !contains_marker(&path) {
                 continue;
@@ -533,7 +526,7 @@ fn every_ignored_step_runs_something_that_is_still_ignored() {
             _ => dir.clone(),
         };
         let mut files = Vec::new();
-        collect_rs(&scope, &mut Vec::new(), &mut files);
+        collect_rs(&scope, &mut files);
         let held: Vec<PathBuf> = files
             .into_iter()
             .map(|(path, _)| path)
