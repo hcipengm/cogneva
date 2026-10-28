@@ -27,6 +27,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::rust_production::all_crate_files;
+
 use cog_gateway::actor_labels::{declared, ACTOR_LABELS, ACTOR_LABEL_PREFIXES, UNKNOWN_ACTOR};
 
 fn repo_root() -> PathBuf {
@@ -234,30 +238,9 @@ fn classify(arg: &str, consts: &BTreeMap<String, String>) -> Site {
     Site::Unresolved(arg.to_string())
 }
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if path
-                .file_name()
-                .is_some_and(|n| n == "target" || n == ".git")
-            {
-                continue;
-            }
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 /// The census, over the working tree. Returns the sites by file.
 fn census(root: &Path) -> BTreeMap<String, Vec<Site>> {
-    let mut files = Vec::new();
-    rust_files(&root.join("crates"), &mut files);
+    let files = all_crate_files(root);
     let mut found = BTreeMap::new();
     for file in files {
         let rel = file

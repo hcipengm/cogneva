@@ -38,6 +38,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::rust_production::all_crate_files;
+
 /// The JSON key whose construction points are being enumerated.
 const KEY: &str = "\"capabilities\":";
 
@@ -131,24 +135,10 @@ fn repo_root() -> PathBuf {
 
 /// Every `.rs` file under `dir`, recursively. Test helpers and build scripts are
 /// `.rs` too, and a declaration written in one of those is still a declaration.
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("{} has to be readable: {e}", dir.display()));
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 /// How many lines of each file contain the key, as repo-relative paths.
 fn census() -> BTreeMap<String, usize> {
     let root = repo_root();
-    let mut files = Vec::new();
-    rust_files(&root.join("crates"), &mut files);
+    let files = all_crate_files(&root);
 
     let mut found = BTreeMap::new();
     for path in files {

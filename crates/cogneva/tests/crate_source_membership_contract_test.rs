@@ -16,6 +16,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod common;
+
+use common::rust_production::all_crate_files;
+
 /// The repository root, derived from this crate's own manifest so the test does
 /// not depend on the working directory it is run from.
 fn workspace_root() -> PathBuf {
@@ -73,31 +77,6 @@ fn member_roots() -> BTreeSet<PathBuf> {
 }
 
 /// Every `.rs` under `crates/`, as a repo-relative path.
-fn rust_sources_under_crates() -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            // `DirEntry::file_type` does not follow symlinks: a link out of the
-            // tree is not a file this repository carries.
-            match entry.file_type() {
-                Ok(t) if t.is_dir() => walk(&path, out),
-                Ok(t) if t.is_file() && path.extension().is_some_and(|e| e == "rs") => {
-                    out.push(path);
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let mut found = Vec::new();
-    walk(&workspace_root().join("crates"), &mut found);
-    found.sort();
-    found
-}
-
 /// The crate root a source file under `crates/<dir>/...` belongs to.
 fn crate_root_of(path: &Path) -> Option<PathBuf> {
     let root = workspace_root();
@@ -129,7 +108,7 @@ fn every_rust_source_under_crates_is_compiled_by_a_workspace_member() {
          source to be checked against and this gate would pass on nothing"
     );
 
-    let sources = rust_sources_under_crates();
+    let sources = all_crate_files(&workspace_root());
     // Every crate member under `crates/` is a directory with at least one source
     // file, so a walk that is working finds at least as many sources as there are
     // such members. A walk that silently stopped early, or a manifest that moved

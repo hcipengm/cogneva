@@ -68,16 +68,15 @@ pub fn sources_of_tree(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `crates/` 下每一个 `.rs`，夹具目录与构建产物除外。
+/// `crates/` 下每一个 `.rs`，夹具、示例、构建脚本都在内。
 ///
-/// 比 [`production_sources`] 宽：`tests/` 之外的一切都在内，`examples/` 与 `benches/`
-/// 也在内——它们同样被编译，一个词在示例里写死了，下次改词时示例照旧编译失败与否，
-/// 取决于有人去跑它。用这一份的门问的是「这棵工作树的 crate 代码里还写不写这个词」，
-/// 不是「产出的镜像里有没有它」；后者用 [`production_sources`]。
+/// 这一份问的是「这棵树里还有没有这个字节」，不是「产物里有没有」。用它的是
+/// 「登记表与树上出现的东西对不对得上」那一族：夹具里写着第二份拼法，同样是登记
+/// 表要认的现场。
 ///
 /// `target/` 与 `.git` 在递归里跳过：它们不是源，而且会把这棵树读成几万个文件。
-pub fn crate_tree_sources(root: &Path) -> Vec<PathBuf> {
-    let out = sources_of_crate_tree(root);
+pub fn all_crate_files(root: &Path) -> Vec<PathBuf> {
+    let out = crate_files_of(root);
     assert!(
         out.len() >= MIN_PRODUCTION_FILES,
         "只读到 {} 个 crate 源文件（下限 {MIN_PRODUCTION_FILES}）：这棵树的 crate 代码\
@@ -87,8 +86,8 @@ pub fn crate_tree_sources(root: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// 同一份遍历，不设下限：给测试自己搭的那棵树用，理由同 [`sources_of_tree`]。
-pub fn sources_of_crate_tree(root: &Path) -> Vec<PathBuf> {
+/// `crates/` 下每一个 `.rs`，不设下限：给测试自己搭的树用。
+pub fn crate_files_of(root: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
@@ -98,7 +97,7 @@ pub fn sources_of_crate_tree(root: &Path) -> Vec<PathBuf> {
             if path.is_dir() {
                 if path
                     .file_name()
-                    .is_some_and(|n| n == "tests" || n == "target" || n == ".git")
+                    .is_some_and(|n| n == "target" || n == ".git")
                 {
                     continue;
                 }
@@ -112,6 +111,28 @@ pub fn sources_of_crate_tree(root: &Path) -> Vec<PathBuf> {
     walk(&root.join("crates"), &mut out);
     out.sort();
     out
+}
+
+/// 上面那一份去掉夹具目录。比 [`production_sources`] 宽：`examples/` 与 `benches/`
+/// 也在内——它们同样被编译。用这一份的门问的是「这棵工作树的 crate 代码里还写不写
+/// 这个词」，不是「产出的镜像里有没有它」；后者用 [`production_sources`]。
+pub fn crate_tree_sources(root: &Path) -> Vec<PathBuf> {
+    let out = sources_of_crate_tree(root);
+    assert!(
+        out.len() >= MIN_PRODUCTION_FILES,
+        "只读到 {} 个 crate 源文件（下限 {MIN_PRODUCTION_FILES}）：这棵树的 crate 代码\
+         一个都没读到，任何「再没有第二处」的断言在空集上都成立",
+        out.len()
+    );
+    out
+}
+
+/// 同一份遍历，不设下限：给测试自己搭的那棵树用，理由同 [`sources_of_tree`]。
+pub fn sources_of_crate_tree(root: &Path) -> Vec<PathBuf> {
+    crate_files_of(root)
+        .into_iter()
+        .filter(|path| !path.components().any(|c| c.as_os_str() == "tests"))
+        .collect()
 }
 
 /// 一个文件在树里的名字：repo 相对、`/` 分隔。
@@ -486,6 +507,62 @@ mod tests {
         );
         let refused = std::panic::catch_unwind(|| production_sources(&root));
         assert!(refused.is_err(), "同一棵树走判真树的那条入口，下限必须拒读");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 工作树那两份普查只差一处：夹具。示例、基准、构建脚本都留在里面。
+    ///
+    /// 钉的是它们之间那个减法。写宽了（比如顺手把 `examples/` 也排除）不会有任何
+    /// 一条门变红——它们的断言在更小的集合上照样成立，只是从此看不见示例里写死的
+    /// 第二份拼法；夹具那一侧同理，读进去了就是把测试数据当成部署事实。
+    #[test]
+    fn the_working_tree_census_keeps_everything_but_the_fixtures() {
+        let root = std::env::temp_dir().join(format!("census-crate-files-{}", std::process::id()));
+        let crate_dir = root.join("crates/only");
+        for (path, body) in [
+            ("src/lib.rs", "pub fn f() {}\n"),
+            ("build.rs", "fn main() {}\n"),
+            ("tests/a.rs", "#[test]\nfn t() {}\n"),
+            ("examples/e.rs", "fn main() {}\n"),
+            ("benches/b.rs", "fn main() {}\n"),
+        ] {
+            let path = crate_dir.join(path);
+            std::fs::create_dir_all(path.parent().expect("a file below the crate root"))
+                .expect("a scratch directory");
+            std::fs::write(&path, body).expect("a source file");
+        }
+
+        let names = |files: Vec<PathBuf>| -> Vec<String> {
+            let mut out: Vec<String> = files.iter().map(|p| relative_name(&root, p)).collect();
+            out.sort();
+            out
+        };
+        assert_eq!(
+            names(crate_files_of(&root)),
+            vec![
+                "crates/only/benches/b.rs",
+                "crates/only/build.rs",
+                "crates/only/examples/e.rs",
+                "crates/only/src/lib.rs",
+                "crates/only/tests/a.rs",
+            ],
+            "工作树那一份连夹具一起读"
+        );
+        assert_eq!(
+            names(sources_of_crate_tree(&root)),
+            vec![
+                "crates/only/benches/b.rs",
+                "crates/only/build.rs",
+                "crates/only/examples/e.rs",
+                "crates/only/src/lib.rs",
+            ],
+            "去掉夹具之后，示例、基准、构建脚本都还在这一份里"
+        );
+        assert!(
+            std::panic::catch_unwind(|| crate_tree_sources(&root)).is_err(),
+            "带下限的那条入口在同一棵树上必须拒读"
+        );
 
         std::fs::remove_dir_all(&root).ok();
     }

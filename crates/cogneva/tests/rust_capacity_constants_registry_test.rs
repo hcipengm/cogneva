@@ -48,6 +48,10 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+mod common;
+
+use common::rust_production::{all_crate_files, crate_files_of};
+
 /// Where the registry lives, relative to the workspace root.
 const REGISTRY: &str = "crates/cogneva/tests/data/rust-capacity-constants.tsv";
 
@@ -90,12 +94,12 @@ fn workspace_root() -> PathBuf {
 /// no measurement will move it. The initializer's first character is the whole
 /// test -- parsing expressions would mean half-reading them, and a half-read
 /// expression in a registry reads as a decision.
-fn scan(root: &Path) -> Vec<Row> {
+fn scan(root: &Path, files: &[PathBuf]) -> Vec<Row> {
     let mut rows = Vec::new();
-    for entry in walk_rs(&root.join("crates")) {
+    for entry in files {
         let rel = entry
             .strip_prefix(root)
-            .unwrap_or(&entry)
+            .unwrap_or(entry)
             .to_string_lossy()
             .to_string();
         // A crate's own `tests/`, `benches/` and `examples/` are not shipped
@@ -103,7 +107,7 @@ fn scan(root: &Path) -> Vec<Row> {
         if !rel.contains("/src/") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&entry) else {
+        let Ok(text) = std::fs::read_to_string(entry) else {
             continue;
         };
         rows.extend(production_rows(&text, &rel));
@@ -213,22 +217,6 @@ fn has_inline_module_body(line: &str, any_name: bool) -> bool {
 /// enough to hold a ratchet and not enough to pay it down.
 fn sites_wanted() -> bool {
     std::env::var_os("COGNEVA_BARE_LITERAL_SITES").is_some()
-}
-
-fn walk_rs(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(walk_rs(&path));
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-    out
 }
 
 /// Drop the module path a type or an initializer may carry, leaving the name
@@ -383,7 +371,7 @@ fn write_registry(root: &Path, scanned: &[Row], existing: &[Row]) {
 #[test]
 fn every_capacity_number_in_rust_says_where_it_comes_from() {
     let root = workspace_root();
-    let scanned = scan(&root);
+    let scanned = scan(&root, &all_crate_files(&root));
     let existing = read_registry(&root);
     if std::env::var("COGNEVA_CAPACITY_REGISTRY_WRITE").as_deref() == Ok("1") {
         write_registry(&root, &scanned, &existing);
@@ -467,7 +455,7 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
 #[test]
 fn the_scan_sees_production_constants_and_not_fixtures() {
     let root = workspace_root();
-    let scanned = scan(&root);
+    let scanned = scan(&root, &all_crate_files(&root));
     assert!(
         scanned.len() > 100,
         "the scan found {} constants, far below what crates/*/src holds: the walk is \
@@ -518,7 +506,7 @@ const PLAIN: u64 = 30;
     )
     .unwrap();
     let value_of = |name: &str| {
-        scan(&root)
+        scan(&root, &crate_files_of(&root))
             .into_iter()
             .find(|r| r.name == name)
             .map(|r| r.value)
@@ -562,7 +550,10 @@ const AFTER: u64 = 45;
 "#,
     )
     .unwrap();
-    let names: Vec<String> = scan(&root).into_iter().map(|row| row.name).collect();
+    let names: Vec<String> = scan(&root, &crate_files_of(&root))
+        .into_iter()
+        .map(|row| row.name)
+        .collect();
     assert_eq!(names, vec!["AFTER".to_string(), "BEFORE".to_string()]);
     std::fs::remove_dir_all(&root).ok();
 }
@@ -612,18 +603,18 @@ const BARE_LITERAL_CEILING: u64 = 0;
 /// Rust expressions and a half-read expression in a register reads as a
 /// decision nobody made. What it must not do is count fixtures or declarations,
 /// and both of those exclusions are exact.
-fn scan_bare_literals(root: &Path) -> BTreeMap<(String, String), usize> {
+fn scan_bare_literals(root: &Path, files: &[PathBuf]) -> BTreeMap<(String, String), usize> {
     let mut out: BTreeMap<(String, String), usize> = BTreeMap::new();
-    for entry in walk_rs(&root.join("crates")) {
+    for entry in files {
         let rel = entry
             .strip_prefix(root)
-            .unwrap_or(&entry)
+            .unwrap_or(entry)
             .to_string_lossy()
             .to_string();
         if !rel.contains("/src/") || DECLARATION_FILES.contains(&rel.as_str()) {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&entry) else {
+        let Ok(text) = std::fs::read_to_string(entry) else {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
@@ -930,7 +921,7 @@ fn write_bare_literals(root: &Path, scanned: &BTreeMap<(String, String), usize>)
 #[test]
 fn a_number_at_the_point_of_use_is_counted_where_it_is_used() {
     let root = workspace_root();
-    let scanned = scan_bare_literals(&root);
+    let scanned = scan_bare_literals(&root, &all_crate_files(&root));
     let existing = read_bare_literals(&root);
     if std::env::var("COGNEVA_BARE_LITERAL_REGISTRY_WRITE").as_deref() == Ok("1") {
         write_bare_literals(&root, &scanned);
@@ -1012,7 +1003,7 @@ fn below_the_module() -> Duration {
 "##,
     )
     .unwrap();
-    let scanned = scan_bare_literals(&root);
+    let scanned = scan_bare_literals(&root, &crate_files_of(&root));
     let row = scanned
         .get(&(
             "crates/probe/src/production.rs".to_string(),

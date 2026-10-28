@@ -55,7 +55,11 @@
 //! there as an unexplained literal rather than as a series nothing checks.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+mod common;
+
+use common::rust_production::all_crate_files;
 
 use serde::Deserialize;
 
@@ -606,7 +610,7 @@ fn every_series_name_literal_in_the_tree_is_accounted_for() {
         .collect();
 
     let mut literals = BTreeSet::new();
-    for path in rust_sources_under_crates() {
+    for path in all_crate_files(&repo_root()) {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
         literals.extend(series_name_literals(&text));
@@ -898,7 +902,7 @@ fn spells_series(text: &str, name: &str) -> bool {
 /// Every series name the tree publishes, from the two shapes a producer uses.
 fn published_names() -> BTreeSet<String> {
     let mut found = BTreeSet::new();
-    for path in rust_sources_under_crates() {
+    for path in all_crate_files(&repo_root()) {
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
         found.extend(declared_names(&text));
@@ -1009,28 +1013,6 @@ fn series_name_literals(text: &str) -> Vec<String> {
 }
 
 /// Every `.rs` under `crates/`, as a path.
-fn rust_sources_under_crates() -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(t) if t.is_dir() => walk(&path, out),
-                Ok(t) if t.is_file() && path.extension().is_some_and(|e| e == "rs") => {
-                    out.push(path)
-                }
-                _ => {}
-            }
-        }
-    }
-    let mut found = Vec::new();
-    walk(&repo_root().join("crates"), &mut found);
-    found.sort();
-    found
-}
-
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
