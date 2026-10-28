@@ -181,6 +181,21 @@ else
     echo "SKIP  容量登记表：本机既没有可用的 rustc 也没有 cargo（CI 的 Test 会跑这一步）"
 fi
 
+# Check 作业本机跑不动（要编译整个工作区，比 CI 还慢），可它红得最多的一种形状本机
+# 几秒钟就能判：**推上去的这几笔，新增了对一个这棵树里不存在的模块的引用**。
+# 2026-10-29 实测过一次代价：一笔带 `use crate::test_support::scrape;` 而定义它的文件
+# 还停在工作树里没提交的提交推了上去，工作树编译是绿的（文件在盘上），CI 红在
+# unresolved import，部署器按设计停在最后一个绿 rev 上不滚，主线红了一小时。
+# 本地没有任何读数看得见它——这条门连同工作树都不编译，就算编译也是读工作树。
+# 判据只有一份（`check-commit-references.py`），这里是它的调用点。
+if command -v python3 >/dev/null 2>&1 && git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
+    run_step "推上去的提交引用的 crate:: 路径在树上能解答" \
+        python3 "${here}/check-commit-references.py" --base origin/main --head HEAD
+else
+    # 跑不了要说出来，不能安静跳过：跳过的绿与跑过的绿在读数上一模一样。
+    echo "SKIP  提交引用可达性：本机没有 python3 或没有 origin/main（CI 的 Check 会跑编译）"
+fi
+
 # ShellCheck：清单同样由 git 推出来，与 CI 同一条命令。
 mapfile -t shell_scripts < <(git ls-files '*.sh')
 # 零个脚本时 shellcheck 没有参数，它读 stdin、读到空、退 0——「一个脚本都没读到」
