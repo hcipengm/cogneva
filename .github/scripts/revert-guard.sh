@@ -57,6 +57,38 @@ IDENTITY_DOMAIN='@cogneva.ai'
 
 log() { printf '%s\n' "$*"; }
 
+# Every branch that stands still says which kind of standing still it was.
+#
+# This guard declines nearly every tip it is shown — it acts only on an aged
+# landing this system authored — so "declined" and "looked and found nothing
+# wrong" used to be the same green run and the same one-line log entry. They
+# are different answers, and the difference only matters on a tip that is
+# already red: nothing in the cluster undid it, this file will not either, and
+# the trace was a line in a log nobody opens, under a run that said success.
+#
+# $1: the kind. The two red kinds mean a red tip is being left standing and are
+# the only ones that annotate the run; every other kind is a tick that had
+# nothing to undo.
+stand_down() {
+  local kind="$1"
+  shift
+  printf '%s\n' "$*"
+  # The step summary is written per run and outlives the log. The kind is the
+  # first column so a reader can count refusals across runs instead of
+  # re-reading sentences.
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf '%s\t%s\n' "${kind}" "$*" >>"${GITHUB_STEP_SUMMARY}"
+  fi
+  case "${kind}" in
+    # A warning annotation is the one mark that shows on the run itself, where
+    # "success" is otherwise all this tick says. Measured 2026-10-28: one
+    # commit in the last 400 on main carries a landing marker, so a red tip is
+    # refused here far more often than it is acted on, and refusing it quietly
+    # reads as a healthy tick.
+    unjudged-red|red-left-standing) printf '::warning::%s\n' "$*" ;;
+  esac
+}
+
 # The change id a commit names as its landing, or nothing.
 #
 # stdin: a commit body. stdout: the trailer's id, or no output.
@@ -142,7 +174,8 @@ main() {
 
   case "${subject}" in
     "${REVERT_PREFIX}"*)
-      log "tip ${sha} is itself a revert (\"${subject}\"); nothing to undo"
+      stand_down nothing-to-do \
+        "tip ${sha} is itself a revert (\"${subject}\"); nothing to undo"
       return 0
       ;;
   esac
@@ -150,14 +183,29 @@ main() {
   local change_id
   change_id="$(landing_change_id "${subject}" "$(git log -1 --format=%b "${sha}")")"
   if [ -z "${change_id}" ]; then
-    log "tip ${sha} is not a landing (\"${subject}\"); refusing to guess"
+    # Whether the tip it is refusing was red is the whole difference between a
+    # tick with nothing to do and a red main nothing will undo, so the refusal
+    # carries it rather than reading the same either way.
+    if [ "${verdict}" = "red" ]; then
+      stand_down unjudged-red \
+        "tip ${sha} is red and names no landing (\"${subject}\"); nothing in the cluster undid it and this guard cannot name what to undo"
+    else
+      stand_down nothing-to-do \
+        "tip ${sha} is not a landing (\"${subject}\"); refusing to guess"
+    fi
     return 0
   fi
   case "${email}" in
     *"${IDENTITY_DOMAIN}")
       ;;
     *)
-      log "tip ${sha} was authored by ${email}, not by this system; refusing to act"
+      if [ "${verdict}" = "red" ]; then
+        stand_down unjudged-red \
+          "tip ${sha} is red and was authored by ${email}, not by this system; this guard does not undo another author's commit (verdict=${verdict})"
+      else
+        stand_down nothing-to-do \
+          "tip ${sha} was authored by ${email}, not by this system; refusing to act"
+      fi
       return 0
       ;;
   esac
@@ -165,17 +213,20 @@ main() {
   now="$(date -u +%s)"
   age=$(( now - cts ))
   if [ "${age}" -lt "${grace}" ]; then
-    log "tip ${sha} landed ${age}s ago, inside the ${grace}s grace (verdict=${verdict}); the in-cluster watcher still owns it"
+    stand_down held-by-grace \
+      "tip ${sha} landed ${age}s ago, inside the ${grace}s grace (verdict=${verdict}); the in-cluster watcher still owns it"
     return 0
   fi
 
   if [ "${verdict}" != "red" ]; then
-    log "tip ${sha} verdict=${verdict} ($(verdict_note "${verdict}")); nothing to undo"
+    stand_down "verdict-${verdict}" \
+      "tip ${sha} verdict=${verdict} ($(verdict_note "${verdict}")); nothing to undo"
     return 0
   fi
 
   if [ "${dry_run}" != "false" ]; then
-    log "DRY RUN: would revert ${sha} (change ${change_id}) on ${base}"
+    stand_down red-left-standing \
+      "DRY RUN: would revert ${sha} (change ${change_id}) on ${base}, and did not"
     return 0
   fi
 
@@ -188,7 +239,7 @@ main() {
   local rev
   rev="$(git rev-parse HEAD)"
   git push "${push_url}" "HEAD:refs/heads/${base}"
-  log "reverted ${sha} as ${rev} on ${base}"
+  stand_down reverted "reverted ${sha} as ${rev} on ${base}"
 }
 
 self_test() {
@@ -248,6 +299,45 @@ This reverts commit deadbeef.'
     'docs(cogneva): explain Landing change handling
 
 See the Landing change paragraphs elsewhere.'
+
+  # A refusal is an answer and has to read as one. The shape this pins is the
+  # one that hid the guard's own reach: every branch printed a line and exited
+  # 0, so a red tip it declined and a healthy tip it had no reason to touch
+  # were the same green run.
+  local out summary recorded
+  out="$(GITHUB_STEP_SUMMARY='' stand_down nothing-to-do 'a quiet refusal')"
+  case "${out}" in
+    *"::warning::"*)
+      printf 'FAIL a quiet refusal annotated the run\n' >&2
+      failed=$((failed + 1))
+      ;;
+    *) printf 'ok   %s\n' "a quiet refusal does not annotate the run" ;;
+  esac
+  out="$(GITHUB_STEP_SUMMARY='' stand_down unjudged-red 'a red tip left standing')"
+  case "${out}" in
+    *"::warning::a red tip left standing"*)
+      printf 'ok   %s\n' "a red tip this guard declines annotates the run"
+      ;;
+    *)
+      printf 'FAIL a red tip this guard declines did not annotate: %q\n' "${out}" >&2
+      failed=$((failed + 1))
+      ;;
+  esac
+  summary="$(mktemp)"
+  GITHUB_STEP_SUMMARY="${summary}" stand_down nothing-to-do 'first' >/dev/null
+  GITHUB_STEP_SUMMARY="${summary}" stand_down unjudged-red 'second' >/dev/null
+  recorded="$(cat "${summary}")"
+  rm -f "${summary}"
+  case "${recorded}" in
+    "nothing-to-do	first
+unjudged-red	second")
+      printf 'ok   %s\n' "each refusal records its kind, in order"
+      ;;
+    *)
+      printf 'FAIL refusals did not record their kinds: %q\n' "${recorded}" >&2
+      failed=$((failed + 1))
+      ;;
+  esac
 
   if [ "${failed}" -ne 0 ]; then
     printf '%d case(s) failed\n' "${failed}" >&2
