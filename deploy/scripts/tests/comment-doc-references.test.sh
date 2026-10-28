@@ -85,12 +85,27 @@ fi
 printf '%s' "${out}" | grep -q '读不出这些文件' \
   || fail "红的时候要说清是读不出来，不是有引用：${out}"
 
+# 自选人口时，读到零行注释与「整棵树没有一处引用」同形——这条门自己的匹配式坏了
+# 就是这个症状。造一棵只有一个无注释文件的 git 树，默认路径必须退 3 并说清读到了几行。
+floor_tree="${work}/floor-tree"
+mkdir -p "${floor_tree}"
+git -C "${floor_tree}" init -q
+printf 'fn main() {}\n' >"${floor_tree}/main.rs"
+git -C "${floor_tree}" add main.rs
+rc=0
+out="$(cd "${floor_tree}" && "${checker}" 2>&1)" || rc=$?
+[ "${rc}" -eq 3 ] || fail "零行注释时 rc=${rc}，应为 3 —— ${out}"
+case "${out}" in
+  *'只读到 0 行注释'*) ;;
+  *) fail "零行注释时没说清读到了几行 —— ${out}" ;;
+esac
+
 # The default path -- the one CI runs -- must be green on the tree itself, and it
 # has to read something: an empty file set would make the check pass by reading
 # nothing.
 out="$("${checker}" 2>&1)" || fail "tree is not green: ${out}"
 case "${out}" in
-  OK:*) ;;
+  OK:*行注释*) ;;
   *) fail "unexpected output: ${out}" ;;
 esac
 

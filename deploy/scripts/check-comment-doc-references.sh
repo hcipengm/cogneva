@@ -42,9 +42,11 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # Discovery rather than a list on the default path: a hand-kept list is what goes
 # quiet the day a file is added to it.
+defaulted=0
 if [ "$#" -gt 0 ]; then
   files=("$@")
 else
+  defaulted=1
   command -v git >/dev/null || fail "git is needed to find the tree's Rust sources"
   git rev-parse --show-toplevel >/dev/null 2>&1 || fail "not inside a git work tree"
   mapfile -t files < <(git ls-files '*.rs')
@@ -68,6 +70,21 @@ hits="$(
     | grep -E 'internal-docs|[0-9]{4}-[0-9]{2}-[0-9]{2}_[^ ]*\.md|§' || true
 )"
 
+# 读了一整棵树却一行注释都没读到，是这条门自己的匹配式坏了，不是「树里没有引用」：
+# 两者交出的都是零命中。所以自选人口时要数一遍注释行——把规则改坏这件事没有任何
+# 别的症状，它只会安静地不再判任何东西。
+comment_count=0
+[ -z "${comment_lines}" ] || comment_count="$(printf '%s\n' "${comment_lines}" | wc -l)"
+comment_floor=10000
+if [ "${defaulted}" -eq 1 ] && [ "${comment_count}" -lt "${comment_floor}" ]; then
+  {
+    echo "FAIL: ${#files[@]} 个 Rust 文件里只读到 ${comment_count} 行注释（下限 ${comment_floor}）。"
+    echo "  零行注释与「整棵树没有一处引用文档」在输出上同形——这一跑什么都没判。"
+    echo "  改了这里的匹配式（^[[:space:]]*(//|/\\*|\\*)）就是这个症状。"
+  } >&2
+  exit 3
+fi
+
 if [ -n "${hits}" ]; then
   {
     echo "代码注释引用了文档。文档在仓库之外，读代码的人跟不过去——"
@@ -77,4 +94,4 @@ if [ -n "${hits}" ]; then
   exit 1
 fi
 
-echo "OK: nothing in a Rust comment cites a document"
+echo "OK: ${#files[@]} 个 Rust 文件的 ${comment_count} 行注释里没有一处引用文档"
