@@ -3874,7 +3874,7 @@ mod tests {
                 build_peak_rss_bytes: peak,
                 ..Tuning::shipped()
             });
-            // 出厂地板是 24 GiB，所以可用的那一格要在地板之上才量得出差：
+            // 默认地板是 24 GiB，所以可用的那一格要在地板之上才量得出差：
             // 地板之下两根除数都塌到 1，测的就不是除数了。
             load.pressure.mem_available_bytes = 32 << 30;
             load
