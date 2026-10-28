@@ -7,7 +7,10 @@
 #   2. 基线里多一条**已经证明**的规则（基线没划掉）：必须红——否则基线是永久免检；
 #   3. 夹具点名一条库里没有的规则（死指针）：必须红；
 #   4. 基线写不回去时（想把它写大）：--update-baseline 必须拒绝，且基线文件一个字节都不动；
-#   5. 配置读不到：退 3，不许把「看不了」读成「没有新债」。
+#   5. 配置读不到：退 3，不许把「看不了」读成「没有新债」；
+#   6. 夹具目录在、但一条 `*.test.yaml` 都没读到：同样退 3。零份证据与「整库都还没被
+#      证明」在判词上同形，而基线恰好覆盖全库时**旧版会退 0 说全覆盖**——那是这条门
+#      最不能犯的错：它绿了，却一份证据都没读。
 # 另有两格证明它不会白红：真树必须绿；--stock 在有欠账时也退 0（它是读数不是判据）。
 #
 # 跑法：bash deploy/scripts/tests/alert-rule-firing-coverage.test.sh
@@ -145,6 +148,24 @@ fi
 run "${work}/does-not-exist.json"
 [ "$rc" -eq 3 ] && ok "配置读不到：退 3（看不了 ≠ 没有新债）" \
     || bad "配置读不到应退 3" "3" "$rc"
+
+# 6b) 夹具目录在、但一条 *.test.yaml 都没有：退 3。
+# 反例按**最坏**的那种摆：基线写成整库全量，于是「一份证据都没读到」在旧版判词里
+# 恰好等于「零条新债、零条要划掉」——退 0 并印 OK。零份证据与「全覆盖」同形。
+mkdir -p "${work}/fx-empty"
+python3 -I - "$config" "${work}/all.baseline" <<'PY'
+import json
+import sys
+config = json.load(open(sys.argv[1], encoding="utf-8"))
+names = sorted(r["name"] for r in config["observability"]["infra_watch"]["rules"] if r.get("name"))
+open(sys.argv[2], "w", encoding="utf-8").write("".join(n + "\n" for n in names))
+PY
+run "$config" "${work}/fx-empty" "${work}/all.baseline"
+if [ "$rc" -eq 3 ] && grep -q "一条 \*.test.yaml 都没读到" "${work}/out"; then
+    ok "夹具目录空的：退 3（零份证据 ≠ 整库都还没证明）"
+else
+    bad "空夹具目录应退 3" "rc=3 且判词点名零份证据" "$rc；$(head -2 "${work}/out" | tr '\n' ' ')"
+fi
 
 # 7) --stock 是读数不是判据：有欠账也退 0。
 run "$config" "$fixtures" "$baseline" --stock

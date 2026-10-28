@@ -81,7 +81,20 @@ proofs = {}
 # 是「这条规则在这份数据上没响」，恒假规则恰好满足它。所以另记一格：夹具里有没有一处
 # `alertname: <它>` 下面跟着非空的 `exp_alerts`——这才是「会响」的那一半证据。
 firing = {}
-for path in sorted(glob.glob(os.path.join(fixtures_dir, "*.test.yaml"))):
+fixture_files = sorted(glob.glob(os.path.join(fixtures_dir, "*.test.yaml")))
+# 零份证据与「每一条规则都还没被证明」不许共用一句话：后者是一种读数（整库记欠账），
+# 前者是这条门没看成——目录指错了、夹具改名成 `.test.yml`、或者有人在空目录上跑它。
+# 两者在下面的判词里长得一样（covered 为空、uncovered 全库），而在基线恰好覆盖全库时
+# 连退出码都一样，所以分母必须在读证据之前先数出来。
+if not fixture_files:
+    print(
+        f"夹具目录里一条 *.test.yaml 都没读到：{fixtures_dir}。零份证据与"
+        "「这些规则都还没被证明」在判词上同形——前者是看不了，后者是一整库欠账，"
+        "而基线覆盖全库时两者都退 0。先确认目录非空、夹具命名还是 *.test.yaml",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+for path in fixture_files:
     text = open(path, encoding="utf-8").read()
     base = os.path.basename(path)
     for name in named.findall(text):
