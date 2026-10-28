@@ -144,5 +144,17 @@ out=$(run "$tmp/not-a-file" 2>&1); rc=$?
 ck_rc "读不动的路径 ⇒ 红" 1 "$rc"
 ck_has "说清是读不出来，不是没有容量数字" "读不出这些文件" "$out"
 
+# 10. 自选人口时一处容量数字都没读到，与「每一处都标明了归属」同形：匹配式或单位表
+#     被改窄就是这个症状。造一棵只有一处无关注释的树，默认路径必须退 3。
+quiet="$tmp/quiet"
+mkdir -p "$quiet/deploy/scripts" "$quiet/deploy/k3s"
+cp "$gate" "$quiet/deploy/scripts/check-comment-capacity-figures.sh"
+: >"$quiet/deploy/scripts/comment-capacity-figures.baseline"
+printf 'spec:\n  # 这里没有任何容量数字\n' >"$quiet/deploy/k3s/x.yaml"
+( cd "$quiet" && git init -q . && git add -A ) >/dev/null 2>&1
+out=$(cd "$quiet" && bash deploy/scripts/check-comment-capacity-figures.sh 2>&1); rc=$?
+ck_rc "零处容量数字 ⇒ 退 3（没判成）" 3 "$rc"
+ck_has "说清是一处都没读到" "只读到 0 处容量数字" "$out"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

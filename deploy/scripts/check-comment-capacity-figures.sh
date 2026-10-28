@@ -76,7 +76,9 @@ for arg in "$@"; do
     esac
 done
 
+defaulted=0
 if [ "${#files[@]}" -eq 0 ]; then
+    defaulted=1
     command -v git >/dev/null || { echo "FAIL: git is needed to find the tree's files" >&2; exit 1; }
     # `deploy/rendered/` 是 render-deploy.sh 从 chart 生成的：同一句注释由拥有它的
     # 模板负责，读生成物只会把一次正当的 chart 改动记到没人手写的文件头上。
@@ -177,6 +179,14 @@ if [ "$new" -gt 0 ]; then
     echo "      改法：写机制与比例（例如「保留块占 size 的比例」），或标明这是谁的数——" >&2
     echo "      「实测 YYYY-MM-DD」「本机」「默认」「例如」。数字本身不是问题，冒充规格才是。" >&2
     exit 1
+fi
+# 零处与「每一处都标明了归属」印的是同一句话：这条门判的是命中集，而匹配式被改窄、
+# 单位表漏了一格时交回来的正是零处。所以自选人口时要数一遍命中——今天 211 处，下限取
+# 四分之一。调用方点名文件时不设下限：一两个文件的夹具本来就只有一两处。
+capacity_floor=50
+if [ "$defaulted" -eq 1 ] && [ "$total" -lt "$capacity_floor" ]; then
+    echo "FAIL: 只读到 $total 处容量数字（下限 $capacity_floor）——零处与「每一处都标明了归属」在输出上同形，这一跑什么都没判" >&2
+    exit 3
 fi
 echo "COMMENT CAPACITY OK：$total 处容量数字全部标明了归属（基线内）"
 exit 0
