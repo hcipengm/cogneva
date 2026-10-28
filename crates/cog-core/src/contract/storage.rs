@@ -283,6 +283,28 @@ impl MetricType {
     }
 }
 
+/// Running the schema statements a store owns, without the store knowing what
+/// runs them.
+///
+/// A store creates its own tables and indexes at startup, and the two things it
+/// needs from whoever runs that text are not backend-shaped: an attempt must
+/// give its locks back rather than leave a reader queued behind them, and a
+/// batch that cannot get them must be replayable as a whole. Both come from
+/// *how* the statements are run and neither from what they run against, so the
+/// consumer asks for this trait instead of naming a database crate.
+///
+/// The stores reach a runner directly today; that edge is registered as owed a
+/// route through this trait, which is why the trait exists before its first
+/// implementation does.
+#[async_trait]
+pub trait SchemaRunner: Send + Sync {
+    /// Run one schema text, bounding how long any single attempt waits for a lock.
+    ///
+    /// The text may hold several statements and they run as one unit, so a
+    /// statement that waits keeps the locks the earlier ones already took.
+    async fn apply_schema(&self, ddl: &str) -> SFResult<()>;
+}
+
 /// Runtime object-storage abstraction for large blobs (files, snapshots, raw sources).
 /// Implementations: Memory (testing), FileSystem (local dev), S3/SeaweedFS (production).
 #[async_trait]
