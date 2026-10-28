@@ -51,6 +51,8 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::routes::strip_comments;
+
 use common::routes::repo_root;
 
 use common::rust_production::{production_sources, production_text, sources_of_tree};
@@ -423,67 +425,6 @@ fn declared_variants(root: &Path, file: &str, name: &str) -> Vec<String> {
         }
     }
     split(item_start, body.len(), &mut out);
-    out
-}
-
-/// The text with line and block comments removed, leaving byte offsets of the
-/// remaining text intact only in order (they are re-derived from the result).
-fn strip_comments(text: &str) -> String {
-    let b = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    let mut block = 0usize;
-    while i < b.len() {
-        let c = b[i];
-        if block > 0 {
-            if c == b'/' && b.get(i + 1) == Some(&b'*') {
-                block += 1;
-                i += 2;
-                continue;
-            }
-            if c == b'*' && b.get(i + 1) == Some(&b'/') {
-                block -= 1;
-                i += 2;
-                continue;
-            }
-            if c == b'\n' {
-                out.push('\n');
-            }
-            i += 1;
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'/') {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            block = 1;
-            i += 2;
-            continue;
-        }
-        if c == b'"' {
-            out.push('"');
-            i += 1;
-            while i < b.len() {
-                out.push(b[i] as char);
-                if b[i] == b'\\' {
-                    i += 1;
-                    if i < b.len() {
-                        out.push(b[i] as char);
-                    }
-                } else if b[i] == b'"' {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        out.push(c as char);
-        i += 1;
-    }
     out
 }
 

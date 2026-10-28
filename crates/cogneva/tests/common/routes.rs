@@ -408,11 +408,30 @@ pub fn strip_comments(text: &str) -> String {
             continue;
         }
         if c == '/' && chars.get(i + 1) == Some(&'*') {
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
+            // Rust 的块注释**可以嵌套**：`/* /* */ */` 的结尾在第二个 `*/`。只找
+            // 第一个 `*/` 的写法会把后半截注释当成代码读——而这一半在判词上与
+            // 「那里真写了这个名字」同形。
+            let mut depth = 0usize;
+            while i < chars.len() {
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                // 换行留着：按行读的消费者不该因为一段块注释被删就看见两行合成一行。
+                if chars[i] == '\n' {
+                    out.push('\n');
+                }
                 i += 1;
             }
-            i += 2;
             continue;
         }
         out.push(c);

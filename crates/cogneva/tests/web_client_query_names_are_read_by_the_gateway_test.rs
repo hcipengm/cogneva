@@ -56,59 +56,14 @@
 
 mod common;
 
+use common::routes::strip_comments;
+
 use common::routes::{read, walk};
 
 use common::routes::repo_root;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-
-/// Comments dropped, string literals kept. Both sides quote names in prose — a
-/// doc comment saying "reads `?limit=`" is not a reader — and both sides spell
-/// names inside strings, which are the only places that count.
-fn strip_comments(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '"' || c == '\'' || c == '`' {
-            out.push(c);
-            i += 1;
-            while i < chars.len() {
-                out.push(chars[i]);
-                if chars[i] == '\\' {
-                    i += 1;
-                    if i < chars.len() {
-                        out.push(chars[i]);
-                    }
-                } else if chars[i] == c {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'/') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
-            i += 2;
-            while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
-}
 
 /// The body of every string and template literal in the text.
 fn string_bodies(text: &str) -> Vec<String> {

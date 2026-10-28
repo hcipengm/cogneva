@@ -41,6 +41,8 @@
 
 mod common;
 
+use common::routes::strip_comments;
+
 use common::routes::read;
 
 use common::routes::repo_root;
@@ -65,55 +67,6 @@ const WEB: &str = "web/src";
 /// 名字，读的也不是变体字段，判到它只会得到一片假红。两者的区别写在代码里：被
 /// switch 的那个变量若自己就是从 `.payload` 里解出来的，这一处不判。
 const PAGE: &str = "crates/cog-gateway/src/takeover.html";
-
-/// 去掉 `//` 与 `/* */` 注释，保留字符串。
-///
-/// 判据读的 `case` 标签与线上名字都是字符串字面量，必须留着；而被注释掉的那一臂
-/// 不该算。整棵树里有中文，所以按字节走、只在字符边界上推进。
-fn strip_comments(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => {
-                let quote = bytes[i];
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == quote {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push_str(&text[start..i.min(bytes.len())]);
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
-            _ => {
-                let ch = text[i..].chars().next().expect("in bounds");
-                out.push(ch);
-                i += ch.len_utf8();
-            }
-        }
-    }
-    out
-}
 
 /// `AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end"` 两列。
 fn wire_names(text: &str) -> BTreeMap<String, String> {

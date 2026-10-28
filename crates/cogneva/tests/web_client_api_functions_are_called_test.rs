@@ -44,6 +44,8 @@
 
 mod common;
 
+use common::routes::strip_comments;
+
 use common::routes::read;
 
 use common::routes::repo_root;
@@ -56,57 +58,6 @@ const CLIENT: &str = "web/src/api/client.ts";
 
 /// The directory whose files count as callers.
 const WEB: &str = "web/src";
-
-/// Drop `//` and `/* */` comments, keep string literals.
-///
-/// The module specifiers this gate reads are strings, so they have to survive;
-/// a commented-out import must not count as a caller, so the comments have to
-/// go. Same reader as the query-name gate, for the same reason — the tree is
-/// full of Chinese and every offset here is a byte offset.
-fn strip_comments(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\'' | b'"' | b'`' => {
-                let quote = bytes[i];
-                let start = i;
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == quote {
-                        i += 1;
-                        break;
-                    }
-                    i += 1;
-                }
-                out.push_str(&text[start..i.min(bytes.len())]);
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                while i < bytes.len() && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                i += 2;
-                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i = (i + 2).min(bytes.len());
-            }
-            _ => {
-                let ch = text[i..].chars().next().expect("in bounds");
-                out.push(ch);
-                i += ch.len_utf8();
-            }
-        }
-    }
-    out
-}
 
 /// The names an `import` statement pulls in, before `from`.
 ///
