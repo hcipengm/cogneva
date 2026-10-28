@@ -176,6 +176,19 @@ jobs:
         run: cargo test -p cog-storage --test schema_ddl_lock -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Splitting a store's schema into several lists buys the readers the
+      # difference between "closed while the shape changes" and "closed while
+      # the rows are walked", but it turns one transaction into three, so the
+      # order the lists land in is now something a start depends on. Neither
+      # wrong order is visible on the fresh database every other test builds:
+      # `SET NOT NULL` on a column the repair has not filled fails only on a
+      # table that predates the column, and a repair that runs before the
+      # `ADD COLUMN` it needs fails for the same reason. Both failures land at
+      # startup, on an old shape -- which is to say in production.
+      - name: Live-DB memory schema lists
+        run: cargo test -p cog-memory --test schema_lists_land_in_order_on_a_legacy_table -- --ignored --test-threads=1
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The decision counters are a sum the database keeps, and the one read a
       # DB-free test cannot take is two writers counting into the same cell at
       # once: a store that reads, adds and writes back loses an increment, while
