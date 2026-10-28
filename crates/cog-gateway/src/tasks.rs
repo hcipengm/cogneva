@@ -1861,6 +1861,7 @@ pub async fn batch_complete_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::claims;
 
     fn task(id: &str, status: cog_core::TaskStatus, task_type: &str, age_secs: i64) -> Task {
         let mut t = Task::new(
@@ -2416,22 +2417,6 @@ mod tests {
         );
     }
 
-    fn claims_with_workspaces(ws: Vec<String>) -> cog_core::Claims {
-        cog_core::Claims {
-            sub: "user-1".into(),
-            iss: "test".into(),
-            aud: "test".into(),
-            exp: 0,
-            iat: 0,
-            jti: "jti".into(),
-            preferred_username: "tester".into(),
-            user_type: cog_core::UserType::Standard,
-            workspace_ids: ws,
-            permissions: Vec::new(),
-            roles: Vec::new(),
-        }
-    }
-
     /// 读面的隔离：声明了 workspace 的 token 看不到别人的任务；没声明范围的口径
     /// 与提交侧一致（不按范围限制）；**没有归属的行对声明了范围的读者不可见**。
     ///
@@ -2441,7 +2426,7 @@ mod tests {
     /// 看不见的判据是「看得见才算」：范围之外的一切都不返回，包括没归属的。
     #[test]
     fn a_scoped_reader_sees_only_its_own_workspaces() {
-        let claims = claims_with_workspaces(vec!["ws-a".into()]);
+        let claims = claims(&["ws-a"]);
         let mut mine = task("a", cog_core::TaskStatus::Pending, "t", 0);
         mine.workspace_id = Some("ws-a".into());
         let mut theirs = task("b", cog_core::TaskStatus::Pending, "t", 0);
@@ -2456,7 +2441,7 @@ mod tests {
              puts somebody else's work on their board"
         );
         assert!(visible_to_claims(None, &theirs));
-        let unscoped = claims_with_workspaces(vec![]);
+        let unscoped = crate::test_support::claims(&[]);
         assert!(
             visible_to_claims(Some(&unscoped), &theirs),
             "a token that declares no scope is not restricted by one"
@@ -2493,22 +2478,6 @@ mod tests {
         assert_eq!(view.bound_by_handover_id.as_deref(), Some("handover-7"));
     }
 
-    fn scoped(workspaces: &[&str]) -> cog_core::Claims {
-        cog_core::Claims {
-            sub: "u1".into(),
-            iss: "test".into(),
-            aud: "test".into(),
-            exp: 0,
-            iat: 0,
-            jti: "j".into(),
-            preferred_username: "tester".into(),
-            user_type: cog_core::UserType::Standard,
-            workspace_ids: workspaces.iter().map(|w| w.to_string()).collect(),
-            permissions: Vec::new(),
-            roles: Vec::new(),
-        }
-    }
-
     /// 一条不属于任何 workspace 的任务，对一个有 workspace 范围的读者不可见。
     ///
     /// 反过来的写法——无主即放行——让每一条历史行同时出现在每个租户的视图里，
@@ -2517,7 +2486,7 @@ mod tests {
     fn unowned_tasks_are_not_visible() {
         let mut t = task("unowned", cog_core::TaskStatus::Pending, "t", 0);
         t.workspace_id = None;
-        let reader = scoped(&["acme"]);
+        let reader = claims(&["acme"]);
         assert!(
             !visible_to_claims(Some(&reader), &t),
             "无主的行不许落进有范围的读者眼里"
@@ -2527,7 +2496,7 @@ mod tests {
             "没有范围的读者（平台运维）仍然看得见它，否则这些行就没有任何读面"
         );
         assert!(
-            visible_to_claims(Some(&scoped(&[])), &t),
+            visible_to_claims(Some(&claims(&[])), &t),
             "空范围＝不受范围限制，与提交侧同一个约定"
         );
     }
@@ -2539,7 +2508,7 @@ mod tests {
         mine.workspace_id = Some("acme".into());
         let mut theirs = task("theirs", cog_core::TaskStatus::Pending, "t", 0);
         theirs.workspace_id = Some("globex".into());
-        let reader = scoped(&["acme"]);
+        let reader = claims(&["acme"]);
         assert!(visible_to_claims(Some(&reader), &mine));
         assert!(!visible_to_claims(Some(&reader), &theirs));
     }

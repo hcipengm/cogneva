@@ -155,9 +155,12 @@ const SUPPORT_ENTRY_POINTS: [&str; 7] = [
 /// 红：`env::var` 读一个没人设置的名字，与「本来就没配」在调用点上完全同形。
 const SUPPORT_ENV_NAMES: [&str; 2] = ["COGNEVA_TEST_DATABASE_URL", "COGNEVA_TEST_REDIS_URL"];
 
-/// 「两个夹具写同一段体」这一面今天真数过的函数体个数：2026-10-29 实测 2544。测法：
-/// 把下面的下限临时调到一个够不着的数，红的那句会印出当天的读数。
-const MIN_BODY_SITES: usize = 2000;
+/// 「两个夹具写同一段体」这一面今天真数过的函数体个数：2026-10-29 实测 7756
+/// （`tests/` 里 2544，`src` 的 `#[cfg(test)]` 模块里 5212）。测法：把下面的下限
+/// 临时调到一个够不着的数，红的那句会印出当天的读数。
+///
+/// 下限落在「题目」上：这一面读到零条时，「一条同体都没有」是一句关于空集的话。
+const MIN_BODY_SITES: usize = 6000;
 
 /// 够到支撑 crate 的调用点下限。今天 69 处。这一面判的是「没有第二处在读」，把调用点
 /// 全删了它也一样绿，所以另一头要有底：这些人真的在用那个 crate。
@@ -329,6 +332,78 @@ fn free_function_bodies(text: &str) -> Vec<(String, usize, String)> {
     out
 }
 
+/// `#[cfg(test)] mod <名字> { … }` 里直接定义的函数体：名字、行号、折叠空白后的体。
+///
+/// 夹具不只在 `tests/` 里：产出文件末尾的 `mod tests` 也是夹具，而它里面的辅助函数
+/// 顶格缩进（`    fn mk_case()`），上面那个只认行首 `fn` 的提取器看不见它们。实测：
+/// cog-eval 的十三个维度文件与 `dimensions/mod.rs` 各写了一遍逐字相同的 `mk_case`，
+/// 而这十四份里没有一份被任何判据数过。
+///
+/// 只取 `mod tests` 的**直接子项**，不取 `impl` 块里的方法：两个 trait 实现对不同类型
+/// 给出同形的方法体是正常的，不构成「一份规则的抄件」。
+fn test_module_function_bodies(text: &str) -> Vec<(String, usize, String)> {
+    let code = strip(text, Dialect::Rust);
+    let bytes = code.as_bytes();
+    let mut out = Vec::new();
+    let mut line_start = 0usize;
+    let mut depth: i32 = 0;
+    let mut pending_cfg_test = false;
+    let mut test_mod_depth: Option<i32> = None;
+    for (index, line) in code.split('\n').enumerate() {
+        let this_line = line_start;
+        line_start += line.len() + 1;
+        let trimmed = line.trim();
+        // `#[cfg(test)]` 与 `mod tests {` 可以在同一行，也可以隔一行；两种都要认。
+        let mut rest_of_line = trimmed;
+        if let Some(after) = trimmed.strip_prefix("#[cfg(test)]") {
+            pending_cfg_test = true;
+            rest_of_line = after.trim();
+        }
+        if pending_cfg_test && !rest_of_line.is_empty() {
+            pending_cfg_test = false;
+            let head = rest_of_line
+                .strip_prefix("pub mod ")
+                .or_else(|| rest_of_line.strip_prefix("mod "));
+            if head.is_some() && rest_of_line.ends_with('{') {
+                test_mod_depth = Some(depth + 1);
+            }
+        }
+        if let Some(want) = test_mod_depth {
+            if depth == want {
+                let head = ["fn ", "pub fn ", "async fn ", "pub async fn "]
+                    .iter()
+                    .find_map(|head| line.trim_start().strip_prefix(head));
+                if let Some(rest) = head {
+                    let lead = line.len() - rest.len();
+                    let called = rest.split('(').next().unwrap_or(rest).trim().to_string();
+                    if let Some(params) = rest.find('(') {
+                        if let Some(closed) = matching_paren(bytes, this_line + lead + params) {
+                            if let Some(body_at) = code[closed..].find('{').map(|at| closed + at) {
+                                if let Some(body_end) = matching_brace(bytes, body_at) {
+                                    let body = code[body_at..body_end]
+                                        .split_whitespace()
+                                        .collect::<Vec<_>>()
+                                        .join(" ");
+                                    if body.len() >= 80 {
+                                        out.push((called, index + 1, body));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        depth += brace_delta(line, Dialect::Rust);
+        if let Some(want) = test_mod_depth {
+            if depth < want {
+                test_mod_depth = None;
+            }
+        }
+    }
+    out
+}
+
 /// 这份文件从哪个 `::{…}` 里导入了哪些名字。
 ///
 /// 跨行的导入也要读得到：夹具里常见的是
@@ -414,6 +489,22 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
             // 走完之后：支撑 crate 排在遍历里的哪一位都好使。
             for (function, line, body) in free_function_bodies(&text) {
                 fixture_bodies.push((format!("{name}:{line} {function}"), body));
+            }
+        // 夹具不只在 `tests/` 里：产出文件末尾的 `#[cfg(test)] mod tests` 也是夹具。
+        // 它的辅助函数缩进着写，上面那个只认行首顶格的提取器看不见——于是同一份
+        // `mk_case` 可以在十三个维度文件里各写一遍，而每一份都从判据底下走过去。
+        // 就近的归宿是该 crate 里一份共同的 `#[cfg(test)]` 模块；跨 crate 的那一半
+        // 照旧归支撑 crate 那一面。
+        } else if let Some(at) = name.find("/src/") {
+            if name.ends_with(".rs") {
+                let crate_root = name[..at].to_string();
+                for (function, line, body) in test_module_function_bodies(&text) {
+                    body_sites += 1;
+                    bodies
+                        .entry((crate_root.clone(), body))
+                        .or_default()
+                        .push(format!("{name}:{line} {function}"));
+                }
             }
         }
         // 支撑 crate 负责的那两个名字：别处直接读它就是要红的那一处。这一面按**读的

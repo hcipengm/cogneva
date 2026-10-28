@@ -14,6 +14,10 @@ pub mod mcp;
 pub mod plugin;
 pub mod transport;
 
+/// 单测共用的样例：一个没人占着的端口。
+#[cfg(test)]
+pub(crate) mod test_support;
+
 /// Protobuf-generated types for agent lifecycle gRPC service.
 /// tonic 生成的 service 方法以 `tonic::Status` 作 Err 变体（体积大），
 /// 触发新版 clippy 的 result_large_err——生成代码不可改，模块级豁免。

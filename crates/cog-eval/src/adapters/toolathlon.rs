@@ -391,8 +391,8 @@ pub fn toolathlon_benchmark(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scaffold::{Budget, FinishReason, NoEnv};
-    use cog_core::{ToolImplementation, Usage};
+    use crate::scaffold::{Budget, NoEnv};
+    use crate::test_support::{mk_output, mk_tool};
 
     fn tempdir() -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -458,17 +458,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    fn tool(name: &str) -> Tool {
-        Tool {
-            name: name.into(),
-            description: name.into(),
-            parameters: serde_json::json!({"type": "object"}),
-            implementation: ToolImplementation::Native(Arc::new(|_| {
-                Box::pin(async move { Ok(serde_json::json!(null)) })
-            })),
-        }
-    }
-
     fn case(id: &str, servers: &[&str]) -> EvalCase {
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -491,9 +480,12 @@ mod tests {
     fn the_tool_face_is_what_the_factory_hands_over_and_never_an_empty_one() {
         let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
         // 名字是 MCP 工具自己的名字：不按 server 名过滤，交回来的一束就是工具面。
-        let kit =
-            ToolathlonToolkit::with_tools(vec![tool("echo"), tool("query"), tool("read_file")])
-                .unwrap();
+        let kit = ToolathlonToolkit::with_tools(vec![
+            mk_tool("echo"),
+            mk_tool("query"),
+            mk_tool("read_file"),
+        ])
+        .unwrap();
         let set = kit
             .toolset(&case("t1", &["excel", "filesystem"]), &env)
             .unwrap();
@@ -510,7 +502,7 @@ mod tests {
         assert!(empty.toolset(&case("t3", &[]), &env).unwrap().is_empty());
 
         // 名字重复是错误（造面那一步已按上游做法去重，重复到这一层就是造面的 bug）。
-        assert!(ToolathlonToolkit::with_tools(vec![tool("echo"), tool("echo")]).is_err());
+        assert!(ToolathlonToolkit::with_tools(vec![mk_tool("echo"), mk_tool("echo")]).is_err());
         // 关工具的那一套：声明了 server 也仍然给空面，这是那一臂的定义。
         assert!(ToolathlonToolkit::without_tools()
             .toolset(&case("t4", &["excel"]), &env)
@@ -528,7 +520,7 @@ mod tests {
                 serde_json::from_str(c.metadata.get("needed_mcp_servers").unwrap())?;
             Ok(declared
                 .iter()
-                .flat_map(|n| [tool(&format!("{n}_run")), tool(&format!("{n}_list"))])
+                .flat_map(|n| [mk_tool(&format!("{n}_run")), mk_tool(&format!("{n}_list"))])
                 .collect())
         });
         assert_eq!(
@@ -547,19 +539,10 @@ mod tests {
             .to_string();
         assert!(err.contains("empty"), "{err}");
 
-        let dup: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![tool("x"), tool("x")]));
+        let dup: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![mk_tool("x"), mk_tool("x")]));
         assert!(ToolathlonToolkit::with_factory(dup)
             .toolset(&case("t3", &["excel"]), &env)
             .is_err());
-    }
-
-    fn output() -> AgentOutput {
-        AgentOutput {
-            final_answer: String::new(),
-            trace: vec![],
-            tokens: Usage::default(),
-            finish: FinishReason::Answered,
-        }
     }
 
     fn check(name: &str, passed: bool) -> ToolathlonCheck {
@@ -603,7 +586,7 @@ mod tests {
             raw: "SUMMARY Overall: PASS".into(),
         })));
         let v = judge
-            .judge(&case("c1", &["excel"]), &env, &output())
+            .judge(&case("c1", &["excel"]), &env, &mk_output())
             .await
             .unwrap();
         assert!(v.resolved, "{}", v.detail);
@@ -617,7 +600,7 @@ mod tests {
             raw: "SUMMARY Overall: FAIL".into(),
         })));
         let v = judge
-            .judge(&case("c2", &["excel"]), &env, &output())
+            .judge(&case("c2", &["excel"]), &env, &mk_output())
             .await
             .unwrap();
         assert!(!v.resolved);
@@ -630,7 +613,7 @@ mod tests {
             raw: "boom".into(),
         })));
         let v = judge
-            .judge(&case("c3", &["excel"]), &env, &output())
+            .judge(&case("c3", &["excel"]), &env, &mk_output())
             .await
             .unwrap();
         assert!(!v.resolved);
@@ -646,7 +629,7 @@ mod tests {
             raw: "killed".into(),
         })));
         let err = judge
-            .judge(&case("c", &["excel"]), &env, &output())
+            .judge(&case("c", &["excel"]), &env, &mk_output())
             .await
             .unwrap_err()
             .to_string();
@@ -655,7 +638,7 @@ mod tests {
         // 没有后端 ⇒ 判不了，不是判错。
         let judge = ToolathlonJudge::new(None);
         let err = judge
-            .judge(&case("c2", &["excel"]), &env, &output())
+            .judge(&case("c2", &["excel"]), &env, &mk_output())
             .await
             .unwrap_err()
             .to_string();

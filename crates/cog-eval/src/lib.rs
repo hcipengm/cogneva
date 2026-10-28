@@ -362,3 +362,9 @@ mod feedback_feed_a_reading_the_artifact_the_pipeline_already_paid_for {
 #[cfg(test)]
 #[path = "../../cogneva/tests/common/root.rs"]
 pub(crate) mod checkout;
+
+/// 单测共用的样例：一题、一步、一份结果、一件工具、一份空外壳输出。
+///
+/// 它们不是任何一处的题目，是每处单测都要先摆好的东西——所以只写一份，谁要谁拿。
+#[cfg(test)]
+pub(crate) mod test_support;

@@ -157,10 +157,8 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
-    use axum::http::Request;
+    use crate::test_support::scrape;
     use std::path::Path;
-    use tower::ServiceExt;
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -174,16 +172,6 @@ mod tests {
         let dir = root.join(slice);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("memory.stat"), stat).unwrap();
-    }
-
-    async fn scrape(app: Router, path: &str) -> (StatusCode, String) {
-        let response = app
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
     /// A blank root must not resolve to the working directory: the process would

@@ -10053,6 +10053,7 @@ mod tests {
     use super::*;
     use crate::checkout::repo_root;
     use crate::rust_production::production_text;
+    use crate::test_support::http_200;
 
     // 滚动侧已搬去 `mainline_rollout`：本模块的用例仍直接调它们，所以只在测试面
     // 把它们带进来。产出面两个模块互不调用这一点不为此放宽——这里带进来的每一项，
@@ -14463,13 +14464,6 @@ exec {real} "$@"
             reqs
         });
         (format!("127.0.0.1:{port}"), handle)
-    }
-
-    fn http_200(body: &str) -> String {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
     }
 
     const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";

@@ -53,39 +53,12 @@ pub fn compute(metric: &EvalMetric, case: &EvalCase, result: &EvalResult) -> (f6
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mk_case() -> EvalCase {
-        EvalCase {
-            metadata: Default::default(),
-            id: "t1".into(),
-            name: "test".into(),
-            input: serde_json::Value::Null,
-            expected_output: None,
-            expected_tools: None,
-            metrics: vec![],
-            tags: vec![],
-        }
-    }
-
-    fn mk_result(passed: bool) -> EvalResult {
-        EvalResult {
-            case_id: "t1".into(),
-            passed,
-            metrics: vec![],
-            agent_output: serde_json::Value::Null,
-            duration_ms: 100,
-            token_usage: 50,
-            cost: 0.001,
-            error: None,
-            steps: vec![],
-            trace_json: None,
-        }
-    }
+    use crate::test_support::{mk_case, mk_result};
 
     #[test]
     fn router_dispatches_d1_step_accuracy() {
         let case = mk_case();
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::StepAccuracy { threshold: 0.5 };
         let (value, passed) = compute(&metric, &case, &result);
         // 0 steps -> total = 1, correct = 0 -> score = 0.0
@@ -96,7 +69,7 @@ mod tests {
     #[test]
     fn router_dispatches_d2_plan_quality() {
         let case = mk_case();
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::PlanQuality { threshold: 0.5 };
         let (value, passed) = compute(&metric, &case, &result);
         // 0 steps -> base=1.5, penalty=0 -> score=0.5
@@ -107,7 +80,7 @@ mod tests {
     #[test]
     fn router_dispatches_d3_tool_selection() {
         let case = mk_case();
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::ToolSelection { threshold: 0.5 };
         let (value, passed) = compute(&metric, &case, &result);
         // no tool calls -> returns (1.0, true)
@@ -118,7 +91,7 @@ mod tests {
     #[test]
     fn router_dispatches_d4_step_ratio() {
         let case = mk_case();
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::StepRatio { threshold: 0.5 };
         let (value, passed) = compute(&metric, &case, &result);
         // 0 steps / 5 baseline = 0.0
@@ -129,7 +102,7 @@ mod tests {
     #[test]
     fn router_dispatches_d5_snapshot() {
         let case = mk_case();
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::SnapshotReproducibility { threshold: 0.5 };
         let (value, passed) = compute(&metric, &case, &result);
         assert_eq!(value, 1.0);
@@ -139,7 +112,7 @@ mod tests {
     #[test]
     fn router_dispatches_d6_harmful_rate() {
         let case = mk_case();
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::HarmfulOutputRate { threshold: 0.1 };
         let (value, passed) = compute(&metric, &case, &result);
         assert_eq!(value, 0.0);
@@ -149,7 +122,7 @@ mod tests {
     #[test]
     fn router_dispatches_d7_output_consistency() {
         let case = mk_case();
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::OutputConsistency { threshold: 0.5 };
         let (value, passed) = compute(&metric, &case, &result);
         // passed=true -> score=1.0
@@ -160,7 +133,7 @@ mod tests {
     #[test]
     fn router_dispatches_d8_collaboration_success() {
         let case = mk_case();
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::CollaborationSuccessRate { threshold: 0.5 };
         let (value, passed) = compute(&metric, &case, &result);
         // passed=true -> score=1.0
@@ -171,7 +144,7 @@ mod tests {
     #[test]
     fn router_dispatches_d9_cost_per_step() {
         let case = mk_case();
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::CostPerStep { threshold: 0.5 };
         let (value, passed) = compute(&metric, &case, &result);
         // cost=0.001 / 1 step = 0.001

@@ -148,6 +148,8 @@ pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::mk_case;
+
     use crate::metric::StepRecord;
 
     fn mk_step(success: bool) -> StepRecord {
@@ -178,19 +180,6 @@ mod tests {
             error: None,
             steps,
             trace_json,
-        }
-    }
-
-    fn mk_case() -> EvalCase {
-        EvalCase {
-            metadata: Default::default(),
-            id: "t1".into(),
-            name: "test".into(),
-            input: serde_json::Value::Null,
-            expected_output: None,
-            expected_tools: None,
-            metrics: vec![],
-            tags: vec![],
         }
     }
 

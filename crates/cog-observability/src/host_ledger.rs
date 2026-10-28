@@ -257,7 +257,7 @@ impl Observable for HostLedgerObservable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkout::repo_root;
+    use crate::test_support::chart_rule;
     use std::collections::BTreeMap;
 
     const NODE: &str = "node-a";
@@ -518,20 +518,6 @@ mod tests {
             observable(Path::new(DEFAULT_ROOT)).root(),
             Path::new(DEFAULT_ROOT)
         );
-    }
-
-    fn chart_rule(name: &str) -> serde_json::Value {
-        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
-        let text = std::fs::read_to_string(&chart)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
-        let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
-        root.pointer("/observability/infra_watch/rules")
-            .and_then(|v| v.as_array())
-            .expect("infra_watch.rules present")
-            .iter()
-            .find(|r| r["name"] == name)
-            .unwrap_or_else(|| panic!("rule {name} missing"))
-            .clone()
     }
 
     /// The gauge only becomes an alert if a rule queries its exact name. A rename

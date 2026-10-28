@@ -73,38 +73,11 @@ pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mk_result(output: serde_json::Value) -> EvalResult {
-        EvalResult {
-            case_id: "t1".into(),
-            passed: true,
-            metrics: vec![],
-            agent_output: output,
-            duration_ms: 0,
-            token_usage: 0,
-            cost: 0.0,
-            error: None,
-            steps: vec![],
-            trace_json: None,
-        }
-    }
-
-    fn mk_case() -> EvalCase {
-        EvalCase {
-            metadata: Default::default(),
-            id: "t1".into(),
-            name: "test".into(),
-            input: serde_json::Value::Null,
-            expected_output: None,
-            expected_tools: None,
-            metrics: vec![],
-            tags: vec![],
-        }
-    }
+    use crate::test_support::{mk_case, mk_result_for_output};
 
     #[test]
     fn deployment_time_lower_better() {
-        let result = mk_result(serde_json::json!({"deployment_time_ms": 42000}));
+        let result = mk_result_for_output(serde_json::json!({"deployment_time_ms": 42000}));
         let metric = EvalMetric::DeploymentTime {
             threshold_ms: 60000,
         };
@@ -115,7 +88,7 @@ mod tests {
 
     #[test]
     fn sla_higher_better() {
-        let result = mk_result(serde_json::json!({"stability_sla": 0.995}));
+        let result = mk_result_for_output(serde_json::json!({"stability_sla": 0.995}));
         let metric = EvalMetric::StabilitySla { threshold: 0.999 };
         let (v, p) = compute(&metric, &mk_case(), &result);
         assert_eq!(v, 0.995);
@@ -124,7 +97,7 @@ mod tests {
 
     #[test]
     fn missing_measurement_is_placeholder() {
-        let result = mk_result(serde_json::Value::Null);
+        let result = mk_result_for_output(serde_json::Value::Null);
         let metric = EvalMetric::MttrPodCrash { threshold_ms: 5000 };
         assert_eq!(compute(&metric, &mk_case(), &result), (0.0, true));
     }

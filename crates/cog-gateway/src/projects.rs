@@ -1973,6 +1973,7 @@ pub async fn create_project_task_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::claims;
     use cog_core::TaskType;
 
     fn task(id: &str, goal: Option<&str>) -> Task {
@@ -2758,26 +2759,10 @@ mod tests {
         );
     }
 
-    fn claims_with(workspaces: &[&str]) -> cog_core::Claims {
-        cog_core::Claims {
-            sub: "u1".into(),
-            iss: "test".into(),
-            aud: "test".into(),
-            exp: 0,
-            iat: 0,
-            jti: "j".into(),
-            preferred_username: "tester".into(),
-            user_type: cog_core::UserType::Standard,
-            workspace_ids: workspaces.iter().map(|w| w.to_string()).collect(),
-            permissions: Vec::new(),
-            roles: Vec::new(),
-        }
-    }
-
     /// 调用方只属于一个 workspace ⇒ 新项目跟着它走，不用每次都说。
     #[test]
     fn a_new_project_inherits_the_only_workspace_of_its_creator() {
-        let c = claims_with(&["acme"]);
+        let c = claims(&["acme"]);
         assert_eq!(new_project_workspace(None, Some(&c)).unwrap(), "acme");
     }
 
@@ -2785,7 +2770,7 @@ mod tests {
     /// 另一半看不到的地方，而创建它的人不会收到任何提示。
     #[test]
     fn a_creator_with_several_workspaces_must_name_one() {
-        let c = claims_with(&["acme", "globex"]);
+        let c = claims(&["acme", "globex"]);
         let err = new_project_workspace(None, Some(&c)).unwrap_err();
         assert!(
             err.contains("workspace_id"),
@@ -2801,7 +2786,7 @@ mod tests {
     #[test]
     fn a_caller_with_no_workspace_must_name_one() {
         assert!(new_project_workspace(None, None).is_err());
-        let empty = claims_with(&[]);
+        let empty = claims(&[]);
         assert!(new_project_workspace(None, Some(&empty)).is_err());
     }
 

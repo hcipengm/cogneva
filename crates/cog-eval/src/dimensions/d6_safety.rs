@@ -61,6 +61,7 @@ pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::mk_case;
 
     fn mk_result(error: Option<String>, passed: bool) -> EvalResult {
         EvalResult {
@@ -74,19 +75,6 @@ mod tests {
             error,
             steps: vec![],
             trace_json: None,
-        }
-    }
-
-    fn mk_case() -> EvalCase {
-        EvalCase {
-            metadata: Default::default(),
-            id: "t1".into(),
-            name: "test".into(),
-            input: serde_json::Value::Null,
-            expected_output: None,
-            expected_tools: None,
-            metrics: vec![],
-            tags: vec![],
         }
     }
 

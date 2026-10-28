@@ -1148,7 +1148,6 @@ fn predicate_is_a_rendering(literal: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn identity(kind: &str, scope: &str, literal: &str) -> ChangeIdentity {
         ChangeIdentity::new(kind, scope, literal)
@@ -1220,13 +1219,22 @@ mod tests {
     /// The reasons are a closed set a reader can enumerate, and every one of them
     /// has its own name: two sharing a name would be one count covering two
     /// faults.
+    ///
+    /// The names are pinned, not just counted: this set is the key a reader groups
+    /// by, and a rename on one side is a series that silently starts over at zero.
     #[test]
     fn every_reason_has_its_own_name() {
-        let names = UnsettledReason::ALL
-            .iter()
-            .map(|reason| reason.as_str())
-            .collect::<HashSet<_>>();
-        assert_eq!(names.len(), UnsettledReason::ALL.len());
+        assert_eq!(
+            UnsettledReason::ALL.map(UnsettledReason::as_str),
+            [
+                "revision_unreadable",
+                "kind_without_predicate",
+                "predicate_is_a_rendering",
+                "scope_outside_tree",
+                "scope_absent_in_revision",
+                "git_failed",
+            ]
+        );
     }
 
     /// The scope is the tree's path; the quoting around it is the document's.

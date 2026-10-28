@@ -3616,6 +3616,10 @@ async fn mcp_tool_call_handler(
     }
 }
 
+/// 单测共用的样例：一份带着 workspace 范围的调用方身份。
+#[cfg(test)]
+pub(crate) mod test_support;
+
 #[cfg(test)]
 mod metrics_exposition_tests {
     use super::*;

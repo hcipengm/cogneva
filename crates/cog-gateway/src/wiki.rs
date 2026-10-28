@@ -282,22 +282,7 @@ pub async fn get_document_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn claims_with_workspaces(ws: Vec<String>) -> cog_core::Claims {
-        cog_core::Claims {
-            sub: "user-1".into(),
-            iss: "test".into(),
-            aud: "test".into(),
-            exp: 0,
-            iat: 0,
-            jti: "jti".into(),
-            preferred_username: "tester".into(),
-            user_type: cog_core::UserType::Standard,
-            workspace_ids: ws,
-            permissions: Vec::new(),
-            roles: Vec::new(),
-        }
-    }
+    use crate::test_support::claims;
 
     fn doc(path: &str) -> cog_core::WikiDocument {
         cog_core::WikiDocument {
@@ -314,13 +299,13 @@ mod tests {
     #[test]
     fn unauthenticated_has_no_prefix() {
         assert_eq!(ns_prefix(None), None);
-        let c = claims_with_workspaces(Vec::new());
+        let c = claims(&[]);
         assert_eq!(ns_prefix(Some(&c)), None);
     }
 
     #[test]
     fn authenticated_gets_workspace_prefix() {
-        let c = claims_with_workspaces(vec!["ws-alpha".into()]);
+        let c = claims(&["ws-alpha"]);
         assert_eq!(ns_prefix(Some(&c)), Some("ws-alpha/".to_string()));
     }
 

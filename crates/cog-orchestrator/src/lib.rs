@@ -113,3 +113,7 @@ pub use task_executor_router::TaskExecutorRouter;
 #[cfg(test)]
 #[path = "../../cogneva/tests/common/root.rs"]
 pub(crate) mod checkout;
+
+/// 单测共用的样例：把几行「路径 ＋ 文本」解析成一份声明账。
+#[cfg(test)]
+pub(crate) mod test_support;

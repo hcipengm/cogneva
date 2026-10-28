@@ -681,6 +681,7 @@ fn map_proto_command(cmd: Command) -> AgentCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::free_port;
     use cog_core::{AgentRegistration, ResourceInfo};
 
     /// Holds what it was given. The handlers answer "is this agent known"
@@ -878,13 +879,6 @@ mod tests {
 
     /// A free port nothing is listening on: bind it, read what the OS chose,
     /// let it go.
-    fn free_port() -> std::net::SocketAddr {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("the OS hands out a port");
-        let addr = probe.local_addr().expect("a bound listener has an address");
-        drop(probe);
-        addr
-    }
-
     /// The state an agent reports has to come back out of the query. It used to
     /// be read off the wire and dropped, so the field answered with a
     /// registration timestamp and the agent's own word -- the only part of a

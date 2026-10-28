@@ -529,7 +529,7 @@ pub async fn run_image_store_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkout::repo_root;
+    use crate::test_support::{chart_rule, write};
     use std::fs;
 
     const NODE: &str = "node-a";
@@ -541,11 +541,6 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn write(path: &Path, bytes: usize) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, vec![b'x'; bytes]).unwrap();
     }
 
     async fn readings(observable: &ImageStoreObservable) -> Vec<RawMetric> {
@@ -695,20 +690,6 @@ mod tests {
         assert_eq!(value_of(&out, PARTS_METRIC, None), Some(0.0));
         assert_eq!(value_of(&out, READABLE_METRIC, None), Some(0.0));
         assert!(observable.scans() == 0);
-    }
-
-    fn chart_rule(name: &str) -> serde_json::Value {
-        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
-        let text = std::fs::read_to_string(&chart)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
-        let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
-        root.pointer("/observability/infra_watch/rules")
-            .and_then(|v| v.as_array())
-            .expect("infra_watch.rules present")
-            .iter()
-            .find(|r| r["name"] == name)
-            .unwrap_or_else(|| panic!("rule {name} missing"))
-            .clone()
     }
 
     /// A reading only becomes an alert if a rule queries its exact name; a

@@ -1192,22 +1192,7 @@ use serde_json::json;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn claims_with_workspaces(ws: Vec<String>) -> cog_core::Claims {
-        cog_core::Claims {
-            sub: "user-1".into(),
-            iss: "test".into(),
-            aud: "test".into(),
-            exp: 0,
-            iat: 0,
-            jti: "jti".into(),
-            preferred_username: "tester".into(),
-            user_type: cog_core::UserType::Standard,
-            workspace_ids: ws,
-            permissions: Vec::new(),
-            roles: Vec::new(),
-        }
-    }
+    use crate::test_support::claims;
 
     #[test]
     fn ns_falls_back_to_default_without_claims() {
@@ -1216,13 +1201,13 @@ mod tests {
 
     #[test]
     fn ns_falls_back_to_default_with_empty_workspaces() {
-        let c = claims_with_workspaces(Vec::new());
+        let c = claims(&[]);
         assert_eq!(effective_ns(Some(&c)), DEFAULT_NS);
     }
 
     #[test]
     fn ns_derives_from_first_workspace() {
-        let c = claims_with_workspaces(vec!["ws-alpha".into(), "ws-beta".into()]);
+        let c = claims(&["ws-alpha", "ws-beta"]);
         assert_eq!(effective_ns(Some(&c)), "ws-alpha");
     }
 

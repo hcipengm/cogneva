@@ -221,5 +221,39 @@ else
     bad "11 a src test module should be judged and counted, got rc=${rc}: ${out}"
 fi
 
+# 12. a schema built through the support crate -- exempt
+# The DDL moved into `cog-test-support`, so the file no longer spells
+# `CREATE SCHEMA` anywhere and the exemption was earned by a string the file
+# stopped containing: `own_schema=0` on a run where a dozen files do build their
+# own schema, and eight whole-table counts judged as shared that are nobody
+# else's rows.
+tree "$(shared_file '    let schema = cog_test_support::own_schema(&url, "probe").await;
+    let pool = cog_test_support::schema_pool(&url, &schema).await;
+    let all = probe.catalog.all(10).await.expect("walk every dataset");
+    assert_eq!(all.len(), 2);
+    cog_test_support::drop_schema(&url, &schema).await;')"
+out="$(run)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'CENSUS exempt .*demo.rs' < <(printf '%s' "$out"); then
+    ok "12 a schema built through the support crate is exempt"
+else
+    bad "12 support-crate schema should be exempt, got rc=${rc}: ${out}"
+fi
+
+# 13. the same names written as *definitions* -- not an exemption
+# A gate that lists the entry points it counts mentions `own_schema(` and
+# `schema_pool(` without ever building a schema. Both halves have to be in the
+# file for this cell to isolate the rule: an exemption needs a start and an end,
+# and it is the pair that a pair of strings can forge.
+tree "$(shared_file '    const COUNTED: &[&str] = &["pub async fn own_schema(", "pub async fn schema_pool("];
+    let all = probe.catalog.all(10).await.expect("walk every dataset");
+    assert_eq!(all.len(), 2);
+    assert!(!COUNTED.is_empty());')"
+out="$(run)"; rc=$?
+if [ "$rc" -eq 1 ] && ! grep -q 'CENSUS exempt' < <(printf '%s' "$out"); then
+    ok "13 naming a definition is not calling it"
+else
+    bad "13 a definition in a string is not an exemption, got rc=${rc}: ${out}"
+fi
+
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [ "${fail}" -eq 0 ]

@@ -601,8 +601,8 @@ pub fn swe_pro_benchmark(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scaffold::{Budget, FinishReason, NoEnv};
-    use cog_core::{ToolImplementation, Usage};
+    use crate::scaffold::{Budget, NoEnv};
+    use crate::test_support::{mk_output, mk_tool};
 
     fn tempdir() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -704,29 +704,18 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    fn tool(name: &str) -> Tool {
-        Tool {
-            name: name.into(),
-            description: name.into(),
-            parameters: serde_json::json!({"type": "object"}),
-            implementation: ToolImplementation::Native(Arc::new(|_| {
-                Box::pin(async move { Ok(serde_json::json!(null)) })
-            })),
-        }
-    }
-
     #[test]
     fn the_tool_face_is_exactly_two_pinned_tools() {
         assert!(SweProToolkit::with_tools(vec![
-            tool(SWE_PRO_TOOL_FILE_EDIT),
-            tool(SWE_PRO_TOOL_BASH)
+            mk_tool(SWE_PRO_TOOL_FILE_EDIT),
+            mk_tool(SWE_PRO_TOOL_BASH)
         ])
         .is_ok());
-        assert!(SweProToolkit::with_tools(vec![tool(SWE_PRO_TOOL_BASH)]).is_err());
+        assert!(SweProToolkit::with_tools(vec![mk_tool(SWE_PRO_TOOL_BASH)]).is_err());
         assert!(SweProToolkit::with_tools(vec![
-            tool(SWE_PRO_TOOL_BASH),
-            tool(SWE_PRO_TOOL_FILE_EDIT),
-            tool("python")
+            mk_tool(SWE_PRO_TOOL_BASH),
+            mk_tool(SWE_PRO_TOOL_FILE_EDIT),
+            mk_tool("python")
         ])
         .is_err());
         let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
@@ -743,7 +732,10 @@ mod tests {
         let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
         let factory: Arc<ToolFactory> = Arc::new(|c, _| {
             if c.id == "swe-pro-per-case" {
-                Ok(vec![tool(SWE_PRO_TOOL_BASH), tool(SWE_PRO_TOOL_FILE_EDIT)])
+                Ok(vec![
+                    mk_tool(SWE_PRO_TOOL_BASH),
+                    mk_tool(SWE_PRO_TOOL_FILE_EDIT),
+                ])
             } else {
                 anyhow::bail!("no container for {}", c.id)
             }
@@ -774,15 +766,6 @@ mod tests {
             tags: vec![],
             metrics: vec![],
             metadata,
-        }
-    }
-
-    fn output() -> AgentOutput {
-        AgentOutput {
-            final_answer: String::new(),
-            trace: vec![],
-            tokens: Usage::default(),
-            finish: FinishReason::Answered,
         }
     }
 
@@ -823,7 +806,7 @@ mod tests {
         // 全过 ⇒ 通过。
         let judge = SweProJudge::new(Some(backend(vec!["t1", "t2", "p1"])));
         let v = judge
-            .judge(&case("c1", "['t1', 't2']", "['p1']"), &env, &output())
+            .judge(&case("c1", "['t1', 't2']", "['p1']"), &env, &mk_output())
             .await
             .unwrap();
         assert!(v.resolved, "{}", v.detail);
@@ -833,7 +816,7 @@ mod tests {
         // fail_to_pass 有一条没过 ⇒ 失败，且判词点名那条。
         let judge = SweProJudge::new(Some(backend(vec!["t1", "p1"])));
         let v = judge
-            .judge(&case("c2", "['t1', 't2']", "['p1']"), &env, &output())
+            .judge(&case("c2", "['t1', 't2']", "['p1']"), &env, &mk_output())
             .await
             .unwrap();
         assert!(!v.resolved);
@@ -842,7 +825,7 @@ mod tests {
         // pass_to_pass 被打破 ⇒ 失败，即便 fail_to_pass 全过。
         let judge = SweProJudge::new(Some(backend(vec!["t1", "t2"])));
         let v = judge
-            .judge(&case("c3", "['t1', 't2']", "['p1']"), &env, &output())
+            .judge(&case("c3", "['t1', 't2']", "['p1']"), &env, &mk_output())
             .await
             .unwrap();
         assert!(!v.resolved);
@@ -851,7 +834,7 @@ mod tests {
         // pass_to_pass 为空的行（公开集里有）只要求 fail_to_pass 全过。
         let judge = SweProJudge::new(Some(backend(vec!["t1"])));
         let v = judge
-            .judge(&case("c4", "['t1']", "[]"), &env, &output())
+            .judge(&case("c4", "['t1']", "[]"), &env, &mk_output())
             .await
             .unwrap();
         assert!(v.resolved, "{}", v.detail);
@@ -870,7 +853,7 @@ mod tests {
         // 「缺」的一向（既有行为）：fail_to_pass 有一条没过 ⇒ 失败，判词点名那条。
         let judge = SweProJudge::new(Some(backend(vec!["t1", "p1"])));
         let v = judge
-            .judge(&case("c1", "['t1', 't2']", "['p1']"), &env, &output())
+            .judge(&case("c1", "['t1', 't2']", "['p1']"), &env, &mk_output())
             .await
             .unwrap();
         assert!(!v.resolved);
@@ -882,7 +865,7 @@ mod tests {
         // 判词不变（仍然通过），但这个名字落进 `extra_passed` 读数，而不是被吞掉。
         let judge = SweProJudge::new(Some(backend(vec!["t1", "t2", "p1", "t3_misparsed"])));
         let v = judge
-            .judge(&case("c2", "['t1', 't2']", "['p1']"), &env, &output())
+            .judge(&case("c2", "['t1', 't2']", "['p1']"), &env, &mk_output())
             .await
             .unwrap();
         assert!(v.resolved, "{}", v.detail);
@@ -925,7 +908,7 @@ mod tests {
         let passed: Vec<&'static str> = REAL_F2P.iter().chain(REAL_P2P.iter()).copied().collect();
         let judge = SweProJudge::new(Some(backend(passed)));
         let v = judge
-            .judge(&case("c0", &f2p_raw, &p2p_raw), &env, &output())
+            .judge(&case("c0", &f2p_raw, &p2p_raw), &env, &mk_output())
             .await
             .unwrap();
         assert!(v.resolved, "{}", v.detail);
@@ -939,7 +922,7 @@ mod tests {
             "test/feed.js::page_still_renders",
         ])));
         let v = judge
-            .judge(&case("c1", &f2p_raw, &p2p_raw), &env, &output())
+            .judge(&case("c1", &f2p_raw, &p2p_raw), &env, &mk_output())
             .await
             .unwrap();
         assert!(!v.resolved, "{}", v.detail);
@@ -966,7 +949,7 @@ mod tests {
             "test/feed.js::reads_it_back",
         ])));
         let v = judge
-            .judge(&case("c2", &f2p_raw, &p2p_raw), &env, &output())
+            .judge(&case("c2", &f2p_raw, &p2p_raw), &env, &mk_output())
             .await
             .unwrap();
         assert!(!v.resolved, "{}", v.detail);
@@ -989,7 +972,7 @@ mod tests {
         // 没有后端：判不了，不是判错。
         let judge = SweProJudge::new(None);
         let err = judge
-            .judge(&case("c", "['t1']", "[]"), &env, &output())
+            .judge(&case("c", "['t1']", "[]"), &env, &mk_output())
             .await
             .unwrap_err()
             .to_string();
@@ -998,7 +981,7 @@ mod tests {
         // fail_to_pass 为空的行没得判 ⇒ 报错，不是判失败。
         let judge = SweProJudge::new(Some(backend(vec![])));
         let err = judge
-            .judge(&case("c2", "[]", "['p1']"), &env, &output())
+            .judge(&case("c2", "[]", "['p1']"), &env, &mk_output())
             .await
             .unwrap_err()
             .to_string();

@@ -529,7 +529,7 @@ pub async fn run_claim_store_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkout::repo_root;
+    use crate::test_support::{chart_rule, write};
     use std::collections::BTreeMap as Map;
     use std::fs;
     use std::path::Path;
@@ -551,11 +551,6 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    fn write(path: &Path, bytes: usize) {
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(path, vec![b'x'; bytes]).unwrap();
     }
 
     fn observable(root: &Path) -> Arc<ClaimStoreObservable> {
@@ -814,20 +809,6 @@ mod tests {
             best < walk_costs / 3,
             "a scrape waited {best:?} on a walk that costs {walk_costs:?}"
         );
-    }
-
-    fn chart_rule(name: &str) -> serde_json::Value {
-        let chart = repo_root().join("deploy/helm/cogneva/files/cogneva.json");
-        let text = std::fs::read_to_string(&chart)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", chart.display()));
-        let root: serde_json::Value = serde_json::from_str(&text).expect("chart config is JSON");
-        root.pointer("/observability/infra_watch/rules")
-            .and_then(|v| v.as_array())
-            .expect("infra_watch.rules present")
-            .iter()
-            .find(|r| r["name"] == name)
-            .unwrap_or_else(|| panic!("rule {name} missing"))
-            .clone()
     }
 
     /// A published reading only becomes an alert if a rule queries its exact

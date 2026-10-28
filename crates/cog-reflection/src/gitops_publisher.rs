@@ -422,22 +422,7 @@ impl PromotionChannel for GitOpsPublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    async fn git(dir: &std::path::Path, args: &[&str]) -> String {
-        let output = tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
+    use crate::test_support::git;
 
     async fn setup_repo() -> (tempfile::TempDir, tempfile::TempDir) {
         crate::test_support::declare_cluster_registry();

@@ -158,10 +158,8 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::to_bytes;
-    use axum::http::Request;
+    use crate::test_support::scrape;
     use std::path::PathBuf;
-    use tower::ServiceExt;
 
     fn scratch(name: &str) -> PathBuf {
         let dir =
@@ -169,16 +167,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    async fn scrape(app: Router, path: &str) -> (StatusCode, String) {
-        let response = app
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = to_bytes(response.into_body(), 1 << 20).await.unwrap();
-        (status, String::from_utf8(body.to_vec()).unwrap())
     }
 
     /// The point of the mode: the number it publishes is the bytes on the disk,

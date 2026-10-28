@@ -1676,25 +1676,10 @@ fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::git;
     use cog_core::MetricsBackend as _;
     use cog_core::TaskStatus;
     use std::path::Path;
-
-    async fn git(dir: &Path, args: &[&str]) -> String {
-        let output = tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {:?} failed: {}",
-            args,
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8_lossy(&output.stdout).trim().to_string()
-    }
 
     /// 初始仓库：一个提交 + v0.5.7 tag，模拟私版 seed 基线。
     async fn setup_repo() -> tempfile::TempDir {

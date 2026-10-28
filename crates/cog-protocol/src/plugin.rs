@@ -257,6 +257,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::free_port;
     use cog_core::SystemPlugin;
     use std::time::Duration;
 
@@ -317,13 +318,6 @@ mod tests {
     /// go. The window between the release and the server's own bind is the cost
     /// of testing on a real socket, and is why the port is chosen this way
     /// rather than written down.
-    fn free_port() -> std::net::SocketAddr {
-        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("the OS hands out a port");
-        let addr = probe.local_addr().expect("a bound listener has an address");
-        drop(probe);
-        addr
-    }
-
     /// Wait until the server answers, so that "it stopped" below is a change
     /// and not a race the test won.
     async fn wait_until_serving(addr: std::net::SocketAddr) {

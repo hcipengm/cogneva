@@ -109,52 +109,11 @@ pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metric::StepRecord;
-
-    fn mk_step(action_type: &str, success: bool) -> StepRecord {
-        StepRecord {
-            step_index: 0,
-            action_type: action_type.into(),
-            action_params: serde_json::Value::Null,
-            thought: None,
-            duration_ms: 10,
-            success,
-            tool_calls: vec![],
-        }
-    }
-
-    fn mk_result_with_steps(steps: Vec<StepRecord>, passed: bool) -> EvalResult {
-        EvalResult {
-            case_id: "t1".into(),
-            passed,
-            metrics: vec![],
-            agent_output: serde_json::Value::Null,
-            duration_ms: 100,
-            token_usage: 50,
-            cost: 0.001,
-            error: None,
-            steps,
-            trace_json: None,
-        }
-    }
-
-    fn mk_case() -> EvalCase {
-        EvalCase {
-            metadata: Default::default(),
-            id: "t1".into(),
-            name: "test".into(),
-            input: serde_json::Value::Null,
-            expected_output: None,
-            expected_tools: None,
-            metrics: vec![],
-            tags: vec![],
-        }
-    }
+    use crate::test_support::{mk_case, mk_result, mk_step};
 
     #[test]
     fn step_accuracy_all_success() {
-        let result =
-            mk_result_with_steps(vec![mk_step("click", true), mk_step("type", true)], true);
+        let result = mk_result(vec![mk_step("click", true), mk_step("type", true)], true);
         let metric = EvalMetric::StepAccuracy { threshold: 0.5 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 1.0);
@@ -163,8 +122,7 @@ mod tests {
 
     #[test]
     fn step_accuracy_half_success() {
-        let result =
-            mk_result_with_steps(vec![mk_step("click", true), mk_step("type", false)], false);
+        let result = mk_result(vec![mk_step("click", true), mk_step("type", false)], false);
         let metric = EvalMetric::StepAccuracy { threshold: 0.6 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 0.5);
@@ -173,7 +131,7 @@ mod tests {
 
     #[test]
     fn click_accuracy_with_no_clicks() {
-        let result = mk_result_with_steps(vec![mk_step("type", true)], true);
+        let result = mk_result(vec![mk_step("type", true)], true);
         let metric = EvalMetric::ClickAccuracy { threshold: 0.5 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 1.0);
@@ -182,7 +140,7 @@ mod tests {
 
     #[test]
     fn click_accuracy_mixed() {
-        let result = mk_result_with_steps(
+        let result = mk_result(
             vec![
                 mk_step("click", true),
                 mk_step("click", false),
@@ -198,7 +156,7 @@ mod tests {
 
     #[test]
     fn goal_fulfillment_passed() {
-        let result = mk_result_with_steps(vec![], true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::GoalFulfillment { threshold: 0.5 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 1.0);
@@ -207,7 +165,7 @@ mod tests {
 
     #[test]
     fn goal_fulfillment_failed() {
-        let result = mk_result_with_steps(vec![], false);
+        let result = mk_result(vec![], false);
         let metric = EvalMetric::GoalFulfillment { threshold: 0.5 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 0.0);
@@ -216,7 +174,7 @@ mod tests {
 
     #[test]
     fn task_success_rate_passed() {
-        let result = mk_result_with_steps(vec![], true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::TaskSuccessRate { threshold: 0.5 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 1.0);
@@ -225,7 +183,7 @@ mod tests {
 
     #[test]
     fn operation_f1_empty_steps() {
-        let result = mk_result_with_steps(vec![], true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::OperationF1 { threshold: 0.5 };
         let (value, _passed) = compute(&metric, &mk_case(), &result);
         // empty steps -> total = 1, correct = 0 -> score = 0.0
@@ -234,7 +192,7 @@ mod tests {
 
     #[test]
     fn navigate_accuracy_all_success() {
-        let result = mk_result_with_steps(
+        let result = mk_result(
             vec![mk_step("navigate", true), mk_step("navigate", true)],
             true,
         );

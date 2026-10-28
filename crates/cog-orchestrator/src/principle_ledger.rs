@@ -1164,6 +1164,7 @@ fn unreadable_summary(declarations: &Declarations) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::declarations;
     use chrono::{TimeZone, Utc};
 
     fn row(slug: &str, host: Option<&str>, state: Option<PrincipleState>) -> PrincipleRow {
@@ -1184,15 +1185,6 @@ mod tests {
             measured_at: None,
             measured_rev: None,
         }
-    }
-
-    fn declarations(lines: &[(&str, &str)]) -> Declarations {
-        Declarations::parse(
-            &lines
-                .iter()
-                .map(|(path, text)| (path.to_string(), text.to_string()))
-                .collect::<Vec<_>>(),
-        )
     }
 
     /// Every reason in the closed set is named on the line, zeroes included. A

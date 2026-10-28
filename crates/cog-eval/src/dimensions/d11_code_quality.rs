@@ -58,38 +58,11 @@ pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mk_result(output: serde_json::Value) -> EvalResult {
-        EvalResult {
-            case_id: "t1".into(),
-            passed: true,
-            metrics: vec![],
-            agent_output: output,
-            duration_ms: 0,
-            token_usage: 0,
-            cost: 0.0,
-            error: None,
-            steps: vec![],
-            trace_json: None,
-        }
-    }
-
-    fn mk_case() -> EvalCase {
-        EvalCase {
-            metadata: Default::default(),
-            id: "t1".into(),
-            name: "test".into(),
-            input: serde_json::Value::Null,
-            expected_output: None,
-            expected_tools: None,
-            metrics: vec![],
-            tags: vec![],
-        }
-    }
+    use crate::test_support::{mk_case, mk_result_for_output};
 
     #[test]
     fn test_pass_rate_higher_better() {
-        let result = mk_result(serde_json::json!({"cargo_test_pass_rate": 0.97}));
+        let result = mk_result_for_output(serde_json::json!({"cargo_test_pass_rate": 0.97}));
         let metric = EvalMetric::CargoTestPassRate { threshold: 0.95 };
         let (v, p) = compute(&metric, &mk_case(), &result);
         assert_eq!(v, 0.97);
@@ -98,7 +71,7 @@ mod tests {
 
     #[test]
     fn clippy_warn_lower_better() {
-        let result = mk_result(serde_json::json!({"clippy_warn_count": 12}));
+        let result = mk_result_for_output(serde_json::json!({"clippy_warn_count": 12}));
         let metric = EvalMetric::ClippyWarnCount { threshold: 10.0 };
         let (v, p) = compute(&metric, &mk_case(), &result);
         assert_eq!(v, 12.0);

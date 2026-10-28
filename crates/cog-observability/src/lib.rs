@@ -480,3 +480,7 @@ pub use infra_watch::{run_infra_watch_loop, InfraWatchOutlets};
 #[cfg(test)]
 #[path = "../../cogneva/tests/common/root.rs"]
 pub(crate) mod checkout;
+
+/// 单测共用的样例：一片写满字节的文件，与 chart 里那条按名字取的规则。
+#[cfg(test)]
+pub(crate) mod test_support;

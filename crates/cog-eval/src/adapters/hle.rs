@@ -376,7 +376,8 @@ pub fn hle_benchmark(
 mod tests {
     use super::*;
     use crate::scaffold::{Budget, FinishReason, NoEnv};
-    use cog_core::{ChatOptions, ChatResponse, ContentBlock, SFResult, ToolImplementation, Usage};
+    use crate::test_support::mk_tool;
+    use cog_core::{ChatOptions, ChatResponse, ContentBlock, SFResult, Usage};
 
     fn tempdir() -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -428,31 +429,22 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    fn tool(name: &str) -> Tool {
-        Tool {
-            name: name.into(),
-            description: name.into(),
-            parameters: serde_json::json!({"type": "object"}),
-            implementation: ToolImplementation::Native(Arc::new(|_| {
-                Box::pin(async move { Ok(serde_json::json!(null)) })
-            })),
-        }
-    }
-
     #[test]
     fn the_tool_face_is_exactly_two_pinned_tools() {
-        assert!(
-            HleToolkit::with_tools(vec![tool(HLE_TOOL_PYTHON), tool(HLE_TOOL_WEB_SEARCH)]).is_ok()
-        );
-        // 多一件、少一件、换个名字，都不是 HLE 的那一束。
-        assert!(HleToolkit::with_tools(vec![tool(HLE_TOOL_WEB_SEARCH)]).is_err());
         assert!(HleToolkit::with_tools(vec![
-            tool(HLE_TOOL_WEB_SEARCH),
-            tool(HLE_TOOL_PYTHON),
-            tool("bash")
+            mk_tool(HLE_TOOL_PYTHON),
+            mk_tool(HLE_TOOL_WEB_SEARCH)
+        ])
+        .is_ok());
+        // 多一件、少一件、换个名字，都不是 HLE 的那一束。
+        assert!(HleToolkit::with_tools(vec![mk_tool(HLE_TOOL_WEB_SEARCH)]).is_err());
+        assert!(HleToolkit::with_tools(vec![
+            mk_tool(HLE_TOOL_WEB_SEARCH),
+            mk_tool(HLE_TOOL_PYTHON),
+            mk_tool("bash")
         ])
         .is_err());
-        assert!(HleToolkit::with_tools(vec![tool("search"), tool(HLE_TOOL_PYTHON)]).is_err());
+        assert!(HleToolkit::with_tools(vec![mk_tool("search"), mk_tool(HLE_TOOL_PYTHON)]).is_err());
         let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
         let empty_case = case("hle-x", "exactMatch", "q", "a");
         assert!(HleToolkit::without_tools()
@@ -471,7 +463,7 @@ mod tests {
         let c = case("hle-y", "exactMatch", "q", "a");
 
         let good: Arc<ToolFactory> =
-            Arc::new(|_, _| Ok(vec![tool(HLE_TOOL_WEB_SEARCH), tool(HLE_TOOL_PYTHON)]));
+            Arc::new(|_, _| Ok(vec![mk_tool(HLE_TOOL_WEB_SEARCH), mk_tool(HLE_TOOL_PYTHON)]));
         assert_eq!(
             HleToolkit::with_factory(good)
                 .toolset(&c, &env)
@@ -481,7 +473,7 @@ mod tests {
             2
         );
 
-        let short: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![tool(HLE_TOOL_WEB_SEARCH)]));
+        let short: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![mk_tool(HLE_TOOL_WEB_SEARCH)]));
         let err = HleToolkit::with_factory(short)
             .toolset(&c, &env)
             .unwrap_err()

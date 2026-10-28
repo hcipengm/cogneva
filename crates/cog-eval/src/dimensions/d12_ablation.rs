@@ -59,38 +59,11 @@ pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mk_result(output: serde_json::Value) -> EvalResult {
-        EvalResult {
-            case_id: "t1".into(),
-            passed: true,
-            metrics: vec![],
-            agent_output: output,
-            duration_ms: 0,
-            token_usage: 0,
-            cost: 0.0,
-            error: None,
-            steps: vec![],
-            trace_json: None,
-        }
-    }
-
-    fn mk_case() -> EvalCase {
-        EvalCase {
-            metadata: Default::default(),
-            id: "t1".into(),
-            name: "test".into(),
-            input: serde_json::Value::Null,
-            expected_output: None,
-            expected_tools: None,
-            metrics: vec![],
-            tags: vec![],
-        }
-    }
+    use crate::test_support::{mk_case, mk_result_for_output};
 
     #[test]
     fn pge_delta_passes_when_above_threshold() {
-        let result = mk_result(serde_json::json!({"ablation_delta_pge": 0.08}));
+        let result = mk_result_for_output(serde_json::json!({"ablation_delta_pge": 0.08}));
         let metric = EvalMetric::AblationDeltaPge { threshold: 0.05 };
         let (v, p) = compute(&metric, &mk_case(), &result);
         assert_eq!(v, 0.08);
@@ -99,7 +72,7 @@ mod tests {
 
     #[test]
     fn negative_delta_fails() {
-        let result = mk_result(serde_json::json!({"ablation_delta_ralph": -0.02}));
+        let result = mk_result_for_output(serde_json::json!({"ablation_delta_ralph": -0.02}));
         let metric = EvalMetric::AblationDeltaRalph { threshold: 0.0 };
         let (_, p) = compute(&metric, &mk_case(), &result);
         assert!(!p);

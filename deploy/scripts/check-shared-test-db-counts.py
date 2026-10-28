@@ -133,8 +133,23 @@ LEN_EQ = re.compile(
 CLEAN = re.compile(r"\bcleanup\s*\(|\bDELETE\s+FROM\b|\bTRUNCATE\b")
 # A file that makes its own schema and takes it away again owns every table its
 # reads can see, so a whole-table count there is this run's own rows.
-OWN_SCHEMA = re.compile(r"\bCREATE\s+SCHEMA\b")
-OWN_SCHEMA_END = re.compile(r"\bDROP\s+SCHEMA\b|\bsearch_path\b")
+#
+# Two forms, and both are the same fact: the DDL written out inline, or the call
+# into the support crate that writes it (`own_schema(..)` plus `schema_pool(..)`
+# or `drop_schema(..)`). Reading only the inline form is what this check did
+# until 2026-10-29, when the extraction that moved the DDL into
+# `cog-test-support` left every one of those files spelling the exemption
+# nowhere: `own_schema=0` on a run where a dozen files do build their own schema,
+# and eight whole-table counts judged as shared that are nobody else's rows. The
+# denominator said zero and the verdicts still read as eight defects -- the
+# exemption has to be recognised by the form the tree now uses.
+# `(?<!fn )` keeps a *definition* out: a gate that lists the entry points it
+# counts (`"pub async fn own_schema("`) mentions the name without ever building a
+# schema, and an exemption earned by that line would hide that file's reads.
+OWN_SCHEMA = re.compile(r"\bCREATE\s+SCHEMA\b|(?<!fn )\bown_schema\s*\(")
+OWN_SCHEMA_END = re.compile(
+    r"\bDROP\s+SCHEMA\b|\bsearch_path\b|(?<!fn )\b(?:drop_schema|schema_pool)\s*\("
+)
 NARROW = re.compile(r"\.(?:filter|retain)\s*\(")
 CFG_TEST = re.compile(r"#!?\[cfg\(test\)\]")
 FN = re.compile(r"\bfn\s+(\w+)")

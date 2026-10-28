@@ -60,6 +60,40 @@ pub fn declare_cluster_registry() {
     );
 }
 
+/// Run `git` in `dir` and hand back its trimmed stdout.
+///
+/// A non-zero exit panics with the command and git's stderr: a fixture whose
+/// `git init` silently failed would then be measuring an empty directory, and
+/// the case would read as a product failure rather than a broken fixture.
+pub async fn git(dir: &Path, args: &[&str]) -> String {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// A whole `200` carrying `body` as JSON: what the registry answers when it does
+/// not stream.
+///
+/// `Content-Length` is the body's own length, so a fixture that edits the body
+/// without re-measuring it is caught by the client rather than by the assertion
+/// on the far side.
+pub fn http_200(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

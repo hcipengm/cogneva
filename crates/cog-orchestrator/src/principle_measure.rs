@@ -549,6 +549,7 @@ pub fn drift_annotation(drift: &PrincipleDrift) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::declarations;
     use chrono::{TimeZone, Utc};
 
     fn row(slug: &str, host: Option<&str>) -> PrincipleRow {
@@ -569,15 +570,6 @@ mod tests {
             measured_at: None,
             measured_rev: None,
         }
-    }
-
-    fn declarations(lines: &[(&str, &str)]) -> Declarations {
-        Declarations::parse(
-            &lines
-                .iter()
-                .map(|(path, text)| (path.to_string(), text.to_string()))
-                .collect::<Vec<_>>(),
-        )
     }
 
     /// Two files claiming one slug: the account records the same one whichever
@@ -938,13 +930,21 @@ mod tests {
 
     /// Every reason in the closed set has its own name: two sharing one would be
     /// a single count covering two faults with two different owners.
+    ///
+    /// The names are pinned, not just counted: this set is the key a reader groups
+    /// by, and a rename on one side is a series that silently starts over at zero.
     #[test]
     fn every_reason_has_its_own_name() {
-        let names = UnsettledReason::ALL
-            .iter()
-            .map(|reason| reason.as_str())
-            .collect::<HashSet<_>>();
-        assert_eq!(names.len(), UnsettledReason::ALL.len());
+        assert_eq!(
+            UnsettledReason::ALL.map(UnsettledReason::as_str),
+            [
+                "registry_unreadable",
+                "revision_unreadable",
+                "host_column_absent",
+                "carrier_not_in_tree",
+                "declaration_unparsable",
+            ]
+        );
     }
 
     /// The identity is narrow, and it has to be: this string is the account's

@@ -55,38 +55,11 @@ pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn mk_result(passed: bool) -> EvalResult {
-        EvalResult {
-            case_id: "t1".into(),
-            passed,
-            metrics: vec![],
-            agent_output: serde_json::Value::Null,
-            duration_ms: 100,
-            token_usage: 50,
-            cost: 0.001,
-            error: None,
-            steps: vec![],
-            trace_json: None,
-        }
-    }
-
-    fn mk_case() -> EvalCase {
-        EvalCase {
-            metadata: Default::default(),
-            id: "t1".into(),
-            name: "test".into(),
-            input: serde_json::Value::Null,
-            expected_output: None,
-            expected_tools: None,
-            metrics: vec![],
-            tags: vec![],
-        }
-    }
+    use crate::test_support::{mk_case, mk_result};
 
     #[test]
     fn collaboration_success_rate_passed() {
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::CollaborationSuccessRate { threshold: 0.5 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 1.0);
@@ -95,7 +68,7 @@ mod tests {
 
     #[test]
     fn collaboration_success_rate_failed() {
-        let result = mk_result(false);
+        let result = mk_result(vec![], false);
         let metric = EvalMetric::CollaborationSuccessRate { threshold: 0.5 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 0.0);
@@ -104,7 +77,7 @@ mod tests {
 
     #[test]
     fn total_stance_shift_within_threshold() {
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::TotalStanceShift { threshold: 0.5 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 0.0);
@@ -113,7 +86,7 @@ mod tests {
 
     #[test]
     fn role_conflict_rate_within_threshold() {
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::RoleConflictRate { threshold: 0.1 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 0.0);
@@ -122,7 +95,7 @@ mod tests {
 
     #[test]
     fn semantic_diversity_meets_threshold() {
-        let result = mk_result(true);
+        let result = mk_result(vec![], true);
         let metric = EvalMetric::SemanticDiversity { threshold: 0.4 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 0.5);

@@ -589,6 +589,7 @@ fn manifest_path(digest: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::http_200;
 
     /// A registry that routes by path, so a walk's request order is not part of
     /// what the test asserts. The table is shared so a test can change what the
@@ -637,13 +638,6 @@ mod tests {
 
     fn routes(entries: Vec<(String, String)>) -> Arc<std::sync::Mutex<Vec<(String, String)>>> {
         Arc::new(std::sync::Mutex::new(entries))
-    }
-
-    fn http_200(body: &str) -> String {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
-            body.len()
-        )
     }
 
     /// The same 200 the registry sends for a body it streams: hex chunk-size lines,
