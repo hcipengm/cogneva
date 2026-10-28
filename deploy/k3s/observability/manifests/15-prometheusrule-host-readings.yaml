@@ -712,8 +712,27 @@ spec:
             cogneva_io_face: "资源管理"
             severity: warning
           annotations:
-            summary: "宿主已被压着，而构建闸外还有 {{ $value }} 发构建在跑"
+            summary: "宿主已被压着，而构建闸外还有构建在跑（几发看 `build_containment_builds{containment=\"outside\"}`）"
             description: "宿主上跑那条 containment 读数（脚本名 `cogneva-host-build-containment-reading.sh`，不在本仓，在值守用的另一棵树里，以 cogneva 用户跑）看两件事：`build_containment_builds{containment=\"outside\"}` 是闸外几发，`build_containment_outside_names` 把每一发往上走到底的那条父链点出来——`systemd<tmux: server<claude<bash<timeout<cargo` 这样的链就是「某个会话里直接敲的」。修法二选一：那一发改用同一棵树里的构建闸包装 `cogneva-build.sh cargo …` 起（取槽、按界分宽度），或者等它跑完再起闸里的活。**不要**抬闸的界——闸外的构建根本不看那个界。"
+
+        # 构建在 slice 里，而那个 slice 没有配额。这一条比「没人在 slice 里」更该响：
+        # slice 存在、构建在里面、`systemd-cgls` 也指着它，读起来像「有界」，而
+        # `cpu.max` 是 max —— 一个自称有界、实际不设界的属性，比不设界更难发现，
+        # 因为查的人会停在「它在那儿」这一步。实测过一个真实形状：配额一度设在每个
+        # scope 上而不是 slice 上，一发一个上限，两发同时跑就是两份，总量仍然没有，
+        # 而当时所有读数都显示「有配额」。
+        #
+        # 不等：这不是一个会自己恢复的状态，它要么被改回来，要么一直是假的。
+        - alert: CognevaBuildSliceUnbounded
+          expr: max(build_containment_slice_unbounded) == 1
+          for: 10m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "资源管理"
+            severity: warning
+          annotations:
+            summary: "构建在一个没有配额的 cgroup slice 里（自称有界，实际 cpu.max 是 max）"
+            description: "宿主上那条 containment 读数（脚本名 `cogneva-host-build-containment-reading.sh`，不在本仓，在值守用的另一棵树里）印 `build_containment_slice_builds`（里头几发）与 `build_containment_quota_percent`（从那个 slice 的 `cpu.max` 读出来的百分比）。修法：给 slice 本身设总量，不是给每发设一份——`systemctl --user set-property --runtime cogneva-build.slice CPUQuota=<核数×75>%`（走构建闸包装 `cogneva-build.sh` 的构建每次自己会设）；或者把 `COGNEVA_BUILD_SLICE` 改回那一发真正有界的 slice。**不要**把这一条静音：静音之后剩下的读数仍然会说「在 slice 里」，而那正是它要防的谎。"
 
         # 任务面的两个发布者对不上：同一批任务，两条路径报出来的状态不同。判据是它们
         # 应当一致（同一份正本的两个投影），所以不一致本身就是缺陷，不需要等某个阈值。
