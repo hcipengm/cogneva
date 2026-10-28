@@ -39,9 +39,15 @@ fn read_days(raw: Option<&str>) -> Option<i64> {
 ///
 /// 给「0 是写坏了」的那一类旋钮：返回值永远是一个生效的保留天数，调用方不必处理
 /// 「没有天数」这一支。
+///
+/// 0 由**这里**挡住，不由 `min_days` 挡：`days > 0` 写在闸上，所以「0 落回默认」
+/// 是这个函数的承诺，而不是它与调用点传进来的下限之间的默契。一个允许「极小保留
+/// 期」的旋钮很自然会传 `min_days = 0`，那时若靠下限挡零，`Some(0)` 会原样通过，
+/// 于是每一趟清空这张表——正是这个函数名字里说要防的那件事，而编译与它自己的测试
+/// 都不会响。
 pub fn keep_days_or_default(raw: Option<&str>, default_days: i64, min_days: i64) -> i64 {
     match read_days(raw) {
-        Some(days) if days >= min_days => days,
+        Some(days) if days > 0 && days >= min_days => days,
         _ => default_days,
     }
 }
@@ -50,10 +56,13 @@ pub fn keep_days_or_default(raw: Option<&str>, default_days: i64, min_days: i64)
 ///
 /// 给「不扫」本身是一个正当状态的那一类旋钮。关掉之后读数照发——这张表现在有
 /// 多大、最老一行多旧，仍然答得出来，所以「关掉」不等于「不知道」。
+///
+/// 正数与下限的关系同上：`days > 0` 在这一层，负数与零都不会走到「按天数清扫」
+/// 那一支。
 pub fn keep_days_or_disable(raw: Option<&str>, default_days: i64, min_days: i64) -> Option<i64> {
     match read_days(raw) {
         Some(0) => None,
-        Some(days) if days >= min_days => Some(days),
+        Some(days) if days > 0 && days >= min_days => Some(days),
         _ => Some(default_days),
     }
 }
@@ -127,5 +136,15 @@ mod tests {
         assert_eq!(keep_days_or_default(Some("3"), DEFAULT, 3), 3);
         assert_eq!(keep_days_or_disable(Some("2"), DEFAULT, 3), Some(DEFAULT));
         assert_eq!(keep_days_or_disable(Some("3"), DEFAULT, 3), Some(3));
+    }
+
+    /// 零不是「下限恰好是 0 时的合法天数」：一个允许极小保留期的旋钮传
+    /// `min_days = 0` 时，零仍然落回默认（或者关掉），否则它是一张每趟被清空的表。
+    #[test]
+    fn a_zero_floor_does_not_let_zero_days_through() {
+        assert_eq!(keep_days_or_default(Some("0"), DEFAULT, 0), DEFAULT);
+        assert_eq!(keep_days_or_disable(Some("0"), DEFAULT, 0), None);
+        assert_eq!(keep_days_or_default(Some("-1"), DEFAULT, 0), DEFAULT);
+        assert_eq!(keep_days_or_disable(Some("-1"), DEFAULT, 0), Some(DEFAULT));
     }
 }
