@@ -68,6 +68,22 @@ fn canary_pod_verdict(line: &str, allow_pending: bool) -> Option<String> {
     None
 }
 
+/// 金丝雀的宽限期：新副本刚被 set image 时还在 `ContainerCreating`，这段
+/// not-ready 属正常，过了才算病。
+///
+/// 下面是「九十秒与看护期四分之一里较大的那个」，上面是看护期的四分之三。
+/// 那个上界不是凑数：宽限期一旦覆盖整个看护期，`allow_pending` 就永远是 true，
+/// 金丝雀这条腿一次 readiness 判断都不做——只剩等待态词表与重启次数还活着，
+/// 而 `ImagePullBackOff` 不在词表里（它属于「registry 此刻不服务」，不属于
+/// 「这个版本坏」），于是永远拉不到镜像的版本会一路绿灯。默认的 600 秒算出
+/// 150 秒，与上界不冲突；只有把 `COGNEVA_GITOPS_CANARY_WATCH_SECS` 调到 120 秒
+/// 以内才会碰到它。
+fn canary_grace(watch_secs: u64) -> Duration {
+    let floor = std::cmp::max(90, watch_secs / 4);
+    let ceiling = (watch_secs * 3) / 4;
+    Duration::from_secs(std::cmp::min(floor, ceiling))
+}
+
 /// Rule name for this process's own alert: a canary metric gate spent a whole
 /// watch without a reading, for a reason that traffic does not explain.
 ///
@@ -1181,7 +1197,7 @@ impl GitOpsPuller {
         let deadline = started + Duration::from_secs(watch_secs);
         // 宽限期：金丝雀刚 set image 时新副本还在 ContainerCreating，
         // not-ready 属正常；宽限过后仍不 ready 才算异常。
-        let grace = Duration::from_secs(std::cmp::max(90, watch_secs / 4));
+        let grace = canary_grace(watch_secs);
         // 参考点两侧同拍取，且装在同一个值里：只重取一侧就会让两侧的起算点分开，
         // 两个分位数描述的时间长度随即差一个数量级（旧副本已跑一整天、候选才几分
         // 钟），而这个差会静默地把闸门推宽或推窄。
@@ -2639,6 +2655,24 @@ mod tests {
                 "判词要点名是哪种等待态：{verdict}"
             );
         }
+    }
+
+    /// 宽限期必须短于看护期。宽限覆盖整段看护时 `allow_pending` 恒为真，
+    /// 金丝雀就不再做 readiness 判断，而拉取失败不在判死的词表里——一个永远
+    /// 拉不到镜像的版本会一路绿灯。默认 600 秒算 150 秒，碰不到上界；只有把
+    /// 那个 knob 调到 120 秒以内才会碰到，所以这条界要在没有集群时钉住。
+    #[test]
+    fn the_grace_never_covers_the_whole_watch() {
+        for watch in [1u64, 30, 60, 90, 120, 300, 600, 3600] {
+            let grace = canary_grace(watch);
+            assert!(
+                grace < Duration::from_secs(watch),
+                "watch={watch} 的宽限是 {grace:?}：整段看护都在宽限里，金丝雀一次 readiness 判断都不做"
+            );
+        }
+        // 上界不该改变大窗口下的量纲。
+        assert_eq!(canary_grace(600), Duration::from_secs(150));
+        assert_eq!(canary_grace(3600), Duration::from_secs(900));
     }
 
     /// 重启次数与 ready 是另外两条界，与那张词表无关。
