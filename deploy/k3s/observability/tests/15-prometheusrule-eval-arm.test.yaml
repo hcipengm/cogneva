@@ -1,0 +1,116 @@
+# promtool 规则单测：评测臂那两条判词**真的会 firing**，而且**只在它要抓的局面里**。
+#
+# 为什么要有这一层：这两条规则读的是两条此前没有消费者的读数（`eval_judged_cases`、
+# `eval_bench_cases`）。没有这一层，它们与「写了一个永远不响的表达式」在读数上完全一样：
+# 把 `changes(...) == 0` 写成 `>= 0`（恒真）、把 `for:` 写成 `15y`、把比值界写成 `>= 0`，
+# 结构门全都绿。这里让 Prometheus 自己的规则引擎跑一遍，每一格都带一份反向证据。
+#
+# 反向证据分三种，因为「什么时候不该响」有三种：
+#   * 池子关着（`eval_pool_available=0`）——已知原因，不是新故障；
+#   * 已判数在涨——它在干活；
+#   * 用例数为 0——那个比值是 0/0，不是「一个都没丢」。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/15-prometheusrule-host-readings.yaml \
+#         deploy/k3s/observability/tests/15-prometheusrule-eval-arm.test.yaml
+#
+# `rule_files` 这一行由跑者重写：promtool 只认裸的 `groups:`，不认 PrometheusRule 这个
+# CRD。它从**清单本身**抽出 `spec.groups` 再改指过去——规则只有一份，测试读的就是它。
+rule_files:
+  - ../manifests/15-prometheusrule-host-readings.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、池开着、还差着题、24 小时一题没涨 ⇒ `for: 1h` 之后必须响。
+  - interval: 1m
+    input_series:
+      - series: 'eval_pool_available'
+        values: '1x200'
+      - series: 'eval_judged_remaining'
+        values: '193x200'
+      - series: 'eval_judged_cases'
+        values: '5x200'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaEvalJudgedStalled
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: CognevaEvalJudgedStalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "商用交付"
+
+  # 二、负对照：池子关着。不涨是已知原因（`verdict=blocked-on-pool` 自己说了），
+  # 报它等于把已知状况当新故障——2026-10-22 起到 11-04 池子实测关了八天。
+  - interval: 1m
+    input_series:
+      - series: 'eval_pool_available'
+        values: '0x200'
+      - series: 'eval_judged_remaining'
+        values: '193x200'
+      - series: 'eval_judged_cases'
+        values: '5x200'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: CognevaEvalJudgedStalled
+        exp_alerts: []
+
+  # 三、负对照：已判数每分钟 +1。这一格抓的是 `changes(...) == 0` 被写成恒真——没有它，
+  # 「在涨」与「停住」在夹具上分不开。
+  - interval: 1m
+    input_series:
+      - series: 'eval_pool_available'
+        values: '1x200'
+      - series: 'eval_judged_remaining'
+        values: '193x200'
+      - series: 'eval_judged_cases'
+        values: '0+1x200'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: CognevaEvalJudgedStalled
+        exp_alerts: []
+
+  # 四、归不到基准的用例超过一成 ⇒ `for: 2h` 之后必须响，之前不许响。
+  - interval: 1m
+    input_series:
+      - series: 'eval_bench_cases'
+        values: '10x200'
+      - series: 'eval_bench_unattributed'
+        values: '3x200'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: CognevaEvalBenchCasesUnattributed
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: CognevaEvalBenchCasesUnattributed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "可评估"
+
+  # 五、负对照：一条都归得上（0/10）。这一格抓的是比值界被写成 `>= 0`。
+  - interval: 1m
+    input_series:
+      - series: 'eval_bench_cases'
+        values: '10x200'
+      - series: 'eval_bench_unattributed'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: CognevaEvalBenchCasesUnattributed
+        exp_alerts: []
+
+  # 六、负对照：这一段还没跑过（用例数 0，`eval_bench_unattributed` 缺席）。0/0 不是
+  # 「一个都没丢」，这一格不许响。
+  - interval: 1m
+    input_series:
+      - series: 'eval_bench_cases'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: CognevaEvalBenchCasesUnattributed
+        exp_alerts: []

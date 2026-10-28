@@ -706,6 +706,55 @@ spec:
             summary: "有 {{ $value }} 条原则载体声明已落，账上查不到落地行"
             description: "原则载体（`memory/` 里带 `# principle:` 行的那一份）声明了这个 slug 已落地，而账本里没有它落地的行。两种修法：载体说错了就改载体，账漏了就把落地行补上——不要为了消红去改账上的状态。逐条点名跑 `bash scripts/host/cogneva-principle-census-reading.sh`。"
 
+    # 评测臂：`eval_judged_cases` 与 `eval_bench_cases` 一直是两条**没有消费者**的读数
+    # ——每拍都在发、面表拿它当首读数，而没有任何规则、面板或代码读它们（2026-10-28
+    # 逐面量过：13 个面里没读者的就是这两个）。后果不是抽象的：`judged=0/198` 从 2026-10-19
+    # 起停了八天，读数面一切正常，没有任何人被告知。这两条规则就是那两条读数的消费者。
+    #
+    # 分两条而不是一条，因为修法完全不同：一条问「池子开着、题还剩着，为什么一行都不涨」
+    # （泵坏了），另一条问「判出来的用例有多少归不到任何一个基准上」（尺子坏了——归不上的
+    # 那些行不是某个基准的 0 分，是这一面看不见的行）。
+    - name: cogneva-eval-arm
+      rules:
+        # 池子开着、还差着题、24 小时内已判数一个都没涨。三个条件缺一不可：
+        #   * 池子关着时「不涨」是已知原因，报它等于把已知状况当新故障（2026-10-22 起到
+        #     11-04 实测：池 `available=0` 连续八天，`verdict=blocked-on-pool` 自己说出了原因）；
+        #   * 题判完了（`remaining=0`）时不涨是对的；
+        #   * 24 小时是「一次滚动 + 一轮评测」的量级，短了会把正常的慢轮报成卡死。
+        # `changes()` 读的是这一格自己有没有变过，而不是它跟谁比——判据只有一条：涨了没有。
+        # 三个叶子各自 `max()` 包一层：告警身份是「规则名 + 返回序列的标签」，不加就会把
+        # 报信那条序列的 pod/container 带进身份，同一个状况每滚一次重建就是一条新告警。
+        - alert: CognevaEvalJudgedStalled
+          expr: |
+            max(eval_pool_available) == 1
+              and max(eval_judged_remaining) > 0
+              and max(changes(eval_judged_cases[24h])) == 0
+          for: 1h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "商用交付"
+            severity: warning
+          annotations:
+            summary: "评测池开着、还差 {{ $value }} 题，24 小时里已判数一题没涨"
+            description: "`eval_judged_cases` 是这一面的首读数，24 小时内没有变化，而池子报 `eval_pool_available=1`、还差着题。先看 `eval_last_progress_age_seconds` 与 `eval_runs_by_outcome`：`flat-stalled` 涨说明轮次起得来但中途停住，`flat-fast` 涨说明起不来（网关 503、镜像拉不到），`flat-incomplete` 说明有基准接不上。逐轮看 `eval_verdict` 的成因，再动手。读数：`bash scripts/host/eval-evidence-reading.sh`。"
+
+        # 归不到基准上的用例超过一成。守的是「得分」这一格的诚实边界：`eval_bench_score`
+        # 的分母是已判数，归不到基准的那些行两边都不在——它们不会让任何基准变红，只会让
+        # 这一面在读数上显得比实际干净。`eval_bench_cases > 0` 是它的在场证明：0 个用例时
+        # 这个比值是 0/0，不是「一个都没丢」。
+        - alert: CognevaEvalBenchCasesUnattributed
+          expr: |
+            max(eval_bench_cases) > 0
+              and max(eval_bench_unattributed) / max(eval_bench_cases) > 0.1
+          for: 2h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "可评估"
+            severity: warning
+          annotations:
+            summary: "{{ $value }} 的用例归不到任何一个基准上"
+            description: "`eval_bench_unattributed / eval_bench_cases` 超过一成：这些行不进任何基准的得分，也不进任何基准的失败，两个方向都看不见。查：评测轮那一侧的基准名与检查点里的 `scaffold`/`benchmark` 字段是不是同一套写法（改名、大小写、前缀都会让归并落空）。读数：`bash scripts/host/eval-evidence-reading.sh` 的 `bench_unattributed=`。"
+
     # 端到端十环：一笔变更从被提出到用户真的用上它。这一族此前一条规则都没有，
     # 而它恰恰是最不能靠肉眼的一族——2026-10-20 与 2026-10-22 两次实测都是「每一环
     # 各自的尺子都合格，整条链却断了」：主线上没有对应镜像（第 3 环），部署器最后
