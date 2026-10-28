@@ -32,9 +32,15 @@ pub fn read(path: &Path) -> String {
 }
 
 pub fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
+    // 读不出来就 panic：递归遍历里跳过一个子目录不会让任何断言变红，而剩下的那份
+    // 普查往往仍高于下限——「少读了一块」与「那一块都合规」在判词上分不开。
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| {
+        panic!(
+            "{} 读不出来（{e}）：这棵树的普查面少了一块，而用剩下的那份判出来的\
+             结论与「整片区都合规」同形",
+            dir.display()
+        )
+    });
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -111,37 +117,82 @@ pub fn normalize(raw: &str) -> String {
     out
 }
 
-/// `pub const NAME: &str = "..."` values in the crate that declares routes.
-pub fn core_path_constants(root: &Path) -> BTreeMap<String, String> {
+/// `NAME: &str = "..."` declarations, by name, from every crate's production
+/// source.
+///
+/// A `.route(SOME_PATH, …)` call names its path indirectly, so this table is
+/// what turns the registration into a shape. A name the table does not carry
+/// contributes no route at all -- the path drops out of the served set without
+/// a word, and every reader downstream then answers about a tree that registers
+/// fewer paths than it does.
+///
+/// The population is every crate rather than the one crate this reader was
+/// first written against. The constant a route names may sit beside the route:
+/// the gateway declares `pub(crate) const INTERNAL_…_PATH` in the very module
+/// that registers it, and a reader walking one hardcoded crate path dropped
+/// that registration silently. Walking `crates/` instead means the population
+/// is the tree's own crate list, which is also why a fixture tree needs no
+/// invented `cog-core`.
+///
+/// Two cuts keep that widening from making the table say something false:
+/// `#[cfg(test)]` items are skipped (a fixture may declare a same-named
+/// constant with a fake path), and a name two crates give different values is
+/// dropped rather than resolved to whichever crate the walk reached last --
+/// an ambiguous name is not a resolution, and a route that loses it shows up as
+/// a path with nothing serving it, which is loud, rather than as a plausible
+/// wrong shape, which is not.
+pub fn path_constants(root: &Path) -> BTreeMap<String, String> {
+    let crates = root.join("crates");
+    let entries = std::fs::read_dir(&crates).unwrap_or_else(|e| {
+        panic!(
+            "{} 读不出来（{e}）：路由常量的普查面是这棵树的全部 crate，\
+             少读一个 crate 就是一批 .route(CONST) 悄悄不再算作一条路由",
+            crates.display()
+        )
+    });
     let mut files = Vec::new();
-    walk(&root.join("crates/cog-core/src"), &["rs"], &mut files);
-    let mut constants = BTreeMap::new();
-    for path in files {
-        let text = read(&path);
-        for line in text.lines() {
-            let Some(at) = line.find("pub const ") else {
-                continue;
-            };
-            let rest = &line[at + "pub const ".len()..];
-            let Some((name, tail)) = rest.split_once(':') else {
-                continue;
-            };
-            if !tail.trim_start().starts_with("&str = \"") {
-                continue;
-            }
-            let Some(start) = tail.find('"') else {
-                continue;
-            };
-            let Some(end) = tail[start + 1..].find('"') else {
-                continue;
-            };
-            constants.insert(
-                name.trim().to_string(),
-                tail[start + 1..start + 1 + end].to_string(),
-            );
+    for entry in entries.flatten() {
+        let src = entry.path().join("src");
+        // A crate without `src` declares no source, so it carries no constant.
+        // This is a property of the tree, not a failed read: `crates/` itself
+        // being unreadable is the panic above.
+        if src.is_dir() {
+            walk(&src, &["rs"], &mut files);
         }
     }
-    constants
+    let mut declared: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for path in files {
+        let text = read(&path);
+        for line in super::rust_production::production_lines(&text) {
+            if let Some((name, value)) = const_path(line) {
+                declared.entry(name).or_default().insert(value);
+            }
+        }
+    }
+    declared
+        .into_iter()
+        .filter_map(|(name, mut values)| {
+            if values.len() == 1 {
+                values.pop_first().map(|value| (name, value))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// `NAME` and the literal in `<vis> const NAME: &str = "…"`.
+fn const_path(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("pub(crate) const ")
+        .or_else(|| trimmed.strip_prefix("pub(super) const "))
+        .or_else(|| trimmed.strip_prefix("pub const "))
+        .or_else(|| trimmed.strip_prefix("const "))?;
+    let (name, tail) = rest.split_once(':')?;
+    let value = tail.trim_start().strip_prefix("&str = \"")?;
+    let end = value.find('"')?;
+    Some((name.trim().to_string(), value[..end].to_string()))
 }
 
 /// One `.route(path, ...)` registration: the shape, the verbs it answers, and
@@ -219,7 +270,7 @@ pub fn route_entries(root: &Path) -> Vec<Route> {
 /// sends, where an extra served path only makes the answer more lenient, and
 /// changing that would change what those gates judge.
 pub fn route_entries_in(root: &Path, files: &[PathBuf], production_only: bool) -> Vec<Route> {
-    let constants = core_path_constants(root);
+    let constants = path_constants(root);
     let mut routes = Vec::new();
     for path in files {
         let text = read(path);
@@ -390,4 +441,109 @@ pub fn strip_comments(text: &str) -> String {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("a file has a parent")).expect("dir");
+        std::fs::write(&path, body).expect("write");
+    }
+
+    fn shapes(root: &Path) -> Vec<String> {
+        route_entries(root).into_iter().map(|r| r.shape).collect()
+    }
+
+    /// 常量声明在路由旁边时，那条路由仍然是一条路由。
+    ///
+    /// 这张表曾经只走一个写死的 crate 路径（`crates/cog-core/src`）。网关把几个
+    /// 路径常量声明在自己的模块里（`pub(crate) const INTERNAL_…_PATH`），于是那些
+    /// `.route(CONST)` 无声地从「服务过的路径」里消失——判据读到的是一棵比实际注册
+    /// 得更少的树。普查面现在取这棵树自己的 crate 列表，夹具树也不必再凭空造一个
+    /// 它没写过的 `cog-core`。
+    #[test]
+    fn a_constant_declared_beside_its_route_still_names_the_route() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        write(
+            root,
+            "crates/cog-gateway/src/lib.rs",
+            "pub(crate) const INTERNAL_STATUS_PATH: &str = \"/internal/status\";\n\
+             pub fn router() -> Router {\n\
+                 Router::new().route(INTERNAL_STATUS_PATH, post(status))\n\
+             }\n",
+        );
+        assert_eq!(shapes(root), vec!["/internal/status".to_string()]);
+    }
+
+    /// 两个 crate 给同一个名字两个取值时，那不是一次解析。名字整个不算，它那条
+    /// 路由就落到「没有东西服务这个路径」里——红，且点得出是哪个路径——而不是
+    /// 解析成遍历先后决定的那个值。
+    #[test]
+    fn a_name_two_crates_disagree_on_is_not_resolved() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        write(
+            root,
+            "crates/cog-one/src/lib.rs",
+            "pub const SHARED_PATH: &str = \"/api/v1/one\";\n",
+        );
+        write(
+            root,
+            "crates/cog-two/src/lib.rs",
+            "pub const SHARED_PATH: &str = \"/api/v1/two\";\n",
+        );
+        write(
+            root,
+            "crates/cog-gateway/src/lib.rs",
+            "pub fn router() -> Router {\n\
+                 Router::new().route(SHARED_PATH, get(shared))\n\
+             }\n",
+        );
+        assert!(
+            shapes(root).is_empty(),
+            "重名常量被解析成了 {:?}——遍历顺序决定了路由的形状",
+            shapes(root)
+        );
+    }
+
+    /// `#[cfg(test)]` 里的常量是夹具自己的路径，不是程序注册的。放它进来，一条
+    /// 真路由就会被解析成假路径，而那条假路径恰好也「服务过」。
+    #[test]
+    fn a_constant_inside_a_test_module_is_not_resolved() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path();
+        write(
+            root,
+            "crates/cog-gateway/src/lib.rs",
+            "pub fn router() -> Router {\n\
+                 Router::new().route(FIXTURE_PATH, get(fixture))\n\
+             }\n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+                 pub const FIXTURE_PATH: &str = \"/fixture/only\";\n\
+             }\n",
+        );
+        assert!(
+            shapes(root).is_empty(),
+            "夹具里的常量被当成了程序声明的路径: {:?}",
+            shapes(root)
+        );
+    }
+
+    /// `crates/` 读不出来时这张表必须炸：空表不会让任何断言变红，它只会让一批
+    /// `.route(CONST)` 悄悄退出「服务过的路径」。
+    #[test]
+    fn a_crates_directory_that_cannot_be_read_is_refused() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("no-crates-here");
+        let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| path_constants(&root)));
+        assert!(
+            got.is_err(),
+            "没有 crates/ 的树交出了一张空常量表，判据照旧往下走"
+        );
+    }
 }

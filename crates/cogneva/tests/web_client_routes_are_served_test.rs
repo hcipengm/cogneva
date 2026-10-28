@@ -336,6 +336,10 @@ fn the_method_reader_sees_the_call_shapes_this_tree_writes() {
     let dir = tempfile::tempdir().expect("temp dir");
     let root = dir.path();
     std::fs::create_dir_all(root.join("web/src")).expect("client dir");
+    // 这份夹具只造客户端那一半，网关的内嵌页面那一半是**空目录**而不是不存在：
+    // 读者对这两个面各走一次递归，「这个面读不出来」与「这个面一个文件都没有」
+    // 在它眼里同一件事，而后者正是这棵树的事实。
+    std::fs::create_dir_all(root.join("crates/cog-gateway/src")).expect("gateway dir");
     std::fs::write(
         root.join("web/src/calls.ts"),
         "// 名单、对话都走 `/api/v1/agents`\n\
