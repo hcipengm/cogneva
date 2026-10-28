@@ -16,7 +16,12 @@
 //! leaves every other one silently wrong, and the next one written by hand will
 //! be wrong again unless something looks at the shape.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+#[path = "../../cogneva/tests/common/rust_production.rs"]
+mod rust_production;
+
+use rust_production::{production_sources, relative_name};
 
 /// The statement that must never follow `record_learning`.
 const BUMP: &str = "update_recurrence(";
@@ -25,37 +30,35 @@ const BUMP: &str = "update_recurrence(";
 const WRITE: &str = "record_learning(";
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("crate lives at <root>/crates/cog-reflection")
         .to_path_buf()
 }
 
-/// Every `.rs` file under the crate's `src/`, recursively.
+/// This crate's shipping sources: the shared census, cut down to the crate.
 fn source_files() -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
-            let path = entry.expect("readable dir entry").path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
-    let mut files = Vec::new();
-    walk(
-        &workspace_root().join("crates/cog-reflection/src"),
-        &mut files,
+    let root = workspace_root();
+    let prefix = format!(
+        "{}/",
+        relative_name(&root, &root.join("crates/cog-reflection/src"))
     );
-    files.sort();
-    files
+    production_sources(&root)
+        .into_iter()
+        .filter(|path| relative_name(&root, path).starts_with(&prefix))
+        .collect()
 }
 
 /// Everything up to the first test-only item. A fixture that stores a learning
 /// and bumps it in a different order is not a call site the engine runs.
-fn production_source(text: &str) -> &str {
+///
+/// Not the shared `production_text`: that one drops comment lines and fixture
+/// items, which shifts every line number after the first one -- and this gate
+/// reports `file:line`, so a finding would point at the wrong statement. A slice
+/// keeps the numbering, so the two cannot share, and the name says which one
+/// this is.
+fn up_to_the_first_fixture(text: &str) -> &str {
     let cut = text
         .match_indices("#[cfg(test)]")
         .chain(text.match_indices("mod tests"))
@@ -72,7 +75,7 @@ fn production_source(text: &str) -> &str {
 /// invariant names both calls, and pairing off a doc comment would make every
 /// correctly written site look like a defect.
 fn bump_after_write_lines(text: &str) -> Vec<usize> {
-    let code: Vec<(usize, &str)> = production_source(text)
+    let code: Vec<(usize, &str)> = up_to_the_first_fixture(text)
         .lines()
         .enumerate()
         .map(|(i, line)| (i + 1, line.trim()))

@@ -20,10 +20,20 @@
 //! 计数口径（复现方式就是跑本测试，或跑同一段遍历）：`crates/*/src/**/*.rs` 里
 //! `reqwest::Client::new()` 与 `reqwest::Client::builder()` 的出现次数，去掉
 //! `#[cfg(test)]` 项与注释行。
+//!
+//! 那份人口与「哪一半是生产代码」两条规则不在本文件里写第二遍：它们来自
+//! `crates/cogneva/tests/common/rust_production.rs`，本文件按路径把它编进来。
+//! 抄一份的代价不是多几行——是这份抄件与正本分叉的那天，本门读到的位点数会变，
+//! 而「读到的少了」与「本来就没有」在读数上同形。
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+#[path = "../../cogneva/tests/common/rust_production.rs"]
+mod rust_production;
+
+use rust_production::{production_sources, production_text, relative_name};
 
 /// 豁免：不进表，因为在这里手工构造正是对的。每一条都要给出理由，理由不成立的
 /// 时候这一行就该消失。只有一条，因为「正当性」在这里是例外而不是常态：连安装器
@@ -57,82 +67,28 @@ const COUNTED: &[(&str, usize)] = &[
 ];
 
 fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .canonicalize()
         .expect("cog-net lives in crates/, so ../.. is the workspace root")
 }
 
-fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rust_files(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
-/// 去掉 `#[cfg(test)]` 标注的那一整项之后剩下的行号与行内容。
-fn production_lines(text: &str) -> Vec<(usize, String)> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < lines.len() {
-        if lines[i].trim() == "#[cfg(test)]" {
-            let mut depth: i32 = 0;
-            let mut opened = false;
-            let mut j = i + 1;
-            while j < lines.len() {
-                let code = lines[j].split("//").next().unwrap_or("");
-                depth += code.matches('{').count() as i32;
-                depth -= code.matches('}').count() as i32;
-                opened |= code.contains('{');
-                if opened && depth <= 0 {
-                    break;
-                }
-                j += 1;
-            }
-            i = j + 1;
-            continue;
-        }
-        out.push((i + 1, lines[i].to_string()));
-        i += 1;
-    }
-    out
-}
-
 fn counted_sites() -> BTreeMap<String, usize> {
     let root = workspace_root();
-    let mut files = Vec::new();
-    rust_files(&root.join("crates"), &mut files);
 
     let mut counts = BTreeMap::new();
-    for path in files {
-        // 只看每个 crate 的 src/：测试目录与 build script 不是生产路径。
-        let rel = path
-            .strip_prefix(&root)
-            .expect("walked path is under the root")
-            .to_string_lossy()
-            .to_string();
-        if !rel.contains("/src/") {
-            continue;
-        }
+    for path in production_sources(&root) {
+        let rel = relative_name(&root, &path);
         if EXEMPT.iter().any(|(p, _)| rel == *p || rel.starts_with(p)) {
             continue;
         }
         let Ok(text) = fs::read_to_string(&path) else {
             continue;
         };
+        // 生产那一半：注释行与 `#[cfg(test)]` 项都不在里面，两种排除都在共享的
+        // 那一份里，本文件不重新判一次。
         let mut n = 0;
-        for (_, line) in production_lines(&text) {
-            if line.trim_start().starts_with("//") {
-                continue;
-            }
+        for line in production_text(&text).lines() {
             n += line.matches("reqwest::Client::new()").count();
             n += line.matches("reqwest::Client::builder()").count();
         }

@@ -34,6 +34,12 @@ use std::path::{Path, PathBuf};
 
 use cog_reflection::build_gate::{BUILD_GATE_ASKERS, BUILD_GATE_ASKER_UNNAMED};
 
+/// 人口与「哪一半是生产代码」都取自同一份普查，本文件不写第二遍。
+#[path = "../../cogneva/tests/common/rust_production.rs"]
+mod rust_production;
+
+use rust_production::{production_sources, production_text};
+
 /// The openings a call site asks through, as the text each one starts with.
 ///
 /// The three `try_*` names are matched bare as well as under the module: the
@@ -70,39 +76,24 @@ const ASKING_CALLS: [&str; 4] = [
 /// word this table lists -- and that check is what makes the copy stay true.
 const OUTSIDE_TREE_ASKS: [&str; 1] = ["host build"];
 
-/// The source root of every workspace crate, which is where a production call
-/// site can be.
-fn crates_root() -> PathBuf {
+/// The workspace root: the crates directory's parent.
+fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("a crate lives inside the crates directory")
+        .ancestors()
+        .nth(2)
+        .expect("crate lives at <root>/crates/cog-reflection")
         .to_path_buf()
-}
-
-/// Every `.rs` file under `dir`, at any depth.
-fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rust_sources(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
 }
 
 /// The words each production call site in `text` asks under.
 ///
-/// Everything after the first `#[cfg(test)]` is dropped: the asks below are the
-/// ones a running process makes, and the test modules ask as themselves.
+/// `text` is the production half only: the asks that count are the ones a
+/// running process makes, and the test modules ask as themselves. Which bytes
+/// those are is decided by [`production_text`], not here.
 fn asking_words(text: &str) -> Vec<&str> {
-    let code = text.split("#[cfg(test)]").next().unwrap_or(text);
     let mut out = Vec::new();
     for call in ASKING_CALLS {
-        let mut rest = code;
+        let mut rest = text;
         while let Some(at) = rest.find(call) {
             let after = &rest[at + call.len()..];
             let Some(end) = after.find('"') else {
@@ -117,24 +108,10 @@ fn asking_words(text: &str) -> Vec<&str> {
 
 #[test]
 fn every_ask_the_build_gate_refuses_lands_in_a_named_cell() {
-    let crates = crates_root();
-    let mut files: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(&crates)
-        .expect("the crates directory is there")
-        .flatten()
-    {
-        let source = entry.path().join("src");
-        if source.is_dir() {
-            rust_sources(&source, &mut files);
-        }
-    }
-    // The denominator first: a walk that silently found nothing would make every
-    // assertion below true.
-    assert!(
-        files.len() > 200,
-        "只扫到 {} 个源文件，扫描面塌了：这条判据的分母是它",
-        files.len()
-    );
+    // The denominator is the census's own: production_sources refuses a tree it
+    // read almost none of, so a walk that silently found nothing cannot reach
+    // the assertions below.
+    let files = production_sources(&workspace_root());
 
     let named: Vec<&str> = BUILD_GATE_ASKERS.iter().map(|(words, _)| *words).collect();
     assert!(
@@ -148,7 +125,7 @@ fn every_ask_the_build_gate_refuses_lands_in_a_named_cell() {
         let Ok(text) = fs::read_to_string(path) else {
             continue;
         };
-        for words in asking_words(&text) {
+        for words in asking_words(&production_text(&text)) {
             if !named.contains(&words) {
                 unnamed_sites.push(format!("{}: {words:?}", path.display()));
             }

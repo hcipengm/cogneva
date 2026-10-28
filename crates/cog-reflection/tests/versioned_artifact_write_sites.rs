@@ -15,7 +15,14 @@
 //! the driver is still enabled by default.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+
+/// The census and the production-only cut come from the same place every other
+/// gate reads them from -- a copy of 「which files ship」 and of 「where the
+/// fixtures start」 is a second answer that drifts without saying so.
+#[path = "../../cogneva/tests/common/rust_production.rs"]
+mod rust_production;
+
+use rust_production::{production_sources, production_text, relative_name};
 
 /// How a versioned artifact gets written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,68 +95,23 @@ const WRITE_SITES: &[WriteSite] = &[
     },
 ];
 
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
         .expect("crate lives at <root>/crates/cog-reflection")
         .to_path_buf()
 }
 
-/// Everything up to the first test-only item. Occurrences inside test modules
-/// are fixtures, not production write paths, so the gate stops reading there.
-fn production_source(text: &str) -> &str {
-    let cut = text
-        .match_indices("#[cfg(test)]")
-        .chain(text.match_indices("mod tests"))
-        .map(|(i, _)| i)
-        .min()
-        .unwrap_or(text.len());
-    &text[..cut]
-}
-
-fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            if path.file_name().is_some_and(|n| n == "target") {
-                continue;
-            }
-            rust_sources(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-}
-
 fn files_calling_the_write_api() -> BTreeSet<String> {
     let root = workspace_root();
     let mut found = BTreeSet::new();
-    for crate_dir in std::fs::read_dir(root.join("crates"))
-        .expect("workspace has a crates directory")
-        .flatten()
-    {
-        let src = crate_dir.path().join("src");
-        if !src.is_dir() {
+    for path in production_sources(&root) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
-        }
-        let mut sources = Vec::new();
-        rust_sources(&src, &mut sources);
-        for path in sources {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if calls_the_write_api(production_source(&text)) {
-                let relative = path
-                    .strip_prefix(&root)
-                    .expect("scanned path is under the workspace root")
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                found.insert(relative);
-            }
+        };
+        if calls_the_write_api(&production_text(&text)) {
+            found.insert(relative_name(&root, &path));
         }
     }
     found
@@ -181,7 +143,7 @@ fn every_versioned_artifact_write_site_is_classified() {
         let text = std::fs::read_to_string(root.join(site.file))
             .unwrap_or_else(|e| panic!("{}: {e}", site.file));
         assert!(
-            production_source(&text).contains(site.evidence),
+            production_text(&text).contains(site.evidence),
             "{} is classified {:?} because of `{}`, which is no longer there",
             site.file,
             site.trigger,
