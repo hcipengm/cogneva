@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::routes::strip_comments;
+use common::lex::{strip, Dialect};
 
 use common::routes::repo_root;
 
@@ -397,7 +397,7 @@ fn declared_variants(root: &Path, file: &str, name: &str) -> Vec<String> {
     let close = matching(b, open, b'{', b'}').expect("enum body is not closed");
     // 文档注释里的散文与 `{` 都不是声明：先剥注释再按顶层逗号切，否则
     // 「一句带 `{` 的注释」会把后面的散文读成变体。
-    let body = strip_comments(&text[open + 1..close]);
+    let body = strip(&text[open + 1..close], Dialect::Rust);
 
     let bytes = body.as_bytes();
     let mut out = Vec::new();

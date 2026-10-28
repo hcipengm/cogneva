@@ -27,8 +27,16 @@ use std::path::{Path, PathBuf};
 #[allow(clippy::duplicate_mod)]
 #[path = "fsio.rs"]
 mod fsio;
+// The same arrangement for the source lexer: inside `tests/common/` it is
+// already mounted as `common::lex`, and on a crate root it has to be compiled
+// here because there is no `common` to reach for.
+#[allow(clippy::duplicate_mod)]
+#[path = "lex.rs"]
+mod lex;
 
 use self::fsio::walk_files;
+
+pub use self::lex::BraceShape;
 
 /// 一次普查至少该读到多少个生产源文件。
 ///
@@ -200,178 +208,21 @@ pub fn opens_test_module(line: &str) -> bool {
         || trimmed.starts_with("pub mod tests")
 }
 
-/// One line's brace shape: how the nesting changes, and whether a `{` opened.
-#[derive(Clone, Copy, Default)]
-pub struct BraceShape {
-    pub delta: i32,
-    pub opens: bool,
-}
-
 /// Per-line brace shapes for a whole file, carrying string, character-literal
 /// and comment state across the newlines.
+///
+/// The scanner itself is [`lex::scan`], shared with the fixtures that strip
+/// comments: the two used to be separate readers of the same bytes, and the
+/// comment-stripping one did not know raw strings or lifetimes. One of them was
+/// therefore wrong about where a string ends, and nothing compared them.
 ///
 /// Counting each line on its own is not enough. A fixture string spans lines --
 /// `"suggestions":[]}"#,` closes a raw string opened four lines above -- and the
 /// `}` inside that text would end a skipped item early, after which the rest of
 /// the test module reads as production. Over-reading is noisy; under-reading is
 /// silent, and only one of those is a gate.
-///
-/// Three things that look like nesting and are not: braces inside string or
-/// character literals, and a `'` that is a lifetime (`&'a str`) rather than the
-/// opening of `'{'`. A character literal's closing quote is the next quote
-/// within a few bytes; a lifetime's is not.
 pub fn brace_shapes(text: &str) -> Vec<BraceShape> {
-    let b = text.as_bytes();
-    let mut out: Vec<BraceShape> = Vec::new();
-    let mut shape = BraceShape::default();
-    let mut i = 0;
-    let mut block_comment = 0usize;
-    let mut string = false;
-    let mut raw_hashes: Option<usize> = None;
-    while i < b.len() {
-        let c = b[i];
-        if c == b'\n' {
-            out.push(shape);
-            shape = BraceShape::default();
-            i += 1;
-            continue;
-        }
-        if block_comment > 0 {
-            if c == b'/' && b.get(i + 1) == Some(&b'*') {
-                block_comment += 1;
-                i += 2;
-                continue;
-            }
-            if c == b'*' && b.get(i + 1) == Some(&b'/') {
-                block_comment -= 1;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if let Some(hashes) = raw_hashes {
-            if c == b'"' {
-                let mut j = i + 1;
-                let mut seen = 0;
-                while seen < hashes && b.get(j) == Some(&b'#') {
-                    seen += 1;
-                    j += 1;
-                }
-                if seen == hashes {
-                    raw_hashes = None;
-                    i = j;
-                    continue;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        if string {
-            if c == b'\\' {
-                // A backslash that ends the line continues the string: let the
-                // newline below emit the line boundary, or every later line's
-                // shape is reported one line early. `\` + CR + LF is the same
-                // continuation.
-                //
-                // What decides is the byte *after* the backslash, never the one
-                // after that: a backslash always escapes exactly the character
-                // next to it. Reading a byte further out swallows an escaped
-                // quote that ends a line (`value: \"1\"`), and the `"` right
-                // there is then taken for the string's end -- every line below
-                // it is read as code, braces and quotes included.
-                if b.get(i + 1) == Some(&b'\n') || b.get(i + 1) == Some(&b'\r') {
-                    i += 1;
-                } else {
-                    i += 2;
-                }
-                continue;
-            }
-            if c == b'"' {
-                string = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            b'/' if b.get(i + 1) == Some(&b'/') => {
-                while i < b.len() && b[i] != b'\n' {
-                    i += 1;
-                }
-                continue;
-            }
-            b'/' if b.get(i + 1) == Some(&b'*') => {
-                block_comment = 1;
-                i += 2;
-                continue;
-            }
-            b'"' => {
-                string = true;
-                i += 1;
-                continue;
-            }
-            b'\'' => {
-                // Past the backslash an escape covers **two** bytes, the
-                // backslash and the character it escapes: stopping after the
-                // backslash leaves `j` sitting on the escaped quote, so a
-                // literal like `'\''` closes on its own escape and every quote
-                // or brace after it on the same line reads as code.
-                let mut j = i + 1;
-                if b.get(j) == Some(&b'\\') {
-                    j += 2;
-                }
-                let mut close = None;
-                while j < b.len() && j <= i + 5 {
-                    if b[j] == b'\'' {
-                        close = Some(j);
-                        break;
-                    }
-                    j += 1;
-                }
-                i = match close {
-                    Some(at) => at + 1,
-                    None => i + 1,
-                };
-                continue;
-            }
-            b'r' | b'b' | b'c' => {
-                let mut j = i + 1;
-                if b.get(j) == Some(&b'"') {
-                    string = true;
-                    i = j + 1;
-                    continue;
-                }
-                if c == b'b' || c == b'c' {
-                    if b.get(j) != Some(&b'r') {
-                        i += 1;
-                        continue;
-                    }
-                    j += 1;
-                }
-                let mut hashes = 0;
-                while b.get(j) == Some(&b'#') {
-                    hashes += 1;
-                    j += 1;
-                }
-                if b.get(j) == Some(&b'"') {
-                    raw_hashes = Some(hashes);
-                    i = j + 1;
-                    continue;
-                }
-                i += 1;
-                continue;
-            }
-            b'{' => {
-                shape.delta += 1;
-                shape.opens = true;
-            }
-            b'}' => shape.delta -= 1,
-            _ => {}
-        }
-        i += 1;
-    }
-    out.push(shape);
-    out
+    lex::scan(text, lex::Dialect::Rust).lines
 }
 
 /// One line's brace delta, for the scanner's own tests.

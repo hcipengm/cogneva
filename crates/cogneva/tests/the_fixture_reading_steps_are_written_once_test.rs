@@ -56,7 +56,8 @@ mod common;
 
 use std::path::PathBuf;
 
-use common::routes::{matching_brace, matching_paren, repo_root, strip_comments};
+use common::lex::{blank, brace_delta, strip, Dialect};
+use common::routes::{matching_brace, matching_paren, repo_root};
 use common::rust_production::relative_name;
 
 /// 读文件、走目录这两条的唯一定义。
@@ -65,6 +66,11 @@ const THE_ONE: &str = "crates/cogneva/tests/common/fsio.rs";
 /// 去注释、配平括号这两条的定义在 `routes` 里——它们要读同一批源码，和注册路线的
 /// 读法住在一起。
 const ROUTES_HOME: &str = "crates/cogneva/tests/common/routes.rs";
+
+/// 「哪里是字符串、哪里是注释」这一条的定义在 `lex` 里：块注释的嵌套、原始字符串、
+/// 字符字面量与生命周期都在那一台状态机上。`routes::strip_comments` 与
+/// `rust_production::brace_shapes` 都只是它的两个出口。
+const LEX_HOME: &str = "crates/cogneva/tests/common/lex.rs";
 
 /// 取仓库相对名那一条的定义在 `rust_production` 里：它先是「读一棵生产源码树」的一
 /// 部分，后来才被别处借去用。
@@ -174,7 +180,7 @@ struct Census {
 ///
 /// 括号与花括号的配平走共享的那两条：注释里写着签名不算，字符串里的 `{` 也不算。
 fn recursions_in(file: &str, text: &str) -> Vec<(String, usize, String)> {
-    let code = strip_comments(text);
+    let code = strip(text, Dialect::Rust);
     let bytes = code.as_bytes();
     let mut out = Vec::new();
     let mut lineno = 0usize;
@@ -229,7 +235,7 @@ fn recursions_in(file: &str, text: &str) -> Vec<(String, usize, String)> {
 ///
 /// 空白折叠掉，是因为抄的人会重新排版：缩进、换行、参数折行都会变，规则本身不变。
 fn free_function_bodies(text: &str) -> Vec<(String, usize, String)> {
-    let code = strip_comments(text);
+    let code = strip(text, Dialect::Rust);
     let bytes = code.as_bytes();
     let mut out = Vec::new();
     let mut line_start = 0usize;
@@ -521,10 +527,14 @@ fn the_fixture_reading_steps_are_written_once() {
         "{ROUTES_HOME} 里不再定义 `strip_comments`：「只有一处」就是指着这份\
          不干这件事的文件"
     );
+    let lex_home = std::fs::read_to_string(root.join(LEX_HOME)).expect("共享词法读得到");
     assert!(
-        routes_home.contains("depth") && routes_home.contains("chars[i] == '\\n'"),
-        "{ROUTES_HOME} 里的去注释不再按嵌套层数走：Rust 的块注释可以嵌套，\
-         只看第一个 `*/` 会把后半截注释当成代码读"
+        lex_home.contains("block_comment += 1")
+            && lex_home.contains("raw_hashes")
+            && lex_home.contains("fn scan(text: &str, dialect: Dialect) -> Scan"),
+        "{LEX_HOME} 里的扫描不再按嵌套层数与原始字符串走：Rust 的块注释可以嵌套、\
+         原始字符串里可以有任意括号，只看第一个 `*/` 或 `\"` 会把后半截读反，\
+         而读反的那一半在判词上与「那里没有」同形"
     );
     // 括号那一份：两条入口都还在，而且都还走在同一个数层数的实现上。少这一问，
     // 把某一条改成「找最近的 `}`」之后，本判据只证明了「没有第二份」，不证明这一份对。
@@ -865,4 +875,55 @@ fn a_body_written_twice_is_reported() {
     );
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// 同一段字节，两种方言的读法不同——这正是方言必须由调用方说出来的原因。
+///
+/// Rust 的生命周期在「`'` 一律是引号」的读法下会开一段字符串，把后面的代码吃到下一个
+/// `'` 为止；JavaScript 的长单引号字符串在 Rust 的窗口判据下认不出来。两边各自的错法
+/// 都不会报错，只会少读——所以这里把两种方言在同一段文本上钉住。
+#[test]
+fn the_one_lexer_reads_rust_where_the_javascript_rule_does_not() {
+    // `'a` 是生命周期，不是字符字面量的开头：它后面的代码必须还是代码。
+    let source = "fn f<'a>(x: &'a str) -> u8 { let n = 1; n }";
+    assert!(
+        strip(source, Dialect::Rust).contains("let n = 1;"),
+        "{:?}",
+        strip(source, Dialect::Rust)
+    );
+    assert_eq!(
+        brace_delta(source, Dialect::Rust),
+        0,
+        "一行的函数体里括号自平：{:?}",
+        strip(source, Dialect::Rust)
+    );
+
+    // 原始字符串里的 `"` 与 `//` 都不是语法：整段是一条字面量。
+    let raw = "let s = r#\"a \" b // c\"#; let after = 2;";
+    let stripped = strip(raw, Dialect::Rust);
+    assert!(
+        stripped.contains("let after = 2;"),
+        "原始字符串在它自己那个 `\"#` 上收尾，里面那个 `\"` 不算收尾：{stripped:?}"
+    );
+
+    // 反过来：JavaScript 的长单引号字符串必须整段认成字符串，里面的括号不进括号形状。
+    let js = "const p = '/api/v1/things/{id}'; const q = 1;";
+    assert_eq!(strip(js, Dialect::JavaScript), js);
+    assert_eq!(
+        brace_delta(js, Dialect::JavaScript),
+        0,
+        "字符串里的花括号不是嵌套"
+    );
+
+    // 空掉字面量那一份：注释与字符串都变成空格，换行与行数原样。
+    let blanked = blank("let a = \"x\\ny\"; // note\nlet b = 2;", Dialect::Rust);
+    assert_eq!(
+        blanked.lines().count(),
+        2,
+        "行数要留住，否则报行号的读者指不到地方：{blanked:?}"
+    );
+    assert!(
+        blanked.contains("let b = 2;") && !blanked.contains("note"),
+        "{blanked:?}"
+    );
 }

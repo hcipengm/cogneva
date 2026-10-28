@@ -1,6 +1,7 @@
 pub mod fsio;
 pub mod harness;
 pub mod js_literal;
+pub mod lex;
 pub mod mocks;
 pub mod root;
 pub mod routes;

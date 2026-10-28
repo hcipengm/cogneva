@@ -405,67 +405,13 @@ pub fn served_prefixes(root: &Path) -> BTreeSet<String> {
 /// 路径的普查可以读注释：写在散文里的一条路径仍然是网关服务的路径，读它不要钱。
 /// 动词的普查读不了——注释里点名的路径前面没有动词，最近的那个动词会是从旁边
 /// 某个调用借来的。
+///
+/// 这一份是给**客户端**（`web/src` 的 JS/TS、页面里的脚本）用的方言：`'` 与反引号
+/// 都是引号。读 Rust 源码要用 [`super::lex::strip`] 加 `Dialect::Rust`——那里的 `'`
+/// 可能是生命周期，按这里的规矩会吃掉一段代码，而吃掉的那一段在判词上与「那里没有」
+/// 同形。
 pub fn strip_comments(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '"' || c == '\'' || c == '`' {
-            out.push(c);
-            i += 1;
-            while i < chars.len() {
-                out.push(chars[i]);
-                if chars[i] == '\\' {
-                    i += 1;
-                    if i < chars.len() {
-                        out.push(chars[i]);
-                    }
-                } else if chars[i] == c {
-                    i += 1;
-                    break;
-                }
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'/') {
-            while i < chars.len() && chars[i] != '\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == '/' && chars.get(i + 1) == Some(&'*') {
-            // Rust 的块注释**可以嵌套**：`/* /* */ */` 的结尾在第二个 `*/`。只找
-            // 第一个 `*/` 的写法会把后半截注释当成代码读——而这一半在判词上与
-            // 「那里真写了这个名字」同形。
-            let mut depth = 0usize;
-            while i < chars.len() {
-                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    i += 2;
-                    continue;
-                }
-                if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                    depth -= 1;
-                    i += 2;
-                    if depth == 0 {
-                        break;
-                    }
-                    continue;
-                }
-                // 换行留着：按行读的消费者不该因为一段块注释被删就看见两行合成一行。
-                if chars[i] == '\n' {
-                    out.push('\n');
-                }
-                i += 1;
-            }
-            continue;
-        }
-        out.push(c);
-        i += 1;
-    }
-    out
+    super::lex::strip(text, super::lex::Dialect::JavaScript)
 }
 
 #[cfg(test)]

@@ -49,6 +49,7 @@
 
 mod common;
 
+use common::lex::{blank, Dialect};
 use common::routes::repo_root;
 use common::rust_production::relative_name;
 
@@ -176,134 +177,12 @@ fn carried_sources() -> BTreeSet<PathBuf> {
 /// mentions a module, a test string that spells one, and a `#[path = "..."]` attribute
 /// all contain the word `mod` in a position no declaration is. Blanking the non-code
 /// keeps the line structure, so a reader of a failure can still be pointed at a line.
-fn code_only(text: &str) -> String {
-    let c: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let blank = |out: &mut String, from: usize, to: usize, c: &[char]| {
-        for ch in &c[from..to] {
-            out.push(if *ch == '\n' { '\n' } else { ' ' });
-        }
-    };
-    let mut i = 0;
-    while i < c.len() {
-        // A line comment runs to the end of the line, newline excluded.
-        if c[i] == '/' && c.get(i + 1) == Some(&'/') {
-            let start = i;
-            while i < c.len() && c[i] != '\n' {
-                i += 1;
-            }
-            blank(&mut out, start, i, &c);
-            continue;
-        }
-        // A block comment nests, so the depth has to be counted.
-        if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-            let start = i;
-            let mut depth = 0usize;
-            while i < c.len() {
-                if c[i] == '/' && c.get(i + 1) == Some(&'*') {
-                    depth += 1;
-                    i += 2;
-                } else if c[i] == '*' && c.get(i + 1) == Some(&'/') {
-                    i += 2;
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                } else {
-                    i += 1;
-                }
-            }
-            blank(&mut out, start, i.min(c.len()), &c);
-            continue;
-        }
-        // A raw string (`r"..."`, `r#"..."#`, and the `b`-prefixed forms) ends at a
-        // quote followed by as many hashes as opened it.
-        if let Some(end) = raw_string_end(&c, i) {
-            blank(&mut out, i, end, &c);
-            i = end;
-            continue;
-        }
-        // An ordinary string literal, escapes honoured.
-        if c[i] == '"' {
-            let start = i;
-            i += 1;
-            while i < c.len() {
-                if c[i] == '\\' {
-                    i += 2;
-                } else if c[i] == '"' {
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
-            blank(&mut out, start, i.min(c.len()), &c);
-            continue;
-        }
-        // A character literal holds exactly one character, escapes included. A lone
-        // quote that opens neither is a lifetime, and the quote itself is code.
-        if c[i] == '\'' {
-            let is_char = matches!(
-                (c.get(i + 1), c.get(i + 2)),
-                (Some(&'\\'), _) | (Some(_), Some(&'\''))
-            );
-            if is_char {
-                let start = i;
-                i += 1;
-                while i < c.len() {
-                    if c[i] == '\\' {
-                        i += 2;
-                    } else if c[i] == '\'' {
-                        i += 1;
-                        break;
-                    } else {
-                        i += 1;
-                    }
-                }
-                blank(&mut out, start, i.min(c.len()), &c);
-                continue;
-            }
-        }
-        out.push(c[i]);
-        i += 1;
-    }
-    out
-}
-
-/// Where a raw string literal that starts at `start` ends, one past its closing quote.
 ///
-/// `None` when no raw string starts there, which leaves an ordinary `r` identifier or a
-/// `b` byte prefix to the rest of the scanner.
-fn raw_string_end(c: &[char], start: usize) -> Option<usize> {
-    let mut j = start;
-    if c.get(j) == Some(&'b') {
-        j += 1;
-    }
-    if c.get(j) != Some(&'r') {
-        return None;
-    }
-    j += 1;
-    let mut hashes = 0;
-    while c.get(j) == Some(&'#') {
-        hashes += 1;
-        j += 1;
-    }
-    if c.get(j) != Some(&'"') {
-        return None;
-    }
-    j += 1;
-    while j < c.len() {
-        if c[j] == '"' {
-            let closes = (0..hashes).all(|k| c.get(j + 1 + k) == Some(&'#'));
-            if closes {
-                return Some(j + 1 + hashes);
-            }
-        }
-        j += 1;
-    }
-    // An unterminated literal: blanking to the end is the safe reading, since the file
-    // cannot compile anyway.
-    Some(c.len())
+/// The lexing itself is [`blank`]: raw strings, escapes and lifetimes are decided in one
+/// place, shared with every fixture that reads Rust text, so this scanner and those
+/// cannot disagree about where a string ends.
+fn code_only(text: &str) -> String {
+    blank(text, Dialect::Rust)
 }
 
 /// The module names declared by `mod name;` in `text`.

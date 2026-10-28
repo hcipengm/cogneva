@@ -101,6 +101,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::lex::{strip, Dialect};
 use common::routes::repo_root;
 use common::rust_production::{
     production_sources, production_text, relative_name, sources_of_tree,
@@ -148,19 +149,17 @@ fn word_family(name: &str) -> Option<&str> {
 /// 一处漏读就是一处不比较，而「少读了一个」与「那个常量没有矛盾」在结果上
 /// 分不开。
 fn word_constants(source: &str) -> Result<Vec<(String, String)>, String> {
+    // 注释掉的声明不是任何一个词的发源地。这里用 Rust 方言剥注释：`'` 可能是
+    // 生命周期（`&'static str`），按「`'` 一律是引号」的读法会把等号后面的字面量
+    // 一起吞掉，而在那之间写着的声明就读不到了。
+    let source = strip(source, Dialect::Rust);
+    let source = source.as_str();
     let mut out = Vec::new();
     let mut cursor = 0;
     while let Some(offset) = source[cursor..].find("const ") {
         let keyword = cursor + offset;
         let at = keyword + "const ".len();
         cursor = at;
-        // 注释掉的声明不是任何一个词的发源地：看这一行在它之前有没有 `//`。
-        // 这里不调 `strip_comments`——那把 `'` 当字符串引号，遇到 `&'static str`
-        // 会把等号后面的字面量一起吞掉。
-        let line_start = source[..keyword].rfind('\n').map_or(0, |p| p + 1);
-        if source[line_start..keyword].contains("//") {
-            continue;
-        }
         let name: String = source[at..]
             .chars()
             .take_while(|c| c.is_alphanumeric() || *c == '_')
