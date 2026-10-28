@@ -4,7 +4,7 @@
 //! 解释「读不出来就 panic」的注释一起抄。抄的人不是懒：每个测试二进制都是一棵独立的
 //! crate，`common` 不是自动可见的，手边最快的一条路就是复制。
 //!
-//! 代价落在**改的时候**：`routes::walk` 里那句「读不出来就 panic」是这条规则的全部
+//! 代价落在**改的时候**：`fsio::walk` 里那句「读不出来就 panic」是这条规则的全部
 //! 价值（跳过一个读不出来的子目录不会让任何断言变红，剩下的那份普查往往仍高于下限，
 //! 「少读了一块」与「那一块都合规」在判词上分不开），而抄件里那句话是注释，不是机制。
 //! 谁要是在其中一份里把 `unwrap_or_else(panic!)` 换成 `flatten()` 或 `else { continue }`，
@@ -14,9 +14,9 @@
 //! 判据按**签名**判，不按出现次数：被抄的那两份的形状是固定的——
 //! `fn read(path: &Path) -> String` 与
 //! `fn walk(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>)`。
-//! 这比「凡 `read_dir` 即红」窄得多，是量过的：`crates/*/tests` 里有三十来份夹具自己
-//! 走目录，其中绝大多数是不同形状（只下一层、带着自己的过滤与解析、返回相对名字），
-//! 那些不是这条规则的副本。这里只抓逐字抄过去的那一种。
+//! 这比「凡 `read_dir` 即红」窄得多，是量过的：夹具与产出面里有几十份文件自己走目录，
+//! 其中绝大多数是不同形状（只下一层、带着自己的过滤与解析、返回相对名字），那些不是
+//! 这条规则的副本。这里只抓逐字抄过去的那一种。
 //!
 //! 三条断言，各自单独会长回来：副本为零、共享模块还在真干活、还有人在用它。
 
@@ -28,7 +28,7 @@ use common::routes::repo_root;
 use common::rust_production::relative_name;
 
 /// 两条规则的唯一定义。
-const THE_ONE: &str = "crates/cogneva/tests/common/routes.rs";
+const THE_ONE: &str = "crates/cogneva/tests/common/fsio.rs";
 
 /// 被抄走的那两个签名，逐字。
 const COPIED_SIGNATURES: [&str; 2] = [
@@ -42,17 +42,14 @@ const COPIED_SIGNATURES: [&str; 2] = [
 const THE_PREDICATE: &str =
     "crates/cogneva/tests/the_tree_walk_and_the_file_read_are_written_once_test.rs";
 
-/// 普查面：`crates/**/tests/**/*.rs`，今天 316 份。
-///
-/// 不做 `src/` 是量过的、不是漏的：`common/routes.rs` 里有一句
-/// `pub use super::root::repo_root;`，它要求这两份编在同一个父模块下。`tests/` 的
-/// 父模块是 `common/mod.rs`，天然满足；`src/` 里的那个父模块今天只有一个名字
-/// （`checkout`，指的是 `root.rs`），把 `routes` 也挂进去要连带改根的挂法，而它服务
-/// 的是全仓七十多处 `crate::checkout::repo_root()`。`src/` 里唯一的同形物是
-/// `startup_guard.rs` 单测模块里那三行 shim，留作下一步；判据只覆盖夹具，
-/// 覆盖不到的地方在这行写清楚，而不是让「全仓只有一处」瞒着它。
+// 普查面：`crates/**/*.rs`，夹具与产出面一起算。
+//
+// `src/` 必须在里面：这一族抄件上一轮就长在 `src/` 的单测模块里（`startup_guard.rs`
+// 自己那三行 `read`），而只扫夹具的判据对它是瞎的。`fsio.rs` 不 import 任何兄弟
+// 模块，正是为了让 `src/` 也能按 `#[path]` 编它——判据能覆盖 `src/`，前提是那份
+// 规则本身挂得过去。
 
-/// 引用共享读取的文件下限。今天 17 份，取一半。
+/// 引用共享读取的文件下限。今天 18 份，取一半。
 const MIN_READERS: usize = 8;
 
 /// 引用共享遍历的文件下限。今天 2 份——真数，不是估的；`walk` 只服务那两处「按扩展名
@@ -78,7 +75,11 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         };
         files += 1;
         if name != THE_ONE {
-            if text.contains("routes::read") || text.contains("routes::{read") {
+            if text.contains("routes::read")
+                || text.contains("routes::{read")
+                || text.contains("fsio::read")
+                || text.contains("fsio::{read")
+            {
                 readers += 1;
             }
             if text.contains("routes::walk") || text.contains("routes::{read, walk") {
@@ -111,7 +112,6 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
 fn all_files(root: &std::path::Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     common::routes::walk(root.join("crates").as_path(), &["rs"], &mut out);
-    out.retain(|path| relative_name(root, path).contains("/tests/"));
     out.sort();
     out
 }
@@ -121,10 +121,10 @@ fn the_tree_walk_and_the_file_read_are_written_once() {
     let root = repo_root();
     let found = census(&root, &all_files(&root));
 
-    // 下限落在题目上：读不到文件时，「副本为零」是一句关于空集的话。
+    // 下限落在题目上：读不到文件时，「副本为零」是一句关于空集的话。今天 1075 份。
     assert!(
-        found.files >= 250,
-        "只读到 {} 个夹具源文件（下限 250）：遍历没走到，下面的「没有副本」不算数",
+        found.files >= 800,
+        "只读到 {} 个 crate 源文件（下限 800）：遍历没走到，下面的「没有副本」不算数",
         found.files
     );
     // 摘掉这份门自己之前先问一句判据还认不认得出它。判据若是瞎的，下面的清单为空
@@ -171,13 +171,13 @@ fn the_tree_walk_and_the_file_read_are_written_once() {
 
     assert!(
         found.readers >= MIN_READERS,
-        "只有 {} 份夹具在用共享的 `read`（下限 {MIN_READERS}）：规则定义了一处，却几乎\
+        "只有 {} 份文件在用共享的 `read`（下限 {MIN_READERS}）：规则定义了一处，却几乎\
          没人读它——那与没定义同形",
         found.readers
     );
     assert!(
         found.walkers >= MIN_WALKERS,
-        "只有 {} 份夹具在用共享的 `walk`（下限 {MIN_WALKERS}）：遍历被搬走了，\
+        "只有 {} 份文件在用共享的 `walk`（下限 {MIN_WALKERS}）：遍历被搬走了，\
          或者被绕开了",
         found.walkers
     );
@@ -234,6 +234,25 @@ fn a_copy_on_disk_is_reported() {
             .iter()
             .any(|(file, line, _)| file == "crates/probe/tests/copy.rs" && *line == 5),
         "报出来的位置要能直接翻到（`walk` 那一处在第 5 行）：{:?}",
+        found.copies
+    );
+
+    // 抄件长在 `src/` 的单测模块里也要点名：这一族抄件的上一轮就长在那儿
+    // （`startup_guard.rs` 的三行 shim），只扫夹具的判据对它一声不响。
+    let src = root.join("crates/probe/src");
+    std::fs::create_dir_all(&src).expect("a scratch src directory");
+    std::fs::write(
+        src.join("unit.rs"),
+        "fn read(path: &Path) -> String {\n    std::fs::read_to_string(path).unwrap()\n}\n",
+    )
+    .expect("a copy in a unit test module");
+    let found = census(&root, &all_files(&root));
+    assert!(
+        found
+            .copies
+            .iter()
+            .any(|(file, line, _)| file == "crates/probe/src/unit.rs" && *line == 1),
+        "`src/` 里的抄件也要数得出来，否则这份门只看得见夹具：{:?}",
         found.copies
     );
 

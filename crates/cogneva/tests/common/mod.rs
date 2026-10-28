@@ -1,3 +1,4 @@
+pub mod fsio;
 pub mod harness;
 pub mod js_literal;
 pub mod mocks;

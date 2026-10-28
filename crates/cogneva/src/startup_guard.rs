@@ -85,8 +85,14 @@ fn bounded(text: &str) -> String {
 }
 
 #[cfg(test)]
+#[path = "../tests/common/fsio.rs"]
+mod fsio;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    use super::fsio::read;
 
     #[derive(Debug)]
     struct Leaf;
@@ -108,10 +114,6 @@ mod tests {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
         }
-    }
-
-    fn read(path: &Path) -> String {
-        std::fs::read_to_string(path).unwrap()
     }
 
     #[test]
