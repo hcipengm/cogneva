@@ -1320,10 +1320,12 @@ impl FailureLocus {
     /// 这一版吃得多，而代价不对称——判不准就往停下的一侧取，误停只是等一个新 rev。
     /// 它的可读部分因此不放在类别上，放在落点里（原因跟落点走，见 [`KilledReason`]）。
     ///
-    /// 「清单删掉的字段没被删掉」同样两个阶段都按版本类。它发生在镜像一个都还没动
-    /// 之前，但**说得出版本的事**：这一版的清单没能在集群上生效，是这一版的属性，
+    /// 「清单删掉的字段没被删掉」同样两个阶段都按版本类。它可能发生在镜像一个都还
+    /// 没动之前（支撑面），也可能发生在目标面已经翻上去之后（逐目标 apply 之后那次
+    /// 回读），但**说得出版本的事**：这一版的清单没能在集群上生效，是这一版的属性，
     /// 下一轮拿到同一份清单只会得到同一个结果。判成环境类会让它每过一个冷却窗就重试
-    /// 一次，永远停不下来，而读数上看起来像「集群还没就绪」。
+    /// 一次，永远停不下来，而读数上看起来像「集群还没就绪」；判成可回滚又会退到一版
+    /// 同样带着那个字段的清单上——两个方向都不修它。
     ///
     /// 「上游已判红」同样两个阶段都按版本类。`before_any_change` 那一支默认把
     /// 非 Observed 的落点全判成环境类——那是给"动手之前就说不清"的那些落点
@@ -19759,6 +19761,102 @@ echo "||1"
         );
     }
 
+    /// 目标面：`deploy-<name>.yaml` 里删掉一个字段，apply 一样退 0、一样回
+    /// `serverside-applied`，而对象上还挂着它。支撑面一直有这次回读，目标面此前
+    /// 没有——于是从目标清单里拿掉一个字段，这一轮照样报健康完成。
+    ///
+    /// 判失败之后不许回滚：上一版的清单同样没有这次删除动作，那个字段在旧版本上
+    /// 一样挂着。回滚把这一版换下去、把同一份「字段还在」留在集群上，下一轮再删
+    /// 一次、再撞一次——所以这一支必须落在「留在新版、报这一版没落地」上。
+    #[tokio::test]
+    async fn a_target_field_removal_that_did_not_land_keeps_the_revision_and_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) = fake_kubectl_target_field_removal(&bin_dir, false);
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        plan.targets = vec![RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "cogneva".into(),
+            name: "cogneva".into(),
+        }];
+        let err = executor.run(&plan).await.unwrap_err();
+
+        assert_eq!(err.class, FailureClass::Version, "{err:?}");
+        // 签名点名是**目标面**漏的，与支撑面那一条分得开：同一个落点、两个面，
+        // 修法不同（一个改支撑清单，一个改目标清单）。
+        assert_eq!(err.signature, "version:apply:cogneva:field-removal");
+        let msg = err.to_string();
+        assert!(is_field_removal_not_taken(&msg), "{msg}");
+        assert!(
+            msg.contains("target manifest for cogneva"),
+            "the judgement has to say which face dropped the field: {msg}"
+        );
+        assert!(
+            msg.contains("spec.template.spec.containers[name=cogneva].env[name=LEGACY]"),
+            "the dropped field has to be named: {msg}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("get deployment.apps cogneva -n cogneva -o json"),
+            "the deletion has to be judged by reading the object back: {calls}"
+        );
+        assert!(
+            !calls.contains("set image "),
+            "rolling back cannot delete the field — the older manifest does not carry the delete \
+             either — so this failure must not spend a rollback: {calls}"
+        );
+    }
+
+    /// 反面对照：同一条清单、同一套假 kubectl，只要回读时字段真的不在了，这一轮
+    /// 照常滚完。缺了这一半，「见到目标清单就判死」的实现也会让上面那条绿。
+    #[tokio::test]
+    async fn a_target_field_removal_that_did_land_lets_the_rollout_finish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) = fake_kubectl_target_field_removal(&bin_dir, true);
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        plan.targets = vec![RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "cogneva".into(),
+            name: "cogneva".into(),
+        }];
+        executor.run(&plan).await.unwrap();
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("get deployment.apps cogneva -n cogneva -o json"),
+            "the target face has to be read back even when the deletion landed: {calls}"
+        );
+    }
+
     /// 盲区用例：同一个对象这一版既删字段又换了镜像 tag。
     ///
     /// 支撑工作负载本来就每版换镜像，于是 `metadata.generation` 一定前进——按代数判
@@ -19865,6 +19963,89 @@ metadata:
 "
         );
         fake_kubectl_support_settle_with(dir, 2, true, current, &extra)
+    }
+
+    /// 假 kubectl：目标清单 `deploy-cogneva.yaml` 这一版删掉了一个 env，而对象上
+    /// 还挂着它。上一版的清单存在包里另一个键上——与支撑面同一条通路，只是面不同。
+    fn fake_kubectl_target_field_removal(dir: &Path, deletion_lands: bool) -> (PathBuf, PathBuf) {
+        // 只拿掉一个 env，`env` 这个键还在：整棵子树没了只记一层（路径停在
+        // `env`），而这一次要判的是「列表里那个按 name 认出来的元素在不在」。
+        let target = |legacy: bool| {
+            format!(
+                "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cogneva
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cogneva
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cogneva
+    spec:
+      containers:
+        - name: cogneva
+          image: localhost:30500/cogneva:main-old
+          env:
+{}            - name: KEPT
+              value: \"1\"
+",
+                if legacy {
+                    "            - name: LEGACY\n              value: \"1\"\n"
+                } else {
+                    ""
+                }
+            )
+        };
+        let current = target(false);
+        let previous = target(true);
+        // 上一版的包：支撑面那一份没有内容，于是支撑面这条判据读作「首装」；
+        // 目标面在同一个包里按键取到了自己的上一版。
+        let bundle = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "cogneva-manifests-previous",
+                    "creationTimestamp": "2026-10-22T09:00:00Z",
+                },
+                "data": {"deploy-cogneva.yaml": previous},
+            }],
+        })
+        .to_string();
+        let mut live = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "cogneva", "namespace": "cogneva", "generation": 7},
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [{
+                            "name": "cogneva",
+                            "image": "localhost:30500/cogneva:main-new",
+                        }],
+                    },
+                },
+            },
+        });
+        live["spec"]["template"]["spec"]["containers"][0]["env"] =
+            serde_json::json!([{"name": "KEPT", "value": "1"}]);
+        if !deletion_lands {
+            live["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name": "LEGACY", "value": "1"}));
+        }
+        let live = live.to_string();
+        let support = "kind: ConfigMap\nmetadata:\n  name: cogneva-config\n";
+        let extra = format!(
+            "  *\"get configmap -l \"*) printf '%s\\n' '{bundle}' ;;\n  \
+             *\"get deployment.apps cogneva -n cogneva -o json\"*) printf '%s\\n' '{live}' ;;\n"
+        );
+        let (manifests, log) = fake_kubectl_support_settle_with(dir, 2, true, support, &extra);
+        std::fs::write(manifests.join("deploy-cogneva.yaml"), current).unwrap();
+        (manifests, log)
     }
 
     /// 假 kubectl：同一版里支撑 Deployment 既换了镜像 tag、又删掉了一个 env。镜像写进去
@@ -20911,6 +21092,8 @@ exit 0
     /// 宿主的负载不是这一版的属性：整段都在排队时，回滚既救不回它（旧镜像一样
     /// 排不上），又会把一台机器别人的负载记成代码缺陷；而留在原地的这一版在宿主
     /// 松下来之后自己会起来。
+    ///
+    /// principle: feedback_a_wall_clock_budget_under_host_contention_measures_someone_elses_load
     #[tokio::test]
     async fn a_budget_spent_queued_on_a_loaded_host_says_nothing_about_the_revision() {
         let (tmp, kubectl, plan) = never_converging_rollout();

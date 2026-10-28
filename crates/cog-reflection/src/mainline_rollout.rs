@@ -1118,6 +1118,40 @@ pub(crate) struct RemovalReadback {
     pub unreadable: Vec<FieldRemoval>,
 }
 
+/// 判词里点名「哪个对象还挂着哪几条路径」。两个面各调一次，措辞只写一处：
+/// 同一句话写两遍，读到的人会以为两边的判据不同。
+fn field_removal_not_taken_message(face: &str, target: &str, not_taken: &[FieldRemoval]) -> String {
+    let detail = not_taken
+        .iter()
+        .map(|r| {
+            format!(
+                "{}/{} still has {} (namespace {})",
+                r.resource,
+                r.name,
+                r.paths
+                    .iter()
+                    .map(|p| render_path(p))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                r.namespace
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let of = if target.is_empty() {
+        format!("this revision's {face} manifest")
+    } else {
+        format!("this revision's {face} manifest for {target}")
+    };
+    format!(
+        "{FIELD_REMOVAL_NOT_TAKEN_MARKER}: {of} no longer declares these fields, and the \
+         apply reported success: {detail}. Server-side apply only deletes fields this field \
+         manager owns, so taking a field out of the manifest is not a delete — the cluster \
+         still carries it while the round would otherwise report health. Remove them with a \
+         json patch instead of by leaving them out of the manifest"
+    )
+}
+
 /// 字段路径上的一步：一个映射的键，或者一个列表里按 `name` 认出来的那一个元素。
 ///
 /// 列表不按下标比：前面插进一个元素之后，后面每一项的下标都错位，按下标比会把一串
@@ -2895,7 +2929,9 @@ impl RolloutExecutor {
         None
     }
 
-    async fn apply_target(&self, plan: &RolloutPlan, t: &RolloutTarget) -> SFResult<()> {
+    /// 返回值是「这次删除没量成」的对象名（读不回来），不是失败：量不成不拦这一轮，
+    /// 但读数面上不能与「量过、干净」同形。
+    async fn apply_target(&self, plan: &RolloutPlan, t: &RolloutTarget) -> SFResult<Vec<String>> {
         if let Some(dir) = &plan.manifests_dir {
             let key = target_manifest_key(&t.deployment);
             let path = Path::new(dir).join(&key);
@@ -2916,6 +2952,11 @@ impl RolloutExecutor {
                         manifest = %path_arg,
                         "mainline rollout: apply target manifest"
                     );
+                    // 目标清单里删掉的字段。与支撑面同一个病：apply 退 0、回
+                    // serverside-applied，删除没落地与落地在账上同形。支撑面一
+                    // 直在回读，目标面此前没有——于是从目标清单里拿掉一个字段，
+                    // 这一轮照样报健康完成。
+                    let field_removals = self.field_removals_to_verify(&key, &text).await;
                     let outcome = async {
                         self.clear_superseded_env_values(&staged_path).await?;
                         self.apply_manifest_file(&path_arg, 60).await.map(|_| ())
@@ -2925,7 +2966,20 @@ impl RolloutExecutor {
                     // 所以用完就删：留着就是随每一次滚动在临时目录里堆一份，而没有任何
                     // 回收方认得它们。失败那一路也删——它派生自包里那份清单，包还在。
                     let _ = tokio::fs::remove_file(&staged_path).await;
-                    return outcome;
+                    outcome?;
+                    let readback = self.read_back_removals(&field_removals).await;
+                    if !readback.not_taken.is_empty() {
+                        return Err(SFError::Agent(field_removal_not_taken_message(
+                            "target",
+                            &t.deployment,
+                            &readback.not_taken,
+                        )));
+                    }
+                    return Ok(readback
+                        .unreadable
+                        .iter()
+                        .map(|r| format!("{}/{}", r.resource, r.name))
+                        .collect());
                 }
                 warn!(
                     deployment = %t.deployment,
@@ -2936,7 +2990,9 @@ impl RolloutExecutor {
                 warn!(deployment = %t.deployment, "no target manifest in bundle; falling back to set image");
             }
         }
-        self.set_image(t, &plan.tag).await
+        self.set_image(t, &plan.tag).await?;
+        // 走 set image 的目标没有清单，也就没有「这一版删了哪个字段」可言。
+        Ok(Vec::new())
     }
 
     /// 采一次命名空间里每份 ConfigMap 的内容（`data` 段），用来在 apply 前后比出
@@ -3178,14 +3234,18 @@ impl RolloutExecutor {
         Ok(out)
     }
 
-    /// 上一版发布的支撑清单原文。取**最新的、内容与本次不同的那一份**：包按 rev
-    /// 各存一份、保留若干代，所以「上一版」不需要谁告诉它，读第二新的那一份就是。
+    /// 上一版发布的某一份清单原文（`key` 是包里的那个键：支撑面是 `support.yaml`，
+    /// 目标面是 `deploy-<name>.yaml`）。取**最新的、内容与本次不同的那一份**：包按
+    /// rev 各存一份、保留若干代，所以「上一版」不需要谁告诉它，读第二新的那一份就是。
     /// 内容相同的不算上一版——一份没变的清单说不出任何一次删除。
+    ///
+    /// 按键取而不是只取支撑面：两个面各自 apply，字段删没删要各自比各自的那一份。
+    /// 只比支撑面时，目标清单里删掉的字段与「没删过字段」在账上同形。
     ///
     /// 「读不到」与「没有上一版」分得开：前者把错误交回调用方留一条日志，后者是
     /// 首装。两者都不改变这一轮的去向——集群里连包都列不出来时拦下每一次滚动，
     /// 代价比这条判据挡不住那一次大——但它们在日志里必须是两句话。
-    async fn previous_support_bundle(&self, current: &str) -> SFResult<Option<String>> {
+    async fn previous_bundle_doc(&self, key: &str, current: &str) -> SFResult<Option<String>> {
         let text = self
             .probe(
                 &[
@@ -3209,7 +3269,7 @@ impl RolloutExecutor {
             .iter()
             .filter_map(|item| {
                 let created = item["metadata"]["creationTimestamp"].as_str()?;
-                let yaml = item["data"]["support.yaml"].as_str()?;
+                let yaml = item["data"][key].as_str()?;
                 Some((created, yaml))
             })
             .collect();
@@ -3223,8 +3283,11 @@ impl RolloutExecutor {
 
     /// 这次 apply 要删字段的对象。只读清单，不读集群：判据比的是「这一版声明删了
     /// 什么」，而落地没落地由 apply 之后那次回读回答。
-    async fn field_removals_to_verify(&self, current: &str) -> Vec<FieldRemoval> {
-        let previous = match self.previous_support_bundle(current).await {
+    ///
+    /// `key` 是包里的那一份：两个面各自 apply、各自比各自的那一份。拿支撑面那一份
+    /// 去比目标面的清单，比的是一组不相干的对象，两个方向的答案都是错的。
+    async fn field_removals_to_verify(&self, key: &str, current: &str) -> Vec<FieldRemoval> {
+        let previous = match self.previous_bundle_doc(key, current).await {
             Ok(Some(previous)) => previous,
             // 没有上一版：首装，没有「相对上一版删掉了什么」可言。
             Ok(None) => return Vec::new(),
@@ -3232,6 +3295,7 @@ impl RolloutExecutor {
             // 但这一次"没查"要留在日志里，不能与"查过、没有删除"同形。
             Err(e) => {
                 warn!(
+                    key,
                     error = %e,
                     "mainline rollout: cannot read the previous manifest bundle; this apply's \
                      field removals are not verified"
@@ -4589,7 +4653,8 @@ impl RolloutExecutor {
                         // 没声明、由别的写者拥有」的字段，而那种删除失败退 0、回
                         // serverside-applied，读起来像成功。它到底落没落，只能在 apply
                         // 之后把对象读回来看那个字段还在不在。
-                        let field_removals = self.field_removals_to_verify(&text).await;
+                        let field_removals =
+                            self.field_removals_to_verify("support.yaml", &text).await;
                         info!(
                             source = %support.display(),
                             manifest = %support_arg,
@@ -4652,36 +4717,13 @@ impl RolloutExecutor {
                             .map(|r| format!("{}/{}", r.resource, r.name))
                             .collect();
                         if !readback.not_taken.is_empty() {
-                            let detail = readback
-                                .not_taken
-                                .iter()
-                                .map(|r| {
-                                    format!(
-                                        "{}/{} still has {} (namespace {})",
-                                        r.resource,
-                                        r.name,
-                                        r.paths
-                                            .iter()
-                                            .map(|p| render_path(p))
-                                            .collect::<Vec<_>>()
-                                            .join(", "),
-                                        r.namespace
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("; ");
                             return Err(classify_before_any_change(
                                 "field-removal",
                                 "",
-                                SFError::Agent(format!(
-                                    "{FIELD_REMOVAL_NOT_TAKEN_MARKER}: this revision's support \
-                                     manifest no longer declares these fields, and the apply \
-                                     reported success: {detail}. Server-side apply only deletes \
-                                     fields this field manager owns, so taking a field out of \
-                                     the manifest is not a delete — the cluster still carries \
-                                     it while the round would otherwise report health. Remove \
-                                     them with a json patch instead of by leaving them out of \
-                                     the manifest"
+                                SFError::Agent(field_removal_not_taken_message(
+                                    "support",
+                                    "",
+                                    &readback.not_taken,
                                 )),
                             ));
                         }
@@ -4813,17 +4855,20 @@ impl RolloutExecutor {
                 failure.admission_hold = Some(shortfall.dimension);
                 return Err(failure);
             }
-            if let Err(e) = self.apply_target(plan, target).await {
-                return self
-                    .fail_without_blind_rollback(
-                        "apply",
-                        &target.deployment,
-                        e,
-                        &done,
-                        &prevs,
-                        &refs,
-                    )
-                    .await;
+            match self.apply_target(plan, target).await {
+                Ok(unverified) => unverified_removals.extend(unverified),
+                Err(e) => {
+                    return self
+                        .fail_without_blind_rollback(
+                            "apply",
+                            &target.deployment,
+                            e,
+                            &done,
+                            &prevs,
+                            &refs,
+                        )
+                        .await;
+                }
             }
             if let Err(e) = self.wait_rollout_complete(target, prev_shape).await {
                 done.push(target);
@@ -5015,6 +5060,26 @@ impl RolloutExecutor {
                 stage,
                 target,
                 FailureLocus::Tool,
+                false,
+                e,
+            ));
+        }
+        // 清单里删掉的字段没被删掉。退回去也删不掉它：上一版清单里同样没有这次
+        // 的删除动作，那个字段在旧版本上一样挂着。回滚是唯一一个会**让这件事更
+        // 难查**的动作——它把这一版换下去，然后把同一份「字段还在」留在集群上，
+        // 下一轮再删一次、再撞一次。所以留在新版上，把「这一版没落地」报出去。
+        if is_field_removal_not_taken(primary) {
+            warn!(
+                error = %e,
+                "this revision's manifest took a field out and the object still carries it; \
+                 keeping the new revision (no rollback) — the older revision's manifest does not \
+                 carry the delete either, so rolling back would leave the same field in place \
+                 and spend a revision on it"
+            );
+            return Err(RolloutFailure::at(
+                stage,
+                target,
+                FailureLocus::FieldRemoval,
                 false,
                 e,
             ));
