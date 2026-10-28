@@ -398,10 +398,16 @@ def stray_manifest_joins(manifest_dir):
     """
     hits = []
     if not manifest_dir or not os.path.isdir(manifest_dir):
-        return None
-    for name in sorted(os.listdir(manifest_dir)):
+        return None, 0
+    try:
+        names = sorted(os.listdir(manifest_dir))
+    except OSError:
+        return None, 0
+    files = 0
+    for name in names:
         if not name.endswith(('.yaml', '.yml')):
             continue
+        files += 1
         full = os.path.join(manifest_dir, name)
         try:
             with open(full, encoding='utf-8') as fh:
@@ -409,8 +415,8 @@ def stray_manifest_joins(manifest_dir):
                     if COMPARISON_ON.search(line):
                         hits.append('%s:%d' % (name, no))
         except OSError:
-            return None
-    return hits
+            return None, 0
+    return hits, files
 
 
 def main(path, manifest_dir):
@@ -421,6 +427,12 @@ def main(path, manifest_dir):
     except (OSError, ValueError, KeyError, TypeError) as exc:
         print('check-alert-rule-join-shape: 规则读不了：%s' % exc)
         print('check-alert-rule-join-shape: 判词记 3（看不了，不是一致）')
+        return 3
+    if not isinstance(rules, list) or not rules:
+        # 零条与「一条都不违规」在汇总行上同形（判得动 0、违规 0 处）。文件在而结构变了，
+        # 读数不能读成干净。
+        print('check-alert-rule-join-shape: %s 里一条规则都没有读到——零条与「全都合规」'
+              '同形，这一跑什么都没判，判词记 3' % path)
         return 3
     bad = 0
     unjudged = 0
@@ -460,9 +472,16 @@ def main(path, manifest_dir):
     print('check-alert-rule-join-shape: 集合运算（顶层 and/unless）判不了 %d 个、'
           '形状判不动 %d 个、嵌在聚合里不在射程 %d 个；判得动的 %d 个'
           % (set_named, set_silent, set_nested, set_judged))
-    stray = stray_manifest_joins(manifest_dir)
+    stray, manifest_files = stray_manifest_joins(manifest_dir)
     if stray is None:
         print('check-alert-rule-join-shape: 清单目录读不了（%s）：射程有没有缺口不知道，'
+              '判词记 3' % manifest_dir)
+        return 3
+    if manifest_files == 0:
+        # 目录在而里面一份 .yaml 都没有：射程守卫印的「清单里没有带 on() 的比较」与
+        # 「清单里什么都没有」是同一句话。规则搬到别处去了，这道守卫守的是空的。
+        print('check-alert-rule-join-shape: %s 里一份 .yaml 都没有读到——'
+              '「清单里没有带 on() 的比较」与「清单是空的」同形，射程守卫此刻什么都没守，'
               '判词记 3' % manifest_dir)
         return 3
     if stray:

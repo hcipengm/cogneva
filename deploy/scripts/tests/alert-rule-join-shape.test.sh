@@ -120,6 +120,16 @@ set -e
 [ "${rc}" -eq 3 ] || fail "JSON 坏掉应 rc=3，实际 rc=${rc}：${out}"
 ok "读不了 -> rc=3，判词不留成「一致」"
 
+# 6b. 读得到但零条规则 -> 也是 rc=3：汇总行会把「判得动 0 个、违规 0 处」印成绿的口气，
+#     与「一条都不违规」完全同形。结构变了（键名换了、列表被清空）不能读成干净。
+printf '{"observability":{"infra_watch":{"rules":[]}}}' > "${work}/empty-rules.json"
+set +e
+out="$(bash "${gate}" "${work}/empty-rules.json" 2>&1)"; rc=$?
+set -e
+[ "${rc}" -eq 3 ] || fail "零条规则应 rc=3，实际 rc=${rc}：${out}"
+grep -q '一条规则都没有读到' <<<"${out}" || fail "零条规则的判词没说清是没读到：${out}"
+ok "读到零条规则 -> rc=3"
+
 # 7. 射程守卫：清单里的规则一条都不被这条门读过。真清单里没有带 on() 的比较 -> 绿；
 #    放一份进去 -> 红并点名文件与行号。那是 subject 门的前身走过的弯路：规则改落在
 #    manifest 里，chart 那份 JSON 一条不少，门却再也没看过新规则。
@@ -147,7 +157,15 @@ out="$(bash "${gate}" "${config}" "${work}/no-such-dir" 2>&1)"; rc=$?
 set -e
 [ "${rc}" -eq 3 ] || fail "清单目录不在应 rc=3（射程有没有缺口不知道），实际 rc=${rc}：${out}"
 grep -q '判词记 3' <<<"${out}" || fail "清单目录读不了时没说「判词记 3」：${out}"
-ok "射程守卫：清单里的连接红并点名，真清单绿，清单目录读不了记 3"
+# 7b. 目录在、里面一份 .yaml 都没有 -> rc=3：射程守卫印的「清单里没有带 on() 的比较」
+#     与「清单是空的」是同一句话，而后者意味着规则搬走了、守卫守的是空目录。
+mkdir -p "${work}/empty-manifests"
+set +e
+out="$(bash "${gate}" "${config}" "${work}/empty-manifests" 2>&1)"; rc=$?
+set -e
+[ "${rc}" -eq 3 ] || fail "清单目录里零份 yaml 应 rc=3，实际 rc=${rc}：${out}"
+grep -q '一份 .yaml 都没有读到' <<<"${out}" || fail "空清单目录的判词没说清是没读到：${out}"
+ok "射程守卫：清单目录空着 -> rc=3"
 
 # 8. 集合运算（and / unless）不带 on()/ignoring()：默认按全标签集匹配。
 #    8a 两侧 by 集不等 -> 连不上，红：and 恒空（规则一生不响）、unless 恒亮（永远在报）。
