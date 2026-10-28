@@ -19672,8 +19672,11 @@ echo "||1"
     /// 从清单里拿掉一个字段，apply 退 0、回 `serverside-applied`、diff 为空——三项都
     /// 像成功，而对象一个字都没变。
     ///
-    /// 判据只能问对象自己：清单里少了字段的那个对象，`metadata.generation` 必须动。
-    /// 假 kubectl 把 apply 之后那一次读数钉在旧值上，于是这一轮必须被拒绝；而失败
+    /// 判据只能问对象自己：apply 之后把它读回来，看那个字段还在不在。`metadata.
+    /// generation` 当不了判据——它只要 spec 有任何一处变化就前进，而支撑工作负载本来
+    /// 每版都换镜像 tag，一边删字段一边换 tag 就会让代数涨了、字段还在。
+    ///
+    /// 假 kubectl 让 apply 之后那次回读仍然带着那个字段，于是这一轮必须被拒绝；而失败
     /// 分类要落在**这一版**上（清单没生效是这一版的属性），不能读成"集群还没就绪"。
     #[tokio::test]
     async fn a_removal_the_apply_did_not_write_stops_the_rollout_as_the_revisions_failure() {
@@ -19710,7 +19713,7 @@ echo "||1"
             "the object has to be named: {msg}"
         );
         assert!(
-            msg.contains(".spec.headers.customRequestHeaders"),
+            msg.contains("spec.headers.customRequestHeaders"),
             "the dropped field has to be named: {msg}"
         );
         let calls = std::fs::read_to_string(&log).unwrap();
@@ -19720,7 +19723,7 @@ echo "||1"
         );
     }
 
-    /// 反向对照：同一条清单、同一套假 kubectl，只要 apply 之后代数真的前进了，
+    /// 反向对照：同一条清单、同一套假 kubectl，只要 apply 之后回读时那个字段真的不在了，
     /// 这一轮照常滚完。少了这一半，上面那条用例在"见到删字段就判死"的实现下也是绿的，
     /// 而那会让每一次正常的字段删除都拦下主线。
     #[tokio::test]
@@ -19749,13 +19752,55 @@ echo "||1"
             calls.contains("set image "),
             "a deletion that did land must not hold the rollout: {calls}"
         );
-        assert!(calls.contains(".metadata.generation"), "{calls}");
+        assert!(
+            calls.contains("get middleware.traefik.io cogneva-strip"),
+            "the deletion has to be judged by reading the object back: {calls}"
+        );
+    }
+
+    /// 盲区用例：同一个对象这一版既删字段又换了镜像 tag。
+    ///
+    /// 支撑工作负载本来就每版换镜像，于是 `metadata.generation` 一定前进——按代数判
+    /// 落地的话，这一轮会照绿放过，而那正是"从清单里拿掉一个字段，apply 说成功、
+    /// 字段还在"的现场。判据只认对象自己：读回来那个字段还在，就必须红。
+    #[tokio::test]
+    async fn a_generation_that_moved_does_not_cover_a_field_that_is_still_live() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let (manifests, log) = fake_kubectl_field_removal_under_an_image_bump(&bin_dir);
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        let mut plan = RolloutPlan::from_config(
+            &MainlineDeployerConfig::default(),
+            "localhost:30500/cogneva:main-new".into(),
+        );
+        plan.manifests_dir = Some(manifests.to_string_lossy().to_string());
+        let err = executor.run(&plan).await.unwrap_err();
+
+        assert_eq!(err.class, FailureClass::Version, "{err:?}");
+        let msg = err.to_string();
+        assert!(is_field_removal_not_taken(&msg), "{msg}");
+        // 点名的是那个还在的字段，而不是那条真的落下去的镜像改动。
+        assert!(
+            msg.contains("spec.template.spec.containers[name=registry].env[name=OLD_LEFTOVER]"),
+            "{msg}"
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(!calls.contains("set image "), "{calls}");
     }
 
     /// 假 kubectl：这一版的 `support.yaml` 相对上一版少了一个字段（那个对象由
-    /// 上一版的清单包给出，包留在集群里若干代），`metadata.generation` 在 apply
-    /// 之后**不动**——除非 `generation_moves`，那是反过来的一半。
-    fn fake_kubectl_field_removal(dir: &Path, generation_moves: bool) -> (PathBuf, PathBuf) {
+    /// 上一版的清单包给出，包留在集群里若干代），apply 之后回读那个对象时字段还在
+    /// ——除非 `deletion_lands`，那是反过来的一半。
+    fn fake_kubectl_field_removal(dir: &Path, deletion_lands: bool) -> (PathBuf, PathBuf) {
         let previous = "\
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
@@ -19797,13 +19842,89 @@ metadata:
             }],
         })
         .to_string();
-        let after = if generation_moves { "4" } else { "3" };
+        // apply 之后读回来的对象。`deletion_lands` 是「那个字段真的不在了」的那一半。
+        let mut live = serde_json::json!({
+            "apiVersion": "traefik.io/v1alpha1",
+            "kind": "Middleware",
+            "metadata": {"name": "cogneva-strip", "namespace": "cogneva", "generation": 4},
+            "spec": {
+                "headers": {
+                    "customResponseHeaders": {"X-Frame-Options": "DENY"},
+                },
+            },
+        });
+        if !deletion_lands {
+            live["spec"]["headers"]["customRequestHeaders"] =
+                serde_json::json!({"X-Frame-Options": "DENY"});
+        }
+        let live = live.to_string();
         let extra = format!(
             "  *\"get configmap -l \"*) printf '%s\\n' '{bundle}' ;;\n  \
-             *\"get middleware.traefik.io cogneva-strip\"*)\n    \
-             if [ -f '{{{{applied}}}}' ]; then echo {after}; else echo 3; fi ;;\n"
+             *\"get middleware.traefik.io cogneva-strip\"*) printf '%s\\n' '{live}' ;;
+"
         );
         fake_kubectl_support_settle_with(dir, 2, true, current, &extra)
+    }
+
+    /// 假 kubectl：同一版里支撑 Deployment 既换了镜像 tag、又删掉了一个 env。镜像写进去
+    /// 了、代数因此前进，而那个 env 还挂在对象上（apply 只删自己拥有的字段）。
+    fn fake_kubectl_field_removal_under_an_image_bump(dir: &Path) -> (PathBuf, PathBuf) {
+        let deployment = |image: &str, env: &str| {
+            format!(
+                "\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cogneva-registry
+spec:
+  template:
+    spec:
+      containers:
+      - name: registry
+        image: {image}
+        env:
+{env}"
+            )
+        };
+        let previous = deployment(
+            "localhost:30500/cogneva:rev-old",
+            "        - name: TOKEN\n          value: t\n        - name: OLD_LEFTOVER\n          value: x\n",
+        );
+        let current = deployment(
+            "localhost:30500/cogneva:rev-new",
+            "        - name: TOKEN\n          value: t\n",
+        );
+        let bundle = serde_json::json!({
+            "items": [{
+                "metadata": {
+                    "name": "cogneva-manifests-previous",
+                    "creationTimestamp": "2026-10-22T09:00:00Z",
+                },
+                "data": {"support.yaml": previous},
+            }],
+        })
+        .to_string();
+        // 读回来的对象：镜像已是新的、代数是 5（上一版 4），而那个 env 还在。
+        let live = serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "cogneva-registry", "namespace": "cogneva", "generation": 5},
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "registry",
+                "image": "localhost:30500/cogneva:rev-new",
+                "env": [
+                    {"name": "TOKEN", "value": "t"},
+                    {"name": "OLD_LEFTOVER", "value": "x"},
+                ],
+            }]}}},
+        })
+        .to_string();
+        let extra = format!(
+            "  *\"get configmap -l \"*) printf '%s\\n' '{bundle}' ;;\n  \
+             *\"get deployment.apps cogneva-registry\"*) printf '%s\\n' '{live}' ;;
+"
+        );
+        fake_kubectl_support_settle_with(dir, 2, true, &current, &extra)
     }
 
     /// 现场读数读不到（这里是 apiserver 拒绝：选择器读不出来）时，判词如实写"读不到"，

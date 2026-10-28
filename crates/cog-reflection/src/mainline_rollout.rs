@@ -1106,8 +1106,75 @@ pub(crate) struct FieldRemoval {
     pub resource: String,
     pub namespace: String,
     pub name: String,
-    /// 相对上一版少掉的字段路径，`spec` 起算，例如 `.spec.headers.customRequestHeaders`。
-    pub paths: Vec<String>,
+    /// 相对上一版少掉的字段，`spec` 起算。
+    pub paths: Vec<Vec<FieldStep>>,
+}
+
+/// 字段路径上的一步：一个映射的键，或者一个列表里按 `name` 认出来的那一个元素。
+///
+/// 列表不按下标比：前面插进一个元素之后，后面每一项的下标都错位，按下标比会把一串
+/// 根本不存在的「删除」写进判词，读日志的人去找一个从没存在过的字段。认不出 `name`
+/// 的列表（端口那种按 `containerPort` 认的）整段不比——少抓到一种删除，好过报一个
+/// 假的。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum FieldStep {
+    Key(String),
+    /// 列表里 `name` 等于这个值的那个元素。
+    Named(String),
+}
+
+/// 路径的读法：`spec.headers.customRequestHeaders`、
+/// `spec.template.spec.containers[name=registry].env[name=TOKEN]`。
+pub(crate) fn render_path(path: &[FieldStep]) -> String {
+    let mut out = String::new();
+    for step in path {
+        match step {
+            FieldStep::Key(k) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(k);
+            }
+            FieldStep::Named(name) => out.push_str(&format!("[name={name}]")),
+        }
+    }
+    out
+}
+
+/// 活对象里那条路径上的值。
+pub(crate) fn live_value<'a>(
+    live: &'a serde_json::Value,
+    path: &[FieldStep],
+) -> Option<&'a serde_json::Value> {
+    let mut cur = live;
+    for step in path {
+        cur = match step {
+            FieldStep::Key(k) => cur.get(k)?,
+            FieldStep::Named(name) => cur
+                .as_array()?
+                .iter()
+                .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(name.as_str()))?,
+        };
+    }
+    Some(cur)
+}
+
+/// 活对象里还留着的那几条路径。
+///
+/// 判据是对象的**内容**，不是它的代数。代数会在任何 spec 变化时前进，而支撑清单里的
+/// 工作负载本来就每版都换镜像 tag：一个对象这一版既删了字段又换了镜像时，代数照涨，
+/// 拿代数判会把一次没落地的删除读成落上了——那正是这条判据要抓的形状换到 Deployment
+/// 上。读回来的对象是直接证据：清单说这个字段没有了，而集群上那个对象还挂着它，就是
+/// 这次删除没写进去。
+pub(crate) fn paths_still_live(
+    live: &serde_json::Value,
+    paths: &[Vec<FieldStep>],
+) -> Vec<Vec<FieldStep>> {
+    paths
+        .iter()
+        .filter(|p| live_value(live, p).is_some())
+        .cloned()
+        .collect()
 }
 
 /// server-side apply 只删「本次声明过、并且由本 field manager 拥有」的字段：清单里
@@ -1116,10 +1183,6 @@ pub(crate) struct FieldRemoval {
 /// 都像成功。2026-10-22 实测：从 chart 的 traefik `Middleware` 删掉
 /// `spec.headers.customRequestHeaders`，主线滚动报健康完成，那个对象的
 /// `metadata.generation` 还停在旧值上，一条改动都没上线。
-///
-/// 判据因此只能问对象自己：清单里少了字段的对象，`metadata.generation` 必须变。
-/// 它变，说明这一轮写进去的东西让控制器看见了一份新 spec；它不变而清单里明明少了
-/// 字段，就是这次删除没落。
 pub(crate) const FIELD_REMOVAL_NOT_TAKEN_MARKER: &str =
     "a field this revision removed is still in the live object";
 
@@ -1148,32 +1211,60 @@ fn manifest_identity(doc: &serde_yaml::Value) -> Option<(String, String, Option<
     Some((resource, name, namespace))
 }
 
-/// 旧文档有、新文档没有的字段路径。值变了不算删除——那是「写上了」，代数是会动的。
+/// 列表里那个元素的 `name`。认不出名字的列表另作处理。
+fn element_name(v: &serde_yaml::Value) -> Option<String> {
+    v.get("name").and_then(|n| n.as_str()).map(str::to_string)
+}
+
+/// 旧文档有、新文档没有的字段。值变了不算删除——那是「写上了」，写上了会看得见。
 /// 整棵子树没了只记一层：路径再往下每一行都是同一件事的重复。
 fn removed_field_paths(
     old: &serde_yaml::Value,
     new: &serde_yaml::Value,
-    path: &str,
-    out: &mut Vec<String>,
+    path: &mut Vec<FieldStep>,
+    out: &mut Vec<Vec<FieldStep>>,
 ) {
     match (old, new) {
         (serde_yaml::Value::Mapping(o), serde_yaml::Value::Mapping(n)) => {
             for (k, ov) in o {
-                let key = match k.as_str() {
-                    Some(s) => s.to_string(),
-                    None => continue,
-                };
+                let Some(key) = k.as_str() else { continue };
                 match n.get(k) {
-                    Some(nv) => removed_field_paths(ov, nv, &format!("{path}.{key}"), out),
-                    None => out.push(format!("{path}.{key}")),
+                    Some(nv) => {
+                        path.push(FieldStep::Key(key.to_string()));
+                        removed_field_paths(ov, nv, path, out);
+                        path.pop();
+                    }
+                    None => {
+                        let mut gone = path.clone();
+                        gone.push(FieldStep::Key(key.to_string()));
+                        out.push(gone);
+                    }
                 }
             }
         }
         (serde_yaml::Value::Sequence(o), serde_yaml::Value::Sequence(n)) => {
-            for (i, ov) in o.iter().enumerate() {
-                match n.get(i) {
-                    Some(nv) => removed_field_paths(ov, nv, &format!("{path}[{i}]"), out),
-                    None => out.push(format!("{path}[{i}]")),
+            if !o.iter().chain(n.iter()).all(|e| element_name(e).is_some()) {
+                // 这一层认不出名字：不比。按下标比会为一次插入报出一串假的删除。
+                return;
+            }
+            for ov in o {
+                let Some(name) = element_name(ov) else {
+                    continue;
+                };
+                match n
+                    .iter()
+                    .find(|e| element_name(e).as_deref() == Some(name.as_str()))
+                {
+                    Some(nv) => {
+                        path.push(FieldStep::Named(name));
+                        removed_field_paths(ov, nv, path, out);
+                        path.pop();
+                    }
+                    None => {
+                        let mut gone = path.clone();
+                        gone.push(FieldStep::Named(name));
+                        out.push(gone);
+                    }
                 }
             }
         }
@@ -1215,7 +1306,12 @@ pub(crate) fn objects_that_lost_fields(
             continue;
         };
         let mut paths = Vec::new();
-        removed_field_paths(old_spec, new_spec, ".spec", &mut paths);
+        removed_field_paths(
+            old_spec,
+            new_spec,
+            &mut vec![FieldStep::Key("spec".into())],
+            &mut paths,
+        );
         if paths.is_empty() {
             continue;
         }
@@ -1227,23 +1323,6 @@ pub(crate) fn objects_that_lost_fields(
         });
     }
     out
-}
-
-/// 哪些「删了字段」的对象**没有变**：事前事后都一样，说明这次删除没落。
-///
-/// 判不出来的一律放过：读不到代数（对象不存在、权限不够、查询超时）不是「没变」的
-/// 证据，把没有证据写成失败会让这条判据在别的故障上误报。只有「两次都读到了、而且
-/// 没有增加」才算数。
-pub(crate) fn removals_that_did_not_land(
-    seen: &[(FieldRemoval, Option<i64>, Option<i64>)],
-) -> Vec<FieldRemoval> {
-    seen.iter()
-        .filter(|(_, before, after)| match (before, after) {
-            (Some(b), Some(a)) => a <= b,
-            _ => false,
-        })
-        .map(|(r, _, _)| r.clone())
-        .collect()
 }
 
 /// 沿一串键取一个字符串字段，缺一层或不是字符串都给 `None`。
@@ -3132,9 +3211,9 @@ impl RolloutExecutor {
             .map(str::to_string))
     }
 
-    /// 这次 apply 要删字段的对象，连同它们此刻的代数。取在 apply **之前**：事后
-    /// 没有对照，「删没落」与「本来就长这样」就分不开了。
-    async fn field_removals_to_verify(&self, current: &str) -> Vec<(FieldRemoval, Option<i64>)> {
+    /// 这次 apply 要删字段的对象。只读清单，不读集群：判据比的是「这一版声明删了
+    /// 什么」，而落地没落地由 apply 之后那次回读回答。
+    async fn field_removals_to_verify(&self, current: &str) -> Vec<FieldRemoval> {
         let previous = match self.previous_support_bundle(current).await {
             Ok(Some(previous)) => previous,
             // 没有上一版：首装，没有「相对上一版删掉了什么」可言。
@@ -3151,28 +3230,23 @@ impl RolloutExecutor {
             }
         };
         let removals = objects_that_lost_fields(&previous, current, &self.ns);
-        if removals.is_empty() {
-            return Vec::new();
+        if !removals.is_empty() {
+            info!(
+                objects = %removals
+                    .iter()
+                    .map(|r| format!("{}/{}", r.resource, r.name))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "mainline rollout: this apply removes fields from live objects; they must be \
+                 gone from the objects afterwards"
+            );
         }
-        info!(
-            objects = %removals
-                .iter()
-                .map(|r| format!("{}/{}", r.resource, r.name))
-                .collect::<Vec<_>>()
-                .join(","),
-            "mainline rollout: this apply removes fields from live objects; their generation must move"
-        );
-        let mut out = Vec::new();
-        for r in removals {
-            let before = self.generation_of(&r).await;
-            out.push((r, before));
-        }
-        out
+        removals
     }
 
-    /// 一个对象的 `metadata.generation`。读不到就是读不到——`None` 与「代数为 0」
-    /// 在判据上必须分得开。
-    async fn generation_of(&self, r: &FieldRemoval) -> Option<i64> {
+    /// 一个对象的全文。读不到就是读不到——`None` 与「读回来了、字段不在」在判据上
+    /// 必须分得开。
+    async fn live_object(&self, r: &FieldRemoval) -> Option<serde_json::Value> {
         let text = self
             .probe(
                 &[
@@ -3182,24 +3256,37 @@ impl RolloutExecutor {
                     "-n",
                     &r.namespace,
                     "-o",
-                    "jsonpath={.metadata.generation}",
+                    "json",
                 ],
                 30,
                 self.rollout_timeout_secs,
             )
             .await
             .ok()?;
-        text.trim().parse::<i64>().ok()
+        serde_json::from_str(&text).ok()
     }
 
-    /// apply 之后再读一次代数，挑出「清单里删了字段、对象却没变」的那些。
-    async fn removals_not_taken(&self, seen: &[(FieldRemoval, Option<i64>)]) -> Vec<FieldRemoval> {
-        let mut reread = Vec::new();
-        for (r, before) in seen {
-            let after = self.generation_of(r).await;
-            reread.push((r.clone(), *before, after));
+    /// apply 之后把对象读回来，挑出「清单里删了字段、对象上还挂着」的那些，路径
+    /// 只留仍在的那几条。
+    ///
+    /// 读不回来（对象不在了、查不动）的不算数：那不是「没删掉」的证据，把没有证据
+    /// 写成失败会让这条判据在别的故障上误报。
+    async fn removals_not_taken(&self, seen: &[FieldRemoval]) -> Vec<FieldRemoval> {
+        let mut out = Vec::new();
+        for r in seen {
+            let Some(live) = self.live_object(r).await else {
+                continue;
+            };
+            let still = paths_still_live(&live, &r.paths);
+            if still.is_empty() {
+                continue;
+            }
+            out.push(FieldRemoval {
+                paths: still,
+                ..r.clone()
+            });
         }
-        removals_that_did_not_land(&reread)
+        out
     }
 
     /// 等这次 apply 动过的支撑工作负载回到就绪。等不到（或读不到集群）都把错误
@@ -4528,10 +4615,14 @@ impl RolloutExecutor {
                                 .iter()
                                 .map(|r| {
                                     format!(
-                                        "{}/{} ({} : {})",
+                                        "{}/{} still has {} (namespace {})",
                                         r.resource,
                                         r.name,
-                                        r.paths.join(", "),
+                                        r.paths
+                                            .iter()
+                                            .map(|p| render_path(p))
+                                            .collect::<Vec<_>>()
+                                            .join(", "),
                                         r.namespace
                                     )
                                 })
@@ -4542,12 +4633,13 @@ impl RolloutExecutor {
                                 "",
                                 SFError::Agent(format!(
                                     "{FIELD_REMOVAL_NOT_TAKEN_MARKER}: this revision's support \
-                                     manifest no longer declares {detail}, but the live object's \
-                                     generation did not move — server-side apply only deletes \
-                                     fields this field manager owns, so the deletion was never \
-                                     written and the cluster still carries them; remove them \
-                                     with a json patch instead of by leaving them out of the \
-                                     manifest"
+                                     manifest no longer declares these fields, and the apply \
+                                     reported success: {detail}. Server-side apply only deletes \
+                                     fields this field manager owns, so taking a field out of \
+                                     the manifest is not a delete — the cluster still carries \
+                                     it while the round would otherwise report health. Remove \
+                                     them with a json patch instead of by leaving them out of \
+                                     the manifest"
                                 )),
                             ));
                         }
@@ -5511,9 +5603,17 @@ data:
                 resource: "middleware.traefik.io".into(),
                 namespace: "cogneva".into(),
                 name: "cogneva-strip".into(),
-                paths: vec![".spec.headers.customRequestHeaders".into()],
+                paths: vec![vec![
+                    FieldStep::Key("spec".into()),
+                    FieldStep::Key("headers".into()),
+                    FieldStep::Key("customRequestHeaders".into()),
+                ]],
             }],
             "only the dropped key is a deletion: a changed value or a new label is not"
+        );
+        assert_eq!(
+            render_path(&removals[0].paths[0]),
+            "spec.headers.customRequestHeaders"
         );
 
         // 新对象不是删除；对象消失也不在这条判据里（它不在这一版要 apply 的东西里）。
@@ -5525,32 +5625,110 @@ data:
         assert!(objects_that_lost_fields("kind: [torn", current, "cogneva").is_empty());
     }
 
-    /// 判断「删没落」只认两次都读到的代数：读不到不是「没变」的证据，把没有证据
-    /// 写成失败会让这条判据在别的故障上误报。
+    /// 列表按 `name` 对齐，不按下标：一个元素从前面插进来，按下标比会把后面每一样都
+    /// 报成删除，而那串路径会被写进判词，读的人去找一个从没存在过的字段。认不出
+    /// `name` 的列表整段不比——少抓一种删除，好过报一个假的。
     #[test]
-    fn a_generation_that_did_not_move_is_the_only_proof_the_deletion_was_never_written() {
-        let removed = FieldRemoval {
-            resource: "middleware.traefik.io".into(),
-            namespace: "cogneva".into(),
-            name: "cogneva-strip".into(),
-            paths: vec![".spec.headers.customRequestHeaders".into()],
+    fn a_list_element_is_named_or_not_compared_at_all_never_compared_by_index() {
+        let with_containers = |list: &str| {
+            format!(
+                "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: cogneva-registry\n\
+                 spec:\n  template:\n    spec:\n      containers:\n{list}"
+            )
         };
-        // 代数没动：这次删除没写进去。
-        assert_eq!(
-            removals_that_did_not_land(&[(removed.clone(), Some(7), Some(7))]),
-            vec![removed.clone()]
+        let registry = "      - name: registry\n        image: a\n        env:\n        - name: A\n          value: '1'\n";
+        let walker = "      - name: walker\n        image: b\n";
+        // 前面插了一个元素：registry 的下标从 0 变成 1，它自己一个字都没少。
+        let previous = with_containers(&registry);
+        let current = with_containers(&format!("{walker}{registry}"));
+        assert!(
+            objects_that_lost_fields(&previous, &current, "cogneva").is_empty(),
+            "an element inserted at the front is not a deletion of everything after it"
         );
-        // 代数退回去也是"没往前动"——对象被别的写者改回旧 spec 同样是这一版没落地。
+
+        // 真的少了：按名字点名，路径里带得走。
+        let removals = objects_that_lost_fields(&current, &previous, "cogneva");
+        assert_eq!(removals.len(), 1, "{removals:?}");
         assert_eq!(
-            removals_that_did_not_land(&[(removed.clone(), Some(7), Some(6))]),
-            vec![removed.clone()]
+            render_path(&removals[0].paths[0]),
+            "spec.template.spec.containers[name=walker]"
         );
-        // 代数前进：这次 apply 写进去了，不是失败。
-        assert!(removals_that_did_not_land(&[(removed.clone(), Some(7), Some(8))]).is_empty());
-        // 任何一侧读不到都放过。
-        assert!(removals_that_did_not_land(&[(removed.clone(), None, Some(7))]).is_empty());
-        assert!(removals_that_did_not_land(&[(removed.clone(), Some(7), None)]).is_empty());
-        assert!(removals_that_did_not_land(&[(removed.clone(), None, None)]).is_empty());
+        // 列表里那个元素身上的一个键没了：路径一路走到那个元素里。
+        let without_value = registry.replace("          value: '1'\n", "");
+        assert_ne!(without_value, registry, "the fixture did not change");
+        let dropped =
+            objects_that_lost_fields(&previous, &with_containers(&without_value), "cogneva");
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(
+            dropped[0]
+                .paths
+                .iter()
+                .map(|p| render_path(p))
+                .collect::<Vec<_>>(),
+            vec!["spec.template.spec.containers[name=registry].env[name=A].value".to_string()]
+        );
+
+        // 认不出名字的列表（端口按 containerPort 认）整段不比。
+        let ports = |list: &str| {
+            format!(
+                "apiVersion: v1\nkind: Service\nmetadata:\n  name: registry\n\
+                 spec:\n  ports:\n{list}"
+            )
+        };
+        assert!(objects_that_lost_fields(
+            &ports("  - port: 5000\n  - port: 443\n"),
+            &ports("  - port: 5000\n"),
+            "cogneva"
+        )
+        .is_empty());
+    }
+
+    /// 「删没落」的证据是**对象的内容**，不是它的代数：代数在任何 spec 变化时都会
+    /// 前进，而支撑工作负载本来就每版都换镜像 tag。一个对象这一版既删了字段又换了
+    /// 镜像时，代数照涨——拿代数判会把一次没落地的删除读成落上了。
+    #[test]
+    fn a_field_still_on_the_live_object_is_the_proof_the_deletion_never_landed() {
+        let path = vec![
+            FieldStep::Key("spec".into()),
+            FieldStep::Key("headers".into()),
+            FieldStep::Key("customRequestHeaders".into()),
+        ];
+        // 字段还在：删除没写进去。
+        let still = serde_json::json!({"metadata": {"generation": 12}, "spec": {"headers":
+            {"customRequestHeaders": {"X-Frame-Options": "DENY"}}}});
+        assert_eq!(
+            paths_still_live(&still, std::slice::from_ref(&path)),
+            vec![path.clone()]
+        );
+        assert_eq!(
+            live_value(&still, &path).and_then(|v| v.get("X-Frame-Options")),
+            Some(&serde_json::json!("DENY"))
+        );
+        // 字段没了：落上了。代数在这里前进与否都不影响这一句。
+        let gone = serde_json::json!({"metadata": {"generation": 12}, "spec": {"headers": {}}});
+        assert!(paths_still_live(&gone, std::slice::from_ref(&path)).is_empty());
+        // 列表里那一个元素还在（按名字认），它的字段就还在。
+        let named = vec![
+            FieldStep::Key("spec".into()),
+            FieldStep::Key("template".into()),
+            FieldStep::Key("spec".into()),
+            FieldStep::Key("containers".into()),
+            FieldStep::Named("registry".into()),
+            FieldStep::Key("resources".into()),
+        ];
+        let live = serde_json::json!({"spec": {"template": {"spec": {"containers": [
+            {"name": "walker"},
+            {"name": "registry", "resources": {"limits": {"memory": "1Gi"}}},
+        ]}}}});
+        assert_eq!(
+            paths_still_live(&live, std::slice::from_ref(&named)),
+            vec![named.clone()]
+        );
+        // 那个容器整个没了：它的字段跟着没了，不算没落地。
+        let live = serde_json::json!({"spec": {"template": {"spec": {"containers": [
+            {"name": "walker"},
+        ]}}}});
+        assert!(paths_still_live(&live, std::slice::from_ref(&named)).is_empty());
     }
 
     /// 这条失败是**这一版的属性**：它发生在镜像一个都没动之前，却说得清「这一版的
