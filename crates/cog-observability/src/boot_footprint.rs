@@ -16,6 +16,15 @@
 //! config loaded, each model session built, all plugins initialised, serving.
 //! The value is this process's `VmRSS` at that moment, in bytes.
 //!
+//! The same points also publish **when** they were reached, in seconds counted
+//! from the first mark. Startup time could only be attributed by replaying the
+//! log by hand before this: the process-internal work behind a slow start
+//! writes nothing a database can query, and the only trace of it was the gap
+//! between two adjacent log lines. Two numbers taken at the same instants as
+//! the memory snapshots cost nothing extra to read, and one phase's own cost is
+//! the difference from the phase before it -- exactly the same arithmetic as
+//! the memory series, for the same reason.
+//!
 //! Two things about what a value means, because they decide how it is read:
 //!
 //! - **A phase's value is cumulative**, not that phase's own cost. The snapshot
@@ -44,6 +53,7 @@
 //! let one caller's typo become a second series that no rule reads.
 
 use std::sync::Mutex;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
@@ -51,6 +61,9 @@ use cog_core::SFResult;
 
 /// Resident bytes of this process at a named startup phase.
 pub const BOOT_RSS_METRIC: &str = "cogneva_boot_rss_bytes";
+
+/// Seconds from the first mark to a named startup phase.
+pub const BOOT_ELAPSED_METRIC: &str = "cogneva_boot_phase_elapsed_seconds";
 
 /// The rule that reads the series, named here so the pairing is asserted
 /// rather than left to whoever edits the chart.
@@ -71,8 +84,23 @@ pub const PHASES: &[&str] = &[
     "serving",
 ];
 
+/// One phase as it stood when it was reached.
+#[derive(Clone, Debug, PartialEq)]
+struct Mark {
+    phase: &'static str,
+    /// Resident bytes at that instant, or `None` where the read failed.
+    rss: Option<u64>,
+    /// Seconds from the first mark to this one.
+    elapsed_seconds: f64,
+}
+
 /// One snapshot per phase, in phase order, first mark wins.
-static MARKS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
+static MARKS: Mutex<Vec<Mark>> = Mutex::new(Vec::new());
+
+/// The instant elapsed time is counted from: the first phase marked, which in a
+/// real boot is `process-start`. A mutex rather than a `OnceLock` so a test can
+/// forget the origin along with the marks it left behind.
+static ORIGIN: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Records this process's resident memory at `phase`.
 ///
@@ -87,7 +115,7 @@ static MARKS: Mutex<Vec<(&'static str, u64)>> = Mutex::new(Vec::new());
 /// startup has no series at all, and the log is then the only place the last
 /// phase reached is written down. When the resident read fails the phase is
 /// still announced -- where a boot got to is worth knowing even without the
-/// number.
+/// number -- and it still carries its elapsed time, which costs no read to take.
 pub fn mark(phase: &'static str) {
     if !PHASES.contains(&phase) {
         tracing::debug!(
@@ -100,26 +128,62 @@ pub fn mark(phase: &'static str) {
         Ok(m) => m,
         Err(e) => e.into_inner(),
     };
-    if marks.iter().any(|(p, _)| *p == phase) {
+    if marks.iter().any(|m| m.phase == phase) {
         return;
     }
-    match resident_bytes() {
+    // Time before memory: the resident read opens a file, and a phase's position
+    // in startup must not move because procfs was slow or missing.
+    let elapsed_seconds = {
+        let mut origin = match ORIGIN.lock() {
+            Ok(o) => o,
+            Err(e) => e.into_inner(),
+        };
+        origin
+            .get_or_insert_with(Instant::now)
+            .elapsed()
+            .as_secs_f64()
+    };
+    let rss = resident_bytes();
+    marks.push(Mark {
+        phase,
+        rss,
+        elapsed_seconds,
+    });
+    marks.sort_by_key(|m| {
+        PHASES
+            .iter()
+            .position(|x| *x == m.phase)
+            .unwrap_or(usize::MAX)
+    });
+    match rss {
         Some(rss) => {
-            marks.push((phase, rss));
-            marks.sort_by_key(|(p, _)| PHASES.iter().position(|x| x == p).unwrap_or(usize::MAX));
-            tracing::info!(phase, rss, "boot footprint: phase reached");
+            tracing::info!(phase, rss, elapsed_seconds, "boot footprint: phase reached")
         }
-        None => {
-            tracing::info!(
-                phase,
-                "boot footprint: phase reached, but resident memory could not be read here"
-            );
-        }
+        None => tracing::info!(
+            phase,
+            elapsed_seconds,
+            "boot footprint: phase reached, but resident memory could not be read here"
+        ),
     }
 }
 
-/// The snapshots taken so far, in phase order.
+/// The memory snapshots taken so far, in phase order.
 pub fn marks() -> Vec<(&'static str, u64)> {
+    snapshot()
+        .into_iter()
+        .filter_map(|m| m.rss.map(|rss| (m.phase, rss)))
+        .collect()
+}
+
+/// Seconds from the first mark to every phase reached so far, in phase order.
+pub fn marks_elapsed() -> Vec<(&'static str, f64)> {
+    snapshot()
+        .into_iter()
+        .map(|m| (m.phase, m.elapsed_seconds))
+        .collect()
+}
+
+fn snapshot() -> Vec<Mark> {
     match MARKS.lock() {
         Ok(m) => m.clone(),
         Err(e) => e.into_inner().clone(),
@@ -130,11 +194,14 @@ pub fn marks() -> Vec<(&'static str, u64)> {
 /// marks must not decide what the next test reads.
 #[doc(hidden)]
 pub fn clear_for_tests() {
-    let mut marks = match MARKS.lock() {
-        Ok(m) => m,
-        Err(e) => e.into_inner(),
-    };
-    marks.clear();
+    match MARKS.lock() {
+        Ok(mut m) => m.clear(),
+        Err(e) => e.into_inner().clear(),
+    }
+    match ORIGIN.lock() {
+        Ok(mut o) => *o = None,
+        Err(e) => *e.into_inner() = None,
+    }
 }
 
 /// This process's resident bytes from `/proc/self/status`, or `None` where that
@@ -156,18 +223,27 @@ pub fn parse_vm_rss(status: &str) -> Option<u64> {
     })
 }
 
-/// Publishes one `cogneva_boot_rss_bytes` series per recorded phase.
+/// Publishes one `cogneva_boot_rss_bytes` and one
+/// `cogneva_boot_phase_elapsed_seconds` series per recorded phase.
 pub struct BootFootprintObservable;
 
 #[async_trait]
 impl Observable for BootFootprintObservable {
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
-        Ok(marks()
-            .into_iter()
-            .map(|(phase, bytes)| {
-                RawMetric::new(BOOT_RSS_METRIC, bytes as f64).with_label(crate::LABEL_PHASE, phase)
-            })
-            .collect())
+        let mut metrics = Vec::new();
+        for mark in snapshot() {
+            metrics.push(
+                RawMetric::new(BOOT_ELAPSED_METRIC, mark.elapsed_seconds)
+                    .with_label(crate::LABEL_PHASE, mark.phase),
+            );
+            if let Some(bytes) = mark.rss {
+                metrics.push(
+                    RawMetric::new(BOOT_RSS_METRIC, bytes as f64)
+                        .with_label(crate::LABEL_PHASE, mark.phase),
+                );
+            }
+        }
+        Ok(metrics)
     }
 
     async fn collect_trace(&self, _task_id: &str) -> SFResult<Vec<TraceFragment>> {
@@ -333,6 +409,64 @@ mod tests {
         clear_for_tests();
     }
 
+    #[test]
+    fn the_second_phase_carries_the_time_the_first_one_did_not() {
+        let _guard = one_at_a_time();
+        clear_for_tests();
+        mark("process-start");
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        mark("config-loaded");
+
+        let elapsed = marks_elapsed();
+        assert_eq!(
+            elapsed.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+            vec!["process-start", "config-loaded"],
+            "the time series has to name the same phases, in the same order, as the memory series"
+        );
+        assert!(
+            elapsed[0].1 < 0.030,
+            "the first phase is the origin of the count and must come out at about zero, got {:?}",
+            elapsed
+        );
+        assert!(
+            elapsed[1].1 >= 0.020,
+            "30 ms passed between the two marks and the second has to carry it, got {:?}",
+            elapsed
+        );
+
+        // First mark wins here too: a later call is the process at some
+        // unrelated moment under a name that says "at startup".
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        mark("config-loaded");
+        assert_eq!(
+            marks_elapsed(),
+            elapsed,
+            "re-marking a phase moved the time it was reached at"
+        );
+        clear_for_tests();
+    }
+
+    #[test]
+    fn clearing_forgets_the_origin_along_with_the_marks() {
+        let _guard = one_at_a_time();
+        clear_for_tests();
+        mark("process-start");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        clear_for_tests();
+
+        // A second test's first phase is its own origin, not the time since
+        // whatever the previous test happened to mark.
+        mark("serving");
+        let elapsed = marks_elapsed();
+        assert_eq!(elapsed.len(), 1);
+        assert!(
+            elapsed[0].1 < 0.010,
+            "the origin survived a clear, so the next test reads the previous one's clock: {:?}",
+            elapsed
+        );
+        clear_for_tests();
+    }
+
     // Driven from a sync test on purpose: the guard this suite serializes on is
     // a std mutex, and holding one across an await is both a lint and a real
     // hazard -- another test running on the same thread would wait for a lock
@@ -362,8 +496,36 @@ mod tests {
             .collect();
         assert_eq!(phases, vec!["process-start", "plugins-initialized"]);
         assert!(
-            metrics.iter().all(|m| m.value > 0.0),
+            metrics
+                .iter()
+                .filter(|m| m.name == BOOT_RSS_METRIC)
+                .all(|m| m.value > 0.0),
             "a live process has resident memory"
+        );
+
+        // The time series is published for the same phases by the same reading:
+        // a reader that has to ask a second endpoint for it is a reader that
+        // compares two scrapes of different instants.
+        let timed: Vec<String> = metrics
+            .iter()
+            .filter(|m| m.name == BOOT_ELAPSED_METRIC)
+            .map(|m| {
+                m.labels
+                    .get(crate::LABEL_PHASE)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect();
+        assert_eq!(
+            timed, phases,
+            "the reading published a time series for a different set of phases than the memory series"
+        );
+        assert!(
+            metrics
+                .iter()
+                .filter(|m| m.name == BOOT_ELAPSED_METRIC)
+                .all(|m| m.value >= 0.0),
+            "elapsed time cannot run backwards from the origin"
         );
         clear_for_tests();
     }
