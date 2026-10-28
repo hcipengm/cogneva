@@ -33,12 +33,11 @@
 mod common;
 
 use common::routes::{read_repo, repo_root};
+use common::service_topology;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
 
 use cog_gateway::security_gateway::{RangeReadBaseline, RANGE_READ_BASELINES};
-use serde::Deserialize;
 
 #[path = "common/closed_set.rs"]
 mod closed_set;
@@ -1809,60 +1808,18 @@ fn chart_rules() -> Vec<(String, String)> {
         .collect()
 }
 
-/// The directory holding the rules this repo applies from a manifest rather
-/// than from the chart.
-const RULE_MANIFESTS_DIR: &str = "deploy/k3s/observability/manifests";
-
 /// Every rule carried by a `PrometheusRule` manifest here, name to expression,
 /// in file order.
 ///
 /// The chart is not the only place this repo ships rules: `deploy/k3s/` carries
 /// its own `PrometheusRule` objects, and the cluster applies those directly. A
 /// rule there that reads a series nothing publishes never fires, and a gate
-/// that only reads the chart says nothing about it. The directory is scanned
-/// rather than listed, because a hard-coded list of manifests is the same blind
-/// spot one level down.
+/// that only reads the chart says nothing about it.
 ///
 /// Recording rules are in reach too: "the series this reads does not exist" is
 /// the same defect whether the rule alerts on it or records it.
 fn manifest_rules() -> Vec<(String, String)> {
-    let dir = repo_root().join(RULE_MANIFESTS_DIR);
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()))
-        .map(|entry| entry.expect("manifest entry").path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-        })
-        .collect();
-    paths.sort();
-
-    let mut rules = Vec::new();
-    for path in paths {
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        // A manifest file holds several documents, so the single-document
-        // parser rejects the file itself. A document that will not parse is a
-        // failure rather than a skip: skipping it would drop whichever rules it
-        // carried and leave the gate green on a torn file.
-        for document in serde_yaml::Deserializer::from_str(&text) {
-            let doc = serde_yaml::Value::deserialize(document).unwrap_or_else(|e| {
-                panic!("{} has a document that will not parse: {e}", path.display())
-            });
-            if doc["kind"].as_str() != Some("PrometheusRule") {
-                continue;
-            }
-            for group in doc["spec"]["groups"].as_sequence().into_iter().flatten() {
-                for rule in group["rules"].as_sequence().into_iter().flatten() {
-                    let name = rule["alert"].as_str().or_else(|| rule["record"].as_str());
-                    if let (Some(name), Some(expr)) = (name, rule["expr"].as_str()) {
-                        rules.push((name.to_string(), expr.to_string()));
-                    }
-                }
-            }
-        }
-    }
-    rules
+    service_topology::prometheus_rules(&repo_root())
 }
 
 /// Every rule this repo ships: the ones the chart renders plus the ones a
@@ -1876,48 +1833,23 @@ fn shipped_rules() -> Vec<(String, String)> {
 
 /// Every alert in a `PrometheusRule` manifest here, as (file, alert, labels).
 fn manifest_alerts() -> Vec<(String, String, BTreeMap<String, String>)> {
-    let dir = repo_root().join(RULE_MANIFESTS_DIR);
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()))
-        .map(|entry| entry.expect("manifest entry").path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-        })
-        .collect();
-    paths.sort();
-
     let mut alerts = Vec::new();
-    for path in paths {
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        for document in serde_yaml::Deserializer::from_str(&text) {
-            let doc = serde_yaml::Value::deserialize(document).unwrap_or_else(|e| {
-                panic!("{} has a document that will not parse: {e}", path.display())
-            });
-            if doc["kind"].as_str() != Some("PrometheusRule") {
-                continue;
-            }
-            for group in doc["spec"]["groups"].as_sequence().into_iter().flatten() {
-                for rule in group["rules"].as_sequence().into_iter().flatten() {
-                    let Some(alert) = rule["alert"].as_str() else {
-                        continue;
-                    };
-                    let labels = rule["labels"]
-                        .as_mapping()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|(k, v)| {
-                            Some((k.as_str()?.to_string(), v.as_str()?.to_string()))
-                        })
-                        .collect();
-                    alerts.push((name.clone(), alert.to_string(), labels));
-                }
+    for (file, doc) in service_topology::observability_documents(&repo_root()) {
+        if doc["kind"].as_str() != Some("PrometheusRule") {
+            continue;
+        }
+        for group in doc["spec"]["groups"].as_sequence().into_iter().flatten() {
+            for rule in group["rules"].as_sequence().into_iter().flatten() {
+                let Some(alert) = rule["alert"].as_str() else {
+                    continue;
+                };
+                let labels = rule["labels"]
+                    .as_mapping()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+                    .collect();
+                alerts.push((file.clone(), alert.to_string(), labels));
             }
         }
     }
@@ -1957,7 +1889,8 @@ fn every_manifest_alert_is_marked_for_the_mirror() {
     let alerts = manifest_alerts();
     assert!(
         !alerts.is_empty(),
-        "no alert found in {RULE_MANIFESTS_DIR}, so this gate checked nothing"
+        "no alert found in {}, so this gate checked nothing",
+        service_topology::OBSERVABILITY_MANIFESTS
     );
     let complaints = mirror_complaints(&alerts, label, wanted, &chart_rule_names);
 

@@ -28,6 +28,86 @@ pub const MAIN: &str = "crates/cogneva/src/main.rs";
 pub const APPLY_TREE: &str = "deploy/k3s";
 /// 预渲染产物：`helm install` 投递的那份字节。每个 profile 一个目录。
 pub const RENDERED: &str = "deploy/rendered";
+/// 观测面直接 apply 的那批清单：`PrometheusRule`、`ServiceMonitor`、Grafana 面板。
+pub const OBSERVABILITY_MANIFESTS: &str = "deploy/k3s/observability/manifests";
+
+/// 观测清单目录下的每一篇文档，带它所在文件的名字，按文件名与文件内顺序。
+///
+/// 目录是扫出来的，不是列出来的——一份写死的清单就是同一处盲点低一层。文件读不出来、
+/// 文档解析不出来都停在这里，而不是少读一份继续。这三步「枚举目录 → 读文件 → 逐篇
+/// 解析」在几份观测判据里各写了一遍，而每份对失败的处理不同：有的逐个 `entry.ok()`
+/// 把读不出的条目丢掉，有的 `filter_map` 把解析不出的一篇丢掉。丢掉的那一份从此不在
+/// 人口里，剩下的普查照样报绿，而「它有冲突但没读到」与「它干净」在判词上同形。
+///
+/// 只给文件名（不是绝对路径）：调用方要判的是「哪份清单说的」，绝对路径读起来只是噪音。
+pub fn observability_documents(root: &Path) -> Vec<(String, serde_yaml::Value)> {
+    let mut files = Vec::new();
+    walk(
+        &root.join(OBSERVABILITY_MANIFESTS),
+        &["yaml", "yml"],
+        &mut files,
+    );
+    files.sort();
+    let mut out = Vec::new();
+    for path in files {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        for doc in super::yaml::docs(&read(&path), &path.display().to_string()) {
+            out.push((name.clone(), doc));
+        }
+    }
+    out
+}
+
+/// `kind: PrometheusRule` 清单里的每条规则：名字（`alert`，没有就取 `record`）到表达式。
+///
+/// 记录规则也算：「这里读的序列没人产出」与这条规则是告警还是记录无关。
+pub fn prometheus_rules(root: &Path) -> Vec<(String, String)> {
+    prometheus_rule_entries(root)
+        .into_iter()
+        .filter_map(|(name, expr)| Some((name?, expr)))
+        .collect()
+}
+
+/// `PrometheusRule` 清单里每条规则的 `expr`，不管它有没有名字。
+///
+/// 与 [`prometheus_rules`] 的差别只在名字：那份要按名字把规则对起来，没名字的对不上；
+/// 这份问的是「这些规则读了哪些序列」，一条没有名字却带着表达式的规则照样在读。拿按名
+/// 字的那份去算表达式面，会让面悄悄小一圈，而小了的面对「有没有人读这条序列」还是报绿。
+pub fn prometheus_rule_expressions(root: &Path) -> Vec<String> {
+    prometheus_rule_entries(root)
+        .into_iter()
+        .map(|(_, expr)| expr)
+        .collect()
+}
+
+/// 同一遍走：规则的名字（`alert` 优先，其次 `record`；都没有就是 `None`）与表达式。
+///
+/// 没有表达式的那条不进人口——它不读任何序列，与「读了但没名字」不是一回事。
+fn prometheus_rule_entries(root: &Path) -> Vec<(Option<String>, String)> {
+    let mut rules = Vec::new();
+    for (_, doc) in observability_documents(root) {
+        if doc["kind"].as_str() != Some("PrometheusRule") {
+            continue;
+        }
+        for group in doc["spec"]["groups"].as_sequence().into_iter().flatten() {
+            for rule in group["rules"].as_sequence().into_iter().flatten() {
+                let Some(expr) = rule["expr"].as_str() else {
+                    continue;
+                };
+                let name = rule["alert"]
+                    .as_str()
+                    .or_else(|| rule["record"].as_str())
+                    .map(str::to_string);
+                rules.push((name, expr.to_string()));
+            }
+        }
+    }
+    rules
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ContainerSpec {

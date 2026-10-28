@@ -56,15 +56,12 @@
 //! there as an unexplained literal rather than as a series nothing checks.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 
 mod common;
 
 use common::routes::{read_repo, repo_root};
-
 use common::rust_production::all_crate_files;
-
-use serde::Deserialize;
+use common::service_topology;
 
 #[path = "common/dashboard.rs"]
 mod dashboard;
@@ -771,9 +768,6 @@ fn faces() -> Vec<(&'static str, BTreeSet<String>)> {
     ]
 }
 
-/// Where this repo applies alert rules from a manifest rather than the chart.
-const RULE_MANIFESTS_DIR: &str = "deploy/k3s/observability/manifests";
-
 /// Every expression this repo ships as an alert or recording rule: the chart's,
 /// then the manifests'.
 ///
@@ -787,11 +781,8 @@ const RULE_MANIFESTS_DIR: &str = "deploy/k3s/observability/manifests";
 /// directory; both sides have to see the same rules or each is a gate the
 /// other does not know about.
 ///
-/// The directory is scanned rather than listed, for the reason the alert-rule
-/// contract gives: a hard-coded list of manifests is the same blind spot one
-/// level down. A document that will not parse fails the test rather than being
-/// skipped -- skipping would drop that document's rules and leave this face
-/// quietly smaller, which reads as coverage.
+/// Both sources are read through the one shared walk, so a document that will
+/// not parse stops the census rather than leaving this face quietly smaller.
 fn rule_expressions() -> Vec<String> {
     let text = read_repo(CHART_CONFIG);
     let value: serde_json::Value =
@@ -810,43 +801,12 @@ fn rule_expressions() -> Vec<String> {
     expressions
 }
 
-/// Every `expr` the `PrometheusRule` manifests under `RULE_MANIFESTS_DIR` carry.
+/// Every `expr` the `PrometheusRule` manifests under the observability tree carry.
 ///
 /// Recording rules count: "a series nothing publishes is read here" is the same
 /// defect whether the rule alerts on it or records it.
 fn manifest_rule_expressions() -> Vec<String> {
-    let dir = repo_root().join(RULE_MANIFESTS_DIR);
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()))
-        .map(|entry| entry.expect("manifest entry").path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-        })
-        .collect();
-    paths.sort();
-
-    let mut expressions = Vec::new();
-    for path in paths {
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        for document in serde_yaml::Deserializer::from_str(&text) {
-            let doc = serde_yaml::Value::deserialize(document).unwrap_or_else(|e| {
-                panic!("{} has a document that will not parse: {e}", path.display())
-            });
-            if doc["kind"].as_str() != Some("PrometheusRule") {
-                continue;
-            }
-            for group in doc["spec"]["groups"].as_sequence().into_iter().flatten() {
-                for rule in group["rules"].as_sequence().into_iter().flatten() {
-                    if let Some(expr) = rule["expr"].as_str() {
-                        expressions.push(expr.to_string());
-                    }
-                }
-            }
-        }
-    }
-    expressions
+    service_topology::prometheus_rule_expressions(&repo_root())
 }
 
 /// The series names one produced table lists.

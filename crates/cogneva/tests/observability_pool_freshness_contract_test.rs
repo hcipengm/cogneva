@@ -47,11 +47,9 @@
 mod common;
 
 use common::routes::{read_repo, repo_root};
+use common::service_topology;
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
-
-use serde::Deserialize;
 
 #[path = "common/promql.rs"]
 mod promql;
@@ -59,7 +57,6 @@ mod promql;
 use promql::unguarded_store_reading_complaints;
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
-const RULE_MANIFESTS_DIR: &str = "deploy/k3s/observability/manifests";
 
 /// Every rule the chart renders, name to expression, in file order.
 fn chart_rules() -> Vec<(String, String)> {
@@ -78,51 +75,13 @@ fn chart_rules() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Every rule a `PrometheusRule` manifest ships, name to expression.
+/// Every rule this repo ships: the chart's, plus the ones a manifest applies.
 ///
 /// The chart is not the only place rules come from, and a gate that reads one
-/// source says nothing about the other. A document that will not parse fails
-/// rather than being skipped: skipping it would drop whichever rules it carried
-/// and leave the gate green on a torn file.
-fn manifest_rules() -> Vec<(String, String)> {
-    let dir = repo_root().join(RULE_MANIFESTS_DIR);
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()))
-        .map(|entry| entry.expect("manifest entry").path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-        })
-        .collect();
-    paths.sort();
-
-    let mut rules = Vec::new();
-    for path in paths {
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        for document in serde_yaml::Deserializer::from_str(&text) {
-            let doc = serde_yaml::Value::deserialize(document).unwrap_or_else(|e| {
-                panic!("{} has a document that will not parse: {e}", path.display())
-            });
-            if doc["kind"].as_str() != Some("PrometheusRule") {
-                continue;
-            }
-            for group in doc["spec"]["groups"].as_sequence().into_iter().flatten() {
-                for rule in group["rules"].as_sequence().into_iter().flatten() {
-                    let name = rule["alert"].as_str().or_else(|| rule["record"].as_str());
-                    if let (Some(name), Some(expr)) = (name, rule["expr"].as_str()) {
-                        rules.push((name.to_string(), expr.to_string()));
-                    }
-                }
-            }
-        }
-    }
-    rules
-}
-
+/// source says nothing about the other.
 fn shipped_rules() -> Vec<(String, String)> {
     let mut rules = chart_rules();
-    rules.extend(manifest_rules());
+    rules.extend(service_topology::prometheus_rules(&repo_root()));
     rules
 }
 
@@ -131,53 +90,29 @@ fn shipped_rules() -> Vec<(String, String)> {
 ///
 /// The dashboards reach Grafana as `ConfigMap` data labelled `grafana_dashboard`
 /// and are read by file provisioning, so the file is the query text and nothing
-/// else stands between it and the panel. A document that will not parse fails
-/// rather than being skipped, for the same reason the rule walk does: skipping
-/// would drop the panels it carried and leave the gate green on a torn file.
+/// else stands between it and the panel.
 fn panel_expressions() -> Vec<(String, String)> {
-    let dir = repo_root().join(RULE_MANIFESTS_DIR);
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{} unreadable: {e}", dir.display()))
-        .map(|entry| entry.expect("manifest entry").path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|ext| ext == "yaml" || ext == "yml")
-        })
-        .collect();
-    paths.sort();
-
     let mut out = Vec::new();
-    for path in paths {
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
-        for document in serde_yaml::Deserializer::from_str(&text) {
-            let doc = serde_yaml::Value::deserialize(document).unwrap_or_else(|e| {
-                panic!("{} has a document that will not parse: {e}", path.display())
-            });
-            if doc["kind"].as_str() != Some("ConfigMap") {
-                continue;
-            }
-            if doc["metadata"]["labels"]["grafana_dashboard"].as_str() != Some("1") {
-                continue;
-            }
-            let Some(data) = doc["data"].as_mapping() else {
+    for (file, doc) in service_topology::observability_documents(&repo_root()) {
+        if doc["kind"].as_str() != Some("ConfigMap") {
+            continue;
+        }
+        if doc["metadata"]["labels"]["grafana_dashboard"].as_str() != Some("1") {
+            continue;
+        }
+        let Some(data) = doc["data"].as_mapping() else {
+            continue;
+        };
+        for (key, body) in data {
+            let Some(dashboard_name) = key.as_str() else {
                 continue;
             };
-            for (key, body) in data {
-                let Some(dashboard_name) = key.as_str() else {
-                    continue;
-                };
-                let Some(body) = body.as_str() else {
-                    continue;
-                };
-                let dashboard: serde_json::Value = serde_json::from_str(body).unwrap_or_else(|e| {
-                    panic!(
-                        "{} / {dashboard_name} is not valid JSON: {e}",
-                        path.display()
-                    )
-                });
-                walk_panels(dashboard_name, &dashboard, &mut out);
-            }
+            let Some(body) = body.as_str() else {
+                continue;
+            };
+            let dashboard: serde_json::Value = serde_json::from_str(body)
+                .unwrap_or_else(|e| panic!("{file} / {dashboard_name} is not valid JSON: {e}"));
+            walk_panels(dashboard_name, &dashboard, &mut out);
         }
     }
     out
