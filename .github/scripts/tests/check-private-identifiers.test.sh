@@ -108,7 +108,24 @@ export REQUIRE_PRIVATE_IDENTIFIERS=true
 run_gate 1 '要求它必须在' "${fixture}"
 unset REQUIRE_PRIVATE_IDENTIFIERS
 
-# --- 3：真文件 —— 这棵仓库今天必须绿 ---
+# --- 3：一处引用都没读到 != 一处都不该引 ---
+# 这条门只认命中，所以「扫了个空」与「树里只有允许的那一处」印的是同一句「通过」。
+# 两种扫不到各钉一格：
+#   a) 仓库在、被跟踪的文件里一处 `hcipengm/…` 都没有；
+#   b) 根目录根本不是 git 仓库（git grep 退出 >1，命中同样为空）。
+quiet="${work}/quiet"
+git -C "${work}" init -q quiet
+mkdir -p "${quiet}/deploy"
+printf '%s\n' 'nothing points at a repository here' >"${quiet}/deploy/notes.txt"
+git -C "${quiet}" add deploy/notes.txt
+run_gate 3 '一处 hcipengm/… 的引用都没有读到' "${quiet}"
+
+not_a_repo="${work}/not-a-repo"
+mkdir -p "${not_a_repo}/deploy"
+printf '%s\n' 'see https://github.com/hcipengm/cogneva' >"${not_a_repo}/deploy/notes.txt"
+run_gate 3 '读不出这棵树' "${not_a_repo}"
+
+# --- 4：真文件 —— 这棵仓库今天必须绿 ---
 # 夹具全绿而真树红，说明这条门在测自己；两边都绿，才说明它今天在守东西。
 run_gate 0 '通过' "${repo}"
 

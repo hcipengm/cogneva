@@ -46,8 +46,12 @@ offenders() {
 
 # 树里所有 `owner/repo` 形态的匹配，去重。`git grep` 读的是**被跟踪**的文件，
 # 所以构建残渣、未跟踪的草稿不会把门弄红。
+#
+# 调用方在 main 里直接取它的输出并**自己看退出码**：这个函数若在命令替换里 `exit`，
+# 只结束那个子壳，父壳会接着走到「通过」。`git grep` 的 1 是「一处也没中」，
+# >1 才是「没扫成」——两种都在输出上表现为空。
 scan_owner_repo() {
-  git -C "$ROOT" grep -ohE -- "${OWNER}/[A-Za-z0-9._-]+" | sort -u
+  git -C "$ROOT" grep -ohE -- "${OWNER}/[A-Za-z0-9._-]+" | sed '/^$/d' | sort -u
 }
 
 locate() {  # 判词要指到行，不然拿到一个仓名还得自己找它在哪
@@ -89,8 +93,19 @@ scan_bare_identifiers() {
 }
 
 main() {
-  local matches bad rc=0 member
-  matches="$(scan_owner_repo)"
+  local matches bad rc=0 member status=0
+  matches="$(scan_owner_repo)" || status=$?
+  if [ "${status}" -gt 1 ]; then
+    # 读不出来与「树里没有指向任何私有仓的引用」印的是同一句「通过」。后者是结论，
+    # 前者是没做成这件事，两者不能共用一个退出码。
+    log "私有标识门（所有者/仓）：读不出这棵树（git grep 退出 ${status}）——没读到就判不了引用指向谁"
+    return 3
+  fi
+  if [ -z "${matches}" ]; then
+    log "私有标识门（所有者/仓）：树里一处 ${OWNER}/… 的引用都没有读到——零处与"
+    log "「只有 ${OWNER}/${ALLOWED_REPO}」在输出上同形，这一跑什么都没证明"
+    return 3
+  fi
   bad="$(printf '%s\n' "${matches}" | offenders)"
   if [ -n "${bad}" ]; then
     rc=1
