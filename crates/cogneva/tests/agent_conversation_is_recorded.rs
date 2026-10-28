@@ -20,13 +20,15 @@
 //! PostgreSQL in `cog-storage`'s own suite, and what this suite is about is
 //! whether the route writes at all and reads back what it wrote.
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use cog_core::{AgentRegistration, AgentRegistry, ResourceInfo, SFResult};
+use cog_core::{AgentRegistration, AgentRegistry, SFResult};
 use cog_gateway::{create_router, GatewayState};
 use cog_storage::{AgentMessage, AgentMessageStore, NewAgentMessage, SendOutcome};
 
@@ -50,31 +52,16 @@ impl AgentRegistry for OneAgent {
         Ok(())
     }
     async fn get(&self, agent_id: &str) -> SFResult<Option<AgentRegistration>> {
-        Ok((agent_id == AGENT).then(registration))
+        Ok((agent_id == AGENT).then(|| common::mocks::registration(AGENT)))
     }
     async fn list(&self) -> SFResult<Vec<AgentRegistration>> {
-        Ok(vec![registration()])
+        Ok(vec![common::mocks::registration(AGENT)])
     }
     async fn list_by_role(&self, _role: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(vec![registration()])
+        Ok(vec![common::mocks::registration(AGENT)])
     }
     async fn list_by_capability(&self, _capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(vec![registration()])
-    }
-}
-
-fn registration() -> AgentRegistration {
-    let now = chrono::Utc::now();
-    AgentRegistration {
-        agent_id: AGENT.into(),
-        hostname: "probe-host".into(),
-        pod_ip: "127.0.0.1".into(),
-        role: "worker".into(),
-        workspace_id: "default".into(),
-        capabilities: Vec::new(),
-        resources: ResourceInfo::default(),
-        registered_at: now,
-        last_heartbeat: now,
+        Ok(vec![common::mocks::registration(AGENT)])
     }
 }
 

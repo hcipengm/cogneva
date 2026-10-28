@@ -23,6 +23,8 @@
 //! is the route's contract, and a real agent would add a model call in the
 //! middle of it.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,9 +32,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use cog_core::{
-    AgentRegistration, AgentRegistry, InboxMessage, MessageBackend, ResourceInfo, SFResult,
-};
+use cog_core::{AgentRegistration, AgentRegistry, InboxMessage, MessageBackend, SFResult};
 use cog_gateway::{create_router, GatewayState};
 
 mod router_state;
@@ -55,31 +55,16 @@ impl AgentRegistry for OneAgent {
         Ok(())
     }
     async fn get(&self, agent_id: &str) -> SFResult<Option<AgentRegistration>> {
-        Ok((agent_id == AGENT).then(registration))
+        Ok((agent_id == AGENT).then(|| common::mocks::registration(AGENT)))
     }
     async fn list(&self) -> SFResult<Vec<AgentRegistration>> {
-        Ok(vec![registration()])
+        Ok(vec![common::mocks::registration(AGENT)])
     }
     async fn list_by_role(&self, _role: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(vec![registration()])
+        Ok(vec![common::mocks::registration(AGENT)])
     }
     async fn list_by_capability(&self, _capability: &str) -> SFResult<Vec<AgentRegistration>> {
-        Ok(vec![registration()])
-    }
-}
-
-fn registration() -> AgentRegistration {
-    let now = chrono::Utc::now();
-    AgentRegistration {
-        agent_id: AGENT.into(),
-        hostname: "probe-host".into(),
-        pod_ip: "127.0.0.1".into(),
-        role: "worker".into(),
-        workspace_id: "default".into(),
-        capabilities: Vec::new(),
-        resources: ResourceInfo::default(),
-        registered_at: now,
-        last_heartbeat: now,
+        Ok(vec![common::mocks::registration(AGENT)])
     }
 }
 
