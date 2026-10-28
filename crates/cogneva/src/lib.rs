@@ -396,3 +396,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 #[path = "../../cogneva/tests/common/root.rs"]
 pub(crate) mod checkout;
+
+/// 单测共用的样例：真的走一遍 HTTP，读回状态码与正文。
+#[cfg(test)]
+pub(crate) mod test_support;
