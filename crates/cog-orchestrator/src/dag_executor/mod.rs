@@ -417,7 +417,13 @@ impl DagExecutorRuntime {
         // alternative -- splitting one allowance between queues -- lets a
         // backlog on one queue decide how much the other may dispatch, which is
         // how a stalled queue starves a healthy one.
-        let mut admitted_by_stream: HashMap<String, u64> = HashMap::new();
+        // The admission itself, not just its job count: the line below that
+        // reports a hold names the gate that held it, and that gate is this
+        // value's `bound`. Carrying only the count makes the reporter
+        // reconstruct a gate it was already told, and a reconstruction of a
+        // closed set defaults to whichever member is written first.
+        let mut admitted_by_stream: HashMap<String, crate::ready_queue::PassAdmission> =
+            HashMap::new();
         for stream in [
             crate::ready_queue::ready_stream(&self.config.workspace_id),
             crate::ready_queue::process_local_ready_stream(&self.config.workspace_id),
@@ -430,7 +436,7 @@ impl DagExecutorRuntime {
                 window_jobs,
                 READY_TASKS_PER_PASS,
             );
-            admitted_by_stream.insert(stream.clone(), admitted.jobs);
+            admitted_by_stream.insert(stream.clone(), admitted);
             self.record_admission(
                 &stream,
                 pays_for,
@@ -445,8 +451,8 @@ impl DagExecutorRuntime {
         let mut first_error: Option<SFError> = None;
         let mut column_holds: HashMap<(String, &'static str), u64> = HashMap::new();
         for (stream, mut entries) in by_stream {
-            if let Some(&admitted) = admitted_by_stream.get(&stream) {
-                if (entries.len() as u64) > admitted {
+            if let Some(admitted) = admitted_by_stream.get(&stream).copied() {
+                if (entries.len() as u64) > admitted.jobs {
                     // The reading the refusal was decided on travels with it:
                     // a hold that names only how many were held leaves the
                     // reader unable to tell a window that is nearly spent from
@@ -458,7 +464,7 @@ impl DagExecutorRuntime {
                         tracing::warn!(
                             stream = %stream,
                             ready = entries.len(),
-                            admitted,
+                            admitted = admitted.jobs,
                             owed = in_flight.get(&stream).copied().unwrap_or(0),
                             window_jobs = ?bound.window_jobs,
                             allowance_tokens = bound.pace.allowance_tokens,
@@ -476,45 +482,48 @@ impl DagExecutorRuntime {
                                     self.config.ready_task_poll_interval_secs as i64
                                 )
                             ),
-                            // Which gate said zero. The window arithmetic below
-                            // is printed either way, and for an unavailable
-                            // pool it contradicts the hold -- the allowance
-                            // already covers a job while nothing is admitted.
-                            // A reader given only the numbers would tune the
-                            // pace for a pool that is simply down.
+                            // Which gate said zero, read off the admission this
+                            // pass actually made -- the same value the held
+                            // counter is labelled with, so the line and the
+                            // series cannot disagree. The window arithmetic
+                            // below is printed either way, and for an
+                            // unavailable pool it contradicts the hold -- the
+                            // allowance already covers a job while nothing is
+                            // admitted. A reader given only the numbers would
+                            // tune the pace for a pool that is simply down,
+                            // and a line that named the window while the pass
+                            // was sliced by its own ceiling would send that
+                            // reader to tune an allowance nothing was reading.
                             refusal = crate::ready_queue::hold_reason(
                                 bound.unavailable,
-                                crate::ready_queue::PassBound::Window,
+                                admitted.bound,
                             ),
                             "holding ready tasks back: nothing may be admitted this pass, so they stay pending until the pool can serve them"
                         );
                     } else {
-                        // The other branch is the one with no window bound to
-                        // print, and it has two causes: no status read at all,
-                        // and a status whose measurement cannot bound the pool.
-                        // Both are throttles by the pass's own slice, and a
-                        // batch that shrank from two thousand to two hundred
-                        // with no line about it is a throttle nobody can find
-                        // later -- so the line is written, and it says which of
-                        // the two it was.
+                        // This branch is reached on exactly one condition: no
+                        // status was read at all. A status that was read but
+                        // whose measurement cannot bound the pool arrives as
+                        // `Some(bound)` with `window_jobs: None` and takes the
+                        // branch above, which is why nothing here tries to
+                        // print the pool's numbers -- reading `pays_for` again
+                        // in this arm can only yield `None`, and three fields
+                        // that always print `None` read like a measurement of
+                        // something rather than the absence of one.
                         tracing::info!(
                             stream = %stream,
                             ready = entries.len(),
-                            admitted,
-                            held = entries.len() as u64 - admitted,
+                            admitted = admitted.jobs,
+                            held = entries.len() as u64 - admitted.jobs,
                             ceiling = READY_TASKS_PER_PASS,
-                            status_read = pays_for.is_some(),
-                            measured_upstreams = ?pays_for.map(|bound| bound.pace.measured_upstreams),
-                            pool_size = ?pays_for.map(|bound| bound.pool_size),
-                            reserve_tokens = ?pays_for.map(|bound| bound.pace.reserve_tokens),
                             refusal = crate::ready_queue::hold_reason(
                                 false,
-                                crate::ready_queue::PassBound::Ceiling,
+                                admitted.bound,
                             ),
-                            "the pool gave no window bound this pass, so the batch is this pass's slice; the rest stays pending for the next one"
+                            "no pool status was read this pass, so the batch is this pass's slice; the rest stays pending for the next one"
                         );
                     }
-                    entries.truncate(usize::try_from(admitted).unwrap_or(usize::MAX));
+                    entries.truncate(usize::try_from(admitted.jobs).unwrap_or(usize::MAX));
                 }
             }
             let limit = self.backend.payload_limit(&stream).await?;
