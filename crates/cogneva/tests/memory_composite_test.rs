@@ -1,22 +1,11 @@
-use cog_core::{
-    MemoryBackend, MetricsBackend, RawSource, SchemaEntry, SchemaKind, SourceRef, SummaryEntry,
-};
+use cog_core::{MemoryBackend, MetricsBackend, RawSource, SchemaEntry, SchemaKind, SummaryEntry};
 use cog_memory::*;
+
+mod common;
+
 use cog_storage::FileObjectBackend;
+use common::mocks::{raw, source_ref};
 use std::sync::Arc;
-
-fn make_raw(id: &str, text: &str) -> RawSource {
-    RawSource::new(
-        id,
-        "default",
-        "conversation/transcript",
-        text.as_bytes().to_vec(),
-    )
-}
-
-fn make_source_ref(raw_id: &str) -> SourceRef {
-    SourceRef::new(format!("memory://{}", raw_id), "test/v1")
-}
 
 #[tokio::test]
 async fn test_composite_memory_raw_roundtrip() {
@@ -28,7 +17,7 @@ async fn test_composite_memory_raw_roundtrip() {
         128,
     );
 
-    let source = make_raw("raw-1", "Hello composite world");
+    let source = raw("raw-1", "Hello composite world");
     let uri = backend.archive_raw(&source).await.unwrap();
     assert!(uri.starts_with("file://"));
 
@@ -58,7 +47,7 @@ async fn test_composite_memory_schema_crud() {
         SchemaKind::Entity,
         "PostgreSQL",
         "postgresql",
-        make_source_ref("raw-1"),
+        source_ref("raw-1"),
     )
     .with_properties(serde_json::json!({"category": "database"}));
 
@@ -87,7 +76,7 @@ async fn test_composite_memory_summary_search() {
                 "Decision A",
                 emb_a,
                 "test",
-                make_source_ref("r1"),
+                source_ref("r1"),
             ),
         )
         .await
@@ -104,7 +93,7 @@ async fn test_composite_memory_summary_search() {
                 "Decision B",
                 emb_b,
                 "test",
-                make_source_ref("r2"),
+                source_ref("r2"),
             ),
         )
         .await
@@ -129,8 +118,8 @@ async fn test_composite_memory_list_raw() {
         128,
     );
 
-    backend.archive_raw(&make_raw("a", "A")).await.unwrap();
-    backend.archive_raw(&make_raw("b", "B")).await.unwrap();
+    backend.archive_raw(&raw("a", "A")).await.unwrap();
+    backend.archive_raw(&raw("b", "B")).await.unwrap();
 
     let ids = backend.list_raw("default", None).await.unwrap();
     assert_eq!(ids.len(), 2);
@@ -155,7 +144,7 @@ async fn test_composite_memory_schema_for_raw() {
                 SchemaKind::Entity,
                 "X",
                 "x",
-                make_source_ref("raw-x"),
+                source_ref("raw-x"),
             ),
         )
         .await
@@ -182,7 +171,7 @@ async fn test_composite_memory_summary_for_raw() {
                 "Summary X",
                 vec![0.1; 4],
                 "test",
-                make_source_ref("raw-x"),
+                source_ref("raw-x"),
             ),
         )
         .await
@@ -212,7 +201,7 @@ async fn test_composite_memory_list_schema() {
                 SchemaKind::Entity,
                 "Alpha",
                 "alpha",
-                make_source_ref("r1"),
+                source_ref("r1"),
             ),
         )
         .await
@@ -226,7 +215,7 @@ async fn test_composite_memory_list_schema() {
                 SchemaKind::Entity,
                 "Beta",
                 "beta",
-                make_source_ref("r2"),
+                source_ref("r2"),
             ),
         )
         .await
@@ -252,7 +241,7 @@ async fn test_composite_memory_list_summary() {
                 "Text A",
                 vec![0.1; 4],
                 "test",
-                make_source_ref("r1"),
+                source_ref("r1"),
             ),
         )
         .await
@@ -266,7 +255,7 @@ async fn test_composite_memory_list_summary() {
                 "Text B",
                 vec![0.2; 4],
                 "test",
-                make_source_ref("r2"),
+                source_ref("r2"),
             ),
         )
         .await
@@ -285,7 +274,7 @@ async fn test_composite_memory_metrics() {
 
     assert_eq!(backend.metrics().raw_archived, 0);
 
-    backend.archive_raw(&make_raw("m1", "A")).await.unwrap();
+    backend.archive_raw(&raw("m1", "A")).await.unwrap();
     assert_eq!(backend.metrics().raw_archived, 1);
 
     backend
@@ -297,7 +286,7 @@ async fn test_composite_memory_metrics() {
                 SchemaKind::Entity,
                 "A",
                 "a",
-                make_source_ref("m1"),
+                source_ref("m1"),
             ),
         )
         .await
@@ -309,14 +298,7 @@ async fn test_composite_memory_metrics() {
     backend
         .store_summary(
             "default",
-            &SummaryEntry::new(
-                "sum1",
-                "default",
-                "text",
-                emb,
-                "test",
-                make_source_ref("m1"),
-            ),
+            &SummaryEntry::new("sum1", "default", "text", emb, "test", source_ref("m1")),
         )
         .await
         .unwrap();
@@ -339,10 +321,7 @@ async fn test_composite_memory_delete_raw() {
         128,
     );
 
-    backend
-        .archive_raw(&make_raw("del-1", "content"))
-        .await
-        .unwrap();
+    backend.archive_raw(&raw("del-1", "content")).await.unwrap();
     let ids = backend.list_raw("default", None).await.unwrap();
     assert_eq!(ids.len(), 1);
 
@@ -372,7 +351,7 @@ async fn test_composite_memory_delete_schema() {
                 SchemaKind::Entity,
                 "X",
                 "x",
-                make_source_ref("r1"),
+                source_ref("r1"),
             ),
         )
         .await
@@ -399,7 +378,7 @@ async fn test_composite_memory_delete_summary() {
                 "Text",
                 vec![0.1; 4],
                 "test",
-                make_source_ref("r1"),
+                source_ref("r1"),
             ),
         )
         .await
@@ -439,7 +418,7 @@ async fn test_composite_memory_update_schema_merge() {
         SchemaKind::Entity,
         "PostgreSQL",
         "postgresql",
-        make_source_ref("raw-1"),
+        source_ref("raw-1"),
     )
     .with_properties(serde_json::json!({"category": "database", "version": "14"}));
 
@@ -451,7 +430,7 @@ async fn test_composite_memory_update_schema_merge() {
         SchemaKind::Entity,
         "PostgreSQL",
         "postgresql",
-        make_source_ref("raw-2"),
+        source_ref("raw-2"),
     )
     .with_properties(serde_json::json!({"version": "15", "license": "PostgreSQL"}));
 
@@ -481,7 +460,7 @@ async fn test_composite_memory_update_summary_overwrite() {
         "Original text",
         emb.clone(),
         "test",
-        make_source_ref("raw-1"),
+        source_ref("raw-1"),
     );
     backend.store_summary("default", &entry).await.unwrap();
 
@@ -493,7 +472,7 @@ async fn test_composite_memory_update_summary_overwrite() {
         "Updated text",
         emb2.clone(),
         "test",
-        make_source_ref("raw-2"),
+        source_ref("raw-2"),
     );
     backend.update_summary("default", &update).await.unwrap();
 
@@ -534,7 +513,7 @@ async fn test_composite_memory_persistence_roundtrip() {
                 SchemaKind::Entity,
                 "Redis",
                 "redis",
-                make_source_ref("r1"),
+                source_ref("r1"),
             ),
         )
         .await
@@ -544,14 +523,7 @@ async fn test_composite_memory_persistence_roundtrip() {
     backend
         .store_summary(
             "default",
-            &SummaryEntry::new(
-                "sum1",
-                "default",
-                "Summary",
-                emb,
-                "test",
-                make_source_ref("r1"),
-            ),
+            &SummaryEntry::new("sum1", "default", "Summary", emb, "test", source_ref("r1")),
         )
         .await
         .unwrap();
@@ -626,7 +598,7 @@ async fn test_time_range_filter() {
         "Old summary",
         vec![1.0f32, 0.0, 0.0, 0.0],
         "test",
-        make_source_ref("r1"),
+        source_ref("r1"),
     );
     old_entry.generated_at = old_time;
     backend.store_summary("default", &old_entry).await.unwrap();
@@ -637,7 +609,7 @@ async fn test_time_range_filter() {
         "Recent summary",
         vec![0.0f32, 1.0, 0.0, 0.0],
         "test",
-        make_source_ref("r2"),
+        source_ref("r2"),
     );
     recent_entry.generated_at = recent_time;
     backend
@@ -684,7 +656,7 @@ async fn test_decay_demotes_aged_low_value_summary() {
         "Decay test",
         vec![0.12345f32, 0.98765f32, 0.11111f32, 0.99999f32],
         "test",
-        make_source_ref("r1"),
+        source_ref("r1"),
     )
     .with_importance(0.1);
     entry.generated_at = old_time;
@@ -731,7 +703,7 @@ async fn test_decay_archives_summary_that_falls_to_the_floor() {
         "Already near the floor",
         vec![0.5f32, 0.5f32],
         "test",
-        make_source_ref("r1"),
+        source_ref("r1"),
     )
     .with_importance(0.03);
     entry.generated_at = old_time;
@@ -769,7 +741,7 @@ async fn test_decay_leaves_fresh_and_high_value_summaries_alone() {
         "Just stored",
         vec![1.0f32, 0.0f32],
         "test",
-        make_source_ref("r1"),
+        source_ref("r1"),
     )
     .with_importance(0.01);
     fresh.generated_at = now;
@@ -782,7 +754,7 @@ async fn test_decay_leaves_fresh_and_high_value_summaries_alone() {
         "Worth keeping",
         vec![0.0f32, 1.0f32],
         "test",
-        make_source_ref("r2"),
+        source_ref("r2"),
     )
     .with_importance(0.9);
     valuable.generated_at = now - chrono::Duration::hours(48);
@@ -821,7 +793,7 @@ async fn test_decay_maintenance_loop_drives_a_real_pass() {
         "aged low value",
         vec![0.2f32, 0.2f32],
         "test",
-        make_source_ref("r1"),
+        source_ref("r1"),
     )
     .with_importance(0.4);
     entry.generated_at = chrono::Utc::now() - chrono::Duration::hours(48);
@@ -896,7 +868,7 @@ async fn test_composite_memory_query_relations_outgoing() {
                 SchemaKind::Entity,
                 "Alice",
                 "alice",
-                make_source_ref("r1"),
+                source_ref("r1"),
             ),
         )
         .await
@@ -912,7 +884,7 @@ async fn test_composite_memory_query_relations_outgoing() {
                 SchemaKind::Relation,
                 "Alice -> Bob",
                 "alice_to_bob",
-                make_source_ref("r1"),
+                source_ref("r1"),
             )
             .with_properties(
                 serde_json::json!({"from": "Alice", "to": "Bob", "relation_type": "manages"}),
@@ -949,7 +921,7 @@ async fn test_composite_memory_query_relations_incoming() {
                 SchemaKind::Relation,
                 "Alice -> Bob",
                 "alice_to_bob",
-                make_source_ref("r1"),
+                source_ref("r1"),
             )
             .with_properties(
                 serde_json::json!({"from": "Alice", "to": "Bob", "relation_type": "manages"}),
@@ -987,7 +959,7 @@ async fn test_composite_memory_query_relations_filtered() {
                 SchemaKind::Relation,
                 "Alice -> Bob",
                 "alice_to_bob",
-                make_source_ref("r1"),
+                source_ref("r1"),
             )
             .with_properties(
                 serde_json::json!({"from": "Alice", "to": "Bob", "relation_type": "manages"}),
@@ -1005,7 +977,7 @@ async fn test_composite_memory_query_relations_filtered() {
                 SchemaKind::Relation,
                 "Alice -> Carol",
                 "alice_to_carol",
-                make_source_ref("r1"),
+                source_ref("r1"),
             )
             .with_properties(
                 serde_json::json!({"from": "Alice", "to": "Carol", "relation_type": "reports_to"}),
@@ -1097,8 +1069,8 @@ async fn test_list_raw_survives_backend_rebuild() {
         Arc::new(cog_storage::MemoryVectorBackend::new()),
         1024,
     );
-    first.archive_raw(&make_raw("r1", "one")).await.unwrap();
-    first.archive_raw(&make_raw("r2", "two")).await.unwrap();
+    first.archive_raw(&raw("r1", "one")).await.unwrap();
+    first.archive_raw(&raw("r2", "two")).await.unwrap();
 
     let second = CompositeMemoryBackend::new(
         object,
@@ -1121,7 +1093,7 @@ async fn test_raw_roundtrip_preserves_metadata() {
         1024,
     );
 
-    let source = make_raw("m1", "payload").with_tags(vec!["alpha".into(), "beta".into()]);
+    let source = raw("m1", "payload").with_tags(vec!["alpha".into(), "beta".into()]);
     backend.archive_raw(&source).await.unwrap();
 
     let back = backend.get_raw("default", "m1").await.unwrap().unwrap();
@@ -1140,7 +1112,7 @@ async fn test_list_raw_filters_by_content_type() {
         1024,
     );
 
-    backend.archive_raw(&make_raw("a", "A")).await.unwrap();
+    backend.archive_raw(&raw("a", "A")).await.unwrap();
     backend
         .archive_raw(&RawSource::new(
             "b",
@@ -1238,7 +1210,7 @@ async fn test_stored_summary_carries_both_halves_of_the_hybrid_vector() {
         "the deployment hung because the weight directory was empty",
         Vec::new(),
         cog_core::NO_EMBEDDING_MODEL,
-        make_source_ref("r1"),
+        source_ref("r1"),
     );
     backend.store_summary("default", &entry).await.unwrap();
 
@@ -1415,7 +1387,7 @@ async fn a_bounded_listing_reads_only_the_items_it_returns() {
     );
 
     for id in ["raw-1", "raw-2", "raw-3", "raw-4", "raw-5"] {
-        backend.archive_raw(&make_raw(id, "payload")).await.unwrap();
+        backend.archive_raw(&raw(id, "payload")).await.unwrap();
     }
     let before = object.gets.load(std::sync::atomic::Ordering::SeqCst);
 
@@ -1454,8 +1426,7 @@ async fn a_benchmark_tagged_raw_is_refused_at_the_archive_face() {
     )
     .with_operations_metrics(metrics.clone() as Arc<dyn MetricsBackend>);
 
-    let source =
-        make_raw("eval-1", "payload").with_tags(vec![cog_core::RAW_TAG_BENCHMARK.to_string()]);
+    let source = raw("eval-1", "payload").with_tags(vec![cog_core::RAW_TAG_BENCHMARK.to_string()]);
 
     let err = backend.archive_raw(&source).await.unwrap_err();
     assert!(

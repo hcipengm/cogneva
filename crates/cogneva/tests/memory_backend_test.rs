@@ -3,26 +3,17 @@ use cog_core::{
 };
 use cog_memory::*;
 
+mod common;
+
+use common::mocks::{raw, source_ref};
+
 use chrono::{Duration, Utc};
-
-fn make_raw(id: &str, text: &str) -> RawSource {
-    RawSource::new(
-        id,
-        "default",
-        "conversation/transcript",
-        text.as_bytes().to_vec(),
-    )
-}
-
-fn make_source_ref(raw_id: &str) -> SourceRef {
-    SourceRef::new(format!("memory://{}", raw_id), "test/v1")
-}
 
 #[tokio::test]
 async fn test_memory_backend_raw_crud() {
     let backend = MemoryMemoryBackend::new();
 
-    let source = make_raw("raw-1", "Hello world");
+    let source = raw("raw-1", "Hello world");
     let uri = backend.archive_raw(&source).await.unwrap();
     assert_eq!(uri, "memory://raw-1");
 
@@ -41,7 +32,7 @@ async fn test_memory_backend_raw_crud() {
 async fn test_memory_backend_list_raw() {
     let backend = MemoryMemoryBackend::new();
 
-    backend.archive_raw(&make_raw("a-1", "A")).await.unwrap();
+    backend.archive_raw(&raw("a-1", "A")).await.unwrap();
     backend
         .archive_raw(&RawSource::new(
             "b-1",
@@ -51,7 +42,7 @@ async fn test_memory_backend_list_raw() {
         ))
         .await
         .unwrap();
-    backend.archive_raw(&make_raw("a-2", "B")).await.unwrap();
+    backend.archive_raw(&raw("a-2", "B")).await.unwrap();
 
     let all = backend.list_raw("default", None).await.unwrap();
     assert_eq!(all.len(), 3);
@@ -73,7 +64,7 @@ async fn test_memory_backend_schema_crud() {
         SchemaKind::Entity,
         "Redis",
         "redis",
-        make_source_ref("raw-1"),
+        source_ref("raw-1"),
     )
     .with_properties(serde_json::json!({"category": "database"}))
     .with_confidence(0.95);
@@ -108,7 +99,7 @@ async fn test_memory_backend_schema_search() {
                 SchemaKind::Entity,
                 "PostgreSQL",
                 "postgresql",
-                make_source_ref("raw-1"),
+                source_ref("raw-1"),
             ),
         )
         .await
@@ -123,7 +114,7 @@ async fn test_memory_backend_schema_search() {
                 SchemaKind::Entity,
                 "Redis",
                 "redis",
-                make_source_ref("raw-2"),
+                source_ref("raw-2"),
             ),
         )
         .await
@@ -138,7 +129,7 @@ async fn test_memory_backend_schema_search() {
                 SchemaKind::Relation,
                 "depends_on",
                 "depends_on",
-                make_source_ref("raw-3"),
+                source_ref("raw-3"),
             ),
         )
         .await
@@ -169,7 +160,7 @@ async fn test_memory_backend_schema_for_raw() {
                 SchemaKind::Entity,
                 "A",
                 "a",
-                make_source_ref("raw-x"),
+                source_ref("raw-x"),
             ),
         )
         .await
@@ -183,7 +174,7 @@ async fn test_memory_backend_schema_for_raw() {
                 SchemaKind::Entity,
                 "B",
                 "b",
-                make_source_ref("raw-x"),
+                source_ref("raw-x"),
             ),
         )
         .await
@@ -197,7 +188,7 @@ async fn test_memory_backend_schema_for_raw() {
                 SchemaKind::Entity,
                 "C",
                 "c",
-                make_source_ref("raw-y"),
+                source_ref("raw-y"),
             ),
         )
         .await
@@ -223,7 +214,7 @@ async fn test_memory_backend_summary_crud() {
         "Key decision: use Rust for the backend.",
         vec![0.1f32; 128],
         "test-model/v1",
-        make_source_ref("raw-1"),
+        source_ref("raw-1"),
     )
     .with_confidence(0.88);
 
@@ -248,7 +239,7 @@ async fn test_memory_backend_summary_search() {
     backend
         .store_summary(
             "default",
-            &SummaryEntry::new("sa", "default", "A", entry_a, "m", make_source_ref("r1"))
+            &SummaryEntry::new("sa", "default", "A", entry_a, "m", source_ref("r1"))
                 .with_related_schema_ids(vec!["s1".into()]),
         )
         .await
@@ -259,7 +250,7 @@ async fn test_memory_backend_summary_search() {
     backend
         .store_summary(
             "default",
-            &SummaryEntry::new("sb", "default", "B", entry_b, "m", make_source_ref("r2")),
+            &SummaryEntry::new("sb", "default", "B", entry_b, "m", source_ref("r2")),
         )
         .await
         .unwrap();
@@ -269,7 +260,7 @@ async fn test_memory_backend_summary_search() {
     backend
         .store_summary(
             "default",
-            &SummaryEntry::new("sc", "default", "C", entry_c, "m", make_source_ref("r3")),
+            &SummaryEntry::new("sc", "default", "C", entry_c, "m", source_ref("r3")),
         )
         .await
         .unwrap();
@@ -289,42 +280,21 @@ async fn test_memory_backend_summary_for_raw() {
     backend
         .store_summary(
             "default",
-            &SummaryEntry::new(
-                "s1",
-                "default",
-                "A",
-                vec![0.0; 4],
-                "m",
-                make_source_ref("raw-x"),
-            ),
+            &SummaryEntry::new("s1", "default", "A", vec![0.0; 4], "m", source_ref("raw-x")),
         )
         .await
         .unwrap();
     backend
         .store_summary(
             "default",
-            &SummaryEntry::new(
-                "s2",
-                "default",
-                "B",
-                vec![0.0; 4],
-                "m",
-                make_source_ref("raw-x"),
-            ),
+            &SummaryEntry::new("s2", "default", "B", vec![0.0; 4], "m", source_ref("raw-x")),
         )
         .await
         .unwrap();
     backend
         .store_summary(
             "default",
-            &SummaryEntry::new(
-                "s3",
-                "default",
-                "C",
-                vec![0.0; 4],
-                "m",
-                make_source_ref("raw-y"),
-            ),
+            &SummaryEntry::new("s3", "default", "C", vec![0.0; 4], "m", source_ref("raw-y")),
         )
         .await
         .unwrap();
@@ -336,7 +306,7 @@ async fn test_memory_backend_summary_for_raw() {
 #[tokio::test]
 async fn test_rule_based_extractor_entities() {
     let extractor = RuleBasedExtractor::new();
-    let source = make_raw(
+    let source = raw(
         "raw-1",
         "Meeting notes:\n@entity:Alice\n@entity:Bob\n@relation:Alice->Bob",
     );
@@ -367,7 +337,7 @@ async fn test_rule_based_extractor_entities() {
 #[tokio::test]
 async fn test_rule_based_extractor_summary() {
     let extractor = RuleBasedExtractor::new();
-    let source = make_raw("raw-1", "This is a long conversation about architecture.");
+    let source = raw("raw-1", "This is a long conversation about architecture.");
 
     let summary = extractor.generate_summary(&source).await.unwrap();
     assert_eq!(summary.id, "summary-raw-1");
@@ -388,7 +358,7 @@ async fn test_ingestion_pipeline() {
     let extractor = RuleBasedExtractor::new();
     let pipeline = IngestionPipeline::new(extractor);
 
-    let source = make_raw("raw-1", "Project kickoff:\n@entity:Cogneva\n@entity:Rust");
+    let source = raw("raw-1", "Project kickoff:\n@entity:Cogneva\n@entity:Rust");
 
     let (schema, summary) = pipeline.ingest(&source).await.unwrap();
     assert_eq!(schema.len(), 2);
@@ -404,7 +374,7 @@ fn test_memory_consolidator_keep_newer() {
         SchemaKind::Entity,
         "A",
         "a",
-        make_source_ref("raw-1"),
+        source_ref("raw-1"),
     );
     let mut b = a.clone();
     b.extracted_at = Utc::now() + Duration::seconds(10);
@@ -423,7 +393,7 @@ fn test_memory_consolidator_keep_confidence() {
         SchemaKind::Entity,
         "A",
         "a",
-        make_source_ref("raw-1"),
+        source_ref("raw-1"),
     )
     .with_confidence(0.5);
     let b = SchemaEntry::new(
@@ -432,7 +402,7 @@ fn test_memory_consolidator_keep_confidence() {
         SchemaKind::Entity,
         "A",
         "a",
-        make_source_ref("raw-2"),
+        source_ref("raw-2"),
     )
     .with_confidence(0.9);
 
@@ -449,7 +419,7 @@ fn test_memory_consolidator_preserve_both() {
         SchemaKind::Entity,
         "A",
         "a",
-        make_source_ref("raw-1"),
+        source_ref("raw-1"),
     );
     let b = SchemaEntry::new(
         "s2",
@@ -457,7 +427,7 @@ fn test_memory_consolidator_preserve_both() {
         SchemaKind::Entity,
         "A",
         "a",
-        make_source_ref("raw-2"),
+        source_ref("raw-2"),
     );
 
     let consolidator = MemoryConsolidator::new(ConsolidationStrategy::PreserveBoth);
@@ -474,7 +444,7 @@ fn test_memory_consolidator_deduplicate() {
             SchemaKind::Entity,
             "Redis",
             "redis",
-            make_source_ref("r1"),
+            source_ref("r1"),
         )
         .with_confidence(0.5),
         SchemaEntry::new(
@@ -483,7 +453,7 @@ fn test_memory_consolidator_deduplicate() {
             SchemaKind::Entity,
             "Redis",
             "redis",
-            make_source_ref("r2"),
+            source_ref("r2"),
         )
         .with_confidence(0.9),
         SchemaEntry::new(
@@ -492,7 +462,7 @@ fn test_memory_consolidator_deduplicate() {
             SchemaKind::Entity,
             "Postgres",
             "postgres",
-            make_source_ref("r3"),
+            source_ref("r3"),
         ),
     ];
 
@@ -530,7 +500,7 @@ fn test_schema_entry_builder() {
         SchemaKind::Entity,
         "Name",
         "name",
-        make_source_ref("raw"),
+        source_ref("raw"),
     )
     .with_confidence(0.75)
     .with_properties(serde_json::json!({"x": 1}));
@@ -546,7 +516,7 @@ fn test_summary_entry_builder() {
         "text",
         vec![0.1; 4],
         "model",
-        make_source_ref("raw"),
+        source_ref("raw"),
     )
     .with_confidence(0.6)
     .with_related_schema_ids(vec!["s1".into()]);
