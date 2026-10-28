@@ -45,8 +45,8 @@ CMP_LITERAL = re.compile(r"(>=|<=|==|!=|>|<)\s*(-?\d+(?:\.\d+)?)(?![0-9.])")
 BOUND_KEYS = ("greater_than", "less_than", "greater_than_or_equal", "less_than_or_equal", "equal")
 
 
-def rule_libraries(config_path: str, manifests_dir: str):
-    """Yield (where, name, expression, thresholds) for every rule in both libraries."""
+def config_rule_library(config_path: str):
+    """Yield (where, name, expression, thresholds) for every rule in the in-process library."""
     with open(config_path, encoding="utf-8") as fh:
         config = json.load(fh)
 
@@ -70,9 +70,11 @@ def rule_libraries(config_path: str, manifests_dir: str):
             for i, value in enumerate(node):
                 yield from walk(value, f"{path}[{i}]")
 
-    for item in walk(config, "cogneva.json"):
-        yield item
+    yield from walk(config, "cogneva.json")
 
+
+def manifest_rule_library(manifests_dir: str):
+    """Yield (where, name, expression, thresholds) for every rule in the manifest library."""
     if not os.path.isdir(manifests_dir):
         raise OSError(f"manifest directory is not there: {manifests_dir}")
     import yaml
@@ -109,11 +111,35 @@ def main(argv):
     manifests = args[1] if len(args) > 1 else "deploy/k3s/observability/manifests"
 
     try:
-        rules = list(rule_libraries(config, manifests))
+        config_rules = list(config_rule_library(config))
+        manifest_rules = list(manifest_rule_library(manifests))
     except (OSError, json.JSONDecodeError) as exc:
         print(f"check-alert-rule-derived-bounds: cannot read a rule library: {exc}", file=sys.stderr)
         print("check-alert-rule-derived-bounds: judged nothing (not the same as clean)", file=sys.stderr)
         return 3
+
+    # 读到了零条规则与「规则全都合规」在汇总行上同形：`rules=0 ... violations=0` 读起来
+    # 就是一声通过的汇总。两套库各自都必须至少读到一条，少一条就是这套库的读取面已经
+    # 指错了地方（文件在、结构变了；目录在、清单没了）。3 是「什么都没判」，不是 0。
+    empty = [
+        (where, why)
+        for where, why, found in (
+            (config, f"{config} 里", config_rules),
+            (manifests, f"{manifests} 里", manifest_rules),
+        )
+        if not found
+    ]
+    if empty:
+        for where, why in empty:
+            print(
+                f"check-alert-rule-derived-bounds: {why}一条规则都没有读到"
+                f"（{where}）——零条与「全都合规」在汇总行上同形",
+                file=sys.stderr,
+            )
+        print("check-alert-rule-derived-bounds: judged nothing (not the same as clean)", file=sys.stderr)
+        return 3
+
+    rules = config_rules + manifest_rules
 
     scanned = len(rules)
     runway_rules = 0

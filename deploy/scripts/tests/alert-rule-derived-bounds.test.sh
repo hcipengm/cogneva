@@ -14,7 +14,8 @@
 #   - 读 runway 家族跟别的数比 ⇒ 红，判词要点名是哪条规则、读了哪个序列、比了几；
 #   - runway 家族没有任何数值比较 ⇒ 不判（守卫子句），但要**计数上报**，
 #     因为「没判」与「判过且通过」在汇总行上必须分开；
-#   - 读不到规则库 ⇒ 3，不是 0（同上：没读到 ≠ 干净）。
+#   - 读不到规则库 ⇒ 3，不是 0（同上：没读到 ≠ 干净）；**读到了但一条规则都没有** ⇒
+#     也是 3：零条与「一条都不违规」在汇总行上同形（`rules=0 ... violations=0`）。
 # 另有一格确认两套库**都**在判：只读进程内规则、漏掉清单，等于一半的门。
 set -uo pipefail
 
@@ -163,6 +164,19 @@ ck_has "12. 点名是哪份文件" "$out" "cannot parse 10-bad.yaml"
 t="$work/no-json"; seed "$t"
 yaml_rule "$t" Unrelated 'max(node_inodes_pct) > 85'
 out="$(run "$t")"; ck_rc "13. 进程内规则文件不在 ⇒ 3" 3 "$?"
+
+# 14. 进程内规则库里一条规则都没有：文件在、结构变了 ⇒ 3，并点名是哪一边
+t="$work/empty-config"; seed "$t"
+printf '{"observability": {}}\n' >"$t/deploy/helm/cogneva/files/cogneva.json"
+yaml_rule "$t" Unrelated 'max(node_inodes_pct) > 85'
+out="$(run "$t")"; ck_rc "14. 进程内库读到零条 ⇒ 3" 3 "$?"
+ck_has "14. 点名是这一边" "$out" "cogneva.json 里一条规则都没有读到"
+
+# 15. 清单目录在，但一份清单都没有：目录还在就算「读到了」会把扫描面缩成零
+t="$work/empty-manifests"; seed "$t"
+printf 'disk_high|node_disk_usage_pct|greater_than|85\n' | json_rules "$t"
+out="$(run "$t")"; ck_rc "15. 清单库读到零条 ⇒ 3" 3 "$?"
+ck_has "15. 点名是这一边" "$out" "observability/manifests 里一条规则都没有读到"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
