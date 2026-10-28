@@ -56,8 +56,12 @@ run_step() { # run_step <说明> <命令…>
 # 解释器加路径，要么把新形式在这里说清楚——不再有「安静地不跑」这一种。
 mapfile -t ci_steps < <(python3 - "${ci}" repo-conventions deploy-parity <<'PY'
 import re, sys
+# 分隔符不能用制表符：IFS 把连续的制表符当一个分隔展开，空的步骤名会越位，
+# 名字与理由两列就会对到别的位置上。
+SEP = "\x1f"
 path, wanted = sys.argv[1], set(sys.argv[2:])
 job = None
+step_name = ""
 for raw in open(path, encoding="utf-8"):
     line = raw.rstrip("\n")
     header = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
@@ -66,19 +70,36 @@ for raw in open(path, encoding="utf-8"):
         continue
     if job not in wanted:
         continue
+    # 每一步的名字先记下，后面那一行 `run:` 才说得清跳过的到底是哪一步：一份
+    # 不点名的跳过与另一份不点名的跳过在读数上一样，而这次要看见的恰恰是
+    # 「跑整棵工作区测试的那一步被跳过了」。
+    named = re.match(r"^\s+- name:\s*(.*?)\s*$", line)
+    if named:
+        step_name = named.group(1)
+        continue
+    # `- run: …` 是同一个 `run:` 写在了列表项那一行上：把前缀摘掉再往下判，否则
+    # 一条列表项的复位会把这一步整个吞掉——跳过不印、跑也不印，读数上什么都不会发生。
+    item = re.match(r"^\s+- (.*)$", line)
+    if item:
+        step_name = ""
+        line = f"      {item.group(1)}"
     step = re.match(r"^\s+run: (bash|python3|sh) (\S.*)$", line)
     if step:
-        print(f"RUN\t{step.group(1)}\t{step.group(2).strip()}")
+        print(SEP.join(["RUN", step.group(1), step.group(2).strip()]))
+        step_name = ""
         continue
     if re.match(r"^\s+run: \|\s*$", line):
-        print("SKIP\t多行脚本块")
+        print(SEP.join(["SKIP", step_name, "多行脚本块"]))
+        step_name = ""
         continue
     if re.match(r"^\s+run: sudo ", line):
-        print("SKIP\t装依赖")
+        print(SEP.join(["SKIP", step_name, "装依赖"]))
+        step_name = ""
         continue
     other = re.match(r"^\s+run: (.*)$", line)
     if other:
-        print(f"OTHER\t{other.group(1).strip()}")
+        print(SEP.join(["OTHER", other.group(1).strip(), step_name]))
+        step_name = ""
 PY
 )
 if [ "${#ci_steps[@]}" -eq 0 ]; then
@@ -88,7 +109,7 @@ fi
 ran=0; skipped=0; unrecognised=0
 for step in "${ci_steps[@]}"; do
     [ -n "${step}" ] || continue
-    IFS=$'\t' read -r kind a b <<<"${step}"
+    IFS=$'\x1f' read -r kind a b <<<"${step}"
     case "${kind}" in
         RUN)
             ran=$((ran + 1))
@@ -97,11 +118,12 @@ for step in "${ci_steps[@]}"; do
             ;;
         SKIP)
             skipped=$((skipped + 1))
-            printf 'SKIP  %s（%s）\n' "${b}" "${a}"
+            printf 'SKIP  %s（%s）\n' "${a:-这一步没有名字}" "${b}"
             ;;
         OTHER)
             unrecognised=$((unrecognised + 1))
-            printf 'RED   CI 里这一步本地认不出，推之前不会跑它：%s\n' "${b}" >&2
+            printf 'RED   CI 里这一步本地认不出，推之前不会跑它：%s%s\n' \
+                "${a}" "${b:+（${b}）}" >&2
             failures=$((failures + 1))
             ;;
     esac

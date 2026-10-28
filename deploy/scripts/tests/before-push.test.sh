@@ -54,6 +54,19 @@ case "${out}" in
 esac
 echo "OK: 取到的步骤全是跳过的，门是红的并说明它自己没跑"
 
+# 跳过的那一步必须点得出名字。2026-10-28：CI 的 Test 作业连着红在十几格上，
+# 五笔提交照样往上走，而这份门当时印的是两行一模一样的 `SKIP  （多行脚本块）`
+# ——「跑整棵工作区测试的那一步被跳过了」这件事，在这份读数里没有名字。
+case "${out}" in
+  *"SKIP  A multiline block the local runner cannot replay（多行脚本块）"*) ;;
+  *) fail "跳过的步没有点名是哪一步 —— ${out}" ;;
+esac
+case "${out}" in
+  *"SKIP  （多行脚本块）"*) fail "跳过的步仍然印着一对空括号，读的人认不出它 —— ${out}" ;;
+  *) ;;
+esac
+echo "OK: 跳过的步点名到具体那一步"
+
 case "${out}" in
   *"一个脚本都没读到"*) ;;
   *) fail "空脚本表没有被点名（shellcheck 读 stdin 退 0）—— ${out}" ;;
@@ -71,8 +84,7 @@ jobs:
         run: bash -n deploy/scripts/check-before-push.sh
   deploy-parity:
     steps:
-      - name: A multiline block
-        run: |
+      - run: |
           echo three
 YAML
 rc=0
@@ -88,5 +100,13 @@ esac
 # 这一步仍是红的（临时树不是 git 仓库，脚本表为空），所以只断言它没被当成「全绿」。
 [ "${rc}" -ne 0 ] || fail "空脚本表与「不是 git 仓库」在这棵临时树上应当是红的 —— ${out}"
 echo "OK: 有一步跑起来时不再报「没跑」，且空脚本表仍然红"
+
+# 没有写 `- name:` 的步骤也要有一段能读的字，不能退回空括号——空括号读起来像是
+# 「有一个跳过的步」而说不出是哪一个，与点名之前是同一种沉默。
+case "${out}" in
+  *"SKIP  这一步没有名字（多行脚本块）"*) ;;
+  *) fail "无名的跳过没有兜底说法 —— ${out}" ;;
+esac
+echo "OK: 没有名字的步骤印出兜底说法，而不是空括号"
 
 echo "before-push.test: all checks passed"
