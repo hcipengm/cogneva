@@ -3277,6 +3277,16 @@
           "face": "原则管理"
         },
         {
+          "name": "principle_refusals_sustained",
+          "promql": "(min_over_time((max by (slug) (changes(cogneva_principle_refusals[24h])))[3d:1h]) > 0) and (max by (slug) (count_over_time(cogneva_principle_refusals[6d:1h])) > max by (slug) (count_over_time(cogneva_principle_refusals[3d:1h]))) and on() ((time() - max(cogneva_principle_refusals_observed_timestamp_seconds)) < 1800)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "同一条原则连续三天每天都在拦人：`{slug}` 在过去三天里每一个 24 小时窗口内都被闸门拒绝过至少一次。这不是数量问题，是**持续性**问题，所以判据读的是形状而不是水位——一次拒绝就是闸门在干活，说明原则写得准、闸门装得上；同一条原则天天被拒，说明要么这条原则没有传到正在干活的那一方手里（它在反复尝试同一件被禁止的事），要么这条原则本身写宽了（正当工作被它挡住），两种都只能靠改原则正文或改闸门来修，改不动这个数字。一天里没有任何拒绝就清空重来，是因为断档之后又出现的拒绝是重新开始，不是同一段。为什么是三天而不是一周：窗口聚合只对它窗口里**存在**的样点作答，所以这条规则必须带一条两倍宽的覆盖子句，而小规格观测档（`kube-prometheus-stack-values-small.yaml`）的 Prometheus 只留七天——七天要十四天样点，这一对永远不可能同时成立；三天配六天落得进平台最紧的那份保留策略里。代价写在明处：被认证的那三天本身不算覆盖，序列必须比它更老——一条两天大的序列即使天天被拒也证明不了三天，那是算术不是故障。三天看不见的是一件慢热的事——每周拒一次、拖上几个月——那种不在本规则的口径里。读 `changes()` 而不是读值：值本身是账本里的累计数，一条去年被拒过五百次的原则今天一文不值，而累计数只增不减，拿它当水位等于把历史当现状；`changes` 问的是「这段窗口里这个数有没有动过」，一天的长度远大于一次 fold 的节拍，所以 fold 什么时候把拒绝抄进账本不影响答案，只有「这一天有没有新的拒绝」影响答案（帮助文本提醒过 `rate()` 量到的是 fold 的节拍而不是拒绝，正因为如此窗口才按天开）。它读不出的是这一族第一条增量：按需创建的序列，第一个样点就已经带着这次拒绝的值，`changes` 看不见它——影响是把一条原则的第一天算作安静，而判据要三天连续，所以最多晚一天，不会漏掉一段。写者停了这条规则是**安静**而不是长亮：值冻住就没有变化，`changes` 读到 0，于是它最多是沉默、不可能永久点亮。最后那一条合取仍然写着「写者还在写」（`(time() - max(..._observed_timestamp_seconds)) < 1800`），因为它让「有人还在写这一族」成为表达式的**一条合取**，而不是要靠人从「值没动」反推出来的结论；1800 秒不是新数，是同一族、同一个写者、300 秒一次 pass（`PRINCIPLE_LEDGER_PASS_INTERVAL`）的普查规则 `principle_ledger_census_stopped` 已经带着的那个界，六个 pass。发布者自己停了归那条规则报，那条问的是普查这一族还有没有人在写，与这条问的是两件事。`max by (slug) (count_over_time(...[6d:1h])) > max by (slug) (count_over_time(...[3d:1h]))` 那一半是覆盖子句：两条腿的差恰好是「三到六天前有多少个点真的有值」，所以它证明的是「这条序列在被认证的三天开始之前就存在」，不是「六天都铺满了」——窗口里有多少样点本来就由数据决定，这条子句把那个前提变成一条要成立的事实。按 `slug` 聚合：同一个原则被几个副本刮到是同一条原则的几份读数，聚合之后一条原则只出一条告警；闸门把自己的自伤也记在这张账上（名字形如 `principle-gate.sh:self-fault:drill`），本规则照发不误，那是刻意的——自伤天天出现同样说明那条闸门在反复拦错东西。",
+          "face": "原则管理"
+        },
+        {
           "name": "clippy_verdict_not_produced",
           "promql": "1 - max by (node) (cogneva_clippy_verdict_present)",
           "condition": {

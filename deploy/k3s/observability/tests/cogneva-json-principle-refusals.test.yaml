@@ -1,0 +1,80 @@
+# 原则账拒绝计数那条告警的单测夹具：让 Prometheus 自己的规则引擎跑一遍，断言它真的会从
+# 「空」走到 firing，并在三种该安静的形状下真的安静。
+#
+# 这条规则读的序列由应用发布（`cogneva_principle_refusals`，每个被闸门拒过的原则一条，
+# 值是账本里的累计数），它的规则不在 PrometheusRule 清单里，而在部署配置的进程内
+# watcher 那一库——所以这里点名规则名，由跑者从 `deploy/helm/cogneva/files/cogneva.json`
+# 按名字取正文：
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-principle-refusals.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+#
+# 判据是形状而不是水位：同一条原则在过去三天的**每一个** 24 小时窗口里都被拒过至少一次。
+# 所以夹具里要同时造两个方向——值一直在动（响），值不再动（安静），只动了两天（安静），
+# 值在动但写者那侧的钟停了（安静）。每一条都缺一不可：少一个方向，这一族最想抓的形状
+# 就没人证明过。
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: principle_refusals_sustained
+
+evaluation_interval: 1h
+
+tests:
+  # 一条原则每小时都被拒一次，持续六天多：三天里每一个 24 小时窗口都有变化，六天那条腿
+  # 比三天那条腿多出窗口之前的点，写者的钟跟着走——三段合取全成立，响。
+  - interval: 1h
+    input_series:
+      - series: 'cogneva_principle_refusals{slug="p-refused",readout="principle_ledger_refusals"}'
+        values: '0+1x151'
+      - series: 'cogneva_principle_refusals_observed_timestamp_seconds{slug="p-refused",readout="principle_ledger_refusals"}'
+        values: '0+3600x151'
+    alert_rule_test:
+      - eval_time: 150h
+        alertname: principle_refusals_sustained
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              slug: p-refused
+
+  # 最后一次拒绝停在第四天，之后三天一次都没有：窗口里没有变化，三天那句话不成立，
+  # 安静。这一格是判据的主体——它要的是「还在被拒」，不是「拒过很多次」。
+  - interval: 1h
+    input_series:
+      - series: 'cogneva_principle_refusals{slug="p-stopped",readout="principle_ledger_refusals"}'
+        values: '0+1x77 78x75'
+      - series: 'cogneva_principle_refusals_observed_timestamp_seconds{slug="p-stopped",readout="principle_ledger_refusals"}'
+        values: '0+3600x151'
+    alert_rule_test:
+      - eval_time: 150h
+        alertname: principle_refusals_sustained
+        exp_alerts: []
+
+  # 序列只有两天大，虽然这两天每小时都被拒：六天那条腿比三天那条腿多不出任何点——
+  # 窗口之前的样点一个都不存在——所以「已经持续了三天」这句话没有被证明，安静。
+  # 这一格防的正是「一条刚出生两天的序列凭两天的样点自称持续了三天」。
+  - interval: 1h
+    input_series:
+      - series: 'cogneva_principle_refusals{slug="p-young",readout="principle_ledger_refusals"}'
+        values: '_x100 0+1x51'
+      - series: 'cogneva_principle_refusals_observed_timestamp_seconds{slug="p-young",readout="principle_ledger_refusals"}'
+        values: '_x100 0+3600x51'
+    alert_rule_test:
+      - eval_time: 150h
+        alertname: principle_refusals_sustained
+        exp_alerts: []
+
+  # 值在动、序列也够老，但写者那侧的钟停在原地：这一条合取就是为它写的，安静。
+  # 形状是人工造的（同一个 store 写出来的值与钟不会分开停），造它是为了让这条合取
+  # 自己也被证明过一次——没有被点过的合取，删掉它所有夹具照样绿。
+  - interval: 1h
+    input_series:
+      - series: 'cogneva_principle_refusals{slug="p-frozen",readout="principle_ledger_refusals"}'
+        values: '0+1x151'
+      - series: 'cogneva_principle_refusals_observed_timestamp_seconds{slug="p-frozen",readout="principle_ledger_refusals"}'
+        values: '0+3600x20 72000x131'
+    alert_rule_test:
+      - eval_time: 150h
+        alertname: principle_refusals_sustained
+        exp_alerts: []

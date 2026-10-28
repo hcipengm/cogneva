@@ -1132,11 +1132,18 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_principle_ledger_rows",
         "crates/cog-orchestrator/src/principle_ledger.rs",
     ),
-    // `cogneva_principle_refusals` is deliberately not here: this table registers
-    // series a shipped rule reads, and nothing reads the refusal counts yet --
-    // the bound they would be read against is a policy nobody has stated. The
-    // series is published and filed as a debt in UNREAD instead; it moves into
-    // this table on the same pass its rule lands.
+    // The other half of the same account: how many times one principle's gate
+    // stopped something, by slug. Cumulative and monotone, so no level of it is
+    // a fault -- a slug refused five hundred times last year is not a fault
+    // today -- and what the rule reads instead is the *shape*: the same slug
+    // refused inside every 24-hour window of the last three days. The series is
+    // written by the same pass that writes the census above, and named here
+    // beside it for that reason: the census says whether anyone is still
+    // counting, this one says what the counting found.
+    (
+        "cogneva_principle_refusals",
+        "crates/cog-orchestrator/src/principle_ledger.rs",
+    ),
     // 跨 agent 投递的两格。命令读完并 ack 与「handler 失败、留在 pending 等
     // 那次重启」在队列里都是同一条条目，而队列的 lag 读数看不见 pending，
     // 于是失败唯一留下的证据是那一行日志——它在一小时后早就滚掉了。两格都按
@@ -4423,16 +4430,6 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_change_block_census",
         Unread::Gap("the change account counted by the face of the programme its declaring documents name, and by reading: `landed`, `owed`, `retired` and `oldest_unmeasured_seconds`, over a closed set of blocks that includes `none` for rows no document filed. The three counts are the whole population of a face, which is what lets a face that retired its work be told from one that finished; every face is written on every pass, including ones that owe nothing, so a head missing from the census is a head that stopped being counted rather than one with nothing to say. It has no rule because nothing in the deployment declares how much owed work on one face, or how old its longest-unmeasured row, is a fault -- the count says the population and not the state, and the one reading here with a natural direction, `oldest_unmeasured_seconds`, needs the same undecided bound. The reader owed is a panel over the census by block and reading, which states the comparison without inventing a threshold"),
     ),
-    // The account has counted refusals per principle since the gates first
-    // reported them, and the platform surface published none of it: the only
-    // reader was a host script querying the database and writing a TSV, which
-    // is a surface outside this repository's rules and panels. Publishing the
-    // count as a series is the half that closes "a rule cannot read it"; the
-    // half still owed is a declared bound, and what number of refusals is a
-    // fault is a policy nobody has stated -- a principle refused once is a gate
-    // doing its job, and the same principle refused for a week is a rule that is
-    // not being internalized. A threshold invented here would page on the
-    // policy, so the entry stays a debt until someone states it.
     // The same account counted the other way, by the tier each carrier said its
     // principle would be checked at. No rule reads it, and the reason is not
     // that the reading is unimportant: the cell worth watching is `undeclared`,
@@ -4443,10 +4440,11 @@ const UNREAD: &[(&str, Unread)] = &[
     // corpus that gains principles gains undeclared rows with them until someone
     // writes the sentence. Its reader is the panel beside the state census,
     // which shows the composition without inventing a threshold.
-    (
-        "cogneva_principle_refusals",
-        Unread::Gap("how many times a gate has refused work because of one principle, by slug. The account stored the count per row already; what was missing was a surface outside a query, and this series is that surface. What is still missing is a declared bound: one refusal is a gate doing its job, the same principle refused for a week is a rule the corpus is not internalizing, and where between those two a page belongs is a policy decision rather than a number a producer can know. The host script `scripts/host/cogneva-principle-refusal-reading.sh` reads the same fact straight from the database today, which is why the absence of a rule is not the absence of a reader -- but that reader lives outside this repository and cannot be named here as a series name"),
-    ),
+    // The refusal count left this table when `principle_refusals_sustained`
+    // landed: one refusal is a gate doing its job, and the same slug refused
+    // inside every 24-hour window of three days is a rule the corpus is not
+    // internalizing. The bound that made it a debt is now a shape rather than a
+    // level, which is what the entry above asks for in the same words.
     // The size readings of an archive whose retention bounds age. A stream is
     // retired when it goes quiet past the retention, so the row count and the
     // stream count settle at whatever the deployment writes in that window --
@@ -4723,7 +4721,17 @@ const UNREAD: &[(&str, Unread)] = &[
 /// it answers "is anyone still counting" and not "what does the count say". A
 /// series published with its reader adds no debt, which is what this number is
 /// for: it counts the ones that were left.
-const GAPS_AT_CENSUS: usize = 33;
+///
+/// It came down to 32 when the principle account's refusal count got its rule.
+/// That entry said the missing piece was a declared bound, and the sentence it
+/// gave for one was a shape rather than a level: one refusal is a gate doing
+/// its job, the same principle refused for a week is a rule the corpus is not
+/// internalizing. A level was never going to close it, because the number is a
+/// cumulative account value -- a slug refused five hundred times a year ago is
+/// not a fault today -- so the rule reads change per day against a coverage
+/// clause instead, and the entry left the table in the pass that wrote
+/// `principle_refusals_sustained`.
+const GAPS_AT_CENSUS: usize = 32;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {
