@@ -591,6 +591,19 @@ jobs:
       # reading is that rows of other producers and resolved rows are *not*
       # returned, because returning them would have the mirror announce
       # recoveries that never happened.
+      # Two alert bridges -- the application pod and the evolution pod -- write
+      # one alerts table with no lease between them, and the row keeps only the
+      # last writer's verdict. These tests are about the data that makes a
+      # disagreement readable at all: the row names the pod that wrote it, and
+      # every writer's own verdict survives per (key, writer), tagged with the
+      # deployment that reached it. The DDL half matters for the same reason the
+      # notification mark's does -- it is one multi-statement string, so a
+      # statement broken in the middle leaves the table without a column the
+      # writes name, silently, on a tree where every DB-free test still passes.
+      - name: Live-DB alert writer identity and verdicts
+        run: cargo test -p cog-observability --test alert_writer_divergence -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - name: Live-DB alert mirror ownership
         run: cargo test -p cog-observability --test alert_mirror_source -- --ignored
         env:

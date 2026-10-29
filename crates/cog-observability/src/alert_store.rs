@@ -286,7 +286,8 @@ fn process_identity() -> String {
 /// evaluate the same rule set against the same table, and neither can see the
 /// other's opinion there.
 fn process_role() -> String {
-    std::env::var("COGNEVA_DEPLOYMENT_NAME").unwrap_or_else(|_| String::from("unknown-role"))
+    std::env::var(cog_core::env::DEPLOYMENT_NAME_ENV)
+        .unwrap_or_else(|_| String::from("unknown-role"))
 }
 
 /// PostgreSQL alert store.
