@@ -66,6 +66,16 @@ pub const EVAL_FAILURE_RULE: &str = "infra_watch_eval_failure";
 /// This loop's name in the liveness census.
 pub const INFRA_WATCH_LOOP: &str = "infra_watch";
 
+/// How many consecutive evaluation passes must fail to list a key before its
+/// row is closed. A key that is believed firing and absent from this tick's
+/// series is not proof the condition ended: during a rollout two watchers
+/// overlap, and a scrape gap or a fresh process's first read can drop a series
+/// for one tick while the condition never stopped holding. Closing on the
+/// first miss turns that into a close followed by a re-fire, which the receiver
+/// reads as a brand-new alert with a fresh `fired_at` -- a false "it was
+/// resolved and came back" for something that never went away.
+const MISSING_TICKS_BEFORE_CLOSE: u32 = 2;
+
 /// Outlets the watcher drives. Both are optional: with no store the watcher
 /// still notifies, with no notifier it still persists, with neither it does
 /// not run at all (the plugin decides).
@@ -129,6 +139,10 @@ pub async fn run_infra_watch_loop(
                 // dedup keys whose condition is holding but whose rule asks for a
                 // `for_seconds` window first: value is the first tick it held.
                 let mut holding: HashMap<String, Instant> = HashMap::new();
+                // dedup keys believed firing but absent from the last tick, with
+                // how many ticks in a row that has been true. A single miss is
+                // not an end of the condition: see MISSING_TICKS_BEFORE_CLOSE.
+                let mut missing: HashMap<String, u32> = HashMap::new();
                 let mut adopted = false;
                 // What the alert mirror last saw Prometheus firing. Empty on a
                 // restart is correct: the first successful read lists it all.
@@ -165,7 +179,7 @@ pub async fn run_infra_watch_loop(
                             if !retired {
                                 retired = retire_rules(&config, &outlets).await;
                             }
-                            tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks, &mut holding).await;
+                            tick(&config, &outlets, &http, &mut known_firing, &mut eval_failure_firing, &mut failure_streaks, &mut holding, &mut missing).await;
                             // After the rules, so a read that fails is one
                             // more broken reading in the same tick's budget
                             // rather than a reason to skip them.
@@ -352,6 +366,7 @@ fn eval_failure_plan(threshold: u32, streak: u32, latched: bool) -> Option<EvalF
 }
 
 /// One evaluation pass over every configured rule.
+#[allow(clippy::too_many_arguments)]
 async fn tick(
     config: &InfraWatchConfig,
     outlets: &InfraWatchOutlets,
@@ -360,6 +375,7 @@ async fn tick(
     eval_failure_firing: &mut HashSet<String>,
     failure_streaks: &mut HashMap<String, u32>,
     holding: &mut HashMap<String, Instant>,
+    missing: &mut HashMap<String, u32>,
 ) {
     for rule in &config.rules {
         let series = match query_prometheus(http, &config.prometheus_url, &rule.promql).await {
@@ -441,12 +457,24 @@ async fn tick(
         // A condition that stopped holding restarts its clock: the window is
         // about one uninterrupted stretch, not about a total across ticks.
         forget_held_except(rule, &series, holding);
+        // A key this tick did report starts over; only the ones it did not are
+        // candidates for closing, and one missing tick is not enough.
+        let own = format!("{}:", rule.name);
+        missing.retain(|key, _| !key.starts_with(own.as_str()) || plan.close.contains(key));
         for key in &plan.close {
+            let count = missing.entry(key.clone()).or_insert(0);
+            *count += 1;
+            if *count < MISSING_TICKS_BEFORE_CLOSE {
+                continue;
+            }
             // Keep believing it until the row is actually closed: the close
             // retry lives in this set, and dropping the key here is what turns
             // one failed write into a row that stays `firing` for good.
             let closed = resolve(key, outlets).await;
             settle_close(known_firing, key, closed);
+            if closed {
+                missing.remove(key);
+            }
         }
     }
 }
@@ -1594,6 +1622,203 @@ mod tests {
         );
     }
 
+    /// One pass that does not list a key is not the condition ending.
+    ///
+    /// Measured 2026-10-29T17:58:39.328Z: a fresh watcher Pod's first pass
+    /// resolved two rows it had never raised, and the generation still running
+    /// fired them back ten seconds later. The condition had not stopped holding
+    /// at any point — a pass that just started, or one whose scrape missed,
+    /// simply has no series to list yet. Closing on the first miss turns an
+    /// ongoing incident into a close followed by a re-fire, which the receiver
+    /// reads as a new alert with a fresh `fired_at`: a claim that something was
+    /// resolved and came back, for something that never went away.
+    #[tokio::test]
+    async fn a_key_absent_for_one_pass_is_not_closed() {
+        let config = test_config(0);
+        let outlets = InfraWatchOutlets {
+            store: None,
+            notifier: None,
+            metrics: None,
+        };
+        let http: Arc<dyn cog_core::HttpClient> = Arc::new(SeriesHttp::present());
+        let mut known_firing = HashSet::new();
+        let mut eval_firing = HashSet::new();
+        let mut streaks = HashMap::new();
+        let mut holding = HashMap::new();
+        let mut missing = HashMap::new();
+        let key = "rule_a:node=vm-1".to_string();
+
+        tick(
+            &config,
+            &outlets,
+            &http,
+            &mut known_firing,
+            &mut eval_firing,
+            &mut streaks,
+            &mut holding,
+            &mut missing,
+        )
+        .await;
+        assert!(known_firing.contains(&key), "第一拍就该开起来");
+        assert!(missing.is_empty(), "开得起来的一拍不是缺席");
+
+        // 条件这一拍没被列出来：还不算结束。
+        let quiet = Arc::new(SeriesHttp::default());
+        let quiet: Arc<dyn cog_core::HttpClient> = quiet;
+        tick(
+            &config,
+            &outlets,
+            &quiet,
+            &mut known_firing,
+            &mut eval_firing,
+            &mut streaks,
+            &mut holding,
+            &mut missing,
+        )
+        .await;
+        assert!(
+            known_firing.contains(&key),
+            "只缺一拍不许关：那一拍可能只是新进程还没读到、或抓取漏了"
+        );
+        assert_eq!(missing.get(&key), Some(&1));
+    }
+
+    /// Two passes in a row without the key is the close.
+    #[tokio::test]
+    async fn a_key_absent_for_two_passes_is_closed() {
+        let config = test_config(0);
+        let outlets = InfraWatchOutlets {
+            store: None,
+            notifier: None,
+            metrics: None,
+        };
+        let http: Arc<dyn cog_core::HttpClient> = Arc::new(SeriesHttp::present());
+        let mut known_firing = HashSet::new();
+        let mut eval_firing = HashSet::new();
+        let mut streaks = HashMap::new();
+        let mut holding = HashMap::new();
+        let mut missing = HashMap::new();
+        let key = "rule_a:node=vm-1".to_string();
+
+        for _ in 0..3 {
+            tick(
+                &config,
+                &outlets,
+                &http,
+                &mut known_firing,
+                &mut eval_firing,
+                &mut streaks,
+                &mut holding,
+                &mut missing,
+            )
+            .await;
+        }
+        assert!(known_firing.contains(&key));
+
+        let quiet = Arc::new(SeriesHttp::default());
+        let quiet: Arc<dyn cog_core::HttpClient> = quiet;
+        for _ in 0..2 {
+            tick(
+                &config,
+                &outlets,
+                &quiet,
+                &mut known_firing,
+                &mut eval_firing,
+                &mut streaks,
+                &mut holding,
+                &mut missing,
+            )
+            .await;
+        }
+        assert!(
+            !known_firing.contains(&key),
+            "连续两拍都没列出来，才当条件结束了"
+        );
+        assert!(
+            !missing.contains_key(&key),
+            "关掉之后不许留在缺席表里，否则它永远数不完"
+        );
+    }
+
+    /// A key that comes back starts counting from zero again: the window is
+    /// about consecutive misses, not about a total across passes.
+    #[tokio::test]
+    async fn a_key_that_reappears_resets_its_missing_count() {
+        let config = test_config(0);
+        let outlets = InfraWatchOutlets {
+            store: None,
+            notifier: None,
+            metrics: None,
+        };
+        let quiet = Arc::new(SeriesHttp::default());
+        let present = Arc::new(SeriesHttp::present());
+        let quiet: Arc<dyn cog_core::HttpClient> = quiet;
+        let present: Arc<dyn cog_core::HttpClient> = present;
+        let mut known_firing = HashSet::new();
+        let mut eval_firing = HashSet::new();
+        let mut streaks = HashMap::new();
+        let mut holding = HashMap::new();
+        let mut missing = HashMap::new();
+        let key = "rule_a:node=vm-1".to_string();
+
+        tick(
+            &config,
+            &outlets,
+            &present,
+            &mut known_firing,
+            &mut eval_firing,
+            &mut streaks,
+            &mut holding,
+            &mut missing,
+        )
+        .await;
+        tick(
+            &config,
+            &outlets,
+            &quiet,
+            &mut known_firing,
+            &mut eval_firing,
+            &mut streaks,
+            &mut holding,
+            &mut missing,
+        )
+        .await;
+        assert_eq!(missing.get(&key), Some(&1));
+
+        // 回来了：计数清零，行仍在。
+        tick(
+            &config,
+            &outlets,
+            &present,
+            &mut known_firing,
+            &mut eval_firing,
+            &mut streaks,
+            &mut holding,
+            &mut missing,
+        )
+        .await;
+        assert!(known_firing.contains(&key));
+        assert!(
+            missing.is_empty(),
+            "看见的一拍必须把缺席计数清掉，否则断续的缺席会攒成一次误关"
+        );
+
+        // 再缺一拍仍不关——这是「连续」而不是「累计」。
+        tick(
+            &config,
+            &outlets,
+            &quiet,
+            &mut known_firing,
+            &mut eval_firing,
+            &mut streaks,
+            &mut holding,
+            &mut missing,
+        )
+        .await;
+        assert!(known_firing.contains(&key));
+        assert_eq!(missing.get(&key), Some(&1));
+    }
+
     #[test]
     fn parse_vector_extracts_labels_and_values() {
         let body = serde_json::json!({
@@ -2397,6 +2622,47 @@ mod tests {
         }
     }
 
+    /// HTTP client stub: always answers 200, and the one series it lists can be
+    /// flipped on and off between ticks, so a test can make a condition vanish
+    /// for exactly one evaluation pass.
+    #[derive(Debug, Default)]
+    struct SeriesHttp {
+        present: std::sync::atomic::AtomicBool,
+    }
+
+    impl SeriesHttp {
+        fn present() -> Self {
+            Self {
+                present: std::sync::atomic::AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HttpClient for SeriesHttp {
+        async fn execute(
+            &self,
+            _req: cog_core::HttpRequest,
+        ) -> cog_core::SFResult<cog_core::HttpResponse> {
+            let result = if self.present.load(std::sync::atomic::Ordering::SeqCst) {
+                serde_json::json!([
+                    {"metric": {"node": "vm-1"}, "value": [1700000000, "1"]}
+                ])
+            } else {
+                serde_json::json!([])
+            };
+            Ok(cog_core::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "status": "success",
+                    "data": {"resultType": "vector", "result": result}
+                }))
+                .unwrap(),
+            })
+        }
+    }
+
     fn firing_record(rule: &str, key: &str) -> AlertRecord {
         AlertRecord {
             id: "id".into(),
@@ -2503,6 +2769,7 @@ mod tests {
         let mut eval_firing = HashSet::new();
         let mut streaks = HashMap::new();
         let mut holding = HashMap::new();
+        let mut missing = HashMap::new();
         let key = format!("{EVAL_FAILURE_RULE}:rule_a");
 
         // First failure: below threshold, no self-alert.
@@ -2514,6 +2781,7 @@ mod tests {
             &mut eval_firing,
             &mut streaks,
             &mut holding,
+            &mut missing,
         )
         .await;
         assert!(eval_firing.is_empty());
@@ -2527,6 +2795,7 @@ mod tests {
             &mut eval_firing,
             &mut streaks,
             &mut holding,
+            &mut missing,
         )
         .await;
         assert!(eval_firing.contains(&key));
@@ -2542,6 +2811,7 @@ mod tests {
             &mut eval_firing,
             &mut streaks,
             &mut holding,
+            &mut missing,
         )
         .await;
         assert!(eval_firing.is_empty());
@@ -2615,6 +2885,7 @@ mod tests {
         let mut eval_firing = HashSet::new();
         let mut streaks = HashMap::new();
         let mut holding = HashMap::new();
+        let mut missing = HashMap::new();
         for _ in 0..5 {
             tick(
                 &config,
@@ -2624,6 +2895,7 @@ mod tests {
                 &mut eval_firing,
                 &mut streaks,
                 &mut holding,
+                &mut missing,
             )
             .await;
         }
