@@ -13,6 +13,7 @@
 //! - **记忆维护循环**（[`maintenance`]）— 周期衰减低价值记忆的驱动方
 
 pub mod backend;
+pub mod boot_mark;
 pub mod causal;
 pub mod composite;
 pub mod config;

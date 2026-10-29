@@ -10,10 +10,6 @@ repository.workspace = true
 [dependencies]
 cog-core = { workspace = true }
 cog-storage = { workspace = true }
-# 只为出生占用的快照点：模型会话是本进程出生占用里最重的一段，而它发生在插件
-# init 之内、装配根看不见的地方。observability 是叶子 crate（只依赖 core），
-# 与网关同一条依赖方向，不成环。
-cog-observability = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

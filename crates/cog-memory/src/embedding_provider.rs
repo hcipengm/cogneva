@@ -131,7 +131,7 @@ impl FastEmbedProvider {
         // needs, so a failure here is the provider failing, reported as such.
         let dense_model = fastembed::TextEmbedding::try_new(dense_options)
             .map_err(|e| format!("failed to load BGE-M3 dense embedding model: {e}"))?;
-        cog_observability::boot_footprint::mark("embedding-dense");
+        crate::boot_mark::mark("embedding-dense");
 
         // Sparse second, and independently: it failing is a degraded provider, not a
         // broken one. The reason travels with the provider so the refusal a caller
@@ -148,7 +148,7 @@ impl FastEmbedProvider {
                     (None, Some(reason))
                 }
             };
-        cog_observability::boot_footprint::mark("embedding-sparse");
+        crate::boot_mark::mark("embedding-sparse");
 
         Ok(Self {
             dense_model: std::sync::Mutex::new(dense_model),

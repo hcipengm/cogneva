@@ -51,7 +51,7 @@ impl FastEmbedRerankerProvider {
         }
         let model = fastembed::TextRerank::try_new(options)
             .map_err(|e| format!("failed to load BGE-Reranker-V2-M3: {e}"))?;
-        cog_observability::boot_footprint::mark("reranker");
+        crate::boot_mark::mark("reranker");
 
         Ok(Self {
             model: std::sync::Mutex::new(model),

@@ -53,9 +53,6 @@ const ALLOWED: &[Row] = &[
     ("cog-guardrail", "cog-core", ""),
     ("cog-llm", "cog-core", ""),
     ("cog-memory", "cog-core", ""),
-    // The boot-footprint marks are published through the metrics exporter that
-    // `cog-observability` owns; the route out of this edge is that contract.
-    ("cog-memory", "cog-observability", ""),
     ("cog-memory", "cog-storage", ""),
     ("cog-net", "cog-core", ""),
     ("cog-notification", "cog-core", ""),

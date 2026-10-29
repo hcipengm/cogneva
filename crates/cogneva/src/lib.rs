@@ -70,6 +70,12 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // 排在订阅者之后，否则第一条相位（`process-start`）同样落进 no-op 默认订阅者，
     // 日志里就只有六条——而按日志读启动的人正是拿「最后一条相位」当作停在哪里的。
     cog_observability::boot_footprint::mark("process-start");
+    // 模型会话的相位由加载它的 crate 报，而那个 crate 不认识 observability：
+    // 这里把读者交过去。必须在任何插件初始化之前——第一条属于模型的相位就发生
+    // 在插件 init 之内，晚一行就是那一行之前的相位一次也报不出来。
+    cog_memory::boot_mark::install(std::sync::Arc::new(
+        cog_observability::boot_footprint::BootMarks,
+    ));
 
     let mut config = assembly::infra::load_and_normalize_config();
     let app_version = if config.core.app.version.is_empty() {

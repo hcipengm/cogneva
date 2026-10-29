@@ -204,6 +204,21 @@ fn announce(phase: &'static str, rss: Option<u64>, elapsed_seconds: f64, cpu_sec
     }
 }
 
+/// This module's [`mark`], handed out as a contract.
+///
+/// A crate that loads a model does not depend on this crate: it reports the
+/// phase through `cog_core::BootPhaseMarker`, and the host publishes this
+/// implementation into it. The type exists so that publishing is one line and
+/// has no state of its own — the registry the call writes into is the same one
+/// a mark from this crate lands in.
+pub struct BootMarks;
+
+impl cog_core::BootPhaseMarker for BootMarks {
+    fn mark(&self, phase: &'static str) {
+        mark(phase)
+    }
+}
+
 /// The memory snapshots taken so far, in phase order.
 pub fn marks() -> Vec<(&'static str, u64)> {
     snapshot()

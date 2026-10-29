@@ -625,6 +625,27 @@ pub trait ObservabilityGateway: Send + Sync {
     fn publish_event(&self, event: AgentEvent);
 }
 
+// ─── Where startup got to ──────────────────────────────────────────────────
+
+/// Reports that this process has reached a named point in its startup.
+///
+/// The reader that attributes the birth footprint owns the series and its
+/// closed phase list; a crate that loads a model only knows which instant it is
+/// at. Linking the reader to say one sentence means the loading crate cannot be
+/// built, tested or reused without the exporter and everything the exporter
+/// pulls in, so the seam is this trait: the host publishes an implementation
+/// and the crate reports through it.
+///
+/// The phase is `&'static str` rather than `&str` because the series' identity
+/// is a closed set of literals: a name built at run time is a name the reader
+/// has to trust, and the reader's list is what decides whether a mark becomes a
+/// series at all. An implementation that receives a name outside its own set
+/// drops it, which is why the argument carries no error channel — a mark that
+/// names nothing is a caller's typo, not a failure to report upward.
+pub trait BootPhaseMarker: Send + Sync {
+    fn mark(&self, phase: &'static str);
+}
+
 // ─── Token spend, read from the durable rollup ─────────────────────────────
 
 /// One `(actor, origin, upstream, protocol)` line of token spend, summed over

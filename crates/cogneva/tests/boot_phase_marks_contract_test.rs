@@ -23,8 +23,13 @@ use common::routes::repo_root;
 
 use common::rust_production::{production_lines, production_sources, relative_name};
 
-/// The call the marks are made with, as it appears in the source.
-const CALL: &str = "boot_footprint::mark(";
+/// The calls the marks are made with, as they appear in the source.
+///
+/// Two spellings, both real: the crate that owns the series marks directly, and
+/// a crate that only knows the moment reports through the sink its host
+/// published (`cog_core::BootPhaseMarker`, reached as `boot_mark::mark`). The
+/// census has to see both or the sink's call sites read as phases nobody marks.
+const CALLS: &[&str] = &["boot_footprint::mark(", "boot_mark::mark("];
 
 /// One `mark(...)` call site: the file, the line, and the argument as written.
 #[derive(Debug)]
@@ -37,10 +42,14 @@ struct Mark {
 fn marks_in(rel: &str, text: &str) -> Vec<Mark> {
     let mut found = Vec::new();
     for (number, line) in production_lines(text).into_iter().enumerate() {
-        let Some(at) = line.find(CALL) else {
+        let Some((call, at)) = CALLS
+            .iter()
+            .filter_map(|call| line.find(call).map(|at| (*call, at)))
+            .min_by_key(|(_, at)| *at)
+        else {
             continue;
         };
-        let rest = &line[at + CALL.len()..];
+        let rest = &line[at + call.len()..];
         // The argument is a literal in every call today; a call that spans
         // lines or passes a variable is reported as written, and the caller
         // turns that into a failure rather than guessing at it.
@@ -161,6 +170,32 @@ fn the_first_phase_is_marked_after_a_subscriber_exists_to_print_it() {
         "process-start is marked before the early subscriber is installed, so its line \
          goes to the no-op default subscriber and the log starts at the second phase"
     );
+}
+
+/// 装配根交给加载方的那个读者真的收到了相位。
+///
+/// 这一处原来是直接依赖：加载模型的 crate 认识 observability，标记是一条函数
+/// 调用，编译通过就等于通路存在。改成注入之后，编译通过只证明「有人可以接」，
+/// 不证明「接了」——安装一次、标记一次、在读侧读到一次，才是这条缝存在的证据；
+/// 缺了它，标记会安静地落进没人接的位置，而盘点门只数调用点，看不见这件事。
+#[test]
+fn a_mark_from_the_loader_reaches_the_series() {
+    cog_observability::boot_footprint::clear_for_tests();
+    cog_memory::boot_mark::install(std::sync::Arc::new(
+        cog_observability::boot_footprint::BootMarks,
+    ));
+    cog_memory::boot_mark::mark("reranker");
+    let phases: Vec<&str> = cog_observability::boot_footprint::marks_elapsed()
+        .into_iter()
+        .map(|(phase, _)| phase)
+        .collect();
+    assert_eq!(
+        phases,
+        vec!["reranker"],
+        "装配根注入的读者没有收到加载方报的相位：注入断了，而读数上只会表现为\
+         「这段启动没跑过」"
+    );
+    cog_observability::boot_footprint::clear_for_tests();
 }
 
 #[test]
