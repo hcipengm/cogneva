@@ -33,8 +33,10 @@
 #   19. Pod 的 serviceAccountName 在树里没声明 -> 红（Pod 会拿到 default 身份）；
 #   20. RoleBinding 的 roleRef 指向不存在的角色 -> 红（授予落在空集上）；
 #   21. 绑定的主体是一个没人拥有的 ServiceAccount -> 红；
-#   22. Ingress 注解里的中间件名在树里没有同名对象 -> 红（traefik 只是不套这层中间件）；
-#   23. 中间件注解少了 provider 后缀 -> 红（这条引用同样不生效）。
+#   22. Ingress 注解里的中间件名在树里没有同名对象 -> 红（traefik 会丢弃整条路由）；
+#   23. 中间件注解少了 provider 后缀 -> 红（这条引用同样解析不到）；
+#   24. 中间件注解只写对象名、没带命名空间前缀 -> 红，判词给出 `<ns>-<name>@kubernetescrd`
+#       （traefik 按「命名空间-名字」登记中间件；2026-10-29 这条注解就是整站 404 的成因）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -270,13 +272,13 @@ edit("17-rolebinding-cogneva-evolution.yaml", mutate)
 '
 
 # 22. Ingress 注解按名字引用的 Middleware 在树里没有同名对象：注解是字符串、对象是
-#     另一份清单，指不到时 traefik 不报错、只是不套这层中间件。
+#     另一份清单，指不到时 traefik 不报错，它丢掉整条路由。
 expect_red "middleware-name-miss" "里没有这个 Middleware" '
 def mutate(d):
     if d.get("kind") != "Ingress":
         return
     d["metadata"]["annotations"]["traefik.ingress.kubernetes.io/router.middlewares"] = \
-        "websocket-headers-typo@kubernetescrd"
+        "cogneva-websocket-headers-typo@kubernetescrd"
 edit("60-ingress-cogneva.yaml", mutate)
 '
 
@@ -290,4 +292,16 @@ def mutate(d):
 edit("60-ingress-cogneva.yaml", mutate)
 '
 
-echo "control-plane-reachability.test.sh: 23 用例全过"
+# 24. 注解只写对象名、没带命名空间前缀：对象在、名字对，但 traefik 的 CRD provider 按
+#     「命名空间-名字」登记，这条引用仍然解析不到。2026-10-29 整站 404 就是这一格：
+#     旧判据只比后一半，所以它把这条注解判成了过。
+expect_red "middleware-no-namespace" "必须写成 cogneva-websocket-headers@kubernetescrd" '
+def mutate(d):
+    if d.get("kind") != "Ingress":
+        return
+    d["metadata"]["annotations"]["traefik.ingress.kubernetes.io/router.middlewares"] = \
+        "websocket-headers@kubernetescrd"
+edit("60-ingress-cogneva.yaml", mutate)
+'
+
+echo "control-plane-reachability.test.sh: 24 用例全过"

@@ -1,8 +1,12 @@
 {{- if .Values.ingress.enabled }}
-{{- /* WebSocket 中间件的名字只在这里写一遍：注解里的 `<name>@kubernetescrd` 与下面
-       Middleware 对象的 metadata.name 是同一个名字，分两处写就会漂——注解指不到时
-       traefik 不会让 Ingress 失败，它只是不套这层中间件，响应头悄悄消失。 */}}
+{{- /* WebSocket 中间件的名字只在这里写一遍，但它有两种写法：对象叫 `websocket-headers`，
+       注解里引用它必须写成 `<namespace>-<name>@kubernetescrd`——traefik 的 CRD provider
+       按「命名空间-名字」登记每个中间件，只写名字的引用解析不到。2026-10-29 实测：
+       注解写成 `websocket-headers@kubernetescrd` 时 traefik 丢弃整条路由、整站 404
+       （不是只少一层响应头），写成 `cogneva-websocket-headers@kubernetescrd` 才路由。
+       两种写法由一个变量派生，分两处写就会漂。 */}}
 {{- $middleware := "websocket-headers" }}
+{{- $middlewareRef := printf "%s-%s" (include "cogneva.namespace" .) $middleware }}
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -14,7 +18,7 @@ metadata:
   annotations:
   {{- if eq .Values.ingress.className "traefik" }}
     traefik.ingress.kubernetes.io/router.entrypoints: web
-    traefik.ingress.kubernetes.io/router.middlewares: "{{ $middleware }}@kubernetescrd"
+    traefik.ingress.kubernetes.io/router.middlewares: "{{ $middlewareRef }}@kubernetescrd"
   {{- else }}
     # nginx 原生支持 WebSocket Upgrade，加长读写超时避免长连接被掐断
     nginx.ingress.kubernetes.io/proxy-read-timeout: {{ .Values.ingress.proxyTimeoutSecs | int | quote }}

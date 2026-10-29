@@ -9,6 +9,11 @@
 # WebSocket 与安全响应头由同目录 middleware-websocket-headers.yaml 承担——traefik 的
 # ingress 注解不覆盖这些，middleware 才覆盖。
 #
+# 注解里的引用带命名空间前缀（`cogneva-websocket-headers@kubernetescrd`）：traefik 的
+# CRD provider 按「命名空间-名字」登记中间件，只写名字的引用解析不到，而它的反应不是
+# 少套一层头——它把整条路由丢掉，整站 404。2026-10-29 实测：`websocket-headers@` 404、
+# `cogneva-websocket-headers@` 200 且带 X-Frame-Options。
+#
 # 不设 host 作为兜底路由：任意 Host 头（含隧道直连）都进主应用；
 # 监控组件按各自域名路由（见 observability/manifests/07-ingress-monitoring.yaml）。
 
@@ -22,7 +27,7 @@ metadata:
     app.kubernetes.io/component: gateway
   annotations:
     traefik.ingress.kubernetes.io/router.entrypoints: web
-    traefik.ingress.kubernetes.io/router.middlewares: "websocket-headers@kubernetescrd"
+    traefik.ingress.kubernetes.io/router.middlewares: "cogneva-websocket-headers@kubernetescrd"
 spec:
   ingressClassName: traefik
   rules:

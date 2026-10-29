@@ -572,8 +572,13 @@ for pname, sources in trees:
                         ", ".join(sorted("%s/%s" % (a, n) for (a, n) in service_accounts)) or "无"))
 
     # Ingress 注解里按名字引用的 Middleware：注解是字符串，Middleware 是另一份清单，
-    # 两者之间没有任何东西比较。名字指不到时 traefik 不报错、Ingress 也不失败——它只是
-    # 不套这层中间件，被它改写的响应头于是悄悄消失，而「没套」与「本来就不需要」同形。
+    # 两者之间没有任何东西比较。名字指不到时 traefik 不报错、Ingress 也不失败——它丢掉
+    # 整条路由，站点整体 404（2026-10-29 实测），而 404 与「这个路由本来就没有」同形。
+    #
+    # 名字指的是**登记名**，不是对象的 metadata.name：CRD provider 按「命名空间-名字」
+    # 登记，所以同一命名空间里的中间件在注解里也要写成 `<ns>-<name>@kubernetescrd`。
+    # 只认后一半（曾经就是这么判的）会把一条 404 的注解判成过——判据与 traefik 的口径
+    # 不一致时，绿的不是树，是判据自己。
     middlewares = {
         (d["metadata"].get("namespace"), d["metadata"]["name"])
         for d in docs if d.get("kind") == "Middleware"
@@ -599,11 +604,23 @@ for pname, sources in trees:
             if provider != "kubernetescrd":
                 # 别的 provider（@file / @internal）的中间件不在这棵树里声明。
                 continue
-            if (ins, name) not in middlewares:
+            prefix = "%s-" % ins
+            if name.startswith(prefix):
+                obj_name = name[len(prefix):]
+            else:
+                obj_name = name
+            if (ins, obj_name) not in middlewares:
                 fail("%s：Ingress %s 的中间件注解指向 %r，但 namespace %r 里没有这个 Middleware"
-                     "（声明过的：%s）——traefik 不会因此让 Ingress 失败，它只是不套这层中间件"
+                     "（声明过的：%s）——traefik 不会因此让 Ingress 失败，它丢弃整条路由，"
+                     "站点整体 404"
                      % (pname, iname, entry, ins,
-                        ", ".join(sorted(n for (a, n) in middlewares if a == ins)) or "无"))
+                        ", ".join(sorted("%s-%s@kubernetescrd" % (a, n)
+                                         for (a, n) in middlewares if a == ins)) or "无"))
+            elif not name.startswith(prefix):
+                fail("%s：Ingress %s 的中间件注解指向 %r，而 traefik 的 CRD provider 按"
+                     "「命名空间-名字」登记中间件——同一命名空间里也必须写成 %s，只写名字的"
+                     "引用解析不到，整条路由会被丢弃"
+                     % (pname, iname, entry, "%s%s@kubernetescrd" % (prefix, obj_name)))
 
 if judged == 0:
     print("判不了：一个 Service / 工作负载 / NetworkPolicy / ServiceAccount 都没读到，"
