@@ -1806,7 +1806,7 @@ data:
                 },
                 {
                   "name": "change_pool_block_stranded",
-                  "promql": "(max without (pod, container, instance) (cogneva_change_dispatch_pool_blocked_oldest_seconds and ((time() - cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds) < 1800)) > 1800) and on () (max without (pod, container, instance) ((cogneva_change_dispatch_verdict{decision=\"proceed\", reading=\"available\"}) and ((time() - cogneva_change_dispatch_verdict_observed_timestamp_seconds) < 1800)) == 1)",
+                  "promql": "(max without (pod, container, instance) (cogneva_change_dispatch_pool_blocked_oldest_seconds and ((time() - cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds) < 1800)) > 1800) and on () (max without (pod, container, instance) ((cogneva_change_dispatch_verdict{decision=\"proceed\", pool_reading=\"available\"}) and ((time() - cogneva_change_dispatch_verdict_observed_timestamp_seconds) < 1800)) == 1)",
                   "condition": {
                     "greater_than": 0.0
                   },

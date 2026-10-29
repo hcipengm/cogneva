@@ -32,9 +32,9 @@ tests:
         values: '1200x60'
       - series: 'cogneva_change_dispatch_pool_blocked_rows'
         values: '0x60'
-      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",pool_reading="available"}'
         values: '1x60'
-      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",pool_reading="available"}'
         values: '1200x60'
     alert_rule_test:
       - eval_time: 20m
@@ -50,9 +50,9 @@ tests:
         values: '1200x60'
       - series: 'cogneva_change_dispatch_pool_blocked_rows'
         values: '2129x60'
-      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",pool_reading="available"}'
         values: '1x60'
-      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",pool_reading="available"}'
         values: '1200x60'
     alert_rule_test:
       - eval_time: 20m
@@ -70,9 +70,9 @@ tests:
         values: '1200x60'
       - series: 'cogneva_change_dispatch_pool_blocked_rows'
         values: '40x60'
-      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",pool_reading="available"}'
         values: '1x60'
-      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",pool_reading="available"}'
         values: '1200x60'
     alert_rule_test:
       - eval_time: 20m
@@ -88,9 +88,9 @@ tests:
         values: '0x60'
       - series: 'cogneva_change_dispatch_pool_blocked_rows'
         values: '2129x60'
-      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",pool_reading="available"}'
         values: '0x60'
-      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",pool_reading="available"}'
         values: '0x60'
     alert_rule_test:
       - eval_time: 40m
@@ -106,13 +106,13 @@ tests:
         values: '1200x60'
       - series: 'cogneva_change_dispatch_pool_blocked_rows'
         values: '2129x60'
-      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",pool_reading="available"}'
         values: '0x60'
-      - series: 'cogneva_change_dispatch_verdict{decision="paused_llm_pool_unavailable",reading="unavailable"}'
+      - series: 'cogneva_change_dispatch_verdict{decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
         values: '1x60'
-      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",pool_reading="available"}'
         values: '0x60'
-      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="paused_llm_pool_unavailable",reading="unavailable"}'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="paused_llm_pool_unavailable",pool_reading="unavailable"}'
         values: '1200x60'
     alert_rule_test:
       - eval_time: 20m
@@ -128,13 +128,13 @@ tests:
         values: '1200x60'
       - series: 'cogneva_change_dispatch_pool_blocked_rows'
         values: '2129x60'
-      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",pool_reading="available"}'
         values: '0x60'
-      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="absent"}'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",pool_reading="absent"}'
         values: '1x60'
-      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",pool_reading="available"}'
         values: '0x60'
-      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="absent"}'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",pool_reading="absent"}'
         values: '1200x60'
     alert_rule_test:
       - eval_time: 20m
@@ -150,9 +150,9 @@ tests:
         values: '1200x60'
       - series: 'cogneva_change_dispatch_pool_blocked_rows'
         values: '2129x60'
-      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",pool_reading="available"}'
         values: '1x60'
-      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",pool_reading="available"}'
         values: '0x60'
     alert_rule_test:
       - eval_time: 40m
