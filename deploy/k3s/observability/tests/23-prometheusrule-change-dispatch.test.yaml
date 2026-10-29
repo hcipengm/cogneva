@@ -175,3 +175,123 @@ tests:
       - eval_time: 12h
         alertname: CognevaChangeLedgerStoppedMoving
         exp_alerts: []
+
+  # ═══ CognevaLlmPoolNoDeclaredReturn ═══
+  #
+  # 这一条回答的是「等得到还是等不到」。它与上面那条判的不是同一件事：上面那条说「账本
+  # 六小时没动」，这一条说「动不了的原因是等不到」。同一次停摆里，只有这一条能分开
+  # 「六天后上游自己会好」与「谁来换一次凭证才行」——两种情形的修法相反，一个是不动，
+  # 一个是必须动，而对同一句「池子不可用」说同一句话的判词，只能靠读者自己去查。
+
+  # 一、等不到：唯一的上游不可用，`quota_cycle`，重置时刻是 0（上游没说）。`for: 1h`
+  # 之前空、之后 firing。前半格钉 `for`，后半格钉判据。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0x200'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x200'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 59m
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts: []
+      - eval_time: 61m
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 二、等得到：上游说了 24 小时后恢复。这条必须**一直静**，12 小时也不许响。
+  # 这一格是现网 2026-10-29 的样子（一个上游声明 2026-11-04 15:59 UTC 恢复，账本 2126 条
+  # 停在下面等）。判据写成「有上游不可用就响」的话这一格立刻亮，而那种亮会连着亮六天。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0x721'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://ark.cn-beijing.volces.com/api/plan/v3|ark-code-latest"}'
+        values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://ark.cn-beijing.volces.com/api/plan/v3|ark-code-latest"}'
+        values: '86400x721'
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts: []
+
+  # 三、池子好好的：上游那一格再怎么缺重置时刻，池子可用就不该响。这一格钉的是左式的后
+  # 一半——删掉 `and on() (min(llm_pool_available) == 0)`，这一格立刻亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '1x721'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x721'
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts: []
+
+  # 四、重置时刻已经过去：上游声明过第 60 秒恢复，而十二小时后它还在拒。这不是「等得到」
+  # ——那个时刻已经在后面了，窗口早该结束。判据只看「有没有未来时刻」，所以这一格必须响；
+  # 只看「这个字段有没有被填过」的写法在这一格里会静下去，而它恰是最该响的一种。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0x721'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '60x721'
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  # 五、两个上游、一个说得出一个说不出：必须静。等得到的那个还在，等待仍然有指望。
+  # 这一格钉的是量词——判据要写成「没有任何一个声明了未来时刻」，而不是「有一个没声明」。
+  # 写成后者的话这一格会亮，而现网正是这个形状（kimi 的重置时刻是 0、ark 的在下周）。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0x721'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x721'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://ark.cn-beijing.volces.com/api/plan/v3|ark-code-latest"}'
+        values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://ark.cn-beijing.volces.com/api/plan/v3|ark-code-latest"}'
+        values: '1793807999x721'
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts: []
+
+  # 六、三个副本各报一次同一个上游：不能因为「三份里有一份说了未来时刻」就静，也不能
+  # 因为「三份里有两份没说」就响。上游只有两个，判据必须按 `upstream` 聚合后再数——
+  # 不聚合的话 `and on(upstream)` 会在副本之间做配对，答案取决于副本数而不是上游数。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0x721'
+      - series: 'llm_upstream_healthy{instance="10.42.0.142:8080",job="cogneva",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x721'
+      - series: 'llm_upstream_healthy{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.142:8080",job="cogneva",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="https://api.kimi.com/coding/v1|k3"}'
+        values: '86400x721'
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts: []

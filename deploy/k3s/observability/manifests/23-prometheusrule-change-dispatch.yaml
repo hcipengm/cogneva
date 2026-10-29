@@ -62,3 +62,56 @@ spec:
           annotations:
             summary: "变更账本已经 6 小时没有派发任何一条，还有 {{ $value }} 条在等"
             description: "派发 pass 连续判 `paused_llm_pool_unavailable`。先比两格：`llm_pool_available` 为 0 是真的没有可用上游（看 `llm_upstream_healthy`、`llm_upstream_refusal_kind`：`quota_cycle` 等上游自己声明的重置时刻 `llm_upstream_quota_reset_unix`，`entitlement` 要换凭证），为 1 则是闩住的判词与已恢复的池子分家了，那条路要清 latch 而不是等。两种情况都别逐条去动账本里的行：行上的 `blocked_reason` 是这一层写上去的，池子恢复后的下一趟 pass 会自己清。"
+
+        # 「池子不可用」有两种，修法相反，而上面那一条对两种说同一句话：等。
+        #
+        #   - 有一种**等得到**：某个被拒的上游是 `quota_cycle`，而且它自己声明了窗口结束的
+        #     时刻（`llm_upstream_quota_reset_unix` 在未来）。2026-10-29 现网就是这样：
+        #     池里两个上游都判 `quota_cycle`，其中一个声明 2026-11-04 15:59 UTC 恢复，
+        #     账本 2126 条停在那里，六天后自己会走。这种情形不该多一条红——红六天等于
+        #     没有红。
+        #   - 有一种**等不到**：没有任何一个被拒的上游声明未来的重置时刻。要么 `entitlement`
+        #     （凭证不对，换凭证才行），要么 `quota_cycle` 而重置时刻是 0 或已经过去
+        #     （窗口早该结束却还在拒，说明上游那侧的账不是按时辰结的）。这种情形下
+        #     「等下一次探测」永远等不到，能结束它的只有换凭证、抬额度、或者把那个上游
+        #     摘掉——三件事都是**人**做的，所以它必须单独亮。
+        #
+        # 判据就是这两者之差：池子不可用 ∧ 没有任何一个不可用的上游声明了未来的重置时刻。
+        # 后半个条件的取法要小心「零个」：PromQL 里 `count(<空向量>)` 不产生序列，
+        # 所以不能写成 `count(...) == 0`——那样在真的零个时反而是空、规则永不响，而它恰
+        # 恰是唯一该响的格子。这里用 `unless`：左式（有不可用的上游）减去右式（其中声明了
+        # 未来重置时刻的），还剩东西才响。
+        #
+        # 为什么按 `upstream` 先聚合：`llm_upstream_*` 有三处导出者（网关、主应用、进化），
+        # 同一个 upstream 会被三个 Pod 各报一次，不先 `by (upstream)` 聚合的话，`and on(upstream)`
+        # 会在三份副本之间做笛卡尔配对，判据变成「三个 Pod 里有一个这么说」。
+        #
+        # 为什么不需要伴生钟（`_observed_timestamp_seconds`）：这一族不是共享表读出来的，
+        # 它是导出者自己的进程内 gauge，导出者停下时这一次刮取直接失败、序列消失，不会
+        # 像共享表那样把最后一笔值永久送出去。序列消失时这条规则静下来——那时该响的是
+        # 导出者本身，不是池子的后果。
+        #
+        # `for: 1h`：一次探测周期是分钟级，而「声明了未来重置时刻」只可能因为又探了一次
+        # 而变化。给一小时，是让一次刚恢复的窗口（那一刻约满、马上就能用）在 `for` 走完
+        # 之前自己消失，而不是把一分钟的可恢复报成「等不到」。
+        #
+        # 值取的是「不可用的上游有几个」：左式是那个计数，`and`/`unless` 都保留左式的值，
+        # 所以 `{{ $value }}` 是数得出来的那个数，读者不用再查一次。
+        - alert: CognevaLlmPoolNoDeclaredReturn
+          expr: |
+            count(min by (upstream) (llm_upstream_healthy) == 0)
+              and on() (min(llm_pool_available) == 0)
+                unless on()
+              count(
+                  (max by (upstream) (llm_upstream_quota_reset_unix) > time())
+                and on(upstream)
+                  (min by (upstream) (llm_upstream_healthy) == 0)
+              )
+          for: 1h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "LLM 池不可用，而且 {{ $value }} 个不可用的上游没有一个说得出什么时候恢复"
+            description: "`llm_pool_available` 为 0，且每一个不可用的上游都没有声明未来的重置时刻——等下一次探测不会改变任何事，能结束它的只有三件事之一：换凭证（`llm_upstream_refusal_kind{kind=\"entitlement\"}=1` 的上游）、抬额度（`quota_cycle` 而上游那侧的账单没按时辰结）、或者把那个上游从网关的 `llm-upstreams` 里摘掉。逐条看 `llm_upstream_healthy{upstream=...}` 与 `llm_upstream_refusal_kind{upstream=...}` 定是哪一个、哪一种：两个数合起来只有一格为 1，那 `upstream` 标签就是该动的那一条。修好后这条自己会灭——判据是 `llm_pool_available` 回到 1，不是这条红消失。别去动账本里的行：行上的 `blocked_reason` 由派发那一层写，池子恢复后的下一趟 pass 会自己清。"
