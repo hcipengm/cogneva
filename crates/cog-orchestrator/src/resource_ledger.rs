@@ -275,6 +275,43 @@ async fn publish_account_once(
     }
 }
 
+/// Give "has never dropped anything" a row of its own.
+///
+/// [`publish_drops_once`] only writes when the running total moved, so a
+/// process that never lost an event leaves no row at all -- and a missing row
+/// is the same shape, on every surface that reads this counter, as a counter
+/// nobody wired up. One of those states needs nothing done and the other needs
+/// the producer fixed, so a reader cannot tell which it is looking at. A zero
+/// written once at start separates them: a row holding zero means the question
+/// was asked and the answer was none, no row means nobody asked.
+///
+/// Once, not every pass: the sample table is append-only and capped, so a zero
+/// per tick would push other series' history out of it. The counter contract
+/// states that a zero write adds to whatever total the series already holds
+/// rather than assigning to it, which is what makes the seed safe to repeat
+/// across restarts.
+async fn seed_drops(metrics: Option<&Arc<dyn MetricsBackend>>) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    if let Err(e) = metrics
+        .record_counter(
+            metric_names::RESOURCE_EVENTS_DROPPED_TOTAL,
+            0.0,
+            HashMap::new(),
+        )
+        .await
+    {
+        // A failed seed is not a failure to do the work; it is this one grid
+        // going back to being absent, and absent reads as "never dropped".
+        warn!(
+            error = %e,
+            "resource account: the zero seed for dropped events was not written, so a process \
+             that has dropped nothing will read the same as one that never wired the counter"
+        );
+    }
+}
+
 /// Publish the events this process could not hand over in time.
 ///
 /// Called once per pass with the producer's running total, so the counter is
@@ -330,6 +367,13 @@ pub fn spawn_resource_ledger_loop(
              folded and nothing is published -- a refusal will be visible only to whoever opens \
              the table"
         );
+    }
+
+    // Queued before the loop so the series exists before the first pass has a
+    // chance to publish a difference: a reader that finds the row missing in
+    // that window reads it as a producer that is not wired.
+    if let Some(published) = metrics.clone() {
+        tokio::spawn(async move { seed_drops(Some(&published)).await });
     }
 
     drop(cog_core::loop_health::spawn(
@@ -440,6 +484,132 @@ mod tests {
             detail: serde_json::json!({}),
             count: 1,
         }
+    }
+
+    /// Counters only: the seed and the delta are the two writes this module
+    /// makes, and both go through `record_counter`.
+    #[derive(Default)]
+    struct RecordingCounters {
+        counters: std::sync::Mutex<Vec<(String, f64)>>,
+    }
+
+    impl RecordingCounters {
+        fn writes(&self) -> Vec<(String, f64)> {
+            self.counters.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl MetricsBackend for RecordingCounters {
+        async fn record_gauge(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn record_counter(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            _: HashMap<String, String>,
+        ) -> SFResult<()> {
+            self.counters
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value));
+            Ok(())
+        }
+        async fn record_histogram(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn query_gauge_range(
+            &self,
+            _: &str,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_gauge_latest(&self, _: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_counter_range(
+            &self,
+            _: &str,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_counter_totals(&self, _: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_histogram_totals(
+            &self,
+            _: &str,
+        ) -> SFResult<Vec<cog_core::HistogramTotals>> {
+            unimplemented!()
+        }
+        async fn query_histogram_range(
+            &self,
+            _: &str,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn list_metric_names(&self, _: cog_core::MetricType) -> SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn health_check(&self) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 「从没丢过」与「这一格没接线」在读数面上同形，种子就是分开它们的那一行。
+    /// 没有这次改动，一个从没丢过事件的进程在这条序列上零行，而读的人会把它
+    /// 读成生产者缺席。
+    #[tokio::test]
+    async fn a_process_that_dropped_nothing_still_publishes_the_series() {
+        let counters = Arc::new(RecordingCounters::default());
+        let metrics: Arc<dyn MetricsBackend> = counters.clone();
+
+        seed_drops(Some(&metrics)).await;
+
+        let writes = counters.writes();
+        assert_eq!(writes.len(), 1, "the seed wrote more than one series");
+        assert_eq!(
+            writes[0].0,
+            metric_names::RESOURCE_EVENTS_DROPPED_TOTAL.as_str()
+        );
+        assert_eq!(writes[0].1, 0.0, "the seed must report no loss");
+    }
+
+    /// 种子只播一次：样本表 append-only 且有容量上限，每拍写一个零会挤掉别人的历史。
+    /// 所以种子之后的那一拍，在没有新损失时不能再写。
+    #[tokio::test]
+    async fn a_pass_after_the_seed_writes_nothing_more() {
+        let counters = Arc::new(RecordingCounters::default());
+        let metrics: Arc<dyn MetricsBackend> = counters.clone();
+        seed_drops(Some(&metrics)).await;
+
+        // 起手就把此刻的累计当作已经播过，于是这一拍没有差值可播。
+        let mut reported = cog_core::contract::build_gate::dropped_resource_events();
+        publish_drops_once(Some(&metrics), &mut reported).await;
+
+        let writes = counters.writes();
+        assert_eq!(
+            writes.len(),
+            1,
+            "a pass with nothing to report wrote the seed again: {writes:?}"
+        );
     }
 
     /// The seat guards the reading, not the writing: a process that does not
