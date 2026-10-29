@@ -46,14 +46,18 @@ pub enum Unread {
     NotAReading(&'static str),
     /// Nothing states it. A debt, counted by the census's `GAPS_AT_*`.
     ///
-    /// Nothing constructs this variant as of 2026-10-29: both censuses that
-    /// share this file reached zero gaps, the last one leaving when the
-    /// startup phase timing got a panel. Keeping it is what makes the ratchet
-    /// a ratchet -- the next series published with no reader is recorded by
-    /// writing one of these, and writing one is what pushes the pinned count
-    /// above its constant. A census that had to reintroduce the variant to
-    /// say "this one is owed" would instead have a comment saying so, which is
-    /// the shape the debt took before the count existed.
+    /// The scrape census stopped constructing this variant on 2026-10-29, when
+    /// its last entry left: the startup phase timing got a panel. *That* unit
+    /// is the one clippy calls this variant dead in, and clippy judges each
+    /// compilation unit separately -- the sibling census sharing this file
+    /// still files its own debts with it, and one file shared by two units is
+    /// exactly what makes the same variant live in one and dead in the other.
+    /// Keeping it is what makes the ratchet a ratchet: the next series
+    /// published with no reader is recorded by writing one of these, and
+    /// writing one is what pushes the pinned count above its constant. A
+    /// census that had to reintroduce the variant to say "this one is owed"
+    /// would instead have a comment saying so, which is the shape the debt
+    /// took before the count existed.
     #[allow(dead_code)]
     Gap(&'static str),
 }
