@@ -271,6 +271,94 @@ defaultRules:
     PrometheusErrorSendingAlertsToSomeAlertmanagers: true
     PrometheusNotificationQueueRunningFull: true
 
+# ─── 休眠理由：装得上、却不可能触发的上游规则 ─────────────────────
+#
+# 一条规则加载成功不等于它能触发：它引用的序列在本档里一条都不存在，表达式
+# 永远求不出 true。睡觉本身不是缺陷——守着一个本档没有的对象的规则，正确地
+# 睡着——但这个判断得写下来，否则「这条规则没响是因为没事」与「因为它根本
+# 不可能响」在读数上逐字同形。
+#
+# 为什么写在这里、而不是另立一张登记表：这些规则是上游 chart 的默认规则组，
+# 我们只通过本文件决定它们的去留（上面 defaultRules）。理由写在它们去留的
+# 同一个文件里，改规则的人本来就要碰这里；而一条规则若被上游改名或删掉，
+# 这张 map 的键还在——那种漂移由读到它的那扇门点名，不靠人记。
+#
+# reason 取闭集：object_absent / component_absent / feature_off / collector_off /
+# exporter_version / series_renamed / known_defect / lazy_counter / error_only_state /
+# code_not_deployed。why 一句话说清「凭什么此刻不可能触发、什么时候会醒」。
+# 缺席的**名字**不写在这里：它是每一拍从规则选择子减去现网名字面算出来的，
+# 抄一遍就是把机器算好的值手打一次，打错了不会有任何一排红。
+cognevaDormancy:
+  # --- collector_off（2 条）
+  NodeSystemdServiceCrashlooping:
+    reason: collector_off
+    why: "The systemd collector is the one opt-in collector among the three: node_scrape_collector_success has no series for it at all, and enabling it needs --collector.systemd plus the host dbus socket mounted into the pod. Turning it on can make node-exporter fail to start, so it is a deployment decision, not a flip."
+  NodeSystemdServiceFailed:
+    reason: collector_off
+    why: "Same opt-in collector as NodeSystemdServiceCrashlooping; absent from node_scrape_collector_success means it was never asked to run."
+  # --- error_only_state（2 条）
+  KubeNodeUnreachable:
+    reason: error_only_state
+    why: "kube-state-metrics exports one series per taint, so this family is empty while no node carries one -- and the exporter is demonstrably up, because kube_node_spec_unschedulable from the same node spec collector reads 1 here. Absent is the state, not the collector: the taint that makes a node unreachable is what creates the series, and the rule reads it from that moment."
+  KubePodNotReady:
+    reason: error_only_state
+    why: "kube_pod_status_reason is exported per reason only while a pod carries one (SchedulingGated et al.); no series means no pod is gated, and the unless clause then excludes nothing while the rule still fires on its phase/ready side."
+  # --- exporter_version（3 条）
+  KubeJobNotCompleted:
+    reason: exporter_version
+    why: "kube-state-metrics v2 dropped the kube_*_labels families; kube_job_info carries only allowlisted labels, which are off. The name appears only inside an unless clause, so its absence does not stop the rule from firing: it only makes the label_excluded_from_alerts opt-out inert. Restore by widening the allowlist and rewriting the clause to kube_job_info."
+  KubePersistentVolumeFillingUp:
+    reason: exporter_version
+    why: "Same removed family as KubeJobNotCompleted, and again only inside an unless clause, so filling-volume alerts still fire; the opt-out is inert until the allowlist carries the label and the clause reads kube_persistentvolumeclaim_info."
+  KubePersistentVolumeInodesFillingUp:
+    reason: exporter_version
+    why: "Same removed family and same unless-only position as KubePersistentVolumeFillingUp; the inode rule fires, its opt-out does not."
+  # --- feature_off（7 条）
+  KubeletClientCertificateExpiration:
+    reason: feature_off
+    why: "The certificate-manager family exists only while kubelet runs with --rotate-certificates; k3s leaves it off, so this is a config gap, not an upstream removal. Enabling rotation would expose it."
+  KubeletClientCertificateRenewalErrors:
+    reason: feature_off
+    why: "Same certificate-manager gate: emitted only with --rotate-certificates enabled."
+  KubeletServerCertificateExpiration:
+    reason: feature_off
+    why: "Same certificate-manager gate: emitted only with server certificate rotation enabled."
+  KubeletServerCertificateRenewalErrors:
+    reason: feature_off
+    why: "Same certificate-manager gate: emitted only with server certificate rotation enabled."
+  PrometheusRemoteStorageFailures:
+    reason: feature_off
+    why: "No remote_write is configured, so the remote-storage queue never registers its counters."
+  PrometheusRemoteWriteBehind:
+    reason: feature_off
+    why: "No remote_write target exists; there is no queue head to fall behind the tip."
+  PrometheusRemoteWriteDesiredShards:
+    reason: feature_off
+    why: "No remote_write target exists; shard sizing only runs once remote write is configured."
+  # --- lazy_counter（1 条）
+  KubeNodeEviction:
+    reason: lazy_counter
+    why: "kubelet_evictions is an ALPHA counter labelled by eviction_signal, created on the first increment; no series means no eviction happened, and the rule fires as soon as one does. Not removed upstream."
+  # --- object_absent（6 条）
+  KubeHpaMaxedOut:
+    reason: object_absent
+    why: "No HorizontalPodAutoscaler exists in the cluster; correct dormancy, the rule wakes when one is created."
+  KubeHpaReplicasMismatch:
+    reason: object_absent
+    why: "No HorizontalPodAutoscaler exists; the replica mismatch this rule guards cannot occur."
+  KubePdbNotEnoughHealthyPods:
+    reason: object_absent
+    why: "No PodDisruptionBudget exists; correct dormancy, the rule wakes when one is created."
+  NodeBondingDegraded:
+    reason: object_absent
+    why: "The bonding collector is enabled by default in node-exporter and this host runs it -- node_scrape_collector_success{collector=\"bonding\"} reads 0 because the host has no /proc/net/bonding at all, not because the collector is off. No bond device exists, so the family is empty; it is exported as soon as a bond is created and the rule then reads it."
+  NodeRAIDDegraded:
+    reason: object_absent
+    why: "The mdadm collector is enabled by default and reads success=1 on this host; /proc/mdstat lists the personalities but no arrays, so the family is legitimately empty. Create an array and the series appear."
+  NodeRAIDDiskFailure:
+    reason: object_absent
+    why: "Same collector and same reason as NodeRAIDDegraded: mdadm runs (success=1) and exports per-disk state once an array exists; this host has none."
+
 # ─── 补回被关掉的规则 ─────────────────────────────────────────────
 # 只放需要重写的规则；其余默认规则保持 chart 原样。
 additionalPrometheusRulesMap:
