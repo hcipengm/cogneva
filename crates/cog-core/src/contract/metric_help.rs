@@ -597,6 +597,24 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the no_recipients state describes",
     ),
     (
+        "cogneva_alert_assertion_write_total",
+        "How many times this process tried to record an alert verdict, labelled by \
+         `outcome`; the cell's value is a count. An alert is two writes: the row a \
+         reader selects, and the verdict row that says which writer asserted what. \
+         The first one succeeding says nothing about the second, and for as long as \
+         only the failure to write the verdict was a warn line, a verdict table that \
+         refused every insert left the family reading exactly like a calm deployment \
+         -- no writer ever asserted anything, which is also what one healthy writer \
+         that agrees with nobody looks like. A warn line is already gone by the time \
+         anyone asks. Each attempt counts one in the cell it ended in: `written` is a \
+         verdict that landed, `failed` is one that did not (the log line beside it \
+         names the dedup key and the error). A flat `written` and no sample at all \
+         are different readings -- the first is a writer that agrees with the stored \
+         state, the second is nobody asserting -- and keeping them in one family is \
+         the point. Read `failed` with `increase()` over a window: it should never \
+         move, and any rise means alerts landed without a recorded verdict",
+    ),
+    (
         "cogneva_alert_rule_count",
         "How many rules the two sides of the loaded-rule-set check hold, \
          labelled by `state`; the cell's value is a count. The check already \

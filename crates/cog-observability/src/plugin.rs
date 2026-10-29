@@ -425,21 +425,33 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // before start_all, and self-discovery consumes it in start.
         self.alert_store = match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => match PostgresAlertStore::connect(&url).await {
-                Ok(store) => match store.init_schema(schema_runner.as_ref()).await {
-                    Ok(()) => {
-                        info!("alert state machine persisted to PostgreSQL");
-                        let store = Arc::new(store);
-                        let source: Arc<dyn cog_core::ActiveAlertSource> = store.clone();
-                        ctx.publish_service(source);
-                        let sink: Arc<dyn cog_core::PersistentAlertSink> = store.clone();
-                        ctx.publish_service(sink);
-                        Some(store)
+                // The store is where a verdict write fails, so it is where the
+                // failure has to be counted; a warn line from inside the pod
+                // that is failing does not survive the rollout that follows.
+                Ok(store) => {
+                    let store = match ctx.consume_service::<dyn cog_core::MetricsBackend>() {
+                        Some(backend) => store.with_metrics(backend),
+                        None => store,
+                    };
+                    match store.init_schema(schema_runner.as_ref()).await {
+                        Ok(()) => {
+                            info!("alert state machine persisted to PostgreSQL");
+                            let store = Arc::new(store);
+                            let source: Arc<dyn cog_core::ActiveAlertSource> = store.clone();
+                            ctx.publish_service(source);
+                            let sink: Arc<dyn cog_core::PersistentAlertSink> = store.clone();
+                            ctx.publish_service(sink);
+                            Some(store)
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "alert table init failed; alerts stay notification-only"
+                            );
+                            None
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "alert table init failed; alerts stay notification-only");
-                        None
-                    }
-                },
+                }
                 Err(e) => {
                     warn!(error = %e, "alert store connect failed; alerts stay notification-only");
                     None

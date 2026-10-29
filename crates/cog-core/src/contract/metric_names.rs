@@ -541,6 +541,21 @@ metric_names! {
     // covers at least two passes.
     ALERT_CHANNEL_RESOLUTION_TOTAL => "cogneva_alert_channel_resolution_total",
 
+    // cog-observability — verdict writes, labelled by `outcome`.
+    //
+    // The alert row and its verdict are two writes, and the row is the one a
+    // reader sees: a verdict table that refuses every insert leaves a family
+    // that says no writer ever asserted anything, which is also exactly what a
+    // deployment with one healthy writer that agrees with nobody looks like.
+    // The failure was reported only as a warn line, and a warn line dies with
+    // the pod that wrote it -- the two states stayed indistinguishable for as
+    // long as nobody grepped the log. Each attempt counts one in the cell it
+    // ended in: a rising `failed` says writers are being refused, a flat
+    // `written` says they are not, and an absent family says nobody asserted at
+    // all -- the third state has to stay readable as its own thing rather than
+    // as a quiet deployment.
+    ALERT_ASSERTION_WRITE_TOTAL => "cogneva_alert_assertion_write_total",
+
     // cog-observability — the two sizes the loaded-rule-set check compares,
     // labelled by `state` (`declared|loaded|document_readable`), the cell's
     // value being a count.

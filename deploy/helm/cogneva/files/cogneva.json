@@ -3464,6 +3464,16 @@
           "face": "可观测与告警"
         },
         {
+          "name": "alert_verdict_not_recorded",
+          "promql": "(max(increase(cogneva_alert_assertion_write_total{outcome=\"failed\"}[15m])) > 0)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "有告警落了库、它的判词没落：`alerts` 那一行写成了，`alert_assertions` 那一行每次写都失败，这面读数的 `outcome=\"failed\"` 那一格在窗口里涨了。这不是「告警丢了」——投递照常，人在第一时间仍然会被通知；丢的是「哪个写者、在什么时候、断言它是什么状态」这半张表。它坏掉的读法很安静：判词面停住、每个写者都读作从没断言过，而一个只剩一个健康写者的部署长得一模一样。失败原先只有一行 warn，写在正在出错的那个 Pod 里，而紧接着的滚动正好会把它带走——所以这条读数就是那个日志行留下的唯一痕迹。查法：按同一段时间找 `alert verdict not recorded; the alert row itself landed`，那条日志点名 dedup key 与数据库报的错；常见成因是判词表停在旧形状（少一列）或整张表不在。用 15 分钟窗口读 `increase` 而不是裸读累计值：计数器随进程重启归零，`increase` 跨重启仍然读得对；没有样点时不触发，那正是「一条判词都没写过」的部署，不是故障。severity 取 warning：告警本身还在，错的是它的署名与分歧面。",
+          "face": "可观测与告警"
+        },
+        {
           "name": "alert_rule_set_disagrees_with_configmap",
           "promql": "min without (pod, container, instance, endpoint, service, namespace) (cogneva_alert_rule_count{state=\"agrees\"})",
           "condition": {

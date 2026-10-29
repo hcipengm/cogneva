@@ -1,0 +1,61 @@
+# 「告警落了库、判词没落」这条规则的夹具：证明它会响，也证明它不会白响。
+#
+# 一个告警是两次写：`alerts` 那一行（读者按状态选出来的），和 `alert_assertions` 那一行
+# （哪个写者、在什么时候、断言它是什么状态）。第二次写失败时 `set_alert` 仍然返回 `Ok`，
+# 投递照常，所以从外面看什么都没有发生——除了判词面停住。这条读数把两种结局都写出来
+# （`outcome="written"` 与 `outcome="failed"`），因为它们分开才读得出「没人断言过」与
+# 「每个人都同意」的差别：只有失败那一格时，两者都是没有序列。
+#
+# 规则在部署配置的进程内 watcher 那一库，不在 PrometheusRule 清单里，所以这里点名规则名，
+# 由跑者从 `deploy/helm/cogneva/files/cogneva.json` 按名字取正文（连同它自己的 `condition`）：
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-alert-verdict-write.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: alert_verdict_not_recorded
+
+evaluation_interval: 1m
+
+tests:
+  # 失败那一格在长，成功那一格平着：窗口里的 `increase` 大于 0 ⇒ 响。
+  #
+  # 这一格守两件事：方向（增长为正就响，比较写反它先红），以及读**增长**而不是读电平
+  # ——累计值本身是只增不减的正整数，读电平会让每个写过一次失败的进程常年亮灯。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_assertion_write_total{outcome="failed"}'
+        values: '0x5 1x15'
+      - series: 'cogneva_alert_assertion_write_total{outcome="written"}'
+        values: '5x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_verdict_not_recorded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 只有成功那一格在长：一次都没失败过。这一格守选择器——把 `{outcome="failed"}` 去掉，
+  # 上面那格照样绿，而这里会红，因为成功的写入被算成了「判词丢了」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_assertion_write_total{outcome="failed"}'
+        values: '0x20'
+      - series: 'cogneva_alert_assertion_write_total{outcome="written"}'
+        values: '5x5 20x15'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_verdict_not_recorded
+        exp_alerts: []
+
+  # 两格都没有（这个部署从来没写过判词）：不响。缺席不是失败，它自己那件事由旁的东西看。
+  - interval: 1m
+    input_series:
+      - series: 'up{job="prometheus"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_verdict_not_recorded
+        exp_alerts: []

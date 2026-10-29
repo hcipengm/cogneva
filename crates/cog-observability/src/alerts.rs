@@ -46,6 +46,15 @@ pub const OUTCOME_NO_CHANNEL: &str = "no_channel";
 /// bell will not find the alert that produced it.
 pub const OUTCOME_WRITE_FAILED: &str = "write_failed";
 
+/// The alert verdict was written: this writer's opinion on the alert is on the
+/// verdict table, where a reader comparing writers can see it.
+///
+/// The other half of [`cog_core::metric_names::ALERT_ASSERTION_WRITE_TOTAL`] is
+/// [`OUTCOME_FAILED`]. Both cells exist so that "no writer asserted" and "every
+/// writer asserted what the row already said" are different readings: with the
+/// failure cell alone they are the same absence.
+pub const OUTCOME_WRITTEN: &str = "written";
+
 /// The `channel` label for the notification centre: one row in
 /// `notifications`, addressed to the instance owner, shown behind the WebUI's
 /// bell. Distinct from `in_app`, which is the `alerts` table the alert panel

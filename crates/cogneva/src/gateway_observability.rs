@@ -156,16 +156,21 @@ async fn build_pool_observability(
     let alerts = match config.database_url.as_deref() {
         Some(url) => match cog_storage::schema_ddl::PgSchemaRunner::connect(url).await {
             Ok(schema_runner) => match PostgresAlertStore::connect(url).await {
-                Ok(store) => match store.init_schema(&schema_runner).await {
-                    Ok(()) => {
-                        tracing::info!("告警状态机已落 PostgreSQL");
-                        Some(Arc::new(store))
+                // 判词写不进去时，唯一看得见这件事的是这个进程自己的日志——而
+                // 出错的那一次滚动正好会把它带走。计数器留下来，日志点名 dedup key。
+                Ok(store) => {
+                    let store = store.with_metrics(metrics.clone());
+                    match store.init_schema(&schema_runner).await {
+                        Ok(()) => {
+                            tracing::info!("告警状态机已落 PostgreSQL");
+                            Some(Arc::new(store))
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "alerts 建表失败，告警落库降级为关闭");
+                            None
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "alerts 建表失败，告警落库降级为关闭");
-                        None
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "PostgreSQL 连接失败，告警落库降级为关闭");
                     None

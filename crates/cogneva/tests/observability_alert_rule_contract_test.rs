@@ -1189,6 +1189,14 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_alert_channel_resolution_total",
         "crates/cog-observability/src/config.rs",
     ),
+    // 一条判词写进去了没有。告警是两次写：`alerts` 那行读者看得见，判词那行说
+    // 是哪个写者断言了什么。只有第二次能在第一次成功的前提下失败，而失败原先
+    // 只有一行 warn——写它的 Pod 一滚就没了。两格（`written`/`failed`）每次尝试
+    // 写一格为 1，好让「没人断言过」与「每个人都同意」不再同形。
+    (
+        "cogneva_alert_assertion_write_total",
+        "crates/cog-observability/src/alert_store.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.

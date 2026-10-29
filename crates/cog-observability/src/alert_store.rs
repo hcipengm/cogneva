@@ -329,6 +329,9 @@ pub struct PostgresAlertStore {
     /// writes -- see [`Self::prune_stale_verdicts_once`] for why the write path
     /// and not the schema path owns it.
     pruned_verdicts: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Where a verdict this store could not record is counted, when the process
+    /// has a metrics backend. See [`Self::record_assertion_best_effort`].
+    metrics: Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
 }
 
 impl PostgresAlertStore {
@@ -346,7 +349,19 @@ impl PostgresAlertStore {
             writer: writer.into(),
             role: role.into(),
             pruned_verdicts: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            metrics: None,
         }
+    }
+
+    /// Count unrecordable verdicts on the process's metrics backend.
+    ///
+    /// Off by default because the tests build stores with no backend; the
+    /// process that owns a backend attaches it here rather than threading one
+    /// through [`Self::connect`], which also runs where there is no backend to
+    /// hand over.
+    pub fn with_metrics(mut self, metrics: std::sync::Arc<dyn cog_core::MetricsBackend>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// The name this store writes under.
@@ -572,12 +587,51 @@ impl PostgresAlertStore {
     /// kept moving. Losing the verdict is a real loss and must not be silent,
     /// so it is logged with the key that lost it; it is not, however, a reason
     /// to report the alert itself as unpersisted.
+    ///
+    /// The log line is not the surface an operator reads: it is emitted from
+    /// inside the process that is failing, and it is gone once that pod is
+    /// replaced — which is the same event that would have explained the loss.
+    ///
+    /// Both outcomes are counted, not just the failure. A bare failure counter
+    /// leaves "no writer asserted anything" and "every writer asserted what the
+    /// row already said" as the same absent series at the reader, and those are
+    /// the two states this whole family exists to separate.
     async fn record_assertion_best_effort(&self, dedup_key: &str, state: AlertState) {
-        if let Err(e) = self.record_assertion(dedup_key, state).await {
+        let failure = self.record_assertion(dedup_key, state).await.err();
+        if let Some(e) = failure.as_ref() {
             tracing::warn!(
                 dedup_key = %dedup_key,
                 error = %e,
                 "alert verdict not recorded; the alert row itself landed"
+            );
+        }
+        let Some(backend) = self.metrics.as_ref() else {
+            return;
+        };
+        let outcome = if failure.is_some() {
+            crate::alerts::OUTCOME_FAILED
+        } else {
+            crate::alerts::OUTCOME_WRITTEN
+        };
+        let labels = std::collections::HashMap::from([(
+            crate::alerts::LABEL_OUTCOME.to_string(),
+            outcome.to_string(),
+        )]);
+        if let Err(count_error) = backend
+            .record_counter(
+                cog_core::metric_names::ALERT_ASSERTION_WRITE_TOTAL,
+                1.0,
+                labels,
+            )
+            .await
+        {
+            // Nothing left to fall back on for the count itself; the log line
+            // above already carries the key and the error when there was one.
+            tracing::warn!(
+                dedup_key = %dedup_key,
+                outcome,
+                error = %count_error,
+                "could not count the alert verdict write"
             );
         }
     }
@@ -1128,6 +1182,110 @@ mod tests {
         assert_eq!(role, "test-role", "新写入的断言带上写者的角色");
 
         cog_test_support::drop_schema(&url, &schema).await;
+    }
+
+    /// A verdict that cannot be written has to leave the process it failed in.
+    ///
+    /// An alert is two writes and only the second can fail without the first
+    /// noticing: `set_alert` returns `Ok` for a fired alert whose verdict never
+    /// landed. For as long as that was a warn line, the failure was reported
+    /// from inside the pod that was failing, and the rollout that follows a bad
+    /// deploy is what takes that line away — the verdict table then reads as
+    /// "nobody asserted", which is also what a quiet deployment with one
+    /// healthy writer looks like. Measured on 2026-10-30: seven minutes in
+    /// which no notification left the process and nothing in the metrics
+    /// surface said so.
+    ///
+    /// Both halves are pinned: the alert row still lands (a lost verdict must
+    /// not be read by a caller as "the alert was not persisted"), and the two
+    /// outcomes move apart — a failure counts one under `failed` and a success
+    /// counts one under `written`. A family that only had the failure cell
+    /// would leave "nobody asserted" and "everybody agreed" as the same
+    /// absence, which is the reading this whole thing exists to separate.
+    #[tokio::test]
+    #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+    async fn a_verdict_that_cannot_be_written_is_counted() {
+        let url = cog_test_support::database_url();
+        let schema = cog_test_support::own_schema(&url, "alert_assert_fail").await;
+        let pool = cog_test_support::schema_pool(&url, &schema).await;
+        let runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let store = PostgresAlertStore::with_identity(pool.clone(), "test-writer", "test-role")
+            .with_metrics(metrics.clone());
+        store
+            .init_schema(&runner)
+            .await
+            .expect("the tables are created");
+
+        let said = alert(POOL_MESSAGE, 1_789_744_595, "critical");
+        store
+            .set_alert(true, &said)
+            .await
+            .expect("the verdict table is there");
+        assert_eq!(
+            verdict_writes(&metrics, crate::alerts::OUTCOME_WRITTEN).await,
+            1.0,
+            "写得进去的断言落在 written 那一格"
+        );
+        assert_eq!(
+            verdict_writes(&metrics, crate::alerts::OUTCOME_FAILED).await,
+            0.0,
+            "一次成功的写不该被算成失败"
+        );
+
+        // 判词表整个不在：这是那个现场的最小复现——`alerts` 那张照常写，判词
+        // 那张每次写都报错。抽掉整张表只是让失败与表的形状无关，永远可复现。
+        sqlx::query("DROP TABLE alert_assertions")
+            .execute(&pool)
+            .await
+            .expect("the verdict table is removed");
+
+        let transition = store
+            .set_alert(false, &said)
+            .await
+            .expect("the alert row lands; only its verdict is missing");
+        assert_eq!(
+            transition,
+            AlertTransition::Resolved,
+            "没有判词，告警本身还是一次告警"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM alerts WHERE dedup_key = $1")
+            .bind(&said.dedup_key)
+            .fetch_one(&pool)
+            .await
+            .expect("the alert row is readable");
+        assert_eq!(rows, 1, "告警行必须照样落地");
+
+        assert_eq!(
+            verdict_writes(&metrics, crate::alerts::OUTCOME_FAILED).await,
+            1.0,
+            "写不进去的判词要在这个进程之外留下读数"
+        );
+        assert_eq!(
+            verdict_writes(&metrics, crate::alerts::OUTCOME_WRITTEN).await,
+            1.0,
+            "失败的那一次不许被算成写过"
+        );
+
+        cog_test_support::drop_schema(&url, &schema).await;
+    }
+
+    /// 本进程在某个结局那一格记下的总数。
+    async fn verdict_writes(
+        metrics: &cog_test_support::MemoryMetricsBackend,
+        outcome: &str,
+    ) -> f64 {
+        use cog_core::MetricsBackend as _;
+        metrics
+            .query_counter_totals(cog_core::metric_names::ALERT_ASSERTION_WRITE_TOTAL.as_str())
+            .await
+            .expect("the in-memory backend answers every read")
+            .iter()
+            .filter(|sample| sample.labels.get("outcome").map(String::as_str) == Some(outcome))
+            .map(|sample| sample.value)
+            .sum()
     }
 
     /// The state machine is the part worth pinning down; `set_alert` is pure
