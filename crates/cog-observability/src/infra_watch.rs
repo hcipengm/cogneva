@@ -517,7 +517,7 @@ async fn close_unattended(
     let stale_after = chrono::Duration::seconds(
         (config.poll_interval_secs.max(1) * u64::from(MISSING_TICKS_BEFORE_CLOSE)) as i64,
     );
-    let (closing, present): (Vec<String>, HashSet<String>) = match &outlets.store {
+    let (closing, present): (Unattended, HashSet<String>) = match &outlets.store {
         Some(store) => {
             let rules: Vec<String> = config.rules.iter().map(|r| r.name.clone()).collect();
             match store.firing_rows_for_rules(&rules).await {
@@ -543,9 +543,38 @@ async fn close_unattended(
         }
         // Without a store there is nothing shared to ask, and the local count is
         // the only reading available.
-        None => (due.to_vec(), due.iter().cloned().collect()),
+        None => (
+            Unattended {
+                missed: due.to_vec(),
+                never_opened: Vec::new(),
+            },
+            due.iter().cloned().collect(),
+        ),
     };
-    for key in &closing {
+    // Neither half nominated a key and nothing is due: this pass has no row to
+    // close, and the two loops below would ask the store about nothing.
+    if closing.is_empty() && due.is_empty() {
+        return;
+    }
+    for (key, never_opened) in closing
+        .missed
+        .iter()
+        .map(|k| (k, false))
+        .chain(closing.never_opened.iter().map(|k| (k, true)))
+    {
+        // The two halves are one action -- a row is closed -- but not one
+        // story, and the difference is the whole point of the second half: a
+        // row this process opened is being retired by the writer that opened
+        // it, while a row it never opened is being retired by a writer that had
+        // no part in raising it. Whoever reads the log afterwards cannot tell
+        // those apart from the close alone, and only the second one is a
+        // judgement about somebody else's alert.
+        if never_opened {
+            info!(
+                key = %key,
+                "infra watch: closing a row this process never opened -- its sighting clock stopped and no rule of this pass reports it"
+            );
+        }
         // Keep believing it until the row is actually closed: the close retry
         // lives in this set, and dropping the key here is what turns one failed
         // write into a row that stays `firing` for good.
@@ -589,6 +618,27 @@ async fn close_unattended(
 /// `evaluated_ok` is what keeps that second half honest: a rule this pass could
 /// not query says nothing about its rows, and an outage is not a reason for
 /// every alert to report recovery.
+///
+/// The two populations are kept apart because closing is one action with two
+/// stories: a row this process knows about is being retired by whoever raised
+/// it, while a row it never opened is being retired by a party that had no part
+/// in raising it. Only the second is a judgement about somebody else's alert,
+/// and a log that cannot name it makes both read the same afterwards.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Unattended {
+    /// Keys this pass missed often enough, whose shared clock has also stopped.
+    missed: Vec<String>,
+    /// Rows of a rule this pass read whose key it never held at all.
+    never_opened: Vec<String>,
+}
+
+impl Unattended {
+    /// Nothing nominated at all. Used where the answer is "did the shared row
+    /// list ask this pass to close anything", which both halves answer.
+    fn is_empty(&self) -> bool {
+        self.missed.is_empty() && self.never_opened.is_empty()
+    }
+}
 fn unattended_rows(
     rows: &[AlertRecord],
     due: &[String],
@@ -596,7 +646,7 @@ fn unattended_rows(
     known_firing: &HashSet<String>,
     now: chrono::DateTime<Utc>,
     stale_after: chrono::Duration,
-) -> Vec<String> {
+) -> Unattended {
     let quiet = |row: &AlertRecord| match row.last_seen_at {
         // A clock that is still moving belongs to somebody else's sighting,
         // not to the end of a condition.
@@ -605,15 +655,23 @@ fn unattended_rows(
         // has sighted this row since the column existed.
         None => true,
     };
-    let mut closing = Vec::new();
+    let mut closing = Unattended::default();
     for row in rows {
-        let missed = due.iter().any(|key| key == &row.dedup_key);
+        if !quiet(row) {
+            continue;
+        }
+        // The local count wins the naming: a key this process nominated is one
+        // it raised or adopted, so the close is its own business however the
+        // shared row got there.
+        if due.iter().any(|key| key == &row.dedup_key) {
+            closing.missed.push(row.dedup_key.clone());
+            continue;
+        }
         // Nobody here ever opened it, and the rule was read this pass: the row
         // is somebody else's, and the only claim it has on staying open is a
         // clock that has stopped.
-        let unclaimed = !known_firing.contains(&row.dedup_key) && evaluated_ok.contains(&row.rule);
-        if (missed || unclaimed) && quiet(row) {
-            closing.push(row.dedup_key.clone());
+        if !known_firing.contains(&row.dedup_key) && evaluated_ok.contains(&row.rule) {
+            closing.never_opened.push(row.dedup_key.clone());
         }
     }
     closing
@@ -3382,9 +3440,46 @@ mod tests {
             two_intervals(),
         );
         assert_eq!(
-            closing,
+            closing.never_opened,
             vec![key.to_string()],
             "另一个写者开出来、此后再没人刷新的行，本进程连漏拍都数不到它，只能靠时钟关"
+        );
+        assert!(
+            closing.missed.is_empty(),
+            "这一行不是本进程的漏拍，别记在它头上"
+        );
+    }
+
+    /// A key this process nominated is its own close even if its belief was
+    /// already dropped: the log has to say "I retired this", not "somebody else
+    /// raised an alert I never saw". Both readings close the row, but only one
+    /// of them is a judgement about somebody else's alert.
+    #[test]
+    fn a_key_this_pass_nominated_is_named_as_its_own_even_when_the_belief_is_gone() {
+        let now = Utc::now();
+        let key = "contended_rule:pod=a";
+        let rows = vec![firing_row(
+            "contended_rule",
+            key,
+            Some(now - chrono::Duration::seconds(600)),
+        )];
+        let evaluated_ok: HashSet<String> = HashSet::from(["contended_rule".to_string()]);
+        let closing = unattended_rows(
+            &rows,
+            &[key.to_string()],
+            &evaluated_ok,
+            &HashSet::new(),
+            now,
+            two_intervals(),
+        );
+        assert_eq!(
+            closing.missed,
+            vec![key.to_string()],
+            "本进程点过名的键，关掉它要记成自己的动作"
+        );
+        assert!(
+            closing.never_opened.is_empty(),
+            "同一个键不能同时算成「从没开过的行」——那会把一次自己的收口读成对别人的判断"
         );
     }
 
