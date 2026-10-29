@@ -116,11 +116,16 @@ runtime_asset_not_refreshed	cogneva_runtime_asset_state	error_only_state	Same ga
 # --- lazy_counter ---------------------------------------------------------
 mainline_admission_held	cogneva_mainline_admission_held_total	lazy_counter	cog-reflection/src/mainline_deployer.rs records this labelled counter only on a pass where admission actually held the rollout, so the family is created by the first hold. A deployment that never waited has no series, and the rule fires the moment one appears.
 
-# --- code_not_deployed ----------------------------------------------------
+# --- code_not_deployed: none right now -------------------------------------
+# The one row here (`change_ledger_measure_blind`) was deleted on 2026-10-29
+# after the rollout: the witness reading in the infra_watch layer reported it as
+# a stale declaration (the series is present), which is the condition the row
+# itself asked to be deleted under. The reasoning below is kept for whoever has
+# to file this cell again -- it is a start-up seed, not a lazy counter.
+#
 # The cell is seeded at zero for every reason on both halves when the change
 # ledger loop starts (cog-orchestrator/src/change_ledger.rs), so once this code
 # is running the series is present whether or not anything goes wrong -- the
 # absence can only be an image older than the seed. Not lazy_counter: that code
 # means the family is created by the first bad event, which is the opposite of
 # what a start-up seed does, and filing it there would record the wrong shape.
-change_ledger_measure_blind	cogneva_change_ledger_measure_unsettled_total	code_not_deployed	cog-orchestrator/src/change_ledger.rs seed_measure_unsettled writes one zero row per reason and half before the first pass runs; the series appears on the rollout carrying that code and this row must then be deleted.
