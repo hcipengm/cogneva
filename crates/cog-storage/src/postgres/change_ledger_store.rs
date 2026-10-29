@@ -523,11 +523,23 @@ SELECT h.kind, h.scope, h.literal, \
 /// reader adds the undecided bucket to the owed one), but "owed because it is
 /// queued" and "owed because a look could not settle it" are different debts,
 /// and only the second one has somebody to go and ask.
+///
+/// Every state the vocabulary knows is named here, including the three that
+/// share the owed bucket, so the `ELSE` is not what decides where a state goes.
+/// A state added later would otherwise appear as owed work without anybody
+/// having said that it is, and the count would be right while the reading was
+/// wrong -- the same shape as the missing `undecided` arm, one state later. The
+/// `ELSE` stays as the answer for a row whose state is not in the vocabulary at
+/// all, which a test cannot enumerate; naming the states here is what makes that
+/// unreachable for the ones it can.
 const BLOCK_CENSUS_SQL_TEMPLATE: &str = "\
 SELECT block, \
        CASE state WHEN '{state:landed}' THEN '{state:landed}' \
                   WHEN '{state:retired}' THEN '{state:retired}' \
                   WHEN '{state:undecided}' THEN '{state:undecided}' \
+                  WHEN '{state:conflict}' THEN 'owed' \
+                  WHEN '{state:pending}' THEN 'owed' \
+                  WHEN '{state:partial}' THEN 'owed' \
                   ELSE 'owed' END AS state, \
        count(*) AS n, \
        max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at))))::float8 \
@@ -2053,6 +2065,29 @@ mod templates {
                 sql.contains(&format!("THEN '{}'", state.as_str())),
                 "the census reads `{}` by name but the statement never emits that word, so the \
                  bucket always reads as zero: {sql}",
+                state.as_str()
+            );
+        }
+    }
+
+    /// The `ELSE` arm answers for rows this cannot enumerate, not for states the
+    /// vocabulary knows.
+    ///
+    /// A state with no arm of its own lands in the `ELSE`, which is how
+    /// `undecided` was reported as owed work for as long as it was: the total
+    /// stayed right and only the reader that asks for that bucket by name saw
+    /// the difference. Adding the missing arm fixes that one state; naming every
+    /// state the vocabulary holds is what makes the next one visible the moment
+    /// it is added, rather than one live reading later. The vocabulary is the
+    /// list, so this needs no database and changes when `ChangeState::ALL` does.
+    #[test]
+    fn the_census_answers_for_every_state_out_of_its_own_arm() {
+        let sql = fill_vocabulary(BLOCK_CENSUS_SQL_TEMPLATE);
+        for state in ChangeState::ALL {
+            assert!(
+                sql.contains(&format!("WHEN '{}' THEN", state.as_str())),
+                "`{}` has no arm of its own, so its rows reach the `ELSE` and are reported as \
+                 whatever that arm says rather than as something somebody decided: {sql}",
                 state.as_str()
             );
         }
