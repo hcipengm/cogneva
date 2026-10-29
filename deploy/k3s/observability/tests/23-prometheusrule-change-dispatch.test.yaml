@@ -189,10 +189,16 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x200'
+      - series: 'llm_pool_available_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0+60x200'
       - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x200'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x200'
       - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x200'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x200'
     alert_rule_test:
       - eval_time: 59m
         alertname: CognevaLlmPoolNoDeclaredReturn
@@ -212,10 +218,16 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x721'
+      - series: 'llm_pool_available_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0+60x721'
       - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
         values: '0x721'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
+        values: '0+60x721'
       - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
         values: '86400x721'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
+        values: '0+60x721'
     alert_rule_test:
       - eval_time: 12h
         alertname: CognevaLlmPoolNoDeclaredReturn
@@ -227,10 +239,16 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '1x721'
+      - series: 'llm_pool_available_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0+60x721'
       - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x721'
       - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x721'
     alert_rule_test:
       - eval_time: 12h
         alertname: CognevaLlmPoolNoDeclaredReturn
@@ -243,10 +261,16 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x721'
+      - series: 'llm_pool_available_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0+60x721'
       - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x721'
       - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '60x721'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x721'
     alert_rule_test:
       - eval_time: 12h
         alertname: CognevaLlmPoolNoDeclaredReturn
@@ -263,14 +287,24 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x721'
+      - series: 'llm_pool_available_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0+60x721'
       - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x721'
       - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x721'
       - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
         values: '0x721'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
+        values: '0+60x721'
       - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
         values: '1793807999x721'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
+        values: '0+60x721'
     alert_rule_test:
       - eval_time: 12h
         alertname: CognevaLlmPoolNoDeclaredReturn
@@ -283,14 +317,47 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x721'
+      - series: 'llm_pool_available_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0+60x721'
       - series: 'llm_upstream_healthy{instance="10.42.0.142:8080",job="cogneva",upstream="u1"}'
         values: '0x721'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.142:8080",job="cogneva",upstream="u1"}'
+        values: '0+60x721'
       - series: 'llm_upstream_healthy{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="u1"}'
         values: '0x721'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="u1"}'
+        values: '0+60x721'
       - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.142:8080",job="cogneva",upstream="u1"}'
         values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.142:8080",job="cogneva",upstream="u1"}'
+        values: '0+60x721'
       - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="u1"}'
         values: '86400x721'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="u1"}'
+        values: '0+60x721'
+    alert_rule_test:
+      - eval_time: 12h
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts: []
+
+  # 七、写者停了：三笔读数还是「池子不可用、没有一个上游说得出什么时候恢复」，而三条伴
+  # 生钟都冻在很久以前。这一格必须**静**——冻着的那几笔说的是几天前的事，把它读成现在，
+  # 就是把一条关于死写者的判词挂成「池子等不到」，而写者那一面有自己的红。钉的就是
+  # 三条 `and on()` 里的伴生钟判据：删掉它们，这一格和第一格一样亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0x721'
+      - series: 'llm_pool_available_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0x721'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0x721'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0x721'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0x721'
     alert_rule_test:
       - eval_time: 12h
         alertname: CognevaLlmPoolNoDeclaredReturn

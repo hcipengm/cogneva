@@ -86,10 +86,15 @@ spec:
         # 同一个 upstream 会被三个 Pod 各报一次，不先 `by (upstream)` 聚合的话，`and on(upstream)`
         # 会在三份副本之间做笛卡尔配对，判据变成「三个 Pod 里有一个这么说」。
         #
-        # 为什么不需要伴生钟（`_observed_timestamp_seconds`）：这一族不是共享表读出来的，
-        # 它是导出者自己的进程内 gauge，导出者停下时这一次刮取直接失败、序列消失，不会
-        # 像共享表那样把最后一笔值永久送出去。序列消失时这条规则静下来——那时该响的是
-        # 导出者本身，不是池子的后果。
+        # 为什么三条读数各要一个伴生钟（`_observed_timestamp_seconds`）：这一族登记在
+        # `DURABLE_POOL_GAUGES` 里，网关的 `record_gauge` 写进程内的同时也写耐久面，
+        # 而耐久面每次刮取都把手里最后那一笔照印一遍。导出者停下时序列不会消失、只会
+        # 原地冻住：冻着的 0 让这条永久点亮而没人能熄灭它，冻着的重置时刻让「等不到」
+        # 变成一句关于几天前的判词。三条都取交 `(time() - <伴生钟>) < 3600`——界宽过
+        # 1800s 的写者心跳，健康的写者不会在两次自己的发布之间被读成「停了」。伴生钟
+        # 取 `max` 而不是逐 `upstream`：写者是网关这一层，只要还有一处写着，这几条读数
+        # 就是现时的；全都停了是 `gateway_durable_writes_failing` 那一面的红，
+        # 不是池子的后果。
         #
         # `for: 1h`：一次探测周期是分钟级，而「声明了未来重置时刻」只可能因为又探了一次
         # 而变化。给一小时，是让一次刚恢复的窗口（那一刻约满、马上就能用）在 `for` 走完
@@ -101,6 +106,9 @@ spec:
           expr: |
             count(min by (upstream) (llm_upstream_healthy) == 0)
               and on() (min(llm_pool_available) == 0)
+              and on() ((time() - max(llm_pool_available_observed_timestamp_seconds)) < 3600)
+              and on() ((time() - max(llm_upstream_healthy_observed_timestamp_seconds)) < 3600)
+              and on() ((time() - max(llm_upstream_quota_reset_unix_observed_timestamp_seconds)) < 3600)
                 unless on()
               count(
                   (max by (upstream) (llm_upstream_quota_reset_unix) > time())
