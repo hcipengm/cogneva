@@ -20,6 +20,7 @@ rule_files:
 # rule: notification_delivery_failing
 # rule: notification_sign_refused
 # rule: alert_bound_band_reaches_bound
+# rule: alert_channel_declared_without_recipients
 
 evaluation_interval: 1m
 
@@ -44,7 +45,16 @@ tests:
         values: '200x20'
       - series: 'cogneva_alert_bound_band_limit_bytes{namespace="cogneva"}'
         values: '8192x20'
+      # 每一拍每个注册的频道都在三种结果上各写一格，命中的那格加一、其余写 0。
+      # 这一格是「写了 0」而不是「没写」：缺席是发布者停了，0 是这次解析就是这个结果。
+      - series: 'cogneva_alert_channel_resolution_total{channel="email",result="no_recipients"}'
+        values: '0x20'
+      - series: 'cogneva_alert_channel_resolution_total{channel="email",result="ok"}'
+        values: '20x20'
     alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_channel_declared_without_recipients
+        exp_alerts: []
       - eval_time: 20m
         alertname: alert_rule_count_reading_stopped
         exp_alerts: []
@@ -150,6 +160,26 @@ tests:
           - exp_labels:
               severity: warning
               state: agrees
+
+  # 一个频道被声明了、却没人能收到：`no_recipients` 这一格随时间增长（每拍解析一遍就
+  # 加一），而兄弟格 `ok` 平着不动——这就是「永远投不出去」的形状，因为它走不到投递，
+  # 投递侧的序列一条也不会动。
+  #
+  # 这一格同时守三件事：一是方向（增长为正就响，比较写反它先红）；二是读**增长**而不是
+  # 电平（`ok` 那格的累计值本来就是个正整数，读电平会让每个正常部署每拍都响）；三是
+  # 选择器（上面那格里涨的是 `ok`，去掉 `result` 过滤这里照样绿、那里就红）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_alert_channel_resolution_total{channel="email",result="no_recipients"}'
+        values: '0x5 1x15'
+      - series: 'cogneva_alert_channel_resolution_total{channel="email",result="ok"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: alert_channel_declared_without_recipients
+        exp_alerts:
+          - exp_labels:
+              severity: warning
 
   # 带宽贴着界但没过（6635 / 8192 = 0.8099）：规则写的是严格大于，差一点就是不许亮。
   # 这一格守的是那个比较方向——写成 `>=` 时它会先红，而不是等现网哪天刚好落在 0.8100。
