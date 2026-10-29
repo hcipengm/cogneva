@@ -7,7 +7,8 @@
  * 拿这条相等当判据。
  *
  * 令牌的角色是固定的：`ink-1000…600` 从最深的底色到最浅的表面，`paper*` 是文字，
- * `brass` 是唯一的强调色（标「你需要动手的地方」），`live/danger/warn/ok` 是状态。
+ * `brass` 是唯一的强调色（标「你需要动手的地方」），`live/danger/warn/ok` 是状态，
+ * `tag-*` 是顶栏五格各自的身份色——五格五色，同屏互不相像。
  * 结构靠 1px 细线和间距编码，不靠圆角卡片堆叠。
  *
  * 字阶只有四档（11/12/13/15）。密度是这一面的功能：同样的屏幕要多看几行日志、
@@ -30,6 +31,13 @@
   --danger: #ff6b7a;
   --warn: #f7ff5a;
   --ok: #a4ff5f;
+
+  /* 顶栏五格的身份色：同屏五个色相，互不相像。 */
+  --tag-platform: #5785f4;
+  --tag-web: #e13af2;
+  --tag-model: #f3523f;
+  --tag-alerts: #90c90d;
+  --tag-inbox: #0dc96c;
 
   --font-ui: 'IBM Plex Sans', 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;

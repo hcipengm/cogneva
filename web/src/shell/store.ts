@@ -69,9 +69,55 @@ export interface EditorTab {
   hint?: string;
 }
 
+/** 左栏宽度的上下界：再窄名字就截成两个字，再宽主区就放不下一段对话。 */
+export const SIDEBAR_MIN_WIDTH = 190;
+export const SIDEBAR_MAX_WIDTH = 640;
+export const SIDEBAR_DEFAULT_WIDTH = 262;
+const SIDEBAR_STORAGE_KEY = 'cogneva.sidebarWidth';
+
+/** 宽度只在这一台机器的这个浏览器里记着，所以刷新之后不用重新拖一次。 */
+function bootSidebarWidth(): number {
+  try {
+    const raw = window.localStorage.getItem(SIDEBAR_STORAGE_KEY);
+    const width = raw ? Number(raw) : NaN;
+    if (Number.isFinite(width)) return clampSidebarWidth(width);
+  } catch {
+    // 隐私模式下面 localStorage 会抛：拖拽照样能用，只是不跨刷新记住。
+  }
+  return SIDEBAR_DEFAULT_WIDTH;
+}
+
+export function clampSidebarWidth(width: number): number {
+  return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, Math.round(width)));
+}
+
+/**
+ * 工作台的两排法。`columns` 是编辑器式并排，`tabs` 是一次全屏看一段。
+ *
+ * 这不是两种皮肤，是两种不同的注意力分配：并排是为了同时看两边在说什么，
+ * 标签页是为了把一段放到最大。段数一多，并排会窄到读不成句子，那时候换排法
+ * 比缩小字号有用。
+ */
+export type WorkspaceMode = 'columns' | 'tabs';
+const WORKSPACE_MODE_STORAGE_KEY = 'cogneva.workspaceMode';
+
+function bootWorkspaceMode(): WorkspaceMode {
+  try {
+    const raw = window.localStorage.getItem(WORKSPACE_MODE_STORAGE_KEY);
+    if (raw === 'tabs' || raw === 'columns') return raw;
+  } catch {
+    // 同上：记不住只影响下一次打开用哪一种排法。
+  }
+  return 'columns';
+}
+
 interface ShellState {
   activity: ActivityId;
   sidebarVisible: boolean;
+  /** 左栏现在的宽度（像素）。读者拖过它之后就是这个数。 */
+  sidebarWidth: number;
+  /** 工作台怎么排：并排分栏，还是一次一段的标签页。 */
+  workspaceMode: WorkspaceMode;
   tabs: EditorTab[];
   activeTabId: string;
   panelOpen: boolean;
@@ -98,6 +144,8 @@ interface ShellState {
 
   setActivity: (activity: ActivityId) => void;
   toggleSidebar: () => void;
+  setSidebarWidth: (width: number) => void;
+  setWorkspaceMode: (mode: WorkspaceMode) => void;
   openTab: (tab: EditorTab) => void;
   closeTab: (id: string) => void;
   activateTab: (id: string) => void;
@@ -118,6 +166,8 @@ const FIRST_TAB: EditorTab = {
 export const useShell = create<ShellState>((set, get) => ({
   activity: 'workspace',
   sidebarVisible: true,
+  sidebarWidth: bootSidebarWidth(),
+  workspaceMode: bootWorkspaceMode(),
   tabs: [FIRST_TAB],
   activeTabId: FIRST_TAB.id,
   panelOpen: false,
@@ -150,6 +200,25 @@ export const useShell = create<ShellState>((set, get) => ({
     }),
 
   toggleSidebar: () => set((state) => ({ sidebarVisible: !state.sidebarVisible })),
+
+  setSidebarWidth: (width) => {
+    const clamped = clampSidebarWidth(width);
+    set({ sidebarWidth: clamped });
+    try {
+      window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(clamped));
+    } catch {
+      // 记不住不改变这一屏的宽度，只是下一次打开回到默认。
+    }
+  },
+
+  setWorkspaceMode: (workspaceMode) => {
+    set({ workspaceMode });
+    try {
+      window.localStorage.setItem(WORKSPACE_MODE_STORAGE_KEY, workspaceMode);
+    } catch {
+      // 记不住只影响下一次打开用哪一种排法。
+    }
+  },
 
   openTab: (tab) =>
     set((state) => {

@@ -72,6 +72,8 @@ const PATHS: Record<string, string[]> = {
     'M9.6 9.3a2.5 2.5 0 1 1 3.3 2.4c-.6.2-.9.8-.9 1.4v.6',
     'M12 17.1h.01',
   ],
+  columns: ['M3.5 4.5h17v15h-17z', 'M12 4.5v15'],
+  tabs: ['M3.5 6.5h8v-3h9v14h-17z', 'M6.5 3.5v3'],
   folder: ['M3.5 6.5h6l2 2.5h9v9.5h-17z'],
   file: ['M6.5 3.5h7l4 4v13h-11z', 'M13.5 3.5v4h4'],
   save: ['M5 5.5h11l3 3v10H5z', 'M8 5.5v4h7v-4', 'M8 13.5h8v5H8z'],

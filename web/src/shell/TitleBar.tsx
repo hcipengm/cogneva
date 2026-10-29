@@ -17,6 +17,19 @@ export function TitleBar() {
   const unread = notifications.unreadCount;
   const initial = (username ?? '?').slice(0, 1).toUpperCase();
 
+  // 五格各有自己的身份色（`tag-*`），不共用强调色与状态色：两格同色时，读者
+  // 只能读字才分得清，颜色就等于没上。
+  //
+  // 状态不占色相，改成让计数与圆点自己变色——身份说「这是哪一格」，状态说
+  // 「这一格现在有没有事」，两件事分开之后，五格同屏仍然五色，而不是热闹起来
+  // 一起变成红黄蓝。
+  const firingTone = alerts.error ? 'var(--warn)' : firing > 0 ? 'var(--danger)' : 'var(--muted)';
+  const unreadTone = notifications.error
+    ? 'var(--warn)'
+    : unread > 0
+      ? 'var(--paper)'
+      : 'var(--muted)';
+
   // 模型状态在顶栏只用一个点说三种事，每种都写出来源：配了、没配、还没读到。
   // 「还没读到」不能画成「没配」——那会让人去重配一条已经配好的上游。
   const configured = llm.status?.configured;
@@ -56,21 +69,19 @@ export function TitleBar() {
           type="button"
           onClick={() => setActivity('alerts')}
           title={alerts.error ? '告警读数没读到' : `${firing} 条告警在 firing`}
-          className="flex h-6 items-center gap-1.5 px-2 text-[11px] transition-colors hover:bg-[var(--ink-700)]"
-          style={{ color: alerts.error ? 'var(--warn)' : firing > 0 ? 'var(--danger)' : 'var(--muted)' }}
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-alerts)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="alerts" size={14} />
-          {alerts.error ? '?' : firing}
+          <span style={{ color: firingTone }}>{alerts.error ? '?' : firing}</span>
         </button>
         <button
           type="button"
           onClick={() => setActivity('inbox')}
           title={notifications.error ? '通知读数没读到' : `${unread} 条未读`}
-          className="flex h-6 items-center gap-1.5 px-2 text-[11px] transition-colors hover:bg-[var(--ink-700)]"
-          style={{ color: notifications.error ? 'var(--warn)' : unread > 0 ? 'var(--live)' : 'var(--muted)' }}
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-inbox)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="inbox" size={14} />
-          {notifications.error ? '?' : unread}
+          <span style={{ color: unreadTone }}>{notifications.error ? '?' : unread}</span>
         </button>
         {/* 模型入口：顶栏直达配置，不必先进设置再找那一格。状态点与设置页读的是
             同一份读数（Shell 里那一份 useLlmStatus），所以两处不会各说一套。 */}
@@ -79,8 +90,7 @@ export function TitleBar() {
           onClick={overlays.openLlmSetup}
           title={`${modelLabel} · GET /api/v1/llm/status · 读于 ${readAt} · 点开配置（保存时服务端会按双协议各探测一次）`}
           aria-label={`${modelLabel}，点开配置模型`}
-          className="flex h-6 items-center gap-1.5 px-2 text-[11px] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
-          style={{ color: modelTone }}
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-model)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <span
             className="inline-block h-1.5 w-1.5 rounded-full"
@@ -91,8 +101,9 @@ export function TitleBar() {
         </button>
         {/* 代码平台与上网以前只住在命令面板和设置页里：知道它们存在的人得先进
             别处才找得到。它们是两条各自独立的对外通路，顶栏各给一格。
-            这两格是全顶栏唯一带强调色的字：它们通向集群**之外**，而外部通路没配
-            就是没有——用缺席的灰字写，等于让人以为「这一格本来就没东西」。
+            这两格一直带字，也一直带色——通向集群**之外**的通路没配就是没有，
+            用缺席的灰字写，等于让人以为「这一格本来就没东西」。颜色是身份色，
+            五格各一个：两格同色时读者只能读字来分，颜色就白上了。
             图标也不再借用邻居的形状：本地那张源代码树是分支图，这里是出站箭头与
             地球，三个形状在 16px 下不会互相认错。 */}
         <button
@@ -100,7 +111,7 @@ export function TitleBar() {
           onClick={overlays.openCredentials}
           title="代码平台（GitHub / Gitee）令牌与 SSH 身份 · 点开配置"
           aria-label="代码平台：令牌与 SSH 身份"
-          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--brass)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-platform)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="platform" size={14} />
           代码平台
@@ -110,7 +121,7 @@ export function TitleBar() {
           onClick={overlays.openWebSearch}
           title="上网检索与抓取的后备池 · 点开配置"
           aria-label="上网：检索与抓取的后备池"
-          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--brass)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
+          className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-web)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="globe" size={14} />
           上网

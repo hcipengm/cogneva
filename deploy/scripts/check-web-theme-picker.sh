@@ -165,6 +165,44 @@ render_pos = main_src.find("createRoot(")
 if boot_pos < 0 or render_pos < 0 or boot_pos > render_pos:
     problems.append(f"{ENTRY} 里 bootTheme() 发生在 createRoot() 之后：第一帧已经用错配色画出来了")
 
+# ── 5. 顶栏五格的身份色：每套主题里五个都不一样，而且真的被读 ──
+# 这一条来自一个具体的坏形状：代码平台与上网两格同色，五格挤在顶栏右侧时，读者
+# 分不清哪一格是哪一格，颜色等于没上。同色不会报错、不会报红，只在屏幕上把辨识度
+# 悄悄收走，所以判据要落在「两两足够远」上，而不是「定义了五个名字」。
+TAGS = ["tag-platform", "tag-web", "tag-model", "tag-alerts", "tag-inbox"]
+TITLE = "shell/TitleBar.tsx"
+
+
+def rgb(hex_value):
+    return tuple(int(hex_value.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
+
+
+for theme_id, tokens in sorted(themes.items()):
+    missing_tags = [tag for tag in TAGS if tag not in tokens]
+    if missing_tags:
+        problems.append(
+            f"主题 {theme_id} 没有定义 {', '.join('--' + t for t in missing_tags)}"
+            "（顶栏五格的身份色缺一格，那一格会继承上一个主题的颜色）"
+        )
+        continue
+    for i in range(len(TAGS)):
+        for j in range(i):
+            a, b = tokens[TAGS[j]], tokens[TAGS[i]]
+            gap = sum((x - y) ** 2 for x, y in zip(rgb(a), rgb(b))) ** 0.5
+            if gap < 60:
+                problems.append(
+                    f"主题 {theme_id} 的 --{TAGS[j]}（{a}）与 --{TAGS[i]}（{b}）几乎同色"
+                    "（两格同色时读者只能读字来分，颜色等于没上）"
+                )
+
+title_src = read(TITLE)
+for tag in TAGS:
+    if f"var(--{tag})" not in title_src:
+        problems.append(
+            f"{TITLE} 没有读 --{tag}：身份色定义在注册表里而顶栏不用，"
+            "五格会退回共用同一两个强调色"
+        )
+
 if problems:
     sys.exit("配色主题不合格：\n  " + "\n  ".join(problems))
 

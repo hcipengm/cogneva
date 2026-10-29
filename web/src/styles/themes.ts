@@ -16,6 +16,16 @@
  * 而不是「照着名字另调一版」。
  */
 
+/**
+ * `tag-*` 是顶栏那五格的**身份色**，不是状态色：代码平台、上网、模型、告警、
+ * 收件箱各占一个，同一个主题里五个色相撑开四十度以上，所以一眼能把它们分开。
+ * 它们以前共用 `brass` 与 `live`——两格同色，读者只能靠字认，认字就等于没有色。
+ *
+ * 每套主题按自己的强调色对齐转一个角度取这五个色相，所以换主题之后它们跟着换，
+ * 又不至于压到这套主题的强调色和四个状态色上；每个色对的对比度都对过顶栏底色，
+ * 最浅的一套也有 5:1。亮色主题的取法不均匀（跳过黄绿的橄榄段），因为同样的角度
+ * 网格在浅底上会让其中一格变成脏橄榄色。
+ */
 export const TOKEN_KEYS = [
   'ink-1000',
   'ink-900',
@@ -33,6 +43,11 @@ export const TOKEN_KEYS = [
   'danger',
   'warn',
   'ok',
+  'tag-platform',
+  'tag-web',
+  'tag-model',
+  'tag-alerts',
+  'tag-inbox',
 ] as const;
 
 export type TokenKey = (typeof TOKEN_KEYS)[number];
@@ -99,6 +114,11 @@ export const THEMES: Theme[] = [
       danger: '#ff6b7a',
       warn: '#f7ff5a',
       ok: '#a4ff5f',
+      'tag-platform': '#5785f4',
+      'tag-web': '#e13af2',
+      'tag-model': '#f3523f',
+      'tag-alerts': '#90c90d',
+      'tag-inbox': '#0dc96c',
     },
   },
   {
@@ -124,6 +144,11 @@ export const THEMES: Theme[] = [
       danger: '#ff0066',
       warn: '#fff952',
       ok: '#4bff9e',
+      'tag-platform': '#f2532c',
+      'tag-web': '#7ec90d',
+      'tag-model': '#0dc97e',
+      'tag-alerts': '#617ff5',
+      'tag-inbox': '#ef0ff0',
     },
   },
   {
@@ -149,6 +174,11 @@ export const THEMES: Theme[] = [
       danger: '#ff4fa3',
       warn: '#ffc26d',
       ok: '#7effc3',
+      'tag-platform': '#f33f48',
+      'tag-web': '#adc90d',
+      'tag-model': '#0dc94f',
+      'tag-alerts': '#2782f1',
+      'tag-inbox': '#c949f3',
     },
   },
   {
@@ -174,6 +204,11 @@ export const THEMES: Theme[] = [
       danger: '#d68492',
       warn: '#e0caa3',
       ok: '#9ec08a',
+      'tag-platform': '#f36549',
+      'tag-web': '#85c90d',
+      'tag-model': '#0dc977',
+      'tag-alerts': '#6a8bf6',
+      'tag-inbox': '#ec44f3',
     },
   },
   {
@@ -199,6 +234,11 @@ export const THEMES: Theme[] = [
       danger: '#ff5470',
       warn: '#ffe08a',
       ok: '#9be15d',
+      'tag-platform': '#f45c57',
+      'tag-web': '#9ec90d',
+      'tag-model': '#0dc95e',
+      'tag-alerts': '#528ef4',
+      'tag-inbox': '#d952f4',
     },
   },
   {
@@ -224,6 +264,11 @@ export const THEMES: Theme[] = [
       danger: '#ff3860',
       warn: '#ffd23f',
       ok: '#39ff88',
+      'tag-platform': '#f05319',
+      'tag-web': '#71c90d',
+      'tag-model': '#0dc98b',
+      'tag-alerts': '#6a7df6',
+      'tag-inbox': '#f11ee2',
     },
   },
   {
@@ -249,6 +294,11 @@ export const THEMES: Theme[] = [
       danger: '#ff6e9c',
       warn: '#ffcb6b',
       ok: '#c3e88d',
+      'tag-platform': '#e76ad0',
+      'tag-web': '#e07e42',
+      'tag-model': '#5fb81e',
+      'tag-alerts': '#1eb896',
+      'tag-inbox': '#8d8fec',
     },
   },
   {
@@ -274,6 +324,11 @@ export const THEMES: Theme[] = [
       danger: '#ff5252',
       warn: '#ffca28',
       ok: '#9ccc65',
+      'tag-platform': '#b8b61e',
+      'tag-web': '#1eb83a',
+      'tag-model': '#2c99dd',
+      'tag-alerts': '#ba77e9',
+      'tag-inbox': '#e76a85',
     },
   },
   {
@@ -299,6 +354,11 @@ export const THEMES: Theme[] = [
       danger: '#ff5a3c',
       warn: '#ffcc33',
       ok: '#9ad46b',
+      'tag-platform': '#a7b81e',
+      'tag-web': '#1eb84e',
+      'tag-model': '#4290e0',
+      'tag-alerts': '#c165e6',
+      'tag-inbox': '#e5616d',
     },
   },
   {
@@ -324,6 +384,11 @@ export const THEMES: Theme[] = [
       danger: '#ff2d55',
       warn: '#ffd166',
       ok: '#6ee7a8',
+      'tag-platform': '#d76d23',
+      'tag-web': '#5ab81e',
+      'tag-model': '#1eb89b',
+      'tag-alerts': '#8180ea',
+      'tag-inbox': '#e250c3',
     },
   },
   {
@@ -349,6 +414,11 @@ export const THEMES: Theme[] = [
       danger: '#ff3b30',
       warn: '#ff9f0a',
       ok: '#34c759',
+      'tag-platform': '#66b81e',
+      'tag-web': '#1eb88f',
+      'tag-model': '#8087ea',
+      'tag-alerts': '#e458d2',
+      'tag-inbox': '#df703a',
     },
   },
   {
@@ -374,6 +444,11 @@ export const THEMES: Theme[] = [
       danger: '#ff3b5c',
       warn: '#d4ff3f',
       ok: '#38ff9c',
+      'tag-platform': '#1ea6b8',
+      'tag-web': '#9e7bea',
+      'tag-model': '#e561a1',
+      'tag-alerts': '#b88d1e',
+      'tag-inbox': '#2bb81e',
     },
   },
   {
@@ -399,6 +474,11 @@ export const THEMES: Theme[] = [
       danger: '#ff3355',
       warn: '#ffc24b',
       ok: '#6be08c',
+      'tag-platform': '#b8991e',
+      'tag-web': '#1eb81e',
+      'tag-model': '#1e9ab8',
+      'tag-alerts': '#a173e8',
+      'tag-inbox': '#e55d93',
     },
   },
   {
@@ -424,6 +504,11 @@ export const THEMES: Theme[] = [
       danger: '#c62828',
       warn: '#8a6100',
       ok: '#2e7d32',
+      'tag-platform': '#c51b3f',
+      'tag-web': '#945914',
+      'tag-model': '#107535',
+      'tag-alerts': '#156b9d',
+      'tag-inbox': '#871fe0',
     },
   },
   {
@@ -449,6 +534,11 @@ export const THEMES: Theme[] = [
       danger: '#c62828',
       warn: '#8a6100',
       ok: '#2e7d32',
+      'tag-platform': '#bc1a9c',
+      'tag-web': '#ce1c26',
+      'tag-model': '#277911',
+      'tag-alerts': '#117962',
+      'tag-inbox': '#1f29e0',
     },
   },
   {
@@ -474,6 +564,11 @@ export const THEMES: Theme[] = [
       danger: '#c9252d',
       warn: '#9a6200',
       ok: '#1a7f43',
+      'tag-platform': '#af1887',
+      'tag-web': '#bc1c1a',
+      'tag-model': '#1e700f',
+      'tag-alerts': '#0f6c5e',
+      'tag-inbox': '#221fe0',
     },
   },
   {
@@ -499,6 +594,11 @@ export const THEMES: Theme[] = [
       danger: '#c62828',
       warn: '#9a6200',
       ok: '#17794a',
+      'tag-platform': '#116879',
+      'tag-web': '#1f2ee0',
+      'tag-model': '#b81940',
+      'tag-alerts': '#755c10',
+      'tag-inbox': '#166c0f',
     },
   },
 ];

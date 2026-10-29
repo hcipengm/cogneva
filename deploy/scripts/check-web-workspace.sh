@@ -244,5 +244,45 @@ if "expect_hash" not in ide_src:
 if "ensure_unchanged(" not in handler_body("write_handler"):
     sys.exit(f"{IDE}: write_handler 落盘前不比底稿——409 永远不会出现")
 
-print("WORKSPACE OK：搜索、配额、保存冲突三条链路的取数、渲染、落点、后端判据都在")
+# ── 9. 工作台：段数不设上限，宽高跟着段数与窗口走，两种排法都在 ──
+# 这一条来自一个具体的坏形状：工作台只肯开三段，第四段点下去什么都不发生；排法
+# 固定成一列几栏，开得多了一格窄成竖条。两种坏法都不报错、不报红，只是「明明有
+# 这个功能却用不了」，而用不了的人只会以为软件就到此为止。
+workspaces = [
+    rel
+    for rel in sorted(graph)
+    if rel.endswith(".tsx") and re.search(r"<ConversationPane[\s/>]", read(rel))
+]
+if not workspaces:
+    sys.exit("没有任何可达的组件渲染 <ConversationPane：工作台不在任何一屏上")
+
+for rel in workspaces:
+    src = read(rel)
+    # 段数上限：写死的常量 + 拿它把按钮关掉，两样凑齐才是「只能开三段」。
+    for cap in re.findall(r"MAX_\w+\s*=\s*(\d+)", src):
+        sys.exit(
+            f"{rel} 里有一个写死的段数上限（MAX_… = {cap}）："
+            "开第 N+1 段时按钮会安静地什么都不做，读者只会以为软件只支持这么几段"
+        )
+    if re.search(r"disabled=\{[^}]*order\.length\s*>=", src):
+        sys.exit(f"{rel} 按段数把「新对话」按钮关掉了：段数应当是读者决定的，不是常量决定的")
+    if not re.search(r"(order|shown)\.map\(", src):
+        sys.exit(f"{rel} 没有按会话列表逐段渲染窗格：多开的对话不会出现在工作台上")
+    # 宽与高都要跟着段数和容器大小走：只排一维的话，段数一多就变成竖着的一条线。
+    if "gridTemplateColumns" not in src or "gridTemplateRows" not in src:
+        sys.exit(
+            f"{rel} 没有同时排宽与排高（缺 gridTemplateColumns / gridTemplateRows）："
+            "只按宽度分栏时，段数一多每一格就被压成一条竖线"
+        )
+    if "ResizeObserver" not in src:
+        sys.exit(f"{rel} 没有量容器大小：窗口改尺寸、侧栏被拖之后，排法不会跟着变")
+    # 两种排法：编辑器式的并排，与一次全屏看一段的标签页。
+    if not ("'tabs'" in src and "'columns'" in src):
+        sys.exit(
+            f"{rel} 只有一种排法：并排与标签页是两种不同的注意力分配，"
+            "只剩一种时，段数一多就没有「把这一段放到最大」的做法"
+        )
+
+print("WORKSPACE OK：搜索、配额、保存冲突三条链路的取数、渲染、落点、后端判据都在；"
+      "工作台段数不设上限、宽高自适应、并排与标签页两种排法都在")
 PYEOF

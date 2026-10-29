@@ -1,10 +1,10 @@
-import type { ReactNode } from 'react';
+import { useCallback, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react';
 import { FileTree } from '@/files/FileTree';
 import { SearchPanel } from '@/files/SearchPanel';
 import { WorkspaceUsage } from '@/files/WorkspaceUsage';
 import { useServices } from '@/shell/context';
 import { Icon, type IconName } from '@/shell/icons';
-import { useShell, type ActivityId } from '@/shell/store';
+import { SIDEBAR_DEFAULT_WIDTH, useShell, type ActivityId } from '@/shell/store';
 import { useStreamStore } from '@/store/streamStore';
 import { Moment } from '@/ui/primitives';
 
@@ -19,11 +19,48 @@ export function SideBar() {
   const activity = useShell((s) => s.activity);
   const visible = useShell((s) => s.sidebarVisible);
   const toggleSidebar = useShell((s) => s.toggleSidebar);
+  const width = useShell((s) => s.sidebarWidth);
+  const setWidth = useShell((s) => s.setSidebarWidth);
+
+  /**
+   * 拖右沿改宽。
+   *
+   * 位移按「按下时的宽度 + 指针移动了多少」算，而不是按「指针现在在哪儿」算：
+   * 侧栏左边不是屏幕左边（还有一条活动栏），拿绝对坐标会让第一下跳动。
+   * 指针移出侧栏之后事件还在 window 上，是因为拖拽一旦开始就该跟着指针走完，
+   * 而不是在边界处断掉。
+   */
+  const startDrag = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      const fromX = event.clientX;
+      const fromWidth = width;
+      const previousCursor = document.body.style.cursor;
+      const previousSelect = document.body.style.userSelect;
+      document.body.style.cursor = 'col-resize';
+      document.body.style.userSelect = 'none';
+
+      const move = (e: PointerEvent) => setWidth(fromWidth + (e.clientX - fromX));
+      const stop = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', stop);
+        document.body.style.cursor = previousCursor;
+        document.body.style.userSelect = previousSelect;
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', stop);
+    },
+    [setWidth, width]
+  );
 
   if (!visible) return null;
 
   return (
-    <aside className="flex h-full w-[262px] shrink-0 flex-col border-r border-[var(--line)] bg-[var(--ink-800)]">
+    <aside
+      className="relative flex h-full shrink-0 flex-col border-r border-[var(--line)] bg-[var(--ink-800)]"
+      style={{ width }}
+    >
       <header className="flex h-9 shrink-0 items-center border-b border-[var(--line)] px-3">
         <span className="text-[11px] uppercase tracking-[0.14em] text-[var(--muted)]">
           {TITLES[activity]}
@@ -40,6 +77,18 @@ export function SideBar() {
       <div className="min-h-0 flex-1 overflow-y-auto py-1">
         <ActivityPanel activity={activity} />
       </div>
+      {/* 抓的是这条 6px 的窄带而不是一像素的边框：边框太细，按不中就等于没有。
+          窄带压在侧栏右沿内侧，不占主区的宽度。 */}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="拖拽调整侧栏宽度"
+        onPointerDown={startDrag}
+        onDoubleClick={() => setWidth(SIDEBAR_DEFAULT_WIDTH)}
+        title="拖拽调整宽度，双击回到默认"
+        className="absolute right-0 top-0 z-10 h-full w-[6px] cursor-col-resize transition-colors hover:bg-[var(--line-strong)]"
+        data-sidebar-resizer="true"
+      />
     </aside>
   );
 }
