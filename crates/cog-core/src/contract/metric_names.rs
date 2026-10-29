@@ -1520,6 +1520,26 @@ metric_names! {
     // state family says `waiting`.
     CHANGE_LEDGER_OUT_OF_EFFECT_OLDEST_SECONDS => "cogneva_change_ledger_out_of_effect_oldest_seconds",
 
+    // cog-orchestrator — rows a change-ledger pass tried to measure and could
+    // not, counted as they enter that set, by reason and by which half of the
+    // pass could not settle them.
+    //
+    // A row whose check settles to no state keeps the state it had and is
+    // written nowhere: the only trace was a line in the pass's log, so "how
+    // many rows this pass could not measure, and why" had no series, no panel
+    // and no rule. The reason is a label because re-running the same look
+    // answers differently for some of them and never for others, and the two
+    // ask for different repairs. `half` keeps the outstanding set and the
+    // landed one apart: they are asked by different sweeps, and a landed row
+    // whose check stopped being answerable is a claim the account already made.
+    //
+    // Counted on entry rather than as occupancy: every pass re-asks the rows it
+    // already knows are unsettleable, so a count of the set would read one
+    // permanently unreadable row as a rising rate. Seeded at zero for every
+    // reason on each half at start-up and only added to when a row enters, so
+    // `increase()` over a window is the flow of rows becoming unmeasurable.
+    CHANGE_LEDGER_MEASURE_UNSETTLED_TOTAL => "cogneva_change_ledger_measure_unsettled_total",
+
     // cog-orchestrator — keeping a running task's progress resumable.
     //
     // The write side of the resume chain: a task that loses its process (a

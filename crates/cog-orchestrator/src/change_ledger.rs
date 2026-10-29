@@ -1123,6 +1123,19 @@ pub fn spawn_change_ledger_loop(
                 // put it.
                 let mut out_of_effect: HashMap<ChangeIdentity, String> = HashMap::new();
 
+                // Seeded at start-up, not per pass: every cell this family can
+                // write exists from the first scrape, so a series that has
+                // counted nothing yet is a series at zero rather than a hole in
+                // the surface that reads the same as never having been wired.
+                // Lives here rather than in the pass because a pass that writes
+                // zero every tick would add an unchanged row to an append-only
+                // table for every cell, every five minutes. An attempt that
+                // restarts re-seeds the same zeros: `record_counter` is
+                // additive by contract -- a boot-time seed of a closed set is
+                // what that clause exists for -- so adding zero neither loses
+                // a count nor resets one somebody else is keeping.
+                seed_measure_unsettled(metrics.as_ref()).await;
+
                 let mut ticker = tokio::time::interval(CHANGE_LEDGER_PASS_INTERVAL);
                 // The first tick is immediately ready; eating it puts the first
                 // read one period after the start rather than contending with
@@ -1235,7 +1248,7 @@ pub fn spawn_change_ledger_loop(
                     if let Some(ref deliveries) = deliveries {
                         stamp_deliveries(&*store, deliveries).await;
                     }
-                    measure_pass(&*store, &tree, &mut unsettled, &changed).await;
+                    measure_pass(&*store, &tree, &mut unsettled, &changed, metrics.as_ref()).await;
                     // The second face of "is it done", read after the
                     // measurement so that a row this pass just found landed is
                     // checked in the same pass it landed in -- the gap between
@@ -2116,6 +2129,7 @@ async fn measure_pass(
     tree: &CheckTree,
     unsettled: &mut HashMap<ChangeIdentity, UnsettledCheck>,
     changed: &[String],
+    metrics: Option<&Arc<dyn MetricsBackend>>,
 ) {
     // The batch is read before the tree is opened, so that a revision which
     // cannot be resolved still reports how many rows it left unmeasured. Opening
@@ -2177,6 +2191,10 @@ async fn measure_pass(
     let mut undecided = 0usize;
     let mut retired = 0usize;
     let mut by_reason: HashMap<UnsettledReason, usize> = HashMap::new();
+    // The rows that became unmeasurable in *this* pass, which is what the
+    // reading counts: `by_reason` is the size of the known set, re-counted
+    // every time each remembered row is asked again.
+    let mut entering_by_reason: HashMap<UnsettledReason, usize> = HashMap::new();
     let mut known_unsettled = 0usize;
     let mut considered = 0usize;
     for row in rows {
@@ -2245,6 +2263,9 @@ async fn measure_pass(
                     "change ledger: this change's check cannot be settled against the tree; \
                      its state is left as it was"
                 );
+            }
+            if !unsettled.contains_key(&row.identity) {
+                *entering_by_reason.entry(reason).or_default() += 1;
             }
             unsettled.insert(row.identity.clone(), UnsettledCheck { why, since: now });
             *by_reason.entry(reason).or_default() += 1;
@@ -2359,6 +2380,17 @@ async fn measure_pass(
         revision = snapshot.rev(),
         "change ledger: measured the outstanding set against the tree"
     );
+    // Both halves are published from here because both were counted by this
+    // call: the outstanding sweep above, and the landed sweep it ran itself.
+    // The counter is the one place this pass's failure to measure is readable
+    // after the process that wrote it is gone -- the log line above goes to
+    // whatever is collecting logs, and nothing selects rows by it.
+    publish_measure_unsettled(
+        metrics,
+        &entering_by_reason,
+        &reopened_pass.entering_by_reason,
+    )
+    .await;
 }
 
 /// What one pass over the landed set did, including what it could not do.
@@ -2375,6 +2407,11 @@ struct ReopenPass {
     reopened: usize,
     touched: usize,
     unsettleable: HashMap<UnsettledReason, usize>,
+    /// The rows that entered `unsettleable` in this pass, as opposed to the
+    /// ones already in it and asked again. Published beside the outstanding
+    /// half's own count; see [`publish_measure_unsettled`] for why the reading
+    /// is of entries.
+    entering_by_reason: HashMap<UnsettledReason, usize>,
     held: usize,
     /// Rows a look settled as `retired` because their scope had left the tree.
     /// Separate from `rechecked`, which counts rows whose check answered: a
@@ -2740,6 +2777,9 @@ async fn reopen_pass(
                                     "change ledger: a landed row's scope left the tree, but the \
                                      retirement could not be written, so the row keeps its state"
                                 );
+                                if !unsettled.contains_key(&row.identity) {
+                                    *pass.entering_by_reason.entry(reason).or_default() += 1;
+                                }
                                 unsettled.insert(
                                     row.identity.clone(),
                                     UnsettledCheck { why, since: now },
@@ -2772,6 +2812,9 @@ async fn reopen_pass(
                      it keeps its state and its old measured time, so it stays at the head \
                      of the staleness order"
                 );
+            }
+            if !unsettled.contains_key(&row.identity) {
+                *pass.entering_by_reason.entry(reason).or_default() += 1;
             }
             unsettled.insert(row.identity.clone(), UnsettledCheck { why, since: now });
             *pass.unsettleable.entry(reason).or_default() += 1;
@@ -4825,6 +4868,108 @@ async fn publish_in_effect_reading(
     }
 }
 
+/// The two halves of the account an unsettled count is kept for.
+///
+/// One family with a label rather than two names: the two sweeps ask the same
+/// question of different sets and fail for the same reasons, and what a reader
+/// needs is both answers side by side and the ability to select either. Folding
+/// them into one `{reason}` cell would return the reading to what it was before
+/// the landed sweep existed -- a landed row whose claim stopped being answerable
+/// is a different fact from a row that never landed.
+const MEASURE_HALVES: [&str; 2] = ["outstanding", "landed"];
+
+/// Make every cell of the measure-unsettled family exist, at zero, once.
+///
+/// Written at start-up rather than per pass. A counter is rendered from its
+/// accumulated total on every scrape, so a pass that wrote zero would add a row
+/// saying what the previous scrape already said, to an append-only table with a
+/// capacity bound. But a series is only rendered if the store has seen its name
+/// at all, so the cells cannot wait for the first row to become unmeasurable
+/// either: until then the surface would not carry the series, and a reader
+/// cannot tell a family that has counted nothing from one that was never wired.
+/// The seed adds zero, so a restart into a store that already holds counts does
+/// not lose them.
+async fn seed_measure_unsettled(metrics: Option<&Arc<dyn MetricsBackend>>) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    for reason in UnsettledReason::ALL {
+        for half in MEASURE_HALVES {
+            let labels = HashMap::from([
+                (crate::LABEL_REASON.to_string(), reason.as_str().to_string()),
+                (crate::LABEL_HALF.to_string(), half.to_string()),
+            ]);
+            if let Err(e) = metrics
+                .record_counter(
+                    metric_names::CHANGE_LEDGER_MEASURE_UNSETTLED_TOTAL,
+                    0.0,
+                    labels,
+                )
+                .await
+            {
+                warn!(
+                    error = %e,
+                    reason = reason.as_str(),
+                    half,
+                    "change ledger: a measure-unsettled cell could not be seeded at zero, so its \
+                     series is absent from the reading surface until it first counts something"
+                );
+            }
+        }
+    }
+}
+
+/// Add the rows that entered the unsettleable set this pass, per half and
+/// reason.
+///
+/// Only entries are counted. A known unsettleable row is asked again once its
+/// retry window is past, so counting the set's size would read one permanently
+/// unreadable row as a rate that climbs every pass, and the bound on the
+/// consumer side is "a whole batch entered", not "a batch is standing there".
+///
+/// A half that entered nothing is not written at all: the series was seeded at
+/// start-up, and a zero adds no information to the accumulated total.
+async fn publish_measure_unsettled(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    outstanding: &HashMap<UnsettledReason, usize>,
+    landed: &HashMap<UnsettledReason, usize>,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    for (half, counts) in [
+        (MEASURE_HALVES[0], outstanding),
+        (MEASURE_HALVES[1], landed),
+    ] {
+        for (reason, count) in counts {
+            if *count == 0 {
+                continue;
+            }
+            let labels = HashMap::from([
+                (crate::LABEL_REASON.to_string(), reason.as_str().to_string()),
+                (crate::LABEL_HALF.to_string(), half.to_string()),
+            ]);
+            if let Err(e) = metrics
+                .record_counter(
+                    metric_names::CHANGE_LEDGER_MEASURE_UNSETTLED_TOTAL,
+                    *count as f64,
+                    labels,
+                )
+                .await
+            {
+                warn!(
+                    error = %e,
+                    reason = reason.as_str(),
+                    half,
+                    rows = *count,
+                    "change ledger: rows that entered the unsettleable set this pass could not \
+                     be counted, so the reading is short by this pass's entries"
+                );
+            }
+        }
+    }
+}
+
 /// What the pool's snapshot says this pass should do.
 ///
 /// Pure, and that is on purpose: this is the judgement that has to be right
@@ -5174,6 +5319,7 @@ fn outstanding_summary(rows: &[ChangeLedgerRow]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::change_measure::GONE_KIND;
     use chrono::{TimeZone, Utc};
     use cog_core::{ChangeIdentity, ChangeLedgerEvent, LiveRevisionGap, SFError, SFResult};
 
@@ -6185,7 +6331,7 @@ mod tests {
             "the pass cannot relocate a rule whose declaration it did not read: {declared:?}"
         );
 
-        measure_pass(&store, &tree, &mut unsettled, &[]).await;
+        measure_pass(&store, &tree, &mut unsettled, &[], None).await;
 
         let measurements = store.measurements();
         assert_eq!(measurements.len(), 1, "{measurements:?}");
@@ -9272,7 +9418,7 @@ mod tests {
         // The pass's own order: stamp, then measure.
         stamp_deliveries(&fake, &deliveries).await;
         let mut unsettled = HashMap::new();
-        measure_pass(&fake, &tree, &mut unsettled, &[]).await;
+        measure_pass(&fake, &tree, &mut unsettled, &[], None).await;
 
         assert_eq!(
             fake.deliveries(),
@@ -10178,6 +10324,220 @@ mod tests {
             write_window_reading_from(&Err(SFError::Database("relation missing".into())), now),
             None,
             "a failed read is not a table that holds nothing"
+        );
+    }
+
+    /// One counter write: its name, its value, and the labels it carried.
+    type CounterWrite = (String, f64, HashMap<String, String>);
+
+    /// A metrics backend that keeps every counter write, in order.
+    ///
+    /// Gauges are unimplemented rather than recorded: the family under test
+    /// has none, and a double that silently swallowed one would let a change
+    /// that published a counter as a gauge pass.
+    #[derive(Default)]
+    struct RecordingCounters {
+        counters: std::sync::Mutex<Vec<CounterWrite>>,
+    }
+
+    impl RecordingCounters {
+        fn counters(&self) -> Vec<CounterWrite> {
+            self.counters.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MetricsBackend for RecordingCounters {
+        async fn record_gauge(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!("this family writes counters only")
+        }
+        async fn record_counter(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            self.counters
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
+            Ok(())
+        }
+        async fn record_histogram(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!("this family writes counters only")
+        }
+        async fn query_gauge_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_counter_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_gauge_latest(&self, _: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_counter_totals(&self, _: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_histogram_totals(
+            &self,
+            _: &str,
+        ) -> SFResult<Vec<cog_core::HistogramTotals>> {
+            unimplemented!()
+        }
+        async fn query_histogram_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn list_metric_names(&self, _: cog_core::MetricType) -> SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn health_check(&self) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// The cells this family can write, as `(reason, half, value)`, in a stable
+    /// order so two runs compare.
+    fn measure_writes(recording: &RecordingCounters) -> Vec<(String, String, f64)> {
+        let mut writes: Vec<(String, String, f64)> = recording
+            .counters()
+            .into_iter()
+            .map(|(name, value, labels)| {
+                assert_eq!(
+                    name,
+                    metric_names::CHANGE_LEDGER_MEASURE_UNSETTLED_TOTAL.as_str(),
+                    "the family has one name; another one here is a write nothing reads"
+                );
+                (
+                    labels.get(crate::LABEL_REASON).cloned().unwrap_or_default(),
+                    labels.get(crate::LABEL_HALF).cloned().unwrap_or_default(),
+                    value,
+                )
+            })
+            .collect();
+        writes.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        writes
+    }
+
+    /// Every cell the family can write exists from start-up, at zero.
+    ///
+    /// The exporter renders the counters whose names the store has already
+    /// seen, so a cell first written the hour it goes wrong would not exist on
+    /// the surface until then, and its absence would read the same as a family
+    /// that was never wired. Seeding is how the series is present while
+    /// everything is answerable -- which is also the only state in which nobody
+    /// is looking at it.
+    #[tokio::test]
+    async fn every_measure_unsettled_cell_exists_from_start_up_at_zero() {
+        let recording = Arc::new(RecordingCounters::default());
+        let metrics: Arc<dyn MetricsBackend> = recording.clone();
+
+        seed_measure_unsettled(Some(&metrics)).await;
+
+        let writes = measure_writes(&recording);
+        let expected: Vec<(String, String, f64)> = {
+            let mut cells: Vec<(String, String, f64)> = UnsettledReason::ALL
+                .into_iter()
+                .flat_map(|reason| {
+                    MEASURE_HALVES.map(|half| (reason.as_str().to_string(), half.to_string(), 0.0))
+                })
+                .collect();
+            cells.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            cells
+        };
+        assert_eq!(
+            writes, expected,
+            "every reason on both halves, once, at zero: a missing cell is a series a reader \
+             cannot tell from one that was never wired"
+        );
+    }
+
+    /// A pass counts the rows that *become* unmeasurable, not the ones it asked
+    /// again.
+    ///
+    /// Every pass re-asks the rows it already knows it cannot settle once their
+    /// retry window is past, so a count of the set would read one permanently
+    /// unreadable row as a rate that climbs every pass -- and the rule on the
+    /// consumer side means "a whole batch became unmeasurable", not "a batch is
+    /// standing there". The third row below is the discriminator: it is asked
+    /// again, answers nothing again, and must add nothing.
+    #[tokio::test]
+    async fn a_pass_counts_the_rows_that_become_unmeasurable_and_not_the_ones_it_re_asks() {
+        let dir = repo_holding(&[("crates/x/lib.rs", "fn thing() {}")]);
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        // A scope the tree could hold but this revision does not: the look says
+        // nothing about the row and moves nothing, which is the only kind of
+        // unsettled outcome that reaches this set. The reasons that are a
+        // property of the row itself -- no evaluator, a predicate that is a
+        // finding, a path this tree cannot hold -- move the row to `undecided`
+        // and write it, so they are counted on the account's state and never
+        // here.
+        let absent = |scope: &str| ChangeLedgerRow {
+            identity: ChangeIdentity::new(GONE_KIND, scope, "fn thing"),
+            ..row(ChangeState::Pending, None)
+        };
+        let store = FakeLedger {
+            rows: vec![
+                absent("crates/gone_a.rs"),
+                absent("crates/gone_b.rs"),
+                // Known before this pass, and past its retry window, so it is
+                // asked again rather than held.
+                absent("crates/gone_c.rs"),
+            ],
+            ..Default::default()
+        };
+        let known = ChangeIdentity::new(GONE_KIND, "crates/gone_c.rs", "fn thing");
+        let mut unsettled = HashMap::from([(
+            known.clone(),
+            UnsettledCheck {
+                why: "asked an hour ago and answered nothing".to_string(),
+                since: Instant::now() - UNMEASURABLE_RETRY - Duration::from_secs(60),
+            },
+        )]);
+        let recording = Arc::new(RecordingCounters::default());
+        let metrics: Arc<dyn MetricsBackend> = recording.clone();
+
+        measure_pass(&store, &tree, &mut unsettled, &[], Some(&metrics)).await;
+
+        assert!(
+            unsettled.contains_key(&known),
+            "the third row really was re-asked, or the assertion below would pass for the \
+             wrong reason"
+        );
+        assert_eq!(
+            measure_writes(&recording),
+            vec![(
+                UnsettledReason::ScopeAbsentInRevision.as_str().to_string(),
+                "outstanding".to_string(),
+                2.0
+            )],
+            "two rows entered and are counted; the re-asked row added nothing although it failed \
+             for the same reason, which is the difference between a flow of entries and the size \
+             of the set"
         );
     }
 }

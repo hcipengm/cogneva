@@ -1,0 +1,50 @@
+# 变更账「量不下去」那一格的规则夹具：一整个批量的行新进入不可测集就响，零星的进入不响。
+#
+# 计数的是**进入**而不是占用：一个 pass 会把已知不可测的行按重试窗口再问一遍，所以
+# `{reason}` 的累计量涨的是「这一轮有多少行变成量不下去」，与「现在有多少行量不下去」
+# 是两件事。界 200 来自 `MEASUREMENTS_PER_PASS`——一个 pass 最多判 200 行，一窗里新进入
+# 一整批说明「看这棵树」这件事本身坏了，而不是某几行的路径这一版没有。
+#
+# 两格：
+#   - 第一格：30 分钟内同一种 reason 的累计从 0 跳到 200（一整批），响。
+#   - 第二格：同一个形状，但半小时里只进了 1 行，静——树在动的时候几行问不到是常态。
+#
+#   第三格不在这份夹具里，但同样要看得见：写者停住时 `increase()` 归零，这条规则是静的
+#   不是常亮的。写者的死活由读时间戳的那一族规则管（`change_landed_but_not_running`），
+#   两种语义不并进一条——一条靠冻结样本点亮的规则没有修法能熄灭它。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-change-ledger-measure.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: change_ledger_measure_blind
+
+evaluation_interval: 1m
+
+tests:
+  # 一整批进入：五分钟后累计跳 200，此后持平。30 分钟窗口里的 increase 是一整批，响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_ledger_measure_unsettled_total{reason="git_failed",half="outstanding"}'
+        values: '0x5 200x55'
+      - series: 'cogneva_change_ledger_measure_unsettled_total{reason="scope_absent_in_revision",half="outstanding"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_ledger_measure_blind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: git_failed
+
+  # 零星进入：半小时里只有一行变成量不下去。静——这是树在动，不是看的能力坏了。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_ledger_measure_unsettled_total{reason="scope_absent_in_revision",half="outstanding"}'
+        values: '0x5 1x55'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_ledger_measure_blind
+        exp_alerts: []

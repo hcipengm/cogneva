@@ -1753,6 +1753,16 @@ data:
                   "face": "变更管理"
                 },
                 {
+                  "name": "change_ledger_measure_blind",
+                  "promql": "max by (reason) (increase(cogneva_change_ledger_measure_unsettled_total{half=\"outstanding\"}[30m])) >= 200",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "severity": "warning",
+                  "summary": "in the last 30m, {value} of the account's rows became unmeasurable for one reason, counted as they entered that set rather than as the set's size. The bound is one batch: a pass judges at most 200 rows, so entering that many in a window means the look itself is broken -- git not answering, a revision that cannot be resolved, a tree that is not the one the rows were written against -- rather than some rows being unanswerable. Below that, a handful of rows behind a path this revision does not have is the ordinary state of a tree that moves, and the count by reason is what says which repair is owed. A half of the pass is not counted here on purpose: half=landed rows are ones the account already called done, and their becoming unanswerable is a claim being made without a look rather than work going unseen. This rule is quiet when the writer stops as well as when nothing is entering: increase() over a window holding no new samples is zero, so a dead loop is silent here, and the rule that watches whether the loop is running at all is change_landed_but_not_running, which reads the timestamps this family does not carry. That separation is why a zero here must not be read as health",
+                  "face": "变更管理"
+                },
+                {
                   "name": "evolution_resident_index_outlives_its_changes",
                   "promql": "(max by (dir) (cogneva_evolution_resident_results) > max by (dir) (cogneva_evolution_change_queue_files))",
                   "condition": {

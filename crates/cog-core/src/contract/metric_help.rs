@@ -247,6 +247,28 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          that is the reading no other series states",
     ),
     (
+        "cogneva_change_ledger_measure_unsettled_total",
+        "Rows a change-ledger pass tried to measure and could not, by reason and \
+         by half, counted as they enter that set. half=outstanding is the rows \
+         still owed a state; half=landed is rows the account already calls \
+         landed whose check could no longer be settled, which is a claim being \
+         made without a look. reason names why the look settled nothing: a \
+         revision that cannot be read, a kind with no predicate, a predicate \
+         that is a whole finding, a scope this tree cannot hold, a scope this \
+         revision does not have, or git not answering. Rows unmeasurable for a \
+         reason on the row itself move to `undecided` and are written to the \
+         account, so they never reach this set: what this counts is a look that \
+         could not be taken. Every half-and-reason series is seeded at zero at \
+         start-up and added to only when a row enters, and a pass that enters \
+         nothing writes nothing, so increase() over a window is the flow of \
+         rows becoming unmeasurable rather than the size of the set -- the set \
+         is asked again on a timer and its size would climb on its own. A \
+         stopped writer leaves this family's increase() empty, which is the same \
+         reading as a healthy window: this family says the account could not \
+         measure, and whether the account is running at all is a different \
+         series",
+    ),
+    (
         "cogneva_eval_gate_outcomes_total",
         "How each run of an eval A/B gate ended, labelled by `outcome` and \
          `site`, written once per run. The gate refuses a change that \

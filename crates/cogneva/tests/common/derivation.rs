@@ -63,6 +63,13 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
         MetricDerivation::Store,
     ),
     ("cogneva_change_fate_total", MetricDerivation::Store),
+    // Rendered from the store's cumulative total like the other counters:
+    // every process that can reach the store reports the same number, and the
+    // rule that reads it takes `max` over the copies.
+    (
+        "cogneva_change_ledger_measure_unsettled_total",
+        MetricDerivation::Store,
+    ),
     ("cogneva_change_tier_total", MetricDerivation::Store),
     (
         "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
