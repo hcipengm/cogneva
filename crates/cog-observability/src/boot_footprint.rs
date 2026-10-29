@@ -52,15 +52,21 @@
 //! the series' cardinality is decided by it, and a free-form phase name would
 //! let one caller's typo become a second series that no rule reads.
 //!
-//! Each of those lines also carries **`cpu_seconds`** for the same instant --
-//! not a series, only a field. Elapsed time alone cannot say whether a slow
-//! phase was working or waiting: the same work costs about the same CPU time
-//! however long it is made to wait, so a phase whose elapsed time rose while
-//! its CPU time did not is a phase that was not given a core. The field is not
-//! published as a series because a phase's value is cumulative and its meaning
-//! is the difference from the phase before it, which is the reader's arithmetic
-//! either way; keeping it in the line costs no cardinality and answers the one
-//! question the two numbers together are asked.
+//! Each of those lines also carries **`cpu_seconds`**, **`minor_faults`** and
+//! **`major_faults`** for the same instant -- not series, only fields. Elapsed
+//! time alone cannot say whether a slow phase was working or waiting: the same
+//! work costs about the same CPU time however long it is made to wait, so a
+//! phase whose elapsed time rose while its CPU time did not had time pass with
+//! no thread running. That still leaves the two ways time passes without a
+//! thread: waiting to be scheduled, and waiting on a page of the model file to
+//! come off the disk. `major_faults` is what tells them apart -- a phase that
+//! page-faulted its way through the weights shows a jump of one fault per page
+//! of the file, and one that was merely not scheduled shows almost none.
+//!
+//! They are not published as series because a phase's value is cumulative and
+//! its meaning is the difference from the phase before it, which is the
+//! reader's arithmetic either way; keeping them in the line costs no
+//! cardinality and answers the one question the numbers together are asked.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -153,10 +159,10 @@ pub fn mark(phase: &'static str) {
             .elapsed()
             .as_secs_f64()
     };
-    // CPU time is taken beside the wall clock and for the same reason: it
-    // describes this instant, and the two are only comparable when they were
-    // read at the same instant.
-    let cpu_seconds = process_cpu_seconds();
+    // The CPU and fault counters are taken beside the wall clock and for the same
+    // reason: they describe this instant, and they are only comparable with it
+    // when they were read at the same instant.
+    let vitals = process_vitals();
     let rss = resident_bytes();
     marks.push(Mark {
         phase,
@@ -169,31 +175,36 @@ pub fn mark(phase: &'static str) {
             .position(|x| *x == m.phase)
             .unwrap_or(usize::MAX)
     });
-    announce(phase, rss, elapsed_seconds, cpu_seconds);
+    announce(phase, rss, elapsed_seconds, vitals);
 }
 
 /// Prints the line a reached phase is announced with.
 ///
 /// One place prints it, so a field added here reaches every shape the line
-/// takes -- with or without a resident reading, with or without a CPU reading --
-/// rather than the one an edit happened to touch. A field that reaches only
-/// some of the shapes is read as absent by whoever greps the others.
-fn announce(phase: &'static str, rss: Option<u64>, elapsed_seconds: f64, cpu_seconds: Option<f64>) {
-    match (rss, cpu_seconds) {
-        (Some(rss), Some(cpu_seconds)) => tracing::info!(
+/// takes -- with or without a resident reading, with or without the process
+/// counters -- rather than the one an edit happened to touch. A field that
+/// reaches only some of the shapes is read as absent by whoever greps the
+/// others.
+fn announce(phase: &'static str, rss: Option<u64>, elapsed_seconds: f64, vitals: Option<Vitals>) {
+    match (rss, vitals) {
+        (Some(rss), Some(vitals)) => tracing::info!(
             phase,
             rss,
             elapsed_seconds,
-            cpu_seconds,
+            cpu_seconds = vitals.cpu_seconds,
+            minor_faults = vitals.minor_faults,
+            major_faults = vitals.major_faults,
             "boot footprint: phase reached"
         ),
         (Some(rss), None) => {
             tracing::info!(phase, rss, elapsed_seconds, "boot footprint: phase reached")
         }
-        (None, Some(cpu_seconds)) => tracing::info!(
+        (None, Some(vitals)) => tracing::info!(
             phase,
             elapsed_seconds,
-            cpu_seconds,
+            cpu_seconds = vitals.cpu_seconds,
+            minor_faults = vitals.minor_faults,
+            major_faults = vitals.major_faults,
             "boot footprint: phase reached, but resident memory could not be read here"
         ),
         (None, None) => tracing::info!(
@@ -254,6 +265,47 @@ pub fn clear_for_tests() {
         Ok(mut o) => *o = None,
         Err(e) => *e.into_inner() = None,
     }
+}
+
+/// What this process has spent so far, as the kernel counts it.
+///
+/// Kept in one struct so a phase's line has one reading to carry rather than
+/// three that can each be missing: they are taken from the same two syscalls at
+/// the same instant, and an instant with only some of them is an instant that
+/// answers no question.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Vitals {
+    /// CPU seconds, summed over every thread.
+    cpu_seconds: f64,
+    /// Minor page faults: pages that had to be mapped in, served from memory.
+    minor_faults: u64,
+    /// Major page faults: pages that had to be read from disk.
+    major_faults: u64,
+}
+
+/// The process counters at this instant, or `None` where they cannot be read.
+fn process_vitals() -> Option<Vitals> {
+    let (minor_faults, major_faults) = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|stat| parse_faults(&stat))?;
+    Some(Vitals {
+        cpu_seconds: process_cpu_seconds()?,
+        minor_faults,
+        major_faults,
+    })
+}
+
+/// `minflt` and `majflt` from `/proc/<pid>/stat`: pages mapped in from memory,
+/// and pages that had to be read from disk.
+///
+/// The programme name in that line is parenthesised and may itself contain
+/// spaces and parentheses, so the fields are counted from the last `)` rather
+/// than from the start: from there the first field is the state, and `minflt`
+/// and `majflt` are the seventh and ninth.
+fn parse_faults(stat: &str) -> Option<(u64, u64)> {
+    let tail = &stat[stat.rfind(')')? + 1..];
+    let f: Vec<&str> = tail.split_whitespace().collect();
+    Some((f.get(7)?.parse().ok()?, f.get(9)?.parse().ok()?))
 }
 
 /// Seconds of CPU this process has been scheduled for so far, summed over
@@ -389,6 +441,8 @@ mod tests {
         phase: Option<String>,
         rss: Option<u64>,
         cpu_seconds: Option<f64>,
+        minor_faults: Option<u64>,
+        major_faults: Option<u64>,
     }
 
     /// A log backend that only records what it was handed.
@@ -405,6 +459,8 @@ mod tests {
                 phase: None,
                 rss: None,
                 cpu_seconds: None,
+                minor_faults: None,
+                major_faults: None,
             };
             let mut fields = Fields(&mut logged);
             event.record(&mut fields);
@@ -414,6 +470,10 @@ mod tests {
                 .push(logged);
         }
     }
+
+    /// What the shape test reads off each line: resident bytes, CPU seconds,
+    /// minor faults, major faults.
+    type Counters = (Option<u64>, Option<f64>, Option<u64>, Option<u64>);
 
     struct Fields<'a>(&'a mut Logged);
 
@@ -431,8 +491,11 @@ mod tests {
         }
 
         fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-            if field.name() == "rss" {
-                self.0.rss = Some(value);
+            match field.name() {
+                "rss" => self.0.rss = Some(value),
+                "minor_faults" => self.0.minor_faults = Some(value),
+                "major_faults" => self.0.major_faults = Some(value),
+                _ => {}
             }
         }
 
@@ -574,36 +637,53 @@ mod tests {
     }
 
     #[test]
-    fn a_phase_announced_without_its_memory_still_carries_its_cpu_time() {
+    fn a_phase_announced_without_its_memory_still_carries_its_counters() {
         use tracing_subscriber::prelude::*;
 
+        let vitals = Vitals {
+            cpu_seconds: 1.5,
+            minor_faults: 11,
+            major_faults: 3,
+        };
         let logged = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&logged)));
         tracing::subscriber::with_default(subscriber, || {
-            announce("serving", Some(4096), 0.0, Some(1.5));
-            announce("serving", None, 0.0, Some(1.5));
+            announce("serving", Some(4096), 0.0, Some(vitals));
+            announce("serving", None, 0.0, Some(vitals));
             announce("serving", Some(4096), 0.0, None);
             announce("serving", None, 0.0, None);
         });
 
-        let fields: Vec<(Option<u64>, Option<f64>)> = logged
+        let fields: Vec<Counters> = logged
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|e| (e.rss, e.cpu_seconds))
+            .map(|e| (e.rss, e.cpu_seconds, e.minor_faults, e.major_faults))
             .collect();
         assert_eq!(
             fields,
             vec![
-                (Some(4096), Some(1.5)),
-                (None, Some(1.5)),
-                (Some(4096), None),
-                (None, None),
+                (Some(4096), Some(1.5), Some(11), Some(3)),
+                (None, Some(1.5), Some(11), Some(3)),
+                (Some(4096), None, None, None),
+                (None, None, None, None),
             ],
-            "every shape of the line has to carry the CPU reading it has: the shape that \
-             drops the resident number is the one the reader greps when procfs is missing, \
-             and a field present in only some shapes reads as absent in the others"
+            "every shape of the line has to carry the counters it has: the shape that drops \
+             the resident number is the one the reader greps when procfs is missing, and a \
+             field present in only some shapes reads as absent in the others"
         );
+    }
+
+    #[test]
+    fn faults_are_read_from_the_fields_after_the_programme_name() {
+        // A real line's programme name is parenthesised and may itself contain
+        // spaces and parentheses, which is why the fields are counted from the
+        // last `)` rather than from the start of the line.
+        let stat = "1234 (cog neva (x)) S 1 1234 1234 0 -1 4194560 111 0 0 0 5 6 0 0 20 0 7 0 99 1000 200 0 0 0 0 0 0 0 0 0 0 0";
+        assert_eq!(parse_faults(stat), Some((111, 0)));
+
+        assert_eq!(parse_faults("no parenthesis here"), None);
+        assert_eq!(parse_faults("1234 (short) S 1"), None);
     }
 
     #[test]
