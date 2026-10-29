@@ -337,16 +337,19 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // cannot be separated from the noise from this data in any case, because
     // no revision ran twice.
     //
-    // So the debt is not a label to add, and it is not the sibling's shape
-    // either: the sibling compares generations of one build, and startup here
-    // has no two samples of anything. What is owed is startup settling enough
-    // for a phase to be read against the same phase of another boot, and that
-    // is not a metric's job. Until it does, a number that moved says the boot
-    // landed somewhere else in a spread nothing measured yet explains.
-    (
-        "cogneva_boot_phase_elapsed_seconds",
-        Unread::Gap("how long each startup phase took, one series per phase. Its sibling on the same label has a rule and the same shape on this one was written and withdrawn: the spread is tenfold and it sits inside the model-loading phases (`reranker` 21.7-188.1 s across eighteen rolls) while `config-loaded` never leaves a second, so it is not the build and it is not the host -- the slow boots use fewer cores than the fast ones and never throttle, which on its own cannot tell waiting from computing. A comparison needs two samples of one thing, and there is one boot per roll, so the face owed waits on startup settling; after that a five-second bound would name a phase that doubled"),
-    ),
+    // So the debt was not a label to add, and it was not the sibling's shape
+    // either. The paragraph that used to close this entry said what was owed
+    // was startup settling enough to read one phase against the same phase of
+    // another boot, and called that "not a metric's job". Half of it holds and
+    // half of it was the debt talking: a *bound* is still wrong here, for
+    // exactly the reasons above, but "read this boot against another" is a
+    // reader, and a panel is the reader for it. Startup cannot be seen to
+    // settle until something draws it settling, so waiting for that evidence
+    // before writing the panel would have waited forever. The panel draws the
+    // series per phase with one segment per boot, which is the comparison the
+    // entry asked for; the bound stays unwritten, which is what the
+    // measurement said. Nothing was exempted -- the entry is gone because a
+    // reader now exists, and the reader is the dashboard's own check.
     // Two names that had a `Gap` here until panels were written to carry them,
     // and the reason they came off this table is the reason the debts were real:
     //   `cogneva_volume_capacity_bytes` -- the growth loop's `declared` and
@@ -465,10 +468,19 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// registered` was the last reading on this table whose face was obviously
 /// writable and simply not written, and the panel is the reader its producer's
 /// own comment describes -- the count that shows a family going missing before
-/// a person notices. One entry remains, and it is a different kind of debt: a
-/// phase timing with one sample per boot, where no reader can compare anything
-/// until startup itself settles.
-const GAPS_AT_SCRAPE_CENSUS: usize = 1;
+/// a person notices.
+///
+/// Down to zero when the startup phase timing got one. That entry was the only
+/// one on this table whose reason was "a reader would not help yet", and
+/// writing the panel is what showed the reason was wrong: the comparison it
+/// said startup had to settle into *is* what the panel draws, and nothing can
+/// be seen to settle before something draws it. What stays true is the other
+/// half -- no bound, because the spread is tenfold and one sample per boot
+/// gives a threshold nothing to be read against. So this count reaching zero
+/// does not mean the startup face is finished; it means every series this
+/// build publishes now has at least one named reader, and the remaining work
+/// on startup is a reading of CPU seconds that no series carries yet.
+const GAPS_AT_SCRAPE_CENSUS: usize = 0;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

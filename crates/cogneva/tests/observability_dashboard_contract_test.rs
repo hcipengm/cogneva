@@ -147,6 +147,16 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &[],
         "crates/cog-gateway/src/lib.rs",
     ),
+    // Cumulative seconds at each startup phase, published once per boot. The
+    // panel is the only reader: no rule can be written on it, because one
+    // sample per boot against a tenfold spread gives a bound nothing to be
+    // read against. The phase label is what makes the panel a comparison
+    // rather than a single number.
+    (
+        "cogneva_boot_phase_elapsed_seconds",
+        &["phase"],
+        "crates/cog-observability/src/boot_footprint.rs",
+    ),
     // Pool recovery readings. Three separate series rather than one "recovers
     // at" number: which upstream said it, when we will probe again, and how long
     // the window an upstream stated is are answers of different strength, and
