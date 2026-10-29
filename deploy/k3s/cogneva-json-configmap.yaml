@@ -810,6 +810,10 @@ data:
                 },
                 {
                   "name": "declared_failure_class_unrecorded",
+                  "dormancy": {
+                    "reason": "error_only_state",
+                    "why": "cog-collaboration/src/observable.rs emits this gauge only on the branch where a failure class could not be recorded; healthy operation exports nothing, which the rule reads as \"no problem\"."
+                  },
                   "promql": "max without (pod, container, instance) (collab_classification_unreachable)",
                   "condition": {
                     "greater_than": 0.0
@@ -1243,6 +1247,10 @@ data:
                 },
                 {
                   "name": "trace_tier_migration_failing",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "Counted only when a trace-tier pass fails (cog-observability/src/snapshot.rs); no failure in the window."
+                  },
                   "promql": "sum without (pod, container, instance) (increase(cogneva_trace_tier_pass_failures_total[1h]))",
                   "condition": {
                     "greater_than": 0.0
@@ -1363,6 +1371,10 @@ data:
                 },
                 {
                   "name": "runtime_asset_not_refreshed",
+                  "dormancy": {
+                    "reason": "error_only_state",
+                    "why": "Same gauge and same export rule; not_refreshed is absent because every checked asset matched its manifest."
+                  },
                   "promql": "max without (pod, container, instance) (cogneva_runtime_asset_state{state=\"not_refreshed\"}) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -1373,6 +1385,10 @@ data:
                 },
                 {
                   "name": "runtime_asset_content_drift",
+                  "dormancy": {
+                    "reason": "error_only_state",
+                    "why": "cog-reflection/src/runtime_assets.rs exports state gauges only for problem states of destinations that have one; a healthy asset is absent. The check's own timestamp is a separate series (cogneva_runtime_asset_check_seconds, present)."
+                  },
                   "promql": "max without (pod, container, instance) (cogneva_runtime_asset_state{state=\"content_drift\"}) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -1494,6 +1510,10 @@ data:
                 },
                 {
                   "name": "landing_mirror_behind",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "Counted only when a mirror push is refused (cog-github/src/landing.rs record_counter on the failure branch); no refusal in 24h means the counter was never created. The rule fires on the first one."
+                  },
                   "promql": "sum by (mirror) (increase(cogneva_mirror_push_failures_total[6h])) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -1524,6 +1544,10 @@ data:
                 },
                 {
                   "name": "redrive_budget_forgotten",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "Read-side ledger loss is counted only when the ledger read fails (cog-github/src/landing.rs); today the read succeeds, so the {side=\"read\"} series does not exist."
+                  },
                   "promql": "max by (side) (increase(cogneva_redrive_budget_losses_total{side=\"read\"}[24h])) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -1534,6 +1558,10 @@ data:
                 },
                 {
                   "name": "redrive_charge_not_persisted",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "Write-side ledger loss is counted only when the ledger write fails (cog-github/src/landing.rs); today the write succeeds, so the {side=\"write\"} series does not exist."
+                  },
                   "promql": "max by (side) (increase(cogneva_redrive_budget_losses_total{side=\"write\"}[24h])) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -1574,6 +1602,10 @@ data:
                 },
                 {
                   "name": "held_series_check_unreadable",
+                  "dormancy": {
+                    "reason": "error_only_state",
+                    "why": "cog-gateway/src/lib.rs exports this gauge only when the held-series check cannot be read; a readable check is absent, and the rule's max() sees no series."
+                  },
                   "promql": "max without (pod, container, instance) (cogneva_metric_held_unreadable)",
                   "condition": {
                     "greater_than": 0.0
@@ -1894,6 +1926,10 @@ data:
                 },
                 {
                   "name": "registry_tag_deletion_refused",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "Counted only when a registry prune is refused (cog-reflection/src/mainline_deployer.rs); no refusal in the window."
+                  },
                   "promql": "sum without (pod, container, instance) (increase(cogneva_registry_prune_failures_total[1h])) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -2615,6 +2651,10 @@ data:
                 },
                 {
                   "name": "mainline_delivery_preflight_refused",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "Counted only when the preflight refuses a deploy (cog-reflection/src/mainline_deployer.rs); refused_total has no zero-value series until the first refusal."
+                  },
                   "promql": "max by (verb, resource) (increase(cogneva_mainline_preflight_refused_total[1h])) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -2625,6 +2665,10 @@ data:
                 },
                 {
                   "name": "mainline_kubectl_refused",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "Counted only when the cluster's authorization refuses one of the deployer's kubectl calls (cog-reflection/src/mainline_deployer.rs record_kubectl_refused, refusal branch only); labels are the server's own verb+resource, so the family is created by the first refusal and the rule fires on it. Emitter landed in 252fe47b, inside the running image main-93ebcda35e7a."
+                  },
                   "promql": "max by (verb, resource) (increase(cogneva_mainline_kubectl_refused_total[1h])) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -2635,6 +2679,10 @@ data:
                 },
                 {
                   "name": "mainline_rollout_refused",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "Counted only when the cluster's admission face keeps a rollout from creating a Pod (cog-reflection/src/mainline_deployer.rs record_rollout_refused, admission branch only); labels are the wall (quota/limitrange/podsecurity/admission), so the family is created by the first refusal and the rule fires on it. The emitter ships in the same change as this row, so the series stays absent until that build is running."
+                  },
                   "promql": "max by (reason) (increase(cogneva_mainline_rollout_refused_total[1h])) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -2645,6 +2693,10 @@ data:
                 },
                 {
                   "name": "mainline_admission_held",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "cog-reflection/src/mainline_deployer.rs records this labelled counter only on a pass where admission actually held the rollout, so the family is created by the first hold. A deployment that never waited has no series, and the rule fires the moment one appears."
+                  },
                   "promql": "max by (resource) (increase(cogneva_mainline_admission_held_total[1h])) > 0",
                   "condition": {
                     "greater_than": 0.0
@@ -2875,6 +2927,10 @@ data:
                 },
                 {
                   "name": "memory_backend_operation_never_succeeds",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "Counted only on a failed memory backend operation (cog-memory/src/metrics_instrumented.rs); no error in the window means no series. The rule also requires memory_operations_total, which is present on the success path."
+                  },
                   "promql": "(max by (operation) (increase(memory_operation_errors_total[6h])) > 0) unless (max by (operation) (increase(memory_operations_total[6h]) - increase(memory_operation_errors_total[6h])) > 0)",
                   "condition": {
                     "greater_than": 0.0
