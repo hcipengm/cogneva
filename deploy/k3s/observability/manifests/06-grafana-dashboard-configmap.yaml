@@ -3096,6 +3096,45 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 72,
+          "title": "Registered Observables",
+          "description": "How many observables the process registered for scraping, one line per process kind. Registration is keyed on a static type id, so a service registered as a concrete type is invisible to this endpoint and every metric it publishes leaves the scrape silently -- the exposition simply stops carrying them, and an absent family reads exactly like a quiet one. This count is what makes that visible: it is the population the rest of the exposition is drawn from, so a step down means a reader is now missing series it believes it is drawing. The two lines are read separately because the kinds do not register the same set (the evolution process carries no dense model), so a shared value would be a number neither of them reported; compare each line against its own history rather than against the other.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 336
+          },
+          "targets": [
+            {
+              "expr": "cogneva_observables_registered{job=\"cogneva\"}",
+              "legendFormat": "app",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_observables_registered{job=\"cogneva-evolution\"}",
+              "legendFormat": "evolution",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

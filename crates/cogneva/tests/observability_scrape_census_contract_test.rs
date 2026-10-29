@@ -180,11 +180,16 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // scraping. Its producer spelled the name inline in the exposition body,
     // which is a shape the declaration scan cannot read, so the series was live
     // on the wire and named by no gate until the literal scan was widened to
-    // see it. What it is owed is the face its own comment intends.
-    (
-        "cogneva_observables_registered",
-        Unread::Gap("how many observables are registered for scraping, rendered into the exposition body rather than recorded, which is why the registry does not hold it. The producer's own comment gives the reason it exists: registration is keyed on a static type id, so a service registered as a concrete type is invisible to this endpoint and its metrics leave the scrape silently -- the count is what lets a reader see the family go missing rather than wait for a person to notice. Two sibling series in that file are both read by a rule and this one is read by nothing, so the face is owed rather than decided"),
-    ),
+    // see it.
+    //
+    // A name that had a `Gap` here until a panel was written to carry it. The
+    // entry is gone and `GAPS_AT_SCRAPE_CENSUS` came down by one. What the
+    // panel settles is having a reader, which is the whole of what this table
+    // asks; it does not settle a bound, and a bound was never the right shape
+    // here -- the number is a population, and what a person needs from it is
+    // its own history (a step down means a service's metrics left the scrape
+    // without saying so), not a threshold that would have to be invented per
+    // process kind and would go stale the moment a plugin was added.
     // A name that had a `Gap` here until a panel was written to carry it:
     // `cogneva_stream_read_failures_total`, the count of reads a consumer's loop
     // had refused, split by the cause the bus itself named. The entry is gone
@@ -454,11 +459,16 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// Down to two when the task count got a panel: `cogneva_tasks_current` was the
 /// last of the task graph's five readings with no face, and the panel draws the
 /// whole status vector from one publisher's snapshot rather than summing
-/// publishers that each restate the same shared store. Two entries remain and
-/// they are different debts: a registration count whose face would be a
-/// population reading rather than a bound, and a phase timing with one sample
-/// per boot, which no reader can compare until startup itself settles.
-const GAPS_AT_SCRAPE_CENSUS: usize = 2;
+/// publishers that each restate the same shared store.
+///
+/// Down to one when the registration count got a panel: `cogneva_observables_
+/// registered` was the last reading on this table whose face was obviously
+/// writable and simply not written, and the panel is the reader its producer's
+/// own comment describes -- the count that shows a family going missing before
+/// a person notices. One entry remains, and it is a different kind of debt: a
+/// phase timing with one sample per boot, where no reader can compare anything
+/// until startup itself settles.
+const GAPS_AT_SCRAPE_CENSUS: usize = 1;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
