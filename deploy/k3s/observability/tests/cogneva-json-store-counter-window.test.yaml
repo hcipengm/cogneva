@@ -1,0 +1,104 @@
+# 「同一条读数，窗口比一条序列的寿命长」那一类规则的单测夹具。
+#
+# 这一族计数器的值是从 store 的行渲染出来的：每个能读到那行的进程都报同一个事实，而每个
+# 进程按自己的节拍重读——谁先刷谁领先一格。序列身份又随 pod 滚动换一次：`increase(x[24h])`
+# 只在**一条序列自己的生命**里累加，pod 寿命约四十分钟，于是一个 24 小时窗口只读到真值的
+# 几个百分点。更糟的是它读错的方向不是单调的：两个 Pod 领先/落后那半分钟里，合并后的
+# 序列会写成 41、40、41，而每一次回落都被 `increase()` 当成一次计数器重置、把整段总量再
+# 加一遍。
+#
+# 所以这一族的长窗口规则不再读 `increase`，改读「每一拍先取领先者，再对时间取包络差」：
+#
+#   max_over_time((max by (…身份以外的标签…) (x))[24h:1m])
+#     - min_over_time((max by (…身份以外的标签…) (x))[24h:1m])
+#
+# 它对两种运动同时免疫：两个 Pod 短暂不一致时 `max` 取领先者（落后那一格永远 ≤ 领先者），
+# pod 滚动换序列时值本身是那一行 store 的总量、跨序列连续。`[24h:1m]` 那一段是子查询，
+# 少写步长是解析错误（`ranges only allowed for vector selectors`）。
+#
+# 这份夹具判的是**数**，不是响不响：`change_tier_routing_inert` 的表达式原样返回左侧的
+# 增量，所以同一个输入在新旧两种读法下给出不同的值，而 `> 0` 的判词两种读法都会亮——
+# 只判响不响的夹具对这一族缺陷完全失明。表达式用 `'__rule_promql:<名字>'` 占位，由跑者
+# 换成发货那一份；抄进夹具的那一份在规则被改回去时不会红，等于没判。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-store-counter-window.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: change_tier_routing_inert
+
+evaluation_interval: 1m
+
+tests:
+  # 一格什么都没有：分档计数器不涨，规则静。这一格同时是后面几格的对照——值断言里
+  # 读到的数不是「有个默认值」，而是真从序列上算出来的。
+  - interval: 1h
+    input_series:
+      - series: 'cogneva_change_tier_total{tier="fast"}'
+        values: '0x26'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: change_tier_routing_inert
+        exp_alerts: []
+
+  # 分档路由在走、真闸一次没走：规则亮，标签只带 severity（表达式把 tier 折掉了）。
+  - interval: 1h
+    input_series:
+      - series: 'cogneva_change_tier_total{tier="fast"}'
+        values: '0x20 3x6'
+    alert_rule_test:
+      - eval_time: 26h
+        alertname: change_tier_routing_inert
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 两个 Pod 报同一行 store 的现场：一个领先一格、一个落后一格。按拍取 `max` 就取到领先
+  # 那个，包络差是 0——落后那一格不该被读成「往回走了一次」。旧读法在这里也是 0，这一格
+  # 不是给旧读法的，是给将来「把两个 Pod 合并成一条序列」的改动：一旦合并，这条序列会写成
+  # 41、41、40、41，下一格才是它真正的形状。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_tier_total{tier="fast",pod="a"}'
+        values: '41x3'
+      - series: 'cogneva_change_tier_total{tier="fast",pod="b"}'
+        values: '40x3'
+    promql_expr_test:
+      - expr: '__rule_promql:change_tier_routing_inert'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{}'
+            value: 0
+
+  # 合并后的序列：领先/落后那半分钟被写成一次回落。新读法读 1（最大值与最小值之差），
+  # 旧读法把三跳按「每次回落都是一次重置」全加一遍——在这份序列上是 71.75。
+  # 这一格判的就是那条：**回落不是事件，是同一个事实在两个进程里的先后。**
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_tier_total{tier="fast"}'
+        values: '41 40 41'
+    promql_expr_test:
+      - expr: '__rule_promql:change_tier_routing_inert'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+
+  # pod 滚动：老 Pod 的序列停在 4，新 Pod 接着从 5 涨到 9。真值是一小时里涨了 9，而
+  # `increase(x[24h])` 只看得到一条序列自己的那一段——旧读法在这份序列上读 4.5（老序列
+  # 涨了 4、新序列涨了 4，取 `max` 后按窗口端点外推）。新读法读 9：值本身是那一行 store
+  # 的总量，换一条序列也接得上。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_tier_total{tier="fast",pod="a"}'
+        values: '0+1x4 _x5'
+      - series: 'cogneva_change_tier_total{tier="fast",pod="b"}'
+        values: '_x5 5+1x4'
+    promql_expr_test:
+      - expr: '__rule_promql:change_tier_routing_inert'
+        eval_time: 9m
+        exp_samples:
+          - labels: '{}'
+            value: 9

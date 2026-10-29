@@ -27,6 +27,10 @@
 # 第二、三种用法不是顺手加的：一个规则族「会不会响」只能这样判，而它不该只对一份清单
 # 有效——每复制一份跑者，取 promtool 的那段（`$PROMTOOL` → PATH → apt 解包）就会多一份
 # 会各自漂的副本。
+#
+# 夹具还能判**数**，不只是响不响：`promql_expr_test:` 里的表达式写成 `'__rule_promql:<名字>'`
+# 时，这里把它换成部署配置里那条规则的发货表达式（只对 `.json` 那一库成立）。有些缺陷
+# 只改读到的数、不改判词的方向，`> 0` 的形状照样亮照样灭，只有值断言看得见它。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -162,5 +166,50 @@ grep -q "^  - ${work}/rules.yaml$" "${work}/case.yaml" || {
     echo "夹具的 rule_files 行没改写成功——路径写法变了，改这条 sed" >&2
     exit 3
 }
+
+# 值断言夹具：夹具的 `promql_expr_test:` 里用 `'__rule_promql:<名字>'` 占位，这里换成
+# **发货那一份**的表达式。
+#
+# 为什么会有一条比「响不响」更细的路：有些缺陷不改判词的方向，只改它读到的数——计数器
+# 序列每滚一次 pod 就换一条，`increase()` 只在一条序列自己的生命里累加，于是同一条规则
+# 在 24 小时窗口上读到真值的几个百分点，而 `> 0` 的形状照样亮、照样灭，响不响这一层
+# 根本看不见它。判据只能是数，而数必须来自真正的表达式：抄进夹具的那一份在规则被改回去
+# 时一声不响，正好把这条夹具变成橡皮图章——它证明的只有「抄来的那份没变」。
+if grep -q '__rule_promql:' "${work}/case.yaml"; then
+    case "${MANIFEST}" in
+        *.json) ;;
+        *)
+            echo "夹具里有 '__rule_promql:' 占位，但清单不是部署配置（*.json）——取不到规则表达式" >&2
+            exit 3
+            ;;
+    esac
+    python3 - "${MANIFEST}" "${work}/case.yaml" <<'PY'
+import json
+import re
+import sys
+
+manifest, case = sys.argv[1:3]
+rules = json.load(open(manifest, encoding="utf-8"))["observability"]["infra_watch"]["rules"]
+by_name = {rule["name"]: rule for rule in rules}
+text = open(case, encoding="utf-8").read()
+
+
+def swap(match):
+    name = match.group(1)
+    if name not in by_name:
+        sys.exit(f"夹具占位的规则不在部署配置里：{name}")
+    # 单引号标量：表达式里只有双引号（标签选择器），单引号按 YAML 的规矩翻倍。
+    return "'" + by_name[name]["promql"].replace("'", "''") + "'"
+
+
+token = re.compile(r"'__rule_promql:([A-Za-z0-9_]+)'")
+text = token.sub(swap, text)
+# 夹具头部会拿占位写法当例子（那里写的是 `'__rule_promql:<名字>'`，不是一条规则名），
+# 所以这里只查「还留着一条能换成规则名的占位」，不查这个词本身。
+if token.search(text):
+    sys.exit("还有没换掉的 '__rule_promql:<规则名>' 占位——写法变了，改这条正则")
+open(case, "w", encoding="utf-8").write(text)
+PY
+fi
 
 "${promtool}" test rules "${work}/case.yaml"

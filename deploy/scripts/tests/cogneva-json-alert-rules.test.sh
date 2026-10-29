@@ -10,7 +10,12 @@
 #   4. 删掉默认的 1 GiB 地板：小阶段那一格必须红——否则 300→400 MiB 的噪声也会响；
 #   4d. 把折叠键从 `(phase, job)` 退回 `(phase)`：跨工作负载那一格必须红——否则应用会被
 #       拿去和同一批阶段名的进化 Pod 比，报出 47 倍而那是两个进程；
-#   5. 夹具点名一条库里没有的规则：必须非零，而不是「没取到规则所以没判」。
+#   5. 夹具点名一条库里没有的规则：必须非零，而不是「没取到规则所以没判」；
+#   5b. 夹具目录里每一份 `cogneva-json-*.test.yaml` 都必须真跑绿——覆盖门只按夹具头
+#       记「已证明」，一份红着的或从没被执行过的夹具在它眼里与绿的完全一样；
+#   5c. 删掉告警出口那条规则的 `unless` 腿：那一格必须红；
+#   5d. 把一条长窗口规则退回 `increase()`：值夹具必须红——它判的是发货的那份表达式，
+#       不是抄进夹具的一份。
 # 另有两格证明它**不会**白红：真文件必须绿；拿不到 promtool 必须退 3（看不了 ≠ 一致）。
 #
 # 跑法：bash deploy/scripts/tests/cogneva-json-alert-rules.test.sh
@@ -131,6 +136,16 @@ mutate "${work}/c7.json" 'rule["promql"] = rule["promql"].split(" unless")[0]' "
 run "${work}/c7.json" "${repo}/deploy/k3s/observability/tests/cogneva-json-alert-pipeline.test.yaml"
 [ "$rc" -eq 1 ] && ok "删掉 unless 腿：夹具红（watcher 在跑时不该报「没有出口」）" \
     || bad "删掉 unless 腿应红" "1" "$rc"
+
+# 5d) 把一条长窗口规则退回 `increase()`：值夹具必须红。
+# 这一格证明 `cogneva-json-store-counter-window.test.yaml` 判的是**发货的那份表达式**，
+# 不是夹具里抄的一份：占位 `'__rule_promql:<名字>'` 由跑者换掉，抄进夹具的那份在规则被
+# 改回去时一声不响。判据是数——同一份序列（41、40、41）在包络读法下是 1，在旧读法下是
+# 71.75，而 `> 0` 的判词两种读法都亮，只有值断言分得开。
+mutate "${work}/c9.json" 'rule["promql"] = "max(increase(cogneva_change_tier_total[24h])) unless max(increase(cogneva_change_tier_total{tier=\"real_gate\"}[24h])) > 0"' "change_tier_routing_inert"
+run "${work}/c9.json" "${repo}/deploy/k3s/observability/tests/cogneva-json-store-counter-window.test.yaml"
+[ "$rc" -eq 1 ] && ok "长窗口规则退回 increase：值夹具红" \
+    || bad "退回 increase 应红" "1" "$rc"
 
 # 6) 拿不到 promtool：必须退 3，不许报绿。
 PROMTOOL=/nonexistent/promtool RULES_MANIFEST="$config" RULES_CASE="$case_file" \
