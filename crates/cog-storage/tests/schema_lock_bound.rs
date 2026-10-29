@@ -55,11 +55,30 @@ use common::release_after;
 /// the one that collides.
 const PROBE_TABLE: &str = "events_probe";
 
+/// An index the text below asks for and the catalog does not have yet.
+///
+/// The runner answers a batch it can prove is already in the catalog without
+/// asking for a lock at all, which is the point of that check -- and it also
+/// means a text whose every statement already holds can never collide with the
+/// writer these tests hold open. The second call therefore names one index that
+/// is still missing: the batch is real, and this is the statement in it that
+/// queues behind the writer.
+const PENDING_INDEX: &str = "events_probe_kind";
+
 fn probe_ddl() -> String {
     format!(
         "CREATE TABLE IF NOT EXISTS {PROBE_TABLE} (\
            event_id text PRIMARY KEY, event_type text NOT NULL);\n\
          CREATE INDEX IF NOT EXISTS {PROBE_TABLE}_type ON {PROBE_TABLE} (event_type);"
+    )
+}
+
+/// The same table, plus the one index the catalog is still missing.
+fn probe_ddl_with_a_new_index() -> String {
+    format!(
+        "{}\n\
+         CREATE INDEX IF NOT EXISTS {PENDING_INDEX} ON {PROBE_TABLE} (event_id, event_type);",
+        probe_ddl()
     )
 }
 
@@ -128,9 +147,12 @@ async fn a_store_schema_names_the_table_it_could_not_lock_instead_of_hanging() {
     took_it.await.expect("the writer took its lock");
 
     let started = Instant::now();
-    let outcome = tokio::time::timeout(Duration::from_secs(40), runner.apply_schema(&probe_ddl()))
-        .await
-        .expect("the schema must give up on the lock, not wait out the writer");
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(40),
+        runner.apply_schema(&probe_ddl_with_a_new_index()),
+    )
+    .await
+    .expect("the schema must give up on the lock, not wait out the writer");
     let waited = started.elapsed();
 
     stop.store(true, Ordering::SeqCst);
@@ -175,14 +197,27 @@ async fn a_store_schema_takes_its_lock_once_the_writer_commits() {
     took_it.await.expect("the writer took its lock");
     release_after(stop.clone(), Duration::from_millis(900));
 
-    let outcome = tokio::time::timeout(Duration::from_secs(40), runner.apply_schema(&probe_ddl()))
-        .await
-        .expect("the retry must not hang either");
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(40),
+        runner.apply_schema(&probe_ddl_with_a_new_index()),
+    )
+    .await
+    .expect("the retry must not hang either");
+    let waited = started.elapsed();
 
     stop.store(true, Ordering::SeqCst);
     writer.await.expect("the writer task");
     drop_schema(&url, &schema).await;
 
+    // A batch with nothing left to do is answered before it asks for a lock,
+    // so success alone does not say the lock was ever contended for -- and the
+    // writer here holds it for most of a second.
+    assert!(
+        waited >= Duration::from_millis(500),
+        "the schema finished in {waited:?}, before the writer let go, so it never \
+         asked for the lock this case is about"
+    );
     assert!(
         outcome.is_ok(),
         "the writer let go after a second, so the schema should have landed: \
