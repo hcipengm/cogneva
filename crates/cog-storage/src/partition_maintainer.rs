@@ -44,9 +44,16 @@ impl PartitionedTable {
 
 /// The time-series tables that carry an insert key, in the order maintenance
 /// touches them.
+///
+/// Every name here must be a table the migration chain still leaves behind. A
+/// retired table left in this list costs more than a skipped step: the round
+/// cannot open a DEFAULT on a table that does not exist, so it reports a
+/// shortfall every time it runs, for as long as the name stays -- and a red
+/// that no repair can clear is worse than no rule at all. The transcript table
+/// this used to list was retired when the chat history moved to an unpartitioned
+/// table; nothing writes it and no migration recreates it.
 pub fn time_series_tables() -> Vec<PartitionedTable> {
     vec![
-        PartitionedTable::new("messages", "created_at", "messages"),
         PartitionedTable::new("audit_logs", "created_at", "audit_logs"),
         PartitionedTable::new("billing_records", "created_at", "billing_records"),
         PartitionedTable::new("raw_log_index", "log_date", "raw_log_index"),
@@ -480,6 +487,61 @@ mod tests {
         let (start, end) = month_bounds(months_since_epoch(date(2026, 12, 1)));
         assert_eq!(start, date(2026, 12, 1));
         assert_eq!(end, date(2027, 1, 1));
+    }
+
+    /// A table the chain retires has to leave this list in the same change.
+    ///
+    /// Maintenance cannot open a DEFAULT partition on a table that no longer
+    /// exists, so a retired name left behind reports a shortfall on every round
+    /// for as long as it stays, and the alert that reads those shortfalls stays
+    /// red with no repair available. The check runs over the migration files
+    /// themselves rather than a hand-kept list, so it cannot drift from them.
+    #[test]
+    fn no_retired_table_is_still_maintained() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations/postgres");
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .expect("postgres migrations directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.ends_with(".up.sql"))
+            })
+            .collect();
+        entries.sort();
+
+        let mut retired: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for path in &entries {
+            let sql = std::fs::read_to_string(path).expect("migration is readable");
+            for line in sql.lines() {
+                let statement = line.trim().trim_end_matches(';');
+                let Some(rest) = statement.strip_prefix("DROP TABLE IF EXISTS ") else {
+                    continue;
+                };
+                // A comma means several tables on one statement; nothing in the
+                // chain does that today, so a shape this simple cannot read is
+                // better failed loudly than skipped silently.
+                assert!(
+                    !rest.contains(','),
+                    "{}: multi-table DROP is not parsed by this check",
+                    path.display()
+                );
+                retired.insert(rest.trim().trim_matches('"').to_ascii_lowercase());
+            }
+        }
+
+        let tables = time_series_tables();
+        let still_maintained: Vec<&str> = tables
+            .iter()
+            .map(|table| table.parent.as_str())
+            .filter(|parent| retired.contains(&parent.to_ascii_lowercase()))
+            .collect();
+        assert!(
+            still_maintained.is_empty(),
+            "these tables are still maintained but a migration drops them, so every \
+             round reports a DEFAULT partition it cannot create: {still_maintained:?}"
+        );
     }
 
     #[test]
