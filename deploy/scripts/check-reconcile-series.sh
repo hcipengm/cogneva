@@ -17,7 +17,9 @@
 set -euo pipefail
 
 SERIES="${COGNEVA_RECONCILE_SERIES:-${XDG_STATE_HOME:-$HOME/.local/state}/cogneva/cross-layer-reconcile.tsv}"
-INTERVAL=1800
+# 缺省 30 分钟一拍；`--interval` 与 `COGNEVA_RECONCILE_INTERVAL` 都能压过它。
+# 写死的那一版只能在改脚本时改节奏，而这台机器上换一个核对节奏是运维动作。
+INTERVAL="${COGNEVA_RECONCILE_INTERVAL:-1800}"
 NOW=""
 
 while [ $# -gt 0 ]; do

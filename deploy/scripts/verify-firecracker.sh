@@ -24,8 +24,10 @@ WORKDIR="${COGNEVA_MICROVM_DIR:-/opt/cogneva/microvm}"
 FC_VERSION="v1.11.0"
 ALPINE_VERSION="3.20.3"
 ALPINE_BRANCH="v3.20"
-PV_SIZE_MB=64
-ROOTFS_SIZE_MB=128
+# 两个尺寸是这个脚本的运行参数，不是常量：换成别的内核/发行版时它们得跟着动，
+# 所以先读环境、没给才用默认。写死的那一版没人能调，只能改脚本。
+PV_SIZE_MB="${FIRECRACKER_PV_SIZE_MB:-64}"
+ROOTFS_SIZE_MB="${FIRECRACKER_ROOTFS_SIZE_MB:-128}"
 ARCH="$(uname -m)"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
