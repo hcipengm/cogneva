@@ -323,6 +323,24 @@ pub struct BackupDrillRecord {
     /// The size the drill itself found on disk, which is a measurement of the
     /// file rather than a repetition of what the run recorded about it.
     pub package_bytes: Option<i64>,
+    /// Where the copy was restored **from**: the server and database this drill
+    /// read, with any password stripped (`postgres:5432/cogneva`).
+    ///
+    /// Recorded together with [`Self::restore_target`] because the two are one
+    /// fact split in two: "this package restores" says nothing about whether it
+    /// restores *somewhere else*. Until both halves are written down, a drill
+    /// that put the data back on the same server and a drill that put it on a
+    /// machine built from nothing produce the same row -- and the second is the
+    /// one that answers "can this installation be rebuilt".
+    pub restore_source: Option<String>,
+    /// Where the copy was restored **to**, in the same shape as
+    /// [`Self::restore_source`].
+    ///
+    /// `None` on a drill that never got as far as creating a target, and on
+    /// rows written before this column existed. The second kind is not
+    /// backfilled: nobody recorded it, and inventing a value would put a
+    /// location in the ledger that no drill ever visited.
+    pub restore_target: Option<String>,
     /// How far apart the package's own segment stamps were, and the bound the
     /// package declared for that distance. Both `None` for a package with no
     /// segment table, and both `None` when no package was opened.
@@ -579,6 +597,8 @@ mod tests {
             package: Some("cogneva-backup-20261018T031700Z.tar.zst".into()),
             package_written_at: Some(at),
             package_bytes: Some(1024),
+            restore_source: Some("postgres:5432/cogneva".into()),
+            restore_target: Some("postgres:5432/cogneva_drill".into()),
             segment_skew_seconds: Some(38),
             segment_skew_bound_seconds: Some(300),
             packages_on_volume: 7,

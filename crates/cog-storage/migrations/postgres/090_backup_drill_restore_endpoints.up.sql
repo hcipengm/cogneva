@@ -1,0 +1,25 @@
+-- Migration: 090_backup_drill_restore_endpoints
+-- Where a drill read from and where it put the bytes back.
+--
+-- Every other column on `backup_drills` measures the copy itself: how many
+-- tables came back, how many rows, whether the artifact stores opened. None of
+-- them says where it came back *to*. A drill that restores into a scratch
+-- database on the same server and a drill that restores into a machine built
+-- from nothing produce the same row today, and the difference between them is
+-- exactly the question "can this installation be rebuilt" -- the second one
+-- answers it, the first one only answers "the package opens".
+--
+-- The value is `host:port/database` with the userinfo stripped: the account is
+-- copied off the volume to an offsite repository, so a password in this row
+-- would be a credential written down twice in the two places a backup travels.
+--
+-- Both halves are stored rather than one, because "same as the source" is not a
+-- value the writer can be trusted to compute -- a stored boolean is a verdict,
+-- and a verdict written by the process it judges cannot be re-derived by a
+-- reader. Two endpoints let a reader compare servers itself.
+--
+-- NULL on rows written before this migration: nobody recorded the location, and
+-- a filled-in default would put an address in the account that no drill ever
+-- visited. Not backfilled.
+ALTER TABLE backup_drills ADD COLUMN IF NOT EXISTS restore_source TEXT;
+ALTER TABLE backup_drills ADD COLUMN IF NOT EXISTS restore_target TEXT;

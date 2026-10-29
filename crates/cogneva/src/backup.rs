@@ -4025,6 +4025,29 @@ impl Drop for TempTree {
     }
 }
 
+/// 连接串的 `host:port/db`，去掉 userinfo 与查询串。
+///
+/// 账本要记的是「读到哪儿／装到哪儿」，不是「用什么身份连的」：口令留在行里等于
+/// 把一份凭证抄进备份账本，而账本随包被复制到卷外与异地。userinfo 取**最后一个**
+/// `@` 之前的部分——口令里可以有 `@`。
+fn endpoint_of(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, p),
+        None => (rest, ""),
+    };
+    let host = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let database = path.split_once('?').map(|(d, _)| d).unwrap_or(path);
+    if database.is_empty() {
+        host.to_string()
+    } else {
+        format!("{host}/{database}")
+    }
+}
+
 /// 从连接串里换掉数据库名。
 ///
 /// 口令里可能有 `/`、`?` 之类会破坏朴素字符串替换的字符，所以从 `://` 之后
@@ -4138,6 +4161,8 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
         package: None,
         package_written_at: None,
         package_bytes: None,
+        restore_source: None,
+        restore_target: None,
         segment_skew_seconds: None,
         segment_skew_bound_seconds: None,
         packages_on_volume: 0,
@@ -4451,6 +4476,11 @@ async fn drill_once(
         .execute(live)
         .await?;
     let scratch_url = with_database(&cfg.database_url, DRILL_DATABASE);
+    // 两边各记一条，判「装到哪儿」才判得了。只有目标那一格时，读的人无法说
+    // 「同一个服务器上的另一个库」与「另一台机器」有什么区别——而演练要回答的
+    // 正是后者：这一套装得回去，还是这一套**换台机器**也建得起来。
+    drill.restore_source = Some(endpoint_of(&cfg.database_url));
+    drill.restore_target = Some(endpoint_of(&scratch_url));
     tracing::info!(database = DRILL_DATABASE, "drill: scratch database created");
 
     let result = restore_and_compare(cfg, live, &scratch_url, &pkg_dir, &manifest, drill).await;
@@ -4990,6 +5020,24 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
 
+    /// 账本里那一格只留地址，不留身份：口令写成 `@` 也不会漏出来，查询串不进格。
+    ///
+    /// 这一条是给「备份账本随包被复制到卷外与异地」这件事守的门——一个把口令抄进
+    /// 账本的实现，在这里就能被抓到，而不是等到某天有人读异地那份账本。
+    #[test]
+    fn the_restore_endpoint_carries_no_credentials() {
+        assert_eq!(
+            endpoint_of("postgres://cog_user:p%40ss@postgres:5432/cogneva?sslmode=disable"),
+            "postgres:5432/cogneva"
+        );
+        assert_eq!(
+            endpoint_of("postgres://cog_user:s3cr@t@postgres:5432/cogneva"),
+            "postgres:5432/cogneva"
+        );
+        // 没有 scheme、没有库名：只剩地址的那一段原样交出去，不编一个库名。
+        assert_eq!(endpoint_of("postgres:5432"), "postgres:5432");
+    }
+
     /// 一趟超时必须留下**一行能读的结论**，而不是让 Job 的界把进程杀掉。
     ///
     /// 这是本文件对 2026-10-27 那次现场的门：`backup-drill` 第一趟跑了 2271 s，
@@ -5004,6 +5052,8 @@ mod tests {
             package: Some("cogneva-backup-20261027T031714Z.tar.zst".into()),
             package_written_at: None,
             package_bytes: None,
+            restore_source: Some("postgres:5432/cogneva".into()),
+            restore_target: None,
             segment_skew_seconds: None,
             segment_skew_bound_seconds: None,
             packages_on_volume: 7,
@@ -5724,6 +5774,8 @@ mod tests {
             package: Some("cogneva-backup-20261019T103951Z.tar.zst".into()),
             package_written_at: Some(at),
             package_bytes: Some(1),
+            restore_source: Some("postgres:5432/cogneva".into()),
+            restore_target: Some("postgres:5432/cogneva_drill".into()),
             segment_skew_seconds: Some(1),
             segment_skew_bound_seconds: Some(300),
             packages_on_volume: 1,

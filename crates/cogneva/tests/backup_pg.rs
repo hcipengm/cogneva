@@ -569,6 +569,8 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         package: Some("cogneva-backup-20261018T031700Z.tar.zst".into()),
         package_written_at: Some(at),
         package_bytes: Some(1),
+        restore_source: Some("postgres:5432/cogneva".into()),
+        restore_target: Some("postgres:5432/cogneva_drill".into()),
         segment_skew_seconds: Some(12),
         segment_skew_bound_seconds: Some(300),
         packages_on_volume: 1,
@@ -629,6 +631,20 @@ async fn pg_a_drill_row_keeps_the_columns_the_target_recomputed() {
         read.offsite_missing_packages,
         Some(3),
         "窗口里没有卷外副本的包数没有原样回来"
+    );
+
+    // 「装回了哪儿」两格：值故意写得不一样、且都不是 NULL——两格若在绑定或
+    // SELECT 里错开一位，读回来的是对方那一格，而两格都非空时这种错位不会报错，
+    // 只会让判据把「另一台机器」读成「同一台」。
+    assert_eq!(
+        read.restore_source.as_deref(),
+        Some("postgres:5432/cogneva"),
+        "演练行的源地址没有原样回来"
+    );
+    assert_eq!(
+        read.restore_target.as_deref(),
+        Some("postgres:5432/cogneva_drill"),
+        "演练行的目标地址没有原样回来"
     );
 }
 
