@@ -71,15 +71,15 @@ crates/cog-collaboration/src/profile.rs	SHORTCUT_MAX_FILES	3	bound	files a reque
 crates/cog-collaboration/src/profile.rs	SHORTCUT_MAX_LINES	40	bound	diff lines an attached change may declare and still be the shortcut's own work
 crates/cog-collaboration/src/squad/executor.rs	PIPELINE_FAILURES_BEFORE_UPGRADE	2	bound	连续 Pipeline 失败多少次后自动升级到 Roundtable 模式。
 crates/cog-collaboration/src/squad/ralph/ralph_loop.rs	PACED_SLEEP_MAX_SECS	60	bound	ceiling on the paced backoff so a paused squad is not silent longer than a minute; the known cost of the last paced round is recorded above it rather than folded into the number
-crates/cog-core/src/admission.rs	ADMISSION_RECOMPUTE_WINDOW	60s	bound	重新算一次界的最小间隔：60s。
-crates/cog-core/src/admission.rs	LATENCY_MIN_SAMPLES	5	bound	floor before a median is this workload's history rather than noise
-crates/cog-core/src/admission.rs	LATENCY_RED_FACTOR	2.0	bound	判定「这一例偏慢」的倍数：比自己的历史中位数慢这么多倍才算红灯。
-crates/cog-core/src/admission.rs	MEM_FLOOR_BYTES	44 * 1024 * 1024 * 1024	bound	可用内存的地板，低于它减半。
-crates/cog-core/src/admission.rs	MEM_GREEN_MIN_BYTES	46 * 1024 * 1024 * 1024	bound	绿灯的可用内存线：高于它才加一。
-crates/cog-core/src/admission.rs	PSI_GREEN_AVG60	5.0	bound	绿灯：PSI 三项的 `avg60` 全在这条线以下才加一。
-crates/cog-core/src/admission.rs	PSI_RED_AVG10	20.0	bound	红灯：PSI 任一项的 `avg10` 越过这个百分比就减半。
-crates/cog-core/src/admission.rs	UNMEASURED_CEILING	4	bound	未实测的上界：4，取的是驱动原先写死的并发数。
-crates/cog-core/src/admission.rs	UNMEASURED_FLOOR	1	bound	未实测的下界：1，只是「不许是零」的形式下界。
+crates/cog-eval/src/admission.rs	ADMISSION_RECOMPUTE_WINDOW	60s	bound	重新算一次界的最小间隔：60s。
+crates/cog-eval/src/admission.rs	LATENCY_MIN_SAMPLES	5	bound	floor before a median is this workload's history rather than noise
+crates/cog-eval/src/admission.rs	LATENCY_RED_FACTOR	2.0	bound	判定「这一例偏慢」的倍数：比自己的历史中位数慢这么多倍才算红灯。
+crates/cog-eval/src/admission.rs	MEM_FLOOR_BYTES	44 * 1024 * 1024 * 1024	bound	可用内存的地板，低于它减半。
+crates/cog-eval/src/admission.rs	MEM_GREEN_MIN_BYTES	46 * 1024 * 1024 * 1024	bound	绿灯的可用内存线：高于它才加一。
+crates/cog-eval/src/admission.rs	PSI_GREEN_AVG60	5.0	bound	绿灯：PSI 三项的 `avg60` 全在这条线以下才加一。
+crates/cog-eval/src/admission.rs	PSI_RED_AVG10	20.0	bound	红灯：PSI 任一项的 `avg10` 越过这个百分比就减半。
+crates/cog-eval/src/admission.rs	UNMEASURED_CEILING	4	bound	未实测的上界：4，取的是驱动原先写死的并发数。
+crates/cog-eval/src/admission.rs	UNMEASURED_FLOOR	1	bound	未实测的下界：1，只是「不许是零」的形式下界。
 crates/cog-core/src/build_cache.rs	CACHE_LAYER_DEPTH	2	bound	cargo's profile level, then the deps/incremental level that can be dropped
 crates/cog-core/src/build_cache.rs	DEFAULT_CACHE_MAX_BYTES	3_221_225_472	bound	a 5 GiB claim less the co-tenants measured by hand; the auto cap can replace it
 crates/cog-core/src/build_cache.rs	MAX_PUBLISHED_LAYERS	12	bound	series cap; everything past it is folded into one other series by size

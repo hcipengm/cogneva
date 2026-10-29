@@ -35,7 +35,7 @@ const COMPARED: [&str; 6] = [
 /// read below goes through [`cog_core::contract::prompt::PromptManager`],
 /// which is what makes the key set below the declarations' own rather than a
 /// second copy of them.
-async fn manager() -> Arc<dyn cog_core::contract::prompt::PromptManager> {
+async fn manager() -> Arc<dyn PromptManagerContract> {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../prompts");
     let manager = PromptManager::from_dir(dir, WatchMode::None)
         .await

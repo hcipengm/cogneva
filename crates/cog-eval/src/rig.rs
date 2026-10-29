@@ -68,7 +68,7 @@ pub struct RunConfig {
     /// 管的是这一次跑自己允许多少个并行。缺了闸门，读的人从表上看到的分不出「宿主当时有余量」
     /// 与「没人看过宿主」——所以报表在闸门缺席时会明说这一次没有闸门。闸门自己的下界上界在
     /// 它自己的配置里。
-    pub admission: Option<Arc<cog_core::admission::Admission>>,
+    pub admission: Option<Arc<crate::admission::Admission>>,
     /// 这一跑的骨干能不能看图。`false` ＝ 带图的题**不跑**，记进 `skipped`，不进分母。
     ///
     /// 为什么不是「照跑、算没过」：模型看不到图时，判 false 记的是「题面被摘掉了」，不是
@@ -543,7 +543,7 @@ pub struct Table {
     /// 一张分数配一份别的时刻的闸门读数。没有闸门时是 `None`，与「闸门开着但一动不动」
     /// 分得开。
     #[serde(default)]
-    pub gate: Option<cog_core::admission::GateReading>,
+    pub gate: Option<crate::admission::GateReading>,
     /// 调用侧的退避界，以及它在这一跑里咬合了多少次。
     ///
     /// 与 `gate` 同理，随表一起出：读的人要能从同一份产物里看到「这一跑有没有在拒绝
@@ -634,7 +634,7 @@ impl Table {
 #[allow(dead_code)]
 struct Ticket {
     slot: Option<tokio::sync::OwnedSemaphorePermit>,
-    gate: Option<cog_core::admission::Permit>,
+    gate: Option<crate::admission::Permit>,
 }
 
 /// 运行器。
@@ -1701,10 +1701,7 @@ mod tests {
         }
     }
 
-    fn gated_rig(
-        slot: Option<usize>,
-        admission: Option<Arc<cog_core::admission::Admission>>,
-    ) -> Rig {
+    fn gated_rig(slot: Option<usize>, admission: Option<Arc<crate::admission::Admission>>) -> Rig {
         Rig::new(
             Arc::new(NeverCalled),
             RunConfig {
@@ -1736,7 +1733,7 @@ mod tests {
     async fn a_column_ceiling_holds_even_when_the_gate_would_admit_more() {
         let env = Arc::new(CountingEnv::new());
         let dir = tempfile::tempdir().unwrap();
-        let gate = cog_core::admission::open(&cog_core::admission::AdmissionConfig {
+        let gate = crate::admission::open(&crate::admission::AdmissionConfig {
             dir: dir.path().to_path_buf(),
             // 两界都是 4：闸门这一刻就是 4 个名额，拦人的只可能是这一列自己的上界。
             floor_unmeasured: 4,
@@ -1774,7 +1771,7 @@ mod tests {
     async fn a_static_slot_smaller_than_the_gate_bounds_the_run() {
         let env = Arc::new(CountingEnv::new());
         let dir = tempfile::tempdir().unwrap();
-        let gate = cog_core::admission::open(&cog_core::admission::AdmissionConfig {
+        let gate = crate::admission::open(&crate::admission::AdmissionConfig {
             dir: dir.path().to_path_buf(),
             floor_unmeasured: 4,
             ceiling_unmeasured: 4,

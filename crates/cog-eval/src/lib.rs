@@ -11,6 +11,7 @@
 
 pub mod ablation;
 pub mod adapters;
+pub mod admission;
 pub mod backoff;
 pub mod bench;
 pub mod comparator;

@@ -1247,14 +1247,14 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
     // 里记一句没开成」——后者会在宿主已经被压住的时候才发现。
     let admission = match &args.admission_dir {
         Some(dir) => {
-            let mut cfg = cog_core::admission::AdmissionConfig::new(dir);
+            let mut cfg = cog_eval::admission::AdmissionConfig::new(dir);
             if let Some(floor) = args.admission_floor_unmeasured {
                 cfg.floor_unmeasured = floor;
             }
             if let Some(ceiling) = args.admission_ceiling_unmeasured {
                 cfg.ceiling_unmeasured = ceiling;
             }
-            Some(cog_core::admission::open(&cfg).map_err(|e| anyhow::anyhow!("{e}"))?)
+            Some(cog_eval::admission::open(&cfg).map_err(|e| anyhow::anyhow!("{e}"))?)
         }
         None => None,
     };
@@ -2610,14 +2610,14 @@ mod tests {
         );
     }
 
-    fn one_cell_table_with_gate(gate: cog_core::admission::GateReading) -> Table {
+    fn one_cell_table_with_gate(gate: cog_eval::admission::GateReading) -> Table {
         let mut table = one_cell_table();
         table.gate = Some(gate);
         table
     }
 
-    fn gate_reading() -> cog_core::admission::GateReading {
-        cog_core::admission::GateReading {
+    fn gate_reading() -> cog_eval::admission::GateReading {
+        cog_eval::admission::GateReading {
             bound: 2,
             floor: 1,
             ceiling: 4,
