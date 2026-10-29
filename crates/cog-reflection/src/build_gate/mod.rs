@@ -584,6 +584,9 @@ struct Counters {
     excluded: u64,
     waiting: u64,
     acquired: u64,
+    /// Milliseconds in which the disk was stalled and no build ran. See
+    /// [`BUILD_GATE_IO_OUTSIDE_SECONDS`].
+    io_outside_ms: u64,
     /// One count per ask and per wall, indexed by [`asker_index`] and
     /// [`RefusedBy::index`], so the refusal counter publishes a fixed series set
     /// rather than one that grows with the walls a process happens to have hit
@@ -1478,6 +1481,38 @@ fn tuning_readings(t: &Tuning, measured_peak: Option<u64>, origin: Origin<'_>) -
         .collect()
 }
 
+/// How far back one io sample speaks: the window the kernel itself averaged
+/// over for `full avg60`.
+///
+/// The interval between two looks is not the same quantity. A scrape that
+/// arrives ten minutes after the last one is still one observation of the last
+/// minute, and charging those ten minutes to it would invent nine minutes of
+/// stall nobody measured. Capping at the sample's own horizon makes the counter
+/// a floor rather than a total, which is the safe direction for a rule that
+/// fires on it being large.
+const IO_SAMPLE_HORIZON: Duration = Duration::from_secs(60);
+
+/// What share of `since` a look at the disk may charge to [`BUILD_GATE_IO_OUTSIDE_SECONDS`].
+///
+/// Both conditions or nothing, and the absence of the reading is not the
+/// absence of the condition: a kernel with no `full` line answers `None`, so
+/// the caller records nothing and the published zero stays "not measured".
+fn io_outside_credit(
+    builds_on_host: usize,
+    since: Duration,
+    io_calm_pct: f64,
+    io_full_avg60: Option<f64>,
+) -> Option<Duration> {
+    if builds_on_host > 0 {
+        return None;
+    }
+    let full = io_full_avg60?;
+    if full < io_calm_pct {
+        return None;
+    }
+    Some(since.min(IO_SAMPLE_HORIZON))
+}
+
 /// The whole series set, in one place: a reader that has to tell "no bound here"
 /// from "this deployment never reported" cannot do it if the two sources of the
 /// set can drift.
@@ -1506,6 +1541,13 @@ fn readings(
         label(RawMetric::new(BUILD_GATE_EXCLUDED, c.excluded as f64)),
         label(RawMetric::new(BUILD_GATE_WAITING, c.waiting as f64)),
         label(RawMetric::new(BUILD_GATE_ACQUIRED_TOTAL, c.acquired as f64)),
+        // Always a row, zero included: "the disk never stalled while nothing was
+        // building" and "this process never looked" have to be different rows,
+        // and only the second one is a defect in the reading.
+        label(RawMetric::new(
+            BUILD_GATE_IO_OUTSIDE_SECONDS,
+            c.io_outside_ms as f64 / 1000.0,
+        )),
     ];
     // One row per wall and per ask, all of them always, so a reader summing the
     // counter over either label gets the same total the one-number version
@@ -1992,6 +2034,14 @@ pub struct BuildGate {
     excluded: AtomicU64,
     waiting: AtomicU64,
     acquired: AtomicU64,
+    /// Milliseconds in which the disk was stalled and this host had no build
+    /// running at all. See [`BUILD_GATE_IO_OUTSIDE_SECONDS`]: the pair of
+    /// conditions is the whole point, so it is one counter rather than two.
+    io_outside_ms: AtomicU64,
+    /// When the disk was last looked at, so the interval charged to a stalled
+    /// window is the interval that actually passed between two looks. `None`
+    /// until the first look, which establishes the instant and charges nothing.
+    io_outside_last: Mutex<Option<Instant>>,
     /// One counter per ask and per wall, indexed by [`asker_index`] and
     /// [`RefusedBy::index`].
     refused: [[AtomicU64; RefusedBy::ALL.len()]; ASKER_CELLS],
@@ -2114,6 +2164,8 @@ impl BuildGate {
             excluded: AtomicU64::new(0),
             waiting: AtomicU64::new(0),
             acquired: AtomicU64::new(0),
+            io_outside_ms: AtomicU64::new(0),
+            io_outside_last: Mutex::new(None),
             refused: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             wait_ms_total: AtomicU64::new(0),
             wait_ms_max: AtomicU64::new(0),
@@ -2420,6 +2472,11 @@ impl BuildGate {
         if !self.installed {
             return;
         }
+        // Outside the derivation below, and before the pinned gate returns: a
+        // gate holding a fixed bound lets builds in without deriving anything,
+        // and a zero it published because it never looked would read exactly
+        // like a disk that never stalled.
+        self.record_io_outside_the_gate();
         // A pinned gate measures nothing, so there is no bound to derive -- but
         // the number it enforces is still the number every other builder on the
         // host reads, and the only place they read it is this file. A pin that
@@ -2810,6 +2867,71 @@ impl BuildGate {
             .sum()
     }
 
+    /// Records a window in which the disk was stalled and no build was running.
+    ///
+    /// Both conditions, or nothing: an io reading on its own is what a working
+    /// host looks like while it builds, and "no build" on its own is what an
+    /// idle host looks like. Only the pair says the disk is stuck with nothing
+    /// of the gate's on it -- and that pair is the one fact about this host that
+    /// neither the ceiling nor the bound can express, because both of them
+    /// answer "what may I admit", not "may I admit nothing and still be in
+    /// trouble".
+    ///
+    /// The builds counted are the slot locks, not this process's `in_flight`:
+    /// a builder that is not this process takes a slot this process can see and
+    /// does not count, and that outside builder is exactly the one this reading
+    /// must not blame on nothing.
+    ///
+    /// The threshold is the control law's own `io_calm_pct` rather than a number
+    /// of its own. The gate is holding the bound down because that line says the
+    /// host is not calm; a reading that drew its own line could say "nothing is
+    /// stalling" about the same window and leave two answers to one question.
+    ///
+    /// A kernel that publishes no `full` line records nothing. That is a missing
+    /// face, not a quiet disk, and counting it as quiet would make this reading
+    /// silently absent on exactly the hosts where nobody has looked.
+    ///
+    /// Taken at every step rather than inside the derivation window, because a
+    /// gate pinned to a fixed bound returns before it derives anything and that
+    /// gate is the one whose zero would otherwise mean "this process never
+    /// looked". The interval charged is the time since the previous look, so
+    /// two callers stepping in the same second split that second rather than
+    /// both claiming it.
+    fn record_io_outside_the_gate(&self) {
+        let now = Instant::now();
+        let since_last = {
+            let mut last = self
+                .io_outside_last
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let since = last.map(|t| now.saturating_duration_since(t));
+            *last = Some(now);
+            since
+        };
+        // The first look has no interval behind it to charge anything to, and
+        // its opening instant is the only thing it establishes.
+        let Some(since) = since_last else {
+            return;
+        };
+        let Some(full) = cog_core::admission::io_full_avg60() else {
+            return;
+        };
+        // This process's own count first, because it is an atomic read: a build
+        // running here is on the host, so the lock scan below cannot add to it.
+        let builds_on_host = if self.in_flight.load(Ordering::Relaxed) > 0 {
+            1
+        } else {
+            cog_core::admission::build_slots_held(&self.dir)
+        };
+        let (tuning, _) = self.tuning_in_force();
+        if let Some(credit) =
+            io_outside_credit(builds_on_host, since, tuning.io_calm_pct, Some(full))
+        {
+            self.io_outside_ms
+                .fetch_add(credit.as_millis() as u64, Ordering::Relaxed);
+        }
+    }
+
     /// The counters as they stand, for the reading.
     fn counters(&self) -> Counters {
         Counters {
@@ -2817,6 +2939,7 @@ impl BuildGate {
             excluded: self.excluded.load(Ordering::Relaxed),
             waiting: self.waiting.load(Ordering::Relaxed),
             acquired: self.acquired.load(Ordering::Relaxed),
+            io_outside_ms: self.io_outside_ms.load(Ordering::Relaxed),
             refused: std::array::from_fn(|asker| {
                 std::array::from_fn(|wall| self.refused[asker][wall].load(Ordering::Relaxed))
             }),
@@ -4207,6 +4330,48 @@ mod tests {
             lock_dir: dir.to_string_lossy().into_owned(),
             ..BuildGateConfig::default()
         }))
+    }
+
+    /// The outside-io reading counts one situation and nothing near it.
+    ///
+    /// Four of the five cases below are the near misses, and each of them is a
+    /// way the reading could look right while saying something else: a build
+    /// running makes the pressure the gate's own (it is the answer to "why is
+    /// the disk busy", not "why is the disk busy with nothing of mine on it"),
+    /// a quiet disk is an idle host, and a kernel with no `full` line is a host
+    /// nobody can ask. Only the first case is the defect this series exists to
+    /// make visible. The last case is the cap: one sample is one minute of
+    /// kernel average however long the gap before it was.
+    #[test]
+    fn the_outside_io_reading_counts_only_windows_with_nothing_building() {
+        let window = Duration::from_secs(90);
+        let calm = 1.0;
+
+        assert_eq!(
+            io_outside_credit(0, window, calm, Some(46.5)),
+            Some(IO_SAMPLE_HORIZON),
+            "盘堵着、一个构建都没有：记满，但一次采样最多只管它自己那一分钟"
+        );
+        assert_eq!(
+            io_outside_credit(0, Duration::from_secs(15), calm, Some(46.5)),
+            Some(Duration::from_secs(15)),
+            "两次看之间只有十五秒，就只记十五秒"
+        );
+        assert_eq!(
+            io_outside_credit(1, window, calm, Some(46.5)),
+            None,
+            "有一台构建在跑就不算「门外」，哪怕它不是本进程放的"
+        );
+        assert_eq!(
+            io_outside_credit(0, window, calm, Some(0.4)),
+            None,
+            "盘不堵的时候，没有构建在跑只是一台闲着的机器"
+        );
+        assert_eq!(
+            io_outside_credit(0, window, calm, None),
+            None,
+            "内核没有 full 行是量不了，不许记成堵、也不许记成不堵"
+        );
     }
 
     /// A build has to be runnable from a spawned task, or the call sites cannot
@@ -7075,6 +7240,20 @@ unevictable 28532736
         assert!(
             refused.contains(BUILD_GATE_REFUSED_TOTAL),
             "rule {BUILD_GATE_RULE} must query {BUILD_GATE_REFUSED_TOTAL}, got: {refused}"
+        );
+
+        // The reading for the window the gate cannot see: nothing admitted, the
+        // disk still stalled. Named here so a rename on either side fails,
+        // because the series is worthless without the rule and the rule fires on
+        // nothing without the series.
+        let outside_io = find(BUILD_GATE_IO_OUTSIDE_RULE);
+        assert!(
+            outside_io.contains(BUILD_GATE_IO_OUTSIDE_SECONDS),
+            "rule {BUILD_GATE_IO_OUTSIDE_RULE} must query {BUILD_GATE_IO_OUTSIDE_SECONDS}, got: {outside_io}"
+        );
+        assert!(
+            outside_io.contains(&format!("\"{BUILD_GATE_ROLE_BUILDER}\"")),
+            "rule {BUILD_GATE_IO_OUTSIDE_RULE} must select builders by role, got: {outside_io}"
         );
 
         // A builder whose gate is not in force is the state the refusal counter

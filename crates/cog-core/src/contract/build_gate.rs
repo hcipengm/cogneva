@@ -150,6 +150,31 @@ pub const BUILD_GATE_WAIT_MS_MAX: &str = "cogneva_build_gate_wait_ms_max";
 pub const BUILD_GATE_HELD_MS_TOTAL: &str = "cogneva_build_gate_held_ms_total";
 /// The longest single slot hold, in milliseconds. A high-water mark.
 pub const BUILD_GATE_HELD_MS_MAX: &str = "cogneva_build_gate_held_ms_max";
+/// Seconds in which the disk was stalled and this host had no build running at
+/// all, summed.
+///
+/// Every other reading here is about what the gate did with the slots: how many
+/// it admitted, how long they waited, which wall turned them away. This one is
+/// the reading for the case where the answer is "nothing" and the host is still
+/// in trouble -- the gate admits nothing because it measures a host it cannot
+/// size a bound for, while the pressure keeping it there is not a build's. The
+/// two conditions are read together on purpose and are one counter rather than
+/// two: `io stalled` alone is what a busy host looks like, and `no build` alone
+/// is what an idle one looks like, and only the pair says "this disk is stuck
+/// with nothing of mine on it".
+///
+/// It answers no question about capacity. Whether the gate's domain should reach
+/// the builds it does not admit is a decision about who may use the host, and
+/// this reading does not argue for one: it makes the situation that decision is
+/// about visible, so the decision is made on a number instead of on a picture of
+/// ninety compiler processes in `ps`.
+///
+/// `io_full_avg60` is what "stalled" means here -- time on which *every* task
+/// was stopped, not the `some` line the control law reads. A build running
+/// beside the gate counts against the second condition, and it is read from the
+/// slot locks rather than from this process's own count, so a builder that is
+/// not this process is not invisible to it.
+pub const BUILD_GATE_IO_OUTSIDE_SECONDS: &str = "cogneva_build_gate_io_outside_seconds_total";
 /// How long the work holding each slot has held it, in seconds, as a gauge,
 /// carrying the holder's own `what` and the slot it holds.
 ///
@@ -177,6 +202,11 @@ pub const BUILD_GATE_HOLDER_SECONDS: &str = "cogneva_build_gate_holder_seconds";
 pub const BUILD_GATE_WAIT_BUDGET_MS: &str = "cogneva_build_gate_wait_budget_ms";
 /// Name of the rule that reads the refusal counter, so the pairing can be asserted.
 pub const BUILD_GATE_RULE: &str = "build_gate_refused";
+/// Name of the rule that reads [`BUILD_GATE_IO_OUTSIDE_SECONDS`], so the pairing
+/// can be asserted. A counter with no rule is a number on the wire that nobody
+/// wakes up for, and the situation it describes -- a stalled disk on a host the
+/// gate is admitting nothing to -- is precisely the one nobody is watching.
+pub const BUILD_GATE_IO_OUTSIDE_RULE: &str = "build_gate_io_stalled_outside";
 /// Name of the rule that reads the slot count of a process that runs builds, so
 /// the pairing can be asserted.
 pub const BUILD_GATE_IN_FORCE_RULE: &str = "build_gate_not_in_force";

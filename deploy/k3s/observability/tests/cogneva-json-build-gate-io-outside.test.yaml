@@ -1,0 +1,68 @@
+# 「盘堵着、而宿主上一台构建都没有」这条读数的夹具。
+#
+# 这条规则要判的是闸门**什么都没放行**的那段时间：界被 io 钉住、构建全被挡在门外，
+# 而把盘压住的是闸门看不见的那些构建。闸门其余每一条读数说的都是它对槽位做了什么
+# ——放行了几条、拒了几次、等了多久——没有一条能说出这个情形，因为这里的答案是「没有」，
+# 而机器照样在坏。
+#
+# 五小时（300 秒）是一小时里的阀，不是目标：一次门外构建能把盘压住几十分钟，按第一分钟
+# 就亮的话这条规则会变成一盏常亮的灯。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-build-gate-io-outside.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: build_gate_io_stalled_outside
+
+evaluation_interval: 1m
+
+tests:
+  # 一小时里累加了 420 秒：盘堵着、没有构建，而且堵了七分钟以上。亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_io_outside_seconds_total{dir="host",role="builder"}'
+        values: '0+7x60'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: build_gate_io_stalled_outside
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: host
+              role: builder
+
+  # 同一小时只累加了 180 秒：短暂的一阵，阀之下。不亮——这一格保证这条规则不会在
+  # 「偶尔堵一下」的机器上常亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_io_outside_seconds_total{dir="host",role="builder"}'
+        values: '0+3x60'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: build_gate_io_stalled_outside
+        exp_alerts: []
+
+  # 计数器停在一千秒上一小时没动：那是**已经过去**的堵，不是这一小时里的。读的是增量，
+  # 不是水位——把它读成水位，这条规则会在一次堵之后一直亮着。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_io_outside_seconds_total{dir="host",role="builder"}'
+        values: '1000x61'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: build_gate_io_stalled_outside
+        exp_alerts: []
+
+  # 同一份增量长在控制平面的那一条上：它不放行构建，这个数对它没有意义。选择器按
+  # role="builder" 取，这一格钉住那个选择器——去掉它，这条规则会在每条控制平面上
+  # 读到同一份横轴。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_io_outside_seconds_total{dir="host",role="control-plane"}'
+        values: '0+7x60'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: build_gate_io_stalled_outside
+        exp_alerts: []

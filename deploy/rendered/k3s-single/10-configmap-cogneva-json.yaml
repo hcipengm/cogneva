@@ -1666,6 +1666,16 @@ data:
               "face": "CI/构建/部署"
             },
             {
+              "name": "build_gate_io_stalled_outside",
+              "promql": "max by (dir, role) (increase(cogneva_build_gate_io_outside_seconds_total{role=\"builder\"}[1h]))",
+              "condition": {
+                "greater_than": 300.0
+              },
+              "severity": "warning",
+              "summary": "for {value} seconds in the last hour the build volume was stalled while no build was running on this host: the gate admitted nothing and the disk was still stopped, so the pressure it is holding the bound down for is not a build's. Every other reading on this gate says what it did with the slots -- admitted, refused, waited, held -- and none of them can show this case, because the answer here is nothing and the host is in trouble anyway. What it does not do is decide whether that is wrong: the gate bounds the builds it knows about, and whether the builds running beside it should answer to the same account is a decision about who may use the host. This row is what lets that decision be made on a number instead of on a picture of ninety compiler processes in ps. Stalled is the io full avg60 -- time on which every task was stopped, not the some line the control law reads, which is high whenever anything is waiting at all -- and the other half of the pair is read from the slot locks rather than from the admitting process's own count, so a builder that is not this process is not mistaken for an empty host. The bound is five minutes out of the last hour: an episode of outside builds saturates this disk for tens of minutes at a time, and a row that fired on the first stalled minute would be one more constant alarm. It is deliberately not a capacity claim: when the host's own compilers are admitted to the same gate this count goes to near zero, and until then it moves without anyone having been refused anything, which is the whole point of reading it.",
+              "face": "CI/构建/部署"
+            },
+            {
               "name": "build_gate_slot_held_too_long",
               "promql": "max by (dir, role, slot, what) (cogneva_build_gate_holder_seconds) > on(dir, role) group_left () (2 * max by (dir, role) (cogneva_build_gate_wait_budget_ms) / 1000)",
               "condition": {

@@ -93,6 +93,37 @@ fn parse_psi(text: &str) -> Option<(f64, f64)> {
     Some((avg10?, avg60?))
 }
 
+/// io 的 `full` 行 `avg60`：这一拍里**所有**任务都停住的时间占比。
+///
+/// 它与 [`Pressure::io_avg60`] 不是同一个数，也不是它的更严版本：`some` 数的是「至少一个
+/// 任务在等」，`full` 数的是「没有任何任务在跑」。前者在盘被人占着时就高，后者只在真的
+/// 没有人跑得动时才高。所以它回答的是另一个问题——「这一拍机器上谁都没在干活」——而不是
+/// 「有多忙」，也就不能进 [`Pressure`]：那份读数是控制律的输入，而控制律**故意**按 `some`
+/// 减，理由见上面 [`read_psi_at`] 那段。
+///
+/// 用到它的是另一半问题：机器已经被堵住的时候，闸门到底放行了什么。答「什么都没放行、
+/// 盘却在堵」的那条读数，读的就是这一个窗口。
+///
+/// 没有这一行就返回 `None`：`full` 行只有 io 与 memory 两个控制器有（cpu 至今没有），
+/// 旧内核上一个都没有。把缺行读成 0 会让「这个内核量不了」与「盘一点都不堵」同形，
+/// 而那正是这块模块开头写着不许做的那件事。
+pub fn io_full_avg60_at(path: &str) -> Option<f64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    parse_psi_full_avg60(&text)
+}
+
+/// 这一拍 io 的 `full avg60`，见 [`io_full_avg60_at`]。
+pub fn io_full_avg60() -> Option<f64> {
+    io_full_avg60_at("/proc/pressure/io")
+}
+
+fn parse_psi_full_avg60(text: &str) -> Option<f64> {
+    let line = text.lines().find(|l| l.starts_with("full"))?;
+    line.split_whitespace()
+        .find_map(|field| field.strip_prefix("avg60="))
+        .and_then(|v| v.parse().ok())
+}
+
 fn read_mem_available() -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
     let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
@@ -174,6 +205,34 @@ mod tests {
         assert!(
             parse_psi("full avg10=1 avg60=1\n").is_none(),
             "没有 some 行就是没读到"
+        );
+    }
+
+    /// `full` 那一行是另一个问题，读法也不同：没有它就该是「量不了」，不是「零」。
+    ///
+    /// 这两条断言是同一个决定的两面。读成 0 会让一台读不到的机器与一台一点都不堵的
+    /// 机器在读数上同形，而那正是这条读数存在的理由——它要指出的是「我什么都没放行、
+    /// 盘却在堵」，把「量不了」也算成「不堵」，这条读数就永远只在有 `full` 行的内核上
+    /// 才有意义，而读的人不会知道自己在看哪种内核。
+    #[test]
+    fn the_psi_full_line_is_read_as_a_reading_of_its_own_and_its_absence_is_not_zero() {
+        let text = "some avg10=7.17 avg60=24.12 avg300=100.00 total=1234\n\
+                    full avg10=6.00 avg60=20.00 avg300=90.00 total=1000\n";
+        assert_eq!(
+            parse_psi_full_avg60(text),
+            Some(20.00),
+            "取 full 行的 avg60"
+        );
+        let no_full = "some avg10=7.17 avg60=24.12 avg300=100.00 total=1234\n";
+        assert_eq!(
+            parse_psi_full_avg60(no_full),
+            None,
+            "没有 full 行是量不了，不是不堵"
+        );
+        assert_eq!(
+            parse_psi_full_avg60("full avg10=6.00 total=10\n"),
+            None,
+            "有 full 行却没有 avg60，同样是量不了"
         );
     }
 }

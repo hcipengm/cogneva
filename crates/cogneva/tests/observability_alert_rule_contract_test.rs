@@ -178,6 +178,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_build_gate_wait_budget_ms",
         "crates/cog-core/src/contract/build_gate.rs",
     ),
+    // The window no refusal covers: the disk stalled while no build was running.
+    // A refusal is an event at the gate, and this is a state of the host -- the
+    // gate admitted nothing and the machine was still stopped, which is the one
+    // thing in this family that says the pressure keeping the bound down is not
+    // the gate's own.
+    (
+        "cogneva_build_gate_io_outside_seconds_total",
+        "crates/cog-core/src/contract/build_gate.rs",
+    ),
     // The turn granted and never taken: a claim on the next build that a later
     // arrival read past its freshness budget. It is published by the reflection
     // process that runs the gate, not by the contract beside the other three,
