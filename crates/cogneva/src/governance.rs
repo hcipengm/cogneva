@@ -89,6 +89,18 @@ SUBCOMMANDS:
                            Ballot rules are written at open time and never
                            rewritten; a principle that settles the question
                            records its basis and closes with no votes.
+    readings               Print the host-reading roster, four columns:
+                           producer script note series-families. This is the
+                           list the host aggregator runs: the readings live in
+                           the graph, not in a file somebody edits.
+    import-readings --from <file>
+                           Put every row of a four-column roster into the graph
+                           and cancel the rows the file no longer names. The
+                           import is authoritative in both directions, so a
+                           script that was deleted leaves the roster in the same
+                           act that removes it. `--from -` reads stdin, which is
+                           how a host with no database credentials feeds it in:
+                           `kubectl exec -i ... import-readings --from -`.
     assign [--face <id>] [--workspace <id>]
                            Give every staffed face one standing work row,
                            owned by the face's owner and carrying its face id,
@@ -131,6 +143,11 @@ pub enum Action {
     Assign {
         face: Option<String>,
         workspace: Option<String>,
+    },
+    /// The host-reading roster, four columns, straight from the graph.
+    Readings,
+    ImportReadings {
+        from: PathBuf,
     },
     // Boxed: a handover carries a spec whose text fields make it the widest
     // variant, and every other action would pay for that width. One CLI
@@ -231,6 +248,10 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             keep_ownership,
         },
         Some("assign") => Action::Assign { face, workspace },
+        Some("readings") => Action::Readings,
+        Some("import-readings") => Action::ImportReadings {
+            from: from.ok_or("import-readings needs --from <file>")?,
+        },
         Some(other) => return Err(format!("unknown governance subcommand {other}")),
         None => return Err("governance needs a subcommand".into()),
     };
@@ -317,6 +338,8 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             )
             .await?;
         }
+        Action::Readings => readings_roster(&*store).await?,
+        Action::ImportReadings { from } => import_readings(&*store, &from).await?,
         Action::Act(act) => {
             // The heartbeat store is what an exit handover's apply step
             // re-reads. Without it the command still works for every handover
@@ -437,6 +460,34 @@ async fn agent_registry(url: Option<&str>) -> (Option<Arc<RedisAgentRegistry>>, 
             )),
         ),
     }
+}
+
+/// The host-reading roster, exactly the four columns the aggregator parses.
+///
+/// Printed from the graph on every call rather than cached anywhere: the whole
+/// point of the move is that there is one account, and a cache would be a second
+/// one. The aggregation is what repeats every minute, not this query.
+async fn readings_roster(store: &dyn GovernanceStore) -> Result<(), Box<dyn Error>> {
+    print!("{}", crate::governance_readings::roster(store).await?);
+    Ok(())
+}
+
+async fn import_readings(store: &dyn GovernanceStore, from: &Path) -> Result<(), Box<dyn Error>> {
+    // `-` reads stdin. The roster has to get into the graph from a host that holds
+    // no database credentials, so the route is `kubectl exec -i ... import-readings
+    // --from -`: piped in, nothing staged on the pod's disk and nothing left there.
+    let text = if from == Path::new("-") {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+            .map_err(|why| format!("cannot read stdin: {why}"))?;
+        text
+    } else {
+        std::fs::read_to_string(from)
+            .map_err(|why| format!("cannot read {}: {why}", from.display()))?
+    };
+    let summary = crate::governance_readings::import_from_text(store, &text).await?;
+    println!("{}", summary.line());
+    Ok(())
 }
 
 async fn readings(
