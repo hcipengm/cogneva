@@ -7060,6 +7060,7 @@ unevictable 28532736
             BUILD_GATE_EXCLUDED,
             BUILD_GATE_WAITING,
             BUILD_GATE_ACQUIRED_TOTAL,
+            BUILD_GATE_IO_OUTSIDE_SECONDS,
         ];
         expected.extend(std::iter::repeat_n(
             BUILD_GATE_REFUSED_TOTAL,
