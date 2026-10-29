@@ -29,6 +29,13 @@
 //! Every row this file writes carries a per-run suffix in its dedup key and is
 //! the only row of its kind, so the counts below are statements about this
 //! test's rows.
+//!
+//! The table lives in a schema this run creates and drops, not in `public`.
+//! `COGNEVA_TEST_DATABASE_URL` is the only thing pointing this test at a
+//! database, and nothing checks that the database it names is a throwaway one
+//! -- it has been pointed at a live one by mistake, and what that left behind
+//! was three assertion rows nothing would ever delete. A schema created per run
+//! is what makes a repeat harmless rather than what makes the mistake likely.
 
 use chrono::{Duration, Utc};
 use sqlx::PgPool;
@@ -57,9 +64,8 @@ async fn state_of(pool: &PgPool, dedup_key: &str) -> String {
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_row_no_live_pass_refreshes_is_closed_and_a_fresh_one_is_not() {
     let url = cog_test_support::database_url();
-    let pool = PgPool::connect(&url)
-        .await
-        .expect("database must be reachable");
+    let schema = cog_test_support::own_schema(&url, "alert_row_sweep").await;
+    let pool = cog_test_support::schema_pool(&url, &schema).await;
     let store = PostgresAlertStore::new(pool.clone());
     let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
     store
@@ -131,11 +137,5 @@ async fn a_row_no_live_pass_refreshes_is_closed_and_a_fresh_one_is_not() {
         "a grace older than every row's last sighting must close nothing"
     );
 
-    for key in [&stale_agent, &fresh_agent, &stale_other] {
-        sqlx::query("DELETE FROM alerts WHERE dedup_key = $1")
-            .bind(key)
-            .execute(&pool)
-            .await
-            .expect("cleanup must land");
-    }
+    cog_test_support::drop_schema(&url, &schema).await;
 }
