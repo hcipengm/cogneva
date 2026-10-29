@@ -960,7 +960,10 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
 /// after that, and a pass never has to read the project back to learn whether
 /// its anchor exists.
 fn dispatch_project_root(row: &ChangeLedgerRow) -> Task {
-    let project = dispatch_project_key(row);
+    dispatch_project_root_for(&dispatch_project_key(row))
+}
+
+fn dispatch_project_root_for(project: &str) -> Task {
     let mut root = Task::new(
         dispatch_project_root_id(&project),
         TaskType::Custom(DISPATCH_PROJECT_ROOT_KIND.into()),
@@ -969,7 +972,7 @@ fn dispatch_project_root(row: &ChangeLedgerRow) -> Task {
             (cog_core::INPUT_TASK_KIND): DISPATCH_PROJECT_ROOT_KIND,
         }),
     );
-    root.goal_id = Some(project);
+    root.goal_id = Some(project.to_string());
     root.parent_task_id = None;
     // The anchor is where work hangs, not work: nothing reads it as a change,
     // and the queue must not start it.
@@ -982,6 +985,106 @@ fn dispatch_project_root_id(project: &str) -> String {
         .strip_prefix(DISPATCH_PROJECT_PREFIX)
         .unwrap_or(project);
     format!("{DISPATCH_PROJECT_ROOT_PREFIX}{scope}")
+}
+
+/// What one settle of the dispatched projects did, cell by cell.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SettledProjects {
+    anchored: usize,
+    reparented: usize,
+    failed: usize,
+}
+
+impl SettledProjects {
+    fn line(&self) -> String {
+        format!(
+            "settled dispatched projects: anchored={} reparented={} failed={}",
+            self.anchored, self.reparented, self.failed
+        )
+    }
+}
+
+/// Put the projects written before the anchor existed back into the shape the
+/// hand-over now writes.
+///
+/// The hand-over only fixes the group it touches, and a project whose changes
+/// have all finished is never touched again -- so rows written before the
+/// anchor existed would keep two roots for the life of the graph, and
+/// replanning refuses a group with two roots rather than guessing which one to
+/// hang work on. Measured on 2026-10-29, the first run of this pass had six
+/// such projects to fix.
+///
+/// A project holding one root is in shape whichever row that root is: the
+/// single change it holds, or the anchor. Only a second root is a refusal, so
+/// only a project with a second root is rewritten -- the rows that are already
+/// whole cost no write.
+///
+/// Called once per process rather than once per pass: every row written after
+/// this is in shape by construction, so a full graph read on every beat would
+/// be a cost paid forever for a defect that can no longer recur. A graph read
+/// that comes back empty is indistinguishable from a graph with nothing in it,
+/// and both mean there is nothing to settle.
+async fn settle_dispatch_parents(orchestrator: &Arc<dyn OrchestratorControl>) -> SettledProjects {
+    let mut settled = SettledProjects::default();
+    let tasks = orchestrator.get_all_tasks().await;
+    let mut projects: HashMap<&str, Vec<&Task>> = HashMap::new();
+    for task in &tasks {
+        if let Some(project) = task
+            .goal_id
+            .as_deref()
+            .filter(|project| project.starts_with(DISPATCH_PROJECT_PREFIX))
+        {
+            projects.entry(project).or_default().push(task);
+        }
+    }
+    for (project, rows) in projects {
+        let anchor_id = dispatch_project_root_id(project);
+        let anchored = rows.iter().any(|row| row.id == anchor_id);
+        let strays: Vec<&Task> = rows
+            .iter()
+            .copied()
+            .filter(|row| row.parent_task_id.is_none() && row.id != anchor_id)
+            .collect();
+        if strays.is_empty() || (!anchored && strays.len() < 2) {
+            continue;
+        }
+        if !anchored {
+            match orchestrator
+                .add_task(dispatch_project_root_for(project))
+                .await
+            {
+                Ok(()) => settled.anchored += 1,
+                Err(e) => {
+                    settled.failed += 1;
+                    warn!(
+                        project,
+                        error = %e,
+                        "change ledger: a dispatched project's anchor could not be written, so \
+                         the group keeps the roots it was written with"
+                    );
+                    continue;
+                }
+            }
+        }
+        for row in strays {
+            let mut hung = row.clone();
+            hung.parent_task_id = Some(anchor_id.clone());
+            match orchestrator.replace_task(hung).await {
+                Ok(()) => settled.reparented += 1,
+                Err(e) => {
+                    settled.failed += 1;
+                    warn!(
+                        project,
+                        task = %row.id,
+                        error = %e,
+                        "change ledger: a dispatched change could not be hung under its \
+                         project's anchor, so the group still holds it as a root"
+                    );
+                }
+            }
+        }
+    }
+    settled
 }
 
 /// The project a dispatched change belongs to: the part of the tree its check
@@ -1202,6 +1305,10 @@ pub fn spawn_change_ledger_loop(
                 // revision, and widening the diff to the last one that did is
                 // what keeps that gap from becoming a window of unseen changes.
                 let mut previous_rev: Option<String> = None;
+                // Whether this process has already put the dispatched projects
+                // written before the anchor existed back into shape. Once, not
+                // per pass: see `settle_dispatch_parents`.
+                let mut parents_settled = false;
                 loop {
                     beat.beat();
                     tokio::select! {
@@ -1324,6 +1431,14 @@ pub fn spawn_change_ledger_loop(
                     // and a change this pass just found missing is handed over on
                     // the same pass that found it, rather than one period later.
                     if let Some(ref orchestrator) = orchestrator {
+                        if !parents_settled {
+                            let settled = settle_dispatch_parents(orchestrator).await;
+                            if settled.anchored > 0 || settled.reparented > 0 || settled.failed > 0
+                            {
+                                info!("change ledger: {}", settled.line());
+                            }
+                            parents_settled = true;
+                        }
                         let pool = pool.as_deref();
                         // Work with nobody's name on it shows up in the rows
                         // of this account filed under no face, and in the
@@ -5771,6 +5886,68 @@ mod tests {
         );
     }
 
+    /// A project written before the anchor existed holds one root per change,
+    /// and replanning refuses a group with two roots rather than guessing. The
+    /// hand-over cannot fix a project it never touches again -- a project whose
+    /// changes have all finished is never handed anything -- so the settle pass
+    /// writes the anchor and hangs the strays under it.
+    #[tokio::test]
+    async fn a_project_written_with_two_roots_is_hung_under_one_anchor() {
+        let graph = Arc::new(
+            FakeGraph::default()
+                .holding_root_change("change-a", "change-ledger:crates")
+                .holding_root_change("change-b", "change-ledger:crates"),
+        );
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        let settled = settle_dispatch_parents(&control).await;
+
+        assert_eq!(
+            settled.anchored, 1,
+            "the project had no anchor: {settled:?}"
+        );
+        assert_eq!(settled.reparented, 2, "both rows were roots: {settled:?}");
+        assert_eq!(settled.failed, 0);
+        let anchor = graph
+            .held("change-ledger-project:crates")
+            .expect("the anchor is on the graph");
+        assert_eq!(anchor.goal_id.as_deref(), Some("change-ledger:crates"));
+        assert_eq!(anchor.parent_task_id, None);
+        assert!(!anchor.is_executable);
+        for id in ["change-a", "change-b"] {
+            let row = graph.held(id).expect("the change is still on the graph");
+            assert_eq!(
+                row.parent_task_id.as_deref(),
+                Some("change-ledger-project:crates"),
+                "the change hangs under the anchor now: {row:?}"
+            );
+        }
+    }
+
+    /// The settle must be free when the graph is already in shape, or every
+    /// start would rewrite a project that never needed it -- and one root is a
+    /// shape: a project holding a single change is a project replanning can
+    /// hang work on.
+    #[tokio::test]
+    async fn a_project_already_holding_one_root_costs_no_write() {
+        let graph = Arc::new(
+            FakeGraph::default()
+                .holding_root_change("only-change", "change-ledger:deploy")
+                .holding_root_change("change-a", "change-ledger:crates")
+                .holding_root_change("change-b", "change-ledger:crates"),
+        );
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        settle_dispatch_parents(&control).await;
+
+        let settled = settle_dispatch_parents(&control).await;
+
+        assert_eq!(
+            settled,
+            SettledProjects::default(),
+            "a second settle finds nothing left to do"
+        );
+    }
+
     /// A dispatched change declares a rank below the one a task lands on by
     /// default, and the rest of the row is unchanged by that.
     ///
@@ -7415,13 +7592,16 @@ mod tests {
     /// cannot be taken.
     #[derive(Default)]
     struct FakeGraph {
-        tasks: HashMap<String, Task>,
+        // Behind a lock so the two write calls the settle pass makes -- `add_task`
+        // and `replace_task` -- can be answered from a `&self`, the way the real
+        // graph answers them.
+        tasks: std::sync::Mutex<HashMap<String, Task>>,
         refuse_submissions: bool,
         submitted: std::sync::Mutex<Vec<String>>,
     }
 
     impl FakeGraph {
-        fn holding(mut self, id: &str, status: TaskStatus) -> Self {
+        fn holding(self, id: &str, status: TaskStatus) -> Self {
             let mut task = Task::new(
                 id.to_string(),
                 TaskType::Custom(DISPATCH_TASK_KIND.into()),
@@ -7433,11 +7613,11 @@ mod tests {
                 // re-arm is for.
                 task.error_cause = Some(UpstreamFailure::Auth);
             }
-            self.tasks.insert(id.to_string(), task);
+            self.tasks.lock().unwrap().insert(id.to_string(), task);
             self
         }
 
-        fn holding_dead_work(mut self, id: &str) -> Self {
+        fn holding_dead_work(self, id: &str) -> Self {
             let mut task = Task::new(
                 id.to_string(),
                 TaskType::Custom(DISPATCH_TASK_KIND.into()),
@@ -7445,8 +7625,26 @@ mod tests {
             );
             task.status = TaskStatus::Failed;
             task.error = Some("degenerate_loop: the same failure repeated".into());
-            self.tasks.insert(id.to_string(), task);
+            self.tasks.lock().unwrap().insert(id.to_string(), task);
             self
+        }
+
+        /// A row of the shape the hand-over wrote before the project anchor
+        /// existed: a change in a project, and a root of it.
+        fn holding_root_change(self, id: &str, project: &str) -> Self {
+            let mut task = Task::new(
+                id.to_string(),
+                TaskType::Custom(DISPATCH_TASK_KIND.into()),
+                serde_json::json!({}),
+            );
+            task.goal_id = Some(project.to_string());
+            self.tasks.lock().unwrap().insert(id.to_string(), task);
+            self
+        }
+
+        /// The row stored under `id`, as the graph now holds it.
+        fn held(&self, id: &str) -> Option<Task> {
+            self.tasks.lock().unwrap().get(id).cloned()
         }
 
         fn refusing(mut self) -> Self {
@@ -7475,7 +7673,12 @@ mod tests {
         async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
             Ok(())
         }
-        async fn add_task(&self, _task: Task) -> SFResult<()> {
+        async fn add_task(&self, task: Task) -> SFResult<()> {
+            self.tasks.lock().unwrap().insert(task.id.clone(), task);
+            Ok(())
+        }
+        async fn replace_task(&self, task: Task) -> SFResult<()> {
+            self.tasks.lock().unwrap().insert(task.id.clone(), task);
             Ok(())
         }
         async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
@@ -7488,7 +7691,7 @@ mod tests {
             Vec::new()
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
-            self.tasks.values().cloned().collect()
+            self.tasks.lock().unwrap().values().cloned().collect()
         }
         async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
             Ok(false)
@@ -7530,7 +7733,7 @@ mod tests {
             Ok(Vec::new())
         }
         async fn get_task(&self, task_id: &str) -> Option<Task> {
-            self.tasks.get(task_id).cloned()
+            self.tasks.lock().unwrap().get(task_id).cloned()
         }
         async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
             Ok(())
