@@ -35,11 +35,43 @@ const REDIS_URL_ENV: &str = "COGNEVA_TEST_REDIS_URL";
 /// 没设就停，不回落默认地址——这些用例会建表、写行、删数据，落到一台恰好跑着
 /// PostgreSQL 的机器上，比干脆不跑更糟。
 pub fn database_url() -> String {
-    std::env::var(DATABASE_URL_ENV).expect(
+    let raw = std::env::var(DATABASE_URL_ENV).expect(
         "set COGNEVA_TEST_DATABASE_URL to a throwaway PostgreSQL database before \
          running these tests",
-    )
+    );
+    checked_database_url(raw)
 }
+
+/// 那个 URL 能不能拿来跑用例；不能就停在这里。
+///
+/// 单独一个入口是因为护栏必须能被判：`database_url()` 读环境变量，而进程里改环境变量
+/// 与并行跑的用例共用一份，测不了。判的这一个是纯函数，删掉护栏那一行它就红。
+///
+/// 「一次性的库」这句话此前没有任何东西校验过，而这两个地址长得一模一样：配错一次，
+/// 用例建的 Schema、写的行、删掉的键就全落在真数据上。2026-10-29 就是这个形状——一条
+/// 用例按名字逐键删掉的，正是线上那张表里的行，事后只能靠一列写者身份把碎片认回来。
+///
+/// 库名不是指纹，可它是 URL 里唯一能把「这台实例的库」与「跑完就丢的库」分开的东西。
+/// 按名字拒掉一个已知的错配，比事后辨认哪些行是谁写的便宜。它挡不住有人配成别的
+/// 名字——那需要让用例自建库，是另一件事。
+fn checked_database_url(raw: String) -> String {
+    use std::str::FromStr as _;
+    let named_platform = sqlx::postgres::PgConnectOptions::from_str(&raw)
+        .ok()
+        .and_then(|options| options.get_database().map(str::to_string))
+        .is_some_and(|database| database == PLATFORM_DATABASE);
+    if named_platform {
+        panic!(
+            "{DATABASE_URL_ENV} points at the platform's own database \
+             `{PLATFORM_DATABASE}`: these suites create schemas, write rows and delete \
+             keys, so a throwaway database is the only thing they may run against"
+        );
+    }
+    raw
+}
+
+/// 平台自己在连的那个库名：所有业务 Pod 的 `COGNEVA_DATABASE_URL` 都指向它。
+const PLATFORM_DATABASE: &str = "cogneva";
 
 /// 这些用例要用的那个 Redis，没设就用开发机上的默认端口。
 ///
@@ -190,7 +222,40 @@ impl cog_core::SchemaRunner for SchemaTextRunner {
 
 #[cfg(test)]
 mod scratch_dir_tests {
-    use super::ScratchDir;
+    use super::{checked_database_url, ScratchDir};
+
+    /// 指向平台自己那个库就让用例停下，指向一次性库就放行。
+    ///
+    /// 两半都要判：只判「拒」的写法在把护栏删掉之后照样绿，只判「放行」的写法在一律
+    /// 拒绝时也照样绿，而一律拒绝会让每条活库用例在 CI 上停住——那是最容易被整段删掉的
+    /// 形状。
+    #[test]
+    fn a_url_pointing_at_the_platforms_own_database_is_refused() {
+        let refused = std::panic::catch_unwind(|| {
+            checked_database_url("postgres://u:p@127.0.0.1:5432/cogneva".to_string())
+        });
+        assert!(
+            refused.is_err(),
+            "the platform's own database is not a throwaway one"
+        );
+        let with_params = std::panic::catch_unwind(|| {
+            checked_database_url("postgres://u:p@127.0.0.1:5432/cogneva?sslmode=disable".into())
+        });
+        assert!(
+            with_params.is_err(),
+            "a query string does not hide which database it is"
+        );
+        for throwaway in [
+            "postgres://u:p@127.0.0.1:5432/cogneva_itest",
+            "postgres://u:p@127.0.0.1:5432/postgres",
+        ] {
+            assert_eq!(
+                checked_database_url(throwaway.to_string()),
+                throwaway,
+                "a throwaway database is handed back unchanged"
+            );
+        }
+    }
 
     /// 目录活着的时候能用，出了作用域什么都不留。
     ///
