@@ -409,6 +409,21 @@ const DISPATCH_TASK_KIND: &str = "change_ledger";
 /// loop in the graph.
 const DISPATCH_PROJECT_PREFIX: &str = "change-ledger:";
 
+/// The task kind of the row that anchors a dispatched change's project.
+///
+/// Not [`DISPATCH_TASK_KIND`]: a reader that counts dispatched work must not
+/// count the anchor, and a row the change-generation path is looked up by is
+/// the wrong row to hand anybody. The anchor is never executable, which is what
+/// keeps the queue off it whatever its kind says.
+const DISPATCH_PROJECT_ROOT_KIND: &str = "change_ledger_project";
+
+/// What a project anchor's id starts with.
+///
+/// Derived from the project key, so the same project always names the same
+/// anchor: the batch that carries it is idempotent, and a second pass finds the
+/// row it already wrote instead of opening a second root.
+const DISPATCH_PROJECT_ROOT_PREFIX: &str = "change-ledger-project:";
+
 /// The name a pass writes into `sources_unread` when the principle ledger could
 /// not be read.
 ///
@@ -927,7 +942,46 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
     // the board's column limits, the rollup, earned value, the WBS the project
     // face reports -- reads a tree with no parents and no sums.
     task.goal_id = Some(dispatch_project_key(row));
+    // Hang the change under the project's anchor rather than leaving it a root
+    // of its own. A project is the group of rows under one `goal_id` whose root
+    // is the row with no parent, and that root is what replanning hangs new
+    // work on; a group with two roots is refused outright, because picking one
+    // of them is a guess. Measured on 2026-10-29: 223 dispatched rows across 35
+    // projects, every one of them a root, six projects already holding two or
+    // more.
+    task.parent_task_id = Some(dispatch_project_root_id(&dispatch_project_key(row)));
     task
+}
+
+/// The row that anchors one dispatched change's project.
+///
+/// Submitted with every handover, not once: the graph skips an id it already
+/// holds, so the row costs a write on the first change of a project and nothing
+/// after that, and a pass never has to read the project back to learn whether
+/// its anchor exists.
+fn dispatch_project_root(row: &ChangeLedgerRow) -> Task {
+    let project = dispatch_project_key(row);
+    let mut root = Task::new(
+        dispatch_project_root_id(&project),
+        TaskType::Custom(DISPATCH_PROJECT_ROOT_KIND.into()),
+        serde_json::json!({
+            "goal": format!("dispatched changes under {project}"),
+            (cog_core::INPUT_TASK_KIND): DISPATCH_PROJECT_ROOT_KIND,
+        }),
+    );
+    root.goal_id = Some(project);
+    root.parent_task_id = None;
+    // The anchor is where work hangs, not work: nothing reads it as a change,
+    // and the queue must not start it.
+    root.is_executable = false;
+    root
+}
+
+fn dispatch_project_root_id(project: &str) -> String {
+    let scope = project
+        .strip_prefix(DISPATCH_PROJECT_PREFIX)
+        .unwrap_or(project);
+    format!("{DISPATCH_PROJECT_ROOT_PREFIX}{scope}")
 }
 
 /// The project a dispatched change belongs to: the part of the tree its check
@@ -3680,7 +3734,8 @@ async fn dispatch_pass(
                 }
                 let goal = dispatch_goal(row);
                 let task = dispatch_task(row, generation);
-                match orchestrator.submit_goal_auto(&goal, vec![task]).await {
+                let root = dispatch_project_root(row);
+                match orchestrator.submit_goal_auto(&goal, vec![root, task]).await {
                     Ok(_) => counts.submitted += 1,
                     Err(e) => {
                         counts.failed += 1;
@@ -5648,6 +5703,72 @@ mod tests {
         let root = with_scope("").expect("the repository root is still a project");
         assert!(root.starts_with(DISPATCH_PROJECT_PREFIX));
         assert_ne!(root, key);
+    }
+
+    /// A project with no root is a group replanning cannot hang work on, and a
+    /// project with two roots is refused rather than guessed at -- so a
+    /// dispatched change must not be a root of its own project.
+    ///
+    /// Measured on 2026-10-29: 223 dispatched rows across 35 projects, every one
+    /// of them a root, six projects already holding two or more. Those six read
+    /// as projects replanning declines to touch, which is the same finding as a
+    /// project with no work in it from the outside.
+    #[test]
+    fn a_dispatched_change_hangs_under_its_projects_anchor() {
+        let handed = row(ChangeState::Pending, Some(1_760_000_000));
+        let task = dispatch_task(&handed, 0);
+        let root = dispatch_project_root(&handed);
+
+        let project = task.goal_id.clone().expect("the change names its project");
+        assert_eq!(
+            root.goal_id.as_deref(),
+            Some(project.as_str()),
+            "the anchor belongs to the project it anchors: {root:?}"
+        );
+        assert_eq!(
+            root.parent_task_id, None,
+            "the anchor is the row with no parent: {root:?}"
+        );
+        assert_eq!(root.id, dispatch_project_root_id(&project));
+        assert!(
+            !root.is_executable,
+            "the anchor is where work hangs, not work: {root:?}"
+        );
+        assert_eq!(
+            task.parent_task_id.as_deref(),
+            Some(root.id.as_str()),
+            "the change hangs under the anchor, so the group holds exactly one root: {task:?}"
+        );
+    }
+
+    /// However many changes one part of the tree holds, they name one anchor: a
+    /// second anchor would be the second root that gets the whole project
+    /// refused, and the id has to be stable for the batch to stay idempotent.
+    #[test]
+    fn one_project_names_one_anchor_however_many_changes_it_holds() {
+        let scoped = |scope: &str, literal: &str| {
+            let mut handed = row(ChangeState::Pending, Some(1_760_000_000));
+            handed.identity = ChangeIdentity::new("grep", scope, literal);
+            handed
+        };
+        let first = scoped("crates", "fn a");
+        let second = scoped("crates/", "fn b");
+        let elsewhere = scoped("deploy", "fn c");
+
+        assert_eq!(
+            dispatch_project_root(&first).id,
+            dispatch_project_root(&second).id,
+            "one part of the tree is one project, so it names one anchor"
+        );
+        assert_eq!(
+            dispatch_task(&first, 0).parent_task_id,
+            dispatch_task(&second, 0).parent_task_id
+        );
+        assert_ne!(
+            dispatch_project_root(&first).id,
+            dispatch_project_root(&elsewhere).id,
+            "two parts of the tree are two projects, so two anchors"
+        );
     }
 
     /// A dispatched change declares a rank below the one a task lands on by
@@ -8628,12 +8749,19 @@ mod tests {
         assert_the_counts_add_up(&state);
         // And the handovers are on the graph: the re-arm goes out under the
         // first generation nothing holds, and the fresh row under generation 0.
+        // Each change travels with the anchor of the project it joins, because
+        // a change that named no parent would be a root of its own project.
+        let mut expected = vec![at(&store.rows[1], 1), at(&store.rows[2], 0)];
+        for row in [&store.rows[1], &store.rows[2]] {
+            let project = dispatch_task(row, 0)
+                .goal_id
+                .expect("a dispatched change names its project");
+            expected.push(dispatch_project_root_id(&project));
+        }
+        expected.sort();
         let mut handed_over = graph.submitted();
         handed_over.sort();
-        assert_eq!(
-            handed_over,
-            vec![at(&store.rows[1], 1), at(&store.rows[2], 0)]
-        );
+        assert_eq!(handed_over, expected);
     }
 
     /// One pass hands over a bounded slice, and the rows it leaves are counted
@@ -8681,7 +8809,12 @@ mod tests {
             "the pass handed over its slice and no more"
         );
         assert_eq!(state.held_back, 1, "and the row past the slice is counted");
-        assert_eq!(graph.submitted().len(), HANDOVERS_PER_PASS);
+        // Twice the changes, because every handover carries its project's
+        // anchor and each row here is a project of its own. `submitted` still
+        // counts changes: an anchor is a row this pass wrote, not work it
+        // handed over, and counting it would put the arithmetic above off the
+        // pending set it closes on.
+        assert_eq!(graph.submitted().len(), HANDOVERS_PER_PASS * 2);
         assert_the_counts_add_up(&state);
     }
 
