@@ -308,17 +308,16 @@ for (obj, key), entries in sorted(declared.items()):
                 f"{TEMPLATES[obj]} 声明 {holder} 读 {obj}/{key}，渲染产物里找不到这个"
                 "读者：声明陈旧了，删掉它或改回真实读者")
 
-# 3) 带外片的 role 写权限只能落在安全网关这一个主体上。
-#    多一个能 patch 的主体，等于把「代持带外凭证」复制一份；而清单上看起来只是
-#    多了一个对象名，读清单的人不会意识到那是一个能改写上游密钥与平台 token 的人。
+# 3) 整对象访问（Role 授权、整卷挂载、envFrom 整片）只能落在安全网关这一个主体上：
+#    带外片里每一把都是能对外发号的身份，多一个能 patch 的人等于把「代持」复制一份；
+#    而清单上看起来只是多了一个对象名。内部片同理——整片挂上就不必再逐键判断。
 GW_SA = "ServiceAccount/cogneva-security-gateway"
 for (obj, key, path, holder), access in sorted(observed.items()):
-    if key != "*" or path != "role":
+    if key != "*" or holder == GW_SA:
         continue
-    if holder != GW_SA and ("write" in access or obj == OBJS[1]):
-        failures.append(
-            f"{holder} 对 {obj} 有整对象权限（{access}）：整对象授权只该给 {GW_SA}，"
-            "其余主体的读写应当经 secret_write::forward 交给网关")
+    failures.append(
+        f"{holder} 对 {obj} 有整对象访问（路径 {path}，{access}）：整对象授权只该给 "
+        f"{GW_SA}，其余主体的读写应当经 secret_write::forward 交给网关")
 
 if failures:
     print("CREDENTIAL HOLDER SURFACE FAIL：", file=sys.stderr)

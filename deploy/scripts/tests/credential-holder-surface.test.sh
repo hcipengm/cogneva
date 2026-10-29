@@ -16,6 +16,7 @@
 #   1. 真树 -> 绿，并报出持有者数与写者声明键数（不是空跑）；
 #   2. 新出现一个持有者（主应用多挂一个带外键，三形态都改）-> 红，点名那个持有者与键；
 #   2b. 只在一种形态里多挂 -> 红，报出形态之间的持有面差异；
+#   2c. 整片挂上带外 Secret（整卷/int 对象读法）-> 红，整对象访问只给网关；
 #   3. 持有者消失了而声明还在 -> 红，点名那条陈旧的声明；
 #   4. 声明里写了个树上不存在的读者 -> 红（声明漂移）；
 #   5. 写者声明的键头上没有 `# readers:` 行 -> 红，点名那个键；
@@ -123,6 +124,7 @@ grep -q "渲染产物里 Deployment/cogneva 持有 cogneva-secrets-oob/github-to
 
 # 2b) 只在一种形态里多挂：另一形态的清单里永远看不见，所以要按形态比
 mirror
+
 python3 - "${work}/root/deploy/rendered/k3s-single/41-deployment-cogneva.yaml" <<'PY'
 import sys
 p = sys.argv[1]
@@ -144,6 +146,23 @@ PY
 out="$(run_gate)" && fail "只在一种形态里多挂时应当红，实际绿：${out}"
 grep -q "\[k3s-single\] 比 \[k3s-multi\] 多一个持有者：Deployment/cogneva 持有" <<<"${out}" \
   || fail "没报出形态之间的持有面差异：${out}"
+
+# 2c) 整片挂上带外 Secret（不经 env 的键级读法）：整对象访问只有网关能有，
+#     所以这条不走键头上的声明，走的是「谁都不许整片拿」那条判据。
+mirror
+for prof in "${PROFILES[@]}"; do
+  edit "${work}/root/deploy/rendered/${prof}/41-deployment-cogneva.yaml" \
+    "      volumes:
+        - name: data" \
+    "      volumes:
+        - name: leaked-oob
+          secret:
+            secretName: cogneva-secrets-oob
+        - name: data"
+done
+out="$(run_gate)" && fail "整片挂上带外 Secret 时应当红，实际绿：${out}"
+grep -q "Deployment/cogneva 对 cogneva-secrets-oob 有整对象访问（路径 volume，read）" <<<"${out}" \
+  || fail "没报出整片挂载的越界：${out}"
 
 # 3) 持有者消失而声明还在
 mirror
@@ -226,7 +245,7 @@ for prof in "${PROFILES[@]}"; do
     name: cogneva-evolution"
 done
 out="$(run_gate)" && fail "整对象权限给了别的身份时应当红，实际绿：${out}"
-grep -q "ServiceAccount/cogneva-evolution 对 cogneva-secrets-oob 有整对象权限" <<<"${out}" \
+grep -q "ServiceAccount/cogneva-evolution 对 cogneva-secrets-oob 有整对象访问" <<<"${out}" \
   || fail "没报出越界的整对象授权：${out}"
 
 # 9) api 路径的代码指针锈了（文件不在）
@@ -247,4 +266,4 @@ out="$(run_gate)" && fail "指针指向的文件不再提这个键时应当红�
 grep -q "的 API 读点 'crates/cog-gateway/src/contribution_admin.rs' 里没有出现这个键名" <<<"${out}" \
   || fail "没报出锈成空指针的读点：${out}"
 
-echo "OK: credential-holder-surface 门禁定向测试通过（1 绿 + 10 红，各点名一处）"
+echo "OK: credential-holder-surface 门禁定向测试通过（1 绿 + 11 红，各点名一处）"
