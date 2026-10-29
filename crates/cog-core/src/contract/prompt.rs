@@ -136,6 +136,49 @@ pub fn render_varying_half(payload: &serde_json::Value) -> String {
     format!("{{{}}}", members.join(","))
 }
 
+/// The request block exactly as [`render_varying_half`] writes it, if the
+/// payload carries one.
+///
+/// A caller that wants to know whether the conversation already holds this
+/// request has to compare against the **rendered** spelling (`"task":{…}`),
+/// not the value alone: the value also appears anywhere else the same text was
+/// quoted, and a substring match on it would claim the request was already sent
+/// when only a fragment of it was.
+pub fn request_members(payload: &serde_json::Value) -> Option<String> {
+    let fields = payload.as_object()?;
+    let key_text = |key: &str| serde_json::Value::String(key.to_string()).to_string();
+    let members: Vec<String> = REQUEST_KEYS
+        .iter()
+        .filter_map(|key| {
+            fields
+                .get(*key)
+                .map(|value| format!("{}:{}", key_text(key), value))
+        })
+        .collect();
+    (!members.is_empty()).then(|| members.join(","))
+}
+
+/// Render what this attempt adds, leaving the request block out.
+///
+/// For a second attempt at the same task the request is byte-identical to the
+/// one already in the conversation. Re-sending it adds nothing the model can
+/// read twice and pays for every byte of it again: on the measured traffic a
+/// fifth of the bytes added per turn were these repeated request blocks.
+/// `None` when nothing would be left — a user message that says only `{}` is a
+/// turn that says nothing.
+pub fn render_varying_half_after_request(payload: &serde_json::Value) -> Option<String> {
+    let fields = payload.as_object()?;
+    let key_text = |key: &str| serde_json::Value::String(key.to_string()).to_string();
+    let mut members: Vec<String> = Vec::with_capacity(fields.len());
+    for (key, value) in fields {
+        if REQUEST_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        members.push(format!("{}:{}", key_text(key), value));
+    }
+    (!members.is_empty()).then(|| format!("{{{}}}", members.join(",")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +199,34 @@ mod tests {
         assert!(payload.get(PROMPT_CONTRACT_KEY).is_none());
         assert_eq!(payload["task"]["id"], "t1");
         assert_eq!(payload["context"]["attempt"], 2);
+    }
+
+    /// 请求块的两种渲染必须逐字节对得上。
+    ///
+    /// 调用方拿 `request_members` 的串去比对对话里已经有的内容，再决定还发不
+    /// 发这一块：这个串与真正发出去的那一段差一个字节，判断就会反过来——要么
+    /// 每次都重发（等于没改），要么该发的时候不发（这一轮没有任务可做）。
+    #[test]
+    fn the_request_members_are_the_bytes_the_renderer_writes() {
+        let payload = serde_json::json!({"task": {"id": "t1"}, "context": {"attempt": 2}});
+        let members = request_members(&payload).expect("the request block");
+        assert!(
+            render_varying_half(&payload).starts_with(&format!("{{{members},")),
+            "请求块必须原样出现在渲染结果的开头"
+        );
+        assert_eq!(
+            render_varying_half_after_request(&payload).as_deref(),
+            Some("{\"context\":{\"attempt\":2}}")
+        );
+    }
+
+    /// 只有请求、没有别的：不剩任何东西可发。
+    #[test]
+    fn a_payload_with_only_the_request_has_nothing_left_to_send() {
+        assert!(
+            render_varying_half_after_request(&serde_json::json!({"task": {"id": "t1"}})).is_none(),
+            "空消息就是一次什么都没说的回合"
+        );
     }
 
     #[test]

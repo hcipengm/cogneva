@@ -1266,9 +1266,25 @@ impl AgentRuntime {
         // The varying half is rendered request-first, so the attempt counter
         // that used to open it does not sit in front of the one block every
         // attempt of a task shares. See `render_varying_half`.
-        self.context.add_message(Message::user(
-            cog_core::contract::prompt::render_varying_half(&payload),
-        ));
+        //
+        // 同一次任务的第二个 attempt 起，请求那一块与对话里已有的逐字节相同。
+        // 再发一遍不加任何模型能读到的新东西，却要按整块重新付一次钱——测过
+        // 的那段流量里，每轮新增字节有五分之一是这些重复的请求块。所以只在
+        // 投影里找不到它时整块发；找得到就只发这一次尝试新增的那一半。
+        // 看的是 `messages()` 而不是 `history`：被裁掉的请求模型这一轮确实读
+        // 不到，那时必须整块重发。
+        let repeated_request =
+            cog_core::contract::prompt::request_members(&payload).is_some_and(|sent| {
+                self.context
+                    .messages()
+                    .iter()
+                    .any(|m| m.content().contains(&sent))
+            });
+        let rendered = repeated_request
+            .then(|| cog_core::contract::prompt::render_varying_half_after_request(&payload))
+            .flatten()
+            .unwrap_or_else(|| cog_core::contract::prompt::render_varying_half(&payload));
+        self.context.add_message(Message::user(rendered));
 
         // Guardrail refusals, counted per identical call for this run. A refusal
         // is a decision about the call as written: the same name and the same
@@ -4204,19 +4220,15 @@ mod tests {
         );
     }
 
-    /// The user message opens on the request, so the block two attempts share
-    /// reaches past the attempt counter that used to lead it.
+    /// 同一次任务的第二个 attempt 不再把请求整块重发：它已经在对话里。
     ///
-    /// The system message is the same in both attempts either way; what differs
-    /// is how much of *this* message the upstream cache can hold. Read as a
-    /// prefix length rather than as a shape, because the length is the thing the
-    /// cache acts on: the old order shared `{"context":{"attempt":`, and
-    /// everything after it — the task, its input — was bought again at full
-    /// price on every attempt of the same task.
+    /// 重复的那一块对模型没有新东西，却按整块的字节数再付一次钱；测过的
+    /// 那段流量里，每轮新增的字节有五分之一就是这些重复的请求块。第一个
+    /// attempt 仍以请求开头（那时对话里还没有它）。
     #[tokio::test]
-    async fn two_attempts_share_the_body_of_the_user_message() {
+    async fn a_second_attempt_does_not_resend_the_request_block() {
         let llm = RecordingLlm::default();
-        let mut runtime = census_runtime("contract-body");
+        let mut runtime = census_runtime("contract-repeat");
         for attempt in [1, 2] {
             runtime
                 .run(contract_input(attempt, "Emit JSON only"), &llm)
@@ -4233,18 +4245,51 @@ mod tests {
                 .content()
         };
         let (first, second) = (body_of(&calls[0]), body_of(&calls[1]));
-        let shared = first
-            .bytes()
-            .zip(second.bytes())
-            .take_while(|(a, b)| a == b)
-            .count();
         assert!(
             first.starts_with("{\"task\":"),
-            "the request must open the message: {first}"
+            "第一个 attempt 的请求必须开头就是它：{first}"
         );
         assert!(
-            shared > "{\"context\":{\"attempt\":".len(),
-            "the two attempts share only {shared} bytes of the user message"
+            !second.contains("\"task\":"),
+            "请求已经在对话里，再发一遍就是为同一段字节付第二次钱：{second}"
+        );
+        assert!(
+            second.contains("\"attempt\":2"),
+            "这一次尝试新增的那一半必须还在：{second}"
+        );
+    }
+
+    /// 换了任务的 attempt 必须整块发：那不是重复，是模型还没读过的请求。
+    #[tokio::test]
+    async fn a_different_task_is_sent_in_full() {
+        let llm = RecordingLlm::default();
+        let mut runtime = census_runtime("contract-new-task");
+        runtime
+            .run(contract_input(1, "Emit JSON only"), &llm)
+            .await
+            .expect("the run delivers");
+        runtime
+            .run(
+                serde_json::json!({
+                    cog_core::contract::prompt::PROMPT_CONTRACT_KEY: {"instructions": "Emit JSON only"},
+                    "task": {"id": "t2"},
+                    "context": {"attempt": 2},
+                }),
+                &llm,
+            )
+            .await
+            .expect("the run delivers");
+
+        let calls = llm.calls();
+        let second = calls[1]
+            .iter()
+            .rev()
+            .find(|m| matches!(m, Message::User { .. }))
+            .expect("a user message")
+            .content();
+        assert!(
+            second.contains("\"id\":\"t2\""),
+            "换了的请求必须整块出现，否则这一轮就没有任务可做：{second}"
         );
     }
 
