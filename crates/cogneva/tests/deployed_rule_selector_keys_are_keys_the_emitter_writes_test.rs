@@ -43,7 +43,9 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
-use common::routes::repo_root;
+use common::lex::Dialect;
+use common::routes::{matching_brace, repo_root};
+use common::rules::promql_expressions;
 
 use common::rust_production::{
     production_lines_keeping_comments, production_sources, relative_name,
@@ -510,36 +512,22 @@ fn selector_pairs(expression: &str) -> BTreeSet<(String, String)> {
             continue;
         };
         let rest = expression[after_metric..].trim_start();
-        let Some(body) = rest.strip_prefix('{') else {
+        if !rest.starts_with('{') {
+            continue;
+        }
+        // `rest` 是 `expression` 的后缀切片，所以开括号的字节下标是两个长度之差：
+        // 共享的配平件要的是绝对下标，按相对偏移喂进去会从别处开始数。
+        let open = expression.len() - rest.len();
+        let Some(close) = matching_brace(&expression, open, Dialect::Rust) else {
             continue;
         };
-        let Some(close) = matching_brace(body) else {
-            continue;
-        };
-        for matcher in split_matchers(&body[..close]) {
+        for matcher in split_matchers(&expression[open + 1..close]) {
             if let Some(key) = matcher_key(matcher) {
                 out.insert((metric.to_string(), key.to_string()));
             }
         }
     }
     out
-}
-
-/// `{` 之后到配对的 `}` 之前的长度，引号里的 `}` 不算。
-fn matching_brace(body: &str) -> Option<usize> {
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    let mut quoted = false;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if quoted => i += 1,
-            b'"' => quoted = !quoted,
-            b'}' if !quoted => return Some(i),
-            _ => {}
-        }
-        i += 1;
-    }
-    None
 }
 
 /// 选择子里的每一段都形如 `键<op>"值"`；按引号外的逗号切成段。
@@ -573,29 +561,6 @@ fn matcher_key(matcher: &str) -> Option<&str> {
         Some(key)
     } else {
         None
-    }
-}
-
-/// 一条 promql 表达式，从规则文档里任意深度的 `promql` 键取出。
-fn promql_expressions(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                if key == "promql" {
-                    if let Some(text) = child.as_str() {
-                        out.push(text.to_string());
-                    }
-                } else {
-                    promql_expressions(child, out);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                promql_expressions(item, out);
-            }
-        }
-        _ => {}
     }
 }
 

@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 mod common;
 
 use common::routes::repo_root;
+use common::rules::promql_expressions;
 
 use common::rust_production::{production_sources, relative_name};
 
@@ -111,29 +112,6 @@ const WRITTEN_BY_CODE: &[(&str, &str)] = &[
     ("what", "crates/cog-reflection/src/build_gate/mod.rs"),
     ("worktree", "crates/cog-reflection/src/workspace.rs"),
 ];
-
-/// One `promql` string anywhere in the rule document.
-fn promql_expressions(value: &serde_json::Value, out: &mut Vec<String>) {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                if key == "promql" {
-                    if let Some(text) = child.as_str() {
-                        out.push(text.to_string());
-                    }
-                } else {
-                    promql_expressions(child, out);
-                }
-            }
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                promql_expressions(item, out);
-            }
-        }
-        _ => {}
-    }
-}
 
 /// The end of the parenthesised group that starts at `open`, inclusive of the
 /// closing paren.
