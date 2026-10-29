@@ -608,9 +608,12 @@ jobs:
       # name: a name filter that matches nothing exits 0, so the step would go
       # green after a rename having run nothing, and the ignored-test corpus
       # contract refuses to read a filter it cannot resolve to a test it knows.
-      # There is one ignore-marked test in this crate's lib, so the whole-lib
-      # form costs nothing today.
-      - name: Live-DB watcher adoption and retirement reach every row
+      #
+      # The second test under this step asks the same server a different
+      # question: whether a close is decided by the local miss count alone or by
+      # the row's shared sighting clock. Both need a database, so one step runs
+      # both.
+      - name: Live-DB watcher adoption, retirement and close
         run: cargo test -p cog-observability --lib -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres

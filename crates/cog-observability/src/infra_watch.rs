@@ -377,6 +377,10 @@ async fn tick(
     holding: &mut HashMap<String, Instant>,
     missing: &mut HashMap<String, u32>,
 ) {
+    // Keys that have missed long enough to be considered for closing; the
+    // decision itself is taken once, after every rule, because it is a question
+    // about the shared rows rather than about one rule's pass.
+    let mut due: Vec<String> = Vec::new();
     for rule in &config.rules {
         let series = match query_prometheus(http, &config.prometheus_url, &rule.promql).await {
             Ok(series) => series,
@@ -464,17 +468,89 @@ async fn tick(
         for key in &plan.close {
             let count = missing.entry(key.clone()).or_insert(0);
             *count += 1;
-            if *count < MISSING_TICKS_BEFORE_CLOSE {
-                continue;
+            if *count >= MISSING_TICKS_BEFORE_CLOSE {
+                due.push(key.clone());
             }
-            // Keep believing it until the row is actually closed: the close
-            // retry lives in this set, and dropping the key here is what turns
-            // one failed write into a row that stays `firing` for good.
-            let closed = resolve(key, outlets).await;
-            settle_close(known_firing, key, closed);
-            if closed {
-                missing.remove(key);
+        }
+    }
+    close_unattended(&due, config, outlets, known_firing, missing).await;
+}
+
+/// Close the rows no pass has listed for long enough, once nobody is sighting
+/// them either.
+///
+/// The miss count is this process's own; the row is not. Two processes carry
+/// the same rules (the app and the evolution workload both start a watcher),
+/// and a rolling replacement overlays two generations, so "this pass did not
+/// list the series" can be true for one writer while another is reporting the
+/// same key every tick. Deciding the close from the local count alone lets the
+/// half that cannot see it end a condition the other half keeps confirming,
+/// which then reads downstream as a resolve and an immediate re-fire with a
+/// fresh `fired_at` -- a claim that something ended and came back.
+///
+/// So the local count only says the key is a candidate; the store's
+/// `last_seen_at` decides. That clock is advanced by whichever writer still
+/// sees the series, so a row nobody is asserting goes quiet while a row
+/// asserted elsewhere stays fresh and stays open. A row with no sighting at
+/// all is closed: it is the orphan an adoption otherwise strands.
+///
+/// Without a store there is nothing shared to ask, and the local count is the
+/// only reading available.
+async fn close_unattended(
+    due: &[String],
+    config: &InfraWatchConfig,
+    outlets: &InfraWatchOutlets,
+    known_firing: &mut HashSet<String>,
+    missing: &mut HashMap<String, u32>,
+) {
+    if due.is_empty() {
+        return;
+    }
+    // One tick of margin either side of the count: a writer that reports every
+    // tick leaves a clock at most one interval old, while a key this process
+    // stopped seeing carries a clock at least this many intervals old.
+    let stale_after = chrono::Duration::seconds(
+        (config.poll_interval_secs.max(1) * u64::from(MISSING_TICKS_BEFORE_CLOSE)) as i64,
+    );
+    let sighted_elsewhere: HashSet<String> = match &outlets.store {
+        Some(store) => {
+            let rules: Vec<String> = config.rules.iter().map(|r| r.name.clone()).collect();
+            match store.firing_rows_for_rules(&rules).await {
+                Ok(rows) => {
+                    let now = Utc::now();
+                    rows.into_iter()
+                        .filter(|row| due.iter().any(|key| key == &row.dedup_key))
+                        .filter(|row| match row.last_seen_at {
+                            // A clock that is still moving belongs to somebody
+                            // else's sighting, not to the end of a condition.
+                            Some(seen) => now.signed_duration_since(seen) < stale_after,
+                            None => false,
+                        })
+                        .map(|row| row.dedup_key)
+                        .collect()
+                }
+                Err(e) => {
+                    // A row list that could not be read is not a list of rows
+                    // nobody is sighting; closing on it would turn one store
+                    // error into every candidate reporting recovery.
+                    warn!(error = %e, "infra watch: could not read the sighting clocks; leaving rows open");
+                    return;
+                }
             }
+        }
+        None => HashSet::new(),
+    };
+    for key in due {
+        if sighted_elsewhere.contains(key) {
+            continue;
+        }
+        // Keep believing it until the row is actually closed: the close retry
+        // lives in this set, and dropping the key here is what turns one failed
+        // write into a row that stays `firing` for good.
+        let closed = resolve(key, outlets).await;
+        settle_close(known_firing, key, closed);
+        if closed {
+            missing.remove(key);
         }
     }
 }
@@ -3083,6 +3159,113 @@ mod tests {
             "a retired rule's row older than the read limit would otherwise \
              never be settled"
         );
+
+        cog_test_support::drop_schema(&url, &schema).await;
+    }
+
+    /// A row another writer is still sighting is not this writer's to close.
+    ///
+    /// The two workloads carry the same rules with no lease between them, so a
+    /// pass that does not list a series says only that *this* watcher cannot
+    /// see it. `last_seen_at` is the shared record of whether anybody still
+    /// can. Closing on the local count alone ends a condition the other half
+    /// keeps confirming, and the re-fire that follows arrives with a fresh
+    /// `fired_at` -- a claim that something ended and came back.
+    #[tokio::test]
+    #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+    async fn a_row_another_writer_is_still_sighting_is_not_closed() {
+        let url = cog_test_support::database_url();
+        let schema = cog_test_support::own_schema(&url, "alert_sighted").await;
+        let pool = cog_test_support::schema_pool(&url, &schema).await;
+        let store = PostgresAlertStore::new(pool.clone());
+        let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+        store
+            .init_schema(&schema_runner)
+            .await
+            .expect("the alert DDL runs in one piece");
+
+        let key = "contended_rule:pod=a";
+        // Fresh clock: the other writer reported this key on the tick this one
+        // is deciding about.
+        sqlx::query(
+            "INSERT INTO alerts (id, rule, dedup_key, severity, state, message, labels, \
+             fired_at, updated_at, last_seen_at) VALUES \
+             ('c-1', 'contended_rule', 'contended_rule:pod=a', 'warning', 'firing', 'm', \
+              '{}'::jsonb, now() - interval '1 hour', now(), now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("the contended row is written");
+
+        let mut config = test_config(3);
+        config.rules = vec![test_rule("contended_rule")];
+        let outlets = InfraWatchOutlets {
+            store: Some(Arc::new(PostgresAlertStore::new(pool.clone()))),
+            notifier: None,
+            metrics: None,
+        };
+        let mut known_firing: HashSet<String> = HashSet::from([key.to_string()]);
+        let mut missing: HashMap<String, u32> =
+            HashMap::from([(key.to_string(), MISSING_TICKS_BEFORE_CLOSE)]);
+
+        close_unattended(
+            &[key.to_string()],
+            &config,
+            &outlets,
+            &mut known_firing,
+            &mut missing,
+        )
+        .await;
+
+        let state: String = sqlx::query_scalar("SELECT state FROM alerts WHERE dedup_key = $1")
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .expect("the row is read back");
+        assert_eq!(
+            state, "firing",
+            "另一个写者这一拍还在断言的行不是本进程的，本地漏了几拍也关不得"
+        );
+        assert!(
+            known_firing.contains(key),
+            "行还开着，本进程就得继续相信它，否则再没有东西替它重试"
+        );
+        assert_eq!(
+            missing.get(key),
+            Some(&MISSING_TICKS_BEFORE_CLOSE),
+            "没关成的候选要留着计数，下一拍接着问"
+        );
+
+        // The clock goes quiet: nobody is sighting this key any more, and the
+        // same local count now does decide the close.
+        sqlx::query(
+            "UPDATE alerts SET last_seen_at = now() - interval '1 hour' WHERE dedup_key = $1",
+        )
+        .bind(key)
+        .execute(&pool)
+        .await
+        .expect("the clock is moved back");
+
+        close_unattended(
+            &[key.to_string()],
+            &config,
+            &outlets,
+            &mut known_firing,
+            &mut missing,
+        )
+        .await;
+
+        let state: String = sqlx::query_scalar("SELECT state FROM alerts WHERE dedup_key = $1")
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .expect("the row is read back");
+        assert_eq!(
+            state, "resolved",
+            "没人再断言的行必须被关掉，否则它永远停在 firing"
+        );
+        assert!(!known_firing.contains(key), "关掉之后不许再留着");
+        assert!(!missing.contains_key(key), "关掉之后计数也该清掉");
 
         cog_test_support::drop_schema(&url, &schema).await;
     }
