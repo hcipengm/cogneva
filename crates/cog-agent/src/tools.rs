@@ -76,6 +76,40 @@ pub fn caller_agent_id() -> Option<String> {
     CALLER_AGENT_ID.try_with(|id| id.clone()).ok()
 }
 
+/// 按行切出 `read_file` 调用方要的那一段。
+///
+/// 整份读回来再整份塞进 tool_result 的代价不在磁盘上：这份正文进了上下文，
+/// 之后每一轮都要重发一遍，还要再被上游缓存或不缓存各算一次钱。调用方大多
+/// 只想要一段（某个函数、报错所在的那几行）。`offset` 与 `limit` 都不给时
+/// 原样返回整份，老调用方与老断言不受影响；给了就带上文件的总行数与「后面
+/// 还有没有」，只回切片不回总行数，读的人会以为文件到那里就结束了。
+fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_json::Value {
+    if offset.is_none() && limit.is_none() {
+        return serde_json::json!({ "content": text });
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let start = offset.unwrap_or(1).max(1) as usize;
+    let end = match limit {
+        Some(want) => start
+            .saturating_sub(1)
+            .saturating_add(want as usize)
+            .min(total),
+        None => total,
+    };
+    let slice: Vec<&str> = if start > total {
+        Vec::new()
+    } else {
+        lines[start - 1..end.max(start - 1)].to_vec()
+    };
+    serde_json::json!({
+        "content": slice.join("\n"),
+        "start_line": start,
+        "total_lines": total,
+        "has_more": end < total,
+    })
+}
+
 /// Why a tool call produced no value.
 ///
 /// A guardrail refusal is kept apart from a tool failure on purpose. A refusal is
@@ -401,6 +435,10 @@ impl ToolRegistry {
                             }
                         }
                     };
+                // 行范围在参数被交给沙箱之前取出来：`input` 会把整份参数搬走，
+                // 而读回结果时还要用它切出调用方要的那一段。
+                let read_offset = arguments.get("offset").and_then(|v| v.as_u64());
+                let read_limit = arguments.get("limit").and_then(|v| v.as_u64());
                 let req = SandboxRequest {
                     task_id: scope
                         .map(|s| s.task_id.clone())
@@ -432,7 +470,7 @@ impl ToolRegistry {
                     })),
                     cog_core::ShellOp::ReadFile => {
                         if code == 0 {
-                            Ok(serde_json::json!({ "content": stdout }))
+                            Ok(read_window(&stdout, read_offset, read_limit))
                         } else {
                             Err(cog_core::SFError::IO(stderr).into())
                         }
@@ -1208,6 +1246,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 带行范围读时只回那一段，但必须同时说清文件有多长、后面还有没有：
+    /// 只回切片，读到的人会以为文件到那里就结束了；不回这一段，整份正文就
+    /// 要进上下文，并且之后每一轮都跟着重发。
+    #[tokio::test]
+    async fn read_file_returns_the_requested_line_window_and_says_what_it_left() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-window-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lines.txt");
+        let path = path.to_str().unwrap();
+        let body: String = (1..=10).map(|i| format!("line {i}\n")).collect();
+
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        cog_core::ToolRegistry::register(&registry, builtins::read_file());
+        cog_core::ToolRegistry::register(&registry, builtins::write_file());
+        registry
+            .execute(
+                "write_file",
+                serde_json::json!({"path": path, "content": body}),
+            )
+            .await
+            .unwrap();
+
+        let part = registry
+            .execute(
+                "read_file",
+                serde_json::json!({"path": path, "offset": 3, "limit": 4}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(part["content"], "line 3\nline 4\nline 5\nline 6");
+        assert_eq!(part["total_lines"], 10);
+        assert_eq!(part["has_more"], true);
+
+        let tail = registry
+            .execute("read_file", serde_json::json!({"path": path, "offset": 9}))
+            .await
+            .unwrap();
+        assert_eq!(tail["content"], "line 9\nline 10");
+        assert_eq!(tail["has_more"], false);
+
+        let whole = registry
+            .execute("read_file", serde_json::json!({"path": path}))
+            .await
+            .unwrap();
+        assert_eq!(whole["content"], body.as_str());
+        assert!(
+            whole.get("total_lines").is_none(),
+            "不带范围的老调用形状不变"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The tool list a request carries must come out in name order, whatever
     /// order the definitions were registered in.
     ///
@@ -1600,12 +1691,25 @@ pub mod builtins {
             name: "read_file".into(),
             description: "Read the contents of a file. Relative paths resolve against \
                           the task's working directory, which is the repository root \
-                          when a checkout is provisioned."
+                          when a checkout is provisioned. Pass offset and/or limit \
+                          to read one line range of a long file instead of the whole \
+                          thing; the result then also reports the file's total line \
+                          count and whether more remains."
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "File path" }
+                    "path": { "type": "string", "description": "File path" },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "1-based line to start at; omit to start at the first line"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many lines to return; omit to read to the end of the file"
+                    }
                 },
                 "required": ["path"]
             }),
