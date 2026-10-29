@@ -744,6 +744,19 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             self.alert_store.is_some(),
         )
         .await;
+        // The same list, with the reason each kind is or is not on it. The
+        // family above can only name the kinds that work: a channel somebody
+        // declared with nothing to send to is absent from it, which is
+        // indistinguishable from a kind nobody configured. Written here so the
+        // cells exist from the first pass, and again on every sweep of the
+        // bridge below so a process that outlives the window keeps saying it.
+        let alert_resolutions = obs_cfg.alertmanager.channel_resolutions();
+        crate::config::publish_channel_resolutions(
+            ctx.consume_service::<dyn cog_core::MetricsBackend>()
+                .as_ref(),
+            &alert_resolutions,
+        )
+        .await;
 
         // ── Alert bridge: notification outlets + persistent state machine ──
         let alert_store = self.alert_store.clone();
@@ -851,6 +864,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                         .unwrap_or_default();
                     let bridged = spawn_alert_bridge(
                         alert_channels.clone(),
+                        alert_resolutions.clone(),
                         alert_timeout,
                         http_client,
                         alert_store,
@@ -1472,6 +1486,12 @@ const ALERT_BELL_BATCH: i64 = 200;
 #[allow(clippy::too_many_arguments)]
 fn spawn_alert_bridge<S>(
     channels: Vec<AlertChannel>,
+    // What the configuration said about every registered kind. Published from
+    // this loop because it is the one that already runs wherever alerts do,
+    // and the `no_recipients` state it reports is the state in which this loop
+    // has nothing to send: a publication tied to a dispatch would never be
+    // written for exactly the channels it describes.
+    resolutions: Vec<(&'static str, crate::config::ChannelResolution)>,
     timeout_secs: u64,
     http_client: Option<Arc<dyn cog_core::HttpClient>>,
     store: Option<Arc<S>>,
@@ -1514,6 +1534,7 @@ where
                 manager_for_task.clone(),
                 metrics.clone(),
                 Arc::clone(&alert_rx),
+                resolutions.clone(),
                 row_stale_after,
                 sweep_every,
                 beat,
@@ -1600,6 +1621,7 @@ async fn run_alert_bridge(
     manager: Option<Arc<crate::alerts::AlertManager>>,
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
     alert_rx: Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<cog_core::SupervisorEvent>>>,
+    resolutions: Vec<(&'static str, crate::config::ChannelResolution)>,
     row_stale_after: std::time::Duration,
     sweep_every: std::time::Duration,
     beat: cog_core::loop_health::Beat,
@@ -1609,6 +1631,10 @@ async fn run_alert_bridge(
     if let Some(store) = store.as_deref() {
         close_unrefreshed_rows(store, row_stale_after, "start").await;
     }
+    // 配置解析的读数随这条环一起发：它描述的是「这个进程把每个频道判成了什么」，
+    // 与有没有东西要投递无关。只在构造点写一次会把它变成一次启动事件——进程活得
+    // 久，读数就过期；所以启动这一拍写一次，之后每一拍扫描再写一次。
+    crate::config::publish_channel_resolutions(metrics.as_ref(), &resolutions).await;
     // 进程活着的这段时间也要收，而且这才是常态的一半：舰队的名字本来就在轮换（短命
     // squad 成员、每次进化都换名的 agent）。一个 id 离开注册表之后，它的行既不会被本
     // 进程再刷新、也不会被谁收掉——只留启动那一收，行数就只在重启时才掉一次，而读数
@@ -1631,7 +1657,7 @@ async fn run_alert_bridge(
                 _ = stop.wait() => return,
                 // 收排在事件之前：事件风暴里它永远轮不到，而风暴正是行最多的时候。
                 // 它只是一句 UPDATE，插进来的延迟以毫秒计。
-                _ = sweep.tick(), if store.is_some() => BridgeWake::Sweep,
+                _ = sweep.tick() => BridgeWake::Sweep,
                 received = rx.recv() => BridgeWake::Event(Box::new(received)),
             }
         };
@@ -1640,6 +1666,9 @@ async fn run_alert_bridge(
                 if let Some(store) = store.as_deref() {
                     close_unrefreshed_rows(store, row_stale_after, "tick").await;
                 }
+                // 没有表的部署也照样有这一拍：配置解析的读数要在安静的系统上
+                // 继续移动，而安静正是它最该说得出话的时候。
+                crate::config::publish_channel_resolutions(metrics.as_ref(), &resolutions).await;
                 continue;
             }
             BridgeWake::Event(received) => *received,
@@ -1867,6 +1896,10 @@ mod tests {
     #[derive(Default)]
     struct Gauges {
         calls: std::sync::Mutex<Vec<GaugeWrite>>,
+        /// Counter writes, kept apart from the gauge list: the families here
+        /// are published through both, and a reader of one must not be handed
+        /// the other's rows.
+        counters: std::sync::Mutex<Vec<GaugeWrite>>,
     }
 
     impl Gauges {
@@ -1922,10 +1955,14 @@ mod tests {
 
         async fn record_counter(
             &self,
-            _name: cog_core::MetricName,
-            _value: f64,
-            _labels: HashMap<String, String>,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
         ) -> cog_core::SFResult<()> {
+            self.counters
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
             Ok(())
         }
 
@@ -2091,6 +2128,68 @@ mod tests {
             vec![(ALERT_CHANNEL_NONE_READOUT.to_string(), 0.0)]
         );
         assert_states_are_paired(&backend.calls.lock().unwrap());
+    }
+
+    /// The resolution reading names every registered kind under every result,
+    /// the matching one at 1 and the rest at 0.
+    ///
+    /// The zeros are the point. A family written only for the matching cell
+    /// leaves "this deployment resolved email to no_recipients" and "nothing
+    /// ever resolved email" the same absence, and the second one is the
+    /// publisher having stopped — the failure the reading exists to catch.
+    #[tokio::test]
+    async fn a_channel_resolution_reading_writes_every_cell_on_every_pass() {
+        let gauges = Arc::new(Gauges::default());
+        let backend: Arc<dyn cog_core::MetricsBackend> = gauges.clone();
+        let mut cfg = crate::config::AlertmanagerConfig::default();
+        cfg.email.smtp_host = "smtp.example.invalid".into();
+
+        crate::config::publish_channel_resolutions(Some(&backend), &cfg.channel_resolutions())
+            .await;
+
+        let written: Vec<(String, String, f64)> = gauges
+            .counters
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, value, labels)| {
+                assert_eq!(name, "cogneva_alert_channel_resolution_total");
+                (
+                    labels.get(crate::LABEL_CHANNEL).cloned().unwrap(),
+                    labels.get(crate::LABEL_RESULT).cloned().unwrap(),
+                    *value,
+                )
+            })
+            .collect();
+        assert_eq!(
+            written.len(),
+            9,
+            "three registered kinds times three results: {written:?}"
+        );
+        // One cell per kind, and which one follows from the configuration: the
+        // relay with no recipient list that the setup declares is the fault,
+        // and the two kinds nobody configured are the ordinary reading of a
+        // deployment that chose another outlet.
+        let raised: Vec<(&str, &str)> = written
+            .iter()
+            .filter(|(_, _, value)| *value == 1.0)
+            .map(|(channel, result, _)| (channel.as_str(), result.as_str()))
+            .collect();
+        assert_eq!(
+            raised,
+            vec![
+                ("webhook", "not_configured"),
+                ("email", "no_recipients"),
+                ("slack", "not_configured"),
+            ],
+            "exactly the matching result of each registered kind: {written:?}"
+        );
+        for (channel, result, value) in &written {
+            assert!(
+                *value == 0.0 || *value == 1.0,
+                "{channel}/{result} carries {value}, not a cell"
+            );
+        }
     }
 
     /// With outlets configured the family names them, one row per kind, so the
@@ -2392,6 +2491,7 @@ mod bridge_sweep {
             None,
             None,
             Arc::new(tokio::sync::Mutex::new(rx)),
+            Vec::new(),
             Duration::from_secs(600),
             Duration::from_millis(20),
             beat(),

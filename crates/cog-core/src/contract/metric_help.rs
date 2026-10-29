@@ -576,6 +576,27 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          an alert a human never saw",
     ),
     (
+        "cogneva_alert_channel_resolution_total",
+        "Why each registered alert channel does or does not carry alerts out of \
+         this process, labelled by `channel` and `result`, one observation per \
+         cell per pass; the matching cell is 1 and the other two are 0, so the \
+         family is read with `increase(...)` over a window that covers at least \
+         two passes, never as a level. `channel` is the kind of outlet \
+         (webhook, email, slack) and never its URL or its recipients. `result` \
+         is a closed set: ok (configured and usable), no_recipients (declared \
+         with nothing to send to -- an email relay whose recipient list is \
+         empty, the one state somebody has to fix), and not_configured (nothing \
+         declared for this kind, which is how a deployment that chose another \
+         outlet reads and is not a fault). Every registered channel is written \
+         under all three results on every pass, so a zero cell says 'this \
+         deployment resolved it that way' and a missing cell says 'nothing \
+         resolved it' -- the two are different readings and the absent one is \
+         the failure. This is a fact about this process's configuration, not \
+         about a delivery: unlike cogneva_alert_notifications_total it moves on \
+         a deployment that never sends a batch, which is exactly the deployment \
+         the no_recipients state describes",
+    ),
+    (
         "cogneva_alert_rule_count",
         "How many rules the two sides of the loaded-rule-set check hold, \
          labelled by `state`; the cell's value is a count. The check already \

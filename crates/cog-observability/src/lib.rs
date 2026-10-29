@@ -45,6 +45,12 @@ pub const LABEL_STATE: &str = "state";
 /// 读数带上「为什么是这个值」时用的标签键。
 pub const LABEL_REASON: &str = "reason";
 
+/// 读数带上一组闭集时用的标签键：这一格是哪一个可能的结果。
+///
+/// 与 `outcome` 分开：`outcome` 说的是「一次尝试怎么结束的」，这个说的是
+/// 「这次判定落在闭集里的哪一格」，同一条序列上两件事同时出现时不会互相冒充。
+pub const LABEL_RESULT: &str = "result";
+
 /// 读数带上「这一格说的是什么」时用的标签键。
 pub const LABEL_MESSAGE: &str = "message";
 

@@ -1180,6 +1180,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "agent_inbox_orphaned_entries",
         "crates/cog-storage/src/inbox_orphan_readings.rs",
     ),
+    // 一个已注册的告警频道为什么发不出去。读的是**配置事实**，不是投递结果：
+    // `cogneva_alert_notifications_total` 只在真的投递时动，而 `no_recipients`
+    // 描述的正是「永远投不出去」的那一档，它在那个计数器上根本不会出现。三格
+    // （`ok`/`no_recipients`/`not_configured`）每拍全写一遍，匹配的那格为 1、
+    // 其余为 0，好让「这格是 0」与「这格没有」分得开。
+    (
+        "cogneva_alert_channel_resolution_total",
+        "crates/cog-observability/src/config.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -4431,22 +4440,6 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_alert_channels_configured",
         Unread::Gap("which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, and no such row is written when there is no outlet -- a placeholder name would read as a kind that exists and is switched off -- and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. The in-app alert surface counts as an outlet: it has no address, so nothing about it can be misconfigured, and the WebUI reads the same rows the external channels would carry. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
     ),
-    // The change account's census by face landed with its producer and without
-    // a reader, and the reason is the same one the two entries above give: what
-    // it counts is a population, and no policy states how large an owed
-    // remainder is a fault. The reading that could be bounded on its own is
-    // `oldest_unmeasured_seconds`, and bounding it needs the same missing
-    // decision -- a change owed for a day is a queue, a change owed for a month
-    // on a face that also retired nothing is the face having stopped, and where
-    // between those two a page belongs is the face owners' call. Filing it keeps
-    // the producer's own discipline visible: every face writes every reading on
-    // every pass precisely so a face the census never reports can be told from
-    // one that finished, and that distinction is only worth the writes once
-    // something reads it.
-    (
-        "cogneva_change_block_census",
-        Unread::Gap("the change account counted by the face of the programme its declaring documents name, and by reading: `landed`, `owed`, `retired`, `undecided` and `oldest_unmeasured_seconds`, over a closed set of blocks that includes `none` for rows no document filed. The three counts are the whole population of a face, which is what lets a face that retired its work be told from one that finished; every face is written on every pass, including ones that owe nothing, so a head missing from the census is a head that stopped being counted rather than one with nothing to say. `undecided` is not a fourth bucket: it counts rows already inside `owed`, the ones nothing has settled, and is written at zero on every face so that a head with nothing unsettled is not confused with one that never asked. It has no rule because nothing in the deployment declares how much owed work on one face, or how old its longest-unmeasured row, is a fault -- the count says the population and not the state, and the one reading here with a natural direction, `oldest_unmeasured_seconds`, needs the same undecided bound. The reader owed is a panel over the census by block and reading, which states the comparison without inventing a threshold"),
-    ),
     // The same account counted the other way, by the tier each carrier said its
     // principle would be checked at. No rule reads it, and the reason is not
     // that the reading is unimportant: the cell worth watching is `undeclared`,
@@ -4803,7 +4796,23 @@ const UNREAD: &[(&str, Unread)] = &[
 /// other side: there the age had the rule and the depth had no bound the writer
 /// could settle; here the depth is the number a level would have to be stated
 /// for. Both are read together by the panel the change-ledger group owes.
-const GAPS_AT_CENSUS: usize = 34;
+///
+/// Down to 33 in the pass that drew the change account by face. That entry said
+/// the reader owed was a panel over the census by block and reading, and the
+/// panels now exist -- two of them, one drawing the face's four counts (landed,
+/// owed, retired, and `undecided`, which is a part of `owed` rather than a
+/// fourth bucket) and one drawing the age of the longest-unmeasured owed row --
+/// so the entry leaves the table the way the window entry did: the reader
+/// landed, and a series with a reader may not stay filed as having none. What
+/// does not change is why no rule takes it: the counts are a population and
+/// nothing in the deployment declares how much owed work on one face is a
+/// fault, and the age has a direction but not a bound -- a change owed for a
+/// day is a queue, one owed for a month on a face that also retired nothing is
+/// the face having stopped, and where between those a page belongs is the face
+/// owners' call. That sentence is why the census has a reader and no rule, and
+/// it is written here rather than in the entry because the entry's whole value
+/// was the reader it named.
+const GAPS_AT_CENSUS: usize = 33;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

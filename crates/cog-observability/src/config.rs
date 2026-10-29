@@ -503,10 +503,29 @@ impl AlertEmailConfig {
             .collect()
     }
 
+    /// Why this half of the configuration does or does not let email out.
+    ///
+    /// The empty recipient list is separated from the absent relay because the
+    /// two are not the same absence and only one of them is a fault: a
+    /// deployment that configured a relay has declared that it means to send
+    /// mail, and a list left empty under it is a receiver nobody can reach. A
+    /// deployment with no relay never declared the channel at all, and reading
+    /// that as a fault would fire on every profile that uses another outlet.
+    pub fn resolution(&self) -> ChannelResolution {
+        match (
+            !self.recipients.trim().is_empty(),
+            !self.smtp_host.trim().is_empty(),
+        ) {
+            (true, true) => ChannelResolution::Ok,
+            (false, true) => ChannelResolution::NoRecipients,
+            _ => ChannelResolution::NotConfigured,
+        }
+    }
+
     /// Whether this is an outlet: recipients to send to and a relay to send
     /// through. Both halves are needed, so the predicate names both.
     pub fn is_outlet(&self) -> bool {
-        !self.recipients.trim().is_empty() && !self.smtp_host.trim().is_empty()
+        self.resolution() == ChannelResolution::Ok
     }
 }
 
@@ -567,7 +586,153 @@ pub fn alert_channel_names() -> Vec<&'static str> {
     names
 }
 
+/// What a configuration says about one registered channel.
+///
+/// A channel is registered whether or not anybody configured it: the set of
+/// kinds this build can deliver through does not depend on the deployment, and
+/// "this deployment has no email relay" is a fact about the deployment rather
+/// than about the code. The three states are therefore the whole answer
+/// `channels()` gives, and they are kept apart because the absent one is not a
+/// fault: most deployments leave at least one kind empty on purpose, and only
+/// [`ChannelResolution::NoRecipients`] -- a relay somebody configured with
+/// nobody to send to -- describes a channel that was meant to work and cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelResolution {
+    /// Configured and usable.
+    Ok,
+    /// Declared, with nothing to send to: an email relay without recipients.
+    NoRecipients,
+    /// Nothing declared for this kind, which is how a deployment that uses
+    /// another outlet reads.
+    NotConfigured,
+}
+
+impl ChannelResolution {
+    /// The closed set of outcomes, in the order they are published.
+    pub const ALL: [ChannelResolution; 3] = [
+        ChannelResolution::Ok,
+        ChannelResolution::NoRecipients,
+        ChannelResolution::NotConfigured,
+    ];
+
+    /// The word this state is published under.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ChannelResolution::Ok => "ok",
+            ChannelResolution::NoRecipients => "no_recipients",
+            ChannelResolution::NotConfigured => "not_configured",
+        }
+    }
+}
+
+/// Publish what this process resolved each registered channel to.
+///
+/// One observation per channel per result on every call: the cell matching the
+/// resolution moves by one and the other two are written at zero. The zeros are
+/// the point -- a family written only for the matching cell leaves "this
+/// deployment resolved email to ok" and "nothing ever resolved email" in the
+/// same shape, and the second is the failure. It is a counter because the write
+/// repeats rather than states a level, so a reader takes `increase(...)` over a
+/// window covering at least two writes.
+///
+/// The fact is about this process's configuration, not about a delivery: it
+/// moves on a deployment that never sends a batch, which is exactly the
+/// deployment whose declared email outlet has nobody to send to.
+pub async fn publish_channel_resolutions(
+    metrics: Option<&std::sync::Arc<dyn cog_core::MetricsBackend>>,
+    resolutions: &[(&'static str, ChannelResolution)],
+) {
+    let Some(backend) = metrics else { return };
+    for (channel, resolution) in resolutions {
+        for result in ChannelResolution::ALL {
+            let observed = f64::from(u8::from(result == *resolution));
+            let labels = std::collections::HashMap::from([
+                (crate::LABEL_CHANNEL.to_string(), (*channel).to_string()),
+                (crate::LABEL_RESULT.to_string(), result.as_str().to_string()),
+            ]);
+            if let Err(e) = backend
+                .record_counter(
+                    cog_core::metric_names::ALERT_CHANNEL_RESOLUTION_TOTAL,
+                    observed,
+                    labels,
+                )
+                .await
+            {
+                tracing::warn!(
+                    channel,
+                    result = result.as_str(),
+                    error = %e,
+                    "could not record the alert channel resolution"
+                );
+            }
+        }
+    }
+}
+
 impl AlertmanagerConfig {
+    /// What this configuration says about each registered channel, in
+    /// registration order.
+    ///
+    /// This is the one derivation of both questions the configuration answers
+    /// about a channel -- what it says, and whether anything leaves through it
+    /// -- because the two readings drift the moment they are computed apart: a
+    /// channel announced as an outlet while its own resolution reads
+    /// `not_configured` is a deployment that says it delivers somewhere it has
+    /// no address for. [`Self::channels`] builds from this list, so a kind
+    /// reported as usable and a kind actually handed to the dispatcher are the
+    /// same decision.
+    pub fn channel_resolutions(&self) -> Vec<(&'static str, ChannelResolution)> {
+        let declared = |configured: bool| {
+            if configured {
+                ChannelResolution::Ok
+            } else {
+                ChannelResolution::NotConfigured
+            }
+        };
+        vec![
+            (
+                ALERT_CHANNEL_WEBHOOK,
+                declared(!self.webhook_url.trim().is_empty()),
+            ),
+            (ALERT_CHANNEL_EMAIL, self.email.resolution()),
+            (ALERT_CHANNEL_SLACK, declared(self.slack.is_outlet())),
+        ]
+    }
+
+    /// The channel [`Self::channel_resolutions`] answered `ok` for, or `None`
+    /// for a name this build does not implement.
+    fn outlet(&self, channel: &'static str) -> Option<AlertChannel> {
+        match channel {
+            ALERT_CHANNEL_WEBHOOK => Some(AlertChannel::Webhook {
+                url: self.webhook_url.trim().to_string(),
+                headers: std::collections::HashMap::new(),
+            }),
+            ALERT_CHANNEL_EMAIL => {
+                let optional = |value: &str| {
+                    let value = value.trim();
+                    (!value.is_empty()).then(|| value.to_string())
+                };
+                Some(AlertChannel::Email {
+                    smtp_config: SmtpConfig {
+                        host: self.email.smtp_host.trim().to_string(),
+                        port: self.email.smtp_port,
+                        username: optional(&self.email.smtp_username),
+                        password: optional(&self.email.smtp_password),
+                        from_address: self.email.from_address.trim().to_string(),
+                        use_tls: self.email.use_tls,
+                    },
+                    to: self.email.recipient_list(),
+                    subject_template: self.email.subject_template.clone(),
+                })
+            }
+            ALERT_CHANNEL_SLACK => Some(AlertChannel::Slack {
+                webhook_url: self.slack.webhook_url.trim().to_string(),
+                channel: self.slack.channel.trim().to_string(),
+            }),
+            _ => None,
+        }
+    }
+
     /// The channels this configuration enables, in registration order.
     ///
     /// The one derivation of what leaves this process: the registration, the
@@ -575,42 +740,11 @@ impl AlertmanagerConfig {
     /// of channels drift the moment one is added and then the process
     /// announces an outlet it never registered.
     pub fn channels(&self) -> Vec<AlertChannel> {
-        let mut channels = Vec::new();
-
-        if !self.webhook_url.trim().is_empty() {
-            channels.push(AlertChannel::Webhook {
-                url: self.webhook_url.trim().to_string(),
-                headers: std::collections::HashMap::new(),
-            });
-        }
-
-        if self.email.is_outlet() {
-            let optional = |value: &str| {
-                let value = value.trim();
-                (!value.is_empty()).then(|| value.to_string())
-            };
-            channels.push(AlertChannel::Email {
-                smtp_config: SmtpConfig {
-                    host: self.email.smtp_host.trim().to_string(),
-                    port: self.email.smtp_port,
-                    username: optional(&self.email.smtp_username),
-                    password: optional(&self.email.smtp_password),
-                    from_address: self.email.from_address.trim().to_string(),
-                    use_tls: self.email.use_tls,
-                },
-                to: self.email.recipient_list(),
-                subject_template: self.email.subject_template.clone(),
-            });
-        }
-
-        if self.slack.is_outlet() {
-            channels.push(AlertChannel::Slack {
-                webhook_url: self.slack.webhook_url.trim().to_string(),
-                channel: self.slack.channel.trim().to_string(),
-            });
-        }
-
-        channels
+        self.channel_resolutions()
+            .into_iter()
+            .filter(|(_, resolution)| *resolution == ChannelResolution::Ok)
+            .filter_map(|(channel, _)| self.outlet(channel))
+            .collect()
     }
 
     /// Names of the enabled channels, read off the channels themselves rather
@@ -983,6 +1117,76 @@ mod tests {
             }
             other => panic!("expected an email channel, got {other:?}"),
         }
+    }
+
+    /// A declared email outlet with an empty recipient list is the one state
+    /// somebody has to fix, and it has to be nameable from the configuration
+    /// alone: the dispatch counter cannot carry it, because this is the channel
+    /// that never gets to dispatch.
+    #[test]
+    fn email_with_a_relay_and_no_recipients_resolves_to_no_recipients() {
+        let mut cfg = AlertmanagerConfig::default();
+        cfg.email.smtp_host = "smtp.example.invalid".into();
+        cfg.email.recipients = "   ".into();
+
+        assert_eq!(cfg.email.resolution(), ChannelResolution::NoRecipients);
+        assert!(
+            cfg.channels().is_empty(),
+            "a channel with nowhere to send is still not an outlet"
+        );
+        assert_eq!(
+            cfg.channel_resolutions(),
+            vec![
+                (ALERT_CHANNEL_WEBHOOK, ChannelResolution::NotConfigured),
+                (ALERT_CHANNEL_EMAIL, ChannelResolution::NoRecipients),
+                (ALERT_CHANNEL_SLACK, ChannelResolution::NotConfigured),
+            ],
+            "the fault is named on the channel it belongs to, and the kinds \
+             nobody configured read as absent rather than broken"
+        );
+    }
+
+    /// The other direction: a relay and a recipient list resolve to a channel
+    /// that works, so the reading is not permanently red on a healthy profile.
+    #[test]
+    fn email_with_a_relay_and_recipients_resolves_to_ok() {
+        let mut cfg = AlertmanagerConfig::default();
+        cfg.email.smtp_host = "smtp.example.invalid".into();
+        cfg.email.recipients = "ops@example.invalid".into();
+
+        assert_eq!(cfg.email.resolution(), ChannelResolution::Ok);
+        assert_eq!(
+            cfg.channel_names(),
+            vec![ALERT_CHANNEL_EMAIL],
+            "what resolves ok is what gets built: one list, not two"
+        );
+    }
+
+    /// The two answers this type gives about a channel come from one
+    /// derivation: a kind the reading calls `ok` and a kind the dispatcher
+    /// holds are the same kind, in the same order.
+    #[test]
+    fn the_outlets_are_the_channels_that_resolved_ok() {
+        let mut cfg = AlertmanagerConfig {
+            webhook_url: "https://receiver.example.invalid/alerts".into(),
+            ..AlertmanagerConfig::default()
+        };
+        cfg.email.smtp_host = "smtp.example.invalid".into();
+        cfg.slack.webhook_url = "https://hooks.example.invalid/T1".into();
+
+        let ok: Vec<&str> = cfg
+            .channel_resolutions()
+            .into_iter()
+            .filter(|(_, resolution)| *resolution == ChannelResolution::Ok)
+            .map(|(channel, _)| channel)
+            .collect();
+        assert_eq!(ok, cfg.channel_names());
+        assert_eq!(
+            ok,
+            vec![ALERT_CHANNEL_WEBHOOK, ALERT_CHANNEL_SLACK],
+            "email declared a relay and no recipients, so it is neither an \
+             outlet nor absent"
+        );
     }
 
     /// The names are the channels, not a second list: each channel that gets

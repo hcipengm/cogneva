@@ -3474,6 +3474,16 @@ data:
               "face": "可观测与告警"
             },
             {
+              "name": "alert_channel_declared_without_recipients",
+              "promql": "(max(increase(cogneva_alert_channel_resolution_total{result=\"no_recipients\"}[30m])) > 0)",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "有一个告警频道被声明了、却没有人能收到：`result=\"no_recipients\"` 这一格在窗口里涨了。它与 `cogneva_alert_notifications_total` 的 `skipped` 不是同一个读数：后者只在真的投递了一批时才动，而这一档描述的正是**永远投不出去**——收件人列表是空的，那批事件根本走不到投递，所以投递侧的任何序列都报不出它，只有配置解析这一面能。三种结果每拍全写一遍（`ok` / `no_recipients` / `not_configured`），匹配的那格为 1、其余为 0，于是「这一版把 email 判成了 ok」与「从来没有人解析过 email」在读数面上不同形：缺的是那一格，才是发布停了。`not_configured` 不进这条规则：多数部署本来就用别的出口，没声明不是故障，把它算进来会让每个正常 profile 常年亮灯。阈值取大于 0 而不是某个数量：一个声明了却没人收的频道就是零送达，没有可容忍的基线。用 30 分钟窗口读 `increase` 而不是裸读累计值：解析随告警桥每拍重写一次（约五分钟一轮），窗口覆盖数拍，进程重启把计数器归零也不会让它误熄。severity 取 warning：这是一件配置面的事实，不是某个业务面正在出事；但它亮着的时候，那个通道上的一切告警都只剩站内那一条路，修法是补上收件人、或者把那个没人收的出口摘掉。",
+              "face": "可观测与告警"
+            },
+            {
               "name": "alert_rule_set_disagrees_with_configmap",
               "promql": "min without (pod, container, instance, endpoint, service, namespace) (cogneva_alert_rule_count{state=\"agrees\"})",
               "condition": {

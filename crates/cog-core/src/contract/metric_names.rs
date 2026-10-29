@@ -521,6 +521,26 @@ metric_names! {
     // copies every process that loads this plugin reports.
     ALERT_CHANNELS_CONFIGURED => "cogneva_alert_channels_configured",
 
+    // cog-observability — why each registered alert channel does or does not
+    // carry alerts out of this process, labelled by `channel` and `result`
+    // (`ok|no_recipients|not_configured`), one observation per cell per pass.
+    //
+    // The family above says which outlets exist, and that is all it can say: a
+    // channel nobody configured and a channel somebody configured with nothing
+    // to send to are both simply absent from it, so the one state a person has
+    // to fix -- an email relay with an empty recipient list -- read exactly
+    // like the ordinary state of a deployment that chose another outlet. The
+    // dispatch counter cannot answer it either: it only moves when a batch is
+    // sent, and this channel is the one that never can be. `result` is the
+    // closed set of resolutions and every registered channel is written under
+    // all three on every pass, the matching one at 1 and the others at 0, so
+    // "this deployment resolved email to ok" and "nothing ever resolved email"
+    // stay distinguishable -- an absent cell is not a zero. A counter, because
+    // the write is a repeating observation rather than a state a reader can
+    // compare across restarts; read it with `increase(...)` over a window that
+    // covers at least two passes.
+    ALERT_CHANNEL_RESOLUTION_TOTAL => "cogneva_alert_channel_resolution_total",
+
     // cog-observability — the two sizes the loaded-rule-set check compares,
     // labelled by `state` (`declared|loaded|document_readable`), the cell's
     // value being a count.
