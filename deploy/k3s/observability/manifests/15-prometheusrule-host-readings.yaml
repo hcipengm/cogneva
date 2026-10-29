@@ -1222,7 +1222,7 @@ spec:
             severity: warning
           annotations:
             summary: "同一个 must-green 驱动者在窗口内重复假红"
-            description: "跑 `bash scripts/principles/must-green-flake-reading.sh` 看 `flaky_by_suite_window`：哪个套件堆得高、几次。界是 `flaky_suite_budget`（默认 3 次／窗口，窗口 7 天），改界改生产者的 `COGNEVA_FLAKE_SUITE_BUDGET`，这条规则读的是判词。记录里只有驱动套件、没有成员名（`host-tests.test.sh` 一份驱动整层 `scripts/host/*.test.sh`），所以下一步是去那一层里找哪一份不稳，不是重试那一笔提交。假红与真红分开数：真红落在 `red/`、不复跑、不进这一堆。"
+            description: "跑 `bash scripts/principles/must-green-flake-reading.sh`。先看 `flaky_by_member_window`：它按**成员名**分开数，点到的就是那一份不稳，直接去修那一份。成员名为空时看 `flaky_member_unattributed_window`——那个数说的是这几条记录早于成员名那一栏落地（2026-10-28 起记录里才有 `member=` 行），不是「没有成员在抖」；这时才退一步看 `flaky_by_suite_window`（哪个套件堆得高、几次），去那一层里找。界是 `flaky_suite_budget`（默认 3 次／窗口，窗口 7 天），改界改生产者的 `COGNEVA_FLAKE_SUITE_BUDGET`，这条规则读的是判词。下一步是修那一份不稳，不是重试那一笔提交。假红与真红分开数：真红落在 `red/`、不复跑、不进这一堆。"
 
         # 面名这一环：正本（另一棵树里的 `scripts/data/faces.tsv`）与树内载体申报的面集合。
         # 这三格此前只有「规则真响之后」才看得见——载体挂着一个正本不认的面，读数面报
