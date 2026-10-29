@@ -20,6 +20,7 @@ evaluation_interval: 1m
 tests:
   # 一、规格在说谎：stale 从 0 跳到 2，`for: 15m` 之前必须是空，之后必须 firing。
   # 反向证据在同一格里：20m 时还要是空（这条规则不是「一有数就响」）。
+  # 两条红都在自己那片干净路径上（`own_scope_clean`），所以压制条件不成立。
   - interval: 1m
     input_series:
       - series: 'cogneva_acceptance_items{verdict="stale"}'
@@ -28,6 +29,12 @@ tests:
         values: '80x60'
       - series: 'cogneva_acceptance_age_seconds'
         values: '30x60'
+      - series: 'cogneva_acceptance_stale_causes{cause="own_scope_clean"}'
+        values: '0x15 2x45'
+      - series: 'cogneva_acceptance_stale_causes{cause="own_scope_dirty"}'
+        values: '0x60'
+      - series: 'cogneva_acceptance_stale_causes{cause="own_scope_unknown"}'
+        values: '0x60'
     alert_rule_test:
       - eval_time: 10m
         alertname: CognevaAcceptanceSpecStale
@@ -193,3 +200,70 @@ tests:
               severity: warning
               cogneva_io_managed: "true"
               cogneva_io_face: "落地≠生效"
+
+  # 九、每一条红都落在**它自己读的那片路径**的未提交改动上 ⇒ 不响。
+  # 这是这条规则唯一的静音条件，也是它存在的理由：三条会话同写一棵树，别人正在飞的改动
+  # 会被普查读成「规格与代码对不上」，等他们提交完那几条自己就消失了。没有这一格，把
+  # 压制条件整段删掉、或者把 `cause=~` 写成永远为真的正则，两种改法都能过上面所有格。
+  # 反向证据是同一条序列在第十格里换成 `clean` 就必须响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{verdict="stale"}'
+        values: '2x60'
+      - series: 'cogneva_acceptance_stale_causes{cause="own_scope_clean"}'
+        values: '0x60'
+      - series: 'cogneva_acceptance_stale_causes{cause="own_scope_dirty"}'
+        values: '2x60'
+      - series: 'cogneva_acceptance_stale_causes{cause="own_scope_unknown"}'
+        values: '0x60'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '30x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaAcceptanceSpecStale
+        exp_alerts: []
+
+  # 十、成因是 `unknown`（取不出这条判据读的路径）⇒ 照响。判不了成因不是清白：2026-10-29
+  # 那两条真实的红（deploy-admission A8、resource-ledger-service A1）scope 就是取不出来的，
+  # 把它们压下去等于把真矛盾一起压掉。这一格和第九格只差一个 `cause` 的取值，所以它同时
+  # 是「压制只对 dirty 生效」的反向证据。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{verdict="stale"}'
+        values: '2x60'
+      - series: 'cogneva_acceptance_stale_causes{cause="own_scope_clean"}'
+        values: '0x60'
+      - series: 'cogneva_acceptance_stale_causes{cause="own_scope_dirty"}'
+        values: '0x60'
+      - series: 'cogneva_acceptance_stale_causes{cause="own_scope_unknown"}'
+        values: '2x60'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '30x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaAcceptanceSpecStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "落地≠生效"
+              verdict: stale
+
+  # 十一、成因那一族整条缺席 ⇒ 照响。旧快照、生产者换版、或者哪天普查把这格停了，这几种
+  # 情况下「没有成因序列」与「没有红落在干净路径上」长得一模一样；把缺席读成干净就是这套
+  # 系统反复栽过的那个形状。宁可多响一次，不可永久静音。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_acceptance_items{verdict="stale"}'
+        values: '2x60'
+      - series: 'cogneva_acceptance_age_seconds'
+        values: '30x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaAcceptanceSpecStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "落地≠生效"
+              verdict: stale

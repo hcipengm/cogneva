@@ -37,8 +37,29 @@ spec:
         # 15 分钟＝三十拍读数。界比读数的拍距长得多，是因为它要抓的是**已经写进树里的
         # 矛盾**，不是一次抖动；而每次判词变动都带着 `taken_at` 与两棵树的 rev，追问谁改的
         # 有据可查。
+        #
+        # 但「有一条红」不等于「规格在说谎」：普查读的是工作树此刻盘上的样子，三条会话同写
+        # 一棵树，别人正在飞的改动会被读成规格与代码对不上。生产者因此逐条判了成因
+        # （`cogneva_acceptance_stale_causes`）：`own_scope_clean` 是这条判据自己读的那片
+        # 路径干净，规格与代码确实矛盾；`own_scope_dirty` 是那片路径上有未提交改动，等它
+        # 提交完再看；`own_scope_unknown` 是取不出路径，这一趟判不了成因。
+        #
+        # 所以这条规则在**每一条红都落在脏路径上**时不响——那种红过几分钟会自己消失，响了
+        # 也只是叫醒人去看别人的编辑。`unknown` 照响：判不了成因不是清白，它既可能是真矛盾
+        # 也可能不是，压下去就把真矛盾一起压掉了。成因那一族整条缺席时也照响——缺席读成
+        # 干净是这套系统反复栽过的形状，宁可多响一次，不可永久静音。
+        #
+        # 这条压制只会让这条规则**少响**、不会多响：新表达式是老表达式与一个附加条件的交,
+        # 交出来的集合一定是原来的子集。
         - alert: CognevaAcceptanceSpecStale
-          expr: max by (verdict) (cogneva_acceptance_items{verdict="stale"}) > 0
+          expr: |
+            max by (verdict) (cogneva_acceptance_items{verdict="stale"}) > 0
+            and on()
+            (
+              sum(cogneva_acceptance_stale_causes{cause=~"own_scope_clean|own_scope_unknown"}) > 0
+              or on()
+              absent(cogneva_acceptance_stale_causes)
+            )
           for: 15m
           labels:
             cogneva_io_managed: "true"
@@ -46,7 +67,7 @@ spec:
             severity: warning
           annotations:
             summary: "有 {{ $value }} 条验收项的规格与它自己的判据不符（verdict=stale）"
-            description: "不是读数坏了，是规格说了「已落」而判据跑不过。逐条点名跑一把普查：`python3 -I scripts/gates/run-spec-acceptance.py --census --root <那棵树> --cwd <cogneva 树>`，看 verdict=stale 的那几行；修的是规格或它点名的代码，不是这条规则。数值是条数，不是持续时间。"
+            description: "不是读数坏了，是规格说了「已落」而判据跑不过。逐条点名跑一把普查：`python3 -I scripts/gates/run-spec-acceptance.py --census --root <那棵树> --cwd <cogneva 树>`，看 verdict=stale 的那几行；修的是规格或它点名的代码，不是这条规则。数值是条数，不是持续时间。每一条红都落在它自己读的那片路径的未提交改动上时不响——成因见 `cogneva_acceptance_stale_causes`，先看那片是谁在改。"
 
         # 二、整条读数不见了。`absent_over_time` 的作用是「窗口内一条样本都没有」，
         # 它不继承被抓序列的标签，所以身份只剩规则名——这是对的：主体是「这条读数」。
