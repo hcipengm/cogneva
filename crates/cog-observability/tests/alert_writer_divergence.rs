@@ -335,6 +335,69 @@ async fn the_writer_identity_lands_on_a_table_that_predates_it() {
     drop_schema(&url, &schema).await;
 }
 
+/// The verdict table's size must follow the alert keys, not the rollouts.
+///
+/// A row is keyed by writer and a writer is a pod name, so each rollout leaves a
+/// generation nothing will ever overwrite again. The only reader looks at a
+/// five-minute window, so a day of history is already more than anyone asks for;
+/// past that the rows are pure growth, and growth that no reading would attribute
+/// to anything — the table simply keeps getting bigger.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_writer_that_stopped_asserting_does_not_keep_its_rows_forever() {
+    let url = database_url();
+    let schema = own_schema(&url, "alert_div_prune").await;
+    let pool = schema_pool(&url, &schema).await;
+
+    let store = PostgresAlertStore::with_identity(pool.clone(), "cogneva-app-old", "cogneva");
+    store
+        .init_schema(&cog_test_support::SchemaTextRunner::new(pool.clone()))
+        .await
+        .expect("the alert DDL runs in one piece");
+
+    for (writer, age_seconds) in [
+        (
+            "cogneva-app-old",
+            2 * cog_observability::alert_store::ASSERTION_RETENTION_SECONDS,
+        ),
+        ("cogneva-app-new", 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO alert_assertions (dedup_key, writer, role, state, observed_at) \
+             VALUES ($1, $2, $3, $4, now() - ($5::bigint * interval '1 second'))",
+        )
+        .bind("probe_rule:prune")
+        .bind(writer)
+        .bind("cogneva")
+        .bind("firing")
+        .bind(age_seconds)
+        .execute(&pool)
+        .await
+        .expect("the verdict row lands");
+    }
+
+    // A fresh start is the moment the set of possible writers changes, so it is
+    // also the moment to drop the ones that are not coming back.
+    PostgresAlertStore::with_identity(pool.clone(), "cogneva-app-new", "cogneva")
+        .init_schema(&cog_test_support::SchemaTextRunner::new(pool.clone()))
+        .await
+        .expect("a restart reapplies the schema");
+
+    assert_eq!(
+        assertion_rows(&pool, "cogneva-app-old").await,
+        0,
+        "a writer silent for longer than the retention keeps no rows"
+    );
+    assert_eq!(
+        assertion_rows(&pool, "cogneva-app-new").await,
+        1,
+        "a writer that is still asserting keeps its verdict"
+    );
+
+    pool.close().await;
+    drop_schema(&url, &schema).await;
+}
+
 /// A verdict table that stopped keeping up must not take the alert with it.
 ///
 /// `set_alert` returns one value, and every caller reads `Err` as "nothing was

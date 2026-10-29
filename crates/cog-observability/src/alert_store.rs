@@ -103,6 +103,14 @@ pub fn ddl() -> String {
     alert_sql(DDL_TEMPLATE)
 }
 
+/// How long a writer's last verdict is kept after that writer stops asserting.
+///
+/// A day, because nothing reads past five minutes (the divergence surface's
+/// window) and a day of history is enough to explain a disagreement someone
+/// noticed this morning. The point of the bound is that the table's size has to
+/// follow the number of alert keys rather than the number of rollouts.
+pub const ASSERTION_RETENTION_SECONDS: i64 = 24 * 60 * 60;
+
 /// A new alert condition to raise (or close).
 #[derive(Debug, Clone)]
 pub struct NewAlert {
@@ -355,6 +363,21 @@ impl PostgresAlertStore {
             .apply_schema(&ddl())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // The verdict table is keyed by writer, and a writer is a pod name: every
+        // rollout leaves a generation of rows nothing will ever overwrite again.
+        // Their only reader — the divergence surface — looks at a five-minute
+        // window, so what is kept beyond a day is history nothing asks for, and
+        // what is not pruned grows with the number of rollouts rather than with
+        // the number of alerts. Pruned here because the set of dead writers
+        // changes exactly when a process starts: a startup that adds a writer is
+        // the moment to drop the ones that are no longer coming back.
+        sqlx::query(
+            "DELETE FROM alert_assertions \
+             WHERE observed_at < now() - ($1::bigint * interval '1 second')",
+        )
+        .bind(ASSERTION_RETENTION_SECONDS)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
