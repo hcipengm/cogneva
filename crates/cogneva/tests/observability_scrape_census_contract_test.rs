@@ -270,10 +270,9 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // app process reached `serving` in 24.1 s at its fastest and 236.2 s at its
     // slowest inside three days; the evolution process, which loads no dense
     // model and has four phases instead of seven, swings 2.1 s to 49.1 s over
-    // the same window. The quantity is wall clock from process entry, so one
-    // number carries the page cache, the host's load and the image's contents
-    // together. The sibling's quantity does not: resident set at a named moment
-    // is what the process allocated, and nothing the host did to it moves that.
+    // the same window. The sibling's quantity does not swing like that at all:
+    // resident set at a named moment is what the process allocated, and two
+    // generations of one build hold it to within a few MiB.
     //
     // A bound wide enough to absorb a tenfold spread cannot name a phase that
     // doubled, and one tight enough to name it fires on every roll -- on the
@@ -281,15 +280,32 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // one then running read 74.8 s, so any five-second bound would have been
     // continuously true and pointed at nothing.
     //
-    // What the series can answer needs the host's load read beside it: a
-    // startup that slowed on a quiet host is a different fact from one that
-    // slowed under a saturated one, and that companion reading does not exist.
-    // The entry stays a `Gap` for that reason, and its wording now says the
-    // debt is a paired reading rather than a threshold, which is cheaper to
-    // name than to write and is why it is still here.
+    // The first guess at what it owed -- "read it against the host's load" --
+    // was checked and is wrong, which is worth keeping: the same twenty hours
+    // hold a boot that reached `serving` in 24.1 s at load 11.4 and one that
+    // took 74.8 s at load 10.3, and the busiest host in the window (load 177.5)
+    // booted in 81.1 s. Disk occupancy does not explain it either: the
+    // correlation with `rate(node_disk_io_time_seconds_total[5m])` over the
+    // same boots is 0.33. What does explain it is the revision. Twenty hours
+    // hold eighteen rolls and eighteen distinct images -- `main-4ba3a013f867`
+    // through `main-787e2f0d7e08` -- so the spread is not one build's
+    // generation-to-generation noise, it is eighteen different builds being
+    // measured once each. There is exactly one boot per revision, which means
+    // the series has no sample that can be compared with another sample of the
+    // same thing.
+    //
+    // That is why the sibling's shape transfers nowhere here, and it is not
+    // about wall clock versus resident set in the abstract: the sibling
+    // compares generations of one build, and startup time has generations of
+    // one build only if a revision runs twice. The debt this entry carries is
+    // therefore a comparison that holds the revision fixed, and the cheapest
+    // way to have one is to carry the revision as a label -- the image tag is
+    // already in the environment the process starts with -- so that a phase can
+    // be read against the same phase of the build beside it. Until then a
+    // number that moved says the build changed, not that startup got slower.
     (
         "cogneva_boot_phase_elapsed_seconds",
-        Unread::Gap("how long each startup phase took, one series per phase. Its sibling on the same label has a rule and the same shape on this one was written and withdrawn: within one process kind the reading swings by an order of magnitude between rolls -- 24 to 236 seconds for the app process over three days -- because it is wall clock and carries the host's load and the page cache in the same number. A bound wide enough for that spread cannot name a phase that doubled, so the face owed is startup time read against the host's load at that same moment, and that companion does not exist"),
+        Unread::Gap("how long each startup phase took, one series per phase. Its sibling on the same label has a rule and the same shape on this one was written and withdrawn: twenty hours hold eighteen rolls and eighteen distinct images, so the 24-to-236-second spread for the app process is eighteen builds measured once each rather than one build's noise, and the host's load does not explain it (the fastest boot ran at load 11.4 and one three times slower ran at load 10.3). A comparison needs two samples of the same thing and there is one boot per revision, so the face owed is a reading that carries the revision -- the image tag the process already starts with -- and can put a phase beside the same phase of the build next to it"),
     ),
     // Two names that had a `Gap` here until panels were written to carry them,
     // and the reason they came off this table is the reason the debts were real:
