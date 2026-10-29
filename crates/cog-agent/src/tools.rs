@@ -76,6 +76,13 @@ pub fn caller_agent_id() -> Option<String> {
     CALLER_AGENT_ID.try_with(|id| id.clone()).ok()
 }
 
+/// `read_file` 在调用方没说要看多少行时给出的一页。
+///
+/// 一页按行数计，不按字节：行数读起来能对上编辑器，也能直接当 `offset`
+/// 用。取值让常见源码文件一次读完，而整文件倾倒型的读（几千行、几十万
+/// 字符）自动变成可分页的几段。
+const READ_FILE_DEFAULT_WINDOW_LINES: usize = 600;
+
 /// 按行切出 `read_file` 调用方要的那一段。
 ///
 /// 整份读回来再整份塞进 tool_result 的代价不在磁盘上：这份正文进了上下文，
@@ -84,11 +91,19 @@ pub fn caller_agent_id() -> Option<String> {
 /// 原样返回整份，老调用方与老断言不受影响；给了就带上文件的总行数与「后面
 /// 还有没有」，只回切片不回总行数，读的人会以为文件到那里就结束了。
 fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_json::Value {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    // 调用方没说要看多少行，而这份文件又比一页长：给一页。
+    // 整份塞进上下文的代价不在这一次调用上——它之后每一轮都要重发，
+    // 缓存命中率的分母就是每一轮新追加的字节，一次整文件读能把接下来
+    // 整段对话的命中去掉一大块。`has_more` 与 `next_offset` 让读的人
+    // 知道后面还有、从哪继续，而不是把「到这儿就结束了」当成结论。
+    let limit = limit.or_else(|| {
+        (total > READ_FILE_DEFAULT_WINDOW_LINES).then_some(READ_FILE_DEFAULT_WINDOW_LINES as u64)
+    });
     if offset.is_none() && limit.is_none() {
         return serde_json::json!({ "content": text });
     }
-    let lines: Vec<&str> = text.lines().collect();
-    let total = lines.len();
     let start = offset.unwrap_or(1).max(1) as usize;
     let end = match limit {
         Some(want) => start
@@ -102,11 +117,13 @@ fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_jso
     } else {
         lines[start - 1..end.max(start - 1)].to_vec()
     };
+    let has_more = end < total;
     serde_json::json!({
         "content": slice.join("\n"),
         "start_line": start,
         "total_lines": total,
-        "has_more": end < total,
+        "has_more": has_more,
+        "next_offset": has_more.then_some(end + 1),
     })
 }
 
@@ -1299,6 +1316,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 不带范围地读一份长文件，拿到的是一页，不是整份。
+    ///
+    /// 这份正文要在之后每一轮重发：一轮读出几千行，会把这一整段对话的输入
+    /// 全部推高，而上游前缀缓存只认「与上一轮相同的字节」——新追加的那一坨
+    /// 越大，命中率越低。所以默认给一页，并让读的人从 `next_offset` 接着读；
+    /// 文件本来就短时行为不变，老调用方看到的一直是 `content`。
+    #[tokio::test]
+    async fn a_long_file_comes_back_one_page_at_a_time() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-page-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("long.txt");
+        let path = path.to_str().unwrap();
+        let body: String = (1..=2000).map(|i| format!("line {i}\n")).collect();
+
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        cog_core::ToolRegistry::register(&registry, builtins::read_file());
+        cog_core::ToolRegistry::register(&registry, builtins::write_file());
+        registry
+            .execute(
+                "write_file",
+                serde_json::json!({"path": path, "content": body}),
+            )
+            .await
+            .unwrap();
+
+        let first = registry
+            .execute("read_file", serde_json::json!({"path": path}))
+            .await
+            .unwrap();
+        assert_eq!(first["total_lines"], 2000);
+        assert_eq!(first["start_line"], 1);
+        assert_eq!(first["has_more"], true);
+        assert_eq!(
+            first["content"].as_str().unwrap().lines().count(),
+            READ_FILE_DEFAULT_WINDOW_LINES
+        );
+        assert!(
+            first["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("line 1\nline 2\n"),
+            "一页从文件头开始"
+        );
+
+        let next = first["next_offset"].as_u64().unwrap();
+        let second = registry
+            .execute(
+                "read_file",
+                serde_json::json!({"path": path, "offset": next}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["start_line"], next);
+        assert!(
+            second["content"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("line {next}")),
+            "续读必须从上一页的下一行开始，不重不漏"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The tool list a request carries must come out in name order, whatever
     /// order the definitions were registered in.
     ///
@@ -1708,7 +1789,7 @@ pub mod builtins {
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "How many lines to return; omit to read to the end of the file"
+                        "description": "How many lines to return; omit to read one page (600 lines) or the rest of the file if shorter. The reply carries total_lines, has_more and next_offset, so a long file is read page by page instead of in one piece"
                     }
                 },
                 "required": ["path"]
