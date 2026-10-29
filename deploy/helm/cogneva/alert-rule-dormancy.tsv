@@ -6,7 +6,13 @@
 # HPA objects that do not exist is correctly asleep -- but the reason has to be
 # written down where the reader can find it:
 #
-#     rule <tab> absent_series (comma separated) <tab> reason <tab> why
+#     rule <tab> reason <tab> why
+#
+# The absent series are NOT listed here. They are what the reading computes --
+# the rule's selectors minus the live name face -- so writing them down would be
+# retyping a value the machine already has, and a typo in it would never turn
+# anything red: the verdict only asks that the rule has a row. One row per rule;
+# a reason is a property of the rule, not of one series it happens to miss.
 #
 # reason is a closed set:
 #   object_absent     the object family is not deployed; the rule wakes with it
@@ -28,9 +34,11 @@
 # layer can tell apart on its own.
 #
 # The witness reading (`scripts/host/cogneva-alert-rule-witness-reading.sh` in
-# the private companion repository) treats an absent series without a row here as red.
-# A row whose series is back (or whose rule is gone) is reported as stale and
-# must be deleted -- the condition it describes is no longer true.
+# the private companion repository) treats a rule with absent series and no row
+# here as red. A row for a rule that now misses nothing (or that is gone from the
+# rule list) is reported as stale and must be deleted -- the condition it
+# describes is no longer true. A row for a rule name the layer's list does not
+# contain is red: that is a rename or a typo, and it will never heal by itself.
 #
 # Re-read 2026-10-19 02:20Z against Prometheus 3.14.0, kubelet v1.36.4+k3s1.
 
@@ -50,32 +58,32 @@
 # nothing in this registry is needed there because their series exist.
 
 # --- feature_off (3 rules): no remote write is configured -------------------
-PrometheusRemoteStorageFailures	prometheus_remote_storage_failed_samples_total,prometheus_remote_storage_samples_failed_total,prometheus_remote_storage_samples_total,prometheus_remote_storage_succeeded_samples_total	feature_off	No remote_write is configured, so the remote-storage queue never registers its counters.
-PrometheusRemoteWriteBehind	prometheus_remote_storage_queue_highest_sent_timestamp_seconds,prometheus_remote_storage_queue_highest_timestamp_seconds	feature_off	No remote_write target exists; there is no queue head to fall behind the tip.
-PrometheusRemoteWriteDesiredShards	prometheus_remote_storage_shards_desired,prometheus_remote_storage_shards_max	feature_off	No remote_write target exists; shard sizing only runs once remote write is configured.
+PrometheusRemoteStorageFailures	feature_off	No remote_write is configured, so the remote-storage queue never registers its counters.
+PrometheusRemoteWriteBehind	feature_off	No remote_write target exists; there is no queue head to fall behind the tip.
+PrometheusRemoteWriteDesiredShards	feature_off	No remote_write target exists; shard sizing only runs once remote write is configured.
 
 # --- object_absent (3 rules): HPA and PDB objects do not exist --------------
-KubeHpaMaxedOut	kube_horizontalpodautoscaler_spec_max_replicas,kube_horizontalpodautoscaler_spec_min_replicas,kube_horizontalpodautoscaler_status_current_replicas	object_absent	No HorizontalPodAutoscaler exists in the cluster; correct dormancy, the rule wakes when one is created.
-KubeHpaReplicasMismatch	kube_horizontalpodautoscaler_spec_max_replicas,kube_horizontalpodautoscaler_spec_min_replicas,kube_horizontalpodautoscaler_status_current_replicas,kube_horizontalpodautoscaler_status_desired_replicas	object_absent	No HorizontalPodAutoscaler exists; the replica mismatch this rule guards cannot occur.
-KubePdbNotEnoughHealthyPods	kube_poddisruptionbudget_status_current_healthy,kube_poddisruptionbudget_status_desired_healthy	object_absent	No PodDisruptionBudget exists; correct dormancy, the rule wakes when one is created.
+KubeHpaMaxedOut	object_absent	No HorizontalPodAutoscaler exists in the cluster; correct dormancy, the rule wakes when one is created.
+KubeHpaReplicasMismatch	object_absent	No HorizontalPodAutoscaler exists; the replica mismatch this rule guards cannot occur.
+KubePdbNotEnoughHealthyPods	object_absent	No PodDisruptionBudget exists; correct dormancy, the rule wakes when one is created.
 
 # --- exporter_version (14 rules): the source version does not expose it -----
-KubeJobNotCompleted	kube_job_labels	exporter_version	kube-state-metrics v2 dropped the kube_*_labels families; kube_job_info carries only allowlisted labels, which are off. The name appears only inside an unless clause, so its absence does not stop the rule from firing: it only makes the label_excluded_from_alerts opt-out inert. Restore by widening the allowlist and rewriting the clause to kube_job_info.
-KubePersistentVolumeFillingUp	kube_persistentvolumeclaim_labels	exporter_version	Same removed family as KubeJobNotCompleted, and again only inside an unless clause, so filling-volume alerts still fire; the opt-out is inert until the allowlist carries the label and the clause reads kube_persistentvolumeclaim_info.
-KubePersistentVolumeInodesFillingUp	kube_persistentvolumeclaim_labels	exporter_version	Same removed family and same unless-only position as KubePersistentVolumeFillingUp; the inode rule fires, its opt-out does not.
-KubePodNotReady	kube_pod_status_reason	error_only_state	kube_pod_status_reason is exported per reason only while a pod carries one (SchedulingGated et al.); no series means no pod is gated, and the unless clause then excludes nothing while the rule still fires on its phase/ready side.
-KubeNodeEviction	kubelet_evictions	lazy_counter	kubelet_evictions is an ALPHA counter labelled by eviction_signal, created on the first increment; no series means no eviction happened, and the rule fires as soon as one does. Not removed upstream.
-KubeletClientCertificateExpiration	kubelet_certificate_manager_client_ttl_seconds	feature_off	The certificate-manager family exists only while kubelet runs with --rotate-certificates; k3s leaves it off, so this is a config gap, not an upstream removal. Enabling rotation would expose it.
-KubeletClientCertificateRenewalErrors	kubelet_certificate_manager_client_expiration_renew_errors	feature_off	Same certificate-manager gate: emitted only with --rotate-certificates enabled.
-KubeletServerCertificateExpiration	kubelet_certificate_manager_server_ttl_seconds	feature_off	Same certificate-manager gate: emitted only with server certificate rotation enabled.
-KubeletServerCertificateRenewalErrors	kubelet_server_expiration_renew_errors	feature_off	Same certificate-manager gate: emitted only with server certificate rotation enabled.
+KubeJobNotCompleted	exporter_version	kube-state-metrics v2 dropped the kube_*_labels families; kube_job_info carries only allowlisted labels, which are off. The name appears only inside an unless clause, so its absence does not stop the rule from firing: it only makes the label_excluded_from_alerts opt-out inert. Restore by widening the allowlist and rewriting the clause to kube_job_info.
+KubePersistentVolumeFillingUp	exporter_version	Same removed family as KubeJobNotCompleted, and again only inside an unless clause, so filling-volume alerts still fire; the opt-out is inert until the allowlist carries the label and the clause reads kube_persistentvolumeclaim_info.
+KubePersistentVolumeInodesFillingUp	exporter_version	Same removed family and same unless-only position as KubePersistentVolumeFillingUp; the inode rule fires, its opt-out does not.
+KubePodNotReady	error_only_state	kube_pod_status_reason is exported per reason only while a pod carries one (SchedulingGated et al.); no series means no pod is gated, and the unless clause then excludes nothing while the rule still fires on its phase/ready side.
+KubeNodeEviction	lazy_counter	kubelet_evictions is an ALPHA counter labelled by eviction_signal, created on the first increment; no series means no eviction happened, and the rule fires as soon as one does. Not removed upstream.
+KubeletClientCertificateExpiration	feature_off	The certificate-manager family exists only while kubelet runs with --rotate-certificates; k3s leaves it off, so this is a config gap, not an upstream removal. Enabling rotation would expose it.
+KubeletClientCertificateRenewalErrors	feature_off	Same certificate-manager gate: emitted only with --rotate-certificates enabled.
+KubeletServerCertificateExpiration	feature_off	Same certificate-manager gate: emitted only with server certificate rotation enabled.
+KubeletServerCertificateRenewalErrors	feature_off	Same certificate-manager gate: emitted only with server certificate rotation enabled.
 
 # --- collector_off (5 rules): node-exporter collectors not enabled ----------
-NodeBondingDegraded	node_bonding_active,node_bonding_slaves	object_absent	The bonding collector is enabled by default in node-exporter and this host runs it -- node_scrape_collector_success{collector="bonding"} reads 0 because the host has no /proc/net/bonding at all, not because the collector is off. No bond device exists, so the family is empty; it is exported as soon as a bond is created and the rule then reads it.
-NodeRAIDDegraded	node_md_disks,node_md_disks_required	object_absent	The mdadm collector is enabled by default and reads success=1 on this host; /proc/mdstat lists the personalities but no arrays, so the family is legitimately empty. Create an array and the series appear.
-NodeRAIDDiskFailure	node_md_disks	object_absent	Same collector and same reason as NodeRAIDDegraded: mdadm runs (success=1) and exports per-disk state once an array exists; this host has none.
-NodeSystemdServiceCrashlooping	node_systemd_service_restart_total	collector_off	The systemd collector is the one opt-in collector among the three: node_scrape_collector_success has no series for it at all, and enabling it needs --collector.systemd plus the host dbus socket mounted into the pod. Turning it on can make node-exporter fail to start, so it is a deployment decision, not a flip.
-NodeSystemdServiceFailed	node_systemd_unit_state	collector_off	Same opt-in collector as NodeSystemdServiceCrashlooping; absent from node_scrape_collector_success means it was never asked to run.
+NodeBondingDegraded	object_absent	The bonding collector is enabled by default in node-exporter and this host runs it -- node_scrape_collector_success{collector="bonding"} reads 0 because the host has no /proc/net/bonding at all, not because the collector is off. No bond device exists, so the family is empty; it is exported as soon as a bond is created and the rule then reads it.
+NodeRAIDDegraded	object_absent	The mdadm collector is enabled by default and reads success=1 on this host; /proc/mdstat lists the personalities but no arrays, so the family is legitimately empty. Create an array and the series appear.
+NodeRAIDDiskFailure	object_absent	Same collector and same reason as NodeRAIDDegraded: mdadm runs (success=1) and exports per-disk state once an array exists; this host has none.
+NodeSystemdServiceCrashlooping	collector_off	The systemd collector is the one opt-in collector among the three: node_scrape_collector_success has no series for it at all, and enabling it needs --collector.systemd plus the host dbus socket mounted into the pod. Turning it on can make node-exporter fail to start, so it is a deployment decision, not a flip.
+NodeSystemdServiceFailed	collector_off	Same opt-in collector as NodeSystemdServiceCrashlooping; absent from node_scrape_collector_success means it was never asked to run.
 
 # --- error_only_state (1 rule): the family exists only while the state does --
-KubeNodeUnreachable	kube_node_spec_taint	error_only_state	kube-state-metrics exports one series per taint, so this family is empty while no node carries one -- and the exporter is demonstrably up, because kube_node_spec_unschedulable from the same node spec collector reads 1 here. Absent is the state, not the collector: the taint that makes a node unreachable is what creates the series, and the rule reads it from that moment.
+KubeNodeUnreachable	error_only_state	kube-state-metrics exports one series per taint, so this family is empty while no node carries one -- and the exporter is demonstrably up, because kube_node_spec_unschedulable from the same node spec collector reads 1 here. Absent is the state, not the collector: the taint that makes a node unreachable is what creates the series, and the rule reads it from that moment.

@@ -12,7 +12,11 @@
 # rule that found nothing wrong. Sleeping is not automatically a defect, but the
 # reason has to be written down where a reader (and the reading) can find it:
 #
-#     rule <tab> absent_series (comma separated) <tab> reason <tab> why
+#     rule <tab> reason <tab> why
+#
+# The absent series are NOT listed here: the reading computes them from the
+# rule's own selectors minus the live name face. Retyping a computed column only
+# adds a place for it to be wrong without anything turning red. One row per rule.
 #
 # reason is a closed set:
 #   object_absent     the object family is not deployed; the rule wakes with it
@@ -32,9 +36,10 @@
 #                     series appears on the next rollout, at which point this
 #                     row is reported stale and must be deleted
 #
-# An absent series without a row here exits 1. An unknown reason code, an empty
-# why, or a missing registry exits 3. A row whose series came back is reported
-# as stale -- the condition it describes is no longer true.
+# A rule with absent series and no row here exits 1. An unknown reason code, an
+# empty why, or a missing registry exits 3. A row for a rule that now misses
+# nothing is reported as stale -- the condition it describes is no longer true.
+# A row naming a rule this layer's list does not contain exits 1: rename or typo.
 #
 # The last two codes are the ones to watch: they turn "nothing happened" into a
 # legitimate dormant rule, so a wholesale application of them would silently
@@ -45,21 +50,21 @@
 # chart had grown to 194 rules (194 total, 12 cannot fire, 10 absent names).
 
 # --- lazy_counter (9 rules): counters that exist only after the bad event ----
-landing_mirror_behind	cogneva_mirror_push_failures_total	lazy_counter	Counted only when a mirror push is refused (cog-github/src/landing.rs record_counter on the failure branch); no refusal in 24h means the counter was never created. The rule fires on the first one.
-mainline_kubectl_refused	cogneva_mainline_kubectl_refused_total	lazy_counter	Counted only when the cluster's authorization refuses one of the deployer's kubectl calls (cog-reflection/src/mainline_deployer.rs record_kubectl_refused, refusal branch only); labels are the server's own verb+resource, so the family is created by the first refusal and the rule fires on it. Emitter landed in 252fe47b, inside the running image main-93ebcda35e7a.
-mainline_rollout_refused	cogneva_mainline_rollout_refused_total	lazy_counter	Counted only when the cluster's admission face keeps a rollout from creating a Pod (cog-reflection/src/mainline_deployer.rs record_rollout_refused, admission branch only); labels are the wall (quota/limitrange/podsecurity/admission), so the family is created by the first refusal and the rule fires on it. The emitter ships in the same change as this row, so the series stays absent until that build is running.
-mainline_delivery_preflight_refused	cogneva_mainline_preflight_refused_total	lazy_counter	Counted only when the preflight refuses a deploy (cog-reflection/src/mainline_deployer.rs); refused_total has no zero-value series until the first refusal.
-memory_backend_operation_never_succeeds	memory_operation_errors_total	lazy_counter	Counted only on a failed memory backend operation (cog-memory/src/metrics_instrumented.rs); no error in the window means no series. The rule also requires memory_operations_total, which is present on the success path.
-redrive_budget_forgotten	cogneva_redrive_budget_losses_total	lazy_counter	Read-side ledger loss is counted only when the ledger read fails (cog-github/src/landing.rs); today the read succeeds, so the {side="read"} series does not exist.
-redrive_charge_not_persisted	cogneva_redrive_budget_losses_total	lazy_counter	Write-side ledger loss is counted only when the ledger write fails (cog-github/src/landing.rs); today the write succeeds, so the {side="write"} series does not exist.
-registry_tag_deletion_refused	cogneva_registry_prune_failures_total	lazy_counter	Counted only when a registry prune is refused (cog-reflection/src/mainline_deployer.rs); no refusal in the window.
-trace_tier_migration_failing	cogneva_trace_tier_pass_failures_total	lazy_counter	Counted only when a trace-tier pass fails (cog-observability/src/snapshot.rs); no failure in the window.
+landing_mirror_behind	lazy_counter	Counted only when a mirror push is refused (cog-github/src/landing.rs record_counter on the failure branch); no refusal in 24h means the counter was never created. The rule fires on the first one.
+mainline_kubectl_refused	lazy_counter	Counted only when the cluster's authorization refuses one of the deployer's kubectl calls (cog-reflection/src/mainline_deployer.rs record_kubectl_refused, refusal branch only); labels are the server's own verb+resource, so the family is created by the first refusal and the rule fires on it. Emitter landed in 252fe47b, inside the running image main-93ebcda35e7a.
+mainline_rollout_refused	lazy_counter	Counted only when the cluster's admission face keeps a rollout from creating a Pod (cog-reflection/src/mainline_deployer.rs record_rollout_refused, admission branch only); labels are the wall (quota/limitrange/podsecurity/admission), so the family is created by the first refusal and the rule fires on it. The emitter ships in the same change as this row, so the series stays absent until that build is running.
+mainline_delivery_preflight_refused	lazy_counter	Counted only when the preflight refuses a deploy (cog-reflection/src/mainline_deployer.rs); refused_total has no zero-value series until the first refusal.
+memory_backend_operation_never_succeeds	lazy_counter	Counted only on a failed memory backend operation (cog-memory/src/metrics_instrumented.rs); no error in the window means no series. The rule also requires memory_operations_total, which is present on the success path.
+redrive_budget_forgotten	lazy_counter	Read-side ledger loss is counted only when the ledger read fails (cog-github/src/landing.rs); today the read succeeds, so the {side="read"} series does not exist.
+redrive_charge_not_persisted	lazy_counter	Write-side ledger loss is counted only when the ledger write fails (cog-github/src/landing.rs); today the write succeeds, so the {side="write"} series does not exist.
+registry_tag_deletion_refused	lazy_counter	Counted only when a registry prune is refused (cog-reflection/src/mainline_deployer.rs); no refusal in the window.
+trace_tier_migration_failing	lazy_counter	Counted only when a trace-tier pass fails (cog-observability/src/snapshot.rs); no failure in the window.
 
 # --- error_only_state (3 rules): gauges exported only when unhealthy --------
-declared_failure_class_unrecorded	collab_classification_unreachable	error_only_state	cog-collaboration/src/observable.rs emits this gauge only on the branch where a failure class could not be recorded; healthy operation exports nothing, which the rule reads as "no problem".
-held_series_check_unreadable	cogneva_metric_held_unreadable	error_only_state	cog-gateway/src/lib.rs exports this gauge only when the held-series check cannot be read; a readable check is absent, and the rule's max() sees no series.
-runtime_asset_content_drift	cogneva_runtime_asset_state	error_only_state	cog-reflection/src/runtime_assets.rs exports state gauges only for problem states of destinations that have one; a healthy asset is absent. The check's own timestamp is a separate series (cogneva_runtime_asset_check_seconds, present).
-runtime_asset_not_refreshed	cogneva_runtime_asset_state	error_only_state	Same gauge and same export rule; not_refreshed is absent because every checked asset matched its manifest.
+declared_failure_class_unrecorded	error_only_state	cog-collaboration/src/observable.rs emits this gauge only on the branch where a failure class could not be recorded; healthy operation exports nothing, which the rule reads as "no problem".
+held_series_check_unreadable	error_only_state	cog-gateway/src/lib.rs exports this gauge only when the held-series check cannot be read; a readable check is absent, and the rule's max() sees no series.
+runtime_asset_content_drift	error_only_state	cog-reflection/src/runtime_assets.rs exports state gauges only for problem states of destinations that have one; a healthy asset is absent. The check's own timestamp is a separate series (cogneva_runtime_asset_check_seconds, present).
+runtime_asset_not_refreshed	error_only_state	Same gauge and same export rule; not_refreshed is absent because every checked asset matched its manifest.
 
 # llm_pool_open_but_idle was declared code_not_deployed while the gateway image
 # predated both the rule (5443b0b4) and its publisher (ee334e8b). The rollout to
@@ -114,7 +119,7 @@ runtime_asset_not_refreshed	cogneva_runtime_asset_state	error_only_state	Same ga
 # --- code_not_deployed: none of the four sweeps any more ------------------
 
 # --- lazy_counter ---------------------------------------------------------
-mainline_admission_held	cogneva_mainline_admission_held_total	lazy_counter	cog-reflection/src/mainline_deployer.rs records this labelled counter only on a pass where admission actually held the rollout, so the family is created by the first hold. A deployment that never waited has no series, and the rule fires the moment one appears.
+mainline_admission_held	lazy_counter	cog-reflection/src/mainline_deployer.rs records this labelled counter only on a pass where admission actually held the rollout, so the family is created by the first hold. A deployment that never waited has no series, and the rule fires the moment one appears.
 
 # --- code_not_deployed: none right now -------------------------------------
 # The one row here (`change_ledger_measure_blind`) was deleted on 2026-10-29
