@@ -402,4 +402,175 @@ face_symmetry\tscripts/host/cogneva-face-symmetry-reading.sh\t面表对称\tcogn
             "imported 3 rows: inserted=2 updated=1 unchanged=0 retired=1"
         );
     }
+
+    /// A governance store that keeps rows in a vector. Only the two methods
+    /// this module calls are real; the rest of the port belongs to faces and
+    /// handovers, and reaching one of them from here would be a bug.
+    #[derive(Default)]
+    struct Rows(std::sync::Mutex<Vec<Task>>);
+
+    impl Rows {
+        fn dump(&self) -> Vec<Task> {
+            self.0.lock().expect("unpoisoned").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl GovernanceStore for Rows {
+        async fn governance_nodes(&self, task_type: &str) -> cog_core::SFResult<Vec<Task>> {
+            Ok(self
+                .dump()
+                .into_iter()
+                .filter(
+                    |task| matches!(&task.task_type, TaskType::Custom(kind) if kind == task_type),
+                )
+                .collect())
+        }
+
+        async fn save_governance_node(&self, task: &Task) -> cog_core::SFResult<()> {
+            let mut rows = self.0.lock().expect("unpoisoned");
+            match rows.iter_mut().find(|row| row.id == task.id) {
+                Some(existing) => *existing = task.clone(),
+                None => rows.push(task.clone()),
+            }
+            Ok(())
+        }
+
+        async fn face_nodes(&self) -> cog_core::SFResult<Vec<Task>> {
+            unreachable!("readings never touch faces")
+        }
+
+        async fn open_face_bound_tasks(&self) -> cog_core::SFResult<Vec<Task>> {
+            unreachable!("readings never touch faces")
+        }
+
+        async fn save_face_node(&self, _task: &Task) -> cog_core::SFResult<()> {
+            unreachable!("readings never touch faces")
+        }
+
+        async fn save_face_node_if_revision(
+            &self,
+            _task: &Task,
+            _expected: i64,
+        ) -> cog_core::SFResult<bool> {
+            unreachable!("readings never touch faces")
+        }
+
+        async fn save_governance_node_if_status(
+            &self,
+            _task: &Task,
+            _expected: &[TaskStatus],
+        ) -> cog_core::SFResult<bool> {
+            unreachable!("a roster import writes unconditionally")
+        }
+
+        async fn save_governance_node_with_event(
+            &self,
+            _event: &Task,
+            _node: &Task,
+            _expected: &[TaskStatus],
+        ) -> cog_core::SFResult<bool> {
+            unreachable!("a roster import carries no event")
+        }
+
+        async fn apply_handover(
+            &self,
+            _handover: &Task,
+            _face: &Task,
+            _expected_revision: i64,
+        ) -> cog_core::SFResult<Option<usize>> {
+            unreachable!("readings never move hands")
+        }
+
+        async fn reassign_face_work(
+            &self,
+            _face_id: &str,
+            _to_unit: &str,
+        ) -> cog_core::SFResult<usize> {
+            unreachable!("readings never move work")
+        }
+
+        async fn release_face_work(&self, _face_id: &str) -> cog_core::SFResult<usize> {
+            unreachable!("readings never release work")
+        }
+
+        async fn ensure_face_duty(&self, _row: &Task) -> cog_core::SFResult<bool> {
+            unreachable!("readings are not duties")
+        }
+    }
+
+    // The roster is the file, which is why importing twice must move no byte the
+    // second time: the import and the read run from the same file, and a row that
+    // flip-flopped on every round would look like a roster nobody is editing and
+    // everybody is rewriting.
+    #[tokio::test]
+    async fn importing_the_same_file_twice_is_a_fixed_point() {
+        let store = Rows::default();
+        let first = import_from_text(&store, ROSTER).await.expect("imports");
+        assert_eq!(first.rows, 2);
+        assert_eq!(first.inserted, 2);
+        let before = roster(&store).await.expect("reads");
+        let second = import_from_text(&store, ROSTER).await.expect("imports");
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.updated, 0);
+        assert_eq!(second.unchanged, 2);
+        assert_eq!(second.retired, 0);
+        assert_eq!(roster(&store).await.expect("reads"), before);
+    }
+
+    // A producer whose script was deleted leaves the file, and the file is the
+    // only place that says so. An import that only ever added rows would keep
+    // sending the aggregator back to a script that no longer exists, and the beat
+    // would read it as failing rather than gone.
+    #[tokio::test]
+    async fn a_row_the_file_stops_naming_leaves_the_roster() {
+        let store = Rows::default();
+        import_from_text(&store, ROSTER).await.expect("imports");
+        let shortened = "face_symmetry\tscripts/host/cogneva-face-symmetry-reading.sh\t面表对称\tcogneva_face_symmetry_unknown=verdict\n";
+        let summary = import_from_text(&store, shortened).await.expect("imports");
+        assert_eq!(summary.retired, 1);
+        assert_eq!(summary.unchanged, 1);
+        let now = roster(&store).await.expect("reads");
+        assert!(!now.contains("debt_edge_hook"), "{now}");
+        assert!(now.contains("face_symmetry"), "{now}");
+    }
+
+    #[tokio::test]
+    async fn changing_a_row_in_the_file_reaches_the_roster() {
+        let store = Rows::default();
+        import_from_text(&store, ROSTER).await.expect("imports");
+        let edited = ROSTER.replace("依赖边账的读数", "依赖边账的新说法");
+        let summary = import_from_text(&store, &edited).await.expect("imports");
+        assert_eq!(summary.updated, 1);
+        assert_eq!(summary.inserted, 0);
+        assert!(roster(&store)
+            .await
+            .expect("reads")
+            .contains("依赖边账的新说法"));
+    }
+
+    // A retired row stays in the graph as a cancelled node; rendering it would
+    // put the aggregator back on the deleted script one beat after the import
+    // that retired it.
+    #[tokio::test]
+    async fn a_cancelled_row_is_not_part_of_the_roster() {
+        let store = Rows::default();
+        import_from_text(&store, ROSTER).await.expect("imports");
+        let mut rows = store.dump();
+        rows[0].status = TaskStatus::Cancelled;
+        *store.0.lock().expect("unpoisoned") = rows;
+        let now = roster(&store).await.expect("reads");
+        let named = ROSTER.lines().filter(|line| !line.starts_with('#')).count();
+        assert_eq!(now.lines().count(), named - 1, "{now}");
+    }
+
+    #[tokio::test]
+    async fn a_file_that_does_not_parse_writes_nothing() {
+        let store = Rows::default();
+        let why = import_from_text(&store, "a\tscripts/a.sh\tx\t\na\tscripts/b.sh\ty\t\n")
+            .await
+            .expect_err("refused");
+        assert!(why.to_string().contains("appears twice"), "{why}");
+        assert!(store.dump().is_empty());
+    }
 }
