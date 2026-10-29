@@ -27,6 +27,7 @@ data:
   # 值从各工作负载的副本数算出来，不是这里另写一个数：改了副本数而这里不动，
   # 分摊就会按过期的进程数做。`+1` 是滚动影子——同一次滚动里新 Pod 已经连上、
   # 旧 Pod 还没退出，两者都要算。
+  {{- /* lit: 1 fixed — 滚动影子：一次滚动里新 Pod 已经连上、旧 Pod 还没退出，两者同时分摊同一个连接上限；它不随任何 profile 的副本数变 */}}
   COGNEVA_PG_SHARING_PROCESSES: {{ add (int .Values.gateway.replicas) (int .Values.evolution.replicas) (int .Values.securityGateway.replicas) 1 | quote }}
   COGNEVA_VECTOR_PROVIDER: "qdrant"
   QDRANT_URL: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.grpcPort) | quote }}
