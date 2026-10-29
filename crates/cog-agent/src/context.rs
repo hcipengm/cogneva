@@ -251,6 +251,16 @@ const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 /// 见 [`ContextWindow::trim_target`]。
 const TRIM_LOW_WATER_DIVISOR: usize = 2;
 
+/// 一条工具结果最多带多少字符，无论窗口有多大。
+///
+/// 窗口份额那道界回答的是「装不装得下」，这道界回答的是「值不值得每一轮都
+/// 带上它」。一条结果进来之后，它之后每一轮都要重发一次；上游前缀缓存能认的
+/// 只有与上一轮相同的字节，所以每轮新追加的体量直接决定命中率。实测工具结果
+/// 占每轮新增字节的 76%，把界放在窗口的一半时，一条构建日志就能占掉一轮的
+/// 全部新增。与 `read_file` 一页的字符界同源：一页读回来的和一条命令打出来的
+/// 进的是同一个位置。
+const TOOL_RESULT_CHAR_CAP: usize = 32 * 1024;
+
 /// The number of characters one tool result may occupy before it is cut.
 ///
 /// The tool-return path reads this to decide whether a result needs archiving,
@@ -262,6 +272,7 @@ pub fn tool_result_budget_chars(max_tokens: usize) -> usize {
     (max_tokens / TOOL_RESULT_WINDOW_SHARE_DIVISOR)
         .max(1)
         .saturating_mul(cog_core::token_estimate::CHARS_PER_TOKEN)
+        .min(TOOL_RESULT_CHAR_CAP)
 }
 
 /// 把超出窗口份额的单条工具结果截断到预算内，其余消息原样返回。
@@ -816,6 +827,31 @@ mod tests {
             kept.chars().count() < 1000,
             "8000 字符的结果被压到窗口份额换算出的字符预算 400/2*4 = 800 附近: {}",
             kept.chars().count()
+        );
+    }
+
+    #[test]
+    /// 窗口大不等于一条结果就可以带走半个窗口。
+    ///
+    /// 生产窗口几十万 token，按份额算一条结果能带两百万字符——那是「装得下」，
+    /// 不是「值得之后每一轮都重发一遍」。两道界取更紧的那个；小窗口下份额仍是
+    /// 更紧的那道，所以小窗口的曲线不变。
+    #[test]
+    fn a_result_is_capped_by_characters_not_only_by_the_window_share() {
+        assert_eq!(
+            tool_result_budget_chars(400),
+            800,
+            "小窗口下份额仍是更紧的那道，老行为不变"
+        );
+        assert_eq!(
+            tool_result_budget_chars(200_000),
+            TOOL_RESULT_CHAR_CAP,
+            "生产窗口下字符界才是更紧的那道"
+        );
+        assert!(
+            tool_result_budget_chars(200_000)
+                < 200_000 * cog_core::token_estimate::CHARS_PER_TOKEN / 2,
+            "份额那道界必须真的被压下来，否则这条用例没有题目"
         );
     }
 
