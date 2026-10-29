@@ -3217,6 +3217,93 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 75,
+          "title": "Change Ledger Debt by Face",
+          "description": "The change account counted by the face the declaring documents name, one line per reading per face. Landed, owed and retired are the face's three populations and are drawn unstacked: a stack would add them into a height that means nothing, because the lines count different rows and a face's size is not their sum. The three together are the whole population, which is what lets a face that retired its work be told from one that finished -- those are opposite answers that read the same on any single line. Undecided is drawn beside them and is not a fourth bucket: it counts rows already inside owed, the ones nothing has settled, so it can never exceed the owed line it belongs to, and a face whose undecided sits at zero is a face that has asked about every row it owes rather than a face with nothing outstanding. None is the block rows no document filed fall under, and it reads like any other face: an account whose unfiled rows dominate is one whose own declarations have fallen behind. Every face is written on every pass, including the ones that owe nothing, and the pass publishes nothing at all rather than a set of zeros when its store read fails -- so a gap across every block is the read failing, not the account emptying, and a single block whose line stops is that block leaving the population the census walks, with its last values standing until a newer row supersedes them. Neither shape is a zero, and a reader who takes one for a zero reads a face that finished as one that went quiet. Every value is a whole-account count, so a maximum across label sets is the same fact once and a sum would count two processes' copies twice.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 352
+          },
+          "targets": [
+            {
+              "expr": "max by (block) (cogneva_change_block_census{reading=\"owed\"})",
+              "legendFormat": "{{block}} owed",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (block) (cogneva_change_block_census{reading=\"undecided\"})",
+              "legendFormat": "{{block}} undecided (inside owed)",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (block) (cogneva_change_block_census{reading=\"landed\"})",
+              "legendFormat": "{{block}} landed",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "max by (block) (cogneva_change_block_census{reading=\"retired\"})",
+              "legendFormat": "{{block}} retired",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "id": 76,
+          "title": "Change Ledger Oldest Unmeasured Debt by Face",
+          "description": "Seconds since the last measurement of the longest-waiting row each face still owes -- the one reading on the census with a direction of its own, because an owed count that is not moving says nothing about whether anybody is looking at it and an age does. Drawn per block and never summed: an age is not a quantity, and the account's longest wait is the largest of these lines rather than their total. The cell is skipped rather than written as zero on a face whose every owed row has been measured, so a gap in one block's line says that face owes nothing unmeasured while a neighbour climbing says it does -- and that is the opposite of zero, which would say the face owes nothing at all. Read beside the debt panel: a flat owed line under a climbing age is a backlog nobody is measuring, and a flat owed line with no age at all is a backlog already settled and only waiting for a decision.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 352
+          },
+          "targets": [
+            {
+              "expr": "max by (block) (cogneva_change_block_census{reading=\"oldest_unmeasured_seconds\"})",
+              "legendFormat": "{{block}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "spanNulls": false
+              }
+            }
+          }
         }
       ],
       "templating": {

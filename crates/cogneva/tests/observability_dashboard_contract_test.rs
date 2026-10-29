@@ -959,6 +959,18 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &[],
         "crates/cogneva/src/pin_census.rs",
     ),
+    // The change account counted by face and by reading. The row is what makes
+    // the legends on the two face panels a claim rather than a label: a panel
+    // naming `{{block}}` is only drawn from a series that carries the label, and
+    // the label set lives in the producer, not in the panel. The producer
+    // writes every face on every pass, including the ones that owe nothing, so
+    // a face whose line stops is one that left the census rather than one that
+    // emptied -- which is the distinction those panels are read for.
+    (
+        "cogneva_change_block_census",
+        &["block", "reading"],
+        "crates/cog-orchestrator/src/change_ledger.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

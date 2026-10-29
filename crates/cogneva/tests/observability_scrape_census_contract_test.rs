@@ -55,12 +55,12 @@
 //! producer that spells its name some other way and that nothing reads lands
 //! there as an unexplained literal rather than as a series nothing checks.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 mod common;
 
 use common::routes::{read_repo, repo_root};
-use common::rust_production::all_crate_files;
+use common::rust_production::{all_crate_files, production_sources, production_text};
 use common::service_topology;
 
 #[path = "common/dashboard.rs"]
@@ -74,6 +74,14 @@ use promql::metric_names_in;
 use unread::{unresolved_readers, Unread};
 
 const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
+
+/// 生产代码里至少该读到多少条被 `query_*` 点名的序列。
+///
+/// 实测只有三条——这条腿现在就是这么细：多数 `query_*` 调用点落在文件的
+/// `#[cfg(test)]` 模块里，生产代码读回 store 的地方本就不多。下限压在实测之下但
+/// 不为零，它挡的是「遍历走错目录」与「括号配对坏了、一个区间都没取到」这两种走法：
+/// 两种都会把这条腿读成空，而空腿会让所有靠自读喂下一轮的面整体记成没人看。
+const MIN_SHIPPED_QUERY_NAMES: usize = 2;
 
 /// The two produced-series tables, and the line that opens each. They are read
 /// as text out of the test that owns them: the face is "the table in that
@@ -697,6 +705,277 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
     );
 }
 
+/// How many series the store can hold that nothing in the tree reads.
+///
+/// The census above stops at the edge of the closed set on purpose: a name in
+/// `metric_names::ALL` is one the store may hold, and its reader is judged by the
+/// alert-rule contract, which asks every closed-set name whether a rule or a
+/// panel reads it. That leaves a shape neither contract counts. A name enters
+/// the closed set when a producer calls `record_gauge` with it; the rule and the
+/// panel faces read PromQL, so a series read back **inside** a process -- the
+/// pass that writes a number and the next pass that reads it to decide what to
+/// do -- is read by neither. Today that is the ordinary shape of a store-backed
+/// reading: the change ledger writes its census and its dispatch readouts, and
+/// the dispatch pass queries them on the next tick. Before that gate existed,
+/// `cogneva_change_block_census` had a producer, two test-only query calls, and
+/// nothing else -- and every gate was green, because the rule-and-panel census
+/// had filed it as a declared debt and the scrape census had excluded it as a
+/// closed-set name.
+///
+/// So this counts the third face: closed-set names that no rule expression, no
+/// panel and no shipped `query_*` call names. It is a count rather than a zero
+/// because several of these are deliberate -- a series written so that a
+/// question has an answer at all, months before the reader that asks it -- and
+/// the number is what keeps "nobody reads this yet" a decision on the record
+/// instead of a shape the gates cannot see.
+///
+/// The read leg is `production_sources`, not `all_crate_files`: the latter walks
+/// `tests/` too, and the first count taken with it was wrong in the direction
+/// that hides a debt -- `change_ledger.rs`'s own `#[cfg(test)]` module queries
+/// the census twice, and a call from a fixture reads the fixture. Files under
+/// `src/` keep their in-file test modules, so `production_text` cuts those out.
+///
+/// Forty when the count was first taken, and the size is not a smell: several of
+/// these names are filed in the alert-rule contract's UNREAD table as readings
+/// whose reader is owed or lives outside this repository's rules and panels, and
+/// the rest are the same shape -- a producer written so the question has an
+/// answer before anything asks it. Judging those filings is that table's job;
+/// what this adds is that the set is counted, so a new series lands here as a
+/// number that moved rather than as a name nobody noticed. It is not a target
+/// either -- a series that acquires a rule, a panel or a shipped read leaves
+/// this number, and adding one means admitting a new series nobody reads.
+const STORE_BACKED_WITHOUT_A_READER: usize = 40;
+
+#[test]
+fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {
+    let registry: BTreeSet<String> = cog_core::metric_names::ALL
+        .iter()
+        .map(|n| n.as_str().to_string())
+        .collect();
+    let mut read: BTreeSet<String> = rule_expressions()
+        .iter()
+        .flat_map(|expr| metric_names_in(expr))
+        .collect();
+    read.extend(dashboard::series());
+    let shipped = production_query_reads();
+    read.extend(shipped.iter().cloned());
+
+    assert!(
+        !read.is_empty(),
+        "规则与面板一条都没读到，这一行数的是「没有读者」，读数会全靠坏掉的那两面"
+    );
+    assert!(
+        shipped.len() >= MIN_SHIPPED_QUERY_NAMES,
+        "生产代码里只读到 {} 条被 `query_*` 点名的序列（下限 {MIN_SHIPPED_QUERY_NAMES}）: {shipped:?}\n\
+         这一面读不到就等于把所有进程内自读的序列都记成没有读者，而这行数的正是它们",
+        shipped.len()
+    );
+
+    // 一个直方图以基名登记，读者读的是记录时派生出来的后缀：`_bucket` / `_sum` /
+    // `_count`，外加 store 给每条序列渲染的那个时间戳伴生名。读后缀就是读了这一族，
+    // 不折这一刀会把每个直方图都记成没人看。
+    let read_by = |name: &str| {
+        read.contains(name)
+            || DERIVED_SUFFIXES
+                .iter()
+                .any(|suffix| read.contains(&format!("{name}{suffix}")))
+    };
+    let unread: Vec<&str> = registry
+        .iter()
+        .map(String::as_str)
+        .filter(|n| !read_by(n))
+        .collect();
+
+    assert_eq!(
+        unread.len(),
+        STORE_BACKED_WITHOUT_A_READER,
+        "闭集里既没有规则、没有面板、也没有生产代码 `query_*` 读的序列数与 \
+         STORE_BACKED_WITHOUT_A_READER 不再相等（现在 {} 条，常数 \
+         {STORE_BACKED_WITHOUT_A_READER}）:\n{}\n\
+         多一条：新序列要当轮补一个读者（规则、面板或生产代码里的自读），\
+         否则它不是「已覆盖」而是「写进 store 却没人看」；\
+         少一条：补齐了读者，这个数要跟着减",
+        unread.len(),
+        unread.join("\n")
+    );
+}
+
+/// 生产代码里被 `query_*` 调用点名过的闭集序列。
+///
+/// 一条序列有三种读者：告警规则、面板、以及进程内自读——某个面把上一轮写进
+/// store 的读数读回来，用它决定这一轮做什么。第三种不经过 PromQL，所以前两张
+/// 面都看不见它，而它恰恰是 store 派生序列最常见的读者。
+///
+/// 名字在调用实参里通常不是字面量：`metric_names::CHANGE_BLOCK_CENSUS.as_str()`、
+/// `cog_core::metric_names::POLICY_STORE_READINGS.as_str()`。所以这里读两样：实参
+/// 区间里的序列名字面量，和 `metric_names::<IDENT>` 里的那个标识符——后者经
+/// `IDENTIFIED` 换回名字，那个表是编译期从常量生成的，不是这里手抄的第二份。
+///
+/// 读不到的两处并写在这里：名字经局部变量转手（`query_gauge_latest(name)`，`name`
+/// 是形参）时，这一层只看见形参；名字经 `use ... as` 改名后以别名传入时，只看见
+/// 别名。两者都只会让本条判据少认一个读者，也就是多半条欠账——方向与这张表一致
+/// （宁可多记一笔没人看的，不肯把没人看读成有人看）。
+fn production_query_reads() -> BTreeSet<String> {
+    let registry: BTreeSet<&str> = cog_core::metric_names::ALL
+        .iter()
+        .map(|n| n.as_str())
+        .collect();
+    let ident_to_name: BTreeMap<&str, &str> = cog_core::metric_names::IDENTIFIED
+        .iter()
+        .map(|(ident, metric)| (*ident, metric.as_str()))
+        .collect();
+    let mut found = BTreeSet::new();
+    for path in production_sources(&repo_root()) {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+        let text = production_text(&text);
+        for span in query_call_spans(&text) {
+            // 实参里的字面量不按前缀认：闭集里不是每条序列都以那个前缀开头，
+            // `http_request_duration_ms` 与 `memory_*` 一族就不是。认「闭集里有没有
+            // 这个词」而不是「它长得像不像」，前缀是别处登记表的形状，不是这里的。
+            found.extend(
+                string_literals(&span)
+                    .into_iter()
+                    .filter(|literal| registry.contains(literal.as_str())),
+            );
+            for ident in metric_path_idents(&span) {
+                if let Some(name) = ident_to_name.get(ident.as_str()) {
+                    found.insert((*name).to_string());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// `text` 里每一个双引号字符串的内容。
+///
+/// 反斜杠转义整体跳过，所以 SQL 常量里的 `\"` 不会把一段代码读成一个字符串。字符
+/// 字面量与行注释不跳：它们在这个位置不出现，出现了也只会多切一段、少认一个名字，
+/// 不会让一个调用点凭空读出一条序列。
+fn string_literals(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        let mut value = String::new();
+        i += 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => {
+                    if let Some(next) = text[i + 1..].chars().next() {
+                        value.push(next);
+                    }
+                    i += 2;
+                }
+                b'"' => {
+                    i += 1;
+                    break;
+                }
+                _ => {
+                    let ch = text[i..].chars().next().unwrap_or('"');
+                    value.push(ch);
+                    i += ch.len_utf8();
+                }
+            }
+        }
+        out.push(value);
+    }
+    out
+}
+
+/// 一次生产代码里 `query_*` 调用的实参区间。
+///
+/// 区间的边界靠配对括号找，括号里跳字符串字面量：实参本身就是一个字符串时，
+/// 字面量里的括号不是语法的一部分。行注释与字符字面量不跳——这个位置不该出现
+/// 它们，出现了也只会让区间提前结束或少认一个名字，不会让调用点凭空多出一个。
+fn query_call_spans(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if !(c.is_ascii_alphabetic() || c == '_') {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && {
+            let ch = bytes[i] as char;
+            ch.is_ascii_alphanumeric() || ch == '_'
+        } {
+            i += 1;
+        }
+        if !text[start..i].starts_with("query_") {
+            continue;
+        }
+        let mut open = i;
+        while open < bytes.len() && (bytes[open] as char).is_whitespace() {
+            open += 1;
+        }
+        if open >= bytes.len() || bytes[open] != b'(' {
+            continue;
+        }
+        if let Some(close) = matching_close(text, open) {
+            spans.push(text[open + 1..close].to_string());
+            i = close + 1;
+        }
+    }
+    spans
+}
+
+/// `open` 位置上那个 `(` 的配对位置，字符串字面量整体跳过。
+fn matching_close(text: &str, open: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' => i += 2,
+                        b'"' => break,
+                        _ => i += 1,
+                    }
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 实参区间里 `metric_names::<IDENT>` 的标识符。
+fn metric_path_idents(span: &str) -> Vec<String> {
+    let mut idents = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = span[from..].find("metric_names::") {
+        let start = from + offset + "metric_names::".len();
+        let end = span[start..]
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(span.len(), |i| start + i);
+        if end > start {
+            idents.push(span[start..end].to_string());
+        }
+        from = end.max(start);
+    }
+    idents
+}
+
 /// Every series-name literal under `crates/` is accounted for.
 ///
 /// The denominator above is read from two shapes, so a producer that spelled
@@ -1186,6 +1465,54 @@ mod tests {
         assert!(
             !spells_series(&renamed, &name),
             "a row naming a file that no longer spells the series is a registration without a producer"
+        );
+    }
+
+    /// 一次 `query_*` 调用的实参，两处细节各占一条：字符串里的括号不是语法，而
+    /// 名字既可能写成字面量，也可能写成 `metric_names::<IDENT>`。
+    ///
+    /// 这条判据第一次跑的时候，正是把「括号配对」写成了「取到行尾」，于是一个带
+    /// 括号的实参后面所有调用点都没被读到——腿读空时那张表仍然「自洽」，只是整片
+    /// 生产读者都被记成了没人看。所以这两处形状在这里各钉一个标本。
+    #[test]
+    fn a_call_span_ends_at_its_own_close_and_carries_both_spellings() {
+        let literal = r#"metrics.query_gauge_latest("a_series").await"#;
+        assert_eq!(query_call_spans(literal), vec!["\"a_series\"".to_string()]);
+
+        let nested = "store.query_gauge_range(metric_names::SOME_READING.as_str(), (start, end))";
+        let spans = query_call_spans(nested);
+        assert_eq!(
+            spans,
+            vec!["metric_names::SOME_READING.as_str(), (start, end)".to_string()],
+            "实参里自己带括号时，区间要停在这条调用自己的右括号上"
+        );
+        assert_eq!(
+            metric_path_idents(&spans[0]),
+            vec!["SOME_READING".to_string()]
+        );
+
+        let quoted_paren = "m.query_counter_totals(\"a(name)\")";
+        assert_eq!(
+            query_call_spans(quoted_paren),
+            vec!["\"a(name)\"".to_string()],
+            "字符串里的括号不配对，跟着它走会把区间延到文件末尾"
+        );
+        assert_eq!(string_literals("\"a(name)\""), vec!["a(name)".to_string()]);
+    }
+
+    /// 名字经形参转手时这一层看不见它，而看不见的方向是多记一笔欠账。
+    ///
+    /// 不是「本该看见却漏了」：调用点写的是 `name`，`name` 绑定在哪是另一个文件的
+    /// 事实，把绑定当读者追下去就得做类型推导。方向写清楚比能力写大重要——这条腿
+    /// 读不到只会让某个真读者被记成没人看，不会让没人看的读成有人看。
+    #[test]
+    fn a_name_passed_as_a_variable_is_not_read_as_a_reader() {
+        let through_a_variable = "backend.query_gauge_latest(name).await";
+        let spans = query_call_spans(through_a_variable);
+        assert_eq!(spans, vec!["name".to_string()]);
+        assert!(
+            string_literals(&spans[0]).is_empty() && metric_path_idents(&spans[0]).is_empty(),
+            "形参不是名字，这一层只认得写下来的字面量与常量路径"
         );
     }
 }
