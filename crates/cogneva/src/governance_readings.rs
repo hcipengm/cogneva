@@ -80,6 +80,17 @@ pub fn parse_roster(text: &str) -> Result<Vec<ReadingRow>, String> {
         if path.is_empty() {
             return Err(format!("line {at}: producer `{producer}` names no script"));
         }
+        // The aggregator runs `$ROOT/$path`, so the path has to stay inside the
+        // tree. An absolute path or one that climbs with `..` would name a script
+        // outside the repo, and the failure downstream is indistinguishable from
+        // "the script was never landed" — the one diagnosis this roster cannot
+        // afford to blur.
+        if path.starts_with('/') || path.split(['/', '\\']).any(|part| part == "..") {
+            return Err(format!(
+                "line {at}: producer `{producer}` names `{path}`, which is not a path \
+                 inside the repository"
+            ));
+        }
         let note = columns.get(2).map(|n| n.trim()).unwrap_or("").to_string();
         let series: Vec<String> = columns
             .get(3)
@@ -316,6 +327,17 @@ face_symmetry\tscripts/host/cogneva-face-symmetry-reading.sh\t面表对称\tcogn
     fn a_producer_that_is_not_a_label_is_refused() {
         let why = parse_roster("DeadgEdge\tscripts/a.sh\tx\t\n").expect_err("refused");
         assert!(why.contains("not `[a-z][a-z0-9_]*`"), "{why}");
+    }
+
+    // The aggregator joins this onto the repository root. A path that leaves the
+    // tree fails downstream exactly like a script nobody landed, and that is the
+    // one pair of causes this roster must not make look alike.
+    #[test]
+    fn a_path_outside_the_tree_is_refused() {
+        for path in ["/usr/bin/true", "../outside.sh", "scripts/../../x.sh"] {
+            let why = parse_roster(&format!("p\t{path}\tn\t\n")).expect_err("refused");
+            assert!(why.contains("not a path"), "{path}: {why}");
+        }
     }
 
     #[test]
