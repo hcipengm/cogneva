@@ -1094,10 +1094,18 @@ jobs:
       # and the log needs a token to read. This job runs the same suite under
       # instrumentation, so a failure here and a failure there are two readings
       # of one flake unless both say which test it was.
+      #
+      # --no-fail-fast for the same reason the test job has it, and one round
+      # later than it should have: without it cargo stops at the first failing
+      # test *binary*, so the report names one red and says nothing about the
+      # next. 2026-10-29 cost two full CI rounds for exactly that -- f917787b
+      # red on the scrape census, a57d3db1 fixed it and red on
+      # the_fixture_reading_steps_are_written_once, which had been failing in
+      # the same tree the whole time.
       - name: Generate coverage
         run: |
           set -o pipefail
-          cargo llvm-cov --workspace --cobertura --output-path cobertura.xml --fail-under-lines 40 2>&1 | tee /tmp/coverage.log || {
+          cargo llvm-cov --workspace --no-fail-fast --cobertura --output-path cobertura.xml --fail-under-lines 40 2>&1 | tee /tmp/coverage.log || {
             # The panic line names a place, not a cause: the message the
             # assertion carried -- and for an assertion, the values it compared
             # -- is on the lines after it. An annotation that stops at the line
