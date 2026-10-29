@@ -37,10 +37,39 @@
 //! statements to retry one of them would mean parsing SQL, and a text that
 //! holds a dollar-quoted body or a semicolon inside a literal would be split
 //! wrongly by anything that did not.
+//!
+//! # Why a statement the catalog already satisfies is not run at all
+//!
+//! A bounded wait answers "how long may this hold the queue open", not "should
+//! it queue at all". On a table of a few hundred megabytes and a host whose
+//! storage is saturated, the reader an `ALTER` waits for can hold ACCESS SHARE
+//! for minutes, and no retry budget short of that window gets the lock -- while
+//! every attempt that gives up hands the queue back and re-joins it, which is
+//! the reader's latency paid over and over for a statement that would have done
+//! nothing. Measured on a rolling restart: the incoming replica retried sixteen
+//! times over seventeen seconds against a read that took a hundred and fifteen,
+//! and the start failed while the table it wanted to alter already had every
+//! column the statement names.
+//!
+//! So the wait is not where the steady state should live. Every statement this
+//! module can prove is already in the catalog is dropped before the batch is
+//! sent: [`already_in_effect`] reads the text, keeps only the shapes whose
+//! effect is a catalog fact (`CREATE TABLE IF NOT EXISTS`,
+//! `CREATE INDEX IF NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`,
+//! `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL`), and answers whether every
+//! one of them already holds. A text holding anything else -- a statement whose
+//! effect is rows rather than catalog, a shape this cannot read, a body it
+//! cannot split -- is run as it always was, unread.
+//!
+//! The guard only ever removes work. It cannot skip a statement that would have
+//! changed something: a check it cannot evaluate makes the whole text run, and
+//! the shapes it does read are the ones PostgreSQL itself defines as no-ops
+//! when the object is there.
 
 use cog_core::{SFError, SFResult};
 use sqlx::PgPool;
 use std::time::Duration;
+use tracing::warn;
 
 /// The runner a store outside this crate is handed instead of a pool.
 ///
@@ -179,6 +208,14 @@ fn mark(tag: &str) -> String {
 /// lock wait would still be holding every lock the earlier statements took,
 /// and there would be no point at which they could be released.
 pub async fn apply(pool: &PgPool, schema: &str) -> SFResult<()> {
+    // Before anything asks for a lock: is there anything left to do? The
+    // common start is a table that already has every column and index the text
+    // names, and there the honest cost of the batch is zero -- asking for
+    // ACCESS EXCLUSIVE to find that out is what put the outgoing replica's
+    // readers at the back of a queue behind a statement with no work to do.
+    if already_in_effect(pool, schema).await {
+        return Ok(());
+    }
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -302,6 +339,334 @@ pub async fn apply_all(pool: &PgPool, schemas: &[&str]) -> SFResult<()> {
     Ok(())
 }
 
+/// Whether every statement in `schema` is one the catalog already satisfies,
+/// so sending the batch would take locks to change nothing.
+///
+/// `false` is the safe answer and the one every uncertainty resolves to: a
+/// statement this cannot read, a check that does not hold, a catalog that
+/// cannot be read. The batch then runs exactly as it did before this existed.
+///
+/// A catalog read that fails is reported and treated as "no answer": a start
+/// that cannot read `pg_catalog` has a larger problem than the lock, and
+/// turning it into a different failure here would hide it.
+async fn already_in_effect(pool: &PgPool, schema: &str) -> bool {
+    let Some(checks) = catalog_checks(schema) else {
+        return false;
+    };
+    match checks_hold(pool, &checks).await {
+        Ok(all) => all,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "schema_ddl: the catalog could not be read, so the schema is sent unread"
+            );
+            false
+        }
+    }
+}
+
+/// Whether the guard reads every statement in `schema` as a catalog fact, so
+/// the batch can be answered without sending it.
+///
+/// This is the guard's own question, asked without a database, and it is public
+/// because the answer is a property of the text while the texts belong to the
+/// crates that own the statements. The only place that can hold the real
+/// startup batch next to the guard is the assembly root, and a guard no real
+/// text reaches is a guard that fixes nothing.
+///
+/// `false` says nothing about whether the batch is idempotent -- only that this
+/// module cannot prove it from the catalog, and will therefore run it.
+pub fn guard_reads(schema: &str) -> bool {
+    catalog_checks(schema).is_some()
+}
+
+/// One fact the catalog can be asked about, per statement this can read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Check {
+    TableExists(String),
+    IndexExists(String),
+    ColumnExists { table: String, column: String },
+    ColumnIsNotNull { table: String, column: String },
+}
+
+/// The checks a schema text reduces to, or `None` when it holds anything this
+/// cannot prove is already done.
+///
+/// `Some(vec![])` is a text with no statements in it, which is satisfied by
+/// doing nothing; `None` is always "run it".
+fn catalog_checks(schema: &str) -> Option<Vec<Check>> {
+    let mut checks = Vec::new();
+    for statement in statements(schema)? {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        checks.push(classify(statement)?);
+    }
+    Some(checks)
+}
+
+/// Which catalog fact one statement establishes, if this can read it.
+///
+/// Only the leading tokens are read, and only as far as the object's name: the
+/// body of a `CREATE TABLE` holds types, defaults and constraints, and nothing
+/// there changes whether running it would be a no-op. A shape that is not one
+/// of the four below -- including the same words with `IF NOT EXISTS` missing,
+/// which is a statement that *fails* when the object is there -- is `None`.
+fn classify(statement: &str) -> Option<Check> {
+    let words: Vec<String> = statement
+        .split_whitespace()
+        .map(|word| word.to_ascii_lowercase())
+        .collect();
+    let word = |at: usize| words.get(at).map(String::as_str);
+    // An identifier this hands to the catalog has to be the unquoted, folded
+    // form PostgreSQL will look it up by; anything else (quoted, qualified,
+    // carrying the opening parenthesis) is left to the batch to run.
+    let name = |at: usize| -> Option<String> {
+        let found = words.get(at)?;
+        let usable = !found.is_empty()
+            && found
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$');
+        usable.then(|| found.clone())
+    };
+
+    match word(0)? {
+        "create" => match (word(1)?, word(2)?) {
+            ("table", "if") if word(3) == Some("not") && word(4) == Some("exists") => {
+                Some(Check::TableExists(name(5)?))
+            }
+            ("index", "if") if word(3) == Some("not") && word(4) == Some("exists") => {
+                Some(Check::IndexExists(name(5)?))
+            }
+            ("unique", "index")
+                if word(3) == Some("if") && word(4) == Some("not") && word(5) == Some("exists") =>
+            {
+                Some(Check::IndexExists(name(6)?))
+            }
+            _ => None,
+        },
+        "alter" => {
+            if word(1)? != "table" {
+                return None;
+            }
+            let table = name(2)?;
+            if word(3) == Some("add")
+                && word(4) == Some("column")
+                && word(5) == Some("if")
+                && word(6) == Some("not")
+                && word(7) == Some("exists")
+            {
+                return Some(Check::ColumnExists {
+                    table,
+                    column: name(8)?,
+                });
+            }
+            if word(3) == Some("alter")
+                && word(4) == Some("column")
+                && word(6) == Some("set")
+                && word(7) == Some("not")
+                && word(8) == Some("null")
+            {
+                return Some(Check::ColumnIsNotNull {
+                    table,
+                    column: name(5)?,
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Split a schema text into statements at the semicolons that end them.
+///
+/// This is not a SQL parser and is not asked to be one: it tracks the four
+/// things that can hide a semicolon -- a line comment, a (nesting) block
+/// comment, a quoted string or identifier, a dollar-quoted body -- and returns
+/// `None` when one of them is left open. A separator it gets wrong splits one
+/// statement into two, and neither half then matches a shape, which makes the
+/// text run unread rather than skip.
+fn statements(text: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut found: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut at = 0;
+    while at < chars.len() {
+        let here = chars[at];
+        let next = chars.get(at + 1).copied();
+        if here == '-' && next == Some('-') {
+            at += 2;
+            while at < chars.len() && chars[at] != '\n' {
+                at += 1;
+            }
+        } else if here == '/' && next == Some('*') {
+            let mut depth = 1usize;
+            at += 2;
+            while at < chars.len() && depth > 0 {
+                if chars[at] == '/' && chars.get(at + 1) == Some(&'*') {
+                    depth += 1;
+                    at += 2;
+                } else if chars[at] == '*' && chars.get(at + 1) == Some(&'/') {
+                    depth -= 1;
+                    at += 2;
+                } else {
+                    at += 1;
+                }
+            }
+            if depth > 0 {
+                return None;
+            }
+        } else if here == '\'' || here == '"' {
+            // A doubled quote is the escape; the run ends at the first one not
+            // followed by its twin.
+            current.push(here);
+            at += 1;
+            loop {
+                let inner = *chars.get(at)?;
+                current.push(inner);
+                at += 1;
+                if inner == here {
+                    if chars.get(at) == Some(&here) {
+                        current.push(here);
+                        at += 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else if here == '$' {
+            // A dollar-quoted body, whose tag is read off the opening marker
+            // and looked for again as the closing one.
+            let mut end_of_tag = at + 1;
+            while end_of_tag < chars.len()
+                && (chars[end_of_tag].is_alphanumeric() || chars[end_of_tag] == '_')
+            {
+                end_of_tag += 1;
+            }
+            if chars.get(end_of_tag) != Some(&'$') {
+                // A `$` that opens nothing -- a parameter, or an operator.
+                current.push(here);
+                at += 1;
+                continue;
+            }
+            let tag: String = chars[at..=end_of_tag].iter().collect();
+            let rest: String = chars[end_of_tag + 1..].iter().collect();
+            let close = rest.find(&tag)?;
+            let end = end_of_tag + 1 + rest[..close].chars().count() + tag.chars().count();
+            current.extend(chars[at..end].iter());
+            at = end;
+        } else if here == ';' {
+            found.push(std::mem::take(&mut current));
+            at += 1;
+        } else {
+            current.push(here);
+            at += 1;
+        }
+    }
+    if !current.trim().is_empty() {
+        found.push(current);
+    }
+    Some(found)
+}
+
+/// Whether the catalog already says everything `checks` asks for.
+async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
+    if checks.is_empty() {
+        return Ok(true);
+    }
+
+    let tables: Vec<String> = checks
+        .iter()
+        .filter_map(|check| match check {
+            Check::TableExists(table) => Some(table.clone()),
+            _ => None,
+        })
+        .collect();
+    if !tables.is_empty() {
+        let present: Vec<String> = sqlx::query_scalar(
+            "SELECT c.relname
+               FROM pg_class c
+               JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = current_schema() AND c.relname = ANY($1)",
+        )
+        .bind(&tables)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read the catalog's relations: {e}")))?;
+        if present.len() != tables.len() {
+            return Ok(false);
+        }
+    }
+
+    let indexes: Vec<String> = checks
+        .iter()
+        .filter_map(|check| match check {
+            Check::IndexExists(index) => Some(index.clone()),
+            _ => None,
+        })
+        .collect();
+    if !indexes.is_empty() {
+        let present: Vec<String> = sqlx::query_scalar(
+            "SELECT indexname FROM pg_indexes
+              WHERE schemaname = current_schema() AND indexname = ANY($1)",
+        )
+        .bind(&indexes)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read the catalog's indexes: {e}")))?;
+        if present.len() != indexes.len() {
+            return Ok(false);
+        }
+    }
+
+    let mut wanted: Vec<(String, String)> = Vec::new();
+    let mut must_be_not_null: Vec<(String, String)> = Vec::new();
+    for check in checks {
+        match check {
+            Check::ColumnExists { table, column } => wanted.push((table.clone(), column.clone())),
+            Check::ColumnIsNotNull { table, column } => {
+                wanted.push((table.clone(), column.clone()));
+                must_be_not_null.push((table.clone(), column.clone()));
+            }
+            _ => {}
+        }
+    }
+    if !wanted.is_empty() {
+        // One round trip for every pair, and the answer carries `attnotnull`
+        // so the two questions are read off the same row rather than two reads
+        // that could disagree.
+        let tables: Vec<String> = wanted.iter().map(|(table, _)| table.clone()).collect();
+        let columns: Vec<String> = wanted.iter().map(|(_, column)| column.clone()).collect();
+        let rows: Vec<(String, String, bool)> = sqlx::query_as(
+            "SELECT c.relname, a.attname, a.attnotnull
+               FROM unnest($1::text[], $2::text[]) AS want(tbl, col)
+               JOIN pg_class c ON c.relname = want.tbl
+               JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = current_schema()
+               JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = want.col
+              WHERE NOT a.attisdropped",
+        )
+        .bind(&tables)
+        .bind(&columns)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| SFError::Database(format!("read the catalog's columns: {e}")))?;
+        if rows.len() != wanted.len() {
+            return Ok(false);
+        }
+        for (table, column) in &must_be_not_null {
+            let held = rows.iter().any(|(found_table, found_column, not_null)| {
+                found_table == table && found_column == column && *not_null
+            });
+            if !held {
+                return Ok(false);
+            }
+        }
+    }
+
+    Ok(true)
+}
+
 async fn apply_once(pool: &PgPool, schema: &str, tag: &str, wait: &str) -> Result<(), sqlx::Error> {
     // `SET LOCAL` goes first in the same message, and no `BEGIN` is written:
     // a multi-statement simple query is already one implicit transaction, so
@@ -351,4 +716,154 @@ fn blocked(waited_on: &[String], cause: sqlx::Error) -> SFError {
          open, and the start is reported instead of being killed at a startup \
          probe with no reason. Last error: {cause}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the splitter is for: the semicolons that end statements, and only
+    /// those. The DDL texts carry default values like `'{}'::jsonb` and index
+    /// expressions like `LOWER(name)`, and a split inside one of them would
+    /// hand `classify` a fragment instead of a statement.
+    ///
+    /// This is the half of the guard that needs no database, so it is the half
+    /// that can be wrong without the live tests noticing: a splitter that
+    /// over-splits makes the text run unread (slow, not wrong), but one that
+    /// under-splits glues two statements together and then matches neither --
+    /// also slow, not wrong. Only a splitter that quietly drops a statement
+    /// could skip real work, which is why every piece below is counted.
+    #[test]
+    fn a_schema_splits_at_the_semicolons_that_end_statements() {
+        let split = statements(
+            "CREATE TABLE IF NOT EXISTS t (a TEXT DEFAULT 'a;b');\n\
+             -- a comment; with a semicolon in it\n\
+             ALTER TABLE t ADD COLUMN IF NOT EXISTS b TEXT DEFAULT E'x;y';\n\
+             /* a block comment; /* nested; */ still inside */\n\
+             CREATE INDEX IF NOT EXISTS i ON t (LOWER(a));",
+        )
+        .expect("every construct here is one the splitter follows");
+        let trimmed: Vec<&str> = split.iter().map(|s| s.trim()).collect();
+        assert_eq!(trimmed.len(), 3, "got {trimmed:#?}");
+        assert!(trimmed[0].starts_with("CREATE TABLE"));
+        assert!(trimmed[0].contains("'a;b'"), "the literal stays whole");
+        assert!(trimmed[1].starts_with("ALTER TABLE"));
+        assert!(trimmed[1].contains("E'x;y'"), "the literal stays whole");
+        assert!(trimmed[2].starts_with("CREATE INDEX"));
+    }
+
+    /// A body the splitter cannot follow ends the answer, not the statement:
+    /// the caller then runs the text exactly as it did before the guard
+    /// existed. Returning a best guess here would be the one way the guard
+    /// could skip a statement that has work to do.
+    #[test]
+    fn a_text_the_splitter_cannot_follow_is_run_rather_than_read() {
+        for open in [
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS a TEXT DEFAULT 'never closed",
+            "ALTER TABLE t ADD COLUMN IF NOT EXISTS a TEXT /* never closed",
+            "CREATE OR REPLACE FUNCTION f() RETURNS int AS $$ SELECT 1; /* ",
+        ] {
+            assert!(
+                statements(open).is_none(),
+                "an unclosed construct must not be guessed at: {open}"
+            );
+        }
+        // A dollar-quoted body closes normally, so its semicolons are body text
+        // rather than statement boundaries.
+        let split = statements("CREATE FUNCTION f() RETURNS int AS $$ SELECT 1; $$ LANGUAGE sql;")
+            .expect("a closed dollar body is followed");
+        assert_eq!(
+            split.len(),
+            1,
+            "the body's semicolon is not an end: {split:?}"
+        );
+    }
+
+    /// The four shapes worth answering without the database, and the reason
+    /// each one is exact rather than approximate: PostgreSQL's own `IF NOT
+    /// EXISTS` (and, for `SET NOT NULL`, its own catalog check) already does
+    /// nothing when the catalog already says so.
+    #[test]
+    fn the_guard_reads_the_shapes_postgres_itself_skips() {
+        let read = |statement: &str| classify(statement.trim());
+        assert_eq!(
+            read("CREATE TABLE IF NOT EXISTS entries (id TEXT)"),
+            Some(Check::TableExists("entries".into()))
+        );
+        assert_eq!(
+            read("CREATE INDEX IF NOT EXISTS idx ON entries (id)"),
+            Some(Check::IndexExists("idx".into()))
+        );
+        assert_eq!(
+            read("CREATE UNIQUE INDEX IF NOT EXISTS idx ON entries (id)"),
+            Some(Check::IndexExists("idx".into()))
+        );
+        assert_eq!(
+            read("ALTER TABLE entries ADD COLUMN IF NOT EXISTS seen TIMESTAMPTZ"),
+            Some(Check::ColumnExists {
+                table: "entries".into(),
+                column: "seen".into()
+            })
+        );
+        assert_eq!(
+            read("ALTER TABLE entries ALTER COLUMN seen SET NOT NULL"),
+            Some(Check::ColumnIsNotNull {
+                table: "entries".into(),
+                column: "seen".into()
+            })
+        );
+    }
+
+    /// Everything else makes the whole text run. The cases here are the ones
+    /// where answering "already done" would be a lie: a statement that has row
+    /// effects, one that *fails* when the object is there, and two whose object
+    /// this cannot name in the form the catalog would look it up by.
+    #[test]
+    fn a_shape_this_cannot_name_exactly_is_run() {
+        for statement in [
+            // Row effects, not catalog facts: the repair pass.
+            "UPDATE entries SET seen = at WHERE seen IS NULL",
+            "INSERT INTO entries (id) VALUES ('x') ON CONFLICT DO NOTHING",
+            // No `IF NOT EXISTS`: this one errors when the object is there.
+            "CREATE TABLE entries (id TEXT)",
+            "ALTER TABLE entries ADD COLUMN seen TIMESTAMPTZ",
+            // A table created elsewhere in the ALTER's own name.
+            "ALTER TABLE \"Entries\" ADD COLUMN IF NOT EXISTS seen TIMESTAMPTZ",
+            "ALTER TABLE public.entries ADD COLUMN IF NOT EXISTS seen TIMESTAMPTZ",
+            // Not a shape this knows at all.
+            "DROP TABLE IF EXISTS entries",
+            "ALTER TABLE entries DROP COLUMN IF EXISTS seen",
+        ] {
+            assert_eq!(
+                classify(statement),
+                None,
+                "this must not be answered from the catalog: {statement}"
+            );
+        }
+    }
+
+    /// One unreadable statement makes the batch run -- the guard is
+    /// all-or-nothing per text, because the statements share one implicit
+    /// transaction and skipping half of it would skip the half that matters.
+    #[test]
+    fn one_statement_the_guard_cannot_read_runs_the_whole_text() {
+        assert!(
+            guard_reads(
+                "CREATE TABLE IF NOT EXISTS entries (id TEXT);\n\
+                 ALTER TABLE entries ADD COLUMN IF NOT EXISTS seen TIMESTAMPTZ;"
+            ),
+            "a text made only of catalog facts is the one the guard reads"
+        );
+        assert!(
+            !guard_reads(
+                "ALTER TABLE entries ADD COLUMN IF NOT EXISTS seen TIMESTAMPTZ;\n\
+                 UPDATE entries SET seen = at WHERE seen IS NULL;"
+            ),
+            "the repair's row effects must not be skipped along with the DDL"
+        );
+        assert!(
+            guard_reads(" \n-- nothing but a comment\n"),
+            "a text with no statements has nothing to do, which the guard can say"
+        );
+    }
 }

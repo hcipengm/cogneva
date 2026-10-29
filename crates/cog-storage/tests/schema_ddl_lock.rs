@@ -129,13 +129,17 @@ async fn drop_tables(pool: &PgPool, tables: &[&str]) {
 /// The reader here holds the table for the whole of the schema's attempts,
 /// which is what the outgoing replica does for as long as it is serving.
 /// Without a bound on the wait this test does not fail -- it does not finish.
+///
+/// The column is genuinely absent: a statement the catalog already satisfies is
+/// dropped before any lock is asked for, so a no-op here would test the guard
+/// instead of the bound.
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_schema_gives_up_rather_than_waiting_out_a_live_reader() {
     let pool = pool().await;
     let marker = marker();
     let table = format!("{marker}_t");
-    create_table(&pool, &table, "a int, c2 int").await;
+    create_table(&pool, &table, "a int").await;
 
     let stop = Arc::new(AtomicBool::new(false));
     let (reader, took_it) = hold_a_reader(pool.clone(), table.clone(), stop.clone());
@@ -190,8 +194,11 @@ async fn a_newcomers_schema_does_not_freeze_a_reader_of_a_table_it_already_locke
     let marker = marker();
     let free = format!("{marker}_free");
     let held = format!("{marker}_held");
+    // Neither column is there yet: a batch the catalog already satisfies is
+    // dropped before it asks for a lock, so the accumulation below only
+    // happens when the statements have work to do.
     for table in [&free, &held] {
-        create_table(&pool, table, "a int, c2 int").await;
+        create_table(&pool, table, "a int").await;
     }
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -233,6 +240,77 @@ async fn a_newcomers_schema_does_not_freeze_a_reader_of_a_table_it_already_locke
          {held}: it was queueing behind a lock the schema had no reason to keep \
          holding, and on a real rollout that reader is the replica the new one \
          is replacing"
+    );
+}
+
+/// The start a rolling restart actually performs: every statement in the batch
+/// is already in the catalog, so the batch has nothing to do and must come back
+/// without asking for a lock at all.
+///
+/// The reader holds the table for the whole run, which is what the outgoing
+/// replica does -- and on the incident it held it for a hundred and fifteen
+/// seconds. A bounded wait is not enough here: sixteen retries over seventeen
+/// seconds ended in a failed start against a table that already had every
+/// column the text names, and each of those attempts put every later reader of
+/// the table behind it.
+///
+/// The assertions are deliberately about the run *while* the reader still
+/// holds: coming back after the reader lets go would pass on an implementation
+/// that waited a minute, which is the outage this is preventing.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_schema_the_catalog_already_satisfies_returns_while_a_reader_holds_the_table() {
+    let pool = pool().await;
+    let marker = marker();
+    let table = format!("{marker}_t");
+    let index = format!("{marker}_i");
+    create_table(&pool, &table, "a int, c2 int NOT NULL, c3 int").await;
+    sqlx::query(&format!("CREATE INDEX {index} ON {table} (a)"))
+        .execute(&pool)
+        .await
+        .expect("create the index");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (reader, took_it) = hold_a_reader(pool.clone(), table.clone(), stop.clone());
+    took_it.await.expect("the reader took its lock");
+    // A cap rather than the shape: an implementation that does wait still ends
+    // here instead of hanging the suite, and the elapsed time below is what
+    // says so.
+    release_after(stop.clone(), Duration::from_secs(60));
+
+    // The incident's batch, statement for statement: a table that exists, six
+    // columns that exist, an index that exists, and a constraint that holds.
+    let schema = format!(
+        "CREATE TABLE IF NOT EXISTS {table} (a int);\n\
+         ALTER TABLE {table} ADD COLUMN IF NOT EXISTS c2 int;\n\
+         ALTER TABLE {table} ADD COLUMN IF NOT EXISTS c3 int;\n\
+         ALTER TABLE {table} ALTER COLUMN c2 SET NOT NULL;\n\
+         CREATE INDEX IF NOT EXISTS {index} ON {table} (a);"
+    );
+    let started = Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(50),
+        cog_storage::schema_ddl::apply(&pool, &schema),
+    )
+    .await
+    .expect("a batch with nothing to do must not wait out the reader");
+    let waited = started.elapsed();
+    let held_through = !stop.load(Ordering::SeqCst);
+
+    stop.store(true, Ordering::SeqCst);
+    reader.await.expect("the reader task");
+    drop_tables(&pool, &[&table]).await;
+
+    assert!(
+        outcome.is_ok(),
+        "the table already has everything the text names, so there is nothing \
+         for this to fail on: {outcome:?}"
+    );
+    assert!(
+        held_through && waited < Duration::from_secs(10),
+        "the schema took {waited:?} against a reader that was still holding {table}: \
+         it queued for a lock on a batch with no work to justify it, and every \
+         later reader of that table queued behind it"
     );
 }
 

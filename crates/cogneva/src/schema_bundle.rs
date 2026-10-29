@@ -138,6 +138,45 @@ mod tests {
         names
     }
 
+    /// The batch that failed a rolling start has to be the batch the guard can
+    /// answer: a table that already has every column the text names, and a
+    /// text the guard reads as catalog facts, so the start returns before it
+    /// asks for a lock rather than retrying for seventeen seconds and giving up.
+    ///
+    /// Written here because this is the only place holding both the real texts
+    /// and the runner: the stores own their statements and never see the guard,
+    /// so a shape the guard cannot read would leave the whole mechanism
+    /// silently switched off for the batch it was written for.
+    #[test]
+    fn the_startups_table_batch_is_one_the_guard_can_answer_from_the_catalog() {
+        for (name, text) in [
+            (
+                "SCHEMA_ENTRIES_DDL",
+                cog_memory::postgres_schema::SCHEMA_ENTRIES_DDL,
+            ),
+            (
+                "SCHEMA_ENTRIES_AFTER_REPAIR",
+                cog_memory::postgres_schema::SCHEMA_ENTRIES_AFTER_REPAIR,
+            ),
+        ] {
+            assert!(
+                cog_storage::schema_ddl::guard_reads(text),
+                "{name} is catalog-only, so a start against a database that already \
+                 has it must not take a lock for it -- and it does just that unless \
+                 every statement in it is a shape the guard reads"
+            );
+        }
+        // The repair walks rows, which no catalog read can stand in for: it
+        // must go on running, and its presence must not switch the guard off
+        // for the DDL above (they are separate entries, run separately).
+        assert!(
+            !cog_storage::schema_ddl::guard_reads(
+                cog_memory::postgres_schema::SCHEMA_ENTRIES_REPAIR
+            ),
+            "the repair changes rows, so it can never be answered from the catalog"
+        );
+    }
+
     /// Gluing in a text that ends mid-statement makes the *next* statement
     /// the one the error names, so the boundary is checked here rather than
     /// left to be rediscovered from a syntax error pointing at the wrong line.
