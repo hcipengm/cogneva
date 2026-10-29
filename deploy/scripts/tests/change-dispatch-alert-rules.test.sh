@@ -62,13 +62,23 @@ expect_red() { # <名字> <期望 12h 红格数> <期望 6h1m 红格数>
 
 # 改坏一处：把改好的副本写到 $2，并确认改动真的落到了文件上（写死的 sed 若哪天不再匹配
 # 清单，下面那条断言会静默地判真文件——这正是「改坏没落地」要拦的东西）。
-mutate() { # <名字> <目标文件> <sed 表达式> <落地后必须出现的串> <落地后必须消失的串>
-    sed "$3" "$manifest" >"$2"
-    grep -qF -- "$4" "$2" || { bad "$1：改坏没落地" "含「$4」的清单" "原样"; return 1; }
-    if [ -n "${5:-}" ] && grep -qF -- "$5" "$2"; then
-        bad "$1：改坏没落地" "不含「$5」的清单" "仍含"; return 1
+#
+# 消失判据按**出现次数变少**判，不按「一处也不剩」：同一个串在清单里可能出现在不止一条规则
+# 上（`and on()` 就同时是判词合取和池子那一条的前缀），按「一处也不剩」判会把别的规则那几处
+# 误读成「改坏没落地」——那时规则明明被改坏了，报出来的却是夹具坏了。
+mutate() { # <名字> <目标文件> <sed 表达式> <落地后必须出现的串> <改坏后应该少掉的串>
+    local name="$1" target="$2" expr="$3" landed="$4" gone="${5:-}" before=0 after
+    [ -n "${gone}" ] && before="$(grep -cF -- "${gone}" "${manifest}" || true)"
+    sed "${expr}" "${manifest}" >"${target}"
+    grep -qF -- "${landed}" "${target}" || { bad "${name}：改坏没落地" "含「${landed}」的清单" "原样"; return 1; }
+    if [ -n "${gone}" ]; then
+        after="$(grep -cF -- "${gone}" "${target}" || true)"
+        if [ "${after}" -ge "${before}" ]; then
+            bad "${name}：改坏没落地" "「${gone}」少出现一处" "${after} 处（原 ${before} 处）"
+            return 1
+        fi
     fi
-    run "$2"
+    run "${target}"
 }
 
 run "$manifest"
