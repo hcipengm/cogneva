@@ -231,6 +231,15 @@ impl Face {
             )
         });
         task.id = self.face_id.clone();
+        // The face node is the root of its own project. A project is the group
+        // of rows under one `goal_id` whose root is the row with no parent, and
+        // the work that answers for the face hangs off this node. A root that
+        // names no project leaves its children in a group nobody can find —
+        // they read as orphans in the tree views and as "not planned" in the
+        // earned-value one, which is indistinguishable from the face having no
+        // work at all.
+        task.goal_id = Some(self.face_id.clone());
+        task.parent_task_id = None;
         task.task_type = crate::TaskType::Custom(FACE_TASK_TYPE.into());
         task.status = crate::TaskStatus::Pending;
         task.is_executable = false;
@@ -1598,6 +1607,23 @@ mod tests {
         assert!(is_face_node(&task));
         let back = Face::from_task(&task).expect("round trip");
         assert_eq!(back, face);
+    }
+
+    /// The face node is the root of the project its duties belong to.
+    ///
+    /// A project is the group of rows under one `goal_id`, and the row in the
+    /// group with no parent is its root. If the face node names no project, the
+    /// duties that hang off it are a group with no root: the tree view cannot
+    /// place them and replan refuses to plan into the group, so the face reads
+    /// as work that exists but is not going anywhere.
+    #[test]
+    fn a_face_node_is_the_root_of_its_own_project() {
+        let task = face(Some("unit-operator")).to_task(None);
+        assert_eq!(task.goal_id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(
+            task.parent_task_id, None,
+            "a root that declares a parent is not a root"
+        );
     }
 
     #[test]

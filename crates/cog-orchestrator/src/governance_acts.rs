@@ -83,6 +83,36 @@ pub fn ensure_duty_shape(task: &mut Task) {
     if !matches!(&task.task_type, TaskType::Custom(kind) if kind == FACE_DUTY_TASK_TYPE) {
         task.task_type = TaskType::Custom(FACE_DUTY_TASK_TYPE.to_string());
     }
+    attach_to_its_face(task);
+}
+
+/// The one condition that makes a face's standing duty done.
+///
+/// A duty row that says nothing about what "done" means can only ever be an
+/// unfinished leaf: the project views draw it, its earned-value row never
+/// closes, and the decomposition gate has nothing to apply to it. The wording
+/// is the completion condition the row's owner is already handed in the goal
+/// text, so the two cannot drift apart.
+pub const FACE_DUTY_ACCEPTANCE: &str = "本面的判据读数有新的读取时刻与值，且开着的活都归属本面";
+
+/// Hang the duty on the face's own node, so a face is a project *with a tree*
+/// rather than two flat lists that only agree by coincidence.
+///
+/// The face node's id is also its project id: a project is a group of rows
+/// under one `goal_id`, and the row in that group with no parent is its root.
+/// The face node is that root. Writing both directions from one place keeps
+/// the group's root unique — a duty whose `goal_id` names a root it does not
+/// declare as its parent is a group with no root, which replan refuses to
+/// plan into and the earned-value view cannot date.
+fn attach_to_its_face(task: &mut Task) {
+    let Some(face_id) = task.face_id.clone() else {
+        return;
+    };
+    task.goal_id.get_or_insert_with(|| face_id.clone());
+    task.parent_task_id.get_or_insert(face_id);
+    if task.acceptance.is_empty() {
+        task.acceptance.push(FACE_DUTY_ACCEPTANCE.to_string());
+    }
 }
 
 /// The standing duty row a face's owner works from, as one shape written once.
@@ -1698,6 +1728,55 @@ mod tests {
                 .is_some_and(|goal| goal.contains("变更管理")),
             "the goal text is the duty the owner is handed"
         );
+    }
+
+    /// A duty is the face's child row, not a second flat list entry.
+    ///
+    /// The drift reading and the dispatcher only need the row to exist; the
+    /// project face needs it to be *in* the face's project, which means the
+    /// group the earned-value and tree views group by is the face node's own
+    /// id and the duty names that node as its parent. Without both, every face
+    /// is a project of one and the tree has no second level to draw.
+    #[test]
+    fn the_duty_hangs_under_the_face_node_as_that_projects_child() {
+        let row = standing_row(&face(Some("worker")), "default");
+
+        assert_eq!(
+            row.goal_id.as_deref(),
+            Some("变更管理"),
+            "the face node's own id is the project the duty belongs to"
+        );
+        assert_eq!(
+            row.parent_task_id.as_deref(),
+            Some("变更管理"),
+            "a group whose root is the face node needs the duty to name it"
+        );
+        assert_eq!(
+            row.acceptance,
+            vec![FACE_DUTY_ACCEPTANCE.to_string()],
+            "a leaf with no acceptance criterion is work nobody can call done"
+        );
+    }
+
+    /// A duty written before this shape settled is repaired by whoever holds it.
+    ///
+    /// Rows already in the database carry no `goal_id`, no parent and no
+    /// acceptance criterion. Every writer that touches one puts the whole shape
+    /// right, so the pass that already reads those rows is what migrates them —
+    /// there is no separate backfill to run and no window where a repaired row
+    /// and a stale one are both live.
+    #[test]
+    fn an_old_duty_is_repaired_into_the_tree_when_its_writer_holds_it() {
+        let mut row = standing_row(&face(Some("worker")), "default");
+        row.goal_id = None;
+        row.parent_task_id = None;
+        row.acceptance.clear();
+
+        ensure_duty_shape(&mut row);
+
+        assert_eq!(row.goal_id.as_deref(), Some("变更管理"));
+        assert_eq!(row.parent_task_id.as_deref(), Some("变更管理"));
+        assert_eq!(row.acceptance, vec![FACE_DUTY_ACCEPTANCE.to_string()]);
     }
 
     #[test]
