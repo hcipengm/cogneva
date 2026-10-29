@@ -319,7 +319,16 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         Action::ImportFaces {
             from,
             keep_ownership,
-        } => import_faces(&*store, &from, keep_ownership).await?,
+        } => {
+            import_faces(
+                &*store,
+                &assign_pool,
+                &from,
+                keep_ownership,
+                &config.dag_executor.workspace_id,
+            )
+            .await?
+        }
         Action::Assign { face, workspace } => {
             let workspace = workspace.unwrap_or_else(|| config.dag_executor.workspace_id.clone());
             let (registry, note) = agent_registry(redis_url.as_deref()).await;
@@ -902,6 +911,7 @@ async fn assign(
     let mut assigned = 0usize;
     let mut rebound = 0usize;
     let mut kept = 0usize;
+    let mut repaired = 0usize;
     let mut released = 0usize;
     let mut vacant = 0usize;
     let mut absent: Vec<String> = Vec::new();
@@ -945,6 +955,11 @@ async fn assign(
                     running,
                 ) {
                     StandingRow::Keep => {
+                        if let Some(shaped) = kept_row_repair(&existing, running) {
+                            backend.dag_set_task(workspace, &id, &shaped).await?;
+                            repaired += 1;
+                            continue;
+                        }
                         kept += 1;
                         continue;
                     }
@@ -971,8 +986,8 @@ async fn assign(
         assigned += 1;
     }
     println!(
-        "assigned {assigned}, rebound {rebound}, kept {kept}, released {released}, \
-         vacant {vacant}, absent {} (workspace {workspace})",
+        "assigned {assigned}, rebound {rebound}, repaired {repaired}, kept {kept}, \
+         released {released}, vacant {vacant}, absent {} (workspace {workspace})",
         absent.len()
     );
     // Named, not just counted: the repair is somebody bringing that unit back
@@ -1070,6 +1085,90 @@ fn rebind_standing_row(mut row: Task, face_id: &str, owner: &str, workspace: &st
         }
     }
     row
+}
+
+/// The shaped copy of a row the pass decided to keep, when keeping it would
+/// leave something wrong in the graph.
+///
+/// Bound to the right unit is not the same as shaped right. A row written
+/// before the standing shape was settled sits there with no parent and no
+/// acceptance criterion, and every project view -- the tree, the rollup,
+/// earned value -- reads exactly those two fields. `Keep` used to mean
+/// "nothing to write", so such a row stayed flat for as long as its owner did
+/// not change, and the face read as an empty project the whole time.
+///
+/// `None` means there is nothing to write, which is the ordinary answer: the
+/// shape is applied to a copy and only a row that actually moved is handed
+/// back, so a whole row still costs no write. A running row is left alone --
+/// its progress lives in the same record -- and a completed one is re-created
+/// from the settled shape by the pass's insert branch anyway.
+fn kept_row_repair(existing: &Task, running: bool) -> Option<Task> {
+    if running {
+        return None;
+    }
+    let mut shaped = existing.clone();
+    cog_orchestrator::governance_acts::ensure_duty_shape(&mut shaped);
+    (shaped != *existing).then_some(shaped)
+}
+
+/// Put the standing rows already in the graph into the settled shape.
+///
+/// The pass that writes these rows is `assign`, and nothing calls it on a
+/// cadence -- its only caller is the command line -- so a row keeps whatever
+/// shape it happened to be written in until somebody remembers to run that one
+/// command. Every project view reads that shape: the tree takes
+/// `parent_task_id`, and both earned value and the plan-baseline refusal take
+/// `acceptance`. An unsettled row therefore reads as a project with no children
+/// and a work package whose "done" has no criterion, and no reading says the
+/// difference is a missing write rather than a face with no work in it.
+///
+/// The roster import already runs on a cadence and already holds every face, so
+/// it is the pass that puts those rows right. The ordinary path writes nothing:
+/// a row that is already whole compares equal to its shaped copy. A running row
+/// is left alone, and a finished one is re-created from the settled shape by
+/// `assign` whenever that next runs.
+///
+/// An empty workspace means this deployment has no DAG workspace configured, so
+/// there is nowhere these rows could be; that is said out loud rather than
+/// counted as "no row needed repair", because the two call for opposite fixes.
+async fn settle_standing_rows(
+    store: &dyn GovernanceStore,
+    pool: &sqlx::PgPool,
+    workspace: &str,
+) -> Result<usize, Box<dyn Error>> {
+    if workspace.trim().is_empty() {
+        eprintln!(
+            "cogneva governance: no dag_executor.workspace_id is configured, so no standing row \
+             was settled; the faces read as projects with no children until one is set"
+        );
+        return Ok(0);
+    }
+    let backend = PostgresStateBackend::new(pool.clone());
+    let faces: Vec<Face> = store
+        .face_nodes()
+        .await?
+        .iter()
+        .filter_map(Face::from_task)
+        .collect();
+    let mut repaired = 0usize;
+    for face in faces {
+        let id = cog_orchestrator::governance_acts::face_work_id(&face.face_id);
+        let Some(existing) = backend.dag_get_task(workspace, &id).await? else {
+            continue;
+        };
+        if matches!(
+            existing.status,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        ) {
+            continue;
+        }
+        let running = existing.status == TaskStatus::Running;
+        if let Some(shaped) = kept_row_repair(&existing, running) {
+            backend.dag_set_task(workspace, &id, &shaped).await?;
+            repaired += 1;
+        }
+    }
+    Ok(repaired)
 }
 
 /// What one roster import did, cell by cell.
@@ -1193,13 +1292,22 @@ pub async fn import_faces_from_roster(
 
 async fn import_faces(
     store: &dyn GovernanceStore,
+    pool: &sqlx::PgPool,
     from: &Path,
     keep_ownership: bool,
+    workspace: &str,
 ) -> Result<(), Box<dyn Error>> {
     let text = std::fs::read_to_string(from)
         .map_err(|e| format!("cannot read {}: {e}", from.display()))?;
     let summary = import_faces_from_roster(store, &text, keep_ownership).await?;
     println!("{}", summary.line());
+    // Before the refusal below: an import that erased a binding still wrote the
+    // rows it was asked to write, and the shape of the standing rows is a
+    // separate fact from who owns the faces.
+    let repaired = settle_standing_rows(store, pool, workspace).await?;
+    if repaired > 0 {
+        println!("settled {repaired} standing row(s) into the rooted shape");
+    }
     // The line is printed before this refusal so a reader of the log sees the
     // count it is about; the exit code is what makes it a failure rather than a
     // number somebody has to notice.
@@ -1363,6 +1471,79 @@ mod tests {
             !cog_orchestrator::ready_queue::is_dispatchable_work(&moved),
             "a duty has no body to run, so the dispatcher must leave it alone: {moved:?}"
         );
+    }
+
+    /// A duty row whose owner never changes is the ordinary case, and `Keep`
+    /// used to mean the pass wrote nothing at all -- so a row written before
+    /// the shape was settled stayed flat for the rest of its life. Every
+    /// project view reads `parent_task_id` and `acceptance`; a face whose row
+    /// never gets them reads as a project with no children and no work
+    /// package that can hold a baseline, which is exactly what A2/A3 need.
+    #[test]
+    fn a_kept_row_written_before_the_shape_settled_is_repaired() {
+        let mut flat = old_flat_duty();
+        flat.owner_unit = Some("c2".into());
+
+        let shaped = kept_row_repair(&flat, false)
+            .expect("a flat duty row cannot be kept as it stands: nothing reads it as work");
+
+        assert_eq!(
+            shaped.parent_task_id.as_deref(),
+            Some("通信"),
+            "the duty hangs under its face node, which is what makes the tree two levels deep: {shaped:?}"
+        );
+        assert_eq!(
+            shaped.goal_id.as_deref(),
+            Some("通信"),
+            "the duty lives in the face's project, not a project of its own: {shaped:?}"
+        );
+        assert!(
+            !shaped.acceptance.is_empty(),
+            "a work package whose done has no criterion cannot take a plan baseline: {shaped:?}"
+        );
+    }
+
+    /// The repair has to be free when there is nothing to repair, or every
+    /// drift pass writes all eighteen rows and the queue churns forever.
+    #[test]
+    fn a_row_already_shaped_costs_no_write() {
+        let mut whole = old_flat_duty();
+        cog_orchestrator::governance_acts::ensure_duty_shape(&mut whole);
+
+        assert_eq!(
+            kept_row_repair(&whole, false),
+            None,
+            "a whole row must not be written again: {whole:?}"
+        );
+    }
+
+    /// A running row carries its progress in the same record; a pass that
+    /// rewrites it from a copy taken a moment earlier can lose a step.
+    #[test]
+    fn a_running_row_is_not_rewritten_even_when_its_shape_is_old() {
+        let flat = old_flat_duty();
+
+        assert_eq!(
+            kept_row_repair(&flat, true),
+            None,
+            "the repair has to wait for the row to stop running: {flat:?}"
+        );
+    }
+
+    /// A duty row in the form rows were written before the shape was settled:
+    /// executable, typed as a plain dag node, carrying its face and owner, and
+    /// with neither a parent nor an acceptance criterion.
+    fn old_flat_duty() -> Task {
+        let mut row = Task::new(
+            "face-work-~901a~4fe1",
+            cog_core::TaskType::DagNode,
+            serde_json::json!({"goal": "keep the face in the target state", "face": "通信"}),
+        );
+        row.face_id = Some("通信".into());
+        row.owner_unit = Some("c2".into());
+        row.workspace_id = Some("default".into());
+        row.is_executable = true;
+        row
     }
 
     /// A row the drift pass released must not be handed back to the absent
