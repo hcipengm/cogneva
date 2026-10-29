@@ -28,6 +28,7 @@ crates/cog-agent/src/agent_kernel/runtime.rs	RESULT_BUILD_TIMEOUT	180s	bound	Wal
 crates/cog-agent/src/archive.rs	ARCHIVE_TIMEOUT_SECS	20	bound	one turn's share: long enough to store a payload, short enough not to wedge the turn
 crates/cog-agent/src/consumer.rs	INBOX_RECLAIM_BATCH	64	bound	How many pending messages one reclaim call asks for.
 crates/cog-agent/src/consumer.rs	INBOX_RECLAIM_MIN_IDLE_MS	60_000	bound	safety threshold so a still-draining process is not robbed; nothing waits on it
+crates/cog-agent/src/context.rs	TOOL_RESULT_CHAR_CAP	32 * 1024	bound	a tool result is re-sent on every turn after it arrives, so this bounds what those later turns pay rather than whether the window has room for it; 32K characters is the read page's own size because a page read back and a command printed out occupy the same place in the conversation
 crates/cog-agent/src/context.rs	TOOL_RESULT_WINDOW_SHARE_DIVISOR	2	bound	policy split: half the window is kept for task input and later turns
 crates/cog-agent/src/context.rs	TRIM_LOW_WATER_DIVISOR	2	bound	the low-water mark the trim cuts to, not the budget it cuts from: cutting to exactly the budget drops one entry every turn and slides the cached prefix forever, so the cut goes to half and the same cut returns a half window later
 crates/cog-agent/src/hooks/lifecycle.rs	DEFAULT_LIFECYCLE_CHANNEL_BUFFER	256	bound	Default capacity of the engine's input channel.
