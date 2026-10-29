@@ -921,6 +921,33 @@ pub struct RemeasureBacklog {
     pub oldest_seconds: Option<u64>,
 }
 
+/// What the outstanding queue is waiting on the pool for, as one read of it.
+///
+/// The block is written on the pass's own verdict and cleared by the first pass
+/// that can hand work over, so it is a claim about *now* that outlives the pass
+/// that made it. A claim nobody re-examines is the failure this read exists for:
+/// a pool that came back after a pass failed before reaching the clear leaves
+/// rows stamped as waiting with nothing left to release them, and every reading
+/// beside the block says the same thing it said while the pool really was down.
+///
+/// Two numbers rather than one because a count cannot say "for how long", and an
+/// age alone cannot say how much: a thousand rows stamped this second and one
+/// row stamped yesterday are opposite facts about the queue's health. The age is
+/// the oldest stamped row's, not an average, so one row nobody releases stays
+/// visible while the rest of the queue turns over.
+///
+/// `oldest_seconds` is `None` when no row carries the block, never `0` -- zero
+/// would be the age of a row stamped in this very pass, and a reader that only
+/// saw the number could not tell a released queue from a just-paused one. That
+/// is why the pair travels together: `rows` separates them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolWait {
+    /// Rows carrying the pool block.
+    pub rows: u64,
+    /// How long the oldest of them has been waiting, in whole seconds.
+    pub oldest_seconds: Option<u64>,
+}
+
 /// Durable storage for the change ledger.
 ///
 /// The only way to move a row's state is [`Self::apply_measurement`]. Rows enter
@@ -1380,6 +1407,17 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// over all of them would report every waiting-on-a-person row as free -- the
     /// same silent rewrite the writer above avoids, in the other direction.
     async fn clear_pool_block(&self) -> SFResult<u64>;
+
+    /// What the queue is still waiting on the pool for, read back from the rows
+    /// the two writes above stamped.
+    ///
+    /// Taken from the rows rather than from the pass that wrote them because the
+    /// question is the rows': a block outlives the pass that made it, and the
+    /// only thing that can say how long it has stood is the stamp on it. A pass
+    /// that read its own verdict would answer "the pool is down" -- which the
+    /// pool's own reading already says -- and would answer nothing at all about
+    /// a block whose pass never came back.
+    async fn pool_wait(&self) -> SFResult<PoolWait>;
 
     /// One row, by the identity that names it.
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>>;

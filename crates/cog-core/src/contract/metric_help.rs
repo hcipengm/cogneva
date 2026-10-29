@@ -2261,6 +2261,33 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          one",
     ),
     (
+        "cogneva_change_dispatch_pool_blocked_rows",
+        "How many outstanding changes are stamped as waiting on the LLM pool, \
+         written on every change-ledger dispatch pass and read back from the rows \
+         rather than from the pass's own verdict. The stamp is put there by a \
+         pass that found the pool down and removed by the first pass that could \
+         hand work over, so a row that still carries it has been waiting since \
+         its own blocked_since. This family exists for the stamped rows whose \
+         clearing pass never came: the pool's own rules go green the moment it \
+         recovers, and a row left stamped behind a recovery is still counted as \
+         owed with nothing left to release it, which no reading of the pool can \
+         show. Zero is written like any other value, so a queue that drains does \
+         not go on standing at its last depth. Read beside \
+         cogneva_change_dispatch_pool_blocked_oldest_seconds: this number counts, \
+         that one says how long",
+    ),
+    (
+        "cogneva_change_dispatch_pool_blocked_oldest_seconds",
+        "How long the oldest change stamped as waiting on the LLM pool has been \
+         waiting, in seconds, written on every change-ledger dispatch pass. It is \
+         the age of the oldest stamped row, not an average, so one row nobody \
+         releases stays visible while the queue around it turns over. Zero means \
+         no row carries the stamp, never a row stamped this very pass, which is \
+         why the count beside it is the reading that tells an empty set from a \
+         just-paused one -- the age of a row stamped a moment ago would also round \
+         to zero",
+    ),
+    (
         "cogneva_backup_run_readings",
         "What the backup account holds, by readout, read from the rows the backup \
          runs wrote rather than measured again from the volume. The run counts, \

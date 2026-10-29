@@ -1541,6 +1541,36 @@ metric_names! {
     // very second would also round to zero.
     CHANGE_LEDGER_REMEASURE_OLDEST_SECONDS => "cogneva_change_ledger_remeasure_oldest_seconds",
 
+    // cog-orchestrator — how many outstanding rows are stamped as waiting on the
+    // LLM pool, and how long the oldest of them has been stamped.
+    //
+    // The block is written by a pass on its own verdict and cleared by the first
+    // pass that can hand work over, so it is a claim about the queue that
+    // outlives the pass that made it. Nothing else reports it. The pool's own
+    // rules read the pool, and they go green the moment it recovers -- which is
+    // exactly the state in which a stamped row that no pass ever came back to
+    // clear is still stamped, still counted as owed, and now indistinguishable
+    // from a row that was never handed over. The pair fires while the pool is
+    // healthy, which no other family can express.
+    //
+    // `rows` and the age travel together for the reason the re-measurement pair
+    // does: a count cannot say how long, and an age alone cannot say how much.
+    // Read from the stamps on the rows, not from the pass's verdict, because the
+    // question is the rows': a pass that died before clearing left no verdict to
+    // ask. Written on every pass, `0` included, so a queue that drains cannot go
+    // on standing at its last depth.
+    CHANGE_DISPATCH_POOL_BLOCKED_ROWS => "cogneva_change_dispatch_pool_blocked_rows",
+
+    // cog-orchestrator — how long the oldest row stamped as waiting on the pool
+    // has been waiting, in seconds, published beside the count above.
+    //
+    // `0` means no row carries the block, not a row stamped this second: an age
+    // of zero and an empty set are the same number here, and the count is what
+    // separates them. The age is the oldest row's rather than an average, so a
+    // single row nobody releases stays visible while the rest of the queue turns
+    // over underneath it.
+    CHANGE_DISPATCH_POOL_BLOCKED_OLDEST_SECONDS => "cogneva_change_dispatch_pool_blocked_oldest_seconds",
+
     // cog-orchestrator — rows a change-ledger pass tried to measure and could
     // not, counted as they enter that set, by reason and by which half of the
     // pass could not settle them.

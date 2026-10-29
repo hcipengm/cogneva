@@ -1,0 +1,160 @@
+# 池子标在行上的「等」有没有人撤：池子已经好了，行还挂着。
+#
+# 形状与七格：
+#   - 没有一行挂着（年龄 0、行数 0）、池子可用：静。常态。
+#   - 挂了 4000 秒、池子可用：响。一拍就该撤，六拍没撤不是慢，是没撤。
+#   - 界内（1200 秒）、池子可用：静。一拍 5 分钟，池子刚回来时行还挂着是正常的。
+#   - 写者停了（年龄 4000，伴生钟不再动）：静。该响的是写者本身
+#     （`cogneva_loop_tick_age_seconds`），冻结样本点亮的规则没有修法能熄灭它。
+#   - 挂着 4000 秒但本拍判的是暂停：静。池子真的没在服务，这时候挂着是对的。
+#   - 挂着 4000 秒但本拍 proceed 的读数是 absent：静。这一拍没量到池子，
+#     它说不出这些标还该不该在。
+#   - 判词那一侧冻结（本拍判 proceed、伴生钟早就不动了）：静。比较的另一头也是
+#     共享表的 gauge，冻结的 proceed 会把这行从「没人撤」读成「确实该等」。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-change-pool-block-stranded.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: change_pool_block_stranded
+
+evaluation_interval: 1m
+
+tests:
+  # 没有一行挂着：池子可用，静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds'
+        values: '0x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_rows'
+        values: '0x60'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+        values: '1x60'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+        values: '1200x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_pool_block_stranded
+        exp_alerts: []
+
+  # 挂了四千秒、池子这一拍说它可用：撤标的拍丢了。响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds'
+        values: '4000x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_rows'
+        values: '2129x60'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+        values: '1x60'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+        values: '1200x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_pool_block_stranded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 等了二十分钟，还在几拍之内：静。池子刚回来时行还挂着是正常的。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds'
+        values: '1200x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_rows'
+        values: '40x60'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+        values: '1x60'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+        values: '1200x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_pool_block_stranded
+        exp_alerts: []
+
+  # 写者停了：年龄还停在四千秒，伴生钟不再动。静——这一格不该由冻结的样本点亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds'
+        values: '4000x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds'
+        values: '0x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_rows'
+        values: '2129x60'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+        values: '0x60'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: change_pool_block_stranded
+        exp_alerts: []
+
+  # 挂着四千秒，但本拍判的是暂停：池子真的没在服务，挂着是对的。静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds'
+        values: '4000x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_rows'
+        values: '2129x60'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+        values: '0x60'
+      - series: 'cogneva_change_dispatch_verdict{decision="paused_llm_pool_unavailable",reading="unavailable"}'
+        values: '1x60'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+        values: '0x60'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="paused_llm_pool_unavailable",reading="unavailable"}'
+        values: '1200x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_pool_block_stranded
+        exp_alerts: []
+
+  # 挂着四千秒，本拍 proceed 但池子读数是 absent：这一拍没量到池子，说不出该不该撤。静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds'
+        values: '4000x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_rows'
+        values: '2129x60'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+        values: '0x60'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="absent"}'
+        values: '1x60'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+        values: '0x60'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="absent"}'
+        values: '1200x60'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: change_pool_block_stranded
+        exp_alerts: []
+
+  # 判词那一侧冻结：本拍的值还写着 proceed，但那一笔早就没有人在写了。静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds'
+        values: '4000x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds'
+        values: '1200x60'
+      - series: 'cogneva_change_dispatch_pool_blocked_rows'
+        values: '2129x60'
+      - series: 'cogneva_change_dispatch_verdict{decision="proceed",reading="available"}'
+        values: '1x60'
+      - series: 'cogneva_change_dispatch_verdict_observed_timestamp_seconds{decision="proceed",reading="available"}'
+        values: '0x60'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: change_pool_block_stranded
+        exp_alerts: []

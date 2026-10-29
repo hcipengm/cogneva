@@ -17,7 +17,7 @@ use sqlx::{PgPool, Row};
 use cog_core::{
     BlockCensus, BlockedReason, BlockingHolder, BlockingSurface, ChangeBlock, ChangeIdentity,
     ChangeLedgerEvent, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
-    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState,
+    ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState, PoolWait,
     RemeasureBacklog, RetireReason, SFError, SFResult, WriteWindow,
 };
 
@@ -578,6 +578,23 @@ const CLEAR_POOL_BLOCK_SQL_TEMPLATE: &str = "\
 UPDATE change_ledger
    SET blocked_reason = NULL, unblock_condition = NULL, blocked_since = NULL
  WHERE blocked_reason = '{blocked:pool_unavailable}'";
+
+/// What the two writes above left on the rows: how many are still stamped, and
+/// how long the oldest has been.
+///
+/// Counted over the outstanding rows only. A row that has left `pending` is no
+/// longer in the queue the stamp is about -- whatever it still carries is the
+/// clear's business, and counting it here would report work waiting that nobody
+/// is owed. The age comes from `min(blocked_since)` and is `NULL` when nothing
+/// matches, which the caller reads as "no wait" rather than as "waiting zero
+/// seconds": `EXTRACT` over an empty aggregate is null, not zero, and that is
+/// the distinction the pair exists to keep.
+const POOL_WAIT_SQL_TEMPLATE: &str = "\
+SELECT count(*) AS rows,
+       CAST(EXTRACT(EPOCH FROM (now() - min(blocked_since))) AS BIGINT) AS oldest_seconds
+  FROM change_ledger
+ WHERE state = '{state:pending}'
+   AND blocked_reason = '{blocked:pool_unavailable}'";
 
 /// Append one dispatch pass's own reading.
 ///
@@ -1608,6 +1625,24 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         Ok(result.rows_affected())
     }
 
+    async fn pool_wait(&self) -> SFResult<PoolWait> {
+        let row = sqlx::query(&fill_vocabulary(POOL_WAIT_SQL_TEMPLATE))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("pool wait: {e}")))?;
+        // Both columns are read as errors rather than defaulted: a count that
+        // failed to decode is not a queue of zero, and `0` here would publish a
+        // released queue over a real wait.
+        let field_error = |e: sqlx::Error| SFError::Database(format!("pool wait: {e}"));
+        Ok(PoolWait {
+            rows: row.try_get::<i64, _>("rows").map_err(field_error)?.max(0) as u64,
+            oldest_seconds: row
+                .try_get::<Option<i64>, _>("oldest_seconds")
+                .map_err(field_error)?
+                .map(|secs| secs.max(0) as u64),
+        })
+    }
+
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {
         let row = sqlx::query(&format!(
             "SELECT {ROW_COLUMNS} FROM change_ledger \
@@ -1952,6 +1987,7 @@ mod templates {
         ("BLOCK_CENSUS", BLOCK_CENSUS_SQL_TEMPLATE),
         ("STAMP_POOL_BLOCK", STAMP_POOL_BLOCK_SQL_TEMPLATE),
         ("CLEAR_POOL_BLOCK", CLEAR_POOL_BLOCK_SQL_TEMPLATE),
+        ("POOL_WAIT", POOL_WAIT_SQL_TEMPLATE),
     ];
 
     /// A slot nobody fills is not a missing word, it is a statement the database

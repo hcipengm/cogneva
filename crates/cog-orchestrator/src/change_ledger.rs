@@ -119,9 +119,9 @@ use cog_core::{
     ChangeLedgerStore, ChangeMeasurement, ChangePriority, ChangeReading, ChangeReopen,
     ChangeSource, ChangeState, DemandClosure, DispatchDecision, DispatchState, LiveRevision,
     LiveRevisionSource, LlmPoolStatus, LlmWindowPace, MetricsBackend, OrchestratorControl,
-    OwnerLeaseBroker, PoolReading, PrincipleCheckKind, PrincipleLedgerStore, PrincipleRow,
-    RemeasureBacklog, RetireReason, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus,
-    TaskType, WriteWindow,
+    OwnerLeaseBroker, PoolReading, PoolWait, PrincipleCheckKind, PrincipleLedgerStore,
+    PrincipleRow, RemeasureBacklog, RetireReason, SFResult, ShutdownSignal, StateBackend, Task,
+    TaskStatus, TaskType, WriteWindow,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -3906,6 +3906,59 @@ async fn dispatch_pass(
         ),
     }
 
+    // Read what the writes above left on the rows, and publish it.
+    //
+    // The stamp outlives the pass that made it -- it is cleared by the next pass
+    // that can hand work over -- so the queue can come out of a pause carrying
+    // rows nobody is going to release: a pass that died before the clear, or one
+    // whose clear failed with nothing left to retry it. Every other reading about
+    // the pool is the pool's own, and it goes green the moment the pool serves,
+    // which is exactly when a stranded stamp stops being visible anywhere else.
+    // The rows are the only witness to it, and this is where they are asked.
+    //
+    // Asked on every pass, including the paused ones: the question is how long
+    // the queue has been stamped, not what this pass decided about it. A store
+    // that cannot answer publishes nothing rather than zero -- the previous value
+    // stands and the log says why, because a zero here means "the queue is free"
+    // and replacing a real wait with that is the one mistake this reading exists
+    // to prevent.
+    let pool_wait: Option<PoolWait> = match store.pool_wait().await {
+        Ok(wait) => Some(wait),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: what the outstanding queue is still waiting on the pool \
+                 for could not be read"
+            );
+            None
+        }
+    };
+    if let Some(wait) = pool_wait {
+        info!(
+            rows = wait.rows,
+            oldest_seconds = wait.oldest_seconds,
+            "change ledger: outstanding rows stamped as waiting on the pool"
+        );
+        if let Some(metrics) = metrics {
+            for (name, value, what) in [
+                (
+                    metric_names::CHANGE_DISPATCH_POOL_BLOCKED_ROWS,
+                    wait.rows as f64,
+                    "how many rows are stamped as waiting on the pool",
+                ),
+                (
+                    metric_names::CHANGE_DISPATCH_POOL_BLOCKED_OLDEST_SECONDS,
+                    wait.oldest_seconds.unwrap_or(0) as f64,
+                    "how long the oldest of them has been waiting",
+                ),
+            ] {
+                if let Err(e) = metrics.record_gauge(name, value, HashMap::new()).await {
+                    warn!(error = %e, "change ledger: {what} could not be published");
+                }
+            }
+        }
+    }
+
     // The batch this pass may hand over: the tick's own ceiling, lowered by what
     // the window left when the snapshot measured one. Derived once, from the same
     // verdict the pass writes down, so the row and the batch cannot disagree about
@@ -7487,6 +7540,11 @@ mod tests {
         /// Why a row is not being worked on. Seeded by a test that wants a block
         /// somebody else declared, and written by the pass under test.
         blocked: std::sync::Mutex<std::collections::HashMap<ChangeIdentity, String>>,
+        /// When each of those blocks was first stamped. Kept beside the reasons
+        /// because the reading the pass publishes is a count *and* an age, and a
+        /// double that could only say the first would let a pass publish a wait
+        /// that never started.
+        blocked_at: std::sync::Mutex<std::collections::HashMap<ChangeIdentity, std::time::Instant>>,
         /// The revision each identity landed at, for the tests where that is not
         /// the row's `measured_rev`.
         ///
@@ -7508,6 +7566,9 @@ mod tests {
         /// queue is a different reading from an empty one, and the only way a
         /// test can tell them apart is to build the first.
         backlog_unreadable: bool,
+        /// Whether reading back the pool stamps fails. Same distinction on the
+        /// other intake: a count that was not taken is not a count of zero.
+        pool_wait_unreadable: bool,
     }
 
     impl FakeLedger {
@@ -7590,6 +7651,12 @@ mod tests {
                                 .as_str()
                                 .to_string(),
                         );
+                        // The first sighting is the one that starts the wait,
+                        // the same way the real statement's COALESCE does.
+                        self.blocked_at
+                            .lock()
+                            .unwrap()
+                            .insert(row.identity.clone(), std::time::Instant::now());
                         touched += 1;
                     }
                     // Already waiting on the pool: the statement matches the row
@@ -7608,7 +7675,40 @@ mod tests {
             let before = blocked.len();
             let pool = cog_core::BlockedReason::PoolUnavailable.as_str();
             blocked.retain(|_, reason| reason != pool);
+            self.blocked_at
+                .lock()
+                .unwrap()
+                .retain(|identity, _| blocked.contains_key(identity));
             Ok((before - blocked.len()) as u64)
+        }
+        async fn pool_wait(&self) -> SFResult<PoolWait> {
+            if self.pool_wait_unreadable {
+                return Err(SFError::Database("the table could not be read".into()));
+            }
+            let pool = cog_core::BlockedReason::PoolUnavailable.as_str();
+            let blocked = self.blocked.lock().unwrap();
+            let stamped: Vec<&ChangeIdentity> = blocked
+                .iter()
+                .filter(|(_, reason)| reason.as_str() == pool)
+                .map(|(identity, _)| identity)
+                .collect();
+            if stamped.is_empty() {
+                // No row carries the block: `None`, not zero -- the same
+                // distinction the real store keeps with `min()` over an empty
+                // set.
+                return Ok(PoolWait::default());
+            }
+            let at = self.blocked_at.lock().unwrap();
+            let oldest = stamped
+                .iter()
+                .filter_map(|identity| at.get(*identity))
+                .map(|stamped_at| stamped_at.elapsed().as_secs())
+                .max()
+                .unwrap_or(0);
+            Ok(PoolWait {
+                rows: stamped.len() as u64,
+                oldest_seconds: Some(oldest),
+            })
         }
         async fn declare(&self, _readings: &[ChangeReading]) -> SFResult<usize> {
             Ok(0)
@@ -9761,6 +9861,126 @@ mod tests {
             vec![("crates/b".to_string(), "owner_decision".to_string())],
             "a clear keyed on 'blocked at all' would report the person-blocked row as free"
         );
+    }
+
+    /// What the queue is still stamped with is published on every pass, and the
+    /// numbers come off the rows rather than off the pass's own verdict.
+    ///
+    /// The stamp outlives the pass that wrote it -- it is taken off by the next
+    /// pass that can hand work over -- so a queue that keeps its rows stamped
+    /// after the pool comes back is invisible everywhere else: every other
+    /// reading about the pool is the pool's, and it goes green the moment the
+    /// pool does. The row is the only witness, and this pass is the only place
+    /// that asks it.
+    #[tokio::test]
+    async fn a_pass_publishes_what_the_queue_is_still_stamped_with() {
+        fn published(gauges: &RecordingGauges, name: &str) -> Vec<f64> {
+            gauges
+                .gauges()
+                .into_iter()
+                .filter(|(n, _)| n == name)
+                .map(|(_, value)| value)
+                .collect()
+        }
+        const ROWS: &str = "cogneva_change_dispatch_pool_blocked_rows";
+        const OLDEST: &str = "cogneva_change_dispatch_pool_blocked_oldest_seconds";
+
+        let store = FakeLedger {
+            rows: vec![pending_row("crates/a"), pending_row("crates/b")],
+            ..Default::default()
+        };
+
+        // The pass that writes the stamps publishes the wait it just made: two
+        // rows, and an age of zero because both started in this pass. A publish
+        // that only happened once a wait had aged would be absent exactly when
+        // the queue first went quiet, which is the state this reading exists to
+        // make legible.
+        let gauges = std::sync::Arc::new(RecordingGauges::default());
+        let metrics: std::sync::Arc<dyn MetricsBackend> = gauges.clone();
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            Some(&DeadPool),
+            None,
+            Some(&metrics),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            published(&gauges, ROWS),
+            vec![2.0],
+            "the pass has to publish how many rows it left stamped"
+        );
+        assert_eq!(
+            published(&gauges, OLDEST),
+            vec![0.0],
+            "and how long the oldest of them has been waiting"
+        );
+
+        // A serving pass clears them and writes the zero back. A gauge written
+        // only while something was stamped would leave the last depth standing
+        // after the clear that emptied it.
+        let gauges = std::sync::Arc::new(RecordingGauges::default());
+        let metrics: std::sync::Arc<dyn MetricsBackend> = gauges.clone();
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            Some(&ServingPool),
+            None,
+            Some(&metrics),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            published(&gauges, ROWS),
+            vec![0.0],
+            "a queue that drains cannot go on standing at its last depth"
+        );
+        assert_eq!(published(&gauges, OLDEST), vec![0.0]);
+
+        // A store that cannot answer publishes nothing. Zero here would read as
+        // "the queue is free", which is the one wrong answer that looks like the
+        // best one -- and it would overwrite a real wait with it.
+        let unreadable = FakeLedger {
+            rows: vec![pending_row("crates/a")],
+            pool_wait_unreadable: true,
+            ..Default::default()
+        };
+        let gauges = std::sync::Arc::new(RecordingGauges::default());
+        let metrics: std::sync::Arc<dyn MetricsBackend> = gauges.clone();
+        let graph = Arc::new(FakeGraph::default());
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+        dispatch_pass(
+            &unreadable,
+            &control,
+            &HashMap::new(),
+            Some(&DeadPool),
+            None,
+            Some(&metrics),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            published(&gauges, ROWS).is_empty(),
+            "a reading that was not taken must not overwrite the last one taken: {:?}",
+            published(&gauges, ROWS)
+        );
+        assert!(published(&gauges, OLDEST).is_empty());
     }
 
     /// The first pass after a start has nothing to carry over, and it behaves as

@@ -2292,6 +2292,113 @@ async fn a_pool_block_lands_only_on_the_owed_rows_and_the_clear_takes_back_only_
     cleanup(&pool, &marker).await;
 }
 
+/// The wait the pass stamps on the queue is read back off the rows: how many of
+/// them still carry it, and how long the oldest has been carrying it.
+///
+/// The pair exists because the stamp outlives the pass that wrote it -- a pass
+/// that died before the clear leaves it standing -- and no other reading can see
+/// that: the pool's own rules report the pool and go green the moment it
+/// recovers. The age is the oldest stamped row's rather than the newest's, so one
+/// row nobody releases stays visible while the queue around it turns over, and
+/// no rows carrying the stamp is no age at all rather than an age of zero.
+///
+/// The count is over the whole table, and this suite runs its probes in
+/// parallel, so the numbers here are lower bounds; what is exact is the
+/// discrimination the probe is built around. A stamp left on a row that has
+/// landed is not a wait -- the row is owed nothing -- so its age must not be the
+/// one this reading reports.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_pool_wait_reads_the_stamps_back_off_the_owed_rows() {
+    let (store, pool, marker) = store().await;
+    let owed = identity(&marker, "wait-owed");
+    let left_behind = identity(&marker, "wait-left-behind");
+    for (id, state) in [
+        (&owed, ChangeState::Pending),
+        (&left_behind, ChangeState::Landed),
+    ] {
+        store
+            .apply_measurement(&ChangeMeasurement::new(id.clone(), state))
+            .await
+            .expect("write a measurement");
+    }
+
+    // A stamp from an earlier pass on a row that has since landed: seeded by
+    // hand, because the writer takes the block off when a row leaves the account
+    // and this reading is what has to hold if that ever stops happening. Two
+    // hours back, so an implementation that dropped the state filter would
+    // report it as the wait's age and say so loudly.
+    sqlx::query(
+        "UPDATE change_ledger \
+            SET blocked_reason = 'pool_unavailable', \
+                unblock_condition = 'an upstream the pool can reach', \
+                blocked_since = now() - interval '2 hours' \
+          WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&left_behind.kind)
+    .bind(&left_behind.scope)
+    .bind(&left_behind.literal)
+    .execute(&pool)
+    .await
+    .expect("seed a stale stamp on a landed row");
+
+    let wait = store.pool_wait().await.expect("read the wait");
+    assert!(
+        match wait.oldest_seconds {
+            None => true,
+            Some(secs) => secs < 7200,
+        },
+        "a stamp on a row that is owed nothing is not part of the wait: {wait:?}"
+    );
+
+    // Stamp the queue, as a paused pass does, and backdate this probe's own row
+    // so the age has one unambiguous meaning: an implementation reading the
+    // newest stamp instead of the oldest would answer ~0 here.
+    store
+        .stamp_pool_block("an upstream the pool can reach")
+        .await
+        .expect("stamp the pool block");
+    sqlx::query(
+        "UPDATE change_ledger SET blocked_since = now() - interval '2 hours' \
+          WHERE kind = $1 AND scope = $2 AND literal = $3",
+    )
+    .bind(&owed.kind)
+    .bind(&owed.scope)
+    .bind(&owed.literal)
+    .execute(&pool)
+    .await
+    .expect("backdate this probe's own wait");
+
+    let wait = store.pool_wait().await.expect("read the wait");
+    assert!(
+        wait.rows >= 1,
+        "the row the stamp landed on has to be counted: {wait:?}"
+    );
+    let oldest = wait
+        .oldest_seconds
+        .expect("rows are stamped, so the wait has an age");
+    assert!(
+        oldest >= 7200,
+        "the age is the oldest stamped row's, not the newest one's: {oldest}"
+    );
+
+    // The serving pass releases it, and the reading comes down with the work.
+    store
+        .clear_pool_block()
+        .await
+        .expect("clear the pool block");
+    let after = store.pool_wait().await.expect("read the wait again");
+    assert!(
+        match after.oldest_seconds {
+            None => true,
+            Some(secs) => secs < 7200,
+        },
+        "the released row must not go on being counted at its old age: {after:?}"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 /// A wait goes away with the work it described.
 ///
 /// The three blocked columns are what every by-reason census counts, and a row

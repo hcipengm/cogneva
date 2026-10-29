@@ -4483,6 +4483,37 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_llm_usage_rows",
         Unread::Gap("how many per-call token rows the ledger holds. Everything that can be judged about this table is judged from age instead: llm_usage_retention_behind compares the oldest surviving row against the retention the loop publishes, and llm_usage_fold_behind compares the rows the hourly fold never reached against what the sweep is allowed to delete. Neither is a statement about how many rows is too many -- one call writes one row whatever the task was doing, so the count tracks call volume rather than the sweep, and no row budget for it is declared anywhere in the tree. It is published because the table reached 312,803 rows and 32 days' worth of history with no reading at all until 2026-10-27, and the nightly backup's budget is sized from it"),
     ),
+    // The re-measurement intake publishes two numbers from the same pass and only
+    // the age got a rule. The reason is not that the depth is uninteresting: it
+    // is the size of the population the age rule is about, and the help text
+    // beside it already names a shape -- above zero across two passes is the
+    // intake failing -- so this is not the usual "no bound is declared" case.
+    // The shape cannot be sampled, though. The pass cadence is a number in the
+    // writer's configuration and no series publishes it, so "two passes" is not
+    // a window a rule can be written over; the nearest thing a rule could say is
+    // "still above zero after N minutes", and the queue's ordinary life is
+    // exactly one pass, which makes every N a decision about how long an
+    // ordinary queue may be caught mid-turn rather than a reader someone forgot
+    // to write. Meanwhile the fault the depth would catch, a fold that is not
+    // reaching the request, already fires from the age at six passes. What the
+    // pair settles -- a depth that turns over while the age climbs is one row
+    // the tree cannot settle, a depth that does not move at all is a writer --
+    // is a comparison of two curves, so the reader owed is a panel, not a rule.
+    (
+        "cogneva_change_ledger_remeasure_pending",
+        Unread::Gap("how many re-measurement requests are waiting to be folded, written on every change-ledger pass beside the oldest pending age. Its help says a depth above zero across two passes is the intake failing, but the pass cadence is not published as a series, so the rule that sentence describes has no window to be sampled over: the queue's ordinary life is one pass, and every minute-based rendering of 'two passes' would fire on a queue caught mid-turn. The fault the depth would catch is already read from the age by change_ledger_remeasure_stuck, and telling one row the tree cannot settle from a writer that has stopped is a comparison of the two curves over time, which is a panel's job"),
+    ),
+    // The other half of the pool-wait pair, filed for the opposite reason to the
+    // entry above: here the shape is known -- a stamp that outlives the pool's
+    // recovery -- and the rule is written over the age. The depth is the size of
+    // the population that age is about, and any rule over it would have to state
+    // how many owed rows waiting on a pool is too many, which is a fraction of a
+    // queue whose total nothing publishes and no policy bounds. A number that
+    // rises with the backlog is not a fault while the backlog is legitimate.
+    (
+        "cogneva_change_dispatch_pool_blocked_rows",
+        Unread::Gap("how many outstanding changes are stamped as waiting on the LLM pool, written on every dispatch pass beside the age of the oldest one. The rule reads the age: a stamp that outlives the pool's recovery is a wait nobody is going to release, and one pass is its whole ordinary life, so that shape has a bound the writer's own interval settles. The depth is the population that age is about, and a bound on it would have to say what fraction of an owed queue waiting on a pool is too many -- the queue's size is published per pass but no policy states a level, and the same depth is legitimate while the pool really is down. Read together with the age by a panel, which is the reader it owes. The intake's depth above was filed on the same reasoning from the other side: there the age had a bound and the depth had none"),
+    ),
 ];
 
 /// How many `Gap` entries the census left. A new series that no face reads and
@@ -4744,7 +4775,31 @@ const UNREAD: &[(&str, Unread)] = &[
 /// not a fault today -- so the rule reads change per day against a coverage
 /// clause instead, and the entry left the table in the pass that wrote
 /// `principle_refusals_sustained`.
-const GAPS_AT_CENSUS: usize = 32;
+///
+/// It went back to 33 in the pass that gave the re-measurement intake its age
+/// rule. The intake writes two numbers from the same pass -- the depth of the
+/// queue and the age of its oldest row -- and the rule reads the age, because
+/// six passes of waiting is a shape the writer's own interval settles. The
+/// depth is the one entry here whose help text already names a shape rather
+/// than asking for a level, and it is filed anyway: the shape is "two passes",
+/// and the pass cadence is not a series, so a rule built from that sentence
+/// would have to pick a number of minutes for a queue that legitimately lives
+/// exactly one pass. That is a threshold argument, which is what the last
+/// paragraph of this note says is the wrong reason to keep a debt and the right
+/// reason to file one.
+///
+/// It went to 34 in the pass that made the pool stamps readable. That pass
+/// publishes a pair from the dispatch loop and writes the rule over the age
+/// only: the age is the wait, and a stamp that outlives the pool's recovery is
+/// a wait nobody is going to release, which is a fault with a bound. The depth
+/// is not uninteresting -- it is how much is stranded -- but a rule over it
+/// would have to state what share of an owed queue may be waiting on a pool,
+/// and that share is as large as the backlog whenever the pool really is down.
+/// So the depth files the same way the intake's did one pass earlier, from the
+/// other side: there the age had the rule and the depth had no bound the writer
+/// could settle; here the depth is the number a level would have to be stated
+/// for. Both are read together by the panel the change-ledger group owes.
+const GAPS_AT_CENSUS: usize = 34;
 
 #[test]
 fn every_series_the_closed_set_publishes_has_a_decided_reader() {

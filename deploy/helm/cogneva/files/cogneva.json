@@ -1795,6 +1795,16 @@
           "face": "变更管理"
         },
         {
+          "name": "change_pool_block_stranded",
+          "promql": "(max without (pod, container, instance) (cogneva_change_dispatch_pool_blocked_oldest_seconds and ((time() - cogneva_change_dispatch_pool_blocked_oldest_seconds_observed_timestamp_seconds) < 1800)) > 1800) and on () (max without (pod, container, instance) ((cogneva_change_dispatch_verdict{decision=\"proceed\", reading=\"available\"}) and ((time() - cogneva_change_dispatch_verdict_observed_timestamp_seconds) < 1800)) == 1)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "the oldest outstanding change stamped as waiting on the LLM pool has been waiting {value} second(s), while the latest dispatch pass says the pool serves. The stamp is written by a pass that found the pool down and taken off by the first pass that can hand work over, so one pass after the pool returns is the whole of its ordinary life: six passes with it still on the rows is not a slow release but a release that is not happening -- a pass that died between the stamp and the clear, a clear whose write failed with nothing to retry it, or a dispatcher that has stopped passing at all, whose own liveness is cogneva_loop_tick_age_seconds. This is the only reading that can see it, because every other family about the pool reports the pool and goes green the moment it recovers; a row left stamped behind that recovery is still counted as owed, still has no task, and reads exactly like work nobody has reached. Read cogneva_change_dispatch_pool_blocked_rows beside it for how much is stranded, and cogneva_change_ledger_remeasure_pending for whether the dispatcher's other intake is moving -- two intakes stuck together is the loop rather than either write. A pass that proceeds on an absent pool reading does not satisfy this rule: nothing measured the pool on that pass, so it says nothing about whether the stamps it kept are still owed. Silent while the writer is not stamping, for the same reason as its neighbours: the store serves each series' newest row forever, and a rule fired on a frozen sample cannot be put out. The same holds on the other side of the comparison, which is why the verdict is asked for with its own age: a dispatcher that stopped passing leaves its last verdict standing, and a frozen proceed would hold this rule lit over rows no pass is left to clear",
+          "face": "变更管理"
+        },
+        {
           "name": "evolution_resident_index_outlives_its_changes",
           "promql": "(max by (dir) (cogneva_evolution_resident_results) > max by (dir) (cogneva_evolution_change_queue_files))",
           "condition": {

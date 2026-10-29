@@ -243,6 +243,10 @@ impl ChangeLedgerStore for FakeLedger {
         unimplemented!("the read route does not write blocks")
     }
 
+    async fn pool_wait(&self) -> SFResult<cog_core::PoolWait> {
+        unimplemented!("the read face does not ask this question yet")
+    }
+
     async fn get(&self, identity: &ChangeIdentity) -> SFResult<Option<ChangeLedgerRow>> {
         Ok(self
             .rows
