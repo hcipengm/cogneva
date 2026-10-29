@@ -92,31 +92,6 @@ impl Drop for ScratchDir {
     }
 }
 
-#[cfg(test)]
-mod scratch_dir_tests {
-    use super::ScratchDir;
-
-    /// 目录活着的时候能用，出了作用域什么都不留。
-    ///
-    /// 判的是 `Drop` 上真的挂了清理。这个类型存在的全部理由就是「没人回来收拾的那一份
-    /// 要被收拾掉」，而把清理删掉、或者退回成返回一个 `PathBuf`，用例照样全绿——绿的是
-    /// 被测模块，漏的是每个用例几十兆的残留，而残留只有下一轮扫盘时才会显形。
-    #[test]
-    fn a_scratch_dir_leaves_nothing_behind_when_it_goes_out_of_scope() {
-        let path;
-        {
-            let dir = ScratchDir::new("scratch-dir-contract");
-            std::fs::write(dir.path().join("payload"), b"x").expect("the payload is written");
-            assert!(
-                dir.join("payload").is_file(),
-                "the dir is usable while it is alive"
-            );
-            path = dir.path().to_path_buf();
-        }
-        assert!(!path.exists(), "{} survived its scope", path.display());
-    }
-}
-
 /// 一次用例独占的那个 schema：名字由 `label` 加上本次的进程号与纳秒数拼成。
 ///
 /// `label` 由调用方说，它只是这个名字的前半截——谁建的 schema 谁按名字删它，所以这个
@@ -204,5 +179,30 @@ impl cog_core::SchemaRunner for SchemaTextRunner {
             .await
             .map_err(|e| cog_core::SFError::Database(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod scratch_dir_tests {
+    use super::ScratchDir;
+
+    /// 目录活着的时候能用，出了作用域什么都不留。
+    ///
+    /// 判的是 `Drop` 上真的挂了清理。这个类型存在的全部理由就是「没人回来收拾的那一份
+    /// 要被收拾掉」，而把清理删掉、或者退回成返回一个 `PathBuf`，用例照样全绿——绿的是
+    /// 被测模块，漏的是每个用例几十兆的残留，而残留只有下一轮扫盘时才会显形。
+    #[test]
+    fn a_scratch_dir_leaves_nothing_behind_when_it_goes_out_of_scope() {
+        let path;
+        {
+            let dir = ScratchDir::new("scratch-dir-contract");
+            std::fs::write(dir.path().join("payload"), b"x").expect("the payload is written");
+            assert!(
+                dir.join("payload").is_file(),
+                "the dir is usable while it is alive"
+            );
+            path = dir.path().to_path_buf();
+        }
+        assert!(!path.exists(), "{} survived its scope", path.display());
     }
 }
