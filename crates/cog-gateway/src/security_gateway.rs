@@ -3245,7 +3245,13 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<
             )
         }
         _ => {
-            let usage = json.get("usage");
+            // 尾帧里的 usage 有的上游放顶层，有的塞在 `choices[0]` 里（k3 就是这样，
+            // 同一条上游换后端时两种形状会交替出现）。只认顶层的话，那一半调用会
+            // 整条记成零——不是"上游没说"，是我们没看它说的那处。
+            let usage = json
+                .get("usage")
+                .filter(|u| !u.is_null())
+                .or_else(|| json.pointer("/choices/0/usage").filter(|u| !u.is_null()));
             (
                 usage.and_then(|u| u.get("prompt_tokens")).and_then(as_u64),
                 usage
@@ -3281,6 +3287,10 @@ struct UsageScanner {
     /// usage. Read off the outgoing body rather than the vendor profile: the
     /// profile is what we believe, the body is what we sent.
     asked: bool,
+    /// 结束标记到过没有。调用方读到最后一帧就走时，尾巴没跑但 body 是完整的；
+    /// 只有没见到结束标记就被放开的流才真的是中途断了。这两件事在没有这个
+    /// 字段时同形，读数只能把它们一起记成"断了"。
+    saw_done: bool,
 }
 
 impl UsageScanner {
@@ -3297,10 +3307,19 @@ impl UsageScanner {
                 continue;
             };
             let data = data.trim();
-            if data.is_empty() || data == "[DONE]" {
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                self.saw_done = true;
                 continue;
             }
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                // Anthropic 面没有 `[DONE]`，流的终点是 `message_stop`：两种面
+                // 各有一个"到此为止"的标记，漏认一个就让那一半的完整流看起来像断线。
+                if json.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
+                    self.saw_done = true;
+                }
                 let (input, output, cached) = extract_usage(&json);
                 self.absorb(input, output, cached);
             }
@@ -3336,9 +3355,24 @@ impl UsageScanner {
             UsageOutcome::Interrupted
         } else if self.saw_usage {
             UsageOutcome::Read
+        } else if self.saw_done {
+            // 结束标记已经到过，只是我们没再往下轮询：body 是完整的，尾巴那一格
+            // 的问题原样成立（问了没答是上游的，没问是我们的），不该记成断线。
+            if self.asked {
+                UsageOutcome::Absent
+            } else {
+                UsageOutcome::NotAsked
+            }
         } else {
             UsageOutcome::Abandoned
         }
+    }
+
+    /// 调用方放开流时，这次调用算不算完整。看成败的标记而不是尾巴跑没跑：
+    /// 我们自己的 SSE 客户端在结束标记处就断开，尾巴永远不跑，把"尾巴没跑"
+    /// 记成"调用断了"会让每一笔正常调用都看起来像被丢弃。
+    fn dropped_completed(&self) -> bool {
+        self.saw_done
     }
 
     /// 把一帧里报出的用量并进读数。两件事分开记：**帧到过没有**（决定归哪一格）
@@ -3451,6 +3485,7 @@ impl Drop for UsageRecorder {
         if self.claimed {
             return;
         }
+        let completed = self.scanner.lock().is_ok_and(|s| s.dropped_completed());
         let (reading, raw) = self.reading(true);
         let state = self.state.clone();
         let upstream = self.upstream.clone();
@@ -3474,13 +3509,13 @@ impl Drop for UsageRecorder {
                     &request,
                 )
                 .await;
-                // 被丢弃的流也要留底：它的正文是"这次调用问到一半没了"的唯一现场，
-                // 而用量行只留下三个计数。
+                // 这里也要留底：用量行只留下三个计数，正文才是这次调用真正的现场。
+                // 标签按"流有没有走完"给，而不是"尾巴跑没跑"——后者对每一笔都成立。
                 record_exchange(
                     &state,
                     &upstream,
                     &request,
-                    "abandoned",
+                    if completed { "ok" } else { "abandoned" },
                     Some(&raw),
                     latency_ms,
                 )
@@ -9194,6 +9229,63 @@ mod tests {
         s.finish();
         assert_eq!(s.tokens_input, 10);
         assert_eq!(s.tokens_output, 2);
+    }
+
+    /// 同一条上游换后端时，尾帧的 usage 会从顶层挪进 `choices[0]`。只看顶层，
+    /// 那一半调用的三个计数就整条归零，而零与"上游没说"在表里同形。
+    #[test]
+    fn usage_extract_reads_a_tail_frame_that_nests_usage_inside_the_choice() {
+        let nested = serde_json::json!({
+            "id": "chatcmpl-x",
+            "object": "chat.completion.chunk",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls",
+                "usage": {
+                    "prompt_tokens": 20547,
+                    "completion_tokens": 189,
+                    "total_tokens": 20736,
+                    "cached_tokens": 17920,
+                    "prompt_tokens_details": {"cached_tokens": 17920}
+                }
+            }]
+        });
+        assert_eq!(
+            extract_usage(&nested),
+            (Some(20547), Some(189), Some(17920))
+        );
+    }
+
+    /// 读到结束标记就放开的流是完整的：它不该被记成断线，沉默该按"问没问过"
+    /// 分给上游或我们自己。
+    #[test]
+    fn a_stream_that_reached_its_terminator_is_not_an_abandoned_stream() {
+        let mut s = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
+        s.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n");
+        s.feed(b"data: [DONE]\n\n");
+        assert!(s.dropped_completed());
+        assert_eq!(s.outcome_abandoned(), UsageOutcome::Absent);
+
+        let mut cut = UsageScanner {
+            asked: true,
+            ..UsageScanner::default()
+        };
+        cut.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"he\"}}]}\n\n");
+        assert!(!cut.dropped_completed());
+        assert_eq!(cut.outcome_abandoned(), UsageOutcome::Abandoned);
+    }
+
+    /// Anthropic 面没有 `[DONE]`，终点是 `message_stop`：认不出它，走这条面的
+    /// 每一笔完整调用都会落进"断了"那一格。
+    #[test]
+    fn the_anthropic_terminator_counts_as_the_end_of_the_stream() {
+        let mut s = UsageScanner::default();
+        s.feed(b"event:message_stop\ndata:{\"type\":\"message_stop\"}\n\n");
+        assert!(s.dropped_completed());
     }
 
     #[test]
