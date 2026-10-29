@@ -965,7 +965,7 @@ fn dispatch_project_root(row: &ChangeLedgerRow) -> Task {
 
 fn dispatch_project_root_for(project: &str) -> Task {
     let mut root = Task::new(
-        dispatch_project_root_id(&project),
+        dispatch_project_root_id(project),
         TaskType::Custom(DISPATCH_PROJECT_ROOT_KIND.into()),
         serde_json::json!({
             "goal": format!("dispatched changes under {project}"),
