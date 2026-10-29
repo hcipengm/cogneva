@@ -432,6 +432,51 @@ fn deliverable_in(text: &str) -> Option<serde_json::Value> {
         .filter(|v| !v.is_null() && *v != serde_json::Value::Object(Default::default()))
 }
 
+/// The request block exactly as `cog_core::contract::prompt::render_varying_half`
+/// writes it, if the payload carries one.
+///
+/// The membership comes from
+/// `cog_core::contract::prompt::REQUEST_KEYS` — the contract says which keys
+/// state the request, this decides what to do about it. The comparison has to
+/// be against the **rendered** spelling (`"task":{…}`), not the value alone:
+/// the value also appears anywhere else the same text was quoted, and a
+/// substring match on it would claim the request was already sent when only a
+/// fragment of it was. A test pins these bytes to the renderer's.
+fn request_members(payload: &serde_json::Value) -> Option<String> {
+    let fields = payload.as_object()?;
+    let key_text = |key: &str| serde_json::Value::String(key.to_string()).to_string();
+    let members: Vec<String> = cog_core::contract::prompt::REQUEST_KEYS
+        .iter()
+        .filter_map(|key| {
+            fields
+                .get(*key)
+                .map(|value| format!("{}:{}", key_text(key), value))
+        })
+        .collect();
+    (!members.is_empty()).then(|| members.join(","))
+}
+
+/// Render what this attempt adds, leaving the request block out.
+///
+/// For a second attempt at the same task the request is byte-identical to the
+/// one already in the conversation. Re-sending it adds nothing the model can
+/// read twice and pays for every byte of it again: on the measured traffic a
+/// fifth of the bytes added per turn were these repeated request blocks.
+/// `None` when nothing would be left — a user message that says only `{}` is a
+/// turn that says nothing.
+fn render_varying_half_after_request(payload: &serde_json::Value) -> Option<String> {
+    let fields = payload.as_object()?;
+    let key_text = |key: &str| serde_json::Value::String(key.to_string()).to_string();
+    let mut members: Vec<String> = Vec::with_capacity(fields.len());
+    for (key, value) in fields {
+        if cog_core::contract::prompt::REQUEST_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        members.push(format!("{}:{}", key_text(key), value));
+    }
+    (!members.is_empty()).then(|| format!("{{{}}}", members.join(",")))
+}
+
 /// The text of an assistant turn, as the loop reads it.
 /// Text blocks win; reasoning-only models (e.g. kimi-k2.6) put the answer in
 /// thinking/reasoning blocks instead, so those are the fallback rather than a
@@ -1273,15 +1318,14 @@ impl AgentRuntime {
         // 投影里找不到它时整块发；找得到就只发这一次尝试新增的那一半。
         // 看的是 `messages()` 而不是 `history`：被裁掉的请求模型这一轮确实读
         // 不到，那时必须整块重发。
-        let repeated_request =
-            cog_core::contract::prompt::request_members(&payload).is_some_and(|sent| {
-                self.context
-                    .messages()
-                    .iter()
-                    .any(|m| m.content().contains(&sent))
-            });
+        let repeated_request = request_members(&payload).is_some_and(|sent| {
+            self.context
+                .messages()
+                .iter()
+                .any(|m| m.content().contains(&sent))
+        });
         let rendered = repeated_request
-            .then(|| cog_core::contract::prompt::render_varying_half_after_request(&payload))
+            .then(|| render_varying_half_after_request(&payload))
             .flatten()
             .unwrap_or_else(|| cog_core::contract::prompt::render_varying_half(&payload));
         self.context.add_message(Message::user(rendered));
@@ -4217,6 +4261,36 @@ mod tests {
         assert_eq!(
             systems, 1,
             "the contract must not reappear mid-conversation"
+        );
+    }
+
+    /// 请求块的两种渲染必须与契约自己那一份逐字节对得上。
+    ///
+    /// 这里拿 `request_members` 的串去比对对话里已经有的内容，再决定还发不发
+    /// 这一块：这个串与契约真正渲染出去的那一段差一个字节，判断就会反过来——
+    /// 要么每次都重发（等于没改），要么该发的时候不发（这一轮没有任务可做）。
+    /// 所以成员由 `REQUEST_KEYS` 定、字节由契约的渲染函数校验，两边不许各写一份。
+    #[test]
+    fn the_request_members_are_the_bytes_the_contract_renders() {
+        let payload = serde_json::json!({"task": {"id": "t1"}, "context": {"attempt": 2}});
+        let members = request_members(&payload).expect("the request block");
+        assert!(
+            cog_core::contract::prompt::render_varying_half(&payload)
+                .starts_with(&format!("{{{members},")),
+            "请求块必须原样出现在契约渲染结果的开头"
+        );
+        assert_eq!(
+            render_varying_half_after_request(&payload).as_deref(),
+            Some("{\"context\":{\"attempt\":2}}")
+        );
+    }
+
+    /// 只有请求、没有别的：不剩任何东西可发。
+    #[test]
+    fn a_payload_with_only_the_request_has_nothing_left_to_send() {
+        assert!(
+            render_varying_half_after_request(&serde_json::json!({"task": {"id": "t1"}})).is_none(),
+            "空消息就是一次什么都没说的回合"
         );
     }
 
