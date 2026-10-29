@@ -2355,6 +2355,10 @@ pub(crate) enum CiNoVerdictReason {
     ConnectFailed,
     /// 200 回来了、body 用不成 ⇒ 响应在途中被弄坏了（截断也算），主人在代理这一段。
     UnusableBody,
+    /// 判这棵树的检查落的是 `cancelled`：**没有结论**，不是不通过。扣满窗口仍然没有
+    /// 结论就按这一格放行——扣着整条主线换不到信息量，而它挡掉的风险由这一格自己
+    /// 说清楚，不是悄悄变绿。
+    CancelledWaived,
     /// 非 200 的状态码，按主人分格见 [`Self::label`]。
     Http(u16),
 }
@@ -2386,6 +2390,7 @@ impl CiNoVerdictReason {
             Self::BadApiBase => "bad_api_base",
             Self::ConnectFailed => "connect_failed",
             Self::UnusableBody => "unusable_body",
+            Self::CancelledWaived => "cancelled_waived",
             // 401/403 是同一件事的两张脸：凭证被拒，或凭证所带的额度被限（GitHub 的
             // 二级限流也回 403）。两脸同一主人，所以同一格。
             Self::Http(401) | Self::Http(403) => "http_auth_rejected",
@@ -3677,6 +3682,7 @@ impl MainlineDeployer {
         Option<CiNoVerdictReason>,
         Vec<String>,
         Vec<(String, String)>,
+        Vec<String>,
     ) {
         let mut attempt = 0usize;
         loop {
@@ -3721,6 +3727,23 @@ impl MainlineDeployer {
     const CI_ASK_RETRY_DELAYS_MS: [u64; 4] = [500, 1_000, 2_000, 4_000];
 
     /// 问一次，按这一次的回答给出结论（复问的循环在上面那一层）。
+    /// 一次 check run 的新旧次序。
+    ///
+    /// `check_runs` 的数组顺序不承诺是时间序（同一个名字重跑之后，旧的那次仍可能
+    /// 排在新的一次前面），所以按顺序取"最后一条"会把结论钉在旧 run 上。时间戳是
+    /// ISO8601 UTC 定长串，字典序即时间序；缺时间戳时退到 `id`——平台的 id 单调递增，
+    /// 后建的 run 一定更大。
+    fn check_run_freshness(run: &serde_json::Value) -> (String, i64) {
+        let when = run
+            .get("completed_at")
+            .or_else(|| run.get("started_at"))
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let id = run.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
+        (when, id)
+    }
+
     async fn platform_ci_verdict_once(
         api_base: &str,
         repo: &str,
@@ -3730,6 +3753,7 @@ impl MainlineDeployer {
         Option<CiNoVerdictReason>,
         Vec<String>,
         Vec<(String, String)>,
+        Vec<String>,
     ) {
         let mut conclusions: Vec<String> = Vec::new();
         // 判不通过的那几条检查的名字（判这棵树的那些）。日志只说「有一项」时，
@@ -3740,6 +3764,10 @@ impl MainlineDeployer {
         // 必须从这一路带出去记下来，否则"为什么这版带着一条红检查却滚了"在下游
         // 只剩一个绿灯，谁都答不上来。
         let mut excluded_checks: Vec<(String, String)> = Vec::new();
+        // 判这棵树、但落的是 `cancelled` 的那几条：**它们没有给出结论**。带出去是为了让
+        // 上层能把「扣满一个窗口仍然没有结论」与「上游真说了不通过」分开处置——两者在
+        // `Some(false)` 这一面上同形，而处置相反。
+        let mut cancelled_checks: Vec<String> = Vec::new();
         let mut saw_signal = false;
         let mut pending = false;
         // 原因由这一段的形状决定（读到内容 / 读失败），没有"默认值"这种中间态：
@@ -3750,46 +3778,111 @@ impl MainlineDeployer {
         {
             Ok(v) => {
                 if let Some(runs) = v.get("check_runs").and_then(|r| r.as_array()) {
-                    for run in runs {
-                        saw_signal = true;
-                        match run.get("conclusion").and_then(|c| c.as_str()) {
-                            Some(c) => {
-                                // 「这条检查不判这棵树」是**工作流身份**，与它给出的结论
-                                // 无关：Pages 那套跑批被后一次推送取消时，它落的是
-                                // `cancelled` 而不是 `failure`。只对 `failure`/`error` 问
-                                // 身份，等于让一条被取消的 Pages 检查把整棵树判红——
-                                // 2026-10-28 实测：`e147236f` 上 13 条 CI 检查全绿，而
-                                // `build` / `deploy` / `report-build-status` 三条 Pages
-                                // 检查 `cancelled`，按这一支就是一次假红。
-                                let passes = cog_core::contract::ci::ci_conclusion_passes(c);
-                                if !passes {
-                                    if let Some(workflow) =
-                                        Self::excluded_check_workflow(api_base, repo, run).await
-                                    {
-                                        let name = run
-                                            .get("name")
-                                            .and_then(|n| n.as_str())
-                                            .filter(|n| !n.is_empty())
-                                            .unwrap_or("<unnamed>");
-                                        excluded_checks.push((name.to_string(), workflow));
-                                        continue;
-                                    }
+                    saw_signal = !runs.is_empty();
+                    // 同一个名字会有多次 run：重跑是**追加**，不是覆盖——旧的那次仍
+                    // 留在列表里。照数组顺序逐条折，等于把第一次的结论永久钉在判词
+                    // 上，重跑成功也翻不了案；而部署器能不能靠重跑自救，全看这一层。
+                    //
+                    // 采信规则：同一个名字取**最近一次给出结论**的那条 run，但
+                    // `cancelled` 不算结论——一次被取消的重跑不许盖掉它之前那条真
+                    // 失败，否则"重跑"就成了抹掉红的通道。只被取消过的名字，结论就是
+                    // 取消；上层据此分辨该不该一直扣着（取消不是不通过，见
+                    // `waive_a_hold_that_only_cancellations_hold_up`）。
+                    //
+                    // 没有名字的 run 不参与合并：名字是"这两条是同一个检查的两次运行"
+                    // 的唯一凭据，证明不了就逐条独立判——折成一条会让后一条绿盖掉前
+                    // 一条红，而那种红正是这一层要拦的东西。
+                    let mut newest: BTreeMap<String, ((String, i64), &serde_json::Value)> =
+                        BTreeMap::new();
+                    let mut newest_concluded: BTreeMap<
+                        String,
+                        ((String, i64), &serde_json::Value),
+                    > = BTreeMap::new();
+                    let mut order: Vec<String> = Vec::new();
+                    for (index, run) in runs.iter().enumerate() {
+                        let named = run
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .filter(|n| !n.is_empty());
+                        let key = match named {
+                            Some(n) => n.to_string(),
+                            None => format!("<unnamed#{index}>"),
+                        };
+                        let fresh = Self::check_run_freshness(run);
+                        let concluded = run
+                            .get("conclusion")
+                            .and_then(|c| c.as_str())
+                            .filter(|c| *c != "cancelled");
+                        if newest.get(&key).is_none_or(|(f, _)| fresh > *f) {
+                            if !newest.contains_key(&key) {
+                                order.push(key.clone());
+                            }
+                            newest.insert(key.clone(), (fresh.clone(), run));
+                        }
+                        if concluded.is_some()
+                            && newest_concluded.get(&key).is_none_or(|(f, _)| fresh > *f)
+                        {
+                            newest_concluded.insert(key, (fresh, run));
+                        }
+                    }
+                    // 还在跑的检查仍然是「没有证据」：哪怕它之前那次给出了结论，这一次
+                    // 重问的结果还没出来，此刻宣布通过就是拿半个结果下结论。
+                    if runs
+                        .iter()
+                        .any(|run| run.get("conclusion").and_then(|c| c.as_str()).is_none())
+                    {
+                        pending = true;
+                    }
+                    for key in &order {
+                        let Some((_, fallback)) = newest.get(key) else {
+                            continue;
+                        };
+                        let run = newest_concluded
+                            .get(key)
+                            .map(|(_, r)| *r)
+                            .unwrap_or(*fallback);
+                        // 一个名字一次结论都没有过：它在跑或者它被取消过，两者都在上面
+                        // 各自记下了，这里不往判词里添东西。
+                        let Some(c) = run.get("conclusion").and_then(|c| c.as_str()) else {
+                            continue;
+                        };
+                        let named = run
+                            .get("name")
+                            .and_then(|n| n.as_str())
+                            .filter(|n| !n.is_empty());
+                        // 「这条检查不判这棵树」是**工作流身份**，与它给出的结论无关：
+                        // Pages 那套跑批被后一次推送取消时，它落的是 `cancelled` 而不是
+                        // `failure`。只对 `failure`/`error` 问身份，等于让一条被取消的
+                        // Pages 检查把整棵树判红——2026-10-28 实测：`e147236f` 上 13 条
+                        // CI 检查全绿，而 `build` / `deploy` / `report-build-status` 三条
+                        // Pages 检查 `cancelled`，按那一支就是一次假红。
+                        let passes = cog_core::contract::ci::ci_conclusion_passes(c);
+                        if !passes {
+                            if let Some(workflow) =
+                                Self::excluded_check_workflow(api_base, repo, run).await
+                            {
+                                let pair = (named.unwrap_or("<unnamed>").to_string(), workflow);
+                                if !excluded_checks.contains(&pair) {
+                                    excluded_checks.push(pair);
                                 }
-                                conclusions.push(c.to_string());
-                                // 进了这张表的是**判这棵树**的检查，所以它记的是「为什么
-                                // 红」；不判这棵树的那几条在上面的 `continue` 里已经分走
-                                // 了，两张表不混。判红的结论不止 `failure` 一种：`cancelled`
-                                // 同样让 `fold_ci_signals` 给出失败，不点名它就只剩一个红字。
-                                if !passes {
-                                    if let Some(name) = run.get("name").and_then(|n| n.as_str()) {
-                                        if !name.is_empty() {
-                                            failed_checks.push(name.to_string());
-                                        }
-                                    }
+                                continue;
+                            }
+                        }
+                        conclusions.push(c.to_string());
+                        // 进了这张表的是**判这棵树**的检查，所以它记的是「为什么红」；
+                        // 不判这棵树的那几条在上面的 `continue` 里已经分走了，两张表
+                        // 不混。判红的结论不止 `failure` 一种：`cancelled` 同样让
+                        // `fold_ci_signals` 给出失败，不点名它就只剩一个红字。
+                        if !passes {
+                            if let Some(real) = named {
+                                failed_checks.push(real.to_string());
+                                // 「取消」与「不通过」在这一层是同一个 `false`，但上层
+                                // 要按它决定该不该一直扣着：取消没有结论，扣满一个窗口
+                                // 就是拿着零信息量挡整条主线。
+                                if c == "cancelled" {
+                                    cancelled_checks.push(real.to_string());
                                 }
                             }
-                            // 结论为 null = 这条检查还在跑。此刻下结论等于拿半个结果判死刑。
-                            None => pending = true,
                         }
                     }
                 }
@@ -3804,7 +3897,13 @@ impl MainlineDeployer {
         if let Some(verdict) =
             cog_core::contract::ci::fold_ci_signals(saw_signal, pending, &conclusions)
         {
-            return (Some(verdict), None, failed_checks, excluded_checks);
+            return (
+                Some(verdict),
+                None,
+                failed_checks,
+                excluded_checks,
+                cancelled_checks,
+            );
         }
         // 只用提交状态上报 CI 的仓库（没有 check runs），与落地通道同一条兜底。
         if let Ok(status) =
@@ -3812,10 +3911,22 @@ impl MainlineDeployer {
         {
             match status.get("state").and_then(|s| s.as_str()) {
                 Some("success") => {
-                    return (Some(true), None, failed_checks, excluded_checks);
+                    return (
+                        Some(true),
+                        None,
+                        failed_checks,
+                        excluded_checks,
+                        cancelled_checks,
+                    );
                 }
                 Some("failure") | Some("error") => {
-                    return (Some(false), None, failed_checks, excluded_checks);
+                    return (
+                        Some(false),
+                        None,
+                        failed_checks,
+                        excluded_checks,
+                        cancelled_checks,
+                    );
                 }
                 // 接口答了、状态字段却不可判。只有 check-runs 那边本来就什么也没说时才
                 // 换成这一格：两边都没给出可判的东西，这一格比 `no_runs` 更贴近实情。
@@ -3826,7 +3937,13 @@ impl MainlineDeployer {
                 _ => {}
             }
         }
-        (None, Some(reason), failed_checks, excluded_checks)
+        (
+            None,
+            Some(reason),
+            failed_checks,
+            excluded_checks,
+            cancelled_checks,
+        )
     }
 
     /// 这条报失败的检查属于哪个**不判这棵树**的工作流：属于就给它的 `path`，
@@ -3893,10 +4010,17 @@ impl MainlineDeployer {
         &self,
         rev: &str,
         ask: CiAsk,
-    ) -> (Option<bool>, Vec<String>, Vec<String>, Vec<String>) {
+    ) -> (
+        Option<bool>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+    ) {
         let mut verdicts = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         let mut excluded: Vec<String> = Vec::new();
+        let mut cancelled: Vec<String> = Vec::new();
         let mut reasons: Vec<(&'static str, CiNoVerdictReason)> = Vec::new();
         for up in &self.cfg.upstreams {
             let platform = up.platform.slug();
@@ -3912,9 +4036,14 @@ impl MainlineDeployer {
                 continue;
             };
             let repo = up.repo.trim().trim_end_matches(".git");
-            let (verdict, reason, names, skipped) =
+            let (verdict, reason, names, skipped, cancelled_names) =
                 Self::platform_ci_verdict(base, repo, rev).await;
             failed.extend(names.into_iter().map(|n| format!("{platform}:{n}")));
+            cancelled.extend(
+                cancelled_names
+                    .into_iter()
+                    .map(|n| format!("{platform}:{n}")),
+            );
             for (name, workflow) in skipped {
                 self.record_ci_check_excluded_reading(platform, &workflow)
                     .await;
@@ -3943,7 +4072,64 @@ impl MainlineDeployer {
             .iter()
             .map(|(platform, reason)| format!("{platform}:{}", reason.label()))
             .collect();
-        (verdict, failed, reason_slugs, excluded)
+        (verdict, failed, reason_slugs, excluded, cancelled)
+    }
+
+    /// 只有「取消」在撑着的扣住，扣满一个窗口就放行。
+    ///
+    /// 取消不是不通过：它说的是**这一问没有结论**。而这一层只认 `Some(false)` 与
+    /// 其余两支，取消于是与真失败同寿命——上游那次取消不会再自己变绿，扣住就是永久的，
+    /// 解开的唯一办法是有人发现并手工重跑。代价全在主线：扣着的这段时间里零信息量进账。
+    ///
+    /// 窗口之内照旧扣：重跑可能就是这一次。满窗之后按没有证据放行，原因写成
+    /// `cancelled_waived` 一格——放行不等于没发生过，读数面必须能指着它说「这一版是
+    /// 带着一次取消滚上去的」。
+    ///
+    /// 时限的参照是**这一笔第一次被判 `fail` 的时刻**（`decided_unix`；重复判出同一个
+    /// 结论时它不被刷新，所以它是窗口的起点而不是最后一次提问的时刻）。宿主实测一段冷
+    /// 构建约 8 分钟，窗口给到 30 分钟，足够让一次重跑跑完还留出排队的余量。
+    const CANCELLED_WAIVER_WINDOW_SECS: i64 = 30 * 60;
+
+    /// 见 [`Self::CANCELLED_WAIVER_WINDOW_SECS`]。返回新的判词与原因列；没有可以放行的
+    /// 东西时原样返回。
+    fn waive_a_hold_that_only_cancellations_hold_up(
+        verdict: Option<bool>,
+        reasons: Vec<String>,
+        failed_checks: &[String],
+        cancelled_checks: &[String],
+        held_since_unix: Option<i64>,
+        now_unix: i64,
+    ) -> (Option<bool>, Vec<String>) {
+        if verdict != Some(false) || cancelled_checks.is_empty() {
+            return (verdict, reasons);
+        }
+        // 取消必须是**全部**原因：只要还剩一条真失败，它自己就够扣住了，取消不背这个锅。
+        if cancelled_checks.len() != failed_checks.len() {
+            return (verdict, reasons);
+        }
+        // 第一次见到这一笔的时候窗口才开始走，这一轮不可能是满窗。
+        let Some(since) = held_since_unix else {
+            return (verdict, reasons);
+        };
+        if now_unix.saturating_sub(since) < Self::CANCELLED_WAIVER_WINDOW_SECS {
+            return (verdict, reasons);
+        }
+        let mut waived: Vec<String> = Vec::new();
+        for name in cancelled_checks {
+            let platform = name.split(':').next().unwrap_or_default();
+            let slug = format!("{platform}:{}", CiNoVerdictReason::CancelledWaived.label());
+            if !waived.contains(&slug) {
+                waived.push(slug);
+            }
+        }
+        info!(
+            cancelled = %cancelled_checks.join(","),
+            held_seconds = now_unix.saturating_sub(since),
+            "every failing check on this rev was cancelled and the hold outlived its window; \
+             releasing it as no_evidence instead of holding the mainline for a verdict that \
+             no run is going to produce"
+        );
+        (None, waived)
     }
 
     /// 上游 CI 已经给出明确的失败结论就扣住这个 rev；`Ok(true)` = 扣住了。
@@ -3973,8 +4159,23 @@ impl MainlineDeployer {
         rev: &str,
         ask: CiAsk,
     ) -> SFResult<bool> {
-        let (verdict, failed_checks, reasons, excluded_checks) =
+        let (verdict, failed_checks, reasons, excluded_checks, cancelled_checks) =
             self.ci_verdict_with_failures(rev, ask).await;
+        // 「取消」在一层之下与「不通过」同形（都是 `Some(false)`），但它的意思是
+        // **这一问没有结论**。扣满一个窗口仍没有结论，就按没有证据放行，并把原因写成
+        // 具名的一格；窗口之内照旧扣着，给它一次跑完的机会。
+        let (verdict, reasons) = Self::waive_a_hold_that_only_cancellations_hold_up(
+            verdict,
+            reasons,
+            &failed_checks,
+            &cancelled_checks,
+            state
+                .last_ci_verdict
+                .as_ref()
+                .filter(|r| r.rev == rev && r.verdict == "fail")
+                .map(|r| r.decided_unix),
+            chrono::Utc::now().timestamp(),
+        );
         self.record_ci_verdict_in_state(
             state,
             rev,
@@ -14534,12 +14735,13 @@ exec {real} "$@"
             )),
         ])
         .await;
-        let (verdict, reason, failed, _excluded) = MainlineDeployer::platform_ci_verdict(
-            &format!("http://{endpoint}/github"),
-            "o/r",
-            "abc",
-        )
-        .await;
+        let (verdict, reason, failed, _cancelled, _excluded) =
+            MainlineDeployer::platform_ci_verdict(
+                &format!("http://{endpoint}/github"),
+                "o/r",
+                "abc",
+            )
+            .await;
         assert_eq!(
             verdict,
             Some(true),
@@ -14646,7 +14848,7 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, _excluded) = deployer
+        let (verdict, failed, _reasons, _excluded, _cancelled) = deployer
             .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
             .await;
         assert_eq!(verdict, Some(false));
@@ -15237,7 +15439,7 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) = deployer
+        let (verdict, failed, _reasons, excluded, _cancelled) = deployer
             .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
             .await;
         assert_eq!(verdict, Some(true), "被排掉的那条不判这棵树，另一条是绿的");
@@ -15282,7 +15484,7 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) = deployer
+        let (verdict, failed, _reasons, excluded, _cancelled) = deployer
             .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
             .await;
         assert_eq!(
@@ -15323,12 +15525,212 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) = deployer
+        let (verdict, failed, _reasons, excluded, cancelled) = deployer
+            .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+            .await;
+        // 被判词扣住这件事不改：一次取消仍然是"没有结论"，在窗口之内照旧扣。
+        assert_eq!(verdict, Some(false));
+        assert_eq!(failed, vec!["github:Test".to_string()]);
+        assert!(excluded.is_empty(), "{excluded:?}");
+        // 但它必须被单独认出来——"扣满窗口就放行"只能靠这一列把取消从真失败里分
+        // 出来。混在一堆失败名里，取消就永远是永久的扣。
+        assert_eq!(cancelled, vec!["github:Test".to_string()]);
+        let _ = handle.await.unwrap();
+    }
+
+    /// 满窗之后按「没有证据」放行，而且必须把这件事写成具名的一格。
+    ///
+    /// 放行本身是判据的目的，原因格才是它的代价控制：没有这一格，读数面上一次
+    /// 「带着取消滚上去」的放行与一次「查过、确实绿」的放行完全同形。
+    #[test]
+    fn a_hold_that_only_cancellations_hold_up_is_released_once_the_window_is_spent() {
+        let failed = vec!["github:Test".to_string()];
+        let cancelled = vec!["github:Test".to_string()];
+        let (verdict, reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
+            Some(false),
+            vec!["github:pending".to_string()],
+            &failed,
+            &cancelled,
+            Some(1_000),
+            1_000 + MainlineDeployer::CANCELLED_WAIVER_WINDOW_SECS,
+        );
+        assert_eq!(verdict, None, "满窗之后没有结论就按没有证据放行");
+        assert_eq!(reasons, vec!["github:cancelled_waived".to_string()]);
+    }
+
+    /// 窗口之内照旧扣着：重跑可能就是这一次，扣住的成本远小于放一条没判过的版本上线。
+    #[test]
+    fn a_cancelled_check_inside_the_window_still_holds() {
+        let failed = vec!["github:Test".to_string()];
+        let cancelled = vec!["github:Test".to_string()];
+        let (verdict, reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
+            Some(false),
+            vec!["github:pending".to_string()],
+            &failed,
+            &cancelled,
+            Some(1_000),
+            1_000 + MainlineDeployer::CANCELLED_WAIVER_WINDOW_SECS - 1,
+        );
+        assert_eq!(verdict, Some(false));
+        assert_eq!(
+            reasons,
+            vec!["github:pending".to_string()],
+            "原因列原样不动"
+        );
+    }
+
+    /// 第一次见到这一笔的时候窗口才开始走；这一次不可能是满窗。
+    #[test]
+    fn the_window_starts_at_the_first_failing_verdict() {
+        let failed = vec!["github:Test".to_string()];
+        let cancelled = vec!["github:Test".to_string()];
+        let (verdict, _reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
+            Some(false),
+            Vec::new(),
+            &failed,
+            &cancelled,
+            None,
+            i64::MAX,
+        );
+        assert_eq!(verdict, Some(false), "没有起点就没有窗口，先扣着");
+    }
+
+    /// 还有一条真失败在场，取消就不背这个锅：窗口再久也不放行。
+    ///
+    /// 这是这条判据最容易写错的一格——只问「有多久」而不问「是不是全都在取消」，
+    /// 一次上游抖动造成的取消就能把一条真红放过去。
+    #[test]
+    fn a_real_failure_riding_along_keeps_the_hold() {
+        let failed = vec!["github:Test".to_string(), "github:Clippy".to_string()];
+        let cancelled = vec!["github:Test".to_string()];
+        let (verdict, _reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
+            Some(false),
+            Vec::new(),
+            &failed,
+            &cancelled,
+            Some(0),
+            MainlineDeployer::CANCELLED_WAIVER_WINDOW_SECS * 100,
+        );
+        assert_eq!(verdict, Some(false));
+    }
+
+    /// 原因格的平台前缀从检查名上取：两端的同名检查是两件事，读数面不能合并。
+    #[test]
+    fn the_waived_reason_carries_the_platform_of_the_cancelled_check() {
+        let failed = vec!["github:Test".to_string(), "gitee:Test".to_string()];
+        let cancelled = vec!["github:Test".to_string(), "gitee:Test".to_string()];
+        let (verdict, reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
+            Some(false),
+            Vec::new(),
+            &failed,
+            &cancelled,
+            Some(0),
+            MainlineDeployer::CANCELLED_WAIVER_WINDOW_SECS,
+        );
+        assert_eq!(verdict, None);
+        assert_eq!(
+            reasons,
+            vec![
+                "github:cancelled_waived".to_string(),
+                "gitee:cancelled_waived".to_string()
+            ]
+        );
+    }
+
+    /// 重跑成功能翻案：同一个名字以**最近一次给出结论**的那条 run 为准。
+    ///
+    /// 这条是这层判据能靠重跑自救的前提。数组里旧的取消排在新成功**之后**，所以
+    /// 按顺序取最后一条的实现会把它判死；按时间取才翻得过来。
+    #[tokio::test]
+    async fn a_rerun_that_concluded_supersedes_the_cancelled_run_before_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[
+                {"name":"Test","conclusion":"success","id":2,
+                 "started_at":"2026-10-30T01:10:00Z","completed_at":"2026-10-30T01:12:00Z"},
+                {"name":"Test","conclusion":"cancelled","id":1,
+                 "started_at":"2026-10-30T01:00:00Z","completed_at":"2026-10-30T01:01:00Z"}]}"#,
+        )])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let (verdict, failed, _reasons, cancelled, excluded) = deployer
+            .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+            .await;
+        assert_eq!(verdict, Some(true), "重跑给出结论之后这一项不再是取消");
+        assert!(failed.is_empty(), "{failed:?}");
+        assert!(cancelled.is_empty(), "{cancelled:?}");
+        assert!(excluded.is_empty(), "{excluded:?}");
+        let _ = handle.await.unwrap();
+    }
+
+    /// 但一次被取消的重跑不许把先前那条真失败抹掉。
+    ///
+    /// 否则「重跑」就成了清红通道：随便重跑一次、让它被取消，红就没了。取消的
+    /// 意思是没有结论，没有结论不能盖掉一条已经有结论的失败。
+    #[tokio::test]
+    async fn a_cancelled_rerun_does_not_erase_the_failure_it_came_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(
+                r#"{"check_runs":[
+                    {"name":"Test","conclusion":"failure","id":1,
+                     "started_at":"2026-10-30T01:00:00Z","completed_at":"2026-10-30T01:05:00Z",
+                     "html_url":"https://github.com/o/r/actions/runs/4247/job/7"},
+                    {"name":"Test","conclusion":"cancelled","id":2,
+                     "started_at":"2026-10-30T01:10:00Z","completed_at":"2026-10-30T01:25:00Z"}]}"#,
+            ),
+            http_200(r#"{"id":4247,"path":".github/workflows/ci.yml"}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let (verdict, failed, _reasons, cancelled, _excluded) = deployer
+            .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
+            .await;
+        assert_eq!(verdict, Some(false), "先前的失败还在");
+        assert_eq!(failed, vec!["github:Test".to_string()]);
+        // 取消这一列必须**空**：它一旦非空，上层就会在窗口之后把这条真红放行。
+        assert!(cancelled.is_empty(), "{cancelled:?}");
+        let _ = handle.await.unwrap();
+    }
+
+    /// 还在跑的重跑同样盖不掉先前的失败：两条事实并存，失败那一支说了算。
+    #[tokio::test]
+    async fn a_rerun_still_running_does_not_erase_the_failure_it_came_after() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(
+                r#"{"check_runs":[
+                    {"name":"Test","conclusion":"failure","id":1,
+                     "started_at":"2026-10-30T01:00:00Z","completed_at":"2026-10-30T01:05:00Z",
+                     "html_url":"https://github.com/o/r/actions/runs/4248/job/7"},
+                    {"name":"Test","conclusion":null,"id":2,
+                     "started_at":"2026-10-30T01:10:00Z","completed_at":null}]}"#,
+            ),
+            http_200(r#"{"id":4248,"path":".github/workflows/ci.yml"}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let (verdict, failed, _reasons, cancelled, _excluded) = deployer
             .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
             .await;
         assert_eq!(verdict, Some(false));
         assert_eq!(failed, vec!["github:Test".to_string()]);
-        assert!(excluded.is_empty(), "{excluded:?}");
+        assert!(cancelled.is_empty(), "{cancelled:?}");
         let _ = handle.await.unwrap();
     }
 
@@ -15351,7 +15753,7 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) = deployer
+        let (verdict, failed, _reasons, excluded, _cancelled) = deployer
             .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
             .await;
         assert_eq!(verdict, Some(false));
@@ -15380,7 +15782,7 @@ exec {real} "$@"
         cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
 
-        let (verdict, failed, _reasons, excluded) = deployer
+        let (verdict, failed, _reasons, excluded, _cancelled) = deployer
             .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
             .await;
         assert_eq!(verdict, Some(false));

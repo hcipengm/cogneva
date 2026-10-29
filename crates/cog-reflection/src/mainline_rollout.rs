@@ -4473,7 +4473,7 @@ impl RolloutExecutor {
         let mut still_running: Vec<String> = Vec::new();
         let mut not_asked: Vec<String> = Vec::new();
         for up in &ask.upstreams {
-            let (verdict, reason, names, excluded) =
+            let (verdict, reason, names, excluded, _cancelled) =
                 MainlineDeployer::platform_ci_verdict(&up.api_base, &up.repo, &ask.rev).await;
             if !excluded.is_empty() {
                 // 排掉的那几条要留话：这个 rev 上游确实有一条红检查，只是那条不判
