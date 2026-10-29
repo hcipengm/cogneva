@@ -157,6 +157,16 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["phase"],
         "crates/cog-observability/src/boot_footprint.rs",
     ),
+    // The same marks, read as work done rather than time taken: the CPU seconds
+    // this process had spent when each phase was reached. Drawn on its own panel
+    // beside the elapsed one so the pair can be compared without a person
+    // grepping two adjacent log lines, which is where this reading lived before
+    // it had a series.
+    (
+        "cogneva_boot_phase_cpu_seconds",
+        &["phase"],
+        "crates/cog-observability/src/boot_footprint.rs",
+    ),
     // Pool recovery readings. Three separate series rather than one "recovers
     // at" number: which upstream said it, when we will probe again, and how long
     // the window an upstream stated is are answers of different strength, and

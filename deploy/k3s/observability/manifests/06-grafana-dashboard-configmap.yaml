@@ -3140,7 +3140,7 @@ data:
         {
           "id": 73,
           "title": "Startup Phases: When Each One Was Reached",
-          "description": "Seconds from the first mark at which each startup phase was reached, one line per phase, one segment per boot. The series is written once at the moment of the mark and then held, so every restart drops the lines to zero and climbs again, and the height a line flattens at is that boot's boundary for the phase. Read it across boots rather than inside one: a phase's own cost is the difference from the phase above it, and what makes a boot slow is which segment stretched. Measured over eighteen rolls to 2026-10-29, the tenfold spread is inside the three phases that build an ONNX session (reranker 21.7 to 188.1 s, embedding-sparse 7.6 to 121.4 s, embedding-dense 4.6 to 116.9 s) while process-start is 0.000 s and config-loaded never leaves a second, so a slow boot is not a slow configuration. What the panel cannot say is whether a stretched phase was working or waiting -- the same work given fewer cores runs longer, and the slow boots here used fewer cores than the fast ones without ever throttling. The reading that separates the two is the CPU seconds each phase spent, which is printed beside elapsed seconds in every phase-reached log line and deliberately not published as a series; a wall clock that grew while its CPU seconds did not is waiting. There is no rule on this series for the same reason: a bound wide enough to absorb the spread names nothing, and one tight enough to name a phase that doubled would fire on every roll.",
+          "description": "Seconds from the first mark at which each startup phase was reached, one line per phase, one segment per boot. The series is written once at the moment of the mark and then held, so every restart drops the lines to zero and climbs again, and the height a line flattens at is that boot's boundary for the phase. Read it across boots rather than inside one: a phase's own cost is the difference from the phase above it, and what makes a boot slow is which segment stretched. Measured over eighteen rolls to 2026-10-29, the tenfold spread is inside the three phases that build an ONNX session (reranker 21.7 to 188.1 s, embedding-sparse 7.6 to 121.4 s, embedding-dense 4.6 to 116.9 s) while process-start is 0.000 s and config-loaded never leaves a second, so a slow boot is not a slow configuration. What the panel cannot say is whether a stretched phase was working or waiting -- the same work given fewer cores runs longer, and the slow boots here used fewer cores than the fast ones without ever throttling. The reading that separates the two is the CPU seconds each phase spent, drawn on the panel beside this one from the same mark; a wall clock that grew while its CPU seconds did not is waiting. There is no rule on this series for the same reason: a bound wide enough to absorb the spread names nothing, and one tight enough to name a phase that doubled would fire on every roll.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -3159,6 +3159,47 @@ data:
             },
             {
               "expr": "cogneva_boot_phase_elapsed_seconds{job=\"cogneva-evolution\"}",
+              "legendFormat": "evolution {{phase}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "s",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "spanNulls": false
+              }
+            }
+          }
+        }
+        ,
+        {
+          "id": 74,
+          "title": "Startup Phases: CPU Seconds Spent When Each Was Reached",
+          "description": "CPU seconds this process had spent, summed over every thread, by the time each startup phase was reached -- the same marks, on the same phases, as the panel beside it. Read the two together: that panel is time taken, this one is work done, and a phase whose line there climbed while this one stayed flat had time pass with no thread running. It cannot say which kind of wait that was, being scheduled or waiting for a page of the model file to come off the disk, because both leave this clock where it was; the phase-reached log lines carry the major fault count for that, and the difference between two adjacent lines is what separates the two waits. Both series are cumulative, so a phase's own CPU cost is the difference from the phase above it, exactly as on the elapsed panel. There is no rule on this series for the same reason there is none there: one sample per boot against a tenfold spread gives a bound nothing to be read against.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 344
+          },
+          "targets": [
+            {
+              "expr": "cogneva_boot_phase_cpu_seconds{job=\"cogneva\"}",
+              "legendFormat": "{{phase}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_boot_phase_cpu_seconds{job=\"cogneva-evolution\"}",
               "legendFormat": "evolution {{phase}}",
               "datasource": {
                 "type": "prometheus",

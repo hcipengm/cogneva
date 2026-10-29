@@ -53,7 +53,14 @@
 //! let one caller's typo become a second series that no rule reads.
 //!
 //! Each of those lines also carries **`cpu_seconds`**, **`minor_faults`** and
-//! **`major_faults`** for the same instant -- not series, only fields. Elapsed
+//! **`major_faults`** for the same instant. The CPU reading is published as
+//! `cogneva_boot_phase_cpu_seconds` beside the elapsed one, so the comparison
+//! that says whether a phase was working or waiting can be made by something
+//! other than a person reading two adjacent log lines. The two fault counters
+//! stay fields on the line: their meaning is a difference between adjacent
+//! phases either way, and the question they answer -- was this phase's missing
+//! CPU spent waiting to be scheduled or waiting for the disk -- is asked once,
+//! by whoever is looking at a slow boot, not continuously. Elapsed
 //! time alone cannot say whether a slow phase was working or waiting: the same
 //! work costs about the same CPU time however long it is made to wait, so a
 //! phase whose elapsed time rose while its CPU time did not had time pass with
@@ -63,10 +70,10 @@
 //! page-faulted its way through the weights shows a jump of one fault per page
 //! of the file, and one that was merely not scheduled shows almost none.
 //!
-//! They are not published as series because a phase's value is cumulative and
-//! its meaning is the difference from the phase before it, which is the
-//! reader's arithmetic either way; keeping them in the line costs no
-//! cardinality and answers the one question the numbers together are asked.
+//! The two fault counters are not published as series because a phase's value
+//! is cumulative and its meaning is the difference from the phase before it,
+//! which is the reader's arithmetic either way; keeping them in the line costs
+//! no cardinality and answers the one question the numbers together are asked.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -80,6 +87,14 @@ pub const BOOT_RSS_METRIC: &str = "cogneva_boot_rss_bytes";
 
 /// Seconds from the first mark to a named startup phase.
 pub const BOOT_ELAPSED_METRIC: &str = "cogneva_boot_phase_elapsed_seconds";
+
+/// Seconds of CPU this process had spent, summed over every thread, by the time
+/// a named startup phase was reached.
+///
+/// Published beside the elapsed time so that the pair can be compared by
+/// something other than a person reading log lines: a phase whose wall clock
+/// grew while its CPU time did not had time pass with no thread running.
+pub const BOOT_CPU_METRIC: &str = "cogneva_boot_phase_cpu_seconds";
 
 /// The rule that reads the series, named here so the pairing is asserted
 /// rather than left to whoever edits the chart.
@@ -108,6 +123,9 @@ struct Mark {
     rss: Option<u64>,
     /// Seconds from the first mark to this one.
     elapsed_seconds: f64,
+    /// CPU seconds this process had spent by this instant, or `None` where the
+    /// clock could not be read.
+    cpu_seconds: Option<f64>,
 }
 
 /// One snapshot per phase, in phase order, first mark wins.
@@ -168,6 +186,7 @@ pub fn mark(phase: &'static str) {
         phase,
         rss,
         elapsed_seconds,
+        cpu_seconds: vitals.map(|v| v.cpu_seconds),
     });
     marks.sort_by_key(|m| {
         PHASES
@@ -349,8 +368,9 @@ pub fn parse_vm_rss(status: &str) -> Option<u64> {
     })
 }
 
-/// Publishes one `cogneva_boot_rss_bytes` and one
-/// `cogneva_boot_phase_elapsed_seconds` series per recorded phase.
+/// Publishes one `cogneva_boot_rss_bytes`, one
+/// `cogneva_boot_phase_elapsed_seconds` and, where the CPU clock was read, one
+/// `cogneva_boot_phase_cpu_seconds` series per recorded phase.
 pub struct BootFootprintObservable;
 
 #[async_trait]
@@ -362,6 +382,12 @@ impl Observable for BootFootprintObservable {
                 RawMetric::new(BOOT_ELAPSED_METRIC, mark.elapsed_seconds)
                     .with_label(crate::LABEL_PHASE, mark.phase),
             );
+            if let Some(cpu_seconds) = mark.cpu_seconds {
+                metrics.push(
+                    RawMetric::new(BOOT_CPU_METRIC, cpu_seconds)
+                        .with_label(crate::LABEL_PHASE, mark.phase),
+                );
+            }
             if let Some(bytes) = mark.rss {
                 metrics.push(
                     RawMetric::new(BOOT_RSS_METRIC, bytes as f64)
@@ -387,6 +413,20 @@ impl Observable for BootFootprintObservable {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// The phases a named series was published for, in the order published.
+    fn series_phases(metrics: &[RawMetric], name: &str) -> Vec<String> {
+        metrics
+            .iter()
+            .filter(|m| m.name == name)
+            .map(|m| {
+                m.labels
+                    .get(crate::LABEL_PHASE)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
 
     /// The registry is one per process, so tests that mark have to take turns:
     /// otherwise each one reads the marks another one left behind.
@@ -746,27 +786,31 @@ mod tests {
         // The time series is published for the same phases by the same reading:
         // a reader that has to ask a second endpoint for it is a reader that
         // compares two scrapes of different instants.
-        let timed: Vec<String> = metrics
-            .iter()
-            .filter(|m| m.name == BOOT_ELAPSED_METRIC)
-            .map(|m| {
-                m.labels
-                    .get(crate::LABEL_PHASE)
-                    .cloned()
-                    .unwrap_or_default()
-            })
-            .collect();
+        let timed = series_phases(&metrics, BOOT_ELAPSED_METRIC);
         assert_eq!(
             timed, phases,
             "the reading published a time series for a different set of phases than the memory series"
         );
+
+        // The CPU series has to cover the same phases for the same reason. It is
+        // absent as a whole on a platform whose CPU clock cannot be read, which
+        // is why the empty case is allowed and a partial one is not: a reading
+        // that covers some phases and not others would make a boot look like it
+        // spent no CPU where the clock happened to fail.
+        let cpu = series_phases(&metrics, BOOT_CPU_METRIC);
         assert!(
-            metrics
-                .iter()
-                .filter(|m| m.name == BOOT_ELAPSED_METRIC)
-                .all(|m| m.value >= 0.0),
-            "elapsed time cannot run backwards from the origin"
+            cpu.is_empty() || cpu == phases,
+            "the CPU series covers {cpu:?} while the phases are {phases:?}"
         );
+        for sibling in [BOOT_ELAPSED_METRIC, BOOT_CPU_METRIC] {
+            assert!(
+                metrics
+                    .iter()
+                    .filter(|m| m.name == sibling)
+                    .all(|m| m.value >= 0.0),
+                "{sibling} cannot run backwards from the origin"
+            );
+        }
         clear_for_tests();
     }
 
