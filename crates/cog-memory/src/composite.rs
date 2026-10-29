@@ -879,18 +879,16 @@ mod tests {
         }
     }
 
-    fn counting_composite(tally: Arc<ReadTally>) -> (CompositeMemoryBackend, tempfile::TempDir) {
-        let tmp = tempfile::tempdir().unwrap();
-        let backend = CompositeMemoryBackend::new(
-            Arc::new(cog_storage::FileObjectBackend::new(tmp.path())),
-            Arc::new(cog_storage::MemoryVectorBackend::new()),
+    fn counting_composite(tally: Arc<ReadTally>) -> CompositeMemoryBackend {
+        CompositeMemoryBackend::new(
+            Arc::new(cog_test_support::MemoryObjectBackend::new()),
+            Arc::new(cog_test_support::MemoryVectorBackend::new()),
             4,
         )
         .with_schema_backend(Arc::new(CountingSchema {
             tally: tally.clone(),
         }))
-        .with_summary_backend(Arc::new(CountingSummary { tally }));
-        (backend, tmp)
+        .with_summary_backend(Arc::new(CountingSummary { tally }))
     }
 
     /// A readiness probe hits this several times a minute, so the health check
@@ -901,7 +899,7 @@ mod tests {
     #[tokio::test]
     async fn health_check_reads_one_row_per_layer_instead_of_the_namespace() {
         let tally = Arc::new(ReadTally::default());
-        let (backend, _tmp) = counting_composite(tally.clone());
+        let backend = counting_composite(tally.clone());
 
         backend.health_check().await.unwrap();
 
@@ -924,7 +922,7 @@ mod tests {
     #[tokio::test]
     async fn a_retrieval_reading_goes_to_the_layer_that_named_the_ids() {
         let tally = Arc::new(ReadTally::default());
-        let (backend, _tmp) = counting_composite(tally.clone());
+        let backend = counting_composite(tally.clone());
 
         backend
             .record_retrievals(&["s1".to_string(), "s2".to_string()], &["m1".to_string()])

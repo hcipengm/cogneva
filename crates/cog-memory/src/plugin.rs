@@ -81,10 +81,68 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             )
         };
 
-        // Consume PostgreSQL explain pool (published by StoragePlugin).
-        let pg_pool_explain = ctx
-            .consume::<cog_storage::ExplainPool>()
-            .and_then(|p| p.0.clone());
+        // ── This crate's own tables in the platform database ──
+        // The summary and schema layers keep their rows in PostgreSQL, and the
+        // pool below is this crate's own. Taking the pool another crate
+        // published would make this crate's build name that crate for a handle
+        // whose entire content is a driver type core cannot hold -- the summary
+        // layer would then only exist in processes that link that crate.
+        //
+        // The location comes from the value the storage plugin published, not
+        // from a second reading of the environment: the resolution order is one
+        // fact, and a second copy of it is a second answer the day the first
+        // one changes.
+        // The pool and the runner are one decision, not two: a pool without a
+        // runner is a database whose tables nobody can create, and treating it
+        // as present would build stores whose every query fails against a
+        // missing table -- which reads exactly like a store with nothing to say.
+        let endpoint = ctx.consume_service::<cog_core::DatabaseEndpoint>();
+        let db_url = endpoint
+            .as_ref()
+            .and_then(|endpoint| endpoint.as_str().map(str::to_string));
+        let pool_ceiling = endpoint.as_ref().map(|endpoint| endpoint.pool_ceiling);
+        let (pg_pool_explain, schema_runner) = match (
+            ctx.consume_service::<dyn cog_core::SchemaRunner>(),
+            db_url,
+        ) {
+            (Some(runner), Some(url)) => match crate::pg_summary_pool::connect(
+                &url,
+                pool_ceiling.unwrap_or(crate::pg_summary_pool::SUMMARY_POOL_CONNECTIONS),
+            )
+            .await
+            {
+                Ok(pool) => (Some(pool), Some(runner)),
+                Err(e) => {
+                    if strict_persistence {
+                        return Err(cog_core::SFError::Config(format!(
+                            "summary layer pool failed (strict_persistence=true): {e}"
+                        )));
+                    }
+                    warn!(
+                        error = %e,
+                        "summary layer pool failed; the summary and schema layers stay in-process"
+                    );
+                    (None, None)
+                }
+            },
+            (None, Some(_)) => {
+                if strict_persistence {
+                    return Err(cog_core::SFError::Config(
+                        "a database is configured but no SchemaRunner was published, so no \
+                             layer of composite memory can create its tables \
+                             (strict_persistence=true)"
+                            .into(),
+                    ));
+                }
+                warn!(
+                    "a database is configured but no SchemaRunner was published; the summary \
+                         and schema layers stay in-process, and a table that was never created \
+                         would have read as a layer with nothing to say"
+                );
+                (None, None)
+            }
+            _ => (None, None),
+        };
 
         // ── Metrics backend ──
         let metrics_backend = ctx
@@ -199,10 +257,10 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                         vector_backend.clone(),
                         memory_embedding_dimension,
                     );
-                    match pg_pool_explain {
-                        Some(ref pool) => {
+                    match (pg_pool_explain.as_ref(), schema_runner.as_ref()) {
+                        (Some(pool), Some(runner)) => {
                             let entry_store = crate::PostgresEntryStore::from_pool(pool.clone());
-                            match entry_store.init_table().await {
+                            match entry_store.init_table(runner.as_ref()).await {
                                 Ok(()) => {
                                     info!("PostgresEntryStore initialized for summary layer");
                                     summary_backend =
@@ -222,13 +280,13 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                                 }
                             }
                         }
-                        None => {
+                        _ => {
                             if strict_persistence {
                                 return Err(cog_core::SFError::Config(
-                                    "No ExplainPool published by StoragePlugin; the summary layer of composite memory has no persistent entry store (strict_persistence=true)".into(),
+                                    "no persistent store for the summary layer of composite memory (strict_persistence=true)".into(),
                                 ));
                             }
-                            warn!("No ExplainPool published by StoragePlugin; summary layer will use memory fallback");
+                            warn!("no persistent store for the summary layer; it will use the memory fallback");
                         }
                     }
                     if let Err(e) = summary_backend.load().await {
@@ -246,11 +304,11 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                         embedding_repair = Some((summary_layer, embedder.clone()));
                     }
 
-                    match pg_pool_explain {
-                        Some(ref pool) => {
+                    match (pg_pool_explain.as_ref(), schema_runner.as_ref()) {
+                        (Some(pool), Some(runner)) => {
                             let schema_backend =
                                 Arc::new(crate::PostgresSchemaBackend::from_pool(pool.clone()));
-                            match schema_backend.init_table().await {
+                            match schema_backend.init_table(runner.as_ref()).await {
                                 Ok(()) => {
                                     info!("PostgresSchemaBackend initialized for schema layer");
                                     composite = composite.with_schema_backend(schema_backend);
@@ -265,13 +323,13 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                                 }
                             }
                         }
-                        None => {
+                        _ => {
                             if strict_persistence {
                                 return Err(cog_core::SFError::Config(
-                                    "No ExplainPool published by StoragePlugin; the schema layer of composite memory has no persistent store (strict_persistence=true)".into(),
+                                    "no persistent store for the schema layer of composite memory (strict_persistence=true)".into(),
                                 ));
                             }
-                            warn!("No ExplainPool published by StoragePlugin; schema layer will use memory fallback");
+                            warn!("no persistent store for the schema layer; it will use the memory fallback");
                         }
                     }
                     info!("CompositeMemoryBackend enabled");

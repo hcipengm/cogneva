@@ -186,7 +186,7 @@ impl PostgresSchemaBackend {
     /// Three lists, in this order: the shape, the rows, and what depends on
     /// the rows. Each is its own transaction, so the table is closed to readers
     /// for the length of the shape and no longer.
-    pub async fn init_table(&self) -> SFResult<()> {
+    pub async fn init_table(&self, runner: &dyn cog_core::SchemaRunner) -> SFResult<()> {
         // Through the shared runner, not `raw_sql` directly: this list holds
         // ALTERs, and an ALTER takes its lock before it checks whether it has
         // anything to do, so on a restart it queues behind the replica that is
@@ -197,11 +197,9 @@ impl PostgresSchemaBackend {
             SCHEMA_ENTRIES_REPAIR,
             SCHEMA_ENTRIES_AFTER_REPAIR,
         ] {
-            cog_storage::schema_ddl::apply(&self.pool, schema)
-                .await
-                .map_err(|e| {
-                    SFError::Agent(format!("PostgresSchemaBackend init_table failed: {}", e))
-                })?;
+            runner.apply_schema(schema).await.map_err(|e| {
+                SFError::Agent(format!("PostgresSchemaBackend init_table failed: {}", e))
+            })?;
         }
         Ok(())
     }

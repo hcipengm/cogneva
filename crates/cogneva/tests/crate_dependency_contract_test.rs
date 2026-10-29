@@ -53,7 +53,6 @@ const ALLOWED: &[Row] = &[
     ("cog-guardrail", "cog-core", ""),
     ("cog-llm", "cog-core", ""),
     ("cog-memory", "cog-core", ""),
-    ("cog-memory", "cog-storage", ""),
     ("cog-net", "cog-core", ""),
     ("cog-notification", "cog-core", ""),
     ("cog-observability", "cog-core", ""),

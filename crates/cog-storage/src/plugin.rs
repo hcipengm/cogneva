@@ -114,6 +114,7 @@ impl cog_core::SystemPlugin for StoragePlugin {
         // what the next reader needs: obeying the budget and not saying which
         // ceiling was in force leaves the fix's effect unreadable.
         let mut pg_pool_ceiling: Option<(u32, &'static str)> = None;
+        let database_url_for_publishing = db_url.clone();
         let (users_pool, messages_pool, config_pool, explain_pool) = if let Some(url) = db_url {
             let migrator = crate::migrate::Migrator::new(crate::migrate::migrations_dir(&app_dir));
             match migrator.run(&url).await {
@@ -292,6 +293,21 @@ impl cog_core::SystemPlugin for StoragePlugin {
         };
 
         self.pg_pool = explain_pool.clone();
+
+        // ── Where the database is, and what share of it one pool may take ──
+        // Published as a value because the resolution above is one fact: a
+        // crate that opens its own pool for its own tables has to land in the
+        // same database as the backends, and a second copy of that order is a
+        // second answer the day the first one changes. The ceiling rides along
+        // for the same reason -- it is what the division of the server's
+        // connections came out to, and a new pool picking its own size spends
+        // from that division without reading it.
+        ctx.publish_service(std::sync::Arc::new(cog_core::DatabaseEndpoint {
+            url: database_url_for_publishing,
+            pool_ceiling: pg_pool_ceiling
+                .map(|(ceiling, _)| ceiling)
+                .unwrap_or(pg_max_connections),
+        }));
 
         // ── Running other stores' schema text ──
         // A store in another crate owns its statements and creates its own
@@ -1593,8 +1609,14 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     factory: || Box::new(StoragePlugin::new()),
 };
 
-/// How many PostgreSQL pools this plugin opens against the same database.
-const POSTGRES_POOL_COUNT: u32 = 4;
+/// How many PostgreSQL pools one process opens against the same database.
+///
+/// The four below, plus the summary layer's own pool in `cog-memory`: that one
+/// opens from the endpoint this plugin publishes, so it is spending from the
+/// same division and the divisor has to count it. Leaving it out would give
+/// every pool a share of a total one too large, and the overrun is paid by
+/// whichever component asks for a connection last.
+const POSTGRES_POOL_COUNT: u32 = 5;
 
 /// How long a read notification stays in the table.
 ///

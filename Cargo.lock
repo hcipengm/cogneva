@@ -1655,7 +1655,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cog-core",
- "cog-storage",
  "cog-stream",
  "cog-test-support",
  "fastembed",
@@ -1961,6 +1960,7 @@ version = "0.5.10"
 dependencies = [
  "async-trait",
  "cog-core",
+ "serde_json",
  "sqlx",
 ]
 

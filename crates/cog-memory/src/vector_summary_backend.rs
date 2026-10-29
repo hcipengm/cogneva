@@ -803,7 +803,7 @@ mod tests {
         store.upsert(&entry("s1")).await.unwrap();
         store.upsert(&entry("s2")).await.unwrap();
 
-        let vector = Arc::new(cog_storage::MemoryVectorBackend::new());
+        let vector = Arc::new(cog_test_support::MemoryVectorBackend::new());
         let backend = VectorSummaryBackend::new(vector, 4).with_store(store);
 
         backend.load().await.unwrap();
@@ -827,7 +827,7 @@ mod tests {
         store.upsert(&entry("s1")).await.unwrap();
 
         let backend =
-            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+            VectorSummaryBackend::new(Arc::new(cog_test_support::MemoryVectorBackend::new()), 4)
                 .with_store(store);
 
         backend.load().await.unwrap();
@@ -859,7 +859,7 @@ mod tests {
         store.upsert(&entry("s1")).await.unwrap();
 
         let backend =
-            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+            VectorSummaryBackend::new(Arc::new(cog_test_support::MemoryVectorBackend::new()), 4)
                 .with_store(store)
                 .with_persist_dir(dir.path());
         backend.persist().await.unwrap();
@@ -887,7 +887,7 @@ mod tests {
         store.upsert(&no_vector).await.unwrap();
 
         let backend =
-            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+            VectorSummaryBackend::new(Arc::new(cog_test_support::MemoryVectorBackend::new()), 4)
                 .with_store(store);
 
         backend.load().await.unwrap();
@@ -916,7 +916,7 @@ mod tests {
     async fn an_entry_that_loses_its_embedding_drops_its_index_point() {
         let store = Arc::new(DurableStubStore::new());
         let backend =
-            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+            VectorSummaryBackend::new(Arc::new(cog_test_support::MemoryVectorBackend::new()), 4)
                 .with_store(store);
 
         backend
@@ -949,7 +949,7 @@ mod tests {
     async fn a_search_without_a_query_vector_returns_nothing() {
         let store = Arc::new(DurableStubStore::new());
         let backend =
-            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+            VectorSummaryBackend::new(Arc::new(cog_test_support::MemoryVectorBackend::new()), 4)
                 .with_store(store);
 
         backend
@@ -973,7 +973,7 @@ mod tests {
     async fn restoring_an_entry_keeps_its_point() {
         let store = Arc::new(DurableStubStore::new());
         let backend =
-            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+            VectorSummaryBackend::new(Arc::new(cog_test_support::MemoryVectorBackend::new()), 4)
                 .with_store(store);
         backend.load().await.unwrap();
 
@@ -1082,7 +1082,7 @@ mod tests {
         store.upsert(&unembedded("old")).await.unwrap();
 
         let backend =
-            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+            VectorSummaryBackend::new(Arc::new(cog_test_support::MemoryVectorBackend::new()), 4)
                 .with_store(store);
         backend.load().await.unwrap();
 
@@ -1134,7 +1134,7 @@ mod tests {
         store.upsert(&entry("s1")).await.unwrap();
 
         let backend =
-            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+            VectorSummaryBackend::new(Arc::new(cog_test_support::MemoryVectorBackend::new()), 4)
                 .with_store(store);
         backend.load().await.unwrap();
 
@@ -1173,7 +1173,7 @@ mod tests {
         store.upsert(&unembedded("good")).await.unwrap();
 
         let backend =
-            VectorSummaryBackend::new(Arc::new(cog_storage::MemoryVectorBackend::new()), 4)
+            VectorSummaryBackend::new(Arc::new(cog_test_support::MemoryVectorBackend::new()), 4)
                 .with_store(store);
         backend.load().await.unwrap();
 
@@ -1203,7 +1203,7 @@ mod tests {
     /// one failure worth repeating: the next attempt finds the collection the
     /// server did make, and startup continues instead of exiting.
     struct SlowCreate {
-        inner: cog_storage::MemoryVectorBackend,
+        inner: cog_test_support::MemoryVectorBackend,
         failures: std::sync::atomic::AtomicUsize,
         attempts: std::sync::atomic::AtomicUsize,
     }
@@ -1211,7 +1211,7 @@ mod tests {
     impl SlowCreate {
         fn failing(times: usize) -> Self {
             Self {
-                inner: cog_storage::MemoryVectorBackend::new(),
+                inner: cog_test_support::MemoryVectorBackend::new(),
                 failures: std::sync::atomic::AtomicUsize::new(times),
                 attempts: std::sync::atomic::AtomicUsize::new(0),
             }
@@ -1273,7 +1273,7 @@ mod tests {
     /// sharing it, or the server still finishing a call whose client had given
     /// up — and this caller is told no anyway. That refusal is convergence.
     struct LostCreateRace {
-        inner: cog_storage::MemoryVectorBackend,
+        inner: cog_test_support::MemoryVectorBackend,
         seeded: std::sync::atomic::AtomicBool,
         attempts: std::sync::atomic::AtomicUsize,
     }
@@ -1281,7 +1281,7 @@ mod tests {
     impl LostCreateRace {
         fn new() -> Self {
             Self {
-                inner: cog_storage::MemoryVectorBackend::new(),
+                inner: cog_test_support::MemoryVectorBackend::new(),
                 seeded: std::sync::atomic::AtomicBool::new(false),
                 attempts: std::sync::atomic::AtomicUsize::new(0),
             }

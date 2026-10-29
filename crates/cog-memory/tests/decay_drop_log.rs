@@ -199,10 +199,9 @@ fn an_entry_that_was_only_demoted_is_not_named() {
 /// separate files; a shared helper is not what keeps them in step.
 #[test]
 fn the_composite_backend_names_its_drop_too() {
-    let tmp = tempfile::tempdir().unwrap();
     let backend = CompositeMemoryBackend::new(
-        Arc::new(cog_storage::FileObjectBackend::new(tmp.path())),
-        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        Arc::new(cog_test_support::MemoryObjectBackend::new()),
+        Arc::new(cog_test_support::MemoryVectorBackend::new()),
         4,
     );
 
@@ -212,10 +211,9 @@ fn the_composite_backend_names_its_drop_too() {
 
 #[test]
 fn the_composite_backend_does_not_name_a_demotion() {
-    let tmp = tempfile::tempdir().unwrap();
     let backend = CompositeMemoryBackend::new(
-        Arc::new(cog_storage::FileObjectBackend::new(tmp.path())),
-        Arc::new(cog_storage::MemoryVectorBackend::new()),
+        Arc::new(cog_test_support::MemoryObjectBackend::new()),
+        Arc::new(cog_test_support::MemoryVectorBackend::new()),
         4,
     );
 

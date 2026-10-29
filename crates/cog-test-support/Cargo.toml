@@ -12,4 +12,5 @@ repository.workspace = true
 sqlx = { workspace = true }
 # 夹具 runner 实现的是 core 的契约；指向 core 的边不是欠账（那是架构）。
 cog-core = { workspace = true }
+serde_json = { workspace = true }
 async-trait = "0.1"

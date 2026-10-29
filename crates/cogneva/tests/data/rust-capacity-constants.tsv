@@ -296,6 +296,8 @@ crates/cog-memory/src/extractor.rs	SUMMARY	5	bound	A preview is a slice of the p
 crates/cog-memory/src/ingestor.rs	SUBSCRIBE_RETRY_BACKOFF	5s	bound	订阅失败后的重试间隔：5s。
 crates/cog-memory/src/maintenance.rs	DECAY_ARCHIVE_FLOOR	0.02	bound	降到这个重要性（含）以下的合格条目离开可检索的摘要层。
 crates/cog-memory/src/maintenance.rs	DECAY_IMPORTANCE_FACTOR	0.5	bound	一次衰减扫描把合格条目的重要性乘上的系数。
+crates/cog-memory/src/pg_summary_pool.rs	ACQUIRE_TIMEOUT	5s	bound	a caller waits this long for one of two connections before the database is reported busy, rather than the request hanging behind the summary layer
+crates/cog-memory/src/pg_summary_pool.rs	SUMMARY_POOL_CONNECTIONS	2	bound	the summary and schema layers are read concurrently and neither holds a connection between calls, so two; the pool also never exceeds the per-pool ceiling the storage plugin published	
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_DOUBLINGS	4	bound	four doublings from 500 ms cap the wait at 8 s inside the 120 s retry window
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_MS	500	bound	the first retry delay; doubling from here keeps asking during a create storm
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_DEADLINE	120s	bound	How long startup keeps trying to (re)create the summary collection before it reports the failure.
@@ -497,7 +499,7 @@ crates/cog-storage/src/partition_maintainer.rs	MONTHS_AHEAD	2	bound	How far ahea
 crates/cog-storage/src/partition_maintainer.rs	MONTHS_BEHIND	1	bound	How far back maintenance reaches, so a recently dropped partition heals.
 crates/cog-storage/src/plugin.rs	CONNECTION_ACQUIRE_TIMEOUT	5s	bound	读服务端连接数时拿一条连接的等待上限：5s。
 crates/cog-storage/src/plugin.rs	NOTIFICATION_KEEP_DAYS	90	bound	How long a read notification stays in the table.
-crates/cog-storage/src/plugin.rs	POSTGRES_POOL_COUNT	4	bound	the four pools share the server's connection ceiling, so that ceiling is divided by four
+crates/cog-storage/src/plugin.rs	POSTGRES_POOL_COUNT	5	bound	the four pools here plus the summary layer's own pool share the server's connection ceiling, so that ceiling is divided by five
 crates/cog-storage/src/postgres/agent_message_store.rs	ROWS_KEPT_PER_PEER	500	bound	Rows kept per receiving peer, so a chatty sender cannot grow the table without bound. Larger than what a panel shows at once, because how far back a reader can scroll and what fits on one screen answer different questions.
 crates/cog-storage/src/postgres/change_ledger_store.rs	DOC_MAX	512	bound	a writer-side cap on the source document; the row itself keeps the sources in JSONB
 crates/cog-storage/src/postgres/change_ledger_store.rs	KIND_MAX	32	bound	the identity's kind column width, a schema limit rather than a measurement

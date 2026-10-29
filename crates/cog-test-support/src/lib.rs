@@ -11,6 +11,10 @@
 
 use sqlx::Connection as _;
 
+mod backends;
+
+pub use backends::{MemoryObjectBackend, MemoryVectorBackend};
+
 /// 下面那几个入口读的名字。一条名字只在这里拼写一次。
 ///
 /// 拼第二遍的地方不会因为拼错而红：`env::var` 读一个没人设置的名字，与「本来就没配」

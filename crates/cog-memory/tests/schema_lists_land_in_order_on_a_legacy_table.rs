@@ -65,11 +65,13 @@ async fn the_lists_fill_a_table_that_predates_its_columns_and_are_safe_to_repeat
         .await
         .expect("the legacy table is built with a row in it");
 
+    let runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+
     // Two starts: the second is the one every restart after an upgrade does,
     // and it has to be a no-op rather than an error.
     for start in 1..=2 {
         PostgresSchemaBackend::from_pool(pool.clone())
-            .init_table()
+            .init_table(&runner)
             .await
             .unwrap_or_else(|e| panic!("start {start} must apply the lists: {e}"));
     }
@@ -121,8 +123,9 @@ async fn the_summary_store_also_writes_its_rows_outside_the_shape() {
     let schema = own_schema(&url, "memorder").await;
     let pool = schema_pool_with(&url, &schema, 4).await;
 
+    let runner = cog_test_support::SchemaTextRunner::new(pool.clone());
     PostgresEntryStore::from_pool(pool.clone())
-        .init_table()
+        .init_table(&runner)
         .await
         .expect("a fresh database takes both lists");
 
@@ -138,7 +141,7 @@ async fn the_summary_store_also_writes_its_rows_outside_the_shape() {
     .expect("the zero-vector row is inserted");
 
     PostgresEntryStore::from_pool(pool.clone())
-        .init_table()
+        .init_table(&runner)
         .await
         .expect("the second start applies both lists again");
 

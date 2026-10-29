@@ -1991,9 +1991,7 @@ fn enqueue(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        CompositeMemoryBackend, MemoryMemoryBackend, NoopVectorBackend, RuleBasedExtractor,
-    };
+    use crate::{MemoryMemoryBackend, RuleBasedExtractor};
     use chrono::Utc;
     use cog_core::{Message, SchemaEntry, SummaryEntry};
 
@@ -2176,52 +2174,6 @@ mod tests {
             err.to_string()
                 .contains(&format!("failure #{}", max_retries + 1)),
             "the returned error must be the last one, got {err}"
-        );
-    }
-
-    /// Regression for the ENAMETOOLONG archive failure: with the raw layer on
-    /// a real filesystem object store (the production wiring), a full issue
-    /// title as agent_id must still archive, and the verbatim agent_id must
-    /// survive as a tag for traceability.
-    #[tokio::test]
-    async fn long_agent_id_archives_on_filesystem_backend() {
-        let dir = tempfile::tempdir().unwrap();
-        let composite = CompositeMemoryBackend::new(
-            Arc::new(cog_storage::FileObjectBackend::new(dir.path())),
-            Arc::new(NoopVectorBackend::new()),
-            8,
-        );
-        let backend: Arc<dyn MemoryBackend> = Arc::new(composite);
-        let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
-        let (event_tx, _) = broadcast::channel::<AgentEvent>(16);
-        let _handle = ingestor.spawn(event_tx.subscribe());
-
-        event_tx.send(agent_end(LIVE_LONG_AGENT_ID)).unwrap();
-
-        let mut archived_id = None;
-        for _ in 0..100 {
-            if let Ok(list) = backend.list_raw("default", None).await {
-                if let Some(id) = list.into_iter().next() {
-                    archived_id = Some(id);
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let id = archived_id.expect("long agent_id must archive on the filesystem backend");
-        assert!(id.len() < 128, "archived id not bounded: {id}");
-
-        let raw = backend
-            .get_raw("default", &id)
-            .await
-            .expect("raw readable")
-            .expect("raw present");
-        assert!(
-            raw.tags
-                .iter()
-                .any(|t| t == &format!("agent_id:{LIVE_LONG_AGENT_ID}")),
-            "verbatim agent_id must be retained in tags, got {:?}",
-            raw.tags
         );
     }
 

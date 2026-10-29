@@ -101,14 +101,16 @@ impl PostgresEntryStore {
     ///
     /// Two calls, not one text: see [`SUMMARY_ENTRIES_DDL`] for what merging
     /// them costs the readers of this table.
-    pub async fn init_table(&self) -> SFResult<()> {
+    pub async fn init_table(&self, runner: &dyn cog_core::SchemaRunner) -> SFResult<()> {
         // Shared runner for the same reason as the schema table: an ALTER
         // takes its lock before it checks whether it has anything to do, and
         // an unbounded wait queues the outgoing replica's readers behind it.
-        cog_storage::schema_ddl::apply(&self.pool, SUMMARY_ENTRIES_DDL)
+        runner
+            .apply_schema(SUMMARY_ENTRIES_DDL)
             .await
             .map_err(|e| SFError::Agent(format!("PostgresEntryStore init_table failed: {}", e)))?;
-        cog_storage::schema_ddl::apply(&self.pool, SUMMARY_ENTRIES_REPAIR)
+        runner
+            .apply_schema(SUMMARY_ENTRIES_REPAIR)
             .await
             .map_err(|e| SFError::Agent(format!("PostgresEntryStore init_table failed: {}", e)))
     }

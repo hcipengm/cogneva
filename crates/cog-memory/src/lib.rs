@@ -29,6 +29,7 @@ pub mod maintenance;
 pub mod metrics_instrumented;
 pub mod noop_backends;
 pub mod observable;
+pub mod pg_summary_pool;
 pub mod postgres_entry_store;
 pub mod postgres_schema;
 pub mod reranker;

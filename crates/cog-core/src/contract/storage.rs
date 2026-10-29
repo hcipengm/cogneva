@@ -305,6 +305,42 @@ pub trait SchemaRunner: Send + Sync {
     async fn apply_schema(&self, ddl: &str) -> SFResult<()>;
 }
 
+/// Where this process' PostgreSQL is, and how many connections one pool may
+/// take from it.
+///
+/// The location has three sources in order -- an environment variable and two
+/// config paths -- and they are one fact, not three: a component that opens its
+/// own pool for its own tables has to reach the same database as the component
+/// that publishes the shared backends, or the process keeps half its state
+/// somewhere else and nothing says so. Carried as a value rather than left to
+/// each crate to resolve, because a second copy of that order is a second
+/// answer the day the first one changes.
+///
+/// The ceiling rides along because it is not a separate decision. The server's
+/// `max_connections` is divided between the processes on the host and the pools
+/// in each process; a crate that opens one more pool and picks its own size is
+/// spending from that division without reading it, and the overrun shows up as
+/// another component being refused a connection. One number, handed out by the
+/// component that did the division.
+///
+/// `url: None` is "this deployment has no database", which is a state the
+/// callers already handle: it is the same state as a pool that was never
+/// opened.
+#[derive(Debug, Clone, Default)]
+pub struct DatabaseEndpoint {
+    /// The connection string, if this deployment has one.
+    pub url: Option<String>,
+    /// How many connections one pool may hold, as the division came out.
+    pub pool_ceiling: u32,
+}
+
+impl DatabaseEndpoint {
+    /// The connection string, if this deployment has one.
+    pub fn as_str(&self) -> Option<&str> {
+        self.url.as_deref()
+    }
+}
+
 /// Runtime object-storage abstraction for large blobs (files, snapshots, raw sources).
 /// Implementations: Memory (testing), FileSystem (local dev), S3/SeaweedFS (production).
 #[async_trait]
