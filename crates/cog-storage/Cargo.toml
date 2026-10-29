@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
-cog-redis = { workspace = true }
 tokio = { workspace = true }
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio-native-tls"] }
 chrono = { workspace = true }

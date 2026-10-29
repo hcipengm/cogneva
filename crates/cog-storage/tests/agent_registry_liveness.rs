@@ -69,7 +69,9 @@ async fn plant_without_expiry(reg: &AgentRegistration) {
     // building the manager straight from the driver leaves its retry delays
     // uncapped, so a probe aimed at an address that is not there waits minutes
     // before it can say so.
-    let mut conn = cog_redis::connect(&client).await.expect("connection");
+    let mut conn = cog_storage::redis::connect(&client)
+        .await
+        .expect("connection");
     let payload = serde_json::to_string(reg).expect("serialize");
     let key = format!("orchestrator:agents:{}", reg.agent_id);
     let _: () = conn.set(&key, payload).await.expect("planted record");
@@ -81,7 +83,9 @@ async fn plant_without_expiry(reg: &AgentRegistration) {
 
 async fn ttl_secs(agent_id: &str) -> i64 {
     let client = redis::Client::open(redis_url()).expect("redis url");
-    let mut conn = cog_redis::connect(&client).await.expect("connection");
+    let mut conn = cog_storage::redis::connect(&client)
+        .await
+        .expect("connection");
     conn.ttl(format!("orchestrator:agents:{agent_id}"))
         .await
         .expect("ttl")
@@ -199,7 +203,9 @@ async fn plant_with_expiry(reg: &AgentRegistration, seconds: u64) {
     let client = redis::Client::open(redis_url()).expect("redis url");
     // Bounded like the other plant helper: a probe must not spend minutes on an
     // address that is not there.
-    let mut conn = cog_redis::connect(&client).await.expect("connection");
+    let mut conn = cog_storage::redis::connect(&client)
+        .await
+        .expect("connection");
     let payload = serde_json::to_string(reg).expect("serialize");
     let key = format!("orchestrator:agents:{}", reg.agent_id);
     let _: () = conn
@@ -277,7 +283,9 @@ async fn a_heartbeat_keeps_an_agent_live_past_its_first_expiry() {
 /// Whether a name is on the roster `list` walks.
 async fn indexed(agent_id: &str) -> bool {
     let client = redis::Client::open(redis_url()).expect("redis url");
-    let mut conn = cog_redis::connect(&client).await.expect("connection");
+    let mut conn = cog_storage::redis::connect(&client)
+        .await
+        .expect("connection");
     conn.sismember("orchestrator:agents:index", agent_id)
         .await
         .expect("sismember")

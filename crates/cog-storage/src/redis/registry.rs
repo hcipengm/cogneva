@@ -49,7 +49,7 @@ impl RedisAgentRegistry {
 
     pub async fn from_url(url: &str) -> SFResult<Self> {
         let client = redis::Client::open(url).map_err(|e| SFError::Redis(e.to_string()))?;
-        let connection = cog_redis::connect(&client)
+        let connection = crate::redis::connect(&client)
             .await
             .map_err(|e| SFError::Redis(e.to_string()))?;
         Ok(Self::new(connection))

@@ -57,7 +57,7 @@ const IGNORE_MARKER: &str = concat!("#[ig", "nore");
 /// made, which is the failure the test below exists to catch.
 const UNNAMED: &[(&str, &str)] = &[
     (
-        "crates/cog-redis/src/lib.rs",
+        "crates/cog-storage/src/redis/connect.rs",
         "The one test here asserts that the default configuration stalls the \
          driver for over a minute, and the waiting is the finding; running it \
          would add minutes to every CI run to re-establish a number nobody acts \

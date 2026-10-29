@@ -63,9 +63,7 @@ const ALLOWED: &[Row] = &[
     ("cog-reflection", "cog-core", ""),
     ("cog-skill", "cog-core", ""),
     ("cog-storage", "cog-core", ""),
-    ("cog-storage", "cog-redis", ""),
     ("cog-stream", "cog-core", ""),
-    ("cog-stream", "cog-redis", ""),
     ("cog-supervisor", "cog-core", ""),
     // The fixture runner implements a core contract, so the fixture crate names
     // core like everything else. Its edge into core is architecture rather than
@@ -111,12 +109,10 @@ const ALLOWED_DEV: &[Row] = &[
     ("cog-memory", "cog-test-support", ""),
     ("cog-observability", "cog-test-support", ""),
     ("cog-orchestrator", "cog-storage", ""),
-    ("cog-redis", "cog-test-support", ""),
     ("cog-reflection", "cog-prompt", ""),
     ("cog-reflection", "cog-storage", ""),
     ("cog-storage", "cog-test-support", ""),
     ("cog-stream", "cog-test-support", ""),
-    ("cogneva", "cog-redis", ""),
     ("cogneva", "cog-test-support", ""),
 ];
 

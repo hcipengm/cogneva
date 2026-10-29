@@ -1827,16 +1827,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cog-redis"
-version = "0.5.10"
-dependencies = [
- "cog-test-support",
- "redis",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "cog-reflection"
 version = "0.5.10"
 dependencies = [
@@ -1894,7 +1884,6 @@ dependencies = [
  "chrono",
  "clap",
  "cog-core",
- "cog-redis",
  "cog-test-support",
  "etcd-client",
  "futures",
@@ -1926,7 +1915,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cog-core",
- "cog-redis",
  "cog-test-support",
  "futures",
  "redis",
@@ -2010,7 +1998,6 @@ dependencies = [
  "cog-prompt",
  "cog-protocol",
  "cog-quota",
- "cog-redis",
  "cog-reflection",
  "cog-skill",
  "cog-storage",

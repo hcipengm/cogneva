@@ -20,7 +20,7 @@ impl RedisStateBackend {
         let client = redis::Client::open(redis_url).map_err(|e| SFError::Redis(e.to_string()))?;
         let mut last_err = None;
         for attempt in 0..3 {
-            match cog_redis::connect(&client).await {
+            match crate::redis::connect(&client).await {
                 Ok(connection) => return Ok(Self { connection }),
                 Err(e) => {
                     last_err = Some(e);

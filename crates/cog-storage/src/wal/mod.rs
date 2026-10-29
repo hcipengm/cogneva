@@ -462,7 +462,7 @@ impl RedisWalBackend {
     pub async fn new(redis_url: &str) -> Result<Self, WalError> {
         let client =
             redis::Client::open(redis_url).map_err(|e| WalError::Backend(e.to_string()))?;
-        let conn = cog_redis::connect(&client)
+        let conn = crate::redis::connect(&client)
             .await
             .map_err(|e| WalError::Backend(e.to_string()))?;
         Ok(Self {

@@ -31,7 +31,7 @@ const PROBE: &str = "probe_wal_retirement";
 
 async fn backend() -> RedisWalBackend {
     let client = redis::Client::open(redis_url()).expect("redis url");
-    let conn = cog_redis::connect(&client)
+    let conn = cog_storage::redis::connect(&client)
         .await
         .expect("connect to the Redis named by COGNEVA_TEST_REDIS_URL");
     RedisWalBackend::from_connection(conn)

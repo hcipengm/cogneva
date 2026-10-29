@@ -64,7 +64,7 @@ fn session_id() -> String {
 
 async fn length(backend_key: &str, session: &str) -> usize {
     let client = redis::Client::open(backend_key).expect("redis url");
-    let mut conn = cog_redis::connect(&client).await.expect("connect");
+    let mut conn = cog_storage::redis::connect(&client).await.expect("connect");
     redis::cmd("LLEN")
         .arg(format!("wal:{session}"))
         .query_async::<usize>(&mut conn)
@@ -74,7 +74,7 @@ async fn length(backend_key: &str, session: &str) -> usize {
 
 async fn delete(backend_key: &str, session: &str) {
     let client = redis::Client::open(backend_key).expect("redis url");
-    let mut conn = cog_redis::connect(&client).await.expect("connect");
+    let mut conn = cog_storage::redis::connect(&client).await.expect("connect");
     redis::cmd("DEL")
         .arg(format!("wal:{session}"))
         .query_async::<()>(&mut conn)

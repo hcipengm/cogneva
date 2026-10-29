@@ -66,7 +66,9 @@ pub async fn migrate_once(url: &str, lock: i64) {
 /// throwaway instance is at, through the same client the product uses.
 pub async fn raw_conn() -> redis::aio::ConnectionManager {
     let client = redis::Client::open(cog_test_support::redis_url()).expect("redis url");
-    cog_redis::connect(&client).await.expect("connection")
+    cog_storage::redis::connect(&client)
+        .await
+        .expect("connection")
 }
 
 /// How many rows `table` holds.

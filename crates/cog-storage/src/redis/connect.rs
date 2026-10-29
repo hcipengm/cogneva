@@ -1,5 +1,6 @@
-//! principle: feedback_a_hung_read_is_not_a_refusal
 //! Redis connection construction, bounded.
+//!
+//! principle: feedback_a_hung_read_is_not_a_refusal
 //!
 //! `redis::aio::ConnectionManager` is the layer that replaces a socket that died,
 //! which is why every long-lived redis client in this workspace holds one. Its
@@ -25,8 +26,11 @@
 //!
 //! So connections here are always **bounded**: within the budget they either
 //! connect or return an error the caller can act on. Callers that want to keep
-//! trying have their own retry loop; what they never get from this crate is a
-//! call that hangs.
+//! trying have their own retry loop; what they never get from this module is a
+//! call that hangs. The budget's arithmetic is
+//! [`cog_core::config::RedisConnectBudget`]'s, shared with the other crate that
+//! opens redis connections of its own; building the connection is this crate's,
+//! because the manager type is the driver's and cannot cross a contract.
 //!
 //! A *connected* manager was the other half of that promise, and it was not
 //! kept: a command issued on a socket the peer silently stopped answering rode
@@ -35,131 +39,32 @@
 //! zero — a hung read is not a refused one, so nothing counted it, nothing
 //! reconnected, and the only thing that ended the stall was the kernel giving
 //! up. Every connection built here therefore also carries a response timeout
-//! ([`ConnectBudget::response_timeout`]): a reply that does not arrive in that
-//! time is an I/O error, which is what makes the manager replace the socket and
-//! what the caller counts. A call site whose commands legitimately block longer
-//! (a `XREADGROUP ... BLOCK`) sets its own, above its block period.
+//! ([`RedisConnectBudget::response_timeout`]): a reply that does not arrive in
+//! that time is an I/O error, which is what makes the manager replace the socket
+//! and what the caller counts. A call site whose commands legitimately block
+//! longer (a `XREADGROUP ... BLOCK`) sets its own, above its block period.
 //!
-//! Scope: this crate owns *how a connection is built*. What is stored on redis —
+//! Scope: this module owns *how a connection is built*. What is stored on redis —
 //! state, streams, registries, audit — belongs to `cog-storage` and `cog-stream`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 use redis::aio::ConnectionManager;
 use redis::aio::ConnectionManagerConfig;
 
-/// Total connect budget in milliseconds. Bounds the retry delays *and* each
-/// attempt, so it is also the order of magnitude of the worst case.
-const DEFAULT_BUDGET_MS: u64 = 2_000;
-/// Retry attempts within that budget. Kept low on purpose: the callers that can
-/// tolerate redis being away for a while already retry the whole operation, and
-/// they need the failure to come back to them rather than be absorbed here.
-const DEFAULT_RETRIES: usize = 2;
-/// A budget below this would turn a momentary refusal into a permanent error.
-const MIN_BUDGET_MS: u64 = 100;
-
-/// How long one command on an established connection may wait for its reply.
-///
-/// Thirty seconds is not a latency target: it is the point past which a reply
-/// is not late but lost. Every command this workspace issues against redis other
-/// than a blocking stream read answers in milliseconds, and the reads that do
-/// block say so explicitly and widen this. Left unset, the wait is the kernel's,
-/// which is measured in minutes.
-const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 30_000;
-
-/// A response timeout below this is not a bound, it is a race against the
-/// round trip.
-const MIN_RESPONSE_TIMEOUT_MS: u64 = 100;
-
-/// How long a connection attempt may take, how many times it is retried, and how
-/// long one command on the finished connection may wait for its reply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ConnectBudget {
-    /// Total budget in milliseconds.
-    pub budget_ms: u64,
-    /// Retries after the first attempt.
-    pub retries: usize,
-    /// Upper bound on a single command's round trip, on the connection this
-    /// budget builds.
-    pub response_timeout_ms: u64,
-}
-
-impl Default for ConnectBudget {
-    fn default() -> Self {
-        Self {
-            budget_ms: DEFAULT_BUDGET_MS,
-            retries: DEFAULT_RETRIES,
-            response_timeout_ms: DEFAULT_RESPONSE_TIMEOUT_MS,
-        }
-    }
-}
-
-impl ConnectBudget {
-    /// Read the budget from the environment.
-    ///
-    /// Both knobs are defined by injection: an installation that runs redis on a
-    /// slow link can widen the budget without a rebuild.
-    pub fn from_env() -> Self {
-        Self::from_lookup(|key| std::env::var(key).ok())
-    }
-
-    /// The same, with the value source injected — reading the environment is a
-    /// property of the process, not of the decision, and the decision is what
-    /// the tests below pin down.
-    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
-        let read = |key: &str| get(key).and_then(|v| v.trim().parse::<u64>().ok());
-        let default = Self::default();
-        Self {
-            budget_ms: read("COGNEVA_REDIS_CONNECT_BUDGET_MS")
-                .filter(|v| *v >= MIN_BUDGET_MS)
-                .unwrap_or(default.budget_ms),
-            retries: read("COGNEVA_REDIS_CONNECT_RETRIES").unwrap_or(default.retries as u64)
-                as usize,
-            response_timeout_ms: read("COGNEVA_REDIS_RESPONSE_TIMEOUT_MS")
-                .filter(|v| *v >= MIN_RESPONSE_TIMEOUT_MS)
-                .unwrap_or(default.response_timeout_ms),
-        }
-    }
-
-    /// The same budget with a different response timeout, for the call sites
-    /// whose commands legitimately block past the default.
-    pub fn with_response_timeout_ms(mut self, ms: u64) -> Self {
-        self.response_timeout_ms = ms.max(MIN_RESPONSE_TIMEOUT_MS);
-        self
-    }
-
-    /// Per-attempt timeout. Without it a peer that silently drops packets (rather
-    /// than refusing) holds the attempt open for the operating system's TCP
-    /// timeout — again minutes, and again not a number this system can wait on.
-    pub fn attempt_timeout(&self) -> Duration {
-        Duration::from_millis(self.budget_ms)
-    }
-
-    /// Ceiling for the delay between attempts. This is the knob that removes the
-    /// minutes: the driver's default has no ceiling, so the delays grow with the
-    /// multiplier it was handed.
-    pub fn max_delay_ms(&self) -> u64 {
-        self.budget_ms / (self.retries as u64 + 1)
-    }
-
-    /// How long one command on the built connection may wait for its reply.
-    pub fn response_timeout(&self) -> Duration {
-        Duration::from_millis(self.response_timeout_ms)
-    }
-}
+pub use cog_core::config::RedisConnectBudget;
 
 /// Connect with a connection manager that replaces a dead socket, bounded by the
 /// budget from the environment.
 pub async fn connect(client: &redis::Client) -> redis::RedisResult<ConnectionManager> {
-    connect_with(client, ConnectBudget::from_env()).await
+    connect_with(client, RedisConnectBudget::from_env()).await
 }
 
 /// Connect with an explicit budget. For call sites with a reason to differ, and
 /// for tests that need a fixed bound.
 pub async fn connect_with(
     client: &redis::Client,
-    budget: ConnectBudget,
+    budget: RedisConnectBudget,
 ) -> redis::RedisResult<ConnectionManager> {
     let config = ConnectionManagerConfig::new()
         .set_number_of_retries(budget.retries)
@@ -208,7 +113,7 @@ pub async fn connect_with(
 /// was read.
 pub struct Reconnecting {
     client: redis::Client,
-    budget: ConnectBudget,
+    budget: RedisConnectBudget,
     conn: std::sync::Mutex<Option<ConnectionManager>>,
     failed_attempts: AtomicU64,
 }
@@ -216,12 +121,12 @@ pub struct Reconnecting {
 impl Reconnecting {
     /// A channel bounded by the budget from the environment.
     pub fn new(client: redis::Client) -> Self {
-        Self::with_budget(client, ConnectBudget::from_env())
+        Self::with_budget(client, RedisConnectBudget::from_env())
     }
 
     /// The same, with an explicit budget. For call sites with a reason to
     /// differ, and for tests that need a fixed bound.
-    pub fn with_budget(client: redis::Client, budget: ConnectBudget) -> Self {
+    pub fn with_budget(client: redis::Client, budget: RedisConnectBudget) -> Self {
         Self {
             client,
             budget,
@@ -275,6 +180,7 @@ mod tests {
     use redis::AsyncCommands;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::sync::Arc;
+    use std::time::Duration;
 
     /// An address that refuses immediately: the shape of "redis is not running".
     const REFUSED: &str = "redis://127.0.0.1:1";
@@ -283,100 +189,12 @@ mod tests {
     /// timeout can bound.
     const BLACK_HOLE: &str = "redis://192.0.2.1:6379";
 
-    fn budget() -> ConnectBudget {
-        ConnectBudget {
+    fn budget() -> RedisConnectBudget {
+        RedisConnectBudget {
             budget_ms: 500,
             retries: 2,
-            ..ConnectBudget::default()
+            ..RedisConnectBudget::default()
         }
-    }
-
-    /// The delays must stay inside the budget. Without a ceiling the driver
-    /// multiplies its one-second floor by the factor it was handed, which is
-    /// where the minutes come from.
-    #[test]
-    fn the_budget_bounds_every_delay() {
-        let b = ConnectBudget {
-            budget_ms: 900,
-            retries: 2,
-            ..ConnectBudget::default()
-        };
-        assert_eq!(b.max_delay_ms(), 300);
-        assert_eq!(b.attempt_timeout(), Duration::from_millis(900));
-
-        let default = ConnectBudget::default();
-        assert_eq!(default.budget_ms, DEFAULT_BUDGET_MS);
-        assert_eq!(default.retries, DEFAULT_RETRIES);
-        assert_eq!(
-            default.response_timeout(),
-            Duration::from_millis(DEFAULT_RESPONSE_TIMEOUT_MS),
-            "a connection built here must bound each command's round trip"
-        );
-        assert!(
-            default.max_delay_ms() * (default.retries as u64 + 1) <= default.budget_ms,
-            "the delays alone must not be able to exceed the budget"
-        );
-    }
-
-    /// An installation may widen the budget; a nonsense value must not narrow it
-    /// into "no retry at all", which would turn a restart into a hard failure.
-    #[test]
-    fn the_environment_sets_the_budget_and_is_ignored_when_unusable() {
-        let lookup = |pairs: &[(&str, &str)]| {
-            let owned: Vec<(String, String)> = pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
-        };
-
-        let widened = ConnectBudget::from_lookup(lookup(&[
-            ("COGNEVA_REDIS_CONNECT_BUDGET_MS", "9000"),
-            ("COGNEVA_REDIS_CONNECT_RETRIES", "5"),
-        ]));
-        assert_eq!(widened.budget_ms, 9000);
-        assert_eq!(widened.retries, 5);
-
-        let nonsense = ConnectBudget::from_lookup(lookup(&[
-            ("COGNEVA_REDIS_CONNECT_BUDGET_MS", "0"),
-            ("COGNEVA_REDIS_CONNECT_RETRIES", "many"),
-        ]));
-        assert_eq!(
-            nonsense,
-            ConnectBudget::default(),
-            "an unusable value falls back to the default instead of disabling retries"
-        );
-    }
-
-    /// The response timeout is a knob for call sites with blocking commands, and
-    /// the widening has to survive the reading; a value that would fire inside
-    /// the round trip is refused rather than honoured.
-    #[test]
-    fn the_response_timeout_widens_on_request_and_never_below_the_round_trip() {
-        let widened = ConnectBudget::default().with_response_timeout_ms(20_000);
-        assert_eq!(widened.response_timeout(), Duration::from_secs(20));
-
-        let narrowed = ConnectBudget::default().with_response_timeout_ms(0);
-        assert_eq!(
-            narrowed.response_timeout(),
-            Duration::from_millis(MIN_RESPONSE_TIMEOUT_MS),
-            "a timeout that fires before any answer could arrive would fail every command"
-        );
-
-        let from_env = ConnectBudget::from_lookup(|key| match key {
-            "COGNEVA_REDIS_RESPONSE_TIMEOUT_MS" => Some("45000".into()),
-            _ => None,
-        });
-        assert_eq!(from_env.response_timeout(), Duration::from_secs(45));
-
-        let unusable = ConnectBudget::from_lookup(|key| match key {
-            "COGNEVA_REDIS_RESPONSE_TIMEOUT_MS" => Some("0".into()),
-            _ => None,
-        });
-        assert_eq!(
-            unusable.response_timeout(),
-            Duration::from_millis(DEFAULT_RESPONSE_TIMEOUT_MS)
-        );
     }
 
     /// The stall this bound exists for: a peer that accepts the connection and
@@ -441,7 +259,7 @@ mod tests {
         );
     }
 
-    /// The regression this crate exists for. Against a refused address the call
+    /// The regression this module exists for. Against a refused address the call
     /// must come back as an error within the budget — degrading a backend is
     /// allowed to cost a second, not minutes.
     #[tokio::test]
@@ -491,7 +309,7 @@ mod tests {
             .expect("a managed connection answers");
         assert_eq!(pong, "PONG");
         let _: () = connection
-            .set("cog-redis:test", "1")
+            .set("cog-storage:connect-test", "1")
             .await
             .expect("and takes commands");
     }

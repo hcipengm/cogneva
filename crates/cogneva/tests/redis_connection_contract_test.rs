@@ -17,7 +17,7 @@
 //!    hands the driver's `factor` (milliseconds) to a backoff builder that reads
 //!    it as a multiplier, on top of a one-second floor and no ceiling, so an
 //!    unreachable address is retried for minutes before an error comes back —
-//!    measured, see `cog_redis`'s ignored test. Almost every call site here
+//!    measured, see the recording file's ignored test. Almost every call site here
 //!    treats "redis is not reachable" as a reason to degrade, and degrading
 //!    cannot be measured in minutes: the startup path stops reporting progress
 //!    instead of failing.
@@ -26,11 +26,15 @@
 //! constructor* a line calls, and both are invisible at runtime until they bite.
 //! So they are asserted over the sources.
 //!
-//! The shared constructor in `cog_redis` is the one approved way: a manager that
-//! replaces a dead socket, within a budget. Both rules are scoped to what the
-//! failure actually costs: the first is about a connection that has to keep
-//! working for hours and is checked over production code, the second is about a
-//! call that hangs for minutes and is checked everywhere.
+//! Building a connection is each owning crate's own code, but it has to be the
+//! bounded shape: a manager that replaces a dead socket, within a budget. Two
+//! crates open redis connections (`cog-storage` for state, registries and the
+//! write-ahead log, `cog-stream` for its streams backend), and the budget's
+//! arithmetic is `cog_core`'s so the two cannot drift; the driver call itself is
+//! repeated, because the manager type cannot cross a contract. Both rules are
+//! scoped to what the failure actually costs: the first is about a connection
+//! that has to keep working for hours and is checked over production code, the
+//! second is about a call that hangs for minutes and is checked everywhere.
 //!
 //! Note on the literals below: they are assembled at compile time, so that this
 //! file — which is itself one of the sources scanned — never contains the text it
@@ -57,14 +61,27 @@ const UNBOUNDED_QUALIFIED: &str = concat!("redis::aio::Connection", "Manager::ne
 /// name, whose constructor is not a redis connection at all.
 const MANAGER_IMPORT: &str = concat!("aio::Connection", "Manager");
 
-/// The approved way to build a managed connection.
-const APPROVED: &str = concat!("cog_redis::", "connect");
+/// The approved way to build a managed connection: the configured constructor,
+/// which carries the retry ceiling, the per-attempt timeout and the reply
+/// deadline. A bare `ConnectionManager` constructor carries none of them.
+const APPROVED: &str = concat!("new_with_", "config");
 
-/// The one file allowed to name the unbounded constructor: `cog_redis` records
-/// the driver's stall as a runnable test, which is the evidence for its own
-/// budget. The exemption is checked below, so renaming or deleting that file
-/// fails this gate instead of quietly widening it.
-const RECORDING_FILE: &str = "crates/cog-redis/src/lib.rs";
+/// The one file allowed to name the unbounded constructor: it records the
+/// driver's stall as a runnable test, which is the evidence for every budget in
+/// the workspace. The exemption is checked below, so renaming or deleting that
+/// file fails this gate instead of quietly widening it.
+const RECORDING_FILE: &str = "crates/cog-storage/src/redis/connect.rs";
+
+/// The two crates that open redis connections of their own, and the module in
+/// each where that happens.
+///
+/// Listed so that a crate deleting its bounded builder fails here rather than
+/// leaving the rules below passing over a tree that no longer has one: the
+/// stream's own builder is also the subject of the block-period rule.
+const CONNECTION_BUILDERS: &[&str] = &[
+    "crates/cog-storage/src/redis/connect.rs",
+    "crates/cog-stream/src/redis.rs",
+];
 
 /// The stream reads' own connection builder, and the two halves of the rule that
 /// its reply deadline clears the block period the read asked for.
@@ -129,10 +146,9 @@ fn the_detectors_see_both_shapes_and_leave_the_other_ones_alone() {
         "conn: redis::aio::Multiplexed",
         "Connection,"
     )));
-    assert!(!holds_a_bare_connection(concat!(
-        "let conn = cog_redis::",
-        "connect(&client).await?;"
-    )));
+    assert!(!holds_a_bare_connection(
+        "let conn = connect(&client).await?;"
+    ));
     // The cut stops at the test module, so a fixture inside a production file is
     // not a finding.
     assert!(!holds_a_bare_connection(&production_text(concat!(
@@ -214,7 +230,7 @@ fn no_production_source_holds_a_bare_multiplexed_connection() {
     let mut bare = Vec::new();
     let mut approved = Vec::new();
     for (relative, text) in scan() {
-        if text.contains(APPROVED) {
+        if production_text(&text).contains(APPROVED) {
             approved.push(relative.clone());
         }
         if is_integration_test(&relative) {
@@ -224,11 +240,15 @@ fn no_production_source_holds_a_bare_multiplexed_connection() {
             bare.push(relative);
         }
     }
-    assert!(
-        approved.len() > 1,
-        "the scan found no source using {APPROVED} at all, so the rule below is \
-         vacuous — check that the walk still reaches the crates: {approved:?}"
-    );
+    for builder in CONNECTION_BUILDERS {
+        assert!(
+            approved.iter().any(|file| file == builder),
+            "{builder} no longer builds a connection with {APPROVED}. Every redis \
+             connection in this workspace is built within a budget — see the \
+             recording file for what the unbounded default costs. Building them: \
+             {approved:?}"
+        );
+    }
     assert!(
         bare.is_empty(),
         "these sources hold a connection that is never replaced when its socket \

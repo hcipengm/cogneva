@@ -24,7 +24,7 @@ pub struct RedisDeadLetterQueue {
 impl RedisDeadLetterQueue {
     pub async fn new(redis_url: &str, queue_key: impl Into<String>) -> SFResult<Self> {
         let client = redis::Client::open(redis_url).map_err(|e| SFError::Redis(e.to_string()))?;
-        let connection = cog_redis::connect(&client)
+        let connection = crate::redis::connect(&client)
             .await
             .map_err(|e| SFError::Redis(e.to_string()))?;
         Ok(Self::from_connection(connection, queue_key))

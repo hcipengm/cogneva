@@ -43,7 +43,7 @@ enum Connection {
     Held(ConnectionManager),
     /// Opened at the first call that needs one, and re-attempted by the next
     /// call after a failure.
-    OnDemand(Arc<cog_redis::Reconnecting>),
+    OnDemand(Arc<crate::redis::Reconnecting>),
 }
 
 /// Redis implementation of [`KeyValueStore`].
@@ -81,18 +81,18 @@ impl RedisKeyValueStore {
     /// still an error -- that one is a fact about the configuration, not about
     /// this second.
     pub fn on_demand(redis_url: &str) -> SFResult<Self> {
-        Self::on_demand_with_budget(redis_url, cog_redis::ConnectBudget::from_env())
+        Self::on_demand_with_budget(redis_url, crate::redis::RedisConnectBudget::from_env())
     }
 
     /// The same, with an explicit budget. For call sites with a reason to
     /// differ, and for tests that need a fixed bound.
     pub fn on_demand_with_budget(
         redis_url: &str,
-        budget: cog_redis::ConnectBudget,
+        budget: crate::redis::RedisConnectBudget,
     ) -> SFResult<Self> {
         let client = redis::Client::open(redis_url).map_err(err)?;
         Ok(Self {
-            connection: Connection::OnDemand(Arc::new(cog_redis::Reconnecting::with_budget(
+            connection: Connection::OnDemand(Arc::new(crate::redis::Reconnecting::with_budget(
                 client, budget,
             ))),
         })
@@ -247,18 +247,18 @@ mod tests {
     /// An address that refuses immediately: the shape of "the store is not up".
     const REFUSED: &str = "redis://127.0.0.1:1";
 
-    fn budget() -> cog_redis::ConnectBudget {
-        cog_redis::ConnectBudget {
+    fn budget() -> crate::redis::RedisConnectBudget {
+        crate::redis::RedisConnectBudget {
             budget_ms: 300,
             retries: 1,
-            ..cog_redis::ConnectBudget::default()
+            ..crate::redis::RedisConnectBudget::default()
         }
     }
 
     /// The channel behind a store built from a URL. Read here rather than
     /// exposed: how many times the store has tried to reach redis is a fact this
     /// crate's tests need and no production reader asks for.
-    fn channel_of(store: &RedisKeyValueStore) -> &Arc<cog_redis::Reconnecting> {
+    fn channel_of(store: &RedisKeyValueStore) -> &Arc<crate::redis::Reconnecting> {
         match &store.connection {
             Connection::OnDemand(channel) => channel,
             Connection::Held(_) => {

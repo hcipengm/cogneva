@@ -32,7 +32,7 @@ pub async fn open_at(redis_url: &str) -> Option<redis::aio::ConnectionManager> {
             return None;
         }
     };
-    match cog_redis::connect(&client).await {
+    match cog_storage::redis::connect(&client).await {
         Ok(conn) => Some(conn),
         Err(e) => {
             eprintln!("SKIP: no Redis reachable ({e})");

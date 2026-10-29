@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::read_health::{ReadHealth, ReadRefusal};
+use cog_core::config::RedisConnectBudget;
 use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
 
 /// Upper bound on how many over-threshold entries one measurement lists. The
@@ -141,33 +142,51 @@ impl RedisMessageBackend {
         // (measured on 2026-10-22: ten minutes of silence, zero refusals
         // counted, every group of the process stalled at once).
         let block_ms = self.read_block_ms.max(self.resume_block_ms) as u64;
-        let budget = cog_redis::ConnectBudget::from_env()
+        let budget = RedisConnectBudget::from_env()
             .with_response_timeout_ms(block_ms.saturating_add(READ_RESPONSE_GRACE_MS));
-        cog_redis::connect_with(&self.client, budget)
-            .await
-            .map_err(|e| SFError::Redis(e.to_string()))
+        connect_with(&self.client, budget).await
     }
 }
 
-/// A connection that replaces its own socket when the socket dies.
+/// A connection that replaces its own socket when the socket dies, built within
+/// a budget.
 ///
-/// A bare multiplexed connection does not: once the peer closes it, every
-/// later command is issued on the same dead socket and fails with the same
-/// I/O error, forever (observed in the cluster: a pod repeating "broken
-/// pipe" for hours until it was restarted by hand, its consumers frozen on
-/// a message stream nobody was reading). The manager swaps the socket in on
-/// an I/O error and hands that one error back to the caller, so the next
-/// command goes out on a fresh connection — retries that already exist
-/// therefore recover, and a command is never issued twice, so a failed
-/// publish is never silently duplicated.
+/// A bare multiplexed connection does not replace its socket: once the peer
+/// closes it, every later command is issued on the same dead socket and fails
+/// with the same I/O error, forever (observed in the cluster: a pod repeating
+/// "broken pipe" for hours until it was restarted by hand, its consumers frozen
+/// on a message stream nobody was reading). The manager swaps the socket in on
+/// an I/O error and hands that one error back to the caller, so the next command
+/// goes out on a fresh connection — retries that already exist therefore
+/// recover, and a command is never issued twice, so a failed publish is never
+/// silently duplicated.
 ///
 /// The other half — that this connection is not worth waiting minutes for — is
-/// [`cog_redis::connect`]'s, and it is a property of that one call site for
-/// every backend in the workspace.
-async fn connect(client: &redis::Client) -> SFResult<ConnectionManager> {
-    cog_redis::connect(client)
+/// the budget's: the driver's own default configuration retries an unreachable
+/// address for minutes (measured at 473 s, recorded as an ignored test on
+/// `cog_storage::redis::connect`), and every call site here reads "redis is not
+/// reachable" as a reason to degrade rather than a reason to stall. The
+/// arithmetic is [`cog_core::config::RedisConnectBudget`]'s, shared with the
+/// other crates that open redis connections; only the driver call is repeated,
+/// because the manager type cannot cross a contract.
+async fn connect_with(
+    client: &redis::Client,
+    budget: RedisConnectBudget,
+) -> SFResult<ConnectionManager> {
+    let config = redis::aio::ConnectionManagerConfig::new()
+        .set_number_of_retries(budget.retries)
+        .set_max_delay(budget.max_delay_ms())
+        .set_connection_timeout(budget.attempt_timeout())
+        .set_response_timeout(budget.response_timeout());
+    ConnectionManager::new_with_config(client.clone(), config)
         .await
         .map_err(|e| SFError::Redis(e.to_string()))
+}
+
+/// The budget from the environment: this backend's ordinary connection is not a
+/// blocking one, so it takes the defaults as read.
+async fn connect(client: &redis::Client) -> SFResult<ConnectionManager> {
+    connect_with(client, RedisConnectBudget::from_env()).await
 }
 
 /// Create a stream's consumer group, tolerating the group already being there.

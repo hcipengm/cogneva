@@ -93,9 +93,14 @@ crates/cog-core/src/config.rs	DEFAULT_ACCESS_TOKEN_TTL_MINUTES	15	bound	the toke
 crates/cog-core/src/config.rs	DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS	3600	bound	hourly against a 24h Gitee token, leaving room for several failed renewals
 crates/cog-core/src/config.rs	DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS	4 * 3600	bound	Renew once under 4h of lifetime remain: enough for the token exchange, the Secret patch and the gateway roll to all land before expiry.
 crates/cog-core/src/config.rs	DEFAULT_READY_CLAIM_IDLE_SECS	600	bound	one window shared by the ready sweeper and the publisher's stall check
+crates/cog-core/src/config.rs	DEFAULT_REDIS_CONNECT_BUDGET_MS	2_000	bound	the budget is where a call must return an error, not a latency target; the driver default costs 473 s against a refused address
+crates/cog-core/src/config.rs	DEFAULT_REDIS_CONNECT_RETRIES	2	bound	retry attempts within that budget; the callers that can tolerate redis being away already retry the whole operation, and they need the failure to come back to them rather than be absorbed here
 crates/cog-core/src/config.rs	DEFAULT_REDIS_READ_BLOCK_MS	5000	bound	per-consumer quiet period: one round trip when idle, prompt wake when not
 crates/cog-core/src/config.rs	DEFAULT_REDIS_READ_RESUME_BLOCK_MS	1000	bound	a drain read; the entries it waits for are already in the stream
+crates/cog-core/src/config.rs	DEFAULT_REDIS_RESPONSE_TIMEOUT_MS	30_000	bound	the point past which a reply is lost rather than late, not a latency target; left unset the wait is the kernel's, measured at ten minutes
 crates/cog-core/src/config.rs	DEFAULT_TASK_LEASE_SECS	120	bound	three renewal ticks at lease/3, so two may be missed before another process judges it gone
+crates/cog-core/src/config.rs	MIN_REDIS_CONNECT_BUDGET_MS	100	bound	below it a momentary refusal would be reported as a permanent error
+crates/cog-core/src/config.rs	MIN_REDIS_RESPONSE_TIMEOUT_MS	100	bound	below it the timeout races the round trip itself
 crates/cog-core/src/config_sections.rs	MAX_MESSAGE_CHARS	600	bound	character ceiling because names come from the document and multiply the length
 crates/cog-core/src/config_sections.rs	MAX_NAMES_PER_LIST	6	bound	names spelled out before the rest are counted; keeps one alert row readable
 crates/cog-core/src/contract/alerts.rs	ALERT_LABEL_VALUE_MAX_CHARS	1024	bound	long enough for a path or an upstream message to survive truncation, short enough that a label value stays a label value
@@ -297,7 +302,7 @@ crates/cog-memory/src/ingestor.rs	SUBSCRIBE_RETRY_BACKOFF	5s	bound	订阅失败�
 crates/cog-memory/src/maintenance.rs	DECAY_ARCHIVE_FLOOR	0.02	bound	降到这个重要性（含）以下的合格条目离开可检索的摘要层。
 crates/cog-memory/src/maintenance.rs	DECAY_IMPORTANCE_FACTOR	0.5	bound	一次衰减扫描把合格条目的重要性乘上的系数。
 crates/cog-memory/src/pg_summary_pool.rs	ACQUIRE_TIMEOUT	5s	bound	a caller waits this long for one of two connections before the database is reported busy, rather than the request hanging behind the summary layer
-crates/cog-memory/src/pg_summary_pool.rs	SUMMARY_POOL_CONNECTIONS	2	bound	the summary and schema layers are read concurrently and neither holds a connection between calls, so two; the pool also never exceeds the per-pool ceiling the storage plugin published	
+crates/cog-memory/src/pg_summary_pool.rs	SUMMARY_POOL_CONNECTIONS	2	bound	the summary and schema layers are read concurrently and neither holds a connection between calls, so two; the pool also never exceeds the per-pool ceiling the storage plugin published
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_DOUBLINGS	4	bound	four doublings from 500 ms cap the wait at 8 s inside the 120 s retry window
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_MS	500	bound	the first retry delay; doubling from here keeps asking during a create storm
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_DEADLINE	120s	bound	How long startup keeps trying to (re)create the summary collection before it reports the failure.
@@ -384,11 +389,6 @@ crates/cog-prompt/src/loader.rs	CHANNEL_POLL_INTERVAL	200ms	bound	从通道取�
 crates/cog-protocol/src/convert.rs	DEFAULT_ZSTD_LEVEL	3	derived	zstd's own default level: cheap enough to sit on the write path.
 crates/cog-protocol/src/plugin.rs	GRPC_SHUTDOWN_TIMEOUT	5s	bound	等 gRPC server 优雅退出的上限：5s。
 crates/cog-quota/src/day.rs	SECONDS_PER_DAY	86_400	bound	the length of a UTC day; a definition, not a measured allowance
-crates/cog-redis/src/lib.rs	DEFAULT_BUDGET_MS	2_000	bound	the budget is where a call must return an error, not a latency target
-crates/cog-redis/src/lib.rs	DEFAULT_RESPONSE_TIMEOUT_MS	30_000	bound	the point past which a reply is lost rather than late, not a latency target
-crates/cog-redis/src/lib.rs	DEFAULT_RETRIES	2	bound	Retry attempts within that budget. Kept low on purpose: the callers that can tolerate redis being away for a while already retry the whole operation, and they need the failure to come back to them rather than be absorbed here.
-crates/cog-redis/src/lib.rs	MIN_BUDGET_MS	100	bound	below it a momentary refusal would be reported as a permanent error
-crates/cog-redis/src/lib.rs	MIN_RESPONSE_TIMEOUT_MS	100	bound	below it the timeout races the round trip itself
 crates/cog-reflection/src/auto_promoter.rs	APPROVAL_SWEEP_LIMIT	1000	bound	one page of waiting approvals per round; the backlog advances a page at a time
 crates/cog-reflection/src/auto_promoter.rs	LEDGER_LOOKBACK	50	bound	幂等守卫与「等人工审批」查询看的窗口：两者必须看同一段历史，否则会出现 「判定说这条已有记录、审批台却说没有那一行」。台账是追加表，一周一行时 这个窗口按年计。
 crates/cog-reflection/src/baseline_port.rs	GIT_COMMAND_TIMEOUT	120s	bound	一条 git 命令（取基线、摘文件）的墙：120s。

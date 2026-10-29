@@ -351,6 +351,123 @@ fn default_redis_read_resume_block_ms() -> u64 {
     DEFAULT_REDIS_READ_RESUME_BLOCK_MS
 }
 
+/// Total connect budget in milliseconds: the ceiling on how long building one
+/// redis connection may cost before the caller is told the peer is away.
+///
+/// This is not a latency target. Every call site in this workspace reads "redis
+/// is not reachable" as a reason to degrade, and degrading cannot be measured in
+/// minutes: the driver's own default configuration retries an unreachable
+/// address for **473 s** (measured, recorded as an ignored test beside the code
+/// that overrides it), during which the process reports no progress and looks
+/// wedged rather than degraded.
+pub const DEFAULT_REDIS_CONNECT_BUDGET_MS: u64 = 2_000;
+
+/// Retries within that budget. Kept low on purpose: the callers that can
+/// tolerate redis being away for a while already retry the whole operation, and
+/// they need the failure to come back to them rather than be absorbed here.
+pub const DEFAULT_REDIS_CONNECT_RETRIES: usize = 2;
+
+/// How long one command on an established connection may wait for its reply.
+///
+/// Thirty seconds is not a latency target either: it is the point past which a
+/// reply is not late but lost. Every command against redis other than a blocking
+/// stream read answers in milliseconds, and the reads that do block widen this
+/// explicitly. Left unset, the wait is the kernel's, which is measured in
+/// minutes (ten minutes of silence on 2026-10-22, with nothing counted as a
+/// refusal because a hung read is not a refused one).
+pub const DEFAULT_REDIS_RESPONSE_TIMEOUT_MS: u64 = 30_000;
+
+/// A budget below this would turn a momentary refusal into a permanent error.
+pub const MIN_REDIS_CONNECT_BUDGET_MS: u64 = 100;
+
+/// A response timeout below this is not a bound, it is a race against the round
+/// trip.
+pub const MIN_REDIS_RESPONSE_TIMEOUT_MS: u64 = 100;
+
+/// How long a redis connection attempt may take, how many times it is retried,
+/// and how long one command on the finished connection may wait for its reply.
+///
+/// The arithmetic lives here, next to the defaults, because more than one crate
+/// opens redis connections of its own and the numbers must not drift between
+/// them: a caller that read the environment itself would keep the same key names
+/// and slowly disagree about what a usable value is. Building the connection
+/// stays with the crate that owns that driver call — this type never names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedisConnectBudget {
+    /// Total budget in milliseconds.
+    pub budget_ms: u64,
+    /// Retries after the first attempt.
+    pub retries: usize,
+    /// Upper bound on a single command's round trip, on the connection this
+    /// budget builds.
+    pub response_timeout_ms: u64,
+}
+
+impl Default for RedisConnectBudget {
+    fn default() -> Self {
+        Self {
+            budget_ms: DEFAULT_REDIS_CONNECT_BUDGET_MS,
+            retries: DEFAULT_REDIS_CONNECT_RETRIES,
+            response_timeout_ms: DEFAULT_REDIS_RESPONSE_TIMEOUT_MS,
+        }
+    }
+}
+
+impl RedisConnectBudget {
+    /// Read the budget from the environment.
+    ///
+    /// Both knobs are defined by injection: an installation that runs redis on a
+    /// slow link can widen the budget without a rebuild.
+    pub fn from_env() -> Self {
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// The same, with the value source injected — reading the environment is a
+    /// property of the process, not of the decision, and the decision is what
+    /// the tests pin down.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let read = |key: &str| get(key).and_then(|v| v.trim().parse::<u64>().ok());
+        let default = Self::default();
+        Self {
+            budget_ms: read("COGNEVA_REDIS_CONNECT_BUDGET_MS")
+                .filter(|v| *v >= MIN_REDIS_CONNECT_BUDGET_MS)
+                .unwrap_or(default.budget_ms),
+            retries: read("COGNEVA_REDIS_CONNECT_RETRIES").unwrap_or(default.retries as u64)
+                as usize,
+            response_timeout_ms: read("COGNEVA_REDIS_RESPONSE_TIMEOUT_MS")
+                .filter(|v| *v >= MIN_REDIS_RESPONSE_TIMEOUT_MS)
+                .unwrap_or(default.response_timeout_ms),
+        }
+    }
+
+    /// The same budget with a different response timeout, for the call sites
+    /// whose commands legitimately block past the default.
+    pub fn with_response_timeout_ms(mut self, ms: u64) -> Self {
+        self.response_timeout_ms = ms.max(MIN_REDIS_RESPONSE_TIMEOUT_MS);
+        self
+    }
+
+    /// Per-attempt timeout. Without it a peer that silently drops packets
+    /// (rather than refusing) holds the attempt open for the operating system's
+    /// TCP timeout — again minutes, and again not a number this system can wait
+    /// on.
+    pub fn attempt_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.budget_ms)
+    }
+
+    /// Ceiling for the delay between attempts. This is the knob that removes the
+    /// minutes: the driver's default has no ceiling, so the delays grow with the
+    /// multiplier it was handed.
+    pub fn max_delay_ms(&self) -> u64 {
+        self.budget_ms / (self.retries as u64 + 1)
+    }
+
+    /// How long one command on the built connection may wait for its reply.
+    pub fn response_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.response_timeout_ms)
+    }
+}
+
 /// Two minutes: the renewal cadence is a third of this, so a process may miss
 /// two renewals — a paused container, a loaded node — before another process
 /// judges it gone. Shorter values make a live process lose its own tasks to a
@@ -2128,5 +2245,99 @@ mod tests {
         let unset: SelfEvolutionConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(unset.fmt_check_command, None);
         assert_eq!(unset.lint_command, None);
+    }
+
+    /// The delays must stay inside the budget. Without a ceiling the driver
+    /// multiplies its one-second floor by the factor it was handed, which is
+    /// where the minutes come from.
+    #[test]
+    fn the_redis_connect_budget_bounds_every_delay() {
+        let b = RedisConnectBudget {
+            budget_ms: 900,
+            retries: 2,
+            ..RedisConnectBudget::default()
+        };
+        assert_eq!(b.max_delay_ms(), 300);
+        assert_eq!(b.attempt_timeout(), std::time::Duration::from_millis(900));
+
+        let default = RedisConnectBudget::default();
+        assert_eq!(default.budget_ms, DEFAULT_REDIS_CONNECT_BUDGET_MS);
+        assert_eq!(default.retries, DEFAULT_REDIS_CONNECT_RETRIES);
+        assert_eq!(
+            default.response_timeout(),
+            std::time::Duration::from_millis(DEFAULT_REDIS_RESPONSE_TIMEOUT_MS),
+            "a connection built from this budget must bound each command's round trip"
+        );
+        assert!(
+            default.max_delay_ms() * (default.retries as u64 + 1) <= default.budget_ms,
+            "the delays alone must not be able to exceed the budget"
+        );
+    }
+
+    /// An installation may widen the budget; a nonsense value must not narrow it
+    /// into "no retry at all", which would turn a restart into a hard failure.
+    #[test]
+    fn the_redis_connect_budget_follows_the_environment_and_ignores_nonsense() {
+        let lookup = |pairs: &[(&str, &str)]| {
+            let owned: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            move |key: &str| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        };
+
+        let widened = RedisConnectBudget::from_lookup(lookup(&[
+            ("COGNEVA_REDIS_CONNECT_BUDGET_MS", "9000"),
+            ("COGNEVA_REDIS_CONNECT_RETRIES", "5"),
+        ]));
+        assert_eq!(widened.budget_ms, 9000);
+        assert_eq!(widened.retries, 5);
+
+        let nonsense = RedisConnectBudget::from_lookup(lookup(&[
+            ("COGNEVA_REDIS_CONNECT_BUDGET_MS", "0"),
+            ("COGNEVA_REDIS_CONNECT_RETRIES", "many"),
+        ]));
+        assert_eq!(
+            nonsense,
+            RedisConnectBudget::default(),
+            "an unusable value falls back to the default instead of disabling retries"
+        );
+    }
+
+    /// The response timeout is a knob for call sites with blocking commands, and
+    /// the widening has to survive the reading; a value that would fire inside
+    /// the round trip is refused rather than honoured.
+    #[test]
+    fn the_redis_response_timeout_widens_on_request_and_never_below_the_round_trip() {
+        let widened = RedisConnectBudget::default().with_response_timeout_ms(20_000);
+        assert_eq!(
+            widened.response_timeout(),
+            std::time::Duration::from_secs(20)
+        );
+
+        let narrowed = RedisConnectBudget::default().with_response_timeout_ms(0);
+        assert_eq!(
+            narrowed.response_timeout(),
+            std::time::Duration::from_millis(MIN_REDIS_RESPONSE_TIMEOUT_MS),
+            "a timeout that fires before any answer could arrive would fail every command"
+        );
+
+        let from_env = RedisConnectBudget::from_lookup(|key| match key {
+            "COGNEVA_REDIS_RESPONSE_TIMEOUT_MS" => Some("45000".into()),
+            _ => None,
+        });
+        assert_eq!(
+            from_env.response_timeout(),
+            std::time::Duration::from_secs(45)
+        );
+
+        let unusable = RedisConnectBudget::from_lookup(|key| match key {
+            "COGNEVA_REDIS_RESPONSE_TIMEOUT_MS" => Some("0".into()),
+            _ => None,
+        });
+        assert_eq!(
+            unusable.response_timeout(),
+            std::time::Duration::from_millis(DEFAULT_REDIS_RESPONSE_TIMEOUT_MS)
+        );
     }
 }
