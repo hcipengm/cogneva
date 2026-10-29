@@ -16,7 +16,6 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$(cd "$HERE/.." && pwd)"
-ROOT="$(cd "$SCRIPTS/../.." && pwd)"
 
 pass=0; fail=0
 ok()  { printf 'ok    - %s\n' "$1"; pass=$((pass + 1)); }
