@@ -184,7 +184,7 @@ export function TokenView() {
                 { key: 'cached', title: '缓存', width: '100px', render: (a) => (
                   <span className="mono text-[11px] text-[var(--muted)]">{a.tokens_cached.toLocaleString()}</span>
                 ) },
-                { key: 'share', title: '缓存 / 输入', width: '100px', render: (a) => (
+                { key: 'share', title: '缓存占比', width: '100px', render: (a) => (
                   <span className="mono text-[11px] text-[var(--muted)]">{hitRate(a)}</span>
                 ) },
                 { key: 'per', title: '每调用输入', width: '110px', render: (a) => (
@@ -221,9 +221,17 @@ const WINDOWS: { hours: number; label: string }[] = [
   { hours: 168, label: '7 天' },
 ];
 
-/** 缓存占输入的比例。输入为 0 时没有比例可言——写 0% 会读成「一点没命中」。 */
+/**
+ * 缓存占全部输入的比例，即 `cached / (input + cached)`。
+ *
+ * 分母要把两段加起来，不能只用 input：两种协议面对同一笔缓存的记法不同——
+ * Anthropic 面 `input` 不含缓存的那些 token，OpenAI 兼容面 `input` 已经含了，
+ * 只拿 `input` 作分母时前者会算出超过 100%，后者则把命中份额压低。
+ * 分母为 0 时没有比例可言——写 0% 会读成「一点没命中」。
+ */
 function hitRate(actor: ActorUsage): string {
-  if (actor.tokens_input <= 0) return '—';
-  const value = (actor.tokens_cached / actor.tokens_input) * 100;
+  const input = actor.tokens_input + actor.tokens_cached;
+  if (input <= 0) return '—';
+  const value = (actor.tokens_cached / input) * 100;
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)}%`;
 }

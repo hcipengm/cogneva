@@ -2240,6 +2240,16 @@ data:
                   "face": "token 管理"
                 },
                 {
+                  "name": "llm_cache_hit_share_collapsed",
+                  "promql": "((sum by (actor) (increase(llm_tokens_total{kind=\"cached\"}[1h]))) / ((sum by (actor) (increase(llm_tokens_total{kind=\"input\"}[1h]))) + (sum by (actor) (increase(llm_tokens_total{kind=\"cached\"}[1h]))))) and on (actor) (((sum by (actor) (increase(llm_tokens_total{kind=\"input\"}[1h]))) + (sum by (actor) (increase(llm_tokens_total{kind=\"cached\"}[1h])))) > 200000)",
+                  "condition": {
+                    "less_than": 0.15
+                  },
+                  "severity": "warning",
+                  "summary": "One actor's share of prompt tokens served by the upstream cache fell below 0.15 over the last hour, while that actor still moved more than 200,000 prompt tokens in it. Spend on this platform is dominated by re-sent context, so the cache share of the prompt is the single number that decides whether that context is paid for once or every turn: between 2026-10-18 and 2026-10-19 the same pool answered 33% to 67% of its prompt tokens from cache, and from 2026-10-24 it answered 9%, then 2.7% -- no rule was watching, so the drop was read as traffic growing and nothing else. The cause that time was structural: the requests carried no cache breakpoint at all, so the upstream was never told what to cache. The ratio here is cached/(input+cached) rather than cached/input because the two protocol faces count differently: on a face where cached and input are disjoint (Anthropic) this is exactly the hit share, on a face where cached is a subset of input (OpenAI-compatible) input already contains the cached tokens and the printed number understates the share. So read 0.15 as the line where caching is effectively off, not as a target -- what a healthy actor reaches differs by face. The volume floor is part of the rule because a ratio over a handful of tokens is noise: an actor under it is not judged here at all. What this cannot say is which part of the request broke the prefix -- a system preamble that changes every call, a tool list that comes out in a new order, or a missing breakpoint; the stored request bodies are the place to tell those apart. {actor} is the actor, {value} is its share.",
+                  "face": "token 管理"
+                },
+                {
                   "name": "llm_upstream_reading_outlives_its_pool_entry",
                   "promql": "((time() - max by (upstream) (llm_upstream_healthy_observed_timestamp_seconds)) > 3600) and on () (count(llm_upstream_healthy_observed_timestamp_seconds) > 0) and on () (count(llm_pool_face_upstreams_observed_timestamp_seconds and ((time() - llm_pool_face_upstreams_observed_timestamp_seconds) < 3600)) > 0)",
                   "condition": {

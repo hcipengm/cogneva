@@ -1,0 +1,64 @@
+# 「一个角色这一小时里靠上游缓存省下的输入占比掉到地上了」那条读数的夹具。
+#
+# 这条的界是常数 0.15，但比值只在一个角色真的搬了 200,000 个输入 token 以上的
+# 那一小时里判：几个 token 上的比值没有意义，所以表达式右半边是量阈，不是第二个界。
+#
+# 为什么比值是 cached/(input+cached) 而不是 cached/input：两种协议面把同一笔
+# 缓存的 token 记在不同位置。互斥的面（Anthropic）里 input 不含 cached，这个比值
+# 就是命中份额；包含的面（OpenAI 兼容）里 input 已经含了 cached，同一份流量算出来
+# 会偏小。所以 0.15 是「缓存基本没在工作」这条线，不是健康水位——这一格不判
+# 正常面能到多高，只判它有没有掉下来。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-llm-cache-hit.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: llm_cache_hit_share_collapsed
+
+evaluation_interval: 15m
+
+tests:
+  # 每 15 分钟 cached 涨 30000、input 涨 70000：一小时里比值 120000/400000 = 0.30，
+  # 量 400000 也过了闸。静。
+  - interval: 15m
+    input_series:
+      - series: 'llm_tokens_total{kind="cached",actor="a1"}'
+        values: '0+30000x16'
+      - series: 'llm_tokens_total{kind="input",actor="a1"}'
+        values: '0+70000x16'
+    alert_rule_test:
+      - eval_time: 4h
+        alertname: llm_cache_hit_share_collapsed
+        exp_alerts: []
+
+  # 同一份量，缓存命中一条不再涨（上游从来没报过命中）：比值 0，量仍在闸上。亮。
+  # 这一格就是 2026-10-24 起那段现场：请求里一次 cache_control 都没带，命中读数归零，
+  # 而没有任何一条规则看着这个数。
+  - interval: 15m
+    input_series:
+      - series: 'llm_tokens_total{kind="cached",actor="a1"}'
+        values: '0+0x16'
+      - series: 'llm_tokens_total{kind="input",actor="a1"}'
+        values: '0+70000x16'
+    alert_rule_test:
+      - eval_time: 4h
+        alertname: llm_cache_hit_share_collapsed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              actor: a1
+
+  # 命中同样归零，但这个角色一小时只搬了 40000 个 token（每 15 分钟 10000）：量阈
+  # 之下不判。只判有量的那些，这条规则才不会在静默的池子上连响。
+  - interval: 15m
+    input_series:
+      - series: 'llm_tokens_total{kind="cached",actor="a2"}'
+        values: '0+0x16'
+      - series: 'llm_tokens_total{kind="input",actor="a2"}'
+        values: '0+10000x16'
+    alert_rule_test:
+      - eval_time: 4h
+        alertname: llm_cache_hit_share_collapsed
+        exp_alerts: []
