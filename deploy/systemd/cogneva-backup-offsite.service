@@ -15,14 +15,18 @@ Group=root
 
 # 非密钥的配置（仓库地址、保留策略）走一个 0644 文件：其中没有任何秘密，
 # 而把它设成加密凭证会让「仓库地址换了」也要动一次 systemd-creds。
+# cred: perms=0644 rotator=operator — 仓库地址与保留策略；里面没有任何秘密，所以敢让它是 0644
 EnvironmentFile=/etc/cogneva/backup-offsite.env
 
 # 密钥只经 systemd 加密凭证进入：`LoadCredentialEncrypted` 的值由宿主密钥解密，
 # 落在 $CREDENTIALS_DIRECTORY 里（tmpfs，只此进程可见），磁盘上不存在明文口令。
 # 明文文件在 install-backup-offsite.sh 里加密完即删——「加密完之后还留一份明文」
 # 会让这条约束只剩一句声明。
+# cred: perms=0400 rotator=operator — restic 仓库口令；加密后明文文件由安装脚本删除，运行时只在 tmpfs
 LoadCredentialEncrypted=restic-password:/etc/cogneva/credentials/restic-password.cred
+# cred: perms=0400 rotator=operator — 桶的写权限密钥；桶策略不给 DeleteObject，丢了两份副本不会一起没
 LoadCredentialEncrypted=aws-access-key-id:/etc/cogneva/credentials/aws-access-key-id.cred
+# cred: perms=0400 rotator=operator — 同上，与 access-key-id 配成一对
 LoadCredentialEncrypted=aws-secret-access-key:/etc/cogneva/credentials/aws-secret-access-key.cred
 
 # 失败要让 systemd 记下来：定时器下这一跑失败了，下一次不会补做，只有 journal

@@ -2,24 +2,32 @@
 # principle: feedback_a_gate_that_only_reads_one_side_cannot_see_a_stale_row
 # check-host-credential-surface.sh 的定向测试。它判的是「宿主上的 systemd 单元
 # 碰得到哪个凭证」，而这个面出错时**运行时没有症状**：单元照常起、定时器照常跑，
-# 只是它从此握着一把没人登记过的钥匙，或者那把钥匙其实写在了一个 0644 的单元
+# 只是它从此握着一把没人声明过的钥匙，或者那把钥匙其实写在了一个 0644 的单元
 # 文件里——任何一次 `cat` 都能读到。
+#
+# 判据两侧都在单元文件里：指令（机器解析得出）与它头上那行 `# cred:`（人写的
+# 权限／轮换人／凭什么）。一份登记表能漂移的两个方向——指令多一条表里没有、
+# 表里有一行指令已经不在了——在只有一个载体时都不再是能写出来的形状，剩下的
+# 是「指令没声明」，所以用例围绕它。
 #
 # 每个用例都在真树的一份副本上只改一处，然后断言它红的正是那一处。
 #
 # 用例：
-#   1. 真树 -> 绿，且报出登记条数与单元数（不是空跑）；
-#   2. 单元里多一条没登记的 LoadCredential -> 红，点名单元与名字；
-#   3. 登记表里有一行单元里已经没有了 -> 红，点名那条陈旧登记；
+#   1. 真树 -> 绿，且报出声明条数与单元数（不是空跑）；
+#   2. 单元里多一条凭证指令、头上没有 `# cred:` -> 红，点名单元与名字；
+#   2b. `# cred:` 的 perms 不在闭集里 -> 红，点名那个取值；
+#   2c. `# cred:` 没写 ` — ` 之后那句（凭什么留着）-> 红；
+#   3. 指令删了、`# cred:` 还挂在原地 -> 红，点名那行声明；
 #   4. 单元里用 Environment= 写 RESTIC_PASSWORD 字面量 -> 红；
 #   5. 渲染物里出现 RESTIC_PASSWORD -> 红（业务 Pod 零凭证的边界）；
 #   5b. 部署面读不到 / 一个文件都没读到 -> 红：零命中与「一个引用都没有」同形；
 #   6. 安装脚本加密的名字与单元要的名字对不上 -> 红；
 #   7. ExecStart 指向的脚本不在树里 -> 红（指针锈了）；
 #   8a. --live 且单元没装、通道也从没配过 -> 不适用，绿（不判成违约）；
-#   8b. --live 且单元没装、但通道配过 -> 红并点名，不许崩出 traceback（登记表加列时真的崩过）；
+#   8b. --live 且单元没装、但通道配过 -> 红并点名，不许崩出 traceback；
 #   9. --live 且凭证源文件不在 -> 红并点名那个路径；
-#   10. --live 的绿路：单元与登记表一致、权限一致 -> 绿并报出 --live；
+#   10. --live 的绿路：单元与声明一致、权限一致 -> 绿并报出 --live；
+#   10b. --live 且源文件权限与 `# cred:` 声明的不一致 -> 红，两个读数都印出来；
 #   1b. 绿的时候要报出扫描面分母（本仓扫了几个单元文件）；
 #   12. --live 点名本仓之外带凭证指令的单元，但**不**判红（它们归各自所在的树判）；
 #   13. 本仓外一个都没有时，读数要说「没有一个」，不与空差集同形。
@@ -28,7 +36,6 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 gate="${repo}/deploy/scripts/check-host-credential-surface.sh"
-registry="deploy/systemd/credential-holders.tsv"
 unit="deploy/systemd/cogneva-backup-offsite.service"
 installer="deploy/scripts/install-backup-offsite.sh"
 fail() { echo "FAIL: $*"; exit 1; }
@@ -60,8 +67,8 @@ run_gate_live() { COGNEVA_HOST_UNIT_DIRS="${work}/hostunits" bash "${gate}" "${w
 # 1) 真树绿，报数是真读数
 out="$(run_gate)" || fail "真树应当绿，实际红：${out}"
 grep -q "HOST CREDENTIAL SURFACE OK" <<<"${out}" || fail "绿时没有报出判词：${out}"
-rows="$(grep -v '^#' "${repo}/${registry}" | grep -v '^unit' | grep -c .)"
-grep -qE "${rows} 条登记" <<<"${out}" || fail "绿时没报出登记条数（表里 ${rows} 行）：${out}"
+decls="$(grep -c '^# cred:' "${repo}/${unit}")"
+grep -qE "${decls} 条凭证指令" <<<"${out}" || fail "绿时没报出声明条数（单元里 ${decls} 行）：${out}"
 
 # 1b) 判词必须报出**扫描面**的分母
 #     绿的是「本仓 deploy/systemd 那几个文件」，不是整台宿主。不印分母，`OK` 会被读成
@@ -70,17 +77,32 @@ scanned_files="$(ls "${work}"/root/deploy/systemd/*.service "${work}"/root/deplo
 grep -qE "扫面：deploy/systemd 下 ${scanned_files} 个单元文件" <<<"${out}" \
     || fail "绿时没报出扫描面分母（应报 ${scanned_files} 个单元文件）：${out}"
 
-# 2) 单元多一条没登记的凭证
+# 2) 单元多一条凭证指令、头上没有 `# cred:`
 mirror
 printf 'LoadCredential=llm-key:/etc/cogneva/credentials/llm-key\n' >> "${work}/root/${unit}"
-out="$(run_gate)" && fail "多出一条没登记的 LoadCredential 应当红，实际绿：${out}"
+out="$(run_gate)" && fail "多出一条没声明的凭证指令应当红，实际绿：${out}"
 grep -q "llm-key" <<<"${out}" || fail "红时没有点名那个凭证：${out}"
+grep -q "没有 \`# cred:\` 行" <<<"${out}" || fail "红时没有说清是缺声明：${out}"
 
-# 3) 登记还在、单元里已经没有了
+# 2b) perms 不在闭集：写别的不是更严，是核不了
 mirror
-sed -i '/LoadCredentialEncrypted=aws-secret-access-key/d' "${work}/root/${unit}"
-out="$(run_gate)" && fail "登记陈旧应当红，实际绿：${out}"
-grep -q "aws-secret-access-key" <<<"${out}" || fail "红时没有点名那条陈旧登记：${out}"
+sed -i 's#^\# cred: perms=0400 rotator=operator — restic#\# cred: perms=600 rotator=operator — restic#' \
+    "${work}/root/${unit}"
+out="$(run_gate)" && fail "perms 不在闭集时应当红，实际绿：${out}"
+grep -q "perms=600 不在闭集" <<<"${out}" || fail "红时没有点名那个取值：${out}"
+
+# 2c) 声明缺「凭什么」：写不出为什么的凭证不该在宿主上
+mirror
+sed -i 's#^\# cred: perms=0400 rotator=operator — restic.*#\# cred: perms=0400 rotator=operator#' \
+    "${work}/root/${unit}"
+out="$(run_gate)" && fail "声明没有尾注时应当红，实际绿：${out}"
+grep -q "没写 \` — \` 之后那句" <<<"${out}" || fail "红时没有说清缺的是凭什么：${out}"
+
+# 3) 指令删了、声明还挂在原地：一个还在说、另一个已经不在了
+mirror
+sed -i '/^LoadCredentialEncrypted=aws-secret-access-key/d' "${work}/root/${unit}"
+out="$(run_gate)" && fail "指令删了声明还在时应当红，实际绿：${out}"
+grep -q "aws-secret-access-key" <<<"${out}" || fail "红时没有点名那条声明：${out}"
 
 # 4) 单元里写字面量密钥
 mirror
@@ -94,7 +116,7 @@ echo '        env: [{name: RESTIC_PASSWORD, value: x}]' > "${work}/root/deploy/r
 out="$(run_gate)" && fail "渲染物里出现 RESTIC_PASSWORD 应当红，实际绿：${out}"
 grep -q "99-leak.yaml" <<<"${out}" || fail "红时没有点名那个渲染物：${out}"
 
-# 6) 加密名字与会话名字对不上
+# 6) 加密名字与单元要的名字对不上
 mirror
 sed -i 's/^for name in restic-password aws-access-key-id aws-secret-access-key; do/for name in restic-password aws-access-key-id aws-secret-access-key old-name; do/' \
     "${work}/root/${installer}"
@@ -112,9 +134,9 @@ grep -q "backup-offsite-missing.sh" <<<"${out}" || fail "红时没有点名那�
 #     这一格挡住的是把「没开异地副本」读成凭证面违约：装了之后恒红，红久了没人看。
 mirror
 sed -i "s#/etc/cogneva/backup-offsite.env#${work}/never/backup-offsite.env#g" \
-    "${work}/root/${registry}" "${work}/root/${unit}"
+    "${work}/root/${unit}"
 mkdir -p "${work}/bin-none"
-# `--version` 要答得出来：那一步证明 systemctl 这一侧问得出来（8c 的对照）。
+# `--version` 要答得出来：那一步证明 systemctl 这一侧问得出来。
 printf '#!/usr/bin/env bash\ncase "$1" in --version) echo "systemd 255"; exit 0;; esac\nexit 1\n' \
     > "${work}/bin-none/systemctl"
 chmod +x "${work}/bin-none/systemctl"
@@ -129,7 +151,7 @@ mirror
 mkdir -p "${work}/creds"
 : > "${work}/creds/backup-offsite.env"
 sed -i "s#/etc/cogneva/backup-offsite.env#${work}/creds/backup-offsite.env#g" \
-    "${work}/root/${registry}" "${work}/root/${unit}"
+    "${work}/root/${unit}"
 mkdir -p "${work}/bin-none"
 printf '#!/usr/bin/env bash\ncase "$1" in --version) echo "systemd 255"; exit 0;; esac\nexit 1\n' \
     > "${work}/bin-none/systemctl"
@@ -156,17 +178,20 @@ out="$(PATH="${work}/bin-part:${PATH}" run_gate_live)" && fail "--live 在源文
 grep -q "Traceback" <<<"${out}" && fail "--live 崩出 traceback 而不是判词：${out}"
 grep -q "不存在" <<<"${out}" || fail "--live 没有点名缺失的凭证源：${out}"
 
-# 10) --live 的绿路：单元内容与登记表一致、源文件权限一致 ⇒ 绿并报 --live
+# 10) --live 的绿路：单元内容与声明一致、源文件权限一致 ⇒ 绿并报 --live
 #     没有这一格，「--live 永远红」与「--live 判对了」同形。
-mirror
-mkdir -p "${work}/creds" "${work}/bin-ok"
-for name in restic-password.cred aws-access-key-id.cred aws-secret-access-key.cred; do
-    : > "${work}/creds/${name}"; chmod 0400 "${work}/creds/${name}"
-done
-: > "${work}/creds/backup-offsite.env"; chmod 0644 "${work}/creds/backup-offsite.env"
-sed -i "s#/etc/cogneva/credentials#${work}/creds#g; s#/etc/cogneva/backup-offsite.env#${work}/creds/backup-offsite.env#g" \
-    "${work}/root/${registry}" "${work}/root/${unit}"
-cat > "${work}/bin-ok/systemctl" <<SHIM
+live_ok() { # 把源路径指到夹具目录、按声明摆好权限、装一个能答话的 systemctl
+  mirror
+  # 上一格把凭证设成 0400，不清掉的话这一格连写都写不进去（`: >` 打不开只读文件）
+  rm -rf "${work}/creds"
+  mkdir -p "${work}/creds" "${work}/bin-ok"
+  for name in restic-password.cred aws-access-key-id.cred aws-secret-access-key.cred; do
+      : > "${work}/creds/${name}"; chmod "${1:-0400}" "${work}/creds/${name}"
+  done
+  : > "${work}/creds/backup-offsite.env"; chmod 0644 "${work}/creds/backup-offsite.env"
+  sed -i "s#/etc/cogneva/credentials#${work}/creds#g; s#/etc/cogneva/backup-offsite.env#${work}/creds/backup-offsite.env#g" \
+      "${work}/root/${unit}"
+  cat > "${work}/bin-ok/systemctl" <<SHIM
 #!/usr/bin/env bash
 case "\$1" in
   --version) echo "systemd 255" ;;
@@ -175,9 +200,18 @@ case "\$1" in
   *) exit 1 ;;
 esac
 SHIM
-chmod +x "${work}/bin-ok/systemctl"
+  chmod +x "${work}/bin-ok/systemctl"
+}
+live_ok
 out="$(PATH="${work}/bin-ok:${PATH}" run_gate_live)" || fail "--live 绿路应当通过，实际红：${out}"
 grep -q -- "--live 已核" <<<"${out}" || fail "--live 绿时没有报出已核：${out}"
+
+# 10b) --live 且源文件权限与 `# cred:` 声明的不一致 ⇒ 红，且两个读数都印出来
+#      只印一句「权限不符」的，读者分不出该改文件还是该改声明。
+live_ok 0644
+out="$(PATH="${work}/bin-ok:${PATH}" run_gate_live)" && fail "--live 权限不符时应当红：${out}"
+grep -q "权限是 0644" <<<"${out}" || fail "红时没有印出实测权限：${out}"
+grep -q "声明的是 0400" <<<"${out}" || fail "红时没有印出声明值：${out}"
 
 # 11) --live 的「读不到」：systemctl 自己跑不起来 ⇒ 3，且**不说**「单元没装」
 #     这一格挡的是把「不知道」印成「没有」：两者的修法相反（修 systemd／装单元），
@@ -197,16 +231,9 @@ true
 
 # 12) --live 必须把「本仓没覆盖的单元」印出来，且**不**判红
 #     这一格挡的是把判词读成整台宿主：本仓之外装着别的树的单元，它们不在本门判据里。
-#     只印分母与名字、不判红——它们的归属在别的树（私有仓），强行登记进公开仓的登记表
-#     等于把私有树的名字搬到公开面；判它们的那扇门在各自所在的树里。
-mirror
-rm -f "${work}/creds/backup-offsite.env" "${work}/creds"/*.cred
-: > "${work}/creds/backup-offsite.env"; chmod 0644 "${work}/creds/backup-offsite.env"
-for name in restic-password.cred aws-access-key-id.cred aws-secret-access-key.cred; do
-    : > "${work}/creds/${name}"; chmod 0400 "${work}/creds/${name}"
-done
-sed -i "s#/etc/cogneva/credentials#${work}/creds#g; s#/etc/cogneva/backup-offsite.env#${work}/creds/backup-offsite.env#g" \
-    "${work}/root/${registry}" "${work}/root/${unit}"
+#     只印分母与名字、不判红——它们的归属在别的树（私有仓），强行登记进公开仓等于把
+#     私有树的名字搬到公开面；判它们的那扇门在各自所在的树里。
+live_ok
 printf '[Service]\nEnvironmentFile=/etc/elsewhere/other.env\n' > "${work}/hostunits/cogneva-other-tree.service"
 printf '[Service]\nExecStart=/bin/true\n' > "${work}/hostunits/cogneva-plain.service"
 out="$(PATH="${work}/bin-ok:${PATH}" run_gate_live)" || fail "本仓外的单元不该让本门判红，实际红：${out}"
@@ -233,4 +260,4 @@ find "${work}/root/deploy/rendered" -type f -delete
 out="$(run_gate)" && fail "部署面零个文件时应当红，实际绿：${out}"
 grep -q "只读到 0 个文件" <<<"${out}" || fail "红时没有说清读到零个文件：${out}"
 
-echo "host-credential-surface: 17 个用例全绿"
+echo "host-credential-surface: 18 个用例全绿"

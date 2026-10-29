@@ -176,9 +176,10 @@ sudo deploy/scripts/install-backup-offsite.sh \
 `/etc/cogneva/credentials/*.cred` with `systemd-creds`, deletes the plaintext, and installs
 `cogneva-backup-offsite.{service,timer}`. At runtime the repository password exists only in
 `$CREDENTIALS_DIRECTORY` (a tmpfs owned by the process) — never on disk, never in the
-package, never in a Pod. `deploy/systemd/credential-holders.tsv` is the register those
-credentials must appear in; `deploy/scripts/check-host-credential-surface.sh` holds both
-sides to it (and CI runs it).
+package, never in a Pod. Each credential directive in the unit carries its own
+`# cred:` line — the permission the source file must have, who can rotate it, and why
+it may stay on the host at all. `deploy/scripts/check-host-credential-surface.sh`
+reddens when a directive has no such line (or a line has no directive), and CI runs it.
 
 The bucket key should be write-only for objects it did not create and should not carry
 `DeleteObject`: a compromised host must not be able to erase the copies that outlive it.

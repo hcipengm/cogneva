@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 宿主凭证面门禁：宿主上的 systemd 单元碰得到哪个凭证，必须与登记表逐条对齐。
+# 宿主凭证面门禁：宿主上每个 systemd 单元碰得到哪个凭证、凭什么可以碰，必须与
+# 那条指令自己头上那行声明对齐。
 #
 # 为什么需要这条：业务 Pod 那张表（check-credential-holder-surface.sh）只管集群里
 # 的两个 Secret 对象。宿主上的 unit 是另一条完全不同的路——它以 root 跑、能读整块
@@ -8,23 +9,30 @@
 # 那句话就只覆盖了 Pod 那一层，而没有任何东西会红。
 #
 # 判据面「能推导的就不手写」：
-#   1. 单元里出现的凭证指令从 `deploy/systemd/*.service|*.timer` 解析：三类——
-#      `LoadCredential=`、`LoadCredentialEncrypted=`、`EnvironmentFile=`。集合为空直接
-#      判判据失效（空集合让"每个指令都有登记"恒真）。
-#   2. 两侧互判：单元里有的 ⊆ 登记表（多出来的点名），登记表里的 ⊆ 单元（陈旧的
-#      登记点名）。
-#   3. 加密凭证的名字必须与安装脚本 `systemd-creds encrypt --name=` 用的是同一批：
+#   1. 单元、指令种类、名字、源路径全部从 `deploy/systemd/*.service|*.timer` 解析。
+#      集合为空直接判判据失效（空集合让"每条指令都有声明"恒真）。
+#   2. 人写的那一半只有三条，而且写在**那条指令自己头上**，一行 `# cred:`：
+#        perms    这个源文件在宿主上该是几位权限（`--live` 下实测，静态下只核取值合法）
+#        rotator  谁能换掉它
+#        note     凭什么可以有这一行（` — ` 之后那句）
+#      机器推得出「谁碰得到哪个凭证」，推不出「它该是几位权限、谁能换、凭什么留着」；
+#      那份判断写在指令头上跟着指令走，不另立一张登记表。登记表 2026-10-29 删掉，正是
+#      因为它把前四列（单元/种类/名字/路径）又手抄了一遍：抄错那一行不会有任何一拍红，
+#      而指令多一条、表里少一行，两个错都只在有人记得时才关得上。
+#   3. 每条凭证指令都必须有一行 `# cred:`：写不出凭什么的凭证，不该在宿主上。
+#      反过来，`# cred:` 挂在一条已经不存在（或根本不是凭证指令）的行上面，也判红。
+#   4. 加密凭证的名字必须与安装脚本 `systemd-creds encrypt --name=` 用的是同一批：
 #      加密时叫 A、单元里按 B 去要，症状是单元起不来，而不是这里红——那就在这里核。
-#   4. 单元里不许出现字面量的密钥赋值（`RESTIC_PASSWORD=`、`AWS_SECRET_ACCESS_KEY=`）：
+#   5. 单元里不许出现字面量的密钥赋值（`RESTIC_PASSWORD=`、`AWS_SECRET_ACCESS_KEY=`）：
 #      单元文件是 0644 的公开物，写进去等于把密钥写进公布面。
-#   5. 渲染物 / chart 里不许出现 `RESTIC_PASSWORD`：业务 Pod 零凭证这条，在「宿主
+#   6. 渲染物 / chart 里不许出现 `RESTIC_PASSWORD`：业务 Pod 零凭证这条，在「宿主
 #      要存东西」之后最容易破——把口令顺手加进备份 Job 的 env 是最短的那条路。
-#   6. ExecStart 指向的脚本必须还在树里：指针锈了等于这条单元没有任何被维护的读点。
-#   7. `--live`：单元真的装在了宿主上、源文件的权限与登记表一致（只 stat，不读内容）。
-#      缺装时还要分两种：该单元登记表里那条 EnvironmentFile 的源路径也不在 ⇒ 这个通道
-#      从没配过，名下登记不适用（印一行读数、不判红）；源路径在而单元没了 ⇒ 失败。
+#   7. ExecStart 指向的脚本必须还在树里：指针锈了等于这条单元没有任何被维护的读点。
+#   8. `--live`：单元真的装在了宿主上、源文件的权限与 `# cred:` 声明一致（只 stat，
+#      不读内容）。缺装时还要分两种：该单元那条 EnvironmentFile 的源路径也不在 ⇒ 这个
+#      通道从没配过，声明不适用（印一行读数、不判红）；源路径在而单元没了 ⇒ 失败。
 #      不分这一刀，一台没开异地副本的宿主上这条腿恒红，红久了就没人看。
-#   8. 扫描面的分母必须印出来：判词读作「宿主凭证面干净」，而真正扫过的只是本仓
+#   9. 扫描面的分母必须印出来：判词读作「宿主凭证面干净」，而真正扫过的只是本仓
 #      `deploy/systemd` 下那几个文件。`--live` 另外报出「宿主本机单元目录里还有几个
 #      带凭证指令的单元不在本仓」——只印、不判红：它们归各自所在的树判，把它们登记进
 #      公开仓的登记表等于把私有树的名字搬到公开面。目录可由 `COGNEVA_HOST_UNIT_DIRS`
@@ -57,19 +65,22 @@ import sys
 
 LIVE = sys.argv[1] == "1"
 UNIT_DIR = "deploy/systemd"
-REGISTRY = "deploy/systemd/credential-holders.tsv"
 # 部署面（渲染物 + chart + k3s 清单）的文件数下限。这条面判的是「这些文件里没有
 # RESTIC_PASSWORD」，而一份没读到的部署面与一份干净的同形；真树今天 4 百多个文件。
 SURFACE_FILES_FLOOR = 100
 INSTALLER = "deploy/scripts/install-backup-offsite.sh"
-PROFILES = "deploy/rendered"
 
-KINDS = ("LoadCredential", "LoadCredentialEncrypted", "EnvironmentFile")
 DIRECTIVE = re.compile(
     r"^\s*(LoadCredential(?:Encrypted)?|EnvironmentFile)=(-?)([^:\s]+)(?::(\S.*))?\s*$")
+# 指令头上那行声明：`# cred: perms=0400 rotator=operator — 凭什么留着`
+DECL = re.compile(r"^\s*#\s*cred:\s*(?P<body>\S.*)$")
+FIELD = re.compile(r"\b(?P<key>perms|rotator)=(?P<val>[^\s—]+)")
+# 合法的权限字面量：只有这三个在宿主上说得通。写别的（`600`、`-rw-------`）不是更严，
+# 是核不了——`--live` 的比对是字符串相等，写法不统一就永远红，红久了没人看。
+PERMS = ("0400", "0600", "0644")
 
 failures = []
-# 不判红、但要印出来的读数：某个通道从来没配过，它名下的凭证登记不适用。与失败分开，
+# 不判红、但要印出来的读数：某个通道从来没配过，它名下的凭证声明不适用。与失败分开，
 # 是因为两者的修法相反——失败要人去修，不适用要人去决定「这个通道要不要开」。
 notices = []
 # 读不到：门自己问不出来（systemctl 跑不起来之类）。它既不等于「对齐」，也不等于
@@ -81,19 +92,35 @@ def fail(msg):
     failures.append(msg)
 
 
-def registry_rows():
-    rows = []
-    with open(REGISTRY, encoding="utf-8") as fh:
-        for lineno, line in enumerate(fh, 1):
-            body = line.rstrip("\n")
-            if not body or body.startswith("#") or body.startswith("unit\t"):
-                continue
-            cols = body.split("\t")
-            if len(cols) != 7:
-                fail(f"{REGISTRY}:{lineno} 不是 7 列（{len(cols)} 列）：这一行既不会被读，也不会被核")
-                continue
-            rows.append(cols)
-    return rows
+def parse_cred_line(where, body):
+    """把一行 `# cred:` 解成 (perms, rotator, note)；解不全就点名，返回 None。"""
+    note = ""
+    if " — " in body:
+        body, note = body.split(" — ", 1)
+    fields = {}
+    for m in FIELD.finditer(body):
+        fields[m.group("key")] = m.group("val")
+    rest = FIELD.sub("", body).strip()
+    ok = True
+    if rest:
+        fail(f"{where} 的 `# cred:` 里有认不出的字段 {rest!r}：只认 perms= 与 rotator=")
+        ok = False
+    perms = fields.get("perms")
+    if perms is None:
+        fail(f"{where} 的 `# cred:` 没写 perms=")
+        ok = False
+    elif perms not in PERMS:
+        fail(f"{where} 的 perms={perms} 不在闭集 {'/'.join(PERMS)} 里")
+        ok = False
+    rotator = fields.get("rotator")
+    if not rotator:
+        fail(f"{where} 的 `# cred:` 没写 rotator=：这个凭证谁能换掉，是这一行存在的理由之一")
+        ok = False
+    if not note.strip():
+        fail(f"{where} 的 `# cred:` 没写 ` — ` 之后那句：凭什么可以有这一行。"
+             "写不出来的，就不该有这一行")
+        ok = False
+    return (perms, rotator, note.strip()) if ok else None
 
 
 # 扫面里到底有几个单元文件。判词必须把它印出来：这条门的判词读作「宿主凭证面干净」，
@@ -103,31 +130,73 @@ scanned = {"units": 0}
 
 
 def unit_directives():
-    """单元里出现的凭证指令。返回 (unit, kind, name, source) 四元组表。"""
-    found = []
+    """单元里的凭证指令与它们头上那行声明。
+
+    返回 [unit, kind, name, source, perms, rotator, note] 七元组表——列位与它取代的
+    登记表一致，下游（`--live` 的权限比对、通道标记）不用另改一套读法。
+    """
+    rows = []
     files = sorted(glob.glob(f"{UNIT_DIR}/*.service") + glob.glob(f"{UNIT_DIR}/*.timer"))
     scanned["units"] = len(files)
     if not files:
-        fail(f"{UNIT_DIR} 下没有单元：判据失效（空集合会让两侧互判恒真）")
-        return found
+        fail(f"{UNIT_DIR} 下没有单元：判据失效（空集合会让「每条指令都有声明」恒真）")
+        return rows
     for path in files:
         unit = os.path.basename(path)
+        pending = None          # [(行号, 正文)]：上一条指令之后攒下的 `# cred:` 行
         with open(path, encoding="utf-8") as fh:
             for lineno, line in enumerate(fh, 1):
-                if line.lstrip().startswith("#"):
+                body = line.rstrip("\n")
+                if not body.strip():
                     continue
-                m = DIRECTIVE.match(line)
+                if body.lstrip().startswith("#"):
+                    m = DECL.match(body)
+                    if m:
+                        pending = (pending or []) + [(lineno, m.group("body").strip())]
+                    continue
+                m = DIRECTIVE.match(body)
                 if not m:
+                    # 别的指令会把攒下的声明留在身后，交给下面统一报「挂空了」
+                    if pending:
+                        for decl_line, _ in pending:
+                            fail(f"{unit}:{decl_line} 的 `# cred:` 挂在一条不是凭证指令的"
+                                 f"行上（下一行是 {body.strip()[:40]!r}）：声明必须紧贴它要"
+                                 "约束的那条 LoadCredential…／EnvironmentFile= 指令")
+                        pending = None
                     continue
                 kind, dash, name_or_path, maybe = m.groups()
+                where = f"{unit}:{lineno}"
                 if kind == "EnvironmentFile":
-                    found.append((unit, kind, "-", name_or_path))
+                    entry = (unit, kind, "-", name_or_path)
                 else:
                     if maybe is None:
-                        fail(f"{unit}:{lineno} 的 {kind} 缺 `名字:路径` 里的一半")
+                        fail(f"{where} 的 {kind} 缺 `名字:路径` 里的一半")
+                        if pending:
+                            pending = None
                         continue
-                    found.append((unit, kind, name_or_path, maybe))
-    return found
+                    entry = (unit, kind, name_or_path, maybe)
+                decl = None
+                if not pending:
+                    fail(f"{where} 的 {kind}={name_or_path} 上没有 `# cred:` 行：这个凭证该是"
+                         "几位权限、谁能换、凭什么留在宿主上，是声明出来的判断；"
+                         "写不出来就该把它拿掉")
+                elif len(pending) > 1:
+                    fail(f"{where} 上面挂了 {len(pending)} 行 `# cred:`"
+                         f"（第 {', '.join(str(d[0]) for d in pending)} 行）："
+                         "一条指令一行声明，多出来的那几行说的是哪条？")
+                else:
+                    decl = parse_cred_line(f"{unit}:{pending[0][0]}", pending[0][1])
+                    pending = None
+                if decl is None:
+                    # 声明解不全：仍然把这条指令记下来（下游按七列读），缺的字段留空，
+                    # 免得后面按字典取键时炸出 traceback——判词已经点过名了。
+                    decl = ("", "", "")
+                rows.append(list(entry) + list(decl))
+        if pending:
+            header = "  ".join(f"{ln}: {body}" for ln, body in pending)
+            fail(f"{unit} 末尾有 `# cred:` 没有挂到任何指令上（{header}）："
+                 "那条指令被删掉了，声明还在")
+    return rows
 
 
 def check_literal_secrets():
@@ -221,14 +290,14 @@ def check_live(rows):
             + (f"（{why[0][:120]}）" if why else "")
             + "——宿主安装面这一跑读不到，不是「单元没装」")
         return
-    # 按登记表的列位取名，不按位置解包：表从四列长到七列时，解包会抛 ValueError，
+    # 按列位取名，不按位置解包：这七列里任何一列改形状，解包会抛 ValueError，
     # 门于是打出一段 traceback 然后退出 1——看起来是红，实际没判任何一条。
     # 每个单元只 `systemctl cat` 一次：同一单元的多条凭证共用同一份输出，
-    # 逐行去问会让一个未安装的单元印出与登记条数一样多的同一句话。
+    # 逐行去问会让一个未安装的单元印出与声明条数一样多的同一句话。
     by_unit = {}
-    # 每个单元的「这个通道配过没有」的标记：登记表里那条 EnvironmentFile 的源路径。
+    # 每个单元的「这个通道配过没有」的标记：单元里那条 EnvironmentFile 的源路径。
     # 安装脚本把它写在凭证之后、单元装好之后，所以它在 ⇔ 这个通道至少装过一次。
-    # 没有 EnvironmentFile 行的单元没有这个标记，缺装一律按失败判（没有更好的判法
+    # 没有 EnvironmentFile 的单元没有这个标记，缺装一律按失败判（没有更好的判法
     # 就不许把它读成「不适用」）。
     channel_marker = {}
     for cols in rows:
@@ -242,16 +311,16 @@ def check_live(rows):
             if marker and not os.path.exists(marker):
                 notices.append(
                     f"--live：{unit} 未装，且 {marker} 不存在——这个通道从来没配过，"
-                    f"名下 {len(by_unit[unit])} 条登记不适用（要开这个通道就跑 "
+                    f"名下 {len(by_unit[unit])} 条声明不适用（要开这个通道就跑 "
                     f"deploy/scripts/install-backup-offsite.sh）")
                 continue
             if marker:
                 fail(f"--live：{unit} 没有装在宿主上，但 {marker} 还在"
                      f"——通道配过、单元却没了（被删或被覆盖），名下 {len(by_unit[unit])} 条"
-                     f"凭证登记一条也核不了")
+                     f"凭证声明一条也核不了")
             else:
                 fail(f"--live：{unit} 没有装在宿主上（systemctl cat 失败）"
-                     f"——它名下的 {len(by_unit[unit])} 条凭证登记一条也核不了")
+                     f"——它名下的 {len(by_unit[unit])} 条凭证声明一条也核不了")
             continue
         for cols in by_unit[unit]:
             kind, name, source, perms = cols[1], cols[2], cols[3], cols[4]
@@ -267,7 +336,7 @@ def check_live(rows):
                 fail(f"--live：{source} 不存在（{unit} 起不来）")
                 continue
             if perms and mode != perms:
-                fail(f"--live：{source} 权限是 {mode}，登记表要求 {perms}")
+                fail(f"--live：{source} 权限是 {mode}，`# cred:` 声明的是 {perms}")
     # 定时器与它那个单元同一口径：通道没配过就没有「腿不会跑」这回事，只有「这条腿
     # 要不要开」这个决定。判据用同一个标记，两处不会各说各话。
     marker = channel_marker.get("cogneva-backup-offsite.service")
@@ -330,20 +399,11 @@ def report_host_scope():
 
 
 def main():
-    rows = registry_rows()
-    found = unit_directives()
+    rows = unit_directives()
     check_literal_secrets()
     check_no_password_in_rendered()
     check_encrypt_names(rows)
     check_execstart()
-
-    reg = {(r[0], r[1], r[2], r[3]) for r in rows}
-    live = set(found)
-    for item in sorted(live - reg):
-        fail(f"单元里有凭证指令没有登记：{item[0]} 的 {item[1]}={item[2]}:{item[3]}")
-    for item in sorted(reg - live):
-        fail(f"登记表里的这一行在单元里找不到：{item[0]} 的 {item[1]}={item[2]}:{item[3]}")
-
     check_live(rows)
     report_host_scope()
 
@@ -365,7 +425,9 @@ def main():
         print(n)
 
     encrypted = sum(1 for r in rows if r[1] == "LoadCredentialEncrypted")
-    print(f"HOST CREDENTIAL SURFACE OK：{len(rows)} 条登记与 {len({r[0] for r in rows})} 个单元对齐"
+    units = len({r[0] for r in rows})
+    print(f"HOST CREDENTIAL SURFACE OK：{len(rows)} 条凭证指令各带一行 `# cred:` 声明、"
+          f"覆盖 {units} 个单元"
           f"（扫面：{UNIT_DIR} 下 {scanned['units']} 个单元文件）；"
           f"其中加密凭证 {encrypted} 个，env 文件 {len(rows) - encrypted} 个；"
           f"渲染物与 chart 里零 RESTIC_PASSWORD"
