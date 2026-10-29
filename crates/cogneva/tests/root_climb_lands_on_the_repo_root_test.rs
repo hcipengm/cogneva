@@ -56,12 +56,22 @@ const MIN_CLIMBS: usize = 50;
 /// 填一条不是给自己开后门，是把「我不想数到根」这个意图写在一个读得到的地方——
 /// 门槛就在这儿，别人加同款时会看见它、要么照抄理由、要么发现自己其实该数到根。
 /// 落点也一并钉住：文件挪了位置，落点变了，这条许可就过期，门会红。
-const NOT_ROOT: &[(&str, usize, &str, &str)] = &[(
-    "deploy/scripts/tests/comment-capacity-figures.test.sh",
-    1,
-    "deploy/scripts",
-    "夹具要的是同级的门脚本所在的目录（deploy/scripts），不是仓库根",
-)];
+const NOT_ROOT: &[(&str, usize, &str, &str)] = &[
+    (
+        "deploy/scripts/tests/comment-capacity-figures.test.sh",
+        1,
+        "deploy/scripts",
+        "夹具要的是同级的门脚本所在的目录（deploy/scripts），不是仓库根",
+    ),
+    (
+        "deploy/scripts/tests/numeric-declarations-are-tunable.test.sh",
+        1,
+        "deploy/scripts",
+        "扫的是同级的门脚本（deploy/scripts/*.sh）；原先那份靠一处数到根的 ROOT 压着这条门，\
+         而 ROOT 没有任何一格读它，shellcheck 的 SC2034 会因此让脚本 lint 失败——留着一句\
+         没人用的赋值去满足一条门，等于让门读的是一个占位符",
+    ),
+];
 
 /// 一处上溯：哪个文件第几行、数了几级、算出来的落点。
 #[derive(Debug, Clone, PartialEq, Eq)]
