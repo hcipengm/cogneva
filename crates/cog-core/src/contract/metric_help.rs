@@ -262,7 +262,15 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          start-up and added to only when a row enters, and a pass that enters \
          nothing writes nothing, so increase() over a window is the flow of \
          rows becoming unmeasurable rather than the size of the set -- the set \
-         is asked again on a timer and its size would climb on its own. A \
+         is asked again on a timer and its size would climb on its own. The \
+         revision_unreadable cells are the one part of the set that stays at \
+         zero by construction: a tree that cannot be opened returns before any \
+         row is classified, so no row enters and the fault travels on that \
+         pass's warning line -- which names the reason and counts the rows it \
+         would have judged -- and not on this counter. A zero there therefore \
+         says nothing about whether the tree has ever been unreadable; it can \
+         only leave zero if some day a pass classifies rows before opening the \
+         tree. A \
          stopped writer leaves this family's increase() empty, which is the same \
          reading as a healthy window: this family says the account could not \
          measure, and whether the account is running at all is a different \
