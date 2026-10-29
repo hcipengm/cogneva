@@ -1,8 +1,0 @@
-# Numbers written where they are used rather than declared: a literal handed to a
-# `Duration` constructor, or a byte multiplier. One row per file and shape; `count`
-# is how many are still in that file. The const census does not see these, which is
-# how the same period could be typed into three call sites unnoticed. A new one is
-# red, and the total is capped in the test that reads this file. Regenerate with
-# COGNEVA_BARE_LITERAL_REGISTRY_WRITE=1 cargo test -p cogneva --test
-# rust_capacity_constants_registry_test
-file	kind	count

@@ -18,32 +18,33 @@
 //! anything real. The DNS form only resolves inside a cluster, so writing one
 //! down is always a deployment fact.
 //!
-//! Every hit has to be a row in
-//! [`data/in-cluster-address-literals.tsv`](data/in-cluster-address-literals.tsv)
-//! with the reason it stays, and the row count is capped, so the set cannot grow
-//! back. Test modules are not scanned: a fixture naming an address is a specimen,
-//! not a fact the process runs on.
+//! Every hit is red. There used to be a register of exemptions next to this
+//! test; it ended at zero rows and is gone -- a register that stays empty still
+//! has to be kept in step with the tree, and its rows would each be a claim that
+//! the deployment cannot declare what the code already knows. Test modules are
+//! not scanned: a fixture naming an address is a specimen, not a fact the
+//! process runs on.
 
 use std::collections::BTreeSet;
 
 mod common;
 
-use common::routes::{read_repo, repo_root};
+use common::routes::repo_root;
 
 use common::rust_production::{
     brace_delta, opens_test_module, production_lines, production_sources, relative_name,
 };
 
-/// The register this census is read against.
-const REGISTER: &str = "crates/cogneva/tests/data/in-cluster-address-literals.tsv";
-
-/// How many registered literals the code may carry. Zero, and nothing is
-/// exempt: the two that used to live here are gone rather than registered.
-/// The `base_image` default in `cog-core` claimed the chart overrode it, and
-/// the variable it named is set nowhere -- so it was the only source, and
-/// `ImageRollout` now refuses before it writes a Containerfile. The registry
-/// convention that had a home in `cog-reflection` was a fifth copy of
-/// `clusterRegistry.port`; the endpoint is now read from the declaration too.
+/// How many cluster-DNS addresses the code may carry: zero, nothing exempt.
+///
+/// There is no register to add a row to any more. The two that used to live
+/// here are gone rather than registered -- the `base_image` default in
+/// `cog-core` claimed the chart overrode it and the variable it named was set
+/// nowhere, so it was the only source; the registry convention in
+/// `cog-reflection` was a fifth copy of `clusterRegistry.port`. Both now read
+/// from their declaration. A register with no rows still had to be kept in
+/// step with the tree, and a row that outlives its literal reads as a fact
+/// that is no longer carried: the count is the whole judgement now.
 const DEBT_CEILING: usize = 0;
 
 /// The suffix every cluster-DNS address ends with before its port.
@@ -123,69 +124,19 @@ fn census() -> BTreeSet<Found> {
     census_with(addresses_on)
 }
 
-/// The register's rows, as `(file, address)`.
-fn register() -> Vec<(String, String)> {
-    read_repo(REGISTER)
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
-        .filter(|line| !line.starts_with("file\t"))
-        .map(|line| {
-            let mut columns = line.split('\t');
-            let file = columns.next().unwrap_or_default().trim().to_string();
-            let address = columns.next().unwrap_or_default().trim().to_string();
-            let reason = columns.next().unwrap_or_default().trim();
-            assert!(
-                !reason.is_empty(),
-                "{REGISTER} 的 {file} / {address} 没写理由：没有理由的行就是一张白名单"
-            );
-            (file, address)
-        })
-        .collect()
-}
-
-// The cap below is a ratchet and a paid-up one reads zero, which folds the
-// comparison to `len() == 0` and makes clippy call the `<=` half absurd. It is
-// written against the constant anyway: raising the cap is how a literal that the
-// manifest genuinely cannot declare gets registered, and an `==` would silently
-// turn "at most" into "exactly".
+// The cap is a ratchet and a paid-up one reads zero. It is written against the
+// constant rather than as `found.is_empty()` so that raising it stays the one
+// edit that says "this literal cannot be declared by the deployment", and that
+// edit is visible in review instead of hiding inside a comparison.
 #[allow(clippy::absurd_extreme_comparisons)]
 #[test]
 fn every_cluster_address_in_the_code_is_a_registered_decision() {
     let found = census();
-    let rows = register();
-    let registered: BTreeSet<(String, String)> = rows.iter().cloned().collect();
-
     assert!(
-        rows.len() <= DEBT_CEILING,
-        "登记表有 {} 行，上限是 {DEBT_CEILING}：这一轮的消除面就是把代码里的集群地址交还给\
-         清单。新增一行要同时抬 DEBT_CEILING 并写清为什么清单声明不了它",
-        rows.len()
-    );
-
-    let mut unregistered = Vec::new();
-    for hit in &found {
-        if !registered.contains(&(hit.file.clone(), hit.address.clone())) {
-            unregistered.push(hit);
-        }
-    }
-
-    // A row whose literal is gone is dead weight: it inflates the cap and reads
-    // as a fact that is still carried.
-    let stale: Vec<&(String, String)> = rows
-        .iter()
-        .filter(|(file, address)| {
-            !found.contains(&Found {
-                file: file.clone(),
-                address: address.clone(),
-            })
-        })
-        .collect();
-
-    assert!(
-        unregistered.is_empty() && stale.is_empty(),
-        "代码里的集群地址与登记表对不上。\n\
-         没登记的（要么改成从清单读，要么登记并写清理由）：{unregistered:#?}\n\
-         登记了但代码里已经没有的（删掉那一行，别让上限替不存在的事实说话）：{stale:#?}"
+        found.len() <= DEBT_CEILING,
+        "代码里写死了 {} 个集群 DNS 地址（上限 {DEBT_CEILING}）：集群地址由清单声明、\
+         进程从环境读，不抄进二进制。{found:#?}",
+        found.len()
     );
 }
 
@@ -344,8 +295,6 @@ fn braces_inside_literals_do_not_nest() {
 /// 形状，做判据会先红在正当代码上；`localhost:<port>/<repo>` 是镜像引用，那个端口
 /// 只可能是 `clusterRegistry.nodePort` 在这一套部署上渲染出来的数——把它写进代码，
 /// 就是把这个集群的端口抄进二进制。带协议的行不算：那是 URL，不是镜像。
-const NODE_PORT_REGISTER: &str = "crates/cogneva/tests/data/node-port-registry-literals.tsv";
-
 /// 这一行里以节点端口当 registry 的镜像引用，端点原样（`localhost:30500`）。
 fn node_port_registries_on(line: &str) -> Vec<String> {
     // 一条 URL 里也有同样的子串，而 registry 端点从来不带协议。
@@ -379,49 +328,11 @@ fn node_port_census() -> BTreeSet<Found> {
 #[test]
 fn every_image_pulled_from_a_node_port_is_a_registered_decision() {
     let found = node_port_census();
-    let rows: Vec<(String, String)> = read_repo(NODE_PORT_REGISTER)
-        .lines()
-        .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
-        .filter(|line| !line.starts_with("file\t"))
-        .map(|line| {
-            let mut columns = line.split('\t');
-            let file = columns.next().unwrap_or_default().trim().to_string();
-            let address = columns.next().unwrap_or_default().trim().to_string();
-            let reason = columns.next().unwrap_or_default().trim();
-            assert!(
-                !reason.is_empty(),
-                "{NODE_PORT_REGISTER} 的 {file} / {address} 没写理由：没有理由的行就是一张白名单"
-            );
-            (file, address)
-        })
-        .collect();
-    let registered: BTreeSet<(String, String)> = rows.iter().cloned().collect();
-
     assert!(
-        rows.len() <= DEBT_CEILING,
-        "登记表有 {} 行，上限是 {DEBT_CEILING}：镜像的 registry 端点由部署面声明，\
-         代码读它，不抄它",
-        rows.len()
-    );
-
-    let unregistered: Vec<&Found> = found
-        .iter()
-        .filter(|hit| !registered.contains(&(hit.file.clone(), hit.address.clone())))
-        .collect();
-    let stale: Vec<&(String, String)> = rows
-        .iter()
-        .filter(|(file, address)| {
-            !found.contains(&Found {
-                file: file.clone(),
-                address: address.clone(),
-            })
-        })
-        .collect();
-    assert!(
-        unregistered.is_empty() && stale.is_empty(),
-        "代码里以节点端口当 registry 的引用与登记表对不上。\n\
-         没登记的（改成从 Service 读那个端口，或登记并写清理由）：{unregistered:#?}\n\
-         登记了但代码里已经没有的（删掉那一行）：{stale:#?}"
+        found.len() <= DEBT_CEILING,
+        "代码里有 {} 处以节点端口当 registry（上限 {DEBT_CEILING}）：那个端口是 chart 的\
+         clusterRegistry.nodePort 渲染出来的，代码读它、不抄它。{found:#?}",
+        found.len()
     );
 }
 

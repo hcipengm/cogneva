@@ -567,14 +567,12 @@ const AFTER: u64 = 45;
 // belong to the census above) and not an inline test module. A new one is red;
 // the total is capped by [`BARE_LITERAL_CEILING`] and the cap only comes down.
 //
-// Counted per file and per shape rather than one row each. Four hundred rows of
-// `.../mod.rs 1800` would name the numbers without making them cheaper to find,
-// and the thing a reader needs from this file is which files still hold the
-// hardcoding and how much of it.
+// Counted per file and per shape, and the breakdown is printed when the cap is
+// crossed rather than kept in a file: four hundred rows of `.../mod.rs 1800`
+// would name the numbers without making them cheaper to find, and a registry
+// that has to be regenerated after every edit is one more document that can say
+// the tree is clean when it is not.
 // ---------------------------------------------------------------------------
-
-/// Where the use-site numbers are registered, relative to the workspace root.
-const BARE_LITERALS: &str = "crates/cogneva/tests/data/rust-bare-literals.tsv";
 
 /// The shape names, as they appear in the registry.
 const BARE_CADENCE: &str = "cadence";
@@ -873,45 +871,6 @@ fn byte_literals(code: &str) -> usize {
     count
 }
 
-fn read_bare_literals(root: &Path) -> Vec<(String, String, usize)> {
-    let path = root.join(BARE_LITERALS);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter(|l| !l.starts_with('#') && !l.starts_with("file\t") && !l.trim().is_empty())
-        .filter_map(|l| {
-            let mut f = l.split('\t');
-            Some((
-                f.next()?.to_string(),
-                f.next()?.to_string(),
-                f.next()?.parse().ok()?,
-            ))
-        })
-        .collect()
-}
-
-fn write_bare_literals(root: &Path, scanned: &BTreeMap<(String, String), usize>) {
-    let mut out = String::from(
-        "# Numbers written where they are used rather than declared: a literal handed to a\n\
-         # `Duration` constructor, or a byte multiplier. One row per file and shape; `count`\n\
-         # is how many are still in that file. The const census does not see these, which is\n\
-         # how the same period could be typed into three call sites unnoticed. A new one is\n\
-         # red, and the total is capped in the test that reads this file. Regenerate with\n\
-         # COGNEVA_BARE_LITERAL_REGISTRY_WRITE=1 cargo test -p cogneva --test\n\
-         # rust_capacity_constants_registry_test\n\
-         file\tkind\tcount\n",
-    );
-    for ((file, kind), count) in scanned {
-        out.push_str(&format!("{file}\t{kind}\t{count}\n"));
-    }
-    let path = root.join(BARE_LITERALS);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&path, out).expect("write the bare literal registry");
-}
-
 // Same shape as the reviewed-debt cap above: the ceiling reads zero once the
 // debt is paid, and the comparison has to survive it being raised again.
 #[allow(clippy::absurd_extreme_comparisons)]
@@ -919,45 +878,17 @@ fn write_bare_literals(root: &Path, scanned: &BTreeMap<(String, String), usize>)
 fn a_number_at_the_point_of_use_is_counted_where_it_is_used() {
     let root = repo_root();
     let scanned = scan_bare_literals(&root, &production_sources(&root));
-    let existing = read_bare_literals(&root);
-    if std::env::var("COGNEVA_BARE_LITERAL_REGISTRY_WRITE").as_deref() == Ok("1") {
-        write_bare_literals(&root, &scanned);
-        return;
-    }
-    let present: BTreeMap<(String, String), usize> = existing
+    let total: u64 = scanned.values().map(|count| *count as u64).sum();
+    let held: Vec<String> = scanned
         .iter()
-        .map(|(f, k, c)| ((f.clone(), k.clone()), *c))
+        .map(|((file, kind), count)| format!("{file} ({kind}): {count}"))
         .collect();
-    let mut drifted = Vec::new();
-    for ((file, kind), count) in &scanned {
-        match present.get(&(file.clone(), kind.clone())) {
-            None => drifted.push(format!("{file} ({kind}): {count} new, unregistered")),
-            Some(old) if old != count => drifted.push(format!(
-                "{file} ({kind}): {old} -> {count}: say where the new number comes from"
-            )),
-            Some(_) => {}
-        }
-    }
-    for (file, kind, count) in &existing {
-        if !scanned.contains_key(&(file.clone(), kind.clone())) {
-            drifted.push(format!(
-                "{file} ({kind}): {count} gone (regenerate the file)"
-            ));
-        }
-    }
     assert!(
-        drifted.is_empty(),
-        "use-site numbers moved.\n{}\nRegenerate with COGNEVA_BARE_LITERAL_REGISTRY_WRITE=1 \
-         cargo test -p cogneva --test rust_capacity_constants_registry_test",
-        drifted.join("\n")
-    );
-
-    let total: usize = existing.iter().map(|(_, _, count)| count).sum();
-    assert!(
-        (total as u64) <= BARE_LITERAL_CEILING,
+        total <= BARE_LITERAL_CEILING,
         "{total} numbers are still written where they are used and the ceiling is \
          {BARE_LITERAL_CEILING}. The debt only comes down: give the number a declaration \
-         (a `const` the census asks about) or make it configurable."
+         (a `const` the census asks about) or make it configurable.\n{}",
+        held.join("\n")
     );
 }
 
