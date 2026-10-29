@@ -515,10 +515,19 @@ SELECT h.kind, h.scope, h.literal, \
  WHERE h.delivered_rev IS NOT NULL AND h.state NOT IN ('{state:landed}', '{state:retired}') \
  ORDER BY held DESC, h.kind, h.scope, h.literal";
 
+/// `undecided` gets its own arm rather than being folded into `owed`.
+///
+/// The reader counts the four buckets by name, and a bucket this query never
+/// emits can only ever be counted as zero -- which is exactly what a face with
+/// nothing undecided in it also reads as. The row is still owed work (the
+/// reader adds the undecided bucket to the owed one), but "owed because it is
+/// queued" and "owed because a look could not settle it" are different debts,
+/// and only the second one has somebody to go and ask.
 const BLOCK_CENSUS_SQL_TEMPLATE: &str = "\
 SELECT block, \
        CASE state WHEN '{state:landed}' THEN '{state:landed}' \
                   WHEN '{state:retired}' THEN '{state:retired}' \
+                  WHEN '{state:undecided}' THEN '{state:undecided}' \
                   ELSE 'owed' END AS state, \
        count(*) AS n, \
        max(EXTRACT(EPOCH FROM (now() - COALESCE(measured_at, first_seen_at))))::float8 \
@@ -2018,6 +2027,33 @@ mod templates {
             assert!(
                 !sql.contains('{'),
                 "{name} 还有没填的槽，这条语句发到数据库会被拒：{sql}"
+            );
+        }
+    }
+
+    /// The census reader finds its buckets by name, so a bucket the statement
+    /// never emits reads exactly like an empty one.
+    ///
+    /// The reader selects `landed`, `retired` and `undecided` by the words the
+    /// state writes, and takes whatever else comes back as owed. The statement
+    /// folded `undecided` in with the rest: a face whose looks had all come back
+    /// unsettled and a face with nothing unsettled in it both read zero, and the
+    /// one row that could tell them apart -- the one somebody has to go and ask
+    /// about -- was the row not counted. Only a live database caught that, in a
+    /// step that runs after every other test has passed.
+    #[test]
+    fn the_census_emits_every_bucket_the_reader_counts_by_name() {
+        let sql = fill_vocabulary(BLOCK_CENSUS_SQL_TEMPLATE);
+        for state in [
+            ChangeState::Landed,
+            ChangeState::Retired,
+            ChangeState::Undecided,
+        ] {
+            assert!(
+                sql.contains(&format!("THEN '{}'", state.as_str())),
+                "the census reads `{}` by name but the statement never emits that word, so the \
+                 bucket always reads as zero: {sql}",
+                state.as_str()
             );
         }
     }
