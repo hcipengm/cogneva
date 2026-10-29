@@ -565,7 +565,7 @@ fn ask_counts() -> std::sync::MutexGuard<'static, ()> {
 /// stream afterwards. The target's half (running the prompt and publishing the
 /// result) is covered where the inbox handler runs.
 struct Answering {
-    inner: cog_stream::MemoryMessageBackend,
+    inner: cog_test_support::MemoryMessageBackend,
     answer: Option<serde_json::Value>,
     /// The queue refuses the request itself, after the caller has already
     /// opened its reply stream.
@@ -587,7 +587,7 @@ struct Answering {
 impl Answering {
     fn new(answer: Option<serde_json::Value>) -> Self {
         Self {
-            inner: cog_stream::MemoryMessageBackend::new(),
+            inner: cog_test_support::MemoryMessageBackend::new(),
             answer,
             refuse_publish: false,
             asked: Mutex::new(None),

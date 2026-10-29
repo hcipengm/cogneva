@@ -26,11 +26,13 @@ use crate::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
 /// These are not copies kept for their own sake. The same instruction has to
 /// hold on both paths — the declared prompt a running process reads and the
 /// text the code sends when there is nothing to read — and a side that is
-/// edited alone is how a declaration stops describing the run. The guard in
-/// this file's tests renders every declared key and compares it to the text
-/// here byte for byte, so an edit to either side that is not mirrored fails the
-/// suite instead of shipping as a quiet difference.
-mod fallback {
+/// edited alone is how a declaration stops describing the run. A guard in the
+/// assembly root's test suite renders every declared key and compares it to the
+/// text here byte for byte, so an edit to either side that is not mirrored
+/// fails the suite instead of shipping as a quiet difference. That guard reads
+/// this module from outside, which is why it is public: the crate that owns the
+/// declaration and the crate that owns the loader do not name each other.
+pub mod fallback {
     /// Skill refinement: asks for an improved `SkillConfig` for one skill.
     pub fn skill_refinement(skill_json: &str, skill_id: &str) -> String {
         format!(
@@ -1402,163 +1404,13 @@ mod tests {
     }
 }
 
-/// The declared prompt and the code's fallback are one instruction carried
-/// twice, and until this guard existed nothing compared them.
-///
-/// The paths diverge in a way no other gate sees: the code path is the one the
-/// tests exercise (every test builds the engine without a prompt manager, so
-/// the fallback is what runs), while the declared path is the one production
-/// runs (the ConfigMap is what a deployed process loads). An edit to either
-/// side alone therefore passes every behavioural test and changes what the
-/// model is told in production only.
-#[cfg(test)]
-mod declared_prompt_matches_fallback {
-    use super::fallback;
-    use cog_prompt::{PromptManager, WatchMode};
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    /// Every key this guard compares. The list is checked against what
-    /// `prompts/` actually declares in both directions, so a declaration added
-    /// or removed without touching this guard fails here rather than dropping
-    /// out of coverage.
-    const COMPARED: [&str; 6] = [
-        "agent:default",
-        "reflection:evolution_refinement",
-        "reflection:evolution_refinement_system",
-        "reflection:evolution_tool",
-        "reflection:evolution_tool_system",
-        "reflection:skill_extractor",
-    ];
-
-    /// Load `prompts/` the way a process does: from the directory as shipped,
-    /// not from a copy written by the test.
-    ///
-    /// Built by name and read through the contract. A loader names the type it
-    /// builds, so this is the one line that reaches for the implementation; every
-    /// read below goes through [`cog_core::contract::prompt::PromptManager`],
-    /// which is what makes the key set below the declarations' own rather than a
-    /// second copy of them.
-    async fn manager() -> Arc<dyn cog_core::contract::prompt::PromptManager> {
-        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../prompts");
-        let manager = PromptManager::from_dir(dir, WatchMode::None)
-            .await
-            .unwrap_or_else(|e| panic!("prompts/ must load from {dir}: {e}"));
-        Arc::new(manager)
-    }
-
-    /// A `|` block scalar keeps one trailing newline; the code's literal has
-    /// none. That byte is YAML's, not the instruction's, so it is not a
-    /// difference in what the model is told.
-    fn same_instruction(rendered: &str, text: &str) -> bool {
-        rendered.trim_end_matches('\n') == text.trim_end_matches('\n')
-    }
-
-    fn refinement_vars() -> (HashMap<String, String>, &'static str, &'static str) {
-        let json = "{\"skill_id\":\"sk-1\"}";
-        let id = "sk-1";
-        (
-            HashMap::from([
-                ("skill_json".to_string(), json.to_string()),
-                ("skill_id".to_string(), id.to_string()),
-            ]),
-            json,
-            id,
-        )
-    }
-
-    fn tool_vars() -> (HashMap<String, String>, &'static str, &'static str) {
-        let name = "read_file";
-        let errors = "timeout\nbad path";
-        (
-            HashMap::from([
-                ("tool_name".to_string(), name.to_string()),
-                ("error_patterns".to_string(), errors.to_string()),
-            ]),
-            name,
-            errors,
-        )
-    }
-
-    #[tokio::test]
-    async fn every_declared_prompt_is_the_text_the_code_falls_back_to() {
-        let pm = manager().await;
-        let mut keys: Vec<String> = pm.keys();
-        keys.sort();
-        let compared: Vec<String> = COMPARED.iter().map(|k| k.to_string()).collect();
-        assert_eq!(
-            keys, compared,
-            "prompts/ declares a different set of keys than this guard compares"
-        );
-
-        // Each arm reads its key as a literal at the call rather than passing the
-        // loop's variable down: the workspace-wide sweep that reconciles every
-        // prompt call site against `prompts/` reads the key off the call, and a
-        // call it cannot read is a call it cannot check.
-        for key in COMPARED {
-            // Bootstrap entry owned by cog-prompt; this crate never asks for it
-            // and so has no fallback to compare against.
-            if key == "agent:default" {
-                continue;
-            }
-            let pairs: Vec<(String, String)> = match key {
-                "reflection:skill_extractor" => vec![(
-                    pm.get("reflection:skill_extractor").expect("declared"),
-                    crate::extractor::SKILL_EXTRACTOR_SYSTEM.to_string(),
-                )],
-                "reflection:evolution_refinement" => {
-                    let (vars, json, id) = refinement_vars();
-                    vec![(
-                        pm.render("reflection:evolution_refinement", &vars)
-                            .expect("renders"),
-                        fallback::skill_refinement(json, id),
-                    )]
-                }
-                "reflection:evolution_refinement_system" => vec![(
-                    pm.get("reflection:evolution_refinement_system")
-                        .expect("declared"),
-                    fallback::SKILL_REFINEMENT_SYSTEM.to_string(),
-                )],
-                "reflection:evolution_tool" => {
-                    let (vars, name, errors) = tool_vars();
-                    vec![(
-                        pm.render("reflection:evolution_tool", &vars)
-                            .expect("renders"),
-                        fallback::tool_variant(name, errors),
-                    )]
-                }
-                "reflection:evolution_tool_system" => vec![(
-                    pm.get("reflection:evolution_tool_system")
-                        .expect("declared"),
-                    fallback::TOOL_VARIANT_SYSTEM.to_string(),
-                )],
-                other => panic!(
-                    "{other} is declared in prompts/ and this guard has no case for \
-                     it. If cog-reflection falls back for it, compare that text \
-                     here; if another crate reads it, name that crate in this arm."
-                ),
-            };
-            assert!(
-                !pairs.is_empty(),
-                "{key} produced no comparison, so its arm asserts nothing"
-            );
-            for (declared, expected) in pairs {
-                assert!(
-                    same_instruction(&declared, &expected),
-                    "{key}: the declared instruction and the code's fallback differ"
-                );
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod agent_default_exemption_carries_its_own_witness {
     //! principle: feedback_an_exemption_is_also_a_blind_spot
     //!
-    //! The parity guard above skips one key it lists: `agent:default` is skipped
-    //! with a comment claiming this crate never asks for it and that cog-prompt
-    //! owns the bootstrap prompt. That skip is an exemption, and an exemption is
+    //! The parity guard in the assembly root's test suite skips one key it lists:
+    //! `agent:default` is skipped with a comment claiming this crate never asks
+    //! for it and that cog-prompt owns the bootstrap prompt. That skip is an exemption, and an exemption is
     //! by construction a blind spot: it rests on a hypothesis about an ambiguous
     //! signal -- "this crate never requests that key" -- which the guard itself
     //! never checks. The day a call site requests `agent:default`, the skip

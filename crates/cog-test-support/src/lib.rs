@@ -14,8 +14,14 @@ use std::path::{Path, PathBuf};
 use sqlx::Connection as _;
 
 mod backends;
+mod message;
+mod metrics;
+mod state;
 
 pub use backends::{MemoryObjectBackend, MemoryVectorBackend};
+pub use message::MemoryMessageBackend;
+pub use metrics::MemoryMetricsBackend;
+pub use state::MemoryStateBackend;
 
 /// 下面那几个入口读的名字。一条名字只在这里拼写一次。
 ///

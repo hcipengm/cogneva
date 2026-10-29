@@ -2562,7 +2562,7 @@ mod tests {
     /// 结局读数的值面：失败写 1、成功写 0，且每轮各写一格。
     #[tokio::test]
     async fn a_tick_outcome_is_one_when_failed_and_zero_when_not() {
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let porter = BaselinePorter::new(".").with_metrics(Some(metrics.clone()));
         let name = cog_core::metric_names::BASELINE_PORT_TICK_FAILED.as_str();
 
@@ -2589,7 +2589,7 @@ mod tests {
     /// 开的东西。
     #[tokio::test]
     async fn the_closed_outcome_set_is_seeded_so_a_gate_that_never_ran_reads_as_zero() {
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let porter = BaselinePorter::new(".").with_metrics(Some(metrics.clone()));
         let name = cog_core::metric_names::EVAL_GATE_OUTCOMES_TOTAL.as_str();
 
@@ -2656,7 +2656,7 @@ mod tests {
     /// 掉，所以这条测的是循环壳，不是 port_tick 自己。
     #[tokio::test]
     async fn the_loop_stamps_a_failed_round_instead_of_leaving_it_silent() {
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         // 不存在的仓库：每轮 git 调用都失败。
         let porter = std::sync::Arc::new(
             BaselinePorter::new("/nonexistent/baseline-port-loop-outcome-test")

@@ -13736,7 +13736,7 @@ exit 0
         fake_strip(&bin_dir);
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
 
         let old_path = std::env::var("PATH").unwrap_or_default();
@@ -13805,7 +13805,7 @@ exit 0
     /// 提问的调用点没了或被绕过。任何别的成因（这一轮死在问答之间）都会把一笔永久留在
     /// 差里，判据于是把「没走完」报成「守卫失踪」。
     async fn rollout_counter_pair(
-        metrics: &std::sync::Arc<cog_storage::MemoryMetricsBackend>,
+        metrics: &std::sync::Arc<cog_test_support::MemoryMetricsBackend>,
     ) -> (f64, f64) {
         let attempts = metrics
             .query_counter_totals(cog_core::metric_names::MAINLINE_ROLLOUT_ATTEMPTS_TOTAL.as_str())
@@ -13860,7 +13860,7 @@ exit 0
         fake_strip(&bin_dir);
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
 
         let old_path = std::env::var("PATH").unwrap_or_default();
@@ -13960,7 +13960,7 @@ exit 0
         fake_strip(&bin_dir);
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
 
         let old_path = std::env::var("PATH").unwrap_or_default();
@@ -14146,7 +14146,7 @@ exit 0
         let buildah = fake_buildah(&bin_dir, "");
         let deployed = main_image("localhost:30500", &rev_b);
         let kubectl = fake_kubectl(&bin_dir, &deployed);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let deployer =
@@ -14181,7 +14181,7 @@ exit 0
         let buildah = fake_buildah(&bin_dir, "");
         let deployed = main_image("localhost:30500", &rev_a);
         let kubectl = fake_kubectl(&bin_dir, &deployed);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let deployer =
@@ -14236,7 +14236,7 @@ exit 0
         let buildah = fake_buildah(&bin_dir, "");
         let deployed = main_image("localhost:30500", &rev_b);
         let kubectl = fake_kubectl(&bin_dir, &deployed);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
         let deployer =
@@ -14266,7 +14266,7 @@ exit 0
         let buildah = fake_buildah(&bin_dir, "");
         let deployed = main_image("localhost:30500", &rev_a);
         let kubectl = fake_kubectl(&bin_dir, &deployed);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
 
         // 同一段 A→C：中间的 B 没有哪一拍看过。
         real_git(&work, &["fetch", "local", "main"]).await;
@@ -14416,7 +14416,7 @@ exec {real} "$@"
         let ws = test_workspaces(root, &bare);
         fake_cargo(&bin_dir, ws.target_dir());
         fake_strip(&bin_dir);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
         let old_path = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{}", bin_dir.display(), old_path));
@@ -15461,7 +15461,7 @@ exec {real} "$@"
         use cog_core::metric_names::MAINLINE_CI_HOLD_SECONDS;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         // 三次提问各一次应答：红、红（一小时后再问）、绿（放行）。
         let (endpoint, handle) = fake_registry(vec![
             http_200(r#"{"check_runs":[{"conclusion":"failure"}]}"#),
@@ -15622,7 +15622,7 @@ exec {real} "$@"
         use cog_core::metric_names::MAINLINE_CI_VERDICT_TOTAL;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let (endpoint, handle) = fake_registry(vec![
             http_200(r#"{"check_runs":[{"conclusion":"success"}]}"#),
             http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
@@ -15683,7 +15683,7 @@ exec {real} "$@"
         };
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
 
         // 读到全绿。
         let (endpoint, handle) = fake_registry(vec![http_200(
@@ -15827,15 +15827,16 @@ exec {real} "$@"
         };
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         // 一个上游、给定基址，读数落进同一个后端：每条上游的沉默都进同一本账。
-        let asks = |base: &str, metrics: &std::sync::Arc<cog_storage::MemoryMetricsBackend>| {
-            let mut cfg = upstream_config(root, Path::new("/nonexistent"));
-            cfg.upstreams.truncate(1);
-            cfg.upstreams[0].api_base = Some(base.to_string());
-            MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
-                .with_metrics(metrics.clone())
-        };
+        let asks =
+            |base: &str, metrics: &std::sync::Arc<cog_test_support::MemoryMetricsBackend>| {
+                let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+                cfg.upstreams.truncate(1);
+                cfg.upstreams[0].api_base = Some(base.to_string());
+                MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+                    .with_metrics(metrics.clone())
+            };
 
         // 检查还在跑：动作是等下一轮。兜底那条接口答了却没结论，也不许把原因改写
         // ——先问的那一次更接近真相。
@@ -16925,7 +16926,7 @@ exit 0
         cfg.registry_claim = "cogneva-registry-pvc".into();
         cfg.registry_walker_port = walker_port;
         cfg.registry_retention = 1;
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
 
@@ -16994,7 +16995,7 @@ exit 0
         cfg.registry_claim = "cogneva-registry-pvc".into();
         cfg.registry_walker_port = walker_port;
         cfg.registry_retention = 1;
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         // 库里已经有一轮走完留下的时刻——上一代进程写的，或本代更早那一轮写的。
         let done = 1_700_000_000.0;
         metrics
@@ -17219,7 +17220,7 @@ exit 0
         // 读部署镜像之前就折了。
         let mut cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
         cfg.registry_claim = "cogneva-registry-pvc".into();
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
 
@@ -17259,7 +17260,7 @@ exit 0
         // 裸仓库指到不存在的地方：`git --git-dir … rev-parse` 非零退出，这一轮就折在
         // 读裸仓库那一站——正是判版本契约要用的输入取不到的那一站。
         let cfg = test_config(root, Path::new("/nonexistent"), "noop", "noop");
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
 
@@ -17867,7 +17868,7 @@ exit 0
         );
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer =
             MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
         let state_path = seed_state(
@@ -24977,7 +24978,7 @@ exit 0
         tag_release(&bare, "v0.5.8", &revs[2]).await;
         tag_release(&bare, "v0.5.9", &revs[2]).await;
 
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         version_deployer(root, &bare)
             .with_metrics(metrics.clone())
             .report_version_contract("main")
@@ -25138,7 +25139,7 @@ exit 0
             "noop",
             &bin_dir.join("kread").to_string_lossy(),
         );
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
 
@@ -25189,7 +25190,7 @@ exit 0
             "noop",
             &bin_dir.join("kdead").to_string_lossy(),
         );
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
 
@@ -26051,7 +26052,7 @@ exit 0
         let kubectl = fake_kubectl_live(&bin_dir, "localhost:30500/cogneva:main-222222222222 ");
         let mut cfg = test_config(root, Path::new("/nonexistent"), &buildah, &kubectl);
         cfg.registry_retention = 1;
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_metrics(metrics.clone());
 
@@ -26132,7 +26133,7 @@ exit 0
             .to_string_lossy()
             .to_string();
         let kubectl = fake_kubectl_live(&bin_dir, "localhost:30500/cogneva:main-222222222222 ");
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(
             test_config(root, Path::new("/nonexistent"), &buildah, &kubectl),
             test_workspaces(root, Path::new("/nonexistent")),
@@ -26191,7 +26192,7 @@ exit 0
         // 库存读不懂 ⇒ 这一轮走不完。走不完正是这条读数要分辨的那一支。
         let buildah = fake_buildah_store(&bin_dir, "buildah: image store is not initialized");
         let kubectl = fake_kubectl_live(&bin_dir, "localhost:30500/cogneva:main-222222222222 ");
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(
             test_config(root, Path::new("/nonexistent"), &buildah, &kubectl),
             test_workspaces(root, Path::new("/nonexistent")),
@@ -26242,7 +26243,7 @@ exit 0
         let kubectl = write_fake_bin(&bin_dir, "fake-kubectl", &script)
             .to_string_lossy()
             .to_string();
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(
             test_config(root, Path::new("/nonexistent"), &buildah, &kubectl),
             test_workspaces(root, Path::new("/nonexistent")),
@@ -26303,7 +26304,7 @@ exit 0
 
     /// 某格结果读数当前的值；这一格没写过就是 0。
     async fn poll_cycles(
-        metrics: &std::sync::Arc<cog_storage::MemoryMetricsBackend>,
+        metrics: &std::sync::Arc<cog_test_support::MemoryMetricsBackend>,
         outcome: &str,
     ) -> f64 {
         metrics
@@ -26341,7 +26342,7 @@ exit 0
         fake_strip(&bin_dir);
 
         let cfg = test_config(root, &bare, &buildah, &kubectl);
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer = MainlineDeployer::new(cfg, ws).with_metrics(metrics.clone());
 
         let old_path = std::env::var("PATH").unwrap_or_default();

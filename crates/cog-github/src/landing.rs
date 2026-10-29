@@ -3080,15 +3080,18 @@ mod tests {
     /// can read back what a landing counted.
     fn measured_channel(
         policy: crate::config::LandingPolicy,
-    ) -> (MainChannel, Arc<cog_storage::MemoryMetricsBackend>) {
+    ) -> (MainChannel, Arc<cog_test_support::MemoryMetricsBackend>) {
         let chan = channel(policy);
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         chan.attach_metrics(metrics.clone());
         (chan, metrics)
     }
 
     /// Recorded count for one failure category, zero when it has no series.
-    async fn failure_count(metrics: &cog_storage::MemoryMetricsBackend, category: &str) -> f64 {
+    async fn failure_count(
+        metrics: &cog_test_support::MemoryMetricsBackend,
+        category: &str,
+    ) -> f64 {
         metrics
             .query_counter_totals(LANDING_FAILURES_METRIC.as_str())
             .await
@@ -3099,7 +3102,7 @@ mod tests {
             .unwrap_or(0.0)
     }
 
-    async fn series_count(metrics: &cog_storage::MemoryMetricsBackend) -> usize {
+    async fn series_count(metrics: &cog_test_support::MemoryMetricsBackend) -> usize {
         metrics
             .query_counter_totals(LANDING_FAILURES_METRIC.as_str())
             .await
@@ -3109,7 +3112,7 @@ mod tests {
 
     /// How many census rows have been written, not what they say. The rule
     /// being judged is about rows, so the count is the reading.
-    async fn census_rows(metrics: &cog_storage::MemoryMetricsBackend) -> usize {
+    async fn census_rows(metrics: &cog_test_support::MemoryMetricsBackend) -> usize {
         metrics
             .query_gauge_range(
                 crate::change_funnel::CHANGE_FUNNEL_METRIC.as_str(),
@@ -3124,7 +3127,7 @@ mod tests {
     /// How many fate rows have been appended, not their value. The seed is
     /// free to read and not to write, so the cost it has to be judged by is
     /// the row count.
-    async fn fate_rows(metrics: &cog_storage::MemoryMetricsBackend) -> usize {
+    async fn fate_rows(metrics: &cog_test_support::MemoryMetricsBackend) -> usize {
         metrics
             .query_counter_range(
                 crate::change_funnel::CHANGE_FATE_METRIC.as_str(),
@@ -4376,7 +4379,7 @@ mod tests {
     fn watching_at(
         workdir: &Path,
         provider: Arc<dyn CodePlatformProvider>,
-    ) -> (MainChannel, Arc<cog_storage::MemoryMetricsBackend>) {
+    ) -> (MainChannel, Arc<cog_test_support::MemoryMetricsBackend>) {
         let chan = MainChannel::new(
             workdir,
             GitHubIntegrationConfig {
@@ -4395,7 +4398,7 @@ mod tests {
             provider,
             ContributionController::new_shared(),
         );
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         chan.attach_metrics(metrics.clone());
         (chan, metrics)
     }
@@ -4420,7 +4423,7 @@ mod tests {
         .unwrap();
     }
 
-    async fn inherited_count(metrics: &cog_storage::MemoryMetricsBackend) -> f64 {
+    async fn inherited_count(metrics: &cog_test_support::MemoryMetricsBackend) -> f64 {
         metrics
             .query_counter_totals(LANDING_CI_FAILURE_INHERITED_METRIC.as_str())
             .await

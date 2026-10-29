@@ -1280,7 +1280,11 @@ mod tests {
         assert_eq!(git_out(&rebuilt.path, &["rev-parse", "HEAD"]), rev_b);
     }
 
-    async fn gauge_of(mb: &cog_storage::MemoryMetricsBackend, name: &str, worktree: &str) -> f64 {
+    async fn gauge_of(
+        mb: &cog_test_support::MemoryMetricsBackend,
+        name: &str,
+        worktree: &str,
+    ) -> f64 {
         let samples = mb.query_gauge_latest(name).await.unwrap();
         samples
             .into_iter()
@@ -1293,7 +1297,7 @@ mod tests {
     async fn index_health_reads_clean_on_a_healthy_worktree() {
         let tmp = tempfile::tempdir().unwrap();
         let (bare, _a, rev_b) = seed_bare(tmp.path());
-        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mb = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
 
         let spec = WorkspaceSpec::persistent(
@@ -1325,7 +1329,7 @@ mod tests {
     async fn index_health_reports_every_tracked_file_when_the_index_is_gone() {
         let tmp = tempfile::tempdir().unwrap();
         let (bare, _a, rev_b) = seed_bare(tmp.path());
-        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mb = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
 
         let spec = WorkspaceSpec::persistent(
@@ -1367,7 +1371,7 @@ mod tests {
     async fn index_health_names_an_incomplete_sample_apart_from_a_healthy_tree() {
         let tmp = tempfile::tempdir().unwrap();
         let (bare, _a, rev_b) = seed_bare(tmp.path());
-        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mb = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
 
         let spec = WorkspaceSpec::persistent(
@@ -1425,7 +1429,7 @@ mod tests {
     async fn index_health_skips_ephemeral_worktrees() {
         let tmp = tempfile::tempdir().unwrap();
         let (bare, _a, rev_b) = seed_bare(tmp.path());
-        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mb = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
 
         let ws = mgr
@@ -1446,7 +1450,7 @@ mod tests {
     /// 某棵树在某条读数上已经落了多少行。心跳的全部效果就是"落一行"或"不落"，
     /// 所以判据要数行，不能只看最新值——值在窗内重复写也是同一个数。
     async fn sample_rows(
-        mb: &cog_storage::MemoryMetricsBackend,
+        mb: &cog_test_support::MemoryMetricsBackend,
         name: &str,
         worktree: &str,
     ) -> usize {
@@ -1491,7 +1495,7 @@ mod tests {
     async fn heartbeat_stamps_long_lived_worktrees_and_leaves_instance_trees_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let (bare, _a, rev_b) = seed_bare(tmp.path());
-        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mb = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let mgr = manager(tmp.path(), &bare).with_metrics(mb.clone());
 
         // 三棵树都建出来，但一条读数都还没采（ensure_persistent 不采）。

@@ -27,4 +27,4 @@ async-trait = "0.1"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
-cog-storage = { workspace = true }
+cog-test-support = { path = "../cog-test-support" }

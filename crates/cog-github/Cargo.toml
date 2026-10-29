@@ -42,5 +42,6 @@ base64 = "0.22"
 tokio-test = "0.4"
 # 测试进程不经 main.rs，需自装 rustls 进程级 CryptoProvider。
 rustls = { workspace = true }
-# 内存版指标后端，用来读回落地记了哪些失败类别。
-cog-storage = { workspace = true }
+# 内存版指标后端，用来读回落地记了哪些失败类别。它在夹具层，不在存储 crate：
+# 用例判的是「这一拍记到哪一格」，不是某个后端的判题规则。
+cog-test-support = { path = "../cog-test-support" }

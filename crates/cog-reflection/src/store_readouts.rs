@@ -429,7 +429,7 @@ mod tests {
     ) -> (
         PolicyStore,
         Arc<MetaLearningEngine>,
-        Arc<cog_storage::MemoryMetricsBackend>,
+        Arc<cog_test_support::MemoryMetricsBackend>,
     ) {
         let store = PolicyStore::new(dir.join("policies"));
         store
@@ -448,7 +448,7 @@ mod tests {
             )
             .await,
         );
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         (store, engine, metrics)
     }
 
@@ -519,7 +519,7 @@ mod tests {
             )
             .await,
         );
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let readouts = StoreReadouts::new(
             dir.path(),
             vec![(META_LEARNING_POLICY.to_string(), store)],
@@ -527,7 +527,7 @@ mod tests {
             Some(metrics.clone()),
         );
 
-        async fn readout(metrics: &cog_storage::MemoryMetricsBackend, name: &str) -> f64 {
+        async fn readout(metrics: &cog_test_support::MemoryMetricsBackend, name: &str) -> f64 {
             metrics
                 .query_gauge_latest(metric_names::POLICY_STORE_READINGS.as_str())
                 .await

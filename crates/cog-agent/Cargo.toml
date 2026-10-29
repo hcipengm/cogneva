@@ -33,9 +33,10 @@ url = "2"
 dom_smoothie = { version = "0.18", default-features = false }
 
 [dev-dependencies]
-# The inbox reply tests read their answer back through a real message backend;
-# a hand-written double would only prove the double agrees with itself.
-cog-stream = { path = "../cog-stream" }
+# The inbox reply tests read their answer back through a message backend that
+# implements the core contract. The fixture layer owns that implementation: the
+# answer is judged against the contract, not against one crate's backend.
+cog-test-support = { path = "../cog-test-support" }
 tempfile = "3"
 # 断言「这一行读数到了采集面」要按**字段值**读它，不是断言「打过日志」——
 # 与 cog-memory 的落库读数同一条纪律，所以这里也直接装一层捕获。

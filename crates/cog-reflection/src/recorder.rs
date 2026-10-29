@@ -1218,7 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn every_repair_round_lands_in_exactly_one_cell() {
         let backend = Arc::new(RawAndSchemaBackend::default());
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let recorder =
             MemoryBackendRecorder::new(backend, "reflection").with_metrics(Some(metrics.clone()));
 

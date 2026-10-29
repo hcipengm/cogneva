@@ -751,7 +751,7 @@ mod tests {
 
     fn promoter(
         policy: crate::PromotionGateConfig,
-        ledger: Arc<cog_storage::MemoryStateBackend>,
+        ledger: Arc<cog_test_support::MemoryStateBackend>,
         channel: Option<Arc<dyn PromotionChannel>>,
     ) -> AutoPromoter {
         AutoPromoter::new(policy, ledger, channel, engine())
@@ -766,7 +766,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("COGNEVA_DATA_DIR", tmp.path());
 
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let policy = crate::PromotionGateConfig {
             enabled: true,
             // soak 已满由 `is_due` 的考试负责，这里考的是「取走并落账」。
@@ -812,7 +812,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("COGNEVA_DATA_DIR", tmp.path());
 
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let policy = crate::PromotionGateConfig {
             enabled: true,
             soak_secs: 600,
@@ -846,7 +846,7 @@ mod tests {
 
     #[tokio::test]
     async fn l1_change_auto_promotes_when_all_gates_pass() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -868,7 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn l0_change_goes_to_config_channel() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -888,7 +888,7 @@ mod tests {
 
     #[tokio::test]
     async fn core_path_waits_for_approval() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
@@ -939,7 +939,7 @@ mod tests {
     /// 晋级的变更永远算作待批。
     #[tokio::test]
     async fn approving_a_change_awaiting_approval_moves_that_row_out_of_awaiting() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -981,7 +981,7 @@ mod tests {
     /// 出去，但不能对集群里已经在跑的那个版本再开一场金丝雀。
     #[tokio::test]
     async fn approving_a_change_already_on_the_mainline_does_not_republish() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(LandedChannel {
             published: Mutex::new(Vec::new()),
             landed: vec![("already-landed".into(), "1fcf76a".into())],
@@ -1024,7 +1024,7 @@ mod tests {
     /// 能把它销账，而它的判据是实证：仓库说这个 id 已经在主线上。
     #[tokio::test]
     async fn a_landed_change_closes_its_awaiting_approval_row() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(LandedChannel {
             published: Mutex::new(Vec::new()),
             landed: vec![("landed-x".into(), "1fcf76a".into())],
@@ -1079,7 +1079,7 @@ mod tests {
     /// 断言里，因为被考的正是读 `updated_at` 的那段代码：让记录一出生就老两天，
     /// 才量得到同一条路径上的真实行为。
     struct BackdatedLedger {
-        inner: cog_storage::MemoryStateBackend,
+        inner: cog_test_support::MemoryStateBackend,
         age: Duration,
     }
 
@@ -1110,7 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_approval_is_decided_and_closed() {
         let ledger = Arc::new(BackdatedLedger {
-            inner: cog_storage::MemoryStateBackend::new(),
+            inner: cog_test_support::MemoryStateBackend::new(),
             age: Duration::days(2),
         });
         let policy = crate::PromotionGateConfig {
@@ -1151,7 +1151,7 @@ mod tests {
     /// 没到点的行一格都不能动：等待窗是窗，不是一个每轮重判的开关。
     #[tokio::test]
     async fn a_fresh_approval_is_left_waiting() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()
@@ -1174,7 +1174,7 @@ mod tests {
     #[tokio::test]
     async fn a_zero_window_does_not_close_anything() {
         let ledger = Arc::new(BackdatedLedger {
-            inner: cog_storage::MemoryStateBackend::new(),
+            inner: cog_test_support::MemoryStateBackend::new(),
             age: Duration::days(2),
         });
         let policy = crate::PromotionGateConfig {
@@ -1198,7 +1198,7 @@ mod tests {
     /// 「批一条还没进过晋级器的变更」堵死。
     #[tokio::test]
     async fn approving_a_change_with_no_ledger_row_appends_a_record() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1223,7 +1223,7 @@ mod tests {
 
     #[tokio::test]
     async fn paused_switch_downgrades_to_approval() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1245,7 +1245,7 @@ mod tests {
 
     #[tokio::test]
     async fn runtime_paused_switch_downgrades_to_approval() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1287,7 +1287,7 @@ mod tests {
     /// 第二次）。若有人把 is_paused() 检查加进 promote_approved，这条测试必须红。
     #[tokio::test]
     async fn a_paused_switch_gates_the_queue_but_not_the_human_approval() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1327,7 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn quota_exceeded_downgrades() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         // 预填 3 条 24h 内的 promoted 记录，打满默认配额。
         for i in 0..3 {
             ledger
@@ -1368,7 +1368,7 @@ mod tests {
 
     #[tokio::test]
     async fn breaker_trips_on_consecutive_rollbacks() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         for i in 0..2 {
             ledger
                 .record(PromotionRecord {
@@ -1399,7 +1399,7 @@ mod tests {
 
     #[tokio::test]
     async fn breaker_resets_after_success() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         for (i, status) in [
             PromotionStatus::RolledBack,
             PromotionStatus::RolledBack,
@@ -1435,7 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn publish_failure_marks_failed_and_feeds_breaker() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: true,
@@ -1503,7 +1503,7 @@ mod tests {
 
     #[tokio::test]
     async fn eval_rejected_change_never_promotes() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1538,7 +1538,7 @@ mod tests {
         // `Inconclusive` blocks exactly like `Reject`: a gate that cannot tell
         // "it got worse" from "it did not get better" must not let the change
         // through on the strength of the doubt.
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1566,7 +1566,7 @@ mod tests {
         // The other direction: an `Adopt` verdict is not a refusal, so the
         // change reaches the channel. This is the half that proves the gate
         // reads the verdict rather than refusing anything that carries one.
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1595,7 +1595,7 @@ mod tests {
         // 生产上没有任何东西给它写 `Some`（变更从盘上重建成 `None`），读它等于
         // 把「门从没跑」记成「门放行」。这条钉子钉住那个改动——把存量判词重新接
         // 回门里，这条必须红。
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1624,7 +1624,7 @@ mod tests {
     async fn a_change_with_no_eval_gate_wired_is_not_gated_on_eval() {
         // 求值器槽没填（没接线 / 还在启动）时门不测、也不拦。钉住这一点：一处接线
         // 未完成不该把整条晋升线停住——那是「门没测」，不是「全仓都回归了」。
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1644,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_change_not_promoted_twice() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1667,7 +1667,7 @@ mod tests {
         // 无所谓，门变成重跑之后它才是缺陷。
         //
         // 这条钉住那个顺序：把门挪回守卫之前，求值器会被调两次，`calls` 就变 2。
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(FakeChannel {
             published: Mutex::new(Vec::new()),
             fail: false,
@@ -1697,7 +1697,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_channel_downgrades_to_approval() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let policy = crate::PromotionGateConfig {
             enabled: true,
             ..Default::default()

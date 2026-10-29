@@ -3013,7 +3013,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
 
         // puller 拉。
         let pull_dir = tempfile::tempdir().unwrap();
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let puller = GitOpsPuller::new(
             GitOpsConfig {
                 repo_url: central.path().to_string_lossy().to_string(),
@@ -3054,7 +3054,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
         .await;
 
         let pull_dir = tempfile::tempdir().unwrap();
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let puller = GitOpsPuller::new(
             GitOpsConfig {
                 repo_url: central.path().to_string_lossy().to_string(),
@@ -3070,7 +3070,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
 
     #[tokio::test]
     async fn already_processed_is_idempotent() {
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let now = chrono::Utc::now();
         ledger
             .record(PromotionRecord {
@@ -3093,7 +3093,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
         // 不同集群不算处理过（各集群各自晋级）。
         let puller_c = GitOpsPuller::new(
             GitOpsConfig::default(),
-            Arc::new(cog_storage::MemoryStateBackend::new()),
+            Arc::new(cog_test_support::MemoryStateBackend::new()),
             "cluster-c".into(),
         );
         assert!(!puller_c.already_processed("p-1").await.unwrap());
@@ -3102,7 +3102,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
     fn test_puller() -> GitOpsPuller {
         GitOpsPuller::new(
             GitOpsConfig::default(),
-            Arc::new(cog_storage::MemoryStateBackend::new()),
+            Arc::new(cog_test_support::MemoryStateBackend::new()),
             "c".into(),
         )
     }
@@ -3117,14 +3117,14 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
     async fn a_failed_poll_leaves_a_failure_reading() {
         use cog_core::MetricsBackend as _;
         let tmp = tempfile::tempdir().unwrap();
-        let mb = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let mb = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let puller = GitOpsPuller::new(
             GitOpsConfig {
                 repo_url: tmp.path().join("no-such-bare-repo").display().to_string(),
                 work_dir: tmp.path().join("checkout").display().to_string(),
                 ..GitOpsConfig::default()
             },
-            Arc::new(cog_storage::MemoryStateBackend::new()),
+            Arc::new(cog_test_support::MemoryStateBackend::new()),
             "cluster-x".into(),
         )
         .with_metrics(Some(
@@ -3298,7 +3298,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
                 deployment: "cogneva".into(),
                 ..Default::default()
             },
-            Arc::new(cog_storage::MemoryStateBackend::new()),
+            Arc::new(cog_test_support::MemoryStateBackend::new()),
             "c".into(),
         );
 
@@ -3339,7 +3339,7 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
                 deployment: "cogneva".into(),
                 ..Default::default()
             },
-            Arc::new(cog_storage::MemoryStateBackend::new()),
+            Arc::new(cog_test_support::MemoryStateBackend::new()),
             "c".into(),
         );
         // 空名单（列举失败时也走这条）：唯一在跑的副本被当成候选而不是旧组，
@@ -4413,7 +4413,7 @@ spec:
                 work_dir: dir.path().to_string_lossy().into_owned(),
                 ..Default::default()
             },
-            Arc::new(cog_storage::MemoryStateBackend::new()),
+            Arc::new(cog_test_support::MemoryStateBackend::new()),
             "c".into(),
         );
         puller
@@ -4467,7 +4467,7 @@ spec:
                 work_dir: repo.to_string_lossy().into_owned(),
                 ..Default::default()
             },
-            Arc::new(cog_storage::MemoryStateBackend::new()),
+            Arc::new(cog_test_support::MemoryStateBackend::new()),
             "c".into(),
         );
 

@@ -4233,7 +4233,7 @@ mod tests {
     /// 终态双副本：两个 DagExecutor 共享一个支持细粒度 dag_* 的后端，
     /// 模拟双 pod —— 内存不再权威，所有读写直落共享存储。
     fn fg_pods() -> (DagExecutor, DagExecutor) {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         (
             DagExecutor::new("ws-fg".into()).with_state_backend(backend.clone()),
             DagExecutor::new("ws-fg".into()).with_state_backend(backend),
@@ -4312,7 +4312,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_store_path_refuses_an_id_reused_for_different_work() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let dag = DagExecutor::new("ws-reuse-fg".into()).with_state_backend(backend);
         dag.add_tasks_batch(vec![Task::new(
             "t1",
@@ -4449,7 +4449,7 @@ mod tests {
     /// the backend rather than of memory — the path every pod actually takes.
     #[tokio::test]
     async fn the_store_path_promotes_a_pre_placed_row_too() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let dag = DagExecutor::new("ws-promote-fg".into()).with_state_backend(backend);
         dag.add_tasks_batch(vec![Task::new(
             "goal-2",
@@ -4852,7 +4852,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_terminate_stale_orphan_in_store_mode() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let dag = DagExecutor::new("ws-orphan-fg".into()).with_state_backend(backend);
         let stale = chrono::Utc::now() - chrono::Duration::minutes(60);
         dag.add_task(placeholder("sig-alert-store", stale))
@@ -4983,7 +4983,7 @@ mod tests {
     /// 存储模式走的是 `dag_cancel_task` 那一笔条件写，reason 也必须落进去。
     #[tokio::test]
     async fn the_store_path_cancels_an_unblockable_dependent_with_the_reason() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let dag = DagExecutor::new("ws-unblockable-fg".into()).with_state_backend(backend);
         dag.add_task(Task::new("pre", TaskType::DagNode, serde_json::json!({})))
             .await
@@ -5295,7 +5295,7 @@ mod tests {
     /// 退避在过界时丢掉的那种实现。
     #[tokio::test]
     async fn store_mode_holds_off_a_transient_retry_too() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let dag = DagExecutor::new("ws-backoff-fg".into()).with_state_backend(backend);
         let task = Task::new("t-backoff-fg", TaskType::DagNode, serde_json::json!({}));
         let task_id = task.id.clone();
@@ -5368,7 +5368,7 @@ mod tests {
             "上游说的 300s 没有盖过 5s 的策略退避: {due}"
         );
 
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let stored = DagExecutor::new("ws-stated-fg".into()).with_state_backend(backend);
         let task = Task::new("t-stated-fg", TaskType::DagNode, serde_json::json!({}));
         let task_id = task.id.clone();
@@ -5484,7 +5484,7 @@ mod tests {
     /// 判定与重新投递不是同一个进程，只测内存路径会漏掉另一条。
     #[tokio::test]
     async fn store_mode_also_lets_the_environment_pay() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let dag = DagExecutor::new("ws-outage-fg".into()).with_state_backend(backend);
         let task = Task::new("t-outage-fg", TaskType::DagNode, serde_json::json!({}));
         let task_id = task.id.clone();
@@ -5693,7 +5693,7 @@ mod tests {
     /// 存储模式走的是另一条实现，判据必须一样：换了持有者不记账，任务回到队列。
     #[tokio::test]
     async fn a_store_claim_whose_owner_is_replaced_keeps_its_budget() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let dag = DagExecutor::new("ws-lease-nc-fg".into())
             .with_state_backend(backend.clone())
             .with_task_lease_secs(60);
@@ -5822,7 +5822,7 @@ mod tests {
     /// 不在任何一个进程的内存里。
     #[tokio::test]
     async fn a_lease_expired_store_claim_is_reclaimed() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let dag = DagExecutor::new("ws-lease-fg".into())
             .with_state_backend(backend.clone())
             .with_task_lease_secs(60);
@@ -5857,7 +5857,7 @@ mod tests {
     /// 续期，否则我的进程死了，它手里的租约被旁观者一直续着，永远不会被回收。
     #[tokio::test]
     async fn a_peer_process_cannot_renew_my_store_claim() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let pod_a = DagExecutor::new("ws-lease-renew-fg".into())
             .with_state_backend(backend.clone())
             .with_task_lease_secs(60);
@@ -6317,7 +6317,7 @@ mod tests {
     /// 迁移上，只有一个能落，另一个不会把已经在路上的那一笔第二次挪走。
     #[tokio::test]
     async fn a_shared_store_re_arms_a_stalled_task_once_for_the_whole_cluster() {
-        let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::MemoryStateBackend::new());
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
         let pod_a = DagExecutor::new("ws-stalled-fg".into()).with_state_backend(backend.clone());
         let pod_b = DagExecutor::new("ws-stalled-fg".into()).with_state_backend(backend);
 
@@ -6356,7 +6356,7 @@ mod tests {
     async fn the_producer_publishes_its_outcome_vocabulary_before_any_work_arrives() {
         use std::collections::BTreeSet;
 
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let executor = DagExecutor::new("ws-vocabulary".to_string());
         executor.attach_metrics(metrics.clone());
 

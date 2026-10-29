@@ -14,3 +14,7 @@ sqlx = { workspace = true }
 cog-core = { workspace = true }
 serde_json = { workspace = true }
 async-trait = "0.1"
+# 内存替身用的运行时原语：广播通道（消息）、时钟（样本时间戳）、流拼接。
+tokio = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }

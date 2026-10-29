@@ -1383,7 +1383,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cog-core",
- "cog-stream",
+ "cog-test-support",
  "dom_smoothie",
  "futures",
  "hex",
@@ -1583,7 +1583,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cog-core",
- "cog-storage",
+ "cog-test-support",
  "hex",
  "hmac 0.12.1",
  "jsonwebtoken 9.3.1",
@@ -1652,7 +1652,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cog-core",
- "cog-stream",
  "cog-test-support",
  "fastembed",
  "futures",
@@ -1741,7 +1740,7 @@ dependencies = [
  "blake3",
  "chrono",
  "cog-core",
- "cog-storage",
+ "cog-test-support",
  "futures",
  "schemars",
  "serde",
@@ -1831,8 +1830,7 @@ dependencies = [
  "blake3",
  "chrono",
  "cog-core",
- "cog-prompt",
- "cog-storage",
+ "cog-test-support",
  "libc",
  "schemars",
  "serde",
@@ -1944,9 +1942,12 @@ name = "cog-test-support"
 version = "0.5.10"
 dependencies = [
  "async-trait",
+ "chrono",
  "cog-core",
+ "futures",
  "serde_json",
  "sqlx",
+ "tokio",
 ]
 
 [[package]]

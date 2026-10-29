@@ -5603,7 +5603,7 @@ index 1111111..2222222 100644
             .await
             .unwrap();
 
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let pipeline =
             ChangePipeline::new(root.path(), root.path(), true).with_metrics(metrics.clone());
         let name = cog_core::metric_names::CHANGE_TIER_TOTAL.as_str();
@@ -5670,7 +5670,7 @@ index 1111111..2222222 100644\n\
         use cog_core::MetricsBackend;
 
         let root = tempfile::tempdir().unwrap();
-        let metrics = std::sync::Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let pipeline =
             ChangePipeline::new(root.path(), root.path(), true).with_metrics(metrics.clone());
         let name = cog_core::metric_names::PROJECT_KIND_TOTAL.as_str();

@@ -1611,7 +1611,7 @@ mod inbox_reply_tests {
     #[tokio::test]
     async fn a_prompt_reply_lands_on_the_stream_the_sender_named() {
         let backend: Arc<dyn cog_core::MessageBackend> =
-            Arc::new(cog_stream::MemoryMessageBackend::new());
+            Arc::new(cog_test_support::MemoryMessageBackend::new());
         backend
             .create_consumer_group("replies", "caller")
             .await

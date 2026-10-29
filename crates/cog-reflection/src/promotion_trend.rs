@@ -880,7 +880,7 @@ mod tests {
         // `query_gauge_latest` is a trait method: the reading side is the
         // `MetricsBackend` interface, not an inherent method of the test double.
         use cog_core::MetricsBackend as _;
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let reporter = PromotionTrendReporter::new(
             Arc::new(FixedLedger(vec![
                 rec(0, PromotionStatus::Promoted),

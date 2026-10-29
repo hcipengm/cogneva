@@ -1419,7 +1419,7 @@ mod tests {
 
         // 那一行由真实生产者写出来。手搭一行只能证明形状对，证明不了这条路
         // 真的会在跑起来时落到那一格。
-        let ledger = Arc::new(cog_storage::MemoryStateBackend::new());
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let channel = Arc::new(RecordingChannel::default());
         let promoter = Arc::new(crate::AutoPromoter::new(
             crate::PromotionGateConfig {

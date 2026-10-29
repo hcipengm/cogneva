@@ -611,7 +611,7 @@ mod tests {
     async fn every_round_lands_in_exactly_one_cell() {
         let tmp = tempfile::tempdir().unwrap();
         let evolution = Arc::new(ArtifactEvolution::new(crate::PolicyStore::new(tmp.path())));
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let d = PolicyEvolutionDriver::new(
             PolicyEvolutionConfig::default(),
             engine_with(&[("pipeline", 40, 20)]).await,

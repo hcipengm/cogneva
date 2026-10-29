@@ -96,18 +96,18 @@ const ALLOWED: &[Row] = &[
 
 /// The same, for dependencies only tests link.
 const ALLOWED_DEV: &[Row] = &[
-    ("cog-agent", "cog-stream", ""),
-    ("cog-github", "cog-storage", ""),
-    ("cog-memory", "cog-stream", ""),
-    // Fixture support: four crates' `tests/` need the same facts (which
-    // PostgreSQL, and whether an unset one stops or skips). Nothing shipped
-    // links it, so the edges are dev-only; keeping the rule inside one crate's
-    // `tests/common` just means the other three write it again.
+    // Fixture support: the in-memory backends and the "which PostgreSQL, and
+    // does an unset one stop or skip" reading. Nothing shipped links this
+    // crate, so the edges are dev-only. They point at core contracts rather
+    // than at the crate that ships a backend: a double owned by a production
+    // crate turns another crate's test red when that crate changes its rules,
+    // and the failure is reported where nothing about it was being tested.
+    ("cog-agent", "cog-test-support", ""),
+    ("cog-github", "cog-test-support", ""),
     ("cog-memory", "cog-test-support", ""),
+    ("cog-orchestrator", "cog-test-support", ""),
+    ("cog-reflection", "cog-test-support", ""),
     ("cog-observability", "cog-test-support", ""),
-    ("cog-orchestrator", "cog-storage", ""),
-    ("cog-reflection", "cog-prompt", ""),
-    ("cog-reflection", "cog-storage", ""),
     ("cog-storage", "cog-test-support", ""),
     ("cog-stream", "cog-test-support", ""),
     ("cogneva", "cog-test-support", ""),

@@ -2347,7 +2347,7 @@ mod tests {
     async fn bus_events_are_archived_and_extracted() {
         const EVENTS: usize = 4;
         let backend = Arc::new(MemoryMemoryBackend::new());
-        let bus = Arc::new(cog_stream::MemoryMessageBackend::new());
+        let bus = Arc::new(cog_test_support::MemoryMessageBackend::new());
         let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
         let _handle = ingestor.spawn_bus(bus.clone(), "cogneva-events");
         // 等订阅建立再发布，排除"发布早于订阅"的竞态（真实后端靠持久流
@@ -2383,7 +2383,7 @@ mod tests {
     #[tokio::test]
     async fn bus_redelivery_is_idempotent() {
         let backend = Arc::new(MemoryMemoryBackend::new());
-        let bus = Arc::new(cog_stream::MemoryMessageBackend::new());
+        let bus = Arc::new(cog_test_support::MemoryMessageBackend::new());
         let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
         let _handle = ingestor.spawn_bus(bus.clone(), "cogneva-events");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2422,7 +2422,7 @@ mod tests {
     #[tokio::test]
     async fn bus_poison_and_foreign_events_do_not_block() {
         let backend = Arc::new(MemoryMemoryBackend::new());
-        let bus = Arc::new(cog_stream::MemoryMessageBackend::new());
+        let bus = Arc::new(cog_test_support::MemoryMessageBackend::new());
         let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()));
         let _handle = ingestor.spawn_bus(bus.clone(), "cogneva-events");
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2958,13 +2958,13 @@ mod tests {
     /// 认领失败在生产里没有活的样本（Redis Streams 那一支的错误路径从没被读到
     /// 过），要证明这一支真的会各自落一格，只能把假总线摆出来逼它发生。
     struct ClaimFailingBus {
-        inner: cog_stream::MemoryMessageBackend,
+        inner: cog_test_support::MemoryMessageBackend,
     }
 
     impl ClaimFailingBus {
         fn new() -> Self {
             Self {
-                inner: cog_stream::MemoryMessageBackend::new(),
+                inner: cog_test_support::MemoryMessageBackend::new(),
             }
         }
     }
@@ -3124,7 +3124,7 @@ mod tests {
         });
 
         let _handle = ingestor.spawn_bus(
-            Arc::new(cog_stream::MemoryMessageBackend::new()),
+            Arc::new(cog_test_support::MemoryMessageBackend::new()),
             "cogneva-events",
         );
 
@@ -3173,7 +3173,7 @@ mod tests {
         });
 
         let _handle = ingestor.spawn_bus(
-            Arc::new(cog_stream::MemoryMessageBackend::new()),
+            Arc::new(cog_test_support::MemoryMessageBackend::new()),
             "cogneva-events",
         );
 
@@ -4440,7 +4440,7 @@ mod tests {
     #[tokio::test]
     async fn a_benchmark_event_on_the_bus_never_reaches_a_memory_layer() {
         let backend = Arc::new(MemoryMemoryBackend::new());
-        let bus = Arc::new(cog_stream::MemoryMessageBackend::new());
+        let bus = Arc::new(cog_test_support::MemoryMessageBackend::new());
         let metrics = Arc::new(RecordingMetrics::default());
         let ingestor = MemoryIngestor::new(backend.clone(), Arc::new(RuleBasedExtractor::new()))
             .with_metrics(metrics.clone())

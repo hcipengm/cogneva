@@ -10327,7 +10327,7 @@ mod tests {
             .iter()
             .map(|row| dispatch_task_id(&row.identity, 0))
             .collect();
-        let events = Arc::new(cog_storage::MemoryStateBackend::new());
+        let events = Arc::new(cog_test_support::MemoryStateBackend::new());
         events
             .append_event(
                 &ids[0],
@@ -10347,7 +10347,8 @@ mod tests {
             rows,
             ..Default::default()
         });
-        let metrics: Arc<dyn MetricsBackend> = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics: Arc<dyn MetricsBackend> =
+            Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let shutdown = ShutdownSignal::new();
 
         spawn_change_ledger_loop(
@@ -10463,7 +10464,7 @@ mod tests {
             ..Default::default()
         };
         let graph: Arc<dyn OrchestratorControl> = Arc::new(FakeGraph::default());
-        let events = cog_storage::MemoryStateBackend::new();
+        let events = cog_test_support::MemoryStateBackend::new();
         events
             .append_event(
                 &dispatch_task_id(&store.rows[0].identity, 0),
@@ -10482,7 +10483,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let metrics: Arc<dyn MetricsBackend> = metrics.clone();
 
         dispatch_pass(
@@ -10576,7 +10577,7 @@ mod tests {
     #[tokio::test]
     async fn a_changes_product_is_read_back_from_the_id_its_identity_fixes() {
         let identity = ChangeIdentity::new("grep", "crates/a", "fn thing");
-        let events = cog_storage::MemoryStateBackend::new();
+        let events = cog_test_support::MemoryStateBackend::new();
         events
             .append_event(
                 &dispatch_task_id(&identity, 0),
@@ -10615,7 +10616,7 @@ mod tests {
     #[tokio::test]
     async fn a_handover_that_recorded_no_artifact_is_not_one_whose_events_are_gone() {
         let identity = ChangeIdentity::new("grep", "crates/a", "fn thing");
-        let events = cog_storage::MemoryStateBackend::new();
+        let events = cog_test_support::MemoryStateBackend::new();
         events
             .append_event(
                 &dispatch_task_id(&identity, 0),
@@ -10659,7 +10660,7 @@ mod tests {
     #[tokio::test]
     async fn the_roundtables_own_shape_is_read_and_named_as_where_it_came_from() {
         let identity = ChangeIdentity::new("grep", "crates/a", "fn thing");
-        let events = cog_storage::MemoryStateBackend::new();
+        let events = cog_test_support::MemoryStateBackend::new();
         let mut event = handover_event(serde_json::json!([{
             "name": CRITERION_ARTIFACT_NAME,
             "content": "diff --git a/round-2 b/round-2\n",
@@ -10703,7 +10704,7 @@ mod tests {
     #[tokio::test]
     async fn a_deliverable_past_the_first_page_is_still_found() {
         let identity = ChangeIdentity::new("grep", "crates/a", "fn thing");
-        let events = cog_storage::MemoryStateBackend::new();
+        let events = cog_test_support::MemoryStateBackend::new();
         let task_id = dispatch_task_id(&identity, 0);
         for _ in 0..HANDOVER_EVENTS_PER_PAGE {
             events
@@ -10793,7 +10794,7 @@ mod tests {
             products: 6,
             unreadable: 1,
         };
-        let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let metrics: Arc<dyn MetricsBackend> = metrics.clone();
         // The account's own counts, as its census and its band count would
         // answer them. The two partitions are of the same set, and that set is
@@ -11059,7 +11060,8 @@ mod tests {
             sources_unread: Some(String::new()),
             window_pace: None,
         };
-        let metrics: Arc<dyn MetricsBackend> = Arc::new(cog_storage::MemoryMetricsBackend::new());
+        let metrics: Arc<dyn MetricsBackend> =
+            Arc::new(cog_test_support::MemoryMetricsBackend::new());
         publish_dispatch_rows(Some(&metrics), &state, None, None, None, None).await;
 
         let end = Utc::now() + chrono::Duration::seconds(1);
