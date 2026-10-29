@@ -2837,11 +2837,16 @@ pub const RANGE_READ_BASELINES: &[(&str, RangeReadBaseline)] = &[
             readers: &[
                 "llm_context_per_call_above_its_own_week",
                 "llm_cached_tokens_exceed_input",
+                "llm_cache_hit_share_collapsed",
             ],
-            reason: "格子带 actor，理由与 llm_calls_total 同一条。两条读者都把这个族与另一个计数相减或\
-                     相除：某一侧看不见的第一个增量，在一小时窗口的和里至多值一次调用，而两条都是 warning。\
+            reason: "格子带 actor，理由与 llm_calls_total 同一条。三条读者都把这个族与另一个计数相减或\
+                     相除：某一侧看不见的第一个增量，在一小时窗口的和里至多值一次调用，而三条都是 warning。\
                      缓存的那些格子（kind=cached）由 `llm_cached_tokens_exceed_input` 读，它的判词是\
-                     「缓存数超过输入数」这种按构造不可能的事，方向不靠第一个增量。",
+                     「缓存数超过输入数」这种按构造不可能的事，方向不靠第一个增量。\
+                     `llm_cache_hit_share_collapsed` 读的是 cached/(input+cached) 这个比例，且只在\
+                     该 actor 一小时里走过 20 万 prompt token 以上时才判：少掉的那一次调用同时落在分子\
+                     与分母的同一个量级之外，挪不动它跨过 0.15 那条线，所以它看不见第一个增量也不会把\
+                     判词读反。",
         },
     ),
 ];

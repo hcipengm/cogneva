@@ -27,6 +27,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod common;
+
+use common::release_after;
+
 /// A marker only this run produces, so the tables below cannot collide with a
 /// concurrent run of the same file or with rows another test left behind.
 fn marker() -> String {
@@ -90,14 +94,6 @@ fn hold_a_reader(
         sqlx::query("ROLLBACK").execute(&mut *conn).await.ok();
     });
     (handle, took_it)
-}
-
-/// Raise `stop` after `after`, so a held reader can be given a lifespan.
-fn release_after(stop: Arc<AtomicBool>, after: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(after).await;
-        stop.store(true, Ordering::SeqCst);
-    });
 }
 
 /// The worst single-read latency seen while `until` is raised.

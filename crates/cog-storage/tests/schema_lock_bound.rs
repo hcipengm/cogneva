@@ -43,6 +43,10 @@ use cog_storage::schema_ddl::PgSchemaRunner;
 
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
 
+mod common;
+
+use common::release_after;
+
 /// The table the probe writes into, and the index the sweep creates over it.
 ///
 /// A table plus an index in one text, which is the shape every store's schema
@@ -98,13 +102,6 @@ fn hold_a_writer(
         sqlx::query("ROLLBACK").execute(&mut *conn).await.ok();
     });
     (handle, took_it)
-}
-
-fn release_after(stop: Arc<AtomicBool>, after: Duration) {
-    tokio::spawn(async move {
-        tokio::time::sleep(after).await;
-        stop.store(true, Ordering::SeqCst);
-    });
 }
 
 /// A store whose schema cannot get its locks has to end and say which table,

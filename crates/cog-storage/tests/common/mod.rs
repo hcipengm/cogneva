@@ -12,6 +12,24 @@
 //! be editing, and every copy stayed green.
 
 use sqlx::PgPool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Raise `stop` after `after`, so a held reader can be given a lifespan.
+///
+/// Both suites that hold a lock open need the same end: a reader that never
+/// lets go turns a case that should fail into one that never returns, and a
+/// case that never returns reports nothing. The two copies this replaces
+/// differed by a doc comment, which is exactly the shape the shared-steps gate
+/// is for -- the day one of them learned to hold across a statement boundary,
+/// the other would still have been testing the old rule.
+pub fn release_after(stop: Arc<AtomicBool>, after: Duration) {
+    tokio::spawn(async move {
+        tokio::time::sleep(after).await;
+        stop.store(true, Ordering::SeqCst);
+    });
+}
 
 /// Apply this crate's migrations to `url`, one caller at a time.
 ///
