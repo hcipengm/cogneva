@@ -72,7 +72,11 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         pace: None,
     };
 
-    store.init_schema().await.expect("init the schema");
+    let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+    store
+        .init_schema(&schema_runner)
+        .await
+        .expect("init the schema");
 
     // First face: a call that the upstream served partly from cache reaches the
     // ledger with the cache split intact. Folding it into `tokens_input` would
@@ -125,7 +129,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     .await
     .expect("drop the columns to reproduce the pre-migration table");
     store
-        .init_schema()
+        .init_schema(&schema_runner)
         .await
         .expect("re-init against a table without the columns");
 

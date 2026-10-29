@@ -32,13 +32,17 @@ use cog_test_support::database_url;
 /// DDL mutually exclusive: the second test waits for the first instead of
 /// colliding with it.
 async fn init_schema_once(store: &LlmUsageStore, pool: &PgPool) {
+    let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
     let mut conn = pool.acquire().await.expect("acquire the schema lock");
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(90_565_001i64)
         .execute(&mut *conn)
         .await
         .expect("take the schema lock");
-    store.init_schema().await.expect("init the schema");
+    store
+        .init_schema(&schema_runner)
+        .await
+        .expect("init the schema");
     sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(90_565_001i64)
         .execute(&mut *conn)

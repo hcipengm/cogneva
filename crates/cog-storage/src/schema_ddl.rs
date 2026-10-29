@@ -42,6 +42,40 @@ use cog_core::{SFError, SFResult};
 use sqlx::PgPool;
 use std::time::Duration;
 
+/// The runner a store outside this crate is handed instead of a pool.
+///
+/// A store owns its statements; how an attempt bounds its lock wait and how a
+/// blocked start explains itself are properties of the database, not of the
+/// store, so they live here and reach the store as a contract. The store asks
+/// for [`cog_core::SchemaRunner`], the assembly root hands over this, and the
+/// crate that keeps the statements never learns which driver runs them.
+pub struct PgSchemaRunner {
+    pool: PgPool,
+}
+
+impl PgSchemaRunner {
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// A runner with a pool of its own, for a process that starts a store
+    /// before -- or outside -- the assembly.
+    ///
+    /// The pool is for schema text only: it is created on demand and never
+    /// handed out, so the caller is not adding a second serving path to the
+    /// same database.
+    pub async fn connect(database_url: &str) -> Result<Self, sqlx::Error> {
+        Ok(Self::new(PgPool::connect(database_url).await?))
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::SchemaRunner for PgSchemaRunner {
+    async fn apply_schema(&self, ddl: &str) -> SFResult<()> {
+        apply(&self.pool, ddl).await
+    }
+}
+
 /// How long one attempt may wait for a lock before giving the locks back.
 ///
 /// Short enough that a replica still serving the table is never queued behind

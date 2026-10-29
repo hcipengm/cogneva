@@ -65,8 +65,9 @@ async fn the_mark_lands_and_a_new_episode_clears_it() {
     .await
     .expect("the legacy alert table is created");
     let store = PostgresAlertStore::new(pool.clone());
+    let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
     store
-        .init_schema()
+        .init_schema(&schema_runner)
         .await
         .expect("the alert DDL runs in one piece");
 

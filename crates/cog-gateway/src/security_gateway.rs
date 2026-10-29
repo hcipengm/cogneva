@@ -2837,16 +2837,11 @@ pub const RANGE_READ_BASELINES: &[(&str, RangeReadBaseline)] = &[
             readers: &[
                 "llm_context_per_call_above_its_own_week",
                 "llm_cached_tokens_exceed_input",
-                "llm_cache_hit_share_collapsed",
             ],
-            reason: "格子带 actor，理由与 llm_calls_total 同一条。三条读者都把这个族与另一个计数相减或\
-                     相除：某一侧看不见的第一个增量，在一小时窗口的和里至多值一次调用，而三条都是 warning。\
+            reason: "格子带 actor，理由与 llm_calls_total 同一条。两条读者都把这个族与另一个计数相减或\
+                     相除：某一侧看不见的第一个增量，在一小时窗口的和里至多值一次调用，而两条都是 warning。\
                      缓存的那些格子（kind=cached）由 `llm_cached_tokens_exceed_input` 读，它的判词是\
-                     「缓存数超过输入数」这种按构造不可能的事，方向不靠第一个增量。\
-                     `llm_cache_hit_share_collapsed` 读的是 cached/(input+cached) 这个比例，且只在\
-                     该 actor 一小时里走过 20 万 prompt token 以上时才判：少掉的那一次调用同时落在分子\
-                     与分母的同一个量级之外，挪不动它跨过 0.15 那条线，所以它看不见第一个增量也不会把\
-                     判词读反。",
+                     「缓存数超过输入数」这种按构造不可能的事，方向不靠第一个增量。",
         },
     ),
 ];
@@ -8468,20 +8463,30 @@ async fn build_pool_observability(
         None
     };
 
+    // The schema text a store owns runs through the runner the storage crate
+    // keeps, not through the store: bounding the lock wait is a property of the
+    // database, and this process starts these stores outside the assembly that
+    // would have published one.
     let alerts = match config.database_url.as_deref() {
-        Some(url) => match PostgresAlertStore::connect(url).await {
-            Ok(store) => match store.init_schema().await {
-                Ok(()) => {
-                    tracing::info!("告警状态机已落 PostgreSQL");
-                    Some(Arc::new(store))
-                }
+        Some(url) => match cog_storage::schema_ddl::PgSchemaRunner::connect(url).await {
+            Ok(schema_runner) => match PostgresAlertStore::connect(url).await {
+                Ok(store) => match store.init_schema(&schema_runner).await {
+                    Ok(()) => {
+                        tracing::info!("告警状态机已落 PostgreSQL");
+                        Some(Arc::new(store))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "alerts 建表失败，告警落库降级为关闭");
+                        None
+                    }
+                },
                 Err(e) => {
-                    tracing::warn!(error = %e, "alerts 建表失败，告警落库降级为关闭");
+                    tracing::warn!(error = %e, "PostgreSQL 连接失败，告警落库降级为关闭");
                     None
                 }
             },
             Err(e) => {
-                tracing::warn!(error = %e, "PostgreSQL 连接失败，告警落库降级为关闭");
+                tracing::warn!(error = %e, "schema runner 连接失败，告警落库降级为关闭");
                 None
             }
         },
@@ -8489,25 +8494,31 @@ async fn build_pool_observability(
     };
 
     let usage = match config.database_url.as_deref() {
-        Some(url) => match LlmUsageStore::connect(url).await {
-            Ok(store) => match store.init_schema().await {
-                Ok(()) => {
-                    tracing::info!("LLM token 计量明细已落 PostgreSQL");
-                    // 留底表（含正文）的保留期不在这里管：它由主应用里的
-                    // `observability_exchange_retention` 循环按同一个库定期清，
-                    // 并且把"最老一行多老 / 保留期是多少 / 占多少字节"发布成读数。
-                    // 放在启动时清一次等于把"一行能活多久"绑在网关的滚动频率上——
-                    // 那是关于部署习惯的假设，不是这张表能陈述的边界；滚动比保留期
-                    // 稀时的后果（表长成库里最大的一张）也没有任何读数会说出来。
-                    Some(Arc::new(store))
-                }
+        Some(url) => match cog_storage::schema_ddl::PgSchemaRunner::connect(url).await {
+            Ok(schema_runner) => match LlmUsageStore::connect(url).await {
+                Ok(store) => match store.init_schema(&schema_runner).await {
+                    Ok(()) => {
+                        tracing::info!("LLM token 计量明细已落 PostgreSQL");
+                        // 留底表（含正文）的保留期不在这里管：它由主应用里的
+                        // `observability_exchange_retention` 循环按同一个库定期清，
+                        // 并且把"最老一行多老 / 保留期是多少 / 占多少字节"发布成读数。
+                        // 放在启动时清一次等于把"一行能活多久"绑在网关的滚动频率上——
+                        // 那是关于部署习惯的假设，不是这张表能陈述的边界；滚动比保留期
+                        // 稀时的后果（表长成库里最大的一张）也没有任何读数会说出来。
+                        Some(Arc::new(store))
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "gateway_llm_usage 建表失败，计量明细降级为关闭");
+                        None
+                    }
+                },
                 Err(e) => {
-                    tracing::warn!(error = %e, "gateway_llm_usage 建表失败，计量明细降级为关闭");
+                    tracing::warn!(error = %e, "PostgreSQL 连接失败，计量明细降级为关闭");
                     None
                 }
             },
             Err(e) => {
-                tracing::warn!(error = %e, "PostgreSQL 连接失败，计量明细降级为关闭");
+                tracing::warn!(error = %e, "schema runner 连接失败，计量明细降级为关闭");
                 None
             }
         },

@@ -56,7 +56,11 @@ async fn a_row_naming_a_run_is_no_more_traceable_than_a_row_naming_nothing() {
     let store = LlmUsageStore::connect(&url)
         .await
         .expect("connect the store");
-    store.init_schema().await.expect("create the ledger schema");
+    let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+    store
+        .init_schema(&schema_runner)
+        .await
+        .expect("create the ledger schema");
     // 这个方法问的正是「账上这个 id 是不是一件活」，所以图的那张表必须在，
     // 而且只需这两列：它被当成名单读，不当成任务读。
     sqlx::query(

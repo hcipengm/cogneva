@@ -2741,8 +2741,9 @@ mod tests {
         let schema = cog_test_support::own_schema(&url, "alert_adopt").await;
         let pool = cog_test_support::schema_pool(&url, &schema).await;
         let store = PostgresAlertStore::new(pool.clone());
+        let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
         store
-            .init_schema()
+            .init_schema(&schema_runner)
             .await
             .expect("the alert DDL runs in one piece");
 

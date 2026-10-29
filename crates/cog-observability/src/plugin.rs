@@ -363,6 +363,30 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // snapshots taken during startup are all there by the time anyone asks.
         ctx.publish_observable(Arc::new(crate::boot_footprint::BootFootprintObservable));
 
+        // ── How the stores' schema text is run ──
+        // Every store below owns its statements and creates its tables at
+        // startup, but none of them owns how an attempt bounds its lock wait:
+        // that is a property of the database and reaches them as a contract
+        // the storage plugin publishes. A store that reached for a database
+        // crate to get it would be a store that cannot be built, tested or
+        // reused without that crate's whole driver stack.
+        //
+        // A missing runner is not an error of this plugin's own making, and it
+        // needs no branch of its own: the fallback answers every call with the
+        // reason, which puts each store on the degrade-and-warn path a failed
+        // attempt already takes.
+        let schema_runner: Arc<dyn cog_core::SchemaRunner> =
+            match ctx.consume_service::<dyn cog_core::SchemaRunner>() {
+                Some(runner) => runner,
+                None => {
+                    warn!(
+                        "no schema runner published (the storage plugin binds none without a \
+                         database); the stores below will report that their schema did not run"
+                    );
+                    Arc::new(NoSchemaRunner)
+                }
+            };
+
         // ── Host producers that feed the platform's accounts ──
         // The row is written by the producer on the host, once per successful
         // cycle whether or not that cycle had anything new to queue; the intake
@@ -375,7 +399,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => {
                 match crate::producer_heartbeat::ProducerHeartbeatStore::connect(&url).await {
-                    Ok(store) => match store.init_schema().await {
+                    Ok(store) => match store.init_schema(schema_runner.as_ref()).await {
                         Ok(()) => {
                             ctx.publish_observable(Arc::new(
                                 crate::producer_heartbeat::ProducerHeartbeatObservable::new(store),
@@ -401,7 +425,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // before start_all, and self-discovery consumes it in start.
         self.alert_store = match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => match PostgresAlertStore::connect(&url).await {
-                Ok(store) => match store.init_schema().await {
+                Ok(store) => match store.init_schema(schema_runner.as_ref()).await {
                     Ok(()) => {
                         info!("alert state machine persisted to PostgreSQL");
                         let store = Arc::new(store);
@@ -435,7 +459,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         // makes the two creators agree rather than race.
         self.usage_store = match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => match LlmUsageStore::connect(&url).await {
-                Ok(store) => match store.init_schema().await {
+                Ok(store) => match store.init_schema(schema_runner.as_ref()).await {
                     Ok(()) => {
                         info!("LLM usage ledger reachable; window rollup armed");
                         Some(Arc::new(store))
@@ -480,7 +504,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         self.skip_store = match std::env::var(cog_core::env::DATABASE_URL) {
             Ok(url) if !url.trim().is_empty() => {
                 match crate::skip_store::LlmSkipStore::connect(&url).await {
-                    Ok(store) => match store.init_schema().await {
+                    Ok(store) => match store.init_schema(schema_runner.as_ref()).await {
                         Ok(()) => {
                             info!("saved-call ledger reachable");
                             Some(Arc::new(store))
@@ -523,7 +547,7 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                     )
                     .await
                     {
-                        Ok(store) => match store.init_schema().await {
+                        Ok(store) => match store.init_schema(schema_runner.as_ref()).await {
                             Ok(()) => {
                                 info!("spend verdict projection armed");
                                 self.verdict_store = Some(Arc::new(store));
@@ -1791,6 +1815,26 @@ async fn persist_alerts(store: &dyn AlertRowStore, alerts: &[AlertEvent]) -> boo
 
 /// Wrapper so [`crate::LogFilterHandle`] can be stored in [`cog_core::PluginContext`].
 pub struct LogFilterHandleHolder(pub crate::LogFilterHandle);
+
+/// What every store here is handed when no runner was published.
+///
+/// Not a no-op: a schema that silently did not run leaves a table missing, and
+/// a missing table is indistinguishable from a store with nothing to say. Each
+/// call therefore comes back as a named failure, so the caller's warning names
+/// the seam that is missing instead of reporting the symptom twenty lines
+/// later.
+struct NoSchemaRunner;
+
+#[async_trait::async_trait]
+impl cog_core::SchemaRunner for NoSchemaRunner {
+    async fn apply_schema(&self, _ddl: &str) -> cog_core::SFResult<()> {
+        Err(cog_core::SFError::Config(
+            "no cog_core::SchemaRunner was published; a store's schema text has no way to run, \
+             and a table that was never created reads as a store with nothing to say"
+                .into(),
+        ))
+    }
+}
 
 /// Static descriptor for auto-discovery.
 pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {

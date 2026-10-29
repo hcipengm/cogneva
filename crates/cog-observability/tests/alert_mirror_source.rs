@@ -53,8 +53,9 @@ async fn only_the_firing_rows_of_the_named_source_are_returned() {
 
     let pool = schema_pool(&url, &schema).await;
     let store = PostgresAlertStore::new(pool.clone());
+    let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
     store
-        .init_schema()
+        .init_schema(&schema_runner)
         .await
         .expect("the alert DDL runs in one piece");
 

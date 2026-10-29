@@ -266,8 +266,9 @@ impl PostgresAlertStore {
         Ok(Self::new(pool))
     }
 
-    pub async fn init_schema(&self) -> anyhow::Result<()> {
-        cog_storage::schema_ddl::apply(&self.pool, &ddl())
+    pub async fn init_schema(&self, schema: &dyn cog_core::SchemaRunner) -> anyhow::Result<()> {
+        schema
+            .apply_schema(&ddl())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())
@@ -751,6 +752,56 @@ impl cog_core::PersistentAlertSink for PostgresAlertStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 建表语句交给的是调用方递进来的那个 runner。
+    ///
+    /// 这个 crate 曾经自己连库、自己调存储层的执行器：那条依赖让「按什么方式跑建表
+    /// 语句」和「跑在哪个后端上」绑在一起，于是这个 store 只能在链着那个驱动栈的
+    /// 进程里存在。缝换成参数之后，编译通过只证明「有人可以递进来」——不证明它真被
+    /// 用了：把参数丢掉、另找一条路跑，签名照样对。所以这里递一个只记账的 runner，
+    /// 读它收到了什么。
+    #[tokio::test]
+    async fn the_schema_text_runs_through_the_runner_it_is_handed() {
+        use std::sync::Mutex;
+
+        struct Recorder {
+            seen: Mutex<Vec<String>>,
+        }
+
+        #[async_trait::async_trait]
+        impl cog_core::SchemaRunner for Recorder {
+            async fn apply_schema(&self, ddl: &str) -> cog_core::SFResult<()> {
+                self.seen.lock().unwrap().push(ddl.to_string());
+                Ok(())
+            }
+        }
+
+        let recorder = Recorder {
+            seen: Mutex::new(Vec::new()),
+        };
+        // 一个永远不会被连上的池：这个用例要证明的是「语句没有走池」，所以池在
+        // 这里连不通反而更好——真被用上就会失败。
+        let pool = sqlx::PgPool::connect_lazy("postgres://user:pw@127.0.0.1:1/none")
+            .expect("a lazy pool parses without connecting");
+        let store = PostgresAlertStore::new(pool);
+        store
+            .init_schema(&recorder)
+            .await
+            .expect("the recorder answers every attempt");
+
+        let seen = recorder.seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "建表语句应当恰好交给递进来的 runner 一次，实得 {} 次",
+            seen.len()
+        );
+        assert!(
+            seen[0].contains("CREATE TABLE IF NOT EXISTS alerts"),
+            "交出去的应当是这张表自己的语句：{}",
+            seen[0]
+        );
+    }
 
     /// Every statement this store builds is rendered here, not in the database:
     /// a slot left behind is a parse error at the moment an operator needs the

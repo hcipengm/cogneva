@@ -181,8 +181,9 @@ impl ProducerHeartbeatStore {
     /// are applied by migration 061 in `cog-storage`, which also runs at
     /// startup. A fresh database gets the final shape from here, and an existing
     /// one gets it from there; neither path drops a row.
-    pub async fn init_schema(&self) -> anyhow::Result<()> {
-        cog_storage::schema_ddl::apply(&self.pool, &ddl())
+    pub async fn init_schema(&self, schema: &dyn cog_core::SchemaRunner) -> anyhow::Result<()> {
+        schema
+            .apply_schema(&ddl())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())

@@ -531,8 +531,9 @@ impl SpendVerdictStore {
         })
     }
 
-    pub async fn init_schema(&self) -> anyhow::Result<()> {
-        cog_storage::schema_ddl::apply(&self.pool, DDL)
+    pub async fn init_schema(&self, schema: &dyn cog_core::SchemaRunner) -> anyhow::Result<()> {
+        schema
+            .apply_schema(DDL)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())

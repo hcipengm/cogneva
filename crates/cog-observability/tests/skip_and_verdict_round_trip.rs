@@ -175,7 +175,11 @@ async fn cells_in(
 async fn a_saving_written_through_the_sink_is_read_back_by_stage_and_reason() {
     let probe = Probe::open("probe_skip_round_trip").await;
     let store = LlmSkipStore::connect(&probe.url).await.expect("connecting");
-    store.init_schema().await.expect("creating the schema");
+    let schema_runner = cog_test_support::SchemaTextRunner::new(probe.pool.clone());
+    store
+        .init_schema(&schema_runner)
+        .await
+        .expect("creating the schema");
 
     // Two stages, two reasons, and one stage used twice — so a read that folds
     // the stage away, or the reason away, shows up as a different number rather
@@ -247,18 +251,25 @@ async fn the_fold_gives_each_window_the_verdict_its_readings_imply() {
     let pool = probe.pool.clone();
 
     let ledger = LlmUsageStore::connect(&url).await.expect("connecting");
-    ledger.init_schema().await.expect("creating the ledger");
+    let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+    ledger
+        .init_schema(&schema_runner)
+        .await
+        .expect("creating the ledger");
     // The fixture is the probe's own; the production table is created by the
     // gateway and this test must not depend on a deployment having run.
     clear_probe_rows(&pool).await;
 
     let skips = LlmSkipStore::connect(&url).await.expect("connecting");
-    skips.init_schema().await.expect("creating the skip schema");
+    skips
+        .init_schema(&schema_runner)
+        .await
+        .expect("creating the skip schema");
     let store = SpendVerdictStore::connect(&url, ledger.clone(), Some(skips.clone()))
         .await
         .expect("connecting");
     store
-        .init_schema()
+        .init_schema(&schema_runner)
         .await
         .expect("creating the verdict schema");
 

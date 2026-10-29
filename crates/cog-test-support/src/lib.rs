@@ -102,3 +102,34 @@ fn schema_options(url: &str, schema: &str) -> sqlx::postgres::PgConnectOptions {
         .expect("the test database URL parses")
         .options([("search_path", schema)])
 }
+
+/// 把一段 schema 文本直接交给数据库跑的 runner。
+///
+/// 生产上跑建表语句的那个 runner 有锁等待上限、退避重放，并在失败时报出等在哪张表上
+/// ——那是它要对付「旧副本还在服务」这件事。用例这边没有旧副本：库是一次性的，
+/// 表是这一轮刚切的 schema 里的，跑不完只说明语句写错了。所以夹具给的是不带上限的那个，
+/// 语义差着一件事：**用这个 runner 的用例测不到锁等待行为**，那条行为在
+/// `crates/cog-storage/tests/schema_lock_bound.rs` 里对着真的 runner 量。
+///
+/// 它存在是因为其余 crate 的用例不能为了建一张表去依赖存储层：那是生产 crate，
+/// 用例伸手进去，就会长出一条「测试替契约把关」的边进来。
+pub struct SchemaTextRunner {
+    pool: sqlx::PgPool,
+}
+
+impl SchemaTextRunner {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl cog_core::SchemaRunner for SchemaTextRunner {
+    async fn apply_schema(&self, ddl: &str) -> cog_core::SFResult<()> {
+        sqlx::raw_sql(ddl)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| cog_core::SFError::Database(e.to_string()))?;
+        Ok(())
+    }
+}

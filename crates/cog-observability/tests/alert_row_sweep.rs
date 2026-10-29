@@ -61,7 +61,11 @@ async fn a_row_no_live_pass_refreshes_is_closed_and_a_fresh_one_is_not() {
         .await
         .expect("database must be reachable");
     let store = PostgresAlertStore::new(pool.clone());
-    store.init_schema().await.expect("schema must apply");
+    let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+    store
+        .init_schema(&schema_runner)
+        .await
+        .expect("schema must apply");
 
     let run = uuid::Uuid::new_v4().simple().to_string();
     let stale_agent = format!("agent_unhealthy:test-stale-{run}");

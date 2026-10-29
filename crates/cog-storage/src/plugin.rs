@@ -293,6 +293,19 @@ impl cog_core::SystemPlugin for StoragePlugin {
 
         self.pg_pool = explain_pool.clone();
 
+        // ── Running other stores' schema text ──
+        // A store in another crate owns its statements and creates its own
+        // tables at startup, but the two things an attempt needs from the
+        // database -- giving its locks back instead of leaving a reader queued,
+        // and replaying a batch that could not get them -- are this crate's
+        // mechanism. Publishing it here keeps those stores off this crate's
+        // dependency list while still running their schema the same way.
+        if let Some(pool) = self.pg_pool.clone() {
+            let runner: Arc<dyn cog_core::SchemaRunner> =
+                Arc::new(crate::schema_ddl::PgSchemaRunner::new(pool));
+            ctx.publish_service(runner);
+        }
+
         // ── GuardAuditRecorder (PostgreSQL) ──
         if let Some(ref pool) = explain_pool.clone() {
             let recorder = crate::PostgresAuditRecorder::new(pool.clone());

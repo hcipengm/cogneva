@@ -9,10 +9,6 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
-# 只为 `schema_ddl::apply`：建表与建索引的语句要在启动时跑，而等待锁必须有界，
-# 否则这个进程启动时会把还在服务的旧副本排在自己后面。存储层不反向依赖本 crate，
-# 而依赖本 crate 的三个 crate 本来就都依赖存储层，所以这条边不加编译量、不成环。
-cog-storage = { workspace = true }
 
 prometheus = { workspace = true }
 tokio = { workspace = true }

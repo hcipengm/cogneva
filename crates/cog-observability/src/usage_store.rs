@@ -840,8 +840,9 @@ impl LlmUsageStore {
     ///
     /// The statements themselves are [`ddl`]: a restore replays that same list
     /// instead of keeping a second copy of the schema that only it would run.
-    pub async fn init_schema(&self) -> anyhow::Result<()> {
-        cog_storage::schema_ddl::apply(&self.pool, &ddl())
+    pub async fn init_schema(&self, schema: &dyn cog_core::SchemaRunner) -> anyhow::Result<()> {
+        schema
+            .apply_schema(&ddl())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())

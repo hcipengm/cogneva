@@ -57,12 +57,6 @@ const ALLOWED: &[Row] = &[
     ("cog-net", "cog-core", ""),
     ("cog-notification", "cog-core", ""),
     ("cog-observability", "cog-core", ""),
-    // The bounded lock wait is a property of the runner `cog-storage` owns, so a
-    // store that writes DDL has to hand it to that runner instead of keeping its
-    // own `raw_sql`. The edge does not deepen the graph: every crate that already
-    // depends on `cog-observability` depends on `cog-storage` too, and storage
-    // reaches only core and redis.
-    ("cog-observability", "cog-storage", ""),
     ("cog-orchestrator", "cog-core", ""),
     ("cog-prompt", "cog-core", ""),
     ("cog-protocol", "cog-core", ""),
@@ -74,6 +68,10 @@ const ALLOWED: &[Row] = &[
     ("cog-stream", "cog-core", ""),
     ("cog-stream", "cog-redis", ""),
     ("cog-supervisor", "cog-core", ""),
+    // The fixture runner implements a core contract, so the fixture crate names
+    // core like everything else. Its edge into core is architecture rather than
+    // debt, and it is listed here because this table is the whole graph.
+    ("cog-test-support", "cog-core", ""),
     ("cog-wiki", "cog-core", ""),
     ("cogneva", "cog-agent", ""),
     ("cogneva", "cog-auth", ""),

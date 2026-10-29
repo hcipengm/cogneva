@@ -541,9 +541,10 @@ impl PostgresAnalyticsBackend {
     }
 
     /// Initialize the events table.
-    pub async fn init_table(&self) -> anyhow::Result<()> {
+    pub async fn init_table(&self, schema: &dyn cog_core::SchemaRunner) -> anyhow::Result<()> {
         let ddl = postgres_table_ddl(&self.table);
-        cog_storage::schema_ddl::apply(&self.pool, &ddl)
+        schema
+            .apply_schema(&ddl)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         Ok(())

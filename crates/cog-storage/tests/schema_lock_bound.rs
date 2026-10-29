@@ -1,8 +1,13 @@
-//! What this crate's schema sweep does to the process that is already writing.
+//! What this crate's schema runner does to the process that is already writing.
 //!
-//! The stores here create their tables and indexes at startup, in one text, on
-//! a database another replica may still be using. Two facts make that unsafe
-//! without a bound on the wait: a multi-statement simple query is one implicit
+//! Stores create their tables and indexes at startup, in one text, on a
+//! database another replica may still be using, and they hand that text to
+//! [`cog_storage::schema_ddl::PgSchemaRunner`] -- including stores in other
+//! crates, which know the contract and not this implementation. So the bound
+//! is measured here, against the runner those stores are given.
+//!
+//! Two facts make that unsafe without a bound on the wait: a multi-statement
+//! simple query is one implicit
 //! transaction, so the locks an earlier statement took are held until the last
 //! one finishes, and `CREATE INDEX IF NOT EXISTS` takes its lock before it
 //! checks whether the index is already there. A writer holding the table
@@ -21,7 +26,7 @@
 //!
 //! ```text
 //! COGNEVA_TEST_DATABASE_URL=postgres://user:pw@127.0.0.1:5432/throwaway \
-//!   cargo test -p cog-observability --test schema_lock_bound -- --ignored
+//!   cargo test -p cog-storage --test schema_lock_bound -- --ignored
 //! ```
 //!
 //! Every run works inside its own schema and drops it at the end, so the
@@ -33,9 +38,26 @@ use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
 
-use cog_observability::analytics::PostgresAnalyticsBackend;
+use cog_core::SchemaRunner;
+use cog_storage::schema_ddl::PgSchemaRunner;
 
 use cog_test_support::{database_url, drop_schema, own_schema, schema_pool_with};
+
+/// The table the probe writes into, and the index the sweep creates over it.
+///
+/// A table plus an index in one text, which is the shape every store's schema
+/// has: the index is the statement that takes a lock a writer conflicts with,
+/// and the table is what makes the first attempt succeed so the second one is
+/// the one that collides.
+const PROBE_TABLE: &str = "events_probe";
+
+fn probe_ddl() -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {PROBE_TABLE} (\
+           event_id text PRIMARY KEY, event_type text NOT NULL);\n\
+         CREATE INDEX IF NOT EXISTS {PROBE_TABLE}_type ON {PROBE_TABLE} (event_type);"
+    )
+}
 
 /// Open a schema of this run's own and hand back its name.
 /// Hold a write open on `table` until `stop` is raised, then roll back.
@@ -97,10 +119,10 @@ async fn a_store_schema_names_the_table_it_could_not_lock_instead_of_hanging() {
     let url = database_url();
     let schema = own_schema(&url, "schemabound").await;
     let pool = schema_pool_with(&url, &schema, 6).await;
-    let table = "events_probe";
-    let store = PostgresAnalyticsBackend::new(pool.clone()).with_table(table);
-    store
-        .init_table()
+    let table = PROBE_TABLE;
+    let runner = PgSchemaRunner::new(pool.clone());
+    runner
+        .apply_schema(&probe_ddl())
         .await
         .expect("the table and its indexes are created before anything holds them");
 
@@ -109,7 +131,7 @@ async fn a_store_schema_names_the_table_it_could_not_lock_instead_of_hanging() {
     took_it.await.expect("the writer took its lock");
 
     let started = Instant::now();
-    let outcome = tokio::time::timeout(Duration::from_secs(40), store.init_table())
+    let outcome = tokio::time::timeout(Duration::from_secs(40), runner.apply_schema(&probe_ddl()))
         .await
         .expect("the schema must give up on the lock, not wait out the writer");
     let waited = started.elapsed();
@@ -144,10 +166,10 @@ async fn a_store_schema_takes_its_lock_once_the_writer_commits() {
     let url = database_url();
     let schema = own_schema(&url, "schemabound").await;
     let pool = schema_pool_with(&url, &schema, 6).await;
-    let table = "events_probe";
-    let store = PostgresAnalyticsBackend::new(pool.clone()).with_table(table);
-    store
-        .init_table()
+    let table = PROBE_TABLE;
+    let runner = PgSchemaRunner::new(pool.clone());
+    runner
+        .apply_schema(&probe_ddl())
         .await
         .expect("the table and its indexes are created before anything holds them");
 
@@ -156,7 +178,7 @@ async fn a_store_schema_takes_its_lock_once_the_writer_commits() {
     took_it.await.expect("the writer took its lock");
     release_after(stop.clone(), Duration::from_millis(900));
 
-    let outcome = tokio::time::timeout(Duration::from_secs(40), store.init_table())
+    let outcome = tokio::time::timeout(Duration::from_secs(40), runner.apply_schema(&probe_ddl()))
         .await
         .expect("the retry must not hang either");
 
