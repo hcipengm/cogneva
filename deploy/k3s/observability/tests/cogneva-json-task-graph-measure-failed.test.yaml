@@ -1,0 +1,66 @@
+# `task_graph_measure_failed` 的单测夹具。
+#
+# 这条规则与它旁边的两条同族规则分工不同，夹具要证的正是那个分工：
+#   - `task_graph_measure_stale` 看的是「戳不再动」，读不动了就响，要三十次
+#     失败才到界；
+#   - `task_graph_measure_absent` 看的是「戳整个没了」；
+#   - 这一条看的是「还在试着读、但被拒了」——计数器只在失败时发布，戳不动而
+#     计数器不动是循环停了，戳不动而计数器在涨是存储拒绝了读。
+#
+# 三格：
+#   一、健康格：计数器根本不出现（发布侧只在失败时发），戳新鲜 ⇒ 静。
+#      这一格同时证明「缺席即零失败」，规则的判据不能是 series 存不存在。
+#   二、被拒格：计数器从零开始涨 ⇒ 响。用从零起涨而不是给定一个高位，是为了
+#      证规则读的是 increase 而不是现值：新 Pod 起来第一秒计数器就是零，
+#      按值判会在最该响的时候静。
+#   三、退潮格：十五分钟前涨过一次、之后不动 ⇒ 先响后静。两格同一组序列、
+#      只挪 eval_time，证窗口真的在起作用。
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: task_graph_measure_failed
+
+evaluation_interval: 1m
+
+tests:
+  # 一、健康：计数器不出现，戳三十秒前刚读过。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_task_graph_measure_last_seconds{namespace="cogneva",job="cogneva"}'
+        values: '3500x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: task_graph_measure_failed
+        exp_alerts: []
+
+  # 二、被拒：两个 Pod 各自从零开始涨，合成一条带 namespace 的告警。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_task_graph_measure_failures_total{namespace="cogneva",pod="cogneva-1"}'
+        values: '0+1x29'
+      - series: 'cogneva_task_graph_measure_failures_total{namespace="cogneva",pod="cogneva-2"}'
+        values: '0+2x29'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: task_graph_measure_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+
+  # 三、退潮：第五分钟涨到 5，之后四十分钟不动。十五分钟时仍在窗口里 ⇒ 响；
+  #     六十分钟时那条失败已经滑出窗口 ⇒ 静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_task_graph_measure_failures_total{namespace="cogneva",job="cogneva"}'
+        values: '0x5 5x55'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: task_graph_measure_failed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              namespace: cogneva
+      - eval_time: 60m
+        alertname: task_graph_measure_failed
+        exp_alerts: []

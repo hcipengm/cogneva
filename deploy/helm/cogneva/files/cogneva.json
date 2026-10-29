@@ -1360,6 +1360,17 @@
           "face": "任务管理"
         },
         {
+          "name": "task_graph_measure_failed",
+          "promql": "sum by (namespace) (increase(cogneva_task_graph_measure_failures_total[15m])) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "for_seconds": 0,
+          "severity": "warning",
+          "summary": "A read of the task graph was refused inside the last fifteen minutes. The stale rule beside this one fires when the reading has stopped, and it cannot tell why: a store refusing every read and a loop that is no longer running both leave the stamp frozen. This counter separates them, because it only moves while something is still trying -- the series is published only when a read has failed, so a frozen stamp with no counter movement is the loop being down and a frozen stamp with the counter moving is the store walking away. That is the half the staleness rule reaches with a thirty-read delay and the half a person reading the number by hand would see only after the face had already gone quiet. Fifteen minutes is the same window the stale rule uses, so the two answer at the same cadence rather than one masking the other. The counter is cumulative for the life of the process, which is why the rule reads an increase rather than the value: a rollout starts a fresh process at zero and a level test would go quiet exactly when the new pod had its first failure.",
+          "face": "任务管理"
+        },
+        {
           "name": "runtime_asset_not_refreshed",
           "dormancy": {
             "reason": "error_only_state",

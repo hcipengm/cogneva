@@ -219,10 +219,18 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_tasks_current",
         Unread::Gap("tasks in the graph right now, one series per status. It is the shape a status panel is normally drawn from, and no panel or rule names it: a person reading the stack today sees no task count at all, and the three readings beside it are read with it"),
     ),
-    (
-        "cogneva_task_graph_measure_failures_total",
-        Unread::Gap("reads of the task graph that failed. It is the counter beside the last-success second above, and like it has no reader: without one, a task face shows the last known shape indefinitely and reads as healthy while the reader is down"),
-    ),
+    // A name that had a `Gap` here until a rule was written to read it:
+    // `cogneva_task_graph_measure_failures_total`, the counter beside the
+    // last-success stamp above. The entry is gone and `GAPS_AT_SCRAPE_CENSUS`
+    // came down by one. What the rule settles is having a reader, and it settles
+    // the half the staleness rule beside it cannot: a stamp that stopped moving
+    // is either the store refusing reads or the loop being down, and this
+    // counter answers which, because it only moves while something is still
+    // trying. What it does not settle is a bound that would tell one refusal
+    // apart from a store walking away -- the producer publishes this series only
+    // when a read has failed, so on this tree it has never had a sample and any
+    // number tighter than "more than none in fifteen minutes" would be
+    // invented. That debt sits on the alert side, with the count above.
     // A name that had a `Gap` here until a panel was written to carry it:
     // `cogneva_task_unowned_rows`, the count of rows in a state that can still
     // move but with nobody assigned to them. The entry is gone and
@@ -297,8 +305,17 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // `rate(node_disk_io_time_seconds_total[5m])` is the disk busy with
     // something else. CPU: over each boot's own window the container averages
     // 0.1 to 0.43 cores and CFS throttling stays at 0.000-0.002, nowhere near
-    // a quarter of its limit, and cores correlate *negatively* with duration
-    // (-0.365) -- the slow boots are the ones that computed less.
+    // a quarter of its limit. Cores correlate *negatively* with duration
+    // (-0.365), and that is the signature of starvation rather than its
+    // absence: the same work given fewer cores runs longer at a lower
+    // average. What separates the two is the CPU seconds each phase spent, and
+    // since 2026-10-29 every `phase reached` log line carries `cpu_seconds`
+    // beside `elapsed_seconds` for exactly that subtraction. A wall clock that
+    // grew while the CPU seconds barely moved is waiting; an ONNX phase whose
+    // CPU seconds grew with it is computing -- possibly on more threads, which
+    // is why that second reading alone does not say whether it computed slowly.
+    // The reading lives in the log line, not in a series, so it does not pay
+    // this entry's debt: nothing reads it, a person does.
     //
     // The fourth explanation was this entry's own and it was wrong too.
     // Twenty hours hold eighteen rolls and eighteen distinct images -- one
@@ -317,7 +334,7 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // landed somewhere else in a spread nothing measured yet explains.
     (
         "cogneva_boot_phase_elapsed_seconds",
-        Unread::Gap("how long each startup phase took, one series per phase. Its sibling on the same label has a rule and the same shape on this one was written and withdrawn: the spread is tenfold and it sits inside the model-loading phases (`reranker` 21.7-188.1 s across eighteen rolls) while `config-loaded` never leaves a second, so it is not the build and it is not the host -- the slow boots use fewer cores than the fast ones and never throttle. A comparison needs two samples of one thing, and there is one boot per roll, so the face owed waits on startup settling; after that a five-second bound would name a phase that doubled"),
+        Unread::Gap("how long each startup phase took, one series per phase. Its sibling on the same label has a rule and the same shape on this one was written and withdrawn: the spread is tenfold and it sits inside the model-loading phases (`reranker` 21.7-188.1 s across eighteen rolls) while `config-loaded` never leaves a second, so it is not the build and it is not the host -- the slow boots use fewer cores than the fast ones and never throttle, which on its own cannot tell waiting from computing. A comparison needs two samples of one thing, and there is one boot per roll, so the face owed waits on startup settling; after that a five-second bound would name a phase that doubled"),
     ),
     // Two names that had a `Gap` here until panels were written to carry them,
     // and the reason they came off this table is the reason the debts were real:
@@ -417,7 +434,17 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// one most worth checking afterwards, since a handful of names can leave a
 /// table in a single edit and nothing but the panels drawing them keeps them
 /// read.
-const GAPS_AT_SCRAPE_CENSUS: usize = 4;
+///
+/// Down to three when the task graph's failure counter got a rule:
+/// `cogneva_task_graph_measure_failures_total` was the one entry in that family
+/// whose missing reader cost a fact rather than a convenience, because the
+/// staleness rule next to it can see a stamp stop moving but cannot say whether
+/// the store refused or the loop died. The rule reads an increase over the
+/// staleness window, which matches the cadence of the rule it answers rather
+/// than picking a number. What came off the table is the debt of having no
+/// reader; the bound it still lacks is the alert side's, the same way it is for
+/// the count and the unowned rows above.
+const GAPS_AT_SCRAPE_CENSUS: usize = 3;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
