@@ -43,7 +43,7 @@ manifest_for() { # <夹具路径> ⇒ 清单路径；配不上就空
 # 0) 真树：每一份夹具都跑过。
 ran=0; failed=""
 for f in "${tests}"/*prometheusrule*.test.yaml; do
-    case "$(basename "$f")" in cogneva-json-*) continue ;; esac
+    case "$(basename "$f")" in cogneva-json-*) skip=$((skip + 1)); continue ;; esac
     m="$(manifest_for "$f")"
     if [ -z "$m" ]; then
         failed="${failed} $(basename "$f")(无配对清单)"
@@ -98,5 +98,6 @@ rc=$?
 [ "$rc" -eq 3 ] && ok "清单不存在时退 3（看不了 ≠ 通过）" \
     || bad "清单不存在应退 3" "3" "$rc"
 
-printf '%s: %d passed, %d failed\n' "$(basename "${BASH_SOURCE[0]}")" "$pass" "$fail"
+# 跳过的份数要印出来：一份既没跑也没跳才是「安静」，印了 0 才说明这一轮确实没有该跳的。
+printf '%s: %d passed, %d failed, %d skipped\n' "$(basename "${BASH_SOURCE[0]}")" "$pass" "$fail" "$skip"
 [ "$fail" -eq 0 ]

@@ -568,16 +568,17 @@ jobs:
         run: cargo test -p cog-observability --test alert_schema -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-      # Every store in this crate now creates its schema through the shared
-      # bounded runner, and what the bound buys is an end rather than speed: a
-      # sweep whose locks are held gives them back and names the table, so the
-      # startup path reports a store that failed to initialise instead of a pod
-      # that never becomes ready. Only two sessions can witness that -- without
-      # a server the test does not fail, it never finishes -- and the failure
+      # Every store in the tree creates its schema through the shared bounded
+      # runner, and what the bound buys is an end rather than speed: a sweep
+      # whose locks are held gives them back and names the table, so the startup
+      # path reports a store that failed to initialise instead of a pod that
+      # never becomes ready. Only two sessions can witness that -- without a
+      # server the test does not fail, it never finishes -- and the failure
       # message is the whole deliverable, since the caller's alternative is a
-      # silence.
-      - name: Live-DB observability schema lock bounds
-        run: cargo test -p cog-observability --test schema_lock_bound -- --ignored --test-threads=1
+      # silence. The test lives beside the runner, in the crate that owns it:
+      # the stores in other crates know the contract and not the wait.
+      - name: Live-DB schema lock bounds
+        run: cargo test -p cog-storage --test schema_lock_bound -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The alert mirror decides what to close by subtracting the keys it just
