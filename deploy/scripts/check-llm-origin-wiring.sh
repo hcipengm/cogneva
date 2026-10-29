@@ -7,7 +7,7 @@
 #
 # 这条轴的值由**进程自己声明**，而进程是部署出来的，所以声明落在清单上。它坏起来
 # 没有症状：值是自由字符串，写错一个字母、或者干脆没写，读数照常发布，只是那一格
-# 落进 `unknown`，而 `unknown` 不是环境、不计进任何一家的总数（见 usage_store.rs
+# 落进 `unknown`，而 `unknown` 不是环境、不计进任何一家的总数（见 core 里
 # 里 `LlmOrigin::Unknown` 的注释）。渲染期合法、parity 也绿、面板上少一格，没人会
 # 去看。这与 check-deployment-name-wiring.sh 是同一个形状：**写者身份类的东西在
 # 清单里错了，症状要到读数面才出现，所以判据必须提前到渲染产物上。**
@@ -43,7 +43,14 @@ import yaml
 
 ROOT = sys.argv[1]
 RENDERED = os.path.join(ROOT, "deploy/rendered")
-CLOSED_SET_SOURCE = os.path.join(ROOT, "crates/cog-observability/src/usage_store.rs")
+# 闭集在哪：`LlmOrigin` 与它的 `declared` 是一份契约，契约住在 core，原先住在
+# observability 的 usage_store 里，搬过一次。**写成一列而不是一个路径**：写死一个
+# 路径的门在文件搬家的那一刻红成「闭集没读出来」，而那条判词说的是门自己记的那一
+# 行旧了，不是接线坏了——漂的正是这条门本来要防的东西，只是这次漂的是它自己。
+CLOSED_SET_SOURCES = [
+    "crates/cog-core/src/contract/usage_ledger.rs",
+    "crates/cog-observability/src/usage_store.rs",
+]
 CRATES = os.path.join(ROOT, "crates")
 ENV_NAME = "COGNEVA_LLM_ORIGIN"
 # 生产者在树外的那一个值。见脚本头注释第 4 条。
@@ -53,10 +60,18 @@ WORKLOAD_KINDS = ("Deployment", "StatefulSet", "DaemonSet", "CronJob")
 
 # 闭集从代码读。抄一份在这里就多了一处会漂的值，而这条门的全部意义就是
 # 「清单里的值必须与代码认的值一致」——自己抄的那份一旦漂，门会替错的那边说话。
-src = open(CLOSED_SET_SOURCE).read()
-arms = re.findall(r'Some\("([a-z_]+)"\)\s*=>\s*(?:LlmOrigin|Self)::(\w+)', src)
+arms = []
+for rel in CLOSED_SET_SOURCES:
+    path = os.path.join(ROOT, rel)
+    if not os.path.isfile(path):
+        continue
+    with open(path) as fh:
+        arms = re.findall(r'Some\("([a-z_]+)"\)\s*=>\s*(?:LlmOrigin|Self)::(\w+)', fh.read())
+    if arms:
+        break
 if not arms:
-    sys.exit(f"闭集没读出来：{CLOSED_SET_SOURCE} 里找不到 LlmOrigin::declared 的匹配臂")
+    sys.exit("闭集没读出来：这些文件里都没有 LlmOrigin::declared 的匹配臂——"
+             + "、".join(CLOSED_SET_SOURCES))
 declarable = {value: variant for value, variant in arms}
 
 profiles = sorted(d for d in os.listdir(RENDERED)
