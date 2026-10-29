@@ -52,28 +52,35 @@
 //! the series' cardinality is decided by it, and a free-form phase name would
 //! let one caller's typo become a second series that no rule reads.
 //!
-//! Each of those lines also carries **`cpu_seconds`**, **`minor_faults`** and
-//! **`major_faults`** for the same instant. The CPU reading is published as
-//! `cogneva_boot_phase_cpu_seconds` beside the elapsed one, so the comparison
-//! that says whether a phase was working or waiting can be made by something
-//! other than a person reading two adjacent log lines. The two fault counters
-//! stay fields on the line: their meaning is a difference between adjacent
-//! phases either way, and the question they answer -- was this phase's missing
-//! CPU spent waiting to be scheduled or waiting for the disk -- is asked once,
-//! by whoever is looking at a slow boot, not continuously. Elapsed
+//! Each of those lines also carries **`cpu_seconds`**, **`minor_faults`**,
+//! **`major_faults`** and **`read_bytes`** for the same instant. The CPU
+//! reading is published as `cogneva_boot_phase_cpu_seconds` beside the elapsed
+//! one, so the comparison that says whether a phase was working or waiting can
+//! be made by something other than a person reading two adjacent log lines. The
+//! fault and disk counters stay fields on the line: their meaning is a
+//! difference between adjacent phases either way, and the question they answer
+//! -- was this phase's missing CPU spent waiting to be scheduled or waiting for
+//! the disk -- is asked once, by whoever is looking at a slow boot, not
+//! continuously. Elapsed
 //! time alone cannot say whether a slow phase was working or waiting: the same
 //! work costs about the same CPU time however long it is made to wait, so a
 //! phase whose elapsed time rose while its CPU time did not had time pass with
 //! no thread running. That still leaves the two ways time passes without a
-//! thread: waiting to be scheduled, and waiting on a page of the model file to
-//! come off the disk. `major_faults` is what tells them apart -- a phase that
-//! page-faulted its way through the weights shows a jump of one fault per page
-//! of the file, and one that was merely not scheduled shows almost none.
+//! thread: waiting to be scheduled, and waiting on the disk. `major_faults`
+//! separates fault-driven paging from the rest -- a phase that page-faulted its
+//! way through the weights shows about one fault per page of the file, and one
+//! that was merely not scheduled shows almost none -- but it cannot see a
+//! loader that reads its weights with `read()` into a buffer: the process waits
+//! inside that call, with no fault raised and no CPU spent, which is the same
+//! shape as never being scheduled. `read_bytes` closes that gap: the bytes the
+//! kernel fetched off the block layer on this process's behalf, whether the
+//! process then mapped them or copied them.
 //!
-//! The two fault counters are not published as series because a phase's value
-//! is cumulative and its meaning is the difference from the phase before it,
-//! which is the reader's arithmetic either way; keeping them in the line costs
-//! no cardinality and answers the one question the numbers together are asked.
+//! The fault and disk counters are not published as series because a phase's
+//! value is cumulative and its meaning is the difference from the phase before
+//! it, which is the reader's arithmetic either way; keeping them in the line
+//! costs no cardinality and answers questions asked once, of one slow boot,
+//! rather than continuously.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -213,6 +220,7 @@ fn announce(phase: &'static str, rss: Option<u64>, elapsed_seconds: f64, vitals:
             cpu_seconds = vitals.cpu_seconds,
             minor_faults = vitals.minor_faults,
             major_faults = vitals.major_faults,
+            read_bytes = vitals.read_bytes,
             "boot footprint: phase reached"
         ),
         (Some(rss), None) => {
@@ -224,6 +232,7 @@ fn announce(phase: &'static str, rss: Option<u64>, elapsed_seconds: f64, vitals:
             cpu_seconds = vitals.cpu_seconds,
             minor_faults = vitals.minor_faults,
             major_faults = vitals.major_faults,
+            read_bytes = vitals.read_bytes,
             "boot footprint: phase reached, but resident memory could not be read here"
         ),
         (None, None) => tracing::info!(
@@ -300,6 +309,9 @@ struct Vitals {
     minor_faults: u64,
     /// Major page faults: pages that had to be read from disk.
     major_faults: u64,
+    /// Bytes this process has made the kernel fetch from the block layer, or
+    /// `None` where `/proc/self/io` could not be read.
+    read_bytes: Option<u64>,
 }
 
 /// The process counters at this instant, or `None` where they cannot be read.
@@ -311,6 +323,25 @@ fn process_vitals() -> Option<Vitals> {
         cpu_seconds: process_cpu_seconds()?,
         minor_faults,
         major_faults,
+        read_bytes: std::fs::read_to_string("/proc/self/io")
+            .ok()
+            .and_then(|io| parse_read_bytes(&io)),
+    })
+}
+
+/// `read_bytes` from `/proc/<pid>/io`: bytes this process caused to be fetched
+/// from the block layer.
+///
+/// The fault counters say whether a file came in through the page tables; this
+/// says whether it came off the disk at all. A loader that reads its weights
+/// with `read()` into a buffer waits on the disk inside that call, which costs
+/// no CPU and raises no major fault -- so a phase whose wall clock grew while
+/// its CPU time and its major faults did not is indistinguishable from one that
+/// was never scheduled, until this number is looked at.
+fn parse_read_bytes(io: &str) -> Option<u64> {
+    io.lines().find_map(|line| {
+        let rest = line.strip_prefix("read_bytes:")?;
+        rest.trim().parse().ok()
     })
 }
 
@@ -483,6 +514,7 @@ mod tests {
         cpu_seconds: Option<f64>,
         minor_faults: Option<u64>,
         major_faults: Option<u64>,
+        read_bytes: Option<u64>,
     }
 
     /// A log backend that only records what it was handed.
@@ -501,6 +533,7 @@ mod tests {
                 cpu_seconds: None,
                 minor_faults: None,
                 major_faults: None,
+                read_bytes: None,
             };
             let mut fields = Fields(&mut logged);
             event.record(&mut fields);
@@ -513,7 +546,13 @@ mod tests {
 
     /// What the shape test reads off each line: resident bytes, CPU seconds,
     /// minor faults, major faults.
-    type Counters = (Option<u64>, Option<f64>, Option<u64>, Option<u64>);
+    type Counters = (
+        Option<u64>,
+        Option<f64>,
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+    );
 
     struct Fields<'a>(&'a mut Logged);
 
@@ -535,6 +574,7 @@ mod tests {
                 "rss" => self.0.rss = Some(value),
                 "minor_faults" => self.0.minor_faults = Some(value),
                 "major_faults" => self.0.major_faults = Some(value),
+                "read_bytes" => self.0.read_bytes = Some(value),
                 _ => {}
             }
         }
@@ -684,6 +724,7 @@ mod tests {
             cpu_seconds: 1.5,
             minor_faults: 11,
             major_faults: 3,
+            read_bytes: Some(77),
         };
         let logged = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&logged)));
@@ -698,15 +739,23 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .iter()
-            .map(|e| (e.rss, e.cpu_seconds, e.minor_faults, e.major_faults))
+            .map(|e| {
+                (
+                    e.rss,
+                    e.cpu_seconds,
+                    e.minor_faults,
+                    e.major_faults,
+                    e.read_bytes,
+                )
+            })
             .collect();
         assert_eq!(
             fields,
             vec![
-                (Some(4096), Some(1.5), Some(11), Some(3)),
-                (None, Some(1.5), Some(11), Some(3)),
-                (Some(4096), None, None, None),
-                (None, None, None, None),
+                (Some(4096), Some(1.5), Some(11), Some(3), Some(77)),
+                (None, Some(1.5), Some(11), Some(3), Some(77)),
+                (Some(4096), None, None, None, None),
+                (None, None, None, None, None),
             ],
             "every shape of the line has to carry the counters it has: the shape that drops \
              the resident number is the one the reader greps when procfs is missing, and a \
@@ -724,6 +773,25 @@ mod tests {
 
         assert_eq!(parse_faults("no parenthesis here"), None);
         assert_eq!(parse_faults("1234 (short) S 1"), None);
+    }
+
+    #[test]
+    fn bytes_read_from_the_block_layer_are_read_from_the_line_that_names_them() {
+        // `rchar` counts bytes handed back from the page cache too, so it is not
+        // this number: a loader whose file is already cached reads gigabytes
+        // without touching the disk, and that is exactly the case this counter
+        // has to keep apart from one that waited on the disk.
+        let io = "rchar: 999999999\n\
+                  wchar: 12\n\
+                  syscr: 40\n\
+                  syscw: 0\n\
+                  read_bytes: 1572864\n\
+                  write_bytes: 0\n\
+                  cancelled_write_bytes: 0\n";
+        assert_eq!(parse_read_bytes(io), Some(1_572_864));
+
+        assert_eq!(parse_read_bytes("rchar: 1\n"), None);
+        assert_eq!(parse_read_bytes("read_bytes: not-a-number\n"), None);
     }
 
     #[test]
