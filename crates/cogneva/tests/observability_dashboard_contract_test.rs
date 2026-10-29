@@ -137,6 +137,11 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["status"],
         "crates/cog-orchestrator/src/observable.rs",
     ),
+    (
+        "cogneva_tasks_current",
+        &["status"],
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
     // Pool recovery readings. Three separate series rather than one "recovers
     // at" number: which upstream said it, when we will probe again, and how long
     // the window an upstream stated is are answers of different strength, and

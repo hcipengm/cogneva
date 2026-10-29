@@ -215,10 +215,16 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // invents, so the pair reads a reader that stopped apart from a graph that
     // is exactly as it last appeared. The rule does not draw the count by
     // status, which is why that entry stays.
-    (
-        "cogneva_tasks_current",
-        Unread::Gap("tasks in the graph right now, one series per status. It is the shape a status panel is normally drawn from, and no panel or rule names it: a person reading the stack today sees no task count at all, and the three readings beside it are read with it"),
-    ),
+    // A name that had a `Gap` here until a panel was written to draw it:
+    // `cogneva_tasks_current`, the count by status. The entry is gone and
+    // `GAPS_AT_SCRAPE_CENSUS` came down by one. What the panel settles is
+    // having a reader; it does not settle a bound, and none was ever owed
+    // here in the shape a rule would take -- a count with no reference is a
+    // number, and what makes it a fault is the shape against its neighbours
+    // (pending growing while unowned stays flat is work nobody claims; failed
+    // climbing is the retry path filling). Those are comparisons a panel draws
+    // and a threshold would flatten, so the debt that remains, if any, is the
+    // one the alert side carries for the unowned count above.
     // A name that had a `Gap` here until a rule was written to read it:
     // `cogneva_task_graph_measure_failures_total`, the counter beside the
     // last-success stamp above. The entry is gone and `GAPS_AT_SCRAPE_CENSUS`
@@ -444,7 +450,15 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// than picking a number. What came off the table is the debt of having no
 /// reader; the bound it still lacks is the alert side's, the same way it is for
 /// the count and the unowned rows above.
-const GAPS_AT_SCRAPE_CENSUS: usize = 3;
+///
+/// Down to two when the task count got a panel: `cogneva_tasks_current` was the
+/// last of the task graph's five readings with no face, and the panel draws the
+/// whole status vector from one publisher's snapshot rather than summing
+/// publishers that each restate the same shared store. Two entries remain and
+/// they are different debts: a registration count whose face would be a
+/// population reading rather than a bound, and a phase timing with one sample
+/// per boot, which no reader can compare until startup itself settles.
+const GAPS_AT_SCRAPE_CENSUS: usize = 2;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.

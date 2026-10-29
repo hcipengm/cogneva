@@ -3065,6 +3065,37 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 71,
+          "title": "Task Rows by Status",
+          "description": "Rows in the task graph right now, one line per status. Nothing draws this today, so the only counts a person can see are the four readings beside it -- the oldest wait, the unowned rows, the last successful read, the failures -- none of which is the queue's length. Drawn from one publisher's whole snapshot, the same publisher of record the unowned-row panel draws: every pod reads the same shared store and reports it again, so summing counts one row once per reporting pod, and per-cell maxima mix pods that read a moment apart. Read the shape rather than any single value: a large pending against a small running is intake outrunning claim, a pending that grows while unowned stays flat is work nobody is claiming, and a failed column that climbs is the retry path filling up. Zero statuses are drawn as zeros, because 'no row is failed' is an answer and an absent series would not be.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 336
+          },
+          "targets": [
+            {
+              "expr": "cogneva_tasks_current and on (instance) topk (1, sum by (instance) (cogneva_tasks_current))",
+              "legendFormat": "{{status}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
