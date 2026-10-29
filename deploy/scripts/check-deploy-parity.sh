@@ -58,11 +58,12 @@ kubectl kustomize deploy/k3s > "$TMP/k3s.yaml"
 # 额度是投影产物，不是 values.yaml 里的一段（见 project-resource-governance.py）：
 # 不带上它，这一侧渲染出的 ResourceQuota/LimitRange 是空的，而 deploy/k3s 里那份
 # 是有数的——差值会全部记在"k3s 有、helm 没有"上，读起来像静态清单多写了东西。
-helm template cogneva deploy/helm/cogneva \
-  --namespace cogneva \
-  -f deploy/helm/cogneva/profiles/k3s-single.yaml \
-  -f deploy/helm/cogneva/values.resource-governance.k3s-single.yaml \
-  > "$TMP/helm.yaml"
+#
+# 入参不在这里拼：`render-chart.sh` 是唯一的构造点（render-deploy.sh 与宿主机上
+# 量交付清单的那几格读数走同一个）。这里自己拼过一遍的代价是实测过的：chart 把
+# 额度改成必填之后，两格宿主机读数静默渲染失败，而本脚本因为恰好带了那个文件
+# 才没跟着瞎——同一件事三处写法，只有一处跟着 chart 走。
+bash deploy/scripts/render-chart.sh k3s-single > "$TMP/helm.yaml"
 
 python3 - "$TMP/k3s.yaml" "$TMP/helm.yaml" <<'PYEOF'
 import sys, json, yaml

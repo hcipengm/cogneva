@@ -62,23 +62,14 @@ generated_values() { echo "$CHART_DIR/values.resource-governance.$1.yaml"; }
 # deploy/k3s 的配额清单是 parity 基线兼 GitOps 消费物，与 k3s-single 的投影同源。
 QUOTA_BASELINE="$REPO_ROOT/deploy/k3s/resource-quota.yaml"
 
-# `raw` 是"先渲染一遍好让投影有输入"的那一遍：额度还没有，模板里的 required
-# 会报错，所以整段治理关掉（额度与 LimitRange 上限都不在工作负载声明里，投影
-# 读的东西一分不少）。正式那一遍带 -f 投影产物。
+# 入参集合不在这里拼：`render-chart.sh` 是它唯一的构造点，宿主机上量「交付时会是
+# 哪一份清单」的那几格读数也走同一个脚本。本脚本只是把它的输出落到文件里。
+# `raw` 是"先渲染一遍好让投影有输入"的那一遍，见 render-chart.sh 里那个开关。
 helm_render() {
   local profile="$1" out="$2" mode="${3:-governed}"
-  local extra=()
-  if [ "$mode" = raw ]; then
-    extra=(--set resourceGovernance.enabled=false)
-  else
-    local gen; gen="$(generated_values "$profile")"
-    [ -f "$gen" ] && extra=(-f "$gen")
-  fi
-  helm template cogneva "$CHART_DIR" \
-    -f "$PROFILES_DIR/$profile.yaml" \
-    ${extra[@]+"${extra[@]}"} \
-    --namespace cogneva \
-    > "$out"
+  local raw=0
+  [ "$mode" = raw ] && raw=1
+  COGNEVA_RENDER_RAW="$raw" bash "$SCRIPT_DIR/render-chart.sh" "$profile" > "$out"
 }
 
 # 从一次渲染里投影出额度并写回（或只核对）。读的只有工作负载自己的声明与

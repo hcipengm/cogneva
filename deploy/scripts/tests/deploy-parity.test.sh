@@ -40,6 +40,9 @@ trap 'rm -rf "${work}"' EXIT
 mkdir -p "${work}/base/deploy"
 cp -a "${repo}/deploy/k3s" "${work}/base/deploy/k3s"
 cp -a "${repo}/deploy/helm" "${work}/base/deploy/helm"
+# 渲染入参的构造点（deploy/scripts/render-chart.sh）也要在副本里：门禁按 cwd 找它，
+# 与它找 deploy/k3s、deploy/helm 是同一套约定。少了它，真树那一趟会直接报「找不到命令」。
+cp -a "${repo}/deploy/scripts" "${work}/base/deploy/scripts"
 
 case_dir() { # case_dir <名字> -> 打印一份可以随便改的树根
   local d="${work}/$1"
