@@ -334,3 +334,78 @@ async fn the_writer_identity_lands_on_a_table_that_predates_it() {
     pool.close().await;
     drop_schema(&url, &schema).await;
 }
+
+/// A verdict table that stopped keeping up must not take the alert with it.
+///
+/// `set_alert` returns one value, and every caller reads `Err` as "nothing was
+/// written" — they skip delivery on that branch and keep the firing row from
+/// being announced. So a failure in the auxiliary verdict write must not be
+/// reported as a failure of the alert: the caller cannot tell the two apart,
+/// and the one it would act on is the wrong one. Measured on the cluster on
+/// 2026-10-30: a missing column in the verdict table cost seven minutes in
+/// which no outward notification left the process while `alerts` kept moving.
+///
+/// The drift is made the way it happens in production — the column exists when
+/// the schema is applied and goes missing afterwards — rather than by writing a
+/// table the DDL would repair on the next start.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_broken_verdict_table_does_not_fail_the_alert_it_describes() {
+    let url = database_url();
+    let schema = own_schema(&url, "alert_div_drift").await;
+    let pool = schema_pool(&url, &schema).await;
+
+    let store = PostgresAlertStore::with_identity(pool.clone(), "cogneva-app-0", "cogneva");
+    store
+        .init_schema(&cog_test_support::SchemaTextRunner::new(pool.clone()))
+        .await
+        .expect("the alert DDL runs in one piece");
+
+    sqlx::query("ALTER TABLE alert_assertions DROP COLUMN role")
+        .execute(&pool)
+        .await
+        .expect("the verdict table loses a column after the fact");
+
+    let alert = probe_alert("probe_rule:drift");
+    let transition = store
+        .set_alert(true, &alert)
+        .await
+        .expect("a broken verdict write is not the alert's failure");
+    assert_eq!(
+        transition,
+        AlertTransition::Fired,
+        "the caller has to be able to announce an alert whose row landed"
+    );
+    assert_eq!(
+        row_writer(&pool, &alert.dedup_key).await.as_deref(),
+        Some("cogneva-app-0"),
+        "the alert row itself is written before the verdict is attempted"
+    );
+    assert_eq!(
+        assertion_rows(&pool, "cogneva-app-0").await,
+        0,
+        "the verdict really was lost — this case is about not claiming otherwise"
+    );
+
+    // The same for the paths that keep a row up and close it: both are called
+    // with the transition's answer in hand, and a lost verdict there would
+    // otherwise read as "this writer no longer owns the row".
+    assert!(
+        store
+            .refresh_firing(&alert.dedup_key)
+            .await
+            .expect("a refresh is about the alert row, not the verdict"),
+        "the refresh touched the row it was asked about"
+    );
+    assert_eq!(
+        store
+            .set_alert(false, &alert)
+            .await
+            .expect("a close is about the alert row, not the verdict"),
+        AlertTransition::Resolved,
+        "the row was open and this writer closes it"
+    );
+
+    pool.close().await;
+    drop_schema(&url, &schema).await;
+}

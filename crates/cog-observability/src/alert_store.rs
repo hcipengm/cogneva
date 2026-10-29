@@ -436,8 +436,8 @@ impl PostgresAlertStore {
                 .bind(&self.writer)
                 .execute(&self.pool)
                 .await?;
-                self.record_assertion(&alert.dedup_key, AlertState::Firing)
-                    .await?;
+                self.record_assertion_best_effort(&alert.dedup_key, AlertState::Firing)
+                    .await;
                 Ok(AlertTransition::Fired)
             }
             AlertTransition::Resolved => {
@@ -452,8 +452,8 @@ impl PostgresAlertStore {
                 .bind(&self.writer)
                 .execute(&self.pool)
                 .await?;
-                self.record_assertion(&alert.dedup_key, AlertState::Resolved)
-                    .await?;
+                self.record_assertion_best_effort(&alert.dedup_key, AlertState::Resolved)
+                    .await;
                 Ok(AlertTransition::Resolved)
             }
             AlertTransition::NoChange => {
@@ -498,10 +498,32 @@ impl PostgresAlertStore {
                     } else {
                         AlertState::Resolved
                     };
-                    self.record_assertion(&alert.dedup_key, state).await?;
+                    self.record_assertion_best_effort(&alert.dedup_key, state)
+                        .await;
                 }
                 Ok(AlertTransition::NoChange)
             }
+        }
+    }
+
+    /// Record the verdict, but never let that bookkeeping decide the outcome.
+    ///
+    /// The row written above is the alert; this is the record of who said it.
+    /// Letting a failure here travel out as `Err` from `set_alert` makes every
+    /// caller read "nothing landed" — and they act on that by skipping the
+    /// delivery step, so the alert row is written and nobody is told. Measured
+    /// on 2026-10-30: a column missing from this table cost seven minutes in
+    /// which no outward notification left the process at all while `alerts`
+    /// kept moving. Losing the verdict is a real loss and must not be silent,
+    /// so it is logged with the key that lost it; it is not, however, a reason
+    /// to report the alert itself as unpersisted.
+    async fn record_assertion_best_effort(&self, dedup_key: &str, state: AlertState) {
+        if let Err(e) = self.record_assertion(dedup_key, state).await {
+            tracing::warn!(
+                dedup_key = %dedup_key,
+                error = %e,
+                "alert verdict not recorded; the alert row itself landed"
+            );
         }
     }
 
@@ -596,7 +618,8 @@ impl PostgresAlertStore {
         // out of the divergence count — the safest direction to be wrong in, but
         // wrong: it would hide a disagreement behind a missing row.
         if touched {
-            self.record_assertion(dedup_key, AlertState::Firing).await?;
+            self.record_assertion_best_effort(dedup_key, AlertState::Firing)
+                .await;
         }
         Ok(touched)
     }
