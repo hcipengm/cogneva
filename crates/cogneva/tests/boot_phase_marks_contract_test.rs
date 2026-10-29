@@ -140,6 +140,29 @@ fn every_declared_phase_is_marked_somewhere() {
     );
 }
 
+/// The phase a boot reached is read off the log when the process never gets far
+/// enough to serve its own series, and the reader's rule is "the last phase
+/// named before the silence". A mark taken before any subscriber exists goes to
+/// tracing's no-op default and is printed nowhere -- the line is not late, it is
+/// gone, and the log then simply starts at the second phase. So the first mark
+/// has to come after the early subscriber is installed, not before it.
+#[test]
+fn the_first_phase_is_marked_after_a_subscriber_exists_to_print_it() {
+    let path = repo_root().join("crates/cogneva/src/lib.rs");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let subscriber = text
+        .find("install_early_subscriber()")
+        .expect("lib.rs has to install the early subscriber: every event before the observability plugin would be dropped");
+    let first_mark = text
+        .find("boot_footprint::mark(\"process-start\")")
+        .expect("lib.rs has to mark process-start");
+    assert!(
+        subscriber < first_mark,
+        "process-start is marked before the early subscriber is installed, so its line \
+         goes to the no-op default subscriber and the log starts at the second phase"
+    );
+}
+
 #[test]
 fn the_census_reddens_on_an_undeclared_name_and_ignores_comments() {
     let text = "\

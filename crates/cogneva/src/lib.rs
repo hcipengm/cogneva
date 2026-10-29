@@ -57,9 +57,6 @@ use tracing::warn;
 
 /// Pure wiring logic: initialize components and connect them together.
 pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
-    // 出生占用主要在前半分钟里落地，而它占掉的是运行期可用的那份预算：这里每个
-    // 点是那一刻整进程的常驻内存快照，读者按相邻两点的差读出每一段自己的代价。
-    cog_observability::boot_footprint::mark("process-start");
     // 正式日志栈由 observability 插件安装，而它排在 net/storage 之后——在那
     // 之前的一切 tracing 事件（配置加载、版本行、身份播种、先初始化的插件）
     // 会落进 tracing 的 no-op 默认订阅者被静默丢弃，而那正是启动失败最常发生
@@ -68,6 +65,11 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // 只能放在 run_app()：子命令二进制（mainline-rollout、command-server、
     // security-gateway）各自用会 panic 的 .init() 装订阅者，不走这条路径。
     cog_observability::install_early_subscriber();
+    // 出生占用主要在前半分钟里落地，而它占掉的是运行期可用的那份预算：这里每个
+    // 点是那一刻整进程的常驻内存快照，读者按相邻两点的差读出每一段自己的代价。
+    // 排在订阅者之后，否则第一条相位（`process-start`）同样落进 no-op 默认订阅者，
+    // 日志里就只有六条——而按日志读启动的人正是拿「最后一条相位」当作停在哪里的。
+    cog_observability::boot_footprint::mark("process-start");
 
     let mut config = assembly::infra::load_and_normalize_config();
     let app_version = if config.core.app.version.is_empty() {
