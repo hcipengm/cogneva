@@ -85,6 +85,21 @@ const RELEASE_BATCH: i64 = 5_000;
 pub const SUPERSEDED_SHAPES: &[(&str, &str)] = &[
     ("cogneva_eval_gate_outcomes_total", "site"),
     ("cogneva_mainline_ci_no_verdict_reason_total", "platform"),
+    // 2026-10-29 现量：这两格的孤儿停下之后，带标签的兄弟一直在走，而孤儿本身仍是
+    // 一条活序列——两者的值相差一个数量级，读的人先看到的是那个不动的大数。
+    // `cogneva_mainline_ci_verdict_total` 的 `{verdict}` 那三行停在 10-28 18:18Z
+    // （fail 850 / no_evidence 1126 / pass 518），带 `ask` 的九行同一刻正在写
+    // （合计 fail 28）；`cogneva_process_report_ingest_total` 的 `{outcome}` 那两行
+    // 停在 10-27 08:26Z，带 `node` 的三行 08:00 刚写过。
+    //
+    // 为什么这两个能申报而 `cogneva_cluster_read_total` 不能：申报要求「生产者现在
+    // **必须**带这个标签」。两处写入点分别是 `record_ci_verdict_reading` 与
+    // `publish_ingest`，都在构造标签的表里无条件插入；而 `cogneva_cluster_read_total`
+    // 的 `deployment` 是 `if let Some(...)`，`deployment_label()` 解析不到时会整批不写
+    // 这个标签——那批行今天安静两天只是没走到那条路上，不是写者停了，所以它**不能**
+    // 申报。要先让那个标签变成无条件，再说这一格。
+    ("cogneva_mainline_ci_verdict_total", "ask"),
+    ("cogneva_process_report_ingest_total", "node"),
     ("metrics_retired_rows_removed", DEPLOYMENT_LABEL),
     ("metrics_samples_rows", DEPLOYMENT_LABEL),
     ("metrics_samples_bytes", DEPLOYMENT_LABEL),
@@ -874,6 +889,32 @@ mod tests {
                 Some("probe-deployment"),
                 "the outcome names who ran the pass, for the same reason the \
                  removal rows do: {row:?}"
+            );
+        }
+    }
+
+    /// The counters whose label set was widened while the name stayed, and
+    /// whose orphans were still being served when this was written.
+    ///
+    /// Not a restatement of the registry for its own sake: each pair is here
+    /// because someone counted the writes on 2026-10-29 and the alternative
+    /// reading of the same store rows is wrong. The orphans outvalue their
+    /// live siblings by an order of magnitude, so a reader that sees the
+    /// family without this release sees the frozen total and not the traffic.
+    ///
+    /// A name leaves this list only with a measurement that says its producer
+    /// stopped carrying the label, which is the opposite of why it was added.
+    #[test]
+    fn the_shapes_whose_label_became_mandatory_stay_declared() {
+        for (name, label) in [
+            ("cogneva_mainline_ci_verdict_total", "ask"),
+            ("cogneva_process_report_ingest_total", "node"),
+        ] {
+            assert!(
+                SUPERSEDED_SHAPES.contains(&(name, label)),
+                "{name} without {label} is a frozen total that reads as traffic: \
+                 its live sibling is written every minute and the orphan has been \
+                 quiet since the day the label was added"
             );
         }
     }
