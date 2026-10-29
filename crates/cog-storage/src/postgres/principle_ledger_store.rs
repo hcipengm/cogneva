@@ -73,6 +73,12 @@ const ROW_COLUMNS: &str = "slug, lead, carrier_path, carrier_sha256, host_gate, 
 const SLUG_MAX: usize = 191;
 const SOURCE_MAX: usize = 512;
 const REFUSAL_SOURCE_MAX: usize = 256;
+/// The shape name a refusal carries: the gate's own key for what matched, not
+/// the principle it counts against.
+const REFUSAL_CRITERION_MAX: usize = 64;
+/// The matched text. Wide enough to hold a phrase, narrow enough that the intake
+/// stays a record of what happened rather than a copy of the call.
+const REFUSAL_SPAN_MAX: usize = 512;
 const SHA256_MAX: usize = 64;
 
 /// PostgreSQL principle ledger store.
@@ -678,10 +684,13 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         let mut queued = 0usize;
         for event in events {
             check_refusal(event).map_err(SFError::Validation)?;
+            let span: String = event.span.chars().take(REFUSAL_SPAN_MAX).collect();
             let outcome = sqlx::query(REPORT_REFUSAL_SQL)
                 .bind(&event.slug)
                 .bind(event.refused_at)
                 .bind(&event.source)
+                .bind(&event.criterion)
+                .bind(&span)
                 .bind(event.count)
                 .execute(&self.pool)
                 .await
@@ -1063,11 +1072,24 @@ const CHECK_KIND_CENSUS_SQL: &str = concat!(
 /// than the key matches no unique constraint, and the insert fails at run time
 /// rather than merging. `hits` is left out for the opposite reason: a magnitude
 /// is counted by the side that did the refusing, and this side counts none.
+/// The key includes `criterion`, so two shapes of one principle refused in the
+/// same second are two rows.
+///
+/// They are two facts: a call that both added widely and committed bare was
+/// refused for two reasons, and a row that named whichever arrived first would
+/// answer "which shape is doing this" with the wrong shape for good. The merge
+/// below is the same merge as before, one column narrower: a re-report of the
+/// same shape still collapses, and only a genuinely different shape takes a row
+/// of its own.
+///
+/// `span` is written on insert and left alone on conflict, like `briefed`: it is
+/// what the refusing side saw at that instant, and a re-report of the same event
+/// is not a second observation of it.
 const REPORT_REFUSAL_SQL: &str = "\
-INSERT INTO principle_refusals (slug, refused_at, source, session_id, count)
-VALUES ($1, $2, $3, '', $4)
-ON CONFLICT (slug, refused_at, source, session_id) DO UPDATE
-SET count = GREATEST(principle_refusals.count, EXCLUDED.count)
+INSERT INTO principle_refusals (slug, refused_at, source, criterion, span, session_id, count) \
+VALUES ($1, $2, $3, $4, $5, '', $6) \
+ON CONFLICT (slug, refused_at, source, session_id, criterion) DO UPDATE \
+SET count = GREATEST(principle_refusals.count, EXCLUDED.count) \
 WHERE principle_refusals.count < EXCLUDED.count";
 
 /// A refusal queued for the fold, carrying the whole of its key.
@@ -1216,6 +1238,19 @@ fn check_reading(reading: &PrincipleReading) -> Result<(), String> {
 fn check_refusal(event: &PrincipleRefusal) -> Result<(), String> {
     check_fits("slug", &event.slug, SLUG_MAX)?;
     check_fits("source", &event.source, REFUSAL_SOURCE_MAX)?;
+    // A criterion longer than the column is refused, not cut: it is part of the
+    // key, and two shape names that agree for the first sixty-four characters
+    // would become one shape without anybody deciding that. The span, one line
+    // down, is cut instead -- it is the evidence and not the identity, and
+    // losing a refusal because its text ran long would trade the count for the
+    // description of it.
+    if event.criterion.chars().count() > REFUSAL_CRITERION_MAX {
+        return Err(format!(
+            "the criterion of a refusal of {} is longer than {REFUSAL_CRITERION_MAX} characters, \
+             which is not a shape name",
+            event.slug
+        ));
+    }
     if event.count < 1 {
         return Err(format!(
             "a refusal of {} carries count {}, which is not a refusal",

@@ -165,13 +165,24 @@ pub async fn report(workdir: &Path, store: &dyn PrincipleLedgerStore, rev: &str,
     };
 
     let mut slugs: BTreeSet<String> = BTreeSet::new();
+    // Which file a principle was declared in, so the refusal can say where the
+    // gate that went red is written. A slug is the name of a memory, and the
+    // memory names the gate; the file this run actually read is the one thing
+    // here that puts the two together at the revision that failed.
+    let mut declared_in: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     let mut unreadable = 0usize;
     let mut read = 0usize;
     for path in paths.iter().take(MAX_FILES_READ) {
         match run_git(workdir, &["show", &format!("{rev}:{path}")]).await {
             Ok(source) => {
                 read += 1;
-                slugs.extend(declared_slugs(&source));
+                for slug in declared_slugs(&source) {
+                    declared_in
+                        .entry(slug.clone())
+                        .or_insert_with(|| path.clone());
+                    slugs.insert(slug);
+                }
             }
             // A path in a log is not necessarily a path this revision holds: it
             // can come from another job's tree, from a dependency, or from a
@@ -199,6 +210,11 @@ pub async fn report(workdir: &Path, store: &dyn PrincipleLedgerStore, rev: &str,
             refused_at,
             source: format!("ci:{rev}"),
             count: 1,
+            // The shape here is a red revision, and what it matched is the file
+            // that declares the principle: the gate this run failed in is
+            // written there, and that is what a reader has to open to see why.
+            criterion: "ci_red_revision".into(),
+            span: declared_in.get(slug).cloned().unwrap_or_default(),
         })
         .collect();
     match store.report_refusals(&events).await {

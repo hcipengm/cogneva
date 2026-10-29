@@ -65,12 +65,24 @@ async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
 
 /// One refusal as a gate reports it, at an instant of this run.
 fn refusal(slug: &str, second: i64, count: i64) -> PrincipleRefusal {
+    refusal_of_shape(slug, second, count, "probe-shape", "the text that matched")
+}
+
+fn refusal_of_shape(
+    slug: &str,
+    second: i64,
+    count: i64,
+    criterion: &str,
+    span: &str,
+) -> PrincipleRefusal {
     PrincipleRefusal {
         slug: slug.to_string(),
         refused_at: chrono::DateTime::from_timestamp(second, 0)
             .expect("a second inside the representable range"),
         source: "probe-census".into(),
         count,
+        criterion: criterion.into(),
+        span: span.into(),
     }
 }
 

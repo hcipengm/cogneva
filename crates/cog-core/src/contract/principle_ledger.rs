@@ -357,6 +357,22 @@ pub struct PrincipleRefusal {
     /// by source rather than only in total.
     pub source: String,
     pub count: i64,
+    /// Which of the principle's shapes matched.
+    ///
+    /// One principle can be carried by several shapes -- the shared-tree rule
+    /// has a wide add and a bare commit, the deferral rule has a family of
+    /// sentences -- and until this was recorded the count could not be split
+    /// by them. Empty is not a shape: it is "the refusing side did not say",
+    /// which is what a row written before this existed answers, so it must read
+    /// as an unknown population rather than as one shape more.
+    pub criterion: String,
+    /// The text that matched, verbatim.
+    ///
+    /// This is what makes a row replayable: the phrase the gate refused can be
+    /// read from the row itself, without the call, the tree or the session that
+    /// produced it still existing. A summary of the phrase would answer the same
+    /// question only while its author and its reader agreed about the words.
+    pub span: String,
 }
 
 /// The shape of a platform-side declaration, as a line of the platform's own
