@@ -131,8 +131,24 @@ impl ContextWindow {
         tool_result_budget_chars(self.max_tokens)
     }
 
+    /// 裁到哪一格为止。
+    ///
+    /// 不是裁到预算为止，是裁到预算的一半：前缀缓存只认「从第一个字节起
+    /// 完全相同的这一段」，而裁剪从地板之后删起，删掉的那一格就是下一轮
+    /// 缓存长度为零的分界点。裁到刚刚压线时，下一轮新增一条消息就又过界、
+    /// 又删一格，于是**每一轮**的前缀都往前挪一格——命中率永远只有地板
+    /// （system 与首条 user）那几百 token，窗口一旦填满就再也涨不回去。
+    /// 裁到一半，同样的事隔一整个半窗才发生一次，中间每一轮都是纯追加。
+    fn trim_target(&self) -> usize {
+        self.max_tokens / TRIM_LOW_WATER_DIVISOR
+    }
+
     fn trim_if_needed(&mut self) {
-        while self.current_tokens > self.max_tokens && self.messages.len() > 2 {
+        // 只有真过界才裁；一旦裁就裁到低水位，而不是裁到刚好不超。
+        // 判据是「这一次入队把窗口顶过了预算」——没过界就不裁，过界之后
+        // 的循环由低水位收尾。
+        let over_budget = self.current_tokens > self.max_tokens;
+        while over_budget && self.current_tokens > self.trim_target() && self.messages.len() > 2 {
             // 保留 system message 与首条 user（任务输入）：丢掉首条 user 后，
             // 后续轮次会变成 assistant/tool 起头的无目标对话，模型答非所问。
             // 删除单位是「轮次组」：assistant(tool_calls) 与其紧随的 tool result
@@ -176,10 +192,11 @@ impl ContextWindow {
             // 不另铸指标：压力读数由耐久面自己给（transcript 的估算长度对窗口
             // 配置），铸一个只在这里 +1 的计数器，等于把同一个量记两遍。
             tracing::debug!(
-                "Context window dropped {} messages (~{} tokens) from the prompt; the window budget is {}, the run history keeps {} messages",
+                "Context window dropped {} messages (~{} tokens) from the prompt; the window budget is {}, the low-water target is {}, the run history keeps {} messages",
                 dropped,
                 freed,
                 self.max_tokens,
+                self.trim_target(),
                 self.history.len(),
             );
         }
@@ -225,6 +242,14 @@ impl ContextWindow {
 /// 这条结果根本挤不进这段对话。与窗口同源而不是另立一个绝对值：
 /// 窗口配大了，允许的单条结果跟着变大，两者不会各自漂移。
 const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
+
+/// 裁剪要把窗口压到预算的几分之一为止，即滞回的低水位。
+///
+/// 裁到刚好压线，下一轮新增一条就又过界、又删一格：投影的前缀每轮都往前
+/// 挪一格，缓存从第一个被删的位置起全部作废，命中率永远只剩地板。压到一半
+/// 之后，同样的裁剪要隔半个窗口才再发生一次，中间每一轮都是纯追加。
+/// 见 [`ContextWindow::trim_target`]。
+const TRIM_LOW_WATER_DIVISOR: usize = 2;
 
 /// The number of characters one tool result may occupy before it is cut.
 ///
@@ -704,6 +729,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// 窗口填满之后，下一轮不许再裁一次。
+    ///
+    /// 裁剪从地板（system 与首条 user）之后删起，所以每裁一次，缓存能认到的
+    /// 前缀就断在新删掉的那一格上。裁到刚好压线时，下一轮任何一条新消息都会
+    /// 再压线、再删一格：投影每轮都变，命中率永远只剩地板那几百 token——窗口
+    /// 一旦填满就再也涨不回去。所以裁完必须留出一整个半窗，让后续若干轮都是
+    /// 纯追加。这条用例钉的就是「裁完还有余量」，不是「裁到预算以内」。
+    #[test]
+    fn trimming_leaves_room_so_the_next_turn_does_not_trim_again() {
+        let mut ctx = ContextWindow::new(200);
+        ctx.add_message(Message::system("系统提示词"));
+        ctx.add_message(Message::user("原始任务输入"));
+        let turn = |i: usize| Message::user(format!("第 {i} 轮输入 {}", "内容 ".repeat(20)));
+        let mut trimmed = false;
+        let mut before = ctx.token_count();
+        for i in 0..12 {
+            ctx.add_message(turn(i));
+            let now = ctx.token_count();
+            if now < before {
+                trimmed = true;
+                break;
+            }
+            before = now;
+        }
+        assert!(
+            trimmed,
+            "这组输入必须真的把窗口顶过界，否则这条用例没有题目"
+        );
+        assert!(
+            ctx.token_count() <= 100,
+            "过界之后必须一路裁到半窗以下，而不是裁到刚好压线：{}",
+            ctx.token_count()
+        );
+
+        let prefix: Vec<String> = ctx.messages().iter().map(|m| m.content()).collect();
+        ctx.add_message(turn(99));
+        let after: Vec<String> = ctx.messages().iter().map(|m| m.content()).collect();
+
+        assert_eq!(
+            after.len(),
+            prefix.len() + 1,
+            "同规模的一条新消息进来时窗口应当还在半窗之上，不该再触发第二次裁剪"
+        );
+        assert_eq!(
+            &after[..prefix.len()],
+            &prefix[..],
+            "前缀必须原样保留——缓存认的就是这一段"
+        );
     }
 
     #[test]
