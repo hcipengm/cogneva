@@ -186,6 +186,36 @@ else
     echo "SKIP  容量登记表：本机既没有可用的 rustc 也没有 cargo（CI 的 Test 会跑这一步）"
 fi
 
+# 告警规则契约：`crates/cogneva/tests/observability_alert_rule_contract_test.rs` 是**唯一**
+# 会因为「发布了一条没有读者的序列」而红的门，与上面那张登记表是同一笔账的另一面——
+# 一个数字没有来历、一条序列没有读者，都只在 CI 里才被问。2026-10-29 实测：
+# `cogneva_change_ledger_remeasure_pending` 发布出去了，规则只在 summary 里提到它、
+# promql 里没读它，推上去 `Code Coverage` 红、部署器按设计停在最后一个绿 rev 上，
+# 整条主线跟着停。
+#
+# 走 `cargo test` 而不是裸 `rustc`：这份测试从 `tests/common` 取仓库根与词法分析，
+# 裸 `rustc` 没有 `--extern` 解析不了。价格是两个数，别混成一个：判定 0.11 秒，
+# 冷编译 7 分 55 秒。跑**整份文件**（本地 102 条），不加 filter —— 挑着跑一条是在挑
+# 判据，而这条门唯一不能犯的错就是「它绿了，CI 却红了」。
+#
+# 这一格没把整条脚本推到二十分钟，靠的是**它排在容量登记表之后**：那张表的快路（裸
+# `rustc`）今天编不出来、实测 1.2 秒即失败，于是走 `cargo test` 回退，而回退编的是
+# 同一个 `cogneva` test target —— 轮到这一格时编译已经热了，多花的只有判定那 0.11 秒。
+# 这个顺序是它便宜的**唯一**理由。哪天快路修好了、容量登记表真的只花几秒，这一格就会
+# 退回冷编译的 8 分钟；那时要么把它挪进 cargo 回退那一支，要么给它加触发条件。
+#
+# 还有一处它必然要付出的代价，写在读它的人最容易读错的地方：**这条门判的是工作树，而推
+# 上去的是提交**。共享工作树里别的会话飞到一半的改动也在这一份读数里，所以它红的时候先
+# `git status` 看一眼红的是谁的文件——别人的半成品不进你的提交，这一格红了也说明不了你要
+# 推的那一笔红了。反过来也别把它当噪声：那一格绿的时候它确实判过了你树上的东西。
+cargo_bin="${capreg_cargo}"
+if [ -n "${cargo_bin}" ]; then
+    run_step "告警规则契约（observability_alert_rule_contract_test）" \
+        "${cargo_bin}" test -p cogneva --test observability_alert_rule_contract_test
+else
+    echo "SKIP  告警规则契约：本机没有可用的 cargo（CI 的 Code Coverage 会跑这一步）"
+fi
+
 # Check 作业本机跑不动（要编译整个工作区，比 CI 还慢），可它红得最多的一种形状本机
 # 几秒钟就能判：**推上去的这几笔，新增了对一个这棵树里不存在的模块的引用**。
 # 2026-10-29 实测过一次代价：一笔带 `use crate::test_support::scrape;` 而定义它的文件
