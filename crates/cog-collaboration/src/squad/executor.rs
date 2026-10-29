@@ -9,7 +9,9 @@ use std::sync::Arc;
 use crate::actors::{EvaluatorActor, GeneratorActor, PlannerActor};
 use crate::hierarchy::{HierarchicalCommunication, HierarchicalMessage};
 use crate::profile::PgeMode;
-use crate::squad::classify::{classify, PACED_CLASS};
+use crate::squad::classify::{
+    classify, PACED_CLASS, TERMINAL_ENV_FAILURE_CLASS, UPSTREAM_UNAVAILABLE_CLASS,
+};
 use crate::squad::pge::pipeline::{PgePipeline, PgePipelineConfig};
 use crate::squad::pge::roundtable::{PgeRoundtable, PgeRoundtableConfig};
 use crate::squad::ralph::ralph_loop::{RalphLoop, RalphLoopConfig, RalphVerdict};
@@ -320,16 +322,26 @@ impl SquadExecutor {
         if let Some(ref engine) = self.meta_learning {
             let decision = crate::meta_features::squad_decision();
             if let Some(mode_str) = result.pge_mode.as_learnt_mode() {
-                let _ = engine
-                    .record_outcome(
-                        &decision.group,
-                        &decision.features,
-                        mode_str,
-                        result.success,
-                        if result.success { 1.0 } else { 0.0 },
-                        0,
-                    )
-                    .await;
+                if result.success || reason_speaks_of_the_mode(result.error.as_deref()) {
+                    let _ = engine
+                        .record_outcome(
+                            &decision.group,
+                            &decision.features,
+                            mode_str,
+                            result.success,
+                            if result.success { 1.0 } else { 0.0 },
+                            0,
+                        )
+                        .await;
+                } else {
+                    tracing::info!(
+                        squad_id = %result.squad_id,
+                        mode = mode_str,
+                        reason = result.error.as_deref().unwrap_or(""),
+                        "Not recorded as a trial of the mode: the call was refused before \
+                         the topology could run, so this tells the selector nothing about it"
+                    );
+                }
             }
         }
 
@@ -1257,6 +1269,31 @@ fn declared_unfixable(verdict: &RalphVerdict) -> bool {
     )
 }
 
+/// Whether a run that did not succeed says anything about the topology that ran
+/// it.
+///
+/// The three environment classes are the same answer for every mode: the call
+/// was never served, or the transport died before the work could start, so
+/// neither topology was given a chance. Recorded as a failed trial, a week-long
+/// outage becomes a week of evidence that the mode under it is the thing that
+/// fails, and the longer it lasts the more sure the selector is -- the sample
+/// it learns from is a batch of trials that never happened. That is the same
+/// pollution the decomposition path above is kept out of, and it is decided by
+/// the classifier the retry ladder already reads rather than a second list of
+/// prefixes that would drift from it.
+///
+/// A degenerate loop stays a trial: spending the budget without producing
+/// anything is exactly what the topology did, and the selector should learn it.
+fn reason_speaks_of_the_mode(reason: Option<&str>) -> bool {
+    match reason {
+        None => true,
+        Some(reason) => !matches!(
+            classify(reason),
+            UPSTREAM_UNAVAILABLE_CLASS | PACED_CLASS | TERMINAL_ENV_FAILURE_CLASS
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1344,6 +1381,50 @@ mod tests {
                 "an undeclared failure must keep its upgrade: {undeclared:?}"
             );
         }
+    }
+
+    /// 上游拒绝不是对模式的判决。
+    ///
+    /// 实测的形状：两个 LLM 面同时熔断的那段时间里，进化循环每一轮都以
+    /// `upstream_unavailable: environment_error: ...` 结束，于是一轮一条
+    /// `mode: roundtable, success: false` 写进 meta_learning。停得越久，
+    /// 选择器越确信失败的是 roundtable，而真正被拒绝的是每一次调用。
+    #[test]
+    fn an_environment_refusal_is_not_a_trial_of_the_mode() {
+        use cog_core::contract::outcome::{
+            DEGENERATE_LOOP_PREFIX, TERMINAL_ENV_FAILURE_PREFIX, UPSTREAM_UNAVAILABLE_PREFIX,
+        };
+
+        for refused in [
+            format!(
+                "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: \
+                 LLM upstream refused (server_error): HTTP 503"
+            ),
+            format!(
+                "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: \
+                 LLM upstream refused (rate_limited): HTTP 429"
+            ),
+            format!("Agent execution error: {TERMINAL_ENV_FAILURE_PREFIX}: upstream 503"),
+        ] {
+            assert!(
+                !reason_speaks_of_the_mode(Some(&refused)),
+                "an environment refusal says nothing about the mode: {refused:?}"
+            );
+        }
+
+        // 花了预算没买到进展，是拓扑自己的结果，选择器该学到它。
+        for about_the_mode in [
+            format!("{DEGENERATE_LOOP_PREFIX}: 3 iterations bought no progress"),
+            "evaluator: criteria unmet".to_string(),
+        ] {
+            assert!(
+                reason_speaks_of_the_mode(Some(&about_the_mode)),
+                "this failure is the mode's own: {about_the_mode:?}"
+            );
+        }
+
+        // 没失败的一轮当然是一次试验。
+        assert!(reason_speaks_of_the_mode(None));
     }
 
     #[test]
