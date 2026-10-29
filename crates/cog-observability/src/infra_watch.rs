@@ -381,6 +381,9 @@ async fn tick(
     // decision itself is taken once, after every rule, because it is a question
     // about the shared rows rather than about one rule's pass.
     let mut due: Vec<String> = Vec::new();
+    // The rules this pass actually read. A row of a rule that could not be read
+    // is one nobody looked at this tick, not one nobody is looking at any more.
+    let mut evaluated_ok: HashSet<String> = HashSet::new();
     for rule in &config.rules {
         let series = match query_prometheus(http, &config.prometheus_url, &rule.promql).await {
             Ok(series) => series,
@@ -435,6 +438,7 @@ async fn tick(
         // resolves (including rows adopted after a restart, for which no
         // in-process streak exists), and the streak resets.
         failure_streaks.remove(&rule.name);
+        evaluated_ok.insert(rule.name.clone());
         let eval_key = format!("{EVAL_FAILURE_RULE}:{}", rule.name);
         if eval_failure_firing.contains(&eval_key) && resolve(&eval_key, outlets).await {
             eval_failure_firing.remove(&eval_key);
@@ -473,7 +477,7 @@ async fn tick(
             }
         }
     }
-    close_unattended(&due, config, outlets, known_firing, missing).await;
+    close_unattended(&due, &evaluated_ok, config, outlets, known_firing, missing).await;
 }
 
 /// Close the rows no pass has listed for long enough, once nobody is sighting
@@ -498,12 +502,13 @@ async fn tick(
 /// only reading available.
 async fn close_unattended(
     due: &[String],
+    evaluated_ok: &HashSet<String>,
     config: &InfraWatchConfig,
     outlets: &InfraWatchOutlets,
     known_firing: &mut HashSet<String>,
     missing: &mut HashMap<String, u32>,
 ) {
-    if due.is_empty() {
+    if due.is_empty() && config.rules.is_empty() {
         return;
     }
     // One tick of margin either side of the count: a writer that reports every
@@ -512,23 +517,21 @@ async fn close_unattended(
     let stale_after = chrono::Duration::seconds(
         (config.poll_interval_secs.max(1) * u64::from(MISSING_TICKS_BEFORE_CLOSE)) as i64,
     );
-    let sighted_elsewhere: HashSet<String> = match &outlets.store {
+    let (closing, present): (Vec<String>, HashSet<String>) = match &outlets.store {
         Some(store) => {
             let rules: Vec<String> = config.rules.iter().map(|r| r.name.clone()).collect();
             match store.firing_rows_for_rules(&rules).await {
-                Ok(rows) => {
-                    let now = Utc::now();
-                    rows.into_iter()
-                        .filter(|row| due.iter().any(|key| key == &row.dedup_key))
-                        .filter(|row| match row.last_seen_at {
-                            // A clock that is still moving belongs to somebody
-                            // else's sighting, not to the end of a condition.
-                            Some(seen) => now.signed_duration_since(seen) < stale_after,
-                            None => false,
-                        })
-                        .map(|row| row.dedup_key)
-                        .collect()
-                }
+                Ok(rows) => (
+                    unattended_rows(
+                        &rows,
+                        due,
+                        evaluated_ok,
+                        known_firing,
+                        Utc::now(),
+                        stale_after,
+                    ),
+                    rows.iter().map(|row| row.dedup_key.clone()).collect(),
+                ),
                 Err(e) => {
                     // A row list that could not be read is not a list of rows
                     // nobody is sighting; closing on it would turn one store
@@ -538,12 +541,11 @@ async fn close_unattended(
                 }
             }
         }
-        None => HashSet::new(),
+        // Without a store there is nothing shared to ask, and the local count is
+        // the only reading available.
+        None => (due.to_vec(), due.iter().cloned().collect()),
     };
-    for key in due {
-        if sighted_elsewhere.contains(key) {
-            continue;
-        }
+    for key in &closing {
         // Keep believing it until the row is actually closed: the close retry
         // lives in this set, and dropping the key here is what turns one failed
         // write into a row that stays `firing` for good.
@@ -553,6 +555,68 @@ async fn close_unattended(
             missing.remove(key);
         }
     }
+    // A key the row list does not carry has no row left to close -- the other
+    // writer got there first, or the row was settled from the panel. The belief
+    // is then the only thing still holding it, so it has to be dropped here or
+    // it is retried every tick for as long as the process lives.
+    for key in due {
+        if present.contains(key) {
+            continue;
+        }
+        let closed = resolve(key, outlets).await;
+        settle_close(known_firing, key, closed);
+        if closed {
+            missing.remove(key);
+        }
+    }
+}
+
+/// The rows this pass should close: the keys it missed often enough, and the
+/// open rows of a rule it read fine that nothing has sighted since.
+///
+/// One question -- is anybody still sighting this row? -- asked of two
+/// readings. `due` is this process's own miss count, and the row's
+/// `last_seen_at` overrules it: a key another writer still reports every tick
+/// carries a moving clock and is not ending.
+///
+/// The second population is a row this process never knew at all: a key another
+/// writer opened after this one adopted its rows. No local count can ever
+/// nominate it, so without this half it outlives the writer that opened it and
+/// stays `firing` for good -- which is what the row-shaped writer split makes
+/// reachable, since a rolling replacement or one failed query is enough for the
+/// two watchers to hold different keys.
+///
+/// `evaluated_ok` is what keeps that second half honest: a rule this pass could
+/// not query says nothing about its rows, and an outage is not a reason for
+/// every alert to report recovery.
+fn unattended_rows(
+    rows: &[AlertRecord],
+    due: &[String],
+    evaluated_ok: &HashSet<String>,
+    known_firing: &HashSet<String>,
+    now: chrono::DateTime<Utc>,
+    stale_after: chrono::Duration,
+) -> Vec<String> {
+    let quiet = |row: &AlertRecord| match row.last_seen_at {
+        // A clock that is still moving belongs to somebody else's sighting,
+        // not to the end of a condition.
+        Some(seen) => now.signed_duration_since(seen) >= stale_after,
+        // No clock at all is the orphan an adoption otherwise strands: nothing
+        // has sighted this row since the column existed.
+        None => true,
+    };
+    let mut closing = Vec::new();
+    for row in rows {
+        let missed = due.iter().any(|key| key == &row.dedup_key);
+        // Nobody here ever opened it, and the rule was read this pass: the row
+        // is somebody else's, and the only claim it has on staying open is a
+        // clock that has stopped.
+        let unclaimed = !known_firing.contains(&row.dedup_key) && evaluated_ok.contains(&row.rule);
+        if (missed || unclaimed) && quiet(row) {
+            closing.push(row.dedup_key.clone());
+        }
+    }
+    closing
 }
 
 /// The pseudo rule name a failed mirror read is booked under.
@@ -3210,6 +3274,7 @@ mod tests {
 
         close_unattended(
             &[key.to_string()],
+            &HashSet::new(),
             &config,
             &outlets,
             &mut known_firing,
@@ -3248,6 +3313,7 @@ mod tests {
 
         close_unattended(
             &[key.to_string()],
+            &HashSet::new(),
             &config,
             &outlets,
             &mut known_firing,
@@ -3268,5 +3334,102 @@ mod tests {
         assert!(!missing.contains_key(key), "关掉之后计数也该清掉");
 
         cog_test_support::drop_schema(&url, &schema).await;
+    }
+
+    /// A firing row, with only the fields the close decision reads set to
+    /// anything in particular.
+    fn firing_row(rule: &str, key: &str, seen: Option<chrono::DateTime<Utc>>) -> AlertRecord {
+        AlertRecord {
+            id: key.to_string(),
+            rule: rule.to_string(),
+            dedup_key: key.to_string(),
+            severity: "warning".into(),
+            state: "firing".into(),
+            message: String::new(),
+            labels: serde_json::json!({}),
+            fired_at: Utc::now(),
+            resolved_at: None,
+            updated_at: Utc::now(),
+            last_seen_at: seen,
+            acknowledged_at: None,
+            acknowledged_by: None,
+        }
+    }
+
+    fn two_intervals() -> chrono::Duration {
+        chrono::Duration::seconds(120)
+    }
+
+    /// A row another writer opened after this process adopted its own is a row
+    /// no local miss count can ever nominate. Its clock is the only evidence
+    /// there is, and a clock that stopped is the end of the condition.
+    #[test]
+    fn a_row_this_pass_never_opened_is_closed_once_its_clock_stops() {
+        let now = Utc::now();
+        let key = "contended_rule:pod=a";
+        let rows = vec![firing_row(
+            "contended_rule",
+            key,
+            Some(now - chrono::Duration::seconds(600)),
+        )];
+        let evaluated_ok: HashSet<String> = HashSet::from(["contended_rule".to_string()]);
+        let closing = unattended_rows(
+            &rows,
+            &[],
+            &evaluated_ok,
+            &HashSet::new(),
+            now,
+            two_intervals(),
+        );
+        assert_eq!(
+            closing,
+            vec![key.to_string()],
+            "另一个写者开出来、此后再没人刷新的行，本进程连漏拍都数不到它，只能靠时钟关"
+        );
+    }
+
+    /// An outage is not an ending. A rule this pass could not query says
+    /// nothing about its rows, so its clock going stale proves nothing.
+    #[test]
+    fn a_row_of_a_rule_that_could_not_be_read_is_left_open() {
+        let now = Utc::now();
+        let rows = vec![firing_row(
+            "contended_rule",
+            "contended_rule:pod=a",
+            Some(now - chrono::Duration::seconds(600)),
+        )];
+        let closing = unattended_rows(
+            &rows,
+            &[],
+            &HashSet::new(),
+            &HashSet::new(),
+            now,
+            two_intervals(),
+        );
+        assert!(
+            closing.is_empty(),
+            "这一拍没读到这条规则，不是这条规则的行没人管了"
+        );
+    }
+
+    /// The local miss count nominates; the shared clock decides. A key this
+    /// process stopped seeing but another keeps reporting stays open.
+    #[test]
+    fn a_clock_still_moving_keeps_a_missed_key_open() {
+        let now = Utc::now();
+        let key = "contended_rule:pod=a";
+        let rows = vec![firing_row("contended_rule", key, Some(now))];
+        let closing = unattended_rows(
+            &rows,
+            &[key.to_string()],
+            &HashSet::new(),
+            &HashSet::from([key.to_string()]),
+            now,
+            two_intervals(),
+        );
+        assert!(
+            closing.is_empty(),
+            "另一个写者这一拍还在刷新的行，本进程漏了几拍也关不得"
+        );
     }
 }
