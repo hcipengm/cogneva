@@ -1805,6 +1805,16 @@ data:
               "face": "变更管理"
             },
             {
+              "name": "change_ledger_remeasure_stuck",
+              "promql": "max without (pod, container, instance) (cogneva_change_ledger_remeasure_oldest_seconds and ((time() - cogneva_change_ledger_remeasure_oldest_seconds_observed_timestamp_seconds) < 1800)) > 1800",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "the oldest request to measure a change again has been waiting {value} second(s), and the writer is still stamping. This intake is the only way a change retired under a rule that lives outside the measured tree comes back after that rule is corrected: the tree never moves, so a second reading of the tree would never revisit the row, and the account's own sweeps cannot reach it either. The writer folds its whole queue on the pass after the one that filled it, so the ordinary wait is under one interval -- five minutes -- and six of them is not slowness but a fold that is not reaching the request. Read the two numbers beside it: cogneva_change_ledger_remeasure_pending is how many are waiting and this is how long the oldest has, so a depth that turns over while this age climbs is one row the tree cannot settle, and a depth that does not move at all is the writer, whose liveness is cogneva_loop_tick_age_seconds. It is silent while the writer is not stamping -- the store serves each series' newest row forever, and a rule that stayed fired on a frozen sample is one no repair could put out",
+              "face": "变更管理"
+            },
+            {
               "name": "evolution_resident_index_outlives_its_changes",
               "promql": "(max by (dir) (cogneva_evolution_resident_results) > max by (dir) (cogneva_evolution_change_queue_files))",
               "condition": {
