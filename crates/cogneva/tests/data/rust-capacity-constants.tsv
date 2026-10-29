@@ -29,6 +29,7 @@ crates/cog-agent/src/archive.rs	ARCHIVE_TIMEOUT_SECS	20	bound	one turn's share: 
 crates/cog-agent/src/consumer.rs	INBOX_RECLAIM_BATCH	64	bound	How many pending messages one reclaim call asks for.
 crates/cog-agent/src/consumer.rs	INBOX_RECLAIM_MIN_IDLE_MS	60_000	bound	safety threshold so a still-draining process is not robbed; nothing waits on it
 crates/cog-agent/src/context.rs	TOOL_RESULT_WINDOW_SHARE_DIVISOR	2	bound	policy split: half the window is kept for task input and later turns
+crates/cog-agent/src/context.rs	TRIM_LOW_WATER_DIVISOR	2	bound	the low-water mark the trim cuts to, not the budget it cuts from: cutting to exactly the budget drops one entry every turn and slides the cached prefix forever, so the cut goes to half and the same cut returns a half window later
 crates/cog-agent/src/hooks/lifecycle.rs	DEFAULT_LIFECYCLE_CHANNEL_BUFFER	256	bound	Default capacity of the engine's input channel.
 crates/cog-agent/src/hooks/types.rs	DEFAULT_DEDUP_WINDOW	1s	bound	identical events inside one second run one action; cog-core's dedup_window_secs default spells the same 1
 crates/cog-agent/src/hooks/types.rs	DEFAULT_HOOK_TIMEOUT	30s	bound	a default wait for one hook action; cog-core's hook_timeout_secs and HookDef::timeout() spell the same 30
@@ -343,6 +344,7 @@ crates/cog-orchestrator/src/change_ledger.rs	MEASUREMENTS_PER_PASS	200	bound	How
 crates/cog-orchestrator/src/change_ledger.rs	NAMED	20	bound	Rows one account line names before it summarises the rest as a count: a line is an annotation, and an account that came to hold thousands of rows would otherwise turn it into a dump.
 crates/cog-orchestrator/src/change_ledger.rs	OUTSTANDING_PEEK	50	bound	How many outstanding rows one round reads.
 crates/cog-orchestrator/src/change_ledger.rs	PARENT_BACKFILL_PER_PASS	50	bound	How many existing landings one pass fills a parent reading for.
+crates/cog-orchestrator/src/change_ledger.rs	REMEASURE_PER_PASS	64	bound	one maintenance tick's slice of the re-measurements producers queued after correcting a rule; a producer that queued the whole account would be using this as a sweep, and a full batch warns rather than growing
 crates/cog-orchestrator/src/change_ledger.rs	RESTORED_ANSWERED_PER_PASS	1024	bound	How many retirements that say "another account answered this" one pass re-asks.
 crates/cog-orchestrator/src/change_ledger.rs	RETIRED_RECHECK_PER_PASS	500	bound	How many retired rows one pass asks whether their surface came back.
 crates/cog-orchestrator/src/change_ledger.rs	RETIREMENTS_PER_PASS	200	bound	How many queued retirements one pass folds into the account.
