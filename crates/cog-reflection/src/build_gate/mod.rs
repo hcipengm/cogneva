@@ -640,6 +640,22 @@ struct HostLoad {
     /// quiet, carried with the sample so a reading and the number derived from
     /// it are described by one declaration.
     tuning: Tuning,
+    /// Percentage points of `io some avg60` one build has been measured to
+    /// charge the device, learned over the windows this gate has watched.
+    ///
+    /// The io reading is the one dimension whose per-build cost is not in the
+    /// deployment's declaration: cores and peak resident bytes are properties of
+    /// the workspace that were measured once and written down, while what a
+    /// build costs the disk moves with what the build does and with what else is
+    /// writing to the same device. So it is learned instead, which is also what
+    /// makes the dimension comparable across a build: the raw reading answers
+    /// "many" between builds and "one" during them, and a remembered cost is
+    /// what removes the build from its own measurement.
+    ///
+    /// `None` means no window with a build in it has been seen yet, which is the
+    /// state of a process that has just started. The dimension then reads the
+    /// device directly, as it did before there was a cost to remember.
+    per_build_io: Option<f64>,
 }
 
 /// Free bytes of the filesystem `dir` is on.
@@ -829,6 +845,9 @@ impl HostLoad {
             budget: BuildBudget::read(),
             disk_free_bytes: disk_bytes(dir),
             tuning,
+            // Learned by the caller from earlier windows; this window's own
+            // sample is what teaches the next one.
+            per_build_io: None,
         })
     }
 
@@ -899,6 +918,12 @@ impl HostLoad {
     /// What each dimension answers on its own, in the order the ceiling breaks
     /// ties.
     ///
+    /// One property holds every dimension together, and it is why the bound
+    /// settles: the answer does not depend on how many of the gate's own builds
+    /// are running. A capacity is a fact about the host, and a reading that
+    /// falls because the gate admitted a build counts that build twice -- once
+    /// in the reading, once in the occupancy the bound is enforced against.
+    ///
     /// Published beside the ceiling rather than folded into it: the ceiling is
     /// one number and names one dimension, so a reader looking at it cannot tell
     /// a host with one tight wall from a host with four nearly-tight ones, and
@@ -907,26 +932,47 @@ impl HostLoad {
     /// readings it is chosen from, taken in the same sample.
     fn dimensions(&self) -> [(&'static str, f64); 4] {
         let cores = self.cores.max(1) as f64;
-        let cpu = ((cores - self.busy_cores) / self.tuning.build_demand_cores).clamp(1.0, cores);
-        let memory = (self
-            .pressure
-            .mem_available_bytes
-            .saturating_sub(self.tuning.mem_floor_bytes) as f64
-            / self.tuning.build_peak_rss_bytes as f64)
+        // Each dimension answers "how many builds in total", and the bound it is
+        // compared against counts the builds already running, so the ones in
+        // flight are added back to the room the reading finds. Without that, a
+        // reading of what is *left* was read as the whole: every build the gate
+        // admitted lowered the ceiling by one, the bound fell to it, and the
+        // gate spent the day taking back the slot it had just handed out.
+        // Measured on this host over ten days, the bound moved 231-409 times a
+        // day in that loop, a median 148 seconds apart against a window of 60.
+        let in_flight = self.pressure.builds_in_flight as f64;
+        let cpu = (in_flight + (cores - self.busy_cores) / self.tuning.build_demand_cores)
             .clamp(1.0, cores);
-        // The disk is charged against the stall it is showing now: the builds it
-        // is absorbing are the budget divided by that, so the same device reads
-        // as room for several builds when it is quiet and for one when a build
-        // is already keeping it busy.
-        let io =
-            (self.tuning.io_stall_budget_pct / self.pressure.io_avg60.max(0.01)).clamp(1.0, cores);
+        let memory = (in_flight
+            + self
+                .pressure
+                .mem_available_bytes
+                .saturating_sub(self.tuning.mem_floor_bytes) as f64
+                / self.tuning.build_peak_rss_bytes as f64)
+            .clamp(1.0, cores);
+        // The disk is the one dimension whose cost of a build is measured rather
+        // than declared, so it is charged that way: the budget divided by what
+        // one build has been seen to cost the device, plus whatever load the
+        // builds in flight do not explain -- which is somebody else's writeback,
+        // and it costs the room a build would.
+        //
+        // Charging the raw reading instead, as this did, made the dimension a
+        // square wave of its own admissions: `io some avg60` is 30-58% under one
+        // of our builds and under 1% with none running, so the same device
+        // answered "one" while the build ran and "many" the moment it finished,
+        // and the build that moved it was the gate's own. A cost learned across
+        // windows is the reading that does not contain its own output.
+        let shown = self.pressure.io_avg60.max(0.0);
+        let per_build = self.per_build_io.map(|cost| {
+            let unexplained = (shown - cost * in_flight).max(0.0);
+            cost + unexplained
+        });
+        let io = (self.tuning.io_stall_budget_pct / per_build.unwrap_or(shown).max(0.01))
+            .clamp(1.0, cores);
         let cgroup_memory = self
             .budget
             .as_ref()
-            .map(|b| {
-                b.ceiling(self.tuning.build_peak_rss_bytes)
-                    .clamp(1.0, cores)
-            })
+            .map(|b| (in_flight + b.ceiling(self.tuning.build_peak_rss_bytes)).clamp(1.0, cores))
             .unwrap_or(cores);
         [
             (DIM_CPU, cpu),
@@ -1062,6 +1108,48 @@ const CEILING_DEAD_BAND: f64 = 0.15;
 /// call: a private one leaves the name in no table at all, so what reads it
 /// goes unchecked.
 pub const BUILD_GATE_DIMENSION_CEILING: &str = "cogneva_build_gate_dimension_ceiling";
+/// The rule that watches whether the bound settles at all.
+///
+/// Kept as a name rather than only a string in the deployment: the rule is the
+/// reading that says the derivation converged, so the test that pins it to the
+/// series it counts has to name it, and a rule renamed in one place and not the
+/// other is a reading nobody has.
+pub const BUILD_GATE_BOUND_RULE: &str = "build_gate_bound_not_converging";
+
+/// How far one window's sample moves the remembered cost of a build's io.
+///
+/// A build's own io is bursty -- compiling reads and writes in runs, linking
+/// hardly touches the disk -- and the window is a minute while a build is tens
+/// of minutes, so a per-window sample is a reading of which phase the build is
+/// in as much as of what it costs. Taken as it comes, one quiet minute would
+/// halve the remembered cost and let the bound double. Smoothed, it takes two
+/// windows to cover half the distance to a new steady state and seven to cover
+/// nine tenths, which is inside the life of one build: the cost follows a
+/// workspace that got cheaper, without following a build that got quieter for a
+/// minute.
+const IO_PER_BUILD_SMOOTHING: f64 = 0.3;
+
+/// The remembered io cost of one build after one window.
+///
+/// `sample` is what this window measured, and is `None` when no build of ours
+/// was running: a window with no build in it says nothing about what a build
+/// costs, so it leaves the estimate exactly where it was. That is the other half
+/// of why the dimension stopped waving -- the quiet gaps between builds used to
+/// be read as "the disk is free, take five", and now they are read as "no build
+/// ran, so nothing was learned".
+///
+/// A first sample is taken as it stands rather than smoothed toward a default:
+/// there is no previous estimate to move from, and a default (a fraction of the
+/// budget, say) would be a number no measurement stands behind.
+fn next_per_build_io(previous: Option<f64>, sample: Option<f64>) -> Option<f64> {
+    match (previous, sample) {
+        (None, sample) => sample,
+        (previous, None) => previous,
+        (Some(previous), Some(sample)) => {
+            Some(previous + (sample - previous) * IO_PER_BUILD_SMOOTHING)
+        }
+    }
+}
 
 /// The bound to enforce next, from the bound in force and what the host is
 /// showing.
@@ -1809,6 +1897,17 @@ pub struct BuildGate {
     /// looking at how much room the host reports must not be shown a number the
     /// damping moved.
     held_ceiling: AtomicU64,
+    /// The io cost of one build, learned over the windows this process has
+    /// watched, as the bits of an `f64`; zero means nothing has been learned and
+    /// the io dimension reads the device directly.
+    ///
+    /// In memory rather than beside the bound in the file the builders read: it
+    /// is this process's reading of what a build costs, not a decision about the
+    /// host, and a restart relearning it costs one window with a build in it.
+    /// What a restart does not do is publish a learned cost it never measured --
+    /// a cost read back from a file would outlive the workspace it measured,
+    /// which is the one thing this number has to follow.
+    per_build_io: AtomicU64,
     /// The dimension the ceiling came from.
     dimension: Mutex<&'static str>,
     /// The sample that derivation was made from, published beside it.
@@ -1947,6 +2046,7 @@ impl BuildGate {
             derived: AtomicU64::new(0),
             measured_ceiling: AtomicU64::new(0),
             held_ceiling: AtomicU64::new(0),
+            per_build_io: AtomicU64::new(0),
             dimension: Mutex::new(DIM_UNMEASURED),
             host: Mutex::new(None),
             measured_build_cost: Mutex::new(VecDeque::new()),
@@ -2206,6 +2306,31 @@ impl BuildGate {
         false
     }
 
+    /// The io cost of one build this process has learned, or `None` before a
+    /// window with a build in it has been seen.
+    fn learned_io_cost(&self) -> Option<f64> {
+        match f64::from_bits(self.per_build_io.load(Ordering::Relaxed)) {
+            0.0 => None,
+            cost => Some(cost),
+        }
+    }
+
+    /// Takes what one window measured as one build's io cost, smoothed against
+    /// the estimate already held.
+    ///
+    /// The sample is the device's load divided by the builds in flight: those
+    /// are this gate's own builds, and each of them is one build's worth of the
+    /// reading. A window with none running carries no sample -- the load it
+    /// shows is somebody else's -- so the estimate is left as it was rather than
+    /// read as a build that got cheaper.
+    fn learn_io_cost(&self, load: &HostLoad) {
+        let builds = load.pressure.builds_in_flight;
+        let sample = (builds > 0).then(|| load.pressure.io_avg60 / builds as f64);
+        let next = next_per_build_io(self.learned_io_cost(), sample);
+        self.per_build_io
+            .store(next.unwrap_or(0.0).to_bits(), Ordering::Relaxed);
+    }
+
     /// Re-derives the bound, at most once per window, and persists it where this
     /// process is the one elected to.
     ///
@@ -2242,7 +2367,7 @@ impl BuildGate {
             }
         }
         let (tuning, _) = self.tuning_in_force();
-        let Some(load) = HostLoad::measure(&self.dir, tuning).await else {
+        let Some(mut load) = HostLoad::measure(&self.dir, tuning).await else {
             // No move rather than a move to a default: a host this process
             // cannot read is not a host it may size a bound for.
             tracing::debug!(
@@ -2256,10 +2381,19 @@ impl BuildGate {
         // the previous window enforced, so a host whose reading straddles an
         // integer -- which is what a host building something does -- does not
         // hand the builders a new bound every ninety seconds.
+        // What earlier windows taught this process about one build's io, carried
+        // into this one's arithmetic before anything is derived from it. This
+        // window's own reading is what teaches the next.
+        load.per_build_io = self.learned_io_cost();
         let previous = self.held_ceiling.load(Ordering::Relaxed) as usize;
         let (measured_ceiling, dimension) = load.ceiling();
         let (ceiling, _) = load.ceiling_held_since(previous);
         self.held_ceiling.store(ceiling as u64, Ordering::Relaxed);
+        // The window teaches the io dimension what one build costs, whether or
+        // not the bound moved: the cost is a fact about the device, and the
+        // dimension that reads it should not depend on this window having
+        // changed the answer.
+        self.learn_io_cost(&load);
         // Kept beside the ceiling it produced, from the same sample: the
         // readings published from here are the ones this decision was made on,
         // not a second look at a host that has moved since.
@@ -3912,6 +4046,7 @@ mod tests {
             budget: None,
             disk_free_bytes: None,
             tuning,
+            per_build_io: None,
         }
     }
 
@@ -4711,6 +4846,7 @@ mod tests {
             budget: None,
             disk_free_bytes: None,
             tuning: shipped(),
+            per_build_io: None,
         };
         let plenty = 64 * 1024 * 1024 * 1024;
         // Derived rather than written out: this is the cpu dimension's own
@@ -4780,6 +4916,7 @@ mod tests {
             budget: None,
             disk_free_bytes: Some(1 << 40),
             tuning: shipped(),
+            per_build_io: None,
         };
         // 没有上一拍可依：量到几就是几。
         assert_eq!(load(1.9).ceiling_held_since(0).0, 1);
@@ -4803,6 +4940,209 @@ mod tests {
             assert_eq!(load(2.1).ceiling_held_since(1).0, 2);
             assert_eq!(load(1.9).ceiling_held_since(2).0, 2);
         }
+    }
+
+    /// 宿主没变、闸门自己放出去的构建多了几条，界的答案必须一样。
+    ///
+    /// 这是收敛的判据本身，不是某一种修法：每条构建的代价都如实记进读数里
+    /// （忙核 = 需求核数、可用内存 = 扣掉峰值、io 停顿 = 它自己那份），变的只有
+    /// 在飞的条数 n。
+    ///
+    /// 没有这一条时：cpu / 内存 / cgroup 把「还剩多少」当成「一共有多少」回答，
+    /// 每放出一条构建，界就少一条；界再落回它，闸门当天把刚发出去的槽又收回来。
+    /// 十天的实测是每天 231–409 次移动、间隔中位数 148 秒，而窗口是 60 秒。
+    #[test]
+    fn the_ceiling_does_not_fall_because_the_gate_admitted_a_build() {
+        let gib = 1024 * 1024 * 1024;
+        let host = |n: usize, io_cost: Option<f64>| {
+            let tuning = shipped();
+            let peak = tuning.build_peak_rss_bytes;
+            HostLoad {
+                pressure: Pressure {
+                    cpu_avg10: 0.0,
+                    cpu_avg60: 0.0,
+                    io_avg10: 0.0,
+                    // 我们自己的构建加上设备上别人那半成写回。
+                    io_avg60: 0.5 + io_cost.unwrap_or(0.0) * n as f64,
+                    mem_avg10: 0.0,
+                    mem_avg60: 0.0,
+                    mem_available_bytes: 64 * gib - n as u64 * peak,
+                    builds_in_flight: n,
+                },
+                busy_cores: n as f64 * tuning.build_demand_cores,
+                cores: 24,
+                budget: None,
+                disk_free_bytes: Some(1 << 40),
+                tuning,
+                per_build_io: io_cost,
+            }
+        };
+
+        // 一条吃盘的构建：盘只够一条，它在跑的时候也还是只够一条。
+        let idle = host(0, Some(40.0)).ceiling();
+        assert_eq!(idle.0, 1, "一条构建吃掉大半 io 预算，盘只够一条");
+        for n in 1..=3 {
+            assert_eq!(
+                host(n, Some(40.0)).ceiling(),
+                idle,
+                "{n} 条构建在飞时，同样的宿主读出来的是同一个容量"
+            );
+        }
+
+        // 一条几乎不碰盘的构建：墙是核数，同样不随在飞的条数变。
+        let idle = host(0, Some(2.0)).ceiling();
+        assert_eq!(
+            idle,
+            (
+                (24.0 / shipped().build_demand_cores).floor() as usize,
+                DIM_CPU
+            )
+        );
+        for n in 1..=3 {
+            assert_eq!(
+                host(n, Some(2.0)).ceiling(),
+                idle,
+                "{n} 条轻 io 的构建在飞时，核数这一面答案不变"
+            );
+        }
+    }
+
+    /// 一个构建周期走下来，界不动。
+    ///
+    /// 交替的窗口：没有构建、一条构建在跑、构建结束、下一条起来。io 读数每个
+    /// 窗口都在变（构成它的是构建自己），ceiling 只在第一条构建教会这个进程
+    /// 「一条构建要多少 io」时变一次，之后整段周期一次都不再动——界跟着它动的
+    /// 那几个窗口，就是十天里 404 次移动的来源。
+    #[test]
+    fn a_build_cycle_does_not_keep_moving_the_ceiling() {
+        let gib = 1024 * 1024 * 1024;
+        let host = |n: usize, learned: Option<f64>| {
+            let tuning = shipped();
+            let peak = tuning.build_peak_rss_bytes;
+            HostLoad {
+                pressure: Pressure {
+                    cpu_avg10: 0.0,
+                    cpu_avg60: 0.0,
+                    io_avg10: 0.0,
+                    io_avg60: if n > 0 { 40.0 } else { 0.5 },
+                    mem_avg10: 0.0,
+                    mem_avg60: 0.0,
+                    mem_available_bytes: 64 * gib - n as u64 * peak,
+                    builds_in_flight: n,
+                },
+                busy_cores: n as f64 * tuning.build_demand_cores,
+                cores: 24,
+                budget: None,
+                disk_free_bytes: Some(1 << 40),
+                tuning,
+                per_build_io: learned,
+            }
+        };
+        // 两条构建、每条三个窗口、中间各两个窗口的间隙。
+        let cycle = [0usize, 1, 1, 1, 0, 0, 1, 1, 1, 0, 0, 1];
+        let mut learned: Option<f64> = None;
+        let mut held = 0usize;
+        let mut bound = 1usize;
+        let mut settled: Vec<(usize, usize)> = Vec::new();
+        for (window, n) in cycle.into_iter().enumerate() {
+            let load = host(n, learned);
+            let (ceiling, _) = load.ceiling_held_since(held);
+            held = ceiling;
+            // 构建在飞时宿主不 calm，间隙里也不许它一步跳满：这一条只看稳稳的
+            // 那一侧，界爬升的那一格不算摆动。
+            let next = next_bound(bound, ceiling, false);
+            bound = next;
+            let sample = (n > 0).then(|| load.pressure.io_avg60 / n as f64);
+            learned = next_per_build_io(learned, sample);
+            if window >= 1 {
+                settled.push((ceiling, bound));
+            }
+        }
+        assert!(
+            settled.windows(2).all(|w| w[0] == w[1]),
+            "第一条构建之后，界每一拍都是同一个数：{settled:?}"
+        );
+        assert_eq!(
+            settled.last().map(|(_, bound)| *bound),
+            Some(1),
+            "盘只够一条构建，界就停在一条"
+        );
+    }
+
+    /// 一条构建要多少 io 是学出来的，并且跨间隙留得住。
+    ///
+    /// 同一块盘上，编译在读写、链接几乎不碰盘，窗口一分钟而构建几十分钟：一拍
+    /// 的样本读到的既是代价也是它此刻在做什么。所以平滑——否则一个安静的分钟
+    /// 会把记住的代价砍半，界跟着翻倍；而没有构建的窗口什么也学不到，不许把它
+    /// 读成「构建变便宜了」。
+    #[test]
+    fn the_io_cost_of_a_build_is_learned_and_held_across_the_gaps() {
+        assert_eq!(
+            next_per_build_io(None, Some(40.0)),
+            Some(40.0),
+            "第一拍没有可依的估计，量到几就是几"
+        );
+        assert_eq!(
+            next_per_build_io(Some(40.0), None),
+            Some(40.0),
+            "没有构建在跑的窗口什么也教不了"
+        );
+        let after_one_quiet_minute = next_per_build_io(Some(40.0), Some(5.0)).unwrap();
+        assert!(
+            after_one_quiet_minute > 25.0,
+            "构建里一个安静的分钟不许把代价砍半：{after_one_quiet_minute}"
+        );
+        let mut cost = Some(40.0);
+        for _ in 0..12 {
+            cost = next_per_build_io(cost, Some(5.0));
+        }
+        assert!(
+            cost.unwrap() < 6.0,
+            "工作区真的变便宜了，代价要跟得上：{cost:?}"
+        );
+    }
+
+    /// 记住了一条构建的代价，不等于这块盘不用管了。
+    ///
+    /// 学会的只是「我们自己一条构建要多少」。宿主上没有我们的构建在跑、而设备
+    /// 已经忙到整个预算，那些停顿是别人的写回，它和一个构建一样占地方：答案仍然
+    /// 是一条，不是「记住的那条构建很便宜，所以能跑十几条」。
+    #[test]
+    fn somebody_elses_writeback_is_still_charged_to_the_disk() {
+        let host = |io60: f64, n: usize| HostLoad {
+            pressure: Pressure {
+                cpu_avg10: 0.0,
+                cpu_avg60: 0.0,
+                io_avg10: 0.0,
+                io_avg60: io60,
+                mem_avg10: 0.0,
+                mem_avg60: 0.0,
+                mem_available_bytes: 64 * 1024 * 1024 * 1024,
+                builds_in_flight: n,
+            },
+            busy_cores: 0.0,
+            cores: 24,
+            budget: None,
+            disk_free_bytes: Some(1 << 40),
+            tuning: shipped(),
+            per_build_io: Some(5.0),
+        };
+        // 一条便宜的构建（5 个点）本可容下十几条；设备已经吃到整个预算而我们的
+        // 构建一条也没跑，那部分是别人的。
+        assert_eq!(
+            host(shipped().io_stall_budget_pct, 0).ceiling(),
+            (1, DIM_IO),
+            "别人的写回按它自己占的地方收费"
+        );
+        // 盘安静时，记住的代价才是那面墙。
+        assert_eq!(
+            host(0.1, 0).ceiling(),
+            (
+                (24.0 / shipped().build_demand_cores).floor() as usize,
+                DIM_CPU
+            ),
+            "盘不忙时，答案是核数，不是那条构建"
+        );
     }
 
     /// The ceiling and the per-dimension readings are one sample: whatever the
@@ -4831,6 +5171,7 @@ mod tests {
             budget: None,
             disk_free_bytes: Some(1 << 40),
             tuning: shipped(),
+            per_build_io: None,
         };
         let plenty = 64 * 1024 * 1024 * 1024;
         for (busy, io, mem) in [
@@ -5000,6 +5341,7 @@ mod tests {
             }),
             disk_free_bytes: None,
             tuning: shipped(),
+            per_build_io: None,
         };
         // One build per core the host could run, and then some: a limit this
         // roomy is above the cpu dimension's own answer, so the container is not
@@ -5272,6 +5614,7 @@ unevictable 28532736
             budget: None,
             disk_free_bytes: None,
             tuning: shipped(),
+            per_build_io: None,
         };
         assert!(quiet.is_calm(), "a quiet host is calm");
 
@@ -6558,6 +6901,23 @@ unevictable 28532736
             not_in_force.contains(&format!("\"{BUILD_GATE_ROLE_BUILDER}\"")),
             "rule {BUILD_GATE_IN_FORCE_RULE} must select builders by role, got: {not_in_force}"
         );
+
+        // The bound settling is a reading about the bound in force, and only
+        // about it: the ceiling is a measurement and is allowed to move without
+        // anything being wrong, so a rule counting its changes would fire on a
+        // host that is behaving. What it counts is changes and not a level --
+        // a bound that sat at one all day and a bound crossing one and two four
+        // hundred times a day read the same in any snapshot, and the second one
+        // is the defect.
+        let converging = find(BUILD_GATE_BOUND_RULE);
+        assert!(
+            converging.contains("changes("),
+            "rule {BUILD_GATE_BOUND_RULE} must count changes, got: {converging}"
+        );
+        assert!(
+            converging.contains(BUILD_GATE_SLOTS),
+            "rule {BUILD_GATE_BOUND_RULE} must count the bound in force ({BUILD_GATE_SLOTS}), got: {converging}"
+        );
     }
 
     /// The rules written on the host readings read the names this module
@@ -6658,6 +7018,7 @@ unevictable 28532736
             budget: None,
             disk_free_bytes: Some(1 << 40),
             tuning: shipped(),
+            per_build_io: None,
         };
         let base = baseline();
         let base_ceiling = base.ceiling();

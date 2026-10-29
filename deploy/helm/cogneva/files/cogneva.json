@@ -1135,6 +1135,16 @@
           "face": "CI/构建/部署"
         },
         {
+          "name": "build_gate_bound_not_converging",
+          "promql": "changes((max by (dir, role) (cogneva_build_gate_slots{role=\"builder\"}))[24h:1m])",
+          "condition": {
+            "greater_than": 24.0
+          },
+          "severity": "warning",
+          "summary": "the build gate's bound changed {value} times in the last 24 hours. The bound is one number: how many builds this host runs at once, derived once a window (60 seconds) from the cpu, memory, io and cgroup readings. It should move when the host's capacity changes, and the host's capacity does not change at that rate -- builds last tens of minutes. What the count measures is a derivation chasing its own admissions: each dimension was read while the gate's own builds were running, so a build in flight was charged against the room it took, the ceiling fell by one for every slot handed out, and the bound came down to it -- taking back the slot it had just given. Counted from the ledger, which writes a row each time the bound is rewritten: 231-409 rewrites a day over the ten days to 2026-10-30, and 409 in the last one (10-28 19:02Z to 10-29 19:00Z, new values 1:135, 2:187, 3:87), a median 148 seconds apart, with the host `calm` on only 3.7% of windows. The rule samples the series once a minute, so two rewrites inside one step count as one and it answers a little under the ledger -- the threshold sits far below both, and a green rule beside a ledger still counting more than twenty-four is a floored sample rather than a settled bound. The rows were spread across all four dimensions (cpu 193, io 119, cgroup_memory 86, memory 6), which is what says the readings rather than one wall were moving. The counter reads the bound in force rather than the ceiling beside it: the ceiling is a measurement and may report any number it likes, and only the bound is what builds are refused against. Twenty-four is one move an hour, an order of magnitude under the 231 the defect produced, and above the handful a day a capacity that follows a host should need: the gates that follow this one are `build_gate_refused` and the wait readings, which say whether a bound that is now still is also a bound that is too tight. Where it moved, the ledger's `bound_change` events and the `dimension` label on `cogneva_build_gate_ceiling` say which wall each move came from.",
+          "face": "CI/构建/部署"
+        },
+        {
           "name": "pg_pool_ceiling_unmeasured",
           "promql": "max by (pool, source) (cogneva_pg_pool_max_connections{source=\"server_unreadable\"} and ((time() - cogneva_pg_pool_max_connections_observed_timestamp_seconds) < 1800))",
           "condition": {

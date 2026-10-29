@@ -1,0 +1,56 @@
+# 「构建闸门的界在一天里被挪了太多次」那条读数的夹具。
+#
+# 界是一台机器同时跑几条构建，本来只应该在机器容量变了的时候动——一次构建要几十分钟，
+# 容量不会按分钟变。这一条判的是**界被改写的次数**，不是界的大小：界偏紧由紧随其后的
+# `build_gate_refused` 与等待读数回答，界在摇摆只有这一条看得见。
+#
+# 24 次是阀，不是目标：24 小时里一小时一次，比 2026-10-30 前十天的 231-409 次低一个数量级，
+# 也高于一台跟着容量走的机器一天该有的几次。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-build-gate-bound.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: build_gate_bound_not_converging
+
+evaluation_interval: 1m
+
+tests:
+  # 一小时里界一直是 4：changes 是 0。静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_slots{dir="host",role="builder"}'
+        values: '4x120'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: build_gate_bound_not_converging
+        exp_alerts: []
+
+  # 同一小时里界来回换了 59 次（每分钟一次）：方波，就是 2026-10-30 前十天的现场——
+  # 每条在飞的构建都把自己占掉的位置从余量里扣掉，界下来接住它刚给出的那个槽。
+  # 59 > 24，亮。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_slots{dir="host",role="builder"}'
+        values: '3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4 3 4'
+    alert_rule_test:
+      - eval_time: 1h
+        alertname: build_gate_bound_not_converging
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              dir: host
+              role: builder
+
+  # 界动过，但只有七次（每十分钟一次，跟着一台慢变容量的机器走）：阀之下不判。这一格
+  # 保证这条规则不会在「界确实该动」的机器上连响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_build_gate_slots{dir="host",role="builder"}'
+        values: '4x9 3x10 4x10 3x10 4x10 3x10 4x10 3x10 4x10 3x9'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: build_gate_bound_not_converging
+        exp_alerts: []
