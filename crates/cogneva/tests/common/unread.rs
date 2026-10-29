@@ -45,6 +45,16 @@ pub enum Unread {
     /// timestamp, or a copy of something published where it is read.
     NotAReading(&'static str),
     /// Nothing states it. A debt, counted by the census's `GAPS_AT_*`.
+    ///
+    /// Nothing constructs this variant as of 2026-10-29: both censuses that
+    /// share this file reached zero gaps, the last one leaving when the
+    /// startup phase timing got a panel. Keeping it is what makes the ratchet
+    /// a ratchet -- the next series published with no reader is recorded by
+    /// writing one of these, and writing one is what pushes the pinned count
+    /// above its constant. A census that had to reintroduce the variant to
+    /// say "this one is owed" would instead have a comment saying so, which is
+    /// the shape the debt took before the count existed.
+    #[allow(dead_code)]
     Gap(&'static str),
 }
 
