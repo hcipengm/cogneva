@@ -579,6 +579,11 @@ for pname, sources in trees:
     # 登记，所以同一命名空间里的中间件在注解里也要写成 `<ns>-<name>@kubernetescrd`。
     # 只认后一半（曾经就是这么判的）会把一条 404 的注解判成过——判据与 traefik 的口径
     # 不一致时，绿的不是树，是判据自己。
+    #
+    # 这个口径树里读不出来：清单只写着 `metadata.name`，provider 拿哪个键登记只有集群
+    # 能回答（注解写错时 traefik 的第一条日志就是答案）。所以动这条判据之前要有一条
+    # 现网读数——树内自查能证明「两个拼法不一致」，证明不了「traefik 认哪一个」。2026-10-28
+    # 那次就是只做了前者：把一条本来指得到的注解当成指不到、改掉了前缀，前门 32 小时不可达。
     middlewares = {
         (d["metadata"].get("namespace"), d["metadata"]["name"])
         for d in docs if d.get("kind") == "Middleware"
