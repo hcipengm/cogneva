@@ -64,6 +64,12 @@ const NOT_ROOT: &[(&str, usize, &str, &str)] = &[
         "夹具要的是同级的门脚本所在的目录（deploy/scripts），不是仓库根",
     ),
     (
+        "deploy/scripts/tests/live-service-steps.test.sh",
+        1,
+        "deploy/scripts",
+        "夹具要的是同级的门脚本所在的目录（deploy/scripts），不是仓库根",
+    ),
+    (
         "deploy/scripts/tests/numeric-declarations-are-tunable.test.sh",
         1,
         "deploy/scripts",
