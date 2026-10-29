@@ -186,21 +186,30 @@ else
     echo "SKIP  容量登记表：本机既没有可用的 rustc 也没有 cargo（CI 的 Test 会跑这一步）"
 fi
 
-# 告警规则契约：`crates/cogneva/tests/observability_alert_rule_contract_test.rs` 是**唯一**
-# 会因为「发布了一条没有读者的序列」而红的门，与上面那张登记表是同一笔账的另一面——
-# 一个数字没有来历、一条序列没有读者，都只在 CI 里才被问。2026-10-29 实测：
-# `cogneva_change_ledger_remeasure_pending` 发布出去了，规则只在 summary 里提到它、
-# promql 里没读它，推上去 `Code Coverage` 红、部署器按设计停在最后一个绿 rev 上，
-# 整条主线跟着停。
+# 两份「名字」契约：`observability_alert_rule_contract_test.rs` 与
+# `observability_scrape_census_contract_test.rs`。它们判的是同一笔账的两面——一个数字
+# 没有来历、一条序列没有读者、写了个名字没人认领——与上面那张登记表是同一族，都只在
+# CI 里才被问。2026-10-29 一天之内两面各红了一次：`cogneva_change_ledger_remeasure_pending`
+# 发布出去了却没有规则读它；另一个标本在解析器测试里写成 `"cogneva_x{...`，被普查的
+# 「双引号紧跟 cogneva_」读成「这棵树发布了这个名字」。两次都是 `Code Coverage` 红、
+# 部署器按设计停在最后一个绿 rev 上、整条主线跟着停。
 #
-# 走 `cargo test` 而不是裸 `rustc`：这份测试从 `tests/common` 取仓库根与词法分析，
-# 裸 `rustc` 没有 `--extern` 解析不了。价格是两个数，别混成一个：判定 0.11 秒，
-# 冷编译 7 分 55 秒。跑**整份文件**（本地 102 条），不加 filter —— 挑着跑一条是在挑
-# 判据，而这条门唯一不能犯的错就是「它绿了，CI 却红了」。
+# 走 `cargo test` 而不是裸 `rustc`：两份测试都从 `tests/common` 取仓库根与词法分析，
+# 裸 `rustc` 没有 `--extern` 解析不了。价格是两个数，别混成一个：判定 0.11 秒与 0.28 秒，
+# 冷编译 7 分 55 秒（后一个是编译的价，不是这两条判据的价）。跑**整份文件**，不加 filter
+# ——挑着跑一条是在挑判据，而这条门唯一不能犯的错就是「它绿了，CI 却红了」。
+#
+# 第二条为什么也在这一格里：它们编的是同一个 `cogneva` test target，第二个二进制多花的
+# 只是链接与那 0.28 秒判定，接进来几乎不要钱；而漏掉它，今天上午那一次红就仍然要等
+# 一整轮 CI 才被发现。
+#
+# `--no-fail-fast` 不是顺手加的：不带它，`cargo test` 在第一个二进制红就停，第二份判据
+# 那一跑根本没发生——改完第一条再推，才发现第二条也红，同一轮 CI 的代价付两次。实测
+# 2026-10-29：不带它只印出一行 `Running`，带上它两行都印、两个 verdict 都在。
 #
 # 这一格没把整条脚本推到二十分钟，靠的是**它排在容量登记表之后**：那张表的快路（裸
 # `rustc`）今天编不出来、实测 1.2 秒即失败，于是走 `cargo test` 回退，而回退编的是
-# 同一个 `cogneva` test target —— 轮到这一格时编译已经热了，多花的只有判定那 0.11 秒。
+# 同一个 `cogneva` test target —— 轮到这一格时编译已经热了，多花的只有判定那零点几秒。
 # 这个顺序是它便宜的**唯一**理由。哪天快路修好了、容量登记表真的只花几秒，这一格就会
 # 退回冷编译的 8 分钟；那时要么把它挪进 cargo 回退那一支，要么给它加触发条件。
 #
@@ -210,10 +219,12 @@ fi
 # 推的那一笔红了。反过来也别把它当噪声：那一格绿的时候它确实判过了你树上的东西。
 cargo_bin="${capreg_cargo}"
 if [ -n "${cargo_bin}" ]; then
-    run_step "告警规则契约（observability_alert_rule_contract_test）" \
-        "${cargo_bin}" test -p cogneva --test observability_alert_rule_contract_test
+    run_step "名字契约（告警规则契约 + 观测面普查）" \
+        "${cargo_bin}" test --no-fail-fast -p cogneva \
+        --test observability_alert_rule_contract_test \
+        --test observability_scrape_census_contract_test
 else
-    echo "SKIP  告警规则契约：本机没有可用的 cargo（CI 的 Code Coverage 会跑这一步）"
+    echo "SKIP  名字契约：本机没有可用的 cargo（CI 的 Code Coverage 会跑这两步）"
 fi
 
 # Check 作业本机跑不动（要编译整个工作区，比 CI 还慢），可它红得最多的一种形状本机
