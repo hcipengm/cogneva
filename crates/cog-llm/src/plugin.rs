@@ -224,7 +224,7 @@ pub fn build_single_provider(
             }
             Arc::new(p)
         }
-        "openai-responses" => {
+        crate::responses::API_STYLE => {
             let mut p = crate::responses::OpenAIResponsesProvider::new(model, &backend.api_key)
                 .with_stream_capacity(stream_capacity);
             if let Some(ref c) = http_client {

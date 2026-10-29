@@ -149,6 +149,15 @@ const EXEMPT: &[Exempt] = &[
               那条构造里角色读的是常量，显示名改了只换一个标签",
     },
     Exempt {
+        file: "crates/cog-llm/src/model.rs",
+        value: "openai-responses",
+        why: "`ApiType::OpenAIResponses` 的序列化词，写它的是 `#[serde(rename = ...)]` 属性——\
+              那个位置只接受字面量。它与 `cog_core::contract::llm::RESPONSES_API_STYLE` 同物，\
+              其余读写点（`plugin.rs` 的分派与 `provider/responses.rs` 的报文标签）已改回读\
+              声明，只剩这一处拼写；两者分家由 `model.rs` 的 \
+              `the_responses_serialisation_word_is_the_declared_style` 判红",
+    },
+    Exempt {
         file: "crates/cogneva/build.rs",
         value: "COGNEVA_GIT_REVISION",
         why: "构建期名字的写这一侧：构建脚本是宿主程序，链接 cog-core 会把整棵契约\

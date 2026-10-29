@@ -305,7 +305,7 @@ impl LLMProvider for OpenAIResponsesProvider {
                     context: cog_core::RawContext::default(),
                     payload: cog_core::RawPayload {
                         direction: "outbound".into(),
-                        transport: "openai-responses".into(),
+                        transport: API_STYLE.into(),
                         format: Some("json".into()),
                         raw: body.clone(),
                     },
@@ -317,7 +317,7 @@ impl LLMProvider for OpenAIResponsesProvider {
 
             let mut response = ChatResponse {
                 content: Vec::new(),
-                api: "openai-responses".into(),
+                api: API_STYLE.into(),
                 provider: model.provider.to_string(),
                 model: model.id.clone(),
                 response_id: None,
@@ -352,7 +352,7 @@ impl LLMProvider for OpenAIResponsesProvider {
             }
 
             tracing::info!(
-                provider = "openai-responses",
+                provider = API_STYLE,
                 url = %url,
                 model = %model.id,
                 "OpenAIResponsesProvider executing stream request"
@@ -360,14 +360,14 @@ impl LLMProvider for OpenAIResponsesProvider {
             let http_response = match client.execute_stream(req).await {
                 Ok(r) => {
                     tracing::info!(
-                        provider = "openai-responses",
+                        provider = API_STYLE,
                         status = r.status,
                         "OpenAIResponsesProvider received stream response"
                     );
                     r
                 }
                 Err(e) => {
-                    tracing::warn!(provider = "openai-responses", error = %e, "stream request failed");
+                    tracing::warn!(provider = API_STYLE, error = %e, "stream request failed");
                     response.stop_reason = StopReason::Error;
                     response.upstream_failure = Some(UpstreamFailure::Transport);
                     response.error_message = Some(format!("HTTP error: {}", e));
@@ -783,7 +783,7 @@ impl LLMProvider for OpenAIResponsesProvider {
             }
 
             tracing::info!(
-                provider = "openai-responses",
+                provider = API_STYLE,
                 model = %model.id,
                 elapsed_ms = %start.elapsed().as_millis(),
                 tokens_in = %response.usage.input,
@@ -837,7 +837,7 @@ impl LLMProvider for OpenAIResponsesProvider {
                     context: cog_core::RawContext::default(),
                     payload: cog_core::RawPayload {
                         direction: "inbound".into(),
-                        transport: "openai-responses".into(),
+                        transport: API_STYLE.into(),
                         format: Some("json".into()),
                         raw: match serde_json::to_value(&response) {
                             Ok(v) => v,

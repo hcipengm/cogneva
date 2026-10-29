@@ -162,3 +162,21 @@ pub fn models_are_equal(a: Option<&Model>, b: Option<&Model>) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ApiType;
+
+    /// `ApiType` 的序列化词里有一个与 `api_style` 那一族同物：`openai-responses`。属性位置
+    /// 只收字面量，所以这一处必须自己拼一遍，而声明在
+    /// `cog_core::contract::llm::RESPONSES_API_STYLE`。这条钉住两者是同一个词：声明改了而
+    /// 这里没跟上，写进配置的那一面就成了没人认得的字符串，读它的分支只会落到兜底。
+    #[test]
+    fn the_responses_serialisation_word_is_the_declared_style() {
+        let word = serde_json::to_string(&ApiType::OpenAIResponses).expect("ApiType serialises");
+        assert_eq!(
+            word,
+            format!("\"{}\"", cog_core::contract::llm::RESPONSES_API_STYLE)
+        );
+    }
+}
