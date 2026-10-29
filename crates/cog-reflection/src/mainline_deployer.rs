@@ -4072,7 +4072,7 @@ impl MainlineDeployer {
         };
         self.record_ci_verdict_reading(verdict, ask).await;
         if verdict.is_none() {
-            self.record_ci_verdict_reason_reading(&reasons).await;
+            self.record_ci_verdict_reason_reading(&reasons, ask).await;
         }
         // 原因按「平台:原因」拼回去，与原因计数器同一套取值域；判出结论的轮次没有原因。
         let reason_slugs: Vec<String> = reasons
@@ -4528,9 +4528,21 @@ impl MainlineDeployer {
     /// 它仍然说不出「一条沉默、另一条给了结论」：原因只在 `no_evidence` 时记，而
     /// `no_evidence` 的定义就是所有上游都没给结论。它给的是**分格**——一轮里几条在
     /// 沉默、各落在哪个平台的哪个 `reason` 上。
+    ///
+    /// 每一格还带 `ask` 标签（问的是哪一问：轮首、构建前、派 Job 前、还是作业带回的
+    /// 那一次），与 `verdict` 那一格用同一套闭集取值。不加这一格，"轮首那一问是不是
+    /// 问得太早"在读数面上就只剩减法：四问的原因混在一本账里，只有先把别的几问扣掉
+    /// 才看得出轮首落在哪一格，而扣减法要先知道别的几问各问了几次——那正是这本账
+    /// 本身该回答的问题。2026-10-30 实测：轮首 80 次提问只有 3 次拿到 `pass`，
+    /// 而派 Job 前 38 次里有 5 次，差值落在哪了只能靠推算。写上问次之后，"这一问
+    /// 从来没被答过"是一个可以直接读的格子，不必先做减法。
+    ///
+    /// 加标签与加 `platform` 同形：只开新键、不搬旧键。旧键（无 `ask`）从这一刻起
+    /// 冻住，读它必须连键一起读，理由同上。
     async fn record_ci_verdict_reason_reading(
         &self,
         reasons: &[(&'static str, CiNoVerdictReason)],
+        ask: CiAsk,
     ) {
         let Some(metrics) = &self.metrics else {
             return;
@@ -4539,6 +4551,7 @@ impl MainlineDeployer {
             let mut labels = std::collections::HashMap::new();
             labels.insert(crate::LABEL_PLATFORM.to_string(), (*platform).to_string());
             labels.insert(crate::LABEL_REASON.to_string(), reason.label().to_string());
+            labels.insert(crate::LABEL_ASK.to_string(), ask.label().to_string());
             let _ = metrics
                 .record_counter(
                     cog_core::metric_names::MAINLINE_CI_NO_VERDICT_REASON_TOTAL,
@@ -16496,6 +16509,77 @@ exec {real} "$@"
         assert_eq!(
             reason_total, 8.0,
             "每轮 no_evidence 贡献「沉默的上游数」条原因: {rows:?}"
+        );
+    }
+
+    /// 原因读数要说出是**哪一问**没被答。
+    ///
+    /// 四问共用一本原因账时，「轮首是不是问得太早」只剩减法：先把构建前、派 Job
+    /// 前、作业带回来那几问的原因扣掉，剩下的才算轮首的。而扣减法要先知道别的几问
+    /// 各记了多少——那正是这本账本身该回答的问题。2026-10-30 实测：轮首 80 次提问
+    /// 只有 3 次拿到 `pass`，派 Job 前 38 次里有 5 次，差值落在哪一问上读不出来。
+    ///
+    /// 带上 `ask` 之后，「这一问从来没被答过」是一个可以直接读的格子。
+    #[tokio::test]
+    async fn the_reason_reading_says_which_ask_was_left_without_an_answer() {
+        use cog_core::metric_names::MAINLINE_CI_NO_VERDICT_REASON_TOTAL;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+
+        // 两问、各问一次，上游都在跑：原因同为 `pending`，唯一的区别是问的时机。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"conclusion":null}]}"#),
+            http_200(r#"{"state":"pending"}"#),
+            http_200(r#"{"check_runs":[{"conclusion":null}]}"#),
+            http_200(r#"{"state":"pending"}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("head", CiAsk::RoundHead)
+                .await
+                .0,
+            None
+        );
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("dispatch", CiAsk::PreDispatch)
+                .await
+                .0,
+            None
+        );
+        handle.await.unwrap();
+
+        let rows = metrics
+            .query_counter_totals(MAINLINE_CI_NO_VERDICT_REASON_TOTAL.as_str())
+            .await
+            .unwrap();
+        let count = |ask: &str, want: &str| -> f64 {
+            rows.iter()
+                .filter(|r| {
+                    r.labels.get(crate::LABEL_ASK).map(String::as_str) == Some(ask)
+                        && r.labels.get(crate::LABEL_REASON).map(String::as_str) == Some(want)
+                })
+                .map(|r| r.value)
+                .sum()
+        };
+        assert_eq!(count("round_head", "pending"), 1.0, "{rows:?}");
+        assert_eq!(count("pre_dispatch", "pending"), 1.0, "{rows:?}");
+        assert_eq!(
+            rows.len(),
+            2,
+            "同一句 reason、两个问次，必须是两行；合成一行就等于又把它读成「有一问答过」: {rows:?}"
+        );
+        assert_eq!(
+            count("before_build", "pending"),
+            0.0,
+            "没问过的那一问不许凭空长出一格: {rows:?}"
         );
     }
 
