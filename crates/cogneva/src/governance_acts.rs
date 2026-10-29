@@ -2210,6 +2210,55 @@ mod tests {
         );
     }
 
+    /// A face node written before the project root was decided carries no
+    /// `goal_id`, and every duty that names it as a parent then points at a row
+    /// outside its own group. The face's own content is unchanged, so the
+    /// import reports it as `Unchanged` and writes nothing -- and the node stays
+    /// parentless and groupless for the rest of its life, which reads as an
+    /// orphan in the tree views and as a project replan refuses to plan into.
+    #[tokio::test]
+    async fn an_unchanged_face_still_gets_the_project_its_duties_point_at() {
+        let store = MemoryStore::new();
+        let now = Utc::now();
+        let mut spec = cog_core::FaceSpec::first("f", cog_core::FaceKind::Face);
+        spec.first_reading = Some("本面的判据读数".into());
+        let face = cog_core::Face {
+            face_id: "f".into(),
+            owner_unit: Some("c2".into()),
+            bound_by_handover_id: None,
+            spec,
+            updated_at: now,
+        };
+        store
+            .save_governance_node(&face.to_task(None))
+            .await
+            .unwrap();
+        // Strip the row back to the shape rows were written in before the face
+        // node became a project root.
+        let mut old = store.row("f");
+        old.goal_id = None;
+        old.parent_task_id = None;
+        store.save_governance_node(&old).await.unwrap();
+
+        let outcome =
+            cog_core::import_face_with(&store, &face, cog_core::ImportOwnership::FromFile)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            cog_core::FaceImportOutcome::Updated,
+            "the row moved, so the pass may not report it as unchanged"
+        );
+        let row = store.row("f");
+        assert_eq!(
+            row.goal_id.as_deref(),
+            Some("f"),
+            "the face node is the root of its own project: {row:?}"
+        );
+        assert_eq!(row.parent_task_id, None, "a root names no parent: {row:?}");
+    }
+
     /// The gap task names the work expected to close a vacancy, not the person
     /// who fills it -- so keeping the owner is no reason to keep the plan. A
     /// face whose gap task the import refuses to carry keeps handing its owner

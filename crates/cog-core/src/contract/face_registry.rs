@@ -1012,7 +1012,28 @@ pub async fn import_face_with(
     // timestamp written first would make this branch unreachable and turn every
     // idempotent import into a write.
     if merged == current {
-        return Ok(FaceImportOutcome::Unchanged);
+        // The face's own content did not move, but where the row sits in the
+        // task graph is not part of `Face`. A face node is the root of its own
+        // project, and a node written before that was decided carries no
+        // `goal_id`; every duty that names it as a parent then points at a row
+        // outside its own group, which the tree views report as an orphan and
+        // replan refuses to plan into. Comparing the row it would write is the
+        // only way to see that, and the import is the pass that runs on a
+        // cadence, so it is the pass that settles it.
+        let shaped = merged.to_task(existing_task.clone());
+        if existing_task.as_ref() == Some(&shaped) {
+            return Ok(FaceImportOutcome::Unchanged);
+        }
+        let wrote = store
+            .save_face_node_if_revision(&shaped, current.revision())
+            .await?;
+        if !wrote {
+            return Err(SFError::Validation(format!(
+                "face {} changed while its row was being settled; re-read and import again",
+                merged.face_id
+            )));
+        }
+        return Ok(FaceImportOutcome::Updated);
     }
     merged.updated_at = Utc::now();
 
