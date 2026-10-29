@@ -721,7 +721,15 @@ fn the_selector_parser_reads_keys_and_ignores_foreign_series() {
     );
 
     // 匹配运算符的三种写法都要认，`=~` 不能被读成「没有键」。
-    let regex = selector_pairs("cogneva_x{outcome=~\"a|b\", phase!~\"c\", zone!=\"d\"}");
+    //
+    // 标本用的是闭集里真有的一个 series 名，不是编出来的 `cogneva_x`：观测面
+    // 那份普查会把「引号后面跟着一个 `cogneva_` 名字」读成「这棵树发布了这个
+    // 名字」，一个编造的标本要么让那条门红、要么得给门开一个豁免把这一整类
+    // 挡在射程外。用一个真名字，门照常扫，标本也照常说实话——这条断言只看
+    // 键集合，名字换成真的不改变它测的东西。
+    let regex = selector_pairs(
+        "cogneva_loop_tick_age_seconds{outcome=~\"a|b\", phase!~\"c\", zone!=\"d\"}",
+    );
     assert_eq!(
         regex.into_iter().map(|(_, key)| key).collect::<Vec<_>>(),
         vec![
