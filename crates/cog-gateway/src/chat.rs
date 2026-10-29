@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use crate::websocket_protocol::ServerMessage;
 use crate::GatewayState;
-use cog_observability::usage_store::LlmOrigin;
+use cog_core::LlmOrigin;
 
 /// 一次请求里最多带多少条历史（用户与助手合计）。
 ///

@@ -492,6 +492,14 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             );
             ctx.publish_service(reader);
             info!("LLM usage rolled read face published");
+            // The per-row write/read face. Same store, different question: the
+            // rolled reader answers "what did this actor spend", this one
+            // answers "what did this task spend", and the processes that ask
+            // the second question must not learn this crate's storage
+            // internals to do it.
+            let ledger: Arc<dyn cog_core::LlmUsageLedger> = Arc::new((**store).clone());
+            ctx.publish_service(ledger);
+            info!("LLM usage per-task ledger face published");
         }
 
         // ── Saved-call ledger ──

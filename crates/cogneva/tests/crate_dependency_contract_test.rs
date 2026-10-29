@@ -46,7 +46,6 @@ const ALLOWED: &[Row] = &[
     ("cog-eval", "cog-core", ""),
     ("cog-extension", "cog-core", ""),
     ("cog-gateway", "cog-core", ""),
-    ("cog-gateway", "cog-observability", ""),
     ("cog-gateway", "cog-storage", ""),
     ("cog-github", "cog-core", ""),
     ("cog-guardrail", "cog-core", ""),

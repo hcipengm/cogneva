@@ -231,6 +231,17 @@ impl PrometheusMetricsBackend {
     }
 }
 
+/// The scrape face of this registry, as the contract states it.
+///
+/// The inherent `encode` returns the format library's error type; this one
+/// answers the contract's plain string so a caller forwarding bytes to an HTTP
+/// response never has to name the format's crate to print why it failed.
+impl cog_core::ScrapableMetrics for PrometheusMetricsBackend {
+    fn encode(&self) -> Result<Vec<u8>, String> {
+        PrometheusMetricsBackend::encode(self).map_err(|e| e.to_string())
+    }
+}
+
 #[async_trait]
 impl MetricsBackend for PrometheusMetricsBackend {
     async fn record_gauge(

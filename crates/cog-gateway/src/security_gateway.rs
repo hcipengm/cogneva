@@ -30,17 +30,13 @@ use cog_core::contract::platform_sign::{
     platform_signature, PlatformOutlet, SignRefusal, SignRequest, SIGN_PATH,
 };
 use cog_core::contract::transport::{Credential, Operation, Transport};
-use cog_core::{MetricsBackend, RefusalKind, UsageResult};
-use cog_observability::alert_store::{AlertTransition, NewAlert, PostgresAlertStore};
-use cog_observability::analytics::{
-    AnalyticsEvent, ClickHouseAnalyticsBackend, ClickHouseEventBuffer,
+use cog_core::usage_ledger::{
+    AnalyticsEvent, AnalyticsSink, LlmExchangeRecord, LlmOrigin, LlmUsageLedger, LlmUsageRecord,
+    PaceEvidence, PaceUpstreamEvidence,
 };
-use cog_observability::config::ObservabilityExportersConfig;
-use cog_observability::logs::{init_subscriber_with_pusher, LokiBackgroundPusher, LokiPushClient};
-use cog_observability::metrics::PrometheusMetricsBackend;
-use cog_observability::usage_store::{
-    LlmExchangeRecord, LlmOrigin, LlmUsageRecord, LlmUsageStore, PaceEvidence,
-    PaceUpstreamEvidence, LLM_ORIGIN_HEADER,
+use cog_core::{
+    AlertTransition, MetricsBackend, PersistentAlertSink, RefusalKind, ScrapableMetrics,
+    UsageResult, LLM_ORIGIN_HEADER,
 };
 use serde::{Deserialize, Serialize};
 
@@ -211,9 +207,6 @@ pub struct SecurityGatewayConfig {
     /// 共享键值面的连接串（COGNEVA_REDIS_URL）：跨进程池状态信号。缺省则调度侧
     /// 看不到池状态，只剩网关自身的熔断与日志。
     pub redis_url: Option<String>,
-    /// 观测导出目标（Loki / ClickHouse / Alertmanager），走 `observability`
-    /// 段 + `COGNEVA_LOKI_*` 等 env 覆盖；缺省全部关闭。
-    pub observability: ObservabilityExportersConfig,
 }
 
 impl SecurityGatewayConfig {
@@ -329,11 +322,6 @@ impl SecurityGatewayConfig {
             ),
             database_url: token(cog_core::env::DATABASE_URL),
             redis_url: token(cog_core::env::REDIS_URL),
-            // 配置文件缺失即默认全关，env 覆盖在 load() 内完成。
-            observability: ObservabilityExportersConfig::load().unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "观测导出配置解析失败，按全部关闭处理");
-                ObservabilityExportersConfig::default()
-            }),
         };
         // 上游跑在兜底兼容画像（厂商表查无此 host，按最新 OpenAI 形状假设）
         // 时启动即警告一次。兜底画像会把调用方的 store / reasoning_effort /
@@ -1622,14 +1610,45 @@ impl LatencyStats {
 
 /// 池健康的三类落盘出口。指标是纯进程内 Prometheus 注册表（无外部依赖，
 /// 始终可用）；时序与告警需要外部后端，未配置时为 None（静默跳过）。
-struct PoolObservability {
-    metrics: Arc<PrometheusMetricsBackend>,
-    analytics: Option<Arc<ClickHouseEventBuffer>>,
-    alerts: Option<Arc<PostgresAlertStore>>,
+pub struct PoolObservability {
+    pub metrics: Arc<dyn ScrapableMetrics>,
+    pub analytics: Option<Arc<dyn AnalyticsSink>>,
+    pub alerts: Option<Arc<dyn PersistentAlertSink>>,
     /// 逐调用 token 计量明细（PG）。未配置数据库时 None，计量退化为指标+时序。
-    usage: Option<Arc<LlmUsageStore>>,
+    pub usage: Option<Arc<dyn LlmUsageLedger>>,
     /// 池读数的耐久面（共享 metrics store）。未配置数据库时为 None。
     durable: Option<Arc<DurableGauges>>,
+}
+
+/// 一个卷占用读数：名字与它的来源。
+///
+/// 名字和读数放在一起而不是让观察者自己报：读不到的时候，日志里唯一能指出
+/// "是哪个卷"的就是这一格，而 `dyn Observable` 只有采集方法。
+#[derive(Clone)]
+pub struct VolumeFootprint {
+    pub claim: String,
+    pub observable: Arc<dyn cog_core::Observable>,
+}
+
+impl PoolObservability {
+    /// 装配层递进来的四类落盘出口。耐久面接的是"哪个后端"而不是"写不写"：
+    /// 值不变不重写、写失败只报一次、丢写计数这三条是网关自己的节拍纪律，
+    /// 不该跟着后端的实现走。
+    pub fn new(
+        metrics: Arc<dyn ScrapableMetrics>,
+        analytics: Option<Arc<dyn AnalyticsSink>>,
+        alerts: Option<Arc<dyn PersistentAlertSink>>,
+        usage: Option<Arc<dyn LlmUsageLedger>>,
+        durable: Option<Arc<dyn MetricsBackend>>,
+    ) -> Self {
+        Self {
+            metrics,
+            analytics,
+            alerts,
+            usage,
+            durable: durable.map(|backend| Arc::new(DurableGauges::new(backend))),
+        }
+    }
 }
 
 /// 值没变时的重写周期。它只服务于"上一次写失败"的自愈：值一变就立刻写，
@@ -1939,7 +1958,7 @@ struct AppState {
     /// is the node's filesystem, so the process writing it is the only one that
     /// can say what it holds. Empty when the deployment declares none, and then
     /// /metrics carries exactly no series of that family.
-    volume_footprint: Vec<Arc<cog_observability::data_volume::DataVolumeObservable>>,
+    volume_footprint: Vec<VolumeFootprint>,
     /// 我们相信某台上游认哪些字段——按请求体要按它改写，而这张表是厂商知识，
     /// 住在实现 provider 的那个 crate 里。这里只认契约：问一句「这个地址你信
     /// 什么」，拿回一个形状。`None` = 这个进程没有发布者（独立网关进程没交，
@@ -3928,7 +3947,7 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
     // 停了」。界与它的来源同时进 labels，值不是从别处抄的——它就在这一行的两列里，
     // 两列又都由声明这一处状态导出来。
     let floor_source = cog_core::min_healthy_source(state.config.llm_pool_min_healthy);
-    let alert = NewAlert {
+    let alert = cog_core::PersistentAlertDraft {
         rule: POOL_ALERT_RULE.into(),
         dedup_key: pool_event_dedup_key(
             POOL_ALERT_RULE,
@@ -3957,7 +3976,7 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
             bounds.window_secs,
         ),
     };
-    match alerts.set_alert(down, &alert).await {
+    match alerts.set_persistent_alert(down, &alert).await {
         Ok(AlertTransition::Fired) => {
             tracing::error!(
                 evidenced_recovery_unix = bounds.evidenced_unix,
@@ -4322,7 +4341,7 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
 /// 它的缓存。
 async fn measure_window(
     state: &AppState,
-    store: &cog_observability::usage_store::LlmUsageStore,
+    store: &dyn cog_core::LlmUsageLedger,
     key: &str,
     window_secs: u64,
     quota_reset_unix: Option<i64>,
@@ -4423,7 +4442,7 @@ async fn measure_window(
             .lock()
             .unwrap()
             .insert(slot.clone(), measured);
-        let stored = cog_observability::usage_store::StoredWindow {
+        let stored = cog_core::StoredWindow {
             upstream: key.to_string(),
             capacity_tokens: measured.capacity_tokens,
             window_secs: measured.window_secs,
@@ -7898,11 +7917,11 @@ async fn metrics_handler(State(state): State<AppState>) -> axum::response::Respo
     // per-volume number for a directory-backed volume is the node's filesystem —
     // so a scrape of this process is the only place the deployment can find out
     // what its own mirror volume holds.
-    for observable in &state.volume_footprint {
-        match cog_core::Observable::collect_metrics(observable.as_ref(), "").await {
+    for footprint in &state.volume_footprint {
+        match cog_core::Observable::collect_metrics(footprint.observable.as_ref(), "").await {
             Ok(readings) => body.push_str(&crate::prometheus_render::render_raw_metrics(&readings)),
             Err(e) => tracing::warn!(
-                claim = %observable.claim(),
+                claim = %footprint.claim,
                 error = %e,
                 "volume footprint unavailable this scrape"
             ),
@@ -8395,191 +8414,6 @@ fn metrics_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// 装日志订阅者：级别 `COGNEVA_LOG_LEVEL` → `RUST_LOG` → info，格式
-/// `COGNEVA_LOG_FORMAT=json|pretty`。Loki 开启时同一批事件镜像一份到 Loki，
-/// 网关的 stdout 与 Loki 内容一致（此前网关从不装订阅者，tracing 全被丢弃，
-/// `kubectl logs` 一片空白）。
-///
-/// 返回 Loki pusher（未开启时为 `None`），由调用方在指标后端建好之后接上它的
-/// 结局读数再起刷写循环 —— 循环在构造点就起的话，后端建起来之前的每一轮都没
-/// 地方记结局。
-fn init_gateway_logging(
-    obs: &ObservabilityExportersConfig,
-    http_client: &Arc<dyn cog_core::HttpClient>,
-) -> Option<Arc<LokiBackgroundPusher>> {
-    let level = std::env::var(cog_core::env::LOG_LEVEL)
-        .or_else(|_| std::env::var("RUST_LOG"))
-        .unwrap_or_else(|_| "info".into());
-    let format = if std::env::var("COGNEVA_LOG_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or(false)
-    {
-        cog_observability::LogFormat::Json
-    } else {
-        cog_observability::LogFormat::Pretty
-    };
-    let pusher = if obs.loki.enabled {
-        let client = Arc::new(
-            LokiPushClient::new(&obs.loki.endpoint)
-                .with_max_retries(obs.loki.max_retries.max(1))
-                .with_timeout(obs.loki.timeout_secs)
-                .with_label(crate::LABEL_SERVICE, cog_core::topology::SECURITY_GATEWAY)
-                .with_client(http_client.clone()),
-        );
-        // The loop is started by the caller once the flush loop's metric sink
-        // exists — see `run`. Starting it here would leave every round before
-        // the backend was built unable to record its outcome.
-        Some(Arc::new(LokiBackgroundPusher::new(
-            client,
-            std::time::Duration::from_secs(obs.loki.flush_interval_sec.max(1)),
-            obs.loki.max_batch_size.max(1),
-        )))
-    } else {
-        None
-    };
-    init_subscriber_with_pusher(
-        &level,
-        format,
-        pusher.clone(),
-        cog_core::topology::SECURITY_GATEWAY,
-    );
-    pusher
-}
-
-/// 构建池健康的三类落盘出口。
-/// 任一外部后端不可用都只降级（None + WARN），不阻止网关启动——
-/// 网关的核心职责是代理与凭证代持，观测是附加能力。
-async fn build_pool_observability(
-    config: &SecurityGatewayConfig,
-    http_client: &Arc<dyn cog_core::HttpClient>,
-) -> Arc<PoolObservability> {
-    let obs = &config.observability;
-    let metrics = Arc::new(PrometheusMetricsBackend::new(""));
-
-    let analytics = if obs.clickhouse.enabled {
-        let backend = Arc::new(
-            ClickHouseAnalyticsBackend::new(&obs.clickhouse.base_url, &obs.clickhouse.database)
-                .with_table(&obs.clickhouse.table)
-                .with_auth(&obs.clickhouse.username, &obs.clickhouse.password)
-                .with_client(http_client.clone()),
-        );
-        if let Err(e) = backend.init_table().await {
-            tracing::warn!(error = %e, "ClickHouse 建表失败，时序明细降级为关闭");
-            None
-        } else {
-            tracing::info!(table = %obs.clickhouse.table, "ClickHouse 时序明细已接入");
-            // The flush loop's per-flush outcome reading needs a backend at
-            // construction; this is the one place in the gateway that both has
-            // it and starts the buffer.
-            let flush_metrics: Arc<dyn cog_core::MetricsBackend> = metrics.clone();
-            Some(Arc::new(ClickHouseEventBuffer::new(
-                backend,
-                std::time::Duration::from_secs(obs.clickhouse.flush_interval_sec.max(1)),
-                obs.clickhouse.max_batch_size.max(1),
-                Some(flush_metrics),
-            )))
-        }
-    } else {
-        None
-    };
-
-    // The schema text a store owns runs through the runner the storage crate
-    // keeps, not through the store: bounding the lock wait is a property of the
-    // database, and this process starts these stores outside the assembly that
-    // would have published one.
-    let alerts = match config.database_url.as_deref() {
-        Some(url) => match cog_storage::schema_ddl::PgSchemaRunner::connect(url).await {
-            Ok(schema_runner) => match PostgresAlertStore::connect(url).await {
-                Ok(store) => match store.init_schema(&schema_runner).await {
-                    Ok(()) => {
-                        tracing::info!("告警状态机已落 PostgreSQL");
-                        Some(Arc::new(store))
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "alerts 建表失败，告警落库降级为关闭");
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "PostgreSQL 连接失败，告警落库降级为关闭");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "schema runner 连接失败，告警落库降级为关闭");
-                None
-            }
-        },
-        None => None,
-    };
-
-    let usage = match config.database_url.as_deref() {
-        Some(url) => match cog_storage::schema_ddl::PgSchemaRunner::connect(url).await {
-            Ok(schema_runner) => match LlmUsageStore::connect(url).await {
-                Ok(store) => match store.init_schema(&schema_runner).await {
-                    Ok(()) => {
-                        tracing::info!("LLM token 计量明细已落 PostgreSQL");
-                        // 留底表（含正文）的保留期不在这里管：它由主应用里的
-                        // `observability_exchange_retention` 循环按同一个库定期清，
-                        // 并且把"最老一行多老 / 保留期是多少 / 占多少字节"发布成读数。
-                        // 放在启动时清一次等于把"一行能活多久"绑在网关的滚动频率上——
-                        // 那是关于部署习惯的假设，不是这张表能陈述的边界；滚动比保留期
-                        // 稀时的后果（表长成库里最大的一张）也没有任何读数会说出来。
-                        Some(Arc::new(store))
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "gateway_llm_usage 建表失败，计量明细降级为关闭");
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "PostgreSQL 连接失败，计量明细降级为关闭");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "schema runner 连接失败，计量明细降级为关闭");
-                None
-            }
-        },
-        None => None,
-    };
-
-    // 池读数的耐久面：与 alerts / usage 同一个 database_url，同一条降级约定
-    // （连不上只 WARN，不阻止网关启动——观测是附加能力，代理与凭证代持才是本职）。
-    // 它是加法而不是替代：进程内注册表照旧每拍都写，那条永远先发生、也始终可用。
-    let durable = match config.database_url.as_deref() {
-        Some(url) => match sqlx::PgPool::connect(url).await {
-            Ok(pool) => {
-                let backend = cog_storage::PostgresMetricsBackend::new(pool);
-                match backend.init_schema().await {
-                    Ok(()) => {
-                        tracing::info!("池读数耐久面已接到共享 metrics store");
-                        Some(Arc::new(DurableGauges::new(Arc::new(backend))))
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "metrics 建表失败，池读数耐久面降级为关闭");
-                        None
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "PostgreSQL 连接失败，池读数耐久面降级为关闭");
-                None
-            }
-        },
-        None => None,
-    };
-
-    Arc::new(PoolObservability {
-        metrics,
-        analytics,
-        alerts,
-        usage,
-        durable,
-    })
-}
-
 /// 解析跨进程载荷。`None` = 没有信号，或载荷不可用。解析出的判定要同时用来
 /// 恢复它依赖的逐上游证据，因此这里返回判定本身而不是一个布尔值：两者必须出自
 /// 同一次解析，分别解析就有机会读到两份不同的载荷。
@@ -8680,41 +8514,30 @@ fn identity_default_headers(identity: &str) -> reqwest::header::HeaderMap {
 /// `provider_compat` 同理由装配层交进来：那张厂商相容画像表是"实现 provider 的
 /// crate 的"知识，网关只按契约问它。交 `None` 时按"查无此厂商"处理——请求体一个
 /// 字都不改，与表里没登记这台上游时同一条路，所以缺了它不是另立一套行为。
+/// 独立安全网关进程。
+///
+/// 四类落盘出口（指标注册表、时序明细、告警状态机、计量账本）与要观测的卷都
+/// 由装配层造好交进来：它们各自住在一个拥有那份机制的 crate 里，而本进程只认
+/// 契约。造在这里会让本 crate 链上那些实现，而那正是"除装配根外每个 crate 只
+/// 依赖 core"要挡住的东西。
 pub async fn run(
     config: SecurityGatewayConfig,
     build_revision: Option<&str>,
     http_client: Arc<dyn cog_core::HttpClient>,
     key_value: Option<Arc<dyn cog_core::KeyValueStore>>,
     provider_compat: Option<Arc<dyn cog_core::ProviderCompatTable>>,
+    pool_obs: Arc<PoolObservability>,
+    volume_footprint: Vec<VolumeFootprint>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 本进程的出站客户端由装配层造好交进来（本 crate 不认具体实现）。交回给
     // `contribution_admin`，那些调 github/gitee 的请求与这里其余出站就确实是
     // 同一份设置，而不是各自从配置造出来的第二份。
     crate::contribution_admin::install_http_client(http_client.clone())
         .map_err(|e| format!("安全网关出站客户端装配失败：{e}"))?;
-    let loki_pusher = init_gateway_logging(&config.observability, &http_client);
-
-    let pool_obs = build_pool_observability(&config, &http_client).await;
     let pool_signal = key_value;
-    // 现在后端已建起来，把刷写循环的结局读数接上再起循环：在构造点取手柄会拿到
-    // `None`（后端晚于此 pusher 才建），循环的每一轮都会无处记结局；取与用排在
-    // 产出者之后，跟上一条读数的处置一致。
-    if let Some(pusher) = loki_pusher {
-        let sink: Arc<dyn cog_core::MetricsBackend> = pool_obs.metrics.clone();
-        pusher.set_metrics(Some(sink));
-        drop(pusher.run_loop());
-    }
     let identity: Arc<str> = Arc::from(outbound_identity(build_revision).as_str());
     let identity_headers = identity_default_headers(&identity);
     tracing::info!(identity = %identity, "安全网关出站请求自我标识");
-    // A declaration this process cannot act on is said out loud: a variable set
-    // in the deployment and a pod that started look exactly like a volume whose
-    // footprint is being measured, and the difference is only ever in a log.
-    let (volume_footprint, volume_declaration_problems) =
-        cog_observability::data_volume::observables_from_env();
-    for problem in &volume_declaration_problems {
-        tracing::error!(problem = %problem, "volume footprint declaration became no reading");
-    }
     let state = AppState {
         client: reqwest::Client::builder()
             .timeout(UPSTREAM_REQUEST_TIMEOUT)
@@ -8778,16 +8601,6 @@ pub async fn run(
         config.effective_contribution_oauth_refresh_interval_secs(),
         config.effective_contribution_oauth_refresh_threshold_secs(),
     ));
-    // Nothing hands these a stop signal either: the reading belongs to the pod,
-    // and a walker that stopped would leave its last measurement in place, which
-    // is what a volume that is not growing looks like too. A declaration that
-    // yielded no observable starts no loop, so the census does not list a walker
-    // that would measure nothing.
-    cog_observability::data_volume::spawn_watchers(
-        &state.volume_footprint,
-        cog_observability::data_volume::scan_interval_from_env(),
-        cog_core::ShutdownSignal::default(),
-    );
     // 选路的实测在启动时就发起一次，不等第一个 git 请求：判据要先于请求落地，
     // 否则首批请求只能按策略表猜——受限网络下那意味着先撞一次已知会挂的 HTTPS。
     // 探测目标取身份仓库（`COGNEVA_GATEWAY_GIT_IDENTITY_REPO`）：它就是这条通道
@@ -8871,6 +8684,217 @@ pub async fn run(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    /// 抓取面的测试替身。
+    ///
+    /// 这个 crate 不再拥有 Prometheus 注册表——注册表是实现，跟着拥有导出格式的
+    /// crate 走；网关只持有 [`cog_core::ScrapableMetrics`] 这个契约。但这里的断言
+    /// 读的正是抓取文本本身（"这一拍写了哪条、值是多少"）以及几条按名字取总数的
+    /// 查询，所以替身两样都要能答：渲染一段 `name{labels} value`，并按系列名字把
+    /// 已记下的样本原样交回。
+    ///
+    /// 它不判定抓取文本的语法正确性——那条由导出 crate 自己的测试负责，这里只回答
+    /// "本进程写了什么"。标签按名字排序、整数值不带小数点，与真实编码器的读法一致，
+    /// 因为断言按 `name{labels} value` 的形状切行。
+    #[derive(Default)]
+    struct ScrapeRecorder {
+        /// 一个系列的标签按名字排好后的样子；用它当键，读回时才能还原成
+        /// `MetricSample`，而不是从渲染出来的字符串里再解析一遍。
+        series: std::sync::Mutex<std::collections::BTreeMap<(String, Vec<(String, String)>), f64>>,
+        /// 直方图：(观测次数, 观测和)。桶的划分是真实编码器的事。
+        histograms: std::sync::Mutex<
+            std::collections::BTreeMap<(String, Vec<(String, String)>), (u64, f64)>,
+        >,
+    }
+
+    fn series_key(
+        name: cog_core::MetricName,
+        labels: &std::collections::HashMap<String, String>,
+    ) -> (String, Vec<(String, String)>) {
+        let mut pairs: Vec<(String, String)> =
+            labels.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        pairs.sort();
+        (name.as_str().to_string(), pairs)
+    }
+
+    fn render_key(key: &(String, Vec<(String, String)>)) -> String {
+        if key.1.is_empty() {
+            return key.0.clone();
+        }
+        let rendered: Vec<String> = key.1.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect();
+        format!("{}{{{}}}", key.0, rendered.join(","))
+    }
+
+    fn render_value(value: f64) -> String {
+        if value.fract() == 0.0 && value.abs() < 1e15 {
+            format!("{}", value as i64)
+        } else {
+            format!("{value}")
+        }
+    }
+
+    fn sample(key: &(String, Vec<(String, String)>), value: f64) -> cog_core::MetricSample {
+        cog_core::MetricSample {
+            timestamp: chrono::Utc::now(),
+            value,
+            labels: key.1.iter().cloned().collect(),
+        }
+    }
+
+    impl ScrapeRecorder {
+        fn matching(&self, name: &str) -> Vec<cog_core::MetricSample> {
+            self.series
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| key.0 == name)
+                .map(|(key, value)| sample(key, *value))
+                .collect()
+        }
+
+        fn matching_histograms(&self, name: &str) -> Vec<cog_core::HistogramTotals> {
+            self.histograms
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| key.0 == name)
+                .map(|(key, (count, sum))| cog_core::HistogramTotals {
+                    labels: key.1.iter().cloned().collect(),
+                    // 这个替身不划桶：每条观测都在顶上那一档，所以整批都记成
+                    // 溢出。调用方问的是"量了几次、合计多少"，这两格是真的。
+                    buckets: Vec::new(),
+                    overflow: *count,
+                    count: *count,
+                    sum: *sum,
+                    updated_at: chrono::Utc::now(),
+                })
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::MetricsBackend for ScrapeRecorder {
+        async fn record_gauge(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: std::collections::HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            self.series
+                .lock()
+                .unwrap()
+                .insert(series_key(name, &labels), value);
+            Ok(())
+        }
+
+        async fn record_counter(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: std::collections::HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            *self
+                .series
+                .lock()
+                .unwrap()
+                .entry(series_key(name, &labels))
+                .or_insert(0.0) += value;
+            Ok(())
+        }
+
+        async fn record_histogram(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: std::collections::HashMap<String, String>,
+        ) -> cog_core::SFResult<()> {
+            let mut held = self.histograms.lock().unwrap();
+            let slot = held.entry(series_key(name, &labels)).or_insert((0, 0.0));
+            slot.0 += 1;
+            slot.1 += value;
+            Ok(())
+        }
+
+        async fn query_gauge_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_gauge_latest(
+            &self,
+            name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(self.matching(name))
+        }
+
+        async fn query_counter_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn query_counter_totals(
+            &self,
+            name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(self.matching(name))
+        }
+
+        async fn query_histogram_totals(
+            &self,
+            name: &str,
+        ) -> cog_core::SFResult<Vec<cog_core::HistogramTotals>> {
+            Ok(self.matching_histograms(name))
+        }
+
+        async fn query_histogram_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> cog_core::SFResult<Vec<cog_core::MetricSample>> {
+            Ok(Vec::new())
+        }
+
+        async fn list_metric_names(
+            &self,
+            _: cog_core::MetricType,
+        ) -> cog_core::SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn health_check(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    impl cog_core::ScrapableMetrics for ScrapeRecorder {
+        fn encode(&self) -> Result<Vec<u8>, String> {
+            let mut out = String::new();
+            for (key, value) in self.series.lock().unwrap().iter() {
+                out.push_str(&render_key(key));
+                out.push(' ');
+                out.push_str(&render_value(*value));
+                out.push('\n');
+            }
+            for (key, (count, sum)) in self.histograms.lock().unwrap().iter() {
+                out.push_str(&format!("{}_count {count}\n", render_key(key)));
+                out.push_str(&format!("{}_sum {}\n", render_key(key), render_value(*sum)));
+            }
+            Ok(out.into_bytes())
+        }
+    }
+
+    fn test_metrics() -> Arc<dyn cog_core::ScrapableMetrics> {
+        Arc::new(ScrapeRecorder::default())
+    }
 
     fn test_upstream() -> LlmUpstream {
         LlmUpstream {
@@ -10075,7 +10099,6 @@ mod tests {
             contribution_oauth_refresh_threshold_secs: 0,
             database_url: None,
             redis_url: None,
-            observability: ObservabilityExportersConfig::default(),
             // No ceiling declared: the tests below that exercise it set one.
         }
     }
@@ -14008,7 +14031,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 ),
             )),
             pool_obs: std::sync::Arc::new(PoolObservability {
-                metrics: std::sync::Arc::new(PrometheusMetricsBackend::new("")),
+                metrics: test_metrics(),
                 analytics: None,
                 alerts: None,
                 usage: None,
@@ -14581,22 +14604,66 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     #[tokio::test]
     async fn declared_volume_footprints_reach_the_metrics_channel() {
         use tower::ServiceExt;
-        fn observable(claim: &str) -> Arc<cog_observability::data_volume::DataVolumeObservable> {
-            Arc::new(cog_observability::data_volume::DataVolumeObservable::new(
-                cog_observability::data_volume::WatchedTarget {
-                    claim: claim.into(),
-                    dir: std::path::PathBuf::from("/tmp/cogneva-gateway-volume-test"),
-                    exclude: Vec::new(),
-                },
-            ))
+        /// 一个卷占用观察者：与真实现同一形状（量过才报，读数带卷名标签），
+        /// 但走查的是本进程的内存而不是盘——这里要断的是"这个进程把交进来的
+        /// 观察者渲染出去了没有"，卷怎么走查是拥有那份机制的 crate 的事。
+        struct StubVolume {
+            claim: String,
+            used: std::sync::Mutex<Option<u64>>,
+        }
+
+        #[async_trait::async_trait]
+        impl cog_core::Observable for StubVolume {
+            async fn collect_metrics(
+                &self,
+                _dimension: &str,
+            ) -> cog_core::SFResult<Vec<cog_core::RawMetric>> {
+                Ok(self
+                    .used
+                    .lock()
+                    .unwrap()
+                    .map(|bytes| {
+                        vec![cog_core::RawMetric::new(
+                            cog_core::claim_footprint::USED_METRIC,
+                            bytes as f64,
+                        )
+                        .with_label(cog_core::claim_footprint::CLAIM_LABEL, &self.claim)]
+                    })
+                    .unwrap_or_default())
+            }
+
+            async fn collect_trace(
+                &self,
+                _task_id: &str,
+            ) -> cog_core::SFResult<Vec<cog_core::TraceFragment>> {
+                Ok(Vec::new())
+            }
+
+            fn available_dimensions(&self) -> Vec<cog_core::DimensionSpec> {
+                Vec::new()
+            }
+        }
+
+        fn observable(claim: &str) -> Arc<StubVolume> {
+            Arc::new(StubVolume {
+                claim: claim.into(),
+                used: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn footprint(observable: Arc<StubVolume>) -> VolumeFootprint {
+            VolumeFootprint {
+                claim: observable.claim.clone(),
+                observable,
+            }
         }
 
         let measured = observable("cogneva-git-mirror-pvc");
-        measured.set_used_bytes(4096);
+        *measured.used.lock().unwrap() = Some(4096);
         let unmeasured = observable("cogneva-never-walked-pvc");
 
         let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
-        state.volume_footprint = vec![measured, unmeasured];
+        state.volume_footprint = vec![footprint(measured), footprint(unmeasured)];
         let app = metrics_router(state);
 
         let resp = app

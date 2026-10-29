@@ -78,18 +78,10 @@ pub struct NewAlert {
     pub labels: Value,
 }
 
-/// What a `set_alert` call changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlertTransition {
-    /// The condition already matched the stored state. The row's payload may
-    /// still have been refreshed; callers key their notifications on the
-    /// state edge, not on this variant.
-    NoChange,
-    /// A new firing alert was recorded.
-    Fired,
-    /// An open alert was marked resolved.
-    Resolved,
-}
+/// What a `set_alert` call changed. Declared in the contract layer, because
+/// the process that raises a condition and the one that stores the row are
+/// different crates and both have to name the edge.
+pub use cog_core::contract::alerts::AlertTransition;
 
 /// The mutable payload of one stored row, read back before deciding what a
 /// `set_alert` call has to write.
@@ -705,7 +697,7 @@ impl cog_core::PersistentAlertSink for PostgresAlertStore {
         &self,
         condition: bool,
         draft: &cog_core::PersistentAlertDraft,
-    ) -> Result<(), String> {
+    ) -> Result<cog_core::AlertTransition, String> {
         let alert = NewAlert {
             rule: draft.rule.clone(),
             dedup_key: draft.dedup_key.clone(),
@@ -715,7 +707,17 @@ impl cog_core::PersistentAlertSink for PostgresAlertStore {
         };
         self.set_alert(condition, &alert)
             .await
-            .map(|_| ())
+            .map(|transition| match transition {
+                AlertTransition::NoChange => cog_core::AlertTransition::NoChange,
+                AlertTransition::Fired => cog_core::AlertTransition::Fired,
+                AlertTransition::Resolved => cog_core::AlertTransition::Resolved,
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    async fn firing_key_for_rule(&self, rule: &str) -> Result<Option<String>, String> {
+        PostgresAlertStore::firing_key_for_rule(self, rule)
+            .await
             .map_err(|e| e.to_string())
     }
 

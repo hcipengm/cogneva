@@ -109,12 +109,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 厂商相容画像表同理：表是 provider crate 的，网关只按契约问。
             let provider_compat: std::sync::Arc<dyn cog_core::ProviderCompatTable> =
                 std::sync::Arc::new(cog_llm::utils::compat::CompatImages);
+            // 观测面同理由装配层造：metrics / 告警 / 计量 / 分析 / 卷占用各自的
+            // 实现在 cog-observability 与 cog-storage 里，网关只按 core 的契约用。
+            // 日志订阅者与卷走查也在这里装上——独立网关模式下没有插件上下文。
+            let observability =
+                cogneva::gateway_observability::assemble(&gateway_config, &http_client).await;
             cog_gateway::security_gateway::run(
                 gateway_config,
                 Some(cogneva::build_info::GIT_REVISION),
                 http_client,
                 key_value,
                 Some(provider_compat),
+                observability.pool,
+                observability.volume_footprint,
             )
             .await
         }

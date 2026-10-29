@@ -225,6 +225,11 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // observability 插件发布。缺席时那条路由显式报「未配置」，而不是回一笔空账。
         let llm_usage_reader: Option<Arc<dyn cog_core::LlmUsageReader>> =
             ctx.consume_service::<dyn cog_core::LlmUsageReader>();
+        // The per-row token ledger, published by the same plugin as the rolled
+        // read face above. Same reason it is consumed rather than built: the
+        // gateway asks "what did this task spend", not "how do rows land".
+        let llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>> =
+            ctx.consume_service::<dyn cog_core::LlmUsageLedger>();
 
         // ── Build auxiliary components ──
 
@@ -297,7 +302,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &audit_stream,
             &taste_intent_sink,
             &llm_usage_reader,
-            &pg_pool_explain,
+            &llm_usage,
             &ctx.consume_service::<dyn cog_core::GovernanceStore>(),
             // 原则台账由持有共用库的存储插件发布。它写面归演化的常驻租约，
             // 这里只借读面：属主要在同一个界面里看见语料判成了什么、哪几条

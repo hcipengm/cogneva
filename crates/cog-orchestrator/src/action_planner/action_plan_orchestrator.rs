@@ -2574,14 +2574,22 @@ mod tests {
             &self,
             condition: bool,
             draft: &cog_core::PersistentAlertDraft,
-        ) -> Result<(), String> {
+        ) -> Result<cog_core::AlertTransition, String> {
             self.calls.lock().unwrap().push((
                 condition,
                 draft.rule.clone(),
                 draft.dedup_key.clone(),
             ));
             self.drafts.lock().unwrap().push(draft.clone());
-            Ok(())
+            Ok(if condition {
+                cog_core::AlertTransition::Fired
+            } else {
+                cog_core::AlertTransition::Resolved
+            })
+        }
+
+        async fn firing_key_for_rule(&self, _rule: &str) -> Result<Option<String>, String> {
+            Ok(None)
         }
 
         async fn list_active_persistent_alerts(

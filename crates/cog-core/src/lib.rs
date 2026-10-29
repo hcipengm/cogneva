@@ -84,6 +84,7 @@ pub use contract::system_plugin::*;
 pub use contract::task::*;
 pub use contract::taste::*;
 pub use contract::tool::*;
+pub use contract::usage_ledger::*;
 pub use contract::wiki::*;
 pub use day_key::{day_key, DAY_KEY_FORMAT};
 pub use error::{SFError, SFResult};
@@ -189,6 +190,9 @@ pub mod system_plugin {
 }
 pub mod tool {
     pub use crate::contract::tool::*;
+}
+pub mod usage_ledger {
+    pub use crate::contract::usage_ledger::*;
 }
 pub mod wiki {
     pub use crate::contract::wiki::*;

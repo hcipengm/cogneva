@@ -173,7 +173,7 @@ async fn breaches_this_pass(state: &Arc<GatewayState>) -> (Vec<BreachReport>, Ve
 /// （前一个是装配，后一个是存储），而读数上合成一格会让第二种盖住第一种——「没接
 /// 账」是这个进程永久的状态，恰恰需要一眼看见。
 async fn spends_of(
-    ledger: Option<&Arc<cog_observability::usage_store::LlmUsageStore>>,
+    ledger: Option<&Arc<dyn cog_core::LlmUsageLedger>>,
     tasks: &[Task],
 ) -> Result<BTreeMap<String, u64>, Blind> {
     let Some(store) = ledger else {

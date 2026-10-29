@@ -88,317 +88,13 @@ pub const WINDOW_TABLE: &str = "gateway_llm_window";
 /// definition site.
 pub use cog_core::LLM_ORIGIN_HEADER;
 
-/// The environment a metered call was made in, as a closed set.
-///
-/// Closed because it is read as counts and a reader selects rows by it: a value
-/// outside the set is not a new environment, it is a caller that did not say.
-/// [`Self::declared`] is the only way in, and [`Self::Unknown`] is deliberately
-/// outside the declared set -- an undeclared caller is not attributable to any
-/// environment, and folding it into one would credit that environment with
-/// tokens it did not burn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LlmOrigin {
-    /// The platform's own task pool driving agents (planner, generator, ...).
-    GatewayPool,
-    /// A long-lived resident worker session.
-    ResidentWorker,
-    /// An interactive, human-driven session.
-    Interactive,
-    /// A sandbox executor run.
-    Sandbox,
-    /// The evaluation harness driving scaffolds over a benchmark. It spends on
-    /// the same agents the pool does, but for a measurement rather than for
-    /// output, and the two cannot be told apart afterwards if they share an
-    /// origin: a reader asking what a benchmark cost would have to subtract it
-    /// from production spend by hand.
-    Eval,
-    /// No usable declaration arrived. Not a place a call comes from, so it is
-    /// kept out of [`Self::DECLARED`] and out of any environment's total.
-    Unknown,
-}
-
-impl LlmOrigin {
-    /// The values an environment may declare, in the order the ledger reads
-    /// them. [`Self::Unknown`] is not one of them.
-    pub const DECLARED: [LlmOrigin; 5] = [
-        LlmOrigin::GatewayPool,
-        LlmOrigin::ResidentWorker,
-        LlmOrigin::Interactive,
-        LlmOrigin::Sandbox,
-        LlmOrigin::Eval,
-    ];
-
-    /// The origin a caller declared, or [`Self::Unknown`] when it declared none
-    /// or named one outside the set.
-    ///
-    /// An unrecognised value reads as "nothing was declared" rather than being
-    /// stored as free text: the column is a closed set a reader groups by, and
-    /// letting an arbitrary token in would make every new misspelling its own
-    /// series. Trimming is the only repair -- a value that names an environment
-    /// after trimming is accepted.
-    pub fn declared(raw: Option<&str>) -> Self {
-        match raw.map(str::trim) {
-            Some("gateway_pool") => LlmOrigin::GatewayPool,
-            Some("resident_worker") => LlmOrigin::ResidentWorker,
-            Some("interactive") => LlmOrigin::Interactive,
-            Some("sandbox") => LlmOrigin::Sandbox,
-            Some("eval") => LlmOrigin::Eval,
-            _ => LlmOrigin::Unknown,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            LlmOrigin::GatewayPool => "gateway_pool",
-            LlmOrigin::ResidentWorker => "resident_worker",
-            LlmOrigin::Interactive => "interactive",
-            LlmOrigin::Sandbox => "sandbox",
-            LlmOrigin::Eval => "eval",
-            LlmOrigin::Unknown => "unknown",
-        }
-    }
-}
-
-/// 一次窗口配速拒绝的证据：这一拍的数与拒的是谁，和拒绝本身落在同一行。
-///
-/// 单独一组列而不是复用 `estimated_input` / `refusal_kind` / `upstream`：那三格
-/// 各有各的语义（估算的 prompt、上游拒的原因、这一行的主语），拿任何一个装配速
-/// 的额度缺口都是第二个语义，而两个语义共用一格，读的人就再也分不开它们。
-///
-/// 标量是**池级报表**（各已量到窗口的上游相加），与 429 body 上是同一组数；
-/// 真正判定的是 `upstreams` 里逐家各自的尺子——只留标量，一个"池里有额度、
-/// 但每一家自己的窗口都装不下"的拒绝会读成"整池没额度"。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PaceEvidence {
-    /// 这一拍量到窗口的上游家数。它与 `allowance_tokens` 必须一起读：没有它，
-    /// 0 额度分不清"量了一家且烧穿"与"一家都没量到"。
-    pub measured_upstreams: u32,
-    pub allowance_tokens: u64,
-    pub spent_tokens: u64,
-    pub reserve_tokens: u64,
-    /// 这一窗的起点。不能省：`allowance_tokens = 0` 本身分不清"窗口还没开张"
-    /// 与"已经烧到零"，边界时刻必须自带。
-    pub window_start_unix: i64,
-    /// 参与判定且各自都被自己那把尺子拦下的候选。空集不会出现在拒绝行上。
-    pub upstreams: Vec<PaceUpstreamEvidence>,
-}
-
-/// 一个候选自己被判拦那一刻的读数，键与健康表同形（`base_url|model`）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct PaceUpstreamEvidence {
-    pub upstream: String,
-    pub allowance_tokens: u64,
-    pub spent_tokens: u64,
-    pub reserve_tokens: u64,
-    pub window_start_unix: i64,
-    /// 这一家自己最早什么时候承接得下下一件任务。
-    pub wait_secs: u64,
-}
-
-/// One metered LLM call.
-#[derive(Debug, Clone)]
-pub struct LlmUsageRecord {
-    /// Pool identity of the upstream that served the call.
-    pub upstream: String,
-    /// Wire protocol family (`openai` / `anthropic`).
-    pub api_style: String,
-    /// Real model name as configured on the upstream.
-    pub model: String,
-    /// One of [`UsageResult`]'s words. The two refusals carry zero tokens but
-    /// keep the attempt visible, and they are kept apart from `error` because
-    /// the words name opposite repairs: an `error` row is an upstream that was
-    /// tried and did not serve, `refused_by_circuit` is a call no upstream was
-    /// ever offered (the pool was known unusable), and `refused_by_pace` is one
-    /// this platform held back on purpose. Each reads as its own state rather
-    /// than as "no traffic". On a refusal row `upstream` and `model` are `-`:
-    /// no single upstream is its subject, so both columns say so rather than
-    /// naming a candidate.
-    pub result: String,
-    /// Calling component as normalized by the gateway (`self_review`,
-    /// `agent:<role>`, `unknown`); lets per-actor token spend be audited.
-    pub actor: String,
-    /// Environment the call was made from, as one of [`LlmOrigin`]'s values --
-    /// the gateway's reading of the caller's own [`LLM_ORIGIN_HEADER`]. Answers
-    /// a question `actor` cannot: the same component runs in more than one
-    /// environment, so "who spent this" and "where it was spent" are two axes.
-    pub origin: String,
-    pub tokens_input: u64,
-    pub tokens_output: u64,
-    /// Input tokens the upstream served from its own prefix cache. Its own
-    /// column rather than a fold into `tokens_input`: the ratio of the two is
-    /// the hit rate, and that ratio is the only reading a change to prompt
-    /// prefix stability can be accepted on, so a durable audit of token spend
-    /// that cannot answer it is missing the one number it exists for. How the
-    /// two relate follows the wire protocol (on an OpenAI-compatible upstream
-    /// cached is a subset of input, on Anthropic the two are disjoint), which
-    /// is why they stay apart here instead of being netted out.
-    pub tokens_cached: u64,
-    /// What this platform's own estimator priced the request at, before any
-    /// upstream counted the prompt.
-    ///
-    /// The row's other input figure is the upstream's truth; this one is the
-    /// estimate the window budget is judged against, so one row carries both
-    /// rulers and the gap between them is readable. The estimate is a
-    /// deliberate lower bound ([`cog_core::estimate_tokens`], the unit the
-    /// agent's context window trims by) over the serialized body this gateway
-    /// sent, so `estimated_input` below `tokens_input` is expected and its
-    /// *size* is the finding: a gap that tracks the content mix is the
-    /// estimator's, a request the estimator also called over budget is the
-    /// window's. Without both numbers on the same row those two read alike,
-    /// which is why this is a column and not a counter of over-budget calls.
-    ///
-    /// `None` on rows landed by a path that does not price a request (failed
-    /// attempts and pooled refusals). Absent is not zero here: a row priced at
-    /// zero would read as an empty prompt, and the two have opposite repairs.
-    pub estimated_input: Option<u64>,
-    /// Why the upstream refused, as the gateway classified the refusal body:
-    /// `quota_cycle`, `entitlement`, or `unclassified`.
-    ///
-    /// Nullable, and `NULL` means either "this row is not a refusal" (a
-    /// successful call, a transport failure with no body to read, a pooled
-    /// refusal decided before any upstream was tried) or a row written before
-    /// this column existed -- the reader cannot tell those apart after the
-    /// fact, which is why the value is recorded at the refusal site and never
-    /// reconstructed. The distinction is the point: `quota_cycle` says this
-    /// window is spent and will come back, `entitlement` says it never existed,
-    /// and the two call for opposite actions. Folding both into `error` makes
-    /// "we have no capacity" and "we never bought this model" one cell.
-    pub refusal_kind: Option<String>,
-    /// 这次熔断拒绝让调用方等多久（秒）。
-    ///
-    /// 只有 `refused_by_circuit` 的行有：熔断在拒绝的那一刻就已经说出下一次值得
-    /// 再试的时刻，而**这个数的量级正是两种熔断的分界**——窗口翻页黑障是几十秒到
-    /// 几分钟，额度烧穿是几千秒（通常就是上游自述的 reset）。不落这一格，两种情形
-    /// 在账上都只是 `refused_by_circuit`，读者得回头去读窗口相位才能分开，而那
-    /// 份读数在事后往往已经滚过去了。
-    ///
-    /// `None` 不是 0：0 会读成「立刻可以重试」，而这行说的恰恰是「现在不能」。
-    pub retry_after_secs: Option<u64>,
-    /// The unit of work this call was spent for, as the caller declared it --
-    /// the same identity the caller reports its own per-run totals under.
-    ///
-    /// Nullable on purpose, like `estimated_input` and for the same reason:
-    /// `NULL` is "this call was not attributed to a job", which is a different
-    /// statement from "it was spent for job `unknown`". A NOT NULL default would
-    /// put every unattributed call in one group and read as a single very
-    /// expensive job, so rows landed by paths that have no job identity keep it
-    /// empty rather than inventing one.
-    pub task: Option<String>,
-    /// Wall time of the call; for streams this is first-byte to last-byte.
-    pub latency_ms: u64,
-    /// 窗口配速那一拍的读数，只在 `result = "refused_by_pace"` 的行上有。
-    ///
-    /// `None` 在非配速行上是"不适用"，不是"缺口为 0"——`NULL ≠ 0` 是这组列
-    /// 存在的全部理由：配速拒绝的缺口按 `spent + reserve − allowance` 复算，
-    /// 而别的行上没有这一拍的数，给它们写 0 会让缺口读成"正好不欠额度"。
-    pub pace: Option<PaceEvidence>,
-}
-
-/// One LLM exchange, bodies included.
-///
-/// The usage record beside it answers "how much"; this answers "what was
-/// asked and what came back". They are separate rows in separate tables
-/// because the two are written by the same call but read by different
-/// consumers: pacing and billing read the usage row on every window boundary
-/// and must not pay for text they never look at, while a person asking why a
-/// run burned 850k tokens reads one exchange and nothing else.
-#[derive(Debug, Clone)]
-pub struct LlmExchangeRecord {
-    pub upstream: String,
-    pub api_style: String,
-    pub model: String,
-    pub actor: String,
-    pub origin: String,
-    pub task: Option<String>,
-    /// `ok`, `abandoned` (the caller dropped the stream mid-flight), or
-    /// `error` (the upstream answered with a non-2xx body).
-    pub result: String,
-    pub latency_ms: u64,
-    /// SHA-256 of the exact bytes sent upstream, before redaction.
-    pub request_sha256: String,
-    /// SHA-256 of the response bytes; `None` when no response body existed.
-    pub response_sha256: Option<String>,
-    pub request_bytes: u64,
-    pub response_bytes: u64,
-    /// Redacted text, capped by the caller and marked in `truncated` when it
-    /// was cut. `None` is the shape a caller uses when there were no bytes at
-    /// all -- a request path that builds no body of its own, for instance --
-    /// and is therefore distinct from `Some("")`, which is a body that was
-    /// empty. Both the size and the hash are taken before the cut, so a reader
-    /// can tell a short body from a long one that was clipped.
-    pub request_body: Option<String>,
-    pub response_body: Option<String>,
-    /// Which side was dropped for size: `""`, `request`, `response`, `both`.
-    pub truncated: String,
-}
-
-/// One `(actor, upstream, api_style)` line of a window's token composition.
-///
-/// `failed_calls` is not folded into `calls`: an error row carries zero tokens
-/// by construction (the upstream never served a completion), so a window whose
-/// every call failed and a window with no traffic at all sum to the same token
-/// count. Keeping the failure count beside the token totals is what lets a
-/// reader tell the two apart instead of reading "this path records nothing".
-///
-/// A pooled refusal counts here too, and reads off on its own: its rows are the
-/// only ones whose `upstream` is `-`, so the group answers "how many calls were
-/// turned away before any upstream was tried" without the reader having to
-/// subtract anything. Excluding it instead would make a group of refusals read
-/// as `calls > 0, failed = 0, tokens = 0` — a path that answered everything and
-/// spent nothing, which is the one reading that is certainly false.
-/// One upstream's quota window as the ledger tells it. See
-/// [`LlmUsageStore::upstream_window`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct UpstreamWindowReading {
-    /// Last instant this upstream served a call; `None` when it never has.
-    pub last_ok_unix: Option<i64>,
-    /// Instant of the most recent refusal that said the window was spent;
-    /// `None` when no such refusal is on record.
-    pub last_quota_refusal_unix: Option<i64>,
-    /// Latest instant serving resumed after a spent-cycle refusal, `None` when
-    /// it never has.
-    ///
-    /// This is the only observation of a reset that an upstream which names no
-    /// instant leaves behind: a call cannot succeed while the window is spent,
-    /// so the first success after a wall bounds the instant the quota returned
-    /// — the error is the retry delay, and for a pacer that re-reads every tick
-    /// that is seconds. The instant is a **window start**: windows repeat from
-    /// it, so it anchors the phase even while a later wall has no success after
-    /// it yet. The refusal itself is not that instant: a window can be spent on
-    /// its first day.
-    pub last_resume_unix: Option<i64>,
-    /// What the window ending at the last classified refusal served; zero when
-    /// there is no such refusal, because nothing measured it.
-    pub burned_window_tokens: u64,
-}
-
-/// One upstream's window measurement, as durable state.
-///
-/// `source` names **which observation** the boundary came from, not what kind
-/// of code wrote the row: `named_reset` is the instant an upstream named in its
-/// refusal, `last_resume` is the first successful call after the wall, which
-/// bounds the reset from above by the retry delay, and `observed_reset` is a
-/// live reading that classified the outstanding refusal as a spent cycle and
-/// named when the quota returns. A reader that sees only the instant cannot
-/// tell an exact promise from a bounded one; the three are not equally strong.
-/// Rows written before this vocabulary say `wall_row`: that spelling named the
-/// path the capacity was summed on, not the boundary, so it reads as
-/// `provenance unknown` until the next measurement rewrites the row.
-///
-/// `declared_reset_unix` is the upstream's own statement, kept verbatim. It can
-/// differ from `boundary_unix` when the named instant was rejected as belonging
-/// to another cycle, so the pair answers "what did it say" and "what did we
-/// pace from" separately. `None` means the upstream named no instant at all —
-/// it is never the boundary copied across.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StoredWindow {
-    pub upstream: String,
-    pub capacity_tokens: u64,
-    pub window_secs: u64,
-    pub boundary_unix: i64,
-    pub source: String,
-    pub declared_reset_unix: Option<i64>,
-}
+/// The ledger's environment vocabulary, its pacing evidence and its row shapes
+/// live in the contract layer: the process that fills a row and the process
+/// that owns the table are different crates, and neither may name the other.
+pub use cog_core::contract::usage_ledger::{
+    LlmExchangeRecord, LlmOrigin, LlmUsageRecord, PaceEvidence, PaceUpstreamEvidence, StoredWindow,
+    UpstreamWindowReading,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorSpend {
@@ -1795,6 +1491,110 @@ impl cog_core::LlmUsageReader for RolledUsageReader {
                 })
                 .collect(),
         })
+    }
+}
+
+/// The contract face of this store.
+///
+/// The process that meters calls holds the trait object, not this type: it is
+/// not allowed to name the crate that owns the table. The inherent methods stay
+/// as they are for the reporting side, which is assembled here and can see both.
+#[async_trait::async_trait]
+impl cog_core::LlmUsageLedger for LlmUsageStore {
+    async fn record(&self, record: &LlmUsageRecord) -> Result<(), String> {
+        LlmUsageStore::record(self, record)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn record_exchange(&self, record: &LlmExchangeRecord) -> Result<(), String> {
+        LlmUsageStore::record_exchange(self, record)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn upstream_window(
+        &self,
+        upstream: &str,
+        window_secs: u64,
+    ) -> Result<UpstreamWindowReading, String> {
+        LlmUsageStore::upstream_window(self, upstream, window_secs)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn burned_between(
+        &self,
+        upstream: &str,
+        since_unix: i64,
+        until_unix: i64,
+    ) -> Result<u64, String> {
+        LlmUsageStore::burned_between(self, upstream, since_unix, until_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn record_window(&self, window: &StoredWindow) -> Result<(), String> {
+        LlmUsageStore::record_window(self, window)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn stored_window(
+        &self,
+        upstream: &str,
+        window_secs: u64,
+    ) -> Result<Option<StoredWindow>, String> {
+        LlmUsageStore::stored_window(self, upstream, window_secs)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn spent_since(&self, upstream: &str, since_unix: i64) -> Result<u64, String> {
+        LlmUsageStore::spent_since(self, upstream, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn spend_by_actor_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
+        LlmUsageStore::spend_by_actor_since(self, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn task_cost_quantile(
+        &self,
+        days: i64,
+        quantile: f64,
+    ) -> Result<Option<(u64, u64, i64)>, String> {
+        LlmUsageStore::task_cost_quantile(self, days, quantile)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn task_has_started(&self, task: &str) -> Result<bool, String> {
+        LlmUsageStore::task_has_started(self, task)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn spend_by_task(&self, task_ids: &[String]) -> Result<Vec<(String, u64)>, String> {
+        LlmUsageStore::spend_by_task(self, task_ids)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn unattributed_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, String> {
+        LlmUsageStore::unattributed_between(self, since, until)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 

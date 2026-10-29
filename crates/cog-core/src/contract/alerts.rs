@@ -510,6 +510,25 @@ pub fn bound_alert_labels(labels: &serde_json::Value, max_chars: usize) -> serde
     }
 }
 
+/// What one write to the alert table changed.
+///
+/// The three are not a log line: a caller that only sends conditions cannot
+/// tell "the condition just started" from "it is still true", and either
+/// notifying on every write or not notifying at all is wrong in one of the two
+/// cases. The edge is the thing worth announcing, and it is only knowable where
+/// the row is read before it is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlertTransition {
+    /// The condition already matched the stored state. The row's payload may
+    /// still have been refreshed; callers key their notifications on the state
+    /// edge, not on this variant.
+    NoChange,
+    /// A new firing alert was recorded.
+    Fired,
+    /// An open alert was marked resolved.
+    Resolved,
+}
+
 /// Write-side handle over persisted alerts, symmetric to
 /// [`ActiveAlertSource`]. Producers that detect durable fault conditions
 /// (stalled DAG tasks, exhausted retries) raise alerts through this port so
@@ -520,11 +539,25 @@ pub trait PersistentAlertSink: Send + Sync {
     /// Drive one alert condition: `true` guarantees a firing row, `false`
     /// resolves the row for this dedup key. Errors are returned, never
     /// panicked: an alerting hiccup must not break the caller's main path.
+    ///
+    /// The answer says which edge was crossed, so a caller can log or notify on
+    /// the edge rather than on every tick. `Ok(AlertTransition::NoChange)` is
+    /// the honest answer for a condition that was already true; the payload may
+    /// still have been refreshed.
     async fn set_persistent_alert(
         &self,
         condition: bool,
         draft: &PersistentAlertDraft,
-    ) -> Result<(), String>;
+    ) -> Result<AlertTransition, String>;
+
+    /// The dedup key of the open (firing) row under `rule`, if any.
+    ///
+    /// A caller that re-derives an alert's identity on every tick has to reuse
+    /// the identity that is already open, or one condition becomes a new row
+    /// per tick and the resolve only ever closes the last one. `Ok(None)` is
+    /// "there is no open row"; an error is "the rows could not be read", which
+    /// is a different statement and must not be treated as the first.
+    async fn firing_key_for_rule(&self, rule: &str) -> Result<Option<String>, String>;
 
     /// Firing alerts whose rule starts with `rule_prefix`, newest first.
     /// Used by supervisors to adopt rows raised before a restart.

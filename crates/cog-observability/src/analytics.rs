@@ -11,58 +11,10 @@ use std::sync::Arc;
 
 use cog_core::{HttpClient, HttpRequest, MetricsBackend};
 
-/// Analytics event record.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AnalyticsEvent {
-    pub event_id: String,
-    pub event_type: String,
-    pub timestamp: DateTime<Utc>,
-    pub user_id: Option<String>,
-    pub session_id: Option<String>,
-    pub task_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub properties: HashMap<String, Value>,
-}
-
-impl AnalyticsEvent {
-    pub fn new(event_type: impl Into<String>) -> Self {
-        Self {
-            event_id: uuid::Uuid::new_v4().to_string(),
-            event_type: event_type.into(),
-            timestamp: Utc::now(),
-            user_id: None,
-            session_id: None,
-            task_id: None,
-            agent_id: None,
-            properties: HashMap::new(),
-        }
-    }
-
-    pub fn user_id(mut self, id: impl Into<String>) -> Self {
-        self.user_id = Some(id.into());
-        self
-    }
-
-    pub fn session_id(mut self, id: impl Into<String>) -> Self {
-        self.session_id = Some(id.into());
-        self
-    }
-
-    pub fn task_id(mut self, id: impl Into<String>) -> Self {
-        self.task_id = Some(id.into());
-        self
-    }
-
-    pub fn agent_id(mut self, id: impl Into<String>) -> Self {
-        self.agent_id = Some(id.into());
-        self
-    }
-
-    pub fn property(mut self, key: impl Into<String>, value: Value) -> Self {
-        self.properties.insert(key.into(), value);
-        self
-    }
-}
+/// The event's shape and the sink it is handed to live in the contract layer:
+/// the process that witnesses an event and the one that stores it are
+/// different crates, and neither may name the other.
+pub use cog_core::contract::usage_ledger::{AnalyticsEvent, AnalyticsSink};
 
 /// Analytics storage backend trait.
 #[async_trait::async_trait]
@@ -857,6 +809,13 @@ impl ClickHouseEventBuffer {
 
     pub fn send(&self, event: AnalyticsEvent) {
         let _ = self.tx.send(event);
+    }
+}
+
+/// The contract face of the queue: a producer enqueues and moves on.
+impl AnalyticsSink for ClickHouseEventBuffer {
+    fn send(&self, event: AnalyticsEvent) {
+        ClickHouseEventBuffer::send(self, event);
     }
 }
 

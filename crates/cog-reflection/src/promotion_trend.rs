@@ -469,7 +469,7 @@ impl PromotionTrendReporter {
 
         match sink.set_persistent_alert(stall.is_some(), &draft).await {
             Err(e) => warn!(error = %e, "promotion stall alert not persisted"),
-            Ok(()) => {
+            Ok(_) => {
                 if let Some(stall) = stall {
                     error!(alert = stall, "Promotion stall alert");
                 }
@@ -801,13 +801,20 @@ mod tests {
             &self,
             condition: bool,
             draft: &cog_core::PersistentAlertDraft,
-        ) -> Result<(), String> {
+        ) -> Result<cog_core::AlertTransition, String> {
             self.calls.lock().unwrap().push((
                 condition,
                 draft.rule.clone(),
                 draft.severity.clone(),
             ));
-            Ok(())
+            Ok(if condition {
+                cog_core::AlertTransition::Fired
+            } else {
+                cog_core::AlertTransition::Resolved
+            })
+        }
+        async fn firing_key_for_rule(&self, _rule: &str) -> Result<Option<String>, String> {
+            Ok(None)
         }
         async fn list_active_persistent_alerts(
             &self,

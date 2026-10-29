@@ -61,5 +61,6 @@ pub mod task;
 pub mod taste;
 pub mod tool;
 pub mod transport;
+pub mod usage_ledger;
 pub mod version;
 pub mod wiki;

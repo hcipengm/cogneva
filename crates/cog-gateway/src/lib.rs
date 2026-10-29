@@ -303,7 +303,7 @@ pub struct GatewayState {
     /// actor×上游×协议汇总，答不了「这条任务花了多少」。挣值问的正是后者。
     /// 缺席时读面显式报「量不了」，不把缺账读成零花销。借的是库里已有的池，
     /// 不为这一次读新开一套连接。
-    pub llm_usage: Option<Arc<cog_observability::usage_store::LlmUsageStore>>,
+    pub llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>>,
     /// Observables — 各业务 crate 暴露的系统级指标（D5/D8/D9）。
     pub observables: Vec<Arc<dyn cog_core::Observable>>,
     /// 抓取维度集合的可选收窄项；空 = 不收窄，采每个 observable 自己声明的有界维度。
@@ -3763,7 +3763,7 @@ mod metrics_exposition_tests {
     /// 边界：一个名字登记在**哪个** kind 下，这里判不出来——kind 记在产出点的
     /// `record_*` 调用上（同一个名字既可能是计数也可能是仪表），闭集里没有它。
     /// 登错 kind 与漏描述在暴露面上同形（都是占位符），这条测试看不见它。
-    /// `cog-observability` 那条渲染测试也不覆盖它：它写的名字是
+    /// 渲染那一层自己的测试也不覆盖它：它写的名字是
     /// `MetricName::for_tests_only`，一个**故意**不在闭集里的名字，测的是占位符
     /// 这条路径本身。能判它的读数是暴露面自己——滚上去之后，闭集里的名字不该再
     /// 出现任何一行占位符。修订前实测（现役 `main-c8e245c9978e`，两个 Pod 的

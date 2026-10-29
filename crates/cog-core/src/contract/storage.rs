@@ -245,6 +245,32 @@ pub trait MetricsBackend: Send + Sync {
     async fn health_check(&self) -> SFResult<()>;
 }
 
+/// A live metrics registry that can also be scraped.
+///
+/// [`MetricsBackend`] answers questions *about* metrics that were recorded; it
+/// deliberately says nothing about how a scrape is rendered, because a durable
+/// backend (Postgres, an in-memory map) has no exposition of its own. A
+/// process that serves `/metrics` needs the other half — the exact bytes a
+/// scraper reads — and that half belongs to the registry the process records
+/// into, not to the HTTP surface that forwards it.
+///
+/// The split is why this is a second trait rather than a method on
+/// `MetricsBackend`: adding `encode` there would force every durable backend to
+/// invent an exposition, and an invented one reads as authoritative while
+/// disagreeing with what the producer actually holds.
+///
+/// The encoding is a plain byte vector so that the format stays the
+/// implementation's business: a caller forwarding it to an HTTP response must
+/// not have to link the format's library to do it.
+pub trait ScrapableMetrics: MetricsBackend {
+    /// Render every recorded series in the exposition format the scraper reads.
+    ///
+    /// An error means the registry could not be rendered at all; it does not
+    /// mean "nothing recorded". A caller answering a scrape with an empty body
+    /// on error makes a live, silent process look like a dead one.
+    fn encode(&self) -> Result<Vec<u8>, String>;
+}
+
 /// Which of the three metric kinds a name is recorded under.
 ///
 /// The kinds are not interchangeable at read time: a gauge is read over a
