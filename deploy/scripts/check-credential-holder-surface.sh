@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 凭证持有面门禁：谁碰得到 cogneva-secrets / cogneva-secrets-oob 里的哪个键，必须
-# 与登记表逐条对齐。
+# 与每个键自己的读者声明逐条对齐。
 #
 # 为什么需要这条门禁：这两个对象的读者面就是"零带外凭证"这条约束的实际边界，而
 # 它是**纯粹声明出来**的——多一个工作负载挂上带外那一片，渲染期没有任何症状：清单
@@ -17,20 +17,26 @@
 #        role    Role/ClusterRole 里的 secrets 规则 → RoleBinding 解析到
 #                ServiceAccount。**动词含 patch/update/create/delete 记 write**：
 #                能改就能把值换成自己写的，等价于持有；只有 get/list/watch 记 read。
-#   3. 两侧互判：树上的持有者 ⊆ 登记表（多出来的点名），登记表 ⊆ 树上的持有者
-#      （陈旧的登记点名）。
-#   4. 登记表里的键必须是写者声明过的键（`*` 除外）：运维手写的可选键得同时满足
-#      「树上有读者」且「读它是 optional」——否则读者按名读一个没人建的键就起不来。
-#   5. 三种部署形态的持有面逐条相同（含权限面）：登记表不带形态维，而"只在某一个
+#   3. 两侧互判：树上的持有者 ⊆ 该键上方 `# readers:` 行声明的读者（多出来的点名），
+#      声明的读者 ⊆ 树上的持有者（陈旧的声明点名）。**读者面只能声明、不能推导**：
+#      机器推得出「谁在读」，推不出「谁该读」；那份判断写在键自己头上，跟着键走，
+#      不另立一张表。`deploy/credential-holders.tsv` 2026-10-29 删掉正是因为它把
+#      渲染产物已经算得出的 object/key/path/access 又手抄了一遍——49 行里 47 行
+#      与机器读数逐字相同，抄错的那一行不会有任何一拍红。
+#   4. 每个声明键都要有读者声明，且声明过的读者必须真在树上读它；运维手写的可选键
+#      （安装器不建，`smtp-password` / `task-face-sources`）没有 `stringData` 行可挂
+#      声明，门禁只保留「按名读一个没人建的键、且不是 optional 即红」这一条。
+#   5. 三种部署形态的持有面逐条相同（含权限面）：读者声明不带形态维，而"只在某一个
 #      形态里多挂了一个凭证"是最容易漏看的一种——用另一个形态的清单去看永远看不见。
 #   6. 带外片的 role 写权限只能落在安全网关那个主体上：多一个能 patch 的人，等于
 #      把「代持带外凭证」复制一份，而清单上只多了一个对象名。
 #   7. 迁移窗必须写 `closes-when=<文件>:<符号>`，且那些读点全部搬走（符号都不在树
 #      上了）就红：「迁移窗」三个字是状态描述，不是判据，它不会自己到期。
 #
-# 本门**核不到**的一条路，写在登记表里而不是假装核过：进程内经 Kubernetes API 读
-# 某个键（`path = api` 的行）。渲染产物里看不到它，evidence 列给出读它的代码文件，
-# 门禁只核那个文件还在树上（指针防锈）。它是否真读那个键，要另一条判据。
+# 本门**核不到**的一条路，写在声明里而不是假装核过：进程内经 Kubernetes API 读
+# 某个键。渲染产物里看不到它，所以那类读者写成 `# readers: Deployment/x (api: <文件>)`，
+# 门禁只核两件事：那个文件还在树上，且文件里出现这个键名（指针防锈）。它是否真在
+# 读那个键，要另一条判据。
 #
 # 用法：bash deploy/scripts/check-credential-holder-surface.sh [仓库根目录]
 set -euo pipefail
@@ -44,7 +50,6 @@ python3 - <<'PYEOF'
 import glob, os, re, sys, yaml
 
 RENDERED = "deploy/rendered"
-REGISTRY = "deploy/credential-holders.tsv"
 TEMPLATES = {
     "cogneva-secrets": "deploy/helm/cogneva/templates/secret.yaml",
     "cogneva-secrets-oob": "deploy/helm/cogneva/templates/secret-oob.yaml",
@@ -58,37 +63,88 @@ WRITE_VERBS = {"patch", "update", "create", "delete"}
 failures = []
 
 
-def declared_keys(path):
-    """chart 模板里 stringData 块声明的键。空集合是判据失效，不是"没问题"。"""
-    keys, inside = [], False
+READERS_RE = re.compile(r"^\s*#\s*readers:\s*(.*)$")
+API_RE = re.compile(r"^(?P<holder>\w+/\S+)\s*\(api:\s*(?P<file>[^)]+)\)$")
+
+
+def parse_template(path):
+    """stringData 的键、键所在行、以及键正上方那条 `# readers:` 声明。
+
+    空键集合是判据失效，不是"没问题"。键之间夹着 helm 指令（`{{- if $x }}` /
+    `{{- end }}`，写在行首），它们不是块结束；按"行首不是空格"停会在这里静默截断
+    键表，而截断的后果是后面那些键被当成"写者没声明"。
+    """
+    keys, inside, pending = {}, False, None
     with open(path) as fh:
-        for line in fh:
+        for lineno, line in enumerate(fh, 1):
             body = line.rstrip("\n")
             stripped = body.strip()
             if not inside:
                 if stripped == "stringData:":
                     inside = True
                 continue
-            # 键之间夹着 helm 指令（`{{- if $x }}` / `{{- end }}`，写在行首），
-            # 它们不是块结束；按"行首不是空格"停会在这里静默截断键表，
-            # 而截断的后果是后面那些键被当成"写者没声明"。
-            if not stripped or stripped.startswith("#") or stripped.startswith("{{"):
+            if not stripped or stripped.startswith("{{"):
                 continue
             if not body.startswith(" "):         # 顶层键 = 块结束
                 break
+            if stripped.startswith("#"):
+                m = READERS_RE.match(body)
+                if m:
+                    pending = (lineno, m.group(1).strip())
+                continue
             if body.startswith("   "):            # 更深缩进属于上一个键的值
                 continue
             name = stripped.split(":", 1)[0].strip()
             if name and all(ch.isalnum() or ch in "-._" for ch in name):
-                keys.append(name)
-    return set(keys)
+                keys[name] = (lineno, pending)
+                pending = None
+    return keys, pending
 
 
-declared = {obj: declared_keys(tpl) for obj, tpl in TEMPLATES.items()}
-for obj, keys in declared.items():
+# (obj, key) -> [(holder, api_file 或 None)]；读者面是声明出来的那一份。
+declared = {}
+for obj, tpl in TEMPLATES.items():
+    keys, leftover = parse_template(tpl)
     if not keys:
-        failures.append(f"{TEMPLATES[obj]} 里没解析出任何 stringData 键：判据失效"
-                        "（空集合会让「每个声明的键都有登记」恒真）")
+        failures.append(f"{tpl} 里没解析出任何 stringData 键：判据失效"
+                        "（空集合会让「每个声明的键都有读者」恒真）")
+    if leftover is not None:
+        failures.append(f"{tpl}:{leftover[0]} 的 `# readers:` 没有挂到任何键上："
+                        "它要么被挪到了别的键头上，要么那个键已被删掉")
+    for key, (lineno, pending) in keys.items():
+        where = f"{tpl}:{lineno} 的 {key}"
+        if pending is None:
+            failures.append(f"{where} 上方没有 `# readers:` 行：这个键谁读、凭什么读，"
+                            "是声明出来的判断，写不出来就该把这个键删掉")
+            continue
+        raw = pending[1]
+        note = ""
+        if " — " in raw:
+            raw, note = raw.split(" — ", 1)
+        if "迁移窗" in raw + note:
+            if not re.search(r"closes-when=[^\s:]+:\S+", note):
+                failures.append(f"{where} 的读者声明是迁移窗，却没有 "
+                                "closes-when=<文件>:<符号>：没有关闭条件的窗口等于永久授权")
+        entries, line_fail = [], []
+        for part in [p.strip() for p in raw.split(",") if p.strip()]:
+            m = API_RE.match(part)
+            if m:
+                entries.append((m.group("holder").strip(), m.group("file").strip()))
+            elif re.match(r"^\w+/\S+$", part):
+                entries.append((part, None))
+            else:
+                line_fail.append(f"{where} 的读者 {part!r} 不是 `<kind>/<名字>`"
+                                 "（API 路径写成 `<kind>/<名字> (api: <文件>)`）")
+        if line_fail:
+            failures.extend(line_fail)
+            continue
+        if not entries:
+            failures.append(f"{where} 的 `# readers:` 是空的：没有读者就删掉这个键，"
+                            "别用空声明把它留在那里")
+            continue
+        declared[(obj, key)] = entries
+
+declared_keys = {obj: {k for (o, k) in declared if o == obj} for obj in TEMPLATES}
 
 
 def docs(profile):
@@ -137,7 +193,7 @@ def surface(profile):
                         continue
                     key = ref.get("key")
                     obs[(ref["name"], key, "env", name)] = "read"
-                    if key not in declared[ref["name"]]:
+                    if key not in declared_keys[ref["name"]]:
                         if ref.get("optional"):
                             optional_undeclared.add((ref["name"], key))
                         else:
@@ -153,7 +209,7 @@ def surface(profile):
                 if items:
                     for it in items:
                         obs[(sec["secretName"], it["key"], "volume", name)] = "read"
-                        if it["key"] not in declared[sec["secretName"]]:
+                        if it["key"] not in declared_keys[sec["secretName"]]:
                             if sec.get("optional"):
                                 optional_undeclared.add((sec["secretName"], it["key"]))
                             else:
@@ -215,114 +271,54 @@ for profile in profiles[1:]:
                 f"[{base}] 是 {surfaces[base][t]}：权限面在形态之间不同")
 observed = surfaces[base]
 
-rows = []
-seen = set()
-with open(REGISTRY) as fh:
-    for lineno, line in enumerate(fh, 1):
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        fields = (line.rstrip("\n").split("\t") + [""] * 7)[:7]
-        obj, key, path, holder, access, evidence, note = fields
-        where = f"{REGISTRY}:{lineno}"
-        if not obj or not key or not path or not holder:
-            failures.append(f"{where} 列不全（object/key/path/holder 都必填）：{line.rstrip()!r}")
-            continue
-        if obj not in OBJS:
-            failures.append(f"{where} 的对象 {obj!r} 不是那两个 Secret 对象之一")
-        if path not in PATHS:
-            failures.append(f"{where} 的路径 {path!r} 不在 {PATHS} 里")
-        if access not in ACCESS:
-            failures.append(f"{where} 的权限 {access!r} 不在 {ACCESS} 里")
-        row = (obj, key, path, holder, access)
-        if row in seen:
-            failures.append(f"{where} 与上面某行逐字重复：{obj}/{key}/{path}/{holder}")
-        seen.add(row)
-        rows.append(row + (evidence, note))
-
-# 1) 树上的持有者 ⊆ 登记表
-reg_keys = {(r[0], r[1], r[2], r[3]) for r in rows}
+# 1) 树上的持有者 ⊆ 声明的读者。role 授予的是整个对象（key 记 `*`），它不按键声明，
+#    由下面第 6 条单独约束。
+undeclared_optional = {}   # (obj, key) -> [holder]，运维手写键的读者面
 for obs in sorted(observed):
-    if obs not in reg_keys:
-        failures.append(
-            f"渲染产物里 {obs[3]} 持有 {obs[0]}/{obs[1]}（路径 {obs[2]}，{observed[obs]}），"
-            "登记表里没有这一条：新出现一个握凭证的持有者，或者读法变了")
-
-# 2) 登记表 ⊆ 树上的持有者（api / none 两路径核不到，不参与）
-for obj, key, path, holder, access, evidence, _ in rows:
-    if path in ("api", "none"):
+    obj, key, path, holder = obs
+    if key == "*":
         continue
-    if (obj, key, path, holder) not in observed:
+    if key not in declared_keys[obj]:
+        if (obj, key) in optional_undeclared:
+            undeclared_optional.setdefault((obj, key), []).append(holder)
+        continue
+    if holder not in {h for h, api in declared[(obj, key)] if api is None}:
         failures.append(
-            f"登记表里的 {holder} 持有 {obj}/{key}（{path}）在渲染产物里已不存在："
-            "这条登记陈旧了，删掉它或改回真实持有者")
-    elif observed[(obj, key, path, holder)] != access:
-        failures.append(
-            f"登记表说 {holder} 对 {obj}/{key} 是 {access}，清单里是 "
-            f"{observed[(obj, key, path, holder)]}：权限面变了")
+            f"渲染产物里 {holder} 持有 {obj}/{key}（路径 {path}，{observed[obs]}），"
+            f"而 {TEMPLATES[obj]} 里这个键的 `# readers:` 没写它：新出现一个握凭证的"
+            "读者，或者读法变了")
 
-# 3) 写者声明的每个键都得有登记（真持有者或写明的"无人读"）
-for obj, keys in declared.items():
-    for key in sorted(keys):
-        if not any(r[0] == obj and r[1] == key for r in rows):
+# 2) 声明的读者 ⊆ 树上的持有者（API 路径核不到，单独核指针）
+for (obj, key), entries in sorted(declared.items()):
+    for holder, api_file in entries:
+        if api_file is not None:
+            if not os.path.exists(api_file):
+                failures.append(
+                    f"{obj}/{key} 的 API 读点 {api_file!r} 在树上不存在：指针锈了")
+                continue
+            text = open(api_file, encoding="utf-8", errors="replace").read()
+            if key not in text:
+                failures.append(
+                    f"{obj}/{key} 的 API 读点 {api_file!r} 里没有出现这个键名："
+                    "指针指向的文件已经不再读它了")
+            continue
+        if not any(o == obj and k == key and h == holder and p in ("env", "volume")
+                   for (o, k, p, h) in observed):
             failures.append(
-                f"{obj}/{key} 是写者声明的键，登记表里一条都没有：它要么真无人读"
-                "（补一条 path=none、access=none、holder=- 的行说明），要么有个读者没登记")
+                f"{TEMPLATES[obj]} 声明 {holder} 读 {obj}/{key}，渲染产物里找不到这个"
+                "读者：声明陈旧了，删掉它或改回真实读者")
 
-# 4) 登记表里的键必须在写者的键表里，除非是"树上有 optional 读者"的运维手写键
-for obj, key, path, holder, access, evidence, _ in rows:
-    if key == "*" or key in declared.get(obj, ()):
-        continue
-    if (obj, key) not in optional_undeclared:
-        failures.append(
-            f"登记表里的 {obj}/{key} 不在写者声明的键表里，树上也读不到（或读它不是 "
-            "optional）：键名漂移或手误")
-
-# 5) api 路径的指针防锈
-for obj, key, path, holder, access, evidence, _ in rows:
-    if path != "api":
-        continue
-    if not evidence:
-        failures.append(f"{obj}/{key}（api）没写 evidence：这条路核不到，只剩代码指针能指认")
-    elif not os.path.exists(evidence):
-        failures.append(f"{obj}/{key}（api）的 evidence {evidence!r} 在树上不存在：指针锈了")
-
-# 6) 带外片的 role 写权限只能落在安全网关这一个主体上。
+# 3) 带外片的 role 写权限只能落在安全网关这一个主体上。
 #    多一个能 patch 的主体，等于把「代持带外凭证」复制一份；而清单上看起来只是
 #    多了一个对象名，读清单的人不会意识到那是一个能改写上游密钥与平台 token 的人。
 GW_SA = "ServiceAccount/cogneva-security-gateway"
-for obj, key, path, holder, access, evidence, note in rows:
-    if obj == OBJS[1] and path == "role" and "write" in access and holder != GW_SA:
-        failures.append(
-            f"{holder} 对带外片 {obj}/{key} 有写权限（{access}）：写点只该在 {GW_SA}，"
-            "其余主体的写入应当经 secret_write::forward 交给网关")
-
-# 7) 迁移窗必须带可判读的关闭条件，且条件成立就红。
-#    「迁移窗」三个字是状态描述，不是判据：它不会自己到期。closes-when 把窗口的终点
-#    指到一段代码上——那些读点搬走以后，授权和登记都应该消失；门在这里报红，是因为
-#    到那时没人再读它，留着就是一条无主的凭证权限。多条 closes-when 全部成立才红：
-#    只要还有一条读点没搬走，这条授权就还在被用。
-CLOSE_RE = re.compile(r"closes-when=([^\s:]+):(\S+)")
-for obj, key, path, holder, access, evidence, note in rows:
-    if "迁移窗" not in note:
+for (obj, key, path, holder), access in sorted(observed.items()):
+    if key != "*" or path != "role":
         continue
-    conds = CLOSE_RE.findall(note)
-    where = f"{obj}/{key} 的 {holder}"
-    if not conds:
+    if holder != GW_SA and ("write" in access or obj == OBJS[1]):
         failures.append(
-            f"{where} 还是迁移窗，但 note 里没有 closes-when=<文件>:<符号>："
-            "没有关闭条件的窗口等于永久授权")
-        continue
-    missing = 0
-    for file, sym in conds:
-        if not os.path.exists(file):
-            failures.append(f"{where} 的关闭条件指向 {file!r}，树上没有这个文件：指针锈了")
-            continue
-        if sym not in open(file, encoding="utf-8", errors="replace").read():
-            missing += 1
-    if missing == len(conds):
-        failures.append(
-            f"{where} 的关闭条件已全部成立（{'、'.join(s for _, s in conds)} 都不在树上了）："
-            "这些读点已经搬走，删掉这条授权与这一行登记")
+            f"{holder} 对 {obj} 有整对象权限（{access}）：整对象授权只该给 {GW_SA}，"
+            "其余主体的读写应当经 secret_write::forward 交给网关")
 
 if failures:
     print("CREDENTIAL HOLDER SURFACE FAIL：", file=sys.stderr)
@@ -330,20 +326,19 @@ if failures:
         print(f"  - {f}", file=sys.stderr)
     sys.exit(1)
 
-per_obj = {obj: sum(1 for r in rows if r[0] == obj) for obj in OBJS}
-api_rows = sum(1 for r in rows if r[2] == "api")
-oob_roles = sorted({(r[3], r[4]) for r in rows if r[0] == OBJS[1] and r[2] == "role"})
+per_obj = {obj: sum(1 for (o, k, p, h) in observed if o == obj) for obj in OBJS}
+api_rows = sum(len([1 for _, f in e if f]) for e in declared.values())
 print(
-    f"CREDENTIAL HOLDER SURFACE OK：{len(rows)} 条登记与渲染产物对齐"
-    f"（{OBJS[0]} {per_obj[OBJS[0]]} 条 / {OBJS[1]} {per_obj[OBJS[1]]} 条）；"
-    f"写者声明键 {sum(len(k) for k in declared.values())} 个，无一漏登记；"
-    f"{len(profiles)} 种形态的持有面逐条相同（{len(observed)} 个持有者）。"
-    f"其中 {api_rows} 条走 API 路径，本门核不到（只核代码指针），见登记表"
+    f"CREDENTIAL HOLDER SURFACE OK：{len(observed)} 个持有者与键头上的 `# readers:` "
+    f"逐条对齐（{OBJS[0]} {per_obj[OBJS[0]]} / {OBJS[1]} {per_obj[OBJS[1]]}）；"
+    f"写者声明键 {sum(len(k) for k in declared_keys.values())} 个，读者面两侧都对上；"
+    f"{len(profiles)} 种形态的持有面逐条相同。"
+    f"其中 {api_rows} 条走 API 路径，本门只核代码指针"
 )
-oob_role_text = "；".join(f"{h}={a}" for h, a in oob_roles) or "无"
-oob_volumes = sorted({r[3] for r in rows if r[0] == OBJS[1] and r[2] == "volume"})
-print(
-    "带外片的 role 路径读者：" + oob_role_text
-    + "；另有整对象卷挂：" + ("、".join(oob_volumes) or "无")
-)
+if undeclared_optional:
+    print(
+        "运维手写键（写者不建，读者面不受本门约束）："
+        + "；".join(f"{o}/{k} ← {'、'.join(sorted(set(h)))}"
+                   for (o, k), h in sorted(undeclared_optional.items()))
+    )
 PYEOF

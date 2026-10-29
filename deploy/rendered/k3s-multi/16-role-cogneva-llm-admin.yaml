@@ -12,8 +12,8 @@
 # 拿不到任何一把 key。带 out-of-band 凭证的那两片，这个身份不再有 get。
 #
 # 这条规则整条删掉是有条件的：删完之后主应用那一侧任何一处 Secret 读都会 403，
-# 而它不该有读点——`deploy/credential-holders.tsv` 里只留网关那两行，凭证持有面
-# 门禁按渲染产物反查，多一个能读的主体就报。
+# 而它不该有读点——凭证持有面门禁按渲染产物反查「谁在读」，再与每个键头上那行
+# `# readers:` 声明对两侧，多一个能读的主体就报。
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
