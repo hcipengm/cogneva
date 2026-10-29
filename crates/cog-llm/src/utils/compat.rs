@@ -85,6 +85,32 @@ pub struct VercelGatewayRouting {
     pub order: Option<Vec<String>>,
 }
 
+/// The vendor table, as the contract the gateway reads it through.
+///
+/// A caller that only shapes an outbound request needs six answers about the
+/// upstream, not the whole image: the rest of [`OpenAICompat`] is about how this
+/// crate parses a response, which nobody outside can act on.
+pub struct CompatImages;
+
+impl cog_core::ProviderCompatTable for CompatImages {
+    fn detect(&self, base_url: &str) -> cog_core::ProviderCompat {
+        let image = detect_compat(base_url);
+        cog_core::ProviderCompat {
+            supports_store: image.supports_store,
+            supports_reasoning_effort: image.supports_reasoning_effort,
+            supports_usage_in_streaming: image.supports_usage_in_streaming,
+            supports_strict_mode: image.supports_strict_mode,
+            requires_temperature_one: image.requires_temperature_one,
+            max_tokens_field: match image.max_tokens_field {
+                MaxTokensField::MaxTokens => cog_core::MaxTokensField::MaxTokens,
+                MaxTokensField::MaxCompletionTokens => {
+                    cog_core::MaxTokensField::MaxCompletionTokens
+                }
+            },
+        }
+    }
+}
+
 /// Auto-detect compatibility settings from a provider's base URL.
 pub fn detect_compat(base_url: &str) -> OpenAICompat {
     let lower = base_url.to_lowercase();

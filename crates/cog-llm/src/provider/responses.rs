@@ -28,28 +28,19 @@ use crate::model::Model;
 use crate::utils::compat::compat_from_options;
 use crate::{AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage};
 
-/// The `api_style` string that names this protocol face.
-pub const API_STYLE: &str = "openai-responses";
-
-/// Whether a backend's declared style belongs to the OpenAI protocol family.
+/// The `api_style` string that names this protocol face, the family test that
+/// keeps its vendors in the chat-completions face as well, and the endpoint a
+/// base URL names on it.
 ///
 /// The family is what keeps a vendor that answers `/responses` from dropping
 /// out of the chat-completions face: serving the newer shape says nothing about
 /// having stopped serving the older one, and a pool entry is listed under the
-/// face it was *verified* on, not the only face it can serve.
-pub fn is_openai_family(style: &str) -> bool {
-    style == crate::openai::API_STYLE || style == API_STYLE
-}
-
-/// The endpoint a base URL names on this face.
-///
-/// Same rule as the other two faces: the platform appends exactly one path
-/// element, so the base carries everything before it, version segment
-/// included (`https://api.openai.com/v1` composes
-/// `https://api.openai.com/v1/responses`).
-pub fn responses_url(base_url: &str) -> String {
-    format!("{}/responses", base_url.trim_end_matches('/'))
-}
+/// face it was *verified* on, not the only face it can serve. All three live in
+/// the contract layer, because the gateway composes the same addresses and
+/// compares the same words.
+pub use cog_core::{
+    is_openai_family, responses_url, OPENAI_API_STYLE, RESPONSES_API_STYLE as API_STYLE,
+};
 
 /// Per-item accumulator for a streamed function call. Responses names each
 /// item (`item_id`) rather than indexing a parallel array, and one turn can

@@ -54,6 +54,15 @@ impl cog_core::SystemPlugin for LlmPlugin {
         // Also publish as dyn LlmClient so consumers can use either type.
         ctx.publish_service::<dyn cog_core::LlmClient>(hot_swap.clone());
 
+        // What we believe about an upstream shapes the request body, and the
+        // gateway rewrites that body on its way out. It asks through the
+        // contract instead of linking this crate: the table is vendor
+        // knowledge and stays here, the question and the answer's shape are
+        // the contract's.
+        ctx.publish_service::<dyn cog_core::ProviderCompatTable>(Arc::new(
+            crate::utils::compat::CompatImages,
+        ));
+
         // Observable publish (pin-style)
         ctx.publish_observable(crate::observable::global_observable());
         info!("LlmPlugin observable published");

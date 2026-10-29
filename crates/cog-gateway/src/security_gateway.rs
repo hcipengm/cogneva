@@ -366,7 +366,7 @@ impl SecurityGatewayConfig {
                     base_url = %upstream.base_url,
                     model = %upstream.model,
                     "LLM 上游无厂商兼容画像，按最新 OpenAI 形状兜底；若上游以 400/404/422 \
-                     拒绝而池读数不变，先在 cog_llm::utils::compat::detect_compat 登记画像"
+                     拒绝而池读数不变，先在 provider 相容画像表里登记这台上游"
                 );
             }
         }
@@ -480,12 +480,12 @@ fn parse_upstreams(raw: &str) -> Vec<LlmUpstream> {
 /// answers `/responses`. Nothing would fail loudly — the entry would simply
 /// stop being a candidate for the face it was verified on.
 fn normalize_style(raw: &str) -> String {
-    if raw == cog_llm::anthropic::API_STYLE {
-        cog_llm::anthropic::API_STYLE.into()
-    } else if cog_llm::responses::is_openai_family(raw) && raw != cog_llm::openai::API_STYLE {
-        cog_llm::responses::API_STYLE.into()
+    if raw == cog_core::ANTHROPIC_API_STYLE {
+        cog_core::ANTHROPIC_API_STYLE.into()
+    } else if cog_core::is_openai_family(raw) && raw != cog_core::OPENAI_API_STYLE {
+        cog_core::RESPONSES_API_STYLE.into()
     } else {
-        cog_llm::openai::API_STYLE.into()
+        cog_core::OPENAI_API_STYLE.into()
     }
 }
 
@@ -1371,7 +1371,7 @@ impl LlmHealthTable {
     fn open_capability_questions(&self, u: &LlmUpstream) -> Vec<CapabilityQuestion> {
         // OpenAI 族的两个面共用这三条读点与同一组 chat 形状的探测；anthropic
         // 面上它们既不读也不问得通。
-        if !cog_llm::responses::is_openai_family(&u.api_style) {
+        if !cog_core::is_openai_family(&u.api_style) {
             return Vec::new();
         }
         let caps = self.runtime_caps.lock().unwrap();
@@ -1940,9 +1940,23 @@ struct AppState {
     /// can say what it holds. Empty when the deployment declares none, and then
     /// /metrics carries exactly no series of that family.
     volume_footprint: Vec<Arc<cog_observability::data_volume::DataVolumeObservable>>,
+    /// 我们相信某台上游认哪些字段——按请求体要按它改写，而这张表是厂商知识，
+    /// 住在实现 provider 的那个 crate 里。这里只认契约：问一句「这个地址你信
+    /// 什么」，拿回一个形状。`None` = 这个进程没有发布者（独立网关进程没交，
+    /// 或者插件没起），此时回落成「全都支持」的画像——与表里查无此厂商同一处置，
+    /// 即一个字都不改。
+    provider_compat: Option<Arc<dyn cog_core::ProviderCompatTable>>,
 }
 
 impl AppState {
+    /// 某台上游的画像，按契约问；没有发布者时等价于「查无此厂商」。
+    fn compat_of(&self, base_url: &str) -> cog_core::ProviderCompat {
+        self.provider_compat
+            .as_ref()
+            .map(|table| table.detect(base_url))
+            .unwrap_or_else(cog_core::ProviderCompat::permissive)
+    }
+
     /// 记一次上游实证成功：清该上游的嫌疑态，并留下"池可恢复"的凭据供
     /// 下一拍池判定解除锁存。任何"上游真的应答了"的路径都必须经此记录，
     /// 否则池判定只能靠窗口到期推断恢复——而那只是"可以再试"，不是恢复。
@@ -4651,7 +4665,7 @@ async fn refresh_pool_state(state: &AppState) {
             // 写判定、或网关在健康时自己再问一次）在那面上都不存在——准入探测
             // 本身也只问 openai 条目（见 `llm_admin` 的 `resolve_upstream`），
             // 补问发出的探测又都是 openai 形状的。
-            if cog_llm::responses::is_openai_family(&upstream.api_style) {
+            if cog_core::is_openai_family(&upstream.api_style) {
                 // 用量能力判定有没有出处。这一条把"计量恒零"从一个结果变成一个
                 // 可告警的条件：上游正在承接流量而我们还在按厂商画像猜着剥
                 // `stream_options`，它的 token 计数就不可能非零。别的序列看不出
@@ -5146,8 +5160,11 @@ async fn chat_handler(
 /// `strict` and `max_completion_tokens` to vendors that take none of them —
 /// and cannot know it is doing so. The gateway does know: it holds the pool,
 /// and the pool holds each real upstream URL. The vendor profiles it consults
-/// here are `cog_llm`'s, not a second copy, because a table written twice
-/// drifts and the drift is invisible in both copies.
+/// here are the ones injected through [`cog_core::ProviderCompatTable`], not a
+/// second copy, because a table written twice drifts and the drift is
+/// invisible in both copies. When nothing is injected the gateway assumes the
+/// permissive profile — the same answer a caller with no table gets, so the
+/// gateway never narrows a request its caller would have sent unchanged.
 ///
 /// Only adjustments that rename or drop a field belong here. What the same
 /// profiles also describe — a tool result that has to carry a `name`, an
@@ -5161,10 +5178,10 @@ async fn chat_handler(
 /// caller keeps believing it set something.
 fn adapt_request_body(
     obj: &mut serde_json::Map<String, serde_json::Value>,
-    compat: &cog_llm::utils::compat::OpenAICompat,
+    compat: &cog_core::ProviderCompat,
     usage_verdict: Option<bool>,
 ) -> Vec<&'static str> {
-    use cog_llm::utils::compat::MaxTokensField;
+    use cog_core::MaxTokensField;
     let mut adapted = Vec::new();
 
     // The output cap under its other name. Both spellings carry the same
@@ -5237,7 +5254,7 @@ async fn openai_responses_passthrough(
     State(state): State<AppState>,
     req: axum::extract::Request,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    stream_forward(state, req, cog_llm::responses::API_STYLE).await
+    stream_forward(state, req, cog_core::RESPONSES_API_STYLE).await
 }
 
 /// Anthropic 透传端点：与 OpenAI 透传对称，转发 `/v1/messages`，
@@ -5276,10 +5293,10 @@ async fn anthropic_messages_passthrough(
 /// [`can_take_request`], which adds the measured half — an entry that answered
 /// a simple request on a face serves it whether or not it was declared there.
 fn serves_face(upstream_style: &str, requested: &str) -> bool {
-    if requested == cog_llm::responses::API_STYLE {
-        upstream_style == cog_llm::responses::API_STYLE
-    } else if requested == cog_llm::openai::API_STYLE {
-        cog_llm::responses::is_openai_family(upstream_style)
+    if requested == cog_core::RESPONSES_API_STYLE {
+        upstream_style == cog_core::RESPONSES_API_STYLE
+    } else if requested == cog_core::OPENAI_API_STYLE {
+        cog_core::is_openai_family(upstream_style)
     } else {
         upstream_style == requested
     }
@@ -5453,7 +5470,7 @@ async fn stream_forward(
             .llm_upstreams
             .iter()
             .any(|u| serves_face(&u.api_style, style));
-        if !pool_has_face && style == cog_llm::responses::API_STYLE {
+        if !pool_has_face && style == cog_core::RESPONSES_API_STYLE {
             return Err((
                 StatusCode::NOT_IMPLEMENTED,
                 "池里没有在 /responses 上实证通过的 OpenAI 协议族上游；\
@@ -5507,8 +5524,8 @@ async fn stream_forward(
                     // 都同形，只有这一格分得开。少了它，配在后面的另一面后端永远
                     // 用不上——调用侧由状态码只能翻出 `ServerError`，「换个上游能不
                     // 能解决」在这一档上答不出来。取值与判据同源：常量定义在
-                    // cog-llm 的路由里，读写两侧认的是同一个字面量。
-                    "reason": cog_llm::routing::FACE_WITHOUT_A_MEMBER,
+                    // cog-core 的协议词汇里，读写两侧认的是同一个字面量。
+                    "reason": cog_core::FACE_WITHOUT_A_MEMBER,
                     // 被拒的是哪一个协议面。加在正文字段里而不是只写进日志：
                     // 调用侧唯一能看见的就是这段正文，而池里另一面还有健康成员时，
                     // 「所有上游不可用」这句话本身不足以让读者判断该换面还是该等。
@@ -5642,8 +5659,8 @@ async fn stream_forward(
                     // 它弄坏；Responses 形状的字段名本来就不是那一组（`input`、
                     // `max_output_tokens`、顶层工具定义），按 chat 的名字去改只会
                     // 命中它没有的字段，一个都改不到，却把"改过什么"记成空。
-                    if style == cog_llm::openai::API_STYLE {
-                        let compat = cog_llm::utils::compat::detect_compat(base);
+                    if style == cog_core::OPENAI_API_STYLE {
+                        let compat = state.compat_of(base);
                         // 这里是**追加**不是赋值。这一格要留的是"本趟一共改过
                         // 哪些字段"，适配器返回的只是其中的一半——上面那条角色
                         // 改写已经先记进来了。写赋值会把它静默丢掉，而丢掉的
@@ -5666,13 +5683,11 @@ async fn stream_forward(
                     // 优先、补问的顶上），只有两条路都没有结论时才用厂商画像
                     // 兜底——而那一格是全系统里唯一会**改掉调用方自己挑的数**
                     // 的兜底，所以它值得一条回去问的路。
-                    if style != cog_llm::anthropic::API_STYLE {
+                    if style != cog_core::ANTHROPIC_API_STYLE {
                         let requires_one = state
                             .llm_health
                             .effective_temperature_verdict(upstream)
-                            .unwrap_or_else(|| {
-                                cog_llm::utils::compat::detect_compat(base).requires_temperature_one
-                            });
+                            .unwrap_or_else(|| state.compat_of(base).requires_temperature_one);
                         if requires_one {
                             if let Some(t) = obj.get_mut("temperature") {
                                 if t.as_f64() != Some(1.0) {
@@ -5686,7 +5701,7 @@ async fn stream_forward(
                     // 非流式响应本身就带 usage，用不着要；anthropic 的流自带用量帧；
                     // Responses 的用量在 `response.completed` 事件里，没有要的开关。
                     let streaming = obj.get("stream").and_then(|s| s.as_bool()).unwrap_or(false);
-                    asked_for_usage = style != cog_llm::openai::API_STYLE
+                    asked_for_usage = style != cog_core::OPENAI_API_STYLE
                         || !streaming
                         || obj.contains_key("stream_options");
                 }
@@ -5733,7 +5748,7 @@ async fn stream_forward(
         // 走的就是它被测出能接的那一面。按准入面发，跨面时会发错那一套头，
         // 而发错头换回来的 401 会被读成"这家坏了"。
         let builder = match style {
-            cog_llm::anthropic::API_STYLE => builder
+            cog_core::ANTHROPIC_API_STYLE => builder
                 .header("x-api-key", &upstream.api_key)
                 .header("anthropic-version", "2023-06-01"),
             _ => builder.bearer_auth(&upstream.api_key),
@@ -6188,9 +6203,9 @@ async fn probe_suspect_upstreams(state: &AppState) {
 /// 可用。地址只写一遍是这条约束唯一守得住的形式。
 fn face_url(style: &str, base_url: &str) -> String {
     match style {
-        cog_llm::anthropic::API_STYLE => cog_llm::anthropic::messages_url(base_url),
-        cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base_url),
-        _ => cog_llm::openai::chat_completions_url(base_url),
+        cog_core::ANTHROPIC_API_STYLE => cog_core::messages_url(base_url),
+        cog_core::RESPONSES_API_STYLE => cog_core::responses_url(base_url),
+        _ => cog_core::chat_completions_url(base_url),
     }
 }
 
@@ -6212,7 +6227,7 @@ async fn probe_face(
     upstream: &LlmUpstream,
     face: &str,
 ) -> Result<(), UpstreamRefusal> {
-    let responses_face = face == cog_llm::responses::API_STYLE;
+    let responses_face = face == cog_core::RESPONSES_API_STYLE;
     let url = face_url(face, &upstream.base_url);
     let payload = if responses_face {
         serde_json::json!({
@@ -6233,7 +6248,7 @@ async fn probe_face(
         .header("Content-Type", cog_core::CONTENT_TYPE_JSON)
         .json(&payload);
     let builder = match face {
-        cog_llm::anthropic::API_STYLE => builder
+        cog_core::ANTHROPIC_API_STYLE => builder
             .header("x-api-key", &upstream.api_key)
             .header("anthropic-version", "2023-06-01"),
         _ => builder.bearer_auth(&upstream.api_key),
@@ -6263,9 +6278,9 @@ async fn probe_face(
 
 /// 三个请求面。
 const REQUEST_FACES: [&str; 3] = [
-    cog_llm::openai::API_STYLE,
-    cog_llm::anthropic::API_STYLE,
-    cog_llm::responses::API_STYLE,
+    cog_core::OPENAI_API_STYLE,
+    cog_core::ANTHROPIC_API_STYLE,
+    cog_core::RESPONSES_API_STYLE,
 ];
 
 /// 一次面探测的答复怎么读。
@@ -6436,7 +6451,7 @@ async fn call_one_upstream(
 ) -> Result<Json<LlmResponse>, UpstreamRefusal> {
     let start = std::time::Instant::now();
     let base = upstream.base_url.trim_end_matches('/');
-    if upstream.api_style == cog_llm::anthropic::API_STYLE {
+    if upstream.api_style == cog_core::ANTHROPIC_API_STYLE {
         let (system, msgs): (String, Vec<&ChatMessage>) = {
             let sys = messages
                 .iter()
@@ -8661,11 +8676,16 @@ fn identity_default_headers(identity: &str) -> reqwest::header::HeaderMap {
 /// 道理：这一层不知道本进程用的是哪个键值实现，也不该为了自己去链一个。安全网关
 /// 以独立进程模式跑时没有插件上下文可消费，所以它只能被交进来；交的是 `None`
 /// 表示这台进程没有共享键值面（单进程部署），与"交了一个连不上的"是两回事。
+///
+/// `provider_compat` 同理由装配层交进来：那张厂商相容画像表是"实现 provider 的
+/// crate 的"知识，网关只按契约问它。交 `None` 时按"查无此厂商"处理——请求体一个
+/// 字都不改，与表里没登记这台上游时同一条路，所以缺了它不是另立一套行为。
 pub async fn run(
     config: SecurityGatewayConfig,
     build_revision: Option<&str>,
     http_client: Arc<dyn cog_core::HttpClient>,
     key_value: Option<Arc<dyn cog_core::KeyValueStore>>,
+    provider_compat: Option<Arc<dyn cog_core::ProviderCompatTable>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 本进程的出站客户端由装配层造好交进来（本 crate 不认具体实现）。交回给
     // `contribution_admin`，那些调 github/gitee 的请求与这里其余出站就确实是
@@ -8724,6 +8744,7 @@ pub async fn run(
             crate::spend_reading::Reading::default(),
         )),
         volume_footprint,
+        provider_compat,
         config: config.clone(),
     };
     // 恢复逐上游证据必须发生在任何一拍探测之前：探测按表里的窗口决定谁该被试，
@@ -8883,7 +8904,7 @@ mod tests {
                 "https://api.deepseek.com/anthropic/v1/chat/completions",
             ),
             (
-                cog_llm::responses::API_STYLE,
+                cog_core::RESPONSES_API_STYLE,
                 "https://api.openai.com/v1",
                 "https://api.openai.com/v1/responses",
             ),
@@ -10183,7 +10204,7 @@ mod tests {
                 {"api_style": "something-new", "base_url": "https://c.example.com", "model": "m3", "api_key": "k3"}
             ]"#,
         );
-        assert_eq!(list[0].api_style, cog_llm::responses::API_STYLE);
+        assert_eq!(list[0].api_style, cog_core::RESPONSES_API_STYLE);
         assert_eq!(list[1].api_style, "openai");
         assert_eq!(
             list[2].api_style, "openai",
@@ -11170,7 +11191,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let body: serde_json::Value = serde_json::from_slice(&body).expect("正文是 JSON");
         assert_eq!(
             body.get("reason").and_then(|v| v.as_str()),
-            Some(cog_llm::routing::FACE_WITHOUT_A_MEMBER),
+            Some(cog_core::FACE_WITHOUT_A_MEMBER),
             "熔断 503 少了机器可读的原因，调用侧换不了面：{body}"
         );
         assert_eq!(
@@ -12438,7 +12459,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     async fn a_responses_request_reaches_the_responses_endpoint() {
         let (base, seen) = spawn_responses_stub().await;
         let mut entry = stub_upstream(&base, "m1");
-        entry.api_style = cog_llm::responses::API_STYLE.into();
+        entry.api_style = cog_core::RESPONSES_API_STYLE.into();
         let state = test_state(vec![entry]);
         let req = axum::extract::Request::builder()
             .method("POST")
@@ -12487,7 +12508,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     async fn an_entry_verified_on_responses_still_serves_the_chat_face() {
         let (base, seen) = spawn_responses_stub().await;
         let mut entry = stub_upstream(&base, "m1");
-        entry.api_style = cog_llm::responses::API_STYLE.into();
+        entry.api_style = cog_core::RESPONSES_API_STYLE.into();
         let state = test_state(vec![entry]);
         let req = axum::extract::Request::builder()
             .method("POST")
@@ -13128,8 +13149,6 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 对照组是同一个函数在"厂商未知"的画像下——什么都不动。
     #[test]
     fn the_request_body_is_reshaped_for_the_upstream_that_will_read_it() {
-        use cog_llm::utils::compat::detect_compat;
-
         let body_json = || {
             serde_json::json!({
                 "model": "placeholder",
@@ -13147,8 +13166,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         };
 
         // Kimi 画像：输出上限那个字段叫 max_tokens，store / reasoning_effort /
-        // strict 一概不认。这四件事调用方一件都判不出来——它连的是网关。
-        let kimi = detect_compat("https://api.kimi.com/v1");
+        // strict 一概不认。这四件事调用方一件都判不出来——它连的是网关。画像本身
+        // 从哪来属于 provider crate 的表（它在那边逐分支钉住），这里只关心"拿到
+        // 这份画像之后怎么改体"。
+        let kimi = kimi_image();
         let mut body = body_json();
         let mut adapted = adapt_request_body(body.as_object_mut().unwrap(), &kimi, None);
         adapted.sort_unstable();
@@ -13175,7 +13196,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(body["tools"][0]["function"]["name"], serde_json::json!("f"));
 
         // 反方向也一样：新形状的厂商拿到的是 max_completion_tokens。
-        let modern = detect_compat("http://127.0.0.1:9999/v1");
+        let modern = cog_core::ProviderCompat::permissive();
         let mut body = body_json();
         body.as_object_mut()
             .unwrap()
@@ -13201,10 +13222,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 实测说"不会报"却按画像留着，则是每次调用都带一个上游可能不认的字段。
     #[test]
     fn the_measured_usage_verdict_beats_the_vendor_profile() {
-        use cog_llm::utils::compat::detect_compat;
-
         // 画像说"不报用量"（这条正是 kimi 的画像）；实测说"会报" ⇒ 必须保留。
-        let says_no = detect_compat("https://api.kimi.com/v1");
+        let says_no = kimi_image();
         let mut body = serde_json::json!({
             "model": "placeholder",
             "temperature": 0.2,
@@ -13234,7 +13253,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         // 反方向：画像说"会报"（未知厂商的兜底画像），实测说"不报" ⇒ 也剥掉。
         // 没有这一条，实测就只是"在画像之外多一条加宽的规则"，而不是判定本身。
-        let says_yes = detect_compat("http://127.0.0.1:9999/v1");
+        let says_yes = cog_core::ProviderCompat::permissive();
         let mut body = serde_json::json!({
             "model": "placeholder",
             "temperature": 0.2,
@@ -13502,7 +13521,6 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 没人用"，而那只差一个调用点。
     #[tokio::test]
     async fn a_healthy_upstream_with_no_temperature_verdict_is_asked_before_the_profile_clamps() {
-        use cog_llm::utils::compat::detect_compat;
         let vendor_seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let vendor_stub = spawn_capturing_upstream(
             200,
@@ -13517,7 +13535,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let upstream = state.config.llm_upstreams[0].clone();
         let key = LlmHealthTable::key(&upstream);
         assert!(
-            detect_compat(&upstream.base_url).requires_temperature_one,
+            cog_core::ProviderCompatTable::detect(&StubCompatImages, &upstream.base_url)
+                .requires_temperature_one,
             "这条画像必须是要钳的，否则这一拍测不到画像的兜底"
         );
         assert_eq!(
@@ -13930,10 +13949,40 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         }
     }
 
+    /// 测试里的厂商画像表：只回答这一层会问的那六格。
+    ///
+    /// 真表在 provider crate 里，逐分支钉住自己的断言；这里要钉的是"拿到画像
+    /// 之后改写什么"，所以只需要一份说得清的画像，而不是一份与厂商同步的表。
+    /// kimi 那一台给的是仓库里真表给同一台机器的答案。
+    struct StubCompatImages;
+
+    impl cog_core::ProviderCompatTable for StubCompatImages {
+        fn detect(&self, base_url: &str) -> cog_core::ProviderCompat {
+            if base_url.contains("kimi") {
+                kimi_image()
+            } else {
+                cog_core::ProviderCompat::permissive()
+            }
+        }
+    }
+
+    /// 那台"只收 temperature=1、上限字段叫 max_tokens、其余一概不认"的上游。
+    fn kimi_image() -> cog_core::ProviderCompat {
+        cog_core::ProviderCompat {
+            supports_store: false,
+            supports_reasoning_effort: false,
+            supports_usage_in_streaming: false,
+            supports_strict_mode: false,
+            requires_temperature_one: true,
+            max_tokens_field: cog_core::MaxTokensField::MaxTokens,
+        }
+    }
+
     fn test_state(upstreams: Vec<LlmUpstream>) -> AppState {
         let identity = "cogneva/test";
         let headers = identity_default_headers(identity);
         AppState {
+            provider_compat: Some(std::sync::Arc::new(StubCompatImages)),
             client: reqwest::Client::builder()
                 .default_headers(headers.clone())
                 .build()

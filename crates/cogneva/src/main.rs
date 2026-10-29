@@ -106,11 +106,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_value = cogneva::assembly::infra::key_value_store_from_url(
                 gateway_config.redis_url.as_deref(),
             );
+            // 厂商相容画像表同理：表是 provider crate 的，网关只按契约问。
+            let provider_compat: std::sync::Arc<dyn cog_core::ProviderCompatTable> =
+                std::sync::Arc::new(cog_llm::utils::compat::CompatImages);
             cog_gateway::security_gateway::run(
                 gateway_config,
                 Some(cogneva::build_info::GIT_REVISION),
                 http_client,
                 key_value,
+                Some(provider_compat),
             )
             .await
         }

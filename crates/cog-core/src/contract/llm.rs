@@ -726,6 +726,123 @@ where
     Ok(parsed)
 }
 
+// ─── Protocol faces ────────────────────────────────────────────────────────
+//
+// Three words name the wire shapes this platform speaks: the chat-completions
+// shape, the Anthropic messages shape, and the newer OpenAI responses shape. A
+// backend config, a pool entry and an inbound request each carry one of these
+// words, and the dispatcher picks a provider by comparing them — so they are
+// vocabulary two crates have to agree on, not a detail of the crate that
+// happens to implement the providers. Spelled out separately, one renamed copy
+// turns a declared face into one nothing recognizes and the entry falls through
+// to whichever branch is the catch-all.
+
+/// The `api_style` word for the chat-completions face.
+pub const OPENAI_API_STYLE: &str = "openai";
+/// The `api_style` word for the Anthropic messages face.
+pub const ANTHROPIC_API_STYLE: &str = "anthropic";
+/// The `api_style` word for the OpenAI responses face.
+pub const RESPONSES_API_STYLE: &str = "openai-responses";
+
+/// Whether a declared style belongs to the OpenAI protocol family.
+///
+/// The family is what keeps a vendor that answers `/responses` from dropping out
+/// of the chat-completions face: serving the newer shape says nothing about
+/// having stopped serving the older one, and a pool entry is listed under the
+/// face it was *verified* on, not the only face it can serve.
+pub fn is_openai_family(style: &str) -> bool {
+    style == OPENAI_API_STYLE || style == RESPONSES_API_STYLE
+}
+
+/// The endpoint a base URL names on the chat-completions face.
+///
+/// The platform appends exactly one path element, so the base carries
+/// everything before it, version segment included (`…/v1`,
+/// `…/api/paas/v4`, `…/compatible-mode/v1`). A base that stops short of the
+/// version segment composes an address the vendor does not serve.
+pub fn chat_completions_url(base_url: &str) -> String {
+    format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+/// The endpoint a base URL names on the Anthropic messages face.
+pub fn messages_url(base_url: &str) -> String {
+    format!("{}/messages", base_url.trim_end_matches('/'))
+}
+
+/// The endpoint a base URL names on the responses face.
+pub fn responses_url(base_url: &str) -> String {
+    format!("{}/responses", base_url.trim_end_matches('/'))
+}
+
+/// The reason recorded when an inbound request names a face no member of the
+/// pool serves.
+pub const FACE_WITHOUT_A_MEMBER: &str = "face_has_no_serving_member";
+
+/// Which field names the token ceiling for an upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MaxTokensField {
+    /// The newer spelling, which reasoning models insist on.
+    #[default]
+    MaxCompletionTokens,
+    /// The original spelling, which older compatible vendors only accept.
+    MaxTokens,
+}
+
+/// What the platform believes about one upstream, as far as request shaping is
+/// concerned.
+///
+/// Narrower than the full compatibility image on purpose: this is the part two
+/// crates have to agree on — the gateway, which rewrites an outbound body, and
+/// the provider crate, which reads the same document on its own path. A field
+/// that only one side acts on stays with that side.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderCompat {
+    /// Whether the upstream supports the `store` field.
+    pub supports_store: bool,
+    /// Whether the upstream supports `reasoning_effort`.
+    pub supports_reasoning_effort: bool,
+    /// Whether the upstream supports `stream_options: { include_usage: true }`.
+    pub supports_usage_in_streaming: bool,
+    /// Whether the upstream supports the `strict` field on tool definitions.
+    pub supports_strict_mode: bool,
+    /// Whether the upstream only accepts `temperature = 1.0`.
+    pub requires_temperature_one: bool,
+    /// Which field names the token ceiling.
+    pub max_tokens_field: MaxTokensField,
+}
+
+impl ProviderCompat {
+    /// The image for an upstream nobody registered: it is told the newest field
+    /// shapes and nothing is stripped from its requests.
+    ///
+    /// This is the direction the fallback has to fall: an upstream that answers
+    /// a shape it does not know with a 400 is a request rejected before its
+    /// first byte, and the caller reads it as this platform refusing them. An
+    /// upstream that quietly ignores a field loses nothing.
+    pub fn permissive() -> Self {
+        Self {
+            supports_store: true,
+            supports_reasoning_effort: true,
+            supports_usage_in_streaming: true,
+            supports_strict_mode: true,
+            requires_temperature_one: false,
+            max_tokens_field: MaxTokensField::MaxCompletionTokens,
+        }
+    }
+}
+
+/// The compatibility image of an upstream, looked up by the address it is
+/// reached at.
+///
+/// The table itself is vendor knowledge and stays with the crate that owns the
+/// providers; what crosses is the question ("what do we believe about this
+/// address") and the answer's shape, so a caller can shape a request without
+/// linking the provider implementations.
+pub trait ProviderCompatTable: Send + Sync {
+    /// What we believe about the upstream at `base_url`.
+    fn detect(&self, base_url: &str) -> ProviderCompat;
+}
+
 #[cfg(test)]
 mod upstream_failure_name_tests {
     use super::*;

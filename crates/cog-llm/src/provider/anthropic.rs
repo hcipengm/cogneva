@@ -11,24 +11,18 @@ use crate::{
     model::Model, AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
-/// The `api_style` word for the Anthropic messages face.
+/// The `api_style` word for the Anthropic messages face, and the endpoint a base
+/// URL names on it.
 ///
 /// Same routing key as [`crate::openai::API_STYLE`]: compared as a word, never
-/// parsed from the shape of a response.
-pub const API_STYLE: &str = "anthropic";
-
-/// The messages endpoint a base URL names.
-///
-/// The version segment belongs to the base URL, because this is the only path
-/// the platform appends. Every base therefore has to carry whatever precedes
-/// `/messages` in its vendor's documented endpoint:
-/// `https://api.anthropic.com/v1` for Anthropic itself,
-/// `https://api.deepseek.com/anthropic/v1` for a compatible one. A base that
-/// leaves it out composes an address that never existed, and the refusal reads
-/// as a rejected key rather than as a wrong address.
-pub fn messages_url(base_url: &str) -> String {
-    format!("{}/messages", base_url.trim_end_matches('/'))
-}
+/// parsed from the shape of a response. The version segment belongs to the base
+/// URL, because this is the only path the platform appends: every base carries
+/// whatever precedes `/messages` in its vendor's documented endpoint
+/// (`https://api.anthropic.com/v1`, `https://api.deepseek.com/anthropic/v1`),
+/// and a base that leaves it out composes an address that never existed. Both
+/// the word and that rule live in the contract layer so the gateway, which
+/// composes the same address when it probes an upstream, reads one copy.
+pub use cog_core::{messages_url, ANTHROPIC_API_STYLE as API_STYLE};
 
 /// 这个协议面上「要不要让上游缓存前缀」的落点。
 ///

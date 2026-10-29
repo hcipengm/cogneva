@@ -17,24 +17,17 @@ use crate::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, Usage,
 };
 
-/// The `api_style` word for the chat-completions face.
+/// The `api_style` word for the chat-completions face, and the endpoint a base
+/// URL names on it.
 ///
-/// It is a routing key, not a label: a backend config, a pool entry and an
-/// inbound request all name a face, and the dispatcher picks the provider by
-/// comparing words. Spelled out at each of those sites, one renamed copy turns
-/// the default style into a face nothing recognizes — the entry falls through
-/// to whichever branch is the catch-all, and nothing reports a mismatch.
-pub const API_STYLE: &str = "openai";
-
-/// The chat endpoint a base URL names.
-///
-/// Same rule as the Anthropic side: the platform appends exactly one path
-/// element, so the base carries everything before it (`…/v1`,
-/// `…/api/paas/v4`, `…/compatible-mode/v1`). A base that stops short of the
-/// version segment composes an address the vendor does not serve.
-pub fn chat_completions_url(base_url: &str) -> String {
-    format!("{}/chat/completions", base_url.trim_end_matches('/'))
-}
+/// It is a routing key, not a label: a backend config, a pool entry, an inbound
+/// request and the gateway's protocol adapter all name a face, and the
+/// dispatcher picks the provider by comparing words. Spelled out at each of
+/// those sites, one renamed copy turns the default style into a face nothing
+/// recognizes — the entry falls through to whichever branch is the catch-all,
+/// and nothing reports a mismatch. The word and the path rule therefore live in
+/// the contract layer, and both sides read the same copy.
+pub use cog_core::{chat_completions_url, OPENAI_API_STYLE as API_STYLE};
 
 /// Per-index accumulator for a streaming tool call. OpenAI-compatible SSE
 /// deltas carry an explicit `index` because one turn can contain several

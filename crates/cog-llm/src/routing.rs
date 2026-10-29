@@ -30,8 +30,9 @@ fn status_from_own_message(msg: &str) -> Option<u16> {
 ///
 /// 这个量与「试遍了都不行」在状态码上是同一个 503，在正文的散文上也同形（两句话
 /// 都说得通），只有这一格能把它们分开。写在这里而不是照着正文那句中文判：那句话
-/// 是给人看的，会随措辞改，而改的人不会知道有一层故障转移在认它。
-pub const FACE_WITHOUT_A_MEMBER: &str = "face_has_no_serving_member";
+/// 是给人看的，会随措辞改，而改的人不会知道有一层故障转移在认它。**写它的一方
+/// 在网关**，所以这个词住在契约层，两处读同一份。
+pub use cog_core::FACE_WITHOUT_A_MEMBER;
 
 /// 这段错误文本是不是在说「这一面一个能接的成员都没有」。
 ///
@@ -82,7 +83,7 @@ fn text_failover_flags(msg: &str) -> (bool, bool) {
 ///   一旦开始下发即锁定后端，避免用户看到两个模型拼出的半份答案。
 /// - `health_check` 只要任一 backend 健康即返回 `true`。
 ///
-/// 实例由网关 `upstream_pool` 模块按 `llm_routing` 配置统一构造；本类型
+/// 实例由本 crate 的插件在自己装配时按 `llm_routing` 配置构造；本类型
 /// 只管逐请求故障转移，不持有池级健康判定。
 pub struct RoutingProvider {
     backends: Vec<Arc<dyn LLMProvider>>,

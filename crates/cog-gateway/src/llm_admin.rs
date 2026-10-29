@@ -340,9 +340,9 @@ async fn resolve_upstream(
     let api_style = if skip_verify {
         unverified = Some("已按 skip_verify 跳过连通验证".to_string());
         match style_hint {
-            Some(cog_llm::anthropic::API_STYLE) => cog_llm::anthropic::API_STYLE,
-            Some(cog_llm::responses::API_STYLE) => cog_llm::responses::API_STYLE,
-            _ => cog_llm::openai::API_STYLE,
+            Some(cog_core::ANTHROPIC_API_STYLE) => cog_core::ANTHROPIC_API_STYLE,
+            Some(cog_core::RESPONSES_API_STYLE) => cog_core::RESPONSES_API_STYLE,
+            _ => cog_core::OPENAI_API_STYLE,
         }
     } else {
         match detect_api_style(base_url, model, api_key, style_hint).await {
@@ -381,7 +381,7 @@ async fn resolve_upstream(
         "model": model,
         "api_key": api_key,
     });
-    if cog_llm::responses::is_openai_family(api_style) && !skip_verify {
+    if cog_core::is_openai_family(api_style) && !skip_verify {
         match detect_tool_call_support(base_url, model, api_key).await {
             Some(supported) => {
                 entry["supports_tool_calls"] = json!(supported);
@@ -685,9 +685,9 @@ enum ApiStyleProbe {
 /// 404'd in production.
 fn protocol_probe_url(style: &str, base_url: &str) -> String {
     match style {
-        cog_llm::openai::API_STYLE => cog_llm::openai::chat_completions_url(base_url),
-        cog_llm::responses::API_STYLE => cog_llm::responses::responses_url(base_url),
-        _ => cog_llm::anthropic::messages_url(base_url),
+        cog_core::OPENAI_API_STYLE => cog_core::chat_completions_url(base_url),
+        cog_core::RESPONSES_API_STYLE => cog_core::responses_url(base_url),
+        _ => cog_core::messages_url(base_url),
     }
 }
 
@@ -705,7 +705,7 @@ async fn detect_api_style(
         Err(e) => return ApiStyleProbe::Invalid(format!("HTTP 客户端构建失败: {e}")),
     };
     let base = base_url.trim_end_matches('/');
-    let first_anthropic = style_hint == Some(cog_llm::anthropic::API_STYLE);
+    let first_anthropic = style_hint == Some(cog_core::ANTHROPIC_API_STYLE);
 
     let mut refused: Option<(&'static str, String)> = None;
     // 在 Responses 面上被明确拒服的那一次。它不能进 `refused`：那个面是**偏好**
@@ -720,21 +720,21 @@ async fn detect_api_style(
     // 反过来先问 chat 面会把这个能力整个问不出来。
     let order: [&'static str; 3] = if first_anthropic {
         [
-            cog_llm::anthropic::API_STYLE,
-            cog_llm::responses::API_STYLE,
-            cog_llm::openai::API_STYLE,
+            cog_core::ANTHROPIC_API_STYLE,
+            cog_core::RESPONSES_API_STYLE,
+            cog_core::OPENAI_API_STYLE,
         ]
     } else {
         [
-            cog_llm::responses::API_STYLE,
-            cog_llm::openai::API_STYLE,
-            cog_llm::anthropic::API_STYLE,
+            cog_core::RESPONSES_API_STYLE,
+            cog_core::OPENAI_API_STYLE,
+            cog_core::ANTHROPIC_API_STYLE,
         ]
     };
 
     for style in order {
         let result = match style {
-            cog_llm::responses::API_STYLE => {
+            cog_core::RESPONSES_API_STYLE => {
                 client
                     .post(protocol_probe_url(style, base))
                     .bearer_auth(api_key)
@@ -746,7 +746,7 @@ async fn detect_api_style(
                     .send()
                     .await
             }
-            cog_llm::openai::API_STYLE => {
+            cog_core::OPENAI_API_STYLE => {
                 client
                     .post(protocol_probe_url(style, base))
                     .bearer_auth(api_key)
@@ -786,7 +786,7 @@ async fn detect_api_style(
                         .take(160)
                         .collect();
                     let message = format!("{base_url} 返回 HTTP {status}: {detail}");
-                    if style == cog_llm::responses::API_STYLE {
+                    if style == cog_core::RESPONSES_API_STYLE {
                         tracing::info!(
                             base_url = %base_url,
                             status = %status,
@@ -1141,11 +1141,11 @@ mod tests {
         }
 
         for (served, want) in [
-            (&["/v1/responses"][..], cog_llm::responses::API_STYLE),
+            (&["/v1/responses"][..], cog_core::RESPONSES_API_STYLE),
             (&["/v1/chat/completions"][..], "openai"),
             (
                 &["/v1/responses", "/v1/chat/completions"][..],
-                cog_llm::responses::API_STYLE,
+                cog_core::RESPONSES_API_STYLE,
             ),
         ] {
             let base = spawn_stub(served).await;
