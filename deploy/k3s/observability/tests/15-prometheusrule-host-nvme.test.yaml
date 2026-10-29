@@ -1,0 +1,229 @@
+# 宿主 NVMe 那七条规则的证明，用 promtool 的真引擎跑真表达式。
+#
+# 这七条原来只在另一棵树的那份夹具里有格，本仓的 `check-alert-rule-proof.sh`
+# 因此把它们记在欠账基线里——那份基线是「本仓没有证明」，不是「证明不了」。
+# 这里把格搬到本仓，基线就能划掉七行：跨仓依赖少一条，别人改这一族时不必等
+# 另一棵树先动。那边那份仍留着，是独立写的第二份标本。
+#
+# 输入取自现网真实读数（2026-10-29 20:0x 读 Prometheus）：wear_headroom_pct 60.74、
+# percentage_used 12、lead_days 90、written_bytes_per_day 1.44e12、wear_rate 0.303、
+# devices 1 / readable 1 / replacements_total 0 / media_errors 0。会响的格里把该动的
+# 那个数推过阈值，其余照现场放。
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: 余量为负会响（磨到自己导出的界之外）
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_wear_headroom_pct{device="nvme0",source="derived"}'
+        values: '-5x180'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: CognevaHostNvmeWearHigh
+        exp_alerts:
+          - exp_labels:
+              device: nvme0
+              source: derived
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+  - name: 余量还够不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_wear_headroom_pct{device="nvme0",source="derived"}'
+        values: '5x180'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: CognevaHostNvmeWearHigh
+        exp_alerts: []
+  - name: 窗口写入速率压过终生平均两倍、折成磨损也够，会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_written_bytes_total{device="nvme0"}'
+        values: '40000000000000+2083333333x500'
+      - series: 'cogneva_host_nvme_written_bytes_per_day{device="nvme0"}'
+        values: '1000000000000x500'
+      - series: 'cogneva_host_nvme_wear_rate_pct_per_day{device="nvme0"}'
+        values: '0.27x500'
+    alert_rule_test:
+      - eval_time: 8h
+        alertname: CognevaHostNvmeWearAccelerating
+        exp_alerts:
+          - exp_labels:
+              device: nvme0
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+  - name: 同样在写、只是没比自己的平均值快，不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_written_bytes_total{device="nvme0"}'
+        values: '40000000000000+2083333333x500'
+      - series: 'cogneva_host_nvme_written_bytes_per_day{device="nvme0"}'
+        values: '4000000000000x500'
+      - series: 'cogneva_host_nvme_wear_rate_pct_per_day{device="nvme0"}'
+        values: '0.27x500'
+    alert_rule_test:
+      - eval_time: 8h
+        alertname: CognevaHostNvmeWearAccelerating
+        exp_alerts: []
+  - name: 比自己的平均值快两倍，但折成磨损还够不上事故，不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_written_bytes_total{device="nvme0"}'
+        values: '40000000000000+2083333333x500'
+      - series: 'cogneva_host_nvme_written_bytes_per_day{device="nvme0"}'
+        values: '1000000000000x500'
+      - series: 'cogneva_host_nvme_wear_rate_pct_per_day{device="nvme0"}'
+        values: '0.005x500'
+    alert_rule_test:
+      - eval_time: 8h
+        alertname: CognevaHostNvmeWearAccelerating
+        exp_alerts: []
+
+  # 这一格是回归护栏：磨损百分比在窗口里进了一格（8→9），写入速率却仍是一生平均。
+  # 旧表达式（`deriv(percentage_used[6h]) * 86400 > rate * 2`）在这一格上会响——那一响
+  # 是计数器的分辨率，不是载荷变化。改读字节计数器之后它必须静。
+  - name: 磨损百分比进了一格、写入速率没变，不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_percentage_used{device="nvme0"}'
+        values: '8x300 9x200'
+      - series: 'cogneva_host_nvme_written_bytes_total{device="nvme0"}'
+        values: '40000000000000+694444444x500'
+      - series: 'cogneva_host_nvme_written_bytes_per_day{device="nvme0"}'
+        values: '1000000000000x500'
+      - series: 'cogneva_host_nvme_wear_rate_pct_per_day{device="nvme0"}'
+        values: '0.27x500'
+    alert_rule_test:
+      - eval_time: 8h
+        alertname: CognevaHostNvmeWearAccelerating
+        exp_alerts: []
+  - name: 介质错误会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_media_errors_total{device="nvme0"}'
+        values: '1x40'
+      - series: 'cogneva_host_nvme_critical_warning{device="nvme0"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaHostNvmeHealthWarning
+        exp_alerts:
+          - exp_labels:
+              device: nvme0
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+  - name: 两块都健康不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_media_errors_total{device="nvme0"}'
+        values: '0x40'
+      - series: 'cogneva_host_nvme_critical_warning{device="nvme0"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaHostNvmeHealthWarning
+        exp_alerts: []
+  - name: 有一块盘读不出来会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_devices'
+        values: '2x70'
+      - series: 'cogneva_host_nvme_readable'
+        values: '1x70'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: CognevaHostNvmeUnreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+  - name: 全读得到不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_devices'
+        values: '2x70'
+      - series: 'cogneva_host_nvme_readable'
+        values: '2x70'
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: CognevaHostNvmeUnreadable
+        exp_alerts: []
+  - name: 换盘计数涨了会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_replacements_total{device="nvme0"}'
+        values: '0x30 1x120'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: CognevaHostNvmeReplacementDetected
+        exp_alerts:
+          - exp_labels:
+              device: nvme0
+              severity: info
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+  - name: 计数不动不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_replacements_total{device="nvme0"}'
+        values: '0x150'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: CognevaHostNvmeReplacementDetected
+        exp_alerts: []
+  - name: 换盘计数回落会响（基线被重置）
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_replacements_total{device="nvme0"}'
+        values: '3x30 0x90'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaHostNvmeBaselineLost
+        exp_alerts:
+          - exp_labels:
+              device: nvme0
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+  - name: 计数只增不减时不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_replacements_total{device="nvme0"}'
+        values: '2x150'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: CognevaHostNvmeBaselineLost
+        exp_alerts: []
+  - name: 提前期钉得太短会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_lead_days'
+        values: '7x150'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: CognevaHostNvmeLeadTimeTooShort
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+  - name: 提前期在默认的 90 天不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_nvme_lead_days'
+        values: '90x150'
+    alert_rule_test:
+      - eval_time: 2h
+        alertname: CognevaHostNvmeLeadTimeTooShort
+        exp_alerts: []
+
+  # ── cogneva-host-readings：产出者自己没了 ─────────────────────────────────
+  # 有读数在抓取面上一条序列都没有：这一族此前只有「抓取目标掉了吗」的判据，
+  # 而「目标都在、其中一条读数指着的指标根本没人产」是另一种断法——它的读数就是
+  # 面板上一条零线，与「一切正常」同形。判词带的是条数，逐条的名字在
+  # `reading_producer_missing` 上（另两格钉它）。

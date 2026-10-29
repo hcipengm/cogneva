@@ -1,0 +1,307 @@
+# 读数面那十条规则的证明，用 promtool 的真引擎跑真表达式。
+#
+# 输入取自现网真实读数（2026-10-29 20:2x 读 Prometheus）：47 个生产者的
+# `host_reading_producer_up` 是 1、`host_spin` 那一条是 0；`alert_bound_band` 的
+# `producer_unreadable` 是 1（其余 0）；`reading_producer_absent`=0、
+# `host_reading_series_undeclared`=0、`host_reading_series_vanished`=0、
+# `cogneva_verdict_series_unread`=0 与 `ceiling`=0、`reading_witness_unresolved`=0、
+# `tasks_publishers_agree`=1、`cogneva_refusal_redispatch_state{state="idle_no_runs"}`=1。
+# 上面两条为 1／为 0 的那两格是现网此刻的真事，直接拿来当「会响」的样本——不是编出来的。
+#
+# 每一条都配一格「不响」：这一族里九条判的是 `== 0`／`> 0`／`A > B`，写坏的典型是在
+# 健康数据上恒响（比较号写反、`and` 漏掉半边、把 ceiling 写成常数），恒响的代价是整条
+# 告警被静音，包括它本该报的那一次。
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: 生产者这一拍没跑成会响（现网 host_spin 此刻就是这样）
+    interval: 1m
+    input_series:
+      - series: 'host_reading_producer_up{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="host_spin"}'
+        values: '0x30'
+      - series: 'host_reading_producer_up{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="acceptance_census"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaHostReadingProducerDown
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              producer: host_spin
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  - name: 生产者都跑成了不会响
+    interval: 1m
+    input_series:
+      - series: 'host_reading_producer_up{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="host_spin"}'
+        values: '1x30'
+      - series: 'host_reading_producer_up{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="acceptance_census"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaHostReadingProducerDown
+        exp_alerts: []
+
+  - name: 生产者活着但上游读不到会响（现网 alert_bound_band 此刻就是这样）
+    interval: 1m
+    input_series:
+      - series: 'host_reading_producer_unreadable{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="alert_bound_band"}'
+        values: '1x40'
+      - series: 'host_reading_producer_unreadable{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="backup_package"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaHostReadingProducerUnreadable
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              producer: alert_bound_band
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  - name: 上游读得到时不会响
+    interval: 1m
+    input_series:
+      - series: 'host_reading_producer_unreadable{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="alert_bound_band"}'
+        values: '0x40'
+      - series: 'host_reading_producer_unreadable{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="backup_package"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaHostReadingProducerUnreadable
+        exp_alerts: []
+
+  - name: 有判词却一条序列都没人发会响
+    interval: 1m
+    input_series:
+      - series: 'reading_producer_absent{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '2x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaReadingProducerAbsent
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  - name: 现网那一拍（缺席 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'reading_producer_absent{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaReadingProducerAbsent
+        exp_alerts: []
+
+  - name: 抓取目标掉了会响
+    interval: 1m
+    input_series:
+      - series: 'up{instance="cogneva",job="cogneva-host-readings"}'
+        values: '0x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaHostReadingsEndpointDown
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  - name: 抓取目标在的时候不会响
+    interval: 1m
+    input_series:
+      - series: 'up{instance="cogneva",job="cogneva-host-readings"}'
+        values: '1x25'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaHostReadingsEndpointDown
+        exp_alerts: []
+
+  - name: 有人加了没登记的序列会响
+    interval: 1m
+    input_series:
+      - series: 'host_reading_series_undeclared{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaHostReadingSeriesUndeclared
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  - name: 现网那一拍（没登记 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'host_reading_series_undeclared{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaHostReadingSeriesUndeclared
+        exp_alerts: []
+
+  - name: 登记过的那一条这一拍没印会响
+    interval: 1m
+    input_series:
+      - series: 'host_reading_series_vanished{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaHostReadingSeriesVanished
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  - name: 现网那一拍（消失 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'host_reading_series_vanished{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaHostReadingSeriesVanished
+        exp_alerts: []
+
+  - name: 没有读者的判词涨过承认的欠账会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_verdict_series_unread{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x80'
+      - series: 'cogneva_verdict_series_ceiling{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaVerdictSeriesUnread
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  - name: 现网那一拍（0 与上限 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_verdict_series_unread{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+      - series: 'cogneva_verdict_series_ceiling{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaVerdictSeriesUnread
+        exp_alerts: []
+
+  - name: 有判词没有决定可做会响
+    interval: 1m
+    input_series:
+      - series: 'reading_witness_unresolved{instance="cogneva",job="cogneva-host-readings",node="cogneva",readout="reading_witness_unresolved"}'
+        values: '1x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaReadingWitnessUnresolved
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              readout: reading_witness_unresolved
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  - name: 现网那一拍（0）不会响
+    interval: 1m
+    input_series:
+      - series: 'reading_witness_unresolved{instance="cogneva",job="cogneva-host-readings",node="cogneva",readout="reading_witness_unresolved"}'
+        values: '0x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaReadingWitnessUnresolved
+        exp_alerts: []
+
+  - name: 两份发布者名单不一致会响
+    interval: 1m
+    input_series:
+      - series: 'tasks_publishers_agree{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaTasksPublishersDisagree
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 任务管理
+
+  - name: 现网那一拍（一致）不会响
+    interval: 1m
+    input_series:
+      - series: 'tasks_publishers_agree{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaTasksPublishersDisagree
+        exp_alerts: []
+
+  - name: 拒绝却没把动作交回去会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_refusal_redispatch_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",state="turn_off"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaRefusalRedispatchBroken
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              state: turn_off
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 任务管理
+
+  - name: 现网那一拍（idle_no_runs 不在点名的那三个状态里）不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_refusal_redispatch_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",state="idle_no_runs"}'
+        values: '1x40'
+      - series: 'cogneva_refusal_redispatch_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",state="turn_off"}'
+        values: '0x40'
+      - series: 'cogneva_refusal_redispatch_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",state="below_bar"}'
+        values: '0x40'
+      - series: 'cogneva_refusal_redispatch_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",state="refused_no_redispatch"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaRefusalRedispatchBroken
+        exp_alerts: []

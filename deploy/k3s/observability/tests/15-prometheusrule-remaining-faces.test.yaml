@@ -1,0 +1,524 @@
+# 剩下二十二条托管告警规则的证明，用 promtool 的真引擎跑真表达式。
+#
+# 输入取自现网真实读数（2026-10-29 20:3x 读 Prometheus）：文件尺寸普查两格 0、
+# 六列表里 conn 与 slot 都是 green、原则载体落地缺口 0、十环三格 0、告警回写四格 0、
+# A2A 三格 0／0／1、快车道 30 秒、产品占比 0.722、记忆预算余量 625、
+# `must_green_flake_repeat_verdict=1`、面名三格 0。会响的格只把该动的那个数推过界。
+#
+# 其中 `CognevaMustGreenFlakeRepeat` 的「会响」格用的是**此刻的真值**：现网判词就是 1，
+# 告警正在响（host-tests.test.sh 在窗口里假红四次）。拿真事当样本，比编一个 1 更诚实。
+#
+# 这一批里多数规则的身体是 `X > 0`，看起来平凡；配静格不是为了形式——`> 0` 写成 `< 0`、
+# 或把 `max()` 换成裸子串，都会让它在健康数据上长亮，而长亮的告警等于没有告警。
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: 尺寸普查有文件没判过会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_file_size_census_unjudged{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x140'
+    alert_rule_test:
+      - eval_time: 135m
+        alertname: CognevaFileSizeCensusUnjudged
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 变更管理
+
+  - name: 现网那一拍（没判过 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_file_size_census_unjudged{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x140'
+    alert_rule_test:
+      - eval_time: 135m
+        alertname: CognevaFileSizeCensusUnjudged
+        exp_alerts: []
+
+  - name: 六列表的 conn 列红了会响
+    interval: 1m
+    input_series:
+      - series: 'resource_six_column_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",column="conn",state="red"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaResourceSixColumnConnExhausted
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              column: conn
+              state: red
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 资源管理
+
+  - name: 现网那一拍（conn green）不会响
+    interval: 1m
+    input_series:
+      - series: 'resource_six_column_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",column="conn",state="green"}'
+        values: '1x30'
+      - series: 'resource_six_column_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",column="conn",state="red"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaResourceSixColumnConnExhausted
+        exp_alerts: []
+
+  - name: 六列表的 slot 列红了会响（某次准入放过了界）
+    interval: 1m
+    input_series:
+      - series: 'resource_six_column_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",column="slot",state="red"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaResourceSixColumnSlotOverAdmitted
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              column: slot
+              state: red
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 资源管理
+
+  - name: 现网那一拍（slot green）不会响
+    interval: 1m
+    input_series:
+      - series: 'resource_six_column_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",column="slot",state="green"}'
+        values: '1x30'
+      - series: 'resource_six_column_state{instance="cogneva",job="cogneva-host-readings",node="cogneva",column="slot",state="red"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaResourceSixColumnSlotOverAdmitted
+        exp_alerts: []
+
+  - name: 载体说了已落地而账上没有那一行会响
+    interval: 1m
+    input_series:
+      - series: 'principle_carriers_slug_no_landing{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaPrincipleSlugNoLanding
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 原则管理
+
+  - name: 现网那一拍（缺口 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'principle_carriers_slug_no_landing{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaPrincipleSlugNoLanding
+        exp_alerts: []
+
+  - name: 十环里有环不合格会响
+    interval: 1m
+    input_series:
+      - series: 'e2e_ten_rings_failed_settled{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaE2eRingFailed
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 端到端演练
+
+  - name: 现网那一拍（不合格 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'e2e_ten_rings_failed_settled{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaE2eRingFailed
+        exp_alerts: []
+
+  - name: 十环里有环读不到输入会响
+    interval: 1m
+    input_series:
+      - series: 'e2e_ten_rings_unread{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaE2eRingUnread
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 端到端演练
+
+  - name: 现网那一拍（读不到 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'e2e_ten_rings_unread{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaE2eRingUnread
+        exp_alerts: []
+
+  - name: 进了表没人接会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_alert_attention_unattended{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaAlertUnattended
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  - name: 现网那一拍（没人接 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_alert_attention_unattended{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaAlertUnattended
+        exp_alerts: []
+
+  - name: 行还开着但写者早就不看了会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_alert_sighting_unsighted{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaAlertUnsighted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  - name: 现网那一拍（孤儿 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_alert_sighting_unsighted{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaAlertUnsighted
+        exp_alerts: []
+
+  - name: 正在响的行归不到人会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_alert_ownership_unowned{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaAlertFiringUnowned
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  - name: 现网那一拍（无主 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_alert_ownership_unowned{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaAlertFiringUnowned
+        exp_alerts: []
+
+  - name: 一条规则在刷表会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_alert_traffic_noisy{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x35'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaAlertAccountNoisy
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  - name: 现网那一拍（没有刷表的规则）不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_alert_traffic_noisy{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x35'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaAlertAccountNoisy
+        exp_alerts: []
+
+  - name: 对端面漂移了会响
+    interval: 1m
+    input_series:
+      - series: 'a2a_conformance_drift_cells{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '2x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaA2aConformanceDrifted
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 通信
+
+  - name: 现网那一拍（漂移 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'a2a_conformance_drift_cells{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaA2aConformanceDrifted
+        exp_alerts: []
+
+  - name: 对端连第一步都走不到会响
+    interval: 1m
+    input_series:
+      - series: 'a2a_reach_defect{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaA2aDiscoveryClosed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 通信
+
+  - name: 现网那一拍（名片可达）不会响
+    interval: 1m
+    input_series:
+      - series: 'a2a_reach_defect{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaA2aDiscoveryClosed
+        exp_alerts: []
+
+  - name: 上游套件说名片不合规会响
+    interval: 1m
+    input_series:
+      - series: 'a2a_tck_conformant{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaA2aTckDrifted
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 通信
+
+  - name: 现网那一拍（套件全过）不会响
+    interval: 1m
+    input_series:
+      - series: 'a2a_tck_conformant{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaA2aTckDrifted
+        exp_alerts: []
+
+  - name: 快车道中位数超过一分钟会响
+    interval: 1m
+    input_series:
+      - series: 'commit_fast_lane_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '120x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaCommitFastLaneSlow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 变更管理
+
+  - name: 现网那一拍（30 秒）不会响
+    interval: 1m
+    input_series:
+      - series: 'commit_fast_lane_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '30x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaCommitFastLaneSlow
+        exp_alerts: []
+
+  - name: 产品占比掉到一半以下会响
+    interval: 1m
+    input_series:
+      - series: 'product_commit_share{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0.3x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaProductCommitShareLow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 变更管理
+
+  - name: 现网那一拍（0.722）不会响
+    interval: 1m
+    input_series:
+      - series: 'product_commit_share{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0.722x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaProductCommitShareLow
+        exp_alerts: []
+
+  - name: 记忆预算用超会响
+    interval: 1m
+    input_series:
+      - series: 'brain_budget_remaining{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '-5x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaMemoryBudgetOver
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 原则管理
+
+  - name: 现网那一拍（余量 625）不会响
+    interval: 1m
+    input_series:
+      - series: 'brain_budget_remaining{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '625x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaMemoryBudgetOver
+        exp_alerts: []
+
+  - name: 同一驱动者在窗口里重复假红会响（现网此刻就是）
+    interval: 1m
+    input_series:
+      - series: 'must_green_flake_repeat_verdict{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaMustGreenFlakeRepeat
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 原则管理
+
+  - name: 窗口里没有重复假红时不会响
+    interval: 1m
+    input_series:
+      - series: 'must_green_flake_repeat_verdict{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaMustGreenFlakeRepeat
+        exp_alerts: []
+
+  - name: 载体挂了正本不认的面名会响
+    interval: 1m
+    input_series:
+      - series: 'face_symmetry_unknown{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaFaceNameUnknownToTheTable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  - name: 现网那一拍（不认的面名 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'face_symmetry_unknown{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaFaceNameUnknownToTheTable
+        exp_alerts: []
+
+  - name: 有面一条规则都没有会响
+    interval: 1m
+    input_series:
+      - series: 'face_symmetry_uncovered_excess{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaFaceWithoutAnyRule
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  - name: 现网那一拍（无规则的面数不超）不会响
+    interval: 1m
+    input_series:
+      - series: 'face_symmetry_uncovered_excess{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaFaceWithoutAnyRule
+        exp_alerts: []
+
+  - name: 面表本身读不出来会响
+    interval: 1m
+    input_series:
+      - series: 'face_symmetry_invalid{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaFaceTableUnreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  - name: 现网那一拍（面表可读）不会响
+    interval: 1m
+    input_series:
+      - series: 'face_symmetry_invalid{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaFaceTableUnreadable
+        exp_alerts: []

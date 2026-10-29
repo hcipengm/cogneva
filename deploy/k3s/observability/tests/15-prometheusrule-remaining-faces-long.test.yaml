@@ -1,0 +1,73 @@
+# 剩下那批里 `for: 24h` 的两条（尺寸普查过期、十环无判据），单独成一份。
+#
+# 为什么分开：这两格要跑到第 25 小时，而 promtool 每一个台阶都会把整组规则算一遍，
+# 于是这一份的耗时随视界线性长（69 条 × 300 阶）。放在一起会把「跑一遍全部夹具」
+# 从几秒抬到一分钟，而受益的只有这两条；单独成一份，谁改到这两条才付这份钱。
+#
+# 输入取自现网真实读数（2026-10-29 20:3x 读 Prometheus）：文件尺寸普查两格 0、
+# 六列表里 conn 与 slot 都是 green、原则载体落地缺口 0、十环三格 0、告警回写四格 0、
+# A2A 三格 0／0／1、快车道 30 秒、产品占比 0.722、记忆预算余量 625、
+# `must_green_flake_repeat_verdict=1`、面名三格 0。会响的格只把该动的那个数推过界。
+#
+# 其中 `CognevaMustGreenFlakeRepeat` 的「会响」格用的是**此刻的真值**：现网判词就是 1，
+# 告警正在响（host-tests.test.sh 在窗口里假红四次）。拿真事当样本，比编一个 1 更诚实。
+#
+# 这一批里多数规则的身体是 `X > 0`，看起来平凡；配静格不是为了形式——`> 0` 写成 `< 0`、
+# 或把 `max()` 换成裸子串，都会让它在健康数据上长亮，而长亮的告警等于没有告警。
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: 尺寸普查有行对应的文件已经不在会响
+    interval: 5m
+    input_series:
+      - series: 'cogneva_file_size_census_stale{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x320'
+    alert_rule_test:
+      - eval_time: 1500m
+        alertname: CognevaFileSizeCensusStale
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: info
+              cogneva_io_managed: "true"
+              cogneva_io_face: 变更管理
+
+  - name: 现网那一拍（过期 0）不会响
+    interval: 5m
+    input_series:
+      - series: 'cogneva_file_size_census_stale{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x320'
+    alert_rule_test:
+      - eval_time: 1500m
+        alertname: CognevaFileSizeCensusStale
+        exp_alerts: []
+
+  - name: 有环压根没有判据会响
+    interval: 5m
+    input_series:
+      - series: 'e2e_ten_rings_unchecked{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x320'
+    alert_rule_test:
+      - eval_time: 1500m
+        alertname: CognevaE2eRingNoCheck
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 端到端演练
+
+  - name: 现网那一拍（无判据 0）不会响
+    interval: 5m
+    input_series:
+      - series: 'e2e_ten_rings_unchecked{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x320'
+    alert_rule_test:
+      - eval_time: 1500m
+        alertname: CognevaE2eRingNoCheck
+        exp_alerts: []

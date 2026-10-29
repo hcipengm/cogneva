@@ -26,12 +26,20 @@
 # 射程只看 CRD 清单。进程内那一库（`cogneva.json` 的 `observability.infra_watch.rules`）
 # 有它自己的门 `check-alert-rule-firing-coverage.sh`，判据同形、人口不同，两边不重叠。
 #
-# 基线：这一族里有 56 条规则的证明**不在本仓**——它们住在值守用的另一棵树
+# 基线：有一批规则的证明**不在本仓**——它们住在值守用的另一棵树
 # （`scripts/host/cogneva-host-readings-red-proof.promtool.yaml`），那边的门读本仓的
 # 清单去跑。这正是这条门存在的理由：证明与本仓的规则分居两处，加规则的人看不见那一头，
 # 那一头要等宽限期过了才红，红的时刻落在别人头上。基线把「还没搬进来」记成一个数，
 # **只许变小**：给一条规则在本仓写了夹具，就得把它从基线划掉，否则基线是永久免检。
 # 搬完那天基线应当是空的（判据：`--stock` 里不再有 unproven-in-repo 的行）。
+# 还剩几条不在这里写死——写死的数会随搬迁移走而过期，读 `--stock` 的最后一行。
+#
+# 给**宿主读数那一族**（`15-prometheusrule-host-readings.yaml`）加规则的人还要多做一步，
+# 这条门管不到、也判不出来：那一族另有一份独立写的夹具在值守那棵树里，它的门要求每条
+# 规则在那份夹具里也有两格，宽限 24 小时。本仓这两格是「表达式写得对」，那一头那两格
+# 是「换一个人写一遍也认得出会响」——两份标本都写出来之前，两条门各绿一次，而第三条红
+# 会落在 24 小时后别人身上。`deploy/k3s/observability/tests/15-prometheusrule-host-nvme
+# .test.yaml` 就是搬进来的一份，可照它的形状写。
 #
 # 用法：check-alert-rule-proof.sh [--stock] [--update-baseline [--allow-grow]]
 #   --stock            印出每一条规则的证明情况（含基线内的），退 0——它是读数不是判据

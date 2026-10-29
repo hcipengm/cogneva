@@ -1,0 +1,179 @@
+# 宿主构建缓存回收器那六条规则的证明，用 promtool 的真引擎跑真表达式。
+#
+# 输入取自现网真实读数（2026-10-29 20:1x 读 Prometheus）：周期 1800 s、年龄 1229 s、
+# measured 1、script_committed 1、outcome{below_trigger}=1 而其余五个 outcome 都是 0、
+# 已用 52% / 触发 70% / 地板 50%。会响的格只把该动的那个数推过界，其余照现场放。
+#
+# 「不响」的格在这里不是凑数：这六条里有三条（Stale / CadenceUnknown / FloorUnreachable）
+# 的表达式含减法、除法或 `unless`，这一类写坏的典型不是恒假，而是**在健康数据上也响**——
+# 分母缺席、连接键对不上、`unless` 写成 `and` 都会这样。只有静格能把它们分出来。
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: 年龄超过周期的六倍会响（回收器停了）
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_age_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '12600x40'
+      - series: 'cogneva_host_target_gc_period_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1800x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaHostTargetGcStale
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 资源泄漏与长稳
+
+  - name: 年龄在周期的六倍以内不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_age_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1229x40'
+      - series: 'cogneva_host_target_gc_period_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1800x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaHostTargetGcStale
+        exp_alerts: []
+
+  - name: 有测量但读不出周期会响（节拍判不了）
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_measured{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaHostTargetGcCadenceUnknown
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 资源泄漏与长稳
+
+  - name: 周期读得出来时不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_measured{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x40'
+      - series: 'cogneva_host_target_gc_period_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1800x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaHostTargetGcCadenceUnknown
+        exp_alerts: []
+
+  - name: 从没跑成过会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_measured{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaHostTargetGcNeverRan
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 资源泄漏与长稳
+
+  - name: 跑成过就不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_measured{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x80'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaHostTargetGcNeverRan
+        exp_alerts: []
+
+  - name: 脚本身份立不住会响（拒绝释放）
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_script_committed{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x100'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaHostTargetGcScriptUnverified
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 资源泄漏与长稳
+
+  - name: 脚本与 HEAD 逐字节相等时不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_script_committed{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x100'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaHostTargetGcScriptUnverified
+        exp_alerts: []
+
+  - name: 有进程认不出属主会响（整轮不释放）
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_outcome{instance="cogneva",job="cogneva-host-readings",node="cogneva",outcome="probe_failed"}'
+        values: '1x100'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaHostTargetGcProbeFailed
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              outcome: probe_failed
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 资源泄漏与长稳
+
+  - name: 现网那一拍（below_trigger 亮、其余五档都 0）不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_outcome{instance="cogneva",job="cogneva-host-readings",node="cogneva",outcome="below_trigger"}'
+        values: '1x100'
+      - series: 'cogneva_host_target_gc_outcome{instance="cogneva",job="cogneva-host-readings",node="cogneva",outcome="probe_failed"}'
+        values: '0x100'
+      - series: 'cogneva_host_target_gc_outcome{instance="cogneva",job="cogneva-host-readings",node="cogneva",outcome="floor_unreachable"}'
+        values: '0x100'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaHostTargetGcProbeFailed
+        exp_alerts: []
+      - eval_time: 75m
+        alertname: CognevaHostTargetGcFloorUnreachable
+        exp_alerts: []
+
+  - name: 廉价三档走完仍在地板之上会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_outcome{instance="cogneva",job="cogneva-host-readings",node="cogneva",outcome="floor_unreachable"}'
+        values: '1x100'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaHostTargetGcFloorUnreachable
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              outcome: floor_unreachable
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 资源泄漏与长稳
