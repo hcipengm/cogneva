@@ -656,6 +656,15 @@ struct HostLoad {
     /// state of a process that has just started. The dimension then reads the
     /// device directly, as it did before there was a cost to remember.
     per_build_io: Option<f64>,
+    /// How many of this gate's own builds the io reading's window has had
+    /// running, averaged over that window.
+    ///
+    /// The other three dimensions read an instant -- cores busy now, memory
+    /// available now -- and pair it with the builds running now. The io reading
+    /// is an average over a minute, so it is paired with an average over the
+    /// same minute; see [`next_occupancy_avg`]. Zero before the gate has
+    /// watched a window, which reads the device as carrying nothing of ours.
+    occupancy_avg60: f64,
 }
 
 /// Free bytes of the filesystem `dir` is on.
@@ -848,6 +857,10 @@ impl HostLoad {
             // Learned by the caller from earlier windows; this window's own
             // sample is what teaches the next one.
             per_build_io: None,
+            // Likewise: a fresh sample knows of no build of ours in the window
+            // it averages, and the gate replaces this with its own average
+            // before deriving anything.
+            occupancy_avg60: 0.0,
         })
     }
 
@@ -962,9 +975,21 @@ impl HostLoad {
         // answered "one" while the build ran and "many" the moment it finished,
         // and the build that moved it was the gate's own. A cost learned across
         // windows is the reading that does not contain its own output.
+        //
+        // The share of that reading the gate's own builds account for is counted
+        // over the same sixty seconds the reading covers, not at the instant the
+        // window is closed. `io some avg60` is a kernel average, so a count taken
+        // at one moment is not what went into it: a build that had just finished
+        // still had its writes in the average while the count already read zero,
+        // the whole of that minute was charged to somebody else's writeback, and
+        // the gate took back the slot it had just handed out. Measured on
+        // 2026-10-30 in thirty-second scrapes of one host: in flight 1 with io
+        // 46.50 answered two, in flight 0 with io 46.77 answered one one window
+        // later, and the only input that had moved was the count.
+        let occupied = self.occupancy_avg60.max(0.0);
         let shown = self.pressure.io_avg60.max(0.0);
         let per_build = self.per_build_io.map(|cost| {
-            let unexplained = (shown - cost * in_flight).max(0.0);
+            let unexplained = (shown - cost * occupied).max(0.0);
             cost + unexplained
         });
         let io = (self.tuning.io_stall_budget_pct / per_build.unwrap_or(shown).max(0.01))
@@ -1128,6 +1153,28 @@ pub const BUILD_GATE_BOUND_RULE: &str = "build_gate_bound_not_converging";
 /// workspace that got cheaper, without following a build that got quieter for a
 /// minute.
 const IO_PER_BUILD_SMOOTHING: f64 = 0.3;
+
+/// The kernel's averaging window for the `avg60` pressure figures, in seconds.
+///
+/// Not a dial. It is the definition of the reading the io dimension explains:
+/// the occupancy charged against that reading has to be averaged over the same
+/// period, or the two describe different minutes. See [`next_occupancy_avg`].
+const PSI_AVG60_WINDOW_SECONDS: f64 = 60.0;
+
+/// The build occupancy an io reading's window ends on, given the average it
+/// started from and the builds running at the end of it.
+///
+/// The reading being explained, `pressure/io`'s `avg60`, is an exponential
+/// average with a sixty-second time constant. This applies the same decay over
+/// the time that actually elapsed, so the share of the reading credited to the
+/// gate's own builds fades exactly as fast as the reading it is subtracted
+/// from. Sampled with a slower constant -- the sort a smoother estimate would
+/// use -- it would leave windows where the reading had already faded and the
+/// count had not, which is the same defect one window later.
+fn next_occupancy_avg(previous: f64, in_flight: usize, elapsed: Duration) -> f64 {
+    let decay = (-elapsed.as_secs_f64() / PSI_AVG60_WINDOW_SECONDS).exp();
+    previous * decay + in_flight as f64 * (1.0 - decay)
+}
 
 /// The remembered io cost of one build after one window.
 ///
@@ -1908,6 +1955,15 @@ pub struct BuildGate {
     /// a cost read back from a file would outlive the workspace it measured,
     /// which is the one thing this number has to follow.
     per_build_io: AtomicU64,
+    /// How many of this process's builds the io average has had running, as the
+    /// bits of an `f64`.
+    ///
+    /// The count in the slot directory is what the other dimensions pair with
+    /// their instantaneous readings; the io reading is a sixty-second average,
+    /// so it is paired with this instead. See [`next_occupancy_avg`] for why the
+    /// two have to fade at the same rate, and why a count taken at the instant
+    /// the window closes is not the same thing.
+    occupancy_avg: AtomicU64,
     /// The dimension the ceiling came from.
     dimension: Mutex<&'static str>,
     /// The sample that derivation was made from, published beside it.
@@ -2047,6 +2103,7 @@ impl BuildGate {
             measured_ceiling: AtomicU64::new(0),
             held_ceiling: AtomicU64::new(0),
             per_build_io: AtomicU64::new(0),
+            occupancy_avg: AtomicU64::new(0),
             dimension: Mutex::new(DIM_UNMEASURED),
             host: Mutex::new(None),
             measured_build_cost: Mutex::new(VecDeque::new()),
@@ -2331,6 +2388,25 @@ impl BuildGate {
             .store(next.unwrap_or(0.0).to_bits(), Ordering::Relaxed);
     }
 
+    /// The build occupancy this process has watched, weighted the way the io
+    /// average weights its own window.
+    fn learned_occupancy(&self) -> f64 {
+        f64::from_bits(self.occupancy_avg.load(Ordering::Relaxed))
+    }
+
+    /// Moves the occupancy average on by the window that just passed, and
+    /// answers what it became.
+    ///
+    /// Sampled once per derivation rather than on a timer of its own, for the
+    /// same reason the bound is: a process that is neither asking for slots nor
+    /// being scraped has no reading anyone is waiting on, and the window this
+    /// averages over is the one the bound is derived from anyway.
+    fn learn_occupancy(&self, in_flight: usize, elapsed: Duration) -> f64 {
+        let next = next_occupancy_avg(self.learned_occupancy(), in_flight, elapsed);
+        self.occupancy_avg.store(next.to_bits(), Ordering::Relaxed);
+        next
+    }
+
     /// Re-derives the bound, at most once per window, and persists it where this
     /// process is the one elected to.
     ///
@@ -2358,10 +2434,15 @@ impl BuildGate {
             }
             return;
         }
+        // How long the window being closed actually was. The nominal one is the
+        // right answer for the first derivation, which has no previous window to
+        // measure from.
+        let mut elapsed = self.tuning.bound_window;
         {
             let window = self.window.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(last) = *window {
-                if last.elapsed() < self.tuning.bound_window {
+                elapsed = last.elapsed();
+                if elapsed < self.tuning.bound_window {
                     return;
                 }
             }
@@ -2383,7 +2464,10 @@ impl BuildGate {
         // hand the builders a new bound every ninety seconds.
         // What earlier windows taught this process about one build's io, carried
         // into this one's arithmetic before anything is derived from it. This
-        // window's own reading is what teaches the next.
+        // window's own reading is what teaches the next -- and the occupancy is
+        // this window's own sample folded into the average that explains the io
+        // reading, taken before the dimension reads it.
+        load.occupancy_avg60 = self.learn_occupancy(load.pressure.builds_in_flight, elapsed);
         load.per_build_io = self.learned_io_cost();
         let previous = self.held_ceiling.load(Ordering::Relaxed) as usize;
         let (measured_ceiling, dimension) = load.ceiling();
@@ -4047,6 +4131,7 @@ mod tests {
             disk_free_bytes: None,
             tuning,
             per_build_io: None,
+            occupancy_avg60: 0.0,
         }
     }
 
@@ -4847,6 +4932,7 @@ mod tests {
             disk_free_bytes: None,
             tuning: shipped(),
             per_build_io: None,
+            occupancy_avg60: 0.0,
         };
         let plenty = 64 * 1024 * 1024 * 1024;
         // Derived rather than written out: this is the cpu dimension's own
@@ -4917,6 +5003,7 @@ mod tests {
             disk_free_bytes: Some(1 << 40),
             tuning: shipped(),
             per_build_io: None,
+            occupancy_avg60: 0.0,
         };
         // 没有上一拍可依：量到几就是几。
         assert_eq!(load(1.9).ceiling_held_since(0).0, 1);
@@ -4975,6 +5062,7 @@ mod tests {
                 disk_free_bytes: Some(1 << 40),
                 tuning,
                 per_build_io: io_cost,
+                occupancy_avg60: n as f64,
             }
         };
 
@@ -5036,6 +5124,7 @@ mod tests {
                 disk_free_bytes: Some(1 << 40),
                 tuning,
                 per_build_io: learned,
+                occupancy_avg60: n as f64,
             }
         };
         // 两条构建、每条三个窗口、中间各两个窗口的间隙。
@@ -5126,6 +5215,7 @@ mod tests {
             disk_free_bytes: Some(1 << 40),
             tuning: shipped(),
             per_build_io: Some(5.0),
+            occupancy_avg60: n as f64,
         };
         // 一条便宜的构建（5 个点）本可容下十几条；设备已经吃到整个预算而我们的
         // 构建一条也没跑，那部分是别人的。
@@ -5143,6 +5233,102 @@ mod tests {
             ),
             "盘不忙时，答案是核数，不是那条构建"
         );
+    }
+
+    /// 同一块盘、同一个 `io some avg60`、窗口里同样多的占用，只有「这一刻在飞
+    /// 几条」不同：io 维必须给同一个答案。
+    ///
+    /// 这是上面那条不变式在 io 这一维上的形状。读数是一分钟的平均，而在飞条数
+    /// 是这一瞬取的计数；拿后者去解释前者，构建刚结束的那一拍就会把还压在同一
+    /// 分钟窗口里的那次写盘算成别人的背景 io，界塌一档、下一拍再涨回来——一条
+    /// 构建两笔改写，账上的速率正是这么来的。
+    ///
+    /// 没有这一条时：同一个读数 46.77、同一条学到的代价 25，在飞 0 条答 0.97、
+    /// 在飞 1 条答 1.50，差的那一档全部来自计数。
+    #[test]
+    fn the_io_answer_does_not_depend_on_how_many_builds_are_running() {
+        let host = |n: usize| HostLoad {
+            pressure: Pressure {
+                cpu_avg10: 0.0,
+                cpu_avg60: 0.0,
+                io_avg10: 0.0,
+                io_avg60: 46.77,
+                mem_avg10: 0.0,
+                mem_avg60: 0.0,
+                mem_available_bytes: 64 * 1024 * 1024 * 1024,
+                builds_in_flight: n,
+            },
+            busy_cores: 0.0,
+            cores: 24,
+            budget: None,
+            disk_free_bytes: Some(1 << 40),
+            tuning: shipped(),
+            per_build_io: Some(25.0),
+            occupancy_avg60: 1.0,
+        };
+        assert_eq!(
+            host(0).dimensions()[2],
+            host(1).dimensions()[2],
+            "io 维读的是窗口里的占用，不是这一刻在飞的条数"
+        );
+        assert_eq!(host(0).dimensions()[2], host(2).dimensions()[2]);
+        // 这一维仍然在答：占用一条、读数 46.77、代价 25，答案不止一条。
+        assert!(
+            host(0).dimensions()[2].1 > 1.0,
+            "换掉计数不是把 io 维变成常数：{}",
+            host(0).dimensions()[2].1
+        );
+    }
+
+    /// 一条构建结束、io 的六十秒平均还在回落的那几拍，界不动。
+    ///
+    /// 读数与占用按同一条衰减走，于是「读数减去我们自己的构建那一份」在两边
+    /// 都是同一个别人的份额：构建起来时加上去的、它结束后褪下去的，是同一个
+    /// kernel，不存在一拍里读数还在而计数已经走了。
+    #[test]
+    fn a_build_ending_does_not_take_back_the_slot_it_held() {
+        // 代价 30：没有这次改动时，构建在跑答 2（70/30.5）、结束后那几拍答 1
+        // （70 / (30.5 + 11.0)），界正好跨过整数——这一格就是那两笔改写。
+        let cost = 30.0;
+        let ambient = 0.5;
+        let mut occupancy = 0.0f64;
+        let mut io = ambient;
+        let mut answers: Vec<(usize, &'static str)> = Vec::new();
+        for n in [0usize, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0] {
+            let elapsed = Duration::from_secs(60);
+            occupancy = next_occupancy_avg(occupancy, n, elapsed);
+            // 内核的 avg60：同一个衰减，构建按自己的代价加进去。
+            let decay = (-elapsed.as_secs_f64() / PSI_AVG60_WINDOW_SECONDS).exp();
+            io = ambient + (io - ambient) * decay + cost * n as f64 * (1.0 - decay);
+            let load = HostLoad {
+                pressure: Pressure {
+                    cpu_avg10: 0.0,
+                    cpu_avg60: 0.0,
+                    io_avg10: 0.0,
+                    io_avg60: io,
+                    mem_avg10: 0.0,
+                    mem_avg60: 0.0,
+                    mem_available_bytes: 64 * 1024 * 1024 * 1024,
+                    builds_in_flight: n,
+                },
+                busy_cores: 0.0,
+                cores: 24,
+                budget: None,
+                disk_free_bytes: Some(1 << 40),
+                tuning: shipped(),
+                per_build_io: Some(cost),
+                occupancy_avg60: occupancy,
+            };
+            answers.push(load.ceiling());
+        }
+        for (window, answer) in answers.iter().enumerate() {
+            assert_eq!(
+                *answer,
+                answers[0],
+                "第 {window} 拍（在飞 {} 条）答的和第一拍不是同一台机器",
+                [0usize, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0][window]
+            );
+        }
     }
 
     /// The ceiling and the per-dimension readings are one sample: whatever the
@@ -5172,6 +5358,7 @@ mod tests {
             disk_free_bytes: Some(1 << 40),
             tuning: shipped(),
             per_build_io: None,
+            occupancy_avg60: 0.0,
         };
         let plenty = 64 * 1024 * 1024 * 1024;
         for (busy, io, mem) in [
@@ -5342,6 +5529,7 @@ mod tests {
             disk_free_bytes: None,
             tuning: shipped(),
             per_build_io: None,
+            occupancy_avg60: 0.0,
         };
         // One build per core the host could run, and then some: a limit this
         // roomy is above the cpu dimension's own answer, so the container is not
@@ -5615,6 +5803,7 @@ unevictable 28532736
             disk_free_bytes: None,
             tuning: shipped(),
             per_build_io: None,
+            occupancy_avg60: 0.0,
         };
         assert!(quiet.is_calm(), "a quiet host is calm");
 
@@ -7019,6 +7208,7 @@ unevictable 28532736
             disk_free_bytes: Some(1 << 40),
             tuning: shipped(),
             per_build_io: None,
+            occupancy_avg60: 0.0,
         };
         let base = baseline();
         let base_ceiling = base.ceiling();
