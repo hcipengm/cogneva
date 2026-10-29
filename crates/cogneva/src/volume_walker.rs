@@ -159,14 +159,9 @@ pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use crate::test_support::scrape;
-    use std::path::PathBuf;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cog-volwalker-{}-{}", name, std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> cog_test_support::ScratchDir {
+        cog_test_support::ScratchDir::new(&format!("volwalker-{name}"))
     }
 
     /// The point of the mode: the number it publishes is the bytes on the disk,

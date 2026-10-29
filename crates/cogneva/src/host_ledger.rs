@@ -160,12 +160,8 @@ mod tests {
     use crate::test_support::scrape;
     use std::path::Path;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cog-ledger-mode-{}-{}", name, std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> cog_test_support::ScratchDir {
+        cog_test_support::ScratchDir::new(&format!("ledger-mode-{name}"))
     }
 
     fn write_slice(root: &Path, slice: &str, stat: &str) {
@@ -199,7 +195,7 @@ mod tests {
         write_slice(&root, "user.slice", "anon 1024\nfile 2048\n");
         write_slice(&root, "system.slice", "anon 4096\nfile 8192\n");
 
-        let app = router(Arc::new(HostLedgerObservable::new(&root, "node-a")));
+        let app = router(Arc::new(HostLedgerObservable::new(root.path(), "node-a")));
         let (status, body) = scrape(app, "/metrics").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
@@ -235,8 +231,9 @@ mod tests {
     /// three zeroes and a different one from the node being gone.
     #[tokio::test]
     async fn an_unmounted_root_serves_a_live_but_empty_endpoint() {
+        let root = scratch("unmounted");
         let app = router(Arc::new(HostLedgerObservable::new(
-            scratch("unmounted").join("not-a-cgroup-root"),
+            root.join("not-a-cgroup-root"),
             "node-a",
         )));
         for path in ["/health/live", "/health/ready"] {

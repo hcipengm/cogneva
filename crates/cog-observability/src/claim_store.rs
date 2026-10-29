@@ -536,12 +536,8 @@ mod tests {
 
     const NODE: &str = "node-a";
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cog-claim-store-{}-{}", name, std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> cog_test_support::ScratchDir {
+        cog_test_support::ScratchDir::new(&format!("claim-store-{name}"))
     }
 
     /// `pvc-<uid>_<namespace>_<claim>`, with a uid shaped like a real one.

@@ -422,12 +422,8 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cog-claim-mode-{}-{}", name, std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> cog_test_support::ScratchDir {
+        cog_test_support::ScratchDir::new(&format!("claim-mode-{name}"))
     }
 
     fn claim_dir(root: &Path, namespace: &str, claim: &str) -> PathBuf {
@@ -439,8 +435,11 @@ mod tests {
     }
 
     fn empty_images() -> Vec<Arc<ImageStoreObservable>> {
+        // The path names a child that must not exist; whether the scratch parent
+        // outlives this call makes no difference to the reading it produces.
+        let root = scratch("no-images");
         vec![Arc::new(ImageStoreObservable::new(
-            scratch("no-images").join("absent"),
+            root.join("absent"),
             "node-a",
             image_store::DEFAULT_STORE,
         ))]
@@ -557,7 +556,7 @@ mod tests {
         )
         .unwrap();
 
-        let observable = Arc::new(ClaimStoreObservable::new(&root, "node-a"));
+        let observable = Arc::new(ClaimStoreObservable::new(root.path(), "node-a"));
         observable.scan();
         let app = served(observable, empty_images());
 
@@ -598,10 +597,10 @@ mod tests {
         )
         .unwrap();
 
-        let observable = Arc::new(ClaimStoreObservable::new(&root, "node-a"));
+        let observable = Arc::new(ClaimStoreObservable::new(root.path(), "node-a"));
         observable.scan();
         let images = Arc::new(ImageStoreObservable::new(
-            &images_root,
+            images_root.path(),
             "node-a",
             image_store::DEFAULT_STORE,
         ));
@@ -638,7 +637,7 @@ mod tests {
         fs::write(images_root.join("snap").join("blob"), vec![0u8; 512]).unwrap();
 
         let images = Arc::new(ImageStoreObservable::new(
-            &images_root,
+            images_root.path(),
             "node-a",
             image_store::DEFAULT_STORE,
         ));
@@ -648,7 +647,7 @@ mod tests {
             "the listing must name the store's parts"
         );
         let app = served(
-            Arc::new(ClaimStoreObservable::new(&root, "node-a")),
+            Arc::new(ClaimStoreObservable::new(root.path(), "node-a")),
             vec![images],
         );
 
@@ -689,7 +688,7 @@ mod tests {
         let root = scratch("before-first-sweep");
         let first_sweep = Arc::new(AtomicBool::new(false));
         let app = router(
-            Arc::new(ClaimStoreObservable::new(&root, "node-a")),
+            Arc::new(ClaimStoreObservable::new(root.path(), "node-a")),
             empty_images(),
             Arc::clone(&first_sweep),
         );
@@ -726,7 +725,8 @@ mod tests {
     /// scanner could not read is not mistaken for a node with no claims.
     #[tokio::test]
     async fn an_unmounted_root_serves_a_live_endpoint_that_says_it_saw_nothing() {
-        let missing = scratch("unmounted").join("not-a-storage-root");
+        let root = scratch("unmounted");
+        let missing = root.join("not-a-storage-root");
         let app = served(
             Arc::new(ClaimStoreObservable::new(missing, "node-a")),
             empty_images(),

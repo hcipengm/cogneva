@@ -535,12 +535,8 @@ mod tests {
     const NODE: &str = "node-a";
     const STORE: &str = "containerd";
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("cog-image-store-{}-{}", name, std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> cog_test_support::ScratchDir {
+        cog_test_support::ScratchDir::new(&format!("image-store-{name}"))
     }
 
     async fn readings(observable: &ImageStoreObservable) -> Vec<RawMetric> {
@@ -577,7 +573,7 @@ mod tests {
             8192,
         );
 
-        let observable = ImageStoreObservable::new(&root, NODE, STORE);
+        let observable = ImageStoreObservable::new(root.path(), NODE, STORE);
         assert_eq!(
             observable.scan(),
             Scan::Completed(ScanReport {
@@ -619,7 +615,7 @@ mod tests {
         write(&root.join("content").join("blob"), 4096);
         write(&root.join("snapshots").join("1").join("fs"), 8192);
 
-        let observable = ImageStoreObservable::new(&root, NODE, STORE);
+        let observable = ImageStoreObservable::new(root.path(), NODE, STORE);
         assert_eq!(observable.enumerate(), Listing::Listed(2));
 
         let out = readings(&observable).await;
@@ -645,7 +641,8 @@ mod tests {
     /// is the unreadable-root reading -- so this one keeps publishing it.
     #[tokio::test]
     async fn an_unlistable_store_still_publishes_withheld_coverage_as_zero() {
-        let observable = ImageStoreObservable::new(scratch("unlistable").join("nope"), NODE, STORE);
+        let root = scratch("unlistable");
+        let observable = ImageStoreObservable::new(root.join("nope"), NODE, STORE);
         assert_eq!(observable.enumerate(), Listing::RootUnreadable);
         assert!(
             value_of(&readings(&observable).await, PARTS_METRIC, None).is_none(),
@@ -664,7 +661,7 @@ mod tests {
     async fn a_retired_part_stops_being_reported() {
         let root = scratch("retire");
         write(&root.join("content").join("blob"), 1024);
-        let observable = ImageStoreObservable::new(&root, NODE, STORE);
+        let observable = ImageStoreObservable::new(root.path(), NODE, STORE);
         observable.scan();
         assert_eq!(
             value_of(&readings(&observable).await, BYTES_METRIC, Some("content")),
@@ -683,7 +680,8 @@ mod tests {
     /// from process start so a scanner that never walked is on the stale rule.
     #[tokio::test]
     async fn an_unreadable_root_publishes_coverage_and_no_size() {
-        let observable = ImageStoreObservable::new(scratch("missing").join("nope"), NODE, STORE);
+        let root = scratch("missing");
+        let observable = ImageStoreObservable::new(root.join("nope"), NODE, STORE);
         assert_eq!(observable.scan(), Scan::RootUnreadable);
         let out = readings(&observable).await;
         assert!(value_of(&out, BYTES_METRIC, None).is_none());
@@ -748,7 +746,7 @@ mod tests {
         )
         .unwrap();
 
-        let observable = ImageStoreObservable::new(&root, NODE, STORE);
+        let observable = ImageStoreObservable::new(root.path(), NODE, STORE);
         observable.scan();
         assert_eq!(
             value_of(&readings(&observable).await, BYTES_METRIC, Some("snap")),
@@ -777,7 +775,7 @@ mod tests {
                 );
             }
         }
-        let observable = Arc::new(ImageStoreObservable::new(&root, NODE, STORE));
+        let observable = Arc::new(ImageStoreObservable::new(root.path(), NODE, STORE));
 
         let started = std::time::Instant::now();
         observable.scan();
@@ -806,7 +804,7 @@ mod tests {
     async fn a_plain_file_at_the_top_is_measured_by_its_own_size() {
         let root = scratch("file");
         write(&root.join("io.containerd.metadata.v1.bolt"), 2048);
-        let observable = ImageStoreObservable::new(&root, NODE, STORE);
+        let observable = ImageStoreObservable::new(root.path(), NODE, STORE);
         assert_eq!(
             observable.scan(),
             Scan::Completed(ScanReport {
@@ -838,8 +836,8 @@ mod tests {
         write(&containerd.join("overlay").join("blob"), 1024);
         write(&buildah.join("overlay").join("blob"), 4096);
 
-        let first = ImageStoreObservable::new(&containerd, NODE, "containerd");
-        let second = ImageStoreObservable::new(&buildah, NODE, "buildah");
+        let first = ImageStoreObservable::new(containerd.path(), NODE, "containerd");
+        let second = ImageStoreObservable::new(buildah.path(), NODE, "buildah");
         first.scan();
         second.scan();
 

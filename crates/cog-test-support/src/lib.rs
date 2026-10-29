@@ -9,6 +9,8 @@
 //! 判据在 `crates/cogneva/tests/the_fixture_reading_steps_are_written_once_test.rs`：
 //! 这份文件里定义过的函数体，不许在任何一份夹具里再出现一遍。
 
+use std::path::{Path, PathBuf};
+
 use sqlx::Connection as _;
 
 mod backends;
@@ -46,6 +48,73 @@ pub fn redis_url() -> String {
 pub fn redis_url_required() -> String {
     std::env::var(REDIS_URL_ENV)
         .expect("set COGNEVA_TEST_REDIS_URL to a throwaway Redis before running this test")
+}
+
+/// 一块用完就自己消失的临时目录。
+///
+/// 名字由 `label` 与本次的进程号拼成，所以并行跑的用例不会踩到彼此的路径；也正因为
+/// 名字里带着进程号，进程退出之后没有任何东西会回来收拾它——一次全量单测会给每个
+/// 用到它的用例留下一份几十兆的副本，而单测、构建和集群在这台机器上共用同一块盘。
+/// 所以清理挂在 `Drop` 上：作用域结束就删，用例 panic 也删，不靠谁记得收尾。
+///
+/// `label` 由调用方说，它只决定目录名的前半截。同一次运行里两处用同一个 `label` 会
+/// 落到同一个路径上（先建的被后建的覆盖），所以它要带上用例自己的名字。
+pub struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    /// 建目录。同名旧目录先删掉：上一轮若是被 SIGKILL 打断、`Drop` 没跑成，留着的那份
+    /// 会让本轮读到上一轮写进去的字节。
+    pub fn new(label: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("cog-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("the scratch dir is creatable");
+        Self(dir)
+    }
+
+    /// 目录本身，离开作用域之前一直存在。
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for ScratchDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        // 删不掉不算失败：用例的结论说的是被测代码，不是收尾时磁盘上还剩什么。
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod scratch_dir_tests {
+    use super::ScratchDir;
+
+    /// 目录活着的时候能用，出了作用域什么都不留。
+    ///
+    /// 判的是 `Drop` 上真的挂了清理。这个类型存在的全部理由就是「没人回来收拾的那一份
+    /// 要被收拾掉」，而把清理删掉、或者退回成返回一个 `PathBuf`，用例照样全绿——绿的是
+    /// 被测模块，漏的是每个用例几十兆的残留，而残留只有下一轮扫盘时才会显形。
+    #[test]
+    fn a_scratch_dir_leaves_nothing_behind_when_it_goes_out_of_scope() {
+        let path;
+        {
+            let dir = ScratchDir::new("scratch-dir-contract");
+            std::fs::write(dir.path().join("payload"), b"x").expect("the payload is written");
+            assert!(
+                dir.join("payload").is_file(),
+                "the dir is usable while it is alive"
+            );
+            path = dir.path().to_path_buf();
+        }
+        assert!(!path.exists(), "{} survived its scope", path.display());
+    }
 }
 
 /// 一次用例独占的那个 schema：名字由 `label` 加上本次的进程号与纳秒数拼成。
