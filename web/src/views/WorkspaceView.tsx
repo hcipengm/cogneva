@@ -7,7 +7,7 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { getProcessOverview } from '@/api/client';
 import { CanvasStage } from '@/canvas/CanvasStage';
-import { callsignOf } from '@/conversation/callsign';
+import { conversationNames } from '@/conversation/callsign';
 import { ConversationPane } from '@/conversation/ConversationPane';
 import { goalLiveIndex } from '@/conversation/dispatch';
 import { useResource } from '@/hooks/useResource';
@@ -134,6 +134,10 @@ export function WorkspaceView() {
     [order.length, size.height, size.width]
   );
 
+  // 名字由这一层统一分配：同时开着哪几段决定谁叫什么，单独一格算不出来。
+  const names = useMemo(() => conversationNames(order), [order]);
+  const nameOf = (id: string) => names.get(id) ?? id;
+
   const tabMode = mode === 'tabs';
   // 标签页模式只画当前这一段；没有当前（刚关掉最后一段又还没建新的）时退到第一段。
   const currentId = active && order.includes(active) ? active : order[0];
@@ -211,7 +215,7 @@ export function WorkspaceView() {
                       style={{ color: current ? 'var(--paper)' : 'var(--muted)' }}
                       title={sessions[id]?.title ?? id}
                     >
-                      <span className="mono">{callsignOf(id)}</span>
+                      <span className="mono">{nameOf(id)}</span>
                       <span className="max-w-[18ch] truncate text-[var(--paper-dim)]">
                         {sessions[id]?.title ?? ''}
                       </span>
@@ -220,7 +224,7 @@ export function WorkspaceView() {
                       <button
                         type="button"
                         onClick={() => closeSession(id)}
-                        aria-label={`关掉 ${callsignOf(id)}`}
+                        aria-label={`关掉 ${nameOf(id)}`}
                         className="mr-1 flex h-5 w-5 items-center justify-center text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--danger)]"
                       >
                         ×
@@ -238,6 +242,7 @@ export function WorkspaceView() {
                 <ConversationPane
                   key={id}
                   sessionId={id}
+                  name={nameOf(id)}
                   active
                   onFocus={() => setActive(id)}
                   onClose={() => closeSession(id)}
@@ -260,6 +265,7 @@ export function WorkspaceView() {
                 <ConversationPane
                   key={id}
                   sessionId={id}
+                  name={nameOf(id)}
                   active={id === active}
                   onFocus={() => setActive(id)}
                   onClose={() => closeSession(id)}

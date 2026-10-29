@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch';
-import { callsignOf } from '@/conversation/callsign';
 import type { StreamClient } from '@/hooks/useEventStream';
 import { sessionKind, useChatStore, type ChatMessage, type ChatSession } from '@/store/chatStore';
 import { useStreamStore, type ToolCallRecord } from '@/store/streamStore';
@@ -231,6 +230,11 @@ function KindBadge({ session, live }: { session: ChatSession; live: GoalLive[] }
 
 export interface ConversationPaneProps {
   sessionId: string;
+  /**
+   * 这一段对话的叫法。由工作台统一分配——同时开着哪几段决定谁叫什么，
+   * 单独一格算不出「和邻居不重名」这件事。
+   */
+  name: string;
   active: boolean;
   onFocus: () => void;
   onClose: () => void;
@@ -254,6 +258,7 @@ export interface ConversationPaneProps {
 
 export function ConversationPane({
   sessionId,
+  name,
   active,
   onFocus,
   onClose,
@@ -387,7 +392,7 @@ export function ConversationPane({
       style={{
         borderLeft: active ? '1px solid var(--line-strong)' : '1px solid transparent',
       }}
-      aria-label={`对话 ${callsignOf(session.id)}`}
+      aria-label={`对话 ${name}`}
     >
       <header className="flex shrink-0 items-center gap-2 px-4 pt-3 pb-2">
         <span
@@ -399,12 +404,11 @@ export function ConversationPane({
           }}
         />
         {/*
-          三行都写「新的对话」时没法指认谁是谁。叫法是这段对话自己的名字，从会话
-          id 折出来——刷新之后还是同一个，换一台机器打开也是同一个；后面那截才是
-          这次聊的内容。
+          三行都写「新的对话」时没法指认谁是谁。名字由工作台统一分给这一段，所以
+          同时开着的几段不会重名；后面那截才是这次聊的内容。
         */}
         <span className="mono shrink-0 text-[12px] font-medium" style={{ color: 'var(--brass)' }}>
-          {callsignOf(session.id)}
+          {name}
         </span>
         <h2 className="truncate text-[12px] text-[var(--paper-dim)]" title={session.id}>
           {session.title}
