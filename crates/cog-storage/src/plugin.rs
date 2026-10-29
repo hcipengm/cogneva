@@ -1173,7 +1173,46 @@ impl cog_core::SystemPlugin for StoragePlugin {
             "StoragePlugin object backend published (provider={})",
             storage_provider_config.provider
         );
-        ctx.publish_service(object_backend);
+        ctx.publish_service(object_backend.clone());
+
+        // ── 数据库健康 ──
+        // 报健康的进程（网关）不持有连接池：池是这一侧的资产。这里给出一个只回答
+        // 「还答不答」的入口，探针按 `cog_core::DatabaseHealth` 问。
+        if let Some(pool) = self.pg_pool.clone() {
+            let health: Arc<dyn cog_core::DatabaseHealth> =
+                Arc::new(crate::postgres::PgDatabaseHealth::new(pool));
+            ctx.publish_service(health);
+        }
+
+        // ── Conversations and datasets ──
+        // 三样东西同一个形状：网关要写要读、SQL 在本 crate、库只在这个进程里连。
+        // 一律发布成服务，调用方按 `cog_core` 的契约问——否则每个想读一句对话的
+        // 进程都得为了两张表认识这个 crate 的池与实现。
+        if let Some(pool) = self.pg_pool.clone() {
+            let turns: Arc<dyn cog_core::ChatTurnStore> =
+                Arc::new(crate::PostgresChatTurnStore::new(pool.clone()));
+            ctx.publish_service(turns);
+            let conversation: Arc<dyn cog_core::AgentMessageStore> =
+                Arc::new(crate::PostgresAgentMessageStore::new(pool.clone()));
+            ctx.publish_service(conversation);
+            let catalog: Arc<dyn crate::postgres::DatasetCatalog> =
+                Arc::new(crate::PostgresDatasetCatalog::new(pool));
+            let datasets: Arc<dyn cog_core::DatasetStore> =
+                Arc::new(crate::ObjectDatasetStore::new(object_backend, catalog));
+            ctx.publish_service(datasets);
+            info!("StoragePlugin chat transcript, agent conversation and dataset store published");
+        } else if strict_persistence {
+            return Err(cog_core::SFError::Config(
+                "No PostgreSQL pool for chat transcripts, agent conversations or datasets \
+                 (strict_persistence=true)"
+                    .into(),
+            ));
+        } else {
+            warn!(
+                "No PostgreSQL pool; chat transcripts, agent conversations and datasets are \
+                 unavailable"
+            );
+        }
 
         // ── Roles contended over the shared database ──
         // The loops that must happen once per deployment rather than once per

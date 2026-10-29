@@ -88,7 +88,9 @@ pub struct BackendHealthProbe {
     /// "this deployment has none" rather than "the one it has is down": the two
     /// have different answers, and only the second is a fault.
     pub key_value: Option<Arc<dyn cog_core::KeyValueStore>>,
-    pub pg_pool: Option<sqlx::PgPool>,
+    /// 数据库的健康入口，由持有连接池的 crate 发布。缺席即「这套部署没有库」，
+    /// 与「库挂了」是两件事，只有后者算故障。
+    pub database: Option<Arc<dyn cog_core::DatabaseHealth>>,
     pub nats_url: Option<String>,
     pub memory_backend: Option<Arc<dyn cog_core::MemoryBackend>>,
 }
@@ -124,9 +126,9 @@ impl BackendHealthProbe {
             error: redis_error,
         });
 
-        if let Some(ref pool) = self.pg_pool {
+        if let Some(ref database) = self.database {
             let pg_start = std::time::Instant::now();
-            let (pg_state, pg_error) = outcome(sqlx::query("SELECT 1").fetch_one(pool).await);
+            let (pg_state, pg_error) = outcome(database.ping().await);
             if pg_state == BackendState::Down {
                 overall = BackendState::Degraded;
             }

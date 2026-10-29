@@ -367,6 +367,17 @@ impl DatabaseEndpoint {
     }
 }
 
+/// 一句话问「这个库现在还答不答」。
+///
+/// 健康矩阵要报 postgres 的生死，而它不该持有一个连接池——池是落库那一侧的
+/// 资产，报健康的那一侧只需要一个能回答是或否的入口。实现留在拥有数据库的
+/// crate，探针按契约问。
+#[async_trait::async_trait]
+pub trait DatabaseHealth: Send + Sync {
+    /// One round trip to the database. `Err` means it did not answer.
+    async fn ping(&self) -> SFResult<()>;
+}
+
 /// Runtime object-storage abstraction for large blobs (files, snapshots, raw sources).
 /// Implementations: Memory (testing), FileSystem (local dev), S3/SeaweedFS (production).
 #[async_trait]

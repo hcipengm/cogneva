@@ -5,8 +5,8 @@
 //! 问的都是**按资源**取的一段历史，而哈希链是按顺序取的一整条——它证明历史没被动过，
 //! 不回答「这一张的改动」。
 //!
-//! 所以这里是一个出口、一个落点：`audit_logs` 表（写者与读者在
-//! `cog_storage::postgres::project_audit_log`）。出口做成进程级单例而不是
+//! 所以这里是一个出口、一个落点：`audit_logs` 表（契约是
+//! `cog_core::ProjectAuditLog`，实现落在拥有那张表的 crate 里）。出口做成进程级单例而不是
 //! `GatewayState` 的一个槽：那个结构每加一格，五个测试夹具与生产装配都要跟着改一遍，
 //! 而漏掉的那一处不会报错——它会让审计安静地不写。这里的接线在网关插件里发生一次，
 //! 缺席时 [`record`] 直接把「没接上」记成一个计数，读数面上看得见。
@@ -18,7 +18,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
-use cog_storage::postgres::{AuditEntry, ProjectAuditLog};
+use cog_core::{AuditEntry, AuditRow, ProjectAuditLog};
 use tracing::warn;
 
 /// 装好的那个写者。`None` 是「这个进程没接上审计存储」，与「接上了但一条没写」不同。
@@ -111,10 +111,7 @@ pub async fn record(entry: AuditEntry) {
 /// `Err` 是「有存储但这次没读出来」，`Ok(Some(空))` 是「读了，这个项目没有改动」。
 /// 把中间那种塌进第一种，界面就会在一次数据库抖动之后对客户说「这台部署没有审计」——
 /// 一句关于部署的假话，而它恰好是最难被客户反驳的那类：他看不到库。
-pub async fn recent(
-    project_id: &str,
-    limit: i64,
-) -> Result<Option<Vec<cog_storage::postgres::AuditRow>>, String> {
+pub async fn recent(project_id: &str, limit: i64) -> Result<Option<Vec<AuditRow>>, String> {
     let Some(sink) = sink() else {
         return Ok(None);
     };
@@ -150,7 +147,7 @@ mod tests {
             &self,
             _project_id: &str,
             _limit: i64,
-        ) -> cog_core::SFResult<Vec<cog_storage::postgres::AuditRow>> {
+        ) -> cog_core::SFResult<Vec<AuditRow>> {
             // 读的那一半也跟着 `fail` 走：一个只会写失败、读永远成功的夹具，
             // 恰好盖住「读失败被报成没有审计」这个最贵的错。
             if self.fail {

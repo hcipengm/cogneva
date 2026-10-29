@@ -15,118 +15,13 @@
 //! would otherwise see half a dialogue.
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Row};
 
 use cog_core::{SFError, SFResult};
 
-/// Rows kept per receiving peer, so a chatty sender cannot grow the table
-/// without bound. Larger than what a panel shows at once, because how far back
-/// a reader can scroll and what fits on one screen answer different questions.
-pub const ROWS_KEPT_PER_PEER: i64 = 500;
-
-/// The settled shape of one send.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SendOutcome {
-    /// Delivered; no answer was asked for.
-    Queued,
-    /// Delivered, and the agent answered within the wait.
-    Replied,
-    /// Delivered, and no answer arrived within the wait the caller asked for.
-    TimedOut,
-    /// Refused before delivery: the name holds nothing live, the body was
-    /// malformed, or the deployment could not deliver it.
-    Refused,
-    /// Delivery or the reply stream broke after the command was accepted.
-    Failed,
-}
-
-impl SendOutcome {
-    /// Every outcome this vocabulary has, in the order a reader should see
-    /// them. The column's check constraint, [`Self::parse`] and the panel's
-    /// label map are all derived from this rather than spelling the words
-    /// again — a variant added to `as_str` alone would be a row this build
-    /// writes and cannot read back.
-    pub const ALL: [SendOutcome; 5] = [
-        SendOutcome::Queued,
-        SendOutcome::Replied,
-        SendOutcome::TimedOut,
-        SendOutcome::Refused,
-        SendOutcome::Failed,
-    ];
-
-    /// The spelling the column's check constraint holds.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SendOutcome::Queued => "queued",
-            SendOutcome::Replied => "replied",
-            SendOutcome::TimedOut => "timed_out",
-            SendOutcome::Refused => "refused",
-            SendOutcome::Failed => "failed",
-        }
-    }
-
-    /// Read one back. A value outside the set is not an outcome this build can
-    /// name; the reader reports it rather than folding it into one of these.
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|outcome| outcome.as_str() == value)
-    }
-}
-
-/// One line of a conversation, as stored. Oldest first when returned by
-/// [`AgentMessageStore::conversation`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentMessage {
-    pub id: i64,
-    pub from_unit: String,
-    pub to_unit: String,
-    pub kind: String,
-    pub body: String,
-    pub outcome: SendOutcome,
-    /// What the agent answered, for a `replied` row and only that one.
-    pub reply: Option<String>,
-    /// Why it did not answer, for `timed_out` / `refused` / `failed`. Kept
-    /// apart from `reply` so a reader can never mistake an error for something
-    /// the agent said.
-    pub outcome_detail: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
-/// What a caller hands the store to record one send.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NewAgentMessage<'a> {
-    /// The name that sent it. The WebUI speaks as itself rather than inventing
-    /// a unit name: an owner reading the transcript must be able to tell their
-    /// own words from an agent's.
-    pub from_unit: &'a str,
-    pub to_unit: &'a str,
-    pub kind: &'a str,
-    pub body: &'a str,
-    pub outcome: SendOutcome,
-    pub reply: Option<&'a str>,
-    pub outcome_detail: Option<&'a str>,
-}
-
-/// The conversation's two operations.
-///
-/// A trait rather than the concrete store because the gateway must keep
-/// delivering when no database is reachable: the send goes through, the
-/// transcript is simply not written, and a test can hold a conversation without
-/// a server.
-#[async_trait]
-pub trait AgentMessageStore: Send + Sync {
-    /// Record one send whose outcome is already settled.
-    async fn record(&self, message: &NewAgentMessage<'_>) -> SFResult<()>;
-
-    /// The last `limit` lines of a peer's conversation, oldest first.
-    ///
-    /// Both directions: an exchange belongs to the history of both parties.
-    /// Empty for a peer nobody has addressed, and empty for a limit of zero
-    /// rather than the whole table.
-    async fn conversation(&self, peer: &str, limit: usize) -> SFResult<Vec<AgentMessage>>;
-}
+pub use cog_core::contract::conversation::{
+    AgentMessage, AgentMessageStore, NewAgentMessage, SendOutcome, ROWS_KEPT_PER_PEER,
+};
 
 /// PostgreSQL conversation store.
 pub struct PostgresAgentMessageStore {

@@ -1546,7 +1546,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "cog-core",
- "cog-storage",
  "ed25519-dalek",
  "futures",
  "hex",

@@ -345,8 +345,8 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    fn audited_gate(enabled: bool) -> (AuditedGate, Arc<cog_storage::mem::MemoryMetricsBackend>) {
-        let metrics = Arc::new(cog_storage::mem::MemoryMetricsBackend::new());
+    fn audited_gate(enabled: bool) -> (AuditedGate, Arc<crate::test_metrics::TestMetrics>) {
+        let metrics = Arc::new(crate::test_metrics::TestMetrics::new());
         (
             AuditedGate::new(enabled, DEFAULT_MAX_AUDITED_BODY_BYTES, metrics.clone()),
             metrics,
@@ -507,7 +507,7 @@ mod tests {
 
         /// Current value of one `outcome` cell; None when absent.
         async fn cell(
-            metrics: &Arc<cog_storage::mem::MemoryMetricsBackend>,
+            metrics: &Arc<crate::test_metrics::TestMetrics>,
             outcome: &str,
         ) -> Option<f64> {
             metrics
@@ -587,7 +587,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_body_too_large_to_audit_is_refused() {
-            let metrics = Arc::new(cog_storage::mem::MemoryMetricsBackend::new());
+            let metrics = Arc::new(crate::test_metrics::TestMetrics::new());
             // The bound is turned down to something one call can exceed: this branch
             // judges "what cannot be audited is not released", which is independent of
             // the bound's value, so the test gives it a small one.
@@ -652,9 +652,7 @@ mod tests {
         /// "this request recorded nothing". Both are defects of the judgement
         /// surface, so this asserts "exactly one" instead of just looking at the
         /// cell it wants.
-        async fn sole_nonzero_cell(
-            metrics: &Arc<cog_storage::mem::MemoryMetricsBackend>,
-        ) -> String {
+        async fn sole_nonzero_cell(metrics: &Arc<crate::test_metrics::TestMetrics>) -> String {
             let nonzero: Vec<String> = metrics
                 .query_counter_totals(AUDITED_REQUESTS.as_str())
                 .await
@@ -684,7 +682,7 @@ mod tests {
         /// the same request put on its response.
         async fn scenario(
             gate: AuditedGate,
-            metrics: &Arc<cog_storage::mem::MemoryMetricsBackend>,
+            metrics: &Arc<crate::test_metrics::TestMetrics>,
             body: Body,
         ) -> (String, Option<String>) {
             let (_status, named, _body) = call_with_cell(app(gate), body).await;
@@ -767,7 +765,7 @@ mod tests {
             seen.insert(counted);
 
             // Open + over the bound (turned down to 4 bytes)
-            let metrics = Arc::new(cog_storage::mem::MemoryMetricsBackend::new());
+            let metrics = Arc::new(crate::test_metrics::TestMetrics::new());
             let gate = AuditedGate::new(true, 4, metrics.clone());
             gate.publish_vocabulary().await;
             let (counted, named) = scenario(

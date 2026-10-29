@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use crate::GatewayState;
 use cog_core::{AgentRegistration, ResourceInfo};
-use cog_storage::{NewAgentMessage, SendOutcome};
+use cog_core::{NewAgentMessage, SendOutcome};
 
 #[derive(Debug, Deserialize)]
 pub struct RegisterRequest {
@@ -376,7 +376,7 @@ pub async fn conversation_handler(
     let limit = query
         .limit
         .unwrap_or(CONVERSATION_DEFAULT_LIMIT)
-        .min(cog_storage::ROWS_KEPT_PER_PEER as usize);
+        .min(cog_core::ROWS_KEPT_PER_PEER as usize);
     match store.conversation(&agent_id, limit).await {
         Ok(messages) => {
             let lines: Vec<MessageView> = messages.iter().map(MessageView::from).collect();
@@ -420,8 +420,8 @@ pub struct MessageView {
     pub created_at: String,
 }
 
-impl From<&cog_storage::AgentMessage> for MessageView {
-    fn from(message: &cog_storage::AgentMessage) -> Self {
+impl From<&cog_core::AgentMessage> for MessageView {
+    fn from(message: &cog_core::AgentMessage) -> Self {
         Self {
             id: message.id,
             from_unit: message.from_unit.clone(),

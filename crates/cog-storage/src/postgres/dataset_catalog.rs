@@ -21,38 +21,7 @@ use sqlx::{PgPool, Row};
 
 use cog_core::{SFError, SFResult};
 
-/// One dataset version, as the catalog holds it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DatasetEntry {
-    pub name: String,
-    pub version: String,
-    pub object_key: String,
-    pub content_sha256: String,
-    pub bytes: i64,
-    /// How many records the dataset holds, when it is tabular. Absent for a
-    /// blob: zero would say "a table with no rows", which is a different fact.
-    pub row_count: Option<i64>,
-    /// The interval the dataset covers, when it has one. Both bounds are
-    /// present together or not at all.
-    pub coverage_from: Option<DateTime<Utc>>,
-    pub coverage_to: Option<DateTime<Utc>>,
-    /// Where the bytes came from, in whatever form would let a person fetch
-    /// them again.
-    pub source: String,
-    pub media_type: Option<String>,
-    pub created_at: DateTime<Utc>,
-}
-
-impl DatasetEntry {
-    /// Whether a byte string is the one this row describes.
-    ///
-    /// Compares the digest the row recorded against one computed from the bytes
-    /// a reader actually has. Length is not a substitute: a truncated file and
-    /// a file with a hole can both keep their length.
-    pub fn describes(&self, bytes: &[u8]) -> bool {
-        self.bytes == bytes.len() as i64 && self.content_sha256 == sha256_of(bytes)
-    }
-}
+pub use cog_core::contract::dataset::{sha256_of, DatasetEntry};
 
 /// What a producer declares when it registers a version.
 ///
@@ -102,21 +71,6 @@ pub trait DatasetCatalog: Send + Sync {
     /// What a verification pass walks: after a migration the question is not
     /// "did this one dataset come across" but "did all of them".
     async fn all(&self, limit: usize) -> SFResult<Vec<DatasetEntry>>;
-}
-
-/// `sha256:<hex>` over the bytes. The algorithm name travels with the value so
-/// a row written under a later scheme is readable as "not the one you know".
-pub fn sha256_of(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(7 + 64);
-    out.push_str("sha256:");
-    for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
 }
 
 const INSERT_SQL: &str = "\

@@ -86,36 +86,21 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         let raw_log_index_store = ctx.consume_service::<dyn cog_core::RawLogIndexStore>();
         let hook_engine: Option<Arc<dyn cog_core::HookEngine>> =
             ctx.consume_service::<dyn cog_core::HookEngine>();
-        let pg_pool_explain = ctx
-            .consume::<cog_storage::ExplainPool>()
-            .and_then(|p| p.0.clone());
+        let database: Option<Arc<dyn cog_core::DatabaseHealth>> =
+            ctx.consume_service::<dyn cog_core::DatabaseHealth>();
         // 聊天记录的落点。没有这个池就是这套部署没有那个库：那一趟照样回答，只是
         // 不写下来——绝不用进程内的一张表顶替它，那正是这次改动拆掉的形状。
-        let chat_pool = ctx
-            .consume::<cog_storage::MessagesPool>()
-            .and_then(|p| p.0.clone());
-        let chat_turns: crate::ChatTurnHandle = chat_pool.as_ref().map(|pool| {
-            Arc::new(cog_storage::PostgresChatTurnStore::new(pool.clone()))
-                as Arc<dyn cog_storage::ChatTurnStore>
-        });
-        // 发给 agent 的话与它回的答案。与聊天记录同一个池，因为它本来就是「谁
-        // 说了什么」的另一种会话；没有这个池时这一趟照发，只是不写下来。
-        let agent_messages: crate::AgentMessageHandle = chat_pool.as_ref().map(|pool| {
-            Arc::new(cog_storage::PostgresAgentMessageStore::new(pool.clone()))
-                as Arc<dyn cog_storage::AgentMessageStore>
-        });
-        // 对象存储与它的目录。上传面此前拿到的是 None，于是这条路由在现网永远是
-        // 503；即便接上后端，桶里也只有字节、没有一行说它们是什么。两半都在才装：
-        // 只有目录会让恢复去取不存在的对象，只有桶则留下谁也点不到名的数据。
+        // 聊天记录、发给 agent 的话与数据集：三样都由拥有数据库的那个 crate 装配
+        // 好发布出来，本进程只按 `cog_core` 的契约取。没有发布时这一趟照常服务，
+        // 只是不写下来——那与「写失败」在读数面上是两件事，前者是装配的事。
+        let chat_turns: crate::ChatTurnHandle =
+            ctx.consume_service::<dyn cog_core::ChatTurnStore>();
+        let agent_messages: crate::AgentMessageHandle =
+            ctx.consume_service::<dyn cog_core::AgentMessageStore>();
+        let datasets: Option<Arc<dyn cog_core::DatasetStore>> =
+            ctx.consume_service::<dyn cog_core::DatasetStore>();
         let object_backend: Option<Arc<dyn cog_core::ObjectBackend>> =
             ctx.consume_service::<dyn cog_core::ObjectBackend>();
-        let datasets: Option<Arc<cog_storage::DatasetStore>> = match (&object_backend, &chat_pool) {
-            (Some(objects), Some(pool)) => Some(Arc::new(cog_storage::DatasetStore::new(
-                objects.clone(),
-                Arc::new(cog_storage::PostgresDatasetCatalog::new(pool.clone())),
-            ))),
-            _ => None,
-        };
         let hook_archive = ctx.consume_service::<dyn cog_core::HookArchive>();
         let media_backend = ctx.consume_service::<dyn cog_core::MediaBackend>();
         let shared_orchestrator: Arc<dyn cog_core::OrchestratorControl> = ctx
@@ -204,9 +189,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // 项目面写操作的审计落库。装成进程级单例而不是 `GatewayState` 的一个槽：
         // 那个结构每加一格要跟着改五处夹具，而漏掉的那一处不会报错——它会让审计
         // 安静地不写。接线只有这一处，缺席时计数里看得见。
-        if let Some(project_audit) =
-            ctx.consume_service::<dyn cog_storage::postgres::ProjectAuditLog>()
-        {
+        if let Some(project_audit) = ctx.consume_service::<dyn cog_core::ProjectAuditLog>() {
             crate::project_audit::install(project_audit);
             tracing::info!("project audit log wired");
         } else {
@@ -235,7 +218,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
 
         let backend_health_probe = crate::state_builder::init_backend_health_probe(
             config,
-            &pg_pool_explain,
+            &database,
             &memory_backend,
             &key_value,
         );

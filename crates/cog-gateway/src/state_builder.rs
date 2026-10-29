@@ -15,13 +15,13 @@ pub const SUPERVISOR_EVENT_CACHE_LOOP: &str = "gateway_supervisor_event_cache";
 /// Backend health probe.
 pub fn init_backend_health_probe(
     config: &cog_core::Config,
-    pg_pool_explain: &Option<sqlx::PgPool>,
+    database: &Option<Arc<dyn cog_core::DatabaseHealth>>,
     memory_backend: &Option<Arc<dyn cog_core::MemoryBackend>>,
     key_value: &Option<Arc<dyn cog_core::KeyValueStore>>,
 ) -> Option<Arc<crate::backend_health::BackendHealthProbe>> {
     Some(Arc::new(crate::backend_health::BackendHealthProbe {
         key_value: key_value.clone(),
-        pg_pool: pg_pool_explain.clone(),
+        database: database.clone(),
         nats_url: config.dag_executor.nats_url.clone(),
         memory_backend: memory_backend.clone(),
     }))
@@ -93,7 +93,7 @@ pub async fn build_gateway_state(
     chat_turns: &crate::ChatTurnHandle,
     agent_messages: &crate::AgentMessageHandle,
     object_backend: &Option<Arc<dyn cog_core::ObjectBackend>>,
-    datasets: &Option<Arc<cog_storage::DatasetStore>>,
+    datasets: &Option<Arc<dyn cog_core::DatasetStore>>,
     shutdown: &cog_core::ShutdownSignal,
 ) -> Result<Arc<crate::GatewayState>, Box<dyn std::error::Error>> {
     // Cache of the supervisor's event channel, filled by the drain task below.

@@ -197,12 +197,12 @@ async fn load_history(store: &crate::ChatTurnHandle, session_id: &str) -> Vec<co
 }
 
 /// 记录里的一行变成模型看得懂的一条。角色的闭集在存储面，这里只做搬运。
-fn turns_to_messages(turns: Vec<cog_storage::ChatTurn>) -> Vec<cog_core::Message> {
+fn turns_to_messages(turns: Vec<cog_core::ChatTurn>) -> Vec<cog_core::Message> {
     turns
         .into_iter()
         .map(|turn| match turn.role {
-            cog_storage::ChatTurnRole::User => cog_core::Message::user(turn.content),
-            cog_storage::ChatTurnRole::Assistant => cog_core::Message::assistant_text(turn.content),
+            cog_core::ChatTurnRole::User => cog_core::Message::user(turn.content),
+            cog_core::ChatTurnRole::Assistant => cog_core::Message::assistant_text(turn.content),
         })
         .collect()
 }
@@ -538,7 +538,7 @@ pub async fn run_chat_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_storage::ChatTurnStore;
+    use cog_core::ChatTurnStore;
 
     /// 判退落在目标行的 `Failed` 上、`submit_goal_auto` 照样返回 `Ok`——所以回报必须
     /// 读那一行，否则失败会被报成「已受理，进度见右侧」，用户去右侧只会等一个不会来的
@@ -643,12 +643,12 @@ mod tests {
         assert_eq!(
             held,
             vec![
-                cog_storage::ChatTurn {
-                    role: cog_storage::ChatTurnRole::User,
+                cog_core::ChatTurn {
+                    role: cog_core::ChatTurnRole::User,
                     content: "问".into()
                 },
-                cog_storage::ChatTurn {
-                    role: cog_storage::ChatTurnRole::Assistant,
+                cog_core::ChatTurn {
+                    role: cog_core::ChatTurnRole::Assistant,
                     content: "答".into()
                 },
             ]
@@ -729,7 +729,7 @@ mod tests {
     /// 正是那样一张表。
     #[derive(Default)]
     struct FakeTurns {
-        turns: tokio::sync::Mutex<Vec<cog_storage::ChatTurn>>,
+        turns: tokio::sync::Mutex<Vec<cog_core::ChatTurn>>,
         /// 有问无答的那几轮：留在记录里，但不进上下文（`history` 不返回它们）。
         unanswered: tokio::sync::Mutex<Vec<(String, String)>>,
         /// 交出去的那几轮与它们的目标：(问句, goal_id)。
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl cog_storage::ChatTurnStore for FakeTurns {
+    impl cog_core::ChatTurnStore for FakeTurns {
         async fn record_turn(
             &self,
             session_id: &str,
@@ -753,12 +753,12 @@ mod tests {
             if session_id != "s1" {
                 return Ok(());
             }
-            held.push(cog_storage::ChatTurn {
-                role: cog_storage::ChatTurnRole::User,
+            held.push(cog_core::ChatTurn {
+                role: cog_core::ChatTurnRole::User,
                 content: user.to_string(),
             });
-            held.push(cog_storage::ChatTurn {
-                role: cog_storage::ChatTurnRole::Assistant,
+            held.push(cog_core::ChatTurn {
+                role: cog_core::ChatTurnRole::Assistant,
                 content: assistant.to_string(),
             });
             Ok(())
@@ -778,12 +778,12 @@ mod tests {
                 return Ok(());
             }
             let mut held = self.turns.lock().await;
-            held.push(cog_storage::ChatTurn {
-                role: cog_storage::ChatTurnRole::User,
+            held.push(cog_core::ChatTurn {
+                role: cog_core::ChatTurnRole::User,
                 content: user.to_string(),
             });
-            held.push(cog_storage::ChatTurn {
-                role: cog_storage::ChatTurnRole::Assistant,
+            held.push(cog_core::ChatTurn {
+                role: cog_core::ChatTurnRole::Assistant,
                 content: assistant.to_string(),
             });
             self.dispatched
@@ -816,7 +816,7 @@ mod tests {
             &self,
             _session_id: &str,
             limit: usize,
-        ) -> cog_core::SFResult<Vec<cog_storage::ChatTurn>> {
+        ) -> cog_core::SFResult<Vec<cog_core::ChatTurn>> {
             *self.last_limit.lock().await = Some(limit);
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(cog_core::SFError::Database("unreachable".into()));
@@ -831,7 +831,7 @@ mod tests {
             &self,
             _session_id: &str,
             limit: usize,
-        ) -> cog_core::SFResult<Vec<cog_storage::ChatTurnRecord>> {
+        ) -> cog_core::SFResult<Vec<cog_core::ChatTurnRecord>> {
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(cog_core::SFError::Database("unreachable".into()));
             }
@@ -843,7 +843,7 @@ mod tests {
             Ok(turns[start..]
                 .iter()
                 .enumerate()
-                .map(|(offset, turn)| cog_storage::ChatTurnRecord {
+                .map(|(offset, turn)| cog_core::ChatTurnRecord {
                     id: (start + offset) as i64 + 1,
                     role: turn.role,
                     content: turn.content.clone(),

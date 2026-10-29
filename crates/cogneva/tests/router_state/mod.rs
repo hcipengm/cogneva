@@ -141,7 +141,7 @@ pub fn stateless() -> Arc<GatewayState> {
 /// that only route a request should not have to name a store they never touch,
 /// and a suite that does touch one should be visible in its first line.
 pub fn stateless_with_datasets(
-    datasets: Option<Arc<cog_storage::DatasetStore>>,
+    datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
 ) -> Arc<GatewayState> {
     build(datasets, None, None, None, None, "/tmp".into())
 }
@@ -200,7 +200,7 @@ pub fn with_eval_service(
 }
 
 fn build(
-    datasets: Option<Arc<cog_storage::DatasetStore>>,
+    datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,
     agent_registry: Option<Arc<dyn cog_core::AgentRegistry>>,
     agent_messages: Option<Arc<dyn cog_storage::AgentMessageStore>>,

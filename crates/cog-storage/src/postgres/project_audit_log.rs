@@ -16,8 +16,9 @@
 //! 只有下一次审计才会发现。
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+
+pub use cog_core::contract::project_audit::{AuditEntry, AuditRow, ProjectAuditLog};
 
 /// `users.id` 是 UUID 列；把 `system` 这类非 UUID 身份绑上去会让整条语句失败，
 /// 而失败的是「查人」那一半，不该连「做过什么」一起丢。
@@ -34,48 +35,6 @@ pub const DDL: &str = r#"
     CREATE INDEX IF NOT EXISTS idx_audit_logs_project
         ON audit_logs ((details->>'project_id'));
 "#;
-
-/// 一次写操作留下的那一行。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditEntry {
-    /// 谁。`sub`（用户 UUID）或 `system`；不是已知用户时按 NULL 落库，名字仍进 details。
-    pub actor: String,
-    /// 做了什么，例如 `project.task_updated`。
-    pub action: String,
-    /// 改的是哪类东西：`task`、`project`、`plan`、`card`。
-    pub resource_type: String,
-    pub resource_id: String,
-    /// 这次改动属于哪个项目——项目时间线按它一次扫出来。
-    pub project_id: String,
-    /// 改前与改后。新建时 `before` 是 null；只读字段没变也要写进来，否则「改了什么」
-    /// 与「现在是什么」分不开。
-    pub before: serde_json::Value,
-    pub after: serde_json::Value,
-}
-
-/// 从表里读回来的一行。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditRow {
-    pub id: i64,
-    pub actor: String,
-    pub action: String,
-    pub resource_type: String,
-    pub resource_id: String,
-    pub before: serde_json::Value,
-    pub after: serde_json::Value,
-    pub created_at: chrono::DateTime<chrono::Utc>,
-}
-
-/// 写者与读者的契约。
-///
-/// 放在这个 crate 而不是 cog-core：两端——写它的网关、落库的 `PgPool`——都已经依赖
-/// `cog-storage`，为一条只有一个实现、一个调用点的接口去动 core 的契约面，正好是
-/// core 该变小而不是变大的那类改动。
-#[async_trait]
-pub trait ProjectAuditLog: Send + Sync {
-    async fn record(&self, entry: AuditEntry) -> cog_core::SFResult<()>;
-    async fn recent(&self, project_id: &str, limit: i64) -> cog_core::SFResult<Vec<AuditRow>>;
-}
 
 /// Postgres 实现。
 pub struct PgProjectAuditLog {

@@ -1646,7 +1646,7 @@ pub async fn create_project_handler(
             )
             .await;
     }
-    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+    crate::project_audit::record(cog_core::AuditEntry {
         actor: claims
             .map(|c| c.sub.clone())
             .unwrap_or_else(|| "system".into()),
@@ -1941,7 +1941,7 @@ pub async fn create_project_task_handler(
             )
             .await;
     }
-    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+    crate::project_audit::record(cog_core::AuditEntry {
         actor: claims
             .map(|c| c.sub.clone())
             .unwrap_or_else(|| "system".into()),

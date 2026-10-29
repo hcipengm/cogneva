@@ -86,6 +86,8 @@ pub mod supervisor_status;
 pub mod takeover;
 pub mod tasks;
 pub mod taste;
+#[cfg(test)]
+pub mod test_metrics;
 pub mod trace_fanout;
 pub mod upstream_pool;
 pub mod websocket;
@@ -108,7 +110,7 @@ pub type SharedLlmClient = Arc<std::sync::RwLock<Option<Arc<dyn cog_core::LlmCli
 /// a process-local map standing in for the table -- that is the shape this type
 /// replaced, where a restart quietly took every conversation with it while the
 /// schema still said the history was kept.
-pub type ChatTurnHandle = Option<Arc<dyn cog_storage::ChatTurnStore>>;
+pub type ChatTurnHandle = Option<Arc<dyn cog_core::ChatTurnStore>>;
 
 /// Where a command sent to an agent, and the answer it got, are written down.
 ///
@@ -117,7 +119,7 @@ pub type ChatTurnHandle = Option<Arc<dyn cog_storage::ChatTurnStore>>;
 /// conversation again after the response has scrolled away; a process-local map
 /// in its place would answer that question right up until the next restart and
 /// then answer it wrongly.
-pub type AgentMessageHandle = Option<Arc<dyn cog_storage::AgentMessageStore>>;
+pub type AgentMessageHandle = Option<Arc<dyn cog_core::AgentMessageStore>>;
 
 /// Consumer names for [`cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL`].
 ///
@@ -383,7 +385,7 @@ pub struct GatewayState {
     /// Dataset catalog plus the object store it describes. Absent when either
     /// half is: a catalog with no store could promise bytes it cannot deliver,
     /// and a store with no catalog holds bytes nothing can name.
-    pub datasets: Option<Arc<cog_storage::DatasetStore>>,
+    pub datasets: Option<Arc<dyn cog_core::DatasetStore>>,
 }
 
 impl GatewayState {
@@ -3627,8 +3629,8 @@ mod metrics_exposition_tests {
     use std::collections::HashMap;
 
     /// 记一条 gauge，名字故意不在帮助表里——模拟"有人新增产出面但没来这边登记"。
-    async fn backend_with_extra_gauge() -> cog_storage::mem::MemoryMetricsBackend {
-        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+    async fn backend_with_extra_gauge() -> crate::test_metrics::TestMetrics {
+        let mb = crate::test_metrics::TestMetrics::new();
         mb.record_gauge(
             cog_core::MetricName::for_tests_only("some_future_gauge"),
             7.0,
@@ -3735,7 +3737,7 @@ mod metrics_exposition_tests {
     /// 帮助表是渲染用的，不是筛选用的：它多出来的名字不能凭自己造出序列。
     #[tokio::test]
     async fn a_described_name_nothing_recorded_is_absent() {
-        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+        let mb = crate::test_metrics::TestMetrics::new();
         let body = render_backend_metrics(&mb).await;
 
         assert!(body.is_empty(), "空后端不能凭空产出序列: {body}");
@@ -3859,7 +3861,7 @@ mod metrics_exposition_tests {
     /// reported everything held would be noise nobody reads.
     #[tokio::test]
     async fn a_held_series_no_name_in_this_build_can_write_is_reported() {
-        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+        let mb = crate::test_metrics::TestMetrics::new();
         mb.record_gauge(
             cog_core::MetricName::for_tests_only("a_producer_that_is_gone"),
             1.0,
@@ -3900,7 +3902,7 @@ mod metrics_exposition_tests {
     #[tokio::test]
     async fn a_held_series_declared_retired_is_not_reported_as_unproduced() {
         let retired = cog_core::RETIRED_METRIC_NAMES[0];
-        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+        let mb = crate::test_metrics::TestMetrics::new();
         mb.record_gauge(
             cog_core::MetricName::for_tests_only(retired),
             0.0,
@@ -3926,7 +3928,7 @@ mod metrics_exposition_tests {
     /// healthy store teaches its reader to ignore it.
     #[tokio::test]
     async fn a_store_holding_only_registered_series_reports_nothing() {
-        let mb = cog_storage::mem::MemoryMetricsBackend::new();
+        let mb = crate::test_metrics::TestMetrics::new();
         mb.record_gauge(
             cog_core::metric_names::LLM_POOL_AVAILABLE,
             1.0,
@@ -3981,7 +3983,7 @@ mod metrics_exposition_tests {
     /// A backend that cannot enumerate: every other call behaves like the
     /// in-memory one, so the only difference in the rendered body is the
     /// reading's input.
-    struct UnreadableBackend(cog_storage::mem::MemoryMetricsBackend);
+    struct UnreadableBackend(crate::test_metrics::TestMetrics);
 
     #[async_trait::async_trait]
     impl MetricsBackend for UnreadableBackend {
@@ -4079,7 +4081,7 @@ mod metrics_exposition_tests {
     /// while the store was never asked.
     #[tokio::test]
     async fn a_store_that_cannot_be_read_says_so_instead_of_reporting_nothing() {
-        let inner = cog_storage::mem::MemoryMetricsBackend::new();
+        let inner = crate::test_metrics::TestMetrics::new();
         inner
             .record_gauge(
                 cog_core::MetricName::for_tests_only("a_producer_that_is_gone"),

@@ -100,7 +100,7 @@ pub async fn upload_file_handler(
         .unwrap_or("upload")
         .to_string();
 
-    let spec = cog_storage::DatasetWrite {
+    let spec = cog_core::DatasetWrite {
         name: name.clone(),
         version: file_id.clone(),
         source: "upload".to_string(),

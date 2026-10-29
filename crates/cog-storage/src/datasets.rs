@@ -12,36 +12,25 @@
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
-
 use cog_core::{ObjectBackend, SFError, SFResult};
 
-use crate::postgres::dataset_catalog::{sha256_of, DatasetCatalog, DatasetEntry, NewDataset};
+use crate::postgres::dataset_catalog::{DatasetCatalog, NewDataset};
 
-/// What a producer says about a version before it is written.
-#[derive(Debug, Clone)]
-pub struct DatasetWrite {
-    pub name: String,
-    pub version: String,
-    /// Where the bytes came from, in whatever form would let a person fetch
-    /// them again. The catalog exists so this question has an answer later.
-    pub source: String,
-    /// Record count, when the dataset is tabular. `None` for a blob: zero would
-    /// claim a table with no rows.
-    pub row_count: Option<i64>,
-    /// The interval the data covers, when it covers one. Both bounds together
-    /// or neither.
-    pub coverage: Option<(DateTime<Utc>, DateTime<Utc>)>,
-    pub media_type: Option<String>,
-}
+pub use cog_core::contract::dataset::{
+    sha256_of, DatasetCheck, DatasetEntry, DatasetOutcome, DatasetStore, DatasetVerification,
+    DatasetWrite,
+};
 
 /// A catalog plus the object store it describes.
-pub struct DatasetStore {
+///
+/// 名字里带 `Object` 是因为它正是那两半的接法：对象存储放字节、目录放行。契约叫
+/// [`DatasetStore`]，由本 crate 实现，调用方只按契约问。
+pub struct ObjectDatasetStore {
     objects: Arc<dyn ObjectBackend>,
     catalog: Arc<dyn DatasetCatalog>,
 }
 
-impl DatasetStore {
+impl ObjectDatasetStore {
     pub fn new(objects: Arc<dyn ObjectBackend>, catalog: Arc<dyn DatasetCatalog>) -> Self {
         Self { objects, catalog }
     }
@@ -220,67 +209,34 @@ impl DatasetStore {
     }
 }
 
-/// What one catalogued version turned out to be.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DatasetOutcome {
-    /// The object is the one the row describes.
-    Verified,
-    /// The object is there and is not what the row describes. Both digests and
-    /// both lengths travel: a reader has to be able to see whether this is a
-    /// different file or the same file damaged, and a length alone cannot say.
-    Mismatched {
-        recorded: String,
-        actual: String,
-        recorded_bytes: i64,
-        actual_bytes: i64,
-    },
-    /// The catalog says this version exists and the store has nothing there.
-    Missing,
-    /// The store could not be asked. Distinct from [`Self::Missing`]: a store
-    /// that is down has not been shown to be empty.
-    Unreadable(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DatasetCheck {
-    pub name: String,
-    pub version: String,
-    pub object_key: String,
-    pub outcome: DatasetOutcome,
-}
-
-/// The result of one verification pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DatasetVerification {
-    /// In catalog order: newest first.
-    pub checks: Vec<DatasetCheck>,
-}
-
-impl DatasetVerification {
-    pub fn checked(&self) -> usize {
-        self.checks.len()
+#[async_trait::async_trait]
+impl DatasetStore for ObjectDatasetStore {
+    async fn put(&self, spec: DatasetWrite, bytes: &[u8]) -> SFResult<DatasetEntry> {
+        ObjectDatasetStore::put(self, spec, bytes).await
     }
 
-    pub fn verified(&self) -> usize {
-        self.count(|o| matches!(o, DatasetOutcome::Verified))
+    async fn put_at(&self, key: &str, spec: DatasetWrite, bytes: &[u8]) -> SFResult<DatasetEntry> {
+        ObjectDatasetStore::put_at(self, key, spec, bytes).await
     }
 
-    pub fn failed(&self) -> usize {
-        self.checked() - self.verified()
+    async fn find(&self, name: &str, version: &str) -> SFResult<Option<DatasetEntry>> {
+        ObjectDatasetStore::find(self, name, version).await
     }
 
-    fn count(&self, pred: impl Fn(&DatasetOutcome) -> bool) -> usize {
-        self.checks.iter().filter(|c| pred(&c.outcome)).count()
+    async fn open(&self, name: &str, version: &str) -> SFResult<Option<(DatasetEntry, Vec<u8>)>> {
+        ObjectDatasetStore::open(self, name, version).await
     }
 
-    /// Whether the pass proved anything.
-    ///
-    /// An empty catalog is not a pass. Zero datasets verified is the same
-    /// reading as a migration that carried nothing, and that is exactly the case
-    /// a green verdict must not cover -- so the caller is told no, with
-    /// [`Self::checked`] at zero to say why.
-    pub fn all_verified(&self) -> bool {
-        self.checked() > 0 && self.failed() == 0
+    async fn latest(&self, name: &str) -> SFResult<Option<DatasetEntry>> {
+        ObjectDatasetStore::latest(self, name).await
+    }
+
+    async fn versions(&self, name: &str, limit: usize) -> SFResult<Vec<DatasetEntry>> {
+        ObjectDatasetStore::versions(self, name, limit).await
+    }
+
+    async fn verify(&self, limit: usize) -> SFResult<DatasetVerification> {
+        ObjectDatasetStore::verify(self, limit).await
     }
 }
 
@@ -383,7 +339,7 @@ mod tests {
                 coverage_to: entry.coverage_to,
                 source: entry.source,
                 media_type: entry.media_type,
-                created_at: Utc::now(),
+                created_at: chrono::Utc::now(),
             };
             rows.push(row.clone());
             Ok(row)
@@ -449,11 +405,11 @@ mod tests {
         }
     }
 
-    fn store() -> (DatasetStore, Arc<FakeObjects>, Arc<FakeCatalog>) {
+    fn store() -> (ObjectDatasetStore, Arc<FakeObjects>, Arc<FakeCatalog>) {
         let objects = Arc::new(FakeObjects::default());
         let catalog = Arc::new(FakeCatalog::default());
         (
-            DatasetStore::new(objects.clone(), catalog.clone()),
+            ObjectDatasetStore::new(objects.clone(), catalog.clone()),
             objects,
             catalog,
         )

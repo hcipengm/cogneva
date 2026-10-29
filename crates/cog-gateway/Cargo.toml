@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 cog-core = { workspace = true }
-cog-storage = { workspace = true }
 # 观测导出（Loki/ClickHouse）需要 cog_core::HttpClient，那一份由装配层交进来
 # （网关进程从 net 插件取，安全网关进程由 main 造好传入），所以这里只认契约。
 

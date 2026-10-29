@@ -500,12 +500,12 @@ crates/cog-storage/src/partition_maintainer.rs	MONTHS_BEHIND	1	bound	How far bac
 crates/cog-storage/src/plugin.rs	CONNECTION_ACQUIRE_TIMEOUT	5s	bound	读服务端连接数时拿一条连接的等待上限：5s。
 crates/cog-storage/src/plugin.rs	NOTIFICATION_KEEP_DAYS	90	bound	How long a read notification stays in the table.
 crates/cog-storage/src/plugin.rs	POSTGRES_POOL_COUNT	5	bound	the four pools here plus the summary layer's own pool share the server's connection ceiling, so that ceiling is divided by five
-crates/cog-storage/src/postgres/agent_message_store.rs	ROWS_KEPT_PER_PEER	500	bound	Rows kept per receiving peer, so a chatty sender cannot grow the table without bound. Larger than what a panel shows at once, because how far back a reader can scroll and what fits on one screen answer different questions.
+crates/cog-core/src/contract/conversation.rs	ROWS_KEPT_PER_PEER	500	bound	Rows kept per receiving peer, so a chatty sender cannot grow the table without bound. Larger than what a panel shows at once, because how far back a reader can scroll and what fits on one screen answer different questions.
 crates/cog-storage/src/postgres/change_ledger_store.rs	DOC_MAX	512	bound	a writer-side cap on the source document; the row itself keeps the sources in JSONB
 crates/cog-storage/src/postgres/change_ledger_store.rs	KIND_MAX	32	bound	the identity's kind column width, a schema limit rather than a measurement
 crates/cog-storage/src/postgres/change_ledger_store.rs	LITERAL_MAX	512	bound	the identity's literal column width, a schema limit shared by both dialects
 crates/cog-storage/src/postgres/change_ledger_store.rs	SCOPE_MAX	191	bound	the identity's scope column width, pinned by the narrower dialect's index limit
-crates/cog-storage/src/postgres/chat_turn_store.rs	ROWS_KEPT_PER_SESSION	200	bound	Rows kept per session: two per turn, so a hundred user/assistant pairs.
+crates/cog-core/src/contract/conversation.rs	ROWS_KEPT_PER_SESSION	200	bound	Rows kept per session: two per turn, so a hundred user/assistant pairs.
 crates/cog-storage/src/postgres/decision_stats_store.rs	CATEGORY_MAX	32	bound	the category column width, a schema limit rather than a measurement
 crates/cog-storage/src/postgres/decision_stats_store.rs	DECISION_MAX	191	bound	the decision column width, a schema limit rather than a measurement
 crates/cog-storage/src/postgres/decision_stats_store.rs	GROUP_MAX	191	bound	the group-key column width, a schema limit rather than a measurement

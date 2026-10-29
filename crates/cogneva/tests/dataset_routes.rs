@@ -25,6 +25,7 @@ use cog_core::{ObjectBackend, SFError, SFResult};
 use cog_gateway::{create_router, GatewayState};
 use cog_storage::{
     sha256_of, DatasetCatalog, DatasetEntry, DatasetStore, DatasetWrite, NewDataset,
+    ObjectDatasetStore,
 };
 
 mod router_state;
@@ -164,8 +165,8 @@ struct Fixture {
 fn fixture(with_catalog: bool) -> Fixture {
     let objects = Arc::new(MapObjects::default());
     let catalog = Arc::new(VecCatalog::default());
-    let store: Option<Arc<DatasetStore>> = if with_catalog {
-        Some(Arc::new(DatasetStore::new(
+    let store: Option<Arc<dyn DatasetStore>> = if with_catalog {
+        Some(Arc::new(ObjectDatasetStore::new(
             objects.clone(),
             catalog.clone(),
         )))
@@ -389,7 +390,7 @@ async fn the_catalog_routes_refuse_when_the_deployment_has_no_catalog() {
 async fn a_producer_writing_through_the_store_gets_a_catalogued_version() {
     let objects = Arc::new(MapObjects::default());
     let catalog = Arc::new(VecCatalog::default());
-    let store = DatasetStore::new(objects.clone(), catalog.clone());
+    let store = ObjectDatasetStore::new(objects.clone(), catalog.clone());
     let entry = store
         .put(
             DatasetWrite {

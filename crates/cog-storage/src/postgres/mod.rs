@@ -11,6 +11,7 @@ pub mod audit_recorder;
 pub mod backup_run_store;
 pub mod change_ledger_store;
 pub mod chat_turn_store;
+pub mod database_health;
 pub mod dataset_catalog;
 pub mod decision_stats_store;
 pub mod governance_store;
@@ -39,6 +40,7 @@ pub use chat_turn_store::{
     ChatTurn, ChatTurnRecord, ChatTurnRole, ChatTurnStore, PostgresChatTurnStore,
     ROWS_KEPT_PER_SESSION,
 };
+pub use database_health::PgDatabaseHealth;
 pub use dataset_catalog::{
     sha256_of, DatasetCatalog, DatasetEntry, NewDataset, PostgresDatasetCatalog,
 };

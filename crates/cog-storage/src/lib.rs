@@ -26,7 +26,12 @@ pub mod backends;
 pub(crate) mod consumer_lag;
 pub mod datasets;
 pub mod dlq;
-pub use datasets::{DatasetCheck, DatasetOutcome, DatasetStore, DatasetVerification, DatasetWrite};
+pub use datasets::ObjectDatasetStore;
+// 这些类型的家已经搬到 `cog_core` 的契约面；这里重导出是给本 crate 内部与既有
+// 调用点的短路径，不再是定义点。
+pub use cog_core::contract::dataset::{
+    DatasetCheck, DatasetEntry, DatasetOutcome, DatasetStore, DatasetVerification, DatasetWrite,
+};
 pub mod etcd;
 pub mod event_filter;
 pub mod inbox_orphan_readings;
@@ -67,8 +72,8 @@ pub use mem::{
 #[cfg(feature = "postgres")]
 pub use postgres::{
     gauge_latest_sql, sha256_of, AgentMessage, AgentMessageStore, ChatTurn, ChatTurnRecord,
-    ChatTurnRole, ChatTurnStore, DatasetCatalog, DatasetEntry, HookArchiveRow, NewAgentMessage,
-    NewDataset, PostgresAgentMessageStore, PostgresAuditRecorder, PostgresBackupRunStore,
+    ChatTurnRole, ChatTurnStore, DatasetCatalog, HookArchiveRow, NewAgentMessage, NewDataset,
+    PostgresAgentMessageStore, PostgresAuditRecorder, PostgresBackupRunStore,
     PostgresChangeLedgerStore, PostgresChatTurnStore, PostgresDatasetCatalog,
     PostgresDecisionStatsStore, PostgresGovernanceStore, PostgresHookArchive,
     PostgresMetricsBackend, PostgresNotificationStore, PostgresObservabilityGateway,

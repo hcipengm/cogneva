@@ -90,8 +90,10 @@ const PRODUCERS: [(&str, &str, &str); 5] = [
     (
         // The standalone gateway has no configuration document of its own; it
         // reads the declaration from the environment and starts the watchers.
+        // The assembly sits in the binary that runs it: the gateway consumes
+        // the observables, it does not build them.
         "cogneva-security-gateway",
-        "crates/cog-gateway/src/security_gateway.rs",
+        "crates/cogneva/src/gateway_observability.rs",
         "data_volume::spawn_watchers(",
     ),
     (

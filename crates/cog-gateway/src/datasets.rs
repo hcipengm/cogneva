@@ -29,7 +29,7 @@ pub struct ListQuery {
     pub limit: Option<usize>,
 }
 
-fn entry_json(entry: &cog_storage::DatasetEntry) -> serde_json::Value {
+fn entry_json(entry: &cog_core::DatasetEntry) -> serde_json::Value {
     json!({
         "name": entry.name,
         "version": entry.version,
@@ -153,8 +153,8 @@ pub async fn verify_handler(
                 .iter()
                 .map(|check| {
                     let (outcome, detail) = match &check.outcome {
-                        cog_storage::DatasetOutcome::Verified => ("verified", json!({})),
-                        cog_storage::DatasetOutcome::Mismatched {
+                        cog_core::DatasetOutcome::Verified => ("verified", json!({})),
+                        cog_core::DatasetOutcome::Mismatched {
                             recorded,
                             actual,
                             recorded_bytes,
@@ -168,8 +168,8 @@ pub async fn verify_handler(
                                 "actual_bytes": actual_bytes,
                             }),
                         ),
-                        cog_storage::DatasetOutcome::Missing => ("missing", json!({})),
-                        cog_storage::DatasetOutcome::Unreadable(e) => {
+                        cog_core::DatasetOutcome::Missing => ("missing", json!({})),
+                        cog_core::DatasetOutcome::Unreadable(e) => {
                             ("unreadable", json!({ "error": e }))
                         }
                     };

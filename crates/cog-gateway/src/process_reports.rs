@@ -721,18 +721,18 @@ mod tests {
 
     use cog_core::MetricsBackend as _;
 
-    fn memory_metrics() -> Arc<cog_storage::mem::MemoryMetricsBackend> {
-        Arc::new(cog_storage::mem::MemoryMetricsBackend::new())
+    fn memory_metrics() -> Arc<crate::test_metrics::TestMetrics> {
+        Arc::new(crate::test_metrics::TestMetrics::new())
     }
 
     fn as_backend(
-        metrics: &Arc<cog_storage::mem::MemoryMetricsBackend>,
+        metrics: &Arc<crate::test_metrics::TestMetrics>,
     ) -> Option<Arc<dyn cog_core::MetricsBackend>> {
         Some(metrics.clone())
     }
 
     async fn cell(
-        metrics: &Arc<cog_storage::mem::MemoryMetricsBackend>,
+        metrics: &Arc<crate::test_metrics::TestMetrics>,
         outcome: &str,
         node: &str,
     ) -> Option<f64> {

@@ -1441,7 +1441,7 @@ pub async fn update_task_handler(
             .await;
     }
     // 哈希链记顺序与完整性，这张表记「这一张任务改过什么」——两份的读者不同。
-    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+    crate::project_audit::record(cog_core::AuditEntry {
         actor: claims
             .map(|c| c.sub.clone())
             .unwrap_or_else(|| "system".into()),
@@ -1594,7 +1594,7 @@ pub async fn save_task_plan_handler(
             )
             .await;
     }
-    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+    crate::project_audit::record(cog_core::AuditEntry {
         actor: claims
             .map(|c| c.sub.clone())
             .unwrap_or_else(|| "system".into()),
@@ -1791,7 +1791,7 @@ pub async fn move_task_handler(
             .await;
     }
     // 「这片卡是哪一天被谁挪走的」——事故复盘问的第一个问题，按资源一秒查出来。
-    crate::project_audit::record(cog_storage::postgres::AuditEntry {
+    crate::project_audit::record(cog_core::AuditEntry {
         actor: actor.to_string(),
         action: "project.card_moved".into(),
         resource_type: "card".into(),
