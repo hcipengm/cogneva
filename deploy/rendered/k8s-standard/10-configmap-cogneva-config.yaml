@@ -25,6 +25,16 @@ data:
 
   COGNEVA_DB_PROVIDER: "mysql"
   COGNEVA_PG_PROVIDER: "postgres"
+  # 同一台 Postgres 上有几个进程各开一套连接池：主应用、进化、安全网关，再加一个
+  # 滚动更新时同时活着的新 Pod。每个进程把服务器的连接上限按这个数分摊到自己的池
+  # 上，数少了就是把别人的份也算成自己的——实测 2026-10-30 滚动时新 Pod 报
+  # `pool timed out while waiting for an open connection`：每进程五个池各九条，
+  # 三个进程九十条，服务器只剩九十七条，第四个进程一上来就超。
+  #
+  # 值从各工作负载的副本数算出来，不是这里另写一个数：改了副本数而这里不动，
+  # 分摊就会按过期的进程数做。`+1` 是滚动影子——同一次滚动里新 Pod 已经连上、
+  # 旧 Pod 还没退出，两者都要算。
+  COGNEVA_PG_SHARING_PROCESSES: "4"
   COGNEVA_VECTOR_PROVIDER: "qdrant"
   QDRANT_URL: "http://qdrant.cogneva.svc.cluster.local:6334"
   COGNEVA_MEDIA_PROVIDER: "local-sfu"
