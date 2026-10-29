@@ -924,8 +924,13 @@ impl AgentRuntime {
             )
         };
 
+        // 这一路每一轮都重发整段历史：工具定义、system、以及上一次的每一步。前面
+        // 那一大截逐字节没变，不向上游要缓存就等于按原价把它重买一遍——2026-10-26
+        // 实测同一批提示词在不开缓存断点的协议面上只命中 3.6%，在同一天的兼容面上
+        // 是 50%～67%。短窗就够：一轮之内连续重发，间隔是秒级，不是小时级。
         let options = cog_core::ChatOptions {
             tools: tool_defs,
+            cache_retention: cog_core::CacheRetention::Short,
             ..Default::default()
         }
         .with_actor(&format!("agent:{}", self.config.role));
@@ -1999,8 +2004,13 @@ impl AgentRuntime {
             )
         };
 
+        // 这一路每一轮都重发整段历史：工具定义、system、以及上一次的每一步。前面
+        // 那一大截逐字节没变，不向上游要缓存就等于按原价把它重买一遍——2026-10-26
+        // 实测同一批提示词在不开缓存断点的协议面上只命中 3.6%，在同一天的兼容面上
+        // 是 50%～67%。短窗就够：一轮之内连续重发，间隔是秒级，不是小时级。
         let options = cog_core::ChatOptions {
             tools: tool_defs,
+            cache_retention: cog_core::CacheRetention::Short,
             ..Default::default()
         }
         .with_actor(&format!("agent:{}", self.config.role));

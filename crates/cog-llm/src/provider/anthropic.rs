@@ -30,6 +30,52 @@ pub fn messages_url(base_url: &str) -> String {
     format!("{}/messages", base_url.trim_end_matches('/'))
 }
 
+/// 这个协议面上「要不要让上游缓存前缀」的落点。
+///
+/// 不标断点就没有缓存：上游按 `cache_control` 逐块记下可复用的前缀，返回里的
+/// `cache_creation_input_tokens` 只在请求标了断点时才会涨。2026-10-26 实测 372 条
+/// 成功响应里这个计数**全是 0**，`cache_read_input_tokens` 只有 3.6% 的输入落在
+/// 上面——同一批提示词在同一天的 OpenAI 兼容面上是 50%～67%。差的不是提示词的写法，
+/// 是请求里没有这一句。
+///
+/// 保留期：`Short` 是上游默认的短窗（分钟级，够一段对话内复读）；`Long` 要一小时，
+/// 写缓存按 2 倍价、读按 0.1 倍——只有「同一段前缀会在十分钟以上被反复重发」时才划算。
+fn cache_marker(retention: cog_core::CacheRetention) -> Option<serde_json::Value> {
+    match retention {
+        cog_core::CacheRetention::None => None,
+        cog_core::CacheRetention::Short => Some(json!({"type": "ephemeral"})),
+        cog_core::CacheRetention::Long => Some(json!({"type": "ephemeral", "ttl": "1h"})),
+    }
+}
+
+/// 把断点挂到一条消息内容的末尾。
+///
+/// 内容有两种线上形状：纯文本是裸字符串（没有位置挂断点），多媒体是块数组。
+/// 字符串要就地折成单块数组——这不是改变语义，`[{"type":"text","text":s}]` 与 `s`
+/// 在协议里是同一件事，只是一个能挂断点。
+fn mark_content_end(content: &mut serde_json::Value, marker: &serde_json::Value) {
+    match content {
+        serde_json::Value::String(text) => {
+            let text = text.clone();
+            *content = json!([{ "type": "text", "text": text, "cache_control": marker }]);
+        }
+        serde_json::Value::Array(blocks) => {
+            let marked = match blocks.last_mut().and_then(|b| b.as_object_mut()) {
+                Some(last) => {
+                    last.insert("cache_control".to_string(), marker.clone());
+                    true
+                }
+                None => false,
+            };
+            if !marked {
+                // 空内容也得有个位置：上游拒收空的 content 数组。
+                *content = json!([{ "type": "text", "text": "", "cache_control": marker }]);
+            }
+        }
+        _ => {}
+    }
+}
+
 pub struct AnthropicProvider {
     client: Option<Arc<dyn cog_core::HttpClient>>,
     model: Model,
@@ -150,14 +196,21 @@ impl AnthropicProvider {
             "stream": true,
         });
 
+        // 缓存断点：这个协议面不开自动缓存，不标就是全价重发（见 `cache_marker`）。
+        let marker = cache_marker(options.cache_retention);
+
         if let Some(sys) = system {
-            body["system"] = json!(sys);
+            body["system"] = match &marker {
+                // 标了断点的 system 只能是块数组：字符串形式没有地方挂断点。
+                Some(m) => json!([{ "type": "text", "text": sys, "cache_control": m }]),
+                None => json!(sys),
+            };
         }
         if let Some(temp) = options.temperature {
             body["temperature"] = json!(temp);
         }
         if let Some(tools) = &options.tools {
-            let tool_defs: Vec<_> = tools.iter().map(|t| {
+            let mut tool_defs: Vec<_> = tools.iter().map(|t| {
                 json!({
                     "name": t.name,
                     "description": t.description,
@@ -168,7 +221,24 @@ impl AnthropicProvider {
                     }
                 })
             }).collect();
+            // 断点落在最后一个工具上：协议面的前缀顺序是 工具 → system → messages，
+            // 标在末尾那一个上，整段工具定义连同它后面的 system 一起进缓存。
+            if let Some(m) = marker.as_ref() {
+                if let Some(last) = tool_defs.last_mut() {
+                    last["cache_control"] = m.clone();
+                }
+            }
             body["tools"] = json!(tool_defs);
+        }
+        // 最后一个断点落在最后一条消息的末尾：下一次调用是同一段对话又长了一轮，
+        // 前面那段逐字节没变，于是整段历史按缓存价读，只有新增的那一轮按原价。
+        if let Some(m) = &marker {
+            if let Some(last) = body["messages"]
+                .as_array_mut()
+                .and_then(|arr| arr.last_mut())
+            {
+                mark_content_end(&mut last["content"], m);
+            }
         }
 
         // Tool choice (auto/none/any) from metadata
@@ -836,5 +906,148 @@ fn map_stop_reason(reason: &str) -> StopReason {
         "tool_use" => StopReason::ToolUse,
         "stop_sequence" => StopReason::Stop,
         _ => StopReason::Error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ApiType, ModelCost, Provider};
+    use cog_core::{CacheRetention, ToolDefinition};
+    use std::collections::HashMap;
+
+    fn test_model() -> Model {
+        Model {
+            id: "k3".into(),
+            name: "k3".into(),
+            api: ApiType::AnthropicMessages,
+            provider: Provider::Anthropic,
+            base_url: "https://api.example.com/anthropic/v1".into(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            supports_tools: true,
+            supports_streaming: true,
+            supports_vision: false,
+            supports_reasoning: true,
+            cost: ModelCost::default(),
+            headers: HashMap::new(),
+        }
+    }
+
+    fn one_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "read_file".into(),
+            description: "read one file".into(),
+            parameters: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        }
+    }
+
+    fn conversation() -> Vec<Message> {
+        vec![
+            Message::system("You are the planner."),
+            Message::user("fix the alert"),
+            Message::Assistant {
+                content: vec![ContentBlock::text("looking")],
+                tool_calls: None,
+                usage: None,
+                timestamp: chrono::Utc::now(),
+            },
+            Message::ToolResult {
+                tool_call_id: "call_1".into(),
+                tool_name: "read_file".into(),
+                content: vec![ContentBlock::text("fn main() {}")],
+                is_error: false,
+                timestamp: chrono::Utc::now(),
+            },
+        ]
+    }
+
+    fn body_with(retention: CacheRetention, msgs: &[Message]) -> serde_json::Value {
+        let provider = AnthropicProvider::new(test_model(), "key");
+        let options = ChatOptions {
+            tools: Some(vec![one_tool(), one_tool()]),
+            cache_retention: retention,
+            ..Default::default()
+        };
+        provider.build_request_body(msgs, &options)
+    }
+
+    /// 不要求缓存时，请求体与改动之前逐字节一致：这一支是**回归**的判据。
+    #[test]
+    fn retention_none_sends_no_breakpoint_at_all() {
+        let body = body_with(CacheRetention::None, &conversation());
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "没要缓存却标了断点：上游会照标写缓存，按写价计费"
+        );
+        assert!(body["system"].is_string(), "system 仍是字符串形状");
+    }
+
+    /// 要了缓存：三条断点，落在模型实际读到的顺序上（工具 → system → 最后一条消息）。
+    #[test]
+    fn a_short_retention_marks_the_last_tool_the_system_and_the_tail() {
+        let body = body_with(CacheRetention::Short, &conversation());
+        let tools = body["tools"].as_array().expect("tools");
+        assert!(tools.last().unwrap()["cache_control"].is_object());
+        assert!(
+            tools[0].get("cache_control").is_none(),
+            "断点只标最后一个工具：标在中间会把后面的工具挤出可缓存前缀"
+        );
+
+        let system = body["system"].as_array().expect("system 必须是块数组");
+        assert_eq!(
+            system.last().unwrap()["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+
+        let msgs = body["messages"].as_array().expect("messages");
+        let tail = msgs.last().unwrap()["content"].as_array().expect("content");
+        assert_eq!(
+            tail.last().unwrap()["cache_control"],
+            json!({"type": "ephemeral"})
+        );
+    }
+
+    /// 一小时写缓存按 2 倍价：只有明说要长留时才写这个 ttl。
+    #[test]
+    fn a_long_retention_asks_for_the_hour_and_a_short_one_does_not() {
+        let long = body_with(CacheRetention::Long, &conversation());
+        assert_eq!(long["system"][0]["cache_control"]["ttl"], json!("1h"));
+        let short = body_with(CacheRetention::Short, &conversation());
+        assert!(short["system"][0]["cache_control"].get("ttl").is_none());
+    }
+
+    /// 协议面允许的断点上限是四个；多标一个就整条请求被拒。
+    #[test]
+    fn the_breakpoints_stay_within_the_four_the_protocol_allows() {
+        let body = body_with(CacheRetention::Long, &conversation());
+        let count = body.to_string().matches("cache_control").count();
+        assert!(count <= 4, "标了 {count} 个断点，上游只收 4 个");
+    }
+
+    /// 纯文本消息的内容是裸字符串，断点没有位置可挂——它必须就地折成块数组，
+    /// 否则最后一条消息那一条断点会被静默丢掉，命中率只吃到前两条。
+    #[test]
+    fn a_plain_text_message_still_carries_the_tail_breakpoint() {
+        let body = body_with(CacheRetention::Short, &[Message::user("hello")]);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(
+            content,
+            &json!([{ "type": "text", "text": "hello",
+                      "cache_control": {"type": "ephemeral"} }])
+        );
+    }
+
+    /// 同一段前缀在两次调用之间必须逐字节相同，否则命中的开销白付。
+    #[test]
+    fn two_turns_of_one_conversation_send_the_same_head() {
+        let mut msgs = conversation();
+        let first = body_with(CacheRetention::Short, &msgs);
+        msgs.push(Message::user("and now check the tests"));
+        let second = body_with(CacheRetention::Short, &msgs);
+        assert_eq!(first["system"], second["system"], "system 跨轮变了");
+        assert_eq!(first["tools"], second["tools"], "工具定义跨轮变了");
+        let head = first["messages"][0].clone();
+        assert_eq!(head, second["messages"][0], "第一条消息跨轮变了");
     }
 }
