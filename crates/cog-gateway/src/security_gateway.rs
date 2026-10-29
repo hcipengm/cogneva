@@ -8685,6 +8685,13 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// 一个系列的键：名字，加上按名字排好的标签对。
+    ///
+    /// 起这个名字而不是在每个用到的地方再写一遍元组：抓取替身的两个表都拿它当键，
+    /// 写在类型里两遍会让同一个键有两种拼法，而 `-D warnings` 下的复杂度线正是
+    /// 提醒这件事的那道坎。
+    type SeriesKey = (String, Vec<(String, String)>);
+
     /// 抓取面的测试替身。
     ///
     /// 这个 crate 不再拥有 Prometheus 注册表——注册表是实现，跟着拥有导出格式的
@@ -8700,11 +8707,9 @@ mod tests {
     struct ScrapeRecorder {
         /// 一个系列的标签按名字排好后的样子；用它当键，读回时才能还原成
         /// `MetricSample`，而不是从渲染出来的字符串里再解析一遍。
-        series: std::sync::Mutex<std::collections::BTreeMap<(String, Vec<(String, String)>), f64>>,
+        series: std::sync::Mutex<std::collections::BTreeMap<SeriesKey, f64>>,
         /// 直方图：(观测次数, 观测和)。桶的划分是真实编码器的事。
-        histograms: std::sync::Mutex<
-            std::collections::BTreeMap<(String, Vec<(String, String)>), (u64, f64)>,
-        >,
+        histograms: std::sync::Mutex<std::collections::BTreeMap<SeriesKey, (u64, f64)>>,
     }
 
     fn series_key(
