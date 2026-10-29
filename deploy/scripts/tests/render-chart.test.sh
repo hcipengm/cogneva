@@ -68,7 +68,7 @@ secrets=$(grep -c '^kind: Secret' "${work}/helm-form.yaml" || true)
 
 # 4. 透传：`--show-only` 到得了 helm，`--` 本身不被当成位置参数。
 bash "$render" k3s-single -- --show-only templates/gateway.yaml > "${work}/gateway.yaml" \
-  || fail "透传参数没到 helm（`--` 被当成位置参数了？）"
+  || fail "透传参数没到 helm（'--' 被当成位置参数了？）"
 gw_kinds=$(grep -c '^kind:' "${work}/gateway.yaml" || true)
 [ "${gw_kinds:-0}" -eq 3 ] || fail "--show-only templates/gateway.yaml 出了 ${gw_kinds:-0} 个对象，应为 3（PVC/Service/Deployment）"
 grep -q '^kind: Deployment' "${work}/gateway.yaml" || fail "gateway 渲染里没有 Deployment"
