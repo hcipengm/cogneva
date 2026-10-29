@@ -342,6 +342,11 @@ async fn the_writer_identity_lands_on_a_table_that_predates_it() {
 /// five-minute window, so a day of history is already more than anyone asks for;
 /// past that the rows are pure growth, and growth that no reading would attribute
 /// to anything — the table simply keeps getting bigger.
+///
+/// The prune hangs off the first verdict a process writes, not off schema
+/// application: the schema is handed a runner that may never touch a database,
+/// and this delete needs a real one. A fresh store is the process life in which
+/// the prune has not happened yet.
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn a_writer_that_stopped_asserting_does_not_keep_its_rows_forever() {
@@ -376,12 +381,14 @@ async fn a_writer_that_stopped_asserting_does_not_keep_its_rows_forever() {
         .expect("the verdict row lands");
     }
 
-    // A fresh start is the moment the set of possible writers changes, so it is
-    // also the moment to drop the ones that are not coming back.
-    PostgresAlertStore::with_identity(pool.clone(), "cogneva-app-new", "cogneva")
-        .init_schema(&cog_test_support::SchemaTextRunner::new(pool.clone()))
+    // A fresh process life is the moment the set of possible writers changes,
+    // so it is also the moment to drop the ones that are not coming back. The
+    // first verdict it writes is when that prune happens.
+    let restarted = PostgresAlertStore::with_identity(pool.clone(), "cogneva-app-new", "cogneva");
+    restarted
+        .set_alert(true, &probe_alert("probe_rule:prune"))
         .await
-        .expect("a restart reapplies the schema");
+        .expect("the first verdict of a new process life lands");
 
     assert_eq!(
         assertion_rows(&pool, "cogneva-app-old").await,

@@ -324,6 +324,11 @@ pub struct PostgresAlertStore {
     writer: String,
     /// Which kind of process it is; see [`process_role`].
     role: String,
+    /// Whether this store has already pruned the verdicts of writers that are
+    /// not coming back. One attempt per process life, on the first verdict it
+    /// writes -- see [`Self::prune_stale_verdicts_once`] for why the write path
+    /// and not the schema path owns it.
+    pruned_verdicts: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PostgresAlertStore {
@@ -340,6 +345,7 @@ impl PostgresAlertStore {
             pool,
             writer: writer.into(),
             role: role.into(),
+            pruned_verdicts: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -363,22 +369,48 @@ impl PostgresAlertStore {
             .apply_schema(&ddl())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        // The verdict table is keyed by writer, and a writer is a pod name: every
-        // rollout leaves a generation of rows nothing will ever overwrite again.
-        // Their only reader — the divergence surface — looks at a five-minute
-        // window, so what is kept beyond a day is history nothing asks for, and
-        // what is not pruned grows with the number of rollouts rather than with
-        // the number of alerts. Pruned here because the set of dead writers
-        // changes exactly when a process starts: a startup that adds a writer is
-        // the moment to drop the ones that are no longer coming back.
-        sqlx::query(
+        Ok(())
+    }
+
+    /// Drop the verdicts of writers that stopped asserting long ago, once per
+    /// process life.
+    ///
+    /// The verdict table is keyed by writer, and a writer is a pod name: every
+    /// rollout leaves a generation of rows nothing will ever overwrite again.
+    /// Their only reader — the divergence surface — looks at a five-minute
+    /// window, so what is kept beyond a day is history nothing asks for, and
+    /// what is not pruned grows with the number of rollouts rather than with the
+    /// number of alerts.
+    ///
+    /// This hangs off the write path rather than off schema application because
+    /// the two are handed different things: the schema is applied through a
+    /// caller-provided runner, which may be a recorder that never touches a
+    /// database at all, so a store that pruned there would need a live pool for
+    /// a statement that is not schema. The first verdict a process writes is the
+    /// moment its writer joins the population, which is the same moment the
+    /// writers that are not coming back become worth dropping.
+    async fn prune_stale_verdicts_once(&self) {
+        use std::sync::atomic::Ordering;
+        if self.pruned_verdicts.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        if let Err(e) = sqlx::query(
             "DELETE FROM alert_assertions \
              WHERE observed_at < now() - ($1::bigint * interval '1 second')",
         )
         .bind(ASSERTION_RETENTION_SECONDS)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await
+        {
+            // One attempt per process life: this is housekeeping, and a store
+            // that retried it on every write would turn a database that is
+            // briefly unavailable into a delete statement against every alert
+            // it writes. The next process to start picks it up.
+            tracing::warn!(
+                error = %e,
+                "the verdict rows of writers that stopped asserting were not pruned"
+            );
+        }
     }
 
     /// Drive one alert condition to the requested state, idempotently.
@@ -560,6 +592,7 @@ impl PostgresAlertStore {
     /// clock separable: a writer that stops evaluating reads as stale here even
     /// while the other writer keeps the shared row fresh.
     async fn record_assertion(&self, dedup_key: &str, state: AlertState) -> anyhow::Result<()> {
+        self.prune_stale_verdicts_once().await;
         sqlx::query(
             "INSERT INTO alert_assertions (dedup_key, writer, role, state, observed_at) \
              VALUES ($1, $2, $3, $4, now()) \

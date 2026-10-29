@@ -308,6 +308,7 @@ crates/cog-memory/src/pg_summary_pool.rs	SUMMARY_POOL_CONNECTIONS	2	bound	the su
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_DOUBLINGS	4	bound	four doublings from 500 ms cap the wait at 8 s inside the 120 s retry window
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_BACKOFF_MS	500	bound	the first retry delay; doubling from here keeps asking during a create storm
 crates/cog-memory/src/vector_summary_backend.rs	CREATE_COLLECTION_DEADLINE	120s	bound	How long startup keeps trying to (re)create the summary collection before it reports the failure.
+crates/cog-observability/src/alert_store.rs	ASSERTION_RETENTION_SECONDS	24 * 60 * 60	bound	判词表的保留期：写者分歧面按几分钟的窗口读，一天已经远超「还没读到就先别删」的需要，再长就是替一个不再写判词的进程无限留着行
 crates/cog-observability/src/claim_store.rs	DEFAULT_INTERVAL_SECS	300	bound	the same 300 as cog-core's DEFAULT_SCAN_INTERVAL_SECS, so two processes reporting one claim are equally fresh and the older one's number does not read as growth
 crates/cog-observability/src/claim_store.rs	MIN_INTERVAL_SECS	30	bound	a scan walks every directory below the root, so a faster cadence only keeps the disk busy
 crates/cog-observability/src/config.rs	DEFAULT_TRACE_BUFFER_BYTES	16 * 1024 * 1024	bound	trace 收集缓冲的上限：默认 16 MiB。
@@ -406,6 +407,7 @@ crates/cog-reflection/src/build_gate/mod.rs	MEASURED_BUILD_COST_AGREEMENT	0.10	b
 crates/cog-reflection/src/build_gate/mod.rs	MEASURED_BUILD_COST_DEAD_BAND	0.20	bound	how far a measured divisor must sit from the declared one before it replaces it; the dead band the ceiling has, one level down -- below this the label would flip on noise
 crates/cog-reflection/src/build_gate/mod.rs	MEASURED_BUILD_COST_SAMPLES	3	bound	consecutive agreeing builds required before the divisor moves; one build cannot make "they agree" a claim about a sequence
 crates/cog-reflection/src/build_gate/mod.rs	POLL_INTERVAL	500ms	bound	how promptly a waiter rechecks a freed slot; builds last minutes, so this is only responsiveness
+crates/cog-reflection/src/build_gate/mod.rs	PSI_AVG60_WINDOW_SECONDS	60.0	bound	the kernel's averaging window for the avg60 pressure figures: the share of the io reading credited to this gate's own builds is averaged over the same sixty seconds, and any other period would be explaining a different minute than the one the reading describes
 crates/cog-reflection/src/build_gate/mod.rs	SWITCH_FIELD_WAIT	3600s	bound	等构建场空出来再做进程切换的上限：1 小时。
 crates/cog-reflection/src/build_gate/mod.rs	TURN_STAND_DOWN_SECS	3600	bound	longer than any asker's own round, so a grievance outlives the call that raised it
 crates/cog-reflection/src/build_gate/mod.rs	WALK_YIELD_LIMIT	2	bound	turns a walk stands down before taking the field; a policy for two failure directions
