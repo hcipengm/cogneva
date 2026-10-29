@@ -8,6 +8,8 @@
 #   2. `for_seconds` 改成 900000000：firing 那一格必须红——否则「等一亿秒」也绿；
 #   3. 删掉铺满腿：序列比窗口年轻那一格必须红——否则「刚起的 Pod 凭一条采样证明三天」也绿；
 #   4. 删掉默认的 1 GiB 地板：小阶段那一格必须红——否则 300→400 MiB 的噪声也会响；
+#   4d. 把折叠键从 `(phase, job)` 退回 `(phase)`：跨工作负载那一格必须红——否则应用会被
+#       拿去和同一批阶段名的进化 Pod 比，报出 47 倍而那是两个进程；
 #   5. 夹具点名一条库里没有的规则：必须非零，而不是「没取到规则所以没判」。
 # 另有两格证明它**不会**白红：真文件必须绿；拿不到 promtool 必须退 3（看不了 ≠ 一致）。
 #
@@ -77,10 +79,20 @@ run "${work}/c3.json"
     || bad "删掉铺满腿应红" "1" "$rc"
 
 # 4) 删掉默认的 1 GiB 地板：小阶段那一格必须红。
-mutate "${work}/c4.json" 'rule["promql"] = rule["promql"].replace(" and (max by (phase) (cogneva_boot_rss_bytes) > 1073741824)", "")'
+mutate "${work}/c4.json" 'rule["promql"] = rule["promql"].replace(" and (max by (phase, job) (cogneva_boot_rss_bytes) > 1073741824)", "")'
 run "${work}/c4.json"
 [ "$rc" -eq 1 ] && ok "删掉 1 GiB 地板：单测红（小阶段的比值重新算数）" \
     || bad "删掉 1 GiB 地板应红" "1" "$rc"
+
+# 4d) 把折叠键从 `(phase, job)` 退回 `(phase)`：跨工作负载那一格必须红。
+# 同一个序列名有两个发布者——应用与进化 Pod 都打这七个阶段名，量级差着四十多倍。只按
+# `phase` 折叠时，三天窗口里的最小值会落到当天恰好在线的那一个进程身上，规则就报「应用涨了
+# 47 倍」，而它比的是两个不同进程。这一格证明那个夹具真的在为这件事站岗：退回旧折叠键，
+# 应用那两代一样大的形状必须当场亮起来。
+mutate "${work}/c4d.json" 'rule["promql"] = rule["promql"].replace("max by (phase, job)", "max by (phase)")'
+run "${work}/c4d.json"
+[ "$rc" -eq 1 ] && ok "退回只按 phase 折叠：单测红（跨工作负载的比值重新算数）" \
+    || bad "退回只按 phase 折叠应红" "1" "$rc"
 
 # 4b) 只改 `condition` 的阈值（表达式一个字节不动）：单测必须红。
 # 这一格的存在本身是那条判据：不把 condition 折进表达式，Prometheus 看到的是「表达式返回
