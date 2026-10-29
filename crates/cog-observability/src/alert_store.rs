@@ -56,6 +56,30 @@ ALTER TABLE alerts ADD COLUMN IF NOT EXISTS acknowledged_by TEXT
 -- 就已在响的存量"与"写通知失败后待重试"的待办队列，因此不需要另建一张表。
 ALTER TABLE alerts ADD COLUMN IF NOT EXISTS notified_at TIMESTAMPTZ
 ;
+-- 这一行最后是谁断言的。同一份规则会被好几个进程各自评一遍（应用与进化 Pod 各起
+-- 一个 watcher，共用同一张表），没有这一列时，事后读一行读不出「是谁写的」，
+-- 也就分不清「一个写者说的」与「两个写者各自说、最后写入的那句覆盖了前一句」。
+ALTER TABLE alerts ADD COLUMN IF NOT EXISTS writer TEXT
+;
+-- 每个写者对每个键的最新判词，一行一个写者。冲突计数靠它：`alerts` 一行只存
+-- 最后写入者的判词，覆盖之后前一个写者说的话就没有了，而分歧恰恰是两个人都还
+-- 在断言、结论却相反的那段时间——那段时间在 `alerts` 上不留痕。
+--
+-- `role` 是「哪一种进程」（应用部署与进化部署各跑一个桥），`writer` 是那一具身体
+-- （Pod 名）。分开存是因为它们的寿命不同：一次滚动里两具身体同时活着、属于同一个
+-- role，旧的那具说的话与新那具相反——那是滚动的影子，不是两个写者的分歧。判分歧
+-- 按 role 取最新的一具，滚动就不算数了。
+CREATE TABLE IF NOT EXISTS alert_assertions (
+                dedup_key   TEXT        NOT NULL,
+                writer      TEXT        NOT NULL,
+                role        TEXT        NOT NULL,
+                state       TEXT        NOT NULL,
+                observed_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (dedup_key, writer)
+            )
+;
+CREATE INDEX IF NOT EXISTS idx_alert_assertions_observed ON alert_assertions(observed_at DESC)
+;
 CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(state, fired_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alerts_unnotified ON alerts(fired_at) WHERE state = '{state:firing}' AND notified_at IS NULL;
 "#;
@@ -242,15 +266,68 @@ impl AlertRowStore for PostgresAlertStore {
     }
 }
 
+/// The name this process writes under.
+///
+/// In a pod `HOSTNAME` is the pod name, which is the identity a reader of the
+/// table needs: two writers show up as two names, and a rollout shows up as a
+/// new name rather than as a mysterious change of verdict on a row nobody
+/// touched. Anywhere else the fallback still names exactly one writer, which is
+/// the truth there too.
+fn process_identity() -> String {
+    std::env::var("HOSTNAME").unwrap_or_else(|_| String::from("unknown-writer"))
+}
+
+/// Which kind of process this is: one per deployment.
+///
+/// The name is the kind, not the body. Two bodies of the same kind overlapping
+/// during a rollout are one writer handing over to another, and their differing
+/// verdicts in the overlap are the rollout's shadow rather than a disagreement.
+/// The application and the evolution deployment are genuinely two writers: both
+/// evaluate the same rule set against the same table, and neither can see the
+/// other's opinion there.
+fn process_role() -> String {
+    std::env::var("COGNEVA_DEPLOYMENT_NAME").unwrap_or_else(|_| String::from("unknown-role"))
+}
+
 /// PostgreSQL alert store.
 #[derive(Clone)]
 pub struct PostgresAlertStore {
     pool: PgPool,
+    /// Who this instance is, recorded on every row it writes and on every
+    /// verdict it asserts. Several processes evaluate the same rule set against
+    /// this one table; without the name, "the row says resolved" cannot be
+    /// attributed to a writer, and a disagreement between two live writers is
+    /// invisible — whichever wrote last simply wins the row.
+    writer: String,
+    /// Which kind of process it is; see [`process_role`].
+    role: String,
 }
 
 impl PostgresAlertStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self::with_identity(pool, process_identity(), process_role())
+    }
+
+    /// Build a store that writes under an explicit identity.
+    ///
+    /// For measuring what happens when two writers disagree: a test cannot be
+    /// two pods, and a single process can hold two stores.
+    pub fn with_identity(pool: PgPool, writer: impl Into<String>, role: impl Into<String>) -> Self {
+        Self {
+            pool,
+            writer: writer.into(),
+            role: role.into(),
+        }
+    }
+
+    /// The name this store writes under.
+    pub fn writer(&self) -> &str {
+        &self.writer
+    }
+
+    /// The kind of process this store writes for.
+    pub fn role(&self) -> &str {
+        &self.role
     }
 
     pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
@@ -309,8 +386,8 @@ impl PostgresAlertStore {
                     r#"
                     INSERT INTO alerts
                         (id, rule, dedup_key, severity, state, message, labels,
-                         fired_at, resolved_at, updated_at, last_seen_at)
-                    VALUES ($1, $2, $3, $4, '{state:firing}', $5, $6, $7, NULL, $7, $7)
+                         fired_at, resolved_at, updated_at, last_seen_at, writer)
+                    VALUES ($1, $2, $3, $4, '{state:firing}', $5, $6, $7, NULL, $7, $7, $8)
                     ON CONFLICT (dedup_key) DO UPDATE SET
                         severity   = EXCLUDED.severity,
                         state      = '{state:firing}',
@@ -320,6 +397,7 @@ impl PostgresAlertStore {
                         resolved_at = NULL,
                         updated_at = EXCLUDED.updated_at,
                         last_seen_at = EXCLUDED.last_seen_at,
+                        writer     = EXCLUDED.writer,
                         -- A new firing edge starts a new episode: whoever
                         -- acknowledged the previous one did not acknowledge
                         -- this condition at this time, and carrying the mark
@@ -340,20 +418,27 @@ impl PostgresAlertStore {
                 .bind(&alert.message)
                 .bind(&alert.labels)
                 .bind(now)
+                .bind(&self.writer)
                 .execute(&self.pool)
                 .await?;
+                self.record_assertion(&alert.dedup_key, AlertState::Firing)
+                    .await?;
                 Ok(AlertTransition::Fired)
             }
             AlertTransition::Resolved => {
                 let now = Utc::now();
                 sqlx::query(&alert_sql(
-                    "UPDATE alerts SET state = '{state:resolved}', resolved_at = $2, updated_at = $2 \
+                    "UPDATE alerts SET state = '{state:resolved}', resolved_at = $2, \
+                     updated_at = $2, writer = $3 \
                      WHERE dedup_key = $1 AND state = '{state:firing}'",
                 ))
                 .bind(&alert.dedup_key)
                 .bind(now)
+                .bind(&self.writer)
                 .execute(&self.pool)
                 .await?;
+                self.record_assertion(&alert.dedup_key, AlertState::Resolved)
+                    .await?;
                 Ok(AlertTransition::Resolved)
             }
             AlertTransition::NoChange => {
@@ -365,11 +450,12 @@ impl PostgresAlertStore {
                     // not one.
                     if plan.advance_last_seen {
                         sqlx::query(&alert_sql(
-                            "UPDATE alerts SET last_seen_at = $2 \
+                            "UPDATE alerts SET last_seen_at = $2, writer = $3 \
                              WHERE dedup_key = $1 AND state = '{state:firing}'",
                         ))
                         .bind(&alert.dedup_key)
                         .bind(now)
+                        .bind(&self.writer)
                         .execute(&self.pool)
                         .await?;
                     }
@@ -387,9 +473,48 @@ impl PostgresAlertStore {
                         .await?;
                     }
                 }
+                // A resolved row this writer keeps calling resolved is still a
+                // verdict, and it is half of what makes "these two writers
+                // disagree" a question about the key rather than about who
+                // happens to be firing.
+                if let Some(seen) = stored.as_ref() {
+                    let state = if seen.is_firing() {
+                        AlertState::Firing
+                    } else {
+                        AlertState::Resolved
+                    };
+                    self.record_assertion(&alert.dedup_key, state).await?;
+                }
                 Ok(AlertTransition::NoChange)
             }
         }
+    }
+
+    /// Record this writer's verdict on `dedup_key`, replacing its previous one.
+    ///
+    /// The `alerts` row keeps only the last writer's verdict, so a disagreement
+    /// between two live writers leaves no trace there — the later write simply
+    /// overwrites the earlier one, and the row ends up describing not "what is
+    /// true" but "who evaluated last". One row per (key, writer) keeps this
+    /// bounded by the alert table's own cardinality, and keeps each writer's
+    /// clock separable: a writer that stops evaluating reads as stale here even
+    /// while the other writer keeps the shared row fresh.
+    async fn record_assertion(&self, dedup_key: &str, state: AlertState) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO alert_assertions (dedup_key, writer, role, state, observed_at) \
+             VALUES ($1, $2, $3, $4, now()) \
+             ON CONFLICT (dedup_key, writer) DO UPDATE SET \
+                 role = EXCLUDED.role, \
+                 state = EXCLUDED.state, \
+                 observed_at = EXCLUDED.observed_at",
+        )
+        .bind(dedup_key)
+        .bind(&self.writer)
+        .bind(&self.role)
+        .bind(state.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Close the firing rows of `rule` that nothing has refreshed since `stale_before`.
@@ -441,14 +566,24 @@ impl PostgresAlertStore {
     /// judgement no longer owns a row, and that it has nothing left to sight.
     pub async fn refresh_firing(&self, dedup_key: &str) -> anyhow::Result<bool> {
         let touched = sqlx::query(&alert_sql(
-            "UPDATE alerts SET last_seen_at = $2 \
+            "UPDATE alerts SET last_seen_at = $2, writer = $3 \
              WHERE dedup_key = $1 AND state = '{state:firing}'",
         ))
         .bind(dedup_key)
         .bind(Utc::now())
+        .bind(&self.writer)
         .execute(&self.pool)
         .await?;
-        Ok(touched.rows_affected() > 0)
+        let touched = touched.rows_affected() > 0;
+        // Holding a row up is a verdict about it, the same one this writer will
+        // reach every tick while it lives. Without this, a writer whose rule set
+        // only ever refreshes would read as stopped in the assertions and drop
+        // out of the divergence count — the safest direction to be wrong in, but
+        // wrong: it would hide a disagreement behind a missing row.
+        if touched {
+            self.record_assertion(dedup_key, AlertState::Firing).await?;
+        }
+        Ok(touched)
     }
 
     /// Record that `by` has seen the firing alert under `dedup_key`, answering
