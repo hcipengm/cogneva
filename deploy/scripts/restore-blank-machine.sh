@@ -6,9 +6,10 @@
 # 没有网关，等它签发的地址就是死循环；而为了省一次人工在宿主上常驻长期凭证，
 # 等于把整库的读取权留给任何拿到宿主的人。
 #
-# 步骤的顺序与依赖声明在 `deploy/restore/blank-machine.steps.tsv`，
-# `check-restore-order.sh` 判它闭合。脚本与那张表双向对齐：每个 `run_step`
-# 都要在表里有行。
+# 每一步要什么、装出什么，写在它的 `run_step` 正上方那行 `# step:` 里；
+# `check-restore-order.sh` 判这个声明图闭合。声明与调用挨着，所以「表里有行、
+# 脚本里没这一步」这种分叉写不出来：没有 `run_step` 承接的声明就是一条挂空的
+# 注释，门会红。
 #
 # 可重入：每一步做完往回执目录写一条记录，重跑从下一段继续。回执里的包哈希与
 # 这次给的包不同就停——「这份回执属于另一个包」不是可以接着跑的状态。
@@ -77,7 +78,9 @@ record() {  # record <step> <reading> [owner_input]
 step_done() { [ "$(read_field "$RECEIPT/$1.txt" status)" = "done" ]; }
 
 # ── 每一步 ────────────────────────────────────────────────────────────────
-# run_step <id> 的 id 与步骤表逐字相同，门的双向对齐读的就是这一行。
+# 步骤的依赖声明在文件末尾每个 `run_step` 上方，一行一个。`requires` 必须是更早
+# 一步 `produces` 过的东西（空白机自带 `host_shell`），`needs_gateway=1` 的步骤
+# 之前必须已经有谁产出 `gateway`。
 
 step_package() {
     local recorded
@@ -212,9 +215,13 @@ run_step() {
     "step_$id"
 }
 
+# step: requires=host_shell produces=package_bytes needs_gateway=0 — 属主带来的加密包落在宿主上并核过 sha256；后面每一段读的都是这一份字节
 run_step package
+# step: requires=host_shell produces=engine,cluster_api,managed_pvcs needs_gateway=0 — 公开仓库元启动：装镜像、建集群与 PVC、跑迁移；不需要任何包内数据
 run_step engine
+# step: requires=cluster_api,engine,package_bytes produces=data_roots,restore_job needs_gateway=0 — 恢复 Job：实例身份 Secret、PG、Qdrant、对象层、各数据根的产物层
 run_step restore
+# step: requires=data_roots,restore_job produces=data_roots_readings needs_gateway=0 — 拿恢复 Job 的逐库读数与包内声明对账，写回执
 run_step verify
 
 echo "==> 恢复完成；回执：$RECEIPT"
