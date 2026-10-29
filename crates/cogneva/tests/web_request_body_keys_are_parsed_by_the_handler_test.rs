@@ -102,7 +102,7 @@ fn client_bodies(text: &str, file: &str) -> (Vec<Body>, usize) {
             continue;
         }
         let open = text.len() - rest.len();
-        let Some(close) = matching_paren(text.as_bytes(), open) else {
+        let Some(close) = matching_paren(text, open, Dialect::JavaScript) else {
             break;
         };
         cursor = close + 1;
@@ -119,7 +119,7 @@ fn client_bodies(text: &str, file: &str) -> (Vec<Body>, usize) {
             opaque += 1;
             continue;
         }
-        let Some(body_end) = matching_brace(remainder.as_bytes(), 0) else {
+        let Some(body_end) = matching_brace(remainder, 0, Dialect::JavaScript) else {
             continue;
         };
         let Some(keys) = top_level_keys(&remainder[1..body_end], KeyWords::Identifiers) else {
@@ -156,7 +156,7 @@ fn page_bodies(text: &str, file: &str) -> Vec<Body> {
                 continue;
             }
             let open = start + opener.len() - 1;
-            let Some(close) = matching_paren(text.as_bytes(), open) else {
+            let Some(close) = matching_paren(text, open, Dialect::JavaScript) else {
                 break;
             };
             cursor = close + 1;
@@ -201,7 +201,9 @@ fn page_bodies(text: &str, file: &str) -> Vec<Body> {
                             let rest = rest.trim();
                             if let Some(at) = rest.find("JSON.stringify(") {
                                 let inner_open = at + "JSON.stringify".len();
-                                if let Some(end) = matching_paren(rest.as_bytes(), inner_open) {
+                                if let Some(end) =
+                                    matching_paren(rest, inner_open, Dialect::JavaScript)
+                                {
                                     body = Some(rest[inner_open + 1..end].to_string());
                                 }
                             }
@@ -339,7 +341,7 @@ fn request_structs(files: &[PathBuf]) -> BTreeMap<String, Fields> {
                 continue;
             };
             let body_open = text.len() - after_brace.len() - 1;
-            let Some(body_close) = matching_brace(text.as_bytes(), body_open) else {
+            let Some(body_close) = matching_brace(&text, body_open, Dialect::Rust) else {
                 continue;
             };
             let body = &text[body_open + 1..body_close];
@@ -473,7 +475,7 @@ fn handler_types(root: &Path, files: &[PathBuf]) -> BTreeMap<String, BTreeSet<St
                 _ => continue,
             };
             let open = cursor + (after.len() - rest.len());
-            let Some(close) = matching_paren(text.as_bytes(), open) else {
+            let Some(close) = matching_paren(&text, open, Dialect::Rust) else {
                 continue;
             };
             cursor = close + 1;

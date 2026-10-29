@@ -53,7 +53,7 @@ mod common;
 
 use common::lex::{split_top_level, strip, Dialect};
 
-use common::routes::repo_root;
+use common::routes::{matching_brace, matching_paren, repo_root};
 
 use common::rust_production::{production_sources, production_text, sources_of_tree};
 
@@ -157,122 +157,6 @@ fn following_is_pattern(after: &str) -> bool {
         || (after.starts_with('=') && !after.starts_with("=="))
 }
 
-/// The byte offset of the bracket that closes the one at `open`, ignoring
-/// brackets inside strings, character literals, raw strings and comments.
-fn matching(b: &[u8], open: usize, open_ch: u8, close_ch: u8) -> Option<usize> {
-    let mut depth = 0i32;
-    let mut i = open;
-    let mut block = 0usize;
-    let mut raw: Option<usize> = None;
-    while i < b.len() {
-        let c = b[i];
-        if block > 0 {
-            if c == b'/' && b.get(i + 1) == Some(&b'*') {
-                block += 1;
-                i += 2;
-                continue;
-            }
-            if c == b'*' && b.get(i + 1) == Some(&b'/') {
-                block -= 1;
-                i += 2;
-                continue;
-            }
-            i += 1;
-            continue;
-        }
-        if let Some(hashes) = raw {
-            if c == b'"' {
-                let mut j = i + 1;
-                let mut seen = 0;
-                while seen < hashes && b.get(j) == Some(&b'#') {
-                    seen += 1;
-                    j += 1;
-                }
-                if seen == hashes {
-                    raw = None;
-                    i = j;
-                    continue;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'/') {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        if c == b'/' && b.get(i + 1) == Some(&b'*') {
-            block = 1;
-            i += 2;
-            continue;
-        }
-        if c == b'"' {
-            i += 1;
-            while i < b.len() {
-                if b[i] == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b[i] == b'"' {
-                    break;
-                }
-                i += 1;
-            }
-            i += 1;
-            continue;
-        }
-        if c == b'\'' {
-            // A character literal closes within a few bytes; a lifetime's quote
-            // does not, and a lifetime is not the opening of a literal.
-            let mut j = i + 1;
-            if b.get(j) == Some(&b'\\') {
-                j += 1;
-            }
-            let mut close = None;
-            while j < b.len() && j <= i + 5 {
-                if b[j] == b'\'' {
-                    close = Some(j);
-                    break;
-                }
-                j += 1;
-            }
-            i = match close {
-                Some(at) => at + 1,
-                None => i + 1,
-            };
-            continue;
-        }
-        if c == b'r'
-            && b.get(i.wrapping_sub(1))
-                .is_none_or(|p| !p.is_ascii_alphanumeric())
-        {
-            let mut j = i + 1;
-            let mut hashes = 0;
-            while b.get(j) == Some(&b'#') {
-                hashes += 1;
-                j += 1;
-            }
-            if b.get(j) == Some(&b'"') {
-                raw = Some(hashes);
-                i = j + 1;
-                continue;
-            }
-        }
-        if c == open_ch {
-            depth += 1;
-        } else if c == close_ch {
-            depth -= 1;
-            if depth == 0 {
-                return Some(i);
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
 /// The spans of every `matches!(...)` argument list. A struct-shaped pattern
 /// there is followed by `)`, which on its own would read as a value.
 fn macro_argument_spans(text: &str, needle: &str) -> Vec<(usize, usize)> {
@@ -288,7 +172,7 @@ fn macro_argument_spans(text: &str, needle: &str) -> Vec<(usize, usize)> {
         if i >= b.len() || b[i] != b'(' {
             continue;
         }
-        if let Some(close) = matching(b, i, b'(', b')') {
+        if let Some(close) = matching_paren(text, i, Dialect::Rust) {
             out.push((i, close));
         }
     }
@@ -371,7 +255,7 @@ fn event_sites(text: &str, enum_name: &str) -> Vec<(String, bool)> {
         if j >= b.len() || b[j] != b'{' {
             continue;
         }
-        let Some(close) = matching(b, j, b'{', b'}') else {
+        let Some(close) = matching_brace(text, j, Dialect::Rust) else {
             continue;
         };
         let body = &text[j + 1..close];
@@ -393,8 +277,7 @@ fn declared_variants(root: &Path, file: &str, name: &str) -> Vec<String> {
         panic!("{file} 里没有 `{needle}`：枚举搬了家或改了名，这条门会在空集上假装绿");
     };
     let open = at + needle.len() - 1;
-    let b = text.as_bytes();
-    let close = matching(b, open, b'{', b'}').expect("enum body is not closed");
+    let close = matching_brace(&text, open, Dialect::Rust).expect("enum body is not closed");
     // 文档注释里的散文与 `{` 都不是声明：先剥注释再按顶层逗号切，否则
     // 「一句带 `{` 的注释」会把后面的散文读成变体。
     let body = strip(&text[open + 1..close], Dialect::Rust);

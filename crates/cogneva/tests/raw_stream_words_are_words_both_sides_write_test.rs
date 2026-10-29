@@ -95,7 +95,7 @@ fn enum_variants(file: &str, source: &str) -> Result<BTreeSet<String>, String> {
         .find('{')
         .map(|i| at + i)
         .ok_or_else(|| format!("  `{file}` 的 `enum {ENUM}` 没有函数体"))?;
-    let close = matching_brace(source.as_bytes(), open)
+    let close = matching_brace(source, open, Dialect::Rust)
         .ok_or_else(|| format!("  `{file}` 的 `enum {ENUM}` 括号不闭合：读不出来按红处理"))?;
     let mut variants = BTreeSet::new();
     for part in split_top_level(&source[open + 1..close], Dialect::Rust) {
@@ -127,7 +127,7 @@ fn as_str_body(file: &str, source: &str) -> Result<String, String> {
         .find('{')
         .map(|i| at + i)
         .ok_or_else(|| format!("  `{file}` 的 `impl {ENUM}` 没有函数体"))?;
-    let close = matching_brace(source.as_bytes(), open)
+    let close = matching_brace(source, open, Dialect::Rust)
         .ok_or_else(|| format!("  `{file}` 的 `impl {ENUM}` 括号不闭合：读不出来按红处理"))?;
     let body = &source[open + 1..close];
     let fn_at = body.find("fn as_str").ok_or_else(|| {
@@ -137,7 +137,7 @@ fn as_str_body(file: &str, source: &str) -> Result<String, String> {
         .find('{')
         .map(|i| fn_at + i)
         .ok_or_else(|| format!("  `{file}` 的 `{ENUM}::as_str` 没有函数体"))?;
-    let end = matching_brace(body.as_bytes(), brace)
+    let end = matching_brace(body, brace, Dialect::Rust)
         .ok_or_else(|| format!("  `{file}` 的 `{ENUM}::as_str` 括号不闭合：读不出来按红处理"))?;
     Ok(body[brace + 1..end].to_string())
 }

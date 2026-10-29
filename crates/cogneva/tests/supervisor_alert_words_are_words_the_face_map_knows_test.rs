@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 mod common;
 
+use common::lex::Dialect;
 use common::routes::{matching_brace, repo_root};
 use common::rust_production::{production_text, relative_name};
 
@@ -96,7 +97,7 @@ fn mapped_words(source: &str) -> Result<BTreeMap<String, String>, String> {
             "  `{FACE_MAP}` 的 `{FACE_FN}` 没有函数体：读不出来按红处理"
         ));
     };
-    let close = matching_brace(source.as_bytes(), open)
+    let close = matching_brace(source, open, Dialect::Rust)
         .ok_or_else(|| format!("  `{FACE_MAP}` 的 `{FACE_FN}` 括号不闭合：读不出来按红处理"))?;
     let body = &source[open + 1..close];
     let mut mapped = BTreeMap::new();

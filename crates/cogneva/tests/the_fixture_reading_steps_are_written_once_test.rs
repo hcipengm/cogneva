@@ -62,7 +62,7 @@ use std::path::PathBuf;
 
 use common::js_literal::{quoted_word, top_level_keys, KeyWords};
 use common::lex::{blank, brace_delta, split_top_level, strip, Dialect};
-use common::routes::{matching_brace, matching_paren, repo_root};
+use common::routes::{matching_in, matching_paren, repo_root};
 use common::rust_production::{opens_test_module, opens_test_module_block, relative_name};
 
 /// 读文件、走目录这两条的唯一定义。
@@ -86,6 +86,10 @@ const PRODUCTION_HOME: &str = "crates/cogneva/tests/common/rust_production.rs";
 /// 不写成两份读取器。
 const JS_HOME: &str = "crates/cogneva/tests/common/js_literal.rs";
 
+/// 「一条 `fn <名字>(…)` 的函数体」这一条的定义在 `rust_text` 里：两份夹具读到同一棵树
+/// 上同一种声明，抄件之间只差在括号配平那一句。
+const RUST_TEXT_HOME: &str = "crates/cogneva/tests/common/rust_text.rs";
+
 /// 被抄走的那几行，逐字。开头几条是**整条签名**（这几条规则的参数与返回类型在全仓只有
 /// 这两种写法，所以签名是最窄也最准的形状）；其余只到**定义名**为止。
 ///
@@ -97,7 +101,7 @@ const JS_HOME: &str = "crates/cogneva/tests/common/js_literal.rs";
 /// 那一份收 `bytes: &[u8]`；相对名那一份在一处抄件里连名字都改成了 `relative`。签名
 /// 按抄件当时的形状写下去，下一个抄的人换一种参数类型就漏了。这一串名字是 `common`
 /// 导出的，别处再出现一次定义按构造就是第二份实现。
-const COPIED_FORMS: [&str; 18] = [
+const COPIED_FORMS: [&str; 19] = [
     "fn read(path: &Path) -> String",
     "fn read(rel: &str) -> String",
     "fn read(relative: &str) -> String",
@@ -116,6 +120,7 @@ const COPIED_FORMS: [&str; 18] = [
     "fn split_items(",
     "fn first_arguments(",
     "fn matching_paren_end(",
+    "fn rust_function_body(",
 ];
 
 /// 取相对名还有**内联**的形状：不写成函数，直接把那一串方法调用摊在调用点上。
@@ -244,7 +249,7 @@ struct Census {
 /// 括号与花括号的配平走共享的那两条：注释里写着签名不算，字符串里的 `{` 也不算。
 fn recursions_in(file: &str, text: &str) -> Vec<(String, usize, String)> {
     let code = strip(text, Dialect::Rust);
-    let bytes = code.as_bytes();
+    let blanked = blank(&code, Dialect::Rust);
     let mut out = Vec::new();
     let mut lineno = 0usize;
     let mut line_start = 0usize;
@@ -274,13 +279,14 @@ fn recursions_in(file: &str, text: &str) -> Vec<(String, usize, String)> {
         {
             continue;
         }
-        let Some(closed) = matching_paren(bytes, this_line + lead + 3 + params) else {
+        let Some(closed) = matching_in(&blanked, &code, this_line + lead + 3 + params, b'(', b')')
+        else {
             continue;
         };
         let Some(body_at) = code[closed..].find('{').map(|at| closed + at) else {
             continue;
         };
-        let Some(body_end) = matching_brace(bytes, body_at) else {
+        let Some(body_end) = matching_in(&blanked, &code, body_at, b'{', b'}') else {
             continue;
         };
         let body = &code[body_at..body_end];
@@ -299,7 +305,7 @@ fn recursions_in(file: &str, text: &str) -> Vec<(String, usize, String)> {
 /// 空白折叠掉，是因为抄的人会重新排版：缩进、换行、参数折行都会变，规则本身不变。
 fn free_function_bodies(text: &str) -> Vec<(String, usize, String)> {
     let code = strip(text, Dialect::Rust);
-    let bytes = code.as_bytes();
+    let blanked = blank(&code, Dialect::Rust);
     let mut out = Vec::new();
     let mut line_start = 0usize;
     for (index, line) in code.split('\n').enumerate() {
@@ -323,13 +329,14 @@ fn free_function_bodies(text: &str) -> Vec<(String, usize, String)> {
         {
             continue;
         }
-        let Some(closed) = matching_paren(bytes, this_line + lead + params) else {
+        let Some(closed) = matching_in(&blanked, &code, this_line + lead + params, b'(', b')')
+        else {
             continue;
         };
         let Some(body_at) = code[closed..].find('{').map(|at| closed + at) else {
             continue;
         };
-        let Some(body_end) = matching_brace(bytes, body_at) else {
+        let Some(body_end) = matching_in(&blanked, &code, body_at, b'{', b'}') else {
             continue;
         };
         let body = code[body_at..body_end]
@@ -357,7 +364,7 @@ fn free_function_bodies(text: &str) -> Vec<(String, usize, String)> {
 /// 给出同形的方法体是正常的，不构成「一份规则的抄件」。
 fn test_module_function_bodies(text: &str) -> Vec<(String, usize, String)> {
     let code = strip(text, Dialect::Rust);
-    let bytes = code.as_bytes();
+    let blanked = blank(&code, Dialect::Rust);
     let mut out = Vec::new();
     let mut line_start = 0usize;
     let mut depth: i32 = 0;
@@ -385,9 +392,13 @@ fn test_module_function_bodies(text: &str) -> Vec<(String, usize, String)> {
                     let lead = line.len() - rest.len();
                     let called = rest.split('(').next().unwrap_or(rest).trim().to_string();
                     if let Some(params) = rest.find('(') {
-                        if let Some(closed) = matching_paren(bytes, this_line + lead + params) {
+                        if let Some(closed) =
+                            matching_in(&blanked, &code, this_line + lead + params, b'(', b')')
+                        {
                             if let Some(body_at) = code[closed..].find('{').map(|at| closed + at) {
-                                if let Some(body_end) = matching_brace(bytes, body_at) {
+                                if let Some(body_end) =
+                                    matching_in(&blanked, &code, body_at, b'{', b'}')
+                                {
                                     let body = code[body_at..body_end]
                                         .split_whitespace()
                                         .collect::<Vec<_>>()
@@ -456,7 +467,14 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
     let mut support_bodies: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let mut fixture_bodies: Vec<(String, String)> = Vec::new();
-    let shared = [THE_ONE, ROUTES_HOME, PRODUCTION_HOME, LEX_HOME, JS_HOME];
+    let shared = [
+        THE_ONE,
+        ROUTES_HOME,
+        PRODUCTION_HOME,
+        LEX_HOME,
+        JS_HOME,
+        RUST_TEXT_HOME,
+    ];
     for path in files_in {
         let name = relative_name(root, path);
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -893,15 +911,35 @@ fn the_fixture_reading_steps_are_written_once() {
     // 括号那一份：两条入口都还在，而且都还走在同一个数层数的实现上。少这一问，
     // 把某一条改成「找最近的 `}`」之后，本判据只证明了「没有第二份」，不证明这一份对。
     assert!(
-        routes_home.contains("pub fn matching_paren(bytes: &[u8], open: usize)")
-            && routes_home.contains("pub fn matching_brace(bytes: &[u8], open: usize)"),
+        routes_home.contains("pub fn matching_paren(text: &str, open: usize, dialect: Dialect)")
+            && routes_home
+                .contains("pub fn matching_brace(text: &str, open: usize, dialect: Dialect)"),
         "{ROUTES_HOME} 里不再定义这两条括号读取：「只有一处」就是指着这份不干这件事的文件"
     );
     assert!(
         routes_home.contains("fn matching_delimiter(")
-            && routes_home.contains("matching_delimiter(bytes, open, b'{', b'}')"),
+            && routes_home.contains("matching_delimiter(text, open, b'{', b'}', dialect)"),
         "{ROUTES_HOME} 里两条括号读取不再走同一个数层数的实现：两条各写一遍，就是\
          这份文件内部又长出了第二份规则——同一条缺陷换了个位置"
+    );
+    // 配平的括号也必须**真的按方言分岔**：同一段字节，同一个 `(`，在两种方言里配到
+    // 的不是同一个位置。以前这里自己认 `"…"` 与反斜杠转义，于是它对公司里那段
+    // `&'a str` 与那段 `r#"…"#` 都给出别人的答案——而错的那一份不会红，它只是把一段
+    // 字符串里的 `)` 认成收尾，把后面的代码整段读成实参。
+    assert_eq!(
+        matching_paren("f('a, b)", 1, Dialect::Rust),
+        Some(7),
+        "Rust 的 `'` 在这里是生命周期：它不开字符串，`f(` 该配到末尾那个 `)`"
+    );
+    assert_eq!(
+        matching_paren("f('a, b)", 1, Dialect::JavaScript),
+        None,
+        "同一段字节在 JavaScript 里，`'` 开的那段字符串没有收尾，`f(` 一个收尾都配不到"
+    );
+    assert_eq!(
+        matching_paren("f(a /* ) */ b)", 1, Dialect::Rust),
+        Some(13),
+        "注释里那个 `)` 不是收尾：不跳过注释的读者会把实参截在半句话上"
     );
     // 相对名那一份：抄件缺的正是这行 `./` 折叠，所以共享的这一份必须还带着它。
     let production_home =
@@ -1279,5 +1317,29 @@ fn the_one_lexer_reads_rust_where_the_javascript_rule_does_not() {
     assert!(
         blanked.contains("let b = 2;") && !blanked.contains("note"),
         "{blanked:?}"
+    );
+
+    // 从字符串字面量里取出来的那一段（前端代码住在 Rust 字符串里）：`https://…` 不是
+    // 注释，页面里的引号也不是引号。按 JavaScript 读这两处都会塌，而塌法是「一个括号
+    // 都读不到」——在判词上等于「那里没有」，不红。
+    let page = "let u = \"https://example.test/a(b)\"";
+    assert!(
+        blank(&strip(page, Dialect::Rust), Dialect::Fragment).contains("https"),
+        "片段里的 `//` 不是一个注释的开头"
+    );
+    assert!(
+        !blank(&strip(page, Dialect::Rust), Dialect::Rust).contains("https"),
+        "同一段按 Rust 读就是字符串：这条断言守着上面那条真的分出了方言"
+    );
+    // 页面上一个落单的引号（拼两段字面量时两头各留一半）：按引号读会把后面整段吞成
+    // 字符串，按片段读它只是那个字节。
+    let halves = "let a = \"don't; f(x)";
+    assert!(
+        blank(&strip(halves, Dialect::Rust), Dialect::Fragment).contains("f(x)"),
+        "片段里没有引号语义，落单的那个引号不吞后面的代码"
+    );
+    assert!(
+        !blank(&strip(halves, Dialect::Rust), Dialect::JavaScript).contains("f(x)"),
+        "按 JavaScript 读就从那个引号一路读到末尾：方言必须真的分岔"
     );
 }

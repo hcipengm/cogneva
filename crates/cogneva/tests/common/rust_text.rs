@@ -88,6 +88,18 @@ pub fn raw_string_end(bytes: &[u8], i: usize) -> Option<usize> {
     None
 }
 
+/// `fn <name>(…)` 的函数体：从声明里的 `(` 走到花括号收尾，取中间那一段。
+///
+/// 两份夹具各写过一遍，逐字相同——它们读的是同一棵树上同一种声明。抄件之间只差在
+/// 括号配平那一句，而那正是最该共享的一句：配平问的是「哪里是代码」，答案在
+/// [`super::lex`] 与 [`super::routes`] 里各有一半，谁都不该在夹具里再写第三遍。
+pub fn rust_function_body(source: &str, name: &str) -> Option<String> {
+    let at = source.find(&format!("fn {name}("))?;
+    let brace = at + source[at..].find('{')?;
+    let end = super::routes::matching_brace(source, brace, super::lex::Dialect::Rust)?;
+    Some(source[brace + 1..end].to_string())
+}
+
 /// 一段文字结尾的那个标识符（`Self::X` 收 `X`，`foo(...)` 收空串）。
 ///
 /// 两份夹具都拿它从 `=>` 左边、赋值右边取出被写的那个名字。取法只有一种：

@@ -57,6 +57,7 @@
 mod common;
 
 use common::js_literal::{top_level_keys, KeyWords};
+use common::lex::Dialect;
 use common::routes::{matching_brace, read, repo_root, strip_comments, walk};
 use common::rust_production::relative_name;
 
@@ -191,7 +192,7 @@ fn search_params_of(text: &str) -> Vec<Binding> {
             //
             // A query name is any word the client quotes, dashed or not.
             if text[after..open].trim().is_empty() {
-                if let Some(end) = matching_brace(text.as_bytes(), open) {
+                if let Some(end) = matching_brace(text, open, Dialect::JavaScript) {
                     names = top_level_keys(&text[open + 1..end], KeyWords::Any)
                         .map(|keys| keys.into_iter().collect())
                         .unwrap_or_default();
@@ -359,7 +360,7 @@ fn struct_fields(text: &str, name: &str) -> Option<Vec<String>> {
         from = hit + needle.len();
     };
     let open = text[at..].find('{').map(|i| i + at)?;
-    let close = matching_brace(text.as_bytes(), open)?;
+    let close = matching_brace(text, open, Dialect::Rust)?;
     let body = &text[open + 1..close];
     let attrs = attribute_block(text, at);
     let style = attrs

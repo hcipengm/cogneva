@@ -18,6 +18,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use super::lex::{blank, Dialect};
+
 /// 这棵树的根。算法在 [`super::root`]——一份，全仓共用，别的 crate 的测试也编它。
 ///
 /// `allow(unused_imports)` 是因为这一句要按「每个测试二进制」各判一次：任何一份
@@ -212,49 +214,74 @@ pub const VERBS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "any",
 ];
 
-/// The offset of the bracket closing the one at `open`.
-pub fn matching_delimiter(bytes: &[u8], open: usize, opening: u8, closing: u8) -> Option<usize> {
+/// The offset of the bracket closing the one at `open`, in one dialect.
+///
+/// 哪一段字节算字符串、哪一段算注释，只有 [`super::lex`] 一份答案；这里不自己认
+/// 引号。以前这里认 `"…"` 与 `\` 转义，于是它对一段 Rust 的 `r#"…"#` 和一段
+/// JavaScript 的 `'…'` 都给出错的答案——而错的那一份不会红，它只是把字符串里的
+/// 括号当成真括号，把一个多出来的 `)` 认成收尾。
+///
+/// `open` 与返回值都是**字节**偏移：这些读者走的源码里满是中文，字符下标与字节
+/// 下标是两个数，按错的那个切会把一个字切成半个。
+pub fn matching_delimiter(
+    text: &str,
+    open: usize,
+    opening: u8,
+    closing: u8,
+    dialect: Dialect,
+) -> Option<usize> {
+    matching_in(&blank(text, dialect), text, open, opening, closing)
+}
+
+/// 同一件事，但方言表已经跑过一遍：[`matching_delimiter`] 每次都要空掉整段字面量与
+/// 注释，而一个夹具一文件里要问几十次「这个 `{` 收到哪」——热处把空好的那一份传进来，
+/// 冷处照旧走上面那条。
+pub fn matching_in(
+    blanked: &str,
+    text: &str,
+    open: usize,
+    opening: u8,
+    closing: u8,
+) -> Option<usize> {
+    // `blanked` 与原文逐字符对齐（每个源字符落一个字符），但字面量里的多字节字符
+    // 被换成一个空格的**一个字节**，所以两边的字节长度不同——位置只能按字符下标对，
+    // 答案再取原文那一侧的字节偏移。两条 `.skip(first)` 都是「从头数到 `open`」，
+    // 不走整段的第二条路：这条判据一个文件里问几十次，多一遍全扫就把门拖成分钟级。
+    let first = text[..open.min(text.len())].chars().count();
+    let opening = opening as char;
+    let closing = closing as char;
     let mut depth = 0i32;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            c if c == opening => depth += 1,
-            c if c == closing => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
+    for ((at, _), c) in text
+        .char_indices()
+        .skip(first)
+        .zip(blanked.chars().skip(first))
+    {
+        if c == opening {
+            depth += 1;
+        } else if c == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(at);
             }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {}
         }
-        i += 1;
     }
     None
 }
 
 /// The offset of the paren closing the one at `open`, skipping spans inside
-/// `"…"` because a bracket in a string is not a bracket.
+/// a string or a comment because a bracket there is not a bracket.
 ///
 /// `open` and the answer are both **byte** offsets: the sources these readers
 /// walk are full of Chinese, so a char index and a byte index are different
 /// numbers and slicing by the wrong one cuts a character in half.
-pub fn matching_paren(bytes: &[u8], open: usize) -> Option<usize> {
-    matching_delimiter(bytes, open, b'(', b')')
+pub fn matching_paren(text: &str, open: usize, dialect: Dialect) -> Option<usize> {
+    matching_delimiter(text, open, b'(', b')', dialect)
 }
 
 /// The offset of the brace closing the one at `open`; byte offsets, as
 /// [`matching_paren`].
-pub fn matching_brace(bytes: &[u8], open: usize) -> Option<usize> {
-    matching_delimiter(bytes, open, b'{', b'}')
+pub fn matching_brace(text: &str, open: usize, dialect: Dialect) -> Option<usize> {
+    matching_delimiter(text, open, b'{', b'}', dialect)
 }
 
 /// Every route the gateway registers, read once here so the path reader, the
@@ -309,7 +336,7 @@ pub fn route_entries_in(root: &Path, files: &[PathBuf], production_only: bool) -
             let Some(shape) = shape else {
                 continue;
             };
-            let Some(close) = matching_paren(text.as_bytes(), open) else {
+            let Some(close) = matching_paren(&text, open, Dialect::Rust) else {
                 continue;
             };
             let expression = &text[open + 1..close];

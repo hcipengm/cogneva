@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 mod common;
 
 use common::js_literal::is_identifier;
-use common::lex::{split_top_level, Dialect};
+use common::lex::{blank, split_top_level, strip, Dialect};
 use common::routes::{matching_brace, matching_paren, read, repo_root, walk};
 use common::rust_production::{production_text, relative_name};
 
@@ -346,14 +346,13 @@ fn ternary_branches(expression: &str) -> BTreeSet<String> {
 }
 
 /// `postMessage({ type: … })` 发出的类型词。
-fn posted_types(file: &str, source: &str) -> Result<BTreeSet<String>, String> {
-    let bytes = source.as_bytes();
+fn posted_types(file: &str, source: &str, dialect: Dialect) -> Result<BTreeSet<String>, String> {
     let mut words = BTreeSet::new();
     let mut cursor = 0;
     while let Some(offset) = source[cursor..].find("postMessage(") {
         let at = cursor + offset;
         let open = at + "postMessage".len();
-        let close = matching_paren(bytes, open).ok_or_else(|| {
+        let close = matching_paren(source, open, dialect).ok_or_else(|| {
             format!("  `{file}` 里的 `postMessage(` 括号不闭合：这条消息的类型读不出来")
         })?;
         cursor = close + 1;
@@ -398,7 +397,12 @@ fn posted_types(file: &str, source: &str) -> Result<BTreeSet<String>, String> {
 }
 
 /// `addEventListener('message', <handler>)` 的处理函数体。
-fn handler_region(file: &str, source: &str, handler: &str) -> Result<String, String> {
+fn handler_region(
+    file: &str,
+    source: &str,
+    handler: &str,
+    dialect: Dialect,
+) -> Result<String, String> {
     let handler = handler.trim();
     if handler.contains("=>") || handler.starts_with("function") {
         return Ok(handler.to_string());
@@ -430,7 +434,7 @@ fn handler_region(file: &str, source: &str, handler: &str) -> Result<String, Str
         .find('{')
         .map(|i| body_start + i)
         .ok_or_else(|| format!("  `{file}` 里 `{handler}` 的函数体读不出来"))?;
-    let close = matching_brace(source.as_bytes(), open)
+    let close = matching_brace(source, open, dialect)
         .ok_or_else(|| format!("  `{file}` 里 `{handler}` 的函数体不闭合"))?;
     Ok(source[at..=close].to_string())
 }
@@ -465,19 +469,18 @@ fn collect_type_comparisons(region: &str, words: &mut BTreeSet<String>) {
 }
 
 /// `message` 监听器认的类型词。
-fn listened_types(file: &str, source: &str) -> Result<BTreeSet<String>, String> {
-    let bytes = source.as_bytes();
+fn listened_types(file: &str, source: &str, dialect: Dialect) -> Result<BTreeSet<String>, String> {
     let mut words = BTreeSet::new();
     let mut cursor = 0;
     while let Some(offset) = source[cursor..].find("addEventListener(") {
         let at = cursor + offset;
         let open = at + "addEventListener".len();
-        let close = matching_paren(bytes, open).ok_or_else(|| {
+        let close = matching_paren(source, open, dialect).ok_or_else(|| {
             format!("  `{file}` 里的 `addEventListener(` 括号不闭合：监听器读不出来")
         })?;
         cursor = close + 1;
         let args = &source[open + 1..close];
-        let parts = split_top_level(args, Dialect::JavaScript);
+        let parts = split_top_level(args, dialect);
         let Some(event) = parts.first() else { continue };
         let event = event.trim().trim_matches(|c| c == '\'' || c == '"');
         if event != "message" {
@@ -486,10 +489,35 @@ fn listened_types(file: &str, source: &str) -> Result<BTreeSet<String>, String> 
         let Some(handler) = parts.get(1) else {
             return Err(format!("  `{file}` 的 `message` 监听器没有处理函数"));
         };
-        let region = handler_region(file, source, handler)?;
+        let region = handler_region(file, source, handler, dialect)?;
         collect_type_comparisons(&region, &mut words);
     }
     Ok(words)
+}
+
+/// 这份文件里的前端代码住在哪种方言里：`.rs` 里的那一份是从字符串字面量里取出来的
+/// 片段，没有注释也没有引号；其余文件本身就是前端源码。
+fn dialect_of(relative: &str) -> Dialect {
+    if relative.ends_with(".rs") {
+        Dialect::Fragment
+    } else {
+        Dialect::JavaScript
+    }
+}
+
+/// 一段 `.rs` 文本里的前端代码：字符串字面量的**内容**，其余空成空格。
+///
+/// 前端代码在 Rust 文件里是字符串，所以按 Rust 的判据看它整段都算「字符串」，字符
+/// 串里的括号一个也读不到——而「读不到」在本门里等于「没发过这条消息」，是最坏的那种
+/// 空读数。这里反过来取：方言表把字面量的内容空成空格，就只留那个被空掉的部分。
+/// 空掉的位置仍占位，所以行号不变；字面量的引号本身不算内容，一并空掉。
+fn script_inside(raw: &str) -> String {
+    let code = strip(raw, Dialect::Rust);
+    let blanked = blank(&code, Dialect::Rust);
+    code.chars()
+        .zip(blanked.chars())
+        .map(|(c, b)| if b == ' ' && c != ' ' { c } else { ' ' })
+        .collect()
 }
 
 /// 打开弹窗的一方写进 `state` 的前缀：`xState = 'ghapp:' + …`。
@@ -549,7 +577,7 @@ fn prefixes_tested(source: &str) -> BTreeSet<String> {
 fn struct_fields(source: &str, name: &str) -> Option<(BTreeSet<String>, bool)> {
     let at = source.find(&format!("struct {name}"))?;
     let open = source[at..].find('{').map(|i| at + i)?;
-    let close = matching_brace(source.as_bytes(), open)?;
+    let close = matching_brace(source, open, Dialect::Rust)?;
     let body = &source[open + 1..close];
     let header_renames = source[..at]
         .lines()
@@ -629,15 +657,16 @@ fn contradictions(root: &Path, messages: &[Message], prefix: &Prefix) -> Vec<Str
             }
         };
         let source = if relative.ends_with(".rs") {
-            production_text(&raw)
+            script_inside(&production_text(&raw))
         } else {
             raw
         };
-        match posted_types(&relative, &source) {
+        let dialect = dialect_of(&relative);
+        match posted_types(&relative, &source, dialect) {
             Ok(words) => record(&mut sent, &relative, words),
             Err(complaint) => complaints.push(complaint),
         }
-        match listened_types(&relative, &source) {
+        match listened_types(&relative, &source, dialect) {
             Ok(words) => record(&mut listened, &relative, words),
             Err(complaint) => complaints.push(complaint),
         }
@@ -804,16 +833,19 @@ fn the_census_is_wide_enough_to_mean_something() {
         let relative = relative_name(&root, &path);
         let raw = read(&path);
         let source = if relative.ends_with(".rs") {
-            production_text(&raw)
+            script_inside(&production_text(&raw))
         } else {
             raw
         };
-        let posted = posted_types(&relative, &source).expect("发送点读不出来");
+        let posted =
+            posted_types(&relative, &source, dialect_of(&relative)).expect("发送点读不出来");
         if !posted.is_empty() {
             senders.insert(relative.clone());
         }
         sent.extend(posted);
-        listened.extend(listened_types(&relative, &source).expect("监听器读不出来"));
+        listened.extend(
+            listened_types(&relative, &source, dialect_of(&relative)).expect("监听器读不出来"),
+        );
     }
     assert!(sent.len() >= 3, "只读出 {} 种发出的消息", sent.len());
     assert!(
@@ -842,7 +874,7 @@ fn a_type_that_is_a_variable_is_read_from_its_ternary() {
 var kind = (state.indexOf('p:') === 0) ? 'one' : 'two';
 window.opener.postMessage({ type: kind, code: code }, '*');
 ";
-    let words = posted_types("fixture.js", source).expect("三元读不出两支");
+    let words = posted_types("fixture.js", source, Dialect::JavaScript).expect("三元读不出两支");
     assert_eq!(
         words,
         ["one".to_string(), "two".to_string()].into_iter().collect()

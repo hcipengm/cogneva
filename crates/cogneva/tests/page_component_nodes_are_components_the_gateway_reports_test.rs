@@ -31,6 +31,7 @@ use common::js_literal::{top_level_keys, KeyWords};
 use common::lex::{split_top_level, Dialect};
 use common::routes::{matching_brace, matching_delimiter, read, repo_root, strip_comments};
 use common::rust_production::production_text;
+use common::rust_text::rust_function_body;
 
 const PAGE: &str = "crates/cog-gateway/src/takeover.html";
 const HANDLER_FILE: &str = "crates/cog-gateway/src/cluster.rs";
@@ -66,14 +67,6 @@ fn constants(source: &str) -> BTreeMap<String, String> {
         }
     }
     out
-}
-
-/// The body of `fn <name>(…)`.
-fn rust_function_body(source: &str, name: &str) -> Option<String> {
-    let at = source.find(&format!("fn {name}("))?;
-    let brace = at + source[at..].find('{')?;
-    let end = matching_brace(source.as_bytes(), brace)?;
-    Some(source[brace + 1..end].to_string())
 }
 
 /// The ids the gateway reports, or `None` when either half cannot be read: the
@@ -133,7 +126,7 @@ fn drawn(root: &Path) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
     let page = strip_comments(&read(&root.join(PAGE)));
     let at = page.find(&format!("let {NODES} = {{"))?;
     let brace = at + page[at..].find('{')?;
-    let end = matching_brace(page.as_bytes(), brace)?;
+    let end = matching_brace(&page, brace, Dialect::JavaScript)?;
     // 这张表的键就是组件 id：`security-gateway` 这类带横杠的词不是标识符，而这里
     // 正是它们住的地方——所以方言由调用点说明，读取器只有一份。
     let written = top_level_keys(&page[brace + 1..end], KeyWords::Any)?;
@@ -160,7 +153,7 @@ fn drawn(root: &Path) -> Option<(BTreeSet<String>, BTreeSet<String>)> {
             // learning an id, and the id it writes is not a name this gate has
             // to read. A computed key on the *reading* side is a name it never
             // sees, and guessing it is how a ghost id passes.
-            let close = matching_delimiter(page.as_bytes(), cursor, b'[', b']')?;
+            let close = matching_delimiter(&page, cursor, b'[', b']', Dialect::JavaScript)?;
             let after = page[close + 1..].trim_start();
             let assignment = after.starts_with('=') && !after.starts_with("==");
             if !assignment {

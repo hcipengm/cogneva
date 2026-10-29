@@ -11,9 +11,10 @@
 //!     但它只输出括号形状，不输出剥过注释的正文，于是「剥注释」这条路只能另写。
 //!
 //! 两条规则对同一个字节给出不同答案，而没有任何东西比较它们。这里只留一份：同一台
-//! 状态机一次跑出**剥过注释的正文**和**逐行的括号形状**，方言只差在两处——`'` 怎么
-//! 认（Rust 看它后面几个字节里有没有收尾引号，JavaScript 一律当引号），以及反引号
-//! 认不认（JavaScript 的模板字符串认，Rust 里反引号不是引号）。
+//! 状态机一次跑出**剥过注释的正文**和**逐行的括号形状**，方言差在三处——`'` 怎么
+//! 认（Rust 看它后面几个字节里有没有收尾引号，JavaScript 一律当引号）、反引号认不认
+//! （JavaScript 的模板字符串认，Rust 里反引号不是引号），以及**这一种文字有没有注释
+//! 与引号**（从字符串字面量里取出来的那段文字什么都没有，每个字节都是它自己）。
 //!
 //! 每种方言各自是对的：JavaScript 的长单引号字符串（`'api/v1'`）在 Rust 的窗口判据
 //! 下认不出来，而 Rust 的生命周期在 JavaScript 的规则下会吃掉整段代码。所以方言是
@@ -26,13 +27,21 @@
 
 #![allow(dead_code)]
 
-/// 被读的那段源码是什么语言。只影响引号与原始字符串的认法。
+/// 被读的那段源码是什么语言。只影响引号、原始字符串与注释的认法。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Dialect {
     /// `"`、`'`（字符字面量或生命周期）、`r"…"`、`r#"…"#`、`b"…"`、`br"…"`、`c"…"`、`cr#"…"#`。
     Rust,
     /// `"`、`'`、`` ` ``，`\` 转义；没有原始字符串。
     JavaScript,
+    /// 一段从字符串字面量里取出来的文字：**没有注释，也没有引号**，每个字节都是自己。
+    ///
+    /// 取的时候字面量的边界已经没了，剩下的是页面本身。再按引号读一遍有两处会塌：
+    /// 一是 `https://…` 这样的地址在 JavaScript 的规则下是注释，整行之后全被空掉；
+    /// 二是页面里成对的引号（HTML 属性、JS 字符串）跨过别的字面量就不配对，一次错位
+    /// 之后整段都算字符串——两种塌法都是「一个括号都读不到」，而读不到在判词上不是红，
+    /// 是「那里没有」。
+    Fragment,
 }
 
 /// One line's brace shape: how the nesting changes, and whether a `{` opened.
@@ -154,20 +163,20 @@ pub fn scan(text: &str, dialect: Dialect) -> Scan {
             continue;
         }
         match c {
-            '/' if chars.get(i + 1) == Some(&'/') => {
+            '/' if dialect != Dialect::Fragment && chars.get(i + 1) == Some(&'/') => {
                 while i < chars.len() && chars[i] != '\n' {
                     blanked.push(' ');
                     i += 1;
                 }
                 continue;
             }
-            '/' if chars.get(i + 1) == Some(&'*') => {
+            '/' if dialect != Dialect::Fragment && chars.get(i + 1) == Some(&'*') => {
                 block_comment = 1;
                 blanked.push_str("  ");
                 i += 2;
                 continue;
             }
-            '"' => {
+            '"' if dialect != Dialect::Fragment => {
                 quote = Some('"');
                 code.push(c);
                 blanked.push(' ');
@@ -188,7 +197,7 @@ pub fn scan(text: &str, dialect: Dialect) -> Scan {
                 i += 1;
                 continue;
             }
-            '\'' => {
+            '\'' if dialect == Dialect::Rust => {
                 // Past the backslash an escape covers **two** chars, the backslash
                 // and the character it escapes: stopping after the backslash leaves
                 // `j` sitting on the escaped quote, so a literal like `'\''` closes

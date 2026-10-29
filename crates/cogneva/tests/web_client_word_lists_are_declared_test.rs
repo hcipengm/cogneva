@@ -901,7 +901,7 @@ fn call_arguments<'a>(text: &'a str, callee: &str, out: &mut Vec<&'a str>) {
             continue;
         }
         // 配平的括号是共享的那一份，不在这里重数。
-        let end = matching_paren(bytes, start).unwrap_or(bytes.len());
+        let end = matching_paren(text, start, Dialect::Rust).unwrap_or(text.len());
         if !text[..name_at].trim_end().ends_with("fn") {
             out.push(&text[start + 1..end]);
         }

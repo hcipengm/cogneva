@@ -62,7 +62,7 @@ fn emitted_frames(text: &str) -> BTreeMap<String, BTreeSet<String>> {
             continue;
         }
         let open = start + "emit".len();
-        let Some(close) = matching_paren(text.as_bytes(), open) else {
+        let Some(close) = matching_paren(text, open, Dialect::JavaScript) else {
             break;
         };
         cursor = close + 1;
@@ -79,7 +79,7 @@ fn emitted_frames(text: &str) -> BTreeMap<String, BTreeSet<String>> {
                 Some(offset) => at + offset,
                 None => continue,
             };
-            let Some(end) = matching_brace(payload.as_bytes(), brace) else {
+            let Some(end) = matching_brace(payload, brace, Dialect::JavaScript) else {
                 continue;
             };
             if let Some(keys_in) = top_level_keys(&payload[brace + 1..end], KeyWords::Identifiers) {

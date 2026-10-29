@@ -39,8 +39,9 @@ use std::path::Path;
 
 mod common;
 
-use common::rust_text::snake_case;
+use common::rust_text::{rust_function_body, snake_case};
 
+use common::lex::Dialect;
 use common::routes::{matching_brace, read, repo_root, strip_comments};
 use common::rust_production::production_text;
 
@@ -123,7 +124,7 @@ fn enum_words(source: &str, name: &str) -> Option<BTreeSet<String>> {
         return None;
     }
     let brace = at + source[at..].find('{')?;
-    let end = matching_brace(source.as_bytes(), brace)?;
+    let end = matching_brace(source, brace, Dialect::Rust)?;
     let mut words = BTreeSet::new();
     for part in source[brace + 1..end].split(',') {
         let mut part = part.trim();
@@ -153,16 +154,8 @@ fn enum_words(source: &str, name: &str) -> Option<BTreeSet<String>> {
 fn function_body(page: &str, name: &str) -> Option<String> {
     let at = page.find(&format!("function {name}("))?;
     let brace = at + page[at..].find('{')?;
-    let end = matching_brace(page.as_bytes(), brace)?;
+    let end = matching_brace(page, brace, Dialect::JavaScript)?;
     Some(page[brace + 1..end].to_string())
-}
-
-/// The body of `fn <name>(…)` in a Rust source.
-fn rust_function_body(source: &str, name: &str) -> Option<String> {
-    let at = source.find(&format!("fn {name}("))?;
-    let brace = at + source[at..].find('{')?;
-    let end = matching_brace(source.as_bytes(), brace)?;
-    Some(source[brace + 1..end].to_string())
 }
 
 /// The quoted word that starts at `from`, skipping whitespace, and the index

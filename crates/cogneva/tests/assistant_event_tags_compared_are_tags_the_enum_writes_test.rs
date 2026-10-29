@@ -61,7 +61,7 @@ fn enum_tags(source: &str, name: &str) -> Option<BTreeSet<String>> {
         return None;
     }
     let brace = at + source[at..].find('{')?;
-    let end = matching_brace(source.as_bytes(), brace)?;
+    let end = matching_brace(&source, brace, Dialect::Rust)?;
     let mut tags = BTreeSet::new();
     // 按顶层逗号切：变体自己的结构体字段、属性里的括号都留在同一片里。
     for part in split_top_level(&source[brace + 1..end], Dialect::Rust) {
@@ -149,7 +149,7 @@ fn compared_tags(text: &str, names: &BTreeSet<String>) -> BTreeSet<String> {
                     continue;
                 };
                 let brace = cursor + brace_off;
-                let Some(end) = matching_brace(text.as_bytes(), brace) else {
+                let Some(end) = matching_brace(text, brace, Dialect::JavaScript) else {
                     continue;
                 };
                 let body = &text[brace + 1..end];

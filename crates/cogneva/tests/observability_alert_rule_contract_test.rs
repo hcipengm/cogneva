@@ -32,6 +32,7 @@
 
 mod common;
 
+use common::lex::Dialect;
 use common::routes::{matching_paren, read_repo, repo_root};
 use common::service_topology;
 
@@ -5126,7 +5127,7 @@ fn strip_outer_parens(expr: &str) -> &str {
     // 配平的括号只有一处读法：开头那个 `(` 一直配到末尾，才算一层包装。
     while cur.starts_with('(')
         && cur.ends_with(')')
-        && matching_paren(cur.as_bytes(), 0) == Some(cur.len() - 1)
+        && matching_paren(cur, 0, Dialect::Rust) == Some(cur.len() - 1)
     {
         cur = cur[1..cur.len() - 1].trim();
     }
@@ -5409,7 +5410,7 @@ fn range_aggregate_operands(expr: &str) -> Vec<(&'static str, &str)> {
                 continue;
             }
             let inner_start = from + open + 1;
-            let Some(inner_end) = matching_paren(expr.as_bytes(), inner_start - 1) else {
+            let Some(inner_end) = matching_paren(expr, inner_start - 1, Dialect::Rust) else {
                 continue;
             };
             let arg = expr[inner_start..inner_end].trim();
@@ -5539,7 +5540,7 @@ fn set_operand_expression(operand: &str) -> &str {
             rest.starts_with('(').then_some(rest)
         });
     let expr = match rest {
-        Some(rest) => match matching_paren(rest.as_bytes(), 0) {
+        Some(rest) => match matching_paren(rest, 0, Dialect::Rust) {
             Some(end) => rest[end + 1..].trim_start(),
             None => t,
         },

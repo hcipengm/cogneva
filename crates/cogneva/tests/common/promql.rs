@@ -18,6 +18,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::common::lex::Dialect;
 use crate::common::routes::matching_paren;
 
 /// Aggregation operators and keywords that look like identifiers but name no
@@ -296,7 +297,7 @@ fn operand_close(s: &str, operator_end: usize) -> Option<usize> {
             j += 1;
         }
         if j < bytes.len() && bytes[j] as char == '(' {
-            j = matching_paren(s.as_bytes(), j)? + 1;
+            j = matching_paren(s, j, Dialect::Rust)? + 1;
         }
     }
     while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
@@ -305,7 +306,7 @@ fn operand_close(s: &str, operator_end: usize) -> Option<usize> {
     if j >= bytes.len() || bytes[j] as char != '(' {
         return None;
     }
-    matching_paren(s.as_bytes(), j)
+    matching_paren(s, j, Dialect::Rust)
 }
 
 /// The index of the `(` matching the `)` at `close`, if the text balances.
@@ -1263,7 +1264,7 @@ pub fn existence_only_reads(expr: &str, gated: &BTreeSet<String>) -> BTreeSet<St
         .match_indices(MARKER)
         .filter_map(|(at, marker)| {
             let open = at + marker.len() - 1;
-            matching_paren(stripped.as_bytes(), open).map(|close| (open, close))
+            matching_paren(&stripped, open, Dialect::Rust).map(|close| (open, close))
         })
         .collect();
     if spans.is_empty() {
