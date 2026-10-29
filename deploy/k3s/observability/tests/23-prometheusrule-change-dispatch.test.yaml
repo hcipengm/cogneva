@@ -189,9 +189,9 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x200'
-      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x200'
-      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x200'
     alert_rule_test:
       - eval_time: 59m
@@ -212,9 +212,9 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x721'
-      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://ark.cn-beijing.volces.com/api/plan/v3|ark-code-latest"}'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
         values: '0x721'
-      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://ark.cn-beijing.volces.com/api/plan/v3|ark-code-latest"}'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
         values: '86400x721'
     alert_rule_test:
       - eval_time: 12h
@@ -227,9 +227,9 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '1x721'
-      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
-      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
     alert_rule_test:
       - eval_time: 12h
@@ -243,9 +243,9 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x721'
-      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
-      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '60x721'
     alert_rule_test:
       - eval_time: 12h
@@ -258,18 +258,18 @@ tests:
 
   # 五、两个上游、一个说得出一个说不出：必须静。等得到的那个还在，等待仍然有指望。
   # 这一格钉的是量词——判据要写成「没有任何一个声明了未来时刻」，而不是「有一个没声明」。
-  # 写成后者的话这一格会亮，而现网正是这个形状（kimi 的重置时刻是 0、ark 的在下周）。
+  # 写成后者的话这一格会亮，而现网正是这个形状（一个上游的重置时刻是 0，另一个的在下周）。
   - interval: 1m
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x721'
-      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
-      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
         values: '0x721'
-      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://ark.cn-beijing.volces.com/api/plan/v3|ark-code-latest"}'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
         values: '0x721'
-      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="https://ark.cn-beijing.volces.com/api/plan/v3|ark-code-latest"}'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u2"}'
         values: '1793807999x721'
     alert_rule_test:
       - eval_time: 12h
@@ -283,13 +283,13 @@ tests:
     input_series:
       - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
         values: '0x721'
-      - series: 'llm_upstream_healthy{instance="10.42.0.142:8080",job="cogneva",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_healthy{instance="10.42.0.142:8080",job="cogneva",upstream="u1"}'
         values: '0x721'
-      - series: 'llm_upstream_healthy{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_healthy{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="u1"}'
         values: '0x721'
-      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.142:8080",job="cogneva",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.142:8080",job="cogneva",upstream="u1"}'
         values: '0x721'
-      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="https://api.kimi.com/coding/v1|k3"}'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.143:8080",job="cogneva-evolution",upstream="u1"}'
         values: '86400x721'
     alert_rule_test:
       - eval_time: 12h
