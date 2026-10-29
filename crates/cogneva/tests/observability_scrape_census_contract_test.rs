@@ -259,13 +259,38 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_owner_leases",
         Unread::NotAReading("the Postgres table the owner-lease rows live in, not a series: the same constant is also listed in NOT_A_SERIES so the literal scan does not read it as a producer"),
     ),
-    // `cogneva_boot_phase_elapsed_seconds` sat here from 2026-10-28 to
-    // 2026-10-29 and came off the way its entry said it would: the face it owed
-    // was a rule of the same shape as the footprint rule beside it, and that
-    // rule now exists. It was a rule and not a panel on purpose -- a single
-    // boot answers nothing, two boots apart are what a baseline is made of --
-    // and a panel written instead would have satisfied this census without
-    // answering the question the row was raised for.
+    // Published on 2026-10-28 by the change that started timing each startup
+    // phase instead of only weighing it. Its sibling `cogneva_boot_rss_bytes`
+    // has a face -- the rule that fires when a phase grows past its own 3-day
+    // baseline -- and this entry used to say a threshold was derivable here and
+    // the face owed was a rule of the same shape. It is not, and the rule that
+    // was written against that shape came back off before it landed.
+    //
+    // Measured on 2026-10-29 over the whole retention, per process kind: the
+    // app process reached `serving` in 24.1 s at its fastest and 236.2 s at its
+    // slowest inside three days; the evolution process, which loads no dense
+    // model and has four phases instead of seven, swings 2.1 s to 49.1 s over
+    // the same window. The quantity is wall clock from process entry, so one
+    // number carries the page cache, the host's load and the image's contents
+    // together. The sibling's quantity does not: resident set at a named moment
+    // is what the process allocated, and nothing the host did to it moves that.
+    //
+    // A bound wide enough to absorb a tenfold spread cannot name a phase that
+    // doubled, and one tight enough to name it fires on every roll -- on the
+    // day this was measured the window's fastest serving was 2.1 s while the
+    // one then running read 74.8 s, so any five-second bound would have been
+    // continuously true and pointed at nothing.
+    //
+    // What the series can answer needs the host's load read beside it: a
+    // startup that slowed on a quiet host is a different fact from one that
+    // slowed under a saturated one, and that companion reading does not exist.
+    // The entry stays a `Gap` for that reason, and its wording now says the
+    // debt is a paired reading rather than a threshold, which is cheaper to
+    // name than to write and is why it is still here.
+    (
+        "cogneva_boot_phase_elapsed_seconds",
+        Unread::Gap("how long each startup phase took, one series per phase. Its sibling on the same label has a rule and the same shape on this one was written and withdrawn: within one process kind the reading swings by an order of magnitude between rolls -- 24 to 236 seconds for the app process over three days -- because it is wall clock and carries the host's load and the page cache in the same number. A bound wide enough for that spread cannot name a phase that doubled, so the face owed is startup time read against the host's load at that same moment, and that companion does not exist"),
+    ),
     // Two names that had a `Gap` here until panels were written to carry them,
     // and the reason they came off this table is the reason the debts were real:
     //   `cogneva_volume_capacity_bytes` -- the growth loop's `declared` and
@@ -344,11 +369,14 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// loop's `declared` against its `peak` per claim, one drawing the four
 /// dimension ceilings against the ceiling in force.
 ///
-/// Fourteen, when `cogneva_boot_phase_elapsed_seconds` was rendered with nothing
-/// reading it: timing each startup phase landed the evening this count was last
-/// held, and the sibling series on the same label already had a rule. It was
-/// raised rather than exempted because the face owed is a rule of the same shape
-/// as the sibling's, which is a reader someone can write.
+/// Fourteen, and the one that took it up is `cogneva_boot_phase_elapsed_seconds`:
+/// timing each startup phase landed the evening this count was last held, the
+/// sibling series on the same label already had a rule, and the new one was
+/// rendered with nothing reading it. It was raised rather than exempted because
+/// the shape of the debt was known and looked writable -- see the entry for
+/// what the numbers said when someone went to write it, which is that the
+/// sibling's shape does not transfer to a wall-clock quantity and the entry's
+/// own claim that a threshold was derivable was wrong.
 ///
 /// Down to four when the pin census got its panels: the four pin families and
 /// the plugin population, each published as a count plus one series per member,
@@ -361,13 +389,7 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// one most worth checking afterwards, since a handful of names can leave a
 /// table in a single edit and nothing but the panels drawing them keeps them
 /// read.
-///
-/// Down to three when `boot_phase_slowed` was written: the row for
-/// `cogneva_boot_phase_elapsed_seconds` named a rule of the same shape as the
-/// footprint rule beside it, and that is what paid it. A panel was the cheaper
-/// edit and was not taken, because any reader satisfies this count while only
-/// the one the row named answers what the row was raised for.
-const GAPS_AT_SCRAPE_CENSUS: usize = 3;
+const GAPS_AT_SCRAPE_CENSUS: usize = 4;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
