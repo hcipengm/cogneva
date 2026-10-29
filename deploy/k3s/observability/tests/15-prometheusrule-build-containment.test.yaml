@@ -1,0 +1,109 @@
+# promtool 规则单测：构建闸外那两条判词**真的会 firing**，而且**只在它要抓的局面里**。
+#
+# 为什么要有这一层：两条规则的表达式都是 `max(<布尔读数>) == 1`——一个只取值 0/1 的旗子。
+# 这种形状在结构门上与「恒真」「恒假」完全同形，三种坏法全都过得了：
+#   * `== 1` 写成 `>= 0`（恒真）：宿主没被压着的时候也响，常亮把这条告警变成噪声；
+#   * `for:` 写成 `15y`：永远够不着，规则从此不响，而结构门看不出；
+#   * 去掉 `max()`：每台报信者各响一条——同一次事故变成 N 条告警，且 `job`／`instance`
+#     进了身份，两台的「同一件事」被拆成两件。
+# 这里让 Prometheus 自己的规则引擎跑一遍，每一格都带一份反向证据。
+#
+# 反向证据分三种，因为「什么时候不该响」有三种：
+#   * 宿主没被压着（读数是 0）——常态，不是「这一条先别响」；
+#   * 还没跑满 `for:` 的时长——短命的闸外构建撞上忙碌时段是常态，喊它就是把常亮换个长度；
+#   * 这一族序列整条缺席——生产者没跑或读不到。缺席不是 0：这一跑什么都没量，
+#     那是「宿主读数整条不见」那一族的事，不是这两条的。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/15-prometheusrule-host-readings.yaml \
+#         deploy/k3s/observability/tests/15-prometheusrule-build-containment.test.yaml
+#
+# `rule_files` 这一行由跑者重写：promtool 只认裸的 `groups:`，不认 PrometheusRule 这个
+# CRD。它从**清单本身**抽出 `spec.groups` 再改指过去——规则只有一份，测试读的就是它。
+rule_files:
+  - ../manifests/15-prometheusrule-host-readings.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、宿主被压着，闸外还有构建 ⇒ `for: 30m` 之前不响，之后必须响。
+  # 两片报信者同时报 1：这正是 `max()` 进没进表达式的分界——去掉 `max()` 会响两条，
+  # 而这一格只认一条。
+  - interval: 1m
+    input_series:
+      - series: 'build_containment_saturated_uncontained{job="cogneva-host-readings",instance="cogneva"}'
+        values: '1x200'
+      - series: 'build_containment_saturated_uncontained{job="cogneva-host-readings",instance="cogneva-peer"}'
+        values: '1x200'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaBuildOutsideTheGate
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CognevaBuildOutsideTheGate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+
+  # 二、负对照：宿主没被压着（读数是 0，闸外有构建但机器够用）。这一格抓的是界被写成
+  # `>= 0`——没有它，「今天不忙」与「永远在响」在夹具上分不开。
+  - interval: 1m
+    input_series:
+      - series: 'build_containment_saturated_uncontained{job="cogneva-host-readings",instance="cogneva"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaBuildOutsideTheGate
+        exp_alerts: []
+
+  # 三、负对照：这一族序列整条缺席。缺席不等于 1，也不等于 0：这一跑什么都没量。
+  - interval: 1m
+    input_series:
+      - series: 'build_containment_builds{containment="inside",job="cogneva-host-readings",instance="cogneva"}'
+        values: '1x200'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaBuildOutsideTheGate
+        exp_alerts: []
+
+  # 四、构建在 slice 里，但那个 slice 没有配额 ⇒ `for: 10m` 之前不响，之后必须响。
+  # 同样带两片报信者，理由同上。
+  - interval: 1m
+    input_series:
+      - series: 'build_containment_slice_unbounded{job="cogneva-host-readings",instance="cogneva"}'
+        values: '1x200'
+      - series: 'build_containment_slice_unbounded{job="cogneva-host-readings",instance="cogneva-peer"}'
+        values: '1x200'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CognevaBuildSliceUnbounded
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CognevaBuildSliceUnbounded
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "资源管理"
+
+  # 五、负对照：slice 有配额（读数是 0）。抓的是同一件事：界被写成 `>= 0`。
+  - interval: 1m
+    input_series:
+      - series: 'build_containment_slice_unbounded{job="cogneva-host-readings",instance="cogneva"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaBuildSliceUnbounded
+        exp_alerts: []
+
+  # 六、负对照：这一族序列整条缺席，理由同第三格。
+  - interval: 1m
+    input_series:
+      - series: 'build_containment_slice_builds{job="cogneva-host-readings",instance="cogneva"}'
+        values: '2x200'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaBuildSliceUnbounded
+        exp_alerts: []
