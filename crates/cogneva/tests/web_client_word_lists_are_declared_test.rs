@@ -922,12 +922,26 @@ fn quoted(text: &str) -> Vec<String> {
     words
 }
 
+/// 一条 SQL 语句里的字符串字面量。写给 `role` 列的那个词在这一层，不在 Rust 层：
+/// SQL 常量外面那对双引号是 Rust 的，里面单引号包着的才是落进列里的字节。
+fn sql_quoted(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('\'') {
+        let after = &rest[open + 1..];
+        let Some(close) = after.find('\'') else { break };
+        words.push(after[..close].to_string());
+        rest = &after[close + 1..];
+    }
+    words
+}
+
 /// 「这句话是谁说的」是全平台最短的一张词表，而它被写了四遍：聊天帧的联合类型、
 /// 落盘对话行的 `ChatTurnRole`、聊天套接字 `message.start` 帧的实参，以及界面
 /// 按角色选称呼的那几支。第四份就写在客户端里，也就是本门读的这一份。
 ///
-/// 三个可能的写者里有两个是真写者：套接字帧（`emit_message_start`）与落盘行
-/// （`ChatTurnRole::as_str`）。第三处 `cog_core::Message::role()` 也能返回角色，
+/// 三个可能的写者里有两个是真写者：套接字帧（`emit_message_start`）与落盘行的
+/// INSERT 语句（`role` 列的值就写在 SQL 字面量里）。第三处 `cog_core::Message::role()` 也能返回角色，
 /// 但它服务的是模型请求的组装，聊天面上一格都到不了——它的 `"tool"` 从来没在
 /// 这两个通道上出现过，所以不在这张表里；真有一天到了，写者那一侧先红。
 ///
@@ -977,22 +991,33 @@ fn the_chat_roles_the_client_names_are_the_roles_the_writers_write() {
     frames.sort();
     frames.dedup();
 
-    // 写者二：落盘的一行是谁说的。
+    // 写者二：落盘的一行是谁说的。`role` 列的值写在这几条 INSERT 语句里，读的是
+    // SQL 那一层的字面量而不是契约层的 `ChatTurnRole::as_str`：`as_str` 只是说这一
+    // 列的拼法该长什么样，真正落到磁盘上的是这里的字节，存储层把词换掉而声明不动，
+    // 读声明的那一版照样绿。
     let store_path = repo_root().join("crates/cog-storage/src/postgres/chat_turn_store.rs");
     let store = std::fs::read_to_string(&store_path)
         .unwrap_or_else(|e| panic!("{}: {e}", store_path.display()));
-    let at = store
-        .find("pub fn as_str(self)")
-        .expect("`ChatTurnRole::as_str` 不在了；本门通过它读落盘对话行的角色词");
-    let body = &store[at..];
-    let end = body
-        .find("\n    }")
-        .expect("`ChatTurnRole::as_str` 的函数体没有闭合");
-    let mut stored: Vec<String> = quoted(&body[..end])
-        .into_iter()
+    let inserts: Vec<&str> = store
+        .match_indices("INSERT INTO chat_turns (")
+        .map(|(at, _)| {
+            let rest = &store[at..];
+            &rest[..rest.find("\";").unwrap_or(rest.len())]
+        })
+        .collect();
+    assert!(
+        inserts.len() >= 3,
+        "只读到 {} 条 `INSERT INTO chat_turns`：落盘的角色词就写在这几条语句的 SQL \
+         字面量里，少读一条就等于少判一个写入路径",
+        inserts.len()
+    );
+    let mut stored: Vec<String> = inserts
+        .iter()
+        .flat_map(|sql| sql_quoted(sql))
         .filter(|word| !word.is_empty())
         .collect();
     stored.sort();
+    stored.dedup();
 
     assert_eq!(
         frames, stored,
