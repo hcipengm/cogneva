@@ -1131,17 +1131,57 @@ fn kept_row_repair(existing: &Task, running: bool) -> Option<Task> {
 /// An empty workspace means this deployment has no DAG workspace configured, so
 /// there is nowhere these rows could be; that is said out loud rather than
 /// counted as "no row needed repair", because the two call for opposite fixes.
+///
+/// The face node itself is published here too, under its own id. The roster
+/// keeps that node in its own workspace, while the duties that answer to it are
+/// written into the executing one -- so the parent pointer those duties carry
+/// names a row no reader of their workspace can find. Every reader is scoped to
+/// one workspace (`dag_get_all_tasks(workspace)`, and the project views filter
+/// what that returns), so a parent in the other one is dangling by construction:
+/// the tree reports each duty as orphaned, `replan` refuses a group with no root,
+/// and the fix that put the pointer there reads as never having landed. Publishing
+/// the root beside its children is what makes the pointer resolvable; the roster
+/// copy stays the record of who owns the face.
+fn face_root_repair(face: &Face, workspace: &str, existing: Option<&Task>) -> Option<Task> {
+    if let Some(row) = existing {
+        if row.status == TaskStatus::Running
+            || matches!(
+                row.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            )
+        {
+            return None;
+        }
+    }
+    let mut shaped = face.to_task(existing.cloned());
+    shaped.workspace_id = Some(workspace.to_string());
+    match existing {
+        Some(row) if row == &shaped => None,
+        _ => Some(shaped),
+    }
+}
+
+/// What one settle pass wrote, cell by cell: the roots published beside their
+/// duties, and the duty rows put back into their shape.
+pub struct SettledRows {
+    pub roots: usize,
+    pub duties: usize,
+}
+
 async fn settle_standing_rows(
     store: &dyn GovernanceStore,
     pool: &sqlx::PgPool,
     workspace: &str,
-) -> Result<usize, Box<dyn Error>> {
+) -> Result<SettledRows, Box<dyn Error>> {
     if workspace.trim().is_empty() {
         eprintln!(
             "cogneva governance: no dag_executor.workspace_id is configured, so no standing row \
              was settled; the faces read as projects with no children until one is set"
         );
-        return Ok(0);
+        return Ok(SettledRows {
+            roots: 0,
+            duties: 0,
+        });
     }
     let backend = PostgresStateBackend::new(pool.clone());
     let faces: Vec<Face> = store
@@ -1150,8 +1190,15 @@ async fn settle_standing_rows(
         .iter()
         .filter_map(Face::from_task)
         .collect();
+    let mut roots = 0usize;
     let mut repaired = 0usize;
     for face in faces {
+        let root_id = face.face_id.clone();
+        let existing_root = backend.dag_get_task(workspace, &root_id).await?;
+        if let Some(root) = face_root_repair(&face, workspace, existing_root.as_ref()) {
+            backend.dag_set_task(workspace, &root_id, &root).await?;
+            roots += 1;
+        }
         let id = cog_orchestrator::governance_acts::face_work_id(&face.face_id);
         let Some(existing) = backend.dag_get_task(workspace, &id).await? else {
             continue;
@@ -1168,7 +1215,10 @@ async fn settle_standing_rows(
             repaired += 1;
         }
     }
-    Ok(repaired)
+    Ok(SettledRows {
+        roots,
+        duties: repaired,
+    })
 }
 
 /// What one roster import did, cell by cell.
@@ -1304,9 +1354,18 @@ async fn import_faces(
     // Before the refusal below: an import that erased a binding still wrote the
     // rows it was asked to write, and the shape of the standing rows is a
     // separate fact from who owns the faces.
-    let repaired = settle_standing_rows(store, pool, workspace).await?;
-    if repaired > 0 {
-        println!("settled {repaired} standing row(s) into the rooted shape");
+    let settled = settle_standing_rows(store, pool, workspace).await?;
+    if settled.roots > 0 {
+        println!(
+            "published {} face root(s) beside their duties in workspace {workspace}",
+            settled.roots
+        );
+    }
+    if settled.duties > 0 {
+        println!(
+            "settled {} standing row(s) into the rooted shape",
+            settled.duties
+        );
     }
     // The line is printed before this refusal so a reader of the log sees the
     // count it is about; the exit code is what makes it a failure rather than a
@@ -1544,6 +1603,97 @@ mod tests {
         row.workspace_id = Some("default".into());
         row.is_executable = true;
         row
+    }
+
+    /// A face the roster holds in its own workspace has no root in the one its
+    /// duties are written to. Every reader is scoped to a single workspace, so
+    /// the parent pointer those duties carry resolves to nothing: the tree lists
+    /// each duty as orphaned, `replan` refuses a group with no root, and the
+    /// graph reads as a face with no work at all. Publishing the root beside
+    /// its children is what makes the pointer resolvable.
+    #[test]
+    fn a_face_with_no_root_in_the_executor_workspace_gets_one() {
+        let face = a_face();
+
+        let root = face_root_repair(&face, "default", None)
+            .expect("a workspace holding no root for this face has nothing to keep");
+
+        assert_eq!(
+            root.id, "通信",
+            "the root answers to the face's own id: {root:?}"
+        );
+        assert_eq!(
+            root.parent_task_id, None,
+            "the root is the row with no parent, which is what `replan` looks for: {root:?}"
+        );
+        assert_eq!(
+            root.goal_id.as_deref(),
+            Some("通信"),
+            "the root names the project its duties group under: {root:?}"
+        );
+        assert_eq!(
+            root.workspace_id.as_deref(),
+            Some("default"),
+            "the root has to live where its children are read, not in the roster's workspace: {root:?}"
+        );
+        assert!(
+            !root.is_executable,
+            "a standing root is not work, so no queue may pick it up: {root:?}"
+        );
+        assert_eq!(root.status, TaskStatus::Pending);
+    }
+
+    /// The row found in the executor workspace can only be one a previous pass
+    /// published. Writing it again every pass churns the graph and says a
+    /// repair happened when nothing needed one.
+    #[test]
+    fn a_root_already_published_beside_its_duties_costs_no_write() {
+        let face = a_face();
+        let published = face_root_repair(&face, "default", None)
+            .expect("the first pass has to publish the root");
+
+        assert_eq!(
+            face_root_repair(&face, "default", Some(&published)),
+            None,
+            "a root already in place must not be written again: {published:?}"
+        );
+    }
+
+    /// The root is written whole, so a pass that rewrote a row the executor is
+    /// already running replaces its progress with the settled shape. A finished
+    /// row is left to the next `assign`, which re-creates it from that shape.
+    #[test]
+    fn a_root_the_executor_is_running_or_has_finished_is_left_alone() {
+        let face = a_face();
+        let published = face_root_repair(&face, "default", None)
+            .expect("the first pass has to publish the root");
+
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let mut row = published.clone();
+            row.status = status;
+            assert_eq!(
+                face_root_repair(&face, "default", Some(&row)),
+                None,
+                "a {status:?} row carries state the settled shape does not: {row:?}"
+            );
+        }
+    }
+
+    /// One staffed face as the roster import leaves it: owned, described, and
+    /// bound to no handover.
+    fn a_face() -> Face {
+        Face {
+            face_id: "通信".into(),
+            owner_unit: Some("c2".into()),
+            bound_by_handover_id: None,
+            spec: FaceSpec::first("通信", FaceKind::Face),
+            updated_at: Utc::now(),
+        }
     }
 
     /// A row the drift pass released must not be handed back to the absent
