@@ -83,6 +83,14 @@ pub fn caller_agent_id() -> Option<String> {
 /// 字符）自动变成可分页的几段。
 const READ_FILE_DEFAULT_WINDOW_LINES: usize = 600;
 
+/// 一页最多带多少个字符，行数没到也停下来。
+///
+/// 行数不是字节：一份压缩过的 JSON、一张宽表、一行几十万字符的日志，600 行
+/// 可以轻松超过一次对话里任何一段的体量。这一页之后每一轮都要重发，所以
+/// 两道界取更紧的那道；被这道界停下来的页面照样带 `has_more` 与
+/// `next_offset`，翻页不会漏行。
+const READ_FILE_PAGE_MAX_CHARS: usize = 32 * 1024;
+
 /// 按行切出 `read_file` 调用方要的那一段。
 ///
 /// 整份读回来再整份塞进 tool_result 的代价不在磁盘上：这份正文进了上下文，
@@ -99,23 +107,37 @@ fn read_window(text: &str, offset: Option<u64>, limit: Option<u64>) -> serde_jso
     // 整段对话的命中去掉一大块。`has_more` 与 `next_offset` 让读的人
     // 知道后面还有、从哪继续，而不是把「到这儿就结束了」当成结论。
     let limit = limit.or_else(|| {
-        (total > READ_FILE_DEFAULT_WINDOW_LINES).then_some(READ_FILE_DEFAULT_WINDOW_LINES as u64)
+        let too_long = total > READ_FILE_DEFAULT_WINDOW_LINES
+            || text.chars().count() > READ_FILE_PAGE_MAX_CHARS;
+        too_long.then_some(READ_FILE_DEFAULT_WINDOW_LINES as u64)
     });
     if offset.is_none() && limit.is_none() {
         return serde_json::json!({ "content": text });
     }
     let start = offset.unwrap_or(1).max(1) as usize;
-    let end = match limit {
+    let wanted = match limit {
         Some(want) => start
             .saturating_sub(1)
             .saturating_add(want as usize)
             .min(total),
         None => total,
     };
+    // 行数与字符两道界取更紧的那道。至少给一行：一行就超预算时如果不给，
+    // `next_offset` 永远停在同一个位置，翻页就成了死循环。
+    let mut end = start.saturating_sub(1).min(total);
+    let mut chars = 0usize;
+    while end < wanted {
+        let line = lines[end].len();
+        if end > start.saturating_sub(1) && chars + line + 1 > READ_FILE_PAGE_MAX_CHARS {
+            break;
+        }
+        chars += line + 1;
+        end += 1;
+    }
     let slice: Vec<&str> = if start > total {
         Vec::new()
     } else {
-        lines[start - 1..end.max(start - 1)].to_vec()
+        lines[start - 1..end].to_vec()
     };
     let has_more = end < total;
     serde_json::json!({
@@ -1376,6 +1398,49 @@ mod tests {
                 .starts_with(&format!("line {next}")),
             "续读必须从上一页的下一行开始，不重不漏"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 行数没到也不是无限给：超长行照样要分页。
+    ///
+    /// 一页是给上下文的一笔预算，行数只是它的一半口径。压缩过的 JSON、一行
+    /// 几十万字符的日志，600 行能有几兆——那样一页和整份读没有区别，翻页
+    /// 也就白加了。
+    #[tokio::test]
+    async fn a_page_stops_on_characters_even_when_the_line_count_is_small() {
+        let dir = std::env::temp_dir().join(format!("cog-tools-chars-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.txt");
+        let path = path.to_str().unwrap();
+        // 8 行、每行 10000 字符：行数远没到 600，字节数是 80000。
+        let body: String = (1..=8)
+            .map(|i| format!("{}{i}\n", "x".repeat(9999)))
+            .collect();
+
+        let registry = ToolRegistry::new().with_sandbox_backend(Arc::new(LocalShellBackend));
+        cog_core::ToolRegistry::register(&registry, builtins::read_file());
+        cog_core::ToolRegistry::register(&registry, builtins::write_file());
+        registry
+            .execute(
+                "write_file",
+                serde_json::json!({"path": path, "content": body}),
+            )
+            .await
+            .unwrap();
+
+        let first = registry
+            .execute("read_file", serde_json::json!({"path": path}))
+            .await
+            .unwrap();
+        assert_eq!(first["total_lines"], 8);
+        assert_eq!(first["has_more"], true);
+        assert_eq!(
+            first["content"].as_str().unwrap().lines().count(),
+            3,
+            "三万字符一页：三行就够，第四行会把它推到 40000"
+        );
+        assert_eq!(first["next_offset"], 4);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
