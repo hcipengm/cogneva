@@ -51,6 +51,16 @@
 //! The phase set is a closed list for the same reason a label is ever closed:
 //! the series' cardinality is decided by it, and a free-form phase name would
 //! let one caller's typo become a second series that no rule reads.
+//!
+//! Each of those lines also carries **`cpu_seconds`** for the same instant --
+//! not a series, only a field. Elapsed time alone cannot say whether a slow
+//! phase was working or waiting: the same work costs about the same CPU time
+//! however long it is made to wait, so a phase whose elapsed time rose while
+//! its CPU time did not is a phase that was not given a core. The field is not
+//! published as a series because a phase's value is cumulative and its meaning
+//! is the difference from the phase before it, which is the reader's arithmetic
+//! either way; keeping it in the line costs no cardinality and answers the one
+//! question the two numbers together are asked.
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -143,6 +153,10 @@ pub fn mark(phase: &'static str) {
             .elapsed()
             .as_secs_f64()
     };
+    // CPU time is taken beside the wall clock and for the same reason: it
+    // describes this instant, and the two are only comparable when they were
+    // read at the same instant.
+    let cpu_seconds = process_cpu_seconds();
     let rss = resident_bytes();
     marks.push(Mark {
         phase,
@@ -155,11 +169,34 @@ pub fn mark(phase: &'static str) {
             .position(|x| *x == m.phase)
             .unwrap_or(usize::MAX)
     });
-    match rss {
-        Some(rss) => {
+    announce(phase, rss, elapsed_seconds, cpu_seconds);
+}
+
+/// Prints the line a reached phase is announced with.
+///
+/// One place prints it, so a field added here reaches every shape the line
+/// takes -- with or without a resident reading, with or without a CPU reading --
+/// rather than the one an edit happened to touch. A field that reaches only
+/// some of the shapes is read as absent by whoever greps the others.
+fn announce(phase: &'static str, rss: Option<u64>, elapsed_seconds: f64, cpu_seconds: Option<f64>) {
+    match (rss, cpu_seconds) {
+        (Some(rss), Some(cpu_seconds)) => tracing::info!(
+            phase,
+            rss,
+            elapsed_seconds,
+            cpu_seconds,
+            "boot footprint: phase reached"
+        ),
+        (Some(rss), None) => {
             tracing::info!(phase, rss, elapsed_seconds, "boot footprint: phase reached")
         }
-        None => tracing::info!(
+        (None, Some(cpu_seconds)) => tracing::info!(
+            phase,
+            elapsed_seconds,
+            cpu_seconds,
+            "boot footprint: phase reached, but resident memory could not be read here"
+        ),
+        (None, None) => tracing::info!(
             phase,
             elapsed_seconds,
             "boot footprint: phase reached, but resident memory could not be read here"
@@ -202,6 +239,28 @@ pub fn clear_for_tests() {
         Ok(mut o) => *o = None,
         Err(e) => *e.into_inner() = None,
     }
+}
+
+/// Seconds of CPU this process has been scheduled for so far, summed over
+/// every thread, or `None` where the clock cannot be read.
+///
+/// `CLOCK_PROCESS_CPUTIME_ID` is the quantity the scheduler itself accounts,
+/// already in seconds and already summed over threads, so it needs neither the
+/// platform's tick rate nor a walk over per-thread readings. `None` rather than
+/// zero on failure: zero would read as "this phase did no work", which is the
+/// exact opposite of what an unreadable clock means.
+fn process_cpu_seconds() -> Option<f64> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a live `timespec` the call fills in, and the clock id is a
+    // constant this platform defines.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_PROCESS_CPUTIME_ID, &mut ts) };
+    if rc != 0 {
+        return None;
+    }
+    Some(ts.tv_sec as f64 + ts.tv_nsec as f64 / 1e9)
 }
 
 /// This process's resident bytes from `/proc/self/status`, or `None` where that
@@ -307,11 +366,14 @@ mod tests {
         clear_for_tests();
     }
 
-    /// One event as it reaches a log backend: its level and the phase it named.
+    /// One event as it reaches a log backend: its level and the fields the
+    /// reader of this line is meant to find.
     #[derive(Clone, Debug)]
     struct Logged {
         level: tracing::Level,
         phase: Option<String>,
+        rss: Option<u64>,
+        cpu_seconds: Option<f64>,
     }
 
     /// A log backend that only records what it was handed.
@@ -326,8 +388,10 @@ mod tests {
             let mut logged = Logged {
                 level: *event.metadata().level(),
                 phase: None,
+                rss: None,
+                cpu_seconds: None,
             };
-            let mut fields = PhaseField(&mut logged.phase);
+            let mut fields = Fields(&mut logged);
             event.record(&mut fields);
             self.0
                 .lock()
@@ -336,18 +400,30 @@ mod tests {
         }
     }
 
-    struct PhaseField<'a>(&'a mut Option<String>);
+    struct Fields<'a>(&'a mut Logged);
 
-    impl tracing::field::Visit for PhaseField<'_> {
+    impl tracing::field::Visit for Fields<'_> {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
             if field.name() == "phase" {
-                *self.0 = Some(value.to_string());
+                self.0.phase = Some(value.to_string());
             }
         }
 
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             if field.name() == "phase" {
-                *self.0 = Some(format!("{value:?}"));
+                self.0.phase = Some(format!("{value:?}"));
+            }
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "rss" {
+                self.0.rss = Some(value);
+            }
+        }
+
+        fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+            if field.name() == "cpu_seconds" {
+                self.0.cpu_seconds = Some(value);
             }
         }
     }
@@ -378,6 +454,11 @@ mod tests {
             1,
             "reaching a phase printed {} lines naming it: {events:?}",
             reached.len()
+        );
+        assert!(
+            reached[0].cpu_seconds.is_some(),
+            "the line a reached phase prints carries no cpu_seconds, so a slow phase \
+             still cannot be told apart from a starved one: {reached:?}"
         );
         assert_eq!(
             reached[0].level,
@@ -444,6 +525,70 @@ mod tests {
             "re-marking a phase moved the time it was reached at"
         );
         clear_for_tests();
+    }
+
+    /// What this clock has to do, and the one thing it is not asserted to do
+    /// here: a phase that sleeps shows no CPU *in a process with only itself
+    /// running*, and `cargo test` never gives it that -- the sibling tests run as
+    /// threads of the same process, so the process's CPU time keeps rising while
+    /// this test sleeps. Asserting the sleeping half went red at 0.05 s the first
+    /// time it ran beside the rest of this crate's suite, which is the shape of a
+    /// gate that fails for a reason unrelated to the code. So the test holds the
+    /// half that is this process's own: work done here moves the clock by about
+    /// the work done.
+    #[test]
+    fn the_cpu_clock_advances_with_the_work_this_process_does() {
+        let before = process_cpu_seconds().expect("the process CPU clock is readable here");
+        let start = Instant::now();
+        let mut spin = 0u64;
+        while start.elapsed() < std::time::Duration::from_millis(120) {
+            spin = spin.wrapping_add(1);
+        }
+        std::hint::black_box(spin);
+        let after = process_cpu_seconds().expect("the process CPU clock is readable here");
+        assert!(
+            after >= before,
+            "the process CPU clock ran backwards: {before} -> {after}"
+        );
+        assert!(
+            after - before >= 0.08,
+            "120 ms of spinning moved the CPU clock by only {:.3} s: a phase that computed \
+             would read the same as one that waited",
+            after - before
+        );
+    }
+
+    #[test]
+    fn a_phase_announced_without_its_memory_still_carries_its_cpu_time() {
+        use tracing_subscriber::prelude::*;
+
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&logged)));
+        tracing::subscriber::with_default(subscriber, || {
+            announce("serving", Some(4096), 0.0, Some(1.5));
+            announce("serving", None, 0.0, Some(1.5));
+            announce("serving", Some(4096), 0.0, None);
+            announce("serving", None, 0.0, None);
+        });
+
+        let fields: Vec<(Option<u64>, Option<f64>)> = logged
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|e| (e.rss, e.cpu_seconds))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                (Some(4096), Some(1.5)),
+                (None, Some(1.5)),
+                (Some(4096), None),
+                (None, None),
+            ],
+            "every shape of the line has to carry the CPU reading it has: the shape that \
+             drops the resident number is the one the reader greps when procfs is missing, \
+             and a field present in only some shapes reads as absent in the others"
+        );
     }
 
     #[test]
