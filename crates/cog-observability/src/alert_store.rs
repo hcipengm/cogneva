@@ -78,6 +78,20 @@ CREATE TABLE IF NOT EXISTS alert_assertions (
                 PRIMARY KEY (dedup_key, writer)
             )
 ;
+-- `CREATE TABLE IF NOT EXISTS` says nothing to a table that is already there,
+-- so a table created before this column existed keeps the old shape for good
+-- and every insert that names the column fails -- which reads on the surface as
+-- "no writer ever asserted anything", not as a schema that stopped moving.
+-- Measured on 2026-10-29: a table written by an earlier revision of this DDL
+-- was still three columns wide on the cluster, and the writer's own verdicts
+-- were dropped silently while the shared rows kept updating. Added the same way
+-- `alerts.writer` is, and the default exists only to backfill the rows that
+-- predate it: dropped afterwards so a fresh table and a migrated one have the
+-- same shape.
+ALTER TABLE alert_assertions ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT ''
+;
+ALTER TABLE alert_assertions ALTER COLUMN role DROP DEFAULT
+;
 CREATE INDEX IF NOT EXISTS idx_alert_assertions_observed ON alert_assertions(observed_at DESC)
 ;
 CREATE INDEX IF NOT EXISTS idx_alerts_state ON alerts(state, fired_at DESC);
@@ -964,6 +978,77 @@ mod tests {
         assert!(close.contains(&format!("state = '{resolved}'")), "{close}");
         assert!(close.contains(&format!("state = '{firing}'")), "{close}");
         assert_eq!(AlertState::parse("recovered"), None);
+    }
+
+    /// 一张在 `role` 存在之前建出来的表，不会因为建表语句再跑一遍就长出这一列。
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` 对已经在那儿的表是一句空话：它不校验列，也不
+    /// 补列。先跑的旧版本把表留成三列之后，后来每一笔按名字写 `role` 的断言都在
+    /// 准备阶段报 `column "role" ... does not exist` —— 而这一行日志读起来不像
+    /// 「表停在旧形状」，像「没有任何写者断言过任何东西」。线上就是这个形状：
+    /// `alerts` 一直在更新，`alert_assertions` 停在几天前的三行测试残留。
+    ///
+    /// 所以整条写路径（而不仅是列是否存在）在一个旧形状的表上跑一遍：建表语句要
+    /// 补上这一列，补完之后 `set_alert` 的断言要真的落成一行。
+    #[tokio::test]
+    #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+    async fn a_table_created_before_the_role_column_takes_it() {
+        let url = cog_test_support::database_url();
+        let schema = cog_test_support::own_schema(&url, "alert_assert_role").await;
+        let pool = cog_test_support::schema_pool(&url, &schema).await;
+
+        // 早一版建表语句留下的三列形状，外加一行比这一列更早的断言行：迁移能不能
+        // 跑通是一回事，旧行迁移后读作什么值是另一回事。
+        sqlx::query(
+            "CREATE TABLE alert_assertions (\
+                 dedup_key TEXT NOT NULL, writer TEXT NOT NULL, state TEXT NOT NULL, \
+                 observed_at TIMESTAMPTZ NOT NULL, PRIMARY KEY (dedup_key, writer))",
+        )
+        .execute(&pool)
+        .await
+        .expect("the older shape is created");
+        sqlx::query(
+            "INSERT INTO alert_assertions (dedup_key, writer, state, observed_at) \
+             VALUES ('older-row', 'older-writer', 'firing', now())",
+        )
+        .execute(&pool)
+        .await
+        .expect("a row from before the column exists");
+
+        let store = PostgresAlertStore::with_identity(pool.clone(), "test-writer", "test-role");
+        let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+        store
+            .init_schema(&schema_runner)
+            .await
+            .expect("the schema text runs against a table an older revision built");
+
+        let said = alert(POOL_MESSAGE, 1_789_744_595, "critical");
+        store
+            .set_alert(true, &said)
+            .await
+            .expect("写断言这条路在一张迁移过的表上必须能走通");
+
+        let backfilled: String =
+            sqlx::query_scalar("SELECT role FROM alert_assertions WHERE dedup_key = 'older-row'")
+                .fetch_one(&pool)
+                .await
+                .expect("the column this DDL adds is readable");
+        assert_eq!(
+            backfilled, "",
+            "迁移前就有的行补空角色：它们是这一列出现之前写的，猜一个角色就是把\
+             「不知道」写成「知道」"
+        );
+
+        let role: String = sqlx::query_scalar(
+            "SELECT role FROM alert_assertions WHERE dedup_key = $1 AND writer = 'test-writer'",
+        )
+        .bind(&said.dedup_key)
+        .fetch_one(&pool)
+        .await
+        .expect("the assertion the store just wrote is on the table");
+        assert_eq!(role, "test-role", "新写入的断言带上写者的角色");
+
+        cog_test_support::drop_schema(&url, &schema).await;
     }
 
     /// The state machine is the part worth pinning down; `set_alert` is pure
