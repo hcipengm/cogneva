@@ -21,10 +21,21 @@ deployment, for as long as the reading had.
 
 What is judged, and nothing else: a step whose text opens a connection to a
 live service -- `COGNEVA_TEST_DATABASE_URL` or `COGNEVA_TEST_REDIS_URL`, in its
-`run:` or in its `env:` -- must carry an `if:` that survives an earlier
-failure (`!cancelled()` or `always()`), alone or combined with a condition of
-its own. A step that needs both "not cancelled" and "this is the main branch"
-writes both, and passes.
+`run:`, in its own `env:`, or in an `env:` it inherits from its job or from the
+workflow -- must carry an `if:` that survives an earlier failure
+(`!cancelled()` or `always()`), alone or combined with a condition of its own.
+A step that needs both "not cancelled" and "this is the main branch" writes
+both, and passes. Inheritance is read because a variable lifted one level up
+reaches the same steps while leaving no marker in any of them: a gate that read
+only the step would report agreement for exactly that tidy-up.
+
+An inherited variable flags every step in the job, including ones that plainly
+connect to nothing. That is deliberate and it is the conservative direction:
+nothing in the workflow says which steps use an inherited variable -- a test
+binary reads it from the environment without naming it anywhere -- so the job
+is judged as one chain. The remedy is either the condition on each step of a
+job that is genuinely all live, or putting the variable back on the steps that
+use it, where the gate can see them.
 
 What is deliberately not judged: steps that need no live service. Their
 framing question is different -- they may legitimately depend on a build that
@@ -58,11 +69,24 @@ MIN_STEPS = 100
 MIN_LIVE_STEPS = 30
 
 
-def step_text(step):
+def env_text(env):
+    if not isinstance(env, dict):
+        return []
+    return [f"{key}={value}" for key, value in env.items()]
+
+
+def step_text(step, inherited):
+    """A step's text including the environment it inherits.
+
+    A variable written at workflow or job level reaches every step under it,
+    so a step that opens a connection because of an inherited variable is a
+    live step with no marker in its own body. Reading only the step would
+    report agreement for exactly the arrangement that moves the marker out of
+    sight -- and moving it up one level is a common tidy-up, not a rare one.
+    """
     parts = [str(step.get("run") or ""), str(step.get("name") or "")]
-    env = step.get("env") or {}
-    if isinstance(env, dict):
-        parts.extend(f"{key}={value}" for key, value in env.items())
+    parts.extend(inherited)
+    parts.extend(env_text(step.get("env")))
     return "\n".join(parts)
 
 
@@ -80,20 +104,33 @@ def main():
         for job_name, job in (workflow.get("jobs") or {}).items():
             if not isinstance(job, dict):
                 continue
+            inherited = env_text(workflow.get("env")) + env_text(job.get("env"))
             for index, step in enumerate(job.get("steps") or [], start=1):
                 if not isinstance(step, dict):
                     continue
                 examined += 1
-                text = step_text(step)
+                own = step_text(step, [])
+                text = "\n".join([own, *inherited])
                 if not any(marker in text for marker in LIVE_MARKERS):
                     continue
                 live += 1
                 condition = str(step.get("if") or "")
                 if any(survives in condition for survives in SURVIVES_A_FAILURE):
                     continue
+                # Which variable made it live, and whether it is the step's own.
+                # An inherited one flags every step under it, because nothing in
+                # the workflow says which of them actually connect.
+                inherited_text = "\n".join(inherited)
+                declared = [marker for marker in LIVE_MARKERS if marker in own]
+                if not declared:
+                    declared = [marker for marker in LIVE_MARKERS if marker in inherited_text]
+                    source = "inherited "
+                else:
+                    source = ""
                 offenders.append(
                     f"{path}: job `{job_name}`, step {index} "
-                    f"`{step.get('name') or '<unnamed>'}` (if: {condition or 'none'})"
+                    f"`{step.get('name') or '<unnamed>'}` (if: {condition or 'none'}, "
+                    f"{source}{' / '.join(declared)})"
                 )
 
     if examined < MIN_STEPS:
@@ -119,7 +156,11 @@ def main():
             print(f"  {offender}")
         print(
             'add `if: ${{ !cancelled() }}` to each -- on its own or combined with the '
-            "condition already there -- so a red earlier in the job does not silence them"
+            "condition already there -- so a red earlier in the job does not silence them. "
+            "A step flagged with an `inherited` variable is in a job that declares one, and "
+            "every step under it is flagged for the same reason: the workflow does not say "
+            "which of them connect. Either give those steps the condition too, or move the "
+            "variable back to the steps that use it"
         )
         return 1
 
