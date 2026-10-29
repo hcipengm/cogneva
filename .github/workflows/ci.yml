@@ -1222,6 +1222,14 @@ jobs:
       # 连接键集），判不动的计数上报，不折进绿里。
       - name: Check alert rules declare the many side of a join
         run: bash deploy/scripts/check-alert-rule-join-shape.sh
+      # 启动相位那三条序列有两个发布者：应用与进化 Pod 都跑同一段库代码，各发布一份，
+      # 标签只差 job/pod/instance。只按 phase 折叠于是不是「把重复压成一个」，而是换主语——
+      # 2026-10-29 `boot_phase_footprint_grew` 报应用涨了 47.03 倍，两个分母都是进化 Pod
+      # 的值（应用同一时刻只涨了 1.003 倍）。渲染期没有症状：表达式合法、promtool 绿、
+      # 规则此刻安静。判据读结构——每一处选择器点名 writer，或每一处折叠键都带 job——
+      # 射程含面板的 expr，因为「新面板按 phase 画一条合并曲线」是同一件事的另一种形状。
+      - name: Check boot-phase series pin their writer
+        run: bash deploy/scripts/check-boot-series-writer-pinned.sh
       # 告警链五环里前四环（读数、产出者、消费者、判据）都有机器可读的答案，第五环
       # 「归谁」没有：2026-10-23 实测表里正 firing 十一行、ack 全空、最老一行开了
       # 5550 分钟，而写者每半分钟还在推进 last_seen_at——不是没人抄，是没人看，而
