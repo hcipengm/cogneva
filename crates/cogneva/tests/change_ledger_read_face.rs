@@ -211,6 +211,22 @@ impl ChangeLedgerStore for FakeLedger {
         unimplemented!("the read face does not ask this question yet")
     }
 
+    async fn request_remeasurement(
+        &self,
+        _identity: &ChangeIdentity,
+        _source: &str,
+    ) -> SFResult<()> {
+        unimplemented!("the read face does not queue measurements")
+    }
+
+    async fn pending_remeasurements(&self, _limit: usize) -> SFResult<Vec<ChangeIdentity>> {
+        unimplemented!("the read face does not ask this question yet")
+    }
+
+    async fn mark_remeasured(&self, _identity: &ChangeIdentity) -> SFResult<()> {
+        unimplemented!("the read face does not fold requests")
+    }
+
     async fn record_delivery(&self, _identity: &ChangeIdentity, _rev: &str) -> SFResult<()> {
         unimplemented!("the read route does not record deliveries")
     }

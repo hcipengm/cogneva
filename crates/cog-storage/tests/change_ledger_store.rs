@@ -255,6 +255,79 @@ async fn the_entry_revision_is_written_once_and_never_moved() {
     cleanup(&pool, &marker).await;
 }
 
+/// A request to measure a row again is queued once however often it is asked,
+/// and a later correction of the same rule is a new question rather than a
+/// duplicate the intake swallows.
+///
+/// The second half is the one a `DO NOTHING` conflict clause would get wrong,
+/// and it is not hypothetical: the fixture recogniser on this platform was
+/// corrected once already, and a rule that was wrong once can be wrong again --
+/// each correction has to reach the row, or the second one is silently absorbed
+/// and the account keeps a state nobody asked it about.
+///
+/// Nothing here judges the row. A request says the rule behind its state was
+/// corrected; only the writer's measurement says what the row is, which is why
+/// this intake carries no state and no reason.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_remeasurement_request_is_queued_once_and_revived_by_a_later_correction() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "remeasure");
+    store
+        .apply_measurement(&ChangeMeasurement::retired(
+            id.clone(),
+            RetireReason::Fixture,
+        ))
+        .await
+        .expect("write the retired row");
+
+    // The same correction declared twice is one request.
+    store
+        .request_remeasurement(&id, "probe:first-correction")
+        .await
+        .expect("queue the request");
+    store
+        .request_remeasurement(&id, "probe:first-correction")
+        .await
+        .expect("queue the same request again");
+    let queued = store
+        .pending_remeasurements(500)
+        .await
+        .expect("read the queue");
+    assert_eq!(
+        queued.iter().filter(|queued| **queued == id).count(),
+        1,
+        "one row has one request outstanding, however many times it is asked"
+    );
+
+    store.mark_remeasured(&id).await.expect("fold the request");
+    let queued = store
+        .pending_remeasurements(500)
+        .await
+        .expect("read the queue");
+    assert!(
+        !queued.contains(&id),
+        "a folded request is not handed out again"
+    );
+
+    // The rule is corrected a second time. That is a new question about the same
+    // row, and it has to reach the fold.
+    store
+        .request_remeasurement(&id, "probe:second-correction")
+        .await
+        .expect("queue the later request");
+    let queued = store
+        .pending_remeasurements(500)
+        .await
+        .expect("read the queue");
+    assert!(
+        queued.contains(&id),
+        "a correction after a fold is a new question, not a duplicate"
+    );
+
+    cleanup(&pool, &marker).await;
+}
+
 /// A row created by a measurement entered by being measured, so its entry
 /// revision is that measurement's -- the one path that sets the column without a
 /// reading.
@@ -2272,6 +2345,13 @@ async fn cleanup(pool: &PgPool, marker: &str) {
         .execute(&mut *tx)
         .await
         .expect("clean up the probe retirements");
+    // The re-measurement requests as well, for the same reason: a request left
+    // behind is a row a later run's pass would measure under this run's name.
+    sqlx::query("DELETE FROM change_ledger_remeasure WHERE scope LIKE $1")
+        .bind(format!("{marker}/%"))
+        .execute(&mut *tx)
+        .await
+        .expect("clean up the probe remeasurements");
     // And the reopen series, which nothing else ever deletes: its rows name the
     // same marker and outlive the account rows they were written beside.
     sqlx::query("DELETE FROM change_reopen WHERE scope LIKE $1")

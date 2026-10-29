@@ -257,6 +257,17 @@ const PARENT_BACKFILL_PER_PASS: usize = 50;
 /// persisted with the row), not a larger number here.
 const RETIRED_RECHECK_PER_PASS: usize = 500;
 
+/// How many queued re-measurements one pass takes.
+///
+/// Small, and deliberately not sized like the retirement bound beside it: that
+/// one has to cover a set the account itself grows, while this queue only holds
+/// what a producer asked for because a rule it owns was corrected. A producer
+/// that queued the whole account would be using this as a sweep, which is what
+/// the outstanding pass already is; the bound keeps one pass from becoming a
+/// full pass over the tree on a producer's word. A full batch warns rather than
+/// growing, because the answer to a queue that outgrew it is to ask why.
+const REMEASURE_PER_PASS: usize = 64;
+
 /// How many owed rows one pass hands over.
 ///
 /// The same bound, of the same shape, as the three folds above: a pass is a
@@ -2535,6 +2546,10 @@ async fn measure_pass(
         // about the account: a surface that came back makes the row answerable
         // again, and this is the count of rows that stopped being retired.
         landed_restored = reopened_pass.restored,
+        // The other way a state stops being true without the tree moving: the
+        // rule that took the measurement was corrected, and a producer asked for
+        // the row to be read again.
+        remeasured = reopened_pass.remeasured,
         // The landed half of the same two readings the outstanding pass already
         // gives. A row that cannot be settled keeps its old `measured_at`, so
         // without these two numbers the staleness order reads the same whether a
@@ -2593,6 +2608,15 @@ struct ReopenPass {
     /// make the first count a statement about the account rather than about the
     /// tree it was reading when it said so.
     restored: usize,
+    /// Rows measured again because a producer said the rule behind their state
+    /// had been corrected.
+    ///
+    /// A count here that no movement in the tree can raise: the tree is the same
+    /// tree it was, and what changed is the rule that read it. It is its own
+    /// number beside `restored` because the two are the two ways a state stops
+    /// being true without the tree moving -- one says a surface came back, the
+    /// other says the question was never asked properly.
+    remeasured: usize,
 }
 
 /// Ask the rows the account calls done whether that is still true.
@@ -2713,6 +2737,11 @@ async fn reopen_pass(
     // check. Tying the two would mean an account whose only movement is a surface
     // returning never asking about it.
     let mut pass = restore_retired(store, tree, snapshot).await;
+    // Beside the retirement sweep and independent of the quota below: a queued
+    // request is a producer saying a rule was corrected, and how many landed rows
+    // are left to re-check has nothing to do with whether that correction is
+    // worth a look.
+    pass.remeasured = remeasure_queued(store, tree, snapshot).await;
     let landed = match store.census().await {
         Ok(census) => census
             .iter()
@@ -3171,6 +3200,107 @@ async fn restore_retired(
         }
     }
     pass
+}
+
+/// Measure the rows a producer said were settled by a rule that has changed.
+///
+/// The account's own reads cannot find these rows. `outstanding` holds them out
+/// as answered, and the three retirement reads cover only the reasons whose
+/// ground is falsifiable from here: a returned surface, a withdrawn answer from
+/// another account, a tree mounted for a scope. A `fixture` or a `superseded`
+/// retirement is a classification made by a rule that lives outside the account,
+/// and correcting that rule leaves every row it settled saying what the rule
+/// used to mean -- two accounts disagreeing, with the side that could re-ask
+/// never asked.
+///
+/// So the correction arrives as a request on an intake and this pass folds it
+/// the only way a state may be written: by measuring the identity in the tree
+/// and applying that measurement. What the row becomes is the tree's answer, not
+/// the requester's: a producer can say the old rule was wrong, and cannot say
+/// what the right state is.
+///
+/// A request whose check still cannot be settled stays queued. Dropping it would
+/// lose the correction the same way the old rule lost the row; keeping it costs
+/// one look per pass, and the look is what has to be redone for the answer to
+/// arrive at all.
+async fn remeasure_queued(
+    store: &dyn ChangeLedgerStore,
+    tree: &CheckTree,
+    snapshot: &Snapshot,
+) -> usize {
+    let rows = match store.pending_remeasurements(REMEASURE_PER_PASS).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the queued re-measurements could not be read, so no corrected                  rule was re-asked this pass"
+            );
+            return 0;
+        }
+    };
+    if rows.len() == REMEASURE_PER_PASS {
+        warn!(
+            bound = REMEASURE_PER_PASS,
+            "change ledger: the queue filled the pass's read, so requests beyond the bound wait              for the next pass -- a producer queuing faster than this is using the intake as a              sweep, which the outstanding pass already performs"
+        );
+    }
+    let mut remeasured = 0usize;
+    for identity in rows {
+        let outcome = tree.judge(snapshot, &identity).await;
+        let Some(state) = outcome.state() else {
+            warn!(
+                change = %identity,
+                reason = outcome.reason().map(|r| r.as_str()).unwrap_or("none"),
+                why = outcome.why().unwrap_or("the look settled nothing and gave no reason"),
+                revision = %snapshot.rev(),
+                "change ledger: a queued re-measurement settled nothing, so the request stays                  queued; the row's state is still the one the corrected rule left"
+            );
+            continue;
+        };
+        let measurement = match state {
+            ChangeState::Undecided => ChangeMeasurement::undecided(
+                identity.clone(),
+                outcome
+                    .reason()
+                    .expect("an undecided state is reached only through a reason")
+                    .as_str(),
+            )
+            .at_revision(snapshot.rev()),
+            _ if state == ChangeState::Landed => ChangeMeasurement::new(identity.clone(), state)
+                .at_revision(snapshot.rev())
+                .with_parent_observation(tree.parent_observation(snapshot, &identity).await),
+            _ => ChangeMeasurement::new(identity.clone(), state).at_revision(snapshot.rev()),
+        };
+        match store.apply_measurement(&measurement).await {
+            Ok(()) => {
+                remeasured += 1;
+                // The request is marked after the state is written, never before:
+                // a fold that died in between leaves the request queued and the
+                // next pass measures again, which is idempotent, while the other
+                // order would drop the correction and nothing would say so.
+                if let Err(e) = store.mark_remeasured(&identity).await {
+                    warn!(
+                        change = %identity,
+                        error = %e,
+                        "change ledger: the corrected row was measured but its request could not                          be marked folded, so it will be measured again next pass"
+                    );
+                }
+                warn!(
+                    change = %identity,
+                    state = state.as_str(),
+                    revision = %snapshot.rev(),
+                    "change ledger: a queued re-measurement was folded; the row's state was the                          answer to a rule that has since been corrected"
+                );
+            }
+            Err(e) => warn!(
+                change = %identity,
+                state = state.as_str(),
+                error = %e,
+                "change ledger: a queued re-measurement was taken but could not be written, so the                  request stays queued"
+            ),
+        }
+    }
+    remeasured
 }
 
 /// What one pass of the in-effect check learned about the rolled-out line.
@@ -7292,6 +7422,13 @@ mod tests {
         /// every row the sweep touched after the image was built -- names the
         /// landing here.
         landings: std::sync::Mutex<std::collections::HashMap<ChangeIdentity, String>>,
+        /// The re-measurement requests a producer queued, unfolded.
+        ///
+        /// A test seeds this to say "someone corrected a rule and asked about
+        /// these identities"; the pass under test folds them by measuring and
+        /// removing them, so what is left here after a pass is what it did not
+        /// answer.
+        remeasurements: std::sync::Mutex<Vec<ChangeIdentity>>,
     }
 
     impl FakeLedger {
@@ -7561,6 +7698,34 @@ mod tests {
                 .take(limit)
                 .cloned()
                 .collect())
+        }
+        async fn request_remeasurement(
+            &self,
+            identity: &ChangeIdentity,
+            _source: &str,
+        ) -> SFResult<()> {
+            let mut queued = self.remeasurements.lock().unwrap();
+            if !queued.iter().any(|known| known == identity) {
+                queued.push(identity.clone());
+            }
+            Ok(())
+        }
+        async fn pending_remeasurements(&self, limit: usize) -> SFResult<Vec<ChangeIdentity>> {
+            Ok(self
+                .remeasurements
+                .lock()
+                .unwrap()
+                .iter()
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+        async fn mark_remeasured(&self, identity: &ChangeIdentity) -> SFResult<()> {
+            self.remeasurements
+                .lock()
+                .unwrap()
+                .retain(|known| known != identity);
+            Ok(())
         }
         async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()> {
             self.reopened.lock().unwrap().push(reopen.clone());
@@ -8113,6 +8278,115 @@ mod tests {
                 .contains(&ChangeIdentity::new("grep", "file", "fn thing")),
             "without a moved path the row waits for the window: {:?}",
             quiet.measured()
+        );
+    }
+
+    /// A row retired under a classification rule that has since been corrected
+    /// is asked again when a producer says so -- and the tree, not the producer,
+    /// says what the row is now.
+    ///
+    /// Without this the correction has nowhere to arrive. `outstanding` holds a
+    /// retired row out as answered, and the three retirement reads cover only the
+    /// reasons whose ground is falsifiable from here, so a `fixture` retirement
+    /// stays retired for as long as the account exists no matter what the rule
+    /// that made it says today. Measured on the live account: nineteen real
+    /// principles retired as fixtures, their principle rows saying `unenforced`,
+    /// and no read in the account that would ever look at them again.
+    #[tokio::test]
+    async fn a_queued_remeasurement_is_folded_by_measuring_the_row() {
+        let (dir, bare, work) = scratch_repo();
+        std::fs::write(std::path::Path::new(&work).join("file"), "fn thing\n")
+            .expect("the fixture file");
+        commit_all(&bare, &work, "fixture");
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let identity = ChangeIdentity::new("grep", "file", "fn thing");
+        let retired = ChangeLedgerRow {
+            state: ChangeState::Retired,
+            retire_reason: Some(RetireReason::Fixture),
+            ..pending_row("file")
+        };
+        let store = FakeLedger {
+            rows: vec![retired],
+            ..Default::default()
+        };
+        store
+            .request_remeasurement(&identity, "test:corrected-rule")
+            .await
+            .expect("queue the request");
+
+        let mut unsettled = HashMap::new();
+        let pass = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(
+            pass.remeasured,
+            1,
+            "the request is folded by measuring the row: {:?}",
+            store.measured()
+        );
+        assert!(
+            store.measured().contains(&identity),
+            "the tree answered for the row rather than the requester: {:?}",
+            store.measured()
+        );
+        assert!(
+            store
+                .pending_remeasurements(10)
+                .await
+                .expect("read the queue")
+                .is_empty(),
+            "a request is folded only once its measurement is written"
+        );
+    }
+
+    /// A row the corrected rule no longer calls a fixture, and whose change the
+    /// tree does not hold either, comes back as owed.
+    ///
+    /// This is the shape of the live case: the nineteen principles were retired
+    /// as fixtures, the recogniser was corrected, and the tree does not carry a
+    /// gate for any of them. The honest reading is `pending` -- a change still
+    /// owed -- not `retired`, and the account can only say that by measuring.
+    #[tokio::test]
+    async fn a_queued_remeasurement_of_a_change_the_tree_does_not_hold_becomes_owed() {
+        let (dir, _first, _second) = two_revision_repo();
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let snapshot = tree.snapshot().await.expect("the fixture is readable");
+        let identity = ChangeIdentity::new("grep", "file", "fn thing");
+        let store = FakeLedger {
+            rows: vec![ChangeLedgerRow {
+                state: ChangeState::Retired,
+                retire_reason: Some(RetireReason::Fixture),
+                ..pending_row("file")
+            }],
+            ..Default::default()
+        };
+        store
+            .request_remeasurement(&identity, "test:corrected-rule")
+            .await
+            .expect("queue the request");
+
+        let mut unsettled = HashMap::new();
+        let pass = reopen_pass(&store, &tree, &snapshot, &mut unsettled, &[]).await;
+
+        assert_eq!(
+            pass.remeasured,
+            1,
+            "the request is folded: {:?}",
+            store.measured()
+        );
+        let written = store.measurements();
+        assert_eq!(
+            written.last().map(|m| m.state),
+            Some(ChangeState::Pending),
+            "the fixture the tree does not carry is an owed change, not a silence: {written:?}"
+        );
+        assert!(
+            store
+                .pending_remeasurements(10)
+                .await
+                .expect("read the queue")
+                .is_empty(),
+            "the request is folded once its measurement is written"
         );
     }
 

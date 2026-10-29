@@ -762,6 +762,43 @@ fn parse_state(name: Option<String>) -> SFResult<Option<ChangeState>> {
 const PENDING_RETIRE_SQL: &str =
     "SELECT count(*) AS n FROM change_ledger_retired WHERE folded_at IS NULL";
 
+/// Queue a re-measurement, and revive one that was already folded.
+///
+/// A folded request is a question that was answered: the row was measured under
+/// the rule the requester read, and the answer is on the row. A later request is
+/// then a new question, because a rule corrected once can be corrected again --
+/// so the conflict clause clears the stamp rather than dropping the request. The
+/// alternative, `DO NOTHING`, would make each identity's first correction its
+/// last, and the second correction would be silently absorbed.
+///
+/// Reviving an *unfolded* request only moves its timestamp and who asked. That is
+/// the same request either way, and a writer that saw it once and has not
+/// stamped it yet will see it again.
+const REQUEST_REMEASURE_SQL: &str = "\
+INSERT INTO change_ledger_remeasure (kind, scope, literal, source)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (kind, scope, literal) DO UPDATE SET
+    source = EXCLUDED.source,
+    declared_at = now(),
+    folded_at = NULL";
+
+/// The requests one fold takes, oldest first, with the identity parts breaking
+/// the tie the way the other two intakes do -- a batch queued in one statement
+/// shares a timestamp, and without the tiebreak a half-full fold would take a
+/// different subset on the next run.
+const PENDING_REMEASURE_SQL: &str = "\
+SELECT kind, scope, literal
+FROM change_ledger_remeasure
+WHERE folded_at IS NULL
+ORDER BY declared_at ASC, kind ASC, scope ASC, literal ASC
+LIMIT $1";
+
+/// Mark one request folded, and only if it is still unfolded, so a re-run does
+/// not move a time an earlier fold set.
+const MARK_REMEASURED_SQL: &str = "\
+UPDATE change_ledger_remeasure SET folded_at = now()
+WHERE folded_at IS NULL AND kind = $1 AND scope = $2 AND literal = $3";
+
 /// Write one reading into the account, on whatever executor the caller has.
 ///
 /// Takes an executor rather than the pool because the fold writes inside the
@@ -1441,6 +1478,56 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .fetch_all(&self.pool)
             .await,
         )
+    }
+
+    async fn request_remeasurement(&self, identity: &ChangeIdentity, source: &str) -> SFResult<()> {
+        sqlx::query(REQUEST_REMEASURE_SQL)
+            .bind(&identity.kind)
+            .bind(&identity.scope)
+            .bind(&identity.literal)
+            .bind(source)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                SFError::Database(format!(
+                    "request remeasurement for {}: {e}",
+                    identity.as_key()
+                ))
+            })?;
+        Ok(())
+    }
+
+    async fn pending_remeasurements(&self, limit: usize) -> SFResult<Vec<ChangeIdentity>> {
+        let rows = sqlx::query(PENDING_REMEASURE_SQL)
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read remeasurement requests: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(ChangeIdentity::new(
+                    row.try_get::<String, _>("kind")
+                        .map_err(|e| SFError::Database(format!("kind: {e}")))?,
+                    row.try_get::<String, _>("scope")
+                        .map_err(|e| SFError::Database(format!("scope: {e}")))?,
+                    row.try_get::<String, _>("literal")
+                        .map_err(|e| SFError::Database(format!("literal: {e}")))?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn mark_remeasured(&self, identity: &ChangeIdentity) -> SFResult<()> {
+        sqlx::query(MARK_REMEASURED_SQL)
+            .bind(&identity.kind)
+            .bind(&identity.scope)
+            .bind(&identity.literal)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                SFError::Database(format!("mark remeasured {}: {e}", identity.as_key()))
+            })?;
+        Ok(())
     }
 
     async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()> {

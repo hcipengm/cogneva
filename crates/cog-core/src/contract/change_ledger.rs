@@ -1270,6 +1270,42 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// Ordered by `retired_at` for the same reason.
     async fn retired_answered_elsewhere(&self, limit: usize) -> SFResult<Vec<ChangeLedgerRow>>;
 
+    /// Ask the account to measure this row's identity again.
+    ///
+    /// A row's state is a measurement, and a measurement is only as good as the
+    /// rule the pass that took it read. Most of those rules are the tree's and
+    /// are re-read on their own: a check's answer comes back through the landed
+    /// sweep, a returned surface through [`Self::retired_surface_moved`], an
+    /// answer withdrawn from another account through
+    /// [`Self::retired_answered_elsewhere`]. The rest are classifications made
+    /// outside this account -- which identities name a fixture, which were
+    /// renamed -- and when one of those rules is corrected, the rows it settled
+    /// describe the rule as it was. Nothing revisits them: `outstanding` holds
+    /// them out as answered, and no retirement read covers their reason.
+    ///
+    /// So a correction announces itself here rather than writing a state. This
+    /// account has one door a state is written through, and it is the writer's
+    /// own measurement: a producer can say the state was measured by a rule that
+    /// has since changed, and only the writer can say what the row is now.
+    ///
+    /// Queuing the same identity twice is queuing it once, and a request already
+    /// folded is not revived by a second one -- a row measured again needs no
+    /// second measurement until another rule changes.
+    async fn request_remeasurement(&self, identity: &ChangeIdentity, source: &str) -> SFResult<()>;
+
+    /// The identities whose states were measured by a rule that has since been
+    /// corrected, oldest request first.
+    ///
+    /// The finding only, like the two retirement reads beside it: whether the row
+    /// moves is the caller's measurement to make.
+    async fn pending_remeasurements(&self, limit: usize) -> SFResult<Vec<ChangeIdentity>>;
+
+    /// Mark one request folded, once its measurement has been written.
+    ///
+    /// Guarded so that it is a statement about this fold rather than an
+    /// overwrite: a request already marked keeps the time an earlier fold set.
+    async fn mark_remeasured(&self, identity: &ChangeIdentity) -> SFResult<()>;
+
     /// Record that a commit delivered this row's change, and which commit.
     ///
     /// Written from a reader of the line, not from the landing process: the
