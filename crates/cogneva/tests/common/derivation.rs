@@ -5,6 +5,13 @@
 //! the registry is a cross-crate contract that every crate rebuilds, and the
 //! only readers of this table are the two contracts below and the live probe.
 //! A metric that a production path ever needs to classify can move up then.
+//!
+//! Each test target compiles this file into itself, and no target reads the
+//! whole of it: one asks for the table, another for the lookup. Being unused in
+//! a target that only wants half of it is therefore the normal case, not a sign
+//! that a function has lost its last caller -- which is what `dead_code` would
+//! report on every new contract test that needs the table alone.
+#![allow(dead_code)]
 
 /// How a series' value comes to exist, which decides whether a reading that
 /// adds several processes' copies is a total or a multiple.
