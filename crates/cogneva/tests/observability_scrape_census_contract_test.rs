@@ -280,32 +280,44 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // one then running read 74.8 s, so any five-second bound would have been
     // continuously true and pointed at nothing.
     //
-    // The first guess at what it owed -- "read it against the host's load" --
-    // was checked and is wrong, which is worth keeping: the same twenty hours
-    // hold a boot that reached `serving` in 24.1 s at load 11.4 and one that
-    // took 74.8 s at load 10.3, and the busiest host in the window (load 177.5)
-    // booted in 81.1 s. Disk occupancy does not explain it either: the
-    // correlation with `rate(node_disk_io_time_seconds_total[5m])` over the
-    // same boots is 0.33. What does explain it is the revision. Twenty hours
-    // hold eighteen rolls and eighteen distinct images -- `main-4ba3a013f867`
-    // through `main-787e2f0d7e08` -- so the spread is not one build's
-    // generation-to-generation noise, it is eighteen different builds being
-    // measured once each. There is exactly one boot per revision, which means
-    // the series has no sample that can be compared with another sample of the
-    // same thing.
+    // Where the spread lives is not the whole startup, and reading it phase by
+    // phase across eighteen rolls is what says so: `process-start` is 0.000 s
+    // and `config-loaded` stays inside 0.006-0.803 s, while `embedding-dense`
+    // runs 4.6-116.9 s, `embedding-sparse` 7.6-121.4 s and `reranker`
+    // 21.7-188.1 s. The tenfold spread is inside the three phases that build
+    // an ONNX session.
     //
-    // That is why the sibling's shape transfers nowhere here, and it is not
-    // about wall clock versus resident set in the abstract: the sibling
-    // compares generations of one build, and startup time has generations of
-    // one build only if a revision runs twice. The debt this entry carries is
-    // therefore a comparison that holds the revision fixed, and the cheapest
-    // way to have one is to carry the revision as a label -- the image tag is
-    // already in the environment the process starts with -- so that a phase can
-    // be read against the same phase of the build beside it. Until then a
-    // number that moved says the build changed, not that startup got slower.
+    // Three explanations were checked and all three are wrong, which is worth
+    // keeping. Host load: the same twenty hours hold a boot that reached
+    // `serving` in 24.1 s at load 11.4 and one that took 74.8 s at load 10.3,
+    // and the busiest host in the window (load 177.5) booted in 81.1 s. Disk:
+    // the weights come from a read-only hostPath at /srv/cogneva/models, the
+    // largest blob reads in under a second, so a 117-second phase is not
+    // waiting on the disk, and the 0.33 correlation with
+    // `rate(node_disk_io_time_seconds_total[5m])` is the disk busy with
+    // something else. CPU: over each boot's own window the container averages
+    // 0.1 to 0.43 cores and CFS throttling stays at 0.000-0.002, nowhere near
+    // a quarter of its limit, and cores correlate *negatively* with duration
+    // (-0.365) -- the slow boots are the ones that computed less.
+    //
+    // The fourth explanation was this entry's own and it was wrong too.
+    // Twenty hours hold eighteen rolls and eighteen distinct images -- one
+    // boot each -- so the spread looks like eighteen builds measured once
+    // apiece. But the phases a build can change are the stable ones:
+    // `config-loaded` moves by less than a second across all eighteen. If the
+    // revision drove the spread, every phase would move with it. The revision
+    // cannot be separated from the noise from this data in any case, because
+    // no revision ran twice.
+    //
+    // So the debt is not a label to add, and it is not the sibling's shape
+    // either: the sibling compares generations of one build, and startup here
+    // has no two samples of anything. What is owed is startup settling enough
+    // for a phase to be read against the same phase of another boot, and that
+    // is not a metric's job. Until it does, a number that moved says the boot
+    // landed somewhere else in a spread nothing measured yet explains.
     (
         "cogneva_boot_phase_elapsed_seconds",
-        Unread::Gap("how long each startup phase took, one series per phase. Its sibling on the same label has a rule and the same shape on this one was written and withdrawn: twenty hours hold eighteen rolls and eighteen distinct images, so the 24-to-236-second spread for the app process is eighteen builds measured once each rather than one build's noise, and the host's load does not explain it (the fastest boot ran at load 11.4 and one three times slower ran at load 10.3). A comparison needs two samples of the same thing and there is one boot per revision, so the face owed is a reading that carries the revision -- the image tag the process already starts with -- and can put a phase beside the same phase of the build next to it"),
+        Unread::Gap("how long each startup phase took, one series per phase. Its sibling on the same label has a rule and the same shape on this one was written and withdrawn: the spread is tenfold and it sits inside the model-loading phases (`reranker` 21.7-188.1 s across eighteen rolls) while `config-loaded` never leaves a second, so it is not the build and it is not the host -- the slow boots use fewer cores than the fast ones and never throttle. A comparison needs two samples of one thing, and there is one boot per roll, so the face owed waits on startup settling; after that a five-second bound would name a phase that doubled"),
     ),
     // Two names that had a `Gap` here until panels were written to carry them,
     // and the reason they came off this table is the reason the debts were real:
