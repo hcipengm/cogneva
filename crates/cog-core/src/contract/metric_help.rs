@@ -629,14 +629,19 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          nothing to do were the same picture, and an arm that stopped firing stayed \
          invisible behind a beat the others kept stamping. `pass` is the closed set \
          the producing module declares: health, quota, rebalance, event, \
-         autonomous, control_plane. `outcome` is ok or failed: every arm routes its \
-         round through one recording call, so the reading covers all six the same \
-         way. A failed cell rising is a pass failing every time it runs, which is a \
-         different fact from a pass with nothing to do. The autonomous arm reports \
-         no error by construction, so it only ever lands in ok -- a failure inside \
-         it surfaces as the loop's own death, since a panic in the body is counted \
-         by the liveness family. The control-plane arm has no cell while no control \
-         plane is configured, since the arm then has no work. The loop runs in every \
+         autonomous, control_plane. `outcome` is ok, failed or skipped: every arm \
+         routes its round through one recording call, so the reading covers all six \
+         the same way. A failed cell rising is a pass failing every time it runs, \
+         which is a different fact from a pass with nothing to do. The autonomous \
+         arm reports no error by construction, so it only ever lands in ok -- a \
+         failure inside it surfaces as the loop's own death, since a panic in the \
+         body is counted by the liveness family. The control-plane arm lands in \
+         skipped while no control plane URL is configured: the round is due and has \
+         nothing to report to, and that cell is what separates it from an arm whose \
+         every round succeeded. Without it the rule watching \
+         `pass=\"control_plane\", outcome=\"failed\"` was silent both for an \
+         installation that reports fine and for one that has never reported at all. \
+         The loop runs in every \
          deployment that enables the supervisor and all of them write the one store, \
          so a reader takes a single series rather than summing across deployments: \
          the sum would report the same total once per writer",

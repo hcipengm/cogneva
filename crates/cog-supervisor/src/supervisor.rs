@@ -369,15 +369,24 @@ impl Supervisor {
     /// the same way. The `None` sink and a backend error are both swallowed to a
     /// WARN: a missing reading must not take the supervision loop down with it.
     async fn record_pass(&self, pass: SupervisorPass, ok: bool) {
+        self.record_pass_outcome(pass, if ok { "ok" } else { "failed" })
+            .await;
+    }
+
+    /// Record a round of one arm under an outcome the caller names.
+    ///
+    /// Separate from [`Self::record_pass`] for the arm whose ending is neither
+    /// success nor failure: with no control plane URL configured the
+    /// control-plane arm is idle, not fine, and [`crate::OUTCOME_SKIPPED`] is
+    /// the only cell that says so. Before it existed that arm wrote nothing,
+    /// and nothing is what a reader sees for an arm whose rounds all succeed.
+    async fn record_pass_outcome(&self, pass: SupervisorPass, outcome: &str) {
         let Some(metrics) = &self.metrics else {
             return;
         };
         let mut labels = std::collections::HashMap::new();
         labels.insert(crate::LABEL_PASS.to_string(), pass.as_cell().to_string());
-        labels.insert(
-            crate::LABEL_OUTCOME.to_string(),
-            if ok { "ok" } else { "failed" }.to_string(),
-        );
+        labels.insert(crate::LABEL_OUTCOME.to_string(), outcome.to_string());
         if let Err(e) = metrics
             .record_counter(cog_core::metric_names::SUPERVISOR_PASS_TOTAL, 1.0, labels)
             .await
@@ -924,6 +933,19 @@ impl Supervisor {
                             }
                         };
                         this.record_pass(SupervisorPass::ControlPlane, ok).await;
+                    } else {
+                        // Nothing to report to, so the round is skipped rather
+                        // than left unwritten: the failing rule selects
+                        // `pass="control_plane", outcome="failed"`, and an arm
+                        // that writes no cell at all keeps that rule silent for
+                        // the same reason a healthy arm does. An operator who
+                        // lost a control plane URL in an upgrade would read the
+                        // silence as health.
+                        this.record_pass_outcome(
+                            SupervisorPass::ControlPlane,
+                            crate::OUTCOME_SKIPPED,
+                        )
+                        .await;
                     }
                 }
                 _ = config_tick => {

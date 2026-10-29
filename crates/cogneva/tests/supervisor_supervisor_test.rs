@@ -447,9 +447,20 @@ async fn every_loop_arm_reports_its_rounds() {
             "arm {pass} did not report an ok round: {cells:?}"
         );
     }
-    // No control plane is configured, so that arm has no work and writes no cell.
+    // No control plane URL is configured here, so that arm has no work -- but it
+    // still has to say so. The failing rule selects `pass="control_plane",
+    // outcome="failed"`, and an arm that writes no cell leaves that rule silent
+    // for exactly the same reason a healthy arm does; an installation that lost
+    // its control plane URL would read the silence as health. Skipped is the
+    // cell that separates the two without claiming a report was made.
     assert!(
-        !cells.iter().any(|(pass, _)| pass == "control_plane"),
-        "the control-plane arm reported without a control plane: {cells:?}"
+        cells.contains(&("control_plane".to_string(), "skipped".to_string())),
+        "the control-plane arm has no control plane and did not report a skipped round: {cells:?}"
+    );
+    assert!(
+        !cells
+            .iter()
+            .any(|(pass, outcome)| pass == "control_plane" && outcome != "skipped"),
+        "the control-plane arm claimed an outcome without a control plane: {cells:?}"
     );
 }

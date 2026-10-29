@@ -46,6 +46,18 @@ pub mod unix_heartbeat;
 /// selector reads as empty, which is what "this family never ran" looks like.
 pub const LABEL_OUTCOME: &str = "outcome";
 
+/// The `outcome` value for a pass that was due but had nothing to do, because
+/// the thing it watches is not configured on this installation.
+///
+/// Kept apart from `ok` on purpose: the pass counters are also how a reader
+/// checks that each arm of the loop is alive, one label value at a time. An arm
+/// that writes no cell leaves every selector naming it empty, and an empty
+/// selector reads exactly like an arm whose every round succeeded -- on an
+/// installation with no control plane URL, "the control plane is being reported
+/// to and it is fine" and "nothing has ever been reported" were the same
+/// reading. This cell says which of the two it is without claiming the arm ran.
+pub const OUTCOME_SKIPPED: &str = "skipped";
+
 /// 读数按「第几遍」归属时用的标签键。
 pub const LABEL_PASS: &str = "pass";
 
