@@ -369,13 +369,6 @@ pub fn spawn_resource_ledger_loop(
         );
     }
 
-    // Queued before the loop so the series exists before the first pass has a
-    // chance to publish a difference: a reader that finds the row missing in
-    // that window reads it as a producer that is not wired.
-    if let Some(published) = metrics.clone() {
-        tokio::spawn(async move { seed_drops(Some(&published)).await });
-    }
-
     drop(cog_core::loop_health::spawn(
         RESOURCE_LEDGER_LOOP,
         cog_core::loop_health::Cadence::Periodic(RESOURCE_LEDGER_PASS_INTERVAL),
@@ -392,11 +385,31 @@ pub fn spawn_resource_ledger_loop(
                 // What this process has already reported as dropped. Counted
                 // here rather than in the gate so that the counter is only ever
                 // advanced by what was actually written down.
+                //
+                // Zero, not the gate's current total, even though a body that
+                // panics is run again while the tally it reads survives: the
+                // restart then publishes the whole total a second time. That is
+                // the error to prefer. Seeding from the total would instead
+                // swallow whatever this process dropped before the first pass
+                // could write it -- and a counter whose silent failure is
+                // "the loss never happened" is worse than one that says twice
+                // that something did.
                 let mut reported_drops: u64 = 0;
 
                 // Events the account refused to take, kept so that a database
                 // that is briefly unreachable costs latency rather than facts.
                 let mut carry: Vec<cog_core::ResourceEvent> = Vec::new();
+
+                // Before the loop and outside it: before, so the series exists
+                // before the first pass can publish a difference; outside,
+                // because the sample table keeps every row it is given and a
+                // zero per tick would be a row written every ten seconds that
+                // says nothing happened. This body runs once -- only the
+                // `loop` below repeats -- which is what makes it the place for
+                // a one-time write, and it is inside the loop's liveness
+                // registration, so a seed that never completes is visible as a
+                // stalled loop rather than as an orphan task.
+                seed_drops(metrics.as_ref()).await;
 
                 let mut ticker = tokio::time::interval(RESOURCE_LEDGER_PASS_INTERVAL);
                 // The first tick is immediately ready, and this loop is the
