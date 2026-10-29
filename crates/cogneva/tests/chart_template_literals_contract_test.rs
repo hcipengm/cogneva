@@ -8,13 +8,30 @@
 //! workload port, a retention count, a git timeout written twice.
 //!
 //! The census counts every number a template writes outside comments -- in the
-//! document body and inside `{{ }}` actions alike -- and holds it to
-//! `deploy/helm/cogneva/template-literals.tsv`, one row per (file, value) with an
-//! occurrence count, so a new site in a file that already writes that number is a
-//! count mismatch rather than an absence. An action is mostly a value being read,
-//! but `randAlphaNum 32` is a length somebody typed, and a number a template
-//! computes and a number somebody typed are the same number on the page.
-//! Each row says which of two things the number is:
+//! document body and inside `{{ }}` actions alike -- and every one of them has to
+//! carry its own reason, on the line above where it is written:
+//!
+//! ```text
+//! {{- /* lit: <value> fixed|dial|unreviewed — <why> */}}
+//! ```
+//!
+//! The dash after `{{` and none before `}}` is the only spelling that leaves the
+//! rendered manifests untouched: it eats the marker line's own indentation, while
+//! the newline after it survives. `-}}` would eat that newline too and glue the
+//! marker's line onto the line below it -- which parses as broken YAML, or worse,
+//! is silently inside a block scalar and becomes part of a shell command.
+//!
+//! The reason used to live in a separate table keyed by (file, value), with an
+//! occurrence count beside it. That table was a second copy of what the census
+//! computes -- the file and the value it already had -- and the count was the
+//! part that went stale every time a line moved. Worse, a judgement written one
+//! file away does not travel with the number: the row could name a reason the
+//! template no longer wrote, and the only reading of that was a red test that had
+//! to be reconciled by hand. Beside the number, the two shapes left are the two
+//! that mean something -- a number with no reason, and a reason for a number this
+//! file does not write -- and the count is always the census's own.
+//!
+//! Each reason says which of two things the number is:
 //!
 //! - `fixed`: an identity that is not a dial -- a protocol port (443, 53), the
 //!   UID an image runs as, a file mode, a shell exit status. The note names the
@@ -23,7 +40,7 @@
 //! - `dial`: a number a deployment may want to change, which the chart has not
 //!   given a home in `values.yaml`. This is the debt, and the ceiling is zero:
 //!   the ports, timeouts and replica counts that used to live here now read a
-//!   `values.yaml` key, so a new `dial` row is a red test rather than a budget.
+//!   `values.yaml` key, so a new `dial` reason is a red test rather than a budget.
 //!
 //! What is deliberately not counted, because it is not a number anybody chose:
 //! anything inside `{{/* ... */}}` or a `#` comment (prose), a width handed to
@@ -33,8 +50,8 @@
 //! matching), numbers carrying a unit or a version (e.g. `1000m`, `80Gi`,
 //! `v0.5.10`, `apps/v1`), an address or a date (`10.0.0.5`, `2026-10-20`), a
 //! shell file descriptor (`2>/dev/null`), a positional parameter (`$1`), and a
-//! range (`8080-8081`). The register carries the judgement; the census only
-//! insists that every number reaches it.
+//! range (`8080-8081`). The marker carries the judgement; the census only
+//! insists that every number has one.
 
 mod common;
 
@@ -48,8 +65,20 @@ use std::collections::BTreeMap;
 /// The directory whose files the census reads.
 const TEMPLATES: &str = "deploy/helm/cogneva/templates";
 
-/// The register: one row per (file, value) pair the templates write.
-const REGISTRY: &str = "deploy/helm/cogneva/template-literals.tsv";
+/// The comment a reason is written in, above the number it is about.
+///
+/// A template comment (`{{/* ... */}}`) rather than a YAML `#` one: the chart's
+/// rendered manifests are committed and diffed against a fresh render, and a
+/// `#` comment is copied into them verbatim -- so the reason would show up as a
+/// change to every profile's artifacts while saying nothing about the deployed
+/// object. The template comment is stripped at render and reads the same here.
+///
+/// The marker stands on its own line above the number, in the `{{- /* ... */}}`
+/// form: trim on the left only. The left dash removes the line's indentation,
+/// the unterminated right side keeps the newline, so the line disappears from the
+/// render instead of becoming a whitespace-only line. Trimming on the right as
+/// well would join this line to the next one.
+const MARKER: &str = "lit:";
 
 /// Hardcoded dials still in the templates, counted as sites rather than rows so
 /// that a number written eight times costs what it costs.
@@ -90,12 +119,11 @@ impl Kind {
     }
 }
 
-/// One registered number: where it is written, what it is, and why.
+/// One declared number: where it is written, what it is, and why.
 #[derive(Debug, Clone)]
 struct Row {
     file: String,
     value: String,
-    sites: usize,
     kind: Kind,
     why: String,
 }
@@ -128,6 +156,27 @@ fn starts_with(chars: &[char], at: usize, needle: &str) -> bool {
         .all(|(offset, c)| chars.get(at + offset) == Some(&c))
 }
 
+/// How long a closing comment delimiter is at `at`, or `None`.
+///
+/// Helm lets a comment end as `*/}}`, `*/ -}}` or `*/-}}`, and the trimmed form
+/// is the one that keeps the line out of the rendered manifests -- so a scanner
+/// that only knows the first spelling reads every later line as prose and stops
+/// counting the rest of the file. Only whitespace and one `-` are allowed between
+/// the two halves; anything else is not a closing delimiter.
+fn comment_close_len(chars: &[char], at: usize) -> Option<usize> {
+    if !starts_with(chars, at, "*/") {
+        return None;
+    }
+    let mut i = at + 2;
+    while chars.get(i).is_some_and(|c| c.is_whitespace()) {
+        i += 1;
+    }
+    if chars.get(i) == Some(&'-') {
+        i += 1;
+    }
+    starts_with(chars, i, "}}").then(|| i + 2 - at)
+}
+
 /// Everything on `line` a template writes literally: the `{{ }}` actions and the
 /// comments removed, the rest kept.
 ///
@@ -140,10 +189,15 @@ fn strip_line(line: &str, state: &mut ScanState) -> String {
     let mut i = 0;
     while i < chars.len() {
         if state.in_action {
-            if starts_with(&chars, i, "*/}}") {
+            let close = if state.in_block_comment {
+                comment_close_len(&chars, i)
+            } else {
+                None
+            };
+            if let Some(len) = close {
                 state.in_action = false;
                 state.in_block_comment = false;
-                i += 4;
+                i += len;
                 continue;
             }
             // A block comment that was opened is only closed by its own `*/}}`:
@@ -279,19 +333,14 @@ fn literals_in_actions(text: &str) -> Vec<String> {
             continue;
         }
         if in_block_comment {
-            if starts_with(&chars, i, "*/}}") {
+            let close = comment_close_len(&chars, i);
+            if let Some(len) = close {
                 in_action = false;
                 in_block_comment = false;
-                i += 4;
+                i += len;
                 continue;
             }
             i += 1;
-            continue;
-        }
-        if starts_with(&chars, i, "*/}}") {
-            in_action = false;
-            in_block_comment = false;
-            i += 4;
             continue;
         }
         // `{{- /*` opens the same comment one dash and a space later.
@@ -369,84 +418,145 @@ fn census() -> BTreeMap<(String, String), usize> {
     out
 }
 
-fn parse_registry(text: &str) -> Vec<Row> {
+/// The prose inside `{{/* ... */}}` when the whole line is that comment.
+///
+/// Both spellings are accepted -- `{{/*` and `{{- /*` with the trailing dash --
+/// because the trimmed form is what keeps the line out of the rendered
+/// manifests, and a marker that leaves a blank line behind would show up as an
+/// artifact change in every profile.
+fn comment_body(trimmed: &str) -> Option<&str> {
+    let rest = trimmed.strip_prefix("{{")?;
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let rest = rest.strip_prefix("/*")?;
+    let rest = rest.strip_suffix("}}")?;
+    let rest = rest.strip_suffix('-').unwrap_or(rest);
+    rest.trim_end().strip_suffix("*/")
+}
+
+/// The reason lines in one template: `{{/* lit: <value> <kind> — <why> */}}`.
+///
+/// A marker has to stand on its own line: one opened inside a multi-line action
+/// is inside that action's prose, and one written as a YAML `#` comment would
+/// travel into the rendered manifests. [`strip_line`] tracks both states across
+/// lines, which is why this scan runs it rather than looking at raw text.
+fn parse_markers(file: &str, text: &str) -> (Vec<Row>, Vec<String>) {
     let mut rows = Vec::new();
+    let mut problems = Vec::new();
+    let mut state = ScanState::default();
     for (number, line) in text.lines().enumerate() {
-        let line = line.trim_end();
-        if line.trim().is_empty() || line.starts_with('#') {
+        let inside_action = state.in_action;
+        strip_line(line, &mut state);
+        let where_ = format!("{file}:{}", number + 1);
+        let trimmed = line.trim();
+        let body = if let Some(body) =
+            comment_body(trimmed).and_then(|b| b.trim_start().strip_prefix(MARKER))
+        {
+            body
+        } else if trimmed.starts_with('#') && trimmed.contains(MARKER) {
+            problems.push(format!(
+                "{where_}: this reason is a YAML `#` comment, so it would be copied \
+                 into the rendered manifests; write it as a template comment \
+                 `{{{{- /* {MARKER} <value> <kind> — <why> */}}}}` instead"
+            ));
+            continue;
+        } else {
+            continue;
+        };
+        if inside_action {
+            problems.push(format!(
+                "{where_}: `{MARKER}` is written inside a multi-line `{{{{ }}}}` \
+                 action, so it is part of that action's prose rather than a line of \
+                 its own"
+            ));
             continue;
         }
-        let fields: Vec<&str> = line.split('\t').collect();
-        assert_eq!(
-            fields.len(),
-            5,
-            "{REGISTRY}:{}: a row is file, value, sites, kind, why -- a tab inside \
-             the reason would split it: {line:?}",
-            number + 1
-        );
-        let sites: usize = fields[2].parse().unwrap_or_else(|e| {
-            panic!(
-                "{REGISTRY}:{}: {e}: the sites column counts occurrences",
-                number + 1
-            )
-        });
-        let kind = Kind::parse(fields[3]).unwrap_or_else(|| {
-            panic!(
-                "{REGISTRY}:{}: {:?} is not one of fixed, dial, unreviewed",
-                number + 1,
-                fields[3]
-            )
-        });
+        let body = body.trim();
+        let (head, why) = match body.split_once(" — ") {
+            Some((head, why)) => (head, why.trim()),
+            None => {
+                problems.push(format!(
+                    "{where_}: the reason is missing -- say what agreement the number \
+                     encodes after ` — `, because a number with a name and no reason \
+                     reads exactly like one nobody has looked at"
+                ));
+                continue;
+            }
+        };
+        let mut parts = head.split_whitespace();
+        let (Some(value), Some(word)) = (parts.next(), parts.next()) else {
+            problems.push(format!(
+                "{where_}: a reason line is `<value> <kind> — <why>`, got {head:?}"
+            ));
+            continue;
+        };
+        if parts.next().is_some() {
+            problems.push(format!(
+                "{where_}: {head:?} has more than a value and a kind before the ` — `"
+            ));
+            continue;
+        }
+        let Some(kind) = Kind::parse(word) else {
+            problems.push(format!(
+                "{where_}: {word:?} is not one of fixed, dial, unreviewed"
+            ));
+            continue;
+        };
+        if why.is_empty() {
+            problems.push(format!("{where_}: the reason after ` — ` is empty"));
+            continue;
+        }
         rows.push(Row {
-            file: fields[0].to_string(),
-            value: fields[1].to_string(),
-            sites,
+            file: file.to_string(),
+            value: value.to_string(),
             kind,
-            why: fields[4].to_string(),
+            why: why.to_string(),
         });
     }
-    rows
+    (rows, problems)
 }
 
 fn registry() -> Vec<Row> {
-    parse_registry(&read(&repo_root().join(REGISTRY)))
+    let root = repo_root().join(TEMPLATES);
+    let mut rows = Vec::new();
+    let mut problems = Vec::new();
+    for file in template_files() {
+        let (found, bad) = parse_markers(&file, &read(&root.join(&file)));
+        rows.extend(found);
+        problems.extend(bad);
+    }
+    assert!(
+        problems.is_empty(),
+        "these reason lines cannot be read as one: {problems:#?}"
+    );
+    rows
 }
 
 #[test]
-fn every_number_written_into_a_chart_template_is_registered_once() {
+fn every_number_written_into_a_chart_template_carries_a_reason() {
     let census = census();
     let rows = registry();
 
-    let mut registered: BTreeMap<(String, String), (usize, usize)> = BTreeMap::new();
-    for (index, row) in rows.iter().enumerate() {
+    let mut declared: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for row in &rows {
         let key = (row.file.clone(), row.value.clone());
-        let entry = registered.entry(key.clone()).or_insert((0, index));
-        entry.0 += 1;
-        if entry.0 > 1 {
-            panic!(
-                "{REGISTRY}: {} {} has more than one row",
-                row.file, row.value
-            );
-        }
+        let seen = declared.entry(key).or_insert(0);
+        *seen += 1;
     }
 
     let mut missing = Vec::new();
-    let mut unread = Vec::new();
     for (key, count) in &census {
-        match registered.get(key) {
-            None => missing.push(format!("{} {} ({count} sites)", key.0, key.1)),
-            Some((_, index)) => {
-                if rows[*index].sites != *count {
-                    unread.push(format!(
-                        "{} {}: register says {} sites, the template writes {count}",
-                        key.0, key.1, rows[*index].sites
-                    ));
-                }
-            }
+        if !declared.contains_key(key) {
+            missing.push(format!("{} {} ({count} sites)", key.0, key.1));
+        }
+    }
+    let mut doubled = Vec::new();
+    for (key, seen) in &declared {
+        if *seen > 1 {
+            doubled.push(format!("{} {} ({} reasons)", key.0, key.1, seen));
         }
     }
     let mut unknown = Vec::new();
-    for key in registered.keys() {
+    for key in declared.keys() {
         if !census.contains_key(key) {
             unknown.push(format!("{} {}", key.0, key.1));
         }
@@ -454,24 +564,26 @@ fn every_number_written_into_a_chart_template_is_registered_once() {
 
     assert!(
         missing.is_empty(),
-        "these numbers are written into a chart template and no row says whether \
-         a deployment should be able to change them -- add a row, or read the \
-         number from values.yaml and let the literal go: {missing:#?}"
+        "these numbers are written into a chart template and nothing says whether \
+         a deployment should be able to change them -- write `{{{{- /* lit: <value> \
+         fixed|dial — <why> */}}}}` on the line above, or read the number from \
+         values.yaml and let the literal go: {missing:#?}"
     );
     assert!(
-        unread.is_empty(),
-        "these rows no longer match what the template writes, so the count that \
-         made the number visible stopped being a reading: {unread:#?}"
+        doubled.is_empty(),
+        "these numbers carry more than one reason, so a reader cannot tell which \
+         one is in force: {doubled:#?}"
     );
     assert!(
         unknown.is_empty(),
-        "these rows name numbers no template writes, so the register is \
-         describing a chart that is not here: {unknown:#?}"
+        "these reasons name numbers the template does not write, so they are \
+         describing a chart that is not here -- a stale reason is worse than a \
+         missing one, because it reads as a decision somebody made: {unknown:#?}"
     );
 }
 
 #[test]
-fn a_registered_number_says_which_kind_of_number_it_is() {
+fn a_declared_number_says_which_kind_of_number_it_is() {
     let mut unjudged = Vec::new();
     for row in registry() {
         let where_ = format!("{} {}", row.file, row.value);
@@ -489,7 +601,7 @@ fn a_registered_number_says_which_kind_of_number_it_is() {
         if row.kind == Kind::Dial {
             assert!(
                 row.why.contains("values.yaml"),
-                "{where_} is registered as a dial, so the row has to name the home \
+                "{where_} is declared as a dial, so the reason has to name the home \
                  the number is going to: say which values.yaml key carries it and \
                  read it here"
             );
@@ -497,17 +609,23 @@ fn a_registered_number_says_which_kind_of_number_it_is() {
     }
     assert!(
         unjudged.is_empty(),
-        "these rows were written by the census and nobody has judged them: \
-         {unjudged:#?}"
+        "these numbers are declared but nobody has judged them: {unjudged:#?}"
     );
 }
 
 #[test]
 fn the_hardcoded_dials_do_not_grow() {
-    let dial_sites: usize = registry()
-        .iter()
+    let dial: Vec<(String, String)> = registry()
+        .into_iter()
         .filter(|row| row.kind == Kind::Dial)
-        .map(|row| row.sites)
+        .map(|row| (row.file, row.value))
+        .collect();
+    // The sites come from the census, not from the reason: a number written eight
+    // times costs what it costs, and nobody has to keep a count in step.
+    let dial_sites: usize = census()
+        .into_iter()
+        .filter(|(key, _)| dial.contains(key))
+        .map(|(_, count)| count)
         .sum();
     assert!(
         dial_sites as u64 <= DIAL_SITE_CEILING,
@@ -515,8 +633,39 @@ fn the_hardcoded_dials_do_not_grow() {
          home in values.yaml, and the ceiling is {DIAL_SITE_CEILING}. A deployment \
          cannot change any of them without editing the chart, and two files that \
          write the same number disagree the moment one moves. Move the number to \
-         values.yaml and read it, or register why it is not a dial."
+         values.yaml and read it, or say why it is not a dial."
     );
+}
+
+#[test]
+fn a_reason_line_that_cannot_be_read_is_not_silently_a_missing_reason() {
+    let (rows, problems) = parse_markers(
+        "sample.yaml",
+        "\
+kind: Service
+{{- /* lit: 443 fixed — https itself, the port the protocol defines and nobody renames */}}
+  port: 443
+{{/* lit: 53 — dns itself, the port the protocol defines and nobody renames */}}
+  dns: 53
+{{/* lit: 8080 hardcoded — a port somebody typed, with a word that is not a kind */}}
+  other: 8080
+{{/* lit: 9090 fixed */}}
+  none: 9090
+  # lit: 1 fixed — a YAML comment would be copied into the rendered manifests
+{{/* a block comment
+{{/* lit: 2 fixed — a marker inside another action is that action's prose */}}
+   that carries }} on a prose line */}}
+",
+    );
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0].value, "443");
+    let matched = |needle: &str| problems.iter().filter(|p| p.contains(needle)).count();
+    assert_eq!(matched("a reason line is"), 1, "{problems:#?}");
+    assert_eq!(matched("not one of fixed"), 1, "{problems:#?}");
+    assert_eq!(matched("reason is missing"), 1, "{problems:#?}");
+    assert_eq!(matched("YAML `#` comment"), 1, "{problems:#?}");
+    assert_eq!(matched("multi-line `{{ }}` action"), 1, "{problems:#?}");
+    assert_eq!(problems.len(), 5, "{problems:#?}");
 }
 
 #[test]
@@ -542,10 +691,14 @@ kind: Service
      that carries 12 on a prose line and }} inside it
   */}}
   after: 640
+  {{- /* a trimmed comment with 13 */ -}}
+  trimmed: 641
 ";
     // `42` is counted: a number inside a quoted value is still a number the
     // template wrote, and `value: "8080"` is exactly the shape that hides one.
-    assert_eq!(literals(sample), vec!["8080", "42", "7", "640"]);
+    // `641` is what proves the trimmed close was read: a scanner that only knows
+    // `*/}}` never leaves the comment above it and stops counting the file.
+    assert_eq!(literals(sample), vec!["8080", "42", "7", "640", "641"]);
 
     // Inside an action, the number a template writes is the length it asks for
     // or the fallback it names -- both are typed, and neither can be set. The
@@ -558,6 +711,8 @@ kind: Service
   pattern: {{ printf \"postgres.%s:5432\" .Values.ns }}
   prose: {{/* the reading was 42 */}}
   {{- /* and 43 here */}}
+  {{- /* and 44 here */ -}}
+  entropy: {{ randAlphaNum 64 }}
 ";
-    assert_eq!(literals_in_actions(actions), vec!["32", "9999"]);
+    assert_eq!(literals_in_actions(actions), vec!["32", "9999", "64"]);
 }

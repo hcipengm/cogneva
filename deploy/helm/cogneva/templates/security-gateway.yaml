@@ -19,7 +19,9 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
+      {{- /* lit: 0 fixed — maxSurge 0: a gateway pod holds in-flight proxied bodies and a rollout may not double it */}}
       maxSurge: 0
+      {{- /* lit: 1 fixed — maxUnavailable 1: one gateway pod at a time is this rollout's shape */}}
       maxUnavailable: 1
   selector:
     matchLabels:
@@ -373,6 +375,7 @@ spec:
             # "unrecognized type: int32" — so the whole rollout dies on the
             # first target. Decimal is the only spelling both readers agree on
             # (here 256 == 0o400). Do not "tidy" this back to 0400.
+            {{- /* lit: 256 fixed — defaultMode 256 is 0400: readable by its owner only */}}
             defaultMode: 256
             items:
               - key: git-ssh-private-key
@@ -382,6 +385,7 @@ spec:
       # 落进 root 专属可读的目录。
       securityContext:
         runAsNonRoot: true
+        {{- /* lit: 1001 fixed — the runtime UID/GID the images are built with; every workload pins the same pair */}}
         runAsUser: 1001
         fsGroup: 1001
 ---

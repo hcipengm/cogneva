@@ -33,6 +33,7 @@ spec:
         - protocol: TCP
           port: {{ .Values.backends.postgres.port }}
         - protocol: TCP
+          {{- /* lit: 3306 fixed — mysql's default port on an operator-provided endpoint; the endpoint's own URL carries the same number */}}
           port: 3306
         - protocol: TCP
           port: {{ .Values.backends.redis.port }}
@@ -115,8 +116,10 @@ spec:
               kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace | quote }}
       ports:
         - protocol: TCP
+          {{- /* lit: 9090 fixed — prometheus's own listen port on the operator-provided monitoring endpoint (same shape as loki's 3100 above): the endpoint's URL carries the number, and no chart workload renames it */}}
           port: 9090
         - protocol: TCP
+          {{- /* lit: 3100 fixed — loki's default port on an operator-provided endpoint; the endpoint's own URL carries the same number */}}
           port: 3100
     # kube-apiserver：主线部署器构建侧在 Pod 内调 kubectl（查四部署镜像、
     # apply 滚动 Job）。in-cluster 经 kubernetes Service ClusterIP:443
@@ -133,8 +136,10 @@ spec:
             cidr: "0.0.0.0/0"
       ports:
         - protocol: TCP
+          {{- /* lit: 443 fixed — https itself: the port the protocol is defined on, which no deployment renames */}}
           port: 443
         - protocol: TCP
+          {{- /* lit: 6443 fixed — the kubernetes API server's port, defined by the apiserver's own flags */}}
           port: 6443
     - to:
         - namespaceSelector:
@@ -145,6 +150,7 @@ spec:
               k8s-app: kube-dns
       ports:
         - protocol: UDP
+          {{- /* lit: 53 fixed — dns itself: the port the protocol is defined on, which no deployment renames */}}
           port: 53
         - protocol: TCP
           port: 53
@@ -436,11 +442,13 @@ spec:
         - ipBlock:
             cidr: "::/0"
             except:
+              {{- /* lit: 1 fixed — part of the loopback address ::1/128, not a number of its own */}}
               - "::1/128"
               - "fc00::/7"
               - "fe80::/10"
       ports:
         - protocol: TCP
+          {{- /* lit: 80 fixed — http itself: the port the protocol is defined on, which no deployment renames */}}
           port: 80
         - protocol: TCP
           port: 443

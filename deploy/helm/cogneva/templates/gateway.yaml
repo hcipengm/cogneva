@@ -27,7 +27,9 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
+      {{- /* lit: 1 fixed — maxSurge 1: one extra pod at a time is this rollout's shape */}}
       maxSurge: 1
+      {{- /* lit: 0 fixed — maxUnavailable 0 with maxSurge 1: a rollout may not drop a pod that is serving */}}
       maxUnavailable: 0
   selector:
     matchLabels:
@@ -52,6 +54,7 @@ spec:
       affinity:
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
+            {{- /* lit: 100 fixed — a single backend carries all the traffic, so there is no split to tune */}}
             - weight: 100
               podAffinityTerm:
                 labelSelector:
@@ -425,6 +428,7 @@ spec:
         {{- end }}
       securityContext:
         runAsNonRoot: true
+        {{- /* lit: 1001 fixed — the runtime UID/GID the images are built with; every workload pins the same pair */}}
         runAsUser: 1001
         fsGroup: 1001
 ---

@@ -42,6 +42,8 @@ spec:
           command:
             - sh
             - -c
+            {{- /* lit: 0 fixed — shell and Lua statuses inside the AOF repair script, not numbers anybody chose */}}
+            {{- /* lit: 1 fixed — shell and Lua arithmetic inside the AOF repair script: `head -n 1`, a property line index, and the census's own counters */}}
             - |
               report=/report/aof-repair.prom
               if ! /opt/cogneva/cogneva --help 2>&1 | grep -q 'repair-aof'; then
@@ -134,6 +136,9 @@ spec:
           command:
             - sh
             - -c
+            {{- /* lit: 1000 fixed — the SCAN batch size inside the WAL census Lua script: it moves how many round trips the census takes, not what it measures or which deployment this is, so there is nothing for a deployment to set */}}
+            {{- /* lit: 2 fixed — part of the Lua scan loop's own arithmetic, not a dial */}}
+            {{- /* lit: 3 fixed — `line 3` reads the third field of a kubectl property line */}}
             - |
               report=/report/redis-info.prom
               props=/report/.redis-info.props

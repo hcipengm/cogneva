@@ -70,6 +70,7 @@ spec:
           command:
             - /bin/sh
             - -c
+            {{- /* lit: 0 fixed — a shell exit status in the init script, not a number anybody chose */}}
             - |
               set -eu
               if [ ! -d "{{ .Values.clusterRegistry.rootDir }}/docker/registry/v2/repositories" ]; then

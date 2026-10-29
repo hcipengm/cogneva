@@ -41,7 +41,9 @@ spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
+      {{- /* lit: 0 fixed — maxSurge 0: a sandbox pod holds a workspace and must not be doubled during a rollout */}}
       maxSurge: 0
+      {{- /* lit: 1 fixed — maxUnavailable 1 with maxSurge 0: the rollout shape that keeps a sandbox pod from ever being doubled */}}
       maxUnavailable: 1
   selector:
     matchLabels:
@@ -61,6 +63,7 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
+        {{- /* lit: 1001 fixed — the UID/GID the sandbox image runs as */}}
         runAsUser: 1001
         fsGroup: 1001
       initContainers:
@@ -72,6 +75,7 @@ spec:
           command:
             - sh
             - -c
+            {{- /* lit: 124 fixed — coreutils timeout's exit status; a shell contract, not a dial */}}
             - |
               set -e
               root=/opt/cogneva/sandbox

@@ -91,6 +91,7 @@ spec:
               command:
                 - /bin/sh
                 - -c
+                {{- /* lit: 1 fixed — the shell's stderr-to-stdout redirect (2>&1) in the readiness probe, not a number anybody chose */}}
                 - wget -qS -O /dev/null http://127.0.0.1:{{ .Values.backends.seaweedfs.s3Port }}/ 2>&1 | grep -q 'HTTP/1.1'
 {{ toYaml .Values.healthProbes.readiness | indent 12 }}
           resources:

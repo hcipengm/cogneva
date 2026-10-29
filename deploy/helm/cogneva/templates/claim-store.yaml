@@ -58,6 +58,7 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: false
+        {{- /* lit: 0 fixed — the reading pods run as root to walk host paths */}}
         runAsUser: 0
         runAsGroup: 0
         seccompProfile:

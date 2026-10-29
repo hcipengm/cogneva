@@ -169,6 +169,7 @@ data:
   # 不由部署标志钉死：两个副本同时开着清理时，只有拿到共用库上那行租约的那个真删，
   # 没拿到的只量大小、照常上报，属主被杀后另一个在租约到期后的下一轮接管。所以这个
   # 数现在是「哪些副本有资格当清理者」的选择，正确性不靠它；置 0 = 本 Pod 不参与。
+  {{- /* lit: 0 fixed — zero is an opt-out, not a cap: this override ConfigMap tells the evolution Pod's copy of a loop that another Pod owns by lease that it is not the owner -- 'not me', not 'unbounded' */}}
   COGNEVA_METRICS_SAMPLE_MAX_ROWS: "0"
   # 本 Pod 完全不启用 memory 后端：自进化循环必须在 PostgreSQL/Redis 通不通
   # 的情况下都能起来，而它也不对外提供 memory 读。embedding/reranker 权重另有

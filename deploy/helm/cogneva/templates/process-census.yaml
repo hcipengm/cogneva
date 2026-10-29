@@ -51,6 +51,7 @@ spec:
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
+        {{- /* lit: 65534 fixed — nobody: reading the host's cgroup tree takes no privilege of its own, same pair as host-ledger */}}
         runAsUser: 65534
         runAsGroup: 65534
         seccompProfile:

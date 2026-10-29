@@ -60,6 +60,7 @@ spec:
           # 不用 fsGroup：local-path 的 PVC 与 /offsite 那条 hostPath 都不过 fsGroup。
           securityContext:
             runAsNonRoot: true
+            {{- /* lit: 1001 fixed — the runtime UID/GID the images are built with; every workload pins the same pair */}}
             runAsUser: 1001
             runAsGroup: 1001
           {{- if .Values.evolution.enabled }}
@@ -89,10 +90,12 @@ spec:
               # 只改目录属主的话非 root 的备份与演练读不到它们。
               securityContext:
                 runAsNonRoot: false
+                {{- /* lit: 0 fixed — root in two places: the backup Job writes hostPath archives, and the drill's init container chowns the credential surface before its non-root main container starts; neither has another user that can */}}
                 runAsUser: 0
               command:
                 - sh
                 - -c
+                {{- /* lit: 0700 fixed — file mode for the archives: owner-only, by intent */}}
                 - >-
                   chown -R 1001:1001 /backups{{ if .Values.backup.offsiteHostPath }} /offsite{{ end }} &&
                   chmod 0700 /backups{{ if .Values.backup.offsiteHostPath }} /offsite{{ end }}

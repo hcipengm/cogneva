@@ -198,6 +198,7 @@ spec:
     spec:
       serviceAccountName: cogneva-evolution
       securityContext:
+        {{- /* lit: 0 fixed — the evolution workload runs as root to drive host-path workspaces */}}
         runAsUser: 0
         runAsGroup: 0
         fsGroup: 0
@@ -208,6 +209,7 @@ spec:
           command:
             - sh
             - -c
+            {{- /* lit: 124 fixed — coreutils timeout's exit status; a shell contract, not a dial */}}
             - |
               set -e
               git config --global --add safe.directory /host-git
