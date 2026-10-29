@@ -69,6 +69,10 @@ const CHART_CONFIG: &str = "deploy/helm/cogneva/files/cogneva.json";
 /// can never fire.
 const PRODUCED: &[(&str, &str)] = &[
     (
+        "cogneva_boot_phase_elapsed_seconds",
+        "crates/cog-observability/src/boot_footprint.rs",
+    ),
+    (
         "cogneva_boot_rss_bytes",
         "crates/cog-observability/src/boot_footprint.rs",
     ),
