@@ -1520,6 +1520,27 @@ metric_names! {
     // state family says `waiting`.
     CHANGE_LEDGER_OUT_OF_EFFECT_OLDEST_SECONDS => "cogneva_change_ledger_out_of_effect_oldest_seconds",
 
+    // cog-orchestrator — what the re-measurement intake is holding: how many
+    // requests nobody has folded yet, and how long the oldest has been waiting.
+    //
+    // The intake is the only way a row retired under a rule that lives outside
+    // the measured tree gets looked at again, and until these two existed the
+    // whole of it was a line in a pass log: a request that stopped folding left
+    // no series, so the only reader who could see it was one who already
+    // suspected it. Written on every pass, `0` included, so a queue that
+    // drains cannot go on standing at its last depth.
+    CHANGE_LEDGER_REMEASURE_PENDING => "cogneva_change_ledger_remeasure_pending",
+
+    // cog-orchestrator — the age of the oldest unfolded re-measurement request,
+    // in seconds, published beside the count above.
+    //
+    // A count cannot say how long: twenty-seven requests that arrived this
+    // second and twenty-seven that have been stuck since yesterday are the same
+    // number and different repairs. `0` means the queue is empty -- the count
+    // is what tells a reader that, because the age of a request declared this
+    // very second would also round to zero.
+    CHANGE_LEDGER_REMEASURE_OLDEST_SECONDS => "cogneva_change_ledger_remeasure_oldest_seconds",
+
     // cog-orchestrator — rows a change-ledger pass tried to measure and could
     // not, counted as they enter that set, by reason and by which half of the
     // pass could not settle them.

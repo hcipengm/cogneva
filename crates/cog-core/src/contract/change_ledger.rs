@@ -899,6 +899,28 @@ pub struct ChangeLedgerEvent {
     pub unsettled_reason: Option<String>,
 }
 
+/// What the re-measurement intake is holding, as one read of it.
+///
+/// Two numbers rather than one because a count cannot say "for how long": a
+/// queue of twenty-seven requests that arrived this second and a queue of
+/// twenty-seven that has been stuck since yesterday are the same count and
+/// opposite facts, and the repair for the first is to wait one pass. The age is
+/// the oldest request's, not an average, for the reason the landed account's own
+/// age reading is: one request nobody can fold stays visible while the rest of
+/// the queue turns over.
+///
+/// `oldest_seconds` is `None` when the queue is empty, never `0` -- zero here
+/// would be the age of a request declared in this very second, and a reader that
+/// only saw the number could not tell an idle intake from a just-filled one.
+/// That is why the pair is published together: `pending` separates them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RemeasureBacklog {
+    /// Requests nobody has folded yet.
+    pub pending: u64,
+    /// How long the oldest of them has been waiting, in whole seconds.
+    pub oldest_seconds: Option<u64>,
+}
+
 /// Durable storage for the change ledger.
 ///
 /// The only way to move a row's state is [`Self::apply_measurement`]. Rows enter
@@ -1305,6 +1327,16 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// Guarded so that it is a statement about this fold rather than an
     /// overwrite: a request already marked keeps the time an earlier fold set.
     async fn mark_remeasured(&self, identity: &ChangeIdentity) -> SFResult<()>;
+
+    /// What the intake is holding right now: how many requests are still
+    /// unfolded, and how long the oldest has been waiting.
+    ///
+    /// A separate read rather than a by-product of
+    /// [`Self::pending_remeasurements`], because that one takes a bounded batch
+    /// and a batch that fills its limit cannot say how much was left behind --
+    /// the number a reader needs when the question is "is this intake stuck",
+    /// which is exactly the moment the batch is full.
+    async fn remeasurement_backlog(&self) -> SFResult<RemeasureBacklog>;
 
     /// Record that a commit delivered this row's change, and which commit.
     ///

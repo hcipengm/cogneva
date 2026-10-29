@@ -27,7 +27,7 @@ use cog_auth::jwt::{JwtConfig, JwtManager};
 use cog_core::{
     ChangeBlock, ChangeIdentity, ChangeLedgerEvent, ChangeLedgerRow, ChangeLedgerStore,
     ChangePriority, ChangeReading, ChangeSource, ChangeState, GatewayConfig, PreCheckResult,
-    QuotaManager, QuotaSummary, SFResult, User, UserStatus, UserType,
+    QuotaManager, QuotaSummary, RemeasureBacklog, SFResult, User, UserStatus, UserType,
 };
 use cog_gateway::{create_router, GatewayState};
 use common::orchestrator::control;
@@ -225,6 +225,10 @@ impl ChangeLedgerStore for FakeLedger {
 
     async fn mark_remeasured(&self, _identity: &ChangeIdentity) -> SFResult<()> {
         unimplemented!("the read face does not fold requests")
+    }
+
+    async fn remeasurement_backlog(&self) -> SFResult<RemeasureBacklog> {
+        unimplemented!("the read face does not count the intake")
     }
 
     async fn record_delivery(&self, _identity: &ChangeIdentity, _rev: &str) -> SFResult<()> {

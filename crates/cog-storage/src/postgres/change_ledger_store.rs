@@ -18,7 +18,7 @@ use cog_core::{
     BlockCensus, BlockedReason, BlockingHolder, BlockingSurface, ChangeBlock, ChangeIdentity,
     ChangeLedgerEvent, ChangeLedgerRow, ChangeLedgerStore, ChangeMeasurement, ChangePriority,
     ChangeReading, ChangeReopen, ChangeSource, ChangeState, DemandClosure, DispatchState,
-    RetireReason, SFError, SFResult, WriteWindow,
+    RemeasureBacklog, RetireReason, SFError, SFResult, WriteWindow,
 };
 
 /// Resolve the state and reason words a query template names.
@@ -799,6 +799,20 @@ const MARK_REMEASURED_SQL: &str = "\
 UPDATE change_ledger_remeasure SET folded_at = now()
 WHERE folded_at IS NULL AND kind = $1 AND scope = $2 AND literal = $3";
 
+/// What the intake is holding, in one row: the count, and the age of the oldest
+/// request as whole seconds since it was declared.
+///
+/// `min(declared_at)` over an empty set is NULL and `EXTRACT` carries that
+/// through, so an empty queue reads as "no age" rather than as the age of the
+/// epoch -- the difference a reader acts on is whether there is anything waiting
+/// at all, and a `0` here would be indistinguishable from a request declared a
+/// second ago.
+const REMEASURE_BACKLOG_SQL: &str = "\
+SELECT count(*) AS pending,
+       CAST(EXTRACT(EPOCH FROM (now() - min(declared_at))) AS BIGINT) AS oldest_seconds
+FROM change_ledger_remeasure
+WHERE folded_at IS NULL";
+
 /// Write one reading into the account, on whatever executor the caller has.
 ///
 /// Takes an executor rather than the pool because the fold writes inside the
@@ -1528,6 +1542,27 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 SFError::Database(format!("mark remeasured {}: {e}", identity.as_key()))
             })?;
         Ok(())
+    }
+
+    async fn remeasurement_backlog(&self) -> SFResult<RemeasureBacklog> {
+        let row = sqlx::query(REMEASURE_BACKLOG_SQL)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(format!("read remeasurement backlog: {e}")))?;
+        let pending = row
+            .try_get::<i64, _>("pending")
+            .map_err(|e| SFError::Database(format!("pending: {e}")))?;
+        let oldest = row
+            .try_get::<Option<i64>, _>("oldest_seconds")
+            .map_err(|e| SFError::Database(format!("oldest_seconds: {e}")))?;
+        Ok(RemeasureBacklog {
+            pending: pending.max(0) as u64,
+            // A negative age is a clock that moved backwards between the write
+            // and the read; counting it as "waiting zero seconds" is the honest
+            // half of a number nobody can act on, and it keeps the reading out
+            // of the unsigned type's panic path.
+            oldest_seconds: oldest.map(|s| s.max(0) as u64),
+        })
     }
 
     async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()> {

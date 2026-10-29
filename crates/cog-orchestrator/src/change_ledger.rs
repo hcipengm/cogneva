@@ -120,7 +120,8 @@ use cog_core::{
     ChangeSource, ChangeState, DemandClosure, DispatchDecision, DispatchState, LiveRevision,
     LiveRevisionSource, LlmPoolStatus, LlmWindowPace, MetricsBackend, OrchestratorControl,
     OwnerLeaseBroker, PoolReading, PrincipleCheckKind, PrincipleLedgerStore, PrincipleRow,
-    RetireReason, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus, TaskType, WriteWindow,
+    RemeasureBacklog, RetireReason, SFResult, ShutdownSignal, StateBackend, Task, TaskStatus,
+    TaskType, WriteWindow,
 };
 
 use cog_core::contract::llm::UpstreamFailure;
@@ -2524,6 +2525,12 @@ async fn measure_pass(
     let parent_backfilled =
         backfill_parent_observations(store, tree, PARENT_BACKFILL_PER_PASS).await;
 
+    // Taken after the fold and before the summary, so the number says what is
+    // still waiting when this pass is over rather than what was waiting when it
+    // began: a pass that folds its whole queue and reports the queue it found is
+    // a reading that can never come down.
+    let backlog = record_remeasure_backlog(metrics, store).await;
+
     info!(
         measured = considered,
         landed,
@@ -2550,6 +2557,11 @@ async fn measure_pass(
         // rule that took the measurement was corrected, and a producer asked for
         // the row to be read again.
         remeasured = reopened_pass.remeasured,
+        // The intake's depth and age as the pass leaves them. `None` rather than
+        // zeros: a pass that could not count the intake and a pass that found it
+        // empty are different facts, and the summary line is where the two would
+        // otherwise read the same.
+        remeasure_backlog = ?backlog,
         // The landed half of the same two readings the outstanding pass already
         // gives. A row that cannot be settled keeps its old `measured_at`, so
         // without these two numbers the staleness order reads the same whether a
@@ -5168,6 +5180,69 @@ async fn publish_in_effect_reading(
     }
 }
 
+/// Publish what the re-measurement intake is holding, and give the pass's own
+/// summary line the same numbers.
+///
+/// The intake is the only path a row retired under a rule outside the measured
+/// tree has back into the account, and until this existed the whole of it was a
+/// log line -- one that a busy pod rotates away within a minute. A request that
+/// stopped folding therefore left nothing a reader could select: the producer
+/// had done its part, the queue was durable, and nothing anywhere said it was
+/// not moving.
+///
+/// A failed read publishes nothing rather than zeros. A gauge keeps the value it
+/// was last given, so writing `0` here would turn a blind pass into a *drained*
+/// one, which is the more reassuring of the two readings and the false one.
+async fn record_remeasure_backlog(
+    metrics: Option<&Arc<dyn MetricsBackend>>,
+    store: &dyn ChangeLedgerStore,
+) -> Option<RemeasureBacklog> {
+    let backlog = match store.remeasurement_backlog().await {
+        Ok(backlog) => backlog,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "change ledger: the re-measurement intake could not be counted, so this pass \
+                 publishes no depth -- whatever the series last said is still standing"
+            );
+            return None;
+        }
+    };
+    let Some(metrics) = metrics else {
+        // No reading face is published; the summary line still carries the
+        // number, and returning it here is what makes the two agree.
+        return Some(backlog);
+    };
+    if let Err(e) = metrics
+        .record_gauge(
+            metric_names::CHANGE_LEDGER_REMEASURE_PENDING,
+            backlog.pending as f64,
+            HashMap::new(),
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            "change ledger: how many re-measurement requests are waiting could not be published"
+        );
+    }
+    if let Err(e) = metrics
+        .record_gauge(
+            metric_names::CHANGE_LEDGER_REMEASURE_OLDEST_SECONDS,
+            backlog.oldest_seconds.unwrap_or(0) as f64,
+            HashMap::new(),
+        )
+        .await
+    {
+        warn!(
+            error = %e,
+            "change ledger: how long the oldest re-measurement request has been waiting could \
+             not be published"
+        );
+    }
+    Some(backlog)
+}
+
 /// The two halves of the account an unsettled count is kept for.
 ///
 /// One family with a label rather than two names: the two sweeps ask the same
@@ -7429,6 +7504,10 @@ mod tests {
         /// removing them, so what is left here after a pass is what it did not
         /// answer.
         remeasurements: std::sync::Mutex<Vec<ChangeIdentity>>,
+        /// Whether the intake's own reading fails. A store that cannot count the
+        /// queue is a different reading from an empty one, and the only way a
+        /// test can tell them apart is to build the first.
+        backlog_unreadable: bool,
     }
 
     impl FakeLedger {
@@ -7726,6 +7805,21 @@ mod tests {
                 .unwrap()
                 .retain(|known| known != identity);
             Ok(())
+        }
+        async fn remeasurement_backlog(&self) -> SFResult<RemeasureBacklog> {
+            if self.backlog_unreadable {
+                return Err(SFError::Database("the intake could not be counted".into()));
+            }
+            let queued = self.remeasurements.lock().unwrap();
+            Ok(RemeasureBacklog {
+                pending: queued.len() as u64,
+                // The double keeps no declaration times, so it can say whether
+                // anything is waiting and not for how long. A made-up age would
+                // be a number a test could not tell from a measured one; `None`
+                // is the empty queue's answer and `Some(0)` claims only that the
+                // request exists, which is all this double knows.
+                oldest_seconds: if queued.is_empty() { None } else { Some(0) },
+            })
         }
         async fn record_reopen(&self, reopen: &ChangeReopen) -> SFResult<()> {
             self.reopened.lock().unwrap().push(reopen.clone());
@@ -8387,6 +8481,92 @@ mod tests {
                 .expect("read the queue")
                 .is_empty(),
             "the request is folded once its measurement is written"
+        );
+    }
+
+    /// What the intake holds is published every pass, and a pass that could not
+    /// count it publishes nothing rather than a zero.
+    ///
+    /// This is the reading the intake never had. Everything else about it is
+    /// durable -- the requests are rows, the fold is a write -- but whether the
+    /// queue was moving lived only in a log line, on a pod that writes enough
+    /// per second to rotate that line away inside a minute. A zero written on a
+    /// pass that could not look would be the one wrong answer that reads as the
+    /// best one: a drained queue.
+    #[tokio::test]
+    async fn the_intake_publishes_what_it_holds_and_nothing_when_it_cannot_count() {
+        let identity = ChangeIdentity::new("grep", "file", "fn thing");
+        let store = FakeLedger::default();
+        store
+            .request_remeasurement(&identity, "test:corrected-rule")
+            .await
+            .expect("queue the request");
+
+        let gauges = std::sync::Arc::new(RecordingGauges::default());
+        let metrics: std::sync::Arc<dyn MetricsBackend> = gauges.clone();
+        let backlog = record_remeasure_backlog(Some(&metrics), &store).await;
+        assert_eq!(
+            backlog,
+            Some(RemeasureBacklog {
+                pending: 1,
+                oldest_seconds: Some(0),
+            }),
+            "the summary line carries the same reading the series does"
+        );
+        assert_eq!(
+            gauges.gauges(),
+            vec![
+                ("cogneva_change_ledger_remeasure_pending".to_string(), 1.0),
+                (
+                    "cogneva_change_ledger_remeasure_oldest_seconds".to_string(),
+                    0.0
+                ),
+            ],
+            "both numbers are written, in one order, on every pass"
+        );
+
+        // The reading comes down when the queue does. A gauge that was only
+        // written while something was waiting would leave the last depth
+        // standing after the fold that emptied it.
+        store
+            .mark_remeasured(&identity)
+            .await
+            .expect("fold the request");
+        let gauges = std::sync::Arc::new(RecordingGauges::default());
+        let metrics: std::sync::Arc<dyn MetricsBackend> = gauges.clone();
+        let empty = record_remeasure_backlog(Some(&metrics), &store).await;
+        assert_eq!(
+            empty,
+            Some(RemeasureBacklog {
+                pending: 0,
+                oldest_seconds: None,
+            }),
+            "an empty queue has no age, which is not the same fact as an age of zero"
+        );
+        assert_eq!(
+            gauges.gauges()[0].1,
+            0.0,
+            "the depth is written back down to zero"
+        );
+
+        // A pass that could not count the intake says so and writes nothing: the
+        // series keeps standing at whatever the last pass measured, which a
+        // reader can tell apart from a measured zero.
+        let unreadable = FakeLedger {
+            backlog_unreadable: true,
+            ..Default::default()
+        };
+        let gauges = std::sync::Arc::new(RecordingGauges::default());
+        let metrics: std::sync::Arc<dyn MetricsBackend> = gauges.clone();
+        assert_eq!(
+            record_remeasure_backlog(Some(&metrics), &unreadable).await,
+            None,
+            "a count that was not taken is not a count of zero"
+        );
+        assert!(
+            gauges.gauges().is_empty(),
+            "a blind pass must not overwrite the last measured depth: {:?}",
+            gauges.gauges()
         );
     }
 
@@ -10940,14 +11120,116 @@ mod tests {
     /// One counter write: its name, its value, and the labels it carried.
     type CounterWrite = (String, f64, HashMap<String, String>);
 
+    /// One gauge write, with the same shape, kept in the order it was made.
+    type GaugeWrite = (String, f64, HashMap<String, String>);
+
+    /// A metrics backend that keeps every gauge write, in order.
+    ///
+    /// Counters are unimplemented rather than recorded, for the reason the
+    /// counter double above gives from the other side: a family that published a
+    /// counter as a gauge would otherwise pass.
+    #[derive(Default)]
+    struct RecordingGauges {
+        gauges: std::sync::Mutex<Vec<GaugeWrite>>,
+    }
+
+    impl RecordingGauges {
+        fn gauges(&self) -> Vec<(String, f64)> {
+            self.gauges
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, value, _)| (name.clone(), *value))
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MetricsBackend for RecordingGauges {
+        async fn record_gauge(
+            &self,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
+        ) -> SFResult<()> {
+            self.gauges
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
+            Ok(())
+        }
+        async fn record_counter(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!("this family writes gauges only")
+        }
+        async fn record_histogram(
+            &self,
+            _: cog_core::MetricName,
+            _: f64,
+            _: HashMap<String, String>,
+        ) -> SFResult<()> {
+            unimplemented!("this family writes gauges only")
+        }
+        async fn query_gauge_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_counter_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_gauge_latest(&self, _: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_counter_totals(&self, _: &str) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn query_histogram_totals(
+            &self,
+            _: &str,
+        ) -> SFResult<Vec<cog_core::HistogramTotals>> {
+            unimplemented!()
+        }
+        async fn query_histogram_range(
+            &self,
+            _: &str,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> SFResult<Vec<cog_core::MetricSample>> {
+            unimplemented!()
+        }
+        async fn list_metric_names(&self, _: cog_core::MetricType) -> SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn health_check(&self) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
     /// A metrics backend that keeps every counter write, in order.
     ///
-    /// Gauges are unimplemented rather than recorded: the family under test
-    /// has none, and a double that silently swallowed one would let a change
-    /// that published a counter as a gauge pass.
+    /// Gauges are kept in a list of their own rather than mixed in: a pass
+    /// writes both kinds now, and the counter assertions must not start reading
+    /// a gauge as a counter. What keeps a family from publishing its count under
+    /// the wrong kind is the counters list itself -- `counters()` holds what was
+    /// recorded *as* a counter, so a reading written as a gauge leaves it empty
+    /// and every assertion on it fails.
     #[derive(Default)]
     struct RecordingCounters {
         counters: std::sync::Mutex<Vec<CounterWrite>>,
+        gauges: std::sync::Mutex<Vec<GaugeWrite>>,
     }
 
     impl RecordingCounters {
@@ -10960,11 +11242,15 @@ mod tests {
     impl MetricsBackend for RecordingCounters {
         async fn record_gauge(
             &self,
-            _: cog_core::MetricName,
-            _: f64,
-            _: HashMap<String, String>,
+            name: cog_core::MetricName,
+            value: f64,
+            labels: HashMap<String, String>,
         ) -> SFResult<()> {
-            unimplemented!("this family writes counters only")
+            self.gauges
+                .lock()
+                .unwrap()
+                .push((name.as_str().to_string(), value, labels));
+            Ok(())
         }
         async fn record_counter(
             &self,

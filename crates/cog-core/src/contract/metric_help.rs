@@ -2235,6 +2235,32 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          and only the state cell separates them",
     ),
     (
+        "cogneva_change_ledger_remeasure_pending",
+        "How many re-measurement requests nobody has folded yet, written on every \
+         change-ledger pass. The intake is how a row retired under a rule that \
+         lives outside the measured tree gets asked again after that rule is \
+         corrected -- the tree never moves, so no read of the tree would ever \
+         revisit it -- and the writer folds the whole queue on the pass after the \
+         one that queued it, so a number that stays above zero across two passes \
+         is the intake failing rather than the intake working. Zero is written \
+         like any other value, so a queue that drains does not go on standing at \
+         its last depth. Read beside \
+         cogneva_change_ledger_remeasure_oldest_seconds: this number counts, that \
+         one says how long",
+    ),
+    (
+        "cogneva_change_ledger_remeasure_oldest_seconds",
+        "How long the oldest unfolded re-measurement request has been waiting, in \
+         seconds, written on every change-ledger pass. It is 0 when the queue is \
+         empty, which is why the count beside it is the reading that separates an \
+         idle intake from one filled in this very second: the age of a request \
+         declared a moment ago would also round to zero. It is 0 when the pass \
+         could not count the intake either -- that case writes nothing at all \
+         rather than zero, so a blind pass leaves the previous value standing and \
+         says so in its log rather than replacing a real age with a reassuring \
+         one",
+    ),
+    (
         "cogneva_backup_run_readings",
         "What the backup account holds, by readout, read from the rows the backup \
          runs wrote rather than measured again from the volume. The run counts, \

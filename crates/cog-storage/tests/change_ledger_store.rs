@@ -328,6 +328,78 @@ async fn a_remeasurement_request_is_queued_once_and_revived_by_a_later_correctio
     cleanup(&pool, &marker).await;
 }
 
+/// The intake's depth and age come back as one row of two numbers, and both
+/// move with the queue.
+///
+/// The shapes are what this test is for. The count is a `BIGINT` and the age is
+/// `NULL` when nothing is waiting -- not `0`, which is what a request declared a
+/// second ago would also read as. Folding is expressed as an inequality rather
+/// than as an absolute number because the table is shared: a resident writer
+/// folds other rows between these reads, and counting on a quiet table would
+/// make the test fail on the one day it matters most.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_backlog_counts_the_unfolded_requests_and_ages_the_oldest() {
+    let (store, pool, marker) = store().await;
+    let id = identity(&marker, "backlog");
+    store
+        .apply_measurement(&ChangeMeasurement::retired(
+            id.clone(),
+            RetireReason::Fixture,
+        ))
+        .await
+        .expect("write the retired row");
+
+    let before = store
+        .remeasurement_backlog()
+        .await
+        .expect("read the intake before queueing");
+
+    store
+        .request_remeasurement(&id, "probe:backlog")
+        .await
+        .expect("queue the request");
+    store
+        .request_remeasurement(&id, "probe:backlog")
+        .await
+        .expect("queue the same request again");
+
+    let queued = store
+        .remeasurement_backlog()
+        .await
+        .expect("read the intake after queueing");
+    assert!(
+        queued.pending > before.pending,
+        "the queue grew by the request this test made: {} -> {}",
+        before.pending,
+        queued.pending
+    );
+    assert!(
+        queued.oldest_seconds.is_some(),
+        "a queue with something in it has an age"
+    );
+
+    store.mark_remeasured(&id).await.expect("fold the request");
+    let folded = store
+        .remeasurement_backlog()
+        .await
+        .expect("read the intake after folding");
+    assert!(
+        folded.pending < queued.pending,
+        "folding a request takes it out of the depth: {} -> {}",
+        queued.pending,
+        folded.pending
+    );
+    if folded.pending == 0 {
+        assert_eq!(
+            folded.oldest_seconds, None,
+            "an empty queue has no age, which is not an age of zero"
+        );
+    }
+
+    cleanup(&pool, &marker).await;
+}
+
 /// A row created by a measurement entered by being measured, so its entry
 /// revision is that measurement's -- the one path that sets the column without a
 /// reading.
