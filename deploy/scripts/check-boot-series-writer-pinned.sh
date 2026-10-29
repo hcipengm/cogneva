@@ -7,7 +7,8 @@
 # 因为它们是库里的代码，应用与进化 Pod 都跑它。应用的七格全走（process-start /
 # config-loaded / embedding-dense / embedding-sparse / reranker / plugins-initialized /
 # serving），进化 Pod 只走其中四格，而且量级差四十倍：同一天 `plugins-initialized` 上
-# 应用是 4591 MiB、进化 Pod 是 97 MiB。于是「只按 `phase` 折叠」不是把重复压成一个，
+# 应用是 4591 MiB、进化 Pod 是 97 MiB（2026-10-29 现网实测）。于是「只按 `phase` 折叠」
+# 不是把重复压成一个，
 # 而是**换主语**：`max by (phase)` 取当时量级大的那个，`min_over_time` 之类跨时间的
 # 窗口聚合取当时恰好在线的那一个。`boot_phase_footprint_grew` 就是这样报出「应用涨了
 # 47.03 倍」的——两个分母都是进化 Pod 的值，应用在同一时刻只涨了 1.003 倍。
