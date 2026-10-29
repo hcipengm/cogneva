@@ -909,19 +909,6 @@ fn call_arguments<'a>(text: &'a str, callee: &str, out: &mut Vec<&'a str>) {
     }
 }
 
-/// 一段代码里出现的带引号字面量。
-fn quoted(text: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut rest = text;
-    while let Some(open) = rest.find('"') {
-        let after = &rest[open + 1..];
-        let Some(close) = after.find('"') else { break };
-        words.push(after[..close].to_string());
-        rest = &after[close + 1..];
-    }
-    words
-}
-
 /// 一条 SQL 语句里的字符串字面量。写给 `role` 列的那个词在这一层，不在 Rust 层：
 /// SQL 常量外面那对双引号是 Rust 的，里面单引号包着的才是落进列里的字节。
 fn sql_quoted(text: &str) -> Vec<String> {
