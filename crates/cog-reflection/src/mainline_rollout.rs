@@ -2606,6 +2606,16 @@ pub(crate) enum CiHoldKind {
     Unasked,
 }
 
+/// 容器这一趟运行已经持续了多少秒，取自集群自己的 `state.running.startedAt`。
+///
+/// `None` 的意思只有一个：这一拍没读到、或读到的不是时间。**不是**「它稳了很久」——
+/// 调用点据此保留更严的判词，读不到从不换成一个宽结论。
+fn run_secs_since(started_at: &str) -> Option<u64> {
+    let started = DateTime::parse_from_rfc3339(started_at.trim()).ok()?;
+    let age = Utc::now().signed_duration_since(started.with_timezone(&Utc));
+    u64::try_from(age.num_seconds()).ok()
+}
+
 impl RolloutExecutor {
     pub fn new(
         kubectl: impl Into<String>,
@@ -4180,9 +4190,10 @@ impl RolloutExecutor {
         Ok(normalize_placement_shape(&out))
     }
 
-    /// Pod 健康信号：双标签选择器，查 restartCount/ready/waiting reason。
-    /// 致命等待态（拉不到镜像、配置错误、CrashLoop）与非零重启立即判病。
-    /// 空输出是选择器失效，不能当健康。
+    /// Pod 健康信号：双标签选择器，查 restartCount/ready/waiting reason/这一趟
+    /// 运行的起点。致命等待态（拉不到镜像、配置错误、CrashLoop）与非零重启立即判病；
+    /// 重启那一档只在「这一趟运行还没跨过 soak」或「读不到起点」时成立（理由写在
+    /// 那一支的注释里）。空输出是选择器失效，不能当健康。
     ///
     /// 只用于 soak 复查：滚动期的「新副本还没就绪」由 wait_rollout_complete
     /// 按探针周期给预算，那里的宽限是有刻度的，这里的 fixed 判病只面对已经
@@ -4202,7 +4213,7 @@ impl RolloutExecutor {
                     "-l",
                     &selector,
                     "-o",
-                    "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}",
+                    "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{' '}{.status.containerStatuses[0].state.running.startedAt}{\"\\n\"}{end}",
                 ],
                 30,
                 self.rollout_timeout_secs,
@@ -4214,10 +4225,18 @@ impl RolloutExecutor {
             )));
         }
         for line in out.lines() {
-            let mut parts = line.split_whitespace();
-            let restarts: u32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let ready = parts.next().unwrap_or("false");
-            let waiting_reason = parts.next().unwrap_or("");
+            // 按**位置**切，不按空白切：jsonpath 每个字段之间固定给一个空格，而空字段
+            // （等待原因在运行中的容器上没有、运行起点在等待中的容器上没有）会留下相邻
+            // 的两个空格。`split_whitespace` 会把它们折成一个，后面的字段就整列前移，
+            // 「运行中」的 Pod 看起来像没有起点、「等待中」的 Pod 的等待原因变成别的东西。
+            let mut parts = line.split(' ');
+            let restarts: u32 = parts
+                .next()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            let ready = parts.next().unwrap_or("").trim();
+            let waiting_reason = parts.next().unwrap_or("").trim();
+            let running_since = parts.next().unwrap_or("").trim();
             if FATAL_WAITING_REASONS.contains(&waiting_reason) {
                 let msg = format!(
                     "pod of deployment/{} in fatal waiting state {waiting_reason}: {line}",
@@ -4230,11 +4249,31 @@ impl RolloutExecutor {
                 return Err(self.with_scene(t, msg).await);
             }
             if restarts > self.restart_threshold {
-                let msg = format!(
-                    "pod of deployment/{} restarting ({} restarts, threshold {}): {line}",
-                    t.deployment, restarts, self.restart_threshold
-                );
-                return Err(self.with_scene(t, msg).await);
+                // 重启计数是 Pod 一生的累计，就绪是此刻的事实——两个数回答的不是同一个
+                // 问题。一个此刻就绪、且这一趟运行已经跨过整段 soak 的容器，它那些重启
+                // 全都发生在真正起来之前：宿主在这一刻被别的活挤住（等表锁等穿预算、建
+                // 集合超时）就是这个形状，同一张镜像下一次启动就起来了。版本真坏了，
+                // 同一个容器会再倒一次，下一次采样读到的是 `ready=false`，由上面那一支
+                // 判死——那时判词里有「没起来」的现场，而不是一个与病因无关的计数。
+                //
+                // 判死于是只在两种情况下成立：容器此刻没就绪（上面已拦），或这一趟运行
+                // 还没跨过 soak——那时「起来了」与「刚崩完又起来」在读数上同形。读不到
+                // 起点同样按判死处理：读不到不是「它稳了很久」。
+                //
+                // 这里**不读**宿主负载：那会是在第三处判「机器忙不忙」。这一支只是停止
+                // 用一个与问题无关的数判死，不是把「起不来」解释成环境。
+                let run_secs = run_secs_since(running_since);
+                if !run_secs.is_some_and(|secs| secs >= self.soak_secs) {
+                    let run_note = match run_secs {
+                        Some(secs) => format!("running {secs}s"),
+                        None => "start time not readable".to_string(),
+                    };
+                    let msg = format!(
+                        "pod of deployment/{} restarting ({} restarts, threshold {}, {run_note}): {line}",
+                        t.deployment, restarts, self.restart_threshold
+                    );
+                    return Err(self.with_scene(t, msg).await);
+                }
             }
         }
         Ok(())

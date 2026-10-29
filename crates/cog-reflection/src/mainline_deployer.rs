@@ -19901,7 +19901,7 @@ echo "||1"
         std::fs::write(&pods_file, "0 false ImagePullBackOff").unwrap();
         assert!(executor.pods_healthy(&target).await.is_err());
 
-        // 重启超阈值。
+        // 重启超阈值、且读不到这一趟运行的起点：读不到不换成宽结论，按判死。
         std::fs::write(&pods_file, "2 true ").unwrap();
         assert!(executor.pods_healthy(&target).await.is_err());
 
@@ -19912,6 +19912,79 @@ echo "||1"
         // 健康。
         std::fs::write(&pods_file, "0 true ").unwrap();
         assert!(executor.pods_healthy(&target).await.is_ok());
+    }
+
+    /// 重启计数说的是 Pod 的一生，就绪说的是此刻——两个数回答的不是同一个问题。
+    ///
+    /// 这一格是线上那一幕的形状：新 Pod 已经 `Ready=True`、这一趟已经跑了 313 秒，
+    /// 两次重启都发生在真正起来之前（宿主 io 饱和：一次等 `schema_entries` 的表锁等穿
+    /// 预算，一次建 qdrant 集合超时），部署器却拿 `2 > threshold 1` 判它「没起来」并
+    /// 回滚——同一句判词里那截 `Running ready ran=313s` 就是它自相矛盾的地方。
+    #[tokio::test]
+    async fn a_ready_pod_that_outlived_the_soak_is_not_condemned_by_its_restarts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let pods_file = bin_dir.join("pods.out");
+        let kubectl = fake_kubectl_pods_from_file(&bin_dir, &pods_file);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60, 900);
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "gateway".into(),
+            name: "cogneva".into(),
+        };
+
+        // 就绪，两次重启，这一趟运行的起点远在 soak 之前：那些重启是历史。
+        std::fs::write(&pods_file, "2 true  2020-01-01T00:00:00Z").unwrap();
+        assert!(executor.pods_healthy(&target).await.is_ok());
+    }
+
+    /// 反面：同一个计数，容器这一趟是刚起来的。那时「已经起来了」与「刚崩完又起来」
+    /// 在读数上同形，计数仍然判死——否则一个每次崩完都能就绪一瞬的版本会被读成健康。
+    #[tokio::test]
+    async fn a_ready_pod_that_restarted_inside_the_soak_is_still_condemned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let pods_file = bin_dir.join("pods.out");
+        let kubectl = fake_kubectl_pods_from_file(&bin_dir, &pods_file);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 60, 1, 60, 900);
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "gateway".into(),
+            name: "cogneva".into(),
+        };
+
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        std::fs::write(&pods_file, format!("2 true  {now}")).unwrap();
+        let err = executor.pods_healthy(&target).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("restarting"), "{msg}");
+        assert!(msg.contains("running "), "判词要说清这一趟跑了多久：{msg}");
+    }
+
+    /// 反面之二：没起来的 Pod 不会因为「机器可能忙」被读成环境类。这一支不读宿主，
+    /// 「起不来」仍然是版本类的现场（`not ready`），而不是一个重启计数。
+    #[tokio::test]
+    async fn a_pod_that_never_came_up_is_not_read_as_a_busy_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let pods_file = bin_dir.join("pods.out");
+        let kubectl = fake_kubectl_pods_from_file(&bin_dir, &pods_file);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 60, 1, 60, 900);
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "gateway".into(),
+            name: "cogneva".into(),
+        };
+
+        // 没就绪、重启过两次、宿主的读数也不是这一支的输入。
+        std::fs::write(&pods_file, "2 false ").unwrap();
+        let err = executor.pods_healthy(&target).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not ready"), "{msg}");
+        assert!(!msg.contains(HOST_LOADED_MARKER), "{msg}");
     }
 
     /// A support-workload read that hits an unreachable cluster is tried again
