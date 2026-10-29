@@ -1592,6 +1592,16 @@ pub struct BlockCensus {
     /// to the face's population: without it a face that shrank to nothing by
     /// retiring its work would be indistinguishable from one that finished.
     pub retired: u64,
+    /// How many of `owed` are rows nothing has settled the question about, or
+    /// whose last look did not settle it.
+    ///
+    /// A part of `owed` and not a fourth bucket: the three above still sum to
+    /// the face's population, and a reader that adds this one to them counts
+    /// these rows twice. It is published because `owed` alone answers "someone
+    /// still owes something here" for a row nobody has even asked about, and
+    /// those are two different reasons for the same number -- one a queue, the
+    /// other a heading that was filed under and never looked at.
+    pub undecided: u64,
     /// How long the oldest owed row in this face has gone without a
     /// measurement. `None` when nothing in it is owed or every owed row has
     /// been measured: the two are different facts and neither is zero.

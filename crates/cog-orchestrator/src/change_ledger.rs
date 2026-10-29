@@ -5106,8 +5106,9 @@ async fn record_dispatch_state(
     publish_dispatch_verdict(metrics, &state).await;
 }
 
-/// Publish the account grouped by face: landed, owed, and how long the face's
-/// longest-waiting owed row has gone without a measurement.
+/// Publish the account grouped by face: landed, owed, how much of what is owed
+/// nobody has asked about, and how long the face's longest-waiting owed row has
+/// gone without a measurement.
 ///
 /// Every face on every pass, including the ones that owe nothing, because a
 /// face that stopped being written would go on being served at its last value
@@ -5130,6 +5131,13 @@ async fn publish_block_census(
             ("landed", face.landed as f64),
             ("owed", face.owed as f64),
             ("retired", face.retired as f64),
+            // Written on every face on every pass even at zero, unlike the age
+            // below: `owed` says a face still holds work, and this says how much
+            // of it nobody has even asked about. A face that skips the cell
+            // would read as one with nothing unsettled, which is the answer that
+            // stops anyone from looking. It is a part of `owed`, not a fourth
+            // bucket, so the three counts above remain the face's population.
+            ("undecided", face.undecided as f64),
         ];
         // An absence is not a zero: no age says every owed row in this face has
         // been measured, which is a different fact from none of them having
@@ -11028,6 +11036,127 @@ mod tests {
             )],
             "exactly this pass's combination reads as one; two ones is a reader asking which \
              pass is current and being told there are two"
+        );
+    }
+
+    /// Every face carries its undecided count, on every pass, at zero when it
+    /// has none.
+    ///
+    /// `owed` alone answers "this face still holds work" for two different
+    /// situations: a queue somebody is working through, and rows that were filed
+    /// and then never looked at. The census is the only per-face reading the
+    /// account has, so the second one has nowhere else to be seen -- the global
+    /// dispatch readouts carry the undecided total but not which heading holds
+    /// it.
+    ///
+    /// The cell is written even at zero, unlike the age beside it: a face that
+    /// skipped the cell would be served at the previous tick's value by the
+    /// gauge store, so a heading whose unsettled row was finally measured would
+    /// go on reading as unsettled. And the three buckets are this face's
+    /// population with or without the new cell -- `undecided` counts rows
+    /// already inside `owed`, so a reader that adds it to the three counts these
+    /// rows twice.
+    #[tokio::test]
+    async fn the_face_census_publishes_every_faces_undecided_count_every_pass() {
+        let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let metrics: Arc<dyn MetricsBackend> = metrics.clone();
+        let name = ChangeBlock::named("principles").expect("a face name");
+        let census = [
+            BlockCensus {
+                block: ChangeBlock::NONE,
+                landed: 3,
+                owed: 5,
+                retired: 1,
+                undecided: 2,
+                oldest_unmeasured_secs: Some(90),
+                newest_activity_secs: Some(10),
+            },
+            BlockCensus {
+                block: name.clone(),
+                landed: 7,
+                owed: 0,
+                retired: 0,
+                undecided: 0,
+                oldest_unmeasured_secs: None,
+                newest_activity_secs: Some(5),
+            },
+        ];
+        publish_block_census(Some(&metrics), Some(&census)).await;
+
+        let end = Utc::now() + chrono::Duration::seconds(1);
+        let start = end - chrono::Duration::seconds(600);
+        let samples = metrics
+            .query_gauge_range(metric_names::CHANGE_BLOCK_CENSUS.as_str(), start, end)
+            .await
+            .expect("the census is readable");
+        let mut published: HashMap<(String, String), f64> = HashMap::new();
+        for sample in &samples {
+            assert_eq!(
+                sample.labels.len(),
+                2,
+                "a census cell carries its face and its reading and nothing else: {:?}",
+                sample.labels
+            );
+            let block = sample
+                .labels
+                .get(crate::LABEL_BLOCK)
+                .expect("every cell names its face")
+                .clone();
+            let reading = sample
+                .labels
+                .get(crate::LABEL_READING)
+                .expect("every cell names its reading")
+                .clone();
+            assert!(
+                published.insert((block, reading), sample.value).is_none(),
+                "a cell published twice would be a reader's sum counting it twice"
+            );
+        }
+
+        let cell = |block: &str, reading: &str| {
+            *published
+                .get(&(block.to_string(), reading.to_string()))
+                .unwrap_or_else(|| {
+                    panic!("{block}/{reading} is not on the census; published {published:?}")
+                })
+        };
+        // The face that holds nothing owed still writes the cell, and it reads
+        // zero: an absent cell would leave the last value standing.
+        assert_eq!(cell("principles", "undecided"), 0.0);
+        assert_eq!(cell("none", "undecided"), 2.0);
+        // The part-of-owed relation, checked on the published cells rather than
+        // on the struct: what makes this a reading and not a fourth bucket is
+        // that it never exceeds the bucket it is counted inside.
+        for face in ["none", "principles"] {
+            assert!(
+                cell(face, "undecided") <= cell(face, "owed"),
+                "{face}'s undecided rows are a part of its owed rows"
+            );
+        }
+        // The age is still skipped where there is none, which is what tells the
+        // two kinds of cell apart: a missing age says every owed row has been
+        // measured, a written zero would say the same thing as an old one.
+        assert_eq!(cell("none", "oldest_unmeasured_seconds"), 90.0);
+        assert!(
+            !published.contains_key(&(
+                "principles".to_string(),
+                "oldest_unmeasured_seconds".to_string()
+            )),
+            "a face with nothing owed has no age to report"
+        );
+        // A store that could not group writes nothing at all rather than a set
+        // of zeros, and the undecided cell must not be the exception that
+        // invents a face.
+        let empty: Arc<dyn MetricsBackend> =
+            Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        publish_block_census(Some(&empty), None).await;
+        assert!(
+            empty
+                .query_gauge_range(metric_names::CHANGE_BLOCK_CENSUS.as_str(), start, end)
+                .await
+                .expect("readable")
+                .is_empty(),
+            "an unreadable census publishes no cells, not zero ones"
         );
     }
 

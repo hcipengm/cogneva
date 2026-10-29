@@ -1833,7 +1833,10 @@ async fn a_demand_is_satisfied_by_a_landing_and_owed_until_one_is_measured() {
 /// returns the Rust type the fake chose, so the mismatch only exists across the
 /// wire. The buckets are checked beside it for the same reason the retired cell
 /// exists -- three buckets that add up to the face's population are what let a
-/// face that finished be told from one that retired its work.
+/// face that finished be told from one that retired its work. The undecided
+/// count is checked as a part of the owed bucket rather than beside it: a row
+/// nothing has settled is still owed, and a reader that added this count to the
+/// three buckets would count those rows twice.
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_up() {
@@ -1856,10 +1859,36 @@ async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_u
         }])
         .await
         .expect("queue the declaration");
+    // A second row on the same face whose measurement did not settle the
+    // question. It is what tells the two readings apart: the first row is owed
+    // because it is queued, the second because nothing has answered it, and both
+    // are in the owed bucket.
+    let stuck = identity(&marker, "census-stuck");
+    store
+        .declare(&[ChangeReading {
+            identity: stuck.clone(),
+            title: Some("a change a look could not settle".into()),
+            assertion: None,
+            source: ChangeSource {
+                doc: doc.clone(),
+                verdict: None,
+                priority: ChangePriority::Unstated,
+                block: ChangeBlock::named("principles").expect("a face name"),
+            },
+        }])
+        .await
+        .expect("queue the second declaration");
     store
         .fold_declarations(10_000, Some("probe-rev-census"))
         .await
         .expect("fold the declaration in");
+    store
+        .apply_measurement(
+            &ChangeMeasurement::undecided(stuck.clone(), "scope_outside_tree")
+                .at_revision("probe-rev-census"),
+        )
+        .await
+        .expect("write an undecided measurement");
 
     let census = store
         .block_census()
@@ -1885,6 +1914,19 @@ async fn the_face_census_reads_a_number_for_the_age_and_three_buckets_that_add_u
         "a row whose documents name no face is counted too: a census that dropped \
          the unfiled population would answer about the programme while reading as \
          the whole account: {census:?}"
+    );
+    // The unsettled row is reported beside the owed bucket rather than split out
+    // of it: it is still owed, and a reader adds the three buckets to get the
+    // face's population. What it adds is the second reason a row is owed -- no
+    // look has settled it -- which the bucket alone cannot tell from a queue.
+    assert!(
+        face.undecided >= 1,
+        "a row whose last look settled nothing is counted apart from the queue: {face:?}"
+    );
+    assert!(
+        face.undecided <= face.owed,
+        "the undecided rows are part of the owed rows, so the count can never \
+         exceed the bucket it is counted inside: {face:?}"
     );
 
     // The other two readings over the same account decode against the server as

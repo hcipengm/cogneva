@@ -1800,6 +1800,13 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // is `NULL` when every owed row in the face has been measured, which is
         // a different answer from zero seconds.
         //
+        // The undecided count is taken from the same rows as the owed bucket,
+        // because a row is in that bucket whether it is waiting its turn or
+        // whether nothing has ever looked at it. It is reported beside the
+        // bucket rather than split out of it: the three buckets are what adds up
+        // to the face's population, and a fourth would make that sum double
+        // count these rows.
+        //
         // Beside it, the age of the newest movement anywhere in the face, from
         // the same rows and the same pass. The two answer different questions: a
         // face can owe work it has not measured for a week while having been
@@ -1846,6 +1853,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
         // 读成「还没落地」。
         let landed_word = ChangeState::Landed.as_str();
         let retired_word = ChangeState::Retired.as_str();
+        let undecided_word = ChangeState::Undecided.as_str();
         let mut census = Vec::with_capacity(names.len());
         for name in names {
             let landed = counted
@@ -1863,6 +1871,16 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             let retired = counted
                 .iter()
                 .filter(|(found, state, _, _, _)| found == name && state == retired_word)
+                .map(|(_, _, n, _, _)| *n)
+                .sum::<i64>();
+            // Counted out of the same rows as `owed` rather than beside it: a
+            // row is undone either because it is queued or because nobody has
+            // looked, and those two are the same entry in the owed bucket. The
+            // face keeps both numbers so a reader can tell a queue from work
+            // that was filed and then never asked about.
+            let undecided = counted
+                .iter()
+                .filter(|(found, state, _, _, _)| found == name && state == undecided_word)
                 .map(|(_, _, n, _, _)| *n)
                 .sum::<i64>();
             let oldest = counted
@@ -1887,6 +1905,7 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
                 landed: landed.max(0) as u64,
                 owed: owed.max(0) as u64,
                 retired: retired.max(0) as u64,
+                undecided: undecided.max(0) as u64,
                 oldest_unmeasured_secs: oldest.map(|secs| secs.max(0.0) as u64),
                 newest_activity_secs: newest.map(|secs| secs.max(0.0) as u64),
             });

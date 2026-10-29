@@ -1440,11 +1440,20 @@ metric_names! {
     // so "how far along is this face" was a substring search whose answer changed
     // with who typed it. Two labels rather than one: `block` is the face (a
     // closed set, with `none` for rows no document filed and for rows whose
-    // documents disagree) and `reading` is which count -- `landed`, `owed`, or
-    // `oldest_unmeasured_seconds`, the age of the owed row that has gone longest
-    // without a measurement, taken from when it entered if nothing has measured
-    // it at all. Every face is written on every pass, including the ones that owe
-    // nothing: a face missing from the census would read as a face that finished.
+    // documents disagree) and `reading` is which count -- `landed`, `owed`,
+    // `retired`, `undecided`, or `oldest_unmeasured_seconds`, the age of the owed
+    // row that has gone longest without a measurement, taken from when it
+    // entered if nothing has measured it at all. Every face is written on every
+    // pass, including the ones that owe nothing: a face missing from the census
+    // would read as a face that finished.
+    //
+    // `undecided` is the one cell that is not a bucket: it counts rows already
+    // inside `owed`, the ones nothing has settled the question about. `landed` +
+    // `owed` + `retired` is the face's population and stays that; adding
+    // `undecided` to them counts those rows twice. It is written on every face
+    // at zero when there are none, because the alternative -- skipping it like
+    // the age -- would make "nobody has asked" the same reading as "nothing
+    // unsettled".
     CHANGE_BLOCK_CENSUS => "cogneva_change_block_census",
 
     // cog-orchestrator — the verdict one change-ledger dispatch pass reached,

@@ -2155,9 +2155,12 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          documents named, on every change-ledger pass -- block (the face name a \
          document wrote, so the set is whatever the account holds; none for rows \
          no document filed or whose documents name more than one face) and \
-         reading (landed, owed, retired, or oldest_unmeasured_seconds). The three counts are the whole population \
+         reading (landed, owed, retired, undecided, or oldest_unmeasured_seconds). The three counts are the whole population \
          of the face: a face that retired its work would otherwise look exactly \
-         like one that finished. The \
+         like one that finished. undecided is not a fourth bucket -- it counts \
+         rows already inside owed, the ones no measurement has settled, so it is \
+         what tells a queue from work that was filed and then never asked about; \
+         written on every face at zero when there are none. The \
          grouping answers a question the account's contents could not: how far \
          along a face is. Its rows were always there; the heading was only in \
          prose, so the answer depended on which substring search the reader \

@@ -346,6 +346,7 @@ mod tests {
             landed,
             owed,
             retired,
+            undecided: 0,
             oldest_unmeasured_secs: None,
             newest_activity_secs: idle,
         }
