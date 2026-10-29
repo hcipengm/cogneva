@@ -109,7 +109,26 @@ pub const NARROW_ADD_RE: &str = r"git[[:space:]]+add([[:space:]]+-[^[:space:]]+)
 
 /// A destructive git command is allowed only when the owner asked for that exact
 /// action.
-pub const DESTRUCTIVE_GIT_RE: &str = r"reset[[:space:]]+--hard|push[[:space:]].*(--force|--force-with-lease|[[:space:]]-f)([[:space:]]|$)|branch[[:space:]]+-D|clean[[:space:]]+-[a-z]*f|checkout[[:space:]]+--[[:space:]]";
+///
+/// The force-push branch carries an argument tail and nothing else: `.*` here
+/// crossed command separators, so `git push origin main; rm -f <draft>` -- the
+/// ordinary way a session ends a push, since the draft is a scratch message file
+/// -- read as a force push, and 38 of the 43 refusals this shape produced in one
+/// session were that. The tail stops at `;`, `&`, `|` and a control character --
+/// the ways one command ends and the next begins -- so a `-f` belonging to a
+/// neighbour is no longer read as belonging to the push. Control characters
+/// rather than a literal newline because two engines read this table: the host's
+/// `grep` sees one line at a time and is never handed a newline, while the
+/// in-process judge sees the whole command and would let a bracket expression
+/// walk over one. The cost is that a push whose words are separated by tabs is
+/// not read as a force push either; nobody spells it that way, and a shape that
+/// misses an exotic spelling is cheaper than one that fires on the ordinary one.
+///
+/// The same rewrite closed a hole: `push[[:space:]].*` consumed the space before
+/// the flag, so the `[[:space:]]-f` alternative could never match the short form
+/// -- `git push -f origin main`, the spelling people actually use, was not
+/// refused while `--force` was.
+pub const DESTRUCTIVE_GIT_RE: &str = r"reset[[:space:]]+--hard|push([[:space:]]+[^;&|[:cntrl:]]*)?[[:space:]]+(-f|--force|--force-with-lease)([[:space:]]|$)|branch[[:space:]]+-D|clean[[:space:]]+-[a-z]*f|checkout[[:space:]]+--[[:space:]]";
 
 /// An AI-attribution trailer is forbidden in every commit, including this
 /// repository's. A habit of emitting it is not a lesser violation for carrying a
@@ -130,7 +149,14 @@ pub const AI_TRAILER_RE: &str = r"^[[:space:]]*Co-[Aa]uthored-[Bb]y:|^[[:space:]
 /// is allowed; only `--` with a space or the line end after it ends the match.
 /// That is what separates `git commit --amend` (still bare, refused) from
 /// `git commit -m x -- crates/` (names its paths, allowed).
-pub const BARE_COMMIT_RE: &str = r"git[[:space:]]+commit([^-]|-[^-]|--[^[:space:]])*$";
+///
+/// The word has to end there. `git commit-tree` is plumbing: it builds a commit
+/// object from a tree handed to it and never reads an index, so there is nothing
+/// for `-- <paths>` to narrow and the flag is a syntax error rather than a
+/// safer spelling. Matching `git[[:space:]]+commit` by prefix read it as the
+/// porcelain command and refused work the rule cannot apply to.
+pub const BARE_COMMIT_RE: &str =
+    r"git[[:space:]]+commit([[:space:]]([^-]|-[^-]|--[^[:space:]])*)?$";
 
 /// A frozen document is append-only by new dated document, so editing one in
 /// place is refused.
@@ -611,6 +637,18 @@ mod tests {
             first_match("git push --force origin main"),
             Some("DESTRUCTIVE_GIT_RE")
         );
+        // The short flag is the spelling people type, and the tail used to
+        // swallow the space in front of it: `--force` was refused while `-f`
+        // went through.
+        assert_eq!(
+            first_match("git push -f origin main"),
+            Some("DESTRUCTIVE_GIT_RE")
+        );
+        assert_eq!(
+            first_match("git push origin main -f"),
+            Some("DESTRUCTIVE_GIT_RE"),
+            "the flag after the remote is the same act"
+        );
         assert_eq!(
             first_match("Co-authored-by: someone"),
             Some("AI_TRAILER_RE")
@@ -650,6 +688,23 @@ mod tests {
             first_match("git commit -m 'fix a bug' -- crates/x/src/y.rs"),
             None,
             "a commit that names its paths is the discipline this shape is for"
+        );
+        // One command's flag is not its neighbour's. Both of these were refused
+        // for a force push nobody wrote, and the second is how a session ends
+        // every push -- the draft it deletes is the message file it just read.
+        for nearby in [
+            "git push origin main; rm -f /tmp/draft",
+            "git push origin main && rm -f /tmp/draft",
+            "git push origin main | tail -3; rm -f /tmp/draft",
+            "git push origin main\nrm -f /tmp/draft",
+        ] {
+            assert_eq!(first_match(nearby), None, "no force push in: {nearby}");
+        }
+        assert_eq!(
+            first_match(r#"git commit-tree "$tree" -p HEAD -m "x""#),
+            None,
+            "plumbing builds a commit from a tree it is given and never reads \
+             an index, so there is no pathspec to narrow"
         );
         assert_eq!(first_match("see item one first"), None);
     }
