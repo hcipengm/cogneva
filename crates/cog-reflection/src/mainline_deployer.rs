@@ -10295,7 +10295,7 @@ mod tests {
         settle_jsonpath, stage_rollout_manifest, staged_manifest_path, summarize_events,
         summarize_pod_states, support_pod_causes, support_pod_selector, support_settled,
         terminating_pods, unresolved_configmaps, unschedulable_pods, write_termination_message,
-        CiHoldKind, ClusterConfigSources, HostRunQueue, ProbeCycle, RefSnapshots,
+        CiHoldKind, ClusterConfigSources, HostRunQueue, HostSoakWindow, ProbeCycle, RefSnapshots,
         ReplicaSetFailure, RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause,
         SupportWorkload, UpstreamCiAsk, UpstreamCiTarget, ADMISSION_DENIED_MARKER,
         CI_PENDING_WAIT_SECS, FIELD_REMOVAL_NOT_TAKEN_MARKER, HOST_LOADED_MARKER,
@@ -19899,19 +19899,31 @@ echo "||1"
 
         // ImagePullBackOff 立即判病。
         std::fs::write(&pods_file, "0 false ImagePullBackOff").unwrap();
-        assert!(executor.pods_healthy(&target).await.is_err());
+        assert!(executor
+            .pods_healthy(&target, &HostSoakWindow::default())
+            .await
+            .is_err());
 
         // 重启超阈值、且读不到这一趟运行的起点：读不到不换成宽结论，按判死。
         std::fs::write(&pods_file, "2 true ").unwrap();
-        assert!(executor.pods_healthy(&target).await.is_err());
+        assert!(executor
+            .pods_healthy(&target, &HostSoakWindow::default())
+            .await
+            .is_err());
 
         // 空输出（选择器失效）判病。
         std::fs::write(&pods_file, "").unwrap();
-        assert!(executor.pods_healthy(&target).await.is_err());
+        assert!(executor
+            .pods_healthy(&target, &HostSoakWindow::default())
+            .await
+            .is_err());
 
         // 健康。
         std::fs::write(&pods_file, "0 true ").unwrap();
-        assert!(executor.pods_healthy(&target).await.is_ok());
+        assert!(executor
+            .pods_healthy(&target, &HostSoakWindow::default())
+            .await
+            .is_ok());
     }
 
     /// 重启计数说的是 Pod 的一生，就绪说的是此刻——两个数回答的不是同一个问题。
@@ -19936,7 +19948,10 @@ echo "||1"
 
         // 就绪，两次重启，这一趟运行的起点远在 soak 之前：那些重启是历史。
         std::fs::write(&pods_file, "2 true  2020-01-01T00:00:00Z").unwrap();
-        assert!(executor.pods_healthy(&target).await.is_ok());
+        assert!(executor
+            .pods_healthy(&target, &HostSoakWindow::default())
+            .await
+            .is_ok());
     }
 
     /// 反面：同一个计数，容器这一趟是刚起来的。那时「已经起来了」与「刚崩完又起来」
@@ -19957,10 +19972,88 @@ echo "||1"
 
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         std::fs::write(&pods_file, format!("2 true  {now}")).unwrap();
-        let err = executor.pods_healthy(&target).await.unwrap_err();
+        let err = executor
+            .pods_healthy(&target, &HostSoakWindow::default())
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("restarting"), "{msg}");
         assert!(msg.contains("running "), "判词要说清这一趟跑了多久：{msg}");
+    }
+
+    /// 正面：同一个「刚重启过的就绪 Pod」，但静置那一段里宿主半程以上在排队。
+    ///
+    /// 这一刻的读数说不了这段时间的事：重启计数是 Pod 一生的累计，而「这一趟还没
+    /// 跨过 soak」只是一瞬。要把「宿主没给它时间」判出来，得看静置**整段**的比例。
+    /// 判成环境类之后判词仍然带现场，并且写明读数来自哪台机器——多节点之后读的是
+    /// 判官那台机器，判的是别人的 Pod，这一列是那次误判唯一的线索。
+    #[tokio::test]
+    async fn a_ready_pod_that_restarted_while_the_host_was_queued_is_not_condemned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let pods_file = bin_dir.join("pods.out");
+        let kubectl = fake_kubectl_pods_from_file(&bin_dir, &pods_file);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 60, 1, 60, 900);
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "gateway".into(),
+            name: "cogneva".into(),
+        };
+
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        std::fs::write(&pods_file, format!("2 true  {now}")).unwrap();
+        let window = HostSoakWindow {
+            polls: 12,
+            queued_polls: 9,
+            peak: a_queued_host(),
+            reader: Some("node worker-1".into()),
+        };
+        let err = executor.pods_healthy(&target, &window).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(is_host_loaded(&msg), "{msg}");
+        assert!(
+            msg.contains("node worker-1"),
+            "判词要写明读数来自哪台机器：{msg}"
+        );
+        assert!(
+            msg.contains("9 of 12 samples"),
+            "判词要给出这段窗口里的占比，不是一次尖峰：{msg}"
+        );
+        assert!(
+            !msg.contains("restarting ("),
+            "这一支不该再给出重启判死的措辞：{msg}"
+        );
+    }
+
+    /// 同一个窗口，但宿主只在半程以下排队：仍然按版本类判死。没有这一条，上面那一
+    /// 支会把「机器偶尔忙一下」也读成环境，于是所有起不来的版本都不回滚。
+    #[tokio::test]
+    async fn a_briefly_queued_host_does_not_excuse_a_restarting_pod() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let pods_file = bin_dir.join("pods.out");
+        let kubectl = fake_kubectl_pods_from_file(&bin_dir, &pods_file);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 60, 1, 60, 900);
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "gateway".into(),
+            name: "cogneva".into(),
+        };
+
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        std::fs::write(&pods_file, format!("2 true  {now}")).unwrap();
+        let window = HostSoakWindow {
+            polls: 12,
+            queued_polls: 5,
+            peak: a_queued_host(),
+            reader: Some("node worker-1".into()),
+        };
+        let err = executor.pods_healthy(&target, &window).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(!is_host_loaded(&msg), "{msg}");
+        assert!(msg.contains("restarting"), "{msg}");
     }
 
     /// 反面之二：没起来的 Pod 不会因为「机器可能忙」被读成环境类。这一支不读宿主，
@@ -19981,7 +20074,10 @@ echo "||1"
 
         // 没就绪、重启过两次、宿主的读数也不是这一支的输入。
         std::fs::write(&pods_file, "2 false ").unwrap();
-        let err = executor.pods_healthy(&target).await.unwrap_err();
+        let err = executor
+            .pods_healthy(&target, &HostSoakWindow::default())
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("not ready"), "{msg}");
         assert!(!msg.contains(HOST_LOADED_MARKER), "{msg}");

@@ -609,6 +609,76 @@ fn read_host_run_queue_now() -> Option<HostRunQueue> {
     read_host_run_queue(Path::new(LOADAVG_PATH), Path::new(CPUINFO_PATH))
 }
 
+/// 一段静置期里宿主的排队读数：采了几个点、其中几个点越界、最挤的一刻，以及读数
+/// 来自哪台机器。
+///
+/// 与 [`RolloutExecutor::wait_rollout_complete`] 里那组 `host_polls` /
+/// `queued_polls` 是同一条判据的两处用途：那里问「这段就绪预算里宿主给过时间吗」，
+/// 这里问「静置的这段里宿主给过时间吗」。取占比而不是一次尖峰，理由也相同——一次
+/// 尖峰压不住一段启动，半程以上都在排队才是这台机器没给时间。
+#[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct HostSoakWindow {
+    /// 采到的读数个数。
+    pub polls: u32,
+    /// 其中有几个点的队列宽于核数。
+    pub queued_polls: u32,
+    /// 最挤的一刻，按 `load1 / cores` 取最大。
+    pub peak: Option<HostRunQueue>,
+    /// 读数来自哪台机器，已带上是节点名还是 hostname；`None` 是读不到任何标识。
+    pub reader: Option<String>,
+}
+
+impl HostSoakWindow {
+    /// 半程以上的采样点都在排队。
+    ///
+    /// 一个点都没有时返回 false：读不到宿主读数不改判——与超时那一支读不到就不进
+    /// 排队分支是同一条，否则一次 `/proc` 读失败会把「没有证据」写成「机器很忙」。
+    pub(crate) fn was_queued(&self) -> bool {
+        self.polls > 0 && self.queued_polls.saturating_mul(2) >= self.polls
+    }
+
+    fn record(&mut self, rq: HostRunQueue) {
+        self.polls += 1;
+        if rq.is_loaded() {
+            self.queued_polls += 1;
+            if self
+                .peak
+                .is_none_or(|p| rq.load1 / rq.cores > p.load1 / p.cores)
+            {
+                self.peak = Some(rq);
+            }
+        }
+    }
+}
+
+/// 这份读数是从哪台机器上读的。
+///
+/// 这句话必须进判词：`/proc/loadavg` 读的是**本进程所在机器**的运行队列，而它判的
+/// 那个 Pod 可能落在别的节点上。今天是单机 k3s，两者恰好同一台——那正是这条判据换
+/// 到多节点会静默失效的地方，所以机器名要写进判词，让「读数来自哪一台」成为读者看
+/// 得见的一列，而不是靠他记得这个部署是单机。节点名取自 downward API 注入的
+/// `COGNEVA_NODE_NAME`（与产出宿主读数的那个进程同一个变量）；没有时退回本进程的
+/// hostname，并写明这一退——在 Pod 里 hostname 往往是 Pod 名，不是节点名，而
+/// 把 Pod 名写成节点名会让多节点之后的那次误判更难查。
+fn host_reader_identity() -> Option<String> {
+    if let Some(node) = std::env::var(cog_core::env::NODE_NAME)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return Some(format!("node {node}"));
+    }
+    hostname_of(&std::fs::read_to_string(HOSTNAME_PATH).ok()?)
+}
+
+/// `/proc/sys/kernel/hostname` 的内容说成一个可读的归属。
+fn hostname_of(text: &str) -> Option<String> {
+    let name = text.trim();
+    (!name.is_empty()).then(|| format!("hostname {name} (no node name in this process)"))
+}
+
+pub(crate) const HOSTNAME_PATH: &str = "/proc/sys/kernel/hostname";
+
 /// 用例里的默认读数：没有读数。判据读不到宿主就不改判，所以用例停在这条
 /// 旧路径上，用哪一份宿主读数由用例自己指定。
 fn no_host_reading() -> Option<HostRunQueue> {
@@ -4203,7 +4273,39 @@ impl RolloutExecutor {
     /// 「这一轮什么都没看到」。它**不是**健康结论——把它当结论会让一次抖动
     /// 直接触发回滚，把刚推上去的四部署又拽回旧版。重试预算沿用就绪预算，
     /// 不新开第二套旋钮：它已经是可配的「愿意等多久」上界。
-    pub(crate) async fn pods_healthy(&self, t: &RolloutTarget) -> SFResult<()> {
+    /// 静置整段 `soak_secs`，同时按轮询节拍采宿主运行队列。
+    ///
+    /// 静置本来就要等这一整段，采样只是把这段时间用起来：每 [`ROLLOUT_POLL_SECS`]
+    /// 读一次 `/proc`，与超时那一支同一读法、同一个 [`HostRunQueue::is_loaded`] 界。
+    /// 一次都不采到（读不到 `/proc`）时窗口是空的，[`HostSoakWindow::was_queued`]
+    /// 返回 false，判定回到原来的形状——读不到不是「机器很空」。
+    pub(crate) async fn soak_and_watch_host(&self, soak_secs: u64) -> HostSoakWindow {
+        let mut window = HostSoakWindow {
+            reader: host_reader_identity(),
+            ..HostSoakWindow::default()
+        };
+        let mut left = soak_secs;
+        loop {
+            let nap = left.min(ROLLOUT_POLL_SECS);
+            if nap > 0 {
+                tokio::time::sleep(Duration::from_secs(nap)).await;
+            }
+            left = left.saturating_sub(nap);
+            if let Some(rq) = (self.host_run_queue)() {
+                window.record(rq);
+            }
+            if left == 0 {
+                return window;
+            }
+        }
+    }
+
+    /// `window` 是调用方在静置期里采到的宿主排队读数，见 [`HostSoakWindow`]。
+    pub(crate) async fn pods_healthy(
+        &self,
+        t: &RolloutTarget,
+        window: &HostSoakWindow,
+    ) -> SFResult<()> {
         let selector = pod_selector(&t.name, &t.component);
         let out = self
             .probe(
@@ -4260,10 +4362,39 @@ impl RolloutExecutor {
                 // 还没跨过 soak——那时「起来了」与「刚崩完又起来」在读数上同形。读不到
                 // 起点同样按判死处理：读不到不是「它稳了很久」。
                 //
-                // 这里**不读**宿主负载：那会是在第三处判「机器忙不忙」。这一支只是停止
-                // 用一个与问题无关的数判死，不是把「起不来」解释成环境。
+                // 但「这一趟还没跨过 soak」这一刻只有一个瞬时读数，而它想回答的是
+                // 「这段时间宿主给过它时间吗」——后者是一段窗口里的事。宿主负载不在这里
+                // 读（那会是在第三处现判「机器忙不忙」），而是由调用方在静置期里按轮询
+                // 节拍采样后传进来，与超时那一支共用 `is_loaded` 和「半程以上」这条界：
+                // 两个地方各自发明一个阈值，等于同一件事有两个答案。
                 let run_secs = run_secs_since(running_since);
                 if !run_secs.is_some_and(|secs| secs >= self.soak_secs) {
+                    // 静置期里宿主半程以上都在排队：这个重启是等出来的，不是版本崩
+                    // 出来的。此刻 Pod 是就绪的（上面已拦过未就绪），所以不扣住它、
+                    // 不回滚，宿主松下来它自己会稳；判词带上读数来自哪台机器。
+                    if let (true, Some(peak)) = (window.was_queued(), window.peak) {
+                        let msg = format!(
+                            "{HOST_LOADED_MARKER}: pod of deployment/{} restarted {} times \
+                             (threshold {}) but was ready when the soak ended, and the host's \
+                             run queue was past one task per core on {} of {} samples taken \
+                             during that soak, peaking at load1 {:.2} against {} cores (read on \
+                             {}), so the restarts happened while this machine was giving its \
+                             time to work that is not part of this revision rather than to a \
+                             fault in it: {line}",
+                            t.deployment,
+                            restarts,
+                            self.restart_threshold,
+                            window.queued_polls,
+                            window.polls,
+                            peak.load1,
+                            peak.cores,
+                            window
+                                .reader
+                                .as_deref()
+                                .unwrap_or("a machine this process could not name"),
+                        );
+                        return Err(self.with_scene(t, msg).await);
+                    }
                     let run_note = match run_secs {
                         Some(secs) => format!("running {secs}s"),
                         None => "start time not readable".to_string(),
@@ -4977,9 +5108,12 @@ impl RolloutExecutor {
             soak_secs = self.soak_secs,
             "mainline rollout: all targets updated, soaking"
         );
-        tokio::time::sleep(Duration::from_secs(self.soak_secs)).await;
+        // 静置的这段时间同时是「宿主有没有给过时间」的观察窗口：Pod 健康复查只能
+        // 看到这一刻，而一个刚重启过的就绪 Pod 是不是被宿主挤出来的，是一段窗口里
+        // 的比例问题。采样在这里做，判定在 pods_healthy 里读，两处共用一个界。
+        let host_window = self.soak_and_watch_host(self.soak_secs).await;
         for target in &plan.targets {
-            if let Err(e) = self.pods_healthy(target).await {
+            if let Err(e) = self.pods_healthy(target, &host_window).await {
                 return self
                     .fail_without_blind_rollback(
                         "soak",
@@ -5021,8 +5155,11 @@ impl RolloutExecutor {
     /// - 观测工具本身起不来（kubectl 缺失/没有可执行位/被占用）：我们连一次查询
     ///   都没发出去，说不出新版本的好坏；而且回滚只退镜像，修不好一个坏掉的工具
     ///   路径，只会把新版本换掉而又重复失败一轮。
+    /// - 宿主整段时间都在排队（见 [`HOST_LOADED_MARKER`]）：新 Pod 分到的是排队
+    ///   时间而不是 CPU，这段预算测的是别人的负载。回滚会把一台机器的忙记成代码
+    ///   的缺陷，而那个版本在机器松下来之后自己会起来。
     ///
-    /// 四类都让 Job 非零退出（部署器下轮重试），集群保持在刚推上去的新版本上。
+    /// 这几种都让 Job 非零退出（部署器下轮重试），集群保持在刚推上去的新版本上。
     ///
     /// 准入那一类只认判定进程打的标记、不认措辞：超时记录里还附着一份给人看的
     /// 现场采样，措辞与上游原文同形，用措辞再判一遍会把"变更自己把 requests 调过
