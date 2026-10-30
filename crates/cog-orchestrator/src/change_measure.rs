@@ -39,6 +39,7 @@ use cog_core::{ChangeIdentity, ChangeState};
 /// The bound exists so that a repository on a stalled mount fails as a reading
 /// instead of holding the pass: the pass runs under an owner lease that is
 /// renewed on a cadence, and a pass that hangs is a pass that loses the seat.
+// cap: bound
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where the platform's own deployment mounts the repository it builds from.
@@ -117,16 +118,18 @@ pub const GONE_KIND: &str = "gone";
 
 /// Every kind the judge can answer, for a reader that has to enumerate them.
 ///
-/// The vocabulary's written-down form is `crates/cogneva/contracts/change-kinds.tsv`
-/// -- one row per kind, carrying which way its check points and whether a
-/// declaration may take it. These constants are this crate's binding to that
-/// file and not a second copy of it: a gate compares the two as sets, both ways,
-/// so a kind added on either side without the other is red.
+/// The vocabulary is this list, [`RETIRED_KINDS`] and [`kind_direction`] and
+/// nothing else: a kind's membership here is what makes a declaration under it
+/// measurable, and the direction beside it is what makes the name mean one
+/// thing. Those three are written down once, next to the dispatch arms that
+/// answer them, so "which kinds exist" and "what does this kind ask for" cannot
+/// drift from the code that runs.
 ///
-/// The intake is the third side and is not tied to the file mechanically -- it
-/// lives in the private repository that feeds this account and cannot read it. A
-/// kind the intake accepts but this does not name is a row nothing will ever
-/// measure: it reads as outstanding for good.
+/// The intake is the other side and is not tied to this mechanically -- it lives
+/// in the private repository that feeds this account and cannot read it. A kind
+/// the intake accepts but this does not name is a row nothing will ever measure:
+/// it reads as outstanding for good. That gap is real and is not papered over by
+/// a list kept in a file both sides could edit.
 pub const JUDGEABLE_KINDS: [&str; 6] = [
     GREP_KIND,
     EXISTS_KIND,
@@ -145,6 +148,43 @@ pub const JUDGEABLE_KINDS: [&str; 6] = [
 /// on which names those are, and a literal spelled out at each would be two
 /// places to change one thing.
 pub const RETIRED_KINDS: [&str; 2] = ["absent", "missing"];
+
+/// Which way a kind's check points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KindDirection {
+    /// The criterion demands the thing be there: this literal, this path.
+    Present,
+    /// The criterion demands the thing be gone.
+    Absent,
+    /// The name reads both ways, which is exactly why it cannot be a criterion.
+    Ambiguous,
+}
+
+/// What a kind asks for, by name.
+///
+/// This used to be implied by the kind's spelling, and two names wrote two
+/// directions into one word: `absent`/`missing` mean both "make it disappear"
+/// and "I searched and found nothing". A row carrying one of them cannot be
+/// told apart in the tree -- so it may take an *evidence* line for a criterion
+/// and land a whole backlog of things not yet built in one pass, or it may sit
+/// at `undecided` for good. Splitting the demand out under [`GONE_KIND`] is what
+/// keeps the evidence from reading as a demand; these two names stay nameable
+/// only so rows already in the account can be retired, which is why they answer
+/// [`KindDirection::Ambiguous`] and why the answer is the reason rather than a
+/// leftover.
+///
+/// `None` means the name is not in the vocabulary at all -- the judge has no
+/// predicate for it and no retirement either, so a declaration under it would be
+/// stored and never settled.
+pub fn kind_direction(kind: &str) -> Option<KindDirection> {
+    match kind {
+        GREP_KIND | EXISTS_KIND => Some(KindDirection::Present),
+        GONE_KIND => Some(KindDirection::Absent),
+        named if ABSENCE_KINDS.contains(&named) => Some(KindDirection::Absent),
+        named if RETIRED_KINDS.contains(&named) => Some(KindDirection::Ambiguous),
+        _ => None,
+    }
+}
 
 /// The tree this deployment measures against.
 ///

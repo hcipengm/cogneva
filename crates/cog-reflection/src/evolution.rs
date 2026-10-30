@@ -1568,42 +1568,6 @@ mod a_declarations_identity_is_its_scope_and_prose_cannot_widen_it {
         );
     }
 
-    /// The kind column means what the vocabulary says, not what prose says:
-    /// `grep` is a judgeable presence kind in `change-kinds.tsv`, so carrying
-    /// it asks for a grep over the scope whatever the description column adds.
-    #[test]
-    fn the_kind_column_means_what_the_vocabulary_says() {
-        let vocabulary =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../cogneva/contracts/change-kinds.tsv");
-        let text = std::fs::read_to_string(&vocabulary)
-            .unwrap_or_else(|e| panic!("{}: {e}", vocabulary.display()));
-        let mut found = None;
-        for line in text.lines() {
-            if line.starts_with('#') || line.trim().is_empty() {
-                continue;
-            }
-            let cols: Vec<&str> = line.split('\t').collect();
-            if cols.first() == Some(&"grep") {
-                found = Some((
-                    cols.get(1).copied().unwrap_or(""),
-                    cols.get(2).copied().unwrap_or(""),
-                ));
-                break;
-            }
-        }
-        let (direction, state) = found.unwrap_or_else(|| {
-            panic!(
-                "{} holds no row for `grep`, the kind this declaration carries",
-                vocabulary.display()
-            )
-        });
-        assert_eq!(
-            (direction, state),
-            ("present", "judgeable"),
-            "kind `grep` no longer names a presence grep a new declaration may carry"
-        );
-    }
-
     fn collect_rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
         for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
             let path = entry.unwrap().path();
