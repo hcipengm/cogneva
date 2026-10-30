@@ -93,8 +93,10 @@ pub fn memory_lines(total_bytes: u64) -> MemoryLines {
 /// 读不出来时不退回任何写死的字节数：一份关于别台机器内存的读数，比没有读数更糟。
 pub fn host_memory_lines() -> Option<MemoryLines> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
-    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    // 这个数的解析只有一处（`cog_core::host`）：同一台机器在这里与在安装链的
+    // 容量探针里必须是同一个数，否则节点按一个容量算 QoS 预留、门按另一个容量
+    // 定地板，两条路都对，只是算的不是同一台机器。
+    let kb = cog_core::host::mem_total_kb(&text)?;
     (kb > 0).then(|| memory_lines(kb * 1024))
 }
 /// 判定「这一例偏慢」的倍数：比自己的历史中位数慢这么多倍才算红灯。
@@ -792,7 +794,7 @@ mod tests {
     /// 不退回写死的字节数——那是把别台机器的读数当成这台机器的。
     #[test]
     fn without_a_memory_reading_the_memory_line_is_silent_and_not_green() {
-        let calm = pressure(0.0, 0.0, 1 * GB, 0);
+        let calm = pressure(0.0, 0.0, GB, 0);
         assert!(red_light(&calm, false, None).is_none(), "无读数不判红");
         assert_eq!(
             decide(4, 1, 8, Some(&calm), false, None),

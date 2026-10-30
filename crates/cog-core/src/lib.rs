@@ -13,6 +13,7 @@ pub mod env;
 pub mod error;
 pub mod fs_size;
 pub mod git_budget;
+pub mod host;
 pub mod loop_health;
 pub mod observability_text;
 pub mod paths;

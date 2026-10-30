@@ -301,13 +301,11 @@ impl HostFacts {
     fn read() -> Option<Self> {
         let cores = std::thread::available_parallelism().ok()?.get() as u64;
         let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let kib = meminfo.lines().find_map(|line| {
-            line.strip_prefix("MemTotal:")?
-                .split_whitespace()
-                .next()?
-                .parse::<u64>()
-                .ok()
-        })?;
+        // The parse lives in `cog_core::host`, so the node this gate fits against
+        // is read the same way the install that sized it read that node: two
+        // spellings of the same field would let one of them read a machine the
+        // other did not.
+        let kib = cog_core::host::mem_total_kb(&meminfo)?;
         Some(Self {
             cores,
             mem_total_bytes: kib << 10,

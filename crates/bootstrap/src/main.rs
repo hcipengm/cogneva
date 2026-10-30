@@ -1084,7 +1084,7 @@ async fn ssh_capture(ssh_target: &str, port: Option<&String>, command: &str) -> 
 /// memory and CPU count.
 async fn remote_qos_config(ssh_target: &str, port: Option<&String>) -> Option<String> {
     // MemTotal is in kB; nproc is the CPU count the kubelet will see.
-    let out = ssh_capture(ssh_target, port, cogneva_bootstrap::NODE_CAPACITY_PROBE).await?;
+    let out = ssh_capture(ssh_target, port, &cogneva_bootstrap::node_capacity_probe()).await?;
     let readings = cogneva_bootstrap::parse_node_readings(&out)?;
     Some(cogneva_bootstrap::k3s_qos_config_yaml(
         &cogneva_bootstrap::node_qos(readings.mem_total_mb, readings.cpu_cores),

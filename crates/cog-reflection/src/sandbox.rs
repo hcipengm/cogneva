@@ -106,7 +106,7 @@ impl SandboxSignals {
     /// Collect signals from the real host environment.
     pub fn from_environment() -> Self {
         Self {
-            kubernetes_service_host: std::env::var("KUBERNETES_SERVICE_HOST").ok(),
+            kubernetes_service_host: std::env::var(cog_core::topology::SERVICE_HOST_ENV).ok(),
             kubernetes_service_account: std::path::Path::new(
                 cog_core::topology::SERVICE_ACCOUNT_DIR,
             )

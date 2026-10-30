@@ -861,8 +861,12 @@ pub(crate) struct KubeClient {
 /// variables rather than the answer.
 fn api_base() -> String {
     api_base_from(
-        std::env::var("KUBERNETES_SERVICE_HOST").ok().as_deref(),
-        std::env::var("KUBERNETES_SERVICE_PORT").ok().as_deref(),
+        std::env::var(cog_core::topology::SERVICE_HOST_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(cog_core::topology::SERVICE_PORT_ENV)
+            .ok()
+            .as_deref(),
     )
 }
 

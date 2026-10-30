@@ -819,8 +819,8 @@ impl ClusterConfigSources {
                 .map(|h| Path::new(h).join(".kube/config").is_file())
                 .unwrap_or(false),
             k3s_config: Path::new(K3S_KUBECONFIG).is_file(),
-            in_cluster_host: env("KUBERNETES_SERVICE_HOST"),
-            in_cluster_port: env("KUBERNETES_SERVICE_PORT"),
+            in_cluster_host: env(cog_core::topology::SERVICE_HOST_ENV),
+            in_cluster_port: env(cog_core::topology::SERVICE_PORT_ENV),
             service_account_token: Path::new(SERVICE_ACCOUNT_TOKEN).is_file(),
             home,
         }

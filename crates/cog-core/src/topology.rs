@@ -125,6 +125,19 @@ pub const TRACEPARENT_ANNOTATION: &str = "cogneva.ai/traceparent";
 /// one declaration split by file, so the directory is written once.
 pub const SERVICE_ACCOUNT_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount";
 
+/// The two variables the kubelet injects into every pod, naming the apiserver
+/// this pod must talk to.
+///
+/// Declared here rather than read as literals because three crates ask the same
+/// question -- the admin client, the sandbox detector and the rollout preflight
+/// -- and `env::var` answers a misspelt name with the same `Err` the variable
+/// would give if nobody had set it. A rename on one side is then not an error:
+/// each site quietly takes its "not in a cluster" branch, and the readings that
+/// depend on it say the pod is somewhere it is not.
+pub const SERVICE_HOST_ENV: &str = "KUBERNETES_SERVICE_HOST";
+/// See [`SERVICE_HOST_ENV`].
+pub const SERVICE_PORT_ENV: &str = "KUBERNETES_SERVICE_PORT";
+
 /// A file under [`SERVICE_ACCOUNT_DIR`], spelled as one literal so the path
 /// cannot be built at run time and then forgotten by a census that reads
 /// literals.

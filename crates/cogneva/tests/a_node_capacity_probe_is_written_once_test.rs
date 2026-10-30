@@ -1,8 +1,9 @@
 //! principle: feedback_no_hardcoding_config_surface
 //!
-//! 一台机器的内存总数是 bootstrap 要读的同一件事的四个落点：kubespray 清单里
-//! 每个节点的 SSH 探针、K3s agent 首次启动前的同一个探针、本机 `/proc/meminfo`
-//! 的两处解析。它们今天拼得一样，因为当初是抄的——谁也没有比较谁。
+//! 一台机器的内存总数是同一件事的四个落点：kubespray 清单里每个节点的 SSH 探针、
+//! K3s agent 首次启动前的同一个探针、安装器本机 `/proc/meminfo` 的解析，以及两个
+//! 运行期闸门（评测的准入闸、构建闸）各自要拟合的这台宿主的容量。它们曾经各拼各的，
+//! 因为当初是抄的——谁也没有比较谁。
 //!
 //! 拼法一改，坏的不是读数消失，而是**读数换成另一个数**：把 `MemTotal` 换成
 //! `MemAvailable`、把 `/1024` 换成 `/1024/1024`、或让探针多印一行，另一条路径
@@ -10,9 +11,10 @@
 //! 起来，只是那台节点上「按机器实际内存」推导出来的份额，和同一批装上来的其它
 //! 节点不一样——没有一条读数能把这件事故说成「不一致」，它只是按不同数字算的。
 //!
-//! 所以现在这一份读法只在一处：探针串是 `cogneva_bootstrap::NODE_CAPACITY_PROBE`，
-//! 本机字段的解析是 `cogneva_bootstrap::mem_total_kb`。本门盯的是它不再被抄到
-//! 第二处：生产行里出现 `MemTotal:` 的文件，必须恰好是声明这两个的那个文件。
+//! 所以现在这一份读法只在一处：`cog_core::host` 声明字段名
+//! （`MEMINFO_TOTAL_FIELD`）并解析（`mem_total_kb`），安装器的 SSH 探针串由同一个
+//! 字段名拼出来，两个运行期闸门调同一个解析。本门盯的是它不再被抄到第二处：生产行里
+//! 出现 `MemTotal:` 的文件，必须恰好是那个声明与解析的文件。
 //!
 //! 判不了什么：
 //!
@@ -32,7 +34,7 @@ use common::routes::repo_root;
 use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// 这份读法唯一允许出现的地方。
-const DECLARED_IN: &str = "crates/bootstrap/src/lib.rs";
+const DECLARED_IN: &str = "crates/cog-core/src/host.rs";
 
 /// 每个文件的生产行里提到 `MemTotal:` 的次数。
 fn mentions(text: &str) -> usize {
@@ -76,8 +78,9 @@ fn the_host_memory_total_is_read_out_of_one_place() {
         "宿主内存总数被抄到了第二处。两份拼法都能跑，所以没有任何东西会失败：\
          它们只是按各自的字段与除数算出另一个容量，于是另一条安装路径上的节点拿到\
          另一份 QoS 预留与驱逐水位，而「这条路径算的是另一个数」本身没有读数。\
-         收拢的去处是 `cogneva_bootstrap::NODE_CAPACITY_PROBE`（SSH 探针）与\
-         `cogneva_bootstrap::mem_total_kb`（本机字段）。\n{}",
+         收拢的去处是 `cog_core::host`：字段名 `MEMINFO_TOTAL_FIELD`、解析\
+         `mem_total_kb`，安装器的 SSH 探针串也由同一个字段名拼（\
+         `cogneva_bootstrap::node_capacity_probe`）。\n{}",
         strays
             .iter()
             .map(|(file, count)| format!("      {file}: {count} 处"))

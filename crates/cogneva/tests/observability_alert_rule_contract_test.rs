@@ -1409,6 +1409,10 @@ const FOREIGN: &[(&str, &str)] = &[
     ("node_filesystem_avail_bytes", "node-exporter"),
     ("node_filesystem_size_bytes", "node-exporter"),
     (
+        "node_memory_MemTotal_bytes",
+        "node-exporter（/proc/meminfo 的 MemTotal，按 node 一条）。`host_slice_anon_floor_unmeasured` 拿它当地板的分母：宿主侧 user.slice 的匿名页多少才算「被别的进程按住」是按**这台节点自己的内存**说的，同一个字节数在 62.7 GiB 的节点上是零头、在 16 GiB 的节点上已经是半台机器，所以百分比要除以各节点自己的 MemTotal 而不是除以一个写死的容量。它与被除的那条 `cogneva_host_slice_anon_bytes` 带同一个 node 标签，某个节点缺这条读数由跨层对账门点名（`check-cross-layer-reconcile.sh` 判据 2），不会在这里静默消失",
+    ),
+    (
         "node_filesystem_files_free",
         "node-exporter（inode 表的余量）。字节与 inode 是两条各自走到底的边界：这棵树上每一块会长的树都是小文件形态——镜像库单节点 809k 文件、构建缓存几十万个——所以 inode 先于字节耗尽，而上面两条磁盘规则只看字节，看不见这一格。取 free 而不是 avail：inode 表没有给 root 预留的份额，avail 在它上面与 free 逐值相同",
     ),

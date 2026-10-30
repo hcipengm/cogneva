@@ -416,7 +416,7 @@ async fn wire_kubeconfig() -> Result<()> {
 /// come from its own machine, not from the control plane's.
 async fn read_node_readings(target: &str) -> Option<cogneva_bootstrap::NodeReadings> {
     // MemTotal is in kB; nproc is the CPU count the kubelet will see.
-    let out = sh_on_capture(target, cogneva_bootstrap::NODE_CAPACITY_PROBE).await?;
+    let out = sh_on_capture(target, &cogneva_bootstrap::node_capacity_probe()).await?;
     cogneva_bootstrap::parse_node_readings(&out)
 }
 

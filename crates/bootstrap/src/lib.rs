@@ -778,34 +778,31 @@ pub fn parse_node_readings(out: &str) -> Option<NodeReadings> {
 
 /// The command that produces the two readings above on a node reached over SSH.
 ///
-/// One constant because two install shapes ask the same node the same question
+/// One function because two install shapes ask the same node the same question
 /// -- the kubespray inventory walk and the K3s agent's first start -- and each
 /// answer becomes a QoS account on that node. Spelt twice, a change to one copy
 /// (a different `/proc` field, a different divisor, one extra line before the
 /// numbers) leaves the other shape reading nodes differently, and nothing in
 /// the tree compares the two: the install simply reserves a different share,
 /// with no reading that says so.
-pub const NODE_CAPACITY_PROBE: &str = "awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo; nproc";
+///
+/// The field name comes from [`cog_core::host::MEMINFO_TOTAL_FIELD`] rather
+/// than being spelled into the awk program: this runs on a node reached over
+/// SSH, so it cannot call the parser, but it can read the same field name the
+/// parser reads. Kept as a function so there is no second literal to drift.
+pub fn node_capacity_probe() -> String {
+    format!(
+        "awk '/^{}{{print int($2/1024)}}' /proc/meminfo; nproc",
+        cog_core::host::MEMINFO_TOTAL_FIELD
+    )
+}
 
 /// Total memory in KiB, read out of the text of `/proc/meminfo`.
 ///
-/// The one place this host's own memory total is parsed from the kernel. Every
-/// caller derives from it -- the dirty-page watermarks, the cargo job count --
-/// so the field read and its unit are decided once.
-///
-/// `None` when the line is missing or its number does not parse. A caller that
-/// cannot read the total has to say so: zero is a number the arithmetic below
-/// accepts, and it would mean "this machine has no memory" rather than "the
-/// reading did not happen".
-pub fn mem_total_kb(meminfo: &str) -> Option<u64> {
-    meminfo
-        .lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))?
-        .split_whitespace()
-        .next()?
-        .parse()
-        .ok()
-}
+/// Re-exported from [`cog_core::host`], which is the one place it is parsed:
+/// the gates that fit themselves to this host and the installer that sized it
+/// must be reading the same field with the same divisor.
+pub use cog_core::host::mem_total_kb;
 
 /// A node's memory account as the cluster reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
