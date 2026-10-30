@@ -113,6 +113,51 @@ const ALLOWED_DEV: &[Row] = &[
     ("cogneva", "cog-test-support", ""),
 ];
 
+/// Every crate the workspace has, by package name.
+///
+/// The edge table above governs the edges that *exist*; it says nothing about a
+/// crate that has none. A new crate with no workspace dependency is invisible to
+/// both of that table's assertions -- it adds no edge to be fresh and none to go
+/// stale -- and that is exactly the shape a "just one small crate" takes: a
+/// manifest, a `src/`, and nothing the graph can see. The skeleton is settled;
+/// after that a crate is a whole-tree cost paid by everything that rebuilds, and
+/// the split it proposes is a decision nobody made.
+///
+/// This is the same freeze in the other dimension. A crate the table does not
+/// name fails the build, and a name whose crate is gone fails too, so the table
+/// cannot drift above the workspace any more than the edge table can drift above
+/// the graph. Adding a crate is not forbidden by a rule -- it is impossible to do
+/// quietly, because it cannot happen without a diff to this list.
+const MEMBERS: &[&str] = &[
+    "cog-agent",
+    "cog-auth",
+    "cog-collaboration",
+    "cog-core",
+    "cog-eval",
+    "cog-extension",
+    "cog-gateway",
+    "cog-github",
+    "cog-guardrail",
+    "cog-llm",
+    "cog-memory",
+    "cog-net",
+    "cog-notification",
+    "cog-observability",
+    "cog-orchestrator",
+    "cog-prompt",
+    "cog-protocol",
+    "cog-quota",
+    "cog-reflection",
+    "cog-skill",
+    "cog-storage",
+    "cog-stream",
+    "cog-supervisor",
+    "cog-test-support",
+    "cog-wiki",
+    "cogneva",
+    "cogneva-bootstrap",
+];
+
 /// The crate everything else may depend on, and which depends on nothing here.
 const BASE: &str = "cog-core";
 
@@ -256,6 +301,43 @@ fn dev_edges_have_their_own_table() {
          A dependency declared in both sections is carried by the normal one; \
          the dev row says the wrong thing about it.",
         promoted.join(", ")
+    );
+}
+
+/// E: a crate the table does not name fails, including one with no edges at all.
+#[test]
+fn a_new_crate_is_not_in_the_table() {
+    let g = graph();
+    let table: BTreeSet<&str> = MEMBERS.iter().copied().collect();
+    let fresh: Vec<&String> = g
+        .members
+        .iter()
+        .filter(|m| !table.contains(m.as_str()))
+        .collect();
+    assert!(
+        fresh.is_empty(),
+        "the workspace grew a crate: {:?}\n\
+         The skeleton is settled: a new crate is not a build detail, it is a split \
+         every consumer pays for. If the crate is right, add its name to MEMBERS \
+         and say in the commit why the boundary is new; if it is not, that code \
+         belongs in the crate that already owns the job.",
+        fresh
+    );
+}
+
+/// F: a name whose crate is gone fails, so the list cannot drift above the workspace.
+#[test]
+fn a_crate_the_table_names_is_still_a_member() {
+    let g = graph();
+    let stale: Vec<&&str> = MEMBERS
+        .iter()
+        .filter(|m| !g.members.contains(**m))
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "MEMBERS names crates the workspace no longer has: {:?}\n\
+         Delete the row in the commit that removed the crate.",
+        stale
     );
 }
 

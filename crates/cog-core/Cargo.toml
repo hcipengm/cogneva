@@ -9,7 +9,6 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
-toml = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
@@ -21,7 +20,6 @@ bytes = { workspace = true }
 schemars = { workspace = true }
 jsonschema = { workspace = true }
 blake3 = { workspace = true }
-zstd = { workspace = true }
 # 平台机器人签名（`contract::platform_sign`）：两个进程要用同一条规则，规则在契约
 # 层；密钥各自持有。三者都只是算法原语，与 blake3 同一类。
 hmac = { workspace = true }

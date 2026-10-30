@@ -227,6 +227,40 @@ else
     echo "SKIP  名字契约：本机没有可用的 cargo（CI 的 Code Coverage 会跑这两步）"
 fi
 
+# 工作区的骨架：crate 集合与 crate 之间的依赖边各有一张冻结表（`crate_dependency_contract_test`），
+# 基底 crate `cog-core` 的依赖集与模块表各有一张（`core_boundary_contract_test`）。四张表都只在
+# `cargo test --workspace`（CI 的 Test）里被问，所以「加一个 crate」「加一条依赖」「base 里多个模块」
+# 这三种最该被拦下的编辑，本机在推之前是看不见的——它们编译得过、单测全绿，只等一轮 CI。
+#
+# 这一格是**带触发条件**的：只有这次要推的提交或当前工作树里动过某个 `Cargo.toml` 才跑。
+# 判据本身是整份文件的（不挑 filter，挑一条就是在挑判据），但它的题目只有 manifest 能出——
+# 没动 manifest 的时候它必然绿，而一次冷编译的代价是分钟级，不该摊到每一笔上。
+#
+# 触发判据读的是**工作树**（`git status`）加**要推的范围**（`origin/main...HEAD`）两份：
+# 表判的是工作树，推上去的是提交，两者任一动了 manifest 都可能让这一格红在下一次 CI 上。
+if [ -n "${cargo_bin}" ]; then
+    if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
+        echo "SKIP  crate 骨架（冻结表）：本机没有 origin/main，推的范围判不出来（CI 的 Test 会跑）"
+    else
+        manifests_changed="$(
+            { git diff --name-only 'origin/main...HEAD' -- '*Cargo.toml'
+              git status --porcelain -- '*Cargo.toml' | cut -c4-
+            } | sed '/^$/d'
+        )"
+        if [ -n "${manifests_changed}" ]; then
+            echo "== crate 骨架（冻结表）：这次动过 $(printf '%s\n' "${manifests_changed}" | wc -l) 个 Cargo.toml，四条冻结表整份跑"
+            run_step "crate 骨架（crate 集合 / 依赖边 / base 依赖 / base 模块）" \
+                "${cargo_bin}" test --no-fail-fast -p cogneva \
+                --test crate_dependency_contract_test \
+                --test core_boundary_contract_test
+        else
+            echo "== crate 骨架（冻结表）：这次没动 Cargo.toml，跳过（CI 的 Test 会整份跑）"
+        fi
+    fi
+else
+    echo "SKIP  crate 骨架（冻结表）：本机没有可用的 cargo（CI 的 Test 会跑这两步）"
+fi
+
 # Check 作业本机跑不动（要编译整个工作区，比 CI 还慢），可它红得最多的一种形状本机
 # 几秒钟就能判：**推上去的这几笔，新增了对一个这棵树里不存在的模块的引用**。
 # 2026-10-29 实测过一次代价：一笔带 `use crate::test_support::scrape;` 而定义它的文件
