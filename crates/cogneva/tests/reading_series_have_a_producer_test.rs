@@ -17,8 +17,8 @@
 //! a collector is not the same fact as that collector emitting the series. So the
 //! mapping is not written here from memory: it is read from
 //! `deploy/images/postgres-exporter.series.yaml`, which is measured off the
-//! pinned image (the commands are in its header) and carries the tag it was
-//! measured on.
+//! pinned image by `deploy/scripts/measure-postgres-exporter-surface.sh` and
+//! carries the tag it was measured on.
 
 use crate::common;
 

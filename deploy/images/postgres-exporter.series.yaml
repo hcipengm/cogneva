@@ -5,30 +5,28 @@
 # 退出，而它与数据库同 Pod：库还活着，Service 却没了端点），或者指向一个没有
 # 生产者的序列（面板永远空白，读起来和「一切正常」一样）。这份文件就是那条
 # 连线：读数的序列必须在下面的 series 里，清单的旗标必须在下面的 collector_flags
-# 里，而 image 这一行把它钉到具体版本上——换 tag 必须重跑下面这两条命令。
+# 里，而 image 这一行把它钉到具体版本上——换 tag 必须重新量一次。
 #
-# 量法（image 换过就重跑，并把下面的 image 一起改掉）：
+# 量法是这条命令，不要手工抄：
 #
-#   sudo -n k3s kubectl -n cogneva run exporter-inventory \
-#     --image=prometheuscommunity/postgres-exporter:v0.15.0 \
-#     --env="DATA_SOURCE_URI=<库地址>:5432/cogneva?sslmode=disable" \
-#     --env="DATA_SOURCE_USER=cog_user" --env="DATA_SOURCE_PASS=<口令>" \
-#     --env="PG_EXPORTER_AUTO_DISCOVER_DATABASES=false" \
-#     --env="PG_EXPORTER_DISABLE_SETTINGS_METRICS=false" \
-#     --env="PG_EXPORTER_INCLUDE_DATABASES=cogneva"
-#   sudo -n k3s kubectl -n cogneva port-forward pod/exporter-inventory 19190:9187 &
-#   curl -s 127.0.0.1:19190/metrics | grep -oE '^pg_[a-zA-Z0-9_]+' | sort -u
-#   sudo -n k3s kubectl -n cogneva run exporter-help --rm -i --restart=Never \
-#     --image=prometheuscommunity/postgres-exporter:v0.15.0 -- --help \
-#     | grep -oE '\-\-\[no-\]collector\.[a-z_]+'
+#   bash deploy/scripts/measure-postgres-exporter-surface.sh          # 量完写回
+#   bash deploy/scripts/measure-postgres-exporter-surface.sh --check  # 只判不写
+#
+# 序列从**已经在跑的边车**上抓：口令已经在它的 env 里，脚本一个凭证都不碰；
+# 旗标用同一个镜像跑一次 `--help`（不连库，也不带凭证）。`--check` 在两张名单
+# 与镜像此刻发出的东西不一致时退出 1，要紧的是「名单里有、镜像不发」那一格：
+# 过期的条目会让「读数指向的序列必须有生产者」那条门去担保一个不存在的序列。
+#
+# 下面 image: 之后的每一行都是量出来的，改它请改量的那一步。image 这一行必须与
+# values.yaml 的 exporterImage 相同，`reading_series_have_a_producer` 判这一条。
 #
 # 抓取时**没有**传任何旗标：下面这些序列就是这个镜像在默认集合下发出的，
-# 所以部署清单不需要 args。带 `*` 的条目是前缀（那一族条目太多，逐条抄写只会
-# 抄错；`pg_settings_` 约 300 条）。
+# 所以部署清单不需要 args。带 `*` 的条目是**声明**：那一族的成员跟着库里的内容走
+# （`pg_settings_` 一条 GUC 一个名字，约 300 个），逐条列会让这份名单按宿主漂移。
+# 量的时候照这份声明折叠；新冒出来的族逐条列出，看得见才有人判它该不该折。
 image: prometheuscommunity/postgres-exporter:v0.15.0
 
 collector_flags:
-  - --collector.buffercache_summary
   - --collector.database
   - --collector.database_wraparound
   - --collector.locks
@@ -37,17 +35,14 @@ collector_flags:
   - --collector.process_idle
   - --collector.replication
   - --collector.replication_slot
-  - --collector.roles
   - --collector.stat_activity_autovacuum
   - --collector.stat_bgwriter
-  - --collector.stat_checkpointer
   - --collector.stat_database
-  - --collector.statio_user_indexes
-  - --collector.statio_user_tables
-  - --collector.stat_progress_vacuum
   - --collector.stat_statements
   - --collector.stat_user_tables
   - --collector.stat_wal_receiver
+  - --collector.statio_user_indexes
+  - --collector.statio_user_tables
   - --collector.wal
   - --collector.xlog_location
 
@@ -61,6 +56,7 @@ series:
   - pg_replication_lag_seconds
   - pg_scrape_collector_duration_seconds
   - pg_scrape_collector_success
+  - pg_settings_*
   - pg_stat_activity_count
   - pg_stat_activity_max_tx_duration
   - pg_stat_archiver_archived_count
@@ -132,4 +128,3 @@ series:
   - pg_up
   - pg_wal_segments
   - pg_wal_size_bytes
-  - pg_settings_*

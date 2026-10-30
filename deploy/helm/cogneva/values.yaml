@@ -1092,7 +1092,8 @@ backends:
     # 这个 tag 是读数的生产者，不是实现细节：最老事务年龄那条读数读的
     # `pg_stat_activity_max_tx_duration` 属于这个镜像的默认集（`--help` 列的是
     # opt-in collector，默认集不在那张名单里，所以它看起来像是「没有旗标能打开」）。
-    # 换 tag 要重抓一次序列表 `deploy/images/postgres-exporter.series.yaml`。
+    # 换 tag 要重跑 `deploy/scripts/measure-postgres-exporter-surface.sh`：它从跑着的
+    # 边车上重抓一次 `deploy/images/postgres-exporter.series.yaml`。
     exporterImage: prometheuscommunity/postgres-exporter:v0.15.0
     # 边车自己监听的那个端口：抓取端的 ServiceMonitor/抓取注解按它取数。
     exporterPort: 9187
