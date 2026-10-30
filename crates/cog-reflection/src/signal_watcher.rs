@@ -703,6 +703,160 @@ fn signal_project_key(detail: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// The task kind of the row that anchors one signal's project.
+///
+/// Not [`SIGNAL_PROJECT_PREFIX`]'s kind: a reader counting signal work must not
+/// count the anchor, and the anchor is not work — nothing reads it as a signal
+/// and the queue must never start it.
+pub const SIGNAL_PROJECT_ROOT_KIND: &str = "self_signal_project";
+
+/// What a signal project's anchor id starts with.
+///
+/// Derived from the project key, so the same project always names the same
+/// anchor: a round that finds the row already there writes nothing, and a
+/// project never opens a second root.
+const SIGNAL_PROJECT_ROOT_PREFIX: &str = "signal-project:";
+
+/// The row that anchors one signal's project.
+///
+/// A project is the group of rows under one `goal_id` whose root is the row with
+/// no parent, and the root is where replanning hangs new work. The watcher files
+/// one row per round for as long as a condition keeps firing, so without an
+/// anchor the group grows a new root every round — and replanning refuses a
+/// group with two roots outright rather than guessing which one to hang under.
+/// Measured on 2026-10-30: 9 signal projects held two or more roots, 64 rows in
+/// all, the largest with 41.
+///
+/// A stable anchor rather than "hang it under whichever row is the root today":
+/// a finished row is deleted when the signal is resubmitted, so a group whose
+/// root is one of its own rows loses the parent of everything under it at the
+/// first resubmission. The anchor is submitted with every filing and is never a
+/// signal, so it is never the row that gets cleared.
+fn signal_project_root(project: &str) -> Task {
+    let mut root = Task::new(
+        signal_project_root_id(project),
+        TaskType::Custom(SIGNAL_PROJECT_ROOT_KIND.into()),
+        serde_json::json!({
+            "goal": format!("signals filed under {project}"),
+            (cog_core::INPUT_TASK_KIND): SIGNAL_PROJECT_ROOT_KIND,
+        }),
+    );
+    root.goal_id = Some(project.to_string());
+    root.parent_task_id = None;
+    // The anchor is where work hangs, not work: nothing ever runs it.
+    root.is_executable = false;
+    root
+}
+
+fn signal_project_root_id(project: &str) -> String {
+    let scope = project
+        .strip_prefix(SIGNAL_PROJECT_PREFIX)
+        .unwrap_or(project);
+    format!("{SIGNAL_PROJECT_ROOT_PREFIX}{scope}")
+}
+
+/// What one settle of the signal projects did, cell by cell.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SettledSignals {
+    anchored: usize,
+    reparented: usize,
+    failed: usize,
+}
+
+impl SettledSignals {
+    fn moved_anything(&self) -> bool {
+        self.anchored > 0 || self.reparented > 0 || self.failed > 0
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "settled signal projects: anchored={} reparented={} failed={}",
+            self.anchored, self.reparented, self.failed
+        )
+    }
+}
+
+/// Put the signal projects written before the anchor existed back into the shape
+/// a filing now writes.
+///
+/// A filing only fixes the group it touches, and a condition that has stopped
+/// firing is never touched again -- so the rows written before the anchor
+/// existed would keep their extra roots for the life of the graph.
+///
+/// A project holding one root is in shape whichever row that root is: the single
+/// filing it holds, or the anchor. Only a second root is a refusal, so only a
+/// project with a second root is rewritten; a group that is already whole costs
+/// no write.
+///
+/// Called once per process rather than once per round. Every row written after
+/// this is in shape by construction, and this round already reads the whole
+/// graph every minute: reading it again would be a cost paid forever for a
+/// defect that can no longer recur.
+async fn settle_signal_parents(
+    orch: &Arc<dyn OrchestratorControl>,
+    tasks: &[Task],
+) -> SettledSignals {
+    let mut settled = SettledSignals::default();
+    let mut projects: HashMap<&str, Vec<&Task>> = HashMap::new();
+    for task in tasks {
+        if let Some(project) = task
+            .goal_id
+            .as_deref()
+            .filter(|project| project.starts_with(SIGNAL_PROJECT_PREFIX))
+        {
+            projects.entry(project).or_default().push(task);
+        }
+    }
+    for (project, rows) in projects {
+        let anchor_id = signal_project_root_id(project);
+        let anchored = rows.iter().any(|row| row.id == anchor_id);
+        let strays: Vec<&Task> = rows
+            .iter()
+            .copied()
+            .filter(|row| row.parent_task_id.is_none() && row.id != anchor_id)
+            .collect();
+        // One root and no anchor is a project of exactly one filing, which is in
+        // shape: writing an anchor there would add a row to every quiet signal
+        // in the graph and change nothing about the tree.
+        if strays.is_empty() || (!anchored && strays.len() < 2) {
+            continue;
+        }
+        if !anchored {
+            match orch.add_task(signal_project_root(project)).await {
+                Ok(()) => settled.anchored += 1,
+                Err(e) => {
+                    settled.failed += 1;
+                    warn!(
+                        project,
+                        error = %e,
+                        "signal watcher: a signal project's anchor could not be written, so the \
+                         group keeps the roots it was written with"
+                    );
+                    continue;
+                }
+            }
+        }
+        for row in strays {
+            let mut hung = row.clone();
+            hung.parent_task_id = Some(anchor_id.clone());
+            match orch.replace_task(hung).await {
+                Ok(()) => settled.reparented += 1,
+                Err(e) => {
+                    settled.failed += 1;
+                    warn!(
+                        project,
+                        task = %row.id,
+                        error = %e,
+                        "signal watcher: a signal row could not be hung under its project's \
+                         anchor, so the group still holds it as a root"
+                    );
+                }
+            }
+        }
+    }
+    settled
+}
+
 /// Result of one submission attempt. "Nothing needed doing" and "the intent
 /// never reached the orchestrator" must stay distinct: conflating them makes an
 /// idempotent hit look like a broken channel, and a broken channel look like
@@ -779,8 +933,17 @@ async fn submit_intent(
             // self-signal rows, 1314 distinct goal ids. Grouping them by the
             // condition that keeps asking is what turns "one thousand and
             // fourteen projects" into "the alert rules that are firing".
-            task.goal_id = project;
-            match orch.submit_goal_auto(&goal, vec![task]).await {
+            task.goal_id = project.clone();
+            // And the row hangs under the project's anchor rather than being a
+            // root of its own -- a group whose every round is a root is a group
+            // replanning refuses. See `signal_project_root`.
+            let mut filing = Vec::with_capacity(2);
+            if let Some(project) = &project {
+                task.parent_task_id = Some(signal_project_root_id(project));
+                filing.push(signal_project_root(project));
+            }
+            filing.push(task);
+            match orch.submit_goal_auto(&goal, filing).await {
                 Ok(_) if resubmitting => IntentOutcome::Resubmitted,
                 Ok(_) => IntentOutcome::Registered,
                 Err(e) => IntentOutcome::Failed(e.to_string()),
@@ -848,6 +1011,7 @@ async fn tick(
     taste_source: Option<&Arc<dyn cog_core::TasteIntentSource>>,
     readings: &SignalWatcherReadings,
     held: bool,
+    parents_settled: &mut bool,
 ) {
     // Stamped before anything is read, so a round that fails or finds nothing
     // still counts as a round: the tick count is what the signal counts are
@@ -856,6 +1020,17 @@ async fn tick(
     readings.tick();
     let now = Utc::now();
     let tasks = orch.get_all_tasks().await;
+    // Once per process, on the graph this round already read: see
+    // `settle_signal_parents`. Before the held-round return, because shaping the
+    // tree spends no LLM call and a pool outage is no reason to leave a project
+    // replanning cannot hang work under.
+    if !*parents_settled {
+        let settled = settle_signal_parents(orch, &tasks).await;
+        if settled.moved_anything() {
+            info!("signal watcher: {}", settled.line());
+        }
+        *parents_settled = true;
+    }
     let mut state = load_state().await;
     let mut dirty = false;
 
@@ -1359,6 +1534,10 @@ pub fn spawn_signal_watcher_loop(
                 // Reported on the edge, not once per round: the round runs at
                 // least once a minute and a down pool lasts days.
                 let mut held = false;
+                // Whether this process has already put the signal projects
+                // written before the anchor existed back into shape. Once, not
+                // per round: see `settle_signal_parents`.
+                let mut parents_settled = false;
                 loop {
                     // Every cycle is stamped, including the many that find nothing to
                     // report: a quiet system is the ordinary case here.
@@ -1383,6 +1562,7 @@ pub fn spawn_signal_watcher_loop(
                                 taste_source.as_ref(),
                                 &readings,
                                 standing_down,
+                                &mut parents_settled,
                             )
                             .await;
                         }
@@ -1779,8 +1959,23 @@ mod tests {
         async fn assign_task(&self, _t: &str, _a: &str) -> cog_core::SFResult<()> {
             unimplemented!()
         }
-        async fn add_task(&self, _t: Task) -> cog_core::SFResult<()> {
-            unimplemented!()
+        async fn add_task(&self, task: Task) -> cog_core::SFResult<()> {
+            let mut held = self.tasks.lock().unwrap();
+            if !held.iter().any(|t| t.id == task.id) {
+                held.push(task);
+            }
+            Ok(())
+        }
+        async fn replace_task(&self, task: Task) -> cog_core::SFResult<()> {
+            let mut held = self.tasks.lock().unwrap();
+            let Some(slot) = held.iter_mut().find(|t| t.id == task.id) else {
+                return Err(cog_core::SFError::Internal(format!(
+                    "replace_task: no row {}",
+                    task.id
+                )));
+            };
+            *slot = task;
+            Ok(())
         }
         async fn crew_can_retry(&self, _ids: &[String]) -> bool {
             false
@@ -1911,10 +2106,17 @@ mod tests {
             .into_iter()
             .map(|t| t.id)
             .collect();
-        assert_eq!(
-            filed,
-            vec![alert_task_id("k")],
+        // 记下这一格的行的确写下了；锚点也在这批里，那不是第二个「记录」——
+        // 它不执行、不带信号，只是这一组的挂点。
+        assert!(
+            filed.contains(&alert_task_id("k")),
             "held-off rounds are the ones that have to file: the row is the only record"
+        );
+        assert!(
+            filed
+                .iter()
+                .all(|id| id == &alert_task_id("k") || id.starts_with(SIGNAL_PROJECT_ROOT_PREFIX)),
+            "这一轮只该写出这一格的记录行与项目锚点：{filed:?}"
         );
         assert!(
             dirty,
@@ -1924,6 +2126,141 @@ mod tests {
             state.reported.contains_key(&alert_signal_key("k")),
             "a filed alert has to spend its report clock, or the next round files it again"
         );
+    }
+
+    /// 同一个条件响两轮：两行挂在**同一个**根下面，那个根是锚点，不是其中任何一行。
+    ///
+    /// 没有这一格，两个写法都照样绿：每轮各起一个根（这正是现网的形状，9 个项目
+    /// 2 个以上根、共 64 行），或者把第二行挂到第一行下面（第一行在重投时会被删，
+    /// 删掉它同一组下所有行的父指针就悬空了）。
+    #[tokio::test]
+    async fn two_filings_for_one_signal_hang_under_one_project_root() {
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(vec![]));
+        let detail = serde_json::json!({"kind": "persisted_alert", "rule": "pool_down"});
+        let project = signal_project_key(&detail).expect("这份 detail 指名了项目");
+        for round in 0..2 {
+            let outcome = submit_intent(
+                &orch,
+                format!("self-signal-alert-pool-{round}"),
+                "self_signal",
+                format!("修掉 pool_down，第 {round} 轮"),
+                detail.clone(),
+                true,
+            )
+            .await;
+            assert!(
+                matches!(outcome, IntentOutcome::Registered),
+                "第 {round} 轮没登记上：{outcome:?}"
+            );
+        }
+
+        let filed = orch.get_all_tasks().await;
+        let in_project: Vec<&Task> = filed
+            .iter()
+            .filter(|t| t.goal_id.as_deref() == Some(project.as_str()))
+            .collect();
+        assert_eq!(in_project.len(), 3, "两轮信号 + 一个锚点");
+
+        let roots: Vec<&&Task> = in_project
+            .iter()
+            .filter(|t| t.parent_task_id.is_none())
+            .collect();
+        assert_eq!(roots.len(), 1, "这一组必须恰好一个根：{roots:?}");
+        let anchor = roots[0];
+        assert!(
+            matches!(&anchor.task_type, TaskType::Custom(kind) if kind == SIGNAL_PROJECT_ROOT_KIND),
+            "那个根得是锚点，不是某一轮的行：{:?}",
+            anchor.task_type
+        );
+        assert!(!anchor.is_executable, "锚点不是活，队列不许起它");
+        for row in in_project.iter().filter(|t| t.id != anchor.id) {
+            assert_eq!(
+                row.parent_task_id.as_deref(),
+                Some(anchor.id.as_str()),
+                "{} 没挂到锚点下面",
+                row.id
+            );
+        }
+    }
+
+    /// 早先写下的、两个根的一组，一次结算后回到一个根——这是那 9 个项目的修法。
+    ///
+    /// 同时钉住射程：别的项目（这里是 UUID 项目）一行都不动，而不是「凡是
+    /// 两行的组都去挂一个锚点」。
+    #[tokio::test]
+    async fn a_group_written_with_two_roots_is_settled_onto_one_anchor() {
+        let project = "signal:persisted_alert/pool_down";
+        let stray = |id: &str, project: &str| {
+            let mut task = Task::new(
+                id.to_string(),
+                TaskType::Custom("self_signal".into()),
+                serde_json::json!({"kind": "persisted_alert"}),
+            );
+            task.goal_id = Some(project.to_string());
+            task
+        };
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(vec![
+            stray("self-signal-a", project),
+            stray("self-signal-b", project),
+            // 单一文件的安静项目：一个根，已经在形状里。
+            stray("self-signal-quiet", "signal:queue_backlog"),
+            // 不是信号项目：不在射程内。
+            stray("change-ledger-x", "3f0c1d2e-0000-4000-8000-000000000000"),
+        ]));
+
+        let tasks = orch.get_all_tasks().await;
+        let settled = settle_signal_parents(&orch, &tasks).await;
+        assert_eq!(settled.anchored, 1, "{settled:?}");
+        assert_eq!(settled.reparented, 2, "{settled:?}");
+        assert_eq!(settled.failed, 0, "{settled:?}");
+
+        let after = orch.get_all_tasks().await;
+        let anchor_id = signal_project_root_id(project);
+        let mine: Vec<&Task> = after
+            .iter()
+            .filter(|t| t.goal_id.as_deref() == Some(project))
+            .collect();
+        assert_eq!(mine.len(), 3, "两行 + 一个锚点");
+        assert_eq!(
+            mine.iter().filter(|t| t.parent_task_id.is_none()).count(),
+            1,
+            "结算之后这一组还是不止一个根"
+        );
+        for row in mine.iter().filter(|t| t.id != anchor_id) {
+            assert_eq!(row.parent_task_id.as_deref(), Some(anchor_id.as_str()));
+        }
+        assert!(
+            after
+                .iter()
+                .find(|t| t.id == "self-signal-quiet")
+                .is_some_and(|t| t.parent_task_id.is_none()),
+            "单一文件的安静项目被动了：结算只该修有两个根以上的组"
+        );
+        assert!(
+            after
+                .iter()
+                .find(|t| t.goal_id.as_deref() == Some("3f0c1d2e-0000-4000-8000-000000000000"))
+                .is_some_and(|t| t.parent_task_id.is_none()),
+            "非信号项目被动了"
+        );
+    }
+
+    /// 一组一个根、没有锚点：不写任何东西。这一格守的是成本——结算若给每个安静
+    /// 信号都补一个锚点，图上会凭空多出上千条不执行的空行。
+    #[tokio::test]
+    async fn a_project_that_already_has_one_root_is_left_alone() {
+        let mut only = Task::new(
+            "self-signal-quiet".to_string(),
+            TaskType::Custom("self_signal".into()),
+            serde_json::json!({"kind": "queue_backlog"}),
+        );
+        only.goal_id = Some("signal:queue_backlog".to_string());
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(vec![only]));
+
+        let tasks = orch.get_all_tasks().await;
+        let settled = settle_signal_parents(&orch, &tasks).await;
+        assert!(!settled.moved_anything(), "{settled:?}");
+        assert_eq!(orch.get_all_tasks().await.len(), 1, "多写了一行");
     }
 
     /// A row that already failed is left alone while the pool is closed, and
