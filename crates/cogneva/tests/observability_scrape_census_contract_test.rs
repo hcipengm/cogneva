@@ -286,6 +286,31 @@ const UNREGISTERED: &[(&str, Unread)] = &[
         "cogneva_owner_leases",
         Unread::NotAReading("the Postgres table the owner-lease rows live in, not a series: the same constant is also listed in NOT_A_SERIES so the literal scan does not read it as a producer"),
     ),
+    // The project-control coverage trio lost its reader on 2026-10-30, when the
+    // alert that judged it came off. What that alert was wrong about is the
+    // shape, not the reading: it compared covered rows against coverable ones
+    // and fired on the difference, and on a cold start the difference is every
+    // row that has not been planned yet -- a population, not a breach, so the
+    // rule fired forever and nobody could answer it. The three series are still
+    // published and now nothing draws them. That is a debt, and the reader it
+    // is owed is on the producing side: the estimator skips work it cannot
+    // judge, and once each skip is counted by kind, the pair below is read
+    // beside that count instead of standing alone as a level. Filed as gaps
+    // rather than as `NotAReading` because each one does carry a fact -- a
+    // share of the graph and the moment it was measured -- and as gaps rather
+    // than `Elsewhere` because no face reads that fact anywhere today.
+    (
+        "cogneva_project_control_coverable_rows",
+        Unread::Gap("how many rows the earned-value arithmetic could cover, published with no reader since the baseline alert came off; the reader owed here is the estimator's own skip counter, not an alert on a cold-start population"),
+    ),
+    (
+        "cogneva_project_control_covered_rows",
+        Unread::Gap("the numerator over the series above, unread for the same reason: a share read alone cannot say whether the missing rows were never planned or were planned and dropped"),
+    ),
+    (
+        "cogneva_project_control_coverage_measured_unix",
+        Unread::Gap("when the pair above was last measured, and it has no reader either -- so nothing today separates a measured zero from a frozen one; the same estimator-side reader is what will read it"),
+    ),
     // Published on 2026-10-28 by the change that started timing each startup
     // phase instead of only weighing it. Its sibling `cogneva_boot_rss_bytes`
     // has a face -- the rule that fires when a phase grows past its own 3-day
@@ -488,7 +513,16 @@ const UNREGISTERED: &[(&str, Unread)] = &[
 /// does not mean the startup face is finished; it means every series this
 /// build publishes now has at least one named reader, and the remaining work
 /// on startup is a reading of CPU seconds that no series carries yet.
-const GAPS_AT_SCRAPE_CENSUS: usize = 0;
+///
+/// Back to three on 2026-10-30, and the direction is worth recording because
+/// zero was being read as a finished face: the alert over the project-control
+/// coverage pair came off, and three published readings went with it. Zero had
+/// meant "no series this build publishes is unread"; it now means nothing of
+/// the sort, and a count that only ever fell would have hidden the regression
+/// behind its own commentary. The debt is real -- nothing draws those three --
+/// and the reader they are owed is on the producing side rather than in a
+/// rule.
+const GAPS_AT_SCRAPE_CENSUS: usize = 3;
 
 /// How many scrape-only series are carried by a produced table and by nothing
 /// that reads them.
