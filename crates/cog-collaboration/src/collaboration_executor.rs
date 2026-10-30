@@ -1373,7 +1373,7 @@ impl CollaborationExecutor {
     /// construction: the rule is declared, enabled, evaluated — and can never
     /// fire, which is indistinguishable from a plan that never exceeded it.
     /// Twice the largest threshold the shipped configurations declare.
-    // cap: derived
+    // cap: derived — 取的是出货配置里声明过的最大阈值的两倍：一个实打实等于阈值的估计是看不见的失败，与一个从没超过的计划无法区分
     const TOKEN_ESTIMATE_CAP: u64 = 200_000;
 
     /// Rough token estimate: ~4 chars per token plus 2 000 token overhead for

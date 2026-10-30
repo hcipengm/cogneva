@@ -84,16 +84,16 @@ pub enum ChangeTier {
 }
 
 /// Files a request may name and still be the shortcut's.
-// cap: bound
+// cap: bound — 一个请求可以点出这么多文件，并且仍然算轻量捷径的
 pub const SHORTCUT_MAX_FILES: usize = 3;
 /// Lines an attached diff may declare and still be the shortcut's.
-// cap: bound
+// cap: bound — 附带的 diff 可以自报这么多行，并且仍然算轻量捷径的
 pub const SHORTCUT_MAX_LINES: usize = 40;
 /// Declared files at which a change is too big for the lightest topology.
-// cap: bound
+// cap: bound — 到这个声明文件数，变更就重出了最轻那套拓扑的份
 pub const DEEP_MIN_FILES: usize = 4;
 /// Declared diff lines at which a change is too big for the lightest topology.
-// cap: bound
+// cap: bound — 到这个声明 diff 行数，变更就重出了最轻那套拓扑的份
 pub const DEEP_MIN_LINES: usize = 120;
 
 /// One of the request's own declarations the scale is read from.
@@ -514,7 +514,7 @@ pub fn scale_label(scale: DeclaredScale) -> &'static str {
 }
 
 /// Threshold below which the [`PgeMode::Pipeline`] is preferred.
-// cap: bound
+// cap: bound — 分数低于它才走 Pipeline 这条最轻的拓扑
 pub const PIPELINE_SCORE_THRESHOLD: f64 = 0.4;
 
 /// Compute the complexity score for a profile.

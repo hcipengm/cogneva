@@ -17,7 +17,7 @@ use crate::IngestConfig;
 /// 订阅失败后的重试间隔：5s。
 ///
 /// 与其它消费者同一个节拍：总线要么回来要么不回来。
-// cap: bound
+// cap: bound — 与其它消费者同一个节拍：总线要么回来要么不回来
 const SUBSCRIBE_RETRY_BACKOFF: Duration = Duration::from_secs(5);
 /// Loop name reported through the background-loop liveness family.
 pub const MEMORY_RECONCILE_LOOP: &str = "memory_ingest_reconcile";

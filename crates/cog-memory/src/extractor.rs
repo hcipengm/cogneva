@@ -56,16 +56,16 @@ pub struct RuleBasedExtractor;
 /// `importance`. See [`RuleBasedExtractor`] for why the numbers are a prior.
 mod rating {
     /// An entity is named and nothing more is said about it.
-    // cap: bound
+    // cap: bound — 是这种条目的等级编码，不是容量：实体只是被命名，关于它什么都没说
     pub const ENTITY: u8 = 6;
     /// A relation carries the two ends it connects, so it says slightly more.
-    // cap: bound
+    // cap: bound — 同上：关系带着它连的两端，所以比实体多说一点
     pub const RELATION: u8 = 7;
     /// An event is a thing that happened, at a point in time.
-    // cap: bound
+    // cap: bound — 同上：事件是某个时刻发生过的事
     pub const EVENT: u8 = 8;
     /// A preview is a slice of the payload, not a claim about the payload.
-    // cap: bound
+    // cap: bound — 同上：摘要是载荷的一段切片，不是关于载荷的判断
     pub const SUMMARY: u8 = 5;
 }
 

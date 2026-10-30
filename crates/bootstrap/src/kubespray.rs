@@ -29,7 +29,7 @@ use super::{cn_mirror, command_exists, docker_mirror_host, download, probe_alive
 ///
 /// kubelet 报 Ready 与 apiserver 把它算进 node 列表之间有一个传播窗口；不等
 /// 这一下，紧接着的 wait_all_nodes_ready 会先数到一个缺了节点的集群。
-// cap: bound
+// cap: bound — kubelet 报 Ready 与 apiserver 把它算进 node 列表之间有一个传播窗；不等这一下，紧接的 wait_all_nodes_ready 会先数到一个缺了节点的集群
 const NODE_REGISTRATION_SETTLE: Duration = Duration::from_secs(5);
 
 /// kubespray 容器镜像 tag（跟随官方稳定版，它钉住经测试的 K8s 版本矩阵）。

@@ -90,7 +90,7 @@ pub struct Squad {
 }
 
 /// 连续 Pipeline 失败多少次后自动升级到 Roundtable 模式。
-// cap: bound
+// cap: bound — 连续两次 Pipeline 都失败，第三次的结局不会再变，所以升级拓扑而不是再试一遍
 pub const PIPELINE_FAILURES_BEFORE_UPGRADE: u32 = 2;
 
 /// 单个 Squad 执行结果。

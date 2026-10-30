@@ -1152,7 +1152,7 @@ fn pace_sleep_secs(reason: &str) -> Option<u64> {
 /// （`record_ralph_termination` 带的是 `classify` 出来的 `upstream_unavailable`，
 /// 不是「判死」那一类），下游 hook 也会收到一次 `OnRalphUnrecoverable`。
 /// 分开它们要一个新的 verdict 变体，那会牵动 squad 执行器的分支；今天先记在这里。
-// cap: bound
+// cap: bound — 超过它的等待交回调度面回投而不是就地睡：睡着的任务占着派工侧的在途许可，在消费者眼里与正在执行同形
 const PACED_SLEEP_MAX_SECS: u64 = 60;
 
 /// 这一轮的等待是在这里睡过去，还是交回调度面。
