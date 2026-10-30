@@ -90,14 +90,19 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
         "cogneva_dag_stalled_scheduled_reclaimed_with_backlog_total",
         MetricDerivation::Store,
     ),
-    // Counted in the deployer's own process, from revisions it saw land and
-    // never aimed at. There is one deployer per cluster today, and if a second
-    // one ever runs, each would count the revisions its own rounds missed --
-    // their own events, not a copy of a store row -- so adding them is the
-    // total.
+    // Two processes report it and they report the same number, which is what
+    // decided this row. On 2026-10-30 both `cogneva` pods (`evolution` and the
+    // main app) answered 667, byte-identical and non-zero, for the whole family
+    // of deployer readings beside it -- the same signature as every other row
+    // here that is rendered from the store. Whether that is one counter written
+    // through the store or two deployers sharing one state file does not change
+    // the answer the table is here to give: the copies are one fact seen twice,
+    // so `sum` over them counts the same skipped revisions twice and only a
+    // deduplicating aggregate keeps the number. The panel that draws this series
+    // read `sum` while the row said `Process`; the row was wrong, not the panel.
     (
         "cogneva_deployer_revs_skipped_total",
-        MetricDerivation::Process,
+        MetricDerivation::Store,
     ),
     ("cogneva_event_bus_consumed_total", MetricDerivation::Store),
     ("cogneva_event_bus_dropped_total", MetricDerivation::Store),

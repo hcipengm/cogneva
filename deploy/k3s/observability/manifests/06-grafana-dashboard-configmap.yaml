@@ -2203,7 +2203,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum by (reason) (increase(cogneva_deployer_revs_skipped_total[6h]))",
+              "expr": "max by (reason) (increase(cogneva_deployer_revs_skipped_total[6h]))",
               "legendFormat": "{{reason}} (6h)",
               "datasource": {
                 "type": "prometheus",
@@ -2211,7 +2211,7 @@ data:
               }
             },
             {
-              "expr": "sum(increase(cogneva_deployer_revs_skipped_total[6h]))",
+              "expr": "max(increase(cogneva_deployer_revs_skipped_total[6h]))",
               "legendFormat": "all revisions skipped (6h)",
               "datasource": {
                 "type": "prometheus",
