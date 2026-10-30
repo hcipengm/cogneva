@@ -103,7 +103,6 @@ rc=$?
 [ "$rc" = 1 ] && ok "名单里的序列镜像不发：退出 1" || bad "应退出 1，实得 $rc：$(cat "$work/out")"
 grep -q '过期：pg_up' "$work/out" && ok "名单里的序列镜像不发：点名 pg_up 过期" \
     || bad "没点名过期的 pg_up：$(cat "$work/out")"
-[ "$(sha256sum "$list" | cut -d' ' -f1)" != "" ] || true
 grep -q 'pg_up' "$list" && ok "名单里的序列镜像不发：--check 没把它删掉" \
     || bad "--check 写了文件"
 

@@ -203,6 +203,10 @@ measure_help() { # <out-file>
     local out="$1"
     local name="cogneva-exporter-help-$RANDOM"
 
+    # 与量序列那一半各自解析一次：`--metrics-file` 配着不喂 `--help` 的混用是允许的，
+    # 那种跑法下量序列那一半根本没被调用过，解析也就没发生过。
+    resolve_kubectl || die 3 "这台机器上没有 kubectl 也没有 k3s——取不到 $IMAGE 的 --help"
+
     # `--help` 不连库，因此这个 Pod 不带任何 DATA_SOURCE_*：要口令的那种做法在这里
     # 一次都不需要。名字带随机后缀是因为同名 Pod 正在删除时重建会直接失败。
     $KUBECTL -n "$NAMESPACE" run "$name" --rm -i --restart=Never \
@@ -308,8 +312,6 @@ report_delta() { # <label> <old-list> <new-list>
 
 current_list collector_flags >"$work/flags.before"
 current_list series >"$work/series.before"
-LC_ALL=C sort -o "$work/flags.before" "$work/flags.before"
-LC_ALL=C sort -o "$work/series.before" "$work/series.before"
 
 render "$work/rendered.yaml"
 
