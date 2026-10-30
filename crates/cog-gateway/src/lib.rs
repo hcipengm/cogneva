@@ -90,6 +90,7 @@ pub mod taste;
 pub mod test_metrics;
 pub mod trace_fanout;
 pub mod upstream_pool;
+pub mod usage_landing;
 pub mod websocket;
 pub mod websocket_protocol;
 pub mod wiki;

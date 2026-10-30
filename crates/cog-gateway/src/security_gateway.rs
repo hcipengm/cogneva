@@ -1620,6 +1620,10 @@ pub struct PoolObservability {
     pub alerts: Option<Arc<dyn PersistentAlertSink>>,
     /// 逐调用 token 计量明细（PG）。未配置数据库时 None，计量退化为指标+时序。
     pub usage: Option<Arc<dyn LlmUsageLedger>>,
+    /// 这本账最近是不是写不进去。落账是前台不等、后台 spawn 的写，所以它
+    /// 失败时请求路径上没有任何东西会红——只有这一格记着「连续失败到第几笔」，
+    /// 让告警只在进入/离开故障的那一刻各动一次。
+    pub usage_write_health: Arc<crate::usage_landing::WriteHealth>,
     /// 池读数的耐久面（共享 metrics store）。未配置数据库时为 None。
     durable: Option<Arc<DurableGauges>>,
 }
@@ -1650,6 +1654,7 @@ impl PoolObservability {
             analytics,
             alerts,
             usage,
+            usage_write_health: Arc::new(crate::usage_landing::WriteHealth::default()),
             durable: durable.map(|backend| Arc::new(DurableGauges::new(backend))),
         }
     }
@@ -2605,15 +2610,73 @@ fn pooled_refusal(
 }
 
 /// 台账写入异步化：流结束的调用方不该等一次 PG insert。
+///
+/// 异步的代价是这一笔的成败不在请求路径上——可这本账是折叠面的正本，丢一行
+/// 就是一段永远读不出来的花销，而且它读起来与「那一段没人调用」完全同形。
+/// 所以写在这里的不只是一次 insert：几笔之内重试（PG 重启与连接重置都在一秒
+/// 内自愈），失败连续到要放弃时经耐久告警面喊一次、恢复时关掉——见
+/// [`crate::usage_landing`]。
 fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
     let Some(store) = state.pool_obs.usage.clone() else {
         return;
     };
+    let health = state.pool_obs.usage_write_health.clone();
+    let alerts = state.pool_obs.alerts.clone();
     tokio::spawn(async move {
-        if let Err(e) = store.record(&record).await {
-            tracing::warn!(error = %e, "LLM 计量明细落库失败");
+        let outcome =
+            crate::usage_landing::persist_with_retry(crate::usage_landing::WRITE_ATTEMPTS, || {
+                store.record(&record)
+            })
+            .await;
+        match outcome {
+            Ok(_) => {
+                if health.note_landed() {
+                    resolve_ledger_write_alert(alerts).await;
+                }
+            }
+            Err((error, attempts)) => {
+                tracing::error!(
+                    error = %error,
+                    attempts,
+                    "LLM 计量明细落库失败：这一笔的花销不会进任何窗口"
+                );
+                if health.note_lost() {
+                    fire_ledger_write_alert(alerts, attempts, &error.to_string()).await;
+                }
+            }
         }
     });
+}
+
+/// 计量写不进去时，在耐久告警面上开一行。
+///
+/// 告警面自己的失败只记日志，不重试也不反过来影响记账：它已经在报告一件
+/// 已经发生的事，再让它失败第二次没有意义。
+async fn fire_ledger_write_alert(
+    alerts: Option<Arc<dyn cog_core::PersistentAlertSink>>,
+    attempts: u32,
+    error: &str,
+) {
+    let Some(sink) = alerts else {
+        return;
+    };
+    let draft = crate::usage_landing::write_failed_draft(
+        crate::usage_landing::write_failed_message(attempts, error),
+    );
+    if let Err(e) = sink.set_persistent_alert(true, &draft).await {
+        tracing::warn!(error = %e, "计量落库告警本身写不进去");
+    }
+}
+
+/// 第一笔落地之后关掉那一行。键不重新生成：关的必须是开着的那一条。
+async fn resolve_ledger_write_alert(alerts: Option<Arc<dyn cog_core::PersistentAlertSink>>) {
+    let Some(sink) = alerts else {
+        return;
+    };
+    let draft = crate::usage_landing::write_failed_draft(String::new());
+    if let Err(e) = sink.set_persistent_alert(false, &draft).await {
+        tracing::warn!(error = %e, "计量落库告警关不掉，下一段故障会并进这一行");
+    }
 }
 
 /// One call's usage reading: the two counts and what the read found.
@@ -14005,6 +14068,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 analytics: None,
                 alerts: None,
                 usage: None,
+                usage_write_health: Arc::new(crate::usage_landing::WriteHealth::default()),
                 durable: None,
             }),
             pool_signal: None,
@@ -15344,6 +15408,72 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(
             text.contains("llm_pool_reserve_since_unix 1700000000"),
             "人口最早那件任务的时刻没有落下去，读者分不出「30 天窗口」与「今天到现在」：\n{text}"
+        );
+    }
+
+    /// 计量写不进去时开的那一行，与它恢复时关的是**同一行**。
+    ///
+    /// 这一条要防的坏法是「开了关不掉」：告警的键要是每笔丢失重新生成，一段
+    /// 故障会写成几十行 firing，而恢复只关得掉最后一行，剩下的永远开着。
+    /// 所以判据落在两次调用用的是同一个键，而不是两次都调到了 sink。
+    #[tokio::test]
+    async fn a_metering_outage_fires_one_row_and_recovery_closes_that_same_row() {
+        use cog_core::{AlertTransition, PersistentAlertDraft, PersistentAlertSink};
+
+        #[derive(Default)]
+        struct RecordingSink {
+            calls: std::sync::Mutex<Vec<(bool, String, String, String)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PersistentAlertSink for RecordingSink {
+            async fn set_persistent_alert(
+                &self,
+                condition: bool,
+                draft: &PersistentAlertDraft,
+            ) -> Result<AlertTransition, String> {
+                self.calls.lock().unwrap().push((
+                    condition,
+                    draft.dedup_key.clone(),
+                    draft.severity.clone(),
+                    draft.message.clone(),
+                ));
+                Ok(if condition {
+                    AlertTransition::Fired
+                } else {
+                    AlertTransition::Resolved
+                })
+            }
+            async fn firing_key_for_rule(&self, _rule: &str) -> Result<Option<String>, String> {
+                Ok(None)
+            }
+            async fn list_active_persistent_alerts(
+                &self,
+                _rule_prefix: &str,
+                _limit: i64,
+            ) -> Vec<cog_core::PersistedAlert> {
+                Vec::new()
+            }
+        }
+
+        let sink = Arc::new(RecordingSink::default());
+        let as_sink: Arc<dyn PersistentAlertSink> = sink.clone();
+        fire_ledger_write_alert(Some(as_sink.clone()), 3, "pq: starting up").await;
+        resolve_ledger_write_alert(Some(as_sink)).await;
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "一段故障开一行、恢复关一次：{calls:?}");
+        assert!(calls[0].0, "第一笔是开");
+        assert_eq!(
+            calls[0].1, calls[1].1,
+            "关的必须是开的那一行，键不能每笔重铸：{calls:?}"
+        );
+        assert!(!calls[1].0, "第二笔是关");
+        assert_eq!(calls[0].2, "critical", "计量丢了是立即要看的事");
+        assert!(
+            calls[0].3.contains("不会出现在任何窗口里"),
+            "话要说清丢了什么，而不是只说写失败：{}",
+            calls[0].3
         );
     }
 
