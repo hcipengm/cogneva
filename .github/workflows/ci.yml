@@ -178,6 +178,19 @@ jobs:
         run: cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The metering readings are a column the ledger gained later, so the three
+      # shapes that matter are the ones a server leaves behind and no fixture can
+      # hold: a row that spoke, a row whose upstream said nothing, and a row
+      # written before the column existed (`ALTER ... ADD COLUMN` leaves NULL,
+      # which is "no reading" rather than "a reading of nothing"). The panel
+      # divides by the count whose outcome is `read`, so a store that wrote the
+      # column but did not bring it back turns that share into a number about a
+      # column nobody can see.
+      - name: Live-DB metering readings
+        if: ${{ !cancelled() }}
+        run: cargo test -p cog-observability --test usage_metering -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A schema statement's wait for its locks is a fact about the server's
       # lock queue across two sessions, so nothing that runs without a server
       # can see any of it: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes

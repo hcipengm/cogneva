@@ -96,6 +96,17 @@ const SERVER_WORDS: &[ServerWord] = &[
         server_file: "crates/cog-reflection/src/evolution_build_readings.rs",
         server_needle: "pub const OUTCOME_UNSTARTED: &str = \"unstarted\";",
     },
+    // The metering panel counts the calls that got numbers as those whose outcome
+    // is `read`, so the word has to be one the server writes. It is: the ledger
+    // column is written from `MeteringOutcome`'s spelling, and this is the arm
+    // that means "upstream reported its own usage".
+    ServerWord {
+        field: "outcome",
+        word: "read",
+        client_file: "web/src/observability/OutcomeBreakdown.tsx",
+        server_file: "crates/cog-core/src/contract/usage_ledger.rs",
+        server_needle: "MeteringOutcome::Read => \"read\"",
+    },
     ServerWord {
         field: "status",
         word: "completed",
