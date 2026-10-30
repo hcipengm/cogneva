@@ -131,6 +131,35 @@ const WEB_BUILD_SRC: &str = "/src/web";
 // 纯函数（无 IO，单测覆盖）
 // ---------------------------------------------------------------------------
 
+/// 主线这一次等待的两格读数：走了几轮，以及从哪一刻起在等。
+///
+/// 独立成一个不吃 `MainlineDeployer` 的函数，是为了让用例能直接判「写出去的是
+/// 起点还是年龄」——构造一个部署器要一整套假 git、假 buildah、假 kubectl，
+/// 而这里要证的只有一件事：第二格写的是时间戳，不是已经等了多久。
+///
+/// 起点缺失时写 0 而不是不写：共享表只增不改，一段等待结束后必须有东西把它写回去，
+/// 否则最后那个起点会一直留在库里，读它的人算出「已经等了三天」。
+async fn write_advance_wait(
+    metrics: &dyn cog_core::MetricsBackend,
+    deferrals: u32,
+    since_unix: Option<i64>,
+) {
+    let _ = metrics
+        .record_gauge(
+            cog_core::metric_names::MAINLINE_ADVANCE_DEFERRALS,
+            f64::from(deferrals),
+            std::collections::HashMap::new(),
+        )
+        .await;
+    let _ = metrics
+        .record_gauge(
+            cog_core::metric_names::MAINLINE_ADVANCE_WAIT_SINCE_UNIX,
+            since_unix.unwrap_or(0) as f64,
+            std::collections::HashMap::new(),
+        )
+        .await;
+}
+
 /// 完整 rev 取短 id（git 短 sha 惯例 12 字符）。
 pub(crate) fn rev12(rev: &str) -> &str {
     if rev.len() >= 12 {
@@ -4386,17 +4415,20 @@ impl MainlineDeployer {
     /// 否则最后那个值会一直留在库里、点着规则而没有任何东西能让它灭。第一拍发的是
     /// **从 state.json 读回来的值**而不是默认 0——这个计数落盘的意义就在于重启之后
     /// 还记得连输了几轮，重启丢掉它就是把这个读数的前提丢了。
-    async fn record_advance_deferrals(&self, deferrals: u32) {
+    ///
+    /// 两次一起发的是**两个量纲**：轮次与起点。轮次那一格是控制律自己的坐标
+    /// （够 `ADVANCE_CLAIM_AFTER_DEFERRALS` 就认领名额），但它数不到时间——这一支
+    /// 被拒后立刻回下一轮而不是等，而一轮的长度是分钟级，于是「连输三轮」既可能是
+    /// 四十分钟也可能是一个小时以上，反过来一段五十四分钟的等待在盘上只数到两轮
+    /// （`state.advance_wait_ends` 里十六段的实测）。起点那一格才是「等了多久」：
+    /// 读的人拿自己的求值时刻去减。发起点而不是发年龄，是因为年龄在两次采样之间
+    /// 是常数——要「持续为真一段时间」的规则永远凑不满，而序列陈旧会被读成「年龄
+    /// 停住了」；发起点则让陈旧落回伴生钟那一格，与这一族其它读数同一个形状。
+    async fn record_advance_wait(&self, deferrals: u32, since_unix: Option<i64>) {
         let Some(metrics) = &self.metrics else {
             return;
         };
-        let _ = metrics
-            .record_gauge(
-                cog_core::metric_names::MAINLINE_ADVANCE_DEFERRALS,
-                deferrals as f64,
-                std::collections::HashMap::new(),
-            )
-            .await;
+        write_advance_wait(metrics.as_ref(), deferrals, since_unix).await;
     }
 
     /// 把这一轮的判词按 rev 记进状态文件（见 [`CiVerdictRecord`]）。
@@ -5870,7 +5902,8 @@ impl MainlineDeployer {
         // 这件事——尤其读不到裸仓库的那几轮，恰恰可能是被饿住的那几轮。写在早退
         // 之后，一个长期读不到裸仓库的部署器会让这一格停在旧值上，读它的规则就把
         // 「写者停了」读成「还在饿着」。
-        self.record_advance_deferrals(state.advance_deferrals).await;
+        self.record_advance_wait(state.advance_deferrals, state.advance_wait_since_unix)
+            .await;
 
         // 这两处钉在**本拍最早的位置**，谁不需要这一轮的产物谁就排在早退前面。
         // 它们量的是这一轮之外的事（两棵长命树的索引读数还在不在动、registry 这卷
@@ -6459,7 +6492,11 @@ impl MainlineDeployer {
                     self.save_state(&state)?;
                     // 发出去的值就是刚落到盘上的那个：盘上是 3、指标上还是上一拍的 2，
                     // 会让读的人拿两格不同的数当同一件事。
-                    self.record_advance_deferrals(state.advance_deferrals).await;
+                    self.record_advance_wait(
+                        state.advance_deferrals,
+                        state.advance_wait_since_unix,
+                    )
+                    .await;
                     info!(
                         deferrals = state.advance_deferrals,
                         reason = reason,
@@ -6522,7 +6559,7 @@ impl MainlineDeployer {
         }
         state.advance_deferrals = 0;
         // 拿到槽就把这一格写回 0：共享表只增不改，一段饿住结束后只剩这里能把它灭掉。
-        self.record_advance_deferrals(0).await;
+        self.record_advance_wait(0, None).await;
 
         // 叠层基底在这里才定：上面那条快路不需要它（不重建），而它自己要读 registry
         // 并可能改一个 tag，是"真要构建"才付的代价。它要留在槽里：基底 tag 由这
@@ -16110,6 +16147,58 @@ exec {real} "$@"
         assert_eq!(recorded.rev, "abc123");
         assert_eq!(recorded.verdict, "pass");
         handle.await.unwrap();
+    }
+
+    /// 起点那一格按原样发，空闲那一拍发 0。
+    ///
+    /// 轮次与起点是两个量纲，答的是两个问题：轮次答"现在连输几轮"，是控制律自己
+    /// 的坐标；起点答"这段等待从什么时候开始"，读的人拿求值时刻去减。只发轮次的话
+    /// "等了多久"只能拿轮次乘周期去猜，而一轮的长度是分钟级且被拒之后立刻回下一轮，
+    /// 实测十六段等待里 3227 秒只数到两轮、1127 秒数到一轮——倍率差着量级。
+    ///
+    /// 两个量都要能写回 0，缺一个就有一条规则永远不灭：起点不归零，一段结束了的
+    /// 等待会一直在库里长年龄；0 本身也是真读数，读的人必须先排除它，否则纪元开始
+    /// 到现在都是"等了十七亿秒"。这三个调用点各自做这件事，测试在这里钉住函数的
+    /// 语义，调用点由这一格的值来验。
+    #[tokio::test]
+    async fn the_advance_wait_publishes_the_start_instant_and_zeroes_it_when_idle() {
+        use cog_core::metric_names::{
+            MAINLINE_ADVANCE_DEFERRALS, MAINLINE_ADVANCE_WAIT_SINCE_UNIX,
+        };
+        let metrics = cog_test_support::MemoryMetricsBackend::new();
+        async fn read(metrics: &cog_test_support::MemoryMetricsBackend, name: &str) -> Option<f64> {
+            metrics
+                .query_gauge_latest(name)
+                .await
+                .unwrap()
+                .first()
+                .map(|s| s.value)
+        }
+
+        // 被拒的这一拍：连输两轮，这一段从 1793334443 开始。
+        write_advance_wait(&metrics, 2, Some(1_793_334_443)).await;
+        assert_eq!(
+            read(&metrics, MAINLINE_ADVANCE_DEFERRALS.as_str()).await,
+            Some(2.0)
+        );
+        assert_eq!(
+            read(&metrics, MAINLINE_ADVANCE_WAIT_SINCE_UNIX.as_str()).await,
+            Some(1_793_334_443.0),
+            "起点要按原样发，不是发年龄——年龄在两次采样之间是常数，\
+             要「持续为真一段时间」的规则永远凑不满"
+        );
+
+        // 拿到槽的这一拍：两个量一起归零。
+        write_advance_wait(&metrics, 0, None).await;
+        assert_eq!(
+            read(&metrics, MAINLINE_ADVANCE_DEFERRALS.as_str()).await,
+            Some(0.0)
+        );
+        assert_eq!(
+            read(&metrics, MAINLINE_ADVANCE_WAIT_SINCE_UNIX.as_str()).await,
+            Some(0.0),
+            "等待结束必须把起点写回 0，否则规则会照着一段早已结束的等待一直点着"
+        );
     }
 
     /// 没有证据就放行的那一版，落地之后要能答"上游当时为什么没给结论"。

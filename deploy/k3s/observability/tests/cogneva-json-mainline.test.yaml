@@ -39,8 +39,8 @@ evaluation_interval: 1m
 
 tests:
   # 健康的一小时：CI 判词是 pass、没有「读不出判词」、每次尝试都问过换代、没有被拒、
-  # 尝试与完成一起长、构建 900 秒且读数新鲜、CI 持有 100 秒且新鲜、没有推迟、定位判词
-  # 不在「不前进」、判词一直在判、轮询有成功。十三条全静。
+  # 尝试与完成一起长、构建 900 秒且读数新鲜、CI 持有 100 秒且新鲜、没有在等槽（起点
+  # 写的是 0）、定位判词不在「不前进」、判词一直在判、轮询有成功。十三条全静。
   - interval: 1m
     input_series:
       - series: 'cogneva_mainline_ci_verdict_total{verdict="pass"}'
@@ -69,9 +69,9 @@ tests:
         values: '100x60'
       - series: 'cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds'
         values: '100x60'
-      - series: 'cogneva_mainline_advance_deferrals'
+      - series: 'cogneva_mainline_advance_wait_since_unix'
         values: '0x60'
-      - series: 'cogneva_mainline_advance_deferrals_observed_timestamp_seconds'
+      - series: 'cogneva_mainline_advance_wait_since_unix_observed_timestamp_seconds'
         values: '3500x60'
       - series: 'cogneva_mainline_behind_verdict_stalled'
         values: '0x60'
@@ -157,9 +157,9 @@ tests:
         values: '100x60'
       - series: 'cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds'
         values: '100x60'
-      - series: 'cogneva_mainline_advance_deferrals'
-        values: '1x60'
-      - series: 'cogneva_mainline_advance_deferrals_observed_timestamp_seconds'
+      - series: 'cogneva_mainline_advance_wait_since_unix'
+        values: '2400x60'
+      - series: 'cogneva_mainline_advance_wait_since_unix_observed_timestamp_seconds'
         values: '3500x60'
       - series: 'cogneva_mainline_behind_verdict_stalled'
         values: '1x60'
@@ -234,8 +234,8 @@ tests:
         alertname: mainline_advance_starved
         exp_alerts: []
 
-  # 慢、久、饿死：构建 2000 秒（界 1200）、CI 持有 20000 秒（界 14400）、推迟 5 次（界 3），
-  # 三条读数都新鲜。三条亮。
+  # 慢、久、饿死：构建 2000 秒（界 1200）、CI 持有 20000 秒（界 14400）、等槽从 1000 秒
+  # 起一直等到求值（求值时 2600 秒，界 1800），三条读数都新鲜。三条亮。
   - interval: 1m
     input_series:
       - series: 'cogneva_mainline_build_seconds{outcome="ok"}'
@@ -246,9 +246,9 @@ tests:
         values: '20000x60'
       - series: 'cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds'
         values: '100x60'
-      - series: 'cogneva_mainline_advance_deferrals'
-        values: '5x60'
-      - series: 'cogneva_mainline_advance_deferrals_observed_timestamp_seconds'
+      - series: 'cogneva_mainline_advance_wait_since_unix'
+        values: '1000x60'
+      - series: 'cogneva_mainline_advance_wait_since_unix_observed_timestamp_seconds'
         values: '3500x60'
     alert_rule_test:
       - eval_time: 60m
@@ -280,9 +280,9 @@ tests:
         values: '20000x480'
       - series: 'cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds'
         values: '0x480'
-      - series: 'cogneva_mainline_advance_deferrals'
-        values: '5x480'
-      - series: 'cogneva_mainline_advance_deferrals_observed_timestamp_seconds'
+      - series: 'cogneva_mainline_advance_wait_since_unix'
+        values: '1000x480'
+      - series: 'cogneva_mainline_advance_wait_since_unix_observed_timestamp_seconds'
         values: '0x480'
     alert_rule_test:
       - eval_time: 480m

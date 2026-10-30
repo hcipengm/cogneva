@@ -1012,6 +1012,28 @@ metric_names! {
     // starvation that ends is written back rather than left as its last value,
     // for the reason MAINLINE_CI_HOLD_SECONDS gives above.
     MAINLINE_ADVANCE_DEFERRALS => "cogneva_mainline_advance_deferrals",
+    // When the current run of refusals began, as a unix second; 0 on a round that
+    // is not waiting. The value form of the state file's
+    // `advance_wait_since_unix`.
+    //
+    // It exists because the refusal count above is the wrong unit for the
+    // question it is read to answer. That count increments once per round, and a
+    // round of this loop is ten minutes, so it measures how many times the
+    // deployer came back rather than how long it has been waiting: over the
+    // sixteen waits the state file keeps, a wait of 3227 seconds was recorded
+    // with two refusals and one of 1127 seconds with one, and the largest value
+    // the series has carried in a week is three. A rule written above three was
+    // therefore waiting for a starvation of forty-odd minutes, and the one
+    // measured on 2026-10-30 ran 2352 seconds and peaked at three.
+    //
+    // The start instant, not the age: an age written once per round is constant
+    // between two samples, so a rule that has to stay true for a while can never
+    // satisfy itself, and a series that went stale would read as an age that
+    // stopped growing. Publishing the instant lets the reader subtract at its own
+    // evaluation time, and leaves "the writer stopped" to the freshness
+    // companion every reading in this family already carries. 0 means not
+    // waiting, and a reader has to test it: the age of the epoch is not a wait.
+    MAINLINE_ADVANCE_WAIT_SINCE_UNIX => "cogneva_mainline_advance_wait_since_unix",
     // Rounds the deployer's poll loop finished, by how they finished: `ok` when
     // the round ran to the end, `failed` when it returned an error.
     //

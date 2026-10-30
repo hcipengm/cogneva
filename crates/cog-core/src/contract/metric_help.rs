@@ -2600,14 +2600,45 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          up, so its refusals do land in `cogneva_build_gate_refused_total` as \
          `asker=\"mainline_advance\",reason=\"waited_out\"`, but that is a \
          running total for a whole lifetime and a starvation of three rounds \
-         reads the same on it as one of thirty. Read it against the loop period \
-         beside it: the count times the period is how long the mainline has \
-         been unable to move, and three is the round at which the deployer \
-         stops queuing and claims a slot instead. A value that stops moving is \
-         not by itself starvation -- it also happens when there is nothing to \
-         advance -- so read it with whether the bare main is ahead of \
-         `last_good_rev`; the writing side is one number with no labels because \
-         the deployer is its only writer",
+         reads the same on it as one of thirty. Three is the round at which the \
+         deployer stops queuing and claims a slot instead. What it counts is \
+         rounds, not time, and the two part company as soon as the rounds are \
+         not adjacent: a round of this loop is ten minutes long and the count \
+         increments when a round reaches the gate, so over the sixteen waits the \
+         state file keeps it sits at one to three whatever the duration -- a \
+         wait of 3227 seconds was recorded with two refusals and one of 1127 \
+         seconds with one. Multiplying it by the period is therefore how long \
+         the mainline would have waited had its rounds been back to back, not \
+         how long it waited. The wait itself is published by \
+         `cogneva_mainline_advance_wait_since_unix`; this series is kept because \
+         it is the number the deployer's own claim threshold is compared \
+         against. A value that stops moving is not by itself starvation -- it \
+         also happens when there is nothing to advance -- so read it with \
+         whether the bare main is ahead of `last_good_rev`; the writing side is \
+         one number with no labels because the deployer is its only writer",
+    ),
+    (
+        crate::metric_names::MAINLINE_ADVANCE_WAIT_SINCE_UNIX.as_str(),
+        "The instant the current run of refused build slots began, in unix \
+         seconds; 0 on any round that is not waiting. It is the value form of \
+         the state file's `advance_wait_since_unix`, written on every round so \
+         that a wait that ends is written back rather than left standing as its \
+         last value, and so that the run survives a restart. Read it as an age \
+         -- the reader subtracts it from its own evaluation time -- because the \
+         quantity wanted is how long the mainline has been waiting for the host \
+         to free a slot, and nothing published that as time before: the refusal \
+         count beside it counts rounds and a round here is ten minutes, so a \
+         starvation of thirty-nine minutes and one of four minutes could be \
+         written with the same number. The instant and not the age, because a \
+         value written once per round is constant between samples: a rule that \
+         must stay true for a while could never satisfy itself against it, and a \
+         series that had gone stale would read as an age that had stopped \
+         growing rather than as a writer that had stopped writing, which is what \
+         the freshness companion is for. The zero is a real reading and has to \
+         be tested for -- the age of the epoch is not a wait -- and it is \
+         written by the round that takes the slot, so an idle deployer is silent \
+         rather than permanently overdue. One number, no labels: the run is the \
+         deployer's own and the deployer is its only writer",
     ),
     (
         crate::metric_names::MAINLINE_BUILD_SECONDS.as_str(),
