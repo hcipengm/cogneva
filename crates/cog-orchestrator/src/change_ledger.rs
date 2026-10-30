@@ -1040,6 +1040,7 @@ fn dispatch_project_root_id(project: &str) -> String {
 /// of rows to reach, and this loop shares its process with the measurement
 /// passes. A batch bounds the burst, not the work: the loop asks again on its
 /// next beat until `remaining` is zero.
+// cap: bound
 const SETTLE_BATCH: usize = 400;
 
 /// What one settle of the dispatched projects did, cell by cell.

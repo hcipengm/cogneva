@@ -2455,6 +2455,7 @@ pub(crate) fn assess_acceptance(task_id: &str) -> String {
 /// The first pass after this ships has a few dozen rows to reach and runs on a
 /// round that is also polling two platforms; a batch bounds the burst, not the
 /// work.
+// cap: bound
 const CRITERIA_SETTLE_BATCH: usize = 400;
 
 /// What one back-fill pass did.
