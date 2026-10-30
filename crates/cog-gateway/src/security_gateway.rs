@@ -958,13 +958,19 @@ struct LlmHealthTable {
     /// 或一次真实成功（`note_success`）。留着它会让 `due_for_probe` 对这个上游恒真，
     /// 退避窗就形同虚设——探测变成每拍一次，而每次探测都花真实配额。
     shape_errored: Mutex<std::collections::HashSet<String>>,
-    /// 本进程最近一次看到上游真的应答（成功）的绝对时刻，unix 秒；0 = 还没看到过。
+    /// 本进程最近一次**真的承接了一件活**的绝对时刻，unix 秒；0 = 还没看到过。
     ///
     /// 与 `observed` 记的是同一件事的两个面：那个集合答"有没有哪家被实证过"
     /// （判定面上的"什么都没见过"与"见过成功"要分开），这个时刻答"**从什么时候
     /// 起**有证据了"。消费者自己压着的东西（按上游确定性失败开的退避窗）要判的
     /// 正是后一个问题——它的前提是"上游当下就这个状态"，而这个时刻是那个前提
     /// 已经被推翻的证据。进程换代就归零：这是**本代**的证据，不是对上一代的转述。
+    ///
+    /// **探测通过不写它。** 探测发的是一条 `max_tokens: 1` 的最小请求：它通了只证明
+    /// 这家肯回一个 token，不证明它承接得了一件活——配额按量计的账号上，一个 token
+    /// 落在窗内而一件活下去被拒，就是这个形状，池连续几天送不出活时它每一拍都会通。
+    /// 若把它算作"送出过"，读这个时刻的人（消费者释放自己的退避窗、面板上的"最后送出"）
+    /// 会从一个分钟级的数里读出一件活被承接的证据，而那一刻的真实情况恰恰相反。
     last_success_unix: std::sync::atomic::AtomicI64,
     /// 运行时补问到的能力判定，按上游身份存（与上面两个表同一个键）。
     runtime_caps: Mutex<std::collections::HashMap<String, RuntimeCapabilityProbe>>,
@@ -1147,7 +1153,11 @@ impl LlmHealthTable {
     }
 
     /// 记录一次成功：嫌疑态清除。返回此前是否处于嫌疑（调用方打恢复日志）。
-    fn note_success(&self, u: &LlmUpstream) -> bool {
+    ///
+    /// `served` 说明这次成功是不是由一件真实的活换来的：它决定"最后送出"这个时刻
+    /// 走不走。清除嫌疑与"有证据"这两件事，探测通过同样算——那是这两条上游自己的
+    /// 状态；而"送出过一件活"只有活的成功算，理由见 `last_success_unix`。
+    fn note_success(&self, u: &LlmUpstream, served: bool) -> bool {
         // 成功同样是一次定性：这条上游刚刚受理了一条真实请求，"等探测定性"
         // 的问号随之消掉。
         self.shape_errored.lock().unwrap().remove(&Self::key(u));
@@ -1155,9 +1165,12 @@ impl LlmHealthTable {
         // the reading has to remember it once the verdict table has no further
         // use for the entry.
         self.observed.lock().unwrap().insert(Self::key(u));
-        // 同一件事的第二个面：不只"有没有证据"，还有"从什么时候起"。
-        self.last_success_unix
-            .store(Utc::now().timestamp(), Ordering::SeqCst);
+        // 同一件事的第二个面：不只"有没有证据"，还有"从什么时候起"。只有活的
+        // 成功推进它——探测通只能证明一个 token 过得去。
+        if served {
+            self.last_success_unix
+                .store(Utc::now().timestamp(), Ordering::SeqCst);
+        }
         let mut states = self.states.lock().unwrap();
         match states.remove(&Self::key(u)) {
             Some(h) => h.suspect_until.is_some(),
@@ -1991,7 +2004,7 @@ impl AppState {
     /// 否则池判定只能靠窗口到期推断恢复——而那只是"可以再试"，不是恢复。
     fn note_upstream_success(&self, u: &LlmUpstream) -> bool {
         self.pool_recovered.store(true, Ordering::SeqCst);
-        self.llm_health.note_success(u)
+        self.llm_health.note_success(u, true)
     }
 
     /// 记一次**探测**成功：清它自己的嫌疑窗，但只在没有真实请求刚被拒时才留下
@@ -2023,7 +2036,8 @@ impl AppState {
                 "LLM 上游探测通了，但一个探测窗内还有真实请求被拒；只清嫌疑窗，不作池恢复凭据"
             );
         }
-        self.llm_health.note_success(u)
+        // `served: false`：这一拍没有送出任何一件活，所以本进程的"最后送出"不动。
+        self.llm_health.note_success(u, false)
     }
 
     /// 代码平台透传用的 GitHub 出口凭证：配置了 App 就用 installation token
@@ -10355,9 +10369,47 @@ mod tests {
         // 窗口内的后续失败静默（不重复计数、不刷日志）。
         assert_eq!(table.note_failure(&u, 300, None, None, None), None);
         // 成功即恢复健康；note_success 报告此前确实处于嫌疑。
-        assert!(table.note_success(&u));
+        assert!(table.note_success(&u, true));
         assert!(!table.is_suspect(&u));
-        assert!(!table.note_success(&u));
+        assert!(!table.note_success(&u, true));
+    }
+
+    /// 探测通过清嫌疑、但不算"送出过一件活"。
+    ///
+    /// 现场形状：池四天没送出任何一件活（`max_tokens: 1` 的探测每拍都通），
+    /// 若探测也推进"最后送出"，面板会把四天的断供读成"几分钟前还送出过"，
+    /// 而消费者按这个时刻释放自己压着的退避窗，就会把停在出口的活全部倒在一个
+    /// 只肯回一个 token 的上游上。
+    #[test]
+    fn a_probe_that_answers_is_evidence_but_not_a_served_job() {
+        let table = LlmHealthTable::default();
+        let u = LlmUpstream {
+            api_style: "openai".into(),
+            base_url: "https://a.example.com".into(),
+            model: "m1".into(),
+            api_key: "k".into(),
+            supports_tool_calls: None,
+            requires_temperature_one: None,
+            supports_usage_in_streaming: None,
+        };
+        assert_eq!(table.last_success_unix(), 0, "还没送出过活");
+        assert_eq!(
+            table.note_failure(&u, 300, None, None, None),
+            Some((1, 300))
+        );
+
+        // 探测通：嫌疑窗清掉、上游算"有证据"，但时刻不动。
+        assert!(table.note_success(&u, false));
+        assert!(!table.is_suspect(&u));
+        assert_eq!(
+            table.last_success_unix(),
+            0,
+            "探测发的是一条 max_tokens: 1 的最小请求，它通只证明这一家肯回一个 token"
+        );
+
+        // 一件真实的活送出：这才推进时刻。
+        table.note_success(&u, true);
+        assert!(table.last_success_unix() > 0);
     }
 
     #[test]
@@ -10550,7 +10602,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let reading = table.snapshot(std::slice::from_ref(&u)).remove(0);
         assert_eq!(reading.refusal_kind, Some(RefusalKind::Entitlement));
 
-        assert!(table.note_success(&u));
+        assert!(table.note_success(&u, true));
         let reading = table.snapshot(std::slice::from_ref(&u)).remove(0);
         assert_eq!(
             reading.refusal_kind, None,
@@ -10902,7 +10954,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(bounds.next_attempt_unix() > Utc::now().timestamp());
 
         // 恢复一个即离开"全灭"。
-        table.note_success(&a);
+        table.note_success(&a, true);
         assert!(!table.all_suspect(&pool));
     }
 
@@ -11060,7 +11112,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
 
         // 任一上游恢复即解除熔断，真实请求立刻有机会试它。
-        state.llm_health.note_success(&c);
+        state.llm_health.note_success(&c, true);
         assert_eq!(state.pool_circuit_break(&all), None, "有上游可用即放行");
     }
 
@@ -11506,7 +11558,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(refusal_kind_value(&text, &key, "unclassified"), Some(0.0));
 
         // 上游换了说法：同一台上游、同一拍之后，旧的那条必须落回 0。
-        state.llm_health.note_success(&u);
+        state.llm_health.note_success(&u, true);
         state
             .llm_health
             .note_failure(&u, 300, None, None, Some(RefusalKind::QuotaCycle));
@@ -11547,7 +11599,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         // 窗口到期、也无恢复证据：判定保持不可用。空表是"没有证据"，不是
         // "证据表明可用"——否则网关每次重启都会凭空把池判回可用。
-        state.llm_health.note_success(&u);
+        state.llm_health.note_success(&u, true);
         assert!(
             state.llm_health.states.lock().unwrap().is_empty(),
             "窗口已清，接下来的推导只依据证据"
@@ -11693,7 +11745,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let table = LlmHealthTable::default();
         let old = stub_upstream("https://old.example.com", "m1");
         let current = stub_upstream("https://current.example.com", "m2");
-        table.note_success(&old);
+        table.note_success(&old, true);
         assert_eq!(
             table.snapshot(std::slice::from_ref(&old)).remove(0).healthy,
             Some(true)
@@ -13478,7 +13530,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(state.llm_health.effective_usage_verdict(&upstream), None);
 
         // 一次真实成功：这台上游从此在读数上是健康的（补问的触发条件）。
-        state.llm_health.note_success(&upstream);
+        state.llm_health.note_success(&upstream, true);
 
         // 这一拍：判定还没有出处，观测面报 0，同时把补问发出去。
         refresh_pool_state(&state).await;
@@ -13598,7 +13650,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         };
 
         // 一次真实成功：这台上游从此在读数上是健康的（补问的触发条件）。
-        state.llm_health.note_success(&upstream);
+        state.llm_health.note_success(&upstream, true);
 
         // 这一拍：判定还没有出处，网关只能照画像钳——调用方挑的 0.2 被改掉。
         let resp = chat_completions_passthrough(
@@ -13769,7 +13821,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             &state.config.llm_upstreams[1],
             &state.config.llm_upstreams[2],
         ] {
-            state.llm_health.note_success(u);
+            state.llm_health.note_success(u, true);
         }
 
         refresh_pool_state(&state).await;
@@ -13818,7 +13870,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             &state.config.llm_upstreams[1],
             &state.config.llm_upstreams[2],
         ] {
-            state.llm_health.note_success(u);
+            state.llm_health.note_success(u, true);
         }
 
         refresh_pool_state(&state).await;
@@ -13865,7 +13917,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             &state.config.llm_upstreams[1],
             &state.config.llm_upstreams[2],
         ] {
-            state.llm_health.note_success(u);
+            state.llm_health.note_success(u, true);
         }
 
         refresh_pool_state(&state).await;

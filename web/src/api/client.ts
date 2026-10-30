@@ -168,7 +168,13 @@ export interface LlmPoolView {
   recovery_at: string | null;
   /** 我方下一次探测上游的时刻。 */
   next_attempt_at: string | null;
-  /** 写它的那个进程最后一次看见上游真的答话的时刻。 */
+  /**
+   * 写它的那个进程最后一次真的送出一件活（承接一条真实请求）的时刻。
+   *
+   * 探测通过不算：探测发的是一条 `max_tokens: 1` 的最小请求，它通只证明上游肯回
+   * 一个 token。池连续几天送不出活时探测可以每一拍都通，那个时刻会被读成「刚才还
+   * 送出过」，与事实正相反。
+   */
   last_served_at: string | null;
   /**
    * 这一窗的额度账：允许了多少、花出去多少。null 是「还没有量过一整个窗」，
