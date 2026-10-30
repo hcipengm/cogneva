@@ -45,7 +45,11 @@ $do$;
 ALTER ROLE cog_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
   PASSWORD :'app_password';
 
-GRANT CONNECT ON DATABASE cogneva TO cog_app;
+-- 库名从会话里取，不写死：这个脚本也会被测试拿到一个临时库上跑，写死一个库名
+-- 就等于把「跑在哪」钉在树里，换一个部署就授错库。
+DO $do$ BEGIN
+  EXECUTE format('GRANT CONNECT ON DATABASE %I TO cog_app', current_database());
+END $do$;
 GRANT USAGE, CREATE ON SCHEMA public TO cog_app;
 
 DO $do$
@@ -56,15 +60,32 @@ BEGIN
   -- 扩展成员（deptype = 'e'）跳过：它们的属主要跟着扩展走，改了会让
   -- ALTER EXTENSION 在需要升级时找不到属主。
   FOR obj IN
-    SELECT c.oid::regclass AS name
+    SELECT c.oid::regclass AS name, c.relkind AS kind
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = 'public'
       AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = 'cog_user')
       AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e')
+      -- 附属于某张表的序列（默认分区/自增列的序列）不能单独换属主：Postgres
+      -- 直接拒绝（linked to table），而它本来就跟着宿主表走——上面那句改表属主
+      -- 会把它一起带过去。漏了这个条件，整个循环在第一个自增序列上就断了，
+      -- 而断点之前的对象已经挪走，Job 只在日志里留一行 ERROR。
+      AND NOT (c.relkind = 'S' AND EXISTS (
+        SELECT 1 FROM pg_depend d
+        WHERE d.objid = c.oid
+          AND d.classid = 'pg_class'::regclass
+          AND d.refclassid = 'pg_class'::regclass
+          AND d.deptype IN ('a', 'i')))
   LOOP
-    EXECUTE format('ALTER TABLE %s OWNER TO cog_app', obj.name);
+    -- 换属主的关键字随对象种类变：视图与序列不接受 ALTER TABLE 那种写法。
+    EXECUTE format('ALTER %s %s OWNER TO cog_app',
+      CASE obj.kind
+        WHEN 'S' THEN 'SEQUENCE'
+        WHEN 'v' THEN 'VIEW'
+        WHEN 'm' THEN 'MATERIALIZED VIEW'
+        ELSE 'TABLE'
+      END, obj.name);
   END LOOP;
 
   FOR obj IN

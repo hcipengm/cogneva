@@ -1116,6 +1116,21 @@ jobs:
   entry-scripts:
     name: Entry Scripts Lint
     runs-on: ubuntu-latest
+    # 引导脚本那条门要拿真库跑：它判的是「这段 SQL 在 Postgres 上跑不跑得通」，
+    # 而 2026-10-30 那次正是纯静态的读法看不出问题、真库上第一个自增序列就断。
+    # 库是本作业自己的，用完即弃，探针库名带 cogneva_bootstrap_probe 前缀。
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - name: Install shellcheck
@@ -1157,7 +1172,17 @@ jobs:
       # one managed: the day the image drops it, the failure lands inside a test
       # named for something else. Asked for here, the dependency is a step.
       - uses: azure/setup-kubectl@v4
+      - name: Ensure psql
+        run: |
+          command -v psql >/dev/null || {
+            sudo apt-get update -qq || true
+            sudo apt-get install -y --no-install-recommends postgresql-client
+          }
+          psql --version
       - name: Script tests
+        env:
+          # 只有需要真库的那几条读它；其余的门把它当一段普通字符串。
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: |
           # Both roots, globbed rather than listed: the guard's own tests live
           # beside it under .github/ and a hand-kept list is what goes quiet
