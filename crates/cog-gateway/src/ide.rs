@@ -58,34 +58,34 @@ fn workspace_root_with(explicit: Option<&str>, data_dir: &Path) -> PathBuf {
 /// [`cog_core::paths`]：同一条路径的第二份声明会在有人只改一处时静默分叉。
 const DEFAULT_DATA_DIR: &str = cog_core::paths::DATA_DIR;
 /// 单个文件的上限。编辑器不是上传通道：超过这个量的东西该走附件那条路。
-// cap: bound
+// cap: bound — 编辑器不是上传通道，超过这个量的东西该走附件那条路
 const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// 一次列目录最多回多少条，防止一个百万文件的目录把响应撑爆。
-// cap: bound
+// cap: bound — 一次列目录回多少条，防一个百万文件的目录把响应撑爆
 const MAX_TREE_ENTRIES: usize = 2000;
 /// 判断二进制时看的前缀长度，也是这类文件永不返回正文的理由。
-// cap: bound
+// cap: bound — 判二进制只看前缀这么多字节，这也是这类文件永不返回正文的理由
 const BINARY_PROBE_BYTES: usize = 8192;
 /// 上传 / 下载的上限。比编辑器那条宽——整份构建产物、一张截图也该能搬进搬出，
 /// 但必须落在路由层请求体的封顶之下并留出余量：超过那条线的大请求在到达这里
 /// 之前就被拒，本层再给一个更大的数只会让两边说法不一致。
-// cap: bound
+// cap: bound — 上传下载的上限；比编辑器那条宽，但超出在更外层就被拒，两层说法必须一致
 const TRANSFER_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// 流式读一次拿多少字节。读的是 `git show` 的管道，块越大系统调用越少，但一块
 /// 得小到一次读不会把这一页用不上的部分也搬进内存——取法是在这两头之间落一个
 /// 与文件大小无关的定值，所以它单独是一个界，不跟着 `MAX_FILE_BYTES` 变。
-// cap: bound
+// cap: bound — 流式读一次拿多少字节；与文件大小无关的定值，所以不跟 MAX_FILE_BYTES 变
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 /// 一次搜索最多走多少个文件、读多少字节：搜索是同步回答的请求，没有一个
 /// 上界时一个装满构建产物的根目录会让这一次请求把连接占满。
-// cap: bound
+// cap: bound — 一次搜索最多走多少个文件：搜索是同步回答的请求，上界大了会把连接占满
 const SEARCH_MAX_FILES: usize = 5_000;
 /// 一次搜索最多读多少字节：与上面的文件数同一个界的字节侧，定在扫一份仓库的文本
 /// 仍能在一次请求里答完的位置。
-// cap: bound
+// cap: bound — 与上面那个文件数是同一条界的字节侧，定在一次请求能答完的位置
 const SEARCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// 一次搜索默认回多少条匹配，以及调用方能要到多少。
-// cap: bound
+// cap: bound — 一次搜索默认回多少条匹配；调用方能要更多，到 SEARCH_MAX_* 为止
 const SEARCH_DEFAULT_LIMIT: usize = 100;
 // cap: bound — widest page of matches a caller may ask for
 const SEARCH_MAX_LIMIT: usize = 500;
@@ -94,7 +94,7 @@ const SEARCH_MAX_LIMIT: usize = 500;
 const WORKSPACE_MAX_BYTES_ENV: &str = "COGNEVA_WORKSPACE_MAX_BYTES";
 /// 一个工作区默认能占多少字节：一份源码加它自己的构建产物的量级，
 /// 不是一个按租户量出来的容量，所以它是个部署可改的默认值。
-// cap: bound
+// cap: bound — 工作区体积的默认值，部署可改；不是按租户量出来的容量
 const DEFAULT_WORKSPACE_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]

@@ -35,13 +35,13 @@ use std::sync::Arc;
 use crate::GatewayState;
 
 /// 一份进程表最多几条。超过这个数不是「进程很多」，是有人在灌数据。
-// cap: bound
+// cap: bound — 一份进程表最多几条；超过不是进程多，是有人在灌数据
 pub const MAX_REPORTS: usize = 64;
 /// 名字最长多少个字符。进程名本来就短，长的是命令行——这一面不读命令行。
-// cap: bound
+// cap: bound — 名字最长多少字符；进程名本来就短，长的是命令行，而这一面不读命令行
 pub const MAX_COMMAND_CHARS: usize = 64;
 /// 一份自报多久之后算过期。容器停掉之后不会再有新的一拍，旧表不能一直当现状显示。
-// cap: derived
+// cap: derived — 由自报的节拍决定；容器停掉后不再有新的一拍，旧表不能一直当现状
 pub const FRESH_FOR: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,7 +146,7 @@ pub fn census_at(node: &str) -> Option<DateTime<Utc>> {
 }
 
 /// 一个名字最多在这几个容器里出现几回——`commands` 去重后最多留几个。
-// cap: bound
+// cap: bound — 一个名字去重后最多留几条命令
 pub const MAX_UNCLAIMED_COMMANDS: usize = 4;
 
 /// 采集器看得见、屏上没有格子的一个容器。

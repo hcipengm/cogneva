@@ -44,7 +44,7 @@ pub struct ProjectReadLimiter {
 }
 
 /// 桶超过这个数就先清一遍过期的：调用方 id 的数量不该成为一处无界增长的内存。
-// cap: bound
+// cap: bound — 桶数超过这个数就先清一遍过期的：调用方 id 不该成为一处无界增长的内存
 const BUCKET_SWEEP_AT: usize = 4096;
 
 impl ProjectReadLimiter {

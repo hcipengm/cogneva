@@ -26,24 +26,24 @@ use crate::error::ApiError;
 use crate::ide::{ensure_user_root, resolve_under};
 
 /// 一个 git 动作的硬上限。工作区是本机小仓库，慢过一次轮询周期就说明它坏了。
-// cap: bound
+// cap: bound — 一个 git 动作的硬上限；工作区是本机小仓库，慢过一次轮询周期就说明它坏了
 const GIT_TIMEOUT: Duration = Duration::from_secs(20);
 /// 一次点名多少条路径。
-// cap: bound
+// cap: bound — 一次点名多少条路径
 const MAX_PATHS: usize = 500;
 /// 状态里最多回多少条变更。
-// cap: bound
+// cap: bound — 状态里最多回多少条变更
 const MAX_CHANGES: usize = 500;
 /// 提交说明的上限。留得比一条 changelog 宽，比一篇文章窄。
-// cap: bound
+// cap: bound — 提交说明的上限；比一条 changelog 宽，比一篇文章窄
 const MAX_MESSAGE_CHARS: usize = 4000;
 /// 一次 diff 最多回多少字节、多少行。
-// cap: bound
+// cap: bound — 一次 diff 最多回多少字节
 const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
 // cap: bound — keeps a pathological line count from filling the byte cap with tiny lines; the byte cap is the primary bound
 const MAX_DIFF_LINES: usize = 20_000;
 /// 日志默认与最多回多少条。
-// cap: bound
+// cap: bound — 日志默认回多少条；调用方能要更多，上界另设
 const LOG_DEFAULT: usize = 20;
 // cap: bound — most log rows returned
 const LOG_MAX: usize = 200;

@@ -37,7 +37,7 @@ fn default_limit() -> usize {
 /// How many firing alerts to fetch when all the verdict needs is whether any
 /// exist. The question is boolean, so one row settles it and the read stays
 /// bounded no matter how much is firing.
-// cap: bound
+// cap: bound — 探测只取一条；有界，不随正在告警的数量增长
 const FIRING_PROBE_LIMIT: i64 = 1;
 
 /// Verdict over the firing alerts an evidence source reported.
@@ -345,7 +345,7 @@ fn default_usage_hours() -> i64 {
 /// ledger's own history; a request past the fold's reach is answered as an
 /// uncovered range either way, so the cap bounds the scan and not the honesty
 /// of the answer.
-// cap: bound
+// cap: bound — 用量查询最多回多少小时，界的是单次聚合的代价
 const MAX_USAGE_HOURS: i64 = 24 * 7;
 
 /// The instant a spend request asks the fold to sum from.

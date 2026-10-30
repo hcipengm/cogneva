@@ -16,19 +16,19 @@ use cog_core::LlmOrigin;
 ///
 /// 这是「装得进一次请求」的界，不是「存得下多少」的界：记录本身留在库里，按会话
 /// 自己的上界裁剪，见存储面。
-// cap: bound
+// cap: bound — 一次会话带多少轮历史进上下文，界的是请求体积
 const SESSION_HISTORY_CAP: usize = 40;
 /// Connecting to the LLM backend should be fast; the failover pool handles
 /// slow backends by switching.
-// cap: bound
+// cap: bound — 连上后端的预算；连不上就交给故障转移池，不在这一跳干等
 const CONNECT_TIMEOUT_SECS: u64 = 30;
 /// A reasoning model may think for a long while between deltas; only an idle
 /// gap beyond this aborts the turn. Matches the provider's own in-stream cap.
-// cap: bound
+// cap: bound — 流在两帧之间的空闲上限；推理模型可以想很久，但一直不出字就是断了
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
 /// Intent classification is a one-word answer; anything slower means the
 /// backend is struggling and we fall back to the plain chat path.
-// cap: bound
+// cap: bound — 意图分类只答一个词，超过这个时间说明上游不正常
 const CLASSIFY_TIMEOUT_SECS: u64 = 20;
 
 /// Intent router prompt. The Web UI chat is an entry point into the system,

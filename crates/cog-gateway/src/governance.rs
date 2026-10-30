@@ -195,13 +195,13 @@ fn refused_view(row: cog_core::PrincipleRow) -> RefusedPrinciple {
 /// How many refused principles the route returns in the list. The totals are
 /// taken before the truncation, so this bounds the list without making either
 /// total a page count.
-// cap: bound
+// cap: bound — 一页拒绝记录的条数，界的是单次响应的体积
 const REFUSED_PAGE: usize = 50;
 /// How many refused rows are read to compute the totals. The selection is
 /// `refusals > 0`, so this is a bound on how many principles have ever been
 /// refused by a single deployment; reading the whole set is what lets the two
 /// totals describe the set rather than the page.
-// cap: bound
+// cap: bound — 算拒绝总数最多读多少行；读到这里就按已读部分外推，不把整表读进内存
 const REFUSED_READ_CAP: usize = 10_000;
 
 fn principles(state: &GatewayState) -> Result<&Arc<dyn cog_core::PrincipleLedgerStore>, ApiError> {
@@ -384,7 +384,7 @@ fn change_row_view(row: cog_core::ChangeLedgerRow) -> ChangeLedgerRowView {
 /// How many outstanding rows the route returns. The account can hold thousands;
 /// this bounds the body without bounding `outstanding_total`, which is taken
 /// from the census.
-// cap: bound
+// cap: bound — 一页未结事项的条数，与拒绝页同量级，界的是单次响应体积
 const OUTSTANDING_PAGE: usize = 100;
 
 fn changes(state: &GatewayState) -> Result<&Arc<dyn cog_core::ChangeLedgerStore>, ApiError> {
@@ -473,7 +473,7 @@ pub struct ChangeTimelineResponse {
 /// How many moves one history returns unless the caller asks for fewer. The
 /// steps come newest first, so the bound drops the oldest ones -- the account
 /// can be years deep and the question is "how did this get here".
-// cap: bound
+// cap: bound — 一页时间线的条数，界的是单次响应体积
 const TIMELINE_PAGE: usize = 50;
 // cap: bound — widest history a caller may ask for in one read
 const TIMELINE_MAX: usize = 200;

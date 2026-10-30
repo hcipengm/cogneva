@@ -31,7 +31,7 @@ pub const PROJECT_CONTROL_LOOP: &str = "gateway_project_control";
 /// 与挣值本身的粒度同一量级：计划价值按「已过时间 / 计划总时长」连续折算，但一条
 /// 重规划改的是一整版基线，它不会因为早问了两分钟而不同。间隔只决定「这一版基线
 /// 多快被看到」，不决定造几条——去重键是基线版本。
-// cap: bound
+// cap: bound — 它只决定多快被看到，不决定造几条（去重键是基线版本）
 const CADENCE: Duration = Duration::from_secs(600);
 
 /// 起这条回路。`minter` 缺席时不跑：没有编排侧就没有图可以把活放进，跑起来也只

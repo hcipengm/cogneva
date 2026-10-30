@@ -39,7 +39,7 @@ const WRITE_FAILED_FACE: &str = "token 管理";
 /// the request path, but a store that is down for a minute fails every attempt
 /// of every caller anyway — the retries are for the transient case, and the
 /// alert is for the other one.
-// cap: bound
+// cap: bound — 落库失败的重试次数，界的是写丢失的概率与请求耗时的折中
 pub(crate) const WRITE_ATTEMPTS: u32 = 3;
 
 /// Whether a row has started failing to land, so that only the edges are acted
@@ -100,7 +100,7 @@ pub(crate) fn write_failed_message(attempts: u32, last_error: &str) -> String {
 /// A fifth of a second: long enough to ride out a connection reset, short
 /// enough that a store which is really down is declared in the same second
 /// rather than holding a task open behind it.
-// cap: bound
+// cap: bound — 指数退避的基数，第 n 次重试等 base*2^n
 const BACKOFF_BASE_MS: u64 = 200;
 
 /// How long to wait before the next attempt, by the attempt that just failed.

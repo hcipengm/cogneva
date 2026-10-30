@@ -173,14 +173,14 @@ pub async fn build_runs_handler(State(state): State<Arc<crate::GatewayState>>) -
 
 /// 这一面一次要多少行。窗口本身比较浅，这个数比窗口大，意思是「把整个窗口都给我」，
 /// 而不是「只要最新的这么多」。
-// cap: bound
+// cap: bound — 一次问多少行构建记录；界的是单次响应的体积，不是「只要最新的这么多」
 const BUILD_RUN_ROWS_ASKED: usize = 200;
 
 /// 演进事件流的保活间隔：15s。
 ///
 /// 流要穿过 ingress 与各种中间代理，它们的空闲上限普遍按 30s～60s 设；保活
 /// 比最短的那个更密，才不会被当成空闲连接掐掉。
-// cap: bound
+// cap: bound — 心跳要比最短的空闲判定更密，才不会被当成空闲连接掐掉
 const SSE_KEEP_ALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Return the current self-evolution counters from the D5 observable metrics.

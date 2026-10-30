@@ -336,10 +336,10 @@ impl cog_core::UserStore for InMemoryUserStore {
 
 /// Failed-login attempts allowed per identifier inside the window before
 /// the endpoint answers 429.
-// cap: bound
+// cap: bound — 同一来源在窗口内允许的登录失败次数，界的是暴力猜密码的成本
 pub const LOGIN_MAX_ATTEMPTS: u32 = 5;
 /// Sliding window (seconds) for failed-login counting.
-// cap: bound
+// cap: bound — 失败计数的滑动窗口长度，与上限配成一对
 pub const LOGIN_WINDOW_SECONDS: u64 = 300;
 
 /// Rate-limits failed login attempts per identifier.

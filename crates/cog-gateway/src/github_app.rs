@@ -20,16 +20,16 @@ use base64::Engine;
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
 /// App JWT 有效期：9 分钟（GitHub 硬上限 10 分钟）。
-// cap: derived
+// cap: derived — GitHub 的 App JWT 寿命上限是 10 分钟，这里取 9 分钟给它留余量
 const JWT_TTL_SECS: i64 = 9 * 60;
 /// 签发时间提前 60s，容忍网关与 GitHub 时钟偏差。
-// cap: bound
+// cap: bound — 签发时间往前推的量，容忍网关与 GitHub 之间的时钟偏差
 const JWT_CLOCK_SKEW_SECS: i64 = 60;
 /// installation token 在实际过期前留足刷新余量。
-// cap: bound
+// cap: bound — installation token 到期前提前刷新的余量，取两分钟
 const REFRESH_MARGIN_SECS: u64 = 120;
 /// 解析不到过期时间时的保守缓存时长（installation token 寿命约 1 小时）。
-// cap: derived
+// cap: derived — installation token 寿命约 1 小时；解析不到 expires_at 时按 50 分钟保守缓存
 const FALLBACK_TTL_SECS: u64 = 50 * 60;
 
 /// GitHub App 凭证（仅驻留网关内存，Debug 不打印私钥）。

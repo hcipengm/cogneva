@@ -319,7 +319,7 @@ const PROJECTS_PAGE_MAX: usize = 1000;
 /// 看板是给人挪的，不是给人数的：只回计数的话，界面画得出六列数字，画不出任何一张
 /// 能拖的卡，而「这一列有 37 个」在客户眼里等于「我不知道里面是什么」。上限之外
 /// 的张数由 `cards_hidden` 如实报出来——静默截断会让一列看起来正好装得下。
-// cap: bound
+// cap: bound — 一列最多画多少张卡；超出的张数由 cards_hidden 如实报出来，不静默截断
 const BOARD_CARDS_PER_COLUMN: usize = 100;
 
 /// 看板上的一张卡片。
@@ -1388,7 +1388,7 @@ pub struct WbsResponse {
 ///
 /// 真实的分解深度个位数；一个四千层的链只可能来自坏数据或有人手工造环，那时
 /// 递归会把网关的栈打穿——而栈溢出不是一个能被 `Result` 接住的错误。
-// cap: bound
+// cap: bound — 递归分解的深度上限；坏数据或手工造环会把网关的栈打穿，而栈溢出不是 Result 能接住的
 const WBS_DEPTH_CAP: usize = 256;
 
 /// 把一批任务折成一棵范围树。
@@ -1869,7 +1869,7 @@ pub(crate) fn build_project_task(
 
 /// 标题的上限。超了拒绝而不是截断：截断之后存下来的就不是用户写的那个名字，
 /// 而界面上没有任何地方会说它被改过。
-// cap: bound
+// cap: bound — 标题上限；超了拒绝而不是截断——截断之后存下的就不是用户写的那个名字
 pub(crate) const MAX_TITLE_CHARS: usize = 200;
 
 pub async fn create_project_task_handler(

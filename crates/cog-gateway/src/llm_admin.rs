@@ -35,14 +35,14 @@ const GATEWAY_DEPLOYMENT: &str = cog_core::topology::SECURITY_GATEWAY;
 /// 探测发的是一个最小 chat 请求，30s 覆盖跨区上游的建连加排队；等更久不会让
 /// 判定更准，只会让一次配置写入卡住管理端。超时在这里读作「能力未知」，与
 /// 探测失败同一个结局。
-// cap: bound
+// cap: bound — 探测上游可用性的单次预算，界的是「探测本身拖垮配置页」
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 协议形态探测（anthropic / openai 两种线格式）单次上限。
 ///
 /// 比能力探测紧，因为它要串着试两种形态，墙就是两倍；8s 是健康上游往返的
 /// 量级，超时读作「这一种不通」，直接换下一种。
-// cap: bound
+// cap: bound — 风格探针的预算，比连通探针短：它只问一句，慢就是不通
 const STYLE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[derive(Debug, Deserialize)]

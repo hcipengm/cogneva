@@ -606,7 +606,7 @@ pub async fn summary_search_handler(
 /// turn "list the namespace" into one read per id; the cap keeps a listing to a
 /// bounded number of reads and reports the untrimmed `total` so the caller can
 /// see it was a prefix.
-// cap: bound
+// cap: bound — 列原始记忆时没传 limit 的兜底条数；调用方能要更多，这是默认不是上限
 const DEFAULT_RAW_LIST_LIMIT: usize = 100;
 
 #[derive(Debug, Deserialize)]

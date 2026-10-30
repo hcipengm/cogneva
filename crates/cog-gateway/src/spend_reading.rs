@@ -19,7 +19,7 @@
 //! either a quiet day or a dead writer, and those call for opposite repairs.
 
 /// Seconds in a UTC day.
-// cap: bound
+// cap: derived — 一天的秒数与花销窗口的划分方式绑定，不是可调参数（日历定义）
 const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Start of the UTC day containing `now_unix`.
