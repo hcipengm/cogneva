@@ -31,5 +31,5 @@ use std::time::Duration;
 /// stays irrelevant, short enough that an alert window twice it — the smallest
 /// window one can reasonably hand to a rule — still sees a stamp from a writer
 /// that is alive.
-// cap: bound
+// cap: bound — 1800 是「永久沉默的序列」与「写者停了」还能分得开的那个点：长到让空闲部署的写代价无关紧要，短到一条两倍于它的告警窗仍看得到活着的写者
 pub const UNCHANGED_READING_HEARTBEAT: Duration = Duration::from_secs(1800);

@@ -1029,7 +1029,7 @@ pub trait VectorBackend: Send + Sync {
         /// The damping constant of reciprocal rank fusion as the literature defines it
         /// (k = 60): it holds the weight of the lowest ranks near the weight of the
         /// highest instead of letting one list's top hit decide the fusion.
-        // cap: bound
+        // cap: bound — 取的是 RRF 论文的 k = 60：它让最低那些名次的权重接近最高的，而不是让一张表的头名决定整次融合
         const RRF_K: f32 = 60.0;
         let mut fused_scores: std::collections::HashMap<String, f32> =
             std::collections::HashMap::new();
@@ -1313,7 +1313,7 @@ const DEFAULT_HOT_DURATION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 const DEFAULT_WARM_DURATION: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// 默认每小时扫一次分层：分层是按时间的判据，密到分钟级只会重复搬同一批对象。
-// cap: bound
+// cap: bound — 分层是按时间的判据，密到分钟级只会重复搬同一批对象
 const DEFAULT_TIER_SCAN_INTERVAL: Duration = Duration::from_secs(3600);
 
 impl Default for TierPolicy {

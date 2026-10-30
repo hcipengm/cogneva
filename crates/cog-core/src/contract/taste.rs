@@ -43,11 +43,11 @@ use uuid::Uuid;
 /// content. Submissions are interactive, so the bound is enforced by refusing
 /// the submission rather than by truncating it: a truncated rationale is a
 /// submitter's words with the reason removed, presented as if it were theirs.
-// cap: bound
+// cap: bound — 超了按整份退回而不是截断：截断的说明是提交者的原话被摘掉理由之后、还署着他们的名
 pub const TASTE_TEXT_MAX_CHARS: usize = 2_000;
 
 /// Longest a subject may be, in characters.
-// cap: bound
+// cap: bound — 主题字段的字符宽度上限；和正文那个界一样，界的是这个字段能装多少，不是提交说什么
 pub const TASTE_SUBJECT_MAX_CHARS: usize = 512;
 
 /// Most materials one submission may name.
@@ -56,14 +56,14 @@ pub const TASTE_SUBJECT_MAX_CHARS: usize = 512;
 /// long enough to be a corpus is a listing, and a listing belongs on the
 /// material side where it can be paged and read, not copied into every
 /// submission that mentions it.
-// cap: bound
+// cap: bound — 引用指向的材料留在能被分页读到的那一侧，不复制进每份提到它的提交
 pub const TASTE_EVIDENCE_MAX_REFS: usize = 32;
 
 /// Longest one evidence reference may be, in characters.
 ///
 /// Long enough for a URI with a query string, short enough that a submission
 /// cannot carry a document in the field that exists to point at one.
-// cap: bound
+// cap: bound — 够装一个带查询串的 URI，又短到一份提交不能在「指过去」的字段里夹带一份文档
 pub const TASTE_REFERENCE_MAX_CHARS: usize = 2_048;
 
 /// Whether `reference` cannot stand as a material reference, or `None` when it

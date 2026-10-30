@@ -94,12 +94,12 @@ use crate::SFResult;
 /// The term covers several asks, so a renewal lost to a slow query or a restart
 /// does not cost the holder its role, and the wait after a holder dies is
 /// bounded by the term plus one ask period.
-// cap: bound
+// cap: bound — 一次没问到的询问不会让持有者丢掉角色，而持有者死后的等待被「任期 + 一个询问周期」界住
 pub const ASK_PERIOD: Duration = Duration::from_secs(120);
 /// The span one acquisition covers: three ask periods, so a renewal lost to a
 /// slow query or a restart does not cost the holder its role, and the wait after
 /// a holder dies is bounded by this span plus one ask period.
-// cap: derived
+// cap: derived — 一次慢查询或一次重启不该让持有者丢掉角色，而持有者死后的等待被这一段加一个询问周期界住
 pub const TERM: Duration = Duration::from_secs(360);
 
 /// A term shorter than a few ask periods would expire between two cycles of a

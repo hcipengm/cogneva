@@ -444,7 +444,7 @@ pub struct PersistentAlertDraft {
 pub const ALERT_FACE_LABEL: &str = "cogneva_io_face";
 
 /// Longest an alert label value may be before it is truncated.
-// cap: bound
+// cap: bound — 告警标签值在被截之前最长能有多长；再长的部分读者认不出是同一件事
 pub const ALERT_LABEL_VALUE_MAX_CHARS: usize = 1024;
 
 /// Truncate on a character boundary and mark that it happened.

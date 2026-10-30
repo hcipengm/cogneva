@@ -126,7 +126,7 @@ pub const RETRY_AFTER_MARKER: &str = "[retry_after_secs=";
 /// The longest wait a reader will accept out of rendered text. Matches the
 /// ceiling the gateway's own circuit breaker puts on the interval it advertises,
 /// so a recovered wait cannot outlast the source that produced it.
-// cap: derived
+// cap: derived — 网关自己的熔断器给它公布的间隔也封在同一高度，所以恢复出来的等待不会长过产生它的源头
 pub const MAX_RECOVERED_RETRY_AFTER_SECS: u64 = 6 * 60 * 60;
 
 /// Render `secs` as the token [`retry_after_hint_in`] reads back.

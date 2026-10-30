@@ -337,12 +337,12 @@ pub struct DagExecutorConfig {
 /// block per consumer, short enough that a message reaches an idle consumer
 /// promptly. Every consumer holds its own connection, so this is a per-consumer
 /// quiet period, not a shared polling budget.
-// cap: bound
+// cap: bound — 每个消费者各持一条连接，所以这是每个消费者自己的静默期，不是共享的轮询预算
 pub const DEFAULT_REDIS_READ_BLOCK_MS: u64 = 5000;
 
 /// One second: the resume read is a drain, and the entries it is looking for
 /// are already in the stream.
-// cap: bound
+// cap: bound — 恢复读是一次排空，它要找的条目已经在流里
 pub const DEFAULT_REDIS_READ_RESUME_BLOCK_MS: u64 = 1000;
 
 fn default_redis_read_block_ms() -> u64 {
@@ -362,13 +362,13 @@ fn default_redis_read_resume_block_ms() -> u64 {
 /// address for **473 s** (measured, recorded as an ignored test beside the code
 /// that overrides it), during which the process reports no progress and looks
 /// wedged rather than degraded.
-// cap: bound
+// cap: bound — 超了之后进程报不出进展，看起来是卡住而不是降级
 pub const DEFAULT_REDIS_CONNECT_BUDGET_MS: u64 = 2_000;
 
 /// Retries within that budget. Kept low on purpose: the callers that can
 /// tolerate redis being away for a while already retry the whole operation, and
 /// they need the failure to come back to them rather than be absorbed here.
-// cap: bound
+// cap: bound — 本来就容忍 redis 短暂不在的调用方会重试整个操作；它们需要失败回到自己手上而不是被这里吞掉
 pub const DEFAULT_REDIS_CONNECT_RETRIES: usize = 2;
 
 /// How long one command on an established connection may wait for its reply.
@@ -379,16 +379,16 @@ pub const DEFAULT_REDIS_CONNECT_RETRIES: usize = 2;
 /// explicitly. Left unset, the wait is the kernel's, which is measured in
 /// minutes (ten minutes of silence on 2026-10-22, with nothing counted as a
 /// refusal because a hung read is not a refused one).
-// cap: bound
+// cap: bound — 2026-10-22 实测十分钟无声且没被记成一次拒绝，因为挂住的读不是被拒的读
 pub const DEFAULT_REDIS_RESPONSE_TIMEOUT_MS: u64 = 30_000;
 
 /// A budget below this would turn a momentary refusal into a permanent error.
-// cap: bound
+// cap: bound — 比它更小的预算会把一次瞬时拒绝变成永久错误
 pub const MIN_REDIS_CONNECT_BUDGET_MS: u64 = 100;
 
 /// A response timeout below this is not a bound, it is a race against the round
 /// trip.
-// cap: bound
+// cap: bound — 比它更小的应答超时不是界，是跟一个往返赛跑
 pub const MIN_REDIS_RESPONSE_TIMEOUT_MS: u64 = 100;
 
 /// How long a redis connection attempt may take, how many times it is retried,
@@ -480,7 +480,7 @@ impl RedisConnectBudget {
 /// judges it gone. Shorter values make a live process lose its own tasks to a
 /// slow tick; much longer ones put the orphan window back within reach of the
 /// replacement cadence this exists to stay ahead of.
-// cap: bound
+// cap: bound — 一拍慢是秒级；再长就把孤儿窗口推回到这个数要甩开的那个替换节拍里
 pub const DEFAULT_TASK_LEASE_SECS: u64 = 120;
 
 fn default_task_lease_secs() -> u64 {
@@ -497,7 +497,7 @@ fn default_task_lease_secs() -> u64 {
 /// keep compiling when one is edited, and the pair would then disagree by
 /// exactly the amount that makes the publisher publish a duplicate while the
 /// sweeper is still about to deliver the first copy.
-// cap: bound
+// cap: bound — 取的就是那个量：再多一点，发布方会在清扫者送出第一份之前先发布一份重复
 pub const DEFAULT_READY_CLAIM_IDLE_SECS: u64 = 600;
 
 impl Default for DagExecutorConfig {
@@ -553,7 +553,7 @@ pub struct PlatformWebhookConfig {
 /// Built-in access-token TTL when the config leaves it at 0. Both the JWT
 /// manager (cog-auth) and the HTTP handlers (expires_in responses) derive
 /// from this so the two never drift apart.
-// cap: bound
+// cap: bound — 认证管理器（cog-auth）与 HTTP 处理器（expires_in）都从这里派生，两处才不会走散
 pub const DEFAULT_ACCESS_TOKEN_TTL_MINUTES: u64 = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -655,11 +655,11 @@ impl GatewayConfig {
 
 /// Hourly wake-up. The access token lives 24h, so an hourly check leaves room
 /// for several failed attempts before the token actually lapses.
-// cap: bound
+// cap: bound — 访问令牌活 24h，每小时查一次留出几次失败尝试的余量
 pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_INTERVAL_SECS: u64 = 3600;
 /// Renew once under 4h of lifetime remain: enough for the token exchange, the
 /// Secret patch and the gateway roll to all land before expiry.
-// cap: bound
+// cap: bound — 剩不到 4h 就换：够令牌交换、Secret 改写与网关滚动都在到期前落完
 pub const DEFAULT_CONTRIBUTION_OAUTH_REFRESH_THRESHOLD_SECS: u64 = 4 * 3600;
 
 fn default_websocket_timeout_secs() -> u64 {

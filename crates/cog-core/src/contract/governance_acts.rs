@@ -53,7 +53,7 @@ pub const VOTE_INPUT_KEY: &str = "vote";
 /// signed, short enough that a signature nobody applied is visible inside the
 /// same working session. A signed handover that is never applied is the shape
 /// a change of responsibility takes when the change was only on paper.
-// cap: bound
+// cap: bound — 仍是同一个工作时段：一份签了却从未执行的交接，正是「责任变了但只在纸上」的形状
 pub const SIGNED_UNAPPLIED_LIMIT_SECS: i64 = 900;
 
 /// One signature on a handover.

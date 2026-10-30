@@ -450,11 +450,11 @@ pub fn judge_delivery(delivered: Option<&str>, declared: &str) -> DocumentDelive
 /// Bounded on characters rather than on the number of names: a list budget
 /// multiplies by the length of the names, and section or rule names come from
 /// the document rather than from this code.
-// cap: bound
+// cap: bound — 消息总长会乘以名字的个数，而节名与规则名来自那份文档而不是这段代码
 const MAX_MESSAGE_CHARS: usize = 600;
 
 /// Names per list before the rest are counted instead of spelled out.
-// cap: bound
+// cap: bound — 一个列表里点名几个，其余按计数显示
 const MAX_NAMES_PER_LIST: usize = 6;
 
 /// Say what was delivered, for the alert row and the log.

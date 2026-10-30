@@ -42,7 +42,7 @@ pub const BUILD_TARGET_REWRITE_WINDOW_METRIC: &str = "cogneva_build_target_rewri
 /// after the next build had started. This is also the span the readings taken by
 /// hand off the host used, so a number read here is comparable with the ones
 /// already on record.
-// cap: bound
+// cap: bound — 一小时：值得归因的构建跑几十分钟，更短会把一次构建显示成一串小的，更长会把已完的抖动留在读数里；也是手工读这台机用的那个跨度
 pub const REWRITE_WINDOW_SECS: u64 = 3600;
 
 /// The cap the cache is held to, in bytes. Published only when one is set.
@@ -154,7 +154,7 @@ pub const OTHER_LAYER: &str = "other";
 /// Two: one level is a cargo profile (`debug`, `release`), which says nothing
 /// about what can be dropped, and cargo keeps its own division one level below
 /// that (`deps`, `incremental`, `build`, `.fingerprint`, `examples`).
-// cap: bound
+// cap: bound — 两层：一层是 cargo profile（debug/release），说不清什么能丢，而 cargo 自己把划分放在再下一层
 pub const CACHE_LAYER_DEPTH: usize = 2;
 
 /// How many layers get a series of their own.
@@ -165,13 +165,13 @@ pub const CACHE_LAYER_DEPTH: usize = 2;
 /// act on keep their names, the rest sum into [`OTHER_LAYER`] so the total stays
 /// exact, and a reader sees the fold as that series growing. Cargo's own layout
 /// is well under this, so in practice nothing is folded.
-// cap: bound
+// cap: bound — 界在发布侧、按大小折：读者真要动手的那几层保住名字，其余并进 OTHER_LAYER，总数仍精确；cargo 自己的布局远低于它
 pub const MAX_PUBLISHED_LAYERS: usize = 12;
 
 /// Fastest the cache may be re-walked at. The walk is metadata-only, but it
 /// walks a tree with hundreds of thousands of entries on a host that is also
 /// building, so it holds no value being fresher than minutes.
-// cap: bound
+// cap: bound — 只走元数据，但走的是几十万条目的树、而且这台机同时在构建，比分钟更鲜没有价值
 pub const MIN_SCAN_INTERVAL_SECS: u64 = 60;
 
 /// Bytes a build cache may hold when the deployment names no cap of its own.
@@ -183,7 +183,7 @@ pub const MIN_SCAN_INTERVAL_SECS: u64 = 60;
 /// publisher that keeps a cache in this shape reads the number from here
 /// instead of carrying a copy that can drift; an explicitly configured value
 /// still overrides it, including `0`, which keeps the measure-only behaviour.
-// cap: bound
+// cap: bound — 总量减去实测的共同租户（CARGO_HOME、裸仓、每任务 worktree、host-docs 日志）之后剩下的那部分；同形状的发布者都从这里读，而不是各留一份会漂的副本
 pub const DEFAULT_CACHE_MAX_BYTES: u64 = 3_221_225_472;
 
 /// The layers to publish, largest first, with everything past
