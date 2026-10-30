@@ -4017,16 +4017,6 @@ fn a_cell_no_producer_writes_is_reported_and_one_that_exists_is_not() {
     .is_empty());
 }
 
-/// Every string literal a producer writes: the production sources of every
-/// crate, and the file PRODUCED names for a family produced outside one.
-///
-/// The rule files are not producers, so they are not in here — the chart's
-/// rules are config the chart renders, and their rendered copies under
-/// `deploy/rendered/` carry the same bytes. Indexing anything a rule is written
-/// in would let every cell license itself: the rule that selects a value would
-/// be the one place writing it, and the check would never once have an answer
-/// other than yes.
-
 /// FOREIGN is an allow-list, and the one thing an allow-list must never name is
 /// something this workspace publishes.
 ///
