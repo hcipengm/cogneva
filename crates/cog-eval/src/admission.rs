@@ -17,6 +17,10 @@
 //!   24C／62.7 GiB）。数值和它的来源写在各常量的注释里；改动它们之前先重跑那份测量。
 //!   地板与绿灯内存线是**两个量**，各有来源，不许再写成「地板的倍数」——那是把两条
 //!   各自可测的约束拴成一个，抬一侧会静默关死另一侧。
+//! - 内存那两条线是**份额**（占本机 MemTotal 的 70% 与 74%），不是量出来的那两个字节数：
+//!   字节数只在那台实测 62.7 GiB 的机器上成立，例如换成 32 GiB 的机器就一条永远红、一条永远
+//!   绿不起来。真机 MemTotal 由 [`host_memory_lines`] 读出来，读不到就没有这两条线——
+//!   此时内存不会判红，也不会判绿。
 //!
 //! 只有一个进程能当控制器：两个控制器会互相把界推来推去，读数上还分不出是谁写的。
 //! 选主是同一个目录里一个文件的 flock——持锁者即控制器，进程死了 fd 关闭自动释放，
@@ -52,23 +56,47 @@ pub const PSI_RED_AVG10: f64 = 20.0;
 /// 53.8%–56.7% 之间动（一到三个百分点）。别把它当主要调节手段。
 // cap: derived — 7d 实测 worst_avg60 的第 67 分位；同上，来自一次量过的分布
 pub const PSI_GREEN_AVG60: f64 = 5.0;
-/// 可用内存的地板，低于它减半。
+/// 可用内存的两条线，按这台宿主的 MemTotal 折算出来的字节数。
 ///
-/// 实测：7d MemAvailable 谷底 36.46 GiB、p5 46.4 GiB。地板要「有牙齿」——逐档量
-/// 「内存是唯一决定者的分钟」：≤42 GiB 一周内一次都不是它决定的（PSI 先红），
-/// 44 GiB 才出现 2 分钟、48 GiB 22 分钟。取最小的有点的那一档。
-// cap: derived — 7d MemAvailable 的 p5 与谷底之间取的地板，替这台宿主留出余量
-pub const MEM_FLOOR_BYTES: u64 = 44 * 1024 * 1024 * 1024;
-/// 绿灯的可用内存线：高于它才加一。
+/// 它们是**份额**，不是字节数：7d 实测的那台宿主 MemTotal 62.7 GiB、地板 44 GiB、
+/// MemAvailable p5 实测 46.4 GiB，折成份额是 70% 与 74%。写死字节数只在量过的那台机器上
+/// 成立——例如 32 GiB 的宿主上 44 GiB 的地板高过整机（永远红），46.4 GiB 的绿灯线也永远
+/// 够不着；换成份额，同一个「宿主还剩多少可用内存才算有余量」的意思在任何大小的机器
+/// 上都成立，也不需要谁去重新量一遍。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryLines {
+    pub floor_bytes: u64,
+    pub green_bytes: u64,
+}
+
+/// 有牙齿的地板占实测宿主 MemTotal 的份额（44 GiB / 62.7 GiB）。
+// cap: derived — 7d 实测：44 GiB 地板 / 62.7 GiB MemTotal
+const MEM_FLOOR_PERCENT: u64 = 70;
+/// 绿灯线占实测宿主 MemTotal 的份额（46.4 GiB / 62.7 GiB）。
 ///
-/// 它与地板是两个量，各有实测来源。取 7d 分布的 p5（46.4 GiB）向下取整：绿灯只排除
-/// 最干的 5% 分钟，同时与 44 GiB 地板之间留下约 2.4 GiB 的回滞带，界不会在地板附近
-/// 抖着加一减半。
-// cap: derived — 7d MemAvailable 的 p5 向下取整：绿灯只排除实测里确实出现过的那部分
-pub const MEM_GREEN_MIN_BYTES: u64 = 46 * 1024 * 1024 * 1024;
-/// 编译期不变式：绿灯线高于地板才留得出回滞带。把绿灯写回「地板的倍数」会先撞
-/// 这里，而不是等到宿主上永远不加一才发现。
-const _: () = assert!(MEM_GREEN_MIN_BYTES > MEM_FLOOR_BYTES);
+/// 它比地板高出的那 4 个点就是回滞带：绿灯只排除实测里最干的那部分分钟，界不会在
+/// 地板附近抖着加一减半。两条线各有来源，不是「地板的倍数」——把绿灯写回地板乘二，
+/// 抬一侧会静默关死另一侧。
+// cap: derived — 7d 实测：46.4 GiB（MemAvailable p5）/ 62.7 GiB MemTotal
+const MEM_GREEN_PERCENT: u64 = 74;
+
+/// 这台宿主的两条内存线。`total_bytes` 是 `/proc/meminfo` 的 MemTotal。
+pub fn memory_lines(total_bytes: u64) -> MemoryLines {
+    MemoryLines {
+        floor_bytes: total_bytes / 100 * MEM_FLOOR_PERCENT,
+        green_bytes: total_bytes / 100 * MEM_GREEN_PERCENT,
+    }
+}
+
+/// 这台宿主的 MemTotal，读不出来就没有这两条线。
+///
+/// 读不出来时不退回任何写死的字节数：一份关于别台机器内存的读数，比没有读数更糟。
+pub fn host_memory_lines() -> Option<MemoryLines> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let line = text.lines().find(|l| l.starts_with("MemTotal:"))?;
+    let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+    (kb > 0).then(|| memory_lines(kb * 1024))
+}
 /// 判定「这一例偏慢」的倍数：比自己的历史中位数慢这么多倍才算红灯。
 ///
 /// 它是个比例而不是一个时间：一道题该跑多久取决于这道题，闸门不知道。所以这条灯只能
@@ -120,19 +148,21 @@ impl std::fmt::Debug for Admission {
 /// 一个 bool：`None` ＝四项全不红。四条路各是一个不同的追查方向——PSI 说机器忙、
 /// MemAvailable 说内存快没了、构建槽说对方正在占机器、自身延迟说这一例比自己的历史慢
 /// 得多——合成一句「压力大」就等于把三种因说成了一个。
-pub fn red_light(p: &Pressure, latency_red: bool) -> Option<String> {
+pub fn red_light(p: &Pressure, latency_red: bool, memory: Option<MemoryLines>) -> Option<String> {
     let (which, value) = p.worst_avg10();
     if value > PSI_RED_AVG10 {
         return Some(format!(
             "{which} is at {value:.2}% stalled over the last 10s, past the {PSI_RED_AVG10:.0}% line"
         ));
     }
-    if p.mem_available_bytes < MEM_FLOOR_BYTES {
-        return Some(format!(
-            "MemAvailable is {:.1}GiB, under the {:.1}GiB floor",
-            p.mem_available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            MEM_FLOOR_BYTES as f64 / (1024.0 * 1024.0 * 1024.0),
-        ));
+    if let Some(lines) = memory {
+        if p.mem_available_bytes < lines.floor_bytes {
+            return Some(format!(
+                "MemAvailable is {:.1}GiB, under the {:.1}GiB floor",
+                p.mem_available_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                lines.floor_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            ));
+        }
     }
     if p.builds_in_flight > 0 {
         return Some(format!(
@@ -160,20 +190,23 @@ pub fn decide(
     ceiling: usize,
     pressure: Option<&Pressure>,
     latency_red: bool,
+    memory: Option<MemoryLines>,
 ) -> (usize, Action) {
     let Some(p) = pressure else {
         // 读不出压力就不动界：把「读不出」当成「没压力」会一路加到底，而那是这张表
         // 唯一一个「因为我们没看见所以放大」的方向。
         return (bound, Action::None);
     };
-    if red_light(p, latency_red).is_some() {
+    if red_light(p, latency_red, memory).is_some() {
         let next = (bound / 2).max(floor);
         if next == bound {
             return (bound, Action::AtFloor);
         }
         return (next, Action::Decreased);
     }
-    let green = p.worst_avg60() < PSI_GREEN_AVG60 && p.mem_available_bytes > MEM_GREEN_MIN_BYTES;
+    // 内存线读不出来时不算绿：绿灯要的是「有证据说还有余量」，而不是「没有证据说没有」。
+    let green = p.worst_avg60() < PSI_GREEN_AVG60
+        && memory.is_some_and(|lines| p.mem_available_bytes > lines.green_bytes);
     if green {
         if bound >= ceiling {
             return (bound, Action::AtCeiling);
@@ -269,6 +302,7 @@ pub fn open(cfg: &AdmissionConfig) -> Result<Arc<Admission>, String> {
             dir,
             floor,
             ceiling,
+            memory: host_memory_lines(),
             window: cfg.window,
             is_controller,
             notify: Notify::new(),
@@ -297,6 +331,8 @@ struct Inner {
     dir: PathBuf,
     floor: usize,
     ceiling: usize,
+    /// 这台宿主的两条内存线，开闸门时读一次（MemTotal 在一个 boot 内不变）。
+    memory: Option<MemoryLines>,
     window: Duration,
     is_controller: bool,
     notify: Notify,
@@ -416,13 +452,16 @@ impl Inner {
         }
         let pressure = sample(&self.dir);
         let latency_red = latency_is_red(&gate.latencies);
-        let red = pressure.as_ref().and_then(|p| red_light(p, latency_red));
+        let red = pressure
+            .as_ref()
+            .and_then(|p| red_light(p, latency_red, self.memory));
         let (next, action) = decide(
             gate.bound,
             self.floor,
             self.ceiling,
             pressure.as_ref(),
             latency_red,
+            self.memory,
         );
         gate.pressure = pressure;
         gate.red = red;
@@ -542,12 +581,24 @@ mod tests {
 
     const GB: u64 = 1024 * 1024 * 1024;
 
+    /// 量过的那台宿主的两条线：MemTotal 实测 62.7 GiB 折出来的 44 GiB 地板与 46 GiB 绿灯线
+    /// （62.7 × 70% ≈ 43.9、× 74% ≈ 46.4，都向下取整到整吉）。
+    fn lines() -> Option<MemoryLines> {
+        Some(memory_lines(62 * GB + 700 * 1024 * 1024))
+    }
+
     #[test]
     fn a_red_light_halves_the_bound_and_a_green_one_raises_it_by_one() {
         let busy = pressure(30.0, 40.0, 8 * GB, 0);
-        assert_eq!(decide(4, 1, 8, Some(&busy), false), (2, Action::Decreased));
+        assert_eq!(
+            decide(4, 1, 8, Some(&busy), false, lines()),
+            (2, Action::Decreased)
+        );
         let calm = pressure(0.1, 0.2, 50 * GB, 0);
-        assert_eq!(decide(4, 1, 8, Some(&calm), false), (5, Action::Increased));
+        assert_eq!(
+            decide(4, 1, 8, Some(&calm), false, lines()),
+            (5, Action::Increased)
+        );
     }
 
     #[test]
@@ -556,7 +607,7 @@ mod tests {
         // 时刻上，所以它自己就是一条红灯。
         let with_build = pressure(0.0, 0.0, 50 * GB, 1);
         assert_eq!(
-            decide(4, 1, 8, Some(&with_build), false),
+            decide(4, 1, 8, Some(&with_build), false, lines()),
             (2, Action::Decreased)
         );
     }
@@ -564,16 +615,22 @@ mod tests {
     #[test]
     fn the_bound_never_leaves_its_range() {
         let busy = pressure(90.0, 90.0, GB, 3);
-        assert_eq!(decide(1, 1, 8, Some(&busy), true), (1, Action::AtFloor));
+        assert_eq!(
+            decide(1, 1, 8, Some(&busy), true, lines()),
+            (1, Action::AtFloor)
+        );
         let calm = pressure(0.0, 0.0, 50 * GB, 0);
-        assert_eq!(decide(8, 1, 8, Some(&calm), false), (8, Action::AtCeiling));
+        assert_eq!(
+            decide(8, 1, 8, Some(&calm), false, lines()),
+            (8, Action::AtCeiling)
+        );
     }
 
     #[test]
     fn no_pressure_reading_does_not_move_the_bound() {
         // 读不出压力就不动：把「读不出」当成「没压力」是这张表唯一一个越看不见越放大的
         // 方向。
-        assert_eq!(decide(4, 1, 8, None, false), (4, Action::None));
+        assert_eq!(decide(4, 1, 8, None, false, lines()), (4, Action::None));
     }
 
     #[test]
@@ -658,29 +715,61 @@ mod tests {
             io_avg10: 31.0,
             ..pressure(0.0, 0.0, 8 * GB, 0)
         };
-        let why = red_light(&busy, false).unwrap();
+        let why = red_light(&busy, false, lines()).unwrap();
         assert!(why.contains("io") && why.contains("31.00"), "{why}");
         let low_mem = pressure(0.0, 0.0, GB, 0);
-        assert!(red_light(&low_mem, false).unwrap().contains("MemAvailable"));
+        assert!(red_light(&low_mem, false, lines())
+            .unwrap()
+            .contains("MemAvailable"));
         let building = pressure(0.0, 0.0, 50 * GB, 2);
-        assert!(red_light(&building, false).unwrap().contains("build slot"));
-        assert!(red_light(&pressure(0.0, 0.0, 50 * GB, 0), true)
+        assert!(red_light(&building, false, lines())
+            .unwrap()
+            .contains("build slot"));
+        assert!(red_light(&pressure(0.0, 0.0, 50 * GB, 0), true, lines())
             .unwrap()
             .contains("median"));
-        assert!(red_light(&pressure(0.0, 0.0, 50 * GB, 0), false).is_none());
+        assert!(red_light(&pressure(0.0, 0.0, 50 * GB, 0), false, lines()).is_none());
     }
 
-    /// 内存的那两条线是**两个实测值**，不是一个数的两倍。
+    /// 两条内存线在量过的那台宿主上还原成实测的那两个字节数。
     ///
-    /// 7d 实测：宿主 MemTotal 62.7 GiB、MemAvailable p5 46.4 GiB、谷底 36.46 GiB。
-    /// 若把绿灯写回 `floor * 2`，地板抬到有牙齿的 44 GiB 就会要求 `mem > 88 GiB`，
-    /// 超过 MemTotal ⇒ 绿灯永不成立，而改动看起来只是「把地板换成实测值」。
+    /// 7d 实测：宿主 MemTotal 62.7 GiB、地板 44 GiB、MemAvailable p5 46.4 GiB。份额
+    /// 70%／74% 是这两个数折出来的，所以在这台机器上必须落回原处——否则「换机自动缩放」
+    /// 就是给一次重新拍数打掩护。
     #[test]
-    fn the_green_memory_line_fits_under_the_host_that_was_measured() {
-        let host_total_bytes = 62 * GB; // 62.7 GiB 向下取整，实测值
+    fn the_measured_host_gets_the_two_lines_that_were_measured_on_it() {
+        let measured_host_total = 62 * GB + 700 * 1024 * 1024; // 62.7 GiB
+        let l = memory_lines(measured_host_total);
+        let gib = |bytes: u64| bytes as f64 / GB as f64;
         assert!(
-            MEM_GREEN_MIN_BYTES < host_total_bytes,
-            "绿灯线高过宿主内存就永远不会亮"
+            (gib(l.floor_bytes) - 44.0).abs() < 0.3,
+            "44 GiB 地板，实得 {:.2} GiB",
+            gib(l.floor_bytes)
+        );
+        assert!(
+            (gib(l.green_bytes) - 46.4).abs() < 0.05,
+            "46.4 GiB 绿灯线，实得 {:.2} GiB",
+            gib(l.green_bytes)
+        );
+    }
+
+    /// 换一台小机器，两条线跟着机器走，而不是高过整机。
+    ///
+    /// 写死 44／46 GiB 时：例如 32 GiB 的宿主上地板高过 MemTotal，内存这条红灯永远亮着；
+    /// 绿灯线也永远够不着。份额没有这个问题。
+    #[test]
+    fn a_smaller_host_gets_lines_it_can_actually_reach() {
+        let small = memory_lines(32 * GB);
+        assert!(small.floor_bytes < 32 * GB, "地板不该高过整机");
+        assert!(small.green_bytes < 32 * GB, "绿灯线不该高过整机");
+        let calm = pressure(0.0, 0.0, 24 * GB, 0);
+        assert!(
+            red_light(&calm, false, Some(small)).is_none(),
+            "32 GiB 的宿主上 24 GiB 可用不是红灯"
+        );
+        assert_eq!(
+            decide(4, 1, 8, Some(&calm), false, Some(small)),
+            (5, Action::Increased)
         );
     }
 
@@ -688,8 +777,28 @@ mod tests {
     #[test]
     fn memory_between_the_floor_and_the_green_line_holds() {
         let band = pressure(0.0, 0.0, 45 * GB, 0);
-        assert!(red_light(&band, false).is_none(), "45 GiB 高过 44 GiB 地板");
-        assert_eq!(decide(4, 1, 8, Some(&band), false), (4, Action::Held));
+        assert!(
+            red_light(&band, false, lines()).is_none(),
+            "45 GiB 高过 43.9 GiB 地板"
+        );
+        assert_eq!(
+            decide(4, 1, 8, Some(&band), false, lines()),
+            (4, Action::Held)
+        );
+    }
+
+    /// 读不出本机内存就没有这两条线：内存既不判红，也不判绿。
+    ///
+    /// 不退回写死的字节数——那是把别台机器的读数当成这台机器的。
+    #[test]
+    fn without_a_memory_reading_the_memory_line_is_silent_and_not_green() {
+        let calm = pressure(0.0, 0.0, 1 * GB, 0);
+        assert!(red_light(&calm, false, None).is_none(), "无读数不判红");
+        assert_eq!(
+            decide(4, 1, 8, Some(&calm), false, None),
+            (4, Action::Held),
+            "无读数也不判绿：绿灯要的是有证据，不是没有证据"
+        );
     }
 
     #[test]
