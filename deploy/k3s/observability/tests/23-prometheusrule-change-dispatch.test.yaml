@@ -362,3 +362,45 @@ tests:
       - eval_time: 12h
         alertname: CognevaLlmPoolNoDeclaredReturn
         exp_alerts: []
+
+  # 八、唯一的上游是 `entitlement` 拒的，而它带着一个未来的重置时刻：必须**响**。
+  # 这一格钉的是「说得出什么时候恢复」这句话的取法。重置时刻只是额度窗的尽头，而
+  # `entitlement` 说的是这个账号本来就没有这项权限——窗口转过去也不会多出权限来，能结束
+  # 它的只有换一次凭证。只看「重置时刻在不在未来」的写法在这一格里会静下去，把「等」和
+  # 「必须有人动」报成同一句话，而这两种的修法相反。
+  #
+  # 现网 2026-10-30 就是这个形状的两端分开摆着：五个上游全不可用，其中两个是
+  # `entitlement`、两个是重置时刻为 0 的 `quota_cycle`，只有一个声明了五天后恢复。
+  # 那一格按第五格的口径静默是对的（确实有一个等得到），但「等得到」不能由 `entitlement`
+  # 那个来提供。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_available{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0x200'
+      - series: 'llm_pool_available_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway"}'
+        values: '0+60x200'
+      - series: 'llm_upstream_healthy{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0x200'
+      - series: 'llm_upstream_healthy_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x200'
+      - series: 'llm_upstream_quota_reset_unix{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '1793807999x200'
+      - series: 'llm_upstream_quota_reset_unix_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1"}'
+        values: '0+60x200'
+      - series: 'llm_upstream_refusal_kind{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1",kind="entitlement"}'
+        values: '1x200'
+      - series: 'llm_upstream_refusal_kind{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1",kind="quota_cycle"}'
+        values: '0x200'
+      - series: 'llm_upstream_refusal_kind_observed_timestamp_seconds{instance="10.42.0.140:9090",job="cogneva-security-gateway",upstream="u1",kind="entitlement"}'
+        values: '0+60x200'
+    alert_rule_test:
+      - eval_time: 59m
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts: []
+      - eval_time: 61m
+        alertname: CognevaLlmPoolNoDeclaredReturn
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"

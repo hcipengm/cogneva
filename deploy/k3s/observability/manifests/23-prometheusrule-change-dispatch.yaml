@@ -102,6 +102,20 @@ spec:
         #
         # 值取的是「不可用的上游有几个」：左式是那个计数，`and`/`unless` 都保留左式的值，
         # 所以 `{{ $value }}` 是数得出来的那个数，读者不用再查一次。
+        #
+        # 两处 `unless on()` 判的是**全称**，不是差集，别把它读成「减掉几个」：
+        #
+        #   - 外面那一处：两边都聚成了空标签的单个样本，`unless` 按标签集相消，所以左式
+        #     被丢掉的条件是「右式非空」——一个能等的上游就够，与两个数谁大无关。这正是
+        #     「没有一个说得出什么时候恢复」那句话，也只有这个写法才配得上 `{{ $value }}`
+        #     是左式那个计数（成对夹具第五格钉的就是它：一个能等 + 一个说不出必须静）。
+        #     换成「先把没声明未来时刻的数出来、大于零就响」就成了存在量词，第一格和第五格
+        #     的答案会同时翻过来。
+        #   - 里面那一处：`entitlement` 的那个上游从「能等」这一侧里剔掉。重置时刻只说了
+        #     额度窗什么时候翻页，而 `entitlement` 说的是这个账号本来就没有这项权限——窗
+        #     翻过去也不会多出权限来，能结束它的只有换一次凭证。不剔的话，一个带着未来重置
+        #     时刻的 `entitlement` 上游会替整池顶下这句话，把「等」和「必须有人动」报成
+        #     同一句；两种的修法相反，所以它们不能互相顶替（成对夹具第八格钉这一处）。
         - alert: CognevaLlmPoolNoDeclaredReturn
           expr: |
             count(min by (upstream) (llm_upstream_healthy) == 0)
@@ -114,6 +128,8 @@ spec:
                   (max by (upstream) (llm_upstream_quota_reset_unix) > time())
                 and on(upstream)
                   (min by (upstream) (llm_upstream_healthy) == 0)
+                unless on(upstream)
+                  (max by (upstream) (llm_upstream_refusal_kind{kind="entitlement"}) == 1)
               )
           for: 1h
           labels:
