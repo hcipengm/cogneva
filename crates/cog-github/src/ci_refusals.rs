@@ -50,7 +50,7 @@ const FAILURE_MARKERS: [&str; 2] = ["panicked at ", "--> "];
 /// Measured on the failing revisions this was written against: two and three
 /// `crates/**/*.rs` paths named per run, with the rest of the log's path-like
 /// text being files outside the repository.
-// cap: bound
+// cap: bound — 一次运行里真正改了 crates/**/*.rs 的路径只有十几条，日志里其余像路径的文本是仓外的文件
 const MAX_FILES_READ: usize = 16;
 
 /// The repository-relative Rust sources a job's log names as a failure site.

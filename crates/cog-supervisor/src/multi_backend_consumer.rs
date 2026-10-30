@@ -8,7 +8,7 @@ use tokio::sync::broadcast;
 ///
 /// 与就绪队列、事件流同一个节拍：后端要么回来要么不回来，更快的重试只会在
 /// 集群已经不健康时成倍放大告警。
-// cap: bound
+// cap: bound — 与就绪队列、事件流同一个节拍：后端要么回来要么不回来，更快的重试只在集群已经不健康时成倍放大告警
 const SUBSCRIBE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Consumes AgentEvents from multiple message backends with automatic fallback.

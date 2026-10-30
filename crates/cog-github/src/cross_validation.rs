@@ -167,7 +167,7 @@ pub const CROSS_VALIDATE_TASK_KIND: &str = "pr_cross_validate";
 
 /// Cap on a PR diff fed into the task payload; larger PRs are skipped rather
 /// than blowing the task input.
-// cap: bound
+// cap: bound — 更大的 PR 是跳过而不是硬塞：塞进去只会把任务的输入撑破
 pub const MAX_CV_DIFF_BYTES: usize = 512 * 1024;
 
 /// One in-flight cross-validation task for a PR.

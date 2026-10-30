@@ -1913,7 +1913,7 @@ async fn redrive(
 /// 25 characters, plus the 50 a goal's first line may occupy. A shorter cap
 /// would clip titles that followed the convention, which reads as the
 /// convention not being honoured.
-// cap: bound
+// cap: bound — 照约定写的标题要整句留在主题里；再收就会裁掉守约定的那些，读起来像约定没被执行
 const SUBJECT_LIMIT: usize = 76;
 
 /// Commit message for a landed change: what it does, why, and the trailer the

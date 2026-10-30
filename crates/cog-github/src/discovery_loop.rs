@@ -30,14 +30,14 @@ pub const DISCOVERY_ROLE: &str = "issue_discovery";
 
 /// DAG-side timeout for a single assess task (must exceed the wait budget
 /// below so the poller gives up around the same time the task would be killed).
-// cap: bound
+// cap: bound — 必须长于下面的等待预算，这样轮询放弃与任务被杀几乎同时发生
 const ASSESS_TASK_TIMEOUT_SECS: u64 = 120;
 /// How long the discovery loop blocks waiting for an assess verdict before it
 /// gives up and falls back to the local heuristic this round.
-// cap: bound
+// cap: bound — 等这么久拿不到判词就落回本地启发式，这一轮不再等下去
 const ASSESS_WAIT_TIMEOUT_SECS: u64 = 100;
 /// Poll interval while waiting for the assess task to complete.
-// cap: bound
+// cap: bound — 等待期间多久问一次
 const ASSESS_POLL_INTERVAL_MS: u64 = 500;
 /// Judgement-logic epoch mixed into the assess task id hash. Bump it when the
 /// judge prompt/logic changes, or after a bulk queue reset, to force one
@@ -45,18 +45,18 @@ const ASSESS_POLL_INTERVAL_MS: u64 = 500;
 /// existing task (and its verdict) instead of paying for a duplicate.
 const ASSESS_JUDGE_EPOCH: &str = "v3";
 /// Maximum cross-validation tasks running concurrently for this instance.
-// cap: bound
+// cap: bound — 这个实例同时能跑几条交叉验证
 const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
 /// DAG-side timeout for one cross-validation task (apply + workspace tests +
 /// optional eval A/B in the sandbox).
-// cap: bound
+// cap: bound — 一条交叉验证要应用补丁、跑工作区测试、可选在沙箱里做 A/B 评测，所以按小时计
 const CROSS_VALIDATE_TASK_TIMEOUT_SECS: u64 = 3600;
 /// Upper bound of the per-intent exponential backoff after terminal
 /// (deterministic) upstream failures. Quota/billing windows reset on a
 /// day scale; probing more often than this cap only adds failed attempts
 /// without speeding recovery. Six hours bounds the post-reset recovery
 /// lag while keeping probe cost at one failed call per intent per window.
-// cap: bound
+// cap: bound — 六小时界住重置之后的恢复滞后，同时让探测成本停在「每个意图每窗一次失败的调用」
 const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 /// How long a finished attempt keeps its intent answered, counted from the
 /// round that saw it finish rather than from the row that carried it.
@@ -77,7 +77,7 @@ const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 /// broken issue is re-examined at most once per working day or so, and long
 /// enough to sit out a quota window that kept the attempt from being a real
 /// test of the fix.
-// cap: bound
+// cap: bound — 要长过一个曾让那次尝试不构成真正验证的配额窗
 const ANSWERED_GRACE_SECS: u64 = 48 * 60 * 60;
 
 /// Whether a failed processing attempt is deterministic: retrying the same
@@ -509,7 +509,7 @@ fn intent_verdict_prefix(task_id: &str) -> Option<String> {
 /// listing that returns exactly this many entries may be truncated, so
 /// reaping requires a count below the cap on both surfaces to treat the open
 /// set as provably complete.
-// cap: bound
+// cap: bound — 两个面都要数到低于这个界，才能把开放集当作可证完整
 const PROVIDER_LIST_PAGE_SIZE: usize = 100;
 
 fn listings_complete(issue_count: usize, pr_count: usize) -> bool {
@@ -2455,7 +2455,7 @@ pub(crate) fn assess_acceptance(task_id: &str) -> String {
 /// The first pass after this ships has a few dozen rows to reach and runs on a
 /// round that is also polling two platforms; a batch bounds the burst, not the
 /// work.
-// cap: bound
+// cap: bound — 这一轮同时在轮询两个平台；一批界的是突发不是工作量
 const CRITERIA_SETTLE_BATCH: usize = 400;
 
 /// What one back-fill pass did.

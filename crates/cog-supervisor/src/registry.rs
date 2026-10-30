@@ -14,7 +14,7 @@ use crate::error::{SupervisorError, SupervisorResult};
 /// [`AgentRegistry::check_expired`]. Aligns with the default TTL used by
 /// Redis and etcd agent registries (30 seconds) so the Supervisor's view
 /// of liveness matches the Agent's self-registered TTL.
-// cap: bound
+// cap: bound — 与 Agent 自注册的 TTL 同值，否则 Supervisor 眼里的存活与 Agent 自己声明的对不上
 pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = 30;
 
 /// The role a unit takes when it writes its presence from outside the platform.
