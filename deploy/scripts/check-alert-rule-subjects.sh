@@ -374,6 +374,7 @@ NO_POD_REPORTER = {
     'CognevaHostTargetGcScriptUnverified': 'cogneva_host_target_gc_script_committed',
     'CognevaHostTargetGcProbeFailed': 'cogneva_host_target_gc_outcome{outcome="probe_failed"}',
     'CognevaHostTargetGcFloorUnreachable': 'cogneva_host_target_gc_outcome{outcome="floor_unreachable"}',
+    'CognevaHostTargetGcLockedOutByBuilders': 'cogneva_host_target_gc_left_alone',
     # NVMe 那一族读的是同一台宿主上的盘，走同一条 host-readings 抓取通道（Node 角色，
     # 抓取面上没有 pod/container）。它们的身份由规则名与盘区分：`device` 是身份的一半，
     # 保留它是必须的（一块盘磨到界与另一块无关，两块都要报），而报信的从来不是 Pod——

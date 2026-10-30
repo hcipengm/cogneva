@@ -177,3 +177,50 @@ tests:
               severity: warning
               cogneva_io_managed: "true"
               cogneva_io_face: 资源泄漏与长稳
+
+  - name: 连续六小时每一趟都被构建挡住会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_left_alone{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '2x400'
+    alert_rule_test:
+      - eval_time: 6h
+        alertname: CognevaHostTargetGcLockedOutByBuilders
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 资源泄漏与长稳
+
+  - name: 被挡住但还没满六小时不响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_left_alone{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '2x400'
+    alert_rule_test:
+      - eval_time: 5h
+        alertname: CognevaHostTargetGcLockedOutByBuilders
+        exp_alerts: []
+
+  - name: 中间有一拍够得到树，连续段被打断，不响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_left_alone{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '2x200 0x20 2x200'
+    alert_rule_test:
+      - eval_time: 6h
+        alertname: CognevaHostTargetGcLockedOutByBuilders
+        exp_alerts: []
+
+  - name: 这一格不导出（没看完枚举的那一趟）时也不响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_host_target_gc_left_alone{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '_x400'
+    alert_rule_test:
+      - eval_time: 6h
+        alertname: CognevaHostTargetGcLockedOutByBuilders
+        exp_alerts: []
