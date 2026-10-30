@@ -248,6 +248,70 @@ elif not callers:
 else:
     summary.append("时区: " + ", ".join(f"{rel} ← {s}" for rel, s in [(c, definitions[0]) for c in callers]))
 
+# ── 7. 执行者名单 ──
+# 「谁在花」那一栏按执行者分组，每个名字配一句它是什么。名字的正本是网关的
+# `actor_labels.rs`（闭集决定什么值能落到这一列），读法在这个屏上。两份名单没有
+# 一处会比较：网关添一个执行者，这一屏照旧那份亲手抄的表，会把它显示成「不在
+# 网关登记的执行者闭集里，可能是新调用方或写错了名字」——一次正常的扩词被报成
+# 一次事故；反过来，闭集删掉一个名字而屏上还留着它的读法，那一行就再也不会出现，
+# 而读法成了一段关于不存在的角色的话。
+#
+# 判的是**名单相等**，不是「屏上写了几个名字」：少一个多一个都红。读法本身（那句
+# 中文）判不了——它是对名字的解释，不是可以被机器复核的事实。
+LABELS_RS = "crates/cog-gateway/src/actor_labels.rs"
+BACKEND_FIXED = re.compile(r"pub\s+const\s+ACTOR_LABELS\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];", re.S)
+BACKEND_UNKNOWN = re.compile(r'pub\s+const\s+UNKNOWN_ACTOR\s*:\s*&str\s*=\s*"([^"]+)"')
+FRONT_MAP = re.compile(r"const\s+ACTOR_MEANINGS\s*:\s*Record<string,\s*string>\s*=\s*\{(.*?)\n\};", re.S)
+FRONT_KEY = re.compile(r"^\s*(?:'([^']+)'|([A-Za-z_][\w-]*))\s*:", re.M)
+
+labels_path = os.path.join(ROOT, LABELS_RS)
+if not os.path.isfile(labels_path):
+    problems.append(f"读不到 {LABELS_RS}——执行者的闭集不在它声明的地方，名单无从比起")
+else:
+    backend_src = open(labels_path, encoding="utf-8").read()
+    fixed = BACKEND_FIXED.search(backend_src)
+    unknown = BACKEND_UNKNOWN.search(backend_src)
+    if not fixed or not unknown:
+        problems.append(
+            f"{LABELS_RS} 里找不到 ACTOR_LABELS / UNKNOWN_ACTOR 的声明——"
+            "闭集换了形状，这段比对在空转"
+        )
+    else:
+        declared = set(re.findall(r'"([^"]+)"', fixed.group(1))) | {unknown.group(1)}
+        fronts = [(rel, FRONT_MAP.search(read(rel))) for rel in sorted(graph)]
+        fronts = [(rel, m) for rel, m in fronts if m]
+        if not fronts:
+            problems.append(
+                "可达图里没有 ACTOR_MEANINGS 这张表：执行者名的读法没有一处可比的声明"
+            )
+        elif len(fronts) > 1:
+            problems.append(
+                "ACTOR_MEANINGS 有 "
+                + str(len(fronts))
+                + " 份声明（"
+                + ", ".join(rel for rel, _ in fronts)
+                + "）——两份读法就是两份名单"
+            )
+        else:
+            rel, block = fronts[0]
+            shown = {
+                quoted or bare for quoted, bare in FRONT_KEY.findall(block.group(1))
+            }
+            missing = sorted(declared - shown)
+            foreign = sorted(shown - declared)
+            if missing:
+                problems.append(
+                    f"{rel}: 闭集声明了 {', '.join(missing)}，这一屏没有它的读法——"
+                    "它会显示成「不在闭集里」，把一次正常的扩词报成一次事故"
+                )
+            if foreign:
+                problems.append(
+                    f"{rel}: 写了 {', '.join(foreign)} 的读法，"
+                    f"而闭集（{LABELS_RS}）里没有这个名字——那段读法不会出现在任何一行上"
+                )
+            if not missing and not foreign:
+                summary.append(f"执行者名单: {len(declared)} 个名字，{rel} 与之逐名相等")
+
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
 

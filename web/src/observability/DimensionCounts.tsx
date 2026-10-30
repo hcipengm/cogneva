@@ -194,25 +194,34 @@ const ORIGIN_LABELS: Record<string, string> = {
   unknown: '调用方没有声明环境',
 };
 
+/**
+ * 闭集里每一个固定名字的来历。
+ *
+ * 名单的正本是网关的 `actor_labels.rs`（`ACTOR_LABELS` ＋ `UNKNOWN_ACTOR`）：那里决定
+ * 什么值能落到这一列上，这里只写读法。门（`check-web-token-panel.sh` 第 7 段）把两边
+ * 的名单逐名比对，多一个少一个都红——否则网关新加一个执行者时，这一屏会照着旧表把
+ * 它显示成「不在闭集里，可能是写错了名字」，把一次正常的扩词报成一次事故。
+ */
+const ACTOR_MEANINGS: Record<string, string> = {
+  eval: '评测跑批自己的调用（与 `agent:evaluator` 是两个东西：那是评测的产物，这是评测这个程序）',
+  evolution: '自进化循环',
+  intent_assess: '意图评估阶段',
+  intent_gateway: '意图网关（交互入口的意图路由）',
+  memory: '记忆读写',
+  ralph: 'ralph 循环',
+  self_review: '自检（没有指明被评对象的一侧）',
+  skill_extractor: '技能抽取',
+  'sandbox-document-organizer': '沙盒里的文档整理',
+  web_chat: 'WebUI 对话',
+  wiki: '知识库',
+  unknown: '调用方没有在请求上声明执行者名——这一格记的是「没报」，不是某个角色',
+};
+
 /** 执行者名的来历。前缀族只有两族，其余是闭集里的固定名字。 */
 function actorHint(value: string): string {
   if (value.startsWith('agent:')) return `多智能体里的 ${value.slice('agent:'.length)} 角色`;
   if (value.startsWith('self_review:')) return `自检代理，评审对象是 ${value.slice('self_review:'.length)}`;
-  const fixed: Record<string, string> = {
-    eval: '评测跑批自己的调用（与 `agent:evaluator` 是两个东西：那是评测的产物，这是评测这个程序）',
-    evolution: '自进化循环',
-    intent_assess: '意图评估阶段',
-    intent_gateway: '意图网关（交互入口的意图路由）',
-    memory: '记忆读写',
-    ralph: 'ralph 循环',
-    self_review: '自检（没有指明被评对象的一侧）',
-    skill_extractor: '技能抽取',
-    'sandbox-document-organizer': '沙盒里的文档整理',
-    web_chat: 'WebUI 对话',
-    wiki: '知识库',
-    unknown: '调用方没有在请求上声明执行者名——这一格记的是「没报」，不是某个角色',
-  };
-  return fixed[value] ?? '不在网关登记的执行者闭集里，可能是新调用方或写错了名字';
+  return ACTOR_MEANINGS[value] ?? '不在网关登记的执行者闭集里，可能是新调用方或写错了名字';
 }
 
 function members(actors: ActorUsage[], dim: Dimension): Member[] {
