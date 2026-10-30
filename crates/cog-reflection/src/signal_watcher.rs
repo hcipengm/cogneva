@@ -808,23 +808,36 @@ fn signal_project_root_id(project: &str) -> String {
     format!("{SIGNAL_PROJECT_ROOT_PREFIX}{scope}")
 }
 
+/// How many rows one settle is allowed to rewrite.
+///
+/// The first settle after a filing starts writing a criterion has a thousand
+/// rows to reach, and this round also reads the whole graph every minute. A
+/// batch bounds the burst, not the work: the round asks again on its next tick
+/// until `remaining` is zero.
+const SIGNAL_SETTLE_BATCH: usize = 250;
+
 /// What one settle of the signal projects did, cell by cell.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SettledSignals {
     anchored: usize,
     reparented: usize,
+    criteria: usize,
     failed: usize,
+    /// Rows still out of shape after this settle. Zero means the next tick has
+    /// nothing left to do and the round can stop asking.
+    remaining: usize,
 }
 
 impl SettledSignals {
     fn moved_anything(&self) -> bool {
-        self.anchored > 0 || self.reparented > 0 || self.failed > 0
+        self.anchored > 0 || self.reparented > 0 || self.criteria > 0 || self.failed > 0
     }
 
     fn line(&self) -> String {
         format!(
-            "settled signal projects: anchored={} reparented={} failed={}",
-            self.anchored, self.reparented, self.failed
+            "settled signal projects: anchored={} reparented={} criteria={} failed={} \
+             remaining={}",
+            self.anchored, self.reparented, self.criteria, self.failed, self.remaining
         )
     }
 }
@@ -841,10 +854,12 @@ impl SettledSignals {
 /// project with a second root is rewritten; a group that is already whole costs
 /// no write.
 ///
-/// Called once per process rather than once per round. Every row written after
-/// this is in shape by construction, and this round already reads the whole
-/// graph every minute: reading it again would be a cost paid forever for a
-/// defect that can no longer recur.
+/// Called until it stops finding anything to fill rather than on every tick
+/// forever. Every row written after this is in shape by construction, and this
+/// round already reads the whole graph every minute: reading it again would be
+/// a cost paid forever for a defect that can no longer recur. The stop is the
+/// settle's own `remaining` count, because how many ticks the back-fill takes
+/// depends on how many rows the graph holds.
 async fn settle_signal_parents(
     orch: &Arc<dyn OrchestratorControl>,
     tasks: &[Task],
@@ -907,7 +922,76 @@ async fn settle_signal_parents(
             }
         }
     }
+    fill_signal_criteria(orch, tasks, &mut settled).await;
     settled
+}
+
+/// Give every signal row written before the criterion existed the one it would
+/// be filed with today.
+///
+/// The filing only fixes the row it submits, and a condition that has stopped
+/// asking is never filed again -- so the rows written before the criterion
+/// existed would keep an empty one for the life of the graph. Measured on
+/// 2026-10-30: 1194 signal rows, none of them carrying a criterion.
+///
+/// The criterion is re-derived from the detail the row kept in its own payload,
+/// not from the round's live reading: a row filed by an alert says what closes
+/// that alert, and re-deriving it from today's reading would write a criterion
+/// about a condition the row was not filed for. Rows that kept no detail are
+/// left alone -- there is nothing to say about them, and a guess would be a
+/// criterion that admits no answer.
+async fn fill_signal_criteria(
+    orch: &Arc<dyn OrchestratorControl>,
+    tasks: &[Task],
+    settled: &mut SettledSignals,
+) {
+    let candidates: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| task.acceptance.is_empty())
+        .filter(|task| {
+            task.goal_id
+                .as_deref()
+                .is_some_and(|project| project.starts_with(SIGNAL_PROJECT_PREFIX))
+        })
+        .filter(|task| task.input.get("signal").is_some())
+        .collect();
+    settled.remaining = candidates.len().saturating_sub(SIGNAL_SETTLE_BATCH);
+    for row in candidates.into_iter().take(SIGNAL_SETTLE_BATCH) {
+        // The graph was read once, before this loop, and a worker can move a
+        // row between then and now. Written back from that snapshot the row
+        // would lose the status it just reached -- and the parent the settle
+        // above just gave it. So the row is read again here, and one that is
+        // running this moment is left to the next tick rather than written over.
+        // `replace_task` writes the whole row, so there is no narrower write to
+        // fall back on.
+        let Some(mut filled) = orch.get_task(&row.id).await else {
+            continue;
+        };
+        if !filled.acceptance.is_empty() {
+            continue;
+        }
+        if filled.status == TaskStatus::Running {
+            settled.remaining += 1;
+            continue;
+        }
+        let detail = filled.input["signal"].clone();
+        filled
+            .acceptance
+            .push(signal_acceptance(&detail, filled.goal_id.as_deref()));
+        match orch.replace_task(filled).await {
+            Ok(()) => settled.criteria += 1,
+            Err(e) => {
+                settled.failed += 1;
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "signal watcher: a signal row could not be given its criterion, so it stays \
+                     a work package nobody can close"
+                );
+            }
+        }
+    }
 }
 
 /// Result of one submission attempt. "Nothing needed doing" and "the intent
@@ -1078,16 +1162,18 @@ async fn tick(
     readings.tick();
     let now = Utc::now();
     let tasks = orch.get_all_tasks().await;
-    // Once per process, on the graph this round already read: see
-    // `settle_signal_parents`. Before the held-round return, because shaping the
-    // tree spends no LLM call and a pool outage is no reason to leave a project
-    // replanning cannot hang work under.
+    // Until it stops finding anything to fill, on the graph this round already
+    // read: see `settle_signal_parents`. Before the held-round return, because
+    // shaping the tree spends no LLM call and a pool outage is no reason to
+    // leave a project replanning cannot hang work under.
     if !*parents_settled {
         let settled = settle_signal_parents(orch, &tasks).await;
         if settled.moved_anything() {
             info!("signal watcher: {}", settled.line());
         }
-        *parents_settled = true;
+        // A settle that left rows to fill asks again on the next tick; one that
+        // reached everything is done for the life of the process.
+        *parents_settled = settled.remaining == 0;
     }
     let mut state = load_state().await;
     let mut dirty = false;
@@ -2300,6 +2386,125 @@ mod tests {
                 .find(|t| t.goal_id.as_deref() == Some("3f0c1d2e-0000-4000-8000-000000000000"))
                 .is_some_and(|t| t.parent_task_id.is_none()),
             "非信号项目被动了"
+        );
+    }
+
+    /// 早先写下的信号行没有验收标准：一次结算按它**自己存下的那次读数**补上。
+    ///
+    /// 这一格挡的是「改成提交时才写」留下的存量：提交只修它自己那一行，而一个已经
+    /// 不再问的条件永远不会再被提交一次，所以那 1194 行会一直空着，项目视图里每一
+    /// 行都是关不掉的活。
+    ///
+    /// 判据取自行自己的 payload 而不是结算那一轮的活读数：这一行是为哪条规则建的，
+    /// 就该在哪条规则不响时合上；拿今天的读数去补，会让旧行写下一个它没被建来管的
+    /// 条件。射程也钉住：别的项目、以及没有留下读数的行一行都不动。
+    #[tokio::test]
+    async fn a_signal_row_written_before_the_criterion_existed_is_given_one() {
+        let project = "signal:persisted_alert/pool_down";
+        let detail = serde_json::json!({"kind": "persisted_alert", "rule": "PoolDown"});
+        let row = |id: &str, project: Option<&str>, payload: serde_json::Value| {
+            let mut task = Task::new(
+                id.to_string(),
+                TaskType::Custom("self_signal".into()),
+                payload,
+            );
+            task.goal_id = project.map(str::to_string);
+            task
+        };
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(vec![
+            // 早先的信号行：一个项目一个根，形状已经对，缺的只是验收标准。
+            row(
+                "self-signal-old",
+                Some(project),
+                serde_json::json!({"goal": "g", "signal": detail}),
+            ),
+            // 锚点：不是活，也不带读数。
+            signal_project_root(project),
+            // 没有留下读数的一行：没有东西可说，就不说。
+            row(
+                "self-signal-bare",
+                Some(project),
+                serde_json::json!({"goal": "g"}),
+            ),
+            // 不是信号项目的行：不在射程内。
+            row(
+                "change-ledger-x",
+                Some("3f0c1d2e-0000-4000-8000-000000000000"),
+                serde_json::json!({"goal": "g", "signal": detail}),
+            ),
+        ]));
+
+        let tasks = orch.get_all_tasks().await;
+        let settled = settle_signal_parents(&orch, &tasks).await;
+        assert_eq!(settled.criteria, 1, "{settled:?}");
+        assert_eq!(settled.failed, 0, "{settled:?}");
+        assert_eq!(settled.remaining, 0, "{settled:?}");
+
+        let after = orch.get_all_tasks().await;
+        let filled = after.iter().find(|t| t.id == "self-signal-old").unwrap();
+        assert_eq!(
+            filled.acceptance,
+            vec![signal_acceptance(&detail, Some(project))],
+            "补上的判据必须是这一行自己那条规则，不是别的读数"
+        );
+        assert!(
+            filled.acceptance[0].contains("PoolDown"),
+            "判据要点名这条行是为哪条规则建的：{:?}",
+            filled.acceptance
+        );
+        for untouched in ["self-signal-bare", "change-ledger-x"] {
+            let task = after.iter().find(|t| t.id == untouched).unwrap();
+            assert!(
+                task.acceptance.is_empty(),
+                "{} 不该被补：它没有留下读数，或者根本不在信号项目里",
+                untouched
+            );
+        }
+        assert!(
+            after
+                .iter()
+                .find(|t| t.id == signal_project_root_id(project))
+                .is_some_and(|t| t.acceptance.is_empty()),
+            "锚点不是活，不该有验收标准"
+        );
+    }
+
+    /// 一次结算只写一批，剩下的记在 `remaining` 上让下一轮接着写——存量有上千行，
+    /// 一轮全写完会把这一侧的写压在别的 pass 上。
+    #[tokio::test]
+    async fn a_settle_writes_one_batch_and_says_how_much_is_left() {
+        let total = SIGNAL_SETTLE_BATCH + 3;
+        let tasks: Vec<Task> = (0..total)
+            .map(|i| {
+                let project = format!("signal:persisted_alert/rule-{i}");
+                let detail =
+                    serde_json::json!({"kind": "persisted_alert", "rule": format!("R{i}")});
+                let mut task = Task::new(
+                    format!("self-signal-{i}"),
+                    TaskType::Custom("self_signal".into()),
+                    serde_json::json!({"goal": "g", "signal": detail}),
+                );
+                task.goal_id = Some(project);
+                task
+            })
+            .collect();
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(tasks));
+
+        let first = orch.get_all_tasks().await;
+        let settled = settle_signal_parents(&orch, &first).await;
+        assert_eq!(settled.criteria, SIGNAL_SETTLE_BATCH, "{settled:?}");
+        assert_eq!(settled.remaining, 3, "{settled:?}");
+
+        let second = orch.get_all_tasks().await;
+        let settled = settle_signal_parents(&orch, &second).await;
+        assert_eq!(settled.criteria, 3, "{settled:?}");
+        assert_eq!(settled.remaining, 0, "{settled:?}");
+        assert!(
+            orch.get_all_tasks()
+                .await
+                .iter()
+                .all(|t| !t.acceptance.is_empty()),
+            "第二轮之后还有行没补上"
         );
     }
 

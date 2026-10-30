@@ -1034,19 +1034,36 @@ fn dispatch_project_root_id(project: &str) -> String {
     format!("{DISPATCH_PROJECT_ROOT_PREFIX}{scope}")
 }
 
+/// How many rows one settle is allowed to rewrite.
+///
+/// The first settle after a hand-over starts writing a criterion has thousands
+/// of rows to reach, and this loop shares its process with the measurement
+/// passes. A batch bounds the burst, not the work: the loop asks again on its
+/// next beat until `remaining` is zero.
+const SETTLE_BATCH: usize = 400;
+
 /// What one settle of the dispatched projects did, cell by cell.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct SettledProjects {
     anchored: usize,
     reparented: usize,
+    criteria: usize,
     failed: usize,
+    /// Rows still out of shape after this settle. Zero means the next beat has
+    /// nothing left to do and the pass can stop asking.
+    remaining: usize,
 }
 
 impl SettledProjects {
+    fn moved_anything(&self) -> bool {
+        self.anchored > 0 || self.reparented > 0 || self.criteria > 0 || self.failed > 0
+    }
+
     fn line(&self) -> String {
         format!(
-            "settled dispatched projects: anchored={} reparented={} failed={}",
-            self.anchored, self.reparented, self.failed
+            "settled dispatched projects: anchored={} reparented={} criteria={} failed={} \
+             remaining={}",
+            self.anchored, self.reparented, self.criteria, self.failed, self.remaining
         )
     }
 }
@@ -1066,11 +1083,14 @@ impl SettledProjects {
 /// only a project with a second root is rewritten -- the rows that are already
 /// whole cost no write.
 ///
-/// Called once per process rather than once per pass: every row written after
-/// this is in shape by construction, so a full graph read on every beat would
-/// be a cost paid forever for a defect that can no longer recur. A graph read
-/// that comes back empty is indistinguishable from a graph with nothing in it,
-/// and both mean there is nothing to settle.
+/// Called until it stops finding anything to fill, not on every beat forever:
+/// every row written after this is in shape by construction, so a full graph
+/// read on every beat would be a cost paid forever for a defect that can no
+/// longer recur. The stop is the settle's own `remaining` count rather than a
+/// fixed number of passes, because how many beats the back-fill takes depends on
+/// how many rows the graph holds. A graph read that comes back empty is
+/// indistinguishable from a graph with nothing in it, and both mean there is
+/// nothing to settle.
 async fn settle_dispatch_parents(orchestrator: &Arc<dyn OrchestratorControl>) -> SettledProjects {
     let mut settled = SettledProjects::default();
     let tasks = orchestrator.get_all_tasks().await;
@@ -1131,7 +1151,68 @@ async fn settle_dispatch_parents(orchestrator: &Arc<dyn OrchestratorControl>) ->
             }
         }
     }
+    fill_dispatch_criteria(orchestrator, &tasks, &mut settled).await;
     settled
+}
+
+/// Give every dispatched change row the criterion the hand-over now writes.
+///
+/// The hand-over only fixes the row it submits, and a change that has stopped
+/// being owed is never submitted again -- so rows written before the criterion
+/// existed would keep an empty one for the life of the graph. Measured on
+/// 2026-10-30: 2328 dispatched rows, none of them carrying a criterion, which
+/// is the single largest block of work the project views draw with no answer to
+/// "is it finished".
+///
+/// The criterion is a constant rather than a reading of the row, because what
+/// closes this work is the same for every row: a measurement of the account
+/// finds the artifact as the change asks for it, or finds the identity one the
+/// account should not be holding. Nothing here has to be derived from the row's
+/// payload, so a rewritten row is identical to one filed today.
+async fn fill_dispatch_criteria(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    tasks: &[Task],
+    settled: &mut SettledProjects,
+) {
+    let missing: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| task.task_type.kind_key() == DISPATCH_TASK_KIND)
+        .filter(|task| task.acceptance.is_empty())
+        .collect();
+    settled.remaining = missing.len().saturating_sub(SETTLE_BATCH);
+    for row in missing.into_iter().take(SETTLE_BATCH) {
+        // The graph was read once, before this loop, and a worker can move a
+        // row between then and now. Written back from that snapshot the row
+        // would lose the status it just reached -- and the parent the settle
+        // above just gave it. So the row is read again here, and one that is
+        // running this moment is left to the next pass rather than written
+        // over. `replace_task` writes the whole row, so there is no narrower
+        // write to fall back on.
+        let Some(mut filled) = orchestrator.get_task(&row.id).await else {
+            continue;
+        };
+        if !filled.acceptance.is_empty() {
+            continue;
+        }
+        if filled.status == TaskStatus::Running {
+            settled.remaining += 1;
+            continue;
+        }
+        filled.acceptance.push(DISPATCH_ACCEPTANCE.to_string());
+        match orchestrator.replace_task(filled).await {
+            Ok(()) => settled.criteria += 1,
+            Err(e) => {
+                settled.failed += 1;
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "change ledger: a dispatched change could not be given its criterion, so it \
+                     stays a work package nobody can close"
+                );
+            }
+        }
+    }
 }
 
 /// The project a dispatched change belongs to: the part of the tree its check
@@ -1480,11 +1561,13 @@ pub fn spawn_change_ledger_loop(
                     if let Some(ref orchestrator) = orchestrator {
                         if !parents_settled {
                             let settled = settle_dispatch_parents(orchestrator).await;
-                            if settled.anchored > 0 || settled.reparented > 0 || settled.failed > 0
-                            {
+                            if settled.moved_anything() {
                                 info!("change ledger: {}", settled.line());
                             }
-                            parents_settled = true;
+                            // A settle that left rows to fill asks again on the
+                            // next beat; one that reached everything is done for
+                            // the life of the process.
+                            parents_settled = settled.remaining == 0;
                         }
                         let pool = pool.as_deref();
                         // Work with nobody's name on it shows up in the rows
@@ -6251,6 +6334,81 @@ mod tests {
         );
     }
 
+    /// A change handed over before the criterion existed carries none, and a
+    /// change that has stopped being owed is never handed over again -- so the
+    /// settle pass writes it. Measured on 2026-10-30: 2328 dispatched rows, none
+    /// of them carrying a criterion, which is the largest block of work the
+    /// project views draw with no answer to "is it finished".
+    ///
+    /// The scope is pinned too: this pass writes criteria on changes, and a row
+    /// of another kind is not one -- a blanket "fill every row" would rewrite
+    /// work whose "done" is somebody else's to define.
+    #[tokio::test]
+    async fn a_change_handed_over_before_the_criterion_existed_is_given_one() {
+        let graph = Arc::new(
+            FakeGraph::default()
+                .holding_root_change("change-a", "change-ledger:crates")
+                .holding_other_kind("not-a-change", "self_signal"),
+        );
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        let settled = settle_dispatch_parents(&control).await;
+
+        assert_eq!(settled.criteria, 1, "{settled:?}");
+        assert_eq!(settled.failed, 0, "{settled:?}");
+        assert_eq!(settled.remaining, 0, "{settled:?}");
+        assert_eq!(
+            graph
+                .held("change-a")
+                .expect("still on the graph")
+                .acceptance,
+            vec![DISPATCH_ACCEPTANCE.to_string()],
+            "the change has to say what closes it"
+        );
+        assert!(
+            graph
+                .held("not-a-change")
+                .expect("still on the graph")
+                .acceptance
+                .is_empty(),
+            "a row of another kind is not this pass's to fill"
+        );
+        assert_eq!(
+            settle_dispatch_parents(&control).await,
+            SettledProjects::default(),
+            "a second settle finds nothing left to do"
+        );
+    }
+
+    /// One settle writes a batch and reports the rest on `remaining`, so the
+    /// loop can come back instead of holding the pool against a burst of
+    /// thousands of writes.
+    #[tokio::test]
+    async fn a_settle_writes_one_batch_and_says_how_much_is_left() {
+        let mut graph = FakeGraph::default();
+        let total = SETTLE_BATCH + 3;
+        for i in 0..total {
+            graph =
+                graph.holding_root_change(&format!("change-{i}"), &format!("change-ledger/p{i}"));
+        }
+        let control: Arc<dyn OrchestratorControl> = Arc::new(graph);
+
+        let settled = settle_dispatch_parents(&control).await;
+        assert_eq!(settled.criteria, SETTLE_BATCH, "{settled:?}");
+        assert_eq!(settled.remaining, 3, "{settled:?}");
+
+        let settled = settle_dispatch_parents(&control).await;
+        assert_eq!(settled.criteria, 3, "{settled:?}");
+        assert_eq!(settled.remaining, 0, "{settled:?}");
+
+        let tasks = control.get_all_tasks().await;
+        assert_eq!(
+            tasks.iter().filter(|t| t.acceptance.is_empty()).count(),
+            0,
+            "after the second settle every change says what closes it"
+        );
+    }
+
     /// A dispatched change declares a rank below the one a task lands on by
     /// default, and the rest of the row is unchanged by that.
     ///
@@ -8063,6 +8221,18 @@ mod tests {
                 serde_json::json!({}),
             );
             task.goal_id = Some(project.to_string());
+            self.tasks.lock().unwrap().insert(id.to_string(), task);
+            self
+        }
+
+        /// A row of some other kind, so a settle's scope can be read: this pass
+        /// writes criteria on changes, not on everything the graph holds.
+        fn holding_other_kind(self, id: &str, kind: &str) -> Self {
+            let task = Task::new(
+                id.to_string(),
+                TaskType::Custom(kind.into()),
+                serde_json::json!({}),
+            );
             self.tasks.lock().unwrap().insert(id.to_string(), task);
             self
         }
