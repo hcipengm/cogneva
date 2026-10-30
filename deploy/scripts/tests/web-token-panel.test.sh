@@ -40,17 +40,18 @@ export default function App() {
 }
 EOF
   cat >"${work}/web/src/overlay/TokenPanel.tsx" <<'EOF'
-import { useUsage, useSeries, useOutcomes, useAccount } from '@/hooks/useUsage';
+import { useUsage, useSeries, useOutcomes, useAccount, usePool } from '@/hooks/useUsage';
 export function TokenPanel() {
   const { usage } = useUsage();
   const series = useSeries();
   const outcomes = useOutcomes();
   const account = useAccount();
-  return <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}</div>;
+  const pace = usePool().llm_pool?.pace ?? null;
+  return <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}{pace ?? "?"}</div>;
 }
 EOF
   cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
-import { getTokenUsage, getTokenUsageSeries, getTokenOutcomes, getTokenAccount } from '@/api/client';
+import { getTokenUsage, getTokenUsageSeries, getTokenOutcomes, getTokenAccount, getClusterOverview } from '@/api/client';
 export function useUsage() {
   return getTokenUsage(24);
 }
@@ -62,6 +63,9 @@ export function useOutcomes() {
 }
 export function useAccount() {
   return getTokenAccount(24);
+}
+export function usePool() {
+  return getClusterOverview(24);
 }
 EOF
   cat >"${work}/web/src/api/client.ts" <<'EOF'
@@ -231,6 +235,23 @@ export function useAccount() {
 EOF
 confirm "${work}/web/src/hooks/useUsage.ts" "return null"
 expect_red "只剩前三条读面" "getTokenAccount"
+
+# 10. 额度窗整段剪掉：花销面仍答得出「花了多少」，却答不出「这一窗还剩多少、
+#     什么时候换窗」——那两格在订阅制上游没有单价可乘，它们就是成本读数本身。
+#     上面九条此时全绿：路由在、调用点在、区间字段也在。
+fixture
+sed -i 's/usePool().llm_pool?.pace ?? null/null/' "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "const pace = null;"
+expect_red "没读额度窗" "没有读上游额度窗"
+
+# 11. 只留池子、剪掉 `.pace`：快照照样读、池子照样显示「可用」，而「这一窗还剩
+#     多少」无声地没了。这一条判的是那两半各判一遍，不是「读了 llm_pool 就算数」。
+#     判词固定报两半（`缺 llm_pool, .pace`，不论实际缺哪一个），所以这里只认那句
+#     「没有读上游额度窗」，认不到具体字段名。
+fixture
+sed -i 's/usePool().llm_pool?.pace ?? null/usePool().llm_pool ?? null/' "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "llm_pool ?? null"
+expect_red "读了池子没读窗" "没有读上游额度窗"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
