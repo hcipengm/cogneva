@@ -32,7 +32,7 @@
 //! test target of its own.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 mod common;
 
@@ -199,22 +199,13 @@ fn declared(manifest: &str, section: &str) -> BTreeSet<String> {
 }
 
 /// Every `.rs` the base crate compiles from `src/`.
+///
+/// The shared walk, not a local copy of it: a copy that returns quietly when a
+/// directory cannot be read reports "no forbidden name found" over a slice it
+/// never opened, which is the same reading as a crate that is clean.
 fn sources() -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
-                out.push(path);
-            }
-        }
-    }
     let mut out = Vec::new();
-    walk(&common::root::repo_root().join(BASE_SRC), &mut out);
+    common::routes::walk(&common::root::repo_root().join(BASE_SRC), &["rs"], &mut out);
     out
 }
 
