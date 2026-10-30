@@ -21,7 +21,7 @@
 //! - 两个词表各自该收哪些词。判死与「拉取失败」两个集合的边界是那次实测的结论，
 //!   由 `mainline_deployer` 的单测与金丝雀那三条断言看着。
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::path::Path;

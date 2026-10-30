@@ -45,15 +45,13 @@
 //! fixed, and an expired count reads as a stale gate rather than as a stale
 //! sentence.
 
-mod common;
+use crate::common;
 
 use common::lex::Dialect;
 use common::routes::{matching_paren, read_repo};
 
-#[path = "common/derivation.rs"]
-mod derivation;
-#[path = "common/promql.rs"]
-mod promql;
+use crate::derivation;
+use crate::promql;
 
 use derivation::{MetricDerivation, METRIC_DERIVATIONS};
 use promql::windows_over;

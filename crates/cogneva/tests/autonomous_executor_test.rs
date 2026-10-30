@@ -6,7 +6,7 @@
 //! manager and has no in-memory stand-in, so the harness runs the suite only
 //! where one is reachable and skips it otherwise.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::Duration;

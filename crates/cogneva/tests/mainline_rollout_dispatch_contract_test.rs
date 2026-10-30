@@ -14,7 +14,7 @@
 //! absent, the "nothing was superseded" case and the "no guard is wired" case
 //! are the same series.
 
-mod common;
+use crate::common;
 
 use common::routes::read_repo;
 

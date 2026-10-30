@@ -23,7 +23,7 @@
 //!   若将来接上了，本门要跟着扩到那个 crate——扩的方式是加目录，不是放宽。
 //! - 措辞的**语义**是否仍然合适。本门只保证改的时候两头一起动。
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

@@ -48,7 +48,7 @@
 //! - 列顺序本身。判据钉的是「这句话只有一处」，它读得出两处、读不出一处写错了
 //!   列——那一半由 `state_reads` 自己的单元测试与恢复测试覆盖。
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::path::Path;

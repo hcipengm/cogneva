@@ -14,7 +14,7 @@
 //! The predicate is the root string, in the production half of every crate. The
 //! one file allowed to contain it is the declaration itself.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

@@ -28,7 +28,7 @@ use cog_storage::{
     ObjectDatasetStore,
 };
 
-mod router_state;
+use crate::router_state;
 
 /// Bytes in a map, keyed exactly as the caller named them.
 #[derive(Default)]

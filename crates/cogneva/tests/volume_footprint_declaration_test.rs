@@ -41,7 +41,7 @@
 //! volume that cannot fill up. The claim also may not be walked *twice*, which
 //! would publish two different byte counts under one claim name.
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 

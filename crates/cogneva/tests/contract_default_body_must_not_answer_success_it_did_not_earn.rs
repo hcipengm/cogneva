@@ -34,7 +34,7 @@
 //!
 //! principle: feedback_a_trait_default_body_is_where_a_missing_capability_hides_as_success
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

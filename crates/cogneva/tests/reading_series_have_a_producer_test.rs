@@ -20,7 +20,7 @@
 //! pinned image (the commands are in its header) and carries the tag it was
 //! measured on.
 
-mod common;
+use crate::common;
 
 use common::routes::{repo_root, walk};
 

@@ -47,7 +47,7 @@
 //!   case line, so pairing it with a word would mean following a variable
 //!   through the function — a parser this gate does not have.
 
-mod common;
+use crate::common;
 
 use common::routes::read;
 

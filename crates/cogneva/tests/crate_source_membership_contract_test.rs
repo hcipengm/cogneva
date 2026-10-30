@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

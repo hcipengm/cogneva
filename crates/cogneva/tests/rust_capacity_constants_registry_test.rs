@@ -55,7 +55,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

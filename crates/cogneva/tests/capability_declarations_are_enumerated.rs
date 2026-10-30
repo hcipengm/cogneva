@@ -37,7 +37,7 @@
 
 use std::collections::BTreeMap;
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

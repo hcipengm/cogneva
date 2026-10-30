@@ -17,20 +17,13 @@
 
 use std::collections::BTreeSet;
 
-#[path = "common/cells_written.rs"]
-mod cells_written;
-#[path = "common/closed_set.rs"]
-mod closed_set;
-mod common;
-#[path = "common/derivation.rs"]
-mod derivation;
-#[path = "common/producer.rs"]
-mod producer;
-#[path = "common/promql.rs"]
-mod promql;
+use crate::cells_written;
+use crate::closed_set;
+use crate::derivation;
+use crate::producer;
+use crate::promql;
 
-#[path = "common/dashboard.rs"]
-mod dashboard;
+use crate::dashboard;
 
 use dashboard::{
     is_log_query, json_field, metric_exprs, repo_root, text as dashboard_text, PanelExpr,

@@ -7,7 +7,7 @@
 //! (except for the transient raw-log temp dir). Redis backs the quota manager
 //! and has no in-memory stand-in, so a test skips when none is reachable.
 
-mod common;
+use crate::common;
 
 use axum::{
     body::{to_bytes, Body},

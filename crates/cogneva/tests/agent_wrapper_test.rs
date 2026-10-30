@@ -6,7 +6,7 @@ use tokio::time::timeout;
 
 use futures::StreamExt;
 
-mod mock_provider;
+use crate::mock_provider;
 use mock_provider::MockProvider;
 
 #[tokio::test]

@@ -33,7 +33,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-mod common;
+use crate::common;
 
 use common::js_literal::is_identifier;
 use common::lex::{blank, split_top_level, strip, Dialect};

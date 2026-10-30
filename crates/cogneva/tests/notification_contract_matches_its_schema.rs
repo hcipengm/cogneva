@@ -18,7 +18,7 @@
 //! so does a gap that quietly closes while this list still names it. The list is
 //! empty, which is a reading too: it says the two sides agree today.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

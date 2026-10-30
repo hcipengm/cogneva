@@ -26,7 +26,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-mod common;
+use crate::common;
 use common::routes::{read, repo_root, served_prefixes, strip_comments, walk};
 
 const WEB: &str = "web/src";

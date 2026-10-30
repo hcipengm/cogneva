@@ -42,7 +42,7 @@
 //! 本门红并点名它；把调用方写成从别的模块 import 同名函数，本门仍旧红——证明
 //! 判据认的是 import 的模块，不是出现过这个词。
 
-mod common;
+use crate::common;
 
 use common::routes::strip_comments;
 

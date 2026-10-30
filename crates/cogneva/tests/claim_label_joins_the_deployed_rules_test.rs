@@ -15,7 +15,7 @@
 //! checked, so a second declaration cannot pass by agreeing with the first
 //! while disagreeing with the expression that consumes it.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

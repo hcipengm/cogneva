@@ -7,7 +7,7 @@
 //! 订阅和一个注册表条目。这里的四条用例量的都是「放掉」：消费者真的结束了、
 //! 名册里不再出现、名字可以重新给一个新对象、退役对象不会被当成活人交回去。
 
-mod common;
+use crate::common;
 
 use async_trait::async_trait;
 use cog_agent::GlobalAgentManager;

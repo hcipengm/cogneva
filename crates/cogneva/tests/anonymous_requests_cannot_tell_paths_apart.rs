@@ -31,7 +31,7 @@ use tower::ServiceExt;
 
 use cog_gateway::{create_router, GatewayState};
 
-mod router_state;
+use crate::router_state;
 
 /// A served, protected path. Chosen from the general protected routers, which is
 /// where a per-route attachment would be added first.

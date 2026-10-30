@@ -20,7 +20,7 @@
 //! none in the process that does not. A test that only says "the function
 //! exists" would have passed throughout the window in which it was never called.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

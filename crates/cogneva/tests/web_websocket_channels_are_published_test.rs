@@ -15,7 +15,7 @@
 //! 两个方向都判：订了却没人发的频道族是白等，发了却没人订的频道族是白发。
 //! 「发」只看 `event_channels`：那是唯一决定一帧落到哪条通道上的地方。
 
-mod common;
+use crate::common;
 
 use common::routes::strip_comments;
 

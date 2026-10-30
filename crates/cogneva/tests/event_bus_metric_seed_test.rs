@@ -15,7 +15,7 @@ use cog_core::metric_names::EVENT_BUS_EMITTED_TOTAL;
 use cog_core::MetricsBackend;
 use cog_orchestrator::DagExecutor;
 
-mod common;
+use crate::common;
 
 use common::mocks::MockMetricsBackend;
 

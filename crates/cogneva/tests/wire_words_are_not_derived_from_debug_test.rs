@@ -22,7 +22,7 @@
 //! `crates/cog-gateway/src/processes.rs` 里一句改回
 //! `format!("{:?}", t.task_type).to_lowercase()`，本门红并点名该文件与该行。
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

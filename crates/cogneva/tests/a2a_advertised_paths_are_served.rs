@@ -51,7 +51,7 @@ use tower::ServiceExt;
 
 use cog_gateway::{create_router, GatewayState};
 
-mod router_state;
+use crate::router_state;
 
 /// The state every suite about the route table builds: no store behind it,
 /// because the answers these suites ask for are decided before anything is

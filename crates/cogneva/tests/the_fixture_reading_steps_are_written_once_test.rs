@@ -56,7 +56,7 @@
 //! 断言各自单独会长回来：副本为零、递归只有一处、没有新的同体、共享模块还在真干活、
 //! 还有人在用它。
 
-mod common;
+use crate::common;
 
 use std::path::PathBuf;
 

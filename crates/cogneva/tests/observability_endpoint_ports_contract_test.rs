@@ -17,7 +17,7 @@
 //! [`EXEMPT`] with the reason, so that "not checked" is a decision on the page
 //! rather than a gap.
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 

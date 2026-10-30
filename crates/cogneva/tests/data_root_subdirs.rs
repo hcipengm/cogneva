@@ -14,7 +14,7 @@
 //! `deploy/scripts/check-backup-coverage.sh` 只剩卷覆盖那一半——子目录这一半整体
 //! 搬到了这里，脚本里不再有第二份清单。
 
-mod common;
+use crate::common;
 
 use cogneva::backup::{SubdirClass, DATA_ROOT_SUBDIRS};
 use common::routes::{repo_root, walk};

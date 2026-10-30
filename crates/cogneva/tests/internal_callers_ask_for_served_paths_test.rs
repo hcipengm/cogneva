@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-mod common;
+use crate::common;
 use common::routes::{normalize, read, repo_root, served_paths};
 use common::rust_production::production_text;
 use common::rust_production::{crate_files_of, production_sources, relative_name};

@@ -18,7 +18,7 @@
 //! namespace- and values-shaped patterns need. Coverage is the only judgement
 //! here -- what the address should be is the row's business, not this test's.
 
-mod common;
+use crate::common;
 
 use common::routes::read_repo;
 

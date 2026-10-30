@@ -16,7 +16,7 @@
 //! explaining where the value comes from; a test module may name whatever it
 //! likes to build a specimen.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

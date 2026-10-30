@@ -8,7 +8,7 @@
 //! 这一组用例只问路由看得见的事：跑完之后，报告在不在列表里、读不读得回来、第二次跑
 //! 会不会把第一次盖掉。把报告送到盘上的那条路径若被删掉，第一条就会红。
 
-mod router_state;
+use crate::router_state;
 
 use std::sync::Arc;
 

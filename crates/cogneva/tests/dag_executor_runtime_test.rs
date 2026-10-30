@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 
 use cog_agent::GlobalAgentManager;
 use cog_core::{

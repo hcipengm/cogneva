@@ -12,7 +12,7 @@
 //! 反证：声明之前，这道门在 `cog-gateway/src/lib.rs` 报 7 行、在
 //! `cog-observability/src/traces.rs` 报 3 行——那 10 行正是当时树上各自写了一遍的头名。
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

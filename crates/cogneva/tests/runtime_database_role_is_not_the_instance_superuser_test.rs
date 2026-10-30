@@ -21,7 +21,7 @@
 //! CREATEDB。这条例外不是「漏改」，所以它也必须被钉住——把演练也顺手改过去，
 //! 演练会在真出事的那天才红。
 
-mod common;
+use crate::common;
 
 use common::routes::{read, repo_root};
 

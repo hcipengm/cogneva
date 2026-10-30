@@ -13,7 +13,7 @@
 //! 要解析到 Deployment 真挂上的那份 ConfigMap 里真定义的模块，基础档里一条探测作业
 //! 都不许有。任何一条不成立，装的这套探针在每个集群上都只是「安静」。
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 

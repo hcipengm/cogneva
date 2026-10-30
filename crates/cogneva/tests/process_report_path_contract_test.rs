@@ -30,7 +30,7 @@ use std::path::PathBuf;
 use serde::Deserialize as _;
 use serde_yaml::Value;
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 

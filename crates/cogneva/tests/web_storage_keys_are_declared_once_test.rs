@@ -41,7 +41,7 @@
 //!   Nothing in the tree does that, and the scan would not follow it — the
 //!   direction that goes quiet, not the direction that reddens.
 
-mod common;
+use crate::common;
 
 use common::routes::read;
 

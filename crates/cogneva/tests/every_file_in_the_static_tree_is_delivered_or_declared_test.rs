@@ -9,7 +9,7 @@
 //! 个对象与「这一版本来就不需要它」在读数上分不开。所以盘上的每一份清单都要在这里
 //! 表态：要么进 `resources`，要么进下面那张注明理由的非交付表。
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

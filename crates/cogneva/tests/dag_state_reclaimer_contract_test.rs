@@ -28,7 +28,7 @@
 //! state terminal is a real answer only when the reason says why nothing has to
 //! return to it; that is what the prose in the tables is for.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 // 产出面去掉用例那一半，规则只有 `common::rust_production` 一处：自己切

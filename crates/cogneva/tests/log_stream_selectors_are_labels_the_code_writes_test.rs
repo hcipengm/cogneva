@@ -36,7 +36,7 @@
 //! 守着。当前树上部署侧只有这一条 Loki 选择器，门照样要求它至少读到一条：下一条
 //! 面板查询写错时，它不需要先有第二条才生效。
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

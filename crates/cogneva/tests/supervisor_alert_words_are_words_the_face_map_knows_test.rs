@@ -27,7 +27,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-mod common;
+use crate::common;
 
 use common::lex::Dialect;
 use common::routes::{matching_brace, repo_root};

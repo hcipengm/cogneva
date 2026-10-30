@@ -11,7 +11,7 @@
 //! replace the storage layer's answer, and an absent registry must leave the
 //! cells empty rather than letting a zero stand as a reading.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

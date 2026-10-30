@@ -34,7 +34,7 @@ use cog_core::{A2aTask, A2aTaskStatus, HttpClient, HttpRequest, HttpResponse, SF
 use cog_gateway::create_router;
 use cog_protocol::A2aClient;
 
-mod router_state;
+use crate::router_state;
 
 /// The address the agent card puts in front of a peer.
 const ENDPOINT: &str = "http://probe/api/v1/protocol/a2a";

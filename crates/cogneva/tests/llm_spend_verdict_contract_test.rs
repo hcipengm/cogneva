@@ -32,7 +32,7 @@
 //! actor-label census: the text bounds the vocabulary, the runtime reading
 //! shows the omissions.
 
-mod common;
+use crate::common;
 
 use common::lex::{split_top_level, Dialect};
 use common::routes::repo_root;

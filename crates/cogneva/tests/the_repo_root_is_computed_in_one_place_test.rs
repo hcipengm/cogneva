@@ -30,7 +30,7 @@
 
 use std::path::{Path, PathBuf};
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 use common::rust_production::{all_crate_files, crate_files_of, relative_name};

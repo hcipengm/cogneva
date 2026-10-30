@@ -10,7 +10,7 @@
 //! 这条用例量的是「创建幂等」这一半：同名的第二次创建拿回的是**同一个对象**，
 //! 名册长度不增。
 
-mod common;
+use crate::common;
 
 use cog_agent::GlobalAgentManager;
 use cog_core::{AgentManager, MessageBackend, StateBackend};

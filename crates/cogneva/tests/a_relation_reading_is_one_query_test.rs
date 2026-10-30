@@ -35,7 +35,7 @@
 //! - 别的库函数（`pg_relation_size`、`pg_table_size`）。它们今天不在树上；等有人
 //!   第一次写进来，那才是需要一次判断的地方。
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 

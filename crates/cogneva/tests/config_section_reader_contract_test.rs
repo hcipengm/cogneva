@@ -35,7 +35,7 @@
 //! joined to the pointer's spelling in the source, so "a key no type has a
 //! field for" stays a finding rather than becoming an allowance.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

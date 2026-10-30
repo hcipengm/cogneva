@@ -46,7 +46,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-mod common;
+use crate::common;
 
 use common::lex::{blank, Dialect};
 use common::rust_production::{

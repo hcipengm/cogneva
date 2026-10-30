@@ -32,7 +32,7 @@
 //! made and can be reviewed. A job that is missing is a decision nobody made.
 //! Those are different failures, and only the second one is silent.
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 

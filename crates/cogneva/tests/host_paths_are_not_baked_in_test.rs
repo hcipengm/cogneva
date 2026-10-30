@@ -35,7 +35,7 @@
 
 use std::path::{Path, PathBuf};
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 use common::rust_production::relative_name;

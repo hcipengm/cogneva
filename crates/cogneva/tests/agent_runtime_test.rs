@@ -3,7 +3,7 @@ use cog_core::{AgentEvent, RuntimeConfig, ToolRegistry};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
-mod mock_provider;
+use crate::mock_provider;
 use mock_provider::MockProvider;
 
 #[tokio::test]

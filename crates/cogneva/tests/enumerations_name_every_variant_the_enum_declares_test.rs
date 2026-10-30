@@ -30,7 +30,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-mod common;
+use crate::common;
 
 use common::lex::{split_top_level, Dialect};
 use common::rust_text::raw_string_end;

@@ -25,7 +25,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-mod common;
+use crate::common;
 
 use common::js_literal::{top_level_keys, KeyWords};
 use common::lex::{split_top_level, Dialect};

@@ -35,7 +35,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-mod common;
+use crate::common;
 
 use common::js_literal::{top_level_keys, KeyWords};
 use common::routes::strip_comments;

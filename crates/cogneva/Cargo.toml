@@ -6,6 +6,12 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+# Every test file is a module of `tests/suite.rs` rather than a binary of its
+# own: one link of the assembly instead of two hundred. The files that cannot
+# share a process -- one writes a process-global variable, four carry
+# `#[ignore]`d cases CI runs against a live database -- are declared below and
+# the reason is read back off the file by `the_suite_and_the_directory_agree`.
+autotests = false
 
 [lib]
 name = "cogneva"
@@ -14,6 +20,30 @@ path = "src/lib.rs"
 [[bin]]
 name = "cogneva"
 path = "src/main.rs"
+
+[[test]]
+name = "suite"
+path = "tests/suite.rs"
+
+[[test]]
+name = "backup_pg"
+path = "tests/backup_pg.rs"
+
+[[test]]
+name = "ignored_test_corpus_contract_test"
+path = "tests/ignored_test_corpus_contract_test.rs"
+
+[[test]]
+name = "memory_decay_plugin_test"
+path = "tests/memory_decay_plugin_test.rs"
+
+[[test]]
+name = "store_derived_reading"
+path = "tests/store_derived_reading.rs"
+
+[[test]]
+name = "swe_pro_container"
+path = "tests/swe_pro_container.rs"
 
 [dependencies]
 cog-core = { workspace = true }

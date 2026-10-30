@@ -47,7 +47,7 @@
 //! 消融对照两条：浮层把 `pending` 写成 `unconfirmed`，身份那条红并列出两组词；
 //! `STATE_TONE` 加一个 `zombie`，在岗名单那条红并点名这个词。各自改回即绿。
 
-mod common;
+use crate::common;
 
 use common::lex::{split_top_level, Dialect};
 use common::routes::{matching_paren, repo_root};

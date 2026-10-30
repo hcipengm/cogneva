@@ -34,7 +34,7 @@ use tower::ServiceExt;
 
 use cog_gateway::{create_router, GatewayState};
 
-mod router_state;
+use crate::router_state;
 
 fn state() -> Arc<GatewayState> {
     router_state::stateless()

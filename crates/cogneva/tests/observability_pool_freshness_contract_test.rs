@@ -44,15 +44,14 @@
 //!
 //! [`DURABLE_POOL_GAUGE_HEARTBEAT`]: cog_gateway::security_gateway::DURABLE_GAUGE_HEARTBEAT
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 use common::service_topology;
 
 use std::collections::BTreeSet;
 
-#[path = "common/promql.rs"]
-mod promql;
+use crate::promql;
 
 use promql::unguarded_store_reading_complaints;
 

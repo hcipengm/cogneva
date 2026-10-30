@@ -47,7 +47,7 @@
 //! principle: feedback_a_change_lands_only_if_it_reaches_a_build_target
 //! principle: feedback_a_gate_that_forbids_a_shape_must_judge_what_the_repository_carries
 
-mod common;
+use crate::common;
 
 use common::lex::{blank, Dialect};
 use common::routes::repo_root;

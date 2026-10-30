@@ -21,7 +21,7 @@
 //!   single-node projection, so the applied copy and the rendered copy are the
 //!   same derivation rather than two that happen to agree today.
 
-mod common;
+use crate::common;
 
 use common::routes::read;
 

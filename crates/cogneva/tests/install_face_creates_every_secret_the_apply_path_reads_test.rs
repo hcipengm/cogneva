@@ -22,7 +22,7 @@
 //! failure, not a skip -- a check that cannot run must not report "nothing to
 //! see".
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 use common::yaml::docs;

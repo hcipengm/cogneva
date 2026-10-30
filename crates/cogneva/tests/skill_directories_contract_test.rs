@@ -17,7 +17,7 @@
 //! process's home — the last for the out-of-container case, where the binary
 //! runs from a checkout and nothing is mounted at all.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

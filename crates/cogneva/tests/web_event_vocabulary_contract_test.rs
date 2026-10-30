@@ -28,7 +28,7 @@
 
 use std::collections::BTreeSet;
 
-mod common;
+use crate::common;
 
 use common::routes::read_repo;
 

@@ -12,7 +12,7 @@
 //! 最后一条断言的是行布局：终止消息这条窄通道上与失败落点共用，落点必须还在第一行，否则
 //! 读落点的那一端（只认第一行）会把读数当成一段陌生文本，那一轮失败从此判不出坏在哪一处。
 
-mod common;
+use crate::common;
 
 use common::routes::read_repo;
 use common::rust_production::production_text;

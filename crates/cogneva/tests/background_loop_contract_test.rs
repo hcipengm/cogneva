@@ -34,7 +34,7 @@
 //! Note on the literals: they are assembled at compile time, so this file never
 //! contains the text it forbids (it is itself one of the sources scanned).
 
-mod common;
+use crate::common;
 
 use common::routes::{repo_root, source_texts};
 // 产出面（去掉用例体与 `#[cfg(test)]` 项）只有一处算法，不在这里再写一份：

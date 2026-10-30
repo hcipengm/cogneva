@@ -23,7 +23,7 @@
 //! - 散文。错误信息里提到 `MemTotal` 不是第二个解析点——本门读的是生产行里的
 //!   `MemTotal:`（带冒号），而注释行在普查之前就被剥掉了。
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::path::Path;

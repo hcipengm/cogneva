@@ -53,7 +53,7 @@
 //! range (`8080-8081`). The marker carries the judgement; the census only
 //! insists that every number has one.
 
-mod common;
+use crate::common;
 
 use common::routes::{read, walk_all};
 

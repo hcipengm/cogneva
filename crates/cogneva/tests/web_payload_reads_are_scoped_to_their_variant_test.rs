@@ -39,7 +39,7 @@
 //! `react_step_end` 拼成 `ReactStepEnd`（变体其实叫 `ReActStepEnd`）；文件里找不到
 //! `payload` 绑定的 switch 或守卫不判。
 
-mod common;
+use crate::common;
 
 use common::routes::strip_comments;
 

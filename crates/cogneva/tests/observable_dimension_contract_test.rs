@@ -35,7 +35,7 @@
 //! Unclassified fails. The failure mode here is silence, and silence is what a
 //! forgotten classification looks like.
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 

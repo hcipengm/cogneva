@@ -43,7 +43,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-mod common;
+use crate::common;
 use common::routes::{
     normalize, read, repo_root, served_methods, served_paths, strip_comments, walk,
 };

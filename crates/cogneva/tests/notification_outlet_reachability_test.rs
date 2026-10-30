@@ -40,7 +40,7 @@
 //! 少一跳。缺的那一跳由 `every_alertmanager_env_key_reaches_a_deployment` 按生产面的
 //! 表反向兜住：`OBS_ENV` 里的每个键都得有一个部署面来源。
 
-mod common;
+use crate::common;
 
 use common::routes::read_repo;
 

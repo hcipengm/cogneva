@@ -28,7 +28,7 @@ use cog_core::AgentEvent;
 use cog_gateway::resource_frames::publish_resource_frame;
 use cog_gateway::GatewayState;
 
-mod router_state;
+use crate::router_state;
 
 fn state() -> Arc<GatewayState> {
     router_state::stateless()

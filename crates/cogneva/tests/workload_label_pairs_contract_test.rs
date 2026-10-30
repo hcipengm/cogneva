@@ -24,7 +24,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-mod common;
+use crate::common;
 
 use common::routes::{repo_root, walk};
 

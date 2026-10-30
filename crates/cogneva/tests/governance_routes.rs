@@ -13,7 +13,7 @@
 //! and whether the write face consults the store is visible in the answer it
 //! gives to a name the store does not have.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

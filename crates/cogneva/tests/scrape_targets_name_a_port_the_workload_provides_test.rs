@@ -56,7 +56,7 @@
 //! 守着——真实树上「另一个命名空间的监视器」与「豁免的监视器」同时存在，把它们
 //! 改红只证明它们会被判，不证明它们会被放过。
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

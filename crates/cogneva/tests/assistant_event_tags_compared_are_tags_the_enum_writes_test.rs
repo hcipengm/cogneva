@@ -25,7 +25,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-mod common;
+use crate::common;
 
 use common::rust_text::snake_case;
 

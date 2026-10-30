@@ -23,7 +23,7 @@
 //! call and not its reachability -- a publish inside a helper called from
 //! `start()` is beyond it.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

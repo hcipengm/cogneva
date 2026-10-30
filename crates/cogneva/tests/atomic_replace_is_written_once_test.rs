@@ -32,7 +32,7 @@
 //!   是「自己拼临时名」；但那样一来判据会变成两条，眼下树上那几处都在同一 crate
 //!   的下载路径里，等它们需要统一时再加。
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeSet;
 use std::path::Path;

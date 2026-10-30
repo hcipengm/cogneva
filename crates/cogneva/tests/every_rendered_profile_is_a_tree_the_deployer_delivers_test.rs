@@ -15,7 +15,7 @@
 //! `deploy/rendered/` is a deliverable tree, and every Helm profile is one of
 //! those directories.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

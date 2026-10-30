@@ -37,7 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-mod common;
+use crate::common;
 
 use common::rust_text::{rust_function_body, snake_case};
 

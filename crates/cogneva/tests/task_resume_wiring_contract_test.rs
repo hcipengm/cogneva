@@ -18,7 +18,7 @@
 //! comparison rather than a text match, because that agreement is the one thing
 //! a rename in either crate would silently break.
 
-mod common;
+use crate::common;
 
 use common::routes::read_repo;
 // 产出面（去掉用例体与 `#[cfg(test)]` 项）只有一处算法，不在这里再写一份：

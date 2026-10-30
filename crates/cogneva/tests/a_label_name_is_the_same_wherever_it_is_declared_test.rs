@@ -24,7 +24,7 @@
 //! - 不叫 `*LABEL*` 的常量。本门只普查名字里带 `LABEL` 的那些——这是「标签名」在这棵树
 //!   上的写法约定。
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::path::Path;

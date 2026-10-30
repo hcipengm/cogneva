@@ -10,8 +10,7 @@
 //! **说明里那句关于等待时长的话与代码里的等待时长是不是同一件事**。所以这里把两边都读出来比：
 //! 一边是 `mainline_deployer.rs` 里那个常数，一边是这条序列的说明。
 
-#[path = "common/root.rs"]
-mod root;
+use crate::common::root;
 
 use std::fs;
 

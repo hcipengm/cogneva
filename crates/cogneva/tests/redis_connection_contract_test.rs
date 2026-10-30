@@ -40,7 +40,7 @@
 //! file — which is itself one of the sources scanned — never contains the text it
 //! forbids. Otherwise the gate's first finding would be itself.
 
-mod common;
+use crate::common;
 
 use common::routes::{repo_root, source_texts};
 // 产出面（去掉用例体与 `#[cfg(test)]` 项）只有一处算法，不在这里再写一份：

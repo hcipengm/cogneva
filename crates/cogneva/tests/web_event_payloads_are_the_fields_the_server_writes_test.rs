@@ -17,7 +17,7 @@
 //! 实测（2026-10-27）：10 个客户端载荷形状，每一个的每个字段都在对应变体上；
 //! 服务端 20 个变体。反向留空是刻意的：客户端不读的字段不算漂移。
 
-mod common;
+use crate::common;
 
 use common::routes::read_repo;
 

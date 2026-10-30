@@ -7,7 +7,7 @@ use tokio::time::{timeout, Duration};
 use cog_agent::wal::AgentWal;
 use cog_storage::wal::MemoryWalBackend;
 
-mod mock_provider;
+use crate::mock_provider;
 use mock_provider::MockProvider;
 
 #[tokio::test]

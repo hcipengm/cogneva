@@ -14,7 +14,7 @@
 //! what is checked here is the route: which cells it promises, where it takes
 //! its totals from, and what it says when there is no account at all.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

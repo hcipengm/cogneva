@@ -30,7 +30,7 @@
 //! Anything unclassified fails, because the failure mode here is silence, and
 //! silence is what a forgotten classification looks like.
 
-mod common;
+use crate::common;
 
 use common::lex::Dialect;
 use common::routes::{matching_paren, read_repo, repo_root};
@@ -40,20 +40,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cog_gateway::security_gateway::{RangeReadBaseline, RANGE_READ_BASELINES};
 
-#[path = "common/cells_written.rs"]
-mod cells_written;
-#[path = "common/closed_set.rs"]
-mod closed_set;
-#[path = "common/dashboard.rs"]
-mod dashboard;
-#[path = "common/derivation.rs"]
-mod derivation;
-#[path = "common/producer.rs"]
-mod producer;
-#[path = "common/promql.rs"]
-mod promql;
-#[path = "common/unread.rs"]
-mod unread;
+use crate::cells_written;
+use crate::closed_set;
+use crate::dashboard;
+use crate::derivation;
+use crate::producer;
+use crate::promql;
+use crate::unread;
 
 use producer::carries_the_producer;
 use promql::{

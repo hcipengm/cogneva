@@ -1,7 +1,7 @@
 use cog_core::{MemoryBackend, MetricsBackend, RawSource, SchemaEntry, SchemaKind, SummaryEntry};
 use cog_memory::*;
 
-mod common;
+use crate::common;
 
 use cog_storage::FileObjectBackend;
 use common::mocks::{raw, source_ref};

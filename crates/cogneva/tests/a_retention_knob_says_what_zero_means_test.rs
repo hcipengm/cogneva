@@ -22,7 +22,7 @@
 //!   属主的判断；本门只保证这个分歧是被写明的选择，不是抄写的残余。
 //! - 日数额之外的旋钮（清扫周期、单趟删多少行）。它们没有「0 算什么意思」这个问题。
 
-mod common;
+use crate::common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

@@ -3,7 +3,7 @@ use cog_core::{
 };
 use cog_memory::*;
 
-mod common;
+use crate::common;
 
 use common::mocks::{raw, source_ref};
 

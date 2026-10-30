@@ -27,7 +27,7 @@
 //!   world and is not one -- the failure this is here to catch, since a cap that
 //!   stopped tracking its volume is a steady number either way.
 
-mod common;
+use crate::common;
 
 use common::routes::{read, walk_all};
 

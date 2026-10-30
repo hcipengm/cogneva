@@ -13,7 +13,7 @@
 //! the test would be the same kind of second copy, and it would be the copy
 //! nobody updates when a root moves.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

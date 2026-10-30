@@ -37,7 +37,7 @@
 
 use std::path::PathBuf;
 
-mod common;
+use crate::common;
 
 use common::rust_text::snake_case;
 

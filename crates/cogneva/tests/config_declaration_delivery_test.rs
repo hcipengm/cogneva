@@ -11,7 +11,7 @@
 //! reaches the alert row. A check missing any of them reports nothing while
 //! looking installed.
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 

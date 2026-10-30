@@ -18,7 +18,7 @@
 //! also a word in prose and an ordinary field name, and a gate that reddens on
 //! those teaches people to rename their prose.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

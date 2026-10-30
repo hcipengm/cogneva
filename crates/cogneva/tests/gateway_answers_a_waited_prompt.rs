@@ -23,7 +23,7 @@
 //! is the route's contract, and a real agent would add a model call in the
 //! middle of it.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +35,7 @@ use tower::ServiceExt;
 use cog_core::{AgentRegistration, AgentRegistry, InboxMessage, MessageBackend, SFResult};
 use cog_gateway::{create_router, GatewayState};
 
-mod router_state;
+use crate::router_state;
 
 const AGENT: &str = "probe-agent";
 const ROUTE: &str = "/api/v1/agents/probe-agent/messages";

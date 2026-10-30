@@ -57,18 +57,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 use common::rust_production::{all_crate_files, production_sources, production_text};
 use common::service_topology;
 
-#[path = "common/dashboard.rs"]
-mod dashboard;
-#[path = "common/promql.rs"]
-mod promql;
-#[path = "common/unread.rs"]
-mod unread;
+use crate::dashboard;
+use crate::promql;
+use crate::unread;
 
 use promql::metric_names_in;
 use unread::{unresolved_readers, Unread};

@@ -25,7 +25,7 @@
 //! reaches the render is a different way to have the same outage. The template
 //! is read too, because a re-render must not drop the field back out.
 
-mod common;
+use crate::common;
 
 use common::routes::read_repo;
 

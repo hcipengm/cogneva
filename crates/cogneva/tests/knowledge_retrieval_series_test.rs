@@ -17,7 +17,7 @@ use cog_core::contract::knowledge::{
 use cog_core::metric_names::KNOWLEDGE_RETRIEVAL_TOTAL;
 use cog_core::MetricsBackend;
 
-mod common;
+use crate::common;
 
 use common::mocks::MockMetricsBackend;
 

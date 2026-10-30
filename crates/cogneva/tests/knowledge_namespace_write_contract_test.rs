@@ -33,7 +33,7 @@
 
 use std::collections::BTreeSet;
 
-mod common;
+use crate::common;
 
 use common::lex::{split_top_level, Dialect};
 use common::routes::repo_root;

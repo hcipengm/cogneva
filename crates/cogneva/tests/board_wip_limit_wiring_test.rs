@@ -21,7 +21,7 @@
 //! 默认值也在这里判：`wipLimits: ""` 就是「没配」。写成一个具体数等于替所有人选
 //! 了一条准入闸门，而这条闸门会真的拦住派发。
 
-mod common;
+use crate::common;
 
 use common::routes::read_repo;
 

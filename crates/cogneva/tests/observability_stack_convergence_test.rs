@@ -19,7 +19,7 @@
 //! 归置函数算出交付面，再与 Role 比对。所以 [`cog_reflection::classify_doc`] 是
 //! 公开的，本文件用它而不是自己复制一份 kind 表。
 
-mod common;
+use crate::common;
 
 use common::routes::{read_repo, repo_root};
 

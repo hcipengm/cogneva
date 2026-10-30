@@ -45,7 +45,7 @@
 //! `a_rendered_profile_with_a_stale_probe_path_is_reported`）——真实树上四棵树
 //! 此刻彼此一致，把它们轮流改红只证明同一件事。
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 

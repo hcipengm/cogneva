@@ -31,7 +31,7 @@
 //!   不按语义判。
 //! - 拼法本身对不对（点号分段、引号翻倍）。那由 `cog_core::sql` 自己的单测覆盖。
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 

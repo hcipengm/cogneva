@@ -30,7 +30,7 @@
 //! - 字符串的 `Vec::join`（`.join(", ")`）：只认「一个词」的形状，见
 //!   [`is_lower_word`]。
 
-mod common;
+use crate::common;
 
 use common::rust_text::is_lower_word;
 

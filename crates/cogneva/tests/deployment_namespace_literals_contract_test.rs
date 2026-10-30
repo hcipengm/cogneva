@@ -25,7 +25,7 @@
 //!
 //! Test modules are not scanned: a fixture may name whatever it likes.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

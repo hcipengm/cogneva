@@ -45,6 +45,30 @@ ci=".github/workflows/ci.yml"
 [ -f "${ci}" ] || { echo "找不到 ${ci}（要从仓库根跑）"; exit 1; }
 
 failures=0
+run_suite_file() { # run_suite_file <说明> <模块名>
+    # 合并成一个测试二进制之后，「跑哪一份文件」只能靠模块名当 filter 来选，而 libtest 在
+    # filter 一条都命中不了时的结局是成功：`0 passed; 0 filtered out`，退出码 0。模块改名、
+    # 或者某次重构把文件挪了层级，这一格就会**照常印绿而一条判据都没跑**——绿的形状与真跑
+    # 过的绿逐字相同，这正是这份脚本别处（取不到 CI 步骤即红）治的那件事。所以判据不只读
+    # 退出码，还要求它真的报出至少一条通过的用例。
+    local what="$1"; shift
+    local filter="$1"; shift
+    local out status
+    out="$("$@" "${filter}" 2>&1)"
+    status=$?
+    printf '%s\n' "${out}" | tail -6
+    if [ "${status}" -ne 0 ]; then
+        printf 'RED  %s\n' "${what}" >&2
+        failures=$((failures + 1))
+        return 0
+    fi
+    if ! printf '%s\n' "${out}" | grep -Eq 'test result: ok\. [1-9][0-9]* passed'; then
+        printf 'RED  %s：filter“%s”一条用例都没命中，这条判据没跑\n' "${what}" "${filter}" >&2
+        failures=$((failures + 1))
+    fi
+    return 0
+}
+
 run_step() { # run_step <说明> <命令…>
     local what="$1"; shift
     printf '== %s\n' "${what}"
@@ -186,7 +210,8 @@ if [ "${capreg_compiled}" = yes ]; then
     rm -f "${capreg_bin}"
 elif [ -n "${capreg_cargo}" ]; then
     run_step "容量登记表（${capreg_src}，经 cargo test：这份测试带 tests/common 的依赖，rustc 直接编找不到）" \
-        "${capreg_cargo}" test -p cogneva --test rust_capacity_constants_registry_test
+        run_suite_file "容量登记表（经 cargo test）" rust_capacity_constants_registry_test \
+        "${capreg_cargo}" test -p cogneva --test suite
 else
     # 与 pwsh 那一格同一条规矩：跑不了要说出来，不能安静跳过。
     echo "SKIP  容量登记表：本机既没有可用的 rustc 也没有 cargo（CI 的 Test 会跑这一步）"
@@ -225,10 +250,14 @@ fi
 # 推的那一笔红了。反过来也别把它当噪声：那一格绿的时候它确实判过了你树上的东西。
 cargo_bin="${capreg_cargo}"
 if [ -n "${cargo_bin}" ]; then
-    run_step "名字契约（告警规则契约 + 观测面普查）" \
-        "${cargo_bin}" test --no-fail-fast -p cogneva \
-        --test observability_alert_rule_contract_test \
-        --test observability_scrape_census_contract_test
+    # 合并成一个测试二进制之后，选「一份文件」靠的是模块名当 filter：过滤词是模块路径的
+    # 前缀，整份文件的所有用例都在它下面，挑一条用例仍然要再写一层名字——判据还是整份文件
+    # 的，只是它现在住在 `suite` 里。两步分开跑而不是一次给两个 filter：`run_step` 会记下
+    # 失败继续走，两个 verdict 照样都印出来。
+    run_suite_file "名字契约（告警规则契约）" observability_alert_rule_contract_test \
+        "${cargo_bin}" test -p cogneva --test suite
+    run_suite_file "名字契约（观测面普查）" observability_scrape_census_contract_test \
+        "${cargo_bin}" test -p cogneva --test suite
 else
     echo "SKIP  名字契约：本机没有可用的 cargo（CI 的 Code Coverage 会跑这两步）"
 fi
@@ -241,7 +270,8 @@ fi
 # 会开文件的模块」这三种最该被拦下的编辑，本机推之前是看不见的——它们编译得过、单测全绿。
 #
 # 这一格是**带触发条件**的：只有这次要推的提交或当前工作树里动过某个 `Cargo.toml`，
-# 或动过 `crates/cog-core/src`，才跑。判据本身是整份文件的（不挑 filter，挑一条就是在挑判据），
+# 或动过 `crates/cog-core/src`，才跑。判据本身是整份文件的（filter 只写到模块名，挑到单条用例
+# 就是在挑判据），
 # 但它的题目只有 manifest 与 base 源码能出——两处都没动的时候它必然绿，而一次冷编译的代价
 # 是分钟级，不该摊到每一笔上。base 源码那一半是新加的：依赖是否「被写到」与「模块是否动机器」
 # 这两条判的是源码，只盯 manifest 会让一次新增的机制模块等一整轮 CI 才被看见。
@@ -259,10 +289,10 @@ if [ -n "${cargo_bin}" ]; then
         )"
         if [ -n "${skeleton_changed}" ]; then
             echo "== crate 骨架：这次动过 $(printf '%s\n' "${skeleton_changed}" | wc -l) 个 manifest / base 源文件，两份门整份跑"
-            run_step "crate 骨架（依赖方向 / 仅测试 crate / crate 有没有人用 / base 依赖与机制模块）" \
-                "${cargo_bin}" test --no-fail-fast -p cogneva \
-                --test crate_dependency_contract_test \
-                --test core_boundary_contract_test
+            run_suite_file "crate 骨架（依赖方向 / 仅测试 crate / crate 有没有人用）" crate_dependency_contract_test \
+                "${cargo_bin}" test -p cogneva --test suite
+            run_suite_file "crate 骨架（base 依赖与机制模块）" core_boundary_contract_test \
+                "${cargo_bin}" test -p cogneva --test suite
         else
             echo "== crate 骨架：这次没动 Cargo.toml，也没动 crates/cog-core/src，跳过（CI 的 Test 会整份跑）"
         fi

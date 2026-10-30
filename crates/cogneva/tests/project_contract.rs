@@ -17,7 +17,7 @@ use tower::ServiceExt;
 
 use cog_gateway::GatewayState;
 
-mod router_state;
+use crate::router_state;
 
 async fn state() -> Arc<GatewayState> {
     router_state::stateless()

@@ -20,7 +20,7 @@
 //! PostgreSQL in `cog-storage`'s own suite, and what this suite is about is
 //! whether the route writes at all and reads back what it wrote.
 
-mod common;
+use crate::common;
 
 use std::sync::{Arc, Mutex};
 
@@ -32,7 +32,7 @@ use cog_core::{AgentRegistration, AgentRegistry, SFResult};
 use cog_gateway::{create_router, GatewayState};
 use cog_storage::{AgentMessage, AgentMessageStore, NewAgentMessage, SendOutcome};
 
-mod router_state;
+use crate::router_state;
 
 const AGENT: &str = "probe-agent";
 const ROUTE: &str = "/api/v1/agents/probe-agent/messages";

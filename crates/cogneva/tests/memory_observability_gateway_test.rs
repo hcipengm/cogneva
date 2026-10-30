@@ -7,7 +7,7 @@ use cog_storage::{MemoryObservabilityGateway, MemoryStateBackend};
 use futures::StreamExt;
 use std::sync::Arc;
 
-mod common;
+use crate::common;
 
 use common::mocks::MockStateBackend;
 

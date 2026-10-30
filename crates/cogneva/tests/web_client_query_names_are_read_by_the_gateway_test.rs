@@ -54,7 +54,7 @@
 //!   on names the gateway never had — the direction that reports, not the
 //!   direction that goes quiet.
 
-mod common;
+use crate::common;
 
 use common::js_literal::{top_level_keys, KeyWords};
 use common::lex::Dialect;

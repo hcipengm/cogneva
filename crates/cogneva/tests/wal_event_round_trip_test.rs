@@ -20,7 +20,7 @@
 //! names. A variant added to the enum without a specimen fails the census
 //! below; a name the read table lacks fails the round trip.
 
-mod common;
+use crate::common;
 
 use common::routes::repo_root;
 

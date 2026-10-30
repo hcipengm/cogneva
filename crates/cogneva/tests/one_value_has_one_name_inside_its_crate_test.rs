@@ -49,7 +49,7 @@
 //! `const ABLATION_PROBE: &str = "consumed";` 的文件——红，点名 cog-storage 与
 //! `ABLATION_PROBE, INBOX_ORPHAN_STATE_CONSUMED`；删掉它——绿。
 
-mod common;
+use crate::common;
 
 use common::rust_text::is_lower_word;
 

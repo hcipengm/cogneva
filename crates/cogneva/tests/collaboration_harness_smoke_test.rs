@@ -1,7 +1,7 @@
 use common::harness::TestHarness;
 use std::time::Duration;
 
-mod common;
+use crate::common;
 
 #[tokio::test]
 async fn harness_executes_squad_in_pipeline_mode_and_succeeds() {

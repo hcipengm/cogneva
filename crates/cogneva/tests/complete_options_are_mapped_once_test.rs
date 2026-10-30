@@ -23,7 +23,7 @@
 //! - 表里少搬了哪个字段。本门只保证表只有一份；「四个字段对不对」由
 //!   `chat_options_from` 自己的单元测试与 provider 的既有测试覆盖。
 
-mod common;
+use crate::common;
 
 use std::path::{Path, PathBuf};
 
