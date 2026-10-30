@@ -675,3 +675,114 @@ async fn two_drills_at_once_do_not_drop_each_others_database() {
         "第一场的会话关掉之后锁必须能再取到，否则一次崩溃会让演练永远开不了工"
     );
 }
+
+/// 一个**没有超级用户位**的角色，连同它自己的库：恢复必须能在这种角色上跑通。
+///
+/// 这条腿管的是整条降权路线的最后一段——演练与换机恢复过去都只能用实例超级用户
+/// 跑，理由就是恢复里的 `session_replication_role` 只对超级用户开放。这个位要是
+/// 拿不掉，`ALTER ROLE cog_user NOSUPERUSER` 就永远做不成：降完当晚演练当场红。
+///
+/// 子表名排在父表名之前（`..._members` < `..._users`），所以它能装进去这件事本身
+/// 就说明装载顺序按依赖排过，不是碰巧。
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn pg_restore_runs_on_a_role_without_the_superuser_bit() {
+    const USERS: &str = "restricted_probe_users";
+    const MEMBERS: &str = "restricted_probe_members";
+
+    let base = database_url();
+    let cut = base
+        .rfind('/')
+        .expect("a database URL has a path holding the database name");
+    let server = &base[..cut];
+    let (_, host) = server
+        .rsplit_once('@')
+        .expect("the test database URL carries credentials");
+    let admin = PgPool::connect(&format!("{server}/postgres"))
+        .await
+        .unwrap();
+
+    let role = "cog_restore_probe_limited";
+    let db = "cog_restore_probe_restricted";
+    // 上一次跑挂在半路会留下同名角色与库：先清掉，否则 CREATE 直接失败，而那个
+    // 失败与这一条要证明的事无关。
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {db}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'probe-only'"
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+    sqlx::query(&format!("CREATE DATABASE {db} OWNER {role}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    let pool = PgPool::connect(&format!("postgres://{role}:probe-only@{host}/{db}"))
+        .await
+        .unwrap();
+    let is_superuser: bool = sqlx::query_scalar("SELECT current_setting('is_superuser')::bool")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!is_superuser, "这条腿要的正是没有超级用户位的连接");
+
+    for stmt in [
+        format!("CREATE TABLE {USERS} (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL)"),
+        format!(
+            "CREATE TABLE {MEMBERS} (id BIGSERIAL PRIMARY KEY, \
+             user_id BIGINT NOT NULL REFERENCES {USERS}(id), note TEXT)"
+        ),
+        format!("INSERT INTO {USERS} (name) VALUES ('ada'), ('grace'), ('alan')"),
+        format!(
+            "INSERT INTO {MEMBERS} (user_id, note) VALUES (1, 'first'), (2, 'second'), (3, 'third')"
+        ),
+    ] {
+        sqlx::query(&stmt).execute(&pool).await.unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let pg_dir = dir.path().join("pg");
+    backup_postgres(&pool, &pg_dir).await.unwrap();
+
+    // 装回去之前把两边清空：留着原行时「恢复成功」与「什么都没做」同形。
+    sqlx::query(&format!(
+        "TRUNCATE {MEMBERS}, {USERS} RESTART IDENTITY CASCADE"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let restored = restore_postgres(&pool, &pg_dir).await.unwrap();
+    assert!(restored.tables.contains(&MEMBERS.to_string()));
+    assert!(restored.tables.contains(&USERS.to_string()));
+
+    assert_eq!(count_in(&pool, USERS).await, 3);
+    assert_eq!(count_in(&pool, MEMBERS).await, 3);
+
+    // 外键在装载之后必须仍然有效：关掉检查再打开会留下一个「装着坏数据却报成功」
+    // 的恢复，那是比装不上更坏的结局。
+    let dangling = sqlx::query(&format!(
+        "INSERT INTO {MEMBERS} (user_id, note) VALUES (999, 'no such user')"
+    ))
+    .execute(&pool)
+    .await;
+    assert!(dangling.is_err(), "恢复完成后外键检查必须是开着的");
+
+    pool.close().await;
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {db}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+    sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+}

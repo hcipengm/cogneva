@@ -548,6 +548,89 @@ fn tables_without_a_home<'a>(package: &'a [String], current: &[String]) -> Vec<&
         .collect()
 }
 
+/// 包内表之间的外键边，形状是 `(子表, 父表)`。
+///
+/// 只取**两端都在包里**的边。父表不在包里时，它的行在这个库里本来就有（TRUNCATE
+/// CASCADE 已经把它们带走过一次，剩下的就是装完再核的事），或者这张子表根本装不
+/// 回去——那是外键自己会报的错，不在这里提前判一个猜出来的结论。
+async fn foreign_key_edges(
+    pool: &PgPool,
+    tables: &[String],
+) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT child.relname::text, parent.relname::text \
+         FROM pg_constraint c \
+         JOIN pg_class child ON child.oid = c.conrelid \
+         JOIN pg_class parent ON parent.oid = c.confrelid \
+         JOIN pg_namespace n ON n.oid = child.relnamespace \
+         WHERE c.contype = 'f' AND n.nspname = 'public' \
+           AND child.relname = ANY($1) AND parent.relname = ANY($1)",
+    )
+    .bind(tables)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// 按外键依赖排装载顺序：被引用的表先装，同层按名字排。
+///
+/// 一个表能装进去的条件是它的父表都已经装好。同层按名字排是为了让同一个包每次都
+/// 走同一条路——顺序不稳定时，一次装不上的位置会随运行漂，读日志的人分不清「这次
+/// 与上次是不是同一个问题」。
+///
+/// 成环时返回环上剩下的那些表：环里任何顺序都会被外键挡住，说得出是哪几张表，比
+/// 只说「装失败」有用。只有受限角色那条路会遇到它——超权那条路关掉了外键检查。
+fn load_order(tables: &[String], edges: &[(String, String)]) -> Result<Vec<String>, Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let in_package: BTreeSet<&str> = tables.iter().map(|table| table.as_str()).collect();
+    let mut waiting_on: BTreeMap<&str, BTreeSet<&str>> = in_package
+        .iter()
+        .map(|table| (*table, BTreeSet::new()))
+        .collect();
+    for (child, parent) in edges {
+        // 只等**这个包里也有**的父表：不在包里的父表要么本来就在库里（它的行
+        // 不归这一趟装），要么这张子表根本装不进去——那是外键自己会报的错。
+        if !in_package.contains(parent.as_str()) {
+            continue;
+        }
+        if let Some(parents) = waiting_on.get_mut(child.as_str()) {
+            parents.insert(parent.as_str());
+        }
+    }
+
+    let mut order = Vec::with_capacity(tables.len());
+    let mut remaining: BTreeSet<&str> = tables.iter().map(|table| table.as_str()).collect();
+    loop {
+        let ready: Vec<&str> = remaining
+            .iter()
+            .copied()
+            .filter(|table| {
+                waiting_on
+                    .get(table)
+                    .map(|parents| parents.is_empty())
+                    .unwrap_or(true)
+            })
+            .collect();
+        if ready.is_empty() {
+            break;
+        }
+        for table in ready {
+            order.push(table.to_string());
+            remaining.remove(table);
+            for parents in waiting_on.values_mut() {
+                parents.remove(table);
+            }
+        }
+    }
+
+    if remaining.is_empty() {
+        Ok(order)
+    } else {
+        Err(remaining.into_iter().map(str::to_string).collect())
+    }
+}
+
 /// 包里的列中，目标表接受写入的那些：生成列由目标自己算，不在这份名单里。
 /// `SELECT setval('name', …)` 里那个序列名。认不出返回 `None`，调用方按原样执行。
 ///
@@ -735,9 +818,19 @@ pub struct RestoreReport {
 }
 
 /// PG 恢复：整包表一次性 TRUNCATE ... RESTART IDENTITY CASCADE，
-/// 同一事务内关掉触发器（含外键检查）逐表 COPY FROM，最后序列归位。
-/// 目标必须是跑完迁移的库（fresh install 天然是）；session_replication_role
-/// 需要超级用户，集群的 POSTGRES_USER 与 CI 的 postgres 都满足。
+/// 同一事务内逐表 COPY FROM，最后序列归位。
+/// 目标必须是跑完迁移的库（fresh install 天然是）。
+///
+/// 装载顺序与外键检查有两种走法，按**连接的角色**选，不按部署形态选：
+///
+/// * 角色有超级用户位（`session_replication_role` 只有它能改）：关掉触发器（含
+///   外键）一次装完。这是快的那条，与装载顺序无关，代价是它要求调用方手里有一个
+///   超权连接——恢复与演练因此过去都只能用实例超级用户跑。
+/// * 角色没有超级用户位：外键检查开着，**按依赖顺序装**（被引用的表先装），
+///   同层按名字排。慢一点，但一个只拿了「建库 + 建表」权限的角色就能把整包装回去
+///   ——演练与换机恢复于是不必再借那个位。
+///
+/// 两条走法装出来的数据一样：顺序只决定外键检查能不能过，不决定装进去什么。
 pub async fn restore_postgres(
     pool: &PgPool,
     pkg_pg_dir: &Path,
@@ -780,10 +873,31 @@ pub async fn restore_postgres(
     }
 
     if !tables.is_empty() {
-        let mut tx = pool.begin().await?;
-        sqlx::query("SET LOCAL session_replication_role = 'replica'")
-            .execute(&mut *tx)
+        // 这一趟怎么装由**这条连接的角色**决定，与配置里写的是哪种部署形态无关：
+        // 同一个 DSN 换一个角色，走的就是另一条路。
+        let is_superuser: bool = sqlx::query_scalar("SELECT current_setting('is_superuser')::bool")
+            .fetch_one(pool)
             .await?;
+        let mut load = tables.clone();
+        let mut tx = pool.begin().await?;
+        if is_superuser {
+            sqlx::query("SET LOCAL session_replication_role = 'replica'")
+                .execute(&mut *tx)
+                .await?;
+        } else {
+            let edges = foreign_key_edges(pool, &tables).await?;
+            load = load_order(&tables, &edges).map_err(|cycle| {
+                format!(
+                    "恢复用的角色没有超级用户位，只能按依赖顺序装载，而外键在 {} 上成环：\
+                     环上任何一种顺序都会被外键挡住；换一个能改 session_replication_role 的角色跑这一趟",
+                    cycle.join("、")
+                )
+            })?;
+            tracing::info!(
+                tables = load.len(),
+                "restore: 连接的角色没有超级用户位，按依赖顺序装载，外键检查开着"
+            );
+        }
         let quoted: Vec<String> = tables.iter().map(|t| format!("\"{t}\"")).collect();
         sqlx::query(&format!(
             "TRUNCATE {} RESTART IDENTITY CASCADE",
@@ -791,7 +905,9 @@ pub async fn restore_postgres(
         ))
         .execute(&mut *tx)
         .await?;
-        for table in &tables {
+        // 装的是 `load` 不是 `tables`：超权那条路两者相同，受限角色那条路里面是
+        // 排好依赖的顺序。报告里仍然给 `tables`（包里有哪几张），顺序不是它的答案。
+        for table in &load {
             // 分块流式灌入：整表读进内存会在大表上把容器打 OOM
             // （metrics 类表 CSV 可达数百 MB 并随时间增长）。
             let path = pkg_pg_dir.join(format!("public.{table}.csv"));
@@ -5174,6 +5290,59 @@ mod tests {
         );
         // 没有 scheme、没有库名：只剩地址的那一段原样交出去，不编一个库名。
         assert_eq!(endpoint_of("postgres:5432"), "postgres:5432");
+    }
+
+    /// 没有超级用户位时外键检查是开着的，装载顺序就是唯一能让它通过的东西。
+    /// 父表排在子表之后，这一趟会在第一张子表上撞外键——而这正是过去只能用
+    /// 超级用户跑恢复的那条理由。
+    #[test]
+    fn a_restricted_role_loads_parents_before_children() {
+        let tables = vec!["members".to_string(), "users".to_string()];
+        let edges = vec![("members".to_string(), "users".to_string())];
+        assert_eq!(
+            load_order(&tables, &edges).unwrap(),
+            vec!["users".to_string(), "members".to_string()]
+        );
+    }
+
+    /// 同层按名字排：同一个包装两次走同一条路，失败的位置才不会随运行漂。
+    #[test]
+    fn tables_waiting_on_the_same_parent_are_ordered_by_name() {
+        let tables = vec!["zeta".to_string(), "alpha".to_string(), "users".to_string()];
+        let edges = vec![
+            ("zeta".to_string(), "users".to_string()),
+            ("alpha".to_string(), "users".to_string()),
+        ];
+        assert_eq!(
+            load_order(&tables, &edges).unwrap(),
+            vec!["users".to_string(), "alpha".to_string(), "zeta".to_string()]
+        );
+    }
+
+    /// 边的一头不在包里时不算数：父表不在包里不等于装不进去，它只是不参与排序。
+    #[test]
+    fn an_edge_to_a_table_outside_the_package_does_not_block_the_load() {
+        let tables = vec!["members".to_string()];
+        let edges = vec![("members".to_string(), "users".to_string())];
+        assert_eq!(
+            load_order(&tables, &edges).unwrap(),
+            vec!["members".to_string()]
+        );
+    }
+
+    /// 环上任何一种顺序都会被外键挡住，所以要说得出是哪几张表——只说「装失败」
+    /// 会让读的人以为包坏了。
+    #[test]
+    fn a_foreign_key_cycle_names_the_tables_it_cannot_order() {
+        let tables = vec!["a".to_string(), "b".to_string(), "free".to_string()];
+        let edges = vec![
+            ("a".to_string(), "b".to_string()),
+            ("b".to_string(), "a".to_string()),
+        ];
+        let cycle = load_order(&tables, &edges).unwrap_err();
+        assert_eq!(cycle, vec!["a".to_string(), "b".to_string()]);
+        // 环外的表照样排得出来，只是到它为止的部分不构成可以提交的顺序。
+        assert!(cycle.iter().all(|table| table != "free"));
     }
 
     /// 一趟超时必须留下**一行能读的结论**，而不是让 Job 的界把进程杀掉。

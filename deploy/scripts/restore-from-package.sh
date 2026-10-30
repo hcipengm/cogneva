@@ -350,10 +350,10 @@ $EVOLUTION_AFFINITY
                 secretKeyRef:
                   name: cogneva-secrets
                   key: pg-password
-            # 恢复跑在实例超级用户上，**故意**不是业务那个受限角色：它要把表
-            # 整批灌回去（恢复路径的 `session_replication_role` 只对超级用户开放），
-            # 而目标实例此刻可能还没有那个受限角色——它由一次性的角色引导 Job 建，
-            # 恢复先于它跑是正常顺序。
+            # 恢复跑在实例的属主角色上，**故意**不是业务那个受限角色：目标实例
+            # 此刻可能还没有角色引导 Job 建出来的那个角色，恢复先于它跑是正常顺序。
+            # 超级用户位不是必需的：有它时恢复关掉外键检查一次装完，没有它时按
+            # 依赖顺序装、外键照样在检查。
             - name: COGNEVA_DATABASE_URL
               value: "postgres://cog_user:\$(PG_PASSWORD)@postgres.$NS.svc.cluster.local:$PG_PORT/cogneva"
             - name: COGNEVA_QDRANT_HTTP_URL

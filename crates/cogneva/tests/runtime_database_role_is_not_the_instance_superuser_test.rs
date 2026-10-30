@@ -16,10 +16,11 @@
 //!   的实例**看不出来——它的角色早就在了；
 //! - 口令键漏了：Job 建出没有口令的角色，或者业务侧拿不到那份口令。
 //!
-//! 唯一允许的例外是备份演练：它要把包装回一个一次性库，恢复路径里的
-//! `SET LOCAL session_replication_role` 只对超级用户开放，而建那个库本身要
-//! CREATEDB。这条例外不是「漏改」，所以它也必须被钉住——把演练也顺手改过去，
-//! 演练会在真出事的那天才红。
+//! 唯一允许的例外是备份演练：它要在同一台服务器上 `CREATE DATABASE` 一个一次性
+//! 库，而业务那个受限角色没有 CREATEDB。恢复本身不要求超级用户位——有它时关掉
+//! 外键检查一次装完，没有它时按依赖顺序装、外键照样在检查（`restore_postgres` 按
+//! 连接的角色选这两条路）。这条例外不是「漏改」，所以它也必须被钉住——把演练也
+//! 顺手改过去，演练会在真出事的那天才红。
 
 use crate::common;
 
@@ -134,16 +135,16 @@ fn every_business_workload_connects_as_the_restricted_role() {
     let mut offenders = Vec::new();
     let mut drill_documents = 0;
     for (file, index, role) in &seen {
-        // 演练是唯一的例外，判据是**这份文档自己叫什么**：它把包装回一次性库，
-        // 恢复路径的 `session_replication_role` 只对超级用户开放。按文档判而不是
-        // 按文件判，是因为 chart 的 `backup.yaml` 同时装着导出与演练两个 CronJob：
-        // 按文件比会把「导出已经换成受限角色」这件事一起抹掉。
+        // 演练是唯一的例外，判据是**这份文档自己叫什么**：它要在源库那台服务器上
+        // 建一次性库，业务那个受限角色没有 CREATEDB。按文档判而不是按文件判，是
+        // 因为 chart 的 `backup.yaml` 同时装着导出与演练两个 CronJob：按文件比会把
+        // 「导出已经换成受限角色」这件事一起抹掉。
         let is_drill = file.ends_with("backup.yaml") || file.ends_with("backup-drill-cronjob.yaml");
         if is_drill && drill_document(&root, file, *index) {
             drill_documents += 1;
             assert_eq!(
                 role, SUPERUSER_ROLE,
-                "{file} 第 {index} 份文档是演练，它连的是源库并要建一次性库，必须仍是超级用户"
+                "{file} 第 {index} 份文档是演练，它连的是源库属主并要建一次性库；业务那个受限角色没有 CREATEDB"
             );
             continue;
         }
