@@ -12,6 +12,11 @@
 # 某个后端操作从没成功过。八条里有五条是「A 在涨、B 没涨」的**反事实**形状，
 # 每条都配了「两半都在」的静格：把 `unless` 删掉，那一格会亮。
 #
+# `memory_backend_operation_never_succeeds` 还带一条**覆盖腿**：包络读法（窗口内领先值的
+# 高低差）只在窗口真的被观测过时才说明问题，历史比窗口短时差也是 0，规则会把这个洞读成
+# 「没有增长」。所以它的两格分开：一格 13 小时、覆盖腿成立（响），一格 60 分钟、覆盖腿
+# 不成立（静）——后者正是这条腿的反例，删掉覆盖腿它就会亮。
+#
 #   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
 #   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-claim-memory.test.yaml \
 #   bash deploy/scripts/test-acceptance-census-alert-rules.sh
@@ -134,9 +139,6 @@ tests:
       - eval_time: 60m
         alertname: memory_bus_claim_rounds_all_failed
         exp_alerts: []
-      - eval_time: 60m
-        alertname: memory_backend_operation_never_succeeds
-        exp_alerts: []
 
   # 卷用了 95%、申请 100：过九成但还没满，`fill_level_high` 亮，标签带着卷的身份。
   - interval: 1m
@@ -250,9 +252,9 @@ tests:
               severity: warning
               node: n2
 
-  # 记忆面八条**全部**在说坏消息：衰减只有失败、原始积压老化而重驱一次没跑、抽取扫描失败、
-  # 死信写了、schema 修复只有失败、孤儿修不了、总线认领只有失败、fetch 的错误数等于总操作数
-  # （成功数 0）。八条全亮。
+  # 记忆面七条**全部**在说坏消息：衰减只有失败、原始积压老化而重驱一次没跑、抽取扫描失败、
+  # 死信写了、schema 修复只有失败、孤儿修不了、总线认领只有失败。七条全亮。第八条
+  # （`memory_backend_operation_never_succeeds`）要窗口长过它的 6h，单独两格。
   # 注意「重驱」「总线认领成功」这两条读数必须**存在且为 0**：反事实那一半是空的时，
   # 整个乘积也是空的——规则宁可不响，也不拿「没读数」当「没有成功」。
   - interval: 1m
@@ -277,10 +279,6 @@ tests:
         values: '0x60'
       - series: 'memory_operations_total{operation="bus_claim_failed"}'
         values: '0x55 1x5'
-      - series: 'memory_operation_errors_total{operation="fetch"}'
-        values: '0x40 1x20'
-      - series: 'memory_operations_total{operation="fetch"}'
-        values: '0x40 1x20'
     alert_rule_test:
       - eval_time: 60m
         alertname: memory_decay_passes_all_failed
@@ -315,12 +313,6 @@ tests:
           - exp_labels:
               severity: warning
               operation: bus_claim_failed
-      - eval_time: 60m
-        alertname: memory_backend_operation_never_succeeds
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              operation: fetch
 
   # schema 修复里既有失败、也有「修不了」的孤儿：`orphans_unrepairable` 亮；而
   # `repair_passes_all_failed` 静——「修不了」算在「非失败」那一半里，所以这一轮不是全失败。
@@ -403,4 +395,37 @@ tests:
         exp_alerts: []
       - eval_time: 60m
         alertname: memory_unextracted_scan_failed
+        exp_alerts: []
+
+  # fetch 这个后端操作十二小时里只有失败、一次成功也没有，错误数与总操作数完全重合：
+  # 「这个操作没在被服务」成立。它还要窗口**被观测过**——读数每小时的采样点铺满十三小时，
+  # 所以 12h 的子查询计数（十三拍）大于 6h 的（七拍），覆盖腿成立，规则亮。
+  # 两条读数必须一起给：只给错误数时 `unless` 那一半是空的，乘积也是空的。
+  - interval: 1h
+    input_series:
+      - series: 'memory_operation_errors_total{operation="fetch"}'
+        values: '0x8 1x5'
+      - series: 'memory_operations_total{operation="fetch"}'
+        values: '0x8 1x5'
+    alert_rule_test:
+      - eval_time: 720m
+        alertname: memory_backend_operation_never_succeeds
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              operation: fetch
+
+  # 同样的「只有失败」形状，但历史只有一小时：两个读数都在涨，`unless` 那半也对得上，
+  # 单看形状它会亮。覆盖腿把它挡成静——6h 的问题只拿到 1h 的样本，窗口有没有被观测过
+  # 答不上来，而「没观测到」与「这一小时真的没动」在包络里同形。删掉那条腿，这一格会亮。
+  # 这就是包络读法自带的风险，也是它必须配覆盖腿的原因。
+  - interval: 1m
+    input_series:
+      - series: 'memory_operation_errors_total{operation="fetch"}'
+        values: '0x40 1x20'
+      - series: 'memory_operations_total{operation="fetch"}'
+        values: '0x40 1x20'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: memory_backend_operation_never_succeeds
         exp_alerts: []

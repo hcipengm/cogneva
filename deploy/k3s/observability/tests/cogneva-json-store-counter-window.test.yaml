@@ -16,6 +16,13 @@
 # pod 滚动换序列时值本身是那一行 store 的总量、跨序列连续。`[24h:1m]` 那一段是子查询，
 # 少写步长是解析错误（`ranges only allowed for vector selectors`）。
 #
+# 包络的下锚是一句「窗口里最低到过多少」，不是「整个窗口被观测过」——序列比窗口年轻时它
+# 只会让差**变小**，而这几条规则是「差为 0 就报」，欠读会把「这段时间没动」读成真。所以
+# 规则还带一条覆盖腿：同一个逐拍读数取两倍窗口的步数，要求它多于窗口自己的步数。
+# 这份夹具因此有两段历史：值断言那几格要 48 小时以上的采样才能让覆盖腿成立，而 41、40、41
+# 那半分钟必须原样落在窗口末端——所以它们用 1m 粒度、49 小时的输入（紧凑写法），要判的
+# 三拍一格不少。
+#
 # 这份夹具判的是**数**，不是响不响：`change_tier_routing_inert` 的表达式原样返回左侧的
 # 增量，所以同一个输入在新旧两种读法下给出不同的值，而 `> 0` 的判词两种读法都会亮——
 # 只判响不响的夹具对这一族缺陷完全失明。表达式用 `'__rule_promql:<名字>'` 占位，由跑者
@@ -33,13 +40,14 @@ evaluation_interval: 1m
 
 tests:
   # 一格什么都没有：分档计数器不涨，规则静。这一格同时是后面几格的对照——值断言里
-  # 读到的数不是「有个默认值」，而是真从序列上算出来的。
+  # 读到的数不是「有个默认值」，而是真从序列上算出来的。1h 粒度就够：覆盖腿比的是
+  # 「有多少步读到了东西」之比，均匀采样下 240 > 120 照样成立。
   - interval: 1h
     input_series:
       - series: 'cogneva_change_tier_total{tier="fast"}'
-        values: '0x26'
+        values: '0x49'
     alert_rule_test:
-      - eval_time: 26h
+      - eval_time: 49h
         alertname: change_tier_routing_inert
         exp_alerts: []
 
@@ -47,9 +55,11 @@ tests:
   - interval: 1h
     input_series:
       - series: 'cogneva_change_tier_total{tier="fast"}'
-        values: '0x20 3x6'
+        values: '0x48 3'
+      - series: 'cogneva_change_tier_total{tier="real_gate"}'
+        values: '0x49'
     alert_rule_test:
-      - eval_time: 26h
+      - eval_time: 49h
         alertname: change_tier_routing_inert
         exp_alerts:
           - exp_labels:
@@ -62,26 +72,26 @@ tests:
   - interval: 1m
     input_series:
       - series: 'cogneva_change_tier_total{tier="fast",pod="a"}'
-        values: '41x3'
+        values: '41x2941'
       - series: 'cogneva_change_tier_total{tier="fast",pod="b"}'
-        values: '40x3'
+        values: '40x2941'
     promql_expr_test:
       - expr: '__rule_promql:change_tier_routing_inert'
-        eval_time: 3m
+        eval_time: 2940m
         exp_samples:
           - labels: '{}'
             value: 0
 
   # 合并后的序列：领先/落后那半分钟被写成一次回落。新读法读 1（最大值与最小值之差），
-  # 旧读法把三跳按「每次回落都是一次重置」全加一遍——在这份序列上是 71.75。
+  # 旧读法把三跳按「每次回落都是一次重置」全加一遍——在这份序列上是几十。
   # 这一格判的就是那条：**回落不是事件，是同一个事实在两个进程里的先后。**
   - interval: 1m
     input_series:
       - series: 'cogneva_change_tier_total{tier="fast"}'
-        values: '41 40 41'
+        values: '41x2938 41 40 41'
     promql_expr_test:
       - expr: '__rule_promql:change_tier_routing_inert'
-        eval_time: 3m
+        eval_time: 2940m
         exp_samples:
           - labels: '{}'
             value: 1
@@ -93,12 +103,12 @@ tests:
   - interval: 1m
     input_series:
       - series: 'cogneva_change_tier_total{tier="fast",pod="a"}'
-        values: '0+1x4 _x5'
+        values: '0x2931 0+1x5 _x5'
       - series: 'cogneva_change_tier_total{tier="fast",pod="b"}'
-        values: '_x5 5+1x4'
+        values: '_x2936 5+1x5'
     promql_expr_test:
       - expr: '__rule_promql:change_tier_routing_inert'
-        eval_time: 9m
+        eval_time: 2940m
         exp_samples:
           - labels: '{}'
             value: 9
