@@ -374,6 +374,10 @@ ensure_blank_oob() {
 
 echo "==> 内部实例密钥（自动随机生成，缺失才创建）"
 ensure_random pg-password
+# 业务进程连库的角色（cog_app）口令，与 pg-password 分属两个角色：那个是实例
+# 超级用户，只在数据库自身与一次性的角色引导里出现。这个键由引导 Job 写进角色，
+# 业务 Pod 只读它。
+ensure_random app-password
 ensure_random redis-password
 ensure_random webhook-internal
 ensure_random jwt-secret

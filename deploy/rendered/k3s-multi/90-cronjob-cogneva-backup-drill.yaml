@@ -86,6 +86,11 @@ spec:
                 # `jobTemplate.spec.activeDeadlineSeconds` 是一对。
                 - name: COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS
                   value: "3600"
+                # 这一处**故意**仍是实例超级用户，不是漏改：演练要把包装回一个
+                # 一次性库，恢复路径里的 `SET LOCAL session_replication_role`
+                # 只对超级用户开放（那是关外键与触发器检查唯一不依赖装载顺序的
+                # 办法），而建那个库本身要 CREATEDB。业务 Pod 那条注入面不在这里：
+                # 这个 CronJob 跑的是固定参数的自有代码，不解析任何外部输入。
                 - name: PG_PASSWORD
                   valueFrom:
                     secretKeyRef:

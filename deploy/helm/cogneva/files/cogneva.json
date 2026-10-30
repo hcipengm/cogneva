@@ -212,12 +212,12 @@
       "provider": "postgres",
       "enabled": true,
       "options": {
-        "connection": "postgres://cog_user:${PG_PASSWORD}@postgres.cogneva.svc.cluster.local:5432/cogneva",
+        "connection": "postgres://cog_app:${APP_PASSWORD}@postgres.cogneva.svc.cluster.local:5432/cogneva",
         "host": "postgres.cogneva.svc.cluster.local",
         "port": 5432,
         "database": "cogneva",
-        "user": "cog_user",
-        "password": "${PG_PASSWORD}"
+        "user": "cog_app",
+        "password": "${APP_PASSWORD}"
       }
     },
     "vector": {

@@ -26,7 +26,7 @@ spec:
       annotations:
         # 同主应用：这个 Pod 也挂 cogneva-json、也经 envFrom 取 cogneva-config，
         # 两份配置里任何一份变了它都得跟着重启，否则进程读到的仍是启动时那份。
-        checksum/config: 7771146433b6f2242982150a44a63ea115a2982d4b0ffb8eb8f15cb050996054
+        checksum/config: 36b1d2e1823f9978172c27eb387a63e337206d50f09522e12115b6c929584db9
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution
@@ -204,18 +204,20 @@ spec:
                   optional: true
             # 沙盒零凭证：LLM/平台流量经安全网关透传，真实 key 只在网关 Pod。
             # 缺这三个 env 时 Provider 直连公网平台——集群仅网关在 egress 白名单，直连必败。
-            - name: PG_PASSWORD
+            # 连库用的是 cog_app，不是上面那个实例超级用户：注入到任意一条 SQL 里的
+            # 东西，拿到的是 cogneva 库的读写，不是整台实例。
+            - name: APP_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
-                  key: pg-password
+                  key: app-password
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: redis-password
             - name: COGNEVA_DATABASE_URL
-              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
+              value: "postgres://cog_app:$(APP_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
             - name: COGNEVA_GITHUB_API_BASE
               value: "http://cogneva-security-gateway:8081/github"
             - name: COGNEVA_GITEE_API_BASE

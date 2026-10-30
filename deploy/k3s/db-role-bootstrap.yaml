@@ -1,0 +1,178 @@
+# 业务连库的角色不是实例的超级用户：建 cog_app、把 cogneva 库里现有对象的
+# 所有权从超级用户挪到它名下、给它 public 上的 CREATE。业务 Pod 换它连库之后，
+# 注入到任意一条 SQL 里的东西拿到的是这个库的读写，不是整台实例。
+#
+# 脚本正文与 chart 的 `files/db-role-bootstrap.sh` 是同一份；改这里就是改那一份，
+# 两边由 field-level parity 门禁对齐。
+#
+# 这是个一次性 Job（`kubectl apply` 路径下没有 helm 的 hook 语义）：重复 apply
+# 不会重跑，而它本身是幂等的——角色在、对象已经不在 cog_user 名下时，循环读不到
+# 任何一行。确实要再跑一遍时装或升级流程会重建它。
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cogneva-db-role-bootstrap
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: database-bootstrap
+data:
+  db-role-bootstrap.sh: |
+    #!/bin/sh
+    # 业务连库的角色不是实例的超级用户。
+    #
+    # 这一步把 cog_app 做实：建角色、设口令、把 cogneva 库里现有对象的所有权从
+    # 超级用户挪到它名下，再给它 public 上的 CREATE。之后业务 Pod 换成它连库，
+    # 而 cog_user 只剩数据库自身、备份导出与演练在用。
+    #
+    # 为什么所有权必须挪而不能只 GRANT：分区维护要 DETACH/ATTACH 默认分区，那是
+    # 表属主才有的权限，GRANT 给不出来；而把 cog_app 授成超级用户那个角色的成员
+    # 更不行——成员可以 SET ROLE 过去，超权原样递过去，等于没做。
+    #
+    # 幂等：角色存在就不再建，对象已经不在 cog_user 名下就不会被这个循环读到。
+    # 每一步失败即停（ON_ERROR_STOP），因为半途停下的结果要么是口令没设、要么是
+    # 一半对象还挂在超级用户名下，两者都不该被当成「做完了」。
+
+    set -eu
+
+    : "${APP_PASSWORD:?app-password must be injected}"
+    : "${PGHOST:?}"
+
+    attempt=0
+    until pg_isready -q -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE"; do
+      attempt=$((attempt + 1))
+      if [ "$attempt" -ge 120 ]; then
+        echo "postgres never became ready; the role cannot be bootstrapped" >&2
+        exit 1
+      fi
+      sleep 2
+    done
+
+    psql -v ON_ERROR_STOP=1 -v app_password="$APP_PASSWORD" -f /dev/stdin <<'SQL'
+    -- 改属主要拿每张表的 ACCESS EXCLUSIVE 锁。业务进程此刻还在写这些表，等一把
+    -- 长事务就等于整个 Job 无声地挂着；宁可超时失败让 Job 重试——它幂等，重跑会接着
+    -- 挪剩下的那些。
+    SET lock_timeout = '15s';
+
+    DO $do$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cog_app') THEN
+        CREATE ROLE cog_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION;
+      END IF;
+    END
+    $do$;
+
+    ALTER ROLE cog_app WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+      PASSWORD :'app_password';
+
+    GRANT CONNECT ON DATABASE cogneva TO cog_app;
+    GRANT USAGE, CREATE ON SCHEMA public TO cog_app;
+
+    DO $do$
+    DECLARE
+      obj record;
+    BEGIN
+      -- 表、分区、视图、物化视图、序列：索引与外键随表走，不必单列。
+      -- 扩展成员（deptype = 'e'）跳过：它们的属主要跟着扩展走，改了会让
+      -- ALTER EXTENSION 在需要升级时找不到属主。
+      FOR obj IN
+        SELECT c.oid::regclass AS name
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = 'cog_user')
+          AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e')
+      LOOP
+        EXECUTE format('ALTER TABLE %s OWNER TO cog_app', obj.name);
+      END LOOP;
+
+      FOR obj IN
+        SELECT p.oid::regprocedure AS name
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND p.proowner = (SELECT oid FROM pg_roles WHERE rolname = 'cog_user')
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = p.oid AND d.deptype = 'e')
+      LOOP
+        EXECUTE format('ALTER FUNCTION %s OWNER TO cog_app', obj.name);
+      END LOOP;
+
+      -- 枚举与域是显式造的类型；组合类型（'c'）跟着表自动走，单列出来反而会报
+      -- 「它是某张表的类型」。
+      FOR obj IN
+        SELECT t.oid::regtype AS name
+        FROM pg_type t
+        JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'public'
+          AND t.typowner = (SELECT oid FROM pg_roles WHERE rolname = 'cog_user')
+          AND t.typtype IN ('d', 'e')
+          AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = t.oid AND d.deptype = 'e')
+      LOOP
+        EXECUTE format('ALTER TYPE %s OWNER TO cog_app', obj.name);
+      END LOOP;
+    END
+    $do$;
+    SQL
+
+    echo "db role bootstrap: cog_app is ready and owns the cogneva schema objects"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cogneva-db-role-bootstrap
+  namespace: cogneva
+  labels:
+    app.kubernetes.io/name: cogneva
+    app.kubernetes.io/component: database-bootstrap
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cogneva-db-role-bootstrap
+        app.kubernetes.io/component: database-bootstrap
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+      containers:
+        - name: bootstrap
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "/bootstrap/db-role-bootstrap.sh"]
+          env:
+            - name: PGHOST
+              value: postgres.cogneva.svc.cluster.local
+            - name: PGPORT
+              value: "5432"
+            - name: PGDATABASE
+              value: "cogneva"
+            # 超级用户只在这里出现一次：建角色与改属主需要它，业务侧不需要。
+            - name: PGUSER
+              value: "cog_user"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: pg-password
+            - name: APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: app-password
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: bootstrap-script
+              mountPath: /bootstrap
+              readOnly: true
+      volumes:
+        - name: bootstrap-script
+          configMap:
+            name: cogneva-db-role-bootstrap

@@ -84,13 +84,14 @@ spec:
               imagePullPolicy: Always
               args: ["backup"]
               env:
-                - name: PG_PASSWORD
+                # 导出用 cog_app：它是这些表的属主，pg_dump 读得到全部内容。
+                - name: APP_PASSWORD
                   valueFrom:
                     secretKeyRef:
                       name: cogneva-secrets
-                      key: pg-password
+                      key: app-password
                 - name: COGNEVA_DATABASE_URL
-                  value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
+                  value: "postgres://cog_app:$(APP_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
                 # 快照 API 只在 Qdrant REST 端口（6333），gRPC（6334）没有。
                 - name: COGNEVA_QDRANT_HTTP_URL
                   value: "http://qdrant.cogneva.svc.cluster.local:6333"

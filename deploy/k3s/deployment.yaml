@@ -45,7 +45,7 @@ spec:
         # 一直用旧配置，回滚只改 ConfigMap 时进程仍用新配置。指纹同时覆盖 env 那份
         # cogneva-config（通知/告警出口地址在那里），只哈希卷里那份会让「配好地址但
         # 不重启」永远挂不上出口。
-        checksum/config: 7771146433b6f2242982150a44a63ea115a2982d4b0ffb8eb8f15cb050996054
+        checksum/config: 36b1d2e1823f9978172c27eb387a63e337206d50f09522e12115b6c929584db9
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
@@ -91,11 +91,13 @@ spec:
             # Secret overrides — must use env names that apply_env_overrides() recognises.
             # LLM 与代码平台凭证只注入安全网关，主应用零持有、经网关代理访问，
             # 因此这里不再挂 OPENAI/ANTHROPIC/GitHub/Gitee 任何凭证。
-            - name: PG_PASSWORD
+            # 连库用的是 cog_app，不是上面那个实例超级用户：注入到任意一条 SQL 里的
+            # 东西，拿到的是 cogneva 库的读写，不是整台实例。
+            - name: APP_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
-                  key: pg-password
+                  key: app-password
             # Redis 认证：cogneva.json 的 dag_executor.redis_url 经 ${REDIS_PASSWORD} 插值
             - name: REDIS_PASSWORD
               valueFrom:
@@ -106,7 +108,7 @@ spec:
             # 一个后端（api_key/model 是写死的非敏感占位），真 key 只在安全
             # 网关 Pod，LLM 流量经网关 8081 透传。
             - name: COGNEVA_DATABASE_URL
-              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
+              value: "postgres://cog_app:$(APP_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
             # 引导管理员（admin）的登录口令：装机时随机生成、只从 Secret 注入。
             # 正式部署里有用户库但没有本地管理员，没有这一条客户装完只能走外部平台账号。
             # optional：旧部署缺这个键也要能起；缺键等于没开这扇门。

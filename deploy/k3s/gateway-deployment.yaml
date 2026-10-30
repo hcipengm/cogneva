@@ -34,7 +34,7 @@ spec:
       annotations:
         # 本 Pod 经 envFrom 取 cogneva-config。env 只在进程启动时读一次，所以
         # 只改配置的那次升级必须换掉这个模板，否则改完地址也不会生效。
-        checksum/config: 7771146433b6f2242982150a44a63ea115a2982d4b0ffb8eb8f15cb050996054
+        checksum/config: 36b1d2e1823f9978172c27eb387a63e337206d50f09522e12115b6c929584db9
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
@@ -247,18 +247,20 @@ spec:
             # ── 上游池可观测与自愈落盘 ──
             # 告警状态机落 PG（重启可查历史），池状态跨进程信号走 Redis。
             # 复用集群内既有实例，凭证来自 cogneva-secrets（安装时随机生成）。
-            - name: PG_PASSWORD
+            # 连库用的是 cog_app，不是上面那个实例超级用户：注入到任意一条 SQL 里的
+            # 东西，拿到的是 cogneva 库的读写，不是整台实例。
+            - name: APP_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
-                  key: pg-password
+                  key: app-password
             - name: REDIS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: redis-password
             - name: COGNEVA_DATABASE_URL
-              value: "postgres://cog_user:$(PG_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
+              value: "postgres://cog_app:$(APP_PASSWORD)@postgres.cogneva.svc.cluster.local:5432/cogneva"
             - name: COGNEVA_REDIS_URL
               value: "redis://:$(REDIS_PASSWORD)@redis-0.redis.cogneva.svc.cluster.local:6379"
             # 日志→Loki、时序明细→ClickHouse、告警→Alertmanager；端点随观测栈，

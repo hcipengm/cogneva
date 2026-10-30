@@ -358,7 +358,7 @@ def json_diff(a, b, path=''):
 
 # 两侧都出现的资源类型都必须在这里有答案：比对方式是一次决定，没决定就不算比过。
 COVERED_KINDS = {
-    'Deployment', 'StatefulSet', 'DaemonSet', 'CronJob', 'Service',
+    'Deployment', 'StatefulSet', 'DaemonSet', 'CronJob', 'Job', 'Service',
     'Role', 'ClusterRole', 'RoleBinding', 'ClusterRoleBinding',
     'ResourceQuota', 'LimitRange', 'PersistentVolumeClaim', 'ConfigMap',
     'NetworkPolicy', 'Ingress', 'StorageClass', 'Namespace', 'ServiceAccount',
@@ -386,7 +386,11 @@ for kind in sorted({n[0] for n in both}):
 
 for name in sorted(both):
     kind = name[0]
-    if kind in ('Deployment', 'StatefulSet', 'DaemonSet', 'CronJob'):
+    # Job 的 Pod 模板与 Deployment 同形（spec.template），所以走同一条比对：
+    # 它是一次性的，但决定它做成什么的那份东西——镜像、env、命令、挂载、身份——
+    # 与别的负载一样会在一侧改、另一侧没改，而那种漂移不报错，只让装了它的集群
+    # 与渲染出来的清单说的不是同一件事。
+    if kind in ('Deployment', 'StatefulSet', 'DaemonSet', 'CronJob', 'Job'):
         ka = workload(pod_doc(k[name], kind))
         ha = workload(pod_doc(h[name], kind))
         for key in ('sa', 'automount', 'securityContext', 'templateLabels',

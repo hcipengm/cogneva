@@ -37,6 +37,9 @@ resources:
   - claim-store-service.yaml
   - postgres-deployment.yaml
   - postgres-service.yaml
+  # 业务连库的角色（cog_app）要在业务 Pod 起来之前做实：排在 postgres 之后、
+  # 工作负载之前。它是幂等的，重复 apply 不重跑也不出错。
+  - db-role-bootstrap.yaml
   - redis-deployment.yaml
   - redis-service.yaml
   - qdrant-pvc.yaml

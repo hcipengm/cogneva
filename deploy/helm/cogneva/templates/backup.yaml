@@ -112,13 +112,14 @@ spec:
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               args: ["backup"]
               env:
-                - name: PG_PASSWORD
+                # 导出用 cog_app：它是这些表的属主，pg_dump 读得到全部内容。
+                - name: APP_PASSWORD
                   valueFrom:
                     secretKeyRef:
                       name: cogneva-secrets
-                      key: pg-password
+                      key: app-password
                 - name: COGNEVA_DATABASE_URL
-                  value: {{ printf "postgres://cog_user:$(PG_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
+                  value: {{ printf "postgres://cog_app:$(APP_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
                 # 快照 API 只在 Qdrant REST 端口（6333），gRPC（6334）没有。
                 - name: COGNEVA_QDRANT_HTTP_URL
                   value: {{ printf "http://qdrant.%s.svc.cluster.local:%d" (include "cogneva.namespace" .) (int .Values.backends.qdrant.port) | quote }}
@@ -348,6 +349,11 @@ spec:
                 # `jobTemplate.spec.activeDeadlineSeconds` 是一对。
                 - name: COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS
                   value: {{ .Values.backup.drillPassBudgetSeconds | quote }}
+                # 这一处**故意**仍是实例超级用户，不是漏改：演练要把包装回一个
+                # 一次性库，恢复路径里的 `SET LOCAL session_replication_role`
+                # 只对超级用户开放（那是关外键与触发器检查唯一不依赖装载顺序的
+                # 办法），而建那个库本身要 CREATEDB。业务 Pod 那条注入面不在这里：
+                # 这个 CronJob 跑的是固定参数的自有代码，不解析任何外部输入。
                 - name: PG_PASSWORD
                   valueFrom:
                     secretKeyRef:

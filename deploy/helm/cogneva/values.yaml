@@ -1256,6 +1256,9 @@ secrets:
   # 内部实例密钥留空：全新安装时自动随机生成，升级时复用已部署 Secret 中的值。
   # 仅在需要跨实例固定同一密码时才显式填写；勿在 values 里提交可用密码。
   pgPassword: ""
+  # 业务进程连库的角色（cog_app）口令，与 pgPassword 分属两个角色：pgPassword
+  # 那个是实例超级用户，只在数据库自用与一次性的角色引导里出现。留空则随机生成。
+  appPassword: ""
   redisPassword: ""
   webhookInternal: ""
   jwtSecret: ""

@@ -1,0 +1,98 @@
+{{- if .Values.backends.postgres.enabled }}
+{{- /*
+业务 Pod 连库用的角色与实例超级用户分家。
+
+起因是爆炸半径：`cog_user` 是 `rolsuper=t`，而四个业务部署的
+`COGNEVA_DATABASE_URL` 全部用它连库——任何一处 SQL 注入拿到的不是这个库的读写，
+是整台实例（`COPY … FROM PROGRAM`、任意库、`pg_read_file`）。分成两个角色之后，
+业务侧那条连接里没有的东西，注入也拿不到。
+
+这一步只把 cog_app 做实，不动 cog_user 的超权位：先让业务 Pod 切过去、跑够一拍
+确认不依赖超权，再收那个位。顺序反过来的代价是不可逆的——这个实例里只有 cog_user
+一个超级用户角色，没有 `postgres` 角色，把它降下去之后要再抬回来，只能停库、拿
+数据目录跑 `postgres --single`。
+
+脚本正文在 files/db-role-bootstrap.sh（写在这里会让里面的每个数字都进 chart 的
+数字普查，而那些数字是重试次数与睡眠秒数，不是部署参数）。
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cogneva-db-role-bootstrap
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database-bootstrap
+data:
+  db-role-bootstrap.sh: |
+    {{- .Files.Get "files/db-role-bootstrap.sh" | nindent 4 }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cogneva-db-role-bootstrap
+  namespace: {{ include "cogneva.namespace" . }}
+  labels:
+    {{- include "cogneva.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database-bootstrap
+  annotations:
+    # 新装跑在安装之后（那一刻 postgres 才起来），升级跑在**滚动之前**：升级时
+    # 库里的对象还挂在超级用户名下，而业务 Pod 一换角色就够不到它们——先滚后挪
+    # 只会得到一串 permission denied 与一次没必要的 CrashLoopBackOff。
+    # 每次跑都是幂等的：它读的是「现在还在 cog_user 名下的对象」，挪走的部分读不到。
+    "helm.sh/hook": post-install,pre-upgrade
+    "helm.sh/hook-weight": "-5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cogneva-db-role-bootstrap
+        app.kubernetes.io/component: database-bootstrap
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        runAsNonRoot: true
+        {{- /* lit: 1001 fixed — the runtime UID/GID the images are built with; every workload pins the same pair */}}
+        runAsUser: 1001
+        runAsGroup: 1001
+      containers:
+        - name: bootstrap
+          image: {{ .Values.backends.postgres.image }}
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "/bootstrap/db-role-bootstrap.sh"]
+          env:
+            - name: PGHOST
+              value: postgres.{{ include "cogneva.namespace" . }}.svc.cluster.local
+            - name: PGPORT
+              value: {{ .Values.backends.postgres.port | quote }}
+            - name: PGDATABASE
+              value: "cogneva"
+            # 超级用户只在这里出现一次：建角色与改属主需要它，业务侧不需要。
+            - name: PGUSER
+              value: "cog_user"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: pg-password
+            - name: APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: app-password
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          volumeMounts:
+            - name: bootstrap-script
+              mountPath: /bootstrap
+              readOnly: true
+      volumes:
+        - name: bootstrap-script
+          configMap:
+            name: cogneva-db-role-bootstrap
+{{- end }}
