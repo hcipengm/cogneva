@@ -542,11 +542,17 @@ function AllowanceWindow() {
                 <Reading
                   label="差额"
                   value={`${remaining < 0 ? '−' : ''}${Math.abs(remaining).toLocaleString()}`}
-                  tone={remaining < 0 ? 'warn' : 'plain'}
+                  tone={remaining < 0 || !pool.available ? 'warn' : 'plain'}
                   note={
-                    remaining < 0
-                      ? '越过摊平位置：新的整活会被压到下一窗再发'
-                      : '离摊平位置还剩这么多'
+                    // 池不可用时差额再大也发不出去：额度是「允许多少」，不是
+                    // 「现在能发多少」，后者还要过池可用这一关。这一格在最常见
+                    // 的故障（配额窗用尽、池子躺着）里差额恰恰很宽裕，不写这句
+                    // 读者会当成「还有余量、可以接着跑」。
+                    !pool.available
+                      ? '池此刻不可用：差额再宽裕也发不出去，看「池」与「上游自述复位」'
+                      : remaining < 0
+                        ? '越过摊平位置：新的整活会被压到下一窗再发'
+                        : '离摊平位置还剩这么多'
                   }
                 />
                 <Reading
