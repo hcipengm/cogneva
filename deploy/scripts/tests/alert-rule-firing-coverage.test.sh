@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_channel_that_can_run_a_rule_is_not_the_rules_having_been_run
 # 「哪几条规则真的被证明过会响」这条门**自己**会不会红。
 #
 # 为什么要有这一层：这条门判的是「新增规则必须自带一格证明」。它自己错成「永远绿」时，

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_bound_that_already_has_a_messenger_gets_no_second_one
 # check-alert-rule-duplicate-bounds.py 的定向测试。
 #
 # 被测的是一个**只报不拦**的普查：两套规则库（集群内 PrometheusRule 清单、应用进程内
