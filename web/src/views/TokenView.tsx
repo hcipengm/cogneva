@@ -292,7 +292,15 @@ export function TokenView() {
                   );
                 } },
                 { key: 'style', title: '协议', width: '110px', render: (a) => (
-                  <span className="text-[11px]">{a.api_style}</span>
+                  // `-` 与上游那格同形：池级熔断的拒绝没走到任何一个协议面，
+                  // 这一格占位，不是第三种报文格式。
+                  <span
+                    className="text-[11px]"
+                    style={{ color: a.api_style === '-' ? 'var(--warn)' : undefined }}
+                    title={a.api_style === '-' ? '没有发出请求，因此没有协议' : undefined}
+                  >
+                    {a.api_style === '-' ? '未发起' : a.api_style}
+                  </span>
                 ) },
                 { key: 'calls', title: '调用', width: '80px', render: (a) => (
                   <span className="mono text-[11px]">{a.calls}</span>

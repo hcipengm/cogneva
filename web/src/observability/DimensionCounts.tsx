@@ -145,14 +145,27 @@ const API_STYLE: Dimension = {
   title: '协议',
   pick: (a) => a.api_style,
   read: (value) => {
+    // `-` 不是一种协议，是「一个上游都没试」的占位：池级熔断的拒绝行上没有
+    // 协议可说，账上就拿这一格占位。把它当成协议名数进「有几种协议」，
+    // 读者会以为平台多接了一套报文格式。
+    if (value === '-') {
+      return {
+        label: '未发起',
+        hint: '请求在池级熔断那一步就被拒了，没有走到任何一个协议面',
+        tone: 'var(--warn)',
+      };
+    }
     if (value === 'anthropic') return { label: value, hint: 'Anthropic Messages 协议' };
     if (value === 'openai') return { label: value, hint: 'OpenAI 兼容 Chat Completions 协议' };
     if (value === 'openai-responses') return { label: value, hint: 'OpenAI Responses 协议' };
     return { label: value, hint: '网关不认识的协议名', tone: 'var(--warn)' };
   },
-  note: () => '点开看是哪几种',
-  footnote: () =>
-    '协议是「用哪套报文格式说话」，不是「找哪家厂商」：同一条 Anthropic 协议线路背后可以是任何兼容它的上游，所以协议只有报文格式那么多，厂商可以有更多。`input` 的含义也逐协议不同，缓存命中率因此只在同一协议内比。',
+  note: (list) =>
+    list.some((m) => m.value === '-') ? '点开看是哪几种（含未发起）' : '点开看是哪几种',
+  footnote: (list) =>
+    `协议是「用哪套报文格式说话」，不是「找哪家厂商」：同一条 Anthropic 协议线路背后可以是任何兼容它的上游，所以协议只有报文格式那么多，厂商可以有更多。\`input\` 的含义也逐协议不同，缓存命中率因此只在同一协议内比。${
+      list.some((m) => m.value === '-') ? '「未发起」不是协议，它记的是熔断在选协议之前就挡下的那几次。' : ''
+    }`,
 };
 
 const ORIGIN: Dimension = {
