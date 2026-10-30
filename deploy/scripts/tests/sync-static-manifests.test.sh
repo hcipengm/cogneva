@@ -14,6 +14,10 @@
 # 第三块是「头部自称由渲染脚本生成的整份清单」：它不是人手写的，是渲染产物被抄进
 # 静态目录的一份副本。副本落后于出处时必须红，写回后必须逐字节等于出处。
 #
+# 第四块是版本标签：静态清单里本平台工作负载的 Pod 模板版本，取自渲染产物同一个
+# kind+name。发布版本一改要动几十行，漏一行在 `kubectl get pods -L
+# app.kubernetes.io/version` 上表现为空格——读作「不归发布管」，不是「上一版」。
+#
 # 每个用例都在真树的一份副本上跑（脚本按自身位置算仓库根，副本自成一体）。
 #
 # 用法：bash deploy/scripts/tests/sync-static-manifests.test.sh
@@ -129,7 +133,62 @@ cmp -s "${root}/${censused}" "${root}/deploy/rendered/k3s-single/40-daemonset-co
 out="$(run "${root}" --check)" || fail "整份清单写回之后仍然红：${out}"
 expect_ok "整份清单写回后" "${out}"
 
-# ---- 6. 静态清单里根本没有这个键：不猜，直接说 ----
+# ---- 6. 版本标签落后：红，写回后与渲染产物一致 ----
+root="$(case_dir version-drift)"
+python3 - "${root}" <<'PY'
+import sys, pathlib, re
+p = pathlib.Path(sys.argv[1]) / "deploy/k3s/deployment.yaml"
+s = p.read_text()
+want = "0.5.10"
+assert f'app.kubernetes.io/version: "{want}"' in s, "夹具依赖的版本标签不在那份清单里了"
+p.write_text(s.replace(f'app.kubernetes.io/version: "{want}"',
+                       'app.kubernetes.io/version: "0.0.1"'))
+PY
+out="$(run "${root}" --check)" && fail "版本标签落后时 --check 应当非零：${out}"
+expect_red_naming "版本漂移" "${out}" "deploy/k3s/deployment.yaml"
+out="$(run "${root}")" || fail "版本写回失败：${out}"
+python3 - "${root}" <<'PY' || exit 1
+import sys, pathlib, re, yaml
+root = pathlib.Path(sys.argv[1])
+text = (root / "deploy/k3s/deployment.yaml").read_text()
+doc = yaml.safe_load(text)
+rendered = None
+for yml in sorted((root / "deploy/rendered/k3s-single").glob("*.yaml")):
+    for d in yaml.safe_load_all(yml.read_text()):
+        if isinstance(d, dict) and d.get("kind") == "Deployment" and d["metadata"]["name"] == "cogneva":
+            rendered = d["spec"]["template"]["metadata"]["labels"]["app.kubernetes.io/version"]
+assert rendered, "渲染产物里读不到 cogneva 这份 Deployment 的版本标签"
+got = doc["spec"]["template"]["metadata"]["labels"]["app.kubernetes.io/version"]
+assert got == rendered, f"写回后是 {got}，渲染产物是 {rendered}"
+PY
+out="$(run "${root}" --check)" || fail "版本写回之后仍然红：${out}"
+expect_ok "版本写回后" "${out}"
+
+# ---- 7. 版本标签整行缺失：从渲染产物补回来，而不是留一个空格 ----
+root="$(case_dir version-missing)"
+python3 - "${root}" <<'PY'
+import sys, pathlib, re
+p = pathlib.Path(sys.argv[1]) / "deploy/k3s/gateway-deployment.yaml"
+s = p.read_text()
+line = '        app.kubernetes.io/version: "0.5.10"\n'
+assert line in s, "夹具依赖的 Pod 模板版本行不在那份清单里了"
+p.write_text(s.replace(line, "", 1))
+PY
+out="$(run "${root}" --check)" && fail "版本标签缺失时 --check 应当非零：${out}"
+expect_red_naming "版本缺失" "${out}" "deploy/k3s/gateway-deployment.yaml"
+out="$(run "${root}")" || fail "版本补回失败：${out}"
+python3 - "${root}" <<'PY' || exit 1
+import sys, pathlib, yaml
+root = pathlib.Path(sys.argv[1])
+doc = yaml.safe_load((root / "deploy/k3s/gateway-deployment.yaml").read_text())
+labels = doc["spec"]["template"]["metadata"]["labels"]
+assert labels.get("app.kubernetes.io/version") == "0.5.10", \
+    f"补回来的版本是 {labels.get('app.kubernetes.io/version')!r}"
+PY
+out="$(run "${root}" --check)" || fail "版本补回之后仍然红：${out}"
+expect_ok "版本补回后" "${out}"
+
+# ---- 8. 静态清单里根本没有这个键：不猜，直接说 ----
 root="$(case_dir no-block)"
 python3 - "${root}" <<'PY'
 import sys, pathlib
@@ -139,4 +198,4 @@ PY
 out="$(run "${root}" --check)" && fail "少了块标量时应当红：${out}"
 [[ "${out}" == *"cogneva.json"* ]] || fail "应当点名那个键：${out}"
 
-echo "SYNC STATIC TEST OK：6/6"
+echo "SYNC STATIC TEST OK：8/8"
