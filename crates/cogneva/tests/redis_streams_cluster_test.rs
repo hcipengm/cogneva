@@ -60,7 +60,10 @@ fn make_task(id: &str, task_type: TaskType, blocked_by: Vec<String>, workspace: 
         owner_unit: None,
         bound_by_handover_id: None,
         is_executable: true,
-        acceptance: vec![],
+        // Admission reads this field, not just the board: an executable row with
+        // no criterion stays Pending, so a fixture that leaves it empty tests a
+        // queue nothing is ever published to.
+        acceptance: vec!["the task reaches a terminal state the shared queue records".into()],
     }
 }
 

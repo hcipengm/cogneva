@@ -42,7 +42,9 @@ fn make_test_task(id: &str) -> Task {
         owner_unit: None,
         bound_by_handover_id: None,
         is_executable: true,
-        acceptance: vec![],
+        // 可执行的活必须说得出“怎样算做完”，否则调度面会把它按在 Pending 上：
+        // 这一条判据是准入，不是注释。夹具跟着它走，测的仍是消费者/发布者那半边。
+        acceptance: vec!["the task reaches a terminal state the consumer loop records".into()],
     }
 }
 
