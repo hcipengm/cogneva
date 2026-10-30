@@ -8,6 +8,8 @@ import {
   type QuotaScopeName,
 } from '@/api/client';
 import { Button, Reading, Readings } from '@/ui/primitives';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 
 /**
  * 日上限的管理面：给某一格（人 / 工作空间 / 团队 / 组织 / 全局）写下
@@ -52,6 +54,24 @@ export function QuotaLimitsPanel() {
       setBusy(false);
     }
   };
+
+  // 这一面读的快照也会在**别人**写的时候变：一次成功的 PUT/DELETE 落在
+  // `/api/v1/quota/...` 下，网关按前缀在总线上落一帧（`resource:quota`），这里订它。
+  // 帧到了只重读、只更新读数与读的时刻，不碰输入框：用户手里那一对数可能正改到一半，
+  // 用服务端的值盖上去就是边打字边被改。也不再对齐输入框——对齐只在读回自己那次写的
+  // 时候做（`run`），那一次用户是看着结果按下去的。
+  useKindTickedRefresh([resourceKey('quota')], () => {
+    if (!reading || reading.scope !== scope || reading.target_id !== target) return;
+    void getQuotaLimits(reading.scope, reading.target_id).then(
+      (next) => {
+        setReading(next);
+        setReadAt(new Date().toISOString());
+      },
+      () => {
+        // 一次帧触发的读失败不抹掉屏幕上已有的读数：它还标着上一次读成的时刻。
+      }
+    );
+  });
 
   const write = () => {
     const softLimit = Number(soft);
