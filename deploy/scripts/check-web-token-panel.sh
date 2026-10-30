@@ -312,6 +312,48 @@ else:
             if not missing and not foreign:
                 summary.append(f"执行者名单: {len(declared)} 个名字，{rel} 与之逐名相等")
 
+# ── 8. 占位符不算成员 ──
+# 折叠表里有两类取值混在同一列上：真正的成员（某条上游、某种协议），和占位符
+# `-`——池级熔断在选线路之前就把请求挡下了，账上拿它占「没试过任何一条」。它
+# 是真话，所以不能删、也不能不列；但把它数进「平台上有几条上游」，读者会以为
+# 多接了一条线路，而它恰恰是「一条都没试」。
+#
+# 这条判的是**个数取的是哪一列**：那一格必须来自剔掉占位符的清单，而不是
+# 折叠表的每一行。判不了的是那句中文读法写得好不好——那是解释，不是可复核的
+# 事实；判得了的是「上游 / 协议这两维声明了谁是占位符」以及「那个数没退回全量」。
+PANEL = re.compile(r"const\s+DIMENSIONS\s*=\s*\[")
+count_src = [(rel, read(rel)) for rel in sorted(graph) if PANEL.search(read(rel))]
+if not count_src:
+    problems.append("可达图里找不到声明 DIMENSIONS 的那一屏：个数取哪一列无从判起")
+else:
+    rel, src = count_src[0]
+    if re.search(r"\{list\.length\}\s*</div>", src):
+        problems.append(
+            f"{rel}: 那一格又退回成 {{list.length}} 了——折叠表的每一行都算成员时，"
+            "「未发起」占位符会被数成一条上游 / 一种协议"
+        )
+    elif not re.search(r"\{counted\.length\}\s*</div>", src):
+        problems.append(
+            f"{rel}: 那一格读不出「剔掉占位符之后的清单长度」——"
+            "判不了占位符是否被算进了成员数"
+        )
+    else:
+        listed = [
+            name
+            for name in ("UPSTREAM", "API_STYLE")
+            if not (
+                (m := re.search(rf"const\s+{name}\s*:\s*Dimension\s*=\s*\{{(.*?)\n\}};", src, re.S))
+                and "isPlaceholder" in m.group(1)
+            )
+        ]
+        if listed:
+            problems.append(
+                f"{rel}: {', '.join(listed)} 没有声明谁是占位符——"
+                "个数与清单会把「未发起」当成一个成员"
+            )
+        else:
+            summary.append(f"占位符: {rel} 的上游/协议两维各自标出谁是占位符，个数取的是成员清单")
+
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
 
