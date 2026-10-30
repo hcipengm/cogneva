@@ -67,12 +67,14 @@ const DRILL_PASS_BUDGET_ENV: &str = "COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS";
 /// 没配 env 时单趟的预算。数与 values.yaml 的 `backup.drillPassBudgetSeconds`
 /// 同源，由 `deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh`
 /// 盯着两边与 Job 界的关系。
+// cap: bound
 const DRILL_PASS_BUDGET_DEFAULT_SECS: u64 = 3600;
 const QDRANT_HTTP_URL_ENV: &str = "COGNEVA_QDRANT_HTTP_URL";
 const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 
 /// 落库的错误文本上限。错误本身通常只有一行，这个界是为了让一条失控的长错误
 /// （整段响应体、整张表名清单）不至于把行撑成不可读的东西。
+// cap: bound
 const ERROR_TEXT_MAX_CHARS: usize = 2000;
 
 /// 一次运行默认的期限，也是集群清单里那个 `activeDeadlineSeconds` 的默认值。
@@ -81,6 +83,7 @@ const ERROR_TEXT_MAX_CHARS: usize = 2000;
 /// 落在里面的运行照跑，落在外面的那个不是慢，是卡死了——而它卡着的时候，
 /// 调度器的 `Forbid` 会让后面每一次都不再开始。没有这个界，一次挂住的运行
 /// 就能把备份永久停掉，顺带把「谁来给它收尾」也一并停掉。
+// cap: bound
 const DEFAULT_RUN_DEADLINE_SECONDS: i32 = 3600;
 
 /// 内部实例密钥对象名：业务 Pod 读的那一份（数据库/缓存/内部签名/S3/邮件）。
@@ -357,8 +360,8 @@ pub struct BackupConfig {
     /// 进化 bare 仓的挂载点（`gitRemote` 那一卷）。`None` = 这次部署没有进化，
     /// 包里也就不可能有它的 bundle。
     ///
-    /// 它不在数据根下，是一个独立的卷：`data-root-subdirs.tsv` 里 `git-remote` 这一
-    /// 行的权威面就是它。已推的 rev 能从公开远端重取，未推的不能——那些才是进化
+    /// 它不在数据根下，是一个独立的卷：`DATA_ROOT_SUBDIRS` 里 `git-remote` 那一行
+    /// 的权威面就是它。已推的 rev 能从公开远端重取，未推的不能——那些才是进化
     /// 自己产出的状态，必须逐字进入包。
     pub git_remote_dir: Option<PathBuf>,
     /// Where a package written on somebody's request is put so it can be handed
@@ -1964,7 +1967,7 @@ const PACKAGE_PG_DIR: &str = "pg";
 const SEQUENCES_FILE: &str = "sequences.sql";
 
 /// 数据根下装对象的那一级。
-const OBJECTS_SUBDIR: &str = "storage";
+pub const OBJECTS_SUBDIR: &str = "storage";
 
 /// 包里对象层的那一层。与 [`OBJECTS_SUBDIR`] 同名同构：恢复端按同一个相对布局
 /// 把整棵抄回去，两边各写一份字面量只会在改名之后让恢复把对象放到别处——那边
@@ -1980,6 +1983,134 @@ const PACKAGE_OBJECTS_DIR: &str = "objects";
 fn local_objects_dir(data_dir: &Path) -> Option<PathBuf> {
     let dir = data_dir.join(OBJECTS_SUBDIR);
     dir.is_dir().then_some(dir)
+}
+
+/// 数据根下一级子目录在「换机」这件事上的待遇。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubdirClass {
+    /// 包必须带走。带不走是这次备份的缺陷，不是可以接受的损失。
+    Authoritative,
+    /// 包不带，且换机后不重建也行——行则行在 `why` 上，不写在别处。
+    Discardable,
+}
+
+/// 数据根下一级子目录的一条判词。
+///
+/// `name` 是子目录名本身，不是给人看的标题：判断面（`crates/cogneva/tests/
+/// data_root_subdirs.rs`）拿它跟普查面逐字比对。`roots` 是它会出现的那些数据根
+/// （主根、进化根）——同一个名字在两块卷上都出现时两边都得算。
+///
+/// `why` 回答的是「换机后少了它，为什么可以不补」。`Discardable` 的行没有 `why`
+/// 就是一张「谁都没想过」的空分类，测试判红。
+#[derive(Debug)]
+pub struct DataRootSubdir {
+    pub name: &'static str,
+    pub roots: &'static [&'static str],
+    pub class: SubdirClass,
+    pub what: &'static str,
+    pub why: &'static str,
+}
+
+/// 数据根下每一个一级子目录的判词，**闭集**。
+///
+/// 这张表存在的理由不是「给人查阅」，而是：数据根是「换机有没有丢东西」的实际
+/// 边界，而它此前没有任何一处列过——新增一个子目录时，备份 Job 照旧绿、恢复演练
+/// 照旧绿，包里就是少了一棵树。`warehouse/` 就是这么进来的：它是学习数仓的导出
+/// 面，代码里写 `{data_dir}/warehouse`，在它出现之前没有任何一份清单提过它。
+///
+/// 所以判词的判据不是这张表自己：普查面从代码、应用配置、渲染清单三条来源把
+/// 子目录**数出来**，再回这里找判词；找不着就是「有人新开了一个子目录而没人说
+/// 过它换机怎么办」，红。反过来，表里有一行而普查面没有（`git-workdir`、
+/// `pending-changes` 这类只在运行期出现、代码里由变量拼出来的），只是提示，不是红。
+///
+/// 这张表同时是 `lossy_surfaces()` 里「数据根下丢了什么」那一族的来源：
+/// `Discardable` 的行会进包的损失清单，理由取这一行的 `why`。
+pub const DATA_ROOT_SUBDIRS: &[DataRootSubdir] = &[
+    DataRootSubdir {
+        name: OBJECTS_SUBDIR,
+        roots: &["main"],
+        class: SubdirClass::Authoritative,
+        what: "对象层（providers.storage.options.base_path）",
+        why: "包里的 objects 段逐文件带走并计数",
+    },
+    DataRootSubdir {
+        name: "policies",
+        roots: &["main", "evolution"],
+        class: SubdirClass::Authoritative,
+        what: "策略库版本文件与 ACTIVE",
+        why: "包里的 artifacts 段按「数据根 + 库名」逐库带走",
+    },
+    DataRootSubdir {
+        name: "meta_learning",
+        roots: &["main", "evolution"],
+        class: SubdirClass::Authoritative,
+        what: "决策统计快照",
+        why: "包里的 artifacts 段带走，运行时正本是 PG 表，二者按格取大",
+    },
+    DataRootSubdir {
+        name: "git-remote",
+        roots: &["evolution"],
+        class: SubdirClass::Authoritative,
+        what: "进化的 bare 仓库",
+        why: "整仓打成 git bundle 进包（`git/evolution.bundle`，恢复时种回）；\
+              出包时打不成才退回 lossy_surfaces 点名",
+    },
+    DataRootSubdir {
+        name: "workspace",
+        roots: &["main"],
+        class: SubdirClass::Authoritative,
+        what: "WebUI 编辑器的用户工作区（{data_dir}/workspace/<user uuid>）",
+        why: "包里的 artifacts/<root>/workspace 段整树带走，恢复端按文件数与字节数\
+              核对后换回原位；用户在里面新建的文件没有第二个副本",
+    },
+    DataRootSubdir {
+        name: "raw-logs",
+        roots: &["main"],
+        class: SubdirClass::Discardable,
+        what: "原始来源归档（raw_logger.base_dir）",
+        why: "抽取结果已落 PG 的权威面；重抽取要从上游重抓，代价是时间不是数据",
+    },
+    DataRootSubdir {
+        name: "warehouse",
+        roots: &["main"],
+        class: SubdirClass::Discardable,
+        what: "学习数仓的 JSONL 导出（{data_dir}/warehouse）",
+        why: "它是 PG 与策略库的导出面，不是权威面；数据在来源与 PG 里",
+    },
+    DataRootSubdir {
+        name: "landing",
+        roots: &["main"],
+        class: SubdirClass::Discardable,
+        what: "落地通道的每次落地记录与工作副本",
+        why: "落地的结果以 git 提交与服务状态为准；这些文件是过程记录",
+    },
+    DataRootSubdir {
+        name: "git-workdir",
+        roots: &["main"],
+        class: SubdirClass::Discardable,
+        what: "落地通道的共享 git 工作副本",
+        why: "它是一次克隆的工作区，从远端仓库重新克隆即得",
+    },
+    DataRootSubdir {
+        name: "pending-changes",
+        roots: &["main"],
+        class: SubdirClass::Discardable,
+        what: "还没投递出去的已生成变更（数据根下 pending-changes/，每条一个 json）",
+        why: "已投递的以 change_ledger 与 git 上的提交为准；没投递的那次生成换机后\
+              重跑一遍生成，代价是一次生成而不是系统缺一块",
+    },
+    DataRootSubdir {
+        name: "eval",
+        roots: &["main"],
+        class: SubdirClass::Discardable,
+        what: "评测数据集（{data_dir}/eval/datasets）",
+        why: "`deploy/scripts/fetch-benchmark-data.sh` 可从公开来源重取",
+    },
+];
+
+/// 按子目录名取判词。
+pub fn subdir_policy(name: &str) -> Option<&'static DataRootSubdir> {
+    DATA_ROOT_SUBDIRS.iter().find(|row| row.name == name)
 }
 
 /// 本二进制带的最新 PG 迁移号。读不出来记 0（没声明），不让备份失败：
@@ -2000,6 +2131,7 @@ fn current_schema_version() -> i64 {
 /// 跨段偏差的默认界：五分钟。超过它，包里几段就已经不是同一份数据了。可由
 /// `COGNEVA_BACKUP_MAX_SEGMENT_SKEW_SECONDS` 覆盖——大对象层在小机器上本来就慢，
 /// 把界写死会让那类环境每一晚都产出一个恢复端拒收的包。
+// cap: bound
 const DEFAULT_MAX_SEGMENT_SKEW_SECONDS: u64 = 300;
 
 fn max_segment_skew() -> u64 {
@@ -2109,12 +2241,6 @@ fn lossy_surfaces(
             "镜像是构建产物，不是权威面；由源码 rev 重建或从 release 重新拉取",
             SurfaceRecovery::SelfRebuilding,
         ),
-        (
-            "pending-changes",
-            "还没投递出去的已生成变更（数据根下 pending-changes/）",
-            "已投递的变更以 change_ledger 与 git 上的提交为准；没投递的那次生成换机后重跑，代价是一次生成",
-            SurfaceRecovery::SelfRebuilding,
-        ),
     ]
     .into_iter()
     .map(|(name, lost, why, recovery)| LossySurface {
@@ -2124,19 +2250,30 @@ fn lossy_surfaces(
         recovery,
     })
     .collect();
+    // 数据根下不带走的子目录，判词本来就和 `DATA_ROOT_SUBDIRS` 里那一行是同一句话。
+    // 两处各写一份的结果已经出现过一次：同一条损失在两份清单里措辞不同，读者没法
+    // 判断它们是同一件事还是两件。这里只取表里的那一行。
+    for subdir in DATA_ROOT_SUBDIRS
+        .iter()
+        .filter(|row| row.class == SubdirClass::Discardable)
+    {
+        surfaces.push(LossySurface {
+            name: subdir.name.to_string(),
+            lost: subdir.what.to_string(),
+            acceptable_because: subdir.why.to_string(),
+            recovery: SurfaceRecovery::SelfRebuilding,
+        });
+    }
     if !bundle_present {
-        surfaces.insert(
-            4,
-            LossySurface {
-                name: "evolution-bare-repo".to_string(),
-                lost: "未推送到远端的进化 rev（这个包没有带 git bundle）".to_string(),
-                acceptable_because:
-                    "已推的 rev 可从公开远端重取；未推的那部分确实是损失——出包时仓库还没 seed \
-                     或 bundle 没打成，出包日志里有那一行告警"
-                        .to_string(),
-                recovery: SurfaceRecovery::SelfRebuilding,
-            },
-        );
+        surfaces.push(LossySurface {
+            name: "evolution-bare-repo".to_string(),
+            lost: "未推送到远端的进化 rev（这个包没有带 git bundle）".to_string(),
+            acceptable_because:
+                "已推的 rev 可从公开远端重取；未推的那部分确实是损失——出包时仓库还没 seed \
+                 或 bundle 没打成，出包日志里有那一行告警"
+                    .to_string(),
+            recovery: SurfaceRecovery::SelfRebuilding,
+        });
     }
     if objects_absent {
         surfaces.push(LossySurface {
@@ -3564,6 +3701,7 @@ fn replace_dir(staged: &Path, live: &Path) -> std::io::Result<()> {
 pub const DRILL_DATABASE: &str = "cog_drill";
 
 /// 演练互斥锁的键。取自 `cog_dril` 的 ASCII，只要求集群内不与人撞车，不承担含义。
+// cap: bound
 const DRILL_LOCK_KEY: i64 = 0x636f_675f_6472_696c;
 
 /// 演练配置。只要库、卷与迁移目录。
@@ -6733,7 +6871,8 @@ mod tests {
         manifest.lossy_surfaces.clear();
         assert_eq!(restore_summary(&manifest), "restore complete");
 
-        // 基础那五项都自己长回来，外加包带了对象与凭证：收尾不该点名任何东西。
+        // 基础那几项（含数据根下不带走的子目录）都自己长回来，外加包带了对象与凭证：
+        // 收尾不该点名任何东西。
         manifest.lossy_surfaces = lossy_surfaces(true, true, false);
         assert!(!manifest.lossy_surfaces.is_empty());
         assert_eq!(restore_summary(&manifest), "restore complete");

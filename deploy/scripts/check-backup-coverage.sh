@@ -7,15 +7,14 @@
 # 各写一遍，漏写的那一项恰好是门看不见的那一项。渲染物是 bootstrap 真正 apply
 # 的东西，读它才是读安装面。
 #
-# 它还判第二件事：每个数据根的一级子目录都被分类过（authoritative / discardable）。
-# 覆盖门只问「这个 claim 进没进备份面」，而 claim 里少一棵子树它看不见——
-# `warehouse/` 就是这样在没有任何清单提过它的情况下出现的。
+# 「每个数据根的一级子目录都被分类过」那一条**不在这里**：分类的判词长在备份逻辑
+# 自己旁边（`crates/cogneva/src/backup.rs` 的 `DATA_ROOT_SUBDIRS`），普查面必须跟着
+# 代码走，判据在 `crates/cogneva/tests/data_root_subdirs.rs`。这个脚本只管卷。
 #
 # 用法：
 #   bash deploy/scripts/check-backup-coverage.sh            # 人读，差异即失败
-#   bash deploy/scripts/check-backup-coverage.sh --json     # 机器读（顶层有 .unclassified）
+#   bash deploy/scripts/check-backup-coverage.sh --json     # 机器读
 #   bash deploy/scripts/check-backup-coverage.sh --profile k3s-single
-#   bash deploy/scripts/check-backup-coverage.sh --live     # 把本机数据根的实盘子目录也算进普查
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -136,131 +135,10 @@ def load_profile(profile_dir, mount_path):
     return workloads
 
 
-SUBDIR_LEDGER = "deploy/data-root-subdirs.tsv"
-CLASSES = ("authoritative", "discardable")
-
-
-def subdir_ledger():
-    """数据根一级子目录的分类表。格式问题本身就是红的：读不出来的一行等于没分类。"""
-    rows, problems = {}, []
-    if not os.path.exists(SUBDIR_LEDGER):
-        return rows, [f"{SUBDIR_LEDGER} 不在树里：子目录分类无从判"]
-    with open(SUBDIR_LEDGER, encoding="utf-8") as fh:
-        for lineno, line in enumerate(fh, 1):
-            body = line.rstrip("\n")
-            if not body or body.startswith("#") or body.startswith("subdir\t"):
-                continue
-            cols = body.split("\t")
-            if len(cols) != 6:
-                problems.append(f"{SUBDIR_LEDGER}:{lineno} 是 {len(cols)} 列，不是 6 列")
-                continue
-            name, roots, cls, what, why, evidence = cols
-            if cls not in CLASSES:
-                problems.append(f"{SUBDIR_LEDGER}:{lineno} 的 class={cls!r} 不在 {CLASSES}")
-            if not why.strip():
-                problems.append(f"{SUBDIR_LEDGER}:{lineno}（{name}）没有 why：只写名字的条目等于把问题留给下一个人")
-            if not os.path.exists(evidence):
-                problems.append(f"{SUBDIR_LEDGER}:{lineno}（{name}）的 evidence 指向 {evidence}，树上没有")
-            rows[name] = {"roots": roots.split(","), "class": cls, "what": what,
-                          "why": why, "evidence": evidence}
-    return rows, problems
-
-
-def paths_under(text, mount):
-    """文本里所有 `<数据根>/<一级段>` 的一级段（配置值、渲染清单的 hostPath 都走这条）。"""
-    pattern = re.compile(r"""[\s:"'=]""" + re.escape(mount) + r"/([A-Za-z0-9_-]+)")
-    return set(pattern.findall(text))
-
-
-def rust_segments(mount):
-    """代码里由 data_dir / COGNEVA_DATA_DIR 拼出来的一级路径段。
-
-    两种写法都要认：`.join("x")` 与 `format!("{}/x", …data_dir…)`。接收者不一定是
-    字面上的 `data_dir`（`state.data_dir`、`cfg.data_dir`、`data_dir()` 都算），所以
-    判据是「这一行提到 data_dir」而不是「接收者名字相等」。`git-workdir` 那处把
-    `COGNEVA_DATA_DIR` 读进局部变量、下一行才 join，因此看两行的窗口。
-    """
-    # 接收者必须本身就是数据根：`staging.join("objects")` 也在提 data_dir 的行上
-    # （那条语句的另一个参数是 data_dir），但它拼的是包里的目录，不是数据根下的。
-    # 同理只认 data_dir 之后的第一个 join：`Path::new(data_dir).join(EVAL_SUBDIR)
-    # .join("datasets")` 里 `datasets` 是 `eval` 下的二级目录，把它当一级段会让
-    # 普查面漏掉真正的 `eval`、多出一个从不存在的 `datasets`。
-    # 判据因此是「data_dir 之后只剩 `)`、`.` 和空白，紧跟的就是 join(」。
-    root_join = re.compile(r'[Dd]ata_dir(?:\(\))?[\s).]*\.join\(')
-    # 一级段常写成常量名而不是字面量（`data_dir.join(WORKSPACE_SUBDIR)`），不解析
-    # 常量就等于整段看不见。只解析同一文件里的 `const X: &str = "…"`；解析不出来的
-    # 标识符（函数参数、跨 crate 常量）照旧跳过——猜一个名字写进普查面比漏掉更糟。
-    const_pat = re.compile(
-        r'\bconst\s+([A-Za-z_]\w*)\s*:\s*&(?:\'static\s+)?str\s*=\s*"([A-Za-z0-9_-]+)"\s*;')
-    arg_pat = re.compile(r'\s*(?:"([A-Za-z0-9_-]+)"|([A-Za-z_]\w*))\s*\)')
-    # 例外：先把 `COGNEVA_DATA_DIR` 读进局部变量、下一行才 join 的写法。上一行提到
-    # DATA_DIR 时，这一行的 join 就是在它下面拼路径——这一行本身看不出接收者是谁。
-    local_join = re.compile(r'\.join\("([A-Za-z0-9_-]+)"\)')
-    found = {}
-    for path in glob.glob("crates/**/*.rs", recursive=True):
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-        consts = dict(const_pat.findall(text))
-        # 测试块里的 data_dir 是临时目录：`..data`、`jwt-secret` 这类名字会把普查面
-        # 变成一幅假的现场。
-        cut = text.find("#[cfg(test)]")
-        if cut >= 0:
-            text = text[:cut]
-        # 往回看四行而不是一行：`std::env::var("COGNEVA_DATA_DIR")` 后面常跟
-        # `.ok().filter(…).unwrap_or_else(…)` 的链，join 落在第三、四行上。
-        recent = [""] * 4
-        for line in text.splitlines():
-            mentions = ("data_dir" in line or "DATA_DIR" in line)
-            window = mentions or any("data_dir" in l or "DATA_DIR" in l for l in recent)
-            if window:
-                for m in root_join.finditer(line):
-                    arg = arg_pat.match(line, m.end())
-                    if not arg:
-                        continue
-                    name = arg.group(1) or consts.get(arg.group(2) or "")
-                    if name:
-                        found.setdefault(name, path)
-                for name in re.findall(r'"\{[^"]*\}/([A-Za-z0-9_-]+)', line):
-                    found.setdefault(name, path)
-            if any("DATA_DIR" in l for l in recent):
-                for name in local_join.findall(line):
-                    found.setdefault(name, path)
-            recent = recent[1:] + [line]
-    return found
-
-
-def census_subdirs(mount, live):
-    """普查面：代码、配置、渲染物、本机实盘，四条来源的并集。
-
-    并集而不是任何一条单独成面：`git-remote` 只在渲染清单里出现，`warehouse` 只在
-    代码里出现，而「代码里新加的子目录」和「部署里新挂的子目录」是两种各自独立
-    会漏的分类对象。
-    """
-    sources = {}
-    for name, path in rust_segments(mount).items():
-        sources.setdefault(name, path)
-    config = "deploy/helm/cogneva/files/cogneva.json"
-    if os.path.exists(config):
-        with open(config, encoding="utf-8") as fh:
-            for name in paths_under(fh.read(), mount):
-                sources.setdefault(name, config)
-    for path in glob.glob("deploy/rendered/*/*.yaml"):
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            for name in paths_under(fh.read(), mount):
-                sources.setdefault(name, path)
-    if live and os.path.isdir(mount):
-        for name in sorted(os.listdir(mount)):
-            if os.path.isdir(os.path.join(mount, name)):
-                sources.setdefault(name, f"live:{mount}")
-    return sources
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", action="store_true", help="机器可读输出")
     parser.add_argument("--profile", help="只查一个 profile")
-    parser.add_argument("--live", action="store_true",
-                        help="把本机数据根上真实存在的一级子目录也算进普查面")
     args = parser.parse_args()
 
     mount_path = data_dir()
@@ -283,8 +161,14 @@ def main():
     for profile_dir in profiles:
         profile = os.path.basename(profile_dir)
         workloads = load_profile(profile_dir, mount_path)
-        data_roots = sorted({m["claim"] for w in workloads for m in w["mounts"]})
         backup = [w for w in workloads if w["name"] == "cogneva-backup"]
+        # 数据根只从**别的**工作负载里取。备份 CronJob 自己也是 workload，把它算进
+        # 数据根会让两侧恒等：`extra`（备份挂了没人用的卷）永远空，而 `data_roots`
+        # 永远非空——「一个工作负载都没挂数据目录」也就永远读不成红。备份门拿被备份
+        # 方当自己的判据，是自己跟自己比。
+        data_roots = sorted(
+            {m["claim"] for w in workloads if w["name"] != "cogneva-backup" for m in w["mounts"]}
+        )
         # 覆盖按 claim 判，不按挂载路径判：同一个 claim 在备份 Pod 里可以换个
         # 路径（进化卷与主卷同路径会撞）。路径相同只在「备份 Pod 把数据目录
         # 挂到了别的 claim」时才有意义，那一项仍由 extra 抓。
@@ -308,49 +192,9 @@ def main():
             "workloads": workloads,
         }
 
-    ledger, ledger_problems = subdir_ledger()
-    census = census_subdirs(mount_path, args.live)
-    # 普查面读空了：四条来源（代码里 data_dir 拼出来的段、cogneva.json 里的路径、
-    # 渲染清单里的挂载、--live 的实盘）一条都没交回东西。这时未分类自然是空集，
-    # 判词与「每个子目录都已分类」一字不差——它绿了，却什么都没看。配置路径改了、
-    # 渲染物挂载换了名字、代码里 `data_dir.join` 换了写法，都会落在这里。
-    if not census:
-        print(
-            f"数据根子目录的普查面一条都没读到（代码 `data_dir` 的 join、"
-            f"cogneva.json 里的 {mount_path}/* 路径、渲染清单的挂载、--live 的实盘，"
-            "四条来源全空）。空普查与「每个子目录都已分类」在判词上同形——"
-            "两句都是「未分类 0 个」，所以这里判「没看成」而不是绿",
-            file=sys.stderr,
-        )
-        return 2
-    unclassified = sorted(set(census) - set(ledger))
-    stale = sorted(set(ledger) - set(census))
-    if ledger_problems or unclassified:
-        failed = True
-    out = {
-        "profiles": result,
-        "data_root_subdirs": {
-            "census": census,
-            "classified": len(ledger),
-            "unclassified": unclassified,
-            "stale": stale,
-            "problems": ledger_problems,
-        },
-        # 规格里那条判据读的是顶层这个键：分类面不通过时恢复端没有一条能判红的
-        # 读数，它和「每个 claim 都进了备份面」是同一件事的两半。
-        "unclassified": unclassified,
-    }
-
     if args.json:
-        print(json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
+        print(json.dumps({"profiles": result}, ensure_ascii=False, indent=2, sort_keys=True))
     else:
-        print(f"数据根子目录：普查 {len(census)} 个，已分类 {len(ledger)} 条")
-        for name in unclassified:
-            print(f"  红: {name}/ 出现在 {census[name]}，但不在 {SUBDIR_LEDGER} 里（未分类）")
-        for problem in ledger_problems:
-            print(f"  红: {problem}")
-        if not unclassified and not ledger_problems:
-            print("  绿")
         for profile, row in result.items():
             print(f"[{profile}] data_dir={row['data_mount']}")
             print(f"  数据根: {', '.join(row['data_roots']) or '(空)'}")
