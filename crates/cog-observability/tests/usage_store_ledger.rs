@@ -68,6 +68,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         refusal_kind: refusal_kind.map(str::to_string),
         retry_after_secs: None,
         task: task.map(str::to_string),
+        owner: None,
         latency_ms: 12,
         pace: None,
         usage_outcome: None,
@@ -83,12 +84,17 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // ledger with the cache split intact. Folding it into `tokens_input` would
     // pass every other assertion in this file and still lose the one number the
     // ledger exists to carry.
+    // The person dimension rides along on this row: a refused call is the only
+    // row that can name who was refused, because the spend counters do not move
+    // once the allowance is gone.
+    let mut cached_call = record(before.clone(), 800, Some(900), Some(&task), None);
+    cached_call.owner = Some("u-ledger".to_string());
     store
-        .record(&record(before.clone(), 800, Some(900), Some(&task), None))
+        .record(&cached_call)
         .await
         .expect("record a cached call");
     let row = sqlx::query(
-        "SELECT tokens_input, tokens_output, tokens_cached, estimated_input, task_id \
+        "SELECT tokens_input, tokens_output, tokens_cached, estimated_input, task_id, owner_id \
          FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&before)
@@ -114,6 +120,12 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         "the job identity has to survive the write under the exact string the caller \
          used, or it cannot be joined to that run's own totals"
     );
+    assert_eq!(
+        row.get::<Option<String>, _>("owner_id"),
+        Some("u-ledger".to_string()),
+        "the person has to survive the write the same way, or the row that refused \
+         someone cannot say who"
+    );
 
     // Second face: the table as it exists in production -- populated, and
     // without the columns. Dropping them here is what the real upgrade path does
@@ -124,7 +136,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // not, since "this row was never priced" is not "this row was priced at 0".
     sqlx::query(
         "ALTER TABLE gateway_llm_usage DROP COLUMN tokens_cached, DROP COLUMN estimated_input, \
-         DROP COLUMN task_id, DROP COLUMN refusal_kind, DROP COLUMN retry_after_secs",
+         DROP COLUMN task_id, DROP COLUMN refusal_kind, DROP COLUMN retry_after_secs, \
+         DROP COLUMN owner_id",
     )
     .execute(&pool)
     .await
@@ -136,7 +149,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
 
     let row = sqlx::query(
         "SELECT tokens_input, tokens_cached, estimated_input, task_id, refusal_kind, \
-                retry_after_secs \
+                retry_after_secs, owner_id \
          FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&before)
@@ -176,6 +189,12 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         None,
         "a row that predates the retry hint was never a circuit refusal, and a zero \
          would read as 'retry now' -- the opposite of what the column says"
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("owner_id"),
+        None,
+        "a row written before the person column existed belongs to nobody named, and \
+         a placeholder would gather every such row under one person who never called"
     );
 
     let shape = sqlx::query(

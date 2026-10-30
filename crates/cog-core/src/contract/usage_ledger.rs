@@ -302,6 +302,21 @@ pub struct LlmUsageRecord {
     /// expensive job, so rows landed by paths that have no job identity keep it
     /// empty rather than inventing one.
     pub task: Option<String>,
+    /// The person this call is charged to, as the caller declared it.
+    ///
+    /// Beside `task`, not instead of it: the two answer different questions and
+    /// lead to different readers. `task` is the unit of work whose ceiling the
+    /// call is judged against; this is who pays for it, and it is the same
+    /// identity the gateway's owner check and the person's daily counters use,
+    /// so a refused row names the person it refused rather than leaving that to
+    /// be inferred from the spend counters -- which move only on calls that
+    /// actually ran.
+    ///
+    /// Nullable on the same terms as `task`: `NULL` is "no owner was declared",
+    /// not an owner named `unknown`. Every path that cannot name one keeps it
+    /// empty rather than gathering unattributed calls into one placeholder
+    /// person.
+    pub owner: Option<String>,
     /// Wall time of the call; for streams this is first-byte to last-byte.
     pub latency_ms: u64,
     /// 窗口配速那一拍的读数，只在 `result = "refused_by_pace"` 的行上有。

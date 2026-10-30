@@ -346,6 +346,12 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS estimated_input BIGINT;
 -- identity its own per-run census uses, and the reader's job is to join the
 -- two, not to funnel both through a type.
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS task_id TEXT;
+-- The person dimension, same shape and same reason as the job one: the ceiling
+-- a call was judged against is the person's daily allowance, and the row that
+-- records a refusal has to name the person it refused. Nullable because "no
+-- owner was declared" is a state of its own -- the spend counters cannot stand
+-- in for it, since they move only on calls that ran.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS owner_id TEXT;
 -- What reading the response found. Nullable with no default: the failure and
 -- refusal paths land rows about attempts that never got a body, and rows
 -- written before this column existed have no reading to report. A default of
@@ -563,9 +569,9 @@ impl LlmUsageStore {
                  task_id, latency_ms, refusal_kind, retry_after_secs,
                  pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
                  pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
-                 usage_outcome)
+                 usage_outcome, owner_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21, $22)
+                    $15, $16, $17, $18, $19, $20, $21, $22, $23)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -590,6 +596,7 @@ impl LlmUsageStore {
         .bind(r.pace.as_ref().map(|p| p.window_start_unix))
         .bind(pace_upstreams)
         .bind(r.usage_outcome.map(|o| o.as_str()))
+        .bind(r.owner.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())

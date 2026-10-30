@@ -2292,6 +2292,7 @@ async fn record_llm_call(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    owner: Option<&str>,
     refusal_kind: Option<RefusalKind>,
 ) {
     let key = LlmHealthTable::key(upstream);
@@ -2332,6 +2333,7 @@ async fn record_llm_call(
         actor,
         origin,
         task,
+        owner,
         refusal_kind,
     ) {
         land_usage_record(state, record);
@@ -2355,6 +2357,7 @@ fn failed_attempt_usage(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    owner: Option<&str>,
     refusal_kind: Option<RefusalKind>,
 ) -> Option<LlmUsageRecord> {
     if result == UsageResult::Ok {
@@ -2385,8 +2388,10 @@ fn failed_attempt_usage(
         // 这一行没走到池级熔断：它已经指名试过一家上游，是不是"什么时候值得
         // 再来"不是这条路径的判定，不替它编一个数。
         retry_after_secs: None,
-        // 这件工作由调用方声明，失败不会改变"这笔钱是为谁花的"。
+        // 这件工作由调用方声明，失败不会改变"这笔钱是为谁花的"；同理，
+        // 试过但没成的一发也记在声明的那个人名下。
         task: task.map(str::to_string),
+        owner: owner.map(str::to_string),
         latency_ms,
         // 这一行不是配速拒的：这一拍的额度读数与它无关，写上去会读成"缺口为零"。
         pace: None,
@@ -2417,6 +2422,7 @@ fn pooled_refusal_usage(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    owner: Option<&str>,
     retry_after_secs: u64,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
@@ -2441,8 +2447,10 @@ fn pooled_refusal_usage(
         // 是几千秒，能分开它们的只有这个数的量级——而这个数只在这一行的生成点手边。
         retry_after_secs: Some(retry_after_secs),
         // 拒绝发生在选上游之前，但"这次调用想为哪件事花钱"调用方已经说了，
-        // 照记：被拒的调用正是按任务配速时最该看见的那一族。
+        // 照记：被拒的调用正是按任务配速时最该看见的那一族。人这一格同理：
+        // 被熔断拒掉的那一发，也仍然是某人名下的。
         task: task.map(str::to_string),
+        owner: owner.map(str::to_string),
         latency_ms: 0,
         // 熔断拒的依据是健康表，不是额度；这一格留空，缺口只在配速行上算。
         pace: None,
@@ -2463,6 +2471,7 @@ fn paced_refusal_usage(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    owner: Option<&str>,
     pace: PaceEvidence,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
@@ -2484,6 +2493,7 @@ fn paced_refusal_usage(
         // 混成一个数。
         retry_after_secs: None,
         task: task.map(str::to_string),
+        owner: owner.map(str::to_string),
         latency_ms: 0,
         // 这一行存在的全部理由就是这一拍的数：没有它，拒绝只剩一句"被拒了"，
         // 缺口要等到下一拍再猜。
@@ -2570,6 +2580,7 @@ async fn paced_refusal(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    owner: Option<&str>,
 ) -> Option<PaceRefusal> {
     if candidates.is_empty() {
         return None;
@@ -2614,7 +2625,7 @@ async fn paced_refusal(
         .collect();
     land_usage_record(
         state,
-        paced_refusal_usage(style, actor, origin, task, evidence),
+        paced_refusal_usage(style, actor, origin, task, owner, evidence),
     );
     Some(PaceRefusal {
         wait_secs,
@@ -2675,6 +2686,7 @@ async fn task_budget_refusal(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    owner: Option<&str>,
 ) -> Option<TaskBudgetRefusal> {
     let task = task?;
     let gate = state.task_budget.as_ref()?;
@@ -2702,7 +2714,14 @@ async fn task_budget_refusal(
             };
             land_usage_record(
                 state,
-                task_budget_refusal_usage(style, actor, origin, &refusal.task, refusal.wait_secs),
+                task_budget_refusal_usage(
+                    style,
+                    actor,
+                    origin,
+                    &refusal.task,
+                    owner,
+                    refusal.wait_secs,
+                ),
             );
             Some(refusal)
         }
@@ -2734,6 +2753,7 @@ fn task_budget_refusal_usage(
     actor: &str,
     origin: &str,
     task: &str,
+    owner: Option<&str>,
     retry_after_secs: u64,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
@@ -2753,6 +2773,9 @@ fn task_budget_refusal_usage(
         // 与配速那行不同，这个数不是上游的窗口，是我们自己那份预算的重置点。
         retry_after_secs: Some(retry_after_secs),
         task: Some(task.to_string()),
+        // 这被拒的一发也是记在这个人名下的：一件工作被自己的预算截断，
+        // 不等于它不花这个人的额度。
+        owner: owner.map(str::to_string),
         latency_ms: 0,
         pace: None,
         usage_outcome: None,
@@ -2895,6 +2918,9 @@ fn owner_budget_refusal_usage(
         refusal_kind: None,
         retry_after_secs: Some(refusal.wait_secs),
         task: task.map(str::to_string),
+        // 这一行存在的理由就是「谁被拒了」：`owner` 是判定用的那个标识，拒绝之后
+        // 花销计数不再动，所以事后靠计数追不出这个人——只有这一格记得住。
+        owner: Some(refusal.owner.clone()),
         latency_ms: 0,
         pace: None,
         usage_outcome: None,
@@ -2917,12 +2943,13 @@ fn pooled_refusal(
     actor: &str,
     origin: &str,
     task: Option<&str>,
+    owner: Option<&str>,
 ) -> Option<(u64, u64)> {
     let verdict = state.pool_circuit_break(candidates);
     if let Some((retry_after, _)) = verdict {
         land_usage_record(
             state,
-            pooled_refusal_usage(style, actor, origin, task, retry_after),
+            pooled_refusal_usage(style, actor, origin, task, owner, retry_after),
         );
     }
     verdict
@@ -3501,6 +3528,10 @@ async fn record_llm_tokens(
             // 真实调用的一行：熔断没拒过它，没有"下次再来"可报。
             retry_after_secs: None,
             task,
+            // 这一发的花销记在谁头上，与 [`charge_owner_budget`] 往计数里加的
+            // 是同一个人：账上的一行与额度上的一笔必须指着同一个标识，否则
+            // 「这个人今天花了多少」有两个答案。
+            owner: request.owner.clone(),
             latency_ms,
             // 真实调用的一行：配速没参与这一次的判定。
             pace: None,
@@ -5874,9 +5905,15 @@ async fn stream_forward(
 
     // 池级熔断：同协议面没有一个上游当下能承接请求时，遍历重试只烧请求。
     // 直接 503 + Retry-After 让调用方立刻知道何时可再来。
-    if let Some((retry_after, quota_window)) =
-        pooled_refusal(&state, &candidates, style, &actor, &origin, task.as_deref())
-    {
+    if let Some((retry_after, quota_window)) = pooled_refusal(
+        &state,
+        &candidates,
+        style,
+        &actor,
+        &origin,
+        task.as_deref(),
+        owner.as_deref(),
+    ) {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
             // 都不行"在状态码、在响应体上都同形（两者都可能是 503），唯一分得开
@@ -5928,8 +5965,16 @@ async fn stream_forward(
     // 窗口配速：额度还在，但按这一窗的长度摊到今天，剩下来的不够开一件新任务。
     // 位置在熔断之后：池里一家都没有时，说的是"没有产能"，不是"额度不够"，
     // 两者同时成立时先报前者，否则读的人会去等一个根本不会到来的窗口。
-    if let Some(refusal) =
-        paced_refusal(&state, &candidates, style, &actor, &origin, task.as_deref()).await
+    if let Some(refusal) = paced_refusal(
+        &state,
+        &candidates,
+        style,
+        &actor,
+        &origin,
+        task.as_deref(),
+        owner.as_deref(),
+    )
+    .await
     {
         let retry_after = refusal.wait_secs;
         tracing::warn!(
@@ -5980,8 +6025,15 @@ async fn stream_forward(
     // 位置在配速之后：配速回答「这一窗摊到此刻还能不能开一件」，是池子的事；预算
     // 回答「这件工作允不允许再花」，是工作本身的事。两者同时成立时先报池子——池子
     // 没额度时,抬这件任务的预算也不会让它跑起来。
-    if let Some(refusal) =
-        task_budget_refusal(&state, style, &actor, &origin, task.as_deref()).await
+    if let Some(refusal) = task_budget_refusal(
+        &state,
+        style,
+        &actor,
+        &origin,
+        task.as_deref(),
+        owner.as_deref(),
+    )
+    .await
     {
         tracing::warn!(
             refused_by_budget = true,
@@ -6224,6 +6276,7 @@ async fn stream_forward(
                     &actor,
                     &origin,
                     task.as_deref(),
+                    owner.as_deref(),
                     // 连接没建立起来，没有上游正文可读——这是"没问到"，不是某一种拒绝。
                     None,
                 )
@@ -6299,6 +6352,7 @@ async fn stream_forward(
                 &actor,
                 &origin,
                 task.as_deref(),
+                owner.as_deref(),
                 refusal_kind,
             )
             .await;
@@ -6339,6 +6393,7 @@ async fn stream_forward(
             &actor,
             &origin,
             task.as_deref(),
+            owner.as_deref(),
             // 成功的一行没有拒绝可分类。
             None,
         )
@@ -6822,6 +6877,8 @@ async fn call_llm(
         actor,
         origin,
         None,
+        // 网关自己的意图判定不发在任何人名下：它没有请求方声明的人。
+        None,
     ) {
         tracing::warn!(
             // 拒绝面必须自称：503 是熔断期"一个上游都没试"的结果，与"试遍了
@@ -6863,6 +6920,7 @@ async fn call_llm(
                     origin,
                     None,
                     None,
+                    None,
                 )
                 .await;
                 return Ok(resp);
@@ -6877,6 +6935,7 @@ async fn call_llm(
                     start.elapsed().as_millis() as u64,
                     actor,
                     origin,
+                    None,
                     None,
                     // 这一条读的是上游正文，成因在这里已经分好；传输失败没有正文时
                     // 它就是 `None`，两种"没有成因"在账上同形是实情。
@@ -9796,6 +9855,8 @@ mod tests {
             "agent:generator",
             "sandbox",
             None,
+            // 这一发没人声明过人名，人这一格留空。
+            None,
             Some(RefusalKind::QuotaCycle),
         )
         .expect("a failed attempt must be visible in the ledger");
@@ -9823,6 +9884,7 @@ mod tests {
             12,
             "agent:generator",
             "sandbox",
+            None,
             None,
             None
         )
@@ -11768,7 +11830,14 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 修上游，一个是等窗口。
     #[tokio::test]
     async fn a_pooled_refusal_is_one_ledger_row_and_is_not_an_upstream_error() {
-        let row = pooled_refusal_usage("openai", "agent:planner", "resident_worker", None, 300);
+        let row = pooled_refusal_usage(
+            "openai",
+            "agent:planner",
+            "resident_worker",
+            None,
+            Some("u-7"),
+            300,
+        );
         assert_eq!(row.result, UsageResult::RefusedByCircuit.as_str());
         assert_ne!(
             row.result,
@@ -11794,6 +11863,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(row.actor, "agent:planner");
         assert_eq!(row.origin, "resident_worker");
         assert_eq!(row.api_style, "openai");
+        // 人这一格也照记：被熔断拒掉的一发仍然是某人名下的。不带上它，
+        // 「这个人今天被拦了几次」在账上就没有行可数。
+        assert_eq!(row.owner.as_deref(), Some("u-7"));
         // 这一格是两种熔断唯一的分界线：翻页黑障几十秒、额度烧穿几千秒。留空或
         // 写 0 都会让这一行与「立刻可以重试」同形，而它说的恰恰是「现在不能」。
         assert_eq!(
@@ -11816,6 +11888,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "openai",
             "intent_gateway",
             "interactive",
+            None,
             None,
         );
         let (wait, _) = verdict.expect("全灭时判定仍为真：落账不许改判定");
@@ -12636,6 +12709,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 "openai",
                 "agent:generator",
                 "resident_worker",
+                None,
                 None
             )
             .await
@@ -12665,6 +12739,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 "openai",
                 "agent:generator",
                 "resident_worker",
+                None,
                 None
             )
             .await
@@ -12672,9 +12747,17 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "a call with no job identity is its own boundary and is held when over the line"
         );
         assert!(
-            paced_refusal(&state, &candidates, "openai", "ui", "interactive", None)
-                .await
-                .is_none(),
+            paced_refusal(
+                &state,
+                &candidates,
+                "openai",
+                "ui",
+                "interactive",
+                None,
+                None,
+            )
+            .await
+            .is_none(),
             "a human waiting is not the shape this pacing exists to stop"
         );
     }
@@ -12713,6 +12796,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 "openai",
                 "agent:generator",
                 "resident_worker",
+                None,
                 None
             )
             .await
@@ -12774,6 +12858,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "openai",
             "agent:generator",
             "resident_worker",
+            None,
             None,
         )
         .await
@@ -16352,7 +16437,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         state.task_budget = Some(gate.clone());
 
         assert!(
-            task_budget_refusal(&state, "openai", "a", "o", None)
+            task_budget_refusal(&state, "openai", "a", "o", None, None)
                 .await
                 .is_none(),
             "请求没声明任务就没有主体，也就没有「这件工作花了多少」"
@@ -16366,7 +16451,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         };
         state.task_budget = Some(Arc::new(StubBudgetGate::new(unbudgeted)));
         assert!(
-            task_budget_refusal(&state, "openai", "a", "o", Some("t-1"))
+            task_budget_refusal(&state, "openai", "a", "o", Some("t-1"), None)
                 .await
                 .is_none(),
             "没有声明过预算的任务不许被编出来的上限拦下"
@@ -16374,7 +16459,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         state.task_budget = Some(Arc::new(StubBudgetGate::broken()));
         assert!(
-            task_budget_refusal(&state, "openai", "a", "o", Some("t-1"))
+            task_budget_refusal(&state, "openai", "a", "o", Some("t-1"), None)
                 .await
                 .is_none(),
             "读不出花了多少时放行：拦错一次是从中间截断一件工作"
@@ -16698,6 +16783,13 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             owner_budget_refusal_usage("openai", "web_chat", "interactive", Some("t-9"), &refusal);
         assert_eq!(row.result, "refused_by_owner_budget");
         assert_eq!(row.task.as_deref(), Some("t-9"), "工作那一格照请求声明照抄");
+        // 这一行存在的理由就是「谁被拒了」，所以人那一格不能空：拒绝之后花销
+        // 计数不再动，事后靠计数追不出这个人。
+        assert_eq!(
+            row.owner.as_deref(),
+            Some("u-1"),
+            "被拒的人必须落在这一行上"
+        );
         assert_eq!(
             row.tokens_input + row.tokens_output,
             0,
