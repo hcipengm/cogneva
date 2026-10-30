@@ -17,6 +17,8 @@
 
 use std::collections::BTreeSet;
 
+#[path = "common/cells_written.rs"]
+mod cells_written;
 #[path = "common/closed_set.rs"]
 mod closed_set;
 mod common;
@@ -1080,6 +1082,67 @@ fn legend_labels_in(legend: &str) -> BTreeSet<String> {
             rest.find("}}").map(|end| rest[..end].trim().to_string())
         })
         .collect()
+}
+
+/// A panel that selects a label value nothing writes draws nothing, forever.
+///
+/// The name check above stops at the brace: `series{readout="x"}` is the family
+/// `series`, so a panel whose cell was renamed out from under it passes every
+/// check on this side and renders an empty graph that reads as "the system is
+/// idle". The rule contract on the alert side has the same blind spot and the
+/// same fix; the question is answered once in `cells_written` so the two
+/// surfaces cannot come to different conclusions about what a cell is.
+///
+/// Only cells selected from a series PRODUCED registers are judged: a label on
+/// `container_*` belongs to the kubelet, not to this repository.
+#[test]
+fn every_cell_a_panel_selects_is_a_name_this_tree_writes() {
+    let text = dashboard_text();
+    let produced: BTreeSet<&str> = PRODUCED.iter().map(|(n, _, _)| *n).collect();
+
+    let panels: Vec<(String, String)> = metric_exprs(&text)
+        .into_iter()
+        .map(|panel| (format!("面板第 {} 行", panel.line), panel.expr))
+        .collect();
+    let cells: Vec<(String, String, String)> = panels
+        .iter()
+        .flat_map(|(_, expr)| promql::selected_cells(expr))
+        .filter(|(series, _, _)| produced.contains(series.as_str()))
+        .collect();
+    let labels: BTreeSet<&str> = cells.iter().map(|(_, label, _)| label.as_str()).collect();
+    assert!(
+        cells.len() >= 20 && !labels.is_empty(),
+        "只从 {} 个面板里收到 {} 个单元格、{} 个标签：这份普查的解析面塌了，下面「没有未知单元格」是空的",
+        panels.len(),
+        cells.len(),
+        labels.len()
+    );
+
+    // A panel expression is the only place this census reads a cell. A template
+    // variable that started selecting cells would be a surface outside it, and
+    // would read as covered while nothing judged it -- so it has to fail here
+    // rather than be counted as one more expression nobody wrote down.
+    for line in text.lines().filter(|line| line.contains("\"query\":")) {
+        if let Some(query) = json_field(line, "query") {
+            assert!(
+                !query.contains('{'),
+                "模板变量开始选单元格了，这面普查读不到它: {line}"
+            );
+        }
+    }
+
+    let written = cells_written::literals_the_tree_writes(
+        &repo_root(),
+        PRODUCED
+            .iter()
+            .map(|(_, _, source)| repo_root().join(source)),
+    );
+    let unknown = cells_written::cells_no_one_writes(&panels, &produced, &written);
+    assert!(
+        unknown.is_empty(),
+        "这些面板选中的标签值在面板文件之外一次都没被写下过，它们画的是一个永远不会出现的取值:\n{}",
+        unknown.join("\n")
+    );
 }
 
 #[test]

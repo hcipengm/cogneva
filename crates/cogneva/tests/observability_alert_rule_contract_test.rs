@@ -40,6 +40,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cog_gateway::security_gateway::{RangeReadBaseline, RANGE_READ_BASELINES};
 
+#[path = "common/cells_written.rs"]
+mod cells_written;
 #[path = "common/closed_set.rs"]
 mod closed_set;
 #[path = "common/dashboard.rs"]
@@ -3954,32 +3956,16 @@ fn every_cell_a_rule_selects_is_a_name_this_tree_writes() {
         labels.len()
     );
 
-    let written = literals_the_tree_writes(&repo_root());
-    let unknown = cells_no_one_writes(&rules, &produced, &written);
+    let written = cells_written::literals_the_tree_writes(
+        &repo_root(),
+        PRODUCED.iter().map(|(_, source)| repo_root().join(source)),
+    );
+    let unknown = cells_written::cells_no_one_writes(&rules, &produced, &written);
     assert!(
         unknown.is_empty(),
         "这些规则选中的标签值在规则文件之外一次都没被写下过，它们读的是一个永远不会出现的取值:\n{}",
         unknown.join("\n")
     );
-}
-
-/// The cells selected from a registered series whose value no file in the tree
-/// writes.
-fn cells_no_one_writes(
-    rules: &[(String, String)],
-    produced: &BTreeSet<&str>,
-    written: &BTreeSet<String>,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for (rule, promql) in rules {
-        for (series, label, value) in promql::selected_cells(promql) {
-            if !produced.contains(series.as_str()) || written.contains(&value) {
-                continue;
-            }
-            out.push(format!("{rule}: {series}{{{label}=\"{value}\"}}"));
-        }
-    }
-    out
 }
 
 /// The gate separates the two answers against fabricated rules as well: a gate
@@ -3994,14 +3980,14 @@ fn a_cell_no_producer_writes_is_reported_and_one_that_exists_is_not() {
         .collect();
     let rules = |promql: &str| vec![("rule".to_string(), promql.to_string())];
 
-    assert!(cells_no_one_writes(
+    assert!(cells_written::cells_no_one_writes(
         &rules(r#"max(cogneva_tasks_readings{readout="held_unstated_rows"}) > 0"#),
         &produced,
         &written
     )
     .is_empty());
     // One letter off, and the rule matches nothing for as long as it ships.
-    let complaints = cells_no_one_writes(
+    let complaints = cells_written::cells_no_one_writes(
         &rules(r#"max(cogneva_tasks_readings{readout="held_unstated_row"}) > 0"#),
         &produced,
         &written,
@@ -4014,7 +4000,7 @@ fn a_cell_no_producer_writes_is_reported_and_one_that_exists_is_not() {
     );
     // An alternative of a regex is a cell too.
     assert_eq!(
-        cells_no_one_writes(
+        cells_written::cells_no_one_writes(
             &rules(r#"max(cogneva_tasks_readings{readout=~"held_unstated_rows|gone"}) > 0"#),
             &produced,
             &written
@@ -4023,7 +4009,7 @@ fn a_cell_no_producer_writes_is_reported_and_one_that_exists_is_not() {
         1
     );
     // A series PRODUCED does not register is another gate's question.
-    assert!(cells_no_one_writes(
+    assert!(cells_written::cells_no_one_writes(
         &rules(r#"max(not_ours_total{readout="gone"}) > 0"#),
         &produced,
         &written
@@ -4040,26 +4026,6 @@ fn a_cell_no_producer_writes_is_reported_and_one_that_exists_is_not() {
 /// in would let every cell license itself: the rule that selects a value would
 /// be the one place writing it, and the check would never once have an answer
 /// other than yes.
-fn literals_the_tree_writes(root: &std::path::Path) -> BTreeSet<String> {
-    use common::{fsio, rust_production};
-
-    let mut files = rust_production::production_sources(root);
-    files.extend(PRODUCED.iter().map(|(_, source)| root.join(source)));
-    let mut out = BTreeSet::new();
-    for path in files {
-        let text = fsio::read(&path);
-        let mut rest = text.as_str();
-        while let Some(open) = rest.find('"') {
-            let after = &rest[open + 1..];
-            let Some(close) = after.find('"') else {
-                break;
-            };
-            out.insert(after[..close].to_string());
-            rest = &after[close + 1..];
-        }
-    }
-    out
-}
 
 /// FOREIGN is an allow-list, and the one thing an allow-list must never name is
 /// something this workspace publishes.
