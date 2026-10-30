@@ -2282,22 +2282,32 @@ fn declared_credential_loop_owner() -> bool {
 /// zero all the way to the hour the token expires and egress starts answering
 /// 401. The expiry gauge and the threshold that acts on it are the pair that
 /// separates "rotating" from "trying and failing".
+///
+/// `app_configured` is the caller's own config fact, not a question the gate
+/// asks over HTTP. The gate used to call the gateway's `/v1/oauth/gitee/app`,
+/// and that call fails in exactly the place it has to work: the refresher is
+/// spawned while this process is still starting, before it binds its listener,
+/// so the only answer available is "unreachable" — which the same `Option`
+/// return reports as "not configured". On 2026-10-29 that removed the loop from
+/// a deployment whose OAuth app was configured all along: one INFO line saying
+/// there was nothing to rotate, and a day later egress began answering 401 with
+/// nothing left to rotate the token back.
 pub fn spawn_gitee_token_refresher(
     shutdown: cog_core::shutdown::ShutdownSignal,
     interval_secs: u64,
     refresh_threshold_secs: u64,
     metrics: Arc<dyn cog_core::MetricsBackend>,
+    app_configured: bool,
 ) -> tokio::task::JoinHandle<()> {
     // The task below is the deployment gate, not the loop: it ends by starting
     // the loop, so a caller must not read its completion as the loop's fate.
-    // The gate cannot be asked at process init instead — one of its two inputs is
-    // an HTTP call to the security gateway, which would both block startup and
-    // read "not reachable yet" as "not configured".
+    // What it decides it decides from arguments alone, so the verdict cannot
+    // depend on how far along this process' own startup happens to be.
     tokio::spawn(async move {
         // 每一支退出都带原因。只报「起来了」是不够的：拿 OAuth App 配置当门时，
         // App 被撤掉那一支会静默返回，于是「有轮换材料、但不再刷新」与「没东西
         // 可刷」在日志上同形，只有 24h 后 egress 开始 401 才区分得开。
-        if !gitee_oauth_available().await {
+        if !app_configured {
             tracing::info!(
                 "gitee token refresher not started: no Gitee OAuth app is configured for the security gateway"
             );
@@ -2797,5 +2807,56 @@ mod tests {
         // endpoint reported success.
         assert_eq!(clean_oauth_app_secret("   "), None);
         assert_eq!(clean_oauth_app_secret(""), None);
+    }
+
+    // 续期循环的准入判据必须是调用方手上那份配置，不能是一次自问自答的 HTTP：
+    // 循环在监听口绑上之前就起，那一刻「问自己配没配」得到的必然是连不上，而
+    // 「连不上」在这一族的返回值里与「没配」同形。2026-10-29 就是这样丢掉整个
+    // 循环的——App 早就配好，它留一行「没配」退出，一天后 token 过期、egress
+    // 开始 401，而部署里再没有谁换得动那枚令牌。
+    //
+    // 两半放在同一个测试里，是因为登记表是本进程的全局表：分开写，第二个测试
+    // 会在第一个已登记之后断言「没有」，结果取决于执行顺序。
+    #[tokio::test]
+    async fn the_refresher_start_gate_reads_config_not_a_self_http_call() {
+        let registry = cog_core::loop_health::registry();
+        let registered = || {
+            registry
+                .names()
+                .iter()
+                .any(|n| n == GITEE_TOKEN_REFRESHER_LOOP)
+        };
+
+        // 没配：一行日志退出，不登记。
+        let shutdown = cog_core::ShutdownSignal::new();
+        let metrics = Arc::new(crate::test_metrics::TestMetrics::default());
+        spawn_gitee_token_refresher(shutdown.clone(), 3600, 600, metrics, false)
+            .await
+            .expect("the deployment gate task itself must not panic");
+        assert!(
+            !registered(),
+            "没配 OAuth App 时不该起续期循环，但登记表里出现了它"
+        );
+
+        // 配了：起。这一半没有网络可走——判据退回一次自问，测试进程里必然连不上，
+        // 于是这里就会红。
+        let shutdown = cog_core::ShutdownSignal::new();
+        let metrics = Arc::new(crate::test_metrics::TestMetrics::default());
+        let gate = spawn_gitee_token_refresher(shutdown.clone(), 3600, 600, metrics, true);
+        gate.await
+            .expect("the deployment gate task itself must not panic");
+        // 登记在起循环的那个任务里做，所以它可能比 `gate` 这一笔晚一点。
+        for _ in 0..50 {
+            if registered() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let started = registered();
+        shutdown.trigger();
+        assert!(
+            started,
+            "OAuth App 配好了却没起续期循环：准入判据去问了本进程的监听口，而它此刻还没起来"
+        );
     }
 }
