@@ -127,7 +127,7 @@ pub(crate) fn task_text(case: &EvalCase) -> String {
 }
 
 /// data URL 的长度下界。短串里的 `data:` 是正文（一句话里提到这个词），不是附件。
-// cap: bound
+// cap: bound — 短串里的 data: 是正文不是附件
 const DATA_URL_MIN_LEN: usize = 1024;
 
 fn is_data_url(s: &str) -> bool {

@@ -42,21 +42,21 @@ pub struct ExecLimits {
 ///
 /// 取的是「一整支外部 agent 跑一道题」的量级：多步工具调用加一次模型往返，
 /// 十分钟够跑完一条正常轨迹，又短到卡住的循环不会占住评测机半天。
-// cap: bound
+// cap: bound — 一整支外部 agent 跑一道题的量级：多步工具调用加一次模型往返
 pub const DEFAULT_WALL_CLOCK: Duration = Duration::from_secs(600);
 
 /// 默认给外部流派几个核：2。
 ///
 /// 一行评测同时只跑一个流派，两核让它的编译/脚本步骤不至于排队，同时四行
 /// 并发仍落在评测机的余量里。
-// cap: bound
+// cap: bound — 一行评测同时只跑一个流派：两核够它不排队，四行同跑也不至于抢光
 pub const DEFAULT_CPUS: f32 = 2.0;
 
 /// 默认给外部流派多少内存：4 GiB。
 ///
 /// 装得下一次容器镜像解包加一个中型工具链；再多就是在替流派的选择买单，
 /// 而内存上限一旦按行不同，读数就不再同题可比。
-// cap: bound
+// cap: bound — 装得下一次镜像解包加一个中型工具链；再多是替流派的选择买单
 pub const DEFAULT_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 impl Default for ExecLimits {

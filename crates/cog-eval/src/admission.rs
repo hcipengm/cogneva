@@ -43,28 +43,28 @@ use tokio::sync::Notify;
 /// 按 30–60s 代理 worst 值越过 20 的分钟占 26%（io 25%、cpu 1.6%、memory 1.4%）；
 /// 1s 粒度活采里 17% 的样本越线、最大 49.8 —— 这条线够得着，不是摆设。它对行为也有
 /// 实权：把两条 PSI 红灯整个去掉，界停在 1 的时间从 54.9% 掉到 44.1%。
-// cap: bound
+// cap: derived — 7d 实测的 PSI avg10 分布定出的红灯线；是历史读数，不是这台机器当下的值
 pub const PSI_RED_AVG10: f64 = 20.0;
 /// 绿灯：PSI 三项的 `avg60` 全在这条线以下才加一。
 ///
 /// 实测：5.0 落在这台宿主自己 worst_avg60 分布的第 67 分位（p50 1.51、p75 21.7），
 /// 不是圆整数。但它是这条律里最不灵敏的旋钮：5 → 20 或 5 → 2，界停在 1 的时间只在
 /// 53.8%–56.7% 之间动（一到三个百分点）。别把它当主要调节手段。
-// cap: bound
+// cap: derived — 7d 实测 worst_avg60 的第 67 分位；同上，来自一次量过的分布
 pub const PSI_GREEN_AVG60: f64 = 5.0;
 /// 可用内存的地板，低于它减半。
 ///
 /// 实测：7d MemAvailable 谷底 36.46 GiB、p5 46.4 GiB。地板要「有牙齿」——逐档量
 /// 「内存是唯一决定者的分钟」：≤42 GiB 一周内一次都不是它决定的（PSI 先红），
 /// 44 GiB 才出现 2 分钟、48 GiB 22 分钟。取最小的有点的那一档。
-// cap: bound
+// cap: derived — 7d MemAvailable 的 p5 与谷底之间取的地板，替这台宿主留出余量
 pub const MEM_FLOOR_BYTES: u64 = 44 * 1024 * 1024 * 1024;
 /// 绿灯的可用内存线：高于它才加一。
 ///
 /// 它与地板是两个量，各有实测来源。取 7d 分布的 p5（46.4 GiB）向下取整：绿灯只排除
 /// 最干的 5% 分钟，同时与 44 GiB 地板之间留下约 2.4 GiB 的回滞带，界不会在地板附近
 /// 抖着加一减半。
-// cap: bound
+// cap: derived — 7d MemAvailable 的 p5 向下取整：绿灯只排除实测里确实出现过的那部分
 pub const MEM_GREEN_MIN_BYTES: u64 = 46 * 1024 * 1024 * 1024;
 /// 编译期不变式：绿灯线高于地板才留得出回滞带。把绿灯写回「地板的倍数」会先撞
 /// 这里，而不是等到宿主上永远不加一才发现。
@@ -73,10 +73,10 @@ const _: () = assert!(MEM_GREEN_MIN_BYTES > MEM_FLOOR_BYTES);
 ///
 /// 它是个比例而不是一个时间：一道题该跑多久取决于这道题，闸门不知道。所以这条灯只能
 /// 相对自己——宿主整体变慢由 PSI 那三条路说，不走这条。
-// cap: bound
+// cap: bound — 比例不是时间：一道题该跑多久取决于这道题，闸门不知道
 const LATENCY_RED_FACTOR: f64 = 2.0;
 /// 判中位数之前至少要看过几例。少于这个数，中位数还不是「这个负载的历史」。
-// cap: bound
+// cap: bound — 少于这个数还不算「这个负载的历史」
 const LATENCY_MIN_SAMPLES: usize = 5;
 
 /// 界为什么动。四种动法各是一个读数：少了「顶到上界」与「贴着下界」，「界在 2」与
@@ -212,18 +212,18 @@ pub struct AdmissionConfig {
 }
 
 /// 未实测的下界：1，只是「不许是零」的形式下界。
-// cap: bound
+// cap: bound — 形式下界，只表达「不许是零」
 const UNMEASURED_FLOOR: usize = 1;
 
 /// 未实测的上界：4，取的是驱动原先写死的并发数。
-// cap: bound
+// cap: bound — 未实测时的临时上界；取的是驱动原先写死的并发数
 const UNMEASURED_CEILING: usize = 4;
 
 /// 重新算一次界的最小间隔：60s。
 ///
 /// 界要跟着实测走，而一次实测本身就是一份读数；比一分钟更密的窗口会让界在
 /// 噪声里来回跳，反而压不住并行度。
-// cap: bound
+// cap: bound — 界要跟着实测走，而一次实测本身就是一份读数：再密就是在噪声上改界
 const ADMISSION_RECOMPUTE_WINDOW: Duration = Duration::from_secs(60);
 
 impl AdmissionConfig {
