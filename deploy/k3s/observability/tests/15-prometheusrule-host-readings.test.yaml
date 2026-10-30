@@ -1,0 +1,76 @@
+# 名册与图分家那两条规则的证明，用 promtool 的真引擎跑真表达式。
+#
+# 这两条读的数不是本仓印得出来的：名册在私有仓的 `scripts/data/faces.tsv`，图在平台
+# 数据库里，两条腿隔着一条进程边界。所以这里能证的是**表达式**——`max(...) > 界` 有没有
+# 按写的那样在过界时响、在没过界时不响，以及 `for: 10m` 的那十分钟是不是真的等满了。
+# 「这个数是谁印的、印得对不对」在生产者那一侧，不在这份夹具里。
+#
+# 输入取 2026-10-24 至 10-27 的现场：名册还写着 `operator`/`worker`、图里 15 个面已经
+# 由自动派人交给了 `f5`，漂移数是 18。静格用 0，这是两种收口方向（改名册或开一次交接）
+# 都会把它降回的那个值——不是「随便挑一个没超界的数」。
+rule_files:
+  - rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: 分家了会响（名册与图对不上 18 行）
+    interval: 1m
+    input_series:
+      - series: 'roster_rows_not_in_graph'
+        values: '18x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaGovernanceRosterDrift
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  - name: 收口之后不响，且刚归零那十分钟也不许响
+    interval: 1m
+    input_series:
+      - series: 'roster_rows_not_in_graph'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CognevaGovernanceRosterDrift
+        exp_alerts: []
+      - eval_time: 30m
+        alertname: CognevaGovernanceRosterDrift
+        exp_alerts: []
+
+  # 归零那一拍就撤告警是 `for: 10m` 的一半；另一半是「刚分开还不到十分钟，先别叫人」。
+  # 没有这一格，把 `for` 删掉也照样绿，而删掉之后改名册的那一下会先响一次再自己消失。
+  - name: 刚对上又刚分开，十分钟内还不许响
+    interval: 1m
+    input_series:
+      - series: 'roster_rows_not_in_graph'
+        values: '0x20 18x20'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaGovernanceRosterDrift
+        exp_alerts: []
+
+  - name: 写者停了（超过三百秒没导）会响
+    interval: 1m
+    input_series:
+      - series: 'roster_import_age_seconds'
+        values: '3600x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaGovernanceRosterImportStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "变更管理"
+
+  - name: 写者按六十秒一拍在跑，不会响
+    interval: 1m
+    input_series:
+      - series: 'roster_import_age_seconds'
+        values: '122x40'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaGovernanceRosterImportStale
+        exp_alerts: []
