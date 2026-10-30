@@ -10,10 +10,13 @@ import type { ActorUsage } from '@/api/client';
  * 数组，不会出现「写着 16、下面只列得出 10」的情况。
  *
  * 每个取值都配一句它到底是什么。这几列里混着两类东西：一类是真正的成员
- * （某个执行者名、某条上游），另一类是占位符——`-` 表示请求在池级熔断那一步
- * 就被拒了、一个上游都没试；`unknown` 表示调用方没有声明。占位符也是折叠表里
- * 真实存在的取值，所以照样列出，但**不进那个数**：数「平台上有几条上游」时把
- * 「未发起」加进去，读者会以为多接了一条线路，而它恰恰是「一条都没试」。
+ * （某个执行者名、某条上游、某个环境），另一类是占位符——`-` 表示请求在池级
+ * 熔断那一步就被拒了、一个上游都没试；`unknown` 表示调用方没有声明自己是谁、
+ * 在哪个环境跑。占位符也是折叠表里真实存在的取值，所以照样列出，但**不进那个数**：
+ * 数「平台上有几条上游」时把「未发起」加进去，读者会以为多接了一条线路，而它恰恰
+ * 是「一条都没试」；数「有几个环境」时把「没人声明」加进去，屏幕上就有个数指向
+ * 一个不存在的地方。`LlmOrigin::Unknown` 的契约原文就是「不计进任何一个环境的
+ * 总数」，这一屏只是照着它显示。
  *
  * 「这一维一共几个」还有第二种误读：数出来的只是**这段窗口里出现过的**。一个
  * 闭集登记了六个环境，某段窗口只走过其中一个，屏幕上写「1」不会让任何人想到
@@ -67,7 +70,9 @@ export function DimensionCounts({ actors }: { actors: ActorUsage[] }) {
           <div key={dim.key} className="mt-2 flex flex-col gap-1" style={{ userSelect: 'text' }}>
             <div className="text-[11px] text-[var(--muted)]">
               {dim.title}一共 {counted.length} 个取值
-              {list.length > counted.length ? `，另有 ${list.length - counted.length} 类未发起` : ''}
+              {list.length > counted.length
+                ? `，另有 ${list.length - counted.length} 类不是成员（「未发起」「未声明」这类占位，照样列出）`
+                : ''}
               （一个取值一行，调用数是这段窗口里它的全部尝试）：
             </div>
             {list.map((member) => {
@@ -152,6 +157,19 @@ type Dimension = {
 // 这里是它的读法：它不是成员，只是占位。
 const POOLED_REFUSAL_UNNAMED = '-';
 
+// 调用方一个名字都没报时落在这一格上。契约在 `crates/cog-core/src/contract/usage_ledger.rs`
+// 的 `LlmOrigin::Unknown`：**「不是一个调用能来自的地方，因此既不进 `DECLARED`，
+// 也不进任何一个环境的总数」**——所以它和 `-` 一样是占位，不是成员。门
+// （`check-web-token-panel.sh` 第 8 段）把这个字面量与代码里 `Unknown` 那一臂比对，
+// 两边漂了的唯一症状是面板把「没人认领的那一段」数成一个环境。
+const UNKNOWN_ORIGIN = 'unknown';
+
+// 执行者那一维的同一个占位。契约在网关的 `UNKNOWN_ACTOR`
+// （`crates/cog-gateway/src/actor_labels.rs`）：没在请求上声明自己是谁的调用方落这里。
+// 与上面那个分开写，是因为它们答的是两份不同的声明——两处一旦漂开，这条一行的读法
+// 就会替另一份契约说话。门（第 8 段）逐个比对。
+const UNKNOWN_ACTOR_NAME = 'unknown';
+
 const ORIGIN_LABELS: Record<string, string> = {
   gateway_pool: '经网关共享上游池发出（平台里绝大多数调用）',
   resident_worker: '常驻 worker 进程',
@@ -191,16 +209,23 @@ const ACTOR: Dimension = {
   key: 'actor',
   title: '执行者',
   pick: (a) => a.actor,
-  read: (value) => ({ label: value, hint: actorHint(value), tone: value === 'unknown' ? 'var(--warn)' : undefined }),
+  read: (value) => ({
+    label: value,
+    hint: actorHint(value),
+    tone: value === UNKNOWN_ACTOR_NAME ? 'var(--warn)' : undefined,
+  }),
+  isPlaceholder: (value) => value === UNKNOWN_ACTOR_NAME,
   registry: ACTOR_MEANINGS,
   note: (counted, absent) => {
-    const undeclared = counted.some((m) => m.value === 'unknown') ? '（含未声明）' : '';
+    // 表里还留着一格 `unknown`，它是占位不是名字：读法要留着（否则它显示成
+    // 「不在闭集里」），但不算进「登记了几个名字」。
+    const named = Object.keys(ACTOR_MEANINGS).length - 1;
     return absent.length > 0
-      ? `本窗口出现 ${counted.length} 个${undeclared}，闭集共 ${Object.keys(ACTOR_MEANINGS).length} 个固定名＋2 族`
-      : `点开看是谁${undeclared}`;
+      ? `本窗口出现 ${counted.length} 个，闭集共 ${named} 个固定名＋2 族`
+      : `点开看是谁（闭集 ${named} 个固定名＋2 族）`;
   },
   footnote: () =>
-    '执行者名来自网关的闭集：固定的阶段名（eval、memory、ralph…），加 `agent:<角色>` / `self_review:<被评的角色>` 两族前缀。没声明自己是谁的调用方记成 `unknown`——名字缺席是调用方没报，不是网关丢的。闭集里登记了、这段窗口没出现过的名字也列在下面，标「本窗口没有调用」：出现过几个不是全集。',
+    '执行者名来自网关的闭集：固定的阶段名（eval、memory、ralph…），加 `agent:<角色>` / `self_review:<被评的角色>` 两族前缀。没声明自己是谁的调用方记成 `unknown`——名字缺席是调用方没报，不是网关丢的，所以它不算进「几个执行者」，只把那段花销照实列出来。闭集里登记了、这段窗口没出现过的名字也列在下面，标「本窗口没有调用」：出现过几个不是全集。',
 };
 
 const UPSTREAM: Dimension = {
@@ -264,19 +289,29 @@ const ORIGIN: Dimension = {
     if (known) return { label: value, hint: known };
     return { label: value, hint: '调用方声明的环境名不在已登记的集合里', tone: 'var(--warn)' };
   },
+  // `unknown` 不是一个环境，只是「没人说」。它照样列出（那一段花销真实存在），
+  // 但不进个数——否则屏幕上「环境有 4 个」里有 1 个根本不指向任何地方。
+  isPlaceholder: (value) => value === UNKNOWN_ORIGIN,
   registry: ORIGIN_LABELS,
   note: (counted, absent) => {
-    const declared = counted.length + absent.length;
+    // 同上：登记表里那一格 `unknown` 不是环境。
+    const declared = Object.keys(ORIGIN_LABELS).length - 1;
     if (absent.length > 0) return `本窗口出现 ${counted.length} 个，闭集共 ${declared} 个`;
     return `点开看是哪几个（闭集 ${declared} 个全出现过）`;
   },
-  footnote: (_list, counted, absent) =>
-    `环境是「谁在替它出面」：${Object.keys(ORIGIN_LABELS)
-      .map((k) => `\`${k}\``)
-      .join('、')}。它们全都走网关——「走网关」和「哪个环境」是两件事，所以别指望这里只有一个值。` +
-    (absent.length > 0
-      ? `闭集登记了 ${counted.length + absent.length} 个环境，这段窗口只走过 ${counted.length} 个；没出现的也在下面列着，标「本窗口没有调用」——出现过几个不是全集。`
-      : ''),
+  footnote: (list, counted, absent) => {
+    const environments = Object.keys(ORIGIN_LABELS).filter((k) => k !== UNKNOWN_ORIGIN);
+    const unattributed = list.length > counted.length;
+    return (
+      `环境是「谁在替它出面」：${environments.map((k) => `\`${k}\``).join('、')}。` +
+      '它们全都走网关——「走网关」和「哪个环境」是两件事，所以别指望这里只有一个值。' +
+      '`unknown` 不在其中：它不是某个环境，是调用方一个名字都没报，那一段花销照实列出但不算进「几个环境」。' +
+      (absent.length > 0
+        ? `闭集登记了 ${environments.length} 个环境，这段窗口只走过 ${counted.length} 个；没出现的也在下面列着，标「本窗口没有调用」——出现过几个不是全集。`
+        : '') +
+      (unattributed ? '下面标了 `unknown` 的那一行是没人认领的一段：它此刻有花销，只是说不出是谁的。' : '')
+    );
+  },
 };
 
 /**
@@ -310,7 +345,13 @@ function countedMembers(list: Member[], dim: Dimension): Member[] {
 function registeredButAbsent(list: Member[], dim: Dimension): string[] {
   if (!dim.registry) return [];
   const seen = new Set(list.map((m) => m.value));
-  return Object.keys(dim.registry).filter((value) => !seen.has(value));
+  // 占位符不是闭集的成员，所以「本窗口没有调用」这句话对它无意义：`unknown`
+  // 的意思是「没有人报」，不是「这个环境今天没跑」。把它列成没跑的环境，正好
+  // 把要分开的两件事合回去。剔除写在返回值这一句里，不另绑变量——门要判的正是
+  // 「这一句有没有剔」，中间多一层绑定就判不到了。
+  return Object.keys(dim.registry).filter(
+    (value) => !seen.has(value) && !(dim.isPlaceholder?.(value) ?? false)
+  );
 }
 
 const DIMENSIONS = [ACTOR, UPSTREAM, API_STYLE, ORIGIN];

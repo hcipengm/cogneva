@@ -312,15 +312,56 @@ else:
             if not missing and not foreign:
                 summary.append(f"执行者名单: {len(declared)} 个名字，{rel} 与之逐名相等")
 
+# 环境那一维的闭集住在这儿（`LlmOrigin` 的 `declared` / `as_str` 是一份契约）。
+# 与上面那条闭集源同一个理由写成一列而不是一个路径：搬家的那一天，红的是「读不
+# 出来」，而不是一份陈旧的判词。
+USAGE_LEDGER_REL = "crates/cog-core/src/contract/usage_ledger.rs"
+
+# 这四维的折叠表里都可能有占位符：上游与协议的 `-`、环境与执行者的 `unknown`。
+DIMENSIONS_WITH_PLACEHOLDERS = ("UPSTREAM", "API_STYLE", "ORIGIN", "ACTOR")
+# (屏上的常量名, 代码里那一臂的匹配式, 那一臂所在的文件, 说给人听的名字)。
+# 每一行比的是一个字面量：屏幕要认得出占位符，靠的就是这两个字面量相等。
+#
+# 不按裸子串判：`unknown` 这个词在这一屏里出现过很多次（读法、注释、别的维），
+# 只有「常量声明的那个字面量」和「代码里那一臂的字面量」是两处可以互相比对的声明。
+def code_text(relative):
+    """读一份代码源，读不到就把「读不到」本身当读数返回（空串）。"""
+    path = os.path.join(ROOT, relative)
+    if not os.path.isfile(path):
+        return ""
+    return open(path, encoding="utf-8").read()
+
+
+PLACEHOLDER_ANCHORS = [
+    (
+        "UNKNOWN_ORIGIN",
+        r'LlmOrigin::Unknown\s*=>\s*"([^"]+)"',
+        (USAGE_LEDGER_REL, code_text(USAGE_LEDGER_REL)),
+        "`LlmOrigin::Unknown`",
+    ),
+    (
+        "UNKNOWN_ACTOR_NAME",
+        r'UNKNOWN_ACTOR\s*:\s*&str\s*=\s*"([^"]+)"',
+        (LABELS_RS, code_text(LABELS_RS)),
+        "`UNKNOWN_ACTOR`",
+    ),
+]
+
 # ── 8. 占位符不算成员 ──
-# 折叠表里有两类取值混在同一列上：真正的成员（某条上游、某种协议），和占位符
-# `-`——池级熔断在选线路之前就把请求挡下了，账上拿它占「没试过任何一条」。它
-# 是真话，所以不能删、也不能不列；但把它数进「平台上有几条上游」，读者会以为
-# 多接了一条线路，而它恰恰是「一条都没试」。
+# 折叠表里有两类取值混在同一列上：真正的成员（某条上游、某种协议、某个环境），
+# 和占位符——`-` 是池级熔断在选线路之前就挡下的那一次（一个上游都没试），
+# `unknown` 是调用方没声明自己是谁 / 在哪个环境跑。两个都是真话，所以不能删、
+# 也不能不列；但把它们数进「平台上有几条上游」「有几个环境」，读者会以为多接了
+# 一条线路、多了一个环境，而它们恰恰是「一条都没试」「没人说」。
+# `unknown` 这一格还多一层依据：`LlmOrigin::Unknown` 的契约原文就是「不是一个
+# 调用能来自的地方，因此不进任何一个环境的总数」——屏幕把它数进个数，等于和写
+# 账本的那份契约对着说。
 #
 # 这条判的是**个数取的是哪一列**：那一格必须来自剔掉占位符的清单，而不是
-# 折叠表的每一行。判不了的是那句中文读法写得好不好——那是解释，不是可复核的
-# 事实；判得了的是「上游 / 协议这两维声明了谁是占位符」以及「那个数没退回全量」。
+# 折叠表的每一行；并且四个维各自声明谁是占位符，声明的字面量必须等于代码里
+# 那一臂（`-` 与 `POOLED_REFUSAL_UNNAMED`、`unknown` 与 `LlmOrigin::Unknown` /
+# `UNKNOWN_ACTOR`）——自己抄一份常量，两边漂开时屏幕会照着旧的那个说话。
+# 判不了的是那句中文读法写得好不好——那是解释，不是可复核的事实。
 PANEL = re.compile(r"const\s+DIMENSIONS\s*=\s*\[")
 count_src = [(rel, read(rel)) for rel in sorted(graph) if PANEL.search(read(rel))]
 if not count_src:
@@ -330,7 +371,7 @@ else:
     if re.search(r"\{list\.length\}\s*</div>", src):
         problems.append(
             f"{rel}: 那一格又退回成 {{list.length}} 了——折叠表的每一行都算成员时，"
-            "「未发起」占位符会被数成一条上游 / 一种协议"
+            "「未发起」与「未声明」这两个占位符会被数成一个成员"
         )
     elif not re.search(r"\{counted\.length\}\s*</div>", src):
         problems.append(
@@ -340,7 +381,7 @@ else:
     else:
         listed = [
             name
-            for name in ("UPSTREAM", "API_STYLE")
+            for name in DIMENSIONS_WITH_PLACEHOLDERS
             if not (
                 (m := re.search(rf"const\s+{name}\s*:\s*Dimension\s*=\s*\{{(.*?)\n\}};", src, re.S))
                 and "isPlaceholder" in m.group(1)
@@ -349,10 +390,53 @@ else:
         if listed:
             problems.append(
                 f"{rel}: {', '.join(listed)} 没有声明谁是占位符——"
-                "个数与清单会把「未发起」当成一个成员"
+                "个数与清单会把「未发起」「未声明」当成一个成员"
             )
         else:
-            summary.append(f"占位符: {rel} 的上游/协议两维各自标出谁是占位符，个数取的是成员清单")
+            summary.append(
+                f"占位符: {rel} 的"
+                + "/".join(DIMENSIONS_WITH_PLACEHOLDERS)
+                + "各维都标出谁是占位符，个数取的是成员清单"
+            )
+
+    # 闭集里登记了、窗口里没出现的取值，标成「本窗口没有调用」。占位符不能走这条路：
+    # `unknown` 的意思是「没有人报」，把它列成「这个环境今天没跑」，正是要把两件事
+    # 合回去。判的是剔除那一处还在，且判据里带着 isPlaceholder。
+    absent_body = re.search(
+        r"function\s+registeredButAbsent\s*\(.*?\n\}", src, re.S
+    )
+    if not absent_body:
+        problems.append(
+            f"{rel}: 找不到 registeredButAbsent()——「登记了但本窗口没出现」列的是哪些取值，"
+            "判不了占位符是否被混进了那一段"
+        )
+    elif "isPlaceholder" not in absent_body.group(0):
+        problems.append(
+            f"{rel}: registeredButAbsent() 没有剔除占位符——`unknown` 会被列成"
+            "「本窗口没有调用」的环境，而它根本不是环境"
+        )
+
+    # 声明的字面量必须等于代码里那一臂。两边各写一份常量时，漂开的唯一症状是
+    # 屏幕不再认得出占位符：个数多出一个，且没有任何东西报错。
+    for constant, value_re, value_src, what in PLACEHOLDER_ANCHORS:
+        m = re.search(rf"const\s+{constant}\s*=\s*'([^']+)'", src)
+        code = re.search(value_re, value_src[1])
+        if not m:
+            problems.append(f"{rel}: 找不到常量 {constant}——占位符的字面量没有单一声明")
+            continue
+        if not code:
+            problems.append(
+                f"{value_src[0]} 里找不到 {what} 的声明——占位符字面量无从比起"
+            )
+            continue
+        if m.group(1) != code.group(1):
+            problems.append(
+                f"{rel}: {constant} = {m.group(1)!r}，而 {value_src[0]} 里 {what} 是 "
+                f"{code.group(1)!r}——两边漂开时屏幕不再认得出这个占位符，"
+                "个数会多出一个而没有任何东西报错"
+            )
+        else:
+            summary.append(f"占位符字面量: {constant} == {what}（{code.group(1)!r}）")
 
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
