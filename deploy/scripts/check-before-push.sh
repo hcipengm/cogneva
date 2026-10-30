@@ -27,7 +27,7 @@
 # 命令是从 `.github/workflows/ci.yml` 里**取**的，不是在这里抄一份：抄一份的门会在
 # 有人加作业时静默变窄，而这条门唯一不能犯的错就是「它绿了，CI 却红了」。
 #
-# 不覆盖：Check / Test / Clippy / Code Coverage / Format / Version Contract /
+# 不覆盖：Check / Test / Code Coverage / Format / Version Contract /
 # Web Build / Bootstrap Cross-Platform —— 它们要编译或要 Node，本机跑一遍可能比 CI
 # 还慢。末尾会把这份清单印出来：**这条门绿不等于 CI 绿**，它只保证那几类「改动碰了
 # 别的面的读者」的判据不是推上去才发现的。
@@ -275,15 +275,15 @@ fi
 # 四十分钟为红。它的红只值一行：2026-10-30 一次 `let mut` 的 `unused_mut` 就这样烧掉了一轮，
 # 而本机此前一条读数都看不见它——脚本末尾那句「未覆盖」里写着 Clippy。
 #
-# 本机不能整份跑：实测一次冷跑 214 秒，而且共享工作树里别人飞到一半的文件也在判词里，
-# 红的那个人往往不是推的人。所以这一格的**题目**由 diff 推出来——这次要推的提交动过哪些
-# `crates/<dir>` 下的 `.rs`，就把那个计件包名（读 `crates/<dir>/Cargo.toml` 的 `name`，
-# 不点名，`crates/bootstrap` 这种目录名与包名不一致的也不用另写一条）交给 cargo；**每一个
-# 题目里跑的是 CI 的同一条命令与同一组 flag**，不挑 lint、不挑 target。CI 仍然整份跑。
+# 本机不能整份跑：实测一次冷跑 214 秒。所以这一格的**题目**由 diff 推出来——这次要推的
+# 提交动过哪些 `crates/<dir>` 下的 `.rs`，就把那个计件包名（读 `crates/<dir>/Cargo.toml`
+# 的 `name`，不点名，`crates/bootstrap` 这种目录名与包名不一致的也不用另写一条）交给 cargo；
+# **每一个题目里跑的是 CI 的同一条命令与同一组 flag**，不挑 lint、不挑 target。CI 仍然整份跑。
 #
-# 题目取 `origin/main...HEAD` 而不是工作树：推的是提交，判词该落在提交上。工作树里别人的
-# 半成品只以一个途径进来——它所在的 crate 若被这次提交碰到，编译绕不开它。那时红的是
-# 他们，先 `git status` 看红的是谁的文件。
+# 判的是**提交**不是工作树：CI 编译的是推上去的那棵树，而共享工作树里别人飞到一半的字节
+# 会给这次推的判词投票——红的那个人往往不是推的人。所以 HEAD 展开到一个临时工作树里判，
+# 目标目录指向主树的 `target`：registry 依赖的指纹不随路径变，实测 `-p cog-quota` 在展开里
+# 1m27s，其中大部分是在等别人的构建锁，自己只花 22s CPU。
 if [ -n "${cargo_bin}" ]; then
     if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
         echo "SKIP  Clippy：本机没有 origin/main，推的范围判不出来（CI 的 Clippy 会整份跑）"
@@ -308,9 +308,22 @@ if [ -n "${cargo_bin}" ]; then
             fi
         done
         if [ "${crate_count}" -gt 0 ]; then
-            echo "== Clippy：这次要推的提交动过 ${crate_count} 个 crate 的源码，按 CI 同一条命令判"
-            run_step "cargo clippy ${clippy_args[*]} --all-targets -- -D warnings" \
-                "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings
+            repo_toplevel="$(git rev-parse --show-toplevel)"
+            head_tree="$(mktemp -d "${TMPDIR:-/tmp}/cogneva-push-clippy.XXXXXX")"
+            git worktree prune 2>/dev/null
+            if git worktree add --detach --quiet "${head_tree}" HEAD 2>/dev/null; then
+                echo "== Clippy：这次要推的提交动过 ${crate_count} 个 crate 的源码，判的是 HEAD 展开出来的那棵树"
+                judge_head_tree() {
+                    ( cd "${head_tree}" &&
+                        CARGO_TARGET_DIR="${repo_toplevel}/target" \
+                            "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings )
+                }
+                run_step "cargo clippy ${clippy_args[*]} --all-targets -- -D warnings" judge_head_tree
+                git worktree remove --force "${head_tree}" >/dev/null 2>&1 || rm -rf "${head_tree}"
+            else
+                rm -rf "${head_tree}"
+                echo "SKIP  Clippy：展开不出 HEAD 的临时工作树（${head_tree}），这一份没判（CI 的 Clippy 会整份跑）"
+            fi
         else
             echo "== Clippy：这次要推的提交没动 crates/ 下的 .rs，跳过（CI 的 Clippy 会整份跑）"
         fi
