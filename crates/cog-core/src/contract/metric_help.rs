@@ -2595,10 +2595,12 @@ const GAUGE_HELP: &[(&str, &str)] = &[
         "Consecutive rounds in which the mainline advance could not take the \
          host's build slot; 0 on the round that takes one. It is the value form \
          of the state file's `advance_deferrals`, and it exists because the \
-         refusal itself does not: the advance is the one caller that waits zero \
-         seconds, so a refused round logs one line identical to the last and \
-         returns, and a starvation that lasts does not accumulate anything a \
-         reader can see from outside the pod. Read it against the loop period \
+         gate's refusal counter cannot say how many of them were consecutive: \
+         the advance does wait out a holder for its own bound before it gives \
+         up, so its refusals do land in `cogneva_build_gate_refused_total` as \
+         `asker=\"mainline_advance\",reason=\"waited_out\"`, but that is a \
+         running total for a whole lifetime and a starvation of three rounds \
+         reads the same on it as one of thirty. Read it against the loop period \
          beside it: the count times the period is how long the mainline has \
          been unable to move, and three is the round at which the deployer \
          stops queuing and claims a slot instead. A value that stops moving is \

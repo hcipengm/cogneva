@@ -1000,12 +1000,12 @@ metric_names! {
     // "happened to meet a host that was building" from "never got a turn":
     // measured under saturation, six consecutive refusals, one log line each.
     //
-    // The advance is the only caller that waits zero seconds, so a starved
-    // advance never shows up as a refusal anybody acts on -- the other callers
-    // wait out the holder, this one returns and comes back next round. That is
-    // why the value has to be published rather than counted at the refusal:
-    // the refusal exists only where somebody asked, and the round after the
-    // asker gives up is silent.
+    // The advance does wait out a holder, but only for its own bound, and then
+    // it returns to come back next round. Its refusals therefore do reach the
+    // gate's counter, as `asker="mainline_advance",reason="waited_out"` -- what
+    // that counter cannot say is how many of them were consecutive, since it is
+    // a running total for a whole lifetime and a starvation of three rounds and
+    // one of thirty read the same on it. That is the quantity published here.
     //
     // One number, no labels: the run is the deployer's own, and the deployer is
     // the only writer. 0 is published on the round that takes the slot, so a
