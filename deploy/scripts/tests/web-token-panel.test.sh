@@ -12,6 +12,10 @@
 #   - 把她挪到不可达文件 → 死文件里的调用点不算消费者
 # 每段改动都先确认**落到了文件上**（否则「改动没生效」与「门没抓住」不可区分）。
 #
+# 后三段判的是另外三件事，坏起来同样是静默的：额度窗整段消失（花销面答得出「花了
+# 多少」却答不出「还够不够」）、时区名消失（本地时刻被当成 UTC 读）、执行者的名字
+# 与网关的闭集各写各的（新名字被报成笔误，旧名字的读法永远不上屏）。
+#
 # 最后一条断言是在**真树**上跑：夹具全绿而真树红，说明这条门只是在测自己。
 set -euo pipefail
 
@@ -27,8 +31,27 @@ trap 'rm -rf "${work}"' EXIT
 
 # ── 夹具：一条从入口到面板的链 ──
 fixture() {
-  rm -rf "${work}/web"
-  mkdir -p "${work}/web/src/api" "${work}/web/src/hooks" "${work}/web/src/overlay"
+  rm -rf "${work}/web" "${work}/crates"
+  mkdir -p "${work}/web/src/api" "${work}/web/src/hooks" "${work}/web/src/overlay" \
+    "${work}/web/src/topology" "${work}/crates/cog-gateway/src"
+  # 执行者的闭集：第 7 段跨这条边界比名单，所以夹具两侧都要有。
+  cat >"${work}/crates/cog-gateway/src/actor_labels.rs" <<'EOF'
+pub const ACTOR_LABELS: &[&str] = &[
+    "eval",
+    "memory",
+    "web_chat",
+];
+
+pub const ACTOR_LABEL_PREFIXES: &[&str] = &["agent:", "self_review:"];
+
+/// Where a caller that declared no usable actor lands.
+pub const UNKNOWN_ACTOR: &str = "unknown";
+EOF
+  cat >"${work}/web/src/topology/format.ts" <<'EOF'
+export function localZoneLabel(): string {
+  return 'UTC+8';
+}
+EOF
   cat >"${work}/web/src/main.tsx" <<'EOF'
 import App from './App';
 render(<App />);
@@ -41,13 +64,20 @@ export default function App() {
 EOF
   cat >"${work}/web/src/overlay/TokenPanel.tsx" <<'EOF'
 import { useUsage, useSeries, useOutcomes, useAccount, usePool } from '@/hooks/useUsage';
+import { localZoneLabel } from '@/topology/format';
+const ACTOR_MEANINGS: Record<string, string> = {
+  eval: '评测跑批',
+  memory: '记忆读写',
+  web_chat: 'WebUI 对话',
+  unknown: '没声明自己是谁',
+};
 export function TokenPanel() {
   const { usage } = useUsage();
   const series = useSeries();
   const outcomes = useOutcomes();
   const account = useAccount();
   const pace = usePool().llm_pool?.pace ?? null;
-  return <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}{pace ?? "?"}</div>;
+  return <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}{pace ?? "?"} {localZoneLabel()} {ACTOR_MEANINGS.eval}</div>;
 }
 EOF
   cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
@@ -252,6 +282,34 @@ fixture
 sed -i 's/usePool().llm_pool?.pace ?? null/usePool().llm_pool ?? null/' "${work}/web/src/overlay/TokenPanel.tsx"
 confirm "${work}/web/src/overlay/TokenPanel.tsx" "llm_pool ?? null"
 expect_red "读了池子没读窗" "没有读上游额度窗"
+
+# 12. 时区名剪掉：面板照样画柱、照样给读数，而每一个时刻都是浏览器按本地时区
+#     渲染的，账本与日志是 UTC。差八小时的时候同一件事在两处写成两个时刻，读的
+#     人只能得出「其中一个错了」——现场已经这样误判过一次。
+fixture
+sed -i 's/ {localZoneLabel()}//' "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" 'pace ?? "?"} {ACTOR_MEANINGS.eval}'
+expect_red "没有时区调用点" "有定义但没有调用点"
+
+# 13. 时区定义剪掉、调用点还在：名字从别的文件里来不了，那个调用点读的是空。
+fixture
+printf 'export const nothing = 1;\n' >"${work}/web/src/topology/format.ts"
+confirm "${work}/web/src/topology/format.ts" 'export const nothing'
+expect_red "没有时区定义" "没有地方定义 localZoneLabel()"
+
+# 14. 闭集添了一个执行者、这一屏没有它的读法：那个名字会显示成「不在网关登记的
+#     闭集里，可能是新调用方或写错了名字」——一次正常的扩词被报成一次事故。
+fixture
+sed -i 's/    "web_chat",/    "web_chat",\n    "wiki",/' "${work}/crates/cog-gateway/src/actor_labels.rs"
+confirm "${work}/crates/cog-gateway/src/actor_labels.rs" '"wiki"'
+expect_red "闭集多一个名字" "这一屏没有它的读法"
+
+# 15. 反向：这一屏留着一个闭集里没有的名字。那段读法再也不会出现在任何一行上，
+#     而它看起来仍然是对的——两份名单各写各的，谁也不会红第二遍。
+fixture
+sed -i "s/  unknown: '没声明自己是谁',/  unknown: '没声明自己是谁',\n  planner: '计划者',/" "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" 'planner:'
+expect_red "闭集少一个名字" "里没有这个名字"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
