@@ -398,6 +398,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-orchestrator/src/observable.rs",
     ),
     (
+        "cogneva_tasks_readings",
+        "crates/cog-orchestrator/src/observable.rs",
+    ),
+    (
         "collab_task_resume_total",
         "crates/cog-collaboration/src/observable.rs",
     ),

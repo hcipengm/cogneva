@@ -259,14 +259,20 @@ const UNREGISTERED: &[(&str, Unread)] = &[
     // which status it is a budget for, and only the states where a claim is
     // possible belong on that line. That debt sits on the alert side, beside
     // the count and the failure counter above, neither of which is read yet.
-    // The total restated from the status vector above, so that a reader can
-    // name the reading instead of summing label cells it does not know the
-    // label set of. It publishes no fact of its own: both series come from the
-    // same snapshot in the same scrape, and the total is their sum. The debt,
-    // if any, belongs to the vector it copies and is counted there.
+    // `cogneva_tasks_readings` stood here as "restated from the status vector,
+    // carries no fact of its own" until a rule began reading its
+    // `readout="held_unstated_rows"` cell; an entry for a name a face now
+    // carries is the false registration refused below, so it left. The per-kind
+    // split of that same count arrives beside the total and no rule reads it: a
+    // cell names which kind of work is stuck, which is what an operator goes
+    // looking for after the rule fires, and no threshold follows from a single
+    // kind. The fact is read from the total, so this one is an elsewhere.
     (
-        "cogneva_tasks_readings",
-        Unread::NotAReading("the whole-graph row count, restated from cogneva_tasks_current in the same scrape so a reader can name the reading rather than sum label cells; it carries no fact the status vector does not"),
+        "cogneva_task_held_unstated_rows",
+        Unread::Elsewhere {
+            readers: &["cogneva_tasks_readings"],
+            reason: "the rule reads the same held-row count as one total per scrape; the per-kind cells name which kind is stuck for whoever answers the page, and a single kind being stuck is not a threshold",
+        },
     ),
     // A name whose fact a face already carries, looked up rather than asserted
     // in prose.
