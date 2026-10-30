@@ -253,4 +253,8 @@ else
     render_profile "$p" "$RENDERED_DIR/$p"
   done
   echo "渲染完成：$RENDERED_DIR"
+  # 静态清单里有两块是渲染出来的（配置正文、Pod 模板的配置指纹），渲染完就写回去：
+  # 这两块此前要人记得重抄一遍，而三道门只发现漂移、不消除漂移。同一个命令做完。
+  echo
+  bash "$SCRIPT_DIR/sync-static-manifests.sh"
 fi

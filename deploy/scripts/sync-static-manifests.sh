@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# 把 chart 渲染里的两处派生值写回 deploy/k3s 静态清单，或者检查它们还一致。
+#
+# 用法：
+#   bash deploy/scripts/sync-static-manifests.sh          # 写回（render-deploy.sh 渲染完自己调）
+#   bash deploy/scripts/sync-static-manifests.sh --check  # 只判：漂移即非零
+#
+# 为什么要有这条路：`deploy/k3s/` 不是权威源，但它是 parity 基线与集群内 GitOps 拉取端，
+# 里面有两块是**渲染出来的**，不是人写的——
+#
+#   1. `cogneva-json-configmap.yaml` 的 `data["cogneva.json"]`，逐字节等于
+#      `deploy/helm/cogneva/files/cogneva.json`（只少结尾那个换行，`|-` 会剥掉它）；
+#   2. 每份 Deployment 的 `checksum/config` 注解，等于 chart 按两份配置模板算出来的
+#      sha256（`cogneva.configChecksum`），值就落在 `deploy/rendered/k3s-single/` 里。
+#
+# 这两块此前靠人抄：改一次配置要记得重渲染、再把 JSON 贴进静态清单、再把四个哈希
+# sed 进去。三道门（新鲜度、parity、指纹接线）都只负责**发现**漂移，不负责消除它，
+# 于是每次拓扑或配置变更都留一处要靠人记性的工步——忘了就是一处红，而「红在别人
+# 的提交里」与「本来就没改」在 CI 上长得一样。这台机器能算出来的值不该由人抄。
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+CHART_JSON="${REPO_ROOT}/deploy/helm/cogneva/files/cogneva.json"
+STATIC_CONFIG="${REPO_ROOT}/deploy/k3s/cogneva-json-configmap.yaml"
+STATIC_DIR="${REPO_ROOT}/deploy/k3s"
+RENDERED="${REPO_ROOT}/deploy/rendered/k3s-single"
+
+mode="write"
+case "${1:-}" in
+    "") ;;
+    --check) mode="check" ;;
+    *) echo "用法：$0 [--check]" >&2; exit 2 ;;
+esac
+
+for f in "${CHART_JSON}" "${STATIC_CONFIG}" "${RENDERED}"; do
+    [ -e "${f}" ] || { echo "FAIL: 缺 ${f}" >&2; exit 2; }
+done
+
+python3 - "${REPO_ROOT}" "${mode}" <<'PYEOF'
+import json
+import re
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+mode = sys.argv[2]
+chart_json = root / "deploy/helm/cogneva/files/cogneva.json"
+static_config = root / "deploy/k3s/cogneva-json-configmap.yaml"
+static_dir = root / "deploy/k3s"
+rendered_dir = root / "deploy/rendered/k3s-single"
+
+try:
+    import yaml
+except ImportError:
+    sys.exit("FAIL: 需要 python3-yaml")
+
+changed = []
+problems = []
+
+
+def write(path, text):
+    changed.append(str(path.relative_to(root)))
+    if mode == "write":
+        path.write_text(text)
+
+
+# ---- 1. 配置正文：逐字节抄进静态清单的块标量 ----
+chart_text = chart_json.read_text()
+config_text = static_config.read_text()
+block = chart_text[:-1] if chart_text.endswith("\n") else chart_text
+# 逐行缩进两格；空行保持空行（YAML 块标量里空行不需要缩进）
+indented = "".join(
+    ("  " + line.rstrip("\n") + "\n") if line.strip() else line
+    for line in block.splitlines(keepends=True)
+)
+if not indented.endswith("\n"):
+    indented += "\n"
+
+head = "  cogneva.json: |-"
+lines = config_text.splitlines(keepends=True)
+try:
+    hi = next(i for i, l in enumerate(lines) if l.rstrip("\r\n") == head)
+except StopIteration:
+    problems.append("deploy/k3s/cogneva-json-configmap.yaml 里没有 `  cogneva.json: |-` 这个键")
+    hi = None
+
+if hi is not None:
+    # 块标量的缩进是作者定的（这份清单写的是四格）；照抄它，不自己另定一格。
+    indent_len = None
+    body_end = len(lines)
+    for i in range(hi + 1, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            continue
+        cur = len(line) - len(line.lstrip(" "))
+        if indent_len is None:
+            indent_len = cur
+        if cur < indent_len:
+            body_end = i
+            break
+    if indent_len is None:
+        problems.append("`cogneva.json: |-` 下面一行内容都没有")
+    else:
+        pad = " " * indent_len
+        body = "".join(
+            (pad + l.rstrip("\r\n") + "\n") if l.strip() else l
+            for l in block.splitlines(keepends=True)
+        )
+        new_text = "".join(lines[: hi + 1]) + body + "".join(lines[body_end:])
+        # 文件末尾有没有换行是这份清单原来的写法，不是本脚本要改的事。
+        if not config_text.endswith("\n") and new_text.endswith("\n"):
+            new_text = new_text[:-1]
+        if new_text != config_text:
+            try:
+                doc = yaml.safe_load(new_text)
+                ok = json.loads(list(doc["data"].values())[0]) == json.loads(chart_text)
+            except Exception as exc:  # noqa: BLE001 - 任何解析失败都是这条路的失败
+                ok = False
+                problems.append(f"写入后的静态清单解析不出来：{exc}")
+            if ok:
+                write(static_config, new_text)
+            elif not problems:
+                problems.append("写入后的静态清单与 chart 的 cogneva.json 解析结果不一致")
+
+# ---- 2. 配置指纹：从渲染产物里按 Deployment 名搬到同名静态清单 ----
+rendered_checksums = {}
+for yml in sorted(rendered_dir.glob("*.yaml")):
+    try:
+        for doc in yaml.safe_load_all(yml.read_text()):
+            if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
+                continue
+            name = (doc.get("metadata") or {}).get("name")
+            annotations = ((doc.get("spec") or {}).get("template") or {}).get("metadata", {}).get("annotations") or {}
+            value = annotations.get("checksum/config")
+            if not name or value is None:
+                continue
+            # 以文本读：一个全是数字的摘要会被 YAML 当成整数（0 就是假值），
+            # 按真值判会把它当成「这份工作负载没有指纹」，于是它永远同步不到。
+            value = str(value)
+            if not re.fullmatch(r"[0-9a-f]{64}", value):
+                problems.append(f"{yml.relative_to(root)}：{name} 的 checksum/config 不是 sha256 字面量：{value}")
+                continue
+            rendered_checksums[name] = value
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"{yml.relative_to(root)} 读不出来：{exc}")
+
+seen = set()
+for yml in sorted(static_dir.glob("*.yaml")):
+    text = yml.read_text()
+    if "checksum/config:" not in text:
+        continue
+    try:
+        docs = [d for d in yaml.safe_load_all(text) if isinstance(d, dict)]
+    except Exception as exc:  # noqa: BLE001
+        problems.append(f"{yml.relative_to(root)} 读不出来：{exc}")
+        continue
+    for doc in docs:
+        if doc.get("kind") != "Deployment":
+            continue
+        name = (doc.get("metadata") or {}).get("name")
+        if name not in rendered_checksums:
+            problems.append(
+                f"{yml.relative_to(root)} 的 Deployment/{name} 带 checksum/config，"
+                f"但 k3s-single 渲染产物里没有对应的 Deployment —— 指纹无从派生"
+            )
+            continue
+        seen.add(name)
+        want = rendered_checksums[name]
+        new_text, n = re.subn(r"(checksum/config:\s*)[0-9a-f]{64}", r"\g<1>" + want, text, count=1)
+        if n != 1:
+            problems.append(f"{yml.relative_to(root)}：checksum/config 不是一个 sha256 字面量")
+            continue
+        if new_text != text:
+            write(yml, new_text)
+
+missing = sorted(set(rendered_checksums) - seen)
+if missing:
+    # 只提示不判死：静态清单里没有某一份工作负载，是 parity 那道门管的事，不是这条。
+    print(f"    （k3s-single 渲染有、静态清单没有 fingerprints 的工作负载：{', '.join(missing)}）")
+
+if problems:
+    print("FAIL: 静态清单同步不了：", file=sys.stderr)
+    for p in problems:
+        print(f"  - {p}", file=sys.stderr)
+    sys.exit(1)
+
+if not changed:
+    print(f"SYNC STATIC OK（{mode}）：deploy/k3s 的派生部分与 chart 渲染一致")
+    sys.exit(0)
+
+if mode == "check":
+    print("FAIL: deploy/k3s 的派生部分落后于 chart 渲染：", file=sys.stderr)
+    for c in changed:
+        print(f"  - {c}", file=sys.stderr)
+    print("跑 `bash deploy/scripts/sync-static-manifests.sh` 写回，再一起提交。", file=sys.stderr)
+    sys.exit(1)
+
+print(f"SYNC STATIC 写回 {len(changed)} 份：")
+for c in changed:
+    print(f"  - {c}")
+PYEOF

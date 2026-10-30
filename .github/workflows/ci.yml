@@ -1282,6 +1282,11 @@ jobs:
         run: bash deploy/scripts/check-deploy-parity.sh
       - name: Check rendered profiles are fresh
         run: bash deploy/scripts/render-deploy.sh --check
+      # 静态清单里有两块是渲染出来的（配置正文、Pod 模板的配置指纹）。新鲜度门只管
+      # deploy/rendered/，parity 只管字段级对齐，两块都不问「抄过来的那两份还等于
+      # 源吗」——于是改一次配置、忘了手抄，静态清单会一直落后而三道门全绿。
+      - name: Check static manifests carry the rendered config and fingerprints
+        run: bash deploy/scripts/sync-static-manifests.sh --check
       - name: Check the Postgres connection share covers every pooled process
         run: bash deploy/scripts/check-pg-sharing-processes.sh
       # 配置内容与 Pod 身份的接线：读 Cogneva 配置的工作负载必须带它的 sha256 指纹，
