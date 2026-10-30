@@ -1847,13 +1847,13 @@ mod tests {
 
     /// Counting by stage is the point: the mode alone cannot say whether the
     /// shortcut is still being taken or whether every request now falls through
-    /// to the default.
+    /// to the static score.
     #[tokio::test]
     async fn route_decisions_are_counted_per_stage_and_mode() {
         let obs = CollaborationObservable::new();
         obs.record_route_decision("declared_scale", "direct");
         obs.record_route_decision("declared_scale", "direct");
-        obs.record_route_decision("default", "roundtable");
+        obs.record_route_decision("score", "roundtable");
 
         let metrics = obs.collect_metrics("D8").await.unwrap();
         let cells = route_cells(&metrics);
@@ -1865,7 +1865,7 @@ mod tests {
                 .unwrap_or_default()
         };
         assert_eq!(find("declared_scale", "direct"), 2.0);
-        assert_eq!(find("default", "roundtable"), 1.0);
+        assert_eq!(find("score", "roundtable"), 1.0);
         assert_eq!(find("keyword", "pipeline"), 0.0);
     }
 

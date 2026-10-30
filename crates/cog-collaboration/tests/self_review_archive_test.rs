@@ -9,10 +9,8 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use cog_collaboration::actors::{
-    EvaluatorActor, GeneratorActor, ModeSelectorActor, ModeratorActor, PlannerActor,
-};
-use cog_collaboration::{CollaborationExecutor, PgeMode, RouteStage};
+use cog_collaboration::actors::{EvaluatorActor, GeneratorActor, ModeratorActor, PlannerActor};
+use cog_collaboration::CollaborationExecutor;
 use cog_core::{
     Agent, AgentManager, AgentState, FailurePattern, ImplementationExample, InboxMessage,
     KnowledgeBackend, KnowledgeEntry, LlmClient, SelfReviewConfig, SelfReviewResult, Task,
@@ -185,7 +183,7 @@ impl AgentManager for MockAgentManager {
                 "feedback": "looks good",
                 "criteria": [],
             }),
-            // planner / moderator / mode_selector / anything else
+            // planner / moderator / anything else
             _ => serde_json::json!({
                 "summary": "mock plan",
                 "plan": {"approach": "mock"},
@@ -451,38 +449,6 @@ async fn no_self_review_config_skips_review() {
         "review must not run without config"
     );
     assert_eq!(output.content["code"], "x");
-}
-
-/// The mode selector's one LLM call is its only purchase, and the reply is
-/// read as it came back.
-///
-/// A review used to be asked for here and its revision dropped, so a review
-/// configuration wired into this actor would have paid for a rewrite of the
-/// route word and then taken the decision from the original text. The knob is
-/// gone, and this is the reading that keeps it gone: reintroducing the call
-/// without a consumer turns the count red rather than quietly buying twice.
-#[tokio::test]
-async fn the_mode_selector_does_not_buy_a_review_it_cannot_consume() {
-    let agent = MockAgent::new(serde_json::json!("Roundtable"));
-    let review_calls = agent.review_calls.clone();
-    let actor = ModeSelectorActor::new().with_agent(Arc::new(agent));
-
-    let decision = actor
-        .select_mode("reword the onboarding note", None, Some("t-1"))
-        .await;
-
-    assert_eq!(
-        decision.stage,
-        RouteStage::Agent,
-        "the reply is the decision: {:?}",
-        decision
-    );
-    assert_eq!(decision.mode, PgeMode::Roundtable);
-    assert_eq!(
-        *review_calls.lock().unwrap(),
-        0,
-        "the reply is read once and never reviewed"
-    );
 }
 
 /// A self-evolution round's moderator output is a JSON value the roundtable

@@ -36,9 +36,6 @@ pub const MODERATOR: &str = "moderator";
 /// The actor that merges a branched plan back together.
 pub const MERGER: &str = "merger";
 
-/// The actor that routes an incoming request to the work that suits it.
-pub const MODE_SELECTOR: &str = "mode_selector";
-
 /// Every role this module declares, in the order a run meets them.
 ///
 /// The role a unit registers under when it holds presence through the slow
@@ -64,6 +61,5 @@ pub const ALL: &[&str] = &[
     EVALUATOR,
     MODERATOR,
     MERGER,
-    MODE_SELECTOR,
     EXTERNAL_WORKER,
 ];

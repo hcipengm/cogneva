@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use cog_collaboration::actors::{
     parse_merge_result, parse_moderator_output, EvaluatorActor, GeneratorActor, MergerActor,
-    ModeSelectorActor, ModeratorActor, ModeratorDecision, PlannerActor, PreviousAttempt,
+    ModeratorActor, ModeratorDecision, PlannerActor, PreviousAttempt,
 };
 use cog_collaboration::squad::pge::types::{
     GeneratorOutput, PgeBranchResult, PlannerOutput, RoundOutcome, StopCause, StoppedProduct,
@@ -213,15 +213,6 @@ async fn two_prompts_from_every_actor() -> Vec<(&'static str, Arc<Recorder>, &'s
     }
     roles.push(("merger", merger_agent, "branches"));
 
-    // The router: no profile and no keyword in these goals, so it reaches the
-    // agent stage, which is the only stage that sends a prompt.
-    let selector_agent = Recorder::new(serde_json::json!("Pipeline"));
-    let selector = ModeSelectorActor::new().with_agent(selector_agent.clone());
-    for goal in ["tidy the widget", "tidy the gadget"] {
-        selector.select_mode(goal, None, Some("t-modesel")).await;
-    }
-    roles.push(("mode_selector", selector_agent, "goal"));
-
     roles
 }
 
@@ -303,7 +294,7 @@ async fn every_actor_hands_its_stable_half_over_under_the_contract_key() {
 /// These strings are the parsers' own keys and match arms, not the type names.
 #[tokio::test]
 async fn every_stable_half_names_the_answers_its_own_parser_reads() {
-    let parser_words: [(&str, &[&str]); 6] = [
+    let parser_words: [(&str, &[&str]); 5] = [
         ("planner", &["summary", "sub_tasks"]),
         ("generator", &["content", "artifacts"]),
         ("evaluator", &["verdict", "feedback", "score", "criteria"]),
@@ -312,7 +303,6 @@ async fn every_stable_half_names_the_answers_its_own_parser_reads() {
             &["continue", "change_strategy", "accept_partial", "escalate"],
         ),
         ("merger", &["selected_branch_id", "outcome", "reasoning"]),
-        ("mode_selector", &["Pipeline", "Roundtable"]),
     ];
 
     let roles = two_prompts_from_every_actor().await;

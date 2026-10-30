@@ -106,7 +106,7 @@ impl CollaborationExecutor {
         }
     }
 
-    /// Inject an AgentManager so that ModeSelectorActor can create an Agent.
+    /// Inject an AgentManager for the squad actors a task runs.
     pub fn with_agent_manager(mut self, manager: Arc<dyn cog_core::AgentManager>) -> Self {
         self.agent_manager = Some(manager);
         self
@@ -156,7 +156,6 @@ impl CollaborationExecutor {
 
     /// Attach a unified knowledge backend for historical pattern retrieval.
     pub fn with_knowledge_backend(mut self, backend: Arc<dyn cog_core::KnowledgeBackend>) -> Self {
-        self.mode_selector = self.mode_selector.with_knowledge(backend.clone());
         self.knowledge_backend = Some(backend);
         self
     }
@@ -313,28 +312,6 @@ impl CollaborationExecutor {
                 "could not release the agents of a task that finished executing: {e}"
             ),
         }
-    }
-
-    /// Ensure ModeSelectorActor has an Agent wired. If not, try to create one
-    /// via AgentManager when both manager and LLM provider are available.
-    async fn mode_selector_with_agent(&self) -> ModeSelectorActor {
-        let mut ms = self.mode_selector.clone();
-        if let (Some(ref manager), Some(ref llm)) = (&self.agent_manager, &self.llm_provider) {
-            // 全进程一个：它不属于任何任务，任何任务的终态都不该把它摘掉。
-            match manager
-                .create_agent(
-                    "mode-selector",
-                    cog_core::roles::MODE_SELECTOR,
-                    llm.clone(),
-                    None,
-                )
-                .await
-            {
-                Ok(agent) => ms = ms.with_agent(agent),
-                Err(e) => tracing::warn!("Failed to create ModeSelector agent: {}", e),
-            }
-        }
-        ms
     }
 
     /// Lightweight single-agent multimodal actionability verdict for an external
@@ -676,13 +653,10 @@ impl CollaborationExecutor {
 
         let is_self_evolution = task.is_self_evolution();
 
-        let mode_selector = self.mode_selector_with_agent().await;
         // The decision is counted by the selector itself; the stage is logged
         // here as well so a reader of this line can see which rule decided
         // without going to the metric plane.
-        let decision = mode_selector
-            .select_mode(&goal, Some(&profile), Some(&task.id))
-            .await;
+        let decision = self.mode_selector.select_mode(&goal, &profile).await;
         let pge_mode = decision.mode;
         let reason = &decision.reason;
 

@@ -447,10 +447,6 @@ pub enum RouteStage {
     HistoricalPrior,
     /// The static complexity score.
     Score,
-    /// The mode-selection agent's own judgement.
-    Agent,
-    /// Nothing decided it; quality-first default.
-    Default,
 }
 
 impl RouteStage {
@@ -459,14 +455,15 @@ impl RouteStage {
     /// The observation surface publishes a cell per entry rather than only the
     /// stages that happened to fire: a series that is absent because a stage is
     /// dead and one that is absent because it was never wired up are the same
-    /// reading otherwise, and the second is the one worth catching.
-    pub const ALL: [RouteStage; 6] = [
+    /// reading otherwise, and the second is the one worth catching. A stage
+    /// listed here has to be one the router can actually reach — `agent` and
+    /// `default` were published for a year while no call could produce either,
+    /// which is exactly the reading this list is meant to expose.
+    pub const ALL: [RouteStage; 4] = [
         RouteStage::DeclaredScale,
         RouteStage::Keyword,
         RouteStage::HistoricalPrior,
         RouteStage::Score,
-        RouteStage::Agent,
-        RouteStage::Default,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -475,8 +472,6 @@ impl RouteStage {
             RouteStage::Keyword => "keyword",
             RouteStage::HistoricalPrior => "historical_prior",
             RouteStage::Score => "score",
-            RouteStage::Agent => "agent",
-            RouteStage::Default => "default",
         }
     }
 }

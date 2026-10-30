@@ -69,7 +69,6 @@ impl AgentRole {
     pub const EVALUATOR: &'static str = cog_core::roles::EVALUATOR;
     pub const MODERATOR: &'static str = cog_core::roles::MODERATOR;
     pub const MERGER: &'static str = cog_core::roles::MERGER;
-    pub const MODE_SELECTOR: &'static str = cog_core::roles::MODE_SELECTOR;
 }
 
 impl std::fmt::Display for AgentRole {
