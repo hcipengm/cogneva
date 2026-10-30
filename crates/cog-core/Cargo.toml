@@ -30,3 +30,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+# `start_paused` 只在这个 crate 自己的测试里用。工作区里别的 crate 打开了它，
+# 所以整树 `cargo test` 一直是绿的，而 `cargo test -p cog-core` 单跑编译不过——
+# 一个 crate 的测试必须是能单独跑的测试。
+tokio = { workspace = true, features = ["test-util"] }

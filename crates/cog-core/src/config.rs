@@ -1147,6 +1147,9 @@ impl Default for MultiBackendConsumerConfig {
 pub struct ImageRolloutConfig {
     pub enabled: bool,
     /// 镜像仓库地址（不含 tag），如 `localhost/cogneva`。
+    ///
+    /// 同样由部署面声明，代码里不给默认值：集群内的仓库地址是部署事实，写进
+    /// 二进制就跟着部署走不动，而空串＝没声明、构建前报错。
     pub image_repo: String,
     /// 镜像内基础镜像（COPY 已编译二进制）：必须是正式 cogneva 运行镜像
     /// （WebUI/skills/migrations/动态库齐全，glibc 版本匹配），不能用
@@ -1171,7 +1174,7 @@ impl Default for ImageRolloutConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            image_repo: "localhost/cogneva".into(),
+            image_repo: String::new(),
             base_image: String::new(),
             builder_bin: "buildah".into(),
             registry_push: false,

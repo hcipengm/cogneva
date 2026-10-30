@@ -41,6 +41,24 @@ impl ImageRollout {
         format!("{}:change-{}", self.config.image_repo, sanitized)
     }
 
+    /// 镜像仓库由部署面声明，这里只负责「没声明就停」。
+    ///
+    /// 与基底同一条理由：`localhost/cogneva` 曾经是这个字段的默认值，它是某台
+    /// 节点上的本地仓库，抄进二进制以后，换一个部署形态（远程仓库、带端口的
+    /// 集群内 registry）就推不进任何地方——而失败的现场在镜像构建成功之后才出现，
+    /// 读起来像新镜像坏了。空着就在写 Containerfile 之前拒绝，失败点落在配置上。
+    fn image_repo(&self) -> SFResult<&str> {
+        let repo = self.config.image_repo.trim();
+        if repo.is_empty() {
+            return Err(SFError::Validation(
+                "没有声明镜像仓库（self_evolution.image_rollout.image_repo）：本进程不猜\
+                 仓库地址，猜错要等镜像建完才发现"
+                    .into(),
+            ));
+        }
+        Ok(repo)
+    }
+
     /// 镜像基底由部署面声明，这里只负责「没声明就停」。
     ///
     /// 空着不当作能用默认值补上：集群内的仓库地址写进代码就再也跟着部署走不动，
@@ -115,6 +133,7 @@ impl ImageRollout {
         &self,
         artifact: &crate::evolution_deployer::BuildArtifact,
     ) -> SFResult<String> {
+        self.image_repo()?;
         let tag = self.image_tag(&artifact.change_id);
         let context_dir = self.write_containerfile(&artifact.new_binary_path).await?;
         let context = context_dir.to_string_lossy().to_string();
@@ -286,6 +305,30 @@ mod tests {
         let err = r.deploy(&art).await.unwrap_err();
         assert!(
             err.to_string().contains("base_image"),
+            "拒绝要说清是哪个字段没声明：{err}"
+        );
+        assert!(
+            !tmp.path().join("Containerfile.rollout").exists(),
+            "拒绝之前不许先落一个 `FROM` 空地址的 Containerfile"
+        );
+        assert!(!log.exists(), "镜像构建器一次都不该被调起");
+    }
+
+    /// 仓库地址一条都没有时，与基底同一种拒绝：先停，再动手。代码里给过默认值
+    /// （`localhost/cogneva`），那是某台节点上的本地仓库，换个部署形态就推不进
+    /// 任何地方，而这件事要到镜像建完才看得见。
+    #[tokio::test]
+    async fn an_undeclared_image_repo_stops_before_anything_is_built() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("fake.log");
+        let mut cfg = rollout_config(tmp.path(), true);
+        cfg.image_repo = "  ".into();
+        let r = ImageRollout::new(cfg);
+        let art = artifact(tmp.path());
+
+        let err = r.deploy(&art).await.unwrap_err();
+        assert!(
+            err.to_string().contains("image_repo"),
             "拒绝要说清是哪个字段没声明：{err}"
         );
         assert!(
