@@ -1180,6 +1180,9 @@ jobs:
           }
           psql --version
       - name: Script tests
+        # 这一步连真库。没有这个 `if:` 时，前面任何一处无关的红都会把它跳掉，而
+        # 「跳过」在 job 摘要上与「通过」同形——库里那条链断没断，读的人看不出来。
+        if: ${{ !cancelled() }}
         env:
           # 只有需要真库的那几条读它；其余的门把它当一段普通字符串。
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
