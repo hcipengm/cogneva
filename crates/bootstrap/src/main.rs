@@ -808,8 +808,9 @@ fn write_kubeconfig() -> Result<()> {
         info!("KUBECONFIG 已由环境显式指定，跳过 kubeconfig 落位");
         return Ok(());
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let dir = PathBuf::from(home).join(".kube");
+    let home = home_dir(std::env::var("HOME").ok().as_deref())
+        .context("读不到当前用户的家目录，kubeconfig 无处可落（可用 KUBECONFIG 显式指定）")?;
+    let dir = home.join(".kube");
     let dst = dir.join("config");
     if dst.is_file() {
         return Ok(());
@@ -824,6 +825,19 @@ fn write_kubeconfig() -> Result<()> {
     std::env::set_var("KUBECONFIG", &dst);
     info!("kubeconfig 已落位: {}", dst.display());
     Ok(())
+}
+
+/// 当前用户的家目录：`$HOME` 优先，没设时按运行者的 uid 去 passwd 里查。
+///
+/// 曾经这里回落到 `/root`：那是「以 root 装」这一种情形的家目录，写成了别的
+/// 情形下的答案。以别的用户跑、又没有 `$HOME` 时，它会把 kubeconfig 往一个
+/// 自己无权写、也对 helm 无意义的目录里放。`std::env::home_dir` 问的是这台
+/// 机器上「我是谁」，答案跟着运行者走，不跟着这台机器的安装方式走。
+fn home_dir(home_env: Option<&str>) -> Option<PathBuf> {
+    match home_env.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(home) => Some(PathBuf::from(home)),
+        None => std::env::home_dir(),
+    }
 }
 
 /// CN 模式预置 K3s containerd 镜像站配置。K3s 系统镜像（coredns /
@@ -3727,6 +3741,29 @@ async fn main() -> Result<()> {
 
     info!("引导器使命完成，退出");
     Ok(())
+}
+
+#[cfg(test)]
+mod home_dir_tests {
+    use super::*;
+
+    /// 家目录跟着运行者走：`$HOME` 说了就听它的，没说就问这台机器「我是谁」，
+    /// 而不是回落到某一种安装方式的家目录。
+    #[test]
+    fn the_home_directory_comes_from_who_is_running_it() {
+        assert_eq!(
+            home_dir(Some("/tmp/some-home")),
+            Some(PathBuf::from("/tmp/some-home"))
+        );
+        // 空串与空白不算声明：一个空的 `$HOME` 里拼出来的 `.kube/config`
+        // 会落在当前目录下，那既不是谁的家目录，也不是谁想要的。
+        assert_eq!(home_dir(Some("   ")), std::env::home_dir());
+        assert_eq!(home_dir(None), std::env::home_dir());
+        assert!(
+            std::env::home_dir().is_some(),
+            "这条断言本身依赖的读法在这台机器上读不出家目录，判据也就无从谈起"
+        );
+    }
 }
 
 #[cfg(test)]
