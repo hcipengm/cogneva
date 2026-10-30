@@ -28,11 +28,11 @@ use futures::StreamExt;
 /// wrote just as the previous incarnation was dying: too small and it could
 /// take back a message that a still-draining process is finishing; nothing
 /// waits on this value, so it is chosen for safety rather than latency.
-// cap: bound
+// cap: bound — 为的是不把一条还在排空的进程正在结束的消息抢回来；没有任何人在等这个值，所以按安全取而不是按延迟取
 const INBOX_RECLAIM_MIN_IDLE_MS: u64 = 60_000;
 
 /// How many pending messages one reclaim call asks for.
-// cap: bound
+// cap: bound — 一次回收调用要多少条待处理消息
 const INBOX_RECLAIM_BATCH: usize = 64;
 
 /// Generic agent consumer backed by any [`cog_core::MessageBackend`] implementation.

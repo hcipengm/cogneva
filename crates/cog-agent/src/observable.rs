@@ -204,7 +204,7 @@ struct RosterEntry {
 /// A window rather than a lifetime archive on purpose: the ceiling is meant to
 /// track the workload as it is now, and a run from a month ago under a
 /// different model says nothing about how much work a run needs today.
-// cap: bound
+// cap: bound — 窗口跟的是现在的负载；一个月前另一个模型下的一轮跑，说不了今天的活要多少
 const BUDGET_SAMPLE_WINDOW: usize = 64;
 
 /// What a role's own finished runs say about how many iterations it needs.

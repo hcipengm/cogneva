@@ -312,7 +312,7 @@ fn tool_labels(tool: &str) -> HashMap<String, String> {
 /// rather than a background job's: long enough for a healthy API to store an
 /// oversized payload, short enough that an API that stopped answering delays the
 /// turn instead of wedging it.
-// cap: bound
+// cap: bound — 长到容得下一份过大的载荷，短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
 const ARCHIVE_TIMEOUT_SECS: u64 = 20;
 
 #[cfg(test)]

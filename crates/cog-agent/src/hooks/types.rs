@@ -1,12 +1,12 @@
 use std::time::Duration;
 
 /// Default per-hook execution timeout (30 seconds).
-// cap: bound
+// cap: bound — 单条钩子的默认执行上限：钩子是同步跑的，超时它就是在拖慢这一回合
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default deduplication window (1 second).  Identical events fired inside the
 /// window are coalesced — only the first one runs the action.
-// cap: bound
+// cap: bound — 一秒内的重复事件被合并成一次；窗口再长就会把真正相隔很近的两件不同的事吞成一件
 pub const DEFAULT_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 
 /// The Redis stream a user's notifications are published to, before the user

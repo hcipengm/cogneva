@@ -35,42 +35,42 @@ use url::Url;
 /// Hits returned when the caller does not say how many it wants. Ten is one
 /// screen of titles and excerpts: enough to choose a page to read, small enough
 /// that a turn is not spent on links it will not follow.
-// cap: bound
+// cap: bound — 一屏标题与摘录：够挑出要读的那页，又小到这一回合不会花在不会跟的链接上
 const DEFAULT_SEARCH_RESULTS: u64 = 10;
 
 /// The most hits one call may ask for. Every hit is context the run pays for on
 /// every later turn, so a caller that wants more pages should read the ones it
 /// has rather than page through a result list it cannot use.
-// cap: bound
+// cap: bound — 结果会进入之后每一回合，所以想要更多的调用方该去读已有的那些
 const MAX_SEARCH_RESULTS: u64 = 50;
 
 /// Characters of extracted text returned when the caller does not ask for a
 /// size. Roughly one long article; the caller can raise it for a document it
 /// means to read whole.
-// cap: bound
+// cap: bound — 大约一篇长文；对打算整篇读完的文档，调用方可以自己抬高
 const DEFAULT_FETCH_CHARS: u64 = 20_000;
 
 /// The most text one fetch may return. Above this the answer stops being a turn
 /// and becomes a document, and a document belongs in the archive rather than in
 /// the conversation.
-// cap: bound
+// cap: bound — 过了这个数它就不是一段摘录而是整份文档，那份文档该进归档而不是进对话
 const MAX_FETCH_CHARS: u64 = 200_000;
 
 /// Bytes one page may transfer. Below the point where a single turn is worth
 /// anything, the page cannot be read anyway; above it, an accidental video or
 /// an infinite stream costs the pod's memory before extraction ever runs.
-// cap: bound
+// cap: bound — 不到这个数页面本来就读不了，过了它就是一段误抓的视频或一条无限流，在抽取开始之前先吃掉 Pod 的内存
 const MAX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
 
 /// How long one fetch may take, headers included. A page that has not started
 /// answering in this window is not going to make the turn useful.
-// cap: bound
+// cap: bound — 含头部在内的抓取上限：在这个窗里还没开始应答的页面，不会让这一回合变得有用
 const FETCH_TIMEOUT_SECS: u64 = 30;
 
 /// How long one search may take. The metasearch fan-out answers from several
 /// engines at once and waits for the slowest; this is the point past which the
 /// slowest is not worth the turn.
-// cap: bound
+// cap: bound — 同时问几个引擎、等最慢的那个；过了这一点最慢的那个就不值这一回合了
 const SEARCH_TIMEOUT_SECS: u64 = 20;
 
 /// How many times a search whose engines all stayed silent is asked again.
@@ -79,7 +79,7 @@ const SEARCH_TIMEOUT_SECS: u64 = 20;
 /// answers the next request, while a non-200 or a body that is not JSON is a
 /// verdict about the request itself and asking again returns the same verdict
 /// for the same wait.
-// cap: bound
+// cap: bound — 再问一次是对请求本身的判断，重复一次换来同样的判断和同样的等待
 const SEARCH_ATTEMPTS: u32 = 2;
 
 /// The environment variable that names the SearXNG base URL.
@@ -117,7 +117,7 @@ pub const WEB_FETCH_BASE_ENV: &str = "COGNEVA_WEB_FETCH_BASE";
 
 /// How long one rendered fetch may take. A browser has to start, load, run the
 /// page's scripts and settle; the in-process deadline would cut that short.
-// cap: bound
+// cap: bound — 浏览器要起来、加载、跑完页面脚本并稳定下来；进程内的那个截止时间会把它切短
 const RENDER_TIMEOUT_SECS: u64 = 60;
 
 /// How long one rendered page stays servable out of the backend's own cache.
@@ -141,7 +141,7 @@ const RENDER_CACHE_SECS: u64 = RENDER_TIMEOUT_SECS;
 /// from a warm one and usually returns the page. Only a 5xx is repeated: a 4xx
 /// is a verdict about this URL and repeating it costs the caller the same wait
 /// for the same answer.
-// cap: bound
+// cap: bound — 同样是对这个 URL 的判断，重复它只让调用方为同一个答案再等一遍
 const RENDER_ATTEMPTS: u32 = 2;
 
 fn encode_component(value: &str) -> String {

@@ -15,13 +15,13 @@ use std::time::Duration;
 /// job's: long enough for a healthy API to return a bounded payload, short
 /// enough that an API which stopped answering delays the turn instead of
 /// wedging it.
-// cap: bound
+// cap: bound — 短到让一个不再应答的 API 拖慢这一回合而不是把它卡死
 const MEMORY_READ_TIMEOUT_SECS: u64 = 30;
 
 /// The payload size a read moves without being told otherwise. A quarter
 /// megabyte is what a tool result that already fit an agent's context roughly
 /// holds; a caller that wants a larger source names its own budget.
-// cap: bound
+// cap: bound — 一兆是「本来就装得进 agent 上下文的一条工具结果」的量级；要更大来源的调用方自己报名额
 const DEFAULT_RAW_FETCH_BUDGET_BYTES: u64 = 262_144;
 
 /// How long an ask waits for its answer when the caller does not say, and the
@@ -31,7 +31,7 @@ const DEFAULT_RAW_FETCH_BUDGET_BYTES: u64 = 262_144;
 /// peer's run to finish, short enough that an unanswering peer costs one turn
 /// rather than the run. The cap exists because the bound is the only thing
 /// standing between "ask a peer" and "wait for it forever".
-// cap: bound
+// cap: bound — 这个界是「问一个同伴」与「永远等下去」之间唯一拦着的东西
 const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 // cap: bound — the cap that keeps a peer's silence from becoming an unbounded wait
 const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
@@ -40,14 +40,14 @@ const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
 /// module that never returns has to come back to the caller as a failure, so
 /// the bound is short — a compute-shaped tool that legitimately needs longer
 /// asks for it instead of raising this.
-// cap: bound
+// cap: bound — 计算型工具确实需要更久的话该自己报，而不是把这里调大
 const DEFAULT_WASM_TIMEOUT_SECS: u64 = 30;
 
 /// Default wall for one shell tool call. An order of magnitude above the WASM
 /// bound because the thing being timed is a build or a test run, which is
 /// expected to take minutes; what this catches is a command that wedged, not a
 /// command that works.
-// cap: derived
+// cap: derived — 与构建侧的墙同源：这些命令本来就以分钟计，这里要抓的是卡住的命令而不是能跑的命令
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
 
 /// Real execution identity of one agent run. Carried explicitly from the
@@ -87,7 +87,7 @@ pub fn caller_agent_id() -> Option<String> {
 /// 一页按行数计，不按字节：行数读起来能对上编辑器，也能直接当 `offset`
 /// 用。取值让常见源码文件一次读完，而整文件倾倒型的读（几千行、几十万
 /// 字符）自动变成可分页的几段。
-// cap: bound
+// cap: bound — 让常见源码文件一次读完，而整文件倾倒型（几千行、几十万字符）自动变成可分页的几段
 const READ_FILE_DEFAULT_WINDOW_LINES: usize = 600;
 
 /// 一页最多带多少个字符，行数没到也停下来。
@@ -96,7 +96,7 @@ const READ_FILE_DEFAULT_WINDOW_LINES: usize = 600;
 /// 可以轻松超过一次对话里任何一段的体量。这一页之后每一轮都要重发，所以
 /// 两道界取更紧的那道；被这道界停下来的页面照样带 `has_more` 与
 /// `next_offset`，翻页不会漏行。
-// cap: bound
+// cap: bound — 两道界取更紧的那道；被它停下的页面照样带 has_more 与 next_offset，翻页不漏行
 const READ_FILE_PAGE_MAX_CHARS: usize = 32 * 1024;
 
 /// 按行切出 `read_file` 调用方要的那一段。

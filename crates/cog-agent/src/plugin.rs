@@ -14,13 +14,13 @@ pub const POOL_SIZING_LOOP: &str = "agent_pool_sizing";
 /// Shorter than the pool's own task length on purpose: a task holds its turn
 /// for minutes, so a reading that stepped faster than that could shrink the
 /// pool and regrow it between two tasks without either reading being wrong.
-// cap: bound
+// cap: bound — 负载以分钟为单位变，比那更快的读数会在两次任务之间把池缩了又长回来，而两次读数都没错
 const POOL_SIZING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How often this agent says it is alive to the control plane. Short enough
 /// that a restarted control plane re-learns its agents without a redeploy, long
 /// enough that the heartbeat is not the busiest thing on the channel.
-// cap: bound
+// cap: bound — 短到重启的控制面不用重新部署就能重新认出它的 agent，长到心跳不是这条通道上最忙的东西
 const HEARTBEAT_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Keep the pool's concurrency equal to what the container can carry.

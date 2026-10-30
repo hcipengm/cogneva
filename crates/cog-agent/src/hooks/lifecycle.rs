@@ -41,7 +41,7 @@ use tokio::task::JoinHandle;
 use cog_core::BroadcastScope;
 
 /// Default capacity of the engine's input channel.
-// cap: bound
+// cap: bound — 引擎输入通道的默认容量：够吸收一拍里成批进来的事件，又不让一个卡住的消费者无限占内存
 pub const DEFAULT_LIFECYCLE_CHANNEL_BUFFER: usize = 256;
 
 /// The first seven variants are the canonical "key Hooks" called out in the

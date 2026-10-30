@@ -17,13 +17,13 @@ use futures::StreamExt;
 /// then the message the handler is inside has to finish. Ten seconds is where
 /// an idle consumer always makes it and a busy one is always worth a line — it
 /// is a judgement about the wait, not a percentile of task duration.
-// cap: bound
+// cap: bound — 是对这段等待的判断，不是任务时长的分位数：空闲的消费者总能赶到，忙的那个总值得记一行
 const AGENT_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Wall for the one command this crate runs on a checkout to produce a
 /// change's text. The work is a git diff over a working tree, so two minutes
 /// is sized for a large tree being scanned, not for a slow computation.
-// cap: bound
+// cap: bound — 活是扫一遍工作树的 git diff，两分钟是按大树的扫描耗时给的，不是按慢计算给的
 const WORKSPACE_CHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// What one call to [`Agent::retire`] did.
