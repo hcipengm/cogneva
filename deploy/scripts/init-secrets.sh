@@ -45,6 +45,30 @@ OOB_KEYS=(
   search-fallback-upstreams
 )
 
+# 键表就是这份脚本自己的声明：`--list-keys` 原样印出来，比对清单里 `secretKeyRef`
+# 的那条读数读它。两份各写一遍的键表会在下一次新增键时悄悄分叉——一边有、一边没有，
+# 而症状要等到某个 Pod 卡在 CreateContainerConfigError 上才出现。
+#
+# 只印「本脚本保证它存在」的键：内部随机键从下面的 ensure_random 调用里读回来（包括
+# 函数体内的那些），指纹与 S3 身份文件不在 ensure_random 里，单列。
+if [ "${1:-}" = "--list-keys" ]; then
+  {
+    sed -n 's/^[[:space:]]*ensure_random \([A-Za-z0-9._-]*\).*/\1/p' "${BASH_SOURCE[0]}" | sort -u |
+      while IFS= read -r k; do printf '%s\t%s\n' "${SECRET}" "$k"; done
+    printf '%s\t%s\n' "${SECRET}" instance-fingerprint
+    printf '%s\t%s\n' "${SECRET}" seaweedfs-s3.json
+    for k in "${OOB_KEYS[@]}"; do printf '%s\t%s\n' "${OOB_SECRET}" "$k"; done
+  }
+  exit 0
+fi
+case "${1:-}" in
+'' | --) ;;
+*)
+  printf 'init-secrets: 不认识的参数：%s（只有 --list-keys）\n' "$1" >&2
+  exit 2
+  ;;
+esac
+
 # 生成 48 位十六进制强随机串（纯字母数字，可安全进入连接串/URL）。
 gen() {
   if command -v openssl >/dev/null 2>&1; then
