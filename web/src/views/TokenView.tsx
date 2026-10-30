@@ -58,6 +58,11 @@ export function TokenView() {
   const actors = usage.data?.actors ?? [];
   const sum = (pick: (row: (typeof rows)[number]) => number) => rows.reduce((total, row) => total + pick(row), 0);
   const failed = sum((row) => row.failed_calls);
+  // 折叠账按行记「调用了几次、其中几次失败」，所以成功是两者之差而不是另一列。
+  // 这一格必须单独露出来：一段窗口里 token 合计为 0 有两个完全不同的原因——
+  // 没人用模型，和每一次尝试都被挡在门外——而失败数在同一排里，读者要自己减
+  // 一次才知道是后者。
+  const succeeded = sum((row) => row.calls) - failed;
   // 命中率只在协议内算，而且分母逐协议不同：`input` 在 OpenAI 兼容面已含缓存命中，
   // 分母就是它；Anthropic 面上两者不相交，分母是二者之和。两种协议分行列出——
   // 把两条线并成一个百分比，就是让一个协议的分母去解释另一个协议的分子。
@@ -128,7 +133,16 @@ export function TokenView() {
                   />
                 );
               })}
-              <Reading label="调用" value={cumulativeSum((actor) => actor.calls).toLocaleString()} />
+              <Reading
+                label="调用"
+                value={cumulativeSum((actor) => actor.calls).toLocaleString()}
+                note="尝试次数，含被熔断挡下的那些"
+              />
+              <Reading
+                label="成功调用"
+                value={cumulativeSum((actor) => actor.calls - actor.failed_calls).toLocaleString()}
+                note="与「花销」那一段同一口径：成功的那几次才带回 token"
+              />
               <Reading
                 label="起始"
                 value={
@@ -186,7 +200,21 @@ export function TokenView() {
                     />
                   );
                 })}
-                <Reading label="调用" value={sum((row) => row.calls).toLocaleString()} />
+                <Reading
+                  label="调用"
+                  value={sum((row) => row.calls).toLocaleString()}
+                  note="尝试次数，含被熔断挡下的那些"
+                />
+                <Reading
+                  label="成功调用"
+                  value={succeeded.toLocaleString()}
+                  tone={succeeded === 0 && failed > 0 ? 'warn' : 'plain'}
+                  note={
+                    succeeded === 0 && failed > 0
+                      ? '一次也没成：上面的 token 合计因此是 0，原因看「调用结局」'
+                      : '只有成功的那些才带回 token'
+                  }
+                />
                 <Reading
                   label="失败调用"
                   value={failed.toLocaleString()}

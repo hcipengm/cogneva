@@ -210,7 +210,7 @@ function actorHint(value: string): string {
     'sandbox-document-organizer': '沙盒里的文档整理',
     web_chat: 'WebUI 对话',
     wiki: '知识库',
-    unknown: '调用方没有声明执行者名（例如模型选择器，它发调用时没有报名字）',
+    unknown: '调用方没有在请求上声明执行者名——这一格记的是「没报」，不是某个角色',
   };
   return fixed[value] ?? '不在网关登记的执行者闭集里，可能是新调用方或写错了名字';
 }
