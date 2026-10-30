@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_an_acceptance_item_needs_a_product_that_can_light_it
 # `main`'s required-check list names checks by string, and the checks that exist
 # are whatever the workflows publish. Nothing compared the two until 2026-10-28,
 # when three of the nine required contexts named a job that had been renamed:

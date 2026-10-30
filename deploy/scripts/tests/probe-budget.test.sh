@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_startup_budget_is_sized_by_the_first_walk_not_by_process_start
 # 探针失败预算的确定性判据：每个探针都必须显式给出 timeoutSeconds 与
 # failureThreshold，且数值只能来自 values.yaml 的 healthProbes 一处。
 #

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_mount_is_not_a_role_a_gate_must_classify_by_what_is_done
 # Wiring gate for the Redis AOF tail repair.
 #
 # The repair only works if three things line up, and none of them is visible in
