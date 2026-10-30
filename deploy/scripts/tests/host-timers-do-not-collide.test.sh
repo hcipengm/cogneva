@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # principle: feedback_a_gate_whose_members_are_named_by_hand_must_scan_for_unlisted_members
 # principle: feedback_a_handwritten_census_list_must_be_checked_against_the_whole_tree
-# 这台机器上的宿主 timer 不许撞在同一个分钟——判的是**树里现在的全部**，不是一份手抄的名单。
+# 本仓安装脚本写出的宿主 timer 不许在同一周期里撞在同一个分钟——判的是**树里现在的
+# 全部**，不是一份手抄的名单。
+#
+# 范围说清楚：这台机器上另有一批定时任务是别的仓库的脚本装的，本仓渲染不到、也读不到
+# 它们的排期，所以不在这条门里。这里判的是「本仓能装上去的那些」，而且它自己会随树长大
+# （见下面两路枚举），不会因为新增一个安装脚本就少判一个。
 #
 # 为什么要有这一条：每个 install-*.sh 各自挑一个相位，挑的时候都只说「和别的错开」，
 # 而没有任何东西真的把「别的」数出来。2026-10-30 实测的形状就是这样：headroom 的测试
