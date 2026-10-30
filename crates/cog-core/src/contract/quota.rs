@@ -224,6 +224,31 @@ pub trait HierarchyManager: Send + Sync {
         target_id: &str,
         days: u32,
     ) -> SFResult<Vec<UsageHistoryEntry>>;
+
+    /// The limits configured *for this cell*, or `None` when nobody set any.
+    ///
+    /// Deliberately not the same answer [`check`](Self::check) gives: a check
+    /// reports the limits it evaluated with, which are the manager's defaults
+    /// whenever no override exists. A reader of that answer cannot tell "an
+    /// operator set exactly the default" from "nobody configured this level" —
+    /// and that difference is the whole question a management face asks, since
+    /// clearing an override only changes anything in the second case's absence.
+    async fn limits(&self, scope: QuotaScope, target_id: &str) -> SFResult<Option<QuotaLimits>>;
+
+    /// Configure the daily soft/hard ceilings for one `(scope, target)` cell.
+    /// Set these to give one person, one workspace, or one team its own
+    /// ceiling; the cascade still checks every level above it.
+    async fn set_limits(
+        &self,
+        scope: QuotaScope,
+        target_id: &str,
+        limits: QuotaLimits,
+    ) -> SFResult<()>;
+
+    /// Drop the override for one `(scope, target)` cell so that the manager's
+    /// default applies again. Absent is not an error: clearing twice is what a
+    /// retried request does.
+    async fn clear_limits(&self, scope: QuotaScope, target_id: &str) -> SFResult<()>;
 }
 
 /// Per-workspace quota source used by the supervisor.

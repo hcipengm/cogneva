@@ -355,3 +355,113 @@ async fn test_allowed_decision_has_no_refusal() {
     assert!(decision.allowed);
     assert_eq!(cog_quota::refusal_for(&decision, 10, 0), None);
 }
+
+// ─── 上限的读写（管理面） ───
+//
+// 这三条判的是契约上的那一对读法，不是 `check` 的答案。`check` 在没有覆盖时报出
+// 默认值，所以「按默认值配过」与「没人配过」在它那里逐字同形；管理面要能分开，
+// 否则「清除」这个动作无法预测会不会改变行为。
+
+/// 配置过的一格读作 `Some`，没配置的读作 `None`——即使两者生效值相同。
+#[tokio::test]
+async fn a_configured_cell_reads_as_configured_even_when_it_matches_the_default() {
+    let mgr = fresh_manager();
+    let unset = "tl1:unset";
+    let set_to_default = "tl1:same";
+
+    // 没配过：管理读是 None，检查面照样报出一对默认值。
+    assert_eq!(
+        cog_core::HierarchyManager::limits(&mgr, QuotaScope::User, unset)
+            .await
+            .expect("read ok"),
+        None,
+        "一个从没被配置过的格子没有声明可读"
+    );
+    let ctx = QuotaContext {
+        user_id: Some(unset.to_string()),
+        ..Default::default()
+    };
+    let decision = mgr.check(&ctx, 10).await;
+    assert_eq!(decision.scopes[0].limits, QuotaLimits::new(80, 100));
+
+    // 配成与默认完全一样：检查面两个数一模一样，管理读是 Some。
+    cog_core::HierarchyManager::set_limits(
+        &mgr,
+        QuotaScope::User,
+        set_to_default,
+        QuotaLimits::new(80, 100),
+    )
+    .await
+    .expect("write ok");
+    assert_eq!(
+        cog_core::HierarchyManager::limits(&mgr, QuotaScope::User, set_to_default)
+            .await
+            .expect("read ok"),
+        Some(QuotaLimits::new(80, 100)),
+        "写成默认值也是一次声明，清除它才会改变这一格的来历"
+    );
+}
+
+/// 清除之后回到默认值，检查面也回到默认值。
+#[tokio::test]
+async fn clearing_a_limit_puts_the_default_back() {
+    let mgr = fresh_manager();
+    let user = "tl2:user";
+    let ctx = QuotaContext {
+        user_id: Some(user.to_string()),
+        ..Default::default()
+    };
+    cog_core::HierarchyManager::set_limits(&mgr, QuotaScope::User, user, QuotaLimits::new(5, 10))
+        .await
+        .expect("write ok");
+    assert!(
+        !mgr.check(&ctx, 12).await.allowed,
+        "覆盖生效时，一次 12 个 token 的调用应当被这一格拦下"
+    );
+
+    cog_core::HierarchyManager::clear_limits(&mgr, QuotaScope::User, user)
+        .await
+        .expect("clear ok");
+    assert_eq!(
+        cog_core::HierarchyManager::limits(&mgr, QuotaScope::User, user)
+            .await
+            .expect("read ok"),
+        None
+    );
+    assert!(
+        mgr.check(&ctx, 12).await.allowed,
+        "清除之后这一格回到默认值，12 个 token 不该再被拦"
+    );
+    // 清两次不是错误：重试的请求本来就会走到这里。
+    cog_core::HierarchyManager::clear_limits(&mgr, QuotaScope::User, user)
+        .await
+        .expect("clearing an absent override is not a failure");
+}
+
+/// 存坏的限值在管理读上是错误，不是「没有覆盖」；检查面仍然答得出来。
+#[tokio::test]
+async fn a_stored_limit_that_does_not_parse_is_an_error_not_an_absence() {
+    let store = Arc::new(FakeStore::default());
+    let mgr = HierarchyManager::new(store.clone(), QuotaLimits::new(80, 100));
+    let user = "tl3:user";
+    store
+        .set("quota:user:limits:tl3:user", "{not a limit document}")
+        .await
+        .expect("seed ok");
+
+    assert!(
+        cog_core::HierarchyManager::limits(&mgr, QuotaScope::User, user)
+            .await
+            .is_err(),
+        "读不出来的声明不能读成「没配过」：前者盘上有一条没人执行的限值，后者没有"
+    );
+
+    // 检查面不能因此失败：它没有报错的出口，退回默认值是它此前一直的行为。
+    let ctx = QuotaContext {
+        user_id: Some(user.to_string()),
+        ..Default::default()
+    };
+    let decision = mgr.check(&ctx, 10).await;
+    assert!(decision.allowed);
+    assert_eq!(decision.scopes[0].limits, QuotaLimits::new(80, 100));
+}

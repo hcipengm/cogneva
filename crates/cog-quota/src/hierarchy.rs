@@ -91,23 +91,73 @@ impl HierarchyManager {
         target_id: &str,
         limits: QuotaLimits,
     ) -> QuotaResult<()> {
-        let store = self.store.lock().await;
-        let payload = serde_json::to_string(&limits)?;
-        let key = Self::key(scope, "limits", target_id);
-        store.set(&key, &payload).await.map_err(store_error)?;
-        Ok(())
+        self.write_limits(scope, target_id, limits).await
     }
 
     /// Read the soft/hard limits for `(scope, target)`. Falls back to the
     /// manager's default if no override is set.
     pub async fn get_limits(&self, scope: QuotaScope, target_id: &str) -> QuotaLimits {
+        match self.override_limits(scope, target_id).await {
+            Ok(Some(limits)) => limits,
+            // 限值读坏了就退回默认值，而不是让整套检查失败：检查面没有报错的出口，
+            // 而默认值本来就是「什么都没配」时生效的那一对。坏值以错误形式出现在
+            // 管理读（`override_limits` 的调用方）上——那是能修它的那一面。
+            Ok(None) | Err(_) => self.default_limits,
+        }
+    }
+
+    /// Drop the override for `(scope, target)`, so that the manager's default
+    /// governs that cell again. A cell that had none is not an error.
+    pub async fn clear_limits(&self, scope: QuotaScope, target_id: &str) -> QuotaResult<()> {
+        self.drop_limits(scope, target_id).await
+    }
+
+    /// Remove the override key. Deleting the key rather than writing the
+    /// manager's current default: a written default would read back as "an
+    /// operator chose this", and would keep the old ceiling for every target
+    /// only until the next restart moved the default.
+    async fn drop_limits(&self, scope: QuotaScope, target_id: &str) -> QuotaResult<()> {
         let store = self.store.lock().await;
         let key = Self::key(scope, "limits", target_id);
-        let raw = store.get(&key).await.ok().flatten();
-        match raw {
-            Some(s) => serde_json::from_str(&s).unwrap_or(self.default_limits),
-            None => self.default_limits,
-        }
+        store.del(&key).await.map_err(store_error)?;
+        Ok(())
+    }
+
+    /// The override stored for `(scope, target)`, or `None` when there is none.
+    ///
+    /// A stored value that no longer parses is reported as an error rather than
+    /// as "no override": the two would otherwise read the same at every caller,
+    /// and the difference is that the first case has a limit on disk that
+    /// nothing is applying.
+    async fn override_limits(
+        &self,
+        scope: QuotaScope,
+        target_id: &str,
+    ) -> QuotaResult<Option<QuotaLimits>> {
+        let store = self.store.lock().await;
+        let key = Self::key(scope, "limits", target_id);
+        let Some(raw) = store.get(&key).await.map_err(store_error)? else {
+            return Ok(None);
+        };
+        serde_json::from_str(&raw).map(Some).map_err(|e| {
+            QuotaError::DatabaseError(format!("the limits stored under {key} do not parse: {e}"))
+        })
+    }
+
+    /// Write an override. One store call and no read: the cell's counters are
+    /// not reset by a new ceiling, because the ceiling is a daily bound and the
+    /// day is what the counters are scoped to.
+    async fn write_limits(
+        &self,
+        scope: QuotaScope,
+        target_id: &str,
+        limits: QuotaLimits,
+    ) -> QuotaResult<()> {
+        let store = self.store.lock().await;
+        let payload = serde_json::to_string(&limits)?;
+        let key = Self::key(scope, "limits", target_id);
+        store.set(&key, &payload).await.map_err(store_error)?;
+        Ok(())
     }
 
     async fn used_today(&self, scope: QuotaScope, target_id: &str) -> u64 {
@@ -334,6 +384,33 @@ impl cog_core::HierarchyManager for HierarchyManager {
         days: u32,
     ) -> cog_core::SFResult<Vec<UsageHistoryEntry>> {
         self.history(scope, target_id, days)
+            .await
+            .map_err(|e| cog_core::SFError::Internal(e.to_string()))
+    }
+
+    async fn limits(
+        &self,
+        scope: QuotaScope,
+        target_id: &str,
+    ) -> cog_core::SFResult<Option<QuotaLimits>> {
+        self.override_limits(scope, target_id)
+            .await
+            .map_err(|e| cog_core::SFError::Internal(e.to_string()))
+    }
+
+    async fn set_limits(
+        &self,
+        scope: QuotaScope,
+        target_id: &str,
+        limits: QuotaLimits,
+    ) -> cog_core::SFResult<()> {
+        self.write_limits(scope, target_id, limits)
+            .await
+            .map_err(|e| cog_core::SFError::Internal(e.to_string()))
+    }
+
+    async fn clear_limits(&self, scope: QuotaScope, target_id: &str) -> cog_core::SFResult<()> {
+        self.drop_limits(scope, target_id)
             .await
             .map_err(|e| cog_core::SFError::Internal(e.to_string()))
     }

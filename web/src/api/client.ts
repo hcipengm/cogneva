@@ -2603,6 +2603,53 @@ export async function getQuotaUsage(): Promise<QuotaUsage> {
   return api.get<QuotaUsage>('/api/v1/quota/usage');
 }
 
+/** 五级额度层级，线上写法就是服务端键上写的那一个（`ws`/`org` 不是全称）。 */
+export const QUOTA_SCOPES = ['user', 'ws', 'team', 'org', 'global'] as const;
+export type QuotaScopeName = (typeof QUOTA_SCOPES)[number];
+
+/** 一对日上限（token／UTC 日）。 */
+export interface QuotaLimitPair {
+  soft_limit: number;
+  hard_limit: number;
+}
+
+/**
+ * 一格的日上限：声明的那一对、检查时真正生效的那一对、这一格今天的计数。
+ *
+ * `limits` 与 `effective` 必须分开读：没有覆盖时检查面报的是默认值，所以
+ * 只看 `effective` 分不出「按默认值配过」与「没人配过」——而「清除覆盖」
+ * 会不会改变行为，恰好取决于这个区别。
+ */
+export interface QuotaLimitsReading {
+  scope: QuotaScopeName;
+  target_id: string;
+  limits: QuotaLimitPair | null;
+  effective: QuotaLimitPair;
+  used_today: number;
+  remaining: number;
+}
+
+function quotaLimitsPath(scope: string, id: string): string {
+  return `/api/v1/quota/limits/${encodeURIComponent(scope)}/${encodeURIComponent(id)}`;
+}
+
+export async function getQuotaLimits(scope: string, id: string): Promise<QuotaLimitsReading> {
+  return api.get<QuotaLimitsReading>(quotaLimitsPath(scope, id));
+}
+
+export async function setQuotaLimits(
+  scope: string,
+  id: string,
+  limits: QuotaLimitPair
+): Promise<QuotaLimitsReading> {
+  return api.put<QuotaLimitsReading>(quotaLimitsPath(scope, id), limits);
+}
+
+/** 删掉覆盖，让默认值重新生效。本来就没有覆盖不是错误。 */
+export async function clearQuotaLimits(scope: string, id: string): Promise<QuotaLimitsReading> {
+  return api.delete<QuotaLimitsReading>(quotaLimitsPath(scope, id));
+}
+
 export interface ScmChange {
   path: string;
   /** `M` 改、`A` 加、`D` 删、`R` 改名、`C` 复制、`U` 冲突、`?` 未跟踪。 */

@@ -19,6 +19,7 @@ import { useShell } from '@/shell/store';
 import { useTheme } from '@/shell/theme';
 import { THEMES } from '@/styles/themes';
 import { ThemePicker } from '@/ui/ThemePicker';
+import { QuotaLimitsPanel } from '@/views/QuotaLimitsPanel';
 import { Button, Empty, Loading, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -639,7 +640,7 @@ export function SettingsView() {
           <Readings
             from={quota}
             source="GET /api/v1/quota/usage（配额管理这一侧的数）"
-            caveat="这一侧拦调用，观测页那一侧记花销；两套计数对不上时以拦得住的这一侧为准。"
+            caveat="这三格是配额管理自己的计数器，与观测页那本逐调用的账不是同一套数；本部署里没有记账方推进它们，所以它们读作 0 不代表没人用。"
           >
           <div className="flex flex-wrap py-2">
             <Reading label="今天已用" value={quota.data.used_today.toLocaleString()} />
@@ -650,10 +651,13 @@ export function SettingsView() {
           </Readings>
         )}
         <p className="px-4 pb-2 text-[11px] text-[var(--muted)]">
-          剩余额度是配额管理这一侧的数，与观测页按执行者统计的 token 花销是两套计数：前者拦调用，
-          后者记账，对不上时以拦得住的这一侧为准。
+          这三格是配额管理这一侧的计数器，与观测页按执行者统计的 token 花销是两套数：后者由网关
+          逐调用记账，前者要靠记账方推进——本部署里那一层已经撤掉，所以这三格会一直读作 0。
+          真要判断花了多少，看观测页的 Token 面。
         </p>
       </section>
+
+      <QuotaLimitsPanel />
 
       <section className="border-b border-[var(--line)]">
         <header className="flex items-center gap-3 px-4 py-2">

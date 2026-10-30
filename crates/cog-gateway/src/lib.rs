@@ -778,6 +778,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             post(agents::checkpoint_handler),
         )
         .route("/api/v1/quota/recharge", post(quota_recharge_handler))
+        .route(
+            "/api/v1/quota/limits/{scope}/{id}",
+            get(quota_limits_handler)
+                .put(quota_set_limits_handler)
+                .delete(quota_clear_limits_handler),
+        )
         .route("/api/v1/hooks", post(hooks::create_hook_handler))
         .route(
             "/api/v1/hooks/{id}",
@@ -2391,6 +2397,192 @@ async fn quota_workspace_handler(
         })),
     )
         .into_response()
+}
+
+/// 一格的日上限：声明的那一对、检查时真正生效的那一对，和这一格今天的计数。
+///
+/// `limits` 与 `effective` 分开，是因为它们答的是两个问题。「这一格配过没有」
+/// 只有声明能答——检查面在没有覆盖时报出的是默认值，读那个答案的人分不出
+/// 「按默认值配的」与「没人配过」。而「检查会怎么判」只有生效值能答，因为覆盖
+/// 与默认值随时可能差开。
+#[derive(Debug, serde::Serialize)]
+struct QuotaLimitsResponse {
+    scope: String,
+    target_id: String,
+    /// 有人为这一格写过的那一对；`null` 表示没有覆盖。
+    limits: Option<cog_core::QuotaLimits>,
+    /// 检查面此刻会用的那一对（没有覆盖时就是默认值）。
+    effective: cog_core::QuotaLimits,
+    /// 这一格今天的计数器读数。计数器由记账方推进，读数本身不区分
+    /// 「没人用」与「没人记」。
+    used_today: u64,
+    remaining: u64,
+}
+
+/// 上限的写入载体。
+///
+/// 两个字段都必填：只写上限的一半会让另一半悄悄沿用旧值，而写上限的人
+/// 想的是一整对。
+#[derive(Debug, serde::Deserialize)]
+struct QuotaLimitsPayload {
+    soft_limit: u64,
+    hard_limit: u64,
+}
+
+/// 认不出的层级名是 400，不是某一级：把它读成用户级就会把一个人的上限
+/// 写到所有人身上。报错里点名这一版认识的几个名字。
+fn parse_quota_scope(raw: &str) -> Result<cog_core::QuotaScope, Response> {
+    cog_core::QuotaScope::parse(raw).ok_or_else(|| {
+        let declared: Vec<&str> = cog_core::QuotaScope::cascade_order()
+            .iter()
+            .map(|scope| scope.as_str())
+            .collect();
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "unknown_quota_scope",
+                "message": format!(
+                    "unknown quota scope {raw:?}; declared scopes are {}",
+                    declared.join(", ")
+                ),
+            })),
+        )
+            .into_response()
+    })
+}
+
+/// 只给某一级填空的上下文：五级里其余几格留空，检查就只走这一格。
+fn quota_context_for(scope: cog_core::QuotaScope, target_id: &str) -> cog_core::QuotaContext {
+    let mut ctx = cog_core::QuotaContext::default();
+    let slot = match scope {
+        cog_core::QuotaScope::User => &mut ctx.user_id,
+        cog_core::QuotaScope::Workspace => &mut ctx.workspace_id,
+        cog_core::QuotaScope::Team => &mut ctx.team_id,
+        cog_core::QuotaScope::Organization => &mut ctx.organization_id,
+        cog_core::QuotaScope::Global => &mut ctx.global_id,
+    };
+    *slot = Some(target_id.to_string());
+    ctx
+}
+
+/// 读一格的现状：声明的覆盖、生效的那一对、今天的计数。
+async fn quota_limits_body(
+    hierarchy: &std::sync::Arc<dyn cog_core::HierarchyManager>,
+    scope: cog_core::QuotaScope,
+    target_id: &str,
+) -> Result<QuotaLimitsResponse, Response> {
+    let limits = hierarchy
+        .limits(scope, target_id)
+        .await
+        .map_err(|e| quota_read_error(e.to_string()))?;
+    let ctx = quota_context_for(scope, target_id);
+    let decision = hierarchy.check(&ctx, 0).await;
+    let status = decision.scopes.first();
+    Ok(QuotaLimitsResponse {
+        scope: scope.as_str().to_string(),
+        target_id: target_id.to_string(),
+        limits,
+        effective: status.map(|s| s.limits).unwrap_or_default(),
+        used_today: status.map(|s| s.used_today).unwrap_or(0),
+        remaining: status.map(|s| s.remaining).unwrap_or(0),
+    })
+}
+
+fn quota_read_error(message: String) -> Response {
+    tracing::warn!("Quota limits read failed: {}", message);
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": "quota_limits_unreadable", "message": message})),
+    )
+        .into_response()
+}
+
+/// 没有分层限额管理器时，这一面答 503 而不是一个空表：空表读作「这一格
+/// 没有上限」，而真相是「这个部署没有开限额」。
+fn quota_hierarchy_missing() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "quota_hierarchy_not_configured",
+            "message": "this deployment has no hierarchy quota manager, so no per-scope ceiling can be read or written",
+        })),
+    )
+        .into_response()
+}
+
+/// 查询一格（人 / 工作空间 / 团队 / 组织 / 全局）的日上限。
+async fn quota_limits_handler(
+    State(state): State<Arc<GatewayState>>,
+    axum::extract::Path((scope, target_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let Some(hierarchy) = state.hierarchy_manager.as_ref() else {
+        return quota_hierarchy_missing();
+    };
+    let scope = match parse_quota_scope(&scope) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    match quota_limits_body(hierarchy, scope, &target_id).await {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// 写一格的日上限。写完读回同一条形状，所以调用方看到的是写进去的
+/// 那个值——`soft` 高于 `hard` 时会被压到 `hard`，不压的话生效值会比
+/// 声明值小，而读的人只会看见声明值。
+async fn quota_set_limits_handler(
+    State(state): State<Arc<GatewayState>>,
+    axum::extract::Path((scope, target_id)): axum::extract::Path<(String, String)>,
+    Json(payload): Json<QuotaLimitsPayload>,
+) -> Response {
+    let Some(hierarchy) = state.hierarchy_manager.as_ref() else {
+        return quota_hierarchy_missing();
+    };
+    let scope = match parse_quota_scope(&scope) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    let limits = cog_core::QuotaLimits::new(payload.soft_limit, payload.hard_limit);
+    if let Err(e) = hierarchy.set_limits(scope, &target_id, limits).await {
+        tracing::warn!("Quota limits write failed: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "quota_limits_unwritable", "message": e.to_string()})),
+        )
+            .into_response();
+    }
+    match quota_limits_body(hierarchy, scope, &target_id).await {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(response) => response,
+    }
+}
+
+/// 删掉一格的覆盖，让默认值重新生效。本来就没有覆盖不是错误：
+/// 一次重试的请求本来就会走到这里。
+async fn quota_clear_limits_handler(
+    State(state): State<Arc<GatewayState>>,
+    axum::extract::Path((scope, target_id)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let Some(hierarchy) = state.hierarchy_manager.as_ref() else {
+        return quota_hierarchy_missing();
+    };
+    let scope = match parse_quota_scope(&scope) {
+        Ok(scope) => scope,
+        Err(response) => return response,
+    };
+    if let Err(e) = hierarchy.clear_limits(scope, &target_id).await {
+        tracing::warn!("Quota limits clear failed: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "quota_limits_unclearable", "message": e.to_string()})),
+        )
+            .into_response();
+    }
+    match quota_limits_body(hierarchy, scope, &target_id).await {
+        Ok(body) => (StatusCode::OK, Json(body)).into_response(),
+        Err(response) => response,
+    }
 }
 
 /// Add common security headers to all responses.
