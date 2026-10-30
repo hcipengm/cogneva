@@ -475,8 +475,16 @@ export interface ContributionStatus {
   pending_count: number;
   /** GitHub 设备码通道可用（有 OAuth App client_id） */
   device_flow_available: boolean;
-  /** Gitee 授权码通道可用（有应用 client_id 与 client_secret） */
-  gitee_oauth_available: boolean;
+  /**
+   * Gitee 授权码通道可用（有应用 client_id 与 client_secret）。
+   *
+   * `null` 是第三种答案：这一刻没问出答复（网关正在滚动、监听口没起来）。
+   * 它与 `false`（网关答「没配」）不是一件事——把两者合成一个假值，这一屏
+   * 就会在网关滚动的那一分钟里劝人去补一份本来就填着的配置。
+   */
+  gitee_oauth_available: boolean | null;
+  /** 上面那一格是 `null` 时，网关为什么没答上来。 */
+  gitee_oauth_error?: string;
   gitee_oauth_secret_configured: boolean;
   github_oauth_secret_configured: boolean;
   note?: string;

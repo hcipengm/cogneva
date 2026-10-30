@@ -309,31 +309,40 @@ pub(crate) fn security_gateway_base() -> Result<String, String> {
         })
 }
 
-/// 向网关借 Gitee OAuth App 的 client_id（公开标识）。未配置或网关不可达返回
-/// None，调用方据此走"未配置 OAuth App"的引导。判据只有网关这一个来源，
-/// 主应用不另立近似判据。
-pub(crate) async fn gitee_oauth_client_id() -> Option<String> {
-    let Ok(base) = security_gateway_base() else {
-        return None;
-    };
-    let url = format!("{base}/v1/oauth/gitee/app");
-    // 借不到客户端与网关不可达在返回面上同形（本函数只说"这个来源没给出
-    // client_id"），调用方据此走「未配置 OAuth App」的引导。
-    let body: serde_json::Value = http_client()
-        .ok()?
+/// 向网关借 Gitee OAuth App 的 client_id（公开标识）。
+///
+/// 三种结果必须分开：`Ok(Some)` 是问到了、`Ok(None)` 是网关答「没配」、
+/// `Err` 是**问都没问到**。把后两者合成一个 `None`，就等于在自己的进程里
+/// 把「网关暂时连不上」读成「这个部署没有 OAuth App」——调用方据此把授权按钮
+/// 置灰、或者劝用户改走粘贴令牌，而配置其实好好的。这一族已经付过一次代价：
+/// 续期循环的启动门就是这么把「监听口还没绑好」读成「没配」，静默不启动，
+/// 24 小时后令牌过期、egress 开始 401。
+///
+/// 主应用不持有应用凭证（零带外凭证），所以「有没有配」这个问题只有网关能答；
+/// 本函数只负责把它的答复原样带回来，不替它下结论。
+pub(crate) async fn gitee_oauth_client_id_from(base: &str) -> Result<Option<String>, String> {
+    let url = format!("{}/v1/oauth/gitee/app", base.trim_end_matches('/'));
+    let resp = http_client()?
         .execute(HttpRequest::get(url))
         .await
-        .ok()?
+        .map_err(|e| format!("问不到安全网关（{e}）"))?;
+    let body: serde_json::Value = resp
         .json()
-        .ok()?;
+        .map_err(|e| format!("安全网关的答复读不成 JSON（{e}）"))?;
+    Ok(client_id_in_body(&body))
+}
+
+/// 网关答复里那一格：有值就是配了，缺键或空串就是它自己说没配。
+fn client_id_in_body(body: &serde_json::Value) -> Option<String> {
     body.get("client_id")
         .and_then(|v| v.as_str())
         .map(str::to_string)
         .filter(|s| !s.is_empty())
 }
 
-pub(crate) async fn gitee_oauth_available() -> bool {
-    gitee_oauth_client_id().await.is_some()
+pub(crate) async fn gitee_oauth_client_id_result() -> Result<Option<String>, String> {
+    let base = security_gateway_base()?;
+    gitee_oauth_client_id_from(&base).await
 }
 
 /// 调用网关的 OAuth 端点：成功返回 token 端点响应体，失败返回可展示的错误。
@@ -984,7 +993,16 @@ pub async fn contribution_status_handler(
     };
     reading["pending_count"] = json!(pending_count);
     reading["device_flow_available"] = json!(oauth_client_id(None).is_some());
-    reading["gitee_oauth_available"] = json!(gitee_oauth_available().await);
+    // 三态：`true` 可用、`false` 网关答「没配」、`null` 是没问出答复。前两个是
+    // 平台的实情，第三个是这一刻的读数缺口——把它折叠进 `false`，设置屏就会在
+    // 网关滚动的那一分钟里劝人去「补 client_secret」，而那一格本来就填着。
+    match gitee_oauth_client_id_result().await {
+        Ok(found) => reading["gitee_oauth_available"] = json!(found.is_some()),
+        Err(e) => {
+            reading["gitee_oauth_available"] = serde_json::Value::Null;
+            reading["gitee_oauth_error"] = json!(e);
+        }
+    }
     (StatusCode::OK, Json(reading)).into_response()
 }
 
@@ -1776,15 +1794,30 @@ pub async fn gitee_oauth_start_handler(
     State(_state): State<Arc<crate::GatewayState>>,
     Json(req): Json<GiteeOAuthStartRequest>,
 ) -> Response {
-    let Some(client_id) = gitee_oauth_client_id().await else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "no_oauth_app",
-                "message": "尚未配置 Gitee OAuth App；请先用手动令牌通道连接，或由管理员为安全网关配置应用凭证"
-            })),
-        )
-            .into_response();
+    // 问不到与没配分开报：前者是网关这一刻没答（滚动、监听口没起来），后者是
+    // 真的没配。同一句话盖住两种情况，用户会去改一份本来就对的配置。
+    let client_id = match gitee_oauth_client_id_result().await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "no_oauth_app",
+                    "message": "尚未配置 Gitee OAuth App；请先用手动令牌通道连接，或由管理员为安全网关配置应用凭证"
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "error": "gateway_unreachable",
+                    "message": format!("读不到安全网关的 Gitee OAuth 配置：{e}。这不是「没配」，请稍后重试")
+                })),
+            )
+                .into_response();
+        }
     };
     let redirect_uri = match resolve_redirect_uri(req.redirect_origin.as_deref()) {
         Ok(u) => u,
@@ -2858,5 +2891,29 @@ mod tests {
             started,
             "OAuth App 配好了却没起续期循环：准入判据去问了本进程的监听口，而它此刻还没起来"
         );
+    }
+
+    /// 一条问不到的答复不许被读成「这个部署没配 OAuth App」。判的是分支：`Err`
+    /// 那一支走了，`Ok(None)` 那一支没走。无论问不到的原因是客户端没装配、连接被
+    /// 拒、还是答复不是 JSON，结论都必须是「不知道」，而不是「没有」——设置屏与
+    /// 授权按钮都按这个分支决定是劝人补配置，还是说一句「稍后重试」。
+    #[tokio::test]
+    async fn a_gateway_that_cannot_be_asked_is_not_read_as_no_oauth_app() {
+        match gitee_oauth_client_id_from("http://127.0.0.1:1").await {
+            Err(e) => assert!(!e.trim().is_empty(), "问不到也要说清为什么"),
+            Ok(v) => panic!("连不上的网关被读成了答复 {v:?}"),
+        }
+    }
+
+    /// 反过来那一半：网关答得出来时，「答了没有」必须如实读成 `None`，不能因为
+    /// 上面那条门而对真的没配也含糊。
+    #[test]
+    fn an_answer_without_a_client_id_is_read_as_not_configured() {
+        let answered = serde_json::json!({ "available": false });
+        assert_eq!(client_id_in_body(&answered), None);
+        let empty = serde_json::json!({ "available": true, "client_id": "" });
+        assert_eq!(client_id_in_body(&empty), None);
+        let present = serde_json::json!({ "available": true, "client_id": "abc" });
+        assert_eq!(client_id_in_body(&present).as_deref(), Some("abc"));
     }
 }

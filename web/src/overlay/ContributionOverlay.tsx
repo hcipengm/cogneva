@@ -408,14 +408,19 @@ export function ContributionOverlay({ onClose }: { onClose: () => void }) {
                 >
                   用 GitHub 登录（设备码）
                 </button>
+                {/* 只有网关明确答「没配」（`false`）才置灰。`null` 是这一刻没问出
+                    答复，按钮照常能点：点下去会拿到真实原因（`gateway_unreachable`），
+                    而不是替用户断定「你没配」。 */}
                 <button
                   type="button"
                   onClick={() => void startGitee()}
-                  disabled={busy || !status?.gitee_oauth_available}
+                  disabled={busy || status?.gitee_oauth_available === false}
                   title={
-                    status && !status.gitee_oauth_available
+                    status?.gitee_oauth_available === false
                       ? '网关没配齐 Gitee 应用的 client_id / client_secret，这条路不可用；可以用下面的粘贴令牌'
-                      : undefined
+                      : status && status.gitee_oauth_available === null
+                        ? `这一刻读不到网关的 Gitee 配置${status.gitee_oauth_error ? `（${status.gitee_oauth_error}）` : ''}，可以直接点，失败了再重试`
+                        : undefined
                   }
                   className={smallBtn}
                 >
@@ -444,7 +449,13 @@ export function ContributionOverlay({ onClose }: { onClose: () => void }) {
                 两条授权通道能不能用，读的是网关自己的登记：GitHub 设备码
                 {status ? (status.device_flow_available ? '可用' : '不可用（缺 client_id）') : '…'}
                 ；Gitee 授权码
-                {status ? (status.gitee_oauth_available ? '可用' : '不可用（缺 client_secret）') : '…'}
+                {!status
+                  ? '…'
+                  : status.gitee_oauth_available === null
+                    ? '这一刻读不到（网关没答，不是没配）'
+                    : status.gitee_oauth_available
+                      ? '可用'
+                      : '不可用（缺 client_secret）'}
                 。两条都不可用时，粘贴令牌是唯一的路。
               </p>
               {status && (

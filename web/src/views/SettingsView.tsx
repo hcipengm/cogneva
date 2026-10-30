@@ -339,7 +339,14 @@ export function SettingsView() {
       id: 'gitee',
       label: 'Gitee',
       connected: contrib?.gitee?.configured ?? false,
-      channel: contrib?.gitee_oauth_available ? '授权码 · 粘贴令牌' : '粘贴令牌',
+      // 三态：`null` 是「网关这一刻没答」，不是「没配授权码通道」。这一行说的是
+      // 可走的通道，读不到时写明读不到，不要替用户把一条可能存在的路删掉。
+      channel:
+        contrib?.gitee_oauth_available === null
+          ? '授权码（状态读不到）· 粘贴令牌'
+          : contrib?.gitee_oauth_available
+            ? '授权码 · 粘贴令牌'
+            : '粘贴令牌',
     },
   ];
 

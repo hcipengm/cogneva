@@ -348,12 +348,24 @@ pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response
     let state = contrib::new_oauth_state(&authorize_redirect);
     let url = match provider.as_str() {
         crate::GITEE_PLATFORM => {
-            let Some(client_id) = contrib::gitee_oauth_client_id().await else {
-                return json_err(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "oauth_not_configured",
-                    "尚未配置 Gitee OAuth 应用；请改用访问令牌（PAT）登录",
-                );
+            let client_id = match contrib::gitee_oauth_client_id_result().await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    return json_err(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "oauth_not_configured",
+                        "尚未配置 Gitee OAuth 应用；请改用访问令牌（PAT）登录",
+                    );
+                }
+                // 「网关这一刻没答」不是「这个部署没配」：把它读成没配，用户会去
+                // 找一份本来就填着的应用凭证，而真正该做的是重试一次。
+                Err(e) => {
+                    return json_err(
+                        StatusCode::BAD_GATEWAY,
+                        "oauth_unreachable",
+                        &format!("读不到安全网关的 Gitee OAuth 配置：{e}。稍后重试即可"),
+                    );
+                }
             };
             contrib::build_gitee_authorize_url(&client_id, &authorize_redirect, &state)
         }
