@@ -141,7 +141,7 @@ const FINAL_WAIT: &str = "5s";
 /// The attempts have to span more than one cycle of a periodic reader: the
 /// observed collision was a reader on a ten second poll, and a set of attempts
 /// that all landed inside the same poll would all hit the same lock.
-// cap: bound
+// cap: bound — 尝试的总时长要跨过一个周期读者的循环：实测撞车的是一个十秒轮询的读者，全落在同一拍里的尝试会全撞同一把锁
 const ATTEMPTS: u32 = 16;
 
 /// How long the first replay waits before trying the schema again.
@@ -150,7 +150,7 @@ const ATTEMPTS: u32 = 16;
 /// taken for milliseconds, so the first pause is already long enough to matter
 /// to it; starting shorter would spend attempts inside the same reader's
 /// window.
-// cap: bound
+// cap: bound — 锁是被毫秒级持住的，所以第一次停顿就已经够它看见；更短的起步只会把尝试耗在同一个读者的窗口里
 const FIRST_PAUSE_MS: u64 = 200;
 
 /// How much longer each replay waits than the one before it.
@@ -158,7 +158,7 @@ const FIRST_PAUSE_MS: u64 = 200;
 /// The attempts have to spread across a reader's cycle rather than march in
 /// step: with a fixed pause, sixteen attempts fit inside one ten second poll
 /// and every one of them lands on the same lock.
-// cap: bound
+// cap: bound — 尝试要铺开在一个读者的周期上而不是齐步走：固定停顿下十六次尝试挤进一个十秒轮询，每次都落在那把锁上
 const PAUSE_GROWTH_MS: u64 = 50;
 
 /// The pause before attempt `n`, which grows so the attempts spread out
@@ -175,7 +175,7 @@ fn pause_before(attempt: u32) -> Duration {
 /// milliseconds puts two hundred and fifty readings inside `FINAL_WAIT` and
 /// about a dozen inside a plain `LOCK_WAIT`; finer would spend more of the
 /// wait reading the catalog than waiting.
-// cap: bound
+// cap: bound — 按这个间隔在 FINAL_WAIT 里有两百多次读数、在普通 LOCK_WAIT 里有十几次；更细就是用等待的时间去读目录
 const LOCK_SAMPLE_MS: u64 = 20;
 
 /// SQLSTATE `lock_not_available`, which is what a `lock_timeout` expiry raises.

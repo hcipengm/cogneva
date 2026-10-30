@@ -10,7 +10,7 @@ use std::sync::Arc;
 ///
 /// 这些调用都是单对象读/写（元数据、小文件），慢在远端而不是本机；30s 之后
 /// 重试还有意义，再等只是把调用方一起挂住。
-// cap: bound
+// cap: bound — 这些是单对象读写的远端延迟；30s 之后重试还有意义，再等只是把调用方一起挂住
 const BACKEND_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// File-based object backend for local development and single-node deployment.

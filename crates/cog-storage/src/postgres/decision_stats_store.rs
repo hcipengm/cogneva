@@ -23,7 +23,7 @@ use sqlx::{PgPool, Row};
 use cog_core::{DecisionStatCell, DecisionStatsStore, SFError, SFResult};
 
 /// The widths the keyed columns were created with.
-// cap: bound
+// cap: bound — 建键列当初用的那个宽度
 const CATEGORY_MAX: usize = 32;
 // cap: bound — the group-key column width, a schema limit rather than a measurement
 const GROUP_MAX: usize = 191;

@@ -125,7 +125,7 @@ pub struct PostgresObservabilityGateway {
 
 /// 失败计数最多多久落一次库。选 5 秒是因为它要明显短于一条告警的判定窗
 /// （分钟级），又足以把「每次失败一行」压成「每 5 秒一行」。
-// cap: bound
+// cap: bound — 要明显短于一条告警的判定窗（分钟级），又够把「每次失败一行」压成「每 5 秒一行」
 const FAILURE_FLUSH_SECS: u64 = 5;
 
 impl PostgresObservabilityGateway {

@@ -84,7 +84,7 @@ const WRITE_WINDOW_COLUMNS_SQL: &str = "SELECT window_id, path_scope, writer, ap
 /// The bounds are the narrower dialect's (MySQL cannot key an unbounded TEXT
 /// column), so one set governs both. Widths are counted in characters, which is
 /// what both dialects' VARCHAR lengths mean.
-// cap: bound
+// cap: bound — 取的是更窄那个方言的宽度（MySQL 不能给无界 TEXT 建键），一套管两边
 const KIND_MAX: usize = 32;
 // cap: bound — the identity's scope column width, pinned by the narrower dialect's index limit
 const SCOPE_MAX: usize = 191;

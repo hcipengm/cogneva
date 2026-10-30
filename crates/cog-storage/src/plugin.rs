@@ -9,7 +9,7 @@ use crate::pools::{ConfigPool, ExplainPool, MessagesPool, RedisClient, UsersPool
 ///
 /// 这条探针用的是单连接池，只跑一句 SHOW；池被占满说明数据库已经吃紧，
 /// 5s 拿不到就按「读不到」处理，而不是跟着一起排队。
-// cap: bound
+// cap: bound — 探针用的是单连接池、只跑一句 SHOW；池满说明数据库已吃紧，拿不到就按「读不到」处理而不是跟着排队
 const CONNECTION_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Storage plugin that creates and publishes PostgreSQL pools and Redis client.
@@ -1656,7 +1656,7 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
 /// same division and the divisor has to count it. Leaving it out would give
 /// every pool a share of a total one too large, and the overrun is paid by
 /// whichever component asks for a connection last.
-// cap: bound
+// cap: bound — 每个池分的是总数的一份，漏掉它每个池都按一个大了一的总量分，超支由最后要连接的那个组件付
 const POSTGRES_POOL_COUNT: u32 = 5;
 
 /// How long a read notification stays in the table.
@@ -1664,7 +1664,7 @@ const POSTGRES_POOL_COUNT: u32 = 5;
 /// Longer than the LLM exchange ledger's 30 days because these rows are read by
 /// people rather than by joins: a bell that forgets what happened last month is
 /// still usable, but the history is the only record of what was announced.
-// cap: bound
+// cap: bound — 比 LLM 交换台账的 30 天长，因为这些行是给人读的而不是给 join 用的；铃忘了上月的事还能用，但历史是唯一记下「宣布过什么」的东西
 const NOTIFICATION_KEEP_DAYS: i64 = 90;
 
 /// The server's own connection ceiling and its superuser reserve.

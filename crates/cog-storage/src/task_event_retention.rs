@@ -84,7 +84,7 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// stream is retired only once it has been quiet for that long, so a live run
 /// is never cut. It is a default for the deployment that does not say
 /// otherwise, not a policy.
-// cap: bound
+// cap: bound — 一条流要安静这么久才被退役，正在跑的绝不会被切；这是不说自己保留期的部署的默认值，不是策略
 pub const DEFAULT_KEEP_DAYS: i64 = 30;
 
 /// The shortest retention this loop will accept.
@@ -92,7 +92,7 @@ pub const DEFAULT_KEEP_DAYS: i64 = 30;
 /// A day. The readers replay a whole stream, so a retention shorter than the
 /// time a run takes would retire streams that are still being read. A value
 /// below this is a misconfiguration and falls back rather than being honoured.
-// cap: bound
+// cap: bound — 读者要重放整条流，保留期短于一次运行就该跑的时长就会退掉还在被读的流；低于它的值按配置错误回退
 pub const MIN_KEEP_DAYS: i64 = 1;
 
 /// The environment variable that carries the retention.
@@ -104,7 +104,7 @@ pub const KEEP_DAYS_ENV: &str = "COGNEVA_TASK_EVENT_KEEP_DAYS";
 /// table's size, and Prometheus drops a series it has not seen for five minutes
 /// rather than holding the last value. The age it measures moves by days, so
 /// nothing here needs to be faster.
-// cap: bound
+// cap: bound — 清扫顺带重发表大小，五分钟不发 Prometheus 就丢序列；它量的「年龄」以天计，这里没东西需要更快
 pub const PERIOD: Duration = Duration::from_secs(120);
 
 /// How many streams one statement may retire.
@@ -114,7 +114,7 @@ pub const PERIOD: Duration = Duration::from_secs(120);
 /// its candidates each batch, and a batch is what the loop publishes as its
 /// bound between two beats. Five hundred streams is well under the smallest
 /// batch that matters at the rate this table grows.
-// cap: bound
+// cap: bound — 这一批就是两拍之间发布的界；五百条流远小于这张表增长速度下「算一批」的最小量
 const BATCH_STREAMS: i64 = 500;
 
 /// What one pass did, so a caller can assert on it rather than infer it.

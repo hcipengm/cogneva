@@ -33,7 +33,7 @@ use cog_core::{
 /// The widths the keyed columns were created with, taken from the narrower
 /// dialect's DDL. Checked here so a producer finds out at the write rather than
 /// a database refusing a row halfway through a batch.
-// cap: bound
+// cap: bound — 建键列当初的宽度，取自更窄那个方言的 DDL；在这里查是为了让生产者在写时就知道，而不是库在批量写到一半时拒一行
 const SUBJECT_MAX: usize = 191;
 // cap: bound — the actor column width, a schema limit rather than a measurement
 const ACTOR_MAX: usize = 191;
