@@ -2076,6 +2076,17 @@ export interface ChangeLedgerRow {
   first_seen_at: string;
   measured_at: string | null;
   measured_rev: string | null;
+  /** 把这个变更送上线的那个提交。与 `measured_rev` 不是一件事：一个是交付，
+   * 一个是量判据时读到的那一版；交付了而判据仍不成立的那一行，两个都在。 */
+  delivered_rev: string | null;
+  /** 这一行是不是扣着主线：交付过、判据仍不成立。按 P0 领序，并挡住同一 rev 上的其它行。 */
+  holds_the_line: boolean;
+  /** 这一行为什么重试也不会定下来（`undecided` 才有）。不显示就读成「只是在等」。 */
+  unsettled_reason: string | null;
+  /** 要它的那些文档给的档位（p0/p1/p2/p3/unstated）。 */
+  priority: string;
+  /** 这一条落在哪一面；`none` 表示没有文档点名或点名不一致。 */
+  block: string;
 }
 
 /**

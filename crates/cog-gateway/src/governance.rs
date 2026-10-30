@@ -328,6 +328,57 @@ pub struct ChangeLedgerRowView {
     /// different work, and a filled-in timestamp makes them one row.
     pub measured_at: Option<DateTime<Utc>>,
     pub measured_rev: Option<String>,
+    /// The commit that delivered this change, once one has. A row can be
+    /// delivered and still owed: the diff reached the line and the property it
+    /// was meant to establish does not hold there. Leaving this off the read
+    /// made those two rows indistinguishable from one nothing has landed.
+    pub delivered_rev: Option<String>,
+    /// Whether this row is standing in front of the rest of the account: it was
+    /// delivered and its claim is still owed. Derived from the two facts above
+    /// rather than stored, so it goes false the moment the claim holds.
+    pub holds_the_line: bool,
+    /// Why the row will never settle by retrying, when that is the case. Read
+    /// off the row itself: an undecided row whose reason is not shown reads as
+    /// one that is merely waiting.
+    pub unsettled_reason: Option<String>,
+    /// The band to act on, as the documents asking for this change named it.
+    pub priority: String,
+    /// The face this change is filed under, or `none` when the documents that
+    /// ask for it name none or name different ones.
+    pub block: String,
+}
+
+/// One ledger row as the changes read hands it out.
+///
+/// Split from the handler so the mapping has a reader that needs no database:
+/// which facts a row view keeps is about the row, not about whether the store
+/// answered.
+fn change_row_view(row: cog_core::ChangeLedgerRow) -> ChangeLedgerRowView {
+    let priority = row.priority().as_str().to_string();
+    let block = row.block().as_str().to_string();
+    let holds_the_line = row.holds_the_line();
+    ChangeLedgerRowView {
+        identity: row.identity.as_key(),
+        kind: row.identity.kind.clone(),
+        scope: row.identity.scope.clone(),
+        literal: row.identity.literal.clone(),
+        state: row.state.as_str().to_string(),
+        title: row.title,
+        assertion: row.assertion,
+        sources: row
+            .sources
+            .iter()
+            .map(|source| source.doc.clone())
+            .collect(),
+        first_seen_at: row.first_seen_at,
+        measured_at: row.measured_at,
+        measured_rev: row.measured_rev,
+        delivered_rev: row.delivered_rev,
+        holds_the_line,
+        unsettled_reason: row.unsettled_reason,
+        priority,
+        block,
+    }
 }
 
 /// How many outstanding rows the route returns. The account can hold thousands;
@@ -379,26 +430,7 @@ pub async fn changes_handler(
         })
         .collect();
 
-    let outstanding = rows
-        .into_iter()
-        .map(|row| ChangeLedgerRowView {
-            identity: row.identity.as_key(),
-            kind: row.identity.kind.clone(),
-            scope: row.identity.scope.clone(),
-            literal: row.identity.literal.clone(),
-            state: row.state.as_str().to_string(),
-            title: row.title,
-            assertion: row.assertion,
-            sources: row
-                .sources
-                .iter()
-                .map(|source| source.doc.clone())
-                .collect(),
-            first_seen_at: row.first_seen_at,
-            measured_at: row.measured_at,
-            measured_rev: row.measured_rev,
-        })
-        .collect();
+    let outstanding = rows.into_iter().map(change_row_view).collect();
 
     Ok(Json(ChangesResponse {
         generated_at: now,
@@ -532,6 +564,63 @@ mod tests {
         assert_eq!(view.check_kind.as_deref(), Some("tree"));
         assert_eq!(view.state.as_deref(), Some("enforced"));
         assert_eq!(view.priority, "p1");
+    }
+
+    fn ledger_row() -> cog_core::ChangeLedgerRow {
+        let at = Utc.with_ymd_and_hms(2026, 10, 29, 8, 0, 0).unwrap();
+        cog_core::ChangeLedgerRow {
+            identity: cog_core::ChangeIdentity::new(
+                "grep",
+                "crates/cog-gateway/src/governance.rs",
+                "change_timeline_handler",
+            ),
+            state: cog_core::ChangeState::Pending,
+            title: Some("变更面点得进去".into()),
+            assertion: Some("单条变更读得回它的来路".into()),
+            sources: vec![cog_core::ChangeSource {
+                doc: "specs/example.md".into(),
+                verdict: None,
+                priority: cog_core::ChangePriority::P1,
+                block: cog_core::ChangeBlock::named("change").expect("a face name"),
+            }],
+            first_seen_at: at,
+            measured_at: Some(at),
+            measured_rev: Some("abc123".into()),
+            delivered_rev: Some("def456".into()),
+            landed_at: None,
+            unsettled_reason: Some("scope_absent_in_revision".into()),
+            retire_reason: None,
+            retired_at: None,
+        }
+    }
+
+    /// 一行被交付了却还欠着，与一行什么都没落过，在变更列表上曾经同形：
+    /// 读面只交出了 `measured_rev`，把「哪个提交把它送上了线」和「它为什么还不闭」
+    /// 都丢在台账行里。看见这两格才知道该去修树还是该去修判据。
+    #[test]
+    fn a_row_that_was_delivered_and_is_still_owed_says_so() {
+        let view = change_row_view(ledger_row());
+        assert_eq!(view.delivered_rev.as_deref(), Some("def456"));
+        assert!(view.holds_the_line);
+        assert_eq!(
+            view.unsettled_reason.as_deref(),
+            Some("scope_absent_in_revision")
+        );
+        assert_eq!(view.priority, "p1");
+        assert_eq!(view.block, "change");
+        // 交付不改判据：读的是量到的那一版，不是送来那一版。
+        assert_eq!(view.measured_rev.as_deref(), Some("abc123"));
+    }
+
+    /// 没有交付过的那一行，`holds_the_line` 必须是假的：扣着线的行会按 P0 领序并挡住
+    /// 同一 rev 上的其它行，多判一条就会把主线停在一笔从没送上去的变更后面。
+    #[test]
+    fn a_row_nothing_delivered_does_not_hold_the_line() {
+        let mut row = ledger_row();
+        row.delivered_rev = None;
+        let view = change_row_view(row);
+        assert_eq!(view.delivered_rev, None);
+        assert!(!view.holds_the_line);
     }
 
     fn query(kind: &str, scope: &str, literal: &str) -> ChangeTimelineQuery {

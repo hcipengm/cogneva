@@ -529,6 +529,64 @@ async fn the_account_is_readable_with_a_token() {
     assert_eq!(body["total"], 2, "{body}");
 }
 
+/// A row that was delivered and is still owed reads differently from one that
+/// nothing has landed.
+///
+/// The ledger has known the difference all along -- `delivered_rev` is set once
+/// by the reader that finds the landing trailer and never cleared -- and the
+/// route did not carry it. Two rows whose states were both `pending` then read
+/// the same, one that a commit shipped and whose claim does not hold, one that
+/// nobody has ever touched; the first holds up every other row measured at that
+/// revision, the second holds up nothing. The band and the face are on the row
+/// too, derived from the documents that ask for it, and go the same way: a
+/// reader that gets only the state cannot tell what to act on.
+#[tokio::test]
+async fn a_delivered_row_says_which_revision_said_so_and_that_it_holds_the_line() {
+    let mut delivered = row(ChangeState::Pending, "doc-c.md", "crates/cog-gateway/src");
+    delivered.delivered_rev = Some("def456".into());
+    let mut undecided = row(ChangeState::Undecided, "doc-d.md", "crates/cog-storage/src");
+    undecided.unsettled_reason = Some("scope_absent_in_revision".into());
+    let ledger = Arc::new(FakeLedger::new(
+        vec![
+            delivered,
+            undecided,
+            row(ChangeState::Pending, "doc-e.md", "crates/cogneva/src"),
+        ],
+        0,
+        0,
+    ));
+    let state = state(Some(ledger));
+    let token = bearer(&state).await;
+
+    let (status, body) = get(state, "/api/v1/governance/changes", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let rows = body["outstanding"]
+        .as_array()
+        .expect("the route answers a list of rows");
+    let by_state = |state: &str, delivered: bool| {
+        rows.iter()
+            .find(|r| r["state"] == state && r["delivered_rev"].is_string() == delivered)
+            .unwrap_or_else(|| panic!("no {state} row with delivered_rev={delivered}: {body}"))
+    };
+
+    let held = by_state("pending", true);
+    assert_eq!(held["delivered_rev"], "def456", "{body}");
+    assert_eq!(held["holds_the_line"], true, "{body}");
+    assert_eq!(held["priority"], "p1", "{body}");
+    assert_eq!(held["block"], "none", "{body}");
+
+    let never = by_state("pending", false);
+    assert_eq!(never["delivered_rev"], serde_json::Value::Null, "{body}");
+    assert_eq!(never["holds_the_line"], false, "{body}");
+
+    let stuck = by_state("undecided", false);
+    assert_eq!(
+        stuck["unsettled_reason"], "scope_absent_in_revision",
+        "{body}"
+    );
+}
+
 /// One row's history, asked for by the three parts of its identity.
 ///
 /// The request carries `kind`/`scope`/`literal` and not the rendered

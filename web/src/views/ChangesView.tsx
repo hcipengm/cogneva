@@ -173,6 +173,26 @@ export function ChangesView() {
               { key: 'title', title: '是什么', render: (r) => (
                 <span className="text-[12px]">{r.title ?? r.assertion ?? '—'}</span>
               ) },
+              { key: 'delivered', title: '交付 rev', width: '90px', render: (r) =>
+                r.delivered_rev ? (
+                  <span className="mono truncate text-[11px] text-[var(--paper-dim)]" title={r.delivered_rev}>
+                    {r.delivered_rev.slice(0, 8)}
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-[var(--muted)]">—</span>
+                ) },
+              { key: 'why', title: '还差什么', width: '150px', render: (r) =>
+                r.holds_the_line ? (
+                  <span className="text-[11px] text-[var(--warn)]" title="它已经被交付上线，而判据在树上还不成立——它扣着主线">
+                    扣着主线
+                  </span>
+                ) : r.unsettled_reason ? (
+                  <span className="mono truncate text-[11px] text-[var(--warn)]" title={r.unsettled_reason}>
+                    {r.unsettled_reason}
+                  </span>
+                ) : (
+                  <span className="text-[11px] text-[var(--muted)]">—</span>
+                ) },
               { key: 'seen', title: '首次出现', width: '100px', render: (r) => <Moment iso={r.first_seen_at} /> },
               { key: 'measured', title: '上次判读', width: '110px', render: (r) =>
                 r.measured_at ? <Moment iso={r.measured_at} /> : (
