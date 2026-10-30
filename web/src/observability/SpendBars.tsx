@@ -1,5 +1,6 @@
 import { useState, type KeyboardEvent } from 'react';
 import type { WindowSpend } from '@/api/client';
+import { localZoneLabel } from '@/topology/format';
 
 /**
  * 一条按窗口排开的花销柱：每个整点窗口花了多少 token。
@@ -57,6 +58,7 @@ export function SpendBars({
           {base.stepLabel}
           {size > 1 && ` · 每 ${size} 格并一柱`}
           {peak > 0 && ` · 峰值 ${compact(peak)}`}
+          {` · 本地时间 ${localZoneLabel()}`}
         </span>
       </div>
 

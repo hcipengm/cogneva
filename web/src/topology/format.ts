@@ -42,3 +42,20 @@ export function percentOf(part: number, whole: number): string {
   const value = (part / whole) * 100;
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)}%`;
 }
+
+/**
+ * 本机时区的名字，写成 `UTC+8` 这种能直接对时差的形式。
+ *
+ * 页面上所有时刻都是用浏览器本地时区渲染的（`toLocaleString` 的默认行为），
+ * 而账本、日志、SQL 里记的都是 UTC。两处差八小时的时候，同一件事在页面上是
+ * 「10-26 22:00」、在日志里是「10-26 14:00」，读的人会以为其中一个错了——现场
+ * 真发生过。所以凡是画出时间轴或读出绝对时刻的地方，都得把时区名字写出来，
+ * 而不是让人去猜页面用的是哪一种。
+ */
+export function localZoneLabel(): string {
+  const offsetMinutes = -new Date().getTimezoneOffset();
+  const sign = offsetMinutes >= 0 ? '+' : '-';
+  const hours = Math.floor(Math.abs(offsetMinutes) / 60);
+  const minutes = Math.abs(offsetMinutes) % 60;
+  return `UTC${sign}${hours}${minutes > 0 ? `:${String(minutes).padStart(2, '0')}` : ''}`;
+}

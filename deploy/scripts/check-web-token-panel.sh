@@ -219,6 +219,35 @@ for rel in sorted(graph):
     else:
         summary.append("额度窗: " + ", ".join(consumer))
 
+# ── 6. 时区 ──
+# 这一屏上每一个时刻都是浏览器按**本地时区**渲染的（`toLocaleString` 的默认行为），
+# 而账本、日志、SQL 记的都是 UTC。差八小时的时候，同一件事在页面上是「10-26 22:00」、
+# 在日志里是「10-26 14:00」——读的人只会得出一个结论：其中一个是错的。现场已经发生过
+# 一次：8 小时的时间差被当成「面板说还有花销、他却说四天零成功」。
+#
+# 判据不是「页面上出现 UTC 三个字」：那句话可以是一句不指向任何数的装饰。要的是
+# **本地时区名字由代码算出来**（`localZoneLabel()` 有实现、有调用点），这样换一台
+# 时区不同的机器，写出来的名字也跟着变，而不是钉死某个偏移量再去骗人。
+ZONE_DEF = re.compile(r"export\s+function\s+localZoneLabel\s*\(")
+ZONE_CALL = re.compile(r"\blocalZoneLabel\s*\(")
+definitions = [rel for rel in sorted(graph) if ZONE_DEF.search(read(rel))]
+callers = [
+    rel
+    for rel in sorted(graph)
+    if rel not in definitions and ZONE_CALL.search(read(rel))
+]
+if not definitions:
+    problems.append(
+        "没有地方定义 localZoneLabel()：页面上的时刻是本地时区渲染的，"
+        "而账本与日志是 UTC，不写出时区名字读的人只能猜"
+    )
+elif not callers:
+    problems.append(
+        "localZoneLabel() 有定义但没有调用点：时区名字没有出现在任何一屏上"
+    )
+else:
+    summary.append("时区: " + ", ".join(f"{rel} ← {s}" for rel, s in [(c, definitions[0]) for c in callers]))
+
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
 

@@ -10,7 +10,7 @@ import { OutcomeBreakdown } from '@/observability/OutcomeBreakdown';
 import { SpendAccount } from '@/observability/SpendAccount';
 import { TokenShare } from '@/observability/TokenShare';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
-import { percentOf } from '@/topology/format';
+import { localZoneLabel, percentOf } from '@/topology/format';
 
 /**
  * Token 面：模型花销这一本账的两个粒度，放在同一页上。
@@ -82,7 +82,7 @@ export function TokenView() {
   return (
     <ViewFrame
       title="Token"
-      meta={`最近 ${hours} 小时 · 按 60 秒重读 · 累计 5 分钟`}
+      meta={`最近 ${hours} 小时 · 按 60 秒重读 · 累计 5 分钟 · 页面时刻为本地 ${localZoneLabel()}`}
     >
       <div className="flex flex-wrap items-center gap-1 border-b border-[var(--line)] px-4 py-2">
         <span className="mr-2 text-[11px] text-[var(--muted)]">窗口</span>
