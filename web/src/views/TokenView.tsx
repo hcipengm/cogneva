@@ -6,6 +6,7 @@ import { resourceKey } from '@/store/frameTick';
 import { SpendBars } from '@/observability/SpendBars';
 import { TokenShare } from '@/observability/TokenShare';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
+import { percentOf } from '@/topology/format';
 
 /**
  * Token 面：模型花销这一本账的两个粒度，放在同一页上。
@@ -23,6 +24,10 @@ export function TokenView() {
   const [hours, setHours] = useState(24);
   const series = useResource(`令牌花销（${hours} 小时）`, () => getTokenUsageSeries(hours), 60_000);
   const usage = useResource(`模型用量（${hours} 小时）`, () => getTokenUsage(hours), 60_000);
+  // 累计这一读问的是「这账号一共花过多少」，`hours=0` 即「整本折叠账」。它每分钟
+  // 重问一次没有意义——一个只在增长的总数，问得越勤只让同一个数字重复出现——所以
+  // 它按 5 分钟重读，也不跟 `turn_end` 一起刷新。
+  const cumulative = useResource('累计花销（整本折叠账）', () => getTokenUsage(0), 300_000);
   // 这本账的写者是一轮话、一次运行：`turn_end` 与 `agent_end` 就是那一笔落账的时刻。
   // 整点折叠改的是同一本账的另一个粒度，落在 observability 前缀下。
   useKindTickedRefresh(
@@ -34,9 +39,20 @@ export function TokenView() {
   const actors = usage.data?.actors ?? [];
   const sum = (pick: (row: (typeof rows)[number]) => number) => rows.reduce((total, row) => total + pick(row), 0);
   const failed = sum((row) => row.failed_calls);
+  // 命中率只在协议内算：`input` 在 OpenAI 兼容面已含缓存命中，在 Anthropic 面两者不相交，
+  // 所以分母取 `input + cached`，而两种协议仍然分行列出——把两条线并成一个百分比，
+  // 就是让一个协议的分母去解释另一个协议的分子。
+  const byStyle = styleCells(rows);
+  const cumulativeActors = cumulative.data?.actors ?? [];
+  const cumulativeSum = (pick: (actor: ActorUsage) => number) =>
+    cumulativeActors.reduce((total, actor) => total + pick(actor), 0);
+  const cumulativeByStyle = styleCells(cumulativeActors);
 
   return (
-    <ViewFrame title="Token" meta={`最近 ${hours} 小时 · 按 60 秒重读`}>
+    <ViewFrame
+      title="Token"
+      meta={`最近 ${hours} 小时 · 按 60 秒重读 · 累计 5 分钟`}
+    >
       <div className="flex flex-wrap items-center gap-1 border-b border-[var(--line)] px-4 py-2">
         <span className="mr-2 text-[11px] text-[var(--muted)]">窗口</span>
         {WINDOWS.map((option) => {
@@ -63,6 +79,57 @@ export function TokenView() {
       </div>
 
       <section className="border-b border-[var(--line)]">
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">累计</h2>
+        {cumulative.error ? (
+          <ReadError what="累计花销" error={cumulative.error} onRetry={cumulative.refresh} />
+        ) : !cumulative.data ? (
+          <Loading what="累计花销" />
+        ) : (
+          <Readings
+            from={cumulative}
+            source="GET /api/v1/observability/token-usage?hours=0"
+            caveat="`hours=0` 是「整本折叠账」，端点报出的覆盖起点就是这本账的第一格。聚合面每个执行者一行，所以问全史也不会把整本账拉过来；逐窗口那一面没有这个读法。"
+          >
+            <div className="flex flex-wrap py-2">
+              <Reading label="输入 token" value={cumulativeSum((actor) => actor.tokens_input).toLocaleString()} />
+              <Reading label="输出 token" value={cumulativeSum((actor) => actor.tokens_output).toLocaleString()} />
+              <Reading label="缓存命中" value={cumulativeSum((actor) => actor.tokens_cached).toLocaleString()} />
+              {[...cumulativeByStyle.entries()].map(([style, cell]) => {
+                const base = cacheBase(style, cell.input, cell.cached);
+                return (
+                  <Reading
+                    key={`total-hit-${style}`}
+                    label={`命中率 · ${style}`}
+                    value={base === null ? '—' : percentOf(cell.cached, base)}
+                    note={
+                      base === null
+                        ? '这个协议没有已知的缓存记法'
+                        : `缓存 ${compact(cell.cached)} / 分母 ${compact(base)}`
+                    }
+                  />
+                );
+              })}
+              <Reading label="调用" value={cumulativeSum((actor) => actor.calls).toLocaleString()} />
+              <Reading
+                label="起始"
+                value={
+                  cumulative.data.covered_since ? <Moment iso={cumulative.data.covered_since} /> : '无折叠行'
+                }
+                note="这本账最早折过的那一格，不是平台上线时刻"
+              />
+              <Reading
+                label="截至"
+                value={
+                  cumulative.data.covered_until ? <Moment iso={cumulative.data.covered_until} /> : '—'
+                }
+                note="折叠只折已收口的整点，最近那一小时不算在内"
+              />
+            </div>
+          </Readings>
+        )}
+      </section>
+
+      <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">花销</h2>
         {series.error ? (
           <ReadError what="令牌花销" error={series.error} onRetry={series.refresh} />
@@ -83,6 +150,23 @@ export function TokenView() {
                   value={sum((row) => row.tokens_cached).toLocaleString()}
                   note="只在同一协议内可比"
                 />
+                {[...byStyle.entries()].map(([style, cell]) => {
+                  const base = cacheBase(style, cell.input, cell.cached);
+                  return (
+                    <Reading
+                      key={`hit-${style}`}
+                      label={`命中率 · ${style}`}
+                      value={base === null ? '—' : percentOf(cell.cached, base)}
+                      note={
+                        base === null
+                          ? '这个协议没有已知的缓存记法'
+                          : base > 0
+                            ? `缓存 ${compact(cell.cached)} / 分母 ${compact(base)}`
+                            : '这段没有输入 token'
+                      }
+                    />
+                  );
+                })}
                 <Reading label="调用" value={sum((row) => row.calls).toLocaleString()} />
                 <Reading
                   label="失败调用"
@@ -203,9 +287,9 @@ export function TokenView() {
             />
             <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
               一行是「一个执行者 × 一个环境 × 一个上游 × 一种协议」，四格合起来才是唯一的一行：
-              同一个执行者换过环境就是两行。缓存比的分母是输入，而输入的含义逐协议不同
-              ——OpenAI 兼容线路里它已含缓存命中，Anthropic 上两者不相交——所以这一列只在
-              同一协议内纵向比，跨协议相减会算出一个不存在的命中率。
+              同一个执行者换过环境就是两行。缓存占比的分母逐协议不同——OpenAI 兼容线路里
+              `input` 已含缓存命中，分母就是它；Anthropic 上两者不相交，分母是二者之和——
+              所以这一列只在同一协议内纵向比；混着算出来的百分比，分子和分母往往不是同一段字节。
             </p>
           </>
         )}
@@ -219,19 +303,58 @@ const WINDOWS: { hours: number; label: string }[] = [
   { hours: 24, label: '24 小时' },
   { hours: 72, label: '3 天' },
   { hours: 168, label: '7 天' },
+  // 「整本折叠账」不在这排按钮里：上面两读里有一读是逐窗口的，按钮选它就会让
+  // 60 秒轮询把整本折过的账拉一次（五周就五万多行），而累计那个数只需要按执行者
+  // 求和的那一面——它全史也只有几十行。累计在页顶单独一格、单独一条读。
 ];
 
 /**
- * 缓存占全部输入的比例，即 `cached / (input + cached)`。
+ * 缓存命中的分母，按协议取。
  *
- * 分母要把两段加起来，不能只用 input：两种协议面对同一笔缓存的记法不同——
- * Anthropic 面 `input` 不含缓存的那些 token，OpenAI 兼容面 `input` 已经含了，
- * 只拿 `input` 作分母时前者会算出超过 100%，后者则把命中份额压低。
- * 分母为 0 时没有比例可言——写 0% 会读成「一点没命中」。
+ * 同一个词在两条线上指的不是同一段字节：OpenAI 兼容面的 `input` **已经含**缓存
+ * 命中（账上逐行 `cached ≤ input` 成立），所以命中率是 `cached / input`；Anthropic
+ * 面的 `input` 不含缓存，两者相加才是一次调用的全部输入，分母取 `input + cached`。
+ * 拿一个分母套两种记法，必有一边是错的：对 OpenAI 兼容面会把命中份额压到约六成，
+ * 对 Anthropic 面则可能算出超过 100%。
+ *
+ * 认不出的协议返回 `null`——那不是「命中率为 0」，是没有算法可用，得读成不知道。
  */
+function cacheBase(style: string, input: number, cached: number): number | null {
+  if (style.startsWith('openai')) return input;
+  if (style === 'anthropic') return input + cached;
+  return null;
+}
+
+/** 一行执行者的命中率；分母为 0 时没有比例可言，写 0% 会读成「一点没命中」。 */
 function hitRate(actor: ActorUsage): string {
-  const input = actor.tokens_input + actor.tokens_cached;
-  if (input <= 0) return '—';
-  const value = (actor.tokens_cached / input) * 100;
+  const base = cacheBase(actor.api_style, actor.tokens_input, actor.tokens_cached);
+  if (base === null || base <= 0) return '—';
+  const value = (actor.tokens_cached / base) * 100;
   return `${value >= 10 ? Math.round(value) : value.toFixed(1)}%`;
+}
+
+/**
+ * 逐协议的 `input` / `cached` 小计。
+ *
+ * 两种协议共享同一个词，但 `input` 的含义不同：OpenAI 兼容面它已经含了缓存命中，
+ * Anthropic 面两者不相交。小计必须按协议分开，命中率的分母才可能落对。
+ */
+function styleCells(
+  rows: { api_style: string; tokens_input: number; tokens_cached: number }[]
+): Map<string, { input: number; cached: number }> {
+  const byStyle = new Map<string, { input: number; cached: number }>();
+  for (const row of rows) {
+    const cell = byStyle.get(row.api_style) ?? { input: 0, cached: 0 };
+    cell.input += row.tokens_input;
+    cell.cached += row.tokens_cached;
+    byStyle.set(row.api_style, cell);
+  }
+  return byStyle;
+}
+
+/** 大数按万/亿缩写：读的人要的是量级，不是每一位都念一遍。 */
+function compact(value: number): string {
+  if (value >= 100_000_000) return `${(value / 100_000_000).toFixed(1)}亿`;
+  if (value >= 10_000) return `${(value / 10_000).toFixed(1)}万`;
+  return value.toLocaleString();
 }

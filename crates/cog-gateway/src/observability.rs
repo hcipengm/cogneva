@@ -264,6 +264,45 @@ fn default_usage_hours() -> i64 {
 // cap: bound
 const MAX_USAGE_HOURS: i64 = 24 * 7;
 
+/// The instant a spend request asks the fold to sum from.
+///
+/// `hours <= 0` is how a caller asks for everything the fold holds rather than
+/// for a trailing window. It is a separate answer from clamping to the cap:
+/// the cap bounds one scan, while "all of it" is the only way to read a
+/// cumulative total at all, and a reader that wanted the total and silently got
+/// seven days would publish a number that looks like the total and is not. The
+/// honest bound still travels: every read reports the range the fold actually
+/// covered, so the cumulative figure arrives with the day it starts on.
+///
+/// The floor is the epoch rather than "now minus something large" because the
+/// fold's oldest window is not known here — asking from before any ledger row
+/// can exist needs no knowledge of when the platform started, and an empty
+/// answer still carries `covered_since: None`.
+fn usage_since(hours: i64, until: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    if hours <= 0 {
+        return chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+    }
+    until - chrono::Duration::hours(hours.clamp(1, MAX_USAGE_HOURS))
+}
+
+/// The instant a *per-window* read starts from: always a bounded trailing span.
+///
+/// The summed read above answers "what has this account spent" and can answer it
+/// over the whole fold, because it returns one row per actor however wide the
+/// range is. This one returns one row per window per combination, so the range
+/// *is* the response size — the fold held 55,996 rows over its first five weeks,
+/// and a chart cannot draw them. Asking for everything therefore comes back as
+/// the cap here, and that is not a silent substitution: the answer's own
+/// `covered_since` names the first window it drew, so a reader that asked for
+/// more than seven days can see where the drawing starts. `hours <= 0` keeps the
+/// same reading as [`usage_since`] — "as wide as this read goes".
+fn series_since(hours: i64, until: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    if hours <= 0 {
+        return until - chrono::Duration::hours(MAX_USAGE_HOURS);
+    }
+    until - chrono::Duration::hours(hours.clamp(1, MAX_USAGE_HOURS))
+}
+
 /// The rolled spend, with the range of windows it was summed over.
 ///
 /// The endpoints are the ones the rollup answered for, not the ones the request
@@ -290,9 +329,8 @@ pub async fn token_usage_by_actor_handler(
         .llm_usage_reader
         .as_ref()
         .ok_or_else(|| ApiError::internal("token usage reader not configured"))?;
-    let hours = q.hours.clamp(1, MAX_USAGE_HOURS);
     let until = chrono::Utc::now();
-    let since = until - chrono::Duration::hours(hours);
+    let since = usage_since(q.hours, until);
     let rolled = reader
         .usage_by_actor_rolled(since, until)
         .await
@@ -344,9 +382,8 @@ pub async fn token_series_handler(
         .llm_usage_reader
         .as_ref()
         .ok_or_else(|| ApiError::internal("token usage reader not configured"))?;
-    let hours = q.hours.clamp(1, MAX_USAGE_HOURS);
     let until = chrono::Utc::now();
-    let since = until - chrono::Duration::hours(hours);
+    let since = series_since(q.hours, until);
     let series = reader
         .usage_series(since, until)
         .await
@@ -846,6 +883,65 @@ mod tests {
             wire["covered_since"].is_null() && wire["covered_until"].is_null(),
             "both endpoints read as null on the wire, got: {wire}"
         );
+    }
+
+    /// Asking for everything must not come back as the cap.
+    ///
+    /// The defect this pins is a cumulative figure that is really seven days:
+    /// clamping turns the request into a number nobody can tell from a total,
+    /// and the only thing that would say otherwise is the coverage the response
+    /// carries — which a caller that asked for "all of it" has no reason to
+    /// re-check. The two answers have to differ before they leave this function.
+    #[test]
+    fn asking_for_everything_does_not_come_back_as_the_cap() {
+        let until = chrono::DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
+            .expect("a fixed instant")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            usage_since(0, until),
+            chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            "`hours=0` means the whole fold; answering it with the cap would publish a \
+             seven-day sum under the name of a cumulative total"
+        );
+        assert!(
+            usage_since(-5, until) < usage_since(MAX_USAGE_HOURS, until),
+            "a negative window means the same thing as zero and must not fall back to a \
+             trailing one"
+        );
+        assert_eq!(
+            usage_since(10_000, until),
+            until - chrono::Duration::hours(MAX_USAGE_HOURS),
+            "a trailing window past the cap is still answered at the cap"
+        );
+        assert_eq!(
+            usage_since(6, until),
+            until - chrono::Duration::hours(6),
+            "a window inside the cap is answered as asked"
+        );
+    }
+
+    /// 两个读法在 `hours <= 0` 上故意不同：求和那一面返回的是每个执行者一行，
+    /// 全史也只有几十行，可以问「一共花了多少」；逐窗口那一面返回的是每个窗口
+    /// 的每一行，区间有多宽响应就有多大，全史是五万多行、画不出来。把前者那条
+    /// 「0 即全史」照搬到后者，就是让一个 60 秒轮询的端点把整本折叠账拉出来。
+    #[test]
+    fn the_per_window_read_answers_an_unbounded_ask_at_the_widest_it_can_draw() {
+        let until = chrono::DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
+            .expect("a fixed instant")
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            series_since(0, until),
+            until - chrono::Duration::hours(MAX_USAGE_HOURS),
+            "asking for everything on the per-window read is answered at the widest span \
+             the bars can be drawn for"
+        );
+        assert_eq!(series_since(-5, until), series_since(0, until));
+        assert_eq!(
+            series_since(24, until),
+            until - chrono::Duration::hours(24),
+            "and a bounded window is the same window on both reads"
+        );
+        assert_eq!(series_since(10_000, until), series_since(0, until));
     }
 
     /// The handler has no way to put the request's window into the answer: the
