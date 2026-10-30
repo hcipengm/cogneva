@@ -583,6 +583,141 @@ fn the_face_kinds_the_panel_shows_are_the_ones_the_registry_declares() {
     assert_eq!(FaceKind::parse("cross_cutting"), None);
 }
 
+/// 项目面的四个视图名由 `?view=` 上的导出分支认词。少一个：服务端有了第五个视图，
+/// 页面没有那一栏，那份表从界面上导不出来；多一个：那一栏的按钮每次都换回一条
+/// `unknown_view`，而屏幕上它与「没有这一栏」长得一样。
+///
+/// 这个词表在客户端曾经被抄了四遍（导出函数的参数、导出按钮的 props、页面的
+/// `Mode`、以及一处 `as` 断言）。抄写之间没有判据，改一处就漏三处，所以这里除了
+/// 两侧对齐，还数它在客户端总共声明了几处。
+#[test]
+fn the_project_views_the_page_offers_are_the_ones_the_export_branch_reads() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut panel = union_words(&source, "export type ProjectView =");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "视图联合类型读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    let gateway_path = repo_root().join("crates/cog-gateway/src/projects.rs");
+    let gateway = std::fs::read_to_string(&gateway_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", gateway_path.display()));
+    let from = gateway
+        .find("match q.view.as_str() {")
+        .expect("导出分支不再按 `q.view` 选表；这条判据读的就是它");
+    let rest = &gateway[from..];
+    let end = rest
+        .find("other =>")
+        .expect("导出分支没有兜底臂了：本门按 `other =>` 截出四个视图的臂，改了就得跟着改这里");
+    let mut declared: Vec<String> = rest[..end]
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix('"'))
+        .filter_map(|line| line.split_once('"'))
+        .filter(|(_, rest)| rest.trim_start().starts_with("=>"))
+        .map(|(word, _)| word.to_string())
+        .collect();
+    declared.sort();
+    declared.dedup();
+    assert!(
+        declared.len() >= 2,
+        "导出分支读出来是 {declared:?}；这么短说明解析变了，不是树变干净了"
+    );
+    assert_eq!(panel, declared, "页面给的视图名与导出分支认的词必须同一组");
+
+    // 客户端只许声明一处：这个词表被抄过的代价就是改一处漏三处。
+    let mut copies = Vec::new();
+    let mut stack = vec![repo_root().join("web/src")];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+            .flatten()
+        {
+            let p = entry.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|e| e == "ts" || e == "tsx") {
+                let text = std::fs::read_to_string(&p).unwrap_or_default();
+                if text.contains("'wbs' | 'board' | 'gantt' | 'evm'") {
+                    copies.push(p.display().to_string());
+                }
+            }
+        }
+    }
+    copies.sort();
+    assert_eq!(
+        copies.len(),
+        1,
+        "视图词表在客户端有 {} 处声明：{copies:?}；页面、导出按钮与调用处都该从 \
+         `client.ts` 的 `ProjectView` 取，抄一份就多一处会漂的第二正本",
+        copies.len()
+    );
+}
+
+/// 协作图上的边名是网关写进 `link_type` 的词，面板按它给一条边选颜色与中文名。
+/// 少一个词：那种边落到兜底，与「这条边不存在」长得一样；多一个词：为一条永远
+/// 不会写进图的边留着一支颜色。
+///
+/// 两侧的词都由树里数出来：面板那侧读联合类型，网关那侧按 `rename_all` 折变体名，
+/// 所以核心加一个变体、而面板没跟上时这条会红。
+#[test]
+fn the_collaboration_link_types_the_panel_draws_are_the_ones_the_gateway_writes() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut panel = union_words(&source, "export type CollaborationLinkType =");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "边名联合类型读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    let gateway_path = repo_root().join("crates/cog-gateway/src/collaboration.rs");
+    let gateway = std::fs::read_to_string(&gateway_path)
+        .unwrap_or_else(|e| panic!("{}: {e}", gateway_path.display()));
+    assert!(
+        gateway.contains("#[serde(rename_all = \"snake_case\")]"),
+        "`CollaborationLinkType` 的线上写法不再由 rename_all 决定：本门按 snake_case \
+         折变体名，改了就得跟着改这里"
+    );
+    let from = gateway
+        .find("pub enum CollaborationLinkType {")
+        .expect("`CollaborationLinkType` 没了；这条判据读的就是它");
+    let rest = &gateway[from..];
+    let body = &rest[..rest.find("\n}").expect("the enum body is not closed")];
+    let mut declared: Vec<String> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with("//") && !line.starts_with('#') && !line.is_empty())
+        .filter_map(|line| {
+            line.split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()
+        })
+        .filter(|name| name.chars().next().is_some_and(char::is_uppercase))
+        .map(pascal_to_snake)
+        .collect();
+    declared.sort();
+    declared.dedup();
+    assert!(
+        declared.len() >= 2,
+        "网关那侧读出来是 {declared:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    assert_eq!(
+        panel, declared,
+        "面板画的边名与网关写进 `link_type` 的词必须同一组"
+    );
+
+    // 上面那条对网关那侧用的是文本折名，折法本身由这一条钉住：真正序列化一次，
+    // 与折出来的词比。折法与 serde 哪天分家，这里先红。
+    let spelling = serde_json::to_value(cog_gateway::collaboration::CollaborationLinkType::HandOff)
+        .expect("CollaborationLinkType serializes");
+    assert_eq!(spelling, serde_json::json!(pascal_to_snake("HandOff")));
+}
+
 /// 对照：本门的判据认得出一个不是词的东西。少了这条，`TaskFilter::parse` 哪天
 /// 退化成「什么词都收」，上面那条仍然全绿。
 #[test]

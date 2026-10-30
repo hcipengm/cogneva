@@ -1402,6 +1402,15 @@ export async function getProjectAudit(
 }
 
 /**
+ * 项目面的四个视图。
+ *
+ * `?view=` 上这个参数由 `crates/cog-gateway/src/projects.rs` 的导出分支认词，
+ * 所以它是闭集：多一个词＝服务端落到兜底、导出一份不是那个视图的表，而屏幕上看
+ * 不出这份 CSV 与别的那份有什么不同。声明只有这一处，页面与导出按钮都从这里取。
+ */
+export type ProjectView = 'wbs' | 'board' | 'gantt' | 'evm';
+
+/**
  * 四个视图的 CSV 导出。
  *
  * 先取字节再交给浏览器另存：`<a href>` 那条路不带 Authorization，导出的会是
@@ -1410,7 +1419,7 @@ export async function getProjectAudit(
  */
 export async function downloadProjectCsv(
   projectId: string,
-  view: 'wbs' | 'board' | 'gantt' | 'evm'
+  view: ProjectView
 ): Promise<void> {
   const blob = await api.getBytes(
     `/api/v1/projects/${encodeURIComponent(projectId)}/export.csv?view=${view}`

@@ -10,6 +10,7 @@ import {
   type GanttRow,
   type OverrunRow,
   type ProjectRow,
+  type ProjectView,
   type ReadingSource,
   type TaskRow,
 } from '@/api/client';
@@ -61,7 +62,7 @@ import {
  * 没有第二个任务清单。这里的每个数都是任务图的一个投影，现读现算——另存一份
  * 派生值，两份迟早不一致，而读面上分不出哪一份是错的。
  */
-type Mode = 'wbs' | 'board' | 'gantt' | 'evm' | 'audit';
+type Mode = ProjectView | 'audit';
 
 // 四个按钮各带原本的英文名。中文名是意译，靠它认不出这是行业里那张图；英文名是
 // 通用叫法，靠它认不出这页在说什么。两个一起写，读者才不用先在脑子里做一次翻译。
@@ -216,7 +217,7 @@ export function ProjectsView() {
           {current && mode !== 'audit' && (
             <ExportCsvButton
               projectId={current.id}
-              view={mode as 'wbs' | 'board' | 'gantt' | 'evm'}
+              view={mode}
             />
           )}
           <NewProjectForm onCreated={projects.refresh} />

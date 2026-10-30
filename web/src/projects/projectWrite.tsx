@@ -10,6 +10,7 @@ import {
   type BoardCard,
   type BoardColumnId,
   type ProjectRow,
+  type ProjectView,
 } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
@@ -518,7 +519,7 @@ export function ExportCsvButton({
   view,
 }: {
   projectId: string;
-  view: 'wbs' | 'board' | 'gantt' | 'evm';
+  view: ProjectView;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
