@@ -15373,6 +15373,37 @@ exec {real} "$@"
         );
     }
 
+    /// 一轮的红不是一维的：一条已经判红、另一条还在跑，判词必须两件都说。
+    ///
+    /// 2026-10-30 实测：`04e2498a` 那一轮被扣住时判词只写了 `github:Code Coverage`，
+    /// 而同一个 rev 的 `Test` 在两分钟后也判红。按那句判词去还债的人把 Coverage 弄绿
+    /// 就以为这一轮过了，而这一轮欠的是两格——数漏一格，还的就不是同一笔账。
+    #[test]
+    fn a_red_hold_names_the_checks_that_have_not_answered_as_well() {
+        use crate::mainline_rollout::ci_red_hold_reason;
+        let failed = vec!["github:Code Coverage".to_string()];
+        let reason = ci_red_hold_reason("04e2498a", &failed, &["github".to_string()], &[]);
+        assert!(
+            reason.contains("github:Code Coverage"),
+            "判词没点红的那一格：{reason}"
+        );
+        assert!(
+            reason.contains("still running on github"),
+            "判词把还在跑的那一条丢了，读的人会以为补上红的那格就够：{reason}"
+        );
+        let settled = ci_red_hold_reason("04e2498a", &failed, &[], &[]);
+        assert!(
+            !settled.contains("not answered yet"),
+            "每一格都答了却还印着欠账，下一次读的人就不信这一句：{settled}"
+        );
+        let unnamed = ci_red_hold_reason("abc123", &[], &[], &["gitee:connect_failed".to_string()]);
+        assert!(
+            unnamed.contains("no check runs named the failure")
+                && unnamed.contains("could not be asked (gitee:connect_failed)"),
+            "兜底没名字的那种现场与连不上的那条要各自留在判词里：{unnamed}"
+        );
+    }
+
     /// 「一次都没问到」不是「问了、没问题」。这一条就是 2026-10-27 那次带红上线的
     /// 判据：安全网关正被同一个滚动换副本，两个平台的 CI 接口都连不上，而判据把
     /// 「问不到」与「绿」并成同一句 `None`，于是那个 rev 滚上去了。

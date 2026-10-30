@@ -115,6 +115,42 @@ pub(crate) fn wait_exhausted_reason(waited: Duration, why: &str) -> String {
     )
 }
 
+/// 上游判红时，这一轮的判词。
+///
+/// 「红」与「还没答」可以同时在场：一条检查已经失败、另一条还在跑。只点名红的那几格，
+/// 读的人会以为把那一格弄绿这一轮就过了，而真正要还的账不止它——还没答的那几条要么
+/// 等它出判词，要么下一秒也变成红。判词是唯一会被下一轮读到的东西（这一轮的日志不会
+/// 被任何消费者读），所以欠着的那几条也必须写进同一句里。
+///
+/// `failed` 为空是另一种现场：判词来自提交状态兜底，那个上游只是不逐条给名字，不是
+/// 没有失败项。
+pub(crate) fn ci_red_hold_reason(
+    rev: &str,
+    failed: &[String],
+    still_running: &[String],
+    not_asked: &[String],
+) -> String {
+    let mut reason = if failed.is_empty() {
+        format!("upstream CI reports a failure for {rev} (no check runs named the failure)")
+    } else {
+        format!(
+            "upstream CI reports a failure for {rev}: {}",
+            failed.join(",")
+        )
+    };
+    let mut owed: Vec<String> = Vec::new();
+    if !still_running.is_empty() {
+        owed.push(format!("still running on {}", still_running.join(",")));
+    }
+    if !not_asked.is_empty() {
+        owed.push(format!("could not be asked ({})", not_asked.join(",")));
+    }
+    if !owed.is_empty() {
+        reason.push_str(&format!("; not answered yet: {}", owed.join("; ")));
+    }
+    reason
+}
+
 /// 「还在跑」这一答到手之后，这一轮还该不该再问一次。
 ///
 /// 判红的版本等人改代码，没问到的版本等路通，只有「还在跑」是自己会走完的：它说的
@@ -4699,20 +4735,7 @@ impl RolloutExecutor {
             }
         }
         if failures > 0 {
-            let reason = if failed.is_empty() {
-                // 结论来自提交状态兜底时没有可命名的检查——那是"这个平台不逐条给名字"，
-                // 不是"没有失败项"。
-                format!(
-                    "upstream CI reports a failure for {} (no check runs named the failure)",
-                    ask.rev
-                )
-            } else {
-                format!(
-                    "upstream CI reports a failure for {}: {}",
-                    ask.rev,
-                    failed.join(",")
-                )
-            };
+            let reason = ci_red_hold_reason(&ask.rev, &failed, &still_running, &not_asked);
             return Some((CiHoldKind::Red, reason));
         }
         if still_running.is_empty() && not_asked.is_empty() {
