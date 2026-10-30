@@ -3514,11 +3514,16 @@ impl MainlineDeployer {
     /// 拉不到镜像。**它不是旧 tag，是有人正在跑的那一版**。
     ///
     /// 不读 Job：历史滚动 Job 会把它派发过的每个 rev 永久钉住，等于把回收废掉；
-    /// 正在跑的那个 Job 用的 tag 就是当轮的 bare，本来就在保留集里。
+    /// 正在跑的那个 Job 用的 tag 就是当轮的 bare，本来就在保留集里。这一条挂在
+    /// [`WorkloadKind::holds_finished_instances`] 上，不是把手写的 kind 名从这里
+    /// 绕开——表里加一种会留下历史实例的负载，这一行就自动跟着它。
     async fn live_referenced_revs(&self) -> SFResult<Vec<String>> {
         let repo = format!("{}/{}", self.pull_endpoint(), IMAGE_REPOSITORY);
         let mut revs: Vec<String> = Vec::new();
-        for entry in &WORKLOAD_KINDS {
+        for entry in WORKLOAD_KINDS
+            .iter()
+            .filter(|e| !e.holds_finished_instances)
+        {
             let spec = format!(".{}", entry.pod_template);
             let jsonpath = format!(
                 "jsonpath={{range .items[*]}}{{range {spec}.containers[*]}}{{.image}}{{\" \"}}{{end}}{{range {spec}.initContainers[*]}}{{.image}}{{\" \"}}{{end}}{{end}}"
@@ -9299,10 +9304,10 @@ pub fn classify_doc(kind: &str) -> DocFate {
 ///
 /// The workload kinds are answered from [`WORKLOAD_KINDS`], where their group
 /// and plural are written down with the rest of what this crate knows about
-/// them. `Job` is the one row only this table holds: it is delivered like any
-/// other workload, but no live reading through [`WORKLOAD_KINDS`] addresses it,
-/// because the rollout's own historical Jobs pin every revision they ever
-/// dispatched and reading them would defeat revision collection.
+/// them. `Job` is delivered like any other workload, so it has a row there; the
+/// rollout's own historical Jobs pin every revision they ever dispatched, so
+/// the image reading skips the kinds whose finished instances stay behind
+/// (`holds_finished_instances`).
 pub fn api_resource_of(kind: &str) -> Option<(&'static str, &'static str)> {
     if let Some(entry) = workload_kind(kind) {
         return Some((entry.rbac_group, entry.rbac_resource));
@@ -9311,7 +9316,6 @@ pub fn api_resource_of(kind: &str) -> Option<(&'static str, &'static str)> {
         "ConfigMap" => ("", "configmaps"),
         "Service" => ("", "services"),
         "ServiceAccount" => ("", "serviceaccounts"),
-        "Job" => ("batch", "jobs"),
         "ResourceQuota" => ("", "resourcequotas"),
         "LimitRange" => ("", "limitranges"),
         "NetworkPolicy" => ("networking.k8s.io", "networkpolicies"),
@@ -9612,9 +9616,16 @@ pub struct WorkloadKind {
     /// created per run -- a CronJob's -- reads the new content the next time it
     /// runs, and stamping it would replace nothing.
     pub long_lived_pods: bool,
+    /// Every instance of this kind that ever ran stays in the cluster after it
+    /// finishes, so a reading that walks all instances reads each revision they
+    /// ever ran on. The rollout dispatches a Job per attempt, so enumerating
+    /// them would pin every tag the rollout has ever produced -- the one
+    /// workload kind where the finished object is history rather than a
+    /// consumer.
+    pub holds_finished_instances: bool,
 }
 
-pub const WORKLOAD_KINDS: [WorkloadKind; 4] = [
+pub const WORKLOAD_KINDS: [WorkloadKind; 5] = [
     WorkloadKind {
         kind: "Deployment",
         resource: "deployment",
@@ -9622,6 +9633,7 @@ pub const WORKLOAD_KINDS: [WorkloadKind; 4] = [
         rbac_resource: "deployments",
         pod_template: "spec.template.spec",
         long_lived_pods: true,
+        holds_finished_instances: false,
     },
     WorkloadKind {
         kind: "StatefulSet",
@@ -9630,6 +9642,7 @@ pub const WORKLOAD_KINDS: [WorkloadKind; 4] = [
         rbac_resource: "statefulsets",
         pod_template: "spec.template.spec",
         long_lived_pods: true,
+        holds_finished_instances: false,
     },
     WorkloadKind {
         kind: "DaemonSet",
@@ -9638,6 +9651,7 @@ pub const WORKLOAD_KINDS: [WorkloadKind; 4] = [
         rbac_resource: "daemonsets",
         pod_template: "spec.template.spec",
         long_lived_pods: true,
+        holds_finished_instances: false,
     },
     WorkloadKind {
         kind: "CronJob",
@@ -9646,6 +9660,16 @@ pub const WORKLOAD_KINDS: [WorkloadKind; 4] = [
         rbac_resource: "cronjobs",
         pod_template: "spec.jobTemplate.spec.template.spec",
         long_lived_pods: false,
+        holds_finished_instances: false,
+    },
+    WorkloadKind {
+        kind: "Job",
+        resource: "job",
+        rbac_group: "batch",
+        rbac_resource: "jobs",
+        pod_template: "spec.template.spec",
+        long_lived_pods: false,
+        holds_finished_instances: true,
     },
 ];
 
@@ -25242,6 +25266,61 @@ exit 0
             );
         }
         assert!(rolled > 0, "no kind is rolled, so this compares nothing");
+    }
+
+    /// Every kind the table holds is read by the image reading -- except the
+    /// ones whose finished instances stay behind.
+    ///
+    /// A Job dispatched by an earlier rollout attempt keeps its pod template in
+    /// the cluster after the pod exits, so enumerating Jobs would read every
+    /// revision the rollout has ever produced and the tag collection would hold
+    /// them all: the reading that exists to keep live images alive would turn
+    /// into the reason nothing is ever freed. The skip is read off the table
+    /// (`holds_finished_instances`), not a kind name written here, so a second
+    /// kind with the same property follows the row rather than this test.
+    #[tokio::test]
+    async fn the_image_reading_skips_kinds_whose_finished_instances_stay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let log = dir.join("kubectl.log");
+        let kubectl = fake_kubectl(&dir, "localhost:30500/cogneva:main-aaaaaaaaaaaa");
+        let bare = dir.join("bare.git");
+        let buildah = dir.join("buildah").to_string_lossy().to_string();
+        let cfg = test_config(&dir, &bare, &buildah, &kubectl);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(&dir, &bare));
+
+        // The fake answers a `get job` with a failure, so a regression here
+        // fails loudly even before the call log is read.
+        deployer
+            .live_referenced_revs()
+            .await
+            .expect("the image reading runs against the fake");
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let mut read = 0;
+        for entry in &WORKLOAD_KINDS {
+            let get = format!("get {} -o jsonpath=", entry.resource);
+            let seen = calls.contains(&get);
+            if entry.holds_finished_instances {
+                assert!(
+                    !seen,
+                    "{} keeps every instance it ever ran, so reading it pins every revision \
+                     the rollout dispatched and the collection never frees a tag: {calls}",
+                    entry.kind
+                );
+            } else {
+                assert!(
+                    seen,
+                    "{} may be serving an image on its own, and the reading skipped it: {calls}",
+                    entry.kind
+                );
+                read += 1;
+            }
+        }
+        assert!(
+            read > 1,
+            "{read} kinds were read, so this walk would pass against a single hardcoded path"
+        );
     }
 
     /// The read face covers every kind the table holds, and reads each one at

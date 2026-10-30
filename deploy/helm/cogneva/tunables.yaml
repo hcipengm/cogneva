@@ -532,6 +532,24 @@ rows:
     why: >-
       See the backup job's bound: a practice, not a reading.
 
+  - key: dbRoleBootstrap.resources.requests.cpu
+    source: override
+    why: >-
+      The role bootstrap runs once and then exits; the request only has to let a
+      tight node schedule it, and nothing measures the run back into this claim.
+
+  - key: dbRoleBootstrap.resources.requests.memory
+    source: override
+    why: >-
+      See requests.cpu above: the job holds a psql session and a loop over object
+      names, so its resident set is small by construction.
+
+  - key: dbRoleBootstrap.resources.limits.memory
+    source: override
+    why: >-
+      A ceiling for the ownership loop on a large schema; the loop's length is
+      what varies, not its footprint, so no reading feeds back into this bound.
+
   - key: buildah.resources.requests.cpu
     source: override
     why: >-

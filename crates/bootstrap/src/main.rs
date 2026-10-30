@@ -2450,11 +2450,12 @@ const KUBERNETES_OWN_OBJECTS: [&str; 2] = ["serviceaccount/default", "configmap/
 /// 一次永远命不中的 kubectl，所以改成按种类整片读（见 `existing_cogneva_objects`），
 /// 与发布树的对齐由 `install_trace_tests` 钉住。`secret` 不在发布树里（内部密钥由
 /// init-secrets.sh 安装时生成），但它恰恰是"装到一半"最常见的痕迹，必须在。
-const TRACE_KINDS: [&str; 15] = [
+const TRACE_KINDS: [&str; 16] = [
     "deployment",
     "daemonset",
     "statefulset",
     "cronjob",
+    "job",
     "configmap",
     "secret",
     "serviceaccount",
@@ -4438,6 +4439,92 @@ mod install_trace_tests {
                 "痕迹探测面探 {noun}，发布树里却没有任何清单交付它（安装时才生成的种类要显式登记）"
             );
         }
+    }
+
+    /// 钩子跑完就被清掉的对象，痕迹探测面再也看不见它。
+    ///
+    /// 发布树里有一种对象只在安装期跑一次（`db-role-bootstrap` 的 Job），它进了
+    /// `TRACE_KINDS` 之后，「一个装好的集群还有没有 cogneva 的痕迹」就取决于这条钩子
+    /// 收工时**不被删**。`hook-delete-policy: hook-succeeded` 是更常见的写法，也常被
+    /// 当成「装完顺手清干净」——改成它的那一天，提示符会在每一个装好的集群上说「没有
+    /// 痕迹」，投递判断整条反过来，而发布树、CI 与现网读数都不会红。
+    ///
+    /// 判的是预渲染产物：那是 apply 路径真正交给集群的字节。按**种类**认而不是按对象
+    /// 名认，下一个只在安装期跑一次的钩子对象同样受这条约束；一条都没走到时也判红，
+    /// 否则这条判据会随对象改名安静地变成空转。
+    #[test]
+    fn a_hook_the_trace_probe_covers_survives_its_own_success() {
+        let rendered = repo_file("deploy/rendered");
+        let mut judged = 0;
+        let mut deleted = Vec::new();
+        let mut profiles: Vec<std::path::PathBuf> = std::fs::read_dir(&rendered)
+            .unwrap_or_else(|e| panic!("读不到 {}: {e}", rendered.display()))
+            .map(|entry| entry.expect("rendered 下的目录项").path())
+            .filter(|path| path.is_dir())
+            .collect();
+        profiles.sort();
+        assert!(
+            !profiles.is_empty(),
+            "{} 下一个 profile 都没有",
+            rendered.display()
+        );
+        for dir in profiles {
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+                .unwrap_or_else(|e| panic!("读不到 {}: {e}", dir.display()))
+                .map(|entry| entry.expect("rendered 下的文件项").path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "yaml"))
+                .collect();
+            files.sort();
+            for path in files {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("读不到 {}: {e}", path.display()));
+                for document in serde_yaml::Deserializer::from_str(&text) {
+                    let doc = serde_yaml::Value::deserialize(document)
+                        .unwrap_or_else(|e| panic!("{} 的文档不可解析: {e}", path.display()));
+                    let Some(kind) = doc.get("kind").and_then(|k| k.as_str()) else {
+                        continue;
+                    };
+                    let noun = kind.to_ascii_lowercase();
+                    if !TRACE_KINDS.contains(&noun.as_str()) {
+                        continue;
+                    }
+                    let metadata = doc.get("metadata");
+                    let Some(annotations) = metadata
+                        .and_then(|m| m.get("annotations"))
+                        .and_then(|a| a.as_mapping())
+                    else {
+                        continue;
+                    };
+                    if !annotations.contains_key(serde_yaml::Value::from("helm.sh/hook")) {
+                        continue;
+                    }
+                    judged += 1;
+                    let policy = annotations
+                        .get(serde_yaml::Value::from("helm.sh/hook-delete-policy"))
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    if policy
+                        .split(',')
+                        .any(|word| word.trim() == "hook-succeeded")
+                    {
+                        let name = metadata
+                            .and_then(|m| m.get("name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("<unnamed>");
+                        deleted.push(format!("{}: {kind}/{name} = {policy}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            judged > 0,
+            "发布树里一个被探测面覆盖的钩子对象都没读到，这条判据在空转"
+        );
+        assert!(
+            deleted.is_empty(),
+            "这些钩子对象在成功之后被删掉，而痕迹探测面靠它们判断命名空间里有没有 cogneva：\
+             装好的集群会被读成绿地，投递走到 helm install 去撞已有资源：{deleted:#?}"
+        );
     }
 
     /// 读数里只有 Kubernetes 自建的那两样时必须报"没有痕迹"：报错了，绿地安装会

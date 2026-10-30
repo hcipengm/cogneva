@@ -64,6 +64,13 @@ pub const SECRET_OOB: &str = "cogneva-secrets-oob";
 /// the name is one the code has to know rather than one it merely observes.
 pub const QUOTA: &str = "cogneva-quota";
 
+/// The ConfigMap carrying the database-role bootstrap script, mounted by the
+/// Job of the same name. Nothing in this crate addresses it by name -- the
+/// chart mounts it and the Job runs it -- but a product-named object the
+/// manifests create has to be declared, or the next reader that needs to find
+/// it writes the string a second time and the two copies drift.
+pub const DB_ROLE_BOOTSTRAP_CONFIGMAP: &str = "cogneva-db-role-bootstrap";
+
 /// The namespace the chart declares (`global.namespace`). In-cluster code
 /// cannot read the chart, so this is the compiled-in copy; the installer reads
 /// the real value and hands it to every command it runs.

@@ -52,6 +52,7 @@ fn declared() -> Vec<(&'static str, &'static str)> {
         ("ConfigMap", cog_core::topology::PROMPTS_CONFIGMAP),
         ("ConfigMap", cog_core::topology::EVOLUTION_CONFIG_CONFIGMAP),
         ("ConfigMap", cog_core::topology::ENV_CONFIGMAP),
+        ("ConfigMap", cog_core::topology::DB_ROLE_BOOTSTRAP_CONFIGMAP),
         ("Secret", cog_core::topology::SECRET_INTERNAL),
         ("Secret", cog_core::topology::SECRET_OOB),
         ("ResourceQuota", cog_core::topology::QUOTA),

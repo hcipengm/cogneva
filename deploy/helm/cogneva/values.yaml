@@ -229,6 +229,18 @@ backup:
   # 空 = 跟随集群默认 SC（与 pg/redis/qdrant 同策略，不绑厂商）。
   storageClass: ""
 
+dbRoleBootstrap:
+  # 建库角色那一步的资源界。它是个装完就跑完的 Job：建角色、逐对象改属主，
+  # 常驻内存极小，最长的那一段是所有权循环。界写在这里而不是模板里，理由与
+  # 备份的两个 Job 相同：登记表只枚举本文件的数值叶子，写在模板里的界没有任何
+  # 读数看得见它。
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+
 image:
   # 工作负载统一从集群内 registry 的 NodePort 拉取（每个节点的 kubelet 经
   # localhost:<nodePort> 访问，containerd 对 localhost 默认 http 免 TLS）。
