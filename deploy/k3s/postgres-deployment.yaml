@@ -112,8 +112,10 @@ spec:
           # 而这里一旦写上 args，写错一个名字就不再是「少一条读数」：边车启动即
           # "unknown long flag" 退出，Pod 因此永不 Ready，库与边车同 Pod —— 数据库
           # 还活着，Service 却没了端点，所有客户端读到的都是「数据库不见了」。
-          # 要加旗标，先按镜像的 `--help` 核名，并让 `reading_series_have_a_producer`
-          # 那条门记录下你量到的镜像（`deploy/images/postgres-exporter.series.yaml`）。
+          # 要加旗标，先跑 `deploy/scripts/measure-postgres-exporter-surface.sh` 按镜像的
+          # `--help` 核名——它同时把量到的名单与镜像写回
+          # `deploy/images/postgres-exporter.series.yaml`，`reading_series_have_a_producer`
+          # 那条门判的就是那份名单。
           readinessProbe:
             httpGet:
               path: /metrics
