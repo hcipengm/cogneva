@@ -116,7 +116,6 @@ const ENV_PACK_CPU_LIMIT: &str = "COGNEVA_EVAL_TOOLATHLON_CPU_LIMIT";
 const ENV_PACK_MEMORY_LIMIT: &str = "COGNEVA_EVAL_TOOLATHLON_MEMORY_LIMIT";
 /// 运行时的开关：设成 `off` 就是这一次不接。
 const ENV_RUNTIME: &str = "COGNEVA_EVAL_TOOLATHLON_RUNTIME";
-const DEFAULT_NAMESPACE: &str = "cogneva";
 
 /// 单次 Pod 命令的时间上界（秒）。默认比 swe-bench-pro 那一侧宽：一道题要起库、导入
 /// `init.sql.gz`、跑前处理、再跑判分，其中导入那一步本身就按分钟计。这是一个**安全上界**
@@ -180,7 +179,11 @@ impl PodRuntime {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_NAMESPACE.to_string());
+            // 命名空间是部署声明的：进程读不到 chart，所以编译期那一份副本只在
+            // `cog_core::topology` 里有一处，这里读它而不是再抄一个名字——抄的那个
+            // 在 `--set global.namespace` 之后仍然去建旧名字的命名空间，而错法读起来
+            // 像「评估环境起不来」。
+            .unwrap_or_else(|| cog_core::topology::DEFAULT_NAMESPACE.to_string());
 
         let candidates: Vec<Vec<String>> = match std::env::var(ENV_KUBECTL) {
             Ok(raw) if !raw.trim().is_empty() => {

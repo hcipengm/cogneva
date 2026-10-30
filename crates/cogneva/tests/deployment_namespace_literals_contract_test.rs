@@ -117,8 +117,40 @@ fn census() -> Vec<Hit> {
                 around: flat[start..end].to_string(),
             });
         }
+        for around in bindings(&flat, &namespace) {
+            hits.push(Hit {
+                file: rel.clone(),
+                shape: "namespace-named binding".to_string(),
+                around,
+            });
+        }
     }
     hits
+}
+
+/// `<something naming a namespace> = "<declared>"` is the same declaration with
+/// a binding on it, and the literal shapes above never see it: they look for the
+/// name where a namespace argument is *written*, while a
+/// `const DEFAULT_NAMESPACE: &str = "<name>";` writes it once and then passes a
+/// variable everywhere. That is exactly how one file carried a second
+/// declaration through every previous pass of this gate.
+///
+/// The binding is whatever the statement wrote before the `=` -- back to the
+/// previous `;`, `{` or `}` -- and it has to name a namespace, so the release
+/// name, an image reference and a plain `"<name>".into()` stay innocent.
+fn bindings(flat: &str, namespace: &str) -> Vec<String> {
+    let assignment = format!("=\"{namespace}\"");
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = flat[from..].find(&assignment) {
+        let at = from + offset;
+        let start = flat[..at].rfind([';', '{', '}']).map_or(0, |i| i + 1);
+        if flat[start..at].to_ascii_lowercase().contains("namespace") {
+            found.push(flat[start..(at + assignment.len()).min(flat.len())].to_string());
+        }
+        from = at + assignment.len();
+    }
+    found
 }
 
 #[test]
@@ -152,6 +184,16 @@ fn the_scanner_recognises_the_shapes_and_only_those() {
     // A resource id handed to `kubectl patch`.
     let id = flat(&format!("vec![\"namespace/{namespace}\".to_string()]"));
     assert!(wanted.iter().any(|s| id.contains(s.as_str())), "{id}");
+    // The name bound to a namespace-named item: one write, a variable
+    // everywhere after it, and invisible to every shape above.
+    let bound = flat(&format!("constDEFAULT_NAMESPACE:&str=\"{namespace}\";"));
+    assert!(!bindings(&bound, &namespace).is_empty(), "{bound}");
+    // The same literal with no namespace-named binding is the release name, the
+    // workload name or an image tag, and none of them is a declaration.
+    let loose = flat(&format!(
+        "letimage=format!(\"localhost:30500/{namespace}:local\");"
+    ));
+    assert!(bindings(&loose, &namespace).is_empty(), "{loose}");
     // Not shapes: the release name, the workload name, an image reference, and
     // the same name carried in a variable.
     for innocent in [
