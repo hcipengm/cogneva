@@ -10415,10 +10415,11 @@ mod tests {
         terminating_pods, unresolved_configmaps, unschedulable_pods, write_termination_message,
         CiHoldKind, ClusterConfigSources, HostRunQueue, HostSoakWindow, ProbeCycle, RefSnapshots,
         ReplicaSetFailure, RewrittenRef, RolloutExecutor, RolloutPlan, SupportCause,
-        SupportWorkload, UpstreamCiAsk, UpstreamCiTarget, ADMISSION_DENIED_MARKER,
-        CI_PENDING_WAIT_SECS, FIELD_REMOVAL_NOT_TAKEN_MARKER, HOST_LOADED_MARKER,
-        IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG, NEW_REVISION_NEVER_RAN_MARKER,
-        PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN, SUPPORT_CAUSE_POD_LIMIT,
+        SupportWorkload, TemplateSnapshot, UpstreamCiAsk, UpstreamCiTarget,
+        ADMISSION_DENIED_MARKER, CI_PENDING_WAIT_SECS, FIELD_REMOVAL_NOT_TAKEN_MARKER,
+        HOST_LOADED_MARKER, IMAGE_PULL_WAITING_REASONS, K3S_KUBECONFIG,
+        NEW_REVISION_NEVER_RAN_MARKER, PLACEMENT_BLOCKED_MARKER, SERVICE_ACCOUNT_TOKEN,
+        SUPPORT_CAUSE_POD_LIMIT,
     };
 
     /// 用例里的宿主读数：两种，都是实测到的那一刻。
@@ -19825,6 +19826,7 @@ exit 0
                 &done,
                 &prevs,
                 &refs,
+                &[],
             )
             .await;
 
@@ -19913,6 +19915,7 @@ exit 0
                 &done,
                 &prevs,
                 &refs,
+                &[],
             )
             .await;
 
@@ -19993,6 +19996,7 @@ exit 0
                 &done,
                 &prevs,
                 &refs,
+                &[],
             )
             .await;
 
@@ -20008,6 +20012,187 @@ exit 0
         assert!(
             verdict.not_landed_note().is_none(),
             "a landed rollback leaves the caller's error text alone"
+        );
+    }
+
+    /// 镜像还回去了、Pod 却起不来时，回滚要把整个 Pod 模板也换回去。
+    ///
+    /// 2026-10-30 的现场：新清单要求 `cogneva-secrets` 里的 `app-password`，实例上
+    /// 没有这个键，Pod 停在 `CreateContainerConfigError`；`set image` 把镜像换回了
+    /// 旧版，模板里那条 `secretKeyRef` 还在，旧镜像配新模板照样起不来，网关 0/1 挂了
+    /// 几分钟，最后是人做 `rollout undo` 才恢复。这个用例让假集群只在模板被换回去
+    /// 之后才把 Pod 报成就绪：没有这一手，判词会停在"落地了但没收敛"。
+    #[tokio::test]
+    async fn a_rollback_that_lands_but_does_not_come_back_puts_the_template_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let patched = bin_dir.join("patched.marker");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"patch deployment cogneva-evolution --type=merge"*)
+    touch '{patched}'
+    echo "deployment.apps/cogneva-evolution patched" ;;
+  *observedGeneration*)
+    echo "2|2|1|1|1|0|" ;;
+  *"get pods -l "*)
+    if [ -f '{patched}' ]; then
+      echo "cogneva-evolution-abc-1|Running|true|||2026-10-30T15:00:00Z||"
+    else
+      echo "cogneva-evolution-abc-1|Pending|false|CreateContainerConfigError|couldn't find key app-password in Secret cogneva/cogneva-secrets|||"
+    fi ;;
+  *initContainers*)
+    echo "cogneva=localhost:30500/cogneva:main-old" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            patched = patched.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            0,
+            0,
+        );
+        let target = RolloutTarget {
+            deployment: "cogneva-evolution".into(),
+            container: "cogneva".into(),
+            component: "evolution".into(),
+            name: "cogneva".into(),
+        };
+        let templates = vec![TemplateSnapshot {
+            resource: "deployment".into(),
+            name: "cogneva-evolution".into(),
+            spec: serde_json::json!({
+                "containers": [{"name": "cogneva", "image": "localhost:30500/cogneva:main-old"}]
+            }),
+        }];
+
+        let verdict = executor
+            .rollback(
+                &SFError::Agent("rollout did not complete".into()),
+                &[&target],
+                &[(
+                    "cogneva-evolution".to_string(),
+                    "localhost:30500/cogneva:main-old".to_string(),
+                )],
+                &RefSnapshots::default(),
+                &templates,
+            )
+            .await;
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains(
+                r#"patch deployment cogneva-evolution --type=merge -p {"spec":{"template":{"spec":{"containers":[{"image":"localhost:30500/cogneva:main-old","name":"cogneva"}]}}}}"#
+            ),
+            "the whole pod template goes back, not just the image: {calls}"
+        );
+        assert_eq!(
+            verdict.restored_by_template,
+            vec!["cogneva-evolution".to_string()],
+            "and the workload is recorded as back on the template of the revision it replaced: {verdict:?}"
+        );
+        assert!(
+            verdict.not_converged.is_empty(),
+            "a workload that came back on the old template is not one that stayed down: {verdict:?}"
+        );
+        assert!(
+            verdict.not_converged_note().is_none(),
+            "nothing to tell the caller when everything is back"
+        );
+    }
+
+    /// 模板也换不回去时，判词必须说「落地了但没起来」，而不是把回滚读成成功。
+    ///
+    /// 这一条是上一个用例的反方向：`patch` 命令失败，两次等待都不收敛，结论回到
+    /// `not_converged`，并且这句话要能走进调用方的错误里——只留一行 WARN 的话，
+    /// 读的人以为自己在旧版本上，而集群里跑着的是那个起不来的版本。
+    #[tokio::test]
+    async fn a_rollback_that_neither_lands_nor_comes_back_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"patch deployment cogneva-evolution"*)
+    echo 'Error from server (Forbidden): deployments.apps "cogneva-evolution" is forbidden' >&2
+    exit 1 ;;
+  *observedGeneration*)
+    echo "2|2|1|1|1|0|" ;;
+  *"get pods -l "*)
+    echo "cogneva-evolution-abc-1|Pending|false|CreateContainerConfigError|couldn't find key app-password in Secret cogneva/cogneva-secrets|||" ;;
+  *initContainers*)
+    echo "cogneva=localhost:30500/cogneva:main-old" ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            0,
+            0,
+        );
+        let target = RolloutTarget {
+            deployment: "cogneva-evolution".into(),
+            container: "cogneva".into(),
+            component: "evolution".into(),
+            name: "cogneva".into(),
+        };
+        let templates = vec![TemplateSnapshot {
+            resource: "deployment".into(),
+            name: "cogneva-evolution".into(),
+            spec: serde_json::json!({"containers": [{"name": "cogneva"}]}),
+        }];
+
+        let verdict = executor
+            .rollback(
+                &SFError::Agent("rollout did not complete".into()),
+                &[&target],
+                &[(
+                    "cogneva-evolution".to_string(),
+                    "localhost:30500/cogneva:main-old".to_string(),
+                )],
+                &RefSnapshots::default(),
+                &templates,
+            )
+            .await;
+
+        assert!(
+            verdict.restored_by_template.is_empty(),
+            "nothing came back: {verdict:?}"
+        );
+        assert_eq!(
+            verdict.not_converged,
+            vec!["cogneva-evolution".to_string()],
+            "the workload is recorded as landed but not back on its feet: {verdict:?}"
+        );
+        let note = verdict
+            .not_converged_note()
+            .expect("a workload that stayed down must reach the caller's error");
+        assert!(
+            note.starts_with("rollback landed but the workloads did not come back:")
+                && note.contains("cogneva-evolution"),
+            "the note names the workload the cluster is still not serving: {note}"
+        );
+        assert!(
+            verdict.not_landed_note().is_none(),
+            "the images did land; saying otherwise would send someone after a failure that is not there"
         );
     }
 

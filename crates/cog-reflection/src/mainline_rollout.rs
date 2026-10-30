@@ -1707,6 +1707,22 @@ pub(crate) struct RefSnapshots {
     pub(crate) targets: Vec<RewrittenRef>,
 }
 
+/// 一次 apply 之前某个工作负载的 Pod 模板（`.spec.template.spec` 的原样），回滚
+/// 在「镜像换回去了、Pod 还是起不来」时用它把整个模板换回去。
+///
+/// 只有一个镜像是不够的：apply 换的是整份清单，新版本可以把 env、卷、`secretKeyRef`
+/// 一起改掉，而 `kubectl set image` 一个都换不回来。2026-10-30 实测：新清单要求
+/// `app-password` 这个 Secret 键，实例上没有，Pod 停在 `CreateContainerConfigError`；
+/// 回滚把镜像换回旧版，模板里那条引用还在，旧镜像配新模板同样起不来，网关 0/1
+/// 挂了几分钟，最后是人对 `deployment` 做 `rollout undo` 才恢复。
+pub(crate) struct TemplateSnapshot {
+    pub(crate) resource: String,
+    pub(crate) name: String,
+    /// `spec.template.spec` 的 JSON 原文：合并补丁把这一整块换回去，不在 Rust 里
+    /// 重新拼字段——拼出来的那一份与集群里那一份差一个字段，就是另一个模板。
+    pub(crate) spec: serde_json::Value,
+}
+
 /// 清单文档里每一个带 image 的容器引用。
 ///
 /// 解析失败是硬错误：这份文档马上就要被 apply 出去，读不出它的引用等于回滚没有
@@ -4607,6 +4623,88 @@ impl RolloutExecutor {
         failed
     }
 
+    /// 读一处工作负载**此刻**的 Pod 模板，作为 `set image` 之外的回滚目标。
+    ///
+    /// 读的是整个对象再取 `.spec.template.spec`，不用 `-o jsonpath={.spec.template.spec}`：
+    /// jsonpath 打出来的是一段 `map[...]` 文本，要另写一个解析器才能当 JSON 用，而那个
+    /// 解析器坏掉时会安静地少一个字段——少一个字段的模板就是另一个模板。
+    ///
+    /// 读不到、读回来不是 JSON、或者里面没有 Pod 模板，都是这一轮**一处也不许动**的理由
+    /// （与镜像快照同一条），而不是"跳过这一处"：少一处快照的那一轮，回滚会以为自己
+    /// 有模板可还。
+    pub(crate) async fn snapshot_pod_template(
+        &self,
+        resource: &str,
+        name: &str,
+    ) -> SFResult<TemplateSnapshot> {
+        let out = self
+            .run_kubectl(&["get", resource, name, "-o", "json"], 30)
+            .await?;
+        let doc: serde_json::Value = serde_json::from_str(&out).map_err(|e| {
+            SFError::IO(format!(
+                "reading the pod template of {resource}/{name}: the object did not come back as JSON: {e}"
+            ))
+        })?;
+        let spec = doc
+            .get("spec")
+            .and_then(|s| s.get("template"))
+            .and_then(|t| t.get("spec"))
+            .cloned()
+            .ok_or_else(|| {
+                SFError::Config(format!(
+                    "{resource}/{name} carries no spec.template.spec; there is no template to put back"
+                ))
+            })?;
+        Ok(TemplateSnapshot {
+            resource: resource.to_string(),
+            name: name.to_string(),
+            spec,
+        })
+    }
+
+    /// 把一处工作负载的 Pod 模板换回快照那一份。返回命令是否成功发出去（读回来对不对
+    /// 由调用方再问一遍，与 `set image` 那一路同一条规矩）。
+    ///
+    /// 合并补丁把 `spec.template.spec` 整块替换，这正是要的：这一版改掉的 env、卷、
+    /// `secretKeyRef` 与新镜像在同一个字段里，只还镜像等于把新清单的前半截留在现场。
+    pub(crate) async fn restore_pod_template(&self, snap: &TemplateSnapshot) -> bool {
+        let patch = serde_json::json!({
+            "spec": { "template": { "spec": snap.spec } }
+        })
+        .to_string();
+        let target = format!("{}/{}", snap.resource, snap.name);
+        match self
+            .run_kubectl(
+                &[
+                    "patch",
+                    &snap.resource,
+                    &snap.name,
+                    "--type=merge",
+                    "-p",
+                    &patch,
+                ],
+                60,
+            )
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    workload = %target,
+                    "mainline rollback: pod template put back to the one this rollout replaced"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    workload = %target,
+                    error = %e,
+                    "mainline rollback: could not put the pod template back; the workload stays on the manifest that would not start"
+                );
+                false
+            }
+        }
+    }
+
     /// 落地之前复问上游 CI：`Some((flavor, reason))` = 这一轮不能滚，`flavor` 说
     /// 是哪一种不能滚。
     ///
@@ -5063,6 +5161,9 @@ impl RolloutExecutor {
         // 快照失败则一次变更都不发生（线上原样）。
         let mut prevs: Vec<(String, String)> = Vec::new();
         let mut prev_shapes: Vec<(String, String)> = Vec::new();
+        // 整个 Pod 模板也快照一份：只还镜像时，新清单自己带的 env / `secretKeyRef`
+        // 会留在现场，旧镜像配新模板照样起不来（见 [`TemplateSnapshot`]）。
+        let mut templates: Vec<TemplateSnapshot> = Vec::new();
         for t in &plan.targets {
             let img = self
                 .current_image(t)
@@ -5077,6 +5178,21 @@ impl RolloutExecutor {
             info!(deployment = %t.deployment, prev = %img, "mainline rollout: snapshot prev image");
             prevs.push((t.deployment.clone(), img));
             prev_shapes.push((t.deployment.clone(), shape));
+            // 模板读不到不拦这一轮，只丢掉这一处的兜底：回滚的主路径是 `set image`，
+            // 模板是它落地了却没起来时的那一手。为一次 `get` 抖动扣住一次已经全绿的
+            // 上线，代价比"回滚少一种手段"大得多——而少掉的那一种当场有一行点名。
+            match self
+                .snapshot_pod_template("deployment", &t.deployment)
+                .await
+            {
+                Ok(template) => templates.push(template),
+                Err(e) => warn!(
+                    deployment = %t.deployment,
+                    error = %e,
+                    "mainline rollout: no pod template snapshot for this deployment; a rollback \
+                     that lands but does not converge will have only `set image` to try"
+                ),
+            }
             // 同一份目标清单里被这次 apply 改写的其它容器（init 容器、边车）也一起
             // 快照：`prevs` 只管那个命名主容器，而 apply 换的是整份文档。没有清单
             // 的那一轮走 set image 兜底，只动主容器，没有别的引用要还。
@@ -5147,6 +5263,7 @@ impl RolloutExecutor {
                             &done,
                             &prevs,
                             &refs,
+                            &templates,
                         )
                         .await;
                 }
@@ -5161,6 +5278,7 @@ impl RolloutExecutor {
                         &done,
                         &prevs,
                         &refs,
+                        &templates,
                     )
                     .await;
             }
@@ -5185,6 +5303,7 @@ impl RolloutExecutor {
                         &done,
                         &prevs,
                         &refs,
+                        &templates,
                     )
                     .await;
             }
@@ -5232,6 +5351,10 @@ impl RolloutExecutor {
     /// 不回滚的几支判成环境类，其余（含回滚过的那一支）判成版本类。类别与落点
     /// 随 [`RolloutFailure`] 带到 CLI，翻成进程退出码与终止消息交给部署器——
     /// 部署器据此决定这个 rev 还让不让再滚。
+    // 七份实参各自是这一步的一个来源（判词、滚过哪些、各自的旧镜像、被改写的引用、
+    // 各自的模板），打包成一个结构体只是把同样的七样东西换个地方数，不减少任何一处
+    // 需要它们的地方。
+    #[allow(clippy::too_many_arguments)]
     async fn fail_without_blind_rollback(
         &self,
         stage: &str,
@@ -5240,6 +5363,7 @@ impl RolloutExecutor {
         done: &[&RolloutTarget],
         prevs: &[(String, String)],
         refs: &RefSnapshots,
+        templates: &[TemplateSnapshot],
     ) -> Result<(), RolloutFailure> {
         let msg = e.to_string();
         let primary = primary_message(&msg);
@@ -5371,14 +5495,26 @@ impl RolloutExecutor {
                 e,
             ));
         }
-        let verdict = self.rollback(&e, done, prevs, refs).await;
-        // 回滚没落地这件事必须走进返回给调用方的错误里。回滚后各工作负载都 Ready
-        // 是两个版本共有的形状（Ready 只说明它收敛在**某个**镜像上），把它读成
-        // 「退回去了」是这一步最贵的误读：调用方会以为自己在旧版本上，而实际留在
-        // 失败版本上。判词来自回读到的镜像，不来自就绪。
-        let e = match verdict.not_landed_note() {
-            Some(note) => SFError::Agent(format!("{e}; {note}")),
-            None => e,
+        let verdict = self.rollback(&e, done, prevs, refs, templates).await;
+        // 回滚没落地、和回滚落地了却没收敛，是两件事，但都要走进返回给调用方的
+        // 错误里。回滚后各工作负载都 Ready 是两个版本共有的形状（Ready 只说明它
+        // 收敛在**某个**镜像上），把它读成「退回去了」是这一步最贵的误读：调用方
+        // 会以为自己在旧版本上，而实际留在失败版本上。判词来自回读到的镜像，不来自
+        // 就绪。
+        //
+        // 第二条是 2026-10-30 补的：镜像都还回去了，Pod 却停在
+        // `CreateContainerConfigError` 上（新清单要一个实例上没有的 Secret 键），
+        // 回滚只留了一行 WARN，错误里一个字都没有——读的人以为回滚成功了，而现场
+        // 是 0/1。落地与可用之间隔着这一条。
+        let e = match (verdict.not_landed_note(), verdict.not_converged_note()) {
+            (None, None) => e,
+            (a, b) => SFError::Agent(
+                [Some(e.to_string()), a, b]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            ),
         };
         // 授权被拒这一类在滚动中仍回滚并记版本类：改过的东西要退回去。落点写成
         // auth 而不是 observed，好让"因为读不到集群而回滚"与"版本真的没起来"在
@@ -5404,6 +5540,7 @@ impl RolloutExecutor {
         done: &[&RolloutTarget],
         prevs: &[(String, String)],
         refs: &RefSnapshots,
+        templates: &[TemplateSnapshot],
     ) -> RollbackVerdict {
         let mut verdict = RollbackVerdict::default();
         warn!(
@@ -5457,6 +5594,28 @@ impl RolloutExecutor {
             self.confirm_restored(&here, &mut verdict).await;
             if let Err(e) = self.wait_rollout_complete(t, &live_shape).await {
                 warn!(deployment = %t.deployment, error = %e, "rollback wait failed");
+                // 镜像还回去了却没起来：最常见的成因不是镜像，而是这一版清单自己
+                // ——新加的 env / `secretKeyRef` / 卷在模板里留着，旧镜像配新模板
+                // 起不来。`set image` 换不掉这些字段，只有把整个 Pod 模板换回去才
+                // 换得掉。还不动就算了，但账上要记成这一处没收敛，不是"回滚成功"。
+                if let Some(snap) = templates
+                    .iter()
+                    .find(|s| s.resource == "deployment" && s.name == t.deployment)
+                {
+                    if self.restore_pod_template(snap).await {
+                        match self.wait_rollout_complete(t, &live_shape).await {
+                            Ok(()) => {
+                                verdict.restored_by_template.push(t.deployment.clone());
+                                continue;
+                            }
+                            Err(again) => warn!(
+                                deployment = %t.deployment,
+                                error = %again,
+                                "rollback wait failed again after the pod template was put back"
+                            ),
+                        }
+                    }
+                }
                 verdict.not_converged.push(t.deployment.clone());
             }
         }
@@ -5558,6 +5717,9 @@ pub(crate) struct RollbackVerdict {
     pub not_landed: Vec<String>,
     /// 命令发出去了但读不回来，或读出来的形状认不出——不下结论。
     pub unconfirmed: Vec<String>,
+    /// 落地了但没收敛、把 Pod 模板换回去之后又起来的那些工作负载。它们**不是**停在
+    /// 旧镜像上的：模板连同镜像一起回到了这一轮之前的那一份。
+    pub restored_by_template: Vec<String>,
     /// 落地了但没收敛的工作负载。
     pub not_converged: Vec<String>,
 }
@@ -5571,6 +5733,21 @@ impl RollbackVerdict {
         Some(format!(
             "rollback did not land: {}",
             self.not_landed.join("; ")
+        ))
+    }
+
+    /// 镜像还回去了、Pod 却没起来时说给调用方听的那一句；都起来了就 `None`。
+    ///
+    /// 这句话不能省成一行 WARN：它描述的现场是「集群里跑着的不是你以为的那个版本」，
+    /// 而唯一的读者是那条失败判词。把模板换回去才起来的那些不在此列——它们是真的
+    /// 回到了这一轮之前的那一份。
+    pub(crate) fn not_converged_note(&self) -> Option<String> {
+        if self.not_converged.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "rollback landed but the workloads did not come back: {}",
+            self.not_converged.join("; ")
         ))
     }
 }
