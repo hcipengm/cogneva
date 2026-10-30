@@ -1105,16 +1105,6 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_poll_cycles_total",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
-    // 连续多少轮没拿到构建槽。被拒的每一轮在日志里和上一轮逐字相同（同一个请求者、
-    // 同一句 "host is building"），而推进是唯一零等待的调用者——别的调用方会等下去、
-    // 到预算才失败，它这一轮直接回、下一轮再来。所以饿住的那一段留下的是一条没有任何
-    // 人处理的拒因，以及一个只有进得了演化 Pod 才读得到的 `advance_deferrals`。
-    // 这条读数把那一段搬进指标面，每轮写、含 0：共享表只增不改，饿住结束后必须有东西
-    // 把它写回去，否则规则点亮之后没有任何东西能灭它。
-    (
-        "cogneva_mainline_advance_deferrals",
-        "crates/cog-reflection/src/mainline_deployer.rs",
-    ),
     // 同一段等待的另一个量纲：起点。记的是「从哪一刻开始等」，没在等的轮写 0。
     // 用起点而不是「已经等了多久」，因为一轮才写一次的话年龄在两次采样之间是常数，
     // `for:` 短于一拍就永远凑不满；而写起点让陈旧落回 `_observed_timestamp_seconds`
@@ -4254,7 +4244,7 @@ const UNREAD: &[(&str, Unread)] = &[
         "cogneva_mainline_advance_deferrals",
         Unread::Elsewhere {
             readers: &["cogneva_mainline_advance_wait_since_unix"],
-            reason: "同一件事（推进被构建槽饿住）由读数面按秒读，规则读的是那一条；这一格仍写，但只剩进程内的控制律比它",
+            reason: "the starvation this counted is now read in seconds, and the rule reads that series; this row is still written only because the control law compares the same number inside the process, so nothing on the reading faces consumes it",
         },
     ),
     // An eval A/B gate ends in "did not measure" more often than not right now:
