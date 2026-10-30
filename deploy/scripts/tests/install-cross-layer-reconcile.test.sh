@@ -87,4 +87,21 @@ prod_cal="$(grep -m1 '^OnCalendar=' "${tmr}")"
 chk_cal="$(grep -m1 '^OnCalendar=' "${chkt}")"
 [ "${prod_cal}" != "${chk_cal}" ] || fail "两个 timer 的拍子相同：${prod_cal}"
 
-echo "install-cross-layer-reconcile: 9 passed"
+# 9. 检查器的 --interval 必须等于产出 timer 的周期。两个数分开写时，把周期从 30 分钟
+#    改到 10 分钟而漏改 interval，缺拍判据就静默地迟钝三倍：序列照常落行、检查照常
+#    通过，只有真停了的那天才会发现它一直没在报。
+cadence="$(awk -v value="${prod_cal#OnCalendar=}" 'BEGIN {
+    sub(/^[^:]*\*:/, "", value)
+    sub(/:.*$/, "", value)
+    n = split(value, m, ",")
+    if (n < 1) exit 1
+    step = 60 - m[n] + m[1]
+    for (i = 1; i < n; i++) if (m[i+1] - m[i] < step) step = m[i+1] - m[i]
+    print step * 60
+}')"
+interval_arg="$(printf '%s\n' "${chk_line}" | sed -n 's/.*--interval \([0-9][0-9]*\).*/\1/p')"
+[ -n "${interval_arg}" ] || fail "检查器没有 --interval：${chk_line}"
+[ "${interval_arg}" = "${cadence}" ] \
+    || fail "检查器的 --interval ${interval_arg} 与产出的周期 ${cadence} 秒不一致：换周期漏了换判据"
+
+echo "install-cross-layer-reconcile: 10 passed"

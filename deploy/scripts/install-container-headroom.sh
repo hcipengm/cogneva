@@ -22,9 +22,34 @@ series="${XDG_STATE_HOME:-${HOME:?}/.local/state}/cogneva/container-headroom.tsv
 unit_dir="${XDG_CONFIG_HOME:-${HOME:?}/.config}/systemd/user"
 unit_name="cogneva-container-headroom"
 check_name="cogneva-container-headroom-series-check"
-interval=1800
 
 die() { printf 'install-container-headroom: %s\n' "$*" >&2; exit 1; }
+
+# 拍子的三个数写成一个等式，不各写一遍：周期（分钟）、产出落在哪一分钟、检查器比产出
+# 晚多少分钟。`--interval` 是「两拍之间超过多久算缺拍」，它必须等于 timer 的周期——
+# 两个数分开写时，把周期从 30 分钟改成 10 分钟而漏改 interval，缺拍判据就迟钝三倍，
+# 而序列照常落行、检查照常通过，没有任何东西会红。相位仍是人挑的数（要和这台机器上
+# 别的 timer 错开），那条约束由 tests/ 里「不能同刻」那几组守着。
+cadence_minutes=30
+phase_minute=12
+check_gap_minutes=10
+
+# 一小时里均匀铺满才叫「每 N 分钟一拍」；不整除时下面那个循环会漏拍，而 interval
+# 判据仍然按 N 分钟算——静默地把缺拍读成正常。所以这里直接拒绝。
+if [ $((60 % cadence_minutes)) -ne 0 ] || [ "$cadence_minutes" -ge 60 ]; then
+    die "周期 ${cadence_minutes} 分钟不整除 60：一小时里铺不满，而 --interval 仍按它算"
+fi
+
+interval=$((cadence_minutes * 60))
+calendar_of() { # <第一拍的分钟> -> OnCalendar 串（每 cadence_minutes 分钟一拍）
+    local minute="$1" out="" m
+    for ((m = minute; m < 60; m += cadence_minutes)); do
+        out+=$(printf ',%02d' "$m")
+    done
+    printf '*-*-* *:%s:00' "${out#,}"
+}
+on_calendar="$(calendar_of "$phase_minute")"
+check_calendar="$(calendar_of "$(((phase_minute + check_gap_minutes) % 60))")"
 
 [ -f "${gate}" ] || die "读数脚本不在这里：${gate}"
 [ -x "${gate}" ] || die "${gate} 不可执行"
@@ -62,35 +87,38 @@ Nice=10
 TimeoutStartSec=60
 EOF
 
+# 两个 timer 仍写成带引号的 heredoc，排期用占位符事后替换：无引号的 heredoc 会把注释里
+# 的反引号与 `$(` 一起执行，而这两份文件的注释是讲为什么的散文，随时可能写进一个反引号。
 cat >"${unit_dir}/${unit_name}.timer" <<'EOF'
 [Unit]
 Description=Measure container memory headroom every half hour
 
 [Timer]
-# 与跨层对账的 :07/:37 错开：两者都要问 Prometheus，同刻跑会让一次查询超时
-# 同时打在两份读数上。
-OnCalendar=*-*-* *:12,42:00
+# 与跨层对账的相位错开：两者都要问 Prometheus，同刻跑会让一次查询超时
+# 同时打在两份读数上。相位是 phase_minute，那条约束由测试里「不能同刻」那组守着。
+OnCalendar=@ON_CALENDAR@
 RandomizedDelaySec=120
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
+sed -i "s|@ON_CALENDAR@|${on_calendar}|" "${unit_dir}/${unit_name}.timer"
 
 cat >"${unit_dir}/${check_name}.timer" <<'EOF'
 [Unit]
 Description=Clock for the container headroom series check
 
 [Timer]
-# 与产出的 :12/:42 错开 10 分钟，理由同跨层对账：和产出同刻跑会让一次迟到
-# 同时被算成缺拍与正常。
-OnCalendar=*-*-* *:22,52:00
+# 产出相位 + check_gap_minutes：和产出同刻跑会让一次迟到同时被算成缺拍与正常。
+OnCalendar=@CHECK_CALENDAR@
 RandomizedDelaySec=60
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
+sed -i "s|@CHECK_CALENDAR@|${check_calendar}|" "${unit_dir}/${check_name}.timer"
 
 if [ "${COGNEVA_INSTALL_RENDER_ONLY:-0}" = 1 ]; then
     # 只写文件，不碰这个用户的 systemd 实例。测试要判「渲染出来的文件对不对」，

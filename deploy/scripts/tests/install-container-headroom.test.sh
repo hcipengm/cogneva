@@ -16,6 +16,21 @@ installer="${repo}/deploy/scripts/install-container-headroom.sh"
 cross_installer="${repo}/deploy/scripts/install-cross-layer-reconcile.sh"
 fail() { echo "FAIL: $*"; exit 1; }
 
+# 一个 OnCalendar 值相邻两拍之间差多少秒（含最后一拍跨小时）。`--interval` 判的是
+# 「两拍之间超过多久算缺拍」，它必须等于这个数：两个数分开写时，把周期从 30 分钟改到
+# 10 分钟而漏改 interval，缺拍判据就静默地迟钝三倍。
+cadence_seconds() { # <OnCalendar 值>
+    awk -v value="$1" 'BEGIN {
+        sub(/^[^:]*\*:/, "", value)
+        sub(/:.*$/, "", value)
+        n = split(value, m, ",")
+        if (n < 1) exit 1
+        step = 60 - m[n] + m[1]
+        for (i = 1; i < n; i++) if (m[i+1] - m[i] < step) step = m[i+1] - m[i]
+        print step * 60
+    }'
+}
+
 [ -f "${installer}" ] || fail "安装脚本不存在：${installer}"
 
 work="$(mktemp -d)"
@@ -82,8 +97,24 @@ for f in cogneva-cross-layer-reconcile.timer cogneva-cross-layer-reconcile-serie
     [ "${prod_cal}" != "${other}" ] || fail "与 ${f} 同刻：${prod_cal}"
 done
 
-# 8. 序列检查器要的间隔与产出 timer 的周期一致（1800 秒）。
-printf '%s\n' "${chk_line}" | grep -q -- '--interval 1800' \
-    || fail "检查器的 --interval 不是 1800：${chk_line}"
+# 8. 序列检查器要的间隔必须等于产出 timer 的周期，且两个 timer 相差 check_gap。
+#    这不是「钉住 1800」：钉住的话，把周期改成 10 分钟一拍、忘了改 interval，缺拍
+#    判据就迟钝三倍而没有任何东西会红。判的是两个数之间的等式。
+prod_interval="$(printf '%s\n' "${chk_line}" | sed -n 's/.*--interval \([0-9][0-9]*\).*/\1/p')"
+[ -n "${prod_interval}" ] || fail "检查器没有 --interval：${chk_line}"
+cadence="$(cadence_seconds "${prod_cal#OnCalendar=}")"
+[ "${prod_interval}" = "${cadence}" ] \
+    || fail "检查器的 --interval ${prod_interval} 与产出的周期 ${cadence} 秒不一致：换周期漏了换判据"
+
+# 8b. 两拍之间差的就是 check_gap_minutes，不是「只要不同刻就行」——差 1 分钟也算不同刻，
+#     但检查器会在产出还没落完时就去看序列。
+gap="$(awk -v a="${prod_cal#OnCalendar=}" -v b="${chk_cal#OnCalendar=}" 'BEGIN {
+    sub(/^[^:]*\*:/, "", a); sub(/:.*$/, "", a)
+    sub(/^[^:]*\*:/, "", b); sub(/:.*$/, "", b)
+    split(a, x, ","); split(b, y, ",")
+    d = y[1] - x[1]; if (d < 0) d += 60
+    print d * 60
+}')"
+[ "${gap}" = 600 ] || fail "产出与检查相差 ${gap} 秒，应当是 600（错开 10 分钟）"
 
 echo "install-container-headroom: 8 组用例通过"
