@@ -21,6 +21,27 @@ unit_name="cogneva-host-target-gc"
 
 die() { printf 'install-host-target-gc: %s\n' "$*" >&2; exit 1; }
 
+# 拍子写成两个数，OnCalendar 由它们算出来，不把 ":13,43" 直接抄进模板：抄进去以后
+# 改周期就得同时改串和注释，漏一处不会有东西红。相位仍是要和这台机器上别的 timer
+# 错开的那个数，那条约束由 tests/host-timers-do-not-collide.test.sh 守着。
+cadence_minutes=30
+phase_minute=13
+
+# 一小时里铺满才叫「每 N 分钟一拍」；不整除时下面那个循环会漏拍，而排期看上去还在，
+# 只是少了一拍。所以这里直接拒绝。
+if [ $((60 % cadence_minutes)) -ne 0 ] || [ "${cadence_minutes}" -ge 60 ]; then
+    die "cadence ${cadence_minutes} min does not divide 60: the layout would silently drop a beat"
+fi
+
+calendar_of() { # <first beat's minute> -> OnCalendar string, one beat every cadence_minutes
+    local minute="$1" out="" m
+    for ((m = minute; m < 60; m += cadence_minutes)); do
+        out+=$(printf ',%02d' "$m")
+    done
+    printf '*-*-* *:%s:00' "${out#,}"
+}
+on_calendar="$(calendar_of "${phase_minute}")"
+
 [ -f "${reclaimer}" ] || die "the reclaimer is not at ${reclaimer}"
 [ -d "${work_root}" ] || die "the work root ${work_root} is not a directory; name one: $0 <work root>"
 [ -x "${reclaimer}" ] || die "${reclaimer} is not executable"
@@ -47,20 +68,31 @@ NoNewPrivileges=yes
 TimeoutStartSec=7200
 EOF
 
+# 带引号的 heredoc ＋ 占位符事后替换：无引号的 heredoc 会把注释里的反引号与 `$(` 一起
+# 执行，而这批脚本的注释是讲为什么的散文，随时可能写进一个反引号。
 cat >"${unit_dir}/${unit_name}.timer" <<'EOF'
 [Unit]
 Description=Release the host build cache when the disk is above the trigger
 
 [Timer]
-# Off the hour and off the half hour: nothing else on this machine fires then.
+# 相位来自 phase_minute：同一周期的两个 timer 落在同一个分钟，每一拍都会撞在一起，
+# 而这一拍删文件——它按 idle IO、Nice 19 跑，撞上谁都是把对方拖慢。
 # Persistent catches up a run that was missed while the machine was off.
-OnCalendar=*-*-* *:13,43:00
+OnCalendar=@ON_CALENDAR@
 RandomizedDelaySec=180
 Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
+sed -i "s|@ON_CALENDAR@|${on_calendar}|" "${unit_dir}/${unit_name}.timer"
+
+if [ "${COGNEVA_INSTALL_RENDER_ONLY:-0}" = 1 ]; then
+    # 只写文件，不碰这个用户的 systemd 实例。测试要判「渲染出来的排期对不对」，
+    # 而它不该顺带在这台机器上装一个定时器。
+    printf 'install-host-target-gc: 只渲染（COGNEVA_INSTALL_RENDER_ONLY=1）：%s\n' "${unit_dir}"
+    exit 0
+fi
 
 systemctl --user daemon-reload
 systemctl --user enable --now "${unit_name}.timer"

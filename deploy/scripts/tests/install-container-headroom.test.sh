@@ -13,7 +13,6 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 installer="${repo}/deploy/scripts/install-container-headroom.sh"
-cross_installer="${repo}/deploy/scripts/install-cross-layer-reconcile.sh"
 fail() { echo "FAIL: $*"; exit 1; }
 
 # 一个 OnCalendar 值相邻两拍之间差多少秒（含最后一拍跨小时）。`--interval` 判的是
@@ -37,7 +36,6 @@ work="$(mktemp -d)"
 trap 'rm -rf "${work}"' EXIT
 
 XDG_CONFIG_HOME="${work}" COGNEVA_INSTALL_RENDER_ONLY=1 bash "${installer}" >/dev/null
-XDG_CONFIG_HOME="${work}/cross" COGNEVA_INSTALL_RENDER_ONLY=1 bash "${cross_installer}" >/dev/null
 
 unit_dir="${work}/systemd/user"
 svc="${unit_dir}/cogneva-container-headroom.service"
@@ -86,16 +84,12 @@ grep -q '^SuccessExitStatus=' "${chk}" \
     && fail "检查器把退出码 1 包装成了成功——缺拍就再也不会出现在 systemctl --failed 上"
 grep -q '^WantedBy=timers.target' "${chkt}" || fail "检查器 timer 没有 WantedBy=timers.target"
 
-# 7. 产出与检查不能同刻，且不能与跨层对账的拍子撞车：三份读数共用一个 Prometheus，
-#    同刻跑会让一次慢查询同时打在三份读数上。
+# 7. 这里曾经手抄一份「和谁比」的名单（产出 vs 检查、产出 vs 跨层对账的两个 timer），
+#    名单之外的一律看不见——host-target-gc 的 ":13,43" 就这么漏了一整年。同刻这件事
+#    现在由 host-timers-do-not-collide.test.sh 判，它从树里枚举全部安装脚本与静态单元。
+#    这份测试只留它自己那条等式要用的两个值。
 prod_cal="$(grep -m1 '^OnCalendar=' "${tmr}")"
 chk_cal="$(grep -m1 '^OnCalendar=' "${chkt}")"
-[ "${prod_cal}" != "${chk_cal}" ] || fail "产出与检查同刻：${prod_cal}"
-cross_dir="${work}/cross/systemd/user"
-for f in cogneva-cross-layer-reconcile.timer cogneva-cross-layer-reconcile-series-check.timer; do
-    other="$(grep -m1 '^OnCalendar=' "${cross_dir}/${f}")"
-    [ "${prod_cal}" != "${other}" ] || fail "与 ${f} 同刻：${prod_cal}"
-done
 
 # 8. 序列检查器要的间隔必须等于产出 timer 的周期，且两个 timer 相差 check_gap。
 #    这不是「钉住 1800」：钉住的话，把周期改成 10 分钟一拍、忘了改 interval，缺拍
