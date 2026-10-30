@@ -449,6 +449,23 @@ const DISPATCH_PROJECT_ROOT_KIND: &str = "change_ledger_project";
 /// row it already wrote instead of opening a second root.
 const DISPATCH_PROJECT_ROOT_PREFIX: &str = "change-ledger-project:";
 
+/// What "done" means for one dispatched change.
+///
+/// A row that says nothing about what done means is a work package nobody can
+/// close: the project views draw it and never finish it, and its earned-value
+/// row is open for as long as the graph remembers it. Every one of the account's
+/// dispatched rows carried none when this was written.
+///
+/// The answer is the account's own strongest claim, in the account's two
+/// terminal states rather than a sentence about quality: the row for this
+/// identity is no longer outstanding, which is to say a measurement found the
+/// artifact as the change asks for it (`landed`) or found the identity is one
+/// the account should not be holding (`retired`). Both are written only through
+/// `apply_measurement`, against a revision of the tree the change does not get
+/// to choose -- so the reader that closes this task is the same account that
+/// filed it, and the two cannot drift into different opinions of "done".
+const DISPATCH_ACCEPTANCE: &str = "这条变更在变更账上不再是 outstanding：同一身份的账行落到 landed 或 retired，判据取账上那一行的状态";
+
 /// The name a pass writes into `sources_unread` when the principle ledger could
 /// not be read.
 ///
@@ -977,6 +994,9 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
     // projects, every one of them a root, six projects already holding two or
     // more.
     task.parent_task_id = Some(dispatch_project_root_id(&dispatch_project_key(row)));
+    // What closes this row: see [`DISPATCH_ACCEPTANCE`]. Hung under the anchor
+    // it is a leaf, which is exactly the shape that has to say so.
+    task.acceptance.push(DISPATCH_ACCEPTANCE.to_string());
     task
 }
 
@@ -6253,6 +6273,27 @@ mod tests {
         assert!(task.id.starts_with(DISPATCH_TASK_PREFIX));
         assert_eq!(task.input["task_kind"], DISPATCH_TASK_KIND);
         assert_eq!(task.input["evolution_mode"], "generate_change");
+    }
+
+    /// 交出去的每一条变更都说清「做完」是什么意思，而且说的就是账自己那个终态。
+    ///
+    /// 这一格挡的是空着：现网 2300 多条派出行一条验收标准都没有，项目视图里
+    /// 每一条都是关不掉的活。判据必须落在账的两个终态上——写成「产物看着没问题」
+    /// 这类话，就没有任何一条读数能把它清掉。
+    #[test]
+    fn a_dispatched_change_states_what_done_means_in_the_account_s_own_terms() {
+        let task = dispatch_task(&row(ChangeState::Pending, Some(1_760_000_000)), 0);
+        assert_eq!(task.acceptance, vec![DISPATCH_ACCEPTANCE.to_string()]);
+        for terminal in ["landed", "retired"] {
+            assert!(
+                DISPATCH_ACCEPTANCE.contains(terminal),
+                "验收标准点名的不是账上的终态「{terminal}」：{DISPATCH_ACCEPTANCE}"
+            );
+        }
+        assert!(
+            DISPATCH_ACCEPTANCE.contains("outstanding"),
+            "没写清它清掉的正是这一行欠着的那一格：{DISPATCH_ACCEPTANCE}"
+        );
     }
 
     /// A stated band lifts the handover by exactly the band's own rank, so the
