@@ -1,0 +1,88 @@
+# promtool 规则单测：派发器留住的行那一条**真的会 firing**，而且只在它该响的时候响。
+#
+# 为什么要有这一层：这条规则的结构是「一个求和 > 0，持续 2 小时」。结构门只判得出
+# 「它读了那序列」，判不出它在什么时候出现。这一族最常见的三种坏法，每一种在这份夹具
+# 里都有一格是它的反例：
+#
+#   * `> 0` 写成 `>= 0`：序列在、值为 0 时**永远响**，而干净图上正该是 0；
+#   * `for: 2h` 写成 `0m`：部署后那次一次性回填的半个多小时会当场点亮它，那正是规则
+#     头注释里说「读的人只会学会忽略它」的那一格；
+#   * 规则写成按 `kind` 分的那些格子求和前不过滤：一格里有一天被清空、另一格又长出来，
+#     求和照样非零——那是对的；但少了 `sum()`，身份会随 Pod 走（那是 subjects 门的事，
+#     这里顺带钉住它真的抛开了标签）。
+#
+# 第四组是最要紧的一格：**读不到图**（序列整个消失）时它必须安静，而不是「没有告警就是
+# 没问题」——那种情形该响的是抓不到指标本身。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/26-prometheusrule-dispatch-hold.yaml \
+#         deploy/k3s/observability/tests/26-prometheusrule-dispatch-hold.test.yaml
+rule_files:
+  - ../manifests/26-prometheusrule-dispatch-hold.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、留住的行一直不清：2 小时那一刻响。
+  # 前半格是反向证据：刚长上去就响，等于把部署后那次一次性回填报成事故。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_tasks_readings{readout="held_unstated_rows"}'
+        values: '40x200'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaDispatchHoldingUnclosableWork
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: CognevaDispatchHoldingUnclosableWork
+        exp_alerts: []
+      - eval_time: 130m
+        alertname: CognevaDispatchHoldingUnclosableWork
+        # 措辞不在这里断言：promtool 不展开 Go 模板，`{{ $value }}` 出来后是空串，
+        # 断言它等于把「模板没被渲染」写进夹具。这一格钉的是身份与时刻。
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "任务管理"
+
+  # 二、回填把那批清空了：规则不许跟到底。这一格是 `for: 2h` 的反例——
+  # 它写成「非零」时这一组会红在 150m。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_tasks_readings{readout="held_unstated_rows"}'
+        values: '40x45 0x200'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaDispatchHoldingUnclosableWork
+        exp_alerts: []
+      - eval_time: 200m
+        alertname: CognevaDispatchHoldingUnclosableWork
+        exp_alerts: []
+
+  # 三、干净图：这一格从头到尾都是 0，全程不许响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_tasks_readings{readout="held_unstated_rows"}'
+        values: '0x200'
+      # 同一时刻别的 readout 在动：规则读错 readout 时这一组会红。
+      - series: 'cogneva_tasks_readings{readout="tasks_rows_read"}'
+        values: '3800x200'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: CognevaDispatchHoldingUnclosableWork
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: CognevaDispatchHoldingUnclosableWork
+        exp_alerts: []
+
+  # 四、读不到图：序列整个不在，规则安静。这里断言的正是「看不见 ≠ 没问题」——
+  # 那种情形归抓指标的那条告警，不归这条后果。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_tasks_readings{readout="tasks_rows_read"}'
+        values: '3800x200'
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: CognevaDispatchHoldingUnclosableWork
+        exp_alerts: []

@@ -67,13 +67,27 @@ pub fn is_dispatchable_work(task: &Task) -> bool {
     task.is_executable && !is_face_duty(task) && states_what_done_means(task)
 }
 
+/// Whether the dispatcher is leaving this row alone for want of a criterion.
+///
+/// The complement of [`is_dispatchable_work`] over the rows that have a body to
+/// run, kept as its own name because the two are read by different callers for
+/// different reasons: the dispatcher asks the first before it starts a row, and
+/// the graph reading asks the second to say how much work is stuck behind it.
+/// Writing the second as `!states_what_done_means(task)` alone would count face
+/// duties and non-executable rows, which are left alone for reasons of their own.
+pub fn held_for_want_of_a_criterion(task: &Task) -> bool {
+    task.is_executable && !is_face_duty(task) && !states_what_done_means(task)
+}
+
 /// Whether the row says what would close it.
 ///
-/// One definition, because three things ask it: the dispatcher before it starts
-/// a row, the project views when they draw a card as closable, and the settle
-/// passes that back-fill the rows written before their kind asked for one. A
-/// work package nobody can close is not work -- it is a row that will complete
-/// on the summary the executor writes about itself.
+/// Two callers ask this: the dispatcher, before it starts a row, and the graph
+/// reading that reports how many rows are held for want of it. The settle passes
+/// ask the same question of a row they re-read -- as `acceptance.is_empty()` --
+/// but the question is not quite this one: they correct a row rather than
+/// dispatch it, so the face-duty half does not apply to them. A work package
+/// nobody can close is not work -- it is a row that will complete on the summary
+/// the executor writes about itself.
 pub fn states_what_done_means(task: &Task) -> bool {
     !task.acceptance.is_empty()
 }
@@ -741,6 +755,38 @@ mod tests {
 
     /// 判据是画在**派发**这一道上的，不是画在所有行上：不执行的承载行与面
     /// 值守行本来就不该被派发，缺判据不能让它们换一个理由被拒。
+    ///
+    /// 同一页的另一半是「被留住的」：它俩在有体可跑的那一族上互补。把那一半写成
+    /// `!states_what_done_means` 一句话，面值守行与承载行就会一起被算进「因为没判据
+    /// 而停着」，读数上的那一格从此永远有数。
+    #[test]
+    fn what_is_held_for_want_of_a_criterion_is_the_complement_over_work_that_runs() {
+        let mut row = task(
+            "work-2",
+            TaskType::Custom("platform_ci_fix".into()),
+            serde_json::json!({}),
+        );
+        assert!(held_for_want_of_a_criterion(&row));
+        assert!(!is_dispatchable_work(&row));
+
+        row.acceptance.push("分支的下一次运行判绿".into());
+        assert!(!held_for_want_of_a_criterion(&row));
+        assert!(is_dispatchable_work(&row));
+
+        // 面值守行有体可跑、也是可执行的，但它不是「等判据」：派发器留它是因为它是
+        // 值守行，判据补上也还是留。
+        let mut duty = task(
+            "face-work-y",
+            TaskType::Custom(crate::governance_acts::FACE_DUTY_TASK_TYPE.into()),
+            serde_json::json!({}),
+        );
+        assert!(!held_for_want_of_a_criterion(&duty));
+        duty.acceptance.push("值班有人在".into());
+        assert!(!held_for_want_of_a_criterion(&duty));
+
+        let goal = Task::goal_row("goal-2", "ship it");
+        assert!(!held_for_want_of_a_criterion(&goal));
+    }
     #[test]
     fn a_row_with_no_body_to_run_is_excluded_for_its_own_reason() {
         let mut goal_row = Task::goal_row("goal-1", "ship it");

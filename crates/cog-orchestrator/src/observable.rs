@@ -583,6 +583,25 @@ pub const TASK_OLDEST_UNTOUCHED_METRIC: &str = "cogneva_task_oldest_untouched_se
 /// behind it -- which is the question a reader deciding whether work is being
 /// picked up at all is asking.
 pub const TASK_UNOWNED_ROWS_METRIC: &str = "cogneva_task_unowned_rows";
+/// Rows the dispatcher is leaving pending because they state no criterion, one
+/// series per kind.
+///
+/// A held row is not stuck for a reason of the graph's own making: the
+/// dispatcher refuses it because it does not say what would close it, and the
+/// only thing that fixes that is the producer or a settle pass writing one. The
+/// refusal therefore has to be readable -- the log line naming the kind fires
+/// once per process, which says the defect exists and never says whether it is
+/// still there.
+///
+/// Only kinds that hold rows are published: the rollup below carries the zero,
+/// so "nothing is held" and "nobody looked" stay different readings without
+/// paying a zero series for every kind the platform has ever filed.
+pub const TASK_HELD_UNSTATED_METRIC: &str = "cogneva_task_held_unstated_rows";
+/// The readout name for the same count rolled up over every kind.
+///
+/// The rollup is the cell a rule can read without knowing the kinds in advance,
+/// and it is published on every successful read including the zeros.
+pub const HELD_UNSTATED_READOUT: &str = "held_unstated_rows";
 /// Unix seconds of the last successful read of the task graph. The rows above
 /// are kept across a failed read, so staleness has to be its own series —
 /// otherwise a reader that stopped is indistinguishable from a graph that is
@@ -607,6 +626,12 @@ struct TaskGraphSnapshot {
     counts: Option<Vec<(&'static str, u64)>>,
     oldest_by_agent: Vec<(String, f64)>,
     unowned_by_status: Vec<(&'static str, u64)>,
+    /// Pending rows the dispatcher is holding for want of a criterion, per
+    /// kind, and their sum. Kept beside the status vector because they come
+    /// from the same read: a held row is still counted in `pending`, and the
+    /// two numbers together are what says how much of the queue is not moving.
+    held_unstated_by_kind: Vec<(String, u64)>,
+    held_unstated_total: u64,
     last_measure_seconds: u64,
     measure_failures: u64,
 }
@@ -669,12 +694,24 @@ impl TaskGraphObservable {
                 ];
                 let mut unowned: Vec<(&'static str, u64)> =
                     movable.iter().map(|s| (s.as_str(), 0)).collect();
+                let mut held: HashMap<String, u64> = HashMap::new();
                 for task in &tasks {
                     if let Some(cell) = counts
                         .iter_mut()
                         .find(|(status, _)| *status == task.status.as_str())
                     {
                         cell.1 += 1;
+                    }
+                    // Counted before the `movable` filter below and narrowed to
+                    // Pending by hand, because the two are not the same set: the
+                    // dispatcher only ever starts a pending row, so a scheduled
+                    // or running one that states no criterion is not being held
+                    // by this rule and counting it would grow a backlog figure
+                    // from rows nobody refused.
+                    if task.status == cog_core::TaskStatus::Pending
+                        && crate::ready_queue::held_for_want_of_a_criterion(task)
+                    {
+                        *held.entry(task.task_type.kind_key()).or_default() += 1;
                     }
                     // Only the states that can still move count as owed work.
                     // A finished or cancelled row will not be touched again, so
@@ -703,6 +740,8 @@ impl TaskGraphObservable {
                         .and_modify(|held| *held = held.max(age))
                         .or_insert(age);
                 }
+                snapshot.held_unstated_total = held.values().sum();
+                snapshot.held_unstated_by_kind = held.into_iter().collect();
                 snapshot.counts = Some(counts);
                 snapshot.oldest_by_agent = oldest.into_iter().collect();
                 snapshot.unowned_by_status = unowned;
@@ -761,6 +800,23 @@ impl TaskGraphObservable {
                     RawMetric::new(TASK_OLDEST_UNTOUCHED_METRIC, *age)
                         .with_label(crate::LABEL_AGENT, agent.as_str()),
                 );
+            }
+            // The held rows: the rollup always (so a clean graph states its
+            // zero), the per-kind cells only where there is something to
+            // attribute. A reader that wants to know *which* producer is
+            // starving reads the labelled cells; a rule that wants to know
+            // whether anything is reads the rollup and needs no list of kinds.
+            out.push(
+                RawMetric::new(TASKS_READINGS_METRIC, snapshot.held_unstated_total as f64)
+                    .with_label(crate::LABEL_READOUT, HELD_UNSTATED_READOUT),
+            );
+            for (kind, count) in &snapshot.held_unstated_by_kind {
+                if *count > 0 {
+                    out.push(
+                        RawMetric::new(TASK_HELD_UNSTATED_METRIC, *count as f64)
+                            .with_label(crate::LABEL_KIND, kind.as_str()),
+                    );
+                }
             }
             // Published per movable state even at zero: "no unowned work" and
             // "nobody counted" have to be different readings, and an absent
@@ -1487,6 +1543,108 @@ mod tests {
             "a measured graph must carry the timestamp its staleness is judged against"
         );
         assert!(metric(&metrics, TASK_GRAPH_MEASURE_FAILURES_METRIC).is_none());
+    }
+
+    /// Rows the dispatcher refuses for want of a criterion are on the graph and
+    /// say so.
+    ///
+    /// The refusal itself is the safe half -- the row stays pending instead of
+    /// running to a completion nobody can check against anything -- but a
+    /// refusal nobody can read is an outage of the queue that looks exactly like
+    /// a quiet one. The log line names the kind once per process; this is the
+    /// cell that says whether it is still true.
+    #[tokio::test]
+    async fn the_graph_says_how_much_work_is_held_for_want_of_a_criterion() {
+        let dag = Arc::new(crate::DagExecutor::new("ws-held-unstated".into()));
+
+        let mut closable = task("t-closable", cog_core::TaskStatus::Pending);
+        closable.acceptance.push("门测试跑绿".into());
+
+        let mut bare = task("t-bare", cog_core::TaskStatus::Pending);
+        bare.task_type = cog_core::TaskType::Custom("change_rework".into());
+        let mut second = task("t-bare-2", cog_core::TaskStatus::Pending);
+        second.task_type = cog_core::TaskType::Custom("change_rework".into());
+
+        // Not this rule's population, each for a reason of its own: a running
+        // row was already started, a face duty is left alone by design, and a
+        // goal row has no body to run.
+        let running = task("t-running-bare", cog_core::TaskStatus::Running);
+        let mut duty = task("t-duty", cog_core::TaskStatus::Pending);
+        duty.task_type =
+            cog_core::TaskType::Custom(crate::governance_acts::FACE_DUTY_TASK_TYPE.into());
+        let goal = cog_core::Task::goal_row("goal-held", "ship it");
+
+        for row in [closable, bare, second, running, duty, goal] {
+            dag.add_task(row).await.unwrap();
+        }
+
+        let metrics = TaskGraphObservable::new(dag)
+            .collect_metrics("")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            labeled(
+                &metrics,
+                TASKS_READINGS_METRIC,
+                crate::LABEL_READOUT,
+                HELD_UNSTATED_READOUT
+            )
+            .value,
+            2.0,
+            "the two bare change_rework rows are the ones being held"
+        );
+        assert_eq!(
+            labeled(
+                &metrics,
+                TASK_HELD_UNSTATED_METRIC,
+                crate::LABEL_KIND,
+                "change_rework"
+            )
+            .value,
+            2.0,
+            "the cell has to name the kind: the fix is a producer, and the kind is its name"
+        );
+        assert_eq!(
+            metrics
+                .iter()
+                .filter(|m| m.name == TASK_HELD_UNSTATED_METRIC)
+                .count(),
+            1,
+            "no zero cells for kinds that hold nothing: the rollup already states the zero"
+        );
+    }
+
+    /// 图上一件也没被留住时，读数说 0 而不是缺席。
+    ///
+    /// 缺席与 0 在这里是两个意思：0 是「派发器没有拦下任何东西」，缺席是「这一版
+    /// 根本没量」。按缺席写的规则会在第一次部署、图还是空的时候报警。
+    #[tokio::test]
+    async fn a_graph_that_holds_nothing_states_its_zero() {
+        let dag = Arc::new(crate::DagExecutor::new("ws-held-none".into()));
+        let mut closable = task("t-closable", cog_core::TaskStatus::Pending);
+        closable.acceptance.push("门测试跑绿".into());
+        dag.add_task(closable).await.unwrap();
+
+        let metrics = TaskGraphObservable::new(dag)
+            .collect_metrics("")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            labeled(
+                &metrics,
+                TASKS_READINGS_METRIC,
+                crate::LABEL_READOUT,
+                HELD_UNSTATED_READOUT
+            )
+            .value,
+            0.0
+        );
+        assert!(
+            metrics.iter().all(|m| m.name != TASK_HELD_UNSTATED_METRIC),
+            "a kind with nothing held gets no cell"
+        );
     }
 
     /// A failed read must not present the last known shape as fresh and must

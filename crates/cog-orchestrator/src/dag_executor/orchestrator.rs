@@ -1933,10 +1933,7 @@ impl DagExecutor {
         let mut unclosable: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
         for t in tasks.iter().filter(|t| t.status == TaskStatus::Pending) {
-            if t.is_executable
-                && !crate::ready_queue::is_face_duty(t)
-                && !crate::ready_queue::states_what_done_means(t)
-            {
+            if crate::ready_queue::held_for_want_of_a_criterion(t) {
                 *unclosable.entry(t.task_type.kind_key()).or_default() += 1;
             }
         }

@@ -1,0 +1,46 @@
+# 派发器留住的行也要有判据：一条工作包没说自己怎样算完，就此停在队列里。
+#
+# 为什么需要：派发器现在只开「说了怎样算完」的行（`ready_queue::is_dispatchable_work`）。
+# 没说的行被留住——这是安全的那一半，行仍 pending、仍看板上，不会以执行器自己的总结
+# 收尾而永远无法被证明做过。但「留住」在读数上与「队列本来就安静」同形：`pending` 那一
+# 格照样有数，看板照样画得出卡片，没有任何一格说这些行不会开始。派发器自己的日志每进程
+# 每种只打一次，它说的是「有过这种行」，不是「现在还有」。
+#
+# 判据接在 `cogneva_tasks_readings{readout="held_unstated_rows"}` 上：同一趟图读里数出来的
+# 那个和，图读成功才有这一格（读失败时序列消失、这条规则自己安静——那时该响的是抓不到
+# 指标这件事本身，不是这条后果）。按 `kind` 分的那些格子是给人下钻用的：修法在写出那一行
+# 的生产者身上，或者给那个种类补一趟回填，`kind` 就是那只手的名字。
+#
+# 取 `max` 而不是 `sum`：这一格读的是同一张任务图，报信的每个 Pod 都是它的一个读者、
+# 不是它的一块——求和会把「两个人读了同一张图」报成两倍的积压。顺带把 Pod 维聚合掉，
+# 告警身份才不会随报信的那个 Pod 重建而换新（subject 门要求的就是这一条）。
+#
+# 界取「连续 2 小时非零」，不是「非零」：每个回填 pass 每 5 分钟跑一次、一次 400 行，
+# 现网最大的那一批（两千二百多条 `change_ledger`）也要半小时上下就清空。也就是说两小时
+# 里非零不断，意味着没有任何一趟回填碰得到这些行——不是排队，是没人来。反过来按「非零」判，
+# 部署后那一次性回填的半个多小时会当场点亮它，而那条红没有任何动作可做（回填正在做这件
+# 事），读的人只会学会忽略它。
+#
+# 不用伴生钟：这是图上的一个值，进程读不到图时序列就没了，规则自己静下来。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-dispatch-hold
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-dispatch-hold
+      rules:
+        - alert: CognevaDispatchHoldingUnclosableWork
+          expr: |
+            max(cogneva_tasks_readings{readout="held_unstated_rows"}) > 0
+          for: 2h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "任务管理"
+            severity: warning
+          annotations:
+            summary: "2 小时里有 {{ $value }} 条可执行的行停在队列里，因为它们没说自己怎样算完"
+            description: "`cogneva_tasks_readings{readout=\"held_unstated_rows\"}` 连续两小时非零。这些行不是被别的东西挡着：派发器不开它们，是因为它们没有验收判据，开局就等于一次无法被证明做过的运行。逐 `kind` 看 `cogneva_task_held_unstated_rows` 是哪一类：修法在写出这一类行的生产者（它提交时该带上判据），或者给这一类补一趟回填——回填每 5 分钟一趟、一趟 400 行，两小时还在就说明没有哪一趟碰得到它们。别去逐条补判据：同一类行会继续按原来的样子被写出来，红了又填、填了又红。"
