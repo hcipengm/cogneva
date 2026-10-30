@@ -3294,6 +3294,10 @@ data:
                 },
                 {
                   "name": "gitee_token_not_rotated",
+                  "dormancy": {
+                    "reason": "feature_off",
+                    "why": "cog-gateway/src/contribution_admin.rs publishes this reading only when the stored contribution config says provider=gitee and mode=oauth with an obtained_at -- the refresher writes it on every tick before deciding whether to renew, and again after a successful write-back. A deployment connected with a hand-supplied token keeps mode=manual_or_device, and that token has no renewal this loop can perform, so nothing is published and the rule correctly stays silent; the loop's own health is still published either way (cogneva_loop_period_seconds and cogneva_loop_deaths_total on loop=gateway_gitee_token_refresher), so a refresher that stopped is read by background_loop_stalled rather than here."
+                  },
                   "promql": "(max without (pod, container, instance) (cogneva_gitee_token_seconds_to_expiry) - max without (pod, container, instance) (cogneva_gitee_token_refresh_threshold_seconds)) and ((time() - max without (pod, container, instance) (cogneva_gitee_token_seconds_to_expiry_observed_timestamp_seconds)) < 7200)",
                   "condition": {
                     "less_than": 0.0
