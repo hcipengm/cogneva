@@ -51,12 +51,11 @@ fn spawn_pool_sizing_loop(
                     if let Some((working_set, _)) = reading {
                         cost.observe(working_set, concurrency.in_use());
                     }
-                    let capacity = reading.and_then(|(_, limit)| cost.capacity(limit));
                     let plan = crate::pool_sizing::next_slots(
                         concurrency.slots(),
                         concurrency.declared_cap(),
                         reading,
-                        capacity,
+                        cost,
                     );
                     let changed = concurrency.set_slots(plan.slots).await;
                     // Workers are objects, the count is a measurement: the
@@ -65,7 +64,7 @@ fn spawn_pool_sizing_loop(
                     // worker it has is busy -- otherwise a quiet container
                     // would grow a consumer a minute for doing nothing.
                     let spawned = spawner.spawned();
-                    let target = match capacity {
+                    let target = match plan.capacity {
                         Some(_) => plan.slots,
                         None if concurrency.in_use() >= spawned.max(1) => {
                             (spawned + 1).min(plan.slots.max(1))

@@ -11,8 +11,9 @@
 //!   is the marginal cost of one. Kept as a running maximum, because the
 //!   number this feeds is a capacity and an under-estimate of the cost is an
 //!   over-estimate of how many fit.
-//! - **What the container has.** The cgroup's limit, against the share of it
-//!   this pool will fill.
+//! - **What the container has.** The cgroup's limit, less the measured cost of
+//!   one more task: that difference is what says a slot can be added, and it is
+//!   the same figure that says the pool has to shrink when it turns negative.
 //!
 //! `worker_count` remains as an operator's own cap when one is written down;
 //! absent (zero), nothing but the measurement bounds the count. A declared cap
@@ -35,27 +36,14 @@ use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
-/// Shrink when the container's working set crosses this share of its limit.
-///
-/// The chart's `container_memory_near_limit` alert fires at 0.81 of the limit.
-/// The pool backs off one step before that line, so the alert is the report of
-/// a pool that could not back off rather than the first reader of a container
-/// about to be killed.
-// cap: bound — 要让它表现为一个该退的池，而不是一个即将被杀掉的容器的第一个读者
-pub const MEMORY_RED_FRACTION: f64 = 0.78;
-
-/// Grow only below this share, so one step cannot both shrink and grow.
-///
-/// It has to sit above the container's own baseline: measured on the main pod
-/// on 2026-10-24, the working set stayed between 0.70 and 0.72 of an 8 GiB
-/// limit through the day, and most of that is not the pool's. A growth line
-/// below the baseline would trap a shrunk pool at one slot forever.
-// cap: bound — 取在红线之下：涨的线若低于基线，缩过的池会永远被卡在一个槽
-pub const MEMORY_GROW_FRACTION: f64 = 0.73;
-
-/// A growth line at or above the red line would let one pass both shrink and
-/// grow the pool, so the ordering is checked when the crate is built.
-const _: () = assert!(MEMORY_GROW_FRACTION < MEMORY_RED_FRACTION);
+// Where the pool backs off is not a share of the limit. Two shares used to
+// stand here -- 0.78 to shrink, 0.73 to grow, the gap picked by hand, the lower
+// one picked to clear a baseline measured on one pod on one day -- and a share
+// of a limit is a guess at a quantity this process already measures: what one
+// task costs. The measured form is the limit less that cost, so the pool backs
+// off exactly when one more launch is the one that would not fit, and adds a
+// slot exactly while it would. A pod with a different limit or a different task
+// mix needs no new number here, because there is no number here.
 
 /// Which way the last step moved, so a reader can tell a pool holding at its
 /// measured capacity from one holding because it could not read anything.
@@ -127,18 +115,19 @@ impl SlotCost {
 
     /// How many tasks fit in `limit` bytes, once both figures are measured.
     ///
-    /// The pool plans to the growth line rather than the limit: planning to
-    /// the limit means every step taken at the plan lands in the red band and
-    /// the next pass takes it back.
+    /// The room above the baseline, divided by what one task costs, less the
+    /// one task kept back. The cost is a running maximum, and a task that has
+    /// not finished has not yet peaked, so the last slot has to be one the next
+    /// task's own peak still fits into; planning right up to the limit means
+    /// the step that reaches the plan is the one that gets the container killed.
     pub fn capacity(&self, limit: u64) -> Option<usize> {
         let baseline = self.baseline_bytes?;
         let per_task = self.per_task_bytes?;
         if per_task == 0 {
             return None;
         }
-        let budget = (limit as f64 * MEMORY_GROW_FRACTION) as u64;
-        let room = budget.saturating_sub(baseline);
-        Some((room / per_task) as usize)
+        let room = limit.saturating_sub(baseline);
+        Some((room / per_task).saturating_sub(1) as usize)
     }
 }
 
@@ -146,9 +135,11 @@ impl SlotCost {
 ///
 /// `declared_cap` is an operator's own ceiling when one is written down --
 /// `None`, and `Some(0)` with it, means they did not write one and nothing
-/// but the measurement bounds the count. `capacity` is [`SlotCost::capacity`] once this process
-/// has measured a task; until then the count may still grow one step at a
-/// time, which is how the first task is run at all.
+/// but the measurement bounds the count. `cost` is what this process has
+/// measured about one task; without it neither the capacity nor the room for
+/// one more is known, so the count holds at its floor until a task has been
+/// measured. That is the first task's path: one slot is enough to run the task
+/// that produces the measurement.
 ///
 /// The floor is one worker: a pool that shrank to zero stops consuming, and
 /// nothing left is listening to notice when the pressure clears.
@@ -156,7 +147,7 @@ pub fn next_slots(
     current: usize,
     declared_cap: Option<usize>,
     memory: Option<(u64, u64)>,
-    capacity: Option<usize>,
+    cost: SlotCost,
 ) -> SlotPlan {
     let fraction = memory.and_then(|(used, limit)| {
         if limit == 0 {
@@ -165,6 +156,7 @@ pub fn next_slots(
             Some(used as f64 / limit as f64)
         }
     });
+    let capacity = memory.and_then(|(_, limit)| cost.capacity(limit));
     let plan = |slots: usize, movement: SlotMove| SlotPlan {
         slots,
         movement,
@@ -190,12 +182,19 @@ pub fn next_slots(
     if let Some(bound) = bound {
         next = next.min(bound.max(1));
     }
-    if let Some(fraction) = fraction {
-        if fraction >= MEMORY_RED_FRACTION {
-            next = (next / 2).max(1);
-        } else if fraction < MEMORY_GROW_FRACTION && bound.is_none_or(|bound| next < bound) {
-            next += 1;
-        }
+    // Both directions are the same comparison against the same measured number:
+    // one more task, at the cost this process has observed, against the room the
+    // container has left. Unmeasured is not calm -- with no cost there is no
+    // evidence that another slot fits, and a pool that added one anyway would be
+    // the typed count this module replaced.
+    let one_more_fits = match (memory, cost.per_task_bytes) {
+        (Some((used, limit)), Some(per_task)) => used.saturating_add(per_task) < limit,
+        _ => false,
+    };
+    if matches!(memory, Some((_, limit)) if limit > 0) && !one_more_fits {
+        next = (next / 2).max(1);
+    } else if one_more_fits && bound.is_none_or(|bound| next < bound) {
+        next += 1;
     }
     let movement = match next.cmp(&current) {
         std::cmp::Ordering::Greater => SlotMove::Grow,
@@ -348,54 +347,73 @@ mod tests {
 
     const GIB: u64 = 1024 * 1024 * 1024;
 
+    /// Two gigabytes resident with nothing running, one gigabyte per task, in
+    /// an eight gigabyte limit: six tasks' worth of room, five after the one
+    /// held back for a peak not yet seen.
+    fn measured() -> SlotCost {
+        SlotCost {
+            baseline_bytes: Some(2 * GIB),
+            per_task_bytes: Some(GIB),
+        }
+    }
+
     fn calm() -> Option<(u64, u64)> {
         Some((2 * GIB, 8 * GIB))
     }
 
     #[test]
     fn a_measured_capacity_bounds_the_count() {
-        let plan = next_slots(6, None, calm(), Some(6));
-        assert_eq!(plan.slots, 6);
+        let plan = next_slots(5, None, calm(), measured());
+        assert_eq!(plan.slots, 5);
         assert_eq!(plan.movement, SlotMove::Hold);
+        assert_eq!(plan.capacity, Some(5));
     }
 
     #[test]
     fn a_capacity_below_the_count_takes_the_count_down_to_it() {
-        let plan = next_slots(6, None, calm(), Some(2));
+        // Two gigabytes per task: of the six gigabytes above the baseline
+        // three fit, and the one held back leaves two.
+        let cost = SlotCost {
+            baseline_bytes: Some(2 * GIB),
+            per_task_bytes: Some(2 * GIB),
+        };
+        let plan = next_slots(6, None, calm(), cost);
         assert_eq!(plan.slots, 2);
         assert_eq!(plan.movement, SlotMove::Shrink);
     }
 
     #[test]
     fn without_a_declared_cap_the_measurement_is_the_only_bound() {
-        // Calm, below a capacity of six: the count grows one step at a time.
-        let plan = next_slots(1, None, calm(), Some(6));
-        assert_eq!(plan.slots, 2);
+        // Below a measured capacity of five: the count grows one step at a time.
+        let plan = next_slots(2, None, calm(), measured());
+        assert_eq!(plan.slots, 3);
         assert_eq!(plan.movement, SlotMove::Grow);
     }
 
     #[test]
     fn a_declared_cap_still_wins_when_it_is_the_tighter_one() {
-        let plan = next_slots(2, Some(2), calm(), Some(8));
+        let plan = next_slots(2, Some(2), calm(), measured());
         assert_eq!(plan.slots, 2);
         assert_eq!(plan.movement, SlotMove::Hold);
     }
 
     #[test]
-    fn before_any_task_is_measured_the_count_may_still_grow() {
-        // Nothing has finished yet, so there is no cost to divide by. The
-        // count can still grow -- otherwise the first task could never run --
-        // and the memory line is what stops it.
-        let plan = next_slots(1, None, calm(), None);
-        assert_eq!(plan.slots, 2);
-        assert_eq!(plan.movement, SlotMove::Grow);
+    fn an_unmeasured_cost_does_not_grow_the_pool() {
+        // Nothing has run yet, so there is no cost of a task and no evidence
+        // that another one fits. The floor of one slot is what runs the task
+        // that produces the measurement; a count grown past it on no evidence
+        // is the typed number this module replaced.
+        let plan = next_slots(1, None, calm(), SlotCost::default());
+        assert_eq!(plan.slots, 1);
+        assert_eq!(plan.movement, SlotMove::Hold);
+        assert_eq!(plan.capacity, None);
     }
 
     #[test]
-    fn a_container_near_its_limit_halves_the_pool() {
+    fn a_container_without_room_for_one_more_task_halves_the_pool() {
         // A container whose page cache has already been dropped: working set
-        // at 92% of its limit, past the red line.
-        let plan = next_slots(3, None, Some((7_946_364_672, 8_589_934_592)), Some(8));
+        // at 92% of its limit, less than one task's cost away from it.
+        let plan = next_slots(3, None, Some((7_946_364_672, 8_589_934_592)), measured());
         assert_eq!(plan.slots, 1);
         assert_eq!(plan.movement, SlotMove::Shrink);
     }
@@ -403,12 +421,13 @@ mod tests {
     #[test]
     fn the_measured_shape_of_the_main_pod_does_not_shrink_the_pool() {
         // Measured 2026-10-24: memory.current minus the inactive file cache
-        // came to 70% of this container's limit -- not red.
+        // came to 70% of this container's limit, more than one task's cost
+        // away from it -- room for the task being added.
         let plan = next_slots(
             3,
             Some(3),
             Some((6_804_500_480 - 790_851_584, 8_589_934_592)),
-            None,
+            measured(),
         );
         assert_eq!(plan.slots, 3);
         assert_eq!(plan.movement, SlotMove::Hold);
@@ -418,7 +437,7 @@ mod tests {
     #[test]
     fn an_unreadable_container_holds_the_count() {
         // "Not measured" must not read as "no pressure".
-        let plan = next_slots(3, None, None, Some(8));
+        let plan = next_slots(3, None, None, measured());
         assert_eq!(plan.slots, 3);
         assert_eq!(plan.movement, SlotMove::Hold);
         assert_eq!(plan.memory_fraction, None);
@@ -426,7 +445,7 @@ mod tests {
 
     #[test]
     fn the_pool_never_drops_below_one_worker() {
-        let plan = next_slots(1, None, Some((8 * GIB, 8 * GIB)), Some(0));
+        let plan = next_slots(1, None, Some((8 * GIB, 8 * GIB)), measured());
         assert_eq!(plan.slots, 1);
     }
 
@@ -436,10 +455,10 @@ mod tests {
         // install paths, and that is the whole surface an operator has. Read
         // here as a ceiling of nothing, the same zero would have shut the pool
         // down -- so the two readings of one written value must not exist.
-        let plan = next_slots(3, Some(0), calm(), Some(8));
+        let plan = next_slots(3, Some(0), calm(), measured());
         assert_eq!(
             plan,
-            next_slots(3, None, calm(), Some(8)),
+            next_slots(3, None, calm(), measured()),
             "a written zero has to answer exactly as no cap"
         );
         assert_eq!(plan.slots, 4);
@@ -474,14 +493,14 @@ mod tests {
     }
 
     #[test]
-    fn capacity_is_planned_to_the_growth_line_not_the_limit() {
+    fn capacity_is_the_room_above_the_baseline_less_one_task() {
         let mut cost = SlotCost::default();
         cost.observe(4 * GIB, 0);
         cost.observe(5 * GIB, 1);
-        // Observations of 4 and 5 put the per-task cost at one unit. The
-        // growth line leaves 73% of the limit as budget and the baseline takes
-        // 50% of it, so exactly one more task fits.
-        assert_eq!(cost.capacity(8 * GIB), Some(1));
+        // Observations of 4 and 5 put the per-task cost at one unit. Four
+        // gigabytes of room fit four of them, and the one held back for the
+        // next task's own peak leaves three.
+        assert_eq!(cost.capacity(8 * GIB), Some(3));
     }
 
     #[test]
