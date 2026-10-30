@@ -2881,7 +2881,9 @@ async fn clear_superseded_env_values(text: &str, namespace: &str) -> Result<usiz
             serde_yaml::Value::deserialize(doc).with_context(|| "清单里有读不出来的 YAML 文档")?;
         let desired = serde_json::to_value(&doc)
             .with_context(|| "清单文档无法表达成 JSON（如非字符串键）")?;
-        let Some(workload) = cog_core::contract::env_supersede::workload_identity(&desired) else {
+        // `pod_workload` 而不是 `workload_identity`：备份 CronJob 的 pod 模板在
+        // `jobTemplate` 下面，不认它，那个工作负载的凭证 env 就没人判。
+        let Some((workload, _)) = cog_core::contract::env_supersede::pod_workload(&desired) else {
             continue;
         };
         let (kind, name) = (workload.kind.clone(), workload.name.clone());
@@ -2895,13 +2897,13 @@ async fn clear_superseded_env_values(text: &str, namespace: &str) -> Result<usiz
         let Some(live) = live_object(&kind, &name, &namespace).await else {
             continue;
         };
-        let removals = cog_core::contract::env_supersede::superseded_env_values(&desired, &live);
-        if removals.is_empty() {
+        // 两类清理（清单改成 valueFrom 的残留 value、清单已不再声明的 Secret env）
+        // 必须合进同一次 patch：下标都按同一份现状算，分开打得先重读一遍对象。
+        let Some(plan) = cog_core::contract::env_supersede::env_cleanup_plan(&desired, &live)
+        else {
             continue;
-        }
-        // 同一容器内按下标倒序删：正向删会让后面条目的下标整体前移，patch 打偏。
-        let ops = cog_core::contract::env_supersede::removal_patch_ops(&removals);
-        let names: Vec<&str> = removals.iter().map(|r| r.name.as_str()).collect();
+        };
+        let names: Vec<&str> = plan.names.iter().map(String::as_str).collect();
         let out = Command::new("kubectl")
             .args([
                 "-n",
@@ -2911,15 +2913,15 @@ async fn clear_superseded_env_values(text: &str, namespace: &str) -> Result<usiz
                 &name,
                 "--type=json",
                 "-p",
-                &serde_json::Value::Array(ops).to_string(),
+                &serde_json::Value::Array(plan.ops).to_string(),
             ])
             .stdin(Stdio::null())
             .output()
             .await
-            .with_context(|| format!("清理 {kind}/{name} 的残留 env value 失败"))?;
+            .with_context(|| format!("清理 {kind}/{name} 的残留 env 失败"))?;
         if !out.status.success() {
             bail!(
-                "清理 {kind}/{name} 上被 valueFrom 取代的 env value 失败（{}）：{}",
+                "清理 {kind}/{name} 上被清单取代、或清单已不再声明的 env 失败（{}）：{}",
                 names.join(", "),
                 String::from_utf8_lossy(&out.stderr).trim()
             );
@@ -2927,9 +2929,10 @@ async fn clear_superseded_env_values(text: &str, namespace: &str) -> Result<usiz
         info!(
             workload = %format!("{kind}/{name}"),
             envs = %names.join(", "),
-            "cleared superseded env values (the manifest injects them from the Secret)"
+            dropped = plan.dropped,
+            "cleared env the manifest no longer declares, and env values it now injects from a source"
         );
-        cleared += removals.len();
+        cleared += plan.names.len();
     }
     Ok(cleared)
 }

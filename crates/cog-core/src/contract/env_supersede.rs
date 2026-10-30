@@ -37,11 +37,97 @@ pub struct SupersededEnvValue {
 impl SupersededEnvValue {
     /// 该残留字段在对象里的 JSON 指针（`kubectl patch --type=json` 用）。
     pub fn patch_path(&self) -> String {
+        self.patch_path_under(POD_TEMPLATE)
+    }
+
+    /// 同上，但 pod 模板不在默认位置时（CronJob 的模板在 `jobTemplate` 之下）
+    /// 由调用方给前缀。
+    pub fn patch_path_under(&self, prefix: &str) -> String {
         format!(
-            "/spec/template/spec/{}/{}/env/{}/value",
+            "{prefix}/{}/{}/env/{}/value",
             self.container_field, self.container, self.env
         )
     }
+
+    /// 整条 env 删掉时的 JSON 指针（没有结尾的 `/value`）。
+    pub fn entry_path_under(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}/{}/{}/env/{}",
+            self.container_field, self.container, self.env
+        )
+    }
+}
+
+/// 两类清理合成一次 `kubectl patch --type=json` 的操作序列：`whole` 整条删，
+/// `value` 只删条目里的 `value`。
+///
+/// 为什么必须合成的**一次**：同一容器里删掉一条 env 会让它后面条目的下标整体
+/// 前移。分成两次 patch，第二次那批下标是按原始对象算出来的，第一次删完就已经
+/// 指向别人了。两类在同一条目上不会撞（整条删的那条清单里根本没有，被 valueFrom
+/// 取代的那条清单里有），所以按（字段、容器、倒序下标）排一遍就够。
+pub fn env_cleanup_patch_ops(
+    whole: &[SupersededEnvValue],
+    value: &[SupersededEnvValue],
+    prefix: &str,
+) -> Vec<Value> {
+    struct Op {
+        head: (&'static str, usize, std::cmp::Reverse<usize>),
+        /// 同一条目上只会有一种；这一位只为排序确定
+        rank: u8,
+        path: String,
+    }
+    let mut ops: Vec<Op> = Vec::new();
+    for r in whole {
+        ops.push(Op {
+            head: (r.container_field, r.container, std::cmp::Reverse(r.env)),
+            rank: 0,
+            path: r.entry_path_under(prefix),
+        });
+    }
+    for r in value {
+        ops.push(Op {
+            head: (r.container_field, r.container, std::cmp::Reverse(r.env)),
+            rank: 1,
+            path: r.patch_path_under(prefix),
+        });
+    }
+    ops.sort_by(|a, b| a.head.cmp(&b.head).then(a.rank.cmp(&b.rank)));
+    ops.into_iter()
+        .map(|o| serde_json::json!({"op": "remove", "path": o.path}))
+        .collect()
+}
+
+/// pod 模板在文档里的指针。CronJob 的模板比别的工作负载多两层（`jobTemplate`），
+/// 这层差异曾让它整个落在下面的判据之外。
+pub const POD_TEMPLATE: &str = "/spec/template/spec";
+pub const CRONJOB_POD_TEMPLATE: &str = "/spec/jobTemplate/spec/template/spec";
+
+/// 带 pod 模板的工作负载，连同模板在文档里的位置；其余文档返回 `None`。
+///
+/// 与 `workload_identity` 的区别只有一个：CronJob 也算。它是真有 pod 模板的
+/// 对象，路径也是确定的，不认它只会让它的 env 没人判。
+pub fn pod_workload(doc: &Value) -> Option<(WorkloadRef, &'static str)> {
+    let prefix = match doc.get("kind")?.as_str()? {
+        "Deployment" | "StatefulSet" | "DaemonSet" | "Job" => POD_TEMPLATE,
+        "CronJob" => CRONJOB_POD_TEMPLATE,
+        _ => return None,
+    };
+    doc.pointer(prefix)?;
+    let kind = doc.get("kind")?.as_str()?.to_string();
+    let metadata = doc.get("metadata")?;
+    let name = metadata.get("name")?.as_str()?.to_string();
+    let namespace = metadata
+        .get("namespace")
+        .and_then(|n| n.as_str())
+        .map(str::to_string);
+    Some((
+        WorkloadRef {
+            kind,
+            name,
+            namespace,
+        },
+        prefix,
+    ))
 }
 
 /// 带 pod 模板的工作负载身份。清除残留之前得先知道要查哪个对象。
@@ -108,10 +194,19 @@ const CONTAINER_FIELDS: [&str; 2] = ["containers", "initContainers"];
 /// 输入是**同一对象**的期望态（清单反序列化后的文档）与现状（`kubectl get -o json`）。
 /// 任一侧读不出 pod 模板就返回空——判不出来就不动，绝不"顺手清一遍"。
 pub fn superseded_env_values(desired: &Value, live: &Value) -> Vec<SupersededEnvValue> {
+    superseded_env_values_at(desired, live, POD_TEMPLATE)
+}
+
+/// 同上，pod 模板不在默认位置时（CronJob）由调用方给前缀。
+pub fn superseded_env_values_at(
+    desired: &Value,
+    live: &Value,
+    prefix: &str,
+) -> Vec<SupersededEnvValue> {
     let mut out = Vec::new();
     for field in CONTAINER_FIELDS {
-        let desired_containers = containers(desired, field);
-        let live_containers = containers(live, field);
+        let desired_containers = containers_at(desired, field, prefix);
+        let live_containers = containers_at(live, field, prefix);
         for (ci, desired_container) in desired_containers.iter().enumerate() {
             let Some(live_container) = live_containers.get(ci) else {
                 continue;
@@ -156,8 +251,118 @@ pub fn superseded_env_values(desired: &Value, live: &Value) -> Vec<SupersededEnv
     out
 }
 
-fn containers<'a>(doc: &'a Value, field: &str) -> &'a [Value] {
-    doc.pointer(&format!("/spec/template/spec/{field}"))
+/// live 上还从 Secret 取值、而清单已经完全不再声明的那几条 env。
+///
+/// 为什么只认 Secret 来源：清单里拿掉一条 env，`kubectl apply` 按名字合并，那条
+/// 在已有对象上**原样留着**——不报错、不留标记，也没有任何路径会去删它。普通
+/// env 不动它（可能是带外调试留下的，删错比留着贵）；但一条凭证不同：它读的是
+/// 别人名下的密钥，而凭证面的读法只认声明，现网多一个读者就是一次越权，不是一次
+/// 配置差异。2026-10-31 的现场正是这样：`6b99311b` 把业务进程换成 `cog_app` 并
+/// 拿掉了 `pg-password`，三个 Deployment 与备份 CronJob 的 env 里那份超级用户
+/// 口令却一直挂着，凭证面读数连红一天，而没有任何东西会去删它。
+///
+/// 容器按名字对（两边都写了名字时），名字缺失才退回下标——按下标对会为一次
+/// 容器重排删掉另一个容器的 env。
+pub fn secret_env_dropped_by_the_manifest(
+    desired: &Value,
+    live: &Value,
+) -> Vec<SupersededEnvValue> {
+    let Some((_, prefix)) = pod_workload(desired) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for field in CONTAINER_FIELDS {
+        let desired_containers = containers_at(desired, field, prefix);
+        let live_containers = containers_at(live, field, prefix);
+        for (ci, live_container) in live_containers.iter().enumerate() {
+            let Some(desired_container) = counterpart(desired_containers, live_container, ci)
+            else {
+                continue;
+            };
+            let declared: Vec<&str> = env_entries(desired_container)
+                .into_iter()
+                .flatten()
+                .filter_map(|e| env_name(e))
+                .collect();
+            let Some(live_env) = env_entries(live_container) else {
+                continue;
+            };
+            for (ei, entry) in live_env.iter().enumerate() {
+                let Some(name) = env_name(entry) else {
+                    continue;
+                };
+                if entry
+                    .get("valueFrom")
+                    .and_then(|v| v.get("secretKeyRef"))
+                    .is_none()
+                {
+                    continue;
+                }
+                if declared.contains(&name) {
+                    continue;
+                }
+                out.push(SupersededEnvValue {
+                    container_field: field,
+                    container: ci,
+                    env: ei,
+                    name: name.to_string(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// 一次清理的完整方案：一次 patch 的删除操作、被清掉的 env 名（日志用）、其中整条
+/// 删除了几条。
+///
+/// 两类清理必须合进**同一次** patch：它们的位置都按同一份现状算下标，分开算、分开
+/// 打，第二份下标已经被第一份删动过了。合成一处也让调用方不必自己记住这个顺序。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvCleanupPlan {
+    pub ops: Vec<Value>,
+    pub names: Vec<String>,
+    pub dropped: usize,
+}
+
+/// 把两类清理与它们的 patch 序列合成一份方案；没什么可清返回 `None`。
+pub fn env_cleanup_plan(desired: &Value, live: &Value) -> Option<EnvCleanupPlan> {
+    let (_, prefix) = pod_workload(desired)?;
+    let superseded = superseded_env_values_at(desired, live, prefix);
+    let dropped = secret_env_dropped_by_the_manifest(desired, live);
+    if superseded.is_empty() && dropped.is_empty() {
+        return None;
+    }
+    let ops = env_cleanup_patch_ops(&dropped, &superseded, prefix);
+    let names = dropped
+        .iter()
+        .chain(superseded.iter())
+        .map(|r| r.name.clone())
+        .collect();
+    Some(EnvCleanupPlan {
+        ops,
+        names,
+        dropped: dropped.len(),
+    })
+}
+
+/// live 的某个容器在清单里的对应项：先按名字，两边都没有名字才按下标。
+fn counterpart<'a>(declared: &'a [Value], live: &Value, index: usize) -> Option<&'a Value> {
+    if let Some(name) = live.get("name").and_then(Value::as_str) {
+        if let Some(found) = declared
+            .iter()
+            .find(|d| d.get("name").and_then(Value::as_str) == Some(name))
+        {
+            return Some(found);
+        }
+        // 清单里没有这个容器：它的 env 没有声明可对照，不猜
+        return None;
+    }
+    declared.get(index)
+}
+
+fn containers_at<'a>(doc: &'a Value, field: &str, prefix: &str) -> &'a [Value] {
+    doc.pointer(&format!("{prefix}/{field}"))
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[])
@@ -312,6 +517,167 @@ mod tests {
             vec![
                 json!({"op": "remove", "path": "/spec/template/spec/containers/0/env/3/value"}),
                 json!({"op": "remove", "path": "/spec/template/spec/containers/0/env/1/value"}),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_secret_env_the_manifest_no_longer_declares_is_dropped_whole() {
+        // 2026-10-31 的形态：清单把 PG_PASSWORD 整条拿掉了，live 上那条还在从
+        // Secret 取超级用户口令。要删的是整条（带 `/value` 的只是它的一半）。
+        let d = json!({"kind": "Deployment", "metadata": {"name": "cogneva"},
+        "spec": {"template": {"spec": {"containers": [
+            {"name": "cogneva", "env": [{"name": "APP_PASSWORD",
+                "valueFrom": {"secretKeyRef": {"name": "s", "key": "app-password"}}}]}
+        ]}}}});
+        let l = json!({"kind": "Deployment", "metadata": {"name": "cogneva"},
+        "spec": {"template": {"spec": {"containers": [
+            {"name": "cogneva", "env": [
+                {"name": "PG_PASSWORD",
+                 "valueFrom": {"secretKeyRef": {"name": "s", "key": "pg-password"}}},
+                {"name": "APP_PASSWORD",
+                 "valueFrom": {"secretKeyRef": {"name": "s", "key": "app-password"}}}]}
+        ]}}}});
+        let dropped = secret_env_dropped_by_the_manifest(&d, &l);
+        assert_eq!(dropped.len(), 1, "{dropped:?}");
+        assert_eq!(dropped[0].name, "PG_PASSWORD");
+        assert_eq!(dropped[0].env, 0);
+        let ops = env_cleanup_patch_ops(&dropped, &[], POD_TEMPLATE);
+        assert_eq!(
+            ops,
+            vec![json!({"op": "remove",
+                "path": "/spec/template/spec/containers/0/env/0"})]
+        );
+    }
+
+    #[test]
+    fn a_plain_env_the_manifest_no_longer_declares_is_left_alone() {
+        // 不带 Secret 的条目不动：可能是带外调试留下来的，删错比留着贵。
+        // 反面：这条判据若扩大成"清单没有就删"，一次带外排障留下的 env 会在
+        // 下一次滚动里被静默拿掉。
+        let d = json!({"kind": "Deployment", "metadata": {"name": "w"},
+            "spec": {"template": {"spec": {"containers": [{"name": "c", "env": []}]}}}});
+        let l = json!({"kind": "Deployment", "metadata": {"name": "w"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "c", "env": [{"name": "RUST_LOG", "value": "debug"}]}]}}}});
+        assert!(secret_env_dropped_by_the_manifest(&d, &l).is_empty());
+    }
+
+    #[test]
+    fn containers_are_matched_by_name_not_by_index() {
+        // 容器重排过一次之后，按下标对会把另一个容器声明的同名 env 当成"清单
+        // 已经没有"而删掉——那是在删一条清单明确要的读取。
+        let d = json!({"kind": "Deployment", "metadata": {"name": "w"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "b", "env": [{"name": "PG_PASSWORD",
+                    "valueFrom": {"secretKeyRef": {}}}]},
+                {"name": "a", "env": []}]}}}});
+        let l = json!({"kind": "Deployment", "metadata": {"name": "w"},
+            "spec": {"template": {"spec": {"containers": [
+                {"name": "a", "env": [{"name": "PG_PASSWORD",
+                    "valueFrom": {"secretKeyRef": {}}}]},
+                {"name": "b", "env": [{"name": "PG_PASSWORD",
+                    "valueFrom": {"secretKeyRef": {}}}]}]}}}});
+        let dropped = secret_env_dropped_by_the_manifest(&d, &l);
+        assert_eq!(
+            dropped
+                .iter()
+                .map(|d| (dropped_container(&l, d), d.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("a", "PG_PASSWORD")],
+            "只该删 a 上那一条：b 的名字清单里有"
+        );
+    }
+
+    fn dropped_container<'a>(live: &'a Value, r: &SupersededEnvValue) -> &'a str {
+        live.pointer(&format!(
+            "/spec/template/spec/{}/{}/name",
+            r.container_field, r.container
+        ))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+    }
+
+    #[test]
+    fn a_cronjob_pod_template_is_found_two_levels_deeper() {
+        // 备份 CronJob 的 env 一直不在这些判据里：它的模板在 jobTemplate 下面。
+        let d = json!({"kind": "CronJob", "metadata": {"name": "cogneva-backup"},
+            "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": [
+                {"name": "backup", "env": []}]}}}}}});
+        let l = json!({"kind": "CronJob", "metadata": {"name": "cogneva-backup"},
+            "spec": {"jobTemplate": {"spec": {"template": {"spec": {"containers": [
+                {"name": "backup", "env": [{"name": "PG_PASSWORD",
+                    "valueFrom": {"secretKeyRef": {}}}]}]}}}}}});
+        let (workload, prefix) = pod_workload(&d).expect("CronJob 有 pod 模板");
+        assert_eq!(workload.kind_arg(), "cronjob");
+        assert_eq!(prefix, CRONJOB_POD_TEMPLATE);
+        let dropped = secret_env_dropped_by_the_manifest(&d, &l);
+        assert_eq!(dropped.len(), 1);
+        let ops = env_cleanup_patch_ops(&dropped, &[], prefix);
+        assert_eq!(
+            ops,
+            vec![json!({"op": "remove",
+                "path": "/spec/jobTemplate/spec/template/spec/containers/0/env/0"})]
+        );
+    }
+
+    /// 端到端：清单不再声明的一条 Secret env 与清单改成 `valueFrom` 的一条，落进
+    /// 同一次 patch，且下标都按原始对象倒序——正向删会让后面条目的下标前移。
+    #[test]
+    fn the_plan_puts_both_cleanups_in_one_patch_and_nothing_else() {
+        let desired = json!({
+            "kind": "Deployment",
+            "metadata": {"name": "app"},
+            "spec": {"template": {"spec": {"containers": [{"name": "app", "env": [
+                {"name": "PG_HOST", "value": "pg"},
+                {"name": "TOKEN", "valueFrom": {"secretKeyRef": {"name": "s", "key": "t"}}},
+            ]}]}}},
+        });
+        let live = json!({
+            "spec": {"template": {"spec": {"containers": [{"name": "app", "env": [
+                {"name": "PG_HOST", "value": "pg"},
+                {"name": "TOKEN", "value": "stale"},
+                {"name": "PG_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "s", "key": "p"}}},
+            ]}]}}},
+        });
+        let plan = env_cleanup_plan(&desired, &live).expect("there is something to clean");
+        assert_eq!(plan.dropped, 1);
+        assert_eq!(
+            plan.names,
+            vec!["PG_PASSWORD".to_string(), "TOKEN".to_string()]
+        );
+        assert_eq!(
+            plan.ops,
+            vec![
+                json!({"op": "remove", "path": "/spec/template/spec/containers/0/env/2"}),
+                json!({"op": "remove", "path": "/spec/template/spec/containers/0/env/1/value"}),
+            ]
+        );
+        // 已经对齐的对象不给任何操作：这条在 apply 之前跑，空 patch 也是白跑一趟。
+        assert!(env_cleanup_plan(&desired, &desired).is_none());
+    }
+
+    #[test]
+    fn both_cleanups_land_in_one_ordered_patch() {
+        // 整条删与删 `.value` 各自的下标都按原始对象算；合成一次、倒序应用。
+        let whole = vec![SupersededEnvValue {
+            container_field: "containers",
+            container: 0,
+            env: 0,
+            name: "GONE".into(),
+        }];
+        let value = vec![SupersededEnvValue {
+            container_field: "containers",
+            container: 0,
+            env: 2,
+            name: "B".into(),
+        }];
+        let ops = env_cleanup_patch_ops(&whole, &value, POD_TEMPLATE);
+        assert_eq!(
+            ops,
+            vec![
+                json!({"op": "remove", "path": "/spec/template/spec/containers/0/env/2/value"}),
+                json!({"op": "remove", "path": "/spec/template/spec/containers/0/env/0"}),
             ]
         );
     }

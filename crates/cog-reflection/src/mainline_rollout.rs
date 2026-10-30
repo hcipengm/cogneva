@@ -3641,12 +3641,14 @@ impl RolloutExecutor {
         format!("{}: {reading}", w.display())
     }
 
-    /// 清单交付前，先把集群对象上"已被清单的 `valueFrom` 取代"的 env `value` 摘掉。
+    /// 清单交付前，先把集群对象上"已被清单的 `valueFrom` 取代"的 env `value` 摘掉，
+    /// 再摘掉"清单已经完全不再声明、却还从 Secret 取值"的整条 env。
     ///
-    /// 三方合并按 env 条目的 name 合并，清单里消失的字段不会被删掉：该条目于是
-    /// 同时带 `value` 与 `valueFrom`、被准入拒绝，本次 apply 停在这一处，而报错
-    /// 指向清单——清单是对的。这个对象从此永远 apply 不进去，直到有人手动摘掉
-    /// 那个字段；残留物往往正是我们要从清单里拿掉的明文凭证。
+    /// 三方合并按 env 条目的 name 合并，清单里消失的字段不会被删掉。前一类残留同时
+    /// 带 `value` 与 `valueFrom`、被准入拒绝，apply 停在这一处而报错指向清单——清单
+    /// 是对的；这个对象从此永远 apply 不进去。后一类不会让 apply 失败，它只是继续
+    /// 挂着：2026-10-31 的现场是 `pg-password`（超级用户口令）留在三个业务
+    /// Deployment 与备份 CronJob 的 env 里，凭证面读数连红一天，没有任何东西会删它。
     ///
     /// 判据与 patch 序列都在 `cog_core`（纯函数），这里只负责取现状与执行。读不到
     /// 现状（对象还不存在、查询失败）就什么都不做：首次交付本就没有残留，集群不可
@@ -3664,7 +3666,9 @@ impl RolloutExecutor {
         for doc in split_docs(&text, &origin)? {
             let desired = serde_json::to_value(&doc)
                 .map_err(|e| SFError::Config(format!("{origin}: document is not JSON: {e}")))?;
-            let Some(workload) = cog_core::contract::env_supersede::workload_identity(&desired)
+            // CronJob 的 pod 模板在 `jobTemplate` 下面：不认它，备份 CronJob 的 env
+            // 就整条落在两半判据之外。
+            let Some((workload, _)) = cog_core::contract::env_supersede::pod_workload(&desired)
             else {
                 continue;
             };
@@ -3685,17 +3689,15 @@ impl RolloutExecutor {
                     continue;
                 }
             };
-            let removals =
-                cog_core::contract::env_supersede::superseded_env_values(&desired, &live);
-            if removals.is_empty() {
+            let Some(plan) = cog_core::contract::env_supersede::env_cleanup_plan(&desired, &live)
+            else {
                 continue;
-            }
-            let ops = cog_core::contract::env_supersede::removal_patch_ops(&removals);
-            let names: Vec<&str> = removals.iter().map(|r| r.name.as_str()).collect();
+            };
             info!(
                 workload = %format!("{}/{}", workload.kind, workload.name),
-                envs = %names.join(", "),
-                "cleared env values the manifest now injects from a source"
+                envs = %plan.names.join(", "),
+                dropped = plan.dropped,
+                "cleared env the manifest no longer declares, and env values it now injects from a source"
             );
             self.run_kubectl(
                 &[
@@ -3704,7 +3706,7 @@ impl RolloutExecutor {
                     &workload.name,
                     "--type=json",
                     "-p",
-                    &serde_json::Value::Array(ops).to_string(),
+                    &serde_json::Value::Array(plan.ops).to_string(),
                 ],
                 60,
             )
@@ -6391,5 +6393,67 @@ data:
         );
         // 判词本身仍带着现场，翻日志的人看得到这一次跑成了什么样。
         assert!(msg.contains("connect: connection refused"), "{msg}");
+    }
+
+    /// 清单已经不再声明的 Secret env，要从活对象上删掉——这是 `PG_PASSWORD`
+    /// 在 2026-10-30 之后还留在四个工作负载上的原因：strategic merge 只合不剪，
+    /// 而主线部署的字段删除核对拿的是**上一版清单 ConfigMap**，不是活对象，于是
+    /// 「清单里没了」在两侧都读成「没有变化」。
+    ///
+    /// 反例（同一份活对象、清单仍声明它）必须返回 `None`：删掉一个还在用的凭证
+    /// 会让下一版 Pod 起不来，而这条门是在 apply **之前**跑的。
+    #[test]
+    fn a_secret_env_the_manifest_no_longer_declares_is_removed_from_the_live_object() {
+        let live = serde_json::json!({
+            "kind": "Deployment",
+            "metadata": {"name": "cogneva"},
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "cogneva",
+                "env": [
+                    {"name": "PG_HOST", "value": "pg"},
+                    {"name": "PG_PASSWORD", "valueFrom": {
+                        "secretKeyRef": {"name": "cogneva-secrets", "key": "pg-password"}
+                    }},
+                ],
+            }]}}},
+        });
+        let desired = serde_json::json!({
+            "kind": "Deployment",
+            "metadata": {"name": "cogneva"},
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "cogneva",
+                "env": [{"name": "PG_HOST", "value": "pg"}],
+            }]}}},
+        });
+
+        let plan = cog_core::contract::env_supersede::env_cleanup_plan(&desired, &live)
+            .expect("the undeclared secret env must be cleaned");
+        assert_eq!(plan.names, vec!["PG_PASSWORD".to_string()]);
+        assert_eq!(plan.dropped, 1);
+        assert_eq!(
+            plan.ops,
+            vec![serde_json::json!({
+                "op": "remove",
+                "path": "/spec/template/spec/containers/0/env/1",
+            })]
+        );
+
+        // 清单仍声明它：什么都不做。删了它下一版起不来，而这条门在 apply 之前。
+        let still_declared = serde_json::json!({
+            "kind": "Deployment",
+            "metadata": {"name": "cogneva"},
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "cogneva",
+                "env": [
+                    {"name": "PG_HOST", "value": "pg"},
+                    {"name": "PG_PASSWORD", "valueFrom": {
+                        "secretKeyRef": {"name": "cogneva-secrets", "key": "pg-password"}
+                    }},
+                ],
+            }]}}},
+        });
+        assert!(
+            cog_core::contract::env_supersede::env_cleanup_plan(&still_declared, &live).is_none()
+        );
     }
 }
