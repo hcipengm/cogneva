@@ -68,14 +68,6 @@ const META_DIR_NAME: &str = ".meta";
 // cap: bound — 目录名要躲开 ENAMETOOLONG，又要装得下生成的 id
 const MAX_TASK_ID_LEN: usize = 128;
 
-/// Headroom kept free on the volume. A cap that fills the disk leaves no room
-/// for the git commands that have to write while the cap is being reached, and
-/// the failure that produces is a command failing, not a tree being reclaimed.
-/// A percentage rather than a byte figure, so it follows whatever volume the
-/// executor is given instead of assuming one.
-// cap: bound — 上限填满磁盘就没地方让 git 写了；这个比例是默认，不是从卷量出来的
-const WORKSPACE_DISK_HEADROOM_PERCENT: u64 = 15;
-
 /// The shortest time between two reclamation passes, and the pace the loop
 /// wakes at whatever the derived interval turns out to be -- waking is cheap,
 /// a pass is not.
@@ -173,10 +165,14 @@ fn workspace_cap(disk: DiskReading, trees_bytes: u64, trees: usize) -> Option<us
     if per_tree == 0 {
         return None;
     }
-    let room = disk
-        .avail_bytes
-        .saturating_mul(100 - WORKSPACE_DISK_HEADROOM_PERCENT)
-        / 100;
+    // The cap is reached by cutting trees, so what has to stay free is the room
+    // to cut and write one more: a tree's size as measured here. A fraction of
+    // the volume is a guess at that same size, and guesses it both ways -- a
+    // fifteenth of a large volume is many trees' worth left unused, and a
+    // fifteenth of a nearly full one can be less than a single tree, which is
+    // the failure the reserve exists to prevent: git fails to write while the
+    // cap is being reached, and that failure is blamed on whatever ran there.
+    let room = disk.avail_bytes.saturating_sub(per_tree);
     Some(trees + (room / per_tree) as usize)
 }
 
@@ -2762,15 +2758,21 @@ pub(crate) mod tests {
             avail_bytes: avail_mib * MIB,
         };
         // Fixtures picked for the test, not a machine: e.g. four trees of
-        // 100 MiB each on a volume with e.g. 4 GiB free. With 15% of the free
-        // space kept free, e.g. the 3.4 GiB left buys 34 more at 100 MiB.
-        assert_eq!(workspace_cap(disk_with(4096), 4 * 100 * MIB, 4), Some(38));
+        // 100 MiB each on a volume with e.g. 4 GiB free. One tree's worth is
+        // reserved so the next one can still be cut, which leaves 3.9 GiB and
+        // buys 39 more at 100 MiB -- a reserve of a fifteenth of the volume
+        // would throw away another 600 MiB and answer 38.
+        assert_eq!(workspace_cap(disk_with(4096), 4 * 100 * MIB, 4), Some(43));
         // The same four trees, with the volume nearly full: the cap is smaller
         // than the number of trees that already exist, so the next pass
         // reclaims rather than grows.
         assert_eq!(workspace_cap(disk_with(300), 4 * 100 * MIB, 4), Some(6));
+        // Big trees on a nearly full volume: a fifteenth of what is free is
+        // less than one tree, so it would let one more be cut into room that a
+        // single tree then fills.
+        assert_eq!(workspace_cap(disk_with(500), 4 * 400 * MIB, 4), Some(4));
         // Trees that grew (the repository added a large file) shrink it too.
-        assert_eq!(workspace_cap(disk_with(4096), 4 * 400 * MIB, 4), Some(12));
+        assert_eq!(workspace_cap(disk_with(4096), 4 * 400 * MIB, 4), Some(13));
         // Nothing measured yet: no per-tree figure, so no invented cap.
         assert_eq!(workspace_cap(disk_with(4096), 0, 0), None);
         assert_eq!(workspace_cap(disk_with(4096), 0, 4), None);
