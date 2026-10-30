@@ -20068,7 +20068,6 @@ exit 0
             name: "cogneva".into(),
         };
         let templates = vec![TemplateSnapshot {
-            resource: "deployment".into(),
             name: "cogneva-evolution".into(),
             spec: serde_json::json!({
                 "containers": [{"name": "cogneva", "image": "localhost:30500/cogneva:main-old"}]
@@ -20155,7 +20154,6 @@ exit 0
             name: "cogneva".into(),
         };
         let templates = vec![TemplateSnapshot {
-            resource: "deployment".into(),
             name: "cogneva-evolution".into(),
             spec: serde_json::json!({"containers": [{"name": "cogneva"}]}),
         }];

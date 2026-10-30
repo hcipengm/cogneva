@@ -1707,8 +1707,12 @@ pub(crate) struct RefSnapshots {
     pub(crate) targets: Vec<RewrittenRef>,
 }
 
-/// 一次 apply 之前某个工作负载的 Pod 模板（`.spec.template.spec` 的原样），回滚
+/// 一次 apply 之前某个 deployment 的 Pod 模板（`.spec.template.spec` 的原样），回滚
 /// 在「镜像换回去了、Pod 还是起不来」时用它把整个模板换回去。
+///
+/// 只对 deployment：这一轮 apply 的目标清单就是 deployment（`RolloutTarget` 的
+/// `deployment` 字段），留一个资源词字段只是给 `get`/`patch` 的 argv 多一个可变来源，
+/// 而资源词一旦是算出来的，谁能读它就得靠猜。
 ///
 /// 只有一个镜像是不够的：apply 换的是整份清单，新版本可以把 env、卷、`secretKeyRef`
 /// 一起改掉，而 `kubectl set image` 一个都换不回来。2026-10-30 实测：新清单要求
@@ -1716,7 +1720,6 @@ pub(crate) struct RefSnapshots {
 /// 回滚把镜像换回旧版，模板里那条引用还在，旧镜像配新模板同样起不来，网关 0/1
 /// 挂了几分钟，最后是人对 `deployment` 做 `rollout undo` 才恢复。
 pub(crate) struct TemplateSnapshot {
-    pub(crate) resource: String,
     pub(crate) name: String,
     /// `spec.template.spec` 的 JSON 原文：合并补丁把这一整块换回去，不在 Rust 里
     /// 重新拼字段——拼出来的那一份与集群里那一份差一个字段，就是另一个模板。
@@ -4632,17 +4635,13 @@ impl RolloutExecutor {
     /// 读不到、读回来不是 JSON、或者里面没有 Pod 模板，都是这一轮**一处也不许动**的理由
     /// （与镜像快照同一条），而不是"跳过这一处"：少一处快照的那一轮，回滚会以为自己
     /// 有模板可还。
-    pub(crate) async fn snapshot_pod_template(
-        &self,
-        resource: &str,
-        name: &str,
-    ) -> SFResult<TemplateSnapshot> {
+    pub(crate) async fn snapshot_pod_template(&self, name: &str) -> SFResult<TemplateSnapshot> {
         let out = self
-            .run_kubectl(&["get", resource, name, "-o", "json"], 30)
+            .run_kubectl(&["get", "deployment", name, "-o", "json"], 30)
             .await?;
         let doc: serde_json::Value = serde_json::from_str(&out).map_err(|e| {
             SFError::IO(format!(
-                "reading the pod template of {resource}/{name}: the object did not come back as JSON: {e}"
+                "reading the pod template of deployment/{name}: the object did not come back as JSON: {e}"
             ))
         })?;
         let spec = doc
@@ -4652,11 +4651,10 @@ impl RolloutExecutor {
             .cloned()
             .ok_or_else(|| {
                 SFError::Config(format!(
-                    "{resource}/{name} carries no spec.template.spec; there is no template to put back"
+                    "deployment/{name} carries no spec.template.spec; there is no template to put back"
                 ))
             })?;
         Ok(TemplateSnapshot {
-            resource: resource.to_string(),
             name: name.to_string(),
             spec,
         })
@@ -4672,12 +4670,12 @@ impl RolloutExecutor {
             "spec": { "template": { "spec": snap.spec } }
         })
         .to_string();
-        let target = format!("{}/{}", snap.resource, snap.name);
+        let target = format!("deployment/{}", snap.name);
         match self
             .run_kubectl(
                 &[
                     "patch",
-                    &snap.resource,
+                    "deployment",
                     &snap.name,
                     "--type=merge",
                     "-p",
@@ -5181,10 +5179,7 @@ impl RolloutExecutor {
             // 模板读不到不拦这一轮，只丢掉这一处的兜底：回滚的主路径是 `set image`，
             // 模板是它落地了却没起来时的那一手。为一次 `get` 抖动扣住一次已经全绿的
             // 上线，代价比"回滚少一种手段"大得多——而少掉的那一种当场有一行点名。
-            match self
-                .snapshot_pod_template("deployment", &t.deployment)
-                .await
-            {
+            match self.snapshot_pod_template(&t.deployment).await {
                 Ok(template) => templates.push(template),
                 Err(e) => warn!(
                     deployment = %t.deployment,
@@ -5598,10 +5593,7 @@ impl RolloutExecutor {
                 // ——新加的 env / `secretKeyRef` / 卷在模板里留着，旧镜像配新模板
                 // 起不来。`set image` 换不掉这些字段，只有把整个 Pod 模板换回去才
                 // 换得掉。还不动就算了，但账上要记成这一处没收敛，不是"回滚成功"。
-                if let Some(snap) = templates
-                    .iter()
-                    .find(|s| s.resource == "deployment" && s.name == t.deployment)
-                {
+                if let Some(snap) = templates.iter().find(|s| s.name == t.deployment) {
                     if self.restore_pod_template(snap).await {
                         match self.wait_rollout_complete(t, &live_shape).await {
                             Ok(()) => {
