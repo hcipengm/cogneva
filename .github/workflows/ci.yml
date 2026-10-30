@@ -313,6 +313,19 @@ jobs:
         run: cargo test -p cog-storage --test principle_ledger_census -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # A refusal now carries the shape that caused it, and the shapes are rows
+      # in a table rather than a number: two shapes refused in the same second
+      # have to be two rows, the matched text has to survive verbatim, and a
+      # row written before the column existed has to stay uncounted instead of
+      # joining a shape that never produced it. All three are properties of what
+      # the insert and the grouped read do on a server -- the interesting ones
+      # are the same-instant collision and the null, neither of which a
+      # database-free double reproduces.
+      - name: Live-DB principle refusal shapes
+        if: ${{ !cancelled() }}
+        run: cargo test -p cog-storage --test principle_refusal_shapes -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The sample-log sweep is expressed almost entirely as one DELETE, so its
       # correctness cannot be checked without a server; the DB-free tests beside
       # it only cover the sweep period. Leaving these out of the gate is how a
