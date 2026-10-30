@@ -4038,12 +4038,14 @@ impl MainlineDeployer {
     /// 不用 CI、检查还没跑完）。三支各自的读数在 [`Self::record_ci_verdict_reading`]
     /// 里留：`None` 与 `Some(true)` 都放行，事后只有读数能把它们分开。
     ///
-    /// 折出 `None` 时**还要问一句为什么**（[`Self::record_ci_verdict_reason_reading`]）：
+    /// 每一轮**还要问一句谁没开口**（[`Self::record_ci_verdict_reason_reading`]）：
     /// `no_evidence` 那一格同时装着「还在跑」「路不通」「响应里没东西」，三支各有各的
-    /// 主人，只有原因读数能把它们分开。原因逐上游记，所以两个累计读数的关系是
-    /// `sum(reason) = no_evidence × 配置的上游数`，且**这条等式只自上游列表最后一次
-    /// 变更起成立**（两个计数都不带纪元，见那个方法的注释）；折出结论的那些轮不问
-    /// 原因——它已经在 `verdict` 那一格里说完了。
+    /// 主人，只有原因读数能把它们分开。原因逐上游记，记的是**沉默**而不是结论：一轮里
+    /// 每个没给出判词的上游各记一条，与这一轮别的上游有没有答、整轮折成了什么无关。
+    /// 所以它与 `no_evidence` 之间没有乘法关系——`no_evidence` 数的是整轮没有结论的
+    /// 轮次，只有当每一轮都全部沉默时两者才成 `sum(reason) = no_evidence × 上游数`。
+    /// 不按结论过滤是有代价的：一端问不到、另一端答了放行的那几轮，主线照常前进，
+    /// 那条坏掉的路只在这一格里；按整轮是否 no_evidence 过滤，它就连一格都没有。
     ///
     /// 每条原因还带上它自己的**平台**（`platform` 标签，取自上游配置里的
     /// `CodePlatform`，值域是那个枚举的闭集）：镜到两端的同一个仓库里，一端可能
@@ -4118,9 +4120,12 @@ impl MainlineDeployer {
             Some(true)
         };
         self.record_ci_verdict_reading(verdict, ask).await;
-        if verdict.is_none() {
-            self.record_ci_verdict_reason_reading(&reasons, ask).await;
-        }
+        // 沉默的上游每一轮都记，**不管这一轮有没有折出结论**：一个平台问不到而另一个
+        // 答了放行时，放行是对的（这一版有人核对过），但那条问不到的路仍然是坏的，而
+        // 它唯一的读数就是这一格。早先只在整轮没有结论时记，于是「一端一直 401、主线
+        // 靠另一端照常前进」在读数面上完全不存在——2026-10-30 实测：Gitee 的 401 在
+        // 计数面上是一行都没有的，只有 Job 日志里那一句。
+        self.record_ci_verdict_reason_reading(&reasons, ask).await;
         // 原因按「平台:原因」拼回去，与原因计数器同一套取值域；判出结论的轮次没有原因。
         let reason_slugs: Vec<String> = reasons
             .iter()
@@ -15475,6 +15480,128 @@ exec {real} "$@"
         );
     }
 
+    /// 一个上游真的读完了这一版并放行，另一个问不到：**不扣**。
+    ///
+    /// 与上面那条是同一原则的两面。「问不到 ≠ 放行」守的是「这一版没人核对过」，不是
+    /// 「每个平台都开过口」：镜到两端的同一个 rev 是同一棵树，一端读完并放行，这棵树
+    /// 就是核对过的。实测（2026-10-30）：Gitee 的凭证 06:53Z 起被 401 拒，主线从此每轮
+    /// 都扣、四个多小时没有一版落地；而同一份代码在 401 之前每一轮印的都是 gitee 的
+    /// `no_runs`——那一端结构上就没有 CI，问通了也只是一个空列表。
+    #[tokio::test]
+    async fn a_revision_one_upstream_judged_is_not_held_by_another_that_could_not_be_asked() {
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"name":"Test","conclusion":"success","completed_at":"2026-10-30T07:00:00Z","id":1}]}"#,
+        )])
+        .await;
+        let executor = RolloutExecutor::new("kubectl", "cogneva", 0, 1, 1, 1);
+        let ask = UpstreamCiAsk {
+            rev: "abc123".into(),
+            upstreams: vec![
+                UpstreamCiTarget {
+                    platform: "github".into(),
+                    api_base: format!("http://{endpoint}/github"),
+                    repo: "owner/repo".into(),
+                },
+                // 必然没人监听的端口：与那次真网关 401 在「这一问没有发生」上同形。
+                UpstreamCiTarget {
+                    platform: "gitee".into(),
+                    api_base: "http://127.0.0.1:1/gitee".into(),
+                    repo: "owner/repo".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            executor.ask_upstreams(&ask).await,
+            None,
+            "一端读完并放行，另一端问不到：这一版是被核对过的，不该按停整条主线"
+        );
+        handle.await.unwrap();
+    }
+
+    /// 另一端**还在跑**：仍然扣。跑着的那条检查可能翻红，而翻红是这一版的属性——
+    /// 与「问不到」那种说不出这一版任何事的情况不同。
+    #[tokio::test]
+    async fn a_still_running_upstream_holds_even_when_another_answered() {
+        let (green, green_handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"name":"Test","conclusion":"success","completed_at":"2026-10-30T07:00:00Z","id":1}]}"#,
+        )])
+        .await;
+        let (running, running_handle) =
+            fake_registry(vec![http_200(r#"{"check_runs":[{"conclusion":null}]}"#)]).await;
+        let executor = RolloutExecutor::new("kubectl", "cogneva", 0, 1, 1, 1);
+        let ask = UpstreamCiAsk {
+            rev: "abc123".into(),
+            upstreams: vec![
+                UpstreamCiTarget {
+                    platform: "github".into(),
+                    api_base: format!("http://{green}/github"),
+                    repo: "owner/repo".into(),
+                },
+                UpstreamCiTarget {
+                    platform: "gitee".into(),
+                    api_base: format!("http://{running}/gitee"),
+                    repo: "owner/repo".into(),
+                },
+            ],
+        };
+        let (flavor, reason) = executor.ask_upstreams(&ask).await.expect("必须扣住");
+        assert_eq!(flavor, CiHoldKind::Pending);
+        assert!(reason.contains("still running"), "{reason}");
+        green_handle.await.unwrap();
+        running_handle.await.unwrap();
+    }
+
+    /// 另一端答了放行、这一端问不到：主线照常前进，但这一端的沉默仍然要入账。
+    ///
+    /// 放行是对的，那条坏掉的路不因此变好，而它唯一的读数就是原因计数器——不记，
+    /// 「一端一直 401、主线靠另一端前进」在读数面上就是一行都没有。
+    #[tokio::test]
+    async fn a_silent_upstream_is_still_counted_when_another_upstream_answered() {
+        use cog_core::metric_names::MAINLINE_CI_NO_VERDICT_REASON_TOTAL;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let (endpoint, handle) = fake_registry(vec![http_200(
+            r#"{"check_runs":[{"name":"Test","conclusion":"success","completed_at":"2026-10-30T07:00:00Z","id":1}]}"#,
+        )])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        // 第二个上游配了却没有基址：一个请求都不会发出去，落在配置面那一格。
+        cfg.upstreams[1].api_base = None;
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+        assert_eq!(
+            deployer
+                .ci_verdict_with_failures("abc", CiAsk::RoundHead)
+                .await
+                .0,
+            Some(true),
+            "一端答了放行，整轮就有结论"
+        );
+        handle.await.unwrap();
+
+        let rows = metrics
+            .query_counter_totals(MAINLINE_CI_NO_VERDICT_REASON_TOTAL.as_str())
+            .await
+            .unwrap();
+        let gitee: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.labels.get(crate::LABEL_PLATFORM).map(String::as_str) == Some("gitee"))
+            .map(|r| {
+                r.labels
+                    .get(crate::LABEL_REASON)
+                    .map(String::as_str)
+                    .unwrap_or("<没有 reason>")
+            })
+            .collect();
+        assert_eq!(
+            gitee,
+            vec!["bad_api_base"],
+            "整轮折出了结论不等于每个上游都开了口：{rows:?}"
+        );
+    }
+
     /// 参数面是这一侧与派发侧之间唯一的契约：拼错的开关在别的通道上是一句报错，
     /// 在这条通道上会变成"安静地少问一次 CI"。
     #[test]
@@ -16667,7 +16794,8 @@ exec {real} "$@"
         let reason_total: f64 = rows.iter().map(|r| r.value).sum();
         assert_eq!(
             reason_total, 8.0,
-            "每轮 no_evidence 贡献「沉默的上游数」条原因: {rows:?}"
+            "这一组每一轮都全部沉默，所以每轮贡献「沉默的上游数」条原因；有上游答了的那几轮 \
+             也照记，只是不再等于 no_evidence 的倍数: {rows:?}"
         );
     }
 

@@ -4680,8 +4680,9 @@ impl RolloutExecutor {
         }
     }
 
-    /// 这一版在上游各平台的 CI 结论，折成「能不能滚」。`None` = 每一个上游都答了
-    /// 放行（或这一版根本没有东西可判），可以滚。
+    /// 这一版在上游各平台的 CI 结论，折成「能不能滚」。`None` = 可以滚：要么每个
+    /// 上游都答了（放行，或问到了但没有东西可判），要么至少一个上游答了放行而没有
+    /// 别的一端还在跑。**判红永远扣**，不管别的上游说了什么。
     pub(crate) async fn ask_upstreams(&self, ask: &UpstreamCiAsk) -> Option<(CiHoldKind, String)> {
         let mut failures: usize = 0;
         // 判词是失败、但上游没有逐条给名字的那几条（结论来自提交状态兜底）。
@@ -4689,6 +4690,9 @@ impl RolloutExecutor {
         // 问了、但这一轮不能放行的两种：上游还在跑，以及这一问根本没有发生。
         let mut still_running: Vec<String> = Vec::new();
         let mut not_asked: Vec<String> = Vec::new();
+        // 真的读完并放行的上游。它与上面两列一起决定「问不到」该不该扣：扣住要的是
+        // 「这一版没人核对过」，不是「每个平台都开过口」。
+        let mut answered: Vec<String> = Vec::new();
         for up in &ask.upstreams {
             let (verdict, reason, names, excluded, _cancelled) =
                 MainlineDeployer::platform_ci_verdict(&up.api_base, &up.repo, &ask.rev).await;
@@ -4711,7 +4715,7 @@ impl RolloutExecutor {
                     failures += 1;
                     failed.extend(names.into_iter().map(|n| format!("{}:{n}", up.platform)));
                 }
-                Some(true) => {}
+                Some(true) => answered.push(up.platform.clone()),
                 None => {
                     // 「没有判词」不是一个结论，是三种现场：还在跑、问到了没有东西、没
                     // 问到。第三种与「绿」之间没有任何共同点，把它读成放行，就是
@@ -4739,6 +4743,31 @@ impl RolloutExecutor {
             return Some((CiHoldKind::Red, reason));
         }
         if still_running.is_empty() && not_asked.is_empty() {
+            return None;
+        }
+        // 一个上游真的读完了这一版并放行，另一个问不到：不扣。
+        //
+        // 「问不到 ≠ 放行」守的是「这一版没人核对过」——2026-10-27 那两个平台都连不上
+        // 的一次。它要的不是「每个平台都必须开口」：镜到两端的同一个 rev 是同一棵树，
+        // 一端读完并放行，这棵树就是核对过的。把另一端的一次读失败读成扣住，代价全落
+        // 在主线上，而那一端在这套部署里**结构上**给不出判词：平台从不往 Gitee 写
+        // commit status，没有别的东西会替它跑 CI。
+        //
+        // 实测（2026-10-30）：Gitee 的凭证 06:53Z 起被 401 拒，主线从此每轮都扣，
+        // 四个多小时没有一版落地；而同一份代码在 06:53Z 之前每一轮都印着 gitee 的
+        // `no_runs`——问通了也只是一个空列表。一个只可能答「没有」的平台，唯一能
+        // 发生的就是问失败，而问失败就扣住整条主线。
+        //
+        // 「还在跑」仍然扣（走下面那支）：那一端可能翻红，而翻红是这一版的属性。
+        if !answered.is_empty() && still_running.is_empty() {
+            info!(
+                rev = %ask.rev,
+                answered = %answered.join(","),
+                not_asked = %not_asked.join(","),
+                "this revision was judged by the upstream(s) that answered and nothing is \
+                 running on the others; the ones that could not be asked are recorded in the \
+                 no-verdict reading and do not hold the rollout"
+            );
             return None;
         }
         // 没判红但也没放行。两种现场可能同时发生（一个平台还在跑、另一个连不上），
