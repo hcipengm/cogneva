@@ -48,7 +48,7 @@ use std::path::{Path, PathBuf};
 
 use crate::common;
 
-use common::lex::{blank, Dialect};
+use common::lex::{blank, strip, Dialect};
 use common::rust_production::{
     all_crate_files, production_sources, production_text, relative_name,
 };
@@ -151,12 +151,25 @@ fn modules(root: &Path) -> BTreeMap<String, Vec<PathBuf>> {
 /// `#[cfg(test)]` half is dropped, because a test module's call is not the
 /// crate's behaviour.
 fn code_of(files: &[PathBuf]) -> String {
+    project_files(files, |text| blank(&production_text(text), Dialect::Rust))
+}
+
+/// [`code_of`], with string literals left standing.
+///
+/// The question this projection answers is "which environment variable was this
+/// call given", and a blanked literal has no name left in it.
+fn stripped_code_of(files: &[PathBuf]) -> String {
+    project_files(files, |text| strip(&production_text(text), Dialect::Rust))
+}
+
+/// One module's files, read and projected the same way each time.
+fn project_files(files: &[PathBuf], project: impl Fn(&str) -> String) -> String {
     files
         .iter()
         .map(|path| {
             let raw =
                 std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            blank(&production_text(&raw), Dialect::Rust)
+            project(&raw)
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -267,6 +280,11 @@ fn is_ident(name: &str) -> bool {
 /// Production only: a `cog_core::` call in a test module does not make the base
 /// shared -- the crate that ships without the test does not reach it.
 fn consumer_code(root: &Path) -> BTreeMap<String, String> {
+    consumer_code_with(root, |text| blank(&production_text(text), Dialect::Rust))
+}
+
+/// [`consumer_code`] under a caller-chosen projection.
+fn consumer_code_with(root: &Path, project: impl Fn(&str) -> String) -> BTreeMap<String, String> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
     for path in production_sources(root) {
         let name = relative_name(root, &path);
@@ -279,7 +297,7 @@ fn consumer_code(root: &Path) -> BTreeMap<String, String> {
         }
         let raw =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        let code = blank(&production_text(&raw), Dialect::Rust);
+        let code = project(&raw);
         out.entry(dir.to_owned()).or_default().push_str(&code);
     }
     out
@@ -745,4 +763,171 @@ fn the_marker_scan_separates_a_call_from_a_mention() {
 /// [`code_of`]'s two projections, over text instead of a file.
 fn code_of_text(text: &str) -> String {
     blank(&production_text(text), Dialect::Rust)
+}
+
+/// A census that read fewer environment variables than this out of the base has
+/// gone wrong, and the rule below would pass over the empty set.
+///
+/// Three, against the five the base reads today: the floor is a "the scan still
+/// works" tripwire, not an inventory, so it is set low enough that a module
+/// leaving the base does not have to be argued about here first.
+const MIN_ENVIRONMENT_READS: usize = 3;
+
+/// The same tripwire for the consumer side.
+///
+/// The whole workspace reads well over a hundred variables today; the floor is
+/// there so that a scan which read nothing outside the base cannot report "no
+/// overlap" and call that a pass.
+const MIN_CONSUMER_ENVIRONMENT_READS: usize = 50;
+
+/// The environment variables a piece of code reads, by name.
+///
+/// Two spellings are live in this tree: the literal, and a
+/// `const NAME: &str = "VALUE"` declared in the same module. Anything else -- a
+/// parameter, a name assembled at runtime, the reference `EnvSecretProvider` is
+/// handed -- is skipped rather than guessed at: a guessed name would make the
+/// rule below fire on a variable nobody reads, and stay quiet on one that is.
+fn environment_reads(code: &str) -> BTreeSet<String> {
+    let mut consts: BTreeMap<String, String> = BTreeMap::new();
+    for statement in code.split(';') {
+        let Some(at) = statement.rfind("const ") else {
+            continue;
+        };
+        let decl = &statement[at + "const ".len()..];
+        let name: String = decl
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        let (Some(eq), false) = (decl.find('='), name.is_empty()) else {
+            continue;
+        };
+        let value = decl[eq + 1..].trim_start();
+        if let Some(after) = value.strip_prefix('"') {
+            if let Some(end) = after.find('"') {
+                consts.insert(name, after[..end].to_owned());
+            }
+        }
+    }
+
+    let mut out = BTreeSet::new();
+    for needle in ["env::var(", "env::var_os("] {
+        let mut from = 0;
+        while let Some(at) = code[from..].find(needle) {
+            let start = from + at + needle.len();
+            let rest = code[start..].trim_start();
+            let name = match rest.strip_prefix('"') {
+                Some(after) => after.split('"').next().map(str::to_owned),
+                None => {
+                    let ident: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    consts.get(&ident).cloned()
+                }
+            };
+            if let Some(name) = name.filter(|name| !name.is_empty()) {
+                out.insert(name);
+            }
+            from = start;
+        }
+    }
+    out
+}
+
+/// The base may read the environment; nobody else may read what it reads.
+///
+/// Reading a deployment knob is a shape -- a path, a default, a switch -- only
+/// while one place decides it. The moment a consumer reads the same variable,
+/// the base is holding knowledge that only that consumer needs, and the crate
+/// nobody may change is now part of a policy two components execute. Whichever
+/// side is wrong, the base's copy is the one that has to move: a consumer can
+/// put the knob in its own config, and the base has nowhere to put it.
+///
+/// The rule is narrower than "the base does not read the environment", which the
+/// census below would fail today on five modules that are supposed to read it --
+/// paths, config, topology, secrets, and the body-egress switch. The failure mode
+/// worth a gate is the duplication, so the duplication is what is judged.
+#[test]
+fn an_environment_variable_the_base_reads_is_not_read_elsewhere() {
+    let root = common::root::repo_root();
+    let mut base: BTreeSet<String> = BTreeSet::new();
+    for files in modules(&root).values() {
+        base.extend(environment_reads(&stripped_code_of(files)));
+    }
+    assert!(
+        base.len() >= MIN_ENVIRONMENT_READS,
+        "read {} environment variables out of `{BASE_SRC}` (floor {MIN_ENVIRONMENT_READS}): \
+         the scan is lying, and the rule below would pass over the empty set",
+        base.len()
+    );
+
+    let mut leaked = Vec::new();
+    let mut read_by_consumers = 0_usize;
+    for (crate_dir, code) in
+        consumer_code_with(&root, |text| strip(&production_text(text), Dialect::Rust))
+    {
+        let reads = environment_reads(&code);
+        read_by_consumers += reads.len();
+        for name in reads {
+            if base.contains(&name) {
+                leaked.push(format!("{name}: the base and {crate_dir} both read it"));
+            }
+        }
+    }
+    assert!(
+        read_by_consumers >= MIN_CONSUMER_ENVIRONMENT_READS,
+        "read {read_by_consumers} environment variables out of the crates outside the base \
+         (floor {MIN_CONSUMER_ENVIRONMENT_READS}): the consumer scan is lying, and an \
+         overlap with the base cannot be found in a set that was never read"
+    );
+    assert!(
+        leaked.is_empty(),
+        "environment variables decided in two places, one of which is the base:\n  {}\n\
+         The base keeps shapes; which directory to write to, which namespace to \
+         label, whether a body may leave -- that is the consumer's policy and it \
+         changes without the base changing. A consumer reads its own config key \
+         and the base reads nothing of it, or the knob stays a parameter the \
+         consumer passes in.",
+        leaked.join("\n  ")
+    );
+    println!(
+        "{} environment variables read by the base, none of them read elsewhere",
+        base.len()
+    );
+}
+
+/// The environment scan reads a read, and not a mention of one.
+///
+/// Same shape as the marker scan's polarity check, for the same reason: a
+/// scanner that answered "no" to everything would make the rule above pass over
+/// every module, and one that answered "yes" to a comment would make it fire on
+/// documentation.
+#[test]
+fn the_environment_scan_separates_a_read_from_a_mention() {
+    let read = "fn name() -> Option<String> { std::env::var(\"COGNEVA_NAMESPACE\").ok() }";
+    assert!(
+        environment_reads(&strip(read, Dialect::Rust)).contains("COGNEVA_NAMESPACE"),
+        "a real read was not read: the scan answers no to everything"
+    );
+
+    let indirect = "const DATA_DIR_ENV: &str = \"COGNEVA_DATA_DIR\";\n\
+                    fn dir() -> Option<String> { std::env::var(DATA_DIR_ENV).ok() }";
+    assert!(
+        environment_reads(&strip(indirect, Dialect::Rust)).contains("COGNEVA_DATA_DIR"),
+        "a variable named by a const was not resolved, so the value its consumer \
+         spells out would go unseen on both sides"
+    );
+
+    let mention = "/// Reads `std::env::var(\"COGNEVA_NAMESPACE\")`.\nfn name() {}";
+    assert!(
+        environment_reads(&strip(mention, Dialect::Rust)).is_empty(),
+        "a read quoted in a doc comment was counted as a read"
+    );
+
+    let fixture = "#[cfg(test)]\nmod tests {\n    \
+                   fn t() { std::env::var(\"COGNEVA_TEST_ONLY\").ok(); }\n}\n";
+    assert!(
+        environment_reads(&strip(&production_text(fixture), Dialect::Rust)).is_empty(),
+        "a read in a test module was counted as the crate's behaviour"
+    );
 }
