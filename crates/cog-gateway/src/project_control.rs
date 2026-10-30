@@ -407,7 +407,14 @@ const KIND_STARTED_TASKS: &str = "started_tasks";
 /// 项目能不能算出挣值：`earned_value` 为 `None` 的项目一条越界都判不出来。
 const KIND_PROJECT_EVM: &str = "project_evm";
 
-const COVERAGE_KINDS: [(&str, fn(Coverage) -> (u64, u64)); 3] = [
+/// 一行覆盖率读数怎么取：种类名，加上一份「把覆盖率拆成（该有、已经有）」的函数。
+///
+/// 单写一个别名不是为了少打几个字，是因为这张表的元素类型两头都要写在纸上——一边是
+/// 名字，一边是取值函数——不加名字时每次读这张表都得先在心里把 `fn(Coverage) -> (u64, u64)`
+/// 解一遍才知道两格分别是什么。
+type CoverageRowRead = fn(Coverage) -> (u64, u64);
+
+const COVERAGE_KINDS: [(&str, CoverageRowRead); 3] = [
     (KIND_TASK_BASELINE, |c| (c.tasks, c.tasks_baselined)),
     (KIND_STARTED_TASKS, |c| (c.started, c.started_baselined)),
     (KIND_PROJECT_EVM, |c| (c.projects, c.projects_measurable)),
