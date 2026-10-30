@@ -202,4 +202,16 @@ if out="$(run "${d}")"; then fail "一侧渲染成空却判绿：${out}"; fi
 grep -q '两侧都渲染出东西才谈得上对齐：k3s=0 个资源' <<<"${out}" \
   || fail "判红却没说出两侧各读到多少：${out}"
 
+# 9. 容器镜像只改一侧：这是唯一一个两侧都写、却一直没人比过的能力面。镜像换了一半
+#    的集群里，两个副本跑的是两份代码——而两侧的清单各自看起来都完整，parity 报「全
+#    对齐」，读的人只会去查别处。
+d="$(case_dir image)"
+edit_doc "${d}/deploy/k3s/redis-deployment.yaml" \
+  'kind: StatefulSet' \
+  'image: quay.io/prometheus/node-exporter:v1.12.1-distroless' \
+  'image: quay.io/prometheus/node-exporter:v1.11.0-distroless'
+if out="$(run "${d}")"; then fail "镜像只改了一侧却判绿：${out}"; fi
+one_error "${out}" "容器镜像"
+grep -q 'image' <<<"${out}" || fail "判红却没点名镜像那一格：${out}"
+
 echo "DEPLOY PARITY GATE TESTS OK"

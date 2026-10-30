@@ -6,7 +6,7 @@
 # 比什么：资源集合一个不少不多，且两侧都不是空的；每工作负载的 sa/automount/pod
 # securityContext/整份卷声明/Pod 模板的 labels 与 annotations（Pod 标签是
 # NetworkPolicy 的 podSelector 与 Service 的 selector 的匹配面，改名即换受众）；
-# 每容器的 args/端口(含协议)/挂载(含只读)/env(含取值来源)/envFrom(含 optional 与
+# 每容器的镜像/args/端口(含协议)/挂载(含只读)/env(含取值来源)/envFrom(含 optional 与
 # prefix)/命令正文/探针/资源声明/securityContext/workingDir；Service 的
 # type/selector/clusterIP 与其上的其余 spec 字段；NetworkPolicy、Ingress、
 # StorageClass、Namespace、ServiceAccount 的整份对象（NetworkPolicy 那四条就是
@@ -259,6 +259,7 @@ def workload(doc):
     conts = {}
     for c in ps.get('containers', []) + ps.get('initContainers', []):
         conts[c['name']] = {
+            'image': c.get('image', ''),
             'args': ' '.join(c.get('args', [])),
             'ports': sorted(port_sig(p) for p in c.get('ports', [])),
             'envFrom': sorted(envfrom_sig(e) for e in c.get('envFrom', [])),
@@ -412,7 +413,7 @@ for name in sorted(both):
                     errors.append(f"{kind}/{name[1]} [{cn}] {f} k3s-only: {x}")
                 for x in sorted(set(hc[f]) - set(kc[f])):
                     errors.append(f"{kind}/{name[1]} [{cn}] {f} helm-only: {x}")
-            for f in ('resources', 'probes', 'securityContext', 'workingDir', 'command'):
+            for f in ('image', 'resources', 'probes', 'securityContext', 'workingDir', 'command'):
                 if kc[f] != hc[f]:
                     errors.append(f"{kind}/{name[1]} [{cn}] {f}: k3s={kc[f]} helm={hc[f]}")
         if kind == 'CronJob':
