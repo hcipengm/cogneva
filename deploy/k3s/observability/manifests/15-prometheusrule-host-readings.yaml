@@ -1353,3 +1353,47 @@ spec:
           annotations:
             summary: "面名正本有 {{ $value }} 行读不出来，对账那一拍没有结论"
             description: "跑 `bash scripts/host/cogneva-face-symmetry-reading.sh`，看 `invalid_row` 逐行的原因（列数不够、kind 写成 face/cross 以外、同名声明两次）。正本有坏行时上面两格会停印：残缺的分母会让「少了一个面」和「少了一行」看起来是同一件事，而修法相反。先修表，再看对账结论。"
+
+    # 面主名册的**入向**：名册文件里写的面主，图里认不认。
+    #
+    # 这条通道有两个写者，但它们改的不是同一件事：`governance-roster-writer` 每 60 秒把
+    # 名册导进图里，导的是**结构**（面的存在、说明、判据读数），所有权它一律不碰
+    # （`--keep-ownership`）；而派人是另一条路——声明的面主不在心跳名册里时，自动派人
+    # （`governance:auto-staffing`）会开一条交接把面交给在场的人，**两处签名都签它自己**，
+    # 于是这条交接不需要任何别人同意就成立了。两种行为都对得上各自的设计，合起来的结果
+    # 却是：**名册一旦被机器越过，就再也拿不回来**——导入只刷新说明，而图的修订号已经
+    # 大过 1，文件里的 owner 从此是一句没有人执行的话。
+    #
+    # 2026-10-24 至 10-27 实测就是这一版：15 个面由自动派人交给 `f5`，名册还写着
+    # `operator`/`worker`；面读数全绿（f5 在场、有值班行），漂移数是 18，没有任何东西在读它。
+    #
+    # 所以这两格判的不是「出事了」，是「声明与事实分家了，要有个人来收口」：把名册改成
+    # 图里那一版（承认这次派人），或者走一次交接把人换回来。分家本身不响；响的是分家
+    # 之后没有人被叫到名字。
+    - name: cogneva-governance-roster
+      rules:
+        # 等十分钟：改名册那一下会在下一拍被导入，漂移数当场归零；持续十分钟还差的，
+        # 是没有人打算改的那一种。
+        - alert: CognevaGovernanceRosterDrift
+          expr: max(roster_rows_not_in_graph) > 0
+          for: 10m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "名册与图有 {{ $value }} 个面主对不上，没人打算收口"
+            description: "跑 `bash scripts/principles/governance-roster-freshness.sh` 看它点名的每一行（面、名册说的、图里记的）。两种收口方向都对，但必须选一个：名册是目标，图是事实——要图里那个人继续干，就把 `scripts/data/faces.tsv` 的 owner 列改成它（导入下一拍生效）；要名册那个人回来，就走 `governance handover` 开一次交接，签字应用之后图才会动。**不要**手改图里的 `owner_unit`：自动派人签的是 `governance:auto-staffing`，手改出来的那一版没有签名，下一次在场性变化时会被当成没有出处的那一档。"
+
+        # 写者每 60 秒一拍，界 300 秒（脚本里的 `--max-age`）。等十分钟是为了让一次滚动
+        # ——Pod 换了、`kubectl exec` 那几拍打不通——与通道死掉分开。
+        - alert: CognevaGovernanceRosterImportStale
+          expr: max(roster_import_age_seconds) > 300
+          for: 10m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "名册 {{ $value }} 秒没导进图了，这一方向的通道大概已经停了"
+            description: "先看写者单元：`systemctl --user status cogneva-governance-roster-writer.timer`，再跑一次 `bash scripts/host/cogneva-governance-roster-writer.sh` 看它退几。它失败时会在状态目录留一个 `roster-import.failed` 标记，而读数见到标记就判「读不到」（退 3）而不是报超期——那种情况下这条规则会先停印而不是先响，`CognevaHostReadingProducerUnreadable` 会先响；两条一起看：这一条说的是「没人导」，那一条说的是「读不出导没导」。"
