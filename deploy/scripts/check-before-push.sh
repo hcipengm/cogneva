@@ -271,6 +271,54 @@ else
     echo "SKIP  crate 骨架：本机没有可用的 cargo（CI 的 Test 会跑这两步）"
 fi
 
+# Clippy 那一格在 CI 里是整份 workspace 的 `--all-targets -- -D warnings`，红一格就判整轮
+# 四十分钟为红。它的红只值一行：2026-10-30 一次 `let mut` 的 `unused_mut` 就这样烧掉了一轮，
+# 而本机此前一条读数都看不见它——脚本末尾那句「未覆盖」里写着 Clippy。
+#
+# 本机不能整份跑：实测一次冷跑 214 秒，而且共享工作树里别人飞到一半的文件也在判词里，
+# 红的那个人往往不是推的人。所以这一格的**题目**由 diff 推出来——这次要推的提交动过哪些
+# `crates/<dir>` 下的 `.rs`，就把那个计件包名（读 `crates/<dir>/Cargo.toml` 的 `name`，
+# 不点名，`crates/bootstrap` 这种目录名与包名不一致的也不用另写一条）交给 cargo；**每一个
+# 题目里跑的是 CI 的同一条命令与同一组 flag**，不挑 lint、不挑 target。CI 仍然整份跑。
+#
+# 题目取 `origin/main...HEAD` 而不是工作树：推的是提交，判词该落在提交上。工作树里别人的
+# 半成品只以一个途径进来——它所在的 crate 若被这次提交碰到，编译绕不开它。那时红的是
+# 他们，先 `git status` 看红的是谁的文件。
+if [ -n "${cargo_bin}" ]; then
+    if ! git rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null; then
+        echo "SKIP  Clippy：本机没有 origin/main，推的范围判不出来（CI 的 Clippy 会整份跑）"
+    elif ! "${cargo_bin}" clippy --version >/dev/null 2>&1; then
+        echo "SKIP  Clippy：这个工具链没装 clippy 组件（CI 的 Clippy 会整份跑）"
+    else
+        mapfile -t touched_crates < <(
+            git diff --name-only 'origin/main...HEAD' -- 'crates/*.rs' |
+                awk -F/ '$1 == "crates" && NF >= 3 { print $2 }' | sort -u
+        )
+        clippy_args=()
+        crate_count=0
+        for crate_dir in ${touched_crates[@]+"${touched_crates[@]}"}; do
+            package="$(sed -n 's/^name *= *"\([^"]*\)".*/\1/p' "crates/${crate_dir}/Cargo.toml" 2>/dev/null | head -1)"
+            if [ -n "${package}" ]; then
+                clippy_args+=(-p "${package}")
+                crate_count=$((crate_count + 1))
+            else
+                # 有 `.rs` 却读不到包名：那个目录不是工作区成员。另一条门
+                # （`crate_source_membership_contract_test`）判这件事，这里只说没判到。
+                echo "SKIP  Clippy：crates/${crate_dir} 下这次动过源码但读不到包名，这一份没判（CI 的 Clippy 会整份跑）"
+            fi
+        done
+        if [ "${crate_count}" -gt 0 ]; then
+            echo "== Clippy：这次要推的提交动过 ${crate_count} 个 crate 的源码，按 CI 同一条命令判"
+            run_step "cargo clippy ${clippy_args[*]} --all-targets -- -D warnings" \
+                "${cargo_bin}" clippy "${clippy_args[@]}" --all-targets -- -D warnings
+        else
+            echo "== Clippy：这次要推的提交没动 crates/ 下的 .rs，跳过（CI 的 Clippy 会整份跑）"
+        fi
+    fi
+else
+    echo "SKIP  Clippy：本机没有可用的 cargo 或 python3（CI 的 Clippy 会整份跑）"
+fi
+
 # Check 作业本机跑不动（要编译整个工作区，比 CI 还慢），可它红得最多的一种形状本机
 # 几秒钟就能判：**推上去的这几笔，新增了对一个这棵树里不存在的模块的引用**。
 # 2026-10-29 实测过一次代价：一笔带 `use crate::test_support::scrape;` 而定义它的文件
@@ -315,5 +363,6 @@ if [ "${failures}" -ne 0 ]; then
     exit 1
 fi
 echo "PRE-PUSH: 上列的 shell 面判据全绿。"
-echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Test / Clippy / Code Coverage /"
+echo "Clippy 只判这次要推的提交动过的 crate；其余 crate 的 lint 仍由 CI 整份跑。"
+echo "未覆盖（要编译 / 要 Node，CI 才会跑）：Check / Test / Code Coverage /"
 echo "Format / Version Contract / Web Build / Bootstrap Cross-Platform。"
