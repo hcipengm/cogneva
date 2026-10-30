@@ -632,7 +632,7 @@ write_state() { # outcome, released_kb, gap_pct, targets, skipped, unreadable, u
     local tmp
     tmp="$(mktemp "${state_file}.XXXXXX")"
     cat >"${tmp}" <<EOF
-{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"unlabelled":$7,"deferred_tier":"$8","deferred_need_pct":${9:-null},"tag_reached":${10:-0},"scan":"${scan_coverage:-}","dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
+{"last_run":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","outcome":"$1","trigger_pct":${trigger_pct},"floor_pct":${floor_pct},"used_pct_before":${before_pct},"used_pct_after":${disk_pct},"released_bytes":$(( $2 * 1024 )),"gap_pct":$3,"targets":$4,"skipped":$5,"unreadable":$6,"unlabelled":$7,"deferred_tier":"$8","deferred_need_pct":${9:-null},"tag_reached":${10:-0},"left_alone":${left_alone:-null},"scan":"${scan_coverage:-}","dry_run":${dry_run},"rev":"${script_rev}","rev_state":"${script_state}","script":"${script_sha}"}
 EOF
     mv -f -- "${tmp}" "${state_file}"
 }
@@ -646,9 +646,9 @@ report() { # outcome, released_kb, covered, skipped, unreadable, unlabelled, def
     local gap=0
     [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
     local reached="${9:-0}"
-    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s unlabelled=%s unreadable=%s tag_reached=%s scan=%s deferred_tier=%s deferred_need_pct=%s rev=%s rev_state=%s script=%s\n' \
+    printf 'target-gc: outcome=%s trigger=%s%% floor=%s%% before=%s%% after=%s%% released=%s gap=%s%% caches=%s skipped=%s left_alone=%s unlabelled=%s unreadable=%s tag_reached=%s scan=%s deferred_tier=%s deferred_need_pct=%s rev=%s rev_state=%s script=%s\n' \
         "$1" "${trigger_pct}" "${floor_pct}" "${before_pct}" "${disk_pct}" \
-        "$(human_kb "$2")" "${gap}" "$3" "$4" "$6" "$5" "${reached}" \
+        "$(human_kb "$2")" "${gap}" "$3" "$4" "${left_alone:--}" "$6" "$5" "${reached}" \
         "${scan_coverage:-}" "${7:-}" "${8:-}" \
         "${script_rev}" "${script_state}" "${script_sha}"
     # A plan is not a run, so it does not become the last run. The state file is
@@ -756,6 +756,21 @@ skipped=0
 covered=0
 tag_reached_file="${released_dir}/tag_reached"
 : >"${tag_reached_file}"
+# Every tree a tier walk refused to touch because a process of ours was building
+# into it or holding it open. Without this the two endings below are the same
+# line: "the cheap tiers found nothing to release" and "the cheap tiers were
+# kept away from the only tree worth releasing" both read as a gap that `gap_pct`
+# cannot explain, and the run's own sentence then blames the cache for a disk it
+# was never allowed to reclaim.
+# Empty, not zero, until the walks have actually run: a run that stops before
+# enumerating anything (an uncommitted script, a filesystem it could not read)
+# has not found that zero trees were blocked, it has not looked. `${left_alone}`
+# stays empty for those and the state carries `null` -- the reading then exports
+# nothing, because "every tree was reachable" and "nobody looked" are two
+# different statements and only one of them is a measurement.
+left_alone_file="${released_dir}/left_alone"
+: >"${left_alone_file}"
+left_alone=""
 for target in "${candidates[@]}"; do
     if [ "$(fs_identity "${target}")" != "${work_fs}" ]; then
         log "skipping ${target}: another filesystem (the trigger was read from ${work_root})"
@@ -883,6 +898,7 @@ for tier in ${TIERS}; do
         reason="$(busy_reason "${target}" "${released_dir}/busy")"
         if [ -n "${reason}" ]; then
             log "leaving ${target} alone: pid ${reason}"
+            printf '%s\n' "${target}" >>"${left_alone_file}"
             continue
         fi
         progressed=1
@@ -927,12 +943,32 @@ fi
 gap=0
 [ "${disk_pct}" -gt "${floor_pct}" ] && gap=$((disk_pct - floor_pct))
 
+# Counted once, after the walks: a tree skipped in three tiers is one tree this
+# run never touched, and the ending below is about trees, not about decisions.
+# Reaching this line is what makes the zero a measurement.
+left_alone=0
+if [ -s "${left_alone_file}" ]; then
+    left_alone="$(LC_ALL=C sort -u -- "${left_alone_file}" | wc -l | tr -d ' ')"
+fi
+# The one sentence an operator reads after a run that did not reach the floor has
+# to answer "was the cache the reason" -- and a run that never got to touch the
+# big trees has not answered it. Saying "the build cache is not what is filling
+# this filesystem" while N trees were left alone because somebody was compiling
+# is a refusal reported as a finding.
+left_alone_clause=""
+[ "${left_alone}" -eq 0 ] ||
+    left_alone_clause=" -- and ${left_alone} tree(s) were left alone because a process of ours was building into or holding one, so this run's release set was not the whole cache: run again when the trees are idle"
+
 if [ "${outcome}" = floor_unreachable ]; then
     if [ -n "${deferred_tier}" ]; then
         # The cheap tiers ran out and the expensive one was held back on purpose:
         # that is a different ending from "nothing on this filesystem is ours",
         # and only this line tells them apart.
-        log "still above the floor after every tier the water level allowed: ${gap} points short, and the ${deferred_tier} tier was deferred -- it waits for ${deferred_need_pct}% and this run had ${disk_pct}%, because releasing it deletes the current artifacts and costs a full rebuild"
+        log "still above the floor after every tier the water level allowed: ${gap} points short, and the ${deferred_tier} tier was deferred -- it waits for ${deferred_need_pct}% and this run had ${disk_pct}%, because releasing it deletes the current artifacts and costs a full rebuild${left_alone_clause}"
+    elif [ "${left_alone}" -gt 0 ]; then
+        # Every tier ran and every candidate in reach was in use: the gap is not
+        # evidence about the cache at all.
+        log "still above the trigger after every tier, but this run was kept out of ${left_alone} tree(s) by a process of ours building into or holding one: the gap of ${gap} points says nothing about whether the cache is the reason until a run reaches them"
     else
         log "still above the trigger after every tier: the build cache is not what is filling this filesystem (gap ${gap} points)$(
             [ "${unlabelled}" -eq 0 ] || printf ', and %s cache-like tree(s) no run can judge were never in reach' "${unlabelled}"

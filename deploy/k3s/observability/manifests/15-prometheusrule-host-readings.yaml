@@ -367,8 +367,11 @@ spec:
             summary: "有进程读不到属主／工作目录，回收器整轮不释放"
             description: "它判断某棵树是不是被占着时必须认得占着它的进程；认不出就不动（删除不可撤销）。journal 里那一行会点名是哪个 pid、读不到的是什么。"
 
-        # 便宜的三档都走完、盘仍在地板之上：缓存不是这颗盘被填满的原因。这条红的意思是
-        # 「去看是谁在吃盘」，不是「缓存没删干净」——所以它与上两条分开。
+        # 便宜的三档都走完、盘仍在地板之上。三种来路，修法各不相同，所以它与上两条分开：
+        # 真的有东西在吃盘；破坏性那一档被推迟到了 85%；或者**这一趟根本没轮到大树**——
+        # 唯一值得回收的那棵正被某人的 cargo 写着，回收器按契约不动它。第三种最容易被
+        # 读成第一种（读数是同一行 `floor_unreachable`），而它的修法是「等树空下来再跑一趟」，
+        # 不是去查谁在吃盘。`cogneva_host_target_gc_left_alone` 就是分这第三种的那一格。
         - alert: CognevaHostTargetGcFloorUnreachable
           expr: cogneva_host_target_gc_outcome{outcome="floor_unreachable"} == 1
           for: 1h
@@ -378,7 +381,7 @@ spec:
             severity: warning
           annotations:
             summary: "构建缓存已经放到地板之上仍回不去"
-            description: "它把它能判的树都放过了，盘依然在地板之上。运行 journal 那一行会说是「缓存不是原因」还是「破坏性的一档被推迟到了 85%」。看谁在吃：`bash scripts/host/cogneva-host-footprint-trend-reading.sh`。"
+            description: "先看 `cogneva_host_target_gc_left_alone`：大于 0 说明这一趟被构建挡在树外、缓存是不是原因还没人知道，等树空下来再跑一趟；这一格不在（`null`）也是同一句——那一趟在枚举候选之前就停了，它没看，不是它看见零棵树被挡。只有它为 0，才按下面两条判——journal 那一行会说是「缓存不是原因」还是「破坏性的一档被推迟到了 85%」。看谁在吃：`bash scripts/host/cogneva-host-footprint-trend-reading.sh`。"
 
     # NVMe 磨损与硬件健康（`nvme_wear`，宿主侧每拍读一次 SMART log）。
     #

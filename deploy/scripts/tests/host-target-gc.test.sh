@@ -246,6 +246,24 @@ grep -q "leaving ${byopen} alone: pid" <<<"${out}" \
   || fail "持有该树内文件描述符的构建被无视了；fd 那条腿 fail-open"
 grep -q 'unreadable=0' <<<"${out}" || fail "无法归属的进程没有被单列成读数：${out}"
 
+# A tree left alone is a *refusal*, and a refusal printed only as a journal line
+# leaves the ending claiming a finding it does not have. The run above reached
+# every tier and touched neither tree; its last line has to say that, and the
+# state has to carry the count -- a reader selecting by outcome sees
+# `floor_unreachable` and nothing else.
+grep -q 'left_alone=2' <<<"${out}" \
+  || fail "被写者挡住的两棵树没有进结局读数；读者看到的是「便宜档没东西可删」：${out}"
+python3 - "${work}/state.json" <<'PY' || fail "状态文件里没有 left_alone，按 outcome 取行的读者永远看不见这次拒绝"
+import json, sys
+state = json.load(open(sys.argv[1]))
+assert state.get("left_alone") == 2, state
+PY
+grep -q 'kept out of 2 tree(s)' <<<"${out}" \
+  || fail "结局文案把「没轮到我」说成了「缓存不是原因」：${out}"
+if grep -q 'the build cache is not what is filling this filesystem' <<<"${out}"; then
+  fail "树被写者挡着的同时宣称缓存不是原因；这是把拒绝当成了结论：${out}"
+fi
+
 # --- 6b) a process that ended is not a process we cannot attribute -----------
 # The probe can read `/proc/<pid>` and fail to read `/proc/<pid>/cwd` for two
 # reasons that call for opposite answers: the process is there and out of reach
@@ -711,6 +729,16 @@ out="$(run_gc COGNEVA_TARGET_GC_DISK_READER="${gate_reader}" \
 grep -q 'outcome=script_unverified' <<<"${out}" \
   || fail "改过还没提交的脚本仍然动手了：${out}"
 grep -q 'rev_state=modified' <<<"${out}" || fail "没有说明它为什么不动手：${out}"
+# It stopped before enumerating anything, so it has not found that no tree was
+# blocked -- it has not looked. A count of 0 here would be the unmeasured zero
+# this whole field exists to keep out of the ending.
+grep -q 'left_alone=-' <<<"${out}" \
+  || fail "没走完候选枚举的运行报了被挡住的树数；没看过不等于零棵：${out}"
+python3 - "${work}/state.json" <<'PY' || fail "没看过的那一趟把 left_alone 写成了观测值（0 会被读成「每棵树都够得到」）"
+import json, sys
+state = json.load(open(sys.argv[1]))
+assert state.get("left_alone") is None, state
+PY
 [ -f "${gate_tree}/debug/deps/libstale.rlib" ] \
   || fail "改过的脚本删了文件；删除路径必须只跑提交过的版本"
 [ -f "${gate_tree}/debug/incremental/x/dep-graph.bin" ] \
