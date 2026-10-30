@@ -1,0 +1,213 @@
+# promtool 规则单测：项目面（任务管理）重规划回路的两条后果判据**真的会 firing**，
+# 而且只在它该响的时候响。
+#
+# 为什么要有这一层：这两条的结构是 `sum(increase(...[6h])) > 0`。结构门只判得出
+# 「这条读了那序列」，判不出它在什么时候出现。
+#   * `> 0` 写成 `>= 0`：没有序列时它不响，但有序列且恒为 0 时**永远响**；
+#   * 把 `{outcome="dispatch_failed"}` 写成不带过滤的选择器：只要回路在跑就响；
+#   * 把 `[6h]` 换成无限或去掉 `increase()` 直接读计数器：响一次之后永不安静；
+#   * 把 `reading=~"no_baseline|cost_unreadable"` 写成 `reading=~".*"`：
+#     那一格会被 `no_ledger` 每分钟点亮一次，从此永久红。
+# 所以每一格都配了反向证据：红的落点是「该响没响」与「该安静没安静」两种。
+#
+# 最要紧的一格是第四组（`no_ledger` 不进来）：那是这份规则**故意**写在射程之外的，
+# 而它是这条回路里唯一每轮都会增长的那一格。删掉 `reading=~` 这条过滤，这一组会红。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/25-prometheusrule-project-control.yaml \
+#         deploy/k3s/observability/tests/25-prometheusrule-project-control.test.yaml
+rule_files:
+  - ../manifests/25-prometheusrule-project-control.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、一次派发失败：在 30 分钟那一刻长出 1。
+  # 前半格是反向证据——刚长上去就响，等于把一次瞬时抖动报成事故（`for: 10m` 就是这一档）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_outcomes_total{outcome="dispatch_failed"}'
+        values: '0x30 1x40'
+      # 同一时刻造任务那格安静着：判词成立但交接还没走完的那一瞬不是这条的红。
+      - series: 'cogneva_project_control_outcomes_total{outcome="minted"}'
+        values: '0x70'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaReplanDispatchFailed
+        exp_alerts: []
+      - eval_time: 35m
+        alertname: CognevaReplanDispatchFailed
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CognevaReplanDispatchFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "任务管理"
+
+  # 二、窗口滚过去之后自己安静：这才是「一直失败一直亮、失败过一阵子就灭掉」。
+  # 没有这一格，`[6h]` 写成无穷（或直接读计数器）也照样绿，而那条红再没人能熄。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_outcomes_total{outcome="dispatch_failed"}'
+        values: '0x30 1x400'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaReplanDispatchFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "任务管理"
+      - eval_time: 400m
+        alertname: CognevaReplanDispatchFailed
+        exp_alerts: []
+
+  # 三、干净的负对照：回路每轮都在跑、结局都正常，全程不许响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_outcomes_total{outcome="dispatch_failed"}'
+        values: '0x420'
+      - series: 'cogneva_project_control_outcomes_total{outcome="minted"}'
+        values: '0x200 3x220'
+      - series: 'cogneva_project_control_outcomes_total{outcome="already_open"}'
+        values: '0x100 5x320'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaReplanDispatchFailed
+        exp_alerts: []
+      - eval_time: 400m
+        alertname: CognevaReplanDispatchFailed
+        exp_alerts: []
+
+  # 四、`no_ledger` 刻意不进来：这一版部署没接 token 账，它每轮都记一次。
+  # 按斜率判它就是一条永久红；这一组的存在就是那条「故意的射程外」的判据。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_ledger"}'
+        values: '0x420'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: CognevaProjectIndexUnmeasurable
+        exp_alerts: []
+      - eval_time: 400m
+        alertname: CognevaProjectIndexUnmeasurable
+        exp_alerts: []
+
+  # 五、基线和账读不出来是真的判不了，这一格里它该响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_baseline"}'
+        values: '0x30 1x40'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaProjectIndexUnmeasurable
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CognevaProjectIndexUnmeasurable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "任务管理"
+
+  # 六、三种量不成同时出现时，`sum` 数的是全部，不是只数第一种。
+  # 没有这一格，把 `sum(...)` 写成 `max(...)`（或只留 `no_baseline`）也照样绿。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_baseline"}'
+        values: '0x30 2x40'
+      - series: 'cogneva_project_control_unmeasured_total{reading="cost_unreadable"}'
+        values: '0x30 3x40'
+      - series: 'cogneva_project_control_unmeasured_total{reading="no_ledger"}'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaProjectIndexUnmeasurable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "任务管理"
+
+  # 七、开工了却没有基线：差额 2 条。前三十分钟是反向证据——`for: 30m` 还没走完，
+  # 一条任务刚开工、基线正要在同一笔里写下来的那一瞬不该响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_coverable_rows{kind="started_tasks"}'
+        values: '10x80'
+      - series: 'cogneva_project_control_covered_rows{kind="started_tasks"}'
+        values: '8x80'
+      - series: 'cogneva_project_control_coverage_measured_unix'
+        values: '0x80'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaStartedTaskWithoutBaseline
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: CognevaStartedTaskWithoutBaseline
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "任务管理"
+
+  # 八、干净的负对照：开工的全都有基线，全程不许响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_coverable_rows{kind="started_tasks"}'
+        values: '10x200'
+      - series: 'cogneva_project_control_covered_rows{kind="started_tasks"}'
+        values: '10x200'
+      - series: 'cogneva_project_control_coverage_measured_unix'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaStartedTaskWithoutBaseline
+        exp_alerts: []
+      - eval_time: 150m
+        alertname: CognevaStartedTaskWithoutBaseline
+        exp_alerts: []
+
+  # 九、读数冻住了就不许再说话：差额还在，但覆盖已经三小时没量成。
+  # 没有这一格，去掉时刻守卫、把一条冻住的差额永久点亮，也照样绿。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_coverable_rows{kind="started_tasks"}'
+        values: '10x220'
+      - series: 'cogneva_project_control_covered_rows{kind="started_tasks"}'
+        values: '8x220'
+      - series: 'cogneva_project_control_coverage_measured_unix'
+        values: '0x220'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaStartedTaskWithoutBaseline
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "任务管理"
+      - eval_time: 200m
+        alertname: CognevaStartedTaskWithoutBaseline
+        exp_alerts: []
+
+  # 十、缺基线的都是还没开工的行：那不算缺陷人口，不许响。
+  # 没有这一格，把 `kind="started_tasks"` 写成 `kind="task_baseline"`（甚至不带过滤）
+  # 也照样绿，而那条红永远不会灭——新任务一建出来就缺基线。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_project_control_coverable_rows{kind="task_baseline"}'
+        values: '100x120'
+      - series: 'cogneva_project_control_covered_rows{kind="task_baseline"}'
+        values: '10x120'
+      - series: 'cogneva_project_control_coverable_rows{kind="started_tasks"}'
+        values: '6x120'
+      - series: 'cogneva_project_control_covered_rows{kind="started_tasks"}'
+        values: '6x120'
+      - series: 'cogneva_project_control_coverage_measured_unix'
+        values: '0x120'
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: CognevaStartedTaskWithoutBaseline
+        exp_alerts: []

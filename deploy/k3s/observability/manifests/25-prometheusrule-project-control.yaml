@@ -1,0 +1,91 @@
+# 重规划回路的**后果**接上判据：这一环判出越界之后，活有没有真的落成。
+#
+# 为什么需要：`cogneva_project_control_outcomes_total` 与 `_unmeasured_total` 早在
+# `/metrics` 上，五种结局与三种「量不成」各有自己的格子。但它们此前一条规则也没有——
+# 读数存在、消费者不存在，于是「一次都没派发成功」与「一切正常」在告警面上同形。
+# 面板不是消费者：没有人会因为一块面板变色去修东西。
+#
+# 两条判据分开，因为修的地方不同：
+#
+#   - `dispatch_failed`：判出了越界，交给造任务那一侧时整体失败，这一轮什么都没落定。
+#     修的是编排侧的交接那一步。
+#   - `no_baseline`／`cost_unreadable`：这一轮根本判不了。前者是计划基线表读不出来，
+#     后者是有 token 账但这一下读不到。
+#
+# **`no_ledger` 刻意不进来**：进程里没有 token 账是一个装配选择（这一版部署没接账），
+# 不是故障；它每轮都记一次，按斜率判就是一条永远亮、谁也灭不掉的红。它该被读在
+# `cogneva_project_control_unmeasured_total{reading="no_ledger"}` 那一格上，由看那一面
+# 的人决定要不要接账。这里写在射程之外，是有意的，不是漏了。
+#
+# 界取 6 小时窗的 `increase`，不是「计数器非零」：这条回路的间隔是 600 秒，一次失败在
+# 6 小时窗里留一条，窗口滚过去自己灭掉；一直失败就一直亮——那正是要的。反过来按
+# 「非零」判，进程启动以来第一次失败会让规则**永久**点亮（计数器只增不减），那条红
+# 再没人能熄。
+#
+# 不用伴生钟：这两条是进程自己的计数器，进程停下时序列消失、`increase()` 变空，规则
+# 自己静下来；那种情形该响的是进程本身（`background_loop_stalled`），不是这条后果。
+#
+# 第三条判的是**覆盖**，与前两条不同源：前两条问「判出来的活落成了没有」，这一条问
+# 「有多少活根本判不出来」。基线覆盖率只是一个比例，比例单独存在时说不出人口——3917
+# 行里的 61% 与 3 行里的 61% 读起来一样。所以这里的判据不用比例，用**已经开工却缺基线
+# 的行数**：待定与已排期的任务还没轮到自己有基线，缺着不算漏；开工之后还缺，那一条此后
+# 每一轮都判不出来，而它已经在花时间与 token 了。已取消的也不算：它不再贡献任何挣值。
+#
+# 这一条的读法是「积压有多大」，不是「掉没掉过线」：它上面那个差额就是积压的行数，
+# 判据是它走到零。历史积压降得慢不影响这条成立——降不动本身就是要看见的事实。
+#
+# 为什么要那个时刻守卫：这三格是**会被冻住**的读数（这一轮没量成就不更新），进程活着
+# 但量不成的时候，差额会停在上一份上，把一条已经不该说话的判据永久点亮。守卫取三小时，
+# 是这条回路节拍（600 秒）的十八倍：健康的回路每十分钟盖一次章，不会在两次之间被读成停。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-project-control
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-project-control
+      rules:
+        - alert: CognevaReplanDispatchFailed
+          expr: |
+            sum(increase(cogneva_project_control_outcomes_total{outcome="dispatch_failed"}[6h])) > 0
+          for: 10m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "任务管理"
+            severity: warning
+          annotations:
+            summary: "重规划回路判出了越界，但 6 小时里有 {{ $value }} 轮没能把它交出去"
+            description: "`cogneva_project_control_outcomes_total{outcome=\"dispatch_failed\"}` 在动，意思是这一轮判出了越界、交给造任务那一侧时整体失败，什么都没落定。先看同一时刻的 `outcome=\"minted\"` 在不在动：两格都在动说明只是其中一轮抖了一下；只有失败那格在动说明交接这条路断了。再看 `cogneva_loop_tick_age_seconds{loop=\"gateway_project_control\"}` 确认判词那一侧还活着——两个都活着而仍然失败，修的是 `ReplanMinter::mint_replans` 那条调用，不是池子也不是账本。别逐条去动项目里的任务行：这条回路下一轮会自己再判一次。"
+
+        - alert: CognevaProjectIndexUnmeasurable
+          expr: |
+            sum(increase(cogneva_project_control_unmeasured_total{reading=~"no_baseline|cost_unreadable"}[6h])) > 0
+          for: 10m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "任务管理"
+            severity: warning
+          annotations:
+            summary: "挣值这一轮没能判：6 小时里有 {{ $value }} 轮有一个量没量成"
+            description: "`cogneva_project_control_unmeasured_total` 在动，标签 `reading` 分开说是哪一种：`no_baseline` 是计划基线表整张读不出来（三个量全算不了，修的是 `task_plan` 那条读路），`cost_unreadable` 是账在、这一下读不到（修的是 token 账）。两者都不是「没有越界」——后面那种情形这一轮一条判词都没有。`reading=\"no_ledger\"` 不在这条规则的射程内：那是装配选择，不是故障，按斜率判会让这条永久点亮。判据是这几格不再增长，不是这条红消失。"
+
+        - alert: CognevaStartedTaskWithoutBaseline
+          expr: |
+            sum(
+                cogneva_project_control_coverable_rows{kind="started_tasks"}
+                  - on(kind)
+                cogneva_project_control_covered_rows{kind="started_tasks"}
+              ) > 0
+              and on()
+            ((time() - cogneva_project_control_coverage_measured_unix) < 10800)
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "任务管理"
+            severity: warning
+          annotations:
+            summary: "{{ $value }} 条已经开工的任务没有基线，挣值这一面判不出它们"
+            description: "缺的是计划基线那一行（`task_plan`）：没有它，这三个量一个都算不了，所以这些任务无论落后多少都不会变成一条重规划——它们在挣值面上是隐形的。这个数就是积压的行数，判据是它走到零。先看 `cogneva_project_control_coverable_rows{kind=\"started_tasks\"}` 有多大：分母同时掉说明是任务行在减少，不是基线补上了。别拿虚构的计划起止去补历史行——那会把一条从没承诺过的基线写成承诺过的；补这一行要走正常的重规划/基线发布那条路。新任务要在**开工之前**带基线，否则补完积压第二天又长回来。"

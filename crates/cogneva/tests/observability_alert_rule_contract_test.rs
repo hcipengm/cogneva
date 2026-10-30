@@ -659,6 +659,26 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_project_control_unmeasured_total",
         "crates/cog-gateway/src/project_control.rs",
     ),
+    // The same loop's coverage account: how many rows are on the graph at all,
+    // how many of them carry the baseline row the earned-value arithmetic needs,
+    // and the moment that was last measured. Numerator and denominator are two
+    // series on purpose -- a share alone cannot say whether 61% means "the graph
+    // is three rows and none of them are due yet" or "3917 rows and half of them
+    // are being spent on invisibly". The timestamp is what stops the pair from
+    // being read after the producer stopped measuring: the pair is a level, so
+    // it does not go stale by itself.
+    (
+        "cogneva_project_control_coverable_rows",
+        "crates/cog-gateway/src/project_control.rs",
+    ),
+    (
+        "cogneva_project_control_covered_rows",
+        "crates/cog-gateway/src/project_control.rs",
+    ),
+    (
+        "cogneva_project_control_coverage_measured_unix",
+        "crates/cog-gateway/src/project_control.rs",
+    ),
     // The project face's audit outlet, in three counters: how many rows were
     // asked for, how many of them did not land, and how many found no writer at
     // all. Split because the repairs differ -- the store, the database, and the

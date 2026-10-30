@@ -73,9 +73,15 @@ pub fn spawn_project_control(
 /// 一轮：判出所有越界，把它们一起交给编排侧。
 pub async fn run_once(state: &Arc<GatewayState>, minter: &dyn ReplanMinter) {
     let readings = readings();
-    let (breaches, blind) = breaches_this_pass(state).await;
+    let (breaches, blind, coverage) = breaches_this_pass(state).await;
     for reason in blind {
         readings.record_blind(reason);
+    }
+    // 覆盖只在真的量成了的那一轮才盖出去：没量成时保留上一份与它自己的时刻，
+    // 由读那一面按时刻判它新不新——把「这一轮没量成」写成 0 覆盖，与「图上真的
+    // 一行基线都没有」同形，而后者是一个需要动手的事实。
+    if let Some(coverage) = coverage {
+        readings.record_coverage(coverage, Utc::now().timestamp());
     }
     dispatch(&breaches, minter).await;
 }
@@ -149,21 +155,30 @@ pub async fn dispatch(breaches: &[BreachReport], minter: &dyn ReplanMinter) {
     }
 }
 
-/// 这一轮有哪些项目越界，以及这一轮有哪些量**没量成**。
-async fn breaches_this_pass(state: &Arc<GatewayState>) -> (Vec<BreachReport>, Vec<Blind>) {
+/// 这一轮有哪些项目越界、有哪些量**没量成**，以及这一轮量成的那份覆盖。
+///
+/// 覆盖与判词同一次遍历出：覆盖率是「这一轮到底看见了多大的图」，它只有在与判词
+/// 同一时刻读出来的前提下才说明得了「那几条越界是在多大的图上判的」。
+async fn breaches_this_pass(
+    state: &Arc<GatewayState>,
+) -> (Vec<BreachReport>, Vec<Blind>, Option<Coverage>) {
     // 基线读不到时一个项目也判不了：三个量全靠它。空着回去，而不是把每个项目都
     // 报成不越界——那是两件事。
     let Some(plans) = readable_plans(&state.orchestrator).await else {
-        return (Vec::new(), vec![Blind::NoBaseline]);
+        return (Vec::new(), vec![Blind::NoBaseline], None);
     };
     let tasks = state.orchestrator.get_all_tasks().await;
     // 一轮问一次账，不是每个项目问一次：账里已经有 task_id，按项目切是本地的事。
     match spends_of(state.llm_usage.as_ref(), &tasks).await {
-        Ok(spends) => (
-            breaches_of(&tasks, &plans, Some(&spends), Utc::now()),
-            Vec::new(),
-        ),
-        Err(blind) => (breaches_of(&tasks, &plans, None, Utc::now()), vec![blind]),
+        Ok(spends) => {
+            let (breaches, coverage) = breaches_of(&tasks, &plans, Some(&spends), Utc::now());
+            (breaches, Vec::new(), Some(coverage))
+        }
+        // 账读不到时覆盖照样算得出来：挣值那一侧的分母是基线，不是花销。
+        Err(blind) => {
+            let (breaches, coverage) = breaches_of(&tasks, &plans, None, Utc::now());
+            (breaches, vec![blind], Some(coverage))
+        }
     }
 }
 
@@ -277,6 +292,40 @@ impl Blind {
 const OUTCOME_LABEL: &str = crate::LABEL_OUTCOME;
 const BLIND_LABEL: &str = "reading";
 
+/// 这一轮在图上看见了多少行，其中有多少行量得出来。
+///
+/// 为什么分子与分母是同一族的两格、而不是一个比例：一个孤立的「覆盖率 61%」在 3 行
+/// 的图上与在 3917 行的图上读起来一样，而它们的修法相反——前者是刚建的项目、还不该
+/// 有基线，后者是装配漏了、每天都少判一片。人口下限必须跟着数一起出去，而不是让读
+/// 那个比例的人自己猜。
+///
+/// 两种覆盖各有自己的分母：任务行的分母是图上全部任务，项目行的分母是图上全部项目
+/// （未分组不算项目，它没有根）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Coverage {
+    /// 图上全部任务行，与其中有一行基线的行。
+    pub tasks: u64,
+    pub tasks_baselined: u64,
+    /// 已经开工或已经收尾的任务行，与其中有一行基线的行。
+    ///
+    /// 这一格才是**缺陷人口**：待定与已排期还没轮到自己有基线，缺着不算漏；开工
+    /// 之后还缺，那一条此后每一轮都判不出来，而它已经在花时间与 token 了。
+    pub started: u64,
+    pub started_baselined: u64,
+    /// 图上的项目数（不含未分组），与挣值挣得出来的项目数。
+    pub projects: u64,
+    pub projects_measurable: u64,
+}
+
+/// 已经开工或已经收尾的任务：它本该有一行基线。
+///
+/// 已取消的不算：它此后不再贡献任何挣值，补一行基线改变不了任何读数，把它记进缺陷
+/// 人口只会让那个数永远降不到零。
+fn baseline_due(status: cog_core::TaskStatus) -> bool {
+    use cog_core::TaskStatus::{Completed, Failed, Running};
+    matches!(status, Running | Completed | Failed)
+}
+
 /// 这条回路从本进程起来到现在，落成了多少条、有多少轮没量成。
 ///
 /// 进程级累计，随生产者一起消失：它是「这条回路在这一版部署上做了什么事」，
@@ -285,6 +334,12 @@ const BLIND_LABEL: &str = "reading";
 pub struct Readings {
     outcomes: [std::sync::atomic::AtomicU64; Outcome::ALL.len()],
     blindsight: [std::sync::atomic::AtomicU64; Blind::ALL.len()],
+    /// 最近一轮量成的那份覆盖，连同量成它的时刻（unix 秒）。
+    ///
+    /// 带时刻而不是只带值，是因为它是个**会被冻住的读数**：这一轮没量成时不更新它，
+    /// 光看值分不出「刚量过」与「两小时前量过一次」。读的那一面拿 `time() - 时刻`
+    /// 判新旧，停下来的量器不会把一份旧覆盖继续冒充成现在的。
+    coverage: std::sync::Mutex<Option<(Coverage, i64)>>,
 }
 
 impl Readings {
@@ -313,6 +368,18 @@ impl Readings {
             )
         })
     }
+
+    /// 盖出这一轮量成的覆盖。没量成的那一轮不许调它——留着上一份与它自己的时刻，
+    /// 比写一份零更像真话。
+    pub fn record_coverage(&self, coverage: Coverage, measured_at_unix: i64) {
+        if let Ok(mut slot) = self.coverage.lock() {
+            *slot = Some((coverage, measured_at_unix));
+        }
+    }
+
+    pub fn coverage(&self) -> Option<(Coverage, i64)> {
+        self.coverage.lock().ok().and_then(|slot| *slot)
+    }
 }
 
 /// 本进程的那一份。做成进程级而不是挂在状态上的一个字段，与后台循环的注册表
@@ -325,6 +392,27 @@ pub fn readings() -> Arc<Readings> {
 pub const OUTCOMES_TOTAL: &str = "cogneva_project_control_outcomes_total";
 pub const UNMEASURED_TOTAL: &str = "cogneva_project_control_unmeasured_total";
 
+/// 某一类行在图上总共有多少（分母）。
+pub const COVERABLE_ROWS: &str = "cogneva_project_control_coverable_rows";
+/// 其中有多少量得出来（分子）。
+pub const COVERED_ROWS: &str = "cogneva_project_control_covered_rows";
+/// 上一次量成覆盖的时刻（unix 秒）；0 表示这一版还没量成过。
+pub const COVERAGE_MEASURED_UNIX: &str = "cogneva_project_control_coverage_measured_unix";
+
+const COVERAGE_KIND_LABEL: &str = "kind";
+/// 任务行有没有一行基线（`task_plan`）：没有基线的行三个挣值量一个都算不了。
+const KIND_TASK_BASELINE: &str = "task_baseline";
+/// 同上，人口收窄到「已经开工或已经收尾」的行：这一格的差额是缺陷，不是还没轮到。
+const KIND_STARTED_TASKS: &str = "started_tasks";
+/// 项目能不能算出挣值：`earned_value` 为 `None` 的项目一条越界都判不出来。
+const KIND_PROJECT_EVM: &str = "project_evm";
+
+const COVERAGE_KINDS: [(&str, fn(Coverage) -> (u64, u64)); 3] = [
+    (KIND_TASK_BASELINE, |c| (c.tasks, c.tasks_baselined)),
+    (KIND_STARTED_TASKS, |c| (c.started, c.started_baselined)),
+    (KIND_PROJECT_EVM, |c| (c.projects, c.projects_measurable)),
+];
+
 #[async_trait::async_trait]
 impl cog_core::Observable for Readings {
     async fn collect_metrics(
@@ -332,7 +420,9 @@ impl cog_core::Observable for Readings {
         _dimension: &str,
     ) -> cog_core::SFResult<Vec<cog_core::observability::RawMetric>> {
         // 零值也发：一格还没发生过是这一版部署的读数，缺一格则什么都不是。
-        let mut readings = Vec::with_capacity(Outcome::ALL.len() + Blind::ALL.len());
+        let mut readings = Vec::with_capacity(
+            Outcome::ALL.len() + Blind::ALL.len() + 2 * COVERAGE_KINDS.len() + 1,
+        );
         for (outcome, count) in self.counts() {
             readings.push(
                 cog_core::observability::RawMetric::new(OUTCOMES_TOTAL, count as f64)
@@ -345,6 +435,24 @@ impl cog_core::Observable for Readings {
                     .with_label(BLIND_LABEL, blind.label()),
             );
         }
+        // 覆盖也照发，包括「还没量成过」那一份全零：缺一格会让「这一版没量过」与
+        // 「这一版不认识这个读数」同形。时刻那一格是它的保鲜标记。
+        let (coverage, measured_at) = self.coverage().unwrap_or_default();
+        for (kind, cells) in COVERAGE_KINDS {
+            let (coverable, covered) = cells(coverage);
+            readings.push(
+                cog_core::observability::RawMetric::new(COVERABLE_ROWS, coverable as f64)
+                    .with_label(COVERAGE_KIND_LABEL, kind),
+            );
+            readings.push(
+                cog_core::observability::RawMetric::new(COVERED_ROWS, covered as f64)
+                    .with_label(COVERAGE_KIND_LABEL, kind),
+            );
+        }
+        readings.push(cog_core::observability::RawMetric::new(
+            COVERAGE_MEASURED_UNIX,
+            measured_at as f64,
+        ));
         Ok(readings)
     }
 
@@ -370,18 +478,33 @@ fn breaches_of(
     plans: &BTreeMap<String, cog_core::TaskPlan>,
     spends: Option<&BTreeMap<String, u64>>,
     now: chrono::DateTime<chrono::Utc>,
-) -> Vec<BreachReport> {
+) -> (Vec<BreachReport>, Coverage) {
     let mut by_project: BTreeMap<&str, Vec<&Task>> = BTreeMap::new();
     for task in tasks {
         by_project.entry(task.project_key()).or_default().push(task);
     }
 
+    // 与判词同一次遍历数出来：覆盖说的是「这一轮判词是在多大的图上得的」，分成
+    // 两趟数就会在图上正在变的时候给出一份与判词不相干的覆盖。
+    let mut coverage = Coverage {
+        tasks: tasks.len() as u64,
+        tasks_baselined: tasks.iter().filter(|t| plans.contains_key(&t.id)).count() as u64,
+        started: tasks.iter().filter(|t| baseline_due(t.status)).count() as u64,
+        started_baselined: tasks
+            .iter()
+            .filter(|t| baseline_due(t.status) && plans.contains_key(&t.id))
+            .count() as u64,
+        ..Coverage::default()
+    };
+
     let mut found = Vec::new();
     for (project, rows) in by_project {
-        // 未分组不是项目：它没有根，一条重规划挂在谁下面都说不清。
+        // 未分组不是项目：它没有根，一条重规划挂在谁下面都说不清。它也因此不进
+        // 项目级的分母——它是桶，不是项目。
         if project == UNGROUPED {
             continue;
         }
+        coverage.projects += 1;
         // 一条基线行都没有的项目，三个量量不出来，不必去算。
         if !rows.iter().any(|t| plans.contains_key(&t.id)) {
             continue;
@@ -396,9 +519,15 @@ fn breaches_of(
             None,
             now,
         );
+        // 「挣值算得出来」判的是挣值本身，不是两个指数：指数各有自己的分母
+        // （计划价值、实际成本），把「指数为 `None`」记进覆盖会让刚起步的项目
+        // 与真的算不出挣值的项目混成一格。
+        if evm.earned_value.value.is_some() {
+            coverage.projects_measurable += 1;
+        }
         found.extend(breaches_in(&evm));
     }
-    found
+    (found, coverage)
 }
 
 /// 一份挣值读数里的越界。
@@ -600,8 +729,42 @@ mod tests {
         let mut plans: BTreeMap<String, cog_core::TaskPlan> = BTreeMap::new();
         // 基线全在未分组那条上：g1 一条都没有。
         plans.insert("u".into(), plan("u", 1000, -20, -10, now));
-        let found = breaches_of(&[ungrouped, unplanned], &plans, Some(&BTreeMap::new()), now);
+        let (found, coverage) =
+            breaches_of(&[ungrouped, unplanned], &plans, Some(&BTreeMap::new()), now);
         assert_eq!(found, Vec::new(), "两个项目都没有可比的基线");
+        // 分母仍然是两个项目：判不出来不等于图里没有它，那正是要看见的缺口。
+        assert_eq!(coverage.projects, 1, "未分组不进项目级分母");
+        assert_eq!(coverage.projects_measurable, 0);
+        assert_eq!(coverage.tasks, 2);
+        assert_eq!(coverage.tasks_baselined, 1, "基线全在未分组那条上");
+        // 两条都已经开工或收尾，一条有基线：差额 1 就是这条回路的缺陷人口。
+        assert_eq!(coverage.started, 2);
+        assert_eq!(coverage.started_baselined, 1);
+    }
+
+    /// 「还没轮到」与「漏了」分得开：待定、已排期、已取消缺基线不算缺陷人口，开工
+    /// 之后还缺才算。
+    ///
+    /// 合成一格会让那个数永远降不到零——每建一条新任务它就加一，而新任务刚建出来
+    /// 本来就不该有基线。那样的红不是判据，是背景噪声。
+    #[test]
+    fn only_tasks_that_have_already_started_count_as_missing_a_baseline() {
+        let now = chrono::Utc::now();
+        let rows = [
+            task("p", "g1", TaskStatus::Pending),
+            task("s", "g1", TaskStatus::Scheduled),
+            task("r", "g1", TaskStatus::Running),
+            task("c", "g1", TaskStatus::Completed),
+            task("f", "g1", TaskStatus::Failed),
+            task("x", "g1", TaskStatus::Cancelled),
+        ];
+        // 一行基线也没有。
+        let (found, coverage) = breaches_of(&rows, &BTreeMap::new(), None, now);
+        assert_eq!(found, Vec::new());
+        assert_eq!(coverage.tasks, 6);
+        assert_eq!(coverage.tasks_baselined, 0);
+        assert_eq!(coverage.started, 3, "开工与收尾的三条才算缺陷人口");
+        assert_eq!(coverage.started_baselined, 0);
     }
 
     /// 账读不到时进度照判、成本不判：一条腿断不代表另一条腿也断。
@@ -618,9 +781,16 @@ mod tests {
         .map(|p| (p.task_id.clone(), p))
         .collect();
 
-        let found = breaches_of(&[done, late], &plans, None, now);
+        let (found, coverage) = breaches_of(&[done, late], &plans, None, now);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].index, PerformanceIndex::Schedule);
+        // 账读不到不拖累覆盖：挣值那一侧的分母是基线，不是花销。
+        assert_eq!(coverage.tasks, 2);
+        assert_eq!(coverage.tasks_baselined, 2);
+        assert_eq!(coverage.projects, 1);
+        assert_eq!(coverage.projects_measurable, 1);
+        assert_eq!(coverage.started, 2);
+        assert_eq!(coverage.started_baselined, 2);
     }
 
     /// 判出来的越界真的交到造任务那一侧：几条就交几条，没越界就一次都不交。
@@ -793,6 +963,85 @@ mod tests {
             );
         }
         assert!(published.iter().all(|m| m.value == 0.0), "新起的一份全是零");
+    }
+
+    /// 覆盖发的是**分子与分母两格**，另带量成它的时刻。
+    ///
+    /// 只发一个比例的话，「图上只有 3 行、其中 0 行有基线」与「3917 行里 2385 行有
+    /// 基线」在读数面上同形，而前者该等、后者该修。只发值不发时刻的话，一份两小时
+    /// 前量成的覆盖会继续冒充现在的——这一格恰恰是会在量不成时被冻住的。
+    #[test]
+    fn the_coverage_ships_its_denominator_and_the_moment_it_was_measured() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let readings = Readings::default();
+        let published = runtime
+            .block_on(cog_core::Observable::collect_metrics(&readings, ""))
+            .unwrap();
+        assert_eq!(
+            cell(&published, COVERAGE_MEASURED_UNIX, None),
+            Some(0.0),
+            "还没量过是 0，不是「刚量过一份全零」"
+        );
+
+        readings.record_coverage(
+            Coverage {
+                tasks: 3917,
+                tasks_baselined: 2385,
+                started: 600,
+                started_baselined: 540,
+                projects: 10,
+                projects_measurable: 7,
+            },
+            1_790_000_000,
+        );
+        let published = runtime
+            .block_on(cog_core::Observable::collect_metrics(&readings, ""))
+            .unwrap();
+        assert_eq!(
+            cell(&published, COVERABLE_ROWS, Some(KIND_TASK_BASELINE)),
+            Some(3917.0)
+        );
+        assert_eq!(
+            cell(&published, COVERED_ROWS, Some(KIND_TASK_BASELINE)),
+            Some(2385.0)
+        );
+        assert_eq!(
+            cell(&published, COVERABLE_ROWS, Some(KIND_STARTED_TASKS)),
+            Some(600.0)
+        );
+        assert_eq!(
+            cell(&published, COVERED_ROWS, Some(KIND_STARTED_TASKS)),
+            Some(540.0)
+        );
+        assert_eq!(
+            cell(&published, COVERABLE_ROWS, Some(KIND_PROJECT_EVM)),
+            Some(10.0)
+        );
+        assert_eq!(
+            cell(&published, COVERED_ROWS, Some(KIND_PROJECT_EVM)),
+            Some(7.0)
+        );
+        assert_eq!(
+            cell(&published, COVERAGE_MEASURED_UNIX, None),
+            Some(1_790_000_000.0)
+        );
+    }
+
+    /// 一格里那个值：按指标名取，带 `kind` 的再按 `kind` 取。
+    fn cell(
+        published: &[cog_core::observability::RawMetric],
+        name: &str,
+        kind: Option<&str>,
+    ) -> Option<f64> {
+        published
+            .iter()
+            .find(|m| {
+                m.name == name && m.labels.get(COVERAGE_KIND_LABEL).map(String::as_str) == kind
+            })
+            .map(|m| m.value)
     }
 
     /// 量不出来与量出来是零是两件事：账没接上时成本绩效永远算不出来，这时
