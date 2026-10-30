@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_key_value_reading_parsed_to_end_of_line_swallows_the_fields_that_follow
 # 空白机恢复的回执：可重入、按包认身份、逐段对账。
 #
 # 这里用假的 kubectl 与假的恢复实现，是因为被测的是「回执怎么判」，不是集群
