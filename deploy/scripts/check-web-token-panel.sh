@@ -21,14 +21,17 @@
 #      折叠每整点落一行，没折的区间与没花销的区间给出同一个答案（空列表）；
 #      不读端点的那一屏会把「没读到」显示成「没花钱」。
 #
-# 同一本账有三条读面，每条各自过一遍上面四条，谁也不替谁作证：
-#   `/token-usage`         按执行者合并——答「谁花的」；
-#   `/token-usage/series`  按窗口分行  ——答「什么时候花的」；
-#   `/token-usage/outcomes` 每次尝试的结局——答「为什么一分没花」。
+# 同一本账有四条读面，每条各自过一遍上面四条，谁也不替谁作证：
+#   `/token-usage`          按执行者合并——答「谁花的」；
+#   `/token-usage/series`   按窗口分行  ——答「什么时候花的」；
+#   `/token-usage/outcomes` 每次尝试的结局——答「试过但没成」；
+#   `/token-usage/account`  省下账与判定账——答「根本没发起 / 本来在花、现在停了」。
 # 只判第一条时，画时间轴的那一屏可以整块消失而门全绿：它的一条也不在被判的路径上。
-# 第三条读的是逐笔账本而不是折叠表，所以它自报的区间叫 `since`/`until`：账本没有
-# 「还没折到这里」这回事，答得出的就是它读过的。判据的形状不变——那一屏必须把
-# 它实际读到的区间显示出来，而不是把请求的区间当结果。
+# 后两条读的是逐笔账本与两本旁账而不是折叠表，所以它们自报的区间叫 `since`/`until`：
+# 账本没有「还没折到这里」这回事，答得出的就是它读过的。判据的形状不变——那一屏必须
+# 把它实际读到的区间显示出来，而不是把请求的区间当结果。
+# 第三条与第四条各答一种零花销，是一种的两个半边：少了第三条，「根本没发起」会读成
+# 「没人用模型」；少了第四条，「本来在花、无声停了」同样读成「没人用模型」。
 #
 # 用法：bash deploy/scripts/check-web-token-panel.sh [仓库根目录]
 set -euo pipefail
@@ -52,6 +55,7 @@ READS = [
     ("/api/v1/observability/token-usage", "getTokenUsage", COVERAGE),
     ("/api/v1/observability/token-usage/series", "getTokenUsageSeries", COVERAGE),
     ("/api/v1/observability/token-usage/outcomes", "getTokenOutcomes", ("since", "until")),
+    ("/api/v1/observability/token-usage/account", "getTokenAccount", ("since", "until")),
 ]
 
 if not os.path.isdir(WEB):

@@ -632,36 +632,51 @@ impl SpendVerdictStore {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> anyhow::Result<Vec<VerdictLine>> {
-        let rows = sqlx::query(&format!(
-            r#"
-            SELECT actor, verdict, skip_reason,
-                   COUNT(*)::BIGINT AS cells,
-                   COALESCE(SUM(skips), 0)::BIGINT   AS skips,
-                   COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_input,
-                   COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_output
-            FROM {VERDICT_TABLE}
-            WHERE window_start >= $1 AND window_end <= $2
-            GROUP BY actor, verdict, skip_reason
-            ORDER BY actor, verdict, skip_reason
-            "#
-        ))
-        .bind(since)
-        .bind(until)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| VerdictLine {
-                actor: r.get("actor"),
-                verdict: r.get("verdict"),
-                skip_reason: r.get("skip_reason"),
-                cells: r.get("cells"),
-                skips: r.get("skips"),
-                tokens_input: r.get("tokens_input"),
-                tokens_output: r.get("tokens_output"),
-            })
-            .collect())
+        verdict_lines(&self.pool, since, until).await
     }
+}
+
+/// The cells whose windows lie wholly inside `[since, until)`.
+///
+/// A window has to *end* inside the range rather than merely start in it: an
+/// hour still running has not been judged, and counting it would report a
+/// silence that the loop has not had the chance to look at. Both readers — the
+/// loop's own check and the spend screen — go through here so they cannot
+/// disagree about which windows are in a range.
+pub async fn verdict_lines(
+    pool: &PgPool,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> anyhow::Result<Vec<VerdictLine>> {
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT actor, verdict, skip_reason,
+               COUNT(*)::BIGINT AS cells,
+               COALESCE(SUM(skips), 0)::BIGINT   AS skips,
+               COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_input,
+               COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_output
+        FROM {VERDICT_TABLE}
+        WHERE window_start >= $1 AND window_end <= $2
+        GROUP BY actor, verdict, skip_reason
+        ORDER BY actor, verdict, skip_reason
+        "#
+    ))
+    .bind(since)
+    .bind(until)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| VerdictLine {
+            actor: r.get("actor"),
+            verdict: r.get("verdict"),
+            skip_reason: r.get("skip_reason"),
+            cells: r.get("cells"),
+            skips: r.get("skips"),
+            tokens_input: r.get("tokens_input"),
+            tokens_output: r.get("tokens_output"),
+        })
+        .collect())
 }
 
 /// Per-actor `(calls, tokens_in, tokens_out)` over the window, summed across

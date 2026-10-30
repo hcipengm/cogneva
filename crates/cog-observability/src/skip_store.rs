@@ -108,28 +108,41 @@ impl LlmSkipStore {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> anyhow::Result<Vec<StageSkip>> {
-        let rows = sqlx::query(&format!(
-            r#"
-            SELECT stage, reason, COUNT(*) AS skips
-            FROM {SKIP_TABLE}
-            WHERE ts >= $1 AND ts < $2
-            GROUP BY stage, reason
-            ORDER BY stage, reason
-            "#
-        ))
-        .bind(since)
-        .bind(until)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| StageSkip {
-                stage: r.get("stage"),
-                reason: r.get("reason"),
-                skips: r.get("skips"),
-            })
-            .collect())
+        skips_between(&self.pool, since, until).await
     }
+}
+
+/// The savings recorded over `[since, until)`.
+///
+/// The query lives beside the table so both readers ask it the same way: the
+/// verdict fold and the spend screen must agree about what a window saved, and
+/// two hand-written statements are two chances to disagree.
+pub async fn skips_between(
+    pool: &PgPool,
+    since: DateTime<Utc>,
+    until: DateTime<Utc>,
+) -> anyhow::Result<Vec<StageSkip>> {
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT stage, reason, COUNT(*) AS skips
+        FROM {SKIP_TABLE}
+        WHERE ts >= $1 AND ts < $2
+        GROUP BY stage, reason
+        ORDER BY stage, reason
+        "#
+    ))
+    .bind(since)
+    .bind(until)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .iter()
+        .map(|r| StageSkip {
+            stage: r.get("stage"),
+            reason: r.get("reason"),
+            skips: r.get("skips"),
+        })
+        .collect())
 }
 
 /// The sink the call sites write through.

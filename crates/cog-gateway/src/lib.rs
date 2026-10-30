@@ -1194,6 +1194,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/observability/token-usage/outcomes",
             get(observability::token_outcomes_handler),
         )
+        // 决定不花的那一侧：省下多少、凭什么省，以及每个窗口被判成了什么。
+        // 这两本账一直在写、从没有人读回，于是「花销为零」只剩一个数字。
+        .route(
+            "/api/v1/observability/token-usage/account",
+            get(observability::token_account_handler),
+        )
         .route(
             "/api/v1/tasks/{id}/logs",
             get(observability::task_logs_handler),

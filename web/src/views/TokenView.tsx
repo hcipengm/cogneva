@@ -1,11 +1,12 @@
 import { useState } from 'react';
-import { getTokenOutcomes, getTokenUsage, getTokenUsageSeries, type ActorUsage } from '@/api/client';
+import { getTokenAccount, getTokenOutcomes, getTokenUsage, getTokenUsageSeries, type ActorUsage } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { SpendBars } from '@/observability/SpendBars';
 import { DimensionCounts } from '@/observability/DimensionCounts';
 import { OutcomeBreakdown } from '@/observability/OutcomeBreakdown';
+import { SpendAccount } from '@/observability/SpendAccount';
 import { TokenShare } from '@/observability/TokenShare';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { percentOf } from '@/topology/format';
@@ -21,6 +22,11 @@ import { percentOf } from '@/topology/format';
  * 折叠面答不出「为什么一分没花」。被熔断挡回来的调用没有被发出去，也就没有
  * 花销，和一段没人用模型的区间在每个花销读数上都是同一个零；只有结局分布
  * 能把「池子空着」和「池子死了」分开。
+ *
+ * 再往下第三读从**省下账与判定账**取：根本没发起的那一次。它答的是结局面
+ * 答不了的另一种零——一个因为上游全挂而拒绝规划的 planner 一次调用都不发，
+ * 于是一行账本也没有，和「没人用模型」在结局面上一模一样。这两本账一直在写
+ * （判定循环每十分钟判一次已关闭的小时），但此前没有任何读面。
  *
  * 这一面故意不给「预算用了多少」那根进度条：平台里逐用户的每日额度账没有
  * 写者（网关不再由任何中间件扣减它），画出来会是一个永远是 0 的「今日已用」。
@@ -38,11 +44,14 @@ export function TokenView() {
   // 这一读从逐笔账本取，答的是「每次尝试怎么结束的」。它和上面两读同窗不同源：
   // 折叠表只留「失败了几次」，说不出一分没花是因为池子空着还是熔断开着。
   const outcomes = useResource(`调用结局（${hours} 小时）`, () => getTokenOutcomes(hours), 60_000);
+  // 第三种零花销：根本没发起过。省下账与判定账都是「决定不花」那一侧，
+  // 一直在写、以前没有任何读法，于是「本来在花、无声停了」这句话没人读得到。
+  const account = useResource(`决定不花（${hours} 小时）`, () => getTokenAccount(hours), 60_000);
   // 这本账的写者是一轮话、一次运行：`turn_end` 与 `agent_end` 就是那一笔落账的时刻。
   // 整点折叠改的是同一本账的另一个粒度，落在 observability 前缀下。
   useKindTickedRefresh(
     ['usage', resourceKey('observability')],
-    [series.refresh, usage.refresh, outcomes.refresh]
+    [series.refresh, usage.refresh, outcomes.refresh, account.refresh]
   );
 
   const rows = series.data?.rows ?? [];
@@ -222,6 +231,23 @@ export function TokenView() {
             caveat="这一读取逐笔账本，不是折叠表：折叠只留「失败了几次」，说不出被谁挡下来。区间是它实际读的那一段，不是请求的那一段。"
           >
             <OutcomeBreakdown data={outcomes.data} />
+          </Readings>
+        )}
+      </section>
+
+      <section className="border-b border-[var(--line)]">
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">决定不花</h2>
+        {account.error ? (
+          <ReadError what="决定不花" error={account.error} onRetry={account.refresh} />
+        ) : !account.data ? (
+          <Loading what="决定不花" />
+        ) : (
+          <Readings
+            from={account}
+            source={`GET /api/v1/observability/token-usage/account?hours=${hours}`}
+            caveat="省下账与判定账一直在写、以前没有读面：省下的调用从来没进过账本，所以在花销与结局两处都是空的。这两本账是唯一说得出「根本没发起」与「本来在花、现在停了」的读数。"
+          >
+            <SpendAccount data={account.data} />
           </Readings>
         )}
       </section>

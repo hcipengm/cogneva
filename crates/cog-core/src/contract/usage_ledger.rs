@@ -332,6 +332,46 @@ pub struct OutcomeCount {
     pub calls: i64,
 }
 
+/// One site's savings in a range, as the saved-call ledger recorded them.
+///
+/// The spend ledger answers what was paid for. This answers what was *not* paid
+/// for and on purpose, which is a different fact and comes from a different
+/// table: a stage that spent nothing looks the same whether it decided not to
+/// or was never reached, and only the recorded saving separates them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkippedWorkLine {
+    /// The stage that chose not to call (a role name, a self-review stage).
+    pub stage: String,
+    /// Why it chose that. Free text from the caller, so it is grouped and shown
+    /// rather than interpreted here.
+    pub reason: String,
+    pub skips: i64,
+}
+
+/// One line of the spend verdict projection: how one site's windows were judged.
+///
+/// A verdict is the only face that says a silence was *unexplained*. The spend
+/// report shows zero, the outcomes show refused calls, and the saved-call
+/// ledger shows the savings that were recorded — none of them can say "this
+/// site used to spend here and nothing accounts for it stopping".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendVerdictLine {
+    /// The declared call site this cell belongs to.
+    pub actor: String,
+    /// `necessary` / `documented_skip` / `unexpected_absent` / `unsettled`.
+    /// Carried as written rather than as an enum: the column is what a reader
+    /// selects by, and a value this crate does not know is a value the writer
+    /// wrote, not an error to swallow.
+    pub verdict: String,
+    /// The saving the cell was judged against, or empty when it had none.
+    pub skip_reason: String,
+    /// How many hourly windows share this judgement.
+    pub windows: i64,
+    pub skips: i64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+}
+
 /// The writing and window-reading face of the spend ledger.
 ///
 /// Separate from the reporting face ([`crate::LlmUsageReader`]) because the two
@@ -435,6 +475,39 @@ pub trait LlmUsageLedger: Send + Sync {
         since: chrono::DateTime<chrono::Utc>,
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<OutcomeCount>, String>;
+
+    /// The savings recorded in `[since, until)`, one line per `(stage, reason)`.
+    ///
+    /// Read beside the spend and the outcomes because the three together are
+    /// the only complete answer to "why did this range cost nothing": some
+    /// calls were refused, and some work was never attempted. This is the
+    /// second half, and without it a deliberate saving and a stalled planner
+    /// produce the same screen.
+    ///
+    /// An empty answer means nothing chose to skip, which is not the same as
+    /// "nothing was skipped": a saved-call ledger nothing writes to also
+    /// answers empty. The caller is the one that knows whether its writer is
+    /// alive.
+    async fn skips_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<SkippedWorkLine>, String>;
+
+    /// The spend verdicts judged for windows inside `[since, until)`, summed
+    /// per `(actor, verdict, skip_reason)`.
+    ///
+    /// The loop that judges windows writes these rows and moves on, so until
+    /// something reads them back the judgement is made and never delivered. A
+    /// site whose windows read `unexpected_absent` — it was live, it had been
+    /// spending, and it stopped with no saving on the record — is exactly the
+    /// case the other two faces cannot name, so this is the face that has to
+    /// carry it.
+    async fn verdicts_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<SpendVerdictLine>, String>;
 }
 
 /// A process's analytics sink: fire-and-forget events, one call per event.

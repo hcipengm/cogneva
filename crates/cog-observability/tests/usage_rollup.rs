@@ -657,3 +657,147 @@ async fn the_outcome_breakdown_keeps_the_verdict_that_explains_a_failed_range() 
         .await
         .expect("clean up the ledger probe rows");
 }
+
+/// 平台自己那本账：省下了什么、每个窗口被判成什么。两本账都在写、都没有读面，
+/// 所以这条测的正是「读回来」这件事本身：花销为零的那一屏要靠它才说得出是
+/// 「没花」还是「决定不花」。
+///
+/// 同时判两件容易被合并的事：
+/// - 区间里没有记录时是**空**，不是零行或一行零——空才是「这本账这次没说什么」；
+/// - 判定按 `(actor, verdict, reason)` 分格，`unexpected_absent` 与
+///   `documented_skip` 不许被求和成同一行。
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_account_read_returns_the_savings_and_the_judgements_it_was_given() {
+    let url = database_url();
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("connect to the test database");
+    let store = LlmUsageStore::connect(&url)
+        .await
+        .expect("connect the store");
+    init_schema_once(&store, &pool).await;
+    let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
+    let skip_store = cog_observability::skip_store::LlmSkipStore::connect(&url)
+        .await
+        .expect("connect the saved-call store");
+    skip_store
+        .init_schema(&schema_runner)
+        .await
+        .expect("init the saved-call schema");
+    sqlx::raw_sql(cog_observability::spend_verdict::DDL)
+        .execute(&pool)
+        .await
+        .expect("init the verdict schema");
+
+    let run = uuid::Uuid::new_v4();
+    let stage = format!("account-stage:{run}");
+    let actor = format!("account-actor:{run}");
+    let start = hour_floor(Utc::now()) - Duration::hours(1_100);
+    let end = start + Duration::hours(1);
+
+    // 区间里什么也没有：两半都必须是空的，而且不是「一行零」。
+    let empty_skips = store
+        .skips_between(start, end)
+        .await
+        .expect("read an empty range's savings");
+    let empty_verdicts = store
+        .verdicts_between(start, end)
+        .await
+        .expect("read an empty range's judgements");
+    assert!(
+        empty_skips.iter().all(|s| s.stage != stage),
+        "no saving was recorded for this probe stage"
+    );
+    assert!(
+        empty_verdicts.iter().all(|v| v.actor != actor),
+        "no window was judged for this probe site"
+    );
+
+    skip_store
+        .record(&cog_core::LlmSkipRecord {
+            stage: stage.clone(),
+            reason: "upstream_unavailable",
+        })
+        .await
+        .expect("record a saving");
+    skip_store
+        .record(&cog_core::LlmSkipRecord {
+            stage: stage.clone(),
+            reason: "upstream_unavailable",
+        })
+        .await
+        .expect("record the same saving again");
+    sqlx::query("UPDATE cog_llm_skip SET ts = $1 WHERE stage = $2")
+        .bind(start + Duration::minutes(5))
+        .bind(&stage)
+        .execute(&pool)
+        .await
+        .expect("place the savings in the probe window");
+
+    for (verdict, reason, windows) in [
+        ("documented_skip", "upstream_unavailable", 2i64),
+        ("unexpected_absent", "", 1i64),
+    ] {
+        for i in 0..windows {
+            let window_start = start + Duration::hours(i);
+            sqlx::query(
+                "INSERT INTO cog_llm_spend_verdict \
+                 (window_start, window_end, actor, verdict, skip_reason, skips, calls) \
+                 VALUES ($1, $2, $3, $4, $5, 0, 0)",
+            )
+            .bind(window_start)
+            .bind(window_start + Duration::hours(1))
+            .bind(&actor)
+            .bind(verdict)
+            .bind(reason)
+            .execute(&pool)
+            .await
+            .expect("plant a judged window");
+        }
+    }
+
+    let skips = store
+        .skips_between(start, end + Duration::hours(1))
+        .await
+        .expect("read the savings back");
+    let mine: Vec<(String, String, i64)> = skips
+        .into_iter()
+        .filter(|s| s.stage == stage)
+        .map(|s| (s.stage, s.reason, s.skips))
+        .collect();
+    assert_eq!(
+        mine,
+        vec![(stage.clone(), "upstream_unavailable".to_string(), 2)],
+        "two recorded savings read back as one line of two"
+    );
+
+    let verdicts = store
+        .verdicts_between(start, end + Duration::hours(1))
+        .await
+        .expect("read the judgements back");
+    let mine: Vec<(String, String, i64)> = verdicts
+        .into_iter()
+        .filter(|v| v.actor == actor)
+        .map(|v| (v.verdict, v.skip_reason, v.windows))
+        .collect();
+    assert_eq!(
+        mine,
+        vec![
+            ("documented_skip".to_string(), "upstream_unavailable".to_string(), 2),
+            ("unexpected_absent".to_string(), String::new(), 1),
+        ],
+        "two verdicts stay two lines: the one that needs a repair is not summed into the documented one"
+    );
+
+    sqlx::query("DELETE FROM cog_llm_skip WHERE stage = $1")
+        .bind(&stage)
+        .execute(&pool)
+        .await
+        .expect("clean up the saving probe rows");
+    sqlx::query("DELETE FROM cog_llm_spend_verdict WHERE actor = $1")
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("clean up the verdict probe rows");
+}

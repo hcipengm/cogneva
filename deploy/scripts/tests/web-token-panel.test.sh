@@ -40,16 +40,17 @@ export default function App() {
 }
 EOF
   cat >"${work}/web/src/overlay/TokenPanel.tsx" <<'EOF'
-import { useUsage, useSeries, useOutcomes } from '@/hooks/useUsage';
+import { useUsage, useSeries, useOutcomes, useAccount } from '@/hooks/useUsage';
 export function TokenPanel() {
   const { usage } = useUsage();
   const series = useSeries();
   const outcomes = useOutcomes();
-  return <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}</div>;
+  const account = useAccount();
+  return <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}</div>;
 }
 EOF
   cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
-import { getTokenUsage, getTokenUsageSeries, getTokenOutcomes } from '@/api/client';
+import { getTokenUsage, getTokenUsageSeries, getTokenOutcomes, getTokenAccount } from '@/api/client';
 export function useUsage() {
   return getTokenUsage(24);
 }
@@ -59,11 +60,15 @@ export function useSeries() {
 export function useOutcomes() {
   return getTokenOutcomes(24);
 }
+export function useAccount() {
+  return getTokenAccount(24);
+}
 EOF
   cat >"${work}/web/src/api/client.ts" <<'EOF'
 export const PATH = '/api/v1/observability/token-usage';
 export const SERIES = '/api/v1/observability/token-usage/series';
 export const OUTCOMES = '/api/v1/observability/token-usage/outcomes';
+export const ACCOUNT = '/api/v1/observability/token-usage/account';
 export async function getTokenUsage(hours: number) {
   return fetch(`${PATH}?hours=${hours}`);
 }
@@ -72,6 +77,9 @@ export async function getTokenUsageSeries(hours: number) {
 }
 export async function getTokenOutcomes(hours: number) {
   return fetch(`${OUTCOMES}?hours=${hours}`);
+}
+export async function getTokenAccount(hours: number) {
+  return fetch(`${ACCOUNT}?hours=${hours}`);
 }
 EOF
 }
@@ -133,7 +141,7 @@ expect_red "只 import 不渲染" "没有一格渲染出来的组件用到它"
 
 # 4. 剪掉区间字段（三条读面那几格都拿掉：任何一处读到它都会让这一门绿）。
 fixture
-sed -i 's/{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}/花销/' "${work}/web/src/overlay/TokenPanel.tsx"
+sed -i 's/{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}/花销/' "${work}/web/src/overlay/TokenPanel.tsx"
 confirm "${work}/web/src/overlay/TokenPanel.tsx" "花销"
 expect_red "没读区间字段" "没有读它实际答出的区间"
 
@@ -164,7 +172,7 @@ expect_red "入口不接任何东西" "没有活的外部消费者"
 #    而第一条读面一律绿。这一条判的是「两条各判一遍」这件事本身。
 fixture
 cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
-import { getTokenUsage, getTokenOutcomes } from '@/api/client';
+import { getTokenUsage, getTokenOutcomes, getTokenAccount } from '@/api/client';
 export function useUsage() {
   return getTokenUsage(24);
 }
@@ -174,6 +182,9 @@ export function useSeries() {
 export function useOutcomes() {
   return getTokenOutcomes(24);
 }
+export function useAccount() {
+  return getTokenAccount(24);
+}
 EOF
 confirm "${work}/web/src/hooks/useUsage.ts" "return null"
 expect_red "只剩第一条读面" "getTokenUsageSeries"
@@ -182,7 +193,7 @@ expect_red "只剩第一条读面" "getTokenUsageSeries"
 #    而「为什么没花」那一块可以整块消失。这一条判的是第三条读面各判一遍。
 fixture
 cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
-import { getTokenUsage, getTokenUsageSeries } from '@/api/client';
+import { getTokenUsage, getTokenUsageSeries, getTokenAccount } from '@/api/client';
 export function useUsage() {
   return getTokenUsage(24);
 }
@@ -192,9 +203,34 @@ export function useSeries() {
 export function useOutcomes() {
   return null;
 }
+export function useAccount() {
+  return getTokenAccount(24);
+}
 EOF
 confirm "${work}/web/src/hooks/useUsage.ts" "return null"
 expect_red "只剩前两条读面" "getTokenOutcomes"
+
+# 9. 省下账与判定账被剪掉，另外三条还在：「根本没发起」与「本来在花、现在停了」
+#    这两句话会整块消失，而那三种零花销从此只有一种读得出来。这一条判的是
+#    第四条读面各判一遍——它和前三条答的不是同一件事，所以不能由它们代判。
+fixture
+cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
+import { getTokenUsage, getTokenUsageSeries, getTokenOutcomes } from '@/api/client';
+export function useUsage() {
+  return getTokenUsage(24);
+}
+export function useSeries() {
+  return getTokenUsageSeries(24);
+}
+export function useOutcomes() {
+  return getTokenOutcomes(24);
+}
+export function useAccount() {
+  return null;
+}
+EOF
+confirm "${work}/web/src/hooks/useUsage.ts" "return null"
+expect_red "只剩前三条读面" "getTokenAccount"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0

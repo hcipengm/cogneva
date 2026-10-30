@@ -484,6 +484,118 @@ fn outcomes_response(
     }
 }
 
+// ─── What the platform decided not to spend ───
+
+/// Query parameters for [`token_account_handler`]. Same trailing window and the
+/// same `hours <= 0` reading as the other two reads.
+#[derive(Debug, Deserialize)]
+pub struct TokenAccountQuery {
+    #[serde(default = "default_usage_hours")]
+    pub hours: i64,
+}
+
+/// One stage's savings: what it chose not to call, and the reason it recorded.
+#[derive(Debug, Serialize)]
+pub struct SkipLine {
+    pub stage: String,
+    pub reason: String,
+    pub skips: i64,
+}
+
+/// One site's windows as the verdict fold judged them.
+#[derive(Debug, Serialize)]
+pub struct VerdictLine {
+    pub actor: String,
+    pub verdict: String,
+    pub skip_reason: String,
+    pub windows: i64,
+    pub skips: i64,
+    pub tokens_input: i64,
+    pub tokens_output: i64,
+}
+
+/// The platform's own account of a range it spent nothing in.
+///
+/// The outcome read says which calls were turned away. It cannot say what was
+/// never attempted: a planner that refused to plan because no upstream was
+/// healthy makes no call at all, so it lands on the outcome read as nothing and
+/// on the spend read as nothing, and the two silences together look like a
+/// quiet platform. The savings and the verdicts are the only two faces that
+/// know the difference, and until this route existed neither was ever read
+/// back — they were written for an account nobody opened.
+#[derive(Debug, Serialize)]
+pub struct TokenAccountResponse {
+    pub since: String,
+    pub until: String,
+    pub skips: Vec<SkipLine>,
+    pub verdicts: Vec<VerdictLine>,
+}
+
+/// What the platform recorded deciding not to spend, and how its windows were
+/// judged, over the trailing window.
+pub async fn token_account_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<TokenAccountQuery>,
+) -> Result<Json<TokenAccountResponse>, ApiError> {
+    let ledger = state
+        .llm_usage
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("token usage ledger not configured"))?;
+    let until = chrono::Utc::now();
+    let since = usage_since(q.hours, until);
+    // Both halves are read even when the first one fails to answer: a savings
+    // ledger that cannot be read and a verdict face that can are two different
+    // repairs, and collapsing them into one error would name neither.
+    let skips = ledger
+        .skips_between(since, until)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "saved-call read failed; the account shows no savings");
+            Vec::new()
+        });
+    let verdicts = ledger
+        .verdicts_between(since, until)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "verdict read failed; the account shows no judgements");
+            Vec::new()
+        });
+    Ok(Json(account_response(since, until, skips, verdicts)))
+}
+
+/// Project the savings and the verdicts onto the response face.
+fn account_response(
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+    skips: Vec<cog_core::SkippedWorkLine>,
+    verdicts: Vec<cog_core::SpendVerdictLine>,
+) -> TokenAccountResponse {
+    TokenAccountResponse {
+        since: since.to_rfc3339(),
+        until: until.to_rfc3339(),
+        skips: skips
+            .into_iter()
+            .map(|row| SkipLine {
+                stage: row.stage,
+                reason: row.reason,
+                skips: row.skips,
+            })
+            .collect(),
+        verdicts: verdicts
+            .into_iter()
+            .map(|row| VerdictLine {
+                actor: row.actor,
+                verdict: row.verdict,
+                skip_reason: row.skip_reason,
+                windows: row.windows,
+                skips: row.skips,
+                tokens_input: row.tokens_input,
+                tokens_output: row.tokens_output,
+            })
+            .collect(),
+    }
+}
+
 // ─── Task Metrics ───
 
 pub async fn task_metrics_handler(
@@ -1099,6 +1211,63 @@ mod tests {
         );
         assert_eq!(wire["outcomes"][0]["refusal_kind"], "quota_cycle");
         assert_eq!(wire["outcomes"][1]["refusal_kind"], "entitlement");
+    }
+
+    /// 账本的两半必须各自出现：省下的与判定过的是两种事实，一栏空了不代表
+    /// 另一栏也空。把空数组当成「没有可说的」会在两种情况下读成同一个零：
+    /// 一次都没省（没有 savings），与一次都没判（verdict 面没在跑）。
+    ///
+    /// 判定里那两种缺失也得分得开：`unexpected_absent` 是「它本来在花、现在
+    /// 无声无息地停了」，`documented_skip` 是「停得有记录」——合成一行就等于
+    /// 把要修的那一种藏进正常的那一种里。
+    #[test]
+    fn the_account_projection_keeps_savings_and_judgements_apart() {
+        let until = chrono::DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
+            .expect("a fixed instant")
+            .with_timezone(&chrono::Utc);
+        let since = until - chrono::Duration::hours(24);
+        let response = account_response(
+            since,
+            until,
+            vec![cog_core::SkippedWorkLine {
+                stage: "planner".into(),
+                reason: "upstream_unavailable".into(),
+                skips: 31_151,
+            }],
+            vec![
+                cog_core::SpendVerdictLine {
+                    actor: "agent:planner".into(),
+                    verdict: "documented_skip".into(),
+                    skip_reason: "upstream_unavailable".into(),
+                    windows: 24,
+                    skips: 31_151,
+                    tokens_input: 0,
+                    tokens_output: 0,
+                },
+                cog_core::SpendVerdictLine {
+                    actor: "agent:generator".into(),
+                    verdict: "unexpected_absent".into(),
+                    skip_reason: String::new(),
+                    windows: 3,
+                    skips: 0,
+                    tokens_input: 0,
+                    tokens_output: 0,
+                },
+            ],
+        );
+        let wire = serde_json::to_value(&response).expect("the response serializes");
+        assert_eq!(response.since, since.to_rfc3339());
+        assert_eq!(response.until, until.to_rfc3339());
+        assert_eq!(wire["skips"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(wire["skips"][0]["reason"], "upstream_unavailable");
+        assert_eq!(
+            wire["verdicts"].as_array().map(|a| a.len()),
+            Some(2),
+            "the two silences stay two lines"
+        );
+        assert_eq!(wire["verdicts"][0]["verdict"], "documented_skip");
+        assert_eq!(wire["verdicts"][1]["verdict"], "unexpected_absent");
+        assert_eq!(wire["verdicts"][1]["skip_reason"], "");
     }
 
     fn spend_row(

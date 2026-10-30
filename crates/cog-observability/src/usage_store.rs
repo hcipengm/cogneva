@@ -1004,6 +1004,55 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// The savings the call sites recorded in `[since, until)`.
+    ///
+    /// Read here rather than from [`crate::skip_store::LlmSkipStore`] because
+    /// the reader that needs it already holds this store and asks its three
+    /// questions in one place; the tables share one owner (this crate) and one
+    /// database, so the join across them is a query, not a boundary crossing.
+    pub async fn skips_between(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<cog_core::SkippedWorkLine>> {
+        Ok(crate::skip_store::skips_between(&self.pool, since, until)
+            .await?
+            .into_iter()
+            .map(|row| cog_core::SkippedWorkLine {
+                stage: row.stage,
+                reason: row.reason,
+                skips: row.skips,
+            })
+            .collect())
+    }
+
+    /// The spend verdicts judged for windows inside `[since, until)`.
+    ///
+    /// One query with the projection's own read: two statements answering
+    /// nearly the same question would drift, and the screen would then disagree
+    /// with anything else that asked.
+    pub async fn verdicts_between(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<cog_core::SpendVerdictLine>> {
+        Ok(
+            crate::spend_verdict::verdict_lines(&self.pool, since, until)
+                .await?
+                .into_iter()
+                .map(|row| cog_core::SpendVerdictLine {
+                    actor: row.actor,
+                    verdict: row.verdict,
+                    skip_reason: row.skip_reason,
+                    windows: row.cells,
+                    skips: row.skips,
+                    tokens_input: row.tokens_input,
+                    tokens_output: row.tokens_output,
+                })
+                .collect(),
+        )
+    }
+
     /// Whether a job has already put anything on the wire under this identity.
     ///
     /// This is the only question that turns "a task is running" into a reading,
@@ -1658,6 +1707,26 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<cog_core::OutcomeCount>, String> {
         LlmUsageStore::outcomes_between(self, since, until)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn skips_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::SkippedWorkLine>, String> {
+        LlmUsageStore::skips_between(self, since, until)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn verdicts_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::SpendVerdictLine>, String> {
+        LlmUsageStore::verdicts_between(self, since, until)
             .await
             .map_err(|e| e.to_string())
     }

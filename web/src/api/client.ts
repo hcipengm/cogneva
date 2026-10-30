@@ -656,6 +656,51 @@ export async function getTokenOutcomes(hours?: number): Promise<TokenOutcomes> {
   return api.get<TokenOutcomes>(`/api/v1/observability/token-usage/outcomes${query}`);
 }
 
+/** 一个阶段省下的调用：它决定不调，并记下了理由。 */
+export interface SkipLine {
+  stage: string;
+  reason: string;
+  skips: number;
+}
+
+/**
+ * 一个调用点那些窗口的判定。
+ *
+ * `verdict` 是闭集：`necessary`（花了）、`documented_skip`（没花，账上有记录）、
+ * `unexpected_absent`（本该在花、无声地停了）、`unsettled`（这一窗判不了）。
+ * 后两个是这条读法存在的理由——前两个别的面也看得出来。
+ */
+export interface VerdictLine {
+  actor: string;
+  verdict: string;
+  skip_reason: string;
+  windows: number;
+  skips: number;
+  tokens_input: number;
+  tokens_output: number;
+}
+
+/**
+ * 平台自己那本账：决定不花的那一侧，连同这次读实际用了哪个区间。
+ *
+ * 结局那一读说的是「哪些调用被挡回来了」；它说不出「根本没发起过」——一个
+ * 因为上游全挂而拒绝规划的 planner 一次调用都不发，于是在结局面是空、在花销面
+ * 也是空，两个空凑在一起看起来就像一个安静的池子。省下账与判定账是唯一知道
+ * 区别的两个面，而它们一直在写、先前没有任何读法。
+ */
+export interface TokenAccount {
+  since: string;
+  until: string;
+  skips: SkipLine[];
+  verdicts: VerdictLine[];
+}
+
+/** 过去 `hours` 小时「决定不花」与「窗口判定」；`hours=0` 是整本账。 */
+export async function getTokenAccount(hours?: number): Promise<TokenAccount> {
+  const query = hours === undefined ? '' : `?hours=${hours}`;
+  return api.get<TokenAccount>(`/api/v1/observability/token-usage/account${query}`);
+}
+
 // ── 活跃告警（内存事件 + 耐久表合并） ──
 
 /** 一条正在 firing 的告警。 */
