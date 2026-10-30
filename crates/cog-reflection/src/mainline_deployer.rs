@@ -120,12 +120,31 @@ const OVERLAY_BUILT_ASSETS: &[&str] = &[cog_core::paths::APP_WEB_DIR];
 /// 部署器镜像不用为此多背一套工具链。
 const WEB_BUILDER_REPOSITORY: &str = "cogneva/node-builder";
 const WEB_BUILDER_TAG: &str = "22-slim";
-/// npm registry 镜像，与 Dockerfile 全量构建用的同一条。
+/// npm registry 镜像的默认值，与 Dockerfile 全量构建用的那一条同源。
 const WEB_NPM_REGISTRY: &str = "https://registry.npmmirror.com";
+/// 覆盖上面那条默认值的环境变量。
+const WEB_NPM_REGISTRY_ENV: &str = "COGNEVA_NPM_REGISTRY";
 /// 前端产物在运行镜像里的落点。
 const WEB_DIST_DEST: &str = cog_core::paths::APP_WEB_DIR;
 /// 构建容器里放源码的路径。
 const WEB_BUILD_SRC: &str = "/src/web";
+
+/// 这一次 overlay 构建该用的 npm registry。
+///
+/// 常量本身是一个**声明**，不是一次测量：这条地址在这台主机通不通，只有主机的
+/// 引导器探得出来（它的 npm 候选表就在那边），部署器跑在集群里，探不到宿主的
+/// 出网情况。所以默认值照旧，但让一个测过的地址经 `COGNEVA_NPM_REGISTRY` 进得来
+/// ——否则换一台够不着这个镜像的主机，前端就只在 overlay 这一条路上构建失败，
+/// 而全量构建那条路（构建参数 `NPM_REGISTRY`）换一个值就好了。
+///
+/// 空串按「没设」处理：`npm config set registry ""` 会把 registry 指到一条空
+/// URL，下一次 `npm ci` 报的是一个与真因无关的解析错误。
+fn web_npm_registry() -> String {
+    match std::env::var(WEB_NPM_REGISTRY_ENV) {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => WEB_NPM_REGISTRY.to_string(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 纯函数（无 IO，单测覆盖）
@@ -7314,7 +7333,7 @@ impl MainlineDeployer {
             &[
                 "run",
                 "--env",
-                &format!("NPM_CONFIG_REGISTRY={WEB_NPM_REGISTRY}"),
+                &format!("NPM_CONFIG_REGISTRY={}", web_npm_registry()),
                 ctr,
                 "--",
                 "sh",
@@ -27738,5 +27757,33 @@ exit 0
             Some(Vec::<String>::new()),
             "空清单要读成空表"
         );
+    }
+
+    /// 镜像里那条默认值只在没人测过的时候用；测过一次的主机要能把测出来的地址
+    /// 递给 overlay 这一趟，否则前端只在 overlay 这条路上构建失败——全量构建那条
+    /// 路换一个 `--build-arg` 就好了。
+    ///
+    /// 空串没有当成「显式要求直连 npmjs」：`npm config set registry ""` 指到一条
+    /// 空 URL，下一次 `npm ci` 报的解析错误与真因无关。
+    #[test]
+    fn the_npm_registry_follows_a_measured_value_when_there_is_one() {
+        let restore = std::env::var(WEB_NPM_REGISTRY_ENV).ok();
+        std::env::remove_var(WEB_NPM_REGISTRY_ENV);
+        assert_eq!(web_npm_registry(), WEB_NPM_REGISTRY, "没设的时候回落默认值");
+
+        std::env::set_var(WEB_NPM_REGISTRY_ENV, "  https://npm.example/proxy  ");
+        assert_eq!(
+            web_npm_registry(),
+            "https://npm.example/proxy",
+            "设了就用它，且去掉两边的空白：拼进 NPM_CONFIG_REGISTRY 时空白会进值里"
+        );
+
+        std::env::set_var(WEB_NPM_REGISTRY_ENV, "   ");
+        assert_eq!(web_npm_registry(), WEB_NPM_REGISTRY, "空白按没设算");
+
+        match restore {
+            Some(value) => std::env::set_var(WEB_NPM_REGISTRY_ENV, value),
+            None => std::env::remove_var(WEB_NPM_REGISTRY_ENV),
+        }
     }
 }
