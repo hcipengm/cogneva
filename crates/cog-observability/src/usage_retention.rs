@@ -59,6 +59,7 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// that bought it are gone. What ends at thirty days is the per-call detail —
 /// which task bought which tokens — and that is a promise about the ledger
 /// rather than a side effect of the table's size.
+// cap: bound
 pub const DEFAULT_KEEP_DAYS: i64 = 30;
 
 /// The shortest retention this loop will accept.
@@ -66,6 +67,7 @@ pub const DEFAULT_KEEP_DAYS: i64 = 30;
 /// One day. Zero or negative days would erase the ledger every pass, which
 /// reads as a working retention while destroying the rows the current hour's
 /// fold is computed from — the value falls back rather than being honoured.
+// cap: bound
 pub const MIN_KEEP_DAYS: i64 = 1;
 
 /// The environment variable that carries the retention.
@@ -76,6 +78,7 @@ pub const KEEP_DAYS_ENV: &str = "COGNEVA_LLM_USAGE_KEEP_DAYS";
 /// Five minutes, for the same reason the prompt archive uses it: the readings
 /// this loop publishes are what the alert rules read, and Prometheus drops a
 /// series it has not seen for five minutes.
+// cap: bound
 pub const PERIOD: Duration = Duration::from_secs(300);
 
 /// How many rows one statement may delete.
@@ -83,6 +86,7 @@ pub const PERIOD: Duration = Duration::from_secs(300);
 /// Two thousand rows is a few hundred kilobytes and a short lock. The pass
 /// repeats until it finds nothing past the cutoff, so the number of batches
 /// follows the backlog rather than the batch size.
+// cap: bound
 const BATCH_ROWS: i64 = 2_000;
 
 /// What one pass did, so a caller can assert on it rather than infer it.

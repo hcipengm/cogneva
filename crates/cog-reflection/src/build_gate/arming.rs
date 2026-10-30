@@ -66,6 +66,7 @@ use cog_core::SelfEvolutionConfig;
 /// this deployment -- 3600s each -- so the floor covers both today, and an
 /// operator who raised the test timeout alone would move the longest legal hold
 /// past the floor without touching the number that answers for it.
+// cap: bound
 pub const WAIT_RELEASE_MARGIN_SECS: u64 = 600;
 
 /// The gate configuration to arm for a self-evolution block, and the one number

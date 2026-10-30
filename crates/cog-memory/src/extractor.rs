@@ -56,12 +56,16 @@ pub struct RuleBasedExtractor;
 /// `importance`. See [`RuleBasedExtractor`] for why the numbers are a prior.
 mod rating {
     /// An entity is named and nothing more is said about it.
+    // cap: bound
     pub const ENTITY: u8 = 6;
     /// A relation carries the two ends it connects, so it says slightly more.
+    // cap: bound
     pub const RELATION: u8 = 7;
     /// An event is a thing that happened, at a point in time.
+    // cap: bound
     pub const EVENT: u8 = 8;
     /// A preview is a slice of the payload, not a claim about the payload.
+    // cap: bound
     pub const SUMMARY: u8 = 5;
 }
 

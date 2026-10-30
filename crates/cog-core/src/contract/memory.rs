@@ -19,6 +19,7 @@ use uuid::Uuid;
 /// The `importance` field on each entry type stays a plain `f32` in
 /// `0.0..=1.0`, because that is what consumers sort on, and a bounded float
 /// needs no conversion at the point of use.
+// cap: bound
 pub const IMPORTANCE_RATING_MAX: u8 = 10;
 
 /// Place a rating on the shared importance scale, clamping it into range.
@@ -165,6 +166,7 @@ pub fn tool_output_raw_id(task_id: &str, turn: u32, frame: u32) -> String {
 /// With the timestamp and random segments alongside it the whole key stays far
 /// below the file system's `NAME_MAX` (255 bytes), while the prefix is still
 /// long enough for a listing to show where an entry came from.
+// cap: bound
 pub const RAW_ID_SLUG_MAX: usize = 64;
 
 /// Fold any source name into something safe to put in an object key: ASCII

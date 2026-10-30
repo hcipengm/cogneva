@@ -33,8 +33,11 @@ use cog_core::{
 /// The widths the keyed columns were created with, taken from the narrower
 /// dialect's DDL. Checked here so a producer finds out at the write rather than
 /// a database refusing a row halfway through a batch.
+// cap: bound
 const SUBJECT_MAX: usize = 191;
+// cap: bound — the actor column width, a schema limit rather than a measurement
 const ACTOR_MAX: usize = 191;
+// cap: bound — the reading-name column width, a schema limit rather than a measurement
 const READING_MAX: usize = 191;
 
 const ROW_COLUMNS: &str = "kind, occurred_at, subject, actor, reading, reading_value, \

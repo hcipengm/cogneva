@@ -21,10 +21,12 @@ use sqlx::PgPool;
 /// Two, because the two layers are read concurrently and neither holds a
 /// connection between calls: one would serialise them, three would be a share
 /// taken from the serving pools for no measured gain.
+// cap: bound
 pub const SUMMARY_POOL_CONNECTIONS: u32 = 2;
 
 /// How long a caller waits for one of those two connections before being told
 /// the database is busy.
+// cap: bound
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Open the pool for the summary and schema layers.

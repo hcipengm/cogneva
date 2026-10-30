@@ -22,6 +22,7 @@ use axum::response::{IntoResponse, Response};
 /// 每个调用方每分钟允许的读次数。默认值与集群里其他读面的量级对齐：一个正常
 /// 刷新的看板每分钟十几次，这个数是它的几十倍，够任何真人用，也够拦住环。
 pub const RATE_ENV: &str = "COGNEVA_PROJECT_READ_PER_MIN";
+// cap: bound — 每调用方每分钟的读预算，可由 `COGNEVA_PROJECT_READ_PER_MIN` 覆盖。一个正常刷新的看板每分钟十几次，600 是它的几十倍——够任何真人用，也够挡住一个卡在刷新循环里的页面；它不是从机器测量导出的，是从「一个人一分钟会看几次」定出来的界。
 pub const DEFAULT_PER_MIN: u32 = 600;
 
 /// 一条调用方的桶。
@@ -43,6 +44,7 @@ pub struct ProjectReadLimiter {
 }
 
 /// 桶超过这个数就先清一遍过期的：调用方 id 的数量不该成为一处无界增长的内存。
+// cap: bound
 const BUCKET_SWEEP_AT: usize = 4096;
 
 impl ProjectReadLimiter {

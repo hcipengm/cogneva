@@ -238,6 +238,7 @@ pub struct RestartPolicy {
 /// budget is deliberately left out of this wait: it is time the loop spends
 /// working rather than time between attempts, and a restart that waited it out
 /// would delay the repair by the length of the thing that is not being repaired.
+// cap: derived
 const STALL_PERIODS: u32 = 6;
 
 impl RestartPolicy {

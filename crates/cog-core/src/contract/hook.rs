@@ -191,6 +191,7 @@ pub struct HookDef {
 ///
 /// 钩子是任务路径上的同步点，默认值必须短到「卡住的钩子」不会把一次任务拖成
 /// 超时；而一个正常的钩子（写一条记忆、发一次通知）远在秒级内完成。
+// cap: bound
 const DEFAULT_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl HookDef {

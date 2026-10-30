@@ -111,6 +111,7 @@ impl JwksCache {
 ///
 /// 签名密钥的轮换以小时计，缓存一小时意味着最坏情况下一小时的旧 key 仍被信任；
 /// 更短则每次校验都要回源，把鉴权路径压到 Keycloak 上。
+// cap: bound
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
 
 impl Default for JwksCache {
@@ -543,6 +544,7 @@ struct CachedJwks {
     fetched_at: Instant,
 }
 
+// cap: bound — how long a fetched key set is reused; bounds how long a rotated-away key is still accepted
 const JWKS_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Keycloak OIDC authentication provider.

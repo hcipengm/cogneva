@@ -22,6 +22,7 @@ use crate::metric::StepRecord;
 ///
 /// 逐类比照公开模型值，不额外放宽；上下文是评测里最容易被「给多一点」吃掉
 /// 可变性的地方——同一道题给不同流派不同的窗口，读数就不可比了。
+// cap: bound
 const DEFAULT_MAX_CONTEXT_TOKENS: u32 = 512 * 1024;
 
 /// 外壳跑完一题交回来的东西。

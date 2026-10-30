@@ -28,6 +28,7 @@ use cog_core::contract::llm::retry_after_hint_in;
 ///
 /// 单位已经写在名字里；窗口再另立一个数，就会出现「每分钟 3 次、窗口 90 秒」
 /// 这种自相矛盾的组合。
+// cap: bound
 const PER_MINUTE_WINDOW: Duration = Duration::from_secs(60);
 use cog_core::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, LlmClient, Message,
@@ -39,6 +40,7 @@ use cog_core::{
 /// 一秒不是拍出来的：它比一次快速失败（实测 0.7 ms）长三个数量级，足以把
 /// 「一秒钟灌进几百条」压回「一秒钟一条」。比它更长的值会把一次正常的重跑也拖慢，
 /// 而拒绝本来就是少数时刻。
+// cap: bound
 pub const DEFAULT_REFUSAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// 同一个调用方一分钟内最多发起多少次尝试。
@@ -47,6 +49,7 @@ pub const DEFAULT_REFUSAL_BACKOFF: Duration = Duration::from_secs(1);
 /// 一分钟上千次。这个数是**每一次调用都要过的一道闸**，与单次退避叠加。
 /// 10 次/秒 比正常评测的调用密度（现网一小时几十到几百次）高两个数量级，所以它
 /// 不是正常路径的节流阀；它只在拒绝风暴里咬合。
+// cap: bound
 pub const ATTEMPTS_PER_MINUTE: usize = 600;
 
 /// 一跑最多肯为**一次**拒绝坐等多久；默认 600 秒。
@@ -62,6 +65,7 @@ pub const ATTEMPTS_PER_MINUTE: usize = 600;
 ///
 /// 600 秒这个数取的是「比实测见过的窗口翻页（约 4 分钟）长、又明显短于一次 Pod 的
 /// 寿命（45 分钟）」，两头都留得下一段。
+// cap: bound
 pub const DEFAULT_REFUSAL_WAIT_CAP: Duration = Duration::from_secs(600);
 
 /// 一跑里调用侧退避的界，以及它咬合了多少次。随表一起出（`Table::backoff`）。

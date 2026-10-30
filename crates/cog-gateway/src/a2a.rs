@@ -826,7 +826,9 @@ fn a2a_task_with_history(task: &Task, wanted: usize) -> A2aTask {
 
 /// 一页默认几条、最多几条。两数出自规范对 `page_size` 的说明：不写就按 50，
 /// 值域 1..=100。
+// cap: bound
 const LIST_PAGE_DEFAULT: usize = 50;
+// cap: bound — the A2A specification's page_size ceiling
 const LIST_PAGE_MAX: usize = 100;
 
 /// `ListTasks` 的过滤与分页条件（解析之后的样子）。

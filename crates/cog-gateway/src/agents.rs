@@ -443,6 +443,7 @@ impl From<&cog_core::AgentMessage> for MessageView {
 /// is refused rather than silently cut down to it, because a caller that asked
 /// for five minutes and was given two would read the timeout as the agent's
 /// silence rather than as this bound.
+// cap: bound
 pub const MAX_WAIT_SECS: u64 = 120;
 
 /// The consumer group the route reads its answers with.
@@ -467,6 +468,7 @@ pub struct MessageQuery {
 }
 
 /// How many lines of a conversation a read returns when the caller does not say.
+// cap: bound
 const CONVERSATION_DEFAULT_LIMIT: usize = 100;
 
 /// Whether this request wants an answer, and why not when it cannot have one.

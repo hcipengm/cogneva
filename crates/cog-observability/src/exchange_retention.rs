@@ -56,6 +56,7 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// default for the deployment that does not say otherwise, not a policy — a
 /// deployment with stricter promises about what it holds shortens it, and the
 /// readings move with it because the number is published rather than assumed.
+// cap: bound
 pub const DEFAULT_KEEP_DAYS: i64 = 30;
 
 /// The shortest retention this loop will accept.
@@ -64,6 +65,7 @@ pub const DEFAULT_KEEP_DAYS: i64 = 30;
 /// which reads as "the retention works" while the table it exists to bound is
 /// empty by construction — the promise to the reader is what has to survive a
 /// misconfiguration, so the value falls back rather than being honoured.
+// cap: bound
 pub const MIN_KEEP_DAYS: i64 = 1;
 
 /// The environment variable that carries the retention.
@@ -75,6 +77,7 @@ pub const KEEP_DAYS_ENV: &str = "COGNEVA_LLM_EXCHANGE_KEEP_DAYS";
 /// read, and Prometheus drops a series it has not seen for five minutes. A
 /// shorter period would spend durable rows to restate a table whose age changes
 /// by days; a longer one would let the published size go stale between scrapes.
+// cap: bound
 pub const PERIOD: Duration = Duration::from_secs(300);
 
 /// How many rows one statement may delete.
@@ -83,6 +86,7 @@ pub const PERIOD: Duration = Duration::from_secs(300);
 /// statement's work and the locks it holds. The pas repeats until it finds
 /// nothing past the cutoff, so the count of batches follows the backlog rather
 /// than the batch size.
+// cap: bound
 const BATCH_ROWS: i64 = 2_000;
 
 /// What one pass did, so a caller can assert on it rather than infer it.

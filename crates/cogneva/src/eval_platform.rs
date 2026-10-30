@@ -132,9 +132,12 @@ pub const PLATFORM_BASE_ENV: &str = "COG_EVAL_PLATFORM_BASE";
 pub const PLATFORM_TOKEN_ENV: &str = "COG_EVAL_PLATFORM_TOKEN";
 /// 一题在平台侧最多等多久（秒）。
 pub const PLATFORM_DEADLINE_ENV: &str = "COG_EVAL_PLATFORM_DEADLINE_SECS";
+// cap: bound — a platform case's wall budget; a case that cannot finish must not be scored
 const DEFAULT_DEADLINE_SECS: u64 = 3600;
+// cap: bound — polling period for a submitted platform case; the wall budget is DEFAULT_DEADLINE_SECS
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// 轨迹列表一次取多少条。按最近的排，刚跑完的那条在最前面。
+// cap: bound
 const TRACE_LIST_LIMIT: usize = 200;
 
 /// 桥的接入点。三样东西各有独立的判据：没有基址就是没有平台；令牌与时限有默认值。

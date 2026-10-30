@@ -370,6 +370,7 @@ impl WalkOutcome {
 
 /// How often a waiter looks again. Builds run for minutes, so this only decides
 /// how promptly a freed slot is picked up.
+// cap: bound
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How many turns in a row an exclusion stands down for someone else's claim on
@@ -383,6 +384,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// whether builds interfere with the cluster. Two turns is enough for the waiter
 /// to come round and take what it asked for, and short enough that a waiter that
 /// cannot take it does not hold the field off builds it never runs.
+// cap: bound
 const WALK_YIELD_LIMIT: u32 = 2;
 
 /// How long a work's stand-down for another work's claim on the next build is
@@ -393,12 +395,14 @@ const WALK_YIELD_LIMIT: u32 = 2;
 /// scoped to one call: it is the work that keeps losing, not the call. An hour
 /// is longer than any of those rounds and shorter than a work that has stopped
 /// asking has any claim to a turn it no longer wants.
+// cap: bound
 const TURN_STAND_DOWN_SECS: u64 = 3600;
 
 /// 等构建场空出来再做进程切换的上限：1 小时。
 ///
 /// 构建最长可跑一小时，所以等不到就让这一版留在暂存处——在别人的构建上切一刀
 /// 的代价是一个半完成的部署；而无限期等待会让调用它的管理端永远挂着。
+// cap: bound
 pub(crate) const SWITCH_FIELD_WAIT: Duration = Duration::from_secs(3600);
 
 static GLOBAL: OnceLock<Arc<BuildGate>> = OnceLock::new();
@@ -1127,6 +1131,7 @@ const HOST_DISK_FREE_BYTES: &str = "cogneva_host_disk_free_bytes";
 /// A fraction of one build rather than a count of windows: what is being damped
 /// is the reading's own noise across the integer it floors to, not a trend, and
 /// the noise is measured in the same unit the answer is.
+// cap: bound
 const CEILING_DEAD_BAND: f64 = 0.15;
 /// What each dimension answers on its own, beside the ceiling that takes the
 /// smallest of them.
@@ -1155,6 +1160,7 @@ pub const BUILD_GATE_BOUND_RULE: &str = "build_gate_bound_not_converging";
 /// nine tenths, which is inside the life of one build: the cost follows a
 /// workspace that got cheaper, without following a build that got quieter for a
 /// minute.
+// cap: bound
 const IO_PER_BUILD_SMOOTHING: f64 = 0.3;
 
 /// The kernel's averaging window for the `avg60` pressure figures, in seconds.
@@ -1162,6 +1168,7 @@ const IO_PER_BUILD_SMOOTHING: f64 = 0.3;
 /// Not a dial. It is the definition of the reading the io dimension explains:
 /// the occupancy charged against that reading has to be averaged over the same
 /// period, or the two describe different minutes. See [`next_occupancy_avg`].
+// cap: bound
 const PSI_AVG60_WINDOW_SECONDS: f64 = 60.0;
 
 /// The build occupancy an io reading's window ends on, given the average it
@@ -1357,10 +1364,12 @@ fn host_metrics(reading: Option<HostReading>, origin: Origin<'_>) -> Vec<RawMetr
 /// all of it — and the number this replaces is the divisor of a bound that
 /// decides how many builds run at once. Three is the smallest count at which
 /// "they agree" can be true of a sequence rather than of a pair.
+// cap: bound
 const MEASURED_BUILD_COST_SAMPLES: usize = 3;
 
 /// How close the measured builds must be to each other, as a fraction of their
 /// median, before they count as agreeing.
+// cap: bound
 const MEASURED_BUILD_COST_AGREEMENT: f64 = 0.10;
 
 /// How far the measured divisor must be from the declared one before it is used
@@ -1370,6 +1379,7 @@ const MEASURED_BUILD_COST_AGREEMENT: f64 = 0.10;
 /// differences smaller than the measurement's own noise, and every flip would
 /// be a bound move: the same square wave the ceiling's dead band exists to
 /// stop, one level down.
+// cap: bound
 const MEASURED_BUILD_COST_DEAD_BAND: f64 = 0.20;
 
 /// The divisor the measurements have earned, if they have earned one.
@@ -1490,6 +1500,7 @@ fn tuning_readings(t: &Tuning, measured_peak: Option<u64>, origin: Origin<'_>) -
 /// stall nobody measured. Capping at the sample's own horizon makes the counter
 /// a floor rather than a total, which is the safe direction for a rule that
 /// fires on it being large.
+// cap: derived
 const IO_SAMPLE_HORIZON: Duration = Duration::from_secs(60);
 
 /// What share of `since` a look at the disk may charge to [`BUILD_GATE_IO_OUTSIDE_SECONDS`].
@@ -1861,6 +1872,7 @@ pub fn reserve_build_field(what: &str) -> bool {
 /// dozen asks, and a bound moves at most once per measurement window. The number
 /// is not a policy about how many events matter -- anything this large means the
 /// consumer is not running, which is what the dropped count is for.
+// cap: bound
 const EVENT_RING_CAPACITY: usize = 256;
 
 /// The process that made a decision about the host, as the account records it.
@@ -3669,10 +3681,12 @@ fn lay_out_slots(_dir: &Path, _bound: usize) {}
 /// it. Nothing here is a secret -- a holder's name, a claim, a count -- so the
 /// mode is not about who may read it; it is about who may *write* it, and the
 /// answer has to be everyone who builds.
+// cap: bound
 const GATE_DIR_MODE: u32 = 0o1777;
 /// Mode a gate file is created with. World-writable on purpose: every user that
 /// builds on this host has to be able to record a verdict, and the mode is about
 /// who may write, not about who may read.
+// cap: bound
 const GATE_FILE_MODE: u32 = 0o666;
 
 /// Opens the gate directory to every builder on this host, whichever user it

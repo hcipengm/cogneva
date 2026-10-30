@@ -90,6 +90,7 @@ struct SnapshotGroup {
 impl SnapshotFile {
     /// 这份快照的落盘形状的版本。读侧遇到不认识的版本一律不猜：形状变了才动这个数，
     /// 它标的是「这份文件按哪种形状写的」，不是容量。
+    // cap: bound
     const VERSION: u32 = 1;
 
     fn from_map(stats: &HashMap<(DecisionCategory, DecisionGroupKey), DecisionStatistics>) -> Self {

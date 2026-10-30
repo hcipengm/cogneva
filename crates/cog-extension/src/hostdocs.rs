@@ -76,6 +76,7 @@ const JOURNAL_FILE: &str = "journal.json";
 /// 回滚完成后把日志改名成它。存在即「这一次已经回滚过」，读取侧据此拒收。
 const JOURNAL_ROLLED_BACK_FILE: &str = "journal.rolled-back.json";
 
+// cap: bound — Default for the body of one host document. Sized for the largest document this platform writes by hand (a plan or an audit), not to the channel's bound: a document is stored whole, so the number answers to what a reader can open.
 const DEFAULT_MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
 /// A full-size body. **Deliberately not tied to the audited channel's bound**: that one
 /// is another process's quantity, bounding the text one request sends out, while this
@@ -83,16 +84,20 @@ const DEFAULT_MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
 /// is a coincidence, and coupling them would let either side drag the other whenever it
 /// is adjusted -- while the smaller side is observable (`over_ceiling` carries both
 /// numbers) rather than silently lost.
+// cap: bound
 const DEFAULT_MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 /// A listing is for a person to read and for a model to read; past a few thousand
 /// entries, both sides are only paying for it.
+// cap: bound
 const DEFAULT_MAX_LIST_ENTRIES: usize = 5_000;
 /// A day. This gate is a person reading one plan, and a plan left unread for more than
 /// a working day is no longer the plan about to be read -- approving it then is
 /// approving something nobody looked at.
+// cap: bound
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 /// A window shorter than this is not a window: the plan could expire between being
 /// displayed and being clicked.
+// cap: bound
 const MIN_APPROVAL_TTL_SECS: u64 = 60;
 /// The same order of magnitude as a body: if a plan carries more text than one write is
 /// allowed to carry, then approving it does not mean what it says on the tin.

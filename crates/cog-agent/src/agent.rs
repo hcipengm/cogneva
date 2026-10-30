@@ -17,11 +17,13 @@ use futures::StreamExt;
 /// then the message the handler is inside has to finish. Ten seconds is where
 /// an idle consumer always makes it and a busy one is always worth a line — it
 /// is a judgement about the wait, not a percentile of task duration.
+// cap: bound
 const AGENT_RETIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Wall for the one command this crate runs on a checkout to produce a
 /// change's text. The work is a git diff over a working tree, so two minutes
 /// is sized for a large tree being scanned, not for a slow computation.
+// cap: bound
 const WORKSPACE_CHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// What one call to [`Agent::retire`] did.

@@ -22,6 +22,7 @@ use std::sync::OnceLock;
 ///
 /// 第一次失败几乎都是对端刚重启，100ms 后重试就是一次正常写入；翻倍让连续
 /// 失败退到秒级，不会在 Loki 长时间不可用时把它压死。
+// cap: bound
 const BACKOFF_BASE_MS: u64 = 100;
 
 pub type LogFilterHandle =

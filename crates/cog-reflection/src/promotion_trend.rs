@@ -21,10 +21,13 @@ use cog_core::{
 use tracing::{error, info, warn};
 
 /// 参与聚合的周数。
+// cap: bound
 const WINDOW_WEEKS: usize = 8;
 /// 判定趋势向下的连续下降周数。
+// cap: bound
 const DECLINE_RUN: usize = 3;
 /// 单周完结对决样本下限（低于则该周不参与趋势判定，避免小样本抖动误报）。
+// cap: bound
 const MIN_WEEK_SAMPLES: u64 = 2;
 
 /// 抓取面上这一族的两个标签。
@@ -47,6 +50,7 @@ const OUTCOME_AWAITING_REVIEW: &str = "awaiting_review";
 ///
 /// 防的是配置错误：周期被填成 0 或 1 会让这条循环对着表打热循环，而趋势读数
 /// 本身的粒度就是分钟级，更密不会让曲线更准。
+// cap: bound
 const MIN_TREND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 从台账记录聚合周报。纯函数，便于测试。

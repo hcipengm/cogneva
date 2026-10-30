@@ -99,10 +99,12 @@ pub const LOOP_PERIOD: Duration = MAX_SWEEP_PERIOD;
 /// disappear exactly when the log has gone quiet — the moment an operator is
 /// most likely to look. Half the staleness window leaves room for a scrape to
 /// land late.
+// cap: bound
 const MAX_SWEEP_PERIOD: Duration = Duration::from_secs(120);
 
 /// Shortest the sweeper will wait between passes. A guard against a control
 /// loop that never sleeps, not a cadence anyone is choosing.
+// cap: bound
 const MIN_SWEEP_PERIOD: Duration = Duration::from_secs(1);
 
 /// What one pass did, so a caller can assert on it rather than infer it.

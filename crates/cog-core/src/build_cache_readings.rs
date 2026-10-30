@@ -129,6 +129,7 @@ pub use crate::build_cache::*;
 /// A cap derived from a peak the cache has not come near for this long holds
 /// space for a build pattern that no longer happens; the window lets the next
 /// walk replace it with what is actually there.
+// cap: bound
 const PEAK_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// Headroom over the peak, in percent.
@@ -136,6 +137,7 @@ const PEAK_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 /// A cap at the peak itself reclaims the bytes the next build is about to
 /// write: the peak is the largest working set seen, so bounding to it turns the
 /// busiest walk into an over-cap one every time it repeats.
+// cap: bound
 const CAP_HEADROOM_PERCENT: u64 = 120;
 
 /// The ceiling slot before any loop has stated one.

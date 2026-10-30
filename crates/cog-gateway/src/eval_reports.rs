@@ -26,6 +26,7 @@ use crate::GatewayState;
 /// 列举要按修改时间排序，并且为了给出数据集名要读每一份的正文——每个返回项一次
 /// 读。不设上限时，「列一下目录」会退化成按文件数读盘，所以上限落在这里，同时把
 /// 未截断的总数报出去：调用方必须能看出自己拿到的是前缀。
+// cap: bound
 pub const DEFAULT_LIST_LIMIT: usize = 200;
 
 /// 报告目录：`{data_dir}/eval/reports`。

@@ -108,6 +108,7 @@ pub struct PgeSettings {
 /// feedback is unchanged between iterations, so repeating it cannot buy a
 /// different outcome — either the plan is the real defect, which is the global
 /// reset's job, or nothing in the feedback is actionable.
+// cap: bound
 pub const DEFAULT_LOCAL_REPAIR_MAX: u32 = 2;
 
 /// A zero here would close the repair loop for every deployment that does not

@@ -23,6 +23,7 @@ pub const EVENT_AGGREGATOR_LOOP: &str = "supervisor_event_aggregator";
 /// matter how cheap each event is to take. A deadline lets a burst run as long
 /// as it stays cheap without letting it hold the wake-up, and it is what gives
 /// the stop signal a chance to be observed while the queue is busy.
+// cap: bound
 const DRAIN_BUDGET: Duration = Duration::from_millis(250);
 
 /// Statistics emitted by the [`EventAggregator`] every aggregation

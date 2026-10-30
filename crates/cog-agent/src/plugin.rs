@@ -14,11 +14,13 @@ pub const POOL_SIZING_LOOP: &str = "agent_pool_sizing";
 /// Shorter than the pool's own task length on purpose: a task holds its turn
 /// for minutes, so a reading that stepped faster than that could shrink the
 /// pool and regrow it between two tasks without either reading being wrong.
+// cap: bound
 const POOL_SIZING_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How often this agent says it is alive to the control plane. Short enough
 /// that a restarted control plane re-learns its agents without a redeploy, long
 /// enough that the heartbeat is not the busiest thing on the channel.
+// cap: bound
 const HEARTBEAT_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Keep the pool's concurrency equal to what the container can carry.
@@ -717,7 +719,9 @@ async fn event_upload_task(
 ) {
     use tokio::time::{interval, Duration};
 
+    // cap: bound — a batching choice; the flush deadline is what bounds the wait
     const BATCH_SIZE: usize = 16;
+    // cap: bound — flush deadline for buffered events; the batch size of 16 is the other half of the batching
     const BATCH_TIMEOUT: Duration = Duration::from_millis(100);
 
     let mut buffer: Vec<cog_core::AgentEvent> = Vec::with_capacity(BATCH_SIZE);

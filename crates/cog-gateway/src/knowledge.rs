@@ -34,6 +34,7 @@ fn default_top_k() -> usize {
 /// The widest answer this route will assemble. Same ceiling the wiki search
 /// applies, because both are asking a store to return a page of its contents
 /// over HTTP rather than sizing an internal candidate window.
+// cap: bound
 const MAX_TOP_K: usize = 100;
 
 #[derive(Debug, Deserialize)]

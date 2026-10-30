@@ -90,6 +90,7 @@ pub struct Squad {
 }
 
 /// 连续 Pipeline 失败多少次后自动升级到 Roundtable 模式。
+// cap: bound
 pub const PIPELINE_FAILURES_BEFORE_UPGRADE: u32 = 2;
 
 /// 单个 Squad 执行结果。

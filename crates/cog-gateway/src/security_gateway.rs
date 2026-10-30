@@ -502,6 +502,7 @@ fn env_usize(key: &str, default: usize) -> usize {
 /// 截断长度保证常见厂商错误 JSON 的 type 字段（如 access_terminated_error）
 /// 不被切掉——调用方的终止性失败分类依赖这些标记。
 fn error_excerpt(text: &str) -> String {
+    // cap: bound — upstream error excerpt: the truncation point is chosen so the vendor's own error-type marker (access_terminated_error) survives, because termination classification reads it
     const MAX_CHARS: usize = 512;
     let t = text.trim();
     if t.chars().count() <= MAX_CHARS {
@@ -515,6 +516,7 @@ fn error_excerpt(text: &str) -> String {
 
 /// 嫌疑窗指数退避封顶：与调用侧终止退避同形，配额类终止的上游
 /// 每窗口最多烧一次最小探测调用，恢复延迟最多一个窗口。
+// cap: derived
 const SUSPECT_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 
 /// 嫌疑窗时长：探测间隔 × 2^(n-1)，封顶 6h。n 为连续失败次数。
@@ -689,6 +691,7 @@ fn parse_quota_window_secs(body: &str) -> Option<u64> {
 
 /// 窗口长度的上界：上游写什么我们都不当"永远不可用"播报，超过一年的数只可能是
 /// 解析错了或上游文案变了，按一年截断并保留"这只是个窗口"的语义。
+// cap: bound
 const MAX_QUOTA_WINDOW_SECS: u64 = 366 * 86_400;
 
 /// 把一条拒绝的正文读成 [`RefusalKind`]。
@@ -1015,6 +1018,7 @@ struct FaceAnswerReading {
 /// 一次面探测就是一次 `max_tokens=1` 的 ping，配额成本可以忽略；而"某个面没了"
 /// 是件**慢**事（厂商下掉端点、运维写错地址），要的是迟早会看见，不是三十秒内
 /// 看见。这个间隔同时是候选资格的有效期：一条十天前的答复不该替今天放行流量。
+// cap: bound
 const FACE_ANSWER_TTL_SECS: u64 = 1800;
 
 /// 准入探测问的三个问题。
@@ -1720,6 +1724,7 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
 
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
 /// 池判定就不再续期，所以等一个不响应的 PG 必须有上限。
+// cap: bound
 const DURABLE_GAUGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 池读数的耐久面：把同一个 gauge 再往共享 metrics store 写一份，让读数活得比
@@ -2969,26 +2974,31 @@ struct RequestSide {
 /// code-platform payloads, and the gateway has to have the whole thing before
 /// it can decide whether to send it; it is still a bound, so a caller streaming
 /// without end fails here instead of in memory.
+// cap: bound
 const MAX_PROXIED_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// How much of a git pack transfer this will buffer. The copy is held so that
 /// the forwarded request carries a complete Content-Length — git servers
 /// disagree about chunked encoding — and cogneva's own repositories sit far
 /// below this, so the memory is spent on the header rather than the payload.
+// cap: bound
 const MAX_GIT_PACK_BYTES: usize = 256 * 1024 * 1024;
 
 /// Wall for one outbound call to an upstream. Sized for a non-streaming
 /// completion, which is the slowest non-stream thing this process asks for.
+// cap: bound
 const UPSTREAM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Wall for the connection alone. Kept well under the request wall so an
 /// unreachable upstream is reported as "cannot connect" quickly instead of
 /// being indistinguishable from a slow one.
+// cap: bound
 const UPSTREAM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 留底表的单边上限。流式响应的原文扫描本来就只留 1 MiB（见 [`UsageScanner::feed`]），
 /// 请求侧对齐同一个界：两边都是"一次调用的规模"，而把它调大只会让一张诊断表变成
 /// 库里最大的一张。
+// cap: derived
 const EXCHANGE_BODY_CAP: usize = 1024 * 1024;
 
 /// 留底开关。默认开，`COGNEVA_GATEWAY_EXCHANGE_STORE=0` 关——关掉之后台账照写，
@@ -3995,9 +4005,11 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
 
 /// 配速预留用多少天的历史任务来量一件任务的成本。取近一个月：短了会被一次
 /// 异常便宜的批任务拉低，长了会把配置/提示词变更之前的形状带进来。
+// cap: bound
 const WINDOW_PACE_RESERVE_DAYS: i64 = 30;
 /// 预留取的分位数。中位数会让一半的任务**装不下**它自己，那正好是"开一半就
 /// 断"的那种坏法；75 分位让大多数任务整件装得下，代价是开头那一小段等得更久。
+// cap: bound
 const WINDOW_PACE_RESERVE_QUANTILE: f64 = 0.75;
 
 /// 一拍窗口配速：量出每个上游的容量、算出这一窗的允许量、把用量对上去。
@@ -4134,6 +4146,7 @@ async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReadin
 
 /// 一次账本求和的等待上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
 /// 池状态就不再续期，所以等一个不响应的 PG 必须有上限。
+// cap: bound
 const SPEND_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 重算"今天为止花了多少"，以及这一拍到底量到没有。
@@ -6963,6 +6976,7 @@ async fn code_platform_forward(
 /// 它必须小于调用方自己的检索墙（`cog-agent` 的 `SEARCH_TIMEOUT_SECS` 是 20s）：
 /// 池是按顺序问的，一次超过这里就会让「还有第二、第三家可问」在调用方眼里变成
 /// 一次超时——那时换上游这件事根本没有发生，而读起来像「后备全挂了」。
+// cap: bound
 const SEARCH_FALLBACK_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// 后备出口的两个动作。路由决定问哪一个，不由请求体决定——请求体是调用方给的，
@@ -7308,6 +7322,7 @@ async fn attach_proxy(
 ) -> Result<axum::response::Response, (StatusCode, String)> {
     /// 附件的上限，与 GitHub 附件面那条界同值：一个平台接受的附件，在网关这一侧和
     /// 在代码平台那一侧必须是同一个规摸。
+    // cap: bound
     const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
     let raw = params

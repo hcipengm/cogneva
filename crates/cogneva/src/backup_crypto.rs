@@ -31,14 +31,18 @@ pub const MAGIC: &[u8] = b"COGNEVA-BACKUP-ENC-1\n";
 /// 读不到时给出的说法。
 pub const KEY_ENV: &str = cog_core::env::BACKUP_PACKAGE_KEY;
 
+// cap: bound — sixteen random bytes per package: enough that two packages from one password cannot be compared.
 const SALT_LEN: usize = 16;
+// cap: bound — the tag ChaCha20-Poly1305 appends: sixteen bytes, and the terminal frame is recognised by it.
 const TAG_LEN: usize = 16;
 /// 密文形状里三个由算法定死的长度：ChaCha20-Poly1305 的 nonce 12 字节、认证标签
 /// 16 字节（终止帧靠它认出来），以及每个包一份的 16 字节随机盐——盐够大就够让同一
 /// 句口令打出来的两个包互不可比。它们不是可调的旋钮。
+// cap: bound
 const NONCE_LEN: usize = 12;
 /// 一帧的明文上限。1 MiB 是吞吐与内存占用的折中：包体量在百 MB 量级，整包读进
 /// 内存会让备份 Pod 的峰值跟着包大小走。
+// cap: bound
 const CHUNK: usize = 1 << 20;
 const MAX_FRAME: usize = CHUNK + TAG_LEN;
 

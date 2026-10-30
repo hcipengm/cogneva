@@ -606,6 +606,7 @@ pub async fn summary_search_handler(
 /// turn "list the namespace" into one read per id; the cap keeps a listing to a
 /// bounded number of reads and reports the untrimmed `total` so the caller can
 /// see it was a prefix.
+// cap: bound
 const DEFAULT_RAW_LIST_LIMIT: usize = 100;
 
 #[derive(Debug, Deserialize)]
@@ -962,6 +963,7 @@ pub async fn get_raw_url_handler(
     // A short window: the URL carries the object store's signature and is meant
     // to be used at once. A long one would leave a working link to the stored
     // bytes circulating past the request that asked for it.
+    // cap: bound — lifetime of the signed URL for stored bytes: long enough for the request that asked, short enough that a working link does not circulate
     const EXPIRY_SECS: u64 = 300;
     match backend.presign_raw(&ns, &id, EXPIRY_SECS).await {
         Ok(Some(url)) => (

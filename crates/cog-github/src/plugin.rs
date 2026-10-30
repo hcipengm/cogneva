@@ -16,6 +16,7 @@ use crate::provider::CodePlatformProvider;
 ///
 /// 排空要看的是外部平台侧「合并了没有」，这个数决定「合并到看见它走完」的最长
 /// 滞后；一拍的代价是几次查询，密到分钟级没有收益。
+// cap: bound
 const STAGED_CHANGE_DRAIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// Background loop state, held behind a mutex because [`SystemPlugin::start`]

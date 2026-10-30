@@ -42,6 +42,7 @@ pub struct BehaviorMonitor {
 }
 
 impl BehaviorMonitor {
+    // cap: bound — actions the pattern detector can see; a fixed depth, not a reading
     pub const DEFAULT_MAX_HISTORY: usize = 20;
 
     pub fn new(agent_id: impl Into<String>) -> Self {

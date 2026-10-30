@@ -38,6 +38,7 @@ use std::time::Duration;
 /// steps spike, codegen plateaus — so half a second is fine enough to see a
 /// spike that lasts, and coarse enough that the sampler's own reads are a
 /// rounding error against the compile it is watching.
+// cap: bound
 pub const SAMPLE_PERIOD: Duration = Duration::from_millis(500);
 
 /// How long a caller waits for the sampler to report after the process it was
@@ -48,10 +49,12 @@ pub const SAMPLE_PERIOD: Duration = Duration::from_millis(500);
 /// not reap, where waiting for the reading would cost the build. Named rather
 /// than written at the call site because it is a wall with a reason, and a bare
 /// number in a `Duration` constructor is one nothing can be asked about.
+// cap: bound
 pub const DRAIN_WAIT: Duration = Duration::from_secs(5);
 
 /// A bound on the tree walk, so a `/proc` that is misbehaving (a name cycle, a
 /// pid reused mid-walk) costs a sample rather than the build.
+// cap: bound
 const MAX_TREE: usize = 4096;
 
 /// What one build's memory looked like while it ran.

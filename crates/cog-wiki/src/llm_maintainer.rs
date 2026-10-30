@@ -26,6 +26,7 @@ use crate::maintainer::{
 use crate::page::{WikiPage, WikiPageType};
 
 /// 孤立页/过时页判定阈值（天）。
+// cap: bound
 const OUTDATED_THRESHOLD_DAYS: i64 = 30;
 
 pub struct LlmWikiMaintainer {

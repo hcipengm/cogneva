@@ -20,6 +20,7 @@ pub const SUPERVISOR_LOOP: &str = "supervisor_main";
 /// given up on. Reaping earlier would delete the evidence while the attempt to
 /// bring the crew back was still running; reaping later costs nothing but the
 /// announcement each pass makes about an agent that is already gone.
+// cap: bound
 const REAP_AFTER_DEAD: Duration = Duration::from_secs(1800);
 
 /// The verdicts a pass may announce as an unhealthy agent.
@@ -110,29 +111,34 @@ pub struct SupervisorConfig {
 ///
 /// 判据（可疑 15s、死亡 60s）都在秒级，巡检必须比它们密，否则判据被巡检自己
 /// 拖粗。
+// cap: bound
 const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 配额巡检周期：60s。
 ///
 /// 配额是按分钟算的额度，一分钟读一次就够；更密只是重复读同一批计数。
+// cap: bound
 const QUOTA_INTERVAL: Duration = Duration::from_secs(60);
 
 /// 任务再平衡周期：300s。
 ///
 /// 再平衡会挪动在跑的任务，代价远高于一次巡检；五分钟一拍让舰队形状稳定下来，
 /// 而不是跟着一次抖动来回搬。
+// cap: bound
 const REBALANCE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// 事件窗口：30s。
 ///
 /// 告警去重与突发判定都看这个窗口；它要长到能盖住一次真实的故障脉冲，短到
 /// 不会把两次独立故障并成一条。
+// cap: bound
 const EVENT_WINDOW: Duration = Duration::from_secs(30);
 
 /// 控制面巡检周期：30s。
 ///
 /// 控制面地址是可选的外部依赖，读它的代价在网络往返上；30s 一拍足够发现
 /// 「控制面不在了」，而不会把监控面变成对它的压力源。
+// cap: bound
 const CONTROL_PLANE_INTERVAL: Duration = Duration::from_secs(30);
 
 impl Default for SupervisorConfig {

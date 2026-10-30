@@ -65,6 +65,7 @@ pub const HISTOGRAM_SUMS_TABLE: &str = "cog_metric_histogram_sums";
 /// locks, the same way the sweep's batch does. A retired name's history can be
 /// the larger part of the log, and deleting it in one statement would block
 /// every writer for as long as that takes.
+// cap: bound
 const RELEASE_BATCH: i64 = 5_000;
 
 /// 申报：一个名字**后来长出来的标签**，与长出之前那批标签集。
@@ -139,6 +140,7 @@ pub const SUPERSEDED_SHAPES: &[(&str, &str)] = &[
 /// `increment_counter_total` 是 `SET value = t.value + EXCLUDED.value`，下一笔从增量
 /// 重起、Prometheus 读成 reset ⇒ 比不删更坏。取大了只是把一个没有截止期的删除推后。
 /// 中位数落在被保护的形状自己正常的节奏里，压根不是候选。
+// cap: bound
 pub const SUPERSEDED_QUIET_SECS: i64 = 6 * 3600;
 
 /// 一张表把时钟放在哪——形状守卫要按它判年龄。

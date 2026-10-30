@@ -52,6 +52,7 @@ pub const FACE_DRIFT_LOOP: &str = "governance_face_drift";
 pub const FACE_DRIFT_ROLE: &str = "governance_face_drift";
 
 /// How often a pass runs.
+// cap: bound
 pub const FACE_DRIFT_PASS_INTERVAL: Duration = Duration::from_secs(120);
 
 /// The scrape-only metric carrying each face's current verdict.

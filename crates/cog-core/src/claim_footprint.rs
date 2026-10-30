@@ -41,6 +41,7 @@ pub const CLAIM_LABEL: &str = "persistentvolumeclaim";
 /// The walk is metadata-only and cheap, but it holds no value being fresher than
 /// the scrape interval, and a deployment that asks for more gets this instead of
 /// a knob that reads as "how wrong the setting was".
+// cap: bound
 pub const MIN_SCAN_INTERVAL_SECS: u64 = 30;
 
 /// Cadence a process re-walks its volumes at when nothing states one.
@@ -51,6 +52,7 @@ pub const MIN_SCAN_INTERVAL_SECS: u64 = 30;
 /// on a ten-minute one for the same workload. It sits beside the floor because
 /// the two are read together — a deployment's own cadence is clamped by the
 /// floor and falls back to this.
+// cap: bound
 pub const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
 
 /// Deployment variable stating the `claim=path` mounts a pod measures.

@@ -15,11 +15,13 @@ use std::time::Duration;
 /// job's: long enough for a healthy API to return a bounded payload, short
 /// enough that an API which stopped answering delays the turn instead of
 /// wedging it.
+// cap: bound
 const MEMORY_READ_TIMEOUT_SECS: u64 = 30;
 
 /// The payload size a read moves without being told otherwise. A quarter
 /// megabyte is what a tool result that already fit an agent's context roughly
 /// holds; a caller that wants a larger source names its own budget.
+// cap: bound
 const DEFAULT_RAW_FETCH_BUDGET_BYTES: u64 = 262_144;
 
 /// How long an ask waits for its answer when the caller does not say, and the
@@ -29,19 +31,23 @@ const DEFAULT_RAW_FETCH_BUDGET_BYTES: u64 = 262_144;
 /// peer's run to finish, short enough that an unanswering peer costs one turn
 /// rather than the run. The cap exists because the bound is the only thing
 /// standing between "ask a peer" and "wait for it forever".
+// cap: bound
 const ASK_DEFAULT_TIMEOUT_MS: u64 = 120_000;
+// cap: bound — the cap that keeps a peer's silence from becoming an unbounded wait
 const ASK_MAX_TIMEOUT_MS: u64 = 600_000;
 
 /// Default wall for one WASM tool call. The guest is somebody else's code: a
 /// module that never returns has to come back to the caller as a failure, so
 /// the bound is short — a compute-shaped tool that legitimately needs longer
 /// asks for it instead of raising this.
+// cap: bound
 const DEFAULT_WASM_TIMEOUT_SECS: u64 = 30;
 
 /// Default wall for one shell tool call. An order of magnitude above the WASM
 /// bound because the thing being timed is a build or a test run, which is
 /// expected to take minutes; what this catches is a command that wedged, not a
 /// command that works.
+// cap: derived
 const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 600;
 
 /// Real execution identity of one agent run. Carried explicitly from the
@@ -81,6 +87,7 @@ pub fn caller_agent_id() -> Option<String> {
 /// 一页按行数计，不按字节：行数读起来能对上编辑器，也能直接当 `offset`
 /// 用。取值让常见源码文件一次读完，而整文件倾倒型的读（几千行、几十万
 /// 字符）自动变成可分页的几段。
+// cap: bound
 const READ_FILE_DEFAULT_WINDOW_LINES: usize = 600;
 
 /// 一页最多带多少个字符，行数没到也停下来。
@@ -89,6 +96,7 @@ const READ_FILE_DEFAULT_WINDOW_LINES: usize = 600;
 /// 可以轻松超过一次对话里任何一段的体量。这一页之后每一轮都要重发，所以
 /// 两道界取更紧的那道；被这道界停下来的页面照样带 `has_more` 与
 /// `next_offset`，翻页不会漏行。
+// cap: bound
 const READ_FILE_PAGE_MAX_CHARS: usize = 32 * 1024;
 
 /// 按行切出 `read_file` 调用方要的那一段。

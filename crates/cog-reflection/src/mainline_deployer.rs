@@ -200,14 +200,17 @@ pub(crate) const MAIN_TAG_PREFIX: &str = "main-";
 /// 声明自己的工期界，而一条每批 900 秒、批数随库存变的回收循环，会让那个界没法
 /// 存在——库存涨起来时，同一条循环可以从"一轮一分钟"变成"一轮几小时"而没有一次
 /// 心跳。删不完的留给下一轮，回收是幂等的。
+// cap: bound
 const BUILDAH_RMI_BATCHES_PER_ROUND: u64 = 2;
 
 /// 回收那一轮里每批删几张。与 [`BUILDAH_RMI_BATCHES_PER_ROUND`] 一起构成这一段
 /// 一轮的上界。
+// cap: bound
 const BUILDAH_RMI_BATCH_CHUNK: usize = 32;
 
 /// 构建那一段里 strip 那一跳的墙钟上界。与 cargo 构建分成两跳（失败不致命），
 /// 所以构建那一段的墙是"cargo 的墙 + 这个数"。
+// cap: bound
 const STRIP_WALL_SECS: u64 = 60;
 
 /// 判定 Job 还在跑时，就地轮询它的间隔。
@@ -215,6 +218,7 @@ const STRIP_WALL_SECS: u64 = 60;
 /// 这个数是"看见它退出"的延迟，不是"等它跑完"的时间：判定本身要跑几分钟，而
 /// 十五秒的粒度在十分钟的轮询节拍旁边几乎不花什么——它只换掉一个本来要等满
 /// 一轮才发生的结论。
+// cap: bound
 const JUDGEMENT_POLL_SECS: u64 = 15;
 
 /// 部署器这一轮愿意为一次判定等多久。
@@ -287,6 +291,7 @@ const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
 /// 它取到全场并没有"回答"这一方的请求），被构建挡住时又把自己的认领写上去，直接顶掉
 /// 这一方的。两种情况都让这一方每轮白认领一次，于是照旧连输。闸门现在只允许认领的持有者
 /// 清掉自己的那条，且已有人认领时不再覆写——构建对两个认领一样让步，覆写换不到任何东西。
+// cap: bound
 const ADVANCE_CLAIM_AFTER_DEFERRALS: u32 = 3;
 
 /// 主线在构建闸前排队等多久，秒。
@@ -298,18 +303,21 @@ const ADVANCE_CLAIM_AFTER_DEFERRALS: u32 = 3;
 /// 一分钟是**排队**的时长，不是**构建**的时长：一轮构建要十几分钟，等满它会把一拍
 /// 轮询整个停住，而这一拍正是发布「我还在等」的那一拍。等满一分钟还没轮到的，照旧按
 /// 被拒处理（计数、起点、认领名额都不变），下一拍重新排队。
+// cap: bound
 const ADVANCE_BUILD_WAIT: Duration = Duration::from_secs(60);
 
 /// `kubectl auth can-i` 的墙：30s。
 ///
 /// 这一步只问一句权限，正常是百毫秒级；30s 是「apiserver 正忙但仍然活着」与
 /// 「叫不动了」之间的分界，报错文案跟着这个数走。
+// cap: bound
 const KUBECTL_AUTHZ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 一次带 stdin 的 `kubectl` 调用的墙：60s。
 ///
 /// 这里跑的是 apply/create 这类会写进 apiserver 的动作，慢在一次提交的落库与
 /// admission 链；比只读多给一倍，是因为超时后的重试会留下半完成的资源。
+// cap: bound
 const KUBECTL_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 稳定叠层基底的 tag：`<registry>/cogneva:seed`。
@@ -797,6 +805,7 @@ pub(crate) const FATAL_WAITING_REASONS: &[&str] = &[
 /// derived from this count as well as from the per-target budgets, because a
 /// Job killed by its deadline never runs its own rollback — that half-rolled
 /// cluster is what the deadline exists to prevent.
+// cap: bound
 const PREFLIGHT_RETRYING_READS: u64 = 3;
 
 /// 支撑工作负载等不到就绪时，贴在判词后面的现场读数与主判词之间的分隔。**判据
@@ -806,6 +815,7 @@ const PREFLIGHT_RETRYING_READS: u64 = 3;
 /// 不是这次失败的性质——辅助读数能让主判据换个落点，等于让病因自己决定归谁管。
 pub(crate) const SUPPORT_CAUSE_SEPARATOR: &str = "; why it has not come up: ";
 
+// cap: bound — the text comes from the cluster, so its length cannot be the cluster's to decide: it ends up in logs, termination messages and failure records
 pub(crate) const SUPPORT_CAUSE_MESSAGE_CHARS: usize = 200;
 
 /// 一个 Pod 模板里「读到某个 ConfigMap」的形态，写成相对 Pod 模板根的路径。
@@ -1536,6 +1546,7 @@ fn killed_reason(
 /// `activeDeadlineSeconds` 到点，**在退出码上**判不出类别，按版本类靠。三种杀法
 /// 本身在 Pod 状态里是可分的（`state.terminated.reason` 与 Pod 的 `status.reason`），
 /// 所以那一侧的原因不丢：落点里的 [`KilledReason`] 就是它。
+// cap: bound
 pub(crate) const ROLLOUT_EXIT_ENVIRONMENT: i32 = 75;
 
 /// 滚动失败的类别。分的是**这次失败说不说得出新版本的问题**：版本类是这份
@@ -2023,6 +2034,7 @@ const CI_HOLD_ENDED_EVENT: &str = "ci_hold_ended";
 
 /// 盘上保留多少次扣住的结局。扣住是被上游 CI 挡住的那几次，不是每一轮都会发生；
 /// 一个环足够回答"最近几版都怎么被放的"，又不让状态文件随历史线性长大。
+// cap: bound
 const CI_HOLD_END_KEEP: usize = 16;
 
 /// 出现在这个仓库的检查里、却**不判这棵树**的那些工作流。
@@ -2082,6 +2094,7 @@ const ADVANCE_WAIT_ENDED_EVENT: &str = "advance_wait_ended";
 
 /// 盘上保留多少段等槽的结局。与 [`CI_HOLD_END_KEEP`] 同尺度：这里答的是"最近几段
 /// 等待怎么结束的"，不是全量审计。
+// cap: bound
 const ADVANCE_WAIT_KEEP: usize = 16;
 
 /// 上一次问上游 CI 得到的判词，按 rev 落盘。
@@ -4099,6 +4112,7 @@ impl MainlineDeployer {
     /// 时限的参照是**这一笔第一次被判 `fail` 的时刻**（`decided_unix`；重复判出同一个
     /// 结论时它不被刷新，所以它是窗口的起点而不是最后一次提问的时刻）。宿主实测一段冷
     /// 构建约 8 分钟，窗口给到 30 分钟，足够让一次重跑跑完还留出排队的余量。
+    // cap: bound
     const CANCELLED_WAIVER_WINDOW_SECS: i64 = 30 * 60;
 
     /// 见 [`Self::CANCELLED_WAIVER_WINDOW_SECS`]。返回新的判词与原因列；没有可以放行的
@@ -9148,6 +9162,7 @@ fn manifests_configmap_name(rev: &str) -> String {
 ///
 /// 撤回要用的是**上一版**的那一份包；保留一个数是为了让「留几个」成为一处可读的
 /// 决定，而不是散在清理逻辑里的隐含行为。改这个数的人要同时想清楚撤回窗口有多长。
+// cap: bound
 pub(crate) const MANIFEST_BUNDLES_KEPT: usize = 5;
 
 /// 集群级 kind：进化 SA 只有命名空间级 Role，apply 这些必然被拒；它们由

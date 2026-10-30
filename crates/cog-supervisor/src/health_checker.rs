@@ -89,17 +89,20 @@ pub struct HealthCheckerConfig {
 /// 多久没心跳算可疑：15s。
 ///
 /// 心跳是秒级的，15s 是「丢了两三拍」的量级；一到两拍的抖动不该被报成可疑。
+// cap: bound
 const SUSPECT_AFTER: Duration = Duration::from_secs(15);
 
 /// 多久没心跳算死亡：60s。
 ///
 /// 与可疑是同一把尺子的两档：进程真没了与网络抖动在这两个数之间分开。
+// cap: bound
 const DEAD_AFTER: Duration = Duration::from_secs(60);
 
 /// 多久没有进展算卡住：10 分钟。
 ///
 /// 一次长任务（构建、一轮评测）可以十分钟没有可见输出；判据比它短会误报，
 /// 比它长则卡住的 agent 白占一个槽。
+// cap: bound
 const STUCK_AFTER: Duration = Duration::from_secs(600);
 
 impl Default for HealthCheckerConfig {

@@ -18,4 +18,5 @@
 /// The number is the one the maintainer's own query path already used, moved
 /// here rather than chosen again: it is the size of one page's worth of context
 /// for a model, which is the same quantity in both places.
+// cap: bound
 pub const WIKI_PAGE_PROMPT_CHARS: usize = 2_000;

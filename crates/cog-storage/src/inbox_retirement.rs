@@ -47,6 +47,7 @@ pub const INBOX_RETIRE_SWEEP_LOOP: &str = "storage_inbox_retire_sweep";
 
 /// How often the pass looks. Matched to the WAL sweep: both delete, both need
 /// the same second look, and there is nothing time-critical about either.
+// cap: derived
 pub const INBOX_RETIRE_SWEEP_PERIOD: Duration = Duration::from_secs(600);
 
 /// The prefix and suffix of an agent's inbox stream.

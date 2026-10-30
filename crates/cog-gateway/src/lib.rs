@@ -565,6 +565,7 @@ fn memory_raw_routes() -> Router<Arc<GatewayState>> {
 /// 记忆写入与原始流上传是这里唯一的批量入口，两条路由面（对外与集群内）共用
 /// 这一个数——各写一份时，改一处就有一个面静默地留着旧上限。这是这段代码自己
 /// 选的界，不是量出来的容量。
+// cap: bound
 const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub fn create_internal_router(state: Arc<GatewayState>) -> Router {

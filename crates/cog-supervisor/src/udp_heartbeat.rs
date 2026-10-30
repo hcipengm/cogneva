@@ -15,12 +15,14 @@ use cog_core::{AgentRegistry, SFResult, ShutdownSignal};
 ///
 /// UDP 不重传，冗余发送就是这里唯一的重传；三份覆盖「单包丢弃」这个常态，
 /// 更多只是把心跳流量乘以份数。
+// cap: bound
 const REDUNDANT_PACKETS: u32 = 3;
 
 /// 冗余包之间的间隔：10ms。
 ///
 /// 太密会被接收端当成重复包一次丢掉，太疏则三份落在同一个拥塞窗口里，
 /// 冗余随之失去意义。
+// cap: bound
 const REDUNDANT_PACKET_SPACING: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// Heartbeat packet payload.

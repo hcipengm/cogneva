@@ -22,9 +22,11 @@ use std::time::Duration;
 /// Probe target. Kept off the business-request metric surface as an
 /// infrastructure route — see the assertion in the tests below.
 const PROBE_PATH: &str = "/health/ready";
+// cap: bound — read/write timeout on a loopback readiness probe; waiting longer only delays the verdict
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// A status line longer than this is not a status line; stop reading rather
 /// than block until the timeout.
+// cap: bound
 const STATUS_LINE_LIMIT: usize = 512;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {

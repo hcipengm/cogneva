@@ -23,12 +23,14 @@ use async_trait::async_trait;
 /// 给文件算 sha256 时一次读多少：默认 64 KiB。
 ///
 /// 整块读让哈希只受磁盘顺序读限制，默认的 64 KiB 是页缓存友好的块大小。
+// cap: bound
 const HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 /// 抓一次 /metrics 的墙：5s。
 ///
 /// 这是评测里的一条读数，抓不到按缺读数处理；等更久只会让一条评测卡在别人的
 /// 观测面上。
+// cap: bound
 const METRICS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 use cog_core::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, HttpClient, LlmClient,
@@ -69,6 +71,7 @@ fn pins_key(benchmark: &str) -> &str {
 const SCAFFOLDS: [&str; 4] = ["codeact", "gepa", "agentflow", "nql"];
 
 /// 每个格子打印几条失败明细。
+// cap: bound
 const FAILURE_SAMPLE: usize = 3;
 
 pub const USAGE: &str = "\

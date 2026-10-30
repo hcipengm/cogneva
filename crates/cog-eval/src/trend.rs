@@ -104,8 +104,11 @@ pub fn analyze_convergence(
 
 /// 画布尺寸与留白。这是呈现面的几何：选的是一条曲线与它前后的读数能一眼看清，
 /// 不是从数据里量出来的量，也没有别的代码依赖这几个数。
+// cap: bound
 const SVG_WIDTH: u32 = 800;
+// cap: bound — presentation geometry: the canvas height at which a curve and its readings are legible at a glance.
 const SVG_HEIGHT: u32 = 400;
+// cap: bound — presentation geometry: the whitespace that keeps axis labels from meeting the curve.
 const MARGIN: u32 = 50;
 
 const PALETTE: [&str; 8] = [

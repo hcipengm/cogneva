@@ -41,6 +41,7 @@ use tokio::task::JoinHandle;
 use cog_core::BroadcastScope;
 
 /// Default capacity of the engine's input channel.
+// cap: bound
 pub const DEFAULT_LIFECYCLE_CHANNEL_BUFFER: usize = 256;
 
 /// The first seven variants are the canonical "key Hooks" called out in the

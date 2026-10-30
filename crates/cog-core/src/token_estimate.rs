@@ -32,6 +32,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// 公开是因为别的 crate 里也有按这一档算字符预算的地方：估算口径一处写死、
 /// 别处各写一份 4，剪裁与估算就会按两个比例走，同一段文本两处算出来的窗口占用
 /// 对不上。
+// cap: bound
 pub const CHARS_PER_TOKEN: usize = 4;
 
 /// 一个英文词的代价，也是任何一个词的下限。
@@ -40,6 +41,7 @@ pub const CHARS_PER_TOKEN: usize = 4;
 /// 两个调用方的既有预算都是按它定过的，下限一动，同一段英文的窗口账就整体变了。
 /// 它与 `CHARS_PER_TOKEN` 同源——一个词大约四个字符一个 token——所以一个词超过
 /// 这一档的长度之后，涨价由字符数自己给出，不需要另立一个阈值。
+// cap: bound
 const ENGLISH_WORD_TOKENS: usize = 4;
 
 /// 一个词在估计口径里的代价。

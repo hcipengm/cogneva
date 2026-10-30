@@ -241,6 +241,7 @@ impl ContextWindow {
 /// 留一半给任务输入、system 与后续轮次，超出的部分不是"内容多"而是
 /// 这条结果根本挤不进这段对话。与窗口同源而不是另立一个绝对值：
 /// 窗口配大了，允许的单条结果跟着变大，两者不会各自漂移。
+// cap: bound
 const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 
 /// 裁剪要把窗口压到预算的几分之一为止，即滞回的低水位。
@@ -249,6 +250,7 @@ const TOOL_RESULT_WINDOW_SHARE_DIVISOR: usize = 2;
 /// 挪一格，缓存从第一个被删的位置起全部作废，命中率永远只剩地板。压到一半
 /// 之后，同样的裁剪要隔半个窗口才再发生一次，中间每一轮都是纯追加。
 /// 见 [`ContextWindow::trim_target`]。
+// cap: bound
 const TRIM_LOW_WATER_DIVISOR: usize = 2;
 
 /// 一条工具结果最多带多少字符，无论窗口有多大。
@@ -259,6 +261,7 @@ const TRIM_LOW_WATER_DIVISOR: usize = 2;
 /// 占每轮新增字节的 76%，把界放在窗口的一半时，一条构建日志就能占掉一轮的
 /// 全部新增。与 `read_file` 一页的字符界同源：一页读回来的和一条命令打出来的
 /// 进的是同一个位置。
+// cap: bound
 const TOOL_RESULT_CHAR_CAP: usize = 32 * 1024;
 
 /// The number of characters one tool result may occupy before it is cut.

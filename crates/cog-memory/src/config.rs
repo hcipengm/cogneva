@@ -108,6 +108,7 @@ impl Default for MaintenanceConfig {
 /// 取今天窗口配置的值：raw 层改存完整历史之前，抽取器拿到的最长载荷就是被
 /// 裁到一个窗口的那份，默认值让这条请求的量级不变。它是这条链路上第一个显式
 /// 的界——窗口配置改了要一起看，两者比的是同一段文本。
+// cap: bound
 pub const DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS: usize = 64_000;
 
 /// 自动摄取管线的运行参数。代码侧 [`Default`] 只是兜底，集群上调参改

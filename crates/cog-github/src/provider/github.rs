@@ -20,10 +20,13 @@ use crate::provider::{
 };
 
 /// Max failed jobs whose logs are fetched per run.
+// cap: bound
 const MAX_FAILED_JOBS: usize = 5;
 /// Max bytes of log kept per job (tail).
+// cap: bound
 const MAX_JOB_LOG_BYTES: usize = 16 * 1024;
 /// Max total bytes of logs returned per run.
+// cap: bound
 const MAX_TOTAL_LOG_BYTES: usize = 80 * 1024;
 
 /// What one commit's check runs say: whether the platform reported any at all,

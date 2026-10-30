@@ -43,9 +43,11 @@ use uuid::Uuid;
 /// content. Submissions are interactive, so the bound is enforced by refusing
 /// the submission rather than by truncating it: a truncated rationale is a
 /// submitter's words with the reason removed, presented as if it were theirs.
+// cap: bound
 pub const TASTE_TEXT_MAX_CHARS: usize = 2_000;
 
 /// Longest a subject may be, in characters.
+// cap: bound
 pub const TASTE_SUBJECT_MAX_CHARS: usize = 512;
 
 /// Most materials one submission may name.
@@ -54,12 +56,14 @@ pub const TASTE_SUBJECT_MAX_CHARS: usize = 512;
 /// long enough to be a corpus is a listing, and a listing belongs on the
 /// material side where it can be paged and read, not copied into every
 /// submission that mentions it.
+// cap: bound
 pub const TASTE_EVIDENCE_MAX_REFS: usize = 32;
 
 /// Longest one evidence reference may be, in characters.
 ///
 /// Long enough for a URI with a query string, short enough that a submission
 /// cannot carry a document in the field that exists to point at one.
+// cap: bound
 pub const TASTE_REFERENCE_MAX_CHARS: usize = 2_048;
 
 /// Whether `reference` cannot stand as a material reference, or `None` when it

@@ -37,11 +37,13 @@ struct AppState {
 }
 
 /// Hard ceiling on command duration regardless of what the client asks for.
+// cap: bound
 const MAX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// Wall for a command whose caller named none. Long enough for an interactive
 /// command to finish, short enough that a caller which stopped listening does not
 /// hold the executor; a caller that needs longer asks for it, up to the ceiling
 /// above.
+// cap: bound
 const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Port the executor listens on when `SANDBOX_EXECUTOR_PORT` names none.
@@ -50,6 +52,7 @@ const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// rather than remade per deployment: a missing or unusable variable binds
 /// the port the Service already routes to, while the environment stays
 /// authoritative when it names a usable port.
+// cap: bound
 const DEFAULT_EXECUTOR_PORT: u16 = 9090;
 
 /// Resolve the listen port from `SANDBOX_EXECUTOR_PORT`.

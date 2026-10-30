@@ -332,6 +332,7 @@ pub struct AttachmentData {
 
 /// Cap on a single attachment's bytes (mirrors the gateway `/attach` limit;
 /// applied in direct mode too so a huge file cannot blow up memory).
+// cap: derived
 pub const MAX_ATTACHMENT_BYTES: usize = 20 * 1024 * 1024;
 
 /// Derive the security-gateway root (where `/attach` lives) from a platform

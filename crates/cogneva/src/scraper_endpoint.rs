@@ -11,6 +11,7 @@
 ///
 /// One number for all three modes: each runs in its own pod, so nothing
 /// collides, and a deployment that moves the port moves it in one place.
+// cap: bound
 pub const DEFAULT_PORT: u16 = 9100;
 
 /// Port from `env`, falling back to [`DEFAULT_PORT`]. A value that is present

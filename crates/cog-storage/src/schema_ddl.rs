@@ -141,6 +141,7 @@ const FINAL_WAIT: &str = "5s";
 /// The attempts have to span more than one cycle of a periodic reader: the
 /// observed collision was a reader on a ten second poll, and a set of attempts
 /// that all landed inside the same poll would all hit the same lock.
+// cap: bound
 const ATTEMPTS: u32 = 16;
 
 /// How long the first replay waits before trying the schema again.
@@ -149,6 +150,7 @@ const ATTEMPTS: u32 = 16;
 /// taken for milliseconds, so the first pause is already long enough to matter
 /// to it; starting shorter would spend attempts inside the same reader's
 /// window.
+// cap: bound
 const FIRST_PAUSE_MS: u64 = 200;
 
 /// How much longer each replay waits than the one before it.
@@ -156,6 +158,7 @@ const FIRST_PAUSE_MS: u64 = 200;
 /// The attempts have to spread across a reader's cycle rather than march in
 /// step: with a fixed pause, sixteen attempts fit inside one ten second poll
 /// and every one of them lands on the same lock.
+// cap: bound
 const PAUSE_GROWTH_MS: u64 = 50;
 
 /// The pause before attempt `n`, which grows so the attempts spread out
@@ -172,6 +175,7 @@ fn pause_before(attempt: u32) -> Duration {
 /// milliseconds puts two hundred and fifty readings inside `FINAL_WAIT` and
 /// about a dozen inside a plain `LOCK_WAIT`; finer would spend more of the
 /// wait reading the catalog than waiting.
+// cap: bound
 const LOCK_SAMPLE_MS: u64 = 20;
 
 /// SQLSTATE `lock_not_available`, which is what a `lock_timeout` expiry raises.

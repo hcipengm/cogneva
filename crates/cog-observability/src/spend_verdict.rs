@@ -76,9 +76,11 @@ pub const VERDICT_TABLE: &str = "cog_llm_spend_verdict";
 /// Window length. The same closed hour the usage rollup folds, so a verdict
 /// cell and the spend it judges are keyed identically and can be read together
 /// without a mapping.
+// cap: bound
 pub const WINDOW_SECS: i64 = 3600;
 
 /// How often the loop looks for windows that have closed.
+// cap: bound
 pub const PERIOD: Duration = Duration::from_secs(600);
 
 /// How far back a first run reaches: nowhere.
@@ -93,6 +95,7 @@ pub const PERIOD: Duration = Duration::from_secs(600);
 /// judges the newest closed window and follows the watermark from there; a run
 /// that *has* a watermark still fills every window after it, so a gap while
 /// this loop was down is caught up rather than skipped.
+// cap: bound
 pub const LOOKBACK_SECS: i64 = 0;
 
 /// This store's schema, and the one a restore replays.

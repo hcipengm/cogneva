@@ -1894,6 +1894,7 @@ async fn redrive(
 /// 25 characters, plus the 50 a goal's first line may occupy. A shorter cap
 /// would clip titles that followed the convention, which reads as the
 /// convention not being honoured.
+// cap: bound
 const SUBJECT_LIMIT: usize = 76;
 
 /// Commit message for a landed change: what it does, why, and the trailer the

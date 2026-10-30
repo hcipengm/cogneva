@@ -30,11 +30,14 @@ pub const DISCOVERY_ROLE: &str = "issue_discovery";
 
 /// DAG-side timeout for a single assess task (must exceed the wait budget
 /// below so the poller gives up around the same time the task would be killed).
+// cap: bound
 const ASSESS_TASK_TIMEOUT_SECS: u64 = 120;
 /// How long the discovery loop blocks waiting for an assess verdict before it
 /// gives up and falls back to the local heuristic this round.
+// cap: bound
 const ASSESS_WAIT_TIMEOUT_SECS: u64 = 100;
 /// Poll interval while waiting for the assess task to complete.
+// cap: bound
 const ASSESS_POLL_INTERVAL_MS: u64 = 500;
 /// Judgement-logic epoch mixed into the assess task id hash. Bump it when the
 /// judge prompt/logic changes, or after a bulk queue reset, to force one
@@ -42,15 +45,18 @@ const ASSESS_POLL_INTERVAL_MS: u64 = 500;
 /// existing task (and its verdict) instead of paying for a duplicate.
 const ASSESS_JUDGE_EPOCH: &str = "v3";
 /// Maximum cross-validation tasks running concurrently for this instance.
+// cap: bound
 const MAX_CROSS_VALIDATION_INFLIGHT: usize = 3;
 /// DAG-side timeout for one cross-validation task (apply + workspace tests +
 /// optional eval A/B in the sandbox).
+// cap: bound
 const CROSS_VALIDATE_TASK_TIMEOUT_SECS: u64 = 3600;
 /// Upper bound of the per-intent exponential backoff after terminal
 /// (deterministic) upstream failures. Quota/billing windows reset on a
 /// day scale; probing more often than this cap only adds failed attempts
 /// without speeding recovery. Six hours bounds the post-reset recovery
 /// lag while keeping probe cost at one failed call per intent per window.
+// cap: bound
 const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 /// How long a finished attempt keeps its intent answered, counted from the
 /// round that saw it finish rather than from the row that carried it.
@@ -71,6 +77,7 @@ const TERMINAL_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 /// broken issue is re-examined at most once per working day or so, and long
 /// enough to sit out a quota window that kept the attempt from being a real
 /// test of the fix.
+// cap: bound
 const ANSWERED_GRACE_SECS: u64 = 48 * 60 * 60;
 
 /// Whether a failed processing attempt is deterministic: retrying the same
@@ -496,6 +503,7 @@ fn intent_verdict_prefix(task_id: &str) -> Option<String> {
 /// listing that returns exactly this many entries may be truncated, so
 /// reaping requires a count below the cap on both surfaces to treat the open
 /// set as provably complete.
+// cap: bound
 const PROVIDER_LIST_PAGE_SIZE: usize = 100;
 
 fn listings_complete(issue_count: usize, pr_count: usize) -> bool {

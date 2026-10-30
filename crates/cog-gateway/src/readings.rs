@@ -285,6 +285,7 @@ fn query_client() -> Result<std::sync::Arc<dyn cog_core::HttpClient>, String> {
 
 /// The deadline for one query. A reading that cannot answer in five seconds is
 /// already the answer; a failed query is reported as "no reading", never as 0.
+// cap: bound
 const QUERY_TIMEOUT_SECS: u64 = 5;
 
 /// Ask Prometheus for one query.

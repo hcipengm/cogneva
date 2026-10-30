@@ -5,9 +5,11 @@ use std::time::{Duration, Instant};
 
 /// Default high watermark: when the buffer reaches this level, the producer pauses.
 /// Zero in core — real defaults live in the assembly-layer config loader.
+// cap: bound
 pub const DEFAULT_HIGH_WATERMARK: usize = 0;
 /// Default low watermark: when the buffer drops below this level, the producer resumes.
 /// Zero in core — real defaults live in the assembly-layer config loader.
+// cap: bound
 pub const DEFAULT_LOW_WATERMARK: usize = 0;
 
 /// Configuration for backpressure watermarks.

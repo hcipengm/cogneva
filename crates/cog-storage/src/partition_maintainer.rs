@@ -62,9 +62,11 @@ pub fn time_series_tables() -> Vec<PartitionedTable> {
 }
 
 /// How far ahead of the current month partitions are kept open.
+// cap: bound
 const MONTHS_AHEAD: i32 = 2;
 
 /// How far back maintenance reaches, so a recently dropped partition heals.
+// cap: bound
 const MONTHS_BEHIND: i32 = 1;
 
 /// Loop name reported through the background-loop liveness family.

@@ -1373,6 +1373,7 @@ impl CollaborationExecutor {
     /// construction: the rule is declared, enabled, evaluated — and can never
     /// fire, which is indistinguishable from a plan that never exceeded it.
     /// Twice the largest threshold the shipped configurations declare.
+    // cap: derived
     const TOKEN_ESTIMATE_CAP: u64 = 200_000;
 
     /// Rough token estimate: ~4 chars per token plus 2 000 token overhead for

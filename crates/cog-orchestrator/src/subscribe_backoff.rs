@@ -7,4 +7,5 @@ use std::time::Duration;
 /// 两个消费者（就绪队列与 DAG 事件流）曾各自写着 5s：后端要么回来要么不回来，
 /// 更快的重试只会在集群已经不健康时成倍放大告警，而更慢的重试会让恢复多等一个
 /// 周期。同一个决定只写一处。
+// cap: bound
 pub const SUBSCRIBE_RETRY_BACKOFF: Duration = Duration::from_secs(5);

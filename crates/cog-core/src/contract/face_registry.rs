@@ -54,6 +54,7 @@ pub const FACE_INPUT_KEY: &str = "face";
 ///
 /// Ten minutes: long enough to cover a build or a long model call, short enough
 /// that an owner who stopped is visible inside the same working session.
+// cap: bound
 pub const OWNER_IDLE_AFTER_SECS: i64 = 600;
 
 /// Whether a row is one of the standing faces or one of the lines that cut

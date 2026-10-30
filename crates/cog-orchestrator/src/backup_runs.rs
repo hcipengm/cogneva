@@ -55,6 +55,7 @@ pub const BACKUP_RUNS_ROLE: &str = "backup_runs";
 /// while leaving hours of margin. The deployed liveness alert derives its
 /// threshold from this period (`6 * period`), so changing it changes that
 /// threshold.
+// cap: bound
 pub const BACKUP_RUNS_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The readouts one look at the account produces.

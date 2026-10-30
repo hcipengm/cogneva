@@ -88,6 +88,7 @@ pub struct ExpectedStore {
 impl RestoreExpectation {
     /// 交接单的落盘形状的版本。读侧遇到不认识的版本一律不猜：形状变了才动这个数，
     /// 它标的是「这份文件按哪种形状写的」，不是容量。
+    // cap: bound
     pub const VERSION: u32 = 1;
 
     /// 交接单在数据根里的位置。放在 `meta_learning/` 而不是数据根顶层：那一层已经
@@ -368,6 +369,7 @@ pub const STORE_READOUTS_LOOP: &str = "reflection_store_readouts";
 /// 要短于读它的告警规则的写者窗口（规则那边用 1800 秒判「写者还在写」），否则一条
 /// 正常的循环会因为自己的节奏被判成停了；也不能太短，策略库的 ACTIVE 一天动不了
 /// 几次，太快只是让同一份值反复落库。
+// cap: bound
 pub const STORE_READOUTS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// 挂上刷新循环。

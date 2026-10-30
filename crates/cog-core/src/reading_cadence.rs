@@ -31,4 +31,5 @@ use std::time::Duration;
 /// stays irrelevant, short enough that an alert window twice it — the smallest
 /// window one can reasonably hand to a rule — still sees a stamp from a writer
 /// that is alive.
+// cap: bound
 pub const UNCHANGED_READING_HEARTBEAT: Duration = Duration::from_secs(1800);

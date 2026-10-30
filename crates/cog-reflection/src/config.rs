@@ -935,6 +935,7 @@ pub struct ObservabilityStackConfig {
 
 impl ObservabilityStackConfig {
     /// 间隔下限：低于它，一次 apply 还没落地就进下一轮，日志与 API 都被刷屏。
+    // cap: bound
     pub const MIN_INTERVAL_SECS: u64 = 60;
 }
 

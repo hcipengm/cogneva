@@ -10,6 +10,7 @@ use std::sync::Arc;
 ///
 /// 这些调用都是单对象读/写（元数据、小文件），慢在远端而不是本机；30s 之后
 /// 重试还有意义，再等只是把调用方一起挂住。
+// cap: bound
 const BACKEND_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// File-based object backend for local development and single-node deployment.
@@ -579,6 +580,7 @@ impl ObjectBackend for S3ObjectBackend {
             let mut continuation: Option<String> = None;
             // A bucket listing is unbounded; cap the walk so a server that keeps
             // reporting truncation without advancing the cursor cannot spin forever.
+            // cap: bound — a page-count ceiling so a cursor that keeps truncating cannot spin forever
             const MAX_PAGES: usize = 10_000;
 
             for _ in 0..MAX_PAGES {

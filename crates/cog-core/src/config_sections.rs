@@ -450,9 +450,11 @@ pub fn judge_delivery(delivered: Option<&str>, declared: &str) -> DocumentDelive
 /// Bounded on characters rather than on the number of names: a list budget
 /// multiplies by the length of the names, and section or rule names come from
 /// the document rather than from this code.
+// cap: bound
 const MAX_MESSAGE_CHARS: usize = 600;
 
 /// Names per list before the rest are counted instead of spelled out.
+// cap: bound
 const MAX_NAMES_PER_LIST: usize = 6;
 
 /// Say what was delivered, for the alert row and the log.

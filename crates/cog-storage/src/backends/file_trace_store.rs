@@ -16,6 +16,7 @@ use cog_core::{AgentTrace, SFError, SFResult, StorageTier, TraceMeta, TraceStore
 /// loadable; anything else becomes `prefix-<hash>`, keeping distinct long ids
 /// collision-free even when they share the retained prefix.
 fn file_stem(trace_id: &str) -> String {
+    // cap: bound — well under the filesystem's 255-byte name limit, leaving room for .trace and .meta.json
     const MAX_SAFE_LEN: usize = 180;
     let is_safe = !trace_id.is_empty()
         && trace_id.len() <= MAX_SAFE_LEN

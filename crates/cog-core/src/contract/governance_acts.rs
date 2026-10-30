@@ -53,6 +53,7 @@ pub const VOTE_INPUT_KEY: &str = "vote";
 /// signed, short enough that a signature nobody applied is visible inside the
 /// same working session. A signed handover that is never applied is the shape
 /// a change of responsibility takes when the change was only on paper.
+// cap: bound
 pub const SIGNED_UNAPPLIED_LIMIT_SECS: i64 = 900;
 
 /// One signature on a handover.

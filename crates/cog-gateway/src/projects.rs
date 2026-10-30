@@ -309,7 +309,9 @@ pub struct ListProjectsQuery {
     pub cursor: Option<usize>,
 }
 
+// cap: bound — 不传 `limit` 时一页返回多少个项目。与 `PROJECTS_PAGE_MAX` 成对：默认值小到一屏能读完，大请求才要显式说要。
 const PROJECTS_PAGE_DEFAULT: usize = 200;
+// cap: bound — 一页的上限。存在的理由是拒绝比静默截断更便宜：读全量要带游标一页页走，而不是把 `limit` 调成一百万让这一次请求把整张图读进内存。
 const PROJECTS_PAGE_MAX: usize = 1000;
 
 /// 每列最多带回多少张卡片。
@@ -317,6 +319,7 @@ const PROJECTS_PAGE_MAX: usize = 1000;
 /// 看板是给人挪的，不是给人数的：只回计数的话，界面画得出六列数字，画不出任何一张
 /// 能拖的卡，而「这一列有 37 个」在客户眼里等于「我不知道里面是什么」。上限之外
 /// 的张数由 `cards_hidden` 如实报出来——静默截断会让一列看起来正好装得下。
+// cap: bound
 const BOARD_CARDS_PER_COLUMN: usize = 100;
 
 /// 看板上的一张卡片。
@@ -1385,6 +1388,7 @@ pub struct WbsResponse {
 ///
 /// 真实的分解深度个位数；一个四千层的链只可能来自坏数据或有人手工造环，那时
 /// 递归会把网关的栈打穿——而栈溢出不是一个能被 `Result` 接住的错误。
+// cap: bound
 const WBS_DEPTH_CAP: usize = 256;
 
 /// 把一批任务折成一棵范围树。
@@ -1865,6 +1869,7 @@ pub(crate) fn build_project_task(
 
 /// 标题的上限。超了拒绝而不是截断：截断之后存下来的就不是用户写的那个名字，
 /// 而界面上没有任何地方会说它被改过。
+// cap: bound
 pub(crate) const MAX_TITLE_CHARS: usize = 200;
 
 pub async fn create_project_task_handler(

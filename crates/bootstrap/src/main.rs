@@ -29,6 +29,7 @@ use std::time::Duration;
 /// 计时要覆盖「进程起来了但 apiserver 还没应答」这一段，而这一段在 NVMe 上是
 /// 几秒、在慢盘上接近一分钟；改成一次性的长 sleep 会让快机器白等，所以是
 /// 「短间隔 × 多次」而不是一个总墙。
+// cap: bound
 const KUBECONFIG_READY_ATTEMPTS: usize = 30;
 
 /// 引导器据以定位仓库根的变量名。三条子命令各读一次，名字写在这里一次：
@@ -37,26 +38,31 @@ const KUBECONFIG_READY_ATTEMPTS: usize = 30;
 const REPO_ROOT_ENV: &str = "COGNEVA_REPO_ROOT";
 
 /// 上面那组里的间隔：2s 一次，短到快机器不必为这一次探测多等。
+// cap: bound
 const KUBECONFIG_READY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// 等全部节点 Ready 的次数与间隔：60 × 5s = 5 分钟。
 ///
 /// 多节点装机的最后一步是 kubelet 拉镜像，最慢的节点决定整条链路；5 分钟是
 /// 慢盘 + 冷镜像缓存的实测上界，超时后的报错文案与这个墙一致。
+// cap: bound
 const NODES_READY_ATTEMPTS: usize = 60;
 
 /// 上面那组里的间隔：5s 一次，够一个节点把镜像拉完一层。
+// cap: bound
 const NODES_READY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// 集群内 registry 播种基镜像失败后的重试间隔。
 ///
 /// 播种走的是节点上的 containerd，失败通常是对方刚启动还没准备好；10s 够一次
 /// 重启，且三次重试的总等待仍在整条装机链路的预算里。
+// cap: bound
 const REGISTRY_SEED_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 最佳努力的新版本探测单次上限。
 ///
 /// 这一步只提示、绝不阻塞命门链路：3s 之后就当官方没有新版本，静默返回。
+// cap: bound
 const OUTDATED_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 在 /var/tmp 下创建 0700 随机工作目录。/var/tmp 全局可写，固定文件名会被

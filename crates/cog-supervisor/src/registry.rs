@@ -14,6 +14,7 @@ use crate::error::{SupervisorError, SupervisorResult};
 /// [`AgentRegistry::check_expired`]. Aligns with the default TTL used by
 /// Redis and etcd agent registries (30 seconds) so the Supervisor's view
 /// of liveness matches the Agent's self-registered TTL.
+// cap: bound
 pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = 30;
 
 /// The role a unit takes when it writes its presence from outside the platform.
@@ -32,6 +33,7 @@ pub const DEFAULT_HEARTBEAT_TTL_SECONDS: u64 = 30;
 /// word, and a second spelling would leave one side unable to recognise the
 /// units the other one registered.
 pub const EXTERNAL_WORKER_ROLE: &str = cog_core::roles::EXTERNAL_WORKER;
+// cap: bound — heartbeat records kept per agent; a ring depth, not a measured history
 pub const HEARTBEAT_HISTORY_MAX: usize = 1000;
 
 /// The heartbeat vocabulary lives in `cog_core`: the supervisor fills the
@@ -74,6 +76,7 @@ pub struct CrewInfo {
 }
 
 impl CrewInfo {
+    // cap: bound — three crew-level retries before the failure is escalated; a policy cap
     pub const MAX_CREW_RETRIES: u32 = 3;
 
     pub fn new(crew_id: impl Into<String>) -> Self {

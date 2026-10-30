@@ -529,11 +529,13 @@ const REPLY_REFUSED_INSTRUCTION: &str = "The reply you just wrote cannot be deli
 /// bookkeeping the run already has the material for, so it is generous only to
 /// cover a large artifact being rendered — a run that spends this long has
 /// wedged rather than worked.
+// cap: bound
 const RESULT_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Wall for the one extra model call that reshapes a thought into the JSON the
 /// squad protocol reads. It is a single short completion, so it is held to a
 /// fraction of a turn: a slow upstream should cost this fallback, not the run.
+// cap: bound
 const REFORMAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl AgentRuntime {

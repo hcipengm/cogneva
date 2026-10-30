@@ -6,6 +6,7 @@ use tokio::sync::broadcast;
 use cog_core::{AlertSeverity, SupervisorEvent};
 
 /// Maximum number of alerts retained in memory.
+// cap: bound
 pub const ALERT_HISTORY_MAX: usize = 10_000;
 
 /// A single alert entry derived from a SupervisorEvent.

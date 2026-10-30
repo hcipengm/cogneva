@@ -57,6 +57,7 @@ pub const RESOURCE_LEDGER_ROLE: &str = "resource_ledger";
 /// refusal is one line of work, not a stream. Shorter would put a query against
 /// the shared database on every few control ticks for an account that is read
 /// by people; longer starts to look like the ring's bound.
+// cap: bound
 pub const RESOURCE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(10);
 
 /// How many queued events one pass folds.
@@ -65,6 +66,7 @@ pub const RESOURCE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(10);
 /// but generous, because the common case is two or three events and anything
 /// that reached this bound is a producer that looped rather than a corpus being
 /// read.
+// cap: bound
 const FOLD_PER_PASS: usize = 500;
 
 /// How many events this loop holds on to when the account cannot be written.
@@ -78,12 +80,14 @@ const FOLD_PER_PASS: usize = 500;
 /// the log rather than counted as a ring drop, because the two losses are
 /// different facts: one is a producer outrunning its consumer, the other is a
 /// consumer that cannot reach its store at all.
+// cap: bound
 const CARRY_CAPACITY: usize = 1024;
 
 /// How many recent events one pass looks at when it says what it saw.
 ///
 /// Only for the log line, so a bound that keeps a few is enough; the table is
 /// what a reader who wants the whole thing reads.
+// cap: bound
 const RECENT_PEEK: usize = 5;
 
 /// One pass: carry this process's events out, then read and fold the account.

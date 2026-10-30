@@ -55,17 +55,22 @@ pub(crate) const GIT_SSH_KEY_ENV: &str = "COGNEVA_GATEWAY_GIT_SSH_KEY";
 pub(crate) const GIT_SSH_BASE_ENV: &str = "COGNEVA_GATEWAY_GIT_SSH_BASE";
 /// 镜像保鲜期：最后一次成功 fetch 在这个秒数内，才允许把它当基线发出去。
 /// 取得短是因为它同时是"兜底期基线能有多旧"的上界。
+// cap: bound
 pub(crate) const MIRROR_FRESHNESS_SECS: u64 = 30;
 /// 熔断探测节拍：连续失败按指数退避，封顶见 [`suspect_backoff_secs`]。
+// cap: bound
 const HTTPS_PROBE_INTERVAL_SECS: u64 = 60;
 /// HTTPS 快路径的等待上限。GET 是 `info/refs`（应答小、上游立刻回）；POST 是
 /// pack 计算 + 传输，给足时间。**这两个值判的是"是不是进了黑洞"，不是给正常
 /// 请求设预算**——透传路径原本没有任何总超时，加它就是为了让降级判据存在。
+// cap: bound
 const HTTPS_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 /// post 的判据与 get 同形，只是量级不同：一次 post 要把整包算完再传出去，
 /// 所以在正常仓库上它本来就以分钟计；这个界判的仍是「是不是进了黑洞」。
+// cap: bound
 const HTTPS_POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 /// 镜像单次响应体上限，与透传路径的 256MB 缓冲约定一致。
+// cap: bound
 const MAX_MIRROR_BODY: usize = 256 * 1024 * 1024;
 /// git 可执行文件。镜像路径只经由它跑 clone/fetch/push/show-ref。
 const DEFAULT_GIT_BIN: &str = "git";
@@ -87,23 +92,31 @@ pub(crate) fn git_bin_from_env() -> PathBuf {
 /// 没声**，而 `git clone`/`fetch` 带 `--progress` 的进度输出是秒级的——静默 N 秒
 /// 就等于"没有进展"。用总时长判会把"链路慢"和"链路死"压成同一个结论，而这两种
 /// 情况该做的事相反：慢要等，死要立刻换通道。总时长上限另外设一层（见下）。
+// cap: bound
 const DEFAULT_MIRROR_STALL_SECS: u64 = 180;
 /// 静默判死的下限。允许部署面调小，但不允许小到把正常传输误杀。
+// cap: bound
 const MIRROR_STALL_FLOOR_SECS: u64 = 30;
 /// 单次 clone/fetch/push 的总时长上限（秒）。沉默判死之外再压一层，防的是另一种
 /// 形态：远端**一直在吐进度却永远不结束**——那样静默判据永远不触发，只看总时长。
+// cap: bound
 const DEFAULT_MIRROR_OP_TIMEOUT_SECS: u64 = 1800;
+// cap: bound — lowest the deployment may set the operation timeout to; below it a large legitimate fetch is cut
 const MIRROR_OP_TIMEOUT_FLOOR_SECS: u64 = 60;
 /// 看门狗巡检间隔的上限；实际间隔按静默窗的四分之一取（见
 /// [`GitTransport::watchdog_interval`]），这样测试里把窗口压到秒级仍然判得准。
+// cap: bound
 const MIRROR_WATCHDOG_MAX_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// 巡检间隔的下限：静默窗压到毫秒级（测试）时，别让巡检变成忙等。
+// cap: bound
 const MIRROR_WATCHDOG_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 /// 失败信息里保留的 stderr 尾巴长度：传输失败的**原因在最后几行**，而前几千行
 /// 是进度刷屏。留尾部才留得住原因，同时也别让一条日志带上几 MB。
+// cap: bound
 const STDERR_TAIL_CHARS: usize = 600;
 /// 临时物/锁的清理门槛下限：比这新的东西可能是**活着的**传输手里的
 /// （进度秒级更新、锁活不过一次请求），只有明显陈旧才是死进程的遗物。
+// cap: bound
 const RESIDUE_MIN_AGE_SECS: u64 = 60;
 
 /// 兜底路径的部署配置。全部来自环境变量，未配置私钥即视为**未启用**。
@@ -824,6 +837,7 @@ impl GitExec {
 
 /// 超时后等被杀的进程/读取任务收尾的上限。杀的是整个进程组，正常情况下管道
 /// 立刻断开；给个上限只为不让"已判定超时"的路径自己再挂住。
+// cap: bound
 const WATCHDOG_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 对进程组发 SIGKILL。`pid` 是组长（调用点用 `process_group(0)` 让子进程自己

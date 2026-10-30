@@ -60,6 +60,7 @@ pub const OPTIONAL: Timeouts = Timeouts {
 };
 
 /// 可达性探测的时限（与 shell 侧 `probe_reachable` 的 5s 对齐）。
+// cap: bound
 pub const PROBE: Duration = Duration::from_secs(5);
 
 /// 下载到文件。任何失败返回 Err，调用方决定是回退还是降级。

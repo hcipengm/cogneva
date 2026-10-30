@@ -8,12 +8,19 @@
 //! anywhere asked where it came from -- which is how a hand-measured figure
 //! outlives the measurement and starts reading as a fact about the deployment.
 //!
-//! The registry is a snapshot rather than a filter: the entries are the
-//! constants that exist today, `source` says which kind each one is, and the
-//! test fails in both directions -- a constant with no entry (a new hardcode),
-//! and an entry with no constant (a stale row pretending something is still
-//! governed). `COGNEVA_CAPACITY_REGISTRY_WRITE=1` rewrites the file from the
-//! tree, so maintaining it is one command and never hand-editing.
+//! The answer lives on the constant, as a `// cap: derived` or `// cap: bound`
+//! line in the comment block right above it: one word for which kind of answer
+//! this is, and -- when the block carries no prose of its own -- a reason after
+//! a dash. It used to live in a table beside the code with a row per constant,
+//! and that table was the same number restated twice: its `value` column was
+//! whatever the declaration said, its `note` was the doc comment above it, and
+//! only the one word was new. A restatement drifts, and it drifts in the
+//! direction nobody catches -- regenerate it after a sloppy edit and the drift
+//! is written down as the truth.
+//!
+//! Keeping it on the constant also deletes a whole failure mode: a row for a
+//! constant that no longer exists is impossible, because the row *is* the
+//! constant. What is left for this test is the census and the word.
 //!
 //! **It enumerates every written number, not only the ones whose name reads
 //! like a quantity.** The first version filtered by name -- bytes, sizes, caps,
@@ -25,14 +32,14 @@
 //! deployment's behaviour depends on does not become harmless because its name
 //! does not contain `LIMIT`. So the population is now every `const` of a numeric
 //! type or `Duration` whose initializer starts with a digit, and the judgement
-//! that a given one is not a dial belongs in the `source` column, where it is
-//! read by a person, rather than in a name filter, where it is made by a string
+//! that a given one is not a dial belongs in the `cap:` word, where it is read
+//! by a person, rather than in a name filter, where it is made by a string
 //! match.
 //!
-//! The rows that have not been judged carry `source = unreviewed`, which is debt
-//! and not an answer. Their number is capped by [`DEBT_CEILING`] and the cap
-//! only comes down: a constant added tomorrow cannot be parked there, because
-//! there is no room, so it has to arrive with a source and a note.
+//! There is no third answer and no place to park one: a constant that arrives
+//! without a `cap:` line is red, and the two words are the whole closed set. A
+//! debt column would have been the easy shape and the wrong one -- "not judged
+//! yet" is exactly what a registry of every number was supposed to end.
 //!
 //! The other half of the same question is on this file too: a number written at
 //! the point of *use* rather than in a declaration. The census above cannot see
@@ -54,28 +61,25 @@ use common::routes::repo_root;
 
 use common::rust_production::{production_sources, sources_of_tree};
 
-/// Where the registry lives, relative to the workspace root.
-const REGISTRY: &str = "crates/cogneva/tests/data/rust-capacity-constants.tsv";
+/// The word that answers for a constant, in the comment block above it.
+const CAP_MARKER: &str = "// cap:";
 
-/// How many rows may still be `unreviewed`.
-///
-/// The ceiling is the gate's teeth: with a finitely large debt, adding a
-/// constant without deciding what it is would go unnoticed, because the file
-/// would simply grow. Pinning the count means the next one arrives with an
-/// answer, and paying a debt is the only thing that makes room. It sits at zero
-/// because the debt is paid: every constant in the tree now names either the
-/// reading it follows or the reason its bound should not move, so the next one
-/// written has to decide before it lands.
-const DEBT_CEILING: u64 = 0;
+/// The whole closed set of answers.
+const CAP_SOURCES: [&str; 2] = ["derived", "bound"];
 
-/// One line of the registry.
+/// One written number: where it is, what it says, and what the block above it
+/// answered.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct Row {
     file: String,
     name: String,
     value: String,
+    /// `derived` or `bound`; empty when the constant carries no marker.
     source: String,
+    /// The reason after the dash, when the marker carries one.
     note: String,
+    /// Whether the block above carries prose of its own.
+    doc: bool,
 }
 
 /// Every `const NAME: <numeric type> = <initializer starting with a digit>;`
@@ -127,7 +131,12 @@ fn production_rows(text: &str, rel: &str) -> Vec<Row> {
     let mut fixtures: Option<i32> = None;
     let mut expecting_test_module = false;
     let mut raw: Option<usize> = None;
+    let mut above = Above::default();
     for line in text.lines() {
+        // 这一行的判词是**上一行之前**攒下来的那一块：常量自己这一行会把块清空，
+        // 所以先留一份快照，再让 observe 处理本行。
+        let block_above = above.clone();
+        above.observe(line);
         let trimmed = line.trim();
         let code = code_only(line, &mut raw);
         // `#[cfg(test)]` guards whatever comes next -- a module, or a single
@@ -165,12 +174,57 @@ fn production_rows(text: &str, rel: &str) -> Vec<Row> {
         if in_fixtures || opens_tests {
             continue;
         }
-        let Some(row) = parse_const(line, rel) else {
+        let Some(mut row) = parse_const(line, rel) else {
             continue;
         };
+        row.doc = block_above.doc;
+        if let Some((source, reason)) = block_above.marker.clone() {
+            row.source = source;
+            row.note = reason;
+        }
         rows.push(row);
     }
     rows
+}
+
+/// The comment block sitting immediately above a declaration.
+///
+/// Carried across blank lines and attributes because that is how the block is
+/// written: `/// why it is this`, then maybe an `#[allow]`, then the constant.
+/// Anything else ends it -- a marker two functions up governs the function, not
+/// the number below it.
+#[derive(Debug, Default, Clone)]
+struct Above {
+    /// `(source, reason)`, when a `// cap:` line was seen in this block.
+    marker: Option<(String, String)>,
+    /// Whether the block carries prose of its own, which is what makes a bare
+    /// `// cap: bound` an answer rather than a label with nothing behind it.
+    doc: bool,
+}
+
+impl Above {
+    fn observe(&mut self, line: &str) {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix(CAP_MARKER) {
+            if rest.is_empty() || rest.starts_with(' ') || rest.starts_with('\u{2014}') {
+                let rest = rest.trim();
+                let (word, reason) = match rest.split_once('\u{2014}') {
+                    Some((w, r)) => (w.trim(), r.trim()),
+                    None => (rest, ""),
+                };
+                self.marker = Some((word.to_string(), reason.to_string()));
+                return;
+            }
+        }
+        if t.starts_with("///") {
+            self.doc = true;
+            return;
+        }
+        if t.starts_with("//") || t.starts_with("#[") || t.is_empty() {
+            return;
+        }
+        *self = Above::default();
+    }
 }
 
 /// Whether this line opens an inline module whose contents are fixtures.
@@ -295,150 +349,74 @@ fn parse_const(line: &str, file: &str) -> Option<Row> {
         file: file.to_string(),
         name: name.to_string(),
         value: value.to_string(),
-        source: "unreviewed".to_string(),
+        source: String::new(),
         note: String::new(),
+        doc: false,
     })
 }
 
-fn read_registry(root: &Path) -> Vec<Row> {
-    let path = root.join(REGISTRY);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-    text.lines()
-        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-        // The column line describes the file rather than being a row in it.
-        .filter(|l| !l.starts_with("file\t"))
-        .filter_map(|l| {
-            let mut f = l.split('\t');
-            Some(Row {
-                file: f.next()?.to_string(),
-                name: f.next()?.to_string(),
-                value: f.next()?.to_string(),
-                source: f.next()?.to_string(),
-                note: f.next().unwrap_or("").to_string(),
-            })
-        })
-        .collect()
-}
-
-fn write_registry(root: &Path, scanned: &[Row], existing: &[Row]) {
-    let carried: BTreeMap<(&str, &str), &Row> = existing
-        .iter()
-        .map(|r| ((r.file.as_str(), r.name.as_str()), r))
-        .collect();
-    let mut out = String::from(
-        "# Every number written into a Rust constant: one row per `const`, so a number that\n\
-         # arrives without a decision about it is red rather than invisible. `source` is\n\
-         # either the reading the value is derived from (`derived`) or the reason it is a\n\
-         # bound (`bound`); `unreviewed` is debt, not an answer, and its row count is capped\n\
-         # in the test that reads this file. Regenerate with\n\
-         # COGNEVA_CAPACITY_REGISTRY_WRITE=1 cargo test -p cogneva --test\n\
-         # rust_capacity_constants_registry_test\n\
-         file\tname\tvalue\tsource\tnote\n",
-    );
-    for row in scanned {
-        let mut row = row.clone();
-        if let Some(prev) = carried.get(&(row.file.as_str(), row.name.as_str())) {
-            if prev.source != "unreviewed" {
-                row.source = prev.source.clone();
-                row.note = prev.note.clone();
-            }
-        }
-        out.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\n",
-            row.file, row.name, row.value, row.source, row.note
-        ));
-    }
-    let path = root.join(REGISTRY);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::write(&path, out).expect("write the registry");
-}
-
-// The cap below is a ratchet and a paid-up one reads zero, which folds the
-// comparison to `len() == 0` and makes clippy call the `<` half absurd. It is
-// written against the constant anyway: raising the cap is the whole point of the
-// gate, and an `==` would silently turn "at most" into "exactly".
-#[allow(clippy::absurd_extreme_comparisons)]
+/// Every written number carries a word above it saying which kind of answer it
+/// is, and the word is one of two.
+///
+/// There is no debt column and no place to park a new number: a constant that
+/// arrives without a `cap:` line is red on the run that adds it. That is the
+/// whole point -- a register with an "unreviewed" slot absorbs exactly the
+/// numbers nobody decided about, and then reads green.
+///
+/// A bare `// cap: bound` is only an answer when the block above it says why, so
+/// a marker with no reason behind it must carry the reason itself. That is what
+/// keeps this from degrading into a label every new constant gets and nobody
+/// reads.
 #[test]
 fn every_capacity_number_in_rust_says_where_it_comes_from() {
     let root = repo_root();
     let scanned = scan(&root, &production_sources(&root));
-    let existing = read_registry(&root);
-    if std::env::var("COGNEVA_CAPACITY_REGISTRY_WRITE").as_deref() == Ok("1") {
-        write_registry(&root, &scanned, &existing);
-        return;
-    }
     assert!(
-        !existing.is_empty(),
-        "no registry at {REGISTRY}: run COGNEVA_CAPACITY_REGISTRY_WRITE=1 cargo test -p \
-         cogneva --test rust_capacity_constants_registry_test"
-    );
-    let registered: BTreeMap<(&str, &str), &Row> = existing
-        .iter()
-        .map(|r| ((r.file.as_str(), r.name.as_str()), r))
-        .collect();
-    let mut missing = Vec::new();
-    for row in &scanned {
-        match registered.get(&(row.file.as_str(), row.name.as_str())) {
-            None => missing.push(format!(
-                "{file}:{name} = {value}",
-                file = row.file,
-                name = row.name,
-                value = row.value
-            )),
-            Some(old) if old.value != row.value => missing.push(format!(
-                "{file}:{name} changed {old} -> {new}: say where the new number comes from",
-                file = row.file,
-                name = row.name,
-                old = old.value,
-                new = row.value
-            )),
-            Some(_) => {}
-        }
-    }
-    let present: BTreeMap<(&str, &str), ()> = scanned
-        .iter()
-        .map(|r| ((r.file.as_str(), r.name.as_str()), ()))
-        .collect();
-    let stale: Vec<String> = existing
-        .iter()
-        .filter(|r| !present.contains_key(&(r.file.as_str(), r.name.as_str())))
-        .map(|r| format!("{}:{} (gone)", r.file, r.name))
-        .collect();
-    assert!(
-        missing.is_empty() && stale.is_empty(),
-        "the capacity registry ({REGISTRY}) is out of step with the tree.\n\
-         New or changed numbers (add a row for each, saying which reading it follows or why it \
-         is a bound):\n{}\nStale rows (the constant is gone; regenerate):\n{}\n\
-         Regenerate, then edit the rows this printed: COGNEVA_CAPACITY_REGISTRY_WRITE=1 \
-         cargo test -p cogneva --test rust_capacity_constants_registry_test",
-        missing.join("\n"),
-        stale.join("\n")
+        scanned.len() > 100,
+        "the scan found {} constants, far below what crates/*/src holds: the walk is \
+         broken, not the tree",
+        scanned.len()
     );
 
-    // The ceiling is what makes a row an answer rather than a place to park a
-    // number: regeneration writes new rows as `unreviewed`, so without a cap the
-    // file would absorb any new constant and every later reader would see a
-    // green gate. With the cap the regeneration step succeeds and the next run
-    // says how many decisions are owed.
-    let unreviewed: Vec<&Row> = existing
-        .iter()
-        .filter(|r| r.source == "unreviewed")
-        .collect();
+    let mut unmarked = Vec::new();
+    let mut unknown = Vec::new();
+    let mut unreasoned = Vec::new();
+    for row in &scanned {
+        if row.source.is_empty() {
+            unmarked.push(format!("{}:{} = {}", row.file, row.name, row.value));
+            continue;
+        }
+        if !CAP_SOURCES.contains(&row.source.as_str()) {
+            unknown.push(format!(
+                "{}:{} says `cap: {}`",
+                row.file, row.name, row.source
+            ));
+            continue;
+        }
+        // A reason in the marker stands on its own; without one, the doc block
+        // above has to carry it -- which `Above` records as `doc`.
+        if row.note.is_empty() && !row.doc {
+            unreasoned.push(format!("{}:{} = {}", row.file, row.name, row.value));
+        }
+    }
     assert!(
-        (unreviewed.len() as u64) <= DEBT_CEILING,
-        "{} constants are registered as `unreviewed` and the ceiling is {DEBT_CEILING}. \
-         The debt only comes down: give the new ones a `derived` source naming the reading \
-         they follow, or a `bound` source saying why no measurement should move them.\n{}",
-        unreviewed.len(),
-        unreviewed
-            .iter()
-            .map(|r| format!("{}:{} = {}", r.file, r.name, r.value))
-            .collect::<Vec<_>>()
-            .join("\n")
+        unmarked.is_empty(),
+        "these written numbers say nothing about where they come from. Put a line in \
+         the block above each one -- `// cap: derived` when it follows a reading, \
+         `// cap: bound` when no measurement should move it -- and, if the block has no \
+         prose of its own, the reason after a dash:\n{}",
+        unmarked.join("\n")
+    );
+    assert!(
+        unknown.is_empty(),
+        "these say something the vocabulary does not have; the set is {CAP_SOURCES:?}:\n{}",
+        unknown.join("\n")
+    );
+    assert!(
+        unreasoned.is_empty(),
+        "these carry a `cap:` word with no reason anywhere above it -- a bare label is \
+         the answer a reader cannot check:\n{}",
+        unreasoned.join("\n")
     );
 }
 

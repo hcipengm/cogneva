@@ -67,6 +67,7 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// well outside the read window on a normal day and inside it during a storm —
 /// which is what the window verdict is for. It is a default for the deployment
 /// that does not say otherwise, not a policy: the deployment states its own.
+// cap: bound
 pub const DEFAULT_MAX_ROWS: u64 = 1_000_000;
 
 /// How far back readers are promised rows, in seconds.
@@ -74,6 +75,7 @@ pub const DEFAULT_MAX_ROWS: u64 = 1_000_000;
 /// Not a retention knob — it is the floor the capacity may not cross. It
 /// matches the default window of the historical-events query, so a reader that
 /// asks for what it asks for by default never sees a gap the sweep made.
+// cap: bound
 pub const DEFAULT_READ_WINDOW_SECS: u64 = 86_400;
 
 /// The environment variables that carry the two numbers.
@@ -91,10 +93,12 @@ pub const READ_WINDOW_ENV: &str = "COGNEVA_OBSERVABILITY_EVENT_READ_WINDOW_SECS"
 /// drops a series it has not seen for five minutes rather than holding the
 /// last value. A period at or beyond that would make the size reading vanish
 /// exactly when the table has gone quiet.
+// cap: bound
 const MAX_SWEEP_PERIOD: Duration = Duration::from_secs(120);
 
 /// Shortest the sweeper will wait between passes. A guard against a control
 /// loop that never sleeps, not a cadence anyone is choosing.
+// cap: bound
 const MIN_SWEEP_PERIOD: Duration = Duration::from_secs(1);
 
 /// The cadence this loop declares for itself: the longest it will wait
@@ -106,6 +110,7 @@ pub const LOOP_PERIOD: Duration = MAX_SWEEP_PERIOD;
 /// The batch size bounds a single statement's work and the locks it holds. It
 /// is not a second knob: the `LIMIT` is how the capacity is enforced, so a
 /// pass' reach and its cost are the same number.
+// cap: bound
 const BATCH_ROWS: i64 = 20_000;
 
 /// What one pass did, so a caller can assert on it rather than infer it.

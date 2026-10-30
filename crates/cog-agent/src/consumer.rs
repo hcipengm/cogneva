@@ -28,9 +28,11 @@ use futures::StreamExt;
 /// wrote just as the previous incarnation was dying: too small and it could
 /// take back a message that a still-draining process is finishing; nothing
 /// waits on this value, so it is chosen for safety rather than latency.
+// cap: bound
 const INBOX_RECLAIM_MIN_IDLE_MS: u64 = 60_000;
 
 /// How many pending messages one reclaim call asks for.
+// cap: bound
 const INBOX_RECLAIM_BATCH: usize = 64;
 
 /// Generic agent consumer backed by any [`cog_core::MessageBackend`] implementation.

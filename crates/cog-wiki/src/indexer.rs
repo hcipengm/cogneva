@@ -31,7 +31,9 @@ impl Bm25Index {
     /// BM25's saturation (k1 = 1.5) and length-normalisation (b = 0.75) parameters,
     /// at the values the literature reports for short passages. They are retrieval
     /// defaults, not readings taken from this corpus.
+    // cap: bound
     const K1: f32 = 1.5;
+    // cap: bound — BM25 length normalisation at the value the literature reports for short passages (b = 0.75).
     const B: f32 = 0.75;
 
     pub fn new() -> Self {

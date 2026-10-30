@@ -151,6 +151,7 @@ pub const CHANGE_LEDGER_ROLE: &str = "change_ledger";
 /// steady state out of the log. The deployed liveness alert derives its
 /// threshold from this period (`6 * period`), so changing it changes that
 /// threshold.
+// cap: bound
 pub const CHANGE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// What a reader of a blocked row is told ends the wait.
@@ -169,6 +170,7 @@ const POOL_BLOCK_CONDITION: &str = "\
 /// A bound is needed because the read returns the rows themselves; it is set
 /// far above any real firing set so that a pass which fills it knows its own
 /// count is not a census and says so rather than comparing a truncated pile.
+// cap: bound
 pub const ALERT_CENSUS_LIMIT: i64 = 5000;
 
 /// How many outstanding rows one round reads.
@@ -178,6 +180,7 @@ pub const ALERT_CENSUS_LIMIT: i64 = 5000;
 /// not a work list, so the bound is a fixed small number; a round that does hand
 /// work over will pick its own batch size from its own throttle rather than
 /// reusing this one.
+// cap: bound
 const OUTSTANDING_PEEK: usize = 50;
 
 /// How many queued declarations one pass folds into the account.
@@ -188,6 +191,7 @@ const OUTSTANDING_PEEK: usize = 50;
 /// past the cadence it is renewed on. The queue is written by a person or a
 /// script, in batches of tens, so this bound is generous for how it is used --
 /// reaching it means the fold is behind, which the backlog reading says anyway.
+// cap: bound
 const DECLARATIONS_PER_PASS: usize = 200;
 
 /// How many queued retirements one pass folds into the account.
@@ -198,6 +202,7 @@ const DECLARATIONS_PER_PASS: usize = 200;
 /// cadence. Retirements are written by a classifier in batches of tens, so this
 /// bound is generous for how it is used -- reaching it means the fold is behind,
 /// which the backlog reading says anyway.
+// cap: bound
 const RETIREMENTS_PER_PASS: usize = 200;
 
 /// How many retirements that say "another account answered this" one pass
@@ -209,6 +214,7 @@ const RETIREMENTS_PER_PASS: usize = 200;
 /// -- the rows it did not reach read as retirements nothing will ever revisit.
 /// It is still a bound, because the pass holds the owner lease and each row costs
 /// a read of the other account.
+// cap: bound
 const RESTORED_ANSWERED_PER_PASS: usize = 1024;
 
 /// How many rows one pass measures against the tree.
@@ -218,6 +224,7 @@ const RESTORED_ANSWERED_PER_PASS: usize = 1024;
 /// lease. Rows are taken stalest-first, so this bound costs latency rather than
 /// coverage: everything outstanding is still reached, in as many passes as it
 /// takes.
+// cap: bound
 const MEASUREMENTS_PER_PASS: usize = 200;
 
 /// How many landed rows one pass re-asks because a path their check reads moved.
@@ -237,6 +244,7 @@ const TOUCHED_PER_PASS: usize = MEASUREMENTS_PER_PASS;
 /// git calls at a revision from the history, so it is bounded like the batches
 /// above; unlike them it does not rotate forever -- a row it writes leaves the
 /// set, so the bound is the length of a one-off sweep.
+// cap: bound
 const PARENT_BACKFILL_PER_PASS: usize = 50;
 
 /// How many retired rows one pass asks whether their surface came back.
@@ -256,6 +264,7 @@ const PARENT_BACKFILL_PER_PASS: usize = 50;
 /// reads a full batch, which is the only signal that the assumption has been
 /// outgrown. What that warning asks for is a rotation key in the read (a cursor
 /// persisted with the row), not a larger number here.
+// cap: bound
 const RETIRED_RECHECK_PER_PASS: usize = 500;
 
 /// How many queued re-measurements one pass takes.
@@ -267,6 +276,7 @@ const RETIRED_RECHECK_PER_PASS: usize = 500;
 /// the outstanding pass already is; the bound keeps one pass from becoming a
 /// full pass over the tree on a producer's word. A full batch warns rather than
 /// growing, because the answer to a queue that outgrew it is to ask why.
+// cap: bound
 const REMEASURE_PER_PASS: usize = 64;
 
 /// How many owed rows one pass hands over.
@@ -299,6 +309,7 @@ const REMEASURE_PER_PASS: usize = 64;
 /// up to `HANDOVERS_PER_PASS * UNMEASURABLE_RETRY / CHANGE_LEDGER_PASS_INTERVAL`
 /// rows is swept inside `UNMEASURABLE_RETRY`, and the assertion below fails to
 /// compile if the three numbers drift apart.
+// cap: bound
 const HANDOVERS_PER_PASS: usize = 200;
 
 const _: () = assert!(
@@ -322,6 +333,7 @@ const _: () = assert!(
 /// runs every few minutes and the unanswered set is a few hundred rows) and
 /// short enough that a tree that changed is noticed within the same working
 /// session.
+// cap: bound
 const UNMEASURABLE_RETRY: Duration = Duration::from_secs(3600);
 
 /// How long a row the account calls done may go before its check is asked again.
@@ -404,6 +416,7 @@ const DISPATCH_TASK_PREFIX: &str = "change-ledger-";
 /// deep. One below the default keeps a dispatched change from taking the slot a
 /// submitted goal could have used, without making it ineligible: it still runs
 /// whenever the graph has room this pass did not claim.
+// cap: bound
 const DISPATCH_TASK_PRIORITY: i32 = 0;
 
 /// The task kind a dispatched change is submitted under.
@@ -556,6 +569,7 @@ fn dispatch_task_id(identity: &ChangeIdentity, generation: u32) -> String {
 /// would forget it. The landing machine writes at most a few commits a day, and
 /// this bound is what keeps a repository with years of history from turning one
 /// pass into a walk of it.
+// cap: bound
 const LANDING_LOG_COMMITS: usize = 2_000;
 
 /// The changes a commit log says it landed, keyed by the id each commit names.
@@ -664,6 +678,7 @@ const HANDOVER_ROUNDTABLE_HISTORY: &str = "/snapshot/roundtable/history";
 /// position 146, so a single page would have to be longer than the longest run
 /// there has ever been. Paging at a bound under that keeps the read correct for
 /// a stream longer than any of them rather than correct for the ones observed.
+// cap: bound
 const HANDOVER_EVENTS_PER_PAGE: usize = 100;
 
 /// The deliverable one handover left.
@@ -2067,6 +2082,7 @@ fn principle_literal(slug: &str) -> String {
 /// within the budget reaches `git log --oneline` whole; a longer one is
 /// shortened there, and a shortened title is a view a reader has to scroll
 /// past.
+// cap: bound
 const GOAL_TITLE_CHARS: usize = 50;
 
 /// What a row of the principle ledger asks for, in the words the goal path is
@@ -5038,6 +5054,7 @@ async fn record_dispatch_state(
             /// Rows one account line names before it summarises the rest as a count: a line
             /// is an annotation, and an account that came to hold thousands of rows would
             /// otherwise turn it into a dump.
+            // cap: bound
             const NAMED: usize = 20;
             let named: Vec<String> = holders
                 .iter()

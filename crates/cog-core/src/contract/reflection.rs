@@ -1310,10 +1310,12 @@ pub fn path_protected_dir_segment<'a>(
 
 /// Longest an extension may be before a trailing `.foo` reads as a sentence
 /// fragment rather than a file type.
+// cap: bound
 const GOAL_PATH_EXT_MAX: usize = 6;
 
 /// Shortest extension worth reading as a file type. One letter is the shape of
 /// an abbreviation (`e.g`, `i.e`), not of an extension anybody ships.
+// cap: bound
 const GOAL_PATH_EXT_MIN: usize = 2;
 
 /// Characters that separate one candidate token from the next. A goal is prose,
@@ -2517,6 +2519,7 @@ fn test_binary_of(line: &str) -> Option<String> {
 fn without_metadata_hash(stem: &str) -> String {
     /// How many hex digits cargo appends to a binary name's stem: sixteen, the
     /// truncated metadata hash.
+    // cap: bound
     const HASH_LEN: usize = 16;
     match stem.rsplit_once('-') {
         Some((name, hash))
@@ -2648,6 +2651,7 @@ fn failure_blocks(output: &str) -> String {
 /// How many panic sites a digest names. A run can panic in every test it has;
 /// the first few name the places to look, and the rest is repetition that would
 /// spend the budget the failing-test list needs.
+// cap: bound
 const PANIC_LINES: usize = 8;
 
 /// At most `budget` characters from the front.

@@ -74,6 +74,7 @@ pub const PRINCIPLE_LEDGER_ROLE: &str = "principle_ledger";
 /// being maintained". Minutes rather than seconds keeps the steady state out of
 /// the log. The deployed liveness alert derives its threshold from this period
 /// (`6 * period`), so changing it changes that threshold.
+// cap: bound
 pub const PRINCIPLE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// What the tier census calls a row whose carrier never declared one.
@@ -89,6 +90,7 @@ const CHECK_KIND_UNDECLARED: &str = "undeclared";
 ///
 /// The round exists for one thing: to make "the account is readable, and this is
 /// how much is outstanding" a line in the log with a reading behind it.
+// cap: bound
 const OUTSTANDING_PEEK: usize = 50;
 
 /// How many refused rows one pass publishes.
@@ -99,6 +101,7 @@ const OUTSTANDING_PEEK: usize = 50;
 /// truncate the reading by the ordering instead of by what the gates refused,
 /// and the total a reader adds up would then disagree with the account for a
 /// reason nothing on the surface states.
+// cap: bound
 const REFUSAL_ROWS_PER_PASS: usize = 1000;
 
 /// How many queued readings one pass folds into the account.
@@ -109,9 +112,11 @@ const REFUSAL_ROWS_PER_PASS: usize = 1000;
 /// read in between would be of a half-folded corpus -- which is exactly the kind
 /// of reading this account must not publish. A pass is still bounded: a queue
 /// that grew past this is not a corpus being read, it is a writer looping.
+// cap: bound
 const DECLARATIONS_PER_PASS: usize = 1000;
 
 /// How many queued refusal events one pass counts.
+// cap: bound
 const REFUSALS_PER_PASS: usize = 500;
 
 /// How many rows one pass looks at against the registries.
@@ -121,6 +126,7 @@ const REFUSALS_PER_PASS: usize = 500;
 /// lease. Rows are taken stalest-first, so this bound costs latency rather than
 /// coverage: everything outstanding is still reached, in as many passes as it
 /// takes.
+// cap: bound
 const MEASUREMENTS_PER_PASS: usize = 200;
 
 /// How many human-held rows one pass may look at for the first time.
@@ -131,6 +137,7 @@ const MEASUREMENTS_PER_PASS: usize = 200;
 /// of them and no look had ever reached one. The bound is small enough that the
 /// debt still gets most of a pass, and large enough that the first sweep clears
 /// in hours rather than weeks.
+// cap: bound
 const HUMAN_ONLY_SWEEP_PER_PASS: usize = 50;
 
 /// How long a look that could not be settled is left before it is asked again.
@@ -142,6 +149,7 @@ const HUMAN_ONLY_SWEEP_PER_PASS: usize = 50;
 /// (the pass runs every few minutes and the unanswered set is a few hundred rows)
 /// and short enough that a tree that changed is noticed within the same working
 /// session.
+// cap: bound
 const UNMEASURABLE_RETRY: Duration = Duration::from_secs(3600);
 
 /// A principle this process could not settle, and when it last tried.

@@ -115,6 +115,7 @@ pub const INTERVAL_ENV: &str = "COGNEVA_CLAIM_SCAN_INTERVAL_SECS";
 /// The same default the in-process walkers use: two processes reporting the same
 /// claim must be as fresh as each other, or the older one's number reads as
 /// growth that did not happen.
+// cap: bound
 pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 
 /// Fastest cadence a scan may run at.
@@ -122,6 +123,7 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 300;
 /// A scan walks every directory below the root, so it costs what the node holds
 /// rather than a fixed amount, and a deployment asking for more than this gets
 /// this instead of a knob whose only effect is to keep the disk busy.
+// cap: bound
 pub const MIN_INTERVAL_SECS: u64 = 30;
 
 /// Prefix of this scanner's name in the loop liveness census.

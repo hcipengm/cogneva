@@ -520,6 +520,7 @@ fn grade(
 
 /// 判词里最多点几条测试名——全列出来会把判词撑成一整份测试报告。
 fn sample(names: &[&str]) -> String {
+    // cap: bound — at most five test names in a verdict; the rest are counted, not listed
     const MAX: usize = 5;
     if names.is_empty() {
         return "none".into();

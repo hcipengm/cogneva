@@ -84,12 +84,16 @@ pub enum ChangeTier {
 }
 
 /// Files a request may name and still be the shortcut's.
+// cap: bound
 pub const SHORTCUT_MAX_FILES: usize = 3;
 /// Lines an attached diff may declare and still be the shortcut's.
+// cap: bound
 pub const SHORTCUT_MAX_LINES: usize = 40;
 /// Declared files at which a change is too big for the lightest topology.
+// cap: bound
 pub const DEEP_MIN_FILES: usize = 4;
 /// Declared diff lines at which a change is too big for the lightest topology.
+// cap: bound
 pub const DEEP_MIN_LINES: usize = 120;
 
 /// One of the request's own declarations the scale is read from.
@@ -510,6 +514,7 @@ pub fn scale_label(scale: DeclaredScale) -> &'static str {
 }
 
 /// Threshold below which the [`PgeMode::Pipeline`] is preferred.
+// cap: bound
 pub const PIPELINE_SCORE_THRESHOLD: f64 = 0.4;
 
 /// Compute the complexity score for a profile.

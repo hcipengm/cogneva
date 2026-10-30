@@ -18,6 +18,7 @@ use std::sync::RwLock;
 ///
 /// 这条循环曾经阻塞等待，在同一个线程上与运行时互锁、冻住整个进程；轮询间隔
 /// 要短到看不出延迟，长到不把线程占满。
+// cap: bound
 const CHANNEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// 热重载模式。

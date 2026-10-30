@@ -88,11 +88,13 @@ impl ConfigDeclarationConfig {
     /// Floor for the settle window. The mount is refreshed by kubelet on its
     /// own sync period, so a window shorter than that would read the same stale
     /// document twice and call a rollout a permanent gap.
+    // cap: bound
     pub const MIN_SETTLE_SECS: u64 = 10;
 
     /// Floor for the hold. Below the settle floor it would only re-read the
     /// same window; the pod replacement it is there to wait out takes minutes,
     /// not seconds.
+    // cap: bound
     pub const MIN_HOLD_SECS: u64 = 60;
 }
 
@@ -162,6 +164,7 @@ pub struct TraceCollectorConfig {
 ///
 /// 缓冲吸收的是「导出端比产生端慢」的那一段；超过它就丢最旧的 span，而不是
 /// 让进程内存跟着涨。这是代码自己选的界，不是量出来的容量。
+// cap: bound
 const DEFAULT_TRACE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 impl Default for TraceCollectorConfig {
@@ -334,6 +337,7 @@ pub struct InfraRule {
 impl InfraWatchConfig {
     /// Minimum poll cadence: faster polling only burns Prometheus CPU without
     /// improving detection, since scrape intervals dominate freshness.
+    // cap: bound
     pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
 }
 

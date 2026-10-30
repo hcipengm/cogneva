@@ -38,9 +38,11 @@ impl PatternEntry {
 }
 
 /// Default maximum pattern DB size before LRU/score-based eviction kicks in.
+// cap: bound
 pub const DEFAULT_MAX_PATTERN_DB_SIZE: usize = 256;
 /// Default maximum age (in days) for pattern DB entries before they are
 /// expired even if the size cap has not been reached.
+// cap: bound
 pub const DEFAULT_MAX_PATTERN_AGE_DAYS: i64 = 30;
 
 /// ActionPlanOrchestrator implements Stage 1 decomposition logic:

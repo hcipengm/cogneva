@@ -17,6 +17,7 @@ use cog_core::SupervisorEvent;
 
 /// Threshold for pending-handoffs / active-agents ratio that triggers a
 /// scale-out recommendation in [`AutonomousCollaborator::run_decision_pass`].
+// cap: bound
 const LOAD_RATIO_THRESHOLD: f64 = 0.8;
 
 /// Configuration for autonomous collaboration decisions.

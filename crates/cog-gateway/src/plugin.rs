@@ -10,9 +10,11 @@ type ServerHandle = tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error
 /// 策略这一段要重试：3s 一拍、最多 10 拍（约 30s）。拍长与被重启的那一端
 /// 同步起停的时长同量级，更短只是空转，更长则属主设的 local/ask 会更久地
 /// 停在默认的 auto 上。
+// cap: bound
 const POLICY_RESTORE_CADENCE: std::time::Duration = std::time::Duration::from_secs(3);
 /// 重试上限拍数。退避到最后仍读不到就报「没恢复」，不无限等——留着的默认
 /// 策略是 auto，无限等等于永远不报。
+// cap: bound
 const POLICY_RESTORE_ATTEMPTS: u32 = 10;
 
 /// Gateway plugin that self-assembles [`crate::GatewayState`] and drives the HTTP server lifecycle.

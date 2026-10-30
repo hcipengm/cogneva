@@ -322,6 +322,7 @@ impl WalBackend for MemoryWalBackend {
 /// oldest record still held. Raising this number keeps more history; lowering
 /// it trades history for memory. Neither choice removes the logs themselves;
 /// that is the retirement path, which is a separate change.
+// cap: bound
 pub const WAL_MAX_ENTRIES_PER_SESSION: usize = 5_000;
 
 /// How long the sweep waits between passes over the store.
@@ -331,6 +332,7 @@ pub const WAL_MAX_ENTRIES_PER_SESSION: usize = 5_000;
 /// whose session ended while over the cap, and that population changes when
 /// sessions end rather than on any clock. What the period really buys is a
 /// bounded delay between a session ending and its log giving the memory back.
+// cap: bound
 pub const WAL_CAP_SWEEP_PERIOD: Duration = Duration::from_secs(600);
 
 /// The name this loop registers under in the process's loop readings.
@@ -366,6 +368,7 @@ pub struct RetireOutcome {
 /// a second pass costs one sweep period and removes the race: a session that is
 /// really starting registers long before the second look, while an abandoned
 /// log has neither a registry record nor any growth in the meantime.
+// cap: bound
 pub const WAL_RETIRE_PASSES: usize = 2;
 
 /// Which of this pass's candidates may be removed, given the previous pass.

@@ -70,15 +70,21 @@ const ROW_COLUMNS: &str = "slug, lead, carrier_path, carrier_sha256, host_gate, 
 /// The bounds are the narrower dialect's (MySQL cannot key an unbounded TEXT
 /// column), so one set governs both. Widths are counted in characters, which is
 /// what both dialects' VARCHAR lengths mean.
+// cap: bound
 const SLUG_MAX: usize = 191;
+// cap: bound — the reading's source column width, a schema limit rather than a measurement
 const SOURCE_MAX: usize = 512;
+// cap: bound — the refusal row's source column width, a schema limit rather than a measurement
 const REFUSAL_SOURCE_MAX: usize = 256;
 /// The shape name a refusal carries: the gate's own key for what matched, not
 /// the principle it counts against.
+// cap: bound
 const REFUSAL_CRITERION_MAX: usize = 64;
 /// The matched text. Wide enough to hold a phrase, narrow enough that the intake
 /// stays a record of what happened rather than a copy of the call.
+// cap: bound
 const REFUSAL_SPAN_MAX: usize = 512;
+// cap: bound — the width of a SHA-256 digest in hex; a protocol figure
 const SHA256_MAX: usize = 64;
 
 /// PostgreSQL principle ledger store.

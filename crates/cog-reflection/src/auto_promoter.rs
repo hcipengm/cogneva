@@ -39,10 +39,12 @@ use crate::ReflectionEngine;
 /// 幂等守卫与「等人工审批」查询看的窗口：两者必须看同一段历史，否则会出现
 /// 「判定说这条已有记录、审批台却说没有那一行」。台账是追加表，一周一行时
 /// 这个窗口按年计。
+// cap: bound
 const LEDGER_LOOKBACK: usize = 50;
 
 /// 一轮超时决断最多看多少条审批行。取旧在前，所以积压只会一轮轮往前推；
 /// 这个数是每轮的界，不是「最多只决断这么多」——到点的那些每一轮都会被关掉。
+// cap: bound
 const APPROVAL_SWEEP_LIMIT: usize = 1000;
 
 /// 待晋级提交的来源。沙盒变更提交在临时工作树里（detached HEAD，用完即弃），

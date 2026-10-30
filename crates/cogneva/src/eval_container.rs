@@ -29,6 +29,7 @@ use cog_core::{SFError, SFResult, ToolExecutor};
 ///
 /// 这些探测只判「这台机器能不能建」，命令本身是秒级；20s 还没结束就说明守护
 /// 进程不在，与「不能建」是同一个结论。
+// cap: bound
 const PROBE_CONTAINER_WAIT: Duration = Duration::from_secs(20);
 use cog_eval::{
     parse_test_list, swe_pro_tool_definitions, tools_bound_to, CaseEnv, EvalCase, ExecLimits,
@@ -80,6 +81,7 @@ const ENV_IMAGE_MIRROR: &str = "COGNEVA_EVAL_IMAGE_MIRROR";
 /// 是一个宽得多的**安全上界**，不是量出来的界，所以它可覆盖；它的意义是让一条卡住的命令
 /// 变成一次带原因的失败，而不是一个永远挂在那里的格子。
 const ENV_TIMEOUT_SECS: &str = "COGNEVA_EVAL_CONTAINER_TIMEOUT_SECS";
+// cap: bound — a wide safety ceiling over a measured 100-second score plus a 60-second pull
 const DEFAULT_TIMEOUT_SECS: u64 = 900;
 /// 默认那份（overlay）起不来时换的那一份。选 vfs 而不是 fuse-overlayfs：后者要 Pod 里再装
 /// 一个二进制与一份 `/etc/containers/storage.conf`，而 vfs 是 buildah 自带的、只要一个参数。

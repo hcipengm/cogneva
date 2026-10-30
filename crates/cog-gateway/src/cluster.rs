@@ -668,6 +668,7 @@ pub const READ_PROBE_LOOP: &str = "cluster_read_probe";
 /// 不是「此刻集群里有什么」。授权被收窄这种事以小时计，一分钟足够在有人第一次
 /// 打开页面之前就把它变成一条告警；再快只是在 apiserver 上多花请求，而这一面
 /// 每次只读一行（`limit=1`）。
+// cap: bound
 pub const READ_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 探针要读的每一条集合：(资源名, 路径)。
@@ -960,6 +961,7 @@ struct Sources {
 ///
 /// 这一面是轮询的，一个不响的走查端不能把整次读取拖住；共用客户端的默认期限
 /// 是给 apiserver 往返的，套在这里会把一次前端刷新拖到那个数。
+// cap: bound
 const WALKTHROUGH_POLL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// 每个节点上都有一个 claim-store，它走查节点存储根，把每个卷的真实字节数发布在

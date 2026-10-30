@@ -36,15 +36,18 @@ pub const DEFAULT_SUMMARY_COLLECTION: &str = "summaries";
 /// half a minute of failed attempts took a process down on 2026-10-25) and it
 /// stays well inside the 300s startup probe, so a store that is genuinely
 /// broken still surfaces instead of hanging.
+// cap: bound
 const CREATE_COLLECTION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Delay before the second attempt; doubled for each attempt after that, up to
 /// [`CREATE_COLLECTION_BACKOFF_DOUBLINGS`], so a long wait keeps asking often
 /// instead of sleeping one long block.
+// cap: bound
 const CREATE_COLLECTION_BACKOFF_MS: u64 = 500;
 
 /// How many times the backoff doubles before it stops growing: 500ms × 2⁴ = 8s
 /// between attempts.
+// cap: bound
 const CREATE_COLLECTION_BACKOFF_DOUBLINGS: u32 = 4;
 
 /// What one repair pass did.

@@ -7,6 +7,7 @@ use tracing::{info, warn};
 ///
 /// 关停时先让在飞的调用收尾；5s 之后还没停就交给进程退出——把停机拖到编排器
 /// 的宽限期用完，才是真正难看的结局。
+// cap: bound
 const GRPC_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Protocol plugin that provides MCP, A2A, and gRPC lifecycle services.

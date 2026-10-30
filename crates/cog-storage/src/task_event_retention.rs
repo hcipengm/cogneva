@@ -84,6 +84,7 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// stream is retired only once it has been quiet for that long, so a live run
 /// is never cut. It is a default for the deployment that does not say
 /// otherwise, not a policy.
+// cap: bound
 pub const DEFAULT_KEEP_DAYS: i64 = 30;
 
 /// The shortest retention this loop will accept.
@@ -91,6 +92,7 @@ pub const DEFAULT_KEEP_DAYS: i64 = 30;
 /// A day. The readers replay a whole stream, so a retention shorter than the
 /// time a run takes would retire streams that are still being read. A value
 /// below this is a misconfiguration and falls back rather than being honoured.
+// cap: bound
 pub const MIN_KEEP_DAYS: i64 = 1;
 
 /// The environment variable that carries the retention.
@@ -102,6 +104,7 @@ pub const KEEP_DAYS_ENV: &str = "COGNEVA_TASK_EVENT_KEEP_DAYS";
 /// table's size, and Prometheus drops a series it has not seen for five minutes
 /// rather than holding the last value. The age it measures moves by days, so
 /// nothing here needs to be faster.
+// cap: bound
 pub const PERIOD: Duration = Duration::from_secs(120);
 
 /// How many streams one statement may retire.
@@ -111,6 +114,7 @@ pub const PERIOD: Duration = Duration::from_secs(120);
 /// its candidates each batch, and a batch is what the loop publishes as its
 /// bound between two beats. Five hundred streams is well under the smallest
 /// batch that matters at the rate this table grows.
+// cap: bound
 const BATCH_STREAMS: i64 = 500;
 
 /// What one pass did, so a caller can assert on it rather than infer it.

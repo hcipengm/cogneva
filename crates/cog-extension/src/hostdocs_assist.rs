@@ -38,12 +38,15 @@ pub const ASSIST_MAX_CANDIDATES_ENV: &str = "HOST_DOCS_ASSIST_MAX_CANDIDATES";
 /// A body is evidence of what a file is, not the whole of it: a couple of kilobytes of a
 /// text file name the subject as well as the whole file does, and the cost of the call
 /// grows with every byte of it.
+// cap: bound
 pub const DEFAULT_ASSIST_MAX_BODY_BYTES: usize = 2048;
 /// Past a few dozen unclassified files, the folder is telling the operator something about
 /// the rule table rather than about the files.
+// cap: bound
 pub const DEFAULT_ASSIST_MAX_CANDIDATES: usize = 50;
 /// An answer to one question. Long enough for a slow upstream, short enough that a run
 /// cannot hang on a channel that accepted the connection and then went quiet.
+// cap: bound
 const REQUEST_TIMEOUT_SECS: u64 = 120;
 
 /// The model name this module sends. **It is a placeholder by contract**: the gateway

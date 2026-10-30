@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 /// The level zstd itself calls its default: cheap enough for the raw-log write
 /// path, which is on the hot path of every record.
+// cap: derived
 const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 fn zstd_compress(bytes: &[u8], level: i32) -> SFResult<Vec<u8>> {

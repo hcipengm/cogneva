@@ -26,8 +26,10 @@ use crate::eval_mcp_in_pod::sh_quote as shq;
 use crate::eval_toolathlon::{ToolathlonPod, CONTAINER_AGENT_WORKSPACE};
 
 /// 上游 `overlong_tool_manager.PAGE_SIZE`：一页约一万字符。
+// cap: bound
 const PAGE_SIZE: usize = 10_000;
 /// 上游 `python_execute` 自带上界：`timeout = min(int(timeout), 120)`。
+// cap: bound
 const PYTHON_TIMEOUT_CEILING: u64 = 120;
 
 /// 这道题要的本地工具。`wanted` 是 `needed_local_tools` 里的那几个**声明名**。

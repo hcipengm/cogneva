@@ -28,6 +28,7 @@ pub const TERMINATION_LOG: &str = "/dev/termination-log";
 
 /// 终止消息有大小上限，超了由 kubelet 截断且不说明截在哪里。这里先自己截，
 /// 并且把「截过」写出来：看起来完整的读数比明说被截过更坏，人会照着半句话下结论。
+// cap: bound
 const MESSAGE_CHARS: usize = 1500;
 
 /// 记下这一轮启动为什么失败。任何内部错误都被吞掉——这条路径本身不能成为

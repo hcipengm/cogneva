@@ -37,6 +37,7 @@ fn default_limit() -> usize {
 /// How many firing alerts to fetch when all the verdict needs is whether any
 /// exist. The question is boolean, so one row settles it and the read stays
 /// bounded no matter how much is firing.
+// cap: bound
 const FIRING_PROBE_LIMIT: i64 = 1;
 
 /// Verdict over the firing alerts an evidence source reported.
@@ -260,6 +261,7 @@ fn default_usage_hours() -> i64 {
 /// ledger's own history; a request past the fold's reach is answered as an
 /// uncovered range either way, so the cap bounds the scan and not the honesty
 /// of the answer.
+// cap: bound
 const MAX_USAGE_HOURS: i64 = 24 * 7;
 
 /// The rolled spend, with the range of windows it was summed over.

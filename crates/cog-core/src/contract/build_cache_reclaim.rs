@@ -100,6 +100,7 @@ pub const RESULT_LEAVES: &[&str] = &["deps", ".fingerprint"];
 ///
 /// One, and it is the newest file the layer has. See the module docs: this is
 /// what keeps a layer from reading as absent, not what keeps a build warm.
+// cap: bound
 pub const FLOOR_FILES_PER_LAYER: usize = 1;
 
 /// The rank of a layer neither list places, which is the last of them.
@@ -107,6 +108,7 @@ pub const FLOOR_FILES_PER_LAYER: usize = 1;
 /// Named rather than written as a literal because the question "is this layer
 /// placed at all" is asked in more than one place, and a second `2` there would
 /// be a second answer to it.
+// cap: bound
 const UNPLACED: usize = 2;
 
 /// One file a plan would delete, by every name it has.

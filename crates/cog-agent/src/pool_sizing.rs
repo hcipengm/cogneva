@@ -41,6 +41,7 @@ use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 /// The pool backs off one step before that line, so the alert is the report of
 /// a pool that could not back off rather than the first reader of a container
 /// about to be killed.
+// cap: bound
 pub const MEMORY_RED_FRACTION: f64 = 0.78;
 
 /// Grow only below this share, so one step cannot both shrink and grow.
@@ -49,6 +50,7 @@ pub const MEMORY_RED_FRACTION: f64 = 0.78;
 /// on 2026-10-24, the working set stayed between 0.70 and 0.72 of an 8 GiB
 /// limit through the day, and most of that is not the pool's. A growth line
 /// below the baseline would trap a shrunk pool at one slot forever.
+// cap: bound
 pub const MEMORY_GROW_FRACTION: f64 = 0.73;
 
 /// A growth line at or above the red line would let one pass both shrink and

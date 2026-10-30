@@ -77,19 +77,24 @@ const DATABASE_URL_FLAG: &str = "--database-url";
 const REDIS_URL_FLAG: &str = "--redis-url";
 
 /// The role was taken or renewed: this writer may act this round.
+// cap: bound
 pub const EXIT_HOLDS_THE_ROLE: i32 = 0;
 /// The ask was made and the answer was no. Three different noes — the pool
 /// carries the work, another writer holds a live term, or nothing on record
 /// says the pool is down — and the printed line names which.
+// cap: bound
 pub const EXIT_MUST_NOT_WRITE: i32 = 1;
 /// The ask never left this process: unusable arguments, or an end that is not
 /// configured. Nothing was learned about the role or the pool.
+// cap: bound
 pub const EXIT_CANNOT_ASK: i32 = 2;
 /// The arbiter could not be read. Not a verdict about the role: an unreachable
 /// arbiter and a role someone else holds are different facts.
+// cap: bound
 pub const EXIT_ARBITER_SILENT: i32 = 3;
 /// No pool snapshot could be read. Not a verdict about the pool: absence must
 /// not be read as health, because taking over moves real code.
+// cap: bound
 pub const EXIT_POOL_SILENT: i32 = 4;
 
 pub const USAGE: &str = "\

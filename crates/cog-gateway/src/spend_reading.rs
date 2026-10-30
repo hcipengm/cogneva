@@ -19,6 +19,7 @@
 //! either a quiet day or a dead writer, and those call for opposite repairs.
 
 /// Seconds in a UTC day.
+// cap: bound
 const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Start of the UTC day containing `now_unix`.

@@ -1,10 +1,12 @@
 use std::time::Duration;
 
 /// Default per-hook execution timeout (30 seconds).
+// cap: bound
 pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Default deduplication window (1 second).  Identical events fired inside the
 /// window are coalesced — only the first one runs the action.
+// cap: bound
 pub const DEFAULT_DEDUP_WINDOW: Duration = Duration::from_secs(1);
 
 /// The Redis stream a user's notifications are published to, before the user

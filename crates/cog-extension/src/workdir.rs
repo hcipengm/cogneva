@@ -51,9 +51,13 @@ pub const WORKTREE_FETCH_LOOP: &str = "extension_worktree_fetch";
 /// Loop name of the claim-footprint walk over this executor's own volumes.
 pub const VOLUME_FOOTPRINT_LOOP: &str = "extension_volume_footprint";
 
+// cap: bound — seed; applies only until two trees exist to give an arrival interval
 const DEFAULT_TTL_SECS: u64 = 21600;
+// cap: bound — seed; applies only until a reclamation pass has been timed, then the interval follows the pass
 const DEFAULT_GC_INTERVAL_SECS: u64 = 600;
+// cap: bound — seed; applies only until the first observed move of main, then the fetch period follows that
 const DEFAULT_FETCH_INTERVAL_SECS: u64 = 300;
+// cap: bound — policy ceiling when the deployment names none; the disk measurement can still lower it
 const DEFAULT_MAX_WORKSPACES: usize = 8;
 
 const META_DIR_NAME: &str = ".meta";
@@ -61,6 +65,7 @@ const META_DIR_NAME: &str = ".meta";
 /// Maximum task id length, keeps the on-disk directory name clear of
 /// `ENAMETOOLONG` while accommodating generated ids such as
 /// `ralph-roundtable-<uuid>`.
+// cap: bound
 const MAX_TASK_ID_LEN: usize = 128;
 
 /// Headroom kept free on the volume. A cap that fills the disk leaves no room
@@ -68,11 +73,13 @@ const MAX_TASK_ID_LEN: usize = 128;
 /// the failure that produces is a command failing, not a tree being reclaimed.
 /// A percentage rather than a byte figure, so it follows whatever volume the
 /// executor is given instead of assuming one.
+// cap: bound
 const WORKSPACE_DISK_HEADROOM_PERCENT: u64 = 15;
 
 /// The shortest time between two reclamation passes, and the pace the loop
 /// wakes at whatever the derived interval turns out to be -- waking is cheap,
 /// a pass is not.
+// cap: bound
 const MIN_GC_INTERVAL_SECS: u64 = 30;
 
 /// How many times a pass's own duration the interval must cover, so maintenance
@@ -80,6 +87,7 @@ const MIN_GC_INTERVAL_SECS: u64 = 30;
 /// period: the pass gets slower as the volume fills, and the interval has to
 /// follow it or the upkeep becomes the load. Shared by reclamation and the
 /// build-cache walk -- one control law, one number.
+// cap: derived
 const MAINTENANCE_OVERHEAD_MULTIPLE: u64 = 20;
 
 /// The published name of the interval the reclamation loop is keeping.
@@ -90,6 +98,7 @@ const GC_INTERVAL_METRIC: &str = "sandbox_workspace_gc_interval_seconds";
 /// cost of the git round trip stops being paid for by anything. A floor rather
 /// than a period: the period itself follows how often `main` is observed to
 /// move.
+// cap: bound
 const MIN_FETCH_INTERVAL_SECS: u64 = 30;
 
 /// The published name of the wait the fetch loop is currently keeping, and the
@@ -195,6 +204,7 @@ fn ttl_from(capacity: usize, trees: usize, span_secs: u64) -> Option<Duration> {
 
 /// The shortest an idle tree is held, whatever the arithmetic says: below this
 /// the executor rebuilds trees it has just finished with.
+// cap: bound
 const MIN_TTL_SECS: u64 = 3600;
 
 /// Which of the three inputs set the period in force.

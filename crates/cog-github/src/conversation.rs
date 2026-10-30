@@ -248,6 +248,7 @@ impl IssueConversation {
 
 /// At most this many attachments are fetched and sent to the judge per
 /// intent (the most recent ones).
+// cap: bound
 pub const MAX_MEDIA_PER_INTENT: usize = 6;
 
 /// Keep at most `cap` items, preferring the most recent (tail) — comments

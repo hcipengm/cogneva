@@ -16,6 +16,7 @@ use crate::SFResult;
 /// Larger than the forty messages the model is shown as context, because the
 /// two bounds answer different questions: the context window is what fits in a
 /// request, and this is how far back a reader can still see what was said.
+// cap: bound
 pub const ROWS_KEPT_PER_SESSION: i64 = 200;
 
 /// Who said one line of the transcript.
@@ -147,6 +148,7 @@ pub trait ChatTurnStore: Send + Sync {
 /// Rows kept per receiving peer, so a chatty sender cannot grow the table
 /// without bound. Larger than what a panel shows at once, because how far back
 /// a reader can scroll and what fits on one screen answer different questions.
+// cap: bound
 pub const ROWS_KEPT_PER_PEER: i64 = 500;
 
 /// The settled shape of one send.

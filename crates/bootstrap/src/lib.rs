@@ -426,10 +426,12 @@ pub const NODE_IO_SYSCTL_FILE: &str = "/etc/sysctl.d/99-cogneva-node-io.conf";
 
 /// Seconds of the device's own sustained write the node lets pile up before the
 /// kernel starts writing back in the background.
+// cap: bound
 const DIRTY_BACKGROUND_SECONDS: u64 = 2;
 
 /// The same, for the watermark at which a writer is made to write back before it
 /// can dirty more.
+// cap: bound
 const DIRTY_FORCE_SECONDS: u64 = 5;
 
 /// Floor for the background watermark. Below the speed the flusher threads can
@@ -437,9 +439,11 @@ const DIRTY_FORCE_SECONDS: u64 = 5;
 /// it, so the queue this bound exists to shape never forms and the two points
 /// collapse into a permanent trickle. These floors are the smallest pair that
 /// still lets a burst finish.
+// cap: bound
 const DIRTY_BACKGROUND_FLOOR_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Floor for the force watermark, above the background floor by construction.
+// cap: bound
 const DIRTY_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The unflushed data never grows past this share of RAM: one twentieth, a
@@ -450,10 +454,12 @@ const DIRTY_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 /// unflushed data is affordable; it decides only that a device so fast the
 /// throughput-derived number would be enormous must not be allowed to hold the
 /// whole node's memory dirty, which would turn a disk bound into an OOM.
+// cap: bound
 const DIRTY_MAX_RAM_DIVISOR: u64 = 20;
 
 /// Hard ceiling on either watermark, for a node whose RAM would put the share
 /// above it.
+// cap: bound
 const DIRTY_CEILING_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The dirty-page watermarks this node should run with, in bytes.

@@ -17,6 +17,7 @@ use tracing::{info, warn};
 ///
 /// 这一步只决定用不用得上镜像；等不到就当它不可用、换下一个候选，拖久了会让
 /// 整条装机链路在探测上多花掉几分钟。
+// cap: bound
 const MIRROR_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 国内 apt 镜像候选。与 bootstrap.sh 的候选表同源（同样由测试盯着）。

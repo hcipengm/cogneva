@@ -14,9 +14,11 @@
 use std::time::Duration;
 
 /// The ceiling before any command has completed here: only this is available.
+// cap: bound
 pub const GIT_TIMEOUT_FLOOR_SECS: u64 = 120;
 
 /// How many times the slowest completed command a command may take.
+// cap: derived
 pub const GIT_TIMEOUT_MULTIPLE: u64 = 10;
 
 /// How long a git command may run, from the slowest one that has completed.

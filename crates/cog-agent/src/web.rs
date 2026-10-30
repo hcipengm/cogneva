@@ -35,35 +35,42 @@ use url::Url;
 /// Hits returned when the caller does not say how many it wants. Ten is one
 /// screen of titles and excerpts: enough to choose a page to read, small enough
 /// that a turn is not spent on links it will not follow.
+// cap: bound
 const DEFAULT_SEARCH_RESULTS: u64 = 10;
 
 /// The most hits one call may ask for. Every hit is context the run pays for on
 /// every later turn, so a caller that wants more pages should read the ones it
 /// has rather than page through a result list it cannot use.
+// cap: bound
 const MAX_SEARCH_RESULTS: u64 = 50;
 
 /// Characters of extracted text returned when the caller does not ask for a
 /// size. Roughly one long article; the caller can raise it for a document it
 /// means to read whole.
+// cap: bound
 const DEFAULT_FETCH_CHARS: u64 = 20_000;
 
 /// The most text one fetch may return. Above this the answer stops being a turn
 /// and becomes a document, and a document belongs in the archive rather than in
 /// the conversation.
+// cap: bound
 const MAX_FETCH_CHARS: u64 = 200_000;
 
 /// Bytes one page may transfer. Below the point where a single turn is worth
 /// anything, the page cannot be read anyway; above it, an accidental video or
 /// an infinite stream costs the pod's memory before extraction ever runs.
+// cap: bound
 const MAX_DOWNLOAD_BYTES: usize = 5 * 1024 * 1024;
 
 /// How long one fetch may take, headers included. A page that has not started
 /// answering in this window is not going to make the turn useful.
+// cap: bound
 const FETCH_TIMEOUT_SECS: u64 = 30;
 
 /// How long one search may take. The metasearch fan-out answers from several
 /// engines at once and waits for the slowest; this is the point past which the
 /// slowest is not worth the turn.
+// cap: bound
 const SEARCH_TIMEOUT_SECS: u64 = 20;
 
 /// How many times a search whose engines all stayed silent is asked again.
@@ -72,6 +79,7 @@ const SEARCH_TIMEOUT_SECS: u64 = 20;
 /// answers the next request, while a non-200 or a body that is not JSON is a
 /// verdict about the request itself and asking again returns the same verdict
 /// for the same wait.
+// cap: bound
 const SEARCH_ATTEMPTS: u32 = 2;
 
 /// The environment variable that names the SearXNG base URL.
@@ -109,6 +117,7 @@ pub const WEB_FETCH_BASE_ENV: &str = "COGNEVA_WEB_FETCH_BASE";
 
 /// How long one rendered fetch may take. A browser has to start, load, run the
 /// page's scripts and settle; the in-process deadline would cut that short.
+// cap: bound
 const RENDER_TIMEOUT_SECS: u64 = 60;
 
 /// How long one rendered page stays servable out of the backend's own cache.
@@ -132,6 +141,7 @@ const RENDER_CACHE_SECS: u64 = RENDER_TIMEOUT_SECS;
 /// from a warm one and usually returns the page. Only a 5xx is repeated: a 4xx
 /// is a verdict about this URL and repeating it costs the caller the same wait
 /// for the same answer.
+// cap: bound
 const RENDER_ATTEMPTS: u32 = 2;
 
 fn encode_component(value: &str) -> String {

@@ -336,8 +336,10 @@ impl cog_core::UserStore for InMemoryUserStore {
 
 /// Failed-login attempts allowed per identifier inside the window before
 /// the endpoint answers 429.
+// cap: bound
 pub const LOGIN_MAX_ATTEMPTS: u32 = 5;
 /// Sliding window (seconds) for failed-login counting.
+// cap: bound
 pub const LOGIN_WINDOW_SECONDS: u64 = 300;
 
 /// Rate-limits failed login attempts per identifier.

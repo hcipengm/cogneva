@@ -256,6 +256,7 @@ pub fn differing_lines(diff: &str) -> usize {
 ///
 /// 这不是一个调出来的数，而是 `DiffOutcome::Differs` 的含义本身——"至少一处"，
 /// 所以它不需要从哪次实测导出，名字就是它的出处。
+// cap: bound
 const AT_LEAST_ONE_DIFFERENCE: usize = 1;
 
 /// 一个 `Differs` 文件的读数：`(值, 这次读数是不是没解出来)`。
@@ -461,6 +462,7 @@ fn rev12(rev: &str) -> String {
 
 /// 日志里一段文本的字符上限。界挂在**字符数**上而不是行数上：一行可以很长，
 /// 按行截断等于没有上界（`kubectl diff` 的对象正文就是单行 JSON 拼出来的）。
+// cap: bound
 const DIFF_LOG_CHARS: usize = 2000;
 
 /// 截断到 `max` 个字符，截断时留一个尾巴让读的人知道后面还有。

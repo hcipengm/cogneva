@@ -112,6 +112,7 @@ pub(crate) async fn clear_stale_git_lock(lock: &Path, max_age: Duration) -> bool
 
 /// 临时工作树默认存活上限。要容得下一整轮演进：属主 pid 是 Pod 进程号，
 /// 同一进程内永远"活着"，存活时长才是唯一的兜底判据。
+// cap: bound
 pub const DEFAULT_EPHEMERAL_TTL: Duration = Duration::from_secs(21600);
 
 /// 回收"实例身份已轮换"遗留工作树的最小存活时长。滚动更新期间新旧 Pod 可能
@@ -121,6 +122,7 @@ pub const DEFAULT_EPHEMERAL_TTL: Duration = Duration::from_secs(21600);
 /// 旧 Pod 必须已经释放卷，实际重叠窗口接近零；这个值只防御将来换成 RWX 或
 /// RollingUpdate 的情形，取默认终止宽限期的若干倍即可，不能取大——取值越大，
 /// 重启越频繁时遗留树越可能永远躲过回收。
+// cap: bound
 pub const ORPHAN_MIN_AGE: Duration = Duration::from_secs(900);
 
 /// 部署器独占那棵稳定工作树的 id。
