@@ -1,181 +1,350 @@
-//! Guards the contract layer boundary.
+//! Gate: the contract layer's boundary, read off the crate instead of a table.
 //!
-//! `cog-core` defines traits and cross-crate types; concrete storage drivers
-//! belong to `cog-storage`. Depending on `sqlx`/`redis` there would force every
-//! consumer of the contracts to link a driver, so the boundary is asserted
-//! rather than left to review.
+//! `cog-core` is where the *shape* of what crosses between crates lives: the
+//! traits and the types. Everything else -- the loop that runs, the file that is
+//! written, the row that is read -- belongs to the crate that owns that job.
+//! "Contracts, not business" cannot be read off the source directly, because
+//! what counts as business is a judgement. Two of its consequences can, and they
+//! are what this file asserts.
 //!
-//! The driver ban is the sharp end of a larger claim: the base crate is where
-//! the *shape* of what crosses between crates lives, and everything else -- the
-//! loop that runs, the file that is written, the row that is read -- belongs to
-//! the crate that owns that job. That claim cannot be read off the source (what
-//! counts as business is a judgement), but the first step toward breaking it
-//! can: a new dependency on the base, or a new module in it. So both are frozen
-//! the same way the edge graph is frozen -- a name the table does not carry
-//! fails the build, and a name whose entry is gone fails too -- and the reason
-//! beside each row is what makes "it is only a small helper" a sentence
-//! somebody had to write down.
+//! First, the base is supposed to get smaller: every dependency it declares has
+//! to be named in its own sources. A dependency nobody names is weight every
+//! crate that links the base pays for, and it is the shape a "just in case"
+//! addition takes. This rule found four (`toml` and `zstd` on the shipped side,
+//! `tokio-test` and `filetime` on the dev side), declared and never written.
 //!
-//! Two dependencies were removed rather than listed when this table was
-//! written: `toml` and `zstd` were declared and never named in a single source
-//! file. That is the other direction of the same rule -- the base crate is
-//! supposed to get smaller, and a dependency nobody uses is weight every
-//! consumer of the contracts links for nothing.
+//! Second, an *act* in the base has to be earning its place. A module that opens
+//! files, spawns, opens a socket or keeps shared mutable state does work, and
+//! work belongs to the crate that performs it -- with one structural exception:
+//! a crate other than the assembly may depend on the base and nothing else, so a
+//! mechanism that two crates need has no other home that does not become a
+//! sideways edge. So the count is the argument. A mechanism reached by two or
+//! more crates outside the base is shared by construction; one reached by fewer
+//! belongs in the crate that reaches it, and the failure names that crate.
 //!
-//! This gate lives here rather than under `crates/cog-core/tests/` because its
-//! subject is the workspace's layering, not anything inside the base crate: the
-//! base is the crate that is supposed to stop changing, and adding a test
-//! directory to it makes every future boundary question a commit to the crate
-//! nobody is supposed to touch. The workspace-level gates already live in this
-//! crate -- `crate_dependency_contract_test` walks the same graph from the same
-//! side -- so the two read as one picture here, and the base crate keeps no
-//! test target of its own.
+//! Both were tables before this, one row per dependency and one per module, each
+//! with a reason beside it. The reasons were worth writing -- that is where the
+//! rule got sharpened -- but a copy of the crate kept by hand drifts from the
+//! crate, and the drift is silent in the one direction that matters: the table
+//! says what a human believed, the source says what is there. These rules read
+//! the source.
+//!
+//! The scanner is the part that has to be trusted, so the things that make a
+//! naive search lie are removed before anything is counted: comments and string
+//! literals are blanked (`lex::blank`), and the `#[cfg(test)]` half of a file is
+//! dropped (`production_text`) -- a marker in a doc comment or in a test module
+//! is not a call, and a module that only *mentions* `std::fs::` in prose is not
+//! doing anything. `the_marker_scan_separates_a_call_from_a_mention` pins that
+//! distinction on both polarities.
+//!
+//! Where this gate lives, and why not in the crate it measures: its subject is
+//! the workspace's layering, and the base is the crate that is supposed to stop
+//! changing. A test directory inside it would make every future boundary
+//! question a commit to that crate, and would add a test target to the one crate
+//! whose cost is paid by all twenty-six others.
 
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 mod common;
+
+use common::lex::{blank, Dialect};
+use common::rust_production::{
+    all_crate_files, production_sources, production_text, relative_name,
+};
 
 /// Where the base crate's sources sit relative to the workspace root.
 const BASE_SRC: &str = "crates/cog-core/src";
 /// The base crate's manifest, workspace-relative.
 const BASE_MANIFEST: &str = "crates/cog-core/Cargo.toml";
+/// The directory the base crate lives in, workspace-relative.
+const BASE_CRATE: &str = "crates/cog-core";
 
-/// The dependencies `cog-core` declares for the artifact it ships, and what each
-/// one is for.
+/// The storage drivers that must not appear in the base, in either section.
 ///
-/// The second column is not checked against anything -- it is here because a
-/// frozen list without reasons is a list somebody appends to. A row that cannot
-/// fill it in is a row that has not been thought about.
-const DEPENDENCIES: &[(&str, &str)] = &[
-    (
-        "async-trait",
-        "trait objects across an await point in the contracts",
-    ),
-    (
-        "base64",
-        "the payload encoding the stream and platform-sign contracts speak",
-    ),
-    ("blake3", "the digest both sides of an audit entry compute"),
-    ("bytes", "the frames the stream and storage contracts carry"),
-    ("chrono", "timestamps on the cross-crate types"),
-    ("futures", "the combinators the stream contracts hand back"),
-    (
-        "hmac",
-        "platform-sign: one rule for two processes, keys held apart",
-    ),
-    (
-        "jsonschema",
-        "validating against a schema the contracts carry themselves",
-    ),
-    (
-        "libc",
-        "the host's own numbers, which the admission and build-cache contracts name",
-    ),
-    ("regex", "the shapes the secret redactor recognises"),
-    ("schemars", "the JSON schemas the contract types derive"),
-    ("serde", "the derives on every cross-crate type"),
-    (
-        "serde_json",
-        "the wire form of those types and of the config body",
-    ),
-    ("sha2", "the digests governance acts and agent state carry"),
-    ("thiserror", "the contract error enums"),
-    (
-        "tokio",
-        "the async traits the contracts are defined against",
-    ),
-    (
-        "tracing",
-        "the spans the loop-health and observability contracts publish",
-    ),
-    ("uuid", "identifiers on the cross-crate types"),
+/// This is a rule rather than a derivation: nothing about the tree says a driver
+/// is different from any other dependency. It is here because the consequence is
+/// structural -- a driver in the base is linked into every consumer of the
+/// contracts, so a crate that only wanted a trait gets the driver's whole world
+/// (a connection pool, a runtime, a TLS stack) whether it asked for it or not.
+const DRIVERS: &[&str] = &["sqlx", "redis"];
+
+/// How many crates outside the base have to reach a mechanism before it earns
+/// its way into the base.
+///
+/// Two, and the number comes from the layering rather than from taste: a crate
+/// other than the assembly can reach the base and nothing else, so sharing an
+/// act between two components means putting it here. One consumer has a home --
+/// its own crate -- and moving a one-crate mechanism out is exactly the
+/// direction the base is supposed to shrink in.
+const SHARED: usize = 2;
+
+/// A census that read fewer modules than this has gone wrong, and the rule below
+/// would pass over the empty set.
+const MIN_MODULES: usize = 20;
+
+/// What makes a module an act.
+///
+/// Each name is something a trait or a type cannot do: read or write a file,
+/// start a process, open a socket, spawn a task, keep state that outlives the
+/// call. The list is short on purpose -- every entry on it is a decision that a
+/// module containing it is doing work, and an entry that stops being decisive is
+/// a false failure somebody has to argue with.
+const ACTS: &[&str] = &[
+    "std::fs::",
+    "std::process::",
+    "std::net::",
+    "std::thread::spawn",
+    "tokio::spawn",
+    "Command::new",
+    "OnceLock",
+    "std::sync::Mutex",
+    "std::sync::RwLock",
+    "std::sync::atomic",
 ];
 
-/// What a top-level module in the base crate is allowed to be.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
-    /// A contract: traits and types other crates describe their work with.
-    Contract,
-    /// A name, a constant or a pure reading of one -- vocabulary several crates
-    /// spell the same way. Nothing is read, written or decided here.
-    Vocabulary,
-    /// An act: it opens a file, spawns, queries a store, or keeps state. These
-    /// are the rows a boundary argument is about.
-    Mechanism,
-}
-
-/// Every top-level module the base crate carries, what kind it is, and why it
-/// is there rather than in the crate whose work it is.
+/// The top-level modules the base's `lib.rs` declares, and the sources that make
+/// each one up.
 ///
-/// The boundary rule is "contracts, not business". That sentence cannot be
-/// checked directly -- what counts as business is a judgement -- but the thing
-/// that precedes every violation of it can: a module appears here. So the list
-/// is frozen the same way the dependency set is, and the third column is the
-/// question a `Mechanism` row has to answer out loud: *which crate owns this
-/// work, and why can it not live there?*
-///
-/// The honest answers today are two. Some mechanisms are read by most of the
-/// workspace (`loop_health` by thirteen crates, `paths` by sixteen); a crate
-/// other than `cogneva` may depend on `cog-core` and nothing else, so a shared
-/// act has no other home that does not become a sideways edge. The rest are
-/// waiting to move, and the rows say so.
-const MODULES: &[(&str, Kind, &str)] = &[
-    ("admission", Kind::Mechanism, "reads the host's own pressure; three crates read it and none of them owns the host"),
-    ("atomic_write", Kind::Mechanism, "replaces a file whole; four crates write files and they are not each other's dependents"),
-    ("audit", Kind::Contract, "the audit entry's shape and the chain both sides verify"),
-    ("build_cache", Kind::Contract, "the reading a build cache's size travels under"),
-    ("build_cache_readings", Kind::Mechanism, "reads the cache's layers; cog-reflection and cog-extension both do"),
-    ("build_cache_reclaim", Kind::Mechanism, "deletes what the plan in `contract` names; the only caller is this crate's own cache readings, so the seam between planning and deleting is inside one mechanism rather than across crates"),
-    ("claim_footprint", Kind::Mechanism, "walks a claim-backed directory; five crates read it under different names"),
-    ("config", Kind::Contract, "the configuration document every crate is handed"),
-    ("config_sections", Kind::Contract, "which parts of that document reach a process"),
-    ("contract", Kind::Contract, "the contracts themselves"),
-    ("day_key", Kind::Vocabulary, "the date form a day goes into a name with"),
-    ("env", Kind::Vocabulary, "the environment names the platform sets"),
-    ("error", Kind::Contract, "the error enum the contracts hand back"),
-    ("fs_size", Kind::Mechanism, "walks a directory tree for its bytes; three crates ask, one owns the tree"),
-    ("git_budget", Kind::Vocabulary, "how long a git command may run"),
-    ("loop_health", Kind::Mechanism, "the registry of loops; thirteen crates report into it"),
-    ("observability_text", Kind::Mechanism, "renders a reading as text; five crates publish that text"),
-    ("paths", Kind::Vocabulary, "where the image puts the process's own files"),
-    ("reading_cadence", Kind::Vocabulary, "how often an unchanged reading is written again"),
-    ("retention", Kind::Vocabulary, "how a 'how many days' knob is read"),
-    ("roles", Kind::Vocabulary, "the names the platform gives its workers"),
-    ("secrets", Kind::Mechanism, "secret providers and redaction; every crate logs through it"),
-    ("sql", Kind::Vocabulary, "quoting a name into SQL, and the two rulers for a relation"),
-    ("token_estimate", Kind::Vocabulary, "the chars-per-token ruler cog-agent and cog-memory both price text with; pure arithmetic over the text it is handed, and two copies would be two units"),
-    ("topology", Kind::Vocabulary, "the names a deployment gives its workloads"),
-    ("types", Kind::Contract, "the cross-crate types"),
-    ("vocabulary", Kind::Vocabulary, "filling a query template's slots"),
-];
-
-/// The top-level modules the base crate's `lib.rs` declares.
-fn modules() -> BTreeSet<String> {
+/// A module is a declaration ending in `;`; the `pub mod agent { .. }` form
+/// re-exports a contract that is already above it and is not a module of its
+/// own. A module's sources are its `X.rs` or `X/mod.rs` plus everything under
+/// `X/`, read from the tree: the rule below is about what the compiler actually
+/// builds.
+fn modules(root: &Path) -> BTreeMap<String, Vec<PathBuf>> {
     let lib = common::routes::read_repo(&format!("{BASE_SRC}/lib.rs"));
-    lib.lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            // A declaration ends in `;`. The alias modules below are written
-            // `pub mod agent {` and re-export a contract that is already above
-            // them, so they are not modules of their own.
-            let rest = line.strip_prefix("pub mod ")?.strip_suffix(';')?;
-            Some(rest.trim().to_owned())
-        })
-        .collect()
+    let src = root.join(BASE_SRC);
+    let mut out = BTreeMap::new();
+    for line in lib.lines() {
+        let line = line.trim();
+        let Some(rest) = line
+            .strip_prefix("pub mod ")
+            .and_then(|rest| rest.strip_suffix(';'))
+        else {
+            continue;
+        };
+        let name = rest.trim();
+        let mut files = Vec::new();
+        for candidate in [
+            src.join(format!("{name}.rs")),
+            src.join(name).join("mod.rs"),
+        ] {
+            if candidate.is_file() {
+                files.push(candidate);
+            }
+        }
+        let nested = src.join(name);
+        if nested.is_dir() {
+            common::routes::walk(&nested, &["rs"], &mut files);
+        }
+        files.sort();
+        files.dedup();
+        out.insert(name.to_owned(), files);
+    }
+    out
 }
 
-/// The section names in a manifest whose entries are dependencies, and the
-/// table each one is frozen against.
+/// One module's code, with the two things that make a naive search lie removed.
 ///
-/// Only `[dependencies]` has a table today: a dev dependency is not linked into
-/// anything shipped, so it cannot hand another crate's consumer a driver.
-const FROZEN_SECTIONS: &[&str] = &["dependencies"];
+/// Comments and string literals are blanked rather than deleted, because the
+/// question here is a presence question and offsets do not matter; the
+/// `#[cfg(test)]` half is dropped, because a test module's call is not the
+/// crate's behaviour.
+fn code_of(files: &[PathBuf]) -> String {
+    files
+        .iter()
+        .map(|path| {
+            let raw =
+                std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            blank(&production_text(&raw), Dialect::Rust)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
-/// The keys declared in `[section]` of a manifest body.
+/// No identifier character immediately before `at`.
+fn starts_a_word(text: &str, at: usize) -> bool {
+    text[..at]
+        .chars()
+        .next_back()
+        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+}
+
+/// No identifier character immediately after `at`.
+fn ends_a_word(text: &str, at: usize) -> bool {
+    text[at..]
+        .chars()
+        .next()
+        .is_none_or(|c| !(c.is_alphanumeric() || c == '_'))
+}
+
+/// Whether `text` names `path` as a whole path.
 ///
-/// Deliberately a line reader over the section rather than a TOML parser: this
-/// gate has no business adding a parser to the workspace to read four sections,
+/// `crate::types` must not be found inside `crate::types_extra` or in
+/// `my_crate::types`: every count in this file is a count of crates, and a
+/// prefix or suffix match would let one module's consumers pay for another's.
+fn names_path(text: &str, path: &str) -> bool {
+    let mut from = 0;
+    while let Some(at) = text[from..].find(path) {
+        let start = from + at;
+        if starts_a_word(text, start) && ends_a_word(text, start + path.len()) {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Whether `text` writes `<crate>::` -- a dependency earning its place.
+///
+/// Only the boundary in front is checked: the needle ends at a `::`, so what
+/// follows it is the item the dependency is being used for, and that is always
+/// an identifier.
+fn uses_crate(text: &str, dependency: &str) -> bool {
+    let needle = format!("{}::", dependency.replace('-', "_"));
+    let mut from = 0;
+    while let Some(at) = text[from..].find(&needle) {
+        let start = from + at;
+        if starts_a_word(text, start) {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// The public names a module declares, so a crate that uses
+/// `cog_core::<name>` can be attributed to the module the name lives in.
+///
+/// Needed because half the base is reached through `lib.rs`'s re-exports
+/// (`pub use secrets::redact_secrets`) rather than through the module path, and
+/// a gate that only understood `cog_core::<module>` would read those consumers
+/// as zero and fail a module that is in fact used everywhere.
+fn declared_names(code: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for line in code.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("pub ") else {
+            continue;
+        };
+        if let Some(body) = rest.strip_prefix("use ") {
+            for part in body.trim_end_matches(';').split([',', '{', '}']) {
+                let part = part.trim();
+                let part = part.rsplit("::").next().unwrap_or_default();
+                let name = part.split(" as ").last().unwrap_or_default().trim();
+                if is_ident(name) {
+                    out.insert(name.to_owned());
+                }
+            }
+            continue;
+        }
+        for keyword in [
+            "fn ", "struct ", "enum ", "trait ", "type ", "const ", "static ", "mod ",
+        ] {
+            if let Some(rest) = rest.strip_prefix(keyword) {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if is_ident(&name) {
+                    out.insert(name);
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn is_ident(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_alphabetic() || c == '_')
+        && chars.all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// The workspace's crate directories, and the production code of each.
+///
+/// Production only: a `cog_core::` call in a test module does not make the base
+/// shared -- the crate that ships without the test does not reach it.
+fn consumer_code(root: &Path) -> BTreeMap<String, String> {
+    let mut out: BTreeMap<String, String> = BTreeMap::new();
+    for path in production_sources(root) {
+        let name = relative_name(root, &path);
+        let parts: Vec<&str> = name.split('/').collect();
+        let (Some("crates"), Some(dir)) = (parts.first().copied(), parts.get(1).copied()) else {
+            continue;
+        };
+        if dir == "cog-core" {
+            continue;
+        }
+        let raw =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let code = blank(&production_text(&raw), Dialect::Rust);
+        out.entry(dir.to_owned()).or_default().push_str(&code);
+    }
+    out
+}
+
+/// The modules a piece of code reaches through `cog_core`, by module name or by
+/// the name of something one of them declares.
+///
+/// Three spellings have to be read, and they are all live: `cog_core::error`
+/// (the module), `cog_core::SFError::Config(..)` (an item), and
+/// `use cog_core::{SFError, SFResult}` (a brace list, which is how half the
+/// workspace writes it). Missing the third would read a module that every crate
+/// uses as one nothing reaches, and the failure would point at the module
+/// instead of the scan.
+fn referenced_modules(
+    code: &str,
+    modules: &BTreeSet<String>,
+    owners: &BTreeMap<String, BTreeSet<String>>,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    let mut attribute = |name: &str, out: &mut BTreeSet<String>| {
+        if modules.contains(name) {
+            out.insert(name.to_owned());
+        }
+        if let Some(declared_by) = owners.get(name) {
+            out.extend(declared_by.iter().cloned());
+        }
+    };
+    let mut from = 0;
+    while let Some(at) = code[from..].find("cog_core::") {
+        let start = from + at + "cog_core::".len();
+        if code[start..].starts_with('{') {
+            // A brace list: `{SFError, SFResult}`, `{error::SFError}`, or a
+            // nested `{contract::{types, ids}}`. Each entry is attributed to the
+            // module that declares its last segment; `self` and `*` name no
+            // item, and a glob is read as no evidence rather than as everything
+            // -- undercounting a consumer makes this rule quieter, overcounting
+            // would make it lie about a module being shared.
+            let body_end =
+                common::routes::matching_brace(code, start, Dialect::Rust).unwrap_or(code.len());
+            for entry in code[start + 1..body_end].split(',') {
+                let last = entry.trim().rsplit("::").next().unwrap_or_default().trim();
+                if is_ident(last) {
+                    attribute(last, &mut out);
+                }
+            }
+            from = body_end.max(start);
+            continue;
+        }
+        let name: String = code[start..]
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        if !name.is_empty() {
+            attribute(&name, &mut out);
+        }
+        from = start.max(from + at + 1);
+    }
+    out
+}
+
+/// The section names in a manifest whose entries are dependencies.
+///
+/// Deliberately a line reader over the manifest rather than a TOML parser: this
+/// gate has no business adding a parser to the workspace to read two sections,
 /// and the question -- which names are declared here -- does not need one.
 fn declared(manifest: &str, section: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -183,8 +352,6 @@ fn declared(manifest: &str, section: &str) -> BTreeSet<String> {
     for line in manifest.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            // Headings carry their brackets: `[dependencies]` is the section
-            // named `dependencies`.
             inside = trimmed.trim_start_matches('[').trim_end_matches(']').trim() == section;
             continue;
         }
@@ -198,162 +365,384 @@ fn declared(manifest: &str, section: &str) -> BTreeSet<String> {
     out
 }
 
-/// Every `.rs` the base crate compiles from `src/`.
+/// The base crate's `[dependencies]` and `[dev-dependencies]`, and the code each
+/// one is checked against.
 ///
-/// The shared walk, not a local copy of it: a copy that returns quietly when a
-/// directory cannot be read reports "no forbidden name found" over a slice it
-/// never opened, which is the same reading as a crate that is clean.
-fn sources() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    common::routes::walk(&common::root::repo_root().join(BASE_SRC), &["rs"], &mut out);
-    out
+/// The shipped side is checked against the production half only: that is the
+/// code the dependency is linked for. The dev side is checked against everything
+/// under the crate, because that is where a dev dependency is used -- a name in
+/// a test module is the dependency earning its place.
+fn code_for(root: &Path, shipped: bool) -> String {
+    if shipped {
+        let mut files = Vec::new();
+        common::routes::walk(&root.join(BASE_SRC), &["rs"], &mut files);
+        files.sort();
+        code_of(&files)
+    } else {
+        let mut code = String::new();
+        for path in all_crate_files(root) {
+            if !relative_name(root, &path).starts_with(&format!("{BASE_CRATE}/")) {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            code.push_str(&blank(&raw, Dialect::Rust));
+            code.push('\n');
+        }
+        code
+    }
+}
+
+/// The census read the crate, so the rules below are not passing over nothing.
+#[test]
+fn the_census_reads_the_crate() {
+    let root = common::root::repo_root();
+    let modules = modules(&root);
+    assert!(
+        modules.len() >= MIN_MODULES,
+        "read {} modules out of `{BASE_SRC}/lib.rs` (floor {MIN_MODULES}): the \
+         declaration scan is lying, and every rule below would be measuring a \
+         module set that does not exist",
+        modules.len()
+    );
+    for (name, files) in &modules {
+        assert!(
+            !files.is_empty(),
+            "`lib.rs` declares `{name}` but no source was found for it: a module \
+             whose code could not be read is classified as doing nothing, which \
+             is the reading a broken scan and a clean module share"
+        );
+    }
+    assert!(
+        !consumer_code(&root).is_empty(),
+        "no crate outside the base was read: every mechanism would the count \
+         zero consumers and the rule would pass by measuring nothing"
+    );
 }
 
 #[test]
 fn core_does_not_depend_on_storage_drivers() {
     let manifest = common::routes::read_repo(BASE_MANIFEST);
-    let declared = declared(&manifest, "dependencies");
-    for banned in ["sqlx", "redis"] {
-        assert!(
-            !declared.contains(banned),
-            "cog-core must not depend on `{banned}`; storage drivers live in cog-storage"
-        );
+    for section in ["dependencies", "dev-dependencies"] {
+        let declared = declared(&manifest, section);
+        for banned in DRIVERS {
+            assert!(
+                !declared.contains(*banned),
+                "cog-core must not depend on `{banned}` in [{section}]; storage \
+                 drivers live in cog-storage, and a driver in the base is linked \
+                 into every crate that only wanted a trait"
+            );
+        }
     }
 }
 
 #[test]
 fn core_sources_do_not_name_storage_drivers() {
-    let files = sources();
+    let root = common::root::repo_root();
+    let mut files = Vec::new();
+    common::routes::walk(&root.join(BASE_SRC), &["rs"], &mut files);
     assert!(
         !files.is_empty(),
         "no sources found under {BASE_SRC} -- this gate is measuring nothing"
     );
     for path in files {
         let src = std::fs::read_to_string(&path).expect("source file is readable");
-        for banned in ["sqlx::", "redis::"] {
+        for banned in DRIVERS {
+            let needle = format!("{banned}::");
             assert!(
-                !src.contains(banned),
-                "cog-core sources must not reference `{banned}` ({})",
+                !src.contains(&needle),
+                "cog-core sources must not reference `{needle}` ({})",
                 path.display()
             );
         }
     }
 }
 
-/// A dependency the table does not name fails, so the base cannot grow quietly.
+/// Every declared dependency is a name the crate writes.
+///
+/// This is the rule that keeps the base shrinking: a dependency nobody names is
+/// weight every consumer links for nothing, and adding one is a one-line diff
+/// nobody reviews. The failure asks for one of two things -- name it in the code
+/// that needs it, or drop it -- and both are visible in the same commit.
 #[test]
-fn a_new_dependency_is_not_in_the_table() {
+fn every_declared_dependency_is_named_in_the_crate() {
+    let root = common::root::repo_root();
     let manifest = common::routes::read_repo(BASE_MANIFEST);
-    let table: BTreeSet<&str> = DEPENDENCIES.iter().map(|(name, _)| *name).collect();
-    for section in FROZEN_SECTIONS {
-        let declared = declared(&manifest, section);
-        let fresh: Vec<&String> = declared
-            .iter()
-            .filter(|name| !table.contains(name.as_str()))
+    let mut unnamed = Vec::new();
+    for (section, shipped) in [("dependencies", true), ("dev-dependencies", false)] {
+        let code = code_for(&root, shipped);
+        for dependency in declared(&manifest, section) {
+            if !uses_crate(&code, &dependency) {
+                unnamed.push(format!("{dependency} (in [{section}])"));
+            }
+        }
+    }
+    assert!(
+        unnamed.is_empty(),
+        "the base declares dependencies its own sources never name: {}\n\
+         Everything in the workspace links what the base links, so a dependency \
+         here is a cost paid twenty-six times. A declared-and-unused dependency \
+         is the shape a 'just in case' addition takes: it compiles, it costs, and \
+         nothing ever breaks. Either the code that wants it is missing -- which is \
+         a feature nobody shipped -- or the line is, and it belongs in this \
+         commit's diff.",
+        unnamed.join(", ")
+    );
+}
+
+/// Which acting modules are reached by fewer than [`SHARED`] crates outside the
+/// base, and how many modules act at all.
+///
+/// Split out of the test that runs it on the tree so the judgement can be fed
+/// data no tree currently has: the shape of a module nobody outside the base
+/// calls is one the tree is supposed not to contain, so the only way to see the
+/// rule fire is to hand it that shape.
+fn lonely_mechanisms(
+    code: &BTreeMap<String, String>,
+    reached_by: &BTreeMap<String, BTreeSet<String>>,
+) -> (Vec<String>, usize) {
+    // What each module reaches inside the base: a `crate::<other>` path.
+    let references: BTreeMap<String, BTreeSet<String>> = code
+        .iter()
+        .map(|(name, text)| {
+            let reached = code
+                .keys()
+                .filter(|other| *other != name && names_path(text, &format!("crate::{other}")))
+                .cloned()
+                .collect();
+            (name.clone(), reached)
+        })
+        .collect();
+
+    // A module acts if it names one of the markers, or if it reaches a module
+    // that does: the act is inherited by whatever calls it. `build_cache_reclaim`
+    // is the live example -- it opens files, and the only thing that calls it is
+    // this crate's own readings, which three crates call.
+    let mut acts: BTreeSet<String> = code
+        .keys()
+        .filter(|name| ACTS.iter().any(|marker| code[*name].contains(marker)))
+        .cloned()
+        .collect();
+    loop {
+        let grew: Vec<String> = code
+            .keys()
+            .filter(|name| !acts.contains(*name))
+            .filter(|name| references[*name].iter().any(|other| acts.contains(other)))
+            .cloned()
             .collect();
-        assert!(
-            fresh.is_empty(),
-            "[{section}] grew dependencies the table does not name: {:?}\n\
-             Everything else in the workspace links what the base links, so a new \
-             dependency here is a cost paid by every crate and a step away from the \
-             base being contracts only. If it is right, add a row with the reason \
-             it cannot live in the crate that needs it; if it is not, the code that \
-             wants it belongs in that crate.",
-            fresh
-        );
+        if grew.is_empty() {
+            break;
+        }
+        acts.extend(grew);
     }
-}
 
-/// A row whose dependency is gone fails, so the table cannot drift above the manifest.
-#[test]
-fn a_dependency_the_table_names_is_still_declared() {
-    let manifest = common::routes::read_repo(BASE_MANIFEST);
-    let declared = declared(&manifest, "dependencies");
-    let stale: Vec<&&str> = DEPENDENCIES
-        .iter()
-        .map(|(name, _)| name)
-        .filter(|name| !declared.contains(**name))
+    // A module's reach is its own consumers plus the consumers of everything
+    // that reaches it: a mechanism only this crate's other modules call is still
+    // reached by whoever calls them. The edges point from a caller to what it
+    // calls, so the reach flows the other way -- a caller's consumers are its
+    // dependencies' consumers too.
+    let mut shared: BTreeMap<String, BTreeSet<String>> = code
+        .keys()
+        .map(|name| {
+            let own = reached_by.get(name).cloned().unwrap_or_default();
+            (name.clone(), own)
+        })
         .collect();
-    assert!(
-        stale.is_empty(),
-        "the table names dependencies the manifest no longer has: {:?}\n\
-         Delete the row in the commit that removed the dependency.",
-        stale
-    );
-}
-
-/// Every row says why, so the table cannot become a list somebody appends to.
-#[test]
-fn every_dependency_row_says_what_it_is_for() {
-    for (name, why) in DEPENDENCIES {
-        assert!(
-            !why.trim().is_empty(),
-            "{name} is frozen without a reason; the column is the difference \
-             between a decision and a row"
-        );
+    loop {
+        let mut grew = false;
+        for (module, dependencies) in &references {
+            let own = shared[module].clone();
+            for dependency in dependencies {
+                let entry = shared
+                    .get_mut(dependency)
+                    .expect("every module is measured");
+                let before = entry.len();
+                entry.extend(own.iter().cloned());
+                grew |= entry.len() != before;
+            }
+        }
+        if !grew {
+            break;
+        }
     }
-}
 
-/// A module the table does not name fails, so the base cannot grow a mechanism
-/// without a row that argues for it.
-#[test]
-fn a_new_module_is_not_in_the_table() {
-    let declared = modules();
-    let table: BTreeSet<&str> = MODULES.iter().map(|(name, _, _)| *name).collect();
-    let fresh: Vec<&String> = declared
+    let lonely: Vec<String> = acts
         .iter()
-        .filter(|name| !table.contains(name.as_str()))
+        .filter(|module| shared[*module].len() < SHARED)
+        .map(|module| {
+            let who: Vec<&str> = shared[module].iter().map(String::as_str).collect();
+            if who.is_empty() {
+                format!("{module}: no crate outside the base reaches it")
+            } else {
+                format!("{module}: reached by {}", who.join(", "))
+            }
+        })
         .collect();
-    assert!(
-        fresh.is_empty(),
-        "cog-core grew modules the table does not name: {:?}\n\
-         The base crate is where what crosses between crates is written down. A \
-         new module here is either a contract (say so, and put the shape under \
-         `contract`), a name several crates spell (a `Vocabulary` row), or work \
-         that belongs to the crate whose job it is -- and if it really is shared \
-         work, the `Mechanism` row has to name the crates that read it and why \
-         none of them can own it.",
-        fresh
-    );
+    (lonely, acts.len())
 }
 
-/// A row whose module is gone fails, so the table cannot drift above the crate.
+/// A mechanism in the base has to be reached by more than one crate.
 #[test]
-fn a_module_the_table_names_is_still_declared() {
-    let declared = modules();
-    let stale: Vec<&&str> = MODULES
+fn a_module_that_touches_the_machine_is_reached_by_more_than_one_crate() {
+    let root = common::root::repo_root();
+    let modules = modules(&root);
+    let code: BTreeMap<String, String> = modules
         .iter()
-        .map(|(name, _, _)| name)
-        .filter(|name| !declared.contains(**name))
+        .map(|(name, files)| (name.clone(), code_of(files)))
         .collect();
-    assert!(
-        stale.is_empty(),
-        "the table names modules `lib.rs` no longer declares: {:?}\n\
-         Delete the row in the commit that removed the module.",
-        stale
-    );
-}
-
-/// Every row says why it is here, so the table cannot become a list of names.
-#[test]
-fn every_module_row_says_why_it_is_here() {
-    for (name, kind, why) in MODULES {
-        assert!(
-            !why.trim().is_empty(),
-            "{name} is listed as {kind:?} without a reason; the column is what \
-             separates a decision from a row"
-        );
+    // Item name -> the modules that declare it, so a crate that names a
+    // re-exported item (`cog_core::SFError`) is attributed to the module the
+    // item lives in rather than to nobody.
+    let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (module, text) in &code {
+        for name in declared_names(text) {
+            owners.entry(name).or_default().insert(module.clone());
+        }
     }
-    // The mechanism count is the number this rule is trying to bring down. It is
-    // printed rather than asserted against a constant: a ceiling written here
-    // would be a number to raise, and the rows are the argument.
-    let mechanisms = MODULES
-        .iter()
-        .filter(|(_, k, _)| *k == Kind::Mechanism)
-        .count();
+    let module_names: BTreeSet<String> = modules.keys().cloned().collect();
+
+    // Who reaches each module, by crate directory outside the base.
+    let mut reached_by: BTreeMap<String, BTreeSet<String>> = modules
+        .keys()
+        .map(|name| (name.clone(), BTreeSet::new()))
+        .collect();
+    for (crate_dir, text) in consumer_code(&root) {
+        for module in referenced_modules(&text, &module_names, &owners) {
+            if let Some(set) = reached_by.get_mut(&module) {
+                set.insert(crate_dir.clone());
+            }
+        }
+    }
+
+    let (lonely, acting) = lonely_mechanisms(&code, &reached_by);
+    assert!(
+        lonely.is_empty(),
+        "modules in the base that do work nothing outside it shares:\n  {}\n\
+         A module that opens files, starts processes, opens sockets or keeps \
+         state is an act, and an act belongs to the crate that performs it. The \
+         one thing that can force an act into the base is being shared: a crate \
+         other than the assembly may depend on the base and nothing else, so a \
+         mechanism two or more crates need has no other home that does not become \
+         a sideways edge. These have fewer. Either move the code into the crate \
+         that reaches it -- the base is supposed to get smaller, and this is the \
+         direction it shrinks in -- or, if it really is shared, the consumer is \
+         not reaching it yet and that is the thing to fix.",
+        lonely.join("\n  ")
+    );
     println!(
-        "{mechanisms} of {} modules in cog-core are mechanisms; the rest are \
-         contracts and vocabulary",
-        MODULES.len()
+        "{acting} of {} modules in the base do work; the rest are shapes and names",
+        modules.len()
     );
+}
+
+/// The judgement counts reach, not names.
+///
+/// The tree is supposed not to contain a mechanism reached by fewer than two
+/// crates, so the rule above can only ever pass on it -- which is the same
+/// reading as a rule that cannot fail. These four shapes pin both polarities:
+/// the act nobody reaches, the act one crate reaches, the act two reach, and the
+/// act reached only through another module (which is the shape the cache reclaim
+/// has today).
+#[test]
+fn the_judgement_counts_reach_and_not_names() {
+    let code: BTreeMap<String, String> = [
+        ("actor", "pub fn f() { std::fs::read(\"/p\"); }"),
+        ("caller", "pub fn g() { crate::actor::f(); }"),
+        ("local", "pub fn h() { std::fs::write(\"/p\", \"\"); }"),
+        ("shape", "pub struct S;"),
+    ]
+    .into_iter()
+    .map(|(name, text)| (name.to_owned(), text.to_owned()))
+    .collect();
+
+    let reached = |pairs: &[(&str, &[&str])]| {
+        code.keys()
+            .map(|name| {
+                let crates = pairs
+                    .iter()
+                    .find(|(module, _)| module == name)
+                    .map(|(_, crates)| crates.iter().map(|c| (*c).to_owned()).collect())
+                    .unwrap_or_default();
+                (name.clone(), crates)
+            })
+            .collect::<BTreeMap<String, BTreeSet<String>>>()
+    };
+
+    // Two crates reach the caller, which is the only thing that reaches the
+    // actor; nothing reaches `local`; `shape` does not act and is not judged.
+    let (lonely, acting) = lonely_mechanisms(
+        &code,
+        &reached(&[("actor", &["cog-one"]), ("caller", &["cog-one", "cog-two"])]),
+    );
+    assert_eq!(
+        acting, 3,
+        "an act reached through another module was not counted as one"
+    );
+    assert_eq!(
+        lonely,
+        vec!["local: no crate outside the base reaches it".to_owned()],
+        "the judgement flagged the wrong modules: {lonely:?}"
+    );
+
+    // The same tree with the caller reached by one crate only: the actor now
+    // inherits the count of a single consumer, and both acts are flagged.
+    let (lonely, _) = lonely_mechanisms(
+        &code,
+        &reached(&[("actor", &["cog-one"]), ("caller", &["cog-one"])]),
+    );
+    assert_eq!(
+        lonely,
+        vec![
+            "actor: reached by cog-one".to_owned(),
+            "caller: reached by cog-one".to_owned(),
+            "local: no crate outside the base reaches it".to_owned(),
+        ],
+        "an act reached by one crate was not flagged: {lonely:?}"
+    );
+}
+
+/// The marker scan tells a call from a mention.
+///
+/// The rule above is a presence question over a projection of the source, so the
+/// projection is the thing that can be wrong: a scan that read comments would
+/// call a documented `std::fs::read` an act, and a scan that read string
+/// literals would call a logged one an act. Both polarities are pinned here,
+/// because a scanner that answered "no" to everything would make the rule above
+/// pass over every module in the crate.
+#[test]
+fn the_marker_scan_separates_a_call_from_a_mention() {
+    let call = "fn read_it() -> std::io::Result<()> { std::fs::read(\"/p\")?; Ok(()) }";
+    assert!(
+        ACTS.iter()
+            .any(|marker| blank(call, Dialect::Rust).contains(marker)),
+        "a real call was not read as an act: the scan is answering no to \
+         everything, and the boundary rule above is vacuous"
+    );
+    let comment = "/// Reads `std::fs::read` for the caller.\nfn read_it() {}";
+    assert!(
+        !ACTS
+            .iter()
+            .any(|marker| blank(comment, Dialect::Rust).contains(marker)),
+        "a path inside a doc comment was read as an act"
+    );
+    let literal = "fn name() -> &'static str { \"std::fs::read\" }";
+    assert!(
+        !ACTS
+            .iter()
+            .any(|marker| blank(literal, Dialect::Rust).contains(marker)),
+        "a path inside a string literal was read as an act"
+    );
+    let fixture =
+        "fn f() {}\n#[cfg(test)]\nmod tests {\n    fn t() { std::fs::read(\"/p\").ok(); }\n}\n";
+    assert!(
+        !ACTS
+            .iter()
+            .any(|marker| code_of_text(fixture).contains(marker)),
+        "a call in a test module was read as the crate's behaviour"
+    );
+}
+
+/// [`code_of`]'s two projections, over text instead of a file.
+fn code_of_text(text: &str) -> String {
+    blank(&production_text(text), Dialect::Rust)
 }

@@ -1459,7 +1459,6 @@ dependencies = [
  "blake3",
  "bytes",
  "chrono",
- "filetime",
  "futures",
  "hmac 0.12.1",
  "jsonschema",
@@ -1472,7 +1471,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-test",
  "tracing",
  "uuid",
 ]

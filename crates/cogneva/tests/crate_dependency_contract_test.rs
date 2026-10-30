@@ -1,4 +1,4 @@
-//! Gate: the workspace's crate graph may only shrink, never grow.
+//! Gate: the shape of the workspace's crate graph, derived rather than listed.
 //!
 //! The dependency direction between crates is the one rule nothing else can
 //! check. `cargo` accepts any acyclic edge, so a crate can reach sideways or
@@ -8,166 +8,90 @@
 //! `Cargo.toml` that no reviewer reads, added while solving a problem in a
 //! different crate entirely.
 //!
-//! Freezing is the whole mechanism. `ALLOWED` is the graph as it stands: every
-//! workspace-to-workspace edge is a row, and a build that has an edge the table
-//! does not name fails. So a new edge is not forbidden by a rule about *which*
-//! edges are bad -- it is forbidden because it is new, and adding it means
-//! writing the row that says so. The same table is a ceiling in the other
-//! direction: a row whose edge is gone fails too, so the table cannot quietly
-//! grow stale while the graph underneath it shrinks. Removing an edge and
-//! removing its row are one act, and the diff proves it.
+//! This gate used to freeze the graph: every edge it had was a row of a table,
+//! every crate a row of another. A freeze is honest but it is also a second
+//! copy of the graph, kept by hand, and its failure mode is the one every copy
+//! has -- a row stops describing the thing it names while both look fine. The
+//! table was replaced by the shape the rows were approximating, read out of
+//! `cargo metadata` on every run: the whole graph, the crates that are programs,
+//! and who links what into a shipped artifact. Nothing here lists a crate or an
+//! edge; adding one without a change of shape is not possible, because there is
+//! nothing to add it to.
 //!
-//! Dev dependencies are a second table rather than a column, because they are a
-//! different claim: a dev dependency is not linked into anything shipped, so
-//! folding the two would let an edge move from dev to normal without changing
-//! the table -- which is the one direction that matters.
+//! Three sentences, each a test:
 //!
-//! `replace_with` is the route out. A row that carries it names what the
-//! consumer is expected to reach instead; an empty one says the edge is accepted
-//! as it stands and nobody has planned a replacement. It is not checked against
-//! the code, because the shape of the replacement is a design decision -- but a
-//! row cannot be deleted without the edge going first, so the column has a
-//! reader every time somebody shrinks the graph.
+//! 1. a crate other than the assembly reaches the base and nothing else;
+//! 2. a dev edge may only point at a crate nothing ships;
+//! 3. a crate is either a program or something else in the workspace depends on.
+//!
+//! They are the same three the tables encoded, minus their upkeep. The second is
+//! where the fixture crate's exemption lives, and it is worth being exact about
+//! why that is not a list with one name on it: the property that admits a dev
+//! edge is "nothing links this crate into a shipped artifact", which is derived
+//! from the normal edges and can be re-checked against the graph by hand. A
+//! crate that starts shipping stops qualifying in the same commit that makes it
+//! ship, without anyone remembering to update a table.
 
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::process::Command;
 
-/// One accepted edge: `(consumer, dependency, route out)`.
-///
-/// Names are package names, so a rename in `Cargo.toml` fails the table rather
-/// than silently matching a different crate.
-type Row = (&'static str, &'static str, &'static str);
-
-/// Every workspace-to-workspace edge linked into something shipped.
-const ALLOWED: &[Row] = &[
-    ("cog-agent", "cog-core", ""),
-    ("cog-auth", "cog-core", ""),
-    ("cog-collaboration", "cog-core", ""),
-    ("cog-eval", "cog-core", ""),
-    ("cog-extension", "cog-core", ""),
-    ("cog-gateway", "cog-core", ""),
-    ("cog-github", "cog-core", ""),
-    ("cog-guardrail", "cog-core", ""),
-    ("cog-llm", "cog-core", ""),
-    ("cog-memory", "cog-core", ""),
-    ("cog-net", "cog-core", ""),
-    ("cog-notification", "cog-core", ""),
-    ("cog-observability", "cog-core", ""),
-    ("cog-orchestrator", "cog-core", ""),
-    ("cog-prompt", "cog-core", ""),
-    ("cog-protocol", "cog-core", ""),
-    ("cog-quota", "cog-core", ""),
-    ("cog-reflection", "cog-core", ""),
-    ("cog-skill", "cog-core", ""),
-    ("cog-storage", "cog-core", ""),
-    ("cog-stream", "cog-core", ""),
-    ("cog-supervisor", "cog-core", ""),
-    // The fixture runner implements a core contract, so the fixture crate names
-    // core like everything else. Its edge into core is architecture rather than
-    // debt, and it is listed here because this table is the whole graph.
-    ("cog-test-support", "cog-core", ""),
-    ("cog-wiki", "cog-core", ""),
-    ("cogneva", "cog-agent", ""),
-    ("cogneva", "cog-auth", ""),
-    ("cogneva", "cog-collaboration", ""),
-    ("cogneva", "cog-core", ""),
-    ("cogneva", "cog-eval", ""),
-    ("cogneva", "cog-extension", ""),
-    ("cogneva", "cog-gateway", ""),
-    ("cogneva", "cog-github", ""),
-    ("cogneva", "cog-guardrail", ""),
-    ("cogneva", "cog-llm", ""),
-    ("cogneva", "cog-memory", ""),
-    ("cogneva", "cog-net", ""),
-    ("cogneva", "cog-notification", ""),
-    ("cogneva", "cog-observability", ""),
-    ("cogneva", "cog-orchestrator", ""),
-    ("cogneva", "cog-prompt", ""),
-    ("cogneva", "cog-protocol", ""),
-    ("cogneva", "cog-quota", ""),
-    ("cogneva", "cog-reflection", ""),
-    ("cogneva", "cog-skill", ""),
-    ("cogneva", "cog-storage", ""),
-    ("cogneva", "cog-stream", ""),
-    ("cogneva", "cog-supervisor", ""),
-    ("cogneva", "cog-wiki", ""),
-    ("cogneva-bootstrap", "cog-core", ""),
-];
-
-/// The same, for dependencies only tests link.
-const ALLOWED_DEV: &[Row] = &[
-    // Fixture support: the in-memory backends and the "which PostgreSQL, and
-    // does an unset one stop or skip" reading. Nothing shipped links this
-    // crate, so the edges are dev-only. They point at core contracts rather
-    // than at the crate that ships a backend: a double owned by a production
-    // crate turns another crate's test red when that crate changes its rules,
-    // and the failure is reported where nothing about it was being tested.
-    ("cog-agent", "cog-test-support", ""),
-    ("cog-github", "cog-test-support", ""),
-    ("cog-memory", "cog-test-support", ""),
-    ("cog-orchestrator", "cog-test-support", ""),
-    ("cog-reflection", "cog-test-support", ""),
-    ("cog-observability", "cog-test-support", ""),
-    ("cog-storage", "cog-test-support", ""),
-    ("cog-stream", "cog-test-support", ""),
-    ("cogneva", "cog-test-support", ""),
-];
-
-/// Every crate the workspace has, by package name.
-///
-/// The edge table above governs the edges that *exist*; it says nothing about a
-/// crate that has none. A new crate with no workspace dependency is invisible to
-/// both of that table's assertions -- it adds no edge to be fresh and none to go
-/// stale -- and that is exactly the shape a "just one small crate" takes: a
-/// manifest, a `src/`, and nothing the graph can see. The skeleton is settled;
-/// after that a crate is a whole-tree cost paid by everything that rebuilds, and
-/// the split it proposes is a decision nobody made.
-///
-/// This is the same freeze in the other dimension. A crate the table does not
-/// name fails the build, and a name whose crate is gone fails too, so the table
-/// cannot drift above the workspace any more than the edge table can drift above
-/// the graph. Adding a crate is not forbidden by a rule -- it is impossible to do
-/// quietly, because it cannot happen without a diff to this list.
-const MEMBERS: &[&str] = &[
-    "cog-agent",
-    "cog-auth",
-    "cog-collaboration",
-    "cog-core",
-    "cog-eval",
-    "cog-extension",
-    "cog-gateway",
-    "cog-github",
-    "cog-guardrail",
-    "cog-llm",
-    "cog-memory",
-    "cog-net",
-    "cog-notification",
-    "cog-observability",
-    "cog-orchestrator",
-    "cog-prompt",
-    "cog-protocol",
-    "cog-quota",
-    "cog-reflection",
-    "cog-skill",
-    "cog-storage",
-    "cog-stream",
-    "cog-supervisor",
-    "cog-test-support",
-    "cog-wiki",
-    "cogneva",
-    "cogneva-bootstrap",
-];
-
-/// The crate everything else may depend on, and which depends on nothing here.
+/// The crate every other crate may reach, and which reaches nothing here.
 const BASE: &str = "cog-core";
+
+/// The crate whose job is to put the others together.
+///
+/// One exception, named once. It is the assembly: the process that hands each
+/// crate its work and the only place the pieces are allowed to meet. Everything
+/// else is a component, and a component that reaches another component has
+/// become a library with two names -- every change to one is a change to the
+/// other, and every rebuild of one rebuilds both.
+const ASSEMBLY: &str = "cogneva";
+
+/// A census that read fewer crates than this has gone wrong, and every rule
+/// below would pass over the empty set.
+///
+/// The tree has had twenty-seven since the skeleton settled. The floor is not
+/// that number: it is low enough that removing crates never trips it and high
+/// enough that a `cargo metadata` which resolved one package cannot pass.
+const MIN_MEMBERS: usize = 20;
 
 /// What `cargo metadata` says the graph is, right now.
 struct Graph {
     /// Workspace crate names, so a dependency on something outside the
-    /// workspace is not mistaken for an edge this table governs.
+    /// workspace is not mistaken for an edge these rules govern.
     members: BTreeSet<String>,
+    /// Edges linked into a shipped artifact.
     normal: BTreeSet<(String, String)>,
+    /// Edges only tests link.
     dev: BTreeSet<(String, String)>,
+    /// Crates that are programs: their package directory holds a `src/main.rs`.
+    ///
+    /// Read from the tree rather than from a list, because it is a fact about
+    /// the crate and not a decision about it.
+    programs: BTreeSet<String>,
+}
+
+impl Graph {
+    /// The crates something links into a shipped artifact.
+    ///
+    /// This is the set a dev edge is measured against: it is what "ships"
+    /// means, derived from the graph instead of asserted about a name.
+    fn shipped(&self) -> BTreeSet<&String> {
+        self.normal
+            .iter()
+            .map(|(_, dependency)| dependency)
+            .collect()
+    }
+
+    /// The crates something depends on at all, dev edges included.
+    fn depended_on(&self) -> BTreeSet<&String> {
+        self.normal
+            .iter()
+            .chain(self.dev.iter())
+            .map(|(_, dependency)| dependency)
+            .collect()
+    }
 }
 
 fn graph() -> Graph {
@@ -189,16 +113,23 @@ fn graph() -> Graph {
         .collect();
     let mut normal = BTreeSet::new();
     let mut dev = BTreeSet::new();
+    let mut programs = BTreeSet::new();
     for package in packages {
         // Only workspace members are governed. A dependency `cog-*` crate
         // published outside the workspace would share the prefix and not the
-        // rule, and this table would then be asserting about something it does
+        // rule, and these rules would then be asserting about something they do
         // not own.
         let Some(consumer) = package["name"].as_str() else {
             continue;
         };
         if !members.contains(consumer) {
             continue;
+        }
+        if let Some(dir) = package["manifest_path"].as_str() {
+            let dir = Path::new(dir).parent().unwrap_or(Path::new(""));
+            if dir.join("src/main.rs").is_file() {
+                programs.insert(consumer.to_owned());
+            }
         }
         for dep in package["dependencies"].as_array().into_iter().flatten() {
             let Some(name) = dep["name"].as_str() else {
@@ -223,133 +154,56 @@ fn graph() -> Graph {
         members,
         normal,
         dev,
+        programs,
     }
-}
-
-fn rows(table: &[Row]) -> BTreeSet<(String, String)> {
-    table
-        .iter()
-        .map(|(consumer, dep, _)| ((*consumer).to_owned(), (*dep).to_owned()))
-        .collect()
 }
 
 fn name(edge: &(String, String)) -> String {
     format!("{} -> {}", edge.0, edge.1)
 }
 
-/// A: an edge the table does not name fails, so the graph cannot grow.
+/// The census read the workspace, so the rules below are not passing over
+/// nothing.
 #[test]
-fn a_new_edge_is_not_in_the_table() {
+fn the_graph_was_read() {
     let g = graph();
-    let table = rows(ALLOWED);
-    let fresh: Vec<String> = g.normal.difference(&table).map(name).collect();
     assert!(
-        fresh.is_empty(),
-        "the crate graph grew: {}\n\
-         An edge this table does not name is a design decision, not a build \
-         detail. If the edge is right, add `(\"<consumer>\", \"<dep>\", \"\")` to \
-         ALLOWED and say in the commit why; if it is not, reach the same code \
-         through the crate that already owns it.",
-        fresh.join(", ")
+        g.members.len() >= MIN_MEMBERS,
+        "the census read {} workspace crates (floor {MIN_MEMBERS}): every rule in \
+         this file would hold over a graph that was never read",
+        g.members.len()
+    );
+    assert!(
+        g.members.contains(BASE),
+        "{BASE} is not a workspace member any more; the rules below name a crate \
+         that no longer exists and would pass by measuring nothing"
+    );
+    assert!(
+        g.members.contains(ASSEMBLY),
+        "{ASSEMBLY} is not a workspace member any more; the one exemption in this \
+         file would then apply to no crate at all, and the direction rule would \
+         silently become 'everything reaches only the base' with no assembly"
+    );
+    assert!(
+        g.programs.contains(ASSEMBLY),
+        "{ASSEMBLY} is exempt from the direction rule because it is the process \
+         that assembles the components, but its package no longer has a \
+         `src/main.rs` -- the exemption now covers a library, and the one place \
+         the pieces meet is somewhere else"
+    );
+    println!(
+        "{} crates, {} shipped edges, {} dev edges, {} programs",
+        g.members.len(),
+        g.normal.len(),
+        g.dev.len(),
+        g.programs.len()
     );
 }
 
-/// B: a row whose edge is gone fails, so the table cannot drift above the graph.
-#[test]
-fn a_row_whose_edge_is_gone_is_stale() {
-    let g = graph();
-    let table = rows(ALLOWED);
-    let stale: Vec<String> = table.difference(&g.normal).map(name).collect();
-    assert!(
-        stale.is_empty(),
-        "the table names edges the graph no longer has: {}\n\
-         Delete those rows in the same commit that removed the edge. A ceiling \
-         nobody lowers is not a ceiling, it is a record of what used to be true.",
-        stale.join(", ")
-    );
-}
-
-/// C: the two tables stay separate, so an edge cannot move between them unseen.
-#[test]
-fn dev_edges_have_their_own_table() {
-    let g = graph();
-    let table = rows(ALLOWED_DEV);
-    let fresh: Vec<String> = g.dev.difference(&table).map(name).collect();
-    let stale: Vec<String> = table.difference(&g.dev).map(name).collect();
-    let promoted: Vec<String> = g
-        .normal
-        .intersection(&rows(ALLOWED_DEV))
-        .map(name)
-        .collect();
-    assert!(
-        fresh.is_empty(),
-        "new dev-only edges: {}\n\
-         Dev dependencies are in ALLOWED_DEV, not ALLOWED: an edge that moves \
-         from one table to the other is the change this split exists to make \
-         visible.",
-        fresh.join(", ")
-    );
-    assert!(
-        stale.is_empty(),
-        "ALLOWED_DEV names dev edges the graph no longer has: {}\n\
-         Delete those rows with the edge.",
-        stale.join(", ")
-    );
-    assert!(
-        promoted.is_empty(),
-        "linked into the artifact and also listed as dev-only: {}\n\
-         A dependency declared in both sections is carried by the normal one; \
-         the dev row says the wrong thing about it.",
-        promoted.join(", ")
-    );
-}
-
-/// E: a crate the table does not name fails, including one with no edges at all.
-#[test]
-fn a_new_crate_is_not_in_the_table() {
-    let g = graph();
-    let table: BTreeSet<&str> = MEMBERS.iter().copied().collect();
-    let fresh: Vec<&String> = g
-        .members
-        .iter()
-        .filter(|m| !table.contains(m.as_str()))
-        .collect();
-    assert!(
-        fresh.is_empty(),
-        "the workspace grew a crate: {:?}\n\
-         The skeleton is settled: a new crate is not a build detail, it is a split \
-         every consumer pays for. If the crate is right, add its name to MEMBERS \
-         and say in the commit why the boundary is new; if it is not, that code \
-         belongs in the crate that already owns the job.",
-        fresh
-    );
-}
-
-/// F: a name whose crate is gone fails, so the list cannot drift above the workspace.
-#[test]
-fn a_crate_the_table_names_is_still_a_member() {
-    let g = graph();
-    let stale: Vec<&&str> = MEMBERS
-        .iter()
-        .filter(|m| !g.members.contains(**m))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "MEMBERS names crates the workspace no longer has: {:?}\n\
-         Delete the row in the commit that removed the crate.",
-        stale
-    );
-}
-
-/// D: the bottom of the graph stays the bottom.
+/// 1: the bottom of the graph stays the bottom.
 #[test]
 fn the_base_crate_depends_on_nothing_here() {
     let g = graph();
-    assert!(
-        g.members.contains(BASE),
-        "{BASE} is not a workspace member any more; this gate is measuring a \
-         name that no longer exists"
-    );
     let grown: Vec<String> = g
         .normal
         .iter()
@@ -364,5 +218,234 @@ fn the_base_crate_depends_on_nothing_here() {
          makes the direction circular the moment that crate reaches back. A type \
          the base needs from another crate belongs in the base, not beside it.",
         grown.join(", ")
+    );
+}
+
+/// The component-to-component edges, as sentences.
+fn sideways(g: &Graph) -> Vec<String> {
+    g.normal
+        .iter()
+        .filter(|(consumer, dependency)| consumer != ASSEMBLY && dependency != BASE)
+        .map(name)
+        .collect()
+}
+
+/// The dev edges whose target is something an artifact already links, as
+/// sentences.
+fn dev_offenders(g: &Graph) -> Vec<String> {
+    let shipped = g.shipped();
+    let mut offenders = Vec::new();
+    for (consumer, target) in &g.dev {
+        let edge = (consumer.clone(), target.clone());
+        if g.normal.contains(&edge) {
+            offenders.push(format!(
+                "{} (declared in both sections; the normal one wins and the dev \
+                 section says the wrong thing about it)",
+                name(&edge)
+            ));
+        } else if g.programs.contains(target) {
+            offenders.push(format!("{} (its target is a program)", name(&edge)));
+        } else if shipped.contains(target) {
+            let linkers: Vec<&str> = g
+                .normal
+                .iter()
+                .filter(|(_, dependency)| dependency == target)
+                .map(|(linker, _)| linker.as_str())
+                .collect();
+            offenders.push(format!(
+                "{} (its target is linked into the artifact by {})",
+                name(&edge),
+                linkers.join(", ")
+            ));
+        }
+    }
+    offenders
+}
+
+/// The crates that are neither programs nor depended on.
+fn orphans(g: &Graph) -> Vec<String> {
+    let depended = g.depended_on();
+    g.members
+        .iter()
+        .filter(|member| !g.programs.contains(*member) && !depended.contains(*member))
+        .cloned()
+        .collect()
+}
+
+/// 2: a component reaches the base and nothing else.
+#[test]
+fn a_crate_that_is_not_the_assembly_reaches_only_the_base() {
+    let sideways = sideways(&graph());
+    assert!(
+        sideways.is_empty(),
+        "a component reached another component: {}\n\
+         Every crate but the assembly may depend on the base and nothing else. \
+         That is what makes the graph a star instead of a lattice: without it \
+         every change to one crate becomes a rebuild and a possible breaking \
+         change in every crate that reaches it, and 'which crate owns this' stops \
+         having an answer. Three honest routes for the code that wants the edge: \
+         the shape it needs moves into the base (a trait or a type, not the \
+         work), the work moves into the crate that already owns that job, or the \
+         assembly -- whose job is to put components together -- does the wiring.",
+        sideways.join(", ")
+    );
+}
+
+/// 3: a dev edge points at a crate nothing ships.
+///
+/// The double is the fixture crate's whole reason to exist, and its exemption is
+/// this property rather than its name: nothing links it into an artifact, so it
+/// cannot drag a rule of one crate into the test run of another. The failure it
+/// prevents is specific -- a double owned by a shipping crate turns that crate's
+/// changes into the failing tests of every crate that uses the double, reported
+/// where nothing about it was being tested.
+#[test]
+fn a_dev_edge_points_at_a_crate_nothing_ships() {
+    let offenders = dev_offenders(&graph());
+    assert!(
+        offenders.is_empty(),
+        "a test-only edge does not point at a crate nothing ships:\n  {}\n\
+         A dev dependency that names a shipping crate is a double a crate's \
+         rules live in: the moment that crate changes, the test that fails is in \
+         somebody else's suite, about something that was not being tested. A \
+         double belongs in the crate whose tests use it, or in a crate nothing \
+         links into an artifact -- which is a property of the graph here, not an \
+         entry on a list.",
+        offenders.join("\n  ")
+    );
+}
+
+/// 4: a crate is a program, or something in the workspace depends on it.
+///
+/// The skeleton is settled. What this replaces from the frozen table is the
+/// "just one small crate" shape: a manifest, a `src/`, and no edge either way. No
+/// edge means no gate on the edge side can see it, and it is a whole-tree cost
+/// paid by everything that rebuilds while being a split nobody made a decision
+/// about. The rule does not forbid a crate; it says a crate has to be *for*
+/// something -- wired into the crate that will use it, or a process of its own.
+#[test]
+fn no_crate_sits_in_the_tree_with_nobody_using_it() {
+    let orphans = orphans(&graph());
+    assert!(
+        orphans.is_empty(),
+        "crates nothing depends on and that are not programs: {orphans:?}\n\
+         The skeleton is settled: a crate is not a build detail, it is a split \
+         every consumer pays for. If the crate is right, the crate that uses it \
+         depends on it -- a dev edge is enough, and a crate nothing ships (the \
+         fixture crate is one) reaches the graph that way. If it is not, that \
+         code belongs in the crate that already owns the job."
+    );
+}
+
+/// The rules separate the shapes they are aimed at from the ones they allow.
+///
+/// The tree passes all of them, which is the same reading as rules that cannot
+/// fail. Each judgement is fed a graph that has the offending shape and one that
+/// has the permitted neighbour of it -- the assembly's sideways edges, the
+/// fixture crate's dev-only reach -- so both polarities are pinned without
+/// editing a manifest to find out.
+#[test]
+fn the_rules_separate_the_shapes_they_are_aimed_at() {
+    let graph_of = |members: &[&str],
+                    normal: &[(&str, &str)],
+                    dev: &[(&str, &str)],
+                    programs: &[&str]| Graph {
+        members: members.iter().map(|m| (*m).to_owned()).collect(),
+        normal: normal
+            .iter()
+            .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+            .collect(),
+        dev: dev
+            .iter()
+            .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+            .collect(),
+        programs: programs.iter().map(|p| (*p).to_owned()).collect(),
+    };
+
+    // A component reaching the base is the shape; the assembly reaching a
+    // component is the neighbour that must stay silent.
+    let reaching = graph_of(
+        &[BASE, ASSEMBLY, "cog-one", "cog-two"],
+        &[
+            ("cog-one", BASE),
+            ("cog-two", BASE),
+            ("cog-two", "cog-one"),
+            (ASSEMBLY, "cog-one"),
+            (ASSEMBLY, BASE),
+        ],
+        &[],
+        &[ASSEMBLY],
+    );
+    assert_eq!(
+        sideways(&reaching),
+        vec!["cog-two -> cog-one".to_owned()],
+        "the direction rule flagged the wrong edges"
+    );
+
+    // A dev edge to a crate nothing ships is the shape the fixture crate has;
+    // the same edge, once something links that crate, is the offender -- and so
+    // is a pair declared in both sections.
+    let doubling = graph_of(
+        &[
+            BASE,
+            ASSEMBLY,
+            "cog-one",
+            "cog-user",
+            "cog-test-support",
+            "cog-shipping",
+        ],
+        &[
+            ("cog-one", BASE),
+            ("cog-shipping", BASE),
+            ("cog-one", "cog-shipping"),
+            (ASSEMBLY, "cog-shipping"),
+        ],
+        &[
+            ("cog-user", "cog-test-support"),
+            ("cog-user", "cog-shipping"),
+            ("cog-one", "cog-shipping"),
+        ],
+        &[ASSEMBLY],
+    );
+    let offenders = dev_offenders(&doubling);
+    assert_eq!(
+        offenders.len(),
+        2,
+        "the dev rule did not separate the shipped target from the test-only \
+         one: {offenders:?}"
+    );
+    assert!(
+        offenders
+            .iter()
+            .any(|line| line.starts_with("cog-one -> cog-shipping")
+                && line.contains("declared in both sections")),
+        "a pair declared dev and normal at once was not reported as such: {offenders:?}"
+    );
+    assert!(
+        offenders
+            .iter()
+            .any(|line| line.starts_with("cog-user -> cog-shipping")
+                && line.contains("linked into the artifact")),
+        "a dev edge to a crate an artifact links was not reported: {offenders:?}"
+    );
+    assert!(
+        !offenders
+            .iter()
+            .any(|line| line.starts_with("cog-user -> cog-test-support")),
+        "the test-only crate's edge was reported: {offenders:?}"
+    );
+
+    // A crate nobody depends on and that is not a program is the shape; the
+    // fixture crate (dev-reached) and a program are the neighbours.
+    let hanging = graph_of(
+        &[BASE, ASSEMBLY, "cog-test-support", "cog-orphan"],
+        &[(ASSEMBLY, BASE)],
+        &[(ASSEMBLY, "cog-test-support")],
+        &[ASSEMBLY],
+    );
+    assert_eq!(
+        orphans(&hanging),
+        vec!["cog-orphan".to_owned()],
+        "the orphan rule flagged the wrong crates"
     );
 }
