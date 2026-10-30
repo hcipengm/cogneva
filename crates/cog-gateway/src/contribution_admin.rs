@@ -2275,10 +2275,18 @@ fn declared_credential_loop_owner() -> bool {
 /// of the Secret and writes the rotated pair back, so it can only run where the
 /// Secret is readable — and only one process may run it, because every refresh
 /// rotates a single-use token.
+///
+/// `metrics` is where the two readings go that say whether rotation is working
+/// at all. The loop's own liveness is not it: a loop whose every exchange fails
+/// still cycles, so its tick age stays young and its death counter stays at
+/// zero all the way to the hour the token expires and egress starts answering
+/// 401. The expiry gauge and the threshold that acts on it are the pair that
+/// separates "rotating" from "trying and failing".
 pub fn spawn_gitee_token_refresher(
     shutdown: cog_core::shutdown::ShutdownSignal,
     interval_secs: u64,
     refresh_threshold_secs: u64,
+    metrics: Arc<dyn cog_core::MetricsBackend>,
 ) -> tokio::task::JoinHandle<()> {
     // The task below is the deployment gate, not the loop: it ends by starting
     // the loop, so a caller must not read its completion as the loop's fate.
@@ -2303,6 +2311,19 @@ pub fn spawn_gitee_token_refresher(
             refresh_threshold_secs,
             "gitee token refresher started: this process owns the contribution secret"
         );
+        // 阈值先落一次：规则拿它当界，而它只在起循环时读得到。写成一条常数的
+        // 话，改配置之后规则会继续按旧数等下去——那是静默，不是安全。
+        if let Err(e) = metrics
+            .record_gauge(
+                cog_core::metric_names::GITEE_TOKEN_REFRESH_THRESHOLD_SECONDS,
+                refresh_threshold_secs as f64,
+                std::collections::HashMap::new(),
+            )
+            .await
+        {
+            // 写不出去只让规则少一臂，不影响刷新本身，所以不阻断循环。
+            tracing::warn!(error = %e, "gitee token refresh threshold reading could not be written");
+        }
         // 登记在这一行之后：属主与轮换材料两道门都在前面，没过的进程不是「刷新
         // 循环死了」，而是这个部署里本来就没有这个循环，上面那两行日志已经把它
         // 为什么没有说清了。登记之后再退出会被记成一次死亡，而那说的不是这里
@@ -2314,6 +2335,7 @@ pub fn spawn_gitee_token_refresher(
             // Rebuilt per attempt, so everything the body consumes is cloned here.
             move |beat| {
                 let shutdown = shutdown.clone();
+                let metrics = metrics.clone();
                 async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
                     interval.tick().await; // first tick is immediate; skip it
@@ -2324,7 +2346,7 @@ pub fn spawn_gitee_token_refresher(
                             _ = shutdown.wait() => return,
                             _ = interval.tick() => {}
                         }
-                        if let Err(e) = gitee_refresh_tick(refresh_threshold_secs).await {
+                        if let Err(e) = gitee_refresh_tick(refresh_threshold_secs, &metrics).await {
                             tracing::warn!(error = %e, "gitee token refresh tick failed");
                         }
                     }
@@ -2334,7 +2356,10 @@ pub fn spawn_gitee_token_refresher(
     })
 }
 
-async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
+async fn gitee_refresh_tick(
+    refresh_threshold_secs: u64,
+    metrics: &Arc<dyn cog_core::MetricsBackend>,
+) -> Result<(), String> {
     let kube = KubeClient::in_cluster()?;
     // 这一次 tick 要读的键横跨两片：配置文档在内部片，refresh token 在带外片。
     let secret = crate::secret_layout::load_data_view(&kube).await?;
@@ -2345,20 +2370,21 @@ async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
     };
     let config_raw = decode(SECRET_CONTRIB_CONFIG).unwrap_or_default();
     let config: serde_json::Value = serde_json::from_str(&config_raw).unwrap_or_else(|_| json!({}));
+    // 读数在判之前就写：这一拍刷不刷新、刷没刷成，都先留下「此刻还剩多少」。
+    // 只在刷新成功时写的话，失败路径上的读数是上一次成功时的旧值——而
+    // 「一直没刷新过」正是这条读数要抓的状态。
+    let now = unix_now() as i64;
+    if let Some(seconds) = expiry_reading(&config, now) {
+        publish_expiry(metrics, seconds).await;
+    }
     if config.get("provider").and_then(|v| v.as_str()) != Some(crate::GITEE_PLATFORM)
         || config.get("mode").and_then(|v| v.as_str()) != Some("oauth")
     {
         return Ok(());
     }
-    let obtained_at = config
-        .get("obtained_at")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let expires_in = config
-        .get("expires_in")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(86400);
-    let remaining = (obtained_at + expires_in).saturating_sub(unix_now());
+    // 判定沿用老口径：读不出 `obtained_at` 时按「早已到期」处理，去换一次新的。
+    // 那与读数是两件事——读数在那种配置下什么都不写（年龄未知），这里仍然要动作。
+    let remaining = expiry_reading(&config, now).unwrap_or(0).max(0) as u64;
     if remaining > refresh_threshold_secs {
         return Ok(());
     }
@@ -2389,7 +2415,52 @@ async fn gitee_refresh_tick(refresh_threshold_secs: u64) -> Result<(), String> {
     // picks up the fresh pair. The new pod sees a young token and idles.
     crate::secret_write::apply(string_data, false, true)
         .await
-        .map(|_| ())
+        .map(|_| ())?;
+    // 写回去之后立刻改写读数：下一次 tick 要等一个周期，这中间它若继续指着旧
+    // token 的剩余，规则看到的就是一次刷新之后还剩四分钟。写在 `apply` 之后，
+    // 是因为写失败时新 token 并不在 Secret 里，那时报一个满的剩余是假读数。
+    publish_expiry(metrics, set.expires_in as i64).await;
+    Ok(())
+}
+
+/// 这份贡献配置对应的「令牌还剩多少秒」，没有可量的东西时为 `None`。
+///
+/// 三种情形返回 `None`，彼此原因不同：
+/// - 不是 Gitee OAuth 模式：个人访问令牌没有过期时间，这一格不该有；
+/// - 配置里没有 `obtained_at`：令牌的年龄未知，编一个剩余比不报更糟——
+///   它会读成一个确切的数，而那个数没有任何来路；
+/// - 配置读不出来（空对象）：同上，什么都不知道。
+///
+/// 返回值可以为负：负数是「已经过期多久」，它比 0 更有用，0 与「一秒都不剩」
+/// 同形，而「过期一小时」与「刚好到期」要修的急迫程度不同。
+pub fn expiry_reading(config: &serde_json::Value, now_unix: i64) -> Option<i64> {
+    if config.get("provider").and_then(|v| v.as_str()) != Some(crate::GITEE_PLATFORM)
+        || config.get("mode").and_then(|v| v.as_str()) != Some("oauth")
+    {
+        return None;
+    }
+    let obtained_at = config.get("obtained_at").and_then(|v| v.as_i64())?;
+    let expires_in = config
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(86_400);
+    Some((obtained_at + expires_in) - now_unix)
+}
+
+/// 把剩余寿命写进读数面。写不出去只记一行日志：读数是这一面的眼睛，而刷新本身
+/// 是它的手——让一次写指标失败把刷新标成失败，会把「看不见」与「没换成」读成
+/// 同一件事。
+async fn publish_expiry(metrics: &Arc<dyn cog_core::MetricsBackend>, seconds: i64) {
+    if let Err(e) = metrics
+        .record_gauge(
+            cog_core::metric_names::GITEE_TOKEN_SECONDS_TO_EXPIRY,
+            seconds as f64,
+            std::collections::HashMap::new(),
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "gitee token expiry reading could not be written");
+    }
 }
 
 #[cfg(test)]
@@ -2655,6 +2726,63 @@ mod tests {
         // nothing.
         assert_eq!(oauth_app_secret_key(""), None);
         assert_eq!(oauth_app_secret_key("bitbucket"), None);
+    }
+
+    /// 读数是「还剩多少」，三种没有可量的东西时它是 `None` 而不是一个数。
+    ///
+    /// 这一格最容易做错的方向是把「不知道」写成 0：0 读作「此刻刚好到期」，
+    /// 而一条规则会因此在一个配置根本没有过期概念的部署上点火，或者在一个
+    /// 读不出年龄的部署上永远报「已到期」。
+    #[test]
+    fn the_expiry_reading_is_a_number_only_when_there_is_a_token_to_measure() {
+        let now = 1_700_000_000;
+        let oauth = json!({
+            "provider": crate::GITEE_PLATFORM,
+            "mode": "oauth",
+            "obtained_at": now - 3600,
+            "expires_in": 86400,
+        });
+        assert_eq!(expiry_reading(&oauth, now), Some(86400 - 3600));
+
+        // 已经过期：负数是「过期多久」，比 0 多一层信息。
+        let stale = json!({
+            "provider": crate::GITEE_PLATFORM,
+            "mode": "oauth",
+            "obtained_at": now - 90000,
+            "expires_in": 86400,
+        });
+        assert_eq!(expiry_reading(&stale, now), Some(-3600));
+
+        // 个人访问令牌没有过期时间：这一格不该有。
+        let pat = json!({"provider": crate::GITEE_PLATFORM, "mode": "pat"});
+        assert_eq!(expiry_reading(&pat, now), None);
+
+        // 别的平台、空配置：同上。
+        assert_eq!(
+            expiry_reading(
+                &json!({"provider": crate::GITHUB_PLATFORM, "mode": "oauth"}),
+                now
+            ),
+            None
+        );
+        assert_eq!(expiry_reading(&json!({}), now), None);
+
+        // oauth 模式但没有 `obtained_at`：令牌的年龄未知，编一个剩余会读成一个
+        // 确切的数，而那个数没有任何来路。
+        let ageless = json!({
+            "provider": crate::GITEE_PLATFORM,
+            "mode": "oauth",
+            "expires_in": 86400,
+        });
+        assert_eq!(expiry_reading(&ageless, now), None);
+
+        // `expires_in` 缺席时按 Gitee 的 24 小时算，与刷新那条路的口径一致。
+        let no_ttl = json!({
+            "provider": crate::GITEE_PLATFORM,
+            "mode": "oauth",
+            "obtained_at": now,
+        });
+        assert_eq!(expiry_reading(&no_ttl, now), Some(86400));
     }
 
     #[test]

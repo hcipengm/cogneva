@@ -9025,6 +9025,9 @@ pub async fn run(
         cog_core::ShutdownSignal::default(),
         config.effective_contribution_oauth_refresh_interval_secs(),
         config.effective_contribution_oauth_refresh_threshold_secs(),
+        // 读数交给本进程的指标注册表：刷新失败时循环还活着，而「活着但换不动」
+        // 只有这一格说得出来。
+        state.pool_obs.metrics.clone(),
     ));
     // 选路的实测在启动时就发起一次，不等第一个 git 请求：判据要先于请求落地，
     // 否则首批请求只能按策略表猜——受限网络下那意味着先撞一次已知会挂的 HTTPS。

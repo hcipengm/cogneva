@@ -1204,6 +1204,17 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_alert_assertion_write_total",
         "crates/cog-observability/src/alert_store.rs",
     ),
+    // 贡献令牌还剩多久到期，以及换新该在多早以前开始——界由被测的循环自己报，
+    // 不写进规则里。两条一起看才是一句话：心跳年龄只证明循环还在打卡，而每次
+    // 交换都失败的那条循环照样按拍打卡，一路安静到令牌过期、出口开始 401。
+    (
+        "cogneva_gitee_token_seconds_to_expiry",
+        "crates/cog-gateway/src/contribution_admin.rs",
+    ),
+    (
+        "cogneva_gitee_token_refresh_threshold_seconds",
+        "crates/cog-gateway/src/contribution_admin.rs",
+    ),
 ];
 
 /// Series the rules read that this workspace does not publish, with the owner.
@@ -1764,6 +1775,14 @@ const FOREIGN: &[(&str, &str)] = &[
     (
         "must_green_flake_repeat_verdict",
         "宿主读数 `scripts/principles/must-green-flake-reading.sh`（不在本仓，登记行 `must_green_flake`）：0/1 判词，1 表示**同一个**驱动套件在窗口（默认 7 天）里留下的假红记录达到界（默认 3 次）。假红＝第一次红、同一份字节再跑转绿——真正复现的红落在 `red/`、不进这一堆，两群混起来数会把回归算成噪声。降到套件粒度是因为修法就在那一层（去查那一层里哪一份不稳），而代价落在所有排队提交者身上：每一条记录都让当时排队的人各付一整轮门。界与窗口只写在生产者里，这条规则读判词、不另立一套数；读不到目录时生产者一条序列都不印，那是 `CognevaHostReadingProducerUnreadable{producer=\"must_green_flake\"}` 的事，不是「这一周没有假红」",
+    ),
+    (
+        "roster_import_age_seconds",
+        "宿主读数 `scripts/principles/governance-roster-freshness.sh`（不在本仓，登记行 `roster`）：名册最近一次导进任务图的 stamp 距今多少秒。名册与图各住一边——名册在私有仓的 `scripts/data/faces.tsv`，图在平台数据库里——两条腿隔着一条进程边界，所以「导入那一方向还有没有人跑」只能由跨这条边界的读数回答，本仓印不出它。规则 `CognevaGovernanceRosterImportStale` 等十分钟再响：那十分钟是给一次滚动（Pod 换了、探针打不通那几拍）留的，不是给写者的节奏留的",
+    ),
+    (
+        "roster_rows_not_in_graph",
+        "同一生产者：名册声明的面主与图里记的 `owner_unit` 对不上有几行。它是**状态**不是计数——两种收口方向（改名册或开交接）都能把它降回 0，所以规则 `CognevaGovernanceRosterDrift` 拿它直接判而不取窗口：一个停住的写者留下的最后一行在图上读起来与此刻的对不上一样，而这一条读的本来就是「没人打算收口」这件事本身。写者读不到名册或图时它不印这一格，那是 `CognevaHostReadingProducerUnreadable` 的判词",
     ),
 ];
 

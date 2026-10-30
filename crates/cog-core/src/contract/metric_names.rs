@@ -1125,6 +1125,25 @@ metric_names! {
     // fault is one account's binding.
     CLUSTER_READ_TOTAL => "cogneva_cluster_read_total",
 
+    // cog-gateway — how long the contribution access token has left, and the
+    // age at which the rotation loop is supposed to renew it.
+    //
+    // Two series rather than one verdict because the rule's boundary is the
+    // loop's own declaration: the threshold is configuration, and a rule that
+    // carried its own copy of "four hours" would keep waiting on a number the
+    // operator stopped using. The expiry gauge is written on every rotation
+    // tick whether or not anything was rotated -- a reading that only appeared
+    // when a refresh happened would be absent through exactly the state it
+    // exists to report, which is repeated refresh failures while the loop keeps
+    // cycling and its age stays young.
+    //
+    // Both are absent, not zero, in a deployment without an OAuth app: a
+    // personal access token has no expiry here, and writing zero would read as
+    // "expired long ago". Whether the loop runs at all is the loop-health
+    // family's question.
+    GITEE_TOKEN_SECONDS_TO_EXPIRY => "cogneva_gitee_token_seconds_to_expiry",
+    GITEE_TOKEN_REFRESH_THRESHOLD_SECONDS => "cogneva_gitee_token_refresh_threshold_seconds",
+
     // cog-gateway — LLM pool and upstream health.
     LLM_CALLS_TOTAL => "llm_calls_total",
     LLM_CALL_LATENCY_MS => "llm_call_latency_ms",

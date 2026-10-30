@@ -1309,6 +1309,37 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 /// Descriptions for the gauge series. See [`COUNTER_HELP`].
 const GAUGE_HELP: &[(&str, &str)] = &[
     (
+        crate::metric_names::GITEE_TOKEN_SECONDS_TO_EXPIRY.as_str(),
+        "How long the contribution access token has left, in seconds; negative \
+         means it has already expired. Written on every rotation tick, whether \
+         or not the tick rotated anything, because the state it exists to \
+         report is repeated refresh failures and in that state the loop keeps \
+         cycling and its own tick age stays young. Absent, not zero, when the \
+         deployment holds no OAuth app: a personal access token does not \
+         expire here, and a zero would read as a token that died at the epoch. \
+         Compare it with `cogneva_gitee_token_refresh_threshold_seconds` rather \
+         than a constant: below the threshold with no rotation shortly after is \
+         the incident, and the threshold is the loop's own configuration, so a \
+         rule carrying its own copy would keep waiting on a value the operator \
+         stopped using. Only the security gateway publishes it, and only while \
+         an OAuth app is configured; whether that loop runs at all is \
+         `cogneva_loop_tick_age_seconds` with loop \
+         `gateway_gitee_token_refresher`",
+    ),
+    (
+        crate::metric_names::GITEE_TOKEN_REFRESH_THRESHOLD_SECONDS.as_str(),
+        "The remaining token lifetime at which the rotation loop renews the \
+         contribution access token, in seconds, as the security gateway \
+         resolved it from configuration at start. Published for the alert rule \
+         that reads it beside \
+         `cogneva_gitee_token_seconds_to_expiry`: the boundary belongs to the \
+         loop that acts on it, and a rule holding its own copy of 'four hours' \
+         would go on comparing against a number nobody configures any more. \
+         One value per process, so take any series rather than summing them; \
+         absent in a deployment without an OAuth app, for the same reason the \
+         expiry reading is",
+    ),
+    (
         crate::metric_names::ALERT_CHANNELS_CONFIGURED.as_str(),
         "Which outlets this deployment can deliver an alert through. This family \
          carries two kinds of row with opposite polarity, so select one kind by \

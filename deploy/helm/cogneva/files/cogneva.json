@@ -3283,6 +3283,17 @@
           "face": "安全与凭证"
         },
         {
+          "name": "gitee_token_not_rotated",
+          "promql": "(max without (pod, container, instance) (cogneva_gitee_token_seconds_to_expiry) - max without (pod, container, instance) (cogneva_gitee_token_refresh_threshold_seconds)) and ((time() - max without (pod, container, instance) (cogneva_gitee_token_seconds_to_expiry_observed_timestamp_seconds)) < 7200)",
+          "condition": {
+            "less_than": 0.0
+          },
+          "for_seconds": 7200,
+          "severity": "warning",
+          "summary": "The contribution access token has {value} second(s) left, past the point where the rotation loop is supposed to renew it, and two hours have gone by without the number coming back up (twice the default hourly tick; the tick this loop actually runs at is readable as cogneva_loop_period_seconds on the same loop label, and a deployment that slows the loop down should stretch the wait to match rather than keep waiting two hours). Both operands belong to the loop: the expiry is written on every tick whether or not the tick rotated anything, and the threshold is the value the gateway resolved from configuration at start, so moving the refresh window moves this judgement with it instead of leaving a rule waiting on a number nobody configures any more. This is the reading the loop's own liveness cannot give -- an exchange that fails every hour keeps the loop beating, so its tick age stays young and its death counter stays at zero all the way to the hour the token dies and egress starts answering 401. A Gitee refresh token is single-use, so a failed exchange can also have consumed it: the deployment then cannot renew on its own until a person re-authorises, and nothing before this rule said so. Repair in order: the error on the tick's log line (secret read, exchange or secret write), whether a refresh token is still in the Secret, and whether an OAuth app is still configured. Read background_loop_stalled on loop=gateway_gitee_token_refresher beside it -- that one says the loop stopped, this one says it kept running and kept failing. A negative value is a token that has already died. Silent when the series is absent, which is the right answer for a deployment holding no OAuth app: a personal access token does not expire here, there is nothing to renew, and whether the loop runs at all is the loop-health family's question rather than a rotation that is late. Silent as well when the newest stored row is more than two hours old: the metric store serves a series' last value forever, so a writer that stopped would otherwise leave this verdict standing on a frozen sample that nothing can move off the firing side, and a stopped writer is background_loop_stalled's finding, not this rule's",
+          "face": "安全与凭证"
+        },
+        {
           "name": "backup_run_over_its_own_deadline",
           "promql": "(max(cogneva_backup_run_readings{readout=\"oldest_running_age_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)) > max(cogneva_backup_run_readings{readout=\"oldest_running_deadline_seconds\"} and ((time() - cogneva_backup_run_readings_observed_timestamp_seconds) < 1800)))",
           "condition": {
