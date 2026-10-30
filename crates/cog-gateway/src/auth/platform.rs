@@ -363,7 +363,7 @@ pub async fn oauth_start_handler(Json(req): Json<OAuthStartRequest>) -> Response
                     return json_err(
                         StatusCode::BAD_GATEWAY,
                         "oauth_unreachable",
-                        &format!("读不到安全网关的 Gitee OAuth 配置：{e}。稍后重试即可"),
+                        format!("读不到安全网关的 Gitee OAuth 配置：{e}。稍后重试即可"),
                     );
                 }
             };
