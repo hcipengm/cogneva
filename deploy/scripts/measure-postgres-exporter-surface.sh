@@ -239,6 +239,11 @@ series_names() {
 # `--help` 把布尔旗标写成 `--[no-]collector.x`；命令行上要的是 `--collector.x`。
 # 只认这一种写法：它正是当初量出下面那张名单的那条正则，换成更宽的模式会把帮助文本
 # 里的举例一起收进来。
+#
+# 收的是这个镜像**公开列出来**的全集。kingpin 的隐藏旗标在这条路上看不见——对这个
+# 镜像实测过 2026-10-30：`--help` 与 `--help-long` 都是同样 18 条，原来那份手抄名单里
+# 多出来的四个（buffercache_summary、roles、stat_checkpointer、stat_progress_vacuum）
+# 拿单独一个旗标去跑，镜像直接答 `unknown long flag`——它们不是隐藏，是这个镜像没有。
 collector_names() {
     grep -oE '\-\-\[no-\]collector\.[a-z_]+' "$1" | sed 's/^--\[no-\]/--/' | LC_ALL=C sort -u
 }
