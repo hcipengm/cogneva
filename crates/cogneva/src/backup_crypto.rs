@@ -40,9 +40,9 @@ const TAG_LEN: usize = 16;
 /// 句口令打出来的两个包互不可比。它们不是可调的旋钮。
 // cap: bound — AES-GCM 的 nonce 长度由算法定死，不是可调的旋钮
 const NONCE_LEN: usize = 12;
-/// 一帧的明文上限。1 MiB 是吞吐与内存占用的折中：包体量在百 MB 量级，整包读进
-/// 内存会让备份 Pod 的峰值跟着包大小走。
-// cap: bound — 1 MiB 是吞吐与内存的折中：包体在百 MB 量级，整包读进内存会让备份 Pod 的峰值跟着包大小走
+/// 一帧的明文上限。它是吞吐与内存占用的折中：包体越大，整包读进内存就越让备份
+/// Pod 的峰值跟着包大小走。
+// cap: bound — 这一帧上限是吞吐与内存的折中：整包读进内存会让备份 Pod 的峰值跟着包大小走
 const CHUNK: usize = 1 << 20;
 const MAX_FRAME: usize = CHUNK + TAG_LEN;
 

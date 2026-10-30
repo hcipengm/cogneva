@@ -19,7 +19,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 ///
 /// 一条帧是一行 JSON，远小于这个数；整块读让大帧也不必多次系统调用，而
 /// 默认的 64 KiB 是页缓存里「一次读一次拷贝」的量级。
-// cap: bound — 一条帧是一行 JSON，远小于这个数；整块读让大帧也不必多次系统调用，而 64 KiB 正是页缓存里「一次读一次拷贝」的量级
+// cap: bound — 一条帧是一行 JSON，远小于这个数；整块读让大帧也不必多次系统调用，而块大小取的是页缓存里「一次读一次拷贝」的量级
 const COPY_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Unified writer for all 7 raw streams.

@@ -69,8 +69,8 @@ const HTTPS_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20
 /// 所以在正常仓库上它本来就以分钟计；这个界判的仍是「是不是进了黑洞」。
 // cap: bound — 推送正常就以分钟计，这个界判的仍是「是不是进了黑洞」
 const HTTPS_POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
-/// 镜像单次响应体上限，与透传路径的 256MB 缓冲约定一致。
-// cap: bound — 镜像单次响应体上限，与透传路径的 256MB 缓冲约定一致
+/// 镜像单次响应体上限，与透传路径的缓冲约定一致。
+// cap: bound — 镜像单次响应体上限，与透传路径的缓冲约定一致
 const MAX_MIRROR_BODY: usize = 256 * 1024 * 1024;
 /// git 可执行文件。镜像路径只经由它跑 clone/fetch/push/show-ref。
 const DEFAULT_GIT_BIN: &str = "git";
