@@ -27,7 +27,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CHART_JSON="${REPO_ROOT}/deploy/helm/cogneva/files/cogneva.json"
 STATIC_CONFIG="${REPO_ROOT}/deploy/k3s/cogneva-json-configmap.yaml"
-STATIC_DIR="${REPO_ROOT}/deploy/k3s"
 RENDERED="${REPO_ROOT}/deploy/rendered/k3s-single"
 
 mode="write"

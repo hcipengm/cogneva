@@ -23,9 +23,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "${here}/../../.." && pwd)"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-for bin in python3; do
-    command -v "${bin}" >/dev/null || { echo "缺少依赖：${bin}" >&2; exit 2; }
-done
+command -v python3 >/dev/null || { echo "缺少依赖：python3" >&2; exit 2; }
 python3 -c 'import yaml' 2>/dev/null || { echo "缺少依赖：python3-yaml" >&2; exit 2; }
 
 work="$(mktemp -d)"
