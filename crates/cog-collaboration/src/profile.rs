@@ -16,8 +16,6 @@ pub struct TaskProfile {
     pub dependency_count: f64,
     /// Token budget headroom available for the task, normalized to 0.0..=1.0.
     pub token_budget: f64,
-    /// Historical success rate on comparable tasks (0.0 = always fails, 1.0 = always succeeds).
-    pub historical_success: f64,
     /// What the request itself declares about the size of the change it asks
     /// for. Deliberately outside [`complexity_score`]: the five weighted
     /// dimensions read the request's *description*, this reads the *change*, and
@@ -40,7 +38,6 @@ impl Default for TaskProfile {
             ambiguity: 0.0,
             dependency_count: 0.0,
             token_budget: 1.0,
-            historical_success: 1.0,
             declared_scale: DeclaredScale::Unknown,
             declaration_inputs: DeclarationInputs::empty(),
         }
@@ -518,16 +515,25 @@ pub fn scale_label(scale: DeclaredScale) -> &'static str {
 pub const PIPELINE_SCORE_THRESHOLD: f64 = 0.4;
 
 /// Compute the complexity score for a profile.
-/// Weights match the design doc:
-/// `0.25*novelty + 0.30*risk + 0.20*ambiguity + 0.10*deps + 0.15*(1 - historical_success)`.
+///
+/// `0.25*novelty + 0.30*risk + 0.20*ambiguity + 0.10*deps`, so the score spans
+/// 0.0..=0.85 rather than 0.0..=1.0 and [`PIPELINE_SCORE_THRESHOLD`] is 0.4 of
+/// that same span — the numbers are unchanged for every profile it already
+/// scored, because the fourth input below never varied.
+///
+/// A fifth weighted term used to sit here, `0.15*(1 - historical_success)`. It
+/// was removed rather than kept: no writer ever measured a success rate, every
+/// profile was built with the literal `1.0`, and the term therefore contributed
+/// exactly zero to every decision ever taken. A weight that cannot vary does not
+/// make the score more careful — it makes a reader believe the routing consults
+/// history, and the routing does not. Reinstating it means finding the writer
+/// that reads outcomes first; the type will refuse to compile until the field
+/// comes back, which is the point.
+///
 /// `token_budget` is intentionally not used in the scoring formula but is kept
 /// on [`TaskProfile`] for future budget-aware variants.
 pub fn complexity_score(p: &TaskProfile) -> f64 {
-    p.novelty * 0.25
-        + p.risk * 0.30
-        + p.ambiguity * 0.20
-        + p.dependency_count * 0.10
-        + (1.0 - p.historical_success) * 0.15
+    p.novelty * 0.25 + p.risk * 0.30 + p.ambiguity * 0.20 + p.dependency_count * 0.10
 }
 
 /// Select the PGE mode appropriate for the given task profile.
@@ -581,7 +587,6 @@ pub fn derive_task_profile(task: &cog_core::Task) -> TaskProfile {
         },
         dependency_count: (dep_count / 20.0).min(1.0),
         token_budget: 1.0,
-        historical_success: 1.0,
         declared_scale: declared_scale(task),
         declaration_inputs: declaration_inputs(task),
     }
@@ -675,7 +680,6 @@ mod tests {
             ambiguity: 0.5,
             dependency_count: 0.0,
             token_budget: 1.0,
-            historical_success: 1.0,
             declared_scale: DeclaredScale::Unknown,
             declaration_inputs: DeclarationInputs::empty(),
         };
@@ -697,7 +701,6 @@ mod tests {
             ambiguity: 0.9,
             dependency_count: 0.9,
             token_budget: 1.0,
-            historical_success: 0.1,
             declared_scale: DeclaredScale::Unknown,
             declaration_inputs: DeclarationInputs::empty(),
         };
@@ -716,7 +719,6 @@ mod tests {
             token_budget: 1.0,
             // Use a direct mix that yields exactly 0.4: risk 1.0 contributes 0.30,
             // dependency_count 1.0 contributes 0.10. 0.30 + 0.10 = 0.40.
-            historical_success: 1.0,
             declared_scale: DeclaredScale::Unknown,
             declaration_inputs: DeclarationInputs::empty(),
         };
@@ -730,28 +732,95 @@ mod tests {
         assert_eq!(select_mode(&p).mode, PgeMode::Roundtable);
     }
 
+    /// 分数的量程就是那四个**被测过**的输入：满分 0.85，阈值落在量程之内。
+    ///
+    /// 这一条判的是「公式只能吃这四个输入」这件事本身。曾经还有第五项
+    /// `0.15*(1 - historical_success)`，而没有任何一处量过成功率——每个 profile
+    /// 都是用字面量 1.0 建出来的，那一项对每一次判定都恰好贡献零。它加进来的样子
+    /// 就是「能到 1.0 而其中 0.15 没人量」，而量程是这条判据里唯一读得出那个差值
+    /// 的数：谁再加一项常量，这里立刻对不上 0.85。
     #[test]
-    fn low_historical_success_band_transitions() {
-        let p = TaskProfile {
-            novelty: 0.0,
-            risk: 0.6,
-            ambiguity: 0.0,
-            dependency_count: 0.0,
-            token_budget: 1.0,
-            historical_success: 0.0,
-            declared_scale: DeclaredScale::Unknown,
-            declaration_inputs: DeclarationInputs::empty(),
+    fn the_score_spans_the_four_inputs_that_are_measured() {
+        let maxed = TaskProfile {
+            novelty: 1.0,
+            risk: 1.0,
+            ambiguity: 1.0,
+            dependency_count: 1.0,
+            ..TaskProfile::default()
         };
-        // 0.6*0.30 + 1.0*0.15 = 0.18 + 0.15 = 0.33 → Pipeline.
-        assert_eq!(select_mode(&p).mode, PgeMode::Pipeline);
+        let top = complexity_score(&maxed);
+        assert!(
+            (top - 0.85).abs() < 1e-9,
+            "满分是 {top}，不是四个权重之和 0.85——多出来的那一段没人量过"
+        );
+        assert!(
+            PIPELINE_SCORE_THRESHOLD < top,
+            "阈值 {PIPELINE_SCORE_THRESHOLD} 不在量程 0..={top} 之内：任何输入都只会走同一个分支"
+        );
 
-        let p = TaskProfile { risk: 0.8, ..p };
-        // 0.8*0.30 + 0.15 = 0.24 + 0.15 = 0.39 → Pipeline.
-        assert_eq!(select_mode(&p).mode, PgeMode::Pipeline);
+        // 四个输入各自都动得动分数。谁被钉死成常量（历史长相与这一次那个字面量
+        // 一模一样），这一条就对不上。
+        let base = complexity_score(&TaskProfile::default());
+        for (name, moved) in [
+            (
+                "novelty",
+                TaskProfile {
+                    novelty: 1.0,
+                    ..TaskProfile::default()
+                },
+            ),
+            (
+                "risk",
+                TaskProfile {
+                    risk: 1.0,
+                    ..TaskProfile::default()
+                },
+            ),
+            (
+                "ambiguity",
+                TaskProfile {
+                    ambiguity: 1.0,
+                    ..TaskProfile::default()
+                },
+            ),
+            (
+                "dependency_count",
+                TaskProfile {
+                    dependency_count: 1.0,
+                    ..TaskProfile::default()
+                },
+            ),
+        ] {
+            assert!(
+                complexity_score(&moved) > base,
+                "{name} 置 1.0 之后分数没有动：这个输入在公式里形同常量"
+            );
+        }
+    }
 
-        let p = TaskProfile { risk: 0.9, ..p };
-        // 0.9*0.30 + 0.15 = 0.27 + 0.15 = 0.42 → Roundtable.
-        assert_eq!(select_mode(&p).mode, PgeMode::Roundtable);
+    /// 从任务算出来的那一份，四个输入都跟着任务走，不是被谁填死的。
+    ///
+    /// 上面那条判的是公式，这条判的是**推导**：公式里的四个输入各自都得由任务本身
+    /// 算出来。一个被写成字面量的字段（上一次是 `historical_success: 1.0`）在这条
+    /// 断言下当场红——两个在所有维度上都不同的任务，推出同一个 profile。
+    #[test]
+    fn the_derived_profile_scores_only_what_the_task_carries() {
+        let light = task_with("fix it", serde_json::json!({}));
+        let mut heavy = task_with(
+            "rewrite the parser so that every caller in the workspace keeps compiling while              the AST gains a second shape and the error type learns to carry spans",
+            serde_json::json!({}),
+        );
+        heavy.blocked_by = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+
+        let a = derive_task_profile(&light);
+        let b = derive_task_profile(&heavy);
+        assert_ne!(a.risk, b.risk, "risk 没有跟着依赖数走");
+        assert_ne!(
+            a.dependency_count, b.dependency_count,
+            "dependency_count 没有跟着依赖数走"
+        );
+        assert_ne!(a.ambiguity, b.ambiguity, "ambiguity 没有跟着输入长度走");
+        assert!(complexity_score(&b) > complexity_score(&a));
     }
 
     fn task_with(goal: &str, extra: serde_json::Value) -> cog_core::Task {

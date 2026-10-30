@@ -371,7 +371,6 @@ impl ModeSelectorActor {
                 "risk": profile.risk,
                 "ambiguity": profile.ambiguity,
                 "dependency_count": profile.dependency_count,
-                "historical_success": profile.historical_success,
                 "complexity_score": complexity_score(profile),
             });
         }
