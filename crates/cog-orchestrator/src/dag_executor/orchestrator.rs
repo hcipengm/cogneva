@@ -1,4 +1,5 @@
 //! DAG 执行器编排核心：任务状态、租约、续跑与自修复都在这里汇合。
+//! principle: feedback_a_count_that_feeds_a_bound_must_not_include_rows_no_one_holds
 use cog_core::{SFError, SFResult, Task, TaskStatus, TaskType, UpstreamFailure};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

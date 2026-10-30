@@ -1,4 +1,5 @@
 //! principle: feedback_a_client_and_a_server_tested_apart_can_speak_different_wires
+//! principle: feedback_a_suite_that_promotes_a_may_needs_the_field_not_a_looser_criterion
 //!
 //! The A2A client and the A2A server are two halves of one wire, and this drives
 //! the client against the served router.
