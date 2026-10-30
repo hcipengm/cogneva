@@ -392,7 +392,7 @@ mod tests {
     #[tokio::test]
     async fn every_published_stage_is_one_this_router_can_return() {
         let score_goal = "polish the wording in `docs/quickstart.md`";
-        let mut produced = vec![
+        let produced = vec![
             ModeSelectorActor::new()
                 .select_mode(
                     "polish the wording in `docs/quickstart.md`",
