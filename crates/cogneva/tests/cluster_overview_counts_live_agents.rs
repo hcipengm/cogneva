@@ -462,3 +462,82 @@ async fn no_snapshot_is_unknown_not_available() {
         "nothing to read is not a verdict: {body}"
     );
 }
+
+/// The window's allowance account has to reach the route, both ways round.
+///
+/// The projection has its own test; this one answers the question that test
+/// cannot: does the reading a person opens carry the account at all? Between
+/// the snapshot and the wire there is a projection and a serialization, and a
+/// dropped field fails neither of them. The spend faces answer how much went
+/// out; without this half nobody can say how much the window had, so a window
+/// nearly gone and one barely touched read the same everywhere else.
+///
+/// The empty case is judged too, because the wrong zero is worse than a
+/// missing number: a pace of zeros says the window allows nothing, while the
+/// truth is that no upstream has been measured refusing a spent window yet.
+#[tokio::test]
+async fn the_allowance_account_reaches_the_route_and_reads_unmeasured_when_it_never_was() {
+    let kv = Arc::new(FakeKeyValue::default());
+    let snapshot = serde_json::json!({
+        "unavailable": false,
+        "unavailable_upstreams": [],
+        "pool_size": 1,
+        "evidenced_recovery_unix": 0,
+        "next_attempt_unix": 0,
+        "quota_window_secs": 2_592_000,
+        "last_success_unix": 1_792_800_000,
+        "pace": {
+            "measured_upstreams": 1,
+            "allowance_tokens": 16_620_054,
+            "spent_tokens": 4_000_000,
+            "reserve_tokens": 358_943,
+            "reserve_population": 533,
+            "window_secs": 2_592_000,
+            "window_start_unix": 1_793_028_477,
+        },
+    });
+    kv.set(cog_core::LLM_POOL_STATUS_KEY, &snapshot.to_string())
+        .await
+        .expect("the stand-in takes the snapshot");
+
+    let (status, body) = overview(state_with(None, Some(kv))).await;
+
+    assert_eq!(status, StatusCode::OK, "the route answers: {body}");
+    let pace = &body["llm_pool"]["pace"];
+    assert_eq!(pace["allowance_tokens"], 16_620_054, "{body}");
+    assert_eq!(pace["spent_tokens"], 4_000_000, "{body}");
+    assert_eq!(pace["reserve_tokens"], 358_943, "{body}");
+    assert_eq!(
+        pace["reserve_population"], 533,
+        "一份预留量要带着它测自几个整活，否则读者分不清五个样本和五百个: {body}"
+    );
+    assert_eq!(pace["window_secs"], 2_592_000, "{body}");
+    assert!(
+        pace["window_start_at"].is_string(),
+        "窗起点是读者算出「还有多久换窗」的唯一依据: {body}"
+    );
+
+    // 没有量过整窗的快照：默认值解析成 `measured_upstreams: 0`。
+    let unmeasured = Arc::new(FakeKeyValue::default());
+    let snapshot = serde_json::json!({
+        "unavailable": false,
+        "unavailable_upstreams": [],
+        "pool_size": 1,
+        "evidenced_recovery_unix": 0,
+        "next_attempt_unix": 0,
+        "quota_window_secs": 0,
+        "last_success_unix": 0,
+    });
+    unmeasured
+        .set(cog_core::LLM_POOL_STATUS_KEY, &snapshot.to_string())
+        .await
+        .expect("the stand-in takes the snapshot");
+
+    let (status, body) = overview(state_with(None, Some(unmeasured))).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["llm_pool"]["pace"].is_null(),
+        "没量过就是没有读数，不能是一窗零额度: {body}"
+    );
+}

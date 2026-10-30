@@ -189,17 +189,27 @@ for ROUTE, FETCHER, RANGE_FIELDS in READS:
 # 屏上却没有任何一处说过额度。
 #
 # 判据与上面同形，只是问的是字段而不是路由：调用逐窗口那一读的屏（含渲染出来的
-# 调用方的组件）里，必须出现 `llm_pool` 与 `pace` 两个字段名。缺 `pace` 是最坏的
-# 那种缺——快照照样读、池子照样显示「可用」，而「这一窗还剩多少」无声地没了。
+# 调用方的组件）里，**至少一个文件**同时读 `llm_pool` 与 `.pace`。缺 `pace` 是最坏
+# 的那种缺——快照照样读、池子照样显示「可用」，而「这一窗还剩多少」无声地没了。
+#
+# 两个形状上的坑，都在第一版里踩过：
+#   - 不能把这一屏的文件**拼起来**再找子串：`views/registry.tsx` 里有个
+#     `WorkspaceView`，"workspace" 就含 "pace"，于是「额度读数被删掉」永远为假。
+#     逐个文件判，且要求的是字段访问 `\.pace\b`，不是裸词。
+#   - `client.ts` 里那一行是它自己的声明，不是调用点：把它算成消费者，可达性会从
+#     「谁调用了这一读」变成「谁 import 了 client」，整棵树都成了那一屏。
+PACE_FIELD = re.compile(r"\.pace\b")
 for rel in sorted(graph):
-    # `client.ts` 里那一行是它自己的声明，不是调用点：把它算成消费者，可达性会
-    # 从「谁调用了这一读」变成「谁 import 了 client」，于是整棵树都成了那一屏。
     if rel == CLIENT or not re.search(r"\bgetTokenUsageSeries\s*\(", read(rel)):
         continue
     readers = [s for s in screens if imported_by([s[0]], rel)]
     screen_files = {s[0] for s in readers} | {rel}
-    shown = "".join(read(f) for f in screen_files)
-    missing = [f for f in ("llm_pool", "pace") if f not in shown]
+    consumer = [
+        f
+        for f in sorted(screen_files)
+        if re.search(r"\bllm_pool\b", read(f)) and PACE_FIELD.search(read(f))
+    ]
+    missing = [] if consumer else ["llm_pool", ".pace"]
     if missing:
         problems.append(
             f"{rel}: 花销这一屏（{', '.join(sorted(screen_files))}）没有读上游额度窗"
@@ -207,7 +217,7 @@ for rel in sorted(graph):
             "什么时候换窗"
         )
     else:
-        summary.append("额度窗: " + ", ".join(sorted(screen_files)))
+        summary.append("额度窗: " + ", ".join(consumer))
 
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))

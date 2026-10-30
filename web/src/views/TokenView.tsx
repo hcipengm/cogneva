@@ -530,18 +530,18 @@ function AllowanceWindow() {
               <>
                 <Reading
                   label="这一窗允许"
-                  value={compact(pace.allowance_tokens)}
+                  value={pace.allowance_tokens.toLocaleString()}
                   note={`实测容量按 ${spanOf(pace.window_secs)} 摊平到此刻`}
                 />
                 <Reading
                   label="这一窗已花"
-                  value={compact(pace.spent_tokens)}
+                  value={pace.spent_tokens.toLocaleString()}
                   tone={remaining < 0 ? 'warn' : 'plain'}
                   note="同一窗内，取自台账"
                 />
                 <Reading
                   label="差额"
-                  value={`${remaining < 0 ? '−' : ''}${compact(Math.abs(remaining))}`}
+                  value={`${remaining < 0 ? '−' : ''}${Math.abs(remaining).toLocaleString()}`}
                   tone={remaining < 0 ? 'warn' : 'plain'}
                   note={
                     remaining < 0
@@ -551,7 +551,7 @@ function AllowanceWindow() {
                 />
                 <Reading
                   label="一个整活"
-                  value={compact(pace.reserve_tokens)}
+                  value={pace.reserve_tokens.toLocaleString()}
                   note={
                     pace.reserve_population > 0
                       ? `测自 ${pace.reserve_population} 个已完成的活`
