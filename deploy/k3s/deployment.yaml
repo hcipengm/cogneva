@@ -206,6 +206,11 @@ spec:
             # 角色判，零凭证的调用方恒吃 401。不经安全网关。缺这个值＝归档未配置。
             - name: COGNEVA_MEMORY_API_BASE
               value: "http://127.0.0.1:8085"
+            # 容器自报的落点：跑本镜像的每个容器把进程表推到这里。与 chart 的
+            # gateway 部署同源（端口取自 gateway.internalPort），写在这里是为了
+            # parity 能逐字段对上，不是第二处可改的配置。
+            - name: COGNEVA_PROCESS_REPORT_URL
+              value: "http://cogneva:8085/api/v1/cluster/process-report"
             # 免费网页检索后端（集群内 SearXNG），与 chart 的 gateway 部署同源。
             - name: COGNEVA_WEB_SEARCH_BASE
               value: "http://searxng:8080"

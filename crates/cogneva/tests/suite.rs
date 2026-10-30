@@ -125,6 +125,8 @@ mod capability_declarations_are_enumerated;
 mod change_kind_vocabulary_test;
 #[path = "change_ledger_read_face.rs"]
 mod change_ledger_read_face;
+#[path = "chart_declared_ports_reach_the_process_test.rs"]
+mod chart_declared_ports_reach_the_process_test;
 #[path = "chart_template_literals_contract_test.rs"]
 mod chart_template_literals_contract_test;
 #[path = "ci_gate_parity_contract_test.rs"]

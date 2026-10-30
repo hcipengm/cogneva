@@ -206,10 +206,13 @@ spec:
                   name: cogneva-secrets-oob
                   key: github-oauth-client-secret
                   optional: true
-            # webhook 入口（8082）：验平台签名后附内部 HMAC 转发主应用
-            # （默认 http://cogneva:9091，可用 COGNEVA_WEBHOOK_FORWARD_URL
-            # 覆盖）。任一 secret 未配置时对应端点一律 503（fail-closed），
-            # 真实值带外写入（kubectl edit secret cogneva-secrets-oob）。
+            # webhook 入口（8082）：验平台签名后附内部 HMAC 转发主应用。
+            # 转发基址与 chart 的 securityGateway 部署同源（端口取自
+            # gateway.webhookPort），写在这里是为了 parity 能逐字段对上，
+            # 不是第二处可改的配置。任一 secret 未配置时对应端点一律 503
+            # （fail-closed），真实值带外写入（kubectl edit secret cogneva-secrets-oob）。
+            - name: COGNEVA_WEBHOOK_FORWARD_URL
+              value: "http://cogneva:9091"
             - name: COGNEVA_GITHUB_WEBHOOK_SECRET
               valueFrom:
                 secretKeyRef:

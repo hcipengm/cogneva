@@ -300,6 +300,12 @@ spec:
               value: {{ .Values.securityGateway.llmProxyPort | int | quote }}
             - name: COGNEVA_SG_WEBHOOK_PORT
               value: {{ .Values.securityGateway.webhookPort | int | quote }}
+            # 验签之后的转发基址：主应用的 webhook 监听端口。与上面那三条同一个道理——
+            # 只改 values 而不传 env，挪动的就只有主应用的容器端口、Service 与策略，
+            # 安全网关仍把验过签的请求发到出厂那个端口上。上游看到的是一次超时，读起来
+            # 像平台没有发出 webhook，而实际上它发了、也被验过了。
+            - name: COGNEVA_WEBHOOK_FORWARD_URL
+              value: {{ printf "http://cogneva:%d" (int .Values.gateway.webhookPort) | quote }}
             # 观测通道监听端口；与容器端口同源 values，避免两处漂移。
             - name: COGNEVA_SG_METRICS_PORT
               value: {{ .Values.securityGateway.metricsPort | quote }}

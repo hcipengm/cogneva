@@ -212,6 +212,14 @@ spec:
             # unconfigured 的原因。
             - name: COGNEVA_MEMORY_API_BASE
               value: {{ printf "http://127.0.0.1:%d" (int .Values.gateway.internalPort) | quote }}
+            # 容器自报的落点（`POST /api/v1/cluster/process-report`）：跑本镜像的每个
+            # 容器把进程表推到这里，网关据此答「现在跑着什么」。与上一条同一个端口，
+            # 走 Service 名而不是回环——多个副本各自上报自己，网关只留一份表。
+            # 缺这个值，代码里的缺省把端口钉在出厂那个数上：改 values 挪
+            # internalPort 之后 Service 与网络策略跟着走，上报却仍打到旧端口，而
+            # 那在这条读数上与「这些容器没有进程」同形。
+            - name: COGNEVA_PROCESS_REPORT_URL
+              value: {{ printf "http://cogneva:%d/api/v1/cluster/process-report" (int .Values.gateway.internalPort) | quote }}
             # 免费网页检索的后端（集群内 SearXNG）：本进程里的 agent 循环用它，
             # 与进化 Pod 同源同名，少一条就有一面的 `web_search` 用不了。
             - name: COGNEVA_WEB_SEARCH_BASE
