@@ -580,7 +580,24 @@ fn resolve_word(word: &str) -> Result<(&'static str, &'static str), String> {
 struct Computed {
     expr: &'static str,
     words: Words,
-    guard: &'static str,
+    guard: Guard,
+}
+
+/// What justifies a computed slot's words.
+enum Guard {
+    /// This text must appear in the file.
+    Text(&'static str),
+    /// The slot is bound by `for <ident> in <expr>`, and `<expr>` must be built
+    /// from that table. Checking the table rather than one literal loop header
+    /// is the point: `&TABLE`, `TABLE.iter()` and `TABLE.iter().filter(..)` all
+    /// say the same thing about where the words come from, and a guard written
+    /// as a bare substring goes stale on the first legal refactor. Measured
+    /// 2026-10-30: the loop gained a filter over the table's own column, the
+    /// table stayed, and this gate reported that the words had no owner.
+    LoopOver {
+        ident: &'static str,
+        table: &'static str,
+    },
 }
 
 enum Words {
@@ -607,32 +624,35 @@ const COMPUTED: &[Computed] = &[
     Computed {
         expr: "entry.resource",
         words: Words::WorkloadRows,
-        guard: "for entry in &WORKLOAD_KINDS",
+        guard: Guard::LoopOver {
+            ident: "entry",
+            table: "WORKLOAD_KINDS",
+        },
     },
     Computed {
         expr: "&consumer.kind",
         words: Words::WorkloadRows,
-        guard: "workload_kind_of_resource(&consumer.kind)",
+        guard: Guard::Text("workload_kind_of_resource(&consumer.kind)"),
     },
     Computed {
         expr: "w.kind",
         words: Words::WorkloadRows,
-        guard: "workload_kind_of_resource(w.kind)",
+        guard: Guard::Text("workload_kind_of_resource(w.kind)"),
     },
     Computed {
         expr: "resource",
         words: Words::WorkloadRows,
-        guard: "workload_kind_of_resource(resource)",
+        guard: Guard::Text("workload_kind_of_resource(resource)"),
     },
     Computed {
         expr: "kind",
         words: Words::WorkloadRows,
-        guard: "for kind in SUPPORT_WORKLOAD_KINDS",
+        guard: Guard::Text("for kind in SUPPORT_WORKLOAD_KINDS"),
     },
     Computed {
         expr: "&workload.kind_arg()",
         words: Words::Literal(&["deployment", "statefulset", "daemonset", "job"]),
-        guard: "kind_arg",
+        guard: Guard::Text("kind_arg"),
     },
     // Reading back a field this revision removed: `kubectl get <kind>` on an
     // object the previous bundle itself applied. The reachable words are the
@@ -650,7 +670,7 @@ const COMPUTED: &[Computed] = &[
             owner_file: "crates/cog-reflection/src/mainline_deployer.rs",
             owner_test: "the_evolution_role_covers_every_document_the_loop_will_apply",
         },
-        guard: "objects_that_lost_fields(",
+        guard: Guard::Text("objects_that_lost_fields("),
     },
 ];
 
@@ -704,6 +724,53 @@ fn binding_expr(src: &str, ident: &str) -> Option<String> {
     Some(rest[..end].trim().to_string())
 }
 
+/// Does a `for <ident> in <expr>` in this source build `<expr>` from `table`?
+///
+/// The iterable is read up to its opening brace, so a chain written across lines
+/// is the same statement as a one-liner. What is checked is the table the words
+/// come from, not how the table is spelled into a loop: `&TABLE`,
+/// `TABLE.iter()` and `TABLE.iter().filter(..)` are one fact about the source.
+fn loop_iterates(src: &str, ident: &str, table: &str) -> bool {
+    let needle = format!("for {ident} in ");
+    let mut at = 0usize;
+    while let Some(pos) = src[at..].find(&needle) {
+        let start = at + pos + needle.len();
+        let tail = &src[start..];
+        let end = tail.find('{').unwrap_or(tail.len());
+        if mentions_ident(&tail[..end], table) {
+            return true;
+        }
+        at = start;
+    }
+    false
+}
+
+/// Does this expression name `ident` as a whole identifier?
+///
+/// A substring test would accept `SUPPORT_WORKLOAD_KINDS` for `WORKLOAD_KINDS`
+/// and vouch for a table the slot never walks, so the neighbours have to be
+/// non-identifier characters.
+fn mentions_ident(expr: &str, ident: &str) -> bool {
+    let mut at = 0usize;
+    while let Some(pos) = expr[at..].find(ident) {
+        let begin = at + pos;
+        let end = begin + ident.len();
+        let before_ok = expr[..begin]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        let after_ok = expr[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
+        if before_ok && after_ok {
+            return true;
+        }
+        at = begin + 1;
+    }
+    false
+}
+
 fn bare_ident(slot: &str) -> Option<&str> {
     let t = slot.trim().trim_start_matches('&').trim();
     if !t.is_empty()
@@ -737,10 +804,17 @@ fn slot_words(
         }
     }
     if let Some(row) = COMPUTED.iter().find(|c| c.expr == slot.trim()) {
-        if !file_src.contains(row.guard) {
+        let (holds, described) = match row.guard {
+            Guard::Text(text) => (file_src.contains(text), format!("{text:?}")),
+            Guard::LoopOver { ident, table } => (
+                loop_iterates(file_src, ident, table),
+                format!("for {ident} in ...{table}"),
+            ),
+        };
+        if !holds {
             return Err(format!(
-                "槽位 {:?} 的来源判据 {:?} 在文件里找不到了：这几个字可能已经不是那张表给的",
-                slot, row.guard
+                "槽位 {:?} 的来源判据 {} 在文件里找不到了：这几个字可能已经不是那张表给的",
+                slot, described
             ));
         }
         used.insert(row.expr);
@@ -955,6 +1029,43 @@ fn the_scan_sees_the_commands_it_is_supposed_to() {
             "解析出来的资源面里没有 {word:?}：别名表或槽位解析坏了"
         );
     }
+}
+
+/// The words a slot gets from the workload table are recognised by the table,
+/// not by one spelling of the loop that walks it.
+///
+/// Written after the gate refused a loop that had gained a filter over the
+/// table's own column: the words still came from `WORKLOAD_KINDS`, but the loop
+/// header no longer matched the literal the guard was written as, so the gate
+/// reported "nobody owns this word" about a word it had just been told about.
+#[test]
+fn a_slot_bound_to_the_workload_table_is_recognised_in_any_loop_shape() {
+    for src in [
+        "for entry in &WORKLOAD_KINDS {\n",
+        "for entry in WORKLOAD_KINDS.iter().filter(|e| !e.done) {\n",
+        "for entry in WORKLOAD_KINDS\n            .iter()\n            .filter(|e| !e.done)\n        {\n",
+    ] {
+        assert!(
+            loop_iterates(src, "entry", "WORKLOAD_KINDS"),
+            "这个形状读不出「词来自那张表」：{src}"
+        );
+    }
+    assert!(
+        !loop_iterates(
+            "for entry in &SUPPORT_WORKLOAD_KINDS {\n",
+            "entry",
+            "WORKLOAD_KINDS"
+        ),
+        "走了另一张表的循环被当成了这张表的：门会替一张不存在的来源背书"
+    );
+    assert!(
+        !loop_iterates(
+            "for other in &WORKLOAD_KINDS {\n",
+            "entry",
+            "WORKLOAD_KINDS"
+        ),
+        "变量名不同也算，槽位的绑定就没人证明了"
+    );
 }
 
 /// A file that talks to the cluster must be classified, not merely absent.
