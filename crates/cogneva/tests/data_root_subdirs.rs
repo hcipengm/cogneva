@@ -14,17 +14,13 @@
 //! `deploy/scripts/check-backup-coverage.sh` 只剩卷覆盖那一半——子目录这一半整体
 //! 搬到了这里，脚本里不再有第二份清单。
 
-use cogneva::backup::{SubdirClass, DATA_ROOT_SUBDIRS};
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+mod common;
 
-fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/cogneva 之上应该还有两级")
-        .to_path_buf()
-}
+use cogneva::backup::{SubdirClass, DATA_ROOT_SUBDIRS};
+use common::routes::{repo_root, walk};
+use common::rust_production::production_text_keeping_comments;
+use std::collections::BTreeMap;
+use std::path::Path;
 
 /// 应用配置里的数据根。读不到才用默认值——普查面跟着配置走，不跟着脚本里的常量走。
 fn data_dir(root: &Path) -> String {
@@ -43,20 +39,6 @@ fn data_dir(root: &Path) -> String {
         }
     }
     "/var/lib/cogneva-data".to_string()
-}
-
-fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rs_files(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            out.push(path);
-        }
-    }
 }
 
 fn find_seq(haystack: &[char], needle: &[char]) -> Option<usize> {
@@ -267,7 +249,7 @@ fn consts_in(text: &str) -> BTreeMap<String, String> {
 /// 代码里由 `data_dir` / `COGNEVA_DATA_DIR` 拼出来的一级路径段。
 fn rust_segments(root: &Path) -> BTreeMap<String, String> {
     let mut files = Vec::new();
-    rs_files(&root.join("crates"), &mut files);
+    walk(&root.join("crates"), &["rs"], &mut files);
     let mut found = BTreeMap::new();
     for path in files {
         // 测试目录里的 `data_dir.join("…")` 是夹具，不是对数据根的判断：本文件
@@ -280,11 +262,9 @@ fn rust_segments(root: &Path) -> BTreeMap<String, String> {
         };
         let consts = consts_in(&text);
         // 测试块里的 data_dir 是临时目录：`..data`、`jwt-secret` 这类名字会把普查面
-        // 变成一幅假的现场。
-        let text = match text.find("#[cfg(test)]") {
-            Some(cut) => &text[..cut],
-            None => text.as_str(),
-        };
+        // 变成一幅假的现场。切法用共享的那一份——切在第一个 `#[cfg(test)]` 上会把
+        // 它之后的产出整段丢掉，而「那里没有」与「那里没读」在判词上是同一句话。
+        let text = production_text_keeping_comments(&text);
         // 往回看四行而不是一行：`std::env::var("COGNEVA_DATA_DIR")` 后面常跟
         // `.ok().filter(…).unwrap_or_else(…)` 的链，join 落在第三、四行上。
         let mut recent: Vec<&str> = vec![""; 4];
@@ -338,23 +318,6 @@ fn paths_under(text: &str, mount: &str) -> Vec<String> {
     out
 }
 
-fn glob_yaml(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            glob_yaml(&path, out);
-        } else if path
-            .extension()
-            .is_some_and(|ext| ext == "yaml" || ext == "yml")
-        {
-            out.push(path);
-        }
-    }
-}
-
 /// 普查面：代码、应用配置、渲染清单三条来源的并集。
 ///
 /// 并集而不是任何一条单独成面：`git-remote` 只在渲染清单里出现，`warehouse` 只在
@@ -370,7 +333,11 @@ fn census(root: &Path, mount: &str) -> BTreeMap<String, String> {
         }
     }
     let mut rendered = Vec::new();
-    glob_yaml(&root.join("deploy/rendered"), &mut rendered);
+    walk(
+        &root.join("deploy/rendered"),
+        &["yaml", "yml"],
+        &mut rendered,
+    );
     for path in rendered {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
