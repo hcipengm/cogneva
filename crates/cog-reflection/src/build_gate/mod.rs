@@ -1541,9 +1541,13 @@ fn readings(
         label(RawMetric::new(BUILD_GATE_EXCLUDED, c.excluded as f64)),
         label(RawMetric::new(BUILD_GATE_WAITING, c.waiting as f64)),
         label(RawMetric::new(BUILD_GATE_ACQUIRED_TOTAL, c.acquired as f64)),
-        // Always a row, zero included: "the disk never stalled while nothing was
-        // building" and "this process never looked" have to be different rows,
-        // and only the second one is a defect in the reading.
+        // Always a row, zero included. A series that appears only once it moves
+        // makes "quiet" and "not measured" the same absence, and the rule that
+        // reads this one fires on a value rather than on a presence. The zero is
+        // not proof of quiet either -- a kernel with no `full` line in
+        // /proc/pressure/io can never move this counter -- so what the row does
+        // mean is bounded by who published it: the selector names the process
+        // that holds slots, and only that process looks.
         label(RawMetric::new(
             BUILD_GATE_IO_OUTSIDE_SECONDS,
             c.io_outside_ms as f64 / 1000.0,
