@@ -420,7 +420,6 @@ pub const COVERED_ROWS: &str = "cogneva_project_control_covered_rows";
 /// 上一次量成覆盖的时刻（unix 秒）；0 表示这一版还没量成过。
 pub const COVERAGE_MEASURED_UNIX: &str = "cogneva_project_control_coverage_measured_unix";
 
-const COVERAGE_KIND_LABEL: &str = "kind";
 /// 任务行有没有一行基线（`task_plan`）：没有基线的行三个挣值量一个都算不了。
 const KIND_TASK_BASELINE: &str = "task_baseline";
 /// 同上，人口收窄到「已经开工或已经收尾」的行。
@@ -480,11 +479,11 @@ impl cog_core::Observable for Readings {
             let (coverable, covered) = cells(coverage);
             readings.push(
                 cog_core::observability::RawMetric::new(COVERABLE_ROWS, coverable as f64)
-                    .with_label(COVERAGE_KIND_LABEL, kind),
+                    .with_label(crate::LABEL_KIND, kind),
             );
             readings.push(
                 cog_core::observability::RawMetric::new(COVERED_ROWS, covered as f64)
-                    .with_label(COVERAGE_KIND_LABEL, kind),
+                    .with_label(crate::LABEL_KIND, kind),
             );
         }
         readings.push(cog_core::observability::RawMetric::new(
@@ -1093,9 +1092,7 @@ mod tests {
     ) -> Option<f64> {
         published
             .iter()
-            .find(|m| {
-                m.name == name && m.labels.get(COVERAGE_KIND_LABEL).map(String::as_str) == kind
-            })
+            .find(|m| m.name == name && m.labels.get(crate::LABEL_KIND).map(String::as_str) == kind)
             .map(|m| m.value)
     }
 
