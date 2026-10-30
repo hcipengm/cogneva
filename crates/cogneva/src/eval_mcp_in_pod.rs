@@ -32,7 +32,7 @@ use crate::eval_toolathlon::PodRuntime;
 ///
 /// 60 秒取自上游（`cfg.get("client_session_timeout_seconds", 60)`），不由调用点另定：
 /// 两个地方各定一个默认值，同一条配置就有两个超时，而慢的那一台会被读成坏的那一台。
-// cap: bound
+// cap: bound — 取自上游 client_session_timeout_seconds 的默认值，不由调用点另定：两处各定一个，同一条配置就有两个超时，慢的那台会被读成坏的那台
 pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 配置里那三个占位符。上游 runner 做的替换逐字就是这三个（`utils/mcp/tool_servers.py`

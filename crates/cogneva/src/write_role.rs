@@ -77,24 +77,24 @@ const DATABASE_URL_FLAG: &str = "--database-url";
 const REDIS_URL_FLAG: &str = "--redis-url";
 
 /// The role was taken or renewed: this writer may act this round.
-// cap: bound
+// cap: bound — 退出码只承担两件事：同一结局永远同一个数，不同结局不共用同一个数
 pub const EXIT_HOLDS_THE_ROLE: i32 = 0;
 /// The ask was made and the answer was no. Three different noes — the pool
 /// carries the work, another writer holds a live term, or nothing on record
 /// says the pool is down — and the printed line names which.
-// cap: bound
+// cap: bound — 同上：不同的结局拿不同的码，脚本才不会把「不许写」读成「没问出口」
 pub const EXIT_MUST_NOT_WRITE: i32 = 1;
 /// The ask never left this process: unusable arguments, or an end that is not
 /// configured. Nothing was learned about the role or the pool.
-// cap: bound
+// cap: bound — 同上：这个进程根本没把话问出去，与仲裁给出否定是两件事
 pub const EXIT_CANNOT_ASK: i32 = 2;
 /// The arbiter could not be read. Not a verdict about the role: an unreachable
 /// arbiter and a role someone else holds are different facts.
-// cap: bound
+// cap: bound — 同上：仲裁读不到不是关于角色的判词，所以它单独一个码
 pub const EXIT_ARBITER_SILENT: i32 = 3;
 /// No pool snapshot could be read. Not a verdict about the pool: absence must
 /// not be read as health, because taking over moves real code.
-// cap: bound
+// cap: bound — 同上：池的快照读不到不是关于池的判词；缺席不能被读成健康，因为接管会挪动真实的代码
 pub const EXIT_POOL_SILENT: i32 = 4;
 
 pub const USAGE: &str = "\

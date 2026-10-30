@@ -51,12 +51,12 @@ pub const DEFAULT_URL: &str = crate::process_report::DEFAULT_REPORT_URL;
 pub const NODE_ENV: &str = cog_core::env::NODE_NAME;
 
 /// 一拍多久。与容器自报同一个节奏：两边报的是同一份读数，节奏不该有两套。
-// cap: bound
+// cap: bound — 与容器自报同一个节奏：两边报的是同一份读数，节奏不该有两套
 pub const INTERVAL: Duration = Duration::from_secs(60);
 
 /// cgroup 树往下最多走几层。宿主布局是 `/kubepods.slice/<qos>.slice/<pod>.slice/<scope>`，
 /// 四层；留一倍余量，再多就不是我们认识的布局，而不是「树很深」。
-// cap: bound
+// cap: bound — 宿主布局是四层（/kubepods.slice/<qos>.slice/<pod>.slice/<scope>）；留一倍余量，再多就不是我们认识的布局
 const MAX_DEPTH: usize = 8;
 
 /// systemd 驱动给容器起的 scope 名。cgroupfs 驱动下叶子目录名就是 id 本身，

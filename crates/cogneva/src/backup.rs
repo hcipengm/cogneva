@@ -67,14 +67,14 @@ const DRILL_PASS_BUDGET_ENV: &str = "COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS";
 /// 没配 env 时单趟的预算。数与 values.yaml 的 `backup.drillPassBudgetSeconds`
 /// 同源，由 `deploy/scripts/tests/backup-drill-budget-covers-both-passes.test.sh`
 /// 盯着两边与 Job 界的关系。
-// cap: bound
+// cap: bound — 与 Job 的界同源，由 backup-drill-budget-covers-both-passes 那个测试盯着两边的关系
 const DRILL_PASS_BUDGET_DEFAULT_SECS: u64 = 3600;
 const QDRANT_HTTP_URL_ENV: &str = "COGNEVA_QDRANT_HTTP_URL";
 const IMAGE_REF_ENV: &str = "COGNEVA_IMAGE_REF";
 
 /// 落库的错误文本上限。错误本身通常只有一行，这个界是为了让一条失控的长错误
 /// （整段响应体、整张表名清单）不至于把行撑成不可读的东西。
-// cap: bound
+// cap: bound — 错误本身通常只有一行；这个界让一条失控的长错误（整段响应体、整张表名清单）不至于把行撑成不可读的东西
 const ERROR_TEXT_MAX_CHARS: usize = 2000;
 
 /// 一次运行默认的期限，也是集群清单里那个 `activeDeadlineSeconds` 的默认值。
@@ -83,7 +83,7 @@ const ERROR_TEXT_MAX_CHARS: usize = 2000;
 /// 落在里面的运行照跑，落在外面的那个不是慢，是卡死了——而它卡着的时候，
 /// 调度器的 `Forbid` 会让后面每一次都不再开始。没有这个界，一次挂住的运行
 /// 就能把备份永久停掉，顺带把「谁来给它收尾」也一并停掉。
-// cap: bound
+// cap: bound — 调度器的 Forbid 会让后面每一次都不再开始；没有这个界，一次挂住的运行就能把备份永久停掉
 const DEFAULT_RUN_DEADLINE_SECONDS: i32 = 3600;
 
 /// 内部实例密钥对象名：业务 Pod 读的那一份（数据库/缓存/内部签名/S3/邮件）。
@@ -2131,7 +2131,7 @@ fn current_schema_version() -> i64 {
 /// 跨段偏差的默认界：五分钟。超过它，包里几段就已经不是同一份数据了。可由
 /// `COGNEVA_BACKUP_MAX_SEGMENT_SKEW_SECONDS` 覆盖——大对象层在小机器上本来就慢，
 /// 把界写死会让那类环境每一晚都产出一个恢复端拒收的包。
-// cap: bound
+// cap: bound — 大对象层在小机器上本来就慢，写死会让那类环境每一晚都产出一个恢复端拒收的包，所以它可覆盖
 const DEFAULT_MAX_SEGMENT_SKEW_SECONDS: u64 = 300;
 
 fn max_segment_skew() -> u64 {
@@ -3701,7 +3701,7 @@ fn replace_dir(staged: &Path, live: &Path) -> std::io::Result<()> {
 pub const DRILL_DATABASE: &str = "cog_drill";
 
 /// 演练互斥锁的键。取自 `cog_dril` 的 ASCII，只要求集群内不与人撞车，不承担含义。
-// cap: bound
+// cap: bound — 取自 cog_dril 的 ASCII，只要求集群内不与人撞车，不承担含义
 const DRILL_LOCK_KEY: i64 = 0x636f_675f_6472_696c;
 
 /// 演练配置。只要库、卷与迁移目录。

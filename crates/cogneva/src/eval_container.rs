@@ -29,7 +29,7 @@ use cog_core::{SFError, SFResult, ToolExecutor};
 ///
 /// 这些探测只判「这台机器能不能建」，命令本身是秒级；20s 还没结束就说明守护
 /// 进程不在，与「不能建」是同一个结论。
-// cap: bound
+// cap: bound — 这条探测只判「这台机器能不能建」，命令本身是秒级；20s 还没结束说明守护进程不在，与「不能建」是同一个结论
 const PROBE_CONTAINER_WAIT: Duration = Duration::from_secs(20);
 use cog_eval::{
     parse_test_list, swe_pro_tool_definitions, tools_bound_to, CaseEnv, EvalCase, ExecLimits,

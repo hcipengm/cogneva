@@ -26,7 +26,7 @@ const PROBE_PATH: &str = "/health/ready";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// A status line longer than this is not a status line; stop reading rather
 /// than block until the timeout.
-// cap: bound
+// cap: bound — 比这更长的状态行不是状态行；停读，而不是一直阻塞到超时
 const STATUS_LINE_LIMIT: usize = 512;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {

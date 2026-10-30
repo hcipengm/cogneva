@@ -63,11 +63,11 @@ pub const AOF_REPAIR_VERDICT_PUBLISHED_METRIC: &str = "cogneva_aof_repair_verdic
 /// hold a long run of real 0x00 bytes; 4096 keeps the report from crying wolf on
 /// ordinary binary payloads while still catching anything page-shaped. Nothing
 /// is modified on this verdict, so a false positive costs one log line.
-// cap: bound
+// cap: bound — 长到盖过页大小的填充而不误伤普通二进制载荷；这个判词不改任何字节，误报只花一行日志
 const SUSPECTED_INTERIOR_RUN: usize = 4096;
 
 /// Read window for the tail scan and the interior scan.
-// cap: bound
+// cap: bound — 尾部扫描与内部扫描共用的同一个读窗
 const SCAN_CHUNK: usize = 64 * 1024;
 
 /// What happened to one file.

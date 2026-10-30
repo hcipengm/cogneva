@@ -34,13 +34,13 @@ use cog_core::{SFError, SFResult, ToolDefinition, ToolExecutor};
 /// 探测一条外部命令的墙：20s。
 ///
 /// 这里探的是「这台机器上的运行时认不认某种容器能力」，命令本身是秒级。
-// cap: bound
+// cap: bound — 探的是这台机器上的运行时认不认某种容器能力，命令本身是秒级
 const PROBE_COMMAND_WAIT: Duration = Duration::from_secs(20);
 
 /// 等 PG Pod Ready 的轮询间隔：2s。
 ///
 /// 总墙是 [`PG_READY_DEADLINE_SECS`]，这个数决定那个墙里最多问几次。
-// cap: bound
+// cap: bound — 总墙是 PG_READY_DEADLINE_SECS，这个数决定那个墙里最多问几次
 const POD_READY_POLL_INTERVAL: Duration = Duration::from_secs(2);
 use cog_eval::{
     tools_bound_to, CaseEnv, EvalCase, ExecSeam, ToolFactory, ToolathlonBackend, ToolathlonCheck,
@@ -121,11 +121,11 @@ const DEFAULT_NAMESPACE: &str = "cogneva";
 /// 单次 Pod 命令的时间上界（秒）。默认比 swe-bench-pro 那一侧宽：一道题要起库、导入
 /// `init.sql.gz`、跑前处理、再跑判分，其中导入那一步本身就按分钟计。这是一个**安全上界**
 /// 不是量出来的界，所以它可覆盖；它的意义是让一条卡住的命令变成一次带原因的失败。
-// cap: bound
+// cap: bound — 是安全上界而不是量出来的界，所以它可覆盖；它的意义是让一条卡住的命令变成一次带原因的失败
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
 /// 等库就绪的上界（秒）。超过就报「库没起来」，不是继续跑下去把每一格都判成错。
-// cap: bound
+// cap: bound — 超过就报「库没起来」，不是继续跑下去把每一格都判成错
 const PG_READY_DEADLINE_SECS: u64 = 300;
 
 /// pack 容器（跑题的那一个）的 limits。**这两个数是被额度逼出来的，不是拍的**：

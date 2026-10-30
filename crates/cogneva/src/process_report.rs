@@ -21,10 +21,10 @@ pub const REPORT_URL_ENV: &str = "COGNEVA_PROCESS_REPORT_URL";
 pub const DEFAULT_REPORT_URL: &str = "http://cogneva:8085/api/v1/cluster/process-report";
 /// 自报间隔。这一格答「现在跑着什么」，不是一条时间序列；六十秒一拍足够让停掉的
 /// 进程在下一拍消失，又不会把总线塞满。
-// cap: bound
+// cap: bound — 这一格答「现在跑着什么」不是时间序列；六十秒够让停掉的进程在下一拍消失，又不会把总线塞满
 pub const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 /// 与网关收口的条数一致：读多了也没人要，`/proc` 很大时按 PID 从小到大取。
-// cap: bound
+// cap: bound — 与网关收口的条数一致：读多了也没人要，/proc 很大时按 PID 从小到大取
 pub const MAX_PROCESSES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
