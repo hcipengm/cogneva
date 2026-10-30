@@ -16,7 +16,8 @@ import { resourceKey } from '@/store/frameTick';
  * 日上限的管理面：给某一格（人 / 工作空间 / 团队 / 组织 / 全局）写下
  * 一对 soft / hard，或把覆盖删掉、让它回到默认值。
  *
- * 这一面只写声明，不碰计数。两个读法必须同时给出，因为它们答的不是同一个问题：
+ * 这一面只写声明，不写计数：计数由安全网关逐调用记（今天只有「个人」这一格有写者）。
+ * 两个读法必须同时给出，因为它们答的不是同一个问题：
  * 声明（`limits`）答「这一格配过没有」，生效（`effective`）答「检查会怎么判」。
  * 没有覆盖时生效值就是默认值——只显示它会让人以为默认值是自己配的，于是
  * 「清除」这个按钮看起来永远没有效果。
@@ -144,15 +145,23 @@ export function QuotaLimitsPanel() {
           caveat="「声明」是有人为这一格写过的那一对，「生效」是检查此刻真正会用的那一对——没有覆盖时后者就是默认值。"
         >
           {/* 这一格配的是一对什么数：soft 落在 hard 之内的哪里，中间那截就是 soft
-              拦下调用之前预留的余量。用量那一格不画——「今天已记」恒为 0 的原因是
-              这套部署里没有任何一方往计数器里记数（见页脚），把它画成一根零长度的
-              条就是拿「没量过」冒充「一条都没有」。 */}
+              拦下调用之前预留的余量。用量那条只在「个人」这一格画——五级里只有它
+              有写者（安全网关按每次调用声明的属主记真实 token），其余四格至今没有，
+              把它们画成一根零长度的条就是拿「没量过」冒充「一条都没有」。 */}
           {shownPair !== null && shownPair.hard_limit > 0 && (
             <Meter
               label={reading.limits ? '声明：soft 落在 hard 之内的哪里' : '生效：soft 落在 hard 之内的哪里'}
               value={shownPair.soft_limit}
               max={shownPair.hard_limit}
               note={`${shownPair.soft_limit.toLocaleString()} / ${shownPair.hard_limit.toLocaleString()}`}
+            />
+          )}
+          {reading.scope === 'user' && reading.effective.hard_limit > 0 && (
+            <Meter
+              label="这个人今天已花 / 生效的 hard"
+              value={reading.used_today}
+              max={reading.effective.hard_limit}
+              note={`${reading.used_today.toLocaleString()} / ${reading.effective.hard_limit.toLocaleString()}`}
             />
           )}
           <div className="flex flex-wrap py-2">
@@ -210,9 +219,11 @@ export function QuotaLimitsPanel() {
       </div>
 
       <p className="px-4 pb-3 text-[11px] text-[var(--muted)]">
-        这是一张声明表：写成什么样，下一节的刻度就是什么样。它现在量不到用量——本部署没有任何一方
-        往这套计数器里记数（拦调用的那层已经撤掉），所以「今天已记」读作 0 只说明没人记，不说明没人用。
-        花销的真账在观测页的 Token 面，那一侧由网关逐调用写。
+        个人的「今天已记」是实数：安全网关按每次调用声明的属主，把上游报的 token 记进这一格；
+        越过属主为此人声明过的 hard 之后，下一发会被拒（429，结果词 refused_by_owner_budget，
+        观测页的结局分布里单列一行）。没配过的人不会被这个默认值拦下，它只决定读出来是多少。
+        其余四格（工作空间 / 团队 / 组织 / 全局）今天仍然没有写者，它们读到的 0 只说明没人记，
+        不说明没人用。逐笔花销的真账在观测页的 Token 面。
       </p>
     </section>
   );
