@@ -6,6 +6,8 @@ import {
   setTaskBudget,
   type TaskBudgetReading,
 } from '@/api/client';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { Button, Empty, Table } from '@/ui/primitives';
 import { Meter, type Tone } from '@/ui/plots';
 
@@ -46,6 +48,17 @@ export function TaskBudgetPanel() {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // 这张表也会在**别人**写的时候变：一次成功的写落在 `/api/v1/admin/...` 下，网关按
+  // 前缀在总线上落一帧（`resource:admin`），这里订它。没有这一订，两条命令行的
+  // `task-budget set` 之后这张表要等到读者自己按「重读」才动——屏幕停在上一拍，而
+  // 它读的是服务端真实的读数，看起来像预算没写进去。
+  //
+  // 帧只触发重读，不碰输入框：用户可能正把一对上限改到一半。写完之后的对齐在 `run`
+  // 里做，那一次用户是看着结果按下去的。
+  useKindTickedRefresh([resourceKey('admin')], () => {
+    void refresh();
+  });
 
   const target = taskId.trim();
 
