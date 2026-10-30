@@ -3916,6 +3916,151 @@ fn every_series_recorded_as_produced_is_still_published_there() {
     );
 }
 
+/// A rule selects a *cell*, and the name gate stops at the brace.
+///
+/// `every_series_an_alert_rule_reads_is_one_something_produces` compares series
+/// names, so two rules over the same family are equally green whether or not
+/// the cells they select exist. `max(cogneva_tasks_readings{readout="held_unstated_rows"}) > 0`
+/// read `readout="held_unstated_row"` — one letter off a cell the producer
+/// writes — selects a series that exists and a value that never arrives, so it
+/// matches nothing and its silence is indistinguishable from health. Nothing in
+/// the tree reds: the producer is right, the name is right, and the rule is
+/// dead.
+///
+/// The cells checked are the ones selected from a series PRODUCED registers,
+/// whatever the label. The producer side is every string literal the tree
+/// writes outside the rule files themselves: this asks whether the cell is a
+/// name this workspace writes, which is what a rename or a typo breaks. Reading
+/// the rule files into that index would let every cell license itself.
+///
+/// A cell written only at run time (`format!`) is a false red here, and the
+/// message says which rule and cell so it is one line to fix — either the
+/// producer starts writing the literal or the rule stops selecting it.
+#[test]
+fn every_cell_a_rule_selects_is_a_name_this_tree_writes() {
+    let rules = shipped_rules();
+    let produced: BTreeSet<&str> = PRODUCED.iter().map(|(name, _)| *name).collect();
+    let cells: Vec<(String, String, String)> = rules
+        .iter()
+        .flat_map(|(_, promql)| promql::selected_cells(promql))
+        .filter(|(series, _, _)| produced.contains(series.as_str()))
+        .collect();
+    let labels: BTreeSet<&str> = cells.iter().map(|(_, label, _)| label.as_str()).collect();
+    assert!(
+        cells.len() >= 60 && labels.len() >= 15,
+        "只从 {} 条规则里收到 {} 个单元格、{} 个标签：这份普查的解析面塌了，下面「没有未知单元格」是空的",
+        rules.len(),
+        cells.len(),
+        labels.len()
+    );
+
+    let written = literals_the_tree_writes(&repo_root());
+    let unknown = cells_no_one_writes(&rules, &produced, &written);
+    assert!(
+        unknown.is_empty(),
+        "这些规则选中的标签值在规则文件之外一次都没被写下过，它们读的是一个永远不会出现的取值:\n{}",
+        unknown.join("\n")
+    );
+}
+
+/// The cells selected from a registered series whose value no file in the tree
+/// writes.
+fn cells_no_one_writes(
+    rules: &[(String, String)],
+    produced: &BTreeSet<&str>,
+    written: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for (rule, promql) in rules {
+        for (series, label, value) in promql::selected_cells(promql) {
+            if !produced.contains(series.as_str()) || written.contains(&value) {
+                continue;
+            }
+            out.push(format!("{rule}: {series}{{{label}=\"{value}\"}}"));
+        }
+    }
+    out
+}
+
+/// The gate separates the two answers against fabricated rules as well: a gate
+/// that has only ever run over cells that exist has not been shown to report
+/// one that does not.
+#[test]
+fn a_cell_no_producer_writes_is_reported_and_one_that_exists_is_not() {
+    let produced: BTreeSet<&str> = ["cogneva_tasks_readings"].into_iter().collect();
+    let written: BTreeSet<String> = ["held_unstated_rows"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    let rules = |promql: &str| vec![("rule".to_string(), promql.to_string())];
+
+    assert!(cells_no_one_writes(
+        &rules(r#"max(cogneva_tasks_readings{readout="held_unstated_rows"}) > 0"#),
+        &produced,
+        &written
+    )
+    .is_empty());
+    // One letter off, and the rule matches nothing for as long as it ships.
+    let complaints = cells_no_one_writes(
+        &rules(r#"max(cogneva_tasks_readings{readout="held_unstated_row"}) > 0"#),
+        &produced,
+        &written,
+    );
+    assert_eq!(complaints.len(), 1, "{complaints:?}");
+    assert!(
+        complaints[0].contains(r#"readout="held_unstated_row""#),
+        "{}",
+        complaints[0]
+    );
+    // An alternative of a regex is a cell too.
+    assert_eq!(
+        cells_no_one_writes(
+            &rules(r#"max(cogneva_tasks_readings{readout=~"held_unstated_rows|gone"}) > 0"#),
+            &produced,
+            &written
+        )
+        .len(),
+        1
+    );
+    // A series PRODUCED does not register is another gate's question.
+    assert!(cells_no_one_writes(
+        &rules(r#"max(not_ours_total{readout="gone"}) > 0"#),
+        &produced,
+        &written
+    )
+    .is_empty());
+}
+
+/// Every string literal a producer writes: the production sources of every
+/// crate, and the file PRODUCED names for a family produced outside one.
+///
+/// The rule files are not producers, so they are not in here — the chart's
+/// rules are config the chart renders, and their rendered copies under
+/// `deploy/rendered/` carry the same bytes. Indexing anything a rule is written
+/// in would let every cell license itself: the rule that selects a value would
+/// be the one place writing it, and the check would never once have an answer
+/// other than yes.
+fn literals_the_tree_writes(root: &std::path::Path) -> BTreeSet<String> {
+    use common::{fsio, rust_production};
+
+    let mut files = rust_production::production_sources(root);
+    files.extend(PRODUCED.iter().map(|(_, source)| root.join(source)));
+    let mut out = BTreeSet::new();
+    for path in files {
+        let text = fsio::read(&path);
+        let mut rest = text.as_str();
+        while let Some(open) = rest.find('"') {
+            let after = &rest[open + 1..];
+            let Some(close) = after.find('"') else {
+                break;
+            };
+            out.insert(after[..close].to_string());
+            rest = &after[close + 1..];
+        }
+    }
+    out
+}
+
 /// FOREIGN is an allow-list, and the one thing an allow-list must never name is
 /// something this workspace publishes.
 ///

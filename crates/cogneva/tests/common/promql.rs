@@ -190,6 +190,133 @@ pub fn metric_names_in(expr: &str) -> BTreeSet<String> {
     names
 }
 
+/// The `(series, label, value)` cells an expression selects.
+///
+/// `metric_names_in` stops at the brace: two rules can read the same series and
+/// different cells, and the cells are names in their own right — a rule that
+/// selects `readout="held_unstated_rows"` after the producer renamed that cell
+/// reads a series that exists and a value that never arrives, so it matches
+/// nothing and its silence reads as health.
+///
+/// Only `=` and `=~` select. `!=` and `!~` name the cells the rule excludes,
+/// and an alternative carrying a regex operator (`fail.*`, `.*`) is a pattern
+/// rather than a cell, for the same reason `selects_value` refuses one: it
+/// would claim to select whatever the producer writes next.
+pub fn selected_cells(expr: &str) -> Vec<(String, String, String)> {
+    let bytes = expr.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        // The series name is the identifier run ending at the brace, with
+        // whitespace allowed between the two.
+        let mut name_end = i;
+        while name_end > 0 && bytes[name_end - 1].is_ascii_whitespace() {
+            name_end -= 1;
+        }
+        let mut name_start = name_end;
+        while name_start > 0 && name_byte(bytes[name_start - 1]) {
+            name_start -= 1;
+        }
+        // Match the closing brace by nesting: a template (`{{…}}`) and a
+        // selector written inside another one both put more than one brace in
+        // the span.
+        let mut depth = 0usize;
+        let mut j = i;
+        while j < bytes.len() {
+            match bytes[j] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let series = &expr[name_start..name_end];
+        // A brace with no series name in front of it is a grouping or a
+        // template delimiter, not a selector.
+        if !series.is_empty() {
+            selected_cells_of_body(series, &expr[i + 1..j], &mut out);
+        }
+        i = j + 1;
+    }
+    out
+}
+
+fn selected_cells_of_body(series: &str, body: &str, out: &mut Vec<(String, String, String)>) {
+    for piece in body.split(',') {
+        // A templated matcher arrives as `{readout="x"}`: the inner braces are
+        // the template's, not a second selector's.
+        let piece = piece
+            .trim()
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        let found = [
+            ("!~", None),
+            ("!=", None),
+            ("=~", Some(true)),
+            ("=", Some(false)),
+        ]
+        .iter()
+        .filter_map(|(needle, selects)| piece.find(needle).map(|at| (at, *selects, needle.len())))
+        .min_by_key(|(at, _, _)| *at);
+        let Some((at, selects, len)) = found else {
+            continue;
+        };
+        let Some(selects) = selects else {
+            continue;
+        };
+        let label = piece[..at].trim();
+        if label.is_empty() || !label.bytes().all(name_byte) {
+            continue;
+        }
+        let Some(value) = piece[at + len..]
+            .trim()
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+        else {
+            continue;
+        };
+        if selects {
+            for alternative in value.split('|') {
+                let alternative = alternative.trim();
+                if alternative.is_empty() || alternative.bytes().any(regex_operator) {
+                    continue;
+                }
+                out.push((
+                    series.to_string(),
+                    label.to_string(),
+                    alternative.to_string(),
+                ));
+            }
+        } else {
+            out.push((series.to_string(), label.to_string(), value.to_string()));
+        }
+    }
+}
+
+fn name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte == b':'
+}
+
+fn regex_operator(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'*' | b'+' | b'?' | b'[' | b']' | b'{' | b'}' | b'(' | b')' | b'^' | b'$' | b'\\' | b'|'
+    )
+}
+
 /// The operand of every `sum`/`avg` aggregation in the expression.
 ///
 /// The operand is taken by matching parentheses, not by taking the first
@@ -1973,6 +2100,47 @@ mod tests {
             let got: Vec<String> = metric_names_in(expr).into_iter().collect();
             assert_eq!(&got, expected, "{expr}");
         }
+    }
+
+    /// The cells are read where the names are already read, and the two
+    /// spellings of a selection are the two `selects_value` accepts.
+    #[test]
+    fn the_cells_a_rule_selects_are_the_ones_it_names() {
+        let cells = selected_cells;
+        assert_eq!(
+            cells(r#"a{readout="held"}"#),
+            vec![("a".into(), "readout".into(), "held".into())]
+        );
+        // Each alternative is a cell; the exclusion matchers name no cell.
+        assert_eq!(
+            cells(r#"a{outcome=~"failed|refused"}"#),
+            vec![
+                ("a".into(), "outcome".into(), "failed".into()),
+                ("a".into(), "outcome".into(), "refused".into()),
+            ]
+        );
+        assert!(cells(r#"a{outcome!="failed"}"#).is_empty());
+        assert!(cells(r#"a{outcome!~"failed|refused"}"#).is_empty());
+        // A pattern is not a cell.
+        assert!(cells(r#"a{outcome=~"fail.*"}"#).is_empty());
+        assert_eq!(
+            cells(r#"a{outcome=~"fail.*|failed"}"#),
+            vec![("a".into(), "outcome".into(), "failed".into())]
+        );
+        // Two selectors, two series, and a templated matcher is still a cell.
+        assert_eq!(
+            cells(r#"max(a{x="1"}) / b{y="2"}"#),
+            vec![
+                ("a".into(), "x".into(), "1".into()),
+                ("b".into(), "y".into(), "2".into()),
+            ]
+        );
+        assert_eq!(
+            cells(r#"a{{readout="held"}} > 0"#),
+            vec![("a".into(), "readout".into(), "held".into())]
+        );
+        // A brace with no series in front of it names nothing to check.
+        assert!(cells(r#"{{ .Values.x }}"#).is_empty());
     }
 
     /// The defect this gate was written for: the operator between the two
