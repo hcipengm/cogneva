@@ -95,14 +95,21 @@ pub(crate) fn write_failed_message(attempts: u32, last_error: &str) -> String {
     )
 }
 
+/// How long the first wait before a retry is.
+///
+/// A fifth of a second: long enough to ride out a connection reset, short
+/// enough that a store which is really down is declared in the same second
+/// rather than holding a task open behind it.
+// cap: bound
+const BACKOFF_BASE_MS: u64 = 200;
+
 /// How long to wait before the next attempt, by the attempt that just failed.
 ///
-/// Doubling from a fifth of a second, so three attempts span about a second:
-/// long enough to ride out a connection reset or a rolling PostgreSQL restart,
-/// short enough that a store which is really down is declared in the same
-/// second rather than holding a task open behind it.
+/// Doubling from [`BACKOFF_BASE_MS`], so three attempts span about a second.
+/// The shift is capped so a caller that asks for many attempts spends its
+/// budget on a store that might come back rather than on one that will not.
 fn backoff_before(attempt: u32) -> Duration {
-    Duration::from_millis(200_u64 << attempt.min(4))
+    Duration::from_millis(BACKOFF_BASE_MS << attempt.min(4))
 }
 
 /// Offer one write to the store until it lands or the attempts run out.
