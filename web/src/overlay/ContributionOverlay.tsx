@@ -133,7 +133,10 @@ export function ContributionOverlay({ onClose }: { onClose: () => void }) {
     try {
       const g = await startGiteeOAuth(window.location.origin);
       setGitee(g);
-      window.open(g.authorize_url, '_blank', 'noopener');
+      // 回调落在公开落地页上，它唯一能把 code 送回来的路是 `window.opener`：
+      // 带 `noopener` 就等于把这条路封死，那一页只剩「把码显示出来让人复制」。
+      // 同一个落地页在登录入口那边一直是自动回送的，两个入口走的是同一条链。
+      window.open(g.authorize_url, 'cogneva-oauth', 'width=720,height=820');
       setPhase('gitee');
     } catch (err) {
       setError(explain(err));
@@ -141,21 +144,43 @@ export function ContributionOverlay({ onClose }: { onClose: () => void }) {
     }
   };
 
-  const finishGitee = async () => {
+  const completeGitee = useCallback(
+    async (raw: string) => {
+      if (!gitee) return;
+      setError(null);
+      setPhase('loading');
+      try {
+        const r = await exchangeGiteeOAuth(gitee.state, raw.trim());
+        setMessage(r.message);
+        setGitee(null);
+        setPasted('');
+        setPhase('idle');
+        void load();
+      } catch (err) {
+        setError(explain(err));
+        setPhase('gitee');
+      }
+    },
+    [gitee, load]
+  );
+
+  // 落地页把 code `postMessage` 回打开它的窗口。它的 origin 不是我们的（那是一张
+  // 公开页），所以凭证是发起时写进 state 的那串：服务端换码时按一次性消费它。
+  // 少了这一支，用户点完授权还得多做一个复制粘贴——而弹窗打开时已经带着 opener。
+  useEffect(() => {
     if (!gitee) return;
-    setError(null);
-    setPhase('loading');
-    try {
-      const r = await exchangeGiteeOAuth(gitee.state, pasted);
-      setMessage(r.message);
-      setGitee(null);
-      setPasted('');
-      setPhase('idle');
-      void load();
-    } catch (err) {
-      setError(explain(err));
-      setPhase('gitee');
-    }
+    const onMessage = (e: MessageEvent) => {
+      const data = (e.data ?? {}) as { type?: string; code?: string; state?: string };
+      if (data.type !== 'cogneva-gitee-oauth') return;
+      if (!data.code || data.state !== gitee.state) return;
+      void completeGitee(data.code);
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, [gitee, completeGitee]);
+
+  const finishGitee = async () => {
+    await completeGitee(pasted);
   };
 
   const submitPat = async () => {
@@ -324,18 +349,20 @@ export function ContributionOverlay({ onClose }: { onClose: () => void }) {
             </div>
           ) : phase === 'pat' ? (
             <div className="space-y-3">
-              <div className="flex gap-2">
-                {(['github', 'gitee'] as const).map((p) => (
-                  <button
-                    key={p}
-                    type="button"
-                    onClick={() => setPatProvider(p)}
-                    className={`${smallBtn} ${patProvider === p ? 'border-blue-500 text-blue-300' : ''}`}
-                  >
-                    {p === 'github' ? 'GitHub' : 'Gitee'}
-                  </button>
-                ))}
-              </div>
+              {/* 平台是一个选择，不是两个并列的按钮：按钮并排时看着像"两格输入"，
+                  贴令牌的人会把 Gitee 的贴进 GitHub 那一格，而写入成功、连接失败的
+                  读数与「令牌无效」同形。设置页上那一行早就是下拉了。 */}
+              <select
+                value={patProvider}
+                onChange={(e) =>
+                  setPatProvider(e.target.value === 'gitee' ? 'gitee' : 'github')
+                }
+                className={inputCls}
+                aria-label="令牌属于哪个平台"
+              >
+                <option value="github">GitHub</option>
+                <option value="gitee">Gitee</option>
+              </select>
               <input
                 type="password"
                 value={pat}

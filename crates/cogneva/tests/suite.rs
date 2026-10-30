@@ -277,6 +277,8 @@ mod notification_contract_matches_its_schema;
 mod notification_delivery_over_a_socket_test;
 #[path = "notification_outlet_reachability_test.rs"]
 mod notification_outlet_reachability_test;
+#[path = "oauth_popup_keeps_its_opener_test.rs"]
+mod oauth_popup_keeps_its_opener_test;
 #[path = "observability_alert_face_literals_contract_test.rs"]
 mod observability_alert_face_literals_contract_test;
 #[path = "observability_alert_rule_contract_test.rs"]

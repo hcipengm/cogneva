@@ -23,9 +23,9 @@
 //! 变量时按读不到处理，直接红；回调落地页的 URL（运维页里的 `GH_APP_LANDING` 与
 //! Helm values 里那份默认值）属于部署配置面，不在本门。
 //!
-//! 实测（2026-10-27）：客户端面 2 处 `postMessage` 发出 3 种消息（登录落地页 1 种、
-//! `docs/oauth-callback.html` 2 种），5 处 `message` 监听器收这 3 种（运维页 3、
-//! WebUI 2），两向都空；`state` 前缀两边都是 `ghapp:`；消息体的键 7 个（`type`、
+//! 实测（2026-10-30）：客户端面 2 处 `postMessage` 发出 3 种消息（登录落地页 1 种、
+//! `docs/oauth-callback.html` 2 种），6 处 `message` 监听器收这 3 种（运维页 3、
+//! WebUI 3），两向都空；`state` 前缀两边都是 `ghapp:`；消息体的键 7 个（`type`、
 //! `data`、`code`、`state`、`auth`、`access_token`、`refresh_token`、`user`）。
 //! 消融：把落地页三元里的 `'cogneva-app-manifest'` 改成 `'cogneva-app-manifest-v2'`，
 //! 本门红，一边点名登记的那条消息再没人发、一边点名这个新词不在表里；改回即绿。
@@ -46,6 +46,7 @@ const LOGIN_PAGE: &str = "crates/cog-gateway/src/auth/platform.rs";
 const AUTH_RESPONSE: &str = "crates/cog-gateway/src/auth/mod.rs";
 const WEB_AUTH: &str = "web/src/hooks/useAuth.ts";
 const WEB_OAUTH: &str = "web/src/overlay/AuthOverlay.tsx";
+const WEB_CONTRIB: &str = "web/src/overlay/ContributionOverlay.tsx";
 
 /// 一条消息：寄出去的那个词、两端各自的拼写、消息体里的键。
 struct Message {
@@ -143,6 +144,7 @@ const MESSAGES: &[Message] = &[
         receivers: &[
             (OPERATOR, "d.type !== 'cogneva-gitee-oauth'"),
             (WEB_OAUTH, "data.type !== 'cogneva-gitee-oauth'"),
+            (WEB_CONTRIB, "data.type !== 'cogneva-gitee-oauth'"),
         ],
         wires: &[
             Wire {
@@ -165,6 +167,10 @@ const MESSAGES: &[Message] = &[
                         WEB_OAUTH,
                         "if (!data.code || data.state !== pending.state) return;",
                     ),
+                    (
+                        WEB_CONTRIB,
+                        "if (!data.code || data.state !== gitee.state) return;",
+                    ),
                 ],
             },
             Wire {
@@ -178,6 +184,10 @@ const MESSAGES: &[Message] = &[
                     (
                         WEB_OAUTH,
                         "if (!data.code || data.state !== pending.state) return;",
+                    ),
+                    (
+                        WEB_CONTRIB,
+                        "if (!data.code || data.state !== gitee.state) return;",
                     ),
                 ],
             },
