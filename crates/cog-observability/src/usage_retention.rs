@@ -59,7 +59,7 @@ pub const DEPLOYMENT_LABEL: &str = "deployment";
 /// that bought it are gone. What ends at thirty days is the per-call detail —
 /// which task bought which tokens — and that is a promise about the ledger
 /// rather than a side effect of the table's size.
-// cap: bound
+// cap: bound — 「哪条任务买了多少 token」是关于这本账的承诺，不是表大小的副作用
 pub const DEFAULT_KEEP_DAYS: i64 = 30;
 
 /// The shortest retention this loop will accept.
@@ -67,7 +67,7 @@ pub const DEFAULT_KEEP_DAYS: i64 = 30;
 /// One day. Zero or negative days would erase the ledger every pass, which
 /// reads as a working retention while destroying the rows the current hour's
 /// fold is computed from — the value falls back rather than being honoured.
-// cap: bound
+// cap: bound — 更短读作一条在工作的保留期，却把当前小时那个折赖以计算的删掉；低于它的值回退
 pub const MIN_KEEP_DAYS: i64 = 1;
 
 /// The environment variable that carries the retention.
@@ -78,7 +78,7 @@ pub const KEEP_DAYS_ENV: &str = "COGNEVA_LLM_USAGE_KEEP_DAYS";
 /// Five minutes, for the same reason the prompt archive uses it: the readings
 /// this loop publishes are what the alert rules read, and Prometheus drops a
 /// series it has not seen for five minutes.
-// cap: bound
+// cap: bound — 这个循环发布的是告警规则读的那些系列，而 Prometheus 五分钟见不到就丢
 pub const PERIOD: Duration = Duration::from_secs(300);
 
 /// How many rows one statement may delete.
@@ -86,7 +86,7 @@ pub const PERIOD: Duration = Duration::from_secs(300);
 /// Two thousand rows is a few hundred kilobytes and a short lock. The pass
 /// repeats until it finds nothing past the cutoff, so the number of batches
 /// follows the backlog rather than the batch size.
-// cap: bound
+// cap: bound — 循环重复到切点之外没有行为止，所以批数跟的是积压而不是批量
 const BATCH_ROWS: i64 = 2_000;
 
 /// What one pass did, so a caller can assert on it rather than infer it.

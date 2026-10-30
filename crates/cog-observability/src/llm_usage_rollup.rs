@@ -35,14 +35,14 @@ pub const LOOP: &str = "observability_llm_usage_rollup";
 /// enough that a shift in where the tokens go is visible the same day. This is
 /// a property of the reading, not a knob — a deployment that wanted a different
 /// window would want a different series, not a different number here.
-// cap: bound
+// cap: bound — 是这条读数的属性不是旋钮：想要另一个窗的部署想要的是另一条序列，不是这里换个数字
 pub const WINDOW_SECS: i64 = 3600;
 
 /// How often the loop looks for windows that have closed.
 ///
 /// Shorter than a window so a closed one lands well before the next boundary,
 /// which keeps the newest folded window close to now without polling.
-// cap: bound
+// cap: bound — 短于一个窗，关上的窗才会在下个边界之前落好，最新折好的窗贴近现在而不靠轮询
 pub const PERIOD: Duration = Duration::from_secs(600);
 
 /// How far back a first run reaches.
@@ -53,7 +53,7 @@ pub const PERIOD: Duration = Duration::from_secs(600);
 /// from the table itself and are not bounded by this — a gap longer than the
 /// lookback because the fold never ran would otherwise be skipped, and a skipped
 /// window is exactly the hole the fold exists to prevent.
-// cap: bound
+// cap: bound — 折从来没跑过时留下的那段会因此被跳过，而被跳过的窗正是这个折要防的洞
 pub const LOOKBACK_SECS: i64 = 7 * 24 * 3600;
 
 /// How many windows one pass may add to the *older* end of the fold.
@@ -66,7 +66,7 @@ pub const LOOKBACK_SECS: i64 = 7 * 24 * 3600;
 /// covered 24 of them. The number is windows rather than rows because the
 /// cost of a window is set by how many combinations it carries, which is a
 /// property of the deployment rather than of the backlog.
-// cap: bound
+// cap: bound — 一个窗的代价由它带多少种组合决定，那是部署的属性而不是积压的属性
 pub const BACKFILL_WINDOWS_PER_PASS: usize = 24;
 
 /// Fold the windows that have closed since the last fold, then carry the fold's

@@ -111,7 +111,7 @@ pub fn needs_the_hold(later: &DocumentDelivery) -> bool {
 ///
 /// A third of the sighting window, so a miss or two of the tick is not what
 /// decides whether the row reads as maintained.
-// cap: bound
+// cap: bound — 取的是目击窗的三分之一，所以少漏一两拍不决定这一行读不读作「在维护」
 const REASSERT_PERIOD: Duration = Duration::from_secs(300);
 
 /// Read the document, wait out the settle window, read it again, and act.

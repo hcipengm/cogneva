@@ -93,11 +93,11 @@ pub const INTERVAL_ENV: &str = "COGNEVA_IMAGE_SCAN_INTERVAL_SECS";
 ///
 /// Slower than the claim scan because this tree is much larger and changes on the
 /// scale of image pulls, not of a workload writing a file.
-// cap: bound
+// cap: bound — 比 claim 扫描慢，因为这棵树大得多，按镜像拉取变而不是按工作负载写文件变
 pub const DEFAULT_INTERVAL_SECS: u64 = 900;
 
 /// Fastest cadence a walk may run at.
-// cap: bound
+// cap: bound — 一次走查允许的最快节拍
 pub const MIN_INTERVAL_SECS: u64 = 60;
 
 /// Prefix of this scanner's name in the loop liveness census.

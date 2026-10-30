@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 ///
 /// 探针问的是「这个面还活着吗」，正常是毫秒级；5s 是「慢」与「死了」的分界，
 /// 更久只会让一轮巡检被一个不响的端点拖住。
-// cap: bound
+// cap: bound — 探针问的是「这个面还活着吗」，正常是毫秒级；5s 是「慢」与「死了」的分界，更久只会让一轮巡检被一个不响的端点拖住
 const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Result of a single probe.

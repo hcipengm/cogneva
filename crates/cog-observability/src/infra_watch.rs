@@ -74,7 +74,7 @@ pub const INFRA_WATCH_LOOP: &str = "infra_watch";
 /// first miss turns that into a close followed by a re-fire, which the receiver
 /// reads as a brand-new alert with a fresh `fired_at` -- a false "it was
 /// resolved and came back" for something that never went away.
-// cap: bound
+// cap: bound — 少于两拍就关，会让一条没消失的告警读成全新的、带着新 fired_at 的告警，一次「解决过又回来了」的假象
 const MISSING_TICKS_BEFORE_CLOSE: u32 = 2;
 
 /// Outlets the watcher drives. Both are optional: with no store the watcher
@@ -1123,7 +1123,7 @@ pub async fn query_prometheus(
 fn describe_api_error(body: &[u8]) -> Option<String> {
     /// Prometheus messages embed the whole match group; enough to recognise
     /// the cause, not enough to flood the alert row.
-    // cap: bound
+    // cap: bound — Prometheus 的消息会带上整个匹配组；够认出病因，又不够淹掉告警那一行
     const MAX_CHARS: usize = 300;
     let v: serde_json::Value = serde_json::from_slice(body).ok()?;
     let kind = v.get("errorType").and_then(|e| e.as_str())?;

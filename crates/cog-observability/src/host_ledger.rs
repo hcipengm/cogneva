@@ -89,7 +89,7 @@ pub const HOST_LEDGER_SLICES_INVISIBLE_RULE: &str = "host_ledger_slices_invisibl
 /// stay quiet -- and a bound nothing reaches says nothing about anything.
 /// What this floor is set to catch is the host being *held* under pressure,
 /// which is why the derived number comes from the minimum and not the peak.
-// cap: bound
+// cap: bound — 它要抓的是主机被压着「顶住」，所以派生量取的是最小值而不是峰值
 pub const HOST_SLICE_ANON_FLOOR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Environment variable naming the node this process is running on.

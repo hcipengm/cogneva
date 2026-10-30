@@ -16,7 +16,7 @@ use crate::usage_store::LlmUsageStore;
 ///
 /// 判据被配得极短时，这条界保证巡检不会变成对着表打的热循环；正常配置下巡检
 /// 周期是判据的一半，远大于这个下限。
-// cap: bound
+// cap: bound — 判据被配得极短时，这条界保证巡检不变成对着表打的热循环；正常配置下巡检周期是判据的一半，远大于它
 const MIN_SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Loop name reported through the background-loop liveness family.
@@ -1489,11 +1489,11 @@ pub const ALERT_BELL_ROLE: &str = "alert_bell";
 ///
 /// 与前端 `useNotifications` 的轮询（60 秒）同一量级：更慢会让铃铛比轮询晚
 /// 一整拍才亮，更快只是空转——浏览器不会比这更早看到。
-// cap: bound
+// cap: bound — 与前端 useNotifications 的 60 秒轮询同一量级：更慢铃铛比轮询晚一整拍才亮，更快只是空转
 const ALERT_BELL_INTERVAL_SECS: u64 = 60;
 
 /// 一轮最多发多少条。存量补发时不要一次写几千行把这一轮的墙钟撑破。
-// cap: bound
+// cap: bound — 存量补发时不要一次写几千行把这一轮的墙钟撑破
 const ALERT_BELL_BATCH: i64 = 200;
 
 // 参数多是因为这一环的每个入参都来自不同的插件服务，把它们捆成一个结构体只是把

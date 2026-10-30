@@ -88,13 +88,13 @@ impl ConfigDeclarationConfig {
     /// Floor for the settle window. The mount is refreshed by kubelet on its
     /// own sync period, so a window shorter than that would read the same stale
     /// document twice and call a rollout a permanent gap.
-    // cap: bound
+    // cap: bound — 读的那份文档有自己的同步周期；窗比它短就会把同一份过期文档读两次，把一次发布判成永久缺口
     pub const MIN_SETTLE_SECS: u64 = 10;
 
     /// Floor for the hold. Below the settle floor it would only re-read the
     /// same window; the pod replacement it is there to wait out takes minutes,
     /// not seconds.
-    // cap: bound
+    // cap: bound — 同一个窗；它要等过去的 Pod 重建以分钟计，不以秒计
     pub const MIN_HOLD_SECS: u64 = 60;
 }
 
@@ -164,7 +164,7 @@ pub struct TraceCollectorConfig {
 ///
 /// 缓冲吸收的是「导出端比产生端慢」的那一段；超过它就丢最旧的 span，而不是
 /// 让进程内存跟着涨。这是代码自己选的界，不是量出来的容量。
-// cap: bound
+// cap: bound — 缓冲吸收的是「导出端比产生端慢」的那一段；超过它丢最旧的 span，而不是让进程内存跟着涨
 const DEFAULT_TRACE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
 impl Default for TraceCollectorConfig {
@@ -337,7 +337,7 @@ pub struct InfraRule {
 impl InfraWatchConfig {
     /// Minimum poll cadence: faster polling only burns Prometheus CPU without
     /// improving detection, since scrape intervals dominate freshness.
-    // cap: bound
+    // cap: bound — 抓取间隔本就决定了新鲜度的上限；更快的轮询只烧 Prometheus 的 CPU，不会更早发现
     pub const MIN_POLL_INTERVAL_SECS: u64 = 30;
 }
 

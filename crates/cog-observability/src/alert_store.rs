@@ -109,7 +109,7 @@ pub fn ddl() -> String {
 /// window) and a day of history is enough to explain a disagreement someone
 /// noticed this morning. The point of the bound is that the table's size has to
 /// follow the number of alert keys rather than the number of rollouts.
-// cap: bound
+// cap: bound — 界的是这张表的大小跟告警键数走、不跟发布次数走；一天够答「早上注意到的那条还在不在」
 pub const ASSERTION_RETENTION_SECONDS: i64 = 24 * 60 * 60;
 
 /// A new alert condition to raise (or close).
