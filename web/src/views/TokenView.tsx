@@ -228,7 +228,7 @@ export function TokenView() {
           <Readings
             from={outcomes}
             source={`GET /api/v1/observability/token-usage/outcomes?hours=${hours}`}
-            caveat="这一读取逐笔账本，不是折叠表：折叠只留「失败了几次」，说不出被谁挡下来。区间是它实际读的那一段，不是请求的那一段。"
+            caveat="这一读取逐笔账本，不是折叠表：折叠只留「失败了几次」，说不出被谁挡下来。区间是它实际读的那一段，不是请求的那一段。同一读还答一件事：成功的调用里有多少次上游真的报了用量——没报的那些 token 记成 0，和真的没花钱在账上是同一行，所以上面的花销合计是下界还是测量，看这一格。"
           >
             <OutcomeBreakdown data={outcomes.data} />
           </Readings>

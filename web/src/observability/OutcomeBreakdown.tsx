@@ -64,8 +64,118 @@ export function OutcomeBreakdown({ data }: { data: TokenOutcomes }) {
         但它确实被尝试过，所以它在这里、而不在花销里。两种「零花销」——没人用、和每次都被挡回来——
         只有从这个分布上才分得开。
       </p>
+      <Metering data={data} ok={ok} />
     </div>
   );
+}
+
+/**
+ * 成功的那些调用，有多少真的量到了数。
+ *
+ * 这一块回答的是上面所有 token 合计的成色。一次 `ok` 的调用如果没带回用量帧，
+ * 落库时就是三个 0——和一次真的没花钱的调用在账本上是同一行，合计算出来的
+ * 窗口也一模一样。只有这一格分得开「上游说零」与「上游没开口」，所以它不能并
+ * 进「成功 N 次」里：那个 N 里混着测到的钱和没测到的钱。
+ */
+function Metering({ data, ok }: { data: TokenOutcomes; ok: number }) {
+  if (ok === 0) return null;
+  // 旧网关不返回这一格：那时整页还是一份旧前端，但一旦有人把前端与网关分开部署，
+  // 少一格不该让整面白屏——空数组在这里的意思正是「一条读数都没有」。
+  const lines = [...(data.metering ?? [])].sort((a, b) => b.calls - a.calls);
+  const metered = lines.reduce((sum, line) => sum + line.calls, 0);
+  if (metered === 0) {
+    return (
+      <p className="text-[11px] text-[var(--warn)]">
+        这 {ok.toLocaleString()} 次成功调用没有一条带着计量结果：账本在写入时还没有这一列，
+        所以它们的 token 是记成 0 的「没量到」，不是量到的 0。这一段的花销合计只能当下界读。
+      </p>
+    );
+  }
+  const withNumbers = lines
+    .filter((line) => line.outcome === 'read')
+    .reduce((sum, line) => sum + line.calls, 0);
+  const blind = metered - withNumbers;
+  const missing = ok - metered;
+  return (
+    <div className="mt-2 flex flex-col gap-1 border-t border-[var(--line)] pt-2">
+      <div className="flex items-baseline gap-3 text-[11px]">
+        <span className="text-[var(--paper-dim)]">成功调用里量到数的份额</span>
+        <span className="mono text-[var(--muted)]">
+          {withNumbers.toLocaleString()} / {metered.toLocaleString()} 次 · {share(withNumbers, metered)}
+        </span>
+        {blind > 0 && (
+          <span className="mono text-[var(--warn)]">
+            另有 {blind.toLocaleString()} 次没拿到数——那几次的 token 在合计里算作 0
+          </span>
+        )}
+      </div>
+      {lines.map((line) => {
+        const read = meterCell(line.outcome);
+        return (
+          <div key={line.outcome || 'unrecorded'} className="flex items-baseline gap-3 text-[11px]">
+            <span className="mono w-40 shrink-0" style={{ color: read.tone }}>
+              {read.label}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-[var(--muted)]">{read.hint}</span>
+            <span className="mono w-24 shrink-0 text-right text-[var(--paper-dim)]">
+              {line.calls.toLocaleString()} 次
+            </span>
+            <span className="mono w-14 shrink-0 text-right text-[var(--muted)]">
+              {share(line.calls, metered)}
+            </span>
+          </div>
+        );
+      })}
+      {missing > 0 && (
+        <p className="text-[11px] text-[var(--muted)]">
+          还有 {missing.toLocaleString()} 次成功调用不在上面这几格里：它们的行写于计量列存在之前，
+          没有读数可归，既不算量到，也不替它猜一格。
+        </p>
+      )}
+      <p className="text-[11px] text-[var(--muted)]">
+        只有「上游报了用量」那几次的 token 是上游自己说的数；其余各格的 token 是记成 0 的
+        「没量到」，两者在上面的合计里长得一样，在这一块里分得开。
+      </p>
+    </div>
+  );
+}
+
+/** 一格计量读数怎么读给人听。 */
+function meterCell(outcome: string): { label: string; hint: string; tone: string } {
+  switch (outcome) {
+    case 'read':
+      return { label: '上游报了用量', hint: '这一格的 token 是上游自己说的数', tone: 'var(--ok)' };
+    case 'absent':
+      return {
+        label: '上游没报',
+        hint: '问了用量、上游没答：这次调用的 token 记成 0，实际不是 0',
+        tone: 'var(--warn)',
+      };
+    case 'not_asked':
+      return {
+        label: '我们没问',
+        hint: '请求里没要用量帧，上游本来就不用报——修法在我们自己的请求这一侧',
+        tone: 'var(--warn)',
+      };
+    case 'interrupted':
+      return {
+        label: '响应没走完',
+        hint: '流断在半路，没读到用量；这是调用故障，不是上游不肯说',
+        tone: 'var(--danger)',
+      };
+    case 'abandoned':
+      return {
+        label: '调用方提前断开',
+        hint: '我们自己没把正文读完，用量帧还没到；两边都没法归咎',
+        tone: 'var(--muted)',
+      };
+    default:
+      return {
+        label: outcome || '没有计量结果',
+        hint: '账本里出现了界面不认识的计量词',
+        tone: 'var(--paper-dim)',
+      };
+  }
 }
 
 /** 一个结局怎么读给人听。 */

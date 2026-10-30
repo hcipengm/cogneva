@@ -32,7 +32,7 @@ use cog_core::contract::platform_sign::{
 use cog_core::contract::transport::{Credential, Operation, Transport};
 use cog_core::usage_ledger::{
     AnalyticsEvent, AnalyticsSink, LlmExchangeRecord, LlmOrigin, LlmUsageLedger, LlmUsageRecord,
-    PaceEvidence, PaceUpstreamEvidence,
+    MeteringOutcome as UsageOutcome, PaceEvidence, PaceUpstreamEvidence,
 };
 use cog_core::{
     AlertTransition, MetricsBackend, PersistentAlertSink, RefusalKind, ScrapableMetrics,
@@ -2345,6 +2345,9 @@ fn failed_attempt_usage(
         latency_ms,
         // 这一行不是配速拒的：这一拍的额度读数与它无关，写上去会读成"缺口为零"。
         pace: None,
+        // 没读到正文，也就没有"上游报了没有"这个读数。填 `read` 会把一次没发生的
+        // 测量写成已完成，填 `absent` 会替上游背一次它没做过的沉默。
+        usage_outcome: None,
     })
 }
 
@@ -2398,6 +2401,8 @@ fn pooled_refusal_usage(
         latency_ms: 0,
         // 熔断拒的依据是健康表，不是额度；这一格留空，缺口只在配速行上算。
         pace: None,
+        // 一个上游都没发出去，没有正文可读。
+        usage_outcome: None,
     }
 }
 
@@ -2438,6 +2443,8 @@ fn paced_refusal_usage(
         // 这一行存在的全部理由就是这一拍的数：没有它，拒绝只剩一句"被拒了"，
         // 缺口要等到下一拍再猜。
         pace: Some(pace),
+        // 发请求之前就被自己的额度判定拦下，没有正文可读。
+        usage_outcome: None,
     }
 }
 
@@ -2609,61 +2616,6 @@ fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
     });
 }
 
-/// What reading a finished response found, as the cells of
-/// [`USAGE_OUTCOMES`]. One cause per cell, because each calls for a different
-/// action — and the two that both read as "no number arrived" differ in who owns
-/// the fix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UsageOutcome {
-    /// A usage frame was parsed carrying at least one of the three counts, so the
-    /// numbers recorded for this call are the upstream's own — they are not a
-    /// statement about how many of them it sent.
-    Read,
-    /// The response body finished and carried no usage frame at all, on a call
-    /// that did ask the upstream to report usage. The counts recorded beside it
-    /// are zeros because the upstream never said, which is a different fact from
-    /// an upstream that said zero — and the one that says the meter is blind
-    /// while the call itself succeeded.
-    Absent,
-    /// No usage frame arrived because none was asked for: the request we sent
-    /// carried no `stream_options`, so the upstream was never told to report
-    /// usage in the stream. Kept apart from [`Self::Absent`] because the two
-    /// name different owners of the same missing number — this one is our own
-    /// request, and the fix is to start asking, whereas `absent` is the
-    /// upstream's answer and no change on our side can move it.
-    NotAsked,
-    /// The response never finished, so there was nothing to read. A call-level
-    /// fault rather than a metering one, and kept apart so a stream that dies
-    /// mid-flight cannot be read as an upstream that answers without usage.
-    Interrupted,
-    /// Our own caller stopped reading the body before it ended, and no usage
-    /// frame had arrived by then. Neither side can be blamed for the missing
-    /// numbers from this cell alone: the upstream may have been about to speak
-    /// and we stopped listening, so it is not [`Self::Absent`]; and our request
-    /// did ask, so it is not [`Self::NotAsked`] either.
-    ///
-    /// This cell exists because the reading it names used to be dropped
-    /// outright. A caller that stops at the last frame it needs — our own SSE
-    /// client stops at `[DONE]` — leaves the tail of the forwarded stream
-    /// unpolled, and a reading that was only written from that tail was never
-    /// written at all. A usage frame that had already arrived is still
-    /// [`Self::Read`] when this happens: the frame is the whole reading, and
-    /// only the end-of-body marker follows it.
-    Abandoned,
-}
-
-impl UsageOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            UsageOutcome::Read => "read",
-            UsageOutcome::Absent => "absent",
-            UsageOutcome::NotAsked => "not_asked",
-            UsageOutcome::Interrupted => "interrupted",
-            UsageOutcome::Abandoned => "abandoned",
-        }
-    }
-}
-
 /// One call's usage reading: the two counts and what the read found.
 ///
 /// They travel as one value because the outcome is a statement *about* these
@@ -2704,16 +2656,11 @@ impl UsageReading {
     }
 }
 
-/// The cells `llm_usage_readings_total` can carry. Declared next to the
-/// producer rather than in the registry, so a new outcome cannot be recorded
-/// without appearing here.
-const USAGE_OUTCOMES: [UsageOutcome; 5] = [
-    UsageOutcome::Read,
-    UsageOutcome::Absent,
-    UsageOutcome::NotAsked,
-    UsageOutcome::Interrupted,
-    UsageOutcome::Abandoned,
-];
+/// The cells `llm_usage_readings_total` can carry, taken from the contract
+/// rather than restated here: the same word now travels on the ledger row, and
+/// a second copy would let the counter and the column drift into two
+/// vocabularies that each look complete on their own.
+const USAGE_OUTCOMES: [UsageOutcome; 5] = UsageOutcome::ALL;
 
 /// Publish the usage vocabulary at zero, for every configured upstream.
 ///
@@ -3146,6 +3093,9 @@ async fn record_llm_tokens(
             tokens_input: reading.input,
             tokens_output: reading.output,
             tokens_cached: reading.cached,
+            // 这一行是从正文里读出来的数，所以它得说自己读到了什么：两个 0 可以是
+            // 上游说零，也可以是上游没开口，而汇总面只看得见这两个 0。
+            usage_outcome: Some(reading.outcome),
             estimated_input,
             refusal_kind: None,
             // 真实调用的一行：熔断没拒过它，没有"下次再来"可报。

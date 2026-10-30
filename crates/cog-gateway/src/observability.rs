@@ -428,17 +428,35 @@ pub struct OutcomeLine {
     pub calls: i64,
 }
 
+/// One cell of what reading the response found, over the successful calls.
+#[derive(Debug, Serialize)]
+pub struct MeteringLine {
+    /// A cell of the metering vocabulary, or empty for a call whose row was
+    /// written before the column existed and so has no reading to report.
+    pub outcome: String,
+    pub calls: i64,
+}
+
 /// How the calls in a range ended, with the range that was actually read.
 ///
 /// This is the face a flat zero needs. Every other reading on the token page
 /// answers "how much"; when the answer is nothing, the only useful question is
 /// whether the platform was idle or whether every attempt was turned away
 /// before it could spend — and those two look identical on a spend face.
+///
+/// `metering` is the same question asked of the calls that *did* succeed: a
+/// successful call whose response carried no usage frame is written with zero
+/// tokens, so it counts toward the spend as nothing at all. Reading the cells
+/// back is what lets a reader see that a window's token total is a floor rather
+/// than a measurement — a fact the total itself cannot carry.
 #[derive(Debug, Serialize)]
 pub struct TokenOutcomesResponse {
     pub since: String,
     pub until: String,
     pub outcomes: Vec<OutcomeLine>,
+    /// One line per metering cell. Empty means no call succeeded in the range,
+    /// which is not the same as every call having been metered.
+    pub metering: Vec<MeteringLine>,
 }
 
 /// How the calls in the trailing window ended, per `(result, refusal_kind)`.
@@ -456,7 +474,14 @@ pub async fn token_outcomes_handler(
         .outcomes_between(since, until)
         .await
         .map_err(|e| ApiError::internal(format!("failed to read call outcomes: {e}")))?;
-    Ok(Json(outcomes_response(since, until, outcomes)))
+    // A failed read is a failure, not "every call was metered": the second
+    // answer says the spend beside it is exact, and an empty list would claim
+    // that for a range nobody read.
+    let metering = ledger
+        .metering_between(since, until)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to read metering outcomes: {e}")))?;
+    Ok(Json(outcomes_response(since, until, outcomes, metering)))
 }
 
 /// Project the verdict breakdown onto the response face.
@@ -469,6 +494,7 @@ fn outcomes_response(
     since: chrono::DateTime<chrono::Utc>,
     until: chrono::DateTime<chrono::Utc>,
     outcomes: Vec<cog_core::OutcomeCount>,
+    metering: Vec<cog_core::MeteringCount>,
 ) -> TokenOutcomesResponse {
     TokenOutcomesResponse {
         since: since.to_rfc3339(),
@@ -478,6 +504,13 @@ fn outcomes_response(
             .map(|row| OutcomeLine {
                 result: row.result,
                 refusal_kind: row.refusal_kind,
+                calls: row.calls,
+            })
+            .collect(),
+        metering: metering
+            .into_iter()
+            .map(|row| MeteringLine {
+                outcome: row.outcome,
                 calls: row.calls,
             })
             .collect(),
@@ -1193,6 +1226,10 @@ mod tests {
                     calls: 1,
                 },
             ],
+            // This test is about the refusal kinds, so the metering half is
+            // present but empty: an empty half must not make the other half
+            // vanish from the wire.
+            Vec::new(),
         );
         let wire = serde_json::to_value(&response).expect("the response serializes");
         assert_eq!(
@@ -1208,6 +1245,54 @@ mod tests {
         );
         assert_eq!(wire["outcomes"][0]["refusal_kind"], "quota_cycle");
         assert_eq!(wire["outcomes"][1]["refusal_kind"], "entitlement");
+    }
+
+    /// 成功的调用里，有多少真的量到了：这一格是紧挨着的 token 合计的成色。
+    ///
+    /// 一次 `ok` 的调用如果没有带回用量帧，落库时就是三个 0——和一次真的没花
+    /// 钱的调用在账上是同一行。合计算出来的两个窗口因此一模一样，而这个数在
+    /// 两处都读作「零花销」。所以计量的一格必须单独出现在读数面上：`absent`
+    /// 或 `not_asked` 越长，旁边的 token 合计就越是一个下界而不是一个测量。
+    #[test]
+    fn the_outcome_projection_carries_the_calls_whose_numbers_never_came() {
+        let until = chrono::DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
+            .expect("a fixed instant")
+            .with_timezone(&chrono::Utc);
+        let since = until - chrono::Duration::hours(6);
+        let response = outcomes_response(
+            since,
+            until,
+            vec![cog_core::OutcomeCount {
+                result: "ok".into(),
+                refusal_kind: String::new(),
+                calls: 10,
+            }],
+            vec![
+                cog_core::MeteringCount {
+                    outcome: "read".into(),
+                    calls: 7,
+                },
+                cog_core::MeteringCount {
+                    outcome: "absent".into(),
+                    calls: 3,
+                },
+            ],
+        );
+        let wire = serde_json::to_value(&response).expect("the response serializes");
+        assert_eq!(
+            wire["metering"].as_array().map(|a| a.len()),
+            Some(2),
+            "a call the upstream answered silently stays its own line"
+        );
+        assert_eq!(wire["metering"][0]["outcome"], "read");
+        assert_eq!(wire["metering"][1]["outcome"], "absent");
+        assert_eq!(wire["metering"][1]["calls"], 3);
+        // 空的计量面必须还是 `[]`，不能省掉：省掉之后「这一窗没有一次成功调用」
+        // 与「这一读根本没装」在 JSON 上是同一个形状。
+        let empty = outcomes_response(since, until, Vec::new(), Vec::new());
+        let wire = serde_json::to_value(&empty).expect("the response serializes");
+        assert_eq!(wire["metering"], serde_json::json!([]));
+        assert_eq!(wire["outcomes"], serde_json::json!([]));
     }
 
     /// 账本的两半必须各自出现：省下的与判定过的是两种事实，一栏空了不代表

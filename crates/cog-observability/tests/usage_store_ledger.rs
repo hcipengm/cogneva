@@ -70,6 +70,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         task: task.map(str::to_string),
         latency_ms: 12,
         pace: None,
+        usage_outcome: None,
     };
 
     let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());

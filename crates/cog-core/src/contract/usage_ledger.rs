@@ -84,6 +84,77 @@ impl LlmOrigin {
     }
 }
 
+/// What reading a finished response found, as a closed set.
+///
+/// The token counts on a ledger row are what the upstream said. This says
+/// whether it said anything at all, which the counts cannot: a call that came
+/// back `ok` carrying no usage frame lands `0 / 0`, and so does a call that
+/// really served nothing. Summed into a window, the two are indistinguishable
+/// and the silent one reads as a free call — so which of the two happened has
+/// to travel on the row itself.
+///
+/// Closed, like [`LlmOrigin`]: the column is read as counts, and a value
+/// outside the set is not a new way to be silent, it is a writer that drifted.
+/// [`Self::Absent`] and [`Self::NotAsked`] both mean no number arrived and are
+/// kept apart because the repair differs — the first is the upstream's silence
+/// on a call that did ask, the second is our own request that never asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MeteringOutcome {
+    /// A usage frame arrived. It counts even when it reported zeros: a named
+    /// zero is a reading, not a silence.
+    Read,
+    /// The call asked for usage and the upstream answered without it.
+    Absent,
+    /// The request carried no `stream_options`, so no usage frame was ever due.
+    NotAsked,
+    /// The response never finished. A call fault, not a metering one, kept
+    /// apart so a stream that died cannot be read as an upstream that answers
+    /// quietly.
+    Interrupted,
+    /// Our caller stopped reading before the end and no frame had arrived. The
+    /// silence belongs to neither side: the upstream may have been about to
+    /// speak, and the request did ask.
+    Abandoned,
+}
+
+impl MeteringOutcome {
+    /// The five cells, in the order the ledger reads them. Every successful
+    /// call lands in exactly one, so a count over these is the whole of the
+    /// calls that were metered at all.
+    pub const ALL: [MeteringOutcome; 5] = [
+        MeteringOutcome::Read,
+        MeteringOutcome::Absent,
+        MeteringOutcome::NotAsked,
+        MeteringOutcome::Interrupted,
+        MeteringOutcome::Abandoned,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MeteringOutcome::Read => "read",
+            MeteringOutcome::Absent => "absent",
+            MeteringOutcome::NotAsked => "not_asked",
+            MeteringOutcome::Interrupted => "interrupted",
+            MeteringOutcome::Abandoned => "abandoned",
+        }
+    }
+
+    /// The cell a stored word names, or `None` for anything outside the set —
+    /// including the empty string a `NULL` column reads back as. `None` is the
+    /// honest answer for a row written before this column existed, and folding
+    /// it into [`Self::Read`] would credit that row with a reading nobody took.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "read" => Some(MeteringOutcome::Read),
+            "absent" => Some(MeteringOutcome::Absent),
+            "not_asked" => Some(MeteringOutcome::NotAsked),
+            "interrupted" => Some(MeteringOutcome::Interrupted),
+            "abandoned" => Some(MeteringOutcome::Abandoned),
+            _ => None,
+        }
+    }
+}
+
 /// 一次窗口配速拒绝的证据：这一拍的数与拒的是谁，和拒绝本身落在同一行。
 ///
 /// 单独一组列而不是复用 `estimated_input` / `refusal_kind` / `upstream`：那三格
@@ -159,6 +230,22 @@ pub struct LlmUsageRecord {
     /// cached is a subset of input, on Anthropic the two are disjoint), which
     /// is why they stay apart here instead of being netted out.
     pub tokens_cached: u64,
+    /// What reading the response found, when this row came from a call that was
+    /// answered at all.
+    ///
+    /// The three counts above are what the upstream said; this is whether it
+    /// said anything. Without it a successful call that carried no usage frame
+    /// is stored as `0 / 0 / 0` — the same row a call that truly served nothing
+    /// produces — and every total summed from these columns silently treats the
+    /// unmetered call as free. Measured on this deployment over the 30 days to
+    /// 2026-10-30: 892 of 19,687 `ok` rows carry zero tokens, and which of the
+    /// two situations that is cannot be recovered from the row.
+    ///
+    /// `None` is "no reading was taken", not a reading: the failure and refusal
+    /// paths land rows about attempts that never got a body, and rows written
+    /// before this column existed keep it empty. Folding those into
+    /// [`MeteringOutcome::Read`] would invent a measurement.
+    pub usage_outcome: Option<MeteringOutcome>,
     /// What this platform's own estimator priced the request at, before any
     /// upstream counted the prompt.
     ///
@@ -332,6 +419,26 @@ pub struct OutcomeCount {
     pub calls: i64,
 }
 
+/// How many successful calls in a range carried a usage reading, by what the
+/// reading found.
+///
+/// One line per cell of [`MeteringOutcome`], plus a line with an empty outcome
+/// for calls whose row predates the column. This is the trustworthiness of the
+/// token totals beside it: an `absent`/`not_asked` line means those calls are
+/// counted in the spend with zeros, and a window made mostly of them is a
+/// window whose token total is a floor rather than a measurement.
+///
+/// Only successful calls are counted — the failure and refusal paths never got
+/// a body to read, and their rows are unmetered by construction rather than by
+/// fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeteringCount {
+    /// One of [`MeteringOutcome::ALL`]'s words, or empty for a row written
+    /// before the column existed.
+    pub outcome: String,
+    pub calls: i64,
+}
+
 /// One site's savings in a range, as the saved-call ledger recorded them.
 ///
 /// The spend ledger answers what was paid for. This answers what was *not* paid
@@ -475,6 +582,23 @@ pub trait LlmUsageLedger: Send + Sync {
         since: chrono::DateTime<chrono::Utc>,
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<OutcomeCount>, String>;
+
+    /// What reading the response found for the successful calls in
+    /// `[since, until)`, grouped by cell.
+    ///
+    /// The companion to [`Self::outcomes_between`] and read from the same
+    /// rows: that one says how attempts ended, this one says how much of the
+    /// resulting spend was actually measured. A window of `ok` calls that all
+    /// landed `absent` spends tokens the totals record as zero, so a reader
+    /// that only sees the totals has no way to know its number is a floor.
+    ///
+    /// A range with no successful call answers empty, which is not the same as
+    /// every call having been read.
+    async fn metering_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<MeteringCount>, String>;
 
     /// The savings recorded in `[since, until)`, one line per `(stage, reason)`.
     ///

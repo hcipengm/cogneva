@@ -118,6 +118,7 @@ async fn a_window_folds_the_ledger_and_reruns_in_place_with_zeros_for_the_idle()
         task: None,
         latency_ms: 10,
         pace: None,
+        usage_outcome: None,
     };
 
     // Two successful calls and one failed one inside the window.
@@ -306,6 +307,7 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
         task: None,
         latency_ms: latency,
         pace: None,
+        usage_outcome: None,
     };
 
     // Two calls in the first in-range window, one in the second, and one in a
@@ -482,6 +484,7 @@ async fn the_summed_read_leaves_out_a_combination_the_range_never_used() {
             task: None,
             latency_ms: 1,
             pace: None,
+            usage_outcome: None,
         })
         .await
         .expect("record a call");
@@ -604,6 +607,7 @@ async fn the_outcome_breakdown_keeps_the_verdict_that_explains_a_failed_range() 
                     task: None,
                     latency_ms: 1,
                     pace: None,
+                    usage_outcome: None,
                 })
                 .await
                 .expect("record a call");

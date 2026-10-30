@@ -346,6 +346,12 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS estimated_input BIGINT;
 -- identity its own per-run census uses, and the reader's job is to join the
 -- two, not to funnel both through a type.
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS task_id TEXT;
+-- What reading the response found. Nullable with no default: the failure and
+-- refusal paths land rows about attempts that never got a body, and rows
+-- written before this column existed have no reading to report. A default of
+-- `read` would claim a measurement nobody took, and a default of `absent`
+-- would blame every upstream for a silence this table never observed.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS usage_outcome TEXT;
 -- Why a refused attempt was refused. Additive and nullable for the same reason
 -- as the two columns above: rows written before it existed have no kind to
 -- report, and inventing one would make a past window's failures read as a
@@ -556,9 +562,10 @@ impl LlmUsageStore {
                  tokens_input, tokens_output, tokens_cached, estimated_input,
                  task_id, latency_ms, refusal_kind, retry_after_secs,
                  pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
-                 pace_reserve_tokens, pace_window_start_unix, pace_upstreams)
+                 pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
+                 usage_outcome)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21)
+                    $15, $16, $17, $18, $19, $20, $21, $22)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -582,6 +589,7 @@ impl LlmUsageStore {
         .bind(r.pace.as_ref().map(|p| p.reserve_tokens as i64))
         .bind(r.pace.as_ref().map(|p| p.window_start_unix))
         .bind(pace_upstreams)
+        .bind(r.usage_outcome.map(|o| o.as_str()))
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -999,6 +1007,47 @@ impl LlmUsageStore {
             .map(|r| cog_core::OutcomeCount {
                 result: r.get("result"),
                 refusal_kind: r.get("refusal_kind"),
+                calls: r.get("calls"),
+            })
+            .collect())
+    }
+
+    /// How many of the successful calls in `[since, until)` carried a usage
+    /// reading, and what that reading found.
+    ///
+    /// The failure and refusal paths never got a body, so their rows are
+    /// excluded rather than counted as unmetered: this read exists to say how
+    /// far the token totals beside it can be trusted, and a refused call
+    /// spends nothing rather than spending an unknown amount.
+    ///
+    /// Rows written before the column existed come back with an empty outcome
+    /// rather than being dropped or guessed at: the window's denominator is
+    /// still the number of successful calls, and a reader that left them out
+    /// would report a share higher than the one that is true.
+    pub async fn metering_between(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<cog_core::MeteringCount>> {
+        let ok_word = UsageResult::Ok.as_str();
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT COALESCE(usage_outcome, '') AS outcome,
+                   COUNT(*)::BIGINT AS calls
+            FROM {LEDGER_TABLE}
+            WHERE ts >= $1 AND ts < $2 AND result = '{ok_word}'
+            GROUP BY COALESCE(usage_outcome, '')
+            ORDER BY COUNT(*) DESC, COALESCE(usage_outcome, '')
+            "#
+        ))
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| cog_core::MeteringCount {
+                outcome: r.get("outcome"),
                 calls: r.get("calls"),
             })
             .collect())
@@ -1707,6 +1756,16 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<Vec<cog_core::OutcomeCount>, String> {
         LlmUsageStore::outcomes_between(self, since, until)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn metering_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::MeteringCount>, String> {
+        LlmUsageStore::metering_between(self, since, until)
             .await
             .map_err(|e| e.to_string())
     }

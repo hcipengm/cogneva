@@ -648,6 +648,21 @@ export interface TokenOutcomes {
   since: string;
   until: string;
   outcomes: OutcomeLine[];
+  /**
+   * 成功的那些调用各自读到了什么，一格一行。
+   *
+   * 这是旁边 token 合计的成色：一次 `ok` 的调用如果没带回用量帧，落库时就是
+   * 三个 0——和一次真的没花钱的调用在账上是同一行。所以 `absent` / `not_asked`
+   * 越长，那个合计就越是一个下界而不是一个测量。空数组的意思是这一段没有一次
+   * 成功调用，不是「都量到了」。
+   */
+  metering: MeteringLine[];
+}
+
+/** 一格计量读数：`read` / `absent` / `not_asked` / `interrupted` / `abandoned`，空串是没读到（旧行）。 */
+export interface MeteringLine {
+  outcome: string;
+  calls: number;
 }
 
 /** 过去 `hours` 小时各执行者的调用结局分布；`hours=0` 是整本账。 */

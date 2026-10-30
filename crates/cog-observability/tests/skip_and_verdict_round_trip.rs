@@ -120,6 +120,7 @@ async fn spend(store: &LlmUsageStore, actor: &str, tokens_input: u64, tokens_out
             task: None,
             latency_ms: 1,
             pace: None,
+            usage_outcome: None,
         })
         .await
         .expect("writing a usage row");
