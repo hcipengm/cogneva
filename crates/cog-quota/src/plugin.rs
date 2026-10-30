@@ -48,8 +48,7 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         ctx.publish_service(workspace_quota_dyn);
         info!("QuotaPlugin quota manager published");
 
-        let limits = crate::QuotaLimits::from_hard(50_000, 0.8);
-        let hierarchy_manager = Arc::new(crate::HierarchyManager::new(store.clone(), limits));
+        let hierarchy_manager = Arc::new(crate::HierarchyManager::from_store(store.clone()));
         ctx.publish(hierarchy_manager.clone());
         // The reader takes `dyn cog_core::HierarchyManager` through the
         // service table, which is a different pin than the concrete value

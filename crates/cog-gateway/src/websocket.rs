@@ -69,6 +69,11 @@ async fn handle_type_message(
     socket: &mut WebSocket,
     state: &Arc<GatewayState>,
     connection_id: &str,
+    // The person this connection authenticated as, from the verified token
+    // taken at upgrade. Chat spend is charged to it: the socket is the only
+    // place on the platform where a human's identity is established, so it is
+    // the only place a per-person ceiling can be enforced from.
+    user_id: &str,
     text: &str,
     out_tx: &tokio::sync::mpsc::Sender<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -121,8 +126,9 @@ async fn handle_type_message(
             let state = state.clone();
             let out = out_tx.clone();
             let session = session_id.unwrap_or_else(|| "default".into());
+            let owner = user_id.to_string();
             tokio::spawn(async move {
-                crate::chat::run_chat_turn(state, out, session, content).await;
+                crate::chat::run_chat_turn(state, out, session, content, owner).await;
             });
         }
     }
@@ -317,8 +323,15 @@ pub async fn handle_socket(
                         }
 
                         if let Err(e) =
-                            handle_type_message(&mut socket, &state, &connection_id, &text, &out_tx)
-                                .await
+                            handle_type_message(
+                                &mut socket,
+                                &state,
+                                &connection_id,
+                                &user_id,
+                                &text,
+                                &out_tx,
+                            )
+                            .await
                         {
                             tracing::debug!("WebSocket message not handled: {}", e);
                         }

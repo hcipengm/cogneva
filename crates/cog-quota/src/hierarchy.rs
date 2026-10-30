@@ -28,6 +28,13 @@ use crate::{
 };
 use cog_core::KeyValueStore;
 
+/// The daily token ceiling a scope starts with before anyone configures it.
+///
+/// It is a bound, not a policy: enforcement on the person axis applies only to
+/// cells an operator configured (see the LLM gateway's owner check), so this
+/// number decides what an unconfigured cell *reads* as, never who gets cut off.
+pub const PLATFORM_DAILY_TOKENS: u64 = 50_000;
+
 /// Hierarchy checker over a key-value store.
 #[derive(Clone)]
 pub struct HierarchyManager {
@@ -59,6 +66,17 @@ impl HierarchyManager {
             default_limits,
             history_days: 30,
         }
+    }
+
+    /// A manager on this store with the platform's own starting ceiling.
+    ///
+    /// Two processes build one of these on the same store -- the app holding
+    /// the management face and the LLM gateway holding the enforcement point --
+    /// so the number they start from has to be one definition, not two that
+    /// happen to agree today. A cell an operator configured keeps its own pair
+    /// either way; this is only what a cell with no override evaluates against.
+    pub fn from_store(store: Arc<dyn KeyValueStore>) -> Self {
+        Self::new(store, QuotaLimits::from_hard(PLATFORM_DAILY_TOKENS, 0.8))
     }
 
     /// Override the default history retention window (in days).

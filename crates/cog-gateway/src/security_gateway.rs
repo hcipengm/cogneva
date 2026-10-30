@@ -1938,6 +1938,16 @@ struct AppState {
     /// 都是「不拒」。所以「这一格缺了」与「这件任务没人管」在读数上必须分得开——
     /// 缺这一格时请求照常放行，而它不会被任何一条读数说成「预算在生效」。
     task_budget: Option<Arc<dyn cog_core::TaskBudgetGate>>,
+    /// 按人的当日额度，五级层级里「人」那一级，由装配层交进来。
+    ///
+    /// 与 [`Self::task_budget`] 不是同一个问题：那一格的上限挂在「这件工作」上，
+    /// 这一格挂在「这个人今天能花多少」上。上限本身由管理面写进同一个键值面
+    /// （`quota:user:limits:<id>`），本进程只负责在 LLM 代理路径上判与记。
+    ///
+    /// `None` 与「这个人没有额度」是两回事：前者是没配键值面、无从判定，后者是
+    /// 有人声明了上限而他用完了。两者在拒绝面上都表现为放行——见
+    /// [`owner_budget_refusal`] 里对这条边界的说明。
+    owner_budget: Option<Arc<dyn cog_core::HierarchyManager>>,
     /// 跨进程初值是否已落地。建连失败过一次时它是 false，由发布循环按拍重试。
     /// 这一格必须存在：读不到与没有证据在初值上同形，而把前者当后者，池判定
     /// 会在一次瞬时故障后凭空翻回"可用"。
@@ -2246,12 +2256,21 @@ fn record_event(state: &AppState, event: AnalyticsEvent) {
 /// 加一个 UUID），128 是它的两倍多，留给更长的前缀。超长的不截断而是整个不收——
 /// 截断后的 id 与本来的任务对不上，落进账里会变成一件从来不存在的工作，比留空
 /// 更难查。
+///
+/// 个人的标识走同一条归一化：它也是开放集合，也要"没有就是没有"。两者分开命名
+/// 是因为它们答的不是同一个问题——一个是哪件工作，一个是谁——而合成一个函数名
+/// 会让下一步给其中一个加规则时，静默地改掉另一个。
 fn normalize_task(raw: Option<&str>) -> Option<String> {
     let trimmed = raw?.trim();
     if trimmed.is_empty() || trimmed.len() > 128 {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+/// 调用方声明的"这次调用记在谁头上"，归一化规则与任务标识相同，理由也相同。
+fn normalize_owner(raw: Option<&str>) -> Option<String> {
+    normalize_task(raw)
 }
 
 fn normalize_actor(raw: Option<&str>) -> String {
@@ -2740,6 +2759,148 @@ fn task_budget_refusal_usage(
     }
 }
 
+/// 按人当日的额度拒绝：这个人今天能花的已经花完了。
+///
+/// 与 [`TaskBudgetRefusal`] 分成两个类型而不是合成一个：它们答的是两个不同的
+/// 问题（这件工作还能不能花 / 这个人今天还能不能花），响应体的 `reason` 与账上的
+/// 结果词也各是一个，合成一个会让调用侧与读者去查错的那一个。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnerBudgetRefusal {
+    owner: String,
+    spent_today: u64,
+    hard_limit: u64,
+    /// 到下一个 UTC 午夜的秒数。额度按 UTC 日归零，这个数就是「什么时候再来」。
+    wait_secs: u64,
+}
+
+/// 判这一发要不要按人的当日额度拒。
+///
+/// 只有**有人给这个人配过额度**时才判。层级管理器对没配过的格子有一份默认上限，
+/// 那是「读起来是多少」，不是「谁定的」——拿它去拒人，等于平台替属主做了一个谁都
+/// 没做过的决定，而代价是某个人在一天中间被切断、且没有任何一处写着为什么。配过
+/// 上限之后，判定用的就是那一对，与 `/api/v1/quota/limits/user/<id>` 读到的同一个。
+///
+/// 不拒的另外三种：请求没声明人（没有主体，就没有「这个人花了多少」这个说法）、
+/// 本进程没有层级管理器（没配键值面，无从判定）、读不出配过的上限（答不上「花了
+/// 多少」时放行——拦错方向的代价不对称，见 [`task_budget_refusal`]）。
+///
+/// 估算不参与判定，理由与按任务预算那一条相同：这一发要花多少只有上游知道，而这里
+/// 拒的是「已经越线之后再来的任何一发」。
+async fn owner_budget_refusal(
+    state: &AppState,
+    style: &str,
+    actor: &str,
+    origin: &str,
+    task: Option<&str>,
+    owner: Option<&str>,
+) -> Option<OwnerBudgetRefusal> {
+    let owner = owner?;
+    let hierarchy = state.owner_budget.as_ref()?;
+    match hierarchy.limits(cog_core::QuotaScope::User, owner).await {
+        Ok(None) => return None,
+        Ok(Some(_)) => {}
+        Err(e) => {
+            tracing::warn!(
+                owner = %owner,
+                error = %e,
+                "按人额度：读不出这个人配过的上限，这一发不拦"
+            );
+            return None;
+        }
+    }
+    let ctx = cog_core::QuotaContext {
+        user_id: Some(owner.to_string()),
+        ..Default::default()
+    };
+    let decision = hierarchy.check(&ctx, 0).await;
+    if decision.allowed {
+        if let Some(warning) = decision.warnings.first() {
+            tracing::warn!(
+                owner = %owner,
+                spent_today = warning.used_today,
+                soft_limit = warning.limits.soft_limit,
+                hard_limit = warning.limits.hard_limit,
+                "按人额度：这一发跨过了软上限，仍然放行"
+            );
+        }
+        return None;
+    }
+    let blocked = decision.blocked_by.first()?;
+    let refusal = OwnerBudgetRefusal {
+        owner: owner.to_string(),
+        spent_today: blocked.used_today,
+        hard_limit: blocked.limits.hard_limit,
+        wait_secs: cog_core::day::seconds_to_next_day(Utc::now().timestamp()),
+    };
+    land_usage_record(
+        state,
+        owner_budget_refusal_usage(style, actor, origin, task, &refusal),
+    );
+    Some(refusal)
+}
+
+/// 把一次真实花销记到这个人今天的额度上。
+///
+/// **每一发都记**，不是「配过额度才记」：额度可以在一天中间才被配，只从配置那一刻
+/// 开始记，会让上半天花掉的那部分不计入——配额度的人看到的是「还剩一整份」，而账上
+/// 说这个人今天已经花过。多一次自增的代价远小于一个会偏小的判据。
+///
+/// 记不上只 WARN，理由与 [`charge_task_budget`] 相同：为一次记账失败把一次已经付过
+/// 钱的调用变成错误，方向反了。
+async fn charge_owner_budget(state: &AppState, owner: Option<&str>, tokens: u64) {
+    let Some(owner) = owner else { return };
+    let Some(hierarchy) = state.owner_budget.as_ref() else {
+        return;
+    };
+    if tokens == 0 {
+        return;
+    }
+    let ctx = cog_core::QuotaContext {
+        user_id: Some(owner.to_string()),
+        ..Default::default()
+    };
+    if let Err(e) = hierarchy.consume(&ctx, tokens).await {
+        tracing::warn!(
+            owner = %owner,
+            tokens,
+            error = %e,
+            "按人额度：这一发的花销没记上，此后这个人的判据会偏小"
+        );
+    }
+}
+
+/// 按人额度拒绝的台账落点。
+///
+/// 形状与 [`task_budget_refusal_usage`] 相同，`task` 一列照请求声明照抄：这一发可能
+/// 同时属于一件工作，而拒绝说的是这个人。结果词不同是两者唯一的分界——读的人要能
+/// 分开「该收尾这件工作」与「该给这个人加额度」。
+fn owner_budget_refusal_usage(
+    style: &str,
+    actor: &str,
+    origin: &str,
+    task: Option<&str>,
+    refusal: &OwnerBudgetRefusal,
+) -> LlmUsageRecord {
+    LlmUsageRecord {
+        upstream: POOLED_REFUSAL_UNNAMED.to_string(),
+        api_style: style.to_string(),
+        model: POOLED_REFUSAL_UNNAMED.to_string(),
+        result: UsageResult::RefusedByOwnerBudget.as_str().to_string(),
+        actor: actor.to_string(),
+        origin: origin.to_string(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cached: 0,
+        estimated_input: None,
+        refusal_kind: None,
+        retry_after_secs: Some(refusal.wait_secs),
+        task: task.map(str::to_string),
+        latency_ms: 0,
+        pace: None,
+        usage_outcome: None,
+    }
+}
+
 /// 池级熔断的唯一出口：判定与落账在同一次调用里。
 ///
 /// 落账写在 [`AppState::pool_circuit_break`] 的调用点上是**位置判据**——判据能证明
@@ -3125,6 +3286,12 @@ struct RequestSide {
     /// 在读数面上分得开：不声明的调用不许被并进一个占位分组，那会让占位值读成
     /// 全账最贵的那件事。
     task: Option<String>,
+    /// 这次调用记在谁头上，由调用方在请求头上声明。
+    ///
+    /// 与 `task` 的分工：一个是哪件工作，一个是谁。只有后者是**被判定**的——按人
+    /// 的当日额度拿它去拒——所以它必须来自一个已经通过鉴权的身份，不能是调用方
+    /// 随便起的名字。`None` 是"没有声明"，不是"声明为某个人"。
+    owner: Option<String>,
     /// [`price_request`] 的读数。`None` 是"这条路径没量过"，不是"量出来是 0"：台账
     /// 那一列可空正是因为两者修法相反——一个说明装配面还没接上，一个是空提示词——
     /// 所以量不出来的路径一律传 `None`，绝不填 0 冒充量过。
@@ -3307,6 +3474,13 @@ async fn record_llm_tokens(
     // 看到的是「还剩一整份」，而账上说这件工作今天已经花过。多一次自增的代价远小于
     // 一个会偏小的判据。
     charge_task_budget(state, task.as_deref(), reading.input + reading.output).await;
+    // 同一个道理记到这个人今天的额度上：这里也每一发都记，不只看有没有配过上限。
+    charge_owner_budget(
+        state,
+        request.owner.as_deref(),
+        reading.input + reading.output,
+    )
+    .await;
     land_usage_record(
         state,
         LlmUsageRecord {
@@ -5589,6 +5763,16 @@ async fn stream_forward(
             .get(cog_core::LLM_TASK_HEADER)
             .and_then(|v| v.to_str().ok()),
     );
+    // The person axis, read the same way and also defaulted to nothing. It is
+    // the only one of the four that is judged rather than merely recorded: a
+    // daily ceiling on a person is enforced against this value, so a component
+    // that filled it in would be handing its spend to somebody else's budget.
+    // Only a caller that authenticated a human may state it.
+    let owner = normalize_owner(
+        req.headers()
+            .get(cog_core::LLM_OWNER_HEADER)
+            .and_then(|v| v.to_str().ok()),
+    );
     // 账本记到 `unknown` 就到此为止：它数得出"有一次调用没声明"，点不出是谁。
     // 规则 `llm_call_without_declared_actor` 的自述里把这条边界写死了。请求离开
     // 网关的这一刻还知道答案，所以在这里留一行：调用方自报的 User-Agent、两个
@@ -5828,6 +6012,49 @@ async fn stream_forward(
             .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
     }
 
+    // 按人的当日额度：这个人今天能花的已经花完了。
+    // 位置在按任务预算之后：两者都是我们自己的上限，而这一件工作所花的是这个人
+    // 额度里的一部分——工作这一层是调用方自己就能收的尾，人的那一层要等日界或
+    // 属主。能自己解的那个先报，调用方少绕一圈。
+    if let Some(refusal) = owner_budget_refusal(
+        &state,
+        style,
+        &actor,
+        &origin,
+        task.as_deref(),
+        owner.as_deref(),
+    )
+    .await
+    {
+        tracing::warn!(
+            refused_by_owner_budget = true,
+            owner = %refusal.owner,
+            spent_today = refusal.spent_today,
+            hard_limit = refusal.hard_limit,
+            retry_after_secs = refusal.wait_secs,
+            "按人额度：这个人今天的额度已经用完，快速失败 429"
+        );
+        return Ok(axum::response::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(cog_core::RETRY_AFTER_HEADER, refusal.wait_secs.to_string())
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "error": "这个人今天的额度已经用完",
+                    // 同一个 429 也来自配速与按任务预算，三句话指向三种处置：
+                    // 等窗口、收尾这件工作、等日界或加额度。调用侧与读者靠这一格
+                    // 分开，不看正文。
+                    "reason": cog_core::REFUSED_BY_OWNER_BUDGET,
+                    "owner": refusal.owner,
+                    "spent_today": refusal.spent_today,
+                    "hard_limit": refusal.hard_limit,
+                    "retry_after_seconds": refusal.wait_secs,
+                })
+                .to_string(),
+            ))
+            .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
+    }
+
     // 热切换：健康上游优先，嫌疑上游降级为兜底（不硬排除）。
     let candidates = order_by_health(candidates, &state.llm_health);
 
@@ -6031,6 +6258,7 @@ async fn stream_forward(
                     actor: actor.clone(),
                     origin: origin.clone(),
                     task: task.clone(),
+                    owner: owner.clone(),
                     estimated_input: Some(estimated_input),
                     request_body: Some(request_body.clone()),
                 },
@@ -6132,6 +6360,7 @@ async fn stream_forward(
                 actor: actor.clone(),
                 origin: origin.clone(),
                 task: task.clone(),
+                owner: owner.clone(),
                 estimated_input: Some(estimated_input),
                 request_body: Some(request_body.clone()),
             },
@@ -6706,6 +6935,7 @@ async fn call_one_upstream(
             actor: actor.to_string(),
             origin: origin.to_string(),
             task: None,
+            owner: None,
             estimated_input: Some(estimated_input),
             // 这条路自己拼 JSON，不经过可留底的那份字节。
             request_body: None,
@@ -6769,6 +6999,7 @@ async fn call_one_upstream(
         actor: actor.to_string(),
         origin: origin.to_string(),
         task: None,
+        owner: None,
         estimated_input: Some(estimated_input),
         // 这条路自己拼 JSON，不经过可留底的那份字节。
         request_body: None,
@@ -8933,6 +9164,12 @@ fn identity_default_headers(identity: &str) -> reqwest::header::HeaderMap {
 /// 点在这条代理路径上。交 `None` 表示本进程没有预算能力（**不是**"没人声明过
 /// 预算"——后者是门自己答的 `budgeted: false`），两者在管理面上必须分得开：没有
 /// 门时写预算会答 503，因为写下去了而没有东西执行它。
+///
+/// `owner_budget` 是同一个层级管理器在「人」那一级上的用法：上限由管理面写进
+/// 同一个键值面，判定与记账发生在这条代理路径上。它必须与持有管理面的那个进程
+/// 指向同一个存储才算数——上限写在一处、账记在另一处，读出来就是「有上限但没人
+/// 撞过」。交 `None` 表示本进程判不了人的额度（没配键值面），于是只放行、不记账。
+///
 /// 独立安全网关进程。
 ///
 /// 四类落盘出口（指标注册表、时序明细、告警状态机、计量账本）与要观测的卷都
@@ -8949,6 +9186,7 @@ pub async fn run(
     http_client: Arc<dyn cog_core::HttpClient>,
     key_value: Option<Arc<dyn cog_core::KeyValueStore>>,
     task_budget: Option<Arc<dyn cog_core::TaskBudgetGate>>,
+    owner_budget: Option<Arc<dyn cog_core::HierarchyManager>>,
     provider_compat: Option<Arc<dyn cog_core::ProviderCompatTable>>,
     pool_obs: Arc<PoolObservability>,
     volume_footprint: Vec<VolumeFootprint>,
@@ -8982,6 +9220,7 @@ pub async fn run(
         pool_obs,
         pool_signal,
         task_budget,
+        owner_budget,
         pool_down: Arc::new(AtomicBool::new(false)),
         pool_recovered: Arc::new(AtomicBool::new(false)),
         last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -10000,6 +10239,7 @@ mod tests {
                 actor: "agent:planner".to_string(),
                 origin: "gateway_pool".to_string(),
                 task: None,
+                owner: None,
                 // 这条夹具没有请求体可定价，取一个非零数只为了让这条路径落的是
                 // "量过"而不是"没量过"——被丢掉的流要带的就是请求侧钉下的那一份。
                 // 它到不到台账，在这个进程里看不见（测试的 `durable`/`usage` 都是
@@ -14515,6 +14755,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             }),
             pool_signal: None,
             task_budget: None,
+            owner_budget: None,
             pool_down: Arc::new(AtomicBool::new(false)),
             pool_recovered: Arc::new(AtomicBool::new(false)),
             last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -16164,6 +16405,309 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         state.task_budget = None;
         charge_task_budget(&state, Some("t-1"), 50).await;
         assert_eq!(gate.charged.lock().unwrap().len(), 1);
+    }
+
+    // ---- 按人的当日额度：同一份层级管理器，判与记在这条路径上 ---------------
+
+    /// 一格里的人：今天花了多少、上限是多少。没登记的格子就是「没人配过」。
+    ///
+    /// 这个替身只摆判定与记账的那两步真值（越界拒、每发都记），逐格的日界与级联
+    /// 在 cog-quota 里钉过；这里要钉的是网关拿到判定之后做什么。
+    struct StubHierarchy {
+        cells: Vec<(String, u64, cog_core::QuotaLimits)>,
+        broken: bool,
+        consumed: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+    }
+
+    impl StubHierarchy {
+        fn new(cells: &[(&str, u64, u64, u64)]) -> Self {
+            Self {
+                cells: cells
+                    .iter()
+                    .map(|(id, used, soft, hard)| {
+                        (
+                            (*id).to_string(),
+                            *used,
+                            cog_core::QuotaLimits::new(*soft, *hard),
+                        )
+                    })
+                    .collect(),
+                broken: false,
+                consumed: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn broken() -> Self {
+            Self {
+                broken: true,
+                ..Self::new(&[])
+            }
+        }
+
+        fn cell(&self, id: &str) -> Option<(u64, cog_core::QuotaLimits)> {
+            self.cells
+                .iter()
+                .find(|(cell, _, _)| cell == id)
+                .map(|(_, used, limits)| (*used, *limits))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::HierarchyManager for StubHierarchy {
+        async fn check(
+            &self,
+            ctx: &cog_core::QuotaContext,
+            tokens: u64,
+        ) -> cog_core::HierarchyDecision {
+            if self.broken {
+                // 真实现读不出时按「没有证据」处理，替身交出同样的形状：不拦。
+                return cog_core::HierarchyDecision {
+                    allowed: true,
+                    warnings: Vec::new(),
+                    blocked_by: Vec::new(),
+                    scopes: Vec::new(),
+                };
+            }
+            let mut scopes = Vec::new();
+            if let Some(id) = ctx.user_id.as_deref() {
+                if let Some((used, limits)) = self.cell(id) {
+                    let projected = used.saturating_add(tokens);
+                    let blocking = projected > limits.hard_limit;
+                    scopes.push(cog_core::ScopeStatus {
+                        scope: cog_core::QuotaScope::User,
+                        target_id: id.to_string(),
+                        remaining: limits.hard_limit.saturating_sub(used),
+                        used_today: used,
+                        limits,
+                        blocking,
+                        warning: !blocking && projected >= limits.soft_limit,
+                    });
+                }
+            }
+            let blocked_by: Vec<_> = scopes.iter().filter(|s| s.blocking).cloned().collect();
+            let warnings: Vec<_> = scopes.iter().filter(|s| s.warning).cloned().collect();
+            cog_core::HierarchyDecision {
+                allowed: blocked_by.is_empty(),
+                warnings,
+                blocked_by,
+                scopes,
+            }
+        }
+
+        async fn consume(
+            &self,
+            ctx: &cog_core::QuotaContext,
+            tokens: u64,
+        ) -> cog_core::SFResult<cog_core::HierarchyDecision> {
+            if let Some(id) = ctx.user_id.as_deref() {
+                self.consumed.lock().unwrap().push((id.to_string(), tokens));
+            }
+            Ok(self.check(ctx, 0).await)
+        }
+
+        async fn refund(
+            &self,
+            _ctx: &cog_core::QuotaContext,
+            _tokens: u64,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn pre_deduct(
+            &self,
+            ctx: &cog_core::QuotaContext,
+            tokens: u64,
+        ) -> cog_core::SFResult<cog_core::HierarchyDecision> {
+            Ok(self.check(ctx, tokens).await)
+        }
+
+        async fn history(
+            &self,
+            _scope: cog_core::QuotaScope,
+            _target_id: &str,
+            _days: u32,
+        ) -> cog_core::SFResult<Vec<cog_core::UsageHistoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn limits(
+            &self,
+            scope: cog_core::QuotaScope,
+            target_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::QuotaLimits>> {
+            Ok(self
+                .cell(target_id)
+                .filter(|_| scope == cog_core::QuotaScope::User)
+                .map(|(_, limits)| limits))
+        }
+
+        async fn set_limits(
+            &self,
+            _scope: cog_core::QuotaScope,
+            _target_id: &str,
+            _limits: cog_core::QuotaLimits,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn clear_limits(
+            &self,
+            _scope: cog_core::QuotaScope,
+            _target_id: &str,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 用完了个人额度的那一发必须**在碰任何上游之前**回 429，且正文里有一格
+    /// 让调用侧把「这个人该加额度」与另外两种「等一等」分开。
+    ///
+    /// 这一条与按任务预算那一条判的不是同一件事：两者的上限挂在不同的主体上，
+    /// 处置也不同——一件工作能收尾，一个人今天不能。
+    #[tokio::test]
+    async fn a_person_who_used_up_their_allowance_is_refused_by_name_before_any_upstream() {
+        use tower::ServiceExt;
+
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        // 已经越过了上限（而不是恰好停在上面）：判定的是「越线之后再来的任何一发」，
+        // 恰好等于上限的那一发仍然放行，越过的是它自己那一发。
+        state.owner_budget = Some(Arc::new(StubHierarchy::new(&[("u-1", 1200, 800, 1000)])));
+        let app = router(state, true);
+
+        let req = axum::extract::Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
+            .header(cog_core::LLM_OWNER_HEADER, "u-1")
+            .body(axum::body::Body::from(
+                serde_json::json!({"model": "m1", "messages": []}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "用完了的个人额度要快速失败，不能还把这一发发出去"
+        );
+        assert!(
+            resp.headers()
+                .get(cog_core::RETRY_AFTER_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .is_some(),
+            "拒绝必须自带「什么时候可以再来」"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["reason"],
+            cog_core::REFUSED_BY_OWNER_BUDGET,
+            "这一格是调用侧把「这个人该加额度」与另外两种「等一等」分开的唯一依据：{v}"
+        );
+        assert_ne!(
+            cog_core::REFUSED_BY_OWNER_BUDGET,
+            cog_core::REFUSED_BY_BUDGET,
+            "与按任务预算同值的话，读的人只能去找错的那个人"
+        );
+        assert_eq!(v["owner"], "u-1");
+        assert_eq!(v["hard_limit"], 1000);
+        assert_eq!(v["spent_today"], 1200);
+    }
+
+    /// 没有人给这个人配过额度就不判，哪怕今天已经花了天文数字。
+    ///
+    /// 层级管理器对没配过的格子有一份默认上限——那是「读起来是多少」，不是「谁定的」。
+    /// 拿它去拒人，等于平台替属主做了一个谁都没做过的决定，而代价是某个人在一天中间
+    /// 被切断、且没有任何一处写着为什么。读不出配过的上限时同理放行。
+    #[tokio::test]
+    async fn nobody_is_refused_without_a_person_without_a_ceiling_or_without_a_reading() {
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.owner_budget = Some(Arc::new(StubHierarchy::new(&[("u-1", 1000, 800, 1000)])));
+
+        assert!(
+            owner_budget_refusal(&state, "openai", "a", "o", None, None)
+                .await
+                .is_none(),
+            "请求没声明人就没有主体，也就没有「这个人花了多少」这个说法"
+        );
+        assert!(
+            owner_budget_refusal(&state, "openai", "a", "o", None, Some("nobody-set-this"))
+                .await
+                .is_none(),
+            "没有配过额度的人不许被默认上限拦下"
+        );
+
+        state.owner_budget = Some(Arc::new(StubHierarchy::broken()));
+        assert!(
+            owner_budget_refusal(&state, "openai", "a", "o", None, Some("u-1"))
+                .await
+                .is_none(),
+            "读不出配过的上限时放行：拦错一次是从中间截断一个人的工作"
+        );
+
+        state.owner_budget = None;
+        assert!(
+            owner_budget_refusal(&state, "openai", "a", "o", None, Some("u-1"))
+                .await
+                .is_none(),
+            "本进程没有层级管理器时判不了，只能放行"
+        );
+    }
+
+    /// 每一发真实花销都记到这个人头上——包括还没人给他配额度的时候。
+    ///
+    /// 只在「配过额度」之后才记，会让上半天花掉的那部分不计入：配额度的人看到的是
+    /// 「还剩一整份」，而账上说这个人今天已经花过。零 token 与没有主体仍然不记。
+    #[tokio::test]
+    async fn a_real_charge_reaches_the_person_even_before_any_ceiling_is_set() {
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let hierarchy = Arc::new(StubHierarchy::new(&[("u-1", 0, 800, 1000)]));
+        state.owner_budget = Some(hierarchy.clone());
+
+        charge_owner_budget(&state, None, 50).await;
+        charge_owner_budget(&state, Some("u-1"), 0).await;
+        assert!(hierarchy.consumed.lock().unwrap().is_empty());
+
+        charge_owner_budget(&state, Some("u-1"), 50).await;
+        assert_eq!(
+            hierarchy.consumed.lock().unwrap().as_slice(),
+            &[("u-1".to_string(), 50)]
+        );
+
+        state.owner_budget = None;
+        charge_owner_budget(&state, Some("u-1"), 50).await;
+        assert_eq!(hierarchy.consumed.lock().unwrap().len(), 1);
+    }
+
+    /// 拒绝在账上落下的是它自己那个词。
+    ///
+    /// 与 `refused_by_budget` 分开是这一整套的前提：读者按结果词选行，两个词合成
+    /// 一个，就再也分不出「这件工作该收尾」与「这个人该加额度」。
+    #[test]
+    fn a_person_refusal_lands_under_its_own_word() {
+        let refusal = OwnerBudgetRefusal {
+            owner: "u-1".to_string(),
+            spent_today: 1000,
+            hard_limit: 1000,
+            wait_secs: 3600,
+        };
+        let row =
+            owner_budget_refusal_usage("openai", "web_chat", "interactive", Some("t-9"), &refusal);
+        assert_eq!(row.result, "refused_by_owner_budget");
+        assert_eq!(row.task.as_deref(), Some("t-9"), "工作那一格照请求声明照抄");
+        assert_eq!(
+            row.tokens_input + row.tokens_output,
+            0,
+            "一次拒绝一个 token 都没花"
+        );
+        assert_eq!(row.retry_after_secs, Some(3600));
+        assert_eq!(
+            row.upstream, POOLED_REFUSAL_UNNAMED,
+            "拒绝发生在选上游之前，挂到任何一家名下都会读成「那一家拒的」"
+        );
     }
 
     /// 管理面：没有预算门时**不假装**写成功。

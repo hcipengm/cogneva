@@ -219,6 +219,15 @@ function describe(line: OutcomeLine): { label: string; hint: string; tone: strin
         tone: 'var(--warn)',
         bar: 'var(--warn)',
       };
+    case 'refused_by_owner_budget':
+      return {
+        label: '个人额度用完',
+        hint:
+          kind ??
+          '没发出去：这个人今天的额度已经用完，等过午夜重置或由属主调整额度',
+        tone: 'var(--warn)',
+        bar: 'var(--warn)',
+      };
     default:
       return {
         label: line.result,

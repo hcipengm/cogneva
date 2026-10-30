@@ -18,16 +18,23 @@
 //!   [`observable::QuotaObservable`] publishes how many checks ran and how many
 //!   were refused.
 //!
-//! Nothing charges this manager today, and that is deliberate. The one caller
-//! was an axum middleware on the gateway's four management route groups, which
-//! charged each request by the length of its body: those calls spend no model
-//! tokens, so the figure it deducted had nothing to do with what the platform
-//! spends for that user, and once the balance reached zero it refused the
-//! request that reads the balance. It is gone. What a user's work actually
-//! spends is in the gateway's LLM ledger, per call, and attributing that to a
-//! user needs the task → owner join this crate does not have — so the
-//! pre-check surface stays present and inert until that attribution lands,
-//! rather than enforcing a number nobody measured.
+//! What charges this manager is model spend, and only model spend. The one
+//! caller it used to have was an axum middleware on the gateway's four
+//! management route groups, which charged each request by the length of its
+//! body: those calls spend no model tokens, so the figure it deducted had
+//! nothing to do with what the platform spends for that user, and once the
+//! balance reached zero it refused the request that reads the balance. It is
+//! gone. Spend is charged instead where it happens — the gateway's LLM proxy,
+//! by the tokens the upstream reported — and the person axis is the first one
+//! with a writer: a call that declared an owner is charged to that person and
+//! judged against whatever ceiling an operator declared for them, in the same
+//! daily counters the management face reads.
+//!
+//! The workspace, team and organization levels above it still have no writer,
+//! and that stays deliberate: nothing on the platform says which of those a
+//! given call belongs to, so a figure charged against them would be a number
+//! nobody measured. A level with a declared ceiling and no spend is inert, and
+//! reads as exactly that.
 
 pub mod agent_budget;
 pub mod billing;

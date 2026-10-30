@@ -47,6 +47,25 @@ pub const LLM_ORIGIN_HEADER: &str = "x-cogneva-origin";
 /// every unattributed call lands in and would read as one very expensive job.
 pub const LLM_TASK_HEADER: &str = "x-cogneva-task";
 
+/// Inbound header carrying the person a call's spend is charged to.
+///
+/// The three axes already on this request answer which component, which
+/// environment and which job; none of them answers "whose budget is this".
+/// A person's daily ceiling can only be enforced against the last one, and a
+/// caller's own actor name is not it: every WebUI conversation is `web_chat`.
+///
+/// The value has to be an identity this platform authenticated, not a name the
+/// caller chose. A ceiling a caller can rename itself out of is not a ceiling,
+/// which is why the only writer today is the gateway's own WebUI chat, reading
+/// the id out of the websocket's verified token.
+///
+/// Absent is a supported state and means "not attributed to a person" -- most
+/// callers are components with no human behind them. It must not be defaulted
+/// to a placeholder: that placeholder would become the group every
+/// unattributed call lands in, and a ceiling set on it would silently cap the
+/// whole platform.
+pub const LLM_OWNER_HEADER: &str = "x-cogneva-owner";
+
 /// The standard header an upstream uses to say when it can serve us again.
 pub const RETRY_AFTER_HEADER: &str = "retry-after";
 
@@ -267,6 +286,22 @@ impl ChatOptions {
         if !task.is_empty() {
             self.headers
                 .insert(LLM_TASK_HEADER.to_string(), task.to_string());
+        }
+        self
+    }
+
+    /// Declare the person this call is spent for.
+    ///
+    /// Also a property of the call rather than of the process, and also blank-
+    /// tolerant: the person's daily ceiling is judged on this value, so an
+    /// empty one must not become a bucket with a ceiling of its own. Only a
+    /// caller that authenticated a human can state it -- a component naming one
+    /// would be attributing its own spend to somebody who did not ask for it.
+    pub fn with_owner(mut self, owner: &str) -> Self {
+        let owner = owner.trim();
+        if !owner.is_empty() {
+            self.headers
+                .insert(LLM_OWNER_HEADER.to_string(), owner.to_string());
         }
         self
     }
@@ -501,7 +536,7 @@ pub struct Usage {
 /// gateway writes the rows, the observability crate queries them -- so the set
 /// lives here rather than beside either one.
 ///
-/// Three of the five are refusals we made, not answers the upstream gave.
+/// Four of the six are refusals we made, not answers the upstream gave.
 /// `refused_by_circuit` means no upstream was even tried (the pool was shut),
 /// `refused_by_pace` means the window's allowance was spent, and
 /// `refused_by_budget` means the unit of work spent the ceiling someone
@@ -527,6 +562,13 @@ pub enum UsageResult {
     /// ——而它多半该被读成「这件工作该收尾了」，不是「晚点再来」。两者合成一个词，
     /// 修的人会去查窗口，而那窗口一点问题都没有。
     RefusedByBudget,
+    /// 这个人今天的额度用完了，请求没发出去。
+    ///
+    /// 与上一条分开，理由同上一条与配速分开的理由：上一条的上限挂在「这件工作」
+    /// 上，修法是收尾这件工作或抬它的上限；这一条的上限挂在「这个人今天能花
+    /// 多少」上，修法是等日界翻页、或由属主调整这个人的额度。两者合成一个词，
+    /// 读的人会去找错的那个人问。
+    RefusedByOwnerBudget,
 }
 
 impl UsageResult {
@@ -536,12 +578,13 @@ impl UsageResult {
     /// that spells one itself agrees with this enum only until a variant is
     /// renamed, and then it matches no rows -- which reads exactly like a
     /// ledger with nothing in it.
-    pub const ALL: [UsageResult; 5] = [
+    pub const ALL: [UsageResult; 6] = [
         UsageResult::Ok,
         UsageResult::Error,
         UsageResult::RefusedByCircuit,
         UsageResult::RefusedByPace,
         UsageResult::RefusedByBudget,
+        UsageResult::RefusedByOwnerBudget,
     ];
 
     /// The word this outcome is stored under.
@@ -552,6 +595,7 @@ impl UsageResult {
             UsageResult::RefusedByCircuit => "refused_by_circuit",
             UsageResult::RefusedByPace => "refused_by_pace",
             UsageResult::RefusedByBudget => "refused_by_budget",
+            UsageResult::RefusedByOwnerBudget => "refused_by_owner_budget",
         }
     }
 
@@ -798,6 +842,12 @@ pub const FACE_WITHOUT_A_MEMBER: &str = "face_has_no_serving_member";
 /// 等一等」，这一条说「这件工作该收尾了」。写成常量而不是两处字面量，是因为写它的
 /// （网关）与读它的（告警规则、WebUI）不在同一个 crate 里。
 pub const REFUSED_BY_BUDGET: &str = "task_budget_spent";
+
+/// 拒绝的成因：这个人今天的额度用完了。
+///
+/// 与 [`REFUSED_BY_BUDGET`] 同一类东西、同一个理由要分开：那一条的修法是收尾这件
+/// 工作，这一条的修法是等日界或由属主调整这个人的额度。两句话要问的不是同一个人。
+pub const REFUSED_BY_OWNER_BUDGET: &str = "owner_budget_spent";
 
 /// Which field names the token ceiling for an upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1245,6 +1295,75 @@ mod task_header_tests {
         assert_eq!(
             options.headers.get(LLM_TASK_HEADER).map(String::as_str),
             Some("task-1")
+        );
+    }
+}
+
+#[cfg(test)]
+mod owner_header_tests {
+    use super::*;
+
+    /// The person's identity is copied onto the wire unchanged: a ceiling is
+    /// enforced on this value, so a normalisation here would enforce a ceiling
+    /// against an id the management face never wrote.
+    #[test]
+    fn the_declared_owner_travels_verbatim() {
+        let options = ChatOptions::default().with_owner("user-7f3a");
+        assert_eq!(
+            options.headers.get(LLM_OWNER_HEADER).map(String::as_str),
+            Some("user-7f3a")
+        );
+    }
+
+    /// Blank is undeclared, not a person named "": a placeholder would become
+    /// the bucket every unattributed call lands in, and a ceiling set anywhere
+    /// near it would silently cap the platform.
+    #[test]
+    fn a_blank_owner_declares_nothing() {
+        for blank in ["", "   "] {
+            let options = ChatOptions::default().with_owner(blank);
+            assert!(
+                !options.headers.contains_key(LLM_OWNER_HEADER),
+                "a blank owner must leave the header off entirely"
+            );
+        }
+    }
+
+    /// The person and the job are two answers to two different questions, and
+    /// one call carries both: the ceiling on the job and the ceiling on the
+    /// person are judged separately against separate limits.
+    #[test]
+    fn owner_and_task_coexist_without_overwriting_each_other() {
+        let options = ChatOptions::default()
+            .with_task("task-1")
+            .with_owner("user-7f3a");
+        assert_eq!(
+            options.headers.get(LLM_TASK_HEADER).map(String::as_str),
+            Some("task-1")
+        );
+        assert_eq!(
+            options.headers.get(LLM_OWNER_HEADER).map(String::as_str),
+            Some("user-7f3a")
+        );
+    }
+
+    /// Every result word is its own: a reader that selects rows by state has to
+    /// be able to tell "this person is out for the day" from "this job is
+    /// done", so the two words must not collide.
+    #[test]
+    fn the_person_ceiling_has_a_word_of_its_own() {
+        assert_ne!(
+            UsageResult::RefusedByOwnerBudget.as_str(),
+            UsageResult::RefusedByBudget.as_str()
+        );
+        assert!(UsageResult::ALL.contains(&UsageResult::RefusedByOwnerBudget));
+        assert_eq!(
+            UsageResult::parse(UsageResult::RefusedByOwnerBudget.as_str()),
+            Some(UsageResult::RefusedByOwnerBudget)
+        );
+        assert_ne!(
+            REFUSED_BY_OWNER_BUDGET, REFUSED_BY_BUDGET,
+            "两种拒绝的响应成因同值的话，调用侧只能得出一个处置，而它们要问的不是同一个人"
         );
     }
 }

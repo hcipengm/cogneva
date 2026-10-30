@@ -60,7 +60,11 @@ fn now_iso() -> String {
 /// Route a chat message: ACT (system should do something) or CHAT (answer
 /// directly). Classification failure defaults to CHAT — answering is always
 /// safe, silently dropping an intent into a goal is not.
-async fn is_actionable_intent(llm: &Arc<dyn cog_core::LlmClient>, content: &str) -> bool {
+async fn is_actionable_intent(
+    llm: &Arc<dyn cog_core::LlmClient>,
+    content: &str,
+    owner: &str,
+) -> bool {
     let messages = [
         cog_core::Message::system(INTENT_CLASSIFY_PROMPT),
         cog_core::Message::user(content),
@@ -70,7 +74,9 @@ async fn is_actionable_intent(llm: &Arc<dyn cog_core::LlmClient>, content: &str)
         // A person is waiting on this classification, so its spend belongs to
         // the interactive environment even though the process it runs in is
         // the one driving the platform's own pool.
-        .with_origin(LlmOrigin::Interactive.as_str());
+        .with_origin(LlmOrigin::Interactive.as_str())
+        // 这一次分类也是替这个人花的，同一条额度。
+        .with_owner(owner);
     let res = tokio::time::timeout(
         std::time::Duration::from_secs(CLASSIFY_TIMEOUT_SECS),
         llm.chat(&messages, &options),
@@ -299,6 +305,9 @@ pub async fn run_chat_turn(
     out: mpsc::Sender<String>,
     session_id: String,
     content: String,
+    // 这次对话属于谁。空串是「这条连接没有身份」——那时调用方不声明人，账落在
+    // 没有人的那一格，与「声明了某个人」分开。
+    owner: String,
 ) {
     // 1. Echo the user message so the UI renders it (the real transport has
     //    no local echo, unlike the mock client).
@@ -333,7 +342,7 @@ pub async fn run_chat_turn(
     //    stream, which the UI renders live. Decomposition takes 50-90s of
     //    LLM planning, so it runs detached and reports back on this
     //    connection when it lands.
-    if is_actionable_intent(&llm, &content).await {
+    if is_actionable_intent(&llm, &content, &owner).await {
         // 这道目标的身份在受理它的这一层定：承载行的 id 就是它，分解出的子任务都挂在
         // 这一行下面。当场定下来才报得出「是哪个目标」，用户也才有得可查——空 `tasks`
         // 那条提交形态同样合法，但那样身份的诞生就落在了分解里面，读的人拿不到。
@@ -396,7 +405,11 @@ pub async fn run_chat_turn(
     .with_actor("web_chat")
     // Both chat faces answer a person who is waiting, so both are interactive
     // spend — unlike the pool the same process drives on its own.
-    .with_origin(LlmOrigin::Interactive.as_str());
+    .with_origin(LlmOrigin::Interactive.as_str())
+    // 这一发记在谁的头上。这是平台里唯一一处「身份已经过鉴权」的地方：值来自
+    // 升级握手时解出的令牌，不是调用方自己填的名字，所以按人的当日额度可以拿它
+    // 去判——别处报上来的名字只配被记录，不配被判定。
+    .with_owner(&owner);
 
     // 4. Stream the reply: deltas are forwarded as they arrive.
     let mut stream = match tokio::time::timeout(

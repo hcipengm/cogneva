@@ -18,18 +18,14 @@
 //! `measured_at_unix` travels with the figure because a spend without an age is
 //! either a quiet day or a dead writer, and those call for opposite repairs.
 
-/// Seconds in a UTC day.
-// cap: derived — 一天的秒数与花销窗口的划分方式绑定，不是可调参数（日历定义）
-const SECONDS_PER_DAY: i64 = 86_400;
-
-/// Start of the UTC day containing `now_unix`.
+/// Second of the UTC day the figures below were summed over.
 ///
-/// The day is fixed to UTC rather than to a local zone because the figure is
-/// summed from a ledger whose timestamps are UTC, and a boundary derived from the
+/// The boundary is the platform's, declared once in [`cog_core::day`]: the
+/// counters a spend figure is read beside reset on it, and so does a caller
+/// told when to come back. The day is fixed to UTC rather than to a local zone
+/// because the ledger's timestamps are UTC, and a boundary derived from the
 /// host's zone would move the reset hour when the pod moved.
-pub fn day_start_unix(now_unix: i64) -> i64 {
-    now_unix.div_euclid(SECONDS_PER_DAY) * SECONDS_PER_DAY
-}
+pub use cog_core::day::day_start_unix;
 
 /// Today's spend as the ledger last reported it.
 ///
@@ -81,6 +77,7 @@ impl Reading {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cog_core::day::SECONDS_PER_DAY;
 
     const NOON: i64 = 1_600_000_000 - (1_600_000_000 % SECONDS_PER_DAY) + 12 * 3600;
 
@@ -92,14 +89,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_day_boundary_is_utc_midnight() {
-        assert_eq!(day_start_unix(0), 0);
-        assert_eq!(day_start_unix(SECONDS_PER_DAY - 1), 0);
-        assert_eq!(day_start_unix(SECONDS_PER_DAY), SECONDS_PER_DAY);
-        // Before the epoch the floor has to go down, not toward zero.
-        assert_eq!(day_start_unix(-1), -SECONDS_PER_DAY);
-    }
+    // The boundary itself is tested where it is declared (`cog_core::day`);
+    // this module only has to keep yesterday's total from standing as today's.
 
     #[test]
     fn yesterdays_spend_does_not_stand_as_todays() {

@@ -8,6 +8,7 @@ pub mod claim_footprint;
 pub mod config;
 pub mod config_sections;
 pub mod contract;
+pub mod day;
 pub mod day_key;
 pub mod env;
 pub mod error;

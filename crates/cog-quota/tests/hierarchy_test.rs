@@ -465,3 +465,62 @@ async fn a_stored_limit_that_does_not_parse_is_an_error_not_an_absence() {
     assert!(decision.allowed);
     assert_eq!(decision.scopes[0].limits, QuotaLimits::new(80, 100));
 }
+
+/// 网关按人判额度的两个动作，走的正是这一格：先问「这个人配过没有」，配过才判，
+/// 判的依据是记账记出来的那个数。
+///
+/// 这一条把两步钉在一起：`limits()` 的答案决定判不判（`None` = 没人配过，不许拿
+/// 默认上限去拒人），而 `consume()` 记下的花销必须出现在之后的判定里——两处各写
+/// 各的键时，读出来永远是「一分没花」。
+#[tokio::test]
+async fn the_person_axis_answers_only_what_an_operator_declared_and_counts_what_was_spent() {
+    let mgr = HierarchyManager::from_store(Arc::new(FakeStore::default()));
+    let ctx = QuotaContext {
+        user_id: Some("ti9:user".into()),
+        ..Default::default()
+    };
+
+    assert!(
+        cog_core::HierarchyManager::limits(&mgr, QuotaScope::User, "ti9:user")
+            .await
+            .expect("read ok")
+            .is_none(),
+        "没人配过的格子必须答「没人配过」，而不是默认那一对——网关拿它决定判不判"
+    );
+
+    cog_core::HierarchyManager::set_limits(
+        &mgr,
+        QuotaScope::User,
+        "ti9:user",
+        QuotaLimits::new(800, 1000),
+    )
+    .await
+    .expect("set ok");
+    let declared = cog_core::HierarchyManager::limits(&mgr, QuotaScope::User, "ti9:user")
+        .await
+        .expect("read ok")
+        .expect("an override was just written");
+    assert_eq!(declared.hard_limit, 1000);
+
+    mgr.consume(&ctx, 1200).await.expect("consume ok");
+    let decision = mgr.check(&ctx, 0).await;
+    assert!(!decision.allowed, "记进去的花销必须出现在下一次判定里");
+    assert_eq!(decision.blocked_by[0].used_today, 1200);
+    assert_eq!(decision.blocked_by[0].limits.hard_limit, 1000);
+}
+
+/// 平台给未配置格子用的默认上限只有一个定义，两个进程读到的是同一个数。
+#[tokio::test]
+async fn the_platform_default_ceiling_is_one_definition() {
+    let mgr = HierarchyManager::from_store(Arc::new(FakeStore::default()));
+    let ctx = QuotaContext {
+        user_id: Some("ti10:user".into()),
+        ..Default::default()
+    };
+    let decision = mgr.check(&ctx, 0).await;
+    assert_eq!(decision.scopes.len(), 1);
+    assert_eq!(
+        decision.scopes[0].limits,
+        QuotaLimits::from_hard(cog_quota::hierarchy::PLATFORM_DAILY_TOKENS, 0.8)
+    );
+}

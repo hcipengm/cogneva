@@ -753,10 +753,11 @@ pub async fn create_task_handler(
     }
 
     // 按任务配额执法（审计 3.6）：创建前经 5 级 HierarchyManager 检查。
-    // 这是一次只读评估：它读的是各级自己的「今日已用」，而今天没有任何代码往那里
-    // 记数（原来记账的那层管理面中间件已撤掉，理由见 `GatewayState::quota_manager`），
-    // 所以它此刻实际拦不下东西。留着它是因为声明出来的限额本身是可读的事实，且真正
-    // 的消耗要等「任务 → 属主」归属落地后才记；在那之前不另起一套按估值扣账的执法。
+    // 它读的是各级自己的「今日已用」，而今天往那里记数的只有一条路：LLM 代理按
+    // 调用方声明的属主，把真实 token 记到「人」那一级。人这一格因此是活的——有人
+    // 给某个人配过上限，这个人越线之后连任务都创建不了；工作区、团队、组织三级
+    // 仍然没有任何写者（没有哪一处说得清一次调用属于哪一个），配在那里的上限会
+    // 一直判不出东西。这里是一次按估值的只读评估，不扣账。
     if let Some(ref hierarchy) = state.hierarchy_manager {
         let user_id = claims.as_ref().map(|axum::Extension(c)| c.sub.clone());
         let quota_ctx = cog_core::QuotaContext {
