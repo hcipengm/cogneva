@@ -20,6 +20,7 @@ import { useTheme } from '@/shell/theme';
 import { THEMES } from '@/styles/themes';
 import { ThemePicker } from '@/ui/ThemePicker';
 import { QuotaLimitsPanel } from '@/views/QuotaLimitsPanel';
+import { TaskBudgetPanel } from '@/views/TaskBudgetPanel';
 import { Button, Empty, Loading, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -658,6 +659,8 @@ export function SettingsView() {
       </section>
 
       <QuotaLimitsPanel />
+
+      <TaskBudgetPanel />
 
       <section className="border-b border-[var(--line)]">
         <header className="flex items-center gap-3 px-4 py-2">

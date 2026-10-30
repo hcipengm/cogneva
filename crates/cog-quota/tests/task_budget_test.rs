@@ -26,6 +26,9 @@ struct FakeStore {
     strings: Mutex<std::collections::HashMap<String, String>>,
     /// 每个计数器被写时带的 TTL（秒）。`incr_ex` 只在建键那一次设过期，这里照抄。
     ttls: Mutex<std::collections::HashMap<String, u64>>,
+    /// 声明过预算的任务名册。测试要能往里塞一条「孤儿」成员，模拟崩在「写限值」
+    /// 与「登记名册」之间的那一格。
+    sets: Mutex<std::collections::HashMap<String, std::collections::BTreeSet<String>>>,
 }
 
 #[async_trait::async_trait]
@@ -102,16 +105,31 @@ impl KeyValueStore for FakeStore {
         Ok(next)
     }
 
-    async fn sadd(&self, _key: &str, _member: &str) -> cog_core::SFResult<()> {
-        unreachable!("预算这一面不用集合")
+    async fn sadd(&self, key: &str, member: &str) -> cog_core::SFResult<()> {
+        self.sets
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .insert(member.to_string());
+        Ok(())
     }
 
-    async fn srem(&self, _key: &str, _member: &str) -> cog_core::SFResult<()> {
-        unreachable!("预算这一面不用集合")
+    async fn srem(&self, key: &str, member: &str) -> cog_core::SFResult<()> {
+        if let Some(set) = self.sets.lock().unwrap().get_mut(key) {
+            set.remove(member);
+        }
+        Ok(())
     }
 
-    async fn smembers(&self, _key: &str) -> cog_core::SFResult<Vec<String>> {
-        unreachable!("预算这一面不用集合")
+    async fn smembers(&self, key: &str) -> cog_core::SFResult<Vec<String>> {
+        Ok(self
+            .sets
+            .lock()
+            .unwrap()
+            .get(key)
+            .map(|set| set.iter().cloned().collect())
+            .unwrap_or_default())
     }
 
     async fn hset(&self, _key: &str, _field: &str, _value: &str) -> cog_core::SFResult<()> {
@@ -267,4 +285,47 @@ async fn the_request_count_is_kept_beside_the_tokens() {
     m.charge("task-g", 2, NOON).await.unwrap();
     assert_eq!(m.requests_today("task-g").await, 2);
     assert_eq!(m.spent_today("task-g").await, 3);
+}
+
+/// 名册列出的是**真的**有上限的任务：撤销掉的不在，崩在中间的孤儿成员也不在。
+///
+/// 两条都不是洁癖。撤销之后还在名册上，操作者会以为那件工作仍被管着；孤儿成员在
+/// 名册上，管理面会为一格不存在的预算显示一行——而这两句话都会让人少做一次该做的
+/// 决定。
+#[tokio::test]
+async fn the_roster_lists_only_tasks_that_really_carry_a_ceiling() {
+    let store = Arc::new(FakeStore::default());
+    let m = TaskBudgetManager::new(store.clone());
+
+    m.set_budget("task-h", QuotaLimits::new(80, 100))
+        .await
+        .unwrap();
+    m.set_budget("task-i", QuotaLimits::new(8, 10))
+        .await
+        .unwrap();
+    assert_eq!(
+        m.tasks().await.unwrap(),
+        vec!["task-h".to_string(), "task-i".to_string()],
+        "名册要按 id 排序：同样的内容两次读出来顺序不同，读的人会以为是两条"
+    );
+
+    m.clear_budget("task-h").await.unwrap();
+    assert_eq!(m.tasks().await.unwrap(), vec!["task-i".to_string()]);
+
+    // 崩在「写限值」与「登记名册」之间的那一格：名册里有、限值键没有。
+    store.sadd("quota:task:index", "task-ghost").await.unwrap();
+    assert_eq!(
+        m.tasks().await.unwrap(),
+        vec!["task-i".to_string()],
+        "孤儿成员不许出现在名册上：那一行会让一件没有预算的任务读成「有上限」"
+    );
+    // 顺手摘掉，不留着下一拍再核一遍。
+    assert!(
+        !store
+            .smembers("quota:task:index")
+            .await
+            .unwrap()
+            .contains(&"task-ghost".to_string()),
+        "核对不上的成员应当在读的时候被摘掉"
+    );
 }

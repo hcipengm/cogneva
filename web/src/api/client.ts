@@ -2784,6 +2784,60 @@ export async function clearQuotaLimits(scope: string, id: string): Promise<Quota
   return api.delete<QuotaLimitsReading>(quotaLimitsPath(scope, id));
 }
 
+/**
+ * 一件任务的当日上限。
+ *
+ * 与上面那五级不是同一张表：那五级互相包含、检查时逐级走级联；任务是工作单位，
+ * 不属于任何一级。这里答的是「这件工作今天允许花多少」，用完就拒，午夜置零。
+ *
+ * `spent_today` 为 `null` 是「读不出来」而不是 0：写 0 会让一件刚刚被截断的工作
+ * 在页面上显示成「今天一个 token 都没花」。
+ */
+export interface TaskBudgetReading {
+  task_id: string;
+  budget: QuotaLimitPair | null;
+  spent_today: number | null;
+  read_error?: string | null;
+}
+
+export interface TaskBudgetRoster {
+  count: number;
+  tasks: TaskBudgetReading[];
+}
+
+/** 读写都经网关的内部面：判定与记账在网关进程里，这里只转发。 */
+const TASK_BUDGET_PATH = '/api/v1/admin/task-budget';
+
+/** 不带任务名时回名册：所有声明过上限的任务，各自带上今天的花销。 */
+export async function listTaskBudgets(): Promise<TaskBudgetRoster> {
+  return api.get<TaskBudgetRoster>(TASK_BUDGET_PATH);
+}
+
+export async function getTaskBudget(taskId: string): Promise<TaskBudgetReading> {
+  return api.get<TaskBudgetReading>(
+    `${TASK_BUDGET_PATH}?task_id=${encodeURIComponent(taskId)}`
+  );
+}
+
+export async function setTaskBudget(
+  taskId: string,
+  limits: QuotaLimitPair
+): Promise<TaskBudgetReading> {
+  return api.post<TaskBudgetReading>(TASK_BUDGET_PATH, {
+    task_id: taskId,
+    soft_limit: limits.soft_limit,
+    hard_limit: limits.hard_limit,
+  });
+}
+
+/** 撤掉声明。本来就没有不是错误；今天的计数不清零。 */
+export async function clearTaskBudget(taskId: string): Promise<TaskBudgetReading> {
+  return api.post<TaskBudgetReading>(TASK_BUDGET_PATH, {
+    task_id: taskId,
+    clear: true,
+  });
+}
+
 export interface ScmChange {
   path: string;
   /** `M` 改、`A` 加、`D` 删、`R` 改名、`C` 复制、`U` 冲突、`?` 未跟踪。 */

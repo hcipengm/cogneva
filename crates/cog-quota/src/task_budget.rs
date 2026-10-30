@@ -20,9 +20,13 @@
 //! | `quota:task:limits:<id>`      | JSON `QuotaLimits`       |
 //! | `quota:task:used:<id>`        | 今天已花的 token         |
 //! | `quota:task:requests:<id>`    | 今天的调用次数           |
+//! | `quota:task:index`            | 声明过预算的任务名册     |
 //!
 //! 限值键**不带 TTL**：预算是对这件工作整体说的，午夜不该把它抹掉。计数器带
 //! TTL，这就是日置零。
+//!
+//! 名册只服务管理面（「现在有哪些任务有上限」）：判定一个字节都不读它，所以它
+//! 与限值键对不上时，错的是那份清单，不是任何一次放行或拒绝。
 
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -75,6 +79,10 @@ impl std::fmt::Debug for TaskBudgetManager {
 }
 
 impl TaskBudgetManager {
+    /// 声明过预算的任务名册。管理面要回答「现在有哪些任务有上限」，而键值面没有
+    /// 扫描——名册是一个集合，写的时候顺手登记。
+    const INDEX: &'static str = "quota:task:index";
+
     pub fn new(store: Arc<dyn KeyValueStore>) -> Self {
         Self {
             store: Arc::new(Mutex::new(store)),
@@ -97,7 +105,10 @@ impl TaskBudgetManager {
             .set(&Self::key("limits", task_id), &payload)
             .await
             .map_err(store_error)?;
-        Ok(())
+        // 先写限值再登记索引：反过来的话，崩在中间会让索引里挂着一条没有上限的
+        // 任务，而管理面会把它列成「有预算」。`tasks` 两头都读，所以即使崩在这一
+        // 步，读出来也是「没有预算」，与真相同形。
+        store.sadd(Self::INDEX, task_id).await.map_err(store_error)
     }
 
     /// 读一件任务声明的预算。
@@ -127,7 +138,36 @@ impl TaskBudgetManager {
             .del(&Self::key("limits", task_id))
             .await
             .map_err(store_error)?;
+        // 索引摘不掉不影响判定（`tasks` 会核对限值键），所以这一步失败不算撤销
+        // 失败——把它报成失败会让调用方以为预算还在。
+        let _ = store.srem(Self::INDEX, task_id).await;
         Ok(())
+    }
+
+    /// 所有**真的**声明了预算的任务，按 id 排序。
+    ///
+    /// 索引是个集合，而集合成员没有生命周期：崩溃可能留下一个「在索引里、但限值
+    /// 键没有」的名字。所以这里逐个核对限值键，顺手把核对不上的摘掉——管理面列出
+    /// 一件其实没有预算的任务，比少列一件更容易让人做错决定（前者会让操作者以为
+    /// 那件工作有上限）。
+    pub async fn tasks(&self) -> QuotaResult<Vec<String>> {
+        let store = self.store.lock().await;
+        let ids = store.smembers(Self::INDEX).await.map_err(store_error)?;
+        let mut live = Vec::with_capacity(ids.len());
+        for id in ids {
+            match store
+                .get(&Self::key("limits", &id))
+                .await
+                .map_err(store_error)?
+            {
+                Some(_) => live.push(id),
+                None => {
+                    let _ = store.srem(Self::INDEX, &id).await;
+                }
+            }
+        }
+        live.sort();
+        Ok(live)
     }
 
     /// 今天这件任务已经花掉的 token。
@@ -266,6 +306,10 @@ impl cog_core::TaskBudgetGate for TaskBudgetManager {
             .map_err(sf_error)
     }
 
+    async fn budgeted_tasks(&self) -> cog_core::SFResult<Vec<String>> {
+        TaskBudgetManager::tasks(self).await.map_err(sf_error)
+    }
+
     async fn check(
         &self,
         task_id: &str,
@@ -313,20 +357,25 @@ mod tests {
     #[test]
     fn a_budgeted_task_is_refused_once_the_call_would_cross_the_hard_limit() {
         let limits = QuotaLimits::new(80, 100);
-        // 恰好到界放行：界是「用到这里为止」，不是「用到这里就停」。
+        // 恰好到界放行：界是「用到这里为止」，不是「用到这里就停」。这一格同时已经
+        // 越过软上限，所以它也是一个告警——放行与告警不矛盾，它们是两句话。
         let at = verdict("t1", Some(limits), 100, 0, NOON);
         assert!(at.allowed);
-        assert!(!at.warning);
+        assert!(at.warning);
         let over = verdict("t1", Some(limits), 100, 1, NOON);
         assert!(!over.allowed);
         assert_eq!(over.remaining, Some(0));
-        assert_eq!(over.wait_secs, Some(SECONDS_PER_DAY as u64));
+        // 正午到下一个 UTC 午夜是半天，不是一整天：等待是「到那个午夜」，不是
+        // 「再过 24 小时」。
+        assert_eq!(at.wait_secs, None);
+        assert_eq!(over.wait_secs, Some(SECONDS_PER_DAY as u64 / 2));
     }
 
     #[test]
     fn the_wait_is_the_rest_of_the_day_not_a_fixed_number() {
         let limits = QuotaLimits::new(10, 10);
-        let last_second = NOON + SECONDS_PER_DAY - 1;
+        // 午夜前一秒：从正午往后走半天再减一秒。
+        let last_second = NOON + SECONDS_PER_DAY / 2 - 1;
         let d = verdict("t1", Some(limits), 10, 1, last_second);
         assert!(!d.allowed);
         assert_eq!(d.wait_secs, Some(1));

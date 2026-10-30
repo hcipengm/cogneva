@@ -8369,8 +8369,9 @@ async fn internal_contribution_policy_read_handler(
 
 /// 一次按任务预算的管理读写的正文。
 ///
-/// 三种动作共用一个载体，靠「给了什么」分开，而不是靠三个路径：读、写、撤是同一个
+/// 四种动作共用一个载体，靠「给了什么」分开，而不是靠四条路径：读、写、撤是同一个
 /// 格子的三种状态，拆成三条路径就会出现「在哪一条上读到的才作数」这个问题。
+/// - 什么都不给：列出所有声明过上限的任务；
 /// - 只有 `task_id`：读；
 /// - `clear: true`：撤掉声明；
 /// - `soft_limit` 与 `hard_limit` 都给：写。
@@ -8378,6 +8379,7 @@ async fn internal_contribution_policy_read_handler(
 /// 只给一半是 400：另一半会悄悄沿用旧值，而写下限的人想的是一整对。
 #[derive(Debug, serde::Deserialize)]
 struct TaskBudgetPayload {
+    #[serde(default)]
     task_id: String,
     #[serde(default)]
     soft_limit: Option<u64>,
@@ -8425,11 +8427,16 @@ async fn internal_task_budget_handler(
         }
     };
     if payload.task_id.trim().is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "task_id_required"})),
-        )
-            .into_response();
+        // 没有 task_id 只有在「什么都不做、只要名册」时才是合法的：带一个写或撤的
+        // 意图却没有主语，那是一次丢掉了目标的调用，照成功答会让调用方以为写成了。
+        if payload.clear || payload.soft_limit.is_some() || payload.hard_limit.is_some() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "task_id_required"})),
+            )
+                .into_response();
+        }
+        return list_task_budgets(gate).await;
     }
     let task_id = payload.task_id.trim().to_string();
 
@@ -8499,6 +8506,55 @@ async fn internal_task_budget_handler(
             "task_id": task_id,
             "budget": budget,
             "spent_today": spent_today,
+        })),
+    )
+        .into_response()
+}
+
+/// 名册：所有声明过上限的任务，各自带上上限与今天的读数。
+///
+/// 名册只证明「有人声明过」，操作者要看的是「这件工作还剩多少」，所以每一条都回读
+/// 一次。读不出来的一条**不丢**，把读不出的那格写成 `null` 并点名原因——丢一条会让
+/// 「那件任务没有预算」与「这一回合读不到」在页面上同形，而前者会让人以为它不受管。
+async fn list_task_budgets(gate: &Arc<dyn cog_core::TaskBudgetGate>) -> axum::response::Response {
+    let tasks = match gate.budgeted_tasks().await {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "list_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let now_unix = Utc::now().timestamp();
+    let mut rows = Vec::with_capacity(tasks.len());
+    for task_id in tasks {
+        let budget = gate.budget(&task_id).await;
+        let read = gate.check(&task_id, now_unix).await;
+        rows.push(serde_json::json!({
+            "task_id": task_id,
+            "budget": match &budget {
+                Ok(b) => serde_json::to_value(b).unwrap_or(serde_json::Value::Null),
+                Err(_) => serde_json::Value::Null,
+            },
+            "spent_today": match &read {
+                Ok(v) => serde_json::json!(v.spent_today),
+                Err(_) => serde_json::Value::Null,
+            },
+            // 两个独立读数各自可能坏；有任一坏掉就把原因写在同一个字段里，
+            // 这一行仍然出现在名册上。
+            "read_error": match (&budget, &read) {
+                (Ok(_), Ok(_)) => serde_json::Value::Null,
+                (Err(e), _) | (_, Err(e)) => serde_json::json!(e.to_string()),
+            },
+        }));
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "count": rows.len(),
+            "tasks": rows,
         })),
     )
         .into_response()
@@ -15901,6 +15957,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         verdict: cog_core::TaskBudgetVerdict,
         broken: bool,
         charged: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+        /// 名册上的任务。`budget` 只对这些答得出来，与真实现（限值键存在与否）
+        /// 同一个形状：名册上的每一条都该有一条限值。
+        tasks: Vec<String>,
     }
 
     impl StubBudgetGate {
@@ -15909,13 +15968,19 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 verdict,
                 broken: false,
                 charged: Arc::new(std::sync::Mutex::new(Vec::new())),
+                tasks: Vec::new(),
             }
+        }
+
+        fn with_tasks(mut self, tasks: &[&str]) -> Self {
+            self.tasks = tasks.iter().map(|t| (*t).to_string()).collect();
+            self
         }
 
         fn broken() -> Self {
             Self {
                 broken: true,
-                ..Self::new(budgeted(false, 0, 0))
+                ..Self::new(budgeted(false, 0, 0)).with_tasks(&["t-1"])
             }
         }
     }
@@ -15934,11 +15999,14 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             Ok(())
         }
 
-        async fn budget(
-            &self,
-            _task_id: &str,
-        ) -> cog_core::SFResult<Option<cog_core::QuotaLimits>> {
-            Ok(None)
+        async fn budget(&self, task_id: &str) -> cog_core::SFResult<Option<cog_core::QuotaLimits>> {
+            Ok(self.tasks.iter().any(|t| t == task_id).then(|| {
+                cog_core::QuotaLimits::new(self.verdict.soft_limit, self.verdict.hard_limit)
+            }))
+        }
+
+        async fn budgeted_tasks(&self) -> cog_core::SFResult<Vec<String>> {
+            Ok(self.tasks.clone())
         }
 
         async fn check(
@@ -16156,5 +16224,106 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"], "limits_are_a_pair");
+    }
+
+    /// 管理面的名册：每一件声明过上限的任务都在，各自带上今天的读数；读数读不出来
+    /// 的那一条**仍然在**，只是把那一格写成 `null`。
+    ///
+    /// 丢一条是这里唯一真会做错的选择：页面上「这件任务不在名册里」与「这件任务读
+    /// 不出来」同形，而前者会被读成「它没有预算、不受管」——一件被截断的工作就这
+    /// 样从读数里消失，同时它的拒绝还在照常发生。
+    #[tokio::test]
+    async fn the_budget_roster_keeps_a_row_it_cannot_read_and_says_why() {
+        use tower::ServiceExt;
+
+        // 一份读得出、一份读不出的名册，各问一次。
+        for (gate, expect_read_error) in [
+            (
+                Arc::new(StubBudgetGate::new(budgeted(true, 700, 1000)).with_tasks(&["t-1", "t-2"]))
+                    as Arc<dyn cog_core::TaskBudgetGate>,
+                false,
+            ),
+            (
+                Arc::new(StubBudgetGate::broken()) as Arc<dyn cog_core::TaskBudgetGate>,
+                true,
+            ),
+        ] {
+            let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+            state.config.webhook_internal_secret = Some("internal-secret".into());
+            state.task_budget = Some(gate);
+            let app = router(state, true);
+
+            let body = serde_json::json!({}).to_string();
+            let req = axum::extract::Request::builder()
+                .uri(INTERNAL_TASK_BUDGET_PATH)
+                .method("POST")
+                .header("content-type", cog_core::CONTENT_TYPE_JSON)
+                .header(
+                    crate::secret_write::SIGNATURE_HEADER,
+                    crate::secret_write::sign("internal-secret", body.as_bytes()),
+                )
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let rows = v["tasks"].as_array().expect("名册必须是数组");
+            assert!(!rows.is_empty(), "名册上有一条，就必须列出一行：{v}");
+            assert_eq!(v["count"], rows.len());
+            for row in rows {
+                assert!(row["task_id"].is_string(), "{row}");
+                assert!(
+                    row["budget"].is_object() || row["budget"].is_null(),
+                    "{row}"
+                );
+                if expect_read_error {
+                    assert!(row["spent_today"].is_null(), "读不出来时不许写成 0：{row}");
+                    assert!(
+                        row["read_error"].is_string(),
+                        "这一条为什么读不出来要写在行上：{row}"
+                    );
+                } else {
+                    assert_eq!(row["spent_today"], 700, "{row}");
+                    assert!(row["read_error"].is_null(), "{row}");
+                }
+            }
+        }
+    }
+
+    /// 带「写」或「撤」的意图却没有任务名，是 400；只说「给我名册」才是 200。
+    ///
+    /// 没有主语的一次写入照成功答，调用方会以为上限落地了——而这件工作此后照常花
+    /// 钱，读的人还以为它被某条上限管着。
+    #[tokio::test]
+    async fn a_write_without_a_task_id_is_a_bad_request_not_an_empty_roster() {
+        use tower::ServiceExt;
+
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.config.webhook_internal_secret = Some("internal-secret".into());
+        state.task_budget = Some(Arc::new(StubBudgetGate::new(budgeted(true, 0, 100))));
+        let app = router(state, true);
+
+        let body = serde_json::json!({"soft_limit": 10, "hard_limit": 20}).to_string();
+        let req = axum::extract::Request::builder()
+            .uri(INTERNAL_TASK_BUDGET_PATH)
+            .method("POST")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
+            .header(
+                crate::secret_write::SIGNATURE_HEADER,
+                crate::secret_write::sign("internal-secret", body.as_bytes()),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "task_id_required");
     }
 }

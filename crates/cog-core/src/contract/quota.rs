@@ -284,6 +284,12 @@ pub trait TaskBudgetGate: Send + Sync {
     /// 读那份答案的人分不出「按默认值配的」与「没人配过」。
     async fn budget(&self, task_id: &str) -> SFResult<Option<QuotaLimits>>;
 
+    /// 所有声明过上限的任务。
+    ///
+    /// 管理面要回答「现在有哪些任务有上限」，而这件事按 id 问是无解的——问的人
+    /// 得先知道 id。判定一个字节都不读它：清单错了，错的是清单，不是任何一次放行。
+    async fn budgeted_tasks(&self) -> SFResult<Vec<String>>;
+
     /// 判这一发放不放行，不记账。`now_unix` 是参数而不是读时钟：日界决定了拒绝时
     /// 给出多少等待，而「午夜前一秒」那一格只有把时钟交进来才测得了。
     async fn check(&self, task_id: &str, now_unix: i64) -> SFResult<TaskBudgetVerdict>;

@@ -84,6 +84,7 @@ pub mod state_builder;
 pub mod supervisor_control;
 pub mod supervisor_status;
 pub mod takeover;
+pub mod task_budget_admin;
 pub mod tasks;
 pub mod taste;
 #[cfg(test)]
@@ -891,6 +892,13 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/admin/search-fallback",
             get(search_admin::search_fallback_status_handler)
                 .post(search_admin::search_fallback_config_handler),
+        )
+        // 按任务的当日上限：一件工作自己声明一个上限，用完了网关就拒它。读写都转发
+        // 给安全网关——判定与记账在那里，主应用这一侧只负责签名转发。
+        .route(
+            "/api/v1/admin/task-budget",
+            get(task_budget_admin::task_budget_get_handler)
+                .post(task_budget_admin::task_budget_post_handler),
         )
         // Exporting a package is a Job plus a download, not a byte copy in
         // this process: the shape of a backup lives in `cogneva backup`, and
