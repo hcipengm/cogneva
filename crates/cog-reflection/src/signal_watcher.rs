@@ -749,6 +749,15 @@ fn signal_acceptance(detail: &serde_json::Value, project: Option<&str>) -> Strin
             "待办与在飞不再超过 {}：本文件每轮报的那个待办读数",
             number("threshold")
         ),
+        // This one is not a condition that stops asking: the audit is filed
+        // every period whether or not the last one found anything, so "it did
+        // not ask again" can never be its completion. What closes it is the
+        // change it was supposed to produce, read where changes land.
+        SELF_AUDIT_SIGNAL_KIND => format!(
+            "{} 这一期自审点名的缺陷在账上有一条落地的变更：账读得到这次自审的成果，\
+             而不是任务跑完就算",
+            text("period")
+        ),
         _ => format!(
             "条件「{}」不再成立：下一轮不再为它建行",
             project.unwrap_or(kind)
@@ -801,6 +810,13 @@ fn signal_project_root(project: &str) -> Task {
     root
 }
 
+/// The signal kind the periodic self-audit is filed under.
+///
+/// It shares the filing path with the alert and failure signals but names no
+/// condition, so it has no project of its own -- the criterion back-fill finds
+/// it by this kind rather than by a project prefix.
+const SELF_AUDIT_SIGNAL_KIND: &str = "self_audit";
+
 fn signal_project_root_id(project: &str) -> String {
     let scope = project
         .strip_prefix(SIGNAL_PROJECT_PREFIX)
@@ -822,6 +838,8 @@ struct SettledSignals {
     anchored: usize,
     reparented: usize,
     criteria: usize,
+    /// Criterion back-filled onto a rework row this process filed.
+    rework_criteria: usize,
     failed: usize,
     /// Rows still out of shape after this settle. Zero means the next tick has
     /// nothing left to do and the round can stop asking.
@@ -830,14 +848,23 @@ struct SettledSignals {
 
 impl SettledSignals {
     fn moved_anything(&self) -> bool {
-        self.anchored > 0 || self.reparented > 0 || self.criteria > 0 || self.failed > 0
+        self.anchored > 0
+            || self.reparented > 0
+            || self.criteria > 0
+            || self.rework_criteria > 0
+            || self.failed > 0
     }
 
     fn line(&self) -> String {
         format!(
-            "settled signal projects: anchored={} reparented={} criteria={} failed={} \
-             remaining={}",
-            self.anchored, self.reparented, self.criteria, self.failed, self.remaining
+            "settled filings: anchored={} reparented={} criteria={} rework_criteria={} \
+             failed={} remaining={}",
+            self.anchored,
+            self.reparented,
+            self.criteria,
+            self.rework_criteria,
+            self.failed,
+            self.remaining
         )
     }
 }
@@ -948,12 +975,17 @@ async fn fill_signal_criteria(
     let candidates: Vec<&Task> = tasks
         .iter()
         .filter(|task| task.acceptance.is_empty())
+        .filter(|task| task.input.get("signal").is_some())
         .filter(|task| {
             task.goal_id
                 .as_deref()
                 .is_some_and(|project| project.starts_with(SIGNAL_PROJECT_PREFIX))
+                // The periodic audit is filed by this same path but names no
+                // condition, so it gets no project: it is still one of this
+                // process's filings and still owes a criterion.
+                || task.input["signal"].get("kind").and_then(|k| k.as_str())
+                    == Some(SELF_AUDIT_SIGNAL_KIND)
         })
-        .filter(|task| task.input.get("signal").is_some())
         .collect();
     settled.remaining = candidates.len().saturating_sub(SIGNAL_SETTLE_BATCH);
     for row in candidates.into_iter().take(SIGNAL_SETTLE_BATCH) {
@@ -992,6 +1024,101 @@ async fn fill_signal_criteria(
             }
         }
     }
+}
+
+/// Give the rework rows filed before their criterion existed the one they would
+/// be filed with today.
+///
+/// Same defect as the signal rows, one kind over: the hand-off now writes the
+/// criterion, but a requirement filed before it did keeps an empty one for the
+/// life of the graph -- the learning that filed it is retired on the verdict,
+/// so nothing files that requirement again.
+///
+/// Re-derived from the payload the row kept (the cause and the files the gate
+/// pointed at), through the same function the hand-off writes with. A row that
+/// kept neither is left alone: there is no honest criterion to write, and a
+/// guess would close the row on a question nobody asked.
+async fn fill_rework_criteria(
+    orch: &Arc<dyn OrchestratorControl>,
+    tasks: &[Task],
+    settled: &mut SettledSignals,
+) {
+    let candidates: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| task.acceptance.is_empty())
+        .filter(|task| task.task_type.kind_key() == crate::change_rework::REWORK_TASK_KIND)
+        .collect();
+    settled.remaining += candidates.len().saturating_sub(SIGNAL_SETTLE_BATCH);
+    for row in candidates.into_iter().take(SIGNAL_SETTLE_BATCH) {
+        // Read again before writing, for the same reason as the signal rows: the
+        // snapshot is a minute old and `replace_task` writes the whole row.
+        let Some(mut filled) = orch.get_task(&row.id).await else {
+            continue;
+        };
+        if !filled.acceptance.is_empty() {
+            continue;
+        }
+        if filled.status == TaskStatus::Running {
+            settled.remaining += 1;
+            continue;
+        }
+        let cause = filled
+            .input
+            .get("rejection_cause")
+            .and_then(|cause| cause.as_str())
+            .map(str::to_string);
+        let files: Vec<String> = filled
+            .input
+            .get("named_files")
+            .and_then(|files| files.as_array())
+            .map(|files| {
+                files
+                    .iter()
+                    .filter_map(|file| file.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if cause.is_none() && files.is_empty() {
+            continue;
+        }
+        let surface = if files.is_empty() {
+            "这次被拒的那个面".to_string()
+        } else {
+            files.join("、")
+        };
+        filled
+            .acceptance
+            .push(crate::change_rework::rework_acceptance(
+                cause.as_deref(),
+                &surface,
+            ));
+        match orch.replace_task(filled).await {
+            Ok(()) => settled.rework_criteria += 1,
+            Err(e) => {
+                settled.failed += 1;
+                settled.remaining += 1;
+                warn!(
+                    task = %row.id,
+                    error = %e,
+                    "signal watcher: a rework row could not be given its criterion, so it stays \
+                     a work package nobody can close"
+                );
+            }
+        }
+    }
+}
+
+/// Everything one round settles: the signal projects, and the rows this
+/// process files that were written before their kind wrote a criterion.
+///
+/// One entry point because the caller has one flag to keep: a round that still
+/// has rows left to settle asks again on its next tick, and it must not stop
+/// asking just because one of the two halves finished.
+async fn settle_filings(orch: &Arc<dyn OrchestratorControl>, tasks: &[Task]) -> SettledSignals {
+    let mut settled = settle_signal_parents(orch, tasks).await;
+    fill_rework_criteria(orch, tasks, &mut settled).await;
+    settled
 }
 
 /// Result of one submission attempt. "Nothing needed doing" and "the intent
@@ -1163,11 +1290,11 @@ async fn tick(
     let now = Utc::now();
     let tasks = orch.get_all_tasks().await;
     // Until it stops finding anything to fill, on the graph this round already
-    // read: see `settle_signal_parents`. Before the held-round return, because
-    // shaping the tree spends no LLM call and a pool outage is no reason to
-    // leave a project replanning cannot hang work under.
+    // read: see `settle_filings`. Before the held-round return, because shaping
+    // the tree spends no LLM call and a pool outage is no reason to leave a
+    // project replanning cannot hang work under.
     if !*parents_settled {
-        let settled = settle_signal_parents(orch, &tasks).await;
+        let settled = settle_filings(orch, &tasks).await;
         if settled.moved_anything() {
             info!("signal watcher: {}", settled.line());
         }
@@ -1344,10 +1471,10 @@ async fn tick(
             let outcome = submit_intent(
                 orch,
                 key.clone(),
-                "self_audit",
+                SELF_AUDIT_SIGNAL_KIND,
                 goal,
                 serde_json::json!({
-                    "kind": "self_audit",
+                    "kind": SELF_AUDIT_SIGNAL_KIND,
                     "period": period,
                 }),
                 true,
@@ -2505,6 +2632,83 @@ mod tests {
                 .iter()
                 .all(|t| !t.acceptance.is_empty()),
             "第二轮之后还有行没补上"
+        );
+    }
+
+    /// 回流行同样是「早于判据写下的行」，同一趟结算要把它补上。
+    ///
+    /// 判据从这一行自己留的负载重算：成因和门点名的文件都在行里，所以补出来的
+    /// 那句与今天提交时会写的完全一样——两处共用同一个函数。没有留下任何可用
+    /// 字段的行不猜：写一句猜的判据，等于让这一行按一个没人问过的问题关闭。
+    #[tokio::test]
+    async fn a_rework_row_written_before_its_criterion_is_given_the_same_one() {
+        let rework = |id: &str, payload: serde_json::Value| {
+            Task::new(
+                id.to_string(),
+                TaskType::Custom(crate::change_rework::REWORK_TASK_KIND.into()),
+                payload,
+            )
+        };
+        let mut running = rework(
+            "rework-running",
+            serde_json::json!({
+                "rejection_cause": "tests_failed",
+                "named_files": ["crates/x/src/lib.rs"],
+            }),
+        );
+        running.status = TaskStatus::Running;
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(vec![
+            rework(
+                "rework-old",
+                serde_json::json!({
+                    "rejection_cause": "tests_failed",
+                    "named_files": ["crates/x/src/lib.rs"],
+                }),
+            ),
+            // 什么也没留下的行：没有诚实的判据可写。
+            rework("rework-bare", serde_json::json!({"goal": "g"})),
+            // 正在跑的这一行下一轮再说：写回快照会盖掉执行器刚设的状态。
+            running,
+        ]));
+
+        let tasks = orch.get_all_tasks().await;
+        let settled = settle_filings(&orch, &tasks).await;
+        assert_eq!(settled.rework_criteria, 1, "{settled:?}");
+        assert_eq!(settled.remaining, 1, "{settled:?}");
+
+        let after = orch.get_all_tasks().await;
+        let filled = after.iter().find(|t| t.id == "rework-old").unwrap();
+        assert_eq!(
+            filled.acceptance,
+            vec![crate::change_rework::rework_acceptance(
+                Some("tests_failed"),
+                "crates/x/src/lib.rs"
+            )],
+            "补上的判据要与提交时写的那一句完全相同"
+        );
+        for untouched in ["rework-bare", "rework-running"] {
+            let task = after.iter().find(|t| t.id == untouched).unwrap();
+            assert!(
+                task.acceptance.is_empty(),
+                "{untouched} 不该被补：它没有可用的现场，或者正在跑"
+            );
+        }
+    }
+
+    /// 周期性自审不是「不再成立」那一族：它每一期都会再提交一次，所以
+    /// 「下一轮不再为它建行」永远为真，等于给这一行写了一句恒真的判据——那和
+    /// 空判据一样关不掉。关掉它的是它本该产出的那条变更。
+    #[tokio::test]
+    async fn the_periodic_audit_is_closed_by_the_change_it_produces() {
+        let audit = serde_json::json!({"kind": SELF_AUDIT_SIGNAL_KIND, "period": "20261030"});
+        let written = signal_acceptance(&audit, None);
+        assert!(
+            written.contains("20261030") && written.contains("落地"),
+            "自审的判据要点名这一期，并指向一条落地的变更：{written}"
+        );
+        assert!(
+            !written.contains("不再"),
+            "下一期照样会建行，所以「不再成立」对自审是恒真的：{written}"
         );
     }
 

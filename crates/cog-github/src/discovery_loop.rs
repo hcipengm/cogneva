@@ -336,6 +336,12 @@ pub struct GitHubDiscoveryLoop {
     /// not "evidence that the premise is gone", and a fresh gateway reports
     /// zero while an empty verdict table looks perfectly healthy.
     pool_success_epoch: u64,
+    /// Whether every row this loop files already states what done means. The
+    /// back-fill runs until it reaches all of them and then stops for the life
+    /// of the process: every row filed from here on carries one by
+    /// construction, so re-reading the whole graph every round would buy
+    /// nothing.
+    criteria_settled: bool,
 }
 
 /// Persisted intent guards (`$COGNEVA_DATA_DIR/discovery-guards.json`):
@@ -653,6 +659,7 @@ impl GitHubDiscoveryLoop {
             gate: None,
             pool: None,
             pool_success_epoch: 0,
+            criteria_settled: false,
         }
     }
 
@@ -1087,6 +1094,25 @@ impl GitHubDiscoveryLoop {
             return Ok(0);
         }
         self.load_guards_once().await;
+        // Rows filed before their kind wrote a criterion are settled once per
+        // process, not once per round: everything filed from here on carries
+        // one by construction, and the pass stops asking when `remaining` hits
+        // zero. Placed before the round's own work so a row it is about to
+        // re-drive is already closable when it starts.
+        if !self.criteria_settled {
+            if let Some(orch) = self.orchestrator.clone() {
+                let settled = self.settle_filed_criteria(&orch).await;
+                if settled.filled > 0 || settled.failed > 0 {
+                    tracing::info!(
+                        filled = settled.filled,
+                        failed = settled.failed,
+                        remaining = settled.remaining,
+                        "settled the criteria on rows filed before their kind wrote one"
+                    );
+                }
+                self.criteria_settled = settled.remaining == 0;
+            }
+        }
         // 先取这一轮的池实证纪元，再判任何退避窗：它决定的是"窗的前提还在不在"，
         // 而窗在下面几处都要判。一轮一次，不按意图各问一遍 Redis。
         self.refresh_pool_success_epoch().await;
@@ -1474,7 +1500,7 @@ impl GitHubDiscoveryLoop {
             event.workflow_name, event.run_id, event.head_branch, event.head_sha, log_section
         );
 
-        let task = Task::new(
+        let mut task = Task::new(
             format!("{}-ci-run-{}", self.provider.platform_kind(), event.run_id),
             TaskType::Custom("platform_ci_fix".into()),
             serde_json::json!({
@@ -1495,6 +1521,12 @@ impl GitHubDiscoveryLoop {
                 (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
             }),
         );
+        task.acceptance.push(ci_fix_acceptance(
+            &event.workflow_name,
+            &event.head_branch,
+            event.run_id,
+            &event.html_url,
+        ));
 
         let task_ids = orchestrator.submit_goal_auto(&goal, vec![task]).await?;
         tracing::info!(
@@ -1802,6 +1834,7 @@ impl GitHubDiscoveryLoop {
             timestamp: Some(chrono::Utc::now()),
         });
         task.timeout_seconds = ASSESS_TASK_TIMEOUT_SECS;
+        task.acceptance.push(assess_acceptance(&task_id));
 
         let ids = orchestrator.submit_goal_auto(&goal, vec![task]).await?;
         let id = ids.into_iter().next().unwrap_or(task_id);
@@ -2018,7 +2051,7 @@ impl GitHubDiscoveryLoop {
             issue.body
         );
 
-        let task = Task::new(
+        let mut task = Task::new(
             self.intent_task_id(IntentKind::Issue, issue.number),
             TaskType::Custom("platform_issue_fix".into()),
             serde_json::json!({
@@ -2032,6 +2065,10 @@ impl GitHubDiscoveryLoop {
                 (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
             }),
         );
+        task.acceptance.push(issue_fix_acceptance(
+            self.provider.platform_kind(),
+            issue.number,
+        ));
 
         let task_ids = orchestrator.submit_goal_auto(&goal, vec![task]).await?;
         tracing::info!(
@@ -2374,8 +2411,175 @@ impl GitHubDiscoveryLoop {
     }
 }
 
+/// What closes one CI-fix row.
+///
+/// The run it was raised for is the one the next fixer reads, so the criterion
+/// is a reading of the platform and not of the task: a fix can end cleanly
+/// having produced a change that never ran, and only the branch's next run says
+/// which of the two happened.
+pub(crate) fn ci_fix_acceptance(workflow: &str, branch: &str, run_id: u64, url: &str) -> String {
+    format!(
+        "workflow「{workflow}」在 {branch} 上的下一次运行判绿：失败 job 集合为空；按 run \
+         {run_id} 的 {url} 读，而不是按这次修复任务自己的状态"
+    )
+}
+
+/// What closes one issue-fix row.
+///
+/// The requirement is the reporter's, not the task's: it is met when the issue
+/// is closed and no one has come back to say the behaviour is still there. Both
+/// halves are read from the platform, which is where the person who raised it
+/// will look.
+pub(crate) fn issue_fix_acceptance(platform: &str, number: u64) -> String {
+    format!(
+        "{platform} issue #{number} 落到 closed 且关闭前没有新的复述：平台读这一条的 state，\
+         而不是修复任务自己报完成"
+    )
+}
+
+/// What closes one assessment row.
+///
+/// An assessment asks one thing and is done when the answer is on the record: a
+/// decision this process can read back by id on the next round. Left implicit,
+/// an assessor that returns nothing reads the same as one that judged the intent
+/// and found it not worth acting on.
+pub(crate) fn assess_acceptance(task_id: &str) -> String {
+    format!(
+        "这次意图在判定存储里有一条按 {task_id} 可取的判决（fix / clarify / escalate / skip \
+         之一）：重启后同一内容仍读得到它，而不是缺行"
+    )
+}
+
+/// How many rows one back-fill pass writes before reporting what is left.
+///
+/// The first pass after this ships has a few dozen rows to reach and runs on a
+/// round that is also polling two platforms; a batch bounds the burst, not the
+/// work.
+const CRITERIA_SETTLE_BATCH: usize = 400;
+
+/// What one back-fill pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettledCriteria {
+    pub(crate) filled: usize,
+    pub(crate) failed: usize,
+    /// Rows still without a criterion after this pass.
+    pub(crate) remaining: usize,
+}
+
+/// The criterion a row filed by this loop would carry today, rebuilt from the
+/// payload it kept.
+///
+/// `None` means the row kept nothing to rebuild it from. Guessing there would
+/// write a criterion about a question the row was not filed for, and a row that
+/// closes on the wrong question is worse than one that reads as open.
+pub(crate) fn criterion_for_row(platform: &str, row: &Task) -> Option<String> {
+    let kind = row.task_type.kind_key();
+    match kind.as_str() {
+        "platform_ci_fix" => {
+            if let Some(run_id) = row.input.get("run_id").and_then(|id| id.as_u64()) {
+                return Some(ci_fix_acceptance(
+                    row.input
+                        .get("workflow_name")
+                        .and_then(|name| name.as_str())
+                        .unwrap_or(""),
+                    row.input
+                        .get("head_branch")
+                        .and_then(|branch| branch.as_str())
+                        .unwrap_or(""),
+                    run_id,
+                    row.input
+                        .get("run_url")
+                        .and_then(|url| url.as_str())
+                        .unwrap_or(""),
+                ));
+            }
+            // The other filing under this kind is the re-drive of a change
+            // whose landing broke CI: same kind, different requirement, so a
+            // different sentence.
+            let change_id = row.input.get("change_id").and_then(|id| id.as_str())?;
+            Some(crate::landing::redrive_acceptance(
+                change_id,
+                row.input
+                    .get("reverted_rev")
+                    .and_then(|rev| rev.as_str())
+                    .unwrap_or(""),
+                row.input
+                    .get("base_branch")
+                    .and_then(|base| base.as_str())
+                    .unwrap_or(""),
+            ))
+        }
+        "platform_issue_fix" => row
+            .input
+            .get("issue_number")
+            .and_then(|number| number.as_u64())
+            .map(|number| issue_fix_acceptance(platform, number)),
+        "platform_intent_assess" => Some(assess_acceptance(&row.id)),
+        _ => None,
+    }
+}
+
+impl GitHubDiscoveryLoop {
+    /// Give the rows filed before their kind wrote a criterion the one they
+    /// would be filed with today.
+    ///
+    /// The filing only fixes the row it submits, and an intent already in hand
+    /// is never filed again — an assessment id is keyed by content, a fix id by
+    /// the issue, so a row written before this stayed empty for the life of the
+    /// graph and read as a work package nobody could close.
+    pub(crate) async fn settle_filed_criteria(
+        &self,
+        orch: &Arc<dyn OrchestratorControl>,
+    ) -> SettledCriteria {
+        let mut settled = SettledCriteria::default();
+        let platform = self.provider.platform_kind();
+        let candidates: Vec<Task> = orch
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .filter(|row| row.acceptance.is_empty())
+            .filter(|row| criterion_for_row(platform, row).is_some())
+            .collect();
+        settled.remaining = candidates.len().saturating_sub(CRITERIA_SETTLE_BATCH);
+        for row in candidates.into_iter().take(CRITERIA_SETTLE_BATCH) {
+            // Read again before writing: the graph was read once above and a
+            // worker can move a row in between. `replace_task` writes the whole
+            // row, so writing the snapshot back would undo a status the
+            // executor had just set.
+            let Some(mut filled) = orch.get_task(&row.id).await else {
+                continue;
+            };
+            if !filled.acceptance.is_empty() {
+                continue;
+            }
+            if filled.status == TaskStatus::Running {
+                settled.remaining += 1;
+                continue;
+            }
+            let Some(criterion) = criterion_for_row(platform, &filled) else {
+                continue;
+            };
+            filled.acceptance.push(criterion);
+            match orch.replace_task(filled).await {
+                Ok(()) => settled.filled += 1,
+                Err(e) => {
+                    settled.failed += 1;
+                    settled.remaining += 1;
+                    tracing::warn!(
+                        task = %row.id,
+                        error = %e,
+                        "a platform row could not be given its criterion, so it stays a work \
+                         package nobody can close"
+                    );
+                }
+            }
+        }
+        settled
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::provider::{
         CiJobLog, CreatePullRequest, PlatformComment, PlatformPullRequest, PullRequestDetail,
@@ -3008,9 +3212,13 @@ mod tests {
         }
     }
 
-    struct MockOrchestrator {
+    pub(crate) struct MockOrchestrator {
         goals: Mutex<Vec<String>>,
         task_types: Mutex<Vec<String>>,
+        /// 每条提交过的行的类型与它自带的判据，按提交顺序。
+        criteria: Mutex<Vec<(String, Vec<String>)>>,
+        /// 图里已有的行，供回填那趟读与改。
+        rows: Mutex<Vec<Task>>,
         /// Verdict returned for a `platform_intent_assess` task. `None` reports
         /// the task as Failed so the fallback path can be exercised without
         /// waiting out the real poll timeout.
@@ -3027,10 +3235,12 @@ mod tests {
     }
 
     impl MockOrchestrator {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             Self {
                 goals: Mutex::new(vec![]),
                 task_types: Mutex::new(vec![]),
+                criteria: Mutex::new(vec![]),
+                rows: Mutex::new(vec![]),
                 assess_verdict: Mutex::new(Some(serde_json::json!({
                     "decision": "fix",
                     "question": "",
@@ -3070,6 +3280,19 @@ mod tests {
             self
         }
 
+        /// 图里先摆好这些行，模拟这次改动之前就已经交出去的那些。
+        pub(crate) fn holding(rows: Vec<Task>) -> Self {
+            let mock = Self::new();
+            *mock.rows.lock().unwrap() = rows;
+            mock
+        }
+
+        /// 提交过的每一行，连同它自带的判据——另一条提交路径要问的是同一个
+        /// 问题：这一行交出去时有没有说清怎样算做完。
+        pub(crate) fn filed_criteria(&self) -> Vec<(String, Vec<String>)> {
+            self.criteria.lock().unwrap().clone()
+        }
+
         fn with_cv_verdict(self, verdict: serde_json::Value) -> Self {
             *self.cv_verdict.lock().unwrap() = Some(verdict);
             self
@@ -3093,7 +3316,11 @@ mod tests {
                     TaskType::Custom(name) => name.clone(),
                     other => format!("{other:?}"),
                 };
-                self.task_types.lock().unwrap().push(type_name);
+                self.task_types.lock().unwrap().push(type_name.clone());
+                self.criteria
+                    .lock()
+                    .unwrap()
+                    .push((type_name, task.acceptance.clone()));
                 ids.push(task.id);
             }
             Ok(ids)
@@ -3114,7 +3341,20 @@ mod tests {
             vec![]
         }
         async fn get_all_tasks(&self) -> Vec<Task> {
-            vec![]
+            self.rows.lock().unwrap().clone()
+        }
+        async fn replace_task(&self, task: Task) -> cog_core::SFResult<()> {
+            let mut rows = self.rows.lock().unwrap();
+            match rows.iter_mut().find(|row| row.id == task.id) {
+                Some(row) => {
+                    *row = task;
+                    Ok(())
+                }
+                None => Err(cog_core::SFError::DagExecutor(format!(
+                    "no row {} to replace",
+                    task.id
+                ))),
+            }
         }
         async fn push_to_dlq(&self, _t: &str, _e: String) -> cog_core::SFResult<bool> {
             unimplemented!()
@@ -3156,6 +3396,13 @@ mod tests {
             unimplemented!()
         }
         async fn get_task(&self, id: &str) -> Option<Task> {
+            // A row the test put in the graph is the row, before any of the
+            // synthesized answers below: a back-fill that read a fixture back
+            // as a fabricated row would be tested against the fixture's
+            // absence rather than its content.
+            if let Some(row) = self.rows.lock().unwrap().iter().find(|row| row.id == id) {
+                return Some(row.clone());
+            }
             // Polled tasks are reported finished immediately so tests never wait
             // out the real poll timeout.
             if id.contains("pr-cross-validate") {
@@ -3778,6 +4025,239 @@ mod tests {
         assert!(goals[0].contains("run 1001"));
         assert!(goals[0].contains("Clippy"));
         assert!(goals[0].contains("clippy::question_mark"));
+    }
+
+    /// 交出去的 CI 修复行要自带「怎样算修好」，且那句话得读平台。
+    ///
+    /// 修复任务自己结束于完成，只说明它产出了一段变更；失败的那个 run 会不会
+    /// 变绿，要等分支上的下一次运行。判据缺了，一行修好的与一行什么也没修的
+    /// 在按状态取行的视图里长得一样。
+    #[tokio::test]
+    async fn a_ci_fix_says_which_run_has_to_go_green() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![CiJobLog {
+                job_id: 42,
+                job_name: "Clippy".into(),
+                log_tail: "error: clippy::question_mark".into(),
+            }],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        assert!(loop_.process_ci_failure(ci_event(1001)).await.unwrap());
+
+        let filed = orchestrator.criteria.lock().unwrap();
+        assert_eq!(filed.len(), 1, "一次失败提交一行");
+        let (kind, criteria) = &filed[0];
+        assert_eq!(kind, "platform_ci_fix");
+        assert_eq!(
+            criteria.len(),
+            1,
+            "没有判据的行没有人能关；读出来的是 {criteria:?}"
+        );
+        assert!(
+            criteria[0].contains("1001"),
+            "判据要点名这个 run，否则下一个人不知道去看哪一次运行：{}",
+            criteria[0]
+        );
+        assert!(
+            criteria[0].contains("失败 job 集合为空"),
+            "判据要写成一次可从平台读出的观测，而不是「修好了」：{}",
+            criteria[0]
+        );
+    }
+
+    /// 早于判据写下的平台行，要按它们自己留下的现场补上同一句话。
+    ///
+    /// 这条路的行不会被再交一次：判定的 id 按内容定、修复的 id 按 issue 定，
+    /// 已经在手的意图不会再走提交。所以只改生产者等于让存量永远空着——那些行
+    /// 在项目视图里是关不掉的活，而它们恰恰是最旧的那批。
+    #[tokio::test]
+    async fn a_platform_row_written_before_its_criterion_is_given_the_same_one() {
+        let row = |id: &str, kind: &str, payload: serde_json::Value| {
+            Task::new(id.to_string(), TaskType::Custom(kind.into()), payload)
+        };
+        let mut running = row(
+            "github-issue-9",
+            "platform_issue_fix",
+            serde_json::json!({"issue_number": 9}),
+        );
+        running.status = TaskStatus::Running;
+        let orch = Arc::new(MockOrchestrator::holding(vec![
+            row(
+                "github-ci-run-1001",
+                "platform_ci_fix",
+                serde_json::json!({
+                    "run_id": 1001,
+                    "workflow_name": "CI",
+                    "head_branch": "main",
+                    "run_url": "https://example.invalid/runs/1001",
+                }),
+            ),
+            row(
+                "github-issue-7",
+                "platform_issue_fix",
+                serde_json::json!({"issue_number": 7}),
+            ),
+            row(
+                "intent-assess-github-issue-7-deadbeef",
+                "platform_intent_assess",
+                serde_json::json!({"kind": "issue", "number": 7}),
+            ),
+            row(
+                "redrive-chg-1",
+                "platform_ci_fix",
+                serde_json::json!({
+                    "change_id": "chg-1",
+                    "reverted_rev": "abc1234",
+                    "base_branch": "main",
+                }),
+            ),
+            // 没有留下任何可重算的现场：不猜。
+            row(
+                "github-ci-run-1002",
+                "platform_ci_fix",
+                serde_json::json!({}),
+            ),
+            // 正在跑的这一行下一轮再说。
+            running,
+        ]));
+        let loop_ = GitHubDiscoveryLoop::new(
+            Arc::new(MockProvider {
+                issues: vec![],
+                comments: Mutex::new(vec![]),
+                ci_logs: vec![],
+                ci_runs: Mutex::new(vec![]),
+                prs: vec![],
+                pr_details: HashMap::new(),
+            }),
+            IssueTriage::rules_only(),
+            config(),
+            Some(orch.clone()),
+            None,
+        );
+
+        let as_control: Arc<dyn OrchestratorControl> = orch.clone();
+        let settled = loop_.settle_filed_criteria(&as_control).await;
+        assert_eq!(settled.filled, 4, "{settled:?}");
+        assert_eq!(settled.failed, 0, "{settled:?}");
+        assert_eq!(
+            settled.remaining, 1,
+            "正在跑的那一行要留到下一轮：{settled:?}"
+        );
+
+        let after = orch.get_all_tasks().await;
+        let criterion = |id: &str| {
+            after
+                .iter()
+                .find(|row| row.id == id)
+                .unwrap()
+                .acceptance
+                .clone()
+        };
+        assert_eq!(
+            criterion("github-ci-run-1001"),
+            vec![ci_fix_acceptance(
+                "CI",
+                "main",
+                1001,
+                "https://example.invalid/runs/1001"
+            )],
+            "补上的判据要与今天提交时写的那一句完全相同"
+        );
+        assert_eq!(
+            criterion("github-issue-7"),
+            vec![issue_fix_acceptance("platform", 7)]
+        );
+        assert_eq!(
+            criterion("intent-assess-github-issue-7-deadbeef"),
+            vec![assess_acceptance("intent-assess-github-issue-7-deadbeef")]
+        );
+        assert_eq!(
+            criterion("redrive-chg-1"),
+            vec![crate::landing::redrive_acceptance(
+                "chg-1", "abc1234", "main"
+            )]
+        );
+        for untouched in ["github-ci-run-1002", "github-issue-9"] {
+            assert!(
+                criterion(untouched).is_empty(),
+                "{untouched} 不该被补：它没有可用的现场，或者正在跑"
+            );
+        }
+
+        // 第二趟不再重复写：判据是幂等的，读数也是。只剩那条在跑的行，所以
+        // remaining 还报 1——它要等到那一行跑完才补得上，这正是下一轮接着问。
+        let again = loop_.settle_filed_criteria(&as_control).await;
+        assert_eq!(again.filled, 0, "{again:?}");
+        assert_eq!(again.remaining, 1, "{again:?}");
+    }
+
+    /// 一条 issue 在路上会交两行：先判定、再修复。两行各自都要说清怎样算做完，
+    /// 因为它们是两种不同的完成——一个是判决落库，一个是 issue 关掉。
+    #[tokio::test]
+    async fn both_rows_filed_for_one_issue_carry_their_own_criterion() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let provider = Arc::new(MockProvider {
+            issues: vec![issue(
+                11,
+                "The /health endpoint is slow. Expected under 50ms, actual 500ms. Reproduce: curl it.",
+            )],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+        loop_.run_once().await.unwrap();
+        std::env::remove_var("COGNEVA_DATA_DIR");
+
+        let filed = orchestrator.criteria.lock().unwrap();
+        for (kind, criteria) in filed.iter() {
+            assert!(
+                !criteria.is_empty(),
+                "{kind} 交出去时没有判据，这一行永远关不掉"
+            );
+        }
+        let assess = filed
+            .iter()
+            .find(|(kind, _)| kind == "platform_intent_assess")
+            .expect("判定行要先交");
+        assert!(
+            assess.1[0].contains("判决"),
+            "判定行的完成是判决落库，不是判定任务自己跑完：{}",
+            assess.1[0]
+        );
+        let fix = filed
+            .iter()
+            .find(|(kind, _)| kind == "platform_issue_fix")
+            .expect("fix 判决之后要交修复行");
+        assert!(
+            fix.1[0].contains("#11"),
+            "修复行的判据要指向它要关的那条 issue：{}",
+            fix.1[0]
+        );
     }
 
     #[tokio::test]

@@ -49,16 +49,33 @@ pub fn carries_an_owner(task: &Task) -> bool {
 
 /// Whether a task is work the dispatcher may start as a run.
 ///
-/// Everything executable is, with one exception: a face's standing duty row.
-/// That row carries the pair (face, who is answerable for it) and is what the
-/// drift reading counts as the owner being on the face; it has no body to run.
-/// Started as a run it burns its whole budget, is failed on the degenerate-loop
-/// rule, and takes the face's only evidence of staffing with it -- the face
-/// then reads idle and nothing recreates the row. It stays executable so the
-/// owner's own session can still take it from its queue; only the dispatcher
-/// is told to leave it alone.
+/// Two things are excluded. A face's standing duty row carries the pair (face,
+/// who is answerable for it) and is what the drift reading counts as the owner
+/// being on the face; it has no body to run. Started as a run it burns its whole
+/// budget, is failed on the degenerate-loop rule, and takes the face's only
+/// evidence of staffing with it -- the face then reads idle and nothing
+/// recreates the row. It stays executable so the owner's own session can still
+/// take it from its queue; only the dispatcher is told to leave it alone.
+///
+/// The other is a row that does not [`states_what_done_means`]. Held is the safe
+/// half of the two: the row stays pending and stays on the board, so a kind that
+/// files one is visible as work that never starts rather than as work that
+/// starts and can never be closed. Everything this platform files carries a
+/// criterion at filing time; the ones that did not were written before their
+/// kind did, and the settle passes reach them on the rounds after a deploy.
 pub fn is_dispatchable_work(task: &Task) -> bool {
-    task.is_executable && !is_face_duty(task)
+    task.is_executable && !is_face_duty(task) && states_what_done_means(task)
+}
+
+/// Whether the row says what would close it.
+///
+/// One definition, because three things ask it: the dispatcher before it starts
+/// a row, the project views when they draw a card as closable, and the settle
+/// passes that back-fill the rows written before their kind asked for one. A
+/// work package nobody can close is not work -- it is a row that will complete
+/// on the summary the executor writes about itself.
+pub fn states_what_done_means(task: &Task) -> bool {
+    !task.acceptance.is_empty()
 }
 
 /// Whether a row is a face's standing duty marker.
@@ -369,7 +386,8 @@ mod tests {
         );
         assert!(!is_dispatchable_work(&duty));
 
-        let work = task("work-x", TaskType::DagNode, serde_json::json!({}));
+        let mut work = task("work-x", TaskType::DagNode, serde_json::json!({}));
+        work.acceptance.push("门测试跑绿".into());
         assert!(
             is_dispatchable_work(&work),
             "the exclusion must not swallow ordinary work"
@@ -698,6 +716,39 @@ mod tests {
     fn a_plan_without_a_budget_holds_nothing() {
         assert!(!past_its_budget(0, 0));
         assert!(!past_its_budget(1_000_000, 0));
+    }
+
+    /// 一条不写「怎样算做完」的行不派发。
+    ///
+    /// 派发它得到的是一次会以执行器自己的总结收尾的运行：按状态取行的视图
+    /// 分不出它和一条真修好的。留住的那一半是安全的一半——行仍 pending、仍在
+    /// 看板上，于是它读作「从没开始」，而不是「开始了、永远关不掉」。
+    #[test]
+    fn a_row_that_does_not_say_what_done_means_is_not_dispatched() {
+        let mut row = Task::new(
+            "work-1",
+            cog_core::TaskType::Custom("change_ledger".into()),
+            serde_json::json!({"goal": "g"}),
+        );
+        assert!(row.is_executable);
+        assert!(!is_dispatchable_work(&row), "没有判据的活不该被派发");
+        assert!(!states_what_done_means(&row));
+
+        row.acceptance.push("账上同一身份的账行落到 landed".into());
+        assert!(states_what_done_means(&row));
+        assert!(is_dispatchable_work(&row));
+    }
+
+    /// 判据是画在**派发**这一道上的，不是画在所有行上：不执行的承载行与面
+    /// 值守行本来就不该被派发，缺判据不能让它们换一个理由被拒。
+    #[test]
+    fn a_row_with_no_body_to_run_is_excluded_for_its_own_reason() {
+        let mut goal_row = Task::goal_row("goal-1", "ship it");
+        goal_row
+            .acceptance
+            .push("目标由一段被放行的变更达成".into());
+        assert!(!is_dispatchable_work(&goal_row));
+        assert!(states_what_done_means(&goal_row));
     }
 
     #[test]

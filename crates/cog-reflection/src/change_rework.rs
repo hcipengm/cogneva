@@ -68,6 +68,35 @@ impl ChangeReworkOutcome {
 /// 选一条不存在的序列，而这正是这些规则要防的静默。
 pub const CHANGE_REWORK_METRIC: &str = "self_evolution_change_rework_total";
 
+/// 这条支路提交的行带的任务种类。回填按它找行，所以它与提交处共用一处拼写。
+pub const REWORK_TASK_KIND: &str = "change_rework";
+
+/// 一次回流「怎样算做完」，从这一行自己带的字段重算。
+///
+/// 收成因的线上拼写而不是枚举，因为两个调用方手里拿的都已经是它：提交那一刻
+/// 是学习记录，回填那一刻是行负载里原样存下来的那个字符串。一份措辞两个入口，
+/// 所以它在提交与回填之间只有这一处。
+///
+/// 任务行自己的完成不是答案：一次回流可以干净地结束而什么也没修好，按状态取行
+/// 的读法分不出这两种。判官是拒绝上一版的那道门，观测是它对下一版的判词。
+///
+/// 路径拒绝是唯一一个把形状倒过来的判据：它点名的文件是这份实例**碰不得**的
+/// 地方，照着要求"让它通过"就是把需求关在 reopen 它的那个动作上。那里要的是
+/// 目标换条路达成。
+pub(crate) fn rework_acceptance(cause: Option<&str>, surface: &str) -> String {
+    match cause {
+        Some(forbidden) if forbidden == cog_core::RejectionCause::ForbiddenPath.as_str() => {
+            format!(
+                "{surface} 上的目标从别的路径达成：同一道路径门不再以 forbidden_path 拒绝这次尝试"
+            )
+        }
+        Some(cause) => {
+            format!("同一道门（{cause}）放行重新生成的变更：{surface} 上不再出现该判据的拒绝")
+        }
+        None => format!("{surface} 上的目标由一段被放行的变更达成：拒绝上一版的检查不再拒绝这一版"),
+    }
+}
+
 /// 归宿所在的那一维。
 pub const OUTCOME_LABEL: &str = crate::LABEL_OUTCOME;
 

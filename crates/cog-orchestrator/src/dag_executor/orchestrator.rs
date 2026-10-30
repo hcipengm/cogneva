@@ -1926,6 +1926,21 @@ impl DagExecutor {
         }
         let by_id: std::collections::HashMap<&str, &Task> =
             tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        // Work the dispatcher would have started had it said what done means.
+        // Counted by kind and named once per process: holding the row is the
+        // safe half of this rule, and a kind that files one has to be findable
+        // rather than merely stuck.
+        let mut unclosable: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for t in tasks.iter().filter(|t| t.status == TaskStatus::Pending) {
+            if t.is_executable
+                && !crate::ready_queue::is_face_duty(t)
+                && !crate::ready_queue::states_what_done_means(t)
+            {
+                *unclosable.entry(t.task_type.kind_key()).or_default() += 1;
+            }
+        }
+        name_unclosable_kinds(&unclosable);
         let mut ready: Vec<Task> = tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Pending)
@@ -3951,6 +3966,33 @@ impl cog_core::DagExecutor for DagExecutor {
     }
 }
 
+/// Say which kinds have pending work the dispatcher is holding for want of a
+/// criterion, once per process per kind.
+///
+/// The scan runs on every poll, and a held row stays held, so the log line has
+/// to be an event rather than a level: repeating it every poll trains the
+/// reader to skip it, which is the same as not logging at all. Once per kind is
+/// what makes it actionable -- the reader learns the kind, fixes its producer or
+/// adds it to a settle pass, and the next deploy says whether that worked.
+fn name_unclosable_kinds(unclosable: &std::collections::BTreeMap<String, usize>) {
+    static NAMED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let named = NAMED.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
+    let Ok(mut named) = named.lock() else {
+        return;
+    };
+    for (kind, rows) in unclosable {
+        if named.insert(kind.clone()) {
+            tracing::warn!(
+                kind,
+                rows,
+                "pending work is not dispatched because it states no acceptance criterion; the \
+                 rows stay on the board until their producer or a settle pass gives them one"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5236,7 +5278,8 @@ mod tests {
             "the fixture is shaped like the row the duty constructor writes"
         );
 
-        let work = Task::new("work-x", TaskType::DagNode, serde_json::json!({}));
+        let mut work = Task::new("work-x", TaskType::DagNode, serde_json::json!({}));
+        work.acceptance.push("门测试跑绿".into());
         let work_id = work.id.clone();
         dag.add_task(work).await.unwrap();
 

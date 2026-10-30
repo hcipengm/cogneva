@@ -1804,6 +1804,20 @@ pub async fn watch_landed(
     }
 }
 
+/// What closes one re-drive row.
+///
+/// The requirement is the change's, not this attempt's: it is met when the
+/// same identity lands again on top of the revert and that branch's CI goes
+/// green there. A re-drive that ends having produced nothing the ledger
+/// carries leaves the change reverted behind its own revert commit, and a row
+/// read by status cannot tell that apart from a repair.
+pub(crate) fn redrive_acceptance(change_id: &str, landed_rev: &str, base: &str) -> String {
+    format!(
+        "变更 {change_id} 在 {landed_rev} 之上重新落地并且 {base} 的 CI 判绿：账上同一身份的\
+         账行落到 landed，而不是这一笔重新生成自己报完成"
+    )
+}
+
 /// Submit a fix task for a reverted landing, once per landing: the `redriven`
 /// flag is persisted, so a restart between the revert and the re-drive does
 /// not produce a second identical fix task.
@@ -1855,7 +1869,7 @@ async fn redrive(
         );
         return;
     }
-    let task = cog_core::Task::new(
+    let mut task = cog_core::Task::new(
         task_id,
         cog_core::TaskType::Custom("platform_ci_fix".into()),
         serde_json::json!({
@@ -1867,6 +1881,11 @@ async fn redrive(
             (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
         }),
     );
+    task.acceptance.push(redrive_acceptance(
+        &record.change.change_id,
+        &record.landed_rev,
+        &record.base,
+    ));
     match orchestrator.submit_goal_auto(&goal, vec![task]).await {
         Ok(ids) => tracing::info!(
             change_id = %record.change.change_id,
@@ -4585,5 +4604,51 @@ mod tests {
         // test in this process.
         crate::pending_changes::remove_staged("chg-2").await;
         std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 重驱出去的那一行要自带「怎样算修好」：同一个变更身份重新落地，且落到的
+    /// 那条分支判绿。
+    ///
+    /// 缺了这条判据，一次重驱只要自己跑完就与一次修好的无从区分——而被它推的
+    /// 那个变更还原封不动躺在回滚点后面。判据要读账与 CI，不能读这一笔自己。
+    #[tokio::test]
+    async fn a_redrive_says_the_change_has_to_land_again() {
+        let orchestrator = crate::discovery_loop::tests::MockOrchestrator::new();
+        let now = Utc::now();
+        let record = LandingRecord {
+            change: change("chg-r", &diff_touching(&["crates/cog-github/src/lib.rs"])),
+            base: "main".into(),
+            landed_rev: "abc1234".into(),
+            state: LandingState::Landed,
+            failure_recorded: true,
+            redriven: false,
+            unlanded_reported: false,
+            inherited_ci_reported: false,
+            retired_reason: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        redrive(Some(&orchestrator), &record, "error: build failed").await;
+
+        let filed = orchestrator.filed_criteria();
+        assert_eq!(filed.len(), 1, "一次重驱交一行");
+        let (kind, criteria) = &filed[0];
+        assert_eq!(kind, "platform_ci_fix");
+        assert_eq!(
+            criteria.len(),
+            1,
+            "重驱行没有判据就没人能说这次算不算修好：{criteria:?}"
+        );
+        assert!(
+            criteria[0].contains("chg-r"),
+            "判据要点名它推的那个变更身份，读的人才对得上账：{}",
+            criteria[0]
+        );
+        assert!(
+            criteria[0].contains("main"),
+            "判据要指向落地的那条分支，否则不知道去哪儿看绿没绿：{}",
+            criteria[0]
+        );
     }
 }

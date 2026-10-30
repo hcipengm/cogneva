@@ -376,6 +376,17 @@ fn rework_task_id(l: &cog_core::Learning, refused_by_a_gate: bool) -> String {
     format!("rework-{subject}")
 }
 
+/// The surface a handed-back requirement was refused on, as the criterion names
+/// it: the files the gate printed when it named any, the module when it named
+/// none.
+fn rework_surface(l: &cog_core::Learning, named_files: &[String]) -> String {
+    if named_files.is_empty() {
+        format!("{:?} 模块", l.area)
+    } else {
+        named_files.join("、")
+    }
+}
+
 /// Convenience builder that wires together all Phase-1 components.
 pub struct ReflectionEngine {
     pub detector: Arc<dyn LearningDetector>,
@@ -942,14 +953,22 @@ impl ReflectionEngine {
             l.details
         );
 
+        // Hung on the row itself rather than left to the goal text: the goal is
+        // read by the generator, this is read by whoever asks whether the
+        // requirement closed. Built before the payload moves the file list.
+        let acceptance = crate::change_rework::rework_acceptance(
+            l.rejection_cause.map(|c| c.as_str()),
+            &rework_surface(l, &named_files),
+        );
+
         let task_id = rework_task_id(l, refused_by_a_gate);
-        let task = cog_core::Task::new(
+        let mut task = cog_core::Task::new(
             task_id.clone(),
-            cog_core::TaskType::Custom("change_rework".into()),
+            cog_core::TaskType::Custom(crate::change_rework::REWORK_TASK_KIND.into()),
             serde_json::json!({
                 "goal": goal,
                 (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
-                (cog_core::INPUT_TASK_KIND): "change_rework",
+                (cog_core::INPUT_TASK_KIND): crate::change_rework::REWORK_TASK_KIND,
                 "learning_id": l.id,
                 "rejection_cause": l.rejection_cause.map(|c| c.as_str()),
                 // The two things the main flow needs, as fields rather than only
@@ -959,6 +978,7 @@ impl ReflectionEngine {
                 "named_files": named_files,
             }),
         );
+        task.acceptance.push(acceptance);
 
         tracing::info!(
             learning_id = %l.id,
@@ -2113,7 +2133,7 @@ mod tests {
     /// knew nothing about the refusal.
     #[tokio::test]
     async fn a_refusal_reaches_the_main_flow_on_the_first_one() {
-        let (mut engine, submissions, goals) = engine_that_records_rework();
+        let (mut engine, submissions, goals, _) = engine_that_records_rework();
         engine.set_cooldown_secs(0);
 
         let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
@@ -2144,7 +2164,7 @@ mod tests {
     /// 目标。
     #[tokio::test]
     async fn a_path_refusal_aims_away_from_the_files_it_named() {
-        let (mut engine, submissions, goals) = engine_that_records_rework();
+        let (mut engine, submissions, goals, _) = engine_that_records_rework();
         engine.set_cooldown_secs(0);
 
         let files = vec![
@@ -2185,7 +2205,7 @@ mod tests {
     /// 瞄准的地方，否则这一改会把"说清楚哪坏了"降成"哪儿都别说"。
     #[tokio::test]
     async fn a_content_refusal_still_aims_at_the_files_it_named() {
-        let (mut engine, _, goals) = engine_that_records_rework();
+        let (mut engine, _, goals, _) = engine_that_records_rework();
         engine.set_cooldown_secs(0);
 
         let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
@@ -2206,6 +2226,78 @@ mod tests {
         );
     }
 
+    /// 交出去的行必须自带「怎样算做完」。
+    ///
+    /// 判据不能只活在目标文本里：目标读的是生成器，而「这条要求关没关」是另一
+    /// 个人按行问的。一行没有判据的返工任务在按状态取行的视图里与一条修好的
+    /// 无差别——它完成得很干净，而拒绝它的那道门下一次照样会拒。
+    #[tokio::test]
+    async fn a_handed_back_requirement_carries_its_own_criterion() {
+        let (mut engine, _, _, tasks) = engine_that_records_rework();
+        engine.set_cooldown_secs(0);
+
+        let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
+        engine
+            .record_change_refusal(
+                "c-criterion",
+                cog_core::RejectionCause::TestsFailed,
+                &files,
+                "two tests failed",
+            )
+            .await
+            .unwrap();
+
+        let filed = tasks.lock().await;
+        assert_eq!(filed.len(), 1, "一次拒绝交出一次返工");
+        let criteria = &filed[0].acceptance;
+        assert_eq!(
+            criteria.len(),
+            1,
+            "返工行要恰好一条判据，空判据的行读不出怎样算做完"
+        );
+        assert!(
+            criteria[0].contains("tests_failed"),
+            "判据要点名拒绝它的那道门，而不是笼统地说「变好」：{}",
+            criteria[0]
+        );
+        assert!(
+            criteria[0].contains("crates/x/src/lib.rs"),
+            "判据要点名被判的面，否则读的人还得回头去翻这一行的负载：{}",
+            criteria[0]
+        );
+    }
+
+    /// 路径拒绝的判据要跟着上面那条读法一起倒过来：点名的路径不是要再通过的
+    /// 面，而是这次尝试必须绕开的面。判据说成「同一道门放行这个文件」等于让
+    /// 下一个人照着重开同一次拒绝。
+    #[tokio::test]
+    async fn a_path_refusals_criterion_asks_for_another_route() {
+        let (mut engine, _, _, tasks) = engine_that_records_rework();
+        engine.set_cooldown_secs(0);
+
+        let files = vec![std::path::PathBuf::from("deploy/helm/cogneva/values.yaml")];
+        engine
+            .record_change_refusal(
+                "c-path-criterion",
+                cog_core::RejectionCause::ForbiddenPath,
+                &files,
+                "change touches non-contributable paths",
+            )
+            .await
+            .unwrap();
+
+        let filed = tasks.lock().await;
+        let criterion = &filed[0].acceptance[0];
+        assert!(
+            criterion.contains("从别的路径达成"),
+            "路径拒绝的判据要说的是换条路，而不是原路再走一遍：{criterion}"
+        );
+        assert!(
+            !criterion.contains("放行重新生成的变更"),
+            "把路径拒绝读成同面再通过，就是在教下一次去撞同一条规则：{criterion}"
+        );
+    }
+
     /// The control for the test above: the threshold has not gone away, it just
     /// no longer applies to a verdict. A self-review pattern still has to be
     /// seen often enough to be a defect rather than a coincidence, and this is
@@ -2213,7 +2305,7 @@ mod tests {
     /// every record".
     #[tokio::test]
     async fn a_self_review_pattern_still_waits_for_its_threshold() {
-        let (mut engine, submissions, _) = engine_that_records_rework();
+        let (mut engine, submissions, _, _) = engine_that_records_rework();
         engine.change_recurrence_threshold = 5;
         // The hook trigger shares this path and fires from three occurrences, so
         // it is pushed out of the way: this test is about the change threshold,
@@ -2268,7 +2360,7 @@ mod tests {
     /// was told to continue.
     #[tokio::test]
     async fn a_refusal_is_never_the_one_that_waits() {
-        let (mut engine, submissions, _) = engine_that_records_rework();
+        let (mut engine, submissions, _, _) = engine_that_records_rework();
         engine.set_cooldown_secs(3600);
 
         let files = vec![std::path::PathBuf::from("crates/x/src/lib.rs")];
@@ -2384,6 +2476,7 @@ mod tests {
     struct RecordingOrchestrator {
         submissions: Arc<tokio::sync::Mutex<u32>>,
         goals: Arc<tokio::sync::Mutex<Vec<String>>>,
+        tasks: Arc<tokio::sync::Mutex<Vec<cog_core::Task>>>,
     }
 
     #[async_trait::async_trait]
@@ -2398,10 +2491,11 @@ mod tests {
         async fn submit_goal_auto(
             &self,
             goal: &str,
-            _tasks: Vec<cog_core::Task>,
+            tasks: Vec<cog_core::Task>,
         ) -> cog_core::SFResult<Vec<String>> {
             *self.submissions.lock().await += 1;
             self.goals.lock().await.push(goal.to_string());
+            self.tasks.lock().await.extend(tasks);
             Ok(Vec::new())
         }
         async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> cog_core::SFResult<()> {
@@ -2500,19 +2594,22 @@ mod tests {
         ReflectionEngine,
         Arc<tokio::sync::Mutex<u32>>,
         Arc<tokio::sync::Mutex<Vec<String>>>,
+        Arc<tokio::sync::Mutex<Vec<cog_core::Task>>>,
     ) {
         let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
         let engine = ReflectionEngine::new_in_memory(registry);
         let submissions = Arc::new(tokio::sync::Mutex::new(0u32));
         let goals = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let tasks = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         engine.rework.arm();
         engine
             .rework
             .set_orchestrator(Arc::new(RecordingOrchestrator {
                 submissions: submissions.clone(),
                 goals: goals.clone(),
+                tasks: tasks.clone(),
             }));
-        (engine, submissions, goals)
+        (engine, submissions, goals, tasks)
     }
 }
 

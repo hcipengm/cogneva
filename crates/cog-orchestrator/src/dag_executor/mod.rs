@@ -2145,7 +2145,10 @@ mod consumer_ack_tests {
             face_id: None,
             owner_unit: None,
             bound_by_handover_id: None,
-            acceptance: vec![],
+            // Every row this platform files says what would close it, and the
+            // dispatcher holds one that does not: the fixture is ordinary work,
+            // so it carries the criterion ordinary work carries.
+            acceptance: vec!["这张票的判据".into()],
         }
     }
 
