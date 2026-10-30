@@ -151,28 +151,40 @@ as_super "CREATE DATABASE ${probe_db}" >/dev/null
 as_super "DROP ROLE IF EXISTS cog_app" >/dev/null 2>&1 || true
 as_super "DROP ROLE IF EXISTS cog_user" >/dev/null 2>&1 || true
 # cog_user 在真部署里是库的属主角色；这里给它超级用户，好让它造出各种对象。
-as_super "CREATE ROLE cog_user LOGIN SUPERUSER" >/dev/null
+# 密码必须给：CI 的 Postgres 对 TCP 连接走 scram，没有密码的角色连不上——第一版
+# 探针角色只写了 LOGIN SUPERUSER，引导脚本还没碰到对象就先在连接上被拒
+# （2026-10-31 CI：password authentication failed for user "cog_user"），而这一行
+# 红的是探针自己的形状，不是它要判的那段 SQL。密码用本文件自己的字面量，不从
+# URL 里拆出来再拼进 SQL：URL 里那一串要经过两层引号，值带一个 `'` 就能把它拼坏。
+probe_pw='cogneva-probe-cog-user'
+as_super "CREATE ROLE cog_user LOGIN SUPERUSER PASSWORD '${probe_pw}'" >/dev/null
 
 # 夹具：把这段 SQL 要处理的每一种对象都造出来，且都归 cog_user。
-in_db "CREATE TABLE t_serial (id serial PRIMARY KEY, v text);
-       CREATE TABLE t_identity (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
-       CREATE SEQUENCE t_standalone;
-       CREATE TABLE t_plain (id int);
-       CREATE VIEW v_plain AS SELECT 1 AS x;
-       CREATE MATERIALIZED VIEW mv_plain AS SELECT 1 AS x;
-       CREATE TABLE t_part (id int, k int) PARTITION BY RANGE (k);
-       CREATE TABLE t_part_1 PARTITION OF t_part FOR VALUES FROM (0) TO (10);
-       ALTER TABLE t_serial OWNER TO cog_user;
-       ALTER TABLE t_identity OWNER TO cog_user;
-       ALTER SEQUENCE t_standalone OWNER TO cog_user;
-       ALTER TABLE t_plain OWNER TO cog_user;
-       ALTER VIEW v_plain OWNER TO cog_user;
-       ALTER MATERIALIZED VIEW mv_plain OWNER TO cog_user;
-       ALTER TABLE t_part OWNER TO cog_user;
-       ALTER TABLE t_part_1 OWNER TO cog_user;" >/dev/null \
-    || fail "夹具造不出来"
+#
+# 造两个用途的东西要分开跑两遍（引导脚本那一次、反例那一次），所以是一段函数：
+# 反例必须从**还没被动过的**夹具起跑，见下面那段的理由。
+make_fixture() {
+    in_db "CREATE TABLE t_serial (id serial PRIMARY KEY, v text);
+           CREATE TABLE t_identity (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text);
+           CREATE SEQUENCE t_standalone;
+           CREATE TABLE t_plain (id int);
+           CREATE VIEW v_plain AS SELECT 1 AS x;
+           CREATE MATERIALIZED VIEW mv_plain AS SELECT 1 AS x;
+           CREATE TABLE t_part (id int, k int) PARTITION BY RANGE (k);
+           CREATE TABLE t_part_1 PARTITION OF t_part FOR VALUES FROM (0) TO (10);
+           ALTER TABLE t_serial OWNER TO cog_user;
+           ALTER TABLE t_identity OWNER TO cog_user;
+           ALTER SEQUENCE t_standalone OWNER TO cog_user;
+           ALTER TABLE t_plain OWNER TO cog_user;
+           ALTER VIEW v_plain OWNER TO cog_user;
+           ALTER MATERIALIZED VIEW mv_plain OWNER TO cog_user;
+           ALTER TABLE t_part OWNER TO cog_user;
+           ALTER TABLE t_part_1 OWNER TO cog_user;" >/dev/null \
+        || fail "夹具造不出来"
+}
+make_fixture
 
-PGHOST="${PGHOST}" PGPORT="${PGPORT}" PGUSER=cog_user PGPASSWORD="${PGPASSWORD}" \
+PGHOST="${PGHOST}" PGPORT="${PGPORT}" PGUSER=cog_user PGPASSWORD="${probe_pw}" \
     PGDATABASE="${probe_db}" APP_PASSWORD=probe-password \
     bash "${sql_file}" >/dev/null 2>"${work}/bootstrap.err" \
     || fail "引导脚本在真库上失败：$(tail -3 "${work}/bootstrap.err")"
@@ -183,10 +195,19 @@ left="$(in_db "select count(*) from pg_class c join pg_namespace n on n.oid = c.
                    and c.relowner <> (select oid from pg_roles where rolname = 'cog_app')")"
 [ "${left}" = 0 ] || fail "还有 ${left} 个对象没挪到 cog_app 名下"
 
-# 反例：旧写法（对每种对象都发 ALTER TABLE）必须在这同一份夹具上失败。它若跑得过，
+# 反例：旧写法（对每种对象都发 ALTER TABLE）必须在同一份夹具上失败。它若跑得过，
 # 上面那条判据就没有区分力——这条门判的是「种类要对上」，不是「脚本跑完了」。
-in_db "CREATE TABLE t_old (id serial PRIMARY KEY)" >/dev/null
-if psql -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d "${probe_db}" -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<'SQL'
+#
+# 夹具必须重建一遍再跑：上面那次引导已经把 public 下每个对象都挪到 cog_app 了，
+# 旧写法在那个库里一个对象也选不到，于是「什么都没做」退出 0——2026-10-31 实测，
+# 这条反例正是这样在本机上绿的，而它想证明的恰恰相反。空转的绿比没有这条腿更糟：
+# 它替一段被真库拒掉的写法背书。
+as_super "DROP DATABASE IF EXISTS ${probe_db}" >/dev/null
+as_super "CREATE DATABASE ${probe_db}" >/dev/null
+make_fixture
+old_err="${work}/old-form.err"
+if PGPASSWORD="${probe_pw}" psql -h "${PGHOST}" -p "${PGPORT}" -U cog_user \
+    -d "${probe_db}" -v ON_ERROR_STOP=1 >/dev/null 2>"${old_err}" <<'SQL'
 DO $do$
 DECLARE obj record;
 BEGIN
@@ -196,6 +217,7 @@ BEGIN
     WHERE n.nspname = 'public' AND c.relowner = (SELECT oid FROM pg_roles WHERE rolname = 'cog_user')
       AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
       AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.objid = c.oid AND d.deptype = 'e')
+    ORDER BY c.oid
   LOOP
     EXECUTE format('ALTER TABLE %s OWNER TO cog_app', obj.name);
   END LOOP;
@@ -205,5 +227,17 @@ SQL
 then
     fail "旧写法在同一份夹具上跑得过：这条门没有区分力"
 fi
+# 非零退出还不够：连不上库、密码不对也一样非零，把它读成「旧写法被拒」就是拿一个
+# 与判据无关的红替这条门背书。原因必须是 Postgres 拒了这个 ALTER 本身。
+#
+# 判据是「附属序列不能单独换属主」（实测原文：cannot change owner of sequence
+# "t_serial_id_seq" / DETAIL: Sequence ... is linked to table ...），而不是「非表对象
+# 不接受 ALTER TABLE」：PG 16 上视图、物化视图、独立序列都照收 ALTER TABLE，只有
+# 连着表的那条序列会被拒。旧写法会不会撞上它取决于循环顺序——序列先于它的表被取到
+# 才会撞——所以上面的 `ORDER BY c.oid` 把顺序钉在造表时序列先建的那个顺序上
+# （serial/identity 都是先建序列），事故那天遇到的也是这一条。不钉，这条反例就是一
+# 次掷硬币。
+grep -q 'cannot change owner of sequence' "${old_err}" \
+    || fail "旧写法失败了，但不是因为附属序列被拒：$(tail -2 "${old_err}")"
 
 echo "db-role-bootstrap-ownership: 静态腿 + 实跑腿通过（serial/identity/独立序列/视图/物化视图/分区都挪到了 cog_app）"
