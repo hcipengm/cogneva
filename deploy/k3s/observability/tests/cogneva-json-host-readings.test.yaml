@@ -9,6 +9,9 @@
 #   - `host_slice_anon_floor_unmeasured` / `host_ledger_slices_invisible`：两条腿——
 #     值越界**且**「半小时前就已经存在」。刚出现的越界不归它们问，那是另一条规则的事。
 #     静格用「只有最近十分钟才出现」构造。
+#   - 前者的地板是节点 MemTotal 的 13%，所以每一格（包括静格与那条只有十分钟的格）都要给
+#     `node_memory_MemTotal_bytes`。分母缺席时这一条比不出来，静格会**因为分母没了才静**，
+#     于是静格照样绿而它没在判任何东西——只有「快满」那格会露馅（它要这条真的响起来）。
 #   - `host_ledger_node_unreported`：台账里点了名的节点不报；只报台账从没见过的。
 #
 #   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
@@ -32,8 +35,8 @@ evaluation_interval: 1m
 
 tests:
   # 例如一台宽裕的机器：磁盘趋势还有十二天、构建盘 64 GiB、三种压力都低、内存 40 GiB、
-  # CPU 用了 0.4 核、user.slice 匿名内存 4 GiB（地板 8 GiB）、台账认得这台节点且三个
-  # slice 都读得到。十条全静。
+  # CPU 用了 0.4 核、user.slice 匿名内存 4 GiB（例如节点 64 GiB，13% 是 8.9 GiB）、
+  # 台账认得这台节点且三个 slice 都读得到。十条全静。
   - interval: 1m
     input_series:
       - series: 'disk_trend_days_to_full_recent_margin'
@@ -54,6 +57,9 @@ tests:
         values: '20x60'
       - series: 'cogneva_host_slice_anon_bytes{node="n1",slice="user.slice"}'
         values: '4294967296x60'
+      # 例如这台节点自己的 MemTotal（64 GiB）。地板 = 它的 13% = 8.9 GiB。
+      - series: 'node_memory_MemTotal_bytes{node="n1"}'
+        values: '68719476736x60'
       - series: 'kube_node_info{node="n1"}'
         values: '1x60'
       - series: 'cogneva_host_ledger_node_info{node="n1"}'
@@ -115,6 +121,9 @@ tests:
         values: '20x60'
       - series: 'cogneva_host_slice_anon_bytes{node="n1",slice="user.slice"}'
         values: '10737418240x60'
+      # 同一个分母：例如 64 GiB 的 13% 是 8.9 GiB，10 GiB 越过去了。
+      - series: 'node_memory_MemTotal_bytes{node="n1"}'
+        values: '68719476736x60'
       - series: 'kube_node_info{node="n1"}'
         values: '1x60'
       - series: 'kube_node_info{node="n2"}'
@@ -188,6 +197,10 @@ tests:
     input_series:
       - series: 'cogneva_host_slice_anon_bytes{node="n1",slice="user.slice"}'
         values: '10737418240x10'
+      # 这条格要证明的是第二腿（覆盖条件），第一腿必须真成立：越界了，只是才十分钟。
+      # 少了这个分母，第一腿无从比较，删掉第二腿它也照样静——那是橡皮图章。
+      - series: 'node_memory_MemTotal_bytes{node="n1"}'
+        values: '68719476736x10'
     alert_rule_test:
       - eval_time: 10m
         alertname: host_slice_anon_floor_unmeasured
