@@ -11,7 +11,7 @@ use std::time::Duration;
 ///
 /// 同机群内本该是毫秒级；30s 留给「apiserver 正在滚动重启」这种短暂不可达，
 /// 再久就说明不是等一会能好的问题。
-// cap: bound
+// cap: bound — 同机群内本该是毫秒级；30s 留给 apiserver 滚动重启这类短暂不可达
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 读完整个响应的墙：60s。
@@ -19,5 +19,5 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 这些面里最大的是 registry 的 catalog/tags，几 MB 量级；60s 覆盖集群内
 /// 一次性拉完。它单独成界，所以「连上了但对方吐不完」与「连不上」在日志里
 /// 是两句话。
-// cap: bound
+// cap: bound — 单独成界，让「连上了但吐不完」与「连不上」在日志里是两句话
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(60);

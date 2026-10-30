@@ -116,7 +116,7 @@ pub const CLUSTER_LABEL: &str = "cluster";
 ///
 /// Pod 重建本身以十秒计，更密的轮询只会多打几次 kubectl 而不会让发布更早
 /// 完成；10s 也是这条循环在发布期间的全部负载。
-// cap: bound
+// cap: bound — Pod 重建以十秒计，更密的轮询只多打几次 kubectl，不会让发布更早完成
 const ROLLOUT_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// 一次待处理的晋级（从 release 分支 HEAD + promote tag 解析出来）。

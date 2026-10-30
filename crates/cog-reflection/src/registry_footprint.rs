@@ -145,7 +145,7 @@ pub(crate) fn repo_path_of(repository: &str, rest: &str) -> String {
 /// that followed that unboundedly would be a loop, and one that stopped quietly
 /// would under-count. So the limit is a bound on what may be read, and a manifest
 /// beyond it fails the walk rather than contributing nothing.
-// cap: bound
+// cap: bound — 界的是可读的范围；超界的清单让这次走查失败，而不是静默少算
 const MAX_INDEX_DEPTH: usize = 2;
 
 /// The read side of the registry's HTTP API, over the plain-HTTP path `buildah`

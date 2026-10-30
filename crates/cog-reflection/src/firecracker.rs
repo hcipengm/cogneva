@@ -22,13 +22,13 @@ use tracing::{info, warn};
 ///
 /// 进程一起来就 bind，这个等待只覆盖 exec 到 bind 之间的那几毫秒加上调度抖动；
 /// 5s 之后还没出现，说明它已经在启动里退出了，再等只是拖住调用方。
-// cap: bound
+// cap: bound — 只覆盖 exec 到 bind 的几毫秒加调度抖动；5s 还没出现说明它已在启动里退出了
 const SOCKET_APPEAR_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 等 socket 出现时的轮询间隔：50ms。
 ///
 /// 比预期出现时间（毫秒级）长一个量级，既不会漏掉，也不会把这条等待变成忙等。
-// cap: bound
+// cap: bound — 比预期出现时间（毫秒级）长一个量级，不漏也不忙等
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Firecracker 实例句柄。

@@ -181,7 +181,7 @@ struct IntentRow {
 /// face someone looks at while deciding where to spend the next build. A depth that
 /// outlived a restart would have to be written down somewhere, and an unwritten
 /// window that silently drops the oldest row is the shape that lies least.
-// cap: bound
+// cap: bound — 静默丢掉最旧一行的窗口，是活得比重启久又最少说谎的形状
 pub const BUILD_RUN_WINDOW: usize = 64;
 
 /// The builds this process ran, by change kind, plus the last few as rows.

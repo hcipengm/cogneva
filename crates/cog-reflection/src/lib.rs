@@ -32,7 +32,7 @@ pub const REFLECTION_NAMESPACE: &str = "reflection";
 /// 评审读的是这一小时的产出与记忆，比它更密只会把同一批证据再读一遍；更长
 /// 则让一次跑偏的产出等到下一轮才被看见。这是 `SelfEvolution` 引擎的节拍，
 /// 与「一轮评审能跑多久」无关。
-// cap: bound
+// cap: bound — 引擎节拍，决定一次跑偏的产出多晚被看见，与「一轮评审能跑多久」无关
 pub const SELF_REVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 // 整份替换一份文件的规则与网关、主线共用一份实现，见 `cog_core::atomic_write`。
@@ -321,7 +321,7 @@ pub fn refusal_pattern_key(
 /// attempt cannot know. The spend is what matters, not the size — see
 /// `failure_digest`, which puts the diagnosis inside it. Shared by the refusal
 /// path and the general outcome path so one number governs both.
-// cap: bound
+// cap: bound — 同一条数管住拒绝路径与普通结果路径，两处共用才不会被各自调宽
 const CHANGE_EVIDENCE_BUDGET: usize = 2000;
 
 /// The files a refusal names, spelled the one way the key and the record both

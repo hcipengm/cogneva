@@ -335,11 +335,11 @@ impl PromotionEvalOutcome {
 /// 默认 3600）：同样是「把一棵工作树建起来 + 跑固定评估集」这件最贵的事。两个数
 /// 目前各自写在构造点、没有共同的配置位——值一致是因为它们量的是同一件事，不是因为
 /// 有一处领它们；真要分开调时这两处就是覆盖点。
-// cap: bound
+// cap: bound — 两处构造点值一致是因为它们量的是同一件事，没有共同配置位；真要分开调时这两处就是覆盖点
 pub(crate) const DEFAULT_EVAL_TIMEOUT_SECS: u64 = 3600;
 
 /// 轮询任务结果的默认间隔（秒），与基线移植侧一致（默认 5）。
-// cap: bound
+// cap: bound — 与基线移植侧的轮询间隔一致
 pub(crate) const DEFAULT_EVAL_POLL_INTERVAL_SECS: u64 = 5;
 
 impl PromotionEval {

@@ -2247,7 +2247,7 @@ fn outcome_deadline(timeout_secs: u64, period: std::time::Duration) -> std::time
 
 /// 执行契约之外多等几轮。见 `outcome_deadline`：它是一段**没有声明**的排队时间
 /// 的覆盖位，所以是一个标了来源的数，而不是一条实测出来的界。
-// cap: bound
+// cap: bound — 是 outcome_deadline 那段没有声明的排队时间的覆盖位，所以标来源而不是实测
 const OUTCOME_QUEUE_MARGIN_ROUNDS: u32 = 3;
 
 /// 把已经交出去的探针的结局收回来：每条只读一次，**不等它跑完**。

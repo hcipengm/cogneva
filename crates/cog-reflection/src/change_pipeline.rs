@@ -69,7 +69,7 @@ const VERIFICATION_ENV_PASSTHROUGH: &[&str] = &[
 /// Default wall-clock bound on the format check. Formatted-or-not is settled by
 /// parsing every file in the workspace, which takes seconds; a run that
 /// outlives this bound is a hung `rustfmt`, not a large workspace.
-// cap: bound
+// cap: bound — 一次格式化以秒计；超过它说明 rustfmt 挂了，不是工作区大
 pub(crate) const DEFAULT_FMT_TIMEOUT_SECS: u64 = 60;
 
 /// The formatter this workspace's deployments ran while the stage was
@@ -93,7 +93,7 @@ const BUILTIN_FMT_CONFORM: &[&str] = &["cargo", "fmt", "--all"];
 /// two orders of magnitude above that pair on purpose — see the test-side
 /// bound's reasoning — while still being a bound: a command that outlives it
 /// is hung, and a hung command would hold the executor's only in-flight slot.
-// cap: bound
+// cap: bound — 超了就是挂住了，而挂住的命令会把执行器唯一的在飞槽占死
 const DEPLOY_ADMISSION_TIMEOUT_SECS: u64 = 300;
 
 /// The linter this workspace's deployments ran while the stage was hardcoded.
@@ -140,17 +140,17 @@ const BUILTIN_LINT_LINE: &str = "cargo clippy --workspace --all-targets";
 
 /// [`ChangePipeline::run_cargo_fmt`] 里最多几趟命令：探针、判、改写、复判。
 /// 判干净就提前返回，所以这是上界不是次数。
-// cap: bound
+// cap: bound — 探针、判、改写、复判四趟；判干净就提前返回，所以是上界不是次数
 const FMT_CMDS_PER_RUN_FMT: u64 = 4;
 
 /// `run_cargo_fmt` 之外直接跑的那趟基线检查（apply 之前，读这棵树本来就
 /// 是不是格式化过的样子）。
-// cap: bound
+// cap: bound — 直接跑的那趟基线检查只有一次
 const FMT_BASELINE_CHECKS_PER_CHANGE: u64 = 1;
 
 /// `run_cargo_fmt` 在一条变更里最多被调用几次：apply 之后那趟，加上测试失败后
 /// 读基线失败集合的那趟。
-// cap: bound
+// cap: bound — apply 之后那趟，加测试失败后读基线失败集合那趟
 const FMT_RUNS_PER_CHANGE: u64 = 2;
 
 /// 一条变更在格式化这一段上最长的墙钟时间。
@@ -164,11 +164,11 @@ pub(crate) const FMT_SEGMENT_WALL_SECS: u64 = DEFAULT_FMT_TIMEOUT_SECS
 
 /// 一条变更要跑几条吃**测试**预算的命令：`run_cargo_clippy` 一条，
 /// `run_test_command` 两条（套件一条，测试失败后读基线失败集合再一条）。
-// cap: bound
+// cap: bound — clippy 一条加测试命令两条
 const TEST_BUDGET_RUNS_PER_CHANGE: u64 = 3;
 
 /// 吃**构建**预算的那一条：发布构建，它的 acquire 在 `evolution_deployer` 里。
-// cap: bound
+// cap: bound — 吃构建预算的只有发布构建那一条
 const BUILD_BUDGET_RUNS_PER_CHANGE: u64 = 1;
 
 /// 一条变更上不受节拍约束的那几段活的墙钟上界——一个心跳到下一个心跳之间最长

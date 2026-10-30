@@ -830,7 +830,7 @@ fn signal_project_root_id(project: &str) -> String {
 /// rows to reach, and this round also reads the whole graph every minute. A
 /// batch bounds the burst, not the work: the round asks again on its next tick
 /// until `remaining` is zero.
-// cap: bound
+// cap: bound — 界的是这一轮的突发量，不是工作量；下一拍会接着问直到 remaining 归零
 const SIGNAL_SETTLE_BATCH: usize = 250;
 
 /// What one settle of the signal projects did, cell by cell.

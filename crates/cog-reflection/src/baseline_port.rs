@@ -1522,14 +1522,14 @@ pub const BASELINE_PORT_LOOP: &str = "baseline_port";
 /// The floor under the configured poll interval: a value below this is clamped
 /// up, so a reader measuring its cadence against `poll_interval_secs` alone
 /// measures a number the loop does not keep whenever this floor binds.
-// cap: bound
+// cap: bound — 这条地板生效时循环并不按 poll_interval_secs 走，拿它量节拍会量错
 pub const MIN_POLL_INTERVAL_SECS: u64 = 60;
 
 /// 一条 git 命令（取基线、摘文件）的墙：120s。
 ///
 /// 这些命令偶尔要走网络拉一个大仓，慢在别处而不在本机；120s 是「远端在吐数据」
 /// 与「远端不应答」的分界，超时读作基线不可得，而不是基线是空的。
-// cap: bound
+// cap: bound — 分界「远端在吐数据」与「远端不应答」，超时读作基线不可得而不是基线为空
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// 基线移植触发循环。第一轮立即执行（启动即对齐新基线，不等一个

@@ -41,16 +41,16 @@ pub const REQUEST_FILE: &str = "request.json";
 pub const OUTCOME_FILE: &str = "outcome.json";
 
 /// 执行到位并给出了判定：变更通过，产物在结果文件里。
-// cap: bound
+// cap: bound — 与 POSIX 惯例同源：0 表示执行到位且判定通过
 pub const EXIT_PASSED: i32 = 0;
 /// 执行到位并给出了判定：变更被拒，判词与原因在结果文件里。
-// cap: bound
+// cap: bound — 与 POSIX 惯例同源：1 表示执行到位且判定拒绝
 pub const EXIT_REFUSED: i32 = 1;
 /// 没能做出判定：工作树、git、cargo 或构建闸门没能让这次执行跑完。
 ///
 /// 与变更本身无关，也不含任何结论——调用方据此把变更留在队列里重试，而不是记成
 /// 一次失败。取 75（EX_TEMPFAIL），与一次性滚动入口的环境类退出码同源。
-// cap: bound
+// cap: derived — 取 75（EX_TEMPFAIL），与滚动入口的环境类退出码同源
 pub const EXIT_UNAVAILABLE: i32 = 75;
 
 /// 容器终止消息（kubelet 的 `terminationMessagePath` 默认值）。类别在退出码上，
@@ -832,12 +832,12 @@ const PARENT_CONTAINER: &str = cog_core::topology::MAIN_CONTAINER;
 
 /// 每次 kubectl 调用的墙钟上界。它是控制面的读，不是构建：超过这个数说明
 /// API 侧已经不正常，再等也只是把常驻进程挂在这里。
-// cap: bound
+// cap: bound — 控制面的读不是构建；超过它说明 API 侧已不正常，再等只是把常驻进程挂住
 const KUBECTL_TIMEOUT_SECS: u64 = 60;
 
 /// 等待预算比 Job 自己的 `activeDeadlineSeconds` 多出来的那一段：Job 到点后
 /// 还要被控制器判死、状态要回写，派发方等到恰好等于它就会在最后几秒里抢跑。
-// cap: bound
+// cap: bound — 比 Job 的 activeDeadlineSeconds 多出的那一段：到点后还要被控制器判死、状态回写
 const WAIT_MARGIN_SECS: u64 = 300;
 
 /// 容器运行时会在 `imageID` 前面挂一段 scheme（`docker-pullable://` 等）。

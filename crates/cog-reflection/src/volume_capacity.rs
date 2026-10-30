@@ -178,28 +178,28 @@ impl CapacityOutcome {
 /// The same factor the chart's volumes are declared by, and stated once here so
 /// the loop that repairs a declaration and the numbers in `values.yaml` cannot
 /// drift apart into two standards for "big enough".
-// cap: bound
+// cap: bound — 声明值按这条余量放大，维修循环与 values.yaml 才不会各自立一套「够大」的标尺
 pub const HEADROOM_PERCENT: u64 = 120;
 
 /// Walks whose peak is kept. Six is about an hour at the default cadence, which
 /// is longer than any one build and shorter than the day a mis-sized
 /// declaration otherwise survives.
-// cap: derived
+// cap: derived — 峰值要盖过任何一次构建，又要短于「填错一次能活一整天」
 pub const PEAK_ROUNDS: usize = 6;
 
 /// Cadence of the loop when the deployment states none.
-// cap: bound
+// cap: bound — 部署没给节拍时的默认轮询间隔
 pub const DEFAULT_INTERVAL_SECS: u64 = 600;
 
 /// Floor on that cadence: a walk and an API read are cheap, but a loop that
 /// re-decides faster than the volume changes is just a busier way to be wrong.
-// cap: bound
+// cap: bound — 节拍下限：比卷的变化更快地重决只是在更忙地犯错
 pub const MIN_INTERVAL_SECS: u64 = 300;
 
 /// How long a claim that refused the patch is left alone before it is tried
 /// again. An API refusal is usually a property of the StorageClass and will not
 /// change by asking again next round.
-// cap: bound
+// cap: bound — API 拒绝通常是 StorageClass 的属性，再问一遍不会变
 pub const REFUSAL_COOLDOWN_SECS: u64 = 3600;
 
 /// The size to request for a claim that peaked at `peak_bytes` and currently

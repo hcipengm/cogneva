@@ -95,11 +95,11 @@ pub const SOURCE_CEILING: &str = "ceiling";
 /// slower than the slowest one so far still finishes, small enough that a
 /// budget which keeps getting killed still escapes in a few steps rather than
 /// in one jump that makes the next failure take hours to surface.
-// cap: bound
+// cap: bound — 分子：让被反复杀掉的预算在几步内逃出去，而不是一次跳到下次失败要等几小时的位置
 const BUDGET_HEADROOM_NUM: u64 = 3;
 
 /// The denominator of the headroom fraction.
-// cap: bound
+// cap: bound — 上面那个分数的分母
 const BUDGET_HEADROOM_DEN: u64 = 2;
 
 /// The hardest the derived budget may go: this many times the pinned value.
@@ -110,7 +110,7 @@ const BUDGET_HEADROOM_DEN: u64 = 2;
 /// is the point where one bad measurement can no longer cost the pipeline hours
 /// of wall clock before the next change gets judged — past it, the honest answer
 /// is that the pin is wrong, and a name on the reading says so.
-// cap: bound
+// cap: bound — 超过它，诚实的答案是「那个钉错了」，读数上会写出来
 const MAX_BUDGET_MULTIPLE: u64 = 4;
 
 /// What the two budgets are set to and what runs have done against them.

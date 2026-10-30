@@ -64,7 +64,7 @@ pub(crate) const IMAGE_PULL_WAITING_REASONS: &[&str] = &["ErrImagePull", "ImageP
 ///
 /// 两头都要用它：这一侧拿它包住整段提问（超时按「没问到」扣住这一轮），派发侧把它
 /// 加进 Job 的 `activeDeadlineSeconds`——只封一头，另一头的界就名不副实。
-// cap: bound
+// cap: bound — 两头都用它：这一侧包住整段提问，派发侧加进 activeDeadlineSeconds；只封一头另一头就名不副实
 pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 
 /// 上游答「还在跑」时，这一问愿意等多久（秒）再扣住这一轮。
@@ -92,12 +92,12 @@ pub(crate) const CI_ASK_BUDGET_SECS: u64 = 180;
 ///
 /// 派发侧还有一条：正在滚的那一版**不会**被新提交顶掉（`in_flight` 只在结束后才
 /// 前进），所以这段等待等到的结论一定会被用上，不是白等。
-// cap: bound
+// cap: bound — in_flight 只在前一版结束后才前进，所以这段等待等到的结论一定会被用上
 pub(crate) const CI_PENDING_WAIT_SECS: u64 = 1800;
 
 /// 等在里面的复问间隔（秒）。一次 CI 判定的粒度是分钟级，问得比这密只是把同一个
 /// 答案多读几遍。
-// cap: bound
+// cap: bound — 一次 CI 判定的粒度是分钟级，问得更密只是把同一个答案多读几遍
 pub(crate) const CI_PENDING_REASK_SECS: u64 = 60;
 
 /// 「还在跑」等到了界时，这一轮的判词。
@@ -227,18 +227,18 @@ pub(crate) fn settle_jsonpath(kind: &str) -> &'static str {
 
 /// 现场读数带病因，但长度不能由集群里的内容决定：它进日志、进终止消息、进失败
 /// 记录。Pod 数、每个 Pod 的容器数、单条消息的字符数各设一个界，超界显式写出来。
-// cap: bound
+// cap: bound — 现场读数要进日志与终止消息，长度不能由集群内容决定
 pub(crate) const SUPPORT_CAUSE_POD_LIMIT: usize = 3;
 
 // cap: bound — companion to the pod limit: a pod's containers are bounded so one verbose pod cannot crowd out the rest
 const SUPPORT_CAUSE_CONTAINER_LIMIT: usize = 4;
 
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
-// cap: bound
+// cap: bound — 探测、致命态复查、部署态查询共用同一节拍
 const ROLLOUT_POLL_SECS: u64 = 5;
 
 /// 超时诊断里保留的事件条数。错误记录不是日志转储：只要够指出病因。
-// cap: bound
+// cap: bound — 错误记录不是日志转储，够指出病因就行
 const DIAGNOSIS_EVENT_LIMIT: usize = 3;
 
 /// 就绪门禁在探针判定周期之外额外给出的余量：镜像已在节点上时，容器从起进程
@@ -247,7 +247,7 @@ const DIAGNOSIS_EVENT_LIMIT: usize = 3;
 /// 判定周期是 38 秒，差值约 4 秒——这就是起进程到监听的实际开销；这里取 15 秒
 /// 是给这一段留的宽裕上界。预算的另一半从活的探针配置推（见 [`ProbeCycle`]），
 /// 所以换一套探针只动那一半，这个数不跟着变。
-// cap: bound
+// cap: bound — 预算是给这一段留的宽裕上界；另一半从活的探针配置推，换探针时这个数不跟着变
 const CONTAINER_STARTUP_ALLOWANCE_SECS: u64 = 15;
 
 /// 就绪探针自己的四个旋钮。门禁的预算从这里推，不拍固定秒数：探针调周期，
@@ -2659,7 +2659,7 @@ fn kubectl_output_paths() -> (PathBuf, PathBuf) {
 /// 这样败的——九次、三百多秒，一次也没留下 kubectl 说的字，事后翻集群日志也判不出
 /// 是 apiserver 卡住还是 Pod 自己的网络栈坏了。所以输出落到文件而不是管道：文件在
 /// 进程死后仍然可读，判词于是能带上它自己的诊断。
-// cap: bound
+// cap: bound — 输出落到文件而不是管道，进程死后仍可读，判词才能带上自己的诊断
 const STDERR_TAIL_CHARS: usize = 600;
 
 fn stderr_tail(text: &str) -> String {
@@ -3005,7 +3005,7 @@ impl RolloutExecutor {
         /// How long one attempt waits for a full ceiling to drain, and how often it looks
         /// while waiting. Waiting on a path that already said no costs seconds; giving up
         /// early costs a whole retry round.
-        // cap: bound
+        // cap: bound — 等一条已经说过「不」的路径只花几秒，早放弃要赔一整轮重试
         const BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
         // cap: bound — how often the wait looks while draining: small enough that a drained ceiling is noticed within a few seconds.
         const POLL: std::time::Duration = std::time::Duration::from_secs(5);
