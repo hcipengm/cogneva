@@ -13,6 +13,10 @@
 # 最要紧的一格是第四组（`no_ledger` 不进来）：那是这份规则**故意**写在射程之外的，
 # 而它是这条回路里唯一每轮都会增长的那一格。删掉 `reading=~` 这条过滤，这一组会红。
 #
+# 覆盖那三格（`coverable_rows` / `covered_rows` / `coverage_measured_unix`）在这份夹具里
+# 一格都没有，因为清单里没有读它们的规则：它们的判据落在估算器那一侧，理由写在那份
+# 清单的头注释里。夹具只证明存在的规则。
+#
 # 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
 #         deploy/k3s/observability/manifests/25-prometheusrule-project-control.yaml \
 #         deploy/k3s/observability/tests/25-prometheusrule-project-control.test.yaml
@@ -130,84 +134,3 @@ tests:
               severity: warning
               cogneva_io_managed: "true"
               cogneva_io_face: "任务管理"
-
-  # 七、开工了却没有基线：差额 2 条。前三十分钟是反向证据——`for: 30m` 还没走完，
-  # 一条任务刚开工、基线正要在同一笔里写下来的那一瞬不该响。
-  - interval: 1m
-    input_series:
-      - series: 'cogneva_project_control_coverable_rows{kind="started_tasks"}'
-        values: '10x80'
-      - series: 'cogneva_project_control_covered_rows{kind="started_tasks"}'
-        values: '8x80'
-      - series: 'cogneva_project_control_coverage_measured_unix'
-        values: '0x80'
-    alert_rule_test:
-      - eval_time: 20m
-        alertname: CognevaStartedTaskWithoutBaseline
-        exp_alerts: []
-      - eval_time: 45m
-        alertname: CognevaStartedTaskWithoutBaseline
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              cogneva_io_managed: "true"
-              cogneva_io_face: "任务管理"
-
-  # 八、干净的负对照：开工的全都有基线，全程不许响。
-  - interval: 1m
-    input_series:
-      - series: 'cogneva_project_control_coverable_rows{kind="started_tasks"}'
-        values: '10x200'
-      - series: 'cogneva_project_control_covered_rows{kind="started_tasks"}'
-        values: '10x200'
-      - series: 'cogneva_project_control_coverage_measured_unix'
-        values: '0x200'
-    alert_rule_test:
-      - eval_time: 45m
-        alertname: CognevaStartedTaskWithoutBaseline
-        exp_alerts: []
-      - eval_time: 150m
-        alertname: CognevaStartedTaskWithoutBaseline
-        exp_alerts: []
-
-  # 九、读数冻住了就不许再说话：差额还在，但覆盖已经三小时没量成。
-  # 没有这一格，去掉时刻守卫、把一条冻住的差额永久点亮，也照样绿。
-  - interval: 1m
-    input_series:
-      - series: 'cogneva_project_control_coverable_rows{kind="started_tasks"}'
-        values: '10x220'
-      - series: 'cogneva_project_control_covered_rows{kind="started_tasks"}'
-        values: '8x220'
-      - series: 'cogneva_project_control_coverage_measured_unix'
-        values: '0x220'
-    alert_rule_test:
-      - eval_time: 45m
-        alertname: CognevaStartedTaskWithoutBaseline
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              cogneva_io_managed: "true"
-              cogneva_io_face: "任务管理"
-      - eval_time: 200m
-        alertname: CognevaStartedTaskWithoutBaseline
-        exp_alerts: []
-
-  # 十、缺基线的都是还没开工的行：那不算缺陷人口，不许响。
-  # 没有这一格，把 `kind="started_tasks"` 写成 `kind="task_baseline"`（甚至不带过滤）
-  # 也照样绿，而那条红永远不会灭——新任务一建出来就缺基线。
-  - interval: 1m
-    input_series:
-      - series: 'cogneva_project_control_coverable_rows{kind="task_baseline"}'
-        values: '100x120'
-      - series: 'cogneva_project_control_covered_rows{kind="task_baseline"}'
-        values: '10x120'
-      - series: 'cogneva_project_control_coverable_rows{kind="started_tasks"}'
-        values: '6x120'
-      - series: 'cogneva_project_control_covered_rows{kind="started_tasks"}'
-        values: '6x120'
-      - series: 'cogneva_project_control_coverage_measured_unix'
-        values: '0x120'
-    alert_rule_test:
-      - eval_time: 90m
-        alertname: CognevaStartedTaskWithoutBaseline
-        exp_alerts: []

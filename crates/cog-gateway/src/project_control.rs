@@ -31,6 +31,7 @@ pub const PROJECT_CONTROL_LOOP: &str = "gateway_project_control";
 /// 与挣值本身的粒度同一量级：计划价值按「已过时间 / 计划总时长」连续折算，但一条
 /// 重规划改的是一整版基线，它不会因为早问了两分钟而不同。间隔只决定「这一版基线
 /// 多快被看到」，不决定造几条——去重键是基线版本。
+// cap: bound
 const CADENCE: Duration = Duration::from_secs(600);
 
 /// 起这条回路。`minter` 缺席时不跑：没有编排侧就没有图可以把活放进，跑起来也只
@@ -308,10 +309,19 @@ pub struct Coverage {
     pub tasks_baselined: u64,
     /// 已经开工或已经收尾的任务行，与其中有一行基线的行。
     ///
-    /// 这一格才是**缺陷人口**：待定与已排期还没轮到自己有基线，缺着不算漏；开工
-    /// 之后还缺，那一条此后每一轮都判不出来，而它已经在花时间与 token 了。
+    /// 这一格把「还没轮到」摘出去：待定与已排期还没轮到自己有基线。剩下的差额是
+    /// 真判不出来的行，但它有两条来路——算不出来（那个种类攒不够样本）与漏了写，
+    /// 两件的修法不同，而这三格本身分不开它们。
     pub started: u64,
     pub started_baselined: u64,
+    /// 挂在别人下面的任务行，与带验收标准的行。
+    ///
+    /// 两格的分母都是 `tasks`：看板与甘特要的是「有多少行进得了树、有多少行做完
+    /// 有判据」，两件事在同一个图上数才有意义。现网这两个数都很低，原因不在判据
+    /// 上——图上大多数行不是分解出来的，是各个回路直接把一件通知当成任务写进来的，
+    /// 那种行天然没有父、也没有验收标准。读数把它们摆出来，不等于它们是漏写。
+    pub parented: u64,
+    pub accepted: u64,
     /// 图上的项目数（不含未分组），与挣值挣得出来的项目数。
     pub projects: u64,
     pub projects_measurable: u64,
@@ -393,6 +403,17 @@ pub const OUTCOMES_TOTAL: &str = "cogneva_project_control_outcomes_total";
 pub const UNMEASURED_TOTAL: &str = "cogneva_project_control_unmeasured_total";
 
 /// 某一类行在图上总共有多少（分母）。
+///
+/// **这三格目前只有读数，没有判据**，而有意的：现网量过 52 条「已经开工却缺基线」的行，
+/// 30 条 `handover` 根本没有 `started_at`、其余落在 `self_signal`／`platform_intent_assess`
+/// 这些样本不足 5 条的种类上——它们是**冷启动人口**，不是有人漏写。修法是给那个种类定
+/// 一份计划或等它攒够样本，两件都不发生在「把行补上」这个动作里；而按电平给它们定红，
+/// 得到的是一条永远红、谁也灭不掉的告警，读的人三天之内就会把它关掉，那时真的回归也
+/// 没人看得见。
+///
+/// 它该有的判据是「这一刻钟里有多少条活是因为**没样本**而不是因为**没算**而没排上期」，
+/// 那件事只有估算器知道（它在 [`crate::project_control`] 看不见的那一侧按种类跳过）。
+/// 在那条计数器落地之前，这里只发读数：覆盖率看得见，判词留白，白是写在纸上的白。
 pub const COVERABLE_ROWS: &str = "cogneva_project_control_coverable_rows";
 /// 其中有多少量得出来（分子）。
 pub const COVERED_ROWS: &str = "cogneva_project_control_covered_rows";
@@ -402,8 +423,16 @@ pub const COVERAGE_MEASURED_UNIX: &str = "cogneva_project_control_coverage_measu
 const COVERAGE_KIND_LABEL: &str = "kind";
 /// 任务行有没有一行基线（`task_plan`）：没有基线的行三个挣值量一个都算不了。
 const KIND_TASK_BASELINE: &str = "task_baseline";
-/// 同上，人口收窄到「已经开工或已经收尾」的行：这一格的差额是缺陷，不是还没轮到。
+/// 同上，人口收窄到「已经开工或已经收尾」的行。
+///
+/// 这一格的差额**不全是缺陷**：现网 52 条里，2/3 落在没有任何时长样本的种类上，它们缺
+/// 基线是谁也没法算，不是漏了。读它的时候要把「还没轮到」（待定／已排期）与「算不出来」
+/// 分开看，两种缺法对应两种修法。
 const KIND_STARTED_TASKS: &str = "started_tasks";
+/// 任务行有没有父指针：没有父指针的行进不了 WBS 树，甘特与看板只能把它当散行画。
+const KIND_TASK_PARENTED: &str = "task_parented";
+/// 任务行有没有验收标准：没有的行做完了没有判据，看板只能看状态不能判交付。
+const KIND_TASK_ACCEPTED: &str = "task_accepted";
 /// 项目能不能算出挣值：`earned_value` 为 `None` 的项目一条越界都判不出来。
 const KIND_PROJECT_EVM: &str = "project_evm";
 
@@ -414,8 +443,10 @@ const KIND_PROJECT_EVM: &str = "project_evm";
 /// 解一遍才知道两格分别是什么。
 type CoverageRowRead = fn(Coverage) -> (u64, u64);
 
-const COVERAGE_KINDS: [(&str, CoverageRowRead); 3] = [
+const COVERAGE_KINDS: [(&str, CoverageRowRead); 5] = [
     (KIND_TASK_BASELINE, |c| (c.tasks, c.tasks_baselined)),
+    (KIND_TASK_PARENTED, |c| (c.tasks, c.parented)),
+    (KIND_TASK_ACCEPTED, |c| (c.tasks, c.accepted)),
     (KIND_STARTED_TASKS, |c| (c.started, c.started_baselined)),
     (KIND_PROJECT_EVM, |c| (c.projects, c.projects_measurable)),
 ];
@@ -501,6 +532,8 @@ fn breaches_of(
             .iter()
             .filter(|t| baseline_due(t.status) && plans.contains_key(&t.id))
             .count() as u64,
+        parented: tasks.iter().filter(|t| t.parent_task_id.is_some()).count() as u64,
+        accepted: tasks.iter().filter(|t| !t.acceptance.is_empty()).count() as u64,
         ..Coverage::default()
     };
 
@@ -749,11 +782,11 @@ mod tests {
         assert_eq!(coverage.started_baselined, 1);
     }
 
-    /// 「还没轮到」与「漏了」分得开：待定、已排期、已取消缺基线不算缺陷人口，开工
-    /// 之后还缺才算。
+    /// 「还没轮到」与「已经开工」分得开：待定、已排期、已取消缺基线不进这一格。
     ///
     /// 合成一格会让那个数永远降不到零——每建一条新任务它就加一，而新任务刚建出来
-    /// 本来就不该有基线。那样的红不是判据，是背景噪声。
+    /// 本来就不该有基线。这一格只回答「有多少已经开工的活在挣值面上是看不见的」，
+    /// 它自己不是判据（其中一条来路是那个种类攒不够样本，补行也补不出来）。
     #[test]
     fn only_tasks_that_have_already_started_count_as_missing_a_baseline() {
         let now = chrono::Utc::now();
@@ -999,6 +1032,8 @@ mod tests {
                 tasks_baselined: 2385,
                 started: 600,
                 started_baselined: 540,
+                parented: 37,
+                accepted: 32,
                 projects: 10,
                 projects_measurable: 7,
             },
@@ -1022,6 +1057,19 @@ mod tests {
         assert_eq!(
             cell(&published, COVERED_ROWS, Some(KIND_STARTED_TASKS)),
             Some(540.0)
+        );
+        assert_eq!(
+            cell(&published, COVERABLE_ROWS, Some(KIND_TASK_PARENTED)),
+            Some(3917.0),
+            "父指针与验收标准的分母与基线那格相同：同一张图上数才有意义"
+        );
+        assert_eq!(
+            cell(&published, COVERED_ROWS, Some(KIND_TASK_PARENTED)),
+            Some(37.0)
+        );
+        assert_eq!(
+            cell(&published, COVERED_ROWS, Some(KIND_TASK_ACCEPTED)),
+            Some(32.0)
         );
         assert_eq!(
             cell(&published, COVERABLE_ROWS, Some(KIND_PROJECT_EVM)),
