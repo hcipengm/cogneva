@@ -73,24 +73,37 @@ pub const HOST_LEDGER_NODE_UNREPORTED_RULE: &str = "host_ledger_node_unreported"
 /// Name of the rule that states a node whose cgroup tree has no slices.
 pub const HOST_LEDGER_SLICES_INVISIBLE_RULE: &str = "host_ledger_slices_invisible";
 
-/// The floor the anon rule compares `user.slice` against, in bytes.
+/// The floor the anon rule compares `user.slice` against, as a percentage of the
+/// node's own memory.
 ///
-/// Re-derived from the series now that it exists, against the rule's own
-/// reading -- `max by (node) (min_over_time(...[15m]))`, so the number this
-/// floor is compared with is the fifteen-minute *minimum*, not the instant.
-/// Over the first week of it running, that minimum peaked at 4.61 GB on this
-/// host, putting this floor just under twice (1.87x) above the worst the
-/// window has produced, and the rule did not fire once.
+/// Re-derived from the series against the rule's own reading --
+/// `max by (node) (min_over_time(...[15m]))`, so the number this floor is
+/// compared with is the fifteen-minute *minimum*, not the instant.
+///
+/// Over the first week of it running (实测 2026-10), that minimum peaked at
+/// 4.61 GB and the host's MemTotal read 62.7 GiB (also 实测 2026-10), putting
+/// the floor just under twice above the worst the window had produced, and the
+/// rule did not fire once; the same bytes are 13% of that host's MemTotal.
+///
+/// A share rather than the bytes, because what the alert is about is "this node
+/// is being held down by something outside the cluster", and being held down is
+/// a share of a machine, not a count of gibibytes: 例如 a figure of eight
+/// gibibytes on a node that size is a seventh of it, and on a small node it is
+/// over half, so stated as bytes the floor grows quieter as nodes shrink and
+/// would start firing on ordinary build trees as they grow. The denominator is
+/// node-exporter's `node_memory_MemTotal_bytes`, which carries the same `node`
+/// label as this module's series; a node whose MemTotal is missing is named by
+/// the cross-layer gate rather than silently dropping out of the comparison.
 ///
 /// The raw series is a different number and the window is the whole reason:
 /// it peaked at 12.84 GB in the same week, with 31 of 10080 scrape-minutes
-/// over this floor. Those minutes are ordinary build work rather than a host
+/// over the floor. Those minutes are ordinary build work rather than a host
 /// in trouble, so a floor on the instant would have to sit above 12.84 GB to
 /// stay quiet -- and a bound nothing reaches says nothing about anything.
 /// What this floor is set to catch is the host being *held* under pressure,
 /// which is why the derived number comes from the minimum and not the peak.
-// cap: bound — 它要抓的是主机被压着「顶住」，所以派生量取的是最小值而不是峰值
-pub const HOST_SLICE_ANON_FLOOR_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+// cap: derived — 实测：8.59 GB 地板 / 62.7 GiB MemTotal；它要抓的是主机被压着「顶住」，所以派生量取的是最小值而不是峰值
+pub const HOST_SLICE_ANON_FLOOR_PERCENT: u64 = 13;
 
 /// Environment variable naming the node this process is running on.
 ///
@@ -548,19 +561,29 @@ mod tests {
             promql.contains("by (node)"),
             "rule {HOST_SLICE_ANON_FLOOR_RULE} must keep the result per node, got: {promql}"
         );
-        // The floor is one number in two carriers: the query and the sentence
-        // that tells a reader what it means. Changing one without the other
-        // leaves the alert describing a bound it does not use.
+        // The floor is one number in three carriers: the query, the declared
+        // share this module exports, and the sentence that tells a reader what
+        // it means. Changing one without the others leaves the alert describing
+        // a bound it does not use.
+        let share = format!("{}", HOST_SLICE_ANON_FLOOR_PERCENT as f64 / 100.0);
         assert!(
-            promql.contains(&HOST_SLICE_ANON_FLOOR_BYTES.to_string()),
-            "rule {HOST_SLICE_ANON_FLOOR_RULE} does not compare against the declared floor \
-             {HOST_SLICE_ANON_FLOOR_BYTES}, got: {promql}"
+            promql.contains(&share),
+            "rule {HOST_SLICE_ANON_FLOOR_RULE} does not compare against the declared share \
+             {HOST_SLICE_ANON_FLOOR_PERCENT}%, got: {promql}"
+        );
+        // A share of what: the denominator has to be the node's own memory, read
+        // per node. Without it the floor is back to bytes borrowed from one
+        // machine, which is what this rule used to compare against.
+        assert!(
+            promql.contains("node_memory_MemTotal_bytes"),
+            "rule {HOST_SLICE_ANON_FLOOR_RULE} must divide by the node's own memory rather than \
+             compare against bytes read off one host, got: {promql}"
         );
         let summary = rule["summary"].as_str().expect("summary is a string");
         assert!(
-            summary.contains("8 GiB"),
-            "rule {HOST_SLICE_ANON_FLOOR_RULE} compares against 8 GiB but its summary does not \
-             say so: {summary}"
+            summary.contains(&format!("{HOST_SLICE_ANON_FLOOR_PERCENT}%")),
+            "rule {HOST_SLICE_ANON_FLOOR_RULE} compares against {HOST_SLICE_ANON_FLOOR_PERCENT}% \
+             of the node's memory but its summary does not say so: {summary}"
         );
         // Where the number comes from is the sentence a reader sees, and it has
         // to name both halves of the derivation: that the floor was set from the
