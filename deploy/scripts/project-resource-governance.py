@@ -58,6 +58,19 @@ GENERATED_HEADER = (
     "#       自己留出的额度。换一套工作负载，这份数跟着变——它不描述任何一台机器。\n"
 )
 
+# 存储额度的余量。它同时受两个约束，而这两个约束要的是同一个方向：
+#   1) 必须大于 1——额度与声明和相等时，任何一条卷声明调大都要先改额度才装得进去；
+#   2) 必须大于 1/0.9——kube-prometheus-stack 自带的 KubeQuotaAlmostFull 在
+#      used/hard 过 0.9 时报警，而这个额度的**稳态 used 就是 PVC 声明和本身**
+#      （准入按声明记，声明多少就占多少）。余量给 1.1 时稳态占比正好是 0.909，
+#      那盏灯从装机那一刻起就是红的：2026-10-30 现网实测 requests.storage
+#      391Gi/430Gi＝90.9%，把「额度没留够」与「额度一直贴着报警线」两件事绑成了
+#      一个常数。1.25 把稳态压到 0.80，两件事各归各位。
+STORAGE_HEADROOM = 1.25
+# 上游那盏灯的阈值。这里抄的是它的判据而不是它的名字：余量与它的关系由
+# `tests/project-resource-governance.test.sh` 判，改小余量会在那一格红。
+QUOTA_ALERT_RATIO = 0.9
+
 # ── 量纲 ─────────────────────────────────────────────────────────────────────
 
 _CPU_RE = re.compile(r"^([0-9.]+)(m?)$")
@@ -353,10 +366,9 @@ def project(
         # 临时 Pod 与判据 Job 也在同一个额度下。比例而不是绝对值——它跟着
         # 工作负载规模走，不跟着某一台机器的规格走。
         "pods": str(2 * pods_at_rest),
-        # 存储留一成头寸：这个额度的作用是拒绝一份总量越界的清单，而声明和与
-        # 它恰好相等时，任何一条卷声明调大都要先改额度才装得进去——渲染期门禁
-        # 把"头寸为零"判红。一成是余量，不是规格。
-        "requestsStorage": f"{math.ceil(storage * 1.1 / (1024**3))}Gi",
+        # 存储的头寸见 STORAGE_HEADROOM：它既是「拒绝一份总量越界的清单」的那点余量，
+        # 也要把稳态占比压在上游告警阈值之下——稳态 used 就是这里的 storage。
+        "requestsStorage": f"{math.ceil(storage * STORAGE_HEADROOM / (1024**3))}Gi",
         # 上限贴着最大的那份声明：没有更大的声明时，它同时也是 LimitRange 的
         # 默认值能给出的最大尺寸（否则一份「只拿默认值」的容器反而进不来）。
         "maxCpu": fmt_cpu(max(max_container_cpu, cpu_cores(default_cpu))),
@@ -606,7 +618,11 @@ def main():
             f"（渲染集声明和 + 运行期 Pod + Job + 重叠 = "
             f"{p['limitsCpu']}；其中运行期 Pod 占 {p['_runtime_cpu']}），"
             f"requests {p['requestsCpu']} 核 / {p['requestsMemory']}，"
-            f"pods {p['pods']}，storage {p['requestsStorage']}"
+            f"pods {p['pods']}，"
+            # 声明和一起印：额度的稳态占比只有两个变量（额度、声明和），少印一个，
+            # 读的人就得自己把渲染集再求和一遍才能说「这个余量够不够」。
+            f"storage {p['requestsStorage']}"
+            f"（声明和 {d['storage'] / (1024**3):.2f}GiB，余量 {STORAGE_HEADROOM:g}×）"
         )
     return 0
 

@@ -51,6 +51,25 @@ run 0 '额度与渲染集一致' --write-values "${work}/values.yaml" --check
 printf '# hand edit\n' >>"${work}/values.yaml"
 run 1 '与投影不一致' --write-values "${work}/values.yaml" --check
 
+# --- 余量必须把稳态占比压在上游告警阈值之下。
+# 这个额度的稳态 used 就是 PVC 声明和本身（准入按声明记，声明多少就占多少），所以
+# used/hard 只有余量一个变量。kube-prometheus-stack 自带的 KubeQuotaAlmostFull 在
+# 过 0.9 时报警：余量 1.1 落在 0.909，那盏灯从装机那一刻起就是红的（2026-10-30 现网
+# 实测 requests.storage 391/430＝90.9%）。判据只有一条——额度对声明和的比值必须
+# 严格大于 1/0.9；两个数都从这一段自己印的读数里取，不在这里重算渲染集。
+projection="$(python3 "${gate}" --rendered "${rendered}" --values "${values}" \
+    --profile "${profile}" 2>&1)"
+hard="$(sed -n 's/.*storage \([0-9]\+\)Gi（声明和 .*/\1/p' <<<"${projection}")"
+declared="$(sed -n 's/.*声明和 \([0-9.]\+\)GiB.*/\1/p' <<<"${projection}")"
+if [ -z "${hard}" ] || [ -z "${declared}" ]; then
+    printf '%s\n' "${projection}" >&2
+    fail "读数里没有「storage X Gi（声明和 Y GiB）」——这个余量判不了"
+fi
+if ! awk -v h="${hard}" -v d="${declared}" \
+    'BEGIN { exit !(h > d && h / d > 1 / 0.9) }'; then
+    fail "存储余量不足：${hard}Gi 对声明和 ${declared}GiB，稳态占比高于 0.9"
+fi
+
 # --- 读数面：写出来的文件必须带着额度，而不是零额度的一份。
 case "$(cat "${work}/values.yaml")" in
     *limitsCpu*) ;;
