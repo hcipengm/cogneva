@@ -703,6 +703,59 @@ fn signal_project_key(detail: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// 一条信号行说的「做完」是什么意思，用这一侧自己读得到的量来写。
+///
+/// 没有验收标准的行是一个谁也关不掉的活：项目视图画得出它，但画不出「够了没有」，
+/// 挣值那一格永远不合上。所以这一格不是给视图的装饰，它是这条活唯一的止损条件。
+///
+/// 判据一律取**造这条行的那次读数**：告警是这一条规则不再出现在 firing 集合里，
+/// 复发失败是同一张窗里同一个签名不再出现，积压是同一个阈值读数降到线以下。
+/// 这样清掉它的读者和造出它的读者是同一个，两边不可能各自漂。
+///
+/// 落不到具体种类时留下的那句「下一轮不再为它建行」不是循环论证：这一侧「没有新行」
+/// 是「条件不再问」的定义，而这一侧还活着这件事由常驻循环自己的活性门看着，
+/// 所以「观察器停了」不会被读成「条件结束了」。
+fn signal_acceptance(detail: &serde_json::Value, project: Option<&str>) -> String {
+    let kind = detail
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
+    let text = |key: &str| {
+        detail
+            .get(key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    };
+    let number = |key: &str| {
+        detail
+            .get(key)
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    };
+    match kind {
+        "persisted_alert" => format!(
+            "告警「{}」不再处于 firing：下一轮读告警存储时它不在 firing 集合里",
+            text("rule")
+        ),
+        "failure_recurrence" => format!(
+            "签名「{}」在 {} 秒的失败窗里不再出现：同一张窗按签名分组，这一组为空",
+            text("signature"),
+            number("window_secs")
+        ),
+        "queue_backlog" => format!(
+            "待办与在飞不再超过 {}：本文件每轮报的那个待办读数",
+            number("threshold")
+        ),
+        _ => format!(
+            "条件「{}」不再成立：下一轮不再为它建行",
+            project.unwrap_or(kind)
+        ),
+    }
+}
+
 /// The task kind of the row that anchors one signal's project.
 ///
 /// Not [`SIGNAL_PROJECT_PREFIX`]'s kind: a reader counting signal work must not
@@ -916,6 +969,10 @@ async fn submit_intent(
             // `json!` moves the value in, so a key derived afterwards would be
             // derived from nothing.
             let project = signal_project_key(&detail);
+            // What "done" means for this row, taken from the reading that filed
+            // it: see `signal_acceptance`. A leaf carrying none is work nobody
+            // can close.
+            let acceptance = signal_acceptance(&detail, project.as_deref());
             let mut task = Task::new(
                 task_id,
                 TaskType::Custom(task_kind.into()),
@@ -934,6 +991,7 @@ async fn submit_intent(
             // condition that keeps asking is what turns "one thousand and
             // fourteen projects" into "the alert rules that are firing".
             task.goal_id = project.clone();
+            task.acceptance.push(acceptance);
             // And the row hangs under the project's anchor rather than being a
             // root of its own -- a group whose every round is a root is a group
             // replanning refuses. See `signal_project_root`.
@@ -2261,6 +2319,76 @@ mod tests {
         let settled = settle_signal_parents(&orch, &tasks).await;
         assert!(!settled.moved_anything(), "{settled:?}");
         assert_eq!(orch.get_all_tasks().await.len(), 1, "多写了一行");
+    }
+
+    /// 每一种信号都写下「做完」是什么意思，而且写的是**它自己那一次读数**。
+    ///
+    /// 这一格挡住两种退化：整格空着（现网 1194 条信号行全是空的，项目视图里
+    /// 每一条都是关不掉的活），或者三种信号共用一句套话（那就谁也清不掉谁）。
+    #[tokio::test]
+    async fn every_signal_row_states_what_done_means_in_its_own_terms() {
+        let alert = serde_json::json!({"kind": "persisted_alert", "rule": "CognevaHostReadingProducerDown"});
+        let failure = serde_json::json!({
+            "kind": "failure_recurrence",
+            "signature": "panic: index out of bounds",
+            "window_secs": 3600,
+        });
+        let backlog = serde_json::json!({"kind": "queue_backlog", "threshold": 100});
+        let unknown = serde_json::json!({"kind": "some_future_signal"});
+
+        let written = [
+            signal_acceptance(&alert, signal_project_key(&alert).as_deref()),
+            signal_acceptance(&failure, signal_project_key(&failure).as_deref()),
+            signal_acceptance(&backlog, signal_project_key(&backlog).as_deref()),
+            signal_acceptance(&unknown, signal_project_key(&unknown).as_deref()),
+        ];
+        for (index, one) in written.iter().enumerate() {
+            assert!(
+                one.contains("不再"),
+                "第 {index} 条没有说清什么算做完：{one}"
+            );
+        }
+        assert!(
+            written[0].contains("CognevaHostReadingProducerDown") && written[0].contains("firing"),
+            "告警那条要点名规则、说清判据是 firing 集合：{}",
+            written[0]
+        );
+        assert!(
+            written[1].contains("panic: index out of bounds") && written[1].contains("3600"),
+            "复发失败那条要点名签名与窗口：{}",
+            written[1]
+        );
+        assert!(
+            written[2].contains("100"),
+            "积压那条要用它自己报的那个阈值：{}",
+            written[2]
+        );
+        assert!(
+            written[3].contains("some_future_signal"),
+            "落不到具体种类时至少要点名那个项目：{}",
+            written[3]
+        );
+        let distinct: std::collections::BTreeSet<&String> = written.iter().collect();
+        assert_eq!(distinct.len(), written.len(), "四种信号写出了同一句话");
+
+        // 端到端：写到图上的那一行确实带着它。
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(vec![]));
+        submit_intent(
+            &orch,
+            "self-signal-alert-producer-down".to_string(),
+            "self_signal",
+            "修掉 CognevaHostReadingProducerDown".to_string(),
+            alert,
+            true,
+        )
+        .await;
+        let filed = orch.get_all_tasks().await;
+        let row = filed
+            .iter()
+            .find(|t| t.id == "self-signal-alert-producer-down")
+            .expect("这一轮该写出这一行");
+        assert_eq!(row.acceptance.len(), 1, "{:?}", row.acceptance);
+        assert!(row.acceptance[0].contains("CognevaHostReadingProducerDown"));
     }
 
     /// A row that already failed is left alone while the pool is closed, and
