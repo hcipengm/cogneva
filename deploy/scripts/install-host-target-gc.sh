@@ -10,6 +10,9 @@
 # What it installs: a timer that runs the reclaimer every half hour, and a
 # service to run. The reclaimer itself decides whether there is anything to do;
 # below the trigger a run is a couple of readings and no work.
+# 装这一份不需要 root、也不吃参数。install-host-units.sh 只认这一行来决定装哪些——
+# 它的成员从树里枚举，所以新加一个安装脚本要自己声明这一行。
+# host-install: user
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

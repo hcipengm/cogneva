@@ -15,6 +15,9 @@
 # 产出单元自己的退出码回答不了「我在不在跑」——它不在的时候，没有退出码可以红。
 #
 # 用法：bash deploy/scripts/install-cross-layer-reconcile.sh
+# 装这一份不需要 root、也不吃参数。install-host-units.sh 只认这一行来决定装哪些——
+# 它的成员从树里枚举，所以新加一个安装脚本要自己声明这一行。
+# host-install: user
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -141,9 +144,13 @@ systemctl --user enable --now "${check_name}.timer"
 # 读到的是「文件不存在」——那是红，但红的原因是我们刚装好，不是拍子停了。
 # 这一拍失败（集群读不到、Prometheus 没起）不影响安装：它照样落一行 `unreadable`，
 # 那正是「装好了但读不到」该有的读数，交给检查器与 journal 去说。
-systemctl --user start "${unit_name}.service" || \
-    printf 'install-cross-layer-reconcile: 首拍没有成功（它已落一行 unreadable），见 journalctl --user -u %s\n' \
-        "${unit_name}.service" >&2
+# 只在序列还不存在时种：这条命令会被 install-host-units.sh 的定时器每半小时跑一遍，
+# 每次都补一拍就成了额外的高频拍子，而序列的节律恰恰是检查器判缺拍的依据。
+if [ ! -f "${series}" ]; then
+    systemctl --user start "${unit_name}.service" || \
+        printf 'install-cross-layer-reconcile: 首拍没有成功（它已落一行 unreadable），见 journalctl --user -u %s\n' \
+            "${unit_name}.service" >&2
+fi
 
 state="$(systemctl --user is-active "${unit_name}.timer")"
 [ "${state}" = active ] || die "timer 是 ${state}，不是 active"

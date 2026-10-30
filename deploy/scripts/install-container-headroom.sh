@@ -12,6 +12,9 @@
 # 在 systemctl --failed 上要看得见。产出单元自己的退出码回答不了「我在不在跑」。
 #
 # 用法：bash deploy/scripts/install-container-headroom.sh
+# 装这一份不需要 root、也不吃参数。install-host-units.sh 只认这一行来决定装哪些——
+# 它的成员从树里枚举，所以新加一个安装脚本要自己声明这一行。
+# host-install: user
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -133,9 +136,13 @@ systemctl --user enable --now "${check_name}.timer"
 
 # 立刻跑一拍，把序列文件种出来。不种的话，检查器在第一次产出之前（最多 30 分钟）
 # 读到的是「文件不存在」——那是红，但红的原因是我们刚装好，不是拍子停了。
-systemctl --user start "${unit_name}.service" || \
-    printf 'install-container-headroom: 首拍没有成功（它已落一行 unreadable），见 journalctl --user -u %s\n' \
-        "${unit_name}.service" >&2
+# 只在序列还不存在时种：这条命令会被 install-host-units.sh 的定时器每半小时跑一遍，
+# 每次都补一拍就成了额外的高频拍子，而序列的节律恰恰是检查器判缺拍的依据。
+if [ ! -f "${series}" ]; then
+    systemctl --user start "${unit_name}.service" || \
+        printf 'install-container-headroom: 首拍没有成功（它已落一行 unreadable），见 journalctl --user -u %s\n' \
+            "${unit_name}.service" >&2
+fi
 
 state="$(systemctl --user is-active "${unit_name}.timer")"
 [ "${state}" = active ] || die "timer 是 ${state}，不是 active"

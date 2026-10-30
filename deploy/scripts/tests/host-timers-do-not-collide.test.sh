@@ -157,6 +157,15 @@ collisions="$(printf '%s' "${rows}" | awk -F'\t' '
         for (i = 1; i <= n; i++) {
             split(set[i], a, ",")
             for (j = i + 1; j <= n; j++) {
+                # 同一个单元被两个安装脚本各写一遍（聚合脚本也会把成员渲染一遍）：
+                # 内容相同就不是两个 timer 在撞，是同一条排期被报了两遍。内容不同则是
+                # 两个安装脚本对同一个单元写了不同的排期，那是另一种错，单独报。
+                if (name[i] == name[j]) {
+                    if (cadence[i] != cadence[j] || set[i] != set[j])
+                        printf "%s 被 %s 与 %s 写成了两份不同的排期（%s 与 %s）\n", \
+                            name[i], src[i], src[j], set[i], set[j]
+                    continue
+                }
                 if (cadence[i] != cadence[j]) continue
                 split(set[j], b, ",")
                 for (x = 1; x <= length(a); x++) {
@@ -179,5 +188,6 @@ collisions="$(printf '%s' "${rows}" | awk -F'\t' '
     }')"
 [ -z "${collisions}" ] || fail "宿主 timer 撞在同一刻：${collisions}"
 
-count="$(printf '%s' "${rows}" | grep -c .)"
+# 报的是**不同的单元数**，不是行数：同一个单元会被它自己的安装脚本与聚合脚本各渲染一遍。
+count="$(printf '%s' "${rows}" | cut -f3 | sort -u | grep -c .)"
 echo "host-timers-do-not-collide: ${count} 个 timer（${installers} 个安装脚本）通过"

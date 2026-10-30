@@ -12,6 +12,9 @@
 # 只渲染：COGNEVA_INSTALL_RENDER_ONLY=1 跳过凭证、restic、systemd-creds 与 /etc，
 # 只把两份单元写进 $XDG_CONFIG_HOME/systemd/user。测试要判「算出来的时刻对不对」，
 # 而它不该在这台机器上装一个推数据的定时器。
+# 装这一份要 root，还要两个只有属主能给的东西（异地仓库地址、明文凭证目录），所以
+# install-host-units.sh 不代跑它，只把带占位符的调用印出来。这一行同样由它读。
+# host-install: root
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
