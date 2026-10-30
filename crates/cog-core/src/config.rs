@@ -1523,6 +1523,12 @@ impl Default for BuildGateConfig {
             //
             // 实测口径记在各自字段上。取中位/峰值、为什么不用 load average、
             // 为什么地板不能从 MemAvailable 反读，都在那里。
+            //
+            // 其中两个数描述的是机器而不是构建——一个构建吃几个核、开工前
+            // 要有多少空闲内存——所以读到它们的那一层会把它们压到本机付得起
+            // 的范围里（核数、MemTotal 减去一个构建的峰值），只压不抬，并在
+            // `source` 标签上写 `fitted`。搬到更小的机器上，这两个出厂值不会
+            // 变成两条永远清不掉的墙，也不会被当成有人选过的数。
             build_demand_cores: 4.1,
             build_peak_rss_mib: 4481,
             mem_floor_mib: 24 * 1024,

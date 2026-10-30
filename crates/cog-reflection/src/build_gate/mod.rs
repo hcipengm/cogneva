@@ -245,6 +245,83 @@ impl Tuning {
             },
         }
     }
+
+    /// The declaration as the host it landed on can honour it.
+    ///
+    /// Two of these inputs describe a machine rather than a build: how many
+    /// cores one build takes out of the box, and how much memory has to be free
+    /// before another may start. The shipped reading of both was taken on one
+    /// host, and on any other host the same numbers stop being answers to this
+    /// gate's question. A build cannot demand more cores than the box has -- with
+    /// a divisor above the core count the cpu dimension reads below one, the
+    /// dimension becomes the wall on every sample, and the gate spends its day
+    /// admitting one build at a time for a reason that is not true there. A floor
+    /// above what the box can have free after one build is a wall that never
+    /// clears, so the memory dimension says "one" forever and hides whichever
+    /// dimension really is tight.
+    ///
+    /// Both are fitted down, never up: the declaration is a measurement of what
+    /// a build costs and this is only the limit of what the box can pay. A host
+    /// bigger than the one that was measured keeps the declared figure -- the
+    /// cost of a build does not rise just because there is more room around it,
+    /// and raising these would be inventing a measurement nobody took.
+    fn on_host(mut self, host: HostFacts) -> Self {
+        let cores = host.cores.max(1) as f64;
+        if self.build_demand_cores > cores {
+            self.build_demand_cores = cores;
+        }
+        let after_one_build = host
+            .mem_total_bytes
+            .saturating_sub(self.build_peak_rss_bytes);
+        if self.mem_floor_bytes > after_one_build {
+            self.mem_floor_bytes = after_one_build;
+        }
+        self
+    }
+}
+
+/// The two facts about the machine this process landed on that can make a
+/// declared input impossible here: its cores, and the memory it has in total.
+///
+/// Read from the host rather than passed in from the chart, because a value the
+/// chart carries is the chart author's machine again -- the same mistake one
+/// level up. The container the gate runs in is handed a limit the kernel cannot
+/// see, so `/proc/meminfo` is the box, and the box is what a floor is measured
+/// against; a deployment that would rather bound the gate by the container's
+/// limit declares `mem_floor_mib` itself and the smaller of the two wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostFacts {
+    cores: u64,
+    mem_total_bytes: u64,
+}
+
+impl HostFacts {
+    /// `None` when the box cannot be read, which leaves the declaration exactly
+    /// as written rather than substituting a guess for a reading.
+    fn read() -> Option<Self> {
+        let cores = std::thread::available_parallelism().ok()?.get() as u64;
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let kib = meminfo.lines().find_map(|line| {
+            line.strip_prefix("MemTotal:")?
+                .split_whitespace()
+                .next()?
+                .parse::<u64>()
+                .ok()
+        })?;
+        Some(Self {
+            cores,
+            mem_total_bytes: kib << 10,
+        })
+    }
+}
+
+/// The declaration fitted to this process's host, or as written when the host
+/// cannot be read.
+fn fit_to_host(t: Tuning) -> Tuning {
+    match HostFacts::read() {
+        Some(host) => t.on_host(host),
+        None => t,
+    }
 }
 
 /// Where the derived bound is persisted, so every process on the host enforces
@@ -1444,6 +1521,16 @@ fn model_inputs(t: &Tuning) -> Vec<(&'static str, &'static str, f64)> {
 /// being taken.
 const SOURCE_CALIBRATED: &str = "calibrated";
 
+/// The value was not chosen by anybody and was not measured here: it is the
+/// shipped reading lowered to what this box can actually pay for.
+///
+/// Its own word rather than `configured`, because the two ask a reader to do
+/// opposite things. `configured` means somebody looked at this deployment and
+/// picked a number, and a number of theirs is theirs to defend. This one means
+/// nobody picked it: the box is smaller than the one the reading came from, and
+/// the only thing that would change it back is a bigger box or a lighter build.
+const SOURCE_FITTED: &str = "fitted";
+
 /// The model inputs as series, one per input, labelled by which one it is and
 /// by where the value came from.
 ///
@@ -1452,9 +1539,21 @@ const SOURCE_CALIBRATED: &str = "calibrated";
 /// which wall is tightest, never what the wall was computed with. Publishing the
 /// inputs is what lets a reader see that the divisor has not been re-measured,
 /// and the `source` label is the word for it — `calibrated` is a number nobody
-/// has looked at since it was taken, `configured` is one somebody chose.
-fn tuning_readings(t: &Tuning, measured_peak: Option<u64>, origin: Origin<'_>) -> Vec<RawMetric> {
+/// has looked at since it was taken, `configured` is one somebody chose,
+/// `fitted` is one this box lowered on its own.
+fn tuning_readings(
+    t: &Tuning,
+    measured_peak: Option<u64>,
+    origin: Origin<'_>,
+    host: Option<HostFacts>,
+) -> Vec<RawMetric> {
     let shipped = model_inputs(&Tuning::shipped());
+    // What the same declaration reads as on this box, so a value that moved can
+    // be told apart: lowered by the host, or picked by a person.
+    let fitted = match host {
+        Some(host) => model_inputs(&Tuning::shipped().on_host(host)),
+        None => shipped.clone(),
+    };
     let label = |m: RawMetric| {
         m.with_label(
             crate::evolution_queue_readings::DIR_LABEL,
@@ -1478,7 +1577,10 @@ fn tuning_readings(t: &Tuning, measured_peak: Option<u64>, origin: Origin<'_>) -
                     crate::verification_budget::SOURCE_DERIVED
                 }
                 Some((_, _, s)) if (*s - value).abs() > f64::EPSILON => {
-                    crate::verification_budget::SOURCE_CONFIGURED
+                    match fitted.iter().find(|(f, _, _)| *f == field) {
+                        Some((_, _, f)) if (*f - value).abs() <= f64::EPSILON => SOURCE_FITTED,
+                        _ => crate::verification_budget::SOURCE_CONFIGURED,
+                    }
                 }
                 _ => SOURCE_CALIBRATED,
             };
@@ -2164,7 +2266,7 @@ impl BuildGate {
             wait: Duration::from_secs(cfg.wait_secs),
             installed,
             dir,
-            tuning: Tuning::from_config(cfg),
+            tuning: fit_to_host(Tuning::from_config(cfg)),
             derived: AtomicU64::new(0),
             measured_ceiling: AtomicU64::new(0),
             held_ceiling: AtomicU64::new(0),
@@ -4006,7 +4108,12 @@ impl Observable for BuildGate {
         // assumption it is divided by did, and `source` says whether anyone has
         // looked at that assumption since it was measured.
         let (tuning, measured_peak) = self.tuning_in_force();
-        metrics.extend(tuning_readings(&tuning, measured_peak, origin));
+        metrics.extend(tuning_readings(
+            &tuning,
+            measured_peak,
+            origin,
+            HostFacts::read(),
+        ));
         Ok(metrics)
     }
 
@@ -4108,6 +4215,77 @@ mod tests {
         );
     }
 
+    /// 小于被测量的那台机器上，声明里描述机器的那两个数必须落到这台机器付得起
+    /// 的范围内：例如一台 4 核的机器上，出厂地板比整机内存还大，它自己就永远
+    /// 清不掉，出厂除数比整机核数还大，cpu 维度就永远算出一。两条都会让那一维
+    /// 永远贴地，把真正紧的那面墙藏起来。
+    #[test]
+    fn a_smaller_host_gets_figures_it_can_actually_reach() {
+        let gib = |n: u64| n << 30;
+        let small = HostFacts {
+            cores: 4,
+            mem_total_bytes: gib(16),
+        };
+        let t = shipped().on_host(small);
+        let peak = shipped().build_peak_rss_bytes;
+        assert_eq!(t.build_demand_cores, 4.0, "一个构建不能要得比整机还多");
+        assert_eq!(
+            t.mem_floor_bytes,
+            gib(16) - peak,
+            "地板必须留得下一个构建，否则它自己就永远清不掉"
+        );
+        assert!(t.mem_floor_bytes < shipped().mem_floor_bytes);
+    }
+
+    /// 换到更大的机器上，声明值原样保留：一个构建的成本不因为旁边有空位就上涨，
+    /// 往上调就是编一条没人量过的读数。
+    #[test]
+    fn a_larger_host_keeps_the_declared_figures() {
+        let big = HostFacts {
+            cores: 96,
+            mem_total_bytes: 512u64 << 30,
+        };
+        let t = shipped().on_host(big);
+        assert_eq!(t.build_demand_cores, shipped().build_demand_cores);
+        assert_eq!(t.mem_floor_bytes, shipped().mem_floor_bytes);
+    }
+
+    /// 被机箱改小的读数不能读成「有人选过」：这两种读音要读者做的事正相反。
+    #[test]
+    fn a_figure_the_box_lowered_names_itself_fitted() {
+        let gib = |n: u64| n << 30;
+        let t = shipped().on_host(HostFacts {
+            cores: 4,
+            mem_total_bytes: gib(16),
+        });
+        let origin = Origin {
+            dir: "d",
+            role: BUILD_GATE_ROLE_BUILDER,
+        };
+        let host = HostFacts {
+            cores: 4,
+            mem_total_bytes: gib(16),
+        };
+        let series = tuning_readings(&t, None, origin, Some(host));
+        let floor = series
+            .iter()
+            .find(|m| m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("mem_floor_mib"))
+            .expect("mem_floor_mib 没有出现在这一族里");
+        assert_eq!(
+            floor.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+            Some(SOURCE_FITTED)
+        );
+        // 同一份读法下没被机箱碰过的那几条仍是标定值。
+        let calm = series
+            .iter()
+            .find(|m| m.labels.get(crate::LABEL_INPUT).map(String::as_str) == Some("cpu_calm_pct"))
+            .expect("cpu_calm_pct 没有出现在这一族里");
+        assert_eq!(
+            calm.labels.get(crate::LABEL_SOURCE).map(String::as_str),
+            Some(SOURCE_CALIBRATED)
+        );
+    }
+
     /// 被运维改过的模型输入要自己说自己是改过的：分不出「标定值」与
     /// 「有人选过」的读数，等于把一个人的判断读成一次测量。
     #[test]
@@ -4121,7 +4299,7 @@ mod tests {
             dir: "d",
             role: BUILD_GATE_ROLE_BUILDER,
         };
-        let series = tuning_readings(&tuned, None, origin);
+        let series = tuning_readings(&tuned, None, origin, None);
         let demand = series
             .iter()
             .find(|m| {
@@ -4208,7 +4386,7 @@ mod tests {
             dir: "d",
             role: BUILD_GATE_ROLE_BUILDER,
         };
-        let series = tuning_readings(&tuning, measured, origin);
+        let series = tuning_readings(&tuning, measured, origin, None);
         let peak = series
             .iter()
             .find(|m| {
