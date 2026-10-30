@@ -8,6 +8,7 @@ import {
   type QuotaScopeName,
 } from '@/api/client';
 import { Button, Reading, Readings } from '@/ui/primitives';
+import { Meter } from '@/ui/plots';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 
@@ -35,6 +36,8 @@ export function QuotaLimitsPanel() {
 
   const target = targetId.trim();
   const canAct = target.length > 0 && !busy;
+  /** 屏幕上此刻的那一对：有覆盖就是声明的那一对，没有就是默认值（生效值）。 */
+  const shownPair = reading ? (reading.limits ?? reading.effective) : null;
 
   const run = async (action: () => Promise<QuotaLimitsReading>) => {
     setBusy(true);
@@ -140,6 +143,18 @@ export function QuotaLimitsPanel() {
           source={`GET /api/v1/quota/limits/${reading.scope}/${reading.target_id}`}
           caveat="「声明」是有人为这一格写过的那一对，「生效」是检查此刻真正会用的那一对——没有覆盖时后者就是默认值。"
         >
+          {/* 这一格配的是一对什么数：soft 落在 hard 之内的哪里，中间那截就是 soft
+              拦下调用之前预留的余量。用量那一格不画——「今天已记」恒为 0 的原因是
+              这套部署里没有任何一方往计数器里记数（见页脚），把它画成一根零长度的
+              条就是拿「没量过」冒充「一条都没有」。 */}
+          {shownPair !== null && shownPair.hard_limit > 0 && (
+            <Meter
+              label={reading.limits ? '声明：soft 落在 hard 之内的哪里' : '生效：soft 落在 hard 之内的哪里'}
+              value={shownPair.soft_limit}
+              max={shownPair.hard_limit}
+              note={`${shownPair.soft_limit.toLocaleString()} / ${shownPair.hard_limit.toLocaleString()}`}
+            />
+          )}
           <div className="flex flex-wrap py-2">
             <Reading
               label="声明"
