@@ -2758,10 +2758,11 @@ pub(crate) mod tests {
             avail_bytes: avail_mib * MIB,
         };
         // Fixtures picked for the test, not a machine: e.g. four trees of
-        // 100 MiB each on a volume with e.g. 4 GiB free. One tree's worth is
-        // reserved so the next one can still be cut, which leaves 3.9 GiB and
-        // buys 39 more at 100 MiB -- a reserve of a fifteenth of the volume
-        // would throw away another 600 MiB and answer 38.
+        // e.g. 100 MiB each on a volume with e.g. 4 GiB free. One tree's worth
+        // is reserved so the next one can still be cut; what is left buys the
+        // rest of the trees at that size. A share of the volume instead --
+        // e.g. a fifteenth -- would hold back a figure nobody measured a tree
+        // for, and answer one less.
         assert_eq!(workspace_cap(disk_with(4096), 4 * 100 * MIB, 4), Some(43));
         // The same four trees, with the volume nearly full: the cap is smaller
         // than the number of trees that already exist, so the next pass
