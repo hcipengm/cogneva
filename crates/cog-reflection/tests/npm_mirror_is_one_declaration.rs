@@ -206,3 +206,35 @@ fn the_overlay_takes_the_registry_from_the_resolver() {
          这样主机把测过的地址放进 {KNOB} 也进不来"
     );
 }
+
+/// 前端用哪个 node 版本，三处载体说的是同一个。
+///
+/// 同一个前端由两条路构建，而 node 版本写在三处：镜像构建的 `FROM`、把构建器推进
+/// 集群 registry 的脚本里那个源镜像、以及推到 registry 的那个 tag。三处各自是个
+/// 字面量，只有后两处被一条旧测试连在一起（脚本的 `tag=` 与部署器的常量）。升级
+/// 工具链时改了 `FROM` 而没改 provisioning，overlay 就用旧 node 重建前端——产物照样
+/// 完整，只是两份前端的工具链不同，这种差异没有任何读数会报。
+#[test]
+fn the_node_version_is_the_same_in_every_carrier() {
+    let root = repo_root();
+    let dockerfile = text_of(&root, "Dockerfile");
+    let script = text_of(&root, "deploy/scripts/provision-web-builder-image.sh");
+
+    let from = url_after(&dockerfile, "FROM node:");
+    let source = url_after(
+        &script,
+        "source_image=\"${positional[1]:-docker.io/library/node:",
+    );
+    let tag = url_after(&script, "tag=\"");
+
+    assert_eq!(
+        from, source,
+        "镜像构建用 node:{from}，而推进 registry 的构建器是 node:{source}——overlay 那一趟\
+         会用旧 node 重建前端，两份产物各自都看起来完整"
+    );
+    assert_eq!(
+        from, tag,
+        "构建器是从 node:{from} 拿的，却推在 tag `{tag}` 上——注册表里那个名字说的不是\
+         它装的东西"
+    );
+}
