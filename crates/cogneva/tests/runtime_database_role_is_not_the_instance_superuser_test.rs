@@ -23,7 +23,7 @@
 
 mod common;
 
-use common::routes::repo_root;
+use common::routes::{read, repo_root};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,10 +33,6 @@ const APP_ROLE: &str = "cog_app";
 
 /// 实例超级用户，只许出现在两个地方：数据库自身与角色引导。
 const SUPERUSER_ROLE: &str = "cog_user";
-
-fn read(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// 一份清单里每一条 `postgres://<role>:` 的角色名，按出现顺序。
 fn dsn_roles(text: &str) -> Vec<String> {
