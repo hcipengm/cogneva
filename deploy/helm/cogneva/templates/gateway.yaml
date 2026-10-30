@@ -325,6 +325,19 @@ spec:
             # 目录背后是哪张 PVC，所以由部署侧指名（与上面挂载的 claimName 同一个）。
             - name: COGNEVA_DATA_VOLUME_CLAIM
               value: "cogneva-data-pvc"
+            {{- with .Values.backup.packageKeySecret.name }}
+            # 恢复端读的是**同一份**包级口令，来源也必须是同一个 Secret：`cogneva
+            # restore` 就从这个 Pod 里跑（kubectl exec deploy/cogneva），它要解开的
+            # 正是备份 Job 写出的那些包。只给写端、不给这里，配错的那一刻没有任何症状，
+            # 症状要等到真的要从密文包恢复时才会出现——那是整套备份里最不该等的一刻，
+            # 而且到那时已经不能回头重写今晚那份包了。三处注入（写包、演练、恢复）
+            # 是同一份事实的三个读者，由一个 values 键同时打开或同时关掉。
+            - name: COGNEVA_BACKUP_PACKAGE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . | quote }}
+                  key: {{ $.Values.backup.packageKeySecret.key | quote }}
+            {{- end }}
             # 主应用是控制面，不是变更执行器：基础 cogneva.json 对全部 Pod 打开
             # self_evolution.enabled，若不在这里关掉执行器，本 Pod 会每轮跑进化
             # 循环 / 基线移植，与专用进化 worker 抢同一实例指纹、裸仓库与工作树
