@@ -357,6 +357,74 @@ pub fn wait_secs(pace: &LlmWindowPace, rate_per_sec: f64, now_unix: i64) -> Opti
     Some((shortfall as f64 / rate_per_sec).ceil().max(1.0) as u64)
 }
 
+/// Folds the measured members into the pool-level report.
+///
+/// The pool report is a **report**, not a window: each member paces against its
+/// own window, and the amounts add up only because the question "how much may
+/// this pool spend by now" is answered member by member and then summed. The
+/// window, though, is not a sum of anything. Two members on a weekly and a
+/// monthly cycle have two starts and two lengths, and a reading that took the
+/// earliest start and the longest length would name a window that neither
+/// member is in — measured on 2026-10-30: a 7-day member that resumed on
+/// 10-26 paired with a 30-day member whose quota returns on 11-04 came out as
+/// "one 30-day window starting 10-26", an end 21 days after the only date the
+/// pool itself names for the quota's return.
+///
+/// So the window is carried only when every measured member shares one, and is
+/// left unreported (zero) otherwise. The amounts stay: they are still what the
+/// members allow between them, and dropping them would hide the pacing that is
+/// actually in force. A reader that needs a start or an end then knows it has
+/// to ask per member, which is where the answer exists.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PoolPace {
+    measured_upstreams: usize,
+    allowance_tokens: u64,
+    spent_tokens: u64,
+    /// The window every measured member is in, while they all share one.
+    shared_window: Option<(u64, i64)>,
+    /// A member contributed a different window than the one seen first.
+    mixed_windows: bool,
+}
+
+impl PoolPace {
+    /// Add one member's measurement and what it has spent in its window.
+    pub fn add(&mut self, measured: &MeasuredWindow, spent_tokens: u64, now_unix: i64) {
+        self.measured_upstreams += 1;
+        self.allowance_tokens = self
+            .allowance_tokens
+            .saturating_add(measured.allowance_at(now_unix));
+        self.spent_tokens = self.spent_tokens.saturating_add(spent_tokens);
+        let here = (measured.window_secs, measured.window_start_at(now_unix));
+        match self.shared_window {
+            None => self.shared_window = Some(here),
+            Some(seen) if seen == here => {}
+            // Compared as a pair on purpose: two members can start at the same
+            // instant with different lengths, or share a length and start at
+            // different instants. Either way they are not in one window.
+            Some(_) => self.mixed_windows = true,
+        }
+    }
+
+    /// The report, with the reserve that is shared across the whole pool (one
+    /// job's cost does not depend on who serves it).
+    pub fn finish(self, reserve_tokens: u64, reserve_population: u64) -> LlmWindowPace {
+        let window = if self.mixed_windows {
+            None
+        } else {
+            self.shared_window
+        };
+        LlmWindowPace {
+            measured_upstreams: self.measured_upstreams,
+            allowance_tokens: self.allowance_tokens,
+            spent_tokens: self.spent_tokens,
+            reserve_tokens,
+            reserve_population,
+            window_secs: window.map(|(secs, _)| secs).unwrap_or(0),
+            window_start_unix: window.map(|(_, start)| start).unwrap_or(0),
+        }
+    }
+}
+
 /// The rate a [`MeasuredWindow`] hands out allowance at, tokens per second.
 pub fn allowance_rate(capacity_tokens: u64, window_secs: u64) -> f64 {
     if window_secs == 0 {
@@ -455,6 +523,75 @@ mod tests {
             window_secs: (30 * DAY) as u64,
             burned_at_unix: 1_000_000,
         }
+    }
+
+    /// 同一条窗上的两家合成一个窗：起点与窗长都还在，读者算得出窗尾。
+    #[test]
+    fn members_in_one_window_are_reported_as_that_window() {
+        let now = 1_000_000 + 10 * DAY;
+        let mut pool = PoolPace::default();
+        pool.add(&month(), 1_000_000, now);
+        pool.add(&month(), 2_000_000, now);
+        let report = pool.finish(500, 5);
+        assert_eq!(report.measured_upstreams, 2);
+        assert_eq!(report.allowance_tokens, 20_000_000, "两家各摊到一千万");
+        assert_eq!(report.spent_tokens, 3_000_000);
+        assert_eq!(report.window_secs, (30 * DAY) as u64);
+        // 窗还没翻，起点就是上一次烧穿的时刻——两家看到的是同一个起点。
+        assert_eq!(report.window_start_unix, 1_000_000);
+        assert_eq!(report.reserve_tokens, 500, "整活成本是全池共用的一个量");
+    }
+
+    /// 窗不一样长时，报表带额度、不带窗：起点与窗长分属两家，拼起来是第三条窗。
+    ///
+    /// 2026-10-30 的现网形状：一条 7 天窗从 10-26 起，一条 30 天窗的复位在 11-04。
+    /// 取最早起点配最长窗长会印出「10-26 起的 30 天窗，窗尾 11-25」——比池子自己
+    /// 说的复位晚二十一天，而两条上游都不在这个窗里。
+    #[test]
+    fn members_in_different_windows_leave_the_report_without_a_window() {
+        let week = MeasuredWindow {
+            capacity_tokens: 33_000_000,
+            window_secs: (7 * DAY) as u64,
+            burned_at_unix: 1_793_028_477,
+        };
+        let quarter = MeasuredWindow {
+            capacity_tokens: 328_662_149,
+            // 复位在未来的那一支：窗起点就是它自己，摊平量因此为零。
+            window_secs: (30 * DAY) as u64,
+            burned_at_unix: 1_793_807_999,
+        };
+        let now = 1_793_333_000;
+        let mut pool = PoolPace::default();
+        pool.add(&week, 0, now);
+        pool.add(&quarter, 0, now);
+        let report = pool.finish(358_943, 533);
+        assert_eq!(report.measured_upstreams, 2);
+        assert!(
+            report.allowance_tokens > 0,
+            "额度是各家摊平量之和，窗不同不改变这一半"
+        );
+        assert_eq!(report.window_secs, 0, "没有一条共同的窗，就不报窗长");
+        assert_eq!(
+            report.window_start_unix, 0,
+            "最早起点配最长窗长会拼出两条都不在的窗"
+        );
+    }
+
+    /// 同样的窗长、不同的起点也是两条窗：只比长度不够，要比起止这一对。
+    #[test]
+    fn a_shared_length_does_not_make_a_shared_window() {
+        let now = 1_000_000 + 10 * DAY;
+        let first = month();
+        let second = MeasuredWindow {
+            burned_at_unix: 1_000_000 + 15 * DAY,
+            ..month()
+        };
+        let mut pool = PoolPace::default();
+        pool.add(&first, 0, now);
+        pool.add(&second, 0, now);
+        let report = pool.finish(0, 0);
+        assert_eq!(report.window_secs, 0);
+        assert_eq!(report.window_start_unix, 0);
     }
 
     #[test]

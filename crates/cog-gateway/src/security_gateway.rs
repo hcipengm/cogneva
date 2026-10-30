@@ -4261,11 +4261,7 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
             (0, 0, 0)
         }
     };
-    let mut pace = cog_core::LlmWindowPace {
-        reserve_tokens: reserve,
-        reserve_population,
-        ..Default::default()
-    };
+    let mut pace = crate::window_pace::PoolPace::default();
     let mut by_upstream = std::collections::HashMap::new();
     let mut rulers = Vec::with_capacity(readings.len());
     for reading in readings {
@@ -4312,16 +4308,7 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
             }
         };
         rulers.push((reading.key.clone(), crate::window_pace::Ruler::Measured));
-        pace.measured_upstreams += 1;
-        pace.allowance_tokens = pace
-            .allowance_tokens
-            .saturating_add(measured.allowance_at(now_unix));
-        pace.spent_tokens = pace.spent_tokens.saturating_add(spent);
-        pace.window_secs = pace.window_secs.max(measured.window_secs);
-        pace.window_start_unix = match pace.window_start_unix {
-            0 => window_start,
-            current => current.min(window_start),
-        };
+        pace.add(&measured, spent, now_unix);
         // 这一家自己的那份判定。整任务成本是全池共用的一个量（它是"一件任务
         // 要花多少"，与谁承接无关），额度、用量与窗口则逐家分开。
         if let Some(entry) = pace_for_upstream(
@@ -4335,7 +4322,7 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
         }
     }
     WindowPaceReading {
-        pool: pace,
+        pool: pace.finish(reserve, reserve_population),
         by_upstream,
         rulers,
         reserve_since_unix,

@@ -195,6 +195,11 @@ pub struct LlmPaceView {
     /// out of several is a smaller allowance, not a broken one.
     pub measured_upstreams: usize,
     /// Tokens the current window allows by now, summed over those upstreams.
+    ///
+    /// A sum, not one window's figure: the members keep their own windows and
+    /// the total is what they allow between them. It is therefore nonzero
+    /// while `window_secs`/`window_start_at` are absent, whenever the members
+    /// do not share one window — a reader must not pair the two into a rate.
     pub allowance_tokens: u64,
     /// Tokens the current window has served, as the ledger counted them.
     pub spent_tokens: u64,
@@ -205,10 +210,13 @@ pub struct LlmPaceView {
     /// reserve has no population behind it, and a number measured over five
     /// jobs is not the same claim as one measured over five hundred.
     pub reserve_population: u64,
-    /// How long the window is, as the upstream stated it, seconds.
+    /// How long the window is, seconds; `0` when the measured members are not
+    /// all in one window, where the length describes nothing they share.
     pub window_secs: u64,
-    /// When the current window started. Absent in a snapshot that is not
-    /// paced, where the field reads zero.
+    /// When the current window started. `None` when the snapshot is not paced
+    /// and, equally, when the measured members are in different windows: the
+    /// reader then has no single start to pair with `window_secs`, and no end
+    /// to compute.
     pub window_start_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -1635,5 +1643,42 @@ mod tests {
         };
         let wire = serde_json::to_value(pool_view(&status)).expect("the view serializes");
         assert!(wire["pace"].is_null(), "没有量过就是没有读数：{wire}");
+    }
+
+    /// 各家窗不一样时，报表带着额度但不带窗：读者拿不到一个起点去加窗长。
+    ///
+    /// 一条 7 天窗、一条 30 天窗同时量到时，「最早起点 + 最长窗长」会拼出一个
+    /// 两条都不在的窗，而读者拿它算出来的窗尾是一个没人观测过的时刻。额度那一
+    /// 半仍然有效（它是各家摊平量之和），所以两格必须分开读：有额度、没有窗。
+    #[test]
+    fn a_report_over_members_in_different_windows_carries_the_allowance_and_no_window() {
+        let status = cog_core::LlmPoolStatus {
+            unavailable: true,
+            evidenced_recovery_unix: 1_793_807_999,
+            next_attempt_unix: 0,
+            unavailable_upstreams: Vec::new(),
+            pool_size: 2,
+            declared_min_healthy: None,
+            quota_window_secs: 2_592_000,
+            upstream_evidence: Vec::new(),
+            last_success_unix: 0,
+            pace: cog_core::LlmWindowPace {
+                measured_upstreams: 2,
+                allowance_tokens: 16_737_629,
+                spent_tokens: 0,
+                reserve_tokens: 358_943,
+                reserve_population: 533,
+                window_secs: 0,
+                window_start_unix: 0,
+            },
+        };
+        let wire = serde_json::to_value(pool_view(&status)).expect("the view serializes");
+        let pace = &wire["pace"];
+        assert_eq!(pace["allowance_tokens"], 16_737_629);
+        assert_eq!(pace["window_secs"], 0);
+        assert!(
+            pace["window_start_at"].is_null(),
+            "没有共同的窗就没有起点，读者不能拿它加窗长：{wire}"
+        );
     }
 }

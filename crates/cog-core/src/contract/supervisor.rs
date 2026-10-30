@@ -369,10 +369,21 @@ pub struct LlmWindowPace {
     /// at. `0` means the reserve has no population behind it.
     #[serde(default)]
     pub reserve_population: u64,
-    /// Longest window any measured upstream stated, seconds.
+    /// How long the window is, seconds; `0` when not paced **or** when the
+    /// measured members are not all in one window.
+    ///
+    /// The allowance and spend above are sums over members, and a sum is still
+    /// true when its terms are paced against different windows. A length is
+    /// not: taking the longest of several would name a window that none of the
+    /// members is in once it is paired with any single start, and a reader
+    /// that turns it into an end (`start + window_secs`) would publish a date
+    /// nothing observed. So a mixed reading reports no window at all, and the
+    /// per-member windows are the only place the answer exists.
     #[serde(default)]
     pub window_secs: u64,
-    /// When the current window started, unix seconds; `0` when not paced.
+    /// When the current window started, unix seconds; `0` when not paced or
+    /// when the measured members are not all in one window (see
+    /// [`Self::window_secs`]).
     #[serde(default)]
     pub window_start_unix: i64,
 }

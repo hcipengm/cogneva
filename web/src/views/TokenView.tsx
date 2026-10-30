@@ -478,6 +478,8 @@ function spanOf(secs: number): string {
  * - 没有快照：写者没发布过，不能说池子健康；
  * - 有快照但没配速：还没有上游在一个窗里被拒过，没有容量可算，不是额度为 0；
  * - 有配速：允许量、已花、差额、一个整活的预留、窗长与窗尾；
+ * - 有配速但各家窗不一样长：允许量照印（它是各家摊平量之和），窗起止三格改说
+ *   「没有共同的窗」——取最早起点配最长窗长会印出一个谁都不在的窗尾；
  * - 池不可用：带上游自己说的复位时刻，以及我方下一次去探测的时刻。
  *
  * 允许量是**摊平**后的量，不是官方剩余额度：上游不公布额度，这个数是「上个窗
@@ -489,6 +491,10 @@ function AllowanceWindow() {
   const pool = overview.data?.llm_pool ?? null;
   const pace: LlmPaceView | null = pool?.pace ?? null;
   const remaining = pace ? pace.allowance_tokens - pace.spent_tokens : 0;
+  // 各家窗不一样长时，快照不报窗（`window_secs` 与起点都为零）：允许量是各家
+  // 摊平量之和，窗却不是任何东西的和——「最早起点 + 最长窗长」拼出来的那份窗，
+  // 一条上游都不在里面。这种时候不印起止，把读者指到池那一行的复位时刻。
+  const mixedWindows = pace !== null && pace.allowance_tokens > 0 && pace.window_secs === 0;
   const windowEnd =
     pace?.window_start_at && pace.window_secs > 0
       ? new Date(new Date(pace.window_start_at).getTime() + pace.window_secs * 1000).toISOString()
@@ -566,17 +572,36 @@ function AllowanceWindow() {
                 />
                 <Reading
                   label="窗长"
-                  value={spanOf(pace.window_secs)}
-                  note={`${pace.measured_upstreams} 条上游的实测窗合成这一读`}
+                  value={mixedWindows ? '没有共同的窗' : spanOf(pace.window_secs)}
+                  tone={mixedWindows ? 'warn' : 'plain'}
+                  note={
+                    mixedWindows
+                      ? `${pace.measured_upstreams} 条上游各量各的窗，长度不同：额度是各家摊平量相加的报表，不是某一家的剩余额度`
+                      : `${pace.measured_upstreams} 条上游的实测窗合成这一读`
+                  }
                 />
                 <Reading
                   label="窗起点"
-                  value={pace.window_start_at ? <Moment iso={pace.window_start_at} /> : '未报'}
+                  value={
+                    mixedWindows ? (
+                      '没有共同起点'
+                    ) : pace.window_start_at ? (
+                      <Moment iso={pace.window_start_at} />
+                    ) : (
+                      '未报'
+                    )
+                  }
+                  tone={mixedWindows ? 'warn' : 'plain'}
                 />
                 <Reading
                   label="窗尾"
-                  value={windowEnd ? <Moment iso={windowEnd} /> : '未报'}
-                  note="窗尾即下一窗开始，允许量从这里重新摊"
+                  value={mixedWindows ? '算不出来' : windowEnd ? <Moment iso={windowEnd} /> : '未报'}
+                  tone={mixedWindows ? 'warn' : 'plain'}
+                  note={
+                    mixedWindows
+                      ? '各家复位时刻见「上游自述复位」——用最早起点加最长窗长会得到一个谁都不在的日期'
+                      : '窗尾即下一窗开始，允许量从这里重新摊'
+                  }
                 />
               </>
             ) : (

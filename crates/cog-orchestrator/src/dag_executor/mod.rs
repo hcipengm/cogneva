@@ -474,7 +474,12 @@ impl DagExecutorRuntime {
                             reserve_tokens = bound.pace.reserve_tokens,
                             measured_upstreams = bound.pace.measured_upstreams,
                             pool_size = bound.pool_size,
-                            window_start_unix = bound.pace.window_start_unix,
+                            // Zero is "no single window the measured members
+                            // share", and printing it as an instant would read
+                            // as 1970 — the same trap as `next_look_unix`
+                            // below.
+                            window_start_unix = ?(bound.pace.window_start_unix > 0)
+                                .then_some(bound.pace.window_start_unix),
                             // Absolute, not "in N seconds": a relative figure
                             // is wrong the moment anyone reads the line. `None`
                             // when no cadence was configured -- a zero instant
