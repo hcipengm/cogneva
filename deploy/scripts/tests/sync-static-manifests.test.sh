@@ -11,6 +11,9 @@
 #
 # 渲染产物侧同理：指纹改了而静态清单还是旧的，定向红在那一份 Deployment 上。
 #
+# 第三块是「头部自称由渲染脚本生成的整份清单」：它不是人手写的，是渲染产物被抄进
+# 静态目录的一份副本。副本落后于出处时必须红，写回后必须逐字节等于出处。
+#
 # 每个用例都在真树的一份副本上跑（脚本按自身位置算仓库根，副本自成一体）。
 #
 # 用法：bash deploy/scripts/tests/sync-static-manifests.test.sh
@@ -109,7 +112,26 @@ out="$(run "${root}")" || fail "指纹写回失败：${out}"
 out="$(run "${root}" --check)" || fail "指纹写回之后仍然红：${out}"
 expect_ok "指纹写回后" "${out}"
 
-# ---- 5. 静态清单里根本没有这个键：不猜，直接说 ----
+# ---- 5. 自称渲染产物的整份清单落后于出处：红，写回后与出处逐字节相等 ----
+root="$(case_dir whole-file-drift)"
+censused="deploy/k3s/process-census-daemonset.yaml"
+python3 - "${root}" "${censused}" <<'PY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]) / sys.argv[2]
+s = p.read_text()
+assert "readings-delivery: push" in s, "夹具依赖的标签不在那份清单里了"
+p.write_text(s.replace("cogneva.io/readings-delivery: push",
+                       "cogneva.io/readings-delivery: pull", 1))
+PY
+out="$(run "${root}" --check)" && fail "整份清单落后于渲染产物时 --check 应当非零：${out}"
+expect_red_naming "整份清单漂移" "${out}" "${censused}"
+out="$(run "${root}")" || fail "整份清单写回失败：${out}"
+cmp -s "${root}/${censused}" "${root}/deploy/rendered/k3s-single/40-daemonset-cogneva-process-census.yaml" \
+    || fail "写回之后与渲染产物不是逐字节相等"
+out="$(run "${root}" --check)" || fail "整份清单写回之后仍然红：${out}"
+expect_ok "整份清单写回后" "${out}"
+
+# ---- 6. 静态清单里根本没有这个键：不猜，直接说 ----
 root="$(case_dir no-block)"
 python3 - "${root}" <<'PY'
 import sys, pathlib
@@ -119,4 +141,4 @@ PY
 out="$(run "${root}" --check)" && fail "少了块标量时应当红：${out}"
 [[ "${out}" == *"cogneva.json"* ]] || fail "应当点名那个键：${out}"
 
-echo "SYNC STATIC TEST OK：5/5"
+echo "SYNC STATIC TEST OK：6/6"

@@ -44,7 +44,6 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: process-census
-        app.kubernetes.io/version: "0.5.10"
         # 这一格**不提供 /metrics**：读数由进程自己 POST 给网关。它声明出来，
         # 是因为「在跑的 cogneva 镜像没有抓取目标」那条告警按「有指标面就该被抓」
         # 算人口，而这一格里根本没有那个面——不声明的话，它每时每刻都在那本账上，
