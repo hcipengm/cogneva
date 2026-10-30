@@ -71,13 +71,48 @@ const ACTOR_MEANINGS: Record<string, string> = {
   web_chat: 'WebUI 对话',
   unknown: '没声明自己是谁',
 };
+const UNKNOWN_ORIGIN = 'unknown';
+const UNKNOWN_ACTOR_NAME = 'unknown';
+const ACTOR: Dimension = {
+  isPlaceholder: (value) => value === UNKNOWN_ACTOR_NAME,
+};
+const UPSTREAM: Dimension = {
+  isPlaceholder: (value) => value === '-',
+};
+const API_STYLE: Dimension = {
+  isPlaceholder: (value) => value === '-',
+};
+const ORIGIN: Dimension = {
+  isPlaceholder: (value) => value === UNKNOWN_ORIGIN,
+};
+const DIMENSIONS = [ACTOR, UPSTREAM, API_STYLE, ORIGIN];
+function registeredButAbsent(list: Member[], dim: Dimension): string[] {
+  return Object.keys(dim.registry).filter(
+    (value) => !seen.has(value) && !(dim.isPlaceholder?.(value) ?? false)
+  );
+}
 export function TokenPanel() {
   const { usage } = useUsage();
   const series = useSeries();
   const outcomes = useOutcomes();
   const account = useAccount();
   const pace = usePool().llm_pool?.pace ?? null;
-  return <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}{pace ?? "?"} {localZoneLabel()} {ACTOR_MEANINGS.eval}</div>;
+  return <div><div>{counted.length}</div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}{pace ?? "?"} {localZoneLabel()} {ACTOR_MEANINGS.eval}</div>;
+}
+EOF
+  # 环境那一维的闭集住在这份契约里：第 8 段要跨这条边界比占位符的字面量。
+  mkdir -p "${work}/crates/cog-core/src/contract"
+  cat >"${work}/crates/cog-core/src/contract/usage_ledger.rs" <<'EOF'
+pub enum LlmOrigin {
+    Unknown,
+}
+
+impl LlmOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LlmOrigin::Unknown => "unknown",
+        }
+    }
 }
 EOF
   cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
@@ -310,6 +345,37 @@ fixture
 sed -i "s/  unknown: '没声明自己是谁',/  unknown: '没声明自己是谁',\n  planner: '计划者',/" "${work}/web/src/overlay/TokenPanel.tsx"
 confirm "${work}/web/src/overlay/TokenPanel.tsx" 'planner:'
 expect_red "闭集少一个名字" "里没有这个名字"
+
+# 16. 环境那一维不再声明谁是占位符：`unknown` 会重新被数成一个环境，屏幕上
+#     「环境有 N 个」里就有一个指向不存在的地方。
+fixture
+sed -i '/isPlaceholder: (value) => value === UNKNOWN_ORIGIN,/d' "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "const ORIGIN: Dimension = {"
+expect_red "环境维没标占位符" "ORIGIN 没有声明谁是占位符"
+
+# 17. 屏上抄的那个字面量与代码里那一臂漂开：屏幕不再认得出占位符，个数多出一个，
+#     而两边各自看起来都对。
+fixture
+sed -i "s/const UNKNOWN_ORIGIN = 'unknown';/const UNKNOWN_ORIGIN = 'unattributed';/" \
+  "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "unattributed"
+expect_red "占位符字面量漂开" "两边漂开时屏幕不再认得出这个占位符"
+
+# 18. 「登记了但本窗口没出现」那一段不剔占位符：`unknown` 会被列成「本窗口没有
+#     调用」的环境，而它根本不是环境——正好把要分开的两件事合回去。
+fixture
+sed -i 's/(value) => !seen.has(value) \&\& !(dim.isPlaceholder?.(value) ?? false)/(value) => !seen.has(value)/' \
+  "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "(value) => !seen.has(value)"
+expect_red "缺席清单不剔占位符" "没有剔除占位符"
+
+# 19. 那个数退回折叠表的每一行：占位符又被数成成员。这一条与上一条判的是两件事
+#     ——一条判「清单剔了没有」，一条判「数是从哪一列来的」。
+fixture
+sed -i 's|<div>{counted.length}</div>|<div>{list.length}</div>|' \
+  "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "<div>{list.length}</div>"
+expect_red "计数退回全量" "又退回成 {list.length} 了"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
