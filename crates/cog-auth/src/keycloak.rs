@@ -111,7 +111,7 @@ impl JwksCache {
 ///
 /// 签名密钥的轮换以小时计，缓存一小时意味着最坏情况下一小时的旧 key 仍被信任；
 /// 更短则每次校验都要回源，把鉴权路径压到 Keycloak 上。
-// cap: bound
+// cap: bound — key 轮换以小时计；再短就每次校验回源、把鉴权压在 Keycloak 上
 const DEFAULT_JWKS_TTL: Duration = Duration::from_secs(3600);
 
 impl Default for JwksCache {

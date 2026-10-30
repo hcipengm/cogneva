@@ -279,7 +279,7 @@ fn memory_source(layer: &str) -> String {
 /// input is a serialized object of unbounded size, and clipping it at the
 /// write side keeps the ceiling on what the namespace holds rather than on
 /// what a reader is allowed to see.
-// cap: bound
+// cap: bound — 一段自由文本进 prompt 前保留多少字：上限落在产出侧
 const SUMMARY_MAX_CHARS: usize = 500;
 
 /// How many rows a retrieval asks the store for before it ranks them.

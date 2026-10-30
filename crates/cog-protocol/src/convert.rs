@@ -15,7 +15,7 @@ use super::wal as wal_proto;
 /// The level zstd itself calls its default. Picked so compression costs little
 /// enough to sit on the write path: the codec is buying bytes cheaply, not
 /// trading the writer's time for the smallest possible frame.
-// cap: derived
+// cap: bound — zstd 自己叫默认的那个级别，定义值
 pub const DEFAULT_ZSTD_LEVEL: i32 = 3;
 
 // ─── RawRecord ↔ raw::RawRecord conversions ───

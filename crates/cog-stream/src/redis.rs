@@ -24,7 +24,7 @@ use cog_core::{MessageBackend, MessageStream, SFError, SFResult};
 /// saturates at this page, and a saturated page is itself the finding — it
 /// means the reclaim path has stopped taking anything back, which the
 /// reported age says just as plainly.
-// cap: bound
+// cap: bound — 一页列出的超阈值条目上限；满页本身就是「回收路径不干活」的读数
 const PENDING_STATS_PAGE: usize = 1024;
 
 /// How long past its own block period a stream read may wait for a reply before
@@ -36,7 +36,7 @@ const PENDING_STATS_PAGE: usize = 1024;
 /// not tight: a read wrongly declared lost is retried, re-delivered from the
 /// pending list and counted, which is noise, while a read left to the kernel is
 /// a process that stops consuming for minutes.
-// cap: bound
+// cap: bound — 服务器承诺有答案的宽限；误判丢失的代价是重投一次的噪声
 const READ_RESPONSE_GRACE_MS: u64 = 15_000;
 
 /// Redis Streams-backed [`MessageBackend`].

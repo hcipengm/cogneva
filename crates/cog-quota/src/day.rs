@@ -11,7 +11,7 @@
 //! host's zone would move the reset hour when the process moved.
 
 /// Seconds in a UTC day.
-// cap: bound
+// cap: bound — 一个 UTC 日的秒数，定义值，不是这台机器量的
 pub const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Start of the UTC day containing `now_unix`.

@@ -12,6 +12,15 @@ use tracing::warn;
 use crate::{AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions};
 use cog_core::LlmClient as LLMProvider;
 
+/// 故障转移那一跳留多少帧给读者。
+///
+/// 观测层（`crate::observed`）在路由外面又起一跳，它转发事件时要和这一跳取同样
+/// 的容量：下游读得慢，压力应当先落在路由这一跳上，与没有观测层时一模一样。
+/// 两个 `64` 各写各的时候，这句「一样大」只是注释里的一句话——改一处就静默地
+/// 让观测变成新瓶颈。所以这里是一个常量，观测层从它取。
+// cap: bound — 一次路由留多少帧待读者取；取 64 是为了让背压先落在这一跳
+pub const ROUTING_STREAM_CAPACITY: usize = 64;
+
 /// 从我们自己写出的错误文本里取回状态码。
 ///
 /// 首字节之前从事件流里冒出来的 `Error` 事件不携带类型化原因——事件本身没有
@@ -170,7 +179,8 @@ impl RoutingProvider {
         let messages = messages.to_vec();
         let options = options.clone();
 
-        let (out_stream, mut producer) = AssistantMessageEventStream::with_capacity(64);
+        let (out_stream, mut producer) =
+            AssistantMessageEventStream::with_capacity(ROUTING_STREAM_CAPACITY);
         tokio::spawn(async move {
             let probe = RoutingProvider::new(backends, attempts as u32, retry_on_429, retry_on_402);
             let mut current = first;

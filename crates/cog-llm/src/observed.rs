@@ -14,8 +14,8 @@ use crate::observable::{global_observable, LlmObservable};
 /// 这层是旁路：它要把事件原样交给下游，又只有把流读到底才知道这一跳的结果，
 /// 所以只能自己再起一跳。容量取与路由层相同的大小——观测不该成为新的瓶颈，
 /// 下游读得慢时压力先落在路由那一跳上，与没有这层时一致。
-// cap: bound
-const FORWARD_CAPACITY: usize = 64;
+// cap: derived — 路由那一跳的容量本身；两处相等是这条旁路不成为新瓶颈的全部理由
+const FORWARD_CAPACITY: usize = crate::routing::ROUTING_STREAM_CAPACITY;
 
 pub struct ObservedLlmClient {
     inner: Arc<dyn LlmClient>,
