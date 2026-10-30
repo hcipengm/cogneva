@@ -2,9 +2,13 @@
 Description=Push cogneva backup packages to the offsite restic repository
 
 [Timer]
-# 比备份 CronJob 晚一小时：这一步推的是本机目录里已有的包，跑在包还没写出来
-# 的时候只会把上一次的再推一遍。错开分钟数，不和整点的备份抢磁盘。
-OnCalendar=*-*-* 02:17:00
+# 时刻是算出来的，不是写的：备份作业的排期、时区与它的两个界都在
+# deploy/helm/cogneva/values.yaml 里，install-backup-offsite.sh 把它们读出来，
+# 换成「备份最晚可能跑完的那一刻」的宿主本地时刻填进 @ON_CALENDAR@。
+# 为什么必须这样：这一步推的是本机目录里已有的包，跑在包还没写出来的时候只会把
+# 上一次的再推一遍，而推成功是绿的——前一天写死的 02:17 是照着 03:17 排的，
+# 可那个 03:17 是 UTC（= 本地 11:17），于是每天的推都早于当天那份包九个多小时。
+OnCalendar=@ON_CALENDAR@
 Persistent=true
 RandomizedDelaySec=300
 AccuracySec=60

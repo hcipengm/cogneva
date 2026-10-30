@@ -20,9 +20,9 @@
 # 脚本直接判红——它写出来的排期进不了这张比较表，那正是这条门要防的洞。
 #
 # 判据是「同一周期的两个 timer 的**排期分钟集合**不相交」，不是全部 timer 两两不相交：
-# 周期不同的两个撞一分钟，重叠被粗的那一拍封顶（现在唯一一处是每日 02:17 的异地备份与
-# 每小时第 17 分的序列检查，各一次、都是几乎不占资源的活）；周期相同的两个撞一分钟则是
-# **每一拍**都撞。
+# 周期不同的两个撞一分钟，重叠被粗的那一拍封顶（每日一拍的异地备份撞上半小时一拍的序列
+# 检查就是这一类：一天一次、两边都几乎不占资源）；周期相同的两个撞一分钟则是**每一拍**
+# 都撞，一年下来撞成常态。
 #
 # 判的是排期时刻，不是 RandomizedDelaySec 铺开的窗口：窗口重叠由那个延迟本身封顶（这里
 # 最大 300 秒），而这几个单元该退让的地方已经写死在单元里（回收器 Nice=19、idle IO）。
@@ -91,10 +91,16 @@ add_timer() { # <timer 文件> <来源：安装脚本名或 static>
     rows+="${parsed}"$'\t'"${name}"$'\t'"${source}"$'\n'
 }
 
-# 一路：签入的静态单元。
+# 一路：签入的静态单元。带占位符的那些（排期要由安装脚本从账本里算出来）在这里读不到
+# 时刻，先记下名字，等二路渲染完再要求它出现过——否则一份模板没人渲染，就悄悄漏出表外。
 static_count=0
+templated=""
 for f in "${repo}"/deploy/systemd/*.timer; do
     [ -e "${f}" ] || continue
+    if grep -q '@ON_CALENDAR@' "${f}"; then
+        templated+="$(basename "${f}" .timer)"$'\n'
+        continue
+    fi
     add_timer "${f}" "deploy/systemd"
     static_count=$((static_count + 1))
 done
@@ -126,6 +132,14 @@ for script in "${repo}"/deploy/scripts/install-*.sh; do
     fi
 done
 [ "${installers}" -gt 0 ] || fail "一个 install-*.sh 都没找到：枚举本身坏了，这条门会一直绿"
+
+# 带占位符的静态单元必须被某个安装脚本渲染出来，否则它既不在静态那一路、也不在渲染
+# 那一路——「排期读不到」会退回成「不在表里」，而那正是这条门被加进来之前的样子。
+while read -r tname; do
+    [ -n "${tname}" ] || continue
+    printf '%s' "${rows}" | grep -qF "$(printf '\t%s\t' "${tname}")" \
+        || fail "deploy/systemd/${tname}.timer 是模板，却没有任何可渲染的安装脚本写出它：它的排期不在比较表里"
+done <<<"${templated}"
 
 # 覆盖面的自证：至少要把三份 30 分钟一拍的定时任务与静态单元都收上来。数字不钉死
 # 「应当是几」，只判「比静态单元多出来的那些安装脚本确实被读到了」。
