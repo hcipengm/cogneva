@@ -1,6 +1,7 @@
 import { useState } from 'react';
-import { getTokenAccount, getTokenOutcomes, getTokenUsage, getTokenUsageSeries, type ActorUsage } from '@/api/client';
+import { getTokenAccount, getTokenOutcomes, getTokenUsage, getTokenUsageSeries, type ActorUsage, type LlmPaceView } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
+import { useServices } from '@/shell/context';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { SpendBars } from '@/observability/SpendBars';
@@ -32,6 +33,12 @@ import { percentOf } from '@/topology/format';
  * 写者（网关不再由任何中间件扣减它），画出来会是一个永远是 0 的「今日已用」。
  * 花销的真账只有右边这条——网关计量后落进 `gateway_llm_usage`、再由整点折叠
  * 落进 `cog_llm_usage_rollup`。
+ *
+ * 「额度窗」那一节不是那根进度条，别把两者混为一谈。它记的是**上游配额窗**
+ * 自己的账：上游不公布额度，网关能算的是「上一个窗烧穿之前它服务了多少」，
+ * 把那份实测容量按窗长摊平就是此刻允许的量。花销面只答「花了多少」，答不出
+ * 「这一窗允许多少、还剩多少、什么时候换窗」——而订阅制的上游没有单价可乘，
+ * 这三格就是成本读数本身。没有量过整窗时它显式说「没有读数」，绝不是零额度。
  */
 export function TokenView() {
   const [hours, setHours] = useState(24);
@@ -101,6 +108,8 @@ export function TokenView() {
           服务端只答它折过的窗口，最长 7 天
         </span>
       </div>
+
+      <AllowanceWindow />
 
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">累计</h2>
@@ -448,4 +457,148 @@ function compact(value: number): string {
   if (value >= 100_000_000) return `${(value / 100_000_000).toFixed(1)}亿`;
   if (value >= 10_000) return `${(value / 10_000).toFixed(1)}万`;
   return value.toLocaleString();
+}
+
+/** 秒数说成人话：窗长常常是 30 天，写成 2592000 秒没人会去换算。 */
+function spanOf(secs: number): string {
+  if (secs <= 0) return '未报';
+  if (secs % 86_400 === 0) return `${secs / 86_400} 天`;
+  if (secs % 3_600 === 0) return `${secs / 3_600} 小时`;
+  if (secs % 60 === 0) return `${secs / 60} 分钟`;
+  return `${secs} 秒`;
+}
+
+/**
+ * 上游配额窗的账：这一窗允许多少、花出去多少、什么时候换窗、池子此刻能不能供。
+ *
+ * 这一节读的是集群概况里的池快照，不是花销三读的那本折叠账：额度不是花销的
+ * 另一种画法，它是花销的上界，而那个上界只存在于持有凭证的网关的内存里，按
+ * TTL 发布到共享键值面。四种状态要分得开，界面上各有一句话：
+ *
+ * - 没有快照：写者没发布过，不能说池子健康；
+ * - 有快照但没配速：还没有上游在一个窗里被拒过，没有容量可算，不是额度为 0；
+ * - 有配速：允许量、已花、差额、一个整活的预留、窗长与窗尾；
+ * - 池不可用：带上游自己说的复位时刻，以及我方下一次去探测的时刻。
+ *
+ * 允许量是**摊平**后的量，不是官方剩余额度：上游不公布额度，这个数是「上个窗
+ * 烧穿前它服务了多少 token」按窗长线性摊到此刻。差额为负不是错误，它表示这一段
+ * 花得比摊平位置快，池子会把新的整活压到下一窗再发。
+ */
+function AllowanceWindow() {
+  const { overview } = useServices();
+  const pool = overview.data?.llm_pool ?? null;
+  const pace: LlmPaceView | null = pool?.pace ?? null;
+  const remaining = pace ? pace.allowance_tokens - pace.spent_tokens : 0;
+  const windowEnd =
+    pace?.window_start_at && pace.window_secs > 0
+      ? new Date(new Date(pace.window_start_at).getTime() + pace.window_secs * 1000).toISOString()
+      : null;
+
+  return (
+    <section className="border-b border-[var(--line)]">
+      <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+        额度窗
+        <span className="ml-2 normal-case tracking-normal opacity-70">
+          当刻读数，不随上面的窗口变
+        </span>
+      </h2>
+      {overview.error ? (
+        <ReadError what="上游池快照" error={overview.error} onRetry={overview.refresh} />
+      ) : !overview.data ? (
+        <Loading what="上游池快照" />
+      ) : !pool ? (
+        <p className="px-4 pb-3 text-[11px] text-[var(--warn)]">
+          网关没有发布上游池快照——这是「没有读数」，不是「池子健康」：写者可能没起、
+          没配共享键值面，或发布的那条键已过 TTL。
+        </p>
+      ) : (
+        <Readings
+          from={overview}
+          source="GET /api/v1/observability/cluster-overview → llm_pool"
+          caveat="额度窗读的是持有凭证的网关发布的那份快照，不是折叠账。允许量是实测容量按窗长摊平到此刻，不是上游公布的剩余额度——上游不公布。"
+        >
+          <div className="flex flex-wrap py-2">
+            <Reading
+              label="池"
+              value={pool.available ? '可用' : '不可用'}
+              tone={pool.available ? 'ok' : 'danger'}
+              note={`${pool.pool_size - pool.unavailable_count} / ${pool.pool_size} 条此刻可供${
+                pool.min_healthy !== null ? `，声明下限 ${pool.min_healthy}` : '，未声明下限'
+              }`}
+            />
+            {pace ? (
+              <>
+                <Reading
+                  label="这一窗允许"
+                  value={compact(pace.allowance_tokens)}
+                  note={`实测容量按 ${spanOf(pace.window_secs)} 摊平到此刻`}
+                />
+                <Reading
+                  label="这一窗已花"
+                  value={compact(pace.spent_tokens)}
+                  tone={remaining < 0 ? 'warn' : 'plain'}
+                  note="同一窗内，取自台账"
+                />
+                <Reading
+                  label="差额"
+                  value={`${remaining < 0 ? '−' : ''}${compact(Math.abs(remaining))}`}
+                  tone={remaining < 0 ? 'warn' : 'plain'}
+                  note={
+                    remaining < 0
+                      ? '越过摊平位置：新的整活会被压到下一窗再发'
+                      : '离摊平位置还剩这么多'
+                  }
+                />
+                <Reading
+                  label="一个整活"
+                  value={compact(pace.reserve_tokens)}
+                  note={
+                    pace.reserve_population > 0
+                      ? `测自 ${pace.reserve_population} 个已完成的活`
+                      : '最近没有可测的整活，预留量按 0 算'
+                  }
+                />
+                <Reading
+                  label="窗长"
+                  value={spanOf(pace.window_secs)}
+                  note={`${pace.measured_upstreams} 条上游的实测窗合成这一读`}
+                />
+                <Reading
+                  label="窗起点"
+                  value={pace.window_start_at ? <Moment iso={pace.window_start_at} /> : '未报'}
+                />
+                <Reading
+                  label="窗尾"
+                  value={windowEnd ? <Moment iso={windowEnd} /> : '未报'}
+                  note="窗尾即下一窗开始，允许量从这里重新摊"
+                />
+              </>
+            ) : (
+              <Reading
+                label="额度"
+                value="还没有量过整窗"
+                tone="warn"
+                note="上游第一次以「这一窗用完了」拒绝之前没有容量可算——这不是额度为 0"
+              />
+            )}
+            <Reading
+              label="上游自述复位"
+              value={pool.recovery_at ? <Moment iso={pool.recovery_at} /> : '上游没说'}
+              note={pool.quota_window_secs > 0 ? `嫌疑上游声明的窗长 ${spanOf(pool.quota_window_secs)}` : undefined}
+            />
+            <Reading
+              label="下次探测"
+              value={pool.next_attempt_at ? <Moment iso={pool.next_attempt_at} /> : '无嫌疑上游'}
+              note="我方重试的节拍，不是上游的承诺"
+            />
+            <Reading
+              label="最后答话"
+              value={pool.last_served_at ? <Moment iso={pool.last_served_at} /> : '这代进程没见过'}
+              note="写快照的那个进程最后一次看见上游真的答话"
+            />
+          </div>
+        </Readings>
+      )}
+    </section>
+  );
 }

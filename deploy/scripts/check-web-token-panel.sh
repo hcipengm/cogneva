@@ -181,6 +181,34 @@ for ROUTE, FETCHER, RANGE_FIELDS in READS:
         else:
             summary.append(f"{FETCHER}: " + ", ".join(f"{s[0]} ← {s[1]}" for s in readers))
 
+# ── 5. 额度窗 ──
+# 上面四条读的都是「花了多少」。没有一条答得出「这一窗允许多少、还剩多少、什么
+# 时候换窗」，而订阅制的上游没有单价可乘，这三格就是成本读数本身。那份账在持有
+# 凭证的网关发布的上游池快照里（`cluster-overview` 的 `llm_pool.pace`），花销那一
+# 屏必须把它读出来——它可以整块消失而上面四条全绿：路由在、类型在、`tsc` 绿，
+# 屏上却没有任何一处说过额度。
+#
+# 判据与上面同形，只是问的是字段而不是路由：调用逐窗口那一读的屏（含渲染出来的
+# 调用方的组件）里，必须出现 `llm_pool` 与 `pace` 两个字段名。缺 `pace` 是最坏的
+# 那种缺——快照照样读、池子照样显示「可用」，而「这一窗还剩多少」无声地没了。
+for rel in sorted(graph):
+    # `client.ts` 里那一行是它自己的声明，不是调用点：把它算成消费者，可达性会
+    # 从「谁调用了这一读」变成「谁 import 了 client」，于是整棵树都成了那一屏。
+    if rel == CLIENT or not re.search(r"\bgetTokenUsageSeries\s*\(", read(rel)):
+        continue
+    readers = [s for s in screens if imported_by([s[0]], rel)]
+    screen_files = {s[0] for s in readers} | {rel}
+    shown = "".join(read(f) for f in screen_files)
+    missing = [f for f in ("llm_pool", "pace") if f not in shown]
+    if missing:
+        problems.append(
+            f"{rel}: 花销这一屏（{', '.join(sorted(screen_files))}）没有读上游额度窗"
+            f"（缺 {', '.join(missing)}）——花销面只答「花了多少」，答不出还需不需要省着花、"
+            "什么时候换窗"
+        )
+    else:
+        summary.append("额度窗: " + ", ".join(sorted(screen_files)))
+
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
 

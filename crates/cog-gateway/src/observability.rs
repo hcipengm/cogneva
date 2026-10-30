@@ -166,6 +166,50 @@ pub struct LlmPoolView {
     /// process: a freshly started writer reports nothing, which is "no
     /// evidence yet" rather than "nothing has served".
     pub last_served_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// What the current window has allowed and what has been spent against it,
+    /// when at least one upstream has a measured window. `None` is "nothing
+    /// measured yet", never a window allowing nothing.
+    pub pace: Option<LlmPaceView>,
+}
+
+/// The quota window's own account: how much it allowed, how much went out.
+///
+/// The spend faces answer "how much was spent". None of them can answer "how
+/// much was there to spend", and on a deployment whose upstreams are
+/// subscription plans there is no price to multiply by tokens — the window's
+/// measured capacity is the whole of the cost statement. Without this, a
+/// window that is nearly gone and a window that is barely touched read the
+/// same on every other face, because the tokens spent are the only number any
+/// of them carries.
+///
+/// Every figure here comes from an observation, not from a published quota:
+/// nothing upstream tells us its limit, so the capacity is what it served
+/// before it refused the window as spent, and the allowance is that capacity
+/// spread linearly over the window's length. `window_start_at` is when the
+/// current window began — its end is `window_start_at + window_secs`, left to
+/// the reader so the wire carries no second copy of arithmetic.
+#[derive(Debug, Serialize)]
+pub struct LlmPaceView {
+    /// How many upstreams' measured windows went into these numbers. The
+    /// allowance is the sum across them, so a reading measured on one member
+    /// out of several is a smaller allowance, not a broken one.
+    pub measured_upstreams: usize,
+    /// Tokens the current window allows by now, summed over those upstreams.
+    pub allowance_tokens: u64,
+    /// Tokens the current window has served, as the ledger counted them.
+    pub spent_tokens: u64,
+    /// Tokens one whole job takes, measured over finished jobs; `0` when no
+    /// job has finished recently enough to be measured.
+    pub reserve_tokens: u64,
+    /// How many finished jobs the reserve was measured over. `0` means the
+    /// reserve has no population behind it, and a number measured over five
+    /// jobs is not the same claim as one measured over five hundred.
+    pub reserve_population: u64,
+    /// How long the window is, as the upstream stated it, seconds.
+    pub window_secs: u64,
+    /// When the current window started. Absent in a snapshot that is not
+    /// paced, where the field reads zero.
+    pub window_start_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 fn instant(unix: i64) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -173,6 +217,47 @@ fn instant(unix: i64) -> Option<chrono::DateTime<chrono::Utc>> {
         return None;
     }
     chrono::DateTime::from_timestamp(unix, 0)
+}
+
+/// The snapshot's allowance account, or `None` when no window was measured.
+///
+/// The zero case is why this is an `Option` rather than a struct of zeros: a
+/// payload with no measured window carries `measured_upstreams == 0` and every
+/// amount at zero, and a face that published those would say the window allows
+/// nothing — the opposite of "we have not measured anything", and enough to
+/// make a reader believe the quota is spent.
+fn pace_view(pace: &cog_core::LlmWindowPace) -> Option<LlmPaceView> {
+    if pace.measured_upstreams == 0 {
+        return None;
+    }
+    Some(LlmPaceView {
+        measured_upstreams: pace.measured_upstreams,
+        allowance_tokens: pace.allowance_tokens,
+        spent_tokens: pace.spent_tokens,
+        reserve_tokens: pace.reserve_tokens,
+        reserve_population: pace.reserve_population,
+        window_secs: pace.window_secs,
+        window_start_at: instant(pace.window_start_unix),
+    })
+}
+
+/// Project a pool snapshot onto the reading the business plane gets.
+///
+/// One function so the two readers that will exist cannot disagree: the route
+/// reads it now, and anything that later reuses the snapshot reads the same
+/// projection rather than reshuffling the fields itself.
+fn pool_view(status: &cog_core::LlmPoolStatus) -> LlmPoolView {
+    LlmPoolView {
+        available: !status.unavailable,
+        pool_size: status.pool_size,
+        min_healthy: status.declared_min_healthy,
+        unavailable_count: status.unavailable_upstreams.len(),
+        quota_window_secs: status.quota_window_secs,
+        recovery_at: instant(status.evidenced_recovery_unix),
+        next_attempt_at: instant(status.next_attempt_unix),
+        last_served_at: instant(status.last_success_unix),
+        pace: pace_view(&status.pace),
+    }
 }
 
 /// Read the pool snapshot the credential-holding gateway publishes.
@@ -195,16 +280,7 @@ async fn llm_pool_view(state: &GatewayState) -> Option<LlmPoolView> {
             tracing::warn!(error = %e, "the LLM pool snapshot did not parse");
         })
         .ok()?;
-    Some(LlmPoolView {
-        available: !status.unavailable,
-        pool_size: status.pool_size,
-        min_healthy: status.declared_min_healthy,
-        unavailable_count: status.unavailable_upstreams.len(),
-        quota_window_secs: status.quota_window_secs,
-        recovery_at: instant(status.evidenced_recovery_unix),
-        next_attempt_at: instant(status.next_attempt_unix),
-        last_served_at: instant(status.last_success_unix),
-    })
+    Some(pool_view(&status))
 }
 
 // ─── Squad State ───
@@ -1492,5 +1568,72 @@ mod tests {
 
         assert_eq!(agent_event_level(&dead_frame), "error");
         assert_eq!(agent_event_level(&failed_frame), "error");
+    }
+
+    /// 池子读出来的那一面要带上额度窗的账：允许了多少、花出去多少。
+    ///
+    /// 这一条测的是「账真的上了线」：快照里 `pace` 已经有了，投影一旦丢掉
+    /// 它，花销面就只剩「花了多少」，答不出「这一窗还有多少可用」——而对
+    /// 订阅制的上游来说，后者才是唯一存在的成本读数。
+    #[test]
+    fn a_measured_window_reaches_the_reading_with_its_allowance_and_its_spend() {
+        let status = cog_core::LlmPoolStatus {
+            unavailable: false,
+            evidenced_recovery_unix: 0,
+            next_attempt_unix: 0,
+            unavailable_upstreams: Vec::new(),
+            pool_size: 2,
+            declared_min_healthy: None,
+            quota_window_secs: 2_592_000,
+            upstream_evidence: Vec::new(),
+            last_success_unix: 0,
+            pace: cog_core::LlmWindowPace {
+                measured_upstreams: 2,
+                allowance_tokens: 16_620_054,
+                spent_tokens: 4_000_000,
+                reserve_tokens: 358_943,
+                reserve_population: 533,
+                window_secs: 2_592_000,
+                window_start_unix: 1_793_028_477,
+            },
+        };
+        let wire = serde_json::to_value(pool_view(&status)).expect("the view serializes");
+        let pace = &wire["pace"];
+        assert_eq!(pace["measured_upstreams"], 2);
+        assert_eq!(pace["allowance_tokens"], 16_620_054);
+        assert_eq!(pace["spent_tokens"], 4_000_000);
+        assert_eq!(
+            pace["reserve_population"], 533,
+            "预留量测自几个整活，要跟着预留量一起走"
+        );
+        let start: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(pace["window_start_at"].clone()).expect("一个时刻");
+        assert_eq!(
+            Some(start),
+            chrono::DateTime::from_timestamp(1_793_028_477, 0),
+            "窗口起点是读者算出「这一窗还有多久」的唯一依据"
+        );
+    }
+
+    /// 没量过整窗时，额度那一格必须是「没有读数」，不是「额度为 0」。
+    ///
+    /// 两者在界面上差一个词，在含义上差一个结论：零额度会让读者以为配额已
+    /// 经用光、池子本该停摆，而真相是这台进程还没有见过一个烧穿的窗口。
+    #[test]
+    fn a_pool_that_has_measured_no_window_reports_no_reading_not_a_zero_allowance() {
+        let status = cog_core::LlmPoolStatus {
+            unavailable: false,
+            evidenced_recovery_unix: 0,
+            next_attempt_unix: 0,
+            unavailable_upstreams: Vec::new(),
+            pool_size: 2,
+            declared_min_healthy: None,
+            quota_window_secs: 0,
+            upstream_evidence: Vec::new(),
+            last_success_unix: 0,
+            pace: cog_core::LlmWindowPace::default(),
+        };
+        let wire = serde_json::to_value(pool_view(&status)).expect("the view serializes");
+        assert!(wire["pace"].is_null(), "没有量过就是没有读数：{wire}");
     }
 }

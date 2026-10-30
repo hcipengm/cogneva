@@ -170,6 +170,33 @@ export interface LlmPoolView {
   next_attempt_at: string | null;
   /** 写它的那个进程最后一次看见上游真的答话的时刻。 */
   last_served_at: string | null;
+  /**
+   * 这一窗的额度账：允许了多少、花出去多少。null 是「还没有量过一整个窗」，
+   * 不是「额度为零」——后者读起来是配额已经用光，和事实正相反。
+   */
+  pace: LlmPaceView | null;
+}
+
+/**
+ * 上游配额窗的账。上游不公布额度，这里的每个数都来自一次观测：烧穿一个窗
+ * 之前它服务了多少 token，就是那个窗的实测容量，而当刻允许量是把这份容量
+ * 按窗长摊平后走到的位置。
+ */
+export interface LlmPaceView {
+  /** 这个读数由几条上游的实测窗合成；允许量是它们的和。 */
+  measured_upstreams: number;
+  /** 此刻这一窗允许的量，按窗长摊平。 */
+  allowance_tokens: number;
+  /** 此刻这一窗已经服务出去的量，取自台账。 */
+  spent_tokens: number;
+  /** 一个整活要多少 token，测自已完成的活；0 表示最近没有可测的活。 */
+  reserve_tokens: number;
+  /** 预留量测自几个整活。0 表示这份预留背后没有样本。 */
+  reserve_population: number;
+  /** 窗长（秒），上游自己说的。 */
+  window_secs: number;
+  /** 这一窗的起点；没有配速时是 null。窗尾 = 起点 + 窗长。 */
+  window_start_at: string | null;
 }
 
 export async function login(
