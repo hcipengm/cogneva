@@ -1185,3 +1185,50 @@ async fn e2e_token_usage_reports_unconfigured_and_sits_behind_auth() {
 
     app.shutdown.trigger();
 }
+
+/// 逐笔账本那两条读面（结局、决定不花）同样是「答不出来就说答不出来」：
+/// 账本没接上时必须是一次明确的失败，而不是一张空表。空表的形状与「这段一次
+/// 都没尝试」「这段什么都没省」完全一样，而那正是这两条读面为了区分而存在的
+/// 两种情况——一条读面在自己的写者缺席时把另一个答案交出去，比没有这条读面更糟。
+#[tokio::test]
+async fn e2e_ledger_backed_token_faces_report_unconfigured_and_sit_behind_auth() {
+    let Some(app) = spawn_app(false, None).await else {
+        return;
+    };
+
+    let token = app.bearer_token().await;
+    for route in [
+        "/api/v1/observability/token-usage/outcomes",
+        "/api/v1/observability/token-usage/account",
+    ] {
+        let (status, json) = req_oneshot(
+            app.state.clone(),
+            "GET",
+            route,
+            Body::empty(),
+            Some(token.clone()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{route}: an unconfigured ledger is a service that cannot answer, not an empty range"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("not configured"),
+            "{route}: the error names the cause, got: {json}"
+        );
+
+        let (status, _) = req_oneshot(app.state.clone(), "GET", route, Body::empty(), None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{route}: the route must sit behind auth, not beside it"
+        );
+    }
+
+    app.shutdown.trigger();
+}
