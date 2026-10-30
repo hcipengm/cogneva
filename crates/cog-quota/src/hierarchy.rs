@@ -28,6 +28,8 @@ use crate::{
 };
 use cog_core::KeyValueStore;
 
+// cap: bound — 一个谁都没配过的格子读到的默认日上限。它没有实测来源，也不该有：
+// 这个数只决定「没配过的格子读成什么」，决定谁被拦下的是属主为那个人声明的那一对。
 /// The daily token ceiling a scope starts with before anyone configures it.
 ///
 /// It is a bound, not a policy: enforcement on the person axis applies only to

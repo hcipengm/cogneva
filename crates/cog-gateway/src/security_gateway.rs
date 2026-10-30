@@ -2350,6 +2350,12 @@ async fn record_llm_call(
 ///
 /// 失败的尝试零用量但可见（谁在什么时候试过哪个上游，被谁拒了），成功那条仍然由
 /// `record_llm_tokens` 带着真实用量落，所以这里对 `ok` 让位，避免同一次调用两行。
+///
+/// 参数比 clippy 的线多一个不是疏忽：这一行要落的就是这八件事，而它们来自请求的两条
+/// 归属轴（`task` / `owner`）与两侧的判定（`result` / `refusal_kind`），把前四个捆成
+/// 一个结构体只是把同一组数换个地方摆。[`record_llm_call`] 在同一个位置做着同一件事，
+/// 也带着同一条允许。
+#[allow(clippy::too_many_arguments)]
 fn failed_attempt_usage(
     upstream: &LlmUpstream,
     result: UsageResult,
