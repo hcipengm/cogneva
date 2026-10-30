@@ -19,7 +19,6 @@ use serde_json::json;
 use std::sync::Arc;
 
 const SA_DIR: &str = cog_core::topology::SERVICE_ACCOUNT_DIR;
-const API_BASE: &str = "https://kubernetes.default.svc";
 /// 上游池条目：JSON 数组，每元素 {api_style, base_url, model, api_key}。
 /// 它住带外片——这个键只被安全网关读，放内部片等于铺给持那一份的每个业务 Pod
 /// （那份是整对象 get）。键位表与归属见 `secret_layout`。
@@ -845,8 +844,46 @@ fn apiserver_denies_ownership(status: u16) -> bool {
 /// Minimal in-cluster Kubernetes API client (service account token + CA).
 pub(crate) struct KubeClient {
     http: reqwest::Client,
+    /// The apiserver's own address, `https://<host>:<port>`, as this pod was
+    /// handed it -- see [`api_base`].
+    base: String,
     token: String,
     namespace: String,
+}
+
+/// The apiserver's address as this container was handed it.
+///
+/// Kubernetes injects `KUBERNETES_SERVICE_HOST` and `KUBERNETES_SERVICE_PORT`
+/// into every pod, beside the service-account directory this client already
+/// reads. The service DNS name is a convention about that address: it is only
+/// right while the cluster's DNS is reachable and keeps its standard name, so
+/// it is the fallback for a pod that was somehow started without the two
+/// variables rather than the answer.
+fn api_base() -> String {
+    api_base_from(
+        std::env::var("KUBERNETES_SERVICE_HOST").ok().as_deref(),
+        std::env::var("KUBERNETES_SERVICE_PORT").ok().as_deref(),
+    )
+}
+
+/// [`api_base`] on the two values alone, so the address can be judged without
+/// a cluster: the environment is read once, at the edge.
+fn api_base_from(host: Option<&str>, port: Option<&str>) -> String {
+    let host = host.map(str::trim).filter(|h| !h.is_empty());
+    let Some(host) = host else {
+        return "https://kubernetes.default.svc".to_string();
+    };
+    let port = port
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("443");
+    // A bare IPv6 address has to be bracketed to stay one host in a URL.
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    format!("https://{host}:{port}")
 }
 
 impl KubeClient {
@@ -867,6 +904,7 @@ impl KubeClient {
             .map_err(|e| format!("HTTP 客户端构建失败: {e}"))?;
         Ok(Self {
             http,
+            base: api_base(),
             token,
             namespace,
         })
@@ -876,7 +914,7 @@ impl KubeClient {
     pub(crate) async fn get_json(&self, path: &str) -> Result<serde_json::Value, String> {
         let resp = self
             .http
-            .get(format!("{API_BASE}{path}"))
+            .get(format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -912,7 +950,7 @@ impl KubeClient {
     pub(crate) async fn can_get(&self, path: &str) -> Result<bool, String> {
         let resp = self
             .http
-            .get(format!("{API_BASE}{path}"))
+            .get(format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .send()
             .await
@@ -933,7 +971,7 @@ impl KubeClient {
     ) -> Result<serde_json::Value, String> {
         let resp = self
             .http
-            .post(format!("{API_BASE}{path}"))
+            .post(format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .json(&body)
             .send()
@@ -950,7 +988,7 @@ impl KubeClient {
     pub(crate) async fn patch(&self, path: &str, body: serde_json::Value) -> Result<(), String> {
         let resp = self
             .http
-            .patch(format!("{API_BASE}{path}"))
+            .patch(format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .header(
                 reqwest::header::CONTENT_TYPE,
@@ -985,7 +1023,8 @@ impl KubeClient {
         let resp = self
             .http
             .get(format!(
-                "{API_BASE}{}",
+                "{}{}",
+                self.base,
                 crate::secret_layout::oob_secret_api_path(&self.namespace)
             ))
             .bearer_auth(&self.token)
@@ -1050,9 +1089,40 @@ impl KubeClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        apiserver_denies_ownership, classify_probe, classify_temperature_probe,
+        api_base_from, apiserver_denies_ownership, classify_probe, classify_temperature_probe,
         classify_usage_probe, detect_api_style, protocol_probe_url, ApiStyleProbe, ProbeOutcome,
     };
+
+    /// apiserver 的地址来自这个 Pod 拿到的两个变量，而不是一个写死的服务名。
+    ///
+    /// 写死的 `kubernetes.default.svc` 只在集群 DNS 可达、且保持这个标准名时成立；
+    /// 两个变量是 apiserver 自己的地址，kubelet 注入到每个 Pod 里，在改过 DNS 域名的
+    /// 集群上仍然对。这条钉的是「读得到就用它」，以及 IPv6 与缺端口两种形状。
+    #[test]
+    fn the_apiserver_address_comes_from_what_the_pod_was_handed() {
+        assert_eq!(
+            api_base_from(Some("10.43.0.1"), Some("443")),
+            "https://10.43.0.1:443"
+        );
+        // 端口没给时按 https 的默认端口，而不是拼出一个没有端口的地址。
+        assert_eq!(
+            api_base_from(Some("10.43.0.1"), None),
+            "https://10.43.0.1:443"
+        );
+        // IPv6 的裸地址要加方括号，否则 URL 里一个地址会被读成两段。
+        assert_eq!(
+            api_base_from(Some("fd00::1"), Some("6443")),
+            "https://[fd00::1]:6443"
+        );
+        // 两个变量都没有（比如被手工重启进了一个没有注入的环境）：退回服务名，
+        // 那是唯一一个还能指的地址。
+        assert_eq!(api_base_from(None, None), "https://kubernetes.default.svc");
+        assert_eq!(
+            api_base_from(Some("  "), Some("443")),
+            "https://kubernetes.default.svc",
+            "空白不是一个地址"
+        );
+    }
 
     /// 向导里每个预设的 base_url，拼出来必须是各家文档给出的那个端点。
     ///
