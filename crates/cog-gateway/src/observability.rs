@@ -543,23 +543,20 @@ pub async fn token_account_handler(
         .ok_or_else(|| ApiError::internal("token usage ledger not configured"))?;
     let until = chrono::Utc::now();
     let since = usage_since(q.hours, until);
-    // Both halves are read even when the first one fails to answer: a savings
-    // ledger that cannot be read and a verdict face that can are two different
-    // repairs, and collapsing them into one error would name neither.
+    // A read that fails is a failure, not an empty list. Both halves answer with
+    // "no line" for a state that has a meaning -- nothing was saved, or no
+    // window was judged -- and those meanings are exactly what this face exists
+    // to distinguish from a silent zero. Degrading a failed read to an empty
+    // list would make the platform assert one of them on no evidence, and the
+    // caller would have no way to tell.
     let skips = ledger
         .skips_between(since, until)
         .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "saved-call read failed; the account shows no savings");
-            Vec::new()
-        });
+        .map_err(|e| ApiError::internal(format!("failed to read the recorded savings: {e}")))?;
     let verdicts = ledger
         .verdicts_between(since, until)
         .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "verdict read failed; the account shows no judgements");
-            Vec::new()
-        });
+        .map_err(|e| ApiError::internal(format!("failed to read the window verdicts: {e}")))?;
     Ok(Json(account_response(since, until, skips, verdicts)))
 }
 
