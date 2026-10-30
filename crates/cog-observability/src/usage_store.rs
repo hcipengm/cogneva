@@ -960,6 +960,50 @@ impl LlmUsageStore {
         Ok(row.get::<i64, _>("tokens").max(0) as u64)
     }
 
+    /// How the calls in `[since, until)` ended, one line per `(result,
+    /// refusal_kind)`, ordered so two reads of the same range compare line for
+    /// line after the biggest line.
+    ///
+    /// This is read off the per-call ledger, not the rollup, and that is the
+    /// whole point: the fold answers "how many calls failed", the verdict
+    /// columns answer "because of what". A range whose every attempt was
+    /// refused before leaving the process lands a row here for each kind,
+    /// which is what separates a dead pool from an idle one — on every other
+    /// face both read as zero tokens.
+    ///
+    /// `refusal_kind` is coalesced to the empty string: a row that was not
+    /// refused has no kind, and a NULL that reaches a reader as `"null"` is
+    /// one more refusal reason nobody declared.
+    pub async fn outcomes_between(
+        &self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<cog_core::OutcomeCount>> {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT result,
+                   COALESCE(refusal_kind, '') AS refusal_kind,
+                   COUNT(*)::BIGINT AS calls
+            FROM {LEDGER_TABLE}
+            WHERE ts >= $1 AND ts < $2
+            GROUP BY result, COALESCE(refusal_kind, '')
+            ORDER BY COUNT(*) DESC, result, COALESCE(refusal_kind, '')
+            "#
+        ))
+        .bind(since)
+        .bind(until)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| cog_core::OutcomeCount {
+                result: r.get("result"),
+                refusal_kind: r.get("refusal_kind"),
+                calls: r.get("calls"),
+            })
+            .collect())
+    }
+
     /// Whether a job has already put anything on the wire under this identity.
     ///
     /// This is the only question that turns "a task is running" into a reading,
@@ -1277,6 +1321,16 @@ impl LlmUsageStore {
     /// outside the scanned range and drops out of the sums. The other order
     /// would let the sums cover a window the endpoints do not name — the
     /// half-covered answer this range exists to make visible.
+    ///
+    /// Combinations with no call anywhere in the range are left out
+    /// (`HAVING SUM(calls) > 0`). The fold lands a zero row for every
+    /// combination the ledger has ever seen, so that "folded but idle" stays
+    /// distinguishable from "not folded" — a fact about *one window*. Summed
+    /// over a range those rows become every caller that has ever run, most of
+    /// which did nothing in this range, and a reader that counts the distinct
+    /// actors, origins, upstreams or protocols in the answer gets the idle ones
+    /// counted as present. A combination that called and failed keeps its row:
+    /// `calls` counts attempts, so a refused window still reads as a refusal.
     pub async fn usage_by_actor_rolled(
         &self,
         since: DateTime<Utc>,
@@ -1316,6 +1370,7 @@ impl LlmUsageStore {
              FROM {ROLLUP_TABLE} \
              WHERE window_start >= $1 AND window_end <= $2 \
              GROUP BY actor, origin, upstream, api_style \
+             HAVING SUM(calls) > 0 \
              ORDER BY (SUM(tokens_input) + SUM(tokens_output)) DESC, \
                       actor, origin, upstream, api_style"
         ))
@@ -1593,6 +1648,16 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, String> {
         LlmUsageStore::unattributed_between(self, since, until)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn outcomes_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::OutcomeCount>, String> {
+        LlmUsageStore::outcomes_between(self, since, until)
             .await
             .map_err(|e| e.to_string())
     }

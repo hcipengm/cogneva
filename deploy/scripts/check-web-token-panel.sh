@@ -21,10 +21,14 @@
 #      折叠每整点落一行，没折的区间与没花销的区间给出同一个答案（空列表）；
 #      不读端点的那一屏会把「没读到」显示成「没花钱」。
 #
-# 同一本折叠账有两个粒度，两条读面各自过一遍上面四条，谁也不替谁作证：
-#   `/token-usage`        按执行者合并——答「谁花的」；
-#   `/token-usage/series` 按窗口分行  ——答「什么时候花的」。
+# 同一本账有三条读面，每条各自过一遍上面四条，谁也不替谁作证：
+#   `/token-usage`         按执行者合并——答「谁花的」；
+#   `/token-usage/series`  按窗口分行  ——答「什么时候花的」；
+#   `/token-usage/outcomes` 每次尝试的结局——答「为什么一分没花」。
 # 只判第一条时，画时间轴的那一屏可以整块消失而门全绿：它的一条也不在被判的路径上。
+# 第三条读的是逐笔账本而不是折叠表，所以它自报的区间叫 `since`/`until`：账本没有
+# 「还没折到这里」这回事，答得出的就是它读过的。判据的形状不变——那一屏必须把
+# 它实际读到的区间显示出来，而不是把请求的区间当结果。
 #
 # 用法：bash deploy/scripts/check-web-token-panel.sh [仓库根目录]
 set -euo pipefail
@@ -43,10 +47,11 @@ CLIENT = "api/client.ts"
 ENTRY = "main.tsx"
 COVERAGE = ("covered_since", "covered_until")
 
-# 一本账的两个粒度：(请求路径, 取它的函数)。
+# 一本账的几条读面：(请求路径, 取它的函数, 那一屏必须读出来的区间字段)。
 READS = [
-    ("/api/v1/observability/token-usage", "getTokenUsage"),
-    ("/api/v1/observability/token-usage/series", "getTokenUsageSeries"),
+    ("/api/v1/observability/token-usage", "getTokenUsage", COVERAGE),
+    ("/api/v1/observability/token-usage/series", "getTokenUsageSeries", COVERAGE),
+    ("/api/v1/observability/token-usage/outcomes", "getTokenOutcomes", ("since", "until")),
 ]
 
 if not os.path.isdir(WEB):
@@ -127,7 +132,7 @@ screens = [
 problems = []
 summary = []
 
-for ROUTE, FETCHER in READS:
+for ROUTE, FETCHER, RANGE_FIELDS in READS:
     # ── 1. 路由路径与取它的函数 ──
     # 按字面量判，不按裸子串：`/token-usage` 是 `/token-usage/series` 的前缀，
     # 子串判法会让「基础读面的声明被删掉」在还留着 series 那条时照样通过。
@@ -163,11 +168,11 @@ for ROUTE, FETCHER in READS:
             continue
         screen_files = {s[0] for s in readers} | {rel}
         shown = "".join(read(f) for f in screen_files)
-        if not any(f in shown for f in COVERAGE):
+        if not any(f in shown for f in RANGE_FIELDS):
             problems.append(
-                f"{rel}: 那一屏（{', '.join(sorted(screen_files))}）没有读覆盖端点"
-                f"（{COVERAGE[0]}/{COVERAGE[1]}）——"
-                "不读端点的屏会把「这段没折叠」显示成「这期间没花销」"
+                f"{rel}: 那一屏（{', '.join(sorted(screen_files))}）没有读它实际答出的区间"
+                f"（{RANGE_FIELDS[0]}/{RANGE_FIELDS[1]}）——"
+                "不读区间的屏会把「这段没折叠」或「这段读的是别处」显示成「这期间没花销」"
             )
         else:
             summary.append(f"{FETCHER}: " + ", ".join(f"{s[0]} ← {s[1]}" for s in readers))

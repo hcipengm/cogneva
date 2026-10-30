@@ -39,6 +39,14 @@ use sqlx::{PgPool, Row};
 /// revision it may have asked for — so the calls behind one decision are one or
 /// two depending on how the loop would have ended, which nothing here can know.
 /// Multiplying by a fixed number would put a figure in the account that no
+/// measurement produced; a reader that wants calls has to say how it got there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageSkip {
+    pub stage: String,
+    pub reason: String,
+    pub skips: i64,
+}
+
 /// This store's schema, and the one a restore replays.
 pub const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS cog_llm_skip (
@@ -50,14 +58,6 @@ CREATE TABLE IF NOT EXISTS cog_llm_skip (
 ;
 CREATE INDEX IF NOT EXISTS idx_cog_llm_skip_ts ON cog_llm_skip (ts);
 "#;
-
-/// measurement produced; a reader that wants calls has to say how it got there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StageSkip {
-    pub stage: String,
-    pub reason: String,
-    pub skips: i64,
-}
 
 /// PostgreSQL store for the saved-call ledger.
 #[derive(Clone)]

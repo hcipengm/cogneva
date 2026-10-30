@@ -626,6 +626,36 @@ export async function getTokenUsageSeries(hours?: number): Promise<UsageSeries> 
   return api.get<UsageSeries>(`/api/v1/observability/token-usage/series${query}`);
 }
 
+/** 一次调用是怎么结束的：`ok`／`error`／`refused_by_*`。 */
+export interface OutcomeLine {
+  result: string;
+  /** 更细的拒绝理由（如 `quota_cycle`）；不是拒绝的行这里是空串 */
+  refusal_kind: string;
+  calls: number;
+}
+
+/**
+ * 一段窗口里每次调用是怎么结束的，连同这次读实际用了哪个区间。
+ *
+ * 这个读法存在是因为花销面答不了「为什么一分没花」：空闲的池子与熔断开着的
+ * 池子在上面每一个读数里都是 0。这里读的是逐笔账本（不是折叠表），所以：
+ * 呼叫在离开进程前就被拒的那些行也在里面，只不过它们的 token 是 0。
+ *
+ * 与折叠面不同，这里回的是**请求的那个区间本身**——账本没有「还没折到这里」
+ * 这回事，答得出的就是它读过的。
+ */
+export interface TokenOutcomes {
+  since: string;
+  until: string;
+  outcomes: OutcomeLine[];
+}
+
+/** 过去 `hours` 小时各执行者的调用结局分布；`hours=0` 是整本账。 */
+export async function getTokenOutcomes(hours?: number): Promise<TokenOutcomes> {
+  const query = hours === undefined ? '' : `?hours=${hours}`;
+  return api.get<TokenOutcomes>(`/api/v1/observability/token-usage/outcomes${query}`);
+}
+
 // ── 活跃告警（内存事件 + 耐久表合并） ──
 
 /** 一条正在 firing 的告警。 */

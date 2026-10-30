@@ -311,6 +311,27 @@ pub struct StoredWindow {
     pub declared_reset_unix: Option<i64>,
 }
 
+/// How the calls in one range ended, one line per `(result, refusal_kind)`.
+///
+/// The spend report says "these tokens, by this actor"; it cannot say why a
+/// range has no tokens at all, because a call that was refused before it left
+/// the process still lands a row and that row carries its own verdict. Reading
+/// the verdicts back is what turns a flat zero — an idle pool and a pool whose
+/// circuit is open look identical on every other face — into a sentence.
+///
+/// `refusal_kind` is empty for rows that were not refused (`ok`, `error`); it
+/// is carried rather than folded into `result` because two refusals with
+/// different kinds want different repairs, and a count that merges them names
+/// no one to fix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutcomeCount {
+    /// `ok` / `error` / `refused_by_*`, as written by the meter.
+    pub result: String,
+    /// The narrower reason a refusal names, or empty.
+    pub refusal_kind: String,
+    pub calls: i64,
+}
+
 /// The writing and window-reading face of the spend ledger.
 ///
 /// Separate from the reporting face ([`crate::LlmUsageReader`]) because the two
@@ -396,6 +417,24 @@ pub trait LlmUsageLedger: Send + Sync {
         since: chrono::DateTime<chrono::Utc>,
         until: chrono::DateTime<chrono::Utc>,
     ) -> Result<u64, String>;
+
+    /// How the calls in `[since, until)` ended, grouped by `(result,
+    /// refusal_kind)`.
+    ///
+    /// Answered from the per-call ledger rather than from the rollup: the fold
+    /// keeps `calls` and `failed_calls`, which say *that* calls failed, and the
+    /// verdict that says *why* is a column the fold does not carry. A range
+    /// with zero successful calls is exactly when that column is worth reading,
+    /// so the read is allowed to scan the ledger — it is bounded by the range,
+    /// not by the table.
+    ///
+    /// An empty answer means no call was attempted in the range, which is not
+    /// the same as "every call succeeded": that comes back as one `ok` line.
+    async fn outcomes_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<OutcomeCount>, String>;
 }
 
 /// A process's analytics sink: fire-and-forget events, one call per event.

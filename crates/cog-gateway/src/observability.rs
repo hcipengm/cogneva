@@ -404,6 +404,86 @@ fn token_series_response(series: cog_core::UsageSeries) -> TokenSeriesResponse {
     }
 }
 
+// ─── Why nothing was spent ───
+
+/// Query parameters for [`token_outcomes_handler`].
+///
+/// Same trailing window as the spend reads, and the same `hours <= 0` reading:
+/// the whole ledger. That is answerable here because the response is one line
+/// per verdict kind, not one line per window — so "everything" stays a handful
+/// of rows no matter how far back the ledger goes.
+#[derive(Debug, Deserialize)]
+pub struct TokenOutcomesQuery {
+    #[serde(default = "default_usage_hours")]
+    pub hours: i64,
+}
+
+/// One line of the verdict breakdown.
+#[derive(Debug, Serialize)]
+pub struct OutcomeLine {
+    /// `ok` / `error` / `refused_by_*`.
+    pub result: String,
+    /// The narrower reason a refusal names, empty when the row was not refused.
+    pub refusal_kind: String,
+    pub calls: i64,
+}
+
+/// How the calls in a range ended, with the range that was actually read.
+///
+/// This is the face a flat zero needs. Every other reading on the token page
+/// answers "how much"; when the answer is nothing, the only useful question is
+/// whether the platform was idle or whether every attempt was turned away
+/// before it could spend — and those two look identical on a spend face.
+#[derive(Debug, Serialize)]
+pub struct TokenOutcomesResponse {
+    pub since: String,
+    pub until: String,
+    pub outcomes: Vec<OutcomeLine>,
+}
+
+/// How the calls in the trailing window ended, per `(result, refusal_kind)`.
+pub async fn token_outcomes_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<TokenOutcomesQuery>,
+) -> Result<Json<TokenOutcomesResponse>, ApiError> {
+    let ledger = state
+        .llm_usage
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("token usage ledger not configured"))?;
+    let until = chrono::Utc::now();
+    let since = usage_since(q.hours, until);
+    let outcomes = ledger
+        .outcomes_between(since, until)
+        .await
+        .map_err(|e| ApiError::internal(format!("failed to read call outcomes: {e}")))?;
+    Ok(Json(outcomes_response(since, until, outcomes)))
+}
+
+/// Project the verdict breakdown onto the response face.
+///
+/// The range is echoed because this read is from the ledger and answers exactly
+/// the range it was given: unlike the folded faces there is no coverage to
+/// discover, so restating the window is honest here — and a reader that asked
+/// for `hours=0` can see the epoch it really started from.
+fn outcomes_response(
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+    outcomes: Vec<cog_core::OutcomeCount>,
+) -> TokenOutcomesResponse {
+    TokenOutcomesResponse {
+        since: since.to_rfc3339(),
+        until: until.to_rfc3339(),
+        outcomes: outcomes
+            .into_iter()
+            .map(|row| OutcomeLine {
+                result: row.result,
+                refusal_kind: row.refusal_kind,
+                calls: row.calls,
+            })
+            .collect(),
+    }
+}
+
 // ─── Task Metrics ───
 
 pub async fn task_metrics_handler(
@@ -976,6 +1056,49 @@ mod tests {
             "the handler builds the response itself; the range it echoes would be its own request \
              window, which is not the range the rollup answered for"
         );
+    }
+
+    /// 结局分布不能把两种拒绝合成一行：`refused_by_circuit` 与
+    /// `error` 各有自己的修法，而 `refusal_kind` 是它们各自唯一的细分。
+    ///
+    /// 这条测的是投影：分区在 SQL 里做，但投影一旦把 `refusal_kind` 丢掉，
+    /// 两行会显示成同一件事，读数面就再也说不出「哪一种」。
+    #[test]
+    fn the_outcome_projection_keeps_the_kind_that_tells_two_refusals_apart() {
+        let until = chrono::DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
+            .expect("a fixed instant")
+            .with_timezone(&chrono::Utc);
+        let since = until - chrono::Duration::hours(6);
+        let response = outcomes_response(
+            since,
+            until,
+            vec![
+                cog_core::OutcomeCount {
+                    result: "error".into(),
+                    refusal_kind: "quota_cycle".into(),
+                    calls: 3,
+                },
+                cog_core::OutcomeCount {
+                    result: "error".into(),
+                    refusal_kind: "entitlement".into(),
+                    calls: 1,
+                },
+            ],
+        );
+        let wire = serde_json::to_value(&response).expect("the response serializes");
+        assert_eq!(
+            response.since,
+            since.to_rfc3339(),
+            "this read answers the range it was given, so it echoes it"
+        );
+        assert_eq!(response.until, until.to_rfc3339());
+        assert_eq!(
+            wire["outcomes"].as_array().map(|a| a.len()),
+            Some(2),
+            "two kinds of the same result stay two lines"
+        );
+        assert_eq!(wire["outcomes"][0]["refusal_kind"], "quota_cycle");
+        assert_eq!(wire["outcomes"][1]["refusal_kind"], "entitlement");
     }
 
     fn spend_row(

@@ -1,3 +1,4 @@
+import { useState, type KeyboardEvent } from 'react';
 import type { WindowSpend } from '@/api/client';
 
 /**
@@ -5,11 +6,15 @@ import type { WindowSpend } from '@/api/client';
  *
  * 这张图只回答一个问题——「什么时候烧的」。输入 / 输出各占多少不在这里分开画：
  * 两支相邻的颜色在深色底上差异很小，而这条图的价值是把尖峰挑出来；拆分放在
- * 悬停提示和下面的表里，那里有地方写清楚。一列一个窗口，没有第二根纵轴。
+ * 下面的读数行和表里，那里有地方写清楚。一列一个窗口，没有第二根纵轴。
  *
  * 没有折叠行的窗口画成虚线的空格，不画成零高的柱：折叠表里缺一格要么是那一
  * 小时没人用，要么是还没折到这里，两者在图上都是空，而零高的柱会把后者说成
  * 前者。缺口是这段图里唯一用虚线的形状，图例就写在标题里。
+ *
+ * 悬停读数不用浏览器原生的 `title`：那个提示长得像文字，却是浏览器自己画的一层，
+ * 选不中也复制不了，而这一格的全部用处就是让人把数字拿走。所以读数落在页面里的
+ * 一行上——悬停换、点一下钉住、文字可选、右边还给一个「复制」。
  */
 export function SpendBars({
   rows,
@@ -20,6 +25,10 @@ export function SpendBars({
   since: string | null;
   until: string | null;
 }) {
+  // 这两个状态得在提前返回之前备好：柱为零时组件仍然返回一段说明，hooks 却
+  // 不能因为数据形状不同而少调。
+  const [hovered, setHovered] = useState<string | null>(null);
+  const [pinned, setPinned] = useState<string | null>(null);
   const base = buildSlots(rows);
   if (base.slots.length === 0) {
     return (
@@ -32,6 +41,10 @@ export function SpendBars({
 
   const { slots: display, size } = bucket(base.slots, MAX_BARS);
   const peak = Math.max(...display.map((slot) => slot.input + slot.output), 0);
+  // 悬停优先于钉住：钉住是为了腾出手去选中，所以指针一旦移到别的柱上，读数
+  // 必须跟着走，否则用户看到的是上一次钉住的那一格在想什么。
+  const active = display.find((slot) => slot.key === (hovered ?? pinned)) ?? null;
+  const isPinned = active !== null && hovered === null;
 
   return (
     <div className="flex flex-col gap-2 px-4 py-3">
@@ -50,13 +63,34 @@ export function SpendBars({
       <div className="flex h-24 items-end gap-[2px] border-b border-[var(--line)]">
         {display.map((slot) => {
           const total = slot.input + slot.output;
+          const selected = active?.key === slot.key;
+          const handlers = {
+            onMouseEnter: () => setHovered(slot.key),
+            onMouseLeave: () => setHovered(null),
+            onFocus: () => setHovered(slot.key),
+            onBlur: () => setHovered(null),
+            onClick: () => setPinned((held) => (held === slot.key ? null : slot.key)),
+            onKeyDown: (event: KeyboardEvent) => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                setPinned((held) => (held === slot.key ? null : slot.key));
+              }
+            },
+            tabIndex: 0,
+            role: 'button' as const,
+            'aria-pressed': pinned === slot.key,
+            'aria-label': describe(slot),
+          };
           if (slot.missing === slot.windows) {
             return (
               <div
                 key={slot.key}
-                title={`${stamp(slot.at)}：这一格没有折叠行（没人用，或还没折到这里）`}
-                className="flex-1 self-stretch border-x border-dashed border-[var(--line)]"
-                style={{ minWidth: 1 }}
+                {...handlers}
+                className="flex-1 self-stretch border-x border-dashed outline-none"
+                style={{
+                  minWidth: 1,
+                  borderColor: selected ? 'var(--brass)' : 'var(--line)',
+                }}
               />
             );
           }
@@ -65,13 +99,14 @@ export function SpendBars({
           return (
             <div
               key={slot.key}
-              title={describe(slot)}
-              className="flex-1 transition-colors"
+              {...handlers}
+              className="flex-1 transition-colors outline-none"
               style={{
                 height: `${height}%`,
                 minWidth: 1,
                 background: slot.failed > 0 && total === 0 ? 'var(--danger)' : 'var(--brass-dim)',
                 borderRadius: '4px 4px 0 0',
+                boxShadow: selected ? '0 0 0 2px var(--brass)' : undefined,
               }}
             />
           );
@@ -82,6 +117,121 @@ export function SpendBars({
         <span>{stamp(display[0].at)}</span>
         <span>{stamp(display[display.length - 1].end)}</span>
       </div>
+
+      <SlotReading
+        key={active?.key ?? 'none'}
+        slot={active}
+        pinned={isPinned}
+        onClear={() => setPinned(null)}
+      />
+    </div>
+  );
+}
+
+/**
+ * 悬停 / 钉住那一格的读数。
+ *
+ * 这一段是页面上真正「可以拿走」的东西：数字是 DOM 里的文字，选得中、复制得了，
+ * 右边还有一个按钮把整格一次性放进剪贴板。复制出去的是不带千分位的原值——
+ * 屏幕上的逗号是给人读的，进了表格或计算就是噪声。
+ */
+function SlotReading({
+  slot,
+  pinned,
+  onClear,
+}: {
+  slot: Slot | null;
+  pinned: boolean;
+  onClear: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  if (!slot) {
+    return (
+      <p className="text-[11px] text-[var(--muted)]">
+        把指针放到柱子上，这一格的读数落在这里；点一下把它钉住，文字就能选中复制。
+      </p>
+    );
+  }
+  const total = slot.input + slot.output;
+  const rows: { label: string; shown: string; raw: string }[] = [
+    { label: '合计 token', shown: total.toLocaleString(), raw: String(total) },
+    { label: '输入', shown: slot.input.toLocaleString(), raw: String(slot.input) },
+    { label: '输出', shown: slot.output.toLocaleString(), raw: String(slot.output) },
+    { label: '缓存', shown: slot.cached.toLocaleString(), raw: String(slot.cached) },
+    { label: '调用', shown: slot.calls.toLocaleString(), raw: String(slot.calls) },
+    {
+      label: '失败',
+      shown: slot.failed.toLocaleString(),
+      raw: String(slot.failed),
+    },
+    {
+      label: '折叠覆盖',
+      shown: `${slot.windows - slot.missing}/${slot.windows} 格`,
+      raw: `${slot.windows - slot.missing}/${slot.windows}`,
+    },
+  ];
+  const copy = () => {
+    const text = [
+      `${stamp(slot.at)} – ${stamp(slot.end)}`,
+      ...rows.map((row) => `${row.label.replace(' token', '')}: ${row.raw}`),
+      ...(slot.top.length > 0
+        ? [`主要: ${slot.top.map((entry) => `${entry.actor}=${entry.tokens}`).join(' ')}`]
+        : []),
+    ].join('\n');
+    void navigator.clipboard?.writeText(text).then(() => {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    });
+  };
+  return (
+    <div
+      className="flex flex-col gap-1 border border-[var(--line)] px-3 py-2 text-[11px]"
+      style={{ userSelect: 'text' }}
+    >
+      <div className="flex items-baseline justify-between gap-3">
+        <span className="mono text-[var(--paper-dim)]">
+          {stamp(slot.at)} – {stamp(slot.end)}
+        </span>
+        <span className="flex items-center gap-2">
+          {pinned && <span className="text-[var(--muted)]">已钉住</span>}
+          {pinned && (
+            <button
+              type="button"
+              onClick={onClear}
+              className="text-[var(--muted)] underline decoration-dotted hover:text-[var(--paper)]"
+            >
+              取消
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={copy}
+            className="mono px-1.5 py-0.5 text-[10px]"
+            style={{ border: '1px solid var(--line)', color: 'var(--paper-dim)' }}
+          >
+            {copied ? '已复制' : '复制'}
+          </button>
+        </span>
+      </div>
+      <div className="flex flex-wrap gap-x-4 gap-y-0.5">
+        {rows.map((row) => (
+          <span key={row.label} className="whitespace-nowrap">
+            <span className="text-[var(--muted)]">{row.label} </span>
+            <span className="mono text-[var(--paper)]">{row.shown}</span>
+          </span>
+        ))}
+      </div>
+      {slot.top.length > 0 && (
+        <div className="text-[var(--muted)]">
+          主要花在{' '}
+          {slot.top.map((entry, index) => (
+            <span key={entry.actor} className="mono">
+              {index > 0 && ' · '}
+              <span className="text-[var(--paper-dim)]">{entry.actor}</span> {entry.tokens.toLocaleString()}
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

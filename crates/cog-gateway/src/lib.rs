@@ -1188,6 +1188,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/observability/token-usage/series",
             get(observability::token_series_handler),
         )
+        // 花销为零时唯一还有信息量的那一读：同一段窗口里每次调用是怎么结束的。
+        // 它读的是逐笔账本而不是折叠表——折叠只留「失败了几次」，说不出为什么。
+        .route(
+            "/api/v1/observability/token-usage/outcomes",
+            get(observability::token_outcomes_handler),
+        )
         .route(
             "/api/v1/tasks/{id}/logs",
             get(observability::task_logs_handler),
@@ -2431,23 +2437,28 @@ struct QuotaLimitsPayload {
 
 /// 认不出的层级名是 400，不是某一级：把它读成用户级就会把一个人的上限
 /// 写到所有人身上。报错里点名这一版认识的几个名字。
-fn parse_quota_scope(raw: &str) -> Result<cog_core::QuotaScope, Response> {
+///
+/// 错误按 `Box` 上抛：一个已经铺开的响应体在栈上超过一百字节，按值穿过
+/// 每一层只是把它搬几次；分配只发生在出错那一支，正当路径一次都不付。
+fn parse_quota_scope(raw: &str) -> Result<cog_core::QuotaScope, Box<Response>> {
     cog_core::QuotaScope::parse(raw).ok_or_else(|| {
         let declared: Vec<&str> = cog_core::QuotaScope::cascade_order()
             .iter()
             .map(|scope| scope.as_str())
             .collect();
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "unknown_quota_scope",
-                "message": format!(
-                    "unknown quota scope {raw:?}; declared scopes are {}",
-                    declared.join(", ")
-                ),
-            })),
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "unknown_quota_scope",
+                    "message": format!(
+                        "unknown quota scope {raw:?}; declared scopes are {}",
+                        declared.join(", ")
+                    ),
+                })),
+            )
+                .into_response(),
         )
-            .into_response()
     })
 }
 
@@ -2470,11 +2481,11 @@ async fn quota_limits_body(
     hierarchy: &std::sync::Arc<dyn cog_core::HierarchyManager>,
     scope: cog_core::QuotaScope,
     target_id: &str,
-) -> Result<QuotaLimitsResponse, Response> {
+) -> Result<QuotaLimitsResponse, Box<Response>> {
     let limits = hierarchy
         .limits(scope, target_id)
         .await
-        .map_err(|e| quota_read_error(e.to_string()))?;
+        .map_err(|e| Box::new(quota_read_error(e.to_string())))?;
     let ctx = quota_context_for(scope, target_id);
     let decision = hierarchy.check(&ctx, 0).await;
     let status = decision.scopes.first();
@@ -2520,11 +2531,11 @@ async fn quota_limits_handler(
     };
     let scope = match parse_quota_scope(&scope) {
         Ok(scope) => scope,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     match quota_limits_body(hierarchy, scope, &target_id).await {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -2541,7 +2552,7 @@ async fn quota_set_limits_handler(
     };
     let scope = match parse_quota_scope(&scope) {
         Ok(scope) => scope,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let limits = cog_core::QuotaLimits::new(payload.soft_limit, payload.hard_limit);
     if let Err(e) = hierarchy.set_limits(scope, &target_id, limits).await {
@@ -2554,7 +2565,7 @@ async fn quota_set_limits_handler(
     }
     match quota_limits_body(hierarchy, scope, &target_id).await {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -2569,7 +2580,7 @@ async fn quota_clear_limits_handler(
     };
     let scope = match parse_quota_scope(&scope) {
         Ok(scope) => scope,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     if let Err(e) = hierarchy.clear_limits(scope, &target_id).await {
         tracing::warn!("Quota limits clear failed: {}", e);
@@ -2581,7 +2592,7 @@ async fn quota_clear_limits_handler(
     }
     match quota_limits_body(hierarchy, scope, &target_id).await {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 

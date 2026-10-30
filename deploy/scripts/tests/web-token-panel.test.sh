@@ -40,30 +40,38 @@ export default function App() {
 }
 EOF
   cat >"${work}/web/src/overlay/TokenPanel.tsx" <<'EOF'
-import { useUsage, useSeries } from '@/hooks/useUsage';
+import { useUsage, useSeries, useOutcomes } from '@/hooks/useUsage';
 export function TokenPanel() {
   const { usage } = useUsage();
   const series = useSeries();
-  return <div>{usage?.covered_since}{series?.covered_until}</div>;
+  const outcomes = useOutcomes();
+  return <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}</div>;
 }
 EOF
   cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
-import { getTokenUsage, getTokenUsageSeries } from '@/api/client';
+import { getTokenUsage, getTokenUsageSeries, getTokenOutcomes } from '@/api/client';
 export function useUsage() {
   return getTokenUsage(24);
 }
 export function useSeries() {
   return getTokenUsageSeries(24);
 }
+export function useOutcomes() {
+  return getTokenOutcomes(24);
+}
 EOF
   cat >"${work}/web/src/api/client.ts" <<'EOF'
 export const PATH = '/api/v1/observability/token-usage';
 export const SERIES = '/api/v1/observability/token-usage/series';
+export const OUTCOMES = '/api/v1/observability/token-usage/outcomes';
 export async function getTokenUsage(hours: number) {
   return fetch(`${PATH}?hours=${hours}`);
 }
 export async function getTokenUsageSeries(hours: number) {
   return fetch(`${SERIES}?hours=${hours}`);
+}
+export async function getTokenOutcomes(hours: number) {
+  return fetch(`${OUTCOMES}?hours=${hours}`);
 }
 EOF
 }
@@ -123,11 +131,11 @@ EOF
 confirm "${work}/web/src/App.tsx" "return <div />"
 expect_red "只 import 不渲染" "没有一格渲染出来的组件用到它"
 
-# 4. 剪掉覆盖端点（两条读面那两格都拿掉：任何一处读到它都会让这一门绿）。
+# 4. 剪掉区间字段（三条读面那几格都拿掉：任何一处读到它都会让这一门绿）。
 fixture
-sed -i 's/{usage?.covered_since}{series?.covered_until}/花销/' "${work}/web/src/overlay/TokenPanel.tsx"
+sed -i 's/{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}/花销/' "${work}/web/src/overlay/TokenPanel.tsx"
 confirm "${work}/web/src/overlay/TokenPanel.tsx" "花销"
-expect_red "没读覆盖端点" "没有读覆盖端点"
+expect_red "没读区间字段" "没有读它实际答出的区间"
 
 # 5. 调用点挪到一个没人 import 的文件里：不可达的调用点不算消费者。
 fixture
@@ -156,16 +164,37 @@ expect_red "入口不接任何东西" "没有活的外部消费者"
 #    而第一条读面一律绿。这一条判的是「两条各判一遍」这件事本身。
 fixture
 cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
-import { getTokenUsage } from '@/api/client';
+import { getTokenUsage, getTokenOutcomes } from '@/api/client';
 export function useUsage() {
   return getTokenUsage(24);
 }
 export function useSeries() {
   return null;
 }
+export function useOutcomes() {
+  return getTokenOutcomes(24);
+}
 EOF
 confirm "${work}/web/src/hooks/useUsage.ts" "return null"
 expect_red "只剩第一条读面" "getTokenUsageSeries"
+
+# 8. 结局那一条读面被剪掉，另外两条还在：花销面会一直显示「没花多少」，
+#    而「为什么没花」那一块可以整块消失。这一条判的是第三条读面各判一遍。
+fixture
+cat >"${work}/web/src/hooks/useUsage.ts" <<'EOF'
+import { getTokenUsage, getTokenUsageSeries } from '@/api/client';
+export function useUsage() {
+  return getTokenUsage(24);
+}
+export function useSeries() {
+  return getTokenUsageSeries(24);
+}
+export function useOutcomes() {
+  return null;
+}
+EOF
+confirm "${work}/web/src/hooks/useUsage.ts" "return null"
+expect_red "只剩前两条读面" "getTokenOutcomes"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0

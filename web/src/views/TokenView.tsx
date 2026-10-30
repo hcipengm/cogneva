@@ -1,9 +1,11 @@
 import { useState } from 'react';
-import { getTokenUsage, getTokenUsageSeries, type ActorUsage } from '@/api/client';
+import { getTokenOutcomes, getTokenUsage, getTokenUsageSeries, type ActorUsage } from '@/api/client';
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { SpendBars } from '@/observability/SpendBars';
+import { DimensionCounts } from '@/observability/DimensionCounts';
+import { OutcomeBreakdown } from '@/observability/OutcomeBreakdown';
 import { TokenShare } from '@/observability/TokenShare';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { percentOf } from '@/topology/format';
@@ -14,6 +16,11 @@ import { percentOf } from '@/topology/format';
  * 上半页读折叠账按窗口分行的那一面，答「什么时候烧的」；下半页读同一本账
  * 按执行者合并的那一面，答「谁烧的」。两问都要从折叠表来，不能合成一个读数：
  * 合计抹掉尖峰，逐窗口看不出总量。
+ *
+ * 中间还有一读从**逐笔账本**取：每次尝试的结局。它存在的原因只有一个——
+ * 折叠面答不出「为什么一分没花」。被熔断挡回来的调用没有被发出去，也就没有
+ * 花销，和一段没人用模型的区间在每个花销读数上都是同一个零；只有结局分布
+ * 能把「池子空着」和「池子死了」分开。
  *
  * 这一面故意不给「预算用了多少」那根进度条：平台里逐用户的每日额度账没有
  * 写者（网关不再由任何中间件扣减它），画出来会是一个永远是 0 的「今日已用」。
@@ -28,20 +35,23 @@ export function TokenView() {
   // 重问一次没有意义——一个只在增长的总数，问得越勤只让同一个数字重复出现——所以
   // 它按 5 分钟重读，也不跟 `turn_end` 一起刷新。
   const cumulative = useResource('累计花销（整本折叠账）', () => getTokenUsage(0), 300_000);
+  // 这一读从逐笔账本取，答的是「每次尝试怎么结束的」。它和上面两读同窗不同源：
+  // 折叠表只留「失败了几次」，说不出一分没花是因为池子空着还是熔断开着。
+  const outcomes = useResource(`调用结局（${hours} 小时）`, () => getTokenOutcomes(hours), 60_000);
   // 这本账的写者是一轮话、一次运行：`turn_end` 与 `agent_end` 就是那一笔落账的时刻。
   // 整点折叠改的是同一本账的另一个粒度，落在 observability 前缀下。
   useKindTickedRefresh(
     ['usage', resourceKey('observability')],
-    [series.refresh, usage.refresh]
+    [series.refresh, usage.refresh, outcomes.refresh]
   );
 
   const rows = series.data?.rows ?? [];
   const actors = usage.data?.actors ?? [];
   const sum = (pick: (row: (typeof rows)[number]) => number) => rows.reduce((total, row) => total + pick(row), 0);
   const failed = sum((row) => row.failed_calls);
-  // 命中率只在协议内算：`input` 在 OpenAI 兼容面已含缓存命中，在 Anthropic 面两者不相交，
-  // 所以分母取 `input + cached`，而两种协议仍然分行列出——把两条线并成一个百分比，
-  // 就是让一个协议的分母去解释另一个协议的分子。
+  // 命中率只在协议内算，而且分母逐协议不同：`input` 在 OpenAI 兼容面已含缓存命中，
+  // 分母就是它；Anthropic 面上两者不相交，分母是二者之和。两种协议分行列出——
+  // 把两条线并成一个百分比，就是让一个协议的分母去解释另一个协议的分子。
   const byStyle = styleCells(rows);
   const cumulativeActors = cumulative.data?.actors ?? [];
   const cumulativeSum = (pick: (actor: ActorUsage) => number) =>
@@ -186,7 +196,7 @@ export function TokenView() {
                 <Reading
                   label="窗口格数"
                   value={new Set(rows.map((row) => row.window_start)).size}
-                  note={`${new Set(rows.map((row) => `${row.actor}|${row.api_style}`)).size} 个执行者 × 协议`}
+                  note={`${new Set(rows.map((row) => `${row.actor}|${row.api_style}`)).size} 个「执行者 · 协议」组合`}
                 />
               </div>
             </Readings>
@@ -196,6 +206,23 @@ export function TokenView() {
               until={series.data.covered_until}
             />
           </>
+        )}
+      </section>
+
+      <section className="border-b border-[var(--line)]">
+        <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">调用结局</h2>
+        {outcomes.error ? (
+          <ReadError what="调用结局" error={outcomes.error} onRetry={outcomes.refresh} />
+        ) : !outcomes.data ? (
+          <Loading what="调用结局" />
+        ) : (
+          <Readings
+            from={outcomes}
+            source={`GET /api/v1/observability/token-usage/outcomes?hours=${hours}`}
+            caveat="这一读取逐笔账本，不是折叠表：折叠只留「失败了几次」，说不出被谁挡下来。区间是它实际读的那一段，不是请求的那一段。"
+          >
+            <OutcomeBreakdown data={outcomes.data} />
+          </Readings>
         )}
       </section>
 
@@ -215,26 +242,9 @@ export function TokenView() {
             <Readings
               from={usage}
               source={`GET /api/v1/observability/token-usage?hours=${hours}`}
-              caveat="和上面的柱是同源两次读：两次之间正好折了一个窗口，就会只出现在一边。这里是把窗口加起来，所以它答不出尖峰。"
+              caveat="和上面的柱是同源两次读：两次之间正好折了一个窗口，就会只出现在一边。这里是把窗口加起来，所以它答不出尖峰。四个计数都点得开，个数就是清单长度——它们来自同一批行，不会一个说十几个、一个只列得出十个。"
             >
-              <div className="flex flex-wrap py-2">
-                <Reading label="执行者" value={new Set(actors.map((actor) => actor.actor)).size} />
-                <Reading
-                  label="上游"
-                  value={new Set(actors.map((actor) => actor.upstream)).size}
-                  note={[...new Set(actors.map((actor) => actor.upstream))].join(' · ') || '—'}
-                />
-                <Reading
-                  label="协议"
-                  value={new Set(actors.map((actor) => actor.api_style)).size}
-                  note={[...new Set(actors.map((actor) => actor.api_style))].join(' · ') || '—'}
-                />
-                <Reading
-                  label="环境"
-                  value={new Set(actors.map((actor) => actor.origin)).size}
-                  note={[...new Set(actors.map((actor) => actor.origin))].join(' · ') || '—'}
-                />
-              </div>
+              <DimensionCounts actors={actors} />
             </Readings>
             <TokenShare actors={actors} />
             <Table
@@ -245,9 +255,16 @@ export function TokenView() {
                 { key: 'origin', title: '环境', width: '140px', render: (a) => (
                   <span className="text-[11px] text-[var(--muted)]">{a.origin}</span>
                 ) },
-                { key: 'upstream', title: '上游', width: '150px', render: (a) => (
-                  <span className="mono text-[11px] text-[var(--muted)]">{a.upstream}</span>
-                ) },
+                { key: 'upstream', title: '上游', width: '150px', render: (a) => {
+                  // 账上记的是「地址|模型」两件事挤在一格；这里把模型露出来，地址留在
+                  // 悬停里。`-` 不是某个上游，是一次都没发出去的请求。
+                  const up = splitUpstream(a.upstream);
+                  return (
+                    <span className="mono text-[11px] text-[var(--muted)]" title={up.base}>
+                      <span style={{ color: up.missing ? 'var(--warn)' : 'var(--paper-dim)' }}>{up.model}</span>
+                    </span>
+                  );
+                } },
                 { key: 'style', title: '协议', width: '110px', render: (a) => (
                   <span className="text-[11px]">{a.api_style}</span>
                 ) },
@@ -287,7 +304,9 @@ export function TokenView() {
             />
             <p className="px-4 py-2 text-[11px] text-[var(--muted)]">
               一行是「一个执行者 × 一个环境 × 一个上游 × 一种协议」，四格合起来才是唯一的一行：
-              同一个执行者换过环境就是两行。缓存占比的分母逐协议不同——OpenAI 兼容线路里
+              同一个执行者换过环境就是两行，所以行数比执行者个数多。上游那格写的是模型名，
+              指针停上去看它挂在哪条线路上；写「未发起」的行没有任何上游被尝试——请求在
+              池级熔断那一步就被拒了。缓存占比的分母逐协议不同——OpenAI 兼容线路里
               `input` 已含缓存命中，分母就是它；Anthropic 上两者不相交，分母是二者之和——
               所以这一列只在同一协议内纵向比；混着算出来的百分比，分子和分母往往不是同一段字节。
             </p>
@@ -350,6 +369,16 @@ function styleCells(
     byStyle.set(row.api_style, cell);
   }
   return byStyle;
+}
+
+/** 账上的上游是「地址|模型」；`-` 是「一个都没试」。 */
+function splitUpstream(raw: string): { model: string; base: string; missing: boolean } {
+  if (raw === '-') {
+    return { model: '未发起', base: '池级熔断拒绝：请求没有送到任何上游', missing: true };
+  }
+  const cut = raw.lastIndexOf('|');
+  if (cut < 0) return { model: raw, base: '网关没有记下模型名', missing: false };
+  return { model: raw.slice(cut + 1), base: raw.slice(0, cut), missing: false };
 }
 
 /** 大数按万/亿缩写：读的人要的是量级，不是每一位都念一遍。 */

@@ -431,3 +431,229 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
         .await
         .expect("clean up the folded probe rows");
 }
+
+/// 一段区间里一次都没调用的组合，不是这段区间的一行。
+///
+/// 折叠表给每个见过的组合在每个窗口都落一行（零调用时是零行），好让「折过、
+/// 但这一窗没人用」与「没折到这里」分得开——那是**一个窗口**的事实。把若干窗
+/// 口加起来之后，这些零行变成「历史上跑过的全部调用方」，其中绝大多数在这段
+/// 区间里什么都没干；按行数人头的人会把它们算成「在场」。两者必须分开，而分
+/// 开的地方只能是求和这一面：逐窗口那一面还要靠零行画「量过但是零」的柱。
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_summed_read_leaves_out_a_combination_the_range_never_used() {
+    let url = database_url();
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("connect to the test database");
+    let store = LlmUsageStore::connect(&url)
+        .await
+        .expect("connect the store");
+    init_schema_once(&store, &pool).await;
+
+    let run = uuid::Uuid::new_v4();
+    let actor = format!("idle-combo-test:{run}");
+    let upstream = format!("idle-combo-upstream:{run}");
+
+    let hour = hour_floor(Utc::now());
+    let w0 = RollupWindow {
+        start: hour - Duration::hours(3),
+        end: hour - Duration::hours(2),
+    };
+    let w1 = RollupWindow {
+        start: hour - Duration::hours(2),
+        end: hour - Duration::hours(1),
+    };
+
+    store
+        .record(&LlmUsageRecord {
+            upstream: upstream.clone(),
+            api_style: "openai".to_string(),
+            model: "idle-combo-model".to_string(),
+            result: "ok".to_string(),
+            actor: actor.clone(),
+            origin: "gateway_pool".to_string(),
+            tokens_input: 10,
+            tokens_output: 1,
+            tokens_cached: 0,
+            estimated_input: None,
+            refusal_kind: None,
+            retry_after_secs: None,
+            task: None,
+            latency_ms: 1,
+            pace: None,
+        })
+        .await
+        .expect("record a call");
+
+    sqlx::query("UPDATE gateway_llm_usage SET ts = $1 WHERE actor = $2")
+        .bind(w0.start + Duration::minutes(10))
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("place the call in the first window");
+
+    store
+        .rollup_windows(&[w0, w1])
+        .await
+        .expect("fold both windows");
+
+    // 前置事实：第二个窗口里这个人有一行，而且是零行。没有这一行，「这段没有他」
+    // 与「这段根本没折过」就分不开了，而下面那条断言也就成了空台词。
+    let idle = folded(&pool, &upstream, w1.start, &actor).await;
+    assert_eq!(
+        idle,
+        vec![(0, 0, 0, 0, 0)],
+        "the fold lands a zero row for a combination the window did not use"
+    );
+
+    // 只读第二个窗口：他在这段里一次都没调用，所以这里没有他的行。
+    let idle_range = store
+        .usage_by_actor_rolled(w1.start, w1.end)
+        .await
+        .expect("read the window the combination sat out");
+    assert!(
+        idle_range.rows.iter().all(|s| s.actor != actor),
+        "a combination that did nothing in the range is not a row of it, got {:?}",
+        idle_range
+            .rows
+            .iter()
+            .filter(|s| s.actor == actor)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        idle_range.covered_since == Some(w1.start) && idle_range.covered_until == Some(w1.end),
+        "the range is still reported as covered: dropping the idle row is not the same answer \
+         as having folded nothing"
+    );
+
+    // 两窗一起读：他有一行，数的是他真调用的那一次。
+    let both = store
+        .usage_by_actor_rolled(w0.start, w1.end)
+        .await
+        .expect("read both windows");
+    let line = both
+        .rows
+        .iter()
+        .find(|s| s.actor == actor)
+        .expect("a combination that did call is a row");
+    assert_eq!(
+        line.calls, 1,
+        "one call in the first window, none in the second"
+    );
+    assert_eq!(line.tokens_input, 10);
+
+    sqlx::query("DELETE FROM gateway_llm_usage WHERE actor = $1")
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("clean up the ledger probe rows");
+    sqlx::query("DELETE FROM cog_llm_usage_rollup WHERE upstream = $1")
+        .bind(&upstream)
+        .execute(&pool)
+        .await
+        .expect("clean up the folded probe rows");
+}
+
+/// 一段没有花销的区间，究竟是「没人尝试」还是「每次都被挡回来」。
+///
+/// 花销面答不出这个：被熔断挡回来的调用没有发出去、没有 token，和一段没有任何
+/// 调用的区间一样是零。区别只在结局那一列上——它记着每次尝试是怎么结束的。这条
+/// 测试要求分成因计数：把 `refusal_kind` 并从 `result` 里，`quota_cycle` 与
+/// 「没有更细成因」就会合成一行，而这两种要的修法完全不同。
+///
+/// 用的时间窗离现在足够远，别的测试不会往那里落行，所以断言可以做全集比较。
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_outcome_breakdown_keeps_the_verdict_that_explains_a_failed_range() {
+    let url = database_url();
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("connect to the test database");
+    let store = LlmUsageStore::connect(&url)
+        .await
+        .expect("connect the store");
+    init_schema_once(&store, &pool).await;
+
+    let run = uuid::Uuid::new_v4();
+    let actor = format!("outcome-test:{run}");
+    let upstream = format!("outcome-upstream:{run}");
+    let start = hour_floor(Utc::now()) - Duration::hours(1_000);
+
+    let record = |result: &str, kind: Option<&str>, tokens: u64| {
+        let store = store.clone();
+        let actor = actor.clone();
+        let upstream = upstream.clone();
+        let result = result.to_string();
+        let kind = kind.map(|k| k.to_string());
+        async move {
+            store
+                .record(&LlmUsageRecord {
+                    upstream,
+                    api_style: "openai".to_string(),
+                    model: "outcome-model".to_string(),
+                    result,
+                    actor,
+                    origin: "gateway_pool".to_string(),
+                    tokens_input: tokens,
+                    tokens_output: 0,
+                    tokens_cached: 0,
+                    estimated_input: None,
+                    refusal_kind: kind,
+                    retry_after_secs: None,
+                    task: None,
+                    latency_ms: 1,
+                    pace: None,
+                })
+                .await
+                .expect("record a call");
+        }
+    };
+    record("ok", None, 42).await;
+    record("refused_by_circuit", None, 0).await;
+    record("refused_by_circuit", None, 0).await;
+    record("error", Some("quota_cycle"), 0).await;
+
+    sqlx::query("UPDATE gateway_llm_usage SET ts = $1 WHERE actor = $2")
+        .bind(start + Duration::minutes(5))
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("place the calls in the probe window");
+
+    let outcomes = store
+        .outcomes_between(start, start + Duration::hours(1))
+        .await
+        .expect("read the outcome breakdown");
+    let lines: Vec<(String, String, i64)> = outcomes
+        .iter()
+        .map(|o| (o.result.clone(), o.refusal_kind.clone(), o.calls))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            ("refused_by_circuit".to_string(), String::new(), 2),
+            ("error".to_string(), "quota_cycle".to_string(), 1),
+            ("ok".to_string(), String::new(), 1),
+        ],
+        "the breakdown keeps the kind beside the result, biggest line first"
+    );
+
+    // 同一段区间在花销面上只有一行、而且 token 只有那一次成功的：正因为如此，
+    // 「零 token」才需要上面这张表来解释。
+    let spend = store
+        .usage_by_actor_rolled(start, start + Duration::hours(1))
+        .await
+        .expect("read the same range as spend");
+    assert_eq!(
+        spend.rows.len(),
+        0,
+        "nothing was folded for this probe window; the outcome read does not depend on the fold"
+    );
+
+    sqlx::query("DELETE FROM gateway_llm_usage WHERE actor = $1")
+        .bind(&actor)
+        .execute(&pool)
+        .await
+        .expect("clean up the ledger probe rows");
+}
