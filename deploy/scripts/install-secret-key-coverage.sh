@@ -66,7 +66,9 @@ Type=oneshot
 # --record：每一拍（绿的、红的、读不到的）都往序列里落一行。判红的那一拍也是拍子，
 # 不落的话序列上的洞会同时代表「没跑」与「跑了但红了」。
 ExecStart=${gate} --live --record
-Environment=COGNEVA_KUBECTL=sudo -n k3s kubectl
+# 引号不能省：systemd 按空格切 Environment= 的赋值，不加引号时这里会变成四个
+# 「Invalid environment assignment」，最终 KUBECTL 为空、读成「集群读不到」。
+Environment="COGNEVA_KUBECTL=sudo -n k3s kubectl"
 Environment=COGNEVA_SECRET_KEY_SERIES=${series}
 # 只读，但会去问集群；让它排在任何构建后面。
 Nice=10
