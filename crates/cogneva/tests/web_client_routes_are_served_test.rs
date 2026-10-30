@@ -61,7 +61,10 @@ fn client_paths(root: &Path) -> BTreeMap<String, BTreeSet<String>> {
     let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for path in files {
         let rel = relative_name(root, &path);
-        let text = read(&path);
+        // 注释里的路径不是一次请求。这个读法要防的是「一屏按空列表画出来」，
+        // 而注释不会发出去一次 404；把注释算进来，判据就会被一句文档说明判红，
+        // 于是修法变成改写注释，而不是补上那条路由——判据把自己的题目换掉了。
+        let text = strip_comments(&read(&path));
         let mut rest = text.as_str();
         while let Some(at) = rest.find("/api/") {
             let tail = &rest[at..];
@@ -123,6 +126,52 @@ fn every_path_the_webui_asks_for_is_one_the_gateway_serves() {
             ))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+/// 注释里写到的路径不是一次请求，所以它既不该被要求有服务端路由，也不该
+/// 让一条真的少了的路径混在噪声里被忽略。
+///
+/// 这条判据本来是把「有人会发出去」当成题目：一屏按空列表画出来与「什么都没
+/// 发生」长得一样，只有真的会走的请求才有这个后果。而一段解释文字里的
+/// `` `/api/v1/quota/...` `` 走不到任何地方——把注释算进题目，红的那一栏就会
+/// 从「缺了一条路由」变成「注释里提了一句路径」，修法也跟着变成改写注释。
+/// 消融对照：把这行 `strip_comments` 去掉，本用例红（多出 `/api/v1/quota/...`
+/// 那一项），加回来绿。
+#[test]
+fn a_path_that_only_appears_in_a_comment_is_not_a_request() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path();
+    let api = root.join("web/src/api");
+    std::fs::create_dir_all(&api).expect("dir");
+    std::fs::write(
+        api.join("client.ts"),
+        "// 网关的 `/api/v1/quota/...` 前缀\n\
+         /** 也说了一次 `/api/v1/also-a-comment` */\n\
+         export const SERVED = '/api/v1/served';\n",
+    )
+    .expect("write");
+    // 两片普查面都必须存在：`walk` 读不到目录时报的是「少了一块」，不是「空」。
+    let embedded = root.join("crates/cog-gateway/src");
+    std::fs::create_dir_all(&embedded).expect("dir");
+    std::fs::write(
+        embedded.join("page.html"),
+        "<script>api('/api/v1/served')</script>\n",
+    )
+    .expect("write");
+
+    let found = client_paths(root);
+    assert!(
+        found.contains_key("/api/v1/served"),
+        "真请求还是得读出来，剪注释不能把题目也剪掉：{found:?}"
+    );
+    assert!(
+        !found.contains_key("/api/v1/quota/..."),
+        "注释里的路径被当成了一次请求：{found:?}"
+    );
+    assert!(
+        !found.contains_key("/api/v1/also-a-comment"),
+        "块注释里的路径同样不是一次请求：{found:?}"
     );
 }
 
