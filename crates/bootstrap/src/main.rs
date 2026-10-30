@@ -2783,14 +2783,15 @@ async fn deploy_via_apply(profile: Profile, namespace: &str) -> Result<()> {
     // 而 `kubectl apply -f <目录>` 一处失败即中止整批——改过声明量的那几份卷就能
     // 把整套清单的安装一起打停。其余资源不受影响，仍整目录 apply。
     let kept = retain_existing_claims(&rendered, namespace).await?;
-    // 同类问题、另一条判据：清单把某个 env 从字面量改成 valueFrom 后，对象上那份
-    // 残留的 value 会让整批 apply 在这一处中止（理由见函数注释）。它和卷声明一样，
-    // 必须在交付前处理，改清单本身解决不了。
+    // 同类问题、另一条判据：pod 模板的 env 在 apply 时按名字合并，清单改过的两种
+    // 形状都留不下痕迹——从字面量改成 valueFrom 的那份残留 value 会让整批 apply
+    // 在这一处中止，而清单不再声明的 Secret env 会原样留在对象上、没有任何路径去删
+    // （理由见函数注释）。它和卷声明一样，必须在交付前处理，改清单本身解决不了。
     let cleared = clear_superseded_env_values_in_dir(&rendered, namespace).await?;
     if cleared > 0 {
         info!(
             count = cleared,
-            "cleared env values the manifests now inject from the Secret"
+            "cleared env the manifests no longer declare, and env values they now inject from a source"
         );
     }
     if kept > 0 {
@@ -3051,7 +3052,7 @@ async fn deploy_via_helm(profile: Profile, namespace: &str) -> Result<()> {
         if cleared > 0 {
             info!(
                 count = cleared,
-                "cleared env values the chart injects from the Secret"
+                "cleared env the chart no longer declares, and env values it now injects from a source"
             );
         }
     }
