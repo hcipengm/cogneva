@@ -10,8 +10,13 @@
 //!
 //! The answer lives on the constant, as a `// cap: derived` or `// cap: bound`
 //! line in the comment block right above it: one word for which kind of answer
-//! this is, and -- when the block carries no prose of its own -- a reason after
-//! a dash. It used to live in a table beside the code with a row per constant,
+//! this is, and a reason after a dash. The reason goes on that same line rather
+//! than in the prose above, because a block can describe a number without ever
+//! saying why it is the number it is -- `/// Default capacity for the stream.`
+//! is prose, and it answers nothing -- so a rule that accepts prose accepts a
+//! description in place of a decision.
+//!
+//! It used to live in a table beside the code with a row per constant,
 //! and that table was the same number restated twice: its `value` column was
 //! whatever the declaration said, its `note` was the doc comment above it, and
 //! only the one word was new. A restatement drifts, and it drifts in the
@@ -76,10 +81,9 @@ struct Row {
     value: String,
     /// `derived` or `bound`; empty when the constant carries no marker.
     source: String,
-    /// The reason after the dash, when the marker carries one.
+    /// The reason after the dash. Empty means the marker is a label and nothing
+    /// else, which is the thing this test exists to refuse.
     note: String,
-    /// Whether the block above carries prose of its own.
-    doc: bool,
 }
 
 /// Every `const NAME: <numeric type> = <initializer starting with a digit>;`
@@ -177,7 +181,6 @@ fn production_rows(text: &str, rel: &str) -> Vec<Row> {
         let Some(mut row) = parse_const(line, rel) else {
             continue;
         };
-        row.doc = block_above.doc;
         if let Some((source, reason)) = block_above.marker.clone() {
             row.source = source;
             row.note = reason;
@@ -197,9 +200,6 @@ fn production_rows(text: &str, rel: &str) -> Vec<Row> {
 struct Above {
     /// `(source, reason)`, when a `// cap:` line was seen in this block.
     marker: Option<(String, String)>,
-    /// Whether the block carries prose of its own, which is what makes a bare
-    /// `// cap: bound` an answer rather than a label with nothing behind it.
-    doc: bool,
 }
 
 impl Above {
@@ -217,7 +217,6 @@ impl Above {
             }
         }
         if t.starts_with("///") {
-            self.doc = true;
             return;
         }
         if t.starts_with("//") || t.starts_with("#[") || t.is_empty() {
@@ -351,7 +350,6 @@ fn parse_const(line: &str, file: &str) -> Option<Row> {
         value: value.to_string(),
         source: String::new(),
         note: String::new(),
-        doc: false,
     })
 }
 
@@ -363,25 +361,17 @@ fn parse_const(line: &str, file: &str) -> Option<Row> {
 /// whole point -- a register with an "unreviewed" slot absorbs exactly the
 /// numbers nobody decided about, and then reads green.
 ///
-/// A bare `// cap: bound` is only an answer when the block above it says why, so
-/// a marker with no reason behind it must carry the reason itself. That is what
-/// keeps this from degrading into a label every new constant gets and nobody
-/// reads.
-#[test]
-fn every_capacity_number_in_rust_says_where_it_comes_from() {
-    let root = repo_root();
-    let scanned = scan(&root, &production_sources(&root));
-    assert!(
-        scanned.len() > 100,
-        "the scan found {} constants, far below what crates/*/src holds: the walk is \
-         broken, not the tree",
-        scanned.len()
-    );
-
+/// The rows the census refuses, split by which refusal it is: no marker at all,
+/// a word outside the vocabulary, and a marker with no reason on it.
+///
+/// Split out from the test so a fixture tree can be judged by the same code the
+/// real tree is judged by -- a fixture that restated the partition would agree
+/// with the test no matter which way either one was written.
+fn refuses(rows: &[Row]) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut unmarked = Vec::new();
     let mut unknown = Vec::new();
     let mut unreasoned = Vec::new();
-    for row in &scanned {
+    for row in rows {
         if row.source.is_empty() {
             unmarked.push(format!("{}:{} = {}", row.file, row.name, row.value));
             continue;
@@ -393,18 +383,42 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
             ));
             continue;
         }
-        // A reason in the marker stands on its own; without one, the doc block
-        // above has to carry it -- which `Above` records as `doc`.
-        if row.note.is_empty() && !row.doc {
+        // The reason has to be in the marker itself. A block above can describe
+        // a number without saying why it is that number, and a description in
+        // the place of a decision is what a register of labels looks like.
+        if row.note.is_empty() {
             unreasoned.push(format!("{}:{} = {}", row.file, row.name, row.value));
         }
     }
+    (unmarked, unknown, unreasoned)
+}
+
+/// A `// cap: bound` says which kind of answer the number is; the reason after
+/// the dash says what the answer rests on. Only the second is checkable, and a
+/// block of prose above is not a substitute for it: `/// Default capacity for
+/// the stream.` describes the number and answers nothing, so a rule that takes
+/// prose takes a description in place of a decision. Requiring the reason on the
+/// marker's own line is what keeps this from degrading into a label every new
+/// constant gets and nobody reads.
+#[test]
+fn every_capacity_number_in_rust_says_where_it_comes_from() {
+    let root = repo_root();
+    let scanned = scan(&root, &production_sources(&root));
+    assert!(
+        scanned.len() > 100,
+        "the scan found {} constants, far below what crates/*/src holds: the walk is \
+         broken, not the tree",
+        scanned.len()
+    );
+
+    let (unmarked, unknown, unreasoned) = refuses(&scanned);
     assert!(
         unmarked.is_empty(),
         "these written numbers say nothing about where they come from. Put a line in \
          the block above each one -- `// cap: derived` when it follows a reading, \
-         `// cap: bound` when no measurement should move it -- and, if the block has no \
-         prose of its own, the reason after a dash:\n{}",
+         `// cap: bound` when no measurement should move it -- and the reason it \
+         rests on after a dash. The reason goes on that same line, not in the prose \
+         above: a block can describe a number without saying why it is that one:\n{}",
         unmarked.join("\n")
     );
     assert!(
@@ -414,10 +428,75 @@ fn every_capacity_number_in_rust_says_where_it_comes_from() {
     );
     assert!(
         unreasoned.is_empty(),
-        "these carry a `cap:` word with no reason anywhere above it -- a bare label is \
-         the answer a reader cannot check:\n{}",
+        "these carry a `cap:` word with no reason on it -- a bare label is the \
+         answer a reader cannot check:\n{}",
         unreasoned.join("\n")
     );
+}
+
+/// The refusal this census exists for, pinned on a tree written for the purpose.
+///
+/// It is a tree of its own rather than `crates/` because the population is at
+/// zero: a test that the real scan finds at least one bare marker would go red
+/// exactly when the work succeeds. What the fixture pins is the rule -- a marker
+/// with a prose block above it and no reason on its own line is a label, and the
+/// block saying something `about` the number does not make it an answer. The
+/// four rows around it are the ones the rule must not touch, so a version that
+/// simply refused every marker cannot pass either.
+#[test]
+fn a_marker_is_a_label_until_it_carries_its_reason() {
+    let root = std::env::temp_dir().join(format!("cog-cap-marker-{}", std::process::id()));
+    let src = root.join("crates/probe/src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("numbers.rs"),
+        r##"
+/// Default capacity for the stream.
+// cap: bound
+pub const PROSE_ONLY: usize = 256;
+
+// cap: bound
+pub const A_LABEL: usize = 8;
+
+// cap: bound — 一小时：值得归因的构建跑几十分钟，更短会把一次构建显示成一串小的
+pub const EXPLAINED: usize = 3600;
+
+pub const UNMARKED: usize = 4;
+
+// cap: 凭空捏的
+pub const INVENTED: usize = 2;
+"##,
+    )
+    .unwrap();
+    let rows = scan(&root, &sources_of_tree(&root));
+    assert_eq!(
+        rows.len(),
+        5,
+        "the fixture declares five numbers and the scan read {} of them: the walk is \
+         broken, not the fixture",
+        rows.len()
+    );
+    let (unmarked, unknown, unreasoned) = refuses(&rows);
+    assert_eq!(
+        unmarked,
+        vec!["crates/probe/src/numbers.rs:UNMARKED = 4".to_string()],
+        "a number with no marker at all went unreported"
+    );
+    assert_eq!(
+        unknown,
+        vec!["crates/probe/src/numbers.rs:INVENTED says `cap: 凭空捏的`".to_string()],
+        "a word outside the vocabulary went unreported"
+    );
+    assert_eq!(
+        unreasoned,
+        vec![
+            "crates/probe/src/numbers.rs:A_LABEL = 8".to_string(),
+            "crates/probe/src/numbers.rs:PROSE_ONLY = 256".to_string(),
+        ],
+        "a marker with no reason on it went unreported, either because the prose \
+         above counted as one or because the marker was never read"
+    );
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// The scan's two easy failures both read as green, so both are pinned: a scan
