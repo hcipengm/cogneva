@@ -54,7 +54,7 @@ pub const SANDBOX_BUILD_CACHE_LOOP: &str = "extension_build_cache_watch";
 /// The walk is metadata-only, but the tree has hundreds of thousands of entries
 /// and the pod is building into it, so a value below the shared floor buys
 /// nothing; the floor itself is applied where the interval is read.
-// cap: bound
+// cap: bound — 部署没给名字时的重扫周期
 const DEFAULT_SCAN_INTERVAL_SECS: u64 = 300;
 
 /// Bytes the cache may hold when the deployment names none.

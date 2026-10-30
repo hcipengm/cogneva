@@ -65,7 +65,7 @@ const META_DIR_NAME: &str = ".meta";
 /// Maximum task id length, keeps the on-disk directory name clear of
 /// `ENAMETOOLONG` while accommodating generated ids such as
 /// `ralph-roundtable-<uuid>`.
-// cap: bound
+// cap: bound — 目录名要躲开 ENAMETOOLONG，又要装得下生成的 id
 const MAX_TASK_ID_LEN: usize = 128;
 
 /// Headroom kept free on the volume. A cap that fills the disk leaves no room
@@ -73,13 +73,13 @@ const MAX_TASK_ID_LEN: usize = 128;
 /// the failure that produces is a command failing, not a tree being reclaimed.
 /// A percentage rather than a byte figure, so it follows whatever volume the
 /// executor is given instead of assuming one.
-// cap: bound
+// cap: bound — 上限填满磁盘就没地方让 git 写了；这个比例是默认，不是从卷量出来的
 const WORKSPACE_DISK_HEADROOM_PERCENT: u64 = 15;
 
 /// The shortest time between two reclamation passes, and the pace the loop
 /// wakes at whatever the derived interval turns out to be -- waking is cheap,
 /// a pass is not.
-// cap: bound
+// cap: bound — 两次回收之间的最短间隔，也是循环无条件醒来的节奏
 const MIN_GC_INTERVAL_SECS: u64 = 30;
 
 /// How many times a pass's own duration the interval must cover, so maintenance
@@ -87,7 +87,7 @@ const MIN_GC_INTERVAL_SECS: u64 = 30;
 /// period: the pass gets slower as the volume fills, and the interval has to
 /// follow it or the upkeep becomes the load. Shared by reclamation and the
 /// build-cache walk -- one control law, one number.
-// cap: derived
+// cap: bound — 间隔要覆盖一次回收自身耗时的这么多倍，维护至多占 1/20
 const MAINTENANCE_OVERHEAD_MULTIPLE: u64 = 20;
 
 /// The published name of the interval the reclamation loop is keeping.
@@ -98,7 +98,7 @@ const GC_INTERVAL_METRIC: &str = "sandbox_workspace_gc_interval_seconds";
 /// cost of the git round trip stops being paid for by anything. A floor rather
 /// than a period: the period itself follows how often `main` is observed to
 /// move.
-// cap: bound
+// cap: bound — 比这更密就是在向镜像要同一个 commit，比一次推送还快
 const MIN_FETCH_INTERVAL_SECS: u64 = 30;
 
 /// The published name of the wait the fetch loop is currently keeping, and the
@@ -204,7 +204,7 @@ fn ttl_from(capacity: usize, trees: usize, span_secs: u64) -> Option<Duration> {
 
 /// The shortest an idle tree is held, whatever the arithmetic says: below this
 /// the executor rebuilds trees it has just finished with.
-// cap: bound
+// cap: bound — 空闲树最少留一小时，再短执行器就在重建刚用完的树
 const MIN_TTL_SECS: u64 = 3600;
 
 /// Which of the three inputs set the period in force.

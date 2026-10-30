@@ -84,20 +84,20 @@ const DEFAULT_MAX_DOC_BYTES: usize = 8 * 1024 * 1024;
 /// is a coincidence, and coupling them would let either side drag the other whenever it
 /// is adjusted -- while the smaller side is observable (`over_ceiling` carries both
 /// numbers) rather than silently lost.
-// cap: bound
+// cap: bound — 一份满尺寸正文的上限；特意不绑审计通道的界，那是另一个进程的量
 const DEFAULT_MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 /// A listing is for a person to read and for a model to read; past a few thousand
 /// entries, both sides are only paying for it.
-// cap: bound
+// cap: bound — 过几千条之后，人和模型都只是在为这份清单付钱
 const DEFAULT_MAX_LIST_ENTRIES: usize = 5_000;
 /// A day. This gate is a person reading one plan, and a plan left unread for more than
 /// a working day is no longer the plan about to be read -- approving it then is
 /// approving something nobody looked at.
-// cap: bound
+// cap: bound — 放了一整个工作日还没人看的计划，已经不是「马上要读的那份」
 const DEFAULT_APPROVAL_TTL_SECS: u64 = 86_400;
 /// A window shorter than this is not a window: the plan could expire between being
 /// displayed and being clicked.
-// cap: bound
+// cap: bound — 比这更短的窗口不算窗口：计划可能在显示与点击之间过期
 const MIN_APPROVAL_TTL_SECS: u64 = 60;
 /// The same order of magnitude as a body: if a plan carries more text than one write is
 /// allowed to carry, then approving it does not mean what it says on the tin.

@@ -7,7 +7,7 @@ use async_trait::async_trait;
 ///
 /// 连不上通常是被网络策略挡住或对端没起，这两种都不靠等解决；10s 让调用方
 /// 快速失败，而不是卡在 SYN 重传里。
-// cap: bound
+// cap: bound — 连沙盒执行器的墙
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 use cog_core::{
     CommandEvent, CommandEventStream, SFResult, SandboxBackend, SandboxPayload, SandboxRequest,
