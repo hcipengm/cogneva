@@ -74,7 +74,7 @@ pub const PRINCIPLE_LEDGER_ROLE: &str = "principle_ledger";
 /// being maintained". Minutes rather than seconds keeps the steady state out of
 /// the log. The deployed liveness alert derives its threshold from this period
 /// (`6 * period`), so changing it changes that threshold.
-// cap: bound
+// cap: bound — 存活告警的门槛由它推出（6 × 周期）；分钟级是为了让稳态不进日志
 pub const PRINCIPLE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// What the tier census calls a row whose carrier never declared one.
@@ -90,7 +90,7 @@ const CHECK_KIND_UNDECLARED: &str = "undeclared";
 ///
 /// The round exists for one thing: to make "the account is readable, and this is
 /// how much is outstanding" a line in the log with a reading behind it.
-// cap: bound
+// cap: bound — 这一轮只为让「账读得到、还有多少没做」成为一行带读数的日志，peek 取够看就行
 const OUTSTANDING_PEEK: usize = 50;
 
 /// How many refused rows one pass publishes.
@@ -101,7 +101,7 @@ const OUTSTANDING_PEEK: usize = 50;
 /// truncate the reading by the ordering instead of by what the gates refused,
 /// and the total a reader adds up would then disagree with the account for a
 /// reason nothing on the surface states.
-// cap: bound
+// cap: bound — 截断要按「被门拒了」而不是按排序；否则读者加起来的合计会与账对不上，而面上没有一个字说原因
 const REFUSAL_ROWS_PER_PASS: usize = 1000;
 
 /// How many queued readings one pass folds into the account.
@@ -112,11 +112,11 @@ const REFUSAL_ROWS_PER_PASS: usize = 1000;
 /// read in between would be of a half-folded corpus -- which is exactly the kind
 /// of reading this account must not publish. A pass is still bounded: a queue
 /// that grew past this is not a corpus being read, it is a writer looping.
-// cap: bound
+// cap: bound — 仍要有界：涨过这个数就不是在被读的语料，是写入方在打转；半折叠的语料正是这本账不许发布的读数
 const DECLARATIONS_PER_PASS: usize = 1000;
 
 /// How many queued refusal events one pass counts.
-// cap: bound
+// cap: bound — 比申报那批小一半：拒收是例外路径，正常语料里它远小于申报
 const REFUSALS_PER_PASS: usize = 500;
 
 /// How many rows one pass looks at against the registries.
@@ -126,7 +126,7 @@ const REFUSALS_PER_PASS: usize = 500;
 /// lease. Rows are taken stalest-first, so this bound costs latency rather than
 /// coverage: everything outstanding is still reached, in as many passes as it
 /// takes.
-// cap: bound
+// cap: bound — 行的代价是延迟不是覆盖面：最旧的行下一轮接着取，剩下的照样被扫到
 const MEASUREMENTS_PER_PASS: usize = 200;
 
 /// How many human-held rows one pass may look at for the first time.
@@ -137,7 +137,7 @@ const MEASUREMENTS_PER_PASS: usize = 200;
 /// of them and no look had ever reached one. The bound is small enough that the
 /// debt still gets most of a pass, and large enough that the first sweep clears
 /// in hours rather than weeks.
-// cap: bound
+// cap: bound — 小到这笔旧账仍占一轮的大半，大到第一次清扫以小时而不是以周计
 const HUMAN_ONLY_SWEEP_PER_PASS: usize = 50;
 
 /// How long a look that could not be settled is left before it is asked again.
@@ -149,7 +149,7 @@ const HUMAN_ONLY_SWEEP_PER_PASS: usize = 50;
 /// (the pass runs every few minutes and the unanswered set is a few hundred rows)
 /// and short enough that a tree that changed is noticed within the same working
 /// session.
-// cap: bound
+// cap: bound — 长到一次几小时的扫描不会把它重刷一遍，又短到改过的树在同一个工作时段内被注意到
 const UNMEASURABLE_RETRY: Duration = Duration::from_secs(3600);
 
 /// A principle this process could not settle, and when it last tried.

@@ -151,7 +151,7 @@ pub const CHANGE_LEDGER_ROLE: &str = "change_ledger";
 /// steady state out of the log. The deployed liveness alert derives its
 /// threshold from this period (`6 * period`), so changing it changes that
 /// threshold.
-// cap: bound
+// cap: bound — 存活告警的门槛由它推出（6 × 周期）；改周期就是改告警的墙
 pub const CHANGE_LEDGER_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// What a reader of a blocked row is told ends the wait.
@@ -170,7 +170,7 @@ const POOL_BLOCK_CONDITION: &str = "\
 /// A bound is needed because the read returns the rows themselves; it is set
 /// far above any real firing set so that a pass which fills it knows its own
 /// count is not a census and says so rather than comparing a truncated pile.
-// cap: bound
+// cap: bound — 读回的就是行本身，所以要有界；设在远高于任何真实告警集的位置，填满即说明这次不是普查
 pub const ALERT_CENSUS_LIMIT: i64 = 5000;
 
 /// How many outstanding rows one round reads.
@@ -180,7 +180,7 @@ pub const ALERT_CENSUS_LIMIT: i64 = 5000;
 /// not a work list, so the bound is a fixed small number; a round that does hand
 /// work over will pick its own batch size from its own throttle rather than
 /// reusing this one.
-// cap: bound
+// cap: bound — 只给日志一行看的 peek，不是工作清单；真正的批量由做活那一轮按自己的节流取
 const OUTSTANDING_PEEK: usize = 50;
 
 /// How many queued declarations one pass folds into the account.
@@ -191,7 +191,7 @@ const OUTSTANDING_PEEK: usize = 50;
 /// past the cadence it is renewed on. The queue is written by a person or a
 /// script, in batches of tens, so this bound is generous for how it is used --
 /// reaching it means the fold is behind, which the backlog reading says anyway.
-// cap: bound
+// cap: bound — 队列由人或脚本按几十条一批写入；到这个数说明折叠落后了，而后备读数本就会说这件事
 const DECLARATIONS_PER_PASS: usize = 200;
 
 /// How many queued retirements one pass folds into the account.
@@ -202,7 +202,7 @@ const DECLARATIONS_PER_PASS: usize = 200;
 /// cadence. Retirements are written by a classifier in batches of tens, so this
 /// bound is generous for how it is used -- reaching it means the fold is behind,
 /// which the backlog reading says anyway.
-// cap: bound
+// cap: bound — 退役由分类器按几十条一批写入；到这个数说明折叠落后了，而后备读数本就会说这件事
 const RETIREMENTS_PER_PASS: usize = 200;
 
 /// How many retirements that say "another account answered this" one pass
@@ -214,7 +214,7 @@ const RETIREMENTS_PER_PASS: usize = 200;
 /// -- the rows it did not reach read as retirements nothing will ever revisit.
 /// It is still a bound, because the pass holds the owner lease and each row costs
 /// a read of the other account.
-// cap: bound
+// cap: bound — 但仍是界：这一轮持有属主租约，每行都要读另一本账，未扫到的行读作永远没人再看的退役
 const RESTORED_ANSWERED_PER_PASS: usize = 1024;
 
 /// How many rows one pass measures against the tree.
@@ -224,7 +224,7 @@ const RESTORED_ANSWERED_PER_PASS: usize = 1024;
 /// lease. Rows are taken stalest-first, so this bound costs latency rather than
 /// coverage: everything outstanding is still reached, in as many passes as it
 /// takes.
-// cap: bound
+// cap: bound — 行的代价是延迟而不是覆盖面：剩余最旧的行下一轮接着取，条数只是把一轮摊开
 const MEASUREMENTS_PER_PASS: usize = 200;
 
 /// How many landed rows one pass re-asks because a path their check reads moved.
@@ -244,7 +244,7 @@ const TOUCHED_PER_PASS: usize = MEASUREMENTS_PER_PASS;
 /// git calls at a revision from the history, so it is bounded like the batches
 /// above; unlike them it does not rotate forever -- a row it writes leaves the
 /// set, so the bound is the length of a one-off sweep.
-// cap: bound
+// cap: bound — 每行要按版本读一次 git 历史；与上面的批量同源，区别是写过的行离开集合，所以这个界就是一次扫完的长度
 const PARENT_BACKFILL_PER_PASS: usize = 50;
 
 /// How many retired rows one pass asks whether their surface came back.
@@ -264,7 +264,7 @@ const PARENT_BACKFILL_PER_PASS: usize = 50;
 /// reads a full batch, which is the only signal that the assumption has been
 /// outgrown. What that warning asks for is a rotation key in the read (a cursor
 /// persisted with the row), not a larger number here.
-// cap: bound
+// cap: bound — 读满整批是「这个假设被撑破」的唯一信号，那时的答案是给读加游标，不是把这里的数调大
 const RETIRED_RECHECK_PER_PASS: usize = 500;
 
 /// How many queued re-measurements one pass takes.
@@ -276,7 +276,7 @@ const RETIRED_RECHECK_PER_PASS: usize = 500;
 /// the outstanding pass already is; the bound keeps one pass from becoming a
 /// full pass over the tree on a producer's word. A full batch warns rather than
 /// growing, because the answer to a queue that outgrew it is to ask why.
-// cap: bound
+// cap: bound — 存在的活那一轮本身就是界；这个数只防「凭生产者一句话就把一轮变成整棵树」
 const REMEASURE_PER_PASS: usize = 64;
 
 /// How many owed rows one pass hands over.
@@ -309,7 +309,7 @@ const REMEASURE_PER_PASS: usize = 64;
 /// up to `HANDOVERS_PER_PASS * UNMEASURABLE_RETRY / CHANGE_LEDGER_PASS_INTERVAL`
 /// rows is swept inside `UNMEASURABLE_RETRY`, and the assertion below fails to
 /// compile if the three numbers drift apart.
-// cap: bound
+// cap: bound — 与 UNMEASURABLE_RETRY、PASS_INTERVAL 一起决定一次清扫的覆盖速度，下面的断言在三个数走散时编不过
 const HANDOVERS_PER_PASS: usize = 200;
 
 const _: () = assert!(
@@ -333,7 +333,7 @@ const _: () = assert!(
 /// runs every few minutes and the unanswered set is a few hundred rows) and
 /// short enough that a tree that changed is noticed within the same working
 /// session.
-// cap: bound
+// cap: bound — 长到一次几小时的扫描不会把它重刷一遍，又短到改过的树在同一个工作时段内被注意到
 const UNMEASURABLE_RETRY: Duration = Duration::from_secs(3600);
 
 /// How long a row the account calls done may go before its check is asked again.
@@ -416,7 +416,7 @@ const DISPATCH_TASK_PREFIX: &str = "change-ledger-";
 /// deep. One below the default keeps a dispatched change from taking the slot a
 /// submitted goal could have used, without making it ineligible: it still runs
 /// whenever the graph has room this pass did not claim.
-// cap: bound
+// cap: bound — 比默认低一档：派发的变更不去抢提交目标本可以用的槽，但仍够格在还有空位时跑
 const DISPATCH_TASK_PRIORITY: i32 = 0;
 
 /// The task kind a dispatched change is submitted under.
@@ -586,7 +586,7 @@ fn dispatch_task_id(identity: &ChangeIdentity, generation: u32) -> String {
 /// would forget it. The landing machine writes at most a few commits a day, and
 /// this bound is what keeps a repository with years of history from turning one
 /// pass into a walk of it.
-// cap: bound
+// cap: bound — 落地机一天写几笔提交；这个界挡的是「一个多年历史仓把一轮变成走一遍历史」
 const LANDING_LOG_COMMITS: usize = 2_000;
 
 /// The changes a commit log says it landed, keyed by the id each commit names.
@@ -695,7 +695,7 @@ const HANDOVER_ROUNDTABLE_HISTORY: &str = "/snapshot/roundtable/history";
 /// position 146, so a single page would have to be longer than the longest run
 /// there has ever been. Paging at a bound under that keeps the read correct for
 /// a stream longer than any of them rather than correct for the ones observed.
-// cap: bound
+// cap: bound — 小于历史上最长的那一串；按它分页，比按「观察过的最长一串」正确，长过它的流也照样读对
 const HANDOVER_EVENTS_PER_PAGE: usize = 100;
 
 /// The deliverable one handover left.
@@ -1040,7 +1040,7 @@ fn dispatch_project_root_id(project: &str) -> String {
 /// of rows to reach, and this loop shares its process with the measurement
 /// passes. A batch bounds the burst, not the work: the loop asks again on its
 /// next beat until `remaining` is zero.
-// cap: bound
+// cap: bound — 界的是突发不是工作量：这一拍没处理完，下一拍接着问到 remaining 归零
 const SETTLE_BATCH: usize = 400;
 
 /// What one settle of the dispatched projects did, cell by cell.
@@ -2186,7 +2186,7 @@ fn principle_literal(slug: &str) -> String {
 /// within the budget reaches `git log --oneline` whole; a longer one is
 /// shortened there, and a shortened title is a view a reader has to scroll
 /// past.
-// cap: bound
+// cap: bound — 放进预算的那句标题在 git log --oneline 里要整句读得到；更长的在那里被截，截出来的标题是读者得滚过去才看得全的东西
 const GOAL_TITLE_CHARS: usize = 50;
 
 /// What a row of the principle ledger asks for, in the words the goal path is
@@ -5158,7 +5158,7 @@ async fn record_dispatch_state(
             /// Rows one account line names before it summarises the rest as a count: a line
             /// is an annotation, and an account that came to hold thousands of rows would
             /// otherwise turn it into a dump.
-            // cap: bound
+            // cap: bound — 一行是注解不是转储：拥有上千行的账若照单一遍，注解就变成了本体
             const NAMED: usize = 20;
             let named: Vec<String> = holders
                 .iter()

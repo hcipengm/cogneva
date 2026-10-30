@@ -153,7 +153,7 @@ impl CheckpointAgents for LiveCheckpointAgents {
 /// [`cog_core::loop_health::Cadence::PeriodicWithWork`]）：申报的工期界由真正
 /// 施加该界的对象推导，而不是挑一个能让规则闭嘴的整数，所以调整这里的超时
 /// 会带着告警的墙一起动。
-// cap: bound
+// cap: bound — 申报的工期界由真正施加该界的对象推导，不是挑一个让规则闭嘴的整数；调它会带着告警的墙一起动
 pub const CHECKPOINT_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// 给一次检查点动作套上等待上限：超时落成 `cog_core::SFError::Timeout`，

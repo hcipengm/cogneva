@@ -19,7 +19,7 @@ pub const ORPHAN_RECONCILER_LOOP: &str = "orchestrator_orphan_reconciler";
 /// 当成计划：一条三小时的任务按两个十分钟的样本排成二十分钟，会让它在计划上
 /// 「早就该完了」——一个凭空造出来的落后。样本不够就不排，读数上读作「还没
 /// 样本」，那是真话。
-// cap: bound
+// cap: bound — 样本不够就不排程；两三个样本排出来的计划会让一条任务在计划上「早就该完了」，那是凭空造出来的落后
 pub const MIN_ESTIMATE_SAMPLES: u64 = 5;
 
 /// 估算基线版本串的开头，两种写法共有的那一段：「这一行是估算器按历史写的」。
@@ -121,7 +121,7 @@ impl Default for DagExecutorConfig {
 /// `reason="pass_ceiling"`: a healthy publisher holds nothing under that label,
 /// and one that holds a large share of every pass is a ceiling that should be
 /// re-tuned or a pool reading that never arrives.
-// cap: bound
+// cap: bound — 落进 pass_ceiling 标签的计数是它的读数：健康的发布者在那里占用为零，占了大头的说明这个数该重调
 const READY_TASKS_PER_PASS: u64 = 200;
 
 /// What one pass may admit, together with the reading it was derived from.

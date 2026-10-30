@@ -55,7 +55,7 @@ pub const BACKUP_RUNS_ROLE: &str = "backup_runs";
 /// while leaving hours of margin. The deployed liveness alert derives its
 /// threshold from this period (`6 * period`), so changing it changes that
 /// threshold.
-// cap: bound
+// cap: bound — 存活告警的门槛由它推出（6 × 周期），所以这个数是那个门槛的分子，不是独立的一拍
 pub const BACKUP_RUNS_PASS_INTERVAL: Duration = Duration::from_secs(300);
 
 /// The readouts one look at the account produces.

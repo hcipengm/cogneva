@@ -9,14 +9,14 @@ use tracing::{info, warn};
 /// 检查点整轮（枚举全部在跑任务并逐个落点）必须在下一拍到来之前交还控制权，
 /// 否则 beat 停一次、告警就把这条循环记成卡住。余量是「一拍要留多久给节拍本身」
 /// 的取值：小于一个 DB 往返的抖动就会误判，大过一拍就没有轮次可跑。
-// cap: bound
+// cap: bound — 小于一个 DB 往返的抖动会误判，大过一拍就没有轮次可跑
 const CHECKPOINT_ROUND_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// 整轮预算的下限：节拍再密，也要给一轮留出这么久。
 ///
 /// 没有这个下限时，节拍小于余量的部署会得到「零预算」——每轮都被判超时，
 /// 循环看上去永远在超支。10s 是一轮落点在健康集群里的实测耗时上限。
-// cap: bound
+// cap: bound — 10s 是一轮落点在健康集群里的实测耗时上限；没有这个下限，节拍小于余量的部署每轮都被判超支
 const MIN_CHECKPOINT_ROUND_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// 一轮检查点允许占用的时间，由它自己的节拍推出。
@@ -48,7 +48,7 @@ pub const TASK_CHECKPOINT_LOOP: &str = "orchestrator_task_checkpoint";
 /// a queue nobody drains stops being an excuse — past it the row is re-armed
 /// and counted apart, so the queue's refusal to move becomes a reading instead
 /// of an indefinite silence.
-// cap: bound
+// cap: bound — 三个窗口之后，没人排空的队列不再是借口：行被重新上膛并单独计数，队列不动变成一条读数而不是无限沉默
 pub const BACKLOG_WINDOWS_BEFORE_RECLAIM: u64 = 3;
 
 /// Orchestrator plugin that self-assembles the DAG executor and related services.

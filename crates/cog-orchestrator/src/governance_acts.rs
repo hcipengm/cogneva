@@ -796,7 +796,7 @@ pub const DECISION_CLOSE_ROLE: &str = "governance_decision_close";
 /// Thirty seconds: a ballot's deadline is a statement about when the question
 /// is answered, and a reader arriving a minute later should not have to know
 /// that a pass was due. A pass with nothing due writes nothing.
-// cap: bound
+// cap: bound — 选票的截止时刻是对「问题什么时候有答案」的陈述；晚一分钟来的读者不该知道这一拍本来什么时候到
 pub const DECISION_CLOSE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Start the resident pass that writes the verdicts the rules already reached.

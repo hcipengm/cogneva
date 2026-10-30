@@ -39,7 +39,7 @@ use cog_core::{ChangeIdentity, ChangeState};
 /// The bound exists so that a repository on a stalled mount fails as a reading
 /// instead of holding the pass: the pass runs under an owner lease that is
 /// renewed on a cadence, and a pass that hangs is a pass that loses the seat.
-// cap: bound
+// cap: bound — 让卡死的挂载点表现为一条读数而不是挂住整轮：这一轮持有属主租约，挂住就是丢座位
 const GIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Where the platform's own deployment mounts the repository it builds from.

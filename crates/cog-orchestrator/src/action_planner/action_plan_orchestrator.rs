@@ -38,11 +38,11 @@ impl PatternEntry {
 }
 
 /// Default maximum pattern DB size before LRU/score-based eviction kicks in.
-// cap: bound
+// cap: bound — 淘汰策略的触发点，不是数据库容量：界的是「什么时候开始丢最不值的那条模式」，值随实际使用量再调
 pub const DEFAULT_MAX_PATTERN_DB_SIZE: usize = 256;
 /// Default maximum age (in days) for pattern DB entries before they are
 /// expired even if the size cap has not been reached.
-// cap: bound
+// cap: bound — 单条模式的最长寿命：过期的模式是没人再验证过的经验，认它等于让一个旧结论一直生效
 pub const DEFAULT_MAX_PATTERN_AGE_DAYS: i64 = 30;
 
 /// ActionPlanOrchestrator implements Stage 1 decomposition logic:
