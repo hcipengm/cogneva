@@ -106,6 +106,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let key_value = cogneva::assembly::infra::key_value_store_from_url(
                 gateway_config.redis_url.as_deref(),
             );
+            // 按任务预算的门由装配层造：判定与记账的实现在 cog-quota，执行点在
+            // 网关的 LLM 代理路径上，两侧只认 core 的契约（`TaskBudgetGate`）。
+            // 没有键值面时交 `None`——那时预算无处落账，判定也就无从谈起。
+            let task_budget: Option<std::sync::Arc<dyn cog_core::TaskBudgetGate>> =
+                key_value.as_ref().map(|store| {
+                    std::sync::Arc::new(cog_quota::TaskBudgetManager::new(store.clone()))
+                        as std::sync::Arc<dyn cog_core::TaskBudgetGate>
+                });
             // 厂商相容画像表同理：表是 provider crate 的，网关只按契约问。
             let provider_compat: std::sync::Arc<dyn cog_core::ProviderCompatTable> =
                 std::sync::Arc::new(cog_llm::utils::compat::CompatImages);
@@ -119,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(cogneva::build_info::GIT_REVISION),
                 http_client,
                 key_value,
+                task_budget,
                 Some(provider_compat),
                 observability.pool,
                 observability.volume_footprint,

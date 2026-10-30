@@ -40,6 +40,7 @@ pub mod model;
 pub mod observable;
 pub mod quota;
 mod store;
+pub mod task_budget;
 
 pub use agent_budget::{AgentBudget, BudgetAction, BudgetResult};
 pub use billing::{BillingRecord, BillingRepository, RechargeRecord};
@@ -51,6 +52,7 @@ pub use metrics::QuotaMetrics;
 pub use model::{ModelConfig, ModelRegistry, TaskType};
 pub use observable::{QuotaObservable, QuotaReadings};
 pub use quota::{DailyUsage, QuotaChecker, QuotaManager};
+pub use task_budget::{verdict as task_budget_verdict, TaskBudgetDecision, TaskBudgetManager};
 
 // Re-export core DTOs so consumers see them under cog_quota::* as before.
 use cog_core::{

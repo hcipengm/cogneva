@@ -212,6 +212,13 @@ function describe(line: OutcomeLine): { label: string; hint: string; tone: strin
         tone: 'var(--warn)',
         bar: 'var(--warn)',
       };
+    case 'refused_by_budget':
+      return {
+        label: '任务预算用完',
+        hint: kind ?? '没发出去：这件工作自己那份当日预算已经用完，等它过午夜重置',
+        tone: 'var(--warn)',
+        bar: 'var(--warn)',
+      };
     default:
       return {
         label: line.result,

@@ -49,7 +49,7 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         info!("QuotaPlugin quota manager published");
 
         let limits = crate::QuotaLimits::from_hard(50_000, 0.8);
-        let hierarchy_manager = Arc::new(crate::HierarchyManager::new(store, limits));
+        let hierarchy_manager = Arc::new(crate::HierarchyManager::new(store.clone(), limits));
         ctx.publish(hierarchy_manager.clone());
         // The reader takes `dyn cog_core::HierarchyManager` through the
         // service table, which is a different pin than the concrete value
@@ -61,6 +61,13 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         let hm_service: Arc<dyn cog_core::HierarchyManager> = hierarchy_manager;
         ctx.publish_service(hm_service);
         info!("QuotaPlugin hierarchy manager published");
+
+        // 按任务的预算：同一份存储。只有服务钉——读它的是 LLM 代理路径，那一侧
+        // 只认契约（`dyn cog_core::TaskBudgetGate`），没有任何地方按具体类型取它。
+        let task_budget: Arc<dyn cog_core::TaskBudgetGate> =
+            Arc::new(crate::TaskBudgetManager::new(store));
+        ctx.publish_service(task_budget);
+        info!("QuotaPlugin task budget gate published");
 
         self.initialized = true;
         Ok(())

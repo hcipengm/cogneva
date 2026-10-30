@@ -1931,6 +1931,13 @@ struct AppState {
     /// 承担，所以"这一拍写不出去"与"这一侧终生失明"不是一回事。`None`
     /// 表示没配键值面（单进程部署），与连不上是两回事。
     pool_signal: Option<Arc<dyn cog_core::KeyValueStore>>,
+    /// 按任务的当日预算，由装配层交进来。
+    ///
+    /// `None` 的含义与 [`Self::pool_signal`] 的 `None` 不同，这里不能混读：键值面没配
+    /// 时这一项也是 `None`，而**没有预算能力**与**没有预算被声明过**在拒绝面上恰好
+    /// 都是「不拒」。所以「这一格缺了」与「这件任务没人管」在读数上必须分得开——
+    /// 缺这一格时请求照常放行，而它不会被任何一条读数说成「预算在生效」。
+    task_budget: Option<Arc<dyn cog_core::TaskBudgetGate>>,
     /// 跨进程初值是否已落地。建连失败过一次时它是 false，由发布循环按拍重试。
     /// 这一格必须存在：读不到与没有证据在初值上同形，而把前者当后者，池判定
     /// 会在一次瞬时故障后凭空翻回"可用"。
@@ -2596,6 +2603,143 @@ async fn paced_refusal(
     })
 }
 
+/// 把一次真实花销记到这件任务的当日预算上。
+///
+/// 记不上只 WARN：预算是判据，不是请求路径的一部分，为一次记账失败把一次已经付过钱
+/// 的调用变成错误，方向反了。代价要说清楚——这一发的花销不计入，此后这件任务的判定
+/// 会偏小，偏到下一次它越线为止。
+async fn charge_task_budget(state: &AppState, task: Option<&str>, tokens: u64) {
+    let Some(task) = task else { return };
+    let Some(gate) = state.task_budget.as_ref() else {
+        return;
+    };
+    if tokens == 0 {
+        return;
+    }
+    if let Err(e) = gate.charge(task, tokens, Utc::now().timestamp()).await {
+        tracing::warn!(
+            task = %task,
+            tokens,
+            error = %e,
+            "按任务预算：这一发的花销没记上，此后这件任务的判据会偏小"
+        );
+    }
+}
+
+/// 按任务预算的拒绝：这件工作由调用方自己声明了当日上限，它已经用完了。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TaskBudgetRefusal {
+    task: String,
+    spent_today: u64,
+    hard_limit: u64,
+    /// 到下一个 UTC 午夜的秒数——预算按 UTC 日归零，这个数就是「什么时候再来」。
+    wait_secs: u64,
+}
+
+/// 判这一发要不要按任务预算拒。
+///
+/// 三种「不拒」在这里长得一样，但理由不同，读的人要靠日志分：
+///
+/// 1. 请求没声明任务——没有主体，就没有「这件工作花了多少」这个说法；
+/// 2. 进程里没有预算门（键值面没配）——这一格缺了是装配事实，不是判定结果；
+/// 3. 这件任务没人声明过预算——放行，且**不编一个默认上限**。
+///
+/// 第四种不拒是预算门的读数坏了：答不上「花了多少」时放行，而不是按「花满了」拒。
+/// 拦错方向的代价不对称——拒错一次是从中间截断一件工作，而放行一次只是这一发多花
+/// 了；这一发的量级比「一件工作被截断」小得多。
+///
+/// 估算不参与判定：这一发要花多少只有上游知道，而被拒的是「已经越线之后再来的
+/// 任何一发」。所以最后一发可以略微越过上限，越过的是它自己那一发。
+async fn task_budget_refusal(
+    state: &AppState,
+    style: &str,
+    actor: &str,
+    origin: &str,
+    task: Option<&str>,
+) -> Option<TaskBudgetRefusal> {
+    let task = task?;
+    let gate = state.task_budget.as_ref()?;
+    let now_unix = Utc::now().timestamp();
+    match gate.check(task, now_unix).await {
+        Ok(v) if !v.budgeted => None,
+        Ok(v) if v.allowed => {
+            if v.warning {
+                tracing::warn!(
+                    task = %task,
+                    spent_today = v.spent_today,
+                    soft_limit = v.soft_limit,
+                    hard_limit = v.hard_limit,
+                    "按任务预算：这一发跨过了软上限，仍然放行"
+                );
+            }
+            None
+        }
+        Ok(v) => {
+            let refusal = TaskBudgetRefusal {
+                task: task.to_string(),
+                spent_today: v.spent_today,
+                hard_limit: v.hard_limit,
+                wait_secs: v.wait_secs.unwrap_or(60),
+            };
+            land_usage_record(
+                state,
+                task_budget_refusal_usage(style, actor, origin, &refusal.task, refusal.wait_secs),
+            );
+            Some(refusal)
+        }
+        Err(e) => {
+            tracing::warn!(
+                task = %task,
+                error = %e,
+                "按任务预算：读不出这件任务花了多少，这一发不拦"
+            );
+            None
+        }
+    }
+}
+
+/// 按任务预算拒绝的台账落点。
+///
+/// 与另外两种拒绝同形（一个上游都没试过，零用量是实情），但结果词不同：这一行要
+/// 回答的是「这件工作被它自己那份预算截断了」，而那个答案的修法与配速、熔断都不同
+/// ——配速要等窗口，熔断要补上游，这一条要收尾或抬上限。
+///
+/// 上游与模型两列取 [`POOLED_REFUSAL_UNNAMED`]：拒绝发生在选上游之前，挂到任何一家
+/// 名下都会读成「那一家拒的」。
+///
+/// 声明的那一对上限与今天已经花掉多少不在这张表上：账的列是按「这一发花了多少」
+/// 设计的，而一次拒绝一个 token 都没花。那两个数只出现在日志与响应体里——它们是
+/// 判定的依据，不是花销。
+fn task_budget_refusal_usage(
+    style: &str,
+    actor: &str,
+    origin: &str,
+    task: &str,
+    retry_after_secs: u64,
+) -> LlmUsageRecord {
+    LlmUsageRecord {
+        upstream: POOLED_REFUSAL_UNNAMED.to_string(),
+        api_style: style.to_string(),
+        model: POOLED_REFUSAL_UNNAMED.to_string(),
+        result: UsageResult::RefusedByBudget.as_str().to_string(),
+        actor: actor.to_string(),
+        origin: origin.to_string(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cached: 0,
+        estimated_input: None,
+        // 拒绝发生在向上游发请求之前，没有正文可分类。
+        refusal_kind: None,
+        // 这一格是「什么时候可以再来」：到下一个 UTC 午夜，那时预算归零。
+        // 与配速那行不同，这个数不是上游的窗口，是我们自己那份预算的重置点。
+        retry_after_secs: Some(retry_after_secs),
+        task: Some(task.to_string()),
+        latency_ms: 0,
+        pace: None,
+        usage_outcome: None,
+    }
+}
+
 /// 池级熔断的唯一出口：判定与落账在同一次调用里。
 ///
 /// 落账写在 [`AppState::pool_circuit_break`] 的调用点上是**位置判据**——判据能证明
@@ -3158,6 +3302,11 @@ async fn record_llm_tokens(
             .property("estimated_input", serde_json::json!(estimated_input))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
+    // 记到这件任务的当日预算上。**每一发都记**，不是「有预算才记」：预算可以在一天
+    // 中间才被声明，只从声明那一刻开始记，会让上午花掉的那部分不计入——声明的人
+    // 看到的是「还剩一整份」，而账上说这件工作今天已经花过。多一次自增的代价远小于
+    // 一个会偏小的判据。
+    charge_task_budget(state, task.as_deref(), reading.input + reading.output).await;
     land_usage_record(
         state,
         LlmUsageRecord {
@@ -5643,6 +5792,42 @@ async fn stream_forward(
             .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
     }
 
+    // 按任务预算：这件工作由调用方自己声明了当日上限，用完了就到此为止。
+    // 位置在配速之后：配速回答「这一窗摊到此刻还能不能开一件」，是池子的事；预算
+    // 回答「这件工作允不允许再花」，是工作本身的事。两者同时成立时先报池子——池子
+    // 没额度时,抬这件任务的预算也不会让它跑起来。
+    if let Some(refusal) =
+        task_budget_refusal(&state, style, &actor, &origin, task.as_deref()).await
+    {
+        tracing::warn!(
+            refused_by_budget = true,
+            task = %refusal.task,
+            spent_today = refusal.spent_today,
+            hard_limit = refusal.hard_limit,
+            retry_after_secs = refusal.wait_secs,
+            "按任务预算：这件工作的当日上限已经用完，快速失败 429"
+        );
+        return Ok(axum::response::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(cog_core::RETRY_AFTER_HEADER, refusal.wait_secs.to_string())
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "error": "这件工作自己那份当日预算已经用完",
+                    // 机器可读那一格：同一个 429 也来自配速，调用侧与读者要靠它
+                    // 分开——配速是「池子紧，等一等就好」，这一条是「这件工作该
+                    // 收尾了」，两句话指向两种完全不同的处置。
+                    "reason": cog_core::REFUSED_BY_BUDGET,
+                    "task": refusal.task,
+                    "spent_today": refusal.spent_today,
+                    "hard_limit": refusal.hard_limit,
+                    "retry_after_seconds": refusal.wait_secs,
+                })
+                .to_string(),
+            ))
+            .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
+    }
+
     // 热切换：健康上游优先，嫌疑上游降级为兜底（不硬排除）。
     let candidates = order_by_health(candidates, &state.llm_health);
 
@@ -8098,6 +8283,10 @@ fn llm_channel_router() -> Router<AppState> {
             INTERNAL_GITHUB_APP_DISCOVER_PATH,
             post(internal_github_app_discover_handler),
         )
+        .route(
+            INTERNAL_TASK_BUDGET_PATH,
+            post(internal_task_budget_handler),
+        )
 }
 
 /// 贡献通道设置面的内部路径。
@@ -8105,6 +8294,9 @@ fn llm_channel_router() -> Router<AppState> {
 /// 这一面过去由主应用自己读那两片 Secret 拼出来、自己读-改-写配置文档、自己用
 /// App 私钥签 JWT。把读点搬进网关之后，主应用只经这几条路径拿派生读数与结论，
 /// 它那一侧就再也不需要 Secret 的 get 权限。
+/// 按任务预算的管理路径（声明 / 读取 / 撤销共用一条，正文里的形状区分动作）。
+pub(crate) const INTERNAL_TASK_BUDGET_PATH: &str = "/internal/task-budget";
+
 pub(crate) const INTERNAL_CONTRIBUTION_STATUS_PATH: &str = "/internal/contribution-status";
 pub(crate) const INTERNAL_CONTRIBUTION_CONNECT_PATH: &str = "/internal/contribution-connect";
 pub(crate) const INTERNAL_CONTRIBUTION_POLICY_PATH: &str = "/internal/contribution-policy";
@@ -8173,6 +8365,143 @@ async fn internal_contribution_policy_read_handler(
         )
             .into_response(),
     }
+}
+
+/// 一次按任务预算的管理读写的正文。
+///
+/// 三种动作共用一个载体，靠「给了什么」分开，而不是靠三个路径：读、写、撤是同一个
+/// 格子的三种状态，拆成三条路径就会出现「在哪一条上读到的才作数」这个问题。
+/// - 只有 `task_id`：读；
+/// - `clear: true`：撤掉声明；
+/// - `soft_limit` 与 `hard_limit` 都给：写。
+///
+/// 只给一半是 400：另一半会悄悄沿用旧值，而写下限的人想的是一整对。
+#[derive(Debug, serde::Deserialize)]
+struct TaskBudgetPayload {
+    task_id: String,
+    #[serde(default)]
+    soft_limit: Option<u64>,
+    #[serde(default)]
+    hard_limit: Option<u64>,
+    #[serde(default)]
+    clear: bool,
+}
+
+/// 按任务预算的管理面：声明 / 读取 / 撤销。
+///
+/// 放在网关进程里，因为判定与记账也在这里——管理面与本进程正在执行的那份预算读的是
+/// 同一个存储和同一把键，经过第二跳会多出一层「谁才是真的」的问题。
+async fn internal_task_budget_handler(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    if let Some(refusal) = internal_caller_refusal(&state, &headers, &body) {
+        return refusal;
+    }
+    let Some(gate) = state.task_budget.as_ref() else {
+        // 没有预算门时**不假装**管理成功：写下去了而没有东西执行它，读的人会以为
+        // 上限在生效。这里答 503 并点名缺的是什么。
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "task_budget_unavailable",
+                "message": "本进程没有按任务预算的门（键值面没配），写入也不会被执行",
+            })),
+        )
+            .into_response();
+    };
+    let payload: TaskBudgetPayload = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid_payload",
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    if payload.task_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "task_id_required"})),
+        )
+            .into_response();
+    }
+    let task_id = payload.task_id.trim().to_string();
+
+    if payload.clear {
+        if let Err(e) = gate.clear_budget(&task_id).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "clear_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    } else if payload.soft_limit.is_some() || payload.hard_limit.is_some() {
+        let (Some(soft), Some(hard)) = (payload.soft_limit, payload.hard_limit) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "limits_are_a_pair",
+                    "message": "soft_limit 与 hard_limit 必须一起给：只给一半会让另一半悄悄沿用旧值",
+                })),
+            )
+                .into_response();
+        };
+        if let Err(e) = gate
+            .set_budget(&task_id, cog_core::QuotaLimits::new(soft, hard))
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "write_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+
+    // 三种动作都以同一个读数收尾：写完之后读回来的那一份就是执行面此刻会用的，
+    // 而回显请求里那对值只证明「收到了」。
+    let budget = match gate.budget(&task_id).await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "read_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let spent_today = match gate.check(&task_id, Utc::now().timestamp()).await {
+        Ok(v) => v.spent_today,
+        // 预算是声明了、而今天的计数读不出来：这一格必须说出来，写成 0 会让
+        // 「一件刚被截断的任务」在管理面上显示成「今天一个 token 都没花」。
+        Err(e) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "task_id": task_id,
+                    "budget": budget,
+                    "spent_today": null,
+                    "spend_unreadable": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "task_id": task_id,
+            "budget": budget,
+            "spent_today": spent_today,
+        })),
+    )
+        .into_response()
 }
 
 async fn internal_github_app_discover_handler(
@@ -8543,17 +8872,27 @@ fn identity_default_headers(identity: &str) -> reqwest::header::HeaderMap {
 /// `provider_compat` 同理由装配层交进来：那张厂商相容画像表是"实现 provider 的
 /// crate 的"知识，网关只按契约问它。交 `None` 时按"查无此厂商"处理——请求体一个
 /// 字都不改，与表里没登记这台上游时同一条路，所以缺了它不是另立一套行为。
+///
+/// `task_budget` 是按任务的预算门，同一道理：判定与记账的实现在 cog-quota，执行
+/// 点在这条代理路径上。交 `None` 表示本进程没有预算能力（**不是**"没人声明过
+/// 预算"——后者是门自己答的 `budgeted: false`），两者在管理面上必须分得开：没有
+/// 门时写预算会答 503，因为写下去了而没有东西执行它。
 /// 独立安全网关进程。
 ///
 /// 四类落盘出口（指标注册表、时序明细、告警状态机、计量账本）与要观测的卷都
 /// 由装配层造好交进来：它们各自住在一个拥有那份机制的 crate 里，而本进程只认
 /// 契约。造在这里会让本 crate 链上那些实现，而那正是"除装配根外每个 crate 只
 /// 依赖 core"要挡住的东西。
+///
+/// 参数是逐个摆开的而不是打成一个包：每一样都由装配根从不同的实现里造出来，
+/// 顺序与名字就是那份装配本身。打包只会在装配根上再加一层与它同名的结构体。
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: SecurityGatewayConfig,
     build_revision: Option<&str>,
     http_client: Arc<dyn cog_core::HttpClient>,
     key_value: Option<Arc<dyn cog_core::KeyValueStore>>,
+    task_budget: Option<Arc<dyn cog_core::TaskBudgetGate>>,
     provider_compat: Option<Arc<dyn cog_core::ProviderCompatTable>>,
     pool_obs: Arc<PoolObservability>,
     volume_footprint: Vec<VolumeFootprint>,
@@ -8586,6 +8925,7 @@ pub async fn run(
         git_transport: std::sync::Arc::new(crate::git_mirror::GitTransport::from_env()),
         pool_obs,
         pool_signal,
+        task_budget,
         pool_down: Arc::new(AtomicBool::new(false)),
         pool_recovered: Arc::new(AtomicBool::new(false)),
         last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -14111,6 +14451,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 durable: None,
             }),
             pool_signal: None,
+            task_budget: None,
             pool_down: Arc::new(AtomicBool::new(false)),
             pool_recovered: Arc::new(AtomicBool::new(false)),
             last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -15532,5 +15873,288 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             }
         }
         None
+    }
+
+    // ---- 按任务预算：判在网关的读路径上，记账在花的那个点上 ----------------
+
+    /// 一件任务的预算判定，按「放行 / 拒」两种直接摆出来。
+    fn budgeted(allowed: bool, spent: u64, hard: u64) -> cog_core::TaskBudgetVerdict {
+        cog_core::TaskBudgetVerdict {
+            budgeted: true,
+            spent_today: spent,
+            soft_limit: hard,
+            hard_limit: hard,
+            allowed,
+            warning: false,
+            wait_secs: (!allowed).then_some(3600),
+        }
+    }
+
+    /// 一个只回答判定、顺手记下扣了多少的预算门。
+    ///
+    /// 本文件要钉的是「拿到判定之后网关做什么」：拒的那一发回哪个状态码、正文里
+    /// 哪一格让调用侧把「这件工作该收尾了」与「池子紧，等一等」分开、以及一次真实
+    /// 花销有没有回到这件任务上。判定本身（没有预算就放行、恰好到界放行、越界拒
+    /// 并给出到午夜的等待、只跨软上限只告警）在 cog-quota 里逐格钉过，这里不摆
+    /// 第二份真值——两份真值一旦分叉，测试会站在错的那一边说绿。
+    struct StubBudgetGate {
+        verdict: cog_core::TaskBudgetVerdict,
+        broken: bool,
+        charged: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+    }
+
+    impl StubBudgetGate {
+        fn new(verdict: cog_core::TaskBudgetVerdict) -> Self {
+            Self {
+                verdict,
+                broken: false,
+                charged: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn broken() -> Self {
+            Self {
+                broken: true,
+                ..Self::new(budgeted(false, 0, 0))
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::TaskBudgetGate for StubBudgetGate {
+        async fn set_budget(
+            &self,
+            _task_id: &str,
+            _limits: cog_core::QuotaLimits,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn clear_budget(&self, _task_id: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn budget(
+            &self,
+            _task_id: &str,
+        ) -> cog_core::SFResult<Option<cog_core::QuotaLimits>> {
+            Ok(None)
+        }
+
+        async fn check(
+            &self,
+            _task_id: &str,
+            _now_unix: i64,
+        ) -> cog_core::SFResult<cog_core::TaskBudgetVerdict> {
+            if self.broken {
+                return Err(cog_core::SFError::Redis("store unreachable".into()));
+            }
+            Ok(self.verdict)
+        }
+
+        async fn charge(
+            &self,
+            task_id: &str,
+            tokens: u64,
+            _now_unix: i64,
+        ) -> cog_core::SFResult<u64> {
+            self.charged
+                .lock()
+                .unwrap()
+                .push((task_id.to_string(), tokens));
+            Ok(tokens)
+        }
+    }
+
+    /// 用完了预算的那一发必须**在碰任何上游之前**回 429，且正文用机器可读那一格
+    /// 自称是预算拒的。
+    ///
+    /// 同一个 429 还来自窗口配速（池子紧）与上游自己（限流）。三个都说「等一等」，
+    /// 但处置完全不同：配速要等窗口开，上游限流要退避重试，而这一条是这件工作该
+    /// 收尾了——拿它当可重试的抖动去重试，就是在这件工作已经用完的那份预算上反复
+    /// 撞墙，每一次都记一行拒绝。所以正文里必须有 `reason`，且它不能与另外两种
+    /// 同值。
+    #[tokio::test]
+    async fn a_task_that_used_up_its_budget_is_refused_by_name_before_any_upstream() {
+        use tower::ServiceExt;
+
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.task_budget = Some(Arc::new(StubBudgetGate::new(budgeted(false, 1000, 1000))));
+        let app = router(state, true);
+
+        let req = axum::extract::Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
+            .header(cog_core::LLM_TASK_HEADER, "t-42")
+            .body(axum::body::Body::from(
+                serde_json::json!({"model": "m1", "messages": []}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "用完了的预算要快速失败，不能还把这一发发出去"
+        );
+        let wait = resp
+            .headers()
+            .get(cog_core::RETRY_AFTER_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        assert_eq!(
+            wait.as_deref(),
+            Some("3600"),
+            "拒绝必须自带「什么时候可以再来」，否则对面只能自己猜"
+        );
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["reason"],
+            cog_core::REFUSED_BY_BUDGET,
+            "这一格是调用侧把「该收尾」与「等一等」分开的唯一依据：{v}"
+        );
+        assert_eq!(v["task"], "t-42");
+        assert_eq!(v["hard_limit"], 1000);
+        assert_eq!(v["spent_today"], 1000);
+    }
+
+    /// 三种「不拒」各有各的理由，但都是不拒：没声明任务、没人给这件任务声明过
+    /// 预算、以及预算门的读数坏了。
+    ///
+    /// 第三条是刻意的：答不上「花了多少」时放行。两个方向的代价不对称——拦错一次
+    /// 是从中间截断一件正在做的工作，放行一次只是这一发多花；这一发的量级比「一件
+    /// 工作被截断」小得多。
+    #[tokio::test]
+    async fn nothing_is_refused_without_a_task_without_a_budget_or_without_a_reading() {
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let gate = Arc::new(StubBudgetGate::new(budgeted(false, 1000, 1000)));
+        state.task_budget = Some(gate.clone());
+
+        assert!(
+            task_budget_refusal(&state, "openai", "a", "o", None)
+                .await
+                .is_none(),
+            "请求没声明任务就没有主体，也就没有「这件工作花了多少」"
+        );
+
+        // 没人声明过预算：这一条在判定里是 allowed，即便 spent 大得离谱也一样
+        // 拦不住——上限是操作者声明的，不是从花销推出来的。
+        let unbudgeted = cog_core::TaskBudgetVerdict {
+            budgeted: false,
+            ..budgeted(true, 0, 0)
+        };
+        state.task_budget = Some(Arc::new(StubBudgetGate::new(unbudgeted)));
+        assert!(
+            task_budget_refusal(&state, "openai", "a", "o", Some("t-1"))
+                .await
+                .is_none(),
+            "没有声明过预算的任务不许被编出来的上限拦下"
+        );
+
+        state.task_budget = Some(Arc::new(StubBudgetGate::broken()));
+        assert!(
+            task_budget_refusal(&state, "openai", "a", "o", Some("t-1"))
+                .await
+                .is_none(),
+            "读不出花了多少时放行：拦错一次是从中间截断一件工作"
+        );
+    }
+
+    /// 一次真实花销要回到这件任务上；没声明任务、没有门、零 token 时什么都不记。
+    ///
+    /// 零 token 那一格不是洁癖：账本里每天有大量零用量的行，把它们也算成一次调用
+    /// 会让「这件任务今天被问了多少次」变成一个与花销无关的数。
+    #[tokio::test]
+    async fn a_real_charge_reaches_the_task_and_nothing_else_does() {
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let gate = Arc::new(StubBudgetGate::new(budgeted(true, 0, 1000)));
+        state.task_budget = Some(gate.clone());
+
+        charge_task_budget(&state, None, 50).await;
+        charge_task_budget(&state, Some("t-1"), 0).await;
+        assert!(gate.charged.lock().unwrap().is_empty());
+
+        charge_task_budget(&state, Some("t-1"), 50).await;
+        assert_eq!(
+            gate.charged.lock().unwrap().as_slice(),
+            &[("t-1".to_string(), 50)]
+        );
+
+        // 没有预算门时也不 panic、不记：这一格是装配事实，不是判定结果。
+        state.task_budget = None;
+        charge_task_budget(&state, Some("t-1"), 50).await;
+        assert_eq!(gate.charged.lock().unwrap().len(), 1);
+    }
+
+    /// 管理面：没有预算门时**不假装**写成功。
+    ///
+    /// 写下去了而没有东西执行它，读的人会以为上限在生效——一件本该停下来的工作会
+    /// 一直跑，而账上写着它有上限。503 加一个点名缺什么的错误码，是这两种结果之间
+    /// 的分界。
+    #[tokio::test]
+    async fn the_budget_admin_answers_unavailable_rather_than_pretending_when_no_gate_is_wired() {
+        use tower::ServiceExt;
+
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.config.webhook_internal_secret = Some("internal-secret".into());
+        assert!(state.task_budget.is_none());
+        let app = router(state, true);
+
+        let body =
+            serde_json::json!({"task_id": "t-1", "soft_limit": 10, "hard_limit": 20}).to_string();
+        let req = axum::extract::Request::builder()
+            .uri(INTERNAL_TASK_BUDGET_PATH)
+            .method("POST")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
+            .header(
+                crate::secret_write::SIGNATURE_HEADER,
+                crate::secret_write::sign("internal-secret", body.as_bytes()),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "task_budget_unavailable");
+    }
+
+    /// 管理面：只给一半上限是 400。另一半会悄悄沿用旧值，而写下限的人想的是一整对。
+    #[tokio::test]
+    async fn half_a_limit_pair_is_a_bad_request() {
+        use tower::ServiceExt;
+
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.config.webhook_internal_secret = Some("internal-secret".into());
+        state.task_budget = Some(Arc::new(StubBudgetGate::new(budgeted(true, 0, 1000))));
+        let app = router(state, true);
+
+        let body = serde_json::json!({"task_id": "t-1", "hard_limit": 20}).to_string();
+        let req = axum::extract::Request::builder()
+            .uri(INTERNAL_TASK_BUDGET_PATH)
+            .method("POST")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
+            .header(
+                crate::secret_write::SIGNATURE_HEADER,
+                crate::secret_write::sign("internal-secret", body.as_bytes()),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"], "limits_are_a_pair");
     }
 }

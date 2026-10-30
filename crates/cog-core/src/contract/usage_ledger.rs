@@ -200,15 +200,18 @@ pub struct LlmUsageRecord {
     pub api_style: String,
     /// Real model name as configured on the upstream.
     pub model: String,
-    /// One of the platform's result words. The two refusals carry zero tokens
+    /// One of the platform's result words. The three refusals carry zero tokens
     /// but keep the attempt visible, and they are kept apart from `error`
     /// because the words name opposite repairs: an `error` row is an upstream
     /// that was tried and did not serve, `refused_by_circuit` is a call no
-    /// upstream was ever offered (the pool was known unusable), and
-    /// `refused_by_pace` is one this platform held back on purpose. Each reads
-    /// as its own state rather than as "no traffic". On a refusal row
-    /// `upstream` and `model` are `-`: no single upstream is its subject, so
-    /// both columns say so rather than naming a candidate.
+    /// upstream was ever offered (the pool was known unusable),
+    /// `refused_by_pace` is one this platform held back on purpose, and
+    /// `refused_by_budget` is one the job itself declared a ceiling for and has
+    /// now reached. Each reads as its own state rather than as "no traffic" --
+    /// and the last one is the only one whose repair is not "wait for capacity"
+    /// but "finish this job or raise its ceiling". On a refusal row `upstream`
+    /// and `model` are `-`: no single upstream is its subject, so both columns
+    /// say so rather than naming a candidate.
     pub result: String,
     /// Calling component as normalized by the gateway (`self_review`,
     /// `agent:<role>`, `unknown`); lets per-actor token spend be audited.

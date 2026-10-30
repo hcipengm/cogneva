@@ -501,11 +501,14 @@ pub struct Usage {
 /// gateway writes the rows, the observability crate queries them -- so the set
 /// lives here rather than beside either one.
 ///
-/// Two of the four are refusals we made, not answers the upstream gave.
+/// Three of the five are refusals we made, not answers the upstream gave.
 /// `refused_by_circuit` means no upstream was even tried (the pool was shut),
-/// and `refused_by_pace` means the window's allowance was spent. Recording
-/// either as `error` would read as "the upstream answered wrong" and point the
-/// repair at the wrong place.
+/// `refused_by_pace` means the window's allowance was spent, and
+/// `refused_by_budget` means the unit of work spent the ceiling someone
+/// declared for it. Recording any of them as `error` would read as "the
+/// upstream answered wrong" and point the repair at the wrong place -- and each
+/// of the three has a different repair, which is why they are three words and
+/// not one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageResult {
@@ -517,6 +520,13 @@ pub enum UsageResult {
     RefusedByCircuit,
     /// The window pacer refused before the request was sent.
     RefusedByPace,
+    /// 这件工作自己那份当日预算用完了，请求没发出去。
+    ///
+    /// 与上一条分开：配速拒的是「这一窗摊到此刻不够再开一件」，等窗口翻页会自己好；
+    /// 这一条拒的是「有人给这件任务声明了上限，它用完了」，等的不是窗口而是那个上限
+    /// ——而它多半该被读成「这件工作该收尾了」，不是「晚点再来」。两者合成一个词，
+    /// 修的人会去查窗口，而那窗口一点问题都没有。
+    RefusedByBudget,
 }
 
 impl UsageResult {
@@ -526,11 +536,12 @@ impl UsageResult {
     /// that spells one itself agrees with this enum only until a variant is
     /// renamed, and then it matches no rows -- which reads exactly like a
     /// ledger with nothing in it.
-    pub const ALL: [UsageResult; 4] = [
+    pub const ALL: [UsageResult; 5] = [
         UsageResult::Ok,
         UsageResult::Error,
         UsageResult::RefusedByCircuit,
         UsageResult::RefusedByPace,
+        UsageResult::RefusedByBudget,
     ];
 
     /// The word this outcome is stored under.
@@ -540,6 +551,7 @@ impl UsageResult {
             UsageResult::Error => "error",
             UsageResult::RefusedByCircuit => "refused_by_circuit",
             UsageResult::RefusedByPace => "refused_by_pace",
+            UsageResult::RefusedByBudget => "refused_by_budget",
         }
     }
 
@@ -778,6 +790,14 @@ pub fn responses_url(base_url: &str) -> String {
 /// The reason recorded when an inbound request names a face no member of the
 /// pool serves.
 pub const FACE_WITHOUT_A_MEMBER: &str = "face_has_no_serving_member";
+
+/// 拒绝的成因：这件工作自己那份当日预算用完了。
+///
+/// 与 [`FACE_WITHOUT_A_MEMBER`] 同一类东西——写在响应正文里、给调用侧的故障转移与
+/// 告警规则读的那一格。同一个 429 也来自配速，两者靠这一格分开：配速说「池子紧，
+/// 等一等」，这一条说「这件工作该收尾了」。写成常量而不是两处字面量，是因为写它的
+/// （网关）与读它的（告警规则、WebUI）不在同一个 crate 里。
+pub const REFUSED_BY_BUDGET: &str = "task_budget_spent";
 
 /// Which field names the token ceiling for an upstream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

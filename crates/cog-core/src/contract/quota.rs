@@ -257,6 +257,60 @@ pub trait WorkspaceQuotaSource: Send + Sync {
     async fn workspace_remaining(&self, workspace_id: &str) -> u64;
 }
 
+/// 按任务的 token 预算：一件工作由调用方自己声明上限。
+///
+/// 与 [`HierarchyManager`] 的五级级联是两件事，不是它的第六级：那五级互相**包含**
+/// （用户属于工作区，工作区属于团队……），检查时逐级走；任务是工作单位，属于某个
+/// 租户却不与任何一级构成上下级关系。把任务塞进 `scope` 那个闭集里，`cascade_order`
+/// 就变成一个混着两种关系的列表，按它逐级走的检查会把两件事读成一件。
+///
+/// 声明的是**今天**的上限：计数到下一个 UTC 午夜归零，被拒的那一发拿到的等待也是
+/// 到那个午夜。
+///
+/// 写成契约而不是让网关直接依赖实现，是因为写它的（配额实现）与问它的（LLM 代理
+/// 路径）在不同的 crate 里，而业务 crate 之间不直接互相依赖：两边各自认这一个 trait，
+/// 由装配根把它们接起来。
+#[async_trait::async_trait]
+pub trait TaskBudgetGate: Send + Sync {
+    /// 声明（或改写）一件任务的软/硬上限。改写不动今天的计数：改上限不是发一笔新额度。
+    async fn set_budget(&self, task_id: &str, limits: QuotaLimits) -> SFResult<()>;
+
+    /// 撤掉声明，让这件任务回到「没人管」。本来就没有不是错误。
+    async fn clear_budget(&self, task_id: &str) -> SFResult<()>;
+
+    /// 这件任务声明的上限，`None` 表示没人声明过。
+    ///
+    /// 与 [`Self::check`] 答的不是同一个问题：检查用的是一份会退到默认值的上限，
+    /// 读那份答案的人分不出「按默认值配的」与「没人配过」。
+    async fn budget(&self, task_id: &str) -> SFResult<Option<QuotaLimits>>;
+
+    /// 判这一发放不放行，不记账。`now_unix` 是参数而不是读时钟：日界决定了拒绝时
+    /// 给出多少等待，而「午夜前一秒」那一格只有把时钟交进来才测得了。
+    async fn check(&self, task_id: &str, now_unix: i64) -> SFResult<TaskBudgetVerdict>;
+
+    /// 记一次真实花销，返回记完之后今天这件任务的累计。
+    async fn charge(&self, task_id: &str, tokens: u64, now_unix: i64) -> SFResult<u64>;
+}
+
+/// 一次按任务预算的判定。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskBudgetVerdict {
+    /// 有没有人给这件任务声明过上限。`false` 时下面三个上限字段无意义。
+    pub budgeted: bool,
+    /// 今天这件任务已经花掉的 token。
+    pub spent_today: u64,
+    /// 声明的软上限（只用来告警/响应头）。
+    pub soft_limit: u64,
+    /// 声明的硬上限。
+    pub hard_limit: u64,
+    /// 这一次放不放行。
+    pub allowed: bool,
+    /// 放行了，但这一发已经跨过软上限。
+    pub warning: bool,
+    /// 被拒时离下一次重置还有多少秒。
+    pub wait_secs: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
