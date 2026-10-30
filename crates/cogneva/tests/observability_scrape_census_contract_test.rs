@@ -784,7 +784,19 @@ fn a_registration_no_rule_and_no_panel_reads_is_a_counted_row() {
 /// number that moved rather than as a name nobody noticed. It is not a target
 /// either -- a series that acquires a rule, a panel or a shipped read leaves
 /// this number, and adding one means admitting a new series nobody reads.
-const STORE_BACKED_WITHOUT_A_READER: usize = 40;
+///
+/// Forty-one since the advance's starvation moved from a count to an instant.
+/// The deferral counter was published so a rule could bound it, and that rule
+/// now reads seconds instead: a round is ten minutes long, so the count is
+/// nearly independent of the duration it stood for. The counter is still
+/// written, because the control law compares that same number inside the
+/// process -- the third consecutive refusal is what makes the advance claim a
+/// slot -- but nothing on the reading faces consumes it any more, and the
+/// alert-rule census files that as `Elsewhere` against the series that
+/// replaced it. Counting it here is what says so out loud rather than leaving
+/// the loss of a reader to be discovered by whoever next asks why the row is
+/// still published.
+const STORE_BACKED_WITHOUT_A_READER: usize = 41;
 
 #[test]
 fn a_series_the_store_can_hold_with_no_reader_is_a_counted_row() {

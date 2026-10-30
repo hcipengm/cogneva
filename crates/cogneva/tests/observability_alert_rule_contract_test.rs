@@ -1115,6 +1115,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_mainline_advance_deferrals",
         "crates/cog-reflection/src/mainline_deployer.rs",
     ),
+    // 同一段等待的另一个量纲：起点。记的是「从哪一刻开始等」，没在等的轮写 0。
+    // 用起点而不是「已经等了多久」，因为一轮才写一次的话年龄在两次采样之间是常数，
+    // `for:` 短于一拍就永远凑不满；而写起点让陈旧落回 `_observed_timestamp_seconds`
+    // 那条伴生腿，与这一族其它规则同一个形状。0 是一个会被读到的真实值而不是缺席：
+    // 纪元那一刻的年龄不是等待，所以规则必须先问 `> 0` 再算年龄。
+    (
+        "cogneva_mainline_advance_wait_since_unix",
+        "crates/cog-reflection/src/mainline_deployer.rs",
+    ),
     // 版本契约的另一半：判定跑过了。它上面那条（`cogneva_version_contract_violations`）是
     // 按条款读的常驻值，而判定停摆时那条读数停在零——与契约成立同一个零——所以这个计数
     // 是分开两者的那一面。它每轮、每条款各写一次，且停在共享存储里：判定停了，最后那个
@@ -4215,6 +4224,19 @@ fn the_pending_band_is_counted() {
 /// yet, or a repair that is a policy decision rather than a reader to write.
 /// `GAPS_AT_CENSUS` counts them so the next one must be classified deliberately.
 const UNREAD: &[(&str, Unread)] = &[
+    // 被拒轮次的计数。它当初是为饿死那一面建的，而那个面现在按秒读：连续多少轮没拿到
+    // 槽与「等了多久」是两个量纲，轮长十分钟时前者几乎不随后者变（同样十六段等待，
+    // 三千多秒那次数到二），所以规则改读 `cogneva_mainline_advance_wait_since_unix`，
+    // 这一格就失去了它唯一的读者。它仍在写，因为写它的那个函数是控制律取数的同一处：
+    // 阈值比的是这个数（连续三轮被拒就去认领名额），分开写会让两个消费者读两份可能
+    // 不同步的账。所以它不是一个可以撤掉的登记，而是一格只剩进程内消费者的读数。
+    (
+        "cogneva_mainline_advance_deferrals",
+        Unread::Elsewhere {
+            readers: &["cogneva_mainline_advance_wait_since_unix"],
+            reason: "同一件事（推进被构建槽饿住）由读数面按秒读，规则读的是那一条；这一格仍写，但只剩进程内的控制律比它",
+        },
+    ),
     // An eval A/B gate ends in "did not measure" more often than not right now:
     // the repository ships no fixed eval task set, so the sandbox agent reports
     // `applicable=false` on every run. What would make a run of those skips a
