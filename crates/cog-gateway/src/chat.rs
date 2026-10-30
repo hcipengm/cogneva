@@ -406,9 +406,10 @@ pub async fn run_chat_turn(
     // Both chat faces answer a person who is waiting, so both are interactive
     // spend — unlike the pool the same process drives on its own.
     .with_origin(LlmOrigin::Interactive.as_str())
-    // 这一发记在谁的头上。这是平台里唯一一处「身份已经过鉴权」的地方：值来自
-    // 升级握手时解出的令牌，不是调用方自己填的名字，所以按人的当日额度可以拿它
-    // 去判——别处报上来的名字只配被记录，不配被判定。
+    // 这一发记在谁的头上。值来自升级握手时解出的令牌，不是调用方自己填的名字。
+    // 网关代理那条路上同一根轴读 `x-cogneva-owner`，会写进同一张账、按同一个人的
+    // 当日额度判——区别只在那条路信任的是另一个已经鉴权过一个人的调用方，不是名字
+    // 本身更可信；两条路都只允许「手里真有一个主体」的地方填它。
     .with_owner(&owner);
 
     // 4. Stream the reply: deltas are forwarded as they arrive.
