@@ -300,7 +300,7 @@ fn referenced_modules(
     owners: &BTreeMap<String, BTreeSet<String>>,
 ) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let mut attribute = |name: &str, out: &mut BTreeSet<String>| {
+    let attribute = |name: &str, out: &mut BTreeSet<String>| {
         if modules.contains(name) {
             out.insert(name.to_owned());
         }
