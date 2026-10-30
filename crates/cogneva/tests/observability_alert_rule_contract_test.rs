@@ -1480,6 +1480,22 @@ const FOREIGN: &[(&str, &str)] = &[
         "同上（生产者跑成了，却一条序列都没发）。它与 `up` 必须分成两条：脚本崩了与输入读不到修法不同，合成一格就指不出该改哪边",
     ),
     (
+        "host_reading_producer_capped",
+        "同上（这一拍撞到聚合器自己的上限而没有跑完）。它与 `producer_up` 必须分成两条，而这一条**只有聚合器知道**：生产者自己不知道自己是被挤死的，它的退出码与一次普通崩溃相同。2026-10-30 实测，五十个生产者串行跑一拍要 134 秒，排在后半段的那几个起跑时机器已被同一批生产者压满，于是每拍都撞上限、落成 `up 0`——那四个读数看上去是「生产者坏了」，实际是「这一拍的预算不够」。修法相反：前者改生产者，后者改调度或上限",
+    ),
+    (
+        "host_reading_beat_seconds",
+        "同一聚合器自己量的上一拍墙钟耗时。它判的是这个通道**跟不跟得上自己声明的周期**：一拍比周期慢时，端点照常回一份完整、合法、只是更旧的表，抓取侧看不出任何异常，`up` 与每一个 `producer_up` 都是 1。没有这一格，「这条通道按三分半的节奏发数」这件事只能靠人拿秒表量",
+    ),
+    (
+        "host_reading_beat_period_seconds",
+        "同上（它这一拍声明的周期）。规则里的界是它的倍数，因为周期是配出来的：写死一个常数的话，宿主上改了调度、界不会跟着改，而失败方向是静默的——周期调大之后规则仍按旧数发火，调小之后它对真超时永远沉默。它与上一格同生同灭：端点读不到时两格一起缺席，那时由 `up` 那条规则报",
+    ),
+    (
+        "host_reading_served_age_seconds",
+        "同上（端点此刻回的那份表有多旧，按抓取时刻算，不是按拍算）。拍长那一格判不了「刷新线程卡死」：卡死之后没有任何一拍完成，`beat_seconds` 冻在最后一个健康值上，规则永远不会亮，而端点还在回一份每一格都写着正常的旧表。只有这一格会继续涨——它也是这份表里唯一一个不是由某一拍写出来的读数",
+    ),
+    (
         "reading_producer_absent",
         "宿主生产者 `scripts/host/cogneva-reading-producer-reading.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 印出。它判的是抓取面而不是树：`crates/cog-gateway/src/readings.rs` 里每条读数点名的指标，在 Prometheus 里至少有一条样本吗。这一格与上面两条分工相反——那两条问「宿主脚本跑没跑成」，它问「读数点名的指标有没有人发」。0 条缺席才是健康；缺席的那几条由同族的 `reading_producer_missing` 按读数 id 与指标名点名，所以这一格只给判据、不给成因",
     ),
@@ -1582,6 +1598,10 @@ const FOREIGN: &[(&str, &str)] = &[
     (
         "cogneva_host_target_gc_outcome",
         "同一生产者（闭集六种结局的 one-hot：below_trigger／released／floor_unreachable／script_unverified／probe_failed／planned）。三种红必须分开：够不到地板是「去看谁在吃盘」，probe_failed 是进程身份读不到（权限），script_unverified 是脚本身份立不住（提交或还原）。合成一个布尔就指不出该修哪边",
+    ),
+    (
+        "cogneva_host_target_gc_left_alone",
+        "同一生产者（这一趟因为构建占着树而没敢删的目标数，闭集六种结局之外的那个数）。它与 `outcome` 不重叠：outcome 说的是「这一趟判成了什么」，它说的是「有多少该做的没做」。大于零时高出地板的缺口不是缓存的证据——树被构建握着的时候删不了，缺口会一直摆在那儿，而面板上看不出是缓存真的没清还是这一趟被挡在树外；整格缺席＝它这次没看，不是它看见零棵树被挡（那一格在走不到删除那一步时才为 null）",
     ),
     (
         "cogneva_host_nvme_written_bytes_total",
