@@ -305,3 +305,133 @@ tests:
       - eval_time: 30m
         alertname: CognevaRefusalRedispatchBroken
         exp_alerts: []
+
+  # 一拍比它声明的周期慢。样本就是 2026-10-30 12:46 那次实测：一拍 134 秒、周期 60 秒、
+  # 每个生产者都跑成了（`producer_up` 全 1）——四条旧规则一条都不亮，所以这一格必须自己亮。
+  - name: 一拍 134 秒而周期写的是 60 秒会响（慢，不是死）
+    interval: 1m
+    input_series:
+      - series: 'host_reading_beat_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '134x30'
+      - series: 'host_reading_beat_period_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '60x30'
+      - series: 'host_reading_served_age_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '30x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaHostReadingsBeatOverBudget
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+      # 同一份输入下「表还新」⇒ 停更那条不许跟着响。两条规则喂同一份数据时，写坏的
+      # 典型是一起亮，那样人只看得到第一条、永远学不到第二条在判什么。
+      - eval_time: 25m
+        alertname: CognevaHostReadingsServedStale
+        exp_alerts: []
+
+  - name: 一拍 45 秒（并发之后实测）不会响
+    interval: 1m
+    input_series:
+      - series: 'host_reading_beat_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '45x30'
+      - series: 'host_reading_beat_period_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '60x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaHostReadingsBeatOverBudget
+        exp_alerts: []
+
+  - name: 拍长冻住而表在变旧会响（刷新线程卡死）
+    interval: 1m
+    input_series:
+      # 卡死之后没有任何一拍完成，`beat_seconds` 停在最后一个健康值上：这一条喂的就是
+      # 「拍长看着正常」，所以只有年龄那条能亮。
+      - series: 'host_reading_beat_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '45x40'
+      - series: 'host_reading_beat_period_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '60x40'
+      - series: 'host_reading_served_age_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '30x10 121x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaHostReadingsServedStale
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+      - eval_time: 25m
+        alertname: CognevaHostReadingsBeatOverBudget
+        exp_alerts: []
+
+  - name: 健康的一拍（45 秒、表 30 秒）两条都不响
+    interval: 1m
+    input_series:
+      - series: 'host_reading_beat_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '45x30'
+      - series: 'host_reading_beat_period_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '60x30'
+      - series: 'host_reading_served_age_seconds{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '30x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaHostReadingsServedStale
+        exp_alerts: []
+
+  # `up == 0` 一直压着两种成因。这一格喂「被自己人挤死」：`up` 是 0（序列停更），
+  # 但它没崩——聚合器按下过这一拍的上限。两条规则必须一格亮一格不亮，否则分开它就没意义。
+  - name: 撞上限的那一条只算被挤死，不算崩了
+    interval: 1m
+    input_series:
+      - series: 'host_reading_producer_up{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="face_four_rings"}'
+        values: '0x30'
+      - series: 'host_reading_producer_capped{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="face_four_rings"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaHostReadingProducerDown
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: CognevaHostReadingProducerCapped
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              producer: face_four_rings
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  # 反向：真崩了（`capped` 是 0）时只有「崩了」那条亮。少了这一格，把 `unless`
+  # 写反（写成 `and`，或把 `== 1` 写成 `== 0`）也会让上一格全绿。
+  - name: 真崩了的时候只有「崩了」那条亮
+    interval: 1m
+    input_series:
+      - series: 'host_reading_producer_up{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="host_spin"}'
+        values: '0x30'
+      - series: 'host_reading_producer_capped{instance="cogneva",job="cogneva-host-readings",node="cogneva",producer="host_spin"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaHostReadingProducerCapped
+        exp_alerts: []
+      - eval_time: 25m
+        alertname: CognevaHostReadingProducerDown
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              producer: host_spin
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性

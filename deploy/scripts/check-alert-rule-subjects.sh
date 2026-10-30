@@ -357,8 +357,11 @@ def find_container(o):
 # 这些名字就自动回到「未收敛」一栏，而不是继续被静默放行。
 NO_POD_REPORTER = {
     'CognevaHostReadingProducerDown': 'host_reading_producer_up',
+    'CognevaHostReadingProducerCapped': 'host_reading_producer_capped',
     'CognevaHostReadingProducerUnreadable': 'host_reading_producer_unreadable',
     'CognevaHostReadingsEndpointDown': 'up{job="cogneva-host-readings"}',
+    'CognevaHostReadingsBeatOverBudget': 'host_reading_beat_seconds',
+    'CognevaHostReadingsServedStale': 'host_reading_served_age_seconds',
     'CognevaHostCredentialSurfaceStale': 'cogneva_host_credential_surface_age_seconds',
     'CognevaHostCredentialSurfaceCadenceUnknown': 'cogneva_host_credential_surface_period_seconds',
     'CognevaHostCredentialSurfaceNeverRan': 'cogneva_host_credential_surface_measured',

@@ -39,10 +39,20 @@ spec:
   groups:
     - name: cogneva-host-readings
       rules:
-        # 生产者死了：它在窗口内每一拍都没跑成（超时、崩溃、脚本不在）。
+        # 生产者死了：它在窗口内每一拍都没跑成（崩溃、脚本不在），**不含撞上限的**。
         # 10 分钟＝十拍，够长到不会被一次重装或一次换机器误报。
+        #
+        # `up == 0` 一直是两种成因同形：生产者自己崩了，与聚合器把这一拍的预算算短了、
+        # 它跑到一半被 `timeout` 收走。后者的退出码与崩溃逐字相同，**只有聚合器知道**
+        # 自己按下过那个上限，所以由它另发一格 `host_reading_producer_capped`。这里用
+        # `unless` 把它让给下一条规则：两种成因修法相反（改生产者 / 改调度或上限），
+        # 合成一条消息就会把一半的人送到错的地方去修。
+        #
+        # `unless` 而不是 `and ... == 0`：那一格缺席时（老端点、或这一拍还没发）本条要
+        # 照旧按「崩了」报。用 `and` 的话，缺席会让这条规则对那个生产者**永远沉默**——
+        # 一个用来分辨成因的标签，不该有能力关掉主判据。
         - alert: CognevaHostReadingProducerDown
-          expr: host_reading_producer_up == 0
+          expr: host_reading_producer_up == 0 unless on(producer) host_reading_producer_capped == 1
           for: 10m
           labels:
             cogneva_io_managed: "true"
@@ -50,7 +60,22 @@ spec:
             severity: warning
           annotations:
             summary: "宿主读数生产者 {{ $labels.producer }} 没跑成"
-            description: "它每拍都超时/崩溃；这一面的序列停在最后一次的值上，不能当当前读数用。"
+            description: "它每拍都崩溃或脚本不在；这一面的序列停在最后一次的值上，不能当当前读数用。撞上限的那一种不走这条，见 `CognevaHostReadingProducerCapped`。"
+
+        # 撞到聚合器自己给的那一拍预算：生产者没崩，是这一拍跑不完它。2026-10-30 实测，
+        # 五十个生产者串行跑一拍要 2 分 14 秒，排在后半段的几个起跑时机器已被同一批
+        # 生产者压满，于是每拍都撞上 30 秒上限。它与「崩了」必须分成两条：修一个生产者
+        # 的代码，与改这一拍的调度/上限，是两件不同的事，而退出码看不出这个区别。
+        - alert: CognevaHostReadingProducerCapped
+          expr: host_reading_producer_capped == 1
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "读数正确性"
+            severity: warning
+          annotations:
+            summary: "宿主读数生产者 {{ $labels.producer }} 每拍都撞上限"
+            description: "它没崩，是这一拍的时间不够它跑完：先看它单独跑要多久，再看这一拍的并发与上限。持续撞上限意味着这一格读数一直在报「没跑成」，而真正的病在调度。"
 
         # 生产者活着但读不到输入：它这一拍一条序列都没发。这不是生产者坏了，是上游
         # （账本、集群、仓库）读不到——修的位置完全不同。
@@ -91,6 +116,42 @@ spec:
           annotations:
             summary: "宿主读数端点抓不到"
             description: "所有宿主侧面读数同时停更；十环与落地≠生效会各自退化成 absent，而不是变绿。"
+
+        # 上面几条判的都是「某一拍跑没跑成」，判不了**这一拍比它声明的周期慢了多久**。
+        # 2026-10-30 实测：一拍串行跑五十个生产者要 2 分 14 秒，而这台端点的周期写着
+        # 60 秒——通道照常回一份完整、合法、只是更旧的表，抓取侧看不出任何异常，
+        # 四条规则一条都不亮。慢不等于死：`up` 是 1，每个 `producer_up` 也是 1。
+        #
+        # 两边都从端点自己发：`beat_seconds` 是上一拍的实测耗时，`beat_period_seconds`
+        # 是它声明的周期。别把 60 写进表达式——周期可配，写死的界迟早会与真的周期分家，
+        # 而分家的方向恰好是「周期被调大之后这条规则还在按 60 秒发火」。
+        - alert: CognevaHostReadingsBeatOverBudget
+          expr: host_reading_beat_seconds > host_reading_beat_period_seconds
+          for: 10m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "读数正确性"
+            severity: warning
+          annotations:
+            summary: "宿主读数一拍 {{ $value }} 秒，超过它自己声明的周期"
+            description: "通道还活着、每条生产者都跑成了，但整条通道发不出新数：它按「一拍耗时」的节奏在发，而抓取侧以为那是 60 秒一拍。修的是拍长（生产者并发或单个生产者太慢），不是这条规则。"
+
+        # 上一条判「慢」，这一条判「停」。两者不能合成一条：刷新线程卡死时没有任何一拍
+        # 完成，`beat_seconds` 就冻在最后一个健康值上——那条规则**永远不亮**，而端点还在
+        # 回一份每一格都写着「正常」的旧表。只有按抓取时刻算的年龄会往上涨。
+        #
+        # 两倍周期是给抖动留的：「一拍跑完才写、写完立刻算下一拍」这条自定拍的循环里，
+        # 抓取时刻落在两次写之间的任意位置，健康时年龄最大就接近一个周期。
+        - alert: CognevaHostReadingsServedStale
+          expr: host_reading_served_age_seconds > 2 * host_reading_beat_period_seconds
+          for: 5m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "读数正确性"
+            severity: warning
+          annotations:
+            summary: "宿主读数端点回的表已经 {{ $value }} 秒没更新"
+            description: "端点进程还在、表也合法，但那份表比两拍还旧：刷新线程停了或卡住了。它里面的每一格都写着出事之前的判词——这个形状没有任何一条别的规则认得出。"
 
     # 上面三条判的是「生产者这一拍跑没跑成」。有一类生产者能在上游停更之后
     # 继续每一拍都跑成：它读的是一份「每拍追加一行」的归档，最后一行永远停在

@@ -116,6 +116,14 @@ spec:
         #     翻过去也不会多出权限来，能结束它的只有换一次凭证。不剔的话，一个带着未来重置
         #     时刻的 `entitlement` 上游会替整池顶下这句话，把「等」和「必须有人动」报成
         #     同一句；两种的修法相反，所以它们不能互相顶替（成对夹具第八格钉这一处）。
+        #
+        #     这一项自己也要写者判据：`llm_upstream_refusal_kind` 是共享表服务的 gauge，
+        #     写者停下时序列不会缺席，只会把最后一笔 `entitlement` 永久送出去——于是一条
+        #     早就换了凭证、或者早就没人写的旧读数，会永远替整池免掉这条告警。界取一小时，
+        #     与上面三条腿同宽。**界放在内层、不放最外层**：这一项的作用是「免掉一条本该响
+        #     的告警」，读数老了就不该再免；放在内层时读数是旧的只是不再豁免，告警照响
+        #     （fail-safe），放在最外层则会连主判据一起静默——而这条规则静默下来，现网就
+        #     没有任何一格在说「等不到」。
         - alert: CognevaLlmPoolNoDeclaredReturn
           expr: |
             count(min by (upstream) (llm_upstream_healthy) == 0)
@@ -129,7 +137,11 @@ spec:
                 and on(upstream)
                   (min by (upstream) (llm_upstream_healthy) == 0)
                 unless on(upstream)
-                  (max by (upstream) (llm_upstream_refusal_kind{kind="entitlement"}) == 1)
+                  (
+                      (max by (upstream) (llm_upstream_refusal_kind{kind="entitlement"}) == 1)
+                    and on(upstream)
+                      (max by (upstream) ((time() - llm_upstream_refusal_kind_observed_timestamp_seconds{kind="entitlement"}) < 3600))
+                  )
               )
           for: 1h
           labels:
