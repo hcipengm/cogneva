@@ -39,6 +39,10 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: host-ledger
+        # Pod 模板上要有版本：`kubectl get pods -L app.kubernetes.io/version` 那一列
+        # 只读这里。对象级的同名标签只到 DaemonSet 这一层，缺了它每个 Pod 那一格都是
+        # 空的，而空格读作「这个 Pod 不归发布管」，与「它跑的是上一版」在屏上没有区别。
+        app.kubernetes.io/version: "0.5.10"
     spec:
       securityContext:
         runAsNonRoot: true
