@@ -26,9 +26,10 @@
 //! 两样都缺，用户点完授权只能复制粘贴。消融：把 `ContributionOverlay` 那一行改回
 //! `'_blank', 'noopener'`，本门红；删掉它的 `message` 监听同样红。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::common::routes::{read, repo_root, strip_comments, walk};
+use crate::common::rust_production::relative_name;
 
 const WEB_SRC: &str = "web/src";
 /// 落地页发回来的那条消息。两端各拼一遍，这里只认这一个词。
@@ -54,7 +55,7 @@ fn popups() -> Vec<Popup> {
     for path in files {
         let text = read(&path);
         let code = strip_comments(&text);
-        let rel = relative(&root, &path);
+        let rel = relative_name(&root, &path);
         for (index, line) in code.lines().enumerate() {
             let trimmed = line.trim();
             if !trimmed.contains("window.open(") || !trimmed.contains("authorize_url") {
@@ -68,13 +69,6 @@ fn popups() -> Vec<Popup> {
         }
     }
     out
-}
-
-fn relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
 }
 
 #[test]
