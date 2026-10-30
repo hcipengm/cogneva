@@ -7338,7 +7338,12 @@ impl MainlineDeployer {
                 "--",
                 "sh",
                 "-c",
-                "cd /src/web && npm ci --no-audit --no-fund && npm run build",
+                // 与全量构建那段 `webbuilder` 逐字对齐：node:22-slim 自带的 npm 有
+                // "Exit handler never called!" 的已知 bug（npm/cli），在容器里稳定复现，
+                // 先升级 npm 再 `npm ci`。少了这一句，overlay 这一趟走的是全量构建
+                // 特意绕开的那条路——而 overlay 恰恰是每次换版都要跑的那一条。
+                "cd /src/web && npm install -g npm@latest --no-audit --no-fund \
+                 && npm ci --no-audit --no-fund && npm run build",
             ],
         )
         .await?;

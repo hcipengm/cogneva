@@ -129,6 +129,51 @@ fn the_image_build_hands_the_argument_to_npm() {
     );
 }
 
+/// 两条前端构建的路都在 `npm ci` 之前先升级 npm。
+///
+/// node:22-slim 自带的 npm 有 "Exit handler never called!" 的已知 bug（npm/cli），
+/// 在容器里稳定复现；全量构建早就绕开了它，而 overlay 这一趟——每次换版都会跑的那
+/// 一条——没有。绕过它的那句写在一个 `sh -c` 字符串里，没有任何东西比对过两处，
+/// 所以同一条已知失败在两条路上是一个绕开、一个没绕开，而两边产物各自看起来都完整。
+///
+/// 判两个方向：两边都还有这句，且都在 `npm ci` 之前——顺序反了等于没绕（`npm ci`
+/// 才是会撞上那个 bug 的那一步）。
+#[test]
+fn both_build_paths_upgrade_npm_before_ci() {
+    let root = repo_root();
+
+    let dockerfile = text_of(&root, "Dockerfile");
+    let upgrade = dockerfile
+        .find("npm install -g npm@latest")
+        .unwrap_or_else(|| panic!("Dockerfile 不再升级 npm，它会撞上 node:22-slim 自带的那个 bug"));
+    let ci = dockerfile
+        .find("npm ci")
+        .unwrap_or_else(|| panic!("Dockerfile 里找不到 `npm ci`"));
+    assert!(
+        upgrade < ci,
+        "Dockerfile 先 `npm ci` 再升级 npm——顺序反了等于没绕开那个 bug"
+    );
+
+    let source = text_of(&root, "crates/cog-reflection/src/mainline_deployer.rs");
+    let deployer = source
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("按定义总有第一段");
+    let overlay = deployer
+        .find("cd /src/web && npm install -g npm@latest")
+        .unwrap_or_else(|| {
+            panic!(
+                "overlay 这一趟没有在 `npm ci` 之前升级 npm——全量构建绕开的那个 bug，\
+                 在这一条上一次也没绕"
+            )
+        });
+    let after = &deployer[overlay..];
+    assert!(
+        after.contains("npm ci"),
+        "overlay 的升级那句后面没有 `npm ci` 了——这一段形状变了，先确认现在跑的是什么"
+    );
+}
+
 /// overlay 这一趟用那个旋钮，而不是继续把常量钉死在命令行里。
 ///
 /// 钉死的形式没有红过，因为默认值恰好是对的；只有在主机够不着默认地址那天才分家，
