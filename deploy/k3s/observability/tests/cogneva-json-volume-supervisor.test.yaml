@@ -190,7 +190,7 @@ tests:
               severity: warning
               persistentvolumeclaim: data
 
-  # 声明 21Gi、授予 20Gi，而循环每拍都判「没人应答」（orphaned 每拍 +1）：扩容被孤立了。
+  # 例如声明 21Gi、授予 20Gi（差 1Gi），而循环每拍都判「没人应答」（orphaned 每拍 +1）：扩容被孤立了。
   # 这一格的标签就是该动的那一个对象——卷名与存储类都在告警上，不用去比对象。
   - interval: 5m
     input_series:
