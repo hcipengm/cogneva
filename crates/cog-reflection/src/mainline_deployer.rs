@@ -15232,6 +15232,7 @@ exec {real} "$@"
     /// 复问的位置在**第一处写动作之前**，判词落在签名里：这一版为什么没落地，
     /// 读终止消息的人要能一眼看出「上游判的红」，而不是与集群侧的失败混在一个
     /// 说不清的落点里。它同时按版本类处置——上游跑过的那一遍是这一版的属性。
+    /// principle: feedback_a_new_failure_locus_must_answer_both_stages_not_just_the_one_you_came_for
     #[test]
     fn the_ci_hold_signature_survives_the_termination_channel() {
         let sig = upstream_ci_hold_signature();
@@ -15267,6 +15268,7 @@ exec {real} "$@"
     /// 派发时答"还在跑"的那一版，落地之前必须再问一次：2–3 分钟的构建窗口足够
     /// 一条检查跑出结论，而这条通道上此后再没有人复读。这里证明 Job 侧的复问
     /// 真的会扣住，而且回的是哪一个上游、哪一条检查。
+    /// principle: feedback_a_guard_asked_twice_must_bracket_the_stretch_that_makes_the_answer_change
     #[tokio::test]
     async fn the_rollout_asks_ci_again_before_it_touches_the_cluster() {
         let (endpoint, handle) = fake_registry(vec![http_200(
