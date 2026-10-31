@@ -11,8 +11,12 @@
 #     还没等到下一拍换届，不是丢角色。
 #   - `background_loop_role_split`：两条序列各为 1 才相加成 2；`unowned` 在那一格里必须静——
 #     有人持有（两个人持有也是持有），而它的抑制腿只看「最大值是不是 1」。
-#   - 三条计数器（死亡、重启、探测失败）不走窗口就不响；`role_books_unbalanced` 只有在
+#   - 两条计数器（死亡、重启）不走窗口就不响；`role_books_unbalanced` 只有在
 #     取得、失去、持有三者对不上时才响。
+#   - `background_loop_role_probe_failing` 两条腿：计数是记忆（近一小时有过失败的询问），
+#     当下状态是判词（声明还在、却没有任何进程在发持有读数），再压五分钟的保持。只有计数
+#     那一腿时，十秒的池超时会把这个行挂满一小时，而循环早就回去问了——一行说着「停了」
+#     而循环在转，读的人迟早学会跳过它。
 #
 #   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
 #   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-background-loops.test.yaml \
@@ -79,8 +83,9 @@ tests:
         exp_alerts: []
 
   # 一个坏掉的 loop：心跳停在 400 秒（界是 6×60+30=390，刚过去十秒）、死了一次、重启过一次、
-  # 探测失败两次、账上取得 5、失去 2、持有 1（对不上二）。五条亮；角色有关的另外两条静：
-  # 声明了、也正有人持有。
+  # 探测失败两次、账上取得 5、失去 2、持有 1（对不上二）。四条亮；角色有关的另外三条静：
+  # 声明了、也正有人持有——探测失败过两次，可那个进程本来就不该动手，它拿不到答案一分钱
+  # 也不亏，所以 `probe_failing` 也必须静。
   - interval: 1m
     input_series:
       - series: 'cogneva_loop_tick_age_seconds{loop="bad"}'
@@ -124,10 +129,7 @@ tests:
               loop: bad
       - eval_time: 60m
         alertname: background_loop_role_probe_failing
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              loop: bad
+        exp_alerts: []
       - eval_time: 60m
         alertname: background_loop_role_books_unbalanced
         exp_alerts:
@@ -140,6 +142,61 @@ tests:
       - eval_time: 60m
         alertname: background_loop_role_split
         exp_alerts: []
+
+  # 问不出角色的那一格：声明还在、探测一直失败、而**没有任何进程在发持有读数**——这正是
+  # 询问拿不到答案留下的形状（那时持有序列是故意缺的，不是 0）。`probe_failing` 亮；同一
+  # 格里 `unowned` 也亮，这是设计好的配对：一个说没人持有，一个说为什么没人说得出。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_loop_tick_age_seconds{loop="unanswered"}'
+        values: '30x60'
+      - series: 'cogneva_loop_period_seconds{loop="unanswered"}'
+        values: '60x60'
+      - series: 'cogneva_loop_work_budget_seconds{loop="unanswered"}'
+        values: '30x60'
+      - series: 'cogneva_loop_owner_probe_failures_total{loop="unanswered"}'
+        values: '0x5 2x55'
+      - series: 'cogneva_loop_role_declared{loop="unanswered"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: background_loop_role_probe_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              loop: unanswered
+      - eval_time: 60m
+        alertname: background_loop_role_unowned
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              loop: unanswered
+
+  # 刚问不出来的那一格：计数从第一分钟就有了，状态也一直是「说不清」，可到第三分钟为止
+  # 只持续了两分钟。这一格守着那五分钟的保持——去掉 `for_seconds`，同一个夹具在 3m 上就
+  # 会亮，而那正是「十几秒的池超时挂满一小时」的来源：状态会自己清掉，行却留了下来。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_loop_tick_age_seconds{loop="blip"}'
+        values: '30x60'
+      - series: 'cogneva_loop_period_seconds{loop="blip"}'
+        values: '60x60'
+      - series: 'cogneva_loop_work_budget_seconds{loop="blip"}'
+        values: '30x60'
+      - series: 'cogneva_loop_owner_probe_failures_total{loop="blip"}'
+        values: '0x1 2x59'
+      - series: 'cogneva_loop_role_declared{loop="blip"}'
+        values: '1x60'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: background_loop_role_probe_failing
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: background_loop_role_probe_failing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              loop: blip
 
   # 没声明周期的 loop：心跳再老也不归 `stalled` 问。这一格守着表达式末尾那条 `period > 0`——
   # 删掉它，界会退化成 `6×0 + 预算`，任何一条只报心跳年龄、不报周期的序列都会在健康态上
