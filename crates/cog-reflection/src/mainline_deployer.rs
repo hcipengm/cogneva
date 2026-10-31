@@ -2016,6 +2016,15 @@ struct CiHold {
     /// 开始扣住的那一刻，unix 秒。它是被扣住时长的起点，也是
     /// `cogneva_mainline_ci_hold_seconds` 那条读数的来源。
     since_unix: i64,
+    /// 把这一版判红的那几项检查，形如 `<platform>:<name>`；空集是「结论来自提交状态
+    /// 兜底」——那时上游没说哪几项，不是「没有失败项」。
+    ///
+    /// 它必须跟着扣住一起落盘，不能等到结束时再回头看：扣住一结束，`last_ci_verdict`
+    /// 就被下一轮的判词覆盖（判过才放的那一支写成 `pass`，失败项自然是空的），而扣住
+    /// 时那一行日志随 Pod 滚动消失。只在这一版第一次被判红时空的情况才补写，其余时候
+    /// 保留最初的答案——「是什么让它被扣住的」问的是起点，不是最近一拍。
+    #[serde(default)]
+    failed_checks: Vec<String>,
 }
 
 /// 一次扣住的结局：哪一版被按住、从哪一刻起、到哪一刻止、结束的那一轮问出了什么。
@@ -2038,6 +2047,16 @@ struct CiHoldEnd {
     /// （那一次问的不是这一版，不能把别人的原因记到它头上）。
     #[serde(default)]
     reasons: Vec<String>,
+    /// 扣住它的那几项检查的名字，形如 `<platform>:<name>`，从被扣的那一版身上抄来。
+    ///
+    /// `reasons` 答的是「哪一端没给出结论」，这一格答的是「红在哪」。三支结局都需要它：
+    /// 判过才放（`pass`）时结束那一轮的判词里本来就没有失败项（判过了），按那一轮填
+    /// 只留下一个空集；上游换版（`rev_no_longer_tracked`）时那一轮问的根本不是这一版，
+    /// 按那一轮填就是把别人的红记到它头上。所以名字在被扣住的那一刻就跟着 `CiHold`
+    /// 一起落盘，结束时原样转抄——否则「刚才到底是什么红的」只剩扣住时那一行日志，
+    /// 而日志随滚动消失、Job 也带 TTL。
+    #[serde(default)]
+    failed_checks: Vec<String>,
 }
 
 /// 一轮里问上游 CI 的那几个点位，只用来给判词读数贴标签。
@@ -4340,8 +4359,16 @@ impl MainlineDeployer {
             state.ci_hold = Some(CiHold {
                 rev: rev.to_string(),
                 since_unix: now,
+                failed_checks: failed_checks.clone(),
             });
             changed = true;
+        } else if let Some(held) = state.ci_hold.as_mut() {
+            // 同一版被连问几轮，第一轮常常只从提交状态兜底拿得到「红」而拿不到名字；
+            // 后面某一轮说出了名字就补进去，已经有了就不再改——问的是起点。
+            if held.failed_checks.is_empty() && !failed_checks.is_empty() {
+                held.failed_checks = failed_checks.clone();
+                changed = true;
+            }
         }
         if changed {
             self.save_state(state)?;
@@ -8587,6 +8614,9 @@ fn ci_hold_end(
         ended_unix: now_unix,
         outcome: outcome.to_string(),
         reasons,
+        // 名字抄自被扣的那一版自己的记录，与 `bare` 是不是它无关：记的是「它为什么
+        // 被扣住」，那件事在扣住结束之后依然成立，也不随上游换了哪一版而变。
+        failed_checks: held.failed_checks.clone(),
     }
 }
 
@@ -8684,7 +8714,7 @@ fn heartbeat_message_with_pin(
         (PinReading::None, _) => "none",
     };
     format!(
-        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_run_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={} pin={} pin_secs={} pin_actor={} pin_state={} pin_took={}",
+        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_run_secs={} ci_hold_checks={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={} pin={} pin_secs={} pin_actor={} pin_state={} pin_took={}",
         rev12(bare_rev),
         upstream,
         // 落后几个 rev。`last_good_secs` 答的是"多久"，这一格答的是"几笔"——两者
@@ -8721,13 +8751,40 @@ fn heartbeat_message_with_pin(
             .ci_hold_run_since_unix
             .map(|t| (now_unix - t).max(0).to_string())
             .unwrap_or_else(|| "none".into()),
+        // 红在哪。前两格只说"按了多久"，说不出"为什么"；指向日志就等于把定位推给一段
+        // 会滚动消失的字节。`<unnamed>` 是"结论来自提交状态兜底"——上游没说哪几项，
+        // 不是"没有失败项"，与扣住那行日志用的是同一个名字。
+        state
+            .ci_hold
+            .as_ref()
+            .map(|h| {
+                if h.failed_checks.is_empty() {
+                    "<unnamed>".to_string()
+                } else {
+                    h.failed_checks.join(",")
+                }
+            })
+            .unwrap_or_else(|| "none".into()),
         // 扣住的**结局**是另一件事：上一格只答"现在还被按住吗"。一次扣住结束之后
         // `ci_hold` 变回 none，而"这一版是判过才放的，还是上游换了版才放的"从这里读。
         state.ci_hold_ends.len(),
         state
             .ci_hold_ends
             .last()
-            .map(|e| format!("{}@{}", rev12(&e.rev), e.outcome))
+            .map(|e| {
+                // 结局之外还要带上「红在哪」：一次扣住结束后，`ci_hold_checks` 变回 none，
+                // 而这一格正是"上一段为什么被按住"唯一还写着的地方。
+                format!(
+                    "{}@{}[{}]",
+                    rev12(&e.rev),
+                    e.outcome,
+                    if e.failed_checks.is_empty() {
+                        "-".to_string()
+                    } else {
+                        e.failed_checks.join(",")
+                    }
+                )
+            })
             .unwrap_or_else(|| "none".into()),
         // 被"tag 服务正在重建索引"按住多久：没有这一格，"等它答话"与"没有新 rev 可滚"
         // 在同一行上完全同形，而两者的处置相反（一个是等，一个是没事干）。
@@ -12084,6 +12141,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             ci_hold: Some(CiHold {
                 rev: "deadbeef0011".into(),
                 since_unix: 300,
+                failed_checks: vec!["github:Code Coverage".into()],
             }),
             // 这一段的起点比这一版早得多：两个时长在这一行上必须分得开。
             ci_hold_run_since_unix: Some(100),
@@ -12093,6 +12151,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 ended_unix: 200,
                 outcome: "pass".into(),
                 reasons: vec!["gitee:no_runs".into()],
+                failed_checks: vec!["github:Deploy Parity".into()],
             }],
             advance_deferrals: 0,
             // 等槽结束之后 `advance_deferrals` 归零：这一段等了多久、为什么、
@@ -12141,11 +12200,16 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(msg.contains("failed_repeated=false"), "{msg}");
         assert!(msg.contains("cooldown_remaining_secs=500"), "{msg}");
         assert!(msg.contains("ci_hold=deadbeef0011"), "{msg}");
+        // 红在哪与按了多久是两件事：只说时长的那一行把定位推给一段会滚动的日志。
+        assert!(msg.contains("ci_hold_checks=github:Code Coverage"), "{msg}");
         // 同一个 rev 也要说出扣了多久：now_unix=1000 而起点 300。
         assert!(msg.contains("ci_hold_secs=700"), "{msg}");
         // 扣住结束之后 `ci_hold` 退回 none：这一版后来怎么被放的，只能从这里读。
         assert!(msg.contains("ci_hold_ends=1"), "{msg}");
-        assert!(msg.contains("last_ci_hold_end=cafebabe0011@pass"), "{msg}");
+        assert!(
+            msg.contains("last_ci_hold_end=cafebabe0011@pass[github:Deploy Parity]"),
+            "扣住结束后 `ci_hold_checks` 变回 none，上一段为什么被按住只剩这一格写着: {msg}"
+        );
         // 等槽的结局同理：从 400 等到 1000 = 600 秒，被闸挡住、认领过名额。
         assert!(msg.contains("advance_waits=1"), "{msg}");
         assert!(
@@ -12176,6 +12240,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let held = CiHold {
             rev: "aaaa1111bbbb".into(),
             since_unix: 100,
+            failed_checks: vec!["github:Deploy Parity".into()],
         };
         let verdict = |v: &str| CiVerdictRecord {
             rev: "aaaa1111bbbb".into(),
@@ -12190,6 +12255,12 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert_eq!(passed.outcome, "pass");
         assert_eq!(passed.ended_unix - passed.since_unix, 100);
         assert_eq!(passed.reasons, vec!["github:pending".to_string()]);
+        // 判过才放的那一轮判词里没有失败项（判过了），名字只能来自被扣住时的记录：
+        // 按结束那一轮填会把"刚才红在哪"填成一个空集。
+        assert_eq!(
+            passed.failed_checks,
+            vec!["github:Deploy Parity".to_string()]
+        );
 
         let none = ci_hold_end(&held, "aaaa1111bbbb", Some(&verdict("no_evidence")), 200);
         assert_eq!(none.outcome, "no_evidence");
@@ -12200,10 +12271,20 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert_eq!(moved.outcome, "rev_no_longer_tracked");
         assert!(moved.reasons.is_empty(), "{:?}", moved.reasons);
         assert_eq!(moved.rev, "aaaa1111bbbb");
+        // 名字与原因处置相反：原因说的是"这一次问出了什么"，换版就作废；名字说的是
+        // "这一版为什么被扣住"，那件事不随上游换了哪一版而改变。
+        assert_eq!(
+            moved.failed_checks,
+            vec!["github:Deploy Parity".to_string()]
+        );
 
         // 判词读不到不是"判过通过"。
         let unread = ci_hold_end(&held, "aaaa1111bbbb", None, 200);
         assert_eq!(unread.outcome, "no_evidence");
+        assert_eq!(
+            unread.failed_checks,
+            vec!["github:Deploy Parity".to_string()]
+        );
     }
 
     /// 环境类失败不占证据面，`failed_rev` 与 `failed_loci=0` 会同时出现：
@@ -12900,6 +12981,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 ended_unix: 1100,
                 outcome: "rev_no_longer_tracked".into(),
                 reasons: Vec::new(),
+                failed_checks: vec!["github:Code Coverage".into()],
             }],
             advance_deferrals: 0,
             // 同理：结局与"正在等"的三格都要能被 serde 带过去，重启一次不能把
@@ -16337,6 +16419,7 @@ exec {real} "$@"
         state.ci_hold = Some(CiHold {
             rev: "abc123".into(),
             since_unix: an_hour_ago,
+            failed_checks: Vec::new(),
         });
         state.ci_hold_run_since_unix = Some(an_hour_ago);
         deployer.save_state(&state).unwrap();
