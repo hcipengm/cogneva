@@ -242,6 +242,18 @@ pub const REFUSAL_COOLDOWN_SECS: u64 = 3600;
 // cap: bound — 一个钟头还没有任何 resize 条件，就不是「慢」而是「没人应答」
 pub const ORPHAN_AFTER_SECS: u64 = 3600;
 
+/// Where the shortfall's start time is kept: unix seconds, on the claim itself.
+///
+/// The bound above is a fact about how long the claim has been ahead of what it
+/// was given, so the stamp that measures it belongs where the claim is. Kept in
+/// the process, it measured the age of the process instead: measured
+/// 2026-10-31, the pod running this loop was replaced 43 minutes in, so a
+/// one-hour bound never elapsed and the verdict it gates never appeared on an
+/// installation that was in exactly the state it exists to report. Written once
+/// per shortfall and read by every process that mounts the claim, which is also
+/// what makes two reporters agree instead of each counting from its own start.
+pub const SHORTFALL_SINCE_ANNOTATION: &str = "cogneva.io/volume-shortfall-since";
+
 /// The size to request for a claim that peaked at `peak_bytes` and currently
 /// asks for `declared_bytes`, or `None` when the declaration already covers it.
 ///
@@ -270,21 +282,35 @@ pub fn growth_target(peak_bytes: u64, declared_bytes: u64) -> Option<u64> {
 /// inactivity on the first round -- the patch has to be observed, queued and
 /// picked up first. Hence the stamp: the shortfall is only called orphaned once
 /// it has outlived [`ORPHAN_AFTER_SECS`] without one.
+///
+/// The stamp is read off the claim, not carried in this process, so a restarted
+/// reporter asks how old the shortfall is rather than how long it has been
+/// watching. A claim with no stamp yet is inside the window by definition: the
+/// round that first sees it writes one, and the same round is the shortest any
+/// shortfall could be.
 fn shortfall_outcome(
     resizing: bool,
-    shortfall_since: &mut Option<std::time::Instant>,
-    now: std::time::Instant,
+    shortfall_since: Option<u64>,
+    now_unix: u64,
 ) -> CapacityOutcome {
     if resizing {
-        *shortfall_since = None;
         return CapacityOutcome::Expanding;
     }
-    let since = *shortfall_since.get_or_insert(now);
-    if now.saturating_duration_since(since).as_secs() >= ORPHAN_AFTER_SECS {
+    let Some(since) = shortfall_since else {
+        return CapacityOutcome::Expanding;
+    };
+    if now_unix.saturating_sub(since) >= ORPHAN_AFTER_SECS {
         CapacityOutcome::Orphaned
     } else {
         CapacityOutcome::Expanding
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// The most a build cache may occupy of a claim it shares with the rest of a
@@ -383,6 +409,10 @@ pub struct LiveClaim {
     /// been ahead of its capacity for many rounds and carries neither has no
     /// resizer answering it.
     pub resizing: bool,
+    /// When this shortfall was first seen, as unix seconds stamped on the claim
+    /// by whichever process saw it first. `None` means no process has recorded
+    /// one, which is the state of a shortfall that has not yet had a round.
+    pub shortfall_since: Option<u64>,
 }
 
 /// Condition types a controller sets while it is carrying out a resize.
@@ -442,12 +472,22 @@ pub fn parse_claim(json: &str) -> Result<LiveClaim, String> {
         .and_then(|s| s.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
+    // A stamp that does not parse is treated as no stamp rather than as an
+    // error: the field is written by this loop, and a claim whose annotation a
+    // person edited by hand must not take the whole reading down. The cost is
+    // one more round of the window, which is what an absent stamp already
+    // means.
+    let shortfall_since = v
+        .pointer("/metadata/annotations/cogneva.io~1volume-shortfall-since")
+        .and_then(|s| s.as_str())
+        .and_then(|s| s.trim().parse::<u64>().ok());
     Ok(LiveClaim {
         name,
         declared,
         capacity,
         class,
         resizing,
+        shortfall_since,
     })
 }
 
@@ -588,10 +628,12 @@ struct ClaimState {
     /// who has to change one object is told which. `None` is the default class,
     /// which this claim's own object does not name.
     class: Option<String>,
-    /// When this process first saw the claim announce more than it had been
-    /// given with no resize condition on it. Cleared the moment either stops
-    /// being true: the stamp is of one shortfall, not of the claim's whole life.
-    shortfall_since: Option<std::time::Instant>,
+    // The shortfall stamp used to live here, as an `Instant` this process set on
+    // its first round. It is on the claim now -- see
+    // [`SHORTFALL_SINCE_ANNOTATION`] -- because the fact it records is about the
+    // claim and not about this process: measured 2026-10-31, the evolution pod
+    // was replaced 43 minutes after it started, so a one-hour in-process bound
+    // was never reached and the verdict it gates never appeared at all.
     /// The bound that stopped the last round, kept only while it is the current
     /// conclusion: a claim that grew or reached its target has no bound to name.
     ceiling: Option<Ceiling>,
@@ -610,7 +652,6 @@ impl ClaimState {
             declared: None,
             granted: None,
             class: None,
-            shortfall_since: None,
             ceiling: None,
             refused_until: None,
             last_outcome: None,
@@ -1052,17 +1093,30 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
     // still working would be refused by the API. Whether anything is working on
     // it is the claim's own answer -- see [`shortfall_outcome`].
     if live.capacity < live.declared {
-        let outcome = shortfall_outcome(
-            live.resizing,
-            &mut state.shortfall_since,
-            std::time::Instant::now(),
-        );
+        let now = unix_now();
+        let since = match (live.resizing, live.shortfall_since) {
+            // A resize condition is the resizer answering, so the question this
+            // bound asks does not apply and any stamp from an earlier shortfall
+            // would be measuring the wrong one.
+            (true, Some(_)) => {
+                clear_shortfall_stamp(&target.claim, &ns).await;
+                None
+            }
+            (true, None) => None,
+            (false, Some(since)) => Some(since),
+            (false, None) => {
+                stamp_shortfall(&target.claim, &ns, now).await;
+                Some(now)
+            }
+        };
+        let outcome = shortfall_outcome(live.resizing, since, now);
         if outcome == CapacityOutcome::Orphaned && state.last_outcome != Some(outcome) {
             warn!(
                 claim = %target.claim,
                 class = state.class.as_deref().unwrap_or("(the installation's default class)"),
                 declared = live.declared,
                 granted = live.capacity,
+                short_of_its_declaration_since = since.unwrap_or(now),
                 "volume capacity: the claim asks for more than it was given and nothing in the \
                  cluster is working on it; the class's allowVolumeExpansion is a promise with no \
                  implementer here, so the declaration, not the volume, is what has to change"
@@ -1070,7 +1124,14 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
         }
         return state.quiet(outcome);
     }
-    state.shortfall_since = None;
+    // The declaration covers what the volume was given, so there is no
+    // shortfall to date. A stamp left behind would make the next one read as
+    // however old this one was, which is the one way this record can lie, so it
+    // is cleared on the healthy path too -- every round, until the clear
+    // succeeds.
+    if live.shortfall_since.is_some() {
+        clear_shortfall_stamp(&target.claim, &ns).await;
+    }
 
     let Some(wanted) = growth_target(peak, live.declared) else {
         return state.quiet(CapacityOutcome::AtTarget);
@@ -1164,6 +1225,46 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
                 CapacityOutcome::Refused,
             )
         }
+    }
+}
+
+/// Record on the claim the round that first saw it short with nothing answering.
+///
+/// Written with `--overwrite` because the write is reached only when this round
+/// read a claim carrying no stamp: the flag is what keeps a second writer that
+/// raced the same round to a refusal that is not one. Two processes can only
+/// collide on the first stamp of a shortfall, and the loser moves the clock by
+/// the length of one round -- every later round reads the value that landed.
+///
+/// A failure is loud on purpose: without a stamp the bound below can never
+/// elapse, so the claim reads as "still expanding" for as long as the process
+/// that watches it lives, and nothing else on any surface says so.
+async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) {
+    let pair = format!("{SHORTFALL_SINCE_ANNOTATION}={now_unix}");
+    if let Err(e) = kubectl(
+        &["annotate", "pvc", claim, "-n", ns, &pair, "--overwrite"],
+        60,
+    )
+    .await
+    {
+        warn!(
+            claim,
+            error = %e,
+            "volume capacity: could not stamp the shortfall on the claim, so the bound that \
+             separates a slow resize from an unanswered one restarts with this process"
+        );
+    }
+}
+
+async fn clear_shortfall_stamp(claim: &str, ns: &str) {
+    let removal = format!("{SHORTFALL_SINCE_ANNOTATION}-");
+    if let Err(e) = kubectl(&["annotate", "pvc", claim, "-n", ns, &removal], 60).await {
+        warn!(
+            claim,
+            error = %e,
+            "volume capacity: could not clear the shortfall stamp; a later shortfall on this \
+             claim will read as older than it is until the clear succeeds"
+        );
     }
 }
 
@@ -1394,62 +1495,100 @@ mod tests {
     /// the wall clock, so a loop that ticks faster reaches it at the same age.
     #[test]
     fn a_shortfall_nobody_answers_becomes_orphaned_only_after_the_bound() {
-        let start = std::time::Instant::now();
-        let mut since = None;
-        let at = |secs: u64| start + Duration::from_secs(secs);
+        let start = 1_800_000_000u64;
+        let at = |secs: u64| start + secs;
         let cadence = DEFAULT_INTERVAL_SECS;
+        let stamped = Some(start);
 
-        assert_eq!(
-            shortfall_outcome(false, &mut since, at(0)),
-            CapacityOutcome::Expanding
-        );
-        let mut secs = cadence;
+        let mut secs = 0;
         while secs < ORPHAN_AFTER_SECS {
             assert_eq!(
-                shortfall_outcome(false, &mut since, at(secs)),
+                shortfall_outcome(false, stamped, at(secs)),
                 CapacityOutcome::Expanding,
                 "{secs}s is still inside the window a resizer may take"
             );
             secs += cadence;
         }
         assert_eq!(
-            shortfall_outcome(false, &mut since, at(ORPHAN_AFTER_SECS)),
+            shortfall_outcome(false, stamped, at(ORPHAN_AFTER_SECS)),
             CapacityOutcome::Orphaned
         );
 
         // The same claim judged by a loop that ticks at the floor: the round
         // count doubles, the verdict does not move.
-        let mut since = None;
         assert_eq!(
-            shortfall_outcome(false, &mut since, at(0)),
+            shortfall_outcome(false, stamped, at(0)),
             CapacityOutcome::Expanding
         );
         assert_eq!(
-            shortfall_outcome(false, &mut since, at(MIN_INTERVAL_SECS)),
-            CapacityOutcome::Expanding
-        );
-        assert_eq!(
-            shortfall_outcome(false, &mut since, at(ORPHAN_AFTER_SECS - 1)),
+            shortfall_outcome(false, stamped, at(ORPHAN_AFTER_SECS - 1)),
             CapacityOutcome::Expanding,
             "a second short of the bound is still an expansion"
         );
         assert_eq!(
-            shortfall_outcome(false, &mut since, at(ORPHAN_AFTER_SECS)),
+            shortfall_outcome(false, stamped, at(ORPHAN_AFTER_SECS)),
             CapacityOutcome::Orphaned
         );
 
-        // A condition on the claim is the cluster saying it is on it, and it
-        // clears the stamp: the next quiet round starts the window again rather
-        // than reporting the old one.
+        // A condition on the claim is the cluster saying it is on it.
         assert_eq!(
-            shortfall_outcome(true, &mut since, at(ORPHAN_AFTER_SECS + 60)),
+            shortfall_outcome(true, stamped, at(ORPHAN_AFTER_SECS + 60)),
             CapacityOutcome::Expanding
         );
-        assert_eq!(since, None);
+
+        // No stamp yet is the shortest a shortfall can be: the round that
+        // reads this is the one that writes one.
         assert_eq!(
-            shortfall_outcome(false, &mut since, at(ORPHAN_AFTER_SECS + 120)),
+            shortfall_outcome(false, None, at(0)),
             CapacityOutcome::Expanding
         );
+    }
+
+    /// The bound has to measure the claim's shortfall, not this process's age.
+    ///
+    /// A reporter restarted in the last minute reads the claim's stamp and must
+    /// conclude from it alone. Carried in the process instead, the same round
+    /// would answer `expanding` -- which is what happened on 2026-10-31: the
+    /// pod running this loop was replaced 43 minutes in, so a one-hour bound
+    /// never elapsed and the verdict never appeared on an installation that was
+    /// in exactly the state it reports.
+    #[test]
+    fn a_restarted_reporter_reads_the_age_of_the_shortfall_off_the_claim() {
+        let started_long_ago = 1_800_000_000u64;
+        let now = started_long_ago + ORPHAN_AFTER_SECS;
+        assert_eq!(
+            shortfall_outcome(false, Some(started_long_ago), now),
+            CapacityOutcome::Orphaned,
+            "the first round of a restarted reporter must answer from the claim's stamp"
+        );
+    }
+
+    #[test]
+    fn the_stamp_is_read_off_the_claim_and_not_guessed() {
+        let claim = |annotations: &str| {
+            format!(
+                r#"{{"metadata":{{"name":"pvc-a"{annotations}}},
+                     "spec":{{"storageClassName":"local-path",
+                               "resources":{{"requests":{{"storage":"21Gi"}}}}}},
+                     "status":{{"capacity":{{"storage":"20Gi"}}}}}}"#
+            )
+        };
+        let stamped = parse_claim(&claim(
+            r#","annotations":{"cogneva.io/volume-shortfall-since":"1793000000"}"#,
+        ))
+        .expect("stamped claim");
+        assert_eq!(stamped.shortfall_since, Some(1_793_000_000));
+
+        let bare = parse_claim(&claim("")).expect("claim without the annotation");
+        assert_eq!(bare.shortfall_since, None);
+
+        // A hand-edited annotation is not a reason to lose the whole reading:
+        // it reads as no stamp, which costs one more window.
+        let garbled = parse_claim(&claim(
+            r#","annotations":{"cogneva.io/volume-shortfall-since":"yesterday"}"#,
+        ))
+        .expect("claim with an unreadable stamp");
+        assert_eq!(garbled.shortfall_since, None);
     }
 
     #[tokio::test]
