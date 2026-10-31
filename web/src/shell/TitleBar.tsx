@@ -1,6 +1,7 @@
 import { useServices } from '@/shell/context';
 import { Icon } from '@/shell/icons';
 import { useShell } from '@/shell/store';
+import { Note } from '@/ui/Note';
 
 /**
  * 顶栏：这是哪套系统、去哪找东西、有没有人找你。
@@ -53,42 +54,46 @@ export function TitleBar() {
         <span className="text-[11px] text-[var(--muted)]">控制台</span>
       </div>
 
-      <button
+      <Note
+        as="button"
         type="button"
         onClick={() => setPalette('commands')}
         className="mx-auto flex h-6 w-[min(420px,40vw)] items-center gap-2 border border-[var(--line)] bg-[var(--ink-900)] px-2 text-[11px] text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--paper-dim)]"
-        title="命令面板（⌘K）"
+        text="命令面板（⌘K）"
       >
         <Icon name="search" size={12} />
         <span>搜索命令、页面与动作</span>
         <span className="mono ml-auto text-[10px]">⌘K</span>
-      </button>
+      </Note>
 
       <div className="flex items-center gap-1">
-        <button
+        <Note
+          as="button"
           type="button"
           onClick={() => setActivity('alerts')}
-          title={alerts.error ? '告警读数没读到' : `${firing} 条告警在 firing`}
+          text={alerts.error ? '告警读数没读到' : `${firing} 条告警在 firing`}
           className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-alerts)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="alerts" size={14} />
           <span style={{ color: firingTone }}>{alerts.error ? '?' : firing}</span>
-        </button>
-        <button
+        </Note>
+        <Note
+          as="button"
           type="button"
           onClick={() => setActivity('inbox')}
-          title={notifications.error ? '通知读数没读到' : `${unread} 条未读`}
+          text={notifications.error ? '通知读数没读到' : `${unread} 条未读`}
           className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-inbox)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="inbox" size={14} />
           <span style={{ color: unreadTone }}>{notifications.error ? '?' : unread}</span>
-        </button>
+        </Note>
         {/* 模型入口：顶栏直达配置，不必先进设置再找那一格。状态点与设置页读的是
             同一份读数（Shell 里那一份 useLlmStatus），所以两处不会各说一套。 */}
-        <button
+        <Note
+          as="button"
           type="button"
           onClick={overlays.openLlmSetup}
-          title={`${modelLabel} · GET /api/v1/llm/status · 读于 ${readAt} · 点开配置（保存时服务端会按双协议各探测一次）`}
+          text={`${modelLabel} · GET /api/v1/llm/status · 读于 ${readAt} · 点开配置（保存时服务端会按双协议各探测一次）`}
           aria-label={`${modelLabel}，点开配置模型`}
           className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-model)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
@@ -98,7 +103,7 @@ export function TitleBar() {
             aria-hidden="true"
           />
           模型
-        </button>
+        </Note>
         {/* 代码平台与上网以前只住在命令面板和设置页里：知道它们存在的人得先进
             别处才找得到。它们是两条各自独立的对外通路，顶栏各给一格。
             这两格一直带字，也一直带色——通向集群**之外**的通路没配就是没有，
@@ -106,54 +111,59 @@ export function TitleBar() {
             五格各一个：两格同色时读者只能读字来分，颜色就白上了。
             图标也不再借用邻居的形状：本地那张源代码树是分支图，这里是出站箭头与
             地球，三个形状在 16px 下不会互相认错。 */}
-        <button
+        <Note
+          as="button"
           type="button"
           onClick={overlays.openCredentials}
-          title="代码平台（GitHub / Gitee）令牌与 SSH 身份 · 点开配置"
+          text="代码平台（GitHub / Gitee）令牌与 SSH 身份 · 点开配置"
           aria-label="代码平台：令牌与 SSH 身份"
           className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-platform)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="platform" size={14} />
           代码平台
-        </button>
-        <button
+        </Note>
+        <Note
+          as="button"
           type="button"
           onClick={overlays.openWebSearch}
-          title="上网检索与抓取的后备池 · 点开配置"
+          text="上网检索与抓取的后备池 · 点开配置"
           aria-label="上网：检索与抓取的后备池"
           className="flex h-6 items-center gap-1.5 px-2 text-[11px] text-[var(--tag-web)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="globe" size={14} />
           上网
-        </button>
-        <button
+        </Note>
+        <Note
+          as="button"
           type="button"
           onClick={() => setActivity('settings')}
-          title="设置"
+          text="设置"
           className="flex h-6 w-6 items-center justify-center text-[var(--muted)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="settings" size={14} />
-        </button>
-        <button
+        </Note>
+        <Note
+          as="button"
           type="button"
           onClick={() => setPalette('help')}
-          title="去哪找什么"
+          text="去哪找什么"
           aria-label="帮助：去哪找什么"
           className="flex h-6 w-6 items-center justify-center text-[var(--muted)] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
         >
           <Icon name="help" size={14} />
-        </button>
+        </Note>
         {/* 账号位以前是一个不可点的方块：读者点它，什么都问不出来。它现在是
             通往账号与凭据那一页的入口——上面写着谁登录了，点开就是那一页。 */}
-        <button
+        <Note
+          as="button"
           type="button"
           onClick={() => setActivity('settings')}
-          title={username ? `${username} · 账号与凭据` : '还没登录 · 去设置'}
+          text={username ? `${username} · 账号与凭据` : '还没登录 · 去设置'}
           aria-label="账号与凭据"
           className="mono ml-1 flex h-5 w-5 items-center justify-center border border-[var(--line-strong)] text-[10px] text-[var(--paper-dim)] transition-colors hover:border-[var(--brass)] hover:text-[var(--paper)]"
         >
           {initial}
-        </button>
+        </Note>
       </div>
     </header>
   );

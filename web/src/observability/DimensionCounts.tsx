@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { ActorUsage } from '@/api/client';
+import { Note } from '@/ui/Note';
 
 /**
  * 「谁在花」上面那四个数：执行者 / 上游 / 协议 / 环境各出现了几个。
@@ -39,13 +40,14 @@ export function DimensionCounts({ actors }: { actors: ActorUsage[] }) {
           const absent = registeredButAbsent(list, dim);
           const expanded = open === dim.key;
           return (
-            <button
+            <Note
+              as="button"
               key={dim.key}
               type="button"
               onClick={() => setOpen(expanded ? null : dim.key)}
               className="cursor-pointer text-left"
               aria-expanded={expanded}
-              title={expanded ? '收起这一维的成员' : '列出这一维的成员'}
+              text={expanded ? '收起这一维的成员' : '列出这一维的成员'}
             >
               <div className="mono text-[17px] leading-tight text-[var(--paper)]">
                 {counted.length}
@@ -57,7 +59,7 @@ export function DimensionCounts({ actors }: { actors: ActorUsage[] }) {
               <div className="text-[11px] text-[var(--muted)] opacity-80">
                 {dim.note(counted, absent)}
               </div>
-            </button>
+            </Note>
           );
         })}
       </div>

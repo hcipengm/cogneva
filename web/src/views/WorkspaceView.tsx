@@ -21,6 +21,7 @@ import { Icon } from '@/shell/icons';
 import { Button } from '@/ui/primitives';
 import { USE_MOCK } from '@/runtime';
 
+import { Note } from '@/ui/Note';
 /**
  * 一段对话最小要多少像素才读得成句子，以及一格最少要多高才看得见一轮问答。
  * 这两个数是「排几列几行」的尺子，不是硬下限：窗口小到放不下时，格子会一起
@@ -160,12 +161,13 @@ export function WorkspaceView() {
                 ['tabs', '标签页', 'tabs'],
               ] as const
             ).map(([id, label, icon]) => (
-              <button
+              <Note
+                as="button"
                 key={id}
                 type="button"
                 onClick={() => setMode(id)}
                 aria-pressed={mode === id}
-                title={
+                text={
                   id === 'columns'
                     ? '分栏：几段对话并排，宽高按段数与窗口大小自适应'
                     : '标签页：一次全屏看一段，上面一排标签切换'
@@ -178,7 +180,7 @@ export function WorkspaceView() {
               >
                 <Icon name={icon} size={12} />
                 {label}
-              </button>
+              </Note>
             ))}
           </div>
           <Button onClick={() => setPanelTab('logs')}>总线日志</Button>
@@ -206,20 +208,21 @@ export function WorkspaceView() {
                     className="group flex shrink-0 items-center border-r border-[var(--line)]"
                     style={{ background: current ? 'var(--ink-700)' : 'transparent' }}
                   >
-                    <button
+                    <Note
+                      as="button"
                       type="button"
                       role="tab"
                       aria-selected={current}
                       onClick={() => setActive(id)}
                       className="flex h-8 items-center gap-2 px-3 text-[11px] transition-colors"
                       style={{ color: current ? 'var(--paper)' : 'var(--muted)' }}
-                      title={sessions[id]?.title ?? id}
+                      text={sessions[id]?.title ?? id}
                     >
                       <span className="mono">{nameOf(id)}</span>
                       <span className="max-w-[18ch] truncate text-[var(--paper-dim)]">
                         {sessions[id]?.title ?? ''}
                       </span>
-                    </button>
+                    </Note>
                     {order.length > 1 && (
                       <button
                         type="button"

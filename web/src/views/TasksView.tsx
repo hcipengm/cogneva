@@ -17,6 +17,7 @@ import {
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 import { Strip } from '@/ui/plots';
 
+import { Note } from '@/ui/Note';
 /**
  * 任务面：两类问题两个视图。
  *
@@ -503,9 +504,9 @@ function LiveStatus({
     <span className="inline-flex items-baseline gap-1.5">
       <Status value={eff.status} />
       {eff.fromFrame && (
-        <span className="mono text-[10px] text-[var(--brass)]" title="比这次轮询读到的更新">
+        <Note className="mono text-[10px] text-[var(--brass)]" text="比这次轮询读到的更新">
           帧
-        </span>
+        </Note>
       )}
     </span>
   );

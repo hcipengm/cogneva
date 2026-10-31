@@ -12,6 +12,7 @@ import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { outcomesSinceSnapshot, type LiveCommsRow } from '@/store/liveComms';
 import { useLiveCommsStore } from '@/store/liveCommsStore';
+import { Note } from '@/ui/Note';
 import { openExplain } from '@/ui/explain';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { Strip, type Tone } from '@/ui/plots';
@@ -48,24 +49,26 @@ function TwoEnds({ link, onPick }: { link: CollaborationLink; onPick: (id: strin
   const self = link.source_task_id === link.target_task_id;
   return (
     <span className="mono flex items-baseline gap-1 text-[11px]">
-      <button
+      <Note
+        as="button"
         type="button"
         onClick={() => onPick(link.source_task_id)}
         className="max-w-[150px] truncate underline-offset-2 hover:underline"
-        title={link.source_task_id}
+        text={link.source_task_id}
       >
         {link.source_task_id}
-      </button>
+      </Note>
       <span className="text-[var(--muted)]">{self ? '（同一任务）' : '→'}</span>
       {!self && (
-        <button
+        <Note
+          as="button"
           type="button"
           onClick={() => onPick(link.target_task_id)}
           className="max-w-[150px] truncate underline-offset-2 hover:underline"
-          title={link.target_task_id}
+          text={link.target_task_id}
         >
           {link.target_task_id}
-        </button>
+        </Note>
       )}
     </span>
   );
@@ -140,12 +143,12 @@ function AgentCell({
   }
 
   return (
-    <span
+    <Note
       className="mono text-[11px] text-[var(--muted)]"
-      title="边和它的任务都不知道执行者：任务不在这一页的列表里，或者从没被指派"
+      text="边和它的任务都不知道执行者：任务不在这一页的列表里，或者从没被指派"
     >
       —
-    </span>
+    </Note>
   );
 }
 
@@ -189,9 +192,9 @@ function TaskLinks({ taskId, onClose }: { taskId: string; onClose: () => void })
                 {data.upstream.map((link, index) => (
                   <li key={`${link.source_task_id}-${index}`} className="flex items-baseline gap-2">
                     <LinkType value={link.link_type} />
-                    <span className="mono truncate text-[11px]" title={link.source_task_id}>
+                    <Note className="mono truncate text-[11px]" text={link.source_task_id}>
                       {link.source_task_id}
-                    </span>
+                    </Note>
                     <Moment iso={link.timestamp} />
                   </li>
                 ))}
@@ -209,9 +212,9 @@ function TaskLinks({ taskId, onClose }: { taskId: string; onClose: () => void })
                 {data.downstream.map((link, index) => (
                   <li key={`${link.target_task_id}-${index}`} className="flex items-baseline gap-2">
                     <LinkType value={link.link_type} />
-                    <span className="mono truncate text-[11px]" title={link.target_task_id}>
+                    <Note className="mono truncate text-[11px]" text={link.target_task_id}>
                       {link.target_task_id}
-                    </span>
+                    </Note>
                     <Moment iso={link.timestamp} />
                   </li>
                 ))}
@@ -262,12 +265,12 @@ function FreshOutcomes({ rows }: { rows: LiveCommsRow[] }) {
             <span className="text-[var(--muted)]">
               最近 <Moment iso={row.lastAt} />
             </span>
-            <span
+            <Note
               className="mono text-[10px] text-[var(--brass)]"
-              title={`这一格来自 task_status_change 帧（${row.frames} 帧折成一行），不是这次轮询`}
+              text={`这一格来自 task_status_change 帧（${row.frames} 帧折成一行），不是这次轮询`}
             >
               帧
-            </span>
+            </Note>
           </li>
         ))}
       </ul>

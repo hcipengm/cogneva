@@ -8,6 +8,7 @@ import {
   themeFamily,
 } from '@/styles/themes';
 
+import { Note } from '@/ui/Note';
 /**
  * 配色主题的选择器。
  *
@@ -68,11 +69,12 @@ function ThemeCard({
   onPick: (id: string) => void;
 }) {
   return (
-    <button
+    <Note
+      as="button"
       type="button"
       onClick={() => onPick(theme.id)}
       aria-pressed={selected}
-      title={theme.note}
+      text={theme.note}
       className="group flex flex-col gap-1.5 border p-2 text-left transition-colors"
       style={{
         borderColor: selected ? 'var(--brass)' : 'var(--line)',
@@ -91,7 +93,7 @@ function ThemeCard({
       </span>
       <span className="mono text-[10px] leading-snug text-[var(--paper-dim)]">{theme.origin}</span>
       <span className="text-[10px] leading-snug text-[var(--muted)]">{theme.note}</span>
-    </button>
+    </Note>
   );
 }
 

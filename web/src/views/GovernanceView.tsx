@@ -7,6 +7,7 @@ import {
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
+import { Note } from '@/ui/Note';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 import { BarList, Strip, type StripSegment, type Tone } from '@/ui/plots';
 
@@ -157,10 +158,10 @@ export function GovernanceView() {
               if (!reading) return <span className="text-[11px] text-[var(--muted)]">—</span>;
               const rules = [...reading.red_rules, ...reading.yellow_rules];
               return (
-                <span className="text-[11px] text-[var(--muted)]" title={reading.detail ?? ''}>
+                <Note className="text-[11px] text-[var(--muted)]" text={reading.detail ?? ''}>
                   {reading.cause ? `${reading.cause} · ` : ''}
                   {reading.detail || rules.join(', ')}
-                </span>
+                </Note>
               );
             } },
             { key: 'vacancy', title: '空位到', width: '110px', render: (f) => <Moment iso={f.spec.vacancy_until} /> },
@@ -190,9 +191,9 @@ export function GovernanceView() {
             <Table
               columns={[
                 { key: 'slug', title: '原则', width: '260px', render: (r) => (
-                  <span className="text-[12px]" title={r.slug}>
+                  <Note className="text-[12px]" text={r.slug}>
                     {r.lead ?? r.slug}
-                  </span>
+                  </Note>
                 ) },
                 { key: 'state', title: '判读', width: '100px', render: (r) => (
                   <span className="text-[11px]" style={{ color: stateColor(r.state) }}>
@@ -200,9 +201,9 @@ export function GovernanceView() {
                   </span>
                 ) },
                 { key: 'where', title: '会在哪儿红', width: '230px', render: (r) => (
-                  <span className="mono text-[10px] text-[var(--muted)]" title={r.where_red ?? ''}>
+                  <Note className="mono text-[10px] text-[var(--muted)]" text={r.where_red ?? ''}>
                     {r.where_red ?? '还没人说过'}
-                  </span>
+                  </Note>
                 ) },
                 { key: 'gate', title: '门', width: '200px', render: (r) => (
                   <span className="mono text-[10px] text-[var(--muted)]">
@@ -210,9 +211,9 @@ export function GovernanceView() {
                   </span>
                 ) },
                 { key: 'carrier', title: '载体', width: '230px', render: (r) => (
-                  <span className="mono text-[10px] text-[var(--muted)]" title={r.carrier_path ?? ''}>
+                  <Note className="mono text-[10px] text-[var(--muted)]" text={r.carrier_path ?? ''}>
                     {r.carrier_path ?? '—'}
-                  </span>
+                  </Note>
                 ) },
                 { key: 'n', title: '拒绝', width: '70px', render: (r) => (
                   <span className="mono text-[11px]">{r.refusals}</span>

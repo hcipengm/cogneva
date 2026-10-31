@@ -6,6 +6,7 @@ import {
   type ExplainSubject,
 } from '@/ui/explain';
 
+import { Note } from '@/ui/Note';
 /**
  * 视图里共用的几块形状。放一处，是为了让「读失败」「没有数据」「正在读」在这
  * 一面里**长得一样**：三件事在运维眼里完全不同，混成一片空白是这类界面最常见
@@ -150,14 +151,15 @@ export function Reading({
     <div className="border-l border-[var(--line)] py-1 pl-3 pr-4">
       <div className="mono text-[17px] leading-tight" style={{ color }}>
         {subject ? (
-          <button
+          <Note
+            as="button"
             type="button"
             onClick={() => openExplain(subject)}
-            title="这个数由什么算出来"
+            text="这个数由什么算出来"
             className="cursor-pointer text-left underline decoration-dotted decoration-transparent underline-offset-4 transition-colors hover:decoration-[var(--muted)]"
           >
             {value}
-          </button>
+          </Note>
         ) : (
           value
         )}
@@ -292,8 +294,8 @@ export function Moment({ iso }: { iso: string | null | undefined }) {
           ? `${Math.round(seconds / 3600)} 小时前`
           : `${Math.round(seconds / 86_400)} 天前`;
   return (
-    <span className="mono text-[11px] text-[var(--paper-dim)]" title={then.toLocaleString('zh-CN')}>
+    <Note className="mono text-[11px] text-[var(--paper-dim)]" text={then.toLocaleString('zh-CN')}>
       {relative}
-    </span>
+    </Note>
   );
 }

@@ -23,6 +23,7 @@
  */
 
 import type { ReactNode } from 'react';
+import { Note } from '@/ui/Note';
 
 /** 图上能用的那几种语义。名字是语义不是色值：换主题时只换令牌。 */
 export type Tone = 'magnitude' | 'ok' | 'warn' | 'danger' | 'muted';
@@ -101,15 +102,15 @@ export function BarList({
             const width = max > 0 ? Math.max(row.value > 0 ? 2 : 0, (row.value / max) * 100) : 0;
             return (
               <div key={row.id ?? row.label} className="flex items-center gap-2 py-[3px]">
-                <span className="w-40 shrink-0 truncate text-[11px] text-[var(--paper-dim)]" title={row.label}>
+                <Note className="w-40 shrink-0 truncate text-[11px] text-[var(--paper-dim)]" text={row.label}>
                   {row.label}
-                </span>
+                </Note>
                 <span className="relative h-2 flex-1 bg-[var(--ink-700)]">
                   {width > 0 && (
-                    <span
+                    <Note
                       className="absolute inset-y-0 left-0 rounded-r-[4px]"
                       style={{ width: `${width}%`, background: TONE_VAR[row.tone ?? 'magnitude'] }}
-                      title={`${row.label}：${row.note ?? row.value}${row.detail ? `（${row.detail}）` : ''}`}
+                      text={`${row.label}：${row.note ?? row.value}${row.detail ? `（${row.detail}）` : ''}`}
                     />
                   )}
                 </span>
@@ -161,11 +162,11 @@ export function Strip({
         <div role="img" aria-label={`${label}：${shown.map((s) => `${s.label} ${s.value}`).join('，')}`}>
           <div className="flex h-2 w-full gap-[2px]">
             {shown.map((s) => (
-              <span
+              <Note
                 key={s.label}
                 className="h-full first:rounded-l-[4px] last:rounded-r-[4px]"
                 style={{ width: `${(s.value / total) * 100}%`, background: TONE_VAR[s.tone] }}
-                title={`${s.label}：${s.value}`}
+                text={`${s.label}：${s.value}`}
               />
             ))}
           </div>
@@ -270,7 +271,8 @@ export function Meter({
           {value === null ? '没量出来' : (note ?? `${value} / ${max}`)}
         </span>
       </div>
-      <div
+      <Note
+        as="div"
         className="mt-[3px] h-2 w-full bg-[var(--ink-700)]"
         role="img"
         aria-label={
@@ -278,7 +280,7 @@ export function Meter({
             ? `${label}：没量出来${unmeasurable ? `，${unmeasurable}` : ''}`
             : `${label}：${note ?? `${value} / ${max}`}`
         }
-        title={value === null ? unmeasurable : undefined}
+        text={value === null ? unmeasurable : undefined}
       >
         {ratio === null ? (
           <span
@@ -293,7 +295,7 @@ export function Meter({
             style={{ width: `${ratio * 100}%`, background: TONE_VAR[tone] }}
           />
         )}
-      </div>
+      </Note>
       {value === null && unmeasurable && (
         <p className="pt-1 text-[11px] text-[var(--warn)]">{unmeasurable}</p>
       )}

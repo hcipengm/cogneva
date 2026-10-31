@@ -15,6 +15,7 @@ import {
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
+import { Note } from '@/ui/Note';
 import { Button, Empty, Loading, Moment, ReadError } from '@/ui/primitives';
 
 /**
@@ -285,14 +286,15 @@ export function ReparentControl({
 
   if (!open) {
     return (
-      <button
+      <Note
+        as="button"
         type="button"
         onClick={() => setOpen(true)}
         className="mono text-[10px] text-[var(--muted)] hover:text-[var(--paper)]"
-        title={parentTaskId ? `现在的父节点是 ${parentTaskId}` : '现在挂在顶层'}
+        text={parentTaskId ? `现在的父节点是 ${parentTaskId}` : '现在挂在顶层'}
       >
         改归属
-      </button>
+      </Note>
     );
   }
 
@@ -388,16 +390,17 @@ export function MoveCardControl({
   return (
     <span className="flex flex-wrap items-center gap-1">
       {targets.map((to) => (
-        <button
+        <Note
+          as="button"
           key={to}
           type="button"
           disabled={busy}
           onClick={() => void move(to)}
           className="mono border border-[var(--line)] px-1 text-[10px] text-[var(--paper-dim)] hover:border-[var(--brass-dim)] hover:text-[var(--brass)] disabled:opacity-40"
-          title={`挪到「${COLUMN_LABEL[to] ?? to}」`}
+          text={`挪到「${COLUMN_LABEL[to] ?? to}」`}
         >
           → {COLUMN_LABEL[to] ?? to}
-        </button>
+        </Note>
       ))}
       {error && (
         <span className="mono text-[10px]" style={{ color: 'var(--danger)' }}>
@@ -603,9 +606,9 @@ export function AuditTimeline({ projectId }: { projectId: string }) {
               <span className="mono w-40 shrink-0 text-[10px] text-[var(--paper-dim)]">
                 {r.action}
               </span>
-              <span className="mono min-w-0 flex-1 truncate text-[11px]" title={r.resource_id}>
+              <Note className="mono min-w-0 flex-1 truncate text-[11px]" text={r.resource_id}>
                 {r.resource_type} · {r.resource_id}
-              </span>
+              </Note>
               <span className="mono w-32 shrink-0 text-[10px] text-[var(--muted)]">{r.actor}</span>
               <span className="w-36 shrink-0 text-right text-[10px] text-[var(--muted)]">
                 <Moment iso={r.created_at} />

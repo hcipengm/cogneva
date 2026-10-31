@@ -13,6 +13,7 @@ import { resourceKey } from '@/store/frameTick';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Table, ViewFrame } from '@/ui/primitives';
 import { BarList } from '@/ui/plots';
 
+import { Note } from '@/ui/Note';
 const PAGE = 100;
 
 function bytes(n: number): string {
@@ -39,9 +40,9 @@ function ReportBody({ report, onClose }: { report: EvalReportSummary; onClose: (
   return (
     <section className="border-b border-[var(--line)]">
       <div className="flex items-baseline gap-3 px-4 py-2">
-        <span className="mono truncate text-[11px] text-[var(--paper-dim)]" title={report.id}>
+        <Note className="mono truncate text-[11px] text-[var(--paper-dim)]" text={report.id}>
           {report.id}
-        </span>
+        </Note>
         <span className="text-[11px] text-[var(--muted)]">
           {report.dataset_name || '（报告里没有数据集名）'} · {bytes(report.size_bytes)}
         </span>
@@ -141,9 +142,9 @@ export function EvalView() {
                 <span className="text-[11px] text-[var(--muted)]">{d.tags.join(' · ') || '—'}</span>
               ) },
               { key: 'path', title: '文件', render: (d) => (
-                <span className="mono truncate text-[11px] text-[var(--paper-dim)]" title={d.path}>
+                <Note className="mono truncate text-[11px] text-[var(--paper-dim)]" text={d.path}>
                   {d.path}
-                </span>
+                </Note>
               ) },
               { key: 'run', title: '', width: '90px', render: (d) => (
                 <button
@@ -187,13 +188,14 @@ export function EvalView() {
                 <span className="text-[12px]">{r.dataset_name || '—'}</span>
               ) },
               { key: 'id', title: 'id', width: '280px', render: (r) => (
-                <button
+                <Note
+                  as="button"
                   onClick={() => setPicked(picked?.id === r.id ? null : r)}
                   className="mono block w-full truncate text-left text-[11px] text-[var(--paper-dim)] underline-offset-2 hover:underline"
-                  title={r.id}
+                  text={r.id}
                 >
                   {r.id}
-                </button>
+                </Note>
               ) },
               { key: 'at', title: '跑于', width: '110px', render: (r) => <Moment iso={r.created_at} /> },
               { key: 'size', title: '大小', width: '90px', render: (r) => (

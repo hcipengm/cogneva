@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import { useServices } from '@/shell/context';
 import { useShell, type ActivityId } from '@/shell/store';
 import { useTheme } from '@/shell/theme';
+import { Note } from '@/ui/Note';
 import { themeById } from '@/styles/themes';
 import { useStreamStore } from '@/store/streamStore';
 import { pulseVerdict } from '@/store/livePulse';
@@ -132,15 +133,16 @@ function Cell({
   title?: string;
 }) {
   return (
-    <button
+    <Note
+      as="button"
       type="button"
       onClick={onClick}
-      title={title}
+      text={title}
       className="mono h-full whitespace-nowrap px-2.5 transition-colors hover:bg-[var(--ink-800)]"
       style={{ color: tone }}
     >
       {children}
-    </button>
+    </Note>
   );
 }
 

@@ -6,6 +6,7 @@ import { useLiveAlertStore } from '@/store/liveAlertStore';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 import { BarList } from '@/ui/plots';
 
+import { Note } from '@/ui/Note';
 /** 分钟数写成「几小时几分」：图上那一列只有十几格宽，写 137 比写「2 小时 17 分」省地方，但读者换算不了。 */
 function howLong(minutes: number): string {
   if (minutes < 60) return `${minutes} 分钟`;
@@ -157,12 +158,12 @@ function FreshBreaches({ rows }: { rows: LiveAlertRow[] }) {
           <span className="text-[var(--muted)]">
             第一次 <Moment iso={row.firstAt} /> · 最近 <Moment iso={row.lastAt} />
           </span>
-          <span
+          <Note
             className="mono text-[10px] text-[var(--brass)]"
-            title={`这一格来自 resource_alert 帧（${row.frames} 帧折成一行），不是这次轮询`}
+            text={`这一格来自 resource_alert 帧（${row.frames} 帧折成一行），不是这次轮询`}
           >
             帧
-          </span>
+          </Note>
         </div>
       ))}
     </div>

@@ -7,6 +7,7 @@ import {
   type SearchUpstream,
 } from '@/api/client';
 
+import { Note } from '@/ui/Note';
 /**
  * 上网检索与抓取的设置：本机两层之后还有谁可以问。
  *
@@ -313,15 +314,16 @@ export function SearchFallbackOverlay({ onClose }: { onClose: () => void }) {
             <h2 className="text-sm font-medium text-slate-300">第三方后备（按顺序问）</h2>
             <div className="flex gap-2">
               {offered.map((p) => (
-                <button
+                <Note
+                  as="button"
                   key={p.shape}
                   type="button"
                   onClick={() => addRow(p.shape)}
                   className={smallBtn}
-                  title={p.note}
+                  text={p.note}
                 >
                   + {p.label}
-                </button>
+                </Note>
               ))}
             </div>
           </div>

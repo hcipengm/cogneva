@@ -3,6 +3,7 @@ import { useServices } from '@/shell/context';
 import { deriveProblems } from '@/shell/problems';
 import { Icon } from '@/shell/icons';
 import { useShell, type PanelTab } from '@/shell/store';
+import { Note } from '@/ui/Note';
 import {
   SINK_LABELS,
   useStreamStore,
@@ -131,14 +132,15 @@ export function Panel() {
             </button>
           );
         })}
-        <button
+        <Note
+          as="button"
           type="button"
           onClick={togglePanel}
-          title="收起面板（⌘J）"
+          text="收起面板（⌘J）"
           className="ml-auto mr-1 flex h-6 w-6 items-center justify-center text-[var(--muted)] hover:text-[var(--paper)]"
         >
           <Icon name="close" size={12} />
-        </button>
+        </Note>
       </header>
 
       <div className="min-h-0 flex-1 overflow-auto">
@@ -205,18 +207,18 @@ export function Panel() {
                   <span className="mono w-16 shrink-0 text-[var(--muted)]">
                     {new Date(entry.at).toLocaleTimeString('zh-CN', { hour12: false })}
                   </span>
-                  <span className="mono w-32 shrink-0 truncate text-[var(--live)]" title={entry.agent ?? ''}>
+                  <Note className="mono w-32 shrink-0 truncate text-[var(--live)]" text={entry.agent ?? ''}>
                     {entry.agent ?? '—'}
-                  </span>
+                  </Note>
                   <span
                     className="w-56 shrink-0 truncate"
                     style={{ color: entry.failed ? 'var(--danger)' : 'var(--paper-dim)' }}
                   >
                     {entry.summary}
                   </span>
-                  <span className="min-w-0 flex-1 truncate text-[var(--muted)]" title={entry.detail ?? ''}>
+                  <Note className="min-w-0 flex-1 truncate text-[var(--muted)]" text={entry.detail ?? ''}>
                     {entry.detail ?? ''}
-                  </span>
+                  </Note>
                 </li>
               ))}
             </ul>
@@ -252,29 +254,29 @@ export function Panel() {
                     <span className="mono w-16 shrink-0 text-[var(--muted)]">
                       {new Date(point.at).toLocaleTimeString('zh-CN', { hour12: false })}
                     </span>
-                    <span
+                    <Note
                       className="mono w-32 shrink-0 truncate text-[var(--live)]"
-                      title={point.agent ?? ''}
+                      text={point.agent ?? ''}
                     >
                       {point.agent ?? '—'}
-                    </span>
+                    </Note>
                     <span className="flex w-28 shrink-0 gap-1.5">
                       {SINKS.map((sink) => {
                         const fed = point.fed.includes(sink);
                         // 没进的那两处也占着位置并压暗：三徽记始终对齐，读者一眼
                         // 看出「这帧只改了一处」，而不是以为它只该有两处。
                         return (
-                          <span
+                          <Note
                             key={sink}
                             className="mono text-[10px]"
                             style={{
                               color: fed ? 'var(--ok)' : 'var(--muted)',
                               opacity: fed ? 1 : 0.35,
                             }}
-                            title={fed ? `进了${SINK_LABELS[sink]}` : `没进${SINK_LABELS[sink]}`}
+                            text={fed ? `进了${SINK_LABELS[sink]}` : `没进${SINK_LABELS[sink]}`}
                           >
                             {SINK_LABELS[sink]}
-                          </span>
+                          </Note>
                         );
                       })}
                     </span>
@@ -284,12 +286,12 @@ export function Panel() {
                     >
                       {point.summary}
                     </span>
-                    <span
+                    <Note
                       className="min-w-0 flex-1 truncate text-[var(--muted)]"
-                      title={point.detail ?? ''}
+                      text={point.detail ?? ''}
                     >
                       {point.detail ?? ''}
-                    </span>
+                    </Note>
                   </li>
                 ))}
               </ul>
@@ -314,9 +316,9 @@ export function Panel() {
               {messages.map((m) => (
                 <li key={m.id} className="border-b border-[color-mix(in_srgb,var(--line)_55%,transparent)] py-1">
                   <div className="flex items-baseline gap-3">
-                    <span className="mono w-32 shrink-0 truncate text-[var(--live)]" title={m.agent ?? ''}>
+                    <Note className="mono w-32 shrink-0 truncate text-[var(--live)]" text={m.agent ?? ''}>
                       {m.agent ?? '—'}
-                    </span>
+                    </Note>
                     <span className="mono w-16 shrink-0 text-[var(--muted)]">{m.role}</span>
                     <span
                       className="mono w-16 shrink-0"

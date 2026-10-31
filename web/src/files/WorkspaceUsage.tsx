@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { getWorkspaceUsage, type WorkspaceUsage as Usage } from '@/api/client';
+import { Note } from '@/ui/Note';
 
 /**
  * 工作区配额：用了多少、还剩多少。
@@ -66,10 +67,11 @@ export function WorkspaceUsage() {
         <span className="ml-auto">{usage.files} 个文件</span>
       </div>
       {!unlimited && (
-        <div
+        <Note
+          as="div"
           className="mt-1 h-[3px] w-full overflow-hidden rounded-full"
           style={{ background: 'var(--line)' }}
-          title={tight ? '快到上限了，再写会开始被拒' : undefined}
+          text={tight ? '快到上限了，再写会开始被拒' : undefined}
         >
           <div
             className="h-full transition-[width] duration-500"
@@ -78,7 +80,7 @@ export function WorkspaceUsage() {
               background: tight ? 'var(--danger)' : 'var(--brass)',
             }}
           />
-        </div>
+        </Note>
       )}
     </div>
   );

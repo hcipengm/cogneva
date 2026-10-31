@@ -103,6 +103,34 @@
   background: color-mix(in srgb, var(--ink-700) 70%, transparent);
 }
 
+/* 注释面板：悬停或聚焦时浮在触发元素旁边，字可选中、复制。
+   坐标由组件按触发元素的包围盒算出来（`position: fixed`），所以在表格与滚动容器里
+   也不会被裁掉——那正是注释最多的地方。`width: max-content` ＋ 上限，短注释一行放得下，
+   长注释换行而不撑破窗口。 */
+.note:focus-visible {
+  outline: 1px solid var(--brass-dim);
+  outline-offset: 1px;
+}
+.note-panel {
+  position: fixed;
+  z-index: 60;
+  width: max-content;
+  max-width: 20rem;
+  padding: 6px 8px;
+  background: var(--ink-700);
+  border: 1px solid var(--line-strong);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 45%);
+  color: var(--paper-dim);
+  font-size: 11px;
+  line-height: 1.5;
+  letter-spacing: normal;
+  text-align: left;
+  text-transform: none;
+  white-space: normal;
+  cursor: text;
+  user-select: text;
+}
+
 /* 状态点：一个形状只表示一种状态，颜色之外还有文字，色弱也读得出。 */
 .dot {
   display: inline-block;

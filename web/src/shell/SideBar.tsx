@@ -7,6 +7,7 @@ import { Icon, type IconName } from '@/shell/icons';
 import { SIDEBAR_DEFAULT_WIDTH, useShell, type ActivityId } from '@/shell/store';
 import { useStreamStore } from '@/store/streamStore';
 import { Moment } from '@/ui/primitives';
+import { Note as NoteTip } from '@/ui/Note';
 
 /**
  * 左栏：每一面的目录与现在正在发生的事。
@@ -65,27 +66,29 @@ export function SideBar() {
         <span className="text-[11px] uppercase tracking-[0.14em] text-[var(--muted)]">
           {TITLES[activity]}
         </span>
-        <button
+        <NoteTip
+          as="button"
           type="button"
           onClick={toggleSidebar}
-          title="收起侧栏（⌘B）"
+          text="收起侧栏（⌘B）"
           className="ml-auto text-[var(--muted)] transition-colors hover:text-[var(--paper)]"
         >
           <Icon name="sidebar" size={15} />
-        </button>
+        </NoteTip>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto py-1">
         <ActivityPanel activity={activity} />
       </div>
       {/* 抓的是这条 6px 的窄带而不是一像素的边框：边框太细，按不中就等于没有。
           窄带压在侧栏右沿内侧，不占主区的宽度。 */}
-      <div
+      <NoteTip
+        as="div"
         role="separator"
         aria-orientation="vertical"
         aria-label="拖拽调整侧栏宽度"
         onPointerDown={startDrag}
         onDoubleClick={() => setWidth(SIDEBAR_DEFAULT_WIDTH)}
-        title="拖拽调整宽度，双击回到默认"
+        text="拖拽调整宽度，双击回到默认"
         className="absolute right-0 top-0 z-10 h-full w-[6px] cursor-col-resize transition-colors hover:bg-[var(--line-strong)]"
         data-sidebar-resizer="true"
       />

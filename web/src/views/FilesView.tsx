@@ -20,6 +20,7 @@ import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
 import { Button, Empty, Loading, ReadError } from '@/ui/primitives';
 
+import { Note } from '@/ui/Note';
 /**
  * 文件面：一页一个文件。
  *
@@ -256,8 +257,8 @@ export function FilesView() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <header className="flex shrink-0 items-center gap-3 border-b border-[var(--line)] px-4 py-2">
-        <span
-          title={SOURCE_HINT[source]}
+        <Note
+          text={SOURCE_HINT[source]}
           className="shrink-0 border px-1.5 py-0.5 text-[10px]"
           style={{
             borderColor: readOnly ? 'var(--warn)' : 'var(--line)',
@@ -266,10 +267,10 @@ export function FilesView() {
         >
           {SOURCE_LABEL[source]}
           {readOnly ? ' · 只读' : ''}
-        </span>
-        <h1 className="mono text-[13px] font-medium tracking-tight" title={path}>
+        </Note>
+        <Note as="h1" className="mono text-[13px] font-medium tracking-tight" text={path}>
           {path}
-        </h1>
+        </Note>
         {dirty && !readOnly && (
           <span className="text-[10px] uppercase tracking-[0.14em]" style={{ color: 'var(--warn)' }}>
             未保存

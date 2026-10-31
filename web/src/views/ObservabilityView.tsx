@@ -11,6 +11,7 @@ import { ReadingsBoard } from '@/observability/ReadingsBoard';
 import { TracesBoard } from '@/observability/TracesBoard';
 import { ClusterTopology } from '@/topology/ClusterTopology';
 import { useShell } from '@/shell/store';
+import { Note } from '@/ui/Note';
 import { Button, Empty, Loading, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 import { BarList, Strip } from '@/ui/plots';
 
@@ -72,11 +73,12 @@ export function ObservabilityView() {
         {BOARDS.map((entry) => {
           const active = entry.id === board;
           return (
-            <button
+            <Note
+              as="button"
               key={entry.id}
               type="button"
               onClick={() => setBoard(entry.id)}
-              title={entry.what}
+              text={entry.what}
               aria-pressed={active}
               className="border-r border-[var(--line)] px-4 py-2 text-[11px] transition-colors hover:bg-[var(--ink-700)] hover:text-[var(--paper)]"
               style={{
@@ -86,7 +88,7 @@ export function ObservabilityView() {
               }}
             >
               {entry.label}
-            </button>
+            </Note>
           );
         })}
       </nav>

@@ -13,6 +13,7 @@ import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
+import { Note } from '@/ui/Note';
 import { Button, Empty, Loading, Moment, ReadError, ViewFrame } from '@/ui/primitives';
 import { Strip, type Tone } from '@/ui/plots';
 
@@ -98,24 +99,26 @@ export function SourceControlView() {
         key={`${staged ? 's' : 'w'}:${change.path}`}
         className="group flex items-center gap-2 px-3 py-0.5 text-[12px] hover:bg-[var(--ink-700)]"
       >
-        <span
+        <Note
           className="mono w-4 shrink-0 text-center text-[11px]"
           style={{ color: codeColor(change.code) }}
-          title={
+          text={
             change.code === '?' ? '未跟踪（还没被 git 看见）' : CODE_NAMES[change.code] ?? change.code
           }
         >
           {change.code === '?' ? 'U' : change.code}
-        </span>
-        <button
+        </Note>
+        <Note
+          as="button"
           type="button"
           onClick={() => openDiff(change.path, staged)}
           className="mono min-w-0 flex-1 truncate text-left text-[var(--paper-dim)] hover:text-[var(--paper)]"
-          title={`${change.path}（点开看差异）`}
+          text={`${change.path}（点开看差异）`}
         >
           {change.path}
-        </button>
-        <button
+        </Note>
+        <Note
+          as="button"
           type="button"
           onClick={() =>
             void run(staged ? '取消暂存' : '暂存', () =>
@@ -124,10 +127,10 @@ export function SourceControlView() {
           }
           disabled={busy !== null}
           className="shrink-0 text-[10px] text-[var(--muted)] opacity-0 transition-opacity group-hover:opacity-100 hover:text-[var(--paper)]"
-          title={staged ? `把 ${change.path} 从暂存区拿回来` : `把 ${change.path} 放进暂存区`}
+          text={staged ? `把 ${change.path} 从暂存区拿回来` : `把 ${change.path} 放进暂存区`}
         >
           {staged ? '−' : '+'}
-        </button>
+        </Note>
       </div>
     ));
 
@@ -294,9 +297,9 @@ export function SourceControlView() {
                   <span className="mono shrink-0 text-[11px]" style={{ color: 'var(--brass)' }}>
                     {entry.short}
                   </span>
-                  <span className="min-w-0 flex-1 truncate text-[var(--paper-dim)]" title={entry.subject}>
+                  <Note className="min-w-0 flex-1 truncate text-[var(--paper-dim)]" text={entry.subject}>
                     {entry.subject}
-                  </span>
+                  </Note>
                   <span className="shrink-0 text-[11px] text-[var(--muted)]">{entry.author}</span>
                   <Moment iso={new Date(entry.at * 1000).toISOString()} />
                 </div>

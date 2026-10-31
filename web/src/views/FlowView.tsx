@@ -8,6 +8,7 @@ import { resourceKey } from '@/store/frameTick';
 import { frameIsNewer, liveIndex, useStreamStore } from '@/store/streamStore';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 
+import { Note } from '@/ui/Note';
 /**
  * 流程面：一次意图从进来、被分解、被调度、被认领到收口，现在停在哪一段。
  *
@@ -263,7 +264,7 @@ function GoalBlock({
               <span className="inline-flex items-baseline gap-1.5">
                 <span className="text-[11px]" style={{ color: statusColor(live) }}>{live}</span>
                 {live !== t.status && (
-                  <span className="mono text-[10px] text-[var(--brass)]" title="比这份快照新">帧</span>
+                  <Note className="mono text-[10px] text-[var(--brass)]" text="比这份快照新">帧</Note>
                 )}
               </span>
             );

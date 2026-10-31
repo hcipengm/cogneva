@@ -4,6 +4,7 @@ import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { BarList } from '@/ui/plots';
 
+import { Note } from '@/ui/Note';
 /**
  * 审计面：归档表里都留了什么。
  *
@@ -241,14 +242,15 @@ export function AuditView() {
               key: 'payload',
               title: '内容',
               render: (row) => (
-                <button
+                <Note
+                  as="button"
                   type="button"
                   onClick={() => setOpen((current) => (current === row.id ? null : row.id))}
                   className="mono w-full truncate text-left text-[11px] text-[var(--paper-dim)] transition-colors hover:text-[var(--paper)]"
-                  title="点一下展开整段内容"
+                  text="点一下展开整段内容"
                 >
                   {open === row.id ? '' : summarise(row.payload)}
-                </button>
+                </Note>
               ),
             },
           ]}

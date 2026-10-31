@@ -16,6 +16,7 @@ import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { BarList } from '@/ui/plots';
 
+import { Note } from '@/ui/Note';
 const PAGE = 50;
 const PREVIEW_CHARS = 4000;
 
@@ -42,9 +43,9 @@ function RawPreview({ item, onClose }: { item: RawMetadata; onClose: () => void 
   return (
     <section className="border-b border-[var(--line)]">
       <div className="flex items-baseline gap-3 px-4 py-2">
-        <span className="mono truncate text-[11px] text-[var(--paper-dim)]" title={item.id}>
+        <Note className="mono truncate text-[11px] text-[var(--paper-dim)]" text={item.id}>
           {item.id}
-        </span>
+        </Note>
         <span className="text-[11px] text-[var(--muted)]">
           {item.content_type} · {bytes(item.payload_length)}
         </span>
@@ -182,13 +183,14 @@ export function StorageView() {
           <Table
             columns={[
               { key: 'id', title: '来源', width: '320px', render: (r) => (
-                <button
+                <Note
+                  as="button"
                   onClick={() => setPicked(picked?.id === r.id ? null : r)}
                   className="mono block w-full truncate text-left text-[11px] text-[var(--paper-dim)] underline-offset-2 hover:underline"
-                  title={r.id}
+                  text={r.id}
                 >
                   {r.id}
-                </button>
+                </Note>
               ) },
               { key: 'type', title: '内容类型', width: '160px', render: (r) => (
                 <span className="mono text-[11px]">{r.content_type}</span>
@@ -261,9 +263,9 @@ export function StorageView() {
                   <span className="mono text-[11px]">{bytes(e.size_bytes)}</span>
                 ) },
                 { key: 'path', title: '文件', render: (e) => (
-                  <span className="mono truncate text-[11px] text-[var(--paper-dim)]" title={e.file_path}>
+                  <Note className="mono truncate text-[11px] text-[var(--paper-dim)]" text={e.file_path}>
                     {e.file_path}
-                  </span>
+                  </Note>
                 ) },
               ]}
               rows={logEntries}

@@ -47,6 +47,7 @@ import {
   ViewFrame,
 } from '@/ui/primitives';
 
+import { Note } from '@/ui/Note';
 /**
  * 项目面：一个项目 ＝ 任务图里的一个 goal 根连同它的后代。
  *
@@ -300,13 +301,13 @@ function ProjectStrip({
             className="flex w-full items-baseline gap-3 border-b border-[var(--line)] px-4 py-1.5 text-left last:border-b-0"
             style={{ background: active ? 'var(--ink-800)' : 'transparent' }}
           >
-            <span
+            <Note
               className="mono min-w-0 flex-1 truncate text-[11px]"
               style={{ color: ungrouped ? 'var(--muted)' : 'var(--paper)' }}
-              title={r.id}
+              text={r.id}
             >
               {ungrouped ? '未分组（没有 goal_id 的任务）' : r.id}
-            </span>
+            </Note>
             <span className="mono text-[11px] text-[var(--paper-dim)]">
               {r.tasks} 条
               {r.executables !== r.tasks && (
@@ -417,12 +418,12 @@ function FreshNodeChanges({ rows, what }: { rows: LiveTaskRow[]; what: string })
       </div>
       {shown.map((r) => (
         <div key={r.taskId} className="flex items-baseline gap-2 text-[11px]">
-          <span
+          <Note
             className="mono w-40 shrink-0 truncate text-[var(--paper-dim)]"
-            title={r.taskId}
+            text={r.taskId}
           >
             {r.taskId.slice(0, 20)}
-          </span>
+          </Note>
           <Status value={r.status} />
           <span className="text-[10px] text-[var(--muted)]">
             <Moment iso={r.lastAt} />
@@ -532,12 +533,12 @@ function ScopePanel({ project }: { project: ProjectRow }) {
             <div className="flex items-baseline gap-2 px-4 py-1">
               <span style={{ width: depth * 14 }} />
               <span className="mono text-[10px] text-[var(--muted)]">{depth === 0 ? '▪' : '└'}</span>
-              <span className="mono w-40 shrink-0 truncate text-[11px] text-[var(--paper-dim)]" title={node.id}>
+              <Note className="mono w-40 shrink-0 truncate text-[11px] text-[var(--paper-dim)]" text={node.id}>
                 {node.id.slice(0, 20)}
-              </span>
-              <span className="min-w-0 flex-1 truncate text-[11px]" title={titleOf(node)}>
+              </Note>
+              <Note className="min-w-0 flex-1 truncate text-[11px]" text={titleOf(node)}>
                 {titleOf(node)}
-              </span>
+              </Note>
               {orphan && (
                 <span className="mono text-[10px] text-[var(--danger)]">父不在图里</span>
               )}
@@ -694,21 +695,21 @@ function BoardPanel({ project }: { project: ProjectRow }) {
               {c.cards.map((card) => (
                 <div key={card.id} className="border border-[var(--line)] px-1 py-0.5">
                   <div className="flex items-baseline gap-1">
-                    <span className="min-w-0 flex-1 truncate text-[10px]" title={card.title}>
+                    <Note className="min-w-0 flex-1 truncate text-[10px]" text={card.title}>
                       {card.title}
-                    </span>
+                    </Note>
                     {card.blocked && (
-                      <span className="mono text-[9px] text-[var(--danger)]" title="依赖还没完成">
+                      <Note className="mono text-[9px] text-[var(--danger)]" text="依赖还没完成">
                         卡住
-                      </span>
+                      </Note>
                     )}
                     {!card.has_acceptance && (
-                      <span
+                      <Note
                         className="mono text-[9px] text-[var(--warn)]"
-                        title="没有验收标准：这条活之后写不了计划基线"
+                        text="没有验收标准：这条活之后写不了计划基线"
                       >
                         无验收
-                      </span>
+                      </Note>
                     )}
                   </div>
                   <MoveCardControl card={card} onDone={board.refresh} />
@@ -901,32 +902,32 @@ function GanttBar({
 
   return (
     <div className="flex items-center gap-2 border-b border-[var(--line)] py-0.5">
-      <span className="mono w-40 shrink-0 truncate text-[10px] text-[var(--paper-dim)]" title={row.id}>
+      <Note className="mono w-40 shrink-0 truncate text-[10px] text-[var(--paper-dim)]" text={row.id}>
         {row.id.slice(0, 18)}
-      </span>
-      <span className="min-w-0 flex-1 truncate text-[10px] text-[var(--muted)]" title={row.title}>
+      </Note>
+      <Note className="min-w-0 flex-1 truncate text-[10px] text-[var(--muted)]" text={row.title}>
         {row.title}
-      </span>
+      </Note>
       <div className="relative h-4 w-64 shrink-0">
         {/* 上轨：计划。没有基线就没有这一条——不画一根零长度的，那会被读成「计划已完成」。 */}
         {planned && (
-          <div
+          <Note
             className="absolute top-0 h-1"
             style={{ left: `${planned.left}%`, width: `${planned.width}%`, background: 'var(--brass)' }}
-            title={`计划 ${row.planned_start} → ${row.planned_end ?? '（时长未知）'}`}
+            text={`计划 ${row.planned_start} → ${row.planned_end ?? '（时长未知）'}`}
           />
         )}
         {/* 下轨：实际。 */}
         <div className="absolute bottom-0 h-2.5 w-full bg-[var(--line)]">
           {actual && (
-            <div
+            <Note
               className="absolute top-0 h-full"
               style={{
                 left: `${actual.left}%`,
                 width: `${actual.width}%`,
                 background: row.unplanned ? 'var(--brass-dim)' : 'var(--brass)',
               }}
-              title={`实际 ${row.created_at} → ${row.updated_at}`}
+              text={`实际 ${row.created_at} → ${row.updated_at}`}
             />
           )}
         </div>

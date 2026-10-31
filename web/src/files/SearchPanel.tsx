@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { searchWorkspace, type WorkspaceSearchResult } from '@/api/client';
 import { useShell } from '@/shell/store';
+import { Note } from '@/ui/Note';
 
 /**
  * 工作区搜索：一个输入框，一份「哪个文件里有」的清单。
@@ -96,7 +97,8 @@ export function SearchPanel() {
       )}
       <div className="max-h-[40vh] overflow-y-auto">
         {shown.map((match) => (
-          <div
+          <Note
+            as="div"
             key={`${match.path}:${match.line}:${match.column}`}
             role="button"
             tabIndex={0}
@@ -106,7 +108,7 @@ export function SearchPanel() {
               event.preventDefault();
               open(match.path, match.line, result?.query ?? '');
             }}
-            title={`${match.path}:${match.line}:${match.column}`}
+            text={`${match.path}:${match.line}:${match.column}`}
             className="cursor-pointer px-3 py-[2px] text-[11px] transition-colors hover:bg-[var(--ink-700)]"
           >
             <div className="mono truncate" style={{ color: 'var(--paper-dim)' }}>
@@ -119,7 +121,7 @@ export function SearchPanel() {
             >
               {match.text.trim()}
             </div>
-          </div>
+          </Note>
         ))}
       </div>
     </section>

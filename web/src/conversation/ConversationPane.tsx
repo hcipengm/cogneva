@@ -3,6 +3,7 @@ import { callsForGoal, shortGoal, type GoalLive } from '@/conversation/dispatch'
 import type { StreamClient } from '@/hooks/useEventStream';
 import { sessionKind, useChatStore, type ChatMessage, type ChatSession } from '@/store/chatStore';
 import { useStreamStore, type ToolCallRecord } from '@/store/streamStore';
+import { Note } from '@/ui/Note';
 
 /**
  * 一段对话的窗口。
@@ -92,11 +93,12 @@ function ToolTurn({ call }: { call: ToolCallRecord }) {
   return (
     <article className="group relative pl-4">
       <span aria-hidden className="absolute left-0 top-1 bottom-1 w-px" style={{ background: 'var(--line)' }} />
-      <button
+      <Note
+        as="button"
         type="button"
         onClick={() => setOpen((v) => !v)}
         className="flex w-full items-baseline gap-2 text-left"
-        title="展开这次调用的入参与返回"
+        text="展开这次调用的入参与返回"
       >
         <span className="mono text-[11px]" style={{ color: 'var(--paper-dim)' }}>
           工具
@@ -111,7 +113,7 @@ function ToolTurn({ call }: { call: ToolCallRecord }) {
           {label}
         </span>
         <span className="mono ml-auto text-[10px] text-[var(--muted)]">{stamp(call.startedAt)}</span>
-      </button>
+      </Note>
       {open && (
         <div className="mt-1 flex flex-col gap-1 border-l border-[var(--line)] pl-2">
           <div>
@@ -195,12 +197,12 @@ function KindBadge({ session, live }: { session: ChatSession; live: GoalLive[] }
   const kind = sessionKind(session);
   if (kind === 'chat') {
     return (
-      <span
+      <Note
         className="shrink-0 border border-[var(--line)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
-        title="一问一答：回复只走当前这条连接。关掉这一段，这一轮就没有下文了——说过的话仍然记在历史里。"
+        text="一问一答：回复只走当前这条连接。关掉这一段，这一轮就没有下文了——说过的话仍然记在历史里。"
       >
         可下线
-      </span>
+      </Note>
     );
   }
   const running = live.reduce((sum, goal) => sum + goal.running, 0);
@@ -208,10 +210,10 @@ function KindBadge({ session, live }: { session: ChatSession; live: GoalLive[] }
   const done = live.reduce((sum, goal) => sum + goal.completed, 0);
   const failed = live.reduce((sum, goal) => sum + goal.failed, 0);
   return (
-    <span
+    <Note
       className="flex shrink-0 items-baseline gap-1.5 border px-1.5 py-0.5 text-[10px]"
       style={{ borderColor: 'var(--ok)', color: 'var(--ok)' }}
-      title={
+      text={
         '已交给编排器：任务由分解、调度与监督接管，关掉这一段它继续跑，回来接得上。' +
         (total > 0 ? `这道目标下 ${total} 个任务，${done} 个收口、${running} 个在跑。` : '还在分解，子任务尚未落地。')
       }
@@ -224,7 +226,7 @@ function KindBadge({ session, live }: { session: ChatSession; live: GoalLive[] }
           {failed > 0 ? ` · 失败 ${failed}` : ''}
         </span>
       )}
-    </span>
+    </Note>
   );
 }
 
@@ -410,17 +412,17 @@ export function ConversationPane({
         <span className="mono shrink-0 text-[12px] font-medium" style={{ color: 'var(--brass)' }}>
           {name}
         </span>
-        <h2 className="truncate text-[12px] text-[var(--paper-dim)]" title={session.id}>
+        <Note as="h2" className="truncate text-[12px] text-[var(--paper-dim)]" text={session.id}>
           {session.title}
-        </h2>
+        </Note>
         <KindBadge session={session} live={live} />
         {session.goals.length > 0 && (
-          <span
+          <Note
             className="mono shrink-0 text-[10px] text-[var(--muted)]"
-            title={`目标 ${session.goals.map((goal) => goal.id).join('、')}`}
+            text={`目标 ${session.goals.map((goal) => goal.id).join('、')}`}
           >
             目标 {session.goals.map((goal) => shortGoal(goal.id)).join(' ')}
-          </span>
+          </Note>
         )}
         <span className="ml-auto flex items-center gap-3">
           {session.hydrating && (

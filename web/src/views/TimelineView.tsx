@@ -9,6 +9,7 @@ import { Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame 
 import { BarList, Strip, type StripSegment } from '@/ui/plots';
 import type { ExplainOrigin } from '@/ui/explain';
 
+import { Note } from '@/ui/Note';
 /**
  * 线上的一帧 → 活动流认得的形状。
  *
@@ -143,9 +144,9 @@ function TraceScrubber({ trace, origin }: { trace: AgentTrace; origin: ExplainOr
               }`}
             >
               <span className="mono w-20 shrink-0">{clock(row.at)}</span>
-              <span className="mono w-40 shrink-0 truncate" title={row.type}>
+              <Note className="mono w-40 shrink-0 truncate" text={row.type}>
                 {row.type}
-              </span>
+              </Note>
               <span className={row.failed ? 'text-[var(--danger)]' : ''}>{row.summary}</span>
             </li>
           ))}
@@ -205,13 +206,14 @@ export function TimelineView() {
           <Table
             columns={[
               { key: 'id', title: '轨迹', width: '230px', render: (t) => (
-                <button
+                <Note
+                  as="button"
                   onClick={() => setPicked(picked?.trace_id === t.trace_id ? null : t)}
                   className="mono block w-full truncate text-left text-[11px] text-[var(--paper-dim)] underline-offset-2 hover:underline"
-                  title={t.trace_id}
+                  text={t.trace_id}
                 >
                   {t.trace_id}
-                </button>
+                </Note>
               ) },
               { key: 'agent', title: '智能体', width: '150px', render: (t) => (
                 <span className="mono truncate text-[11px]">{t.agent_id || '—'}</span>

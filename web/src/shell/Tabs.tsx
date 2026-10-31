@@ -1,6 +1,7 @@
 import { Icon } from '@/shell/icons';
 import { useShell } from '@/shell/store';
 
+import { Note } from '@/ui/Note';
 /**
  * 编辑器上方的页签。
  *
@@ -28,37 +29,40 @@ export function Tabs() {
               {active && (
                 <span className="absolute inset-x-0 top-0 h-[1.5px]" style={{ background: 'var(--brass)' }} />
               )}
-              <button
+              <Note
+                as="button"
                 type="button"
                 onClick={() => activateTab(tab.id)}
-                title={tab.hint ? `${tab.title} — ${tab.hint}` : tab.title}
+                text={tab.hint ? `${tab.title} — ${tab.hint}` : tab.title}
                 className="flex min-w-0 flex-1 items-center py-0 pl-3 pr-1 text-left text-[12px]"
                 style={{ color: active ? 'var(--paper)' : 'var(--paper-dim)' }}
               >
                 <span className="truncate">{tab.title}</span>
-              </button>
-              <button
+              </Note>
+              <Note
+                as="button"
                 type="button"
                 onClick={() => closeTab(tab.id)}
                 disabled={tabs.length === 1}
-                title={tabs.length === 1 ? '最后一页不关' : '关闭'}
+                text={tabs.length === 1 ? '最后一页不关' : '关闭'}
                 className="mr-1 flex h-4 w-4 items-center justify-center opacity-0 transition-opacity hover:bg-[var(--ink-600)] group-hover:opacity-100 disabled:opacity-0"
                 style={{ color: 'var(--muted)' }}
               >
                 <Icon name="close" size={11} />
-              </button>
+              </Note>
             </div>
           );
         })}
       </div>
-      <button
+      <Note
+        as="button"
         type="button"
         onClick={() => setPalette('open')}
-        title="打开一页（⌘P）"
+        text="打开一页（⌘P）"
         className="flex w-9 shrink-0 items-center justify-center border-l border-[var(--line)] text-[var(--muted)] transition-colors hover:text-[var(--paper)]"
       >
         <Icon name="plus" size={14} />
-      </button>
+      </Note>
     </div>
   );
 }

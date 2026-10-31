@@ -10,6 +10,7 @@ import {
 import { useResource } from '@/hooks/useResource';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
+import { Note } from '@/ui/Note';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, Status, Table, ViewFrame } from '@/ui/primitives';
 import { Strip } from '@/ui/plots';
 
@@ -83,9 +84,9 @@ function TimelineStep({ step, newest }: { step: ChangeTimelineEvent; newest: boo
         <span className="text-[var(--muted)]"> → </span>
         <Status value={step.to_state} />
       </span>
-      <span className="mono w-28 shrink-0 truncate text-[var(--paper-dim)]" title={step.measured_rev ?? ''}>
+      <Note className="mono w-28 shrink-0 truncate text-[var(--paper-dim)]" text={step.measured_rev ?? ''}>
         {step.measured_rev ?? '—'}
-      </span>
+      </Note>
       <span className="min-w-0 flex-1 text-[var(--muted)]">
         {step.retire_reason ? `退役原因 ${step.retire_reason}` : ''}
         {step.retire_reason && step.unsettled_reason ? ' · ' : ''}
@@ -161,13 +162,14 @@ export function ChangesView() {
           <Table
             columns={[
               { key: 'id', title: '身份', width: '190px', render: (r) => (
-                <button
+                <Note
+                  as="button"
                   onClick={() => setPicked(picked?.identity === r.identity ? null : r)}
                   className="mono truncate text-left text-[11px] text-[var(--paper-dim)] underline-offset-2 hover:underline"
-                  title={r.identity}
+                  text={r.identity}
                 >
                   {r.identity}
-                </button>
+                </Note>
               ) },
               { key: 'state', title: '状态', width: '120px', render: (r) => <Status value={r.state} /> },
               { key: 'title', title: '是什么', render: (r) => (
@@ -175,21 +177,24 @@ export function ChangesView() {
               ) },
               { key: 'delivered', title: '交付 rev', width: '90px', render: (r) =>
                 r.delivered_rev ? (
-                  <span className="mono truncate text-[11px] text-[var(--paper-dim)]" title={r.delivered_rev}>
+                  <Note className="mono truncate text-[11px] text-[var(--paper-dim)]" text={r.delivered_rev}>
                     {r.delivered_rev.slice(0, 8)}
-                  </span>
+                  </Note>
                 ) : (
                   <span className="text-[11px] text-[var(--muted)]">—</span>
                 ) },
               { key: 'why', title: '还差什么', width: '150px', render: (r) =>
                 r.holds_the_line ? (
-                  <span className="text-[11px] text-[var(--warn)]" title="它已经被交付上线，而判据在树上还不成立——它扣着主线">
+                  <Note
+                    className="text-[11px] text-[var(--warn)]"
+                    text="它已经被交付上线，而判据在树上还不成立——它扣着主线"
+                  >
                     扣着主线
-                  </span>
+                  </Note>
                 ) : r.unsettled_reason ? (
-                  <span className="mono truncate text-[11px] text-[var(--warn)]" title={r.unsettled_reason}>
+                  <Note className="mono truncate text-[11px] text-[var(--warn)]" text={r.unsettled_reason}>
                     {r.unsettled_reason}
-                  </span>
+                  </Note>
                 ) : (
                   <span className="text-[11px] text-[var(--muted)]">—</span>
                 ) },

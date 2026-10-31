@@ -1,4 +1,5 @@
 import { Fragment, type ReactNode } from 'react';
+import { Note } from '@/ui/Note';
 
 /**
  * 一个够用的 Markdown 渲染器。
@@ -276,9 +277,13 @@ export function inline(text: string): ReactNode[] {
           </a>
         ) : (
           // 站内相对路径在这里没有可走的路由：原样显示路径，读者能看出它指向哪。
-          <span key={nodes.length} className="mono text-[11.5px] text-[var(--muted)]" title="相对链接，不在这里跳转">
+          <Note
+            key={nodes.length}
+            className="mono text-[11.5px] text-[var(--muted)]"
+            text="相对链接，不在这里跳转"
+          >
             {label}（{href}）
-          </span>
+          </Note>
         )
       );
     } else {

@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { getWorkspaceFileBytes } from '@/api/client';
 import { readDocx, type DocxDocument } from '@/files/preview/docx';
 import { columnName, readXlsx, MAX_COLUMNS, MAX_ROWS, type Sheet } from '@/files/preview/xlsx';
+import { Note } from '@/ui/Note';
 import { Empty, Loading, ReadError } from '@/ui/primitives';
 
 /**
@@ -223,7 +224,8 @@ export function XlsxView({ path }: { path: string }) {
                   const cell = row[columnIndex];
                   const text = cell?.text ?? '';
                   return (
-                    <td
+                    <Note
+                      as="td"
                       key={columnIndex}
                       className={`max-w-[280px] truncate border border-[var(--line)] px-1.5 py-0.5 ${
                         cell?.kind === 'n' ? 'mono text-right' : ''
@@ -236,10 +238,10 @@ export function XlsxView({ path }: { path: string }) {
                               ? 'var(--paper-dim)'
                               : 'transparent',
                       }}
-                      title={text}
+                      text={text}
                     >
                       {text || '·'}
-                    </td>
+                    </Note>
                   );
                 })}
               </tr>

@@ -12,6 +12,7 @@ import {
   type GiteeOAuthStart,
 } from '@/api/client';
 
+import { Note } from '@/ui/Note';
 /**
  * 代码平台与凭据：GitHub / Gitee 的令牌，以及网关的 SSH 身份。
  *
@@ -395,11 +396,12 @@ export function ContributionOverlay({ onClose }: { onClose: () => void }) {
           ) : (
             <div className="space-y-3">
               <div className="flex flex-wrap gap-2">
-                <button
+                <Note
+                  as="button"
                   type="button"
                   onClick={() => void startGithub()}
                   disabled={busy || !status?.device_flow_available}
-                  title={
+                  text={
                     status && !status.device_flow_available
                       ? '网关没配 GitHub OAuth App 的 client_id，这条路不可用；可以用下面的粘贴令牌'
                       : undefined
@@ -407,15 +409,16 @@ export function ContributionOverlay({ onClose }: { onClose: () => void }) {
                   className={smallBtn}
                 >
                   用 GitHub 登录（设备码）
-                </button>
+                </Note>
                 {/* 只有网关明确答「没配」（`false`）才置灰。`null` 是这一刻没问出
                     答复，按钮照常能点：点下去会拿到真实原因（`gateway_unreachable`），
                     而不是替用户断定「你没配」。 */}
-                <button
+                <Note
+                  as="button"
                   type="button"
                   onClick={() => void startGitee()}
                   disabled={busy || status?.gitee_oauth_available === false}
-                  title={
+                  text={
                     status?.gitee_oauth_available === false
                       ? '网关没配齐 Gitee 应用的 client_id / client_secret，这条路不可用；可以用下面的粘贴令牌'
                       : status && status.gitee_oauth_available === null
@@ -425,7 +428,7 @@ export function ContributionOverlay({ onClose }: { onClose: () => void }) {
                   className={smallBtn}
                 >
                   用 Gitee 授权
-                </button>
+                </Note>
                 <button
                   type="button"
                   onClick={() => setPhase('pat')}

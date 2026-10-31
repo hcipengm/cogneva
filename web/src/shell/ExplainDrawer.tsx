@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { closeExplain, useExplainSubject } from '@/ui/explain';
 import { Icon } from '@/shell/icons';
+import { Note } from '@/ui/Note';
 
 function moment(iso: string | null): string {
   if (!iso) return '没有记下来';
@@ -45,14 +46,15 @@ export function ExplainDrawer() {
       <header className="flex h-9 shrink-0 items-center gap-2 border-b border-[var(--line)] px-3">
         <span className="text-[11px] uppercase tracking-[0.12em] text-[var(--muted)]">来路</span>
         <span className="min-w-0 flex-1 truncate text-[12px] text-[var(--paper)]">{subject.label}</span>
-        <button
+        <Note
+          as="button"
           type="button"
           onClick={closeExplain}
-          title="关掉（Esc）"
+          text="关掉（Esc）"
           className="text-[var(--muted)] hover:text-[var(--paper)]"
         >
           <Icon name="close" size={12} />
-        </button>
+        </Note>
       </header>
       <div className="min-h-0 flex-1 overflow-auto px-3 py-2 text-[11px] leading-relaxed">
         <div className="mono text-[20px] text-[var(--paper)]">{subject.value}</div>

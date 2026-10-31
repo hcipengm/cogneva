@@ -10,6 +10,7 @@ import { pairHunk } from '@/files/diff';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { useShell } from '@/shell/store';
+import { Note } from '@/ui/Note';
 import { Button, Empty, Loading, ReadError, ViewFrame } from '@/ui/primitives';
 
 /**
@@ -208,14 +209,15 @@ function Cell({
         {line.text || ' '}
       </span>
       {line.kind === 'del' && (
-        <button
+        <Note
+          as="button"
           type="button"
           onClick={() => onTake(line)}
-          title="把工作区里这一行换回左边这一版"
+          text="把工作区里这一行换回左边这一版"
           className="ml-auto shrink-0 px-1 text-[10px] text-[var(--muted)] opacity-0 transition-opacity group-hover:opacity-100 hover:text-[var(--paper)]"
         >
           取用
-        </button>
+        </Note>
       )}
     </div>
   );

@@ -19,6 +19,7 @@ import { SOURCE_HINT, SOURCE_LABEL, fileTabId, parseFileTab } from '@/files/sour
 import { Icon } from '@/shell/icons';
 import { useShell } from '@/shell/store';
 
+import { Note } from '@/ui/Note';
 /**
  * 工作区文件树。
  *
@@ -233,7 +234,8 @@ export function FileTree() {
         const active = activeTabId === fileTabId(source, entry.path);
         const isOpen = !!expanded[entry.path];
         items.push(
-          <div
+          <Note
+            as="div"
             key={entry.path}
             role="button"
             tabIndex={0}
@@ -244,7 +246,7 @@ export function FileTree() {
               if (entry.dir) toggle(entry);
               else openFile(entry);
             }}
-            title={entry.path}
+            text={entry.path}
             className="group flex w-full cursor-pointer items-center gap-1 py-[3px] pr-2 text-left text-[12px] transition-colors hover:bg-[var(--ink-700)]"
             style={{
               paddingLeft: 8 + depth * 12,
@@ -286,7 +288,7 @@ export function FileTree() {
                 </InlineAction>
               </span>
             )}
-          </div>
+          </Note>
         );
         if (entry.dir && isOpen) {
           items.push(...renderLevel(entry.path, depth + 1));
@@ -336,12 +338,13 @@ export function FileTree() {
         {(['workspace', 'project'] as const).map((option) => {
           const active = option === source;
           return (
-            <button
+            <Note
+              as="button"
               key={option}
               type="button"
               role="tab"
               aria-selected={active}
-              title={SOURCE_HINT[option]}
+              text={SOURCE_HINT[option]}
               onClick={() => setSource(option)}
               className="border px-2 py-0.5 text-[11px] transition-colors"
               style={{
@@ -351,7 +354,7 @@ export function FileTree() {
               }}
             >
               {SOURCE_LABEL[option]}
-            </button>
+            </Note>
           );
         })}
       </div>
@@ -381,15 +384,16 @@ function IconButton({
   children: ReactElement;
 }) {
   return (
-    <button
+    <Note
+      as="button"
       type="button"
-      title={title}
+      text={title}
       onClick={onClick}
       disabled={disabled}
       className="flex h-4 w-4 items-center justify-center text-[var(--muted)] transition-colors hover:text-[var(--paper)] disabled:opacity-40"
     >
       {children}
-    </button>
+    </Note>
   );
 }
 
@@ -403,14 +407,15 @@ function InlineAction({
   children: ReactElement;
 }) {
   return (
-    <button
+    <Note
+      as="button"
       type="button"
-      title={title}
+      text={title}
       onClick={onClick}
       className="flex h-4 w-4 items-center justify-center text-[var(--muted)] transition-colors hover:text-[var(--paper)]"
     >
       {children}
-    </button>
+    </Note>
   );
 }
 

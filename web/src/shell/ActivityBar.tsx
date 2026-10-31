@@ -1,6 +1,7 @@
 import { useServices } from '@/shell/context';
 import { Icon, type IconName } from '@/shell/icons';
 import { useShell, type ActivityId } from '@/shell/store';
+import { Note } from '@/ui/Note';
 
 /**
  * 最左侧的一条：每一格是一面。
@@ -60,11 +61,12 @@ export function ActivityBar() {
         const active = activity === item.id;
         const mark = badge(item.id);
         return (
-          <button
+          <Note
+            as="button"
             key={item.id}
             type="button"
             onClick={() => setActivity(item.id)}
-            title={item.label}
+            text={item.label}
             aria-current={active ? 'page' : undefined}
             className="relative flex h-11 w-12 items-center justify-center transition-colors"
             style={{ color: active ? 'var(--paper)' : 'var(--muted)' }}
@@ -87,15 +89,16 @@ export function ActivityBar() {
                 {mark}
               </span>
             )}
-          </button>
+          </Note>
         );
       })}
 
       <div className="mt-auto flex flex-col items-center">
-        <button
+        <Note
+          as="button"
           type="button"
           onClick={() => setActivity('settings')}
-          title="设置"
+          text="设置"
           aria-current={activity === 'settings' ? 'page' : undefined}
           className="relative flex h-11 w-12 items-center justify-center transition-colors"
           style={{ color: activity === 'settings' ? 'var(--paper)' : 'var(--muted)' }}
@@ -104,15 +107,16 @@ export function ActivityBar() {
             <span className="absolute inset-y-1.5 left-0 w-[2px]" style={{ background: 'var(--brass)' }} />
           )}
           <Icon name="settings" size={19} />
-        </button>
-        <button
+        </Note>
+        <Note
+          as="button"
           type="button"
           onClick={signOut}
-          title={username ? `退出（${username}）` : '退出登录'}
+          text={username ? `退出（${username}）` : '退出登录'}
           className="flex h-11 w-12 items-center justify-center text-[var(--muted)] transition-colors hover:text-[var(--danger)]"
         >
           <Icon name="signout" size={18} />
-        </button>
+        </Note>
       </div>
     </nav>
   );

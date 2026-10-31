@@ -12,6 +12,7 @@ import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { BarList, Strip, type Tone } from '@/ui/plots';
 
+import { Note } from '@/ui/Note';
 /**
  * 在岗名单。
  *
@@ -84,15 +85,15 @@ function LiveState({ live }: { live: LiveAgentRow | null }) {
   const tone = STATE_TONE[live.state] ?? 'var(--brass)';
   return (
     <span className="inline-flex items-baseline gap-1.5">
-      <span className="text-[11px]" style={{ color: tone }} title={live.detail ?? undefined}>
+      <Note className="text-[11px]" style={{ color: tone }} text={live.detail ?? undefined}>
         {label}
-      </span>
-      <span
+      </Note>
+      <Note
         className="mono text-[10px] text-[var(--brass)]"
-        title={`这一格来自 ${live.stateFrame} 帧（${live.stateAt}），不是这次轮询`}
+        text={`这一格来自 ${live.stateFrame} 帧（${live.stateAt}），不是这次轮询`}
       >
         帧
-      </span>
+      </Note>
     </span>
   );
 }
@@ -214,9 +215,9 @@ export function AgentsView() {
                   <span className="inline-flex items-baseline gap-1.5">
                     <Moment iso={fromBeat && live ? live.seenAt : a.last_heartbeat} />
                     {fromBeat && (
-                      <span className="mono text-[10px] text-[var(--brass)]" title="这条心跳比这次轮询读到的快照更晚">
+                      <Note className="mono text-[10px] text-[var(--brass)]" text="这条心跳比这次轮询读到的快照更晚">
                         帧
-                      </span>
+                      </Note>
                     )}
                   </span>
                 );

@@ -1,4 +1,5 @@
 import type { TopologyContainer, TopologyEvent, TopologyVolume } from '@/api/client';
+import { Note } from '@/ui/Note';
 import { formatBytes, formatCpu, percentOf } from '@/topology/format';
 
 /**
@@ -199,7 +200,7 @@ export function VolumeRow({ volume }: { volume: TopologyVolume }) {
       <span className="mono text-[var(--paper-dim)]">{volume.name}</span>
       <span className="mono text-[var(--muted)]">{volume.kind}</span>
       {volume.claim && (
-        <span className="mono min-w-0 flex-1 truncate text-[var(--muted)]" title={volume.claim.volume_name ?? ''}>
+        <Note className="mono min-w-0 flex-1 truncate text-[var(--muted)]" text={volume.claim.volume_name ?? ''}>
           {volume.claim.name} · {volume.claim.phase}
           {volume.claim.capacity_bytes != null && ` · ${formatBytes(volume.claim.capacity_bytes)}`}
           {volume.claim.measured_bytes != null && (
@@ -211,7 +212,7 @@ export function VolumeRow({ volume }: { volume: TopologyVolume }) {
           )}
           {volume.claim.storage_class && ` · ${volume.claim.storage_class}`}
           {volume.claim.access_modes.length > 0 && ` · ${volume.claim.access_modes.join('/')}`}
-        </span>
+        </Note>
       )}
     </div>
   );

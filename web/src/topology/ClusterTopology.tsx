@@ -13,6 +13,7 @@ import { clusterName, formatBytes, formatCpu } from '@/topology/format';
 import { ContainerRow, Dot, EventRow, VolumeRow } from '@/topology/rows';
 import { Empty, Loading, ReadError } from '@/ui/primitives';
 
+import { Note } from '@/ui/Note';
 /**
  * 集群拓扑：集群 → 节点 → Pod → 容器。
  *
@@ -97,9 +98,9 @@ function ClusterRow({
       <header className="flex flex-wrap items-baseline gap-x-4 gap-y-1 px-4 py-2">
         <span className="flex items-center gap-1.5">
           <Dot tone={cluster.reachable ? 'ok' : 'danger'} />
-          <span className="text-[12px] text-[var(--paper)]" title={`接口标识 ${cluster.id}`}>
+          <Note className="text-[12px] text-[var(--paper)]" text={`接口标识 ${cluster.id}`}>
             {clusterName(index, total)}
-          </span>
+          </Note>
         </span>
         {cluster.version && <span className="mono text-[11px] text-[var(--muted)]">{cluster.version}</span>}
         <span className="mono text-[11px] text-[var(--muted)]">
