@@ -2706,8 +2706,19 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          the freshness companion is for. The zero is a real reading and has to \
          be tested for -- the age of the epoch is not a wait -- and it is \
          written by the round that takes the slot, so an idle deployer is silent \
-         rather than permanently overdue. One number, no labels: the run is the \
-         deployer's own and the deployer is its only writer",
+         rather than permanently overdue. What counts as not waiting is decided \
+         per round and from how the round before it ended: the cell is written \
+         at the top of a round, before that round has decided whether it will \
+         of a round, before that round has decided whether it will ask for the \
+         slot, so what it can report is whether the previous round reached the \
+         gate and was refused. Republishing the start otherwise would carry a \
+         refusal of the past across a round that stopped for an entirely \
+         different reason -- an upstream CI hold, a withdrawal pin, a rollout \
+         still in flight -- and point the reader at the build gate while the \
+         repair lies elsewhere. The cost is one round of lag: the first round \
+         after a refusal still reads as waiting, because its own decision is not \
+         made yet, and the round after it writes the 0. One number, no labels: \
+         the run is the deployer's own and the deployer is its only writer",
     ),
     (
         crate::metric_names::MAINLINE_BUILD_SECONDS.as_str(),

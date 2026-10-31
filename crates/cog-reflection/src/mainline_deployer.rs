@@ -2292,6 +2292,16 @@ struct MainlineState {
     /// 这一段等待中间，而"已经等了多久"正是最容易被它们抹掉的那个数。
     #[serde(default)]
     advance_wait_since_unix: Option<i64>,
+    /// 上一拍是不是以「被拒」收场的：`true` = 上一拍走到了构建闸、没拿到槽就回去了。
+    ///
+    /// 起点那一格要在每一拍的最早处重发一次，而那时本拍还没决定要不要去要槽——它
+    /// 能回答的只有上一拍的结局。发盘上的旧起点看起来一样，实际把「上一拍被拒过」
+    /// 延长成了「这一拍还在被拒」：一段等待之后，这一拍若被上游 CI 扣住、撞上撤回
+    /// 钉、或者在飞滚动还没收，它连闸都没碰，而旧起点照样被发出去，按三十五分钟判
+    /// 的规则于是指着一个正在往前走的部署器说「等构建槽」，真正挡住它的那条规则
+    /// 另有所指、修法也在另一边。读出来就灭：它说的是上一拍，不是这一拍。
+    #[serde(default)]
+    advance_wait_refused: bool,
     /// 当前这一段等待里最近一次被拒的理由，闭集 `build_gate_busy` / `other`。
     /// 结束时要把它写进结局；只留 `advance_deferrals` 的话，这一段为什么等在
     /// 清零之后没有任何载体。
@@ -6042,8 +6052,32 @@ impl MainlineDeployer {
         // 这件事——尤其读不到裸仓库的那几轮，恰恰可能是被饿住的那几轮。写在早退
         // 之后，一个长期读不到裸仓库的部署器会让这一格停在旧值上，读它的规则就把
         // 「写者停了」读成「还在饿着」。
-        self.record_advance_wait(state.advance_deferrals, state.advance_wait_since_unix)
-            .await;
+        //
+        // 起点这一格发的是**上一拍的结局**，不是盘上那个值。本拍还没走到构建闸，
+        // 它答得出「上一拍被拒了吗」，答不出「这一拍会不会被拒」；而盘上的起点在
+        // 这一支之外没人改写，照原样发出去就等于把「上一拍被拒过」写成了「现在还
+        // 在等」。一段等待之后若这一拍被上游 CI 扣住、撞上撤回钉、或者在飞滚动还
+        // 没收，它连闸都没碰，挡它的是另一件事、修法也在另一处，而起点照旧发出去
+        // 会让按三十五分钟判的规则指着构建闸说事。真的被拒的那一支自己会重发起点
+        // 与轮次（见下面 `record_advance_wait` 那一次），所以一个连续被拒的段落
+        // 每一拍都还是原样的起点，读它的人拿求值时刻去减，年龄照样在长。
+        let refused_last_round = state.advance_wait_refused;
+        if state.advance_wait_refused {
+            // 读出来就灭：它说的是上一拍。落盘而不是只留在内存里——这一拍可能
+            // 在下面任何一条早退上离开，而挂着 true 的下一拍会把一个早就没人去
+            // 要槽的起点当成「正在等」发出去。
+            state.advance_wait_refused = false;
+            self.save_state(&state)?;
+        }
+        self.record_advance_wait(
+            state.advance_deferrals,
+            if refused_last_round {
+                state.advance_wait_since_unix
+            } else {
+                None
+            },
+        )
+        .await;
 
         // 这两处钉在**本拍最早的位置**，谁不需要这一轮的产物谁就排在早退前面。
         // 它们量的是这一轮之外的事（两棵长命树的索引读数还在不在动、registry 这卷
@@ -6637,6 +6671,9 @@ impl MainlineDeployer {
                         state.advance_wait_since_unix = Some(chrono::Utc::now().timestamp());
                     }
                     state.advance_wait_reason = Some(reason.to_string());
+                    // 这一拍真的走到了闸前、也真的被拒了：下一拍最早处那一次重发
+                    // 才敢把这个起点当作「正在等」。见 `advance_wait_refused`。
+                    state.advance_wait_refused = true;
                     // 连输够多轮：认领下一个名额，让正在排队的构建方都让一步。零等待
                     // 那一半没变——这一轮照旧什么都不做地回下一轮（见
                     // `ADVANCE_CLAIM_AFTER_DEFERRALS`）。认领过没有也要落盘：结局里的
@@ -12228,6 +12265,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 reserved_by: None,
             }],
             advance_wait_since_unix: None,
+            advance_wait_refused: false,
             advance_wait_reason: None,
             advance_wait_reserved: false,
             advance_wait_reserved_by: None,
@@ -13058,6 +13096,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 reserved_by: None,
             }],
             advance_wait_since_unix: Some(2000),
+            advance_wait_refused: true,
             advance_wait_reason: Some("build_gate_busy".into()),
             advance_wait_reserved: true,
             advance_wait_reserved_by: Some("renewal".into()),
@@ -16720,6 +16759,67 @@ exec {real} "$@"
             read(&metrics, MAINLINE_ADVANCE_WAIT_SINCE_UNIX.as_str()).await,
             Some(0.0),
             "等待结束必须把起点写回 0，否则规则会照着一段早已结束的等待一直点着"
+        );
+    }
+
+    /// 一拍没走到构建闸，就不能把上一拍的起点当成「这一拍还在等槽」一直发下去。
+    ///
+    /// 起点这一格的契约是「0 = 这一拍不在等槽」。本拍被上游 CI 扣住、撞上撤回钉、
+    /// 或者在飞滚动还没收的时候，它连闸都没碰，挡住它的是另一件事、修法也在另一处；
+    /// 此刻把盘上的旧起点照原样发出去，按三十五分钟判的规则就会指着一个正在往前走
+    /// 的部署器说「等构建槽」，读的人去查构建闸，查到的是别人的构建。
+    ///
+    /// 迟一拍是必然的：每一拍最早处发的是**上一拍的结局**，那一拍还没走到闸前。
+    /// 所以停在同一处的第二拍才发 0——第一拍仍然照着上一拍真被拒的事实说「在等」，
+    /// 这一拍不撒谎；而多说的那一拍不会长，因为下一拍就把结论翻过来了。反过来，
+    /// 在最早处一律写 0 会让一个连续被拒的段落每一拍都闪一次 0（写 0 在最前、
+    /// 写到真起点在闸前，中间隔着几分钟），读数面上成了每十分钟亮灭一次。
+    #[tokio::test]
+    async fn a_round_that_never_reached_the_gate_stops_publishing_the_old_wait_start() {
+        use cog_core::metric_names::MAINLINE_ADVANCE_WAIT_SINCE_UNIX;
+
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_b);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
+
+        // 上一拍被拒了：盘上有连输两轮、四十分钟前的起点，和「上一拍是被拒收场」。
+        let mut state = deployer.load_state();
+        state.advance_deferrals = 2;
+        state.advance_wait_since_unix = Some(chrono::Utc::now().timestamp() - 2400);
+        state.advance_wait_refused = true;
+        deployer.save_state(&state).unwrap();
+
+        // 这一拍无事可做（已经在 main 上），根本走不到构建闸。
+        deployer.poll_once().await.unwrap();
+        assert!(
+            !deployer.load_state().advance_wait_refused,
+            "上一拍的结局读出来就要灭掉，否则下一拍会拿同一个起点再说一次"
+        );
+
+        // 第二拍仍然没碰闸：上一拍没被拒，起点就必须归 0。
+        deployer.poll_once().await.unwrap();
+        let published = metrics
+            .query_gauge_latest(MAINLINE_ADVANCE_WAIT_SINCE_UNIX.as_str())
+            .await
+            .unwrap()
+            .first()
+            .map(|s| s.value);
+        assert_eq!(
+            published,
+            Some(0.0),
+            "两拍都没碰闸，就不存在「正在等槽」：还在发上一拍的起点，\
+             规则会把一次被 CI 扣住 / 撤回 / 在飞滚动读成等构建槽"
         );
     }
 

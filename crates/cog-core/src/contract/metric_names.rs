@@ -1076,6 +1076,18 @@ metric_names! {
     // evaluation time, and leaves "the writer stopped" to the freshness
     // companion every reading in this family already carries. 0 means not
     // waiting, and a reader has to test it: the age of the epoch is not a wait.
+    //
+    // Which rounds may publish the instant is part of the reading. The cell is
+    // written at the top of a round, before that round has decided whether it
+    // will ask for the slot, so all it can report is how the round before it
+    // ended: the instant goes out only when that round reached the gate and was
+    // refused, and 0 otherwise. Republishing the start while a round stops for
+    // another reason -- an upstream CI hold, a withdrawal pin, a rollout still
+    // in flight -- carries a refusal of the past across a round that never
+    // touched the gate, and the rule over it then names the build slot as the
+    // thing to go look at while the repair lies elsewhere. The lag is one
+    // round: the round right after a refusal still reads as waiting, and the
+    // round after that writes the 0.
     MAINLINE_ADVANCE_WAIT_SINCE_UNIX => "cogneva_mainline_advance_wait_since_unix",
     // Rounds the deployer's poll loop finished, by how they finished: `ok` when
     // the round ran to the end, `failed` when it returned an error.
