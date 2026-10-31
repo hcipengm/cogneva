@@ -2226,6 +2226,16 @@ struct MainlineState {
     /// 进程正是它自己会做的事，而重启正是"已经等了多久"最容易被抹掉的时候。
     #[serde(default)]
     ci_hold: Option<CiHold>,
+    /// 上游 CI 一直在报失败、因此连续被按住的这一段从哪一刻起，unix 秒。
+    ///
+    /// `ci_hold` 记的是**某一个 rev 上的一次扣住**，它活不到换版：换版之后那一问
+    /// 还没有判词，扣住先以 `rev_no_longer_tracked` 结束，下一版报红时重新起算。
+    /// 而改动平均半小时落一版，于是「扣了多久」这条读数在真被困住的时候反而一直
+    /// 停在分钟级——它数的是最后一次换版到现在，不是这一段时间。这一段跨版本连续，
+    /// 起点只在**上游明确答了一次不红**时清掉；「没问到」不算答过，换版那一问常常
+    /// 还是 pending，把它读成放行正是这条读数失效的那一步。
+    #[serde(default)]
+    ci_hold_run_since_unix: Option<i64>,
     /// 最近的每一次扣住是怎么结束的。见 [`CiHoldEnd`]。
     ///
     /// 只留最近 [`CI_HOLD_END_KEEP`] 条：这里答的是"最近几版怎么被放的"，不是
@@ -4246,6 +4256,9 @@ impl MainlineDeployer {
     /// 同形，而处置相反。扣住这一支与放行这一支都要发：库里只增不改，一次扣住结束
     /// 之后必须有人把这一格读回 0，否则最后那个值会一直留在库里，读它的规则点着
     /// 而没有任何东西能让它灭。
+    ///
+    /// 发出去的时长跨版本连续（见 `MainlineState::ci_hold_run_since_unix`）：换版
+    /// 不是「不红了」，只是被指的那一版换了。
     async fn hold_if_ci_reports_failure(
         &self,
         state: &mut MainlineState,
@@ -4288,7 +4301,17 @@ impl MainlineDeployer {
             );
         }
         if verdict != Some(false) {
-            self.record_ci_hold_reading(0).await;
+            // 只有上游**答了**不红才算这一段结束。「没问到」是另一件事：换版之后
+            // 上游的检查往往还在跑，问题本身还没有答案，此刻把时长清零，一场持续
+            // 数小时的扣住就在读数上重新从零开始，而读它的那条规则按四小时判。
+            if verdict == Some(true) && state.ci_hold_run_since_unix.take().is_some() {
+                self.save_state(state)?;
+            }
+            let held_secs = state
+                .ci_hold_run_since_unix
+                .map(|since| (chrono::Utc::now().timestamp() - since).max(0))
+                .unwrap_or(0);
+            self.record_ci_hold_reading(held_secs).await;
             return Ok(false);
         }
         warn!(
@@ -4306,17 +4329,26 @@ impl MainlineDeployer {
             "upstream CI reports a failure for this rev; holding the rollout"
         );
         let now = chrono::Utc::now().timestamp();
+        let mut changed = false;
+        // 这一段的第一版落盘就在这一刻。换版不清它：红的还是同一件事（这棵树过不了
+        // 上游的判据），变的只是被指的那一版。
+        if state.ci_hold_run_since_unix.is_none() {
+            state.ci_hold_run_since_unix = Some(now);
+            changed = true;
+        }
         if state.ci_hold.as_ref().map(|h| h.rev.as_str()) != Some(rev) {
             state.ci_hold = Some(CiHold {
                 rev: rev.to_string(),
                 since_unix: now,
             });
+            changed = true;
+        }
+        if changed {
             self.save_state(state)?;
         }
         let held_secs = state
-            .ci_hold
-            .as_ref()
-            .map(|h| (now - h.since_unix).max(0))
+            .ci_hold_run_since_unix
+            .map(|since| (now - since).max(0))
             .unwrap_or(0);
         self.record_ci_hold_reading(held_secs).await;
         // After the hold is on disk: a submission that fails must not cost the
@@ -4382,8 +4414,13 @@ impl MainlineDeployer {
     /// 读回 0，否则最后那个值会一直在，规则点着而没有任何东西能让它灭——所以放行
     /// 的那一支也写。
     ///
-    /// 不带 rev 标签。一次扣住描述的就是那一个 rev，按 rev 建序列会为每一个只描述
-    /// 过它自己的值留一行永久行（与 `MAINLINE_BUILD_SECONDS` 同一条判据，那里写着
+    /// 量的是**这一段**被按了多久，不是最后一次换版到现在：起点落在
+    /// `ci_hold_run_since_unix` 上，跨版本连续，只在 CI 明确答不红时归零。绑在
+    /// 当前这一版上的话，改动每半小时落一版就把它抹一次，于是持续数小时的扣住在
+    /// 这一格上永远停在分钟级，读它的那条四小时规则也就永远不亮。
+    ///
+    /// 不带 rev 标签。这一格描述的就是"这一段"，按 rev 建序列会为每一个只描述过
+    /// 它自己的值留一行永久行（与 `MAINLINE_BUILD_SECONDS` 同一条判据，那里写着
     /// "一个 rev 只构建一次，按 rev 建序列会留下一行永远在的、只描述它自己的行"）。
     /// "扣的是哪个 rev"不是靠这格标签答的：状态文件里的 `ci_hold.rev`、心跳那一行的
     /// `ci_hold=` 与日志都按 rev 记，而这一格答的是"多久"，两者读在一起才成句。
@@ -6367,6 +6404,12 @@ impl MainlineDeployer {
                 reasons = %ended.reasons.join(","),
                 "upstream CI no longer reports a failure; resuming the rollout"
             );
+            // `rev_no_longer_tracked` 不是放行：被按的那一版再也没被问过，拦住它的
+            // 那件事还在不在，这一轮不知道。别的两支都是这一版拿到了判词、并且照它
+            // 走了，这一段到此为止。
+            if ended.outcome != "rev_no_longer_tracked" {
+                state.ci_hold_run_since_unix = None;
+            }
             state.ci_hold_ends.push(ended);
             let excess = state.ci_hold_ends.len().saturating_sub(CI_HOLD_END_KEEP);
             if excess > 0 {
@@ -8635,7 +8678,7 @@ fn heartbeat_message_with_pin(
         (PinReading::None, _) => "none",
     };
     format!(
-        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={} pin={} pin_secs={} pin_actor={} pin_state={} pin_took={}",
+        "bare={} upstream={} behind_revs={} last_good={} last_good_secs={} in_flight={} ci_hold={} ci_hold_secs={} ci_hold_run_secs={} ci_hold_ends={} last_ci_hold_end={} registry_hold_secs={} failed_rev={} failed_class={} failed_loci={} failed_repeated={} cooldown_remaining_secs={} advance_waits={} last_advance_wait={} pin={} pin_secs={} pin_actor={} pin_state={} pin_took={}",
         rev12(bare_rev),
         upstream,
         // 落后几个 rev。`last_good_secs` 答的是"多久"，这一格答的是"几笔"——两者
@@ -8664,6 +8707,13 @@ fn heartbeat_message_with_pin(
             .ci_hold
             .as_ref()
             .map(|h| (now_unix - h.since_unix).to_string())
+            .unwrap_or_else(|| "none".into()),
+        // 这两个时长答的不是同一个问题，而且换版时差得很远：上一格是「这一版被按了
+        // 多久」，换一版就从头算；这一格是「这一段时间被按了多久」，跨版本连续，
+        // 只在 CI 明确答不红时归零。后者才是那条四小时规则在量的东西。
+        state
+            .ci_hold_run_since_unix
+            .map(|t| (now_unix - t).max(0).to_string())
             .unwrap_or_else(|| "none".into()),
         // 扣住的**结局**是另一件事：上一格只答"现在还被按住吗"。一次扣住结束之后
         // `ci_hold` 变回 none，而"这一版是判过才放的，还是上游换了版才放的"从这里读。
@@ -12029,6 +12079,8 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 rev: "deadbeef0011".into(),
                 since_unix: 300,
             }),
+            // 这一段的起点比这一版早得多：两个时长在这一行上必须分得开。
+            ci_hold_run_since_unix: Some(100),
             ci_hold_ends: vec![CiHoldEnd {
                 rev: "cafebabe0011".into(),
                 since_unix: 100,
@@ -12067,6 +12119,10 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             1000,
         );
         assert!(msg.contains("in_flight=aabbccddeeff@Pushed"), "{msg}");
+        // 两个时长答的是两个问题：这一版被按的（300 到现在 1000）与这一段被按的
+        // （100 到现在 1000）。只留前一个，"换版就把计时抹掉"在读取面上看不见。
+        assert!(msg.contains("ci_hold_secs=700"), "{msg}");
+        assert!(msg.contains("ci_hold_run_secs=900"), "{msg}");
         assert!(msg.contains("upstream=up-to-date(aabbccddeeff)"), "{msg}");
         assert!(
             msg.contains("registry_hold_secs=60"),
@@ -12828,6 +12884,8 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             failed_repeated: true,
             failed_class: FailureClass::Environment,
             ci_hold: None,
+            // 这一段还没结束：起点要能被 serde 带过去，重启一次不能让它从头算。
+            ci_hold_run_since_unix: Some(700),
             // 结局要能被 serde 带过去：它是"扣住结束之后唯一还在的那份记录"，
             // 序列化丢了它，重启一次这一次扣住就又变回"从没发生过"。
             ci_hold_ends: vec![CiHoldEnd {
@@ -16267,12 +16325,14 @@ exec {real} "$@"
         let first = read().await.expect("按住这一支也要写这一格");
         assert!(first < 5.0, "刚按住，读出来的是 {first}");
 
-        // 把起点挪到一小时前再问一次：这一格跟着走，不是一次性的。
+        // 把这一段的起点挪到一小时前再问一次：这一格跟着走，不是一次性的。
         let mut state = deployer.load_state();
+        let an_hour_ago = chrono::Utc::now().timestamp() - 3600;
         state.ci_hold = Some(CiHold {
             rev: "abc123".into(),
-            since_unix: chrono::Utc::now().timestamp() - 3600,
+            since_unix: an_hour_ago,
         });
+        state.ci_hold_run_since_unix = Some(an_hour_ago);
         deployer.save_state(&state).unwrap();
         assert!(deployer
             .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
@@ -16295,11 +16355,82 @@ exec {real} "$@"
             0.0,
             "扣住结束必须写回 0，否则最后那个值会一直在库里"
         );
+        assert!(
+            deployer.load_state().ci_hold_run_since_unix.is_none(),
+            "上游答了不红，这一段到此为止：起点要清掉，否则下一段红会接着上一段的年龄算"
+        );
         // 放行那一支同样要留下判词，而且是从 `fail` 改写到 `pass`：
         // "构建期间上游跑完了结论"正是派发前那次提问存在的理由。
         let recorded = state.last_ci_verdict.as_ref().expect("放行也要留判词");
         assert_eq!(recorded.rev, "abc123");
         assert_eq!(recorded.verdict, "pass");
+        handle.await.unwrap();
+    }
+
+    /// 换版不重算：这一段量的是「上游一直红」，不是「这一版被按住」。
+    ///
+    /// 改动平均半小时落一版。起点绑在当前这一版上时，换版那一问往往还没有判词，
+    /// 扣住先以 `rev_no_longer_tracked` 结束，下一版报红又重新起算——一场持续数小时
+    /// 的扣住在这条读数上永远停在分钟级，而读它的那条规则按四小时判，于是「主线
+    /// 已经几小时没部署」在告警面上完全不可见。这里钉住的是：第二个 rev 报红时，
+    /// 读出来的是这一段的墙钟时长，而那一版自己的起点仍然是新的。
+    #[tokio::test]
+    async fn a_second_revision_keeps_the_hold_clock_running() {
+        use cog_core::metric_names::MAINLINE_CI_HOLD_SECONDS;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+        let read = || {
+            let metrics = metrics.clone();
+            async move {
+                metrics
+                    .query_gauge_latest(MAINLINE_CI_HOLD_SECONDS.as_str())
+                    .await
+                    .unwrap()
+                    .first()
+                    .map(|s| s.value)
+            }
+        };
+
+        let mut state = deployer.load_state();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+        assert!(
+            deployer.load_state().ci_hold_run_since_unix.is_some(),
+            "第一次报红就要把这一段的起点落盘"
+        );
+
+        // 这一段一小时前就开始了，中途上游换了版，新的那一版同样是红的。
+        let an_hour_ago = chrono::Utc::now().timestamp() - 3600;
+        state.ci_hold_run_since_unix = Some(an_hour_ago);
+        deployer.save_state(&state).unwrap();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "ffff9999", CiAsk::BeforeBuild)
+            .await
+            .unwrap());
+        let aged = read().await.unwrap();
+        assert!(
+            (3600.0..3720.0).contains(&aged),
+            "换一版不该把这一段的计时重来，读到的却是 {aged}"
+        );
+        let held = deployer.load_state().ci_hold.expect("换版之后要指到新版");
+        assert_eq!(held.rev, "ffff9999");
+        assert!(
+            (chrono::Utc::now().timestamp() - held.since_unix) < 5,
+            "这一版自己的起点是新的：两格答的不是同一个问题"
+        );
         handle.await.unwrap();
     }
 
