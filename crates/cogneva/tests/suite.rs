@@ -51,6 +51,8 @@ pub mod unread;
 mod a2a_advertised_paths_are_served;
 #[path = "a2a_rpc_round_trip.rs"]
 mod a2a_rpc_round_trip;
+#[path = "a_job_inner_wait_budget_widens_the_job_deadline_test.rs"]
+mod a_job_inner_wait_budget_widens_the_job_deadline_test;
 #[path = "a_label_name_is_the_same_wherever_it_is_declared_test.rs"]
 mod a_label_name_is_the_same_wherever_it_is_declared_test;
 #[path = "a_node_capacity_probe_is_written_once_test.rs"]
