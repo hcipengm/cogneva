@@ -2253,6 +2253,12 @@ struct MainlineState {
     /// 停在分钟级——它数的是最后一次换版到现在，不是这一段时间。这一段跨版本连续，
     /// 起点只在**上游明确答了一次不红**时清掉；「没问到」不算答过，换版那一问常常
     /// 还是 pending，把它读成放行正是这条读数失效的那一步。
+    ///
+    /// 另有一处清法：**这一版真的滚上去了**。红着的版本滚不上来，滚上来说明这一段
+    /// 结束了。不清的话起点会一直挂着——实测 2026-10-31：扣住 12:00 以
+    /// `rev_no_longer_tracked` 结束，之后主线又滚了两版，而它在的那些轮问出来的判词
+    /// 是 `no_evidence`（github 还在跑、gitee 没有运行），于是每一次都拿新的时间戳
+    /// 重发一段时间已经结束的扣住，按四小时判的规则在一条正在往前滚的主线上亮。
     #[serde(default)]
     ci_hold_run_since_unix: Option<i64>,
     /// 最近的每一次扣住是怎么结束的。见 [`CiHoldEnd`]。
@@ -4277,7 +4283,8 @@ impl MainlineDeployer {
     /// 而没有任何东西能让它灭。
     ///
     /// 发出去的时长跨版本连续（见 `MainlineState::ci_hold_run_since_unix`）：换版
-    /// 不是「不红了」，只是被指的那一版换了。
+    /// 不是「不红了」，只是被指的那一版换了。所以这一段只能由两件事结束：上游明确
+    /// 答了不红，或者这一版最后真的滚上去了——后者在收敛那一支清，红着的版本滚不上来。
     async fn hold_if_ci_reports_failure(
         &self,
         state: &mut MainlineState,
@@ -6204,6 +6211,13 @@ impl MainlineDeployer {
                 state.failed_repeated = false;
                 state.failed_class = FailureClass::default();
                 state.failed_cooldown_until = 0;
+                // 这一版滚上去了：「上游一直不给绿」那一段到此为止。红着的版本滚不
+                // 上来，滚上来就是「主线被扣住、推不动」的反证。不清的话，起点会跟着
+                // 后面那些「上游还在跑」的轮一次次按新的时间戳重发，四小时那条规则
+                // 就会在一条正在往前滚的主线上亮——而它写的正是「主线停住了」。
+                if state.ci_hold_run_since_unix.take().is_some() {
+                    self.record_ci_hold_reading(0).await;
+                }
                 self.save_state(&state)?;
                 return Ok(());
             }
@@ -18992,6 +19006,68 @@ exit 0
             state.last_good_unix > 0 && state.last_good_unix <= now,
             "收敛时要写下落地时刻，记到的是 {}",
             state.last_good_unix
+        );
+    }
+
+    /// 收敛那一轮要把「上游一直不给绿」这一段结束掉。
+    ///
+    /// 这一格量的是主线被扣住、推不动：推进发生了，钟就该停。2026-10-31 实测过它
+    /// 不停的样子——扣住 12:00 以 `rev_no_longer_tracked` 结束，之后主线又滚了两版，
+    /// 起点只在「上游明确答绿」时才清，而那几轮的判词是 `no_evidence`，于是每一次
+    /// 都按新的时间戳重发一段时间已经结束的扣住，四小时那条规则在一条正在往前滚的
+    /// 主线上亮。
+    #[tokio::test]
+    async fn a_converged_rollout_ends_the_hold_clock() {
+        use cog_core::metric_names::MAINLINE_CI_HOLD_SECONDS;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, _rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        // 四部署已经在目标 main tag 上，判定者也判过了：这一轮会收敛。
+        let deployed = main_image("localhost:30500", &rev_b);
+        let kubectl = fake_kubectl_with_judge(&bin_dir, &deployed, "1||", "");
+
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let deployer =
+            MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let an_hour_ago = chrono::Utc::now().timestamp() - 3600;
+        let state = MainlineState {
+            in_flight: Some(InFlight {
+                rev: rev_b.clone(),
+                phase: Phase::Dispatched,
+            }),
+            ci_hold_run_since_unix: Some(an_hour_ago),
+            ..Default::default()
+        };
+        std::fs::write(
+            state_dir.join("state.json"),
+            serde_json::to_string(&state).unwrap(),
+        )
+        .unwrap();
+
+        deployer.poll_once().await.unwrap();
+
+        let state: MainlineState =
+            serde_json::from_str(&std::fs::read_to_string(state_dir.join("state.json")).unwrap())
+                .unwrap();
+        assert!(state.in_flight.is_none(), "前提：这一轮要真的收敛");
+        assert!(
+            state.ci_hold_run_since_unix.is_none(),
+            "滚上去了这一段就结束了：起点还挂着，下一问会把一段时间已经结束的扣住按新时间戳重发"
+        );
+        let latest = metrics
+            .query_gauge_latest(MAINLINE_CI_HOLD_SECONDS.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            latest.first().map(|s| s.value),
+            Some(0.0),
+            "收敛那一轮要把这一格读回 0，否则库里留着最后那个非零值，规则一直点着"
         );
     }
 
