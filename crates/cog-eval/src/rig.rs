@@ -1,3 +1,5 @@
+//! principle: feedback_without_a_per_case_timeout_a_slow_case_and_a_hung_case_read_the_same
+//!
 //! 运行器与报表：把「基准 × 外壳 × 种子」跑成主表的一格。
 //!
 //! 一格 ＝ 一个基准 × 一个外壳 × 3 个独立种子，报**均值 ± 标准差**。三个种子是
@@ -9,7 +11,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cog_core::{
     AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, LlmClient, Message,
@@ -32,6 +34,20 @@ pub const DATA_ROOT_ENV: &str = "COG_EVAL_DATA_ROOT";
 /// 跳过的原因之一：这一跑的骨干看不见图。写死成常量，因为报表与测试都要逐字比它。
 pub const SKIP_NEEDS_VISION: &str =
     "the backbone cannot see images, so the case would be a blind guess";
+
+/// 一例最多允许跑多久。
+///
+/// 这个数是**读数的尽头**，不是给快例打分的界。逐例推进的一跑里，「很久没有新结果」
+/// 在没有单例上界时是一个二义的量：正在算一道慢题，与挂在一次永远不会返回的等待上，
+/// 印出来的是同一条平线。2026-10-18/19 实测过一次——checkpoint 从 21:13Z 起约
+/// 15 分钟/例地往上加，23:00 之后 55 分钟一行没加，而那个进程 21:44Z 就已经 exit 1
+/// 了。当时能拿到的只有这条平线，分不出「有东西在等」与「已经没人了」。有了单例上界，
+/// 同一件事收在一处可读的结局上：判完，或者记为出错。
+///
+/// 取得宽是有意的：那道慢题实测约 15 分钟/例，上界比它高一倍，才不会把「慢」判成「挂」——
+/// 判错的方向是把还算得出来的题丢掉。它也**不按基准变**：一列一个界，两列的 `errored`
+/// 数就不再是同一件事的数。
+pub const DEFAULT_CASE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// 一次实验的配置。
 #[derive(Debug, Clone)]
@@ -76,6 +92,14 @@ pub struct RunConfig {
     /// 把 base64 塞进题面顶上：那不是喂图，是把一段模型读不了的字节每一步重发一次
     /// （2026-10-19 实测，七道带图题吃掉整张表 91.5% 的 token）。
     pub vision: bool,
+    /// 一例最多允许跑多久，从进环境之后算到判词回来。
+    ///
+    /// **不是 `Option`，所以「这次跑有没有单例上界」不是一个可以从配置里消失的问题**——
+    /// 类型本身就挡掉了「忘了给界」这种写法。这与 `max_concurrency` 的不给默认值是同
+    /// 一条道理的两面：那个界少了会让一次跑把无主的宿主当成自己的，这个界少了会让
+    /// 「一直平着」这条读数分不出慢与挂。默认值 `DEFAULT_CASE_TIMEOUT` 是一个宽界，
+    /// 报表的 `## pins` 段写着这一跑实际用的是多少。
+    pub case_timeout: Duration,
 }
 
 /// 检查点的落点与它的身份。
@@ -372,6 +396,10 @@ impl RunConfig {
             // 默认看不见图：今天组合根上没有任何一条把题面里的图交给模型的路径，默认成
             // `true` 就等于替一台跑不了的机器声明它能跑。
             vision: false,
+            // 与上面那个 `None` 不同，这里给一个默认值不是「替调用方定界」而是**兜底**：
+            // 少一个上界会让「一例卡住」在报表上与「一例在算」同形，而没有哪个值会宽到
+            // 让这件事重新变得可读。要更紧的界就在命令行上写，报表会照着写。
+            case_timeout: DEFAULT_CASE_TIMEOUT,
         }
     }
 
@@ -792,6 +820,8 @@ impl Rig {
         log: Option<Arc<CheckpointLog>>,
     ) -> anyhow::Result<SeedScore> {
         let started = Instant::now();
+        // 取一份到手上：例子里那个 `async move` 拿不到 `&self`，而上界对整跑是同一个数。
+        let case_timeout = self.config.case_timeout;
         // 有效并发 ＝ min(列的隔离上界, 闸门此刻的界, 静态名额)：两个界都给就都要拿到票。
         // 名单个半区各自可能缺席，`run` 已经保证不会两个都缺席。
         let admission = self.config.admission.clone();
@@ -886,22 +916,43 @@ impl Rig {
                 };
                 // 交到外壳手上的只有题面：答案键与评测台的旋钮在 `shell_view` 里就没了，
                 // 判分读的仍是**原来那一份**。
-                let solved = scaffold.solve(&case.shell_view(), &ctx).await;
+                //
+                // 外壳与判分一起套在这个上界里：只框住外壳，判分卡住时那一例仍然不结束，
+                // 而报表会说「这一例在跑」——上界的作用正在于让这句话不可能无限期成立。
+                // 回收在界**外面**：界一到就把环境拆掉，容器与工作目录不会因为这个上界漏掉。
+                let solved_and_judged = async {
+                    let solved = scaffold.solve(&case.shell_view(), &ctx).await;
+                    match solved {
+                        Err(e) => CaseOutcome::errored(&case, format!("scaffold failed: {e}")),
+                        Ok(output) => match judge.judge(&case, &env, &output).await {
+                            Ok(verdict) => CaseOutcome {
+                                case_id: case.id.clone(),
+                                verdict,
+                                errored: false,
+                                tokens: output.tokens.total_tokens as u64,
+                                steps: output.trace.len() as u64,
+                                requests: None,
+                            },
+                            Err(e) => CaseOutcome::errored(&case, format!("judge failed: {e}")),
+                        },
+                    }
+                };
                 // 走到这里之后才把次数填上：上面每一个提前 `return` 都在问模型之前，
                 // 它们的 `None`（没走到）与这里的 `Some(0)`（问了零次）不是同一件事。
-                let mut outcome = match solved {
-                    Err(e) => CaseOutcome::errored(&case, format!("scaffold failed: {e}")),
-                    Ok(output) => match judge.judge(&case, &env, &output).await {
-                        Ok(verdict) => CaseOutcome {
-                            case_id: case.id.clone(),
-                            verdict,
-                            errored: false,
-                            tokens: output.tokens.total_tokens as u64,
-                            steps: output.trace.len() as u64,
-                            requests: None,
-                        },
-                        Err(e) => CaseOutcome::errored(&case, format!("judge failed: {e}")),
-                    },
+                // 超时的那一例也一样填：界到之前已经问过的次数是可读的，丢掉它反而让
+                // 「卡在上游的哪一步」这条线索跟着没了。
+                let mut outcome = match tokio::time::timeout(case_timeout, solved_and_judged).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => CaseOutcome::errored(
+                        &case,
+                        format!(
+                            "the case was still running after {}s: a case that never returns \
+                             and a case that is merely slow print the same flat line until \
+                             something bounds the clock, so this one is recorded as an error \
+                             instead of as a verdict",
+                            case_timeout.as_secs()
+                        ),
+                    ),
                 };
                 outcome.requests = Some(calls.load(Ordering::Relaxed));
                 // 判分读完之后才回收：回收早了判分就没有现场了。
@@ -1226,6 +1277,19 @@ mod tests {
         }
     }
 
+    /// 一个永远不回来的壳：它模拟的是「挂在上游的一次不返回」，与「算得慢」在读数上同形。
+    struct NeverReturns;
+    #[async_trait]
+    impl AgentScaffold for NeverReturns {
+        fn name(&self) -> &str {
+            "never-returns"
+        }
+        async fn solve(&self, _c: &EvalCase, _ctx: &SolveContext) -> anyhow::Result<AgentOutput> {
+            std::future::pending::<()>().await;
+            unreachable!("pending never yields")
+        }
+    }
+
     /// 报错的壳：它交不出答案，但**不许**被当成答错。
     struct Broken;
     #[async_trait]
@@ -1284,6 +1348,7 @@ mod tests {
                 checkpoint: None,
                 admission: None,
                 vision: false,
+                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         )
     }
@@ -1333,6 +1398,7 @@ mod tests {
                 checkpoint: None,
                 admission: None,
                 vision: false,
+                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         )
     }
@@ -1365,6 +1431,7 @@ mod tests {
                         checkpoint: None,
                         admission: None,
                         vision,
+                        case_timeout: DEFAULT_CASE_TIMEOUT,
                     },
                 )
                 .with_scaffold(Arc::new(AlwaysRight))
@@ -1490,6 +1557,49 @@ mod tests {
         assert_eq!(cell.stat().mean, 0.0);
         assert_eq!(cell.errored(), 6, "两道题 × 三个种子都该记成出错");
         assert!(cell.per_seed[0].failures[0].1.contains("upstream refused"));
+    }
+
+    /// 一例跑过界是**一个可读的结局**，不是一条一直平着的线。
+    ///
+    /// 两半判据：这一跑必须回来（外层 `timeout` 兜住，不回来就是红），并且那一例在
+    /// `errored` 里带着界自己的秒数——「超过 N 秒」里的 N 若不出现在产物里，读的人
+    /// 分不出它是被界挡下的还是自己失败的。分母不缩水也在这一格里：界挡下的那题
+    /// 记成**没过**，不是记成没跑。
+    ///
+    /// 反证的方向：把 `run_seed` 里那层 `tokio::time::timeout` 拿掉，这一跑不再回来，
+    /// 外层 5 秒到点后断在「the run must come back」。
+    #[tokio::test]
+    async fn a_case_that_never_returns_is_an_error_naming_its_bound() {
+        let rig = Rig::new(
+            Arc::new(NeverCalled),
+            RunConfig {
+                data_root: "/nonexistent".into(),
+                seeds: vec![7],
+                max_concurrency: Some(4),
+                subset: None,
+                checkpoint: None,
+                admission: None,
+                vision: false,
+                case_timeout: std::time::Duration::from_secs(1),
+            },
+        )
+        .with_scaffold(Arc::new(NeverReturns));
+        let table = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rig.run(&[bench_named("hle", cases()[..1].to_vec(), Arc::new(OkEnv))]),
+        )
+        .await
+        .expect("the run must come back: a case with no bound keeps it running for ever")
+        .unwrap();
+        let cell = table.cell("never-returns", "hle").unwrap();
+        assert_eq!(
+            cell.errored(),
+            1,
+            "the case past the bound is an error, not a verdict"
+        );
+        assert_eq!(cell.stat().mean, 0.0, "it counts in the denominator");
+        let detail = &cell.per_seed[0].failures[0].1;
+        assert!(detail.contains("still running after 1s"), "{detail}");
     }
 
     /// 一个环境永远起不来的基准：整列都是 0。
@@ -1630,6 +1740,7 @@ mod tests {
                 checkpoint: Some(cp),
                 admission: None,
                 vision: false,
+                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         )
     }
@@ -1712,6 +1823,7 @@ mod tests {
                 checkpoint: None,
                 admission,
                 vision: false,
+                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         )
         .with_scaffold(Arc::new(AlwaysRight))
@@ -1997,6 +2109,7 @@ mod tests {
                 checkpoint: Some(checkpoint_at(&path, "run-1")),
                 admission: None,
                 vision: false,
+                case_timeout: DEFAULT_CASE_TIMEOUT,
             },
         );
         rig.with_scaffold(Arc::new(AsksTwice))
