@@ -141,8 +141,29 @@ impl GitOpsPublisher {
 
         // promote tag 是指针性质，重推同 change 允许 -f 覆盖；打上 tag 同时
         // 让这个提交从任何分支之外变得可达，后续 gc 不会把它清掉。
-        self.git_in(&dir, &["tag", "-a", "-f", "-m", &msg, &tag, &head])
-            .await?;
+        //
+        // 身份在这条命令行上给，不指望仓库里有：沙盒工作树是临时检出的，本容器
+        // 也没有 `user.*` 配置。**带注释的 tag 需要一个 tagger**，没有身份时 git
+        // 直接拒绝（`Committer identity unknown`）——晋级台账里全部失败的记录都是
+        // 这一句，变更本身已经编译、过测、eval 通过，只在最后一步丢掉。
+        // 名字从配置来，与拉取端的身份同一份，不给第二处拼法。
+        self.git_in(
+            &dir,
+            &[
+                "-c",
+                &format!("user.name={}", self.config.git_user_name),
+                "-c",
+                &format!("user.email={}", self.config.git_user_email),
+                "tag",
+                "-a",
+                "-f",
+                "-m",
+                &msg,
+                &tag,
+                &head,
+            ],
+        )
+        .await?;
 
         // 非 force 推分支：历史必须 fast-forward。远端出现非本管线
         // 提交时 push 失败 → 台账 Failed → 熔断兜底，绝不强推覆盖。
@@ -584,6 +605,57 @@ mod tests {
             "{calls}"
         );
         assert!(calls.contains("--tls-verify=false"), "{calls}");
+    }
+
+    /// 晋级的 tag 必须带着本管线自己的身份，因为集群里没有第二份。
+    ///
+    /// 沙盒工作树是临时检出的，`user.*` 不在这棵树上，容器里也没有全局配置；
+    /// 而**带注释的 tag 需要一个 tagger**，没有身份时 git 当场拒绝
+    /// （`fatal: unable to auto-detect email address`）。晋级台账里失败的那几条
+    /// 全是这一句——变更本身已经编译、过测、eval 通过，只在打 tag 这一步丢掉。
+    /// 夹具此前恰好给工作树配了身份，所以这一路从没红过。
+    ///
+    /// 判据是 tag 对象自己的 `tagger` 行：只在工作树里配身份、不在这条命令行上
+    /// 给的写法，在这里读到的是夹具的身份（本机没有全局身份时则是直接失败）。
+    #[tokio::test]
+    async fn the_promote_tag_carries_the_pipelines_own_identity() {
+        let (central, work) = setup_repo().await;
+        // 抹掉工作树的身份，复现晋级时那棵树的样子：身份只能来自配置。
+        git(work.path(), &["config", "--unset", "user.email"]).await;
+        git(work.path(), &["config", "--unset", "user.name"]).await;
+        let publisher = l1_publisher(central.path(), work.path());
+
+        publisher
+            .publish(&change("p-identity"), "l1_rollout", None)
+            .await
+            .unwrap();
+
+        let tag = promote_git_tag("p-identity");
+        assert_eq!(
+            git(
+                central.path(),
+                &["cat-file", "-t", &format!("refs/tags/{tag}")]
+            )
+            .await,
+            "tag",
+            "晋级 tag 是带注释的对象，不是轻量 ref"
+        );
+        let body = git(
+            central.path(),
+            &["cat-file", "-p", &format!("refs/tags/{tag}")],
+        )
+        .await;
+        let tagger = body
+            .lines()
+            .find(|l| l.starts_with("tagger "))
+            .unwrap_or_else(|| panic!("带注释的 tag 必有 tagger：{body}"));
+        assert!(
+            tagger.starts_with(&format!(
+                "tagger {} <{}> ",
+                publisher.config.git_user_name, publisher.config.git_user_email
+            )),
+            "tagger 必须是配置里的身份，实际是 {tagger}"
+        );
     }
 
     #[tokio::test]
