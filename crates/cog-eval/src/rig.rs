@@ -47,6 +47,7 @@ pub const SKIP_NEEDS_VISION: &str =
 /// 取得宽是有意的：那道慢题实测约 15 分钟/例，上界比它高一倍，才不会把「慢」判成「挂」——
 /// 判错的方向是把还算得出来的题丢掉。它也**不按基准变**：一列一个界，两列的 `errored`
 /// 数就不再是同一件事的数。
+// cap: derived — 最慢那例实测约 15 分钟，取两倍是为了不把「慢」判成「挂」；判错的代价是丢掉一道还算得出来的题
 pub const DEFAULT_CASE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// 一次实验的配置。
