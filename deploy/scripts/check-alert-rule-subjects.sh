@@ -367,6 +367,7 @@ NO_POD_REPORTER = {
     'CognevaHostCredentialSurfaceNeverRan': 'cogneva_host_credential_surface_measured',
     'CognevaHostCredentialSurfaceDrift': 'cogneva_host_credential_surface_aligned',
     'CognevaHostCredentialSurfaceUnreadable': 'cogneva_host_credential_surface_unreadable',
+    'CognevaWorkloadDatabaseRoleOverPrivileged': 'cogneva_db_role_workload_roles_superuser_unplanned',
     'CognevaBackupPackageOwnerWrong': 'cogneva_backup_package_owner_uid',
     'CognevaBackupPackageUnreadable': 'cogneva_backup_package_reading_state{state="unreadable"}',
     'CognevaBackupPackageMissing': 'cogneva_backup_package_reading_state{state="empty"}',

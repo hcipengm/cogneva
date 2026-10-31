@@ -247,6 +247,32 @@ spec:
             summary: "{{ $labels.source }} 侧的凭证面核对没读成，这一面当前没有判词"
             description: "门自己出错、快照建不出来、或 systemctl 探针失败。这一面判的是「宿主上哪些进程碰得到凭证」，没读成不等于没事。"
 
+    # 业务工作负载连库用的角色，超权位有没有回来。
+    #
+    # 为什么单独成组：降权那件事做完了，而它最要紧的一条——「业务侧再也不许用带超权位的
+    # 角色」——在读数面上只有值、没有读者。判词一早就在序列里（读数脚本 2026-10-29 就在算
+    # 它），读过它的只有 operator 表里的一行字，而那一行不会在某个工作负载被切回超权角色
+    # 时喊。做完了的收尾要有一条规则看着它别再退回去，否则「做过」与「一直那样」在告警面上
+    # 同形。
+    #
+    # 判 `..._unplanned` 而不是 `..._superuser`：演练那条腿按设计要超权（它要
+    # `session_replication_role` 与 `CREATE DATABASE`），拿总数判会在业务侧早就干净之后
+    # 继续红在一条无关的腿上——常红等于没有，整条告警会被静音，包括它本该报的那一次。
+    # `planned` 那一格是预案认领的数量；预案写过时（点名了已改名或已不存在的工作负载）只让
+    # 这一格更严，不单独报警——把预案失效也报出来，会让人在两个修法之间选错一个。
+    - name: cogneva-db-role
+      rules:
+        - alert: CognevaWorkloadDatabaseRoleOverPrivileged
+          expr: cogneva_db_role_workload_roles_superuser_unplanned > 0
+          for: 15m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "安全与凭证"
+            severity: critical
+          annotations:
+            summary: "有 {{ $value }} 个业务工作负载在用的数据库角色带超权位"
+            description: "跑 `bash scripts/host/cogneva-db-role-privilege-reading.sh` 逐条点名 `cogneva_db_role_over_privileged{role=…}=1`。要回答的是「这个角色被哪些工作负载用、该不该用」：把那个工作负载切回受限角色，或者——只有按设计确需超权时（备份演练那条腿）——把「工作负载=角色」写进 `COGNEVA_DB_ROLE_EXEMPT` 预案，让这一格从 unplanned 落回 planned。别去改判词：判词这就是它该有的样子。"
+
     # 持久化存储面：最近一份**已完成**的备份包是谁写的。
     #
     # 为什么单独成组：备份面此前所有的判据都只读「跑成没跑成」与「演练多旧」，没有一条读

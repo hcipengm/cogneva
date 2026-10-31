@@ -1545,6 +1545,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "同上（门没读成，什么也没判）。它与「判成不一致」修法相反——那一格去修适配器，这一格去修读取路径，所以是两条规则而不是一条",
     ),
     (
+        "cogneva_db_role_workload_roles_superuser_unplanned",
+        "宿主生产者 `scripts/host/cogneva-db-role-privilege-reading.sh`（不在本仓，自声明 `producer=db_role_privilege`），经聚合器以 `job=\"cogneva-host-readings\"` 印出。值说的是「业务工作负载真的在用的、没有被预案认领的带超权位的数据库角色有几个」。它读的是现网工作负载 env 里的 DSN，不是 chart 里写着什么——「chart 说要换角色」与「Pod 真的用上了」是两件事，后者才是权限事实。规则读 `..._unplanned` 而不是同族的 `..._superuser`：备份演练那条腿按设计要超权（`session_replication_role` 与 `CREATE DATABASE`），拿总数判会让这条规则在业务侧早就干净之后继续红在一条无关的腿上，常红最终被静音，连同它本该报的那一次；预案认领（`COGNEVA_DB_ROLE_EXEMPT`）把那条腿从 unplanned 移出去，只让这一格更严。生产者退 3（连库/读工作负载失败）时整条序列都不印，那是「没量到」，由聚合器的 `host_reading_producer_unreadable` 接住，不在这里冒充 0",
+    ),
+    (
         "cogneva_mainline_behind_verdict_stalled",
         "宿主侧生产者 `scripts/host/cogneva-mainline-behind-verdict.sh`（不在本仓），由聚合器按 `scripts/data/host-readings.tsv` 逐拍拉起，经 `job=\"cogneva-host-readings\"` 在 :9464 印出，15 分钟一拍。它判的是「现网那一版还动不动」：连续两拍现网 rev 相同、且两拍都没有构建在飞才印 1；判不了时整条序列不印，由 `_judged` 那一格说清楚。这条序列是「部署器空转」唯一的判词：等槽被拒的轮数、Job 尝试数在健康的有界滞后里都会涨（tip 一直在动，每一轮都要重新排队），回答不了这个问题",
     ),

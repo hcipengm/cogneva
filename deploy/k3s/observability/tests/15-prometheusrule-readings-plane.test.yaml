@@ -517,3 +517,39 @@ tests:
               severity: warning
               cogneva_io_managed: "true"
               cogneva_io_face: 读数正确性
+
+  # 业务侧有一个在用的角色带超权位、且没有预案认领 ⇒ 响。这是降权做完之后最要紧的
+  # 那一条判据：角色悄悄换回超权角色时，读数照样是一格值，只有这条规则会喊。
+  - name: 业务角色超权且没人认领会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_db_role_workload_roles_superuser_unplanned{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaWorkloadDatabaseRoleOverPrivileged
+        exp_alerts:
+          - exp_labels:
+              instance: cogneva
+              job: cogneva-host-readings
+              node: cogneva
+              severity: critical
+              cogneva_io_managed: "true"
+              cogneva_io_face: 安全与凭证
+
+  # 现网的形状：演练那条腿按设计超权（`superuser` 是 1），而它被预案认领、`unplanned` 落 0
+  # ⇒ 不响。少了这一格，把判据写成总数（`..._superuser > 0`）也照样让上一格全绿——而那样
+  # 写的规则在降权做完之后仍然常红，最后会被静音掉，连同它本该报的那一次。
+  - name: 只剩按设计超权的演练腿不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_db_role_workload_roles_superuser{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x30'
+      - series: 'cogneva_db_role_workload_roles_superuser_planned{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x30'
+      - series: 'cogneva_db_role_workload_roles_superuser_unplanned{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: CognevaWorkloadDatabaseRoleOverPrivileged
+        exp_alerts: []
