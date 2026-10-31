@@ -315,6 +315,7 @@ CREATE TABLE IF NOT EXISTS gateway_llm_usage (
     tokens_input  BIGINT NOT NULL DEFAULT 0,
     tokens_output BIGINT NOT NULL DEFAULT 0,
     tokens_cached BIGINT NOT NULL DEFAULT 0,
+    tokens_cache_created BIGINT NOT NULL DEFAULT 0,
     latency_ms    BIGINT NOT NULL DEFAULT 0
 );
 -- Additive migration for the per-actor dimension; old rows stay attributable
@@ -326,6 +327,15 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS actor TEXT NOT NULL DEFAU
 -- cached" -- the two are indistinguishable after the fact, which is exactly
 -- why the column is written going forward rather than reconstructed backward.
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_cached BIGINT NOT NULL DEFAULT 0;
+-- The written half of the same cache. Its own column for the same reason the
+-- read half has one: "cached: 0" is two different findings -- a prefix that
+-- changes on every call, and a request that never asked the upstream to keep
+-- anything -- and only the pair tells them apart. Rows written before this
+-- column existed default to 0, which on the OpenAI-compatible face is also the
+-- honest reading (that face never reports it); on the Anthropic face it reads
+-- as "nothing written", so a reader dating a finding has to know when the
+-- column started being written.
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_cache_created BIGINT NOT NULL DEFAULT 0;
 -- Additive migration for the environment dimension, same shape as the actor
 -- one above. Rows written before it existed default to `unknown`, which is the
 -- honest reading -- they are not attributable to any one environment and must
@@ -565,13 +575,13 @@ impl LlmUsageStore {
             r#"
             INSERT INTO gateway_llm_usage
                 (id, upstream, api_style, model, result, actor, origin,
-                 tokens_input, tokens_output, tokens_cached, estimated_input,
-                 task_id, latency_ms, refusal_kind, retry_after_secs,
+                 tokens_input, tokens_output, tokens_cached, tokens_cache_created,
+                 estimated_input, task_id, latency_ms, refusal_kind, retry_after_secs,
                  pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
                  pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
                  usage_outcome, owner_id)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -584,6 +594,7 @@ impl LlmUsageStore {
         .bind(r.tokens_input as i64)
         .bind(r.tokens_output as i64)
         .bind(r.tokens_cached as i64)
+        .bind(r.tokens_cache_created as i64)
         .bind(r.estimated_input.map(|v| v as i64))
         .bind(r.task.as_deref())
         .bind(r.latency_ms as i64)

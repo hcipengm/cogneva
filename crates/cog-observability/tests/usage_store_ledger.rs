@@ -64,6 +64,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         tokens_input: 1000,
         tokens_output: 50,
         tokens_cached: cached,
+        tokens_cache_created: 0,
         estimated_input: estimated,
         refusal_kind: refusal_kind.map(str::to_string),
         retry_after_secs: None,

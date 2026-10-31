@@ -235,6 +235,22 @@ pub struct LlmUsageRecord {
     /// cached is a subset of input, on Anthropic the two are disjoint), which
     /// is why they stay apart here instead of being netted out.
     pub tokens_cached: u64,
+    /// Input tokens the upstream wrote into its prefix cache on this call.
+    ///
+    /// Separate from [`Self::tokens_cached`] because the two answer different
+    /// questions about the same feature, and a ledger holding only the read
+    /// half cannot tell them apart. A cache that was written and never read
+    /// again says the prefix changes between calls; a cache that was never even
+    /// written says the request never asked the upstream to keep anything. The
+    /// first repair is an ordering change in whichever component assembles the
+    /// prompt, the second is a missing field on the wire. With `tokens_cached`
+    /// alone both read as "cached: 0" and the repair is a guess.
+    ///
+    /// Upstreams on the OpenAI-compatible face do not report this at all -- they
+    /// cache without being asked and say nothing about what they wrote -- so a
+    /// zero there is "not reported" rather than "nothing written", and the
+    /// protocol column is what a reader has to pair it with.
+    pub tokens_cache_created: u64,
     /// What reading the response found, when this row came from a call that was
     /// answered at all.
     ///
