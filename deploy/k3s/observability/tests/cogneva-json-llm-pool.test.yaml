@@ -324,6 +324,38 @@ tests:
           - exp_labels:
               severity: critical
 
+  # 许可面四条腿全成立，而用量计数器一小时里**在动**（半小时前开始有读完的调用）：静。
+  # 这一格守的是产出腿——许可绿只证明门开了，不证明活干成了；少了它，一个正在出活
+  # 的池会落进「开着却没人用」那一格，规则就只剩许可面，说不出一句话。
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_allowance_tokens'
+        values: '100x60'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_spent_tokens'
+        values: '10x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_reserve_tokens'
+        values: '10x60'
+      - series: 'llm_pool_reserve_tokens_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'llm_pool_paced_upstreams'
+        values: '1x60'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x60'
+      - series: 'cogneva_ready_admission_readings{kind="ready"}'
+        values: '1x60'
+      - series: 'cogneva_ready_admission_readings_observed_timestamp_seconds{kind="ready"}'
+        values: '3500x60'
+      - series: 'llm_usage_readings_total{outcome="read"}'
+        values: '0x30 5x30'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_open_but_idle
+        exp_alerts: []
+
   # 额度已经不够（10-10-10 = -10）：不开着却闲，是没额度。静。
   - interval: 1m
     input_series:
