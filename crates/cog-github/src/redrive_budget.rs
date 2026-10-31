@@ -36,6 +36,16 @@ use cog_core::{SFError, SFResult};
 /// outside.
 pub use cog_core::metric_names::REDRIVE_REFUSALS_TOTAL as REDRIVE_REFUSALS_METRIC;
 
+/// Re-drives the orchestrator refused to take, after the budget had already
+/// paid for them.
+///
+/// Counted apart from the refusals above because the two facts want different
+/// readers: a refusal is a policy that someone chose and can revisit, while
+/// this is a round that was bought and never ran. Summing them would let a
+/// submission outage read as a deliberate stop in generation, which is the
+/// one answer the operator would not act on.
+pub use cog_core::metric_names::REDRIVE_DISPATCH_FAILURES_TOTAL as REDRIVE_DISPATCH_FAILURES_METRIC;
+
 /// Why a re-drive was refused.
 ///
 /// Closed set: the metric labels it, and a reason nobody named would be

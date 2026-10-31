@@ -1,5 +1,5 @@
 # 容器四件（内存上限被页缓存顶穿、CPU 被限流、日志逼近轮转上限、盘写入太快）与
-# 重驱四件（原因耗尽、没证据也重驱、读侧预算丢了、写侧扣费没落库）的单测夹具。
+# 重驱五件（原因耗尽、没证据也重驱、编排器拒收、读侧预算丢了、写侧扣费没落库）的单测夹具。
 #
 # container 一族的四处易错点：
 #   - `memory_limit_sits_under_its_page_cache` 是「用量占上限 > 99%」**且**「缓存占用量 > 50%」
@@ -16,8 +16,11 @@
 #     截断后仍越界，用了 2000/分钟（远超物理上限）的增量——这一格证的是腿，不是现实值。
 #   - `log_near_rotation_cap` 直接用 kubelet 报的字节数，判据是 kubelet 默认的 64 MiB。
 #
-# redrive 一族四条全是 `increase(counter[24h]) > 0`，各自只认一个标签值；所以第六格同时让
-# `reason="other"` 在涨，四条仍静——标签选择器是判据的一部分。第五格是四条全静的健康账。
+# redrive 一族五条全是 `increase(counter[24h]) > 0`，各自只认一个标签值；所以第六格同时让
+# `reason="other"` 在涨，四条按标签选值的仍静——标签选择器是判据的一部分。第五格是五条全静的
+# 健康账。`redrive_could_not_be_submitted` 不带标签（只有一个写者、一种失败方式），它证的是
+# 另一件事：拒绝那一格读的是「决定不生成」，这一格读的是「付过账的生成根本没开始」，两者
+# 互不代替，所以第六格里 `reason="other"` 涨九次它也必须静。
 #
 #   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
 #   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-container-redrive.test.yaml \
@@ -33,6 +36,7 @@ rule_files:
 # rule: redrive_refused_without_evidence
 # rule: redrive_budget_forgotten
 # rule: redrive_charge_not_persisted
+# rule: redrive_could_not_be_submitted
 
 evaluation_interval: 1m
 
@@ -154,6 +158,8 @@ tests:
         values: '0x26'
       - series: 'cogneva_redrive_budget_losses_total{side="write"}'
         values: '0x26'
+      - series: 'cogneva_redrive_dispatch_failures_total'
+        values: '0x26'
     alert_rule_test:
       - eval_time: 26h
         alertname: redrive_cause_exhausted
@@ -166,6 +172,9 @@ tests:
         exp_alerts: []
       - eval_time: 26h
         alertname: redrive_charge_not_persisted
+        exp_alerts: []
+      - eval_time: 26h
+        alertname: redrive_could_not_be_submitted
         exp_alerts: []
 
   # 重驱账本在说坏消息：因「原因耗尽」拒了 3 次、因「没证据」拒了 2 次、读侧丢了 1 份预算、
@@ -185,6 +194,9 @@ tests:
         values: '0x19 4x7'
       - series: 'cogneva_redrive_budget_losses_total{side="other"}'
         values: '0x20 9x6'
+      # 同一个编排器不通的窗口里，重驱被拒收两次。
+      - series: 'cogneva_redrive_dispatch_failures_total'
+        values: '0x20 2x6'
     alert_rule_test:
       - eval_time: 26h
         alertname: redrive_cause_exhausted
@@ -210,3 +222,10 @@ tests:
           - exp_labels:
               severity: warning
               side: write
+      # 不带标签的读数：这条规则的告警上只有 severity，多出一条标签就说明
+      # 它读的其实是上面按标签选值的那一族。
+      - eval_time: 26h
+        alertname: redrive_could_not_be_submitted
+        exp_alerts:
+          - exp_labels:
+              severity: warning

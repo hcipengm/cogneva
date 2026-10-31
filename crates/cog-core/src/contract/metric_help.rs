@@ -400,6 +400,16 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          same from outside",
     ),
     (
+        "cogneva_redrive_dispatch_failures_total",
+        "Re-drives that were decided and charged and then never reached the \
+         graph, because the orchestrator refused the submission. The refusal \
+         counter next to it answers whether generation was switched off by \
+         policy; this one answers whether the generation that was paid for \
+         started at all. Only one of the two is a fault, and a change left \
+         behind its revert with neither reading is indistinguishable from a \
+         quiet day",
+    ),
+    (
         "cogneva_redrive_budget_losses_total",
         "Round charges the re-drive ledger lost, by side: read (the ledger \
          could not be read, so its rounds were forgotten) or write (the round \

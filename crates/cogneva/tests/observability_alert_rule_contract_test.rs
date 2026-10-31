@@ -702,6 +702,10 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-github/src/redrive_budget.rs",
     ),
     (
+        "cogneva_redrive_dispatch_failures_total",
+        "crates/cog-github/src/redrive_budget.rs",
+    ),
+    (
         "cogneva_redrive_refusals_total",
         "crates/cog-github/src/redrive_budget.rs",
     ),

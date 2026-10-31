@@ -3233,6 +3233,9 @@ pub(crate) mod tests {
         /// attempt into a terminal state and then take it away again — what
         /// the archive pass does between two rounds.
         intent_rows: Mutex<HashMap<String, TaskStatus>>,
+        /// 提交一律失败，模拟编排器这一侧根本不收——上游全 503 那天就是这样，
+        /// 每个派发点在日志里各写一行、读数面上什么也看不见。
+        refuse_submissions: std::sync::atomic::AtomicBool,
     }
 
     impl MockOrchestrator {
@@ -3256,7 +3259,15 @@ pub(crate) mod tests {
                 }))),
                 assess_failure_cause: Mutex::new(None),
                 intent_rows: Mutex::new(HashMap::new()),
+                refuse_submissions: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        /// 让这个假的编排器像不通事的编排器那样拒收每一次提交。
+        pub(crate) fn refusing_submissions(self) -> Self {
+            self.refuse_submissions
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self
         }
 
         /// What the archive pass does to a terminal row once its retention
@@ -3310,6 +3321,14 @@ pub(crate) mod tests {
             goal: &str,
             tasks: Vec<Task>,
         ) -> cog_core::SFResult<Vec<String>> {
+            if self
+                .refuse_submissions
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(cog_core::SFError::LLM(
+                    cog_core::contract::llm::FACE_WITHOUT_A_MEMBER.to_string(),
+                ));
+            }
             self.goals.lock().unwrap().push(goal.to_string());
             let mut ids = Vec::with_capacity(tasks.len());
             for task in tasks {

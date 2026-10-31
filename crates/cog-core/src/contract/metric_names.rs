@@ -106,6 +106,22 @@ metric_names! {
     MIRROR_PUSH_FAILURES_TOTAL => "cogneva_mirror_push_failures_total",
     REDRIVE_REFUSALS_TOTAL => "cogneva_redrive_refusals_total",
     REDRIVE_BUDGET_LOSSES_TOTAL => "cogneva_redrive_budget_losses_total",
+    // A re-drive that was decided and charged and then never reached the graph
+    // because the orchestrator refused the submission.
+    //
+    // The refusal counter above answers "did we decide to stop generating";
+    // this one answers "did the round we paid for actually start". They are
+    // different sides of the same quiet: without this one, an orchestrator
+    // that takes no submission at all reads exactly like a day with nothing to
+    // fix, and the reverted change stays behind its revert with no fix in
+    // flight. Measured 2026-10-31, when every LLM upstream answered 503 and
+    // every dispatch site in the process failed for the same reason while only
+    // the mainline's hold was visible anywhere.
+    //
+    // No labels: one writer, and one way for it to fail. A counter rather than
+    // a gauge because the fact is an event -- absence of a cell means no
+    // submission has failed yet, which a written zero could not say.
+    REDRIVE_DISPATCH_FAILURES_TOTAL => "cogneva_redrive_dispatch_failures_total",
 
     // cog-collaboration — where a self-evolution run's yield ended, and which
     // end the round's change artifact came from.

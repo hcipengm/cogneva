@@ -763,6 +763,29 @@ impl MainChannel {
         }
     }
 
+    /// Count one re-drive the orchestrator would not take.
+    ///
+    /// The round has already been charged to the cause by the time this is
+    /// called: the budget decided to spend it, and spending it bought nothing.
+    /// That is why it is neither a refusal nor a landing failure -- the only
+    /// other record is the warn beside it, and a warn in a pod's log answers
+    /// "did this happen" only to whoever is already looking.
+    async fn note_redrive_dispatch_failure(&self) {
+        let Some(metrics) = self.metrics.get().cloned() else {
+            return;
+        };
+        if let Err(e) = metrics
+            .record_counter(
+                crate::redrive_budget::REDRIVE_DISPATCH_FAILURES_METRIC,
+                1.0,
+                HashMap::new(),
+            )
+            .await
+        {
+            warn!("cannot record a re-drive the orchestrator refused: {e}");
+        }
+    }
+
     /// Count one round charge the ledger lost, under the side that lost it.
     ///
     /// This is the counter that keeps the budget honest about itself: a read
@@ -1786,7 +1809,7 @@ pub async fn watch_landed(
                                     .note_budget_loss(crate::redrive_budget::BudgetSide::Write)
                                     .await;
                             }
-                            redrive(orchestrator, &record, &log).await;
+                            redrive(channel, orchestrator, &record, &log).await;
                         }
                         crate::redrive_budget::RedriveDecision::Refuse(reason) => {
                             tracing::warn!(
@@ -1827,6 +1850,7 @@ pub(crate) fn redrive_acceptance(change_id: &str, landed_rev: &str, base: &str) 
 /// also breaks CI opens a fresh round — the chain is what the cause ledger in
 /// `redrive_budget` bounds, and this only submits what that decision paid for.
 async fn redrive(
+    channel: &MainChannel,
     orchestrator: Option<&dyn cog_core::OrchestratorControl>,
     record: &LandingRecord,
     log: &str,
@@ -1892,11 +1916,17 @@ async fn redrive(
             tasks = ?ids,
             "re-drove generation once from the CI failure of a reverted change"
         ),
-        Err(e) => tracing::warn!(
-            change_id = %record.change.change_id,
-            error = %e,
-            "re-drive submission failed"
-        ),
+        Err(e) => {
+            tracing::warn!(
+                change_id = %record.change.change_id,
+                error = %e,
+                "re-drive submission failed; the change stays behind its revert with no fix \
+                 in flight"
+            );
+            // 这一轮已经从因由的预算里扣过账了：被拒收的那一次什么也没买到。日志之外
+            // 必须有一格，否则「没人需要修」与「修的任务根本没交出去」在外面同形。
+            channel.note_redrive_dispatch_failure().await;
+        }
     }
 }
 
@@ -3120,6 +3150,17 @@ mod tests {
             .find(|s| s.labels.get(crate::LABEL_CATEGORY).map(String::as_str) == Some(category))
             .map(|s| s.value)
             .unwrap_or(0.0)
+    }
+
+    /// 编排器拒收的重驱次数，没有序列时读作零——计数器不出现与零是同一个答案。
+    async fn dispatch_failures(metrics: &cog_test_support::MemoryMetricsBackend) -> f64 {
+        metrics
+            .query_counter_totals(crate::redrive_budget::REDRIVE_DISPATCH_FAILURES_METRIC.as_str())
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.value)
+            .sum()
     }
 
     async fn series_count(metrics: &cog_test_support::MemoryMetricsBackend) -> usize {
@@ -4629,7 +4670,13 @@ mod tests {
             updated_at: now,
         };
 
-        redrive(Some(&orchestrator), &record, "error: build failed").await;
+        redrive(
+            &channel(crate::config::LandingPolicy::default()),
+            Some(&orchestrator),
+            &record,
+            "error: build failed",
+        )
+        .await;
 
         let filed = orchestrator.filed_criteria();
         assert_eq!(filed.len(), 1, "一次重驱交一行");
@@ -4649,6 +4696,50 @@ mod tests {
             criteria[0].contains("main"),
             "判据要指向落地的那条分支，否则不知道去哪儿看绿没绿：{}",
             criteria[0]
+        );
+    }
+
+    /// 编排器拒收的那一次重驱要留下自己的一格。
+    ///
+    /// 走到这里时预算已经按因由扣过账了：这一轮买的是生成，而生成根本没开始。
+    /// 只写一行日志的话，`redriven` 旗标随后仍会落成 true，账面上读作「已经
+    /// 重驱过」，与「今天没有需要修的」同形——被回滚的那个变更就静静躺在自己
+    /// 的回滚点后面。
+    ///
+    /// 两半一起判：收下了的那一次不能写这一格。写了它，这条读数就变成「每次
+    /// 重驱都是一次失败」，反而没有分辨力。
+    #[tokio::test]
+    async fn a_redrive_the_orchestrator_refused_is_counted_apart_from_a_quiet_one() {
+        let now = Utc::now();
+        let record = LandingRecord {
+            change: change("chg-d", &diff_touching(&["crates/cog-github/src/lib.rs"])),
+            base: "main".into(),
+            landed_rev: "def5678".into(),
+            state: LandingState::Landed,
+            failure_recorded: true,
+            redriven: false,
+            unlanded_reported: false,
+            inherited_ci_reported: false,
+            retired_reason: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let (chan, metrics) = measured_channel(crate::config::LandingPolicy::default());
+
+        let refusing = crate::discovery_loop::tests::MockOrchestrator::new().refusing_submissions();
+        redrive(&chan, Some(&refusing), &record, "error: build failed").await;
+        assert_eq!(
+            dispatch_failures(&metrics).await,
+            1.0,
+            "被拒收的重驱没有落到读数上，外面读不出「付过账的生成没开始」"
+        );
+
+        let accepting = crate::discovery_loop::tests::MockOrchestrator::new();
+        redrive(&chan, Some(&accepting), &record, "error: build failed").await;
+        assert_eq!(
+            dispatch_failures(&metrics).await,
+            1.0,
+            "收下的那一次也被算成失败，这一格就没有分辨力了"
         );
     }
 }

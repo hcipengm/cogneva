@@ -1544,6 +1544,16 @@
           "face": "CI/构建/部署"
         },
         {
+          "name": "redrive_could_not_be_submitted",
+          "promql": "max(increase(cogneva_redrive_dispatch_failures_total[24h])) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "The channel bought {value} re-drives in the last day and the orchestrator refused every one of them: the round was already charged to the CI failure's cause, so what was spent bought no generation, and the change sits behind its own revert with no fix in flight. This is not the refusal reading next to it -- that one says generation was switched off on purpose, this one says it was switched on and nothing answered. Read the orchestrator side rather than the change: a submission fails when the planner has no serving member, when the upstream that would decompose the goal is unreachable, or when the store refuses the write, and the same outage takes out every dispatch site in the process at once. Until it clears, nothing in the system can turn a red reading into work, which is why the count matters more than which change it happened to",
+          "face": "CI/构建/部署"
+        },
+        {
           "name": "redrive_refused_without_evidence",
           "promql": "max by (reason) (increase(cogneva_redrive_refusals_total{reason=\"no_evidence\"}[24h])) > 0",
           "condition": {
