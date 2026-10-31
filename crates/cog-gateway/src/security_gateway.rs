@@ -2379,7 +2379,7 @@ fn failed_attempt_usage(
         tokens_input: 0,
         tokens_output: 0,
         tokens_cached: 0,
-        tokens_cache_created: 0,
+        tokens_cache_created: None,
         // 没量过，而且是故意的：这一行说的是"试过但被拒"，它没有上游真值可以配对
         // （`tokens_input` 是 0，一个 token 都没读回来），单独一个估算放上去会被读成
         // "估算 X、真值 0"的一次超额。定价只落在有真值的那一行上。填 0 更糟：会读成
@@ -2442,7 +2442,7 @@ fn pooled_refusal_usage(
         tokens_input: 0,
         tokens_output: 0,
         tokens_cached: 0,
-        tokens_cache_created: 0,
+        tokens_cache_created: None,
         // 同 [`failed_attempt_usage`]：这一行说的是"一个上游都没发出去"，那份请求的
         // 估算在这里没有真值可配对，不填。
         estimated_input: None,
@@ -2492,7 +2492,7 @@ fn paced_refusal_usage(
         tokens_input: 0,
         tokens_output: 0,
         tokens_cached: 0,
-        tokens_cache_created: 0,
+        tokens_cache_created: None,
         estimated_input: None,
         // 拒绝发生在向上游发请求之前，没有正文可分类；把它记成某个上游的成因
         // 会让这一行读成"那一家拒的"。
@@ -2775,7 +2775,7 @@ fn task_budget_refusal_usage(
         tokens_input: 0,
         tokens_output: 0,
         tokens_cached: 0,
-        tokens_cache_created: 0,
+        tokens_cache_created: None,
         estimated_input: None,
         // 拒绝发生在向上游发请求之前，没有正文可分类。
         refusal_kind: None,
@@ -2924,7 +2924,7 @@ fn owner_budget_refusal_usage(
         tokens_input: 0,
         tokens_output: 0,
         tokens_cached: 0,
-        tokens_cache_created: 0,
+        tokens_cache_created: None,
         estimated_input: None,
         refusal_kind: None,
         retry_after_secs: Some(refusal.wait_secs),
@@ -3047,8 +3047,9 @@ struct UsageReading {
     /// 上游自报的、由缓存服务的那部分输入（协议面决定它与 `input` 是包含还是互斥）。
     cached: u64,
     /// 这次调用写进上游缓存的那部分输入。与 `cached` 分开记：写了不等于读过，
-    /// 两格合起来才分得清「前缀每发都变」与「标记没送出去」。
-    cache_created: u64,
+    /// 两格合起来才分得清「前缀每发都变」与「标记没送出去」。`None` 是「这次
+    /// 调用没有报这一半」，与「报了 0」是两件事。
+    cache_created: Option<u64>,
     outcome: UsageOutcome,
 }
 
@@ -3073,7 +3074,7 @@ impl UsageReading {
             input: input.unwrap_or(0),
             output: output.unwrap_or(0),
             cached: cached.unwrap_or(0),
-            cache_created: cache_created.unwrap_or(0),
+            cache_created: cache_created,
             outcome: if input.is_some()
                 || output.is_some()
                 || cached.is_some()
@@ -3752,6 +3753,9 @@ struct UsageScanner {
     tokens_cached: u64,
     /// 这次调用写进上游缓存的那部分输入（第四个数，见 [`extract_usage`]）。
     tokens_cache_created: u64,
+    /// 有没有哪一帧真报了这门读数。计数本身答不了：报 `0` 与不报都把它留在零，
+    /// 而前者是「上游说没写」，后者是「这家不报」——账上这两件事必须分得开。
+    saw_cache_created: bool,
     /// Set when the response stream yielded an error. Kept because "the body
     /// ended" and "the body was cut off" produce the same zero counts, and only
     /// the second one means the call itself failed.
@@ -3865,6 +3869,9 @@ impl UsageScanner {
         if input.is_some() || output.is_some() || cached.is_some() || cache_created.is_some() {
             self.saw_usage = true;
         }
+        if cache_created.is_some() {
+            self.saw_cache_created = true;
+        }
         // 计数却只在真拿到正数时改写：有的上游在中间帧里带一个 usage:0 当占位，
         // 拿它覆盖前面已经报过的真值，就把读数弄丢了。
         if let Some(n) = input.filter(|n| *n > 0) {
@@ -3891,6 +3898,9 @@ impl UsageScanner {
             let (input, output, cached, cache_created) = extract_usage(&json);
             if input.is_some() || output.is_some() || cached.is_some() || cache_created.is_some() {
                 self.saw_usage = true;
+            }
+            if cache_created.is_some() {
+                self.saw_cache_created = true;
             }
             if let Some(n) = input {
                 self.tokens_input = n;
@@ -3958,7 +3968,7 @@ impl UsageRecorder {
                 input: s.tokens_input,
                 output: s.tokens_output,
                 cached: s.tokens_cached,
-                cache_created: s.tokens_cache_created,
+                cache_created: s.saw_cache_created.then_some(s.tokens_cache_created),
                 outcome: if abandoned {
                     s.outcome_abandoned()
                 } else {
@@ -10047,6 +10057,27 @@ mod tests {
         );
         s.finish();
         assert_eq!((s.tokens_cached, s.tokens_cache_created), (0, 64));
+
+        // 三态在读数上就要分得开：报了 0 是「上游说没写」，一个字都不报是
+        // 「这家不报」。扫描器里两者都让计数停在 0，所以它是靠「见到过没有」
+        // 而不是靠数值判断的——用一个 0 去判，两种情形永远同形。
+        let mut said_zero = UsageScanner::default();
+        said_zero.feed(
+            br#"data: {"type":"message_start","message":{"usage":{"input_tokens":3,"cache_creation_input_tokens":0}}}
+"#,
+        );
+        said_zero.finish();
+        assert!(said_zero.saw_cache_created, "报了一个 0 也是报了");
+        let mut said_nothing = UsageScanner::default();
+        said_nothing.feed(
+            br#"data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}
+"#,
+        );
+        said_nothing.finish();
+        assert!(
+            !said_nothing.saw_cache_created,
+            "没报这一半与报了零，必须在读数上分开"
+        );
     }
 
     /// 缓存命中量两种书写都认，且它自成一格而不是并进输入：并入输入之后

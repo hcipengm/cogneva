@@ -64,7 +64,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         tokens_input: 1000,
         tokens_output: 50,
         tokens_cached: cached,
-        tokens_cache_created: 0,
+        tokens_cache_created: None,
         estimated_input: estimated,
         refusal_kind: refusal_kind.map(str::to_string),
         retry_after_secs: None,
@@ -94,6 +94,45 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .record(&cached_call)
         .await
         .expect("record a cached call");
+    // The written half of the same cache, in both of its states: one call that
+    // said how much it wrote, and one that said nothing at all. They must stay
+    // two different rows after the write -- a NULL that lands as 0 turns "this
+    // face does not report it" into "nothing was written", which is a finding
+    // the pair exists to make rather than to invent.
+    let mut wrote_call = record(format!("{before}:wrote"), 0, None, None, None);
+    wrote_call.tokens_cache_created = Some(1200);
+    store
+        .record(&wrote_call)
+        .await
+        .expect("record a call that wrote to the cache");
+    let silent_call = record(format!("{before}:silent"), 0, None, None, None);
+    store
+        .record(&silent_call)
+        .await
+        .expect("record a call that did not report the half");
+    let wrote = sqlx::query("SELECT tokens_cache_created FROM gateway_llm_usage WHERE actor = $1")
+        .bind(format!("{before}:wrote"))
+        .fetch_one(&pool)
+        .await
+        .expect("read the written half back");
+    assert_eq!(
+        wrote.get::<Option<i64>, _>("tokens_cache_created"),
+        Some(1200),
+        "what the call wrote has to survive the write, or the pair the hit count needs \
+         is not in the ledger at all"
+    );
+    let silent = sqlx::query("SELECT tokens_cache_created FROM gateway_llm_usage WHERE actor = $1")
+        .bind(format!("{before}:silent"))
+        .fetch_one(&pool)
+        .await
+        .expect("read the unreported half back");
+    assert_eq!(
+        silent.get::<Option<i64>, _>("tokens_cache_created"),
+        None,
+        "a call that never reported the half must read NULL, not 0 -- 0 is the other \
+         finding"
+    );
+
     let row = sqlx::query(
         "SELECT tokens_input, tokens_output, tokens_cached, estimated_input, task_id, owner_id \
          FROM gateway_llm_usage WHERE actor = $1",
@@ -138,7 +177,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     sqlx::query(
         "ALTER TABLE gateway_llm_usage DROP COLUMN tokens_cached, DROP COLUMN estimated_input, \
          DROP COLUMN task_id, DROP COLUMN refusal_kind, DROP COLUMN retry_after_secs, \
-         DROP COLUMN owner_id",
+         DROP COLUMN owner_id, DROP COLUMN tokens_cache_created",
     )
     .execute(&pool)
     .await
@@ -150,7 +189,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
 
     let row = sqlx::query(
         "SELECT tokens_input, tokens_cached, estimated_input, task_id, refusal_kind, \
-                retry_after_secs, owner_id \
+                retry_after_secs, owner_id, tokens_cache_created \
          FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&before)
@@ -196,6 +235,26 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         None,
         "a row written before the person column existed belongs to nobody named, and \
          a placeholder would gather every such row under one person who never called"
+    );
+    assert_eq!(
+        row.get::<Option<i64>, _>("tokens_cache_created"),
+        None,
+        "a row written before the half was recorded reads NULL, not the default -- a \
+         zero would be read as a call that asked for no caching, which nobody measured"
+    );
+    let cache_write_shape = sqlx::query(
+        "SELECT is_nullable, column_default FROM information_schema.columns \
+         WHERE table_name = 'gateway_llm_usage' AND column_name = 'tokens_cache_created'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the column must exist after the migration");
+    assert_eq!(cache_write_shape.get::<String, _>("is_nullable"), "YES");
+    assert_eq!(
+        cache_write_shape.get::<Option<String>, _>("column_default"),
+        None,
+        "this counter is the one whose zero is a reading; a default would write a \
+         measurement into every row that predates it"
     );
 
     let shape = sqlx::query(

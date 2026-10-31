@@ -678,6 +678,15 @@ pub struct ActorUsage {
     pub tokens_input: i64,
     pub tokens_output: i64,
     pub tokens_cached: i64,
+    /// The written half of the cache, summed over the same windows.
+    ///
+    /// `None` when the line cannot answer it: the OpenAI-compatible face never
+    /// reports what it wrote, and no window folded before this half was
+    /// recorded carries it. `Some(0)` is a measurement and must render as one;
+    /// `None` must not render as zero, or "nobody asked the upstream to keep
+    /// anything" and "this face does not say" become the same finding.
+    #[serde(default)]
+    pub tokens_cache_created: Option<i64>,
     /// Mean wall time across the calls the line covers, weighted by call count
     /// so that it is the mean of the calls rather than the mean of the windows.
     pub avg_latency_ms: i64,
@@ -721,6 +730,10 @@ pub struct WindowSpend {
     pub tokens_input: i64,
     pub tokens_output: i64,
     pub tokens_cached: i64,
+    /// Same three states as [`ActorUsage::tokens_cache_created`], at one
+    /// window's granularity.
+    #[serde(default)]
+    pub tokens_cache_created: Option<i64>,
 }
 
 /// The fold read window by window rather than summed, with the range it covers.

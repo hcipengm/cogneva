@@ -112,7 +112,7 @@ async fn a_window_folds_the_ledger_and_reruns_in_place_with_zeros_for_the_idle()
         tokens_input: input,
         tokens_output: output,
         tokens_cached: cached,
-        tokens_cache_created: 0,
+        tokens_cache_created: None,
         estimated_input: None,
         refusal_kind: None,
         retry_after_secs: None,
@@ -303,7 +303,7 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
         tokens_input: input,
         tokens_output: output,
         tokens_cached: 0,
-        tokens_cache_created: 0,
+        tokens_cache_created: None,
         estimated_input: None,
         refusal_kind: None,
         retry_after_secs: None,
@@ -482,7 +482,7 @@ async fn the_summed_read_leaves_out_a_combination_the_range_never_used() {
             tokens_input: 10,
             tokens_output: 1,
             tokens_cached: 0,
-            tokens_cache_created: 0,
+            tokens_cache_created: None,
             estimated_input: None,
             refusal_kind: None,
             retry_after_secs: None,
@@ -607,7 +607,7 @@ async fn the_outcome_breakdown_keeps_the_verdict_that_explains_a_failed_range() 
                     tokens_input: tokens,
                     tokens_output: 0,
                     tokens_cached: 0,
-                    tokens_cache_created: 0,
+                    tokens_cache_created: None,
                     estimated_input: None,
                     refusal_kind: kind,
                     retry_after_secs: None,
@@ -812,4 +812,156 @@ async fn the_account_read_returns_the_savings_and_the_judgements_it_was_given() 
         .execute(&pool)
         .await
         .expect("clean up the verdict probe rows");
+}
+
+/// The written half of the cache: folded, summed, and kept apart from "nobody
+/// said".
+///
+/// Three states have to survive the fold, and only one of them is a number a
+/// reader may act on. A window whose calls all reported the half sums them; a
+/// window where the calls said nothing carries no reading at all; and a window
+/// that mixes the two cannot be summed either — summing the rows that did speak
+/// would produce a plausible figure covering part of the window, which is worse
+/// than refusing to answer, because nothing downstream can tell it is partial.
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_fold_carries_the_written_half_and_keeps_no_reading_apart_from_zero() {
+    let url = database_url();
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("connect to the test database");
+    let store = LlmUsageStore::connect(&url)
+        .await
+        .expect("connect the store");
+    init_schema_once(&store, &pool).await;
+
+    let run = uuid::Uuid::new_v4();
+    let upstream = format!("rollup-cachewrite-upstream:{run}");
+    let busy = format!("rollup-cachewrite-busy:{run}");
+    let silent = format!("rollup-cachewrite-silent:{run}");
+    let mixed = format!("rollup-cachewrite-mixed:{run}");
+    let idle = format!("rollup-cachewrite-idle:{run}");
+
+    let hour = hour_floor(Utc::now());
+    let w = RollupWindow {
+        start: hour - Duration::hours(2),
+        end: hour - Duration::hours(1),
+    };
+
+    let record = |actor: &str, cached: u64, created: Option<u64>| LlmUsageRecord {
+        upstream: upstream.clone(),
+        // The Anthropic face is the one that reports what it wrote; the
+        // OpenAI-compatible face never does, which is the whole reason the
+        // state has to be a tri-state rather than a counter.
+        api_style: "anthropic".to_string(),
+        model: "rollup-cachewrite-model".to_string(),
+        result: "ok".to_string(),
+        actor: actor.to_string(),
+        origin: "gateway_pool".to_string(),
+        tokens_input: 100,
+        tokens_output: 10,
+        tokens_cached: cached,
+        tokens_cache_created: created,
+        estimated_input: None,
+        refusal_kind: None,
+        retry_after_secs: None,
+        task: None,
+        owner: None,
+        latency_ms: 5,
+        pace: None,
+        usage_outcome: None,
+    };
+
+    for row in [
+        record(&busy, 900, Some(1000)),
+        record(&busy, 300, Some(500)),
+        record(&silent, 0, None),
+        record(&silent, 0, None),
+        record(&mixed, 0, Some(200)),
+        record(&mixed, 0, None),
+        record(&idle, 0, Some(0)),
+    ] {
+        store.record(&row).await.expect("land the probe row");
+    }
+
+    // 记账时的时间戳由库里给（`NOW()`），要折进一个已经关上的窗口就得把它挪过去。
+    sqlx::query("UPDATE gateway_llm_usage SET ts = $1 WHERE upstream = $2")
+        .bind(w.start + Duration::minutes(30))
+        .bind(&upstream)
+        .execute(&pool)
+        .await
+        .expect("move the probe rows into the closed window");
+
+    store
+        .rollup_windows(&[w.clone()])
+        .await
+        .expect("fold the window");
+
+    let folded_rows: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT actor, tokens_cache_created FROM cog_llm_usage_rollup \
+         WHERE window_start = $1 AND upstream = $2 ORDER BY actor",
+    )
+    .bind(w.start)
+    .bind(&upstream)
+    .fetch_all(&pool)
+    .await
+    .expect("read the folded rows");
+
+    let folded_of = |actor: &str| {
+        folded_rows
+            .iter()
+            .find(|(a, _)| a == actor)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("{actor} must have a folded row"))
+    };
+    assert_eq!(
+        folded_of(&busy),
+        Some(1500),
+        "a window whose calls all reported the half sums them"
+    );
+    assert_eq!(
+        folded_of(&silent),
+        None,
+        "calls that never reported the half leave the window with no reading, not a zero"
+    );
+    assert_eq!(
+        folded_of(&mixed),
+        None,
+        "a window that mixes reporting calls with silent ones is not summed: 200 would \
+         look like the window's total while covering only one of its two calls"
+    );
+    assert_eq!(
+        folded_of(&idle),
+        Some(0),
+        "a call that reported writing nothing is a measurement, and 0 is its right value"
+    );
+
+    let summed = store
+        .usage_by_actor_rolled(w.start, w.start + Duration::hours(1))
+        .await
+        .expect("read the folded window back");
+    let line = |actor: &str| {
+        summed
+            .rows
+            .iter()
+            .find(|r| r.actor == actor && r.upstream == upstream)
+            .and_then(|r| r.tokens_cache_created)
+    };
+    assert_eq!(line(&busy), Some(1500));
+    assert_eq!(line(&silent), None);
+    assert_eq!(line(&mixed), None);
+    assert_eq!(line(&idle), Some(0));
+
+    for actor in [&busy, &silent, &mixed, &idle] {
+        sqlx::query("DELETE FROM gateway_llm_usage WHERE actor = $1")
+            .bind(actor)
+            .execute(&pool)
+            .await
+            .expect("clean up the ledger probe rows");
+    }
+    sqlx::query("DELETE FROM cog_llm_usage_rollup WHERE upstream = $1")
+        .bind(&upstream)
+        .execute(&pool)
+        .await
+        .expect("clean up the folded probe rows");
 }

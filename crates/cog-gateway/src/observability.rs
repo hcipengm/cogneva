@@ -1453,6 +1453,8 @@ mod tests {
             tokens_input: input,
             tokens_output: 0,
             tokens_cached: 0,
+            // 这一行是 openai 兼容面：那一家不报写缓存那一半，缺读数就是 None。
+            tokens_cache_created: None,
         }
     }
 

@@ -247,10 +247,14 @@ pub struct LlmUsageRecord {
     /// alone both read as "cached: 0" and the repair is a guess.
     ///
     /// Upstreams on the OpenAI-compatible face do not report this at all -- they
-    /// cache without being asked and say nothing about what they wrote -- so a
-    /// zero there is "not reported" rather than "nothing written", and the
-    /// protocol column is what a reader has to pair it with.
-    pub tokens_cache_created: u64,
+    /// cache without being asked and say nothing about what they wrote -- so
+    /// this is `None` there rather than a zero, and rows written before this
+    /// half was recorded are `None` too. The three states have to stay apart:
+    /// `None` means "this call did not say", `Some(0)` means "it said nothing
+    /// was written", and only the second is a finding. A reader that prints
+    /// both as zero turns a missing column into a measured zero, which is the
+    /// exact mistake this pair exists to prevent.
+    pub tokens_cache_created: Option<u64>,
     /// What reading the response found, when this row came from a call that was
     /// answered at all.
     ///

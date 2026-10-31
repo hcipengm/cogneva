@@ -116,6 +116,12 @@ pub struct ActorSpend {
     pub tokens_input: i64,
     pub tokens_output: i64,
     pub tokens_cached: i64,
+    /// The written half of the cache. Null when no call in the group reported
+    /// it -- the OpenAI-compatible face never does, and neither did any row
+    /// written before the column existed. Zero is a reading and must not be
+    /// printed as a missing one; null is the missing one and must not be
+    /// summed as a zero.
+    pub tokens_cache_created: Option<i64>,
     pub avg_latency_ms: i64,
 }
 
@@ -157,6 +163,8 @@ pub struct SpendWindowRow {
     pub tokens_input: i64,
     pub tokens_output: i64,
     pub tokens_cached: i64,
+    /// Same three states as [`ActorSpend::tokens_cache_created`].
+    pub tokens_cache_created: Option<i64>,
 }
 
 /// One rolled read left at window granularity: the rows, and the range the
@@ -315,7 +323,7 @@ CREATE TABLE IF NOT EXISTS gateway_llm_usage (
     tokens_input  BIGINT NOT NULL DEFAULT 0,
     tokens_output BIGINT NOT NULL DEFAULT 0,
     tokens_cached BIGINT NOT NULL DEFAULT 0,
-    tokens_cache_created BIGINT NOT NULL DEFAULT 0,
+    tokens_cache_created BIGINT,
     latency_ms    BIGINT NOT NULL DEFAULT 0
 );
 -- Additive migration for the per-actor dimension; old rows stay attributable
@@ -330,12 +338,19 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_cached BIGINT NOT 
 -- The written half of the same cache. Its own column for the same reason the
 -- read half has one: "cached: 0" is two different findings -- a prefix that
 -- changes on every call, and a request that never asked the upstream to keep
--- anything -- and only the pair tells them apart. Rows written before this
--- column existed default to 0, which on the OpenAI-compatible face is also the
--- honest reading (that face never reports it); on the Anthropic face it reads
--- as "nothing written", so a reader dating a finding has to know when the
--- column started being written.
-ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_cache_created BIGINT NOT NULL DEFAULT 0;
+-- anything -- and only the pair tells them apart.
+--
+-- Nullable with no default, unlike every other counter here: this is the one
+-- whose zero is a reading. An upstream on the OpenAI-compatible face never
+-- reports it, and rows written before this column existed were not recorded
+-- either -- writing 0 into those would turn "nobody asked" into "nothing was
+-- written", which is the finding the pair exists to find. NULL is "this call
+-- did not say"; 0 is "it said nothing was written".
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_cache_created BIGINT;
+-- A database that already took the earlier NOT NULL form keeps its rows and
+-- only loses the constraint: the values there are already NULL-free.
+ALTER TABLE gateway_llm_usage
+    ALTER COLUMN tokens_cache_created DROP NOT NULL;
 -- Additive migration for the environment dimension, same shape as the actor
 -- one above. Rows written before it existed default to `unknown`, which is the
 -- honest reading -- they are not attributable to any one environment and must
@@ -454,6 +469,7 @@ CREATE TABLE IF NOT EXISTS cog_llm_usage_rollup (
     tokens_input   BIGINT NOT NULL DEFAULT 0,
     tokens_output  BIGINT NOT NULL DEFAULT 0,
     tokens_cached  BIGINT NOT NULL DEFAULT 0,
+    tokens_cache_created BIGINT,
     avg_latency_ms BIGINT NOT NULL DEFAULT 0,
     first_rolled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (window_start, window_end, actor, origin, upstream, api_style)
@@ -485,6 +501,17 @@ BEGIN
         ALTER TABLE cog_llm_usage_rollup
             ADD PRIMARY KEY
                 (window_start, window_end, actor, origin, upstream, api_style);
+    END IF;
+    -- The written half of the cache, nullable for the same reason it is
+    -- nullable in the ledger: a window folded before the half was recorded
+    -- carries no reading, and a zero there would claim one. It is not in the
+    -- key and needs no rebuild.
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'cog_llm_usage_rollup'
+          AND column_name = 'tokens_cache_created'
+    ) THEN
+        ALTER TABLE cog_llm_usage_rollup ADD COLUMN tokens_cache_created BIGINT;
     END IF;
 END
 $mig$;
@@ -594,7 +621,7 @@ impl LlmUsageStore {
         .bind(r.tokens_input as i64)
         .bind(r.tokens_output as i64)
         .bind(r.tokens_cached as i64)
-        .bind(r.tokens_cache_created as i64)
+        .bind(r.tokens_cache_created.map(|n| n as i64))
         .bind(r.estimated_input.map(|v| v as i64))
         .bind(r.task.as_deref())
         .bind(r.latency_ms as i64)
@@ -1223,6 +1250,12 @@ impl LlmUsageStore {
                    COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_input,
                    COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_output,
                    COALESCE(SUM(tokens_cached), 0)::BIGINT AS tokens_cached,
+                   -- 不套 COALESCE：这一格的 NULL 是「没人报」，与「报了零」不同。
+                   -- 组里只要有一行没报，整组的答案就是「没量过」——把报了的那几行
+                   -- 加起来会得到一个像模像样的数，而它其实只盖住了这个组的一部分。
+                   CASE WHEN COUNT(*) > COUNT(tokens_cache_created) THEN NULL
+                        ELSE SUM(tokens_cache_created)::BIGINT END
+                                                          AS tokens_cache_created,
                    COALESCE(AVG(latency_ms), 0)::BIGINT    AS avg_latency_ms
             FROM {LEDGER_TABLE}
             WHERE ts >= $1 AND ts < $2
@@ -1246,6 +1279,7 @@ impl LlmUsageStore {
                 tokens_input: r.get("tokens_input"),
                 tokens_output: r.get("tokens_output"),
                 tokens_cached: r.get("tokens_cached"),
+                tokens_cache_created: r.get("tokens_cache_created"),
                 avg_latency_ms: r.get("avg_latency_ms"),
             })
             .collect())
@@ -1305,8 +1339,8 @@ impl LlmUsageStore {
             INSERT INTO {ROLLUP_TABLE}
                 (window_start, window_end, actor, origin, upstream, api_style,
                  calls, failed_calls, tokens_input, tokens_output, tokens_cached,
-                 avg_latency_ms)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                 tokens_cache_created, avg_latency_ms)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (window_start, window_end, actor, origin, upstream, api_style)
             DO UPDATE SET
                 calls          = EXCLUDED.calls,
@@ -1314,6 +1348,7 @@ impl LlmUsageStore {
                 tokens_input   = EXCLUDED.tokens_input,
                 tokens_output  = EXCLUDED.tokens_output,
                 tokens_cached  = EXCLUDED.tokens_cached,
+                tokens_cache_created = EXCLUDED.tokens_cache_created,
                 avg_latency_ms = EXCLUDED.avg_latency_ms
             "#
         );
@@ -1335,6 +1370,7 @@ impl LlmUsageStore {
                     .bind(s.tokens_input)
                     .bind(s.tokens_output)
                     .bind(s.tokens_cached)
+                    .bind(s.tokens_cache_created)
                     .bind(s.avg_latency_ms)
                     .execute(&self.pool)
                     .await?;
@@ -1367,6 +1403,10 @@ impl LlmUsageStore {
                     .bind(0i64)
                     .bind(0i64)
                     .bind(0i64)
+                    .bind(0i64)
+                    // 空闲窗口：这一格确实没有调用，零是被量到的。同一条线上
+                    // 只要有一行没报，整条线的这一格就是 NULL——那一条规则在
+                    // 读端，不靠这一格兜。
                     .bind(0i64)
                     .execute(&self.pool)
                     .await?;
@@ -1480,6 +1520,9 @@ impl LlmUsageStore {
                     SUM(tokens_input)::BIGINT AS tokens_input, \
                     SUM(tokens_output)::BIGINT AS tokens_output, \
                     SUM(tokens_cached)::BIGINT AS tokens_cached, \
+                    CASE WHEN COUNT(*) > COUNT(tokens_cache_created) THEN NULL \
+                         ELSE SUM(tokens_cache_created)::BIGINT END \
+                                              AS tokens_cache_created, \
                     CASE WHEN SUM(calls) > 0 \
                          THEN (SUM(avg_latency_ms::BIGINT * calls) / SUM(calls))::BIGINT \
                          ELSE 0::BIGINT END AS avg_latency_ms \
@@ -1506,6 +1549,7 @@ impl LlmUsageStore {
                 tokens_input: r.get::<i64, _>("tokens_input"),
                 tokens_output: r.get::<i64, _>("tokens_output"),
                 tokens_cached: r.get::<i64, _>("tokens_cached"),
+                tokens_cache_created: r.get::<Option<i64>, _>("tokens_cache_created"),
                 avg_latency_ms: r.get::<i64, _>("avg_latency_ms"),
             })
             .collect();
@@ -1549,7 +1593,8 @@ impl LlmUsageStore {
         };
         let rows = sqlx::query(&format!(
             "SELECT window_start, window_end, actor, origin, upstream, api_style, \
-                    calls, failed_calls, tokens_input, tokens_output, tokens_cached \
+                    calls, failed_calls, tokens_input, tokens_output, tokens_cached, \
+                    tokens_cache_created \
              FROM {ROLLUP_TABLE} \
              WHERE window_start >= $1 AND window_end <= $2 \
              ORDER BY window_start, (tokens_input + tokens_output) DESC, \
@@ -1573,6 +1618,7 @@ impl LlmUsageStore {
                 tokens_input: r.get::<i64, _>("tokens_input"),
                 tokens_output: r.get::<i64, _>("tokens_output"),
                 tokens_cached: r.get::<i64, _>("tokens_cached"),
+                tokens_cache_created: r.get::<Option<i64>, _>("tokens_cache_created"),
             })
             .collect();
         Ok(WindowSeries {
@@ -1626,6 +1672,7 @@ impl cog_core::LlmUsageReader for RolledUsageReader {
                     tokens_input: s.tokens_input,
                     tokens_output: s.tokens_output,
                     tokens_cached: s.tokens_cached,
+                    tokens_cache_created: s.tokens_cache_created,
                     avg_latency_ms: s.avg_latency_ms,
                 })
                 .collect(),
@@ -1659,6 +1706,7 @@ impl cog_core::LlmUsageReader for RolledUsageReader {
                     tokens_input: s.tokens_input,
                     tokens_output: s.tokens_output,
                     tokens_cached: s.tokens_cached,
+                    tokens_cache_created: s.tokens_cache_created,
                 })
                 .collect(),
         })
