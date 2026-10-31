@@ -1706,12 +1706,15 @@ export async function getBackendHealth(): Promise<BackendHealthMatrix> {
 }
 
 /**
- * 六条观测读数。`value` 为空是「问不到 / 没有样本」，与读到 0 不是一回事；
+ * 观测读数。`value` 为空是「问不到 / 没有样本」，与读到 0 不是一回事；
  * `dashboard_uid` 为空是「这条读数没有面板」，界面据此说明为什么点不过去。
+ * `group` 是闭集：面板按它分段，读到不认识的词就照原样单列一段，而不是把它
+ * 并进某一段——并错段的一行数不算错，但读者会在错的那一分钟去找它。
  */
 export interface ObservabilityReading {
   id: string;
   title: string;
+  group: 'infra' | 'delivery';
   query: string;
   unit: string;
   /** 阈值为空＝这条读数没有阈值，只能报值、不能报警。 */

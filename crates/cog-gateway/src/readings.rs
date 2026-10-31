@@ -1,4 +1,4 @@
-//! The six readings that answer "is anything about to break".
+//! The readings that answer "is anything about to break".
 //!
 //! Each one is a decision that has to be made now — a disk that will not fit the
 //! next build, a database whose oldest transaction has stopped moving, an
@@ -10,13 +10,61 @@
 //! Every reading names the series it reads and the file that produces it. A
 //! reading whose series nobody produces is not "zero": it is unanswerable, and
 //! the shape below keeps that case distinct from a real zero.
+//!
+//! Two groups, because the two answer different questions about different
+//! machinery. `infra` is what the platform stands on — disk, database, vector
+//! store, ingress, probes — every series foreign to this repository. `delivery`
+//! is the platform's own chain, and it runs in one direction: an upstream CI
+//! gate decides whether a revision may enter, the model pool decides whether the
+//! work inside can run at all, and the change queue decides whether finished
+//! work can leave. Until this group existed the whole chain was invisible on
+//! the product's own board: on 2026-10-31 the mainline stood still for 2.7 hours
+//! while every row here read "正常", because no reading asked about it.
 
 use std::collections::HashMap;
+
+/// Which question a reading belongs to.
+///
+/// The board draws one section per group. A reading filed under the wrong group
+/// is not a wrong number, but it is read in the wrong minute: an operator
+/// scanning "基础设施" for a stalled rollout will not find it, and nothing about
+/// the row says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadingGroup {
+    /// The platform's surroundings: machine, database, vector store, ingress,
+    /// reachability. Producers are foreign to this repository.
+    Infra,
+    /// The platform's own delivery chain. Producers are files in this repository,
+    /// which is what makes the sourcing gate able to check them.
+    Delivery,
+}
+
+impl ReadingGroup {
+    /// The word the group travels as, and the key the board's labels use.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReadingGroup::Infra => "infra",
+            ReadingGroup::Delivery => "delivery",
+        }
+    }
+
+    /// Every group this vocabulary has, for readers that must cover all of them
+    /// rather than listing the variants a second time.
+    pub const ALL: [ReadingGroup; 2] = [ReadingGroup::Infra, ReadingGroup::Delivery];
+}
+
+impl serde::Serialize for ReadingGroup {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReadingSpec {
     pub id: &'static str,
     pub title: &'static str,
+    /// Which section of the board this row belongs to.
+    pub group: ReadingGroup,
     /// PromQL. One scalar per reading: a reading that needs two numbers is two
     /// readings, because a card can only show one verdict.
     pub query: &'static str,
@@ -44,6 +92,7 @@ pub struct ReadingSpec {
 pub const DISK_FREE: ReadingSpec = ReadingSpec {
     id: "disk_free_ratio",
     title: "根盘剩余占比",
+    group: ReadingGroup::Infra,
     query: r#"min(1 - (node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay|squashfs"} / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay|squashfs"}))"#,
     unit: "%",
     warn: Some(0.15),
@@ -58,6 +107,7 @@ pub const DISK_FREE: ReadingSpec = ReadingSpec {
 pub const PG_CONNECTIONS: ReadingSpec = ReadingSpec {
     id: "pg_connections",
     title: "数据库连接数",
+    group: ReadingGroup::Infra,
     query: r#"sum(pg_stat_database_numbackends{datname="cogneva"})"#,
     unit: "条",
     warn: Some(80.0),
@@ -73,6 +123,7 @@ pub const PG_CONNECTIONS: ReadingSpec = ReadingSpec {
 pub const PG_OLDEST_TX: ReadingSpec = ReadingSpec {
     id: "pg_oldest_tx_seconds",
     title: "最老事务年龄",
+    group: ReadingGroup::Infra,
     query: r#"max(pg_stat_activity_max_tx_duration{datname="cogneva"})"#,
     unit: "秒",
     warn: Some(300.0),
@@ -88,6 +139,7 @@ pub const PG_OLDEST_TX: ReadingSpec = ReadingSpec {
 pub const QDRANT_VECTORS: ReadingSpec = ReadingSpec {
     id: "qdrant_vectors",
     title: "向量总数",
+    group: ReadingGroup::Infra,
     query: "sum(collections_vector_total)",
     unit: "条",
     warn: None,
@@ -104,6 +156,7 @@ pub const QDRANT_VECTORS: ReadingSpec = ReadingSpec {
 pub const INGRESS_5XX: ReadingSpec = ReadingSpec {
     id: "ingress_5xx_rate",
     title: "入口 5xx 速率",
+    group: ReadingGroup::Infra,
     query: r#"sum(rate(traefik_service_requests_total{code=~"5.."}[5m])) or sum(rate(nginx_ingress_controller_requests{status=~"5.."}[5m]))"#,
     unit: "/s",
     warn: Some(0.1),
@@ -118,6 +171,7 @@ pub const INGRESS_5XX: ReadingSpec = ReadingSpec {
 pub const UNREACHABLE: ReadingSpec = ReadingSpec {
     id: "unreachable_targets",
     title: "不通的目标数",
+    group: ReadingGroup::Infra,
     query: "sum(probe_success == 0)",
     unit: "个",
     warn: Some(1.0),
@@ -128,13 +182,93 @@ pub const UNREACHABLE: ReadingSpec = ReadingSpec {
     dashboard_uid: Some("cogneva-reachability"),
 };
 
-pub const READINGS: [&ReadingSpec; 6] = [
+/// How long the upstream CI gate has been holding the tracked revision.
+///
+/// The chain's first joint: while this is non-zero nothing is being deployed,
+/// whatever the reason, and every other delivery reading is downstream of it.
+///
+/// The critical bound is the alert rule's own number — `mainline_ci_hold_seconds`
+/// fires past four hours — so the board and the pager cannot drift apart. The
+/// warning bound is a stated override rather than a derived one: the longest
+/// segment observed before this reading existed was 43 minutes (released on a
+/// `no_evidence` reading), one upstream round spans about 11 minutes, and the
+/// deployer's own beat is 10; an hour sits above every segment that has ended on
+/// its own. It will be replaced by this series' own distribution once the store
+/// holds a week of it.
+pub const MAINLINE_CI_HOLD: ReadingSpec = ReadingSpec {
+    id: "mainline_ci_hold_seconds",
+    title: "主线被 CI 扣住的时长",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_mainline_ci_hold_seconds)",
+    unit: "秒",
+    warn: Some(3600.0),
+    crit: Some(14400.0),
+    higher_is_worse: true,
+    series: "cogneva_mainline_ci_hold_seconds",
+    produced_by: "crates/cog-reflection/src/mainline_deployer.rs",
+    dashboard_uid: None,
+};
+
+/// How long the oldest change has been blocked by the model pool.
+///
+/// The chain's second joint. A change that cannot call a model never becomes a
+/// build, so this age grows while every worker is idle and every queue looks
+/// busy. The bound is the one the `change_pool_block_stranded` rule already
+/// carries, for the same reason as above.
+///
+/// The count beside it is not a second reading on purpose: the number of
+/// blocked rows says how wide the jam is, and the age says whether it is moving.
+/// Only the second one is a decision, and a row showing four thousand blocked
+/// changes with no threshold would read "正常" while the pipeline is stopped.
+pub const CHANGE_POOL_BLOCKED_OLDEST: ReadingSpec = ReadingSpec {
+    id: "change_pool_blocked_oldest_seconds",
+    title: "被模型池挡住的最老变更",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_change_dispatch_pool_blocked_oldest_seconds)",
+    unit: "秒",
+    warn: None,
+    crit: Some(1800.0),
+    higher_is_worse: true,
+    series: "cogneva_change_dispatch_pool_blocked_oldest_seconds",
+    produced_by: "crates/cog-orchestrator/src/change_ledger.rs",
+    dashboard_uid: None,
+};
+
+/// How many model upstreams the pool reports healthy.
+///
+/// The chain's third joint, and the one that decides whether the other two can
+/// move at all: with zero healthy upstreams nothing runs, and `higher_is_worse`
+/// is false because fewer is worse. Zero is critical, one is a warning — one
+/// answering upstream is a pool with no redundancy left, which is the state that
+/// made 2026-10-31 look like an idle system rather than a broken one.
+///
+/// `max by (upstream)` is not decoration: several pods publish this gauge for
+/// the same upstream, and summing the raw series would multiply the population
+/// by the replica count and report health that does not exist.
+pub const LLM_UPSTREAMS_HEALTHY: ReadingSpec = ReadingSpec {
+    id: "llm_upstreams_healthy",
+    title: "健康的模型上游数",
+    group: ReadingGroup::Delivery,
+    query: r#"sum(max by (upstream) (llm_upstream_healthy{upstream=~".+"}))"#,
+    unit: "个",
+    warn: Some(1.0),
+    crit: Some(0.0),
+    higher_is_worse: false,
+    series: "llm_upstream_healthy",
+    produced_by: "crates/cog-gateway/src/security_gateway.rs",
+    dashboard_uid: None,
+};
+
+pub const READINGS: [&ReadingSpec; 9] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
     &QDRANT_VECTORS,
     &INGRESS_5XX,
     &UNREACHABLE,
+    &MAINLINE_CI_HOLD,
+    &CHANGE_POOL_BLOCKED_OLDEST,
+    &LLM_UPSTREAMS_HEALTHY,
 ];
 
 /// The word a reading carries about its own value.
@@ -467,6 +601,62 @@ mod tests {
             verdict_of(&PG_CONNECTIONS, Some(120.0)),
             ReadingVerdict::Critical
         );
+    }
+
+    /// 交付链那三条的判词方向：两个方向都在这一族里，写反了不会报错，只会安静地
+    /// 把「停了三小时」读成正常、把「一切正常」读成告警。
+    #[test]
+    fn the_delivery_readings_point_both_ways() {
+        // 扣得越久越坏：一小时才到警告，四小时才到严重——两个都是「有出处」的界，
+        // 不是这一格自己编的。
+        assert_eq!(verdict_of(&MAINLINE_CI_HOLD, Some(0.0)), ReadingVerdict::Ok);
+        assert_eq!(
+            verdict_of(&MAINLINE_CI_HOLD, Some(3599.0)),
+            ReadingVerdict::Ok
+        );
+        assert_eq!(
+            verdict_of(&MAINLINE_CI_HOLD, Some(3600.0)),
+            ReadingVerdict::Warning
+        );
+        assert_eq!(
+            verdict_of(&MAINLINE_CI_HOLD, Some(14400.0)),
+            ReadingVerdict::Critical
+        );
+        // 被挡住的最老变更只有一个界：等不到半小时就只是等着。
+        assert_eq!(
+            verdict_of(&CHANGE_POOL_BLOCKED_OLDEST, Some(1799.0)),
+            ReadingVerdict::Ok
+        );
+        assert_eq!(
+            verdict_of(&CHANGE_POOL_BLOCKED_OLDEST, Some(1800.0)),
+            ReadingVerdict::Critical
+        );
+        // 可用上游越少越坏：0 个是什么也调不到，1 个是没有任何冗余。
+        assert_eq!(
+            verdict_of(&LLM_UPSTREAMS_HEALTHY, Some(0.0)),
+            ReadingVerdict::Critical
+        );
+        assert_eq!(
+            verdict_of(&LLM_UPSTREAMS_HEALTHY, Some(1.0)),
+            ReadingVerdict::Warning
+        );
+        assert_eq!(
+            verdict_of(&LLM_UPSTREAMS_HEALTHY, Some(3.0)),
+            ReadingVerdict::Ok
+        );
+        // 问不到不是 0：没有样本时三条都必须说「不知道」，而不是「没问题」。
+        for spec in [
+            &MAINLINE_CI_HOLD,
+            &CHANGE_POOL_BLOCKED_OLDEST,
+            &LLM_UPSTREAMS_HEALTHY,
+        ] {
+            assert_eq!(
+                verdict_of(spec, None),
+                ReadingVerdict::Unknown,
+                "{}",
+                spec.id
+            );
+        }
     }
 
     #[test]

@@ -375,6 +375,48 @@ fn the_reading_verdicts_the_board_knows_are_the_ones_the_endpoint_declares() {
     );
 }
 
+/// 读数分成几段，端点与面板必须是同一组词。
+///
+/// 分段回答的是「该在什么时候读这一行」。多一个词：那一段落在 `groupLabel` 的
+/// 兜底分支，标题是英文原词、副标题写着「未登记的组」——读数本身不算错，但读者
+/// 会在错的那一分钟去找它；少一个词：面板为一段永远不会到来的读数留着标题与一句
+/// 说明。两侧各写一份时这两件事都不报错，所以这里钉住。
+#[test]
+fn the_reading_groups_the_board_knows_are_the_ones_the_endpoint_declares() {
+    let path = repo_root().join("web/src/api/client.ts");
+    let source =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let body_start = source
+        .find("export interface ObservabilityReading {")
+        .expect("the reading type is gone; this gate reads its group through it");
+    let body = &source[body_start..];
+    let body_end = body.find("\n}").expect("the interface body is not closed");
+    let mut panel = union_words(&body[..body_end], "  group:");
+    panel.sort();
+    assert!(
+        panel.len() >= 2,
+        "分组联合类型读出来是 {panel:?}；这么短说明解析变了，不是树变干净了"
+    );
+
+    let mut declared: Vec<String> = cog_gateway::readings::ReadingGroup::ALL
+        .iter()
+        .map(|group| group.as_str().to_string())
+        .collect();
+    declared.sort();
+    assert_eq!(panel, declared, "面板与端点必须认识同一组读数分组");
+
+    // 面板那张表按组取标题：写成 `Record<string, …>` 时，漏掉的一组会落到兜底
+    // 分支——一段读数顶着一个英文标题和「未登记的组」，编译期也不会红。
+    let board = repo_root().join("web/src/observability/ReadingsBoard.tsx");
+    let board =
+        std::fs::read_to_string(&board).unwrap_or_else(|e| panic!("{}: {e}", board.display()));
+    assert!(
+        board.contains("const GROUP_LABEL: Record<string, { title: string; what: string }> = {"),
+        "GROUP_LABEL 的形状变了；这一格读的是它的键类型，缺一行只会落到兜底分支"
+    );
+}
+
 /// 一句发出去的话落定的五种结局：存储层按它写列、面板按它配那一行的话与颜色。
 ///
 /// 多一个词：会话窗口把英文原词贴在灰字里，读起来像一句没人写过的说明；少一个

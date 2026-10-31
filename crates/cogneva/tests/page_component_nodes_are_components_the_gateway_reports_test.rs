@@ -1,26 +1,28 @@
 //! principle: feedback_no_hardcoding_config_surface
 //!
-//! 运维页的拓扑面板画三个固定节点：应用本体、安全网关、进化沙箱。节点的状态来自
-//! `/api/v1/cluster/components`：网关把 `ComponentStatus { id, status }` 按 id 交给
-//! 页面，页面按 id 覆盖自己那张表的初值，再按 id 把三行画出来。两边各写一遍这三个
-//! id：写它们的是 `cluster_components_handler`（`id: "main"` 一个字面量，另外两个
-//! 来自 `READ_COMPONENTS` 引用的 `cog_core::topology::COMPONENT_*` 常量），读它们的是
-//! 运维页。
+//! 运维页的拓扑面板画一组固定节点：应用本体、安全网关、沙盒执行器、进化沙箱、
+//! 镜像仓。节点的状态来自 `/api/v1/cluster/components`：网关把
+//! `ComponentStatus { id, status }` 按 id 交给页面，页面按 id 覆盖自己那张表的初值，
+//! 再按 id 把这几行画出来。两边各写一遍这组 id：写它们的是
+//! `cluster_components_handler`（`id: "main"` 一个字面量，其余来自 `READ_COMPONENTS`
+//! 引用的 `cog_core::topology::COMPONENT_*` 常量），读它们的是运维页。具体几个不写死在
+//! 这段说明里——它就是会随组件增减而变的那件事，判据读的是两边实际写了什么。
 //!
 //! 对不上时整条链路都不报错，两个方向都是静的：
 //!
 //! - 页面读的 id 没人发：那一行永远停在初值 `unknown`，`componentToStatus` 把它画成
 //!   灰色 idle——与「这个组件确实没在跑」同一种读数。
 //! - 网关发的 id 页面不画：一个真实存在的组件在拓扑图上没有位置，图上少一行与
-//!   「本来就只有三个」同一种读数。
+//!   「这一版就发了这些」同一种读数。
 //!
-//! 所以两个方向都判，且都以「读到几个」自证：读不出组件表、读不出页面的三个 id、
+//! 所以两个方向都判，且都以「读到几个」自证：读不出组件表、读不出页面那组 id、
 //! 或者读出来是空的，都按红处理。
 //!
-//! 实测（2026-10-27）：网关发 3 个 id（`main`、`security-gateway`、`evolution`），
+//! 实测（2026-10-27，当时发 3 个 id）：网关发 `main`、`security-gateway`、`evolution`，
 //! 页面写 3 个、读 3 个，两个方向都为空。消融：把 `cluster_components_handler` 里
 //! `id: "main"` 改成 `id: "core"`，本门红并同时点名两个方向（页面画的 `main` 没人发、
-//! 网关发的 `core` 没人画）；改回即绿。
+//! 网关发的 `core` 没人画）；改回即绿。2026-10-31 起组件表加了沙盒执行器与镜像仓，
+//! 判据不变，两个方向仍为空。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;

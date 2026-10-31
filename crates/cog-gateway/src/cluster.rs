@@ -1,10 +1,17 @@
-//! Cluster component health — reports the three fixed deployments that make
-//! up a Cogneva install (main app, security gateway, evolution sandbox) so
-//! the topology view can render real nodes instead of placeholders.
+//! Cluster component health — reports the fixed deployments that make up a
+//! Cogneva install so the topology view can render real nodes instead of
+//! placeholders.
 //!
 //! The main app is the process serving this request, so it is always "up".
-//! The other two are read from the Kubernetes API; when the service account
-//! lacks permission (or we are not in a cluster) they degrade to "unknown".
+//! The rest are read from the Kubernetes API; when the service account lacks
+//! permission (or we are not in a cluster) they degrade to "unknown".
+//!
+//! The list is the platform's own workloads, not everything running in the
+//! namespace. Data services and third-party pods are on the topology view,
+//! which reads the namespace directly and cannot fall behind a list; what this
+//! list answers is "is every deployment this product ships ready", and a
+//! workload missing from it reads exactly like one that is healthy — the strip
+//! says nothing about a deployment it was never asked about.
 
 use axum::Json;
 use cog_core::claim_footprint::quantity_bytes;
@@ -75,8 +82,18 @@ const READ_COMPONENTS: &[(&str, &str)] = &[
         cog_core::topology::SECURITY_GATEWAY,
     ),
     (
+        cog_core::topology::COMPONENT_SANDBOX_EXECUTOR,
+        cog_core::topology::SANDBOX_EXECUTOR,
+    ),
+    (
         cog_core::topology::COMPONENT_EVOLUTION,
         cog_core::topology::EVOLUTION,
+    ),
+    // 镜像仓也在这张表里：它一停，任何一次滚动都拉不到镜像，而「工作负载」这一条
+    // 读作全绿——少一行与「这台起够了」在屏上同形。
+    (
+        cog_core::topology::COMPONENT_REGISTRY,
+        cog_core::topology::REGISTRY,
     ),
 ];
 

@@ -1646,7 +1646,9 @@ const I18N = {
   noActiveGoals:  { en: 'No active goals', zh: '暂无活动目标' },
   nodeMain:       { en: 'Main App', zh: '主应用' },
   nodeSecGw:      { en: 'Security Gateway', zh: '安全网关' },
+  nodeExecutor:   { en: 'Sandbox Executor', zh: '沙盒执行器' },
   nodeEvo:        { en: 'Evolution Sandbox', zh: '进化沙盒' },
+  nodeRegistry:   { en: 'Image Registry', zh: '镜像仓' },
   agentsTitle:    { en: 'AGENTS', zh: '智能体' },
   csOpen:         { en: 'open', zh: '已连接' },
   csConnecting:   { en: 'connecting', zh: '连接中' },
@@ -3029,7 +3031,7 @@ checkLlmStatus();
   // nodes from the processes poll, with bus state_change events updating
   // agent node colors between polls.
   const liveAgents = new Map();
-  let liveComponents = { main: 'up', 'security-gateway': 'unknown', evolution: 'unknown' };
+  let liveComponents = { main: 'up', 'security-gateway': 'unknown', 'sandbox-executor': 'unknown', evolution: 'unknown', 'cluster-registry': 'unknown' };
   let liveGoals = [];
 
   function healthToStatus(h) {
@@ -3170,7 +3172,9 @@ checkLlmStatus();
     topo.textContent = '';
     topo.appendChild(nodeRow(t('nodeMain'), componentToStatus(liveComponents.main), 'core'));
     topo.appendChild(nodeRow(t('nodeSecGw'), componentToStatus(liveComponents['security-gateway']), 'gateway'));
+    topo.appendChild(nodeRow(t('nodeExecutor'), componentToStatus(liveComponents['sandbox-executor']), 'sandbox'));
     topo.appendChild(nodeRow(t('nodeEvo'), componentToStatus(liveComponents.evolution), 'sandbox'));
+    topo.appendChild(nodeRow(t('nodeRegistry'), componentToStatus(liveComponents['cluster-registry']), 'gateway'));
     if (liveAgents.size > 0) {
       const head = document.createElement('div');
       head.className = 'tnode agents-head';

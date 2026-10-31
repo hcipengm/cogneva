@@ -181,6 +181,8 @@ mod database_service_survives_an_unready_sidecar_test;
 mod dataset_routes;
 #[path = "declared_prompts_match_code_fallbacks.rs"]
 mod declared_prompts_match_code_fallbacks;
+#[path = "delivery_readings_are_ours_to_vouch_for_test.rs"]
+mod delivery_readings_are_ours_to_vouch_for_test;
 #[path = "deployed_rule_label_values_are_values_the_code_writes_test.rs"]
 mod deployed_rule_label_values_are_values_the_code_writes_test;
 #[path = "deployed_rule_labels_are_labels_the_code_emits_test.rs"]
