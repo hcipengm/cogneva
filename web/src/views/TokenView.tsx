@@ -9,7 +9,13 @@ import { DimensionCounts } from '@/observability/DimensionCounts';
 import { OutcomeBreakdown } from '@/observability/OutcomeBreakdown';
 import { SpendAccount } from '@/observability/SpendAccount';
 import { ActorTable } from '@/observability/ActorTable';
-import { cacheBase, compact, styleCells } from '@/observability/usageRows';
+import {
+  cacheBase,
+  cacheWriteNote,
+  cacheWriteValue,
+  compact,
+  styleCells,
+} from '@/observability/usageRows';
 import { Empty, Loading, Moment, ReadError, Reading, Readings, ViewFrame } from '@/ui/primitives';
 import { localZoneLabel, percentOf } from '@/topology/format';
 
@@ -108,6 +114,11 @@ export function TokenView() {
               <Reading label="输入 token" value={cumulativeSum((actor) => actor.tokens_input).toLocaleString()} />
               <Reading label="输出 token" value={cumulativeSum((actor) => actor.tokens_output).toLocaleString()} />
               <Reading label="缓存命中" value={cumulativeSum((actor) => actor.tokens_cached).toLocaleString()} />
+              <Reading
+                label="缓存写入"
+                value={cacheWriteValue(cumulativeActors)}
+                note={cacheWriteNote(cumulativeActors)}
+              />
               {[...cumulativeByStyle.entries()].map(([style, cell]) => {
                 const base = cacheBase(style, cell.input, cell.cached);
                 return (
@@ -203,7 +214,12 @@ export function TokenView() {
                     <Reading
                       label="缓存命中"
                       value={sum((row) => row.tokens_cached).toLocaleString()}
-                      note="只在同一协议内可比"
+                      note="只在同一协议内可比：两个协议的 input 含义不同，读回量本身不跨协议相加"
+                    />
+                    <Reading
+                      label="缓存写入"
+                      value={cacheWriteValue(rows)}
+                      note={cacheWriteNote(rows)}
                     />
                     {[...byStyle.entries()].map(([style, cell]) => {
                       const base = cacheBase(style, cell.input, cell.cached);

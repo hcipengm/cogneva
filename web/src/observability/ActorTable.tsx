@@ -4,6 +4,8 @@ import { actorHint, registeredActorNames } from '@/observability/DimensionCounts
 import {
   actorTotals,
   cacheFormula,
+  cacheWriteNote,
+  cacheWriteValue,
   compact,
   hitRate,
   percent,
@@ -91,6 +93,9 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
             <th style={{ width: W.cached, textAlign: 'right' }}>
               缓存
             </th>
+            <th style={{ width: W.write, textAlign: 'right' }}>
+              缓存写入
+            </th>
             <th style={{ width: W.rate, textAlign: 'right' }}>
               缓存占比
             </th>
@@ -144,6 +149,14 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
                   <td className={NUM}>{group.output.toLocaleString()}</td>
                   <td className={NUM} style={{ color: 'var(--muted)' }}>
                     {group.cached.toLocaleString()}
+                  </td>
+                  <td className={NUM} style={{ color: 'var(--muted)' }}>
+                    <Note
+                      className="text-[var(--muted)]"
+                      text={cacheWriteNote(group.rows)}
+                    >
+                      {cacheWriteValue(group.rows)}
+                    </Note>
                   </td>
                   <td className={NUM}>
                     {group.styles.length === 1 ? (
@@ -217,6 +230,14 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
                         <td className={`${NUM} text-[10px]`} style={{ color: 'var(--muted)' }}>
                           {row.tokens_cached.toLocaleString()}
                         </td>
+                        <td className={`${NUM} text-[10px]`} style={{ color: 'var(--muted)' }}>
+                          <Note
+                            className="text-[var(--muted)]"
+                            text={cacheWriteNote([row])}
+                          >
+                            {cacheWriteValue([row])}
+                          </Note>
+                        </td>
                         <td className={`${NUM} text-[10px]`}>
                           <Note
                             className="text-[var(--muted)]"
@@ -251,7 +272,7 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
                   <span className="min-w-0 truncate">{name}</span>
                 </Note>
               </td>
-              <td colSpan={9} className="text-[10px] text-[var(--muted)]">
+              <td colSpan={10} className="text-[10px] text-[var(--muted)]">
                 本窗口没有调用（闭集里登记了，不是这段没花）
               </td>
             </tr>
@@ -265,6 +286,10 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
         一种协议」四格合起来才是账上唯一的一行，同一个执行者换过环境就是两行。
         上游那格写模型名，指针停上去看它挂在哪条线路上；写「未发起」的行没有任何
         上游被尝试——请求在池级熔断那一步就被拒了。
+        「缓存」与「缓存写入」是两半：前者是从缓存取回多少，后者是让上游写进去多少；
+        两半不相加、不互为分母。命中为 0 时它们分开两种成因——写了 0、读了 0 是压根
+        没让上游缓存任何东西；写了 N、读了 0 是标记送到了但前缀每发都在变。没量过的
+        那一半印「还没进账」或「这家不报」，不印 0：0 是「上游说它没写」，是结论。
       </p>
       {spenders.length < groups.length && (
         <p className="text-[11px] text-[var(--muted)]">
@@ -286,6 +311,7 @@ const W = {
   input: '7rem',
   output: '7rem',
   cached: '7rem',
+  write: '7.5rem',
   rate: '7.5rem',
   per: '7rem',
   latency: '5.5rem',

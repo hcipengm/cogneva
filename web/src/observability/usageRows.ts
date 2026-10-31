@@ -133,6 +133,82 @@ export function styleCells(
   return byStyle;
 }
 
+/**
+ * 缓存写入这一半：三种状态，不是三个数。
+ *
+ * 命中为 0 有两种成因，修法相反——压根没让上游缓存任何东西（标记没送出去），
+ * 与标记送到了但前缀每发都在变。分开它们的只有这一列，所以这一列**缺读数时
+ * 不许印 0**：0 是一个结论（「上游说它没写」），「没量过」是另一个答案
+ * （OpenAI 兼容面与 Responses 面根本不报；旧镜像里连这一列都没有）。
+ *
+ * 聚合规则跟着网关走：组里只要有一行没报，整条线就是 `null`。把报了的那几行
+ * 加起来会得到一个像模像样的数，而它只盖住了这一组的一半，屏上没有任何东西
+ * 能把「残的」与「全的」分开。
+ */
+/** 组里只要有一行没报，整条线就是 `null`；全都报了才是那几行的和。 */
+export function cacheWrite(
+  rows: { api_style: string; tokens_cache_created?: number | null }[]
+): number | null {
+  if (rows.length === 0) return null;
+  let total = 0;
+  for (const row of rows) {
+    const value = row.tokens_cache_created;
+    // 这里是 `=== null || === undefined`，不是 `?? 0`：`?? 0` 会把「没量到」压成
+    // 一个量到的零，而那正是这一列要分开的两件事。
+    if (value === null || value === undefined) return null;
+    total += value;
+  }
+  return total;
+}
+
+/**
+ * 这一半为什么没有数。三种「没有」的下一步完全不同，所以不能合成一句话：
+ * - `absent`：整键都不在（这一版网关还没有这一列）——去升级镜像；
+ * - `foreign`：这家协议根本不报这门读数（OpenAI 兼容面与 Responses 面）——没有可修的；
+ * - `unreported`：该报的行这一窗没报——这一窗的读数只能当缺。
+ */
+function writeState(
+  rows: { api_style: string; tokens_cache_created?: number | null }[]
+): 'absent' | 'foreign' | 'unreported' {
+  if (rows.length > 0 && rows.every((row) => row.tokens_cache_created === undefined)) {
+    return 'absent';
+  }
+  if (rows.length > 0 && rows.every((row) => row.api_style !== 'anthropic')) {
+    return 'foreign';
+  }
+  return 'unreported';
+}
+
+/** 缓存写入那一格写什么。缺读数时印的是「为什么没有」，绝不是 0。 */
+export function cacheWriteValue(
+  rows: { api_style: string; tokens_cache_created?: number | null }[]
+): string {
+  const tokens = cacheWrite(rows);
+  if (tokens !== null) return tokens.toLocaleString();
+  const state = writeState(rows);
+  if (state === 'absent') return '还没进账';
+  if (state === 'foreign') return '这家不报';
+  return '没报';
+}
+
+/** 缓存写入那一格的来路：三态各有一句话，只有量到的那一态才印数字。 */
+export function cacheWriteNote(
+  rows: { api_style: string; tokens_cache_created?: number | null }[]
+): string {
+  const tokens = cacheWrite(rows);
+  if (tokens !== null) {
+    return `上游报的缓存写入量（cache_creation_input_tokens）= ${tokens.toLocaleString()}；这一半与「缓存」那一列的读回量不相加、不互为分母。`;
+  }
+  const state = writeState(rows);
+  if (state === 'absent') {
+    return '这一半还没进账（现网镜像还没有这一列）：字段缺席是「没量过」，不是「写了 0」。';
+  }
+  if (state === 'foreign') {
+    return '这家不报缓存写入这一半：OpenAI 兼容面与 Responses 面根本不发这门读数，这里的「没有」不是量到 0。';
+  }
+  return '这一组有一只上游这一窗没报缓存写入，整条线因此不印数——把报了的几行加起来会得到一个只盖住半张窗的数。';
+}
+
 /** 一份占一份的百分比；整份为零时没有比例可说。 */
 export function percent(part: number, whole: number): string {
   if (whole <= 0) return '—';

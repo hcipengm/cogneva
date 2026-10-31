@@ -168,11 +168,31 @@ export function actorTotals(actors: unknown[]): unknown[] {
 export function cacheFormula(style: string, input: number, cached: number): string {
   return `${style} ${input} ${cached}`;
 }
+export function cacheWrite(rows: any[]): number | null {
+  if (rows.length === 0) return null;
+  let total = 0;
+  for (const row of rows) {
+    const value = row.tokens_cache_created;
+    if (value === null || value === undefined) return null;
+    total += value;
+  }
+  return total;
+}
+export function cacheWriteValue(rows: any[]): string {
+  const tokens = cacheWrite(rows);
+  if (tokens !== null) return tokens.toLocaleString();
+  return rows.every((row: any) => row.api_style !== 'anthropic') ? '这家不报' : '还没进账';
+}
+export function cacheWriteNote(rows: any[]): string {
+  return cacheWrite(rows) === null
+    ? '这一半还没进账（现网镜像还没有这一列）'
+    : '上游报的缓存写入量';
+}
 EOF
   # 两级表：一张表、两级行、列宽一处定义、失败格无条件出现。
   cat >"${work}/web/src/overlay/ActorTable.tsx" <<'EOF'
 import { Fragment } from 'react';
-import { actorTotals, cacheFormula } from '@/observability/usageRows';
+import { actorTotals, cacheFormula, cacheWriteNote, cacheWriteValue } from '@/observability/usageRows';
 import { Note } from '@/ui/Note';
 
 const W = {
@@ -214,6 +234,7 @@ export function ActorTable({ actors }: { actors: any[] }) {
             <th style={{ width: W.input }}>输入</th>
             <th style={{ width: W.output }}>输出</th>
             <th style={{ width: W.cached }}>缓存</th>
+            <th style={{ width: W.rate }}>缓存写入</th>
             <th style={{ width: W.rate }}>缓存占比</th>
             <th style={{ width: W.per }}>每调用输入</th>
             <th style={{ width: W.latency }}>均耗</th>
@@ -226,6 +247,9 @@ export function ActorTable({ actors }: { actors: any[] }) {
                 <td>{group.actor}</td>
                 <td>{group.calls}</td>
                 <td>{group.failed}</td>
+                <td>
+                  <Note text={cacheWriteNote(group.rows)}>{cacheWriteValue(group.rows)}</Note>
+                </td>
                 <td>
                   {group.styles.length === 1 ? (
                     <Note text={cacheFormula(group.styles[0], group.input, group.cached)}>{group.cached}</Note>
@@ -250,7 +274,7 @@ export function ActorTable({ actors }: { actors: any[] }) {
           {absent.map((name) => (
             <tr key={name}>
               <td>{name}</td>
-              <td colSpan={9}>本窗口没有调用</td>
+              <td colSpan={10}>本窗口没有调用</td>
             </tr>
           ))}
         </tbody>
@@ -632,6 +656,29 @@ sed -i '/不能相加/d' "${work}/web/src/overlay/TokenPanel.tsx"
 grep -qF "不能相加" "${work}/web/src/overlay/TokenPanel.tsx" && fail "改动没落到 TokenPanel.tsx：不能相加 还在"
 confirm "${work}/web/src/overlay/TokenPanel.tsx" "<h3>零花销</h3>"
 expect_red "没写不能相加" "没有写清三段的单位不同"
+
+# 33. 缓存写入那一半不再印：命中为 0 的两种成因（压根没让上游写 / 前缀每发都变）
+#     从此只有一种读得出来，而它们的修法相反。
+fixture
+sed -i 's/<Note text={cacheWriteNote(group.rows)}>{cacheWriteValue(group.rows)}<\/Note>/—/' \
+  "${work}/web/src/overlay/ActorTable.tsx"
+confirm "${work}/web/src/overlay/ActorTable.tsx" "—"
+expect_red "没印缓存写入" "没有哪一屏印出缓存写入那一半"
+
+# 34. 调用点把缺读数补成 0：屏上再也分不开「上游说它没写」与「没量过」。
+fixture
+sed -i 's|<Note text={cacheWriteNote(group.rows)}>|<Note text={String(group.rows[0]?.tokens_cache_created ?? 0)}>|' \
+  "${work}/web/src/overlay/ActorTable.tsx"
+confirm "${work}/web/src/overlay/ActorTable.tsx" "tokens_cache_created ?? 0"
+expect_red "调用点补零" "补成了 0"
+
+# 35. 聚合那一层把「没量到」判成了 0：组里有一行没报时，它会把报了的几行加起来，
+#     得到一个像模像样、却只盖住半张窗的数。
+fixture
+sed -i 's/    if (value === null || value === undefined) return null;/    total += value ?? 0;/' \
+  "${work}/web/src/observability/usageRows.ts"
+confirm "${work}/web/src/observability/usageRows.ts" "total += value ?? 0;"
+expect_red "聚合层补零" "cacheWrite() 没有把「没量到」判成 null"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0

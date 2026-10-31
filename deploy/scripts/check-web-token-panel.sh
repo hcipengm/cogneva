@@ -698,6 +698,66 @@ else:
         if zero and "不能相加" in src and not any(at < zero.start() for at in legs):
             summary.append(f"零花销: {rel} 三条腿并成一节，并写明单位不同")
 
+# ── 13. 缓存的两半 ──
+# 命中为 0 有两种成因，修法相反：压根没让上游缓存任何东西（标记没送出去，或这家
+# 不收），与标记送到了但前缀每发都在变。分开它们的只有「写进去多少」这一列，
+# 而这一列是三态——没量过（`null`／键缺席）、量到的 0、写了 N。判两件：那一格
+# 印得出来，且**缺读数不许被压成 0**（`?? 0` 会把「没量到」说成一个结论，这正是
+# 这一列要分开的两件事）。
+write_defs = [
+    rel
+    for rel in sorted(graph)
+    if re.search(r"export\s+function\s+cacheWriteValue\s*\(", read(rel))
+]
+# 印它的是**调用点**：定义那个函数自己的文件里当然有这两个名字，把它算成消费者
+# 就是「谁 import 了谁就算读了」——那一屏可以整块消失而这一段照样绿。
+write_cells = [
+    rel
+    for rel in sorted(graph)
+    if rel not in write_defs
+    and "cacheWriteValue(" in read(rel)
+    and "cacheWriteNote(" in read(rel)
+]
+if not write_cells:
+    problems.append(
+        "没有哪一屏印出缓存写入那一半（`cacheWriteValue` 没有调用点）："
+        "命中为 0 的两种成因从此只有一种读得出来"
+    )
+else:
+    summary.append("缓存写入: " + ", ".join(write_cells))
+
+# 聚合那一层必须真的按三态分，而不是把缺读数当 0。
+if not write_defs:
+    problems.append(
+        "找不到 cacheWrite()：缓存写入那一半的聚合没有单一声明，"
+        "「组里有一行没报就是没量过」这条规则没有地方可判"
+    )
+else:
+    body = re.search(r"export\s+function\s+cacheWrite\s*\(.*?\n\}", read(write_defs[0]), re.S)
+    text = body.group(0) if body else ""
+    if "=== null" not in text or "=== undefined" not in text or "return null" not in text:
+        problems.append(
+            f"{write_defs[0]}: cacheWrite() 没有把「没量到」判成 null——"
+            "把缺读数当 0，等于把「没量过」说成「上游说它写了 0」"
+        )
+    if re.search(r"tokens_cache_created\s*\?\?", text):
+        problems.append(
+            f"{write_defs[0]}: cacheWrite() 用 `?? 0` 把缺读数补成了零——"
+            "那正是这一列要分开的两件事"
+        )
+
+# 整棵树上都不许把这一格 `?? 0`：一处补零，那一处的读数就永远读不出「没量过」。
+coerced = [
+    rel
+    for rel in sorted(graph)
+    if re.search(r"tokens_cache_created\s*\?\?", read(rel))
+]
+if coerced:
+    problems.append(
+        "把 tokens_cache_created 补成了 0（" + ", ".join(coerced) + "）——"
+        "缺读数与量到 0 是两件事，补零之后屏上再也分不开"
+    )
+
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
 

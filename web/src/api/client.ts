@@ -603,6 +603,24 @@ export interface ActorUsage {
   tokens_input: number;
   tokens_output: number;
   tokens_cached: number;
+  /**
+   * 这一次调用让上游**写进**缓存多少输入（Anthropic 的 `cache_creation_input_tokens`）。
+   *
+   * 与 `tokens_cached`（从缓存**取回**多少）是两半：不相加，也不互为分母。它答的是
+   * 命中为 0 的两种成因，而这两种的修法相反——写了 0、读了 0 是请求压根没让上游
+   * 缓存任何东西；写了 N、读了 0 是标记送到了，但前缀每发都在变。
+   *
+   * 三态，读法各不相同：
+   * - `null`／键整个缺席 = 这一半没量过（OpenAI 兼容面与 Responses 面根本不报这门
+   *   读数；镜像还没有这一列时整键不在）；
+   * - `0` = 上游明确说这一窗没写；
+   * - `N` = 写了 N。
+   *
+   * 缺读数印成 0，就是把「没量到」说成一个结论。聚合面上这一格是**整条线**的口径：
+   * 组里只要有一行没报，它就是 `null`，不是把报了的那几行加起来——加起来会得到
+   * 一个像模像样的数，而它只盖住了这一组的一半。
+   */
+  tokens_cache_created?: number | null;
   /** 覆盖到的调用按次数加权的平均墙钟耗时 */
   avg_latency_ms: number;
 }
@@ -651,6 +669,24 @@ export interface WindowSpend {
   tokens_input: number;
   tokens_output: number;
   tokens_cached: number;
+  /**
+   * 这一次调用让上游**写进**缓存多少输入（Anthropic 的 `cache_creation_input_tokens`）。
+   *
+   * 与 `tokens_cached`（从缓存**取回**多少）是两半：不相加，也不互为分母。它答的是
+   * 命中为 0 的两种成因，而这两种的修法相反——写了 0、读了 0 是请求压根没让上游
+   * 缓存任何东西；写了 N、读了 0 是标记送到了，但前缀每发都在变。
+   *
+   * 三态，读法各不相同：
+   * - `null`／键整个缺席 = 这一半没量过（OpenAI 兼容面与 Responses 面根本不报这门
+   *   读数；镜像还没有这一列时整键不在）；
+   * - `0` = 上游明确说这一窗没写；
+   * - `N` = 写了 N。
+   *
+   * 缺读数印成 0，就是把「没量到」说成一个结论。聚合面上这一格是**整条线**的口径：
+   * 组里只要有一行没报，它就是 `null`，不是把报了的那几行加起来——加起来会得到
+   * 一个像模像样的数，而它只盖住了这一组的一半。
+   */
+  tokens_cache_created?: number | null;
 }
 
 /** 按窗口分行的折叠账，连同它覆盖到的区间（同 `TokenUsage` 的端点语义）。 */
