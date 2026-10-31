@@ -1216,6 +1216,20 @@ data:
                   "face": "任务管理"
                 },
                 {
+                  "name": "face_remediation_could_not_be_submitted",
+                  "dormancy": {
+                    "reason": "lazy_counter",
+                    "why": "只在动作规划器**拒收**修复目标时计数（cog-orchestrator/src/face_drift.rs 的 Err 支）；24 小时里一次都没被拒，这条序列就不存在，而「没被拒」与「没创建」在这种计数器上同形。"
+                  },
+                  "promql": "max(increase(cogneva_face_drift_dispatch_failures_total[1h])) > 6",
+                  "condition": {
+                    "greater_than": 6.0
+                  },
+                  "severity": "warning",
+                  "summary": "这一小时内，红着的面有 {value} 次没能把修复目标交给动作规划器。漂移读数在两件事上同形：面红着、修复已在队列里被人做，与面红着、连一个修的人都没被叫到——两种都只印一个红。差别只在这一格。漂移循环每 120 秒重试一次，交出去的那一次不进计数，所以 6 次大约是一刻钟的连续拒收，越过一次重启或一次抖动该解释的范围；再往上就是规划器一直没收单子，而同一时刻所有派发点都会一起哑。先查编排侧——规划器没有在岗的成员、负责拆解的上游不可达、或者存储拒写——不要先去查那个面本身",
+                  "face": "任务管理"
+                },
+                {
                   "name": "observability_stack_drift_not_repaired",
                   "promql": "(min_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m]) > 0) and (count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[1h:1m]) > count_over_time((max without (pod, container, instance) (cogneva_observability_drift_lines))[30m:1m]))",
                   "condition": {

@@ -900,6 +900,13 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_governance_face_state",
         "crates/cog-orchestrator/src/face_drift.rs",
     ),
+    // A red face whose remedy the action planner refused. The drift reading
+    // says red either way, so this is the only cell that separates "the fix
+    // is queued" from "nobody could be asked to fix it".
+    (
+        "cogneva_face_drift_dispatch_failures_total",
+        "crates/cog-orchestrator/src/face_drift.rs",
+    ),
     // The observability stack's half of the same pair. Its manifests have one
     // delivery path -- the install script -- so once installed, the repository
     // and the cluster each go their own way, and the convergence loop that

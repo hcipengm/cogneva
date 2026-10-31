@@ -1050,6 +1050,7 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                     store.clone(),
                     agents.clone(),
                     ctx.consume_service::<dyn cog_core::OrchestratorControl>(),
+                    ctx.consume_service::<dyn cog_core::MetricsBackend>(),
                     ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
                     ctx.config().dag_executor.workspace_id.clone(),
                     face_shutdown,

@@ -1292,6 +1292,17 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the ring is too small for the rate the gate produces at, or the \
          carrying loop has stopped.",
     ),
+    (
+        crate::metric_names::FACE_DRIFT_DISPATCH_FAILURES_TOTAL.as_str(),
+        "Remediation goals for red faces that the action planner refused, \
+         counted since the producing process started and accumulated by the \
+         store across restarts. A red face with a queued remedy and a red face \
+         nobody could queue one for are the same row on every other reading -- \
+         both say red -- so this is where the difference lives. The drift pass \
+         re-submits every two minutes: an isolated increase is the planner \
+         being briefly unavailable, a sustained one means that face is red for \
+         want of a queue entry rather than for want of a fix.",
+    ),
 ];
 
 /// Descriptions for the histogram series. See [`COUNTER_HELP`].

@@ -37,8 +37,8 @@ use tracing::{info, warn};
 
 use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragment};
 use cog_core::{
-    AgentRegistry, DriftState, Face, FaceDriftReading, GovernanceStore, Handover, HandoverState,
-    OrchestratorControl, OwnerSource, SFResult, Task,
+    metric_names, AgentRegistry, DriftState, Face, FaceDriftReading, GovernanceStore, Handover,
+    HandoverState, MetricsBackend, OrchestratorControl, OwnerSource, SFResult, Task,
 };
 
 /// The loop's name in the health registry.
@@ -427,6 +427,7 @@ async fn ensure_duty_rows(
 async fn dispatch_red_faces(
     readings: &[FaceDriftReading],
     orchestrator: &dyn OrchestratorControl,
+    metrics: Option<&Arc<dyn MetricsBackend>>,
     now: DateTime<Utc>,
 ) {
     let day = now.format(cog_core::DAY_KEY_FORMAT).to_string();
@@ -452,12 +453,35 @@ async fn dispatch_red_faces(
                     "face remediation handed to the action planner"
                 );
             }
-            Err(e) => warn!(
-                face = %reading.face_id,
-                state = reading.state.as_str(),
-                error = %e,
-                "face remediation could not be submitted; the reading still reports the face red"
-            ),
+            Err(e) => {
+                warn!(
+                    face = %reading.face_id,
+                    state = reading.state.as_str(),
+                    error = %e,
+                    "face remediation could not be submitted; the reading still reports the face red"
+                );
+                // The face stays red either way, so the reading cannot tell a
+                // refusal from work in flight. This is the cell that can, and
+                // the next pass retries in two minutes -- a refusal that
+                // outlives one pass shows up as a rate.
+                if let Some(metrics) = metrics {
+                    if let Err(not_counted) = metrics
+                        .record_counter(
+                            metric_names::FACE_DRIFT_DISPATCH_FAILURES_TOTAL,
+                            1.0,
+                            std::collections::HashMap::new(),
+                        )
+                        .await
+                    {
+                        warn!(
+                            face = %reading.face_id,
+                            error = %not_counted,
+                            "the refusal was not counted; this face's remedy may never be \
+                             queued and now nothing outside the log says so"
+                        );
+                    }
+                }
+            }
         }
     }
 }
@@ -472,6 +496,7 @@ pub fn spawn_face_drift_loop(
     store: Arc<dyn GovernanceStore>,
     agents: Option<Arc<dyn AgentRegistry>>,
     orchestrator: Option<Arc<dyn OrchestratorControl>>,
+    metrics: Option<Arc<dyn MetricsBackend>>,
     role: Option<Arc<dyn cog_core::OwnerLeaseBroker>>,
     workspace: String,
     shutdown: cog_core::ShutdownSignal,
@@ -492,6 +517,7 @@ pub fn spawn_face_drift_loop(
             let store = store.clone();
             let agents = agents.clone();
             let orchestrator = orchestrator.clone();
+            let metrics = metrics.clone();
             let role = role.clone();
             let workspace = workspace.clone();
             let shutdown = shutdown.clone();
@@ -631,7 +657,7 @@ pub fn spawn_face_drift_loop(
                         }
                     }
                     if let Some(ref orchestrator) = orchestrator {
-                        dispatch_red_faces(&readings, &**orchestrator, now).await;
+                        dispatch_red_faces(&readings, &**orchestrator, metrics.as_ref(), now).await;
                     }
                 }
             }
@@ -1135,5 +1161,164 @@ mod tests {
         let faces = vec![owned("通信", Some("f5"), Some("worker/-"))];
         let moves = vec![mov("通信", "operator", HandoverState::Applied)];
         assert_eq!(owners_no_act_explains(&faces, &moves).len(), 1);
+    }
+
+    /// Refusals the reading cannot show.
+    ///
+    /// A red face whose remedy was queued and a red face whose remedy could
+    /// not be submitted are the same row on the drift reading: both say red.
+    /// The difference is only in this counter, so the arm that submits has to
+    /// write it -- a `warn!` alone leaves the two indistinguishable for as
+    /// long as the planner stays shut.
+    struct MockPlanner {
+        refuse: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl OrchestratorControl for MockPlanner {
+        async fn submit_goal(&self, _goal: &str, _tasks: Vec<Task>) -> SFResult<()> {
+            Ok(())
+        }
+        async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+            if self.refuse {
+                return Err(cog_core::SFError::Agent(
+                    "the action planner is not taking goals".into(),
+                ));
+            }
+            Ok(tasks.iter().map(|task| task.id.clone()).collect())
+        }
+        async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn add_task(&self, _task: Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
+            false
+        }
+        async fn crew_retry_all(&self, _task_ids: &[String]) -> usize {
+            0
+        }
+        async fn get_ready_tasks(&self) -> Vec<Task> {
+            Vec::new()
+        }
+        async fn get_all_tasks(&self) -> Vec<Task> {
+            Vec::new()
+        }
+        async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn retry_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn dlq_len(&self) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn start_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn complete_task(
+            &self,
+            _task_id: &str,
+            _result: serde_json::Value,
+        ) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn fail_task(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::contract::llm::UpstreamFailure>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn fail_task_after(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::contract::llm::UpstreamFailure>,
+            _retry_after_secs: Option<u64>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn cancel_task(&self, _task_id: &str) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_task(&self, _task_id: &str) -> Option<Task> {
+            None
+        }
+        async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            Vec::new()
+        }
+        async fn get_dependents(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_dependencies(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
+            (Vec::new(), Vec::new())
+        }
+        async fn delete_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn all_completed(&self) -> bool {
+            false
+        }
+        async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_remedy_the_planner_refused_is_counted_where_the_reading_cannot_see_it() {
+        let metrics: Arc<dyn MetricsBackend> =
+            Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let readings = vec![reading(Some("unit-7"))];
+        assert!(readings[0].state.is_red(), "前提：这一条会被派发");
+
+        dispatch_red_faces(
+            &readings,
+            &MockPlanner { refuse: true },
+            Some(&metrics),
+            Utc::now(),
+        )
+        .await;
+
+        let totals = metrics
+            .query_counter_totals(metric_names::FACE_DRIFT_DISPATCH_FAILURES_TOTAL.as_str())
+            .await
+            .expect("the memory backend answers");
+        let counted: f64 = totals.iter().map(|s| s.value).sum();
+        assert_eq!(
+            counted, 1.0,
+            "被拒的那一次要在读数之外有一格：只留一条 warn，眼睛看到的红脸与「已经在修」同形"
+        );
+    }
+
+    /// The other half: a submission that landed is not a failure. Without this
+    /// the counter above would pass just as well if every pass wrote 1.
+    #[tokio::test]
+    async fn a_remedy_the_planner_took_is_not_counted() {
+        let metrics: Arc<dyn MetricsBackend> =
+            Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let readings = vec![reading(Some("unit-7"))];
+        dispatch_red_faces(
+            &readings,
+            &MockPlanner { refuse: false },
+            Some(&metrics),
+            Utc::now(),
+        )
+        .await;
+
+        let totals = metrics
+            .query_counter_totals(metric_names::FACE_DRIFT_DISPATCH_FAILURES_TOTAL.as_str())
+            .await
+            .expect("the memory backend answers");
+        let counted: f64 = totals.iter().map(|s| s.value).sum();
+        assert_eq!(counted, 0.0, "交出去的那一次不是被拒");
     }
 }

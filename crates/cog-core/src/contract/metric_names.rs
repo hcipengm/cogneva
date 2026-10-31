@@ -2058,6 +2058,22 @@ metric_names! {
     RESOURCE_EVENTS_PENDING => "cogneva_resource_events_pending",
     RESOURCE_EVENTS_OLDEST_UNFOLDED_AGE_SECONDS => "cogneva_resource_events_oldest_unfolded_age_seconds",
     RESOURCE_EVENTS_DROPPED_TOTAL => "cogneva_resource_events_dropped_total",
+
+    // A red face whose remediation goal the action planner refused.
+    //
+    // Face drift has no dispatch of its own: the remedy for a red face is a
+    // goal submitted through the planner, so a submission that never lands
+    // leaves the face exactly as red as it was and nothing else changes. The
+    // drift reading keeps saying red, which is true and says nothing about
+    // why -- "the fix is queued and being worked" and "the fixer could not
+    // even be asked" are the same row. Measured 2026-10-31: the arm held a
+    // `warn!` and nothing else.
+    //
+    // No labels: one writer, one face per submission, and the face name is
+    // already on the log line. A counter rather than a gauge because the fact
+    // is an event; the pass re-submits every two minutes, so a sustained
+    // refusal shows up as a rising rate rather than as a state to be sampled.
+    FACE_DRIFT_DISPATCH_FAILURES_TOTAL => "cogneva_face_drift_dispatch_failures_total",
 }
 
 /// Whether `name` is a series a build can still write.
