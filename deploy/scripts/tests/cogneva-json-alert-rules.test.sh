@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: feedback_a_join_keeps_every_label_nobody_named
 # 进程内那一库规则（部署配置里的 `observability.infra_watch.rules`）的「会不会响」夹具
 # **自己**能不能红。
 #
