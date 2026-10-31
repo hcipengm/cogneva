@@ -1035,6 +1035,17 @@ data:
                   "face": "持久化存储"
                 },
                 {
+                  "name": "volume_capacity_expansion_orphaned",
+                  "promql": "max by (persistentvolumeclaim, storage_class) (increase(cogneva_volume_capacity_outcome_total{outcome=\"orphaned\"}[2h]))",
+                  "condition": {
+                    "greater_than": 0.0
+                  },
+                  "for_seconds": 600,
+                  "severity": "warning",
+                  "summary": "Claim {persistentvolumeclaim} asks for more than it was given, and nothing in the cluster has announced itself as working on it: the loop that raises declarations counted {value} orphaned rounds in the last two hours. The evidence is the claim's own status -- no `Resizing` and no `FileSystemResizePending` condition for an hour of those rounds -- because those conditions are written by the resizer, so their absence after an hour is what says there is none. The class named on this series ({{storage_class}}) is the object to read: `allowVolumeExpansion: true` there is a promise, and a promise with no implementer is why the size never arrives. On this installation it is `local-path`, which neither moves data nor grows the directory it serves, so the request will never be carried out however long it stands. Two different repairs, and the reading picks between them: a class that cannot expand at all needs the claim re-provisioned at the size it declares, while a class that should be able to needs its resizer looked at. Until one of them happens the node's free space, not this number, is what bounds the volume -- which is also why this is not read as an emergency: the bytes are held, and what is wrong is the declaration that says how many.",
+                  "face": "持久化存储"
+                },
+                {
                   "name": "volume_capacity_expansion_never_completes",
                   "promql": "(min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]) > 0) and (max_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]) == min_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m])) and (count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[12h:1m]) > count_over_time((max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"declared\"}) - on (persistentvolumeclaim) max by (persistentvolumeclaim) (cogneva_volume_capacity_bytes{state=\"granted\"}))[6h:1m]))",
                   "condition": {

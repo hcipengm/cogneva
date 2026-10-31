@@ -24,6 +24,7 @@ rule_files:
 # rule: volume_capacity_clamped_by_admission
 # rule: volume_capacity_resize_refused
 # rule: volume_capacity_expansion_never_completes
+# rule: volume_capacity_expansion_orphaned
 # rule: volume_declared_ahead_of_granted
 # rule: volume_holds_more_than_the_storage_granted
 # rule: volume_capacity_cannot_measure
@@ -51,6 +52,8 @@ tests:
       - series: 'cogneva_volume_capacity_outcome_total{outcome="refused"}'
         values: '0x156'
       - series: 'cogneva_volume_capacity_outcome_total{outcome="unmeasured"}'
+        values: '0x156'
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="orphaned",persistentvolumeclaim="data",storage_class="local-path"}'
         values: '0x156'
       - series: 'cogneva_volume_capacity_bytes{persistentvolumeclaim="data",state="declared"}'
         values: '100x156'
@@ -87,6 +90,9 @@ tests:
         exp_alerts: []
       - eval_time: 13h
         alertname: volume_capacity_expansion_never_completes
+        exp_alerts: []
+      - eval_time: 13h
+        alertname: volume_capacity_expansion_orphaned
         exp_alerts: []
       - eval_time: 13h
         alertname: volume_declared_ahead_of_granted
@@ -183,6 +189,45 @@ tests:
           - exp_labels:
               severity: warning
               persistentvolumeclaim: data
+
+  # 声明 21Gi、授予 20Gi，而循环每拍都判「没人应答」（orphaned 每拍 +1）：扩容被孤立了。
+  # 这一格的标签就是该动的那一个对象——卷名与存储类都在告警上，不用去比对象。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="orphaned",persistentvolumeclaim="cogneva-evolution-pvc",storage_class="local-path"}'
+        values: '0x150 1x6'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_capacity_expansion_orphaned
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              persistentvolumeclaim: cogneva-evolution-pvc
+              storage_class: local-path
+
+  # 同一条卷、同样的差值，但循环判的是 `expanding` 而不是 `orphaned`（集群里有
+  # 控制器在扩）：孤立那条必须静。删掉规则里 `outcome="orphaned"` 这个筛选，这一格会响。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="expanding",persistentvolumeclaim="cogneva-evolution-pvc",storage_class="local-path"}'
+        values: '0x150 1x6'
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="orphaned",persistentvolumeclaim="cogneva-evolution-pvc",storage_class="local-path"}'
+        values: '0x156'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_capacity_expansion_orphaned
+        exp_alerts: []
+
+  # 孤立只出现在最后一拍：计数确实在涨，但还没涨满十分钟的保持期，这一刻不该响。
+  # 删掉 `for_seconds`，这一格会响。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="orphaned",persistentvolumeclaim="cogneva-evolution-pvc",storage_class="local-path"}'
+        values: '0x155 1x1'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_capacity_expansion_orphaned
+        exp_alerts: []
 
   # 声明在第六小时里从 200 长到 250、授予还是 100：差值一直大于零，但**不再恒定**。
   # `declared_ahead_of_granted` 亮，而 `expansion_never_completes` 静——它在等一个稳定的

@@ -104,6 +104,9 @@ pub const BOUND_QUOTA: &str = "quota";
 /// The label naming what became of a claim this round.
 pub const OUTCOME_LABEL: &str = crate::LABEL_OUTCOME;
 
+/// The label naming the class a claim binds to, when it names one itself.
+pub const STORAGE_CLASS_LABEL: &str = crate::LABEL_STORAGE_CLASS;
+
 /// The request already covers the peak with its headroom; nothing was written.
 pub const OUTCOME_AT_TARGET: &str = "at_target";
 
@@ -124,6 +127,20 @@ pub const OUTCOME_REFUSED: &str = "refused";
 /// expansion is already in flight and a second one would be refused.
 pub const OUTCOME_EXPANDING: &str = "expanding";
 
+/// The claim announces more than it has been given, and nothing in the cluster
+/// is working on it.
+///
+/// Separate from [`OUTCOME_EXPANDING`] because the two are the same pair of
+/// numbers and opposite facts. An expansion in flight is a size that arrives;
+/// a declaration ahead of a capacity that has stopped moving, with no resize
+/// condition on the claim, is a promise nothing will keep -- the StorageClass
+/// may declare `allowVolumeExpansion` and have no resizer answering it, which
+/// is what `local-path` does on this installation. The request is the number
+/// most size readings divide by, so while the two are apart every one of those
+/// readings is diluted by a size the volume does not have; naming the difference
+/// is what stops that from being read as "the volume has room".
+pub const OUTCOME_ORPHANED: &str = "orphaned";
+
 /// Nothing could be measured this round: the walk failed or the claim could not
 /// be read. Distinct from `at_target`, which is a measurement that agreed.
 pub const OUTCOME_UNMEASURED: &str = "unmeasured";
@@ -135,6 +152,7 @@ pub const OUTCOMES: &[&str] = &[
     OUTCOME_CLAMPED,
     OUTCOME_REFUSED,
     OUTCOME_EXPANDING,
+    OUTCOME_ORPHANED,
     OUTCOME_UNMEASURED,
 ];
 
@@ -146,6 +164,7 @@ pub enum CapacityOutcome {
     Clamped,
     Refused,
     Expanding,
+    Orphaned,
     Unmeasured,
 }
 
@@ -157,6 +176,7 @@ impl CapacityOutcome {
             Self::Clamped => OUTCOME_CLAMPED,
             Self::Refused => OUTCOME_REFUSED,
             Self::Expanding => OUTCOME_EXPANDING,
+            Self::Orphaned => OUTCOME_ORPHANED,
             Self::Unmeasured => OUTCOME_UNMEASURED,
         }
     }
@@ -168,7 +188,8 @@ impl CapacityOutcome {
             Self::Clamped => 2,
             Self::Refused => 3,
             Self::Expanding => 4,
-            Self::Unmeasured => 5,
+            Self::Orphaned => 5,
+            Self::Unmeasured => 6,
         }
     }
 }
@@ -202,6 +223,25 @@ pub const MIN_INTERVAL_SECS: u64 = 300;
 // cap: bound — API 拒绝通常是 StorageClass 的属性，再问一遍不会变
 pub const REFUSAL_COOLDOWN_SECS: u64 = 3600;
 
+/// How long a claim may announce more than it has been given, with no resize
+/// condition on it, before the shortfall is called orphaned.
+///
+/// A resizer that is working adds a condition to the claim's status; how long
+/// it takes to appear is not something this loop can bound, so the threshold
+/// sits far out rather than close, and an hour is long enough that no resizer
+/// is merely slow to announce itself. Below it the claim still reads as
+/// [`OUTCOME_EXPANDING`], because a patch accepted a minute ago and never
+/// carried out is the ordinary state of an expansion that is about to happen.
+///
+/// It is seconds rather than rounds on purpose. The cadence is a knob
+/// (`COGNEVA_VOLUME_CAPACITY_INTERVAL_SECS`) and a count of rounds would make
+/// the bound move with it: the same six would be an hour at the default and
+/// half an hour at the floor, so a resizer that takes forty minutes would be
+/// called missing on a loop that merely decided more often. The fact being
+/// judged is how long nothing has answered, and that is time.
+// cap: bound — 一个钟头还没有任何 resize 条件，就不是「慢」而是「没人应答」
+pub const ORPHAN_AFTER_SECS: u64 = 3600;
+
 /// The size to request for a claim that peaked at `peak_bytes` and currently
 /// asks for `declared_bytes`, or `None` when the declaration already covers it.
 ///
@@ -219,6 +259,31 @@ pub fn growth_target(peak_bytes: u64, declared_bytes: u64) -> Option<u64> {
         Some(rounded)
     } else {
         None
+    }
+}
+
+/// What a claim that announces more than it has been given is doing this round.
+///
+/// The two numbers are the same in both branches; what separates them is
+/// whether anything in the cluster says it is working on the claim. A resize
+/// condition is written by the resizer, so its absence is not proof of
+/// inactivity on the first round -- the patch has to be observed, queued and
+/// picked up first. Hence the stamp: the shortfall is only called orphaned once
+/// it has outlived [`ORPHAN_AFTER_SECS`] without one.
+fn shortfall_outcome(
+    resizing: bool,
+    shortfall_since: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> CapacityOutcome {
+    if resizing {
+        *shortfall_since = None;
+        return CapacityOutcome::Expanding;
+    }
+    let since = *shortfall_since.get_or_insert(now);
+    if now.saturating_duration_since(since).as_secs() >= ORPHAN_AFTER_SECS {
+        CapacityOutcome::Orphaned
+    } else {
+        CapacityOutcome::Expanding
     }
 }
 
@@ -308,7 +373,25 @@ pub struct LiveClaim {
     /// What the volume has actually been given. Behind `declared` while an
     /// expansion is being carried out by whoever owns the StorageClass.
     pub capacity: u64,
+    /// The class the claim binds to, when it names one by hand. Missing means
+    /// the installation's default class, which is a fact about the cluster and
+    /// not something this claim's own object states.
+    pub class: Option<String>,
+    /// Whether the claim's status says a resize is under way. This is the one
+    /// signal that separates a shortfall someone is working on from one nobody
+    /// is: the resizer is what writes these conditions, so a claim that has
+    /// been ahead of its capacity for many rounds and carries neither has no
+    /// resizer answering it.
+    pub resizing: bool,
 }
+
+/// Condition types a controller sets while it is carrying out a resize.
+///
+/// `FileSystemResizePending` is the one the kubelet sets when the volume needs
+/// a filesystem grow; `Resizing` is the newer controller-side one. Either means
+/// something in the cluster is working on this claim, which is the whole of
+/// what this loop needs to tell the two kinds of shortfall apart.
+const RESIZE_CONDITIONS: &[&str] = &["FileSystemResizePending", "Resizing"];
 
 /// Read `kubectl get pvc <name> -o json` into the two sizes this loop needs.
 ///
@@ -344,10 +427,27 @@ pub fn parse_claim(json: &str) -> Result<LiveClaim, String> {
         Some(text) => quantity_bytes(text).unwrap_or(declared as f64) as u64,
         None => declared,
     };
+    let resizing = v
+        .pointer("/status/conditions")
+        .and_then(|c| c.as_array())
+        .is_some_and(|conditions| {
+            conditions.iter().any(|c| {
+                c.pointer("/type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| RESIZE_CONDITIONS.contains(&t))
+            })
+        });
+    let class = v
+        .pointer("/spec/storageClassName")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
     Ok(LiveClaim {
         name,
         declared,
         capacity,
+        class,
+        resizing,
     })
 }
 
@@ -484,6 +584,14 @@ struct ClaimState {
     declared: Option<u64>,
     /// What the storage side has given back, as the claim's status reports it.
     granted: Option<u64>,
+    /// The class the claim binds to, published beside the outcome so a reader
+    /// who has to change one object is told which. `None` is the default class,
+    /// which this claim's own object does not name.
+    class: Option<String>,
+    /// When this process first saw the claim announce more than it had been
+    /// given with no resize condition on it. Cleared the moment either stops
+    /// being true: the stamp is of one shortfall, not of the claim's whole life.
+    shortfall_since: Option<std::time::Instant>,
     /// The bound that stopped the last round, kept only while it is the current
     /// conclusion: a claim that grew or reached its target has no bound to name.
     ceiling: Option<Ceiling>,
@@ -501,6 +609,8 @@ impl ClaimState {
             peak: Vec::new(),
             declared: None,
             granted: None,
+            class: None,
+            shortfall_since: None,
             ceiling: None,
             refused_until: None,
             last_outcome: None,
@@ -546,6 +656,7 @@ pub struct VolumeCapacityReadings {
     declared: Mutex<HashMap<String, AtomicU64>>,
     peak: Mutex<HashMap<String, AtomicU64>>,
     granted: Mutex<HashMap<String, AtomicU64>>,
+    class: Mutex<HashMap<String, String>>,
     ceiling: Mutex<HashMap<String, Ceiling>>,
 }
 
@@ -580,6 +691,22 @@ impl VolumeCapacityReadings {
                 .lock()
                 .unwrap()
                 .insert(claim.to_string(), AtomicU64::new(value));
+        }
+    }
+
+    /// Publish which class the claim binds to, so the outcome rows carry the
+    /// object a reader would have to change rather than only the claim that is
+    /// affected. A claim naming no class is left without the label: the
+    /// installation's default is not a fact about this claim's own object.
+    pub fn observe_class(&self, claim: &str, class: Option<&str>) {
+        let mut table = self.class.lock().unwrap();
+        match class {
+            Some(class) => {
+                table.insert(claim.to_string(), class.to_string());
+            }
+            None => {
+                table.remove(claim);
+            }
         }
     }
 
@@ -626,12 +753,16 @@ impl Observable for VolumeCapacityReadings {
             let Some(slots) = counters.get(&claim) else {
                 continue;
             };
+            let class = self.class.lock().unwrap().get(&claim).cloned();
             for (i, name) in OUTCOMES.iter().enumerate() {
-                out.push(
+                let mut metric =
                     RawMetric::new(OUTCOME_METRIC, slots[i].load(Ordering::Relaxed) as f64)
                         .with_label(CLAIM_LABEL, claim.clone())
-                        .with_label(OUTCOME_LABEL, *name),
-                );
+                        .with_label(OUTCOME_LABEL, *name);
+                if let Some(class) = &class {
+                    metric = metric.with_label(STORAGE_CLASS_LABEL, class.clone());
+                }
+                out.push(metric);
             }
             drop(counters);
             for (state, table) in [
@@ -798,9 +929,10 @@ pub fn capacity_event(
             ResourceEventOutcome::Refused,
             format!("{SUBJECT_PREFIX}{}@api", target.claim),
         ),
-        CapacityOutcome::AtTarget | CapacityOutcome::Expanding | CapacityOutcome::Unmeasured => {
-            return None
-        }
+        CapacityOutcome::AtTarget
+        | CapacityOutcome::Expanding
+        | CapacityOutcome::Orphaned
+        | CapacityOutcome::Unmeasured => return None,
     };
     let as_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
     Some(ResourceEvent {
@@ -909,6 +1041,7 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
     };
     state.declared = Some(live.declared);
     state.granted = Some(live.capacity);
+    state.class = live.class.clone();
     // The bound is a conclusion about the round that just ended, so it is taken
     // back down here and set again only if this round is clamped. A claim that
     // stopped being clamped must not keep naming a wall it no longer stands at.
@@ -916,10 +1049,28 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
 
     // An expansion that has been asked for and not yet carried out: the request
     // is already ahead of the capacity, and a second patch while the class is
-    // still working would be refused by the API.
+    // still working would be refused by the API. Whether anything is working on
+    // it is the claim's own answer -- see [`shortfall_outcome`].
     if live.capacity < live.declared {
-        return state.quiet(CapacityOutcome::Expanding);
+        let outcome = shortfall_outcome(
+            live.resizing,
+            &mut state.shortfall_since,
+            std::time::Instant::now(),
+        );
+        if outcome == CapacityOutcome::Orphaned && state.last_outcome != Some(outcome) {
+            warn!(
+                claim = %target.claim,
+                class = state.class.as_deref().unwrap_or("(the installation's default class)"),
+                declared = live.declared,
+                granted = live.capacity,
+                "volume capacity: the claim asks for more than it was given and nothing in the \
+                 cluster is working on it; the class's allowVolumeExpansion is a promise with no \
+                 implementer here, so the declaration, not the volume, is what has to change"
+            );
+        }
+        return state.quiet(outcome);
     }
+    state.shortfall_since = None;
 
     let Some(wanted) = growth_target(peak, live.declared) else {
         return state.quiet(CapacityOutcome::AtTarget);
@@ -1111,6 +1262,7 @@ pub fn spawn_volume_capacity_loop(
                                 state.granted.unwrap_or(declared),
                             );
                         }
+                        readings.observe_class(&target.claim, state.class.as_deref());
                         readings.observe_ceiling(&target.claim, state.ceiling);
                         offer_cache_ceiling(
                             cache.as_deref(),
@@ -1138,6 +1290,27 @@ mod tests {
                 "spec":{{"resources":{{"requests":{{"storage":"{request}"}}}}}},
                 "status":{{"capacity":{{"storage":"{capacity}"}}}}}}"#
         )
+    }
+
+    /// A claim on a named class whose status carries `conditions` verbatim.
+    fn claim_json_with(
+        request: &str,
+        capacity: &str,
+        class: &str,
+        conditions: serde_json::Value,
+    ) -> String {
+        serde_json::json!({
+            "metadata": {"name": "cogneva-evolution-source-pvc"},
+            "spec": {
+                "storageClassName": class,
+                "resources": {"requests": {"storage": request}},
+            },
+            "status": {
+                "capacity": {"storage": capacity},
+                "conditions": conditions,
+            },
+        })
+        .to_string()
     }
 
     #[test]
@@ -1174,6 +1347,143 @@ mod tests {
         let live = parse_claim(unbound).unwrap();
         assert_eq!(live.declared, 10 * GIB);
         assert_eq!(live.capacity, 10 * GIB);
+    }
+
+    #[test]
+    fn a_claim_reads_the_class_it_binds_and_whether_a_resize_is_under_way() {
+        let quiet = parse_claim(&claim_json_with(
+            "21Gi",
+            "20Gi",
+            "local-path",
+            serde_json::json!([{"type": "Resizing", "status": "True"}]),
+        ))
+        .unwrap();
+        assert_eq!(quiet.class.as_deref(), Some("local-path"));
+        assert!(quiet.resizing);
+
+        let pending = parse_claim(&claim_json_with(
+            "21Gi",
+            "20Gi",
+            "standard",
+            serde_json::json!([{"type": "FileSystemResizePending", "status": "True"}]),
+        ))
+        .unwrap();
+        assert!(pending.resizing);
+
+        // The claim in the field: ahead of its capacity, and the status carries
+        // no conditions at all -- nothing has announced itself as working on it.
+        let orphan = parse_claim(&claim_json_with(
+            "21Gi",
+            "20Gi",
+            "local-path",
+            serde_json::Value::Null,
+        ))
+        .unwrap();
+        assert_eq!(orphan.class.as_deref(), Some("local-path"));
+        assert!(!orphan.resizing);
+
+        // A claim that names no class is not attributed to one here: the
+        // default is the installation's, not this claim's own answer.
+        let unnamed = parse_claim(&claim_json("21Gi", "20Gi")).unwrap();
+        assert_eq!(unnamed.class, None);
+    }
+
+    /// The field claim, round by round: an hour with nothing answering it is a
+    /// promise nobody keeps, and one round short of that is still an expansion
+    /// that may yet land. The rounds here are the default cadence; the bound is
+    /// the wall clock, so a loop that ticks faster reaches it at the same age.
+    #[test]
+    fn a_shortfall_nobody_answers_becomes_orphaned_only_after_the_bound() {
+        let start = std::time::Instant::now();
+        let mut since = None;
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let cadence = DEFAULT_INTERVAL_SECS;
+
+        assert_eq!(
+            shortfall_outcome(false, &mut since, at(0)),
+            CapacityOutcome::Expanding
+        );
+        let mut secs = cadence;
+        while secs < ORPHAN_AFTER_SECS {
+            assert_eq!(
+                shortfall_outcome(false, &mut since, at(secs)),
+                CapacityOutcome::Expanding,
+                "{secs}s is still inside the window a resizer may take"
+            );
+            secs += cadence;
+        }
+        assert_eq!(
+            shortfall_outcome(false, &mut since, at(ORPHAN_AFTER_SECS)),
+            CapacityOutcome::Orphaned
+        );
+
+        // The same claim judged by a loop that ticks at the floor: the round
+        // count doubles, the verdict does not move.
+        let mut since = None;
+        assert_eq!(
+            shortfall_outcome(false, &mut since, at(0)),
+            CapacityOutcome::Expanding
+        );
+        assert_eq!(
+            shortfall_outcome(false, &mut since, at(MIN_INTERVAL_SECS)),
+            CapacityOutcome::Expanding
+        );
+        assert_eq!(
+            shortfall_outcome(false, &mut since, at(ORPHAN_AFTER_SECS - 1)),
+            CapacityOutcome::Expanding,
+            "a second short of the bound is still an expansion"
+        );
+        assert_eq!(
+            shortfall_outcome(false, &mut since, at(ORPHAN_AFTER_SECS)),
+            CapacityOutcome::Orphaned
+        );
+
+        // A condition on the claim is the cluster saying it is on it, and it
+        // clears the stamp: the next quiet round starts the window again rather
+        // than reporting the old one.
+        assert_eq!(
+            shortfall_outcome(true, &mut since, at(ORPHAN_AFTER_SECS + 60)),
+            CapacityOutcome::Expanding
+        );
+        assert_eq!(since, None);
+        assert_eq!(
+            shortfall_outcome(false, &mut since, at(ORPHAN_AFTER_SECS + 120)),
+            CapacityOutcome::Expanding
+        );
+    }
+
+    #[tokio::test]
+    async fn the_outcome_rows_name_the_class_the_claim_binds_to() {
+        let readings = VolumeCapacityReadings::new();
+        readings.record("pvc-a", CapacityOutcome::Orphaned);
+        readings.record("pvc-b", CapacityOutcome::AtTarget);
+        readings.observe_class("pvc-a", Some("local-path"));
+        readings.observe_class("pvc-b", None);
+        let metrics = readings.collect_metrics("").await.expect("collect");
+        let row = |claim: &str, outcome: &str| {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == OUTCOME_METRIC
+                        && m.labels.get(CLAIM_LABEL).map(String::as_str) == Some(claim)
+                        && m.labels.get(OUTCOME_LABEL).map(String::as_str) == Some(outcome)
+                })
+                .unwrap_or_else(|| panic!("no {outcome} row for {claim}"))
+        };
+        assert_eq!(
+            row("pvc-a", OUTCOME_ORPHANED)
+                .labels
+                .get(STORAGE_CLASS_LABEL)
+                .map(String::as_str),
+            Some("local-path"),
+            "the row that says nobody is expanding this claim has to name the class to change"
+        );
+        assert!(
+            !row("pvc-b", OUTCOME_AT_TARGET)
+                .labels
+                .contains_key(STORAGE_CLASS_LABEL),
+            "a claim that names no class is not attributed to one"
+        );
     }
 
     #[test]
@@ -1281,6 +1591,7 @@ mod tests {
             CapacityOutcome::Clamped,
             CapacityOutcome::Refused,
             CapacityOutcome::Expanding,
+            CapacityOutcome::Orphaned,
             CapacityOutcome::Unmeasured,
         ]
         .into_iter()
@@ -1304,6 +1615,7 @@ mod tests {
             CapacityOutcome::Clamped,
             CapacityOutcome::Refused,
             CapacityOutcome::Expanding,
+            CapacityOutcome::Orphaned,
             CapacityOutcome::Unmeasured,
         ] {
             let expected = if o == CapacityOutcome::AtTarget { 1 } else { 0 };

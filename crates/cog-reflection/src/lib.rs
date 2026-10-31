@@ -258,6 +258,10 @@ pub const LABEL_VERSION: &str = "version";
 /// 读数按「哪份清单」归属时用的标签键。
 pub const LABEL_MANIFEST: &str = "manifest";
 
+/// 读数按「哪个存储类」归属时用的标签键。卷这一面的判词要指名到该动的那一个
+/// 对象上：声明扩得了而没人扩，要改的是这个类，不是那个卷。
+pub const LABEL_STORAGE_CLASS: &str = "storage_class";
+
 /// 读数按「哪个维度」归属时用的标签键。
 pub const LABEL_DIMENSION: &str = "dimension";
 
