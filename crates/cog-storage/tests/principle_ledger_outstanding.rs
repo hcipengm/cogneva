@@ -1,4 +1,5 @@
 //! principle: feedback_a_verdict_the_queue_never_offers_the_row_to_is_not_a_fix
+//! principle: feedback_a_folded_reading_does_not_move_the_row_it_changed
 //! Which rows a measuring pass gets to look at, against a live PostgreSQL.
 //!
 //! The pass takes a bounded set and judges every row in it. The bound is the
