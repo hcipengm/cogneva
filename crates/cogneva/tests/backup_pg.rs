@@ -34,7 +34,10 @@ use cog_test_support::database_url;
 /// The test's own database: same server and credentials, its own name.
 ///
 /// Dropped and recreated first, so a run that was killed leaves nothing for the
-/// next one to mistake for its own data.
+/// next one to mistake for its own data. The drop forces stale sessions out:
+/// PostgreSQL refuses to drop a database somebody is connected to, and a
+/// leftover connection from an interrupted run would otherwise turn into a
+/// failure that reads exactly like the restore under test being broken.
 async fn own_database(suffix: &str) -> (PgPool, String) {
     let base = database_url();
     let cut = base
@@ -44,7 +47,7 @@ async fn own_database(suffix: &str) -> (PgPool, String) {
     let admin = PgPool::connect(&format!("{}/postgres", &base[..cut]))
         .await
         .unwrap();
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {name}"))
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
         .execute(&admin)
         .await
         .unwrap();
@@ -113,7 +116,9 @@ async fn restricted_role_database(role: &str, db: &str) -> (PgPool, PgPool, Stri
         .await
         .unwrap();
     for stmt in [
-        format!("DROP DATABASE IF EXISTS {db}"),
+        // 强制删：上一次跑挂掉留下的会话会让 `DROP` 被拒，而那个失败与要证明的事
+        // 无关——读起来却像恢复本身坏了。
+        format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"),
         format!("DROP ROLE IF EXISTS {role}"),
         format!(
             "CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'probe-only'"
@@ -132,10 +137,11 @@ async fn restricted_role_database(role: &str, db: &str) -> (PgPool, PgPool, Stri
     (admin, pool, url)
 }
 
-/// 收尾：先把受限连接关掉，再删库与角色（有活连接时 `DROP DATABASE` 会被拒）。
+/// 收尾：删库与角色。删库带 `FORCE`——调用方已经关掉自己的连接，但池子的回收不总是
+/// 与 `close()` 同步，而留在盘上的一次性库与角色会让下一次跑起来的 `CREATE` 撞名。
 async fn drop_restricted_database(admin: &PgPool, role: &str, db: &str) {
     for stmt in [
-        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)"),
         format!("DROP ROLE IF EXISTS {role}"),
     ] {
         sqlx::query(&stmt).execute(admin).await.unwrap();
