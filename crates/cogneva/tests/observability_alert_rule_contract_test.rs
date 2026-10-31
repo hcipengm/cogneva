@@ -13,6 +13,7 @@
 //! principle: feedback_a_transient_that_hits_every_subject_at_once_is_one_event_not_n
 //! principle: feedback_two_subject_levels_need_two_gates_or_the_untouched_one_reads_as_green
 //! principle: feedback_the_prose_beside_a_rule_is_its_spec_and_the_expression_can_drift_from_it
+//! principle: feedback_a_condition_with_two_writers_gets_two_rows_and_recovery_closes_only_one
 //!
 //! Every PromQL expression in the deployed alert rules reads series by name.
 //!
@@ -35,7 +36,8 @@
 use crate::common;
 
 use common::lex::Dialect;
-use common::routes::{matching_paren, read_repo, repo_root};
+use common::routes::{matching_brace, matching_paren, path_constants, read_repo, repo_root};
+use common::rust_production;
 use common::service_topology;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -6555,3 +6557,253 @@ fn the_bound_under_the_band_is_the_same_number_as_the_bound_above_it() {
     }
     assert!(expr.contains(") / "), "必须除以声明上限：{expr}");
 }
+
+/// 一个 `PersistentAlertDraft { … }` 块里 `rule:` 那一格写的是什么表达式。
+///
+/// 三种形状都收：`rule: X,`、`rule: X`（不带逗号收了尾）、以及 Rust 的字段简写 `rule,`
+/// ——简写就是「变量 `rule`」，一样是读不出名字的写点，不能因为少个冒号就当成没有规则名。
+fn draft_rule_expression(block: &str) -> String {
+    for line in block.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("rule:") {
+            return rest.trim().trim_end_matches(',').trim().to_string();
+        }
+        if t == "rule," || t == "rule" {
+            return "rule".to_string();
+        }
+    }
+    // 读不到 `rule` 这一格与读到简写一样：名字读不出来。留空串，让它进未解析那一侧，
+    // 而不是悄悄当成「这一处没有规则名」。
+    String::new()
+}
+
+/// 一段生产源码里每一个显式构造告警行的写点，取它 `rule:` 那一格的表达式。
+///
+/// 只认 `… PersistentAlertDraft {`：类型定义（前面是 `struct`）和返回类型（前面是
+/// `->`）都不是写点，前者没有规则名，后者只是把类型写进了签名。
+fn draft_writer_expressions(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = 0;
+    while let Some(rel) = text[cursor..].find("PersistentAlertDraft") {
+        let at = cursor + rel;
+        cursor = at + "PersistentAlertDraft".len();
+        let rest = &text[cursor..];
+        let Some(brace_rel) = rest.find('{') else {
+            break;
+        };
+        if !rest[..brace_rel].trim().is_empty() {
+            continue;
+        }
+        let before = text[..at].trim_end();
+        if before.ends_with("struct") || before.ends_with("->") {
+            continue;
+        }
+        let open = cursor + brace_rel;
+        let Some(close) = matching_brace(text, open, Dialect::Rust) else {
+            cursor = open + 1;
+            continue;
+        };
+        out.push(draft_rule_expression(&text[open + 1..close]));
+        cursor = close + 1;
+    }
+    out
+}
+
+/// `rule:` 那一格的表达式落到哪个规则名：字面量直接读，常量名去全树的 `const … &str`
+/// 表里查。查不到（变量、字段简写、`rule.to_string()`）就是 `None`——名字读不出来。
+fn rule_name_of(expr: &str, constants: &BTreeMap<String, String>) -> Option<String> {
+    let e = expr.trim();
+    let e = e
+        .strip_suffix(".into()")
+        .or_else(|| e.strip_suffix(".to_string()"))
+        .unwrap_or(e)
+        .trim();
+    if let Some(lit) = e.strip_prefix('"') {
+        return lit.split('"').next().map(str::to_string);
+    }
+    let tail = e.rsplit("::").next().unwrap_or(e);
+    constants.get(tail).cloned()
+}
+
+/// 告警桥从 `SupervisorEvent` 里拼出来的规则名（`supervisor_event_to_alert_events` 里
+/// 那些 `rule_name: "…"`），以及它按名字跳过的声明 `PERSISTED_ELSEWHERE`。
+fn bridge_rule_names_and_declaration() -> (BTreeSet<String>, BTreeSet<String>) {
+    let text =
+        rust_production::production_text(&read_repo("crates/cog-observability/src/plugin.rs"));
+    let at = text
+        .find("fn supervisor_event_to_alert_events")
+        .expect("告警桥的 supervisor_event_to_alert_events 不在 plugin.rs 里了");
+    let brace = text[at..]
+        .find('{')
+        .map(|p| at + p)
+        .expect("supervisor_event_to_alert_events 没有函数体");
+    let end = matching_brace(&text, brace, Dialect::Rust)
+        .expect("supervisor_event_to_alert_events 的函数体括号不配对");
+    let body = &text[brace + 1..end];
+
+    let mut names = BTreeSet::new();
+    let mut cursor = 0;
+    while let Some(rel) = body[cursor..].find("rule_name:") {
+        let after = cursor + rel + "rule_name:".len();
+        cursor = after;
+        let rest = body[after..].trim_start();
+        let Some(lit) = rest.strip_prefix('"') else {
+            continue;
+        };
+        if let Some(end) = lit.find('"') {
+            names.insert(lit[..end].to_string());
+        }
+    }
+
+    let decl_at = text
+        .find("const PERSISTED_ELSEWHERE")
+        .expect("plugin.rs 里没有 PERSISTED_ELSEWHERE 这条声明了");
+    // 从 `=` 之后找第一个 `[`：类型那一段 `&[&str]` 自带一个方括号，先撞上它就会把
+    // 整个声明读成空集，而空集正是「没人声明过」的样子——门会静默地永远放行。
+    let after_eq = text[decl_at..]
+        .find('=')
+        .map(|p| decl_at + p)
+        .expect("PERSISTED_ELSEWHERE 没有赋值");
+    let open = text[after_eq..]
+        .find('[')
+        .map(|p| after_eq + p)
+        .expect("PERSISTED_ELSEWHERE 不是数组");
+    let close = text[open..]
+        .find(']')
+        .map(|p| open + p)
+        .expect("PERSISTED_ELSEWHERE 的数组没有收尾");
+    let mut declared = BTreeSet::new();
+    for piece in text[open + 1..close].split('"').skip(1).step_by(2) {
+        declared.insert(piece.to_string());
+    }
+    (names, declared)
+}
+
+/// 一条条件在告警表里只能有一个写者。
+///
+/// 表里那一行属于**规则名**，不属于「写入的那次调用」：两个写者哪怕判得完全正确，只要键的
+/// 形状不同就会开出两行，恢复只关得掉自己那个名字，剩下一行永远 `firing`，从此计入每一个
+/// 读表的人——最老未接年龄、firing 计数、点名表——而且再没有东西会去关它。2026-10-23 实测：
+/// 网关按事件写下沿秒做键，告警桥把同一条监督事件按裸规则名又写一行；后者 17:41 开、
+/// 22:55 关，前者 16:44 开、此后无人关，成了「最老未接」里最老的那一条。
+///
+/// 所以这里数两侧：**显式写点**（每个 `PersistentAlertDraft {` 的 `rule:` 落到哪个名字）
+/// 与**通用写者**（规则库里的全部规则名，加上告警桥从 `SupervisorEvent` 里拼出来的那几个）。
+/// 两者相交而没在 `PERSISTED_ELSEWHERE` 里声明 ⇒ 这个条件有两个写者 ⇒ 红。反向也判：
+/// 声明里每一条都必须真的有两个写者，否则那是一行过关条——跳过一条本来只有一个人在写的
+/// 规则，等于把它从告警表里删掉。
+///
+/// 名字读不出来的写点（`rule`、`rule.to_string()`、字段简写）不静默放过：逐条列进
+/// [`UNRESOLVED_DRAFT_WRITERS`]，实测集合必须与它完全相等。将来多出一个动态写点同样红，
+/// 直到有人写下它到底写哪个规则名。
+///
+/// 判据的边：只认 `PersistentAlertDraft` 这一种构造形状。经 store 的 `set_alert` 写行的
+/// 通用路径不在这里逐条数——告警桥就是它，规则名来自求值出来的实例，静态读不到；它由
+/// 「通用写者」那一侧整体代表。
+#[test]
+fn a_rule_name_has_one_writer_or_the_second_one_is_declared() {
+    let root = repo_root();
+    let constants = path_constants(&root);
+
+    let mut writers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut unresolved: BTreeSet<(String, String)> = BTreeSet::new();
+    for path in rust_production::production_sources(&root) {
+        let rel = rust_production::relative_name(&root, &path);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{rel} 读不出来（{e}）：这一处写点不在这份普查里"));
+        for expr in draft_writer_expressions(&rust_production::production_text(&raw)) {
+            match rule_name_of(&expr, &constants) {
+                Some(name) => {
+                    writers.entry(name).or_default().insert(rel.clone());
+                }
+                None => {
+                    unresolved.insert((rel.clone(), expr));
+                }
+            }
+        }
+    }
+
+    assert!(
+        writers.len() >= 5,
+        "只认出 {} 个显式写点，这条普查什么也没数到 —— 构造形状变了，先修读数：{writers:?}",
+        writers.len()
+    );
+
+    let (bridge_names, declared) = bridge_rule_names_and_declaration();
+    let mut generic: BTreeSet<String> = bridge_names.clone();
+    generic.extend(shipped_rules().into_iter().map(|(name, _)| name));
+    assert!(
+        generic.len() > 100,
+        "通用写者那一侧只有 {} 个名字，规则库没读到：这条门会把所有相交都判成不相交",
+        generic.len()
+    );
+
+    let mut complaints: Vec<String> = Vec::new();
+
+    // 1) 显式写点撞上通用写者 ⇒ 这个条件有两个写者。
+    for (name, files) in &writers {
+        if !generic.contains(name) || declared.contains(name) {
+            continue;
+        }
+        complaints.push(format!(
+            "{name}: 有人显式写下它（{files:?}），而通用写者也会写到这个名字——\
+             两行同一个条件，恢复只关得掉其中一个。要么删掉那个显式写点，要么把它加进 \
+             PERSISTED_ELSEWHERE 并写明另一个写者是谁、怎么关"
+        ));
+    }
+
+    // 2) 两个文件各自显式写同一个名字 ⇒ 一样是两个写者，没有声明能救。
+    for (name, files) in &writers {
+        if files.len() > 1 {
+            complaints.push(format!(
+                "{name}: 两个文件各自显式写下它（{files:?}）——写者唯一性没有第二条路，\
+                 删掉一个"
+            ));
+        }
+    }
+
+    // 3) 声明里的每一条都要真的对应「一个显式写点 ＋ 通用写者」。
+    for name in &declared {
+        let explicit = writers.contains_key(name);
+        let via_bridge = generic.contains(name);
+        if !explicit || !via_bridge {
+            complaints.push(format!(
+                "{name}: 写在 PERSISTED_ELSEWHERE 里，但显式写点={explicit}、通用写者={via_bridge}\
+                 ——跳过一条只有一个人在写的规则，等于把它从告警表里删掉"
+            ));
+        }
+    }
+
+    // 4) 读不出名字的写点必须逐条交代，集合相等。
+    let expected: BTreeSet<(String, String)> = UNRESOLVED_DRAFT_WRITERS
+        .iter()
+        .map(|(f, e)| (f.to_string(), e.to_string()))
+        .collect();
+    if unresolved != expected {
+        let added: Vec<_> = unresolved.difference(&expected).collect();
+        let gone: Vec<_> = expected.difference(&unresolved).collect();
+        complaints.push(format!(
+            "读不出规则名的写点与声明的不一致——新增 {added:?}、已有但没读到 {gone:?}。\
+             新加一个动态写点要先写下它到底写哪个规则名"
+        ));
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "规则名的写者唯一性:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// `rule:` 那一格读不出名字的写点，逐条交代。
+///
+/// 两处都是「恢复」那一半：名字是从 dedup key 里反解出来或从入参透传的，静态读不到。
+/// 它们与自己的开行写点用同一个名字（`decomposition_orphaned`），所以不是第二个写者；
+/// 列在这里是为了让**新增**的动态写点红，而不是因为这两处需要人守。
+const UNRESOLVED_DRAFT_WRITERS: &[(&str, &str)] = &[
+    (
+        "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs",
+        "rule.to_string()",
+    ),
+    ("crates/cog-orchestrator/src/dag_executor/mod.rs", "rule"),
+];
