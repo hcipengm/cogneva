@@ -110,6 +110,7 @@ const DEPLOY_ADMISSION_TIMEOUT_SECS: u64 = 300;
 const BUILTIN_LINT: &[&str] = &[
     "cargo",
     "clippy",
+    "--keep-going",
     "--workspace",
     "--message-format=json",
     "--all-targets",
@@ -5841,11 +5842,19 @@ index 1111111..2222222 100644\n\
     const STAGE_ONLY_LINT_ARGS: &[&str] = &["--message-format=json"];
 
     /// The tokens the argv carries and the evidence line does not: the two ways
-    /// this stage turns a run into a reading, plus the promotion that turns a
-    /// finding into a refusal. A reader of the evidence is being told which
-    /// command read the tree; `--` and `-D warnings` are the policy, not the
-    /// command.
-    const NOT_IN_THE_EVIDENCE_LINE: &[&str] = &["--message-format=json", "--", "-D", "warnings"];
+    /// this stage turns a run into a reading, the flag that makes one run report
+    /// every crate that failed instead of stopping at the first, and the
+    /// promotion that turns a finding into a refusal. A reader of the evidence is
+    /// being told which command read the tree; `--` and `-D warnings` are the
+    /// policy, not the command, and `--keep-going` is how much of the tree the
+    /// one run reports, not what it says about any line.
+    const NOT_IN_THE_EVIDENCE_LINE: &[&str] = &[
+        "--message-format=json",
+        "--keep-going",
+        "--",
+        "-D",
+        "warnings",
+    ];
 
     /// The `clippy` job's body, read out of the workflow.
     ///
