@@ -893,7 +893,7 @@ async fn the_fold_carries_the_written_half_and_keeps_no_reading_apart_from_zero(
         .expect("move the probe rows into the closed window");
 
     store
-        .rollup_windows(&[w.clone()])
+        .rollup_windows(std::slice::from_ref(&w))
         .await
         .expect("fold the window");
 

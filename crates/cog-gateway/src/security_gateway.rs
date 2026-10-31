@@ -3074,7 +3074,7 @@ impl UsageReading {
             input: input.unwrap_or(0),
             output: output.unwrap_or(0),
             cached: cached.unwrap_or(0),
-            cache_created: cache_created,
+            cache_created,
             outcome: if input.is_some()
                 || output.is_some()
                 || cached.is_some()
