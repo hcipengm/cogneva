@@ -2445,7 +2445,7 @@ export interface TopologyUnclaimedContainer {
 export interface TopologyCluster {
   /** 接口给这个连接的编号（`in-cluster`），不是集群的名字——Kubernetes 里没有这一项。 */
   id: string;
-  /** 这一面读的是这一个命名空间里的 Pod；节点是整台机器的。 */
+  /** 本进程所在的命名空间——不是这份读数的范围。Pod、事件、卷、入口都是整个集群的。 */
   namespace: string;
   reachable: boolean;
   error: string | null;
@@ -2460,6 +2460,27 @@ export interface TopologyCluster {
   unscheduled: TopologyPod[];
   /** Pod 说在某台节点上，但这次没读到那台节点——不是「没被调度」。 */
   unplaced: TopologyPod[];
+  /** 整个集群的 Service，每条带上此刻解析到几个地址。 */
+  services: TopologyService[];
+}
+
+/** 一条入口：Service 本身，以及它解析到的地址数。 */
+export interface TopologyService {
+  namespace: string;
+  name: string;
+  /** ClusterIP / NodePort / LoadBalancer / ExternalName。 */
+  kind: string;
+  cluster_ip: string | null;
+  /** `80/TCP → 8080` 这样一行一个端口。 */
+  ports: string[];
+  /**
+   * 可服务的地址数。`null` 是「这一读没读到」，`0` 是「读到了，一个都没有」——
+   * 两者修法相反：前者看 RBAC，后者看 selector 与就绪探针。
+   */
+  ready_addresses: number | null;
+  not_ready_addresses: number | null;
+  /** `app=cogneva` 这样的选择器，按 key 排序。 */
+  selector: string[];
 }
 
 export interface ClusterTopology {

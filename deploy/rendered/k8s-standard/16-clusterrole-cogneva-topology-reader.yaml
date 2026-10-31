@@ -83,3 +83,13 @@ rules:
   - apiGroups: [""]
     resources: ["events", "persistentvolumeclaims"]
     verbs: ["get", "list"]
+  # 入口层：Service 与它的 Endpoints。资源面另一半个问题——「外面敲进来，落到哪个
+  # Pod 上」。Service 不占 CPU 也不占内存，所以这一条不在配额头寸里；但一个一条
+  # Endpoint 都没有的 Service 与「这个服务没人访问」在屏上同形，而它正是 5xx 与
+  # 超时排查的第一跳。
+  #
+  # Endpoints 读的是它的集合，不是按 Service 名逐个问：一次读全集群的集合比每个
+  # Service 一次请求便宜几十倍，按名字对齐由读回来的 label 自己做。
+  - apiGroups: [""]
+    resources: ["services", "endpoints"]
+    verbs: ["get", "list"]

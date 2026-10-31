@@ -5,6 +5,7 @@ import {
   type TopologyCluster,
   type TopologyNode,
   type TopologyPod,
+  type TopologyService,
 } from '@/api/client';
 import { useResource, type Resource } from '@/hooks/useResource';
 import { BreathingTopology } from '@/topology/BreathingTopology';
@@ -165,6 +166,84 @@ function ClusterRow({
           </div>
         </div>
       )}
+
+      {cluster.services.length > 0 && (
+        <div className="border-t border-[var(--line)] px-4 py-2">
+          <h3 className="mb-1 text-[10px] uppercase tracking-[0.14em] text-[var(--muted)]">
+            入口 · 敲进来落到谁身上（{cluster.services.length} 个 Service，整个集群）
+          </h3>
+          <div className="flex flex-col gap-0.5">
+            {cluster.services.map((service) => (
+              <ServiceRow key={`${service.namespace}/${service.name}`} service={service} />
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * 一条 Service 的配色与地址读法。
+ *
+ * 三种「没有地址」必须分开：`null` 是这一读没读到（看 RBAC），`0` 是读到了但
+ * selector 一个 Pod 都没选中（看 selector 与标签），`0 就绪 · N 未就绪` 是 Pod
+ * 都在、探针没过（看就绪探针）。三种都画成红，就分不出该去改哪里。
+ *
+ * `ExternalName` 不出现在 Endpoints 里——它没有 selector，解析交给 DNS，所以
+ * 「0 个地址」对它不是故障，是它的正常工作方式。
+ */
+function ServiceRow({ service }: { service: TopologyService }) {
+  const external = service.kind === 'ExternalName';
+  const tone: 'ok' | 'warn' | 'danger' | 'idle' =
+    service.ready_addresses == null
+      ? 'idle'
+      : service.ready_addresses > 0
+        ? 'ok'
+        : external
+          ? 'idle'
+          : (service.not_ready_addresses ?? 0) > 0
+            ? 'warn'
+            : 'danger';
+  const addresses = (() => {
+    if (external) return '解析到外部域名，没有 Endpoint';
+    if (service.ready_addresses == null) return '地址没读到';
+    const notReady = service.not_ready_addresses ?? 0;
+    if (service.ready_addresses === 0 && notReady === 0) {
+      return service.selector.length === 0
+        ? '没有 selector，也没有 Endpoint'
+        : 'selector 一个 Pod 都没选中';
+    }
+    return notReady > 0
+      ? `${service.ready_addresses} 就绪 · ${notReady} 未就绪`
+      : `${service.ready_addresses} 个地址`;
+  })();
+  return (
+    <div className="flex flex-wrap items-baseline gap-x-3 text-[11px]">
+      <Dot tone={tone} />
+      <span className="mono text-[10px] text-[var(--muted)]">{service.namespace}/</span>
+      <span className="mono">{service.name}</span>
+      <span className="mono text-[10px] text-[var(--muted)]">{service.kind}</span>
+      {/* 地址要画出来，因为「敲进来的那个地址」就是读者手里有的东西：ClusterIP 是
+          集群内的入口，Headless 没有入口地址（DNS 直接解析到 Pod，由调用方自己选），
+          ExternalName 交给 DNS。三种都印成空白的话，「没有 IP」看起来像读坏了。 */}
+      {!external && (
+        <span className="mono text-[10px] text-[var(--muted)]">
+          {service.cluster_ip ?? 'Headless（DNS 直解到 Pod）'}
+        </span>
+      )}
+      <span className="mono text-[10px] text-[var(--muted)]">
+        {service.ports.join(' · ') || '没有端口声明'}
+      </span>
+      <span className="mono text-[10px] text-[var(--muted)]">
+        {service.selector.join(' ') || '没有 selector'}
+      </span>
+      <span
+        className="mono text-[10px]"
+        style={{ color: tone === 'danger' ? 'var(--danger)' : tone === 'warn' ? 'var(--warn)' : undefined }}
+      >
+        {addresses}
+      </span>
     </div>
   );
 }

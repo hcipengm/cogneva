@@ -115,6 +115,12 @@ rules:
   - apiGroups: [""]
     resources: ["events", "persistentvolumeclaims"]
     verbs: ["get", "list"]
+  # 入口层：Service 与它的 Endpoints（集合级两条路径）。资源面另一半的问题——
+  # 「外面敲进来，落到哪个 Pod 上」；一个一条 Endpoint 都没有的 Service 与
+  # 「这个服务没人访问」在屏上同形，而它正是 5xx 与超时排查的第一跳。
+  - apiGroups: [""]
+    resources: ["services", "endpoints"]
+    verbs: ["get", "list"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

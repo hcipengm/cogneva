@@ -185,6 +185,15 @@ function OverviewBoard({ overview }: { overview: Resource<ClusterOverview> }) {
 
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">工作负载</h2>
+        {/* 这一节与交付页那张全量表并存，而且都不是多余的：这一节是一份**固定的
+            产品清单**——产品要发的每个工作负载各占一行，少一行就是「平台少发了一个」；
+            交付页那张表读的是集群实际有什么（含监控、kube-system、Job），那边少一行
+            是「集群里没有它」。两张表回答的问题不同，混成一张就两个都答不了：
+            全量表会让「少发了一个」淹没在几十行里，固定清单则答不出「集群里还有什么」。 */}
+        <p className="px-4 pb-1 text-[10px] text-[var(--muted)]">
+          固定产品清单：产品要发的每个工作负载各一行，少一行就是平台少发了一个。
+          集群里实际有什么（监控、系统组件、Job）看交付页那张全量表——那边少一行是集群里没有它。
+        </p>
         {components.error ? (
           <ReadError what="工作负载存活" error={components.error} onRetry={components.refresh} />
         ) : components.data ? (

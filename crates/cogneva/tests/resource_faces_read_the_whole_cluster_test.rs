@@ -163,6 +163,74 @@ fn the_web_client_carries_the_namespace_of_every_row() {
     }
 }
 
+/// The topology draws the entrance layer: which Service resolves to which pods.
+///
+/// Node-and-pod reads answer "what is running on which machine"; without the
+/// Service read the same page cannot say who is calling them — and the first
+/// hop in a 5xx investigation is exactly there: the Service exists, the pods
+/// exist, the selector matches none of them, and every request from outside
+/// times out.
+#[test]
+fn the_topology_reads_the_entrance_layer() {
+    let body = body("cluster_topology_handler");
+    let paths = paths(&body);
+    for want in ["/api/v1/services", "/api/v1/endpoints"] {
+        assert!(
+            paths.iter().any(|path| path == want),
+            "拓扑没有读 {want}（读到的是 {paths:?}）：入口那一段要么空着，要么从别处\
+             推断——而一条 Endpoint 都没有的 Service 与「这个服务没人访问」同形"
+        );
+    }
+}
+
+/// Every field the entrance read fills has to reach the screen.
+///
+/// A field the API carries and the page drops is a read nobody can act on: the
+/// address the caller actually dials, and the split between "ready" and "not
+/// ready", are two of the three things this section exists to say. Rendering
+/// only the address count would leave "no address" and "the read failed" — the
+/// difference between fixing a selector and fixing an RBAC rule — invisible.
+#[test]
+fn the_entrance_rows_show_what_the_read_carries() {
+    let view = read(&repo_root().join("web/src/topology/ClusterTopology.tsx"));
+    for field in [
+        "service.cluster_ip",
+        "service.ready_addresses",
+        "service.not_ready_addresses",
+        "service.selector",
+    ] {
+        assert!(
+            view.contains(field),
+            "拓扑的入口那一行没有画 `{field}`：这一读取回来了，屏上却看不见，\
+             读者拿不到能动手的那个数"
+        );
+    }
+}
+
+/// The probe and the ClusterRole have to agree with the handler.
+///
+/// A read the code makes and the ClusterRole does not grant answers 403 on every
+/// poll: the section is empty, the probe row says failed, and the page reads as
+/// "this cluster has no services" to anyone who does not open the error line.
+#[test]
+fn every_entrance_read_is_probed_and_granted() {
+    let probe = body("read_targets");
+    for resource in ["services", "endpoints"] {
+        assert!(
+            probe.contains(&format!("\"{resource}\"")),
+            "集群读探针没有探 {resource}：这一读 403 时它不会在任何一格读数里留下痕迹"
+        );
+    }
+    let role = read(
+        &repo_root().join("deploy/rendered/k3s-single/16-clusterrole-cogneva-topology-reader.yaml"),
+    );
+    assert!(
+        role.contains("resources: [\"services\", \"endpoints\"]"),
+        "渲染出来的 ClusterRole 没有授权 services 与 endpoints：代码读它们，而集群\
+         会 403——入口那一段永远空着"
+    );
+}
+
 /// The resource view groups by the namespace it now reads. A page that renders
 /// a flat list of two `default` quotas side by side has the data and throws away
 /// the half that says whose they are.

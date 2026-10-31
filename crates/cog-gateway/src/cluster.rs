@@ -169,6 +169,34 @@ pub struct ClusterView {
     /// apiserver 出错），或者节点刚被删。它们不是「没有被调度」，把它们画进
     /// `unscheduled` 就是一句假话：节点读失败时整屏的 Pod 都会变成「未调度」。
     pub unplaced: Vec<PodView>,
+    /// 集群里全部命名空间的 Service，每个带上它此刻解析到几个地址。
+    ///
+    /// 节点与 Pod 答的是「东西跑在哪」，这一格答的是「外面敲进来落到谁身上」。
+    /// 少了它，一张拓扑图只能说清机器里的东西，说不清谁在用它们——而排查 5xx 的
+    /// 第一跳恰恰是这里：Service 在、Pod 也在，selector 一个都没选中，外面敲进来
+    /// 就是超时。
+    pub services: Vec<ServiceView>,
+}
+
+/// 一条入口：一个 Service，以及它此刻解析到的地址。
+#[derive(Debug, Serialize)]
+pub struct ServiceView {
+    pub namespace: String,
+    pub name: String,
+    /// `ClusterIP` / `NodePort` / `LoadBalancer` / `ExternalName`。
+    pub kind: String,
+    pub cluster_ip: Option<String>,
+    /// `port:80/TCP → 8080` 这样一行一条，按声明顺序。
+    pub ports: Vec<String>,
+    /// 解析到几个可服务的地址。
+    ///
+    /// `None` 是「这一读没读到」，`Some(0)` 是「读到了，一个地址都没有」。两者在
+    /// 屏上都画成空，而修法相反：前者去看 RBAC，后者去看 selector 与就绪探针。
+    pub ready_addresses: Option<usize>,
+    /// 解析到了但没就绪的地址数：Pod 在、探针没过的样子。
+    pub not_ready_addresses: Option<usize>,
+    /// `app=cogneva` 这样的选择器，按 key 排序。
+    pub selector: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -362,6 +390,7 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         nodes: Vec::new(),
         unscheduled: Vec::new(),
         unplaced: Vec::new(),
+        services: Vec::new(),
     };
 
     match client.get_json("/version").await {
@@ -482,9 +511,162 @@ pub async fn cluster_topology_handler() -> Json<Topology> {
         }
     }
 
+    // 入口层：Service 与它解析到的 Endpoint 各读一次集合，按 (命名空间, 名字) 对齐。
+    // 两条读互相独立：没有 Endpoint 那条腿时 Service 照样列出来，只是地址数那一格
+    // 写「没读到」——那时说 0 就是替一次没发生的读下一个结论。
+    let endpoints = match client.get_json("/api/v1/endpoints").await {
+        Ok(list) => Some(endpoints_by_service(&list)),
+        Err(e) => {
+            view.error = Some(match view.error {
+                Some(previous) => format!("{previous}；读不到 Endpoints：{e}"),
+                None => format!("读不到 Endpoints：{e}"),
+            });
+            None
+        }
+    };
+    match client.get_json("/api/v1/services").await {
+        Ok(list) => {
+            view.services = list
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| service_view(item, endpoints.as_ref()))
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
+        Err(e) => {
+            view.error = Some(match view.error {
+                Some(previous) => format!("{previous}；读不到 Service：{e}"),
+                None => format!("读不到 Service：{e}"),
+            });
+        }
+    }
+
     Json(Topology {
         clusters: vec![view],
         collected_at,
+    })
+}
+
+/// 每个 Service 此刻解析出的 (可服务地址数, 未就绪地址数)，按 (命名空间, 名字) 索引。
+///
+/// 地址按 IP 去重：一个 Service 声明两个端口时 apiserver 会给出两个 subset，同一个
+/// Pod 的 IP 在两份里各出现一次。按 subset 累加会把「3 个 Pod」报成 6 个，而 6 是
+/// 一个读得通、画得出、对不上的数。
+type ServiceEndpoints = std::collections::HashMap<(String, String), (usize, usize)>;
+
+fn endpoints_by_service(list: &Value) -> ServiceEndpoints {
+    use std::collections::BTreeSet;
+    let mut out: ServiceEndpoints = ServiceEndpoints::new();
+    let Some(items) = list.get("items").and_then(Value::as_array) else {
+        return out;
+    };
+    for item in items {
+        let key = (namespace_of(item), name_of(item));
+        let mut ready: BTreeSet<&str> = BTreeSet::new();
+        let mut not_ready: BTreeSet<&str> = BTreeSet::new();
+        for subset in item
+            .get("subsets")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for (field, into) in [
+                ("addresses", &mut ready),
+                ("notReadyAddresses", &mut not_ready),
+            ] {
+                for address in subset
+                    .get(field)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(ip) = address.get("ip").and_then(Value::as_str) {
+                        into.insert(ip);
+                    }
+                }
+            }
+        }
+        // 同一地址既出现在 ready 又出现在 notReady 里，是按端口分成两组的产物：
+        // 这个地址至少有一个端口在服务，就不算未就绪。
+        let not_ready = not_ready.difference(&ready).count();
+        out.insert(key, (ready.len(), not_ready));
+    }
+    out
+}
+
+fn service_view(service: &Value, endpoints: Option<&ServiceEndpoints>) -> Option<ServiceView> {
+    let name = service.pointer("/metadata/name").and_then(Value::as_str)?;
+    let namespace = namespace_of(service);
+    let selector: Vec<String> = service
+        .pointer("/spec/selector")
+        .and_then(Value::as_object)
+        .map(|map| {
+            // 排序后再输出：apiserver 的对象顺序不保证，同一份选择器两次读到两个
+            // 顺序，屏上就在闪。
+            let mut pairs: Vec<(String, String)> = map
+                .iter()
+                .filter_map(|(key, value)| {
+                    value.as_str().map(|value| (key.clone(), value.to_string()))
+                })
+                .collect();
+            pairs.sort();
+            pairs
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect()
+        })
+        .unwrap_or_default();
+    let ports = service
+        .pointer("/spec/ports")
+        .and_then(Value::as_array)
+        .map(|ports| {
+            ports
+                .iter()
+                .map(|port| {
+                    let number = port
+                        .get("port")
+                        .and_then(Value::as_u64)
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    let protocol = port
+                        .get("protocol")
+                        .and_then(Value::as_str)
+                        .unwrap_or("TCP");
+                    let target = port
+                        .get("targetPort")
+                        .map(|value| match value {
+                            Value::Number(number) => number.to_string(),
+                            Value::String(text) => text.clone(),
+                            _ => "?".to_string(),
+                        })
+                        .unwrap_or_else(|| number.clone());
+                    format!("{number}/{protocol} → {target}")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let addresses = endpoints.and_then(|map| map.get(&(namespace.clone(), name.to_string())));
+    Some(ServiceView {
+        namespace,
+        name: name.to_string(),
+        kind: service
+            .pointer("/spec/type")
+            .and_then(Value::as_str)
+            .unwrap_or("ClusterIP")
+            .to_string(),
+        cluster_ip: service
+            .pointer("/spec/clusterIP")
+            .and_then(Value::as_str)
+            .filter(|ip| *ip != "None")
+            .map(str::to_string),
+        ports,
+        ready_addresses: addresses.map(|(ready, _)| *ready),
+        not_ready_addresses: addresses.map(|(_, not_ready)| *not_ready),
+        selector,
     })
 }
 
@@ -712,6 +894,10 @@ pub fn read_targets() -> Vec<(&'static str, String)> {
         // 不是「能不能读到我这一个命名空间」，而是「这一面整体能不能读到」。
         ("resourcequotas", "/api/v1/resourcequotas".to_string()),
         ("limitranges", "/api/v1/limitranges".to_string()),
+        // 入口层：谁暴露了哪个端口、解析到谁。读不到时拓扑上那一段是空的，
+        // 而空与「这个集群没有入口」同形。
+        ("services", "/api/v1/services".to_string()),
+        ("endpoints", "/api/v1/endpoints".to_string()),
     ];
     for kind in WorkloadKind::ALL {
         let resource = kind.resource();
@@ -2335,7 +2521,73 @@ mod topology_tests {
             nodes: nodes.iter().map(node_view).collect(),
             unscheduled: Vec::new(),
             unplaced: Vec::new(),
+            services: Vec::new(),
         }
+    }
+
+    /// 一个 Service 声明两个端口时，apiserver 给出两个 subset，同一个 Pod 的 IP
+    /// 在两份里各出现一次。按 subset 累加会把「2 个地址」报成 4 个——一个读得通、
+    /// 画得出、和真实情况对不上的数。
+    #[test]
+    fn one_pod_behind_two_ports_is_one_address() {
+        let list = json!({"items": [{
+            "metadata": {"name": "api", "namespace": "cogneva"},
+            "subsets": [
+                {"addresses": [{"ip": "10.0.0.1"}, {"ip": "10.0.0.2"}]},
+                {"addresses": [{"ip": "10.0.0.1"}, {"ip": "10.0.0.2"}]}
+            ]
+        }]});
+        let map = endpoints_by_service(&list);
+        assert_eq!(
+            map.get(&("cogneva".to_string(), "api".to_string())),
+            Some(&(2, 0))
+        );
+    }
+
+    /// `Some(0)` 与 `None` 在屏上都画成空，修法相反：前者看 selector，后者看 RBAC。
+    #[test]
+    fn a_service_with_no_endpoints_is_zero_and_a_missing_read_is_none() {
+        let service = json!({
+            "metadata": {"name": "api", "namespace": "cogneva"},
+            "spec": {
+                "type": "ClusterIP",
+                "clusterIP": "10.43.0.1",
+                "selector": {"app": "api"},
+                "ports": [{"port": 80, "targetPort": 8080}]
+            }
+        });
+        let read = endpoints_by_service(&json!({"items": [{
+            "metadata": {"name": "api", "namespace": "cogneva"},
+            "subsets": []
+        }]}));
+        let view = service_view(&service, Some(&read)).expect("the service");
+        assert_eq!(view.ready_addresses, Some(0));
+        assert_eq!(view.not_ready_addresses, Some(0));
+        assert_eq!(view.selector, vec!["app=api"]);
+        assert_eq!(view.ports, vec!["80/TCP → 8080"]);
+        assert_eq!(view.cluster_ip.as_deref(), Some("10.43.0.1"));
+
+        let unread = service_view(&service, None).expect("the service");
+        assert_eq!(unread.ready_addresses, None);
+        assert_eq!(unread.not_ready_addresses, None);
+    }
+
+    /// 一个地址既在 ready 又在 notReady 里，是按端口分组的产物：它至少有一个端口
+    /// 在服务，就不能算未就绪，否则「3 个就绪 · 3 个未就绪」会是同一个 3 个 Pod。
+    #[test]
+    fn an_address_serving_one_port_is_not_a_not_ready_address() {
+        let list = json!({"items": [{
+            "metadata": {"name": "api", "namespace": "cogneva"},
+            "subsets": [
+                {"addresses": [{"ip": "10.0.0.1"}]},
+                {"notReadyAddresses": [{"ip": "10.0.0.1"}, {"ip": "10.0.0.9"}]}
+            ]
+        }]});
+        let map = endpoints_by_service(&list);
+        assert_eq!(
+            map.get(&("cogneva".to_string(), "api".to_string())),
+            Some(&(1, 1))
+        );
     }
 
     #[test]
