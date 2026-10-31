@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # principle: feedback_a_join_keeps_every_label_nobody_named
+# principle: feedback_absent_over_time_synthesizes_the_selector_equality_matchers
 # 让每一份告警证明夹具**真的跑一遍**。
 #
 # 为什么要有这一层：`check-alert-rule-proof.sh` 判的是「每条规则都被一格会响、一格不响
