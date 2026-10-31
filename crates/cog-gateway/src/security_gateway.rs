@@ -5828,6 +5828,38 @@ fn face_capacity(
         .collect()
 }
 
+/// 自造的拒绝穿什么外衣，由**恢复时刻**决定，不由「是不是快速失败」决定。
+///
+/// 429 在调用侧是一句「换一家、等一个窗口」：`cog-llm` 的 routing 按状态码分类并
+/// 故障转移，agent 的循环见到它就退避重试。窗口配速正好是这个意思——候选池就是
+/// 「换一家」的对象，恢复落在窗口之内。两种当日预算不是：它们的恢复只在下一个日界，
+/// 没有任何别的路能替，而借用 429 会让调用方重试到 UTC 零点，每一次都是一整轮
+/// 上下文重发。402 说的是同一件事的另一半：额度已经用完、要等一个外部窗口重置，
+/// 在 `UpstreamFailure` 里是终态——按拍退避的那条路本来就不存在。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnRefusal {
+    /// 窗口配速：这一窗摊到此刻的额度不够再开一件任务，换一家或等窗口就能过。
+    WindowPace,
+    /// 按任务／按人的当日预算：恢复只在下一个日界。
+    DayBudget,
+}
+
+/// principle: feedback_a_refusal_recovered_only_at_the_day_boundary_must_not_wear_the_status_that_means_fail_over
+///
+/// 我们自己的拒绝唯一的状态码出处。
+///
+/// 收敛到一处，是因为这两个码在**两种恢复时刻上语义相反**，而三个拒绝点彼此离得
+/// 很远：读其中一段的人看不出它本该与另一段不同。写在这里之后，「日界恢复的拒绝
+/// 穿 429」这件事在文件里只有一个地方能写错，且
+/// `a_day_boundary_refusal_does_not_wear_429` 与
+/// `every_rate_limited_site_in_the_gateway_is_on_the_list` 两格钉住了它。
+fn own_refusal_status(kind: OwnRefusal) -> StatusCode {
+    match kind {
+        OwnRefusal::WindowPace => StatusCode::TOO_MANY_REQUESTS,
+        OwnRefusal::DayBudget => StatusCode::PAYMENT_REQUIRED,
+    }
+}
+
 async fn stream_forward(
     state: AppState,
     req: axum::extract::Request,
@@ -6061,7 +6093,7 @@ async fn stream_forward(
             guard.pool
         };
         return Ok(axum::response::Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
+            .status(own_refusal_status(OwnRefusal::WindowPace))
             .header(cog_core::RETRY_AFTER_HEADER, retry_after.to_string())
             .header("content-type", cog_core::CONTENT_TYPE_JSON)
             .body(axum::body::Body::from(
@@ -6112,10 +6144,16 @@ async fn stream_forward(
             spent_today = refusal.spent_today,
             hard_limit = refusal.hard_limit,
             retry_after_secs = refusal.wait_secs,
-            "按任务预算：这件工作的当日上限已经用完，快速失败 429"
+            "按任务预算：这件工作的当日上限已经用完，快速失败 402（额度用完，不是限流）"
         );
         return Ok(axum::response::Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
+            .status(own_refusal_status(OwnRefusal::DayBudget))
+            // 状态码之外再声明一次病因：调用侧的分类器优先读这个头，于是这次拒绝
+            // 落进「额度用完」那一类（终态），而不是「上游忙」那一类（退避重试）。
+            .header(
+                cog_core::UPSTREAM_CAUSE_HEADER,
+                cog_core::UpstreamFailure::QuotaExhausted.name(),
+            )
             .header(cog_core::RETRY_AFTER_HEADER, refusal.wait_secs.to_string())
             .header("content-type", cog_core::CONTENT_TYPE_JSON)
             .body(axum::body::Body::from(
@@ -6155,10 +6193,14 @@ async fn stream_forward(
             spent_today = refusal.spent_today,
             hard_limit = refusal.hard_limit,
             retry_after_secs = refusal.wait_secs,
-            "按人额度：这个人今天的额度已经用完，快速失败 429"
+            "按人额度：这个人今天的额度已经用完，快速失败 402（额度用完，不是限流）"
         );
         return Ok(axum::response::Response::builder()
-            .status(StatusCode::TOO_MANY_REQUESTS)
+            .status(own_refusal_status(OwnRefusal::DayBudget))
+            .header(
+                cog_core::UPSTREAM_CAUSE_HEADER,
+                cog_core::UpstreamFailure::QuotaExhausted.name(),
+            )
             .header(cog_core::RETRY_AFTER_HEADER, refusal.wait_secs.to_string())
             .header("content-type", cog_core::CONTENT_TYPE_JSON)
             .body(axum::body::Body::from(
@@ -16494,14 +16536,14 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         }
     }
 
-    /// 用完了预算的那一发必须**在碰任何上游之前**回 429，且正文用机器可读那一格
+    /// 用完了预算的那一发必须**在碰任何上游之前**回 402，且正文用机器可读那一格
     /// 自称是预算拒的。
     ///
-    /// 同一个 429 还来自窗口配速（池子紧）与上游自己（限流）。三个都说「等一等」，
-    /// 但处置完全不同：配速要等窗口开，上游限流要退避重试，而这一条是这件工作该
-    /// 收尾了——拿它当可重试的抖动去重试，就是在这件工作已经用完的那份预算上反复
-    /// 撞墙，每一次都记一行拒绝。所以正文里必须有 `reason`，且它不能与另外两种
-    /// 同值。
+    /// 429 还来自窗口配速（池子紧）与上游自己（限流）。三者都要「等一等」，但恢复
+    /// 时刻不同：配速与上游限流在窗口内换一家就好，而这一条的额度要到下一个日界
+    /// 才回来——拿它当可重试的抖动，就是在已经用完的那份预算上重试到零点，每一次
+    /// 都带一整轮上下文。所以状态码本身就不能是 429，正文里还要有 `reason` 与
+    /// 一个声明病因的头，让调用侧的分类器不去猜。
     #[tokio::test]
     async fn a_task_that_used_up_its_budget_is_refused_by_name_before_any_upstream() {
         use tower::ServiceExt;
@@ -16523,8 +16565,15 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         assert_eq!(
             resp.status(),
-            StatusCode::TOO_MANY_REQUESTS,
-            "用完了的预算要快速失败，不能还把这一发发出去"
+            StatusCode::PAYMENT_REQUIRED,
+            "日界恢复的预算不许穿 429：那个码说的「换一家就好」在这里不成立"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(cog_core::UPSTREAM_CAUSE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(cog_core::UpstreamFailure::QuotaExhausted.name()),
+            "拒绝要自己声明那一类是「额度用完」，调用侧的分类器优先读这个头"
         );
         let wait = resp
             .headers()
@@ -16771,11 +16820,12 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         }
     }
 
-    /// 用完了个人额度的那一发必须**在碰任何上游之前**回 429，且正文里有一格
+    /// 用完了个人额度的那一发必须**在碰任何上游之前**回 402，且正文里有一格
     /// 让调用侧把「这个人该加额度」与另外两种「等一等」分开。
     ///
     /// 这一条与按任务预算那一条判的不是同一件事：两者的上限挂在不同的主体上，
-    /// 处置也不同——一件工作能收尾，一个人今天不能。
+    /// 处置也不同——一件工作能收尾，一个人今天不能。相同的是恢复时刻：都在下一个
+    /// 日界，所以两者穿同一个码，且都不是 429。
     #[tokio::test]
     async fn a_person_who_used_up_their_allowance_is_refused_by_name_before_any_upstream() {
         use tower::ServiceExt;
@@ -16799,8 +16849,15 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         assert_eq!(
             resp.status(),
-            StatusCode::TOO_MANY_REQUESTS,
-            "用完了的个人额度要快速失败，不能还把这一发发出去"
+            StatusCode::PAYMENT_REQUIRED,
+            "额度要到日界才回来：429 说的「等一会／换一家」在这里不成立"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(cog_core::UPSTREAM_CAUSE_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some(cog_core::UpstreamFailure::QuotaExhausted.name()),
+            "拒绝要自己声明那一类是「额度用完」，调用侧的分类器优先读这个头"
         );
         assert!(
             resp.headers()
@@ -16827,6 +16884,98 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(v["owner"], "u-1");
         assert_eq!(v["hard_limit"], 1000);
         assert_eq!(v["spent_today"], 1200);
+    }
+
+    /// 我们自造的拒绝穿什么码，由恢复时刻决定：日界恢复的那种不许借 429 或 503。
+    ///
+    /// 这一格判的是分类本身，不是某一次拒绝。429 与 503 在调用侧都是「等一会再来」，
+    /// 而当日额度在零点之前一分都不会回来——穿这两个码的拒绝会被重试到 UTC 零点，
+    /// 每一次重试都带着一整轮上下文。402 与它们的分界正是「要不要等」这件事。
+    #[test]
+    fn a_day_boundary_refusal_does_not_wear_429() {
+        assert_eq!(
+            own_refusal_status(OwnRefusal::WindowPace),
+            StatusCode::TOO_MANY_REQUESTS,
+            "配速的恢复在窗口之内，而候选池就是「换一家」的对象：429 在这个位置是对的"
+        );
+        assert_eq!(
+            own_refusal_status(OwnRefusal::DayBudget),
+            StatusCode::PAYMENT_REQUIRED,
+            "额度耗尽、要等外部窗口重置：这是 402 的定义，不是 429 的"
+        );
+        assert_ne!(
+            own_refusal_status(OwnRefusal::DayBudget),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "503 与 429 同病：它说的也是「过一会再来」"
+        );
+    }
+
+    /// 生产代码里有多少处 429，是一张要人签字的名单：新增一处而不改这张表 ⇒ 红。
+    ///
+    /// 上面那一格判的是分类，这一格判的是**读者能不能一次看全**「我们在哪些地方借了
+    /// 429、每一处的恢复时刻是什么」。名单之外最危险的一格是日界恢复：它借的是
+    /// 「换一家就好」这句话，而那句话在零点之前不成立。
+    ///
+    /// 计数按文件而不是按行：行号随任何一次编辑漂移，文件级计数只在有人真的添了一处
+    /// 429 时才变，而那正是该停下来写下恢复时刻的那一刻。
+    #[test]
+    fn every_rate_limited_site_in_the_gateway_is_on_the_list() {
+        // (相对 `src/` 的路径, 生产代码里出现的次数, 这一处的恢复时刻)
+        const SITES: &[(&str, usize, &str)] = &[
+            ("auth/mod.rs", 2, "注册尝试窗口与登录失败窗口，分钟级"),
+            ("error.rs", 1, "上游错误名 → 状态码的映射，不是拒绝点"),
+            (
+                "project_rate_limit.rs",
+                1,
+                "每个调用方每分钟的项目读，分钟级",
+            ),
+            (
+                "security_gateway.rs",
+                1,
+                "只有 own_refusal_status 的配速那一臂，窗口内可换一家",
+            ),
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("读得到网关源码目录") {
+                let path = entry.expect("读得到目录项").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("读得到源文件");
+                // 测试模块里的 429 是夹具，不算我们发出去的拒绝。
+                let production = text.split("\n#[cfg(test)]\nmod ").next().unwrap_or("");
+                let n = production.matches("TOO_MANY_REQUESTS").count();
+                if n > 0 {
+                    let rel = path
+                        .strip_prefix(&root)
+                        .expect("源码都在 src 之下")
+                        .to_string_lossy()
+                        .to_string();
+                    found.insert(rel, n);
+                }
+            }
+        }
+
+        let mut got = found.clone();
+        for (path, want, why) in SITES {
+            let n = got.remove(*path).unwrap_or(0);
+            assert_eq!(
+                n, *want,
+                "src/{path} 里 429 的处数变了（名单说 {want}，实得 {n}）：{why}"
+            );
+        }
+        assert!(
+            got.is_empty(),
+            "这些文件新出现了 429，先写下它的恢复时刻再上名单：{got:?}"
+        );
     }
 
     /// 没有人给这个人配过额度就不判，哪怕今天已经花了天文数字。
