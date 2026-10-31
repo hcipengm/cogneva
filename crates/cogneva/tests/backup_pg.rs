@@ -95,6 +95,53 @@ async fn count_in(pool: &PgPool, relation: &str) -> i64 {
         .unwrap()
 }
 
+/// 现建一个**没有超级用户位**的角色，连同它自己的库；返回管理连接、受限连接与库 URL。
+///
+/// 同名的角色与库先清掉：上一次跑挂在半路会留下它们，那时 `CREATE` 直接失败，而那个
+/// 失败与要证明的事无关。口令是写死的假值——这个角色只活在这一条测试里，跑完就删，
+/// 库与实例都在本地端口转发后面。
+async fn restricted_role_database(role: &str, db: &str) -> (PgPool, PgPool, String) {
+    let base = database_url();
+    let cut = base
+        .rfind('/')
+        .expect("a database URL has a path holding the database name");
+    let server = &base[..cut];
+    let (_, host) = server
+        .rsplit_once('@')
+        .expect("the test database URL carries credentials");
+    let admin = PgPool::connect(&format!("{server}/postgres"))
+        .await
+        .unwrap();
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("DROP ROLE IF EXISTS {role}"),
+        format!(
+            "CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'probe-only'"
+        ),
+        format!("CREATE DATABASE {db} OWNER {role}"),
+    ] {
+        sqlx::query(&stmt).execute(&admin).await.unwrap();
+    }
+    let url = format!("postgres://{role}:probe-only@{host}/{db}");
+    let pool = PgPool::connect(&url).await.unwrap();
+    let is_superuser: bool = sqlx::query_scalar("SELECT current_setting('is_superuser')::bool")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!is_superuser, "这条腿要的正是没有超级用户位的连接");
+    (admin, pool, url)
+}
+
+/// 收尾：先把受限连接关掉，再删库与角色（有活连接时 `DROP DATABASE` 会被拒）。
+async fn drop_restricted_database(admin: &PgPool, role: &str, db: &str) {
+    for stmt in [
+        format!("DROP DATABASE IF EXISTS {db}"),
+        format!("DROP ROLE IF EXISTS {role}"),
+    ] {
+        sqlx::query(&stmt).execute(admin).await.unwrap();
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
 async fn pg_backup_restore_round_trips_rows_partitions_and_sequences() {
@@ -690,49 +737,9 @@ async fn pg_restore_runs_on_a_role_without_the_superuser_bit() {
     const USERS: &str = "restricted_probe_users";
     const MEMBERS: &str = "restricted_probe_members";
 
-    let base = database_url();
-    let cut = base
-        .rfind('/')
-        .expect("a database URL has a path holding the database name");
-    let server = &base[..cut];
-    let (_, host) = server
-        .rsplit_once('@')
-        .expect("the test database URL carries credentials");
-    let admin = PgPool::connect(&format!("{server}/postgres"))
-        .await
-        .unwrap();
-
-    let role = "cog_restore_probe_limited";
-    let db = "cog_restore_probe_restricted";
-    // 上一次跑挂在半路会留下同名角色与库：先清掉，否则 CREATE 直接失败，而那个
-    // 失败与这一条要证明的事无关。
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {db}"))
-        .execute(&admin)
-        .await
-        .unwrap();
-    sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
-        .execute(&admin)
-        .await
-        .unwrap();
-    sqlx::query(&format!(
-        "CREATE ROLE {role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD 'probe-only'"
-    ))
-    .execute(&admin)
-    .await
-    .unwrap();
-    sqlx::query(&format!("CREATE DATABASE {db} OWNER {role}"))
-        .execute(&admin)
-        .await
-        .unwrap();
-
-    let pool = PgPool::connect(&format!("postgres://{role}:probe-only@{host}/{db}"))
-        .await
-        .unwrap();
-    let is_superuser: bool = sqlx::query_scalar("SELECT current_setting('is_superuser')::bool")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert!(!is_superuser, "这条腿要的正是没有超级用户位的连接");
+    const ROLE: &str = "cog_restore_probe_limited";
+    const DB: &str = "cog_restore_probe_restricted";
+    let (admin, pool, _url) = restricted_role_database(ROLE, DB).await;
 
     for stmt in [
         format!("CREATE TABLE {USERS} (id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL)"),
@@ -777,12 +784,51 @@ async fn pg_restore_runs_on_a_role_without_the_superuser_bit() {
     assert!(dangling.is_err(), "恢复完成后外键检查必须是开着的");
 
     pool.close().await;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {db}"))
-        .execute(&admin)
+    drop_restricted_database(&admin, ROLE, DB).await;
+}
+
+/// 演练在源库那台实例上建一个一次性库，**用同一个角色**跑迁移、建各 store 的结构、
+/// 再把包装回去。前两段今天没有覆盖：迁移里有 `CREATE EXTENSION`，它要不要超权位
+/// 取决于扩展的 trusted 位。`ALTER ROLE cog_user NOSUPERUSER` 之后，演练要是只能靠
+/// 超权位建出目标结构，它会在 03:47 那一趟才红——那时没有第二个包可选。
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn the_drill_schema_builds_on_a_role_without_the_superuser_bit() {
+    const ROLE: &str = "cog_drill_probe_limited";
+    const DB: &str = "cog_drill_probe_restricted";
+
+    let (admin, pool, url) = restricted_role_database(ROLE, DB).await;
+
+    let migrations = repo_root().join("crates/cog-storage/migrations");
+    cog_storage::migrate::Migrator::new(&migrations)
+        .run(&url)
         .await
         .unwrap();
-    sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
-        .execute(&admin)
-        .await
-        .unwrap();
+    cogneva::schema_bundle::apply(&pool).await.unwrap();
+
+    // 迁移装的是 `uuid-ossp`。它在 PG16 上是 trusted（库属主装得动），所以上面那一条
+    // 能过；把装了哪些扩展印出来，读的人才分得清「迁移没跑」与「扩展装不上」。
+    let extensions: Vec<String> =
+        sqlx::query_scalar("SELECT extname::text FROM pg_extension ORDER BY extname")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        extensions.iter().any(|name| name == "uuid-ossp"),
+        "uuid-ossp 没装上：{extensions:?}"
+    );
+
+    let tables: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        tables > 50,
+        "受限角色只建出 {tables} 张表——结构没立起来，恢复会在第一张缺表上停"
+    );
+
+    pool.close().await;
+    drop_restricted_database(&admin, ROLE, DB).await;
 }
