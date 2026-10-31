@@ -6407,8 +6407,14 @@ impl MainlineDeployer {
             // `rev_no_longer_tracked` 不是放行：被按的那一版再也没被问过，拦住它的
             // 那件事还在不在，这一轮不知道。别的两支都是这一版拿到了判词、并且照它
             // 走了，这一段到此为止。
+            //
+            // 清零与读数同一拍写：放过这一支的走法（上游一直只回「取消」，等满窗口
+            // 后按没有证据放行）在上一次提问里刚把这一段发成非零，若只清状态不写回
+            // 0，读数会带着一段已经结束的时长停在库里，而那正是这条读数存在的理由
+            // 要防的那件事。
             if ended.outcome != "rev_no_longer_tracked" {
                 state.ci_hold_run_since_unix = None;
+                self.record_ci_hold_reading(0).await;
             }
             state.ci_hold_ends.push(ended);
             let excess = state.ci_hold_ends.len().saturating_sub(CI_HOLD_END_KEEP);
