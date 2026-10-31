@@ -2604,6 +2604,23 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          by the heartbeat's `ci_hold=` cell",
     ),
     (
+        crate::metric_names::MAINLINE_CI_HOLD_UNOWNED.as_str(),
+        "1 on a round that held the rollout on an upstream CI failure and \
+         opened no goal that owns it; 0 otherwise, including the round that \
+         releases the hold. It exists beside the hold duration, which cannot \
+         tell a hold somebody is working on from a hold nobody was ever asked \
+         about: on 2026-10-31 every round of a real hold came back from the \
+         planner with `face_has_no_serving_member` and left only a log line, so \
+         the rollout stood still with a ready explanation that lived in a pod \
+         that had already been replaced. 0 is written on every round that is \
+         not held, for the reason the duration gauge gives -- the store only \
+         adds and overwrites, so a 1 nobody takes back is a rule that stays \
+         lit. No reason label: an unwired orchestrator and a refused submission \
+         both mean nobody owns the hold, and a labelled gauge would leave the \
+         cells it did not write this round standing at their old values; the \
+         distinction is in the log of the same round",
+    ),
+    (
         crate::metric_names::MAINLINE_CI_CHECK_EXCLUDED_TOTAL.as_str(),
         "Check runs that reported a failure and were left out of the CI verdict, \
          by the workflow that produced them (`workflow` label, the path the \

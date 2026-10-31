@@ -4331,6 +4331,9 @@ impl MainlineDeployer {
                 .map(|since| (chrono::Utc::now().timestamp() - since).max(0))
                 .unwrap_or(0);
             self.record_ci_hold_reading(held_secs).await;
+            // 这一轮没有扣住：有没有人接住这个问题也就无从谈起。放行那一支必须把
+            // 上一轮写下的 1 收回来，理由与时长那一格相同——库里只增不改。
+            self.record_ci_hold_unowned(false).await;
             return Ok(false);
         }
         warn!(
@@ -4381,7 +4384,11 @@ impl MainlineDeployer {
         // After the hold is on disk: a submission that fails must not cost the
         // record of how long this revision has been held, which is the reading
         // the alert rests on.
-        self.dispatch_ci_remediation(rev, &failed_checks).await;
+        let owned = self.dispatch_ci_remediation(rev, &failed_checks).await;
+        // 紧接着写这一格，「扣住了」与「谁在处理」才是同一个时点上的两个事实。
+        // 写在这里而不是 dispatch 里面：没有编排器那一支从来走不进 dispatch，
+        // 而它同样意味着没人被问过。
+        self.record_ci_hold_unowned(!owned).await;
         Ok(true)
     }
 
@@ -4398,9 +4405,15 @@ impl MainlineDeployer {
     /// by the graph as an idempotent no-op, and this branch runs on every
     /// polling cycle while the hold stands. A new day gets a new id, because a
     /// revision still red tomorrow is a finding nobody acted on.
-    async fn dispatch_ci_remediation(&self, rev: &str, failed_checks: &[String]) {
+    ///
+    /// Answers whether this hold has an owner: true when a goal was queued or
+    /// one already stood from an earlier round today, false when the submission
+    /// failed or there is no orchestrator to ask at all. The caller publishes
+    /// that as a reading, because a hold nobody can work on and a hold waiting
+    /// on work in flight read the same everywhere else.
+    async fn dispatch_ci_remediation(&self, rev: &str, failed_checks: &[String]) -> bool {
         let Some(orchestrator) = self.orchestrator.as_ref() else {
-            return;
+            return false;
         };
         let id = ci_hold_goal_id(
             rev,
@@ -4415,23 +4428,33 @@ impl MainlineDeployer {
         // present unit holds waits forever in the shared queue.
         row.is_executable = false;
         match orchestrator.submit_goal_auto(&goal, vec![row]).await {
-            Ok(added) if added.is_empty() => info!(
-                rev = %rev12(rev),
-                goal_id = %id,
-                "this revision already has today's CI remediation goal; nothing new queued"
-            ),
-            Ok(added) => info!(
-                rev = %rev12(rev),
-                goal_id = %id,
-                tasks = added.len(),
-                failed_checks = %failed_checks.join(","),
-                "the CI hold was handed to the action planner"
-            ),
-            Err(e) => warn!(
-                rev = %rev12(rev),
-                error = %e,
-                "the CI hold could not be submitted; it stays a held rollout and a log line"
-            ),
+            Ok(added) if added.is_empty() => {
+                info!(
+                    rev = %rev12(rev),
+                    goal_id = %id,
+                    "this revision already has today's CI remediation goal; nothing new queued"
+                );
+                // 已持有同一天的同一张单子也算有主：这一轮没有新任务，不是没人接。
+                true
+            }
+            Ok(added) => {
+                info!(
+                    rev = %rev12(rev),
+                    goal_id = %id,
+                    tasks = added.len(),
+                    failed_checks = %failed_checks.join(","),
+                    "the CI hold was handed to the action planner"
+                );
+                true
+            }
+            Err(e) => {
+                warn!(
+                    rev = %rev12(rev),
+                    error = %e,
+                    "the CI hold could not be submitted; it is a held rollout with no owner"
+                );
+                false
+            }
         }
     }
 
@@ -4459,6 +4482,26 @@ impl MainlineDeployer {
             .record_gauge(
                 cog_core::metric_names::MAINLINE_CI_HOLD_SECONDS,
                 held_secs as f64,
+                std::collections::HashMap::new(),
+            )
+            .await;
+    }
+
+    /// 扣住之外的那一问：这一轮有没有人接住它。
+    ///
+    /// 时长那一格答不了这件事，而「在等合并」与「每一轮都被拒、没人接到单子」
+    /// 在别的读数上完全同形——2026-10-31 的一场扣住就是这么站着：上游全部 503，
+    /// 部署器每一轮都拿回 `face_has_no_serving_member`，留一行 warn 跟着 Pod
+    /// 一起被换掉。0/1 而不是带标签的计数：写者每轮只写其中一格，其余几格的旧值
+    /// 会留在只增不改的库里，读起来像几件事同时成立；原因是哪一路在当轮日志里。
+    async fn record_ci_hold_unowned(&self, unowned: bool) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::MAINLINE_CI_HOLD_UNOWNED,
+                if unowned { 1.0 } else { 0.0 },
                 std::collections::HashMap::new(),
             )
             .await;
@@ -6443,6 +6486,9 @@ impl MainlineDeployer {
                 state.ci_hold_run_since_unix = None;
                 self.record_ci_hold_reading(0).await;
             }
+            // 这一次扣住到此为止，无论上面按哪种结局结束：不再扣住的一轮没有
+            // 「有没有人接手」可问，留着上一轮的 1 会让读它的规则继续点着。
+            self.record_ci_hold_unowned(false).await;
             state.ci_hold_ends.push(ended);
             let excess = state.ci_hold_ends.len().saturating_sub(CI_HOLD_END_KEEP);
             if excess > 0 {
@@ -15155,6 +15201,9 @@ exec {real} "$@"
     #[derive(Default)]
     struct RecordingPlanner {
         submissions: std::sync::Mutex<Vec<Submission>>,
+        /// 让提交失败的那一档：2026-10-31 整天都是它（每个上游 503，变成
+        /// `face_has_no_serving_member`），而"拒了"与"收了"在回读上必须分得开。
+        refuse: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingPlanner {
@@ -15173,6 +15222,11 @@ exec {real} "$@"
             goal: &str,
             tasks: Vec<cog_core::Task>,
         ) -> SFResult<Vec<String>> {
+            if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(cog_core::SFError::LLM(
+                    cog_core::contract::llm::FACE_WITHOUT_A_MEMBER.to_string(),
+                ));
+            }
             let ids: Vec<String> = tasks.iter().map(|task| task.id.clone()).collect();
             let mut held = self.submissions.lock().unwrap();
             let fresh: Vec<String> = ids
@@ -15347,6 +15401,84 @@ exec {real} "$@"
             submissions[1].2.is_empty(),
             "the graph already held that id, so nothing new is queued: {submissions:?}"
         );
+        let _ = handle.await.unwrap();
+    }
+
+    /// 扣住有没有主，必须是一条读数，而不是一行随 Pod 消失的日志。
+    ///
+    /// 2026-10-31 的现场：上游 CI 判红、部署器按住不乱滚（门是对的），可每一轮把
+    /// 这次扣住交给规划器时都拿回 `face_has_no_serving_member`——每个上游 503。
+    /// 于是「有人在修，等合并」与「没人接到单子，站到天荒地老」在屏上是同一行。
+    /// 这一格把两者的区别写进读数：提交成功或当天单子已在前者为 0，被拒与根本没有
+    /// 编排器者为 1；放行那一支写回 0，否则 1 会一直亮着。
+    #[tokio::test]
+    async fn a_hold_nobody_could_take_is_a_reading_of_its_own() {
+        use cog_core::metric_names::MAINLINE_CI_HOLD_UNOWNED;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"success"}]}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        planner
+            .refuse
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone())
+            .with_metrics(metrics.clone());
+        let read = || {
+            let metrics = metrics.clone();
+            async move {
+                metrics
+                    .query_gauge_latest(MAINLINE_CI_HOLD_UNOWNED.as_str())
+                    .await
+                    .unwrap()
+                    .first()
+                    .map(|s| s.value)
+            }
+        };
+
+        // 提交被拒：扣住了，但没人接住。
+        let mut state = MainlineState::default();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+        assert_eq!(
+            read().await.expect("扣住这一支必须写这一格"),
+            1.0,
+            "提交失败就是没人接住，读数上必须与「已派出去」分得开"
+        );
+
+        // 规划器恢复：同一版再问一次，单子开出，这一格收回 0。
+        planner
+            .refuse
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let mut state = deployer.load_state();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+        assert_eq!(
+            read().await.unwrap(),
+            0.0,
+            "单子开出去了，这一格要跟着收回，不能停在上一轮的 1"
+        );
+
+        // 上游放行：不再扣住，这一格同样是 0——库里只增不改，不写回就一直亮着。
+        let mut state = deployer.load_state();
+        assert!(!deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+        assert_eq!(read().await.unwrap(), 0.0);
         let _ = handle.await.unwrap();
     }
 

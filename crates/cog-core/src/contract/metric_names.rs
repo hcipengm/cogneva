@@ -988,6 +988,33 @@ metric_names! {
     // the state file's `ci_hold.rev`, the heartbeat's `ci_hold=` cell and the
     // log -- and it is read together with this number rather than inside it.
     MAINLINE_CI_HOLD_SECONDS => "cogneva_mainline_ci_hold_seconds",
+    // 1 on a round that held the rollout because the upstream CI reported a
+    // failure and that round created no goal to carry it; 0 on every other
+    // round.
+    //
+    // The hold duration above says how long the gate has been holding; it
+    // cannot say whether anything was asked to fix what holds it, and those two
+    // states are the same row on every surface: a held rollout whose
+    // remediation goal is queued and one whose every submission was refused
+    // both read as "held for N seconds". Which of the two it is decides the
+    // repair -- the first waits, the second is a planner nobody can reach.
+    //
+    // Measured 2026-10-31: every LLM upstream answered 503 for hours, so every
+    // round of a real CI hold came back with `face_has_no_serving_member` and
+    // left one warning line that the pod took with it on the next rollout. The
+    // hold itself was visible; "nobody owns it" was not.
+    //
+    // Two ways to be unowned, and both are recorded as 1 rather than split by
+    // label: no orchestrator is wired (nobody was asked) and a submission that
+    // came back an error (asked and refused). The gauge answers "is there an
+    // owner right now" -- a labelled gauge writing one cell per round would
+    // leave the other cells' last values standing in a store that only adds and
+    // overwrites, which reads as several causes being true at once. Which one
+    // it was is in the log of the same round.
+    //
+    // 0 is written by the round that releases the hold, for the reason the
+    // duration gauge above gives: a 1 nobody takes back stays lit forever.
+    MAINLINE_CI_HOLD_UNOWNED => "cogneva_mainline_ci_hold_unowned",
     // Consecutive rounds in which the advance could not take the host's build
     // slot, as a gauge; 0 on the round that takes one.
     //

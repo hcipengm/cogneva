@@ -209,6 +209,33 @@ pub const MAINLINE_CI_HOLD: ReadingSpec = ReadingSpec {
     dashboard_uid: None,
 };
 
+/// Whether anything is working on the rollout the CI gate is holding.
+///
+/// The row beside `mainline_ci_hold_seconds`, and the one that decides how to
+/// read it. A hold that has a goal behind it is the gate working; a hold whose
+/// every round failed to hand that goal to the planner is the mainline standing
+/// still with nobody told — the same row until 2026-10-31, when every upstream
+/// answered 503 and each round's refusal lived only in a log the next rollout
+/// took with it.
+///
+/// One is critical and there is no warning step: the deployer already waits out
+/// three of its own beats inside the alert rule before this is a fault, and a
+/// hold with no owner does not get better by being watched longer. The bound is
+/// that rule's `== 1`, so the board and the pager read the same number.
+pub const MAINLINE_CI_HOLD_UNOWNED: ReadingSpec = ReadingSpec {
+    id: "mainline_ci_hold_unowned",
+    title: "主线被扣住却无人接手",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_mainline_ci_hold_unowned)",
+    unit: "0/1",
+    warn: None,
+    crit: Some(1.0),
+    higher_is_worse: true,
+    series: "cogneva_mainline_ci_hold_unowned",
+    produced_by: "crates/cog-reflection/src/mainline_deployer.rs",
+    dashboard_uid: None,
+};
+
 /// How long the oldest change has been blocked by the model pool.
 ///
 /// The chain's second joint. A change that cannot call a model never becomes a
@@ -259,7 +286,7 @@ pub const LLM_UPSTREAMS_HEALTHY: ReadingSpec = ReadingSpec {
     dashboard_uid: None,
 };
 
-pub const READINGS: [&ReadingSpec; 9] = [
+pub const READINGS: [&ReadingSpec; 10] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -267,6 +294,7 @@ pub const READINGS: [&ReadingSpec; 9] = [
     &INGRESS_5XX,
     &UNREACHABLE,
     &MAINLINE_CI_HOLD,
+    &MAINLINE_CI_HOLD_UNOWNED,
     &CHANGE_POOL_BLOCKED_OLDEST,
     &LLM_UPSTREAMS_HEALTHY,
 ];

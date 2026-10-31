@@ -1,6 +1,7 @@
-# 主干（自进化部署器）那十三条读数的单测夹具。它们说的是「部署这件事还在不在往前走」：
+# 主干（自进化部署器）那十五条读数的单测夹具。它们说的是「部署这件事还在不在往前走」：
 # CI 判词失败或读不出来、换代问句停了、预检与 kubectl 被拒、发布被拒、发布从不落地、
-# 构建变慢、CI 持有太久、推进被饿死、定位判词停在「不前进」、判词沉默、轮询全失败。
+# 构建变慢、CI 持有太久、CI 持有无人接手、推进被饿死、定位判词停在「不前进」、判词
+# 沉默、轮询全失败。
 #
 # 这一族里有一半是「反事实」形状——**该有的那一半没发生**才响：
 #   - `mainline_rollout_never_lands`：有尝试、窗口里没有完成。
@@ -30,6 +31,7 @@ rule_files:
 # rule: mainline_rollout_never_lands
 # rule: mainline_build_slow
 # rule: mainline_ci_hold_too_long
+# rule: mainline_ci_hold_unowned
 # rule: mainline_advance_starved
 # rule: mainline_not_progressing
 # rule: mainline_progress_verdict_mute
@@ -68,6 +70,10 @@ tests:
       - series: 'cogneva_mainline_ci_hold_seconds'
         values: '100x60'
       - series: 'cogneva_mainline_ci_hold_seconds_observed_timestamp_seconds'
+        values: '100x60'
+      - series: 'cogneva_mainline_ci_hold_unowned'
+        values: '0x60'
+      - series: 'cogneva_mainline_ci_hold_unowned_observed_timestamp_seconds'
         values: '100x60'
       - series: 'cogneva_mainline_advance_wait_since_unix'
         values: '0x60'
@@ -109,6 +115,9 @@ tests:
         exp_alerts: []
       - eval_time: 60m
         alertname: mainline_ci_hold_too_long
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: mainline_ci_hold_unowned
         exp_alerts: []
       - eval_time: 60m
         alertname: mainline_advance_starved
@@ -339,4 +348,65 @@ tests:
               resource: memory
       - eval_time: 60m
         alertname: mainline_rollout_refused
+        exp_alerts: []
+
+  # 扣住没人接手：CI 判红、部署器按住（门的本职），可每一轮把这次扣住交给规划器时
+  # 都被拒——2026-10-31 的现场是每个上游 503，回 `face_has_no_serving_member`。这一格
+  # 里读数从第 25 分钟起一直是 1，写者还在写（观测时间戳跟着求值走），求值时窗口内
+  # 三十分钟全是 1。必须亮：删掉这条规则，或者把 `min_over_time` 换成瞬时值以外再把
+  # 界抬到别的数，这一格都是红的唯一读法。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_ci_hold_unowned'
+        values: '0x25 1x35'
+      - series: 'cogneva_mainline_ci_hold_unowned_observed_timestamp_seconds'
+        values: '3000x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: mainline_ci_hold_unowned
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 交不出去只有五分钟，规划器下一轮就恢复了：不亮。这一格是那条界的另一半——
+  # 一次被拒不是故障，循环下一轮还会再问一次；去掉 `min_over_time` 换成「出现 1 就亮」，
+  # 这一格立刻红。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_ci_hold_unowned'
+        values: '0x55 1x5'
+      - series: 'cogneva_mainline_ci_hold_unowned_observed_timestamp_seconds'
+        values: '3000x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: mainline_ci_hold_unowned
+        exp_alerts: []
+
+  # 值一直是 1，但写者停在起点（观测时间戳还是 100 秒，求值时已经差三千多秒）：
+  # 不亮。这是写者不在，不是交接一直失败；去掉新鲜度那一腿，这一格会亮穿——
+  # 而一个死在扣住途中的部署器留下的正是这个形状。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_ci_hold_unowned'
+        values: '0x25 1x35'
+      - series: 'cogneva_mainline_ci_hold_unowned_observed_timestamp_seconds'
+        values: '100x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: mainline_ci_hold_unowned
+        exp_alerts: []
+
+  # 序列比窗口年轻：一分钟的交不出去也没有。这一格里的读数头三十分钟根本不存在，
+  # 之后一直是 1；`min_over_time[1800s]` 此时看到的全是 1，会当作「连续半小时都
+  # 没人接手」——而部署器刚从重启里回来，那只是它写下的第一个采样。铺满那一腿
+  # （`count_over_time[1h] > count_over_time[30m]`）是这一格唯一能把它拦下来的东西。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_mainline_ci_hold_unowned'
+        values: '_x30 1x30'
+      - series: 'cogneva_mainline_ci_hold_unowned_observed_timestamp_seconds'
+        values: '3000x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: mainline_ci_hold_unowned
         exp_alerts: []
