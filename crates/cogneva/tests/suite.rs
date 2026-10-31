@@ -207,6 +207,8 @@ mod eval_table_determinism;
 mod event_bus_metric_seed_test;
 #[path = "every_agent_unhealthy_writer_consults_the_judgement.rs"]
 mod every_agent_unhealthy_writer_consults_the_judgement;
+#[path = "every_alert_condition_has_a_promql_shape_test.rs"]
+mod every_alert_condition_has_a_promql_shape_test;
 #[path = "every_file_in_the_static_tree_is_delivered_or_declared_test.rs"]
 mod every_file_in_the_static_tree_is_delivered_or_declared_test;
 #[path = "every_rendered_profile_is_a_tree_the_deployer_delivers_test.rs"]
