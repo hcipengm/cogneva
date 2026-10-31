@@ -1914,11 +1914,22 @@ impl DagExecutor {
         let now = chrono::Utc::now();
         let mut in_flight: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
+        // Occupancy is a count of work somebody holds, and a row nobody holds
+        // is held at most until one lease has passed since it last moved.
+        // Without that bound the absence of both a start instant and a lease
+        // reads as "the holder is alive forever": the reclaimer declines to
+        // treat the same absence as expiry, so nothing ever returns the row to
+        // the queue, and `admitted` subtracts it from the window's allowance
+        // on every pass. Measured on 2026-10-31, right after a rollout: 1,749
+        // `change_ledger` rows had been left in `Scheduled` by the process that
+        // went away, with neither field set, and a pass could admit nothing at
+        // all while nothing was running.
         for t in tasks.iter().filter(|t| match t.status {
             TaskStatus::Running => true,
             TaskStatus::Scheduled => t
                 .lease_expiry(self.task_lease)
-                .is_none_or(|expires| expires > now),
+                .or(Some(t.updated_at + self.task_lease))
+                .is_some_and(|expires| expires > now),
             _ => false,
         }) {
             *in_flight
@@ -4054,12 +4065,23 @@ mod tests {
         unclaimed.status = TaskStatus::Scheduled;
         pod.add_task(unclaimed).await.unwrap();
 
+        // The shape a process leaves behind when it goes away between moving a
+        // row to `Scheduled` and anybody claiming it: no start, no lease, and
+        // the same fields forever. One lease after it last moved it is not work
+        // in flight any more -- if it were, 1,749 of these would hold the whole
+        // allowance and every pass would admit zero.
+        let mut stranded = evolution_task("stranded");
+        stranded.status = TaskStatus::Scheduled;
+        stranded.updated_at = chrono::Utc::now() - chrono::Duration::hours(3);
+        pod.add_task(stranded).await.unwrap();
+
         let (_, owed) = pod.ready_tasks_and_in_flight().await;
         assert_eq!(
             owed.get(&local).copied().unwrap_or(0),
             2,
-            "a lease that lapsed three hours ago must not be subtracted from the \
-             next window the pool opens: {owed:?}"
+            "a lease that lapsed three hours ago, and a row nobody has held for \
+             longer than a lease, must not be subtracted from the next window \
+             the pool opens: {owed:?}"
         );
     }
 
