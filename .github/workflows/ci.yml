@@ -781,7 +781,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # `--keep-going` is what makes one red run list every offending crate. Without
+      # it the build halts at the first crate that fails, so a toolchain bump that
+      # adds a lint to two unrelated crates costs one push per crate, and the tree
+      # stays red between them.
+      - run: cargo clippy --keep-going --workspace --all-targets -- -D warnings
 
   # 仓库自身产物上的散文规则。这一组读的是**源码注释**这类既成的面，不编不跑，
   # 所以既不属于 fmt/clippy（那两条读编译器），也不属于 deploy-parity（那条读渲染
