@@ -1693,6 +1693,14 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主读数 `scripts/host/cogneva-refusal-redispatch-reading.sh`（不在本仓）的逐拍判词，one-hot 带 `state` 标签。规则只读三个红态：`refused_no_redispatch`（有拒绝、免费重投为 0，等于白挡一次）、`below_bar`（重投通道在跑却交不回 1/3）、`turn_off`（按预登记判据该关掉这条路）。`not_wired` / `no_refusals` / `undecided` / `keep` 是绿态，不进规则",
     ),
     (
+        "principle_style_verdict",
+        "宿主读数 `scripts/host/cogneva-principle-style-reading.sh`（不在本仓）：几扇「只在测试里跑、今天没有任何进程每拍跑它」的写作门，这一拍里至少一扇红时为 1。规则读的是这个判词而不是同族的 `principle_style_gate_failures`：红的扇数是要有人去翻的细节，而「这一刻有没有门红」才是要叫醒人的那一个。同族的 `principle_style_gates_judged` 是这一拍真跑了几扇——门本身跑不起来时脚本一条序列都不印、退 3，所以这个 1 不会由一扇都没跑起来的假 0 冒充。生产者不在本仓，规则侧只能登记",
+    ),
+    (
+        "retire_reasons_contract_drift",
+        "宿主读数 `scripts/host/cogneva-retire-reasons-match-reading.sh`（不在本仓）：脑库进料口的退场理由名单与公开仓平台契约 `as_str` 的字面量不同步时为 1，缺的／多的值按方向印在同一次读数的 stderr。判据跨两个仓，提交路径上不保证有公开仓的检出，所以它进不了提交门，只能由宿主每一拍判；生产者不在本仓，规则侧只能登记",
+    ),
+    (
         "principle_carriers_slug_no_landing",
         "宿主读数 `scripts/host/cogneva-principle-census-reading.sh`（不在本仓）：载体在树上声明了「已落」，账本里却查不到对应落地行的 slug 条数。载体与账两处都不在公开仓，所以这一格只能作为外来读数登记",
     ),
