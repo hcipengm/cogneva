@@ -44,7 +44,7 @@ impl WorkloadKind {
             WorkloadKind::DaemonSet => format!("/apis/apps/v1/namespaces/{namespace}/daemonsets"),
             WorkloadKind::CronJob => format!("/apis/batch/v1/namespaces/{namespace}/cronjobs"),
             WorkloadKind::Job => format!("/apis/batch/v1/namespaces/{namespace}/jobs"),
-            WorkloadKind::Pod => format!("/api/v1/namespaces/{namespace}/pods"),
+            WorkloadKind::Pod => "/api/v1/pods".to_string(),
         }
     }
     fn containers(self) -> &'static str {
@@ -211,6 +211,15 @@ sed -i 's/d.conditions.some(conditionIsTrouble)/d.conditions.some((c) => !c.ok)/
   "${work}/web/src/views/DeliveryView.tsx"
 confirm "${work}/web/src/views/DeliveryView.tsx" "some((c) => !c.ok)"
 expect_red "屏上绕过判据函数" "conditionIsTrouble"
+
+# 8c. Pod 那条读退回单命名空间。裸 Pod（评测环境的题、宿主脚本 apply 的探针、
+# 系统组件）都在各自的命名空间里，按本进程那一个读会正好漏掉它们，而屏上只是少
+# 几行——这就是第 9 条判据当初要堵的那种「存在的东西被说成不存在」。
+fixture
+sed -i 's#WorkloadKind::Pod => "/api/v1/pods".to_string()#WorkloadKind::Pod => format!("/api/v1/namespaces/{namespace}/pods")#' \
+  "${work}/crates/cog-gateway/src/cluster.rs"
+confirm "${work}/crates/cog-gateway/src/cluster.rs" "/api/v1/namespaces/{namespace}/pods"
+expect_red "Pod 读退回单命名空间" "/api/v1/pods"
 
 # 9. 没有这次改动就会红的那条测试被删掉。
 fixture

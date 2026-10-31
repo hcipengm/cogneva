@@ -67,7 +67,10 @@ groups = {
     "cronjobs": "batch",
     "jobs": "batch",
 }
-# 核心组没有 `/apis` 前缀：Pod 那条路径是 `/api/v1/namespaces/…/pods`。
+# 核心组没有 `/apis` 前缀：Pod 那条路径是 `/api/v1/pods`（集群范围的那条）。
+# 判的是集群范围这条，不是 `/api/v1/namespaces/<ns>/pods`：裸 Pod 不止落在本进程
+# 自己那个命名空间里——评测环境的题、宿主脚本 apply 的探针、系统组件的 Pod 都在
+# 各自的命名空间里，按命名空间读会正好漏掉那几种，而空白读起来像「本来就没有」。
 CORE = {"pods": ""}
 for resource, group in groups.items():
     if not re.search(rf"apis/{group}/v1/namespaces/.*{resource}", server):
@@ -77,9 +80,9 @@ for resource, group in groups.items():
         )
 
 for resource in CORE:
-    if not re.search(rf'"/api/v1/namespaces/\{{namespace\}}/{resource}"', server):
+    if not re.search(rf'"/api/v1/{resource}"', server):
         problems.append(
-            f"服务端没有问 /api/v1/namespaces/…/{resource}——裸 Pod（评测环境、一次性探针）"
+            f"服务端没有问 /api/v1/{resource}——裸 Pod（评测环境、一次性探针）"
             "不在清单里，而评测跑起来的时候屏上看不出这件事在发生"
         )
 if not re.search(r"WorkloadKind::Pod", server):

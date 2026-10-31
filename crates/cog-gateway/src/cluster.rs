@@ -2173,26 +2173,35 @@ impl WorkloadKind {
     /// 集群范围的那一版不是把 `namespaces/<ns>` 换成空串拼出来的：apiserver 的集群
     /// 范围路径根本没有这一段。两种拼法都在的时候，占位符漏填会得到一个读得通的
     /// 单命名空间路径——一条少读了一半而看起来正常的读数。
+    ///
+    /// 两条都写成整条字面量，不拆成组前缀加资源名再拼：读权限那条门扫的是源码里的
+    /// 字面量，只看到组前缀与版本、看不到资源名时它认不出这是哪一类资源，只能报
+    /// 「不认识的路径形状」——而一条认不出来的路径，缺权限时那条门什么都不说，屏上
+    /// 只是少几行。整条写出来，那条门才能把每条读对到规则上的 (作用域, group,
+    /// resource)，集群范围与命名空间两条各自被验一遍。
     fn list_path(self, namespace: Option<&str>) -> String {
-        macro_rules! path {
-            ($group:literal, $resource:literal) => {
-                match namespace {
-                    Some(namespace) => format!(
-                        concat!($group, "/namespaces/{namespace}/", $resource),
-                        namespace = namespace
-                    ),
-                    None => concat!($group, "/", $resource).to_string(),
-                }
-            };
-        }
-        match self {
-            WorkloadKind::Deployment => path!("/apis/apps/v1", "deployments"),
-            WorkloadKind::StatefulSet => path!("/apis/apps/v1", "statefulsets"),
-            WorkloadKind::DaemonSet => path!("/apis/apps/v1", "daemonsets"),
-            WorkloadKind::CronJob => path!("/apis/batch/v1", "cronjobs"),
-            WorkloadKind::Job => path!("/apis/batch/v1", "jobs"),
+        match (self, namespace) {
+            (WorkloadKind::Deployment, None) => "/apis/apps/v1/deployments".to_string(),
+            (WorkloadKind::Deployment, Some(ns)) => {
+                format!("/apis/apps/v1/namespaces/{ns}/deployments")
+            }
+            (WorkloadKind::StatefulSet, None) => "/apis/apps/v1/statefulsets".to_string(),
+            (WorkloadKind::StatefulSet, Some(ns)) => {
+                format!("/apis/apps/v1/namespaces/{ns}/statefulsets")
+            }
+            (WorkloadKind::DaemonSet, None) => "/apis/apps/v1/daemonsets".to_string(),
+            (WorkloadKind::DaemonSet, Some(ns)) => {
+                format!("/apis/apps/v1/namespaces/{ns}/daemonsets")
+            }
+            (WorkloadKind::CronJob, None) => "/apis/batch/v1/cronjobs".to_string(),
+            (WorkloadKind::CronJob, Some(ns)) => {
+                format!("/apis/batch/v1/namespaces/{ns}/cronjobs")
+            }
+            (WorkloadKind::Job, None) => "/apis/batch/v1/jobs".to_string(),
+            (WorkloadKind::Job, Some(ns)) => format!("/apis/batch/v1/namespaces/{ns}/jobs"),
             // 核心组没有 `/apis/<group>` 前缀，路径只有 `/api/v1`。
-            WorkloadKind::Pod => path!("/api/v1", "pods"),
+            (WorkloadKind::Pod, None) => "/api/v1/pods".to_string(),
+            (WorkloadKind::Pod, Some(ns)) => format!("/api/v1/namespaces/{ns}/pods"),
         }
     }
 

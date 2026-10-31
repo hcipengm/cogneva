@@ -119,6 +119,23 @@ fixture
 bash "${checker}" "${work}" >"${work}/green.out" 2>&1 \
   || { cat "${work}/green.out" >&2; fail "完整夹具：应当绿却红了"; }
 
+# 0. 路径拆成「组前缀 + 资源名」再拼。这条门扫的是源码里的字面量，半截形状它认
+# 不出是哪一类资源，只能报「不认识的路径形状」——2026-10-31 就是这么红过一次：
+# 集群范围的读改完之后，代码是一条读都没少，可这条门对这一族什么都不说。
+fixture
+python3 - "${work}/crates/cog-gateway/src/cluster.rs" <<'PATCH'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+src = src.replace(
+    'WorkloadKind::Job => format!("/apis/batch/v1/namespaces/{namespace}/jobs"),',
+    'WorkloadKind::Job => format!(concat!("/apis/batch/v1", "/namespaces/{namespace}/jobs")),',
+)
+open(path, "w", encoding="utf-8").write(src)
+PATCH
+confirm "${work}/crates/cog-gateway/src/cluster.rs" 'concat!("/apis/batch/v1"'
+expect_red "路径拆成前缀再拼" "不认识的路径形状"
+
 # 1. 静态清单少授 StatefulSet。
 fixture
 sed -i 's/"deployments", "statefulsets", "daemonsets"/"deployments", "daemonsets"/' \
