@@ -101,7 +101,9 @@ function ClusterRow({
           </span>
         </span>
         {cluster.version && <span className="mono text-[11px] text-[var(--muted)]">{cluster.version}</span>}
-        <span className="mono text-[11px] text-[var(--muted)]">命名空间 {cluster.namespace}</span>
+        <span className="mono text-[11px] text-[var(--muted)]">
+          整个集群 · 本进程在 {cluster.namespace}
+        </span>
         <span className="text-[11px] text-[var(--paper-dim)]">
           节点 {ready}/{cluster.nodes.length} 就绪 · Pod {pods}
           {counts.finished > 0 && `（已完成 ${counts.finished}）`}
@@ -113,9 +115,10 @@ function ClusterRow({
       </header>
 
       <p className="px-4 pb-1 text-[10px] text-[var(--muted)]">
-        Pod 与节点都是整个集群的：别的命名空间（系统组件、监控）也画在它的节点上。
-        事件与卷声明只读<span className="mono"> {cluster.namespace} </span>
-        这一个命名空间，别的命名空间里的 Pod 那两格是空的，不是没有。
+        Pod、事件、卷声明与节点都是整个集群的读数：别的命名空间（系统组件、监控）
+        的 Pod 也画在它的节点上，它们的事件与卷也在各自那一行里。
+        <span className="mono"> {cluster.namespace} </span>
+        是发布这份读数的进程自己所在的命名空间，不是这份读数的范围。
       </p>
 
       {cluster.error && (

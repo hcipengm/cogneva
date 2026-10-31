@@ -204,7 +204,7 @@ export function BreathingTopology({ data }: { data: ClusterTopologyData }) {
                 style={{ cursor: 'pointer' }}
               >
                 <title>
-                  {`${clusterName(cluster, clusters.length)}\n可读 ${view.reachable ? '是' : '否'} · 命名空间 ${view.namespace}\n节点 ${ready}/${view.nodes.length} 就绪\n点这里看这个集群`}
+                  {`${clusterName(cluster, clusters.length)}\n可读 ${view.reachable ? '是' : '否'} · 覆盖整个集群（进程在 ${view.namespace}）\n节点 ${ready}/${view.nodes.length} 就绪\n点这里看这个集群`}
                 </title>
                 <rect
                   x={6}
@@ -594,7 +594,8 @@ function ClusterDetail({
 
       <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-[11px] text-[var(--paper-dim)]">
         <span>
-          命名空间 <span className="mono">{cluster.namespace}</span>
+          范围 <span className="mono">整个集群</span>（进程在{' '}
+          <span className="mono">{cluster.namespace}</span>）
         </span>
         <span>
           用量来源 <span className="mono">{cluster.usage_source ?? '无'}</span>

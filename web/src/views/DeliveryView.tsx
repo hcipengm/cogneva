@@ -55,7 +55,11 @@ export function DeliveryView() {
   return (
     <ViewFrame
       title="构建与部署"
-      meta={report ? `命名空间 ${report.namespace || '（不在集群里）'} · ${new Date(report.collected_at).toLocaleTimeString('zh-CN')}` : '按 15 秒重读'}
+      meta={
+        report
+          ? `整个集群 ${report.namespaces.length} 个命名空间 · ${new Date(report.collected_at).toLocaleTimeString('zh-CN')}`
+          : '按 15 秒重读'
+      }
     >
       <section className="border-b border-[var(--line)]">
         <h2 className="px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">工作负载</h2>
@@ -66,10 +70,10 @@ export function DeliveryView() {
         ) : report.error ? (
           <p className="px-4 py-2 text-[11px] text-[var(--warn)]">{report.error}</p>
         ) : rows.length === 0 ? (
-          <Empty>这个命名空间里没有工作负载。</Empty>
+          <Empty>整个集群里没有读到工作负载。</Empty>
         ) : (
           <>
-            <Readings from={workloads} source="GET /api/v1/cluster/deployments" caveat="「采集于」是服务端读 apiserver 的时刻；这份读数在两次轮询之间不会自己变。Deployment / StatefulSet / DaemonSet / CronJob / Job 五种，加上没有控制器拥有的裸 Pod（评测环境就是这种），都在这一份里。">
+            <Readings from={workloads} source="GET /api/v1/cluster/deployments" caveat="「采集于」是服务端读 apiserver 的时刻；这份读数在两次轮询之间不会自己变。范围是整个集群的全部命名空间，不只是本进程那一个。Deployment / StatefulSet / DaemonSet / CronJob / Job 五种，加上没有控制器拥有的裸 Pod（评测环境就是这种），都在这一份里。">
             <div className="flex flex-wrap py-2">
               <Reading label="工作负载" value={rows.length} note={kindSummary(rows)} />
               <Reading
@@ -93,6 +97,12 @@ export function DeliveryView() {
                     {d.kind}
                     {d.phase ? ` · ${d.phase}` : ''}
                   </span>
+                ) },
+                // 跨命名空间读回来之后，`name` 单独一行已经不能指认是谁：两个
+                // 命名空间各有一个 `default` Service 是常事。命名空间这一列不是
+                // 装饰，它是这行唯一性的另一半。
+                { key: 'namespace', title: '命名空间', width: '150px', render: (d) => (
+                  <span className="mono text-[11px] text-[var(--muted)]">{d.namespace || '—'}</span>
                 ) },
                 { key: 'name', title: '工作负载', width: '190px', render: (d) => (
                   <span className="mono text-[11px]">{d.name}</span>
@@ -121,7 +131,7 @@ export function DeliveryView() {
                 { key: 'conditions', title: '条件', render: (d) => <Conditions workload={d} /> },
               ]}
               rows={rows}
-              rowKey={(d) => `${d.kind}/${d.name}`}
+              rowKey={(d) => `${d.namespace}/${d.kind}/${d.name}`}
             />
             {/* 「已经滚到位几个」是一句比例，而表里只有逐行的「3 / 3」。按各自的
                 目标算成百分比画开，谁还差、差多少一眼看见。没有目标副本的工种
@@ -131,8 +141,8 @@ export function DeliveryView() {
               note="就绪副本 ÷ 目标副本（GET /api/v1/cluster/deployments）；红的是还没滚到位；没有目标副本的工种不画"
               max={100}
               rows={rolling.map((d) => ({
-                id: `${d.kind}/${d.name}`,
-                label: `${d.kind} ${d.name}`,
+                id: `${d.namespace}/${d.kind}/${d.name}`,
+                label: `${d.namespace}/${d.kind} ${d.name}`,
                 value: (d.desired ?? 0) > 0 ? Math.round(((d.ready ?? 0) / (d.desired ?? 1)) * 100) : 0,
                 note: `${d.ready ?? 0} / ${d.desired ?? 0}`,
                 tone: (d.ready ?? 0) >= (d.desired ?? 0) ? undefined : ('warn' as const),

@@ -150,9 +150,10 @@ pub struct ClusterView {
     /// 稳定标识，前端用它做选中态。这是接口给这个连接的编号（`in-cluster`），
     /// 不是集群的名字——Kubernetes 的 API 里没有「集群叫什么」这一项。
     pub id: String,
-    /// 这一面读的是**这一个命名空间**里的 Pod：节点是整台机器的，Pod 只取平台自己的
-    /// 那一个。界面要把这句说出来，否则「Pod 37」会被读成「集群里一共 37 个 Pod」，
-    /// 而 `kubectl get pods -A` 会给出另一个数。
+    /// 发布这份读数的进程自己所在的命名空间。**不是**读数的范围：Pod、事件、卷声明
+    /// 与节点都是集群范围的（`/api/v1/pods` 这类路径没有命名空间段），别的命名空间
+    /// 里的东西一样画在屏上。留这一格是因为读者仍要问「这个进程在哪」——把它当成
+    /// 范围印在标题上，会把「Pod 37」读成「平台自己就 37 个 Pod」。
     pub namespace: String,
     /// 这次读取有没有真的读到集群。`false` 时 `error` 说明为什么。
     pub reachable: bool,
@@ -699,20 +700,18 @@ pub const READ_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// 是 apiserver 不在，而那时节点那一读已经红了；`metrics.k8s.io/pods` 与
 /// `nodes/<n>/proxy/stats/summary` 是**可选**用量来源，没装 metrics-server 的集群
 /// 上它们本来就该 403，把可选的缺席报成故障就是一张永远亮着的红条。
-pub fn read_targets(namespace: &str) -> Vec<(&'static str, String)> {
+/// 没有参数：这一面读的是整个集群，探的也是整个集群。带一个命名空间进来会让
+/// 调用点以为「这一面只管那一个」，而每一条路径其实都不看它。
+pub fn read_targets() -> Vec<(&'static str, String)> {
     let mut targets = vec![
         ("nodes", "/api/v1/nodes".to_string()),
         ("pods", "/api/v1/pods".to_string()),
         ("persistentvolumeclaims", pvc_list_path().to_string()),
         ("events", event_list_path().to_string()),
-        (
-            "resourcequotas",
-            format!("/api/v1/namespaces/{namespace}/resourcequotas"),
-        ),
-        (
-            "limitranges",
-            format!("/api/v1/namespaces/{namespace}/limitranges"),
-        ),
+        // 配额与限额按集群范围读，与 `cluster_quota_handler` 同一条路径：探针探的
+        // 不是「能不能读到我这一个命名空间」，而是「这一面整体能不能读到」。
+        ("resourcequotas", "/api/v1/resourcequotas".to_string()),
+        ("limitranges", "/api/v1/limitranges".to_string()),
     ];
     for kind in WorkloadKind::ALL {
         let resource = kind.resource();
@@ -721,7 +720,10 @@ pub fn read_targets(namespace: &str) -> Vec<(&'static str, String)> {
         if targets.iter().any(|(name, _)| *name == resource) {
             continue;
         }
-        targets.push((resource, kind.list_path(namespace)));
+        // 探针走的是读数**真正会走**的那条路径，不是附近一条能读通的：探测
+        // `/namespaces/<ns>/…` 全绿、而读数读的是集群范围，一个只授权了单命名空间
+        // 的 SA 会让这条读数每次都空，而每一格读数都报 ok。
+        targets.push((resource, kind.list_path(None)));
     }
     targets
 }
@@ -821,11 +823,8 @@ mod read_label_tests {
 /// 两格都缺席。写了 0 之后，缺席只意味着「这个进程不发布这条读数」，0 意味着探针
 /// 跑过、每一条读都答了——那是两种不同的状态，修法也不同。
 pub async fn publish_vocabulary(metrics: &Option<std::sync::Arc<dyn cog_core::MetricsBackend>>) {
-    let namespace = KubeClient::in_cluster()
-        .map(|client| client.namespace().to_string())
-        .unwrap_or_else(|_| "cogneva".to_string());
     let deployment = deployment_label();
-    for (resource, _) in read_targets(&namespace) {
+    for (resource, _) in read_targets() {
         for outcome in [READ_OK, READ_FAILED] {
             publish_read(metrics, resource, outcome, deployment.as_deref(), 0.0).await;
         }
@@ -838,7 +837,7 @@ pub(crate) async fn probe_reads(
     metrics: &Option<std::sync::Arc<dyn cog_core::MetricsBackend>>,
 ) {
     let deployment = deployment_label();
-    for (resource, path) in read_targets(client.namespace()) {
+    for (resource, path) in read_targets() {
         // `limit=1`：探的是这条读通不通，不是它返回什么。一次读回整个集群的 Pod
         // 只为判权限，是把每分钟一次的探针变成了真正的负载。
         let outcome = match client.get_json(&format!("{path}?limit=1")).await {
@@ -1654,6 +1653,10 @@ pub struct QuotaEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QuotaView {
+    /// 这条配额属于哪个命名空间。集群范围读一次就拿到全部命名空间的配额，
+    /// 少了这一格，两个命名空间里同名的 `default` 配额会在屏上并成一条：
+    /// 读者看到的限额是对的、归属是错的，而错的那一半没有任何一处报错。
+    pub namespace: String,
     pub name: String,
     pub entries: Vec<QuotaEntry>,
 }
@@ -1672,13 +1675,23 @@ pub struct LimitEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LimitView {
+    /// 同 [`QuotaView::namespace`]：这条默认限额约束的是哪个命名空间的准入。
+    pub namespace: String,
     pub name: String,
     pub entries: Vec<LimitEntry>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ResourceReport {
+    /// 本进程所在的命名空间。**不是**这份读数覆盖的范围——范围是整个集群，
+    /// 由 `namespaces` 那一条说出来。留这一格是因为读者仍要问「我这个进程在哪」。
     pub namespace: String,
+    /// 这份读数实际覆盖到的命名空间，按名字排序。
+    ///
+    /// 有它，「全量」这句话才可检验：读者数得出来是 3 个还是 6 个命名空间。
+    /// 空的配额列表有两种读法——「整个集群都没有 ResourceQuota」和「一个都没有读到」，
+    /// 而这一格能把它们分开。
+    pub namespaces: Vec<String>,
     /// 读不到时写明原因。空列表本身不说明「配额是零」。
     pub error: Option<String>,
     pub quotas: Vec<QuotaView>,
@@ -1702,6 +1715,9 @@ pub struct ResourceReport {
 pub struct WorkloadView {
     /// 工种：Deployment / StatefulSet / DaemonSet / CronJob / Job / Pod。
     pub kind: String,
+    /// 这个工作负载属于哪个命名空间。集群范围一次读回全部命名空间，这一格是
+    /// 它们在屏上分组、也是「这东西是谁的」的唯一依据。
+    pub namespace: String,
     pub name: String,
     /// 裸 Pod 的相位（`Pending` / `Running` / `Succeeded` / `Failed`），别的工种为 `None`。
     ///
@@ -1723,7 +1739,12 @@ pub struct WorkloadView {
 
 #[derive(Debug, Serialize)]
 pub struct WorkloadsReport {
+    /// 本进程所在的命名空间，不是这份读数覆盖的范围（那是 `namespaces`）。
     pub namespace: String,
+    /// 这份读数覆盖到的命名空间，按名字排序。逐个工种读回来的对象各自带着命名空间，
+    /// 这一格由它们数出来——「全量」这句话得有个数兜着，否则少了 kube-system 的一行
+    /// 与「这个集群本来就没有 kube-system」在屏上同形。
+    pub namespaces: Vec<String>,
     pub error: Option<String>,
     pub workloads: Vec<WorkloadView>,
     pub collected_at: DateTime<Utc>,
@@ -1774,6 +1795,25 @@ fn quota_percent(hard: &str, used: &str) -> Option<f64> {
     Some(((used / hard) * 1000.0).round() / 10.0)
 }
 
+/// 集群范围读回来的每个对象都带着自己的命名空间；这一格就是它的唯一来源。
+///
+/// 不用「这次读的是哪个命名空间」去填：集群范围的那一读没有那一个名字，而拿
+/// 进程自己的命名空间顶上，会把 monitoring 的配额印成 cogneva 的——一个能读、
+/// 能算、能画的错数。
+fn namespace_of(item: &Value) -> String {
+    item.pointer("/metadata/namespace")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn name_of(item: &Value) -> String {
+    item.pointer("/metadata/name")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn quotas_from(list: &Value) -> Vec<QuotaView> {
     let Some(items) = list.get("items").and_then(Value::as_array) else {
         return Vec::new();
@@ -1818,11 +1858,8 @@ fn quotas_from(list: &Value) -> Vec<QuotaView> {
                 })
                 .collect();
             QuotaView {
-                name: item
-                    .pointer("/metadata/name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                namespace: namespace_of(item),
+                name: name_of(item),
                 entries,
             }
         })
@@ -1877,11 +1914,8 @@ fn limits_from(list: &Value) -> Vec<LimitView> {
                 }
             }
             LimitView {
-                name: item
-                    .pointer("/metadata/name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
+                namespace: namespace_of(item),
+                name: name_of(item),
                 entries: merged.into_values().collect(),
             }
         })
@@ -1945,23 +1979,34 @@ impl WorkloadKind {
         }
     }
 
-    /// apiserver 上取这一工种列表的路径。
+    /// apiserver 上取这一工种列表的路径。`None` 是集群范围——一次读回**全部**命名空间。
     ///
     /// Deployment / StatefulSet / DaemonSet 在 apps/v1，CronJob / Job 在 batch/v1：
     /// 分组不是可以统一拼出来的，写成分支。
-    fn list_path(self, namespace: &str) -> String {
+    ///
+    /// 集群范围的那一版不是把 `namespaces/<ns>` 换成空串拼出来的：apiserver 的集群
+    /// 范围路径根本没有这一段。两种拼法都在的时候，占位符漏填会得到一个读得通的
+    /// 单命名空间路径——一条少读了一半而看起来正常的读数。
+    fn list_path(self, namespace: Option<&str>) -> String {
+        macro_rules! path {
+            ($group:literal, $resource:literal) => {
+                match namespace {
+                    Some(namespace) => format!(
+                        concat!($group, "/namespaces/{namespace}/", $resource),
+                        namespace = namespace
+                    ),
+                    None => concat!($group, "/", $resource).to_string(),
+                }
+            };
+        }
         match self {
-            WorkloadKind::Deployment => {
-                format!("/apis/apps/v1/namespaces/{namespace}/deployments")
-            }
-            WorkloadKind::StatefulSet => {
-                format!("/apis/apps/v1/namespaces/{namespace}/statefulsets")
-            }
-            WorkloadKind::DaemonSet => format!("/apis/apps/v1/namespaces/{namespace}/daemonsets"),
-            WorkloadKind::CronJob => format!("/apis/batch/v1/namespaces/{namespace}/cronjobs"),
-            WorkloadKind::Job => format!("/apis/batch/v1/namespaces/{namespace}/jobs"),
+            WorkloadKind::Deployment => path!("/apis/apps/v1", "deployments"),
+            WorkloadKind::StatefulSet => path!("/apis/apps/v1", "statefulsets"),
+            WorkloadKind::DaemonSet => path!("/apis/apps/v1", "daemonsets"),
+            WorkloadKind::CronJob => path!("/apis/batch/v1", "cronjobs"),
+            WorkloadKind::Job => path!("/apis/batch/v1", "jobs"),
             // 核心组没有 `/apis/<group>` 前缀，路径只有 `/api/v1`。
-            WorkloadKind::Pod => format!("/api/v1/namespaces/{namespace}/pods"),
+            WorkloadKind::Pod => path!("/api/v1", "pods"),
         }
     }
 
@@ -1997,7 +2042,11 @@ fn workload_from(kind: WorkloadKind, item: &Value) -> Option<WorkloadView> {
     {
         return None;
     }
-    let name = item.pointer("/metadata/name").and_then(Value::as_str)?;
+    let namespace = namespace_of(item);
+    let name = item
+        .pointer("/metadata/name")
+        .and_then(Value::as_str)?
+        .to_string();
     let count = |pointer: &str| {
         item.pointer(pointer)
             .and_then(Value::as_u64)
@@ -2056,7 +2105,8 @@ fn workload_from(kind: WorkloadKind, item: &Value) -> Option<WorkloadView> {
 
     Some(WorkloadView {
         kind: kind.as_str().to_string(),
-        name: name.to_string(),
+        namespace,
+        name,
         phase: match kind {
             WorkloadKind::Pod => item
                 .pointer("/status/phase")
@@ -2095,6 +2145,7 @@ pub async fn cluster_quota_handler() -> Json<ResourceReport> {
     let Ok(client) = KubeClient::in_cluster() else {
         return Json(ResourceReport {
             namespace: String::new(),
+            namespaces: Vec::new(),
             error: Some("不在集群里跑，读不到配额".to_string()),
             quotas: Vec::new(),
             limits: Vec::new(),
@@ -2105,10 +2156,10 @@ pub async fn cluster_quota_handler() -> Json<ResourceReport> {
     let namespace = client.namespace().to_string();
     let mut error = None;
 
-    let quotas = match client
-        .get_json(&format!("/api/v1/namespaces/{namespace}/resourcequotas"))
-        .await
-    {
+    // 集群范围读：配额与限额是**准入前**的账，一个命名空间限住了，别处申请不到
+    // 额度的 Pod 一样起不来。只读自己那一个，monitoring 的 Prometheus 被 LimitRange
+    // 挡在准入时的现场就永远不出现在资源页上——而那一面本该是「这个集群还剩多少」。
+    let quotas = match client.get_json("/api/v1/resourcequotas").await {
         Ok(list) => quotas_from(&list),
         Err(e) => {
             error = Some(format!("读不到 ResourceQuota：{e}"));
@@ -2116,10 +2167,7 @@ pub async fn cluster_quota_handler() -> Json<ResourceReport> {
         }
     };
 
-    let limits = match client
-        .get_json(&format!("/api/v1/namespaces/{namespace}/limitranges"))
-        .await
-    {
+    let limits = match client.get_json("/api/v1/limitranges").await {
         Ok(list) => limits_from(&list),
         Err(e) => {
             error = Some(match error {
@@ -2132,6 +2180,7 @@ pub async fn cluster_quota_handler() -> Json<ResourceReport> {
 
     Json(ResourceReport {
         namespace,
+        namespaces: covered_namespaces(&quotas, &limits),
         error,
         quotas,
         limits,
@@ -2139,11 +2188,31 @@ pub async fn cluster_quota_handler() -> Json<ResourceReport> {
     })
 }
 
+/// 这次读数实际覆盖到的命名空间。
+///
+/// 从读回来的对象自己身上数，不另读一次 `/api/v1/namespaces`：那一读会多一次往返，
+/// 而且它回答的是「集群里有几个命名空间」，不是「这份读数覆盖了谁」——两者在权限
+/// 不足时正好不同，而屏上要印的是后者。
+fn covered_namespaces(quotas: &[QuotaView], limits: &[LimitView]) -> Vec<String> {
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for quota in quotas {
+        seen.insert(quota.namespace.as_str());
+    }
+    for limit in limits {
+        seen.insert(limit.namespace.as_str());
+    }
+    seen.into_iter()
+        .filter(|namespace| !namespace.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 pub async fn cluster_deployments_handler() -> Json<WorkloadsReport> {
     let collected_at = Utc::now();
     let Ok(client) = KubeClient::in_cluster() else {
         return Json(WorkloadsReport {
             namespace: String::new(),
+            namespaces: Vec::new(),
             error: Some("不在集群里跑，读不到工作负载".to_string()),
             workloads: Vec::new(),
             collected_at,
@@ -2151,9 +2220,12 @@ pub async fn cluster_deployments_handler() -> Json<WorkloadsReport> {
     };
 
     let namespace = client.namespace().to_string();
+    // 集群范围：资源管理要的是这个集群里**全部**工作负载，不是这个进程自己那一格。
+    // 只读本命名空间时，monitoring 的 Prometheus / Grafana、kube-system 的控制面组件
+    // 都不在屏上，而一张缺了一半的清单与一张完整的清单长得一模一样。
     let paths: Vec<String> = WorkloadKind::ALL
         .iter()
-        .map(|kind| kind.list_path(&namespace))
+        .map(|kind| kind.list_path(None))
         .collect();
     // 六个工种互不依赖，一起问。先后问的话一次页面刷新要串六次 apiserver，
     // 其中 Job 那一列还是全命名空间最大的一列。
@@ -2185,8 +2257,18 @@ pub async fn cluster_deployments_handler() -> Json<WorkloadsReport> {
         }
     }
 
+    let namespaces = workloads
+        .iter()
+        .map(|workload| workload.namespace.as_str())
+        .filter(|namespace| !namespace.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
     Json(WorkloadsReport {
         namespace,
+        namespaces,
         error: if errors.is_empty() {
             None
         } else {
@@ -3303,14 +3385,17 @@ mod topology_tests {
     }
 
     /// 每个工种问的是自己那一组接口，路径不是拼出来的。
+    ///
+    /// 两种范围都钉住：字符串拼错一个字母，集群范围的那一读会退成一条读得通的
+    /// 单命名空间路径，屏上少掉半个集群而没有任何一处报错。
     #[test]
     fn every_kind_lists_its_own_resource() {
-        let paths: Vec<String> = WorkloadKind::ALL
+        let scoped: Vec<String> = WorkloadKind::ALL
             .iter()
-            .map(|kind| kind.list_path("cogneva"))
+            .map(|kind| kind.list_path(Some("cogneva")))
             .collect();
         assert_eq!(
-            paths,
+            scoped,
             vec![
                 "/apis/apps/v1/namespaces/cogneva/deployments",
                 "/apis/apps/v1/namespaces/cogneva/statefulsets",
@@ -3320,6 +3405,29 @@ mod topology_tests {
                 "/api/v1/namespaces/cogneva/pods",
             ]
         );
+        let cluster: Vec<String> = WorkloadKind::ALL
+            .iter()
+            .map(|kind| kind.list_path(None))
+            .collect();
+        assert_eq!(
+            cluster,
+            vec![
+                "/apis/apps/v1/deployments",
+                "/apis/apps/v1/statefulsets",
+                "/apis/apps/v1/daemonsets",
+                "/apis/batch/v1/cronjobs",
+                "/apis/batch/v1/jobs",
+                "/api/v1/pods",
+            ]
+        );
+        // 集群范围的路径里不许再出现 `namespaces/`：那一段只属于单命名空间读，
+        // 留着它就是「少读了半个集群，但路径看起来对」。
+        for path in &cluster {
+            assert!(
+                !path.contains("/namespaces/"),
+                "集群范围的路径里出现了命名空间段：{path}"
+            );
+        }
     }
 
     #[test]

@@ -84,7 +84,7 @@ fn group_of(resource: &str) -> &'static str {
 
 #[test]
 fn every_collection_the_face_reads_is_probed() {
-    let targets = cog_gateway::cluster::read_targets("cogneva");
+    let targets = cog_gateway::cluster::read_targets();
     let probed: BTreeSet<(String, String)> = targets
         .iter()
         .map(|(resource, _)| (group_of(resource).to_string(), resource.to_string()))

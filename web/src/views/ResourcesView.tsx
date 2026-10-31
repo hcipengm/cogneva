@@ -46,7 +46,7 @@ export function ResourcesView() {
       title="资源"
       meta={
         report
-          ? `命名空间 ${report.namespace || '（不在集群里）'} · ${new Date(report.collected_at).toLocaleTimeString('zh-CN')}`
+          ? `整个集群 ${report.namespaces.length} 个命名空间 · ${new Date(report.collected_at).toLocaleTimeString('zh-CN')}`
           : '按 30 秒重读'
       }
     >
@@ -71,66 +71,86 @@ export function ResourcesView() {
           <p className="px-4 py-2 text-[11px] text-[var(--warn)]">{report.error}</p>
         ) : report.quotas.length === 0 && report.limits.length === 0 ? (
           <Empty>
-            这个命名空间没有 ResourceQuota 也没有 LimitRange：不是「配额是零」，是没有上限。
+            整个集群没有 ResourceQuota 也没有 LimitRange：不是「配额是零」，是没有上限。
             申请不会被配额拒绝，请求过大的 Pod 仍会被调度器挡在节点之外。
           </Empty>
         ) : (
           <>
-            {report.quotas.map((quotaView) => (
-              <div key={quotaView.name} className="border-t border-[var(--line)] first:border-t-0">
-                <p className="px-4 py-1 text-[11px] text-[var(--muted)]">
-                  ResourceQuota <span className="mono">{quotaView.name}</span>
+            {byNamespace(report.quotas).map(([namespace, quotas]) => (
+              <div key={`quota-${namespace}`} className="border-t border-[var(--line)]">
+                <p className="px-4 py-1 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+                  命名空间 <span className="mono normal-case tracking-normal">{namespace}</span>
                 </p>
-                <Table
-                  columns={[
-                    { key: 'resource', title: '资源', width: '200px', render: (e) => (
-                      <span className="mono text-[11px]">{e.resource}</span>
-                    ) },
-                    { key: 'hard', title: '上限', width: '110px', render: (e) => (
-                      <span className="mono text-[11px]">{e.hard || '—'}</span>
-                    ) },
-                    { key: 'used', title: '已用', width: '110px', render: (e) => (
-                      <span className="mono text-[11px]">{e.used || '—'}</span>
-                    ) },
-                    { key: 'percent', title: '用掉', width: '160px', render: (e) => (
-                      <Meter percent={e.percent} />
-                    ) },
-                  ]}
-                  rows={quotaView.entries}
-                  rowKey={(e) => `${quotaView.name}|${e.resource}`}
-                />
+                {quotas.map((quotaView) => (
+                  <div
+                    key={`${namespace}|${quotaView.name}`}
+                    className="border-t border-[var(--line)] first:border-t-0"
+                  >
+                    <p className="px-4 py-1 text-[11px] text-[var(--muted)]">
+                      ResourceQuota <span className="mono">{quotaView.name}</span>
+                    </p>
+                    <Table
+                      columns={[
+                        { key: 'resource', title: '资源', width: '200px', render: (e) => (
+                          <span className="mono text-[11px]">{e.resource}</span>
+                        ) },
+                        { key: 'hard', title: '上限', width: '110px', render: (e) => (
+                          <span className="mono text-[11px]">{e.hard || '—'}</span>
+                        ) },
+                        { key: 'used', title: '已用', width: '110px', render: (e) => (
+                          <span className="mono text-[11px]">{e.used || '—'}</span>
+                        ) },
+                        { key: 'percent', title: '用掉', width: '160px', render: (e) => (
+                          <Meter percent={e.percent} />
+                        ) },
+                      ]}
+                      rows={quotaView.entries}
+                      rowKey={(e) => `${quotaView.name}|${e.resource}`}
+                    />
+                  </div>
+                ))}
               </div>
             ))}
-            {report.limits.map((limitView) => (
-              <div key={limitView.name} className="border-t border-[var(--line)]">
-                <p className="px-4 py-1 text-[11px] text-[var(--muted)]">
-                  LimitRange <span className="mono">{limitView.name}</span>
-                  ：没写 requests/limits 的容器由这里补默认值，超上限的申请在准入时被拒
+            {byNamespace(report.limits).map(([namespace, limits]) => (
+              <div key={`limit-${namespace}`} className="border-t border-[var(--line)]">
+                <p className="px-4 py-1 text-[11px] uppercase tracking-wider text-[var(--muted)]">
+                  命名空间 <span className="mono normal-case tracking-normal">{namespace}</span>
                 </p>
-                <Table
-                  columns={[
-                    { key: 'kind', title: '对象', width: '110px', render: (e) => (
-                      <span className="text-[11px]">{e.kind}</span>
-                    ) },
-                    { key: 'resource', title: '资源', width: '110px', render: (e) => (
-                      <span className="mono text-[11px]">{e.resource}</span>
-                    ) },
-                    { key: 'min', title: '最小', width: '90px', render: (e) => (
-                      <span className="mono text-[11px]">{e.min ?? '—'}</span>
-                    ) },
-                    { key: 'max', title: '最大', width: '90px', render: (e) => (
-                      <span className="mono text-[11px]">{e.max ?? '—'}</span>
-                    ) },
-                    { key: 'default', title: '默认上限', width: '100px', render: (e) => (
-                      <span className="mono text-[11px]">{e.default ?? '—'}</span>
-                    ) },
-                    { key: 'default_request', title: '默认申报', render: (e) => (
-                      <span className="mono text-[11px]">{e.default_request ?? '—'}</span>
-                    ) },
-                  ]}
-                  rows={limitView.entries}
-                  rowKey={(e) => `${limitView.name}|${e.kind}|${e.resource}`}
-                />
+                {limits.map((limitView) => (
+                  <div
+                    key={`${namespace}|${limitView.name}`}
+                    className="border-t border-[var(--line)] first:border-t-0"
+                  >
+                    <p className="px-4 py-1 text-[11px] text-[var(--muted)]">
+                      LimitRange <span className="mono">{limitView.name}</span>
+                      ：没写 requests/limits 的容器由这里补默认值，超上限的申请在准入时被拒
+                    </p>
+                    <Table
+                      columns={[
+                        { key: 'kind', title: '对象', width: '110px', render: (e) => (
+                          <span className="text-[11px]">{e.kind}</span>
+                        ) },
+                        { key: 'resource', title: '资源', width: '110px', render: (e) => (
+                          <span className="mono text-[11px]">{e.resource}</span>
+                        ) },
+                        { key: 'min', title: '最小', width: '90px', render: (e) => (
+                          <span className="mono text-[11px]">{e.min ?? '—'}</span>
+                        ) },
+                        { key: 'max', title: '最大', width: '90px', render: (e) => (
+                          <span className="mono text-[11px]">{e.max ?? '—'}</span>
+                        ) },
+                        { key: 'default', title: '默认上限', width: '100px', render: (e) => (
+                          <span className="mono text-[11px]">{e.default ?? '—'}</span>
+                        ) },
+                        { key: 'default_request', title: '默认申报', render: (e) => (
+                          <span className="mono text-[11px]">{e.default_request ?? '—'}</span>
+                        ) },
+                      ]}
+                      rows={limitView.entries}
+                      rowKey={(e) => `${limitView.name}|${e.kind}|${e.resource}`}
+                    />
+                  </div>
+                ))}
               </div>
             ))}
           </>
@@ -194,7 +214,7 @@ function NodeBudget({
       <h2 className="flex flex-wrap items-baseline gap-x-3 px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
         <span>节点可调度余量 · 调度时的账</span>
         <span className="mono normal-case tracking-normal text-[var(--paper-dim)]">
-          {clusterName(index, total)} · {cluster.namespace}
+          {clusterName(index, total)} · 整个集群（进程在 {cluster.namespace}）
         </span>
       </h2>
       {!cluster.reachable ? (
@@ -323,7 +343,7 @@ function StorageLedger({
       <h2 className="flex flex-wrap items-baseline gap-x-3 px-4 py-2 text-[11px] uppercase tracking-wider text-[var(--muted)]">
         <span>存储账本 · 声明 vs 实测</span>
         <span className="mono normal-case tracking-normal text-[var(--paper-dim)]">
-          {clusterName(index, total)} · {cluster.namespace}
+          {clusterName(index, total)} · 整个集群（进程在 {cluster.namespace}）
         </span>
       </h2>
       {claims.length === 0 ? (
@@ -445,4 +465,22 @@ function Left({
       {format(Math.max(0, left))}
     </span>
   );
+}
+
+/**
+ * 按命名空间分组，组内保持服务端顺序，组间按名字排序。
+ *
+ * 配额与限额是集群范围读回来的：两个命名空间各有一个同名的 `default` 是常事。
+ * 不分组的话屏上会出现两条「ResourceQuota default」，而读者没有线索知道它们是
+ * 两个不同命名空间的对象——那是「归属错了，但没有一处报错」的形状。
+ */
+function byNamespace<T extends { namespace: string }>(items: T[]): Array<[string, T[]]> {
+  const groups = new Map<string, T[]>();
+  for (const item of items) {
+    const key = item.namespace || '（未标注）';
+    const existing = groups.get(key);
+    if (existing) existing.push(item);
+    else groups.set(key, [item]);
+  }
+  return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b));
 }

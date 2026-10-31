@@ -2481,6 +2481,8 @@ export interface QuotaEntry {
 }
 
 export interface QuotaView {
+  /** 这条配额属于哪个命名空间；读数按集群范围读回，靠这一格分组。 */
+  namespace: string;
   name: string;
   entries: QuotaEntry[];
 }
@@ -2495,12 +2497,17 @@ export interface LimitEntry {
 }
 
 export interface LimitView {
+  /** 同 `QuotaView.namespace`。 */
+  namespace: string;
   name: string;
   entries: LimitEntry[];
 }
 
 export interface ResourceReport {
+  /** 本进程所在的命名空间——不是这份读数覆盖的范围，范围见 `namespaces`。 */
   namespace: string;
+  /** 这份读数覆盖到的命名空间，按名字排序。 */
+  namespaces: string[];
   error: string | null;
   quotas: QuotaView[];
   limits: LimitView[];
@@ -2521,6 +2528,8 @@ export async function getResourceReport(): Promise<ResourceReport> {
  */
 export interface WorkloadView {
   kind: string;
+  /** 这个工作负载属于哪个命名空间；读数按集群范围读回，靠这一格分组。 */
+  namespace: string;
   name: string;
   /** 裸 Pod 的相位；别的工种为 `null`。跑完的 Pod 是 `0 / 1` 但有相位，不是坏了。 */
   phase: string | null;
@@ -2534,7 +2543,10 @@ export interface WorkloadView {
 }
 
 export interface WorkloadsReport {
+  /** 本进程所在的命名空间——不是这份读数覆盖的范围，范围见 `namespaces`。 */
   namespace: string;
+  /** 这份读数覆盖到的命名空间，按名字排序。 */
+  namespaces: string[];
   error: string | null;
   workloads: WorkloadView[];
   collected_at: string;
