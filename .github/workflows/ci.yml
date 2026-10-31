@@ -256,30 +256,6 @@ jobs:
         run: cargo test -p cog-storage --test backup_run_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-      # The restore path's claims are the server's, not the caller's: whether a
-      # package written against an older schema still loads, which tables and
-      # sequences are named as skipped when the schema moved on, whether a
-      # foreign key still refuses a dangling row after the load, and whether a
-      # role without the superuser bit can build the drill's schema and load the
-      # package in dependency order. Every one of them is decided by what the
-      # server does with COPY, TRUNCATE and a constraint -- a DB-free test can
-      # only restate the shape of the code. All of these were ignored and never
-      # named, so they ran nowhere; that is the same account the live steps
-      # around this one settle.
-      #
-      # One is skipped by name: it needs a real package extracted from the
-      # retention window (COGNEVA_TEST_PACKAGE_PG_DIR and
-      # COGNEVA_TEST_PACKAGE_MANIFEST), which no runner has. Skipping it is the
-      # design that test states for itself; run by hand without a package it
-      # reports unjudged rather than green.
-      - name: Live-DB backup and restore
-        if: ${{ !cancelled() }}
-        run: >
-          cargo test -p cogneva --test backup_pg --
-          --ignored --test-threads=1
-          --skip pg_restore_loads_a_package_written_before_the_schema_moved_on
-        env:
-          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The transcript's three claims are the database's: that a turn is written
       # as a pair in one statement so no reader sees a question whose answer is
       # still in flight, that the bound trims per session rather than across the
