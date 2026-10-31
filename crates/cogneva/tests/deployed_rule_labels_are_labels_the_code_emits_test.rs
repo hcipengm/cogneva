@@ -104,6 +104,10 @@ const WRITTEN_BY_CODE: &[(&str, &str)] = &[
     ),
     ("stage", "crates/cog-collaboration/src/observable.rs"),
     ("state", "crates/cog-observability/src/config_delivery.rs"),
+    (
+        "storage_class",
+        "crates/cog-reflection/src/volume_capacity.rs",
+    ),
     ("store", "crates/cog-reflection/src/store_readouts.rs"),
     ("stream", "crates/cog-stream/src/observable.rs"),
     ("tier", "crates/cog-reflection/src/change_pipeline.rs"),

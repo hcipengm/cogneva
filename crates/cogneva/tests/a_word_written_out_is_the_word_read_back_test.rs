@@ -147,20 +147,65 @@ fn body_end(text: &str, open: usize) -> Option<usize> {
     None
 }
 
+/// `from` 之后第一个**作为独立词**出现在代码里的 `needle`，跳过注释与字符串字面量。
+///
+/// 为什么必须跳过：注释与告警文案里会写 `implementer`、`implementation` 这类词，
+/// 它们不是代码。把一句英文里的 `impl` 当成一个 `impl` 块的开始，配对的括号就落进
+/// 半句话中间、跳过了真正的代码，本门会以「括号不闭合」判红——红在一条文案上，
+/// 而它想判的是类型的词表。
+fn next_code_token(source: &str, from: usize, needle: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_alphanumeric() || c == '_');
+    let mut i = from;
+    while i < bytes.len() {
+        if let Some(end) = raw_string_end(bytes, i) {
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+            continue;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i..].starts_with(needle.as_bytes()) {
+            // 匹配从 ASCII 字节起，两端都落在字符边界上。
+            let end = i + needle.len();
+            if !word(source[..i].chars().next_back()) && !word(source[end..].chars().next()) {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 /// 一段源码里每个 `impl <Name>` / `impl <Trait> for <Name>` 的（类型名，函数体）。
 fn impl_blocks(file: &str, source: &str) -> Result<Vec<(String, String)>, String> {
     let mut blocks = Vec::new();
     let mut cursor = 0;
-    while let Some(offset) = source[cursor..].find("impl") {
-        let at = cursor + offset;
+    while let Some(at) = next_code_token(source, cursor, "impl") {
         cursor = at + "impl".len();
-        if source[..at]
-            .chars()
-            .next_back()
-            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-        {
-            continue;
-        }
         let mut rest = source[cursor..].trim_start();
         if rest.starts_with('<') {
             let Some(close) = rest.find('>') else {
@@ -782,6 +827,24 @@ fn an_unreadable_as_str_arm_is_reported() {
     assert!(
         complaints.iter().any(|c| c.contains("读不出来")),
         "{complaints:?}"
+    );
+}
+
+/// 注释与字符串里的 `impl` 不是代码：`implementer` 不是一个 `impl` 块的开始。
+///
+/// 当成代码之后的后果不是「少读一个类型」，而是读错：配对的 `{` 落在半句话中间，
+/// 本门报一句「括号不闭合」，红在一条英文文案上——`crates/cog-reflection/src/
+/// volume_capacity.rs` 的告警文案里的 `implementer` 就是这么让它红的。
+#[test]
+fn a_word_inside_a_comment_or_a_string_is_not_an_impl_block() {
+    let source = "// the class's promise has no implementer here\n\
+                  let note = \"an implementer is missing\";\n\
+                  impl A {}\n";
+    let at = next_code_token(source, 0, "impl").expect("真正的 `impl A` 在里面");
+    assert_eq!(
+        &source[at..],
+        "impl A {}\n",
+        "把注释／字符串里的 `implementer` 当成了 `impl` 块的开始"
     );
 }
 
