@@ -306,6 +306,18 @@ fn shortfall_outcome(
     }
 }
 
+/// Where the bound counts from when a round sees a shortfall whose claim
+/// carries no stamp of its own.
+///
+/// Only reached while the write cannot reach the claim. The round that first
+/// saw the shortfall is what the bound ages from -- returning `now` each round
+/// instead would be a shortfall that never gets any older, which is the same
+/// "always still expanding" this record exists to end, only now with no
+/// surface at all saying the write is failing.
+fn shortfall_anchor(local: &mut Option<u64>, now_unix: u64) -> u64 {
+    *local.get_or_insert(now_unix)
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -634,6 +646,11 @@ struct ClaimState {
     // claim and not about this process: measured 2026-10-31, the evolution pod
     // was replaced 43 minutes after it started, so a one-hour in-process bound
     // was never reached and the verdict it gates never appeared at all.
+    /// The round this process first saw a shortfall it could not stamp, used
+    /// only while the claim carries no stamp of its own. A record that cannot be
+    /// written where the claim is must still age somewhere, or the bound it
+    /// measures can never elapse.
+    local_shortfall_since: Option<u64>,
     /// The bound that stopped the last round, kept only while it is the current
     /// conclusion: a claim that grew or reached its target has no bound to name.
     ceiling: Option<Ceiling>,
@@ -652,6 +669,7 @@ impl ClaimState {
             declared: None,
             granted: None,
             class: None,
+            local_shortfall_since: None,
             ceiling: None,
             refused_until: None,
             last_outcome: None,
@@ -1100,13 +1118,30 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
             // would be measuring the wrong one.
             (true, Some(_)) => {
                 clear_shortfall_stamp(&target.claim, &ns).await;
+                state.local_shortfall_since = None;
                 None
             }
-            (true, None) => None,
-            (false, Some(since)) => Some(since),
+            (true, None) => {
+                state.local_shortfall_since = None;
+                None
+            }
+            (false, Some(since)) => {
+                state.local_shortfall_since = None;
+                Some(since)
+            }
+            // A stamp that cannot be written must not restart the bound every
+            // round: that would be a claim which reads as still expanding for as
+            // long as anybody watches it, which is the failure this whole
+            // record exists to end. Falling back to the round this process first
+            // saw the shortfall costs the age of the process and nothing more.
             (false, None) => {
-                stamp_shortfall(&target.claim, &ns, now).await;
-                Some(now)
+                let first_seen = shortfall_anchor(&mut state.local_shortfall_since, now);
+                if stamp_shortfall(&target.claim, &ns, first_seen).await {
+                    // The claim carries the record now, so this process keeps no
+                    // second copy of it.
+                    state.local_shortfall_since = None;
+                }
+                Some(first_seen)
             }
         };
         let outcome = shortfall_outcome(live.resizing, since, now);
@@ -1129,6 +1164,7 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
     // however old this one was, which is the one way this record can lie, so it
     // is cleared on the healthy path too -- every round, until the clear
     // succeeds.
+    state.local_shortfall_since = None;
     if live.shortfall_since.is_some() {
         clear_shortfall_stamp(&target.claim, &ns).await;
     }
@@ -1239,7 +1275,7 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
 /// A failure is loud on purpose: without a stamp the bound below can never
 /// elapse, so the claim reads as "still expanding" for as long as the process
 /// that watches it lives, and nothing else on any surface says so.
-async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) {
+async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) -> bool {
     let pair = format!("{SHORTFALL_SINCE_ANNOTATION}={now_unix}");
     if let Err(e) = kubectl(
         &["annotate", "pvc", claim, "-n", ns, &pair, "--overwrite"],
@@ -1250,10 +1286,13 @@ async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) {
         warn!(
             claim,
             error = %e,
-            "volume capacity: could not stamp the shortfall on the claim, so the bound that \
-             separates a slow resize from an unanswered one restarts with this process"
+            "volume capacity: could not stamp the shortfall on the claim; the caller keeps the \
+             age in this process instead, so the bound still elapses -- it just stops surviving \
+             a restart of this loop"
         );
+        return false;
     }
+    true
 }
 
 async fn clear_shortfall_stamp(claim: &str, ns: &str) {
@@ -1560,6 +1599,48 @@ mod tests {
             shortfall_outcome(false, Some(started_long_ago), now),
             CapacityOutcome::Orphaned,
             "the first round of a restarted reporter must answer from the claim's stamp"
+        );
+    }
+
+    /// A stamp the loop cannot write must not push the start forward every round.
+    ///
+    /// The fallback is the round this process first saw the shortfall, and this
+    /// test walks four hours of rounds in which every write fails. Under a
+    /// `now`-per-round fallback each round answers `expanding` and the bound has
+    /// no round on which to elapse; under the first-seen fallback the bound
+    /// elapses on the same hour it would have with the claim carrying the stamp.
+    #[test]
+    fn a_stamp_that_never_lands_still_lets_the_bound_elapse() {
+        let first_round = 1_800_000_000u64;
+        let mut local = None;
+        let rounded = |round: u64| first_round + round * DEFAULT_INTERVAL_SECS;
+        assert_eq!(
+            shortfall_anchor(&mut local, first_round),
+            first_round,
+            "the first round that sees the shortfall is the one the bound counts from"
+        );
+
+        let mut elapsed_at = None;
+        for round in 1..=24u64 {
+            let now = rounded(round);
+            let anchor = shortfall_anchor(&mut local, now);
+            assert_eq!(
+                anchor, first_round,
+                "round {round} moved a start that no write ever landed"
+            );
+            let outcome = shortfall_outcome(false, Some(anchor), now);
+            if outcome == CapacityOutcome::Orphaned && elapsed_at.is_none() {
+                elapsed_at = Some(now - first_round);
+            }
+        }
+        let elapsed_at = elapsed_at.expect("the bound never elapsed across four hours of rounds");
+        assert!(
+            elapsed_at >= ORPHAN_AFTER_SECS,
+            "the verdict came at {elapsed_at}s, before the bound it gates"
+        );
+        assert!(
+            elapsed_at < ORPHAN_AFTER_SECS + DEFAULT_INTERVAL_SECS,
+            "the verdict came at {elapsed_at}s, later than the bound plus one round"
         );
     }
 
