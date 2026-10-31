@@ -16,37 +16,18 @@
 //! leaves every other one silently wrong, and the next one written by hand will
 //! be wrong again unless something looks at the shape.
 
-use std::path::PathBuf;
-
-#[path = "../../cogneva/tests/common/rust_production.rs"]
-mod rust_production;
-
-use rust_production::{production_numbered_lines, production_sources, relative_name};
-
 /// The statement that must never follow `record_learning`.
 const BUMP: &str = "update_recurrence(";
 
 /// The only writer of `recurrence_count`.
 const WRITE: &str = "record_learning(";
 
-/// 仓库根：一份算法，全仓共用（本文件按路径把那一份编进来）。
-#[path = "../../cogneva/tests/common/root.rs"]
-mod root;
+/// 本 crate 的出厂源码：共享普查按 crate 裁出来的那一份，与同目录另一扇门共用。
+#[path = "common/mod.rs"]
+mod common;
 
-use root::repo_root;
-
-/// This crate's shipping sources: the shared census, cut down to the crate.
-fn source_files() -> Vec<PathBuf> {
-    let root = repo_root();
-    let prefix = format!(
-        "{}/",
-        relative_name(&root, &root.join("crates/cog-reflection/src"))
-    );
-    production_sources(&root)
-        .into_iter()
-        .filter(|path| relative_name(&root, path).starts_with(&prefix))
-        .collect()
-}
+use common::rust_production::production_numbered_lines;
+use common::source_files;
 
 /// The 1-based line numbers where a `record_learning` call is immediately
 /// followed by an `update_recurrence` call -- the order that drops the bump.

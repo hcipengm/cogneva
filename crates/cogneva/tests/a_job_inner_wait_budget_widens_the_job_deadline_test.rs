@@ -30,11 +30,9 @@
 //!
 //! 这扇门跑在 `cargo test` 里，所以它在带内也生效：集群自己提交的变更同样要过它。
 
-use std::path::Path;
-
 use crate::common;
 
-use common::routes::repo_root;
+use common::routes::{read, repo_root};
 use common::rust_production::production_lines;
 
 const ROLLOUT: &str = "crates/cog-reflection/src/mainline_rollout.rs";
@@ -119,21 +117,16 @@ fn missing_from(terms: &[(&'static str, String)], budgets: &[String]) -> Vec<(St
     out
 }
 
-fn source(root: &Path, rel: &str) -> String {
-    let path = root.join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读不到 {}：{e}", path.display()))
-}
-
 #[test]
 fn every_job_inner_budget_is_added_into_both_deadline_computations() {
     let root = repo_root();
-    let budgets = declared_budgets(&source(&root, ROLLOUT));
+    let budgets = declared_budgets(&read(&root.join(ROLLOUT)));
     assert!(
         !budgets.is_empty(),
         "{ROLLOUT} 里一个 CI_*_BUDGET_SECS / CI_*_WAIT_SECS 都没读到——这是「什么都没判」，不是「都在期限里」"
     );
 
-    let terms = deadline_terms(&source(&root, DEPLOYER));
+    let terms = deadline_terms(&read(&root.join(DEPLOYER)));
     let labels: Vec<&str> = terms.iter().map(|(l, _)| *l).collect();
     for want in ["judgement_wait_budget", "activeDeadlineSeconds"] {
         assert!(
@@ -156,7 +149,7 @@ fn the_scan_names_the_bound_it_compares() {
     // 人口不是空的，而且每个名字都真的在那一份源里：名字改掉而不改这一格时，
     // 上面那条会从「没有违例」变成「什么都没判」，两者在外面同形。
     let root = repo_root();
-    let text = source(&root, ROLLOUT);
+    let text = read(&root.join(ROLLOUT));
     let budgets = declared_budgets(&text);
     assert!(
         budgets.iter().any(|b| b == "CI_ASK_BUDGET_SECS"),

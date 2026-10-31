@@ -19,11 +19,9 @@
 //! （`deploy/scripts/tests/cogneva-json-alert-rules.test.sh` 的「只把阈值抬到十亿」那一格，
 //! 以及不认识的算子必须非零那一格）。
 
-use std::path::Path;
-
 use crate::common;
 
-use common::routes::repo_root;
+use common::routes::{read, repo_root};
 use common::rust_production::production_text;
 
 const ALERTS_RS: &str = "crates/cog-core/src/contract/alerts.rs";
@@ -114,20 +112,15 @@ fn orphan_keys(variants: &[String], keys: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn read(root: &Path, rel: &str) -> String {
-    let path = root.join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("读不到 {}：{e}", path.display()))
-}
-
 #[test]
 fn every_condition_variant_has_a_shape_in_the_fixture_runner() {
     let root = repo_root();
-    let variants = condition_variants(&production_text(&read(&root, ALERTS_RS)));
+    let variants = condition_variants(&production_text(&read(&root.join(ALERTS_RS))));
     assert!(
         !variants.is_empty(),
         "{ALERTS_RS} 里一个 AlertCondition 变体都没读到——这是「什么都没判」，不是「都接上了」"
     );
-    let keys = operator_keys(&read(&root, RUNNER));
+    let keys = operator_keys(&read(&root.join(RUNNER)));
     assert!(
         !keys.is_empty(),
         "{RUNNER} 里一个算子别名都没读到——判据的锚变了（表名或写法改了），这一格要跟着改"
@@ -151,7 +144,7 @@ fn every_condition_variant_has_a_shape_in_the_fixture_runner() {
 #[test]
 fn the_readers_see_the_population_they_compare() {
     let root = repo_root();
-    let variants = condition_variants(&production_text(&read(&root, ALERTS_RS)));
+    let variants = condition_variants(&production_text(&read(&root.join(ALERTS_RS))));
     for want in [
         "GreaterThan",
         "LessThan",
