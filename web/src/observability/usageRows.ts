@@ -258,8 +258,8 @@ export function cacheWriteLanding(pool: LlmPoolView | null | undefined): CacheWr
   if (probe) parts.push(`我方下次探测 ${when(probe)}（重试的节拍，不是上游的承诺）`);
   parts.push(
     served
-      ? `池子最后一次送出真实请求 ${when(served)}（探测通不算）`
-      : '写快照的那一代进程还没送出过真实请求'
+      ? `池子最后一次真的拿到上游回应 ${when(served)}（探测通不算）`
+      : '写快照的那一代进程还没有成功过一件活'
   );
   return {
     at,

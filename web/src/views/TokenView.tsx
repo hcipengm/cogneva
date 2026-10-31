@@ -564,9 +564,9 @@ function AllowanceWindow() {
               note="我方重试的节拍，不是上游的承诺"
             />
             <Reading
-              label="最后送出"
+              label="最后一次成功"
               value={pool.last_served_at ? <Moment iso={pool.last_served_at} /> : '这代进程没见过'}
-              note="写快照的进程最后一次送出真实请求；上游被探测通了不算"
+              note="写快照的进程最后一次真的拿到上游的回应——发出却失败的不算，探测通了也不算；它空了是「这代进程还没成功过」，不是「一件活都没送」"
             />
           </div>
         </Readings>
