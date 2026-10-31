@@ -1134,6 +1134,38 @@ pub fn windows_over(expr: &str, gated: &BTreeSet<String>) -> Vec<(String, u64)> 
     out
 }
 
+/// Every range window in `expr`, in seconds, whichever series it hangs off.
+///
+/// [`windows_over`] answers "which series does this rule look back over", and it
+/// answers it for a caller that already names the series it cares about. This one
+/// answers "how far back does this expression reach", which is a question about
+/// the reading rather than about the series: `max_over_time(x[7d])` and
+/// `(a / b)[7d:1h]` reach exactly as far as each other, and a range selector
+/// hanging off an aggregated subquery reaches as far as one hanging off a name.
+/// A reader that has to know whether the samples the window needs can still
+/// exist -- the retention question -- cannot start from a series list, because
+/// the subquery form has no name to look up.
+///
+/// Every `[...]` is reported, including the step half of a subquery's window
+/// being dropped: `[15m:1m]` is a fifteen-minute window and not a one-minute one.
+pub fn all_windows(expr: &str) -> Vec<u64> {
+    let stripped = strip_braces(&strip_quoted(expr));
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = stripped[from..].find('[') {
+        let at = from + rel;
+        from = at + 1;
+        let Some(close) = stripped[at..].find(']').map(|p| at + p) else {
+            break;
+        };
+        let window = stripped[at + 1..close].split(':').next().unwrap_or("");
+        if let Some(seconds) = duration_seconds(window) {
+            out.push(seconds);
+        }
+    }
+    out
+}
+
 /// The age bound a rule puts on one series' companion, or `None` when it puts
 /// none.
 ///
@@ -2357,6 +2389,32 @@ mod tests {
             "min_over_time(a[30m]) > 0 and count_over_time(b[1h]) > 0"
         )
         .is_empty());
+    }
+
+    /// Every window is reached, including the ones hung off an expression
+    /// instead of a name and the ones inside a coverage leg — those are the two
+    /// shapes a series-keyed reader would walk straight past.
+    #[test]
+    fn every_window_in_the_expression_is_reached() {
+        assert_eq!(all_windows("sum(rate(a[5m])) > 0"), vec![300]);
+        // The step half of a subquery is not the window.
+        assert_eq!(
+            all_windows("quantile_over_time(0.99, (a / b)[7d:1h]) > 0"),
+            vec![604_800]
+        );
+        // A window on an aggregated subquery has no series name to look up, and
+        // it is still the window this expression reads.
+        assert_eq!(
+            all_windows("max_over_time((max by (job) (a))[3d:5m]) > 1"),
+            vec![259_200]
+        );
+        // Both legs of a coverage pair, in the order they appear.
+        assert_eq!(
+            all_windows("min_over_time(a[30m]) > 0 and count_over_time(a[1h]) > 0"),
+            vec![1_800, 3_600]
+        );
+        // A bracket inside a matcher is not a window.
+        assert_eq!(all_windows(r#"a{b="x[5m]"}[2m] > 0"#), vec![120]);
     }
 
     #[test]

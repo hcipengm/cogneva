@@ -52,9 +52,9 @@ use crate::unread;
 
 use producer::carries_the_producer;
 use promql::{
-    bare_observation_reads, companion_age_bound, difference_reads, kept_labels_by_clause,
-    lagged_equality_complaints, metric_names_in, shape_complaints, uncovered_window_complaints,
-    unguarded_store_reading_complaints, windows_over,
+    all_windows, bare_observation_reads, companion_age_bound, difference_reads,
+    kept_labels_by_clause, lagged_equality_complaints, metric_names_in, shape_complaints,
+    uncovered_window_complaints, unguarded_store_reading_complaints, windows_over,
 };
 use unread::{unresolved_readers, Unread};
 
@@ -1947,6 +1947,49 @@ fn shipped_rules() -> Vec<(String, String)> {
     rules
 }
 
+/// How long a sample lives in each observability profile this repo ships, as
+/// (values file, seconds), read from the files that declare one.
+///
+/// The profiles differ by an order of magnitude: the full stack keeps `30d`, and
+/// the small one -- the one this host installs -- keeps `7d`. A rule library is
+/// shared by both, so the number that constrains a window is the small one; the
+/// full profile never binds and mentioning it would only make the complaint
+/// harder to read.
+///
+/// The file name travels with the number because the fix for a window that is
+/// too wide is to narrow the window, not to widen the profile the host runs.
+/// The reachability overlays in the same directory are fragments merged into a
+/// profile rather than profiles, so they carry no retention and are skipped by
+/// the same test that reads the key.
+fn shipped_prometheus_retentions() -> Vec<(String, u64)> {
+    let dir = repo_root().join("deploy/k3s/observability/helm");
+    let entries = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("helm values directory unreadable at {}: {e}", dir.display()));
+    let mut out = Vec::new();
+    for entry in entries {
+        let path = entry.expect("helm values directory entry").path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default()
+            .to_string();
+        if !name.starts_with("kube-prometheus-stack-values") || !name.ends_with(".yaml") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+        let values: serde_yaml::Value =
+            serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("{name} is not valid YAML: {e}"));
+        let Some(retention) = values["prometheus"]["prometheusSpec"]["retention"].as_str() else {
+            continue;
+        };
+        let seconds = promql::duration_seconds(retention)
+            .unwrap_or_else(|| panic!("{name}: retention `{retention}` is not a duration"));
+        out.push((name, seconds));
+    }
+    out
+}
+
 /// Every alert in a `PrometheusRule` manifest here, as (file, alert, labels).
 fn manifest_alerts() -> Vec<(String, String, BTreeMap<String, String>)> {
     let mut alerts = Vec::new();
@@ -3129,6 +3172,70 @@ fn a_rule_that_certifies_a_window_requires_the_window_to_be_covered() {
     assert!(
         complaints.is_empty(),
         "告警规则用一个区间聚合判断整个窗口，却没有要求窗口被铺满——序列比窗口年轻时这句话是假的:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// A window the retention cannot fill is a reading that is short for as long as
+/// the rule ships.
+///
+/// A range aggregate answers only for the samples that *exist* in its window.
+/// Prometheus deletes what is older than its retention, so a window longer than
+/// that retention is answered by the samples that are left -- no error, no
+/// warning, no gap in the graph: the expression evaluates, the rule is green or
+/// red on a shorter window than its summary names, and nothing in the answer
+/// says which. The small profile keeps seven days, so a `[14d]` window reads a
+/// week of samples and calls it a fortnight, every evaluation, forever.
+///
+/// The coverage leg is where this bites hardest, because it is twice as wide as
+/// the window it certifies: a rule that certifies seven days needs a fourteen-day
+/// count, and on this profile that pair can never both hold. That is the
+/// arithmetic the author of `boot_phase_footprint_grew` did by hand when they
+/// picked three days and six -- measured rather than assumed since then, and the
+/// reason that rule certifies three days where a week would have been the
+/// obvious choice.
+///
+/// Both rule sources are read, chart and manifests, and every window in an
+/// expression is reached, not only the ones hanging off a series name: a window
+/// over an aggregated subquery (`(a / b)[7d:1h]`) needs the same samples as a
+/// window over a bare name, and it is the shape a series-keyed reader misses.
+///
+/// The ceiling: the retention is read from the values files that ship, so a
+/// profile whose retention is overridden at install time (`helm --set`) is
+/// outside this reading. The gate judges what ships, and the value it judges
+/// against is one the deploys are free to change -- which is why the complaint
+/// names the file it came from.
+#[test]
+fn a_window_may_not_read_back_further_than_the_retention_that_has_to_fill_it() {
+    let retentions = shipped_prometheus_retentions();
+    assert!(
+        retentions.iter().any(|(file, _)| file.contains("-small")),
+        "小规格档的 values 文件不在保留期读数里（{retentions:?}）：它一消失，这条门就按宽松的那份判，\
+         而小规格档才是本机在跑的那份"
+    );
+    let (tightest_file, tightest) = retentions
+        .iter()
+        .min_by_key(|(_, seconds)| *seconds)
+        .cloned()
+        .unwrap_or_else(|| panic!("没有任何一份 values 文件声明 Prometheus 的保留期"));
+
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in shipped_rules() {
+        for window in all_windows(&promql) {
+            if window <= tightest {
+                continue;
+            }
+            complaints.push(format!(
+                "{rule}: 窗口 {window}s 比最紧的一份保留期 {tightest}s（{tightest_file}）还长——\
+                 窗口里要的采样早被删掉了，这条读数永远只答得出一段更短的窗口，而它的名字和文案说的是\
+                 更长的那段；带铺满腿的规则按两倍窗口算，更进不去\n    {promql}"
+            ));
+        }
+    }
+
+    assert!(
+        complaints.is_empty(),
+        "告警规则的窗口超过了填充它所需要的保留期:\n{}",
         complaints.join("\n")
     );
 }
