@@ -207,6 +207,17 @@ const ACTOR_MEANINGS: Record<string, string> = {
   unknown: '调用方没有在请求上声明执行者名——这一格记的是「没报」，不是某个角色',
 };
 
+/**
+ * 闭集里的执行者名，不含占位符 `unknown`。
+ *
+ * 「谁在花」那张表也要按闭集列全：本窗口没出现过的名字照样占一行，标「本窗口
+ * 没有调用」。只列出现过的，读者会把这个数当成全集——而闭集才是「平台上有哪些
+ * 执行者」。名字只有这一份正本，表与计数格都从这里取。
+ */
+export function registeredActorNames(): string[] {
+  return Object.keys(ACTOR_MEANINGS).filter((name) => name !== UNKNOWN_ACTOR_NAME);
+}
+
 const ACTOR: Dimension = {
   key: 'actor',
   title: '执行者',
@@ -324,7 +335,7 @@ const ORIGIN: Dimension = {
  * 在给别人的产物打分；`self_review:evaluator` 是 evaluator 在审它自己刚写的那份
  * 输出。前两个是两个人，第三个是同一个人干的第二件事。
  */
-function actorHint(value: string): string {
+export function actorHint(value: string): string {
   if (value.startsWith('agent:')) {
     const role = value.slice('agent:'.length);
     return role === 'evaluator'

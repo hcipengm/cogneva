@@ -438,6 +438,266 @@ else:
         else:
             summary.append(f"占位符字面量: {constant} == {what}（{code.group(1)!r}）")
 
+# ── 9. 注释：一处组件，不是散落的 title= ──
+# 原生 `title=` 的提示框由浏览器画在页面之外：选不中、复制不了，出现前有一段系统
+# 延迟，同一排里两个 `title` 也说不清各自属于哪一格。这一屏的每一句解释都要能被
+# 选中抄走（读数出了问题，人要把它贴进工单里），所以注释只能来自同一个组件；
+# 散落的 `title=` 是这件事悄悄退回去的唯一形状，而它退回去时没有任何东西会红。
+#
+# 判的是**DOM 元素上的 title**，不是「组件还有一个 title 参数」：`ViewFrame` / `Section`
+# 这类组件收的 `title` 是可见的标题文字，不是提示框。区分办法看标签名首字母——
+# 小写的是 DOM 元素。`iframe` 的 `title` 是给读屏软件的，那是无障碍要求，放行。
+TITLE_ATTR = re.compile(r"\btitle\s*=")
+TITLE_ALLOWED_TAGS = {"iframe"}
+
+
+def strip_comments(src):
+    """注释里的 `title=` 不是属性：先去掉注释再判，否则判词会被自己那句说明触发。"""
+    return re.sub(r"(?m)//.*$", "", re.sub(r"/\*.*?\*/", "", src, flags=re.S))
+
+
+def tag_at(src, at):
+    """`title=` 所在的那个标签名；回退不到 `<`（或中间隔着别的标签）就当不是属性。"""
+    lt = src.rfind("<", 0, at)
+    if lt < 0 or ">" in src[lt:at]:
+        return None
+    m = re.match(r"<\s*([A-Za-z][\w.-]*)", src[lt:])
+    return m.group(1) if m else None
+
+
+stray = []
+for rel in sorted(graph):
+    if not rel.endswith(".tsx"):
+        continue
+    src = strip_comments(read(rel))
+    for m in TITLE_ATTR.finditer(src):
+        name = tag_at(src, m.start())
+        if name is None or not name[0].islower() or name in TITLE_ALLOWED_TAGS:
+            continue
+        stray.append(f"{rel}: <{name} title=")
+if stray:
+    problems.append(
+        "DOM 元素上又出现了原生 title=（"
+        + "；".join(stray[:4])
+        + (f"…共 {len(stray)} 处" if len(stray) > 4 else "")
+        + "）：提示框选不中、复制不了，注释必须走同一个组件"
+    )
+
+# 那个组件本身：导出 `Note`，且它画出来的是一块**页面内的面板**（`role="note"`），
+# 悬停和聚焦都能打开（只有悬停的话，只用键盘的人永远读不到它）。
+NOTE_DEF = re.compile(r"export\s+function\s+Note\s*\(")
+note_defs = [rel for rel in sorted(graph) if NOTE_DEF.search(read(rel))]
+if not note_defs:
+    problems.append(
+        "可达图里没有导出 Note 的组件：全站注释没有了唯一的出处，"
+        "下一句解释只能退回成原生 title="
+    )
+else:
+    note_rel = note_defs[0]
+    note_src = read(note_rel)
+    lacking = [
+        what
+        for what, pattern in (
+            ("页面内的面板（role: 'note'）", r"""['"]note['"]"""),
+            ("悬停打开", r"onMouseEnter"),
+            ("聚焦打开", r"onFocus"),
+        )
+        if not re.search(pattern, note_src)
+    ]
+    rendered_by = [
+        rel for rel in sorted(graph) if rel != note_rel and "<Note" in read(rel)
+    ]
+    if lacking:
+        problems.append(
+            f"{note_rel}: 注释组件缺 {'、'.join(lacking)}——"
+            "缺面板它就退回成一个选不中的提示框，缺聚焦则只用键盘的人读不到它"
+        )
+    elif not rendered_by:
+        problems.append(
+            f"{note_rel}: 注释组件定义了但没有一处渲染它——"
+            "第一句要解释的话出现时，人会另起一个 title="
+        )
+    else:
+        summary.append(f"注释: {note_rel}，{len(rendered_by)} 个文件在用它")
+
+# 面板的字要能选中、复制。判的是**面板自己的规则块**里有这两条：写在别处（或根本没有）
+# 与「能选中」是两件事，而 `position: fixed` 是它能在表格里活下来的原因——`absolute`
+# 会被表格与滚动容器裁掉，那些容器正是注释最多的地方。
+NOTE_CSS = os.path.join(WEB, "styles/tokens.css")
+if not os.path.isfile(NOTE_CSS):
+    problems.append(
+        "读不到 styles/tokens.css——注释面板的规则不在它声明的地方，"
+        "「能选中、复制」无从判起"
+    )
+else:
+    css = open(NOTE_CSS, encoding="utf-8").read()
+    panel = re.search(r"\.note-panel\s*\{(.*?)\}", css, re.S)
+    if not panel:
+        problems.append("styles/tokens.css 里没有 .note-panel 的规则：注释画出来也选不中")
+    else:
+        body = panel.group(1)
+        missing = [x for x in ("position: fixed", "user-select: text") if x not in body]
+        if missing:
+            problems.append(
+                "styles/tokens.css 的 .note-panel 缺 "
+                + "、".join(missing)
+                + "：缺 user-select 就选不中，缺 fixed 会被表格与滚动容器裁掉"
+            )
+        else:
+            summary.append("注释面板: position: fixed ＋ user-select: text")
+
+# ── 10. 窗口按钮的位置 ──
+# 这一屏上有两种时刻：额度窗是当刻读数、累计是整本折叠账，两者的数**不随窗口变**；
+# 下面一组（花销 / 零花销 / 谁在花）才跟着那个按钮变。按钮长在页头时，它罩住的是
+# 四件事里的四件，读的人按下 6 小时会以为额度窗也变了；组头写了「哪几块跟着变」，
+# 那个误会才有答案。判两半：按钮在那一组里（在额度窗与累计之后），且那句话还在。
+WINDOWS_DECL = re.compile(r"const\s+WINDOWS\b")
+windowed = [
+    rel
+    for rel in sorted(graph)
+    if WINDOWS_DECL.search(read(rel)) and re.search(r">\s*累计", read(rel))
+]
+if not windowed:
+    problems.append("找不到声明 WINDOWS 的那一屏：窗口按钮还在不在，无从问起")
+else:
+    for rel in windowed:
+        src = read(rel)
+        m = re.search(r"WINDOWS\.map\s*\(", src)
+        if not m:
+            problems.append(f"{rel}: 声明了 WINDOWS 却没有一处渲染它——窗口选不了了")
+            continue
+        at = m.start()
+        pace_at = src.find("<AllowanceWindow")
+        cum = re.search(r">\s*累计", src)
+        early = []
+        if pace_at >= 0 and at < pace_at:
+            early.append("额度窗")
+        if cum and at < cum.start():
+            early.append("累计")
+        if early:
+            problems.append(
+                f"{rel}: 窗口按钮排在了 {'、'.join(early)} 前面——那两节的读数不随窗口变"
+                "（一个是当刻快照，一个是整本折叠账），按钮罩住它们等于说它们也会变"
+            )
+        for token, why in (
+            ("跟着它变", "没写清哪几块跟着它变"),
+            ("不跟", "没写清哪几节不跟它变"),
+        ):
+            if token not in src:
+                problems.append(f"{rel}: 窗口那一排没有那句话（缺「{token}」）——{why}")
+        if not early and "跟着它变" in src and "不跟" in src:
+            summary.append(f"窗口: {rel} 的按钮长在分组头上，并写明哪几块跟、哪几节不跟")
+
+# ── 11. 谁在花：一张表两级行 ──
+# 这一段以前是三块各画各的：一条分摊条、一份清单、一张表。三块都对，但它们的行
+# 粒度不一样——条与清单是四格行，表也是四格行，而读者要的是「是不是有一个执行者
+# 吃掉大半」；四格行答的是「他换过几条线路」。三块分开画时，列宽、失败格的有无、
+# 数字的小数位都会各自漂开，屏幕上最明显的那件事（谁最宽）得自己做一次分组才
+# 看得出来。所以判的是**形状**：一张表、两级行、列宽一处定义、失败格无条件出现。
+TABLE_DEF = re.compile(r"export\s+function\s+ActorTable\s*\(")
+table_defs = [rel for rel in sorted(graph) if TABLE_DEF.search(read(rel))]
+if not table_defs:
+    problems.append(
+        "可达图里没有 ActorTable：「谁在花」又退回成一条分摊条加一张表的画法，"
+        "两处的行粒度迟早对不上"
+    )
+else:
+    table_rel = table_defs[0]
+    tsrc = strip_comments(read(table_rel))
+    before = len(problems)
+    tables = len(re.findall(r"<table[\s>]", tsrc))
+    if tables != 1:
+        problems.append(
+            f"{table_rel}: 有 {tables} 张 <table>——两级行不在同一张表里，"
+            "列宽与对齐只能靠两处手抄"
+        )
+    if "group.rows.map(" not in tsrc:
+        problems.append(
+            f"{table_rel}: 一级行点不开到四格行——"
+            "「同一个执行者换过上游」这件事在这一屏上就没有地方说得出来"
+        )
+    if not re.search(r"const\s+W\s*=\s*\{", tsrc) or tsrc.count("width: W.") < 8:
+        problems.append(
+            f"{table_rel}: 列宽没有单点定义（少于 8 格从同一份常量取宽）——"
+            "宽度写第二次，两级行就会有一天差几像素"
+        )
+    if re.search(r"(?:failed|failed_calls)\s*>\s*0\s*&&", tsrc):
+        problems.append(
+            f"{table_rel}: 失败那一格又变成条件渲染了——"
+            "零失败的行走少一格时，它后面的数字会整体左移一列"
+        )
+    if "styles.length === 1" not in tsrc or "分协议见下" not in tsrc:
+        problems.append(
+            f"{table_rel}: 一级行的缓存占比没有分协议的限制——"
+            "两种协议的 input 含义不同，先加起来再除是一个协议的分母除以另一个的分子"
+        )
+    if tsrc.count("actorTotals(") != 1:
+        problems.append(
+            f"{table_rel}: 合计算了 {tsrc.count('actorTotals(')} 遍——"
+            "分摊条、一级行、占比的分母各算一遍，它们迟早各说各的"
+        )
+    computed = [
+        what for what, token in (
+            ("缓存占比的分子分母", "cacheFormula("),
+            ("每调用输入的来路", "perCallNote("),
+            ("加权均耗的公式", "Σ(每行均耗"),
+        )
+        if token not in tsrc
+    ]
+    if computed:
+        problems.append(
+            f"{table_rel}: 算出来的格子没把来路写进注释（缺 {'、'.join(computed)}）——"
+            "比值与差值是前端算的，分子分母不写出来就没人能复核"
+        )
+    if "registeredActorNames(" not in tsrc or "本窗口没有调用" not in tsrc:
+        problems.append(
+            f"{table_rel}: 闭集里登记了、本窗口没出现的执行者不再列出来——"
+            "只列出现过的，读者会把这个数当成全集"
+        )
+    if len(problems) == before:
+        summary.append(f"两级表: {table_rel}（一张表、两级行、列宽单点）")
+
+# ── 12. 零花销：三条腿并成一节 ──
+# 结局、省下账、判定账说的是同一件事——一分没花——的三种成因。分成三节时，
+# 少了任何一块，剩下的两种就会读成同一件事；而它们的**单位不同**（尝试次数 /
+# 决定次数 / 窗口个数），所以并成一节、但必须在同一节里写明不能相加。
+ZERO_BILLS = ("<OutcomeBreakdown", "<SpendAccount")
+merged = [
+    rel
+    for rel in sorted(graph)
+    if all(token in read(rel) for token in ZERO_BILLS)
+]
+if not merged:
+    problems.append(
+        "没有哪一屏同时渲染 OutcomeBreakdown 与 SpendAccount："
+        "「试过被挡回来」与「决定不发 / 该花却停了」又回到了各自一节，"
+        "三分之二的零花销会读成同一件事"
+    )
+else:
+    for rel in merged:
+        src = read(rel)
+        zero = re.search(r">\s*零花销", src)
+        who = re.search(r">\s*谁在花", src)
+        legs = [src.find(token) for token in ZERO_BILLS]
+        if not zero:
+            problems.append(f"{rel}: 那两本账上面没有「零花销」这一节的标题——三种成因的关系没有写进标题")
+        elif any(at < zero.start() for at in legs):
+            problems.append(
+                f"{rel}: 结局或省下账不在「零花销」那一节里——"
+                "分开画时，少了任何一块，剩下的两种就会读成同一件事"
+            )
+        elif who and any(at > who.start() for at in legs):
+            problems.append(
+                f"{rel}: 那两本账有一本被「谁在花」隔到了后面——同一件事的三条腿被拆成了两节"
+            )
+        if "不能相加" not in src:
+            problems.append(
+                f"{rel}: 没有写清三段的单位不同、不能相加——"
+                "尝试次数、决定次数、窗口个数加在一起，读者会把它当成一份花销"
+            )
+        if zero and "不能相加" in src and not any(at < zero.start() for at in legs):
+            summary.append(f"零花销: {rel} 三条腿并成一节，并写明单位不同")
+
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
 

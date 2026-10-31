@@ -33,7 +33,8 @@ trap 'rm -rf "${work}"' EXIT
 fixture() {
   rm -rf "${work}/web" "${work}/crates"
   mkdir -p "${work}/web/src/api" "${work}/web/src/hooks" "${work}/web/src/overlay" \
-    "${work}/web/src/topology" "${work}/crates/cog-gateway/src"
+    "${work}/web/src/topology" "${work}/web/src/ui" "${work}/web/src/styles" \
+    "${work}/web/src/observability" "${work}/crates/cog-gateway/src"
   # 执行者的闭集：第 7 段跨这条边界比名单，所以夹具两侧都要有。
   cat >"${work}/crates/cog-gateway/src/actor_labels.rs" <<'EOF'
 pub const ACTOR_LABELS: &[&str] = &[
@@ -62,9 +63,16 @@ export default function App() {
   return <TokenPanel />;
 }
 EOF
+  # 这一屏的骨架与真树同形：额度窗与累计在页顶（不随窗口变），下面一整组按窗口
+  # ——花销 / 零花销（结局＋两本旁账）/ 谁在花（一张两级表）。夹具要是只有一条扁平
+  # 的 div，第 9~12 段就没有可判的形状。
   cat >"${work}/web/src/overlay/TokenPanel.tsx" <<'EOF'
 import { useUsage, useSeries, useOutcomes, useAccount, usePool } from '@/hooks/useUsage';
 import { localZoneLabel } from '@/topology/format';
+import { Note } from '@/ui/Note';
+import { ActorTable } from './ActorTable';
+
+const WINDOWS = [{ hours: 6, label: '6 小时' }];
 const ACTOR_MEANINGS: Record<string, string> = {
   eval: '评测跑批',
   memory: '记忆读写',
@@ -91,13 +99,168 @@ function registeredButAbsent(list: Member[], dim: Dimension): string[] {
     (value) => !seen.has(value) && !(dim.isPlaceholder?.(value) ?? false)
   );
 }
+function AllowanceWindow({ pool }: { pool: unknown }) {
+  return <div>{String(pool)}</div>;
+}
+function OutcomeBreakdown() {
+  return <div />;
+}
+function SpendAccount() {
+  return <div />;
+}
 export function TokenPanel() {
   const { usage } = useUsage();
   const series = useSeries();
   const outcomes = useOutcomes();
   const account = useAccount();
   const pace = usePool().llm_pool?.pace ?? null;
-  return <div><div>{counted.length}</div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}{pace ?? "?"} {localZoneLabel()} {ACTOR_MEANINGS.eval}</div>;
+  return (
+    <div>
+      <div>{counted.length}</div>
+      <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}</div>
+      <AllowanceWindow pool={pace} />
+      <h2>累计</h2>
+      <section>
+        <div>
+          {WINDOWS.map((option) => (
+            <button key={option.hours}>{option.label}</button>
+          ))}
+          <span>下面三块（花销 / 零花销 / 谁在花）都跟着它变，上面两节不跟</span>
+        </div>
+        <h3>花销</h3>
+        <div>
+          <h3>零花销</h3>
+          <p>三段的单位不同，不能相加。</p>
+          <OutcomeBreakdown />
+          <SpendAccount />
+        </div>
+        <div>
+          <h3>谁在花</h3>
+          <ActorTable actors={[]} />
+          <Note text="四格合起来才是唯一的一行">?</Note>
+        </div>
+      </section>
+      <span>{pace ?? "?"} {localZoneLabel()} {ACTOR_MEANINGS.eval}</span>
+    </div>
+  );
+}
+EOF
+  cat >"${work}/web/src/ui/Note.tsx" <<'EOF'
+export function Note({ text, children }: { text: string; children?: unknown }) {
+  return (
+    <span role="note" onMouseEnter={() => {}} onFocus={() => {}}>
+      {children}
+      <span className="note-panel">{text}</span>
+    </span>
+  );
+}
+EOF
+  cat >"${work}/web/src/styles/tokens.css" <<'EOF'
+.note-panel {
+  position: fixed;
+  user-select: text;
+}
+EOF
+  cat >"${work}/web/src/observability/usageRows.ts" <<'EOF'
+export function actorTotals(actors: unknown[]): unknown[] {
+  return actors;
+}
+export function cacheFormula(style: string, input: number, cached: number): string {
+  return `${style} ${input} ${cached}`;
+}
+EOF
+  # 两级表：一张表、两级行、列宽一处定义、失败格无条件出现。
+  cat >"${work}/web/src/overlay/ActorTable.tsx" <<'EOF'
+import { Fragment } from 'react';
+import { actorTotals, cacheFormula } from '@/observability/usageRows';
+import { Note } from '@/ui/Note';
+
+const W = {
+  actor: '17rem',
+  share: '6.5rem',
+  calls: '5.5rem',
+  failed: '5rem',
+  input: '7rem',
+  output: '7rem',
+  cached: '7rem',
+  rate: '7.5rem',
+  per: '7rem',
+  latency: '5.5rem',
+};
+
+function registeredActorNames(): string[] {
+  return ['eval', 'memory', 'web_chat'];
+}
+
+export function ActorTable({ actors }: { actors: any[] }) {
+  const groups = actorTotals(actors) as any[];
+  const grand = groups.reduce((sum: number, group: any) => sum + group.input + group.output, 0);
+  const spenders = groups.filter((group: any) => group.input + group.output > 0);
+  const absent = registeredActorNames();
+  return (
+    <div>
+      <div aria-hidden>
+        {spenders.map((group: any) => (
+          <span key={group.actor} style={{ width: `${((group.input + group.output) / grand) * 100}%` }} />
+        ))}
+      </div>
+      <table className="grid-table">
+        <thead>
+          <tr>
+            <th style={{ width: W.actor }}>执行者</th>
+            <th style={{ width: W.share }}>占比</th>
+            <th style={{ width: W.calls }}>调用</th>
+            <th style={{ width: W.failed }}>失败</th>
+            <th style={{ width: W.input }}>输入</th>
+            <th style={{ width: W.output }}>输出</th>
+            <th style={{ width: W.cached }}>缓存</th>
+            <th style={{ width: W.rate }}>缓存占比</th>
+            <th style={{ width: W.per }}>每调用输入</th>
+            <th style={{ width: W.latency }}>均耗</th>
+          </tr>
+        </thead>
+        <tbody>
+          {groups.map((group: any) => (
+            <Fragment key={group.actor}>
+              <tr>
+                <td>{group.actor}</td>
+                <td>{group.calls}</td>
+                <td>{group.failed}</td>
+                <td>
+                  {group.styles.length === 1 ? (
+                    <Note text={cacheFormula(group.styles[0], group.input, group.cached)}>{group.cached}</Note>
+                  ) : (
+                    <Note text="两种协议的 input 含义不同">分协议见下</Note>
+                  )}
+                </td>
+                <td>
+                  <Note text={perCallNote(group.input, group.calls)}>{group.calls}</Note>
+                </td>
+                <td>
+                  <Note text={`Σ(每行均耗 × 该行调用) = ${group.latencyWeighted}`}>ms</Note>
+                </td>
+              </tr>
+              {group.rows.map((row: any) => (
+                <tr key={row.upstream}>
+                  <td>{row.upstream}</td>
+                </tr>
+              ))}
+            </Fragment>
+          ))}
+          {absent.map((name) => (
+            <tr key={name}>
+              <td>{name}</td>
+              <td colSpan={9}>本窗口没有调用</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function perCallNote(tokens: number, calls: number): string {
+  return `${tokens} / ${calls} 次调用`;
 }
 EOF
   # 环境那一维的闭集住在这份契约里：第 8 段要跨这条边界比占位符的字面量。
@@ -376,6 +539,99 @@ sed -i 's|<div>{counted.length}</div>|<div>{list.length}</div>|' \
   "${work}/web/src/overlay/TokenPanel.tsx"
 confirm "${work}/web/src/overlay/TokenPanel.tsx" "<div>{list.length}</div>"
 expect_red "计数退回全量" "又退回成 {list.length} 了"
+
+# 20. DOM 元素上又出现原生 title=：提示框选不中、复制不了，而这一屏的每一句解释
+#     都是要贴进工单的。组件自己的 title 参数（可见标题）不算，iframe 的无障碍
+#     title 也不算——这一条判的是「提示框退回去了没有」。
+fixture
+sed -i 's|<span>{pace ??|<span title="读数来自折叠账">{pace ??|' "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" 'title="读数来自折叠账"'
+expect_red "原生 title 回来了" "DOM 元素上又出现了原生 title="
+
+# 21. 注释组件不再画成页面内的面板：它退回成一个只有文字的壳，选不中、复制不了。
+fixture
+sed -i 's/role="note"/role="tip"/' "${work}/web/src/ui/Note.tsx"
+confirm "${work}/web/src/ui/Note.tsx" 'role="tip"'
+expect_red "注释不再是面板" "注释组件缺"
+
+# 22. 面板的规则丢了「能选中」：面板照样浮出来，而里面的字拖不动。
+fixture
+sed -i '/user-select: text/d' "${work}/web/src/styles/tokens.css"
+confirm "${work}/web/src/styles/tokens.css" "position: fixed"
+expect_red "面板选不中" "缺 user-select: text"
+
+# 23. 注释组件整个删掉：下一句要解释的话只能退回成 title=。
+fixture
+rm "${work}/web/src/ui/Note.tsx"
+[ -f "${work}/web/src/ui/Note.tsx" ] && fail "删不掉 ${work}/web/src/ui/Note.tsx"
+expect_red "没有注释组件" "可达图里没有导出 Note 的组件"
+
+# 24. 窗口按钮挪回页头（额度窗与累计之上）：那两节一个是当刻快照、一个是整本
+#     折叠账，都不随窗口变；按钮罩住它们等于说它们也会变。
+fixture
+sed -i '/<AllowanceWindow pool={pace} \/>/d' "${work}/web/src/overlay/TokenPanel.tsx"
+sed -i 's|</section>|</section><AllowanceWindow pool={pace} />|' "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" '</section><AllowanceWindow pool={pace} />'
+expect_red "窗口按钮挪回页头" "窗口按钮排在了"
+
+# 25. 组头那句话删掉：按钮还在组头上，但「下面哪几块跟、上面哪几节不跟」没有了，
+#     读的人按下 6 小时只能自己猜哪些数字变了。
+fixture
+sed -i '/都跟着它变，上面两节不跟/d' "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "<h3>花销</h3>"
+expect_red "组头没写哪几块跟" "窗口那一排没有那句话"
+
+# 26. 两级行拆成两张表：列宽与对齐只能靠两处手抄，迟早对不上。
+fixture
+sed -i 's|<table className="grid-table">|<table className="grid-table"></table><table className="grid-table">|' \
+  "${work}/web/src/overlay/ActorTable.tsx"
+confirm "${work}/web/src/overlay/ActorTable.tsx" "</table><table"
+expect_red "两张表" "两级行不在同一张表里"
+
+# 27. 一级行点不开到四格行：同一个执行者换过几条线路，这一屏上就没有地方说了。
+fixture
+sed -i 's/group.rows.map(/group.rows.forEach(/' "${work}/web/src/overlay/ActorTable.tsx"
+confirm "${work}/web/src/overlay/ActorTable.tsx" "group.rows.forEach("
+expect_red "点不开到四格行" "一级行点不开到四格行"
+
+# 28. 失败那一格退回成条件渲染：零失败的行走少一格，它后面的数字整体左移一列。
+fixture
+sed -i 's|<td>{group.failed}</td>|<td>{group.failed > 0 \&\& group.failed}</td>|' \
+  "${work}/web/src/overlay/ActorTable.tsx"
+confirm "${work}/web/src/overlay/ActorTable.tsx" "group.failed > 0 && group.failed"
+expect_red "失败格条件渲染" "失败那一格又变成条件渲染"
+
+# 29. 一级行的缓存占比不再分协议：两种协议的 input 含义不同，先加起来再除，是一个
+#     协议的分母除以另一个的分子。
+fixture
+sed -i 's/group.styles.length === 1/group.styles.length >= 1/' "${work}/web/src/overlay/ActorTable.tsx"
+confirm "${work}/web/src/overlay/ActorTable.tsx" "group.styles.length >= 1"
+expect_red "缓存占比混协议" "缓存占比没有分协议的限制"
+
+# 30. 合计再算一遍：分摊条、一级行、占比的分母各算各的，迟早各说各的。
+fixture
+sed -i 's|  const grand = groups.reduce|  const again = actorTotals(actors);\n  const grand = groups.reduce|' \
+  "${work}/web/src/overlay/ActorTable.tsx"
+confirm "${work}/web/src/overlay/ActorTable.tsx" "const again = actorTotals(actors);"
+expect_red "合计算两遍" "合计算了"
+
+# 31. 判定账被挪到「谁在花」后面：同一件事的三条腿被拆成两节，少了哪一块，剩下的
+#     两种零花销就会读成同一件事。
+fixture
+sed -i '/^          <SpendAccount \/>$/d' "${work}/web/src/overlay/TokenPanel.tsx"
+sed -i 's|          <ActorTable actors={\[\]} />|          <ActorTable actors={[]} />\n          <SpendAccount />|' \
+  "${work}/web/src/overlay/TokenPanel.tsx"
+awk '/<SpendAccount \/>/{a=NR} /<ActorTable/{t=NR} END{exit !(a>t)}' \
+  "${work}/web/src/overlay/TokenPanel.tsx" || fail "改动没落到 TokenPanel.tsx：SpendAccount 没挪到谁在花之后"
+expect_red "判定账被隔开" "被「谁在花」隔到了后面"
+
+# 32. 那句「单位不同、不能相加」删掉：尝试次数、决定次数、窗口个数并排在一起，
+#     读者会把它当成一份花销去加。
+fixture
+sed -i '/不能相加/d' "${work}/web/src/overlay/TokenPanel.tsx"
+grep -qF "不能相加" "${work}/web/src/overlay/TokenPanel.tsx" && fail "改动没落到 TokenPanel.tsx：不能相加 还在"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "<h3>零花销</h3>"
+expect_red "没写不能相加" "没有写清三段的单位不同"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
