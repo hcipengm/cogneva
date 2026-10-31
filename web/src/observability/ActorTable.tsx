@@ -76,28 +76,28 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
           <tr>
             <th style={{ width: W.actor }}>执行者</th>
             <th style={{ width: W.share }}>占比</th>
-            <th style={{ width: W.calls }} className="text-right">
+            <th style={{ width: W.calls, textAlign: 'right' }}>
               调用
             </th>
-            <th style={{ width: W.failed }} className="text-right">
+            <th style={{ width: W.failed, textAlign: 'right' }}>
               失败
             </th>
-            <th style={{ width: W.input }} className="text-right">
+            <th style={{ width: W.input, textAlign: 'right' }}>
               输入
             </th>
-            <th style={{ width: W.output }} className="text-right">
+            <th style={{ width: W.output, textAlign: 'right' }}>
               输出
             </th>
-            <th style={{ width: W.cached }} className="text-right">
+            <th style={{ width: W.cached, textAlign: 'right' }}>
               缓存
             </th>
-            <th style={{ width: W.rate }} className="text-right">
+            <th style={{ width: W.rate, textAlign: 'right' }}>
               缓存占比
             </th>
-            <th style={{ width: W.per }} className="text-right">
+            <th style={{ width: W.per, textAlign: 'right' }}>
               每调用输入
             </th>
-            <th style={{ width: W.latency }} className="text-right">
+            <th style={{ width: W.latency, textAlign: 'right' }}>
               均耗
             </th>
           </tr>
