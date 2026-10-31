@@ -12,8 +12,12 @@
 #      这种错会在每一面各犯一次。
 #   2. 画法只用主题令牌上色：`ui/plots.tsx` 里不许出现十六进制色值。写死色值的那
 #      几笔在换主题时不会跟着走，会变成深色底上的浅色块。
-#   3. 画出来的那几笔有可读名：每个图都带 `role="img"` 与 `aria-label`，每一格都带
-#      `title` —— 颜色与长度对读屏软件是不可见的，不给名字就等于没有这一幅。
+#   3. 画出来的那几笔有可读名：每个图都带 `role="img"` 与 `aria-label`，每一格的原值
+#      都有一条读得到的路——颜色与长度对读屏软件是不可见的，不给名字就等于没有这一幅。
+#      「路」是闭集但认机制不认属性名：原生 `title=`、SVG 的 `<title>` 元素、页内的
+#      `Note`（悬停/聚焦展开、文字可选可复制，走 `aria-describedby`）都算。判据是
+#      「原值读得到」，不是「必须用某个属性」——把提示换成更好的机制，不该让这一格
+#      看起来像丢了提示；反过来，一个画法一条路都没有，这一条就红。
 #   4. 「没量出来」不许画成 0：`Meter` 必须有 `value === null` 的那一支，且那一支
 #      不落成空条（斜纹 + 写明原因）。把「没人量过」画成「量出来是零」是这一面上
 #      最贵的一种谎。
@@ -80,17 +84,24 @@ if plots.count('role="img"') < 4:
         "ui/plots.tsx 里有画法没带 `role=\"img\"`：颜色与长度对读屏软件是不可见的，"
         "不给名字等于这一幅不存在"
     )
+# 原值可达的路：逐画法判，不是全文件数总数。全文件数到 4 条，四条可以全挤在同一个
+# 画法里，另外三个画法一条都没有——那正是这条判据原先数不出来的一种坏法。
+# 认的是「这一格的原值还读不读得到」，所以三种机制都算：原生 `title=` 属性、SVG 的
+# `<title>` 元素、页内 `Note` 组件。判到属性名上，换一次提示机制就会假红。
+VALUE_PATHS = (r"\btitle=", r"<title[\s>]", r"<Note[\s>]")
 for name in ("BarList", "Strip", "Sparkline", "Meter"):
     body = re.search(r"export function %s\(.*?\n}\n" % name, plots, re.S)
     if not body:
         sys.exit(f"ui/plots.tsx 里读不出 `{name}` 的函数体：这一条判断不了它有没有标可读名")
-    if "aria-label" not in body.group(0):
+    text = body.group(0)
+    if "aria-label" not in text:
         sys.exit(f"ui/plots.tsx 的 `{name}` 没有 `aria-label`：这一幅没有可读名")
-if plots.count("title=") < 4:
-    sys.exit(
-        "ui/plots.tsx 里有画法没给 `title`：密度是这一面功能的一部分，"
-        "每一格的原值只能标在悬停里，去掉它读者就只剩相对长短"
-    )
+    if not any(re.search(pattern, text) for pattern in VALUE_PATHS):
+        sys.exit(
+            f"ui/plots.tsx 的 `{name}` 没有任何一条给原值的路（`title=`、SVG `<title>`、"
+            "`Note` 都没有）：颜色与长度对读屏软件不可见，读者就只剩相对长短，"
+            "答不出「这一格到底是多少」"
+        )
 
 # 4. 「没量出来」不许画成 0。判的是形状不是有没有这个词：`null` 要在**算长度的那
 #    一步**就分出去，`null` 的那一支要画出与「零」不同的样子。只查「函数体里出现过
@@ -115,7 +126,6 @@ if not re.search(r"ratio === null\s*\?[\s\S]{0,400}repeating-linear-gradient", m
 DRAW_MODULES = {
     "@/ui/plots": ("BarList", "Strip", "Sparkline", "Meter"),
     "@/observability/SpendBars": ("SpendBars",),      # 按窗口排开的花销柱
-    "@/observability/TokenShare": ("TokenShare",),    # 按执行者分开的占比条
     "@/topology/ClusterTopology": ("ClusterTopology",),  # 集群 → 节点 → Pod 的拓扑
 }
 
