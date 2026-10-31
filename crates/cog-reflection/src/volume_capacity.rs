@@ -1,3 +1,5 @@
+//! principle: feedback_a_counter_over_a_rolling_process_cannot_reach_a_window_threshold
+//!
 //! Grows a volume's declaration to the size the volume turned out to need.
 //!
 //! A claim's declared size is arithmetic done at install time; what the volume
@@ -316,6 +318,62 @@ fn shortfall_outcome(
 /// surface at all saying the write is failing.
 fn shortfall_anchor(local: &mut Option<u64>, now_unix: u64) -> u64 {
     *local.get_or_insert(now_unix)
+}
+
+/// What the round must do to the claim's stamp, if anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampWork {
+    Nothing,
+    /// A resize condition answered, so a stamp left by an earlier shortfall
+    /// would be measuring a different one.
+    Clear,
+    /// The claim carries no record of when this shortfall began, and every
+    /// process that reads it should count from `first_seen`.
+    Write(u64),
+}
+
+/// What this round's shortfall ages from, and what it owes the claim so the
+/// next round -- possibly in another process -- ages from the same point.
+///
+/// This is the one place the age's origin is decided. Both ways of deciding it
+/// in the process were measured on this installation: a start held only here
+/// never reaches a bound longer than the pod's life (2026-10-31, replaced at 43
+/// minutes), and re-stamping `now` every round is a shortfall that never gets
+/// older. The claim's stamp answers both, because the fact it records belongs
+/// to the claim: a reporter that started a minute ago reads the age off it, and
+/// the write failing does not restart the clock.
+///
+/// `local` is the fallback for a claim that cannot take the stamp, and is
+/// dropped the moment the claim carries one, so a stamp left over from an
+/// earlier shortfall cannot age the next one.
+fn shortfall_start(
+    resizing: bool,
+    claim_stamp: Option<u64>,
+    local: &mut Option<u64>,
+    now_unix: u64,
+) -> (Option<u64>, StampWork) {
+    match (resizing, claim_stamp) {
+        // A resize condition is the resizer answering, so the question this
+        // bound asks does not apply this round.
+        (true, Some(_)) => {
+            *local = None;
+            (None, StampWork::Clear)
+        }
+        (true, None) => {
+            *local = None;
+            (None, StampWork::Nothing)
+        }
+        // The claim's own answer. Reading `now` here instead is the 2026-10-31
+        // shape: the bound then measures this process's age, not the claim's.
+        (false, Some(since)) => {
+            *local = None;
+            (Some(since), StampWork::Nothing)
+        }
+        (false, None) => {
+            let first_seen = shortfall_anchor(local, now_unix);
+            (Some(first_seen), StampWork::Write(first_seen))
+        }
+    }
 }
 
 fn unix_now() -> u64 {
@@ -1112,38 +1170,28 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
     // it is the claim's own answer -- see [`shortfall_outcome`].
     if live.capacity < live.declared {
         let now = unix_now();
-        let since = match (live.resizing, live.shortfall_since) {
-            // A resize condition is the resizer answering, so the question this
-            // bound asks does not apply and any stamp from an earlier shortfall
-            // would be measuring the wrong one.
-            (true, Some(_)) => {
-                clear_shortfall_stamp(&target.claim, &ns).await;
-                state.local_shortfall_since = None;
-                None
-            }
-            (true, None) => {
-                state.local_shortfall_since = None;
-                None
-            }
-            (false, Some(since)) => {
-                state.local_shortfall_since = None;
-                Some(since)
-            }
+        let (since, stamp) = shortfall_start(
+            live.resizing,
+            live.shortfall_since,
+            &mut state.local_shortfall_since,
+            now,
+        );
+        match stamp {
+            StampWork::Nothing => {}
+            StampWork::Clear => clear_shortfall_stamp(&target.claim, &ns).await,
             // A stamp that cannot be written must not restart the bound every
             // round: that would be a claim which reads as still expanding for as
             // long as anybody watches it, which is the failure this whole
             // record exists to end. Falling back to the round this process first
             // saw the shortfall costs the age of the process and nothing more.
-            (false, None) => {
-                let first_seen = shortfall_anchor(&mut state.local_shortfall_since, now);
+            StampWork::Write(first_seen) => {
                 if stamp_shortfall(&target.claim, &ns, first_seen).await {
                     // The claim carries the record now, so this process keeps no
                     // second copy of it.
                     state.local_shortfall_since = None;
                 }
-                Some(first_seen)
             }
-        };
+        }
         let outcome = shortfall_outcome(live.resizing, since, now);
         if outcome == CapacityOutcome::Orphaned && state.last_outcome != Some(outcome) {
             warn!(
@@ -1595,10 +1643,30 @@ mod tests {
     fn a_restarted_reporter_reads_the_age_of_the_shortfall_off_the_claim() {
         let started_long_ago = 1_800_000_000u64;
         let now = started_long_ago + ORPHAN_AFTER_SECS;
+        // A process that has just started carries no round of its own to count
+        // from, so the answer can only come off the claim.
+        let mut local = None;
+        let (since, stamp) = shortfall_start(false, Some(started_long_ago), &mut local, now);
         assert_eq!(
-            shortfall_outcome(false, Some(started_long_ago), now),
+            since,
+            Some(started_long_ago),
+            "the round counted from the process's first sight instead of the claim's stamp"
+        );
+        assert_eq!(
+            stamp,
+            StampWork::Nothing,
+            "a claim that already carries the stamp was asked to carry another"
+        );
+        assert_eq!(
+            shortfall_outcome(false, since, now),
             CapacityOutcome::Orphaned,
             "the first round of a restarted reporter must answer from the claim's stamp"
+        );
+        // The fallback belongs to a claim with no stamp; carrying it forward
+        // would age the next shortfall by the one before it.
+        assert_eq!(
+            local, None,
+            "a first-seen round survived a claim that has one"
         );
     }
 
