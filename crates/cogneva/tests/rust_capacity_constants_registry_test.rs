@@ -1,3 +1,5 @@
+//! principle: feedback_a_verdict_table_beside_the_code_is_a_second_copy_put_it_on_the_object
+//!
 //! Every number written into a Rust constant has to say where it comes from,
 //! and a new one fails this test until it does.
 //!

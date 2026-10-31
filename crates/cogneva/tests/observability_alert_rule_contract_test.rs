@@ -11,6 +11,8 @@
 //! principle: feedback_a_range_selector_keeps_reading_a_subject_that_has_already_been_deleted
 //! principle: feedback_a_companion_clock_only_moves_if_the_writer_advances_it
 //! principle: feedback_a_transient_that_hits_every_subject_at_once_is_one_event_not_n
+//! principle: feedback_two_subject_levels_need_two_gates_or_the_untouched_one_reads_as_green
+//! principle: feedback_the_prose_beside_a_rule_is_its_spec_and_the_expression_can_drift_from_it
 //!
 //! Every PromQL expression in the deployed alert rules reads series by name.
 //!
