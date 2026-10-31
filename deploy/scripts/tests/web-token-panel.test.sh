@@ -70,6 +70,7 @@ EOF
 import { useUsage, useSeries, useOutcomes, useAccount, usePool } from '@/hooks/useUsage';
 import { localZoneLabel } from '@/topology/format';
 import { Note } from '@/ui/Note';
+import { cacheWriteLanding } from '@/observability/usageRows';
 import { ActorTable } from './ActorTable';
 
 const WINDOWS = [{ hours: 6, label: '6 小时' }];
@@ -113,10 +114,13 @@ export function TokenPanel() {
   const series = useSeries();
   const outcomes = useOutcomes();
   const account = useAccount();
-  const pace = usePool().llm_pool?.pace ?? null;
+  const pool = usePool().llm_pool ?? null;
+  const pace = pool?.pace ?? null;
+  const landing = cacheWriteLanding(pool);
   return (
     <div>
       <div>{counted.length}</div>
+      <div>{landing.at}</div>
       <div>{usage?.covered_since}{series?.covered_until}{outcomes?.since}{outcomes?.until}{account?.since}{account?.until}</div>
       <AllowanceWindow pool={pace} />
       <h2>累计</h2>
@@ -185,8 +189,13 @@ export function cacheWriteValue(rows: any[]): string {
 }
 export function cacheWriteNote(rows: any[]): string {
   return cacheWrite(rows) === null
-    ? '这一半还没进账（现网镜像还没有这一列）'
+    ? '这一半要等一次成功调用把用量带回来才有数（现网镜像还没有这一列）'
     : '上游报的缓存写入量';
+}
+export function cacheWriteLanding(pool: any): { at: string | null; basis: string; note: string } {
+  const recovery = pool?.recovery_at ?? null;
+  const probe = pool?.next_attempt_at ?? null;
+  return { at: recovery ?? probe, basis: '上游自述复位', note: '这一半要等一次成功调用' };
 }
 EOF
   # 两级表：一张表、两级行、列宽一处定义、失败格无条件出现。
@@ -492,8 +501,8 @@ expect_red "只剩前三条读面" "getTokenAccount"
 #     什么时候换窗」——那两格在订阅制上游没有单价可乘，它们就是成本读数本身。
 #     上面九条此时全绿：路由在、调用点在、区间字段也在。
 fixture
-sed -i 's/usePool().llm_pool?.pace ?? null/null/' "${work}/web/src/overlay/TokenPanel.tsx"
-confirm "${work}/web/src/overlay/TokenPanel.tsx" "const pace = null;"
+sed -i 's/usePool().llm_pool ?? null/null/' "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "const pool = null;"
 expect_red "没读额度窗" "没有读上游额度窗"
 
 # 11. 只留池子、剪掉 `.pace`：快照照样读、池子照样显示「可用」，而「这一窗还剩
@@ -501,8 +510,8 @@ expect_red "没读额度窗" "没有读上游额度窗"
 #     判词固定报两半（`缺 llm_pool, .pace`，不论实际缺哪一个），所以这里只认那句
 #     「没有读上游额度窗」，认不到具体字段名。
 fixture
-sed -i 's/usePool().llm_pool?.pace ?? null/usePool().llm_pool ?? null/' "${work}/web/src/overlay/TokenPanel.tsx"
-confirm "${work}/web/src/overlay/TokenPanel.tsx" "llm_pool ?? null"
+sed -i 's/const pace = pool?.pace ?? null;/const pace = pool ?? null;/' "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "const pace = pool ?? null;"
 expect_red "读了池子没读窗" "没有读上游额度窗"
 
 # 12. 时区名剪掉：面板照样画柱、照样给读数，而每一个时刻都是浏览器按本地时区
@@ -679,6 +688,32 @@ sed -i 's/    if (value === null || value === undefined) return null;/    total 
   "${work}/web/src/observability/usageRows.ts"
 confirm "${work}/web/src/observability/usageRows.ts" "total += value ?? 0;"
 expect_red "聚合层补零" "cacheWrite() 没有把「没量到」判成 null"
+
+# 36. 缺读数的说明里删掉「这一半要等一次成功调用」：整片「还没进账」读起来就像
+#     采集坏了，读者会去查一条不存在的采集线，而它是账上的事实。
+fixture
+sed -i 's/这一半要等一次成功调用把用量带回来才有数（现网镜像还没有这一列）/这一半还没进账（现网镜像还没有这一列）/' \
+  "${work}/web/src/observability/usageRows.ts"
+confirm "${work}/web/src/observability/usageRows.ts" "这一半还没进账（现网镜像还没有这一列）"
+expect_red "空着没说出在等什么" "没有说出「这一半要等一次成功调用才落账」"
+
+# 37. 「下一次可能进账」那一格从屏上消失：这一半空着的时候，读者只剩「还没进账」
+#     一句，答不出什么时候才可能有数。
+fixture
+sed -i '/<div>{landing.at}<\/div>/d' "${work}/web/src/overlay/TokenPanel.tsx"
+sed -i '/cacheWriteLanding(pool)/d' "${work}/web/src/overlay/TokenPanel.tsx"
+grep -qF "cacheWriteLanding(" "${work}/web/src/overlay/TokenPanel.tsx" \
+  && fail "改动没落到 TokenPanel.tsx：cacheWriteLanding 的调用点还在"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "llm_pool"
+expect_red "没印下次进账" "没有哪一屏把「下一次可能进账」印出来"
+
+# 38. 把「下一次可能进账」写成常量：复位时刻是上游自己说的、随时会变，写死的那个
+#     过了就成假读数，而且不会有任何东西红。
+fixture
+sed -i "s/return { at: recovery ?? probe, basis: '上游自述复位', note: '这一半要等一次成功调用' };/return { at: '2026-11-02T15:28:00Z', basis: '上游自述复位', note: '这一半要等一次成功调用' };/" \
+  "${work}/web/src/observability/usageRows.ts"
+confirm "${work}/web/src/observability/usageRows.ts" "2026-11-02T15:28:00Z"
+expect_red "下次进账写死日期" "写死了日期"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0

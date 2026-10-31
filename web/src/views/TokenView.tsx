@@ -11,6 +11,8 @@ import { SpendAccount } from '@/observability/SpendAccount';
 import { ActorTable } from '@/observability/ActorTable';
 import {
   cacheBase,
+  cacheWrite,
+  cacheWriteLanding,
   cacheWriteNote,
   cacheWriteValue,
   compact,
@@ -49,6 +51,7 @@ import { localZoneLabel, percentOf } from '@/topology/format';
  */
 export function TokenView() {
   const [hours, setHours] = useState(24);
+  const { overview } = useServices();
   const series = useResource(`令牌花销（${hours} 小时）`, () => getTokenUsageSeries(hours), 60_000);
   const usage = useResource(`模型用量（${hours} 小时）`, () => getTokenUsage(hours), 60_000);
   // 累计这一读问的是「这账号一共花过多少」，`hours=0` 即「整本折叠账」。它每分钟
@@ -81,6 +84,11 @@ export function TokenView() {
   // 分母就是它；Anthropic 面上两者不相交，分母是二者之和。两种协议分行列出——
   // 把两条线并成一个百分比，就是让一个协议的分母去解释另一个协议的分子。
   const byStyle = styleCells(rows);
+  // 「下一次可能进账」不是这一页的预测，是池子当刻快照里的两个时刻：上游自述
+  // 复位与我方下次探测。写死日期会在过期后变成假读数，且没有任何东西会红。
+  const pool = overview.data?.llm_pool ?? null;
+  const writeLanding =
+    rows.length > 0 && cacheWrite(rows) === null ? cacheWriteLanding(pool) : null;
   const cumulativeActors = cumulative.data?.actors ?? [];
   const cumulativeSum = (pick: (actor: ActorUsage) => number) =>
     cumulativeActors.reduce((total, actor) => total + pick(actor), 0);
@@ -221,6 +229,17 @@ export function TokenView() {
                       value={cacheWriteValue(rows)}
                       note={cacheWriteNote(rows)}
                     />
+                    {/* 这一半空着的时候，读者要知道的下一件事是「什么时候才可能有数」。
+                        时刻取自池子快照，不写死：配额窗复位是上游自己说的、随时会变。 */}
+                    {writeLanding && (
+                      <Reading
+                        label="缓存写入下次进账"
+                        value={
+                          writeLanding.at ? <Moment iso={writeLanding.at} /> : '没有时刻可报'
+                        }
+                        note={`${writeLanding.basis}。${writeLanding.note}`}
+                      />
+                    )}
                     {[...byStyle.entries()].map(([style, cell]) => {
                       const base = cacheBase(style, cell.input, cell.cached);
                       return (

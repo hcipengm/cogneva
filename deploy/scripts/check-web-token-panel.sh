@@ -758,6 +758,67 @@ if coerced:
         "缺读数与量到 0 是两件事，补零之后屏上再也分不开"
     )
 
+# 「空着」要说出它在等什么。这一半只随成功的那几次调用落账，所以一段窗口整片
+# 没数最常见的成因是那段窗口一次都没成功——账上的事实，不是采集坏了。缺这一句，
+# 读者会把规律读成故障，去查一条不存在的采集线。
+note_bodies = [
+    (rel, re.search(r"export\s+function\s+cacheWriteNote\s*\(.*?\n\}", read(rel), re.S))
+    for rel in sorted(graph)
+    if re.search(r"export\s+function\s+cacheWriteNote\s*\(", read(rel))
+]
+if not note_bodies:
+    problems.append(
+        "找不到 cacheWriteNote()：缺读数时那一格要说的「为什么没有」没有单一声明"
+    )
+for rel, body in note_bodies:
+    text = body.group(0) if body else ""
+    if "成功调用" not in text:
+        problems.append(
+            f"{rel}: 缺读数的说明没有说出「这一半要等一次成功调用才落账」——"
+            "读者会把整片「还没进账」读成采集坏了，而它是账上的事实"
+        )
+
+# 「下一次可能进账」只能取自池子的当刻快照，不能写死。配额窗的复位时刻是上游
+# 自己说的、随时会变：写进前端包里的那一天过了就成了假读数，而且不会有任何东西红。
+landing_defs = [
+    rel
+    for rel in sorted(graph)
+    if re.search(r"export\s+function\s+cacheWriteLanding\s*\(", read(rel))
+]
+landing_cells = [
+    rel for rel in sorted(graph) if rel not in landing_defs and "cacheWriteLanding(" in read(rel)
+]
+if not landing_defs:
+    problems.append(
+        "找不到 cacheWriteLanding()：「下一次可能进账」没有单一来源，"
+        "迟早有人把它写成一个写死的日期"
+    )
+else:
+    body = re.search(
+        r"export\s+function\s+cacheWriteLanding\s*\(.*?\n\}", read(landing_defs[0]), re.S
+    )
+    text = body.group(0) if body else ""
+    if not re.search(r"recovery_at|next_attempt_at", text):
+        problems.append(
+            f"{landing_defs[0]}: cacheWriteLanding() 没有读池子快照里的复位/探测时刻——"
+            "「下一次可能进账」只能来自当刻读数，不能是常量"
+        )
+    literal = re.search(r"20\d\d-\d\d-\d\d", text)
+    if literal:
+        problems.append(
+            f"{landing_defs[0]}: cacheWriteLanding() 里写死了日期 {literal.group(0)}——"
+            "复位时刻会变，写死的那个过了就成假读数，且没有东西会红"
+        )
+if not [rel for rel in landing_cells if "llm_pool" in read(rel)]:
+    problems.append(
+        "没有哪一屏把「下一次可能进账」印出来（`cacheWriteLanding` 的调用点没读 llm_pool）："
+        "缓存写入空着时，读者只能猜它什么时候才会有数"
+    )
+else:
+    summary.append(
+        "缓存写入下次进账: " + ", ".join(rel for rel in landing_cells if "llm_pool" in read(rel))
+    )
+
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
 
