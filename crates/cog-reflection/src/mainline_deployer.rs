@@ -21093,6 +21093,15 @@ echo "||1"
     ///
     /// 假 kubectl 把这条判据做成硬失败：目标在支撑工作负载就绪之前被 `set image`
     /// 就报错退出。少了这段等待，滚动会直接失败（而不是靠断言顺序来推断）。
+    ///
+    /// principle: feedback_a_restart_that_fails_on_name_resolution_is_ordering_not_configuration
+    ///
+    /// 那条规则讲的是症状：重启后第一次连依赖就报 `Name or service not known`，读起来像地址
+    /// 配错了，其实是依赖的 Pod 还没就绪（headless Service 没有 ready endpoint 时 DNS 直接
+    /// NXDOMAIN）。它的门就在这里——`changed_workloads` 决定「这次 apply 动过谁」，
+    /// `support_settled` 按各自声明的代数／副本对判就绪，两者合起来保证目标部署不会早于
+    /// 它依赖的工作负载被滚。判不到的是**滚动之外**的重启（手工 `rollout restart`、节点驱逐），
+    /// 那些不经过这条 apply，也就没有这一序。
     #[tokio::test]
     async fn rollout_waits_for_the_support_workloads_its_own_apply_restarted() {
         let tmp = tempfile::tempdir().unwrap();
