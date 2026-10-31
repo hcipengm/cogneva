@@ -867,6 +867,45 @@ spec:
             summary: "有 {{ $value }} 条原则载体声明已落，账上查不到落地行"
             description: "原则载体（`memory/` 里带 `# principle:` 行的那一份）声明了这个 slug 已落地，而账本里没有它落地的行。两种修法：载体说错了就改载体，账漏了就把落地行补上——不要为了消红去改账上的状态。逐条点名跑 `bash scripts/host/cogneva-principle-census-reading.sh`。"
 
+        # 树内写法普查判红了。那几扇门（`$VAR:-` 少了花括号、按 `..` 数层数取根、拿 `$?`
+        # 当另一条命令的退出码）今天**没有任何提交进程在跑它们**，所以它们是按拍读的；判词
+        # 没有读者的时候，红与绿在读数面上同形，这一条就是那个读者。
+        #
+        # 为什么留半小时：这几扇门扫的是整棵树，两个会话同时改树时，半个提交的中间态可能
+        # 让人误判；而它们守的形状一旦混进树里就会长期留着，半小时的保持漏不掉任何一条真红。
+        #
+        # 为什么不写成 `> 0`：判词是 0/1，`> 0` 与 `== 1` 在这里同义，写 `== 1` 是为了让读
+        # 的人一眼看出它按的是判词而不是计数——计数是旁边的
+        # `principle_style_gate_failures`，它是值，红了哪几扇在生产者 stderr 里。
+        - alert: CognevaPrincipleStyleGateRed
+          expr: max(principle_style_verdict) == 1
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "原则管理"
+            severity: warning
+          annotations:
+            summary: "树内写法普查至少有一扇门在拒这棵树（已持续半小时）"
+            description: "`scripts/host/cogneva-principle-style-reading.sh` 每一拍跑一圈全树写法门，`principle_style_gate_failures` 是其中红了几扇、`principle_style_gates_judged` 是这一拍真跑了几扇。门名不进序列，只在生产者的 stderr（`failed:<名字,…>`）——手动跑一次 `bash scripts/host/cogneva-principle-style-reading.sh` 就会逐扇印出来。修的是树里的写法，不是这条规则：**不要**把这扇门从名单里拿掉来消红，它被挂上按拍读，正是因为它此前没人跑。"
+
+        # 脑库进料口的退场理由名单与公开仓平台契约的 `as_str` 字面量不同步。这扇门跨两个仓，
+        # 提交路径上不保证有公开仓的检出，所以它进不了提交门那一档，只能按拍读——而按拍读
+        # 的判词如果没人读，就等于没在判。
+        #
+        # 为什么要半个小时的保持：两侧是两份各自的提交历史，任何一侧刚落地新值的那几分钟里
+        # 另一侧还没跟上，「先落地、后跟进」是正常节奏。2026-10-22 那次事故的形态不是这几分钟，
+        # 而是平台加了值之后进料口仍按旧名单拒了整整一天——半小时的保持放得过前者、放不过后者。
+        - alert: CognevaRetireReasonsContractDrift
+          expr: max(retire_reasons_contract_drift) == 1
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "退场理由名单两侧不同步（脑库进料口 vs 平台契约）"
+            description: "`scripts/host/cogneva-retire-reasons-match-reading.sh` 每一拍比一遍两侧的值，`retire_reasons_contract_values` 是这一拍比了几个值（分母）。方向与缺的/多的值都在生产者输出里：跑 `bash scripts/host/cogneva-retire-reasons-match-reading.sh` 会按方向点名。修法是让两侧重新对齐——正本（平台契约 `as_str`）加值时副本同一步跟上是纪律，不是可选项：2026-10-22 平台先加了 `answered_elsewhere`，进料口仍按旧的四个值拒，直到排第 121 条退场才被发现。"
+
     # 评测臂：`eval_judged_cases` 与 `eval_bench_cases` 一直是两条**没有消费者**的读数
     # ——每拍都在发、面表拿它当首读数，而没有任何规则、面板或代码读它们（2026-10-28
     # 逐面量过：13 个面里没读者的就是这两个）。后果不是抽象的：`judged=0/198` 从 2026-10-19

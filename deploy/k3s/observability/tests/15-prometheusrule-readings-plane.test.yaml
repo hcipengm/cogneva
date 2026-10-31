@@ -217,6 +217,88 @@ tests:
         alertname: CognevaVerdictSeriesUnread
         exp_alerts: []
 
+  # 树内写法普查判红了，而且红了半小时以上：这一格守的是「判词有读者」。没有这一条时，
+  # 三扇门红了也没有任何规则按它动手，与「这一拍没量」在读数面上同形。
+  - name: 写法普查判红半小时会响
+    interval: 1m
+    input_series:
+      - series: 'principle_style_verdict{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x80'
+      - series: 'principle_style_gate_failures{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x80'
+      - series: 'principle_style_gates_judged{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '3x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaPrincipleStyleGateRed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 原则管理
+
+  # 现网那一拍：判词 0，三扇门都跑了。这一格守的是「不常红」——判词写法改成 `>= 0`
+  # 或 `absent(...)` 这类永远成立的形状时，它就会红。
+  - name: 写法普查全绿不会响
+    interval: 1m
+    input_series:
+      - series: 'principle_style_verdict{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+      - series: 'principle_style_gate_failures{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+      - series: 'principle_style_gates_judged{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '3x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaPrincipleStyleGateRed
+        exp_alerts: []
+
+  # 判词刚红：只持续了两分钟。这一格守着那半小时的保持——去掉 `for`，同一个夹具在 3m
+  # 上就会亮，而那正是「半个提交的中间态把一条判词顶成告警」的来源。
+  - name: 写法普查刚红两分钟不会响
+    interval: 1m
+    input_series:
+      - series: 'principle_style_verdict{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x1 1x79'
+      - series: 'principle_style_gate_failures{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x1 1x79'
+      - series: 'principle_style_gates_judged{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '3x80'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: CognevaPrincipleStyleGateRed
+        exp_alerts: []
+
+  # 退场理由名单两侧不同步，持续半小时以上。
+  - name: 退场理由名单不同步半小时会响
+    interval: 1m
+    input_series:
+      - series: 'retire_reasons_contract_drift{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x80'
+      - series: 'retire_reasons_contract_values{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '5x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaRetireReasonsContractDrift
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 变更管理
+
+  # 现网那一拍：两侧一致。
+  - name: 退场理由名单一致不会响
+    interval: 1m
+    input_series:
+      - series: 'retire_reasons_contract_drift{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x80'
+      - series: 'retire_reasons_contract_values{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '5x80'
+    alert_rule_test:
+      - eval_time: 75m
+        alertname: CognevaRetireReasonsContractDrift
+        exp_alerts: []
+
   - name: 有判词没有决定可做会响
     interval: 1m
     input_series:

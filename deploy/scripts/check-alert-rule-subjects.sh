@@ -400,6 +400,11 @@ NO_POD_REPORTER = {
     'CognevaTasksPublishersDisagree': 'tasks_publishers_agree',
     'CognevaRefusalRedispatchBroken': 'cogneva_refusal_redispatch_state',
     'CognevaPrincipleSlugNoLanding': 'principle_carriers_slug_no_landing',
+    # 两条「按拍读的判词」的读者：它们的生产者各自守着一个跨仓/跨树的形状，提交路径上
+    # 不保证跑得到，所以挂在宿主读数上。身份是那一条判词本身（一个进程、一条判词），
+    # 报信者是聚合器，聚合器重建不改变「这是谁的红」。
+    'CognevaPrincipleStyleGateRed': 'principle_style_verdict',
+    'CognevaRetireReasonsContractDrift': 'retire_reasons_contract_drift',
     'CognevaE2eRingFailed': 'e2e_ten_rings_failed_settled',
     'CognevaE2eRingUnread': 'e2e_ten_rings_unread',
     'CognevaE2eRingNoCheck': 'e2e_ten_rings_unchecked',
