@@ -48,7 +48,12 @@ data:
   # 看板列的在制品上限（`column=limit,…`，可配 scheduled / running）。空串＝不配
   # ＝不限。发布侧与看板读面都从这一份 env 取，所以在这里写下的数就是真正拦住
   # 派发的那个。
-  COGNEVA_BOARD_WIP_LIMITS: ""
+  #
+  # `running=1`：属主 2026-11-01 定的口径「需求再大也是串行一个个解决」。当天
+  # 的现场是 1,923 行待办里 1,767 行已有交接任务在图上、六道变更并行各问几十次，
+  # 额度被切碎到每一道都走不完。只配 running 不配 scheduled：压住的是 token
+  # 花在哪一道上，而 scheduled=1 会把短任务的派发也压成每拍一件。
+  COGNEVA_BOARD_WIP_LIMITS: "running=1"
 
   # Gateway
   COGNEVA_HTTP_PORT: "8080"

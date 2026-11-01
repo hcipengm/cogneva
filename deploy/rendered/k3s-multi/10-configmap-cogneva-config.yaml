@@ -52,7 +52,7 @@ data:
   #
   # 发布是 `pending`→`scheduled` 这一步，所以可配的列只有 scheduled 与
   # running：pending 的限额会拦住唯一能腾空它的那一步，终态列只增不减。
-  COGNEVA_BOARD_WIP_LIMITS: ""
+  COGNEVA_BOARD_WIP_LIMITS: "running=1"
 
   # 进程被告知的三个端口，与容器实际监听的那三个同源（values 的 gateway.*Port，
   # 也与 files/cogneva.json 里的 gateway.*_port 同源）：env 层覆盖 JSON，两处
