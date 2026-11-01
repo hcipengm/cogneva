@@ -3755,6 +3755,19 @@ impl RolloutExecutor {
             else {
                 continue;
             };
+            // 模板不可变的对象（`Job`）上，这条 patch 必然被准入拒绝——而这条拒绝
+            // 会以版本类失败结束整轮主线上滚：一次删不掉的残留，换来此后每一版都
+            // 不落地。残留本身确实删不掉（要删得重建那个对象，那是运维的决定，不在
+            // 这里替他做），所以按「未执行的清理」点名留下，发布继续。
+            if !cog_core::contract::env_supersede::pod_template_is_mutable(&workload.kind) {
+                warn!(
+                    workload = %format!("{}/{}", workload.kind, workload.name),
+                    envs = %plan.names.join(", "),
+                    dropped = plan.dropped,
+                    "pod template is immutable on this kind; the env residue cannot be patched in place"
+                );
+                continue;
+            }
             info!(
                 workload = %format!("{}/{}", workload.kind, workload.name),
                 envs = %plan.names.join(", "),

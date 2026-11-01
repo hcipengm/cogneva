@@ -2905,6 +2905,17 @@ async fn clear_superseded_env_values(text: &str, namespace: &str) -> Result<usiz
             continue;
         };
         let names: Vec<&str> = plan.names.iter().map(String::as_str).collect();
+        // 模板不可变的对象（`Job`）patch 不进去，见
+        // `env_supersede::pod_template_is_mutable` 里记的那次现场。
+        if !cog_core::contract::env_supersede::pod_template_is_mutable(&kind) {
+            warn!(
+                workload = %format!("{kind}/{name}"),
+                envs = %names.join(", "),
+                dropped = plan.dropped,
+                "pod template is immutable on this kind; the env residue cannot be patched in place"
+            );
+            continue;
+        }
         let out = Command::new("kubectl")
             .args([
                 "-n",

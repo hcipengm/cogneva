@@ -146,6 +146,23 @@ impl WorkloadRef {
     }
 }
 
+/// 这个工作负载的 pod 模板在对象创建之后还能不能就地改。
+///
+/// `Job` 不能：`spec.template` 在对象创建时就定下了，之后任何改动都被准入拒绝
+/// （`spec.template: Invalid value: … field is immutable`），而清理残留 env 的
+/// patch 打的正是模板里的路径。
+///
+/// 这不是一条理论上的差别，它会**停掉发布**：主线上滚把一次失败的支撑清单变更
+/// 归为版本类失败并结束整轮，于是「删一条已从清单消失的 env」变成「此后每一版都
+/// 不再落地」。2026-11-01 实测：`cogneva-db-role-bootstrap` 上一条 `BACKUP_PASSWORD`
+/// 把 main 卡在 `ba094981`，之后每一版 rollout 都以 `version:support::observed` 失败，
+/// 而清单本身是对的。
+///
+/// CronJob 在这里是**可以**的：它的 pod 模板在 `jobTemplate` 之下，那一层可变。
+pub fn pod_template_is_mutable(kind: &str) -> bool {
+    !matches!(kind, "Job")
+}
+
 /// 带 pod 模板的工作负载身份（kind、name、namespace）。其余文档返回 None——
 /// 判据只认 pod 模板在 `/spec/template/spec` 的对象，不为别的资源猜路径。
 pub fn workload_identity(doc: &Value) -> Option<WorkloadRef> {
@@ -380,6 +397,20 @@ fn env_name(entry: &Value) -> Option<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// 模板能不能就地改是一条按 kind 的判据，而 `pod_workload` 认的那一族里只有
+    /// `Job` 的模板不可变。两处任改一处（多认一个不可变的 kind，或把 `Job` 放回
+    /// 可改的一侧）都要在这里当场红。
+    #[test]
+    fn only_a_job_has_an_immutable_pod_template() {
+        for kind in ["Deployment", "StatefulSet", "DaemonSet", "CronJob"] {
+            assert!(
+                pod_template_is_mutable(kind),
+                "{kind} templates are mutable"
+            );
+        }
+        assert!(!pod_template_is_mutable("Job"));
+    }
 
     fn live(env: Value) -> Value {
         json!({"spec": {"template": {"spec": {"containers": [{"name": "c", "env": env}]}}}})

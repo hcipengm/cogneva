@@ -23471,6 +23471,74 @@ spec:
         );
     }
 
+    /// 模板不可变的对象（`Job`）上有一条清单已不再声明的 env 时，清理这一步既
+    /// 不能打 patch（必然被准入拒绝），也不能让这一轮发布失败。
+    ///
+    /// 2026-11-01 的现场：`cogneva-db-role-bootstrap` 上留着一条
+    /// `BACKUP_PASSWORD`，patch 回 `spec.template: … field is immutable`，
+    /// 整轮主线上滚以 `version:support::observed` 结束——main 从此停在那一版，
+    /// 之后每一版都失败，而清单本身是对的。
+    #[tokio::test]
+    async fn an_env_residue_on_a_job_is_named_not_patched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let live = r#"{"kind":"Job","metadata":{"name":"cogneva-db-role-bootstrap"},"spec":{"template":{"spec":{"containers":[{"name":"bootstrap","env":[{"name":"PGHOST","value":"postgres"},{"name":"BACKUP_PASSWORD","valueFrom":{"secretKeyRef":{"name":"cogneva-secrets","key":"backup-password"}}}]}]}}}}"#;
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+case "$*" in
+  *"get job cogneva-db-role-bootstrap -o json"*) printf '%s\n' '{live}' ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+"#,
+            log = log.display(),
+            live = live
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+
+        let manifest = tmp.path().join("job.yaml");
+        std::fs::write(
+            &manifest,
+            r#"kind: Job
+metadata:
+  name: cogneva-db-role-bootstrap
+spec:
+  template:
+    spec:
+      containers:
+        - name: bootstrap
+          env:
+            - name: PGHOST
+              value: postgres
+"#,
+        )
+        .unwrap();
+
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        executor
+            .clear_superseded_env_values(&manifest)
+            .await
+            .expect("an immutable pod template must not fail the whole rollout");
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            calls.contains("get job cogneva-db-role-bootstrap -o json"),
+            "the live object still has to be read: {calls}"
+        );
+        assert!(
+            !calls.contains("patch job cogneva-db-role-bootstrap"),
+            "a Job's pod template is immutable; patching it fails the rollout: {calls}"
+        );
+    }
+
     /// 暂存路径**每次调用都不同**：同名部署的两个执行器写同一个路径时，
     /// `std::fs::write` 先截断再写，读到的那一方解析到的是被撕成两半的清单，
     /// 于是把它当成"这一版坏了"。
