@@ -701,6 +701,7 @@ impl cog_core::PromotionLedger for MemoryStateBackend {
         &self,
         cluster: &str,
         change_id: &str,
+        statuses: &[cog_core::PromotionStatus],
         limit: usize,
     ) -> SFResult<Vec<cog_core::PromotionRecord>> {
         let guard = self
@@ -710,7 +711,9 @@ impl cog_core::PromotionLedger for MemoryStateBackend {
         let mut out: Vec<_> = guard
             .promotions
             .iter()
-            .filter(|r| r.cluster == cluster && r.change_id == change_id)
+            .filter(|r| {
+                r.cluster == cluster && r.change_id == change_id && statuses.contains(&r.status)
+            })
             .cloned()
             .collect();
         out.sort_by_key(|r| std::cmp::Reverse(r.updated_at));

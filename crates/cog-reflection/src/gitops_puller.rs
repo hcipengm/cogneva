@@ -385,7 +385,20 @@ impl GitOpsPuller {
     async fn already_processed(&self, change_id: &str) -> SFResult<bool> {
         // 按 change 取，不按时间取（`for_change` 的理由）：同一个候选被重试几十
         // 次之后，它成功过的那条会被挤出按时间的窗口，判据于是随重试次数漂移。
-        let rows = self.ledger.for_change(&self.cluster, change_id, 50).await?;
+        let rows = self
+            .ledger
+            .for_change(
+                &self.cluster,
+                change_id,
+                &[
+                    PromotionStatus::Promoted,
+                    PromotionStatus::Pending,
+                    PromotionStatus::AwaitingApproval,
+                    PromotionStatus::RolledBack,
+                ],
+                1,
+            )
+            .await?;
         Ok(rows.iter().any(|r| {
             matches!(
                 r.status,
@@ -407,7 +420,12 @@ impl GitOpsPuller {
     async fn reconcile_pending(&self, candidate: &PromotionCandidate) -> SFResult<bool> {
         let recent = self
             .ledger
-            .for_change(&self.cluster, &candidate.change_id, 50)
+            .for_change(
+                &self.cluster,
+                &candidate.change_id,
+                &[PromotionStatus::Pending],
+                1,
+            )
             .await?;
         let Some(rec) = recent.iter().find(|r| r.status == PromotionStatus::Pending) else {
             return Ok(false);
@@ -3224,13 +3242,16 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
         assert!(!puller_c.already_processed("p-1").await.unwrap());
     }
 
-    /// 成功过之后，别的 change 的记录再多也不能把这个候选重新算成"没做过"。
+    /// 成功过之后，后来的记录再多也不能把这个候选重新算成"没做过"——无论是别的
+    /// change 的行，还是它自己重试出来的失败行。
     ///
     /// 这个判据曾经按时间取最近 50 行：重试几十次之后，成功那条被后来的一批行
     /// 挤出窗口，于是同一个候选被一遍遍重新金丝雀（2026-11-01 实测：一条成功
     /// 记录 20 分钟后就被挤出，同一个候选一天攒了 233 条失败行，部署被反复换镜像）。
+    /// 只按 change 取还不够——它自己的失败行照样能把它挤出去，所以这一族用例里
+    /// 噪音用的是**同一个 change**。
     #[tokio::test]
-    async fn a_processed_change_stays_processed_when_other_rows_push_it_out_of_a_time_window() {
+    async fn a_processed_change_stays_processed_after_its_own_retries_outnumber_any_window() {
         let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
         let now = chrono::Utc::now();
         let row = |id: &str, change: &str, status, at| PromotionRecord {
@@ -3255,12 +3276,12 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
             ))
             .await
             .unwrap();
-        // 后来的 80 行（别的候选的失败重试）。
+        // 它自己后来的 80 条失败重试：一条候选一天攒过 233 条，任何定长窗口都拦不住。
         for i in 0..80i64 {
             ledger
                 .record(row(
-                    &format!("noise-{i}"),
-                    &format!("p-noise-{i}"),
+                    &format!("retry-{i}"),
+                    "p-done",
                     PromotionStatus::Failed,
                     now - chrono::Duration::seconds(600) + chrono::Duration::seconds(i),
                 ))
@@ -3270,14 +3291,16 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
         // 前提：按时间取的窗口里确实已经看不到那条成功了，否则这条用例什么都没测。
         let window = ledger.recent(50).await.unwrap();
         assert!(
-            !window.iter().any(|r| r.change_id == "p-done"),
+            !window
+                .iter()
+                .any(|r| r.change_id == "p-done" && r.status == PromotionStatus::Promoted),
             "the success row has to be out of the time window for this case to mean anything"
         );
 
         let puller = GitOpsPuller::new(GitOpsConfig::default(), ledger, "cluster-b".into());
         assert!(
             puller.already_processed("p-done").await.unwrap(),
-            "a retired promotion must not look new just because other changes recorded rows \
+            "a retired promotion must not look new just because its own retries recorded rows \
              after it"
         );
     }

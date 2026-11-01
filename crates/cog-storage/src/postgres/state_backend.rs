@@ -1600,20 +1600,23 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
         &self,
         cluster: &str,
         change_id: &str,
+        statuses: &[cog_core::PromotionStatus],
         limit: usize,
     ) -> SFResult<Vec<cog_core::PromotionRecord>> {
+        let wanted: Vec<String> = statuses.iter().map(|s| s.as_str().to_string()).collect();
         let rows: Vec<PromotionRow> = sqlx::query_as(
             r#"
             SELECT id, change_id, level, gate_kind, decision_reason, cluster, status,
                    outcome, eval_summary, created_at, updated_at
             FROM cog_evolution_promotions
-            WHERE cluster = $1 AND change_id = $2
+            WHERE cluster = $1 AND change_id = $2 AND status = ANY($3)
             ORDER BY updated_at DESC
-            LIMIT $3
+            LIMIT $4
             "#,
         )
         .bind(cluster)
         .bind(change_id)
+        .bind(&wanted)
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await
