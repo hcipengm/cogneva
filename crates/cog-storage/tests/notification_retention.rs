@@ -1,3 +1,4 @@
+//! principle: feedback_unread_records_must_not_expire_by_age
 //! Notification retention, against a live PostgreSQL.
 //!
 //! The rule is which rows survive, and that is the database's decision: read

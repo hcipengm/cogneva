@@ -1,3 +1,4 @@
+//! principle: project_cogneva_crate_dependency_boundary_has_no_gate
 //! Gate: the shape of the workspace's crate graph, derived rather than listed.
 //!
 //! The dependency direction between crates is the one rule nothing else can

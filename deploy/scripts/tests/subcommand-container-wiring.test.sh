@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# principle: project_cogneva_registry_walker_rollout_deadlock
 # Deterministic gate for "a container that is supposed to run one subcommand runs
 # the whole application instead".
 #
