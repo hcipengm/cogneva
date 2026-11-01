@@ -206,8 +206,11 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             // 关掉是因为权重不在镜像里：本地无缓存时会向 HuggingFace 发一次没有超时的
             // 拉取，离线集群里会把 init 挂死。部署侧把权重以只读卷挂上、用一个 env
             // 覆盖打开这个开关（`FASTEMBED_CACHE_DIR` 指名那份目录），确认权重就位再
-            // 打开即恢复向量能力。dense 与 sparse 两个 session 一起实测峰值 RSS
-            // 1.67GiB：两者读同一份权重文件，加第二个几乎不涨。
+            // 打开即恢复向量能力。打开这一项要付**两份**权重：dense 与 sparse 是两个
+            // 独立的会话，读的虽是同一批文件，却各把权重读进自己的缓冲区，映射页不共享。
+            // 第二份有多大不用在这里写死——启动打点从 `embedding-dense` 到
+            // `embedding-sparse` 之间那段 RSS 差值就是它。这里曾写着「加第二个几乎不涨」，
+            // 那句话没量过，也正因为它，第一次内存归因是按调用点数权重份数，数错了。
             info!(
                 "Embedding model loading disabled (memory.load_embedding_model=false); \
                  published vectors stay unavailable"
