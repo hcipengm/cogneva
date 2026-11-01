@@ -125,12 +125,33 @@ run "$config" "${work}/missing.test.yaml"
 # 覆盖门（check-alert-rule-firing-coverage.sh）按夹具头把规则记成「已证明」，但它不跑夹具：
 # 一份红着的、或从来没被任何地方执行过的夹具，在它眼里与一份绿的完全一样。这一格把
 # 「点过名」补成「跑过且绿」，否则覆盖数会以夹具的名义涨上去而证明是空的。
-for f in "${repo}"/deploy/k3s/observability/tests/cogneva-json-*.test.yaml; do
-    [ -e "$f" ] || { bad "夹具目录里一份 cogneva-json-*.test.yaml 都没有" "至少一份" "0"; continue; }
-    run "$config" "$f"
-    [ "$rc" -eq 0 ] && ok "夹具真跑绿：$(basename "$f")" \
-        || bad "夹具应跑绿：$(basename "$f")" "0" "$rc；$(tail -3 "${work}/out" | tr '\n' ' ')"
-done
+#
+# 每一份都要起一次 promtool，几十份串行跑是十几分钟。它们彼此独立、只读同一份配置，
+# 所以按批起后台任务：每份写自己的输出文件，跑完再按目录顺序回报——判词和顺序都与
+# 串行时一致，省下的只是等 promtool 的那段墙钟。并发数跟核数走、上限 8：CI 的 runner
+# 只有 4 核，再往上只是多抢内存，而 promtool 自己是单线程的。
+fixtures=("${repo}"/deploy/k3s/observability/tests/cogneva-json-*.test.yaml)
+if [ ! -e "${fixtures[0]}" ]; then
+    bad "夹具目录里一份 cogneva-json-*.test.yaml 都没有" "至少一份" "0"
+else
+    jobs="$(nproc 2>/dev/null || echo 2)"
+    [ "${jobs}" -gt 8 ] && jobs=8
+    mkdir -p "${work}/fixtures"
+    n=0
+    for f in "${fixtures[@]}"; do
+        log="${work}/fixtures/$(basename "$f").log"
+        (RULES_MANIFEST="$config" RULES_CASE="$f" bash "$runner" >"${log}" 2>&1; echo $? >"${log}.rc") &
+        n=$((n + 1))
+        if [ $((n % jobs)) -eq 0 ]; then wait; fi
+    done
+    wait
+    for f in "${fixtures[@]}"; do
+        log="${work}/fixtures/$(basename "$f").log"
+        rc="$(cat "${log}.rc" 2>/dev/null || echo 127)"
+        [ "${rc}" -eq 0 ] && ok "夹具真跑绿：$(basename "$f")" \
+            || bad "夹具应跑绿：$(basename "$f")" "0" "${rc}；$(tail -3 "${log}" | tr '\n' ' ')"
+    done
+fi
 
 # 5c) 告警出口那条规则的 `unless` 腿是承重的：删掉它，「watcher 自己在跑」那格必须红。
 # 这一格证明上面那份新夹具不是橡皮图章——它真的会在规则被改坏时说话。
