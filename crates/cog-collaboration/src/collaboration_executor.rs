@@ -82,6 +82,20 @@ pub struct CollaborationExecutor {
     local_repair_max: Option<u32>,
 }
 
+/// What the producer said about itself, at the two stages the record keeps.
+///
+/// `kind` is the entry point's own spelling and `intent` is the class the
+/// table made of it on the day the change was written. They travel as one value
+/// because they are one fact at two moments: a record that keeps only the class
+/// stays frozen at whichever table answered that day, while one that keeps the
+/// spelling is re-classified by the funnel against today's table. Together they
+/// also keep `extract_changes` inside the seven-parameter bound without
+/// silencing the lint that noticed.
+struct ProducerClass<'a> {
+    intent: Option<cog_core::EvolutionIntent>,
+    kind: Option<&'a str>,
+}
+
 impl CollaborationExecutor {
     /// Create a new collaboration executor.
     pub fn new() -> Self {
@@ -797,8 +811,10 @@ impl CollaborationExecutor {
                     task.input.get("issue_number").and_then(|v| v.as_u64()),
                     &task.id,
                     task.agent_id.as_deref(),
-                    task.evolution_intent(),
-                    task.evolution_kind(),
+                    ProducerClass {
+                        intent: task.evolution_intent(),
+                        kind: task.evolution_kind(),
+                    },
                 ) {
                     // The cause is what came back with the emptiness, and it is
                     // read here rather than discarded: a run that spends a whole
@@ -1144,8 +1160,7 @@ impl CollaborationExecutor {
         issue_number: Option<u64>,
         task_id: &str,
         producer: Option<&str>,
-        intent: Option<cog_core::EvolutionIntent>,
-        kind: Option<&str>,
+        class: ProducerClass<'_>,
     ) -> Result<Vec<cog_core::GeneratedChange>, ChangeYieldOutcome> {
         let mut changes = Vec::new();
         // `pge_payload` reads the result, so it is only `None` when the run
@@ -1199,12 +1214,12 @@ impl CollaborationExecutor {
                 pge_mode: pge_mode.into(),
                 self_review_score: Self::extract_score(squad_result).map(|s| s as f32),
                 issue_number,
-                intent,
+                intent: class.intent,
                 // The spelling survives alongside the class it produced: the
                 // funnel asks the table again whenever the spelling is there,
                 // so a record written under a wrong arm is corrected by the
                 // fix rather than outliving it.
-                kind: kind.map(str::to_string),
+                kind: class.kind.map(str::to_string),
                 producer: producer.map(str::to_string),
             });
         }
@@ -1389,7 +1404,7 @@ impl CollaborationExecutor {
 
 #[cfg(test)]
 mod tests {
-    use super::CollaborationExecutor;
+    use super::{CollaborationExecutor, ProducerClass};
     use crate::checkout::repo_root;
     use cog_core::{Observable, Task, TaskType};
 
@@ -2665,8 +2680,10 @@ mod tests {
             None,
             "task-1",
             None,
-            None,
-            None,
+            ProducerClass {
+                intent: None,
+                kind: None,
+            },
         )
         .expect("the diff the debate produced must reach the sink");
 
@@ -2701,8 +2718,10 @@ mod tests {
             None,
             "task-1",
             Some("luna-1822ab0e"),
-            None,
-            None,
+            ProducerClass {
+                intent: None,
+                kind: None,
+            },
         )
         .expect("the diff the debate produced must reach the sink");
 
@@ -2735,8 +2754,10 @@ mod tests {
             None,
             "task-1",
             None,
-            Some(cog_core::EvolutionIntent::SelfEvolution),
-            Some("change_ledger"),
+            ProducerClass {
+                intent: Some(cog_core::EvolutionIntent::SelfEvolution),
+                kind: Some("change_ledger"),
+            },
         )
         .expect("the diff the debate produced must reach the sink");
 

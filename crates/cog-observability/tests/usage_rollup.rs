@@ -56,6 +56,26 @@ fn hour_floor(now: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::from_timestamp(now.timestamp() - now.timestamp().rem_euclid(w), 0).unwrap()
 }
 
+/// An hour to hang this test's closed windows off, far enough back that no
+/// other test in this file folds one of them.
+///
+/// Folding a window reads the ledger and then writes the row, in two statements
+/// that are not one transaction: a fold that read before a sibling test moved
+/// its rows into the window finishes by writing the zero row it computed, after
+/// the fresh fold has written the real ones. The tests run in parallel against
+/// one database, so the last writer wins — and which one is last depends on
+/// scheduling, which is exactly the shape that fails once in a hundred runs and
+/// holds CI red in the meantime (measured 2026-11-01: the same observability
+/// code passed on 4cefe8fe and failed here on `a_window_folds_the_ledger...`,
+/// with the ledger sum coming back as zeros).
+///
+/// Anchoring each test on its own hours removes the shared window instead of
+/// making the collision less likely. `hours_back` has to stay distinct from the
+/// other anchors in this file and has to keep the windows closed.
+fn hour_owned_by_one_test(hours_back: i64) -> DateTime<Utc> {
+    hour_floor(Utc::now()) - Duration::hours(hours_back)
+}
+
 /// The folded row for one `(window, actor, upstream)`, as a tuple.
 async fn folded(
     pool: &PgPool,
@@ -94,9 +114,9 @@ async fn a_window_folds_the_ledger_and_reruns_in_place_with_zeros_for_the_idle()
     let upstream = format!("rollup-test-upstream:{run}");
     let api_style = "openai".to_string();
 
-    // A closed window, two hours back, so nothing the test writes can fall into
-    // a window that is still open.
-    let hour = hour_floor(Utc::now());
+    // A closed window, well back, so nothing the test writes can fall into a
+    // window that is still open -- and off an hour no sibling test folds.
+    let hour = hour_owned_by_one_test(100);
     let w = RollupWindow {
         start: hour - Duration::hours(2),
         end: hour - Duration::hours(1),
@@ -279,7 +299,7 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
     let upstream = format!("rolled-read-upstream:{run}");
     let api_style = "openai".to_string();
 
-    let hour = hour_floor(Utc::now());
+    let hour = hour_owned_by_one_test(200);
     let old = RollupWindow {
         start: hour - Duration::hours(4),
         end: hour - Duration::hours(3),
@@ -461,7 +481,7 @@ async fn the_summed_read_leaves_out_a_combination_the_range_never_used() {
     let actor = format!("idle-combo-test:{run}");
     let upstream = format!("idle-combo-upstream:{run}");
 
-    let hour = hour_floor(Utc::now());
+    let hour = hour_owned_by_one_test(300);
     let w0 = RollupWindow {
         start: hour - Duration::hours(3),
         end: hour - Duration::hours(2),
@@ -842,7 +862,7 @@ async fn the_fold_carries_the_written_half_and_keeps_no_reading_apart_from_zero(
     let mixed = format!("rollup-cachewrite-mixed:{run}");
     let idle = format!("rollup-cachewrite-idle:{run}");
 
-    let hour = hour_floor(Utc::now());
+    let hour = hour_owned_by_one_test(400);
     let w = RollupWindow {
         start: hour - Duration::hours(2),
         end: hour - Duration::hours(1),
