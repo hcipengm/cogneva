@@ -1035,6 +1035,16 @@ data:
               "face": "持久化存储"
             },
             {
+              "name": "volume_capacity_cannot_expand",
+              "promql": "max by (persistentvolumeclaim, storage_class) (increase(cogneva_volume_capacity_outcome_total{outcome=\"not_expandable\"}[2h]))",
+              "condition": {
+                "greater_than": 0.0
+              },
+              "severity": "warning",
+              "summary": "Claim {persistentvolumeclaim} on class {storage_class}: the volume's measured peak needs a larger request {value} time(s) in the last two hours and the loop left the request alone, because something already on that class asked for more than it was given and nothing ever carried the request out. The raise is the one action here the API cannot undo: a request that has been written stays written for the life of the claim, so writing it on a class with no resizer behind it buys a permanent gap between declared and granted, and every size reading that divides by the declaration is diluted by a size the volume will never have. `local-path` is that class on this installation -- it declares `allowVolumeExpansion: true` and has no controller answering it. The evidence is read from the cluster each round and clears itself: the claim named by `volume_capacity_expansion_orphaned` on the same class is what makes this fire, so replacing or migrating that claim lets the loop raise declarations here again. Until then the room has to arrive from outside the loop: a bigger volume, or a class that can carry an expansion. Admission is not the bound here -- a `volume_capacity_clamped_by_admission` row beside this one is the older fact of the two and is what the loop reports only when the class could carry the raise.",
+              "face": "持久化存储"
+            },
+            {
               "name": "volume_capacity_resize_refused",
               "promql": "max by (persistentvolumeclaim) (increase(cogneva_volume_capacity_outcome_total{outcome=\"refused\"}[1h]))",
               "condition": {

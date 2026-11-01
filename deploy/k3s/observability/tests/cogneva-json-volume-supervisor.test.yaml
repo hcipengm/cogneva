@@ -1,4 +1,4 @@
-# 卷容量、运行时资产与监督者巡检那十六条读数的单测夹具。
+# 卷容量、运行时资产与监督者巡检那十七条读数的单测夹具。
 #
 # volume 一族守的是「声明要的容量与真正拿到的容量」：准入把容量夹小、扩容被拒、
 # 声明了却六小时没长上去（且一直没变）、持有量超过授予量、容量量不出来。
@@ -8,6 +8,8 @@
 #   - `holds_more_than_the_storage_granted`：同一形状，换成持有峰值减授予。
 # 第四格把差值在第六小时内改过一次：declared_ahead 亮、never_completes 静——这是两条
 # 规则唯一的差（「一直没动」这条腿），删掉它那一格会响。
+# 另有 `cannot_expand`：峰值要更大的声明，而同一个类上已有一张卷抬了声明却没人执行——
+# 循环拒绝再写，动作要从循环外面来。它按 `outcome="not_expandable"` 取行。
 #
 # runtime 一族守的是运行时资产（清单、种子）有没有被刷新：状态不是 not_refreshed /
 # content_drift、清单在场可解析、检查读数是新鲜的。
@@ -22,6 +24,7 @@ rule_files:
   - ../../../../deploy/helm/cogneva/files/cogneva.json
 
 # rule: volume_capacity_clamped_by_admission
+# rule: volume_capacity_cannot_expand
 # rule: volume_capacity_resize_refused
 # rule: volume_capacity_expansion_never_completes
 # rule: volume_capacity_expansion_orphaned
@@ -52,6 +55,8 @@ tests:
       - series: 'cogneva_volume_capacity_outcome_total{outcome="refused"}'
         values: '0x156'
       - series: 'cogneva_volume_capacity_outcome_total{outcome="unmeasured"}'
+        values: '0x156'
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="not_expandable"}'
         values: '0x156'
       - series: 'cogneva_volume_capacity_outcome_total{outcome="orphaned",persistentvolumeclaim="data",storage_class="local-path"}'
         values: '0x156'
@@ -164,6 +169,34 @@ tests:
           - exp_labels:
               severity: warning
               persistentvolumeclaim: cogneva-evolution-pvc
+
+  # 本机实测的样子：峰值要 194Gi、声明 192Gi，而同一张类上已经有一张卷抬了声明没人执行。循环不写，
+  # 判 `not_expandable`。这一格点名卷与类——动作不在循环里，在卷本身。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="not_expandable",persistentvolumeclaim="cogneva-evolution-source-pvc",storage_class="local-path"}'
+        values: '0x150 1x6'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_capacity_cannot_expand
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              persistentvolumeclaim: cogneva-evolution-source-pvc
+              storage_class: local-path
+
+  # 同一张卷判的是 `clamped`（准入把它夹住了）：`cannot_expand` 必须静——两条都是
+  # 「没写」，但动的对象不同，一条报成另一条就会把人指到错的旋钮上。
+  - interval: 5m
+    input_series:
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="clamped",persistentvolumeclaim="cogneva-evolution-source-pvc"}'
+        values: '0x150 1x6'
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="not_expandable",persistentvolumeclaim="cogneva-evolution-source-pvc",storage_class="local-path"}'
+        values: '0x156'
+    alert_rule_test:
+      - eval_time: 13h
+        alertname: volume_capacity_cannot_expand
+        exp_alerts: []
 
   # 声明 200、授予 100，十三小时一直没变：三条「差值」规则全亮（扩容一直没完成、
   # 声明跑在授予前面、持有量超过授予量——第三格另给一条峰值）。

@@ -149,6 +149,22 @@ pub const OUTCOME_ORPHANED: &str = "orphaned";
 /// be read. Distinct from `at_target`, which is a measurement that agreed.
 pub const OUTCOME_UNMEASURED: &str = "unmeasured";
 
+/// The volume needs more room than it declares, and the class it sits on has
+/// already shown that it will not carry an expansion out.
+///
+/// The request is deliberately left alone. A request that has been raised on
+/// such a class stays raised forever -- the API has no way to lower it again --
+/// while the size the volume was granted never moves, so what the raise buys is
+/// a permanent shortfall and one more number for every size reading to be
+/// diluted by. The room has to arrive from outside this loop: a bigger volume,
+/// or a class that can expand.
+///
+/// Distinct from [`OUTCOME_CLAMPED`], which is an admission bound this loop
+/// could be given room under, and from [`OUTCOME_ORPHANED`], which is a claim
+/// already carrying a request nothing is working on -- that claim is the
+/// evidence this outcome is decided from, not the same finding.
+pub const OUTCOME_NOT_EXPANDABLE: &str = "not_expandable";
+
 /// Every value the outcome label takes, in slot order.
 pub const OUTCOMES: &[&str] = &[
     OUTCOME_AT_TARGET,
@@ -158,6 +174,7 @@ pub const OUTCOMES: &[&str] = &[
     OUTCOME_EXPANDING,
     OUTCOME_ORPHANED,
     OUTCOME_UNMEASURED,
+    OUTCOME_NOT_EXPANDABLE,
 ];
 
 /// One claim's fate in a round.
@@ -170,6 +187,7 @@ pub enum CapacityOutcome {
     Expanding,
     Orphaned,
     Unmeasured,
+    NotExpandable,
 }
 
 impl CapacityOutcome {
@@ -182,6 +200,7 @@ impl CapacityOutcome {
             Self::Expanding => OUTCOME_EXPANDING,
             Self::Orphaned => OUTCOME_ORPHANED,
             Self::Unmeasured => OUTCOME_UNMEASURED,
+            Self::NotExpandable => OUTCOME_NOT_EXPANDABLE,
         }
     }
 
@@ -194,6 +213,7 @@ impl CapacityOutcome {
             Self::Expanding => 4,
             Self::Orphaned => 5,
             Self::Unmeasured => 6,
+            Self::NotExpandable => 7,
         }
     }
 }
@@ -308,6 +328,55 @@ fn shortfall_outcome(
     } else {
         CapacityOutcome::Expanding
     }
+}
+
+/// The classes this namespace already holds a claim on that asked for more than
+/// it was given and never got it.
+///
+/// The fact that decides whether a raise is worth writing is a property of the
+/// class, and no object states it: `local-path` declares
+/// `allowVolumeExpansion: true` and has no resizer behind it on this
+/// installation, so the declaration is a promise with nobody to keep it. What
+/// the cluster does state is the outcome that promise produced -- a claim whose
+/// request has been ahead of its capacity for longer than
+/// [`ORPHAN_AFTER_SECS`] with no resize condition on it. That claim is the
+/// evidence, and it is read from the cluster every round rather than remembered
+/// here, so a restart neither loses it nor invents it.
+///
+/// Reading it from the whole namespace rather than from the claims this round
+/// happens to have already looked at is what keeps the answer independent of the
+/// order the round walks its targets in: the claim that carries the evidence is
+/// usually not the claim about to be raised, and a per-claim state read after
+/// the raise would be a record written one round too late.
+pub fn classes_that_do_not_expand(
+    claims: &[LiveClaim],
+    now_unix: u64,
+) -> std::collections::BTreeSet<String> {
+    let mut blocked = std::collections::BTreeSet::new();
+    for claim in claims {
+        if claim.capacity >= claim.declared {
+            continue;
+        }
+        let Some(class) = claim.class.as_deref() else {
+            continue;
+        };
+        if shortfall_outcome(claim.resizing, claim.shortfall_since, now_unix)
+            == CapacityOutcome::Orphaned
+        {
+            blocked.insert(class.to_string());
+        }
+    }
+    blocked
+}
+
+/// Whether this round may write a larger request for a claim on `class`.
+///
+/// A claim that names no class binds to the installation's default, which this
+/// loop never reads: blocking it would mean guessing which class it landed on.
+/// The cost of that gap is one raise on the default class, which is the same
+/// thing every claim mounted here does today.
+pub fn may_raise(class: Option<&str>, blocked: &std::collections::BTreeSet<String>) -> bool {
+    class.is_none_or(|class| !blocked.contains(class))
 }
 
 /// Where the bound counts from when a round sees a shortfall whose claim
@@ -505,6 +574,25 @@ const RESIZE_CONDITIONS: &[&str] = &["FileSystemResizePending", "Resizing"];
 pub fn parse_claim(json: &str) -> Result<LiveClaim, String> {
     let v: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("claim is not JSON: {e}"))?;
+    claim_from_value(&v)
+}
+
+/// Read the whole namespace's claims out of `kubectl get pvc -o json`.
+///
+/// The list is what makes a raise decidable: whether a class carries expansions
+/// out is answered by another claim than the one about to be raised, and a
+/// per-claim read can only see itself.
+pub fn parse_claims(json: &str) -> Result<Vec<LiveClaim>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("claim list is not JSON: {e}"))?;
+    let items = v
+        .pointer("/items")
+        .and_then(|i| i.as_array())
+        .ok_or("claim list carries no items")?;
+    items.iter().map(claim_from_value).collect()
+}
+
+fn claim_from_value(v: &serde_json::Value) -> Result<LiveClaim, String> {
     let name = v
         .pointer("/metadata/name")
         .and_then(|s| s.as_str())
@@ -1235,10 +1323,18 @@ pub fn capacity_event(
             ResourceEventOutcome::Refused,
             format!("{SUBJECT_PREFIX}{}@api", target.claim),
         ),
+        // `NotExpandable` is quiet for the same reason the two halves of a
+        // shortfall are: nothing changed here, and the state it describes lasts
+        // until somebody replaces the volume. The counter and the round's own
+        // warning carry it; an account row would repeat that once per round for
+        // as long as the volume lives, and neither of the two kinds this ledger
+        // has -- a bound that moved, an asker that was turned away -- is what
+        // happened.
         CapacityOutcome::AtTarget
         | CapacityOutcome::Expanding
         | CapacityOutcome::Orphaned
-        | CapacityOutcome::Unmeasured => return None,
+        | CapacityOutcome::Unmeasured
+        | CapacityOutcome::NotExpandable => return None,
     };
     let as_i64 = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
     Some(ResourceEvent {
@@ -1321,6 +1417,7 @@ async fn reconcile(
     target: &ClaimTarget,
     state: &mut ClaimState,
     published: &std::collections::BTreeMap<String, u64>,
+    blocked_classes: &std::collections::BTreeSet<String>,
 ) -> CapacityOutcome {
     let used = match &target.occupancy {
         Occupancy::Walked { dir, exclude } => {
@@ -1429,6 +1526,38 @@ async fn reconcile(
     let Some(wanted) = growth_target(peak, live.declared) else {
         return state.quiet(CapacityOutcome::AtTarget);
     };
+
+    // The room this claim needs exists on paper only if its class carries an
+    // expansion out, and a raise is the one action here the API cannot undo.
+    // Checked before the admission bound below because it is the older fact:
+    // a bound can be lifted by changing a LimitRange, a class that does not
+    // implement expansion cannot be changed from here at all.
+    if !may_raise(state.class.as_deref(), blocked_classes) {
+        // Said once per change of conclusion, not once per round: this is a
+        // state that lasts as long as the class does, and a line every tick
+        // would bury the rounds where something did move.
+        if state.last_outcome != Some(CapacityOutcome::NotExpandable) {
+            warn!(
+                claim = %target.claim,
+                class = state.class.as_deref().unwrap_or("(none named)"),
+                declared = live.declared,
+                wanted,
+                peak,
+                "volume capacity: the peak needs a larger request and this claim's class has \
+                 already shown it will not carry an expansion out; the request is left alone \
+                 rather than raised into a shortfall nothing can close"
+            );
+        }
+        return settle(
+            state,
+            target,
+            peak,
+            live.declared,
+            Some(wanted),
+            None,
+            CapacityOutcome::NotExpandable,
+        );
+    }
 
     if let Some(until) = state.refused_until {
         if std::time::Instant::now() < until {
@@ -1699,11 +1828,39 @@ pub fn spawn_volume_capacity_loop(
                              claims other workloads write"
                         );
                     }
+                    // One list read per round, before anything is written: the
+                    // classes that will not carry an expansion out are named by
+                    // a claim other than the one about to be raised, and a read
+                    // taken after the first raise would be answering the
+                    // question too late to be acted on.
+                    let blocked_classes = match kubectl(
+                        &["get", "pvc", "-n", &ns, "-o", "json"],
+                        KUBECTL_READ_TIMEOUT_SECS,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                    .and_then(|json| parse_claims(&json))
+                    {
+                        Ok(claims) => classes_that_do_not_expand(&claims, unix_now()),
+                        Err(e) => {
+                            // The same API read that decides every claim's
+                            // sizes below; if it fails they fail too and nothing
+                            // is raised this round anyway. Kept as a warning
+                            // rather than treated as evidence: an unreadable
+                            // list says nothing about any class.
+                            warn!(
+                                error = %e,
+                                "volume capacity: the namespace's claims could not be listed; \
+                                 no class is taken to be unable to expand this round"
+                            );
+                            std::collections::BTreeSet::new()
+                        }
+                    };
                     for target in &targets {
                         let state = states
                             .entry(target.claim.clone())
                             .or_insert_with(ClaimState::new);
-                        let outcome = reconcile(target, state, &published).await;
+                        let outcome = reconcile(target, state, &published, &blocked_classes).await;
                         if let Some(declared) = state.declared {
                             let peak = state.peak.iter().copied().max().unwrap_or(0);
                             readings.observe_sizes(
@@ -1877,7 +2034,13 @@ mod tests {
             occupancy: Occupancy::Published,
         };
         let mut state = ClaimState::new();
-        let outcome = reconcile(&target, &mut state, &std::collections::BTreeMap::new()).await;
+        let outcome = reconcile(
+            &target,
+            &mut state,
+            &std::collections::BTreeMap::new(),
+            &std::collections::BTreeSet::new(),
+        )
+        .await;
         assert_eq!(outcome, CapacityOutcome::Unmeasured);
         assert!(state.peak.is_empty(), "nothing was recorded as a peak");
     }
@@ -2240,6 +2403,7 @@ mod tests {
             CapacityOutcome::Expanding,
             CapacityOutcome::Orphaned,
             CapacityOutcome::Unmeasured,
+            CapacityOutcome::NotExpandable,
         ]
         .into_iter()
         .enumerate()
@@ -2247,6 +2411,87 @@ mod tests {
             assert_eq!(outcome.index(), i);
             assert_eq!(OUTCOMES[i], outcome.as_str());
         }
+    }
+
+    /// A claim that asked for more than it was given and never got it is the
+    /// only evidence the cluster holds that its class does not carry expansions
+    /// out. This is that specimen, taken from what `local-path` did to the
+    /// evolution claim, measured 2026-10-31 on this host: 21Gi asked, 20Gi
+    /// granted, no resize condition, stamped two hours ago.
+    #[test]
+    fn a_class_that_stranded_a_claim_is_the_one_a_raise_must_not_touch() {
+        let now = 1_800_000_000u64;
+        let stranded = serde_json::json!({
+            "metadata": {
+                "name": "cogneva-evolution-pvc",
+                "annotations": {"cogneva.io/volume-shortfall-since": (now - 7200).to_string()},
+            },
+            "spec": {
+                "storageClassName": "local-path",
+                "resources": {"requests": {"storage": "21Gi"}},
+            },
+            "status": {"capacity": {"storage": "20Gi"}},
+        })
+        .to_string();
+        let stranded = parse_claim(&stranded).unwrap();
+        let blocked = classes_that_do_not_expand(std::slice::from_ref(&stranded), now);
+        assert!(blocked.contains("local-path"), "{blocked:?}");
+        assert!(!may_raise(Some("local-path"), &blocked));
+
+        // Just raised this round: still inside the window where a resizer is
+        // merely slow to announce itself, so it is not evidence about the class.
+        let mut young = stranded.clone();
+        young.shortfall_since = Some(now - 60);
+        assert!(classes_that_do_not_expand(&[young], now).is_empty());
+
+        // A resize condition on the claim says something in the cluster is
+        // working on it, which is the opposite of a class that cannot.
+        let mut answering = stranded.clone();
+        answering.resizing = true;
+        assert!(classes_that_do_not_expand(&[answering], now).is_empty());
+
+        // A claim that never asked for more than it has says nothing either way.
+        assert!(classes_that_do_not_expand(
+            &[parse_claim(&claim_json_with(
+                "20Gi",
+                "20Gi",
+                "local-path",
+                serde_json::json!([]),
+            ))
+            .unwrap()],
+            now
+        )
+        .is_empty());
+    }
+
+    /// The raise is what this guard exists to stop, so the decision itself has
+    /// to be readable without a cluster: a blocked class refuses, an unblocked
+    /// one and a claim that names no class both go ahead.
+    #[test]
+    fn a_raise_is_allowed_on_every_class_but_the_one_that_stranded_a_claim() {
+        let blocked: std::collections::BTreeSet<String> =
+            ["local-path".to_string()].into_iter().collect();
+        assert!(!may_raise(Some("local-path"), &blocked));
+        assert!(may_raise(Some("cogneva-local-retain"), &blocked));
+        assert!(may_raise(None, &blocked));
+    }
+
+    /// The whole namespace in one read is what makes the guard independent of
+    /// the order a round walks its targets in.
+    #[test]
+    fn a_namespace_list_reads_back_every_claim_it_holds() {
+        let list = serde_json::json!({
+            "items": [
+                serde_json::from_str::<serde_json::Value>(&claim_json("192Gi", "192Gi")).unwrap(),
+                serde_json::from_str::<serde_json::Value>(&claim_json("21Gi", "20Gi")).unwrap(),
+            ]
+        })
+        .to_string();
+        let claims = parse_claims(&list).unwrap();
+        assert_eq!(claims.len(), 2);
+        assert_eq!(claims[0].declared, 192 * GIB);
+        assert_eq!(claims[1].capacity, 20 * GIB);
+        assert!(parse_claims(r#"{"kind":"List"}"#).is_err());
     }
 
     #[test]
@@ -2264,6 +2509,7 @@ mod tests {
             CapacityOutcome::Expanding,
             CapacityOutcome::Orphaned,
             CapacityOutcome::Unmeasured,
+            CapacityOutcome::NotExpandable,
         ] {
             let expected = if o == CapacityOutcome::AtTarget { 1 } else { 0 };
             assert_eq!(
@@ -2338,15 +2584,16 @@ mod tests {
         assert_eq!(event.detail["ceiling_bytes"], (GIB * 200) as i64);
     }
 
-    /// The three quiet conclusions are the absence of an event, and each has to
-    /// say so on its own: a test that only checked one would pass a builder
-    /// that answered `None` for the wrong reason.
+    /// The quiet conclusions are the absence of an event, and each has to say so
+    /// on its own: a test that only checked one would pass a builder that
+    /// answered `None` for the wrong reason.
     #[test]
     fn a_round_that_changed_nothing_writes_no_row() {
         for outcome in [
             CapacityOutcome::AtTarget,
             CapacityOutcome::Expanding,
             CapacityOutcome::Unmeasured,
+            CapacityOutcome::NotExpandable,
         ] {
             assert!(
                 capacity_event(&target(), "pod-a", 1, 1, None, None, outcome).is_none(),

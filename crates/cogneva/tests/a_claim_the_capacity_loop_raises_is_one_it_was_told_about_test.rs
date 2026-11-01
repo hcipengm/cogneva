@@ -362,6 +362,52 @@ fn the_variable_name_checked_here_is_the_one_the_loop_reads() {
     );
 }
 
+/// The guard is only worth having if the raise actually goes through it.
+///
+/// A class that will not carry an expansion out is named by a claim it already
+/// stranded, and a request written on such a class can never be lowered again:
+/// the claim then announces more than it will ever be given for the rest of its
+/// life. The decision itself is unit-tested where it lives; this is the wiring
+/// -- the round has to derive the blocked set from the namespace before it
+/// reconciles anything, and the write has to sit behind the verdict.
+#[test]
+fn a_size_nothing_can_carry_out_is_not_written_and_the_write_sits_behind_that_verdict() {
+    let path = repo_root().join("crates/cog-reflection/src/volume_capacity.rs");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+
+    let round = text
+        .find("let blocked_classes = match kubectl(")
+        .unwrap_or_else(|| {
+            panic!(
+                "容量循环不再从命名空间的卷列表推出「哪些类抬不动」：\
+                 这条判据读的那一步没了"
+            )
+        });
+    let first_reconcile = text
+        .find("reconcile(target, state, &published, &blocked_classes)")
+        .unwrap_or_else(|| panic!("容量循环不再把 blocked_classes 交给单卷决策"));
+    assert!(
+        round < first_reconcile,
+        "blocked_classes 必须在任何一卷被决策之前算出来：晚一拍就是先写后判"
+    );
+
+    // Inside the single-claim decision, the patch has to come after the guard.
+    let reconcile = text
+        .find("async fn reconcile(")
+        .expect("找不到单卷决策函数 reconcile");
+    let body = &text[reconcile..];
+    let guard = body
+        .find("if !may_raise(")
+        .expect("单卷决策里没有 may_raise 这一判：白名单算出来了却没人用");
+    let patch = body
+        .find("\"patch\",\n            \"pvc\",")
+        .expect("单卷决策里找不到改卷声明的 patch");
+    assert!(
+        guard < patch,
+        "must not raise 的判定在写之后：这条 guard 挡不住任何一次抬高"
+    );
+}
+
 /// The workloads that may change a claim's declaration.
 ///
 /// A pod can raise a declaration only if its ServiceAccount is bound to a Role
