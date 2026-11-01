@@ -4530,113 +4530,168 @@ impl RolloutExecutor {
     }
 
     /// `window` 是调用方在静置期里采到的宿主排队读数，见 [`HostSoakWindow`]。
+    ///
+    /// 一个**刚开始起来的新副本**不在这里判：控制器可以在静置期里才把它建出来
+    /// （部署被别的写者暂停过再放开就是这种形状），而它自己的启动预算还没走完。
+    /// 2026-11-02 实测：`deployment/cogneva` 的新 Pod `ran=23s` 被判「not ready」，
+    /// 整次滚动连同另外三个已经滚好的目标一起回滚，而它的 startupProbe 是
+    /// 5s × 60 = 300s。同一条道理 `wait_rollout_complete` 早就写着：门禁比探针的
+    /// 判定周期更早开枪，就会把一个几十秒后就绪的正常版本判死。静置期真正要判的是
+    /// 「起来了之后稳不稳」，不是「起没起来」——后者有自己的预算。
     pub(crate) async fn pods_healthy(
         &self,
         t: &RolloutTarget,
         window: &HostSoakWindow,
     ) -> SFResult<()> {
         let selector = pod_selector(&t.name, &t.component);
-        let out = self
-            .probe(
-                &[
-                    "get",
-                    "pods",
-                    "-l",
-                    &selector,
-                    "-o",
-                    "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{' '}{.status.containerStatuses[0].state.running.startedAt}{\"\\n\"}{end}",
-                ],
-                30,
-                self.rollout_timeout_secs,
-            )
-            .await?;
-        if out.trim().is_empty() {
-            return Err(SFError::Agent(format!(
-                "no pods found for selector {selector} (deployment/label mismatch?)"
-            )));
-        }
-        for line in out.lines() {
-            // 按**位置**切，不按空白切：jsonpath 每个字段之间固定给一个空格，而空字段
-            // （等待原因在运行中的容器上没有、运行起点在等待中的容器上没有）会留下相邻
-            // 的两个空格。`split_whitespace` 会把它们折成一个，后面的字段就整列前移，
-            // 「运行中」的 Pod 看起来像没有起点、「等待中」的 Pod 的等待原因变成别的东西。
-            let mut parts = line.split(' ');
-            let restarts: u32 = parts
-                .next()
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0);
-            let ready = parts.next().unwrap_or("").trim();
-            let waiting_reason = parts.next().unwrap_or("").trim();
-            let running_since = parts.next().unwrap_or("").trim();
-            if FATAL_WAITING_REASONS.contains(&waiting_reason) {
-                let msg = format!(
-                    "pod of deployment/{} in fatal waiting state {waiting_reason}: {line}",
-                    t.deployment
-                );
-                return Err(self.with_scene(t, msg).await);
+        // 每个还没就绪的新副本什么时候用完自己的启动预算：按 Pod 自己的起点算，
+        // 不从这一拍重新起算，否则每轮采样都会把界往后推，永远到不了。
+        let mut budget_ends: Option<std::time::Instant> = None;
+        loop {
+            let out = self
+                .probe(
+                    &[
+                        "get",
+                        "pods",
+                        "-l",
+                        &selector,
+                        "-o",
+                        "jsonpath={range .items[*]}{.status.containerStatuses[0].restartCount}{' '}{.status.containerStatuses[0].ready}{' '}{.status.containerStatuses[0].state.waiting.reason}{' '}{.status.containerStatuses[0].state.running.startedAt}{\"\\n\"}{end}",
+                    ],
+                    30,
+                    self.rollout_timeout_secs,
+                )
+                .await?;
+            if out.trim().is_empty() {
+                return Err(SFError::Agent(format!(
+                    "no pods found for selector {selector} (deployment/label mismatch?)"
+                )));
             }
-            if ready != "true" {
-                let msg = format!("pod of deployment/{} not ready: {line}", t.deployment);
-                return Err(self.with_scene(t, msg).await);
-            }
-            if restarts > self.restart_threshold {
-                // 重启计数是 Pod 一生的累计，就绪是此刻的事实——两个数回答的不是同一个
-                // 问题。一个此刻就绪、且这一趟运行已经跨过整段 soak 的容器，它那些重启
-                // 全都发生在真正起来之前：宿主在这一刻被别的活挤住（等表锁等穿预算、建
-                // 集合超时）就是这个形状，同一张镜像下一次启动就起来了。版本真坏了，
-                // 同一个容器会再倒一次，下一次采样读到的是 `ready=false`，由上面那一支
-                // 判死——那时判词里有「没起来」的现场，而不是一个与病因无关的计数。
-                //
-                // 判死于是只在两种情况下成立：容器此刻没就绪（上面已拦），或这一趟运行
-                // 还没跨过 soak——那时「起来了」与「刚崩完又起来」在读数上同形。读不到
-                // 起点同样按判死处理：读不到不是「它稳了很久」。
-                //
-                // 但「这一趟还没跨过 soak」这一刻只有一个瞬时读数，而它想回答的是
-                // 「这段时间宿主给过它时间吗」——后者是一段窗口里的事。宿主负载不在这里
-                // 读（那会是在第三处现判「机器忙不忙」），而是由调用方在静置期里按轮询
-                // 节拍采样后传进来，与超时那一支共用 `is_loaded` 和「半程以上」这条界：
-                // 两个地方各自发明一个阈值，等于同一件事有两个答案。
-                let run_secs = run_secs_since(running_since);
-                if !run_secs.is_some_and(|secs| secs >= self.soak_secs) {
-                    // 静置期里宿主半程以上都在排队：这个重启是等出来的，不是版本崩
-                    // 出来的。此刻 Pod 是就绪的（上面已拦过未就绪），所以不扣住它、
-                    // 不回滚，宿主松下来它自己会稳；判词带上读数来自哪台机器。
-                    if let (true, Some(peak)) = (window.was_queued(), window.peak) {
-                        let msg = format!(
-                            "{HOST_LOADED_MARKER}: pod of deployment/{} restarted {} times \
-                             (threshold {}) but was ready when the soak ended, and the host's \
-                             run queue was past one task per core on {} of {} samples taken \
-                             during that soak, peaking at load1 {:.2} against {} cores (read on \
-                             {}), so the restarts happened while this machine was giving its \
-                             time to work that is not part of this revision rather than to a \
-                             fault in it: {line}",
-                            t.deployment,
-                            restarts,
-                            self.restart_threshold,
-                            window.queued_polls,
-                            window.polls,
-                            peak.load1,
-                            peak.cores,
-                            window
-                                .reader
-                                .as_deref()
-                                .unwrap_or("a machine this process could not name"),
-                        );
-                        return Err(self.with_scene(t, msg).await);
-                    }
-                    let run_note = match run_secs {
-                        Some(secs) => format!("running {secs}s"),
-                        None => "start time not readable".to_string(),
-                    };
+            let mut starting = false;
+            for line in out.lines() {
+                // 按**位置**切，不按空白切：jsonpath 每个字段之间固定给一个空格，而空字段
+                // （等待原因在运行中的容器上没有、运行起点在等待中的容器上没有）会留下相邻
+                // 的两个空格。`split_whitespace` 会把它们折成一个，后面的字段就整列前移，
+                // 「运行中」的 Pod 看起来像没有起点、「等待中」的 Pod 的等待原因变成别的东西。
+                let mut parts = line.split(' ');
+                let restarts: u32 = parts
+                    .next()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(0);
+                let ready = parts.next().unwrap_or("").trim();
+                let waiting_reason = parts.next().unwrap_or("").trim();
+                let running_since = parts.next().unwrap_or("").trim();
+                if FATAL_WAITING_REASONS.contains(&waiting_reason) {
                     let msg = format!(
-                        "pod of deployment/{} restarting ({} restarts, threshold {}, {run_note}): {line}",
-                        t.deployment, restarts, self.restart_threshold
+                        "pod of deployment/{} in fatal waiting state {waiting_reason}: {line}",
+                        t.deployment
                     );
                     return Err(self.with_scene(t, msg).await);
                 }
+                if ready != "true" {
+                    // 没就绪、而且这一生已经倒过超阈值的次数：每倒一次都重来一段启动
+                    // 预算，那不是「起得慢」，是反复起不来——照旧判死。没有这一支，
+                    // 「按每一次运行的起点算预算」就会让重启循环永远够不到界。
+                    if restarts > self.restart_threshold {
+                        let msg = format!(
+                            "pod of deployment/{} restarted {} times (threshold {}) and is still \
+                             not ready, so it is not merely slow to start: {line}",
+                            t.deployment, restarts, self.restart_threshold
+                        );
+                        return Err(self.with_scene(t, msg).await);
+                    }
+                    // 容器在跑、这一趟运行还没走完启动预算 ⇒ 它还在起来，不是判词。
+                    // 读不到起点不算数（照旧判死）：读不到不是「它刚开始起来」。
+                    let ran = run_secs_since(running_since);
+                    if let Some(secs) = ran.filter(|secs| *secs < self.startup_timeout_secs) {
+                        starting = true;
+                        let ends = std::time::Instant::now()
+                            + Duration::from_secs(self.startup_timeout_secs - secs);
+                        budget_ends = Some(budget_ends.map_or(ends, |b| b.max(ends)));
+                        continue;
+                    }
+                    let msg = match ran {
+                        Some(secs) => format!(
+                            "pod of deployment/{} is still not ready {secs}s into this run, past \
+                             its startup budget of {}s: {line}",
+                            t.deployment, self.startup_timeout_secs
+                        ),
+                        None => format!("pod of deployment/{} not ready: {line}", t.deployment),
+                    };
+                    return Err(self.with_scene(t, msg).await);
+                }
+                if restarts > self.restart_threshold {
+                    // 重启计数是 Pod 一生的累计，就绪是此刻的事实——两个数回答的不是同一个
+                    // 问题。一个此刻就绪、且这一趟运行已经跨过整段 soak 的容器，它那些重启
+                    // 全都发生在真正起来之前：宿主在这一刻被别的活挤住（等表锁等穿预算、建
+                    // 集合超时）就是这个形状，同一张镜像下一次启动就起来了。版本真坏了，
+                    // 同一个容器会再倒一次，下一次采样读到的是 `ready=false`，由上面那一支
+                    // 判死——那时判词里有「没起来」的现场，而不是一个与病因无关的计数。
+                    //
+                    // 判死于是只在两种情况下成立：容器此刻没就绪（上面已拦），或这一趟运行
+                    // 还没跨过 soak——那时「起来了」与「刚崩完又起来」在读数上同形。读不到
+                    // 起点同样按判死处理：读不到不是「它稳了很久」。
+                    //
+                    // 但「这一趟还没跨过 soak」这一刻只有一个瞬时读数，而它想回答的是
+                    // 「这段时间宿主给过它时间吗」——后者是一段窗口里的事。宿主负载不在这里
+                    // 读（那会是在第三处现判「机器忙不忙」），而是由调用方在静置期里按轮询
+                    // 节拍采样后传进来，与超时那一支共用 `is_loaded` 和「半程以上」这条界：
+                    // 两个地方各自发明一个阈值，等于同一件事有两个答案。
+                    let run_secs = run_secs_since(running_since);
+                    if !run_secs.is_some_and(|secs| secs >= self.soak_secs) {
+                        // 静置期里宿主半程以上都在排队：这个重启是等出来的，不是版本崩
+                        // 出来的。此刻 Pod 是就绪的（上面已拦过未就绪），所以不扣住它、
+                        // 不回滚，宿主松下来它自己会稳；判词带上读数来自哪台机器。
+                        if let (true, Some(peak)) = (window.was_queued(), window.peak) {
+                            let msg = format!(
+                                "{HOST_LOADED_MARKER}: pod of deployment/{} restarted {} times \
+                                 (threshold {}) but was ready when the soak ended, and the \
+                                 host's run queue was past one task per core on {} of {} \
+                                 samples taken during that soak, peaking at load1 {:.2} \
+                                 against {} cores (read on {}), so the restarts happened while \
+                                 this machine was giving its time to work that is not part of \
+                                 this revision rather than to a fault in it: {line}",
+                                t.deployment,
+                                restarts,
+                                self.restart_threshold,
+                                window.queued_polls,
+                                window.polls,
+                                peak.load1,
+                                peak.cores,
+                                window
+                                    .reader
+                                    .as_deref()
+                                    .unwrap_or("a machine this process could not name"),
+                            );
+                            return Err(self.with_scene(t, msg).await);
+                        }
+                        let run_note = match run_secs {
+                            Some(secs) => format!("running {secs}s"),
+                            None => "start time not readable".to_string(),
+                        };
+                        let msg = format!(
+                            "pod of deployment/{} restarting ({} restarts, threshold {}, \
+                             {run_note}): {line}",
+                            t.deployment, restarts, self.restart_threshold
+                        );
+                        return Err(self.with_scene(t, msg).await);
+                    }
+                }
             }
+            if !starting {
+                return Ok(());
+            }
+            let ends = budget_ends.expect("a starting replica records when its budget ends");
+            if std::time::Instant::now() >= ends {
+                let msg = format!(
+                    "pod of deployment/{} was still not ready when its own startup budget \
+                     ({}s) ran out, so this is not a replica that is merely slow to start: {out}",
+                    t.deployment, self.startup_timeout_secs
+                );
+                return Err(self.with_scene(t, msg).await);
+            }
+            tokio::time::sleep(Duration::from_secs(ROLLOUT_POLL_SECS)).await;
         }
-        Ok(())
     }
 
     /// 给判败记录补上现场：与超时路径同一套采样（Pod 名/相位/ready/等待原因与

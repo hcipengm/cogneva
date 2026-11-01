@@ -13904,6 +13904,46 @@ exit 0
         dir.join("fake-kubectl").to_string_lossy().to_string()
     }
 
+    /// fake kubectl：`get pods` 每次返回序列里的下一行，用完一直返回最后一行。
+    ///
+    /// `pods_healthy` 会为「还在自己的启动预算里」的副本轮询，按文件写的那只夹具每拍
+    /// 读到同一行，跨不过一拍，也就看不出「第一拍不算判词、第二拍就绪即放行」。
+    fn fake_kubectl_pods_sequence(dir: &Path, lines: &[&str]) -> String {
+        let log = dir.join("kubectl.log");
+        let count = dir.join("pods.count");
+        let seq = dir.join("pods.seq");
+        std::fs::write(&seq, lines.join("\n") + "\n").unwrap();
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *"get pods"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    awk -v n="$n" 'NR==n{{print; seen=1}} {{last=$0}} END{{if(!seen) print last}}' '{seq}'
+    ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = count.display(),
+            seq = seq.display()
+        );
+        write_fake_bin(dir, "fake-kubectl", &script);
+        dir.join("fake-kubectl").to_string_lossy().to_string()
+    }
+
     /// fake kubectl：pods 查询输出从文件读（测试逐例改写文件模拟不同 Pod 态）。
     /// `-o` 同样强制 jsonpath= 前缀（见 fake_kubectl 注释）。
     fn fake_kubectl_pods_from_file(dir: &Path, pods_file: &Path) -> String {
@@ -21938,6 +21978,65 @@ echo "||1"
             .pods_healthy(&target, &HostSoakWindow::default())
             .await
             .is_ok());
+    }
+
+    /// 2026-11-02 线上那一幕：控制器在静置期里才把新副本建出来，第一拍读到
+    /// `ready=false` 而这一趟运行才 23 秒——部署器当场判「not ready」并把整次滚动
+    /// 回滚，可那个 Pod 的 startupProbe 是 5s × 60 = 300s，离它自己的界还差得远。
+    /// 静置期要判的是「起来了之后稳不稳」，不是「起没起来」：后者有自己的预算，
+    /// 判据在 `wait_rollout_complete` 里早就是这个口径，这里不能更严。
+    #[tokio::test]
+    async fn a_fresh_replica_inside_its_startup_budget_is_not_judged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let started = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let not_ready_yet = format!("0 false  {started}");
+        let kubectl = fake_kubectl_pods_sequence(&bin_dir, &[&not_ready_yet, "0 true "]);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60, 900);
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "gateway".into(),
+            name: "cogneva".into(),
+        };
+
+        assert!(executor
+            .pods_healthy(&target, &HostSoakWindow::default())
+            .await
+            .is_ok());
+
+        // 放行是因为它第二拍就绪了，不是第一拍就判绿：探了两次。
+        let log = std::fs::read_to_string(bin_dir.join("kubectl.log")).unwrap();
+        let probes = log.lines().filter(|l| l.contains("get pods")).count();
+        assert_eq!(probes, 2, "第一拍还在预算里，得等到下一拍：{log}");
+    }
+
+    /// 反面：同一格读数，但这一趟运行已经走完自己的启动预算。那时「还没起来」就是
+    /// 判词——放宽只放宽预算之内；预算之外再等下去，等于把启动预算当成不存在。
+    #[tokio::test]
+    async fn a_replica_that_never_came_up_inside_its_budget_is_still_condemned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let pods_file = bin_dir.join("pods.out");
+        let kubectl = fake_kubectl_pods_from_file(&bin_dir, &pods_file);
+        let executor = RolloutExecutor::new(kubectl, "cogneva", 1, 1, 60, 900);
+        let target = RolloutTarget {
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            component: "gateway".into(),
+            name: "cogneva".into(),
+        };
+
+        let long_ago = (chrono::Utc::now() - chrono::Duration::seconds(901))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        std::fs::write(&pods_file, format!("0 false  {long_ago}")).unwrap();
+        let err = executor
+            .pods_healthy(&target, &HostSoakWindow::default())
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("startup budget"), "{msg}");
+        assert!(msg.contains("900s"), "判词要说清预算有多长：{msg}");
     }
 
     /// 重启计数说的是 Pod 的一生，就绪说的是此刻——两个数回答的不是同一个问题。
