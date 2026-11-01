@@ -3304,6 +3304,39 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 77,
+          "title": "Mainline: Is a Hold On?",
+          "description": "1 on the round that holds the rollout because the upstream CI calls the tracked revision red, 0 on every round that releases the hold, ends it, or lands a revision. Read beside 'Mainline: Is the Deployment Moving?': that one says whether the live revision is changing, this one says whether the gate is what stopped it, and neither can be read off the other. It is also not the hold duration. `cogneva_mainline_ci_hold_seconds` times one continuous stretch of 'this tree is red upstream', and that stretch survives a revision change and a round in which the upstream has not answered yet -- so a large duration does not mean a hold is on. On 2026-11-02 the duration read 4802 seconds while the state file said ci_hold=None and the verdict was no_evidence, and the rollout was in fact moving; that reading is the reason this line exists. Drawn together the two are legible: a duration that keeps climbing with this line flat is a tree the upstream has not called green yet, not a mainline standing still.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 360
+          },
+          "targets": [
+            {
+              "expr": "max(cogneva_mainline_ci_hold_active)",
+              "legendFormat": "held",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "max": 1,
+              "min": 0,
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
