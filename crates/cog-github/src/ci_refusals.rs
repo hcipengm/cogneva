@@ -32,7 +32,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use chrono::{DateTime, TimeZone, Utc};
-use cog_core::{PrincipleLedgerStore, PrincipleRefusal, PLATFORM_DECLARATION_PREFIXES};
+use cog_core::{
+    is_a_registry_source, PrincipleLedgerStore, PrincipleRefusal, PLATFORM_DECLARATION_PREFIXES,
+};
 
 use crate::landing::run_git;
 
@@ -48,16 +50,19 @@ const FAILURE_MARKERS: [&str; 2] = ["panicked at ", "--> "];
 /// Each candidate costs a `git show`, on the path that settles landings, so a
 /// log that names hundreds of files must not spawn hundreds of processes.
 /// Measured on the failing revisions this was written against: two and three
-/// `crates/**/*.rs` paths named per run, with the rest of the log's path-like
+/// registry-source paths named per run, with the rest of the log's path-like
 /// text being files outside the repository.
-// cap: bound — 一次运行里真正改了 crates/**/*.rs 的路径只有十几条，日志里其余像路径的文本是仓外的文件
+// cap: bound — 一次运行里真正改了名册窗口内文件的路径只有十几条，日志里其余像路径的文本是仓外的文件
 const MAX_FILES_READ: usize = 16;
 
-/// The repository-relative Rust sources a job's log names as a failure site.
+/// The repository-relative files a job's log names as a failure site.
 ///
-/// Only Rust sources: a declaration is a header of the module that enforces it,
-/// so a path that cannot carry one is a path the log mentioned for its own
-/// reasons, and reading it could not produce a slug.
+/// Only the files the registry reads: a declaration sits on the module, test or
+/// shell gate that enforces it, so a path that cannot carry one is a path the log
+/// mentioned for its own reasons, and reading it could not produce a slug. The
+/// set is the registry's own window, so a shell gate the account counts is a gate
+/// a red run can name -- a gate that can be counted but never go red is the same
+/// defect as a red that names nothing, read from the other end.
 pub fn failing_paths(log: &str) -> BTreeSet<String> {
     let mut paths = BTreeSet::new();
     for line in log.lines() {
@@ -91,7 +96,11 @@ fn path_before_a_line_number(rest: &str) -> Option<String> {
         Some((path, line)) if is_a_number(line) => path,
         _ => head,
     };
-    if !path.ends_with(".rs") || path.starts_with('/') || path.starts_with("../") {
+    // The window is the registry's own, not a suffix written out here: a red in a
+    // gate the account counts has to be able to reach that account, and a gate
+    // the account does not count has nothing to be red about. Both rejects stay
+    // literal -- a path outside the repository is a file this tree cannot look up.
+    if path.starts_with('/') || path.starts_with("../") || !is_a_registry_source(path) {
         return None;
     }
     Some(path.to_string())
@@ -305,9 +314,32 @@ mod tests {
     }
 
     #[test]
-    fn only_rust_sources_are_candidates() {
+    fn only_the_registrys_own_window_is_a_candidate() {
+        // Outside every window: a shell script beside the gates is not a gate,
+        // and a file of another kind cannot carry a declaration at all.
         assert!(failing_paths("panicked at scripts/run.sh:3:1").is_empty());
+        assert!(failing_paths("panicked at deploy/scripts/run.sh:3:1").is_empty());
+        assert!(failing_paths("panicked at crates/x/src/notes.txt:3:1").is_empty());
         assert!(failing_paths("panicked at /abs/path/x.rs:3:1").is_empty());
+        assert!(failing_paths("panicked at ../x/crates/a.rs:3:1").is_empty());
+    }
+
+    #[test]
+    fn a_shell_gate_is_a_candidate_too() {
+        // A gate the account counts has to be able to report itself red: the
+        // declaration is in the file, and the file is in the window, so the only
+        // thing that could keep the two apart was this reader's own suffix.
+        for site in [
+            "--> deploy/scripts/tests/x.test.sh:1:1: failed",
+            "--> .github/scripts/tests/y.test.sh:12:3: failed",
+        ] {
+            let paths = failing_paths(site);
+            assert_eq!(paths.len(), 1, "{site} named {paths:?}");
+        }
+        assert!(
+            failing_paths("--> deploy/scripts/tests/x.test.sh:1:1: failed")
+                .contains("deploy/scripts/tests/x.test.sh")
+        );
     }
 
     /// A shell gate declares in the comment syntax its language has, at whatever

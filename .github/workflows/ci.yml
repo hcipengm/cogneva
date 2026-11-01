@@ -1208,7 +1208,11 @@ jobs:
           # when one is added.
           for t in deploy/scripts/tests/*.test.sh .github/scripts/tests/*.test.sh; do
             echo "== ${t}"
-            bash "${t}"
+            # 红在剧本自己的断言里，它的输出里往往没有一行带 `path:line`——而「红的一跑
+            # 点名哪条原则」正是靠这样一行把日志接回文件头部的声明。所以红的这一份由
+            # 跑它的人自己报出来，格式与编译器指错同一形状。行号恒为 1：判据是「这个
+            # 文件红过」，不是「它的第几行红的」。
+            bash "${t}" || { echo "--> ${t}:1:1: failed"; exit 1; }
           done
       - name: PowerShell parse check
         run: |

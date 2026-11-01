@@ -426,6 +426,77 @@ pub const PLATFORM_DECLARATION_PREFIXES: &[&str] = &[
     PLATFORM_ITEM_DECLARATION_PREFIX,
 ];
 
+/// The Rust sources, searched with the prefix each of their two header shapes
+/// carries.
+pub const PLATFORM_REGISTRY_FILES: &str = "*.rs";
+
+/// The shell gates beside the deploy scripts that hold them to their contracts.
+///
+/// A gate is a file that runs. Searching only the Rust half made the shell gates
+/// indistinguishable from principles with no gate at all, which is a claim about
+/// the world that nothing had measured.
+pub const PLATFORM_DEPLOY_GATES: &str = "deploy/scripts/tests/*.test.sh";
+
+/// The shell gates that hold the repository's own scripts to their contracts.
+///
+/// A second directory of the same kind of file, kept as its own source rather
+/// than folded into the deploy glob: the two answer to different owners, and
+/// naming the directory is what makes a reader that loses one of them lose a
+/// visible entry rather than half of an entry.
+pub const PLATFORM_REPO_GATES: &str = ".github/scripts/tests/*.test.sh";
+
+/// Where the registry is read from, as `(pathspec, prefix)` pairs.
+///
+/// Paired rather than two lists: a file type must never be searched with the
+/// other language's prefix, and two lists kept in step by hand are two lists that
+/// end up one step apart.
+pub const PLATFORM_REGISTRY_SOURCES: &[(&str, &str)] = &[
+    (PLATFORM_REGISTRY_FILES, PLATFORM_DECLARATION_PREFIX),
+    (PLATFORM_REGISTRY_FILES, PLATFORM_ITEM_DECLARATION_PREFIX),
+    (PLATFORM_DEPLOY_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
+    (PLATFORM_REPO_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
+];
+
+/// Whether a repository-relative path is one the registry reads.
+///
+/// Three readers ask this question: the registry that walks the tree for
+/// declarations, the host generator that projects the same account, and the
+/// reader that turns a failed run into evidence about the file it failed in. A
+/// path one of them accepts and another does not is either a gate that is
+/// counted and can never go red, or a red that names a gate nothing counts --
+/// the same defect from opposite ends. So the window is one value here rather
+/// than a predicate written out at each site.
+///
+/// Only the two shapes the pathspecs use are matched: a bare name (no `/`, the
+/// whole path is the name) and `dir/*.suffix`. A general glob is not needed and
+/// would read as if the pathspecs could be anything.
+pub fn is_a_registry_source(path: &str) -> bool {
+    PLATFORM_REGISTRY_SOURCES
+        .iter()
+        .any(|(pathspec, _)| pathspec_covers(pathspec, path))
+}
+
+fn pathspec_covers(pathspec: &str, path: &str) -> bool {
+    match pathspec.rsplit_once('/') {
+        Some((dir, pattern)) => path
+            .strip_prefix(dir)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .is_some_and(|name| name_matches(pattern, name)),
+        None => name_matches(pathspec, path),
+    }
+}
+
+fn name_matches(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            name.len() >= prefix.len() + suffix.len()
+                && name.starts_with(prefix)
+                && name.ends_with(suffix)
+        }
+        None => name == pattern,
+    }
+}
+
 /// A principle whose carrier is no longer the text the account measured against.
 ///
 /// Named by slug with both hashes, because a bare count of drifted principles

@@ -66,9 +66,14 @@ pub const HOST_RETIRED_PREFIX: &str = "retired:";
 /// from the other direction -- a run that failed, rather than the registry of
 /// what enforces what -- and one value keeps the two from drifting apart. Every
 /// reference below this line is to that one definition.
+///
+/// The window is re-exported with it and for the same reason: which pathspecs
+/// may carry a declaration is now asked from more than one crate, and a gate
+/// that one reader counts while another cannot report it red is half a gate.
 pub use cog_core::{
-    PLATFORM_DECLARATION_PREFIX, PLATFORM_DECLARATION_PREFIXES, PLATFORM_ITEM_DECLARATION_PREFIX,
-    PLATFORM_SHELL_DECLARATION_PREFIX,
+    PLATFORM_DECLARATION_PREFIX, PLATFORM_DECLARATION_PREFIXES, PLATFORM_DEPLOY_GATES,
+    PLATFORM_ITEM_DECLARATION_PREFIX, PLATFORM_REGISTRY_FILES, PLATFORM_REGISTRY_SOURCES,
+    PLATFORM_REPO_GATES, PLATFORM_SHELL_DECLARATION_PREFIX,
 };
 
 /// The expression the platform's registry is read with: the prefix at the start
@@ -107,40 +112,6 @@ pub fn platform_declaration_pattern_for(prefix: &str) -> String {
 /// search from finding the prefix in the middle of a sentence, and indentation
 /// does not make a sentence.
 pub const PLATFORM_DECLARATION_ANCHOR: &str = "^[[:space:]]*";
-
-/// Which files may declare. Rust sources, because a declaration is written on
-/// the module or the test that enforces it, and the tree's prose about the
-/// convention lives outside them.
-pub const PLATFORM_REGISTRY_FILES: &str = "*.rs";
-
-/// The shell gates the tree holds beside the deploy scripts.
-///
-/// A gate enforces a principle whether or not it is written in Rust, and the
-/// tests that pin the deploy scripts are the only gate several of these
-/// principles have. Reading only the Rust half made them indistinguishable from
-/// principles with no gate at all, which is a claim about the world that nothing
-/// had measured.
-pub const PLATFORM_DEPLOY_GATES: &str = "deploy/scripts/tests/*.test.sh";
-
-/// The shell gates that hold the repository's own scripts to their contracts.
-///
-/// A second directory of the same kind of file, kept as its own source rather
-/// than folded into the deploy glob: the two answer to different owners, and
-/// naming the directory is what makes a reader that loses one of them lose a
-/// visible entry rather than half of an entry.
-pub const PLATFORM_REPO_GATES: &str = ".github/scripts/tests/*.test.sh";
-
-/// Where the registry is read from, as `(pathspec, prefix)` pairs.
-///
-/// Paired rather than two lists: a file type must never be searched with the
-/// other language's prefix, and two lists kept in step by hand are two lists that
-/// end up one step apart.
-pub const PLATFORM_REGISTRY_SOURCES: &[(&str, &str)] = &[
-    (PLATFORM_REGISTRY_FILES, PLATFORM_DECLARATION_PREFIX),
-    (PLATFORM_REGISTRY_FILES, PLATFORM_ITEM_DECLARATION_PREFIX),
-    (PLATFORM_DEPLOY_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
-    (PLATFORM_REPO_GATES, PLATFORM_SHELL_DECLARATION_PREFIX),
-];
 
 /// Why a principle's gate could not be settled, as a closed set.
 ///
