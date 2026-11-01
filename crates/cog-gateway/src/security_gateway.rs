@@ -3762,9 +3762,26 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<
                     .and_then(as_u64),
             )
         }
+        // 尾帧本来只该带 `output_tokens`，可它也是这条流上**唯一**一处把输入拆成
+        // 「没被缓存服务的那部分 + 读回来的那部分」的地方：2026-11-01 实测 k3 的
+        // `message_start` 报 `input_tokens: 17266, cache_read_input_tokens: 0`，
+        // 而同一通的 `message_delta` 报 `input_tokens: 6002,
+        // cache_read_input_tokens: 11264`（两者相加正是 17266）。只认首帧的话，
+        // 一笔命中 65% 的调用在账上读作「input 17266、命中 0」——不是命中低，
+        // 是有命中没读。四种数都在，就都取；真按协议只带输出量的上游那几个键
+        // 取不到，`None` 不覆盖已经读到的值。
         Some("message_delta") => {
-            let output = json.pointer("/usage/output_tokens").and_then(as_u64);
-            (None, output, None, None)
+            let usage = json.pointer("/usage");
+            (
+                usage.and_then(|u| u.get("input_tokens")).and_then(as_u64),
+                usage.and_then(|u| u.get("output_tokens")).and_then(as_u64),
+                usage
+                    .and_then(|u| u.get("cache_read_input_tokens"))
+                    .and_then(as_u64),
+                usage
+                    .and_then(|u| u.get("cache_creation_input_tokens"))
+                    .and_then(as_u64),
+            )
         }
         // Responses 面：用量在 `response.completed`（以及 `response.incomplete`）
         // 的 `response.usage` 里，名字是 `input_tokens` / `output_tokens`。
@@ -10251,6 +10268,28 @@ mod tests {
             "usage": {"output_tokens": 210}
         });
         assert_eq!(extract_usage(&delta), (None, Some(210), None, None));
+    }
+
+    /// 尾帧报的用量才能改之前读到的读数：一条流上 `message_start` 报的是
+    /// 「整段 prompt」，`message_delta` 报的才是「其中没被缓存服务的 + 读回来的」。
+    /// 只读首帧，一笔命中 65% 的调用会在账上读作 `input: 17266, cached: 0`——
+    /// 那正是「命中率是不是太低」这个问题被读错的地方：不是低，是没读。
+    #[test]
+    fn a_tail_frame_reports_the_split_the_head_frame_could_not() {
+        let mut s = UsageScanner::default();
+        s.feed(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":17266,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"output_tokens\":0}}}\n",
+        );
+        assert_eq!((s.tokens_input, s.tokens_cached), (17266, 0));
+        s.feed(
+            b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"input_tokens\":6002,\"cache_read_input_tokens\":11264,\"cache_creation_input_tokens\":0,\"output_tokens\":167}}\n",
+        );
+        s.finish();
+        assert_eq!(
+            (s.tokens_input, s.tokens_output, s.tokens_cached),
+            (6002, 167, 11264),
+            "尾帧把 17266 拆成 6002 未命中 + 11264 命中；只认首帧就会把这次调用记成全价"
+        );
     }
 
     /// 写进缓存的那部分输入必须单独读出来：它与命中量是同一件事的两半，
