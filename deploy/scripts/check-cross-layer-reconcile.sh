@@ -81,6 +81,7 @@
 # 环境：
 #   COGNEVA_KUBECTL          默认 "sudo -n k3s kubectl"
 #   COGNEVA_PROMETHEUS_URL   默认按 svc 发现；测试用它指向一个假端点
+#   COGNEVA_PROM_CURL_MAX_TIME 单次查询的超时，秒，默认 15（网络慢的机器上要能只抬这一个数）
 #   COGNEVA_PROM_QUERY_CMD   测试注入点：给它一个可执行文件，参数是 PromQL，
 #                            标准输出当作 /api/v1/query 的响应体，不再走 curl
 #   COGNEVA_RECONCILE_NS     默认 cogneva
@@ -92,6 +93,7 @@ set -euo pipefail
 KUBECTL="${COGNEVA_KUBECTL:-sudo -n k3s kubectl}"
 NS="${COGNEVA_RECONCILE_NS:-cogneva}"
 QUOTA_NAME="${COGNEVA_RECONCILE_QUOTA:-cogneva-quota}"
+PROM_CURL_MAX_TIME="${COGNEVA_PROM_CURL_MAX_TIME:-15}"
 SERIES="${COGNEVA_RECONCILE_SERIES:-${XDG_STATE_HOME:-$HOME/.local/state}/cogneva/cross-layer-reconcile.tsv}"
 record=0
 converge=0
@@ -166,7 +168,7 @@ prom() { # prom <promql> <输出文件>
         "${COGNEVA_PROM_QUERY_CMD}" "$1" >"$2" || die "注入的 Prometheus 查询失败：$1"
         return
     fi
-    curl -sS --max-time 15 --data-urlencode "query=$1" "${PROM_URL}/api/v1/query" >"$2" \
+    curl -sS --max-time "${PROM_CURL_MAX_TIME}" --data-urlencode "query=$1" "${PROM_URL}/api/v1/query" >"$2" \
         || die "Prometheus 查询失败：$1"
 }
 

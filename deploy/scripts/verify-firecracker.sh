@@ -28,6 +28,9 @@ ALPINE_BRANCH="v3.20"
 # 所以先读环境、没给才用默认。写死的那一版没人能调，只能改脚本。
 PV_SIZE_MB="${FIRECRACKER_PV_SIZE_MB:-64}"
 ROOTFS_SIZE_MB="${FIRECRACKER_ROOTFS_SIZE_MB:-128}"
+# 一次真机循环的上限，秒：冷启动、挂 PV、执行、关机四步都要在这之内走完。慢机器
+# （无 KVM 嵌套、慢盘）要能只抬这一个数，而不是改脚本。
+VERIFY_TIMEOUT_SECS="${FIRECRACKER_VERIFY_TIMEOUT_SECS:-300}"
 ARCH="$(uname -m)"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
@@ -134,7 +137,7 @@ cargo run -q --manifest-path "$REPO_ROOT/Cargo.toml" -p cogneva --example firecr
     --rootfs "$ROOTFS" \
     --pv "$PV" \
     --instance-root "$WORKDIR/instances" \
-    --timeout 300
+    --timeout "$VERIFY_TIMEOUT_SECS"
 
 # ---------- 6. PV 落盘核验 ----------
 step "核验 PV 标记（进化产物真落到持久卷）"

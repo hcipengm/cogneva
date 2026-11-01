@@ -43,6 +43,7 @@
 #   COGNEVA_HEADROOM_RATIO     峰值对上限的红线，默认 0.85（含等于）
 #   COGNEVA_HEADROOM_WINDOW    窗口，Prometheus 时长语法，默认 24h
 #   COGNEVA_PROMETHEUS_URL     默认按 svc 发现
+#   COGNEVA_PROM_CURL_MAX_TIME 单次查询的超时，秒，默认 15（网络慢的机器上要能只抬这一个数）
 #   COGNEVA_PROM_QUERY_CMD     测试注入点：给它一个可执行文件，参数是 PromQL，
 #                              标准输出当作 /api/v1/query 的响应体，不再走 curl
 #   COGNEVA_HEADROOM_SERIES    序列文件路径（`--record` 时写）
@@ -52,6 +53,7 @@ KUBECTL="${COGNEVA_KUBECTL:-sudo -n k3s kubectl}"
 NS="${COGNEVA_HEADROOM_NS:-cogneva}"
 RATIO="${COGNEVA_HEADROOM_RATIO:-0.85}"
 WINDOW="${COGNEVA_HEADROOM_WINDOW:-24h}"
+PROM_CURL_MAX_TIME="${COGNEVA_PROM_CURL_MAX_TIME:-15}"
 SERIES="${COGNEVA_HEADROOM_SERIES:-${XDG_STATE_HOME:-$HOME/.local/state}/cogneva/container-headroom.tsv}"
 record=0
 for arg in "$@"; do
@@ -111,7 +113,7 @@ prom() { # prom <promql> <输出文件>
         "${COGNEVA_PROM_QUERY_CMD}" "$1" >"$2" || die "注入的 Prometheus 查询失败：$1"
         return
     fi
-    curl -sS --max-time 15 --data-urlencode "query=$1" "${PROM_URL}/api/v1/query" >"$2" \
+    curl -sS --max-time "${PROM_CURL_MAX_TIME}" --data-urlencode "query=$1" "${PROM_URL}/api/v1/query" >"$2" \
         || die "Prometheus 查询失败：$1"
 }
 

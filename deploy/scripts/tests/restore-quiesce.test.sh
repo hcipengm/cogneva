@@ -58,9 +58,18 @@ export PATH="${work}/bin:${PATH}"
 export CALLS="${work}/calls"
 : >"${CALLS}"
 
+# 抽出来的这一片读脚本顶层的等待上限（`--timeout="${WAIT_WORKLOAD_SECS}s"`）。
+# 单独跑时那个声明不在作用域里，所以在这里补上——但默认值**从脚本里读**，不在
+# 测试里另抄一个数：抄的那份会在默认改动之后继续绿，而它判的正是这段代码。
+wait_secs="$(sed -n 's/^WAIT_WORKLOAD_SECS="\${COGNEVA_RESTORE_WAIT_WORKLOAD_SECS:-\([0-9]\+\)}".*$/\1/p' "${script}")"
+[ -n "${wait_secs}" ] \
+    || fail "在 ${script} 里找不到 WAIT_WORKLOAD_SECS 的 \${COGNEVA_RESTORE_WAIT_WORKLOAD_SECS:-N} 声明"
+
 run() {  # run <原始副本数……>，部署名由 REPLICAS_* 变量给出
     (
         export NS=cogneva
+        # shellcheck disable=SC2034
+        WAIT_WORKLOAD_SECS="${wait_secs}"
         # shellcheck disable=SC1090
         source "${work}/quiesce.sh"
         # 被 source 进来的 quiesce_writers 读它。

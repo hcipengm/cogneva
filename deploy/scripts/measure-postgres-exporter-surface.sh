@@ -38,6 +38,20 @@ VALUES="$REPO_ROOT/deploy/helm/cogneva/values.yaml"
 # 探针用的本地端口。可覆盖：同一台机器上两条测量并排跑时，第二个得换一个。
 PROBE_PORT="${COGNEVA_EXPORTER_PROBE_PORT:-19190}"
 
+# 等 port-forward 打通：第一次连不上是常态（转发还在建），所以要等；但要有尽头的等。
+# 「等多久」与「多密地试」分开给——慢机器上要抬的是前一个，不是把轮询调密。
+PROBE_WAIT_SECS="${COGNEVA_EXPORTER_PROBE_WAIT_SECS:-30}"
+PROBE_INTERVAL_SECS="${COGNEVA_EXPORTER_PROBE_INTERVAL_SECS:-1}"
+# 单次 curl 的上限：一次抓取要么在这之内回来，要么就是在等端口，不是某个指标太慢。
+PROBE_CURL_MAX_TIME="${COGNEVA_EXPORTER_PROBE_CURL_MAX_TIME:-5}"
+PROBE_ATTEMPTS=$((PROBE_WAIT_SECS / PROBE_INTERVAL_SECS))
+# `die` 还没定义（它在下面），这里自己报错：等不到的次数为 0 会让轮询变成「一次都不试」。
+if [ "${PROBE_ATTEMPTS}" -lt 1 ]; then
+    printf 'POSTGRES-EXPORTER-SURFACE: COGNEVA_EXPORTER_PROBE_WAIT_SECS 必须不小于 COGNEVA_EXPORTER_PROBE_INTERVAL_SECS：%s/%s\n' \
+        "${PROBE_WAIT_SECS}" "${PROBE_INTERVAL_SECS}" >&2
+    exit 2
+fi
+
 # 边车在这个 namespace 里的选择器。chart 给 postgres Pod 打的就是这两个标签，换
 # release 名不会变；真变了用 --selector 覆盖，不去猜第二个默认。
 SELECTOR="app.kubernetes.io/name=postgres,app.kubernetes.io/component=database"
@@ -189,12 +203,12 @@ measure_metrics() { # <out-file>
 
     # 转发建起来之前 curl 会拒连。等，但要有尽头的等：卡在这里读起来会像集群挂了。
     local i=0
-    until curl -sf --max-time 5 "http://127.0.0.1:$PROBE_PORT/metrics" -o "$out" 2>/dev/null; do
+    until curl -sf --max-time "${PROBE_CURL_MAX_TIME}" "http://127.0.0.1:$PROBE_PORT/metrics" -o "$out" 2>/dev/null; do
         i=$((i + 1))
-        if [ "$i" -ge 30 ]; then
+        if [ "$i" -ge "${PROBE_ATTEMPTS}" ]; then
             die 3 "port-forward 到 pod/$pod 的 $container_port 端口一直没通：$(tr '\n' ' ' <"$work/port-forward.log")"
         fi
-        sleep 1
+        sleep "${PROBE_INTERVAL_SECS}"
     done
 }
 

@@ -35,6 +35,12 @@ RECEIPT="${COGNEVA_RESTORE_RECEIPT:-$PWD/restore-receipt}"
 # 取自另一份检出的镜像）时可以指过去，回执里记的 Job 名仍然由这里给。
 RESTORE_CMD="${COGNEVA_RESTORE_PACKAGE_CMD:-$ROOT/deploy/scripts/restore-from-package.sh}"
 
+# 等集群就绪的上限，秒。元启动之后整个应用起来、与恢复之后逐个部署就绪，等的不是
+# 同一个量：前者还牵着镜像导入与数据库首启，后者只是滚动。分成两个数，抬一个不会
+# 让另一个白等。
+WAIT_BOOTSTRAP_SECS="${COGNEVA_RESTORE_WAIT_BOOTSTRAP_SECS:-600}"
+WAIT_DEPLOY_SECS="${COGNEVA_RESTORE_WAIT_DEPLOY_SECS:-300}"
+
 if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
     echo "用法: $0 <cogneva-backup-*.tar.zst> [命名空间，默认 cogneva]" >&2
     exit 2
@@ -153,7 +159,7 @@ step_engine() {
     }
     echo "    跑元启动：$cmd"
     ( cd "$ROOT" && sh "$cmd" )
-    kubectl -n "$NS" rollout status deployment/cogneva --timeout=600s
+    kubectl -n "$NS" rollout status deployment/cogneva --timeout="${WAIT_BOOTSTRAP_SECS}s"
     record engine "bootstrap via $cmd"
 }
 
@@ -203,7 +209,7 @@ step_verify() {
     fi
     while IFS= read -r d; do
         [ -n "$d" ] || continue
-        kubectl -n "$NS" rollout status "deployment/$d" --timeout=300s >/dev/null
+        kubectl -n "$NS" rollout status "deployment/$d" --timeout="${WAIT_DEPLOY_SECS}s" >/dev/null
     done < <(kubectl -n "$NS" get deploy -o name | sed 's#deployment.apps/##')
     record verify "artifacts_restored=$restored artifacts_expected=$expected bundle_seeded=$seeded job=$job deployments=ready"
     echo "    产物层 $restored/$expected 项，进化 bundle 种回 $seeded 份，部署全部就绪"

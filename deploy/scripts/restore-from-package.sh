@@ -17,6 +17,17 @@ NS="${2:-cogneva}"
 # 而「连不上」与「包坏了」在恢复日志里读起来一样。
 PG_PORT="${COGNEVA_PG_PORT:-5432}"
 QDRANT_PORT="${COGNEVA_QDRANT_PORT:-6333}"
+
+# 这条恢复路上等的四个上限，各自按**等的是什么**取名，不并成一个「超时」：库里
+# 的包越大，等的只有恢复 Job；节点慢，等的只有工作负载。抬一个不该拖长其余三个。
+# 单位都是秒。
+WAIT_WORKLOAD_SECS="${COGNEVA_RESTORE_WAIT_WORKLOAD_SECS:-300}"   # 工作负载就绪/旧 Pod 退场
+WAIT_STAGE_POD_SECS="${COGNEVA_RESTORE_WAIT_STAGE_POD_SECS:-180}"  # 暂存 Pod 变成 Ready
+WAIT_JOB_SECS="${COGNEVA_RESTORE_WAIT_JOB_SECS:-1800}"             # 恢复 Job 跑完
+# 暂存 Pod 的保活时长：它的存在只为接住 kubectl cp，之后立刻被删；这个数只是
+# 「别在 cp 还没完时就自己退出」的上限，不是它要活多久。
+STAGE_POD_KEEPALIVE_SECS="${COGNEVA_RESTORE_STAGE_POD_KEEPALIVE_SECS:-3600}"
+
 if [ -z "$PKG" ] || [ ! -f "$PKG" ]; then
     echo "用法: $0 <cogneva-backup-*.tar.zst> [命名空间，默认 cogneva]" >&2
     exit 2
@@ -104,8 +115,8 @@ if ! kubectl -n "$NS" get deployment cogneva >/dev/null 2>&1; then
     echo "命名空间 $NS 内没有 cogneva 部署——先跑 bootstrap/helm 完成正常安装，再执行本脚本" >&2
     exit 1
 fi
-kubectl -n "$NS" rollout status deployment/postgres --timeout=300s
-kubectl -n "$NS" rollout status deployment/qdrant --timeout=300s
+kubectl -n "$NS" rollout status deployment/postgres --timeout="${WAIT_WORKLOAD_SECS}s"
+kubectl -n "$NS" rollout status deployment/qdrant --timeout="${WAIT_WORKLOAD_SECS}s"
 
 # 用运行中的业务镜像做恢复载体：集群内必然拉得到，版本与部署面一致。
 IMAGE="$(kubectl -n "$NS" get deployment cogneva -o jsonpath='{.spec.template.spec.containers[0].image}')"
@@ -162,7 +173,7 @@ quiesce_writers() {
             -o jsonpath='{range $k,$v := .spec.selector.matchLabels}{$k}={$v},{end}')"
         sel="${sel%,}"
         if kubectl -n "$NS" get pods -l "$sel" -o name 2>/dev/null | grep -q .; then
-            kubectl -n "$NS" wait --for=delete pod -l "$sel" --timeout=300s >/dev/null
+            kubectl -n "$NS" wait --for=delete pod -l "$sel" --timeout="${WAIT_WORKLOAD_SECS}s" >/dev/null
         fi
     done
     # 走到这里＝每个部署的 Pod 都等没了（等超时会被 set -e 带走），所以这一行是
@@ -179,7 +190,7 @@ resume_writers() {
     # 从 0 起回来的 Pod 是新的，本身就把内存态重放了一遍，不再额外 restart。
     for pair in "${APP_REPLICAS[@]}"; do
         d="${pair%%=*}"
-        kubectl -n "$NS" rollout status "deployment/$d" --timeout=300s
+        kubectl -n "$NS" rollout status "deployment/$d" --timeout="${WAIT_WORKLOAD_SECS}s"
     done
     RESUMED=1
 }
@@ -208,13 +219,13 @@ kubectl -n "$NS" run "$STAGE_POD" --restart=Never --image="$IMAGE" \
         "containers": [{
           "name": "'"$STAGE_POD"'",
           "image": "'"$IMAGE"'",
-          "command": ["/bin/sh", "-c", "sleep 3600"],
+          "command": ["/bin/sh", "-c", "sleep '"$STAGE_POD_KEEPALIVE_SECS"'"],
           "volumeMounts": [{"name": "backup", "mountPath": "/backups"}]
         }],
         "volumes": [{"name": "backup", "persistentVolumeClaim": {"claimName": "cogneva-backup-pvc"}}]
       }
     }'
-kubectl -n "$NS" wait --for=condition=Ready "pod/$STAGE_POD" --timeout=180s
+kubectl -n "$NS" wait --for=condition=Ready "pod/$STAGE_POD" --timeout="${WAIT_STAGE_POD_SECS}s"
 # 恢复 Job 跑的就是这份镜像，所以代次比对要问它自己，而不是问 tag：tag 是派生
 # 的，可以改；二进制里 baked 的那个 rev 才是代码状态。问不到就跳过，退回显式接受。
 IMAGE_REV="$(kubectl -n "$NS" exec "$STAGE_POD" -- /opt/cogneva/cogneva --version 2>/dev/null \
@@ -387,7 +398,7 @@ $GIT_VOLUMES
           persistentVolumeClaim:
             claimName: cogneva-backup-pvc
 EOF
-kubectl -n "$NS" wait --for=condition=Complete "job/$JOB_NAME" --timeout=1800s || {
+kubectl -n "$NS" wait --for=condition=Complete "job/$JOB_NAME" --timeout="${WAIT_JOB_SECS}s" || {
     echo "==> 恢复 Job 失败，日志：" >&2
     kubectl -n "$NS" logs "job/$JOB_NAME" >&2
     exit 1

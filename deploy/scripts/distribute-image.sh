@@ -27,6 +27,13 @@ fi
 [ -f "$TAR" ] || { echo "文件不存在: $TAR"; exit 1; }
 NS=cogneva
 
+# 等集群就绪的上限，秒。三个数分开给，因为它们等的东西不同：镜像服务 Pod 起来、
+# 分发器把镜像铺到全部节点、单个负载的滚动完成。节点越多前两个越久，而单次滚动
+# 与节点数无关——把它们并成一个数，抬一个就会连不该等的一起等。
+WAIT_SERVER_SECS="${COGNEVA_DISTRIBUTE_WAIT_SERVER_SECS:-600}"
+WAIT_DISTRIBUTOR_SECS="${COGNEVA_DISTRIBUTE_WAIT_DISTRIBUTOR_SECS:-900}"
+WAIT_ROLLOUT_SECS="${COGNEVA_DISTRIBUTE_WAIT_ROLLOUT_SECS:-300}"
+
 echo "==> 注入新镜像包到分发服务 Pod"
 # 镜像服务是 Deployment（裸 Pod 被驱逐后无控制器重建，2026-09-14 实证导致
 # 分发器永久 CrashLoop）；按 label 解析当前 Pod 名再 cp
@@ -36,14 +43,14 @@ kubectl -n "$NS" get deployment cogneva-image-server >/dev/null 2>&1 || {
     echo "      __BUSYBOX_IMAGE__ 替换为可用 busybox 镜像后 kubectl apply。"
     exit 1
 }
-kubectl -n "$NS" wait --for=condition=Available deployment/cogneva-image-server --timeout=600s
+kubectl -n "$NS" wait --for=condition=Available deployment/cogneva-image-server --timeout="${WAIT_SERVER_SECS}s"
 SERVER_POD=$(kubectl -n "$NS" get pod -l app=cogneva-image-server -o jsonpath='{.items[0].metadata.name}')
 [ -n "$SERVER_POD" ] || { echo "错误: 找不到镜像服务 Pod"; exit 1; }
 kubectl -n "$NS" cp "$TAR" "$SERVER_POD":/share/image.tar.gz
 
 echo "==> 触发全节点重新导入"
 kubectl -n "$NS" rollout restart daemonset/cogneva-image-distributor
-kubectl -n "$NS" rollout status daemonset/cogneva-image-distributor --timeout=900s
+kubectl -n "$NS" rollout status daemonset/cogneva-image-distributor --timeout="${WAIT_DISTRIBUTOR_SECS}s"
 
 if [ "${SKIP_RESTART:-0}" != "1" ]; then
     workloads="$(platform_image_workloads)" || {
@@ -59,7 +66,7 @@ if [ "${SKIP_RESTART:-0}" != "1" ]; then
     done < <(printf '%s\n' "$workloads" | cut -f1,2 | sort -u)
     while IFS=$'\t' read -r kind name; do
         [ -n "$kind" ] || continue
-        kubectl rollout status -n "$NS" "$(printf '%s' "$kind" | tr 'A-Z' 'a-z')/${name}" --timeout=300s
+        kubectl rollout status -n "$NS" "$(printf '%s' "$kind" | tr 'A-Z' 'a-z')/${name}" --timeout="${WAIT_ROLLOUT_SECS}s"
     done < <(printf '%s\n' "$workloads" | cut -f1,2 | sort -u)
 fi
 

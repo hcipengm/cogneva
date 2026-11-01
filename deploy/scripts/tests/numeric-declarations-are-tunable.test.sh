@@ -26,6 +26,20 @@ scan() {
     grep -HnE '^[A-Z][A-Z0-9_]*=[0-9]+$' "$@" 2>/dev/null
 }
 
+# 第二个面：**命令行里的等待与超时数**。`sleep 30`、`--max-time 15`、`--timeout=600s`
+# 与行首声明是同一类东西——换台慢机器就要改的那个数——但它们既不在行首、也不是
+# `NAME=` 的形状，所以上面那条判据看不见它们。实测：这条腿补上之前，七个脚本里
+# 藏着十七处这样的数（恢复路径等 Job 1800 秒、分发器等节点 900 秒……），全都只能
+# 改脚本才改得动。
+#
+# 只认这几个旗标，因为它们的参数**就是**「等多久」：其余数字旗标（`--replicas`、
+# `-n 3`）有的是尺寸、有的是位置，判据一宽就会把正当用法判红。
+# 合格形状只有一个：数字从变量来（`--timeout="${WAIT}s"`、`sleep "$N"`）——
+# 至于那个变量是 `${X:-默认}` 的声明还是命令行给的，上一条判据已经管了。
+scan_inline() {
+    grep -HnE '(^|[^-[:alnum:]_])(sleep|--max-time|--timeout|--timeout-seconds|--retries)[ =][0-9]+' "$@" 2>/dev/null
+}
+
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 
@@ -57,6 +71,31 @@ mkdir -p "$T/tree"
 printf 'INTERVAL=1800\n' >"$T/tree/hardcoded.sh"
 out="$(scan "$T/tree"/*.sh | grep -vE '=[01]$' || true)"
 [ -n "$out" ] && ok "反向对照：写死的 1800 点名" || bad "反向对照：写死的 1800 没被点名"
+
+# --- 第二个面：命令行里的等待与超时 ---
+# 对它的三条，与前一个面一一对应：抓得住、放得过、真树上没有。
+printf 'kubectl wait --for=condition=Ready pod/x --timeout=600s\nsleep 30\n' >"$T/inline.sh"
+[ "$(scan_inline "$T/inline.sh" | wc -l)" -eq 2 ] \
+    && ok "命令行里的 600s 与 30 都被扫到" || bad "命令行里的等待数扫漏了：$(scan_inline "$T/inline.sh")"
+
+printf 'kubectl wait --for=condition=Ready pod/x --timeout="${WAIT}s"\nsleep "$POLL"\n' >"$T/inline-ok.sh"
+out="$(scan_inline "$T/inline-ok.sh")"
+[ -z "$out" ] && ok "从变量来的等待数放行" || bad "从变量来的等待数被判红：$out"
+
+inline_bad="$(scan_inline "${files[@]}")"
+if [ -z "$inline_bad" ]; then
+    ok "真树里没有写死的等待/超时数"
+else
+    while IFS= read -r line; do bad "写死的等待/超时数：$line"; done <<<"$inline_bad"
+fi
+
+# 反空洞。上一个面的反空洞是「真树扫到过声明」；这个面不能照抄——树干净之后裸
+# 等待本来就是零条，判「扫到过」恒假。要判的是**这些旗标还在用、只是都从变量来**：
+# 一个旗标都没用上时，上一条判据看的是一片空地，它绿不说明任何事。
+var_form="$(grep -HEn '(^|[^-[:alnum:]_])(sleep|--max-time|--timeout|--timeout-seconds|--retries)[ =]["'"'"']?\$\{?' "${files[@]}" 2>/dev/null | wc -l)"
+[ "$var_form" -gt 0 ] \
+    && ok "反空洞：真树有 $var_form 处等待/超时是从变量给的（上一条判据在看真东西）" \
+    || bad "反空洞：真树一处变量形式的等待/超时都没有——这条判据失去了扫描面"
 
 printf '\nnumeric-declarations-are-tunable.test: %s passed / %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
