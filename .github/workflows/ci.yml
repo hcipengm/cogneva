@@ -1161,14 +1161,24 @@ jobs:
       # HELM_VERSION rather than copied here: trailing whitespace in rendered
       # block scalars differs between helm versions, and two sides picking their
       # own version turns the gate red somewhere unrelated to the change.
+      #
+      # `if:` for the same reason as the script-test step below, measured on the
+      # other side of it: when an earlier step fails these get skipped, helm is
+      # then whatever the runner image happens to carry, and the freshness gate
+      # reports the committed manifests as stale -- telling the author to
+      # re-render, which would rewrite the whole tree in that foreign helm's
+      # shape. A skipped setup does not read as "no helm"; it reads as a render
+      # disagreement.
       - name: Resolve pinned Helm version
         id: helmver
+        if: ${{ !cancelled() }}
         run: |
           v=$(grep -oP 'const HELM_VERSION: &str = "\K[^"]+' crates/bootstrap/src/main.rs)
           [ -n "$v" ] || { echo "未从 crates/bootstrap/src/main.rs 读到 HELM_VERSION"; exit 1; }
           echo "Resolved helm $v"
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - uses: azure/setup-helm@v4
+        if: ${{ !cancelled() }}
         with:
           version: ${{ steps.helmver.outputs.version }}
       # Four of the script tests read manifests through `kubectl kustomize`. The
@@ -1176,7 +1186,9 @@ jobs:
       # one managed: the day the image drops it, the failure lands inside a test
       # named for something else. Asked for here, the dependency is a step.
       - uses: azure/setup-kubectl@v4
+        if: ${{ !cancelled() }}
       - name: Ensure psql
+        if: ${{ !cancelled() }}
         run: |
           command -v psql >/dev/null || {
             sudo apt-get update -qq || true
