@@ -383,17 +383,17 @@ impl GitOpsPuller {
     /// 已回滚的 change 绝不能被下个 poll 周期重复金丝雀（会反复打挂
     /// 集群）；Failed 不在列，瞬时失败允许下轮重试。
     async fn already_processed(&self, change_id: &str) -> SFResult<bool> {
-        let recent = self.ledger.recent(50).await?;
-        Ok(recent.iter().any(|r| {
-            r.change_id == *change_id
-                && r.cluster == self.cluster
-                && matches!(
-                    r.status,
-                    PromotionStatus::Promoted
-                        | PromotionStatus::Pending
-                        | PromotionStatus::AwaitingApproval
-                        | PromotionStatus::RolledBack
-                )
+        // 按 change 取，不按时间取（`for_change` 的理由）：同一个候选被重试几十
+        // 次之后，它成功过的那条会被挤出按时间的窗口，判据于是随重试次数漂移。
+        let rows = self.ledger.for_change(&self.cluster, change_id, 50).await?;
+        Ok(rows.iter().any(|r| {
+            matches!(
+                r.status,
+                PromotionStatus::Promoted
+                    | PromotionStatus::Pending
+                    | PromotionStatus::AwaitingApproval
+                    | PromotionStatus::RolledBack
+            )
         }))
     }
 
@@ -405,12 +405,11 @@ impl GitOpsPuller {
     /// Promoted 或回滚，镜像还是旧版则清理并记 RolledBack。
     /// 返回 true 表示本候选已终结，本周期不再处理。
     async fn reconcile_pending(&self, candidate: &PromotionCandidate) -> SFResult<bool> {
-        let recent = self.ledger.recent(50).await?;
-        let Some(rec) = recent.iter().find(|r| {
-            r.change_id == candidate.change_id
-                && r.cluster == self.cluster
-                && r.status == PromotionStatus::Pending
-        }) else {
+        let recent = self
+            .ledger
+            .for_change(&self.cluster, &candidate.change_id, 50)
+            .await?;
+        let Some(rec) = recent.iter().find(|r| r.status == PromotionStatus::Pending) else {
             return Ok(false);
         };
         // 并发护栏：另一副本里活着的 puller 可能正在跑这条金丝雀，
@@ -3223,6 +3222,64 @@ http_request_duration_ms_bucket{endpoint=\"/a\",le=\"+Inf\"} 100
             "cluster-c".into(),
         );
         assert!(!puller_c.already_processed("p-1").await.unwrap());
+    }
+
+    /// 成功过之后，别的 change 的记录再多也不能把这个候选重新算成"没做过"。
+    ///
+    /// 这个判据曾经按时间取最近 50 行：重试几十次之后，成功那条被后来的一批行
+    /// 挤出窗口，于是同一个候选被一遍遍重新金丝雀（2026-11-01 实测：一条成功
+    /// 记录 20 分钟后就被挤出，同一个候选一天攒了 233 条失败行，部署被反复换镜像）。
+    #[tokio::test]
+    async fn a_processed_change_stays_processed_when_other_rows_push_it_out_of_a_time_window() {
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let now = chrono::Utc::now();
+        let row = |id: &str, change: &str, status, at| PromotionRecord {
+            id: id.into(),
+            change_id: change.into(),
+            level: "l1_rollout".into(),
+            gate_kind: None,
+            decision_reason: "test".into(),
+            cluster: "cluster-b".into(),
+            status,
+            outcome: "ok".into(),
+            eval_summary: None,
+            created_at: at,
+            updated_at: at,
+        };
+        ledger
+            .record(row(
+                "done",
+                "p-done",
+                PromotionStatus::Promoted,
+                now - chrono::Duration::seconds(3600),
+            ))
+            .await
+            .unwrap();
+        // 后来的 80 行（别的候选的失败重试）。
+        for i in 0..80i64 {
+            ledger
+                .record(row(
+                    &format!("noise-{i}"),
+                    &format!("p-noise-{i}"),
+                    PromotionStatus::Failed,
+                    now - chrono::Duration::seconds(600) + chrono::Duration::seconds(i),
+                ))
+                .await
+                .unwrap();
+        }
+        // 前提：按时间取的窗口里确实已经看不到那条成功了，否则这条用例什么都没测。
+        let window = ledger.recent(50).await.unwrap();
+        assert!(
+            !window.iter().any(|r| r.change_id == "p-done"),
+            "the success row has to be out of the time window for this case to mean anything"
+        );
+
+        let puller = GitOpsPuller::new(GitOpsConfig::default(), ledger, "cluster-b".into());
+        assert!(
+            puller.already_processed("p-done").await.unwrap(),
+            "a retired promotion must not look new just because other changes recorded rows \
+             after it"
+        );
     }
 
     fn test_puller() -> GitOpsPuller {

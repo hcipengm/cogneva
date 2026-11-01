@@ -1596,6 +1596,32 @@ impl cog_core::PromotionLedger for PostgresStateBackend {
         Ok(rows.into_iter().map(promotion_record).collect())
     }
 
+    async fn for_change(
+        &self,
+        cluster: &str,
+        change_id: &str,
+        limit: usize,
+    ) -> SFResult<Vec<cog_core::PromotionRecord>> {
+        let rows: Vec<PromotionRow> = sqlx::query_as(
+            r#"
+            SELECT id, change_id, level, gate_kind, decision_reason, cluster, status,
+                   outcome, eval_summary, created_at, updated_at
+            FROM cog_evolution_promotions
+            WHERE cluster = $1 AND change_id = $2
+            ORDER BY updated_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(cluster)
+        .bind(change_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+
+        Ok(rows.into_iter().map(promotion_record).collect())
+    }
+
     async fn awaiting(
         &self,
         cluster: &str,

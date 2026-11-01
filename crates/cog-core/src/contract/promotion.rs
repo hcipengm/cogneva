@@ -284,6 +284,30 @@ pub trait PromotionLedger: Send + Sync {
         Ok(rows)
     }
 
+    /// 某个 change 在本集群的记录（新在前）。
+    ///
+    /// 与 `recent` 的差别是**按 change 选行**，不是按时间截断：同一个候选重试
+    /// 几十次之后，它成功过的那条记录会被后来的一批记录挤出按时间取的那个窗口，
+    /// 「已经晋级过」就变成一个随重试次数漂移的判据——重试越多越像没做过，于是
+    /// 再做一遍金丝雀（2026-11-01 实测：一个候选一天里攒了 233 条失败行，成功
+    /// 那条 20 分钟后就被挤出窗口，部署被反复换镜像）。缺省实现退回按时间取，
+    /// 只够测试替身用；真台账应当覆盖它，让自己的读取面按 change 过滤。
+    async fn for_change(
+        &self,
+        cluster: &str,
+        change_id: &str,
+        limit: usize,
+    ) -> SFResult<Vec<PromotionRecord>> {
+        let mut rows: Vec<PromotionRecord> = self
+            .recent(limit)
+            .await?
+            .into_iter()
+            .filter(|r| r.cluster == cluster && r.change_id == change_id)
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+        Ok(rows)
+    }
+
     /// 审计展示用列表（新在前）。
     async fn list(&self, limit: usize) -> SFResult<Vec<PromotionRecord>> {
         self.recent(limit).await
