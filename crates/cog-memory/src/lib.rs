@@ -13,6 +13,7 @@
 //! - **记忆维护循环**（[`maintenance`]）— 周期衰减低价值记忆的驱动方
 
 pub mod backend;
+mod bge_m3_sparse_linear;
 pub mod boot_mark;
 pub mod causal;
 pub mod composite;
@@ -20,6 +21,7 @@ pub mod config;
 pub mod consolidator;
 mod drop_log;
 pub mod embedding_provider;
+mod sparse_head;
 
 pub mod entry_store;
 pub mod extractor;

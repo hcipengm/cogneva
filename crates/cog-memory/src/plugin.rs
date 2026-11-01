@@ -183,15 +183,15 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             match crate::FastEmbedProvider::try_new() {
                 Ok(p) => {
                     info!("FastEmbed BGE-M3 loaded: {} dim", p.dimension());
-                    // 两个 session 的成败各自独立：sparse 没起来只是少了混合检索的那一半，
+                    // 两半的成败各自独立：sparse 没起来只是少了混合检索的那一半，
                     // 说出来让读者知道该修什么，而不是让整条嵌入能力跟着一起消失。
                     match p.sparse_status() {
                         Ok(()) => info!(
-                            "FastEmbed BGE-M3 sparse session loaded; hybrid retrieval has both \
+                            "FastEmbed BGE-M3 sparse head loaded; hybrid retrieval has both \
                              halves"
                         ),
                         Err(reason) => warn!(
-                            "FastEmbed BGE-M3 sparse session is absent ({reason}); dense \
+                            "FastEmbed BGE-M3 sparse head is absent ({reason}); dense \
                              embedding works, sparse requests will be refused"
                         ),
                     }
@@ -206,11 +206,12 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             // 关掉是因为权重不在镜像里：本地无缓存时会向 HuggingFace 发一次没有超时的
             // 拉取，离线集群里会把 init 挂死。部署侧把权重以只读卷挂上、用一个 env
             // 覆盖打开这个开关（`FASTEMBED_CACHE_DIR` 指名那份目录），确认权重就位再
-            // 打开即恢复向量能力。打开这一项要付**两份**权重：dense 与 sparse 是两个
-            // 独立的会话，读的虽是同一批文件，却各把权重读进自己的缓冲区，映射页不共享。
-            // 第二份有多大不用在这里写死——启动打点从 `embedding-dense` 到
-            // `embedding-sparse` 之间那段 RSS 差值就是它。这里曾写着「加第二个几乎不涨」，
-            // 那句话没量过，也正因为它，第一次内存归因是按调用点数权重份数，数错了。
+            // 打开即恢复向量能力。打开这一项付**一份**权重：dense 与会话稀疏的那一半
+            // 共用同一个会话、同一份权重。曾经要付两份——两个独立会话各把同一批文件读进
+            // 自己的缓冲区，映射页不共享，而这件事在调用点上数不出来：构造语句只有一处，
+            // 权重却进了内存两次。启动打点从 `embedding-dense` 到 `embedding-sparse`
+            // 之间那段 RSS 现在只剩分词器与 1024 个数的开销，差值重新变成权重那么大就是
+            // 第二个会话又回来了。
             info!(
                 "Embedding model loading disabled (memory.load_embedding_model=false); \
                  published vectors stay unavailable"

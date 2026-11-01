@@ -1,8 +1,9 @@
 //! Whether the embedding loader can be fed entirely from a directory, measured on the weights.
 //!
 //! The memory layers keep their summary vectors in a vector store, and the vectors are
-//! produced by BGE-M3 running in this process: one session for the dense vector, another for
-//! the sparse one, both reading the same repository. Nothing about that path can be built on
+//! produced by BGE-M3 running in this process: one session, whose dense vector is pooled out
+//! of its output and whose sparse one is the token hidden states through the sparse head.
+//! Nothing about that path can be built on
 //! a network call at load time -- the cluster reaches no model hub -- so the weights have to
 //! be a directory somebody put there first, and the loader has to find them in it. The
 //! producer is `deploy/scripts/fetch-model-weights.sh --model bge-m3`; this is the measurement that says
@@ -20,12 +21,16 @@
 //! - **The dense control separates**: `如何申请年假？` against an annual-leave policy scores
 //!   cosine **0.717**, the same question against an unrelated canteen menu **0.430**. A
 //!   loader that returned whatever its bytes happened to mean would not keep that order.
-//! - **The sparse session loads from the same directory** and produces indices and weights
-//!   of equal length over a nonempty support: the collection has a named sparse vector ready
-//!   to hold one, and hybrid retrieval is the reason this model was picked.
+//! - **The sparse half comes out of the same session** with indices and weights of equal
+//!   length over a nonempty support: the collection has a named sparse vector ready to hold
+//!   one, and hybrid retrieval is the reason this model was picked.
 //!
-//! It needs both sessions resident, so it is ignored by default and is not in CI (a runner
-//! has neither the weights nor a mirror to fetch them from):
+//! The second test here is the one that makes replacing the second session safe: it runs the
+//! session-free sparse path beside a `fastembed::SparseTextEmbedding` loaded from the same
+//! directory and requires the two to agree term for term and weight for weight.
+//!
+//! These load the weights, so they are ignored by default and are not in CI (a runner has
+//! neither the weights nor a mirror to fetch them from):
 //!
 //! ```text
 //! deploy/scripts/fetch-model-weights.sh --model bge-m3 --dest /srv/cogneva/models/fastembed
@@ -59,6 +64,74 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let nb: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     dot / (na * nb)
+}
+
+/// The sparse half must be the same vector it was when a second session computed it.
+///
+/// Dropping that session is only a saving if the vectors are unchanged: a row embedded by
+/// the old path and a query embedded by the new one have to be scored against each other,
+/// and a term list that quietly shifted would make them incomparable without anything
+/// failing. So this compares against the real second session rather than against a
+/// remembered vector.
+#[tokio::test]
+#[ignore = "needs the BGE-M3 weights in FASTEMBED_CACHE_DIR; see the module comment"]
+async fn the_sparse_half_matches_the_session_it_replaced() {
+    let dir = std::env::var("FASTEMBED_CACHE_DIR").expect(
+        "set FASTEMBED_CACHE_DIR to a directory the weights were fetched into \
+         (deploy/scripts/fetch-model-weights.sh --model bge-m3)",
+    );
+    assert!(
+        std::env::var("HF_HOME").is_err(),
+        "HF_HOME is set, and fastembed prefers it over FASTEMBED_CACHE_DIR"
+    );
+
+    let provider = FastEmbedProvider::try_new_with_cache_dir(Some(PathBuf::from(&dir)))
+        .expect("the weights did not load from FASTEMBED_CACHE_DIR");
+    let mut reference = fastembed::SparseTextEmbedding::try_new(
+        fastembed::SparseInitOptions::new(fastembed::SparseModel::BGEM3)
+            .with_cache_dir(PathBuf::from(&dir)),
+    )
+    .expect("the reference sparse session did not load from the same directory");
+
+    // Chinese, English, and one long enough to be truncated: the three places a
+    // tokenization that drifted from the forward pass would show up differently.
+    let texts: Vec<String> = vec![
+        QUERY.to_string(),
+        RELEVANT.to_string(),
+        IRRELEVANT.to_string(),
+        "Hybrid retrieval keeps the exact term when the paraphrase loses it.".to_string(),
+        "年假 流程 ".repeat(400),
+    ];
+
+    let ours = provider
+        .embed_sparse(texts.clone())
+        .await
+        .expect("the session-free sparse path did not embed");
+    let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
+    let theirs = reference
+        .embed(refs, None)
+        .expect("the reference sparse session did not embed");
+
+    assert_eq!(
+        ours.len(),
+        theirs.len(),
+        "one sparse vector per input, in order"
+    );
+    for (at, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
+        let expected: Vec<u32> = theirs.indices.iter().map(|&i| i as u32).collect();
+        assert_eq!(
+            ours.indices, expected,
+            "text {at}: the same text produced a different set of terms than the second \
+             session did, so vectors from the two paths would not be comparable"
+        );
+        assert_eq!(ours.values.len(), theirs.values.len());
+        for (got, want) in ours.values.iter().zip(&theirs.values) {
+            assert!(
+                (got - want).abs() <= 1e-3 * (1.0 + want.abs()),
+                "text {at}: term weight {got} against the second session's {want}"
+            );
+        }
+    }
 }
 
 #[tokio::test]

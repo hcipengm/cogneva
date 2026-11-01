@@ -63,21 +63,55 @@ pub(crate) async fn fill_missing_halves(
     Ok(entry)
 }
 
+/// One batch's token-level hidden states, with their shape.
+///
+/// Which tensor that is, is read off the rank rather than off a name: a batch may carry
+/// a pooled vector beside the token states, and the sparse head consumes whichever output
+/// is three-dimensional. A batch with none of them is an error, not an empty answer — an
+/// empty answer here would become a row whose sparse column is silently absent.
+fn token_hidden_states(
+    batch: &fastembed::SingleBatchOutput,
+) -> Result<(Vec<usize>, &[f32]), SFError> {
+    for (_name, value) in &batch.outputs {
+        let Ok((shape, data)) = value.try_extract_tensor::<f32>() else {
+            continue;
+        };
+        let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+        if dims.len() == 3 {
+            return Ok((dims, data));
+        }
+    }
+    Err(SFError::Validation(format!(
+        "the forward pass' outputs carry no token-level tensor; named {:?}",
+        batch
+            .outputs
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+    )))
+}
+
 /// Local embedding provider backed by [fastembed](https://crates.io/crates/fastembed),
 /// running **BGE-M3** (`BAAI/bge-m3`): 1024-dim dense vectors, an 8192-token context
 /// window (long summaries are not truncated), ONNX Runtime on CPU.
 ///
-/// Two sessions over one set of weights. BGE-M3 emits both a dense vector and a sparse
-/// (token-weight) one, and the summary collection carries a named sparse vector to hold
-/// the second; hybrid retrieval is the reason this model was chosen over a dense-only
-/// one, so the sparse session is part of what this provider is, not an option it might
-/// grow later.
+/// One session, two halves. BGE-M3 emits both a dense vector and a sparse (token-weight)
+/// one, and the summary collection carries a named sparse vector to hold the second;
+/// hybrid retrieval is the reason this model was chosen over a dense-only one, so the
+/// sparse half is part of what this provider is, not an option it might grow later.
 ///
-/// The two sessions load independently. The dense one is required -- a provider without
-/// it has nothing to answer with -- so its failure is this constructor's error. The
-/// sparse one is not: its failure leaves the provider able to embed densely (the text
-/// path keeps working) and is reported by name when something asks for a sparse vector,
-/// rather than silently swallowing the request or taking the dense session down with it.
+/// The sparse half used to be a second session over the same weight files. That cost a
+/// second copy of the weights: the two sessions read the same files into buffers of their
+/// own, and the boot marks put the difference between them in the gigabytes. Both halves
+/// come from the same forward pass instead -- the dense vector from the pooled output, the
+/// sparse one from the token hidden states through the sparse head, whose whole weight is
+/// the 1024 numbers in [`crate::bge_m3_sparse_linear`]. The second session is gone.
+///
+/// The halves still load independently. The dense one is required -- a provider without it
+/// has nothing to answer with -- so its failure is this constructor's error. The sparse one
+/// is not: its failure leaves the provider able to embed densely (the text path keeps
+/// working) and is reported by name when something asks for a sparse vector, rather than
+/// silently swallowing the request or taking the dense session down with it.
 ///
 /// Loading reads weights from disk and never fetches them: fastembed looks in the
 /// directory it was given (see [`FastEmbedProvider::try_new_with_cache_dir`]) and,
@@ -86,10 +120,10 @@ pub(crate) async fn fill_missing_halves(
 /// before the process starts.
 pub struct FastEmbedProvider {
     dense_model: std::sync::Mutex<fastembed::TextEmbedding>,
-    /// Absent when the sparse session failed to load; the reason is kept so a
-    /// request that needed it can say what actually went wrong instead of reporting
-    /// a generic refusal.
-    sparse_model: Option<std::sync::Mutex<fastembed::SparseTextEmbedding>>,
+    /// Absent when the sparse head could not be set up (its tokenizer or weights were
+    /// missing); the reason is kept so a request that needed it can say what actually
+    /// went wrong instead of reporting a generic refusal.
+    sparse_head: Option<crate::sparse_head::SparseHead>,
     sparse_unavailable: Option<String>,
     dim: usize,
 }
@@ -115,16 +149,14 @@ impl FastEmbedProvider {
     /// somewhere else and the failure reads as a bad weight directory. Whoever loads
     /// a mounted directory has to leave `HF_HOME` unset.
     ///
-    /// Both sessions are built from the same directory: dense and sparse read the
-    /// same repository, down to the same weight files.
+    /// Both halves are set up from the same directory: the session and the sparse head
+    /// read the same snapshot, down to the same weight files.
     pub fn try_new_with_cache_dir(cache_dir: Option<std::path::PathBuf>) -> Result<Self, String> {
         let mut dense_options = fastembed::InitOptions::new(fastembed::EmbeddingModel::BGEM3)
             .with_show_download_progress(true);
-        let mut sparse_options = fastembed::SparseInitOptions::new(fastembed::SparseModel::BGEM3)
-            .with_show_download_progress(true);
+        let head_dir = cache_dir.clone();
         if let Some(dir) = cache_dir {
-            dense_options = dense_options.with_cache_dir(dir.clone());
-            sparse_options = sparse_options.with_cache_dir(dir);
+            dense_options = dense_options.with_cache_dir(dir);
         }
 
         // Dense first, and unconditionally required: it is the session every caller
@@ -133,17 +165,18 @@ impl FastEmbedProvider {
             .map_err(|e| format!("failed to load BGE-M3 dense embedding model: {e}"))?;
         crate::boot_mark::mark("embedding-dense");
 
-        // Sparse second, and independently: it failing is a degraded provider, not a
-        // broken one. The reason travels with the provider so the refusal a caller
-        // gets names the load failure rather than just saying "unavailable".
-        let (sparse_model, sparse_unavailable) =
-            match fastembed::SparseTextEmbedding::try_new(sparse_options) {
-                Ok(model) => (Some(std::sync::Mutex::new(model)), None),
+        // The sparse head second, and independently: it failing is a degraded provider,
+        // not a broken one. It costs no weights of its own -- it is a tokenizer and the
+        // 1024 numbers below -- but it can still fail, on a directory that lacks the
+        // tokenizer or the snapshot pointer, and that must not take dense down.
+        let (sparse_head, sparse_unavailable) =
+            match crate::sparse_head::SparseHead::load(head_dir.as_deref()) {
+                Ok(head) => (Some(head), None),
                 Err(e) => {
-                    let reason = format!("failed to load BGE-M3 sparse embedding model: {e}");
+                    let reason = format!("failed to set up the BGE-M3 sparse head: {e}");
                     tracing::warn!(
                         "{reason}; dense embedding stays available, sparse requests will be \
-                         refused until this is fixed"
+                     refused until this is fixed"
                     );
                     (None, Some(reason))
                 }
@@ -152,7 +185,7 @@ impl FastEmbedProvider {
 
         Ok(Self {
             dense_model: std::sync::Mutex::new(dense_model),
-            sparse_model,
+            sparse_head,
             sparse_unavailable,
             dim: 1024,
         })
@@ -164,7 +197,7 @@ impl FastEmbedProvider {
     /// ingest loop that discovers this per document pays the same failure once per
     /// document, and the answer cannot change while the process runs.
     pub fn sparse_status(&self) -> Result<(), &str> {
-        match (&self.sparse_model, &self.sparse_unavailable) {
+        match (&self.sparse_head, &self.sparse_unavailable) {
             (Some(_), _) => Ok(()),
             (None, Some(reason)) => Err(reason.as_str()),
             // The two fields are set together; an absent session always carries its
@@ -199,38 +232,54 @@ impl EmbeddingProvider for FastEmbedProvider {
         }
 
         // An empty batch is answered as an empty batch -- asking for zero vectors of
-        // anything is satisfied by zero vectors -- but a non-empty one with no session
-        // is refused rather than answered with nothing, because a caller that stores
+        // anything is satisfied by zero vectors -- but a non-empty one with no sparse
+        // head is refused rather than answered with nothing, because a caller that stores
         // that nothing would be writing a row whose sparse column is empty for a
         // reason it cannot see.
-        let Some(sparse_model) = self.sparse_model.as_ref() else {
+        let Some(head) = self.sparse_head.as_ref() else {
             return Err(SFError::Config(format!(
-                "this embedding provider has no sparse session; asked to embed {} text(s) as \
+                "this embedding provider has no sparse head; asked to embed {} text(s) as \
                  sparse vectors ({})",
                 texts.len(),
                 self.sparse_status().unwrap_err()
             )));
         };
 
-        let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-        let mut model = sparse_model.lock().map_err(|e| {
-            cog_core::SFError::Validation(format!("sparse embedding model lock poisoned: {e}"))
+        let mut model = self.dense_model.lock().map_err(|e| {
+            cog_core::SFError::Validation(format!("dense embedding model lock poisoned: {e}"))
         })?;
-        let embeddings = model
-            .embed(refs, None)
-            .map_err(|e| cog_core::SFError::Validation(format!("sparse embedding failed: {e}")))?;
 
-        Ok(embeddings
-            .into_iter()
-            .map(|e| SparseEmbedding {
-                indices: e.indices.iter().map(|&i| i as u32).collect(),
-                values: e.values,
-            })
-            .collect())
+        let mut out = Vec::with_capacity(texts.len());
+        // The same batch size the tokenizer was configured around: padding goes to the
+        // longest text in the batch, so a different grouping would size the rows
+        // differently from the forward pass that produced them.
+        for chunk in texts.chunks(crate::sparse_head::BATCH) {
+            let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+            let encoded = head
+                .tokenize(&refs)
+                .map_err(|e| SFError::Validation(format!("sparse tokenization failed: {e}")))?;
+
+            let raw = model.transform(&refs, None).map_err(|e| {
+                SFError::Validation(format!("sparse embedding forward pass failed: {e}"))
+            })?;
+            let batches = raw.into_raw();
+            let batch = batches.into_iter().next().ok_or_else(|| {
+                SFError::Validation("sparse forward pass returned no batch".into())
+            })?;
+            let (shape, data) = token_hidden_states(&batch)?;
+            out.extend(
+                head.sparse_from_hidden(&encoded, &shape, data)
+                    .map_err(|e| {
+                        SFError::Validation(format!("sparse embedding failed for a batch: {e}"))
+                    })?,
+            );
+        }
+
+        Ok(out)
     }
 
     fn supports_sparse(&self) -> bool {
-        self.sparse_model.is_some()
+        self.sparse_head.is_some()
     }
 
     fn model_id(&self) -> &str {

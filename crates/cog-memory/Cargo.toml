@@ -22,6 +22,10 @@ sqlx = { workspace = true }
 uuid = { workspace = true }
 schemars = { workspace = true }
 fastembed = "5.13"
+# 稀疏那一半自己分词：要与建立会话那一侧分出同样的 token，靠的就是同一个库、
+# 同一份 tokenizer.json 和同一套补齐/截断设置。版本跟着 fastembed 已经拉进来的
+# 那一份走，不额外引入第二个分词实现。
+tokenizers = "0.22"
 anyhow = { workspace = true }
 
 [dev-dependencies]
