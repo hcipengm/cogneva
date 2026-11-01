@@ -1837,7 +1837,12 @@ pub(crate) fn keep_raised_ceilings(
         }
     }
     if !raised.is_empty() {
+        // 修法 5 的审计面：「自动抬天花板」在日志里有名有姓——哪一维、从多少
+        // 抬到多少（`raised` 逐维记 `old -> new`）、依据是集群此刻正举着的那次
+        // 错位观测。事件名 `ceiling_raised` 是这条自动决定的检索键；读数面仍是
+        // 漂移读数那一格，不新铸裸 metric。
         tracing::info!(
+            event = "ceiling_raised",
             raised = %raised.join(", "),
             "rollout: the cluster holds a ceiling above this revision's declaration (a pod \
              outside the release widened it); keeping the higher number so the support apply \
@@ -5260,7 +5265,11 @@ impl RolloutExecutor {
             // 补成门。装不下是集群此刻的事，不是这一版的结论，所以判环境类、
             // 不回滚，下一轮天花板跟上了自己会继续。
             if let Some(shortfall) = self.admission_would_fail(plan, target).await {
+                // 修法 5 的审计面：「因漂移扣住滚动」在扣住成立处落一条事件行，
+                // 事件名 `rollout_held_for_drift` 是检索键；维度与短差原文随行，
+                // 计数面仍是 `admission_hold` 那一格，不新铸裸 metric。
                 warn!(
+                    event = "rollout_held_for_drift",
                     deployment = %target.deployment,
                     dimension = shortfall.dimension,
                     shortfall = %shortfall.text,
