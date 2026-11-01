@@ -13,6 +13,10 @@ pub const GOAL_CONSUMER_LOOP: &str = "orchestrator_goal_consumer";
 /// Loop name reported through the background-loop liveness family.
 pub const ORPHAN_RECONCILER_LOOP: &str = "orchestrator_orphan_reconciler";
 
+/// 这一族告警都以它开头：协调者认领的是「谁在维护这条分解判词」，不是某一条规则。
+/// 前缀而不是白名单，因为新增一条分解规则时也要落进同一个归属面。
+const DECOMPOSITION_ALERT_PREFIX: &str = "decomposition_";
+
 /// 按历史给新任务排期，至少要这么多条跑完的样本。
 ///
 /// 低于这个数，「中位数」只是最近几次的噪声，而被它排出来的期会被甘特与挣值
@@ -1637,8 +1641,9 @@ impl DagExecutorRuntime {
     /// decomposition, partial write, crash mid-injection). Each stalled
     /// orphan is terminated (Pending → Failed) and raises a persistent
     /// alert so signal watcher re-drives the work as a fresh intent; alerts
-    /// resolve once the parent task reaches a terminal state. Rows raised
-    /// before a restart are adopted from the alert store on the first tick.
+    /// resolve once the parent task reaches a terminal state. Ownership is
+    /// re-derived from the alert store on every tick, so rows raised by this
+    /// process, by a restarted one, or by the action planner all end up owned.
     pub async fn run_orphan_reconciler(
         &self,
         enabled: bool,
@@ -1671,8 +1676,8 @@ impl DagExecutorRuntime {
         // awaits until the loop stops.
         //
         // The fired-key bookkeeping is built per attempt. Losing it to a panic
-        // costs nothing that is not recovered: the first tick of the next
-        // attempt re-adopts every active alert from the persistent store.
+        // costs nothing that is not recovered: the next tick re-adopts every
+        // active alert from the persistent store.
         let _ = cog_core::loop_health::spawn(
             ORPHAN_RECONCILER_LOOP,
             cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(interval_secs)),
@@ -1686,7 +1691,6 @@ impl DagExecutorRuntime {
                     // Keys this watcher owns, with the earliest time the alert may resolve.
                     let mut firing: std::collections::HashMap<String, OrphanWatch> =
                         std::collections::HashMap::new();
-                    let mut adopted = false;
                     let mut ticker =
                         tokio::time::interval(std::time::Duration::from_secs(interval_secs));
                     loop {
@@ -1695,30 +1699,7 @@ impl DagExecutorRuntime {
                             biased;
                             _ = shutdown.wait() => break,
                             _ = ticker.tick() => {
-                                if !adopted {
-                                    adopted = true;
-                                    if let Some(sink) = &sink {
-                                        for alert in sink
-                                            .list_active_persistent_alerts("decomposition_", 1000)
-                                            .await
-                                        {
-                                            if let Some(parent) = alert
-                                                .labels
-                                                .get("parent_task_id")
-                                                .and_then(|v| v.as_str())
-                                                .filter(|s| !s.is_empty() && *s != "-")
-                                            {
-                                                firing.insert(
-                                                    alert.dedup_key.clone(),
-                                                    OrphanWatch {
-                                                        parent_id: parent.to_string(),
-                                                        resolve_after: alert.fired_at + dwell,
-                                                    },
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
+                                adopt_owned_alerts(sink.as_ref(), &dwell, &mut firing).await;
                                 let stall = chrono::Duration::seconds(stall_secs as i64);
                                 orphan_reconcile_tick(
                                     &this.orchestrator,
@@ -1743,6 +1724,44 @@ impl DagExecutorRuntime {
 struct OrphanWatch {
     parent_id: String,
     resolve_after: chrono::DateTime<chrono::Utc>,
+}
+
+/// Adopt every active alert of this family that the watcher does not own yet.
+///
+/// Runs on each tick, not once per process attempt: the action planner raises
+/// `decomposition_wbs` / `decomposition_orphaned` rows from outside this loop,
+/// and a row raised after the first tick would otherwise stay owned by nobody
+/// -- never re-asserted, never resolved, and unsighted in the store until
+/// someone closed it by hand.
+async fn adopt_owned_alerts(
+    sink: Option<&Arc<dyn cog_core::PersistentAlertSink>>,
+    dwell: &chrono::Duration,
+    firing: &mut std::collections::HashMap<String, OrphanWatch>,
+) {
+    let Some(sink) = sink else { return };
+    for alert in sink
+        .list_active_persistent_alerts(DECOMPOSITION_ALERT_PREFIX, 1000)
+        .await
+    {
+        if firing.contains_key(&alert.dedup_key) {
+            continue;
+        }
+        let Some(parent) = alert
+            .labels
+            .get("parent_task_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "-")
+        else {
+            continue;
+        };
+        firing.insert(
+            alert.dedup_key.clone(),
+            OrphanWatch {
+                parent_id: parent.to_string(),
+                resolve_after: alert.fired_at + *dwell,
+            },
+        );
+    }
 }
 
 /// One reconciler pass. Split out as a free function so the adoption/firing
@@ -3738,6 +3757,10 @@ mod orphan_reconciler_tests {
         calls: Mutex<Calls>,
         drafts: Mutex<Vec<cog_core::PersistentAlertDraft>>,
         active: Mutex<Vec<cog_core::PersistedAlert>>,
+        /// Rows the store only starts returning after the first listing: the
+        /// action planner keeps raising alerts while the process lives.
+        raised_later: Mutex<Vec<cog_core::PersistedAlert>>,
+        list_calls: Mutex<usize>,
     }
 
     #[async_trait]
@@ -3753,6 +3776,15 @@ mod orphan_reconciler_tests {
                 draft.dedup_key.clone(),
             ));
             self.drafts.lock().unwrap().push(draft.clone());
+            if !condition {
+                // The real store keeps only firing rows: a resolved row stops
+                // being active, which is what stops the next adoption pass from
+                // picking it up again.
+                self.active
+                    .lock()
+                    .unwrap()
+                    .retain(|a| a.dedup_key != draft.dedup_key);
+            }
             Ok(if condition {
                 cog_core::AlertTransition::Fired
             } else {
@@ -3769,6 +3801,13 @@ mod orphan_reconciler_tests {
             rule_prefix: &str,
             _limit: i64,
         ) -> Vec<cog_core::PersistedAlert> {
+            let mut listed = self.list_calls.lock().unwrap();
+            *listed += 1;
+            if *listed > 1 {
+                let mut active = self.active.lock().unwrap();
+                active.append(&mut self.raised_later.lock().unwrap());
+            }
+            drop(listed);
             self.active
                 .lock()
                 .unwrap()
@@ -4061,6 +4100,71 @@ mod orphan_reconciler_tests {
                 .iter()
                 .any(|(c, _, k)| !*c && k == &key),
             "adopted alert not resolved: {:?}",
+            recording.calls.lock().unwrap()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_alert_raised_after_the_first_tick_is_owned_and_resolved() {
+        // The action planner raises `decomposition_wbs` from outside this loop.
+        // While ownership was derived once per process attempt, such a row was
+        // owned by nobody: never re-asserted, never resolved, and read as
+        // unsighted in the store until someone closed it by hand.
+        let dag = Arc::new(DagExecutor::new("ws-orphan-late".into()));
+        let mut parent = placeholder("late-parent", 120);
+        parent.status = TaskStatus::Failed;
+        dag.add_task(parent).await.unwrap();
+
+        let recording = Arc::new(RecordingAlertSink::default());
+        let key = "decomposition_wbs:goal-z:late-parent".to_string();
+        let fired_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        recording
+            .raised_later
+            .lock()
+            .unwrap()
+            .push(cog_core::PersistedAlert {
+                rule: "decomposition_wbs".into(),
+                dedup_key: key.clone(),
+                severity: "warning".into(),
+                state: "firing".into(),
+                message: String::new(),
+                labels: serde_json::json!({ "parent_task_id": "late-parent" }),
+                fired_at,
+                last_seen_at: Some(fired_at),
+                acknowledged_at: None,
+                acknowledged_by: None,
+            });
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
+
+        let runtime = test_runtime(dag);
+        let shutdown = ShutdownSignal::new();
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            runtime
+                .run_orphan_reconciler(true, 30, 60, 30, Some(sink), shutdown_clone)
+                .await;
+        });
+
+        let mut resolved = false;
+        for _ in 0..20 {
+            if recording
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(c, _, k)| !*c && k == &key)
+            {
+                resolved = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+        shutdown.trigger();
+        let _ = handle.await;
+
+        assert!(
+            resolved,
+            "an alert raised after the first tick was never adopted: {:?}",
             recording.calls.lock().unwrap()
         );
     }
