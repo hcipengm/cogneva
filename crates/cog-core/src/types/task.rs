@@ -826,6 +826,29 @@ impl Task {
         self.lease_expires_at = None;
     }
 
+    /// Whether re-running this task could succeed, judged on both channels a
+    /// failure can arrive by: the typed `error_cause` (what the transport
+    /// saw) and the in-band declaration inside the rendered `error` text,
+    /// which is what carries the verdict when the failure was found one or
+    /// more layers below the transport and arrives wrapped in another layer's
+    /// prose. Either channel saying the failure is deterministic settles it:
+    /// a retry that reads only the near one pays again for every failure
+    /// whose cause was found far away.
+    pub fn is_retryable_failure(&self) -> bool {
+        !self.error_cause.is_some_and(UpstreamFailure::is_terminal)
+            && !self
+                .error
+                .as_deref()
+                .is_some_and(crate::contract::outcome::is_deterministic_failure)
+    }
+
+    /// 退避是否已到期：没有退避约束，或约束的时刻已过。失败回投把下次可执行
+    /// 时刻写在这行的 `retry_not_before` 上，判定重试的进程与之后重新投递它的
+    /// 进程可能不是同一个，所以「到点没有」只能从这个字段读，投递侧不另算。
+    pub fn backoff_elapsed(&self, now: DateTime<Utc>) -> bool {
+        self.retry_not_before.is_none_or(|due| due <= now)
+    }
+
     /// 持有者心跳：把到期时刻推后。只有仍在 Running 的任务需要续期——其它状态
     /// 已经不由任何人持有，续它等于伪造一个持有者。返回是否真的续上了。
     pub fn renew_lease(
@@ -926,6 +949,39 @@ impl Task {
 mod tests {
     use super::*;
     use crate::checkout::repo_root;
+
+    /// 两个通道各自都能判死一次重试：类型通道（`error_cause` 为配额/鉴权这类
+    /// 终态拒绝）与带内文本通道（`error` 里经 declares 命中的 terminal 前缀，
+    /// 含被错误包装后的形态）——任一命中即不可重试；都没有时保留重试。
+    #[test]
+    fn either_failure_channel_settles_the_retry_question() {
+        let mut task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        assert!(task.is_retryable_failure());
+
+        task.error_cause = Some(UpstreamFailure::QuotaExhausted);
+        task.error = Some("LLM upstream refused (quota_exhausted): spent".into());
+        assert!(!task.is_retryable_failure());
+
+        // 类型通道缺失、只剩被包装过的文本时，带内通道独立成立。
+        task.error_cause = None;
+        task.error = Some("Agent execution error: terminal_env_failure: prompt failed".into());
+        assert!(!task.is_retryable_failure());
+
+        task.error = Some("upstream is unreachable".into());
+        assert!(task.is_retryable_failure());
+    }
+
+    /// 退避时刻写在这行上：未到期不就绪，到期或没有退避约束就绪。
+    #[test]
+    fn the_backoff_deadline_gates_readiness() {
+        let now = Utc::now();
+        let mut task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        assert!(task.backoff_elapsed(now));
+        task.retry_not_before = Some(now + chrono::Duration::seconds(60));
+        assert!(!task.backoff_elapsed(now));
+        task.retry_not_before = Some(now - chrono::Duration::seconds(1));
+        assert!(task.backoff_elapsed(now));
+    }
 
     /// 状态字符串必须双向可逆：写进 `status` 列的那套拼写，是所有按状态数行
     /// 的查询唯一的依据，往一个方向漂了就会去数另一套拼写写下的行——计数看着

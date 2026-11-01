@@ -330,6 +330,11 @@ pub struct CompleteOptions {
 /// error text. Matching on text is how a quota outage gets recorded as a
 /// content defect: the words differ per upstream and per locale, while the
 /// status code does not.
+///
+/// The retry-side judgement that pairs this typed channel with the in-band
+/// one — a terminal prefix in the rendered text, wrapper prose and all —
+/// lives in `crate::contract::outcome`; `Task::is_retryable_failure`
+/// consults both channels through it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamFailure {
     /// The upstream asked us to slow down. Retrying after the advertised delay
