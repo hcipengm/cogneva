@@ -3863,7 +3863,7 @@ impl MainlineDeployer {
         api_base: &str,
         path: &str,
     ) -> Result<serde_json::Value, PlatformReadFailure> {
-        let body = Self::platform_get_raw(api_base, path, "application/json").await?;
+        let body = Self::platform_get_raw(api_base, path, cog_core::CONTENT_TYPE_JSON).await?;
         serde_json::from_slice(&body).map_err(|_| PlatformReadFailure::UnusableBody)
     }
 
@@ -3875,7 +3875,7 @@ impl MainlineDeployer {
     /// **415**，`application/json` 得到 200 与一份 `text/plain` 正文。要什么由这一端
     /// 声明的响应类型说了算，而正文是什么由那条路由说了算。
     async fn platform_get_text(api_base: &str, path: &str) -> Result<String, PlatformReadFailure> {
-        let body = Self::platform_get_raw(api_base, path, "application/json").await?;
+        let body = Self::platform_get_raw(api_base, path, cog_core::CONTENT_TYPE_JSON).await?;
         String::from_utf8(body).map_err(|_| PlatformReadFailure::UnusableBody)
     }
 
