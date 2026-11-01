@@ -1090,59 +1090,38 @@ pub fn published_occupancy(
     out
 }
 
-/// Every claim the namespace declares, by name.
-///
-/// The registry of claims is the API, not the walker's output. A claim nothing
-/// has written to yet publishes no figure, and one on storage the node's
-/// storage root does not hold — a CSI class on a multi-node install — never
-/// will; both are claims whose declaration this loop still owns, and leaving
-/// them out of the round would leave them out of the count that says they were
-/// decided.
-pub fn parse_claim_names(listing: &str) -> Result<Vec<String>, String> {
-    let doc: serde_json::Value =
-        serde_json::from_str(listing).map_err(|e| format!("claim listing is not JSON: {e}"))?;
-    let items = doc
-        .get("items")
-        .and_then(|i| i.as_array())
-        .ok_or("claim listing carries no items array")?;
-    let mut names: Vec<String> = items
-        .iter()
-        .filter(|item| {
-            // A claim on its way out has a declaration no one should raise: the
-            // patch would race the deletion and the claim is gone either way.
-            item.pointer("/metadata/deletionTimestamp").is_none()
-        })
-        .filter_map(|item| item.pointer("/metadata/name"))
-        .filter_map(|name| name.as_str())
-        .map(|name| name.to_string())
-        .collect();
-    names.sort();
-    names.dedup();
-    Ok(names)
-}
-
 /// What one round decides on.
 ///
-/// Three answers to three questions: what this process mounts (measured by
-/// walking it), what the namespace declares (the registry of claims), and what
-/// the node-wide walker published (the only occupancy available for a claim no
-/// process here writes). A claim in the listing with no figure is still a
-/// target, so its round is counted `unmeasured` — a claim that vanished from the
-/// surface would read the same as one that never had a problem.
+/// Two answers to two questions: what this process mounts (measured by walking
+/// it) and what the node-wide walker published (the only occupancy available for
+/// a claim no process here writes).
+///
+/// `seen` is every claim that walker has published a figure for since this
+/// process started, not only the ones in this round's scrape. A figure that
+/// stops arriving is exactly the failure this widening can introduce, and a
+/// round with no figure for a claim it measured last round counts `unmeasured` —
+/// which is counted, visible, and gated by a rule — where dropping the claim
+/// would read like a volume whose declaration had stopped needing anything.
+///
+/// A claim that has never been published is not in the round: nothing here can
+/// decide it, and the rule that reports a directory-backed claim with no reading
+/// at all already names that population, class by class. Counting it here as
+/// well would put a permanently firing alert on the profile whose storage the
+/// node walker cannot see.
 ///
 /// A walked claim keeps its walk even when a figure was published for it: the
 /// walk excludes the mounts nested inside it, and the published figure counts
 /// the whole claim, so the two are not the same quantity.
 pub fn round_targets(
     walked: &[ClaimTarget],
-    listed: &[String],
+    seen: &std::collections::BTreeSet<String>,
     published: &std::collections::BTreeMap<String, u64>,
 ) -> Vec<ClaimTarget> {
     let mut by_claim: std::collections::BTreeMap<String, ClaimTarget> = walked
         .iter()
         .map(|t| (t.claim.clone(), t.clone()))
         .collect();
-    for name in listed.iter().chain(published.keys()) {
+    for name in seen.iter().chain(published.keys()) {
         by_claim.entry(name.clone()).or_insert_with(|| ClaimTarget {
             claim: name.clone(),
             occupancy: Occupancy::Published,
@@ -1183,15 +1162,6 @@ async fn scrape_occupancy(
         &String::from_utf8_lossy(&out.stdout),
         namespace,
     ))
-}
-
-async fn list_claims(ns: &str) -> Result<Vec<String>, String> {
-    let listing = kubectl(
-        &["get", "pvc", "-n", ns, "-o", "json"],
-        KUBECTL_READ_TIMEOUT_SECS,
-    )
-    .await?;
-    parse_claim_names(&listing)
 }
 
 async fn kubectl(args: &[&str], timeout_secs: u64) -> Result<String, String> {
@@ -1687,12 +1657,13 @@ pub fn spawn_volume_capacity_loop(
             async move {
                 let ns = namespace();
                 let mut states: HashMap<String, ClaimState> = HashMap::new();
-                // The claims the namespace declared when it was last read. Kept
-                // across a failed listing: dropping them for one unreadable
-                // round would take every claim out of the surface it is counted
-                // on, and the count would read as a deployment with fewer
-                // volumes rather than a round that could not look.
-                let mut listed: Vec<String> = Vec::new();
+                // Every claim a figure has arrived for since this process
+                // started. Kept across a failed scrape on purpose: dropping the
+                // claims for one unreadable round would take them out of the
+                // surface they are counted on, and a channel that went down
+                // would read as a deployment with fewer volumes.
+                let mut seen: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
                 let mut said_no_channel = false;
                 let mut ticker = tokio::time::interval(Duration::from_secs(interval));
                 loop {
@@ -1702,17 +1673,6 @@ pub fn spawn_volume_capacity_loop(
                     tokio::select! {
                         _ = ticker.tick() => {}
                         _ = shutdown.wait() => break,
-                    }
-                    match list_claims(&ns).await {
-                        Ok(mut names) => {
-                            names.sort();
-                            listed = names;
-                        }
-                        Err(e) => warn!(
-                            error = %e,
-                            "volume capacity: the namespace's claims could not be listed; \
-                             this round decides on the last listing that was read"
-                        ),
                     }
                     let published = match occupancy_url.as_deref() {
                         Some(url) => match scrape_occupancy(url, &ns).await {
@@ -1728,18 +1688,15 @@ pub fn spawn_volume_capacity_loop(
                         },
                         None => std::collections::BTreeMap::new(),
                     };
-                    let targets = round_targets(&walked, &listed, &published);
-                    if !said_no_channel
-                        && occupancy_url.is_none()
-                        && targets.iter().any(|t| t.occupancy == Occupancy::Published)
-                    {
+                    seen.extend(published.keys().cloned());
+                    let targets = round_targets(&walked, &seen, &published);
+                    if !said_no_channel && occupancy_url.is_none() {
                         said_no_channel = true;
                         warn!(
-                            claims = targets.len() - walked.len(),
-                            "volume capacity: this process declares no path for claims the \
-                             namespace holds, and no endpoint publishes their occupancy, so \
-                             their declarations are never raised here; `{OCCUPANCY_URL_ENV}` is \
-                             what gives this loop a reading for them"
+                            "volume capacity: this process walks only the claims named in its \
+                             own mount list, and no endpoint publishes the rest; \
+                             `{OCCUPANCY_URL_ENV}` is what gives this loop a reading for the \
+                             claims other workloads write"
                         );
                     }
                     for target in &targets {
@@ -1850,34 +1807,13 @@ mod tests {
         assert!(!figures.contains_key("other-metric"));
     }
 
-    /// A listing is the claims the namespace holds, whatever it is holding them
-    /// in: one leaving the cluster is not raised, and the rest arrive sorted so
-    /// the round has a fixed order.
+    /// What one round decides on: the claims this process walks, and the claims
+    /// a figure has arrived for. A claim that was measured in an earlier round
+    /// and not in this one is still a target — its round is counted `unmeasured`,
+    /// which is the reading that says the channel went quiet. A claim nothing has
+    /// ever published is not in the round, because nothing here can decide it.
     #[test]
-    fn a_claim_listing_reads_every_claim_and_drops_the_one_leaving() {
-        let listing = r#"{"items":[
-            {"metadata":{"name":"cogneva-redis-pvc"}},
-            {"metadata":{"name":"cogneva-postgres-pvc"}},
-            {"metadata":{"name":"cogneva-backup-pvc","deletionTimestamp":"2026-11-01T00:00:00Z"}},
-            {"metadata":{}}
-        ]}"#;
-        assert_eq!(
-            parse_claim_names(listing).expect("a listing"),
-            vec![
-                "cogneva-postgres-pvc".to_string(),
-                "cogneva-redis-pvc".to_string()
-            ]
-        );
-        assert!(parse_claim_names("not json").is_err());
-        assert!(parse_claim_names(r#"{"kind":"List"}"#).is_err());
-    }
-
-    /// A claim the namespace lists is decided on every round even when nothing
-    /// published a figure for it: that round is `unmeasured`, which is counted.
-    /// Dropping it from the round instead would make it invisible, and nothing
-    /// on any surface would say its declaration stopped being watched.
-    #[test]
-    fn a_round_covers_a_listed_claim_with_no_figure_and_keeps_the_walk_it_has() {
+    fn a_round_keeps_a_claim_whose_figure_stopped_arriving_and_keeps_the_walk_it_has() {
         let walked = vec![ClaimTarget {
             claim: "cogneva-evolution-pvc".to_string(),
             occupancy: Occupancy::Walked {
@@ -1885,24 +1821,26 @@ mod tests {
                 exclude: vec![PathBuf::from("/opt/cogneva/sandbox/src")],
             },
         }];
-        let listed = vec![
-            "cogneva-evolution-pvc".to_string(),
-            "cogneva-postgres-pvc".to_string(),
-        ];
-        let mut published = std::collections::BTreeMap::new();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        seen.insert("cogneva-postgres-pvc".to_string());
+        seen.insert("cogneva-evolution-pvc".to_string());
+        let mut published: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
         // A figure for the walked claim as well: the walk excludes the mount
         // nested inside it, the published figure counts the whole claim, so the
         // two are different quantities and the walk is the one kept.
         published.insert("cogneva-evolution-pvc".to_string(), 42);
         published.insert("cogneva-only-published-pvc".to_string(), 7);
 
-        let targets = round_targets(&walked, &listed, &published);
+        let targets = round_targets(&walked, &seen, &published);
         let names: Vec<&str> = targets.iter().map(|t| t.claim.as_str()).collect();
         assert_eq!(
             names,
             vec![
                 "cogneva-evolution-pvc",
                 "cogneva-only-published-pvc",
+                // Measured last round, absent from this scrape: still a target,
+                // decided as `unmeasured`.
                 "cogneva-postgres-pvc"
             ]
         );
@@ -1918,6 +1856,15 @@ mod tests {
         // A claim measured from a published figure has no path here, so nothing
         // that asks a target for its directory can bill it to the wrong volume.
         assert_eq!(targets[1].dir(), None);
+
+        // Nothing published and nothing walked: an empty round, not a round that
+        // decided the namespace's claims were fine.
+        assert!(round_targets(
+            &[],
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeMap::new()
+        )
+        .is_empty());
     }
 
     /// A published claim whose figure did not reach the round has nothing to

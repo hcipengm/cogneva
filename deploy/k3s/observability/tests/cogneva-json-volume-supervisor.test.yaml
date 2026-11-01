@@ -141,7 +141,7 @@ tests:
         values: '0x150 3x6'
       - series: 'cogneva_volume_capacity_outcome_total{outcome="refused",persistentvolumeclaim="cogneva-evolution-pvc"}'
         values: '0x150 2x6'
-      - series: 'cogneva_volume_capacity_outcome_total{outcome="unmeasured"}'
+      - series: 'cogneva_volume_capacity_outcome_total{outcome="unmeasured",persistentvolumeclaim="cogneva-evolution-pvc"}'
         values: '0x150 3x6'
     alert_rule_test:
       # 这两条各自点名是哪张卷：规则按 `persistentvolumeclaim` 分组，一条计数
@@ -163,6 +163,7 @@ tests:
         exp_alerts:
           - exp_labels:
               severity: warning
+              persistentvolumeclaim: cogneva-evolution-pvc
 
   # 声明 200、授予 100，十三小时一直没变：三条「差值」规则全亮（扩容一直没完成、
   # 声明跑在授予前面、持有量超过授予量——第三格另给一条峰值）。
