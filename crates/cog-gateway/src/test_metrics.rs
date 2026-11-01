@@ -9,6 +9,7 @@
 //! 它不判定抓取文本的语法正确性——那条由导出 crate 自己的测试负责。
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cog_core::{MetricName, MetricSample, MetricType, MetricsBackend, SFResult};
@@ -56,11 +57,44 @@ pub struct TestMetrics {
     kinds: Mutex<BTreeMap<String, MetricType>>,
     /// (观测次数, 观测和)。桶的划分是真实编码器的事。
     histograms: Mutex<BTreeMap<SeriesKey, (u64, f64)>>,
+    /// 每次按名查询前先睡这么久。零延迟时这一面与从前逐字相同，所以它是可选
+    /// 的而不是一个恒定的 0——测试之外没人该替后端决定它要慢多久。
+    read_delay: Mutex<Option<std::time::Duration>>,
+    /// 此刻有几个按名查询在执行，以及曾经同时有过几个。
+    ///
+    /// 抓取面问后端几百个名字，这一对计数是「它们是重叠着问的还是排着队问的」
+    /// 唯一可量的话：抓取的墙钟时间受机器负载影响，而这个数不受。
+    in_flight: AtomicUsize,
+    peak_in_flight: AtomicUsize,
 }
 
 impl TestMetrics {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 让之后的每次按名查询先睡 `delay`。
+    pub fn set_read_delay(&self, delay: std::time::Duration) {
+        *self.read_delay.lock().unwrap() = Some(delay);
+    }
+
+    /// 从开始量起到此刻，同时执行过的按名查询最多的那一次。
+    pub fn peak_in_flight(&self) -> usize {
+        self.peak_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// 记一次按名查询的开头：进计数、更新峰值，然后才是它的延迟。
+    async fn begin_read(&self) {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+        let delay = *self.read_delay.lock().unwrap();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+    }
+
+    fn end_read(&self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 
     fn already_of(&self, name: MetricName, kind: MetricType) {
@@ -141,7 +175,10 @@ impl MetricsBackend for TestMetrics {
     }
 
     async fn query_gauge_latest(&self, name: &str) -> SFResult<Vec<MetricSample>> {
-        Ok(self.matching(name, MetricType::Gauge))
+        self.begin_read().await;
+        let answer = Ok(self.matching(name, MetricType::Gauge));
+        self.end_read();
+        answer
     }
 
     async fn query_counter_range(
@@ -154,11 +191,15 @@ impl MetricsBackend for TestMetrics {
     }
 
     async fn query_counter_totals(&self, name: &str) -> SFResult<Vec<MetricSample>> {
-        Ok(self.matching(name, MetricType::Counter))
+        self.begin_read().await;
+        let answer = Ok(self.matching(name, MetricType::Counter));
+        self.end_read();
+        answer
     }
 
     async fn query_histogram_totals(&self, name: &str) -> SFResult<Vec<cog_core::HistogramTotals>> {
-        Ok(self
+        self.begin_read().await;
+        let answer = Ok(self
             .histograms
             .lock()
             .unwrap()
@@ -174,7 +215,9 @@ impl MetricsBackend for TestMetrics {
                 sum: *sum,
                 updated_at: chrono::Utc::now(),
             })
-            .collect())
+            .collect());
+        self.end_read();
+        answer
     }
 
     async fn query_histogram_range(

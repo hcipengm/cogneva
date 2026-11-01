@@ -1873,6 +1873,25 @@ pub const UNREADABLE_HELD_METRIC: &str = "cogneva_metric_held_unreadable";
 /// reads declarations, so it is a reading on the wire that no gate can name.
 pub const OBSERVABLES_REGISTERED_METRIC: &str = "cogneva_observables_registered";
 
+/// How many store reads one scrape may have in flight at once.
+///
+/// A scrape asks the store one question per series name it holds, and a
+/// deployment a few months old holds a couple of hundred of them. One after
+/// another that is the sum of a couple of hundred round trips -- each of them
+/// a few milliseconds, almost all of it planning -- which is short enough to
+/// look fine and long enough that the tail decides the reading: the scrape is
+/// lost whenever a handful of those queries happen to meet a busy database,
+/// and a busy database is exactly when the readings are worth having. On this
+/// deployment the endpoint took 0.7 s at the median and still exceeded the
+/// scraper's own 10 s timeout often enough to drop about one scrape in five,
+/// which reads downstream as a target that keeps going away.
+///
+/// The bound is small on purpose. The store serves from a bounded pool, and a
+/// scrape that asks for more connections than exist does not finish sooner --
+/// it queues, and it holds connections the writers whose work it is about to
+/// read would otherwise have.
+const BACKEND_READ_CONCURRENCY: usize = 8;
+
 /// A label value with the three characters the text format reserves escaped.
 ///
 /// The values are series names, which are declared in this crate's own registry
@@ -1893,6 +1912,31 @@ fn escape_label_value(value: &str) -> String {
     escaped
 }
 
+/// Ask the store one question per name, a bounded number of them at a time.
+///
+/// Answers come back in the order the names arrived, not the order they
+/// finished: the body is read as a diff between two scrapes, and a fan-out that
+/// let completion order decide would rewrite the whole page every interval and
+/// make the one line that changed impossible to see.
+async fn read_each_name<T, R, F>(
+    names: Vec<String>,
+    read: F,
+) -> Vec<(String, cog_core::SFResult<T>)>
+where
+    R: std::future::Future<Output = cog_core::SFResult<T>>,
+    F: Fn(String) -> R,
+{
+    use futures::stream::StreamExt as _;
+    futures::stream::iter(names)
+        .map(|name| {
+            let answer = read(name.clone());
+            async move { (name, answer.await) }
+        })
+        .buffered(BACKEND_READ_CONCURRENCY)
+        .collect()
+        .await
+}
+
 /// Render every series the backend holds, in Prometheus text format.
 ///
 /// Takes the backend rather than the gateway state so the rendering can be
@@ -1911,12 +1955,21 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     // a reader looks is the reader's decision — Prometheus holds one in its own
     // scrape interval — and a window chosen here would be this exporter making
     // that decision for every reader at once.
+    //
+    // The per-name reads of each kind run together rather than one after
+    // another, `buffered` so the answers come back in the order the names did:
+    // the body is diffed by readers and compared by tests, and a scrape that
+    // reordered itself every time would be unreadable as a difference.
     let (counter_names, counter_read) =
         listed_metric_names(mb, cog_core::MetricType::Counter).await;
     read_ok &= counter_read;
-    for name in counter_names {
+    let counter_answers = read_each_name(counter_names, |name| async move {
+        mb.query_counter_totals(&name).await
+    })
+    .await;
+    for (name, answer) in counter_answers {
         held.push(name.clone());
-        match mb.query_counter_totals(&name).await {
+        match answer {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_counters(
                     &name,
@@ -1933,9 +1986,13 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
     let (histogram_names, histogram_read) =
         listed_metric_names(mb, cog_core::MetricType::Histogram).await;
     read_ok &= histogram_read;
-    for name in histogram_names {
+    let histogram_answers = read_each_name(histogram_names, |name| async move {
+        mb.query_histogram_totals(&name).await
+    })
+    .await;
+    for (name, answer) in histogram_answers {
         held.push(name.clone());
-        match mb.query_histogram_totals(&name).await {
+        match answer {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_histograms(
                     &name,
@@ -1951,9 +2008,13 @@ async fn render_backend_metrics(mb: &dyn cog_core::MetricsBackend) -> String {
 
     let (gauge_names, gauge_read) = listed_metric_names(mb, cog_core::MetricType::Gauge).await;
     read_ok &= gauge_read;
-    for name in gauge_names {
+    let gauge_answers = read_each_name(gauge_names, |name| async move {
+        mb.query_gauge_latest(&name).await
+    })
+    .await;
+    for (name, answer) in gauge_answers {
         held.push(name.clone());
-        match mb.query_gauge_latest(&name).await {
+        match answer {
             Ok(samples) => {
                 body.push_str(&prometheus_render::render_gauges(
                     &name,
@@ -3890,6 +3951,55 @@ mod metrics_exposition_tests {
         assert!(
             body.contains("some_future_counter_total{} 3"),
             "后端持有的 counter 必须出现在暴露面上: {body}"
+        );
+    }
+
+    /// 一次抓取要问后端几百个名字，逐个问就是几百次往返。
+    ///
+    /// 慢的不是任何一条查询，是它们加起来：实测这套部署上 `/metrics` 的中位
+    /// 0.7 秒，而有约五分之一的抓取撞上自己的 10 秒超时，读数面上读到的是
+    /// 「这个目标一会儿在、一会儿不在」。这条断言问的是同时有几个按名查询在
+    /// 执行，而不是墙钟——墙钟受机器负载影响，同时数不受。
+    #[tokio::test]
+    async fn a_scrape_asks_the_store_for_many_series_at_once_rather_than_one_after_another() {
+        let mb = crate::test_metrics::TestMetrics::new();
+        let names: Vec<String> = (0..BACKEND_READ_CONCURRENCY * 4)
+            .map(|i| format!("slow_gauge_{i}"))
+            .collect();
+        for (i, name) in names.iter().enumerate() {
+            // 名字在注册表里按 `&'static str` 持有；这里造的是测试用的名字，
+            // 活到进程结束正合适。
+            let pinned: &'static str = Box::leak(name.clone().into_boxed_str());
+            mb.record_gauge(
+                cog_core::MetricName::for_tests_only(pinned),
+                i as f64,
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        }
+        mb.set_read_delay(std::time::Duration::from_millis(20));
+
+        let body = render_backend_metrics(&mb).await;
+
+        for name in &names {
+            assert!(
+                body.contains(name.as_str()),
+                "每个名字的读数都要进 body: 缺 {name}"
+            );
+        }
+        let peak = mb.peak_in_flight();
+        assert!(
+            peak > 1,
+            "按名查询要真地重叠；一次只问一个就是这条测试要挡回去的形状，实测最高 {peak} 个在途"
+        );
+        assert!(
+            peak >= BACKEND_READ_CONCURRENCY,
+            "上限是 {BACKEND_READ_CONCURRENCY} 个同时在途，实测最高 {peak} 个"
+        );
+        assert!(
+            peak <= BACKEND_READ_CONCURRENCY,
+            "同时在途的查询不得超过 {BACKEND_READ_CONCURRENCY}，实测 {peak}"
         );
     }
 
