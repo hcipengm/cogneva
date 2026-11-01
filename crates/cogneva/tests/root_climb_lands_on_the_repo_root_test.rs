@@ -69,14 +69,6 @@ const NOT_ROOT: &[(&str, usize, &str, &str)] = &[
         "deploy/scripts",
         "夹具要的是同级的门脚本所在的目录（deploy/scripts），不是仓库根",
     ),
-    (
-        "deploy/scripts/tests/numeric-declarations-are-tunable.test.sh",
-        1,
-        "deploy/scripts",
-        "扫的是同级的门脚本（deploy/scripts/*.sh）；原先那份靠一处数到根的 ROOT 压着这条门，\
-         而 ROOT 没有任何一格读它，shellcheck 的 SC2034 会因此让脚本 lint 失败——留着一句\
-         没人用的赋值去满足一条门，等于让门读的是一个占位符",
-    ),
 ];
 
 /// 一处上溯：哪个文件第几行、数了几级、算出来的落点。
