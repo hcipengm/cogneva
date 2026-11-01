@@ -182,10 +182,17 @@ pub const UNREACHABLE: ReadingSpec = ReadingSpec {
     dashboard_uid: Some("cogneva-reachability"),
 };
 
-/// How long the upstream CI gate has been holding the tracked revision.
+/// How long the upstream CI gate has been calling this tree red, in one
+/// continuous stretch.
 ///
-/// The chain's first joint: while this is non-zero nothing is being deployed,
-/// whatever the reason, and every other delivery reading is downstream of it.
+/// The chain's first joint, but read as an age and not as a state: the stretch
+/// survives a revision change and survives a round in which the upstream has
+/// not answered yet, so a non-zero value does not mean a hold is on. On
+/// 2026-11-02 this row read 4802 seconds while the state file said
+/// `ci_hold=None` and the verdict was `no_evidence` — the rollout was moving,
+/// only the upstream was still running. `mainline_ci_hold_active` is the row
+/// that answers "is a hold on"; this one answers "how long has it been red",
+/// which is what the four-hour bound is about.
 ///
 /// The critical bound is the alert rule's own number — `mainline_ci_hold_seconds`
 /// fires past four hours — so the board and the pager cannot drift apart. The
@@ -232,6 +239,31 @@ pub const MAINLINE_CI_HOLD_UNOWNED: ReadingSpec = ReadingSpec {
     crit: Some(1.0),
     higher_is_worse: true,
     series: "cogneva_mainline_ci_hold_unowned",
+    produced_by: "crates/cog-reflection/src/mainline_deployer.rs",
+    dashboard_uid: None,
+};
+
+/// Whether a hold is on right now.
+///
+/// The third row of the same joint, and the only one of the three that answers
+/// this question. The duration is a stretch that outlives the hold and the
+/// unowned flag is 0 both when a hold is owned and when there is no hold at
+/// all, so a reader with just those two takes 4802 seconds on a round with
+/// `ci_hold=None` for a hold that is on — which is what happened on 2026-11-02.
+///
+/// There is no threshold: 1 is not a fault (the gate holding a red revision is
+/// the gate working) and the two rows beside it decide when that hold is a
+/// problem. The row is on the board so the duration can be read as an age.
+pub const MAINLINE_CI_HOLD_ACTIVE: ReadingSpec = ReadingSpec {
+    id: "mainline_ci_hold_active",
+    title: "主线此刻被扣住",
+    group: ReadingGroup::Delivery,
+    query: "max(cogneva_mainline_ci_hold_active)",
+    unit: "0/1",
+    warn: None,
+    crit: None,
+    higher_is_worse: true,
+    series: "cogneva_mainline_ci_hold_active",
     produced_by: "crates/cog-reflection/src/mainline_deployer.rs",
     dashboard_uid: None,
 };
@@ -286,7 +318,7 @@ pub const LLM_UPSTREAMS_HEALTHY: ReadingSpec = ReadingSpec {
     dashboard_uid: None,
 };
 
-pub const READINGS: [&ReadingSpec; 10] = [
+pub const READINGS: [&ReadingSpec; 11] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -295,6 +327,7 @@ pub const READINGS: [&ReadingSpec; 10] = [
     &UNREACHABLE,
     &MAINLINE_CI_HOLD,
     &MAINLINE_CI_HOLD_UNOWNED,
+    &MAINLINE_CI_HOLD_ACTIVE,
     &CHANGE_POOL_BLOCKED_OLDEST,
     &LLM_UPSTREAMS_HEALTHY,
 ];

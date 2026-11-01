@@ -2618,20 +2618,24 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     ),
     (
         crate::metric_names::MAINLINE_CI_HOLD_SECONDS.as_str(),
-        "Seconds the rollout has been held by the upstream CI gate: 0 while it is \
-         not held, and the age of the current hold while it is. It is the \
-         observation the hold bound is on -- the state file and the heartbeat \
-         line say that a hold exists and which revision it holds, and this says \
-         how long it has lasted, which is what tells a round that is waiting out \
-         a red upstream from a rollout that has stopped for the week. 0 is a \
-         reading and not an absence: the store only adds and overwrites, so a \
-         hold that ends is written back as 0 by the round that ends it -- and \
-         since the gate fails open (only an explicit failure holds), most rounds \
-         write that 0. No label per revision, for the reason the build-duration \
-         gauge beside it gives: a hold describes one revision, and a series per \
-         revision would leave a permanent row for a value that describes only \
-         itself; the revision is carried by the state file's `ci_hold.rev` and \
-         by the heartbeat's `ci_hold=` cell",
+        "Seconds the upstream CI gate has been calling this tree red in one \
+         continuous stretch: 0 before the first red, and the age of the stretch \
+         while a red is in force. The stretch is not tied to a revision -- a \
+         hold that ends because a newer revision took the head did not end \
+         because CI stopped being red, and changes land about every half hour, \
+         so a per-revision clock sat in the low minutes through a 2.7-hour \
+         stall while the rule that reads it asks for four hours. It is cleared \
+         only when upstream answers that the tree is not red (a pass, a waiver, \
+         or the round that lands this tree), and 0 is written back then: the \
+         store only adds and overwrites, so a value nobody takes back stays \
+         forever. It does NOT answer \"is a hold on right now\" -- an answer \
+         still pending keeps the stretch climbing while nothing is held, which \
+         is the state cogneva_mainline_ci_hold_active exists for. No label per \
+         revision, for the reason the build-duration gauge beside it gives: a \
+         series per revision would leave a permanent row for a value that \
+         describes only that revision, and which revision is being judged is \
+         carried by the state file's `ci_hold.rev` and the heartbeat's \
+         `ci_hold=` cell",
     ),
     (
         crate::metric_names::MAINLINE_CI_HOLD_UNOWNED.as_str(),
@@ -2649,6 +2653,22 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          both mean nobody owns the hold, and a labelled gauge would leave the \
          cells it did not write this round standing at their old values; the \
          distinction is in the log of the same round",
+    ),
+    (
+        crate::metric_names::MAINLINE_CI_HOLD_ACTIVE.as_str(),
+        "1 on a round that holds the rollout because the upstream CI called this \
+         revision red; 0 on every other round, including the round that releases \
+         the hold and the round that lands the tree. It is the only reading that \
+         answers \"is a hold on right now\": the duration gauge beside it \
+         measures one stretch of red across revisions and keeps climbing through \
+         an answer still pending, and the unowned gauge is 0 both on a hold \
+         somebody owns and on no hold at all. Measured 2026-11-02: the duration \
+         read 4802 seconds while the state file said `ci_hold=None` and the \
+         verdict was `no_evidence`, and both a reader and a peer session took \
+         that number to mean a hold was on -- the deployer's actual stop that \
+         round was the build slot, a different cell. 0 is written by every \
+         releasing round, because the store only adds and overwrites and a 1 \
+         nobody takes back is a rule that stays lit",
     ),
     (
         crate::metric_names::MAINLINE_CI_CHECK_EXCLUDED_TOTAL.as_str(),

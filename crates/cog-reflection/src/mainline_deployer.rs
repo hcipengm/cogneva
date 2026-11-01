@@ -4683,8 +4683,10 @@ impl MainlineDeployer {
                 .map(|since| (chrono::Utc::now().timestamp() - since).max(0))
                 .unwrap_or(0);
             self.record_ci_hold_reading(held_secs).await;
-            // 这一轮没有扣住：有没有人接住这个问题也就无从谈起。放行那一支必须把
-            // 上一轮写下的 1 收回来，理由与时长那一格相同——库里只增不改。
+            // 这一轮没有扣住，两格 0/1 一起收回：没人接住时问不出「谁在处理」，
+            // 而「在不在扣住」此刻是一条事实。放行那一支必须把上一轮写下的 1 收
+            // 回来，理由与时长那一格相同——库里只增不改，收不回的 1 永远亮着。
+            self.record_ci_hold_active(false).await;
             self.record_ci_hold_unowned(false).await;
             return Ok(false);
         }
@@ -4733,6 +4735,7 @@ impl MainlineDeployer {
             .map(|since| (now - since).max(0))
             .unwrap_or(0);
         self.record_ci_hold_reading(held_secs).await;
+        self.record_ci_hold_active(true).await;
         // After the hold is on disk: a submission that fails must not cost the
         // record of how long this revision has been held, which is the reading
         // the alert rests on.
@@ -4840,6 +4843,30 @@ impl MainlineDeployer {
             .record_gauge(
                 cog_core::metric_names::MAINLINE_CI_HOLD_SECONDS,
                 held_secs as f64,
+                std::collections::HashMap::new(),
+            )
+            .await;
+    }
+
+    /// 扣住之外的另一格：这一轮**在不在**扣住。
+    ///
+    /// 时长那一格答不了这件事。它量的是一段「这棵树被上游判红」的连续时段，
+    /// 跨版本连续、只在上游明确答不红时清零——于是上游还在跑（`no_evidence`）
+    /// 的轮里，它照旧往上走，而那一刻并没有扣住。2026-11-02 实测：状态文件写着
+    /// `ci_hold=None`、判词 `no_evidence`，这一格印 4802 秒，读的人（和另一个
+    /// 会话）都把它当成了「此刻扣着」。「有没有人接住」那一格也答不了：扣住且有人
+    /// 接手与根本没扣住，它都写 0。
+    ///
+    /// 扣住的分支写 1，放行的分支、扣住结束的分支、这一版真的滚上去的分支各写 0：
+    /// 库里只增不改，一个没人收回的 1 会永远亮着。
+    async fn record_ci_hold_active(&self, held: bool) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+        let _ = metrics
+            .record_gauge(
+                cog_core::metric_names::MAINLINE_CI_HOLD_ACTIVE,
+                if held { 1.0 } else { 0.0 },
                 std::collections::HashMap::new(),
             )
             .await;
@@ -6604,6 +6631,8 @@ impl MainlineDeployer {
                 if state.ci_hold_run_since_unix.take().is_some() {
                     self.record_ci_hold_reading(0).await;
                 }
+                // 这一版滚上去了，也就没有扣住可言：两条时长读数一起收回。
+                self.record_ci_hold_active(false).await;
                 self.save_state(&state)?;
                 return Ok(());
             }
@@ -6887,7 +6916,10 @@ impl MainlineDeployer {
                 self.record_ci_hold_reading(0).await;
             }
             // 这一次扣住到此为止，无论上面按哪种结局结束：不再扣住的一轮没有
-            // 「有没有人接手」可问，留着上一轮的 1 会让读它的规则继续点着。
+            // 「有没有人接手」可问，留着上一轮的 1 会让读它的规则继续点着。时长
+            // 那一格在 `rev_no_longer_tracked` 上故意不停（问题还没答案），
+            // 「在不在扣住」这一格必须停：此时确实没有扣住。
+            self.record_ci_hold_active(false).await;
             self.record_ci_hold_unowned(false).await;
             state.ci_hold_ends.push(ended);
             let excess = state.ci_hold_ends.len().saturating_sub(CI_HOLD_END_KEEP);
@@ -17275,6 +17307,81 @@ exec {real} "$@"
         assert!(
             (chrono::Utc::now().timestamp() - held.since_unix) < 5,
             "这一版自己的起点是新的：两格答的不是同一个问题"
+        );
+        handle.await.unwrap();
+    }
+
+    /// 时长不为零，不等于此刻扣着。
+    ///
+    /// 2026-11-02 现场：状态文件写着 `ci_hold=None`、本轮判词 `no_evidence`，而
+    /// 时长那一格读 4802 秒——它量的是一整段「这棵树被上游判红」的墙钟，换版与
+    /// 「上游还没答」都不清零。读的人（连同另一个会话）把它当成了「此刻扣着」，
+    /// 于是去查一个并不存在的扣住。两件事的处置相反：扣着是主线停住，要去看上游；
+    /// 不扣着是主线在往前滚，下一秒就该有构建。
+    ///
+    /// 这一格是新加的 0/1，与时长那一格**故意不同步**：上游还没答的那一轮，时长
+    /// 要留着（问题还没有答案），这一格不能留（此刻确实没扣住）。
+    #[tokio::test]
+    async fn a_running_stretch_does_not_mean_a_hold_is_on() {
+        use cog_core::metric_names::{MAINLINE_CI_HOLD_ACTIVE, MAINLINE_CI_HOLD_SECONDS};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        // 第一问报红；第二问上游还在跑（一次 check-runs，一次提交状态兜底）。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","status":"in_progress"}]}"#),
+            http_200("{}"),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+        let read = |name: &'static str| {
+            let metrics = metrics.clone();
+            async move {
+                metrics
+                    .query_gauge_latest(name)
+                    .await
+                    .unwrap()
+                    .first()
+                    .map(|s| s.value)
+            }
+        };
+
+        // 真扣住的那一轮：两格同时亮，1 与时长说的是一件事。
+        let mut state = deployer.load_state();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+        assert_eq!(
+            read(MAINLINE_CI_HOLD_ACTIVE.as_str()).await,
+            Some(1.0),
+            "扣住的那一轮，「在不在扣住」要写 1，否则这一格根本没人写"
+        );
+
+        // 这一段一小时前就开始了，上游换了一版而新的那一版还在跑。
+        let an_hour_ago = chrono::Utc::now().timestamp() - 3600;
+        state.ci_hold_run_since_unix = Some(an_hour_ago);
+        deployer.save_state(&state).unwrap();
+        let mut state = deployer.load_state();
+        assert!(!deployer
+            .hold_if_ci_reports_failure(&mut state, "def456", CiAsk::BeforeBuild)
+            .await
+            .unwrap());
+
+        let aged = read(MAINLINE_CI_HOLD_SECONDS.as_str()).await.unwrap();
+        assert!(
+            (3600.0..3720.0).contains(&aged),
+            "上游没答，那一段还没结束，时长要留着，读到的是 {aged}"
+        );
+        assert_eq!(
+            read(MAINLINE_CI_HOLD_ACTIVE.as_str()).await,
+            Some(0.0),
+            "同一拍里没有扣住：这一格若跟着时长一起留着，4802 秒那次误读就会重演"
         );
         handle.await.unwrap();
     }

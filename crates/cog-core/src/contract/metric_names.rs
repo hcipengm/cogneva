@@ -1031,6 +1031,24 @@ metric_names! {
     // 0 is written by the round that releases the hold, for the reason the
     // duration gauge above gives: a 1 nobody takes back stays lit forever.
     MAINLINE_CI_HOLD_UNOWNED => "cogneva_mainline_ci_hold_unowned",
+    // 1 on a round that holds the rollout because the upstream CI reported a
+    // failure; 0 on every other round.
+    //
+    // Neither gauge above answers this. The duration measures one stretch of
+    // "this tree is red upstream": it is continuous across revisions and
+    // cleared only when upstream says the tree is not red, so through a
+    // pending answer it keeps climbing while nothing is held -- on 2026-11-02
+    // it read 4802 seconds at a moment when the state file said `ci_hold=None`
+    // and the verdict was `no_evidence`, and a reader took the number for "a
+    // hold is on". The unowned gauge is 0 both on a hold somebody owns and on
+    // no hold at all, so it cannot answer it either. Without this cell the
+    // only surface that says whether a hold exists now is the heartbeat line,
+    // which dies with the pod that wrote it.
+    //
+    // 0 is written by the round that releases the hold and by the round that
+    // lands the tree, for the reason the two gauges above give: a 1 nobody
+    // takes back stays lit forever.
+    MAINLINE_CI_HOLD_ACTIVE => "cogneva_mainline_ci_hold_active",
     // Consecutive rounds in which the advance could not take the host's build
     // slot, as a gauge; 0 on the round that takes one.
     //
