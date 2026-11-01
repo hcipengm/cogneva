@@ -16,6 +16,7 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$(cd "$HERE/.." && pwd)"
+REPO="$(cd "$HERE/../../.." && pwd)"
 
 pass=0; fail=0
 ok()  { printf 'ok    - %s\n' "$1"; pass=$((pass + 1)); }
@@ -53,7 +54,16 @@ out="$(scan "$T/switch.sh" | grep -vE '=[01]$' || true)"
 
 # --- 真树：扫得出来、且全都合格 ---
 files=("$SCRIPTS"/*.sh)
-[ "${#files[@]}" -gt 50 ] && ok "扫到 ${#files[@]} 个部署脚本" || bad "扫描面太窄：${#files[@]} 个脚本"
+# 另一棵**CI 直接跑**的脚本树。判据只看一棵树时，同一类数在另一棵里写死不会红，
+# 而两棵树的运行者没有区别——都是别人机器上的运维动作。
+gh_scripts=("$REPO"/.github/scripts/*.sh)
+[ -e "${gh_scripts[0]}" ] && files+=("${gh_scripts[@]}")
+[ "${#files[@]}" -gt 50 ] && ok "扫到 ${#files[@]} 个脚本（含 ${#gh_scripts[@]} 个 .github/scripts）" \
+    || bad "扫描面太窄：${#files[@]} 个脚本"
+# 反空洞的另一半：另一棵树真的被扫进来了，而不是一个没展开的 glob。
+[ -e "${gh_scripts[0]}" ] \
+    && ok ".github/scripts 那棵树在扫描面里" \
+    || bad ".github/scripts 那棵树没被扫到（glob 没展开）"
 
 bad_lines="$(scan "${files[@]}" | grep -vE '=[01]$' || true)"
 if [ -z "$bad_lines" ]; then
