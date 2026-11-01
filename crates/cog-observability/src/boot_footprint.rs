@@ -118,6 +118,7 @@ pub const PHASES: &[&str] = &[
     "embedding-dense",
     "embedding-sparse",
     "reranker",
+    "memory-plugin-initialized",
     "plugins-initialized",
     "serving",
 ];

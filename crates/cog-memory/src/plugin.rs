@@ -422,6 +422,12 @@ impl cog_core::SystemPlugin for MemoryPlugin {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = embedding_repair;
 
+        // 这个插件是全部插件里唯一在 init 里整份加载持久状态的一个（summary 层
+        // `load()`），所以「模型都装完之后又涨了多少」这件事，先说清是不是它。没有这
+        // 一格时，那一段全部记在 `plugins-initialized` 名下，而那个名字盖着二十几个插件，
+        // 读的人只能在「某个插件贵」与「每个都贵一点」之间猜。
+        crate::boot_mark::mark("memory-plugin-initialized");
+
         self.initialized = true;
         Ok(())
     }
