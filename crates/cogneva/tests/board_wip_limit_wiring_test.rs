@@ -33,27 +33,7 @@ const VALUES_KEY: &str = "wipLimits:";
 
 /// `values.yaml` 里 `board:` 段的 `wipLimits` 值（去掉引号与行尾注释）。
 fn values_wip_limits() -> Option<String> {
-    let values = read_repo(VALUES_YAML);
-    let mut inside = false;
-    for line in values.lines() {
-        if line.starts_with(VALUES_BLOCK) {
-            inside = true;
-            continue;
-        }
-        if !inside {
-            continue;
-        }
-        // 段的下一条顶格键就是出口：values 顶层键都不缩进。
-        if !line.starts_with(' ') && !line.trim().is_empty() {
-            return None;
-        }
-        let Some(rest) = line.trim().strip_prefix(VALUES_KEY) else {
-            continue;
-        };
-        let value = rest.split('#').next().unwrap_or("").trim();
-        return Some(value.trim_matches('"').to_string());
-    }
-    None
+    common::yaml::values_entry(VALUES_YAML, VALUES_BLOCK, VALUES_KEY)
 }
 
 /// 把 env 名送到 Pod 的那一行：名字在左，取值来自 `.Values`。

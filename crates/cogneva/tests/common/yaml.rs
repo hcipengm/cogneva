@@ -11,6 +11,39 @@
 
 use serde::Deserialize;
 
+/// `values.yaml` 里某个顶层段下一行键的取值（去掉引号与行尾注释）。
+///
+/// 三份部署面测试各自抄过一遍这段，抄件对「键不在这一段里」的处理都一样地静默：
+/// 找不到就 `None`，而它们要判的正好是「这个键在不在」。抄件还有第二种走法——
+/// 引用一个不存在的 `.Values` 键会渲染成空串而不报错，于是「没配」与「配了没生效」
+/// 在两侧都不出声。这一份留在这里，读不出来的那一支由调用方点名报错。
+///
+/// `block` 的匹配沿用原写法（行首前缀，含冒号）：段里带冒号的兄弟键要先命中自己
+/// 那一行，所以调用方给的 key 必须带冒号。
+pub fn values_entry(file: &str, block: &str, key: &str) -> Option<String> {
+    let values = crate::common::routes::read_repo(file);
+    let mut inside = false;
+    for line in values.lines() {
+        if line.starts_with(block) {
+            inside = true;
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        // 段的下一条顶格键就是出口：values 顶层键都不缩进。
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            return None;
+        }
+        let Some(rest) = line.trim().strip_prefix(key) else {
+            continue;
+        };
+        let value = rest.split('#').next().unwrap_or("").trim();
+        return Some(value.trim_matches('"').to_string());
+    }
+    None
+}
+
 /// `text` 里的每一篇 YAML 文档，按出现顺序；空文档（`---` 之间什么都没有）不算一篇。
 ///
 /// 解析不出来的文档是**失败**，不是跳过：丢掉它就把它带的规则一起丢掉了，闸门会在一片

@@ -38,6 +38,24 @@ repo="$(cd "${here}/../../.." && pwd)"
 gc="${repo}/deploy/scripts/host-target-gc.sh"
 fail() { echo "FAIL: $*"; exit 1; }
 
+# A stand-in for a running `cargo`: an ordinary program copied under that name,
+# because the gate matches a builder by process name and the name is the file's.
+#
+# Not `sleep`. On the runners whose coreutils is the multi-call build (the
+# Ubuntu 26 image), a copy of `sleep` dispatches on argv[0] and dies with
+# "coreutils: unknown program 'cargo'" -- the process never appears, and every
+# assertion below it would hold while measuring nothing. The self-check after
+# the first pair is what makes that a failure instead of a silent pass; this is
+# what keeps it from happening at all. bash answers to whatever its file is
+# called, and it is the one program this file already assumes.
+#
+# Never a single command in the `-c` script: bash execs the last one in place,
+# and the process name would follow the exec.
+fake_cargo() {
+  mkdir -p "$(dirname "$1")"
+  cp "$(command -v bash)" "$1"
+}
+
 work="$(mktemp -d)"
 fake_pids=()
 cleanup() {
@@ -217,13 +235,13 @@ byname="$(new_tree byname "${signature}")"
 byopen="$(new_tree byopen "${signature}")"
 # Leg one: a process that builds, recognised by its name, sitting in its own
 # worktree — the tree it writes follows from its working directory.
-cp "$(command -v sleep)" "${work}/cargo"
-( cd "${byname}" && exec "${work}/cargo" 60 ) &
+fake_cargo "${work}/cargo"
+( cd "${byname}" && exec "${work}/cargo" -c 'sleep 60; :' ) &
 fake_pids+=("$!")
 # Leg two: a process that builds with its working directory somewhere else,
 # writing into this tree — visible only through an open file descriptor. An fd
 # is inherited across exec, so the process really holds this file open.
-( cd "${work}" && exec 8<"${byopen}/debug/deps/libstale.rlib" && exec "${work}/cargo" 60 ) &
+( cd "${work}" && exec 8<"${byopen}/debug/deps/libstale.rlib" && exec "${work}/cargo" -c 'sleep 60; :' ) &
 fake_pids+=("$!")
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ "$(pgrep -u "$(id -u)" -x cargo | wc -l)" -ge 2 ] && break
@@ -281,10 +299,10 @@ fi
 # A copy of its own: the run above is still executing `${work}/cargo`, and
 # writing over a file that is being executed is ETXTBSY.
 mkdir -p "${work}/zombie"
-cp "$(command -v sleep)" "${work}/zombie/cargo"
+fake_cargo "${work}/zombie/cargo"
 python3 - "${work}/zombie/cargo" <<'PY' &
 import subprocess, sys, time
-subprocess.Popen([sys.argv[1], "0"])  # exits at once, and is never waited for
+subprocess.Popen([sys.argv[1], "-c", "exit 0"])  # exits at once, and is never waited for
 time.sleep(60)
 PY
 fake_pids+=("$!")

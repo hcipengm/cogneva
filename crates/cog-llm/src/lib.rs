@@ -37,6 +37,13 @@ pub use stream::{parse_sse_stream, LLMStream};
 
 pub mod plugin;
 
+/// 指标标签名：失败原因。
+///
+/// 这一族名字每个 crate 各写一遍（编译器不比较），所以拼错的那个不会有任何
+/// 报错，读数面读到的只会是一族空向量。本 crate 只依赖 `cog-core`，引用不到
+/// 别人那份；按同树既有形状在这里再声明一次，名字由那条判据统一对齐。
+pub const LABEL_REASON: &str = "reason";
+
 #[cfg(test)]
 mod tests {
     use super::*;

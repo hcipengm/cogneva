@@ -120,7 +120,7 @@ impl Observable for LlmObservable {
                 };
                 metrics.push(
                     RawMetric::new("llm_error_count", count.load(Ordering::Relaxed) as f64)
-                        .with_label("reason", failure.as_str()),
+                        .with_label(crate::LABEL_REASON, failure.as_str()),
                 );
             }
             if calls > 0 {
