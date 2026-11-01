@@ -1890,6 +1890,7 @@ pub const OBSERVABLES_REGISTERED_METRIC: &str = "cogneva_observables_registered"
 /// scrape that asks for more connections than exist does not finish sooner --
 /// it queues, and it holds connections the writers whose work it is about to
 /// read would otherwise have.
+// cap: bound — 一个抓取同时占住的连接数上限；远低于连接池上限（默认 50），留给正在写这些读数的写者
 const BACKEND_READ_CONCURRENCY: usize = 8;
 
 /// A label value with the three characters the text format reserves escaped.
