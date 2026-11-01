@@ -56,8 +56,24 @@ grep -qF "account.refresh, overview.refresh]" "${work}/web/src/views/TokenView.t
 expect_red "额度窗不跟帧" "没把池子的那份读数跟花销几读一起交给"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
-got=0
-bash "${checker}" "${repo}" >"${work}/real.out" 2>&1 || got=$?
-[ "${got}" -eq 0 ] || { cat "${work}/real.out" >&2; fail "真树上红了"; }
+#
+# 这道门要 `web/node_modules/.bin/tsc`（它把 `frameTick` 编译出来在 node 里实跑），
+# 而跑这份测试的作业（Entry Scripts Lint）有意不装 web 依赖——那份额外的工具链只
+# 活在 Web Build 作业里。于是：
+#   - tsc 在位（本机、以及装了依赖的作业）：照旧跑真树，红就是红。
+#   - tsc 不在位：明写一行「谁在替它看」，并且**把那个前提也判一次**——真树由
+#     ci.yml 里 Web Build 那一跑同一条门的步骤覆盖。那一步被删掉时这里立刻红，
+#     跳过就不会悄悄变成「没人看」，而「跳过」在作业摘要上与「通过」同形。
+if [ -x "${repo}/web/node_modules/.bin/tsc" ]; then
+  got=0
+  bash "${checker}" "${repo}" >"${work}/real.out" 2>&1 || got=$?
+  [ "${got}" -eq 0 ] || { cat "${work}/real.out" >&2; fail "真树上红了"; }
+  echo "ok   - 真树（本作业有 tsc）"
+else
+  grep -qF 'bash deploy/scripts/check-web-stream-driven-refresh.sh' \
+    "${repo}/.github/workflows/ci.yml" \
+    || fail "本作业没有 tsc，而 ci.yml 也不再跑这条门：真树没人看了"
+  echo "skip - 真树：本作业没有 web/node_modules/.bin/tsc；真树由 ci.yml 的 Web Build 作业跑同一条门"
+fi
 
 echo "web-stream-driven-refresh.test: all checks passed"
