@@ -11512,6 +11512,48 @@ mod tests {
         assert!(!table.note_success(&u, true));
     }
 
+    /// 窗内再失败一次不疼，窗到期之后才疼——疼到什么程度也一起钉住。
+    ///
+    /// 两条相反的力作用在同一个计数器上：首字节前的并发失败会在同一个窗里连着
+    /// 报到，每一条都算一档的话一次事故就能把指数打飞；而复测仍然失败就该退得更
+    /// 远，否则一台上游坏了以后每 30 秒还去撞一次。所以窗内只吸收上游这一拍才
+    /// 给出来的证据（复位时刻、窗口长度），不重开窗、不抬计数；窗到期后的第一条
+    /// 失败才 `+1`。
+    ///
+    /// 周期类且没报复位时刻的那一支从 30 秒起步，第二档是 60——不是 300 秒的探测
+    /// 间隔。这一格以前只由探测器那条路径间接证明，直接问 `note_failure` 的一直是
+    /// 那条「静默」断言，秒数从没被数过。
+    #[test]
+    fn only_a_failure_after_the_window_expires_counts_and_stretches_it() {
+        let table = LlmHealthTable::default();
+        let u = stub_upstream("https://a.example.com", "m1");
+        assert_eq!(
+            table.note_failure(&u, 300, None, None, Some(RefusalKind::QuotaCycle)),
+            Some((1, RATE_LIMIT_BACKOFF_BASE_SECS))
+        );
+        assert_eq!(
+            table.note_failure(&u, 300, None, None, Some(RefusalKind::QuotaCycle)),
+            None,
+            "窗内的重复失败不重开窗"
+        );
+        {
+            let states = table.states.lock().unwrap();
+            let entry = states.get(&LlmHealthTable::key(&u)).expect("窗开过");
+            assert_eq!(entry.consecutive_failures, 1, "窗内的失败不进计数");
+        }
+        {
+            let mut states = table.states.lock().unwrap();
+            let entry = states.get_mut(&LlmHealthTable::key(&u)).expect("窗开过");
+            entry.suspect_until =
+                Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        }
+        assert_eq!(
+            table.note_failure(&u, 300, None, None, Some(RefusalKind::QuotaCycle)),
+            Some((2, RATE_LIMIT_BACKOFF_BASE_SECS * 2)),
+            "到期后再失败一档：窗长跟着曲线走，起点仍是 30 秒那条"
+        );
+    }
+
     /// 探测通过清嫌疑、但不算"送出过一件活"。
     ///
     /// 现场形状：池四天没送出任何一件活（`max_tokens: 1` 的探测每拍都通），

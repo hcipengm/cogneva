@@ -83,6 +83,17 @@ pub fn claim_concurrency() -> usize {
     }
 }
 
+/// 本进程的在途执行预算：闸门本身，加上配出去的那个数。
+///
+/// 两者成对传，是因为它们必须成对读：`slots` 是真正拦在路上的许可，`limit` 是
+/// 报给读数面的预算。分成两个参数时，「许可几条」与「读数说几条」是两个可以各自
+/// 漂走的数——写死常量的时候正是这样，谁也看不见它。
+#[derive(Clone)]
+struct ClaimBudget {
+    slots: Arc<tokio::sync::Semaphore>,
+    limit: usize,
+}
+
 /// Dispatcher that routes ready tasks to the first [`TaskExecutor`] whose
 /// [`TaskExecutor::supports`] returns `true`.
 /// Decouples the orchestrator from concrete execution crates
@@ -157,6 +168,11 @@ impl TaskExecutorRouter {
         let claim_concurrency = claim_concurrency();
         let claim_slots = Arc::new(tokio::sync::Semaphore::new(claim_concurrency));
 
+        let claim = ClaimBudget {
+            slots: claim_slots,
+            limit: claim_concurrency,
+        };
+
         let loops = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role)
             .into_iter()
             .map(|ready_stream| {
@@ -165,8 +181,7 @@ impl TaskExecutorRouter {
                     result_backend.clone(),
                     ready_stream,
                     workspace_id.to_string(),
-                    claim_slots.clone(),
-                    claim_concurrency,
+                    claim.clone(),
                     shutdown.clone(),
                 )
             });
@@ -185,10 +200,14 @@ impl TaskExecutorRouter {
         result_backend: Arc<dyn MessageBackend>,
         ready_stream: String,
         workspace_id: String,
-        claim_slots: Arc<tokio::sync::Semaphore>,
-        claim_concurrency: usize,
+        claim: ClaimBudget,
         shutdown: ShutdownSignal,
     ) -> SFResult<()> {
+        // 闸门与它报出去的预算一起进来、一起用：分开传时，「真正许可几条」与
+        // 「读数面说几条」是两个各走各的数，而它们不一致正是这个数被写死时
+        // 没人看得见的原因。
+        let claim_slots = claim.slots;
+        let claim_concurrency = claim.limit;
         // Use a stable group name per workspace so that pod restacks do not
         // leak an unbounded number of consumer groups and so messages are not
         // lost when a new pod takes over. The group name intentionally omits
@@ -1650,9 +1669,14 @@ mod claim_concurrency_tests {
     }
 
     /// 默认值本身必须是一个能用的数：`0` 作为兜底会把「没配」变成「全停」。
+    ///
+    /// 两条都是常量之间的关系，所以在编译期判：写错的那一天编译不过，而不是等到
+    /// 有人把测试跑起来。
     #[test]
     fn the_default_is_a_usable_limit() {
-        assert!(DEFAULT_CLAIM_CONCURRENCY > 0);
-        assert!(DEFAULT_CLAIM_CONCURRENCY < CLAIM_BATCH);
+        const {
+            assert!(DEFAULT_CLAIM_CONCURRENCY > 0);
+            assert!(DEFAULT_CLAIM_CONCURRENCY < CLAIM_BATCH);
+        }
     }
 }
