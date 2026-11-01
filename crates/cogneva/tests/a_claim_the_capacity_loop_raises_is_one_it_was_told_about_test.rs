@@ -36,35 +36,138 @@ use std::path::Path;
 
 const MOUNTS_ENV: &str = "COGNEVA_DATA_VOLUME_MOUNTS";
 
-/// The rendered workloads the check runs over. One profile is enough: the
-/// workload shapes do not vary by profile, only their numbers do, and the
-/// freshness gate keeps this directory equal to the chart.
-fn rendered_workloads() -> Vec<serde_yaml::Value> {
+const OCCUPANCY_URL_ENV: &str = "COGNEVA_CLAIM_STORE_METRICS_URL";
+
+/// Every manifest in a rendered profile, keyed by nothing — the checks below ask
+/// for kinds, so the documents are all kept and filtered at the use.
+fn rendered_documents() -> Vec<serde_yaml::Value> {
     let dir = repo_root().join("deploy/rendered/k3s-single");
     let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-    let mut out = Vec::new();
     let mut paths: Vec<_> = entries
         .filter_map(|e| e.ok())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "yaml"))
         .collect();
     paths.sort();
+    let mut out = Vec::new();
     for path in paths {
         let text =
             std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         for doc in serde_yaml::Deserializer::from_str(&text) {
             let value = serde_yaml::Value::deserialize(doc)
                 .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-            let kind = value
-                .get("kind")
-                .and_then(|k| k.as_str())
-                .unwrap_or_default();
-            if matches!(kind, "Deployment" | "DaemonSet" | "StatefulSet") {
+            if !value.is_null() {
                 out.push(value);
             }
         }
     }
     out
+}
+
+fn kind(value: &serde_yaml::Value) -> &str {
+    value
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .unwrap_or_default()
+}
+
+fn pod_template_labels(workload: &serde_yaml::Value) -> std::collections::BTreeMap<String, String> {
+    workload
+        .get("spec")
+        .and_then(|s| s.get("template"))
+        .and_then(|t| t.get("metadata"))
+        .and_then(|m| m.get("labels"))
+        .and_then(|l| l.as_mapping())
+        .map(|m| {
+            m.iter()
+                .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn selector_labels(
+    selector: Option<&serde_yaml::Value>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let m = selector?.get("matchLabels")?.as_mapping()?;
+    Some(
+        m.iter()
+            .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+            .collect(),
+    )
+}
+
+/// A selector matches when every label it names is held with that value; an
+/// empty selector matches everything it is asked about.
+fn selects(
+    selector: &std::collections::BTreeMap<String, String>,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    selector.iter().all(|(k, v)| labels.get(k) == Some(v))
+}
+
+/// A plain label map, which is the shape a Service selects pods with.
+fn plain_labels(
+    value: Option<&serde_yaml::Value>,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let m = value?.as_mapping()?;
+    Some(
+        m.iter()
+            .filter_map(|(k, v)| Some((k.as_str()?.to_string(), v.as_str()?.to_string())))
+            .collect(),
+    )
+}
+
+/// Whether this container publishes a reading rather than raising declarations.
+///
+/// The volume walker declares the claim it walks so its figure lands on the
+/// right volume; it holds no write access to a declaration and runs none of
+/// these decisions. The parties below are the processes that build.
+fn is_volume_walker(container: &serde_yaml::Value) -> bool {
+    let mut words: Vec<String> = Vec::new();
+    for key in ["command", "args"] {
+        if let Some(seq) = container.get(key).and_then(|c| c.as_sequence()) {
+            words.extend(seq.iter().filter_map(|w| w.as_str()).map(str::to_string));
+        }
+    }
+    words.iter().any(|w| w == "volume-walker")
+}
+
+/// `claim=path` pairs a container declares for the purpose of raising them.
+fn raising_mounts(container: &serde_yaml::Value) -> BTreeSet<(String, String)> {
+    if is_volume_walker(container) {
+        return BTreeSet::new();
+    }
+    declared_mounts(container)
+}
+
+/// `http://host:port/path` into the two parts an allowlist is written with.
+fn split_url(url: &str) -> Option<(String, u16)> {
+    let rest = url.strip_prefix("http://")?;
+    let authority = rest.split('/').next()?;
+    let (host, port) = authority.rsplit_once(':')?;
+    Some((host.to_string(), port.parse().ok()?))
+}
+
+/// The container env by name, first value wins.
+fn env_value(containers: &[serde_yaml::Value], name: &str) -> Option<String> {
+    containers.iter().find_map(|c| {
+        c.get("env")?.as_sequence()?.iter().find_map(|e| {
+            (e.get("name")?.as_str()? == name)
+                .then(|| e.get("value").and_then(|v| v.as_str()).map(str::to_string))
+                .flatten()
+        })
+    })
+}
+
+/// The rendered workloads the check runs over. One profile is enough: the
+/// workload shapes do not vary by profile, only their numbers do, and the
+/// freshness gate keeps this directory equal to the chart.
+fn rendered_workloads() -> Vec<serde_yaml::Value> {
+    rendered_documents()
+        .into_iter()
+        .filter(|d| matches!(kind(d), "Deployment" | "DaemonSet" | "StatefulSet"))
+        .collect()
 }
 
 /// `claim=path` pairs a container declares.
@@ -249,7 +352,350 @@ fn the_variable_name_checked_here_is_the_one_the_loop_reads() {
     assert_eq!(exposed, MOUNTS_ENV);
     assert!(
         text.contains("MOUNTS_ENV"),
-        "{} 里找不到 MOUNTS_ENV：消费者改名了，这条判据读的就不是它了",
+        "{} 里找不到 MOUNTS_ENV：消费者改名了，这条判据读的不是它了",
         Path::new("crates/cog-core/src/claim_footprint.rs").display()
     );
+    assert_eq!(
+        cog_reflection::volume_capacity::OCCUPANCY_URL_ENV,
+        OCCUPANCY_URL_ENV,
+        "容量循环读的变量名改了，这条判据读的不是它了"
+    );
+}
+
+/// The workloads that may change a claim's declaration.
+///
+/// A pod can raise a declaration only if its ServiceAccount is bound to a Role
+/// that grants a write verb on `persistentvolumeclaims`, and the binding in this
+/// namespace is a RoleBinding. That is the whole of the permission, so it is also
+/// the whole of the set this check has to cover: a workload that gains the write
+/// permission by any other route is a widening nobody here would see anyway.
+fn workloads_that_may_raise(documents: &[serde_yaml::Value]) -> BTreeSet<String> {
+    let sequence_of = |value: Option<&serde_yaml::Value>| -> Vec<String> {
+        value
+            .and_then(|v| v.as_sequence())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.as_str())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let mut writing_roles: BTreeSet<String> = BTreeSet::new();
+    for role in documents.iter().filter(|d| kind(d) == "Role") {
+        let Some(name) = role
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+        else {
+            continue;
+        };
+        let writes = role
+            .get("rules")
+            .and_then(|r| r.as_sequence())
+            .map(|rules| {
+                rules.iter().any(|rule| {
+                    let core_group = {
+                        let groups = sequence_of(rule.get("apiGroups"));
+                        groups.iter().any(|g| g.is_empty() || g == "*")
+                    };
+                    let claims = {
+                        let resources = sequence_of(rule.get("resources"));
+                        resources
+                            .iter()
+                            .any(|r| r == "persistentvolumeclaims" || r == "*")
+                    };
+                    let writes = {
+                        let verbs = sequence_of(rule.get("verbs"));
+                        verbs
+                            .iter()
+                            .any(|v| matches!(v.as_str(), "patch" | "update" | "*"))
+                    };
+                    core_group && claims && writes
+                })
+            })
+            .unwrap_or(false);
+        if writes {
+            writing_roles.insert(name.to_string());
+        }
+    }
+
+    let mut writers: BTreeSet<String> = BTreeSet::new();
+    for binding in documents.iter().filter(|d| kind(d) == "RoleBinding") {
+        let role = binding
+            .get("roleRef")
+            .and_then(|r| r.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or_default();
+        if !writing_roles.contains(role) {
+            continue;
+        }
+        let Some(subjects) = binding.get("subjects").and_then(|s| s.as_sequence()) else {
+            continue;
+        };
+        for subject in subjects {
+            if subject.get("kind").and_then(|k| k.as_str()) != Some("ServiceAccount") {
+                continue;
+            }
+            if let Some(name) = subject.get("name").and_then(|n| n.as_str()) {
+                writers.insert(name.to_string());
+            }
+        }
+    }
+
+    documents
+        .iter()
+        .filter(|d| matches!(kind(d), "Deployment" | "DaemonSet" | "StatefulSet"))
+        .filter(|d| {
+            let sa = d
+                .get("spec")
+                .and_then(|s| s.get("template"))
+                .and_then(|t| t.get("spec"))
+                .and_then(|s| s.get("serviceAccountName"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("default");
+            writers.contains(sa)
+        })
+        .filter_map(|d| {
+            d.get("metadata")
+                .and_then(|m| m.get("name"))
+                .and_then(|n| n.as_str())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+fn containers_of(workload: &serde_yaml::Value) -> Vec<serde_yaml::Value> {
+    workload
+        .get("spec")
+        .and_then(|s| s.get("template"))
+        .and_then(|t| t.get("spec"))
+        .and_then(|s| s.get("containers"))
+        .and_then(|c| c.as_sequence())
+        .map(|cs| cs.to_vec())
+        .unwrap_or_default()
+}
+
+/// The pod that raises declarations is given an address for the claims it
+/// cannot measure.
+///
+/// It mounts a handful of claims; the namespace holds more than a dozen, and
+/// every other one belongs to a workload whose image this platform does not
+/// write. The figure for those exists — the process that walks the node's
+/// storage root publishes it — but a figure nothing reads is not a channel.
+/// Without this variable the loop decides nothing about them every round, and
+/// `unmeasured` reads the same from outside as a volume that stopped growing.
+///
+/// The address is checked against the objects it has to resolve to, in the same
+/// render: a Service of that name, carrying that port, whose selector is met by
+/// a workload that exists. A URL nobody answers is worse than none — it reads
+/// as a wired channel.
+///
+/// The set of pods is derived from the permission to raise, not from a list of
+/// names: any workload that gains the write permission has to be given the
+/// channel in the same change, or this reds.
+#[test]
+fn the_pod_that_raises_claims_is_given_the_endpoint_the_others_publish_on() {
+    let documents = rendered_documents();
+    let raisers = workloads_that_may_raise(&documents);
+    assert!(
+        !raisers.is_empty(),
+        "渲染集里没有任何工作负载持有改卷声明的权限：这条判据的分母塌了"
+    );
+
+    for workload in documents
+        .iter()
+        .filter(|d| matches!(kind(d), "Deployment" | "DaemonSet" | "StatefulSet"))
+    {
+        let name = workload
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("<unnamed>");
+        if !raisers.contains(name) {
+            continue;
+        }
+        let containers = containers_of(workload);
+        let declared: BTreeSet<(String, String)> =
+            containers.iter().flat_map(raising_mounts).collect();
+        assert!(
+            !declared.is_empty(),
+            "{name} 持有改卷声明的权限，却没声明 {MOUNTS_ENV}：它一张卷都不量"
+        );
+
+        let url = env_value(&containers, OCCUPANCY_URL_ENV).unwrap_or_else(|| {
+            panic!(
+                "{name} 跑容量循环（声明了 {MOUNTS_ENV}），却没拿到 {OCCUPANCY_URL_ENV}：\
+                 别的 Pod 写的那些卷它每一拍都读成 unmeasured，声明永远不抬"
+            )
+        });
+        assert!(
+            !url.trim().is_empty(),
+            "{name} 的 {OCCUPANCY_URL_ENV} 是空串：读起来就是这条通道关着"
+        );
+        let (host, port) = split_url(&url)
+            .unwrap_or_else(|| panic!("{name} 的地址 {url} 不是 http://host:port/…"));
+        let service_name = host.split('.').next().unwrap_or_default().to_string();
+
+        let service = documents
+            .iter()
+            .find(|d| {
+                kind(d) == "Service"
+                    && d.get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some(service_name.as_str())
+            })
+            .unwrap_or_else(|| panic!("{name} 的地址指向 Service {service_name}，渲染集里没有它"));
+        let ports: Vec<u16> = service
+            .get("spec")
+            .and_then(|s| s.get("ports"))
+            .and_then(|p| p.as_sequence())
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(|p| p.get("port").and_then(|n| n.as_u64()))
+                    .filter_map(|n| u16::try_from(n).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            ports.contains(&port),
+            "{name} 的地址用的是 {port}，而 Service {service_name} 只提供 {ports:?}"
+        );
+
+        // The Service's selector has to reach the pods that publish the figure.
+        let service_selector = plain_labels(service.get("spec").and_then(|s| s.get("selector")))
+            .unwrap_or_else(|| panic!("Service {service_name} 没有选择器，没有人会接住它"));
+        let publishers: Vec<&serde_yaml::Value> = documents
+            .iter()
+            .filter(|d| matches!(kind(d), "Deployment" | "DaemonSet" | "StatefulSet"))
+            .filter(|d| selects(&service_selector, &pod_template_labels(d)))
+            .collect();
+        assert!(
+            !publishers.is_empty(),
+            "Service {service_name} 的选择器没有任何工作负载接住：那个地址上没有人发布读数"
+        );
+    }
+}
+
+/// The egress allowlist the raising pod is under admits the address it was
+/// given.
+///
+/// These pods have a default-deny egress policy; an address that is not on the
+/// allowlist is dropped, and a dropped scrape is a warn in the log beside a
+/// reading that says volumes are unmeasured. The env derives its port from
+/// values while the policy names one by hand, which is the shape that breaks
+/// silently, so both are read out of the same render and compared.
+#[test]
+fn the_egress_that_governs_the_raising_pod_admits_the_endpoint_it_was_given() {
+    let documents = rendered_documents();
+    let raisers = workloads_that_may_raise(&documents);
+    assert!(
+        !raisers.is_empty(),
+        "渲染集里没有任何工作负载持有改卷声明的权限：这条判据的分母塌了"
+    );
+
+    for workload in documents
+        .iter()
+        .filter(|d| matches!(kind(d), "Deployment" | "DaemonSet" | "StatefulSet"))
+    {
+        let name = workload
+            .get("metadata")
+            .and_then(|m| m.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or("<unnamed>");
+        if !raisers.contains(name) {
+            continue;
+        }
+        let containers = containers_of(workload);
+        let labels = pod_template_labels(workload);
+        let url = env_value(&containers, OCCUPANCY_URL_ENV)
+            .unwrap_or_else(|| panic!("{name} 没拿到 {OCCUPANCY_URL_ENV}"));
+        let (host, port) =
+            split_url(&url).unwrap_or_else(|| panic!("{name} 的地址 {url} 不可解析"));
+        let service_name = host.split('.').next().unwrap_or_default().to_string();
+
+        // The pods the address resolves to, found the way the Service finds
+        // them: by the selector it publishes, not by guessing the name.
+        let service_selector = documents
+            .iter()
+            .find(|d| {
+                kind(d) == "Service"
+                    && d.get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some(service_name.as_str())
+            })
+            .and_then(|s| plain_labels(s.get("spec").and_then(|spec| spec.get("selector"))))
+            .unwrap_or_else(|| panic!("渲染集里没有可用的 Service {service_name}"));
+        let publisher_labels = documents
+            .iter()
+            .filter(|d| matches!(kind(d), "Deployment" | "DaemonSet" | "StatefulSet"))
+            .map(pod_template_labels)
+            .find(|labels| selects(&service_selector, labels))
+            .unwrap_or_else(|| panic!("Service {service_name} 的选择器没有任何工作负载接住"));
+
+        let admitted = documents
+            .iter()
+            .filter(|d| kind(d) == "NetworkPolicy")
+            .any(|policy| {
+                let governs = policy
+                    .get("spec")
+                    .and_then(|s| s.get("policyTypes"))
+                    .and_then(|p| p.as_sequence())
+                    .map(|types| types.iter().any(|t| t.as_str() == Some("Egress")))
+                    .unwrap_or(false)
+                    && selects(
+                        &selector_labels(policy.get("spec").and_then(|s| s.get("podSelector")))
+                            .unwrap_or_default(),
+                        &labels,
+                    );
+                if !governs {
+                    return false;
+                }
+                let Some(rules) = policy
+                    .get("spec")
+                    .and_then(|s| s.get("egress"))
+                    .and_then(|e| e.as_sequence())
+                else {
+                    return false;
+                };
+                rules.iter().any(|rule| {
+                    // A named peer, not the namespace-wide `podSelector: {}`
+                    // rule beside it. That one opens this port for every pod in
+                    // the namespace on the ground of a different consumer, so a
+                    // channel admitted only by it is admitted by coincidence:
+                    // change either side's number and the scrape is dropped
+                    // with nothing in this render saying so.
+                    let reaches_publisher = rule
+                        .get("to")
+                        .and_then(|t| t.as_sequence())
+                        .map(|to| {
+                            to.iter().any(|peer| {
+                                selector_labels(peer.get("podSelector"))
+                                    .filter(|sel| !sel.is_empty())
+                                    .is_some_and(|sel| selects(&sel, &publisher_labels))
+                            })
+                        })
+                        .unwrap_or(false);
+                    let opens_port = rule
+                        .get("ports")
+                        .and_then(|p| p.as_sequence())
+                        .map(|ports| {
+                            ports.iter().any(|p| {
+                                p.get("port").and_then(|n| n.as_u64()) == Some(port as u64)
+                            })
+                        })
+                        .unwrap_or(false);
+                    reaches_publisher && opens_port
+                })
+            });
+        assert!(
+            admitted,
+            "{name} 的出口是白名单，而没有任何一条策略放行到 {service_name} 的 {port}：\
+             那一抓被丢弃，那些卷每一拍都读成 unmeasured"
+        );
+    }
 }

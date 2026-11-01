@@ -73,6 +73,18 @@ spec:
         # 而空转与"不需要回收"从外面看一样。
         - protocol: TCP
           port: 9100
+    # 卷账的全集面（claim-store DaemonSet，9100）：容量循环替本 Pod
+    # 量不到的卷抬声明，占用只能从这个走查面读——它按 namespace+claim 发布整张卷的字节。
+    # 挡住的后果不是"不抬"，是那些卷每一拍都读成 unmeasured，而 unmeasured 与"用量没涨"
+    # 从外面看一样：声明停在 values 里，涨到头来没有维修者。按 Pod 选，不按端口对本命名
+    # 空间全开（这一条与上面那个「命名空间内数据面」块同理，只是它要的端口不在那一块里）。
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: claim-store
+      ports:
+        - protocol: TCP
+          port: 9100
     # 网页检索后端（SearXNG，8080）：`web_search` 只问这一个地址。单独立一条而不是并进
     # 上面那个「命名空间内数据面」块——那一块按端口放行所有本地 Pod，8080 一并放开就
     # 等于把主 API 的 8080 也打开，而上面那句「8080 不在这里」正是为此写的。

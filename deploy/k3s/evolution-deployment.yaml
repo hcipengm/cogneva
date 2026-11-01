@@ -194,6 +194,14 @@ spec:
                 cogneva-evolution-data-pvc=/var/lib/cogneva-data
                 cogneva-evolution-pvc=/opt/cogneva/sandbox
                 cogneva-evolution-source-pvc=/opt/cogneva/sandbox/src
+            # 本 Pod 量不了的卷：数据库 / 缓存 / 向量库 / 对象存储 / 镜像库那些卷由第三方
+            # 镜像写，本平台没有任何进程在那些 Pod 里，它们也不在本 Pod 的挂载表里。容量
+            # 循环仍要替它们抬声明——声明量是本部署自己的对象——所以占用只能从走查节点
+            # 存储根的那个进程读（它按 namespace+claim 发布整张卷的字节）。
+            # 不配这一条不会「不抬」，而是每一拍都读成 unmeasured：没有读数就不下判据，
+            # 那些卷停在 values 里的声明上，涨到头来要靠人改。
+            - name: COGNEVA_CLAIM_STORE_METRICS_URL
+              value: "http://cogneva-claim-store.cogneva.svc:9100/metrics"
             # 集群内 registry 的卷不归本 Pod 写，走查也不在它的挂载表里：本 Pod 的
             # 部署器是它唯一的写者（buildah push），从这里能问到的只有 registry
             # API 报的"活 tag 引用的层"，那是另一个量（cogneva_registry_referenced_
