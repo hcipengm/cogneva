@@ -110,7 +110,28 @@ pub struct GeneratedChange {
     /// a reading that has to resolve an identity against a deleted row reports
     /// nothing exactly when the backlog is oldest. Records written before this
     /// field read as `None`, which the census reports as unattributed.
+    ///
+    /// This is the answer the classification table gave on the day the change
+    /// was written, not a fact about the change. Where [`Self::kind`] is
+    /// present the census asks the table again, so fixing a wrong arm relabels
+    /// the changes already on disk; this field is what remains for the records
+    /// written before the spelling was kept.
     pub intent: Option<crate::types::task::EvolutionIntent>,
+    /// The producer's own spelling of the entry point, before the classification
+    /// table turned it into [`Self::intent`].
+    ///
+    /// Kept because the two are not the same fact and one is derived from the
+    /// other: on 2026-10-22 `change_ledger` was missing from the table, 55
+    /// landed records froze as `unattributed`, and no reading could tell them
+    /// from records that genuinely had no producer — the spelling that would
+    /// have re-classified them was never written down. Restamping 55 files by
+    /// hand was the whole repair. A record that keeps its spelling is restamped
+    /// by the table itself the next time the table is read.
+    ///
+    /// `None` on records written before this field and on any change rebuilt
+    /// from an artifact rather than from its recorded copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// The agent that produced this change, by the id it registers under
     /// (`luna-1822ab0e`).
     ///

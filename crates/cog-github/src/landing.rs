@@ -2548,6 +2548,7 @@ mod tests {
             self_review_score: Some(0.9),
             issue_number: None,
             intent: Some(cog_core::EvolutionIntent::CiFix),
+            kind: None,
             producer: None,
         }
     }

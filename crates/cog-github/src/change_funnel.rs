@@ -233,8 +233,19 @@ pub(crate) fn is_first_landing(existing: Option<&LandingRecord>) -> bool {
 /// carried on the change has none, and the census says so instead of guessing
 /// from the goal text: an unattributed change is a fact about the record, and
 /// spreading it across the named classes would make each of them wrong.
+///
+/// Where the record kept the producer's own spelling, the table is asked at
+/// read time rather than trusted from write time. The stored class is an answer
+/// the table gave on the day of the write, and a table that was later fixed —
+/// `change_ledger` was missing from it until 2026-10-22, which froze 55 landed
+/// records as unattributed — would otherwise keep labelling history with a
+/// table nobody holds any more. Asking again is what makes a classification fix
+/// cover the records already on disk instead of only the ones written after it.
 pub(crate) fn intent_of(change: &GeneratedChange) -> EvolutionIntent {
-    change.intent.unwrap_or(EvolutionIntent::Unattributed)
+    match change.kind.as_deref().filter(|kind| !kind.is_empty()) {
+        Some(kind) => EvolutionIntent::classify(kind),
+        None => change.intent.unwrap_or(EvolutionIntent::Unattributed),
+    }
 }
 
 impl crate::landing::MainChannel {
@@ -557,6 +568,49 @@ mod tests {
             count(&points, EvolutionIntent::SelfSignal, FunnelStage::Retired),
             0
         );
+    }
+
+    /// A record that kept its producer's spelling is classified by today's
+    /// table, not by the answer the table gave on the day it was written.
+    ///
+    /// This is the 2026-10-22 shape: `change_ledger` was missing from the
+    /// table, 55 landed changes froze as `unattributed`, and fixing the arm
+    /// changed nothing on disk — restamping every file by hand was the whole
+    /// repair. With the spelling kept, the fix reaches the records already
+    /// written, and no second step is left to forget.
+    #[test]
+    fn a_record_that_kept_its_kind_is_classified_by_todays_table() {
+        let mut stale = record(None, LandingState::Retired);
+        stale.change.kind = Some("change_ledger".into());
+        let points = census(&[stale], &[]);
+        assert_eq!(
+            count(
+                &points,
+                EvolutionIntent::SelfEvolution,
+                FunnelStage::Retired
+            ),
+            1
+        );
+        assert_eq!(
+            count(&points, EvolutionIntent::Unattributed, FunnelStage::Retired),
+            0
+        );
+    }
+
+    /// The spelling outvotes the stored class where both are present, because
+    /// the class is derived from it: a class that disagrees with its own input
+    /// is a record written under a table that has since been fixed.
+    #[test]
+    fn the_kind_outvotes_a_stored_class_it_no_longer_produces() {
+        let mut reclassified = record(Some(EvolutionIntent::Unattributed), LandingState::Landed);
+        reclassified.change.kind = Some("self_audit".into());
+        assert_eq!(intent_of(&reclassified.change), EvolutionIntent::SelfAudit);
+
+        // An empty spelling is no spelling: a producer that left the field
+        // blank means "not named", and must not erase the class it did record.
+        let mut blank = record(Some(EvolutionIntent::CiFix), LandingState::Landed);
+        blank.change.kind = Some(String::new());
+        assert_eq!(intent_of(&blank.change), EvolutionIntent::CiFix);
     }
 
     /// A repeat landing call is the idempotency check answering, and it must

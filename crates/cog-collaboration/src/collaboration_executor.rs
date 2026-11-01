@@ -798,6 +798,7 @@ impl CollaborationExecutor {
                     &task.id,
                     task.agent_id.as_deref(),
                     task.evolution_intent(),
+                    task.evolution_kind(),
                 ) {
                     // The cause is what came back with the emptiness, and it is
                     // read here rather than discarded: a run that spends a whole
@@ -1144,6 +1145,7 @@ impl CollaborationExecutor {
         task_id: &str,
         producer: Option<&str>,
         intent: Option<cog_core::EvolutionIntent>,
+        kind: Option<&str>,
     ) -> Result<Vec<cog_core::GeneratedChange>, ChangeYieldOutcome> {
         let mut changes = Vec::new();
         // `pge_payload` reads the result, so it is only `None` when the run
@@ -1198,6 +1200,11 @@ impl CollaborationExecutor {
                 self_review_score: Self::extract_score(squad_result).map(|s| s as f32),
                 issue_number,
                 intent,
+                // The spelling survives alongside the class it produced: the
+                // funnel asks the table again whenever the spelling is there,
+                // so a record written under a wrong arm is corrected by the
+                // fix rather than outliving it.
+                kind: kind.map(str::to_string),
                 producer: producer.map(str::to_string),
             });
         }
@@ -2659,6 +2666,7 @@ mod tests {
             "task-1",
             None,
             None,
+            None,
         )
         .expect("the diff the debate produced must reach the sink");
 
@@ -2694,11 +2702,50 @@ mod tests {
             "task-1",
             Some("luna-1822ab0e"),
             None,
+            None,
         )
         .expect("the diff the debate produced must reach the sink");
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].producer.as_deref(), Some("luna-1822ab0e"));
+    }
+
+    /// 分类表的输入要跟着变更一起走，而不是只留下它当天给出的答案。
+    /// 漏斗在读的时候会拿这个拼写重问一次表：少了它，修好一条错的分支
+    /// 只对新记录生效，盘上那批旧标签就得靠人工回填。
+    #[test]
+    fn a_change_carries_the_kind_the_table_was_asked_about() {
+        use crate::squad::pge::types::Artifact;
+
+        let diff = "--- a/crates/cog-core/src/lib.rs\n\
+                    +++ b/crates/cog-core/src/lib.rs\n\
+                    @@ -1 +1 @@\n\
+                    -old\n\
+                    +new\n";
+        let squad_result = roundtable_squad_result(vec![Artifact {
+            name: "change.diff".into(),
+            content: diff.into(),
+            artifact_type: "change".into(),
+        }]);
+
+        let changes = CollaborationExecutor::extract_changes(
+            &squad_result,
+            "goal",
+            "roundtable",
+            None,
+            "task-1",
+            None,
+            Some(cog_core::EvolutionIntent::SelfEvolution),
+            Some("change_ledger"),
+        )
+        .expect("the diff the debate produced must reach the sink");
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].kind.as_deref(), Some("change_ledger"));
+        assert_eq!(
+            changes[0].intent,
+            Some(cog_core::EvolutionIntent::SelfEvolution)
+        );
     }
 
     /// The reading that the dropped diff was missing: the score and the

@@ -871,32 +871,45 @@ impl Task {
                 == Some(EVOLUTION_MODE_GENERATE_CHANGE)
     }
 
+    /// The producer's own spelling of this task's entry point, or `None` for a
+    /// task that is not a self-evolution one.
+    ///
+    /// This is the input the classification table is asked about, kept apart
+    /// from its answer on purpose: a class written down today is only right for
+    /// as long as the table is, and the table is exactly what gets fixed when an
+    /// entry point was classified wrongly. A record that carries the spelling
+    /// can be re-classified by whatever the table says later; a record that
+    /// carries only the class is frozen at the answer of the day it was written.
+    ///
+    /// The `task_kind` input field wins over the task type because a producer
+    /// that sets it is naming its own entry point more precisely than the type
+    /// string does — the signal watcher submits several distinct signals under
+    /// one type. Producers that only fill in the type are read from there.
+    pub fn evolution_kind(&self) -> Option<&str> {
+        if !self.is_self_evolution() {
+            return None;
+        }
+        Some(
+            self.input
+                .get(INPUT_TASK_KIND)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or(match &self.task_type {
+                    TaskType::Custom(s) => Some(s.as_str()),
+                    _ => None,
+                })
+                .unwrap_or_default(),
+        )
+    }
+
     /// Which entry point submitted this self-evolution task, or `None` for a
     /// task that is not one.
     ///
     /// Read from the task, like [`Self::is_self_evolution`], and for the same
     /// reason: the kind lives on the task and disappears from every context
     /// built out of it.
-    ///
-    /// The `task_kind` input field wins over the task type because a producer
-    /// that sets it is naming its own entry point more precisely than the type
-    /// string does — the signal watcher submits several distinct signals under
-    /// one type. Producers that only fill in the type are read from there.
     pub fn evolution_intent(&self) -> Option<EvolutionIntent> {
-        if !self.is_self_evolution() {
-            return None;
-        }
-        let kind = self
-            .input
-            .get(INPUT_TASK_KIND)
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .or(match &self.task_type {
-                TaskType::Custom(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        Some(EvolutionIntent::classify(kind))
+        self.evolution_kind().map(EvolutionIntent::classify)
     }
 
     pub fn is_ready(&self, dag: &TaskDAG) -> bool {
