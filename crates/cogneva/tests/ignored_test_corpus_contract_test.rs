@@ -74,9 +74,13 @@ const UNNAMED: &[(&str, &str)] = &[
         "crates/cog-memory/tests/embedding_boundary.rs",
         "Same shape as the reranker entry above it, and for the same reason: \
          what it establishes is that the loader reads the weights from the \
-         directory it was given rather than reaching for a hub, which only has \
-         an answer where a weight directory exists. It is a manual reading \
-         against a materialised model, not a step.",
+         directory it was given rather than reaching for a hub, and that the \
+         one session now built produces the terms and weights the second \
+         session used to produce -- neither has an answer where no weight \
+         directory exists. It is not a step here, but it is no longer a \
+         reading someone has to remember to take either: the host unit \
+         `cogneva-model-dependent-tests` runs this binary daily against the \
+         directory the live deployment loads, and treats a 0-test run as red.",
     ),
     (
         "crates/cogneva/tests/swe_pro_container.rs",
