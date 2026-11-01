@@ -84,6 +84,30 @@ fn canary_grace(watch_secs: u64) -> Duration {
     Duration::from_secs(std::cmp::min(floor, ceiling))
 }
 
+/// 金丝雀的第一步：把滚动节奏收成「新副本先起、旧副本不动」。
+///
+/// 动词必须是 kubectl 真有的那个。`change` 不在它的命令表里（`kubectl change`
+/// 回的是 `unknown command`），写下它的时候 CLI 会把这个词当插件名去找，然后
+/// 以「flags cannot be placed before plugin name: -n」拒掉前面那个命名空间——
+/// 于是这一步在第一条命令上就失败，每一次候选都在同一处记失败，集群上却什么
+/// 都没发生。失败信息里只有插件规则那一句，读起来像参数顺序之争，不像动词写错。
+///
+/// 抽出来是为了让动词能被断言：真集群里它是一次静默的全军覆没，没有一条读数
+/// 会说"这一列根本没下发过"。
+fn canary_strategy_patch_args<'a>(namespace: &'a str, deployment: &'a str) -> Vec<&'a str> {
+    vec![
+        "-n",
+        namespace,
+        "patch",
+        "deployment",
+        deployment,
+        "--type",
+        "merge",
+        "-p",
+        r#"{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}"#,
+    ]
+}
+
 /// Rule name for this process's own alert: a canary metric gate spent a whole
 /// watch without a reading, for a reason that traffic does not explain.
 ///
@@ -965,23 +989,8 @@ impl GitOpsPuller {
         let k = self.config.kubectl_bin.clone();
 
         // 金丝雀节奏：maxSurge=1,maxUnavailable=0 → 新副本先起、旧副本不动。
-        self.run(
-            &k,
-            &[
-                "-n",
-                &n,
-                "change",
-                "deployment",
-                d,
-                "--type",
-                "merge",
-                "-p",
-                r#"{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}"#,
-            ],
-            None,
-            60,
-        )
-        .await?;
+        self.run(&k, &canary_strategy_patch_args(&n, d), None, 60)
+            .await?;
         // 换镜像之前记下本部署已在跑的副本。此后新出现的副本才是候选，
         // 看护要观测的是它。拿不到这份名单就整轮关掉指标闸门（readiness 与
         // restart 仍在看），而不是把新旧混作一组自比自。
@@ -2674,6 +2683,85 @@ mod tests {
         // 上界不该改变大窗口下的量纲。
         assert_eq!(canary_grace(600), Duration::from_secs(150));
         assert_eq!(canary_grace(3600), Duration::from_secs(900));
+    }
+
+    /// 金丝雀的第一步必须问 kubectl 一个它有的动词。
+    ///
+    /// 写成 `change` 的那一版在真集群上让每一次候选都失败：CLI 不认识这个词，
+    /// 把它当插件名去找，再拒掉前置于它的 `-n`。失败行读起来是参数顺序的问题，
+    /// 而集群上什么都没发生——所以要在没有集群的时候把动词钉死。
+    ///
+    /// 词表是 kubectl 自己的命令集，写在这里而不是从代码里反推：这份清单的用途
+    /// 正是判"代码里的那个词在不在 kubectl 里"，反推就永远相等。
+    #[test]
+    fn the_canary_strategy_patch_asks_a_verb_kubectl_has() {
+        const KUBECTL_COMMANDS: &[&str] = &[
+            "annotate",
+            "apply",
+            "auth",
+            "autoscale",
+            "certificate",
+            "cluster-info",
+            "completion",
+            "config",
+            "cordon",
+            "cp",
+            "create",
+            "debug",
+            "delete",
+            "describe",
+            "diff",
+            "drain",
+            "edit",
+            "events",
+            "exec",
+            "explain",
+            "expose",
+            "get",
+            "kustomize",
+            "label",
+            "logs",
+            "options",
+            "patch",
+            "plugin",
+            "port-forward",
+            "proxy",
+            "replace",
+            "rollout",
+            "run",
+            "scale",
+            "set",
+            "taint",
+            "top",
+            "uncordon",
+            "version",
+            "wait",
+        ];
+        let args = canary_strategy_patch_args("cogneva", "cogneva");
+        // `kubectl <全局标志> <动词> …`：这里的全局标志只有 `-n <命名空间>`，
+        // 所以动词落在第三个词上。按位置取而不是找"第一个非标志词"——那个词是
+        // 命名空间的取值，取到它会得到一个永远不在词表里的名字。
+        assert_eq!(args.first().copied(), Some("-n"), "{args:?}");
+        let verb = args.get(2).copied().unwrap_or("");
+        assert!(
+            KUBECTL_COMMANDS.contains(&verb),
+            "金丝雀第一步用的动词是 {verb:?}，kubectl 没有这个命令：{args:?}"
+        );
+        // 命名空间、动作、被改的对象都要对得上，否则动词对了也改错了地方。
+        assert_eq!(
+            args,
+            vec![
+                "-n",
+                "cogneva",
+                "patch",
+                "deployment",
+                "cogneva",
+                "--type",
+                "merge",
+                "-p",
+                r#"{"spec":{"strategy":{"rollingUpdate":{"maxSurge":1,"maxUnavailable":0}}}}"#,
+            ]
+        );
     }
 
     /// 重启次数与 ready 是另外两条界，与那张词表无关。
