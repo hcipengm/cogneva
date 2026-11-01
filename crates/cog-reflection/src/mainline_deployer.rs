@@ -1556,6 +1556,81 @@ fn failure_repeats(seen: &[Option<String>], now: Option<&str>) -> bool {
     })
 }
 
+/// 作业日志末尾那几行里「那一步说了什么」。
+///
+/// 注解不是每条失败的检查都有：2026-11-01 实测，`Entry Scripts Lint` 唯一那条失败级
+/// 注解只写着 `Process completed with exit code 1.`——检查名到这一步，原因还一个字都
+/// 没有，而真正的那两句（`缺少 web/node_modules/.bin/tsc`、`FAIL: 真树上红了`）躺在作业
+/// 日志的最后几行里，只有拿 job id 去 `/actions/jobs/{id}/logs` 才读得到。那一步也是
+/// 机械的，同样该在这里做完。
+///
+/// 取法是「以最后一条 `##[error]` 为结尾」，不是「取最后几行」：失败之后 runner 还要
+/// 打一段清理（`Post job cleanup`、`[command]/usr/bin/git` 之类），按行数取会把它当成
+/// 失败点。日志每一行前面带着一个 ISO 时间戳，先剥掉——它说的是何时，不是何处。
+pub(crate) fn ci_log_tail(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(strip_log_stamp)
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let end = lines
+        .iter()
+        .rposition(|line| line.starts_with("##[error]"))?;
+    let start = end.saturating_sub(MainlineDeployer::CI_LOG_TAIL_LINES - 1);
+    // 从尾部往回装，装不下就停：留下来的必须是**最后**说的那几句，而不是最先说的。
+    let cap = MainlineDeployer::CI_EVIDENCE_MAX_CHARS;
+    let mut kept: Vec<String> = Vec::new();
+    let mut budget = cap;
+    for line in lines[start..=end].iter().rev() {
+        let line = line.strip_prefix("##[error]").unwrap_or(line).trim();
+        if line.is_empty() {
+            continue;
+        }
+        let width = line.chars().count();
+        if kept.is_empty() && width > budget {
+            // 一行就超了：留它的尾巴——那一行最后说的才是这一行要说的。
+            let skip = width - budget;
+            kept.push(line.chars().skip(skip).collect());
+            break;
+        }
+        if width + 3 > budget {
+            break;
+        }
+        budget -= width + 3;
+        kept.push(line.to_string());
+    }
+    kept.reverse();
+    (!kept.is_empty()).then(|| kept.join(" / "))
+}
+
+/// 这句话是不是 runner 在说「那一步没成功」，而不是那条检查在说哪里错了。
+///
+/// 失败级注解里最常见的两句话都不是证据：`Process completed with exit code 1.`（runner
+/// 说的）与空串。它们只回答「失败了没有」，而问题问的是「错在哪」——把这两句当成证据
+/// 交下去，接手的人拿到的仍是零信息，只是多了一行看起来像答案的字。
+fn annotation_says_nothing(message: &str) -> bool {
+    let text = message.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return true;
+    }
+    let rest = match text.strip_prefix("process completed with exit code ") {
+        Some(rest) => rest,
+        None => return false,
+    };
+    rest.trim_end_matches('.').trim().parse::<i32>().is_ok()
+}
+
+/// GitHub 作业日志每一行前面那个 `2026-11-01T00:58:16.1656654Z `。
+fn strip_log_stamp(line: &str) -> &str {
+    match line.split_once(' ') {
+        Some((stamp, rest)) if stamp.len() >= 20 && stamp.ends_with('Z') && stamp.contains('T') => {
+            rest
+        }
+        _ => line,
+    }
+}
+
 /// 从终止消息里读回失败签名。只认我们自己写下的形状（`类别:阶段:目标:落点`，
 /// 四个字段各在值域内）：容器可能因为别的原因死掉，别的进程也可能往这条通道里
 /// 写过东西，把一段陌生文本当签名会让"这次和上次是不是同一处坏"变成掷骰子。
@@ -3788,11 +3863,32 @@ impl MainlineDeployer {
         api_base: &str,
         path: &str,
     ) -> Result<serde_json::Value, PlatformReadFailure> {
+        let body = Self::platform_get_raw(api_base, path, "application/json").await?;
+        serde_json::from_slice(&body).map_err(|_| PlatformReadFailure::UnusableBody)
+    }
+
+    /// 同一个 GET，正文当文本读。
+    ///
+    /// 作业日志那条读回的正文是日志本身（不是 JSON），所以不能走
+    /// [`Self::platform_get_json`] 的反序列化；但请求头仍然要 `application/json`——
+    /// 实测（2026-11-01，经安全网关对作业日志那条路）：`Accept: text/plain` 得到
+    /// **415**，`application/json` 得到 200 与一份 `text/plain` 正文。要什么由这一端
+    /// 声明的响应类型说了算，而正文是什么由那条路由说了算。
+    async fn platform_get_text(api_base: &str, path: &str) -> Result<String, PlatformReadFailure> {
+        let body = Self::platform_get_raw(api_base, path, "application/json").await?;
+        String::from_utf8(body).map_err(|_| PlatformReadFailure::UnusableBody)
+    }
+
+    async fn platform_get_raw(
+        api_base: &str,
+        path: &str,
+        accept: &str,
+    ) -> Result<Vec<u8>, PlatformReadFailure> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (host, port, prefix) =
             split_http_base(api_base).ok_or(PlatformReadFailure::BadApiBase)?;
         let req = format!(
-            "GET {prefix}{path} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n\
+            "GET {prefix}{path} HTTP/1.1\r\nHost: {host}\r\nAccept: {accept}\r\n\
              User-Agent: cogneva-mainline-deployer\r\nConnection: close\r\n\r\n"
         );
         let mut stream = tokio::time::timeout(
@@ -3818,7 +3914,7 @@ impl MainlineDeployer {
         if status != 200 {
             return Err(PlatformReadFailure::Http(status));
         }
-        serde_json::from_slice(&body).map_err(|_| PlatformReadFailure::UnusableBody)
+        Ok(body)
     }
 
     /// 该 rev 在某平台上的 CI 结论：check runs 优先，提交状态兜底，折判据与
@@ -4156,6 +4252,11 @@ impl MainlineDeployer {
     // 上游页面上，任务图不是它的归宿。
     const CI_EVIDENCE_MAX_CHARS: usize = 400;
 
+    /// 没有失败级注解时，从作业日志末尾往回取几行。
+    // cap: bound — 一行是判词、一行是那一步自己打的错、再多几行是它当时在做什么；
+    // 往上多取只会把目标写成一段日志，而读不完的那部分等于没写。
+    const CI_LOG_TAIL_LINES: usize = 6;
+
     /// 这一版上那几条判红的检查**自己写下的**失败点。
     ///
     /// 判词到检查名为止（`github:Test`），而「哪条测试红了」并不在名字里。2026-11-01
@@ -4204,15 +4305,16 @@ impl MainlineDeployer {
             else {
                 continue;
             };
-            let Ok(annotations) = Self::platform_get_json(
+            // 注解读不到不等于这条检查没有证据：读不到恰是该退到日志的那种情形，
+            // 所以这里退化成一叠空注解，往下照走——而不是 `continue` 把这条检查丢掉。
+            let annotations = Self::platform_get_json(
                 api_base,
                 &format!("/repos/{repo}/check-runs/{id}/annotations"),
             )
             .await
-            else {
-                continue;
-            };
+            .unwrap_or(serde_json::Value::Null);
             let mut taken = 0usize;
+            let mut informative = 0usize;
             for item in annotations
                 .get("annotations")
                 .and_then(|a| a.as_array())
@@ -4242,11 +4344,33 @@ impl MainlineDeployer {
                 {
                     continue;
                 }
+                if !annotation_says_nothing(&message) {
+                    informative += 1;
+                }
                 out.push(CheckEvidence {
                     check: name.clone(),
                     said: message,
                 });
                 taken += 1;
+            }
+            // 失败级注解说不清原因时退到作业日志末尾。注解可能就只有 runner 那一句
+            // `Process completed with exit code 1.`——它不是这条检查说的话，是 runner
+            // 在说「那一步没成功」。只在「一句有内容的话都没有」时才去读日志：已经有
+            // 上游自己的话就别再读一遍日志，那是把同一件事说两遍。
+            if informative == 0 {
+                let log = Self::platform_get_text(
+                    api_base,
+                    &format!("/repos/{repo}/actions/jobs/{id}/logs"),
+                )
+                .await
+                .ok()
+                .and_then(|body| ci_log_tail(&body));
+                if let Some(said) = log {
+                    out.push(CheckEvidence {
+                        check: name.clone(),
+                        said: format!("日志末尾：{said}"),
+                    });
+                }
             }
         }
         out
@@ -13223,6 +13347,47 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         assert!(failure_repeats(&[None], None));
     }
 
+    /// 作业日志末尾那几行：以最后一条 `##[error]` 收尾，剥掉时间戳，别把失败之后
+    /// 的清理步骤当失败点。
+    #[test]
+    fn the_log_tail_ends_at_the_last_error_not_at_the_cleanup() {
+        let log = "2026-11-01T00:57:18.0315424Z 20 passed, 0 failed\n\
+                   2026-11-01T00:58:16.1656654Z 缺少 web/node_modules/.bin/tsc——先在 web/ 里装依赖（npm ci）\n\
+                   2026-11-01T00:58:16.1657000Z FAIL: 真树上红了\n\
+                   2026-11-01T00:58:16.1656654Z ##[error]Process completed with exit code 1.\n\
+                   2026-11-01T00:58:17.0000000Z Post job cleanup.\n\
+                   2026-11-01T00:58:17.1000000Z [command]/usr/bin/git version\n";
+        let said = ci_log_tail(log).expect("a log with an error marker has a tail");
+        assert!(said.contains("缺少 web/node_modules/.bin/tsc"), "{said}");
+        assert!(said.contains("FAIL: 真树上红了"), "{said}");
+        assert!(
+            !said.contains("Post job cleanup") && !said.contains("[command]"),
+            "the runner's cleanup runs after the failure and is not a failure point: {said}"
+        );
+        assert!(
+            !said.contains("2026-11-01T"),
+            "timestamps say when, not where: {said}"
+        );
+        assert!(
+            said.ends_with("Process completed with exit code 1."),
+            "{said}"
+        );
+
+        // 没有 `##[error]` 的日志说不出失败点：空着比编一句强。
+        assert_eq!(ci_log_tail("2026-11-01T00:58:16Z all good\n"), None);
+        assert_eq!(ci_log_tail(""), None);
+    }
+
+    /// 一条极长的错只留最后说得出口的那点量：从尾部往前砍，保住最后一句话。
+    #[test]
+    fn an_over_long_tail_keeps_the_last_words() {
+        let head = format!("2026-11-01T00:58:16Z {}\n", "x".repeat(500));
+        let log = format!("{head}2026-11-01T00:58:16Z ##[error]最后一句\n");
+        let said = ci_log_tail(&log).expect("tail");
+        assert!(said.ends_with("最后一句"), "{said}");
+        assert!(said.chars().count() <= MainlineDeployer::CI_EVIDENCE_MAX_CHARS);
+    }
+
     #[test]
     fn failure_signatures_round_trip_through_the_termination_message() {
         let sig = failure_signature(
@@ -15696,6 +15861,70 @@ exec {real} "$@"
              that is not broken: {goal}"
         );
         let _ = handle.await.unwrap();
+    }
+
+    /// 只有 runner 那句「退出码 1」时，退到作业日志末尾去取原因。
+    ///
+    /// 2026-11-01 实测就是这个形状：`Entry Scripts Lint` 的失败级注解只有
+    /// `Process completed with exit code 1.`，检查名到这一步，原因还一个字都没有，
+    /// 而真正的那两句在日志最后几行里——得有人拿 job id 去读日志才看得见。
+    #[tokio::test]
+    async fn a_check_whose_annotation_says_nothing_hands_on_the_end_of_its_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let runs =
+            r#"{"check_runs":[{"name":"Entry Scripts Lint","conclusion":"failure","id":4242}]}"#;
+        let log = "2026-11-01T00:58:16.1656654Z == deploy/scripts/tests/web-stream-driven-refresh.test.sh\n\
+                   2026-11-01T00:58:16.1656654Z 缺少 web/node_modules/.bin/tsc——先在 web/ 里装依赖（npm ci）\n\
+                   2026-11-01T00:58:16.1656654Z FAIL: 真树上红了\n\
+                   2026-11-01T00:58:16.1656654Z ##[error]Process completed with exit code 1.\n\
+                   2026-11-01T00:58:17.0000000Z Post job cleanup.\n";
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(runs),
+            http_200(runs),
+            http_200(
+                r#"{"annotations":[
+                    {"annotation_level":"failure","message":"Process completed with exit code 1."},
+                    {"annotation_level":"notice","message":"Node.js 20 is deprecated"}
+                ]}"#,
+            ),
+            http_200(log),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let mut state = MainlineState::default();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+
+        // 脚本四问都答过才收得到这组请求；少问一次会在这里超时，而不是断言先绿。
+        let reqs = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("every scripted answer is asked for")
+            .unwrap();
+        assert!(
+            reqs.iter().any(|r| r.contains("/actions/jobs/4242/logs")),
+            "the log of the check that failed is read: {reqs:?}"
+        );
+
+        let submissions = planner.submissions();
+        assert_eq!(submissions.len(), 1, "{submissions:?}");
+        let goal = &submissions[0].0;
+        assert!(
+            goal.contains("日志末尾：") && goal.contains("缺少 web/node_modules/.bin/tsc"),
+            "the cause the log names travels with the goal: {goal}"
+        );
+        assert!(
+            !goal.contains("Node.js 20 is deprecated"),
+            "a notice is still not a failure point: {goal}"
+        );
     }
 
     /// 同一版、同一天的第二轮只带同一个 id：扣住期间每一轮都会走到这里，而
