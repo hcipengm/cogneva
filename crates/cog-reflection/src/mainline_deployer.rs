@@ -1506,21 +1506,42 @@ pub(crate) fn ci_hold_goal_id(rev: &str, day: &str) -> String {
 /// 分解是规划器的事，一条已经把步骤写死的目标会把规划该做的判断也一起做掉。
 /// 检查名可能为空——结论来自提交状态兜底时上游没给名字，那就直说没有名字，而不是
 /// 让读的人以为没有失败的检查。
-pub(crate) fn ci_hold_goal_text(rev: &str, failed_checks: &[String]) -> String {
+///
+/// `evidence` 是那几条失败检查**自己写下的**失败点（见
+/// [`MainlineDeployer::platform_ci_failure_evidence`]），带的是上游的语言：cargo 的
+/// 失败测试名、lint 的违规行。有它就把它照抄进去，因为「哪条测试红了」是从检查名里
+/// 读不出来的那一半，而它正是接手的人要做的第一件事。空着时这段不提，也不能凭空补
+/// 一句「原因未知」——没问到时，这一层对原因确实是零信息，说成"已知的未知"会让下面
+/// 的人以为有人看过。
+pub(crate) fn ci_hold_goal_text(
+    rev: &str,
+    failed_checks: &[String],
+    evidence: &[CheckEvidence],
+) -> String {
     let checks = if failed_checks.is_empty() {
         "上游没有给出具体的检查名（结论来自提交状态接口），请到那一版的 Actions 页读出失败的是哪几条"
             .to_string()
     } else {
         failed_checks.join("、")
     };
+    let next = if evidence.is_empty() {
+        "请拉取这几条检查的失败反馈、修好根因再提交一个新版本。".to_string()
+    } else {
+        let mut said = String::from("那几条检查自己写下的失败点（原样照抄，未经这一层改写）：\n");
+        for seen in evidence {
+            said.push_str(&format!("- {}：{}\n", seen.check, seen.said));
+        }
+        said.push_str("修好这些失败点再提交一个新版本。");
+        said
+    };
     format!(
         "Make upstream CI green again for mainline {}\n\n\
-         主线提交 {} 在上游 CI 上被判为失败，部署器已扣住这一版不发版。失败的检查：{}。\
-         请拉取这几条检查的失败反馈、修好根因再提交一个新版本。\
+         主线提交 {} 在上游 CI 上被判为失败，部署器已扣住这一版不发版。失败的检查：{}。{}\
          判据是新的 main 提交在同一组检查上全绿，且这一版被它取代；只有那时部署器才会放开滚动。",
         rev12(rev),
         rev,
         checks,
+        next,
     )
 }
 
@@ -2027,6 +2048,19 @@ struct CiHold {
     failed_checks: Vec<String>,
 }
 
+/// 一条判红的检查**自己写下的**一句话：哪个检查（`<platform>:<name>`），它说了什么。
+///
+/// 与 `CiHold::failed_checks` 分开：那一格记的是身份（谁红了），这一格记的是证据（红在
+/// 哪一处），两者来路不同——身份在判词那一次读里就有，证据要再问一次那条 run 的注解。
+/// 合进一个字符串里会让「这一版有多少条检查红了」与「它们各自说了几句」再也分不开。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckEvidence {
+    /// 形如 `github:Test`，与 `failed_checks` 同一套写法，读的人能把两边对上。
+    pub check: String,
+    /// 上游原样给的那句话，只截过长，不改写。
+    pub said: String,
+}
+
 /// 一次扣住的结局：哪一版被按住、从哪一刻起、到哪一刻止、结束的那一轮问出了什么。
 ///
 /// `ci_hold` 只说明"现在还被按住"，扣住一结束它就被 take 掉了——于是"这一版最后
@@ -2401,6 +2435,13 @@ pub struct MainlineDeployer {
     /// handle the hold still happens and still logs -- its existence does not
     /// depend on anyone being able to take the work.
     orchestrator: Option<std::sync::Arc<dyn cog_core::OrchestratorControl>>,
+    /// 这一张 CI 待办单已经问过的「失败检查自己说了什么」。
+    ///
+    /// 键与单子 id 是同一个（版本 + 日期）：那张单子只用一次这段话，而扣住期间每一轮
+    /// 都会走到组装它这一步。不记下来，就是每分钟向上游问一遍同一份、且永远不变的回答。
+    /// 记在这里而不是落盘的 `MainlineState` 里，因为它是从别处可重算的派生量——重启后
+    /// 多问一次没有代价，而把上游的正文写进状态文件会让那份状态开始承担另一层的职责。
+    ci_evidence_memo: std::sync::Mutex<Option<(String, Vec<CheckEvidence>)>>,
     /// 「一轮都没走完过」这件事在抓取面上只补一次的那个闸。
     ///
     /// 这条读数只在走完一轮的分支里写，于是从没走完过的库在抓取面上是一条**缺席**
@@ -2543,6 +2584,7 @@ impl MainlineDeployer {
             declared_governance: std::sync::Mutex::new(None),
             governance_drift: None,
             orchestrator: None,
+            ci_evidence_memo: std::sync::Mutex::new(None),
             buildah_reading_seeded: std::sync::atomic::AtomicBool::new(false),
             registry_reading_seeded: std::sync::atomic::AtomicBool::new(false),
             loop_beat: std::sync::OnceLock::new(),
@@ -4097,6 +4139,168 @@ impl MainlineDeployer {
             .map(|known| (*known).to_string())
     }
 
+    /// 一条失败的检查最多把几句话带进目标里。
+    // cap: bound — 注解是上游按行给的，一个失败的测试一行；三条足以点名是哪一处红，
+    // 再多就把目标写成一堵读不完的墙，而读不完的那部分等于没写。
+    const CI_EVIDENCE_MAX_MESSAGES: usize = 3;
+
+    /// 单句话最多带多少个字符。
+    // cap: bound — 注解正文可能带着整段 diff 或栈，这里只留够认出是哪一条的量；全文仍在
+    // 上游页面上，任务图不是它的归宿。
+    const CI_EVIDENCE_MAX_CHARS: usize = 400;
+
+    /// 这一版上那几条判红的检查**自己写下的**失败点。
+    ///
+    /// 判词到检查名为止（`github:Test`），而「哪条测试红了」并不在名字里。2026-11-01
+    /// 实测：主线被扣住时日志只有 `github:Test,github:Code Coverage`，要知道红的是
+    /// `rust_capacity_constants_registry_test::every_capacity_number_in_rust_says_where_it_comes_from`
+    /// 得有人拿 run id 去问 `/check-runs/{id}/annotations`。那一步是机械的，就该在这里
+    /// 做完再交出去：交给规划器的话里带着失败点，比让每一个接手的人各自去仓库外翻一遍
+    /// 可复现得多。
+    ///
+    /// 只问判红的那几条，且每个平台只读一次 check-runs：注解是失败时上游**自己**写下的
+    /// 东西，用它的语言（cargo 的失败测试名、lint 的违规行），这里只搬运不改写。取不到
+    /// 就空着——证据缺失不能变成「失败原因是已知的」。
+    async fn platform_ci_failure_evidence(
+        api_base: &str,
+        repo: &str,
+        rev: &str,
+        names: &[String],
+    ) -> Vec<CheckEvidence> {
+        let mut out: Vec<CheckEvidence> = Vec::new();
+        if names.is_empty() {
+            return out;
+        }
+        let Ok(v) =
+            Self::platform_get_json(api_base, &format!("/repos/{repo}/commits/{rev}/check-runs"))
+                .await
+        else {
+            return out;
+        };
+        let Some(runs) = v.get("check_runs").and_then(|r| r.as_array()) else {
+            return out;
+        };
+        for name in names {
+            // 同一个名字可以重跑过：取最近一次给出结论的那条 run，与判词那一层的采信
+            // 口径一致（`cancelled` 不算结论，它也不会留下注解）。
+            let Some(id) = runs
+                .iter()
+                .filter(|run| run.get("name").and_then(|n| n.as_str()) == Some(name.as_str()))
+                .filter(|run| {
+                    run.get("conclusion")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c != "cancelled")
+                })
+                .max_by_key(|run| Self::check_run_freshness(run))
+                .and_then(|run| run.get("id"))
+                .and_then(|id| id.as_i64())
+            else {
+                continue;
+            };
+            let Ok(annotations) = Self::platform_get_json(
+                api_base,
+                &format!("/repos/{repo}/check-runs/{id}/annotations"),
+            )
+            .await
+            else {
+                continue;
+            };
+            let mut taken = 0usize;
+            for item in annotations
+                .get("annotations")
+                .and_then(|a| a.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if taken >= Self::CI_EVIDENCE_MAX_MESSAGES {
+                    break;
+                }
+                // 只要失败级的：notice 是「顺带看一眼」，warning 是「大概有事」，把它们
+                // 抬成失败点会让这一列读起来比真相严重。
+                if item.get("annotation_level").and_then(|l| l.as_str()) != Some("failure") {
+                    continue;
+                }
+                let Some(message) = item
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                else {
+                    continue;
+                };
+                let message: String = message.chars().take(Self::CI_EVIDENCE_MAX_CHARS).collect();
+                if out
+                    .iter()
+                    .any(|seen| &seen.check == name && seen.said == message)
+                {
+                    continue;
+                }
+                out.push(CheckEvidence {
+                    check: name.clone(),
+                    said: message,
+                });
+                taken += 1;
+            }
+        }
+        out
+    }
+
+    /// 交给规划器那段话里的失败点，按单子备忘。
+    ///
+    /// 同一张单子（版本 + 日期）只用一次这段话，而扣住期间每一轮都会走到组装它这一步：
+    /// 不记下来就是每分钟去问一次上游同一份已经定了的注解。键用单子 id 而不是版本号，
+    /// 因为跨天是另一张单子，它该带着当时的话重新写一遍。
+    ///
+    /// **名字一条都没有的那一轮不进备忘**：那种一轮说的是「结论来自提交状态接口，上游
+    /// 没有给出名字」，而后来某一轮说出了名字是同一件事的另一半（状态那一支之后会把
+    /// 名字补进 `ci_hold.failed_checks`）。把它记成「这一版没有证据」，后面有名字的那
+    /// 一轮就永远问不到注解了——空在这一层有两重意思，只有一种可以记。
+    async fn ci_failure_evidence(
+        &self,
+        goal_id: &str,
+        rev: &str,
+        failed_checks: &[String],
+    ) -> Vec<CheckEvidence> {
+        if failed_checks.is_empty() {
+            return Vec::new();
+        }
+        if let Ok(memo) = self.ci_evidence_memo.lock() {
+            if let Some((key, evidence)) = memo.as_ref() {
+                if key == goal_id {
+                    return evidence.clone();
+                }
+            }
+        }
+        let mut out = Vec::new();
+        for up in &self.cfg.upstreams {
+            let platform = up.platform.slug();
+            let Some(base) = up
+                .api_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let repo = up.repo.trim().trim_end_matches(".git");
+            let prefix = format!("{platform}:");
+            let names: Vec<String> = failed_checks
+                .iter()
+                .filter_map(|tag| tag.strip_prefix(prefix.as_str()).map(str::to_string))
+                .collect();
+            for seen in Self::platform_ci_failure_evidence(base, repo, rev, &names).await {
+                out.push(CheckEvidence {
+                    check: format!("{platform}:{}", seen.check),
+                    said: seen.said,
+                });
+            }
+        }
+        if let Ok(mut memo) = self.ci_evidence_memo.lock() {
+            *memo = Some((goal_id.to_string(), out.clone()));
+        }
+        out
+    }
+
     /// 要滚的这个 rev 在上游各平台的 CI 结论。`Some(false)` = 至少一个平台
     /// 给出了明确的失败结论；`None` = 没有证据（没配基址、平台不可达、仓库
     /// 不用 CI、检查还没跑完）。三支各自的读数在 [`Self::record_ci_verdict_reading`]
@@ -4436,7 +4640,8 @@ impl MainlineDeployer {
             rev,
             &Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string(),
         );
-        let goal = ci_hold_goal_text(rev, failed_checks);
+        let evidence = self.ci_failure_evidence(&id, rev, failed_checks).await;
+        let goal = ci_hold_goal_text(rev, failed_checks, &evidence);
         let mut row = cog_core::Task::goal_row(id.clone(), &goal);
         // The row is the goal's identity marker and is never executed: the
         // planner decomposes it and the children carry the work. It is not
@@ -4460,6 +4665,9 @@ impl MainlineDeployer {
                     goal_id = %id,
                     tasks = added.len(),
                     failed_checks = %failed_checks.join(","),
+                    // 0 是「上游没给出可读的注解」，不是「没有人失败」：失败的检查名在
+                    // 上一格，这一格数的只是它们各自说了几句。
+                    evidence_lines = evidence.len(),
                     "the CI hold was handed to the action planner"
                 );
                 true
@@ -15056,6 +15264,16 @@ exec {real} "$@"
 
     const HTTP_404: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
 
+    /// 等假平台的应答脚本跑完，最多等几秒。
+    ///
+    /// 直接 `handle.await` 在「这一轮比脚本少问了一次」时是**挂住**而不是失败：监听方在
+    /// 等一个不会来的连接，而挂住的测试要等到作业超时才红——那时读的人看到的是超时，不是
+    /// 「少问了一次」这件事本身。少问没少问由断言判（它们断的都是问回来的东西），这里只
+    /// 负责不把「少问」变成「卡死」。
+    async fn settle(handle: tokio::task::JoinHandle<Vec<String>>) {
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+    }
+
     /// 假平台 API：按序应答，`None` 表示「收下连接就 RST」；返回 base 与**已接受的
     /// 连接数**。
     ///
@@ -15380,13 +15598,27 @@ exec {real} "$@"
 
     /// 被上游判红的一版不是只把滚动停下来：失败的检查名在判词那一刻就在手上，
     /// 它必须变成一张能被分解的单子，否则这条链的下一环永远是"等人读日志"。
+    ///
+    /// 名字只答了「哪个作业红了」。「哪条测试红了」写在检查自己的注解里，而那是接手的人
+    /// 要做的第一件事——2026-11-01 实测，为读出这一条得有人手工拿 run id 去问
+    /// `/check-runs/{id}/annotations`。所以这段话里必须带着它，且只带失败级的：
+    /// notice 是「顺带看一眼」，把它抬进失败点会让读的人先去修一处没坏的东西。
     #[tokio::test]
-    async fn a_ci_hold_opens_one_goal_naming_the_revision_and_the_failed_checks() {
+    async fn a_ci_hold_opens_one_goal_naming_the_revision_the_failed_checks_and_what_they_said() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let (endpoint, handle) = fake_registry(vec![http_200(
-            r#"{"check_runs":[{"name":"Test","conclusion":"failure"},{"name":"Clippy","conclusion":"success"}]}"#,
-        )])
+        let runs = r#"{"check_runs":[{"name":"Test","conclusion":"failure","id":4242},{"name":"Clippy","conclusion":"success"}]}"#;
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(runs),
+            // 证据那一次重读同一份 check-runs：它要从中找出这条 run 的 id。
+            http_200(runs),
+            http_200(
+                r#"{"annotations":[
+                    {"annotation_level":"notice","message":"顺手提示：这个工作流跑在自托管 runner 上"},
+                    {"annotation_level":"failure","message":"cargo test --workspace: 1 failing test -- rust_capacity_constants_registry_test::every_capacity_number_in_rust_says_where_it_comes_from"}
+                ]}"#,
+            ),
+        ])
         .await;
         let mut cfg = upstream_config(root, Path::new("/nonexistent"));
         cfg.upstreams.truncate(1);
@@ -15419,6 +15651,19 @@ exec {real} "$@"
             !goal.contains("Clippy"),
             "a check that passed is not a failure: {goal}"
         );
+        assert!(
+            goal.contains(
+                "rust_capacity_constants_registry_test::\
+                 every_capacity_number_in_rust_says_where_it_comes_from"
+            ),
+            "the failing test the check pointed at travels with the goal, so whoever picks this \
+             up does not have to ask the platform again: {goal}"
+        );
+        assert!(
+            !goal.contains("自托管 runner"),
+            "a notice is not a failure point: promoting it sends the reader to fix something \
+             that is not broken: {goal}"
+        );
         let _ = handle.await.unwrap();
     }
 
@@ -15429,7 +15674,10 @@ exec {real} "$@"
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let (endpoint, handle) = fake_registry(vec![
+            // 第一轮：判词一次读 + 取失败点的那次重读。
             http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            // 第二轮只有判词那一次：同一张单子的失败点已经记下，不再问第二遍。
             http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
         ])
         .await;
@@ -15456,6 +15704,58 @@ exec {real} "$@"
             submissions[1].2.is_empty(),
             "the graph already held that id, so nothing new is queued: {submissions:?}"
         );
+        settle(handle).await;
+    }
+
+    /// 第一轮从提交状态兜底拿到「红」但拿不到名字时，这一版**没有**被问过失败点；
+    /// 后面那一轮说出了名字，失败点就要在那一轮问出来。
+    ///
+    /// 备忘按「这一版这一天问过了」记，所以空结果也有被记住的诱惑——而这里的空有两重
+    /// 意思：一种是真的没人写过注解，另一种是**这一轮根本无从来问**（连名字都没有）。
+    /// 把后一种也记下来，有名字的那一轮就永远拿不到证据，而这件事在任何读数上都不显形：
+    /// 单子照样开出去，只是它说的比本该说的少。
+    #[tokio::test]
+    async fn names_that_arrive_after_the_first_round_still_bring_their_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            // 第一轮：有结论、没有名字。判词到这里就结束了，不会去问注解。
+            http_200(r#"{"check_runs":[{"conclusion":"failure"}]}"#),
+            // 第二轮：判词 + 取失败点的那次重读。
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure","id":77}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure","id":77}]}"#),
+            http_200(
+                r#"{"annotations":[{"annotation_level":"failure","message":"one test failed: volume_capacity::a_stamp_that_never_lands_still_lets_the_bound_elapse"}]}"#,
+            ),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let mut state = MainlineState::default();
+        for _ in 0..2 {
+            assert!(deployer
+                .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+                .await
+                .unwrap());
+        }
+
+        let submissions = planner.submissions();
+        assert_eq!(submissions.len(), 2, "{submissions:?}");
+        assert!(
+            !submissions[0].0.contains("a_stamp_that_never_lands"),
+            "the first round had no check to ask: {submissions:?}"
+        );
+        assert!(
+            submissions[1]
+                .0
+                .contains("volume_capacity::a_stamp_that_never_lands_still_lets_the_bound_elapse"),
+            "the round that learned the name also asked that check what it saw: {submissions:?}"
+        );
         let _ = handle.await.unwrap();
     }
 
@@ -15472,8 +15772,12 @@ exec {real} "$@"
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let (endpoint, handle) = fake_registry(vec![
+            // 第一轮：判词一次读 + 取失败点的那次重读。
             http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
             http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            // 第二轮：仍然红，但失败点已经记在这张单子上，只问判词。
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            // 第三轮：放行。
             http_200(r#"{"check_runs":[{"name":"Test","conclusion":"success"}]}"#),
         ])
         .await;
@@ -15534,7 +15838,7 @@ exec {real} "$@"
             .await
             .unwrap());
         assert_eq!(read().await.unwrap(), 0.0);
-        let _ = handle.await.unwrap();
+        settle(handle).await;
     }
 
     /// 绿的一版不开单子。一个拿不到证据就开单的门会把每次上游抖动变成待办。
