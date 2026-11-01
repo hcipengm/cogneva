@@ -729,6 +729,15 @@ grep -qF "Date.parse(t) > now" "${work}/web/src/observability/usageRows.ts" \
 confirm "${work}/web/src/observability/usageRows.ts" "cacheWriteLanding"
 expect_red "时刻没跟现在比" "没有拿快照里的时刻跟现在比"
 
+# 40. 正文格再写一遍宽：宽度挂在表头上、正文跟着列走才是单点。正文自己再取一次
+#     W，两级行就分成两套宽度——第一条长内容的行会把整列挤偏，而且两边都对、
+#     只是不一样。
+fixture
+sed -i 's|<td>{group.actor}</td>|<td style={{ width: W.actor }}>{group.actor}</td>|' \
+  "${work}/web/src/overlay/ActorTable.tsx"
+confirm "${work}/web/src/overlay/ActorTable.tsx" "<td style={{ width: W.actor }}>"
+expect_red "正文格写了宽" "列宽没有单点定义"
+
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
 bash "${checker}" "${repo}" >"${work}/real.out" 2>&1 || got=$?
