@@ -356,6 +356,20 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
     }
 
     async fn start(&self, ctx: &cog_core::PluginContext) -> cog_core::SFResult<()> {
+        // 分解是一次 LLM 调用，所以它也要读池的判词。在 start 里挂而不是 init：
+        // 发布方与本插件都在 init 发布，谁先谁后不由本 crate 决定。取不到就是一个
+        // 没有池读面的进程——分解照旧，读不到不等于关窗。
+        match (
+            self.action_planner.clone(),
+            ctx.consume_service::<dyn cog_core::LlmPoolStatusSource>(),
+        ) {
+            (Some(planner), Some(source)) => planner.attach_pool_status_source(source),
+            (Some(_), None) => info!(
+                "OrchestratorPlugin: no LLM pool status source; goal decomposition does not consult the pool"
+            ),
+            (None, _) => {}
+        }
+
         // Persistent alert port, published by the observability plugin in
         // init; attach before any goal message can be processed.
         let alert_sink = ctx.consume_service::<dyn cog_core::PersistentAlertSink>();

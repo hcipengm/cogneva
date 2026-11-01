@@ -128,6 +128,17 @@ impl Default for DagExecutorConfig {
 // cap: bound — 落进 pass_ceiling 标签的计数是它的读数：健康的发布者在那里占用为零，占了大头的说明这个数该重调
 const READY_TASKS_PER_PASS: u64 = 200;
 
+/// How long the goal consumer holds before pulling the next goal when the
+/// planner named a wait.
+///
+/// The named wait is the pool's own statement about when it could serve again,
+/// and it can be hours (a monthly quota). Holding for the whole of it would make
+/// intake deaf to a recovery that arrives early, so the wait is capped: on
+/// waking, the same pool verdict is read again and a pool still down is refused
+/// without spending an LLM call. The cap is what makes the hold safe, not what
+/// makes it cheap.
+const GOAL_CONSUMER_MAX_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
+
 /// What one pass may admit, together with the reading it was derived from.
 ///
 /// The pace rides along so a refusal can be logged with the numbers that
@@ -1572,9 +1583,17 @@ impl DagExecutorRuntime {
                         // retry replays it through the same idempotent injection
                         // path; it does not re-submit anything already added.
                         Err(e) => {
+                            // The wait, if the failure named one, is the pool's
+                            // own clock -- not the broker's redelivery timer.
+                            // Leaving the message pending is what makes the goal
+                            // survive; it must not also be what sets the pace,
+                            // because the timer is measured in hundreds of
+                            // seconds and the pool's answer in thousands.
+                            let named_wait = e.retry_after_secs();
                             tracing::warn!(
                                 goal_id = %goal.message_id,
                                 permanent = Self::permanent_refusal(&e),
+                                wait_secs = named_wait,
                                 "ActionPlanner processing failed: {e}"
                             );
                             if Self::permanent_refusal(&e) {
@@ -1584,6 +1603,19 @@ impl DagExecutorRuntime {
                                     .await
                                 {
                                     tracing::warn!(goal_id = %goal.message_id, msg_id = %msg_id, "Failed to ack refused goal message: {e}");
+                                }
+                            } else if let Some(secs) = named_wait {
+                                let hold = std::time::Duration::from_secs(secs)
+                                    .min(GOAL_CONSUMER_MAX_HOLD);
+                                tracing::info!(
+                                    goal_id = %goal.message_id,
+                                    wait_secs = secs,
+                                    hold_secs = hold.as_secs(),
+                                    "goal intake holds for the wait the planner named"
+                                );
+                                tokio::select! {
+                                    _ = shutdown.wait() => break 'subscribe,
+                                    _ = tokio::time::sleep(hold) => {}
                                 }
                             }
                             continue;

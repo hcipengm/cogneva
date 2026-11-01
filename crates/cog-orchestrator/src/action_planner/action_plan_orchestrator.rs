@@ -73,6 +73,10 @@ pub struct ActionPlanOrchestrator {
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
     /// 计划基线所属的 workspace，与任务行的 `workspace_id` 同一来源。
     workspace_id: String,
+    /// 池自己的判词。分解就是一次 LLM 调用，池宣布没有成员能服务时那一次调用
+    /// 不可能成功；判据与准入读同一个快照，不另立一套「还能不能花」的算法。
+    /// 迟挂（插件之间 init 顺序不定），所以挂在 `OnceCell` 上而不是构造参数。
+    pool_source: tokio::sync::OnceCell<Arc<dyn cog_core::LlmPoolStatusSource>>,
 }
 
 impl std::fmt::Debug for ActionPlanOrchestrator {
@@ -121,6 +125,18 @@ impl ActionPlanOrchestrator {
             alert_sink: tokio::sync::RwLock::new(None),
             state_backend: None,
             workspace_id: "default".into(),
+            pool_source: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Attach the pool's own verdict after construction.
+    ///
+    /// Deferred rather than a constructor argument because the publisher and
+    /// this plugin both publish during init and neither is guaranteed to go
+    /// first; `start()` runs after every `init()`.
+    pub fn attach_pool_status_source(&self, source: Arc<dyn cog_core::LlmPoolStatusSource>) {
+        if self.pool_source.set(source).is_err() {
+            tracing::warn!("LLM pool status source already attached to the action planner");
         }
     }
 
@@ -884,6 +900,32 @@ impl ActionPlanOrchestrator {
         // non-deterministic, so retry within this delivery up to the
         // configured bound; hard errors still propagate immediately for
         // stream redelivery.
+        // 池宣布无人可服务时，分解这一次调用在窗口回来之前不可能成功。放它出去
+        // 只是把同一个必然失败的请求再花一遍，而失败把这条目标退回队列、按队列
+        // 自己的节拍重来（实测 300 秒一次，而池自报的等待是 7500 秒），于是
+        // 「等窗口」被读成「一直在试」。这里按池自报的下次探测时刻拒绝，等待
+        // 随错误一起交出去，由消费侧按它停车。
+        //
+        // 快照读不到就当没有这回事：读不到不等于关窗，这是准入面既有的口径。
+        if let Some(source) = self.pool_source.get() {
+            if let Some(status) = source.status().await {
+                if status.unavailable {
+                    let now = Utc::now().timestamp();
+                    let wait = (status.next_attempt_unix > now)
+                        .then(|| (status.next_attempt_unix - now) as u64);
+                    return Err(SFError::upstream_refused_after(
+                        cog_core::contract::llm::UpstreamFailure::RateLimited,
+                        format!(
+                            "LLM upstream pool unavailable: no member can serve this decomposition ({} of {} upstreams suspect)",
+                            status.unavailable_upstreams.len(),
+                            status.pool_size
+                        ),
+                        wait,
+                    ));
+                }
+            }
+        }
+
         let attempts = self.decomposition_max_attempts.max(1);
         let mut plan = None;
         let mut attempts_used = attempts;
@@ -2457,6 +2499,109 @@ mod tests {
     struct PlanRecorder {
         plans: std::sync::Mutex<Vec<cog_core::TaskPlan>>,
         fail_writes: bool,
+    }
+
+    /// 只数「分解有没有真的发出这一次调用」的执行器。
+    #[derive(Default)]
+    struct CountingExecutor {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl TaskExecutor for CountingExecutor {
+        fn supports(&self, _task_type: &TaskType) -> bool {
+            true
+        }
+
+        async fn execute(&self, _task: &Task) -> SFResult<TaskResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(TaskResult {
+                success: true,
+                output: serde_json::json!({ "atomic_tasks": [] }),
+                metadata: TaskResultMetadata::new("counting").with_score(0.9),
+            })
+        }
+    }
+
+    struct FixedPoolStatus(Option<cog_core::LlmPoolStatus>);
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for FixedPoolStatus {
+        async fn status(&self) -> Option<cog_core::LlmPoolStatus> {
+            self.0.clone()
+        }
+    }
+
+    /// 池宣布无人可服务时，分解不能把这一次调用发出去：那个请求在窗口回来之前
+    /// 不可能成功，发出去只是把同一笔花销再付一遍，还把「等窗口」变成「一直在试」。
+    /// 拒绝要带上池自报的下次探测时刻，否则消费侧只能按自己的节拍重来。
+    #[tokio::test]
+    async fn an_unavailable_pool_refuses_the_decomposition_without_spending_a_call() {
+        let executor = Arc::new(CountingExecutor::default());
+        let now = chrono::Utc::now().timestamp();
+        let status = cog_core::LlmPoolStatus {
+            unavailable: true,
+            next_attempt_unix: now + 7_500,
+            unavailable_upstreams: vec!["https://api.kimi.com/coding/v1|k3".into()],
+            pool_size: 2,
+            ..Default::default()
+        };
+        let planner = ActionPlanOrchestrator::new().with_task_executor(executor.clone());
+        planner.attach_pool_status_source(Arc::new(FixedPoolStatus(Some(status))));
+
+        let registry = SkillRegistry::new();
+        let err = planner
+            .process_goal_impl(
+                "work the change backlog",
+                vec![hint_task("sig-pool-1")],
+                &registry,
+            )
+            .await
+            .expect_err("a pool with no serving member must refuse before spending a call");
+
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the decomposition call must not be issued into a pool that declared nothing can serve it"
+        );
+        assert!(
+            err.upstream_failure().is_some(),
+            "the refusal has to be the environment's, not the request's: {err}"
+        );
+        let wait = err
+            .retry_after_secs()
+            .expect("the pool's own next-probe time must travel with the refusal");
+        assert!(
+            (7_400..=7_500).contains(&wait),
+            "the stated wait is the pool's clock, not a policy backoff: {wait}"
+        );
+    }
+
+    /// 池健康（或读不到）时分解照常——准入面「读不到不等于关窗」的同一个口径。
+    #[tokio::test]
+    async fn a_serving_pool_lets_the_decomposition_through() {
+        let executor = Arc::new(CountingExecutor::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(executor.clone())
+            .with_decomposition_max_attempts(1);
+        planner.attach_pool_status_source(Arc::new(FixedPoolStatus(Some(
+            cog_core::LlmPoolStatus::default(),
+        ))));
+
+        let registry = SkillRegistry::new();
+        let _ = planner
+            .process_goal_impl(
+                "work the change backlog",
+                vec![hint_task("sig-pool-2")],
+                &registry,
+            )
+            .await;
+
+        assert_eq!(
+            executor.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a healthy pool must not stop the decomposition"
+        );
     }
 
     #[async_trait::async_trait]
