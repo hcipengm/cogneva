@@ -359,6 +359,8 @@ mod scrape_targets_name_a_port_the_workload_provides_test;
 mod service_account_mount_literals_contract_test;
 #[path = "skill_directories_contract_test.rs"]
 mod skill_directories_contract_test;
+#[path = "sparse_weights_are_loaded_once_contract_test.rs"]
+mod sparse_weights_are_loaded_once_contract_test;
 #[path = "store_counter_window_contract_test.rs"]
 mod store_counter_window_contract_test;
 #[path = "store_tables_are_in_the_restore_bundle_test.rs"]
