@@ -4,15 +4,21 @@
 # 部署脚本里**运行参数**不许写成裸字面量：`TIMEOUT=30` 只能改脚本才能改，
 # 而这台机器上换一个节奏、换一个尺寸是运维动作，不是改写代码。
 #
-# 判据只有一条，因为它得能被机器判：顶层数值声明只有两种合法形状——
+# 判据有两个面，各一条，因为同一种数在脚本里只有这两种写法：
+#
+# 一、顶层数值声明（`TIMEOUT=30`）。只有两种合法形状——
 #   0 / 1        开关。它是"这次怎么跑"，不是"跑多大"，没有可调的量。
 #   ${VAR:-N}    从环境读、默认值兜底。这是"配置化"的及格线。
 # 其余一律红，判词点名文件与行。
 #
-# 为什么不在一个 tab 文件里逐个登记：这张表的内容随脚本增删而变，登记等于把
-# 可算的东西抄一遍；要的只是"不许写死"这一条判据。
+# 二、命令行里的等待/超时（`sleep 30`、`--timeout=600s`）。它们不在行首、也不是
+# `NAME=` 的形状，第一条判据看不见；合法形状同样只有一个：数字从变量来。
 #
-# 反空洞断言：扫描到 0 个声明判红——"一个都没扫到"与"一个都没写死"同形。
+# 为什么不在一个 tab 文件里逐个登记：这张表的内容随脚本增删而变，登记等于把
+# 可算的东西抄一遍；要的只是"不许写死"这条判据本身。
+#
+# 反空洞断言：扫描面太窄、或判据瞎了（一处可扫的东西都没有），都判红——
+# "一个都没扫到"与"一个都没写死"同形。
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS="$(cd "$HERE/.." && pwd)"
@@ -37,8 +43,13 @@ scan() {
 # `-n 3`）有的是尺寸、有的是位置，判据一宽就会把正当用法判红。
 # 合格形状只有一个：数字从变量来（`--timeout="${WAIT}s"`、`sleep "$N"`）——
 # 至于那个变量是 `${X:-默认}` 的声明还是命令行给的，上一条判据已经管了。
+#
+# 注释行不算：这棵树的注释里到处写着「以前这里是 sleep 30，抬不动」这类现场，
+# 那正是判据要留的东西。把它们判红，下一步就是把记录改写成不含数字的含糊句子——
+# 判据没变严，现场先没了。
 scan_inline() {
-    grep -HnE '(^|[^-[:alnum:]_])(sleep|--max-time|--timeout|--timeout-seconds|--retries)[ =][0-9]+' "$@" 2>/dev/null
+    grep -HnE '(^|[^-[:alnum:]_])(sleep|--max-time|--timeout|--timeout-seconds|--retries)[ =][0-9]+' "$@" 2>/dev/null \
+        | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#'
 }
 
 T="$(mktemp -d)"
@@ -53,9 +64,9 @@ out="$(scan "$T/switch.sh" | grep -vE '=[01]$' || true)"
 [ -z "$out" ] && ok "0/1 开关放行" || bad "0/1 开关放行：$out"
 
 # --- 真树：扫得出来、且全都合格 ---
-# 扫的是**在宿主上由人（或 CI）跑的**脚本：`deploy/` 下的全部（测试夹具除外）与
-# `.github/scripts/`。判据只看一棵树时，同一类数在另一棵里写死不会红，而两棵树的
-# 运行者没有区别——都是在别人的机器上执行的运维动作。
+# 扫的是**在宿主上由人（或 CI）跑的**脚本：`deploy/` 下的全部（测试夹具除外）、
+# `.github/scripts/` 与仓库根。判据只看一棵树时，同一类数在另一棵里写死不会红，而
+# 三棵树的运行者没有区别——都是在别人的机器上执行的运维动作。
 #
 # 排除 `deploy/helm/**/files/`：那些脚本在 Pod 里跑，改一次等待的正当路径是 chart
 # 的 value 与 Pod 的 env，不是编辑脚本；把它们收进来只会要求一堆没人能设的变量。
@@ -63,7 +74,15 @@ mapfile -t files < <(find "$REPO/deploy" -name '*.sh' -not -path '*/tests/*' \
     -not -path "$REPO/deploy/helm/*/files/*" | sort)
 mapfile -t gh_scripts < <(find "$REPO/.github/scripts" -maxdepth 1 -name '*.sh' | sort)
 files+=("${gh_scripts[@]}")
-[ "${#files[@]}" -gt 50 ] && ok "扫到 ${#files[@]} 个脚本（deploy 全部 + ${#gh_scripts[@]} 个 .github/scripts）" \
+# 仓库根的那一个（元启动）。它是操作者跑得最多的脚本，也是最容易漏在扫描面外的一个：
+# 既不在 deploy/ 下，也不在 .github/scripts 下。
+mapfile -t root_scripts < <(find "$REPO" -maxdepth 1 -name '*.sh' | sort)
+files+=("${root_scripts[@]}")
+[ "${#root_scripts[@]}" -gt 0 ] \
+    && ok "仓库根的脚本在扫描面里（${root_scripts[*]##*/}）" \
+    || bad "仓库根一个 .sh 都没扫到（元启动漏在面外）"
+[ "${#files[@]}" -gt 50 ] \
+    && ok "扫到 ${#files[@]} 个脚本（deploy 全部 + ${#gh_scripts[@]} 个 .github/scripts + ${#root_scripts[@]} 个仓库根）" \
     || bad "扫描面太窄：${#files[@]} 个脚本"
 # 反空洞的另一半：另两棵树真的被扫进来了，而不是两个没展开的 glob。
 [ "${#gh_scripts[@]}" -gt 0 ] \
@@ -100,6 +119,10 @@ printf 'kubectl wait --for=condition=Ready pod/x --timeout=600s\nsleep 30\n' >"$
 printf 'kubectl wait --for=condition=Ready pod/x --timeout="${WAIT}s"\nsleep "$POLL"\n' >"$T/inline-ok.sh"
 out="$(scan_inline "$T/inline-ok.sh")"
 [ -z "$out" ] && ok "从变量来的等待数放行" || bad "从变量来的等待数被判红：$out"
+
+printf '  # 以前这里是 sleep 30，慢机器上抬不动\nrun_thing\n' >"$T/inline-comment.sh"
+out="$(scan_inline "$T/inline-comment.sh")"
+[ -z "$out" ] && ok "注释里的等待数放行（现场要留得住）" || bad "注释里的等待数被判红：$out"
 
 inline_bad="$(scan_inline "${files[@]}")"
 if [ -z "$inline_bad" ]; then
