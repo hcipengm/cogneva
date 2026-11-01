@@ -3129,6 +3129,62 @@ mod tests {
         );
     }
 
+    /// 上面那条数的是「一次变更里有几条 gated 命令」，而它读的是**两份
+    /// `include_str!`**。这个形状的失败不响：别处新增一处 `build_gate::acquire(`，
+    /// 上面那个 3 一位都不会动——它数的是两份文件，不是这棵 crate。
+    ///
+    /// 所以这里从 `src/` 现数一遍，把「谁在拿构建槽」钉成一份从树里读出来的名单。
+    /// 名单一变，改的人就得当场回答问题：这一处属于一次变更（上面的计数跟着动），
+    /// 还是不属于（在这里写清它读的是什么）。两种都是回答，悄悄多出来不是。
+    #[test]
+    fn every_source_file_that_takes_the_build_slot_is_known_to_the_count_above() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&src, &mut files);
+        let mut holders: Vec<String> = files
+            .iter()
+            .filter(|path| {
+                std::fs::read_to_string(path)
+                    .map(|text| production_text(&text).contains("build_gate::acquire("))
+                    .unwrap_or(false)
+            })
+            .map(|path| {
+                path.strip_prefix(&src)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        holders.sort();
+
+        // `baseline_port` 那一处排的是基线，不在「一次变更」的时间界里——所以上面
+        // 那个 3 不该把它加上；但它一样在拿构建槽，漏读它就等于对「槽在谁手上」
+        // 少算一份，而槽被谁长久持着正是代价最贵的那件事。
+        assert_eq!(
+            holders,
+            vec![
+                "baseline_port.rs".to_string(),
+                "change_pipeline.rs".to_string(),
+                "evolution_deployer.rs".to_string()
+            ],
+            "拿构建槽的源文件变了：上面那条计数只读了两份文件，新的一处它看不见"
+        );
+    }
+
     /// The seeded source of the formatting fixtures: line 2 is the line the two
     /// tests change, so they differ in nothing else.
     const FORMATTED_PROBE_SOURCE: &str = "pub fn answer() -> i32 {\n    41\n}\n";
