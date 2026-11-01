@@ -44,8 +44,27 @@ PROBE_WAIT_SECS="${COGNEVA_EXPORTER_PROBE_WAIT_SECS:-30}"
 PROBE_INTERVAL_SECS="${COGNEVA_EXPORTER_PROBE_INTERVAL_SECS:-1}"
 # 单次 curl 的上限：一次抓取要么在这之内回来，要么就是在等端口，不是某个指标太慢。
 PROBE_CURL_MAX_TIME="${COGNEVA_EXPORTER_PROBE_CURL_MAX_TIME:-5}"
+# `die` 还没定义（它在下面），所以这三条自己报错。先判形状再判大小：`0` 会让次数
+# 变成除零、非数字会让 `-ge` 报算术错，而这两种退出读起来都与真正的失败无关。
+for probe_secs in "${PROBE_WAIT_SECS}" "${PROBE_INTERVAL_SECS}"; do
+    case "${probe_secs}" in
+        ''|*[!0-9]*)
+            printf 'POSTGRES-EXPORTER-SURFACE: 等 port-forward 的两个数必须是非负整数（秒）：%s/%s\n' \
+                "${PROBE_WAIT_SECS}" "${PROBE_INTERVAL_SECS}" >&2
+            exit 2
+            ;;
+    esac
+done
+unset probe_secs
+# 间隔为 0 要在算出次数**之前**拦：0 是合法数字，过了上面那条形状检查，却会让
+# 下面那行除零。
+if [ "${PROBE_INTERVAL_SECS}" -lt 1 ]; then
+    printf 'POSTGRES-EXPORTER-SURFACE: COGNEVA_EXPORTER_PROBE_INTERVAL_SECS 必须至少是 1 秒：%s\n' \
+        "${PROBE_INTERVAL_SECS}" >&2
+    exit 2
+fi
 PROBE_ATTEMPTS=$((PROBE_WAIT_SECS / PROBE_INTERVAL_SECS))
-# `die` 还没定义（它在下面），这里自己报错：等不到的次数为 0 会让轮询变成「一次都不试」。
+# 次数为 0 会让轮询变成「一次都不试」，而端口还没通时那读起来像「集群里没有边车」。
 if [ "${PROBE_ATTEMPTS}" -lt 1 ]; then
     printf 'POSTGRES-EXPORTER-SURFACE: COGNEVA_EXPORTER_PROBE_WAIT_SECS 必须不小于 COGNEVA_EXPORTER_PROBE_INTERVAL_SECS：%s/%s\n' \
         "${PROBE_WAIT_SECS}" "${PROBE_INTERVAL_SECS}" >&2
