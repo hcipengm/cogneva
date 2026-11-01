@@ -17,6 +17,46 @@ pub fn global_observable() -> Arc<LlmObservable> {
         .clone()
 }
 
+/// Why a call failed, as a closed set.
+///
+/// One number for every failure says a call went wrong and nothing about what to
+/// do next. The two shapes here are repaired in different places: a call that
+/// ended before a stream existed never reached the model, so the endpoint, the
+/// key or the transport is the subject; a response that came back carrying an
+/// error did reach the model, so the subject is what was asked for -- the
+/// prompt, the token count, the model name. Measured on 2026-11-01 the platform
+/// was dark for hours with the reason nowhere on this face: the gateway's own
+/// series names the upstream, and the layer that holds the conversation could
+/// not say whether a "no answer" was a refusal in transit or an answer that was
+/// itself an error.
+///
+/// The two are emitted as two series every time, including at zero. An absent
+/// series and a zero series are different readings -- "nobody measured this" and
+/// "measured, nothing failed" -- and a reader that sees neither cannot tell a
+/// quiet layer from one that was never wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallFailure {
+    /// The call ended without producing a stream or a response.
+    NoStream,
+    /// A response arrived and it carries an error body.
+    InResponse,
+}
+
+impl CallFailure {
+    /// Both members, in the order they are published. Written out rather than
+    /// derived, because it is the list the emitter iterates: a variant left out
+    /// here would be counted and never printed.
+    pub const ALL: [Self; 2] = [Self::NoStream, Self::InResponse];
+
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoStream => "no_stream",
+            Self::InResponse => "in_response",
+        }
+    }
+}
+
 /// LLM-layer observable state.
 #[derive(Default)]
 pub struct LlmObservable {
@@ -26,7 +66,8 @@ pub struct LlmObservable {
     total_latency_ms: AtomicU64,
     ttft_ms: AtomicU64,
     ttft_count: AtomicU64,
-    error_count: AtomicU64,
+    error_no_stream: AtomicU64,
+    error_in_response: AtomicU64,
 }
 
 impl LlmObservable {
@@ -48,8 +89,12 @@ impl LlmObservable {
         self.ttft_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_error(&self) {
-        self.error_count.fetch_add(1, Ordering::Relaxed);
+    pub fn record_error(&self, failure: CallFailure) {
+        let cell = match failure {
+            CallFailure::NoStream => &self.error_no_stream,
+            CallFailure::InResponse => &self.error_in_response,
+        };
+        cell.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -68,10 +113,16 @@ impl Observable for LlmObservable {
                 "llm_token_out",
                 self.token_out.load(Ordering::Relaxed) as f64,
             ));
-            metrics.push(RawMetric::new(
-                "llm_error_count",
-                self.error_count.load(Ordering::Relaxed) as f64,
-            ));
+            for failure in CallFailure::ALL {
+                let count = match failure {
+                    CallFailure::NoStream => &self.error_no_stream,
+                    CallFailure::InResponse => &self.error_in_response,
+                };
+                metrics.push(
+                    RawMetric::new("llm_error_count", count.load(Ordering::Relaxed) as f64)
+                        .with_label("reason", failure.as_str()),
+                );
+            }
             if calls > 0 {
                 let total_latency = self.total_latency_ms.load(Ordering::Relaxed);
                 metrics.push(RawMetric::new(

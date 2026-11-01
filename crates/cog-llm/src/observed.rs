@@ -7,7 +7,7 @@ use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::observable::{global_observable, LlmObservable};
+use crate::observable::{global_observable, CallFailure, LlmObservable};
 
 /// 观测那一跳的容量。
 ///
@@ -66,7 +66,7 @@ fn is_content_delta(event: &AssistantMessageEvent) -> bool {
 /// 两条路径才不会各写各的、把同一次调用数出两个结果。
 fn record_terminal(obs: &LlmObservable, response: &ChatResponse, latency_ms: u64) {
     if response.error_message.is_some() {
-        obs.record_error();
+        obs.record_error(CallFailure::InResponse);
     } else {
         obs.record_call(
             response.usage.input as u64,
@@ -122,7 +122,7 @@ impl LlmClient for ObservedLlmClient {
                 // 连流都没拿到——上游在首字节之前就拒了，agent 的流量正是
                 // 这个形态失败的。这一跳的失败面就在这条路上，不记在这里
                 // 就等于「上游全拒」在 D9 上留下一个 0。
-                self.obs.record_error();
+                self.obs.record_error(CallFailure::NoStream);
                 Err(e)
             }
         }
@@ -137,7 +137,7 @@ impl LlmClient for ObservedLlmClient {
         match self.inner.complete_stream(prompt, options).await {
             Ok(stream) => Ok(observed_stream(stream, self.obs.clone(), start)),
             Err(e) => {
-                self.obs.record_error();
+                self.obs.record_error(CallFailure::NoStream);
                 Err(e)
             }
         }
@@ -151,7 +151,7 @@ impl LlmClient for ObservedLlmClient {
                 Ok(response)
             }
             Err(e) => {
-                self.obs.record_error();
+                self.obs.record_error(CallFailure::NoStream);
                 Err(e)
             }
         }
@@ -283,6 +283,20 @@ mod tests {
             .map(|m| m.value)
     }
 
+    /// 同一个名字下按 `reason` 取一格。名字本身不再唯一：失败的两个成因
+    /// 是两条序列，只按名字取会稳定地读到排在前面的那一条。
+    async fn failed(obs: &LlmObservable, reason: &str) -> Option<f64> {
+        obs.collect_metrics("D9")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| {
+                m.name == "llm_error_count"
+                    && m.labels.get("reason").map(String::as_str) == Some(reason)
+            })
+            .map(|m| m.value)
+    }
+
     /// 把流读到底，等观测那一跳收尾。
     async fn drain(stream: &mut AssistantMessageEventStream) {
         while stream.next().await.is_some() {}
@@ -300,7 +314,10 @@ mod tests {
         assert_eq!(reading(&obs, "llm_call_count").await, Some(1.0));
         assert_eq!(reading(&obs, "llm_token_in").await, Some(5.0));
         assert_eq!(reading(&obs, "llm_token_out").await, Some(7.0));
-        assert_eq!(reading(&obs, "llm_error_count").await, Some(0.0));
+        // 两个成因各是一条序列，成功的这一跳两条都在且都是 0——「量到零」
+        // 与「没量」是两种读数，缺一条就等于这一段没被量过。
+        assert_eq!(failed(&obs, "no_stream").await, Some(0.0));
+        assert_eq!(failed(&obs, "in_response").await, Some(0.0));
         // 有内容增量才有 TTFT，且这两个读数只在 calls > 0 时发布。
         assert!(reading(&obs, "llm_avg_ttft_ms").await.is_some());
         assert!(reading(&obs, "llm_avg_latency_ms").await.is_some());
@@ -315,7 +332,10 @@ mod tests {
             .unwrap();
         drain(&mut stream).await;
 
-        assert_eq!(reading(&obs, "llm_error_count").await, Some(1.0));
+        // 流是拿到了的，错在答复本身：这一格记在 `in_response` 上。记成
+        // `no_stream` 会把「模型返回了一个错误」读成「没走到模型」。
+        assert_eq!(failed(&obs, "in_response").await, Some(1.0));
+        assert_eq!(failed(&obs, "no_stream").await, Some(0.0));
         assert_eq!(reading(&obs, "llm_call_count").await, Some(0.0));
         assert_eq!(reading(&obs, "llm_token_in").await, Some(0.0));
         assert!(
@@ -332,7 +352,8 @@ mod tests {
             .await
             .is_err());
 
-        assert_eq!(reading(&obs, "llm_error_count").await, Some(1.0));
+        assert_eq!(failed(&obs, "no_stream").await, Some(1.0));
+        assert_eq!(failed(&obs, "in_response").await, Some(0.0));
         assert_eq!(reading(&obs, "llm_call_count").await, Some(0.0));
     }
 
@@ -380,7 +401,41 @@ mod tests {
             .await
             .is_err());
 
-        assert_eq!(reading(&obs, "llm_error_count").await, Some(1.0));
+        assert_eq!(failed(&obs, "no_stream").await, Some(1.0));
+        assert_eq!(failed(&obs, "in_response").await, Some(0.0));
         assert_eq!(reading(&obs, "llm_call_count").await, Some(0.0));
+    }
+
+    /// 两个成因加起来就是这一层失败的总数：分开记之后，「一共失败几次」仍
+    /// 读得出来，且不会被两条序列各算一遍。
+    #[tokio::test]
+    async fn the_two_failure_shapes_add_up_to_every_failure() {
+        let (stream_refused, stream_obs) = client(Outcome::Refused);
+        let mut stream = stream_refused
+            .chat_stream(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .unwrap();
+        drain(&mut stream).await;
+
+        let (unreached, unreached_obs) = client(Outcome::ConnectFailure);
+        assert!(unreached
+            .chat(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .is_err());
+
+        assert_eq!(failed(&stream_obs, "in_response").await, Some(1.0));
+        assert_eq!(failed(&unreached_obs, "no_stream").await, Some(1.0));
+        // A call that never reached the model is not also an answer that
+        // carried an error: the second count stays at zero.
+        assert_eq!(failed(&unreached_obs, "in_response").await, Some(0.0));
+        let published: f64 = unreached_obs
+            .collect_metrics("D9")
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|m| m.name == "llm_error_count")
+            .map(|m| m.value)
+            .sum();
+        assert_eq!(published, 1.0, "两条序列相加就是这一层的失败次数");
     }
 }
