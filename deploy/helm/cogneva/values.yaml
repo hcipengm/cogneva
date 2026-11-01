@@ -1100,12 +1100,21 @@ backends:
     storage: 10Gi
     # Resource bounds live here, not in the template, so the tunables registry can
     # see them (it enumerates the numeric leaves of this file only).
+    #
+    # 2026-11-01: the limit was 1000m and the database spent 0.55 of its
+    # periods throttled at an average of 253m -- a quota that a bursty
+    # single-connection-per-client workload exhausts in 100ms samples even
+    # though its average sits far below it. Every loop in the platform waits
+    # on this one, so the throttle is the latency of everything. Raised to
+    # 2000m and the request to match what it actually draws, which is also
+    # what the scheduler was under-provisioning: the namespace quota had 10.8
+    # of its 38 cores free and the node 24 idle.
     resources:
       requests:
-        cpu: 250m
+        cpu: 500m
         memory: 512Mi
       limits:
-        cpu: 1000m
+        cpu: 2000m
         memory: 2Gi
     # 边车只跑十来条只读查询，用量按抓取间隔计量；上限要覆盖的是 exporter 的
     # Go 堆随抓取次数与库表数增长后的规模，而不是稳态均值——上限压得太贴近

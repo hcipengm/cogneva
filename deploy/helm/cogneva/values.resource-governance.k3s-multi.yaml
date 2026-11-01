@@ -6,7 +6,7 @@ resourceGovernance:
   quota:
     requestsCpu: "5"
     requestsMemory: 19Gi
-    limitsCpu: "38"
+    limitsCpu: "39"
     limitsMemory: 73Gi
     pods: "42"
     requestsStorage: 494Gi
