@@ -26,9 +26,17 @@ use crate::bge_m3_sparse_linear::{BIAS, WEIGHT};
 
 /// 一批多少条。与建立会话那一侧用的分批大小一致——`BatchLongest` 补齐意味着
 /// 换一个批大小，同一句话就可能补到另一个长度。
+// cap: derived — 照抄 fastembed 建立会话那一侧的分批大小；两侧取的是同一个数，那边改了这里要一起看
 pub(crate) const BATCH: usize = 256;
 
+/// 权重目录里指向「当前这一版」的那份引用文件名。
+///
+/// 会话那一侧按同一套缓存布局找权重，读的就是这一个；这里抄成常量而不是就地再写一遍，
+/// 是因为两处写成同一段字面量时，改了一处不会让另一处红。
+const CURRENT_REF: &str = "refs/main";
+
 /// 截断长度上限。同样取建立会话那一侧的默认值。
+// cap: derived — 与建立会话那一侧取同一个截断长度；两侧必须一致，那边改了这里要一起看
 const MAX_LENGTH: usize = 512;
 
 /// BGE-M3 词表里 `<s>`、`<pad>`、`</s>`、`<unk>` 的编号，稀疏权重不计它们。
@@ -160,8 +168,9 @@ fn snapshot_dir(cache_dir: Option<&Path>) -> Result<std::path::PathBuf, String> 
         None => std::path::PathBuf::from(fastembed::get_cache_dir()),
     };
     let repo = root.join("models--BAAI--bge-m3");
-    let rev = std::fs::read_to_string(repo.join("refs/main"))
-        .map_err(|e| format!("读不出 {}：{e}", repo.join("refs/main").display()))?;
+    let rev_path = repo.join(CURRENT_REF);
+    let rev = std::fs::read_to_string(&rev_path)
+        .map_err(|e| format!("读不出 {}：{e}", rev_path.display()))?;
     let dir = repo.join("snapshots").join(rev.trim());
     if !dir.is_dir() {
         return Err(format!("权重快照不在：{}", dir.display()));
