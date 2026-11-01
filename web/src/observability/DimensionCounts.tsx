@@ -31,7 +31,7 @@ export function DimensionCounts({ actors }: { actors: ActorUsage[] }) {
   const [open, setOpen] = useState<string | null>(ACTOR.key);
 
   return (
-    <div className="border-l border-[var(--line)] py-2 pl-3 pr-4">
+    <div className="rail py-2 pr-4">
       <div className="flex flex-wrap items-start gap-x-6 gap-y-2">
         {DIMENSIONS.map((dim) => {
           const list = members(actors, dim);

@@ -140,6 +140,7 @@ export function TokenPanel() {
         </div>
         <div>
           <h3>谁在花</h3>
+          <div className="rail py-2 pr-4">{ACTOR_MEANINGS.eval}</div>
           <ActorTable actors={[]} />
           <Note text="四格合起来才是唯一的一行">?</Note>
         </div>
@@ -163,6 +164,14 @@ EOF
 .note-panel {
   position: fixed;
   user-select: text;
+}
+.rail {
+  border-left: 1px solid var(--line);
+  padding-left: calc(1rem - 1px);
+}
+.grid-table > thead > tr > th:first-child,
+.grid-table > tbody > tr > td:first-child {
+  padding-left: 0;
 }
 EOF
   cat >"${work}/web/src/observability/usageRows.ts" <<'EOF'
@@ -737,6 +746,24 @@ sed -i 's|<td>{group.actor}</td>|<td style={{ width: W.actor }}>{group.actor}</t
   "${work}/web/src/overlay/ActorTable.tsx"
 confirm "${work}/web/src/overlay/ActorTable.tsx" "<td style={{ width: W.actor }}>"
 expect_red "正文格写了宽" "列宽没有单点定义"
+
+# 41. 用了 `rail` 的块又自己写一处左边距：竖线来自一处、内边距来自另一处，两块
+#     差几像素——单看每一块都对，并排看就是没对齐。这正是这一屏原来的样子。
+fixture
+sed -i 's|<div className="rail py-2 pr-4">|<div className="rail py-2 pl-3 pr-4">|' \
+  "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" 'className="rail py-2 pl-3 pr-4"'
+expect_red "左轨又写一遍" "又写了"
+
+# 42. 表首列归零那条规则删掉：格子自带的 10px 内边距叠在容器的 gutter 上，第一列
+#     比它上方的标题右移一格，而屏上不会有任何东西报错。
+fixture
+sed -i '/grid-table > thead > tr > th:first-child/,/^}/d' \
+  "${work}/web/src/styles/tokens.css"
+grep -qF "td:first-child" "${work}/web/src/styles/tokens.css" \
+  && fail "改动没落到 tokens.css：首列归零那条规则还在"
+confirm "${work}/web/src/styles/tokens.css" ".rail {"
+expect_red "表首列没归零" "没有把表首列的左边距归零"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0

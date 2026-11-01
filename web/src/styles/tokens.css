@@ -102,6 +102,22 @@
 .grid-table tbody tr:hover td {
   background: color-mix(in srgb, var(--ink-700) 70%, transparent);
 }
+/* 首列不重复容器的 gutter：格子自带 10px 左边距，再叠上容器自己的 `px-4`，
+   表里的第一列就比它上方那个标题右移 10px——同一屏里读数格、计数格、表格三块
+   各有各的左线，读者看到的是「对不齐」。首列与容器共一条左轨，其余列照旧分开。 */
+.grid-table > thead > tr > th:first-child,
+.grid-table > tbody > tr > td:first-child {
+  padding-left: 0;
+}
+
+/* 读数区块共用的一条左轨：竖线画在容器的内容边缘，正文落在容器 `px-4` 落的地方
+   （`1rem` 是那条 gutter，减掉竖线自己的 1px）。写在一处，是因为这几个块各自抄
+   一个像素值时，屏幕上就出现几条相差两三像素的左线——单看每一块都对，并排看
+   就是没对齐。 */
+.rail {
+  border-left: 1px solid var(--line);
+  padding-left: calc(1rem - 1px);
+}
 
 /* 注释面板：悬停或聚焦时浮在触发元素旁边，字可选中、复制。
    坐标由组件按触发元素的包围盒算出来（`position: fixed`），所以在表格与滚动容器里

@@ -847,6 +847,76 @@ else:
         "缓存写入下次进账: " + ", ".join(rel for rel in landing_cells if "llm_pool" in read(rel))
     )
 
+# ── 14. 三块读数共一条左轨 ──
+# 「谁在花」那一屏里，读数格、四格计数、执行者表三块各自决定自己的左边距时，单看
+# 每一块都对，并排看就是几条相差两三像素的左线——「对不齐」不是某一块算错了，是
+# 有几个左轨。判据只有一条：左轨定义在一处（tokens.css 的 `.rail`），用了它的组件
+# 不许把同一件事在 class 串里再写一遍；表首列也不许把容器的 gutter 叠第二遍。
+before = len(problems)
+rail_css_path = os.path.join(WEB, "styles/tokens.css")
+rail_css = open(rail_css_path, encoding="utf-8").read() if os.path.isfile(rail_css_path) else ""
+rail_rules = re.findall(r"\.rail\s*\{([^}]*)\}", rail_css)
+if len(rail_rules) != 1:
+    problems.append(
+        f"styles/tokens.css 里 `.rail` 的规则有 {len(rail_rules)} 条——"
+        "左轨定义两处，两块就会差几像素"
+    )
+else:
+    missing = [
+        piece
+        for piece in ("border-left", "padding-left: calc(1rem - 1px)")
+        if piece not in rail_rules[0]
+    ]
+    if missing:
+        problems.append(
+            "styles/tokens.css 的 `.rail` 缺 "
+            + "、".join(missing)
+            + "：竖线与内边距不在一处，每一块又会各抄一个像素值"
+        )
+rail_users = []
+for rel in sorted(graph):
+    for classes in re.findall(r'className="([^"]*)"', read(rel)):
+        tokens = classes.split()
+        if "rail" not in tokens:
+            continue
+        restated = [t for t in tokens if t == "border-l" or re.fullmatch(r"pl-.*", t)]
+        if restated:
+            problems.append(
+                f"{rel}: `rail` 那一串 class 里又写了 {'、'.join(restated)}——"
+                "同一个左边距写两遍，第二遍迟早和第一遍不一样"
+            )
+        else:
+            rail_users.append(rel)
+if not rail_users:
+    problems.append(
+        "可达图里没有组件用 `.rail`：读数块又各自抄自己的左边距，「谁在花」那一屏对不齐"
+    )
+# 画读数的那两格必须在用它的名单里。只判「用的人没有再写一遍」不够：把 `rail`
+# 整个从读数格上摘掉也是「没有再写一遍」——左边距退回到格子自己的内边距，而
+# 上一句照样绿。夹具里没有这两个组件，这一条就在真树上判。
+for name in ("Reading", "DimensionCounts"):
+    defs = [
+        rel
+        for rel in sorted(graph)
+        if re.search(rf"export\s+function\s+{name}\s*\(", read(rel))
+    ]
+    if defs and not any('className="rail' in read(rel) for rel in defs):
+        problems.append(
+            f"{defs[0]}: 读数格没走 `.rail`——它自己那一处左边距会和别的块差几像素，"
+            "单看每一块都对"
+        )
+# 表格格子自带 10px 左边距，容器的 gutter 再叠一遍，第一列就比它上方的标题右移 10px。
+# 这条规则被删掉时屏上不会报错，只会重新错开一格。
+if not re.search(
+    r"\.grid-table[^{}]*td:first-child[^{}]*\{[^}]*padding-left:\s*0", rail_css
+):
+    problems.append(
+        "styles/tokens.css 没有把表首列的左边距归零——"
+        "第一列会比它自己的标题右移一个 gutter，而屏上没有任何东西会红"
+    )
+if len(problems) == before:
+    summary.append("左轨: `.rail` 单点定义，" + "、".join(rail_users) + " 共用；表首列不叠 gutter")
+
 if problems:
     sys.exit("令牌花销读面的消费者不合格：\n  " + "\n  ".join(problems))
 

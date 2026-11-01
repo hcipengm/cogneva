@@ -148,7 +148,7 @@ export function Reading({
         }
       : null;
   return (
-    <div className="border-l border-[var(--line)] py-1 pl-3 pr-4">
+    <div className="rail py-1 pr-4">
       <div className="mono text-[17px] leading-tight" style={{ color }}>
         {subject ? (
           <Note
