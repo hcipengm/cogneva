@@ -10,12 +10,19 @@
 //! gateway restart and a period with no traffic at all.
 //!
 //! No lease guards it. A lease answers "which replica may act", and here every
-//! replica acting is harmless by construction: the fold's rows are keyed on the
-//! window they cover, so two processes rolling the same window upsert the same
-//! rows with the same values. Correctness comes from the work being recomputable
-//! from the ledger, not from a single writer — so the loop does not need to know
-//! whether it is the only one running, and a replica that was down during a
-//! window still catches that window up on its next pass.
+//! replica acting is harmless: the fold's rows are keyed on the window they
+//! cover, so two processes rolling the same window upsert the same rows. They
+//! agree on the values because the read and the write are not atomic but the
+//! input is stable — a closed window's source rows no longer grow, since the
+//! ledger stamps each row with the time it was accepted and offers no way to
+//! backdate one. Two writers racing can only interleave their two statements;
+//! neither can see a window that a third party is still appending to. Give the
+//! ledger a backdating path and that argument lapses: the fold would then need
+//! a lease, or a watermark the write path enforces. Correctness otherwise comes
+//! from the work being recomputable from the ledger, not from a single writer —
+//! so the loop does not need to know whether it is the only one running, and a
+//! replica that was down during a window still catches that window up on its
+//! next pass.
 
 use std::sync::Arc;
 use std::time::Duration;
