@@ -14,9 +14,12 @@
 #   静态腿（任何机器都跑）——从 SQL 里读出 relkind 清单，要求 CASE 分派覆盖清单里的
 #     每一种；要求附属序列的排除条件同时覆盖 'a'（serial）与 'i'（identity 列），
 #     因为两种都会让 Postgres 拒绝单独换属主。修复前的写法在这里当反例，它必须红。
+#     它还比两份清单：迁移里 `CREATE EXTENSION` 要的每一项，引导脚本都得先装好——
+#     迁移是业务角色跑的，而那个角色没有「当前库的 CREATE」，装不动扩展。
 #   实跑腿（有 COGNEVA_TEST_DATABASE_URL 且指向 localhost 时）——建一个探针库，造出
-#     serial / identity / 独立序列 / 视图 / 物化视图 / 分区，跑真的这段脚本，再判
-#     public 下没有对象还挂在别人名下；随后拿旧写法当反例，它必须失败。
+#     serial / identity / 独立序列 / 视图 / 物化视图 / 分区 / backup_drills，跑真的
+#     这段脚本，再判 public 下没有对象还挂在别人名下、演练那个角色的三样权限真的落到
+#     库上；随后拿旧写法当反例，它必须失败。
 #
 # 跑法：bash deploy/scripts/tests/db-role-bootstrap-ownership.test.sh
 # 探针库只建在 localhost 上：这一步会建库、建角色、改属主，指到别处就是拿别人的
@@ -38,6 +41,8 @@ probe_cleanup() {
         "DROP DATABASE IF EXISTS ${probe_db}" >/dev/null 2>&1 || true
     psql -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d postgres -tAqc \
         "DROP ROLE IF EXISTS cog_app" >/dev/null 2>&1 || true
+    psql -h "${PGHOST}" -p "${PGPORT}" -U "${PGUSER}" -d postgres -tAqc \
+        "DROP ROLE IF EXISTS cog_backup" >/dev/null 2>&1 || true
 }
 trap 'probe_cleanup; rm -rf "${work}"' EXIT
 
@@ -115,6 +120,21 @@ cat >"${old_form}" <<'OLD'
 OLD
 static_leg "${old_form}" >/dev/null && fail "修复前的写法在这条静态腿上跑得过：没有区分力"
 
+# ---- 迁移要的扩展在引导这一步装好 -----------------------------------------
+
+# 迁移是**业务角色**在启动时跑的，而装扩展要「当前库的 CREATE」——那个权限没给
+# 业务角色。所以每一项迁移要的扩展都必须在引导这一步、在还拿得动它的角色手里先装好，
+# 否则新装机的第一次启动停在第一条迁移上。两边按名字比，少一个就红。
+mig_ext="${work}/mig-ext.txt"
+boot_ext="${work}/boot-ext.txt"
+grep -rho 'CREATE EXTENSION IF NOT EXISTS "[a-z0-9_-]*"' \
+    "${repo}/crates/cog-storage/migrations" | sed 's/.*NOT EXISTS "//; s/"$//' | sort -u >"${mig_ext}"
+grep -o 'CREATE EXTENSION IF NOT EXISTS "[a-z0-9_-]*"' \
+    "${sql_file}" | sed 's/.*NOT EXISTS "//; s/"$//' | sort -u >"${boot_ext}"
+[ -s "${mig_ext}" ] || fail "迁移里一个 CREATE EXTENSION 都没读到：这条判据没有分母"
+missing_ext="$(comm -23 "${mig_ext}" "${boot_ext}")"
+[ -z "${missing_ext}" ] || fail "迁移要的扩展没有在引导脚本里预装：${missing_ext//$'\n'/ }（新装机第一次启动会停在第一条迁移上）"
+
 # ---- 实跑腿 -------------------------------------------------------------
 
 url="${COGNEVA_TEST_DATABASE_URL:-}"
@@ -179,13 +199,18 @@ make_fixture() {
            ALTER VIEW v_plain OWNER TO cog_user;
            ALTER MATERIALIZED VIEW mv_plain OWNER TO cog_user;
            ALTER TABLE t_part OWNER TO cog_user;
-           ALTER TABLE t_part_1 OWNER TO cog_user;" >/dev/null \
+           ALTER TABLE t_part_1 OWNER TO cog_user;
+           -- 引导脚本会等这张表出现再授写权（新装机上它由迁移建出来），所以夹具
+           -- 里也得有，否则这一趟会等满 4 分钟再判红——红的原因是夹具缺东西，
+           -- 不是它要判的那段 SQL。
+           CREATE TABLE backup_drills (drill_id text PRIMARY KEY);
+           ALTER TABLE backup_drills OWNER TO cog_user;" >/dev/null \
         || fail "夹具造不出来"
 }
 make_fixture
 
 PGHOST="${PGHOST}" PGPORT="${PGPORT}" PGUSER=cog_user PGPASSWORD="${probe_pw}" \
-    PGDATABASE="${probe_db}" APP_PASSWORD=probe-password \
+    PGDATABASE="${probe_db}" APP_PASSWORD=probe-password BACKUP_PASSWORD=probe-backup-password \
     bash "${sql_file}" >/dev/null 2>"${work}/bootstrap.err" \
     || fail "引导脚本在真库上失败：$(tail -3 "${work}/bootstrap.err")"
 
@@ -194,6 +219,18 @@ left="$(in_db "select count(*) from pg_class c join pg_namespace n on n.oid = c.
                    and c.relkind in ('r', 'p', 'v', 'm', 'S')
                    and c.relowner <> (select oid from pg_roles where rolname = 'cog_app')")"
 [ "${left}" = 0 ] || fail "还有 ${left} 个对象没挪到 cog_app 名下"
+
+# 演练那个角色的三样权限真的落到了库上——判的是 `has_table_privilege` 那类事实，
+# 不是脚本里的那行字（静态腿判形状，这一格判它真的生效）。少一样，演练的失败会
+# 推到一个与权限无关的地方去：恢复跑完、比对通过，最后死在写自己那一行上。
+[ "$(in_db "select has_table_privilege('cog_backup', 'public.backup_drills', 'INSERT')")" = t ] \
+    || fail "cog_backup 写不进 backup_drills：演练记不下自己那一行"
+[ "$(in_db "select has_table_privilege('cog_backup', 'public.t_plain', 'SELECT')")" = t ] \
+    || fail "cog_backup 读不到全部表：比对会漏表，而漏掉的那几张读起来像一致"
+[ "$(in_db "select rolcreatedb from pg_roles where rolname = 'cog_backup'")" = t ] \
+    || fail "cog_backup 没有 CREATEDB：演练建不出一次性库，连恢复都开始不了"
+[ "$(in_db "select rolsuper from pg_roles where rolname = 'cog_backup'")" = f ] \
+    || fail "cog_backup 带上了超权位：换角色换了个寂寞"
 
 # 反例：旧写法（对每种对象都发 ALTER TABLE）必须在同一份夹具上失败。它若跑得过，
 # 上面那条判据就没有区分力——这条门判的是「种类要对上」，不是「脚本跑完了」。

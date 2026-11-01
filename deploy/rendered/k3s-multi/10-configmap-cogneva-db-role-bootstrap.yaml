@@ -18,9 +18,21 @@ data:
     #!/bin/sh
     # 业务连库的角色不是实例的超级用户。
     #
-    # 这一步把 cog_app 做实：建角色、设口令、把 cogneva 库里现有对象的所有权从
-    # 超级用户挪到它名下，再给它 public 上的 CREATE。之后业务 Pod 换成它连库，
-    # 而 cog_user 只剩数据库自身、备份导出与演练在用。
+    # 这一步把两个受限角色做实：
+    #   cog_app    —— 业务 Pod 连库用的那个。建角色、设口令、把 cogneva 库里现有对象的
+    #                 所有权从超级用户挪到它名下、给它 public 上的 CREATE。
+    #   cog_backup —— 备份演练连源库用的那个。它要在同一台服务器上建一个一次性库，
+    #                 所以带 CREATEDB；要逐表比对行数，所以要能读全部表；要回写自己
+    #                 那一行结果，所以要对 backup_drills 有写权。
+    #
+    # 超权位收不掉，这一条要写明白：`cog_user` 是 initdb 建出来的那个角色
+    # （`POSTGRES_USER`），PostgreSQL 16 起**不许任何人**把它降成 NOSUPERUSER——
+    # 2026-11-01 实测，用另一个超级用户去降也一样，报
+    # `permission denied to alter role / The bootstrap user must have the SUPERUSER
+    # attribute`。原因是它同时是 `postgres --single` 唯一能进的那个人，抬不回来的
+    # 代价比留着它更大。所以这里的目标不是「零超权角色」，而是**没有任何工作负载连它**：
+    # 业务与备份导出在 cog_app，备份演练在 cog_backup（后者原先连的是 cog_user），
+    # cog_user 的口令不再注入任何 Pod，它只剩单用户恢复那一条路。
     #
     # 为什么所有权必须挪而不能只 GRANT：分区维护要 DETACH/ATTACH 默认分区，那是
     # 表属主才有的权限，GRANT 给不出来；而把 cog_app 授成超级用户那个角色的成员
@@ -33,6 +45,7 @@ data:
     set -eu
     
     : "${APP_PASSWORD:?app-password must be injected}"
+    : "${BACKUP_PASSWORD:?backup-password must be injected}"
     : "${PGHOST:?}"
     
     attempt=0
@@ -45,7 +58,22 @@ data:
       sleep 2
     done
     
-    psql -v ON_ERROR_STOP=1 -v app_password="$APP_PASSWORD" -f /dev/stdin <<'SQL'
+    # 第二件要等的事：`public.backup_drills` 出现。新装机上这个 Job 与业务 Pod 同时起步，
+    # 而 GRANT 只能授已经存在的表——那句授早了会在第一次演练的凌晨变成一行
+    # `permission denied for table backup_drills`，演练记不下自己那一行就证明不了任何事。
+    # 等的是「迁移跑完了」，不是「库起来了」：上面那个 pg_isready 只回答后者。
+    attempt=0
+    until [ "$(psql -tAqc "select to_regclass('public.backup_drills') is not null")" = t ]; do
+      attempt=$((attempt + 1))
+      if [ "$attempt" -ge 120 ]; then
+        echo "public.backup_drills never appeared; the backup role cannot be granted on it" >&2
+        exit 1
+      fi
+      sleep 2
+    done
+    
+    psql -v ON_ERROR_STOP=1 -v app_password="$APP_PASSWORD" -v backup_password="$BACKUP_PASSWORD" \
+      -f /dev/stdin <<'SQL'
     -- 改属主要拿每张表的 ACCESS EXCLUSIVE 锁。业务进程此刻还在写这些表，等一把
     -- 长事务就等于整个 Job 无声地挂着；宁可超时失败让 Job 重试——它幂等，重跑会接着
     -- 挪剩下的那些。
@@ -68,6 +96,46 @@ data:
       EXECUTE format('GRANT CONNECT ON DATABASE %I TO cog_app', current_database());
     END $do$;
     GRANT USAGE, CREATE ON SCHEMA public TO cog_app;
+    
+    -- 备份演练连源库的那个角色。它要的三样，一样都不能少：
+    --   CREATEDB      —— 在同一台服务器上建一个一次性库，把包装回去；
+    --   读全部表      —— 逐表比对行数（恢复路径不要求超权位：没有它时按外键依赖顺序
+    --                    装载、检查开着，2026-11-01 在现网用这样一个角色跑通过一趟）；
+    --   写 backup_drills 一行 —— 它给出的结论就写在那儿，写不进去这一趟等于没跑。
+    -- 它没有 CREATEROLE、没有超权位，也不属于 cog_app：成员可以 SET ROLE 过去，那等于
+    -- 把 cog_app 的权限整包递过去。
+    DO $do$
+    BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cog_backup') THEN
+        CREATE ROLE cog_backup LOGIN NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION;
+      END IF;
+    END
+    $do$;
+    
+    ALTER ROLE cog_backup WITH LOGIN NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION
+      PASSWORD :'backup_password';
+    
+    DO $do$ BEGIN
+      EXECUTE format('GRANT CONNECT ON DATABASE %I TO cog_backup', current_database());
+    END $do$;
+    
+    -- 读全部表用预定义角色，不逐表 GRANT：逐表授的是一份快照，新建的表不在里面，
+    -- 而演练的比对恰好会读每一张表——漏一张，那一张的行数就不在比对里，读起来像一致。
+    GRANT pg_read_all_data TO cog_backup;
+    
+    GRANT INSERT ON public.backup_drills TO cog_backup;
+    
+    -- 迁移第一条就 `CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`，而迁移是**业务角色**
+    -- 在启动时跑的。装扩展要的是「当前库的 CREATE」——不是 schema 上的 CREATE，也不是
+    -- 库属主：2026-11-01 实测，在一个只拿到 CONNECT 的库上，cog_app 跑那一句拿到的是
+    -- `permission denied to create extension "uuid-ossp" / Must have CREATE privilege on
+    -- current database`。所以扩展必须在这一步、在这个还拿得动它的角色手里先装好，否则
+    -- 新装机第一次启动的迁移会停在第一条上，而那时业务角色已经在跑。
+    --
+    -- 这一行的名字来自 crates/cog-storage/migrations 里的 CREATE EXTENSION；新装一个
+    -- 扩展就要在下面补一行，`deploy/scripts/tests/db-role-bootstrap-ownership.test.sh`
+    -- 拿两边比，少一行就红。
+    CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
     
     DO $do$
     DECLARE
@@ -134,4 +202,5 @@ data:
     SQL
     
     echo "db role bootstrap: cog_app is ready and owns the cogneva schema objects"
+    echo "db role bootstrap: cog_backup can create the drill database, read every table, and record its verdict"
     

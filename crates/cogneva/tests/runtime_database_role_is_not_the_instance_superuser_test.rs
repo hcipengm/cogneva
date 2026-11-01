@@ -16,11 +16,17 @@
 //!   的实例**看不出来——它的角色早就在了；
 //! - 口令键漏了：Job 建出没有口令的角色，或者业务侧拿不到那份口令。
 //!
-//! 唯一允许的例外是备份演练：它要在同一台服务器上 `CREATE DATABASE` 一个一次性
-//! 库，而业务那个受限角色没有 CREATEDB。恢复本身不要求超级用户位——有它时关掉
-//! 外键检查一次装完，没有它时按依赖顺序装、外键照样在检查（`restore_postgres` 按
-//! 连接的角色选这两条路）。这条例外不是「漏改」，所以它也必须被钉住——把演练也
-//! 顺手改过去，演练会在真出事的那天才红。
+//! 备份演练是唯一一个权限与业务不同的工作负载：它要在同一台服务器上
+//! `CREATE DATABASE` 一个一次性库，而业务那个受限角色没有 CREATEDB。它有**自己的**
+//! 角色 `cog_backup`——恢复本身不要求超级用户位（有它时关掉外键检查一次装完，没有
+//! 它时按依赖顺序装、外键照样在检查，`restore_postgres` 按连接的角色选这两条路），
+//! 需要的是「建库 + 读全部表 + 写自己那一行结论」。所以它不是「漏改」的那个例外，
+//! 而是另一个受限角色——把演练也改回超级用户角色，等于把这一刀又还回去一半。
+//!
+//! 超权位本身收不掉，这条也钉在树上：`cog_user` 是 initdb 建出来的那个角色
+//! （`POSTGRES_USER`），PostgreSQL 16 起不许任何人把它改成 NOSUPERUSER。所以这里
+//! 判的不是「它不再是超权」，而是**没有任何工作负载连它**：它的口令不再注入任何
+//! Pod，只剩 `postgres --single` 那一条恢复路径。
 
 use crate::common;
 
@@ -32,7 +38,14 @@ use std::path::{Path, PathBuf};
 /// 业务连库必须落在的那个角色。
 const APP_ROLE: &str = "cog_app";
 
-/// 实例超级用户，只许出现在两个地方：数据库自身与角色引导。
+/// 备份演练连源库用的受限角色：建一次性演练库、读全部表比对、写自己那一行结论。
+const BACKUP_ROLE: &str = "cog_backup";
+
+/// 实例的 bootstrap 超级用户（initdb 按 `POSTGRES_USER` 建出来的那个）。
+///
+/// 它的超权位收不掉——PostgreSQL 16 起不许任何人把它改成 NOSUPERUSER，因为同一个人
+/// 也是 `postgres --single` 唯一能进的角色。所以判据落在**谁在连它**上：任何一份
+/// 工作负载的 DSN 都不许是它。
 const SUPERUSER_ROLE: &str = "cog_user";
 
 /// 一份清单里每一条 `postgres://<role>:` 的角色名，按出现顺序。
@@ -134,17 +147,23 @@ fn every_business_workload_connects_as_the_restricted_role() {
 
     let mut offenders = Vec::new();
     let mut drill_documents = 0;
+    let mut superuser_documents = Vec::new();
     for (file, index, role) in &seen {
-        // 演练是唯一的例外，判据是**这份文档自己叫什么**：它要在源库那台服务器上
-        // 建一次性库，业务那个受限角色没有 CREATEDB。按文档判而不是按文件判，是
-        // 因为 chart 的 `backup.yaml` 同时装着导出与演练两个 CronJob：按文件比会把
-        // 「导出已经换成受限角色」这件事一起抹掉。
+        // 演练走的是自己的角色，不是「又一个业务角色」，也不是超级用户。判据是
+        // **这份文档自己叫什么**：chart 的 `backup.yaml` 同时装着导出与演练两个
+        // CronJob，按文件比会把「导出在 cog_app 上」这件事一起抹掉。
+        if role == SUPERUSER_ROLE {
+            superuser_documents.push(format!("{file} 第 {index} 份"));
+            continue;
+        }
         let is_drill = file.ends_with("backup.yaml") || file.ends_with("backup-drill-cronjob.yaml");
         if is_drill && drill_document(&root, file, *index) {
             drill_documents += 1;
             assert_eq!(
-                role, SUPERUSER_ROLE,
-                "{file} 第 {index} 份文档是演练，它连的是源库属主并要建一次性库；业务那个受限角色没有 CREATEDB"
+                role, BACKUP_ROLE,
+                "{file} 第 {index} 份文档是演练：它要建一次性库（CREATEDB）、读全部表、\
+                 写自己那一行结论，这些 `{BACKUP_ROLE}` 都有，而超级用户角色一个工作负载\
+                 都不该连"
             );
             continue;
         }
@@ -155,12 +174,21 @@ fn every_business_workload_connects_as_the_restricted_role() {
 
     assert!(
         offenders.is_empty(),
-        "业务连接串必须落在 {APP_ROLE} 上（唯一例外是演练）：\n  {}",
+        "业务连接串必须落在 {APP_ROLE} 上（演练在 {BACKUP_ROLE} 上）：\n  {}",
         offenders.join("\n  ")
     );
 
-    // 例外那一侧也要钉住：顺手把演练也改成受限角色，它会在真出事的那天才红——
-    // 那时没有第二个包可选。
+    // 判据的落点在「谁在连它」：超权位收不掉，可一个工作负载都不连它的时候，
+    // 一条注入拿不到它，这个角色就只剩 `postgres --single` 那一条路。
+    assert!(
+        superuser_documents.is_empty(),
+        "这些文档仍在用 {SUPERUSER_ROLE} 连库：{}——它的超权位收不掉，所以这一刀只能\
+         落在「没有任何工作负载连它」上",
+        superuser_documents.join("、")
+    );
+
+    // 演练那一侧也要钉住：把它改回业务角色，它会在真出事的那天才红——那时没有
+    // 第二个包可选。
     assert!(
         drill_documents >= 2,
         "演练文档只钉到 {drill_documents} 份（chart 与静态各一份）：例外没有落到纸上，\
@@ -228,19 +256,72 @@ fn the_restricted_role_is_created_before_anything_uses_it() {
         "静态清单里没有把引导 Job 挂进 kustomization：apply 那一侧永远不会建出这个角色"
     );
 
-    // 口令键：chart 侧生成、init-secrets 侧生成，业务 Pod 只读它。
-    for (label, path) in [
-        (
-            "chart secret",
-            root.join("deploy/helm/cogneva/templates/secret.yaml"),
-        ),
-        ("init-secrets", root.join("deploy/scripts/init-secrets.sh")),
+    // 口令键：chart 侧生成、init-secrets 侧生成，业务 Pod 只读它。演练那个角色
+    // 用自己的一份，所以它也要在两条生成路径上都有——只在一个上，装出来就是
+    // 「角色在、口令空」，连不上库而部署是绿的。
+    for key in ["app-password", "backup-password"] {
+        for (label, path) in [
+            (
+                "chart secret",
+                root.join("deploy/helm/cogneva/templates/secret.yaml"),
+            ),
+            ("init-secrets", root.join("deploy/scripts/init-secrets.sh")),
+        ] {
+            assert!(
+                read(&path).contains(key),
+                "{label} 里没有 {key}：角色建出来没有口令，或者那一侧拿不到这份口令"
+            );
+        }
+    }
+}
+
+/// 备份演练那个角色只带它真的用得上的三样。
+///
+/// 一个角色的权限少写一条不报错，多写一条也不报错——两边的证据都只有一行 `CREATE
+/// ROLE`。所以这里逐条钉住：CREATEDB 要有（建一次性演练库）、超权位与 CREATEROLE
+/// 不能有（它们不是演练要的东西）、不能是 `cog_app` 的成员（成员可以 `SET ROLE`
+/// 过去，等于把业务角色的权限整包递过去）。读全部表走预定义角色而不是逐表 GRANT：
+/// 逐表授的是一份快照，而演练的比对要读**每一张**表，漏一张读起来像一致。
+#[test]
+fn the_drill_role_carries_only_what_the_drill_needs() {
+    let root = repo_root();
+    let script = read(&root.join("deploy/helm/cogneva/files/db-role-bootstrap.sh"));
+
+    for clause in [
+        "CREATE ROLE cog_backup LOGIN NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION",
+        "ALTER ROLE cog_backup WITH LOGIN NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION",
     ] {
         assert!(
-            read(&path).contains("app-password"),
-            "{label} 里没有 app-password：角色建出来没有口令，或者业务侧拿不到那一份"
+            script.contains(clause),
+            "引导脚本里没有 `{clause}`：演练那个角色会以默认属性被建出来（默认能登录、\
+             不能建库——建不出演练库，那一趟连恢复都开始不了）"
         );
     }
+    assert!(
+        script.contains("GRANT pg_read_all_data TO cog_backup"),
+        "演练那个角色没有读全部表：逐表 GRANT 是一份快照，而比对要读每一张表"
+    );
+    assert!(
+        script.contains("GRANT INSERT ON public.backup_drills TO cog_backup"),
+        "演练那个角色写不进 backup_drills：它给出的结论就写在那儿，写不进去这一趟等于没跑\
+         （2026-11-01 实测：恢复与比对全部通过，最后一行 `permission denied for table backup_drills`）"
+    );
+    assert!(
+        !script.contains("GRANT cog_app TO cog_backup"),
+        "把演练那个角色授成 cog_app 的成员等于没分家：它可以 SET ROLE 过去"
+    );
+
+    // 超权位收不掉这件事要留在树里，否则下一个人会以为是漏了一步，去试一次
+    // `ALTER ROLE cog_user NOSUPERUSER`，然后在部署时才遇到那条错。
+    assert!(
+        script.contains("The bootstrap user must have the SUPERUSER"),
+        "引导脚本没有写下「bootstrap 超级用户的超权位收不掉」这件事：下一个人会重复试"
+    );
+    assert!(
+        !script.contains("ALTER ROLE cog_user NOSUPERUSER"),
+        "脚本里又出现了降权那一句：PostgreSQL 16 不许改 bootstrap 超级用户的超权位，\
+         这一句会让每一次安装与升级都停在这里"
+    );
 }
 
 /// 口令和权限是两件事：换掉 DSN 里的角色，却把超级用户的口令留在同一个 Pod 的
@@ -257,7 +338,7 @@ fn a_workload_that_connects_as_the_restricted_role_does_not_hold_the_superuser_p
         let label = path.file_name().unwrap().to_string_lossy().to_string();
         for doc in documents(&read(&path)) {
             let roles = dsn_roles(&doc);
-            if !roles.iter().any(|r| r == APP_ROLE) {
+            if roles.is_empty() {
                 continue;
             }
             checked += 1;
@@ -267,10 +348,11 @@ fn a_workload_that_connects_as_the_restricted_role_does_not_hold_the_superuser_p
         }
     }
 
-    assert!(checked > 0, "一份按受限角色连库的文档都没读到");
+    assert!(checked > 0, "一份带连接串的文档都没读到");
     assert!(
         offenders.is_empty(),
-        "这些文档按 {APP_ROLE} 连库，却仍挂着实例超级用户的口令：{offenders:?}"
+        "这些文档用受限角色连库，却仍挂着实例超级用户的口令（任何工作负载都不该连它）：\
+         {offenders:?}"
     );
 }
 

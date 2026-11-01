@@ -7,10 +7,16 @@
 是整台实例（`COPY … FROM PROGRAM`、任意库、`pg_read_file`）。分成两个角色之后，
 业务侧那条连接里没有的东西，注入也拿不到。
 
-这一步只把 cog_app 做实，不动 cog_user 的超权位：先让业务 Pod 切过去、跑够一拍
-确认不依赖超权，再收那个位。顺序反过来的代价是不可逆的——这个实例里只有 cog_user
-一个超级用户角色，没有 `postgres` 角色，把它降下去之后要再抬回来，只能停库、拿
-数据目录跑 `postgres --single`。
+这一步把两个受限角色做实：cog_app（业务 Pod 连库）与 cog_backup（备份演练连源库，
+要建一个一次性演练库、读全部表比对行数、写自己那一行结论）。
+
+`cog_user` 的超权位**收不掉**，这一点要写在明处：它是 initdb 建出来的那个角色
+（`POSTGRES_USER`），PostgreSQL 16 起不许任何人把它降成 NOSUPERUSER——2026-11-01
+实测，换另一个超级用户去降也一样报 `The bootstrap user must have the SUPERUSER
+attribute`；它同时是 `postgres --single` 唯一能进的那个人，抬不回来的代价更大。
+所以目标不是「零超权角色」，而是**没有任何工作负载用它连库**：它的口令不再注入任何
+Pod，只剩单用户恢复那一条路。这一条由运行时判据盯着（业务角色之外还有谁在连库），
+不是靠人记得。
 
 脚本正文在 files/db-role-bootstrap.sh（写在这里会让里面的每个数字都进 chart 的
 数字普查，而那些数字是重试次数与睡眠秒数，不是部署参数）。
@@ -81,6 +87,11 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: app-password
+            - name: BACKUP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: backup-password
           resources:
 {{ toYaml .Values.dbRoleBootstrap.resources | indent 12 }}
           volumeMounts:

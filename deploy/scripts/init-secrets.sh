@@ -402,6 +402,9 @@ ensure_random pg-password
 # 超级用户，只在数据库自身与一次性的角色引导里出现。这个键由引导 Job 写进角色，
 # 业务 Pod 只读它。
 ensure_random app-password
+# 备份演练连源库的角色（cog_backup）口令：只带 CREATEDB，能读全部表、能写自己那一行
+# 结论。与 pg-password 分开之后，没有任何工作负载再连那个超级用户角色。
+ensure_random backup-password
 ensure_random redis-password
 ensure_random webhook-internal
 ensure_random jwt-secret

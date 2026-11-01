@@ -349,23 +349,22 @@ spec:
                 # `jobTemplate.spec.activeDeadlineSeconds` 是一对。
                 - name: COGNEVA_BACKUP_DRILL_PASS_BUDGET_SECS
                   value: {{ .Values.backup.drillPassBudgetSeconds | quote }}
-                # 这一处连的是**源库的属主角色**，不是业务那个受限角色：演练要在
-                # 同一台服务器上 `CREATE DATABASE` 一个一次性库，而 `cog_app` 没有
-                # CREATEDB。恢复本身不需要超级用户位：有它时关掉外键检查一次装完，
-                # 没有它时按依赖顺序装、外键照样在检查（见 `restore_postgres`）。
-                # 所以这一行在 `cog_user` 被降成 NOSUPERUSER 之后仍然成立。业务 Pod
-                # 那条注入面不在这里：这个 CronJob 跑的是固定参数的自有代码，不解析
-                # 任何外部输入。
-                - name: PG_PASSWORD
+                # 这一处连的是**cog_backup**，一个只带 CREATEDB 的受限角色：演练要在
+                # 同一台服务器上 `CREATE DATABASE` 一个一次性库，所以不能是 `cog_app`
+                # （没有 CREATEDB）；而它也不需要超级用户位——恢复没有它时按外键依赖
+                # 顺序装、检查照样开着（见 `restore_postgres`），2026-11-01 在现网用
+                # 这样一个角色跑通过一整趟。它是**最后一个还连着 cog_user** 的工作
+                # 负载：换过来之后，那个超级用户角色没有任何 Pod 连着它。
+                - name: BACKUP_PASSWORD
                   valueFrom:
                     secretKeyRef:
                       name: cogneva-secrets
-                      key: pg-password
+                      key: backup-password
                 # 演练连的是**源库**：它要在同一个服务器上建演练库，并把装回来的
                 # 账行与源库那几行逐格比。这不违反「不在源库上做演练」——遍历的
                 # 是另一个数据库名，源 schema 只被读。
                 - name: COGNEVA_DATABASE_URL
-                  value: {{ printf "postgres://cog_user:$(PG_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
+                  value: {{ printf "postgres://cog_backup:$(BACKUP_PASSWORD)@postgres.%s.svc.cluster.local:%d/cogneva" (include "cogneva.namespace" .) (int .Values.backends.postgres.port) | quote }}
                 {{- with .Values.backup.packageKeySecret.name }}
                 # 读包要同一份口令：加密包在演练里解不开会让当晚 outcome=failed，
                 # 所以写包、演练、恢复三处的注入必须同一步上线。

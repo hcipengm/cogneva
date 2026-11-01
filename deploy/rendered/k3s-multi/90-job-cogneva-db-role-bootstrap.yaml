@@ -58,6 +58,11 @@ spec:
                 secretKeyRef:
                   name: cogneva-secrets
                   key: app-password
+            - name: BACKUP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cogneva-secrets
+                  key: backup-password
           resources:
             limits:
               memory: 256Mi
