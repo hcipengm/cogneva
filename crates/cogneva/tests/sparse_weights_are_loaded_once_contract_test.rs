@@ -1,3 +1,4 @@
+//! principle: feedback_a_call_site_count_counts_paths_not_copies_of_the_data
 //! One model, one session: the sparse half is derived, not loaded again.
 //!
 //! BGE-M3 answers with two vectors from one forward pass -- a dense one pooled
