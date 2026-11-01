@@ -46,6 +46,7 @@ use crate::registry_footprint::MANIFEST_ACCEPTS;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
+use crate::change_execution::{KUBECTL_READ_TIMEOUT_SECS, KUBECTL_TIMEOUT_SECS};
 use crate::config::{CodePlatform, MainlineDeployerConfig, RolloutTargetConfig};
 use crate::rollout_resources::RolloutResourceReading;
 use crate::version_contract::VersionReadings;
@@ -3628,7 +3629,10 @@ impl MainlineDeployer {
         for t in &self.cfg.targets {
             let jsonpath = crate::deployment_image::container_image_query(&t.container);
             let img = self
-                .kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath], 30)
+                .kubectl(
+                    &["get", "deployment", &t.deployment, "-o", &jsonpath],
+                    KUBECTL_READ_TIMEOUT_SECS,
+                )
                 .await?;
             images.push(crate::deployment_image::container_image(
                 &img,
@@ -3664,7 +3668,10 @@ impl MainlineDeployer {
                 "jsonpath={{range .items[*]}}{{range {spec}.containers[*]}}{{.image}}{{\" \"}}{{end}}{{range {spec}.initContainers[*]}}{{.image}}{{\" \"}}{{end}}{{end}}"
             );
             let out = self
-                .kubectl(&["get", entry.resource, "-o", &jsonpath], 30)
+                .kubectl(
+                    &["get", entry.resource, "-o", &jsonpath],
+                    KUBECTL_READ_TIMEOUT_SECS,
+                )
                 .await?;
             for image in out.split_whitespace() {
                 if image_repository(image) != repo.as_str() {
@@ -5340,8 +5347,11 @@ impl MainlineDeployer {
     async fn restart_registry(&self) -> SFResult<()> {
         let names = self.registry_workload_names().await?;
         for name in &names {
-            self.kubectl(&["rollout", "restart", &format!("deployment/{name}")], 60)
-                .await?;
+            self.kubectl(
+                &["rollout", "restart", &format!("deployment/{name}")],
+                KUBECTL_TIMEOUT_SECS,
+            )
+            .await?;
             info!(workload = %name, "registry workload restarted to run its garbage collection")
         }
         Ok(())
@@ -6221,8 +6231,11 @@ impl MainlineDeployer {
             // 集群上写，最后落在哪一版取决于谁跑得慢，而那一刻「撤回到底生效没有」
             // 是无解的。删不掉就不派撤回——失败比一个读不出结论的集群好。
             let job = job_name(&inflight.rev);
-            self.kubectl(&["delete", "job", &job, "--ignore-not-found"], 60)
-                .await?;
+            self.kubectl(
+                &["delete", "job", &job, "--ignore-not-found"],
+                KUBECTL_TIMEOUT_SECS,
+            )
+            .await?;
             warn!(
                 rev = %rev12(&inflight.rev),
                 job = %job,
@@ -7832,8 +7845,11 @@ impl MainlineDeployer {
             JobStatus::Running | JobStatus::NotFound => {}
             JobStatus::Complete | JobStatus::Failed => {
                 info!(rev = %rev12(rev), "replacing finished rollout job before dispatch");
-                self.kubectl(&["delete", "job", &job_name(rev), "--ignore-not-found"], 60)
-                    .await?;
+                self.kubectl(
+                    &["delete", "job", &job_name(rev), "--ignore-not-found"],
+                    KUBECTL_TIMEOUT_SECS,
+                )
+                .await?;
             }
         }
         // 这一次滚动的因果 id：同一条链上的下一段。滚动 Job 自己也是一个进程，
@@ -8237,7 +8253,10 @@ impl MainlineDeployer {
             return;
         }
         let live = match self
-            .kubectl(&["get", "resourcequota", "-o", "json"], 60)
+            .kubectl(
+                &["get", "resourcequota", "-o", "json"],
+                KUBECTL_READ_TIMEOUT_SECS,
+            )
             .await
         {
             Ok(text) => match crate::governance_drift::live_quotas(&text) {
@@ -8263,7 +8282,13 @@ impl MainlineDeployer {
         // namespace sum would call the two sides equal while every per-container
         // ceiling in the tree could be different. Its failures get their own
         // cells so a reader is told which command to rerun.
-        let live_ranges = match self.kubectl(&["get", "limitrange", "-o", "json"], 60).await {
+        let live_ranges = match self
+            .kubectl(
+                &["get", "limitrange", "-o", "json"],
+                KUBECTL_READ_TIMEOUT_SECS,
+            )
+            .await
+        {
             Ok(text) => match crate::governance_drift::live_limit_ranges(&text) {
                 Ok(ranges) => ranges,
                 Err(e) => {
@@ -8547,7 +8572,10 @@ impl MainlineDeployer {
             if kept.len() < MANIFEST_BUNDLES_KEPT {
                 kept.push(name);
             } else if let Err(e) = self
-                .kubectl(&["delete", "configmap", &name, "--ignore-not-found"], 60)
+                .kubectl(
+                    &["delete", "configmap", &name, "--ignore-not-found"],
+                    KUBECTL_TIMEOUT_SECS,
+                )
                 .await
             {
                 warn!(configmap = %name, error = %e, "could not delete a stale manifest bundle");
@@ -10923,7 +10951,10 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             executor
-                .run_kubectl(&["get", "deployment", "-o", "json"], 30)
+                .run_kubectl(
+                    &["get", "deployment", "-o", "json"],
+                    KUBECTL_READ_TIMEOUT_SECS,
+                )
                 .await
                 .unwrap();
         });

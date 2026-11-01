@@ -636,6 +636,13 @@ const AFTER: u64 = 45;
 /// The shape names, as they appear in the registry.
 const BARE_CADENCE: &str = "cadence";
 const BARE_BYTES: &str = "bytes";
+/// A bare integer handed to a kubectl call as its wall clock: `kubectl(&[…], 60)`.
+///
+/// It has its own name because it was invisible to the other two: no
+/// `Duration::from_*` (the timeout is a plain `u64` seconds parameter) and no
+/// byte multiplier. Fourteen call sites spelled it this way, the same read
+/// carried 30 in one place and 60 in another, and nothing counted the pair.
+const BARE_KUBECTL_TIMEOUT: &str = "kubectl-timeout";
 
 /// How many use-site literals of both shapes may still exist in total.
 ///
@@ -680,6 +687,8 @@ fn scan_bare_literals(root: &Path, files: &[PathBuf]) -> BTreeMap<(String, Strin
         let mut fixtures: Option<i32> = None;
         let mut expecting_test_module = false;
         let mut raw: Option<usize> = None;
+        // A kubectl call split across lines, accumulated until its parens close.
+        let mut kubectl_window: Option<String> = None;
         for (i, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
             let code = code_only(line, &mut raw);
@@ -720,7 +729,31 @@ fn scan_bare_literals(root: &Path, files: &[PathBuf]) -> BTreeMap<(String, Strin
                 }
             }
             if in_fixtures || opens_tests || declares_a_const(&code) {
+                kubectl_window = None;
                 continue;
+            }
+            // The third shape: a bare integer handed to a kubectl call as its
+            // wall clock. This is the one that was invisible to both readers --
+            // no `const`, no `Duration::from_*`, just `, 60)` at fourteen call
+            // sites with two different values for the same read. A call split
+            // across lines is the common spelling (the argv array alone takes a
+            // line), so the window collects code until the parens close.
+            if kubectl_window.is_some() || code.contains("kubectl(") {
+                let window = kubectl_window.get_or_insert_with(String::new);
+                window.push(' ');
+                window.push_str(&code);
+                let open = window.matches('(').count() as i32 - window.matches(')').count() as i32;
+                if open <= 0 {
+                    let hits = kubectl_timeout_literals(window);
+                    if hits > 0 {
+                        if sites_wanted() {
+                            eprintln!("{rel}:{} {BARE_KUBECTL_TIMEOUT} x{hits}", i + 1);
+                        }
+                        *out.entry((rel.clone(), BARE_KUBECTL_TIMEOUT.to_string()))
+                            .or_default() += hits;
+                    }
+                    kubectl_window = None;
+                }
             }
             let cadence = cadence_literals(&code);
             if cadence > 0 {
@@ -930,6 +963,43 @@ fn byte_literals(code: &str) -> usize {
     count
 }
 
+/// The wall clock written straight into a kubectl call, per call.
+///
+/// The last top-level argument is that call's timeout. Nesting is tracked over
+/// brackets as well as parens because the argv is an array: without it every
+/// comma between `"get"` and the resource name would read as the argument
+/// boundary, and the literal in the middle of the argv would be judged instead.
+///
+/// Zero and one are exempt for the same reason as the cadence shape: they say
+/// "do not wait" and "one tick", not how long to wait.
+fn kubectl_timeout_literals(window: &str) -> usize {
+    let Some(at) = window.rfind("kubectl(") else {
+        return 0;
+    };
+    let call = &window[at + "kubectl(".len()..];
+    let mut depth: i32 = 0;
+    let mut last_comma = None;
+    let mut close_at = None;
+    for (i, c) in call.char_indices() {
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' if depth == 0 => {
+                close_at = Some(i);
+                break;
+            }
+            ')' | ']' | '}' => depth -= 1,
+            ',' if depth == 0 => last_comma = Some(i),
+            _ => {}
+        }
+    }
+    let (Some(close_at), Some(last_comma)) = (close_at, last_comma) else {
+        return 0;
+    };
+    let arg = call[last_comma + 1..close_at].trim().replace('_', "");
+    let bare = !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit());
+    usize::from(bare && arg != "0" && arg != "1")
+}
+
 // Same shape as the reviewed-debt cap above: the ceiling reads zero once the
 // debt is paid, and the comparison has to survive it being raised again.
 #[allow(clippy::absurd_extreme_comparisons)]
@@ -973,6 +1043,15 @@ fn wait() {
     tokio::time::sleep(Duration::from_secs(3600)).await;
 }
 
+fn call(ctl: &Ctl) {
+    ctl.kubectl(&["get", "deployment", "-o", "json"], 60).await;
+    ctl.kubectl(
+        &["get", "deployment", "-o", "json"],
+        KUBECTL_READ_TIMEOUT_SECS,
+    ).await;
+    ctl.kubectl(&["delete", "job", "x", "--ignore-not-found"], 1).await;
+}
+
 #[cfg(test)]
 mod tests {
     fn shell() -> &'static str {
@@ -981,6 +1060,10 @@ mod tests {
 
     fn fixture() -> Duration {
         Duration::from_secs(9)
+    }
+
+    fn fixture_call(ctl: &Ctl) {
+        ctl.kubectl(&["get", "pods"], 45).await;
     }
 }
 
@@ -1012,6 +1095,18 @@ fn below_the_module() -> Duration {
     assert_eq!(
         row, 2,
         "expected the two production numbers (above and below the fixture block) and          neither the declared one nor the fixture's; the scan found {row}"
+    );
+    let kubectl_row = scanned
+        .get(&(
+            "crates/probe/src/production.rs".to_string(),
+            BARE_KUBECTL_TIMEOUT.to_string(),
+        ))
+        .copied()
+        .unwrap_or(0);
+    assert_eq!(
+        kubectl_row, 1,
+        "expected only the call whose timeout is a bare number: the named one, the `1`, and the \
+         one inside the fixture block are not debt; the scan found {kubectl_row}"
     );
     assert!(
         scanned.keys().all(|(file, _)| file.contains("/src/")),

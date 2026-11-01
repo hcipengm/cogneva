@@ -835,6 +835,14 @@ const PARENT_CONTAINER: &str = cog_core::topology::MAIN_CONTAINER;
 // cap: bound — 控制面的读不是构建；超过它说明 API 侧已不正常，再等只是把常驻进程挂住
 pub(crate) const KUBECTL_TIMEOUT_SECS: u64 = 60;
 
+/// 一次**只读** kubectl 调用的墙钟上界：30 秒。
+///
+/// 只读没有落库与 admission 链，正常是百毫秒级；30 秒是「apiserver 正忙但仍然活着」与
+/// 「叫不动了」之间的分界，过了它再等只是把一个常驻进程挂在一个不会来的应答上。写动作
+/// 走 [`KUBECTL_TIMEOUT_SECS`]：超时后的重试会在 apiserver 上留下半完成的资源，值得多等。
+// cap: bound — 分界「apiserver 正忙但活着」与「叫不动了」；只读没有落库与 admission 链
+pub(crate) const KUBECTL_READ_TIMEOUT_SECS: u64 = 30;
+
 /// 等待预算比 Job 自己的 `activeDeadlineSeconds` 多出来的那一段：Job 到点后
 /// 还要被控制器判死、状态要回写，派发方等到恰好等于它就会在最后几秒里抢跑。
 // cap: bound — 比 Job 的 activeDeadlineSeconds 多出的那一段：到点后还要被控制器判死、状态回写

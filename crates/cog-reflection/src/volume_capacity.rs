@@ -57,7 +57,7 @@ use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragmen
 use cog_core::{ResourceEvent, ResourceEventKind, ResourceEventOutcome, SFResult, ShutdownSignal};
 use tracing::{debug, info, warn};
 
-use crate::change_execution::KUBECTL_TIMEOUT_SECS;
+use crate::change_execution::{KUBECTL_READ_TIMEOUT_SECS, KUBECTL_TIMEOUT_SECS};
 
 /// What became of one claim in one round, counted per outcome.
 pub const OUTCOME_METRIC: &str = "cogneva_volume_capacity_outcome_total";
@@ -1146,7 +1146,7 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
     let ns = namespace();
     let json = match kubectl(
         &["get", "pvc", &target.claim, "-n", &ns, "-o", "json"],
-        KUBECTL_TIMEOUT_SECS,
+        KUBECTL_READ_TIMEOUT_SECS,
     )
     .await
     {
@@ -1373,7 +1373,7 @@ async fn clear_shortfall_stamp(claim: &str, ns: &str) {
 async fn read_ceiling(ns: &str, own_request: u64) -> Option<Ceiling> {
     let limit = kubectl(
         &["get", "limitrange", "-n", ns, "-o", "json"],
-        KUBECTL_TIMEOUT_SECS,
+        KUBECTL_READ_TIMEOUT_SECS,
     )
     .await
     .ok()
@@ -1386,7 +1386,7 @@ async fn read_ceiling(ns: &str, own_request: u64) -> Option<Ceiling> {
     });
     let quota = kubectl(
         &["get", "resourcequota", "-n", ns, "-o", "json"],
-        KUBECTL_TIMEOUT_SECS,
+        KUBECTL_READ_TIMEOUT_SECS,
     )
     .await
     .ok()

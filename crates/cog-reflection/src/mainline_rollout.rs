@@ -34,6 +34,7 @@ use cog_core::{SFError, SFResult};
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
+use crate::change_execution::{KUBECTL_READ_TIMEOUT_SECS, KUBECTL_TIMEOUT_SECS};
 use crate::config::{MainlineDeployerConfig, RolloutTargetConfig};
 use crate::mainline_deployer::{
     bounded, carries_deployment, config_consumer_jsonpath, exit_code, failure_signature, field,
@@ -2960,7 +2961,10 @@ impl RolloutExecutor {
         let new_limits = docs.iter().find_map(pod_template_limits)?;
 
         let live_text = self
-            .run_kubectl(&["get", "deployment", &t.deployment, "-o", "json"], 60)
+            .run_kubectl(
+                &["get", "deployment", &t.deployment, "-o", "json"],
+                KUBECTL_TIMEOUT_SECS,
+            )
             .await
             .ok()?;
         let live_json: serde_json::Value = serde_json::from_str(&live_text).ok()?;
@@ -2969,7 +2973,10 @@ impl RolloutExecutor {
         let old_limits = pod_template_limits(&live_doc)?;
 
         let quota_text = self
-            .run_kubectl(&["get", "resourcequota", "-o", "json"], 60)
+            .run_kubectl(
+                &["get", "resourcequota", "-o", "json"],
+                KUBECTL_TIMEOUT_SECS,
+            )
             .await
             .ok()?;
         let quotas = crate::governance_drift::live_quota_usage(&quota_text).ok()?;
@@ -2989,7 +2996,10 @@ impl RolloutExecutor {
             return verdict;
         }
         let Ok(quota_text) = self
-            .run_kubectl(&["get", "resourcequota", "-o", "json"], 60)
+            .run_kubectl(
+                &["get", "resourcequota", "-o", "json"],
+                KUBECTL_TIMEOUT_SECS,
+            )
             .await
         else {
             return verdict;
@@ -3031,7 +3041,10 @@ impl RolloutExecutor {
         let started = std::time::Instant::now();
         let mut waited = false;
         loop {
-            let Ok(text) = self.run_kubectl(&["get", "pods", "-o", "json"], 30).await else {
+            let Ok(text) = self
+                .run_kubectl(&["get", "pods", "-o", "json"], KUBECTL_READ_TIMEOUT_SECS)
+                .await
+            else {
                 return waited;
             };
             let Some(names) = terminating_pods(&text) else {
@@ -3079,7 +3092,10 @@ impl RolloutExecutor {
     async fn missing_reference_holds(&self, docs: &[serde_yaml::Value]) -> Option<String> {
         for name in unresolved_configmaps(docs) {
             let exists = match self
-                .run_kubectl(&["get", "configmap", &name, "-o", "name"], 60)
+                .run_kubectl(
+                    &["get", "configmap", &name, "-o", "name"],
+                    KUBECTL_TIMEOUT_SECS,
+                )
                 .await
             {
                 Ok(_) => true,
@@ -3177,7 +3193,7 @@ impl RolloutExecutor {
     /// 当"没变"——那正好是这条判据要防的静默失效。
     async fn configmap_contents(&self) -> Option<BTreeMap<String, serde_json::Value>> {
         let readout = match self
-            .run_kubectl(&["get", "configmap", "-o", "json"], 60)
+            .run_kubectl(&["get", "configmap", "-o", "json"], KUBECTL_TIMEOUT_SECS)
             .await
         {
             Ok(text) => text,
@@ -3572,7 +3588,10 @@ impl RolloutExecutor {
             let mut still: Vec<&SupportWorkload> = Vec::new();
             for w in pending {
                 let readout = self
-                    .run_kubectl(&["get", w.kind, &w.name, "-o", settle_jsonpath(w.kind)], 30)
+                    .run_kubectl(
+                        &["get", w.kind, &w.name, "-o", settle_jsonpath(w.kind)],
+                        KUBECTL_READ_TIMEOUT_SECS,
+                    )
                     .await?;
                 if support_settled(w.kind, &readout) == Some(true) {
                     continue;
@@ -3614,7 +3633,10 @@ impl RolloutExecutor {
     /// 判据，也不能折成「没起来」。
     async fn support_workload_cause(&self, w: &SupportWorkload) -> String {
         let object = match self
-            .run_kubectl(&["get", w.kind, &w.name, "-o", "json"], 30)
+            .run_kubectl(
+                &["get", w.kind, &w.name, "-o", "json"],
+                KUBECTL_READ_TIMEOUT_SECS,
+            )
             .await
         {
             Ok(text) => text,
@@ -3627,7 +3649,10 @@ impl RolloutExecutor {
             );
         };
         let pods = match self
-            .run_kubectl(&["get", "pods", "-l", &selector, "-o", "json"], 30)
+            .run_kubectl(
+                &["get", "pods", "-l", &selector, "-o", "json"],
+                KUBECTL_READ_TIMEOUT_SECS,
+            )
             .await
         {
             Ok(text) => text,
@@ -3719,7 +3744,10 @@ impl RolloutExecutor {
     async fn current_image(&self, t: &RolloutTarget) -> SFResult<String> {
         let jsonpath = crate::deployment_image::container_image_query(&t.container);
         let img = self
-            .run_kubectl(&["get", "deployment", &t.deployment, "-o", &jsonpath], 30)
+            .run_kubectl(
+                &["get", "deployment", &t.deployment, "-o", &jsonpath],
+                KUBECTL_READ_TIMEOUT_SECS,
+            )
             .await?;
         crate::deployment_image::container_image(&img, &t.deployment, &t.container)
     }
@@ -4609,7 +4637,7 @@ impl RolloutExecutor {
             let target = format!("{resource}/{name}");
             let mut args: Vec<&str> = vec!["set", "image", &target];
             args.extend(specs.iter().map(|s| s.as_str()));
-            match self.run_kubectl(&args, 60).await {
+            match self.run_kubectl(&args, KUBECTL_TIMEOUT_SECS).await {
                 Ok(_) => info!(
                     workload = %target,
                     containers = %specs.join(","),
@@ -4639,7 +4667,10 @@ impl RolloutExecutor {
     /// 有模板可还。
     pub(crate) async fn snapshot_pod_template(&self, name: &str) -> SFResult<TemplateSnapshot> {
         let out = self
-            .run_kubectl(&["get", "deployment", name, "-o", "json"], 30)
+            .run_kubectl(
+                &["get", "deployment", name, "-o", "json"],
+                KUBECTL_READ_TIMEOUT_SECS,
+            )
             .await?;
         let doc: serde_json::Value = serde_json::from_str(&out).map_err(|e| {
             SFError::IO(format!(
@@ -4994,7 +5025,10 @@ impl RolloutExecutor {
                 // hard 降到当前用量以下」被拒，而挡住的是一条本该成功的滚动。
                 // 读不到就照原样 apply——老行为，不因为一次读数失败而改道。
                 let text = match self
-                    .run_kubectl(&["get", "resourcequota", "-o", "json"], 60)
+                    .run_kubectl(
+                        &["get", "resourcequota", "-o", "json"],
+                        KUBECTL_TIMEOUT_SECS,
+                    )
                     .await
                 {
                     Ok(live) => match crate::governance_drift::live_quota_usage(&live) {
@@ -5680,7 +5714,10 @@ impl RolloutExecutor {
     async fn live_images(&self, resource: &str, name: &str) -> SFResult<Vec<(String, String)>> {
         let jsonpath = "jsonpath={range .spec.template.spec.initContainers[*]}{.name}={.image}{\"\\n\"}{end}{range .spec.template.spec.containers[*]}{.name}={.image}{\"\\n\"}{end}";
         let out = self
-            .run_kubectl(&["get", resource, name, "-o", jsonpath], 30)
+            .run_kubectl(
+                &["get", resource, name, "-o", jsonpath],
+                KUBECTL_READ_TIMEOUT_SECS,
+            )
             .await?;
         let mut images = Vec::new();
         for line in out.lines() {
