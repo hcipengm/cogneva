@@ -863,6 +863,23 @@ rows:
       three sessions. The measurement exists; it was turned into a number by a
       human, and no loop re-measures it.
 
+  - key: taskRouter.claimConcurrency
+    source: override
+    why: >-
+      How many tasks one executing process runs at once -- the number of
+      concurrent spenders of the token window, and the only global bound on
+      parallelism: the board's column limits are per goal, so a `running=1`
+      there holds each goal to one and says nothing about eight goals running
+      eight tasks. It is pinned by the owner's decision to run work serially
+      rather than in parallel, and the reading that would replace it does not
+      exist yet: `cogneva_task_router_claim_slots` publishes the number in
+      force and `_in_flight` publishes how many are held, but nothing turns the
+      pool's allowance into a count of parallel tasks. Measured 2026-11-01
+      before this was a knob: both processes held four (eight tasks running
+      across eight goals) and spent 1,105,275 of the k3 five-hour window's
+      1,670,569 tokens in the first ten minutes of the window, none of the
+      eight changes finishing.
+
   # --- probe budgets ----------------------------------------------------------
   - key: healthProbes.liveness.periodSeconds
     source: fixed

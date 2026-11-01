@@ -73,15 +73,30 @@ fn the_chart_delivers_the_env_name_from_values() {
     );
 }
 
-/// 引用的那个 values 键必须真的存在，否则渲染成空串而不报错。
+/// 引用的那个 values 键必须真的存在，而且它的值必须是一条**发布侧真能用的**规格。
+///
+/// 这一条此前判的是「必须是空串」，因为它怕的是有人凭空写下一个数、替所有人
+/// 选了一条会真的拦下派发的闸门。属主 2026-11-01 明确选了 `running=1`（「需求再大
+/// 也是串行一个个解决」），于是那个断言变成了「谁按属主的决定配一次就红」——它拦住
+/// 的不再是凭空写下的数，而是这条配置本身。
+///
+/// 判据换成型而不是换成「随便」：值必须能被发布侧那个解析器读成合法的上限（拼错
+/// 的列名、`0`、只增不减的终态列都会被它拒并给出原因），空串仍然合法——那正是
+/// 「没配＝不限」。另外只许配 `running`：`scheduled` 压的是派发而不是 token，会把
+/// 长任务后面所有短任务一起堵死，这条决定写在 values 的注释里，也在这里判住。
 #[test]
-fn the_values_key_exists_and_defaults_to_no_limit() {
+fn the_values_key_holds_a_spec_the_publisher_can_use() {
     let value = values_wip_limits().unwrap_or_else(|| {
         panic!("values.yaml 的 {VALUES_BLOCK} 段里没有 {VALUES_KEY}：引用不存在的键会渲染成空串")
     });
-    assert_eq!(
-        value, "",
-        "看板列上限的默认值必须是空串（没配＝不限）。写成一个数就是替所有人选了一条会真的拦下派发的闸门"
+    let (limits, problems) = cog_core::BoardWipLimits::from_spec(&value);
+    assert!(
+        problems.is_empty(),
+        "values.yaml 里的 {VALUES_KEY} 发布侧读不动（{problems:?}）：写错的条目会被丢掉且不生效"
+    );
+    assert!(
+        limits.limit_for("scheduled").is_none(),
+        "配了 scheduled 的列上限：压下去的是派发而不是 token，长任务会把后面的短任务一起堵死"
     );
 }
 

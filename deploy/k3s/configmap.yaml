@@ -55,6 +55,16 @@ data:
   # 花在哪一道上，而 scheduled=1 会把短任务的派发也压成每拍一件。
   COGNEVA_BOARD_WIP_LIMITS: "running=1"
 
+  # 一个执行进程同时跑几道任务（＝同时花 token 额度的条数），进程级：本进程读的
+  # 每条就绪队列共用这一份许可。看板的列上限按 goal 分区，管不到跨 goal 的并行
+  # （实测 8 条 running 分属 8 个 goal，`running=1` 一条也没拦住），所以「全局一次
+  # 跑几道」是这一格。集群里两个执行进程，全程最多是这个数的两倍。
+  #
+  # 配 1 是属主 2026-11-01 的口径「串行一个个来解决」：k3 5 小时窗 1,670,569
+  # token，最贵的一道变更量到 1,002,927 输入 token，8 条在途时开窗 10 分钟就
+  # 花掉 66%。
+  COGNEVA_TASK_CLAIM_CONCURRENCY: "1"
+
   # Gateway
   COGNEVA_HTTP_PORT: "8080"
   COGNEVA_WS_PORT: "8081"

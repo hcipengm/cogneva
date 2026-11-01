@@ -26,15 +26,62 @@ const CLAIM_INTERVAL: Duration = Duration::from_secs(60);
 /// 本身跨不过两轮之间的间隔。
 // cap: bound — 够把下一次醒来之前的工作铺在 executor 前面，又小到一次认领跨不过两轮之间的间隔
 const CLAIM_BATCH: usize = 16;
-/// 认领消息的执行并发上限。tick 只负责认领和派发，不能在某条认领
-/// 消息的执行上 await：agent 任务可能跑几十分钟，串行处理会让整个
-/// pending 恢复循环停摆（实测一条任务执行 90+ 分钟，期间零
-/// XAUTOCLAIM，恢复网形同虚设）。
+/// 给在途执行上限的那个环境变量名。
 ///
-/// 进程级上限：本进程读的每条 ready 队列共用同一份许可，多读一条队列
-/// 不该把在途执行翻倍。
+/// 这个数是**同时花额度的任务条数**，不是这台机器能吃多少：token 窗口按
+/// 「一道活要多少」切分（`jobs_the_window_can_pay_for`），而在途的每一道都在
+/// 同一份窗口里花。它此前是一个写死的 `4`，于是「一次跑几道」这件事没有运维
+/// 入口——实测 2026-11-01：两个进程各 4 条在途，看板上恰好 8 条 `running`，
+/// k3 的 5 小时窗口（1,670,569 token）在开窗 10 分钟里被花掉 1,105,275，
+/// 八道变更各走一半、一道也没走完。这种数只能改代码才改得动，而它要改的时机
+/// 恰好是额度读数变了的时候。
+pub const CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_TASK_CLAIM_CONCURRENCY";
+
+/// 没有配置时的在途执行上限。
+///
+/// 与 [`cog_core::BoardWipLimits`] 同一个口径：**不配就按默认值跑，不配不等于
+/// 零**。一个凭空造出来的 0 会让所有执行停摆，而它与「没配」在读数上是同一个
+/// 空白。
 // cap: bound — 进程级许可：本进程读的每条就绪队列共用同一份，多读一条队列不该把在途执行翻倍
-const CLAIM_CONCURRENCY: usize = 4;
+pub const DEFAULT_CLAIM_CONCURRENCY: usize = 4;
+
+/// 读一条在途执行上限。
+///
+/// `0` 被拒而不是被当成「不限」：两者在配置里是同一个字符，而误读成停摆
+/// （或误读成不限）都会把额度花光的形状藏起来。拒绝时用默认值，并把这一行
+/// 报告出去——悄悄换成默认值等于运维以为自己改的那个数生效了。
+pub fn parse_claim_concurrency(raw: &str) -> Result<usize, String> {
+    match raw.trim().parse::<usize>() {
+        Ok(0) => Err(
+            "0 would stop every execution; leave the variable unset to run at the default".into(),
+        ),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("`{}` is not a count of tasks", raw.trim())),
+    }
+}
+
+/// 本进程的在途执行上限，从环境读。
+///
+/// 进程级上限：本进程读的每条 ready 队列共用同一份许可，多读一条队列不该把
+/// 在途执行翻倍。它同时是 `cogneva_task_router_claim_slots` 报出去的那个数，
+/// 所以配了多少、生效了多少在读数面是同一个值。
+pub fn claim_concurrency() -> usize {
+    match std::env::var(CLAIM_CONCURRENCY_ENV) {
+        Err(_) => DEFAULT_CLAIM_CONCURRENCY,
+        Ok(raw) => match parse_claim_concurrency(&raw) {
+            Ok(n) => n,
+            Err(problem) => {
+                tracing::warn!(
+                    variable = CLAIM_CONCURRENCY_ENV,
+                    problem = %problem,
+                    using = DEFAULT_CLAIM_CONCURRENCY,
+                    "task claim concurrency entry ignored"
+                );
+                DEFAULT_CLAIM_CONCURRENCY
+            }
+        },
+    }
+}
 
 /// Dispatcher that routes ready tasks to the first [`TaskExecutor`] whose
 /// [`TaskExecutor::supports`] returns `true`.
@@ -105,8 +152,10 @@ impl TaskExecutorRouter {
         shutdown: ShutdownSignal,
     ) -> SFResult<()> {
         // 主订阅循环与清扫器共用的执行许可：新鲜投递与 idle 认领合计最多
-        // CLAIM_CONCURRENCY 条在途执行。
-        let claim_slots = Arc::new(tokio::sync::Semaphore::new(CLAIM_CONCURRENCY));
+        // `claim_concurrency()` 条在途执行。读一次，两条腿用的是同一个数——
+        // 一处读一次会让「报出去的预算」和「真正的许可数」各走各的。
+        let claim_concurrency = claim_concurrency();
+        let claim_slots = Arc::new(tokio::sync::Semaphore::new(claim_concurrency));
 
         let loops = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role)
             .into_iter()
@@ -117,6 +166,7 @@ impl TaskExecutorRouter {
                     ready_stream,
                     workspace_id.to_string(),
                     claim_slots.clone(),
+                    claim_concurrency,
                     shutdown.clone(),
                 )
             });
@@ -136,6 +186,7 @@ impl TaskExecutorRouter {
         ready_stream: String,
         workspace_id: String,
         claim_slots: Arc<tokio::sync::Semaphore>,
+        claim_concurrency: usize,
         shutdown: ShutdownSignal,
     ) -> SFResult<()> {
         // Use a stable group name per workspace so that pod restacks do not
@@ -168,7 +219,7 @@ impl TaskExecutorRouter {
         crate::observable::claim_slots_observable().register(
             &ready_stream,
             claim_slots.clone(),
-            CLAIM_CONCURRENCY,
+            claim_concurrency,
         );
 
         // 观测面单独成任务，不搭清扫器的节拍：清扫卡在认领上时指标序列会跟着
@@ -1564,5 +1615,44 @@ mod ready_queue_placement_tests {
             "subscribed: {subscribed:?}"
         );
         shutdown.trigger();
+    }
+}
+
+#[cfg(test)]
+mod claim_concurrency_tests {
+    use super::*;
+
+    /// 配了多少就是多少：这个数是「同时花额度的任务条数」，运维写下的那个数
+    /// 必须原样生效，多一条少一条都会改变窗口被切碎的方式。
+    #[test]
+    fn a_configured_limit_is_the_number_of_tasks_in_flight() {
+        assert_eq!(parse_claim_concurrency("1").unwrap(), 1);
+        assert_eq!(parse_claim_concurrency(" 12 ").unwrap(), 12);
+    }
+
+    /// `0` 被拒：它读作「不跑任何执行」，而写它的人最可能想说的是「不限」。
+    /// 两种误读都会把额度花光的形状藏起来，所以它既不生效也不静默换成默认值。
+    #[test]
+    fn zero_is_refused_because_it_would_stop_every_execution() {
+        let problem = parse_claim_concurrency("0").expect_err("0 must not be a limit");
+        assert!(
+            problem.contains("stop every execution"),
+            "the refusal must name what 0 does: {problem}"
+        );
+    }
+
+    /// 不是数的东西同样被拒，而且判词带上原文——运维要能在日志里认出是哪一行
+    /// 配置没生效。
+    #[test]
+    fn a_word_is_not_a_count_of_tasks() {
+        let problem = parse_claim_concurrency("four").expect_err("a word is not a count");
+        assert!(problem.contains("four"), "{problem}");
+    }
+
+    /// 默认值本身必须是一个能用的数：`0` 作为兜底会把「没配」变成「全停」。
+    #[test]
+    fn the_default_is_a_usable_limit() {
+        assert!(DEFAULT_CLAIM_CONCURRENCY > 0);
+        assert!(DEFAULT_CLAIM_CONCURRENCY < CLAIM_BATCH);
     }
 }

@@ -389,6 +389,8 @@ mod supervisor_supervisor_test;
 mod supervisor_task_rebalancer_test;
 #[path = "supervisor_udp_heartbeat_test.rs"]
 mod supervisor_udp_heartbeat_test;
+#[path = "task_claim_concurrency_wiring_test.rs"]
+mod task_claim_concurrency_wiring_test;
 #[path = "task_resume_wiring_contract_test.rs"]
 mod task_resume_wiring_contract_test;
 #[path = "the_fixture_reading_steps_are_written_once_test.rs"]
