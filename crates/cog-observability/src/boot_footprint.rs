@@ -147,9 +147,14 @@ static ORIGIN: Mutex<Option<Instant>> = Mutex::new(None);
 /// Records this process's resident memory at `phase`.
 ///
 /// Does nothing when `phase` is not in [`PHASES`] or has already been marked.
-/// Both are said at debug level, because neither is startup progress: the first
-/// is a caller naming a phase that has no series, the second is the same phase
-/// arriving twice.
+/// A name outside the closed set is said at debug level: it is a caller's
+/// mistake, not startup progress. A phase arriving twice is not: two paths
+/// reaching the same phase is the shape that costs a whole extra copy of
+/// something -- two sessions over one set of weights, two initialisations of
+/// one plugin -- and the series cannot show it at all, because the first
+/// snapshot is the one it keeps. So the second arrival is said at warning
+/// level and carries both resident readings, which is what makes the cost of
+/// the second path readable afterwards.
 ///
 /// A phase that does land is announced at info level, before anything else can
 /// go wrong with the snapshot. The published series cannot stand in for this
@@ -170,7 +175,18 @@ pub fn mark(phase: &'static str) {
         Ok(m) => m,
         Err(e) => e.into_inner(),
     };
-    if marks.iter().any(|m| m.phase == phase) {
+    if let Some(first) = marks.iter().find(|m| m.phase == phase) {
+        let first_rss = first.rss;
+        let elapsed_seconds = first.elapsed_seconds;
+        // Dropped before the resident read: the mark table is not the thing
+        // being measured, and a slow procfs read under this lock would stall
+        // every other phase.
+        drop(marks);
+        // The series keeps the first snapshot: one phase is one series, and the
+        // chart's cardinality is fixed by the closed set. What it cannot say is
+        // that something reached the phase a second time, so that is said here,
+        // with the reading this arrival costs beside the one already recorded.
+        announce_duplicate(phase, resident_bytes(), first_rss, elapsed_seconds);
         return;
     }
     // Time before memory: the resident read opens a file, and a phase's position
@@ -241,6 +257,31 @@ fn announce(phase: &'static str, rss: Option<u64>, elapsed_seconds: f64, vitals:
             elapsed_seconds,
             "boot footprint: phase reached, but resident memory could not be read here"
         ),
+    }
+}
+
+/// Prints the line a *second* arrival at a phase is announced with.
+///
+/// Split out for the same reason as [`announce`]: the fields a reader needs
+/// must reach every shape the line takes, and a resident reading that failed
+/// on one side and succeeded on the other is a real shape. `first_rss` is the
+/// one already recorded, so a reader can subtract the two and see what the
+/// second path cost without holding this process's history.
+fn announce_duplicate(
+    phase: &'static str,
+    rss: Option<u64>,
+    first_rss: Option<u64>,
+    elapsed_seconds: f64,
+) {
+    const MESSAGE: &str = "boot footprint: phase reached twice; the series keeps the first \
+                           snapshot, but two paths reached the same phase";
+    match (rss, first_rss) {
+        (Some(rss), Some(first_rss)) => {
+            tracing::warn!(phase, rss, first_rss, elapsed_seconds, MESSAGE)
+        }
+        (Some(rss), None) => tracing::warn!(phase, rss, elapsed_seconds, MESSAGE),
+        (None, Some(first_rss)) => tracing::warn!(phase, first_rss, elapsed_seconds, MESSAGE),
+        (None, None) => tracing::warn!(phase, elapsed_seconds, MESSAGE),
     }
 }
 
@@ -512,6 +553,7 @@ mod tests {
         level: tracing::Level,
         phase: Option<String>,
         rss: Option<u64>,
+        first_rss: Option<u64>,
         cpu_seconds: Option<f64>,
         minor_faults: Option<u64>,
         major_faults: Option<u64>,
@@ -531,6 +573,7 @@ mod tests {
                 level: *event.metadata().level(),
                 phase: None,
                 rss: None,
+                first_rss: None,
                 cpu_seconds: None,
                 minor_faults: None,
                 major_faults: None,
@@ -573,6 +616,7 @@ mod tests {
         fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
             match field.name() {
                 "rss" => self.0.rss = Some(value),
+                "first_rss" => self.0.first_rss = Some(value),
                 "minor_faults" => self.0.minor_faults = Some(value),
                 "major_faults" => self.0.major_faults = Some(value),
                 "read_bytes" => self.0.read_bytes = Some(value),
@@ -634,6 +678,62 @@ mod tests {
         assert!(
             refused.iter().all(|e| e.level == tracing::Level::DEBUG),
             "a phase outside the closed set reached the log at {refused:?}"
+        );
+        clear_for_tests();
+    }
+
+    #[test]
+    fn a_phase_reached_twice_is_warned_about_and_the_series_keeps_the_first() {
+        use tracing_subscriber::prelude::*;
+
+        let _guard = one_at_a_time();
+        clear_for_tests();
+        let logged = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&logged)));
+        tracing::subscriber::with_default(subscriber, || {
+            mark("reranker");
+            mark("reranker");
+        });
+
+        let events = logged.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let reached: Vec<&Logged> = events
+            .iter()
+            .filter(|e| e.phase.as_deref() == Some("reranker"))
+            .filter(|e| e.level == tracing::Level::INFO)
+            .collect();
+        assert_eq!(
+            reached.len(),
+            1,
+            "the second arrival printed another progress line, so a log reader counts two \
+             phases where the boot reached one: {events:?}"
+        );
+        let twice: Vec<&Logged> = events
+            .iter()
+            .filter(|e| e.phase.as_deref() == Some("reranker"))
+            .filter(|e| e.level == tracing::Level::WARN)
+            .collect();
+        assert_eq!(
+            twice.len(),
+            1,
+            "the second arrival said nothing at a level a deployment logs at, so two paths \
+             reaching one phase stay invisible -- and the series cannot show them, because \
+             it keeps the first snapshot: {events:?}"
+        );
+        assert_eq!(
+            twice[0].first_rss, reached[0].rss,
+            "the warning does not carry the reading already recorded beside the new one, so \
+             the cost of the second path cannot be read off it: {events:?}"
+        );
+
+        let recorded: Vec<(&'static str, u64)> = marks()
+            .into_iter()
+            .filter(|(phase, _)| *phase == "reranker")
+            .collect();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the closed set is what fixes the series' cardinality, and a second snapshot for \
+             one phase breaks it"
         );
         clear_for_tests();
     }
