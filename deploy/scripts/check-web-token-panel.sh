@@ -616,9 +616,29 @@ else:
             f"{table_rel}: 一级行点不开到四格行——"
             "「同一个执行者换过上游」这件事在这一屏上就没有地方说得出来"
         )
-    if not re.search(r"const\s+W\s*=\s*\{", tsrc) or tsrc.count("width: W.") < 8:
+    # 列宽单点有两种正当写法，且只有这两种：表头每格写一次 `width: W.x`，或表头
+    # 按一份列清单画、整份表就只有一处 `W[col.key]`。判的不是某一种写法的字面
+    # 次数——只认第一种会把更少重复的写法判红，红久了这道门就被关掉——而是
+    # 「取宽发生在几处」：两种写法各自要求另一种一次都不出现，正文行再从 W 取一次
+    # 宽就算写了第二遍。两张级行共用同一张表、宽度只挂在表头上，正文格跟着列走。
+    width_sites = len(re.findall(r"width:\s*W\[", tsrc))
+    literal_cells = tsrc.count("width: W.")
+    columns_block = re.search(r"const\s+COLUMNS[^=]*=\s*\[(.*?)\n\];", tsrc, re.DOTALL)
+    column_count = len(re.findall(r"\{\s*key:\s*'", columns_block.group(1))) if columns_block else 0
+    per_cell = literal_cells >= 8 and width_sites == 0
+    table_driven = (
+        width_sites == 1
+        and literal_cells == 0
+        and column_count >= 8
+        and re.search(r"keyof\s+typeof\s+W", tsrc)
+    )
+    width_in_body_cell = re.search(r"<td[^>]*width:\s*W", tsrc)
+    single_point = (per_cell or table_driven) and not width_in_body_cell
+    if not re.search(r"const\s+W\s*=\s*\{", tsrc) or not single_point:
         problems.append(
-            f"{table_rel}: 列宽没有单点定义（少于 8 格从同一份常量取宽）——"
+            f"{table_rel}: 列宽没有单点定义（逐格取宽 {literal_cells} 处、"
+            f"按下标取宽 {width_sites} 处、列清单 {column_count} 项"
+            f"{'、正文格也写了宽' if width_in_body_cell else ''}）——"
             "宽度写第二次，两级行就会有一天差几像素"
         )
     if re.search(r"(?:failed|failed_calls)\s*>\s*0\s*&&", tsrc):
