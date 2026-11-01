@@ -177,7 +177,6 @@ pub fn mark(phase: &'static str) {
     };
     if let Some(first) = marks.iter().find(|m| m.phase == phase) {
         let first_rss = first.rss;
-        let elapsed_seconds = first.elapsed_seconds;
         // Dropped before the resident read: the mark table is not the thing
         // being measured, and a slow procfs read under this lock would stall
         // every other phase.
@@ -186,21 +185,17 @@ pub fn mark(phase: &'static str) {
         // chart's cardinality is fixed by the closed set. What it cannot say is
         // that something reached the phase a second time, so that is said here,
         // with the reading this arrival costs beside the one already recorded.
-        announce_duplicate(phase, resident_bytes(), first_rss, elapsed_seconds);
+        //
+        // The time is this arrival's, not the first one's: the line's whole use
+        // is placing the second path in startup order, and handing it the time
+        // of the first arrival would put the cost at the moment it was last
+        // paid, which is the one moment it was not.
+        announce_duplicate(phase, resident_bytes(), first_rss, elapsed_since_origin());
         return;
     }
     // Time before memory: the resident read opens a file, and a phase's position
     // in startup must not move because procfs was slow or missing.
-    let elapsed_seconds = {
-        let mut origin = match ORIGIN.lock() {
-            Ok(o) => o,
-            Err(e) => e.into_inner(),
-        };
-        origin
-            .get_or_insert_with(Instant::now)
-            .elapsed()
-            .as_secs_f64()
-    };
+    let elapsed_seconds = elapsed_since_origin();
     // The CPU and fault counters are taken beside the wall clock and for the same
     // reason: they describe this instant, and they are only comparable with it
     // when they were read at the same instant.
@@ -219,6 +214,22 @@ pub fn mark(phase: &'static str) {
             .unwrap_or(usize::MAX)
     });
     announce(phase, rss, elapsed_seconds, vitals);
+}
+
+/// Seconds from the first mark to now.
+///
+/// Both lines of a phase are timed by this one function so they cannot disagree
+/// about where zero is: a second arrival timed from its own start would read as
+/// earlier than the first one it follows.
+fn elapsed_since_origin() -> f64 {
+    let mut origin = match ORIGIN.lock() {
+        Ok(o) => o,
+        Err(e) => e.into_inner(),
+    };
+    origin
+        .get_or_insert_with(Instant::now)
+        .elapsed()
+        .as_secs_f64()
 }
 
 /// Prints the line a reached phase is announced with.
@@ -554,6 +565,7 @@ mod tests {
         phase: Option<String>,
         rss: Option<u64>,
         first_rss: Option<u64>,
+        elapsed_seconds: Option<f64>,
         cpu_seconds: Option<f64>,
         minor_faults: Option<u64>,
         major_faults: Option<u64>,
@@ -574,6 +586,7 @@ mod tests {
                 phase: None,
                 rss: None,
                 first_rss: None,
+                elapsed_seconds: None,
                 cpu_seconds: None,
                 minor_faults: None,
                 major_faults: None,
@@ -625,8 +638,10 @@ mod tests {
         }
 
         fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-            if field.name() == "cpu_seconds" {
-                self.0.cpu_seconds = Some(value);
+            match field.name() {
+                "cpu_seconds" => self.0.cpu_seconds = Some(value),
+                "elapsed_seconds" => self.0.elapsed_seconds = Some(value),
+                _ => {}
             }
         }
     }
@@ -723,6 +738,12 @@ mod tests {
             twice[0].first_rss, reached[0].rss,
             "the warning does not carry the reading already recorded beside the new one, so \
              the cost of the second path cannot be read off it: {events:?}"
+        );
+        assert!(
+            twice[0].elapsed_seconds > reached[0].elapsed_seconds,
+            "the warning is timed from the first arrival rather than from this one, so it \
+             places the second path at the moment the phase was first passed -- the one \
+             moment the second path was not running: {events:?}"
         );
 
         let recorded: Vec<(&'static str, u64)> = marks()
