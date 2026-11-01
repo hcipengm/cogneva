@@ -211,6 +211,56 @@ pub struct GitOpsPuller {
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
+/// `kubectl get replicasets -o json` 的结果里，本部署名下是否有一个
+/// ReplicaSet 的指定容器带着指定镜像。
+///
+/// 判据按「属于哪个 Deployment」这一条 ownerReference 走，不按名字前缀：
+/// `cogneva` 与 `cogneva-evolution` 的 ReplicaSet 同在一个命名空间，前缀
+/// 相同而归属不同，按前缀判会把另一个部署的历史读成本部署的。读不懂的
+/// JSON 一律判 false——读不出来时退回原来的行为，而不是凭一次解析失败
+/// 把候选提前结案。
+fn rs_history_holds_image(
+    raw: &str,
+    deployment: &str,
+    container: &str,
+    wanted_image: &str,
+) -> bool {
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    let Some(items) = doc.get("items").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    items.iter().any(|rs| {
+        let owned = rs
+            .get("metadata")
+            .and_then(|m| m.get("ownerReferences"))
+            .and_then(|o| o.as_array())
+            .map(|owners| {
+                owners.iter().any(|o| {
+                    o.get("kind").and_then(|k| k.as_str()) == Some("Deployment")
+                        && o.get("name").and_then(|n| n.as_str()) == Some(deployment)
+                })
+            })
+            .unwrap_or(false);
+        if !owned {
+            return false;
+        }
+        rs.get("spec")
+            .and_then(|s| s.get("template"))
+            .and_then(|t| t.get("spec"))
+            .and_then(|s| s.get("containers"))
+            .and_then(|c| c.as_array())
+            .map(|containers| {
+                containers.iter().any(|c| {
+                    c.get("name").and_then(|n| n.as_str()) == Some(container)
+                        && c.get("image").and_then(|i| i.as_str()) == Some(wanted_image)
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// 这一行存下来时的标签。把面写在这里而不是散在调用点：读表的人问「该谁动」只看这一份，
 /// 少写一格的那一行就成了无主，而它照样 firing。
 fn blindness_labels(cluster: &str, gate: &str, cause: &str, ticks: u32) -> serde_json::Value {
@@ -666,6 +716,39 @@ impl GitOpsPuller {
         )
     }
 
+    /// 候选镜像是否曾经在这个部署上跑过、并已被别的镜像取代。
+    ///
+    /// 只看 ReplicaSet 历史：当前模板已经不是这个镜像，而本部署名下的某个
+    /// ReplicaSet 带着它。历史被 `revisionHistoryLimit` 截断时读不到，那种
+    /// 情形退回原来的行为（当成尚未应用）。
+    async fn image_was_superseded(&self, image: &str) -> SFResult<bool> {
+        if self.current_deployment_image().await? == image {
+            // 已经在对的镜像上：这不是「被取代」，交给 reconcile/正常收尾那条路。
+            return Ok(false);
+        }
+        let out = self
+            .run(
+                &self.config.kubectl_bin.clone(),
+                &[
+                    "-n",
+                    &self.config.namespace,
+                    "get",
+                    "replicasets",
+                    "-o",
+                    "json",
+                ],
+                None,
+                60,
+            )
+            .await?;
+        Ok(rs_history_holds_image(
+            &out,
+            &self.config.deployment,
+            &self.config.container,
+            image,
+        ))
+    }
+
     /// 发布本轮 poll 的结局：成功写 0、失败写 1，每次尝试都写一行。
     ///
     /// 轮询失败原先只写日志，而日志随 Pod 消失，也答不出「这样多久了」。循环的
@@ -1037,6 +1120,25 @@ impl GitOpsPuller {
     /// L1：金丝雀发布。pause → 看护 → resume / undo。
     async fn canary_rollout(&self, candidate: &PromotionCandidate) -> SFResult<String> {
         let image = self.obtain_image(candidate).await?;
+        // 已经在这里跑过、又被更新的版本换下去的镜像，不是「还没应用」，是
+        // 「应用过了」。拉取端跑在被滚动的那个部署里：它每金丝雀成功一次，
+        // 判官自己就被新副本换掉，而换下去的那个镜像仍留在 ReplicaSet 历史里。
+        // 此后再有任何一方（主线部署器）滚出更新的版本，这条候选在台账里只要
+        // 还停在 Failed/Pending，下一轮 poll 就会把它读成「尚未应用」，把部署
+        // 倒回旧镜像——一次正常的推进被当成一次待办晋级，部署在两个版本之间
+        // 来回，而每一轮都由一个把自身换掉的金丝雀收尾。判据只问一件事：
+        // 当前模板不是这个镜像，而这个部署的某个 ReplicaSet 带着它。
+        if self.image_was_superseded(&image).await? {
+            warn!(
+                image = %image,
+                "the candidate image already ran here and a newer revision replaced it; \
+                 recording the promotion instead of rolling the deployment back"
+            );
+            return Ok(format!(
+                "already ran here and was superseded by a newer revision; \
+                 deployment left alone ({image})"
+            ));
+        }
         let d = &self.config.deployment;
         let c = &self.config.container;
         let n = self.config.namespace.clone();
@@ -2684,6 +2786,82 @@ fn mounters_of_config(manifest: &str) -> SFResult<Vec<(&'static str, String)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rs_doc(specs: &[(&str, &str, &str)]) -> String {
+        let items: Vec<serde_json::Value> = specs
+            .iter()
+            .map(|(owner, name, image)| {
+                serde_json::json!({
+                    "metadata": {
+                        "name": format!("{owner}-{name}"),
+                        "ownerReferences": [{"kind": "Deployment", "name": owner}],
+                    },
+                    "spec": {"template": {"spec": {"containers": [
+                        {"name": "app", "image": image}
+                    ]}}},
+                })
+            })
+            .collect();
+        serde_json::json!({"items": items}).to_string()
+    }
+
+    /// 候选镜像还留在本部署的 ReplicaSet 历史里、当前模板已经是别的镜像
+    /// ⇒ 它是「跑过、被换下去了」，不是「还没应用」。这条判据存在的理由
+    /// 是拉取端跑在被滚动的部署里：每成功一次判官自己被换掉，换下去的那
+    /// 张镜像留在历史里，而台账里那条候选只要不是终态，下一轮 poll 就会
+    /// 把主线刚滚上来的新版本倒回这张旧镜像。
+    #[test]
+    fn a_candidate_image_still_in_the_replica_history_was_superseded_not_absent() {
+        let raw = rs_doc(&[
+            (
+                "cogneva",
+                "history1",
+                "registry/cogneva:promote-change-ledger-abc",
+            ),
+            ("cogneva", "history2", "registry/cogneva:main-922a8cf8b9a3"),
+        ]);
+        assert!(rs_history_holds_image(
+            &raw,
+            "cogneva",
+            "app",
+            "registry/cogneva:promote-change-ledger-abc"
+        ));
+    }
+
+    /// 另一个部署的历史不是本部署的历史：`cogneva-evolution` 名下的
+    /// ReplicaSet 带着同一张镜像，不构成本部署「已经跑过」的证据。
+    #[test]
+    fn another_deployments_replica_does_not_count_as_this_deployments_history() {
+        let raw = rs_doc(&[(
+            "cogneva-evolution",
+            "history1",
+            "registry/cogneva:promote-change-ledger-abc",
+        )]);
+        assert!(!rs_history_holds_image(
+            &raw,
+            "cogneva",
+            "app",
+            "registry/cogneva:promote-change-ledger-abc"
+        ));
+    }
+
+    /// 读不懂的输出不结案：解析失败退回原来的行为（当作尚未应用），
+    /// 而不是凭一次读失败把候选记成已晋级。
+    #[test]
+    fn an_unreadable_replica_list_does_not_close_the_candidate() {
+        assert!(!rs_history_holds_image(
+            "not json",
+            "cogneva",
+            "app",
+            "registry/cogneva:x"
+        ));
+        assert!(!rs_history_holds_image(
+            r#"{"items": []}"#,
+            "cogneva",
+            "app",
+            "registry/cogneva:x"
+        ));
+    }
 
     /// 拉取失败不是「这个版本坏」：registry 此刻在重启也会写成 `ErrImagePull`，
     /// 宽限期内把它判死，undo 掉的是一份完好的版本。滚动侧为这件事写过一段
