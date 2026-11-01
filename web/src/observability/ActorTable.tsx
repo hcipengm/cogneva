@@ -76,35 +76,14 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
       <table className="grid-table">
         <thead>
           <tr>
-            <th style={{ width: W.actor }}>执行者</th>
-            <th style={{ width: W.share }}>占比</th>
-            <th style={{ width: W.calls, textAlign: 'right' }}>
-              调用
-            </th>
-            <th style={{ width: W.failed, textAlign: 'right' }}>
-              失败
-            </th>
-            <th style={{ width: W.input, textAlign: 'right' }}>
-              输入
-            </th>
-            <th style={{ width: W.output, textAlign: 'right' }}>
-              输出
-            </th>
-            <th style={{ width: W.cached, textAlign: 'right' }}>
-              缓存
-            </th>
-            <th style={{ width: W.write, textAlign: 'right' }}>
-              缓存写入
-            </th>
-            <th style={{ width: W.rate, textAlign: 'right' }}>
-              缓存占比
-            </th>
-            <th style={{ width: W.per, textAlign: 'right' }}>
-              每调用输入
-            </th>
-            <th style={{ width: W.latency, textAlign: 'right' }}>
-              均耗
-            </th>
+            {COLUMNS.map((col) => (
+              <th
+                key={col.key}
+                style={{ width: W[col.key], textAlign: col.numeric ? 'right' : 'left' }}
+              >
+                {col.label}
+              </th>
+            ))}
           </tr>
         </thead>
         <tbody>
@@ -316,6 +295,28 @@ const W = {
   per: '7rem',
   latency: '5.5rem',
 } as const;
+
+/**
+ * 表头按这份清单画，不逐个手写。
+ *
+ * 数字列必须右对齐，否则表头那一格和它下面右对齐的数字不共边，读者看到的是
+ * 「从某一列起整体错开一格」。这个错犯过两次：一次是十二个表头全左对齐，
+ * 一次是补对齐时漏了「占比」——手写十二次，就有十二次机会漏一个。
+ * `numeric` 就在这一处写，表头自己按它取对齐方式。
+ */
+const COLUMNS: { key: keyof typeof W; label: string; numeric: boolean }[] = [
+  { key: 'actor', label: '执行者', numeric: false },
+  { key: 'share', label: '占比', numeric: true },
+  { key: 'calls', label: '调用', numeric: true },
+  { key: 'failed', label: '失败', numeric: true },
+  { key: 'input', label: '输入', numeric: true },
+  { key: 'output', label: '输出', numeric: true },
+  { key: 'cached', label: '缓存', numeric: true },
+  { key: 'write', label: '缓存写入', numeric: true },
+  { key: 'rate', label: '缓存占比', numeric: true },
+  { key: 'per', label: '每调用输入', numeric: true },
+  { key: 'latency', label: '均耗', numeric: true },
+];
 
 /** 数值一律右对齐、等宽、等宽数字：一列比大小靠的是位数对齐。 */
 const NUM = 'mono text-right tabular-nums text-[11px]';
