@@ -1195,6 +1195,19 @@ jobs:
             sudo apt-get install -y --no-install-recommends postgresql-client
           }
           psql --version
+      # 告警规则单测要的是 Prometheus 自己的规则引擎。脚本自己也能从 apt 取一份解到
+      # 临时目录（不安装、不动系统），但那要求这台机器上已经有一份包索引——runner
+      # 镜像里那几份列表不一定是热的，取不到就退 3，而退 3 在测试自己的摘要里只是
+      # 一格「看不了」，读起来像另一件事。依赖在这里当一步问清楚：拿不到就是这一步
+      # 红，名字就说明缺的是什么。与上面那几个 `Ensure` 同形。
+      - name: Ensure promtool
+        if: ${{ !cancelled() }}
+        run: |
+          command -v promtool >/dev/null || {
+            sudo apt-get update -qq || true
+            sudo apt-get install -y --no-install-recommends prometheus
+          }
+          promtool --version
       - name: Script tests
         # 这一步连真库。没有这个 `if:` 时，前面任何一处无关的红都会把它跳掉，而
         # 「跳过」在 job 摘要上与「通过」同形——库里那条链断没断，读的人看不出来。
@@ -1212,7 +1225,21 @@ jobs:
             # 点名哪条原则」正是靠这样一行把日志接回文件头部的声明。所以红的这一份由
             # 跑它的人自己报出来，格式与编译器指错同一形状。行号恒为 1：判据是「这个
             # 文件红过」，不是「它的第几行红的」。
-            bash "${t}" || { echo "--> ${t}:1:1: failed"; exit 1; }
+            #
+            # 红的那一份的**正文**也带上来（`::error::` 注解）：日志只有对仓库有读
+            # 权限的人拿得到，注解是任何人都能通过 API 取的。不带正文时，外面看到的
+            # 只是一句 exit 1，判不了这条红是「规则写错了」还是「这台机器没有
+            # promtool」——2026-11-01 起正是后一种，而外面什么也读不到。
+            log="$(mktemp)"
+            if ! bash "${t}" >"${log}" 2>&1; then
+              cat "${log}"
+              echo "--> ${t}:1:1: failed"
+              while IFS= read -r line; do
+                echo "::error file=${t},line=1::${line//%/%25}"
+              done < <(tail -n 12 "${log}")
+              exit 1
+            fi
+            tail -n 2 "${log}"
           done
       - name: PowerShell parse check
         run: |
@@ -1326,6 +1353,16 @@ jobs:
       - uses: azure/setup-kubectl@v4
       - name: Install pyyaml
         run: sudo apt-get update && sudo apt-get install -y python3-yaml
+      # 与 entry-scripts 那一格同一个理由：这一步的依赖是一枚 promtool，不是一条
+      # 「测试自己想办法」。这条 job 曾经因为取不到它整条变红，而红落在
+      # 「测试验收普查告警会不会响」这个名字下面——名字说的是规则，缺的是工具。
+      - name: Ensure promtool
+        run: |
+          command -v promtool >/dev/null || {
+            sudo apt-get update -qq || true
+            sudo apt-get install -y --no-install-recommends prometheus
+          }
+          promtool --version
       - name: Check helm/kustomize parity
         run: bash deploy/scripts/check-deploy-parity.sh
       - name: Check rendered profiles are fresh

@@ -57,7 +57,11 @@ if [ -z "${promtool}" ]; then
     else
         # 解包而不安装：CI 与开发机的系统状态都不该被一次测试改掉。
         if command -v apt-get >/dev/null 2>&1 && command -v dpkg-deb >/dev/null 2>&1; then
-            if (cd "${work}" && apt-get download prometheus >/dev/null 2>&1); then
+            # 取不到的时候 apt 的话要留下来：吞掉它，红只有一句「拿不到 promtool」，
+            # 读的人分不清是「这台机器没有包索引」「镜像拉不动这 23MB」还是「包里
+            # 没有 promtool」——三种坏法的修法各不相同。2026-11-01 起 GitHub 的
+            # runner 上这一步天天红，而日志里除了那句退 3 之外什么也没有。
+            if (cd "${work}" && apt-get download prometheus >"${work}/apt.err" 2>&1); then
                 deb="$(ls "${work}"/prometheus_*.deb 2>/dev/null | head -1)"
                 if [ -n "${deb}" ]; then
                     # 直接解到缓存目录：`dpkg-deb -x` 就是 tar 解开，已存在的目录会合并。
@@ -75,6 +79,10 @@ if [ -z "${promtool}" ]; then
 fi
 [ -n "${promtool}" ] && [ -x "${promtool}" ] || {
     echo "拿不到 promtool（\$PROMTOOL / PATH / apt 都没有）——看不了，不是一致" >&2
+    if [ -s "${work}/apt.err" ]; then
+        echo "apt 那边说的是：" >&2
+        sed -n '1,6p' "${work}/apt.err" >&2
+    fi
     exit 3
 }
 
