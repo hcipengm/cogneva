@@ -21,7 +21,6 @@
 # "一个都没扫到"与"一个都没写死"同形。
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPTS="$(cd "$HERE/.." && pwd)"
 REPO="$(cd "$HERE/../../.." && pwd)"
 
 pass=0; fail=0
