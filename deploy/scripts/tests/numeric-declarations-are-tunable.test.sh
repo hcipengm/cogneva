@@ -53,17 +53,26 @@ out="$(scan "$T/switch.sh" | grep -vE '=[01]$' || true)"
 [ -z "$out" ] && ok "0/1 开关放行" || bad "0/1 开关放行：$out"
 
 # --- 真树：扫得出来、且全都合格 ---
-files=("$SCRIPTS"/*.sh)
-# 另一棵**CI 直接跑**的脚本树。判据只看一棵树时，同一类数在另一棵里写死不会红，
-# 而两棵树的运行者没有区别——都是别人机器上的运维动作。
-gh_scripts=("$REPO"/.github/scripts/*.sh)
-[ -e "${gh_scripts[0]}" ] && files+=("${gh_scripts[@]}")
-[ "${#files[@]}" -gt 50 ] && ok "扫到 ${#files[@]} 个脚本（含 ${#gh_scripts[@]} 个 .github/scripts）" \
+# 扫的是**在宿主上由人（或 CI）跑的**脚本：`deploy/` 下的全部（测试夹具除外）与
+# `.github/scripts/`。判据只看一棵树时，同一类数在另一棵里写死不会红，而两棵树的
+# 运行者没有区别——都是在别人的机器上执行的运维动作。
+#
+# 排除 `deploy/helm/**/files/`：那些脚本在 Pod 里跑，改一次等待的正当路径是 chart
+# 的 value 与 Pod 的 env，不是编辑脚本；把它们收进来只会要求一堆没人能设的变量。
+mapfile -t files < <(find "$REPO/deploy" -name '*.sh' -not -path '*/tests/*' \
+    -not -path "$REPO/deploy/helm/*/files/*" | sort)
+mapfile -t gh_scripts < <(find "$REPO/.github/scripts" -maxdepth 1 -name '*.sh' | sort)
+files+=("${gh_scripts[@]}")
+[ "${#files[@]}" -gt 50 ] && ok "扫到 ${#files[@]} 个脚本（deploy 全部 + ${#gh_scripts[@]} 个 .github/scripts）" \
     || bad "扫描面太窄：${#files[@]} 个脚本"
-# 反空洞的另一半：另一棵树真的被扫进来了，而不是一个没展开的 glob。
-[ -e "${gh_scripts[0]}" ] \
-    && ok ".github/scripts 那棵树在扫描面里" \
+# 反空洞的另一半：另两棵树真的被扫进来了，而不是两个没展开的 glob。
+[ "${#gh_scripts[@]}" -gt 0 ] \
+    && ok ".github/scripts 那棵树在扫描面里（${#gh_scripts[@]} 个）" \
     || bad ".github/scripts 那棵树没被扫到（glob 没展开）"
+in_pod="$(find "$REPO/deploy/helm" -path '*/files/*' -name '*.sh' | wc -l)"
+[ "$in_pod" -gt 0 ] \
+    && ok "Pod 内脚本确实被排除在外（${in_pod} 个：改它们走 chart value，不是改脚本）" \
+    || bad "一个 Pod 内脚本都没找到——排除的路径写错了，那个面向下会漏扫"
 
 bad_lines="$(scan "${files[@]}" | grep -vE '=[01]$' || true)"
 if [ -z "$bad_lines" ]; then

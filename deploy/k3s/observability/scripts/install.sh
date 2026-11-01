@@ -15,6 +15,13 @@ set -euo pipefail
 PROFILE="${PROFILE:-small}"
 BACKENDS="${BACKENDS:-1}"
 
+# 等的上限，带单位（helm 与 kubectl 都认 `600s` 这种写法）。三个数分开给，因为它们
+# 等的东西不同：装一整套指标栈、装一个 Jaeger、等一批 Pod 变 Ready。慢盘上要抬的是
+# 头一个，抬它不该连带把后两个也拖长。
+STACK_WAIT="${COGNEVA_OBS_STACK_WAIT:-600s}"
+JAEGER_WAIT="${COGNEVA_OBS_JAEGER_WAIT:-300s}"
+PODS_READY_WAIT="${COGNEVA_OBS_PODS_READY_WAIT:-300s}"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HELM_DIR="${SCRIPT_DIR}/../helm"
 MANIFESTS_DIR="${SCRIPT_DIR}/../manifests"
@@ -335,7 +342,7 @@ deploy_prometheus_stack() {
         --values "${VALUES_FILE}" \
         ${reach_args[@]+"${reach_args[@]}"} \
         --wait \
-        --timeout 600s
+        --timeout "${STACK_WAIT}"
 
     log_info "kube-prometheus-stack 部署完成 ✓"
 }
@@ -348,7 +355,7 @@ deploy_jaeger() {
         --namespace "${NAMESPACE}" \
         --values "${HELM_DIR}/jaeger-values.yaml" \
         --wait \
-        --timeout 300s
+        --timeout "${JAEGER_WAIT}"
 
     log_info "Jaeger 部署完成 ✓"
 }
@@ -378,7 +385,7 @@ enable_traefik_metrics() {
 verify_deployment() {
     log_info "验证部署状态..."
 
-    kubectl wait --for=condition=Ready pods --all -n "${NAMESPACE}" --timeout=300s
+    kubectl wait --for=condition=Ready pods --all -n "${NAMESPACE}" --timeout="${PODS_READY_WAIT}"
 
     echo ""
     log_info "=== 部署状态 ==="

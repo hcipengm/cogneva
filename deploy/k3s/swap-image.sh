@@ -34,6 +34,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 NS=cogneva
 IMAGE=localhost/cogneva
+# 等集群就绪的上限，秒。两个数分开给：registry Pod 起来与单个工作负载滚完不是
+# 同一个量，节点多只会拖长后者。写死的那一版慢机器上只能改脚本。
+REGISTRY_WAIT_SECS="${COGNEVA_SWAP_REGISTRY_WAIT_SECS:-180}"
+ROLLOUT_WAIT_SECS="${COGNEVA_SWAP_ROLLOUT_WAIT_SECS:-300}"
 NEW_TAG=""
 PREV_TAG=""
 BUILD_WEB=0
@@ -368,7 +372,7 @@ if [ "$DO_DEPLOY" = 1 ]; then
   # 不先前移浮动签，apply 会让线上拉回 registry 里的旧镜像。版本 tag 一并推送
   # （按版本引用/追溯）。任一失败立即中止——此时尚未 apply/滚动，线上不受影响。
   echo "==> 播种集群内 registry（${NEW_TAG} + :local）"
-  kubectl -n "$NS" wait --for=condition=Available deployment/cogneva-registry --timeout=180s
+  kubectl -n "$NS" wait --for=condition=Available deployment/cogneva-registry --timeout="${REGISTRY_WAIT_SECS}s"
   buildah push --tls-verify=false "${IMAGE}:${NEW_TAG}" "localhost:30500/cogneva:${NEW_TAG}"
   buildah push --tls-verify=false "${IMAGE}:local" "localhost:30500/cogneva:local"
   echo "    registry 已更新（localhost:30500）"
@@ -416,7 +420,7 @@ if [ "$DO_DEPLOY" = 1 ]; then
   while IFS=$'\t' read -r workload_kind workload_name; do
     [ -n "$workload_kind" ] || continue
     kubectl rollout status -n "$NS" \
-      "$(printf '%s' "$workload_kind" | tr 'A-Z' 'a-z')/${workload_name}" --timeout=300s
+      "$(printf '%s' "$workload_kind" | tr 'A-Z' 'a-z')/${workload_name}" --timeout="${ROLLOUT_WAIT_SECS}s"
   done < <(printf '%s\n' "$workloads" | cut -f1,2 | sort -u)
 
   echo "==> 校验新 Pod 实际运行镜像"
@@ -487,7 +491,7 @@ for p in d.get("items",[]):
     while IFS=$'\t' read -r workload_kind workload_name; do
       [ -n "$workload_kind" ] || continue
       kubectl rollout status -n "$NS" \
-        "$(printf '%s' "$workload_kind" | tr 'A-Z' 'a-z')/${workload_name}" --timeout=300s
+        "$(printf '%s' "$workload_kind" | tr 'A-Z' 'a-z')/${workload_name}" --timeout="${ROLLOUT_WAIT_SECS}s"
     done < <(printf '%s\n' "$workloads" | cut -f1,2 | sort -u)
     stale="$(stale_containers)"
   fi
