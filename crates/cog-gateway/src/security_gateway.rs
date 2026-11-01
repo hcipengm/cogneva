@@ -3722,12 +3722,14 @@ async fn record_exchange(
 /// 第三个数是**上游自己报的、由缓存服务的那部分输入 token**。单列一格而不是并进
 /// 输入：它与输入之比就是命中率，而命中率是「把稳定前缀排到前面」这类改动唯一的
 /// 验收读数——没有它，省 token 的改动只能靠推理说"应该省了"。
-/// 两个协议面对它的**关系不同，读的人要按协议读**：OpenAI 兼容面上 `cached_tokens`
-/// 是 `prompt_tokens` 的一部分（命中率 = cached / prompt）；Anthropic 面上
-/// `cache_read_input_tokens` 与 `input_tokens` 互斥（各是 prompt 的一段，相加才是
-/// 完整 prompt，命中率 = cache_read / (input + cache_read)）。这一处差异是协议的，
-/// 不是我们的：合成一格是为了让"从缓存服务了多少"这个量只有一个名字，读的人按
-/// 上游的协议面解释它。读不到仍是 `None`，同上面两个计数。
+/// 两个协议面对它的**关系不同，而这里把它归一**：OpenAI 兼容面上 `cached_tokens`
+/// 是 `prompt_tokens` 的一部分，Anthropic 面上 `cache_read_input_tokens` 与
+/// `input_tokens` 互斥。所以 OpenAI 形状的 `prompt_tokens` 先减去命中量再当输入记，
+/// 两个面就都满足同一条不变式：**输入是没被缓存服务的那部分，输入 + 命中 = 整个
+/// prompt，命中率一律 `cached / (input + cached)`**。不归一的代价在行上看不出来——
+/// 行上记的是请求走的哪个面，而 k3 在 anthropic 面上回的是 OpenAI 形状的尾帧，
+/// 于是同一列里混着两种口径，按协议面解释这件事根本做不到。读不到仍是 `None`，
+/// 同上面两个计数。
 ///
 /// 第四个数是**这次调用写进上游缓存的输入 token**（Anthropic 面 `cache_creation_input_tokens`）。
 /// 它和第三个数问的是同一件事的两半，缺了任何一半都答不成：只读不写＝前缀每发都变，
@@ -3769,13 +3771,19 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<
         // "上游没报"在这一格同形，计量会安静地归零。
         Some(kind) if kind.starts_with("response.") => {
             let usage = json.pointer("/response/usage");
+            let cached = usage
+                .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
+                .and_then(as_u64)
+                .or_else(|| usage.and_then(cached_of));
             (
-                usage.and_then(|u| u.get("input_tokens")).and_then(as_u64),
-                usage.and_then(|u| u.get("output_tokens")).and_then(as_u64),
+                // 与 chat 尾帧同一条口径：这个面的 `input_tokens` 也含缓存命中，
+                // 减掉之后才与 Anthropic 面的 `input_tokens` 是同一个量。
                 usage
-                    .and_then(|u| u.pointer("/input_tokens_details/cached_tokens"))
+                    .and_then(|u| u.get("input_tokens"))
                     .and_then(as_u64)
-                    .or_else(|| usage.and_then(cached_of)),
+                    .map(|input| input.saturating_sub(cached.unwrap_or(0))),
+                usage.and_then(|u| u.get("output_tokens")).and_then(as_u64),
+                cached,
                 // Responses 面不报写缓存：这个协议面上缓存由上游自己决定，
                 // 它没有"我写了多少"这一说。`None` 是"没这门读数"。
                 None,
@@ -3789,12 +3797,24 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<
                 .get("usage")
                 .filter(|u| !u.is_null())
                 .or_else(|| json.pointer("/choices/0/usage").filter(|u| !u.is_null()));
+            let cached = usage.and_then(cached_of);
             (
-                usage.and_then(|u| u.get("prompt_tokens")).and_then(as_u64),
+                // `prompt_tokens` 在这个协议面上**含**缓存命中的那部分，Anthropic 面的
+                // `input_tokens` **不含**。同一个账列装两种口径，读的人分不出来：行上
+                // 记的是「请求走的哪个面」，而 k3 这种上游在 anthropic 面上回的是
+                // OpenAI 形状的尾帧——2026-11-01 实测一行的 `api_style=anthropic`、
+                // 数字却是 `prompt_tokens` 口径。于是照 `cached/(input+cached)` 算命中率
+                // 的人，把 88% 的命中读成 1.1%，把「读回多少」读成「整个 prompt」。
+                // 减掉之后再记，两种口径就合成一句：`input` 是没被缓存服务的那部分，
+                // `input + cached` 是整个 prompt，命中率一律 `cached/(input+cached)`。
+                usage
+                    .and_then(|u| u.get("prompt_tokens"))
+                    .and_then(as_u64)
+                    .map(|prompt| prompt.saturating_sub(cached.unwrap_or(0))),
                 usage
                     .and_then(|u| u.get("completion_tokens"))
                     .and_then(as_u64),
-                usage.and_then(cached_of),
+                cached,
                 None,
             )
         }
@@ -10169,6 +10189,55 @@ mod tests {
         assert_eq!(extract_usage(&json), (Some(123), Some(45), None, None));
     }
 
+    /// 两个协议面的输入不能混着记。
+    ///
+    /// `prompt_tokens` 含缓存命中，`input_tokens` 不含；同一列装两种口径的话，读的人
+    /// 只能靠 `api_style` 去猜行里是哪种——而 k3 在 anthropic 面上回的是 OpenAI 形状的
+    /// 尾帧，猜必错。2026-11-01 实测：一行 `api_style=anthropic`、`prompt_tokens=1455`、
+    /// `cached_tokens=1280`，那是 88% 的命中，按 `cached/(input+cached)` 读成 1.1%，
+    /// 逐行汇总之后全天命中率也是 1.1%——而它是这轮「把稳定前缀排前面」唯一能看的读数。
+    #[test]
+    fn usage_inputs_from_both_faces_mean_the_same_thing() {
+        // OpenAI 形状：命中量要从 prompt 里减掉，减完 input+cached 仍等于整个 prompt。
+        let chat = serde_json::json!({
+            "usage": {"prompt_tokens": 1455, "completion_tokens": 1103, "cached_tokens": 1280}
+        });
+        assert_eq!(
+            extract_usage(&chat),
+            (Some(175), Some(1103), Some(1280), None)
+        );
+
+        // 没命中时减法不该动数：prompt 就是 input。
+        let cold = serde_json::json!({
+            "usage": {"prompt_tokens": 900, "completion_tokens": 10, "cached_tokens": 0}
+        });
+        assert_eq!(extract_usage(&cold), (Some(900), Some(10), Some(0), None));
+
+        // Anthropic 帧本来就不含命中，照原样记，不许再减一次。
+        let start = serde_json::json!({
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 175, "cache_read_input_tokens": 1280}}
+        });
+        assert_eq!(extract_usage(&start), (Some(175), None, Some(1280), None));
+
+        // Responses 面同一个口径：`input_tokens` 也含命中。
+        let done = serde_json::json!({
+            "type": "response.completed",
+            "response": {"usage": {
+                "input_tokens": 1000,
+                "output_tokens": 20,
+                "input_tokens_details": {"cached_tokens": 600}
+            }}
+        });
+        assert_eq!(extract_usage(&done), (Some(400), Some(20), Some(600), None));
+
+        // 上游报的命中比 prompt 还大（自相矛盾的那一份）：输入钳到 0，不许回绕成天文数字。
+        let absurd = serde_json::json!({
+            "usage": {"prompt_tokens": 10, "completion_tokens": 1, "cached_tokens": 99}
+        });
+        assert_eq!(extract_usage(&absurd), (Some(0), Some(1), Some(99), None));
+    }
+
     #[test]
     fn usage_extract_anthropic_frames() {
         let start = serde_json::json!({
@@ -10243,7 +10312,7 @@ mod tests {
         });
         assert_eq!(
             extract_usage(&top_level),
-            (Some(400), Some(7), Some(384), None)
+            (Some(16), Some(7), Some(384), None)
         );
 
         let nested = serde_json::json!({
@@ -10256,7 +10325,7 @@ mod tests {
         });
         assert_eq!(
             extract_usage(&nested),
-            (Some(400), Some(7), Some(256), None)
+            (Some(144), Some(7), Some(256), None)
         );
 
         let anthropic = serde_json::json!({
@@ -10337,7 +10406,7 @@ mod tests {
         });
         assert_eq!(
             extract_usage(&nested),
-            (Some(20547), Some(189), Some(17920), None)
+            (Some(2627), Some(189), Some(17920), None)
         );
     }
 
@@ -10497,7 +10566,7 @@ mod tests {
         );
         s.finish();
         assert_eq!(s.outcome(), UsageOutcome::Read);
-        assert_eq!((s.tokens_input, s.tokens_output), (120, 30));
+        assert_eq!((s.tokens_input, s.tokens_output), (20, 30));
         assert_eq!(s.tokens_cached, 100);
     }
 
