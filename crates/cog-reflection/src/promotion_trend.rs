@@ -54,6 +54,17 @@ const OUTCOME_AWAITING_REVIEW: &str = "awaiting_review";
 const MIN_TREND_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 从台账记录聚合周报。纯函数，便于测试。
+///
+/// 一条变更算一票，不算它的尝试次数。台账一行是一次**尝试**：拉取端每一轮
+/// poll 都为同一个 change 再记一行，金丝雀失败一次就多一行。2026-11-01 实测：
+/// 同一条变更在七小时里记下 212 行失败，那一周于是被读成「165 条变更失败、
+/// 成功率 1.2%」，而那一周真正失败过的变更只有两条。重试是同一件事的又一次
+/// 尝试，不是又一条坏了的变更；把它数成一条，重试风暴就会冒充成一整批产出
+/// 坏掉的证据，而读这五档的人会去修错的环节。
+///
+/// 所以先按 `change_id` 收成它最后的那一行（`updated_at` 最新，同刻比
+/// `created_at`），再按那一行所在的 ISO 周分档。收成"最后一行"而不是"第一行"：
+/// 一条变更的结局是它停下来的那个状态，中途失败后来又晋级的，算晋级。
 pub fn aggregate(
     records: &[cog_core::PromotionRecord],
     now: DateTime<Utc>,
@@ -76,7 +87,20 @@ pub fn aggregate(
         })
         .collect();
 
+    // 收成一条变更一行：`change_id` → 它更新的那一行。
+    let mut settled: std::collections::HashMap<&str, &cog_core::PromotionRecord> =
+        std::collections::HashMap::new();
     for rec in records {
+        match settled.get(rec.change_id.as_str()) {
+            Some(seen)
+                if (seen.updated_at, seen.created_at) >= (rec.updated_at, rec.created_at) => {}
+            _ => {
+                settled.insert(rec.change_id.as_str(), rec);
+            }
+        }
+    }
+
+    for rec in settled.values() {
         let iso = rec.created_at.iso_week();
         let label = format!("{}-W{:02}", iso.year(), iso.week());
         let Some(bucket) = weeks.iter_mut().find(|w| w.week == label) else {
@@ -487,11 +511,18 @@ mod tests {
     use super::*;
     use cog_core::PromotionRecord;
 
+    /// 每一条测试记录都是**另一条**变更。
+    ///
+    /// 这一族数的是变更不是尝试次数，所以拿同一个 `change_id` 造两条，聚合出来
+    /// 就只有一条——那正是被测的行为，不是这些夹具想要的。手工编号而不是按调用
+    /// 顺序编号：先构造后 `reverse()` 的测试要靠它不随顺序变。
     fn rec(weeks_ago: i64, status: PromotionStatus) -> PromotionRecord {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let t = Utc::now() - chrono::Duration::weeks(weeks_ago);
         PromotionRecord {
             id: format!("id-{weeks_ago}-{}", status.as_str()),
-            change_id: "p".into(),
+            change_id: format!("p-{n}"),
             level: "l1_rollout".into(),
             decision_reason: "test".into(),
             cluster: "publisher".into(),
@@ -513,6 +544,52 @@ mod tests {
             gate_kind: Some(gate_kind),
             ..rec(weeks_ago, status)
         }
+    }
+
+    /// 同一条变更被重试两百次，是**一条**失败，不是两百条。
+    ///
+    /// 2026-11-01 的现场：一条候选在七小时里被重试 212 次，每一次都记一行，
+    /// 于是那一周的读数变成 `failed 165 / promoted 2`、成功率 1.2%，而台账里
+    /// 真正失败过的变更只有两条。这一格真正该说的是「生成出来的东西大多没落地」，
+    /// 重试把它说成了「一整批产出坏掉」——两者要修的地方完全不同。
+    ///
+    /// 同一条变更中途失败、最后晋级，也算晋级：一条变更的结局是它停下来的那个
+    /// 状态，不是它最难看的那一刻。
+    #[test]
+    fn retries_of_one_change_count_as_one_change() {
+        let now = Utc::now();
+        let base = rec(0, PromotionStatus::Failed);
+        let mut records: Vec<PromotionRecord> = (0..200)
+            .map(|i| PromotionRecord {
+                id: format!("attempt-{i}"),
+                change_id: "stuck".into(),
+                created_at: now - chrono::Duration::minutes(200 - i),
+                updated_at: now - chrono::Duration::minutes(200 - i),
+                ..base.clone()
+            })
+            .collect();
+        let promoted = PromotionRecord {
+            change_id: "landed".into(),
+            status: PromotionStatus::Promoted,
+            created_at: now,
+            updated_at: now,
+            ..base.clone()
+        };
+        records.push(promoted);
+        // 同一条变更先失败、后晋级：只算晋级那一次，且不是额外的一条。
+        let late_win = PromotionRecord {
+            change_id: "stuck".into(),
+            status: PromotionStatus::Promoted,
+            created_at: now + chrono::Duration::minutes(1),
+            updated_at: now + chrono::Duration::minutes(1),
+            ..base.clone()
+        };
+        records.push(late_win);
+
+        let week = &aggregate(&records, now).weeks[WINDOW_WEEKS - 1];
+        assert_eq!(week.failed, 0, "重试与随后晋级都不该记成失败的变更");
+        assert_eq!(week.promoted, 2, "两条变更，各一票");
+        assert_eq!(week.success_rate, Some(1.0));
     }
 
     #[test]

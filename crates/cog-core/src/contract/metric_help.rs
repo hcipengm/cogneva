@@ -1463,10 +1463,16 @@ const GAUGE_HELP: &[(&str, &str)] = &[
     ),
     (
         crate::metric_names::PROMOTION_WEEK_CHANGES.as_str(),
-        "Promotion-ledger entries of one ISO week, by how they ended: \
+        "Changes of one ISO week, by how they ended: \
          `promoted`, `rolled_back`, `failed`, `pending` (decided and still in \
          flight -- pushed, or not yet picked up by a cluster) and \
-         `awaiting_review`. Labelled by `week` (e.g. `2026-W42`) and by \
+         `awaiting_review`. One vote per change, not per entry: the ledger \
+         writes a row for every attempt, so a candidate retried for hours \
+         would otherwise read as a week of mass failure -- measured \
+         2026-11-01, one change retried 212 times made a week read \
+         `failed 165 / promoted 2` when two changes had actually failed. \
+         A change is counted under the week of its last entry, and its \
+         outcome is that entry's status. Labelled by `week` (e.g. `2026-W42`) and by \
          `outcome`; one cell per week inside the trend report's window, \
          re-written every report cycle rather than incremented, so a cell \
          standing at 0 and a cell nobody wrote stay different readings. The \
