@@ -519,6 +519,17 @@ fn error_excerpt(text: &str) -> String {
 // cap: derived — 与调用侧终止退避同形；配额类终止每窗口最多烧一次最小探测调用，恢复延迟最多一个窗口
 const SUSPECT_BACKOFF_CAP_SECS: u64 = 6 * 60 * 60;
 
+/// 限流类拒绝（配额周期类、上游没报复位时刻）的嫌疑窗起步基线。
+///
+/// 探测间隔那条基线是给**不响应的对端**用的：用整条间隔去关一家按窗口放行的
+/// 上游，代价是单成员协议面上一次 429 买走一整条间隔的全灭。2026-11-01 现场：
+/// anthropic 面只有一家成员，24 小时里 `refused_by_circuit` 30883 次、真正服务
+/// 的只有 656 次——熔断拒掉的不是坏上游，是每一次限流后面的五分钟。
+///
+/// 曲线不改，只改起步：首窗 30 秒，之后照旧 ×2，几次就并回探测间隔那条。反复
+/// 限流仍然会退到分钟级，配额真的耗尽时不会变成 30 秒一次的锤门。
+const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 30;
+
 /// 嫌疑窗时长：探测间隔 × 2^(n-1)，封顶 6h。n 为连续失败次数。
 ///
 /// git 传输熔断（[`crate::git_mirror`]）复用同一条退避曲线：两类通道的失败
@@ -1141,6 +1152,17 @@ impl LlmHealthTable {
         }
         entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
         let mut secs = suspect_backoff_secs(entry.consecutive_failures, probe_interval_secs);
+        // 配额周期类拒绝是上游在给我们配速（「这一窗用完了，回头再来」），不是
+        // 它坏了；探测间隔那条基线是给不响应的对端用的。单成员协议面上，拿整条
+        // 间隔去关一家正在按窗口放行的上游，一次 429 就是整整一个间隔的全灭。
+        // 曲线不改，只改起步基线；上游自己报了复位时刻的那条走下面的 max，是
+        // 证据不是节拍，不许被这里压短。
+        if quota_reset_unix.is_none() && refusal_kind == Some(RefusalKind::QuotaCycle) {
+            secs = secs.min(suspect_backoff_secs(
+                entry.consecutive_failures,
+                RATE_LIMIT_BACKOFF_BASE_SECS,
+            ));
+        }
         if let Some(reset_at) = quota_reset_unix {
             let until_reset = reset_at.saturating_sub(Utc::now().timestamp()).max(0) as u64;
             secs = secs.max(until_reset).min(SUSPECT_BACKOFF_CAP_SECS);
@@ -11307,6 +11329,50 @@ mod tests {
         assert_eq!(suspect_backoff_secs(3, 300), 1200);
         assert_eq!(suspect_backoff_secs(10, 300), SUSPECT_BACKOFF_CAP_SECS);
         assert_eq!(suspect_backoff_secs(0, 5), 30);
+    }
+
+    /// 限流不是"坏了"：一次配额周期类拒绝不能把单成员协议面关闸一整个探测间隔。
+    ///
+    /// 2026-11-01 现场：anthropic 面只有一家成员，24 小时里池级熔断拒了 30883
+    /// 次、真正服务的只有 656 次。熔断拒掉的不是坏上游——每一条 429 都在那条
+    /// 唯一成员身上买了 300 秒（一个完整探测间隔）的全灭。
+    ///
+    /// 下面四格钉的是"起步基线按成因分家"，曲线本身不变：说不清成因的、资格类
+    /// 的照旧一整个间隔（这两类等一等真的不会好）；上游报了复位时刻的跟到那一刻。
+    #[test]
+    fn a_rate_limited_upstream_gets_a_pacing_window_not_a_blackout() {
+        let table = LlmHealthTable::default();
+        let u = stub_upstream("https://a.example.com", "m1");
+
+        assert_eq!(
+            table.note_failure(&u, 300, None, None, Some(RefusalKind::QuotaCycle)),
+            Some((1, RATE_LIMIT_BACKOFF_BASE_SECS)),
+            "配额周期类、没报复位时刻 ⇒ 30 秒起步，不是一个探测间隔"
+        );
+        table.note_success(&u, true);
+
+        assert_eq!(
+            table.note_failure(&u, 300, None, None, Some(RefusalKind::Unclassified)),
+            Some((1, 300)),
+            "读不出成因的照旧一整个探测间隔：这一条改动不许顺带放松它"
+        );
+        table.note_success(&u, true);
+
+        assert_eq!(
+            table.note_failure(&u, 300, None, None, Some(RefusalKind::Entitlement)),
+            Some((1, 300)),
+            "资格类等多久都不会好，窗口不许被压短"
+        );
+        table.note_success(&u, true);
+
+        let reset = Utc::now().timestamp() + 900;
+        let (_, secs) = table
+            .note_failure(&u, 300, Some(reset), None, Some(RefusalKind::QuotaCycle))
+            .expect("上游报了一个还在一刻钟开外的复位时刻，这是一扇新窗");
+        assert!(
+            secs >= 890,
+            "上游自己报了复位时刻就要跟到那一刻，短基线不许把它压短：{secs}"
+        );
     }
 
     #[test]
