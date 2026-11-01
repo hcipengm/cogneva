@@ -4817,48 +4817,103 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
     let mut by_upstream = std::collections::HashMap::new();
     let mut rulers = Vec::with_capacity(readings.len());
     for reading in readings {
+        // 一家的额度可能被不止一把尺子管着（5 小时的突发上限套在 7 天的总量
+        // 里），而池的和是**按成员**加的：一家只能进一次和。加两把会把同一个
+        // 账户算两遍，加最新那次拒绝点名的那把则让界取决于最近撞的是哪堵墙
+        // ——2026-11-01 实测：7 天那把尺第一次出现在账上时它已经花光了，一整
+        // 天的消耗都是按 5 小时那把配的。
+        //
+        // 尺子的集合是**发现**出来的，不是声明出来的：每个窗长都随一次点名它的
+        // 拒绝到来，之后由库里的那一行记住。所以这里按上游把存下的窗长全取出来，
+        // 再并上这一拍上游自报的那一把。
+        let mut window_lengths: Vec<u64> = match store.stored_windows(&reading.key).await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| row.window_secs)
+                .filter(|secs| *secs > 0)
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    upstream = %reading.key,
+                    error = %e,
+                    "窗口配速：读不出这一家存下的窗长，只按这一拍自报的那一把判"
+                );
+                Vec::new()
+            }
+        };
+        if let Some(reported) = reading.quota_window_secs.filter(|secs| *secs > 0) {
+            window_lengths.push(reported);
+        }
+        window_lengths.sort_unstable();
+        window_lengths.dedup();
         // 每一个 `continue` 都是一家的额度没进池和。记下它是哪一种缺席：三处的
         // 修法在三个地方（去要窗口长度／等它撞一次墙／修账本查询），合成一个值
         // 会让读的人全去改同一处。
-        let Some(window_secs) = reading.quota_window_secs.filter(|w| *w > 0) else {
+        if window_lengths.is_empty() {
             rulers.push((
                 reading.key.clone(),
                 crate::window_pace::Ruler::NoWindowReported,
             ));
             continue;
-        };
-        let Some((measured, exhausted)) = measure_window(
-            state,
-            store.as_ref(),
-            &reading.key,
-            window_secs,
-            reading.quota_reset_unix,
-            reading.refusal_kind,
-        )
-        .await
-        else {
+        }
+        let mut members = Vec::with_capacity(window_lengths.len());
+        let mut spend_unreadable = false;
+        for window_secs in window_lengths {
+            // 这一拍自报的窗长才带着活得来的复位时刻与成因；存在库里的另一把
+            // 尺子没有新的观测，按它自己那一行判——这正是它作为持久证据的价值。
+            let (quota_reset_unix, refusal_kind) = if reading.quota_window_secs == Some(window_secs)
+            {
+                (reading.quota_reset_unix, reading.refusal_kind)
+            } else {
+                (None, None)
+            };
+            let Some((measured, exhausted)) = measure_window(
+                state,
+                store.as_ref(),
+                &reading.key,
+                window_secs,
+                quota_reset_unix,
+                refusal_kind,
+            )
+            .await
+            else {
+                continue;
+            };
+            let window_start = measured.window_start_at(now_unix);
+            let spent = match store.spent_since(&reading.key, window_start).await {
+                Ok(value) => value,
+                Err(e) => {
+                    tracing::warn!(
+                        upstream = %reading.key,
+                        window_secs,
+                        error = %e,
+                        "窗口配速：读不出本窗口的用量，这把尺子不进这一拍的判定"
+                    );
+                    spend_unreadable = true;
+                    continue;
+                }
+            };
+            members.push(crate::window_pace::RulerMember {
+                measured,
+                spent_tokens: spent,
+                exhausted,
+            });
+        }
+        let Some(governing) = crate::window_pace::governing_ruler(&members, now_unix) else {
             rulers.push((
                 reading.key.clone(),
-                crate::window_pace::Ruler::WindowUnmeasurable,
+                if spend_unreadable {
+                    crate::window_pace::Ruler::SpendUnreadable
+                } else {
+                    // 量到了但没有一把尺子还说得出此刻的容量：窗长有了，陈旧的
+                    // 容量不算。这与「等它撞一次墙」是同一处修法。
+                    crate::window_pace::Ruler::WindowUnmeasurable
+                },
             ));
             continue;
         };
-        let window_start = measured.window_start_at(now_unix);
-        let spent = match store.spent_since(&reading.key, window_start).await {
-            Ok(value) => value,
-            Err(e) => {
-                tracing::warn!(
-                    upstream = %reading.key,
-                    error = %e,
-                    "窗口配速：读不出本窗口的用量，这一家不进这一拍的判定"
-                );
-                rulers.push((
-                    reading.key.clone(),
-                    crate::window_pace::Ruler::SpendUnreadable,
-                ));
-                continue;
-            }
-        };
+        let member = members[governing];
+        let (measured, spent, exhausted) = (member.measured, member.spent_tokens, member.exhausted);
         rulers.push((reading.key.clone(), crate::window_pace::Ruler::Measured));
         if exhausted {
             pace.add_exhausted(&measured, spent, now_unix);

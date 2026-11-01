@@ -563,6 +563,21 @@ pub trait LlmUsageLedger: Send + Sync {
         window_secs: u64,
     ) -> Result<Option<StoredWindow>, String>;
 
+    /// Every persisted measurement for `upstream`, shortest window first.
+    ///
+    /// One upstream can carry more than one quota window at a time — a
+    /// five-hour burst limit nested inside a seven-day volume limit — and the
+    /// pacer has to answer against **all** of them, not only the one the last
+    /// refusal happened to name. Which one that is changes with which wall was
+    /// hit most recently, so a pacer that reads one row at a time paces against
+    /// whichever quota is currently visible and is blind to the other until it
+    /// is already spent.
+    ///
+    /// Asking by upstream rather than by `(upstream, window_secs)` is what makes
+    /// that set discoverable: nobody enumerates window lengths up front, they
+    /// arrive one refusal at a time.
+    async fn stored_windows(&self, upstream: &str) -> Result<Vec<StoredWindow>, String>;
+
     /// Tokens served for `upstream` since `since_unix`, successful calls only.
     async fn spent_since(&self, upstream: &str, since_unix: i64) -> Result<u64, String>;
 

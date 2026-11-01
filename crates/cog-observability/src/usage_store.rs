@@ -885,6 +885,34 @@ impl LlmUsageStore {
         }))
     }
 
+    /// Every window measurement this upstream has, shortest first.
+    ///
+    /// Shortest first is not cosmetic: a pacer that folds the members in this
+    /// order keeps the short ruler as the tie-breaker when two rulers leave the
+    /// same headroom, and the short ruler refills sooner, so the pair is
+    /// decided on the answer that arrives first.
+    pub async fn stored_windows(&self, upstream: &str) -> anyhow::Result<Vec<StoredWindow>> {
+        let rows = sqlx::query(&format!(
+            "SELECT upstream, boundary_unix, window_secs, capacity_tokens, source,
+                    declared_reset_unix
+               FROM {WINDOW_TABLE} WHERE upstream = $1 ORDER BY window_secs ASC"
+        ))
+        .bind(upstream)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| StoredWindow {
+                upstream: r.get("upstream"),
+                boundary_unix: r.get("boundary_unix"),
+                window_secs: r.get::<i64, _>("window_secs").max(0) as u64,
+                capacity_tokens: r.get::<i64, _>("capacity_tokens").max(0) as u64,
+                source: r.get("source"),
+                declared_reset_unix: r.get("declared_reset_unix"),
+            })
+            .collect())
+    }
+
     /// Tokens this upstream served from `since_unix` onwards.
     ///
     /// Asked separately from [`Self::upstream_window`] because the instant to
@@ -1765,6 +1793,12 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         window_secs: u64,
     ) -> Result<Option<StoredWindow>, String> {
         LlmUsageStore::stored_window(self, upstream, window_secs)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn stored_windows(&self, upstream: &str) -> Result<Vec<StoredWindow>, String> {
+        LlmUsageStore::stored_windows(self, upstream)
             .await
             .map_err(|e| e.to_string())
     }

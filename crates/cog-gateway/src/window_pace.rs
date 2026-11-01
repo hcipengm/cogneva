@@ -84,6 +84,74 @@ impl MeasuredWindow {
     }
 }
 
+/// One of an upstream's rulers, weighed against what that ruler has already
+/// served.
+///
+/// A member is not "a window" but "a window plus what went into it", because
+/// the question the pool asks — may one more job start? — is answered by the
+/// difference, and a ramp without its spend reads as a fresh window forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RulerMember {
+    pub measured: MeasuredWindow,
+    /// Tokens the upstream served inside this ruler's window.
+    pub spent_tokens: u64,
+    /// The upstream refused this window more recently than it served it.
+    pub exhausted: bool,
+}
+
+impl RulerMember {
+    /// What this ruler still allows by `now_unix`.
+    ///
+    /// A window the upstream has said is spent allows nothing, whatever the
+    /// ramp still describes: the refusal is the later observation.
+    pub fn remaining_tokens(&self, now_unix: i64) -> u64 {
+        if self.exhausted {
+            return 0;
+        }
+        self.measured
+            .allowance_at(now_unix)
+            .saturating_sub(self.spent_tokens)
+    }
+
+    /// Whether this measurement still speaks about the window in force.
+    ///
+    /// Two cycles is the same age limit `window_boundary` puts on a resume
+    /// anchor, for the same reason: past it the phase has rolled at least twice
+    /// with nobody watching, so the ramp describes windows that already ended.
+    pub fn is_current(&self, now_unix: i64) -> bool {
+        let window = self.measured.window_secs as i64;
+        window > 0 && now_unix.saturating_sub(self.measured.burned_at_unix) < 2 * window
+    }
+}
+
+/// Which of one upstream's rulers governs this beat.
+///
+/// An upstream can carry more than one quota window at once — a five-hour burst
+/// limit nested inside a seven-day volume limit — and every one of them has to
+/// hold. The pool's arithmetic is a sum over **members**, so a member may enter
+/// it only once:
+///
+/// - adding every ruler credits one account several times, and the pool then
+///   believes it may spend their sum;
+/// - adding only the ruler the newest refusal named makes the bound depend on
+///   which wall was hit most recently. Measured 2026-11-01: the seven-day ruler
+///   first appeared in the ledger at the instant it was already spent, so a
+///   whole day of burn had been paced against the five-hour ruler alone, whose
+///   capacity is roughly four days' worth of the weekly quota per day.
+///
+/// The ruler that governs is the one with the least left after its own spend:
+/// it is the one that would refuse first, so satisfying it satisfies the rest.
+/// Ties keep the shortest window, which is the order the caller hands them in
+/// and also the ruler that refills soonest.
+pub fn governing_ruler(members: &[RulerMember], now_unix: i64) -> Option<usize> {
+    members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| member.measured.is_usable() && member.is_current(now_unix))
+        .min_by_key(|(_, member)| member.remaining_tokens(now_unix))
+        .map(|(index, _)| index)
+}
+
 /// What the process knows about one upstream's last window.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowEvidence {
@@ -1273,5 +1341,125 @@ mod tests {
             Ruler::NoWindowReported.label()
         );
         assert!(!Ruler::NoUsageLedger.contributes());
+    }
+
+    /// 一家同时被 5 小时与 7 天两把尺子管着时，进池和的是**紧**的那把。
+    ///
+    /// 现网形状（2026-11-01）：5 小时那把按 4.0M 的容量摊，7 天那把按一周烧掉
+    /// 的 23.19M 摊。同一时刻前者的余量是后者的四倍多，取后者才是上游真会先
+    /// 拒的那个界。只按最新那次拒绝点名的窗长判，等于让「最近撞的是哪堵墙」
+    /// 决定配额——那天一整天的消耗就是按 5 小时那把走的，7 天那把直到花光才
+    /// 第一次出现在账上。
+    #[test]
+    fn the_tighter_of_one_upstreams_nested_rulers_governs() {
+        let now = 1_000_000 + 10 * DAY;
+        // 5 小时这把刚过半：摊到 2.0M，一分没花。
+        let burst = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 4_000_000,
+                window_secs: 18_000,
+                burned_at_unix: now - 9_000,
+            },
+            spent_tokens: 0,
+            exhausted: false,
+        };
+        // 7 天这把到了第六天：摊到 19.88M，已经花掉 19M，只剩八百多万分之一。
+        let week = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 23_190_000,
+                window_secs: (7 * DAY) as u64,
+                burned_at_unix: now - 6 * DAY,
+            },
+            spent_tokens: 19_000_000,
+            exhausted: false,
+        };
+        assert!(burst.remaining_tokens(now) > week.remaining_tokens(now));
+        let members = [burst, week];
+        assert_eq!(
+            governing_ruler(&members, now),
+            Some(1),
+            "宽的那把先放行，紧的那把随后就会拒，配速照宽的走等于把拒绝留给上游"
+        );
+
+        // 两把都进和就是两份额度：池会以为自己能花 5 小时那把的 2.0M **再加上**
+        // 7 天那把剩下的那一点，而这两笔是同一个账户的同一份额度。
+        let mut both = PoolPace::default();
+        both.add(&members[0].measured, members[0].spent_tokens, now);
+        both.add(&members[1].measured, members[1].spent_tokens, now);
+        let both = both.finish(0, 0);
+        let mut one = PoolPace::default();
+        let governing = members[governing_ruler(&members, now).unwrap()];
+        one.add(&governing.measured, governing.spent_tokens, now);
+        let one = one.finish(0, 0);
+        assert_eq!(
+            both.allowance_tokens - one.allowance_tokens,
+            members[0].measured.allowance_at(now),
+            "多出来的那份正是另一把尺子的允许量，凭空记进池里"
+        );
+    }
+
+    /// 上游当面拒了其中一把尺子时，就是它说了算：余量为零，不是坡度说的那个数。
+    #[test]
+    fn an_exhausted_ruler_governs_even_when_its_ramp_still_pays_out() {
+        let now = 1_000_000 + 10 * DAY;
+        let open = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 30_000_000,
+                window_secs: (30 * DAY) as u64,
+                burned_at_unix: now - 10 * DAY,
+            },
+            spent_tokens: 1_000_000,
+            exhausted: false,
+        };
+        let refused = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 4_000_000,
+                window_secs: 18_000,
+                burned_at_unix: now - 18_000,
+            },
+            spent_tokens: 52_235,
+            exhausted: true,
+        };
+        assert_eq!(
+            governing_ruler(&[open, refused], now),
+            Some(1),
+            "被拒的那把余量为零，坡度还在说的那份额度不能替它说话"
+        );
+        assert_eq!(refused.remaining_tokens(now), 0);
+    }
+
+    /// 超过两个周期没人看过的容量不再是尺子：相位已经滚过不止一遍。
+    ///
+    /// 现网形状：改名前的上游（`kimi-k3`）留下的一行 7 天窗，八天没再有过任何
+    /// 调用，行的坡度却还在按周滚动地把一整周的额度算给池。
+    #[test]
+    fn a_ruler_nobody_observed_for_two_cycles_stops_governing() {
+        let now = 1_000_000 + 30 * DAY;
+        let stale = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 17_284_171,
+                window_secs: (7 * DAY) as u64,
+                burned_at_unix: now - 20 * DAY,
+            },
+            spent_tokens: 0,
+            exhausted: false,
+        };
+        assert!(!stale.is_current(now), "二十天前的边界不止两个周期");
+        assert_eq!(
+            governing_ruler(&[stale], now),
+            None,
+            "没有一只还说得出此刻容量的尺子，就该报「量不出来」而不是报一份额度"
+        );
+
+        let fresh = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 17_284_171,
+                window_secs: (7 * DAY) as u64,
+                burned_at_unix: now - 8 * DAY,
+            },
+            ..stale
+        };
+        assert!(fresh.is_current(now), "一个周期多一点的边界仍在用");
+        assert_eq!(governing_ruler(&[fresh], now), Some(0));
     }
 }
