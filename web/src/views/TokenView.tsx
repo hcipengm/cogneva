@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { getTokenAccount, getTokenOutcomes, getTokenUsage, getTokenUsageSeries, type ActorUsage, type LlmPaceView } from '@/api/client';
+import { useNow } from '@/hooks/useNow';
 import { useResource } from '@/hooks/useResource';
 import { useServices } from '@/shell/context';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
@@ -86,9 +87,10 @@ export function TokenView() {
   const byStyle = styleCells(rows);
   // 「下一次可能进账」不是这一页的预测，是池子当刻快照里的两个时刻：上游自述
   // 复位与我方下次探测。写死日期会在过期后变成假读数，且没有任何东西会红。
+  const now = useNow(30_000);
   const pool = overview.data?.llm_pool ?? null;
   const writeLanding =
-    rows.length > 0 && cacheWrite(rows) === null ? cacheWriteLanding(pool) : null;
+    rows.length > 0 && cacheWrite(rows) === null ? cacheWriteLanding(pool, now) : null;
   const cumulativeActors = cumulative.data?.actors ?? [];
   const cumulativeSum = (pick: (actor: ActorUsage) => number) =>
     cumulativeActors.reduce((total, actor) => total + pick(actor), 0);
@@ -429,7 +431,12 @@ function spanOf(secs: number): string {
  */
 function AllowanceWindow() {
   const { overview } = useServices();
+  // 快照带 TTL（最长 7 天），写它的进程停了以后，载荷里那些「将来的时刻」会一个
+  // 一个变成过去。照原样印成排期，读者会把已经过去的时刻当成还没到——所以这两格
+  // 要跟当前时刻对读一次。
+  const now = useNow(30_000);
   const pool = overview.data?.llm_pool ?? null;
+  const passed = (iso: string | null): boolean => iso !== null && Date.parse(iso) < now;
   const pace: LlmPaceView | null = pool?.pace ?? null;
   const remaining = pace ? pace.allowance_tokens - pace.spent_tokens : 0;
   // 各家窗不一样长时，快照不报窗（`window_secs` 与起点都为零）：允许量是各家
@@ -556,12 +563,24 @@ function AllowanceWindow() {
             <Reading
               label="上游自述复位"
               value={pool.recovery_at ? <Moment iso={pool.recovery_at} /> : '上游没说'}
-              note={pool.quota_window_secs > 0 ? `嫌疑上游声明的窗长 ${spanOf(pool.quota_window_secs)}` : undefined}
+              tone={passed(pool.recovery_at) ? 'warn' : 'plain'}
+              note={
+                passed(pool.recovery_at)
+                  ? `这个时刻已经过去：要么上游说的时刻没有兑现，要么写这份快照的进程有一阵没刷新${pool.quota_window_secs > 0 ? `（嫌疑上游声明的窗长 ${spanOf(pool.quota_window_secs)}）` : ''}`
+                  : pool.quota_window_secs > 0
+                    ? `嫌疑上游声明的窗长 ${spanOf(pool.quota_window_secs)}`
+                    : undefined
+              }
             />
             <Reading
               label="下次探测"
               value={pool.next_attempt_at ? <Moment iso={pool.next_attempt_at} /> : '无嫌疑上游'}
-              note="我方重试的节拍，不是上游的承诺"
+              tone={passed(pool.next_attempt_at) ? 'warn' : 'plain'}
+              note={
+                passed(pool.next_attempt_at)
+                  ? '排的时刻已经过去而快照还是这一份：写它的进程没有按自己的节拍刷新，这不是「探测正在进行」'
+                  : '我方重试的节拍，不是上游的承诺'
+              }
             />
             <Reading
               label="最后一次成功"

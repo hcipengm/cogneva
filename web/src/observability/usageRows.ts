@@ -243,19 +243,36 @@ export interface CacheWriteLanding {
  * 节拍）、最后送出（真正送出过一件活的时刻）。它们都不是「一定会在那时进账」，
  * 所以这一格印的是**界与依据**，不是倒计时。
  */
-export function cacheWriteLanding(pool: LlmPoolView | null | undefined): CacheWriteLanding {
+export function cacheWriteLanding(
+  pool: LlmPoolView | null | undefined,
+  now: number = Date.now()
+): CacheWriteLanding {
   const recovery = pool?.recovery_at ?? null;
   const probe = pool?.next_attempt_at ?? null;
   const served = pool?.last_served_at ?? null;
-  const at = recovery ?? probe;
-  const basis = recovery
-    ? '上游自述复位'
-    : probe
-      ? '我方下次探测'
-      : '上游没说复位时刻，我方也没排下一次探测';
+  // 只认**还在未来**的时刻。快照的 TTL 可以到几小时，写它的进程停摆期间，载荷里
+  // 那两个时刻会一个一个变成过去；照原样印出来，读者会把已经过去的 03:57 当成
+  // 「三点五十七会有数」。过去了的时刻不是排期，是「这份快照不是当刻写的」的证据。
+  const future = [recovery, probe]
+    .filter((at): at is string => at !== null && Date.parse(at) > now)
+    .sort((a, b) => Date.parse(a) - Date.parse(b));
+  const at = future[0] ?? null;
+  const basis = at === null
+    ? '快照里没有还在未来的时刻'
+    : at === recovery
+      ? '上游自述复位'
+      : '我方下次探测';
   const parts: string[] = [];
-  if (recovery) parts.push(`上游自述复位 ${when(recovery)}（它说的最早时刻，不是承诺）`);
-  if (probe) parts.push(`我方下次探测 ${when(probe)}（重试的节拍，不是上游的承诺）`);
+  if (recovery) {
+    parts.push(
+      `上游自述复位 ${when(recovery)}${Date.parse(recovery) > now ? '（它说的最早时刻，不是承诺）' : '（已经过去了：这份快照不是当刻写的，或者上游说的时刻没有兑现）'}`
+    );
+  }
+  if (probe) {
+    parts.push(
+      `我方下次探测 ${when(probe)}${Date.parse(probe) > now ? '（重试的节拍，不是上游的承诺）' : '（已经过去了：说明写快照的进程有一阵没刷新）'}`
+    );
+  }
   parts.push(
     served
       ? `池子最后一次真的拿到上游回应 ${when(served)}（探测通不算）`

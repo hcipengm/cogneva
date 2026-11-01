@@ -809,6 +809,14 @@ else:
             f"{landing_defs[0]}: cacheWriteLanding() 里写死了日期 {literal.group(0)}——"
             "复位时刻会变，写死的那个过了就成假读数，且没有东西会红"
         )
+    # 快照里的时刻必须跟**现在**比一次。快照带 TTL（最长 7 天），写它的进程停摆
+    # 以后，「下次探测 03:57」会一直停在一个已经过去的日子上；不跟现在比，它就
+    # 被印成排期，而事实是「这份快照不是当刻写的」。
+    if "now" not in text or not re.search(r"Date\.parse\(|getTime\(\)", text):
+        problems.append(
+            f"{landing_defs[0]}: cacheWriteLanding() 没有拿快照里的时刻跟现在比——"
+            "已经过去的「下次探测」会被印成还没到的排期"
+        )
 if not [rel for rel in landing_cells if "llm_pool" in read(rel)]:
     problems.append(
         "没有哪一屏把「下一次可能进账」印出来（`cacheWriteLanding` 的调用点没读 llm_pool）："

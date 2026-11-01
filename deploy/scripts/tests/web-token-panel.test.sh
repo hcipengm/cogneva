@@ -192,10 +192,15 @@ export function cacheWriteNote(rows: any[]): string {
     ? '这一半要等一次成功调用把用量带回来才有数（现网镜像还没有这一列）'
     : '上游报的缓存写入量';
 }
-export function cacheWriteLanding(pool: any): { at: string | null; basis: string; note: string } {
+export function cacheWriteLanding(
+  pool: any,
+  now: number = Date.now()
+): { at: string | null; basis: string; note: string } {
   const recovery = pool?.recovery_at ?? null;
   const probe = pool?.next_attempt_at ?? null;
-  return { at: recovery ?? probe, basis: '上游自述复位', note: '这一半要等一次成功调用' };
+  const at =
+    [recovery, probe].filter((t: string | null) => t !== null && Date.parse(t) > now)[0] ?? null;
+  return { at, basis: '上游自述复位', note: '这一半要等一次成功调用' };
 }
 EOF
   # 两级表：一张表、两级行、列宽一处定义、失败格无条件出现。
@@ -710,10 +715,19 @@ expect_red "没印下次进账" "没有哪一屏把「下一次可能进账」�
 # 38. 把「下一次可能进账」写成常量：复位时刻是上游自己说的、随时会变，写死的那个
 #     过了就成假读数，而且不会有任何东西红。
 fixture
-sed -i "s/return { at: recovery ?? probe, basis: '上游自述复位', note: '这一半要等一次成功调用' };/return { at: '2026-11-02T15:28:00Z', basis: '上游自述复位', note: '这一半要等一次成功调用' };/" \
+sed -i "s/return { at, basis: '上游自述复位'/return { at: '2026-11-02T15:28:00Z', basis: '上游自述复位'/" \
   "${work}/web/src/observability/usageRows.ts"
 confirm "${work}/web/src/observability/usageRows.ts" "2026-11-02T15:28:00Z"
 expect_red "下次进账写死日期" "写死了日期"
+
+# 39. 快照里的时刻不跟现在比：快照能活到几小时，写它的进程停摆后「下次探测」
+#     会一直停在一个过去的日子上，而屏上它还是一句排期。
+fixture
+sed -i 's/Date.parse(t) > now/true/' "${work}/web/src/observability/usageRows.ts"
+grep -qF "Date.parse(t) > now" "${work}/web/src/observability/usageRows.ts" \
+  && fail "改动没落到 usageRows.ts：时刻与现在的比较还在"
+confirm "${work}/web/src/observability/usageRows.ts" "cacheWriteLanding"
+expect_red "时刻没跟现在比" "没有拿快照里的时刻跟现在比"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
