@@ -540,6 +540,23 @@ impl GitOpsPuller {
         let expected = self.obtain_image(candidate).await?;
         let current = self.current_deployment_image().await?;
         if current == expected {
+            // 金丝雀换完镜像、还没轮到 resume 写者就死了：pause 留在部署上。这一支
+            // 若照原样记 Promoted，台账说这条候选已落地，部署却停在 pause 上——而
+            // paused 的部署不为任何新模板建 Pod，下一条主线镜像 set 上去也滚不动，
+            // 于是主线每一轮都被读成「没落地」再倒回去（2026-11-01 现场）。先把它
+            // 放下来，再问 rollout 现状：放下来之后 `rollout status` 问的才是「Pod
+            // 到底起没起来」，而不是被 pause 挡住的半句话。
+            let was_paused = self.deployment_paused().await.unwrap_or(false);
+            if was_paused {
+                let _ = self
+                    .run(
+                        &k,
+                        &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
+                        None,
+                        60,
+                    )
+                    .await;
+            }
             let status = self
                 .run(
                     &k,
@@ -558,12 +575,16 @@ impl GitOpsPuller {
                 .await;
             match status {
                 Ok(_) => {
+                    // 台账这一行要让人看出「这条是补收尾的」，不是一次完整的金丝雀：
+                    // 暂停是死掉的写者留下的，本轮把它解开了。
+                    let reason = if was_paused {
+                        "finalized after puller restart: rollout already complete; \
+                         resumed the pause the dead canary left behind"
+                    } else {
+                        "finalized after puller restart: rollout already complete"
+                    };
                     self.ledger
-                        .update_status(
-                            &rec.id,
-                            PromotionStatus::Promoted,
-                            "finalized after puller restart: rollout already complete",
-                        )
+                        .update_status(&rec.id, PromotionStatus::Promoted, reason)
                         .await?;
                 }
                 Err(e) => {
@@ -5072,5 +5093,92 @@ spec:
             .find(|r| r.id == "orphan")
             .expect("the pending row is still there");
         assert_eq!(row.status, PromotionStatus::Failed);
+    }
+
+    /// 补收尾一条**已经换过镜像**的孤儿 Pending 时，也要先把 pause 解掉。
+    ///
+    /// 源码模式那条只盖住了「标 Failed 下轮重试」；镜像仓库模式这一支记的是
+    /// Promoted——台账说这条候选已经落地，可 paused 的部署不为任何新模板建 Pod，
+    /// 部署就停在那儿：下一次主线把 `main-<rev>` set 上来同样滚不动，而写者把它读
+    /// 成「没落地」再倒回去。2026-11-01 现场就是这样顶着，候选镜像 paused、主线
+    /// 每一轮都被倒回候选。判的是「记 Promoted 之前有没有那一次 resume」。
+    #[tokio::test]
+    async fn a_finalized_canary_does_not_leave_the_deployment_paused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo_url, branch) = promotion_repo_with_a_candidate(tmp.path());
+        // 现场是三句话：部署停在 pause、模板已经是候选镜像、Pod 其实起齐了。
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in\n\
+             *spec.paused*) echo true ;;\n\
+             *containers*) echo localhost:30500/cogneva:promote-candidate-1 ;;\n\
+             esac\nexit 0\n",
+            tmp.path().join("kubectl.log").display()
+        );
+        let kubectl = crate::test_support::write_executable(tmp.path(), "fake-kubectl", &script);
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(30 * 60);
+        ledger
+            .record(PromotionRecord {
+                id: "orphan".into(),
+                change_id: "candidate-1".into(),
+                level: "l1_rollout".into(),
+                gate_kind: None,
+                decision_reason: "test".into(),
+                cluster: "cluster-a".into(),
+                status: PromotionStatus::Pending,
+                outcome: "pulled from release branch".into(),
+                eval_summary: None,
+                created_at: stale,
+                updated_at: stale,
+            })
+            .await
+            .unwrap();
+        let cfg = GitOpsConfig {
+            repo_url,
+            branch,
+            work_dir: tmp.path().join("work").to_string_lossy().to_string(),
+            kubectl_bin: kubectl.to_string_lossy().to_string(),
+            namespace: "cogneva".into(),
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            registry: Some("localhost:30500".into()),
+            ..Default::default()
+        };
+        let puller = GitOpsPuller::new(cfg, ledger.clone(), "cluster-a".into());
+
+        assert!(
+            puller.poll_once().await.unwrap(),
+            "the orphaned Pending has to be finalized in this round"
+        );
+
+        let calls = std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or_default();
+        assert!(
+            calls.contains("rollout resume deployment/cogneva"),
+            "recording Promoted while the deployment is still paused leaves every later \
+             revision unable to roll out: {calls}"
+        );
+        assert!(
+            calls.contains("rollout status deployment/cogneva"),
+            "the pause is not the same question as the pods; the rollout still has to be \
+             read after resuming: {calls}"
+        );
+        assert!(
+            !calls.contains("rollout undo"),
+            "a canary whose pods came up is not a rollback: {calls}"
+        );
+        let row = ledger
+            .recent(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == "orphan")
+            .expect("the pending row is still there");
+        assert_eq!(row.status, PromotionStatus::Promoted);
+        assert!(
+            row.outcome.contains("resumed the pause"),
+            "the row has to say the pause was cleared by this round, not that a canary \
+             completed cleanly: {}",
+            row.outcome
+        );
     }
 }
