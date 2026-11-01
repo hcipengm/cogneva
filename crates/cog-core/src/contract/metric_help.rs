@@ -963,10 +963,13 @@ const COUNTER_HELP: &[(&str, &str)] = &[
     (
         "cogneva_task_checkpoint_total",
         "Task checkpoint outcomes, by outcome: saved, unpersisted, failed, \
-         superseded, unsuperseded, no_agents. All six are published from the \
-         first scrape, zeros included, so an outcome that never happens does not \
-         read like one that was never wired up. no_agents counts tasks that were \
-         running with none of their agents present in the chain",
+         superseded, unsuperseded, empty, no_agents. All seven are published from \
+         the first scrape, zeros included, so an outcome that never happens does \
+         not read like one that was never wired up. no_agents counts tasks that \
+         were running with none of their agents present in the chain. empty counts \
+         snapshots that persisted but carried no message: those get no pointer and \
+         collect nothing, because a resume point with no conversation restores an \
+         agent that has just been built and sends it to the beginning",
     ),
     (
         "llm_request_param_clamped_total",

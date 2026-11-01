@@ -37,12 +37,14 @@ pub fn belongs_to_task(agent_id: &str, role: &str, task_id: &str) -> bool {
 
 /// 一轮产出侧动作的读数。
 ///
-/// 五个量分开记而不是折成一个成败：`saved` 是「有了续跑点」，`unpersisted` 是
+/// 几个量分开记而不是折成一个成败：`saved` 是「有了续跑点」，`unpersisted` 是
 /// 「快照拿到了但存储里没有」——那是 agent 没配存储，一份指针写下去就指向空气；
 /// `failed` 是快照调用本身失败。前者是配置病、后者是运行病，共用一个计数器就
 /// 分不出来了。`superseded` 是本轮替下去的旧续跑点，`unsuperseded` 是替不下去
 /// 的那一份——它不影响续跑（新的已经在了），只影响存储的占用，所以既不与
 /// `failed` 合并（那是「这次没续跑成」），也不与 `saved` 合并（那是「有得续」）。
+/// `empty` 是「快照成功、落盘了、但里面没有一句对话」：不写指针，也不替旧的，
+/// 理由见 [`Snapshot`]。
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CheckpointRound {
     /// 这个任务名下的 agent 数。
@@ -57,6 +59,8 @@ pub struct CheckpointRound {
     pub superseded: usize,
     /// 上一份续跑点删不掉（存储报错），它会一直留在库里。
     pub unsuperseded: usize,
+    /// 快照里一条对话都没有：不写指针，也不回收它替不下去的那一份。
+    pub empty: usize,
 }
 
 impl CheckpointRound {
@@ -71,6 +75,22 @@ impl CheckpointRound {
     }
 }
 
+/// 一张快照，以及它替别人记住了多少对话。
+///
+/// `messages` 是快照里 `context_window` 的条数。它为 0 的快照不是「一份短的进度」，
+/// 是一份**空**的进度：恢复端把它读回去，得到的是一个刚建好、还没收到任何输入的
+/// agent——与从头开始同形，只是日志会写「resumed」。实测 2026-11-01 的现网读数：
+/// 板上 16,396 条续跑指针里有 12,000 条（73%）指向 0 条消息的快照，其中 evaluator
+/// 99.9%、moderator 98.5%、generator 94% 为空，planner 只有 2/4,100。空的那些
+/// 是「agent 建好了但这一轮没轮到它」——把指针写上去，等于用一次「恢复成功」把
+/// 「什么都没恢复」这件事盖掉。
+pub struct Snapshot {
+    /// 存储里的快照 id。
+    pub checkpoint_id: String,
+    /// 快照里 `context_window` 的条数；0 表示这次恢复不带走任何对话。
+    pub messages: usize,
+}
+
 /// 产出侧需要看到的两个动作，把「谁的 agent 在跑」与「快照存下来了没有」
 /// 收成一对窄接口：真正的实现是 [`cog_core::AgentManager`] 与
 /// [`cog_core::CheckpointStore`]（见 [`LiveCheckpointAgents`]），而判断逻辑
@@ -80,8 +100,12 @@ pub trait CheckpointAgents: Send + Sync {
     /// 这个任务名下的 `(agent_id, role)`。
     async fn agents_of(&self, task_id: &str) -> SFResult<Vec<(String, String)>>;
 
-    /// 让某个 agent 对当前状态拍一张快照，返回快照 id。
-    async fn snapshot(&self, task_id: &str, agent_id: &str) -> SFResult<String>;
+    /// 让某个 agent 对当前状态拍一张快照，返回它记下了什么。
+    ///
+    /// 消息条数与快照 id 一起回来，是因为它们在实现里是同一次读取：另开一个
+    /// 「这份快照里有多少条消息」的问法，要么再打一次存储、要么把同一次 snapshot
+    /// 调用的结果丢掉重来，而产出侧每一步都是有界的、有超时的动作。
+    async fn snapshot(&self, task_id: &str, agent_id: &str) -> SFResult<Snapshot>;
 
     /// 删掉一份已经被替下去的续跑点。
     ///
@@ -122,14 +146,17 @@ impl CheckpointAgents for LiveCheckpointAgents {
             .collect())
     }
 
-    async fn snapshot(&self, task_id: &str, agent_id: &str) -> SFResult<String> {
+    async fn snapshot(&self, task_id: &str, agent_id: &str) -> SFResult<Snapshot> {
         let agent = self
             .manager
             .get_agent(agent_id)
             .await?
             .ok_or_else(|| cog_core::SFError::Agent(format!("agent not found: {agent_id}")))?;
         let checkpoint = agent.snapshot(task_id.to_string()).await?;
-        Ok(checkpoint.checkpoint_id)
+        Ok(Snapshot {
+            messages: checkpoint.context_window.len(),
+            checkpoint_id: checkpoint.checkpoint_id,
+        })
     }
 
     async fn persisted(&self, checkpoint_id: &str) -> SFResult<bool> {
@@ -208,8 +235,8 @@ pub async fn checkpoint_task_with_timeout(
 
     for (agent_id, role) in roster {
         round.agents += 1;
-        let checkpoint_id = match bounded(step_timeout, agents.snapshot(task_id, &agent_id)).await {
-            Ok(id) => id,
+        let snapshot = match bounded(step_timeout, agents.snapshot(task_id, &agent_id)).await {
+            Ok(snapshot) => snapshot,
             Err(e) => {
                 round.failed += 1;
                 tracing::warn!(
@@ -221,6 +248,20 @@ pub async fn checkpoint_task_with_timeout(
                 continue;
             }
         };
+        // 空对话不是短的进度，是没有进度。指上去会让恢复端「恢复成功」地从头开始，
+        // 而替掉旧指针会把上一轮真正攒下的那一段一起丢掉——两个方向都让「续跑」
+        // 这件事在读数上成立、在字节上不成立。
+        if snapshot.messages == 0 {
+            round.empty += 1;
+            tracing::debug!(
+                task = task_id,
+                agent = %agent_id,
+                checkpoint = %snapshot.checkpoint_id,
+                "task checkpoint carries no conversation; the previous resume point stays"
+            );
+            continue;
+        }
+        let checkpoint_id = snapshot.checkpoint_id;
         match bounded(step_timeout, agents.persisted(&checkpoint_id)).await {
             // 指针只在续跑点真的存在时写：写下一条指不到东西的路标，恢复端
             // 只会把它读成「没有续跑点」，而产出侧的读数会说是「写了」。
@@ -297,12 +338,13 @@ pub async fn checkpoint_task_with_timeout(
 /// 同形——那正是这条链失败时的形状。恢复端对同一件事就是这样办的（两个结局都
 /// 发布，见 `cog-collaboration` 的 `RESUME_OUTCOMES`），这里照同一套：词表先落地
 /// 一次，值再由每一轮去加。
-pub const CHECKPOINT_OUTCOMES: [&str; 6] = [
+pub const CHECKPOINT_OUTCOMES: [&str; 7] = [
     "saved",
     "unpersisted",
     "failed",
     "superseded",
     "unsuperseded",
+    "empty",
     "no_agents",
 ];
 
@@ -317,6 +359,9 @@ pub fn outcome_counts(round: &CheckpointRound) -> HashMap<&'static str, f64> {
         ("failed", round.failed as f64),
         ("superseded", round.superseded as f64),
         ("unsuperseded", round.unsuperseded as f64),
+        // 快照成功落盘、却一句话都没有的那一格。它与 `saved` 分开，是因为
+        // 「续跑点写了」与「续跑点里没有东西可续」在恢复端的日志里同形。
+        ("empty", round.empty as f64),
         // 一格计数而不是一个事实：它数的是「有任务在跑、链里却查不到它的 agent」
         // 的轮数，也就是这个任务的进度没有产出方的时间。已知的覆盖边界（非
         // squad 命名的执行路径）与真正的失配在这里同形，所以它只作为读数存在，
@@ -416,6 +461,8 @@ mod tests {
         roster: Vec<(String, String)>,
         /// agent_id → 快照 id；缺席表示快照调用失败。
         snapshots: HashMap<String, String>,
+        /// 快照里记着多少条对话，按 agent_id；缺席按有一条算（非空）。
+        messages: HashMap<String, usize>,
         /// 存储里真的有的快照 id。
         persisted: Vec<String>,
         /// 被删掉的快照 id，按删除顺序。
@@ -429,11 +476,15 @@ mod tests {
         async fn agents_of(&self, _task_id: &str) -> SFResult<Vec<(String, String)>> {
             Ok(self.roster.clone())
         }
-        async fn snapshot(&self, _task_id: &str, agent_id: &str) -> SFResult<String> {
-            self.snapshots
-                .get(agent_id)
-                .cloned()
-                .ok_or_else(|| cog_core::SFError::Agent(format!("snapshot failed: {agent_id}")))
+        async fn snapshot(&self, _task_id: &str, agent_id: &str) -> SFResult<Snapshot> {
+            let checkpoint_id =
+                self.snapshots.get(agent_id).cloned().ok_or_else(|| {
+                    cog_core::SFError::Agent(format!("snapshot failed: {agent_id}"))
+                })?;
+            Ok(Snapshot {
+                checkpoint_id,
+                messages: self.messages.get(agent_id).copied().unwrap_or(1),
+            })
         }
         async fn persisted(&self, checkpoint_id: &str) -> SFResult<bool> {
             Ok(self.persisted.iter().any(|id| id == checkpoint_id))
@@ -467,6 +518,7 @@ mod tests {
                 .iter()
                 .map(|(id, _)| (id.to_string(), format!("cp-{id}")))
                 .collect(),
+            messages: HashMap::new(),
             persisted: persisted.iter().map(|s| s.to_string()).collect(),
             forgotten: Mutex::new(Vec::new()),
             forget_fails: false,
@@ -633,6 +685,48 @@ mod tests {
         assert!(agents.forgotten.lock().unwrap().is_empty());
     }
 
+    /// 一句对话都没有的快照既不写指针，也不替掉旧的那一份。
+    ///
+    /// 这条读数是现网问出来的：板上 16,396 条续跑指针里 12,000 条指向 0 条消息的
+    /// 快照，恢复端把它们读回去，日志说「resumed」、计数器说「restored」，而 agent
+    /// 手上一条消息都没有——一次恢复成功，什么都没恢复。空的那些都来自「agent 建
+    /// 好了、这一轮没轮到它」：这样的 agent 每一轮都在，若照写不误，它还会把上一轮
+    /// 真正攒下的那份指针替掉并删掉。
+    #[tokio::test]
+    async fn a_snapshot_with_no_conversation_keeps_the_previous_resume_point() {
+        let (board, state) = board();
+        with_previous_pointer(&board, "t-1", "generator", "cp-old");
+        let mut agents = fake(
+            &[("squad:t-1-generator", "generator")],
+            &["cp-old", "cp-squad:t-1-generator"],
+        );
+        // 有名册、快照也成功落盘，只是里面一句话都没有。
+        agents.messages.insert("squad:t-1-generator".into(), 0);
+
+        let round = checkpoint_task("t-1", &agents, &state).await;
+
+        assert_eq!(round.empty, 1);
+        assert_eq!(
+            round.saved, 0,
+            "an empty conversation is not a resume point"
+        );
+        assert_eq!(round.superseded, 0);
+        assert!(
+            agents.forgotten.lock().unwrap().is_empty(),
+            "the checkpoint that holds real progress must not be collected for an empty one"
+        );
+        assert_eq!(
+            board
+                .fields
+                .lock()
+                .unwrap()
+                .get(&("t-1".into(), "checkpoint:generator".into()))
+                .map(String::as_str),
+            Some("cp-old"),
+            "the pointer must still name the checkpoint that carries the conversation"
+        );
+    }
+
     #[tokio::test]
     async fn a_checkpoint_that_cannot_delete_is_counted_apart() {
         let (board, state) = board();
@@ -695,6 +789,7 @@ mod tests {
             "failed",
             "superseded",
             "unsuperseded",
+            "empty",
         ] {
             assert_eq!(counts.get(outcome), Some(&0.0), "{outcome}");
         }
@@ -758,7 +853,7 @@ mod tests {
             async fn agents_of(&self, _task_id: &str) -> SFResult<Vec<(String, String)>> {
                 Ok(self.roster.clone())
             }
-            async fn snapshot(&self, _task_id: &str, _agent_id: &str) -> SFResult<String> {
+            async fn snapshot(&self, _task_id: &str, _agent_id: &str) -> SFResult<Snapshot> {
                 std::future::pending().await
             }
             async fn persisted(&self, _checkpoint_id: &str) -> SFResult<bool> {
