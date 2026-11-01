@@ -294,6 +294,38 @@ pub fn measured_window_with_boundary(
     }
 }
 
+/// 一窗被上游当面收走之后，还要多久才可能再放行一件整任务。
+///
+/// 坡度在这个形状里不作数：它算的是"照已花的量，此刻本可以再花多少"，而上游刚
+/// 说过这一窗没有那个量。能答的只有窗口边界——新的一窗从零起，攒够一件整任务的
+/// 预留还要 `reserve / rate` 秒。起点还在未来时（复位时刻已经指名、这一窗还没
+/// 开始）边界就是那个起点本身，再加一整窗会把复位推到下一个周期去。
+///
+/// 不这么答的代价不是一句保守的等待：按坡度答，`wait_secs` 会算出"此刻已经攒够"
+/// 的一秒，调用方据此立刻重试，围成一个一秒一次的拒绝环。
+pub fn wait_until_reopened(pace: &LlmWindowPace, rate_per_sec: f64, now_unix: i64) -> Option<u64> {
+    if !pace.blocked() {
+        return None;
+    }
+    let window_secs = pace.window_secs as i64;
+    let start = pace.window_start_unix;
+    if window_secs <= 0 || start <= 0 {
+        // 没有窗长、也没有起点：没有边界可指，沿用坡度那一边的答复。
+        return wait_secs(pace, rate_per_sec, now_unix);
+    }
+    let boundary = if start >= now_unix {
+        start
+    } else {
+        start + window_secs
+    };
+    let accrue = if rate_per_sec > 0.0 {
+        pace.reserve_tokens as f64 / rate_per_sec
+    } else {
+        0.0
+    };
+    Some((boundary as f64 + accrue - now_unix as f64).ceil().max(1.0) as u64)
+}
+
 /// Seconds until the allowance covers one more whole job, or `None` when the
 /// pace is not what is holding work back.
 ///
@@ -389,10 +421,42 @@ pub struct PoolPace {
 impl PoolPace {
     /// Add one member's measurement and what it has spent in its window.
     pub fn add(&mut self, measured: &MeasuredWindow, spent_tokens: u64, now_unix: i64) {
+        self.add_with_allowance(
+            measured,
+            spent_tokens,
+            now_unix,
+            measured.allowance_at(now_unix),
+        );
+    }
+
+    /// Add one member the upstream has just refused for its quota.
+    ///
+    /// The measurement still says what the ramp *would* pay out, but the
+    /// upstream has said in so many words that this window's allowance is gone:
+    /// the refusal is the newer observation, so the member enters the sum with
+    /// what it spent and **no** allowance.
+    ///
+    /// Crediting the ramp here is what makes a spent window read as an open
+    /// one. The difference is not cosmetic: the pool's headroom
+    /// (`allowance - spent - reserve`) is the operand every reader uses to
+    /// separate "the budget closed admission" from "the channel did, and the
+    /// budget is fine". Measured 2026-11-01: a member refused with
+    /// `quota_cycle` while its stored ramp still published 753k tokens of
+    /// allowance against 52k spent, so the subtraction came out positive and
+    /// named the one repair that could not work.
+    pub fn add_exhausted(&mut self, measured: &MeasuredWindow, spent_tokens: u64, now_unix: i64) {
+        self.add_with_allowance(measured, spent_tokens, now_unix, 0);
+    }
+
+    fn add_with_allowance(
+        &mut self,
+        measured: &MeasuredWindow,
+        spent_tokens: u64,
+        now_unix: i64,
+        allowance_tokens: u64,
+    ) {
         self.measured_upstreams += 1;
-        self.allowance_tokens = self
-            .allowance_tokens
-            .saturating_add(measured.allowance_at(now_unix));
+        self.allowance_tokens = self.allowance_tokens.saturating_add(allowance_tokens);
         self.spent_tokens = self.spent_tokens.saturating_add(spent_tokens);
         let here = (measured.window_secs, measured.window_start_at(now_unix));
         match self.shared_window {
@@ -540,6 +604,40 @@ mod tests {
         // 窗还没翻，起点就是上一次烧穿的时刻——两家看到的是同一个起点。
         assert_eq!(report.window_start_unix, 1_000_000);
         assert_eq!(report.reserve_tokens, 500, "整活成本是全池共用的一个量");
+    }
+
+    /// 上游当面拒了这一窗的额度之后，这一家进和时不该再带坡度给的允许量。
+    ///
+    /// 坡度是撞墙**之前**量到的，撞墙是更晚的那次观测；两者对着同一窗说得相反
+    /// 时，后说的那个算数。2026-11-01 的现网形状：`allowance` 753k 对 `spent`
+    /// 52k，余量为正，于是每一处读余量的地方都说"不是预算拦的"——而这一家刚刚
+    /// 用 `quota_cycle` 说了这一窗没了。
+    #[test]
+    fn a_member_refused_for_quota_enters_the_sum_without_its_ramp() {
+        let now = 1_000_000 + 10 * DAY;
+        let ramp = MeasuredWindow {
+            capacity_tokens: 4_006_951,
+            window_secs: (5 * 3_600) as u64,
+            burned_at_unix: 1_000_000 + 10 * DAY - 3_600,
+        };
+        let mut open = PoolPace::default();
+        open.add(&ramp, 52_235, now);
+        let open = open.finish(358_030, 533);
+        assert!(
+            open.allowance_tokens > open.spent_tokens + open.reserve_tokens,
+            "没撞墙时坡度确实还装得下一件整任务，这一格是下面那条的对照"
+        );
+
+        let mut refused = PoolPace::default();
+        refused.add_exhausted(&ramp, 52_235, now);
+        let refused = refused.finish(358_030, 533);
+        assert_eq!(refused.measured_upstreams, 1, "撞墙不等于没有尺子");
+        assert_eq!(refused.spent_tokens, 52_235, "花掉多少照实报");
+        assert_eq!(refused.allowance_tokens, 0, "这一窗的额度已经被收走");
+        assert!(
+            refused.allowance_tokens < refused.spent_tokens + refused.reserve_tokens,
+            "余量为负正是「预算关的门」，读余量的判据据此才分得开两种停摆"
+        );
     }
 
     /// 窗不一样长时，报表带额度、不带窗：起点与窗长分属两家，拼起来是第三条窗。
@@ -1073,6 +1171,41 @@ mod tests {
         assert!(
             (wait as i64 - DAY).abs() <= 5,
             "one day of ramp, not the twenty left in the window: waited {wait}s"
+        );
+    }
+
+    /// 一窗被收走之后，答复落在窗口边界上，不落在坡度算出来的那一秒。
+    ///
+    /// 2026-11-01 的现网形状：5 小时窗从 03:27:59 起，容量 4,006,951，花了 52,235，
+    /// 上游每一次都答"这一窗的额度用完了"。允许量按零发布之后，坡度那一侧仍然算得
+    /// 出"此刻早就攒够了这件任务"——答复是一秒，调用方一秒一次地重试。边界才对。
+    #[test]
+    fn a_refused_window_answers_with_its_boundary_not_with_a_spent_ramp() {
+        let start = 1_000_000;
+        let window_secs = 5 * 3_600;
+        let now = start + 3_600;
+        let pace = LlmWindowPace {
+            measured_upstreams: 1,
+            allowance_tokens: 0,
+            spent_tokens: 52_235,
+            reserve_tokens: 358_030,
+            reserve_population: 533,
+            window_secs,
+            window_start_unix: start,
+        };
+        let rate = allowance_rate(4_006_951, window_secs);
+        assert!(pace.blocked());
+        assert_eq!(
+            wait_secs(&pace, rate, now),
+            Some(1),
+            "坡度把已经收走的额度当成还能攒出来，这一格是下面那条的对照"
+        );
+        let wait = wait_until_reopened(&pace, rate, now).expect("blocked, so it names a wait");
+        let boundary = start + window_secs as i64;
+        let expected = (boundary - now) as f64 + 358_030.0 / rate;
+        assert!(
+            (wait as f64 - expected).abs() <= 60.0,
+            "答复是边界加新一窗攒够预留的那一段，实际等了 {wait}s，应约 {expected}s"
         );
     }
 

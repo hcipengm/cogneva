@@ -1867,6 +1867,46 @@ impl DurableGauges {
     }
 }
 
+/// 一家上游这一拍的尺子、它的坡度，以及这一窗还开不开着。
+///
+/// 三样绑在一条记录里，因为答复"还要等多久"要用到的是它们的**合取**：
+/// `wait_secs` 只看得到 `LlmWindowPace` 里那几个数，而"上游已经当面收走了这一窗"
+/// 在那几个数里读不出来——允许量按零发布之后，坡度仍然算得出"此刻已经攒够一件
+/// 整任务"，照它答复就是一个一秒一次的拒绝环。这一位随身带着，答复才落得到边界上。
+#[derive(Clone, Copy, Debug)]
+struct UpstreamPace {
+    pace: cog_core::LlmWindowPace,
+    /// 额度摊到每秒：`capacity / window_secs`，答复等待时间与下一窗的相位都要它。
+    rate_per_sec: f64,
+    /// 最后一次成功之后，上游又用 `quota_cycle` 拒过这一窗。
+    exhausted: bool,
+}
+
+impl UpstreamPace {
+    /// 测试里的那条记录：这一窗还开着。
+    #[cfg(test)]
+    fn measured(pace: cog_core::LlmWindowPace, rate_per_sec: f64) -> Self {
+        Self {
+            pace,
+            rate_per_sec,
+            exhausted: false,
+        }
+    }
+
+    /// 这一家还要等多少秒才可能放行一件整任务。
+    ///
+    /// 没有尺子就不在这张表里，所以这里总有一个答复；退到 60 秒是"答不上来"的
+    /// 那一格，宁可让调用方慢一拍，也不给它一个零。
+    fn wait_secs(&self, now_unix: i64) -> u64 {
+        let wait = if self.exhausted {
+            crate::window_pace::wait_until_reopened(&self.pace, self.rate_per_sec, now_unix)
+        } else {
+            crate::window_pace::wait_secs(&self.pace, self.rate_per_sec, now_unix)
+        };
+        wait.unwrap_or(60)
+    }
+}
+
 /// 一拍配速判定的全部读数，池级与逐上游**同一次写入**。
 ///
 /// 两个集合故意不相等，这是这份结构存在的理由：
@@ -1883,7 +1923,7 @@ impl DurableGauges {
 struct WindowPaceReading {
     pool: cog_core::LlmWindowPace,
     /// 逐上游一条，键与健康表同形（`base_url|model`）。
-    by_upstream: std::collections::HashMap<String, (cog_core::LlmWindowPace, f64)>,
+    by_upstream: std::collections::HashMap<String, UpstreamPace>,
     /// 每一个配置过的上游这一拍进没进池和，按 `readings` 的顺序、与它一一对应。
     ///
     /// 与 `by_upstream` 不是同一件事：那张表只留量到窗口的成员，缺席即「不配速
@@ -2524,21 +2564,21 @@ fn pace_evidence(
     let mut blocked = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let key = LlmHealthTable::key(candidate);
-        let Some((pace, rate)) = reading.by_upstream.get(&key) else {
+        let Some(entry) = reading.by_upstream.get(&key) else {
             // 没量到窗口的一家在候选集里，就是"有一家能承接"。没量过不等于
             // 没有额度，这里按没量过处理，不替它编一个界。
             return None;
         };
-        if !pace.blocked() {
+        if !entry.pace.blocked() {
             return None;
         }
         blocked.push(PaceUpstreamEvidence {
             upstream: key,
-            allowance_tokens: pace.allowance_tokens,
-            spent_tokens: pace.spent_tokens,
-            reserve_tokens: pace.reserve_tokens,
-            window_start_unix: pace.window_start_unix,
-            wait_secs: crate::window_pace::wait_secs(pace, *rate, now_unix).unwrap_or(60),
+            allowance_tokens: entry.pace.allowance_tokens,
+            spent_tokens: entry.pace.spent_tokens,
+            reserve_tokens: entry.pace.reserve_tokens,
+            window_start_unix: entry.pace.window_start_unix,
+            wait_secs: entry.wait_secs(now_unix),
         });
     }
     if blocked.is_empty() {
@@ -4484,27 +4524,40 @@ const WINDOW_PACE_RESERVE_QUANTILE: f64 = 0.75;
 /// 来源是逐家的实测，不是池级聚合数除一除"只有在这里才说得清。
 fn pace_for_upstream(
     measured: Option<&crate::window_pace::MeasuredWindow>,
+    exhausted: bool,
     spent: u64,
     reserve: u64,
     reserve_population: u64,
     now_unix: i64,
-) -> Option<(cog_core::LlmWindowPace, f64)> {
+) -> Option<UpstreamPace> {
     let measured = measured?;
     if !measured.is_usable() {
         return None;
     }
-    Some((
-        cog_core::LlmWindowPace {
+    // 上行已经当面拒了这一窗的额度，允许量就是零：这一格是请求路判"这家还能不能
+    // 接一件整任务"的那一边，把坡度继续算给它，等于让一家刚说过没额度的上游
+    // 在本地仍然显得装得下。
+    let allowance = if exhausted {
+        0
+    } else {
+        measured.allowance_at(now_unix)
+    };
+    Some(UpstreamPace {
+        pace: cog_core::LlmWindowPace {
             measured_upstreams: 1,
-            allowance_tokens: measured.allowance_at(now_unix),
+            allowance_tokens: allowance,
             spent_tokens: spent,
             reserve_tokens: reserve,
             reserve_population,
             window_secs: measured.window_secs,
             window_start_unix: measured.window_start_at(now_unix),
         },
-        crate::window_pace::allowance_rate(measured.capacity_tokens, measured.window_secs),
-    ))
+        rate_per_sec: crate::window_pace::allowance_rate(
+            measured.capacity_tokens,
+            measured.window_secs,
+        ),
+        exhausted,
+    })
 }
 
 /// 把这一拍的配速摊到观测面上。
@@ -4714,7 +4767,7 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
             ));
             continue;
         };
-        let Some(measured) = measure_window(
+        let Some((measured, exhausted)) = measure_window(
             state,
             store.as_ref(),
             &reading.key,
@@ -4747,11 +4800,16 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
             }
         };
         rulers.push((reading.key.clone(), crate::window_pace::Ruler::Measured));
-        pace.add(&measured, spent, now_unix);
+        if exhausted {
+            pace.add_exhausted(&measured, spent, now_unix);
+        } else {
+            pace.add(&measured, spent, now_unix);
+        }
         // 这一家自己的那份判定。整任务成本是全池共用的一个量（它是"一件任务
         // 要花多少"，与谁承接无关），额度、用量与窗口则逐家分开。
         if let Some(entry) = pace_for_upstream(
             Some(&measured),
+            exhausted,
             spent,
             reserve,
             reserve_population,
@@ -4767,6 +4825,32 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
         reserve_since_unix,
     }
 }
+
+/// Whether the upstream's newest observation of this window is a quota refusal.
+///
+/// The two instants come from the same ledger: the newest success and the
+/// newest wall. A wall older than the newest success is a window that came
+/// back, and the ramp measures that window again; a wall newer than it is the
+/// window being closed in front of us.
+fn refused_more_recently_than_served(
+    last_ok_unix: Option<i64>,
+    last_wall_unix: Option<i64>,
+) -> bool {
+    match (last_wall_unix, last_ok_unix) {
+        (Some(wall), Some(ok)) => wall > ok,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// The measured window, plus whether the upstream has refused it for its quota
+/// more recently than it last served.
+///
+/// The second field is what tells the pool to credit this member no allowance
+/// this beat. A stored ramp describes what the window *would* pay out, and it
+/// keeps doing so after the window is spent: the wall is the newer evidence,
+/// and the two disagree exactly when admission must stop.
+type MeasuredWindowReading = (crate::window_pace::MeasuredWindow, bool);
 
 /// 一个上游的容量读数：先看本进程暂存的那一份，没有就读库里存的那一份，再没有
 /// 就只看这次能不能观测到一个窗口。
@@ -4798,7 +4882,7 @@ async fn measure_window(
     window_secs: u64,
     quota_reset_unix: Option<i64>,
     refusal_kind: Option<RefusalKind>,
-) -> Option<crate::window_pace::MeasuredWindow> {
+) -> Option<MeasuredWindowReading> {
     let now_unix = chrono::Utc::now().timestamp();
     // 缓存与库都以「上游 + 窗口长度」为身份：同一家可以同时有两把嵌套的尺子
     // （5 小时与 7 天），只用上游当键会让后测到的那把覆盖先测到的那把。
@@ -4845,9 +4929,14 @@ async fn measure_window(
                 error = %e,
                 "窗口配速：读不出这一家的窗口，沿用上一次量到的容量"
             );
-            return latched;
+            return latched.map(|measured| (measured, false));
         }
     };
+    // 撞墙比最后一次成功更晚，就是上游当着我们的面把这一窗的额度收走了。存着的
+    // 坡度仍在说一份允许量，但那是撞墙**之前**的观测：按它放行，等于对着一个
+    // 已经关上的窗继续发请求，而观测面上的余量还会是正的。
+    let exhausted =
+        refused_more_recently_than_served(reading.last_ok_unix, reading.last_quota_refusal_unix);
     let evidence = crate::window_pace::WindowEvidence {
         last_quota_refusal_unix: reading.last_quota_refusal_unix,
         quota_cycle_observed: refusal_kind == Some(RefusalKind::QuotaCycle),
@@ -4859,7 +4948,7 @@ async fn measure_window(
         now_unix,
     };
     let Some((end, _)) = crate::window_pace::window_boundary(evidence) else {
-        return latched;
+        return latched.map(|measured| (measured, exhausted));
     };
     // 有已定性的撞墙行时用它围出来的和（同一处证据、少一次查询）；没有时按恢复
     // 时刻把这一窗围起来求和。上界钉在恢复时刻，所以复位之后再算还是同一个数，
@@ -4876,7 +4965,7 @@ async fn measure_window(
                         error = %e,
                         "窗口配速：算不出这一窗烧了多少，沿用上一次量到的容量"
                     );
-                    return latched;
+                    return latched.map(|measured| (measured, exhausted));
                 }
             }
         }
@@ -4886,7 +4975,7 @@ async fn measure_window(
     // 沿用的上一次测量带着它自己那次的出处：这一拍没观测到边界，就不能把旧行的
     // 出处改写成「这一拍看到的」。
     let Some(boundary) = boundary else {
-        return Some(measured);
+        return Some((measured, exhausted));
     };
     if Some(measured) != latched {
         state
@@ -4914,7 +5003,7 @@ async fn measure_window(
             );
         }
     }
-    Some(measured)
+    Some((measured, exhausted))
 }
 
 /// 池状态节拍：刷新指标 → 续期跨进程信号 → 边沿处告警与日志。
@@ -12888,7 +12977,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let key = LlmHealthTable::key(&state.config.llm_upstreams[0]);
         state.window_pace.lock().unwrap().by_upstream.insert(
             key,
-            (
+            UpstreamPace::measured(
                 cog_core::LlmWindowPace {
                     measured_upstreams: 1,
                     allowance_tokens: 100,
@@ -12945,7 +13034,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let burned = LlmHealthTable::key(&state.config.llm_upstreams[0]);
         state.window_pace.lock().unwrap().by_upstream.insert(
             burned,
-            (
+            UpstreamPace::measured(
                 cog_core::LlmWindowPace {
                     measured_upstreams: 1,
                     allowance_tokens: 0,
@@ -12991,7 +13080,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             // 缺口 100k、速率 1,000/s ⇒ 约 99s 后攒够。
             guard.by_upstream.insert(
                 LlmHealthTable::key(&state.config.llm_upstreams[0]),
-                (
+                UpstreamPace::measured(
                     cog_core::LlmWindowPace {
                         measured_upstreams: 1,
                         allowance_tokens: 0,
@@ -13007,7 +13096,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             // 缺口 10k、速率 10/s ⇒ 约 999s 后攒够：缺口小、等得长。
             guard.by_upstream.insert(
                 LlmHealthTable::key(&state.config.llm_upstreams[1]),
-                (
+                UpstreamPace::measured(
                     cog_core::LlmWindowPace {
                         measured_upstreams: 1,
                         allowance_tokens: 0,
@@ -13071,7 +13160,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         ] {
             reading.by_upstream.insert(
                 LlmHealthTable::key(&upstream),
-                (
+                UpstreamPace::measured(
                     cog_core::LlmWindowPace {
                         measured_upstreams: 1,
                         allowance_tokens: 0,
@@ -13113,9 +13202,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         // 一家自己的窗口还装得下 ⇒ 同样不拒。
         let mut roomy = reading;
         let key = LlmHealthTable::key(&upstreams[1]);
-        let (mut pace, rate) = roomy.by_upstream[&key];
-        pace.allowance_tokens = 1_000_000;
-        roomy.by_upstream.insert(key, (pace, rate));
+        let mut entry = roomy.by_upstream[&key];
+        entry.pace.allowance_tokens = 1_000_000;
+        roomy.by_upstream.insert(key, entry);
         assert!(pace_evidence(&roomy, &candidates, now).is_none());
     }
 
@@ -13124,7 +13213,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     #[test]
     fn the_per_upstream_map_holds_only_measured_windows() {
         assert!(
-            pace_for_upstream(None, 0, 100, 5, 1_000_000).is_none(),
+            pace_for_upstream(None, false, 0, 100, 5, 1_000_000).is_none(),
             "no measured window means no ruler, not a zero allowance"
         );
         let measured = crate::window_pace::MeasuredWindow {
@@ -13132,15 +13221,60 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             window_secs: 1_000,
             burned_at_unix: 1_000_000,
         };
-        let (pace, rate) = pace_for_upstream(Some(&measured), 250, 100, 5, 1_000_400)
+        let entry = pace_for_upstream(Some(&measured), false, 250, 100, 5, 1_000_400)
             .expect("a measured window is a ruler");
-        assert_eq!(pace.measured_upstreams, 1);
-        assert_eq!(pace.allowance_tokens, 400_000);
-        assert_eq!(pace.spent_tokens, 250);
-        assert_eq!(pace.reserve_tokens, 100);
-        assert_eq!(pace.reserve_population, 5);
-        assert_eq!(pace.window_start_unix, 1_000_000);
-        assert_eq!(rate, 1_000.0);
+        assert_eq!(entry.pace.measured_upstreams, 1);
+        assert_eq!(entry.pace.allowance_tokens, 400_000);
+        assert_eq!(entry.pace.spent_tokens, 250);
+        assert_eq!(entry.pace.reserve_tokens, 100);
+        assert_eq!(entry.pace.reserve_population, 5);
+        assert_eq!(entry.pace.window_start_unix, 1_000_000);
+        assert_eq!(entry.rate_per_sec, 1_000.0);
+        assert!(!entry.exhausted);
+    }
+
+    /// 同一把尺子，但这一家刚撞过墙：允许量归零，其余照实报。
+    ///
+    /// 需求量不能跟着归零——它答的是"这一家在这个窗里花掉多少"，不是"还剩多少"；
+    /// 两条都在的话，`allowance - spent - reserve` 才读得出负值，读余量的判据才
+    /// 分得开"预算关的门"与"通道关的门"。
+    #[test]
+    fn a_refused_upstream_is_paced_with_no_allowance() {
+        let measured = crate::window_pace::MeasuredWindow {
+            capacity_tokens: 1_000_000,
+            window_secs: 1_000,
+            burned_at_unix: 1_000_000,
+        };
+        let entry = pace_for_upstream(Some(&measured), true, 900_000, 100, 5, 1_000_400)
+            .expect("a refused upstream still has a ruler");
+        assert_eq!(entry.pace.allowance_tokens, 0, "这一窗的额度已被收走");
+        assert_eq!(entry.pace.spent_tokens, 900_000, "花掉多少照实报");
+        assert_eq!(entry.pace.measured_upstreams, 1, "撞墙不等于没有尺子");
+        assert_eq!(entry.rate_per_sec, 1_000.0, "坡度仍在，供下一窗的相位用");
+        assert!(entry.exhausted, "这一位要随身带到答复等待时间的那一处");
+    }
+
+    /// 撞墙与最后一次成功的先后，就是"这一窗还开着吗"。
+    #[test]
+    fn a_wall_after_the_last_success_outranks_the_ramp() {
+        assert!(
+            refused_more_recently_than_served(Some(100), Some(200)),
+            "撞墙更晚"
+        );
+        assert!(
+            !refused_more_recently_than_served(Some(300), Some(200)),
+            "之后的成功说明这一窗回来了"
+        );
+        assert!(
+            !refused_more_recently_than_served(Some(200), Some(200)),
+            "同一秒：先按回来算，误放行比误拒便宜"
+        );
+        assert!(refused_more_recently_than_served(None, Some(200)), "只有墙");
+        assert!(
+            !refused_more_recently_than_served(Some(100), None),
+            "没有墙"
+        );
+        assert!(!refused_more_recently_than_served(None, None), "两样都没有");
     }
 
     /// 重启不是新的一页：上一任进程判定的"池不可用"不能被新进程的第一拍探测推翻。
