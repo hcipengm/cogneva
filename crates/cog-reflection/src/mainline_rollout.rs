@@ -215,7 +215,7 @@ const DAEMONSET_SETTLE_JSONPATH: &str = "jsonpath={.metadata.generation}|{.statu
 /// 的位置。顺序就是 [`rollout_converged`] 那一族按下标读的顺序——查询串在读取端
 /// 之外，两边分开写，所以挪字段不会报错，只会在谁也看不见的地方换掉判据读的是
 /// 哪一格；把顺序钉住的是 `the_line_readings_walk_their_fields_in_the_order_their_readers_do`。
-pub(crate) const ROLLOUT_STATUS_JSONPATH: &str = "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.updatedReplicas}|{.status.readyReplicas}|{.status.unavailableReplicas}";
+pub(crate) const ROLLOUT_STATUS_JSONPATH: &str = "jsonpath={.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.updatedReplicas}|{.status.readyReplicas}|{.status.unavailableReplicas}|{.spec.paused}";
 
 /// 这个工作负载该用哪份读法。词表只有一处：资源词进 [`workload_kind_of_resource`]
 /// 换出清单 kind，再由清单 kind 选读法，不在这里手写第二张对照表。
@@ -237,6 +237,17 @@ const SUPPORT_CAUSE_CONTAINER_LIMIT: usize = 4;
 /// 滚动内部轮询间隔：探测、致命态复查、部署态查询共用同一节拍。
 // cap: bound — 探测、致命态复查、部署态查询共用同一节拍
 const ROLLOUT_POLL_SECS: u64 = 5;
+
+/// 一份别人留下的暂停在多久之后算残渣。
+///
+/// 这个平台上暂停只有一个来源：金丝雀。它把部署暂停的时长不会超过自己的看护窗口
+/// 加收尾余量——看护默认 600s，拉取端判「这条 Pending 已经没人管」用的是同一个
+/// 「看护 + 300s」的界。超过它仍在暂停，置这个标志的进程已经不在了（被自家滚动
+/// 杀掉、Job 被驱逐），这一轮可以清掉它。反过来，在这个界之内一律先等：那可能
+/// 是一次正在进行的看护，替它 resume 会让候选在没看完的情况下被放出去。
+// cap: bound — 与拉取端「看护窗口 + 收尾余量」同一个界，两边不能各拍一个数
+pub(crate) const CANARY_PAUSE_MAX_HOLD_SECS: u64 =
+    crate::config::DEFAULT_CANARY_WATCH_SECS + crate::config::CANARY_PAUSE_GRACE_SECS;
 
 /// 超时诊断里保留的事件条数。错误记录不是日志转储：只要够指出病因。
 // cap: bound — 错误记录不是日志转储，够指出病因就行
@@ -1211,6 +1222,16 @@ fn updated_pod_count(out: &str) -> u32 {
         .nth(3)
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0)
+}
+
+/// 这份读数里 Deployment 是不是被 `paused` 停着（第 7 段）。
+///
+/// 它单独占一段，是因为它决定的不是"滚完了没有"，而是"还会不会再动一次"：暂停中的
+/// Deployment 对新的模板**一个 Pod 都不建**，`updatedReplicas` 永远停在 0。读不出
+/// （老 fake、查询里没带这一格）按"没暂停"处理——这一格只用来做一件额外的动作，
+/// 拿不准时不做那个动作，等预算到期的那条判词仍然成立。
+fn deployment_paused(out: &str) -> bool {
+    out.split('|').nth(6).map(str::trim) == Some("true")
 }
 
 /// Pod 双标签选择器：主应用/网关/执行器的 name 标签都是 `cogneva`，
@@ -2704,6 +2725,9 @@ pub struct RolloutExecutor {
     restart_threshold: u32,
     rollout_timeout_secs: u64,
     startup_timeout_secs: u64,
+    /// 一份别人留下的暂停最多等多久才当残渣清掉，见 [`CANARY_PAUSE_MAX_HOLD_SECS`]。
+    /// 用例把它压到 0，让「等多久」这件决定本身可考，而不必真等一刻钟。
+    pause_hold: Duration,
     /// 动手之前要复问的上游 CI。`None` = 这一趟没有上游清单（派发侧没配上游
     /// 或它是旧版二进制），此时不提问、也不假装问过。
     ci_ask: Option<UpstreamCiAsk>,
@@ -2772,6 +2796,7 @@ impl RolloutExecutor {
             restart_threshold,
             rollout_timeout_secs,
             startup_timeout_secs,
+            pause_hold: Duration::from_secs(CANARY_PAUSE_MAX_HOLD_SECS),
             ci_ask: None,
             // 用例里不读跑用例这台机器的负载：同一条判据在一台空闲的机器上与一台
             // 正在编译的机器上会给出两种类别，而这份用例要锁的是判据本身。要用一个
@@ -2794,6 +2819,13 @@ impl RolloutExecutor {
     #[cfg(test)]
     pub(crate) fn with_host_run_queue(mut self, read: fn() -> Option<HostRunQueue>) -> Self {
         self.host_run_queue = read;
+        self
+    }
+
+    /// 缩短「一份暂停等多久才当残渣」。只给用例用：真的等一刻钟。
+    #[cfg(test)]
+    pub(crate) fn with_pause_hold(mut self, hold: std::time::Duration) -> Self {
+        self.pause_hold = hold;
         self
     }
 
@@ -3857,7 +3889,7 @@ impl RolloutExecutor {
     /// 改动这个部署的放置面时，超时说的是**集群放不下**，不是版本不好（见
     /// PLACEMENT_BLOCKED_MARKER）。`prev_shape` 是 apply 之前快照的放置面。
     async fn wait_rollout_complete(&self, t: &RolloutTarget, prev_shape: &str) -> SFResult<()> {
-        let startup_deadline =
+        let mut startup_deadline =
             std::time::Instant::now() + Duration::from_secs(self.startup_timeout_secs);
         // 延迟到首次进入就绪阶段才起算：启动阶段的耗时不算在内。
         let mut readiness_deadline: Option<std::time::Instant> = None;
@@ -3879,6 +3911,14 @@ impl RolloutExecutor {
         // 现场（Pod 等待原因、RS 拒绝条件）全是**旧版本**的，下面那几条环境判据
         // 一条都够不着——预算到期只会走到最后的通用分支，被记成"这一版坏了"。
         let mut new_pod_seen = false;
+        // 这一轮从集群上清掉过几次别人留下的 `paused`。它只能清一次：第一次见到是
+        // 上一轮被打断留下的现场，第二次还见到就说明有活的写者在反复停它，这时候
+        // 再 resume 就是和它抢，滚动永远不会收敛。
+        let mut pause_resumes = 0u32;
+        // 这份暂停是从哪一刻起一直没清掉，以及这件事只警告一次：等待期间每 5 秒
+        // 一条同样的 warn 会把整段时间洗掉。
+        let mut paused_since: Option<std::time::Instant> = None;
+        let mut pause_logged = false;
         // 整段预算里宿主排队排了多久、最挤的一刻有多挤。只在预算到期判死时用它
         // 回答一个问题：这段时间到底是这一版没起来，还是这台机器没给它时间。
         // 正常路径上它只是每轮一次 `/proc` 读，不进日志。
@@ -3904,6 +3944,81 @@ impl RolloutExecutor {
             {
                 Ok(out) => {
                     observed_ever = true;
+                    // 一个置着 `paused` 的 Deployment 对刚 apply 上去的模板**一个 Pod 都
+                    // 不建**：控制器不去碰新那一代，`updatedReplicas` 永远停在 0。整段预算
+                    // 看到的都是旧版本的账，到期只会落到「新版本一个 Pod 都没建成」那一档
+                    // ——那条判词说的是"还没轮到"，而真正的原因是"永远不会轮到"，而且它
+                    // 判成环境类会重试，重试多少次都不会动。
+                    //
+                    // 暂停在这个平台上只有一个来源：金丝雀。它暂停是为了先看一个新副本，
+                    // 在自己的生命周期里会 resume/undo 掉——所以先等它：暂停期间没有任何
+                    // Pod 在起，两段预算都该往后挪，而不是拿别人的看护窗口充自己的超时。
+                    // 等过一个金丝雀**最多**能停的时长还没清掉，置它的进程已经不在了
+                    // （被自家滚动杀掉、Job 被驱逐），这时才 resume 一次并重新起算预算
+                    // ——新 Pod 的时钟从 resume 才开始走。
+                    if deployment_paused(&out) {
+                        let now = std::time::Instant::now();
+                        let since = *paused_since.get_or_insert(now);
+                        if now.duration_since(since) >= self.pause_hold {
+                            if pause_resumes > 0 {
+                                return Err(SFError::IO(format!(
+                                    "{NEW_REVISION_NEVER_RAN_MARKER}: rollout of deployment/{} \
+                                     is paused again right after this rollout resumed it, so the \
+                                     pause is not leftover state from a writer that is gone — \
+                                     someone else is holding it paused, and no pod of the new \
+                                     revision can be created until they let go (last: {out})",
+                                    t.deployment
+                                )));
+                            }
+                            warn!(
+                                deployment = %t.deployment,
+                                held_secs = now.duration_since(since).as_secs(),
+                                "the deployment has stayed paused longer than any live canary \
+                                 could hold it, so the pause is leftover state from a writer \
+                                 that is gone; resuming it and restarting the wait budget"
+                            );
+                            self.run_kubectl(
+                                &["rollout", "resume", &format!("deployment/{}", t.deployment)],
+                                30,
+                            )
+                            .await
+                            .map_err(|e| {
+                                SFError::IO(format!(
+                                    "{NEW_REVISION_NEVER_RAN_MARKER}: rollout of deployment/{} \
+                                     is paused and the pause could not be cleared ({e}), so no \
+                                     pod of the new revision can be created until someone \
+                                     resumes it",
+                                    t.deployment
+                                ))
+                            })?;
+                            pause_resumes += 1;
+                            paused_since = None;
+                            pause_logged = false;
+                            let resumed_at = std::time::Instant::now();
+                            startup_deadline =
+                                resumed_at + Duration::from_secs(self.startup_timeout_secs);
+                            readiness_deadline = None;
+                            seen_init_running = false;
+                        } else {
+                            if !pause_logged {
+                                pause_logged = true;
+                                warn!(
+                                    deployment = %t.deployment,
+                                    "the deployment is paused by another writer (a canary); \
+                                     waiting for it to let go instead of charging this wait's \
+                                     budget against it"
+                                );
+                            }
+                            // 暂停里不会有人起 Pod：预算从此刻重新起算，等价于这段时间
+                            // 不计入等待。
+                            startup_deadline = now + Duration::from_secs(self.startup_timeout_secs);
+                            readiness_deadline = None;
+                            seen_init_running = false;
+                        }
+                    } else {
+                        paused_since = None;
+                        pause_logged = false;
+                    }
                     // 只认控制器处理过当前这一代模板的读数：apply 之后的第一眼
                     // 往往早于控制器，那一段 `updatedReplicas` 仍是上一代的账
                     // （上一轮滚完时它恒等于副本数），拿它置位会让这条"新版本

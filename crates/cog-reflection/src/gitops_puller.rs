@@ -416,7 +416,7 @@ impl GitOpsPuller {
         // 并发护栏：另一副本里活着的 puller 可能正在跑这条金丝雀，
         // 看护+滚动窗口内绝不插手。
         let age = (chrono::Utc::now() - rec.updated_at).num_seconds().max(0) as u64;
-        let guard = self.config.canary_watch_secs + 300;
+        let guard = self.config.canary_watch_secs + crate::config::CANARY_PAUSE_GRACE_SECS;
         if age < guard {
             return Ok(false);
         }
@@ -439,8 +439,27 @@ impl GitOpsPuller {
             return Ok(true);
         }
 
+        let d = self.config.deployment.clone();
+        let n = self.config.namespace.clone();
+        let k = self.config.kubectl_bin.clone();
+
         // L1 源码模式：镜像构建昂贵，标 Failed 让下轮 poll 完整重试。
         if self.config.registry.is_none() {
+            // 但 pause 必须在这里清掉：paused 的部署不会为新模板建 Pod，
+            // 重试把镜像重新 set 一遍也滚不起来，而 Failed 不再进
+            // already_processed、这条 Pending 已经被收尾，于是没有任何一方
+            // 会再回来 resume——部署就停在 pause 上，下一轮重试同样空转。
+            // 走到这里 age 已越过看护窗口，pause 只可能是死掉的写者留下的。
+            if self.deployment_paused().await.unwrap_or(false) {
+                let _ = self
+                    .run(
+                        &k,
+                        &["-n", &n, "rollout", "resume", &format!("deployment/{d}")],
+                        None,
+                        60,
+                    )
+                    .await;
+            }
             self.ledger
                 .update_status(
                     &rec.id,
@@ -453,9 +472,6 @@ impl GitOpsPuller {
 
         let expected = self.obtain_image(candidate).await?;
         let current = self.current_deployment_image().await?;
-        let d = self.config.deployment.clone();
-        let n = self.config.namespace.clone();
-        let k = self.config.kubectl_bin.clone();
         if current == expected {
             let status = self
                 .run(
@@ -687,6 +703,27 @@ impl GitOpsPuller {
                 return Ok(true);
             }
             info!(change_id = %candidate.change_id, cluster = %self.cluster, "Promotion already processed by this cluster");
+            return Ok(false);
+        }
+
+        // 金丝雀的第一步就是改策略、换镜像：这台部署这会儿要是在滚别的版本，
+        // 两个写者会互相顶掉，而且换手时新旧两个 Pod 同时挂在准入账上，候选 Pod
+        // 会被额度拒掉（2026-11-01 实测：主线滚 surge Pod 还没就绪时金丝雀换了
+        // 镜像，旧 Pod 还没从准入账上退掉，候选 Pod 被 FailedCreate 拒了 11 次，
+        // 主线那一版也被换成了候选）。等它滚完再来：这一轮什么都不做，候选留在
+        // release 分支上，下一轮 poll 重新拉——**不写台账**，于是候选不会被记成
+        // 一次失败再去重试。
+        //
+        // 停在这里的每一轮都留一条 warn：这一次拦住的是候选，不是"没有候选"，
+        // 两种空转在日志上必须分得开。
+        if candidate.level != "l0_config" && !self.rollout_complete().await? {
+            warn!(
+                change_id = %candidate.change_id,
+                cluster = %self.cluster,
+                deployment = %self.config.deployment,
+                "the deployment is still rolling another revision; not starting a canary on \
+                 top of it, retrying next poll"
+            );
             return Ok(false);
         }
 
@@ -4603,5 +4640,179 @@ spec:
                  spinning on an errored document"
             ),
         }
+    }
+
+    /// 用真 git 造一份带 promote tag 的 release 分支：`(bare 仓库地址, 分支名)`。
+    fn promotion_repo_with_a_candidate(root: &Path) -> (String, String) {
+        let bare = root.join("origin.git");
+        let seed = root.join("seed");
+        let branch = "evolution-release";
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        std::fs::create_dir_all(&seed).unwrap();
+        git(
+            root,
+            &["init", "--bare", "-b", branch, bare.to_str().unwrap()],
+        );
+        git(&seed, &["init", "-b", branch]);
+        git(&seed, &["config", "user.email", "t@example.invalid"]);
+        git(&seed, &["config", "user.name", "t"]);
+        std::fs::write(seed.join("README.md"), "seed\n").unwrap();
+        git(&seed, &["add", "README.md"]);
+        git(&seed, &["commit", "-m", "seed"]);
+        git(
+            &seed,
+            &[
+                "tag",
+                "-a",
+                "promote/candidate-1",
+                "-m",
+                "change_id=candidate-1\nlevel=l1_rollout",
+            ],
+        );
+        git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&seed, &["push", "origin", branch, "--tags"]);
+        (bare.to_string_lossy().to_string(), branch.to_string())
+    }
+
+    /// 部署正在滚另一个版本时，金丝雀不许动手。
+    ///
+    /// 它第一步就是改策略（maxSurge 0 / maxUnavailable 1）再换镜像：两个写者互相
+    /// 顶掉的同时，换手的新旧两个 Pod 一起挂在准入账上，候选 Pod 会被额度拒掉
+    /// （2026-11-01 实测：候选 Pod 被 FailedCreate 拒了 11 次，主线那一版也被换成了
+    /// 候选）。这一轮应当什么都不做——尤其是**不写台账**：候选要留在 release 分支上
+    /// 等下一轮，记成一次失败会让它带着一个假结局离开。
+    #[tokio::test]
+    async fn a_canary_does_not_start_on_top_of_a_rollout_already_underway() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo_url, branch) = promotion_repo_with_a_candidate(tmp.path());
+        // 新模板还没被控制器处理（observedGeneration < generation），且新版本一个
+        // 副本都没起来：这就是主线正在滚的那个现场。
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\necho \"2 1 1 0 0\"\n",
+            tmp.path().join("kubectl.log").display()
+        );
+        let kubectl = crate::test_support::write_executable(tmp.path(), "fake-kubectl", &script);
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let cfg = GitOpsConfig {
+            repo_url,
+            branch,
+            work_dir: tmp.path().join("work").to_string_lossy().to_string(),
+            kubectl_bin: kubectl.to_string_lossy().to_string(),
+            namespace: "cogneva".into(),
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            registry: Some("localhost:30500".into()),
+            // 没有这一步时这一轮会走完金丝雀；把它压到 0 让那次跑得快，
+            // 本用例判的是「有没有动手」，不是看护本身。
+            canary_watch_secs: 0,
+            ..Default::default()
+        };
+        let puller = GitOpsPuller::new(cfg, ledger.clone(), "cluster-a".into());
+
+        let handled = puller
+            .poll_once()
+            .await
+            .expect("a deployment that is still rolling is not a poll failure");
+        assert!(
+            !handled,
+            "nothing was promoted while the rollout is under way"
+        );
+
+        let calls = std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap();
+        assert!(
+            calls.contains("get deployment"),
+            "the round has to ask the deployment whether it is rolling: {calls}"
+        );
+        assert!(
+            !calls.contains("set image") && !calls.contains("patch"),
+            "a canary must not write onto a deployment that is rolling another revision: {calls}"
+        );
+        assert!(
+            ledger.recent(10).await.unwrap().is_empty(),
+            "a round that stepped aside must leave the ledger untouched, so the candidate is \
+             retried instead of recorded as a failure"
+        );
+    }
+
+    /// 源码模式收尾孤儿 Pending 时，必须先把部署从 pause 上放下来再记 Failed。
+    /// 没有这一步：paused 的部署对新模板不建 Pod，下一轮重试把镜像重新 set
+    /// 一遍也滚不起来，而 Failed 不进 already_processed、Pending 已被收尾，
+    /// 再没有一方会回来 resume——部署永久停在 pause（2026-11-01 实测停了 10
+    /// 分钟，靠人工 kubectl rollout resume 才动）。
+    #[tokio::test]
+    async fn a_source_mode_retry_clears_the_pause_the_dead_canary_left_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo_url, branch) = promotion_repo_with_a_candidate(tmp.path());
+        // 部署停在 pause 上：收尾时要问一次 .spec.paused，问出来是 true
+        // 才有那一次 resume。
+        let script = format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\ncase \"$*\" in *spec.paused*) echo true;; esac\n",
+            tmp.path().join("kubectl.log").display()
+        );
+        let kubectl = crate::test_support::write_executable(tmp.path(), "fake-kubectl", &script);
+        let ledger = Arc::new(cog_test_support::MemoryStateBackend::new());
+        // 越过看护窗口的 Pending：死了的写者留下的尾巴。
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(30 * 60);
+        ledger
+            .record(PromotionRecord {
+                id: "orphan".into(),
+                change_id: "candidate-1".into(),
+                level: "l1_rollout".into(),
+                gate_kind: None,
+                decision_reason: "test".into(),
+                cluster: "cluster-a".into(),
+                status: PromotionStatus::Pending,
+                outcome: "pulled from release branch".into(),
+                eval_summary: None,
+                created_at: stale,
+                updated_at: stale,
+            })
+            .await
+            .unwrap();
+        let cfg = GitOpsConfig {
+            repo_url,
+            branch,
+            work_dir: tmp.path().join("work").to_string_lossy().to_string(),
+            kubectl_bin: kubectl.to_string_lossy().to_string(),
+            namespace: "cogneva".into(),
+            deployment: "cogneva".into(),
+            container: "cogneva".into(),
+            // 源码模式：没有镜像仓库，收尾走「标 Failed 下轮重试」那条路。
+            registry: None,
+            ..Default::default()
+        };
+        let puller = GitOpsPuller::new(cfg, ledger.clone(), "cluster-a".into());
+
+        assert!(
+            puller.poll_once().await.unwrap(),
+            "the orphaned Pending has to be finalized in this round"
+        );
+
+        // 一条都没问过时日志文件根本不会出现，那是"什么都没做"而不是"跑崩了"。
+        let calls = std::fs::read_to_string(tmp.path().join("kubectl.log")).unwrap_or_default();
+        assert!(
+            calls.contains("rollout resume deployment/cogneva"),
+            "a deployment left paused by a dead canary has to be resumed before the retry is \
+             booked, otherwise every retry sets an image onto a paused deployment and nothing \
+             rolls: {calls}"
+        );
+        let rec = ledger.recent(10).await.unwrap();
+        let row = rec
+            .iter()
+            .find(|r| r.id == "orphan")
+            .expect("the pending row is still there");
+        assert_eq!(row.status, PromotionStatus::Failed);
     }
 }

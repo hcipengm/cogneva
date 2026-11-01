@@ -565,6 +565,17 @@ impl BaselinePortConfig {
     }
 }
 
+/// 金丝雀默认的看护窗口。
+///
+/// 它同时是「一份暂停最久能挂多久」的那一半：滚动侧等别人留下的 `paused` 时按
+/// 这个数算残渣，两个数必须同源，否则那边的界会比这边的看护还短，一次正在进行的
+/// 看护会被当成残渣 resume 掉。
+pub const DEFAULT_CANARY_WATCH_SECS: u64 = 600;
+
+/// 看护结束到滚动收场之间留的余量：resume/undo、全量滚动都在这段里做完。
+/// 与 [`DEFAULT_CANARY_WATCH_SECS`] 相加就是一份暂停的最长持有期。
+pub const CANARY_PAUSE_GRACE_SECS: u64 = 300;
+
 /// GitOps 分发配置（路线 B：推送端只推中央仓库，拉取端各自自治，
 /// 沙盒全程不持有任何集群凭证）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -625,7 +636,7 @@ impl Default for GitOpsConfig {
             namespace: cog_core::topology::namespace(),
             deployment: cog_core::topology::MAIN_DEPLOYMENT.into(),
             container: cog_core::topology::MAIN_CONTAINER.into(),
-            canary_watch_secs: 600,
+            canary_watch_secs: DEFAULT_CANARY_WATCH_SECS,
             canary_error_rate_multiplier: 1.5,
             canary_p99_multiplier: 1.3,
             canary_min_requests_for_rate: 100.0,

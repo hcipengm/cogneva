@@ -20629,6 +20629,234 @@ exit 0
         );
     }
 
+    /// apply 那一刻就已置着 `paused`、而且一直没清掉的 Deployment：控制器**不会**
+    /// 为新模板建任何 Pod，读数永远停在 `updatedReplicas` 缺省。暂停过了一个金丝雀
+    /// 最长能停的时长还在，说明置它的进程已经不在了（被自家滚动杀掉、Job 被驱逐），
+    /// 这一轮把整份清单 apply 出去了，现场的清理也归这里：resume 一次，并从 resume
+    /// 的时刻重新起算预算。
+    ///
+    /// 没有这一步，这条出口会把「永远不会轮到」记成「还没轮到」，判成环境类重试；
+    /// 而重试多少次它都不会动——标志还在，下一轮同样等满三百秒。
+    #[tokio::test]
+    async fn a_deployment_left_paused_by_a_writer_that_is_gone_is_resumed_not_waited_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let resumed = bin_dir.join("resumed");
+        // 暂停中：新模板一个 Pod 都没建（`updatedReplicas` 缺省），第 7 段是 `true`。
+        // resume 之后同一份读法收敛——Pod 是 resume 那一刻才开始建的。
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *"initContainers"*) ;;
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"rollout resume"*) : > '{resumed}'; echo "deployment.apps/cogneva resumed" ;;
+  *"generation"*)
+    if [ -f '{resumed}' ]; then
+      echo "2|2|1|1|1||"
+    else
+      echo "2|1|1|||0|true"
+    fi
+    ;;
+  *"deletionTimestamp"*)
+    started=$(date -u -d '-1 min' +%Y-%m-%dT%H:%M:%SZ)
+    echo "p-new|Running|true|||$started|"
+    ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) ;;
+  *"get pods"*) ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            resumed = resumed.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            5,
+            5,
+        );
+        let executor = executor.with_pause_hold(std::time::Duration::ZERO);
+        let plan = main_app_plan("localhost:30500/cogneva:main-new");
+
+        executor.run(&plan).await.expect(
+            "a paused deployment never creates a pod of the new revision, so the wait must \
+             clear the leftover pause instead of judging the revision on an empty reading",
+        );
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            calls.contains("rollout resume deployment/cogneva"),
+            "the pause is cleared by whoever is running this rollout: {calls}"
+        );
+        // 清理暂停不等于替这个版本作证：暂停是环境现场，不该顺手把这笔账记到版本上。
+        assert!(
+            !calls.contains("main-old"),
+            "clearing a leftover pause is not evidence about the new revision: {calls}"
+        );
+    }
+
+    /// 反过来的一支：暂停是**活的**——它会在自己的窗口里被清掉。那一段不属于这一轮
+    /// 滚动的预算，替它 resume 会把一次正在进行的看护半途放出去，候选就此在没看完的
+    /// 情况下被送上线。判据两条：等它自己清掉、并且这一轮一次 resume 都没发。
+    #[tokio::test]
+    async fn a_pause_a_live_canary_still_holds_is_waited_out_and_never_resumed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let first_poll = bin_dir.join("first-poll");
+        // 第一眼：暂停中、新模板一个 Pod 都没建。之后（金丝雀自己 resume 了）：
+        // 同一个模板照样滚完——读数收敛。
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *"initContainers"*) ;;
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"generation"*)
+    if [ -f '{seen}' ]; then
+      echo "2|2|1|1|1||"
+    else
+      : > '{seen}'
+      echo "2|1|1|||0|true"
+    fi
+    ;;
+  *"deletionTimestamp"*)
+    started=$(date -u -d '-1 min' +%Y-%m-%dT%H:%M:%SZ)
+    echo "p-new|Running|true|||$started|"
+    ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) ;;
+  *"get pods"*) ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            seen = first_poll.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            5,
+            5,
+        );
+        let plan = main_app_plan("localhost:30500/cogneva:main-new");
+
+        executor
+            .run(&plan)
+            .await
+            .expect("the canary clears its own pause and the rollout then goes through");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("rollout resume"),
+            "a pause that is still within a canary's own window is not residue: {calls}"
+        );
+    }
+
+    /// 等一次活着的看护，不能拿这一轮自己的滚动预算去等：暂停里没有任何 Pod 在起，
+    /// 这段时间本来就不是「这个版本起不来」。看护窗口（真实现场是十分钟量级）比滚动
+    /// 预算（五分钟）长，把它算进来，每次和一次正常看护撞上都会判成超时。
+    #[tokio::test]
+    async fn waiting_out_a_live_canary_does_not_spend_the_rollout_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let polls = bin_dir.join("polls");
+        // 前 3 眼都是暂停中（看护还没结束），之后金丝雀自己 resume 了、滚动收敛。
+        // 预算 1 秒、轮询 5 秒：把暂停算进预算，第二眼就判超时。
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then
+    case "$a" in
+      jsonpath=*) ;;
+      *) echo "error: unable to match a printer suitable for the output format \"$a\"" >&2; exit 2 ;;
+    esac
+  fi
+  prev="$a"
+done
+case "$*" in
+  *"initContainers"*) ;;
+  *".image"*) echo "localhost:30500/cogneva:main-old" ;;
+  *"generation"*)
+    n=$(cat '{count}' 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > '{count}'
+    if [ "$n" -ge 3 ]; then
+      echo "2|2|1|1|1||"
+    else
+      echo "2|1|1|||0|true"
+    fi
+    ;;
+  *"deletionTimestamp"*)
+    started=$(date -u -d '-1 min' +%Y-%m-%dT%H:%M:%SZ)
+    echo "p-new|Running|true|||$started|"
+    ;;
+  *"restartCount"*) echo "0 true " ;;
+  *"waiting.reason"*) ;;
+  *"get pods"*) ;;
+  *) echo ok ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+            count = polls.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            0,
+            1,
+            1,
+            1,
+        );
+        let plan = main_app_plan("localhost:30500/cogneva:main-new");
+
+        executor
+            .run(&plan)
+            .await
+            .expect("a pause held by a live canary is not this revision's timeout");
+
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            !calls.contains("rollout resume"),
+            "the canary clears its own pause: {calls}"
+        );
+    }
+
     /// 清单里"会被这次 apply 改写的引用"要按工作负载种类的真实深度取全：Deployment 的
     /// 容器与 init 容器、CronJob 埋在 `jobTemplate` 里的那一份。少走一层，那一类引用
     /// 就既不在快照里、也不在还原里——而守着启动路径的正是这些 init 容器。
@@ -24434,6 +24662,7 @@ exit 0
                 ".status.updatedReplicas",
                 ".status.readyReplicas",
                 ".status.unavailableReplicas",
+                ".spec.paused",
             ]
         );
     }
