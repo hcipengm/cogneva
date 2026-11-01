@@ -3960,6 +3960,186 @@ fn no_shipped_rule_guards_a_store_gauge_with_a_change_count() {
     );
 }
 
+/// 帮助文本自己声明了「这个 0 有两个意思」的序列。
+///
+/// 声明的形状是固定的、而且只有一处：同一句里既写 `0 when …` 又写 `and 0 when …`，
+/// 并在同一段里点名一个伴生序列把两种零分开（`… which is why it is read together
+/// with <那个序列>`）。本门不另立一份名单——名单就是那段帮助文本：作者写下这句话的
+/// 那一刻，这条序列就进了射程；改口说「这个零只有一个意思」也同样把它带出射程。
+/// 两种漂移落在同一处，而不是藏在第二张要人记得同步的表里。
+///
+/// 为什么要这道门：一个 `0` 同时是「账上干干净净」与「这一拍没看成」，读它的规则
+/// 就把这两件事报成同一件，而它们的修法相反——一个不用动，一个要去修那一趟。
+/// 判据应当立在这一族自己分出来的状态格上（帮助文本点名的那条伴生序列），不是立在这
+/// 个数上。2026-11-01 普查：共享规则库 412 条，帮助文本声明了这种零的序列 1 条
+/// （`cogneva_change_ledger_out_of_effect_oldest_seconds`），拿它与 0 比的规则 0 条。
+fn two_meaning_zero_names() -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for kind in [cog_core::MetricType::Gauge, cog_core::MetricType::Counter] {
+        for name in cog_core::documented_metric_names(kind) {
+            let help = cog_core::metric_help_text(kind, name);
+            if help.matches("0 when").count() >= 2 && help.contains("read together with") {
+                out.insert(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// 表达式里把某条序列与字面量 `0` 相比的地方（`name {…} <op> 0`、`max(name) <op> 0`）。
+///
+/// 聚合括起来的写法算在内：`max(x) == 0` 读的仍是同一个零。隔着**算术**的写法不算
+/// （`name - 0`、`(time() - name)`）：那里这个数是一个操作数，不是结论。这条边是
+/// 刻意的——把算术也算进来，新鲜度那族的 `(time() - …) > 0` 会全部落进射程，而它们
+/// 读的是时刻差，不是零的两个意思。
+fn zero_comparisons(promql: &str, names: &BTreeSet<String>) -> Vec<String> {
+    const OPS: [&str; 6] = ["==", "!=", "<=", ">=", "<", ">"];
+    let bytes = promql.as_bytes();
+    let mut out = Vec::new();
+    for name in names {
+        let mut from = 0usize;
+        while let Some(rel) = promql[from..].find(name.as_str()) {
+            let start = from + rel;
+            let end = start + name.len();
+            from = end;
+            // 名字必须整词命中：`x_seconds` 与 `x_seconds_observed_timestamp_seconds`
+            // 是两条序列，按子串读会把伴生钟的读数算到主体头上。
+            if start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
+                continue;
+            }
+            if end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+                continue;
+            }
+            // 标签选择器不改变主体，跳过它再读运算符。
+            let mut i = end;
+            while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'{' {
+                let mut depth = 0i32;
+                let mut in_string = false;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    if in_string {
+                        if c == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if c == b'"' {
+                            in_string = false;
+                        }
+                    } else if c == b'"' {
+                        in_string = true;
+                    } else if c == b'{' {
+                        depth += 1;
+                    } else if c == b'}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+                while i < bytes.len() && (bytes[i] as char).is_ascii_whitespace() {
+                    i += 1;
+                }
+            }
+            // 聚合括起来的读数：`max(name)`、`max without (pod, container, instance) (name)`。
+            // 跳过一串右括号再读运算符；隔着别的运算符的（`name - 0`）在这里就停了。
+            while i < bytes.len() && (bytes[i] == b')' || (bytes[i] as char).is_ascii_whitespace())
+            {
+                i += 1;
+            }
+            let Some(op) = OPS.iter().find(|op| promql[i..].starts_with(**op)) else {
+                continue;
+            };
+            let mut j = i + op.len();
+            while j < bytes.len() && (bytes[j] as char).is_ascii_whitespace() {
+                j += 1;
+            }
+            let literal: String = promql[j..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if literal.is_empty() {
+                continue;
+            }
+            if literal.parse::<f64>().map(|v| v == 0.0).unwrap_or(false) {
+                out.push(format!("{name} {op} {literal}"));
+            }
+        }
+    }
+    out
+}
+
+/// 帮助文本声明了一个零有两个意思的序列，不许拿那个零当判据。
+#[test]
+fn no_rule_compares_a_two_meaning_zero_to_zero() {
+    let names = two_meaning_zero_names();
+    // 分母：声明那种零的序列一条都找不出来时，下面那句「没有投诉」什么也不证明。
+    assert!(
+        !names.is_empty(),
+        "没有任何序列的帮助文本声明「这个 0 有两个意思」（`0 when … and 0 when …`, \
+         并点名一个伴生序列把两种零分开）——检测器与写法之间已经脱钩，这条门没有题目"
+    );
+    let mut complaints: Vec<String> = Vec::new();
+    for (rule, promql) in shipped_rules() {
+        for hit in zero_comparisons(&promql, &names) {
+            complaints.push(format!(
+                "{rule}: `{hit}`——这个 0 既是「没有欠着的」也是「这一拍没看成」，\
+                 一个数答不了两个问题\n    {promql}"
+            ));
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "规则拿着一族自己声明了两种零的数与 0 比:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// 这条门对着一句合成的表达式也要能开口——只跑过合规规则的门没证明它会拒。
+#[test]
+fn the_two_meaning_zero_gate_reports_the_comparison_it_is_aimed_at() {
+    // 声明还在：检测器必须仍从帮助文本里读出这个形状，而不是从一张写死的名单里。
+    let names = two_meaning_zero_names();
+    let declared = "cogneva_change_ledger_out_of_effect_oldest_seconds";
+    assert!(
+        names.contains(declared),
+        "帮助文本里那句话没了，或者措辞变了：{names:?}"
+    );
+
+    let subject: BTreeSet<String> = [declared.to_string()].into_iter().collect();
+    assert_eq!(
+        zero_comparisons(&format!("{declared} == 0"), &subject).len(),
+        1
+    );
+    assert_eq!(
+        zero_comparisons(&format!("max({declared}{{store=\"x\"}}) > 0"), &subject).len(),
+        1
+    );
+    // 同一个数跟别的界比，不是拿它的零当判据。
+    assert!(zero_comparisons(&format!("{declared} > 604800"), &subject).is_empty());
+    // 隔着聚合与算术读它，也不是拿零当判据。
+    assert!(zero_comparisons(&format!("max({declared}) - 0"), &subject).is_empty());
+    // 伴生钟是一条别的序列，按整词命中不算主体。
+    assert!(zero_comparisons(
+        &format!("{declared}_observed_timestamp_seconds == 0"),
+        &subject
+    )
+    .is_empty());
+    // 复合布尔再与 0 比，比的不是这个数本身：真实规则
+    // change_landed_but_not_running 就是这个形状，它问的是两个「> 界」的合取是不是假。
+    assert!(zero_comparisons(
+        &format!(
+            "(max({declared}) > 3600) and on () (max(another_series{{state=\"waiting\"}}) > 0) == 0"
+        ),
+        &subject
+    )
+    .is_empty());
+}
+
 /// Complaints about a freshness bound on the policy store readouts that is no
 /// longer than the loop which republishes them.
 ///
