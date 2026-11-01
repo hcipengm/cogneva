@@ -341,13 +341,18 @@ spec:
             # 分开量：两个进程写同一个路径，但各自的卷互不相干。
             - name: COGNEVA_DATA_VOLUME_CLAIM
               value: "cogneva-evolution-data-pvc"
-            # 本 Pod 在数据目录之外还挂了两张卷，占用都远大于上面那张：沙箱工作树
-            # 与构建缓存。不列出来它们就没有观测面——唯一能发现"声明 10Gi、实际
-            # 101G"的规则看不见它们，只会在节点盘整体告急时才被间接发现。
+            # 本 Pod 挂的每一张卷都在这里点名，包括上面那张数据目录的卷：容量循环
+            # 只看这份名单，名单里没有的卷它既不量也**不会替它抬声明**——那张卷就
+            # 只剩一个读数、没有维修者，涨到头来要靠人改 values。
+            # 数据目录那张以前单靠上面那个 `COGNEVA_DATA_VOLUME_CLAIM` 声明，而那个
+            # 变量只喂「占用读数」那一路（它不知道路径是不是卷根，只记一条警告），
+            # 于是那张卷（默认 64Gi）一直没有抬声明的人。`app.data_dir` 就等于这里的挂载
+            # 点，路径是卷根，所以按路径声明它是准确的。
             # 子挂载由进程读自己的挂载表排除，不在这里重复声明，免得挂载一变就
             # 静默量错。
             - name: COGNEVA_DATA_VOLUME_MOUNTS
               value: |
+                cogneva-evolution-data-pvc=/var/lib/cogneva-data
                 cogneva-evolution-pvc=/opt/cogneva/sandbox
                 cogneva-evolution-source-pvc=/opt/cogneva/sandbox/src
             {{- if .Values.clusterRegistry.enabled }}
