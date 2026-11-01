@@ -137,6 +137,7 @@ const READY_TASKS_PER_PASS: u64 = 200;
 /// waking, the same pool verdict is read again and a pool still down is refused
 /// without spending an LLM call. The cap is what makes the hold safe, not what
 /// makes it cheap.
+// cap: bound — 等待是池子自己说的「何时能再服务」，可以是小时级（月度配额）；扣满它会让 intake 对提前恢复失聪，而唤醒后那一问不花一次调用，没有读数应该把这个数移动
 const GOAL_CONSUMER_MAX_HOLD: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What one pass may admit, together with the reading it was derived from.
