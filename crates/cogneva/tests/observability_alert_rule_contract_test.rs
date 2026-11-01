@@ -1548,7 +1548,7 @@ const FOREIGN: &[(&str, &str)] = &[
     ),
     (
         "cogneva_db_role_workload_roles_superuser_unplanned",
-        "宿主生产者 `scripts/host/cogneva-db-role-privilege-reading.sh`（不在本仓，自声明 `producer=db_role_privilege`），经聚合器以 `job=\"cogneva-host-readings\"` 印出。值说的是「业务工作负载真的在用的、没有被预案认领的带超权位的数据库角色有几个」。它读的是现网工作负载 env 里的 DSN，不是 chart 里写着什么——「chart 说要换角色」与「Pod 真的用上了」是两件事，后者才是权限事实。规则读 `..._unplanned` 而不是同族的 `..._superuser`：备份演练那条腿按设计要超权（`session_replication_role` 与 `CREATE DATABASE`），拿总数判会让这条规则在业务侧早就干净之后继续红在一条无关的腿上，常红最终被静音，连同它本该报的那一次；预案认领（`COGNEVA_DB_ROLE_EXEMPT`）把那条腿从 unplanned 移出去，只让这一格更严。生产者退 3（连库/读工作负载失败）时整条序列都不印，那是「没量到」，由聚合器的 `host_reading_producer_unreadable` 接住，不在这里冒充 0",
+        "宿主生产者 `scripts/host/cogneva-db-role-privilege-reading.sh`（不在本仓，自声明 `producer=db_role_privilege`），经聚合器以 `job=\"cogneva-host-readings\"` 印出。值说的是「工作负载真的在用的、没有被预案认领的带超权位的数据库角色有几个」。它读的是现网工作负载 env 里的 DSN，不是清单里写着什么——「清单说要换角色」与「Pod 真的用上了」是两件事，后者才是权限事实。超权位本身收不掉（bootstrap 角色，PostgreSQL 16 不许改），所以判的是**谁在连它**；规则读 `..._unplanned` 而不是同族的 `..._superuser`，因为预案机制留给了下一个真的需要超权的腿，拿总数判会让规则在一条按设计认领过的腿上继续红，常红最终被静音，连同它本该报的那一次。生产者退 3（连库/读工作负载失败）时整条序列都不印，那是「没量到」，由聚合器的 `host_reading_producer_unreadable` 接住，不在这里冒充 0",
     ),
     (
         "cogneva_mainline_behind_verdict_stalled",
