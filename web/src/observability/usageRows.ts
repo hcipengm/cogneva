@@ -250,9 +250,10 @@ export function cacheWriteLanding(
   const recovery = pool?.recovery_at ?? null;
   const probe = pool?.next_attempt_at ?? null;
   const served = pool?.last_served_at ?? null;
-  // 只认**还在未来**的时刻。快照的 TTL 可以到几小时，写它的进程停摆期间，载荷里
-  // 那两个时刻会一个一个变成过去；照原样印出来，读者会把已经过去的 03:57 当成
-  // 「三点五十七会有数」。过去了的时刻不是排期，是「这份快照不是当刻写的」的证据。
+  // 只认**还在未来**的时刻。这两个时刻是绝对时刻，而屏上的「现在」一直在往前走：
+  // 一个已经到过的时刻照原样印成排期，读的人会一直等一件已经发生过、或者根本不会
+  // 再发生的事。页面拿不到「它为什么没兑现」——那要两次读之间比大小，一次读看不见
+  // ——所以这里只报「它已经过去了」，不猜成因。
   const future = [recovery, probe]
     .filter((at): at is string => at !== null && Date.parse(at) > now)
     .sort((a, b) => Date.parse(a) - Date.parse(b));
@@ -265,12 +266,12 @@ export function cacheWriteLanding(
   const parts: string[] = [];
   if (recovery) {
     parts.push(
-      `上游自述复位 ${when(recovery)}${Date.parse(recovery) > now ? '（它说的最早时刻，不是承诺）' : '（已经过去了：这份快照不是当刻写的，或者上游说的时刻没有兑现）'}`
+      `上游自述复位 ${when(recovery)}${Date.parse(recovery) > now ? '（它说的最早时刻，不是承诺）' : '（已经过去了：这个时刻现在是一个已经到过的时刻，不是排期）'}`
     );
   }
   if (probe) {
     parts.push(
-      `我方下次探测 ${when(probe)}${Date.parse(probe) > now ? '（重试的节拍，不是上游的承诺）' : '（已经过去了：说明写快照的进程有一阵没刷新）'}`
+      `我方下次探测 ${when(probe)}${Date.parse(probe) > now ? '（重试的节拍，不是上游的承诺）' : '（已经过去了：不是排期）'}`
     );
   }
   parts.push(

@@ -67,9 +67,14 @@ export function TokenView() {
   const account = useResource(`决定不花（${hours} 小时）`, () => getTokenAccount(hours), 60_000);
   // 这本账的写者是一轮话、一次运行：`turn_end` 与 `agent_end` 就是那一笔落账的时刻。
   // 整点折叠改的是同一本账的另一个粒度，落在 observability 前缀下。
+  //
+  // 额度窗那一节也挂在这条信号上：它读的是池子此刻的账（花了多少、还能摊多少、
+  // 最后一次成功在何时），而这些恰好是「一件活刚跑完」时才变的东西。把它留给
+  // 30 秒的兜底轮询，屏幕上就会有一段时间——账已经往前走了一笔、额度窗还停在
+  // 上一笔上，两节的说法对不上。
   useKindTickedRefresh(
     ['usage', resourceKey('observability')],
-    [series.refresh, usage.refresh, outcomes.refresh, account.refresh]
+    [series.refresh, usage.refresh, outcomes.refresh, account.refresh, overview.refresh]
   );
 
   const rows = series.data?.rows ?? [];
@@ -431,9 +436,8 @@ function spanOf(secs: number): string {
  */
 function AllowanceWindow() {
   const { overview } = useServices();
-  // 快照带 TTL（最长 7 天），写它的进程停了以后，载荷里那些「将来的时刻」会一个
-  // 一个变成过去。照原样印成排期，读者会把已经过去的时刻当成还没到——所以这两格
-  // 要跟当前时刻对读一次。
+  // 这两格印的是绝对时刻，而「现在」一直在走：已经到过的时刻照原样印成排期，读的
+  // 人就会一直等一件不会发生的事。页面只报「它已经过去了」，不猜为什么会过去。
   const now = useNow(30_000);
   const pool = overview.data?.llm_pool ?? null;
   const passed = (iso: string | null): boolean => iso !== null && Date.parse(iso) < now;
@@ -566,7 +570,7 @@ function AllowanceWindow() {
               tone={passed(pool.recovery_at) ? 'warn' : 'plain'}
               note={
                 passed(pool.recovery_at)
-                  ? `这个时刻已经过去：要么上游说的时刻没有兑现，要么写这份快照的进程有一阵没刷新${pool.quota_window_secs > 0 ? `（嫌疑上游声明的窗长 ${spanOf(pool.quota_window_secs)}）` : ''}`
+                  ? `这个时刻已经过去：它现在是一个已经到过的时刻，不是「什么时候恢复」${pool.quota_window_secs > 0 ? `（嫌疑上游声明的窗长 ${spanOf(pool.quota_window_secs)}）` : ''}`
                   : pool.quota_window_secs > 0
                     ? `嫌疑上游声明的窗长 ${spanOf(pool.quota_window_secs)}`
                     : undefined
@@ -578,7 +582,7 @@ function AllowanceWindow() {
               tone={passed(pool.next_attempt_at) ? 'warn' : 'plain'}
               note={
                 passed(pool.next_attempt_at)
-                  ? '排的时刻已经过去而快照还是这一份：写它的进程没有按自己的节拍刷新，这不是「探测正在进行」'
+                  ? '这个时刻已经过去：它现在不是排期，是一个已经到过的时刻'
                   : '我方重试的节拍，不是上游的承诺'
               }
             />
