@@ -57,6 +57,8 @@ use cog_core::observability::{DimensionSpec, Observable, RawMetric, TraceFragmen
 use cog_core::{ResourceEvent, ResourceEventKind, ResourceEventOutcome, SFResult, ShutdownSignal};
 use tracing::{debug, info, warn};
 
+use crate::change_execution::KUBECTL_TIMEOUT_SECS;
+
 /// What became of one claim in one round, counted per outcome.
 pub const OUTCOME_METRIC: &str = "cogneva_volume_capacity_outcome_total";
 
@@ -1142,7 +1144,12 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
     let peak = state.observe(used);
 
     let ns = namespace();
-    let json = match kubectl(&["get", "pvc", &target.claim, "-n", &ns, "-o", "json"], 60).await {
+    let json = match kubectl(
+        &["get", "pvc", &target.claim, "-n", &ns, "-o", "json"],
+        KUBECTL_TIMEOUT_SECS,
+    )
+    .await
+    {
         Ok(json) => json,
         Err(e) => {
             warn!(claim = %target.claim, error = %e, "volume capacity: claim unreadable");
@@ -1273,7 +1280,7 @@ async fn reconcile(target: &ClaimTarget, state: &mut ClaimState) -> CapacityOutc
             "-p",
             &patch,
         ],
-        60,
+        KUBECTL_TIMEOUT_SECS,
     )
     .await
     {
@@ -1327,7 +1334,7 @@ async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) -> bool {
     let pair = format!("{SHORTFALL_SINCE_ANNOTATION}={now_unix}");
     if let Err(e) = kubectl(
         &["annotate", "pvc", claim, "-n", ns, &pair, "--overwrite"],
-        60,
+        KUBECTL_TIMEOUT_SECS,
     )
     .await
     {
@@ -1345,7 +1352,12 @@ async fn stamp_shortfall(claim: &str, ns: &str, now_unix: u64) -> bool {
 
 async fn clear_shortfall_stamp(claim: &str, ns: &str) {
     let removal = format!("{SHORTFALL_SINCE_ANNOTATION}-");
-    if let Err(e) = kubectl(&["annotate", "pvc", claim, "-n", ns, &removal], 60).await {
+    if let Err(e) = kubectl(
+        &["annotate", "pvc", claim, "-n", ns, &removal],
+        KUBECTL_TIMEOUT_SECS,
+    )
+    .await
+    {
         warn!(
             claim,
             error = %e,
@@ -1359,26 +1371,32 @@ async fn clear_shortfall_stamp(claim: &str, ns: &str) {
 /// quota moves as other claims are created, and a cached ceiling would let this
 /// loop write a request the namespace can no longer accept.
 async fn read_ceiling(ns: &str, own_request: u64) -> Option<Ceiling> {
-    let limit = kubectl(&["get", "limitrange", "-n", ns, "-o", "json"], 60)
-        .await
-        .ok()
-        .and_then(|json| match limit_range_max_storage(&json) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "volume capacity: limit range unreadable; ceiling unknown");
-                None
-            }
-        });
-    let quota = kubectl(&["get", "resourcequota", "-n", ns, "-o", "json"], 60)
-        .await
-        .ok()
-        .and_then(|json| match quota_free_storage(&json, own_request) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "volume capacity: quota unreadable; ceiling unknown");
-                None
-            }
-        });
+    let limit = kubectl(
+        &["get", "limitrange", "-n", ns, "-o", "json"],
+        KUBECTL_TIMEOUT_SECS,
+    )
+    .await
+    .ok()
+    .and_then(|json| match limit_range_max_storage(&json) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "volume capacity: limit range unreadable; ceiling unknown");
+            None
+        }
+    });
+    let quota = kubectl(
+        &["get", "resourcequota", "-n", ns, "-o", "json"],
+        KUBECTL_TIMEOUT_SECS,
+    )
+    .await
+    .ok()
+    .and_then(|json| match quota_free_storage(&json, own_request) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(error = %e, "volume capacity: quota unreadable; ceiling unknown");
+            None
+        }
+    });
     admission_ceiling(limit, quota)
 }
 

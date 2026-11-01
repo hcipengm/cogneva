@@ -833,7 +833,7 @@ const PARENT_CONTAINER: &str = cog_core::topology::MAIN_CONTAINER;
 /// 每次 kubectl 调用的墙钟上界。它是控制面的读，不是构建：超过这个数说明
 /// API 侧已经不正常，再等也只是把常驻进程挂在这里。
 // cap: bound — 控制面的读不是构建；超过它说明 API 侧已不正常，再等只是把常驻进程挂住
-const KUBECTL_TIMEOUT_SECS: u64 = 60;
+pub(crate) const KUBECTL_TIMEOUT_SECS: u64 = 60;
 
 /// 等待预算比 Job 自己的 `activeDeadlineSeconds` 多出来的那一段：Job 到点后
 /// 还要被控制器判死、状态要回写，派发方等到恰好等于它就会在最后几秒里抢跑。
