@@ -139,6 +139,21 @@ for pattern, why in (
     if not re.search(pattern, view, re.S):
         sys.exit(f"views/ObservabilityView.tsx 缺 {pattern}：{why}")
 
+# 令牌面：花销那几读订了 `usage`，额度窗读的是池子此刻的账（允许多少、花出去多少、
+# 最后一次成功在何时），而这三样恰好是一件活刚跑完才变的。它若只靠 30 秒的兜底，
+# 屏幕上就会出现「账往前走了一笔、额度窗还停在上一笔」——同一屏两份事实。
+token = read("views/TokenView.tsx")
+if not re.search(
+    r"useKindTickedRefresh\(\s*\[\s*'usage', resourceKey\('observability'\)\s*\],\s*"
+    r"\[series\.refresh, usage\.refresh, outcomes\.refresh, account\.refresh, overview\.refresh\]",
+    token,
+    re.S,
+):
+    sys.exit(
+        "views/TokenView.tsx 没把池子的那份读数跟花销几读一起交给 `usage` 帧："
+        "额度窗会落在上一笔账上，和下面三块各说一个时刻"
+    )
+
 # 任务面：行由帧改写，计数与图来自快照。三份都交出去，缺一份就是同一屏上两份事实。
 tasks = read("views/TasksView.tsx")
 if not re.search(
