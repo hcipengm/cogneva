@@ -18,7 +18,7 @@ use cog_core::{
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::change_pipeline::write_record_file;
+use crate::change_pipeline::{read_record_beside, write_record_file};
 use crate::types::{EvolutionKind, EvolutionResult, EvolutionStatus};
 
 /// What each prompt says when no prompt manager is wired into the engine.
@@ -251,15 +251,38 @@ impl EvolutionEngine {
                     );
                     return false;
                 }
-                let record = EvolutionResult {
-                    kind: EvolutionKind::CodeChange,
-                    artifact_id: artifact_id.to_string(),
-                    description: String::new(),
-                    content: String::new(),
-                    status,
-                    created_at: crate::change_pipeline::UNKNOWN_CREATED_AT,
-                    eval_summary: None,
-                    tiering: None,
+                // 盘上可能已经有一份记录，只是本进程的索引里没有它——重启之后
+                // 每一条都是这个形状。那份记录是这条变更的说明与生成时刻唯一的
+                // 载体，所以这里改的是**状态一格**，不是整份重写：用一份空壳
+                // 覆盖它，description 与 created_at 当场丢失，此后谁也读不出这条
+                // 变更当初要做什么。2026-11-01 的 retired/ 里有两条这样被覆盖过的
+                // 记录（status=active、description 空、时刻是哨兵），它们各自的
+                // diff 是上百行的真实改动。
+                let record = match read_record_beside(&self.change_dir, artifact_id).await {
+                    Ok(Some(mut record)) => {
+                        record.status = status;
+                        record
+                    }
+                    Ok(None) => EvolutionResult {
+                        kind: EvolutionKind::CodeChange,
+                        artifact_id: artifact_id.to_string(),
+                        description: String::new(),
+                        content: String::new(),
+                        status,
+                        created_at: crate::change_pipeline::UNKNOWN_CREATED_AT,
+                        eval_summary: None,
+                        tiering: None,
+                    },
+                    // 读不出来的记录不能被当成没有记录：覆盖它等于把读不出来的
+                    // 原因一并抹掉，而那份字节是本进程唯一没有的那份事实。
+                    Err(e) => {
+                        warn!(
+                            artifact_id = %artifact_id,
+                            error = %e,
+                            "the record beside this change cannot be read; leaving it as it stands rather than overwriting it"
+                        );
+                        return false;
+                    }
                 };
                 self.persist_record(&record).await;
                 true
@@ -1301,6 +1324,79 @@ mod tests {
             record.created_at,
             crate::change_pipeline::UNKNOWN_CREATED_AT,
             "recovering a record must not invent a creation time for it"
+        );
+    }
+
+    /// 盘上已经有一份记录时，更新状态改的是状态那一格，不是整份重写。
+    ///
+    /// 重启之后每一条在队变更都是这个形状：本进程的索引里没有它，盘上有它的
+    /// record。这份 record 是「这条变更当初要做什么」与「它什么时候生成的」唯一
+    /// 的载体——用一份空壳覆盖它，description 与 created_at 当场清零，此后这条
+    /// 变更就只剩一个 id 和一份没人知道来由的 diff。
+    #[tokio::test]
+    async fn a_status_update_to_a_change_the_index_never_saw_keeps_the_record_it_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let engine = engine_on(&change_dir);
+        let pipeline = crate::ChangePipeline::new(temp.path(), &change_dir, true);
+        tokio::fs::write(change_dir.join("kept.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+        let original = code_change("kept", EvolutionStatus::CompileChecked);
+        crate::change_pipeline::write_record_file(&change_dir, &original)
+            .await
+            .unwrap();
+
+        assert!(engine.get_result("kept").await.is_none());
+        assert!(
+            engine
+                .update_status("kept", EvolutionStatus::AwaitingReview)
+                .await
+        );
+
+        let record = pipeline
+            .read_change_record("kept")
+            .await
+            .expect("the record is still there after the update");
+        assert_eq!(record.status, EvolutionStatus::AwaitingReview);
+        assert_eq!(
+            record.description, original.description,
+            "the update overwrote what this change says it does"
+        );
+        assert_eq!(
+            record.created_at, original.created_at,
+            "the update invented a creation time over the one already on disk"
+        );
+    }
+
+    /// 读不出来的记录不被当成没有记录：覆盖它等于把读不出来的那份事实一起抹掉。
+    #[tokio::test]
+    async fn a_status_update_leaves_an_unreadable_record_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let change_dir = temp.path().join("changes");
+        tokio::fs::create_dir_all(&change_dir).await.unwrap();
+        let engine = engine_on(&change_dir);
+        tokio::fs::write(change_dir.join("broken.diff"), "not a real diff\n")
+            .await
+            .unwrap();
+        let garbage = "{ this is not a record";
+        tokio::fs::write(change_dir.join("broken.json"), garbage)
+            .await
+            .unwrap();
+
+        assert!(
+            !engine
+                .update_status("broken", EvolutionStatus::AwaitingReview)
+                .await,
+            "a record it cannot read is not a record it may replace"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(change_dir.join("broken.json"))
+                .await
+                .unwrap(),
+            garbage,
+            "the bytes that would not parse are still the only copy of that fact"
         );
     }
 

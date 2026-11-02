@@ -500,6 +500,45 @@ pub(crate) async fn write_record_file(dir: &Path, result: &EvolutionResult) -> S
     })
 }
 
+/// Read a change's metadata record, telling "no record" apart from "a record
+/// nobody can read".
+///
+/// [`ChangePipeline::read_change_record`] collapses both to `None` on purpose:
+/// a caller building a listing has nothing better to do with either. A caller
+/// about to **write** the record has to tell them apart, because overwriting an
+/// unreadable record destroys the only copy of the fact it states, while
+/// overwriting an absent one destroys nothing. So: `Ok(None)` means there was
+/// no file, `Err` means there was one and its bytes did not parse.
+pub(crate) async fn read_record_beside(
+    dir: &Path,
+    artifact_id: &str,
+) -> SFResult<Option<EvolutionResult>> {
+    for path in [
+        change_record_path(dir, artifact_id),
+        retired_change_record_path(dir, artifact_id),
+    ] {
+        let text = match tokio::fs::read_to_string(&path).await {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                return Err(SFError::IO(format!(
+                    "Failed to read change record {}: {}",
+                    path.display(),
+                    e
+                )))
+            }
+        };
+        return serde_json::from_str(&text).map(Some).map_err(|e| {
+            SFError::IO(format!(
+                "Failed to parse change record {}: {}",
+                path.display(),
+                e
+            ))
+        });
+    }
+    Ok(None)
+}
+
 /// The timestamp a change carries when no record states one.
 ///
 /// A `.diff` written before the record mechanism existed has no creation time
