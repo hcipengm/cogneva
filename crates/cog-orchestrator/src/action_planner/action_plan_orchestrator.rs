@@ -1022,6 +1022,8 @@ impl ActionPlanOrchestrator {
                 )
                 .await;
         }
+        // 分解这一关过了：这个目标名下此前写下的判退行，条件已经不成立。
+        self.resolve_decomposition_alerts(&goal_id).await;
         // 子任务在计划内部的父指针，映射到这一批的 id 上；计划没给父指针的挂在
         // 承载目标答案的那一行下面（一层）。两种都落在同一批注入里，所以父节点
         // 一定存在——这正是结构门判过的那一条。
@@ -1296,6 +1298,52 @@ impl ActionPlanOrchestrator {
             }
         } else {
             tracing::error!(rule, dedup_key = %dedup_key, labels = %labels, "{message} (no persistent alert sink attached)");
+        }
+    }
+
+    /// 分解成功的那一刻，把这个目标名下还开着的判退行关掉。
+    ///
+    /// 告警是「这件事此刻坏着」的断言，不是日记。判退时写了一行，重分解成功说明它
+    /// 已经不成立了——但没有任何一步会回头关它，于是这一行一直 firing，读到的人只会
+    /// 看见「还在坏」。2026-11-02 实测：两行 `decomposition_wbs` 停在前一晚，目标那
+    /// 时早已不在这条路上。
+    ///
+    /// 三条判退规则共用这一个出口：当时写的是哪一条不重要，成立与否由同一件事回答
+    /// ——这个目标这一次分解成了。只碰这一族：同一个目标名下还有别的规则在跑（重试
+    /// 耗尽、执行失败），那些条件与分解成不成无关，替它们答「不成立了」就是撒谎。
+    async fn resolve_decomposition_alerts(&self, goal_id: &str) {
+        let Some(sink) = self.alert_sink().await else {
+            return;
+        };
+        for rule in [
+            cog_core::ALERT_RULE_DECOMPOSITION_EMPTY,
+            cog_core::ALERT_RULE_DECOMPOSITION_SINK_COUNT,
+            cog_core::ALERT_RULE_DECOMPOSITION_WBS,
+            cog_core::ALERT_RULE_DECOMPOSITION_ORPHANED,
+        ] {
+            // dedup_key 是 `{rule}:{goal_id}:{task_id}`，三段都按原样拼出来再比前缀：
+            // 只比 `goal_id` 会连别的规则的行一起关掉，只比规则会把别的目标关掉。
+            let ours = format!("{rule}:{goal_id}:");
+            for row in sink.list_active_persistent_alerts(rule, 200).await {
+                if !row.dedup_key.starts_with(&ours) {
+                    continue;
+                }
+                let draft = cog_core::PersistentAlertDraft {
+                    rule: row.rule,
+                    dedup_key: row.dedup_key,
+                    severity: row.severity,
+                    message: row.message,
+                    labels: row.labels,
+                };
+                if let Err(e) = sink.set_persistent_alert(false, &draft).await {
+                    tracing::warn!(
+                        goal_id,
+                        dedup_key = %draft.dedup_key,
+                        error = %e,
+                        "failed to resolve a decomposition alert after a successful plan"
+                    );
+                }
+            }
         }
     }
 
@@ -2719,6 +2767,9 @@ mod tests {
     struct RecordingAlertSink {
         calls: std::sync::Mutex<Vec<(bool, String, String)>>,
         drafts: std::sync::Mutex<Vec<cog_core::PersistentAlertDraft>>,
+        /// 预先摆在表里的开着的行。`list_active_persistent_alerts` 读它——分解成功
+        /// 之后要关掉的那些判退行，只有从这一格才看得见。
+        open: std::sync::Mutex<Vec<cog_core::PersistedAlert>>,
     }
 
     #[async_trait::async_trait]
@@ -2750,7 +2801,10 @@ mod tests {
             _rule_prefix: &str,
             _limit: i64,
         ) -> Vec<cog_core::PersistedAlert> {
-            Vec::new()
+            // 故意不按前缀过滤：真实的 store 会过滤，但一个只会照做的前缀证明不了
+            // 调用方自己有没有把「这一行是不是我的」判对——它把自己的判据当成
+            // 了调用方的判据。这里把全部行递过去，关谁不关谁全靠被测的那段代码。
+            self.open.lock().unwrap().clone()
         }
     }
 
@@ -2900,6 +2954,85 @@ mod tests {
         assert!(
             labels.get(crate::LABEL_ORIGINAL_INPUT).is_none(),
             "the whole input must not survive as a label"
+        );
+    }
+
+    /// 分解成功时，这个目标名下还开着的判退行必须被关掉。
+    ///
+    /// 告警是「这件事此刻坏着」的断言，不是日记：判退写了一行之后没有任何一步会
+    /// 回头关它，于是重分解成功后这一行还亮着，读到的人只会看见「还在坏」。
+    /// 2026-11-02 实测两行 `decomposition_wbs` 就是这么停在前一晚的。
+    ///
+    /// 这一格同时钉住**不关别人的**：同一个目标名下的别的规则、别的目标名下的同一
+    /// 条规则，都不许跟着一起消失。
+    #[tokio::test]
+    async fn a_successful_decomposition_resolves_its_own_open_verdict_rows() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-resolve-verdict".to_string()));
+        let mut package = atomic_task("child-1");
+        package.acceptance = vec!["接口对这条请求返回 200".into()];
+
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let row = |rule: &str, dedup: &str| cog_core::PersistedAlert {
+            rule: rule.to_string(),
+            dedup_key: dedup.to_string(),
+            severity: "warning".into(),
+            state: "firing".into(),
+            message: "m".into(),
+            labels: serde_json::json!({}),
+            fired_at: chrono::Utc::now(),
+            last_seen_at: None,
+            acknowledged_at: None,
+            acknowledged_by: None,
+        };
+        {
+            let mut open = sink.open.lock().unwrap();
+            // 这一行该关：同一条规则 + 同一个目标。
+            open.push(row(
+                cog_core::ALERT_RULE_DECOMPOSITION_WBS,
+                "decomposition_wbs:goal-resolve:goal-row",
+            ));
+            // 同一个目标、别的规则：分解成功与它无关。
+            open.push(row(
+                "retry_exhausted",
+                "retry_exhausted:goal-resolve:goal-row",
+            ));
+            // 同一条规则、别的目标：别人的判退还在。
+            open.push(row(
+                cog_core::ALERT_RULE_DECOMPOSITION_WBS,
+                "decomposition_wbs:goal-other:goal-row",
+            ));
+        }
+
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![package]]),
+            }))
+            .with_dag_executor(dag)
+            .with_decomposition_max_attempts(1);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let mut goal_row = hint_task("goal-row");
+        goal_row.goal_id = Some("goal-resolve".into());
+        let registry = SkillRegistry::new();
+        planner
+            .process_goal_impl("ship it", vec![goal_row], &registry)
+            .await
+            .expect("这一片过得了分解门");
+
+        let calls = sink.calls.lock().unwrap();
+        let resolved: Vec<&(bool, String, String)> = calls
+            .iter()
+            .filter(|(condition, _, _)| !*condition)
+            .collect();
+        assert_eq!(
+            resolved.len(),
+            1,
+            "只该关掉同一目标同一族的那一行：{calls:?}"
+        );
+        assert_eq!(
+            resolved[0].2,
+            "decomposition_wbs:goal-resolve:goal-row".to_string()
         );
     }
 
