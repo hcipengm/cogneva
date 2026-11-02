@@ -207,6 +207,12 @@ const SAME_VALUE_DIFFERENT_THING: &[(&str, &str, &str)] = &[
         "同上：循环名与消费者名是两个通道",
     ),
     (
+        "cog-storage",
+        "state",
+        "收件箱孤儿状态与连接池里连接状态的标签名是两个指标家族各自的一格：闭集\
+         不同，改一族的标签不该牵动另一族的序列",
+    ),
+    (
         "cogneva",
         "/workspace",
         "两个镜像各自的容器布局：官方判分脚本落点的那个 `/workspace` 与 pack\
