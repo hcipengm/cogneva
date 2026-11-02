@@ -671,6 +671,25 @@ impl cog_core::SystemPlugin for StoragePlugin {
         ctx.publish_service(observability_gateway);
         info!("StoragePlugin observability gateway published");
 
+        // What each pool is carrying, rendered on every scrape. The ceiling
+        // each one was given is written once to the metric store above; the
+        // load on it is a live fact about this process and is published from
+        // here, so a pool that has stopped answering the store still reports
+        // its own load.
+        let pool_readings: Vec<(&'static str, sqlx::PgPool)> = crate::pool_readings::POOL_ROLES
+            .iter()
+            .zip([
+                users_pool.as_ref(),
+                messages_pool.as_ref(),
+                config_pool.as_ref(),
+                explain_pool.as_ref(),
+            ])
+            .filter_map(|(role, pool)| pool.map(|pool| (*role, pool.clone())))
+            .collect();
+        ctx.publish_observable(Arc::new(crate::pool_readings::PoolReadings::new(
+            pool_readings,
+        )));
+
         ctx.publish(Arc::new(UsersPool(users_pool)));
         ctx.publish(Arc::new(MessagesPool(messages_pool)));
         ctx.publish(Arc::new(ConfigPool(config_pool.clone())));

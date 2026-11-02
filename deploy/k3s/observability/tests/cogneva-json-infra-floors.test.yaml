@@ -36,6 +36,7 @@ rule_files:
 # rule: cogneva_workload_metrics_unscraped
 # rule: data_volume_over_declared_size
 # rule: pg_pool_ceiling_unmeasured
+# rule: pg_pool_connections_saturated
 # rule: workload_no_available_replica
 # rule: gitops_pull_failed
 # rule: baseline_port_tick_failing_every_round
@@ -352,4 +353,51 @@ tests:
     alert_rule_test:
       - eval_time: 60m
         alertname: cogneva_workload_metrics_unscraped
+        exp_alerts: []
+
+  # 池子的份额全被占满：`explain` 满格、`users` 有余量。比值型，两边都来自同一条
+  # 渲染序列（`state="in_use"` 除以 `state="max"`），所以分母那一格必须一起给——
+  # 只写 in_use 时右边缺席，整个表达式为空，规则静得像个健康的池。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_pg_pool_connections{pool="explain",state="in_use"}'
+        values: '4x30'
+      - series: 'cogneva_pg_pool_connections{pool="explain",state="max"}'
+        values: '4x30'
+      - series: 'cogneva_pg_pool_connections{pool="users",state="in_use"}'
+        values: '1x30'
+      - series: 'cogneva_pg_pool_connections{pool="users",state="max"}'
+        values: '4x30'
+    alert_rule_test:
+      # `for_seconds: 300` 还没走完：满格两分钟是争用，不是饿死。
+      - eval_time: 2m
+        alertname: pg_pool_connections_saturated
+        exp_alerts: []
+      # 只有 `explain` 这一格：`users` 用了一格、还剩三格，`exp_alerts` 里没有它
+      # 就是断言它没响——同一个绝对数（1 与 4）在两边含义不同，比值才是判据。
+      - eval_time: 10m
+        alertname: pg_pool_connections_saturated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pool: explain
+
+  # 满格十五分钟后腾出一格：同一个窗口里先响后静。这一格守的是「会解」——
+  # 只比比值、不要求继续成立的写法在池子腾空后仍会亮，而亮着一条没人能灭的
+  # 警告，与没有这条规则在读数上是一样的。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_pg_pool_connections{pool="config",state="in_use"}'
+        values: '4x15 1x45'
+      - series: 'cogneva_pg_pool_connections{pool="config",state="max"}'
+        values: '4x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: pg_pool_connections_saturated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              pool: config
+      - eval_time: 30m
+        alertname: pg_pool_connections_saturated
         exp_alerts: []

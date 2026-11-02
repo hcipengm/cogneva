@@ -1196,6 +1196,17 @@ data:
               "face": "持久化存储"
             },
             {
+              "name": "pg_pool_connections_saturated",
+              "promql": "max by (pool) (cogneva_pg_pool_connections{state=\"in_use\"}) / on (pool) max by (pool) (cogneva_pg_pool_connections{state=\"max\"})",
+              "condition": {
+                "greater_than_or_equal": 1.0
+              },
+              "for_seconds": 300,
+              "severity": "warning",
+              "summary": "Pool {pool} has had every connection of its share checked out for five minutes -- {value} of it, where 1 is all of it -- so calls that needed this pool have been waiting out their acquire timeout rather than queueing behind a burst. The ratio is the reading rather than the count: each pool's ceiling is derived at startup from the server's own max_connections divided across the processes and pools that share it, so four connections in use means one thing on a host that gave this pool sixteen and another on one that gave it four, and the budget is the number that moves. The ceiling is rendered on this same series instead of being read from cogneva_pg_pool_max_connections, which carries it too, because that gauge is written through the explain pool into the metric store: a rule that paired the load against it would lose its denominator exactly when the pool it is watching stops answering, which is the moment it is needed. Five minutes is the bound because the acquire timeout is ten seconds -- thirty consecutive windows of nothing free is callers failing, not a burst. Read the idle row beside it: in use below the ceiling with nothing idle is a pool that is not opening connections at all, which points at the server rather than at contention, and is what pg_pool_ceiling_unmeasured describes from the other side when the server's own ceiling was never read. What this rule cannot say is whether the connections come back: a connection held for good and one held for a long request look identical here, and the ownership rules are the ones that name a held lease. Each pod runs its own four pools and the reduction keeps the busiest one, since a pod out of connections serves nobody no matter how idle its siblings are, so repair by naming the pod before the pool. Resolves when the pool frees a connection. A process that stops publishes nothing here, so a stopped replica goes silent rather than stuck -- its own liveness is read elsewhere",
+              "face": "持久化存储"
+            },
+            {
               "name": "governance_ceiling_not_enforced",
               "promql": "(min_over_time((max without (pod, container, instance) (cogneva_governance_drift_fields))[30m:1m]) > 0) and (count_over_time((max without (pod, container, instance) (cogneva_governance_drift_fields))[1h:1m]) > count_over_time((max without (pod, container, instance) (cogneva_governance_drift_fields))[30m:1m]))",
               "condition": {

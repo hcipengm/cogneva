@@ -1202,6 +1202,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "agent_inbox_orphaned_entries",
         "crates/cog-storage/src/inbox_orphan_readings.rs",
     ),
+    // 每个池此刻占了多少连接、空着多少、自己的上限是多少。原先只有上限那一格
+    // 有读数（`cogneva_pg_pool_max_connections`，启动时经指标库写一次），而指标
+    // 库本身经由 `explain` 池落库——池饿死时，写它的那条腿正是先断的那条，所以
+    // 负载必须由进程自己渲染。三格每拍全写：`in_use` 等于 `max` 是「下一个调用者
+    // 要等 acquire 超时」的状态，`idle` 为零而 `in_use` 未满则是池开不出连接。
+    (
+        "cogneva_pg_pool_connections",
+        "crates/cog-storage/src/pool_readings.rs",
+    ),
     // 一个已注册的告警频道为什么发不出去。读的是**配置事实**，不是投递结果：
     // `cogneva_alert_notifications_total` 只在真的投递时动，而 `no_recipients`
     // 描述的正是「永远投不出去」的那一档，它在那个计数器上根本不会出现。三格
