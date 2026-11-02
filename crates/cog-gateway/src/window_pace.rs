@@ -150,9 +150,10 @@ impl RulerMember {
 /// no further, so the admission subtraction is negative for the window's whole
 /// life and the pool admits nothing until the measurement expires — a bound
 /// that cannot be satisfied by waiting, reported in the same words as one that
-/// can. Measured 2026-11-02: the five-hour ruler held 190,982 tokens while one
-/// job drew 348,009 at the 75th percentile, so against a whole-job reserve that
-/// ruler could only ever refuse. A window too small to hold one job is not a
+/// can. Measured 2026-11-02: the five-hour ruler held 190,982 tokens against a
+/// whole-job reserve of 1,099,270 (the 99th percentile of 610 tasks over 30
+/// days), so that ruler could only ever refuse. A window too small to hold one
+/// job is not a
 /// budget this gate can honour at job granularity; it is a wall that will be
 /// hit and re-measured, which is what the refusal path already does.
 ///
