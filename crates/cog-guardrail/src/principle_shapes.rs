@@ -36,9 +36,17 @@
 /// wording of the last correction while missing the next one.
 pub const DEFERRAL_SHAPES: &[&str] = &[
     r"等[^，。；、]{0,10}(你|您|用户)",
-    r"(需要|要|请|由|交给|交由|留给|听)[^，。；、]{0,6}(你|您)",
+    // 否定不是交接. `不要拿你以为的维度` hands nothing over -- it strikes a
+    // premise -- and the bare 要 branch read it as a handover. Excluding one
+    // character in front is narrower than a list of negations that would keep
+    // growing with the corpus; 要 keeps matching after 需, so `需要你确认` is
+    // still a deferral.
+    r"((^|[^不需])要|(^|[^不])需要|请|由|交给|交由|留给|听)[^，。；、]{0,6}(你|您)",
     r"归(你|您|用户)",
-    r"用户(拍|定|判|决定|确认|批准)",
+    // 一条记录不是一次交接. `（经用户确认）` says who decided something that is
+    // already decided; on a decision record that shape is the norm rather than
+    // the exception. Excluding 经 and 已 drops the record and keeps `由用户拍板`.
+    r"(^|[^已经])用户(拍|定|判|决定|确认|批准)",
     r"归.*属主",
     // Three branches rather than one alternation, because the compounds that
     // made this match nouns differ per verb. `属主判据` and `属主判定` name the
@@ -719,6 +727,39 @@ mod tests {
             !deferral_exempt("归属主定。"),
             "an act has to stay unexempted or the exemption eats the rule"
         );
+    }
+
+    /// 否定与记录不是交接: the two branches that read ordinary prose as a
+    /// deferral, pinned beside the acts that must survive the narrowing.
+    ///
+    /// Measured on the host's own planning and design documents on 2026-11-03:
+    /// over 1359 of them four of the five hits were these branches reading a
+    /// state name and a decision record. Each branch narrows on a
+    /// grammatical fact -- a negation, a tense -- and the acts stay beside the
+    /// prose, because narrowing a shape until a corpus is quiet is how a rule
+    /// ends up narrower than the principle it stands for.
+    #[test]
+    fn a_negation_and_a_record_are_not_handovers() {
+        for prose in [
+            "不要拿你以为的维度去读这一行。",
+            "不需要你确认，我自己拍。",
+            "**决策人**：Claude Code（经用户确认）",
+            "已经用户确认过了。",
+        ] {
+            assert_eq!(first_match(prose), None, "not a handover: {prose}");
+        }
+        for act in [
+            "需要你确认之后才能继续。",
+            "这一步要你拍板。",
+            "由用户拍板，我不动。",
+            "用户拍板选项 B。",
+        ] {
+            assert_eq!(
+                first_match(act),
+                Some("DEFERRAL_SHAPES"),
+                "an act must stay caught: {act}"
+            );
+        }
     }
 
     /// A phrase inside quotes is being named, not used, and a striking line is
