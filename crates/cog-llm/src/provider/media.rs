@@ -113,6 +113,14 @@ pub(crate) fn openai_content(blocks: &[ContentBlock], model: &Model) -> Value {
 
 /// Anthropic Messages: content array of `text`, `image` (base64 source), and
 /// `document` (PDF) blocks. Audio/video are not supported and are downgraded.
+///
+/// 一律发块数组，纯文本也不例外。协议允许把「只有一个文本块」写成裸字符串，
+/// 但两种写法在这条协议面上不是可自由互换的：一段对话里某条消息这一次是
+/// 字符串、下一次是块数组，它的字节就变了，而它正落在要复用的前缀里。断点
+/// 随对话前进时，上一条消息的标记被摘掉、形状跟着变回字符串——2026-11-01
+/// 实测的 32 次生成调用里，第 1 次与第 2 次之间唯一的不同就是首条消息从块数组
+/// 变回裸字符串（以及同样的翻转出现在每一次断点后移处），`cached_tokens`
+/// 因此恒为 0。形状固定成一种，断点的来去就只是元数据的来去。
 pub(crate) fn anthropic_content(blocks: &[ContentBlock], model: &Model) -> Value {
     let mut out: Vec<Value> = Vec::new();
     let mut dropped: Vec<&'static str> = Vec::new();
@@ -145,16 +153,14 @@ pub(crate) fn anthropic_content(blocks: &[ContentBlock], model: &Model) -> Value
     }
 
     if !has_media {
-        // No media survived gating: keep the plain-string wire shape, folding
-        // any downgrade note into the text.
+        // No media survived gating: one text block, folding any downgrade note
+        // into the text. Empty content still needs one block — the upstream
+        // rejects an empty content array.
         let mut s = text_of(blocks);
         if !dropped.is_empty() {
             s.push_str(&downgrade_note(&dropped));
         }
-        if s.is_empty() {
-            return json!([{"type": "text", "text": ""}]);
-        }
-        return json!(s);
+        return json!([{"type": "text", "text": s}]);
     }
     if !dropped.is_empty() {
         out.push(json!({"type": "text", "text": downgrade_note(&dropped)}));
@@ -397,7 +403,29 @@ mod tests {
         let vision = model(true, "gpt-4o", ApiType::OpenAICompletions, Provider::OpenAI);
         let v = openai_content(&[ContentBlock::text("hello")], &vision);
         assert_eq!(v, json!("hello"));
-        let a = anthropic_content(&[ContentBlock::text("hello")], &vision);
-        assert_eq!(a, json!("hello"));
+    }
+
+    /// 这条协议面上纯文本永远是块数组。判的是形状不再随断点的来去而变：
+    /// 同一条消息这一次带标记、下一次不带，两次的内容块形状必须一样，
+    /// 否则前缀从它这里起逐字节不同，缓存条目读不回来。
+    #[test]
+    fn anthropic_always_sends_a_text_only_message_as_one_block() {
+        let no_vision = model(false, "k3", ApiType::AnthropicMessages, Provider::Anthropic);
+        let plain = anthropic_content(&[ContentBlock::text("hello")], &no_vision);
+        assert_eq!(plain, json!([{"type": "text", "text": "hello"}]));
+
+        let mut with_media = vec![ContentBlock::text("see this")];
+        with_media.push(ContentBlock::media("BASE64IMG", "image/png"));
+        let downgraded = anthropic_content(&with_media, &no_vision);
+        let arr = downgraded.as_array().expect("array");
+        assert_eq!(arr[0]["type"], json!("text"));
+        assert!(
+            arr[0]["text"].as_str().unwrap().contains("see this"),
+            "文本块原样保留"
+        );
+        assert!(
+            downgraded.to_string().contains("could not be processed"),
+            "被降级的附件要留下一条说明"
+        );
     }
 }

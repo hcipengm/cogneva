@@ -224,26 +224,31 @@ impl AnthropicProvider {
             }
             body["tools"] = json!(tool_defs);
         }
-        // 第三条断点落在**第一条**消息上，不是最后一条。
+        // 两条消息断点：第一条（地板）与最后一条（尾巴）。协议面一共收四个，
+        // 工具与 system 各占一个，这两个正好用满。
         //
-        // 挂在最后一条是按「断点标在历史末尾，下一次整段历史都进缓存」推的，前提是
-        // 上游按语义比对前缀、把标记当元数据。占着这条协议面的那家不是：2026-11-01
-        // 实测同一条生成链的 28 次调用里，第 2 次请求与第 1 次逐条消息逐字节相同
-        // （只多出后续几轮），`cached_tokens` 仍然是 0；而一次几乎逐字重复的调用拿到
-        // 13568。差异只在标记本身——标记是写进消息 content 的字节，它从「上一条」
-        // 移到「这一条」时，上一条的那几个字节就变了，而它们正落在想要复用的前缀里。
-        // 于是每一次调用都把上一次刚写好的缓存作废，命中率永远是 0。
+        // 地板固定不动：整段对话里它始终是同一个位置、同一份字节，所以它上一次
+        // 写下的缓存这一次一定还能读到。哪怕后面几次调用因为别的原因改了前缀
+        // （收尾那条不带工具、system 里的技能清单换了），这一格仍然命中——它保证
+        // 命中率有一个不会掉到零的底。
         //
-        // 固定在第一条上，一个对话里第一次之后的所有请求都只追加、不改写：
-        // 请求 N 的全部消息逐字节是请求 N+1 的前缀，任何实现的前缀缓存都能直接用。
-        // 代价是只到第一条为止（工具 → system → 第一条消息）；这是这几条里唯一
-        // 不随对话增长而移动的位置，也就只有它不会被自己写坏。
+        // 尾巴决定这一次能读到多长，也决定命中率是几个百分点还是接近全量：断点
+        // 落在历史末尾，下一次整段历史连同这一次新写的部分都能从缓存里读回来。
+        // 它看着像「自己把自己写坏」——下一次这条变成倒数第二条，标记被摘掉——但
+        // 摘掉的只是**元数据**，前提是内容块的形状不跟着变。2026-11-01 实测的
+        // 32 次生成调用正是栽在这里：纯文本消息那时发的是裸字符串，标上断点被就地
+        // 折成块数组，下一次摘掉标记又变回字符串，同一条消息的字节因此在两次调用
+        // 之间不同，而它落在要复用的前缀里——28 次调用里 `cached_tokens` 恒为 0。
+        // 形状现在固定成块数组（见 `media::anthropic_content`），断点的来去就只剩
+        // 元数据。
         if let Some(m) = &marker {
-            if let Some(first) = body["messages"]
-                .as_array_mut()
-                .and_then(|arr| arr.first_mut())
-            {
-                mark_content_end(&mut first["content"], m);
+            if let Some(msgs) = body["messages"].as_array_mut() {
+                let last_index = msgs.len().saturating_sub(1);
+                for index in [0usize, last_index] {
+                    if let Some(msg) = msgs.get_mut(index) {
+                        mark_content_end(&mut msg["content"], m);
+                    }
+                }
             }
         }
 
@@ -1009,9 +1014,10 @@ mod tests {
         assert!(body["system"].is_string(), "system 仍是字符串形状");
     }
 
-    /// 要了缓存：三条断点，落在模型实际读到的顺序上（工具 → system → 第一条消息）。
+    /// 要了缓存：四个断点用满，落在模型实际读到的顺序上（工具 → system →
+    /// 第一条消息 → 最后一条消息）。
     #[test]
-    fn a_short_retention_marks_the_last_tool_the_system_and_the_first_message() {
+    fn a_short_retention_marks_the_last_tool_the_system_and_both_ends_of_the_history() {
         let body = body_with(CacheRetention::Short, &conversation());
         let tools = body["tools"].as_array().expect("tools");
         assert!(tools.last().unwrap()["cache_control"].is_object());
@@ -1035,9 +1041,10 @@ mod tests {
             json!({"type": "ephemeral"})
         );
         let tail = msgs.last().unwrap()["content"].as_array().expect("content");
-        assert!(
-            tail.last().unwrap().get("cache_control").is_none(),
-            "最后一条也标了：它会随对话增长而移动，下一次调用就把这条前缀写坏"
+        assert_eq!(
+            tail.last().unwrap()["cache_control"],
+            json!({"type": "ephemeral"}),
+            "最后一条没标：这一次新写进历史的那些字节，下一次调用一条也读不回来"
         );
     }
 
@@ -1071,14 +1078,21 @@ mod tests {
         );
     }
 
-    /// 同一段前缀在两次调用之间必须逐字节相同，否则命中的开销白付。
+    /// 一次调用发出去的东西，下一次调用里必须原样还在——这是前缀缓存的全部
+    /// 前提，也是这套断点唯一要买的东西。
     ///
-    /// 判据是硬的、整份的：后一次请求里，前一次发过的**每一条**消息都要与当时
-    /// 逐字节相同，不只是第一条。断点标在最后一条时这条会红——那条消息在下一次
-    /// 变成倒数第二条，标记被摘掉，字节就变了，而它正落在要复用的前缀里。
+    /// 判据分两层。**内容**是硬的：前一次发过的每一条消息，在后一次里除断点标记
+    /// 之外逐字节相同；形状也要一样，文本消息不能这一次是块数组、下一次是裸字符串
+    /// ——上一次实测的 32 次调用正是栽在这里。**标记**只允许在尾巴上移动：上一条
+    /// 消息摘掉标记属正常（它就是上一次的尾巴），而第一条消息的标记必须一直在，
+    /// 它是命中率的地板。
     #[test]
     fn a_later_turn_rewrites_nothing_the_earlier_turn_sent() {
         let mut msgs = conversation();
+        // 一次调用的最后一条，在真实流量里几乎总是刚追加的那条纯文本 user
+        // 消息（任务的输入、或上一轮的工具结果之后新写的一句）。它正是会被
+        // 标记改写形状的那一条，所以夹具必须以它收尾，否则测不到那次改写。
+        msgs.push(Message::user("and now check the tests"));
         let first = body_with(CacheRetention::Short, &msgs);
         msgs.push(Message::assistant(vec![ContentBlock::text(
             "reading the alert rule",
@@ -1096,9 +1110,37 @@ mod tests {
         );
         for (index, message) in sent.iter().enumerate() {
             assert_eq!(
-                message, &now[index],
-                "第 {index} 条消息在两轮之间被改写：上游按前缀比对时，从这一条起全都重买"
+                without_markers(message),
+                without_markers(&now[index]),
+                "第 {index} 条消息的内容在两轮之间被改写：上游按前缀比对时，从这一条起全都重买"
             );
+        }
+        assert_eq!(
+            sent.first(),
+            now.first(),
+            "第一条连标记一起必须逐字节不变：它是命中率的地板"
+        );
+        assert_ne!(
+            sent.last(),
+            now.get(sent.len() - 1),
+            "上一条消息的标记没摘：断点没跟着历史往前走，尾巴那一段从没进过缓存"
+        );
+    }
+
+    /// 一份 JSON 去掉所有 `cache_control` 之后的形状。断点是元数据，比对内容时
+    /// 它不算——比对时把它也算进去，就等于要求断点永远不动，而那条路走到
+    /// 第一条消息就没了。
+    fn without_markers(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => map
+                .iter()
+                .filter(|(k, _)| k.as_str() != "cache_control")
+                .map(|(k, v)| (k.clone(), without_markers(v)))
+                .collect(),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(without_markers).collect())
+            }
+            other => other.clone(),
         }
     }
 }
