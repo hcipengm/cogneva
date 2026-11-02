@@ -152,7 +152,7 @@ async fn test_critique_parses_llm_json() {
 
     let _loop = SelfReviewLoop::new(SelfReviewConfig::default());
     let obs = SelfReviewLoop::observe("some output");
-    let critique = SelfReviewLoop::critique(&obs, "", "self_review", &provider)
+    let critique = SelfReviewLoop::critique(&obs, "", "self_review", None, &provider)
         .await
         .unwrap();
 
@@ -174,7 +174,7 @@ async fn test_compare_parses_llm_json() {
         strengths: vec!["strength1".into()],
         raw: "raw".into(),
     };
-    let comparison = SelfReviewLoop::compare(&critique, "", &[], "self_review", &provider)
+    let comparison = SelfReviewLoop::compare(&critique, "", &[], "self_review", None, &provider)
         .await
         .unwrap();
 
@@ -413,7 +413,7 @@ async fn test_revise_returns_revised_text() {
         suggestions: vec!["fix it".into()],
         score: 0.3,
     };
-    let revised = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
+    let revised = SelfReviewLoop::revise(&result, "original", "self_review", None, &provider)
         .await
         .unwrap();
 
@@ -438,7 +438,7 @@ async fn test_the_revision_step_is_told_what_to_produce() {
         score: 0.3,
     };
 
-    let _ = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
+    let _ = SelfReviewLoop::revise(&result, "original", "self_review", None, &provider)
         .await
         .unwrap();
 
@@ -463,7 +463,7 @@ async fn test_revise_returns_original_on_pass() {
         score: 1.0,
         summary: "great".into(),
     };
-    let revised = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
+    let revised = SelfReviewLoop::revise(&result, "original", "self_review", None, &provider)
         .await
         .unwrap();
 
@@ -535,7 +535,7 @@ async fn test_revise_keeps_the_original_when_the_upstream_never_answered() {
         score: 0.3,
     };
 
-    let err = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
+    let err = SelfReviewLoop::revise(&result, "original", "self_review", None, &provider)
         .await
         .expect_err("a backend that never answered has no revision to give");
 
@@ -556,7 +556,7 @@ async fn test_revise_keeps_the_original_when_nothing_was_produced() {
         score: 0.3,
     };
 
-    let revised = SelfReviewLoop::revise(&result, "original", "self_review", &provider)
+    let revised = SelfReviewLoop::revise(&result, "original", "self_review", None, &provider)
         .await
         .unwrap();
 
