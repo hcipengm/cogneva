@@ -112,14 +112,56 @@ pub fn watched_targets(
             ));
             continue;
         }
+        // One claim is one volume, so at most one target per claim can exist.
+        // The evolution deployment states its data directory twice on purpose
+        // — once through the claim that feeds this reading, once through the
+        // mount list that the capacity loop reads, and only that list can raise
+        // the declaration — and two targets for it published the same label
+        // set twice per scrape, from two independent walks, so every sample of
+        // one of them was dropped as a duplicate timestamp with a different
+        // value.
+        let claim = volume.claim.trim();
+        let dir = PathBuf::from(volume.path.trim().trim_end_matches('/'));
+        if let Some(seen) = targets.iter().find(|t| t.claim == claim) {
+            if same_dir(&seen.dir, &dir) {
+                continue;
+            }
+            // Two directories under one claim cannot both be published: the
+            // label set is the claim, so the second number would either
+            // overwrite the first or be dropped as a duplicate.
+            rejected.push(format!(
+                "watched volume {claim} at {} is already measured from {}; one claim is one \
+                 volume, so only the first is measured",
+                dir.display(),
+                seen.dir.display()
+            ));
+            continue;
+        }
         targets.push(WatchedTarget {
-            claim: volume.claim.trim().to_string(),
-            dir: PathBuf::from(volume.path.trim().trim_end_matches('/')),
+            claim: claim.to_string(),
+            dir,
             exclude: Vec::new(),
         });
     }
 
     (targets, rejected)
+}
+
+/// Whether two paths name the same directory.
+///
+/// A declaration written as `/a/b/` and one written as `/a/b` are the same
+/// volume; comparing the strings would count them as two.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    fn trimmed(p: &Path) -> &str {
+        let s = p.to_str().unwrap_or("");
+        let s = s.trim_end_matches('/');
+        if s.is_empty() {
+            "/"
+        } else {
+            s
+        }
+    }
+    trimmed(a) == trimmed(b)
 }
 
 /// Give every target the nested mounts its own walk must leave out.
@@ -549,6 +591,63 @@ mod tests {
         assert_eq!(rejected.len(), 2);
         assert!(rejected[0].contains("names no claim"), "{}", rejected[0]);
         assert!(rejected[1].contains("names no path"), "{}", rejected[1]);
+    }
+
+    /// The same volume declared twice is one measurement, not two.
+    ///
+    /// The evolution deployment names its data directory both through the claim
+    /// that feeds this reading and through the mount list the capacity loop
+    /// raises declarations from. Two targets for it published one label set
+    /// twice per scrape from two walks a few kilobytes apart, so Prometheus
+    /// dropped one sample every scrape and the panel showed whichever walk it
+    /// kept.
+    #[test]
+    fn one_claim_and_directory_declared_twice_is_measured_once() {
+        let app = PathBuf::from("/var/lib/cogneva-data");
+        let cfg = watch_cfg(
+            "data-pvc",
+            vec![crate::config::WatchedVolumeConfig {
+                claim: "data-pvc".into(),
+                // 尾斜杠不是第二个目录：同一个挂载点换个写法而已。
+                path: "/var/lib/cogneva-data/".into(),
+            }],
+        );
+
+        let (targets, rejected) = watched_targets(&cfg, &app);
+        assert!(rejected.is_empty(), "{rejected:?}");
+        assert_eq!(
+            targets,
+            vec![WatchedTarget {
+                claim: "data-pvc".into(),
+                dir: app,
+                exclude: Vec::new(),
+            }]
+        );
+    }
+
+    /// Two directories under one claim cannot both be published, so the second
+    /// is refused with its reason instead of quietly overwriting the first —
+    /// or, worse, being dropped by the scraper as a duplicate timestamp.
+    #[test]
+    fn a_second_directory_under_one_claim_is_refused() {
+        let app = PathBuf::from("/var/lib/cogneva-data");
+        let cfg = watch_cfg(
+            "data-pvc",
+            vec![crate::config::WatchedVolumeConfig {
+                claim: "data-pvc".into(),
+                path: "/somewhere/else".into(),
+            }],
+        );
+
+        let (targets, rejected) = watched_targets(&cfg, &app);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].dir, app);
+        assert_eq!(rejected.len(), 1);
+        assert!(
+            rejected[0].contains("already measured from /var/lib/cogneva-data"),
+            "{}",
+            rejected[0]
+        );
     }
 
     #[test]
