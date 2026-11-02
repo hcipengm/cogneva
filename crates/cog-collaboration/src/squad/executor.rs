@@ -562,7 +562,7 @@ impl SquadExecutor {
             pipeline_config.local_repair_max = deps
                 .local_repair_max
                 .unwrap_or(crate::DEFAULT_LOCAL_REPAIR_MAX);
-            let pipeline = archive_generations(PgePipeline::new(pipeline_config), &squad, &deps);
+            let pipeline = archive_generations(PgePipeline::new(pipeline_config), squad, deps);
             return ralph
                 .run_declared_scope(
                     &squad.config.goal,
@@ -653,8 +653,7 @@ impl SquadExecutor {
                 pipeline_config.local_repair_max = deps
                     .local_repair_max
                     .unwrap_or(crate::DEFAULT_LOCAL_REPAIR_MAX);
-                let pipeline =
-                    archive_generations(PgePipeline::new(pipeline_config), &squad, &deps);
+                let pipeline = archive_generations(PgePipeline::new(pipeline_config), squad, deps);
                 match (planner.as_ref(), generator.as_ref(), evaluator.as_ref()) {
                     (Some(p), Some(g), Some(e)) => {
                         let mut planner_actor = PlannerActor::new(Arc::clone(p));

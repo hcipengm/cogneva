@@ -48,6 +48,13 @@ const PRODUCERS: &[(&str, &[&str])] = &[
         "crates/cog-agent/src/self_review.rs",
         &["self_review", "self_review:{role}"],
     ),
+    // The attribution test drives the loop with both shapes and reads the
+    // header the loop put on the request, so it names an actor the same way
+    // the loop does.
+    (
+        "crates/cog-agent/tests/self_review_task_attribution.rs",
+        &["self_review", "self_review:{role}"],
+    ),
     (
         "crates/cog-collaboration/src/collaboration_executor.rs",
         &["intent_assess"],
@@ -106,10 +113,12 @@ const EXCLUDED: &[(&str, &str)] = &[
 ];
 
 /// Declared values that no call site writes directly, and what writes them.
-const NOT_WRITTEN_AT_A_CALL_SITE: &[(&str, &str)] = &[(
-    "self_review",
-    "the default a self-review loop starts with when its caller names no actor",
-)];
+///
+/// Empty as of 2026-11-02: `self_review` was the last entry, and it is written
+/// at a call site now that the review loop stamps its own actor header. The
+/// table stays because the next value a caller stops naming needs a place to
+/// say so with a reason.
+const NOT_WRITTEN_AT_A_CALL_SITE: &[(&str, &str)] = &[];
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Site {

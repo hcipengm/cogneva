@@ -946,16 +946,18 @@ impl GenerationArchive {
             .get("repair_iteration")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let dir = self.generation_dir(generation);
         let path = self.stage_path(generation, repair_iteration);
-        tokio::fs::create_dir_all(&dir).await?;
-        let text = serde_json::to_string_pretty(record)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        // 先写临时文件再改名：读的人可能恰好在写的同时打开这一份，半份
-        // JSON 会被读成「这份信封坏了」，而不是「这份信封还没写完」。
-        let tmp = path.with_extension("json.part");
-        tokio::fs::write(&tmp, text).await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        // 整份替换走 core 里那一条规则：读的人可能恰好在写的同时打开这一份，
+        // 半份 JSON 会被读成「这份信封坏了」而不是「还没写完」，而临时名、改名
+        // 的先后与要不要 fsync 只在那边改一次。读端与写端在同一个内核上（同一
+        // 个卷上的目录），所以不需要抗断电那一档。
+        cog_core::atomic_write::write_json_async(
+            &path,
+            record,
+            cog_core::atomic_write::Durability::SameKernel,
+        )
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
         Ok(path)
     }
 

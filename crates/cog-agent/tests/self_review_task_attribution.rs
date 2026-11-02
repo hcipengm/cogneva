@@ -16,9 +16,12 @@ use cog_core::{
 };
 use std::sync::{Arc, Mutex};
 
+/// 一次调用请求上的两格头，按 `(actor, task)` 的先后记。
+type StampedHeaders = Vec<(Option<String>, Option<String>)>;
+
 /// 记下每一次调用请求上的两格头，并回答一份能通过的评审。
 struct RecordingLlm {
-    seen: Arc<Mutex<Vec<(Option<String>, Option<String>)>>>,
+    seen: Arc<Mutex<StampedHeaders>>,
 }
 
 #[async_trait]
