@@ -1214,6 +1214,7 @@ impl ActionPlanOrchestrator {
                     self.fire_decomposition_alert(
                         cog_core::ALERT_RULE_DECOMPOSITION_ORPHANED,
                         &goal_id,
+                        row.face_id.as_deref(),
                         Some(id.as_str()),
                         attempts_used,
                         Some(&row.input),
@@ -1250,6 +1251,7 @@ impl ActionPlanOrchestrator {
         &self,
         rule: &str,
         goal_id: &str,
+        face: Option<&str>,
         task_id: Option<&str>,
         attempts: u32,
         original_input: Option<&serde_json::Value>,
@@ -1260,7 +1262,7 @@ impl ActionPlanOrchestrator {
         let message = format!(
             "goal {goal_id} task {task_part}: {reason}; self-discovery will re-drive the work via a new intent"
         );
-        let labels = serde_json::json!({
+        let mut labels = serde_json::json!({
             "goal_id": goal_id,
             "parent_task_id": task_id,
             "attempts": attempts,
@@ -1270,6 +1272,13 @@ impl ActionPlanOrchestrator {
                 cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
             ),
         });
+        // 服务哪一面随行落进告警行。归属读数按行问「这一行带没带面、那个面有没有
+        // 人」——没有这一格，一条分解判退就只能读成 `no_face`，谁也说不清该谁动，
+        // 而判退恰恰是「这件事要有人接」的那一类。目标行没指定面时不写这一格：
+        // 空字符串会被读成一个名叫「空」的面，那比缺席更糟。
+        if let Some(face) = face.map(str::trim).filter(|f| !f.is_empty()) {
+            labels[cog_core::ALERT_FACE_LABEL] = serde_json::json!(face);
+        }
         if let Some(sink) = self.alert_sink().await {
             let draft = cog_core::PersistentAlertDraft {
                 rule: rule.to_string(),
@@ -1306,6 +1315,7 @@ impl ActionPlanOrchestrator {
         self.fire_decomposition_alert(
             rule,
             goal_id,
+            tasks.first().and_then(|t| t.face_id.as_deref()),
             tasks.first().map(|t| t.id.as_str()),
             attempts,
             tasks.first().map(|t| &t.input),
@@ -2781,6 +2791,75 @@ mod tests {
         assert!(calls[0].0);
         assert_eq!(calls[0].1, cog_core::ALERT_RULE_DECOMPOSITION_EMPTY);
         assert!(calls[0].2.ends_with(":sig-alert-1"));
+    }
+
+    /// A rejected decomposition carries the face the goal serves, beside the
+    /// goal it came from. Without it the alert row answers only "a goal failed
+    /// to decompose" — the ownership reading labels such a row `no_face`, and
+    /// nothing in the system can say which unit moves. 2026-11-02: two firing
+    /// rows read `decomposition_wbs`/`no_face` for exactly this reason.
+    #[tokio::test]
+    async fn a_rejected_decomposition_alert_names_the_face_the_goal_serves() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-face-on-alert".to_string()));
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let mut original = hint_task("sig-face-1");
+        original.face_id = Some("任务管理".to_string());
+
+        let registry = SkillRegistry::new();
+        planner
+            .process_goal_impl("fix firing alert", vec![original], &registry)
+            .await
+            .expect("exhausted decomposition acks with failed originals");
+
+        let drafts = sink.drafts.lock().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(
+            drafts[0].labels.get(cog_core::ALERT_FACE_LABEL),
+            Some(&serde_json::json!("任务管理")),
+            "labels: {}",
+            drafts[0].labels
+        );
+    }
+
+    /// A goal that serves no face leaves the label off entirely. An empty
+    /// value would be read as a face named "", which is worse than saying the
+    /// row carries none: the reader has a bucket for "no face" and none for
+    /// "a face nobody declared".
+    #[tokio::test]
+    async fn a_rejected_decomposition_alert_leaves_the_face_off_when_there_is_none() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-face-absent".to_string()));
+        let sink: Arc<RecordingAlertSink> = Arc::new(RecordingAlertSink::default());
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![]]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        planner.attach_alert_sink(sink.clone()).await;
+
+        let registry = SkillRegistry::new();
+        planner
+            .process_goal_impl("fix firing alert", vec![hint_task("sig-face-2")], &registry)
+            .await
+            .expect("exhausted decomposition acks with failed originals");
+
+        let drafts = sink.drafts.lock().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert!(
+            drafts[0].labels.get(cog_core::ALERT_FACE_LABEL).is_none(),
+            "labels: {}",
+            drafts[0].labels
+        );
     }
 
     #[tokio::test]
