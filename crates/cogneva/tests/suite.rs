@@ -327,6 +327,8 @@ mod probe_paths_are_routes_the_container_serves_test;
 mod process_report_path_contract_test;
 #[path = "project_contract.rs"]
 mod project_contract;
+#[path = "promotion_eval_row_is_dispatchable_contract_test.rs"]
+mod promotion_eval_row_is_dispatchable_contract_test;
 #[path = "publish_paths_share_one_wiring_ledger.rs"]
 mod publish_paths_share_one_wiring_ledger;
 #[path = "raw_stream_words_are_words_both_sides_write_test.rs"]

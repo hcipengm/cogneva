@@ -12,6 +12,7 @@
 //! 停摆，不代表另一个站点也在动。
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -371,7 +372,6 @@ impl PromotionEval {
             self.report(&outcome).await;
             return outcome;
         };
-        let task_id = format!("promotion-eval-{}", sanitize_ref(change_id));
         let goal = format!(
             "Run the fixed evaluation suite twice to check whether change `{change_id}` \
              (commit {rev}) improves or regresses behavior against its parent commit.\n\n\
@@ -391,18 +391,7 @@ impl PromotionEval {
             repo = source.repo.display(),
             rev = source.rev,
         );
-        let mut task = Task::new(
-            task_id.clone(),
-            TaskType::Custom("promotion_eval".into()),
-            serde_json::json!({
-                (cog_core::INPUT_EVOLUTION_MODE): "promotion",
-                (cog_core::INPUT_TASK_KIND): "promotion_eval",
-                "change_id": change_id,
-                "rev": source.rev,
-                "repo": source.repo.display().to_string(),
-            }),
-        );
-        task.timeout_seconds = self.timeout_secs;
+        let mut task = promotion_eval_task(change_id, &source.rev, &source.repo, self.timeout_secs);
         task.action_planner_meta = Some(verified_meta(
             "Promotion eval A/B; route to the sandbox evolution agent",
         ));
@@ -450,6 +439,47 @@ impl PromotionEval {
 
 /// 提交任务给主流程并轮询至终态。`Completed` 返回任务本身（带 result），
 /// `Failed`/`Cancelled`/超时返回原因文本。移植侧与晋升侧共用这一份提交等待。
+/// The row whose run is this change's A/B, as filed.
+///
+/// Public so a contract test can put it in front of the dispatcher's own
+/// question. The row has to state what would close it: a work package that does
+/// not is never started (`ready_queue::is_dispatchable_work`), which keeps it
+/// safely pending and visible on the board — and also means this gate never
+/// runs while its outcome keeps reading `Unavailable`, the same word written
+/// when the gate was never asked at all. Two very different facts, one cell.
+pub fn promotion_eval_task(change_id: &str, rev: &str, repo: &Path, timeout_secs: u64) -> Task {
+    let mut task = Task::new(
+        format!("promotion-eval-{}", sanitize_ref(change_id)),
+        TaskType::Custom("promotion_eval".into()),
+        serde_json::json!({
+            (cog_core::INPUT_EVOLUTION_MODE): "promotion",
+            (cog_core::INPUT_TASK_KIND): "promotion_eval",
+            "change_id": change_id,
+            "rev": rev,
+            "repo": repo.display().to_string(),
+        }),
+    );
+    task.timeout_seconds = timeout_secs;
+    task.acceptance
+        .push(promotion_eval_acceptance(change_id, rev));
+    task
+}
+
+/// What closes one promotion-eval row.
+///
+/// The requirement belongs to the change, not to this run: it is met when the
+/// answer is on the record in a shape the gate can read back — both sides of the
+/// A/B, or a stated `applicable: false`. A run that ends having said neither
+/// leaves the gate with nothing to judge, and a row read by status cannot tell
+/// that apart from a change that was never measured.
+pub fn promotion_eval_acceptance(change_id: &str, rev: &str) -> String {
+    format!(
+        "变更 {change_id} 在 {rev} 上的 A/B 结局落成一条可取的判决：交回来的 JSON 里 \
+         applicable=false 时写清这个组件没有可跑的固定评测集，否则 before 与 after 各是一组\
+         带 task_id 与 success 的用例记录——而不是这次运行自己报完成"
+    )
+}
+
 pub(crate) async fn submit_and_wait(
     orch: &Arc<dyn OrchestratorControl>,
     poll_interval_secs: u64,
