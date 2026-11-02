@@ -2051,6 +2051,18 @@ struct AppState {
     pool_down: Arc<AtomicBool>,
     /// 自上次池判定以来是否出现过上游实证成功（清除 `pool_down` 的唯一凭据）。
     pool_recovered: Arc<AtomicBool>,
+    /// 告警那一面的锁存，与 `pool_down` 分开：它判的不是"准入开没开"，而是"这一池
+    /// 还承接过活没有"。
+    ///
+    /// 准入锁存必须能被探测放开，否则是死锁——池锁着的时候 LLM 依赖型任务全停，
+    /// 没有真实请求来实证恢复。可一次 ping 通了只放开了"再试一次"的资格：下一条
+    /// 真实请求几秒后再被拒，准入锁存当场又被顶回去。告警跟着准入锁存走，就把一次
+    /// 持续数天的断供记成每十分钟一个"事件"，每行都写着"池已恢复、任务自动继续"
+    /// 而实际上从没继续过。解除它的只有真活被承接，见 `pool_alert_verdict`。
+    pool_alert_down: Arc<AtomicBool>,
+    /// 自上次池判定以来是否有**一件真实的活**被承接。探测 ping 不算：它只证明这家
+    /// 还肯回一个 token。这一格只喂 [`pool_alert_verdict`]，不参与准入判定。
+    pool_served_job: Arc<AtomicBool>,
     /// 最近一次**真实请求**被判失败的时刻（unix 秒），0 = 本进程还没见过。
     ///
     /// 与探测的结果分开记，因为两者的证据强度不同：一条 `max_tokens: 1` 的 ping
@@ -2113,6 +2125,9 @@ impl AppState {
     /// 否则池判定只能靠窗口到期推断恢复——而那只是"可以再试"，不是恢复。
     fn note_upstream_success(&self, u: &LlmUpstream) -> bool {
         self.pool_recovered.store(true, Ordering::SeqCst);
+        // 这一格只由这条路径置位：它是"一件活被承接了"的唯一凭据，探测那条路
+        // （`note_probe_success`）再怎么通也不许置它，见 `pool_alert_verdict`。
+        self.pool_served_job.store(true, Ordering::SeqCst);
         self.llm_health.note_success(u, true)
     }
 
@@ -4454,6 +4469,22 @@ fn pool_event_dedup_key(rule: &str, down: bool, open_key: Option<&str>, now_unix
 /// 任何一处替它申报面。
 const POOL_ALERT_FACE: &str = "token 管理";
 
+/// 告警锁存的下一步。
+///
+/// 置位与准入锁存同源（观测到低于下限），解除却不同源：只有**一件真实的活被承接**
+/// 才算恢复。开路的那把钥匙是探测通不通，可它通不等于它接得住——那只是"可以再试
+/// 一次"。把两者合回一条锁存，一次持续数天的断供就会被准入的试探切成每十分钟一行
+/// 的"事件"，而每一行的 `fired_at` 都在替一次从没发生过的恢复作证。
+fn pool_alert_verdict(below_floor: bool, served_a_job: bool, latched: bool) -> bool {
+    if below_floor {
+        true
+    } else if served_a_job {
+        false
+    } else {
+        latched
+    }
+}
+
 /// 池告警这一行的存库标签。
 ///
 /// 面在键算完之后才加，也不进 `pool_event_dedup_key`：换个人负责，发生的事一个字节
@@ -5261,6 +5292,25 @@ async fn refresh_pool_state(state: &AppState) {
     } else {
         state.pool_down.load(Ordering::SeqCst)
     };
+    // 告警判的是另一件事，用另一条锁存：**这一池还承接过活没有**。
+    //
+    // 准入锁存必须能被探测放开，否则就是死锁——池锁着的那些分钟里 LLM 依赖型
+    // 任务全停，一条真实请求都没有，没有人能实证恢复。可一次 `max_tokens: 1` 的
+    // ping 通了只说明"可以再试一次"：放开准入后的第一条真实请求几秒后再被拒，
+    // 准入锁存当场被顶回去。告警跟着准入锁存走，就把一次持续数天的断供记成每十
+    // 分钟一个"事件"，每一行都写着"池已恢复、任务自动继续"而实际上从没继续过。
+    // 2026-11-02 实测：08:11:35 探测复通 → 08:12:05 告警 resolved → 08:12:57 真实
+    // 请求 429 → 08:13:06 又 firing，一小时八行。
+    //
+    // 所以告警只在**一件真实的活被承接**时解除；探测放开准入不解除它。两者不同向
+    // 时是常态而非矛盾：准入开着而告警仍是一个未结案的断供，读数面说的就是这个。
+    let served_a_job = state.pool_served_job.swap(false, Ordering::SeqCst);
+    let alert_down = pool_alert_verdict(
+        below_floor,
+        served_a_job,
+        state.pool_alert_down.load(Ordering::SeqCst),
+    );
+    state.pool_alert_down.store(alert_down, Ordering::SeqCst);
     let bounds = state.llm_health.recovery_bounds(upstreams);
     let readings = state.llm_health.snapshot(upstreams);
 
@@ -5544,6 +5594,14 @@ async fn refresh_pool_state(state: &AppState) {
                 upstreams = ?upstreams.iter().map(LlmHealthTable::key).collect::<Vec<_>>(),
                 "LLM 上游池可用数低于冗余下限，进入熔断；LLM 依赖型任务应暂停，需补充可联通的上游"
             );
+        } else if alert_down {
+            // 探测放开的这一格不是恢复：准入先开，让一条真实请求去试，试成了才
+            // 算数。说成"熔断解除"就是替一次还没发生的承接作证。
+            tracing::info!(
+                serving,
+                floor,
+                "LLM 上游池准入锁存已解除（探测复通），等一条真实调用实证；告警按未承接保持"
+            );
         } else {
             tracing::info!(
                 serving,
@@ -5557,7 +5615,7 @@ async fn refresh_pool_state(state: &AppState) {
     // 新进程起来时池已是好的、看不到任何边沿，只靠边沿触发就会让那条 firing
     // 永久留在 PG 里，恢复事实再也写不回去。set_alert 幂等（先读 PG 现态再决定
     // 是否迁移），所以每拍调用只是让它成为池状态的投影。
-    sync_pool_alert(state, down).await;
+    sync_pool_alert(state, alert_down).await;
 }
 
 /// 对"健康但某项能力判定未知"的上游补问一次，让那三问有回去问的路。
@@ -9562,6 +9620,10 @@ async fn seed_pool_verdict_from_signal(state: &AppState) -> bool {
     }
     if seed_pool_down(status.as_ref()) {
         state.pool_down.store(true, Ordering::SeqCst);
+        // 告警那一面的锁存同样沿用：它比准入锁存更难解除，起手就落成 false 会让
+        // 新进程第一拍按"没有承接证据"把 PG 里那条 firing 关掉——一次滚动就替
+        // 一次还没结束的断供写了一条恢复记录。
+        state.pool_alert_down.store(true, Ordering::SeqCst);
         // 一起落下"最后一次被拒是什么时候"。这一格回答的是"刚才有没有人真的被拒"，
         // 而一个继承来的锁存说的正是"上一任进程看到的最后一次是拒绝"。不落它，
         // 新进程里它是 0 = 本进程还没见过拒绝，重启后第一拍探测的 200 就会被当成
@@ -9677,6 +9739,8 @@ pub async fn run(
         owner_budget,
         pool_down: Arc::new(AtomicBool::new(false)),
         pool_recovered: Arc::new(AtomicBool::new(false)),
+        pool_alert_down: Arc::new(AtomicBool::new(false)),
+        pool_served_job: Arc::new(AtomicBool::new(false)),
         last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pool_seeded: Arc::new(AtomicBool::new(false)),
         window_pace: Arc::new(std::sync::Mutex::new(WindowPaceReading::default())),
@@ -12813,6 +12877,110 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(!state.pool_down.load(Ordering::SeqCst));
     }
 
+    /// 探测放开的只是准入，告警不许跟着说"已恢复"。
+    ///
+    /// 池锁着的时候 LLM 依赖型任务全停，真实请求一条都没有——"探测窗内没有真实
+    /// 请求被拒"正是锁存自己造成的，它证明不了这一家接得住一件活。实测的形状是
+    /// 同一家上游的 ping 每五分钟通一次、真实请求一秒后 429：按 ping 解告警，
+    /// 一次持续数天的断供就被切成每十分钟一条"事件"，每条都替一次从没发生过的
+    /// 恢复作证。真实承接成功才是告警的解除凭据。
+    #[tokio::test]
+    async fn a_probe_pass_opens_admission_without_claiming_the_pool_recovered() {
+        use cog_core::{AlertTransition, PersistentAlertDraft, PersistentAlertSink};
+
+        /// 只记下每次对账的 (condition, message)，判据落在实际写进告警面的那一格上，
+        /// 而不是进程内的某个字段——字段对、调用点仍旧传错也是要拦的坏法。
+        #[derive(Default)]
+        struct RecordingSink {
+            calls: std::sync::Mutex<Vec<(bool, String)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl PersistentAlertSink for RecordingSink {
+            async fn set_persistent_alert(
+                &self,
+                condition: bool,
+                draft: &PersistentAlertDraft,
+            ) -> Result<AlertTransition, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push((condition, draft.message.clone()));
+                Ok(if condition {
+                    AlertTransition::Fired
+                } else {
+                    AlertTransition::Resolved
+                })
+            }
+            async fn firing_key_for_rule(&self, _rule: &str) -> Result<Option<String>, String> {
+                Ok(Some("llm_upstream_pool_down@1".into()))
+            }
+            async fn list_active_persistent_alerts(
+                &self,
+                _rule_prefix: &str,
+                _limit: i64,
+            ) -> Vec<cog_core::PersistedAlert> {
+                Vec::new()
+            }
+        }
+
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let u = stub_upstream("https://a.example.com", "m1");
+        let sink = Arc::new(RecordingSink::default());
+        state.pool_obs = Arc::new(PoolObservability {
+            metrics: state.pool_obs.metrics.clone(),
+            analytics: None,
+            alerts: Some(sink.clone()),
+            usage: None,
+            usage_write_health: state.pool_obs.usage_write_health.clone(),
+            durable: None,
+        });
+
+        state
+            .llm_health
+            .note_failure(&u, 300, Some(Utc::now().timestamp() + 600), None, None);
+        refresh_pool_state(&state).await;
+        assert!(state.pool_down.load(Ordering::SeqCst));
+        assert!(state.pool_alert_down.load(Ordering::SeqCst));
+        assert_eq!(
+            sink.calls.lock().unwrap().last().map(|c| c.0),
+            Some(true),
+            "低于下限要开一行"
+        );
+
+        // 探测复通：准入解开（不放开就是死锁，没人能再试），告警不解。
+        assert!(
+            state.note_probe_success(&u),
+            "探测窗内没有真实请求、ping 通了，这一格按设计算恢复凭据"
+        );
+        refresh_pool_state(&state).await;
+        assert!(
+            !state.pool_down.load(Ordering::SeqCst),
+            "准入锁存要放开，让一条真实请求去试"
+        );
+        assert!(
+            state.pool_alert_down.load(Ordering::SeqCst),
+            "ping 通了不是承接证据，告警不许替一次没发生的恢复关闭"
+        );
+        assert_eq!(
+            sink.calls.lock().unwrap().last().map(|c| c.0),
+            Some(true),
+            "准入被探测放开的那一拍，对告警面的对账必须仍是 firing；\
+             否则一次断供会被切成每十分钟一行，每行都声称已恢复：{:?}",
+            sink.calls.lock().unwrap()
+        );
+
+        // 一件真实的活被承接，这时才是恢复。
+        state.note_upstream_success(&u);
+        refresh_pool_state(&state).await;
+        assert!(!state.pool_alert_down.load(Ordering::SeqCst));
+        assert_eq!(
+            sink.calls.lock().unwrap().last().map(|c| c.0),
+            Some(false),
+            "真实承接成功之后才关这一行"
+        );
+    }
+
     /// 池判定量的是**容量**，判据是声明的冗余下限；没声明时回落到「一家都不供」。
     ///
     /// 两向都要钉住。收紧那一向（声明 2 家、只供 1 家 ⇒ 不可用）是这条改动本身；
@@ -15569,6 +15737,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             owner_budget: None,
             pool_down: Arc::new(AtomicBool::new(false)),
             pool_recovered: Arc::new(AtomicBool::new(false)),
+            pool_alert_down: Arc::new(AtomicBool::new(false)),
+            pool_served_job: Arc::new(AtomicBool::new(false)),
             last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pool_seeded: Arc::new(AtomicBool::new(true)),
             window_pace: Arc::new(std::sync::Mutex::new(WindowPaceReading::default())),
