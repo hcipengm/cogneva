@@ -4321,18 +4321,74 @@ fn with_database(url: &str, database: &str) -> String {
 
 /// 临时库上一条挂着不走、这一次清不掉的连接。
 ///
-/// 只记判断要用到的三格：是不是这条连接有权发信号、以及报给人看时能指名道姓的
-/// 用户与状态。
+/// 只记判断要用到的几格：是不是这条连接有权发信号、是不是库自己的后台进程、
+/// 以及报给人看时能指名道姓的用户与状态。
+#[derive(Clone)]
 struct ScratchBackend {
     pid: i32,
     user: String,
     state: String,
     signalable: bool,
+    /// 没有 `usename` 的后台进程：自动清理、并行 worker 一类。它们不归任何角色
+    /// 管，`pg_terminate_backend` 与 `DROP DATABASE … WITH (FORCE)` 对它们发信号
+    /// 都只会得到 `permission denied`，但它们**本来就会自己结束**——刚灌完几十
+    /// 张表的演练库上，自动清理几乎一定会在这时正在跑。
+    background: bool,
 }
 
 impl ScratchBackend {
     fn describe(&self) -> String {
         format!("pid={} user={} state={}", self.pid, self.user, self.state)
+    }
+}
+
+/// 后台进程最多等多久：36 次 × 5 秒 ＝ 三分钟。
+///
+/// 实测 2026-11-02 06:46:48：一趟演练全部比对通过，收尾时 `cog_drill` 上只有
+/// 一个 `user=(后台进程)` 的 pid，`DROP … WITH (FORCE)` 报 `permission denied to
+/// terminate process`，于是库没删掉；紧接着 06:46:49 开跑的第二趟在第一句
+/// 「先删上一趟的残库」上就判了「这一趟没有开工」，一趟好包被读成不可恢复。
+/// 那个后台进程是库自己的自动清理——刚灌进去几十张表的库上它几乎一定在跑，而
+/// 它会自己收工。等服务端把自家的活干完，比报一个不由任何人控制的错误更接近事实。
+///
+/// 三分钟是按「大表自动清理不一定几秒就完」留的余量：一趟演练的预算是 3600 秒，
+/// 收尾与预清理各最多等这么久，加起来仍是一个零头，而「上一趟的库清不掉、这一趟
+/// 不开工」是整趟演练白跑。界是有的，不会无限等一个挂着不放的后台进程。
+const BACKGROUND_DRAIN_ATTEMPTS: u32 = 36;
+const BACKGROUND_DRAIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// 这一批剩下的连接里，还有没有值得再试一轮的。
+///
+/// 后台进程会自己走，同角色的连接下一轮会被掐掉，两种都值得等。别的角色的
+/// 会话既掐不动也不会自己走——继续等只是把同一句错误推迟三分钟。
+fn can_still_drain(left: &[ScratchBackend]) -> bool {
+    !left.is_empty() && left.iter().all(|b| b.background || b.signalable)
+}
+
+/// `DROP DATABASE` 失败之后括号里那句话。
+fn leftovers_text(left: &[ScratchBackend], waited: Duration) -> String {
+    if left.is_empty() {
+        return "此刻没有别的连接".to_string();
+    }
+    let list = left
+        .iter()
+        .map(ScratchBackend::describe)
+        .collect::<Vec<_>>()
+        .join("；");
+    if left.iter().all(|b| b.background) {
+        // 等过就说等过：否则读的人会以为程序一次都没试，下次还去查「为什么没权限」。
+        format!(
+            "还挂着：{list}（这些是库自己的后台进程，不由当前角色控制，会自己断开；\
+             等到 {} 秒仍未断开）",
+            waited.as_secs()
+        )
+    } else if left.iter().all(|b| !b.signalable) {
+        // 全都不由当前角色控制时，`WITH (FORCE)` 自己的报错也是一句权限错误：
+        // 读的人会去查「为什么我没有权限删这个库」，而真相是「库删不了是因为
+        // 别人还连在上面，只能等它自己断」。把结论写在括号里，别让他去猜。
+        format!("还挂着：{list}（这些连接不由当前角色控制，只能等它们自己断开）")
+    } else {
+        format!("还挂着：{list}")
     }
 }
 
@@ -4355,50 +4411,53 @@ impl ScratchBackend {
 /// 库名由调用方给：这条路径对「一次性数据库」通用，演练只是它的一个调用者，
 /// 而测试必须能用一个自己的库名跑，不能去动服务端上真在用的那个。
 pub async fn drop_scratch_database(live: &PgPool, database: &str) -> Result<(), String> {
-    let backends = backends_on(live, database).await?;
-    for backend in backends.iter().filter(|b| b.signalable) {
-        if let Err(e) = sqlx::query("SELECT pg_terminate_backend($1)")
-            .bind(backend.pid)
-            .execute(live)
-            .await
+    let mut waited = Duration::ZERO;
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let backends = backends_on(live, database).await?;
+        for backend in backends.iter().filter(|b| b.signalable) {
+            if let Err(e) = sqlx::query("SELECT pg_terminate_backend($1)")
+                .bind(backend.pid)
+                .execute(live)
+                .await
+            {
+                // 挑过权限之后仍可能失败（进程刚退出、语句正处在不可中断的段里）。
+                // 那几种都由下面那一问回答，不需要在这里提前收场。
+                tracing::warn!(pid = backend.pid, error = %e, "演练库上的连接没掐掉");
+            }
+        }
+        // `WITH (FORCE)` 收掉掐信号与 DROP 之间新冒出来的同角色连接：两步之间池子
+        // 的后台关闭正好落地时，就是这一步差。它挡不住别的角色的连接，也挡不住
+        // 库自己的后台进程——前一档由上面那次筛选和下面这句错误文本回答，后一档
+        // 只能等（见 `BACKGROUND_DRAIN_ATTEMPTS`）。
+        match sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            quoted_identifier(database)
+        ))
+        .execute(live)
+        .await
         {
-            // 挑过权限之后仍可能失败（进程刚退出、语句正处在不可中断的段里）。
-            // 那几种都由下面那一问回答，不需要在这里提前收场。
-            tracing::warn!(pid = backend.pid, error = %e, "演练库上的连接没掐掉");
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let left = backends_on(live, database).await.unwrap_or_default();
+                if !can_still_drain(&left) || attempt >= BACKGROUND_DRAIN_ATTEMPTS {
+                    return Err(format!(
+                        "删不掉 {database}：{e}（{}）",
+                        leftovers_text(&left, waited)
+                    ));
+                }
+                tracing::info!(
+                    database,
+                    holders = left.len(),
+                    waited_seconds = waited.as_secs(),
+                    "演练库上还挂着会自己走的进程，等它们走完再删"
+                );
+                tokio::time::sleep(BACKGROUND_DRAIN_INTERVAL).await;
+                waited += BACKGROUND_DRAIN_INTERVAL;
+            }
         }
     }
-    // `WITH (FORCE)` 收掉掐信号与 DROP 之间新冒出来的同角色连接：两步之间池子
-    // 的后台关闭正好落地时，就是这一步差。它挡不住别的角色的连接——那一档要
-    // 由上面那次筛选和下面这句错误文本回答。
-    if let Err(e) = sqlx::query(&format!(
-        "DROP DATABASE IF EXISTS {} WITH (FORCE)",
-        quoted_identifier(database)
-    ))
-    .execute(live)
-    .await
-    {
-        let left = backends_on(live, database).await.unwrap_or_default();
-        let who = if left.is_empty() {
-            "此刻没有别的连接".to_string()
-        } else {
-            // 全都不由当前角色控制时，`WITH (FORCE)` 自己的报错也是一句权限错误：
-            // 读的人会去查「为什么我没有权限删这个库」，而真相是「库删不了是因为
-            // 别人还连在上面，只能等它自己断」。把结论写在括号里，别让他去猜。
-            let all_foreign = left.iter().all(|b| !b.signalable);
-            let list = left
-                .iter()
-                .map(ScratchBackend::describe)
-                .collect::<Vec<_>>()
-                .join("；");
-            if all_foreign {
-                format!("还挂着：{list}（这些连接不由当前角色控制，只能等它们自己断开）")
-            } else {
-                format!("还挂着：{list}")
-            }
-        };
-        return Err(format!("删不掉 {database}：{e}（{who}）"));
-    }
-    Ok(())
 }
 
 /// 库名进 SQL 时按标识符引用。
@@ -4442,13 +4501,17 @@ async fn backends_on(live: &PgPool, database: &str) -> Result<Vec<ScratchBackend
     .map_err(|e| format!("读不到 {database} 上的连接：{e}"))?;
     Ok(rows
         .into_iter()
-        .map(|(pid, user, state, signalable)| ScratchBackend {
-            pid,
-            user: user
-                .filter(|u| !u.is_empty())
-                .unwrap_or_else(|| "(后台进程)".to_string()),
-            state: state.unwrap_or_else(|| "-".to_string()),
-            signalable,
+        .map(|(pid, user, state, signalable)| {
+            let background = user.as_deref().is_none_or(str::is_empty);
+            ScratchBackend {
+                pid,
+                user: user
+                    .filter(|u| !u.is_empty())
+                    .unwrap_or_else(|| "(后台进程)".to_string()),
+                state: state.unwrap_or_else(|| "-".to_string()),
+                signalable,
+                background,
+            }
         })
         .collect())
 }
@@ -5436,6 +5499,51 @@ mod tests {
         assert_eq!(
             truncate_statement(&["a.b".to_string()]),
             "TRUNCATE \"a.b\" RESTART IDENTITY CASCADE"
+        );
+    }
+
+    fn backend(pid: i32, user: &str, signalable: bool, background: bool) -> ScratchBackend {
+        ScratchBackend {
+            pid,
+            user: user.to_string(),
+            state: "idle".to_string(),
+            signalable,
+            background,
+        }
+    }
+
+    /// 收尾时还挂着谁，决定了「等」还是「报」。
+    ///
+    /// 库自己的后台进程（没有换过角色的自动清理、并行 worker）会自己走完，等它
+    /// 比报一句 `permission denied` 更接近事实；别的角色的会话既掐不动也不会自己
+    /// 走，等它只是把同一句错误推迟一分钟。把这两类混成一类，收尾要么永远删不掉
+    /// 一个正常库，要么对一个删不掉的库空转一分钟。
+    #[test]
+    fn a_background_process_is_waited_for_but_a_foreign_session_is_not() {
+        let background = backend(1, "(后台进程)", false, true);
+        let foreign = backend(2, "other_superuser", false, false);
+        let mine = backend(3, "cog_backup", true, false);
+
+        assert!(can_still_drain(std::slice::from_ref(&background)));
+        assert!(can_still_drain(&[mine, background.clone()]));
+        assert!(
+            !can_still_drain(std::slice::from_ref(&foreign)),
+            "别人角色挂着时，等一分钟也等不走它"
+        );
+        assert!(
+            !can_still_drain(&[]),
+            "没有连接还删不掉，就不是等能解决的问题"
+        );
+
+        let waited = leftovers_text(std::slice::from_ref(&background), Duration::from_secs(55));
+        assert!(
+            waited.contains("后台进程") && waited.contains("55"),
+            "等过就要说等过多久，否则读的人以为一次都没试：{waited}"
+        );
+        let foreign_text = leftovers_text(&[foreign], Duration::ZERO);
+        assert!(
+            foreign_text.contains("other_superuser") && foreign_text.contains("不由当前角色控制"),
+            "别的角色的连接要按名字点出来，并给出结论：{foreign_text}"
         );
     }
 
