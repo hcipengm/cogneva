@@ -6977,13 +6977,18 @@ fn a_rule_name_has_one_writer_or_the_second_one_is_declared() {
 
 /// `rule:` 那一格读不出名字的写点，逐条交代。
 ///
-/// 两处都是「恢复」那一半：名字是从 dedup key 里反解出来或从入参透传的，静态读不到。
-/// 它们与自己的开行写点用同一个名字（`decomposition_orphaned`），所以不是第二个写者；
-/// 列在这里是为了让**新增**的动态写点红，而不是因为这两处需要人守。
+/// 三处都是「恢复」那一半：名字是从 dedup key 里反解出来、从入参透传的，或从别处读回来的，
+/// 静态读不到。它们与自己的开行写点用同一个名字（`decomposition_orphaned`、以及被关掉的那
+/// 一行自己的名字），所以不是第二个写者；列在这里是为了让**新增**的动态写点红，而不是因为
+/// 这几处需要人守。
 const UNRESOLVED_DRAFT_WRITERS: &[(&str, &str)] = &[
     (
         "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs",
         "rule.to_string()",
+    ),
+    (
+        "crates/cog-orchestrator/src/action_planner/action_plan_orchestrator.rs",
+        "row.rule",
     ),
     ("crates/cog-orchestrator/src/dag_executor/mod.rs", "rule"),
 ];
