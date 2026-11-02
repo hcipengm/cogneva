@@ -110,7 +110,7 @@ pub struct PgePipeline {
     archive: Option<GenerationArchive>,
 }
 
-/// Where every generation envelope is written the moment it exists.
+/// Where each generation of a task is written down as it is produced.
 ///
 /// The diff a generator produces is the only part of a run that cannot be
 /// bought again for nothing: the plan, the evaluation and the repair feedback
@@ -120,16 +120,18 @@ pub struct PgePipeline {
 /// thrown away by the next inference call that fails — the run returns an
 /// error and the diff, complete and buildable, is dropped with it.
 ///
-/// Everything the envelope needs is on the persistent volume the change queue
-/// already uses, so the bytes survive the process as well as the run.
+/// One directory per `(task, generation)`, one file per stage inside it. The
+/// file is rewritten as each stage completes, so a reader always finds the
+/// furthest point this generation reached without having to ask the process
+/// that wrote it — and the next pass over the same task starts from there
+/// instead of buying the same bytes again.
+///
+/// Everything it needs is on the persistent volume the change queue already
+/// uses, so the bytes survive the process as well as the run.
 #[derive(Debug, Clone)]
 pub struct GenerationArchive {
     dir: std::path::PathBuf,
     task_id: String,
-    /// 本次运行的标识，落成目录名。同一个任务会被外层循环反复重跑，每次都会从
-    /// 第 1 轮重新计数；不带运行标识时，后一次运行的 a1-r0 覆盖前一次那一份，
-    /// 而被覆盖的正是「上一轮唯一那份完整 diff」。
-    run: String,
 }
 
 /// Where an attempt's plan comes from.
@@ -139,6 +141,7 @@ pub struct GenerationArchive {
 /// is stated by the request and has no upstream to reach. Carrying both in one
 /// `Option` would make "no planner and no declaration" representable, and every
 /// reader would then have to decide for itself what that means.
+#[derive(Clone, Copy)]
 pub enum PlanScope<'a> {
     /// A planner agent writes the plan, once per attempt.
     Planned(&'a PlannerActor),
@@ -202,15 +205,9 @@ impl PgePipeline {
         dir: impl Into<std::path::PathBuf>,
         task_id: impl Into<String>,
     ) -> Self {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
         self.archive = Some(GenerationArchive {
             dir: dir.into(),
             task_id: task_id.into(),
-            run: format!("{millis:013}"),
         });
         self
     }
@@ -222,8 +219,10 @@ impl PgePipeline {
     /// 否则「以为存了」与「存了」在任何读数上都没有分别。
     async fn archive_generation(
         &self,
+        task: &cog_core::Task,
         attempt: u32,
         repair_iteration: u32,
+        plan: &PlannerOutput,
         generation: &GeneratorOutput,
     ) {
         let Some(archive) = self.archive.as_ref() else {
@@ -234,46 +233,107 @@ impl PgePipeline {
         if generation.artifacts.is_empty() {
             return;
         }
-        let task_dir = archive.dir.join(sanitize_path_component(&archive.task_id));
-        let run_dir = task_dir.join(&archive.run);
-        let path = run_dir.join(format!("a{attempt}-r{repair_iteration}.json"));
-        let envelope = serde_json::json!({
-            "task_id": archive.task_id,
-            "attempt": attempt,
-            "repair_iteration": repair_iteration,
-            "generation": generation,
-        });
-        let written = async {
-            tokio::fs::create_dir_all(&run_dir).await?;
-            let text = serde_json::to_string_pretty(&envelope)
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
-            // 先写临时文件再改名：读的人可能恰好在写的同时打开这一份，半份
-            // JSON 会被读成「这份信封坏了」，而不是「这份信封还没写完」。
-            let tmp = run_dir.join(format!("a{attempt}-r{repair_iteration}.json.part"));
-            tokio::fs::write(&tmp, text).await?;
-            tokio::fs::rename(&tmp, &path).await
-        }
-        .await;
-        match written {
-            Ok(()) => {
-                tracing::info!(
-                    task_id = %archive.task_id,
-                    attempt,
-                    repair_iteration,
-                    path = %path.display(),
-                    "Generation envelope archived before it could be lost with the run"
-                );
-                prune_superseded_runs(&task_dir, &archive.run).await;
-            }
-            Err(e) => tracing::warn!(
+        let record = |evaluation: Option<&EvaluationResult>, stage: &str| {
+            serde_json::json!({
+                "task_id": archive.task_id,
+                "attempt": attempt,
+                "repair_iteration": repair_iteration,
+                "stage": stage,
+                "request": &task.input,
+                "task_type": format!("{:?}", task.task_type),
+                "plan": plan,
+                "generation": generation,
+                "evaluation": evaluation,
+            })
+        };
+        match archive
+            .write_stage(attempt, &record(None, "generated"))
+            .await
+        {
+            Ok(path) => tracing::info!(
                 task_id = %archive.task_id,
                 attempt,
                 repair_iteration,
                 path = %path.display(),
+                "Generation envelope archived before it could be lost with the run"
+            ),
+            Err(e) => tracing::warn!(
+                task_id = %archive.task_id,
+                attempt,
+                repair_iteration,
                 error = %e,
                 "could not archive this run's generation envelope; the diff lives only in memory until the run ends"
             ),
         }
+    }
+
+    /// The evaluation, written over the same generation's record.
+    ///
+    /// The file keeps the plan and the generation it judged, so a later reader
+    /// gets the verdict together with what it was about rather than a score
+    /// with nothing attached.
+    async fn archive_evaluation(
+        &self,
+        task: &cog_core::Task,
+        attempt: u32,
+        repair_iteration: u32,
+        plan: &PlannerOutput,
+        generation: &GeneratorOutput,
+        evaluation: &EvaluationResult,
+    ) {
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        if generation.artifacts.is_empty() {
+            return;
+        }
+        let record = serde_json::json!({
+            "task_id": archive.task_id,
+            "attempt": attempt,
+            "repair_iteration": repair_iteration,
+            "stage": "evaluated",
+            "request": &task.input,
+            "task_type": format!("{:?}", task.task_type),
+            "plan": plan,
+            "generation": generation,
+            "evaluation": evaluation,
+        });
+        if let Err(e) = archive.write_stage(attempt, &record).await {
+            tracing::warn!(
+                task_id = %archive.task_id,
+                attempt,
+                error = %e,
+                "could not write this attempt's verdict beside its generation"
+            );
+        }
+    }
+
+    /// What an earlier pass over this task already bought for this generation.
+    ///
+    /// Only reused when the request is byte-identical to the one recorded: the
+    /// same task id can be re-issued against a different goal, and a generation
+    /// produced for the previous one is not an answer to this one.
+    async fn archived_attempt(
+        &self,
+        task: &cog_core::Task,
+        attempt: u32,
+    ) -> Option<(PlannerOutput, GeneratorOutput, Option<EvaluationResult>)> {
+        let archive = self.archive.as_ref()?;
+        let record = archive.read_stage(attempt).await?;
+        if record.get("request") != Some(&task.input) {
+            return None;
+        }
+        let plan: PlannerOutput = serde_json::from_value(record.get("plan")?.clone()).ok()?;
+        let generation: GeneratorOutput =
+            serde_json::from_value(record.get("generation")?.clone()).ok()?;
+        if generation.artifacts.is_empty() {
+            return None;
+        }
+        let evaluation = record
+            .get("evaluation")
+            .filter(|e| !e.is_null())
+            .and_then(|e| serde_json::from_value(e.clone()).ok());
+        Some((plan, generation, evaluation))
     }
 
     /// Build the failing result for a deterministic environment/protocol
@@ -394,10 +454,23 @@ impl PgePipeline {
         let mut stall = StallDetector::new(self.config.stall_threshold);
 
         for attempt in 1..=max_attempts {
+            // 重入：这一代上一次已经买过的计划、生成与判词都在盘上。上游在半路
+            // 断掉时，付过钱的东西不该跟着进程一起没——这一次从盘上接着跑，
+            // 不重买一遍。
+            let resumed = self.archived_attempt(task, attempt).await;
+            if resumed.is_some() {
+                tracing::info!(
+                    task_id = %task.id,
+                    attempt,
+                    "re-entering this generation from what the last pass left on disk"
+                );
+            }
+
             // Stage 1: Planner — or, on a declared scope, the plan the request
             // already states.
-            let plan = match scope {
-                PlanScope::Planned(planner) => {
+            let plan = match (&resumed, scope) {
+                (Some((plan, _, _)), _) => plan.clone(),
+                (None, PlanScope::Planned(planner)) => {
                     planner
                         .plan(
                             task,
@@ -409,7 +482,7 @@ impl PgePipeline {
                         )
                         .await
                 }
-                PlanScope::Declared(declared) => (*declared).clone(),
+                (None, PlanScope::Declared(declared)) => (*declared).clone(),
             };
 
             // 计划侧的确定性环境失败：planner 的 prompt 没到上游，重试必然同样
@@ -434,19 +507,24 @@ impl PgePipeline {
                 .as_ref()
                 .map(|g| serde_json::to_value(g).unwrap_or_default());
             let plan_json = serde_json::to_value(&plan).unwrap_or_default();
-            let mut generation = generator
-                .generate(
-                    task,
-                    &plan_json,
-                    attempt,
-                    crate::actors::PreviousAttempt {
-                        evaluation: prev_eval_json.as_ref(),
-                        generation: prev_gen_json.as_ref(),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await;
+            let mut generation = match &resumed {
+                Some((_, generation, _)) => generation.clone(),
+                None => {
+                    generator
+                        .generate(
+                            task,
+                            &plan_json,
+                            attempt,
+                            crate::actors::PreviousAttempt {
+                                evaluation: prev_eval_json.as_ref(),
+                                generation: prev_gen_json.as_ref(),
+                                ..Default::default()
+                            },
+                            None,
+                        )
+                        .await
+                }
+            };
 
             // Deterministic environment/protocol failure: the generator
             // produced nothing because tools never ran or the upstream cannot
@@ -463,7 +541,8 @@ impl PgePipeline {
             // 信封在评估之前落盘：从这里往后每一通调用都可能因为上游配额耗尽而
             // 中断整条流水线，而中断带走的是内存里的这一份 generation。落盘放在
             // 评估之前，才有「下一通调用失败时 diff 已经在盘上」这个性质。
-            self.archive_generation(attempt, 0, &generation).await;
+            self.archive_generation(task, attempt, 0, &plan, &generation)
+                .await;
 
             let eval_history: Vec<serde_json::Value> = history
                 .iter()
@@ -503,7 +582,10 @@ impl PgePipeline {
             // so the evaluator's only possible answer is "there is nothing
             // here". Judge it deterministically under its own cause instead, and
             // hand the repair loop a name it can act on.
-            let mut evaluation = if generation.is_empty_envelope() {
+            let mut evaluation = if let Some((_, _, Some(recorded))) = &resumed {
+                // 上一次已经问过判词，而且它和这一份生成是一起记下来的。
+                recorded.clone()
+            } else if generation.is_empty_envelope() {
                 tracing::warn!(
                     attempt,
                     "Generator returned an empty envelope; failing the attempt under its own cause instead of evaluating nothing"
@@ -545,6 +627,11 @@ impl PgePipeline {
                 );
             }
 
+            // 判词与它判的那份生成写在同一份记录里：读的人不会拿到一个没有对象
+            // 的分数，重入时也不用再问一次。
+            self.archive_evaluation(task, attempt, 0, &plan, &generation, &evaluation)
+                .await;
+
             let mut local_repairs: Vec<LocalRepairAttempt> = Vec::new();
             let mut repair_stall = StallDetector::new(self.config.stall_threshold);
 
@@ -585,7 +672,7 @@ impl PgePipeline {
                 }
 
                 // 与首轮同一条：修复出来的信封在下一次调用之前就落盘。
-                self.archive_generation(attempt, repair_iteration, &generation)
+                self.archive_generation(task, attempt, repair_iteration, &plan, &generation)
                     .await;
 
                 // Same rule as the initial generation: a repair that delivered
@@ -629,6 +716,18 @@ impl PgePipeline {
                         history,
                     );
                 }
+
+                // 修复出来的那一代同样把判词写在自己的记录里：重入时读到的是
+                // 「这一代已经判过了」，而不是「还要再问一次」。
+                self.archive_evaluation(
+                    task,
+                    attempt,
+                    repair_iteration,
+                    &plan,
+                    &generation,
+                    &evaluation,
+                )
+                .await;
 
                 local_repairs.push(LocalRepairAttempt {
                     repair_iteration,
@@ -819,28 +918,82 @@ fn sanitize_path_component(raw: &str) -> String {
     }
 }
 
-/// 同一个任务只留最近一次运行的信封。
-///
-/// 一个任务会被外层循环反复重跑，每次运行都写一份自己的信封；不收拾的话这个
-/// 目录随重跑次数线性增长，而重跑恰恰是失败时才发生的事——增长最快的路径正好
-/// 是没人去看的那条。留下的那份是最近一次运行，也就是重入时唯一该读的那份。
-async fn prune_superseded_runs(task_dir: &std::path::Path, keep: &str) {
-    let Ok(mut entries) = tokio::fs::read_dir(task_dir).await else {
-        return;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.as_ref() == keep {
-            continue;
+impl GenerationArchive {
+    fn task_dir(&self) -> std::path::PathBuf {
+        self.dir.join(sanitize_path_component(&self.task_id))
+    }
+
+    /// One directory per `(task, generation)`: `gen-0001` is the first pass
+    /// over this task. The number is the pipeline's own generation counter,
+    /// not a timestamp, so the same generation always lands in the same place
+    /// however many processes or restarts it took to get there.
+    fn generation_dir(&self, generation: u32) -> std::path::PathBuf {
+        self.task_dir().join(format!("gen-{generation:04}"))
+    }
+
+    fn stage_path(&self, generation: u32, repair_iteration: u32) -> std::path::PathBuf {
+        self.generation_dir(generation)
+            .join(format!("r{repair_iteration:02}.json"))
+    }
+
+    /// Write one generation's record, replacing the previous stage of it.
+    async fn write_stage(
+        &self,
+        generation: u32,
+        record: &serde_json::Value,
+    ) -> std::io::Result<std::path::PathBuf> {
+        let repair_iteration = record
+            .get("repair_iteration")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let dir = self.generation_dir(generation);
+        let path = self.stage_path(generation, repair_iteration);
+        tokio::fs::create_dir_all(&dir).await?;
+        let text = serde_json::to_string_pretty(record)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // 先写临时文件再改名：读的人可能恰好在写的同时打开这一份，半份
+        // JSON 会被读成「这份信封坏了」，而不是「这份信封还没写完」。
+        let tmp = path.with_extension("json.part");
+        tokio::fs::write(&tmp, text).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+        Ok(path)
+    }
+
+    /// What this generation recorded the last time it was reached.
+    async fn read_stage(&self, generation: u32) -> Option<serde_json::Value> {
+        let dir = self.generation_dir(generation);
+        let mut entries = tokio::fs::read_dir(&dir).await.ok()?;
+        let mut best: Option<(u32, serde_json::Value)> = None;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let repair = name
+                .strip_prefix('r')
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .and_then(|n| n.parse::<u32>().ok());
+            let Some(repair) = repair else {
+                continue;
+            };
+            if best.as_ref().is_some_and(|(seen, _)| *seen >= repair) {
+                continue;
+            }
+            let Ok(text) = tokio::fs::read_to_string(entry.path()).await else {
+                continue;
+            };
+            match serde_json::from_str(&text) {
+                Ok(value) => best = Some((repair, value)),
+                // 半份或坏掉的那一份不能当作「这一代没买过」：让它把整代跳过，
+                // 于是这一代会重跑一次，而不是拿一份读不动的记录当答案。
+                Err(e) => {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        error = %e,
+                        "this generation's record cannot be parsed; ignoring it"
+                    );
+                }
+            }
         }
-        if let Err(e) = tokio::fs::remove_dir_all(entry.path()).await {
-            tracing::warn!(
-                path = %entry.path().display(),
-                error = %e,
-                "could not prune a superseded generation envelope run"
-            );
-        }
+        best.map(|(_, value)| value)
     }
 }
 
@@ -2168,16 +2321,12 @@ mod tests {
             "the evaluator must have panicked, or this test proves nothing about ordering"
         );
 
-        let task_dir = temp.path().join("change-ledger-abc");
-        let mut runs = std::fs::read_dir(&task_dir)
-            .expect("the archive directory exists at the moment the evaluator was asked")
-            .map(|e| e.unwrap().path())
-            .collect::<Vec<_>>();
-        runs.sort();
-        let run = runs.last().expect("one run directory");
-        let envelope: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(run.join("a1-r0.json")).unwrap())
-                .unwrap();
+        let generation_dir = temp.path().join("change-ledger-abc").join("gen-0001");
+        let envelope: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(generation_dir.join("r00.json"))
+                .expect("the generation's record exists at the moment the evaluator was asked"),
+        )
+        .unwrap();
         assert_eq!(
             envelope["task_id"], "change-ledger-abc",
             "the envelope must name the task whose run produced it"
@@ -2185,6 +2334,118 @@ mod tests {
         assert_eq!(
             envelope["generation"]["artifacts"][0]["content"], diff,
             "the archived envelope must carry the diff itself, not a pointer to one"
+        );
+        assert_eq!(
+            envelope["stage"], "generated",
+            "the record says how far this generation got, not merely that a file exists"
+        );
+    }
+
+    /// 第二次跑同一个任务时，上一趟买过的生成与判词从盘上接着用。
+    ///
+    /// 盘上这份记录的全部意义在此：上游在半路断掉之后，再跑一趟不该第二次
+    /// 付钱。这里让第二趟的三个角色都炸掉——它能跑完，唯一的原因是它们根本
+    /// 没被问到。
+    #[tokio::test]
+    async fn a_second_pass_over_the_same_task_buys_neither_plan_nor_generation_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive = || {
+            PgePipeline::new(PgePipelineConfig {
+                max_retries: 1,
+                timeout_ms: 5_000,
+                local_repair_max: 2,
+                stall_threshold: 2,
+                independent_review: false,
+            })
+            .with_generation_archive(temp.path(), "change-ledger-abc")
+        };
+
+        let task = test_task("edit x.rs");
+        let diff =
+            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+
+        // 第一趟：正常的三个角色，跑出一份能通过的判词。
+        let first = archive();
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "summary": "s",
+                "plan": {"steps": ["edit"]},
+                "sub_tasks": [],
+                "acceptance_criteria": []
+            }),
+        }));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "content": {"note": "done"},
+                "artifacts": [{
+                    "name": "change.diff",
+                    "artifact_type": "change",
+                    "content": diff,
+                }],
+            }),
+        }));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "verdict": "pass",
+                "score": 92,
+                "feedback": "good",
+                "criteria": [],
+            }),
+        }));
+        let bought = first
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+        assert!(
+            bought.passed,
+            "the first pass has to pass for the second to resume"
+        );
+
+        let generation_dir = temp.path().join("change-ledger-abc").join("gen-0001");
+        let record: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(generation_dir.join("r00.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            record["stage"], "evaluated",
+            "the verdict is written beside the generation it judged"
+        );
+
+        // 第二趟：三个角色都被问到就炸，跑完即证明一次上游都没打过。
+        let second = archive();
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!(PANIC_ON_PROMPT),
+        }));
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!(PANIC_ON_PROMPT),
+        }));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!(PANIC_ON_PROMPT),
+        }));
+        let resumed = second
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planner,
+                &generator,
+                &evaluator,
+            )
+            .await;
+
+        assert!(
+            resumed.passed,
+            "the second pass judged what the first pass left, got: {:?}",
+            resumed.final_evaluation.feedback
+        );
+        assert_eq!(
+            resumed.final_generation.artifacts.len(),
+            1,
+            "the resumed pass carries the generation the first pass paid for"
         );
     }
 }
