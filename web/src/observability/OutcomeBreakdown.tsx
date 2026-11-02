@@ -228,6 +228,17 @@ function describe(line: OutcomeLine): { label: string; hint: string; tone: strin
         tone: 'var(--warn)',
         bar: 'var(--warn)',
       };
+    // 拆分之前这两个成因共用一个词。历史行仍在窗口里，落进 default 会被说成
+    // 「界面不认识这个结局词」——那是在指控一个一次性的读写不一致，而真相是
+    // 旧词。留一格把话说清：这一行只该有 2026-11-03 之前的历史。
+    case 'refused_unidentified':
+      return {
+        label: '没报身份（旧词）',
+        hint:
+          '零花销：2026-11-03 起这个结局拆成「没带身份」与「身份写错」两个词，这一格只该有拆分之前的历史',
+        tone: 'var(--danger)',
+        bar: 'var(--danger)',
+      };
     case 'refused_unidentified_missing':
       return {
         label: '没带身份',
