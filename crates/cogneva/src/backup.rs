@@ -4374,9 +4374,12 @@ pub async fn drop_scratch_database(live: &PgPool, database: &str) -> Result<(), 
     // `WITH (FORCE)` 收掉掐信号与 DROP 之间新冒出来的同角色连接：两步之间池子
     // 的后台关闭正好落地时，就是这一步差。它挡不住别的角色的连接——那一档要
     // 由上面那次筛选和下面这句错误文本回答。
-    if let Err(e) = sqlx::query(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
-        .execute(live)
-        .await
+    if let Err(e) = sqlx::query(&format!(
+        "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+        quoted_identifier(database)
+    ))
+    .execute(live)
+    .await
     {
         let left = backends_on(live, database).await.unwrap_or_default();
         let who = if left.is_empty() {
@@ -4400,6 +4403,15 @@ pub async fn drop_scratch_database(live: &PgPool, database: &str) -> Result<(), 
         return Err(format!("删不掉 {database}：{e}（{who}）"));
     }
     Ok(())
+}
+
+/// 库名进 SQL 时按标识符引用。
+///
+/// 库名在这里是调用方给的一段文本，绑定参数进不了 `DROP DATABASE` 的名字位。
+/// 现在两个调用方给的都是编译期常量，但这条路径一旦多一个「名字来自配置」的调用者，
+/// 不引用就是把配置当 SQL 执行。引号内的引号翻倍是 SQL 标识符的唯一转义。
+fn quoted_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 /// 那个库上此刻的连接。
