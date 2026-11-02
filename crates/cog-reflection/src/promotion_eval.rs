@@ -20,7 +20,7 @@ use cog_core::{
     ActionPlannerMeta, ActionPlannerSource, OrchestratorControl, SFError, SFResult, Task,
     TaskStatus, TaskType,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::auto_promoter::PromotionSource;
 use crate::eval_harness::{compare as eval_compare, EvalComparison, EvalOutcome, EvalVerdict};
@@ -438,8 +438,8 @@ impl PromotionEval {
     /// 没了，于是那行留在 `Pending` 上，没有第二处会再来读它。这道门是那个 id 前缀
     /// 唯一的写者，所以清点这个命名空间是它自己的事，不该留给人在库里找。
     ///
-    /// 在启动时走一趟就够了：能留下这种行的只有进程消失，而进程消失之后的第一件事
-    /// 就是下一次启动。
+    /// 走的是循环而不是启动那一趟：一次重启可能落在行还年轻的时候，那一趟会正确地
+    /// 放过它，而下一次重启也许要几天之后——中间这段时间里，那行既没人等、也没人清。
     pub(crate) async fn withdraw_abandoned(&self) -> SFResult<usize> {
         let now = chrono::Utc::now();
         let mut withdrawn = 0usize;
@@ -450,7 +450,10 @@ impl PromotionEval {
             match self.orchestrator.cancel_task(&task.id).await {
                 Ok(_) => {
                     withdrawn += 1;
-                    debug!(
+                    // 默认可见级别：收走一行是个罕见的、属于运维面的事件，而它同时
+                    // 解释了「图上少了一行」——只在 debug 留痕，读日志的人分不出
+                    // 「这行被收回去了」与「它从来没存在过」。
+                    info!(
                         task_id = %task.id,
                         since = %task.updated_at,
                         "promotion eval: withdrew an A/B row whose wait is over; nothing was \
@@ -465,7 +468,7 @@ impl PromotionEval {
             }
         }
         if withdrawn > 0 {
-            debug!(withdrawn, "promotion eval: abandoned A/B rows withdrawn");
+            info!(withdrawn, "promotion eval: abandoned A/B rows withdrawn");
         }
         Ok(withdrawn)
     }
@@ -864,9 +867,9 @@ mod tests {
         );
     }
 
-    /// 启动时那一趟只收没人等的，别的一行都不碰。
+    /// 这一趟只收没人等的，别的一行都不碰。
     #[tokio::test]
-    async fn the_startup_sweep_withdraws_only_the_rows_no_one_is_waiting_on() {
+    async fn the_sweep_withdraws_only_the_rows_no_one_is_waiting_on() {
         let graph = Arc::new(GateGraph::default());
         let now = chrono::Utc::now();
         let stale = pending_row(

@@ -16,6 +16,14 @@ pub const CHANGE_VERIFICATION_LOOP: &str = "reflection_change_verification";
 /// Loop name reported through the background-loop liveness family.
 pub const LEARNING_REVIEW_LOOP: &str = "reflection_learning_review";
 /// Loop name reported through the background-loop liveness family.
+///
+/// 收的是这道门自己交上去、而等它的那次等待已经不在了的 A/B 行。它是个循环而不是
+/// 启动时跑一趟：一次重启可能落在行还年轻的时候，那一趟会正确地放过它，而下一次
+/// 重启也许要几天之后——中间这段时间里，那行既没人等、也没人清。
+pub const PROMOTION_EVAL_SWEEP_LOOP: &str = "reflection_promotion_eval_sweep";
+/// 这一趟多久走一次。等待上限是一小时，收一行的迟到十分钟不算迟到。
+pub const PROMOTION_EVAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+/// Loop name reported through the background-loop liveness family.
 pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
 /// Loop name reported through the background-loop liveness family.
 ///
@@ -1504,15 +1512,46 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 crate::promotion_eval::DEFAULT_EVAL_POLL_INTERVAL_SECS,
                 eval_metrics,
             ));
-            // 上一个进程交上去的 A/B 行：等它的那次等待已经随进程一起没了。这道门
-            // 是那个 id 前缀唯一的写者，认得出它们、也只有它收得回来——把它们留在
-            // 图上，就是一条永远不会开工、也永远不会清掉的待办。
+            // 这道门交上去、而等它的那次等待已经不在了的 A/B 行：这道门是那个 id
+            // 前缀唯一的写者，认得出它们、也只有它收得回来——把它们留在图上，就是
+            // 一条永远不会开工、也永远不会清掉的待办。
             let sweeper = evaluator.clone();
-            tokio::spawn(async move {
-                if let Err(e) = sweeper.withdraw_abandoned().await {
-                    warn!(error = %e, "promotion eval: could not sweep abandoned A/B rows");
-                }
-            });
+            let sweep_shutdown = cog_core::ShutdownSignal::new();
+            if let Some(broadcast_tx) = ctx.consume::<cog_core::ShutdownBroadcastTx>() {
+                let sweep_shutdown = sweep_shutdown.clone();
+                let mut rx = broadcast_tx.0.subscribe();
+                tokio::spawn(async move {
+                    let _ = rx.recv().await;
+                    sweep_shutdown.trigger();
+                });
+            }
+            drop(cog_core::loop_health::spawn(
+                PROMOTION_EVAL_SWEEP_LOOP,
+                cog_core::loop_health::Cadence::Periodic(PROMOTION_EVAL_SWEEP_INTERVAL),
+                sweep_shutdown.clone(),
+                move |beat| {
+                    let sweeper = sweeper.clone();
+                    let shutdown = sweep_shutdown.clone();
+                    async move {
+                        let mut ticker = tokio::time::interval(PROMOTION_EVAL_SWEEP_INTERVAL);
+                        loop {
+                            beat.beat();
+                            tokio::select! {
+                                biased;
+                                _ = shutdown.wait() => return,
+                                _ = ticker.tick() => {}
+                            }
+                            if let Err(e) = sweeper.withdraw_abandoned().await {
+                                warn!(
+                                    error = %e,
+                                    "promotion eval: the sweep for abandoned A/B rows failed; \
+                                     the next pass retries"
+                                );
+                            }
+                        }
+                    }
+                },
+            ));
             let _ = self.promotion_eval_slot.set(evaluator);
         }
         if !sw_config.enabled {
