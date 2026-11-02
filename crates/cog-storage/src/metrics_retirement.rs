@@ -137,6 +137,7 @@ pub const ROSTERED_LABEL_SERIES: &[&str] = &[
     cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES.as_str(),
     cog_core::metric_names::LLM_UPSTREAM_REFUSAL_KIND.as_str(),
     cog_core::metric_names::LLM_POOL_UPSTREAM_WITH_RULER.as_str(),
+    cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED.as_str(),
     cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED.as_str(),
     cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED.as_str(),
 ];

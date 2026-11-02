@@ -376,3 +376,131 @@ fn the_gate_reports_a_pool_read_without_its_writer() {
         "带写者判据的形状被误判: {with}"
     );
 }
+
+/// A gauge written with an `upstream` label outlives the upstream it describes.
+///
+/// The store answers a gauge with the newest row per label set, so a series
+/// whose producer stopped keeps answering in the present tense: every count
+/// that aggregates by upstream keeps counting a member the configuration no
+/// longer has, and it does so forever. Nothing in the writer deletes a label
+/// set it stopped publishing — it has no idea anyone else still reads it —
+/// so the family needs a declared channel that removes the departed ones.
+/// `ROSTERED_LABEL_SERIES` is that declaration, and the roster it reads is
+/// `llm_upstream_position`, which the pool loop writes for every configured
+/// upstream whether or not this process has ever called it.
+///
+/// The failure this gate exists for is silent in the direction that hurts: a
+/// new per-upstream gauge written in the pool loop and not added to the
+/// roster leaves no trace once its upstream goes away. It is not a wrong
+/// number, it is a member that never leaves the population, and the rule that
+/// reports such a residue would report it for that series forever — a lamp
+/// nobody can turn off, which is the same as no lamp.
+///
+/// Read from the writer's own call sites rather than from
+/// `DURABLE_POOL_GAUGES`: that list answers "whose window must outlast the
+/// heartbeat", which is a different question, and a per-upstream gauge that is
+/// not on it is exactly the case this gate is about.
+#[test]
+fn every_gauge_written_per_upstream_is_on_the_retirement_roster() {
+    // One series per upstream can be left behind on purpose: the ledger
+    // projection is written from the ledger, and the ledger still holds rows
+    // for an upstream that left the configuration (and a `-` total beside
+    // them). Its producer is alive for every one of those label values, so
+    // releasing them would delete a total that is still being written.
+    const EXEMPT: &[(&str, &str)] = &[(
+        "llm_tokens_total",
+        "账本投影：它对已经离开配置的上游照旧写（账上还有这家记过的花销，另有一行 `-` \
+         的合计），写者对每一个这样的标签值都还活着，退休它就是删一个仍在写的合计",
+    )];
+
+    let gateway = read_repo("crates/cog-gateway/src/security_gateway.rs");
+    // The test module holds a stub backend with its own `record_gauge`, and a
+    // `#[cfg(test)]` helper above it. Cut at the test module's opening line, so
+    // the scan reads production call sites only.
+    let production = gateway
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map(|(before, _)| before)
+        .expect("测试模块的开头变了，这条判据会扫到自己的桩实现");
+
+    let mut per_upstream: BTreeSet<String> = BTreeSet::new();
+    let mut from = 0;
+    while let Some(rel) = production[from..].find("record_gauge(") {
+        let at = from + rel;
+        // One past the opening, not past the span: a call inside another one's
+        // span is a call too, and a scan that skips it goes green by not
+        // looking.
+        from = at + 1;
+        let Some(call) = balanced_span(&production[at..]) else {
+            continue;
+        };
+        if !call.contains("\"upstream\"") {
+            continue;
+        }
+        for (ident, metric) in cog_core::metric_names::IDENTIFIED {
+            if call.contains(&format!("metric_names::{ident}")) {
+                per_upstream.insert(metric.as_str().to_string());
+            }
+        }
+    }
+
+    let roster: BTreeSet<&str> = cog_storage::ROSTERED_LABEL_SERIES.iter().copied().collect();
+    assert!(
+        roster.len() >= 8,
+        "退休名册只剩 {} 条——这条判据在拿一份空名单对人口",
+        roster.len()
+    );
+    // The denominator. A scanner that stopped matching would otherwise report
+    // every populated family as covered.
+    assert!(
+        per_upstream.len() >= 10,
+        "只扫到 {} 条按上游写的 gauge——写它们的调用点换了形状，这条判据已经看不见它们了",
+        per_upstream.len()
+    );
+
+    for (name, reason) in EXEMPT {
+        assert!(
+            per_upstream.contains(*name),
+            "豁免表里的 `{name}` 已经不再按上游写（理由：{reason}）——这条豁免在给谁放行？"
+        );
+        assert!(!reason.trim().is_empty(), "`{name}` 的豁免没写理由");
+        assert!(
+            !roster.contains(name),
+            "`{name}` 同时出现在退休名册和豁免里，两句话互相作废"
+        );
+    }
+
+    let missing: Vec<&str> = per_upstream
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !roster.contains(name) && !EXEMPT.iter().any(|(exempt, _)| exempt == name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "这些序列按 upstream 写进耐久面，却不在 `ROSTERED_LABEL_SERIES` 里：上游离开配置后\
+         它们的行会留在现在时里，而没有任何东西会把它们删掉。要么登记进名册，要么在豁免里\
+         写清为什么它的写者对走掉的那一家还活着：\n  {}",
+        missing.join("\n  ")
+    );
+}
+
+/// The text from its first `(` through the one that closes it.
+///
+/// Deliberately naive about strings and comments: it is applied to call sites
+/// this repo writes, and the gateway's own funnel test reads its source the
+/// same way. A span it cannot close is skipped rather than guessed at.
+fn balanced_span(text: &str) -> Option<&str> {
+    let mut depth = 0usize;
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
