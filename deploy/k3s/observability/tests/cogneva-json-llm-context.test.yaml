@@ -30,6 +30,8 @@ tests:
         values: '0+1x672'
       - series: 'llm_tokens_total{kind="input",actor="a1"}'
         values: '0+400x672'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a1"}'
+        values: '0+900x672'
     alert_rule_test:
       - eval_time: 168h
         alertname: llm_context_per_call_above_its_own_week
@@ -43,6 +45,8 @@ tests:
         values: '0+1x672'
       - series: 'llm_tokens_total{kind="input",actor="a1"}'
         values: '0+400x668 269200 271200 273200 275200'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a1"}'
+        values: '0+900x672'
     alert_rule_test:
       - eval_time: 168h
         alertname: llm_context_per_call_above_its_own_week
@@ -60,10 +64,14 @@ tests:
         values: '0+1x672'
       - series: 'llm_tokens_total{kind="input",actor="a1"}'
         values: '0+400x668 269200 271200 273200 275200'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a1"}'
+        values: '0+900x672'
       - series: 'llm_calls_total{result="ok",actor="a2"}'
         values: '0+1x672'
       - series: 'llm_tokens_total{kind="input",actor="a2"}'
         values: '0+2000x672'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a2"}'
+        values: '0+900x672'
     alert_rule_test:
       - eval_time: 168h
         alertname: llm_context_per_call_above_its_own_week

@@ -26,8 +26,12 @@ tests:
     input_series:
       - series: 'llm_tokens_total{kind="cached",actor="a1"}'
         values: '0+30000x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="cached",actor="a1"}'
+        values: '0+900x16'
       - series: 'llm_tokens_total{kind="input",actor="a1"}'
         values: '0+70000x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a1"}'
+        values: '0+900x16'
     alert_rule_test:
       - eval_time: 4h
         alertname: llm_cache_hit_share_collapsed
@@ -40,8 +44,12 @@ tests:
     input_series:
       - series: 'llm_tokens_total{kind="cached",actor="a1"}'
         values: '0+0x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="cached",actor="a1"}'
+        values: '0+900x16'
       - series: 'llm_tokens_total{kind="input",actor="a1"}'
         values: '0+70000x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a1"}'
+        values: '0+900x16'
     alert_rule_test:
       - eval_time: 4h
         alertname: llm_cache_hit_share_collapsed
@@ -56,8 +64,12 @@ tests:
     input_series:
       - series: 'llm_tokens_total{kind="cached",actor="a2"}'
         values: '0+0x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="cached",actor="a2"}'
+        values: '0+900x16'
       - series: 'llm_tokens_total{kind="input",actor="a2"}'
         values: '0+10000x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a2"}'
+        values: '0+900x16'
     alert_rule_test:
       - eval_time: 4h
         alertname: llm_cache_hit_share_collapsed

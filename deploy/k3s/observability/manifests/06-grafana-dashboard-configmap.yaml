@@ -1225,7 +1225,7 @@ data:
           },
           "targets": [
             {
-              "expr": "max by (actor, kind) (increase(llm_tokens_total[30m]))",
+              "expr": "max by (actor, kind) ((max_over_time((llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600))[30m:1m]) - min_over_time((llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600))[30m:1m])))",
               "legendFormat": "{{actor}} {{kind}}",
               "datasource": {
                 "type": "prometheus",
