@@ -646,10 +646,21 @@ else:
             f"{table_rel}: 失败那一格又变成条件渲染了——"
             "零失败的行走少一格时，它后面的数字会整体左移一列"
         )
-    if "styles.length === 1" not in tsrc or "分协议见下" not in tsrc:
+    # 一级行的缓存占比**必须**跨协议算。这一条以前反着判：那时 OpenAI 兼容面的
+    # `input` 已含命中、Anthropic 面不相交，两种记法先加起来再除就是拿一个协议的分母
+    # 解释另一个协议的分子，所以门要求这一格在见过多种协议时不印数。记账面现在落账前
+    # 就归一了（`prompt_tokens` 先减命中量），两列在每个面上都是「没被缓存服务的那部分
+    # ＋被缓存服务的那部分」，分母只有一个。判据于是翻过来：这一格不许再按协议让步——
+    # 让步就说明有人把旧的逐协议分母又写回来了。
+    if "styles.length === 1" in tsrc or "分协议见下" in tsrc:
         problems.append(
-            f"{table_rel}: 一级行的缓存占比没有分协议的限制——"
-            "两种协议的 input 含义不同，先加起来再除是一个协议的分母除以另一个的分子"
+            f"{table_rel}: 一级行的缓存占比又按协议让步了——"
+            "记账面已经归一，分母 `input + cached` 两个协议面一样，跨协议相加不再是混算"
+        )
+    if "hitRate(group.input, group.cached)" not in tsrc:
+        problems.append(
+            f"{table_rel}: 一级行的命中率不是从合计数算的——"
+            "分组换了算法而分母没跟着换，屏上就是一个自洽但错的比值"
         )
     if tsrc.count("actorTotals(") != 1:
         problems.append(

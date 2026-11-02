@@ -230,10 +230,17 @@ pub struct LlmUsageRecord {
     /// column rather than a fold into `tokens_input`: the ratio of the two is
     /// the hit rate, and that ratio is the only reading a change to prompt
     /// prefix stability can be accepted on, so a durable audit of token spend
-    /// that cannot answer it is missing the one number it exists for. How the
-    /// two relate follows the wire protocol (on an OpenAI-compatible upstream
-    /// cached is a subset of input, on Anthropic the two are disjoint), which
-    /// is why they stay apart here instead of being netted out.
+    /// that cannot answer it is missing the one number it exists for.
+    ///
+    /// The two are complements, not a subset and its container:
+    /// `tokens_input` holds only the part no cache served and
+    /// `tokens_input + tokens_cached` is the whole prompt, on every wire
+    /// protocol. An OpenAI-shaped `prompt_tokens` arrives with the cached half
+    /// already inside it and is reduced before it reaches this field; an
+    /// Anthropic-shaped one is disjoint from the start. That is what lets a
+    /// hit rate be `cached / (input + cached)` without asking which face the
+    /// row came from -- the face cannot be trusted to answer it, since an
+    /// upstream asked in the Anthropic shape can answer in the OpenAI one.
     pub tokens_cached: u64,
     /// Input tokens the upstream wrote into its prefix cache on this call.
     ///

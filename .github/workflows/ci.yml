@@ -1045,6 +1045,14 @@ jobs:
       # 里——它要那一份 tsc，别的作业没有。
       - name: Check in-file replace keeps every byte it should
         run: bash deploy/scripts/check-web-replace-semantics.sh
+      # 缓存命中率由两半拼成：网关落账时把两个协议面归一，前端再用
+      # `cached / (input + cached)` 算出来。两半各自都对、拼起来错，屏幕上就是一个
+      # 像模像样的百分比——2026-11-01 之前正是这样（88% 的命中印成 1.1%，反过来
+      # 归一之后又把 OpenAI 面的命中率压到一成多），因为分母是按 `api_style` 挑的，
+      # 而那个字段记的是请求走哪个面，不是上游回哪种形状。这一步把 `cacheBase` 加载
+      # 起来按实测那一行跑断言，并把「分母函数收不收协议名」也判成一格。
+      - name: Check the cache hit ratio reads one invariant on every face
+        run: bash deploy/scripts/check-web-cache-invariant.sh
       # 源代码管理这一面的成品是「看见改了哪些文件、点开一份并排差异、提交掉」，不是
       # `/api/v1/ide/git/status` 这条路由。视图登记不全就永远打不开；差异页少了
       # 「看哪一侧」就永远画同一份；对齐算法把两删一新配错位，屏幕上照样是一份

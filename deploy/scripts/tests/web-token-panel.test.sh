@@ -181,6 +181,9 @@ export function actorTotals(actors: unknown[]): unknown[] {
 export function cacheFormula(style: string, input: number, cached: number): string {
   return `${style} ${input} ${cached}`;
 }
+export function hitRate(input: number, cached: number): string {
+  return `${cached}/${input + cached}`;
+}
 export function cacheWrite(rows: any[]): number | null {
   if (rows.length === 0) return null;
   let total = 0;
@@ -215,7 +218,7 @@ EOF
   # 两级表：一张表、两级行、列宽一处定义、失败格无条件出现。
   cat >"${work}/web/src/overlay/ActorTable.tsx" <<'EOF'
 import { Fragment } from 'react';
-import { actorTotals, cacheFormula, cacheWriteNote, cacheWriteValue } from '@/observability/usageRows';
+import { actorTotals, cacheFormula, cacheWriteNote, cacheWriteValue, hitRate } from '@/observability/usageRows';
 import { Note } from '@/ui/Note';
 
 const W = {
@@ -274,11 +277,7 @@ export function ActorTable({ actors }: { actors: any[] }) {
                   <Note text={cacheWriteNote(group.rows)}>{cacheWriteValue(group.rows)}</Note>
                 </td>
                 <td>
-                  {group.styles.length === 1 ? (
-                    <Note text={cacheFormula(group.styles[0], group.input, group.cached)}>{group.cached}</Note>
-                  ) : (
-                    <Note text="两种协议的 input 含义不同">分协议见下</Note>
-                  )}
+                  <Note text={cacheFormula(group.styles.join('、'), group.input, group.cached)}>{hitRate(group.input, group.cached)}</Note>
                 </td>
                 <td>
                   <Note text={perCallNote(group.input, group.calls)}>{group.calls}</Note>
@@ -648,12 +647,13 @@ sed -i 's|<td>{group.failed}</td>|<td>{group.failed > 0 \&\& group.failed}</td>|
 confirm "${work}/web/src/overlay/ActorTable.tsx" "group.failed > 0 && group.failed"
 expect_red "失败格条件渲染" "失败那一格又变成条件渲染"
 
-# 29. 一级行的缓存占比不再分协议：两种协议的 input 含义不同，先加起来再除，是一个
-#     协议的分母除以另一个的分子。
+# 29. 一级行的缓存占比又按协议让步：记账面已经归一，分母 `input + cached` 两个协议面
+#     一样；让步说明有人把「逐协议挑分母」的旧写法写回来了。
 fixture
-sed -i 's/group.styles.length === 1/group.styles.length >= 1/' "${work}/web/src/overlay/ActorTable.tsx"
-confirm "${work}/web/src/overlay/ActorTable.tsx" "group.styles.length >= 1"
-expect_red "缓存占比混协议" "缓存占比没有分协议的限制"
+sed -i "s|>{hitRate(group.input, group.cached)}<|>{group.styles.length === 1 ? hitRate(group.input, group.cached) : '分协议见下'}<|" \
+  "${work}/web/src/overlay/ActorTable.tsx"
+confirm "${work}/web/src/overlay/ActorTable.tsx" "group.styles.length === 1"
+expect_red "缓存占比按协议让步" "缓存占比又按协议让步了"
 
 # 30. 合计再算一遍：分摊条、一级行、占比的分母各算各的，迟早各说各的。
 fixture

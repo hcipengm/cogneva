@@ -86,9 +86,9 @@ export function TokenView() {
   // 没人用模型，和每一次尝试都被挡在门外——而失败数在同一排里，读者要自己减
   // 一次才知道是后者。
   const succeeded = sum((row) => row.calls) - failed;
-  // 命中率只在协议内算，而且分母逐协议不同：`input` 在 OpenAI 兼容面已含缓存命中，
-  // 分母就是它；Anthropic 面上两者不相交，分母是二者之和。两种协议分行列出——
-  // 把两条线并成一个百分比，就是让一个协议的分母去解释另一个协议的分子。
+  // 命中率的分母是两个面共用的那一条：记账时 `prompt_tokens` 已经减去命中量再记，
+  // 所以 `input` 只装没被缓存服务的那部分，`input + cached` 就是整段 prompt。仍然
+  // 分协议列出，是因为「哪个面问的」本身是读数，不是因为它换了分母。
   const byStyle = styleCells(rows);
   // 「下一次可能进账」不是这一页的预测，是池子当刻快照里的两个时刻：上游自述
   // 复位与我方下次探测。写死日期会在过期后变成假读数，且没有任何东西会红。
@@ -123,10 +123,14 @@ export function TokenView() {
           <Readings
             from={cumulative}
             source="GET /api/v1/observability/token-usage?hours=0"
-            caveat="`hours=0` 是「整本折叠账」，端点报出的覆盖起点就是这本账的第一格。聚合面每个执行者一行，所以问全史也不会把整本账拉过来；逐窗口那一面没有这个读法。"
+            caveat="`hours=0` 是「整本折叠账」，端点报出的覆盖起点就是这本账的第一格。聚合面每个执行者一行，所以问全史也不会把整本账拉过来；逐窗口那一面没有这个读法。命中率的分母是 `input + cached`（记账面归一之后 `input` 只装没被缓存服务的那部分）；这本账里更早的行是旧口径、`input` 已经含命中，所以跨过那次变更的合计会把两种口径加起来，比例偏低。"
           >
             <div className="flex flex-wrap py-2">
-              <Reading label="输入 token" value={cumulativeSum((actor) => actor.tokens_input).toLocaleString()} />
+              <Reading
+                label="输入 token · 未命中缓存"
+                value={cumulativeSum((actor) => actor.tokens_input).toLocaleString()}
+                note="记的是没被缓存服务的那部分；整段 prompt 是这一格加上「缓存命中」"
+              />
               <Reading label="输出 token" value={cumulativeSum((actor) => actor.tokens_output).toLocaleString()} />
               <Reading label="缓存命中" value={cumulativeSum((actor) => actor.tokens_cached).toLocaleString()} />
               <Reading
@@ -135,17 +139,13 @@ export function TokenView() {
                 note={cacheWriteNote(cumulativeActors)}
               />
               {[...cumulativeByStyle.entries()].map(([style, cell]) => {
-                const base = cacheBase(style, cell.input, cell.cached);
+                const base = cacheBase(cell.input, cell.cached);
                 return (
                   <Reading
                     key={`total-hit-${style}`}
                     label={`命中率 · ${style}`}
-                    value={base === null ? '—' : percentOf(cell.cached, base)}
-                    note={
-                      base === null
-                        ? '这个协议没有已知的缓存记法'
-                        : `缓存 ${compact(cell.cached)} / 分母 ${compact(base)}`
-                    }
+                    value={percentOf(cell.cached, base)}
+                    note={`缓存 ${compact(cell.cached)} / 分母 ${compact(base)}（整段 prompt = 未命中 + 命中）`}
                   />
                 );
               })}
@@ -224,12 +224,16 @@ export function TokenView() {
                   caveat="端点给的是折叠读实际覆盖到的窗口，不是请求的区间：最近那一小时通常还没折，所以它不在覆盖里。覆盖里的一格没有行，才是「那一格真的没花」。"
                 >
                   <div className="flex flex-wrap py-2">
-                    <Reading label="输入 token" value={sum((row) => row.tokens_input).toLocaleString()} />
+                    <Reading
+                      label="输入 token · 未命中缓存"
+                      value={sum((row) => row.tokens_input).toLocaleString()}
+                      note="记的是没被缓存服务的那部分；整段 prompt 是这一格加上「缓存命中」"
+                    />
                     <Reading label="输出 token" value={sum((row) => row.tokens_output).toLocaleString()} />
                     <Reading
                       label="缓存命中"
                       value={sum((row) => row.tokens_cached).toLocaleString()}
-                      note="只在同一协议内可比：两个协议的 input 含义不同，读回量本身不跨协议相加"
+                      note="被缓存服务的那部分输入；与「输入 token」相加是整段 prompt"
                     />
                     <Reading
                       label="缓存写入"
@@ -248,18 +252,16 @@ export function TokenView() {
                       />
                     )}
                     {[...byStyle.entries()].map(([style, cell]) => {
-                      const base = cacheBase(style, cell.input, cell.cached);
+                      const base = cacheBase(cell.input, cell.cached);
                       return (
                         <Reading
                           key={`hit-${style}`}
                           label={`命中率 · ${style}`}
-                          value={base === null ? '—' : percentOf(cell.cached, base)}
+                          value={percentOf(cell.cached, base)}
                           note={
-                            base === null
-                              ? '这个协议没有已知的缓存记法'
-                              : base > 0
-                                ? `缓存 ${compact(cell.cached)} / 分母 ${compact(base)}`
-                                : '这段没有输入 token'
+                            base > 0
+                              ? `缓存 ${compact(cell.cached)} / 分母 ${compact(base)}（整段 prompt = 未命中 + 命中）`
+                              : '这段没有输入 token'
                           }
                         />
                       );

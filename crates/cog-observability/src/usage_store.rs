@@ -105,11 +105,12 @@ pub struct ActorSpend {
     /// environment burned this" needs it as its own axis.
     pub origin: String,
     pub upstream: String,
-    /// Wire protocol family the tokens were counted under. Carried because
-    /// `tokens_input` means different things per protocol — on an
-    /// OpenAI-compatible upstream it already contains `tokens_cached`, on
-    /// Anthropic the two are disjoint — so a cache-hit ratio is only meaningful
-    /// within one protocol and the column may not be dropped on the way out.
+    /// Which face the request asked for. Not which numeric convention the row
+    /// is in: the gateway reduces an OpenAI-shaped `prompt_tokens` by its
+    /// cached count before recording it, so `tokens_input` is the uncached half
+    /// of the prompt on every face and `tokens_input + tokens_cached` is the
+    /// whole prompt. A reader may therefore sum across faces and compute one
+    /// hit ratio; this column only says who asked.
     pub api_style: String,
     pub calls: i64,
     pub failed_calls: i64,

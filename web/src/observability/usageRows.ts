@@ -24,7 +24,7 @@ export interface ActorGroup {
    * 「调了一次的那一行」和「调了一万次的那一行」在结果里一样重。分母因此是调用数。
    */
   latencyWeighted: number;
-  /** 这一组出现过的协议。只有一个时，一级行才印得出缓存占比。 */
+  /** 这一组出现过的协议（请求走的哪个面）。命中率不再依赖它，见 [`cacheBase`]。 */
   styles: string[];
 }
 
@@ -76,49 +76,42 @@ export function actorTotals(actors: ActorUsage[]): ActorGroup[] {
 }
 
 /**
- * 缓存命中的分母，按协议取。
+ * 缓存命中的分母：整个 prompt，也就是 `input + cached`。与协议无关。
  *
- * 同一个词在两条线上指的不是同一段字节：OpenAI 兼容面的 `input` **已经含**缓存
- * 命中（账上逐行 `cached ≤ input` 成立），所以命中率是 `cached / input`；Anthropic
- * 面的 `input` 不含缓存，两者相加才是一次调用的全部输入，分母取 `input + cached`。
- * 拿一个分母套两种记法，必有一边是错的：对 OpenAI 兼容面会把命中份额压到约六成，
- * 对 Anthropic 面则可能算出超过 100%。
+ * 记账面在落账前就把两个协议面归一了：OpenAI 兼容面的 `prompt_tokens` **含**缓存
+ * 命中、Anthropic 面的 `input_tokens` 不含，前者先减去命中量再记进 `input`。于是
+ * 两列装的是同一件事的两半——`input` 是没被缓存服务的那部分，`cached` 是被缓存
+ * 服务的那部分——命中率一律 `cached / (input + cached)`。
  *
- * 认不出的协议返回 `null`——那不是「命中率为 0」，是没有算法可用，得读成不知道。
- * 也正因为分母逐协议不同，两个协议的缓存不能先加起来再除：那是一个协议的分子
- * 除以另一个协议的分母。
+ * 这里曾经按 `api_style` 挑分母（OpenAI 面取 `input`，Anthropic 面取两者之和）。
+ * 那个写法在两种记法并存时也是错的：`api_style` 记的是**请求走哪个面**，而上游回
+ * 哪种形状是另一回事——实测过一行 `api_style=anthropic` 却带回 OpenAI 形状的尾帧，
+ * 按 Anthropic 那一支算，88% 的命中被读成 1.1%。归一之后那一支更是把 OpenAI 面的
+ * 命中率压到一成多。一个不是见证者的字段不许决定分母，所以分母只有一个。
  */
-export function cacheBase(style: string, input: number, cached: number): number | null {
-  if (style.startsWith('openai')) return input;
-  if (style === 'anthropic') return input + cached;
-  return null;
+export function cacheBase(input: number, cached: number): number {
+  return input + cached;
 }
 
-/** 这一格命中率怎么写；分母为零或协议不认识时没有比例可言，写 `—`。 */
-export function hitRate(style: string, input: number, cached: number): string {
-  const base = cacheBase(style, input, cached);
-  if (base === null || base <= 0) return '—';
-  return percent(cached, base);
+/** 这一格命中率怎么写；分母为零时没有比例可言，写 `—`。 */
+export function hitRate(input: number, cached: number): string {
+  return percent(cached, cacheBase(input, cached));
 }
 
 /** 这一格命中率的来路：分子、分母、以及这个分母为什么长这样。 */
 export function cacheFormula(style: string, input: number, cached: number): string {
-  const base = cacheBase(style, input, cached);
-  if (base === null) return `${style}：这个协议没有已知的缓存记法，比例算不出来（不是 0%）`;
+  const base = cacheBase(input, cached);
   if (base <= 0) return `${style}：分母为 0（这段没有输入 token），没有比例可言`;
-  const how =
-    style === 'anthropic'
-      ? 'Anthropic 面上 input 与缓存不相交，分母是 input + cached'
-      : 'OpenAI 兼容面的 input 已经含缓存命中，分母就是 input';
-  return `缓存 ${cached.toLocaleString()} / 分母 ${base.toLocaleString()}（${how}）`;
+  return `缓存 ${cached.toLocaleString()} / 分母 ${base.toLocaleString()}（分母是整个 prompt：input 只装没被缓存服务的那部分，两个协议面在记账时已经归一）`;
 }
 
 /**
  * 逐协议的 `input` / `cached` 小计。
  *
- * 两种协议共享同一个词，但 `input` 的含义不同：OpenAI 兼容面它已经含了缓存命中，
- * Anthropic 面两者不相交。小计必须按协议分开，命中率的分母才可能落对——先跨协议
- * 求和再除，是一个协议的分子除以另一个协议的分母。
+ * `input` 只装没被缓存服务的那部分、`cached` 是被缓存服务的那部分——这条不变式
+ * 两个协议面一样（记账时已经归一），所以两者之和就是整段 prompt，跨协议相加也
+ * 不再是把两件事加在一起。仍然分协议列出来，是因为「哪个面问的」本身是读数：
+ * 两个面的命中率差得再远，也要看得见是谁拖的。
  */
 export function styleCells(
   rows: { api_style: string; tokens_input: number; tokens_cached: number }[]

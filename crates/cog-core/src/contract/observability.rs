@@ -662,11 +662,12 @@ pub struct ActorUsage {
     pub origin: String,
     /// Pool identity of the upstream that served the calls.
     pub upstream: String,
-    /// Wire protocol family the tokens were counted under. Carried because
-    /// `tokens_input` means different things per protocol — on an
-    /// OpenAI-compatible upstream it already contains `tokens_cached`, on
-    /// Anthropic the two are disjoint — so a cache-hit ratio is only
-    /// meaningful within one protocol and the two may not be netted together.
+    /// Which face the request asked for. Not which numeric convention the row
+    /// is in: the gateway reduces an OpenAI-shaped `prompt_tokens` by its
+    /// cached count before recording it, so `tokens_input` is the uncached half
+    /// of the prompt on every face and `tokens_input + tokens_cached` is the
+    /// whole prompt. A reader may therefore sum across faces and compute one
+    /// hit ratio; this column only says who asked.
     pub api_style: String,
     /// Every metered call in the range, failed ones included.
     pub calls: i64,

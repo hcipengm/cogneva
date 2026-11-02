@@ -138,21 +138,12 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
                     </Note>
                   </td>
                   <td className={NUM}>
-                    {group.styles.length === 1 ? (
-                      <Note
-                        className="text-[var(--muted)]"
-                        text={cacheFormula(group.styles[0], group.input, group.cached)}
-                      >
-                        {hitRate(group.styles[0], group.input, group.cached)}
-                      </Note>
-                    ) : (
-                      <Note
-                        className="text-[10px] text-[var(--warn)]"
-                        text={`这个执行者这段走过了 ${group.styles.length} 种协议（${group.styles.join('、')}）。两种协议的 input 含义不同，先把两个协议的缓存加起来再除，是拿一个协议的分母解释另一个协议的分子——所以这一格不印数，展开看每种协议各自的比值。`}
-                      >
-                        分协议见下
-                      </Note>
-                    )}
+                    <Note
+                      className="text-[var(--muted)]"
+                      text={cacheFormula(group.styles.join('、'), group.input, group.cached)}
+                    >
+                      {hitRate(group.input, group.cached)}
+                    </Note>
                   </td>
                   <td className={NUM} style={{ color: 'var(--muted)' }}>
                     {group.calls > 0 ? (
@@ -222,7 +213,7 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
                             className="text-[var(--muted)]"
                             text={cacheFormula(row.api_style, row.tokens_input, row.tokens_cached)}
                           >
-                            {hitRate(row.api_style, row.tokens_input, row.tokens_cached)}
+                            {hitRate(row.tokens_input, row.tokens_cached)}
                           </Note>
                         </td>
                         <td className={`${NUM} text-[10px]`} style={{ color: 'var(--muted)' }}>

@@ -592,9 +592,10 @@ export interface ActorUsage {
   /** 服务这次调用的上游池身份 */
   upstream: string;
   /**
-   * 计数所用的线路协议族。`tokens_input` 的含义**逐协议不同**——
-   * OpenAI 兼容上游里它已含 `tokens_cached`，Anthropic 上两者不相交——
-   * 所以缓存命中率只在一个协议内可比，不能跨协议对消。
+   * 请求走的是哪个协议面。它**不**说明这一行的数字用哪种口径：网关落账前
+   * 已经把 OpenAI 形状的 `prompt_tokens` 减去命中量，所以 `tokens_input` 在
+   * 每个面上都是「没被缓存服务的那部分」，`tokens_input + tokens_cached` 是
+   * 整段 prompt。命中率因此可以跨协议算，这一列只说明是谁问的。
    */
   api_style: string;
   /** 区间内所有计量调用，含失败的 */
