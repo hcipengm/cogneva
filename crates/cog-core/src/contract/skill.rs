@@ -175,8 +175,20 @@ impl SkillRegistry {
         self.skills.get(skill_id)
     }
 
+    /// Every registered skill, in id order.
+    ///
+    /// The order is part of the answer, not an accident of storage: this list is
+    /// serialized into the planner's request (as `task.input.executors`), so it
+    /// sits in the first bytes of the prompt. A `HashMap` hands its values back
+    /// in an order that is stable only for as long as that one map is untouched
+    /// — a restart or an insertion reorders them, and every prompt built after
+    /// it differs from the last one from byte zero, which is where a prefix
+    /// cache stops matching. Sorted, the same registry state always renders the
+    /// same bytes.
     pub fn get_all(&self) -> Vec<&Skill> {
-        self.skills.values().collect()
+        let mut skills: Vec<&Skill> = self.skills.values().collect();
+        skills.sort_by(|a, b| a.id.cmp(&b.id));
+        skills
     }
 
     pub fn insert(&mut self, skill: Skill) {
@@ -605,6 +617,38 @@ mod tests {
         registry.remove_skill_config("gen-v2");
         assert!(registry.get("gen-v2").is_none());
         assert!(registry.get_skill("gen-v2").is_none());
+    }
+
+    /// 同一张表的两种插法必须印出同一份清单。
+    ///
+    /// 这份清单是 planner 请求体开头的 `task.input.executors`，两种插法对应
+    /// 「装载顺序不同」与「装载后又加了一条」——都是运行中真会发生的事。旧实现
+    /// 直接把 `HashMap` 的 `values()` 交出去，顺序跟着哈希走，同一张表换个插法
+    /// 就换一个开头，前缀缓存从第一字节起就不匹配。
+    #[test]
+    fn the_skill_list_reads_the_same_whatever_order_it_was_loaded_in() {
+        let ids = ["generator", "planner", "evaluator", "moderator", "observer"];
+        let mut forward = SkillRegistry::new();
+        for id in ids {
+            forward.insert(make_skill(id, vec![], vec![]));
+        }
+        let mut backward = SkillRegistry::new();
+        for id in ids.iter().rev() {
+            backward.insert(make_skill(id, vec![], vec![]));
+        }
+        backward.insert(make_skill("reviewer", vec![], vec![]));
+
+        let read = |r: &SkillRegistry| -> Vec<String> {
+            r.get_all().iter().map(|s| s.id.clone()).collect()
+        };
+        let mut expected: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        let mut expected_with_extra = expected.clone();
+        expected_with_extra.push("reviewer".into());
+        expected_with_extra.sort();
+
+        assert_eq!(read(&forward), expected);
+        assert_eq!(read(&backward), expected_with_extra);
     }
 
     /// 空表是合法状态，不是半配置：没有登记哪类手时两张面都空，且查不到角色。
