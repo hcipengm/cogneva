@@ -2160,9 +2160,9 @@ fn spawn_skill_effectiveness_loop(
 /// 只会让执行侧读到一个空的 `goal`——一条跑起来、什么也没问的探针，与一条
 /// 真的在探的探针在日志面上同形。返回的 goal 单独给出来，是因为提交那一跳要
 /// 它当目标文本，而它是任务的同一个字段，不该有两份。
-fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog_core::Task) {
+pub fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog_core::Task) {
     let goal = probe.hypothesis.clone();
-    let task = cog_core::Task::new(
+    let mut task = cog_core::Task::new(
         probe.id.clone(),
         cog_core::TaskType::Custom("capability_discovery".into()),
         serde_json::json!({
@@ -2179,7 +2179,32 @@ fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog_cor
             "evaluation_criteria": probe.evaluation_criteria,
         }),
     );
+    // 派发器只开工「说了怎样算完」的行，而 `Task::new` 写的是空判据。少了这一句，
+    // 这条探针停在 `Pending` 上，而发现这一环的结局要靠「交出去之后收回判词」才成立
+    // ——一条永远不开工的探针，在账上与「这一轮什么都没生成」是同一格。
+    task.acceptance.push(discovery_probe_acceptance(probe));
     (goal, task)
+}
+
+/// 一条探针怎样算完：跑出结局，且这条结局能被 `evaluate_discovery_result` 判成
+/// validate / reject / inconclusive 之一。
+///
+/// 判据从探针自己的 `evaluation_criteria` 来，不另写一句通用的话：那句通用的话对每
+/// 一条探针都成立，账上却答不出这一条在验证哪件事。判据为空时说的是「带回一条可判的
+/// 结局」——空判据本身是一种合法的探针形状（只问「这个组合能不能用」），不是缺一项。
+pub fn discovery_probe_acceptance(probe: &crate::types::DiscoveryTask) -> String {
+    if probe.evaluation_criteria.is_empty() {
+        format!(
+            "探针 `{}` 跑完并带回一条可判的结局：这个组合被证实或被证伪，而不是停在无判词",
+            probe.explored_key
+        )
+    } else {
+        format!(
+            "探针 `{}` 按它自己的判据跑完：{}",
+            probe.explored_key,
+            probe.evaluation_criteria.join("；")
+        )
+    }
 }
 
 /// 一轮发现：生成、逐条提交、**按受理**退场。返回这一轮的账（`DiscoveryRound`），

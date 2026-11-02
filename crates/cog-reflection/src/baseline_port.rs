@@ -185,6 +185,54 @@ pub struct BaselinePorter {
     metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
 }
 
+/// 移植失败后回流给全进化回路的那一行，以及它要求的目标文本。
+///
+/// 抽成独立函数，是为了让这一格的判据能被打断地量到：派发器只开工「说了怎样算完」
+/// 的行（`ready_queue::is_dispatchable_work`），而 `Task::new` 写的是空判据。这一行
+/// 此前交出去时没有任何东西说明它怎样算完，于是它停在 `Pending` 上——回流是移植最后
+/// 一条兜底路径，它不跑，一份编译不过的变更就既没有移植、也没有人来重新实现，而图上
+/// 只多一条没人读的待办。
+///
+/// 判据写的是**这条变更在新的基线上**怎样算完：同一份意图重新实现出来的变更通过移植
+/// 门。不写「任务完成」——那句对每一行都成立，账上却答不出这一行在证明什么。
+pub fn port_rework_task(
+    change_id: &str,
+    new_tag: &str,
+    intent: &str,
+    reason: &str,
+) -> (String, Task) {
+    let goal = format!(
+        "Re-implement the intent of promoted change `{change_id}` from scratch on \
+         baseline {new_tag}.\n\n\
+         Original intent:\n{intent}\n\n\
+         Automatic porting failed: {reason}\n\n\
+         Generate a fresh change against the current baseline that achieves \
+         the same goal."
+    );
+    let mut task = Task::new(
+        format!(
+            "port-rework-{}-{}",
+            sanitize_ref(change_id),
+            sanitize_ref(new_tag)
+        ),
+        TaskType::Custom("baseline_port_rework".into()),
+        serde_json::json!({
+            (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
+            (cog_core::INPUT_TASK_KIND): "baseline_port_rework",
+            "change_id": change_id,
+            "baseline_tag": new_tag,
+            "intent": intent,
+            "reason": reason,
+            "goal": goal,
+        }),
+    );
+    task.acceptance.push(format!(
+        "变更 `{change_id}` 的同一份意图在基线 {new_tag} 上重新实现的变更通过移植门：\
+         自动移植不再以同一原因失败"
+    ));
+    (goal, task)
+}
+
 impl BaselinePorter {
     pub fn new(repo_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -1054,37 +1102,12 @@ impl BaselinePorter {
     /// 重新实现；无编排器时落文件兜底，绝不静默丢弃。
     async fn submit_rework(&self, change: &PromotedChange, new_tag: &str, reason: &str) {
         let intent = self.change_intent(change).await;
-        let goal = format!(
-            "Re-implement the intent of promoted change `{}` from scratch on \
-             baseline {new_tag}.\n\n\
-             Original intent:\n{intent}\n\n\
-             Automatic porting failed: {reason}\n\n\
-             Generate a fresh change against the current baseline that achieves \
-             the same goal.",
-            change.change_id
-        );
+        let (goal, task) = port_rework_task(&change.change_id, new_tag, &intent, reason);
 
         let Some(orch) = self.llm_orchestrator() else {
             self.fs_rework_dump(change, new_tag, reason, &goal).await;
             return;
         };
-        let task = Task::new(
-            format!(
-                "port-rework-{}-{}",
-                sanitize_ref(&change.change_id),
-                sanitize_ref(new_tag)
-            ),
-            TaskType::Custom("baseline_port_rework".into()),
-            serde_json::json!({
-                (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
-                (cog_core::INPUT_TASK_KIND): "baseline_port_rework",
-                "change_id": change.change_id,
-                "baseline_tag": new_tag,
-                "intent": intent,
-                "reason": reason,
-                "goal": goal,
-            }),
-        );
         match orch.submit_goal_auto(&goal, vec![task]).await {
             Ok(_) => info!(
                 change_id = %change.change_id,

@@ -217,6 +217,8 @@ mod every_agent_unhealthy_writer_consults_the_judgement;
 mod every_alert_condition_has_a_promql_shape_test;
 #[path = "every_file_in_the_static_tree_is_delivered_or_declared_test.rs"]
 mod every_file_in_the_static_tree_is_delivered_or_declared_test;
+#[path = "every_reflection_row_states_what_closes_it_test.rs"]
+mod every_reflection_row_states_what_closes_it_test;
 #[path = "every_rendered_profile_is_a_tree_the_deployer_delivers_test.rs"]
 mod every_rendered_profile_is_a_tree_the_deployer_delivers_test;
 #[path = "export_package_names_test.rs"]
