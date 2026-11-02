@@ -100,12 +100,27 @@ pub fn aggregate(
         }
     }
 
+    // 最末一格（`now` 所在的那一周）右边没有上界。一条记录的时刻比 `now` 还新，
+    // 只可能是它在读与写之间落了地——写者与读者各持一个钟，快一点的那个先落库，
+    // 于是「刚刚判完」在报表的坐标系里落在此刻之后。把它丢掉，消失的不是一格
+    // 计数，是**整条变更**：`settled` 已经把一条变更收成一行，那一行一丢，这条
+    // 变更在报表里就从来没发生过。2026-11-01 23:59:59 那一跑正是这个形状——
+    // 一周的最后半分钟里，晚一分钟落地的晋级跨进了下一周，于是「两条变更，
+    // 各一票」只数出一条。
+    let now_iso = now.iso_week();
+    let current_week = (now_iso.year(), now_iso.week());
+
     for rec in settled.values() {
         let iso = rec.created_at.iso_week();
+        let rec_week = (iso.year(), iso.week());
         let label = format!("{}-W{:02}", iso.year(), iso.week());
-        let Some(bucket) = weeks.iter_mut().find(|w| w.week == label) else {
-            continue; // 窗口外
+        let index = match weeks.iter().position(|w| w.week == label) {
+            Some(i) => i,
+            // 比此刻新：仍算进最末那一格。
+            None if rec_week > current_week => WINDOW_WEEKS - 1,
+            None => continue, // 窗口外——它确实比这扇窗还旧
         };
+        let bucket = &mut weeks[index];
         match rec.status {
             PromotionStatus::Promoted => bucket.promoted += 1,
             PromotionStatus::RolledBack => bucket.rolled_back += 1,
@@ -590,6 +605,41 @@ mod tests {
         assert_eq!(week.failed, 0, "重试与随后晋级都不该记成失败的变更");
         assert_eq!(week.promoted, 2, "两条变更，各一票");
         assert_eq!(week.success_rate, Some(1.0));
+    }
+
+    /// 一周最后一分钟里落地的判定，仍算最末那一格——它不能被读成「窗口外的旧记录」。
+    ///
+    /// 上面那条现场的最小形状：窗口按 ISO 周分格，而记录的时刻可能比 `now` 新
+    /// （写者与读者各持一个钟）。两者之间只要隔着一次周边界，那条变更就不只是
+    /// 落进别的格，而是**没有格**——整条变更从报表里消失。这里把 `now` 钉在
+    /// 2026-11-01 23:59:30Z（周日最后一分钟），判定的时刻在 00:00:30Z（第 45 周）。
+    /// 比窗口还旧的那一条仍要落在地上，否则这条读数就成了「什么都算」。
+    #[test]
+    fn a_verdict_landing_just_after_the_window_edge_still_counts_in_the_open_week() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-01T23:59:30Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let just_past_the_edge = PromotionRecord {
+            change_id: "across-the-edge".into(),
+            status: PromotionStatus::Promoted,
+            created_at: now + chrono::Duration::minutes(1),
+            updated_at: now + chrono::Duration::minutes(1),
+            ..rec(0, PromotionStatus::Failed)
+        };
+        let ancient = PromotionRecord {
+            change_id: "ancient".into(),
+            status: PromotionStatus::Promoted,
+            created_at: now - chrono::Duration::weeks(WINDOW_WEEKS as i64 + 4),
+            updated_at: now - chrono::Duration::weeks(WINDOW_WEEKS as i64 + 4),
+            ..rec(0, PromotionStatus::Failed)
+        };
+
+        let week = &aggregate(&[just_past_the_edge, ancient], now).weeks[WINDOW_WEEKS - 1];
+        assert_eq!(
+            week.promoted, 1,
+            "跨过此刻的判定落在最末一格，比窗口旧的仍在外"
+        );
+        assert_eq!(week.failed, 0);
     }
 
     #[test]
