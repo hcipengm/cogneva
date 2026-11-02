@@ -554,6 +554,22 @@ pub(crate) async fn submit_and_wait(
     timeout_secs: u64,
 ) -> SFResult<Result<Task, String>> {
     let task_id = task.id.clone();
+    // 图里同 id 的旧行会吃掉这一次提交：`add_tasks_batch` 撞上已有的 id 一律跳过，
+    // 不读新交上去的那一份。上一次尝试留下的终态行（超时被收回、或失败）说的正是
+    // 「那次没有答案」；让它挡在这里，同一个变更就再也跑不成 A/B，而且读起来是
+    // 「门没跑」而不是「门被一行旧记录挡住了」。
+    if let Some(held) = orch.get_task(&task_id).await {
+        if matches!(held.status, TaskStatus::Cancelled | TaskStatus::Failed) {
+            if let Err(e) = orch.delete_task(&task_id).await {
+                warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "promotion eval: an attempt that already ended is holding this id; \
+                     the new run will be skipped as a redelivery"
+                );
+            }
+        }
+    }
     let ids = orch
         .submit_goal_auto(&goal, vec![task])
         .await
@@ -625,6 +641,7 @@ mod tests {
     struct GateGraph {
         tasks: Mutex<HashMap<String, Task>>,
         cancelled: Mutex<Vec<String>>,
+        deleted: Mutex<Vec<String>>,
     }
 
     fn pending_row(id: &str, since: chrono::DateTime<chrono::Utc>) -> Task {
@@ -647,8 +664,13 @@ mod tests {
         async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
             let mut ids = Vec::new();
             for task in tasks {
+                // 与真编排器同一条规矩：已有的 id 一律当重投跳过，新交的那份不读。
+                let mut held = self.tasks.lock().unwrap();
+                if held.contains_key(&task.id) {
+                    continue;
+                }
                 ids.push(task.id.clone());
-                self.tasks.lock().unwrap().insert(task.id.clone(), task);
+                held.insert(task.id.clone(), task);
             }
             Ok(ids)
         }
@@ -731,8 +753,10 @@ mod tests {
         async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
             (self.get_all_tasks().await, vec![])
         }
-        async fn delete_task(&self, _task_id: &str) -> SFResult<()> {
-            unimplemented!()
+        async fn delete_task(&self, task_id: &str) -> SFResult<()> {
+            self.deleted.lock().unwrap().push(task_id.to_string());
+            self.tasks.lock().unwrap().remove(task_id);
+            Ok(())
         }
         async fn all_completed(&self) -> bool {
             false
@@ -764,6 +788,37 @@ mod tests {
             *graph.cancelled.lock().unwrap(),
             vec![row.id.clone()],
             "等待结束了，而它交上去的那一行还挂在图上"
+        );
+    }
+
+    /// 上一次尝试已经终态的行会占住这个 id：提交撞上已有 id 一律跳过，于是这一次
+    /// 提交什么都没交上去，等的还是那条旧行。它得先让开。
+    #[tokio::test]
+    async fn an_attempt_that_already_ended_does_not_hold_the_id_against_the_next_one() {
+        let graph = Arc::new(GateGraph::default());
+        let row = promotion_eval_task(
+            "change-ledger-abc",
+            "deadbeef",
+            Path::new("/workspace/cogneva"),
+            900,
+        );
+        let mut ended = row.clone();
+        ended.status = TaskStatus::Cancelled;
+        graph.tasks.lock().unwrap().insert(ended.id.clone(), ended);
+
+        let orch: Arc<dyn OrchestratorControl> = graph.clone();
+        let _ = submit_and_wait(&orch, 0, row.clone(), "goal".into(), 0).await;
+
+        assert_eq!(
+            *graph.deleted.lock().unwrap(),
+            vec![row.id.clone()],
+            "旧行没让开，这一次提交会被当成重投跳过"
+        );
+        // 让开之后这一次真的交上去了，才会又被这一次自己的等待收回。
+        assert_eq!(
+            *graph.cancelled.lock().unwrap(),
+            vec![row.id.clone()],
+            "这一次的提交没有落到图上"
         );
     }
 
