@@ -401,6 +401,8 @@ mod the_fixture_reading_steps_are_written_once_test;
 mod the_production_cut_is_defined_once_test;
 #[path = "the_repo_root_is_computed_in_one_place_test.rs"]
 mod the_repo_root_is_computed_in_one_place_test;
+#[path = "the_token_counters_are_a_projection_of_the_ledger_test.rs"]
+mod the_token_counters_are_a_projection_of_the_ledger_test;
 #[path = "trace_header_names_contract_test.rs"]
 mod trace_header_names_contract_test;
 #[path = "tunable_registry_contract_test.rs"]

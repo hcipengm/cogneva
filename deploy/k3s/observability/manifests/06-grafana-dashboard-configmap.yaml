@@ -1225,7 +1225,7 @@ data:
           },
           "targets": [
             {
-              "expr": "sum by (actor, kind) (increase(llm_tokens_total[1h]))",
+              "expr": "max by (actor, kind) (increase(llm_tokens_total[30m]))",
               "legendFormat": "{{actor}} {{kind}}",
               "datasource": {
                 "type": "prometheus",

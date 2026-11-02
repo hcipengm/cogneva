@@ -266,7 +266,12 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
     ("collab_route_decisions_total", MetricDerivation::Process),
     ("audited_llm_requests_total", MetricDerivation::Process),
     ("llm_calls_total", MetricDerivation::Process),
-    ("llm_tokens_total", MetricDerivation::Process),
+    // Rendered from the ledger's rows on the pool's cadence, not tallied on the
+    // request path: the call that spent the tokens is already a row there, and
+    // a second tally would be a second book. Every process that can reach the
+    // ledger renders the same numbers, so this is the store's fact seen once
+    // per process and `sum` would count it once per process.
+    ("llm_tokens_total", MetricDerivation::Store),
     (
         "llm_upstream_client_errors_total",
         MetricDerivation::Process,

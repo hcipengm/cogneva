@@ -109,19 +109,6 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          appearing",
     ),
     (
-        "llm_tokens_total",
-        "Total LLM tokens consumed, split by `kind` into input, output and \
-         cached. `cached` is the part of the input the upstream served from its \
-         own cache; on an OpenAI-compatible upstream it is a subset of `input`, \
-         on Anthropic it is disjoint from it, so read the ratio according to the \
-         upstream's protocol. Published at zero too: a missing cell says the \
-         metering path never ran for that upstream and actor, a cell holding \
-         zero says it ran and found nothing. The `actor` axis is the same \
-         closed set as on `llm_calls_total`: spend under `unknown` is spend by \
-         a caller that did not declare itself, so it is real money that no \
-         per-actor view accounts for",
-    ),
-    (
         crate::metric_names::LLM_USAGE_READINGS_TOTAL.as_str(),
         "What the read of each finished LLM response found, by upstream and \
          outcome. `absent` and `not_asked` both mean no number arrived, and \
@@ -709,7 +696,7 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          on an unskipped round, and a zero sample does not move a counter's \
          value, so 'this round asked and was told no' is not readable here. The \
          questions are counted by cogneva_mainline_supersession_checks_total, \
-         and the value held here is the share of rounds the guard saved"
+         and the value held here is the share of rounds the guard saved",
     ),
     (
         "cogneva_mainline_rollout_attempts_total",
@@ -1332,6 +1319,23 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 
 /// Descriptions for the gauge series. See [`COUNTER_HELP`].
 const GAUGE_HELP: &[(&str, &str)] = &[
+    (
+        "llm_tokens_total",
+        "Tokens the ledger says were spent since the start of the UTC day, \
+         split by `kind` into input, output and cached. Rendered from the \
+         ledger's rows on the pool's cadence, never tallied on the request \
+         path: the call that spent the tokens already landed a row, so a \
+         process that also counted it would be keeping a second book and the \
+         two would part company at the first restart. `cached` is the part of \
+         the input the upstream served from its own cache and `input` is only \
+         the rest, so the whole prompt is `input + cached` on both protocols \
+         and a hit share is `cached / (input + cached)`. Read the age beside \
+         it -- `llm_tokens_measured_at_unix` -- before believing a number that \
+         has stopped moving. The `actor` axis is the same closed set as on \
+         `llm_calls_total`: spend under `unknown` is spend by a caller that did \
+         not declare itself, so it is real money that no per-actor view \
+         accounts for",
+    ),
     (
         crate::metric_names::GITEE_TOKEN_SECONDS_TO_EXPIRY.as_str(),
         "How long the contribution access token has left, in seconds; negative \

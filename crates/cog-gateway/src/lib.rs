@@ -1837,6 +1837,12 @@ pub const LABEL_UPSTREAM: &str = "upstream";
 /// 读数按「哪个出口」归属时用的标签键。
 pub const LABEL_OUTLET: &str = "outlet";
 
+/// 读数按「哪个调用方」归属时用的标签键。
+///
+/// 与 `upstream` 那一维正交：同一次花费既有一个上游，也有一个声称发起它的
+/// actor。两维都出现在 token 面与调用面上，键名在这里声明一次。
+pub const LABEL_ACTOR: &str = "actor";
+
 /// 读数按「哪个资源」归属时用的标签键。
 pub const LABEL_RESOURCE: &str = "resource";
 

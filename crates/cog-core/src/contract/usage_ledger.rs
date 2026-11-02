@@ -466,6 +466,26 @@ pub struct OutcomeCount {
     pub calls: i64,
 }
 
+/// What one `(upstream, actor)` pair spent since a point in time, split the
+/// same three ways the metric face splits it.
+///
+/// The three kinds are not interchangeable and the split travels with the
+/// totals rather than being recomputed by the reader: `input` holds only the
+/// part of the prompt that was not served from cache, so the whole prompt is
+/// `input + cached` and a hit share is `cached / (input + cached)`. A reader
+/// that received one total and guessed the split would be reporting a ratio
+/// it invented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamActorSpend {
+    /// `base_url|model`, the key the pool, the ledger and the metric face all
+    /// use for one upstream.
+    pub upstream: String,
+    pub actor: String,
+    pub input: u64,
+    pub output: u64,
+    pub cached: u64,
+}
+
 /// How many successful calls in a range carried a usage reading, by what the
 /// reading found.
 ///
@@ -593,6 +613,29 @@ pub trait LlmUsageLedger: Send + Sync {
         &self,
         since_unix: i64,
     ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String>;
+
+    /// Tokens spent over the whole folded record, split by `(upstream, actor)`
+    /// and kind.
+    ///
+    /// This is the read behind the metric face's token counters. The counters
+    /// are a projection and not a second accounting: the same call is already
+    /// a row here, so a process that also tallied it on the request path would
+    /// be keeping two books and the two would drift apart at every restart.
+    /// Reading them back from the rows makes one fact seen twice, which is what
+    /// a projection is.
+    ///
+    /// The span is the whole record rather than a day because the counters are
+    /// read with window envelopes (`max_over_time` less `min_over_time`), and an
+    /// envelope over a value that resets at midnight measures the reset instead
+    /// of the traffic. A total that only ever grows has one reading for every
+    /// window, and a caller that wants a day asks for the difference across it.
+    ///
+    /// Pairs that spent nothing are absent rather than zero, and the caller
+    /// writes the zero it wants: only the caller knows which upstreams it is
+    /// configured with, and a zero invented here for an upstream this ledger
+    /// never saw would say "it spent nothing" about an upstream it never
+    /// heard of.
+    async fn spend_by_upstream_and_actor(&self) -> Result<Vec<UpstreamActorSpend>, String>;
 
     /// What one job costs, from the jobs that finished inside the last `days`:
     /// `(cost at `quantile`, how many jobs that was, when the oldest one was)`.

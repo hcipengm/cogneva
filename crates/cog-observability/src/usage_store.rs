@@ -975,6 +975,50 @@ impl LlmUsageStore {
         Ok((total, by_actor))
     }
 
+    /// Tokens spent over the whole folded record, split by `(upstream, actor)`
+    /// and kind.
+    ///
+    /// Readers of the metric face get their numbers from here rather than from
+    /// a tally kept on the request path. The request path already wrote the row
+    /// this came from; a second tally beside it would be a second book, and two
+    /// books disagree the first time one of them is lost to a restart.
+    ///
+    /// Read from the fold rather than the per-call ledger because only a
+    /// monotone total gives `max_over_time - min_over_time` one reading per
+    /// window: a day-scoped sum resets at midnight, and an envelope across that
+    /// reset measures the reset. A caller that wants a day differences the
+    /// total across it.
+    ///
+    /// `failed_calls` is not filtered out for the same reason as
+    /// [`Self::spend_by_actor_since`]: an upstream that answered and then
+    /// dropped the stream still produced those tokens on our account.
+    pub async fn spend_by_upstream_and_actor(
+        &self,
+    ) -> anyhow::Result<Vec<cog_core::UpstreamActorSpend>> {
+        let rows = sqlx::query(&format!(
+            "SELECT upstream,
+                    actor,
+                    COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_input,
+                    COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_output,
+                    COALESCE(SUM(tokens_cached), 0)::BIGINT AS tokens_cached
+               FROM {ROLLUP_TABLE}
+              GROUP BY upstream, actor
+              ORDER BY upstream, actor"
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| cog_core::UpstreamActorSpend {
+                upstream: row.get::<String, _>("upstream"),
+                actor: row.get::<String, _>("actor"),
+                input: row.get::<i64, _>("tokens_input").max(0) as u64,
+                output: row.get::<i64, _>("tokens_output").max(0) as u64,
+                cached: row.get::<i64, _>("tokens_cached").max(0) as u64,
+            })
+            .collect())
+    }
+
     /// 一组任务各自花了多少 token。
     ///
     /// 按任务取而不是按窗口取：挣值的实际成本问的是「这些活一共花了多少」，
@@ -1815,6 +1859,14 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         since_unix: i64,
     ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
         LlmUsageStore::spend_by_actor_since(self, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn spend_by_upstream_and_actor(
+        &self,
+    ) -> Result<Vec<cog_core::UpstreamActorSpend>, String> {
+        LlmUsageStore::spend_by_upstream_and_actor(self)
             .await
             .map_err(|e| e.to_string())
     }

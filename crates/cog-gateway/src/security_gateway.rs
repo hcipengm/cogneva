@@ -1765,6 +1765,11 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     // 一个厂商悄悄下掉一个面是件漫水的事，读数要能被回头比对，而不是随 Pod
     // 换代消失。
     cog_core::metric_names::LLM_UPSTREAM_FACE_ANSWERS,
+    // token 面是账本的投影，和今日花费同一拍写：它读的是同一本账，比进程活得久的
+    // 理由也一样——随 Pod 换代消失的 token 数会让每一代都从零重读，而账本并没有
+    // 从零开始。它按 (upstream, kind, actor) 分格，每一格都得由这一拍写一遍，所以
+    // 它也在"每拍重写一遍"这条判据的适用范围内。
+    cog_core::metric_names::LLM_TOKENS_TOTAL,
     cog_core::metric_names::LLM_USAGE_VERDICT_MEASURED,
     cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED,
     cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED,
@@ -3350,21 +3355,6 @@ pub const RANGE_READ_BASELINES: &[(&str, RangeReadBaseline)] = &[
                      失败族上。",
         },
     ),
-    (
-        cog_core::metric_names::LLM_TOKENS_TOTAL.as_str(),
-        RangeReadBaseline::Exempt {
-            readers: &[
-                "llm_context_per_call_above_its_own_week",
-                "llm_cache_hit_share_collapsed",
-            ],
-            reason: "格子带 actor，理由与 llm_calls_total 同一条。两条读者都把这个族与另一个计数相除：\
-                     某一侧看不见的第一个增量，在一小时窗口的和里至多值一次调用，而两条都是 warning。\
-                     `llm_cache_hit_share_collapsed` 读的是 cached/(input+cached) 这个比例，且只在\
-                     该 actor 一小时里走过 20 万 prompt token 以上时才判：少掉的那一次调用同时落在分子\
-                     与分母的同一个量级之外，挪不动它跨过 0.15 那条线，所以它看不见第一个增量也不会把\
-                     判词读反。",
-        },
-    ),
 ];
 
 /// 签名面上一次成功发放的结果名。
@@ -3543,9 +3533,13 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(h.finalize())
 }
 
-/// 一次调用的 token 计量落点（三处同写）：Prometheus counter、ClickHouse 明细、
-/// PG 台账。只在拿到真实 usage 或确知为零时调用；任何落点失败只降级为
+/// 一次调用的 token 计量落点：账本（PG 台账 ＋ 事件明细）与"上游说不说 usage"
+/// 那条计数。只在拿到真实 usage 或确知为零时调用；任何落点失败只降级为
 /// warn/debug，绝不影响请求路径——计量是观测，不是业务。
+///
+/// 账本之外的 token 计数不在这里累加：那是账本的投影，由
+/// `publish_token_totals_from_ledger` 在池的节拍上重算。这里写一遍、那里再投一遍，
+/// 就是同一个事实两本账。
 async fn record_llm_tokens(
     state: &AppState,
     upstream: &LlmUpstream,
@@ -3559,38 +3553,13 @@ async fn record_llm_tokens(
     let estimated_input = request.estimated_input;
     let task = request.task.clone();
     let key = LlmHealthTable::key(upstream);
-    // Zero is recorded, not skipped: the two cells answer "has this metering
-    // path ever run for this upstream and actor", and a skipped zero leaves
-    // that question with no reading at all. What the counts cannot say — whether
-    // the upstream said nothing — is on the readings series below.
-    record_counter_add(
-        state,
-        cog_core::metric_names::LLM_TOKENS_TOTAL,
-        reading.input as f64,
-        &[("upstream", &key), ("kind", "input"), ("actor", actor)],
-    )
-    .await;
-    record_counter_add(
-        state,
-        cog_core::metric_names::LLM_TOKENS_TOTAL,
-        reading.output as f64,
-        &[("upstream", &key), ("kind", "output"), ("actor", actor)],
-    )
-    .await;
-    // 第三格是**从缓存服务的那部分输入**，与上面两格同一个名字、同一根 kind 轴。
-    // 被缓存命中的输入没有从缓存里读一遍的价值——它比未命中的输入便宜得多——所以
-    // 命中率是 `cached / (input + cached)`，也是"把稳定前缀排到前面"这类改动唯一
-    // 的验收读数。分母要把两格相加：`reading.input` 到这里已经是**没被缓存服务的那
-    // 部分**，两个协议面在 [`extract_usage`] 里归一到同一条不变式，所以 `cached`
-    // 在命中过半时**必然**大过 `input`——这不是上游算重了，是缓存干得好。曾经按
-    // 「cached 大过 input 即异常」立的规则因此在健康流量上常亮，已删除。
-    record_counter_add(
-        state,
-        cog_core::metric_names::LLM_TOKENS_TOTAL,
-        reading.cached as f64,
-        &[("upstream", &key), ("kind", "cached"), ("actor", actor)],
-    )
-    .await;
+    // 这三格不在请求路径上累加。它们是从账本滚出来的投影：同一次调用已经在
+    // `gateway_llm_usage` 里落了一行，这里再自己攒一本，就是两本账——重启丢一本、
+    // 两本各走各的，观测面和账本对不上的时候没人说得清哪本是正解。正解是账本那本，
+    // 投影由 [`publish_token_totals_from_ledger`] 在池的节拍上重算。
+    //
+    // 留在这里的那条是「上游这次到底说没说 usage」——那不是账本能回答的，账本只
+    // 记它收到了什么。见下面的 readings 序列。
     // No actor here on purpose: whether an upstream speaks usage at all is
     // settled by the upstream and its compat profile, not by who called it, so
     // splitting by caller would multiply one answer across every caller and
@@ -4817,6 +4786,59 @@ async fn publish_spend_reading_gauges(state: &AppState, reading: &crate::spend_r
     .await;
 }
 
+/// 把账本的 token 总量投影到指标面，每拍全写。
+///
+/// 这是 `llm_tokens_total` 唯一的写法。请求路径上不再累加：那次调用已经在账本里落
+/// 了一行，再攒一本就是两本账，重启丢一本之后两边对不上，而观测面和账本各自都像是
+/// 正解。读账本重算之后，同一次花费只有一个出处，指标面只是它的渲染。
+///
+/// 跨度是整个折叠记录而不是「今天」：读这一族的规则用的是窗口包络
+/// （`max_over_time` 减 `min_over_time`），而一个每天零点归零的值，它的包络量到的是
+/// 那次归零而不是流量。只增不减的总量对任何窗口都只有一个读法，要一天的人去取那天
+/// 的首尾差。
+///
+/// 每拍把每一格都写一遍，不用管它动没动：共享表里停写的格子会永远停在最后那个值
+/// 上，而"停在最后那个值"与"今天没花"在读数面上同形。真的读不到账本时这一拍不写，
+/// 那组数是不是新鲜由存储给每条序列配的 `_observed_timestamp_seconds` 说——它只在
+/// 真正写进去时前进，所以"值不动、时刻也不动"是量不到，"值不动、时刻还在走"才是
+/// 真的没在花。读这一族的规则都要把这一条带上。
+async fn publish_token_totals_from_ledger(state: &AppState) {
+    let Some(store) = state.pool_obs.usage.clone() else {
+        return;
+    };
+    let read = tokio::time::timeout(SPEND_READ_TIMEOUT, store.spend_by_upstream_and_actor()).await;
+    let rows = match read {
+        Ok(Ok(rows)) => rows,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "LLM token 投影：读不出账本，这一拍不写");
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("LLM token 投影：读账本的查询超时，这一拍不写");
+            return;
+        }
+    };
+    for row in &rows {
+        for (kind, value) in [
+            ("input", row.input),
+            ("output", row.output),
+            ("cached", row.cached),
+        ] {
+            record_gauge(
+                state,
+                cog_core::metric_names::LLM_TOKENS_TOTAL,
+                value as f64,
+                &[
+                    ("upstream", row.upstream.as_str()),
+                    ("kind", kind),
+                    ("actor", row.actor.as_str()),
+                ],
+            )
+            .await;
+        }
+    }
+}
+
 /// 逐上游各算一份，池级那份只是把它们相加得到的报表：额度不是一份，能力也不是
 /// 一份，用一家的尺子关掉另一家，就是把"没量到"读成"没有"。
 async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> WindowPaceReading {
@@ -5487,6 +5509,10 @@ async fn refresh_pool_state(state: &AppState) {
         *state.spend_reading.lock().unwrap() = reading;
     }
 
+    // token 面与今日花费同一拍：两者读的是同一本账，分两拍就会有一段时间观测面上
+    // 的 token 数和花费数来自不同时刻。
+    publish_token_totals_from_ledger(state).await;
+
     publish_pool_signal(state, down, bounds).await;
 
     let was_down = state.pool_down.swap(down, Ordering::SeqCst);
@@ -6155,9 +6181,7 @@ async fn stream_forward(
     if actor == crate::actor_labels::UNKNOWN_ACTOR {
         tracing::warn!(
             style,
-            actor_header = req
-                .headers()
-                .contains_key(cog_core::LLM_ACTOR_HEADER),
+            actor_header = req.headers().contains_key(cog_core::LLM_ACTOR_HEADER),
             origin_header = req.headers().contains_key(LLM_ORIGIN_HEADER),
             user_agent = req
                 .headers()
@@ -10821,18 +10845,19 @@ mod tests {
         );
         assert_eq!(outcome_sum("abandoned"), 0.0);
 
+        // 数字不在这条路上落指标面。同一次调用已经在账本里落了一行，指标面是它的
+        // 投影，由池的节拍从账本重算；请求路径上再写一遍就是两本账，重启之后两边
+        // 各说各的。这里判的是"没写"，而不是"写了多少"——写了多少由投影那条测试判。
         let tokens = state
             .pool_obs
             .metrics
-            .query_counter_totals(cog_core::metric_names::LLM_TOKENS_TOTAL.as_str())
+            .query_gauge_latest(cog_core::metric_names::LLM_TOKENS_TOTAL.as_str())
             .await
             .expect("token reading");
-        let input: f64 = tokens
-            .iter()
-            .filter(|s| s.labels.get(crate::LABEL_KIND).map(String::as_str) == Some("input"))
-            .map(|s| s.value)
-            .sum();
-        assert_eq!(input, 11.0, "数字本身也要落账");
+        assert!(
+            tokens.is_empty(),
+            "请求路径把 token 写进指标面了：{tokens:?}。这条路上只落账本，指标面从账本投影"
+        );
     }
 
     /// 定价量的是**要发出去的那串字节**，不是消息本身。
