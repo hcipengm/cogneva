@@ -242,11 +242,16 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
             );
           })}
           {absent.map((name) => (
-            <tr key={`absent-${name}`} style={{ opacity: 0.45 }}>
+            // 压暗的是名字，不是这一行。注释面板是触发元素的子节点，整行套一个
+            // `opacity` 会连面板里的字一起压成半透明——悬停出来的解释反倒比表里
+            // 任何一格都难读，而它恰恰是唯一说清「这一行为什么是空的」的地方。
+            <tr key={`absent-${name}`}>
               <td>
                 <Note className="mono flex w-full items-baseline gap-1 text-[11px]" text={actorHint(name)}>
                   <span className="w-2 shrink-0" />
-                  <span className="min-w-0 truncate">{name}</span>
+                  <span className="min-w-0 truncate" style={{ opacity: 0.45 }}>
+                    {name}
+                  </span>
                 </Note>
               </td>
               <td colSpan={10} className="text-[10px] text-[var(--muted)]">
