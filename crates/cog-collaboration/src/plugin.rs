@@ -92,6 +92,10 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
                 collab = collab.with_pge_schemas(pge.schemas.clone());
             }
             collab = collab.with_local_repair_max(pge.local_repair_max);
+            // 每一轮生成的 diff 在评估之前就落到那块跨重启的盘上：这条流水线
+            // 一次运行要串起最多七通推理调用，任何一通因为上游配额耗尽而失败
+            // 都会把已经付过费的那份 diff 一起带走。
+            collab = collab.with_generation_dir(pge.envelope_dir());
 
             collab = collab.with_ralph_config(crate::RalphSettings::load()?.to_loop_config());
 

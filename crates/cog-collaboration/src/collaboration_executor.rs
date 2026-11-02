@@ -80,6 +80,7 @@ pub struct CollaborationExecutor {
     ralph: Option<crate::squad::ralph::RalphLoopConfig>,
     /// 局部修复预算（配置面 `pge` 段；None = [`crate::DEFAULT_LOCAL_REPAIR_MAX`]）。
     local_repair_max: Option<u32>,
+    generation_dir: Option<std::path::PathBuf>,
 }
 
 /// What the producer said about itself, at the two stages the record keeps.
@@ -117,6 +118,7 @@ impl CollaborationExecutor {
             meta_learning: None,
             ralph: None,
             local_repair_max: None,
+            generation_dir: None,
         }
     }
 
@@ -233,6 +235,12 @@ impl CollaborationExecutor {
     /// (from the `pge` config section).
     pub fn with_local_repair_max(mut self, max: u32) -> Self {
         self.local_repair_max = Some(max);
+        self
+    }
+
+    /// 每一轮生成在评估之前落盘的位置（配置面 `pge.envelope_dir`）。
+    pub fn with_generation_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.generation_dir = Some(dir.into());
         self
     }
 }
@@ -595,6 +603,9 @@ impl CollaborationExecutor {
         if let Some(max) = self.local_repair_max {
             squad_executor = squad_executor.with_local_repair_max(max);
         }
+        if let Some(ref dir) = self.generation_dir {
+            squad_executor = squad_executor.with_generation_dir(dir.clone());
+        }
 
         let result = squad_executor
             .execute_squad(
@@ -722,6 +733,9 @@ impl CollaborationExecutor {
         }
         if let Some(max) = self.local_repair_max {
             squad_executor = squad_executor.with_local_repair_max(max);
+        }
+        if let Some(ref dir) = self.generation_dir {
+            squad_executor = squad_executor.with_generation_dir(dir.clone());
         }
 
         let mut context = Self::goal_context(task);

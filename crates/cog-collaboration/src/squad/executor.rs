@@ -130,6 +130,8 @@ pub struct SquadExecutor {
     /// 局部修复预算（来自配置面 `pge` 段）。None = 由
     /// [`crate::DEFAULT_LOCAL_REPAIR_MAX`] 兜底。
     local_repair_max: Option<u32>,
+    /// 生成信封落盘的根目录。None = 不落盘。
+    generation_dir: Option<std::path::PathBuf>,
 }
 
 /// Optional service dependencies shared by squad execution stages.
@@ -148,6 +150,19 @@ pub(crate) struct SquadDeps {
     pub ralph: RalphLoopConfig,
     /// 局部修复预算（配置面 `pge` 段）。None = [`crate::DEFAULT_LOCAL_REPAIR_MAX`]。
     pub local_repair_max: Option<u32>,
+    /// 生成信封落盘的根目录。None = 不落盘。
+    pub generation_dir: Option<std::path::PathBuf>,
+}
+
+/// 给流水线挂上生成信封的落盘位置。
+///
+/// 挂的是任务自己的 id，不是每一趟 PGE 请求的 id：信封回答的是「这件活产出了
+/// 什么」，而每趟请求的 id 只是那一路调用的编号。
+fn archive_generations(pipeline: PgePipeline, squad: &Squad, deps: &SquadDeps) -> PgePipeline {
+    match deps.generation_dir.as_ref() {
+        Some(dir) => pipeline.with_generation_archive(dir.clone(), squad.task_id.clone()),
+        None => pipeline,
+    }
 }
 
 impl SquadExecutor {
@@ -250,6 +265,13 @@ impl SquadExecutor {
         self
     }
 
+    /// 让每一轮生成在评估之前就落盘（配置面 `pge.envelope_dir`）。
+    /// Unset = 只在内存里，运行一断这份 diff 就没了。
+    pub fn with_generation_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.generation_dir = Some(dir.into());
+        self
+    }
+
     /// 直接执行一个 Squad，返回执行结果。
     pub async fn execute_squad(&self, task_id: String, config: SquadConfig) -> SquadResult {
         let squad_id = cog_core::squad_id_for(&task_id);
@@ -306,6 +328,7 @@ impl SquadExecutor {
             state_backend: self.state_backend.clone(),
             ralph: self.ralph,
             local_repair_max: self.local_repair_max,
+            generation_dir: self.generation_dir.clone(),
         };
         let result = Self::run_squad_with_retries(squad, deps).await;
         let squad_latency_ms = squad_start.elapsed().as_millis() as u64;
@@ -539,7 +562,7 @@ impl SquadExecutor {
             pipeline_config.local_repair_max = deps
                 .local_repair_max
                 .unwrap_or(crate::DEFAULT_LOCAL_REPAIR_MAX);
-            let pipeline = PgePipeline::new(pipeline_config);
+            let pipeline = archive_generations(PgePipeline::new(pipeline_config), &squad, &deps);
             return ralph
                 .run_declared_scope(
                     &squad.config.goal,
@@ -630,7 +653,8 @@ impl SquadExecutor {
                 pipeline_config.local_repair_max = deps
                     .local_repair_max
                     .unwrap_or(crate::DEFAULT_LOCAL_REPAIR_MAX);
-                let pipeline = PgePipeline::new(pipeline_config);
+                let pipeline =
+                    archive_generations(PgePipeline::new(pipeline_config), &squad, &deps);
                 match (planner.as_ref(), generator.as_ref(), evaluator.as_ref()) {
                     (Some(p), Some(g), Some(e)) => {
                         let mut planner_actor = PlannerActor::new(Arc::clone(p));

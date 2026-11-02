@@ -107,6 +107,29 @@ pub struct PgePipelineResult {
 #[derive(Debug)]
 pub struct PgePipeline {
     config: PgePipelineConfig,
+    archive: Option<GenerationArchive>,
+}
+
+/// Where every generation envelope is written the moment it exists.
+///
+/// The diff a generator produces is the only part of a run that cannot be
+/// bought again for nothing: the plan, the evaluation and the repair feedback
+/// are all cheap relative to it, and a run that dies after producing it (an
+/// upstream quota running out mid-pass is the observed case) has already paid
+/// for the expensive half. Keeping it only in memory means that payment is
+/// thrown away by the next inference call that fails — the run returns an
+/// error and the diff, complete and buildable, is dropped with it.
+///
+/// Everything the envelope needs is on the persistent volume the change queue
+/// already uses, so the bytes survive the process as well as the run.
+#[derive(Debug, Clone)]
+pub struct GenerationArchive {
+    dir: std::path::PathBuf,
+    task_id: String,
+    /// 本次运行的标识，落成目录名。同一个任务会被外层循环反复重跑，每次都会从
+    /// 第 1 轮重新计数；不带运行标识时，后一次运行的 a1-r0 覆盖前一次那一份，
+    /// 而被覆盖的正是「上一轮唯一那份完整 diff」。
+    run: String,
 }
 
 /// Where an attempt's plan comes from.
@@ -162,7 +185,95 @@ pub fn declared_plan(goal: &str, scale: crate::profile::DeclaredScale) -> Planne
 
 impl PgePipeline {
     pub fn new(config: PgePipelineConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            archive: None,
+        }
+    }
+
+    /// Write every generation envelope under `dir` the moment it is produced.
+    ///
+    /// `task_id` is the task the run is on behalf of, which is not the id of
+    /// the throwaway request each pass is issued under: the envelope is read
+    /// later to answer "what did this task's run produce", and the per-pass id
+    /// answers no such question.
+    pub fn with_generation_archive(
+        mut self,
+        dir: impl Into<std::path::PathBuf>,
+        task_id: impl Into<String>,
+    ) -> Self {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        self.archive = Some(GenerationArchive {
+            dir: dir.into(),
+            task_id: task_id.into(),
+            run: format!("{millis:013}"),
+        });
+        self
+    }
+
+    /// 把这一轮生成的信封写进盘上，供本次运行之外的读者取用。
+    ///
+    /// 写失败不终止运行：信封是这次生成多出来的一份保险，不是运行的前置条件，
+    /// 为它放弃一份已经付费的 diff 就本末倒置了。但失败要留下一条具名日志，
+    /// 否则「以为存了」与「存了」在任何读数上都没有分别。
+    async fn archive_generation(
+        &self,
+        attempt: u32,
+        repair_iteration: u32,
+        generation: &GeneratorOutput,
+    ) {
+        let Some(archive) = self.archive.as_ref() else {
+            return;
+        };
+        // 空信封里没有任何可以重建的东西；写它只会让目录里多一份读不出内容的
+        // 文件，并让「这里存了几份生成」这个读数失真。
+        if generation.artifacts.is_empty() {
+            return;
+        }
+        let task_dir = archive.dir.join(sanitize_path_component(&archive.task_id));
+        let run_dir = task_dir.join(&archive.run);
+        let path = run_dir.join(format!("a{attempt}-r{repair_iteration}.json"));
+        let envelope = serde_json::json!({
+            "task_id": archive.task_id,
+            "attempt": attempt,
+            "repair_iteration": repair_iteration,
+            "generation": generation,
+        });
+        let written = async {
+            tokio::fs::create_dir_all(&run_dir).await?;
+            let text = serde_json::to_string_pretty(&envelope)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            // 先写临时文件再改名：读的人可能恰好在写的同时打开这一份，半份
+            // JSON 会被读成「这份信封坏了」，而不是「这份信封还没写完」。
+            let tmp = run_dir.join(format!("a{attempt}-r{repair_iteration}.json.part"));
+            tokio::fs::write(&tmp, text).await?;
+            tokio::fs::rename(&tmp, &path).await
+        }
+        .await;
+        match written {
+            Ok(()) => {
+                tracing::info!(
+                    task_id = %archive.task_id,
+                    attempt,
+                    repair_iteration,
+                    path = %path.display(),
+                    "Generation envelope archived before it could be lost with the run"
+                );
+                prune_superseded_runs(&task_dir, &archive.run).await;
+            }
+            Err(e) => tracing::warn!(
+                task_id = %archive.task_id,
+                attempt,
+                repair_iteration,
+                path = %path.display(),
+                error = %e,
+                "could not archive this run's generation envelope; the diff lives only in memory until the run ends"
+            ),
+        }
     }
 
     /// Build the failing result for a deterministic environment/protocol
@@ -349,6 +460,11 @@ impl PgePipeline {
                 return Self::terminal_result(attempt, plan, generation, None, history);
             }
 
+            // 信封在评估之前落盘：从这里往后每一通调用都可能因为上游配额耗尽而
+            // 中断整条流水线，而中断带走的是内存里的这一份 generation。落盘放在
+            // 评估之前，才有「下一通调用失败时 diff 已经在盘上」这个性质。
+            self.archive_generation(attempt, 0, &generation).await;
+
             let eval_history: Vec<serde_json::Value> = history
                 .iter()
                 .map(|h| {
@@ -467,6 +583,10 @@ impl PgePipeline {
                     );
                     return Self::terminal_result(attempt, plan.clone(), generation, None, history);
                 }
+
+                // 与首轮同一条：修复出来的信封在下一次调用之前就落盘。
+                self.archive_generation(attempt, repair_iteration, &generation)
+                    .await;
 
                 // Same rule as the initial generation: a repair that delivered
                 // nothing is judged under its own cause, not spent on an
@@ -676,6 +796,54 @@ impl PgePipeline {
     }
 }
 
+/// 把任务 id 变成一个目录名。
+///
+/// 任务 id 来自外部（协作调用方），可能带 `/`、空格或点号；原样拼进路径会让
+/// 「这个任务的信封」落到别的任务的目录里，甚至落到信封目录之外。
+fn sanitize_path_component(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('.').to_string();
+    if trimmed.is_empty() {
+        "unknown-task".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// 同一个任务只留最近一次运行的信封。
+///
+/// 一个任务会被外层循环反复重跑，每次运行都写一份自己的信封；不收拾的话这个
+/// 目录随重跑次数线性增长，而重跑恰恰是失败时才发生的事——增长最快的路径正好
+/// 是没人去看的那条。留下的那份是最近一次运行，也就是重入时唯一该读的那份。
+async fn prune_superseded_runs(task_dir: &std::path::Path, keep: &str) {
+    let Ok(mut entries) = tokio::fs::read_dir(task_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.as_ref() == keep {
+            continue;
+        }
+        if let Err(e) = tokio::fs::remove_dir_all(entry.path()).await {
+            tracing::warn!(
+                path = %entry.path().display(),
+                error = %e,
+                "could not prune a superseded generation envelope run"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -689,9 +857,19 @@ mod tests {
         response: serde_json::Value,
     }
 
+    /// 让一个测试替身在被问到时代码路径中断（而不是返回一个答案）。
+    ///
+    /// 有的性质只能靠「这一刻它还没被问到」来量：生成信封是否在评估之前落盘，
+    /// 就是这样一个性质。让评估这一格真的炸掉，是唯一能证明「信封早已在盘上」
+    /// 而不是「运行跑完顺手写的」的办法。
+    const PANIC_ON_PROMPT: &str = "__panic_on_prompt__";
+
     #[async_trait::async_trait]
     impl cog_core::Agent for MockAgent {
         async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+            if self.response.as_str() == Some(PANIC_ON_PROMPT) {
+                panic!("this role was asked for an answer it must never be asked for");
+            }
             Ok(self.response.clone())
         }
 
@@ -1928,6 +2106,85 @@ mod tests {
         assert!(
             result.history[0].local_repairs.is_empty(),
             "no repair can be aimed at feedback that was never written"
+        );
+    }
+
+    /// 生成信封在评估之前就在盘上。
+    ///
+    /// 一次运行要串起最多七通推理调用，任何一通因为上游配额耗尽而失败都会把
+    /// 内存里那份已经付过费的 diff 一起带走——2026-11-01 起这条流水线上「diff
+    /// 存下来了」只对跑完的运行成立，而跑不完的运行恰恰是最需要那份 diff 的。
+    /// 这里让评估这一格直接炸掉：它能被证明的唯一方式是信封在它被问到之前
+    /// 已经落盘，而不是运行结束时顺手写的。
+    #[tokio::test]
+    async fn a_generation_is_on_disk_before_the_evaluator_is_asked_for_a_verdict() {
+        use futures::FutureExt;
+        let temp = tempfile::tempdir().unwrap();
+        let pipeline = PgePipeline::new(PgePipelineConfig {
+            max_retries: 1,
+            timeout_ms: 5_000,
+            local_repair_max: 2,
+            stall_threshold: 2,
+            independent_review: false,
+        })
+        .with_generation_archive(temp.path(), "change-ledger-abc");
+
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "summary": "s",
+                "plan": {"steps": ["edit"]},
+                "sub_tasks": [],
+                "acceptance_criteria": []
+            }),
+        }));
+        let diff =
+            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "content": {"note": "done"},
+                "artifacts": [{
+                    "name": "change.diff",
+                    "artifact_type": "change",
+                    "content": diff,
+                }],
+            }),
+        }));
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!(PANIC_ON_PROMPT),
+        }));
+
+        let task = test_task("edit x.rs");
+        let outcome = std::panic::AssertUnwindSafe(pipeline.execute_task(
+            &task,
+            serde_json::json!({}),
+            &planner,
+            &generator,
+            &evaluator,
+        ))
+        .catch_unwind()
+        .await;
+        assert!(
+            outcome.is_err(),
+            "the evaluator must have panicked, or this test proves nothing about ordering"
+        );
+
+        let task_dir = temp.path().join("change-ledger-abc");
+        let mut runs = std::fs::read_dir(&task_dir)
+            .expect("the archive directory exists at the moment the evaluator was asked")
+            .map(|e| e.unwrap().path())
+            .collect::<Vec<_>>();
+        runs.sort();
+        let run = runs.last().expect("one run directory");
+        let envelope: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(run.join("a1-r0.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            envelope["task_id"], "change-ledger-abc",
+            "the envelope must name the task whose run produced it"
+        );
+        assert_eq!(
+            envelope["generation"]["artifacts"][0]["content"], diff,
+            "the archived envelope must carry the diff itself, not a pointer to one"
         );
     }
 }
