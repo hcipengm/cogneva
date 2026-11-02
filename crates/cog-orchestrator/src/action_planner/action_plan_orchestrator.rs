@@ -1214,10 +1214,8 @@ impl ActionPlanOrchestrator {
                     self.fire_decomposition_alert(
                         cog_core::ALERT_RULE_DECOMPOSITION_ORPHANED,
                         &goal_id,
-                        row.face_id.as_deref(),
-                        Some(id.as_str()),
+                        Some(&row),
                         attempts_used,
-                        Some(&row.input),
                         &reason,
                     )
                     .await;
@@ -1247,16 +1245,18 @@ impl ActionPlanOrchestrator {
     /// Drive a decomposition alert through the persistent alert port when
     /// one is attached; degrade to error logging otherwise so the condition
     /// stays visible even without the observability plugin.
+    ///
+    /// 判词要落的每一格都取自**同一行**：谁、哪一面、这一行原本要做成什么，
+    /// 分开传就允许调用方把三样凑成一行在图上从没同时成立过的样子。
     async fn fire_decomposition_alert(
         &self,
         rule: &str,
         goal_id: &str,
-        face: Option<&str>,
-        task_id: Option<&str>,
+        row: Option<&Task>,
         attempts: u32,
-        original_input: Option<&serde_json::Value>,
         reason: &str,
     ) {
+        let task_id = row.map(|t| t.id.as_str());
         let task_part = task_id.unwrap_or("-");
         let dedup_key = format!("{rule}:{goal_id}:{task_part}");
         let message = format!(
@@ -1268,7 +1268,7 @@ impl ActionPlanOrchestrator {
             "attempts": attempts,
             "source": "action_planner",
             "task_goal": cog_core::bounded_task_goal(
-                original_input,
+                row.map(|t| &t.input),
                 cog_core::ALERT_LABEL_VALUE_MAX_CHARS,
             ),
         });
@@ -1276,7 +1276,11 @@ impl ActionPlanOrchestrator {
         // 人」——没有这一格，一条分解判退就只能读成 `no_face`，谁也说不清该谁动，
         // 而判退恰恰是「这件事要有人接」的那一类。目标行没指定面时不写这一格：
         // 空字符串会被读成一个名叫「空」的面，那比缺席更糟。
-        if let Some(face) = face.map(str::trim).filter(|f| !f.is_empty()) {
+        if let Some(face) = row
+            .and_then(|t| t.face_id.as_deref())
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+        {
             labels[cog_core::ALERT_FACE_LABEL] = serde_json::json!(face);
         }
         if let Some(sink) = self.alert_sink().await {
@@ -1312,16 +1316,8 @@ impl ActionPlanOrchestrator {
         reason: String,
     ) -> SFResult<Vec<String>> {
         tracing::error!(rule = %rule, goal_id = %goal_id, "{reason}");
-        self.fire_decomposition_alert(
-            rule,
-            goal_id,
-            tasks.first().and_then(|t| t.face_id.as_deref()),
-            tasks.first().map(|t| t.id.as_str()),
-            attempts,
-            tasks.first().map(|t| &t.input),
-            &reason,
-        )
-        .await;
+        self.fire_decomposition_alert(rule, goal_id, tasks.first(), attempts, &reason)
+            .await;
         let Some(ref dag) = self.dag_executor else {
             // No DagExecutor: the verdict was logged and alerted but recorded
             // nowhere, so there is no id to report as recorded.
