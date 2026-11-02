@@ -181,10 +181,26 @@ pub enum ThinkingLevel {
     Xhigh,
 }
 
+/// 请求要不要让上游缓存它的前缀，以及缓存留多久。
+///
+/// 这不是一个「更省」的开关，而是两个协议面之间唯一不对称的那一格：OpenAI 兼容面
+/// 由厂商自动按前缀缓存，请求里什么也不用写；Anthropic 面只缓存请求用
+/// `cache_control` 标出来的那一段，不标就是每一次都按全价重发整段 prompt。
+///
+/// 默认值是 `Short`，因为**默认不该取决于调用点记不记得**：2026-11-02 实测，
+/// 打开这件事的地方只有 agent_kernel 的两处，而它当前不在产生流量的路径上；真正
+/// 在花的三条（`agent:planner` 平均 20k token 一段、`agent:generator`、`ralph`）
+/// 全走默认值，于是 Anthropic 面 7 天 3679 次调用、1300 万 prompt token、
+/// 命中 3.3%，而 `tokens_cache_created` 全期为 0——一次缓存都没写过。默认开着，
+/// 「没开」才需要一个调用点专门说出来。
+///
+/// 代价是有界的：写缓存按 1.25 倍计价，写入后 5 分钟内没被读到的那些前缀等于多付
+/// 了四分之一。账本里 `tokens_cache_created` 与命中率是这件事的判据——写得多而
+/// 一点都不命中，说明前缀每发都在变，那才是该关掉的地方，而不是全局default。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum CacheRetention {
-    #[default]
     None,
+    #[default]
     Short,
     Long,
 }

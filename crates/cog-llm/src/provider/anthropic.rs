@@ -966,6 +966,26 @@ mod tests {
         provider.build_request_body(msgs, &options)
     }
 
+    /// 调用点什么都没说时，这个协议面照样标断点。
+    ///
+    /// 「没说要缓存」与「不要缓存」不是同一件事，而默认值把前者变成了后者：
+    /// 打开缓存的地方只有 agent_kernel 的两处，真正在花的几条路径全走默认值，
+    /// 于是 7 天 1300 万 prompt token 一次缓存都没写过。这条钉的是默认值本身，
+    /// 不是某一处调用点。
+    #[test]
+    fn a_request_that_says_nothing_still_marks_its_cacheable_prefix() {
+        let body = body_with(CacheRetention::default(), &conversation());
+        assert_ne!(
+            CacheRetention::default(),
+            CacheRetention::None,
+            "the default must not be the same value as an explicit opt-out"
+        );
+        let system = body["system"]
+            .as_array()
+            .expect("a default request must mark the system prefix, or this face never caches");
+        assert!(system.last().unwrap()["cache_control"].is_object());
+    }
+
     /// 不要求缓存时，请求体与改动之前逐字节一致：这一支是**回归**的判据。
     #[test]
     fn retention_none_sends_no_breakpoint_at_all() {
