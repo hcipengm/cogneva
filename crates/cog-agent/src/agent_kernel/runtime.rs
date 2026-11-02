@@ -11,6 +11,12 @@ use crate::context::{truncate_to_chars, ContextWindow};
 use crate::hooks::LifecycleHookEvent;
 use crate::tools::{ToolRegistry, ToolRunError};
 
+/// Smallest repeated tool result that is worth replacing with a pointer.
+///
+/// Below this a repeated result is a tool answering a different question with
+/// the same few words, and the pointer would not be shorter than the answer.
+const REPEATED_TOOL_RESULT_MIN_CHARS: usize = 2_000;
+
 /// A single ReAct iteration: Thought -> Action -> Observation.
 /// ReAct (Reasoning + Acting) is the fundamental cycle each Agent executes:
 /// 1. **Think** — the LLM reasons about the problem and decides what to do
@@ -1191,6 +1197,40 @@ impl AgentRuntime {
         }
     }
 
+    /// The stub that stands in for a tool result this run already carried.
+    ///
+    /// The model re-asks for a file it has already read, and each answer puts
+    /// the same bytes into the transcript again. Measured over 2026-10-31 to
+    /// 2026-11-02 (1,018 successful calls): 3% of all tool output was a repeat
+    /// of output the same request already carried, and one generator request
+    /// was 64% duplicated because it read one file three times in a row.
+    /// Those bytes are already in the conversation above, so the repeat is
+    /// replaced by a pointer that says so — the payload is left out, and the
+    /// tool_use / tool_result pairing the provider requires is kept.
+    ///
+    /// Only results that are byte-identical and large enough to be worth it.
+    /// A short repeat ("0 errors", an empty listing) is the tool answering a
+    /// different question with the same words, and the stub would not be
+    /// smaller than what it replaced.
+    fn repeated_tool_result(&self, text: &str) -> Option<String> {
+        if text.chars().count() < REPEATED_TOOL_RESULT_MIN_CHARS {
+            return None;
+        }
+        let repeated = self.context.messages().iter().any(|message| {
+            matches!(message, Message::ToolResult { .. }) && message.content() == text
+        });
+        repeated.then(|| {
+            serde_json::json!({
+                "deduplicated": true,
+                "bytes": text.len(),
+                "note": "This is the same output an earlier call in this run already returned, \
+                         and it is still in the conversation above. Read it there instead of \
+                         asking again.",
+            })
+            .to_string()
+        })
+    }
+
     /// The tool-result message for one call, archiving the output when it will
     /// not fit the window.
     ///
@@ -1208,6 +1248,9 @@ impl AgentRuntime {
         tool_name: &str,
         text: &str,
     ) -> Message {
+        if let Some(stub) = self.repeated_tool_result(text) {
+            return Message::tool_result_text(tool_call_id, tool_name, &stub);
+        }
         let budget = self.context.tool_result_budget_chars();
         if text.chars().count() <= budget {
             return Message::tool_result_text(tool_call_id, tool_name, text);
@@ -5506,5 +5549,71 @@ mod tests {
             "报的必须是角色真正绑上的那个技能名"
         );
         assert!(seen[0].success, "交付了就是成功");
+    }
+
+    /// 同一份工具输出在一趟运行里只付一次钱。
+    ///
+    /// 模型会重读它已经读过的那个文件，而同一次读的答案一直留在对话里：
+    /// 实测 2026-10-31 至 2026-11-02 的 1,018 次成功调用里，请求内重复的工具
+    /// 输出占全部工具输出的 3%，其中一件 generator 请求被三次相同的 read_file
+    /// 撑到 64% 重复。重复的那一份换成指针——配对保住，字节不再付第二次。
+    /// 一条声明了这个工具调用的 assistant 消息：没有它，工具结果在进上下文
+    /// 时就是孤儿，会被剥掉，测的就不再是重复这件事。
+    fn asks_for(tool_call_id: &str) -> Message {
+        Message::Assistant {
+            content: vec![ContentBlock::tool_call(
+                tool_call_id,
+                "read_file",
+                json!({ "path": "crates/a.rs" }),
+            )],
+            tool_calls: None,
+            usage: None,
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_result_the_run_already_carried_is_not_paid_for_twice() {
+        let (tx, mut rx) = mpsc::channel::<AgentEvent>(100);
+        tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut runtime = AgentRuntime::new(RuntimeConfig::default(), tx);
+
+        let big = format!(
+            "{{\"content\":\"{}\"}}",
+            "x".repeat(REPEATED_TOOL_RESULT_MIN_CHARS)
+        );
+        let first = runtime
+            .tool_result_message(None, 0, 0, "call-1", "read_file", &big)
+            .await;
+        assert_eq!(first.content(), big, "第一次读到的东西要原样交给模型");
+        runtime.context.add_message(asks_for("call-1"));
+        runtime.context.add_message(first);
+
+        let second = runtime
+            .tool_result_message(None, 0, 1, "call-2", "read_file", &big)
+            .await;
+        assert_ne!(
+            second.content(),
+            big,
+            "同一份输出第二次出现时不该再发一遍：那 {} 个字节已经在上一轮里了",
+            big.len()
+        );
+        let stub: serde_json::Value =
+            serde_json::from_str(&second.content()).expect("指针仍然是一份工具结果");
+        assert_eq!(stub["deduplicated"], serde_json::json!(true));
+        assert!(
+            second.content().len() < 400,
+            "指针要是指得比原文还长，就等于没省"
+        );
+
+        // 反向对照：换一份内容，它照原样发出去。
+        let other = format!(
+            "{{\"content\":\"{}\"}}",
+            "y".repeat(REPEATED_TOOL_RESULT_MIN_CHARS)
+        );
+        let third = runtime
+            .tool_result_message(None, 0, 2, "call-3", "read_file", &other)
+            .await;
+        assert_eq!(third.content(), other, "没重复的输出不许被当成重复");
     }
 }
