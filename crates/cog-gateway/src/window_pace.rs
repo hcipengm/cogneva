@@ -143,12 +143,45 @@ impl RulerMember {
 /// it is the one that would refuse first, so satisfying it satisfies the rest.
 /// Ties keep the shortest window, which is the order the caller hands them in
 /// and also the ruler that refills soonest.
-pub fn governing_ruler(members: &[RulerMember], now_unix: i64) -> Option<usize> {
-    members
-        .iter()
-        .enumerate()
-        .filter(|(_, member)| member.measured.is_usable() && member.is_current(now_unix))
-        .min_by_key(|(_, member)| member.remaining_tokens(now_unix))
+///
+/// `reserve_tokens` is what one whole job costs, and it takes a ruler out of
+/// the running when that ruler's **capacity** is smaller than it. Such a window
+/// can never pay for a job: its allowance ramps from zero to its capacity and
+/// no further, so the admission subtraction is negative for the window's whole
+/// life and the pool admits nothing until the measurement expires — a bound
+/// that cannot be satisfied by waiting, reported in the same words as one that
+/// can. Measured 2026-11-02: the five-hour ruler held 190,982 tokens while one
+/// job drew 348,009 at the 75th percentile, so against a whole-job reserve that
+/// ruler could only ever refuse. A window too small to hold one job is not a
+/// budget this gate can honour at job granularity; it is a wall that will be
+/// hit and re-measured, which is what the refusal path already does.
+///
+/// When *no* live ruler can hold a job, the largest one still governs rather
+/// than none: with no member in the pool sum the request path refuses on
+/// nothing at all, and an unthrottled burn is the failure this module exists to
+/// prevent while a refusal that names the budget is at least the truth. Its
+/// allowance is the honest best case, and the subtraction stays negative, so
+/// the pool reports the budget as the reason instead of inventing headroom.
+pub fn governing_ruler(
+    members: &[RulerMember],
+    now_unix: i64,
+    reserve_tokens: u64,
+) -> Option<usize> {
+    let live = || {
+        members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| member.measured.is_usable() && member.is_current(now_unix))
+    };
+    let tightest = |(_, a): &(usize, &RulerMember), (_, b): &(usize, &RulerMember)| {
+        a.remaining_tokens(now_unix)
+            .cmp(&b.remaining_tokens(now_unix))
+            .then(a.measured.window_secs.cmp(&b.measured.window_secs))
+    };
+    live()
+        .filter(|(_, member)| member.measured.capacity_tokens >= reserve_tokens)
+        .min_by(tightest)
+        .or_else(|| live().max_by_key(|(_, member)| member.measured.capacity_tokens))
         .map(|(index, _)| index)
 }
 
@@ -648,6 +681,10 @@ mod tests {
     use super::*;
 
     const DAY: i64 = 86_400;
+    /// What one whole job costs at the reserve the gateway runs with, so the
+    /// capacity filter below is exercised at a realistic size rather than at a
+    /// number picked to make both sides of every assertion pass.
+    const ONE_JOB: u64 = 1_100_000;
 
     fn month() -> MeasuredWindow {
         MeasuredWindow {
@@ -1376,7 +1413,7 @@ mod tests {
         assert!(burst.remaining_tokens(now) > week.remaining_tokens(now));
         let members = [burst, week];
         assert_eq!(
-            governing_ruler(&members, now),
+            governing_ruler(&members, now, ONE_JOB),
             Some(1),
             "宽的那把先放行，紧的那把随后就会拒，配速照宽的走等于把拒绝留给上游"
         );
@@ -1388,7 +1425,7 @@ mod tests {
         both.add(&members[1].measured, members[1].spent_tokens, now);
         let both = both.finish(0, 0);
         let mut one = PoolPace::default();
-        let governing = members[governing_ruler(&members, now).unwrap()];
+        let governing = members[governing_ruler(&members, now, ONE_JOB).unwrap()];
         one.add(&governing.measured, governing.spent_tokens, now);
         let one = one.finish(0, 0);
         assert_eq!(
@@ -1421,7 +1458,7 @@ mod tests {
             exhausted: true,
         };
         assert_eq!(
-            governing_ruler(&[open, refused], now),
+            governing_ruler(&[open, refused], now, ONE_JOB),
             Some(1),
             "被拒的那把余量为零，坡度还在说的那份额度不能替它说话"
         );
@@ -1446,7 +1483,7 @@ mod tests {
         };
         assert!(!stale.is_current(now), "二十天前的边界不止两个周期");
         assert_eq!(
-            governing_ruler(&[stale], now),
+            governing_ruler(&[stale], now, ONE_JOB),
             None,
             "没有一只还说得出此刻容量的尺子，就该报「量不出来」而不是报一份额度"
         );
@@ -1460,6 +1497,82 @@ mod tests {
             ..stale
         };
         assert!(fresh.is_current(now), "一个周期多一点的边界仍在用");
-        assert_eq!(governing_ruler(&[fresh], now), Some(0));
+        assert_eq!(governing_ruler(&[fresh], now, ONE_JOB), Some(0));
+    }
+
+    /// 一窗的容量装不下一件整活时，它不许当那把尺子。
+    ///
+    /// 现网形状（2026-11-02 的量）：五小时那把容量 190,982，七天那把
+    /// 15,112,408，而一件活按 99 分位要 1,099,270。五小时那把的允许量从零爬
+    /// 到 190,982 就到顶，永远追不上预留，于是只要它说了算，这一家在整个窗里
+    /// 一件也放不进来——而读数面上它写的是「等额度」，等多久都不会变。让它退出
+    /// 之后，七天那把按自己的坡度放行，五小时那把撞墙时仍然会被 `exhausted`
+    /// 那一路按零计（拒绝是这一家的观测，不是某一把尺子的）。
+    #[test]
+    fn a_window_that_cannot_hold_one_job_never_governs() {
+        let now = 1_000_000 + 10 * DAY;
+        let five_hour = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 190_982,
+                window_secs: 18_000,
+                burned_at_unix: now - 9_000,
+            },
+            spent_tokens: 0,
+            exhausted: false,
+        };
+        let week = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 15_112_408,
+                window_secs: (7 * DAY) as u64,
+                burned_at_unix: now - 3 * DAY,
+            },
+            spent_tokens: 1_000_000,
+            exhausted: false,
+        };
+        // 没有预留时，五小时那把余量最小、照旧最紧——这条断言把「换掉答案的
+        // 是预留，不是别的什么改动」钉在同一个夹具上。
+        assert_eq!(governing_ruler(&[five_hour, week], now, 0), Some(0));
+        assert_eq!(
+            governing_ruler(&[five_hour, week], now, ONE_JOB),
+            Some(1),
+            "装不下一件整活的窗口当尺子，这一家就永远放不进一件活"
+        );
+    }
+
+    /// 一把都装不下时，仍然由最大的那把报数，而不是谁都不报。
+    ///
+    /// 谁都不进池和，请求路就没有可拒的数——那是不限速地烧，比拒更坏；最大的
+    /// 那把给出的是这一家此刻最好的那份允许量，减法照样是负的，于是池子说的是
+    /// 「额度不够」，而不是凭空多出一份产能。
+    #[test]
+    fn the_largest_window_still_reports_when_none_can_hold_a_job() {
+        let now = 1_000_000 + 10 * DAY;
+        let small = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 190_982,
+                window_secs: 18_000,
+                burned_at_unix: now - 9_000,
+            },
+            spent_tokens: 0,
+            exhausted: false,
+        };
+        let smaller = RulerMember {
+            measured: MeasuredWindow {
+                capacity_tokens: 120_000,
+                window_secs: 3_600,
+                burned_at_unix: now - 600,
+            },
+            spent_tokens: 0,
+            exhausted: false,
+        };
+        assert_eq!(
+            governing_ruler(&[smaller, small], now, ONE_JOB),
+            Some(1),
+            "两把都装不下一件活时，报最大的那份允许量"
+        );
+        assert!(
+            small.remaining_tokens(now) < ONE_JOB,
+            "这条判据的前提：放行的那份允许量仍然付不起一件整活"
+        );
     }
 }

@@ -4564,10 +4564,20 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
 /// 异常便宜的批任务拉低，长了会把配置/提示词变更之前的形状带进来。
 // cap: bound — 用近一个月的历史任务量成本；短了会被一次异常便宜的批任务拉低，长了会把提示词变更前的形状带进来
 const WINDOW_PACE_RESERVE_DAYS: i64 = 30;
-/// 预留取的分位数。中位数会让一半的任务**装不下**它自己，那正好是"开一半就
-/// 断"的那种坏法；75 分位让大多数任务整件装得下，代价是开头那一小段等得更久。
-// cap: bound — 预留取 75 分位：中位数会让一半任务装不下自己，那正是「开一半就断」
-const WINDOW_PACE_RESERVE_QUANTILE: f64 = 0.75;
+/// 预留取的分位数。这一格要答的是"这一窗还装不装得下**一件整活**"，不是"装不
+/// 装得下一件典型的活"——低于分布顶端的任何一个分位，答的都是后一个问题，而两
+/// 者之间差的不是风险溢价，是许可：实测 2026-11-01，一台上游按 359,235 的预留放
+/// 进来的一件活，一小时内花了 4,006,951；同一本账近 30 天 610 件任务的分布是
+/// 75 分位 348,009、95 分位 661,722、99 分位 1,099,270、最大 1,727,632。75 分位
+/// 于是把"一窗放一件"变成了"一窗放一件要花十一倍于它自己的活"。
+///
+/// 99 分位而不是最大：最大由一件失控的活定，它会在账上压 30 天，把这台上游整月
+/// 关死；99 分位让百分之一的活可能超出预留，而超出的上界是 1.6 倍（1,727,632 /
+/// 1,099,270），一窗之内有界。这一格抬高之后，配速可以一直拒到这一窗真能付得起
+/// 一件整活为止——而"这条尺子根本装不下一件活"要另判，否则抬高的预留会把窄窗变
+/// 成永久拒绝，见 [`crate::window_pace::governing_ruler`]。
+// cap: bound — 预留取 99 分位：低于它的分位答的是"典型的活装得下"，不是"整件装得下"
+const WINDOW_PACE_RESERVE_QUANTILE: f64 = 0.99;
 
 /// 一拍窗口配速：量出每个上游的容量、算出这一窗的允许量、把用量对上去。
 ///
@@ -4957,7 +4967,8 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
                 exhausted,
             });
         }
-        let Some(governing) = crate::window_pace::governing_ruler(&members, now_unix) else {
+        let Some(governing) = crate::window_pace::governing_ruler(&members, now_unix, reserve)
+        else {
             rulers.push((
                 reading.key.clone(),
                 if spend_unreadable {
@@ -16793,6 +16804,29 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(
             durable_gauge_key("m", &[("a", "1"), ("b", "2")]),
             durable_gauge_key("m", &[("b", "2"), ("a", "1")])
+        );
+    }
+
+    /// 预留那一格答的是"这一窗还装不装得下一件**整活**"，所以它必须落在分布顶端。
+    ///
+    /// 这一格不是能算出来的量，是一个判断，判断的依据是账上的分布（实测
+    /// 2026-11-02：近 30 天 610 件任务的 75 分位 348,009、99 分位 1,099,270、
+    /// 最大 1,727,632）。判据钉住这条推理的下界：低于 95 分位，答的就变成"典型
+    /// 的活装得下"，而 2026-11-01 一窗里放进来一件花掉十一倍预留的活，正是那么
+    /// 来的。想往下调，得先有一个读数说明"整件装得下"不再是问题。
+    #[test]
+    fn the_reserve_answers_whether_one_whole_job_fits() {
+        // 绑一次再断言：直接断言常量会触发 `assertions_on_constants`，而这
+        // 一格确实是一个判断，读起来也该像一个判断。
+        let quantile = WINDOW_PACE_RESERVE_QUANTILE;
+        assert!(
+            quantile >= 0.95,
+            "预留取到了 {quantile} 分位——那答的是「一件典型的活装不装得下」，不是「一件整活装不装得下」"
+        );
+        assert!(
+            quantile < 1.0,
+            "取到最大就等于让一件失控的活把这一家关死 {} 天：它在账上压多久，界就抬到多高",
+            WINDOW_PACE_RESERVE_DAYS
         );
     }
 
