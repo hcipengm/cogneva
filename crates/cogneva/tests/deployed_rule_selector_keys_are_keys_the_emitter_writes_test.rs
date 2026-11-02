@@ -39,13 +39,13 @@
 //!   either teaches the extractor or writes the reason down.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::common;
 
 use common::lex::Dialect;
 use common::routes::{matching_brace, repo_root};
-use common::rules::promql_expressions;
+use common::rules::{promql_expressions, rule_document};
 
 use common::rust_production::{
     production_lines_keeping_comments, production_sources, relative_name,
@@ -562,12 +562,6 @@ fn matcher_key(matcher: &str) -> Option<&str> {
     } else {
         None
     }
-}
-
-fn rule_document(root: &Path) -> serde_json::Value {
-    let path: PathBuf = root.join("deploy/helm/cogneva/files/cogneva.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
 /// 规则里选的每一个 (读数名, 键)，去掉采集面那几条。

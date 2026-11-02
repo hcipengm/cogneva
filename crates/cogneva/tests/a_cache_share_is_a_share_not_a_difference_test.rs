@@ -20,11 +20,12 @@
 //! 所以名册里那行不是形式主义——加一条新读者时，写不清它算的是哪一段就会在下一行
 //! 判红。这是这份标本能给的最强的一格。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::common;
 
 use common::routes::repo_root;
+use common::rules::rule_document;
 
 /// 读 `kind="cached"` 的每条规则：它把缓存那一格算成什么。
 ///
@@ -34,12 +35,6 @@ const CACHED_READERS: &[(&str, &str)] = &[(
     "llm_cache_hit_share_collapsed",
     "命中率 = cached / (input + cached)，只在分母过二十万 token 时判下界 0.15",
 )];
-
-fn rule_document(root: &Path) -> serde_json::Value {
-    let path: PathBuf = root.join("deploy/helm/cogneva/files/cogneva.json");
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-}
 
 /// 规则库里每一条 `(名字, 表达式)`。
 fn named_expressions(value: &serde_json::Value, out: &mut Vec<(String, String)>) {
