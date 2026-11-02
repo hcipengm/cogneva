@@ -108,6 +108,51 @@ pub const SUPERSEDED_SHAPES: &[(&str, &str)] = &[
     ("metrics_samples_over_capacity", DEPLOYMENT_LABEL),
 ];
 
+/// 申报：**按标签值**过期的一族序列，以及它们共用的那份名册。
+///
+/// [`SUPERSEDED_SHAPES`] 管的是「名字还在长、某个标签键没了」；这里管的是另一半：
+/// 标签键一直在，**取值集合变了**——一个上游从配置里被删掉或改了名。名册那条序列
+/// 的写入者是唯一知道「现在池里有谁」的地方（网关的池状态发布循环逐条上游都写
+/// `llm_upstream_position`，连这一代进程一次都没碰过的也写），所以它每拍都给出完整
+/// 的当前集合；**不在名册上的取值 = 从池里走了**。
+///
+/// 为什么必须有人删：durable 那一层的读法是「逐标签集取最新一行」，于是走掉的那条
+/// 序列会带着它最后一次的值永远留在现在时里。2026-11-02 实测这台部署：配置里两个
+/// 上游，而 `llm_upstream_healthy` 这一族带着五个——多出来的三个（`ark-code-latest`
+/// 在 `/api/coding/v3` 上的旧键、`kimi-k3`、`qwen3.8-max`）分别停在 10-18 与 10-24，
+/// 其中两条是一枚改名的前半截。它们在每一处按「上游」聚合的读数上都被算进池子，
+/// 而写者早就没有它们了。
+///
+/// 与名字、形状两条一样，这一条也**不自作判断**：名册是写者给的，不是这里猜的。
+/// 三条腿缺一不可：这一行带 `upstream` 标签、它的取值不在**新鲜**的名册上、它自己
+/// 已经安静超过 [`SUPERSEDED_QUIET_SECS`]。名册不新鲜时**一条都不删**——名册缺席
+/// 不是「池空了」，那是写者停了或进程刚起，而按缺席删会把还活着的一族整族删掉。
+pub const ROSTERED_LABEL_SERIES: &[&str] = &[
+    "llm_upstream_healthy",
+    "llm_upstream_position",
+    "llm_upstream_shape_errored",
+    "llm_upstream_face_answers",
+    "llm_upstream_quota_window_secs",
+    "llm_upstream_quota_reset_unix",
+    "llm_upstream_consecutive_failures",
+    "llm_upstream_refusal_kind",
+    "llm_pool_upstream_with_ruler",
+    "llm_temperature_verdict_measured",
+    "llm_tool_calls_verdict_measured",
+];
+
+/// 上面这一族共用的名册序列，以及它用来指认一条上游的那个标签。
+pub const ROSTER_SERIES: &str = "llm_upstream_position";
+pub const ROSTER_LABEL: &str = "upstream";
+
+/// 名册的一行要有多新，才算「写者这一拍确实在说话」。
+///
+/// 取 3600 s ＝ durable 面那 1800 s 心跳的两倍：名册上每一条的取值都是常量
+/// （位置），所以它只在心跳上重写，一个刚好落在两次心跳之间的读数必须还在窗口内。
+/// 再窄一点会把一个健康的写者读成停了，宽一点只是把删除推后。
+pub const ROSTER_FRESH_SECS: i64 =
+    2 * cog_core::reading_cadence::UNCHANGED_READING_HEARTBEAT.as_secs() as i64;
+
 /// 一个被判为孤儿的标签集要**安静多久**，release 才允许动它。
 ///
 /// 这是形状守卫唯一一条**统计**腿；另两条是结构性的（这行不带那个标签、且同名有个
@@ -292,6 +337,20 @@ impl MetricsRetirement {
             .delete_superseded_shapes(&self.samples, ShapeClock::Column("timestamp"), Some("id"))
             .await?;
 
+        // 名册那一步与上面三条通道同一个归属：删多少折回它所在的那张表。
+        counter_totals += self
+            .delete_roster_orphans(&self.counter_totals, ShapeClock::Column("updated_at"), None)
+            .await?;
+        histogram_buckets += self
+            .delete_roster_orphans(&self.histogram_buckets, ShapeClock::ViaSums, None)
+            .await?;
+        histogram_sums += self
+            .delete_roster_orphans(&self.histogram_sums, ShapeClock::Column("updated_at"), None)
+            .await?;
+        samples += self
+            .delete_roster_orphans(&self.samples, ShapeClock::Column("timestamp"), Some("id"))
+            .await?;
+
         Ok(RetirementOutcome {
             samples,
             counter_totals,
@@ -434,6 +493,115 @@ impl MetricsRetirement {
                 }
                 Ok(total)
             }
+        }
+    }
+
+    /// 名册那一步：把 [`ROSTERED_LABEL_SERIES`] 里不在当前名册上的取值，从一张表里
+    /// 删掉。
+    ///
+    /// 三条腿：这行带 [`ROSTER_LABEL`]、它的取值不在**新鲜**的名册上、它自己安静够久。
+    /// 第四条腿在语句外面：名册一条新鲜行都没有时整条语句不执行——名册缺席不是「池空
+    /// 了」，而是写者停了或进程刚起，那时按缺席删会把还活着的一族整族删掉。
+    ///
+    /// 名册**永远从样本日志读**，不从被删的那张表读：它是这个族里唯一一个每条上游都
+    /// 按拍写到的序列，而累加表里根本没有它。
+    async fn delete_roster_orphans(
+        &self,
+        table: &str,
+        clock: ShapeClock,
+        batch_by: Option<&'static str>,
+    ) -> SFResult<u64> {
+        if ROSTERED_LABEL_SERIES.is_empty() {
+            return Ok(0);
+        }
+        let sql = self.roster_orphan_statement(table, clock, batch_by);
+        let names: Vec<String> = ROSTERED_LABEL_SERIES
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect();
+        let fresh = ROSTER_FRESH_SECS as f64;
+        let quiet = SUPERSEDED_QUIET_SECS as f64;
+
+        match batch_by {
+            None => Ok(sqlx::query(&sql)
+                .bind(&names)
+                .bind(ROSTER_LABEL)
+                .bind(ROSTER_SERIES)
+                .bind(fresh)
+                .bind(quiet)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| SFError::Database(e.to_string()))?
+                .rows_affected()),
+            Some(_) => {
+                let mut total = 0u64;
+                loop {
+                    let deleted = sqlx::query(&sql)
+                        .bind(&names)
+                        .bind(ROSTER_LABEL)
+                        .bind(ROSTER_SERIES)
+                        .bind(fresh)
+                        .bind(quiet)
+                        .bind(RELEASE_BATCH)
+                        .execute(&self.pool)
+                        .await
+                        .map_err(|e| SFError::Database(e.to_string()))?
+                        .rows_affected();
+                    total += deleted;
+                    if deleted < RELEASE_BATCH as u64 {
+                        break;
+                    }
+                }
+                Ok(total)
+            }
+        }
+    }
+
+    /// 名册那一步的 DELETE 语句。
+    ///
+    /// 单独一支是为了让测试读得到它：这条语句里最要紧的一条腿是**名册必须新鲜**
+    /// （末尾那个 `EXISTS`）。少了它，一个刚启动、名册还没写出来的进程会把
+    /// `NOT IN (空集)` 读成「每一条都走了」，把整族活序列一次删光——而删错的方向
+    /// 没有回头路，样本日志按容量轮转，删掉的当前值不会被重写回来。
+    fn roster_orphan_statement(
+        &self,
+        table: &str,
+        clock: ShapeClock,
+        batch_by: Option<&'static str>,
+    ) -> String {
+        let table = cog_core::sql::quote_relation(table);
+        let roster = cog_core::sql::quote_relation(&self.samples);
+        let mine = self.clock_expr("t", clock);
+        // `NOT IN` 的两边都先剔掉 NULL：子查询里一条不带该标签的名册行会让整个 `NOT
+        // IN` 变成 NULL，那会把**每一条**候选都判成「不能删」——一个形状守卫最坏的
+        // 失效方向是静默不删，比删错好，但它会让这一整条通道看起来在工作其实没有。
+        let legs = format!(
+            "t.name = ANY($1)
+               AND t.labels ? $2
+               AND t.labels ->> $2 NOT IN (
+                     SELECT r.labels ->> $2 FROM {roster} r
+                      WHERE r.name = $3
+                        AND r.labels ? $2
+                        AND r.timestamp > NOW() - ($4::double precision * INTERVAL '1 second')
+                   )
+               AND {mine} < NOW() - ($5::double precision * INTERVAL '1 second')"
+        );
+        let fresh_roster = format!(
+            "EXISTS (
+                   SELECT 1 FROM {roster} r2
+                    WHERE r2.name = $3
+                      AND r2.timestamp > NOW() - ($4::double precision * INTERVAL '1 second')
+                 )"
+        );
+        match batch_by {
+            None => format!("DELETE FROM {table} t WHERE {legs} AND {fresh_roster}"),
+            Some(id) => format!(
+                "DELETE FROM {table} WHERE {id} IN (
+                     SELECT t.{id} FROM {table} t
+                      WHERE {legs} AND {fresh_roster}
+                      LIMIT $6
+                 )"
+            ),
         }
     }
 
@@ -919,5 +1087,63 @@ mod tests {
                  quiet since the day the label was added"
             );
         }
+    }
+
+    fn retirement_without_a_server() -> MetricsRetirement {
+        // 这些用例只读语句文本，不连库：`connect_lazy` 拿到一个池而不建立连接。
+        MetricsRetirement::new(
+            sqlx::PgPool::connect_lazy("postgres://unused@127.0.0.1/unused")
+                .expect("a lazy pool parses without a server"),
+        )
+    }
+
+    /// 名册那一步的语句必须带着「名册新鲜」这条腿。
+    ///
+    /// 少了它，删不删全押在 `NOT IN` 上：名册一行都没有时子查询是空集，`NOT IN`
+    /// 对每一条候选都为真，整族活序列一次删光。而这条删除没有回头路——样本日志
+    /// 按容量轮转，删掉的当前值不会被重写回来，下一个读者看到的是「这一族从来
+    /// 没被写过」。一个刚启动、还没写完第一拍名册的进程正是那个输入，所以这不是
+    /// 理论上的坏输入。
+    #[tokio::test]
+    async fn the_roster_pass_refuses_to_run_on_an_absent_roster() {
+        let retirement = retirement_without_a_server();
+        for batch_by in [None, Some("id")] {
+            let sql = retirement.roster_orphan_statement(
+                crate::metrics_sample_cap::SAMPLES_TABLE,
+                ShapeClock::Column("timestamp"),
+                batch_by,
+            );
+            assert!(sql.contains("EXISTS"), "no freshness leg in: {sql}");
+            assert!(
+                sql.contains("$4"),
+                "the freshness leg must be compared against the heartbeat window, \
+                 not a literal baked into the statement: {sql}"
+            );
+            // 名册只活在样本日志里（累加表里根本没有它），所以语句必须去日志里读，
+            // 而不是在被删的那张表里找——在被删的表里找的话，累加表那几次调用拿到
+            // 的永远是一个空的名册。
+            assert!(
+                sql.contains(&cog_core::sql::quote_relation(
+                    crate::metrics_sample_cap::SAMPLES_TABLE
+                )),
+                "the roster is read from the sample log: {sql}"
+            );
+        }
+    }
+
+    /// token 面那一族带 `upstream` 标签，但它**不能**进这份名册清单。
+    ///
+    /// 它是账本的投影：`llm_tokens_total` 每拍把账上出现过的每一条上游各写一遍，
+    /// 包括早就不在配置里的那些（那一行记的是花掉的钱，不是池子的形状），还有一条
+    /// `upstream="-"` 的合计格。名册上没有 `-`，所以它一旦被列进清单，删的就不是
+    /// 一个走掉的上游，而是每次都给账本删掉一行还在被写的合计。
+    #[test]
+    fn the_roster_never_names_the_ledger_projection() {
+        assert!(
+            !ROSTERED_LABEL_SERIES.contains(&"llm_tokens_total"),
+            "llm_tokens_total is written from the ledger, not from the pool: its \
+             upstream values include ones the config dropped and a `-` total, and \
+             the writer is alive for all of them"
+        );
     }
 }

@@ -389,6 +389,17 @@ async fn insert_aged_samples(
     .unwrap();
 }
 
+/// Rows still in the probe log under one `upstream` label value.
+async fn count_upstream(pool: &PgPool, table: &str, upstream: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*) FROM {table} WHERE labels ->> 'upstream' = $1"
+    ))
+    .bind(upstream)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
 /// A shape is released on its own, with no name retired at all.
 ///
 /// A deployment that has retired nothing still has to clear the label sets an
@@ -706,6 +717,175 @@ async fn a_shape_history_larger_than_one_batch_is_drained_completely() {
         probe.count_named(&pool, &probe.samples, name).await,
         1,
         "only the replacement log row is left"
+    );
+    probe.drop(&pool).await;
+}
+
+/// A gauge whose producer enumerates the pool: once a value leaves that
+/// enumeration, its rows leave the store too.
+///
+/// The durable reader takes the newest row per label set, so a series nobody
+/// writes any more goes on answering in the present tense with its last value
+/// forever. Measured on this deployment on 2026-11-02: the configuration held
+/// two upstreams while `llm_upstream_healthy` carried five — the three extra
+/// keys (one of them the first half of a rename) had been quiet since 10-18 and
+/// 10-24, and every reading that counts upstreams counted them in.
+///
+/// The roster is the declaration here, and it is the producer's rather than a
+/// literal in this file: `llm_upstream_position` is written each tick for every
+/// configured upstream, including ones this process has never called.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn an_upstream_that_left_the_pool_leaves_the_store() {
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    let probe = Probe::new("roster");
+    probe.create(&pool).await;
+
+    let quiet = long_quiet();
+    for (name, upstream, age_hours) in [
+        // The roster: only `a` is still configured.
+        (cog_storage::ROSTER_SERIES, "a", 0.0),
+        ("llm_upstream_healthy", "a", 0.0),
+        // `b` left the pool: its last write is far behind the quiet bound.
+        ("llm_upstream_healthy", "b", quiet),
+        ("llm_upstream_consecutive_failures", "b", quiet),
+    ] {
+        insert_aged_samples(
+            &pool,
+            &probe.samples,
+            name,
+            &format!(r#"{{"upstream":"{upstream}"}}"#),
+            age_hours,
+            1,
+        )
+        .await;
+    }
+
+    let outcome = probe
+        .retirement(pool.clone())
+        .with_retired_names(vec![])
+        .release()
+        .await
+        .unwrap();
+
+    let left = |upstream: &'static str| count_upstream(&pool, &probe.samples, upstream);
+    assert_eq!(
+        left("b").await,
+        0,
+        "an upstream the roster no longer names kept its rows: {outcome:?}"
+    );
+    assert_eq!(
+        left("a").await,
+        2,
+        "the upstream that is still configured lost rows it is still writing: \
+         {outcome:?}"
+    );
+    assert_eq!(
+        outcome.samples, 2,
+        "the removal has to be reported against the table it came from: {outcome:?}"
+    );
+    probe.drop(&pool).await;
+}
+
+/// No fresh roster means no deletion — the whole family is held, not released.
+///
+/// Absence is the one input that would make this channel destroy live readings:
+/// with no roster rows at all the `NOT IN` is against an empty set, which is
+/// true for every candidate. A process that has just started, or one whose
+/// writer has stopped, is exactly that input, and a deleted gauge value is not
+/// written back — the sample log rotates by capacity, so the next reader sees a
+/// family that was never written rather than one that stopped.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn no_fresh_roster_releases_nothing() {
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    let probe = Probe::new("roster_absent");
+    probe.create(&pool).await;
+
+    for (name, age_hours) in [
+        // The roster exists but is older than the freshness bound.
+        (cog_storage::ROSTER_SERIES, 24.0),
+        ("llm_upstream_healthy", long_quiet()),
+    ] {
+        insert_aged_samples(
+            &pool,
+            &probe.samples,
+            name,
+            r#"{"upstream":"gone"}"#,
+            age_hours,
+            1,
+        )
+        .await;
+    }
+
+    let outcome = probe
+        .retirement(pool.clone())
+        .with_retired_names(vec![])
+        .release()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.samples, 0,
+        "a stale roster is not a departure: {outcome:?}"
+    );
+    assert_eq!(
+        probe
+            .count_named(&pool, &probe.samples, "llm_upstream_healthy")
+            .await,
+        1,
+        "the reading was deleted on the strength of a roster nobody was writing"
+    );
+    probe.drop(&pool).await;
+}
+
+/// An upstream that is merely slow is not an absent one.
+///
+/// The quiet bound is the second leg: a series still inside it is held even
+/// when the roster does not name it. Without this case the channel reads as
+/// "anything not in the roster goes immediately", which would delete the first
+/// write of a newly added upstream if the two producers were a tick apart.
+#[tokio::test]
+#[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
+async fn a_recent_row_survives_even_when_the_roster_does_not_name_it() {
+    let pool = PgPool::connect(&database_url()).await.unwrap();
+    let probe = Probe::new("roster_recent");
+    probe.create(&pool).await;
+
+    insert_aged_samples(
+        &pool,
+        &probe.samples,
+        cog_storage::ROSTER_SERIES,
+        r#"{"upstream":"a"}"#,
+        0.0,
+        1,
+    )
+    .await;
+    // Written ten minutes ago and not in the roster: held, not released.
+    insert_aged_samples(
+        &pool,
+        &probe.samples,
+        "llm_upstream_healthy",
+        r#"{"upstream":"b"}"#,
+        10.0 / 60.0,
+        1,
+    )
+    .await;
+
+    let outcome = probe
+        .retirement(pool.clone())
+        .with_retired_names(vec![])
+        .release()
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.samples, 0, "{outcome:?}");
+    assert_eq!(
+        probe
+            .count_named(&pool, &probe.samples, "llm_upstream_healthy")
+            .await,
+        1,
+        "a write inside the quiet bound was released"
     );
     probe.drop(&pool).await;
 }
