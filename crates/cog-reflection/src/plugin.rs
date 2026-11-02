@@ -18,10 +18,11 @@ pub const LEARNING_REVIEW_LOOP: &str = "reflection_learning_review";
 /// Loop name reported through the background-loop liveness family.
 ///
 /// 收的是这道门自己交上去、而等它的那次等待已经不在了的 A/B 行。它是个循环而不是
-/// 启动时跑一趟：一次重启可能落在行还年轻的时候，那一趟会正确地放过它，而下一次
-/// 重启也许要几天之后——中间这段时间里，那行既没人等、也没人清。
+/// 走的是循环而不是启动那一趟：一次重启可能落在行还年轻的时候，那一趟会正确地
+/// 放过它，而下一次重启也许要几天之后——中间这段时间里，那行既没人等、也没人清。
 pub const PROMOTION_EVAL_SWEEP_LOOP: &str = "reflection_promotion_eval_sweep";
-/// 这一趟多久走一次。等待上限是一小时，收一行的迟到十分钟不算迟到。
+/// 这一趟多久走一次。
+// cap: bound — 等待上限是一小时，收一行迟到十分钟没有代价；跑得更勤快不了任何事
 pub const PROMOTION_EVAL_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 /// Loop name reported through the background-loop liveness family.
 pub const SKILL_EFFECTIVENESS_LOOP: &str = "reflection_skill_effectiveness";
