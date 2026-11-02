@@ -1175,6 +1175,30 @@ impl LlmHealthTable {
         Some((entry.consecutive_failures, secs))
     }
 
+    /// 探测答了一个 ping：撤掉自己的嫌疑窗，**退避位置与配额证据一概留着**。
+    ///
+    /// 撤窗是因为这次应答本身就否证了"这一窗里别碰它"——不撤，一家已经肯回话的
+    /// 上游会被自己上一发的退避继续挡在外头，而那一发开的窗可能长到一个复位时刻。
+    /// 保留阶梯是因为答了一个 token 不等于接得住一件活：把它一起清掉，下一次真实
+    /// 失败又从起步基线重新数起，双倍递增永远走不到封顶，`Retry-After` 被钉在底线
+    /// 上（2026-11-02 现场钉了六天，每分钟一条）。返回此前是否处于嫌疑。
+    fn clear_window_keeping_ladder(&self, u: &LlmUpstream) -> bool {
+        let mut states = self.states.lock().unwrap();
+        match states.get_mut(&Self::key(u)) {
+            Some(h) => h.suspect_until.take().is_some(),
+            None => false,
+        }
+    }
+
+    /// 消掉"等一次应答来定性这条形态类拒绝"的问号，**只此一件事**。
+    ///
+    /// 与 [`Self::note_success`] 分开是因为拿到应答与"这家回来了"是两件事：探测的
+    /// 200 足以回答"这条上游在这一面上说不说话"，却不足以撤销一次真实请求被拒的
+    /// 账。合成一个动作的话，退避阶梯会被每一次 ping 通清零，指数永远长不起来。
+    fn forget_shape_question(&self, u: &LlmUpstream) {
+        self.shape_errored.lock().unwrap().remove(&Self::key(u));
+    }
+
     /// 记录一次成功：嫌疑态清除。返回此前是否处于嫌疑（调用方打恢复日志）。
     ///
     /// `served` 说明这次成功是不是由一件真实的活换来的：它决定"最后送出"这个时刻
@@ -1183,7 +1207,7 @@ impl LlmHealthTable {
     fn note_success(&self, u: &LlmUpstream, served: bool) -> bool {
         // 成功同样是一次定性：这条上游刚刚受理了一条真实请求，"等探测定性"
         // 的问号随之消掉。
-        self.shape_errored.lock().unwrap().remove(&Self::key(u));
+        self.forget_shape_question(u);
         // Recorded before the entry is dropped: this success is evidence, and
         // the reading has to remember it once the verdict table has no further
         // use for the entry.
@@ -2087,8 +2111,7 @@ impl AppState {
         self.llm_health.note_success(u, true)
     }
 
-    /// 记一次**探测**成功：清它自己的嫌疑窗，但只在没有真实请求刚被拒时才留下
-    /// 池恢复凭据。
+    /// 记一次**探测**成功：它是恢复证据时才热恢复进池，否则**什么都不改**。
     ///
     /// 探测发的是一条最小请求（`max_tokens: 1`）。它能通只证明这一家还肯回一个
     /// token，不证明它能承接一件活——配额按量计的账号上，一个 token 落在这窗里、
@@ -2096,6 +2119,16 @@ impl AppState {
     /// 成功不能当恢复证据：留了它，池判定会在每个探测拍上解除锁存、再被下一条真实
     /// 请求顶回锁存，一次持续几天的断供就被记成每五分钟一个「事件」——告警按事件
     /// 分行，于是「池断了多久」只剩最新那一段的长度，而它读起来永远是几十分钟。
+    ///
+    /// 不是证据的那一档**只撤自己的嫌疑窗，退避位置与配额证据一概留着**。整个清掉
+    /// 等于把「一个 token 过去了」当成「这一家回来了」，而清的是整条阶梯：下一次
+    /// 真实请求又从起步基线重新数起，双倍递增永远走不到封顶。2026-11-02 现场就是
+    /// 这一格——kimi 的七日窗口早已用尽、探测每九十秒通一次，`consecutive_failures`
+    /// 因此一直停在 1，anthropic 面的 `Retry-After` 钉在 60 秒上，二十几条等额的
+    /// 调用循环跟着每分钟撞一次，撞了六天。
+    ///
+    /// 窗要撤：这次应答否证了"这一窗里别碰它"，留着等于让上一发的退避继续挡住一家
+    /// 已经肯回话的上游——那一发开的窗可能长到一个复位时刻。
     ///
     /// 真实请求上的成功不走这里：那条路上的成功本身就是"一件活被承接了"的证据，
     /// 比任何 ping 都强。
@@ -2109,15 +2142,19 @@ impl AppState {
         ) {
             self.pool_recovered.store(true, Ordering::SeqCst);
             tracing::info!(upstream = %u.base_url, "LLM 上游探测复通，热恢复进池");
-        } else {
-            tracing::info!(
-                upstream = %u.base_url,
-                last_caller_failure_unix = last_caller_failure,
-                "LLM 上游探测通了，但一个探测窗内还有真实请求被拒；只清嫌疑窗，不作池恢复凭据"
-            );
+            // `served: false`：这一拍没有送出任何一件活，所以本进程的"最后送出"不动。
+            return self.llm_health.note_success(u, false);
         }
-        // `served: false`：这一拍没有送出任何一件活，所以本进程的"最后送出"不动。
-        self.llm_health.note_success(u, false)
+        // 应答确实拿到了，所以"等一次应答来定性形态类拒绝"的问号可以消掉，自己的
+        // 嫌疑窗也撤掉；退避位置与配额证据留着。
+        self.llm_health.forget_shape_question(u);
+        self.llm_health.clear_window_keeping_ladder(u);
+        tracing::info!(
+            upstream = %u.base_url,
+            last_caller_failure_unix = last_caller_failure,
+            "LLM 上游探测通了，但一个探测窗内还有真实请求被拒；不作恢复凭据，退避位置与配额证据不清零"
+        );
+        false
     }
 
     /// 代码平台透传用的 GitHub 出口凭证：配置了 App 就用 installation token
@@ -11535,6 +11572,78 @@ mod tests {
         assert!(
             secs >= 890,
             "上游自己报了复位时刻就要跟到那一刻，短基线不许把它压短：{secs}"
+        );
+    }
+
+    /// 探测通一次**不许**把退避阶梯清零。
+    ///
+    /// `max_tokens: 1` 的 ping 通只说明"一个 token 过得去"。若它顺手清掉
+    /// `consecutive_failures`，下一次真实失败又从 30 秒起步，双倍递增永远走不到
+    /// 封顶，`Retry-After` 就被钉在 60 秒上——2026-11-02 现场：kimi 的七日窗口
+    /// 早已用尽，探测每九十秒通一次，anthropic 面连着六天每条拒绝都说"一分钟后再来"，
+    /// 二十几条等额的调用循环照着这个数每分钟撞一回。
+    ///
+    /// 反例在同一格里：没有真实请求在窗口内被拒（锁存后任务已停）时，ping 是唯一
+    /// 还在发生的观测，它必须能把上游放回来——否则"任务停了→没人探活→永不恢复"。
+    #[tokio::test]
+    async fn a_probe_that_passes_inside_an_outage_keeps_the_backoff_ladder() {
+        let u = stub_upstream("https://a.example.com", "m1");
+        let state = test_state(vec![u.clone()]);
+        assert_eq!(
+            state.llm_health.note_failure(
+                &u,
+                300,
+                None,
+                Some(604_800),
+                Some(RefusalKind::QuotaCycle)
+            ),
+            Some((1, RATE_LIMIT_BACKOFF_BASE_SECS))
+        );
+        state
+            .last_caller_failure_unix
+            .store(Utc::now().timestamp(), Ordering::SeqCst);
+
+        assert!(
+            !state.note_probe_success(&u),
+            "一个探测窗内还有真实请求被拒 ⇒ 这次通不是恢复证据，不许上报健康态"
+        );
+        assert!(
+            !state.llm_health.is_suspect(&u),
+            "它确实答了一个 ping，自己的嫌疑窗要撤——留着等于让上一发的退避继续挡住一家肯回话的上游"
+        );
+
+        let reading = &state.llm_health.snapshot(std::slice::from_ref(&u))[0];
+        assert_eq!(
+            reading.consecutive_failures, 1,
+            "退避位置被探测清零了：下一次失败会从 30 秒重新起步，阶梯永远到不了封顶"
+        );
+        assert_eq!(
+            reading.quota_window_secs,
+            Some(604_800),
+            "上游自述的窗口长度也是证据，ping 通一次不许把它抹掉"
+        );
+        // 决定性的一格：下一次真实失败接着阶梯往下走（30 → 60），不是从头再来。
+        assert_eq!(
+            state.llm_health.note_failure(
+                &u,
+                300,
+                None,
+                Some(604_800),
+                Some(RefusalKind::QuotaCycle)
+            ),
+            Some((2, 60)),
+            "探测通一次就从 1 重新数起，双倍递增永远走不到封顶，`Retry-After` 就被钉在底线上"
+        );
+
+        state.last_caller_failure_unix.store(0, Ordering::SeqCst);
+        assert!(
+            state.note_probe_success(&u),
+            "没有近期的真实拒绝时，ping 通就是恢复凭据"
+        );
+        assert!(!state.llm_health.is_suspect(&u));
+        assert_eq!(
+            state.llm_health.snapshot(std::slice::from_ref(&u))[0].consecutive_failures,
+            0
         );
     }
 
