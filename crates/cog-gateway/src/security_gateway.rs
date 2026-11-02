@@ -3318,13 +3318,10 @@ pub const RANGE_READ_BASELINES: &[(&str, RangeReadBaseline)] = &[
         RangeReadBaseline::Exempt {
             readers: &[
                 "llm_context_per_call_above_its_own_week",
-                "llm_cached_tokens_exceed_input",
                 "llm_cache_hit_share_collapsed",
             ],
-            reason: "格子带 actor，理由与 llm_calls_total 同一条。三条读者都把这个族与另一个计数相减或\
-                     相除：某一侧看不见的第一个增量，在一小时窗口的和里至多值一次调用，而三条都是 warning。\
-                     缓存的那些格子（kind=cached）由 `llm_cached_tokens_exceed_input` 读，它的判词是\
-                     「缓存数超过输入数」这种按构造不可能的事，方向不靠第一个增量。\
+            reason: "格子带 actor，理由与 llm_calls_total 同一条。两条读者都把这个族与另一个计数相除：\
+                     某一侧看不见的第一个增量，在一小时窗口的和里至多值一次调用，而两条都是 warning。\
                      `llm_cache_hit_share_collapsed` 读的是 cached/(input+cached) 这个比例，且只在\
                      该 actor 一小时里走过 20 万 prompt token 以上时才判：少掉的那一次调用同时落在分子\
                      与分母的同一个量级之外，挪不动它跨过 0.15 那条线，所以它看不见第一个增量也不会把\
@@ -3545,9 +3542,11 @@ async fn record_llm_tokens(
     .await;
     // 第三格是**从缓存服务的那部分输入**，与上面两格同一个名字、同一根 kind 轴。
     // 被缓存命中的输入没有从缓存里读一遍的价值——它比未命中的输入便宜得多——所以
-    // `kind="cached" / kind="input"` 就是命中率，也是"把稳定前缀排到前面"这类改动
-    // 唯一的验收读数。它与 input 的关系随协议面变（OpenAI 兼容面上是 input 的一部分，
-    // Anthropic 面上与 input 互斥），读的人按上游的协议解释。
+    // 命中率是 `cached / (input + cached)`，也是"把稳定前缀排到前面"这类改动唯一
+    // 的验收读数。分母要把两格相加：`reading.input` 到这里已经是**没被缓存服务的那
+    // 部分**，两个协议面在 [`extract_usage`] 里归一到同一条不变式，所以 `cached`
+    // 在命中过半时**必然**大过 `input`——这不是上游算重了，是缓存干得好。曾经按
+    // 「cached 大过 input 即异常」立的规则因此在健康流量上常亮，已删除。
     record_counter_add(
         state,
         cog_core::metric_names::LLM_TOKENS_TOTAL,

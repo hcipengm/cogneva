@@ -2321,16 +2321,6 @@
           "face": "token 管理"
         },
         {
-          "name": "llm_cached_tokens_exceed_input",
-          "promql": "sum by (upstream) (increase(llm_tokens_total{kind=\"cached\"}[1h])) - sum by (upstream) (increase(llm_tokens_total{kind=\"input\"}[1h])) > 0",
-          "condition": {
-            "greater_than": 0.0
-          },
-          "severity": "warning",
-          "summary": "One upstream reported more cached tokens than input tokens in the same hour, which the OpenAI-compatible face this deployment speaks cannot do: there a cached token is one of the prompt tokens already counted in input, so cached never exceeds input. Seeing it means that upstream's protocol changed -- a second upstream was added, or one was reprovisioned -- and the per-call context rule beside this one is now dividing by the wrong quantity, quietly: on a face where cached and input are disjoint the two must be added to give the prompt length, and the ratio it compares has silently halved. This rule turns that silent break into a red. It is deliberately partial and has to be read that way: cached exceeding input is proof the face changed, but a disjoint face whose cache hit rate stays under half leaves cached below input and this stays quiet -- no reading taken from these two counters alone can tell that case apart from the nested face, because the two faces are numerically identical there. The complete fix is to carry the protocol face as a label instead of inferring it; until then this catches the change that also shows up in the numbers. It cannot say which branch is right, only that the nesting this deployment assumed no longer holds for {upstream}. {value} is how far past input the cached count ran.",
-          "face": "token 管理"
-        },
-        {
           "name": "llm_cache_hit_share_collapsed",
           "promql": "((sum by (actor) (increase(llm_tokens_total{kind=\"cached\"}[1h]))) / ((sum by (actor) (increase(llm_tokens_total{kind=\"input\"}[1h]))) + (sum by (actor) (increase(llm_tokens_total{kind=\"cached\"}[1h]))))) and on (actor) (((sum by (actor) (increase(llm_tokens_total{kind=\"input\"}[1h]))) + (sum by (actor) (increase(llm_tokens_total{kind=\"cached\"}[1h])))) > 200000)",
           "condition": {

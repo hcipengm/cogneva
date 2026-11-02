@@ -33,7 +33,6 @@ rule_files:
 # rule: llm_usage_upstream_silent
 # rule: llm_usage_ledger_incomplete
 # rule: llm_call_without_declared_actor
-# rule: llm_cached_tokens_exceed_input
 # rule: llm_upstream_reading_outlives_its_pool_entry
 # rule: llm_pool_paced_on_a_subset_of_its_members
 
@@ -41,8 +40,8 @@ evaluation_interval: 1m
 
 tests:
   # 健康的池：一家上游、三个判词都量过、没有被拒、额度够、账测得新鲜、没有资格类拒绝、
-  # 没有失败、信号连着、用量读数在写、账平、调用都带 actor、缓存不超过输入。
-  # 十三条全静。
+  # 没有失败、信号连着、用量读数在写、账平、调用都带 actor。
+  # 十二条全静。
   - interval: 1m
     input_series:
       - series: 'llm_usage_verdict_measured{upstream="u1"}'
@@ -147,9 +146,6 @@ tests:
         exp_alerts: []
       - eval_time: 60m
         alertname: llm_call_without_declared_actor
-        exp_alerts: []
-      - eval_time: 60m
-        alertname: llm_cached_tokens_exceed_input
         exp_alerts: []
 
   # 上游健康、三个判词却全是 0：三条一起亮。同一格里再放一家**不健康**的上游（u2，
@@ -509,20 +505,23 @@ tests:
           - exp_labels:
               severity: warning
 
-  # 缓存计费超过输入：上游把缓存算重了。亮。
+  # 缓存剂量高过输入：这在 2026-11-01 之后是**健康**的形状，不是故障。
+  # 记账面把两个协议面归一成同一条不变式（input 只装没被缓存服务的那部分，
+  # 整个 prompt = input + cached），于是命中率过半时 cached 必然大过 input。
+  # 一条在这种格里会亮的规则等于把「缓存干得好」报成事故，所以这一类没有规则：
+  # 命中率本身由 `llm_cache_hit_share_collapsed` 从下界看，上界不需要人管。
+  # 这一格留着，是让下一个想写「cached > input 即异常」的人先看见这个反例；
+  # 同时它是一格真断言：命中率 0.9、prompt 过 20 万，下界那条规则必须静。
   - interval: 1m
     input_series:
-      - series: 'llm_tokens_total{kind="cached",upstream="u1"}'
-        values: '0x5 10x55'
-      - series: 'llm_tokens_total{kind="input",upstream="u1"}'
-        values: '0x5 1x55'
+      - series: 'llm_tokens_total{kind="cached",upstream="u1",actor="a1"}'
+        values: '0x5 900000x55'
+      - series: 'llm_tokens_total{kind="input",upstream="u1",actor="a1"}'
+        values: '0x5 100000x55'
     alert_rule_test:
       - eval_time: 60m
-        alertname: llm_cached_tokens_exceed_input
-        exp_alerts:
-          - exp_labels:
-              severity: warning
-              upstream: u1
+        alertname: llm_cache_hit_share_collapsed
+        exp_alerts: []
 
   # 池掉线，而一家上游自己说是**额度周期**用完了（kind=quota_cycle，观测新鲜）：
   # `llm_pool_down_on_a_quota_cycle` 亮，`llm_pool_open_but_idle` **静**。
