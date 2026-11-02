@@ -3337,6 +3337,37 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 78,
+          "title": "Tokens Spent per Landed Change (24h)",
+          "description": "What a day of spending bought: the tokens the ledger says were spent over the trailing 24 hours, divided by the changes that landed in the same 24 hours. Both legs carry the window's whole day rather than the latest scrape because both series are rendered from the store, which re-states one cumulative number for every reader: the spend side is the envelope of `llm_tokens_total` (deduplicated with `max` first, since every pod serves the same cells and summing the pods would multiply the money by the pod count) and the landed side is the same envelope of `cogneva_change_fate_total{fate=\"landed\"}`. A day is the unit because a burst is: the whole weekly allowance has gone out inside one day, so a shorter window would be read as one incident rather than as a rate. Both legs are filtered to be positive, so an empty panel means one of them did not move in the window: no spend, or nothing landed. A zero is deliberately not drawn -- on a platform whose quota is spent, a day with no tokens and two landings would plot as the cheapest day on record, which is the reading exactly backwards. Two caveats are drawn into the reading rather than left to the reader: the spend leg reaches back only to the ledger projection's first render, so until a full window of samples exists this is a ratio over the hours since then rather than over a day; and a change that landed after a long dark spell was paid for by tokens spent in an earlier window, so a spike is read beside the token panel rather than as a fault.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 368
+          },
+          "targets": [
+            {
+              "expr": "(sum((max_over_time((max by (upstream, kind, actor) (llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600)))[24h:5m]) - min_over_time((max by (upstream, kind, actor) (llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600)))[24h:5m]))) > 0) / (sum((max_over_time((max by (intent) (cogneva_change_fate_total{fate=\"landed\"}))[24h:5m]) - min_over_time((max by (intent) (cogneva_change_fate_total{fate=\"landed\"}))[24h:5m]))) > 0)",
+              "legendFormat": "tokens / landed change",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {
