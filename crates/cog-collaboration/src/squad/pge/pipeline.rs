@@ -254,7 +254,7 @@ impl PgePipeline {
             generation: attempt,
             repair_iteration,
             stage,
-            request_sha256: GenerationArchive::request_sha256(&task.input),
+            request_sha256: GenerationArchive::request_sha256(task),
             change_identity: task
                 .input
                 .get(cog_core::INPUT_CHANGE_IDENTITY)
@@ -373,7 +373,7 @@ impl PgePipeline {
                 return None;
             }
         };
-        let want = GenerationArchive::request_sha256(&task.input);
+        let want = GenerationArchive::request_sha256(task);
         let mut resumed = ResumedAttempt {
             plan: None,
             generation: None,
@@ -978,18 +978,30 @@ impl GenerationArchive {
     /// ledger. What a resume has to answer is "is this the same request", and a
     /// hash answers exactly that.
     ///
+    /// The id is half of the request, not decoration on it. Two attempts can
+    /// hand the pipeline byte-identical input and still be different requests:
+    /// the Ralph loop re-asks the same goal under a new task id after choosing a
+    /// different reset strategy, and the id is the only thing that says so. Hash
+    /// the input alone and the second iteration resumes the first one's plan and
+    /// generation, so the strategy it was told to try is never tried and the run
+    /// stalls on a diff it already judged. Within one task the id is fixed —
+    /// a re-dispatched change moves only its generation suffix — so hashing both
+    /// halves still lets a crashed pass resume what it paid for.
+    ///
     /// A request that cannot be serialized hashes to nothing, which matches no
     /// row — resume then buys the stage again rather than reusing a product
     /// that was produced for something this build cannot compare.
-    fn request_sha256(request: &serde_json::Value) -> String {
+    fn request_sha256(task: &cog_core::Task) -> String {
         use sha2::{Digest, Sha256};
-        let Ok(bytes) = serde_json::to_vec(request) else {
+        let Ok(input) = serde_json::to_vec(&task.input) else {
             return String::new();
         };
-        Sha256::digest(&bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
+        let mut hasher = Sha256::new();
+        hasher.update(task.id.as_bytes());
+        hasher.update([0]);
+        hasher.update(&input);
+        let digest = hasher.finalize();
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }
 
@@ -2464,6 +2476,29 @@ mod tests {
                 row.stage.as_str()
             );
         }
+    }
+
+    /// 同一个目标在另一件活名下再问一次，不是同一个请求。
+    ///
+    /// Ralph 每一轮都换一个任务 id 把同一个目标重新问一遍——目标逐字不变，
+    /// 变的是这一轮被要求换掉的重置策略。账上按「哪件活」分格，两轮只差这一
+    /// 格；把这一格漏出摘要，第二轮就会接着上一轮的生成往下判：被要求做的事
+    /// 一次都没做，循环在同一个 diff 上判到停滞。
+    #[test]
+    fn the_same_input_under_another_task_id_is_another_request() {
+        let asked_once = test_task("edit x.rs");
+        let mut asked_again = asked_once.clone();
+        assert_eq!(
+            GenerationArchive::request_sha256(&asked_once),
+            GenerationArchive::request_sha256(&asked_again),
+            "同一件活重问一次，还是同一个请求"
+        );
+        asked_again.id = format!("{}-r1", asked_once.id);
+        assert_ne!(
+            GenerationArchive::request_sha256(&asked_once),
+            GenerationArchive::request_sha256(&asked_again),
+            "另一件活问同一件事，是另一个请求"
+        );
     }
 
     /// 第二次跑同一个任务时，上一趟买过的生成与判词接着用。

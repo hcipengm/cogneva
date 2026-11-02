@@ -52,8 +52,14 @@ Write the question in the same language the reporter used.";
 
 /// Chat options for the actionability verdict. Split out from the call site so
 /// the attribution is pinned by a test rather than by reading the line.
-fn intent_assess_options() -> cog_core::ChatOptions {
-    cog_core::ChatOptions::default().with_actor(INTENT_ASSESS_ACTOR)
+///
+/// 两格都要：`actor` 答「哪个组件在花」，`task_id` 答「哪件活花的」。这一问
+/// 是平台为某个外来意图付的钱，意图本身就是一件活——不带任务 id 时，这一族
+/// 在按任务读成本的那一面（2026-11-02 实测 6 次成功调用）全是空 id。
+fn intent_assess_options(task_id: &str) -> cog_core::ChatOptions {
+    cog_core::ChatOptions::default()
+        .with_actor(INTENT_ASSESS_ACTOR)
+        .with_task(task_id)
 }
 
 /// [`cog_core::TaskExecutor`] implementation that routes tasks through
@@ -431,7 +437,7 @@ impl CollaborationExecutor {
         ];
 
         let stream = agent
-            .chat_stream(&messages, &intent_assess_options())
+            .chat_stream(&messages, &intent_assess_options(&task.id))
             .await?;
         use futures::StreamExt;
         let mut stream = stream;
@@ -1589,17 +1595,27 @@ mod tests {
     }
 
     #[test]
-    fn the_actionability_verdict_carries_an_actor() {
+    fn the_actionability_verdict_carries_both_its_identities() {
         // The gateway falls back to "unknown" when the header is absent, which
         // is indistinguishable from a component genuinely named unknown. The
         // verdict path must therefore never send default options.
-        let options = super::intent_assess_options();
+        //
+        // 任务那一格同样要带：账本按两格取行，只带角色时这次判词的花销在
+        // 按任务读成本的那一面读不到，那件意图的成本里就少了它自己。
+        let options = super::intent_assess_options("platform_intent_assess-42");
         assert_eq!(
             options
                 .headers
                 .get(cog_core::LLM_ACTOR_HEADER)
                 .map(String::as_str),
             Some(super::INTENT_ASSESS_ACTOR)
+        );
+        assert_eq!(
+            options
+                .headers
+                .get(cog_core::LLM_TASK_HEADER)
+                .map(String::as_str),
+            Some("platform_intent_assess-42")
         );
     }
 

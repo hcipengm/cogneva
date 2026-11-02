@@ -175,10 +175,10 @@ pub struct RalphLoop {
     /// 的成功逐条记成消耗，攒满预算后永久返回"预算耗尽"且不再执行：系统
     /// 一旦失败过就再也无法用改进后的代码重试同一个目标。
     history: Vec<RalphIteration>,
-    /// History persistence: when set, the history is loaded from the task's
-    /// context board before the first iteration and written back after every
-    /// iteration, so a crashed pod's replacement resumes where it stopped.
-    history_task_id: Option<String>,
+    /// 这条循环替哪件活干活。两个用途共用同一个 id：历史从该任务的 context
+    /// board 读进来、每轮写回去（崩掉的 Pod 由替补接着跑），以及分类器那一问
+    /// 的花销记在这件活名下——账本按任务读成本时，没有这一格就少算了它。
+    task_id: Option<String>,
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
 }
 
@@ -199,15 +199,23 @@ impl RalphLoop {
         self
     }
 
+    /// Name the task this loop works on behalf of, so what it spends on the
+    /// failure classifier is charged to that task rather than to no one.
+    pub fn with_task(mut self, task_id: impl Into<String>) -> Self {
+        self.task_id = Some(task_id.into());
+        self
+    }
+
     /// Persist the iteration history on the owning task's context board.
     /// `task_id` must be the DAG task id so a retried/transferred execution
-    /// of the same task finds the history.
+    /// of the same task finds the history — and so the classifier's spend
+    /// lands in the same task's cost.
     pub fn with_history_store(
         mut self,
         task_id: String,
         backend: Arc<dyn cog_core::StateBackend>,
     ) -> Self {
-        self.history_task_id = Some(task_id);
+        self = self.with_task(task_id);
         self.state_backend = Some(backend);
         self
     }
@@ -246,7 +254,7 @@ impl RalphLoop {
     /// for history it would never look at.
     /// Best-effort: a missing or unreadable board starts from empty.
     async fn load_history(&mut self) {
-        let (Some(task_id), Some(backend)) = (&self.history_task_id, &self.state_backend) else {
+        let (Some(task_id), Some(backend)) = (&self.task_id, &self.state_backend) else {
             return;
         };
         match backend.get_board(task_id).await {
@@ -284,7 +292,7 @@ impl RalphLoop {
     /// Persist the current history's tail. Best-effort: history loss degrades
     /// a restart to a fresh run, it must never fail the loop itself.
     async fn persist_history(&self) {
-        let (Some(task_id), Some(backend)) = (&self.history_task_id, &self.state_backend) else {
+        let (Some(task_id), Some(backend)) = (&self.task_id, &self.state_backend) else {
             return;
         };
         let keep = self.history_keep();
@@ -308,7 +316,7 @@ impl RalphLoop {
     /// nothing to read. Best-effort: a cold archive that is down degrades
     /// forensics, it must never fail the loop.
     async fn archive_iteration(&self, iteration: &RalphIteration) {
-        let (Some(task_id), Some(backend)) = (&self.history_task_id, &self.state_backend) else {
+        let (Some(task_id), Some(backend)) = (&self.task_id, &self.state_backend) else {
             return;
         };
         let payload = match serde_json::to_value(iteration) {
@@ -971,7 +979,7 @@ History of previous attempts:\n{history_json}"
             },
         ];
 
-        let options = cog_core::ChatOptions {
+        let mut options = cog_core::ChatOptions {
             model: None,
             temperature: Some(0.2),
             // Four verbose JSON fields routinely fill ~1.5k chars; 512 tokens
@@ -987,6 +995,11 @@ History of previous attempts:\n{history_json}"
             ..Default::default()
         }
         .with_actor("ralph");
+        // 两格都要：这一问是替某件活问的，账本按任务取行时没有这一格就把
+        // 分类的钱记成无人认领的空 id。循环没有任务可报时不编一个。
+        if let Some(task_id) = &self.task_id {
+            options = options.with_task(task_id);
+        }
 
         let response = llm.chat(&messages, &options).await?;
         if let Some(ref err) = response.error_message {
@@ -2281,6 +2294,8 @@ mod tests {
         /// Every message list this double was asked to answer, so a test can read
         /// what the classifier actually sent instead of what it was meant to send.
         seen: std::sync::Mutex<Vec<Vec<cog_core::Message>>>,
+        /// 每次调用请求上的 `(actor, task)` 两格头，按发出的顺序记。
+        seen_headers: std::sync::Mutex<Vec<(Option<String>, Option<String>)>>,
     }
 
     impl MockSemanticLlm {
@@ -2288,11 +2303,19 @@ mod tests {
             Self {
                 response_json: response_json.into(),
                 seen: std::sync::Mutex::new(Vec::new()),
+                seen_headers: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn calls(&self) -> Vec<Vec<cog_core::Message>> {
             self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+
+        fn headers(&self) -> Vec<(Option<String>, Option<String>)> {
+            self.seen_headers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
         }
     }
 
@@ -2335,12 +2358,19 @@ mod tests {
         async fn chat(
             &self,
             messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
+            options: &cog_core::ChatOptions,
         ) -> cog_core::SFResult<cog_core::ChatResponse> {
             self.seen
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(messages.to_vec());
+            self.seen_headers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((
+                    options.headers.get(cog_core::LLM_ACTOR_HEADER).cloned(),
+                    options.headers.get(cog_core::LLM_TASK_HEADER).cloned(),
+                ));
             Ok(cog_core::ChatResponse {
                 content: vec![cog_core::ContentBlock::Text {
                     text: self.response_json.clone(),
@@ -2367,6 +2397,51 @@ mod tests {
     fn make_ralph_with_mock(response_json: &str) -> RalphLoop {
         let llm = Arc::new(MockSemanticLlm::new(response_json));
         RalphLoop::new().with_llm_provider(llm)
+    }
+
+    /// 分类器的花销记在这条循环替它干活的那件活名下。
+    ///
+    /// 账本按两格取行：`actor` 答「哪个角色在花」，`task_id` 答「哪件活花的」。
+    /// 只贴角色时，这一族 2026-11-02 实测 6 次成功调用在按任务读成本的那一面
+    /// 全是空 id——一件活的成本里就少了它自己失败诊断的那一问。没有任务可报
+    /// 的那几次不编一个 id：编出来的会读成一件真花过钱的任务。
+    #[tokio::test]
+    async fn the_failure_classifier_is_charged_to_the_task_it_works_on() {
+        let verdict = r#"{"failure_type":"LogicError","root_cause":"bug","recommended_strategy":"Modified","suggested_modifications":"fix"}"#;
+        let eval = EvaluationResult {
+            verdict: Verdict::Fail,
+            score: Some(0),
+            feedback: "the tests did not run".into(),
+            criteria: vec![],
+            details: None,
+        };
+
+        let llm = Arc::new(MockSemanticLlm::new(verdict));
+        let _ = RalphLoop::new()
+            .with_llm_provider(llm.clone())
+            .with_task("change-ledger-abc")
+            .analyze_failure(&eval, &[])
+            .await;
+
+        let headers = llm.headers();
+        assert!(!headers.is_empty(), "the classifier was asked");
+        for (actor, task) in headers {
+            assert_eq!(actor.as_deref(), Some("ralph"));
+            assert_eq!(
+                task.as_deref(),
+                Some("change-ledger-abc"),
+                "this classification's cost would not be part of its task's cost"
+            );
+        }
+
+        let bare = Arc::new(MockSemanticLlm::new(verdict));
+        let _ = RalphLoop::new()
+            .with_llm_provider(bare.clone())
+            .analyze_failure(&eval, &[])
+            .await;
+        for (_, task) in bare.headers() {
+            assert_eq!(task, None, "a loop with no task invented a task id");
+        }
     }
 
     #[tokio::test]
