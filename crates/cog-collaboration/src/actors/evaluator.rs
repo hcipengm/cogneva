@@ -238,6 +238,7 @@ impl EvaluatorActor {
             &output_str,
             cog_core::roles::EVALUATOR,
             review_basis,
+            &task.id,
         )
         .await
         {

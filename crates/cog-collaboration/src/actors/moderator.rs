@@ -208,6 +208,7 @@ impl ModeratorActor {
             &output_str,
             cog_core::roles::MODERATOR,
             review_basis,
+            &task.id,
         )
         .await
         {

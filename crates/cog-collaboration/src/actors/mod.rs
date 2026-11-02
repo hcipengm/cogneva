@@ -162,6 +162,7 @@ pub(crate) async fn maybe_self_review(
     output: &str,
     agent_kind: &str,
     basis: ReviewBasis,
+    task_id: &str,
 ) -> Option<String> {
     let observable = crate::observable::global_observable();
     let Some(config) = config.as_ref() else {
@@ -178,7 +179,10 @@ pub(crate) async fn maybe_self_review(
         }
     };
     let cfg = config.clone().with_declared_spec(&spec);
-    match agent.review_and_revise(output, &cfg).await {
+    match agent
+        .review_and_revise_for_task(output, &cfg, task_id)
+        .await
+    {
         Ok((revised, cog_core::SelfReviewResult::Pass { score, summary })) => {
             observable.record_self_review_verdict(
                 agent_kind,
@@ -544,6 +548,7 @@ mod tests {
                 &task_with_goal("add a rollback step"),
                 &["the plan names the file"],
             )),
+            "t-1",
         )
         .await;
 
@@ -585,6 +590,7 @@ mod tests {
                 &task_with_goal("merge the branches"),
                 &[],
             )),
+            "t-1",
         )
         .await;
 
@@ -617,6 +623,7 @@ mod tests {
                 &cog_core::Task::new("t-2", cog_core::TaskType::Planner, serde_json::json!({})),
                 &[],
             )),
+            "t-2",
         )
         .await;
 
@@ -647,6 +654,7 @@ mod tests {
             "draft",
             "revision_probe_rewrote",
             crate::actors::ReviewBasis::HeldTo("spec".into()),
+            "t-1",
         )
         .await;
         assert_eq!(
@@ -673,6 +681,7 @@ mod tests {
             "draft",
             "revision_probe_noop",
             crate::actors::ReviewBasis::HeldTo("spec".into()),
+            "t-1",
         )
         .await;
         assert_eq!(
@@ -711,6 +720,7 @@ mod tests {
             "{\"verdict\":\"Fail\"}",
             &stage,
             crate::actors::ReviewBasis::Skipped(SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE),
+            "t-1",
         )
         .await;
 
@@ -742,6 +752,7 @@ mod tests {
             "draft",
             &stage,
             crate::actors::ReviewBasis::HeldTo(String::new()),
+            "t-disabled",
         )
         .await;
 

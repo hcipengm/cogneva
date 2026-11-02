@@ -73,6 +73,14 @@ pub fn self_review_actor(role: &str) -> String {
 pub struct SelfReviewLoop {
     pub config: SelfReviewConfig,
     actor: String,
+    /// The DAG task this review is being run for, when it is being run for one.
+    ///
+    /// 与 `actor` 分开记，因为两者答的不是同一问：`actor` 答「哪个角色在花」，
+    /// 这一格答「哪件活花的」。只有前者时，一次自检的花销落在
+    /// `self_review:<role>` 上，按任务看成本的那一面读不到它——账本里这一族
+    /// 2026-11-02 实测 354 次成功调用、任务 id 全空。它不是另一个执行者，
+    /// 所以不并进 `actor`：并进去等于把一个角色的两件事算成两个人。
+    task: Option<String>,
 }
 
 impl SelfReviewLoop {
@@ -80,6 +88,7 @@ impl SelfReviewLoop {
         Self {
             config,
             actor: DEFAULT_SELF_REVIEW_ACTOR.to_string(),
+            task: None,
         }
     }
 
@@ -87,6 +96,16 @@ impl SelfReviewLoop {
     /// on behalf of a specific agent can be charged for it.
     pub fn with_actor(mut self, actor: impl Into<String>) -> Self {
         self.actor = actor.into();
+        self
+    }
+
+    /// Charge this review's spend to `task`, so "what did this change cost"
+    /// counts the calls spent judging it rather than only the ones that wrote it.
+    pub fn with_task(mut self, task: impl Into<String>) -> Self {
+        let task = task.into();
+        if !task.trim().is_empty() {
+            self.task = Some(task);
+        }
         self
     }
 
@@ -128,7 +147,14 @@ impl SelfReviewLoop {
 
             // Step 2: Critique
             let spec = self.config.spec.as_deref().unwrap_or("");
-            let critique = SelfReviewLoop::critique(&observation, spec, &self.actor, llm).await?;
+            let critique = SelfReviewLoop::critique(
+                &observation,
+                spec,
+                &self.actor,
+                self.task.as_deref(),
+                llm,
+            )
+            .await?;
 
             // Step 3: Compare
             let comparison = SelfReviewLoop::compare(
@@ -136,6 +162,7 @@ impl SelfReviewLoop {
                 spec,
                 &self.config.best_practices,
                 &self.actor,
+                self.task.as_deref(),
                 llm,
             )
             .await?;
@@ -151,8 +178,14 @@ impl SelfReviewLoop {
                 SelfReviewResult::NeedRevision { .. } => {
                     // Step 5: Revise
                     let previous = current_output.clone();
-                    current_output =
-                        SelfReviewLoop::revise(&result, &current_output, &self.actor, llm).await?;
+                    current_output = SelfReviewLoop::revise(
+                        &result,
+                        &current_output,
+                        &self.actor,
+                        self.task.as_deref(),
+                        llm,
+                    )
+                    .await?;
 
                     // A revision that rewrote nothing leaves the loop with
                     // nothing left to ask: the next critique and comparison
@@ -198,6 +231,7 @@ impl SelfReviewLoop {
         obs: &Observation,
         spec: &str,
         actor: &str,
+        task: Option<&str>,
         llm: &dyn LlmClient,
     ) -> SFResult<Critique> {
         let user_payload = serde_json::json!({
@@ -205,7 +239,7 @@ impl SelfReviewLoop {
             "spec": spec,
         });
         let user_msg = Message::user(user_payload.to_string());
-        let options = ChatOptions::default().with_actor(actor);
+        let options = stamp(ChatOptions::default(), actor, task);
 
         let output = execute_structured::<CritiqueOutput>(llm, &[user_msg], &options).await?;
         let raw = serde_json::to_string(&output).unwrap_or_default();
@@ -229,6 +263,7 @@ impl SelfReviewLoop {
         spec: &str,
         best_practices: &[String],
         actor: &str,
+        task: Option<&str>,
         llm: &dyn LlmClient,
     ) -> SFResult<Comparison> {
         let user_payload = serde_json::json!({
@@ -239,7 +274,7 @@ impl SelfReviewLoop {
             "best_practices": best_practices,
         });
         let user_msg = Message::user(user_payload.to_string());
-        let options = ChatOptions::default().with_actor(actor);
+        let options = stamp(ChatOptions::default(), actor, task);
 
         let output = execute_structured::<ComparisonOutput>(llm, &[user_msg], &options).await?;
         let raw = serde_json::to_string(&output).unwrap_or_default();
@@ -300,6 +335,7 @@ impl SelfReviewLoop {
         result: &SelfReviewResult,
         original: &str,
         actor: &str,
+        task: Option<&str>,
         llm: &dyn LlmClient,
     ) -> SFResult<String> {
         let (critique, suggestions) = match result {
@@ -318,11 +354,14 @@ impl SelfReviewLoop {
         });
         let user_msg = Message::user(user_payload.to_string());
 
-        let options = ChatOptions {
-            response_format: ResponseFormat::Text,
-            ..Default::default()
-        }
-        .with_actor(actor);
+        let options = stamp(
+            ChatOptions {
+                response_format: ResponseFormat::Text,
+                ..Default::default()
+            },
+            actor,
+            task,
+        );
 
         // The revision is the only step with no schema to say what it answers:
         // the payload names the text, the critique and the suggestions, but
@@ -357,6 +396,20 @@ impl SelfReviewLoop {
         }
 
         Ok(revised)
+    }
+}
+
+/// 把「谁在花」与「哪件活花的」两个身份贴到一次请求上。
+///
+/// 两格都要，因为账本按它们分别取行：只贴角色时，自检这一族 354 次成功调用在
+/// 按任务读成本的那一面全是空 id；只贴任务时，「哪个角色在花」就答不出来。
+/// 没有任务可贴的那几次（常驻角色、临时评测）不编一个 id——编出来的会读成一件
+/// 真花过钱的任务。
+fn stamp(options: ChatOptions, actor: &str, task: Option<&str>) -> ChatOptions {
+    let options = options.with_actor(actor);
+    match task {
+        Some(task) => options.with_task(task),
+        None => options,
     }
 }
 

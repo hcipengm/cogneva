@@ -317,6 +317,7 @@ impl PlannerActor {
             &output_str,
             cog_core::roles::PLANNER,
             review_basis,
+            &task.id,
         )
         .await
         {

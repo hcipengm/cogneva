@@ -239,6 +239,20 @@ pub trait Agent: Send + Sync {
         let result = self.review_output(output, config).await?;
         Ok((output.to_string(), result))
     }
+
+    /// Review an output on behalf of the DAG task `task_id`.
+    ///
+    /// 与 [`Self::review_and_revise`] 分开，是因为「审的是谁的东西」与「这份东西
+    /// 是哪件活」是两个身份，而账本分两格记：只留角色，按任务读成本的那一面就
+    /// 读不到自检这一族的花销。没有任务的调用走默认实现，与不带任务时逐字相同。
+    async fn review_and_revise_for_task(
+        &self,
+        output: &str,
+        config: &crate::SelfReviewConfig,
+        _task_id: &str,
+    ) -> crate::SFResult<(String, crate::SelfReviewResult)> {
+        self.review_and_revise(output, config).await
+    }
 }
 
 /// Commands that the Supervisor may send to an Agent.

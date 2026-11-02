@@ -1142,6 +1142,24 @@ impl Agent {
         loop_.review(output, self.llm.as_ref()).await
     }
 
+    /// Review an output that belongs to DAG task `task_id`.
+    ///
+    /// The label and the task are two cells on the ledger, so both travel: the
+    /// actor says which role spent the tokens, the task says which piece of
+    /// work they were spent on. Without the second, a change's own review cost
+    /// is not part of that change's cost.
+    pub async fn review_and_revise_for_task(
+        &self,
+        output: &str,
+        config: &cog_core::SelfReviewConfig,
+        task_id: &str,
+    ) -> SFResult<(String, cog_core::SelfReviewResult)> {
+        let loop_ = crate::self_review::SelfReviewLoop::new(config.clone())
+            .with_actor(self.review_actor())
+            .with_task(task_id);
+        loop_.review(output, self.llm.as_ref()).await
+    }
+
     /// Start a background consumer that listens for [`InboxMessage`]s on
     /// this agent's Redis Streams inbox.
     /// Idempotent: if a consumer is already running this returns immediately.
@@ -1436,6 +1454,15 @@ impl cog_core::Agent for Agent {
         config: &cog_core::SelfReviewConfig,
     ) -> cog_core::SFResult<(String, cog_core::SelfReviewResult)> {
         Agent::review_and_revise(self, output, config).await
+    }
+
+    async fn review_and_revise_for_task(
+        &self,
+        output: &str,
+        config: &cog_core::SelfReviewConfig,
+        task_id: &str,
+    ) -> cog_core::SFResult<(String, cog_core::SelfReviewResult)> {
+        Agent::review_and_revise_for_task(self, output, config, task_id).await
     }
 }
 

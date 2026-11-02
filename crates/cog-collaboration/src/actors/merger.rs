@@ -139,6 +139,7 @@ impl MergerActor {
             &output_str,
             cog_core::roles::MERGER,
             review_basis,
+            &task.id,
         )
         .await
         {

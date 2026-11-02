@@ -238,6 +238,7 @@ impl GeneratorActor {
             &output_str,
             cog_core::roles::GENERATOR,
             review_basis,
+            &task.id,
         )
         .await
         {
