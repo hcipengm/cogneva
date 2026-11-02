@@ -26,9 +26,11 @@ import { Note } from '@/ui/Note';
  * 是两个数，两个都写出来。
  */
 export function DimensionCounts({ actors }: { actors: ActorUsage[] }) {
-  // 默认展开第一维：读者最常问的就是「这些执行者是谁」，而一个默认全收起的
-  // 界面会让人以为那些数只是装饰。
-  const [open, setOpen] = useState<string | null>(ACTOR.key);
+  // 一进来全是收起的。执行者那一维**没有**可展开的清单：它下面那张表就是清单，
+  // 而且带表头、两级行、能追问到「哪个环境、哪条上游、哪种协议」。同一个维度在
+  // 一屏里画两遍，读者要花一次力气才能确认「上面那串没有表头的名字和下面那张表
+  // 说的是同一件事」，而两处一旦有一处落后，看起来就只是两份不一样的读数。
+  const [open, setOpen] = useState<string | null>(null);
 
   return (
     <div className="rail py-2 pr-4">
@@ -38,23 +40,32 @@ export function DimensionCounts({ actors }: { actors: ActorUsage[] }) {
           // 数的是成员，不是折叠表里的每一格：占位符单列在描述里说。
           const counted = countedMembers(list, dim);
           const absent = registeredButAbsent(list, dim);
-          const expanded = open === dim.key;
+          const expandable = dim.expandable !== false;
+          const expanded = expandable && open === dim.key;
           return (
             <Note
-              as="button"
+              as={expandable ? 'button' : 'div'}
               key={dim.key}
-              type="button"
-              onClick={() => setOpen(expanded ? null : dim.key)}
-              className="cursor-pointer text-left"
-              aria-expanded={expanded}
-              text={expanded ? '收起这一维的成员' : '列出这一维的成员'}
+              type={expandable ? 'button' : undefined}
+              onClick={expandable ? () => setOpen(expanded ? null : dim.key) : undefined}
+              className={expandable ? 'cursor-pointer text-left' : 'text-left'}
+              aria-expanded={expandable ? expanded : undefined}
+              text={
+                !expandable
+                  ? '这一维的成员清单就在下面的表里'
+                  : expanded
+                    ? '收起这一维的成员'
+                    : '列出这一维的成员'
+              }
             >
               <div className="mono text-[17px] leading-tight text-[var(--paper)]">
                 {counted.length}
               </div>
               <div className="text-[11px] text-[var(--muted)]">
                 {dim.title}
-                <span className="ml-1 text-[var(--paper-dim)]">{expanded ? '▾' : '▸'}</span>
+                {expandable && (
+                  <span className="ml-1 text-[var(--paper-dim)]">{expanded ? '▾' : '▸'}</span>
+                )}
               </div>
               <div className="text-[11px] text-[var(--muted)] opacity-80">
                 {dim.note(counted, absent)}
@@ -150,6 +161,11 @@ type Dimension = {
   isPlaceholder?: (value: string) => boolean;
   /** 这一维的闭集：登记了哪些取值。空窗口也要能看出全集有多大。 */
   registry?: Record<string, string>;
+  /**
+   * 这一维有没有可展开的成员清单。执行者那一维没有：它的清单是下面那张带表头的
+   * 表，在这里再画一份就是同一个维度的一幅半图。
+   */
+  expandable?: boolean;
   note: (counted: Member[], absent: string[]) => string;
   footnote: (list: Member[], counted: Member[], absent: string[]) => string;
 };
@@ -229,13 +245,14 @@ const ACTOR: Dimension = {
   }),
   isPlaceholder: (value) => value === UNKNOWN_ACTOR_NAME,
   registry: ACTOR_MEANINGS,
+  expandable: false,
   note: (counted, absent) => {
     // 表里还留着一格 `unknown`，它是占位不是名字：读法要留着（否则它显示成
     // 「不在闭集里」），但不算进「登记了几个名字」。
     const named = Object.keys(ACTOR_MEANINGS).length - 1;
     return absent.length > 0
-      ? `本窗口出现 ${counted.length} 个，闭集共 ${named} 个固定名＋2 族`
-      : `点开看是谁（闭集 ${named} 个固定名＋2 族）`;
+      ? `本窗口出现 ${counted.length} 个，闭集共 ${named} 个固定名＋2 族（明细见下表）`
+      : `见下表（闭集 ${named} 个固定名＋2 族）`;
   },
   footnote: () =>
     '执行者名来自网关的闭集：固定的阶段名（eval、memory、ralph…），加 `agent:<角色>` / `self_review:<被评的角色>` 两族前缀。没声明自己是谁的调用方记成 `unknown`——名字缺席是调用方没报，不是网关丢的，所以它不算进「几个执行者」，只把那段花销照实列出来。闭集里登记了、这段窗口没出现过的名字也列在下面，标「本窗口没有调用」：出现过几个不是全集。',

@@ -147,7 +147,7 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
                   </td>
                   <td className={NUM} style={{ color: 'var(--muted)' }}>
                     {group.calls > 0 ? (
-                      <Note text={perCallNote('输入', group.input, group.calls)}>
+                      <Note text={perCallNote('未命中输入', group.input, group.calls)}>
                         {Math.round(group.input / group.calls).toLocaleString()}
                       </Note>
                     ) : (
@@ -218,7 +218,7 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
                         </td>
                         <td className={`${NUM} text-[10px]`} style={{ color: 'var(--muted)' }}>
                           {row.calls > 0 ? (
-                            <Note text={perCallNote('输入', row.tokens_input, row.calls)}>
+                            <Note text={perCallNote('未命中输入', row.tokens_input, row.calls)}>
                               {Math.round(row.tokens_input / row.calls).toLocaleString()}
                             </Note>
                           ) : (
@@ -256,11 +256,33 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
         一种协议」四格合起来才是账上唯一的一行，同一个执行者换过环境就是两行。
         上游那格写模型名，指针停上去看它挂在哪条线路上；写「未发起」的行没有任何
         上游被尝试——请求在池级熔断那一步就被拒了。
-        「缓存」与「缓存写入」是两半：前者是从缓存取回多少，后者是让上游写进去多少；
+        「缓存命中」与「缓存写入」是两半：前者是从缓存取回多少，后者是让上游写进去多少；
         两半不相加、不互为分母。命中为 0 时它们分开两种成因——写了 0、读了 0 是压根
         没让上游缓存任何东西；写了 N、读了 0 是标记送到了但前缀每发都在变。没量过的
         那一半印「还没进账」或「这家不报」，不印 0：0 是「上游说它没写」，是结论。
       </p>
+      {/* 四列的读法写在表下面，列名自己只留一个词：列宽放不下的定义，放在一处说清。 */}
+      <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px] text-[var(--muted)]">
+        <dt className="mono">未命中输入</dt>
+        <dd className="m-0">
+          这一段 prompt 里没有被缓存服务、按全价计费的那部分输入 token（记账面归一之后
+          `input` 只装这部分，两个协议面同一条不变式）。
+        </dd>
+        <dt className="mono">缓存命中</dt>
+        <dd className="m-0">
+          同一段 prompt 里由上游缓存服务的那部分输入 token——从缓存读回来的量。
+        </dd>
+        <dt className="mono">缓存写入</dt>
+        <dd className="m-0">
+          让上游把前缀写进缓存的那部分输入 token（`cache_creation_input_tokens`）。
+          只有 Anthropic 面报这一半，OpenAI 兼容面不报。
+        </dd>
+        <dt className="mono">缓存命中率</dt>
+        <dd className="m-0">
+          缓存命中 ÷（未命中输入 ＋ 缓存命中），也就是「整段 prompt 里有多大比例是
+          从缓存读回来的」。
+        </dd>
+      </dl>
       {spenders.length < groups.length && (
         <p className="text-[11px] text-[var(--muted)]">
           {groups.length - spenders.length} 行是零 token 的：它们有调用、没拿到回应，
@@ -300,12 +322,12 @@ const COLUMNS: { key: keyof typeof W; label: string; numeric: boolean }[] = [
   { key: 'share', label: '占比', numeric: true },
   { key: 'calls', label: '调用', numeric: true },
   { key: 'failed', label: '失败', numeric: true },
-  { key: 'input', label: '输入', numeric: true },
+  { key: 'input', label: '未命中输入', numeric: true },
   { key: 'output', label: '输出', numeric: true },
-  { key: 'cached', label: '缓存', numeric: true },
+  { key: 'cached', label: '缓存命中', numeric: true },
   { key: 'write', label: '缓存写入', numeric: true },
-  { key: 'rate', label: '缓存占比', numeric: true },
-  { key: 'per', label: '每调用输入', numeric: true },
+  { key: 'rate', label: '缓存命中率', numeric: true },
+  { key: 'per', label: '每调用未命中', numeric: true },
   { key: 'latency', label: '均耗', numeric: true },
 ];
 
