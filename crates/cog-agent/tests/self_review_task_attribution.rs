@@ -9,10 +9,11 @@
 //! 字段在账本上仍然是空的，只有请求上的头会走到账本。
 
 use async_trait::async_trait;
-use cog_agent::SelfReviewLoop;
+use cog_agent::{Agent, SelfReviewLoop};
 use cog_core::{
-    AssistantMessageEventStream, ChatOptions, ChatResponse, CompleteOptions, ContentBlock,
-    LlmClient, Message, SFResult, SelfReviewConfig, StopReason, LLM_ACTOR_HEADER, LLM_TASK_HEADER,
+    Agent as AgentContract, AssistantMessageEventStream, ChatOptions, ChatResponse,
+    CompleteOptions, ContentBlock, LlmClient, Message, RuntimeConfig, SFResult, SelfReviewConfig,
+    StopReason, LLM_ACTOR_HEADER, LLM_TASK_HEADER,
 };
 use std::sync::{Arc, Mutex};
 
@@ -128,6 +129,79 @@ async fn a_review_with_no_task_carries_no_task_header() {
             task.as_deref(),
             None,
             "call {index} invented a task id out of a blank one"
+        );
+    }
+}
+
+/// 协作层拿到的是 trait 上的那个入口，不是循环本身——任务 id 要在外面包了
+/// 一层之后仍然到得了请求上。
+///
+/// 这一层丢参数是编译得过的：`review_and_revise_for_task` 在契约里带一份
+/// 默认实现，它把 `task_id` 原样丢掉、转调不带任务的那个方法。一个有真实
+/// 评审的实现在那里忘了重写，调度侧照常拿到评审结果，只是这一族的花销从此
+/// 归不到任何一件活——账本上读作「这活没花过自检的钱」，而不是「有人丢了参数」。
+#[tokio::test]
+async fn the_agent_entry_point_forwards_the_task_to_every_review_call() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        RuntimeConfig::default(),
+        Arc::new(RecordingLlm { seen: seen.clone() }),
+    );
+    let config = SelfReviewConfig {
+        max_iterations: 1,
+        quality_threshold: 0.5,
+        spec: Some("the plan names the file".into()),
+        best_practices: Vec::new(),
+    };
+
+    let _ =
+        AgentContract::review_and_revise_for_task(&agent, "draft", &config, "change-ledger-abc")
+            .await
+            .unwrap();
+
+    let calls = seen.lock().unwrap().clone();
+    assert!(!calls.is_empty(), "the agent asked something");
+    for (index, (actor, task)) in calls.iter().enumerate() {
+        assert_eq!(
+            actor.as_deref(),
+            Some("self_review:planner"),
+            "call {index} lost the role on its way through the agent"
+        );
+        assert_eq!(
+            task.as_deref(),
+            Some("change-ledger-abc"),
+            "call {index} lost the task on its way through the agent: the wrapper took the \
+             contract's default, which drops the argument"
+        );
+    }
+}
+
+/// 不带任务的那个入口不编一个 id 出来：同一层包装，少一格就必须真的少一格。
+#[tokio::test]
+async fn the_agent_entry_point_without_a_task_carries_no_task_header() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let agent = Agent::new(
+        RuntimeConfig::default(),
+        Arc::new(RecordingLlm { seen: seen.clone() }),
+    );
+    let config = SelfReviewConfig {
+        max_iterations: 1,
+        quality_threshold: 0.5,
+        spec: Some("anything".into()),
+        best_practices: Vec::new(),
+    };
+
+    let _ = AgentContract::review_and_revise(&agent, "draft", &config)
+        .await
+        .unwrap();
+
+    let calls = seen.lock().unwrap().clone();
+    assert!(!calls.is_empty(), "the agent asked something");
+    for (index, (_, task)) in calls.iter().enumerate() {
+        assert_eq!(
+            task.as_deref(),
+            None,
+            "call {index} invented a task id for a review nobody made it for"
         );
     }
 }

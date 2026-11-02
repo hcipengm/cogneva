@@ -380,3 +380,205 @@ fn the_census_reports_an_undeclared_actor() {
     assert!(matches!(ok.as_slice(), [Site::Literal(v)] if v == "ralph"));
     assert!(declared("ralph"));
 }
+
+// ============================================================================
+// 第二格：这条产出替哪件活花的钱
+// ============================================================================
+
+/// 一条产出线的花销记在哪件活上。
+///
+/// 账本按两格取行：`actor` 答「谁花的」，`task_id` 答「哪件活花的」。上面那张
+/// 名单管的是第一格，这一张管第二格——同一份名单，一个产出既然说了「谁」，就得
+/// 说清「哪件活」；不替任何任务花钱的那些必须在这里写明它替的是什么。
+///
+/// 写明的理由不只是文档：一个产出把「来源 id」塞进 `task_id` 看着像归了因，实际
+/// 读成本的那一面按任务图 join，查不到就是归不到（`unattributed_between` 把它
+/// 算作无归因），于是账上多出一串看起来像任务、永远对不上的 id。反过来，一个替
+/// 任务花钱的产出没盖章时，那件活的成本里不含它——2026-11-01 实测 635 次自检调用
+/// 就是这样从「这件变更花了多少」里消失的。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TaskKeying {
+    /// 任务图里的一件活：任务 id 随调用走。
+    Task,
+    /// 任务图不管的那样东西，名字写在这里。
+    KeyedBy(&'static str),
+}
+
+/// 与 `PRODUCERS` 同一份文件清单，逐个说清这家的钱记在哪件活上。
+const TASK_KEYING: &[(&str, TaskKeying)] = &[
+    ("crates/cog-agent/src/agent.rs", TaskKeying::Task),
+    (
+        "crates/cog-agent/src/agent_kernel/runtime.rs",
+        TaskKeying::Task,
+    ),
+    ("crates/cog-agent/src/self_review.rs", TaskKeying::Task),
+    (
+        "crates/cog-agent/tests/self_review_task_attribution.rs",
+        TaskKeying::Task,
+    ),
+    (
+        "crates/cog-collaboration/src/collaboration_executor.rs",
+        TaskKeying::Task,
+    ),
+    (
+        "crates/cog-collaboration/src/squad/ralph/ralph_loop.rs",
+        TaskKeying::Task,
+    ),
+    (
+        "crates/cog-eval/src/adapters/hle.rs",
+        TaskKeying::KeyedBy("一次评测里的那条样本，任务图不建它的节点"),
+    ),
+    (
+        "crates/cog-eval/src/judge.rs",
+        TaskKeying::KeyedBy("一次评测里的那个判分，任务图不建它的节点"),
+    ),
+    (
+        "crates/cog-eval/src/scaffolds/mod.rs",
+        TaskKeying::KeyedBy("一次评测运行，任务图不建它的节点"),
+    ),
+    (
+        "crates/cog-extension/src/hostdocs_assist.rs",
+        TaskKeying::KeyedBy("沙盒里的那份文档"),
+    ),
+    (
+        "crates/cog-gateway/src/chat.rs",
+        TaskKeying::KeyedBy("一段对话，不是任务"),
+    ),
+    (
+        "crates/cog-memory/src/extractor.rs",
+        TaskKeying::KeyedBy("被抽取的那份原始材料"),
+    ),
+    (
+        "crates/cog-reflection/src/evolution.rs",
+        TaskKeying::KeyedBy("一个技能 / 钩子 / 工具变体"),
+    ),
+    (
+        "crates/cog-reflection/src/extractor.rs",
+        TaskKeying::KeyedBy("一个行为模式"),
+    ),
+    (
+        "crates/cog-wiki/src/llm_maintainer.rs",
+        TaskKeying::KeyedBy("一个 wiki 页面"),
+    ),
+    (
+        "crates/cogneva/src/eval_table.rs",
+        TaskKeying::KeyedBy("评测表里的一行"),
+    ),
+    (
+        "crates/cogneva/tests/collaboration_self_review_test.rs",
+        TaskKeying::KeyedBy("一个替身：它不发出任何计费调用"),
+    ),
+];
+
+/// 这一个文件在产出文本里盖不盖任务章。
+///
+/// 只认两种写法：直接挂 `.with_task(`，或走那个把任务挂上去的助手
+/// （`stamp_task`）。直接写 `LLM_TASK_HEADER` 的不是产出端——读请求头的网关
+/// 也在那一格，而它记的是调用方说了什么，不是自己声称哪件活。
+fn stamps_a_task(text: &str) -> bool {
+    text.contains(".with_task(") || text.contains("stamp_task(")
+}
+
+/// 全树里盖任务章的文件。
+fn task_stampers(root: &Path) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for file in all_crate_files(root) {
+        let rel = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        if EXCLUDED.iter().any(|(path, _)| *path == rel) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", file.display()));
+        if stamps_a_task(&production_text(&text)) {
+            found.insert(rel);
+        }
+    }
+    found
+}
+
+#[test]
+fn every_producer_says_what_its_spend_is_charged_to() {
+    let declared: BTreeSet<&str> = TASK_KEYING.iter().map(|(path, _)| *path).collect();
+    let producers: BTreeSet<&str> = PRODUCERS.iter().map(|(path, _)| *path).collect();
+    let unclassified: Vec<_> = producers.difference(&declared).collect();
+    let stale: Vec<_> = declared.difference(&producers).collect();
+    assert!(
+        unclassified.is_empty(),
+        "these producers say who spends but not what the spend is for: {unclassified:?}\n\
+         给它们补一条 `TASK_KEYING`：替任务花钱的写 `Task` 并让任务 id 随调用走，\
+         不替任务花钱的写清它替的是什么。"
+    );
+    assert!(
+        stale.is_empty(),
+        "these files are classified here but no longer write an actor: {stale:?}"
+    );
+    let mut seen = BTreeSet::new();
+    for (path, _) in TASK_KEYING {
+        assert!(seen.insert(*path), "{path} is classified twice");
+    }
+}
+
+/// 只盖任务章的那一侧：写了的必须是任务产出，没写的一个字都不许有。
+#[test]
+fn a_producer_keyed_by_something_else_stamps_no_task() {
+    let root = repo_root();
+    let stamped = task_stampers(&root);
+    let mut complaints = Vec::new();
+    for (path, keying) in TASK_KEYING {
+        let TaskKeying::KeyedBy(key) = keying else {
+            continue;
+        };
+        if stamped.contains(*path) {
+            complaints.push(format!(
+                "{path} 盖了任务章，但它这里声明的是「键在 {key} 上」：\
+                 把 {key} 写进 task_id 看着像归了因，按任务图 join 时对不上，\
+                 读成本的那一面照样算作无归因"
+            ));
+        }
+    }
+    assert!(complaints.is_empty(), "{}", complaints.join("\n"));
+}
+
+/// 另一侧：盖了任务章的每一个文件都得在这里声明成 `Task`。
+///
+/// 缺一个就是一个新产出线悄悄开始记任务了，而上面两张表都还是绿的。
+#[test]
+fn every_file_that_stamps_a_task_is_declared_task_keyed() {
+    let root = repo_root();
+    let stamped = task_stampers(&root);
+    let mut expected: BTreeSet<String> = TASK_KEYING
+        .iter()
+        .filter(|(_, keying)| matches!(keying, TaskKeying::Task))
+        .map(|(path, _)| path.to_string())
+        .collect();
+    // 定义 `.with_task` 的那份契约不是产出端：它写的是「怎么盖」，不是「替谁盖」。
+    expected.remove("crates/cog-core/src/contract/llm.rs");
+
+    let added: Vec<_> = stamped.difference(&expected).collect();
+    let gone: Vec<_> = expected.difference(&stamped).collect();
+    assert!(
+        added.is_empty(),
+        "these files stamp a task header without being declared task-keyed: {added:?}\n\
+         替任务花钱的登记成 `Task`；不替任何任务花钱的，那个章是编出来的 id。"
+    );
+    assert!(
+        gone.is_empty(),
+        "these files are declared `Task` but write no task header: {gone:?}\n\
+         任务是空的，这件活的成本里就不会有这一族的钱。"
+    );
+}
+
+#[test]
+fn the_task_scan_sees_a_stamp() {
+    // 反向对照：一个认不出任务章的扫法在两边都是绿的。
+    assert!(stamps_a_task(&production_text(
+        r#"let o = ChatOptions::default().with_task("t-1");"#
+    )));
+    assert!(!stamps_a_task(&production_text(
+        r#"let o = ChatOptions::default().with_actor("ralph");"#
+    )));
+}
