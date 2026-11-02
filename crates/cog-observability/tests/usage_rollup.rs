@@ -1058,10 +1058,14 @@ async fn one_upstream_answering_on_two_faces_spends_as_two_rows() {
         .await
         .expect("fold the window");
 
-    let mut spent: Vec<_> = store
+    let read = store
         .spend_by_upstream_and_actor()
         .await
-        .expect("read the spend by upstream")
+        .expect("read the spend by upstream");
+    // 这张表是整套测试共用的一张：读本身是全表读，所以数之前先把这次运行自己那个
+    // 上游名筛出来。整表计数会把别的测试的行、以及上一次跑挂了没清理的行一起算上，
+    // 而这一次若因此报错就再也走不到下面的清理，后面每一次都会读到同一个数。
+    let mut spent: Vec<_> = read
         .into_iter()
         .filter(|s| s.upstream == upstream)
         .collect();
