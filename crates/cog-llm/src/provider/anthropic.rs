@@ -224,14 +224,26 @@ impl AnthropicProvider {
             }
             body["tools"] = json!(tool_defs);
         }
-        // 最后一个断点落在最后一条消息的末尾：下一次调用是同一段对话又长了一轮，
-        // 前面那段逐字节没变，于是整段历史按缓存价读，只有新增的那一轮按原价。
+        // 第三条断点落在**第一条**消息上，不是最后一条。
+        //
+        // 挂在最后一条是按「断点标在历史末尾，下一次整段历史都进缓存」推的，前提是
+        // 上游按语义比对前缀、把标记当元数据。占着这条协议面的那家不是：2026-11-01
+        // 实测同一条生成链的 28 次调用里，第 2 次请求与第 1 次逐条消息逐字节相同
+        // （只多出后续几轮），`cached_tokens` 仍然是 0；而一次几乎逐字重复的调用拿到
+        // 13568。差异只在标记本身——标记是写进消息 content 的字节，它从「上一条」
+        // 移到「这一条」时，上一条的那几个字节就变了，而它们正落在想要复用的前缀里。
+        // 于是每一次调用都把上一次刚写好的缓存作废，命中率永远是 0。
+        //
+        // 固定在第一条上，一个对话里第一次之后的所有请求都只追加、不改写：
+        // 请求 N 的全部消息逐字节是请求 N+1 的前缀，任何实现的前缀缓存都能直接用。
+        // 代价是只到第一条为止（工具 → system → 第一条消息）；这是这几条里唯一
+        // 不随对话增长而移动的位置，也就只有它不会被自己写坏。
         if let Some(m) = &marker {
-            if let Some(last) = body["messages"]
+            if let Some(first) = body["messages"]
                 .as_array_mut()
-                .and_then(|arr| arr.last_mut())
+                .and_then(|arr| arr.first_mut())
             {
-                mark_content_end(&mut last["content"], m);
+                mark_content_end(&mut first["content"], m);
             }
         }
 
@@ -997,9 +1009,9 @@ mod tests {
         assert!(body["system"].is_string(), "system 仍是字符串形状");
     }
 
-    /// 要了缓存：三条断点，落在模型实际读到的顺序上（工具 → system → 最后一条消息）。
+    /// 要了缓存：三条断点，落在模型实际读到的顺序上（工具 → system → 第一条消息）。
     #[test]
-    fn a_short_retention_marks_the_last_tool_the_system_and_the_tail() {
+    fn a_short_retention_marks_the_last_tool_the_system_and_the_first_message() {
         let body = body_with(CacheRetention::Short, &conversation());
         let tools = body["tools"].as_array().expect("tools");
         assert!(tools.last().unwrap()["cache_control"].is_object());
@@ -1015,10 +1027,17 @@ mod tests {
         );
 
         let msgs = body["messages"].as_array().expect("messages");
-        let tail = msgs.last().unwrap()["content"].as_array().expect("content");
+        let head = msgs.first().unwrap()["content"]
+            .as_array()
+            .expect("content");
         assert_eq!(
-            tail.last().unwrap()["cache_control"],
+            head.last().unwrap()["cache_control"],
             json!({"type": "ephemeral"})
+        );
+        let tail = msgs.last().unwrap()["content"].as_array().expect("content");
+        assert!(
+            tail.last().unwrap().get("cache_control").is_none(),
+            "最后一条也标了：它会随对话增长而移动，下一次调用就把这条前缀写坏"
         );
     }
 
@@ -1040,9 +1059,9 @@ mod tests {
     }
 
     /// 纯文本消息的内容是裸字符串，断点没有位置可挂——它必须就地折成块数组，
-    /// 否则最后一条消息那一条断点会被静默丢掉，命中率只吃到前两条。
+    /// 否则那一条断点会被静默丢掉，命中率只吃到前两条。
     #[test]
-    fn a_plain_text_message_still_carries_the_tail_breakpoint() {
+    fn a_plain_text_message_still_carries_the_breakpoint() {
         let body = body_with(CacheRetention::Short, &[Message::user("hello")]);
         let content = &body["messages"][0]["content"];
         assert_eq!(
@@ -1053,15 +1072,33 @@ mod tests {
     }
 
     /// 同一段前缀在两次调用之间必须逐字节相同，否则命中的开销白付。
+    ///
+    /// 判据是硬的、整份的：后一次请求里，前一次发过的**每一条**消息都要与当时
+    /// 逐字节相同，不只是第一条。断点标在最后一条时这条会红——那条消息在下一次
+    /// 变成倒数第二条，标记被摘掉，字节就变了，而它正落在要复用的前缀里。
     #[test]
-    fn two_turns_of_one_conversation_send_the_same_head() {
+    fn a_later_turn_rewrites_nothing_the_earlier_turn_sent() {
         let mut msgs = conversation();
         let first = body_with(CacheRetention::Short, &msgs);
+        msgs.push(Message::assistant(vec![ContentBlock::text(
+            "reading the alert rule",
+        )]));
         msgs.push(Message::user("and now check the tests"));
         let second = body_with(CacheRetention::Short, &msgs);
+
         assert_eq!(first["system"], second["system"], "system 跨轮变了");
         assert_eq!(first["tools"], second["tools"], "工具定义跨轮变了");
-        let head = first["messages"][0].clone();
-        assert_eq!(head, second["messages"][0], "第一条消息跨轮变了");
+        let sent = first["messages"].as_array().expect("messages");
+        let now = second["messages"].as_array().expect("messages");
+        assert!(
+            now.len() > sent.len(),
+            "这一轮没追加任何东西，测的就不是追加"
+        );
+        for (index, message) in sent.iter().enumerate() {
+            assert_eq!(
+                message, &now[index],
+                "第 {index} 条消息在两轮之间被改写：上游按前缀比对时，从这一条起全都重买"
+            );
+        }
     }
 }
