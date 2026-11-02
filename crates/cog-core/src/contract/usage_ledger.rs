@@ -207,18 +207,26 @@ pub struct LlmUsageRecord {
     pub api_style: String,
     /// Real model name as configured on the upstream.
     pub model: String,
-    /// One of the platform's result words. The four refusals carry zero tokens
+    /// One of the platform's result words. The five refusals carry zero tokens
     /// but keep the attempt visible, and they are kept apart from `error`
     /// because the words name opposite repairs: an `error` row is an upstream
     /// that was tried and did not serve, `refused_by_circuit` is a call no
     /// upstream was ever offered (the pool was known unusable),
     /// `refused_by_pace` is one this platform held back on purpose,
     /// `refused_by_budget` is one the job itself declared a ceiling for and has
-    /// now reached, and `refused_by_owner_budget` is one the person it would be
-    /// charged to has no allowance left for today. Each reads as its own state
-    /// rather than as "no traffic" -- and the last two are the only ones whose
-    /// repair is not "wait for capacity" but "finish this job or raise its
-    /// ceiling" and "wait for the day to turn, or have the allowance raised".
+    /// now reached, `refused_by_owner_budget` is one the person it would be
+    /// charged to has no allowance left for today, and `refused_unidentified`
+    /// is one that named nobody, refused at the edge before any upstream was
+    /// touched. Each reads as its own state rather than as "no traffic". Only
+    /// the first two are waiting for capacity: the budget pair repairs by
+    /// finishing the job, raising the ceiling, or letting the day turn, and
+    /// `refused_unidentified` repairs by the caller writing its name in
+    /// `x-cogneva-actor` -- the platform does not pay for work it cannot
+    /// attribute.
+    ///
+    /// A `refused_unidentified` row is the one place `actor` is written as
+    /// `unknown`: nobody was named, and the row has to say so rather than
+    /// attribute the refusal to a caller that never identified itself.
     /// On a refusal row `upstream` and `model` are `-`: no single upstream is
     /// its subject, so both columns say so rather than naming a candidate.
     pub result: String,

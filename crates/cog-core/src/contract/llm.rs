@@ -590,6 +590,13 @@ pub enum UsageResult {
     /// 多少」上，修法是等日界翻页、或由属主调整这个人的额度。两者合成一个词，
     /// 读的人会去找错的那个人问。
     RefusedByOwnerBudget,
+    /// 请求没报执行者身份（或报的名字不在闭集里），网关在付钱之前就拒了。
+    ///
+    /// 与上面几种拒绝都分开：那几种拒的是「现在没有产能／额度」，修法是等或加
+    /// 资源；这一条拒的是「不知道这钱该记在谁头上」，修法是让调用方把身份带上。
+    /// 合成一个词，读的人会去加额度，而额度一分没少。这一行只记「有人试过」，
+    /// 用量恒为零：网关不替匿名调用付费。
+    RefusedUnidentified,
 }
 
 impl UsageResult {
@@ -599,13 +606,14 @@ impl UsageResult {
     /// that spells one itself agrees with this enum only until a variant is
     /// renamed, and then it matches no rows -- which reads exactly like a
     /// ledger with nothing in it.
-    pub const ALL: [UsageResult; 6] = [
+    pub const ALL: [UsageResult; 7] = [
         UsageResult::Ok,
         UsageResult::Error,
         UsageResult::RefusedByCircuit,
         UsageResult::RefusedByPace,
         UsageResult::RefusedByBudget,
         UsageResult::RefusedByOwnerBudget,
+        UsageResult::RefusedUnidentified,
     ];
 
     /// The word this outcome is stored under.
@@ -617,6 +625,7 @@ impl UsageResult {
             UsageResult::RefusedByPace => "refused_by_pace",
             UsageResult::RefusedByBudget => "refused_by_budget",
             UsageResult::RefusedByOwnerBudget => "refused_by_owner_budget",
+            UsageResult::RefusedUnidentified => "refused_unidentified",
         }
     }
 

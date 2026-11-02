@@ -2402,15 +2402,6 @@ fn normalize_owner(raw: Option<&str>) -> Option<String> {
     normalize_task(raw)
 }
 
-fn normalize_actor(raw: Option<&str>) -> String {
-    match raw {
-        Some(v) if !v.is_empty() && v.len() <= 32 && crate::actor_labels::declared(v) => {
-            v.to_string()
-        }
-        _ => crate::actor_labels::UNKNOWN_ACTOR.to_string(),
-    }
-}
-
 /// 一次上游调用的落点：指标 counter + 时序明细（上游、结果、调用来源、延迟）。
 #[allow(clippy::too_many_arguments)]
 async fn record_llm_call(
@@ -2637,6 +2628,40 @@ fn paced_refusal_usage(
         // 缺口要等到下一拍再猜。
         pace: Some(pace),
         // 发请求之前就被自己的额度判定拦下，没有正文可读。
+        usage_outcome: None,
+    }
+}
+
+/// 没报身份的调用在台账里的落点。
+///
+/// 这一行记的是「有人试过」，不是一笔花销：用量恒为零，因为没有上游被请求过。
+/// 它必须存在，否则「有人用匿名调用敲门」这件事在账上、在结果面上都不存在——
+/// 这条通道的拒绝全部发生在选上游之前，没有任何一家的正文明细能替它作证。
+fn unidentified_refusal_usage(
+    style: &str,
+    origin: &str,
+    task: Option<&str>,
+    owner: Option<&str>,
+) -> LlmUsageRecord {
+    LlmUsageRecord {
+        upstream: POOLED_REFUSAL_UNNAMED.to_string(),
+        api_style: style.to_string(),
+        model: POOLED_REFUSAL_UNNAMED.to_string(),
+        result: UsageResult::RefusedUnidentified.as_str().to_string(),
+        // 没有身份可记——这一格就是那句话本身：这笔请求没说是谁花的。
+        actor: crate::actor_labels::UNKNOWN_ACTOR.to_string(),
+        origin: origin.to_string(),
+        tokens_input: 0,
+        tokens_output: 0,
+        tokens_cached: 0,
+        tokens_cache_created: None,
+        estimated_input: None,
+        refusal_kind: None,
+        retry_after_secs: None,
+        task: task.map(str::to_string),
+        owner: owner.map(str::to_string),
+        latency_ms: 0,
+        pace: None,
         usage_outcome: None,
     }
 }
@@ -6404,11 +6429,6 @@ async fn stream_forward(
             "网关未配置 LLM 上游".into(),
         ));
     }
-    let actor = normalize_actor(
-        req.headers()
-            .get(cog_core::LLM_ACTOR_HEADER)
-            .and_then(|v| v.to_str().ok()),
-    );
     // The environment axis, read the same way the actor is and from the same
     // caller: the caller knows where it runs, and a table mapping component
     // names to environments would go stale the moment a deployment moved. An
@@ -6440,24 +6460,52 @@ async fn stream_forward(
             .get(cog_core::LLM_OWNER_HEADER)
             .and_then(|v| v.to_str().ok()),
     );
-    // 账本记到 `unknown` 就到此为止：它数得出"有一次调用没声明"，点不出是谁。
-    // 规则 `llm_call_without_declared_actor` 的自述里把这条边界写死了。请求离开
-    // 网关的这一刻还知道答案，所以在这里留一行：调用方自报的 User-Agent、两个
-    // 身份头在不在。只在身份缺失时记，声明正确的一次请求一行也不写——否则这行
-    // 本身就是噪声，而噪声里的名字没人找。
-    if actor == crate::actor_labels::UNKNOWN_ACTOR {
-        tracing::warn!(
-            style,
-            actor_header = req.headers().contains_key(cog_core::LLM_ACTOR_HEADER),
-            origin_header = req.headers().contains_key(LLM_ORIGIN_HEADER),
-            user_agent = req
-                .headers()
-                .get(axum::http::header::USER_AGENT)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or(""),
-            "LLM 代理收到未声明身份的调用：账本上它只会落在 unknown 格，日志是唯一能点名调用者的地方"
-        );
-    }
+    // 身份是**前置条件**，不是事后补的一格。以前这里把缺名字的调用归一成
+    // `unknown` 再照常转发，于是平台为一整段无人认领的调用付了钱：2026-10-04 至
+    // 10-19 的 987 次调用、2,802 万输入 token 全落在那一格，事后只能靠请求体里的
+    // 提示词反推是评测外壳。请求离开网关的这一刻，调用方自报的 User-Agent 和
+    // 两个身份头还在——留一行日志再拒绝，比放它过去再猜便宜，也比放它过去诚实。
+    let claimed = req
+        .headers()
+        .get(cog_core::LLM_ACTOR_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let actor = match crate::actor_labels::claimed(claimed) {
+        Ok(actor) => actor.to_string(),
+        Err(refusal) => {
+            tracing::warn!(
+                style,
+                refusal = refusal.as_str(),
+                actor_header = claimed.is_some(),
+                origin_header = req.headers().contains_key(LLM_ORIGIN_HEADER),
+                user_agent = req
+                    .headers()
+                    .get(axum::http::header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or(""),
+                "LLM 代理拒绝了没有身份的调用：零花销落一行，日志点名调用方"
+            );
+            // 两笔都要落，缺一笔就有一面读不到：台账那一行让结果面数得出
+            // 「有多少次调用因为没报身份被挡在门外」，counter 让
+            // `llm_call_without_declared_actor` 这条规则继续有信号可读——它读的
+            // 就是这个格子，早退之后只剩这一处会写它。
+            land_usage_record(
+                &state,
+                unidentified_refusal_usage(style, &origin, task.as_deref(), owner.as_deref()),
+            );
+            record_counter(
+                &state,
+                cog_core::metric_names::LLM_CALLS_TOTAL,
+                &[
+                    ("upstream", POOLED_REFUSAL_UNNAMED),
+                    ("model", POOLED_REFUSAL_UNNAMED),
+                    ("result", UsageResult::RefusedUnidentified.as_str()),
+                    ("actor", crate::actor_labels::UNKNOWN_ACTOR),
+                ],
+            )
+            .await;
+            return Err((StatusCode::BAD_REQUEST, refusal.message(claimed)));
+        }
+    };
     let body = axum::body::to_bytes(req.into_body(), MAX_PROXIED_BODY_BYTES)
         .await
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -10069,6 +10117,17 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// A proxied call that names its caller, which every real caller does.
+    ///
+    /// The identity check is the gateway's first act, so a request without one
+    /// never reaches the behaviour a test below is about -- it reaches the
+    /// refusal. Building every request through here keeps each test measuring
+    /// what it names; a test that means to ask what an unnamed call gets
+    /// builds its request without this.
+    fn proxy_request() -> axum::http::request::Builder {
+        axum::extract::Request::builder().header(cog_core::LLM_ACTOR_HEADER, "eval")
+    }
+
     /// 一个系列的键：名字，加上按名字排好的标签对。
     ///
     /// 起这个名字而不是在每个用到的地方再写一遍元组：抓取替身的两个表都拿它当键，
@@ -10543,26 +10602,6 @@ mod tests {
             None
         )
         .is_none());
-    }
-
-    #[test]
-    fn actor_header_normalized_to_bounded_labels() {
-        assert_eq!(normalize_actor(Some("self_review")), "self_review");
-        assert_eq!(normalize_actor(Some("agent:generator")), "agent:generator");
-        // A well-shaped token nobody declared is not an actor either: shape
-        // bounded the length, not the vocabulary, so any caller could add a
-        // series by inventing a short lowercase word, and that series read as a
-        // feature someone meant to add.
-        assert_eq!(normalize_actor(Some(&"a".repeat(32))), "unknown");
-        // Missing header, empty value, an undeclared word, uppercase, illegal
-        // characters, and an over-long value all collapse to the single bounded
-        // fallthrough label.
-        assert_eq!(normalize_actor(None), "unknown");
-        assert_eq!(normalize_actor(Some("")), "unknown");
-        assert_eq!(normalize_actor(Some("planner")), "unknown");
-        assert_eq!(normalize_actor(Some("Agent")), "unknown");
-        assert_eq!(normalize_actor(Some("bad/actor")), "unknown");
-        assert_eq!(normalize_actor(Some(&"a".repeat(33))), "unknown");
     }
 
     /// The job axis keeps the caller's own string instead of a bounded label,
@@ -11379,9 +11418,7 @@ mod tests {
         let app = router(state, true);
 
         let call = |signature: Option<String>| {
-            let mut builder = axum::extract::Request::builder()
-                .uri(INTERNAL_LLM_STATUS_PATH)
-                .method("POST");
+            let mut builder = proxy_request().uri(INTERNAL_LLM_STATUS_PATH).method("POST");
             if let Some(sig) = signature {
                 builder = builder.header(crate::secret_write::SIGNATURE_HEADER, sig);
             }
@@ -11436,7 +11473,7 @@ mod tests {
         let app = router(state, true);
 
         let call = |path: &'static str, signature: Option<String>, body: &'static str| {
-            let mut builder = axum::extract::Request::builder()
+            let mut builder = proxy_request()
                 .uri(path)
                 .method("POST")
                 .header("Content-Type", cog_core::CONTENT_TYPE_JSON);
@@ -11510,7 +11547,7 @@ mod tests {
         let app = router(state, true);
 
         let call = |path: &'static str, signature: Option<String>, body: &'static str| {
-            let mut builder = axum::extract::Request::builder()
+            let mut builder = proxy_request()
                 .uri(path)
                 .method("POST")
                 .header("Content-Type", cog_core::CONTENT_TYPE_JSON);
@@ -12914,7 +12951,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .llm_health
             .note_failure(&u, 300, Some(far), None, None);
 
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
@@ -14641,7 +14678,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let mut entry = stub_upstream(&base, "m1");
         entry.api_style = cog_core::RESPONSES_API_STYLE.into();
         let state = test_state(vec![entry]);
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","input":"hi"}"#,
@@ -14664,7 +14701,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     #[tokio::test]
     async fn a_chat_only_pool_refuses_the_responses_face_by_name() {
         let state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","input":"hi"}"#,
@@ -14690,7 +14727,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let mut entry = stub_upstream(&base, "m1");
         entry.api_style = cog_core::RESPONSES_API_STYLE.into();
         let state = test_state(vec![entry]);
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
@@ -14722,7 +14759,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             stub_upstream(&dead, "m1"),
             stub_upstream(&dead2, "m2"),
         ]);
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
@@ -14845,7 +14882,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         .await;
         let state = test_state(vec![stub_upstream(&upstream, "m1")]);
 
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
@@ -14878,7 +14915,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             stub_upstream(&dead, "m1"),
             stub_upstream(&healthy, "m2"),
         ]);
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
@@ -14974,7 +15011,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .llm_health
             .note_failure(&stub_upstream(&first, "m1"), 300, None, None, None);
 
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
@@ -15019,7 +15056,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             measured_at_unix: Some(now),
         };
 
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
@@ -16639,7 +16676,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
     /// 透传端点的最小请求：非流式 chat 体，走真实路由。
     fn json_request(body: &str) -> axum::extract::Request {
-        axum::extract::Request::builder()
+        proxy_request()
             .method("POST")
             .body(axum::body::Body::from(body.to_string()))
             .unwrap()
@@ -16732,7 +16769,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let app = metrics_router(state);
 
         let get = |uri: &'static str| {
-            axum::extract::Request::builder()
+            proxy_request()
                 .uri(uri)
                 .method("GET")
                 .body(axum::body::Body::empty())
@@ -16744,7 +16781,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         }
 
         let post = |uri: &'static str| {
-            axum::extract::Request::builder()
+            proxy_request()
                 .uri(uri)
                 .method("POST")
                 .body(axum::body::Body::empty())
@@ -16834,7 +16871,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         let resp = app
             .oneshot(
-                axum::extract::Request::builder()
+                proxy_request()
                     .uri("/metrics")
                     .method("GET")
                     .body(axum::body::Body::empty())
@@ -16901,7 +16938,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let (buf, _guard) = capture_logs();
 
         let app = router(test_state(Vec::new()), true);
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .uri("/git/github/owner/repo.git/info/refs?service=git-upload-pack")
             .method("GET")
             .body(axum::body::Body::empty())
@@ -16930,7 +16967,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let (buf, _guard) = capture_logs();
 
         let app = router(test_state(Vec::new()), true);
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .uri("/attach")
             .method("GET")
             .body(axum::body::Body::empty())
@@ -16945,7 +16982,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 走一次真实的签名路由，读回状态与 JSON 体。
     async fn sign_call(app: Router, outlet: &str) -> (StatusCode, serde_json::Value) {
         use tower::ServiceExt;
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .uri(SIGN_PATH)
             .method("POST")
             .header("content-type", cog_core::CONTENT_TYPE_JSON)
@@ -17127,7 +17164,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let state = test_state(vec![stub_upstream(&base, "m1")]);
 
         // 出口一：/v1/chat/completions 透传（stream_client）。
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .method("POST")
             .body(axum::body::Body::from(
                 r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
@@ -17158,6 +17195,41 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let ua = recorded(&seen, "user-agent").expect("意图请求必须带 User-Agent");
         assert!(ua.starts_with("cogneva/"), "User-Agent 要自报身份：{ua}");
         assert_eq!(recorded(&seen, "x-app").as_deref(), Some("cogneva"));
+    }
+
+    /// 没有身份的调用在付钱之前就被拒，而不是记成 `unknown` 再转发。
+    ///
+    /// 两条断言缺一不可：状态码与那句提示让调用方知道要补什么，桩上游一条请求
+    /// 都没收到证明拒绝发生在选路之前——否则「拒了」只是账面上拒了，钱照花。
+    #[tokio::test]
+    async fn a_call_that_names_nobody_never_reaches_an_upstream() {
+        let (base, seen) = spawn_header_recording_upstream().await;
+        let state = test_state(vec![stub_upstream(&base, "m1")]);
+
+        for missing in [None, Some(""), Some("unknown"), Some("planner")] {
+            let mut builder = axum::extract::Request::builder().method("POST");
+            if let Some(value) = missing {
+                builder = builder.header(cog_core::LLM_ACTOR_HEADER, value);
+            }
+            let req = builder
+                .body(axum::body::Body::from(
+                    r#"{"model":"placeholder","messages":[{"role":"user","content":"hi"}]}"#,
+                ))
+                .unwrap();
+            let (status, message) = chat_completions_passthrough(State(state.clone()), req)
+                .await
+                .expect_err("没有身份的调用必须被拒");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{missing:?}");
+            assert!(
+                message.contains(cog_core::LLM_ACTOR_HEADER),
+                "拒绝要告诉调用方补哪个头：{message}"
+            );
+        }
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "拒绝必须发生在任何上游被请求之前"
+        );
     }
 
     #[test]
@@ -17770,7 +17842,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         state.task_budget = Some(Arc::new(StubBudgetGate::new(budgeted(false, 1000, 1000))));
         let app = router(state, true);
 
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .uri("/v1/chat/completions")
             .method("POST")
             .header("content-type", cog_core::CONTENT_TYPE_JSON)
@@ -18054,7 +18126,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         state.owner_budget = Some(Arc::new(StubHierarchy::new(&[("u-1", 1200, 800, 1000)])));
         let app = router(state, true);
 
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .uri("/v1/chat/completions")
             .method("POST")
             .header("content-type", cog_core::CONTENT_TYPE_JSON)
@@ -18312,7 +18384,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         let body =
             serde_json::json!({"task_id": "t-1", "soft_limit": 10, "hard_limit": 20}).to_string();
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .uri(INTERNAL_TASK_BUDGET_PATH)
             .method("POST")
             .header("content-type", cog_core::CONTENT_TYPE_JSON)
@@ -18343,7 +18415,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let app = router(state, true);
 
         let body = serde_json::json!({"task_id": "t-1", "hard_limit": 20}).to_string();
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .uri(INTERNAL_TASK_BUDGET_PATH)
             .method("POST")
             .header("content-type", cog_core::CONTENT_TYPE_JSON)
@@ -18391,7 +18463,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             let app = router(state, true);
 
             let body = serde_json::json!({}).to_string();
-            let req = axum::extract::Request::builder()
+            let req = proxy_request()
                 .uri(INTERNAL_TASK_BUDGET_PATH)
                 .method("POST")
                 .header("content-type", cog_core::CONTENT_TYPE_JSON)
@@ -18444,7 +18516,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let app = router(state, true);
 
         let body = serde_json::json!({"soft_limit": 10, "hard_limit": 20}).to_string();
-        let req = axum::extract::Request::builder()
+        let req = proxy_request()
             .uri(INTERNAL_TASK_BUDGET_PATH)
             .method("POST")
             .header("content-type", cog_core::CONTENT_TYPE_JSON)

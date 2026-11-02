@@ -290,7 +290,7 @@ pub const UNREGISTERED_SITES: &[UnregisteredSite] = &[
     },
     UnregisteredSite {
         actor: "unknown",
-        why: "not a call site: it is the cell a caller that declared no actor lands in, and the verdict on it would be a verdict on the declaration, which is what `llm_call_without_declared_actor` already reads",
+        why: "not a call site: it is the cell a call that named nobody lands in. Since 2026-11-03 the gateway refuses such a call before any upstream is touched, so the cell holds refusals and history rather than spend, and the verdict on it would be a verdict on the declaration, which is what `llm_call_without_declared_actor` already reads",
     },
 ];
 

@@ -155,6 +155,10 @@ fn without_attachments(value: &serde_json::Value) -> serde_json::Value {
 
 /// 请求参数。工具规格来自**基准**（外壳不能给自己加工具），温度来自预算
 /// （四行同值，格子之间才可比）。
+///
+/// 身份也在这里打上：外壳花的每一分钱都记在 `eval` 名下。少了这一格，网关只会
+/// 读到「没有声明」，而 2026-10-04 至 10-19 的 987 次调用、2,802 万输入 token 就是
+/// 这么落进无人认领那一格的——事后再靠请求体里的提示词反推是谁花的。
 pub(crate) fn chat_options(ctx: &SolveContext) -> ChatOptions {
     ChatOptions {
         temperature: Some(ctx.budget.temperature),
@@ -165,6 +169,7 @@ pub(crate) fn chat_options(ctx: &SolveContext) -> ChatOptions {
         },
         ..Default::default()
     }
+    .with_actor("eval")
 }
 
 /// 答复里的正文。工具调用不算正文——把工具调用当答案交回去，判分器拿到的是

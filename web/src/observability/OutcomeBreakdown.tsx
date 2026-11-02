@@ -228,6 +228,14 @@ function describe(line: OutcomeLine): { label: string; hint: string; tone: strin
         tone: 'var(--warn)',
         bar: 'var(--warn)',
       };
+    case 'refused_unidentified':
+      return {
+        label: '没报身份',
+        hint:
+          '零花销：请求头 `x-cogneva-actor` 缺失、为空、写着 `unknown`，或者名字不在平台闭集里，网关在付钱之前就拒了。修法是让调用方把身份带上，不是加额度',
+        tone: 'var(--danger)',
+        bar: 'var(--danger)',
+      };
     default:
       return {
         label: line.result,

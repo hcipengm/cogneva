@@ -8,9 +8,14 @@
 //! cost and quota views group by, so a value accepted without being declared
 //! here is a new series nobody decided to carry, and on the reading side it is
 //! indistinguishable from a feature someone meant to add. The edge that admits
-//! a value is the security gateway's `normalize_actor`, and it admits only what
-//! this module declares; anything else lands on [`UNKNOWN_ACTOR`], which is the
-//! cell to watch for a caller that did not declare itself at all.
+//! a value is [`claimed`], and it admits only what this module declares.
+//!
+//! A call that names nobody is refused rather than recorded: the platform does
+//! not pay for work it cannot attribute. [`UNKNOWN_ACTOR`] stays in the column
+//! because the ledger has to keep reading what it already holds — 987 calls and
+//! 28.0M input tokens spent on 2026-10-04..10-19, all of them the evaluation
+//! harness before its scaffolds stamped themselves — not as a value a caller may
+//! choose.
 //!
 //! Two of the values are not single strings but families: an agent role and a
 //! self-review role are configuration, so they are declared as prefixes and the
@@ -59,6 +64,77 @@ pub fn declared(raw: &str) -> bool {
     })
 }
 
+/// Why a request cannot be billed to anyone.
+///
+/// Two reasons, kept apart because they send the reader to two different
+/// places: a missing header is a component that never stamped itself, while an
+/// undeclared value is one that stamped the wrong word. Collapsing them into a
+/// single "unknown" is what made the earlier bucket unreadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unidentified {
+    /// The request carried no `x-cogneva-actor`, or carried a blank one.
+    Missing,
+    /// The request named something the closed set does not hold.
+    Undeclared,
+}
+
+impl Unidentified {
+    /// The tag this refusal is counted under.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Unidentified::Missing => "actor_missing",
+            Unidentified::Undeclared => "actor_undeclared",
+        }
+    }
+
+    /// What the caller is told, built from what it actually sent.
+    ///
+    /// A refusal that only says "bad identity" leaves the caller guessing which
+    /// header to set and what values exist, so it names the header and gives
+    /// the shape of a legal value. The value the caller sent is echoed back --
+    /// bounded and stripped of control bytes -- because "you sent a typo" is
+    /// actionable only next to the typo.
+    pub fn message(self, raw: Option<&str>) -> String {
+        let what_to_send = "请在请求头 `x-cogneva-actor` 上写清是谁在调用：\
+                            `agent:<角色>` 或 `self_review:<角色>`（角色取自平台配置），\
+                            或 eval / ralph / memory 这类固定名";
+        match self {
+            Unidentified::Missing => {
+                format!("这次调用没有声明执行者身份，网关不替匿名调用付费。{what_to_send}。")
+            }
+            Unidentified::Undeclared => format!(
+                "这次调用声明的执行者 `{}` 不在平台闭集里，网关不替匿名调用付费。{what_to_send}。",
+                echo(raw.unwrap_or_default())
+            ),
+        }
+    }
+}
+
+/// `raw` bounded and stripped of control bytes, for echoing back to its author.
+fn echo(raw: &str) -> String {
+    let kept: String = raw.chars().filter(|c| !c.is_control()).take(64).collect();
+    if kept.len() < raw.len() {
+        format!("{kept}…")
+    } else {
+        kept
+    }
+}
+
+/// The identity a caller claims, or why this call cannot be billed.
+///
+/// Narrower than [`declared`], which answers "may this string sit in the
+/// column". A caller may not claim [`UNKNOWN_ACTOR`]: that value exists so the
+/// ledger can hold what history already wrote, not so a caller can opt out of
+/// being named. The platform does not pay for anonymous work.
+pub fn claimed(raw: Option<&str>) -> Result<&str, Unidentified> {
+    match raw {
+        None => Err(Unidentified::Missing),
+        Some(value) if value.trim().is_empty() => Err(Unidentified::Missing),
+        Some(value) if value != UNKNOWN_ACTOR && value.len() <= 32 && declared(value) => Ok(value),
+        Some(_) => Err(Unidentified::Undeclared),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,6 +152,74 @@ mod tests {
             );
         }
         assert!(declared(UNKNOWN_ACTOR));
+    }
+
+    #[test]
+    fn a_claim_must_name_somebody_the_platform_holds() {
+        assert_eq!(claimed(Some("self_review")), Ok("self_review"));
+        assert_eq!(claimed(Some("agent:generator")), Ok("agent:generator"));
+        assert_eq!(
+            claimed(Some("self_review:evaluator")),
+            Ok("self_review:evaluator")
+        );
+        // Nothing at all, and nothing that names nothing.
+        assert_eq!(claimed(None), Err(Unidentified::Missing));
+        assert_eq!(claimed(Some("")), Err(Unidentified::Missing));
+        assert_eq!(claimed(Some("   ")), Err(Unidentified::Missing));
+        // `unknown` is admitted as a *column value* so history stays readable,
+        // but it is not an identity: letting a caller declare it would let any
+        // component opt out of being named by typing the opt-out.
+        assert!(declared(UNKNOWN_ACTOR));
+        assert_eq!(claimed(Some(UNKNOWN_ACTOR)), Err(Unidentified::Undeclared));
+        // Well shaped but never declared, and the shapes the label rule bans.
+        for undeclared in ["planner", "Agent", "bad/actor", "agent:", "agent:Planner"] {
+            assert_eq!(
+                claimed(Some(undeclared)),
+                Err(Unidentified::Undeclared),
+                "{undeclared} was accepted as an identity"
+            );
+        }
+        // The bound the column always had: a label is at most 32 bytes.
+        let longest = format!("agent:{}", "a".repeat(32 - "agent:".len()));
+        assert_eq!(claimed(Some(&longest)), Ok(longest.as_str()));
+        let too_long = format!("agent:{}", "a".repeat(33 - "agent:".len()));
+        assert_eq!(
+            claimed(Some(&too_long)),
+            Err(Unidentified::Undeclared),
+            "a 33-byte label was accepted"
+        );
+    }
+
+    #[test]
+    fn a_refusal_names_the_header_and_echoes_what_arrived() {
+        let missing = Unidentified::Missing.message(None);
+        assert!(
+            missing.contains(cog_core::LLM_ACTOR_HEADER),
+            "a refusal that does not name the header leaves the caller guessing: {missing}"
+        );
+        let undeclared = Unidentified::Undeclared.message(Some("agent:planer"));
+        assert!(
+            undeclared.contains(cog_core::LLM_ACTOR_HEADER),
+            "a refusal that does not name the header leaves the caller guessing: {undeclared}"
+        );
+        assert!(
+            undeclared.contains("agent:planer"),
+            "a refusal that does not echo the value cannot show the typo: {undeclared}"
+        );
+        // The echo is bounded and cannot carry line breaks into a log.
+        let long = format!("agent:{}", "z".repeat(200));
+        let echoed = Unidentified::Undeclared.message(Some(&long));
+        assert!(
+            echoed.contains('…'),
+            "an over-long value is echoed without saying it was cut: {echoed}"
+        );
+        assert!(
+            !echoed.contains(&long),
+            "the refusal echoed a {}-byte value back verbatim",
+            long.len()
+        );
+        let controls = Unidentified::Undeclared.message(Some("agent:a\nb"));
+        assert!(!controls.contains('\n'));
     }
 
     #[test]

@@ -65,6 +65,10 @@ const PRODUCERS: &[(&str, &[&str])] = &[
     ),
     ("crates/cog-eval/src/adapters/hle.rs", &["eval"]),
     ("crates/cog-eval/src/judge.rs", &["eval"]),
+    // The scaffolds are the harness's own loops (plan / step / GEPA judge). They
+    // went without an actor until 2026-11-03, which is where the 28.1M tokens
+    // the ledger holds under `unknown` on 10-18/10-19 came from.
+    ("crates/cog-eval/src/scaffolds/mod.rs", &["eval"]),
     (
         "crates/cog-extension/src/hostdocs_assist.rs",
         &["sandbox-document-organizer"],

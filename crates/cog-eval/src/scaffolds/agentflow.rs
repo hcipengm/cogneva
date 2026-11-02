@@ -322,6 +322,24 @@ mod tests {
         }
     }
 
+    /// 外壳的每一次模型调用都要带身份。网关不替匿名调用付费：没有这一格，
+    /// 请求会被 400 拒掉；而在这之前，它照样发出去、照样花钱，只是账本上落在
+    /// 谁也不认的那一格——2026-10-04 至 10-19 的 2,802 万输入 token 就是这么丢的。
+    #[test]
+    fn every_scaffold_call_states_who_is_paying_for_it() {
+        let recorder = ToolRecorder::new();
+        let ctx = ctx_of(Arc::new(ScriptedLlm::new(vec![])), &recorder);
+        let options = super::chat_options(&ctx);
+        assert_eq!(
+            options
+                .headers
+                .get(cog_core::LLM_ACTOR_HEADER)
+                .map(String::as_str),
+            Some("eval"),
+            "外壳的调用没有声明执行者"
+        );
+    }
+
     #[test]
     fn a_plan_is_read_by_its_numbering_and_an_unreadable_one_is_a_single_step() {
         assert_eq!(
