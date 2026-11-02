@@ -495,7 +495,11 @@ async fn two_rounds_of_one_loop_share_the_request_byte_for_byte() {
     let request_end = rendered[0]
         .find(",\"context\":")
         .expect("the runtime writes the request first");
-    assert!(request_end > 200, "the request is {} bytes", request_end);
+    // Only a floor, not a measurement: the assertion below is the property. It
+    // sits at 100 because the request stopped paying for the goal twice, which
+    // took this one's from 203 to 155. The round's own fields still land after
+    // this point, which is what the split has to guarantee.
+    assert!(request_end > 100, "the request is {} bytes", request_end);
     assert_eq!(
         &rendered[0][..request_end],
         &rendered[1][..request_end],

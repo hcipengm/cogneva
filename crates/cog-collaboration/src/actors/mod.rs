@@ -31,13 +31,41 @@ pub(crate) fn actor_input(
     contract: serde_json::Value,
     context: serde_json::Value,
 ) -> serde_json::Value {
+    let mut request = request_half(task);
+    drop_repeated_goal(&mut request, &context);
     with_contract(
         serde_json::json!({
-            "task": request_half(task),
+            "task": request,
             "context": context,
         }),
         contract,
     )
+}
+
+/// 请求半边与上下文半边都写着同一个 goal 时，只留上下文那一份。
+///
+/// 上下文构建器把 `task.input.goal` 原样抄进 `context.goal`，于是每个请求里
+/// 它出现两次——2026-11-02 实测一件自进化任务的 planner 请求体 60,341 字节，
+/// 其中 6,322 字节是这同一段文字的第二次。三条角色的答案契约都写着「读
+/// `context.goal`」，没有一条读 `task.input.goal`，所以删的是请求那半的这一份：
+/// 契约里每一句都仍然指着存在的字段，模型看到的文本一字不少。
+///
+/// 只在两份逐字节相同时删。自定义上下文构建器写了别的 goal 时不删——那时两份
+/// 不是重复，是两个不同的值。
+fn drop_repeated_goal(request: &mut serde_json::Value, context: &serde_json::Value) {
+    let Some(repeated) = context
+        .get("goal")
+        .zip(request.get("input").and_then(|i| i.get("goal")))
+        .map(|(in_context, in_request)| in_context == in_request)
+    else {
+        return;
+    };
+    if !repeated {
+        return;
+    }
+    if let Some(input) = request.get_mut("input").and_then(|i| i.as_object_mut()) {
+        input.remove("goal");
+    }
 }
 
 /// The part of a task that is the request, as opposed to the record of it.
@@ -303,7 +331,7 @@ pub(crate) fn validate_against_schema(
 
 #[cfg(test)]
 mod tests {
-    use super::{maybe_self_review, review_spec, validate_against_schema};
+    use super::{actor_input, maybe_self_review, review_spec, validate_against_schema};
     use crate::observable::{
         global_observable, SELF_REVIEW_CRITERIA_ABSENT, SELF_REVIEW_CRITERIA_DECLARED,
         SELF_REVIEW_SKIP_DISABLED, SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
@@ -318,6 +346,72 @@ mod tests {
             cog_core::TaskType::Planner,
             serde_json::json!({ "goal": goal }),
         )
+    }
+
+    /// 上下文抄了一遍 goal 时，请求那半不再抄第二遍。
+    ///
+    /// 每一条角色契约都读 `context.goal`，所以删的是 `task.input.goal`：
+    /// 契约里指着的那个字段仍在，模型读到的文字一字不少，少付的是重复的那一份。
+    #[test]
+    fn the_goal_is_in_the_request_once() {
+        let goal = "fix the boot phase footprint alert";
+        let task = task_with_goal(goal);
+        let input = actor_input(
+            &task,
+            serde_json::json!({ "instructions": "read context.goal" }),
+            serde_json::json!({ "goal": goal, "task_id": "t-1" }),
+        );
+
+        let rendered = input.to_string();
+        let occurrences = rendered.matches(goal).count();
+        assert_eq!(
+            occurrences, 1,
+            "the goal is in the request {occurrences} times: {rendered}"
+        );
+        assert_eq!(input["context"]["goal"], serde_json::json!(goal));
+        assert!(
+            input["task"]["input"].get("goal").is_none(),
+            "the request half still carries a second copy: {}",
+            input["task"]["input"]
+        );
+        assert_eq!(
+            input["task"]["input"]["task_type"],
+            serde_json::json!(null),
+            "removing the goal must not take anything else with it: {}",
+            input["task"]["input"]
+        );
+    }
+
+    /// 两份 goal 不同时不是重复，是两个值，都得留着。
+    #[test]
+    fn a_context_goal_that_says_something_else_survives() {
+        let task = task_with_goal("the request's goal");
+        let input = actor_input(
+            &task,
+            serde_json::json!({}),
+            serde_json::json!({ "goal": "the context's goal" }),
+        );
+
+        assert_eq!(
+            input["task"]["input"]["goal"],
+            serde_json::json!("the request's goal")
+        );
+        assert_eq!(
+            input["context"]["goal"],
+            serde_json::json!("the context's goal")
+        );
+    }
+
+    /// 上下文里没有 goal 时，请求那半是唯一的一份，动不得。
+    #[test]
+    fn a_goal_with_nothing_to_compare_against_is_kept() {
+        let task = task_with_goal("the only copy");
+        let input = actor_input(&task, serde_json::json!({}), serde_json::json!({}));
+
+        assert_eq!(
+            input["task"]["input"]["goal"],
+            serde_json::json!("the only copy")
+        );
     }
 
     /// A stage name this one test owns, for reading a counter the production
