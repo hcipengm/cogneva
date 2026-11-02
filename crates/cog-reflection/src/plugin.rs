@@ -1498,13 +1498,22 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                 )
                 .await;
             }
-            let evaluator = crate::promotion_eval::PromotionEval::new(
+            let evaluator = Arc::new(crate::promotion_eval::PromotionEval::new(
                 orch,
                 crate::promotion_eval::DEFAULT_EVAL_TIMEOUT_SECS,
                 crate::promotion_eval::DEFAULT_EVAL_POLL_INTERVAL_SECS,
                 eval_metrics,
-            );
-            let _ = self.promotion_eval_slot.set(Arc::new(evaluator));
+            ));
+            // 上一个进程交上去的 A/B 行：等它的那次等待已经随进程一起没了。这道门
+            // 是那个 id 前缀唯一的写者，认得出它们、也只有它收得回来——把它们留在
+            // 图上，就是一条永远不会开工、也永远不会清掉的待办。
+            let sweeper = evaluator.clone();
+            tokio::spawn(async move {
+                if let Err(e) = sweeper.withdraw_abandoned().await {
+                    warn!(error = %e, "promotion eval: could not sweep abandoned A/B rows");
+                }
+            });
+            let _ = self.promotion_eval_slot.set(evaluator);
         }
         if !sw_config.enabled {
             info!("signal watcher disabled by config");

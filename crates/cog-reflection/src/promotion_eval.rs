@@ -432,6 +432,44 @@ impl PromotionEval {
         outcome
     }
 
+    /// 把这道门交上去、如今已经没人等的行收回来，答收起几条。
+    ///
+    /// 等待超时的那条路自己会收回行；收不回的只有一种：等它的进程在等待结束前就
+    /// 没了，于是那行留在 `Pending` 上，没有第二处会再来读它。这道门是那个 id 前缀
+    /// 唯一的写者，所以清点这个命名空间是它自己的事，不该留给人在库里找。
+    ///
+    /// 在启动时走一趟就够了：能留下这种行的只有进程消失，而进程消失之后的第一件事
+    /// 就是下一次启动。
+    pub(crate) async fn withdraw_abandoned(&self) -> SFResult<usize> {
+        let now = chrono::Utc::now();
+        let mut withdrawn = 0usize;
+        for task in self.orchestrator.get_all_tasks().await {
+            if !is_abandoned_promotion_eval(&task, now, self.timeout_secs) {
+                continue;
+            }
+            match self.orchestrator.cancel_task(&task.id).await {
+                Ok(_) => {
+                    withdrawn += 1;
+                    debug!(
+                        task_id = %task.id,
+                        since = %task.updated_at,
+                        "promotion eval: withdrew an A/B row whose wait is over; nothing was \
+                         reading it"
+                    );
+                }
+                Err(e) => warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "promotion eval: an abandoned A/B row could not be withdrawn"
+                ),
+            }
+        }
+        if withdrawn > 0 {
+            debug!(withdrawn, "promotion eval: abandoned A/B rows withdrawn");
+        }
+        Ok(withdrawn)
+    }
+
     async fn report(&self, outcome: &PromotionEvalOutcome) {
         report_eval_gate_outcome(&self.metrics, outcome.cell(), EvalGateSite::Promotion).await;
     }
@@ -439,6 +477,12 @@ impl PromotionEval {
 
 /// 提交任务给主流程并轮询至终态。`Completed` 返回任务本身（带 result），
 /// `Failed`/`Cancelled`/超时返回原因文本。移植侧与晋升侧共用这一份提交等待。
+/// 这道门给自己那行起的 id 前缀。
+///
+/// 这个命名空间只有这道门往里写，所以也只有它能把里面的行收回来：一行还挂在
+/// 图上、而等它的那次等待已经不在了，图上没有任何别的读者分得出来。
+pub const PROMOTION_EVAL_ID_PREFIX: &str = "promotion-eval-";
+
 /// The row whose run is this change's A/B, as filed.
 ///
 /// Public so a contract test can put it in front of the dispatcher's own
@@ -449,7 +493,7 @@ impl PromotionEval {
 /// when the gate was never asked at all. Two very different facts, one cell.
 pub fn promotion_eval_task(change_id: &str, rev: &str, repo: &Path, timeout_secs: u64) -> Task {
     let mut task = Task::new(
-        format!("promotion-eval-{}", sanitize_ref(change_id)),
+        format!("{PROMOTION_EVAL_ID_PREFIX}{}", sanitize_ref(change_id)),
         TaskType::Custom("promotion_eval".into()),
         serde_json::json!({
             (cog_core::INPUT_EVOLUTION_MODE): "promotion",
@@ -463,6 +507,28 @@ pub fn promotion_eval_task(change_id: &str, rev: &str, repo: &Path, timeout_secs
     task.acceptance
         .push(promotion_eval_acceptance(change_id, rev));
     task
+}
+
+/// 这一行是不是这道门交上去、而等它的那次等待已经不在了的行。
+///
+/// 判据只用这道门自己的时钟：等待上限就是「还在等」的界，过了它还没有终态的行，
+/// 要么等的人已经把它收回去（那它就不是这个状态），要么等的人已经不在了——进程
+/// 重启、任务被取消，都算。留一个等待上限的宽限，是为了不在收尾那一刻和正在收尾
+/// 的那次等待抢同一行。
+pub fn is_abandoned_promotion_eval(
+    task: &Task,
+    now: chrono::DateTime<chrono::Utc>,
+    timeout_secs: u64,
+) -> bool {
+    if !task.id.starts_with(PROMOTION_EVAL_ID_PREFIX) {
+        return false;
+    }
+    if !matches!(task.status, TaskStatus::Pending | TaskStatus::Scheduled) {
+        return false;
+    }
+    let grace = chrono::Duration::from_std(Duration::from_secs(timeout_secs.saturating_mul(2)))
+        .unwrap_or_else(|_| chrono::Duration::seconds(i64::MAX / 1000));
+    task.updated_at + grace < now
 }
 
 /// What closes one promotion-eval row.
@@ -507,6 +573,18 @@ pub(crate) async fn submit_and_wait(
             }
         }
         if Instant::now() >= deadline {
+            // 这次等待结束了，而那一行是它交上去的。就这么走开的话，行会一直挂在
+            // 图上：没有第二处会再来读它（派发器只在行有判据时才开工，清扫器只收
+            // `Scheduled`/`Running`），而按状态读这一行的人分不出「门还在想」与
+            // 「门走了、行留下了」。所以等的人把它收回去。
+            if let Err(e) = orch.cancel_task(&id).await {
+                warn!(
+                    task_id = %id,
+                    error = %e,
+                    "promotion eval: the wait is over but the row it filed could not be \
+                     withdrawn; it stays on the graph with nothing left to read it"
+                );
+            }
             return Ok(Err(crate::cmd_timeout::timed_out_after(timeout_secs)));
         }
         tokio::time::sleep(Duration::from_secs(poll_interval_secs)).await;
@@ -535,4 +613,226 @@ fn sanitize_ref(s: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 图里只放这道门自己交上去的行；答得出「那行现在什么样」，并记下每一次收回。
+    #[derive(Default)]
+    struct GateGraph {
+        tasks: Mutex<HashMap<String, Task>>,
+        cancelled: Mutex<Vec<String>>,
+    }
+
+    fn pending_row(id: &str, since: chrono::DateTime<chrono::Utc>) -> Task {
+        let mut task = Task::new(
+            id.to_string(),
+            TaskType::Custom("promotion_eval".into()),
+            serde_json::json!({}),
+        );
+        task.status = TaskStatus::Pending;
+        task.created_at = since;
+        task.updated_at = since;
+        task
+    }
+
+    #[async_trait::async_trait]
+    impl OrchestratorControl for GateGraph {
+        async fn submit_goal(&self, _goal: &str, _tasks: Vec<Task>) -> SFResult<()> {
+            Ok(())
+        }
+        async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+            let mut ids = Vec::new();
+            for task in tasks {
+                ids.push(task.id.clone());
+                self.tasks.lock().unwrap().insert(task.id.clone(), task);
+            }
+            Ok(ids)
+        }
+        async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn add_task(&self, _task: Task) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
+            false
+        }
+        async fn crew_retry_all(&self, _task_ids: &[String]) -> usize {
+            0
+        }
+        async fn get_ready_tasks(&self) -> Vec<Task> {
+            vec![]
+        }
+        async fn get_all_tasks(&self) -> Vec<Task> {
+            self.tasks.lock().unwrap().values().cloned().collect()
+        }
+        async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
+            unimplemented!()
+        }
+        async fn retry_task(&self, _task_id: &str) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn dlq_len(&self) -> SFResult<usize> {
+            unimplemented!()
+        }
+        async fn start_task(&self, _task_id: &str) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn complete_task(
+            &self,
+            _task_id: &str,
+            _result: serde_json::Value,
+        ) -> SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn fail_task(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!()
+        }
+        async fn fail_task_after(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::UpstreamFailure>,
+            _retry_after_secs: Option<u64>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            unimplemented!()
+        }
+        async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
+            self.cancelled.lock().unwrap().push(task_id.to_string());
+            if let Some(task) = self.tasks.lock().unwrap().get_mut(task_id) {
+                task.status = TaskStatus::Cancelled;
+            }
+            Ok(vec![])
+        }
+        async fn get_task(&self, task_id: &str) -> Option<Task> {
+            self.tasks.lock().unwrap().get(task_id).cloned()
+        }
+        async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            vec![]
+        }
+        async fn get_dependents(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_dependencies(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
+            (self.get_all_tasks().await, vec![])
+        }
+        async fn delete_task(&self, _task_id: &str) -> SFResult<()> {
+            unimplemented!()
+        }
+        async fn all_completed(&self) -> bool {
+            false
+        }
+        async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
+            unimplemented!()
+        }
+    }
+
+    /// 等的人走了，行不能留在图上：按状态读它的人分不出「门还在想」与「门走了」。
+    #[tokio::test]
+    async fn a_wait_that_ran_out_takes_its_row_back() {
+        let graph = Arc::new(GateGraph::default());
+        let row = promotion_eval_task(
+            "change-ledger-abc",
+            "deadbeef",
+            Path::new("/workspace/cogneva"),
+            900,
+        );
+
+        let orch: Arc<dyn OrchestratorControl> = graph.clone();
+        let outcome = submit_and_wait(&orch, 0, row.clone(), "goal".into(), 0).await;
+
+        assert!(
+            matches!(outcome, Ok(Err(_))),
+            "超时要以理由回来，不是以一条任务回来"
+        );
+        assert_eq!(
+            *graph.cancelled.lock().unwrap(),
+            vec![row.id.clone()],
+            "等待结束了，而它交上去的那一行还挂在图上"
+        );
+    }
+
+    /// 生产上那条真的行：2026-11-01 交上去，等它的进程在等待结束前就没了，
+    /// 于是它一直停在 `Pending`。
+    #[test]
+    fn a_row_left_by_a_wait_that_is_gone_reads_as_abandoned() {
+        let now = chrono::Utc::now();
+        let row = pending_row(
+            "promotion-eval-change-ledger-ec0fc6a8c301bbf3-6862a991a1ff",
+            now - chrono::Duration::hours(20),
+        );
+        assert!(
+            is_abandoned_promotion_eval(&row, now, DEFAULT_EVAL_TIMEOUT_SECS),
+            "等待上限 3600 秒，而这行已经在图上停了 20 小时"
+        );
+    }
+
+    /// 三条反例：还在等的、已经终态的、别人的行，都不许被收走。
+    #[test]
+    fn only_rows_this_gate_filed_and_no_longer_waits_on_are_abandoned() {
+        let now = chrono::Utc::now();
+        let fresh = pending_row("promotion-eval-change-ledger-new", now);
+        assert!(
+            !is_abandoned_promotion_eval(&fresh, now, DEFAULT_EVAL_TIMEOUT_SECS),
+            "刚落地的行还在等待上限之内"
+        );
+
+        let mut done = pending_row(
+            "promotion-eval-change-ledger-old",
+            now - chrono::Duration::hours(20),
+        );
+        done.status = TaskStatus::Completed;
+        assert!(
+            !is_abandoned_promotion_eval(&done, now, DEFAULT_EVAL_TIMEOUT_SECS),
+            "终态的行不是没人等，是已经等到了"
+        );
+
+        let foreign = pending_row("some-other-work", now - chrono::Duration::hours(20));
+        assert!(
+            !is_abandoned_promotion_eval(&foreign, now, DEFAULT_EVAL_TIMEOUT_SECS),
+            "不是这道门交上去的行，轮不到这道门来收"
+        );
+    }
+
+    /// 启动时那一趟只收没人等的，别的一行都不碰。
+    #[tokio::test]
+    async fn the_startup_sweep_withdraws_only_the_rows_no_one_is_waiting_on() {
+        let graph = Arc::new(GateGraph::default());
+        let now = chrono::Utc::now();
+        let stale = pending_row(
+            "promotion-eval-change-ledger-ec0fc6a8c301bbf3-6862a991a1ff",
+            now - chrono::Duration::hours(20),
+        );
+        let fresh = pending_row("promotion-eval-change-ledger-new", now);
+        let foreign = pending_row("some-other-work", now - chrono::Duration::hours(20));
+        for row in [&stale, &fresh, &foreign] {
+            graph
+                .tasks
+                .lock()
+                .unwrap()
+                .insert(row.id.clone(), row.clone());
+        }
+
+        let orch: Arc<dyn OrchestratorControl> = graph.clone();
+        let eval = PromotionEval::new(orch, DEFAULT_EVAL_TIMEOUT_SECS, 1, None);
+        let withdrawn = eval.withdraw_abandoned().await.unwrap();
+
+        assert_eq!(withdrawn, 1, "收走的条数不对");
+        assert_eq!(*graph.cancelled.lock().unwrap(), vec![stale.id.clone()]);
+    }
 }
