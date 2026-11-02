@@ -810,6 +810,13 @@ fn signal_project_root(project: &str) -> Task {
     root
 }
 
+/// The task type every row this watcher files carries.
+///
+/// It is what the back-fill reads to decide a row is its own: the type survives
+/// whatever id the filing was given, while the goal id is exactly what the
+/// oldest rows got wrong.
+const SIGNAL_TASK_TYPE: &str = "self_signal";
+
 /// The signal kind the periodic self-audit is filed under.
 ///
 /// It shares the filing path with the alert and failure signals but names no
@@ -968,6 +975,17 @@ async fn settle_signal_parents(
 /// about a condition the row was not filed for. Rows that kept no detail are
 /// left alone -- there is nothing to say about them, and a guess would be a
 /// criterion that admits no answer.
+///
+/// Which rows are ours is read from the type the filing writes, not from the
+/// goal id it was given. That id is the very thing that went wrong on the rows
+/// this pass exists for: before the signal projects existed each filing minted
+/// its own, so the oldest rows sit under a bare uuid. Scoping the repair by
+/// `signal:` therefore selected everyone the defect had already skipped and
+/// nobody it had hit -- measured on 2026-11-02, all 1066 rows still holding an
+/// empty criterion had a uuid there, and the alert on that population had been
+/// firing for two hours while this pass ran every five minutes and wrote
+/// nothing. An identity that a defect can erase cannot decide who needs the
+/// repair.
 async fn fill_signal_criteria(
     orch: &Arc<dyn OrchestratorControl>,
     tasks: &[Task],
@@ -976,17 +994,10 @@ async fn fill_signal_criteria(
     let candidates: Vec<&Task> = tasks
         .iter()
         .filter(|task| task.acceptance.is_empty())
+        .filter(
+            |task| matches!(&task.task_type, TaskType::Custom(kind) if kind == SIGNAL_TASK_TYPE),
+        )
         .filter(|task| task.input.get("signal").is_some())
-        .filter(|task| {
-            task.goal_id
-                .as_deref()
-                .is_some_and(|project| project.starts_with(SIGNAL_PROJECT_PREFIX))
-                // The periodic audit is filed by this same path but names no
-                // condition, so it gets no project: it is still one of this
-                // process's filings and still owes a criterion.
-                || task.input["signal"].get("kind").and_then(|k| k.as_str())
-                    == Some(SELF_AUDIT_SIGNAL_KIND)
-        })
         .collect();
     settled.remaining = candidates.len().saturating_sub(SIGNAL_SETTLE_BATCH);
     for row in candidates.into_iter().take(SIGNAL_SETTLE_BATCH) {
@@ -1401,7 +1412,7 @@ async fn tick(
         let outcome = submit_intent(
             orch,
             format!("self-signal-failure-{hash}"),
-            "self_signal",
+            SIGNAL_TASK_TYPE,
             goal,
             serde_json::json!({
                 "kind": "failure_recurrence",
@@ -1436,7 +1447,7 @@ async fn tick(
             let outcome = submit_intent(
                 orch,
                 "self-signal-backlog".to_string(),
-                "self_signal",
+                SIGNAL_TASK_TYPE,
                 goal,
                 serde_json::json!({
                     "kind": "queue_backlog",
@@ -1597,9 +1608,15 @@ async fn tick(
                             continue;
                         }
                         let (goal, detail) = taste_intent(intent);
-                        let outcome =
-                            submit_intent(orch, task_id.clone(), "self_signal", goal, detail, true)
-                                .await;
+                        let outcome = submit_intent(
+                            orch,
+                            task_id.clone(),
+                            SIGNAL_TASK_TYPE,
+                            goal,
+                            detail,
+                            true,
+                        )
+                        .await;
                         // Only a submission that reached the task layer gets a
                         // fate written down: one that never got there stays
                         // pending and is retried, which is also what makes the
@@ -1700,7 +1717,7 @@ async fn take_alerts_in(
         let outcome = submit_intent(
             orch,
             alert_task_id(&alert.dedup_key),
-            "self_signal",
+            SIGNAL_TASK_TYPE,
             goal,
             detail,
             may_redrive,
@@ -2554,12 +2571,17 @@ mod tests {
                 Some(project),
                 serde_json::json!({"goal": "g"}),
             ),
-            // 不是信号项目的行：不在射程内。
-            row(
-                "change-ledger-x",
-                Some("3f0c1d2e-0000-4000-8000-000000000000"),
-                serde_json::json!({"goal": "g", "signal": detail}),
-            ),
+            // 别的生产者派的行：就算负载里也带一份 `signal`，也不是这一路派的，
+            // 不在射程内。射程按派行的类型认——那是提交时写下的东西，不随 id 变。
+            {
+                let mut task = Task::new(
+                    "change-ledger-x".to_string(),
+                    TaskType::Custom("change_ledger".into()),
+                    serde_json::json!({"goal": "g", "signal": detail}),
+                );
+                task.goal_id = Some("3f0c1d2e-0000-4000-8000-000000000000".into());
+                task
+            },
         ]));
 
         let tasks = orch.get_all_tasks().await;
@@ -2584,7 +2606,7 @@ mod tests {
             let task = after.iter().find(|t| t.id == untouched).unwrap();
             assert!(
                 task.acceptance.is_empty(),
-                "{} 不该被补：它没有留下读数，或者根本不在信号项目里",
+                "{} 不该被补：它没有留下读数，或者不是这一路派出的行",
                 untouched
             );
         }
@@ -2594,6 +2616,41 @@ mod tests {
                 .find(|t| t.id == signal_project_root_id(project))
                 .is_some_and(|t| t.acceptance.is_empty()),
             "锚点不是活，不该有验收标准"
+        );
+    }
+
+    /// 早先那种「一次提交铸一个 uuid」的行，也在这趟回填的射程里。
+    ///
+    /// 这正是 2026-11-02 现网的形状：1066 条 `self_signal` 行里没有一条的
+    /// `goal_id` 以 `signal:` 开头——分组项目是后来才有的，之前每一次提交都自己
+    /// 铸一个 uuid。按项目前缀圈定「哪些行是这一路的」，圈中的恰好是缺陷没碰到的
+    /// 那些、漏掉它碰到的全部，于是回填每五分钟跑一趟、跑了一整天，那一千多行的
+    /// 判据一栏一直是空的，警报读作「没人来」。射程按类型认，正是为此。
+    #[tokio::test]
+    async fn a_row_filed_under_a_uuid_goal_is_still_this_watchers_to_fill() {
+        let detail = serde_json::json!({"kind": "persisted_alert", "rule": "PoolDown"});
+        let legacy_goal = "60af7df5-3f9c-4aed-9e8f-0b0e8d6a6fb7";
+        let mut legacy = Task::new(
+            "self-signal-legacy".to_string(),
+            TaskType::Custom(SIGNAL_TASK_TYPE.into()),
+            serde_json::json!({"goal": "g", "signal": detail}),
+        );
+        legacy.goal_id = Some(legacy_goal.to_string());
+        let orch: Arc<dyn OrchestratorControl> =
+            Arc::new(FilingOrchestrator::holding(vec![legacy]));
+
+        let tasks = orch.get_all_tasks().await;
+        let settled = settle_filings(&orch, &tasks).await;
+        assert_eq!(
+            settled.criteria, 1,
+            "uuid 名下的一行也是这一路派的：{settled:?}"
+        );
+
+        let after = orch.get_all_tasks().await;
+        let filled = after.iter().find(|t| t.id == "self-signal-legacy").unwrap();
+        assert_eq!(
+            filled.acceptance,
+            vec![signal_acceptance(&detail, Some(legacy_goal))]
         );
     }
 
