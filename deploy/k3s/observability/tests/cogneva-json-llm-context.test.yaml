@@ -55,6 +55,34 @@ tests:
               severity: warning
               actor: a1
 
+  # 一个人的 token 分成两格到账（两个上游，或一条上游的两个协议面）。整周只有第一格在动，
+  # 每次调用 300；最后一小时第二格开始花钱、每步 200，两格合起来每步 500。这个人这一周
+  # 的常态是 300/次，最后这一小时是 500/次，比值越界，所以该亮。
+  #
+  # 若读者按「每格取最大」把这条序列折回一个人（`max by (actor, ...)`，改名前的写法），
+  # 最后这一小时看到的是 max(300, 200) = 300，与常态一模一样，这一格就静了——它量的是
+  # 最贵的那一格，不是这个人花掉的 token。两格一起抬同样是抓不到的：常态与尖峰按同一
+  # 比例缩放，比值不变。要抓住「漏掉了另一格」，尖峰必须是**新出现的那一格**带来的。
+  - interval: 15m
+    input_series:
+      - series: 'llm_calls_total{result="ok",actor="a1"}'
+        values: '0+1x672'
+      - series: 'llm_tokens_total{kind="input",actor="a1",upstream="u1",api_style="openai"}'
+        values: '0+300x672'
+      - series: 'llm_tokens_total{kind="input",actor="a1",upstream="u2",api_style="openai"}'
+        values: '0+0x668 200 400 600 800'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a1",upstream="u1",api_style="openai"}'
+        values: '0+900x672'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a1",upstream="u2",api_style="openai"}'
+        values: '0+900x672'
+    alert_rule_test:
+      - eval_time: 168h
+        alertname: llm_context_per_call_above_its_own_week
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              actor: a1
+
   # 同一个尖峰，旁边还有一个整整一周都这么贵的 actor：界是**各人自己的**，所以只有 a1 亮。
   # 若把界写成全局分位（比如按所有 actor 合起来算），a2 的常态会把界抬上去，a1 这一格就静了
   # ——这一格就是那条「界按 actor 分开算」的判据。

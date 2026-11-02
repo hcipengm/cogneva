@@ -975,8 +975,15 @@ impl LlmUsageStore {
         Ok((total, by_actor))
     }
 
-    /// Tokens spent over the whole folded record, split by `(upstream, actor)`
-    /// and kind.
+    /// Tokens spent over the whole folded record, split by `(upstream,
+    /// api_style, actor)` and kind.
+    ///
+    /// The wire protocol is part of the key because one endpoint can answer on
+    /// more than one face and the faces do not cache alike: an
+    /// OpenAI-compatible face is served by the vendor's automatic prefix cache,
+    /// an Anthropic face only caches what the request marks. Summing them under
+    /// one upstream produces a hit share that names neither face, and that is
+    /// the number a reader asks about when spending looks wrong.
     ///
     /// Readers of the metric face get their numbers from here rather than from
     /// a tally kept on the request path. The request path already wrote the row
@@ -997,13 +1004,14 @@ impl LlmUsageStore {
     ) -> anyhow::Result<Vec<cog_core::UpstreamActorSpend>> {
         let rows = sqlx::query(&format!(
             "SELECT upstream,
+                    api_style,
                     actor,
                     COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_input,
                     COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_output,
                     COALESCE(SUM(tokens_cached), 0)::BIGINT AS tokens_cached
                FROM {ROLLUP_TABLE}
-              GROUP BY upstream, actor
-              ORDER BY upstream, actor"
+              GROUP BY upstream, api_style, actor
+              ORDER BY upstream, api_style, actor"
         ))
         .fetch_all(&self.pool)
         .await?;
@@ -1011,6 +1019,7 @@ impl LlmUsageStore {
             .iter()
             .map(|row| cog_core::UpstreamActorSpend {
                 upstream: row.get::<String, _>("upstream"),
+                api_style: row.get::<String, _>("api_style"),
                 actor: row.get::<String, _>("actor"),
                 input: row.get::<i64, _>("tokens_input").max(0) as u64,
                 output: row.get::<i64, _>("tokens_output").max(0) as u64,

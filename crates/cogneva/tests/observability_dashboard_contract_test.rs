@@ -77,7 +77,7 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
     // number at the producer.
     (
         "llm_tokens_total",
-        &["upstream", "kind", "actor"],
+        &["upstream", "kind", "actor", "api_style"],
         "crates/cog-gateway/src/security_gateway.rs",
     ),
     // Agent run counters carry no labels: they are totals for the process, not
@@ -1049,7 +1049,10 @@ const FOREIGN: &[(&str, &str)] = &[
     // for it (or for a store we do not run) would be a second process reading
     // one endpoint that already exists.
     ("collections_vector_total", "qdrant 自身的 /metrics"),
-    ("grpc_responses_avg_duration_seconds", "qdrant 自身的 /metrics"),
+    (
+        "grpc_responses_avg_duration_seconds",
+        "qdrant 自身的 /metrics",
+    ),
     ("grpc_responses_fail_total", "qdrant 自身的 /metrics"),
     ("memory_resident_bytes", "qdrant 自身的 /metrics"),
     // Reachability is asked by the prober, not by any process of ours: a

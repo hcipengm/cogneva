@@ -480,6 +480,19 @@ pub struct UpstreamActorSpend {
     /// `base_url|model`, the key the pool, the ledger and the metric face all
     /// use for one upstream.
     pub upstream: String,
+    /// The wire protocol this spend went over.
+    ///
+    /// Part of the key rather than a note beside it, because one endpoint can
+    /// answer on more than one face and the faces do not behave alike. Caching
+    /// is the case that costs money: an OpenAI-compatible face is served by the
+    /// vendor's automatic prefix cache, while an Anthropic face caches only
+    /// what the request marks with `cache_control`. Measured 2026-11-02 over 30
+    /// days of one endpoint (`api.kimi.com/coding/v1`): the OpenAI face served
+    /// 41.4M of 65.9M prompt tokens from cache (62.8%) and the Anthropic face
+    /// 2.8M of 42.0M (6.6%), on the same actors. Merged into one key those two
+    /// become a single mediocre number that names neither face, and the reader
+    /// who asks why the hit share fell has nowhere to look.
+    pub api_style: String,
     pub actor: String,
     pub input: u64,
     pub output: u64,

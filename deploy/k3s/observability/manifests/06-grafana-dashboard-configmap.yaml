@@ -1216,6 +1216,7 @@ data:
         {
           "id": 31,
           "title": "LLM Tokens by Actor (input / output / cached)",
+          "description": "What each actor spent over the last 30 minutes, by kind, added up across the upstreams and faces that served it. The store renders one row per (upstream, actor, kind, api_style) and every pod renders the same rows, so the per-row envelope is deduplicated with max before the rows are summed: a plain sum over the scrapes would be the fact multiplied by the number of pods, while a max over the whole series would report only the largest cell -- one upstream's share of an actor, or one wire face's share of an upstream that answers on two of them, which is exactly the quantity a hit-share question needs kept apart.",
           "type": "timeseries",
           "gridPos": {
             "h": 8,
@@ -1225,7 +1226,7 @@ data:
           },
           "targets": [
             {
-              "expr": "max by (actor, kind) ((max_over_time((llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600))[30m:1m]) - min_over_time((llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600))[30m:1m])))",
+              "expr": "sum by (actor, kind) ((max_over_time((max by (upstream, kind, actor, api_style) (llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600)))[30m:1m]) - min_over_time((max by (upstream, kind, actor, api_style) (llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600)))[30m:1m])))",
               "legendFormat": "{{actor}} {{kind}}",
               "datasource": {
                 "type": "prometheus",
@@ -3351,7 +3352,7 @@ data:
           },
           "targets": [
             {
-              "expr": "(sum((max_over_time((max by (upstream, kind, actor) (llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600)))[24h:5m]) - min_over_time((max by (upstream, kind, actor) (llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600)))[24h:5m]))) > 0) / (sum((max_over_time((max by (intent) (cogneva_change_fate_total{fate=\"landed\"}))[24h:5m]) - min_over_time((max by (intent) (cogneva_change_fate_total{fate=\"landed\"}))[24h:5m]))) > 0)",
+              "expr": "(sum((max_over_time((max by (upstream, kind, actor, api_style) (llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600)))[24h:5m]) - min_over_time((max by (upstream, kind, actor, api_style) (llm_tokens_total and ((time() - llm_tokens_total_observed_timestamp_seconds) < 3600)))[24h:5m]))) > 0) / (sum((max_over_time((max by (intent) (cogneva_change_fate_total{fate=\"landed\"}))[24h:5m]) - min_over_time((max by (intent) (cogneva_change_fate_total{fate=\"landed\"}))[24h:5m]))) > 0)",
               "legendFormat": "tokens / landed change",
               "datasource": {
                 "type": "prometheus",

@@ -4843,6 +4843,12 @@ async fn publish_token_totals_from_ledger(state: &AppState) {
                     ("upstream", row.upstream.as_str()),
                     ("kind", kind),
                     ("actor", row.actor.as_str()),
+                    // 协议面是键的一部分：同一条地址可以在两个面上应答，而两个面
+                    // 的缓存行为不是一回事（OpenAI 兼容面吃的是上游的自动前缀缓存，
+                    // Anthropic 面只缓存请求用 `cache_control` 标出来的那一段）。
+                    // 不加这一格，一个命中 63% 的面和一个命中 7% 的面在这里合成
+                    // 一个中庸的数，问「命中率为什么掉了」的人无处可看。
+                    ("api_style", row.api_style.as_str()),
                 ],
             )
             .await;

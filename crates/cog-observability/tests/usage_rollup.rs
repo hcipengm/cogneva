@@ -985,3 +985,114 @@ async fn the_fold_carries_the_written_half_and_keeps_no_reading_apart_from_zero(
         .await
         .expect("clean up the folded probe rows");
 }
+
+/// 同一条上游的两个协议面，在按上游取花费时必须是两行。
+///
+/// 面不是备注，是键的一部分：OpenAI 兼容面吃的是上游自己的自动前缀缓存，
+/// Anthropic 面只缓存请求用 `cache_control` 标出来的那一段，同一个模型、同一批
+/// 提示词，两个面的命中率能差一个数量级。合并成一个键之后，命中率读数上剩下的
+/// 是一个中庸的数，两句话都说得通——「这家上游缓存差」和「这一阵走在不爱缓存的那个
+/// 面上」——而读者无从分辨该修哪一边。2026-11-02 实测就是这种形状：
+/// `api.kimi.com/coding/v1` 30 天里 OpenAI 面 65.9M 输入命中 41.4M（62.8%），
+/// Anthropic 面 42.0M 命中 2.8M（6.6%），同一批 actor。
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn one_upstream_answering_on_two_faces_spends_as_two_rows() {
+    let url = database_url();
+    let pool = PgPool::connect(&url)
+        .await
+        .expect("connect to the test database");
+    let store = LlmUsageStore::connect(&url)
+        .await
+        .expect("connect the store");
+    init_schema_once(&store, &pool).await;
+
+    let run = uuid::Uuid::new_v4();
+    let upstream = format!("rollup-faces-upstream:{run}");
+    let actor = format!("rollup-faces-actor:{run}");
+
+    let hour = hour_owned_by_one_test(500);
+    let w = RollupWindow {
+        start: hour - Duration::hours(2),
+        end: hour - Duration::hours(1),
+    };
+
+    let record = |api_style: &str, input: u64, cached: u64| LlmUsageRecord {
+        upstream: upstream.clone(),
+        api_style: api_style.to_string(),
+        model: "rollup-faces-model".to_string(),
+        result: "ok".to_string(),
+        actor: actor.clone(),
+        origin: "gateway_pool".to_string(),
+        tokens_input: input,
+        tokens_output: 10,
+        tokens_cached: cached,
+        tokens_cache_created: None,
+        estimated_input: None,
+        refusal_kind: None,
+        retry_after_secs: None,
+        task: None,
+        owner: None,
+        latency_ms: 5,
+        pace: None,
+        usage_outcome: None,
+    };
+
+    for row in [
+        record("openai", 1_000, 600),
+        record("openai", 1_000, 600),
+        record("anthropic", 900, 100),
+        record("anthropic", 900, 100),
+    ] {
+        store.record(&row).await.expect("land a call on one face");
+    }
+    sqlx::query("UPDATE gateway_llm_usage SET ts = $1 WHERE upstream = $2")
+        .bind(w.start + Duration::minutes(30))
+        .bind(&upstream)
+        .execute(&pool)
+        .await
+        .expect("move the calls into the closed window");
+
+    store
+        .rollup_windows(std::slice::from_ref(&w))
+        .await
+        .expect("fold the window");
+
+    let mut spent: Vec<_> = store
+        .spend_by_upstream_and_actor()
+        .await
+        .expect("read the spend by upstream")
+        .into_iter()
+        .filter(|s| s.upstream == upstream)
+        .collect();
+    spent.sort_by(|a, b| a.api_style.cmp(&b.api_style));
+
+    assert_eq!(
+        spent.len(),
+        2,
+        "两个协议面在同一家上游上是两笔账，合并成一笔就没人答得出命中率掉在哪一面"
+    );
+    assert_eq!(spent[0].api_style, "anthropic");
+    assert_eq!(
+        (spent[0].input, spent[0].cached),
+        (1_800, 200),
+        "Anthropic 面的两笔：输入与命中各归各的"
+    );
+    assert_eq!(spent[1].api_style, "openai");
+    assert_eq!(
+        (spent[1].input, spent[1].cached),
+        (2_000, 1_200),
+        "OpenAI 兼容面的两笔，与另一面分开记"
+    );
+
+    sqlx::query("DELETE FROM cog_llm_usage_rollup WHERE upstream = $1")
+        .bind(&upstream)
+        .execute(&pool)
+        .await
+        .expect("clean up the folded rows");
+    sqlx::query("DELETE FROM gateway_llm_usage WHERE upstream = $1")
+        .bind(&upstream)
+        .execute(&pool)
+        .await
+        .expect("clean up the ledger rows");
+}

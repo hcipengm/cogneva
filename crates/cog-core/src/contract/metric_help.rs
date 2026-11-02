@@ -1340,7 +1340,10 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          spending. The `actor` axis is the same closed set as on \
          `llm_calls_total`: spend under `unknown` is spend by a caller that did \
          not declare itself, so it is real money that no per-actor view \
-         accounts for",
+         accounts for. The `api_style` axis is the wire protocol the spend went \
+         over: one endpoint may answer on several faces and they do not cache \
+         alike, so a hit share taken without it merges faces that differ by an \
+         order of magnitude and names neither",
     ),
     (
         crate::metric_names::GITEE_TOKEN_SECONDS_TO_EXPIRY.as_str(),
