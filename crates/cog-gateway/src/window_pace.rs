@@ -66,6 +66,23 @@ impl MeasuredWindow {
         self.burned_at_unix + (windows * self.window_secs) as i64
     }
 
+    /// Whether the newest refusal still speaks about the window in force.
+    ///
+    /// A wall is evidence about the window it landed in: that window's
+    /// allowance is gone. It is not evidence about the window after it. The
+    /// pool asks this every beat, and the answer has to be able to change when
+    /// the clock rolls past the boundary the measurement anchors on -- otherwise
+    /// "this window is spent" is a latch whose only release is a successful
+    /// call, while it is the same gate that refuses every call. Measured
+    /// 2026-11-02: both upstreams stood at `allowance_tokens 0` with a wall
+    /// newer than the last success, and the one upstream that named its reset
+    /// would have reached that instant with nothing changed: the reset moves
+    /// `window_start_at` past the wall, and only this test reads that as the
+    /// wall no longer describing the window being paced.
+    pub fn wall_still_governs(&self, wall_unix: i64, now_unix: i64) -> bool {
+        wall_unix >= self.window_start_at(now_unix)
+    }
+
     /// Tokens this window has allowed by `now_unix`: the measured capacity
     /// spread linearly over the window's length.
     ///

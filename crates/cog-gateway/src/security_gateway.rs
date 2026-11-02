@@ -5219,6 +5219,34 @@ fn refused_more_recently_than_served(
     }
 }
 
+/// Whether the upstream's newest refusal closes the window being paced.
+///
+/// Two things have to hold, and the second one is the one that can change with
+/// the clock:
+///
+/// - the wall is newer than the newest success (`refused_more_recently_than_served`);
+/// - the wall landed inside the window that is in force now
+///   (`MeasuredWindow::wall_still_governs`).
+///
+/// The first alone is a latch: its only release is a successful call, and the
+/// answer drives the gate that refuses every call, so an upstream that named
+/// its reset would reach that instant with its allowance still forced to zero.
+/// The second is what lets the reset the upstream itself promised open the
+/// window, and it is also why an unnamed reset still recovers at the roll the
+/// measurement anchors on.
+fn window_is_spent(
+    last_ok_unix: Option<i64>,
+    last_wall_unix: Option<i64>,
+    measured: &crate::window_pace::MeasuredWindow,
+    now_unix: i64,
+) -> bool {
+    let Some(wall) = last_wall_unix else {
+        return false;
+    };
+    refused_more_recently_than_served(last_ok_unix, last_wall_unix)
+        && measured.wall_still_governs(wall, now_unix)
+}
+
 /// The measured window, plus whether the upstream has refused it for its quota
 /// more recently than it last served.
 ///
@@ -5311,8 +5339,14 @@ async fn measure_window(
     // 撞墙比最后一次成功更晚，就是上游当着我们的面把这一窗的额度收走了。存着的
     // 坡度仍在说一份允许量，但那是撞墙**之前**的观测：按它放行，等于对着一个
     // 已经关上的窗继续发请求，而观测面上的余量还会是正的。
-    let exhausted =
-        refused_more_recently_than_served(reading.last_ok_unix, reading.last_quota_refusal_unix);
+    let exhausted = |measured: crate::window_pace::MeasuredWindow| {
+        window_is_spent(
+            reading.last_ok_unix,
+            reading.last_quota_refusal_unix,
+            &measured,
+            now_unix,
+        )
+    };
     let evidence = crate::window_pace::WindowEvidence {
         last_quota_refusal_unix: reading.last_quota_refusal_unix,
         quota_cycle_observed: refusal_kind == Some(RefusalKind::QuotaCycle),
@@ -5324,7 +5358,7 @@ async fn measure_window(
         now_unix,
     };
     let Some((end, _)) = crate::window_pace::window_boundary(evidence) else {
-        return latched.map(|measured| (measured, exhausted));
+        return latched.map(|measured| (measured, exhausted(measured)));
     };
     // 有已定性的撞墙行时用它围出来的和（同一处证据、少一次查询）；没有时按恢复
     // 时刻把这一窗围起来求和。上界钉在恢复时刻，所以复位之后再算还是同一个数，
@@ -5341,7 +5375,7 @@ async fn measure_window(
                         error = %e,
                         "窗口配速：算不出这一窗烧了多少，沿用上一次量到的容量"
                     );
-                    return latched.map(|measured| (measured, exhausted));
+                    return latched.map(|measured| (measured, exhausted(measured)));
                 }
             }
         }
@@ -5351,7 +5385,7 @@ async fn measure_window(
     // 沿用的上一次测量带着它自己那次的出处：这一拍没观测到边界，就不能把旧行的
     // 出处改写成「这一拍看到的」。
     let Some(boundary) = boundary else {
-        return Some((measured, exhausted));
+        return Some((measured, exhausted(measured)));
     };
     if Some(measured) != latched {
         state
@@ -5379,7 +5413,7 @@ async fn measure_window(
             );
         }
     }
-    Some((measured, exhausted))
+    Some((measured, exhausted(measured)))
 }
 
 /// 池状态节拍：刷新指标 → 续期跨进程信号 → 边沿处告警与日志。
@@ -14232,6 +14266,69 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "没有墙"
         );
         assert!(!refused_more_recently_than_served(None, None), "两样都没有");
+    }
+
+    /// 撞墙只关它落在的那一窗。窗口滚过去之后，同一条墙不能再当"这一窗没了"用。
+    ///
+    /// 没有这一半时，"这一窗被花光了"就是一把只有成功才能解开的锁，而它锁住的正是
+    /// 那次成功：允许量恒为 0，账上再也不会出现一行 ok，`last_ok_unix` 永远追不上
+    /// 墙。2026-11-02 的上游就是这个形状——两家都停在 `allowance_tokens 0`，其中一家
+    /// 自报 2026-11-04 复位；按只有前一半的读法，那个时刻到了也一个字节不放。
+    #[test]
+    fn a_wall_stops_closing_the_window_once_its_own_boundary_passes() {
+        // 自报了复位时刻的那种：边界就是上游说的那一刻，墙在那之前。
+        let named = crate::window_pace::MeasuredWindow {
+            capacity_tokens: 28_000_000,
+            window_secs: 30 * 24 * 3600,
+            burned_at_unix: 1_793_788_799, // 2026-11-04T15:59:59Z，上游自报
+        };
+        let wall = 1_793_520_000; // 复位之前的那次撞墙
+        assert!(
+            !window_is_spent(None, Some(wall), &named, named.burned_at_unix),
+            "复位时刻到了：墙落在上一窗里，不能再关这一窗"
+        );
+        assert!(
+            !window_is_spent(None, Some(wall), &named, named.burned_at_unix + 86_400),
+            "复位之后一天也一样"
+        );
+
+        // 没自报复位时刻的那种：边界取撞墙之后第一次成功，墙落在这一窗**里面**。
+        let seven_days = 7 * 24 * 3600i64;
+        let resumed = crate::window_pace::MeasuredWindow {
+            capacity_tokens: 23_100_000,
+            window_secs: seven_days as u64,
+            burned_at_unix: 1_793_126_687, // 那次首成功，同时也是这一窗的起点
+        };
+        let wall_inside = resumed.burned_at_unix + 2_100;
+        assert!(
+            window_is_spent(
+                Some(resumed.burned_at_unix),
+                Some(wall_inside),
+                &resumed,
+                wall_inside + 60
+            ),
+            "墙还在这一窗里：照旧按花光算"
+        );
+        assert!(
+            !window_is_spent(
+                Some(resumed.burned_at_unix),
+                Some(wall_inside),
+                &resumed,
+                resumed.burned_at_unix + seven_days + 60,
+            ),
+            "七天后相位滚到下一窗：墙是上一窗的事"
+        );
+
+        // 墙比最后一次成功还早：这一窗已经回来过，无论相位在哪都不算花光。
+        assert!(
+            !window_is_spent(
+                Some(wall_inside + 10),
+                Some(wall_inside),
+                &resumed,
+                wall_inside + 60
+            ),
+            "之后的成功仍是否决墙的那一条证据"
+        );
     }
 
     /// 重启不是新的一页：上一任进程判定的"池不可用"不能被新进程的第一拍探测推翻。
