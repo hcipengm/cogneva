@@ -207,7 +207,7 @@ pub struct LlmUsageRecord {
     pub api_style: String,
     /// Real model name as configured on the upstream.
     pub model: String,
-    /// One of the platform's result words. The five refusals carry zero tokens
+    /// One of the platform's result words. The refusals carry zero tokens
     /// but keep the attempt visible, and they are kept apart from `error`
     /// because the words name opposite repairs: an `error` row is an upstream
     /// that was tried and did not serve, `refused_by_circuit` is a call no
@@ -215,16 +215,18 @@ pub struct LlmUsageRecord {
     /// `refused_by_pace` is one this platform held back on purpose,
     /// `refused_by_budget` is one the job itself declared a ceiling for and has
     /// now reached, `refused_by_owner_budget` is one the person it would be
-    /// charged to has no allowance left for today, and `refused_unidentified`
-    /// is one that named nobody, refused at the edge before any upstream was
-    /// touched. Each reads as its own state rather than as "no traffic". Only
-    /// the first two are waiting for capacity: the budget pair repairs by
-    /// finishing the job, raising the ceiling, or letting the day turn, and
-    /// `refused_unidentified` repairs by the caller writing its name in
-    /// `x-cogneva-actor` -- the platform does not pay for work it cannot
-    /// attribute.
+    /// charged to has no allowance left for today, and the two
+    /// `refused_unidentified_*` words are calls refused at the edge before any
+    /// upstream was touched -- `_missing` when the request carried no actor at
+    /// all, `_undeclared` when it carried one the closed set does not hold.
+    /// Each reads as its own state rather than as "no traffic". Only the first
+    /// two are waiting for capacity: the budget pair repairs by finishing the
+    /// job, raising the ceiling, or letting the day turn, and the identity pair
+    /// repairs at the caller -- by writing the name into `x-cogneva-actor` when
+    /// there is none, by correcting the name when there is a wrong one -- since
+    /// the platform does not pay for work it cannot attribute.
     ///
-    /// A `refused_unidentified` row is the one place `actor` is written as
+    /// An identity-refusal row is the one place `actor` is written as
     /// `unknown`: nobody was named, and the row has to say so rather than
     /// attribute the refusal to a caller that never identified itself.
     /// On a refusal row `upstream` and `model` are `-`: no single upstream is

@@ -87,6 +87,20 @@ impl Unidentified {
         }
     }
 
+    /// The ledger result word this refusal is written under.
+    ///
+    /// The two reasons get two words rather than one because they name two
+    /// different call sites to repair, and the ledger is the only durable
+    /// surface an operator selecting by state can read: the distinction also
+    /// exists in the warning line, but a reader that counts by outcome never
+    /// sees a log line.
+    pub fn result(self) -> cog_core::UsageResult {
+        match self {
+            Unidentified::Missing => cog_core::UsageResult::RefusedUnidentifiedMissing,
+            Unidentified::Undeclared => cog_core::UsageResult::RefusedUnidentifiedUndeclared,
+        }
+    }
+
     /// What the caller is told, built from what it actually sent.
     ///
     /// A refusal that only says "bad identity" leaves the caller guessing which

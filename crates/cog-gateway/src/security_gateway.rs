@@ -2637,9 +2637,16 @@ fn paced_refusal_usage(
 /// 这一行记的是「有人试过」，不是一笔花销：用量恒为零，因为没有上游被请求过。
 /// 它必须存在，否则「有人用匿名调用敲门」这件事在账上、在结果面上都不存在——
 /// 这条通道的拒绝全部发生在选上游之前，没有任何一家的正文明细能替它作证。
+///
+/// 拒绝的成因进的是 `result` 那一格，不是 `refusal_kind`：后者记的是「上游在
+/// 正文里说了为什么拒」，而这里根本没有上游。两个成因各占一个词，因为它们
+/// 指向两个不同的调用点：没带头的要去找那个从没写过 `x-cogneva-actor` 的地方，
+/// 带了不认得的值要去找那个写错的地方。只落一个词，后一种情形在台账上只能靠
+/// 翻网关日志才分得出来，而按状态取行的读者读不到日志。
 fn unidentified_refusal_usage(
     style: &str,
     origin: &str,
+    refusal: crate::actor_labels::Unidentified,
     task: Option<&str>,
     owner: Option<&str>,
 ) -> LlmUsageRecord {
@@ -2647,7 +2654,7 @@ fn unidentified_refusal_usage(
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
         model: POOLED_REFUSAL_UNNAMED.to_string(),
-        result: UsageResult::RefusedUnidentified.as_str().to_string(),
+        result: refusal.result().as_str().to_string(),
         // 没有身份可记——这一格就是那句话本身：这笔请求没说是谁花的。
         actor: crate::actor_labels::UNKNOWN_ACTOR.to_string(),
         origin: origin.to_string(),
@@ -6490,7 +6497,13 @@ async fn stream_forward(
             // 就是这个格子，早退之后只剩这一处会写它。
             land_usage_record(
                 &state,
-                unidentified_refusal_usage(style, &origin, task.as_deref(), owner.as_deref()),
+                unidentified_refusal_usage(
+                    style,
+                    &origin,
+                    refusal,
+                    task.as_deref(),
+                    owner.as_deref(),
+                ),
             );
             record_counter(
                 &state,
@@ -6498,7 +6511,7 @@ async fn stream_forward(
                 &[
                     ("upstream", POOLED_REFUSAL_UNNAMED),
                     ("model", POOLED_REFUSAL_UNNAMED),
-                    ("result", UsageResult::RefusedUnidentified.as_str()),
+                    ("result", refusal.result().as_str()),
                     ("actor", crate::actor_labels::UNKNOWN_ACTOR),
                 ],
             )
@@ -17195,6 +17208,51 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let ua = recorded(&seen, "user-agent").expect("意图请求必须带 User-Agent");
         assert!(ua.starts_with("cogneva/"), "User-Agent 要自报身份：{ua}");
         assert_eq!(recorded(&seen, "x-app").as_deref(), Some("cogneva"));
+    }
+
+    /// 两个身份成因在台账上各占一个词，且都落成零花销的边界拒绝。
+    ///
+    /// 词必须分开：没带头的那一次要在调用点里找出「谁从来没写过这个头」，带了
+    /// 不认得的值的要在调用点里找出「谁写错了」，两处不是同一批文件。只落一个词，
+    /// 拿着这个面板的人只能翻网关日志，而按结果取行的读者从不读日志。
+    #[test]
+    fn the_two_identity_refusals_land_under_two_words() {
+        let missing = unidentified_refusal_usage(
+            "openai",
+            "gateway_pool",
+            crate::actor_labels::Unidentified::Missing,
+            None,
+            None,
+        );
+        let undeclared = unidentified_refusal_usage(
+            "openai",
+            "gateway_pool",
+            crate::actor_labels::Unidentified::Undeclared,
+            None,
+            None,
+        );
+        assert_eq!(missing.result, "refused_unidentified_missing");
+        assert_eq!(undeclared.result, "refused_unidentified_undeclared");
+        for row in [&missing, &undeclared] {
+            assert_eq!(
+                row.tokens_input + row.tokens_output + row.tokens_cached,
+                0,
+                "没人被收过钱，这一行不能带用量"
+            );
+            assert_eq!(row.upstream, POOLED_REFUSAL_UNNAMED);
+            assert_eq!(row.model, POOLED_REFUSAL_UNNAMED);
+            assert_eq!(row.actor, crate::actor_labels::UNKNOWN_ACTOR);
+            assert_eq!(
+                row.refusal_kind, None,
+                "`refusal_kind` 记的是上游正文里的成因，这条路根本没碰上游"
+            );
+            // 结果面的词必须都在台账闭集里：读者的谓词就是按这些词拼的。
+            assert!(
+                cog_core::UsageResult::parse(&row.result).is_some(),
+                "{} 不在结果闭集里",
+                row.result
+            );
+        }
     }
 
     /// 没有身份的调用在付钱之前就被拒，而不是记成 `unknown` 再转发。

@@ -228,11 +228,19 @@ function describe(line: OutcomeLine): { label: string; hint: string; tone: strin
         tone: 'var(--warn)',
         bar: 'var(--warn)',
       };
-    case 'refused_unidentified':
+    case 'refused_unidentified_missing':
       return {
-        label: '没报身份',
+        label: '没带身份',
         hint:
-          '零花销：请求头 `x-cogneva-actor` 缺失、为空、写着 `unknown`，或者名字不在平台闭集里，网关在付钱之前就拒了。修法是让调用方把身份带上，不是加额度',
+          '零花销：请求头 `x-cogneva-actor` 缺失或为空，网关在付钱之前就拒了。修法是找到那个从没写过身份头的调用点，不是加额度',
+        tone: 'var(--danger)',
+        bar: 'var(--danger)',
+      };
+    case 'refused_unidentified_undeclared':
+      return {
+        label: '身份写错',
+        hint:
+          '零花销：调用方带了 `x-cogneva-actor`，但那个词不在平台闭集里（拼错、大小写不对、或自己发明的角色名），网关在付钱之前就拒了。修法是改那个写着的词，不是加额度',
         tone: 'var(--danger)',
         bar: 'var(--danger)',
       };

@@ -551,20 +551,19 @@ pub struct Usage {
 /// What one attempt ended as, as far as the usage ledger is concerned.
 ///
 /// The ledger keeps this in a `result` column and every reader predicates on
-/// one of the four words: the window readers sum the served rows, the failure
+/// one of these words: the window readers sum the served rows, the failure
 /// readers count everything else, and the rollups split them. The spellings
 /// therefore have to agree between two crates that cannot see each other -- the
 /// gateway writes the rows, the observability crate queries them -- so the set
 /// lives here rather than beside either one.
 ///
-/// Four of the six are refusals we made, not answers the upstream gave.
+/// Most of these are refusals we made, not answers the upstream gave.
 /// `refused_by_circuit` means no upstream was even tried (the pool was shut),
 /// `refused_by_pace` means the window's allowance was spent, and
 /// `refused_by_budget` means the unit of work spent the ceiling someone
 /// declared for it. Recording any of them as `error` would read as "the
 /// upstream answered wrong" and point the repair at the wrong place -- and each
-/// of the three has a different repair, which is why they are three words and
-/// not one.
+/// has a different repair, which is why each is its own word and not one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UsageResult {
@@ -590,13 +589,20 @@ pub enum UsageResult {
     /// 多少」上，修法是等日界翻页、或由属主调整这个人的额度。两者合成一个词，
     /// 读的人会去找错的那个人问。
     RefusedByOwnerBudget,
-    /// 请求没报执行者身份（或报的名字不在闭集里），网关在付钱之前就拒了。
+    /// 请求根本没带执行者身份，网关在付钱之前就拒了。
     ///
     /// 与上面几种拒绝都分开：那几种拒的是「现在没有产能／额度」，修法是等或加
     /// 资源；这一条拒的是「不知道这钱该记在谁头上」，修法是让调用方把身份带上。
     /// 合成一个词，读的人会去加额度，而额度一分没少。这一行只记「有人试过」，
     /// 用量恒为零：网关不替匿名调用付费。
-    RefusedUnidentified,
+    RefusedUnidentifiedMissing,
+    /// 请求带了身份，但那个名字不在平台的闭集里，网关在付钱之前就拒了。
+    ///
+    /// 与上一条分开：上一条的修法是**找到那个根本没写身份头的调用点**，这一条的
+    /// 修法是**改一个已经写着的词**——拼错、大小写不对、或者自己发明了一个角色名。
+    /// 两者只在拒绝那一刻分得开：网关知道自己是没读到值，还是读到了一个不认得的值。
+    /// 合成一个词，拿着告警的人两处都要翻，而其中一处永远翻不到东西。用量恒为零。
+    RefusedUnidentifiedUndeclared,
 }
 
 impl UsageResult {
@@ -606,14 +612,15 @@ impl UsageResult {
     /// that spells one itself agrees with this enum only until a variant is
     /// renamed, and then it matches no rows -- which reads exactly like a
     /// ledger with nothing in it.
-    pub const ALL: [UsageResult; 7] = [
+    pub const ALL: [UsageResult; 8] = [
         UsageResult::Ok,
         UsageResult::Error,
         UsageResult::RefusedByCircuit,
         UsageResult::RefusedByPace,
         UsageResult::RefusedByBudget,
         UsageResult::RefusedByOwnerBudget,
-        UsageResult::RefusedUnidentified,
+        UsageResult::RefusedUnidentifiedMissing,
+        UsageResult::RefusedUnidentifiedUndeclared,
     ];
 
     /// The word this outcome is stored under.
@@ -625,7 +632,8 @@ impl UsageResult {
             UsageResult::RefusedByPace => "refused_by_pace",
             UsageResult::RefusedByBudget => "refused_by_budget",
             UsageResult::RefusedByOwnerBudget => "refused_by_owner_budget",
-            UsageResult::RefusedUnidentified => "refused_unidentified",
+            UsageResult::RefusedUnidentifiedMissing => "refused_unidentified_missing",
+            UsageResult::RefusedUnidentifiedUndeclared => "refused_unidentified_undeclared",
         }
     }
 
