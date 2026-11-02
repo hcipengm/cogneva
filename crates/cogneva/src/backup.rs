@@ -4443,7 +4443,19 @@ pub async fn drop_scratch_database(live: &PgPool, database: &str) -> Result<(), 
         .execute(live)
         .await
         {
-            Ok(_) => return Ok(()),
+            Ok(_) => {
+                // 等过就说等到什么：这一行是「等」这条腿在现网里唯一留下的痕迹，
+                // 没有它，一次走了三分钟才删干净的收尾和一次立刻删掉的收尾在日志里
+                // 逐字相同，读的人无从知道那三分钟是否真有必要。
+                if waited > Duration::ZERO {
+                    tracing::info!(
+                        database,
+                        waited_seconds = waited.as_secs(),
+                        "演练库上的后台进程走完了，库删掉了"
+                    );
+                }
+                return Ok(());
+            }
             Err(e) => {
                 let left = backends_on(live, database).await.unwrap_or_default();
                 if !can_still_drain(&left) || attempt >= BACKGROUND_DRAIN_ATTEMPTS {
