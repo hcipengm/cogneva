@@ -182,6 +182,13 @@ const EXEMPT: &[Exempt] = &[
         value: "COGNEVA_VERSION_ID",
         why: "同上：`env!` 的字面量要求",
     },
+    Exempt {
+        file: "crates/cog-storage/src/postgres/pge_stage_store.rs",
+        value: "change_identity",
+        why: "表里的列名，读它的是 SQL（DDL、插入列表、`try_get` 都按列名走），\
+              与任务输入键 `cog_core::contract::pge_stage::INPUT_CHANGE_IDENTITY` 同形\
+              却不同物：列名改了要迁表，输入键改了只改派发那一侧，改名时两处不必同步",
+    },
 ];
 
 /// A value worth holding to one spelling: long enough and shaped like a path,

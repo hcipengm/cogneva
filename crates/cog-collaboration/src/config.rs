@@ -32,23 +32,6 @@ fn load_section_from<T: serde::de::DeserializeOwned + Default>(
     }
 }
 
-fn load_pointer<T: serde::de::DeserializeOwned>(path: &Path, pointer: &str) -> SFResult<Option<T>> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let root: serde_json::Value = serde_json::from_str(&text)
-                .map_err(|e| SFError::Config(format!("{}: {e}", path.display())))?;
-            match root.pointer(pointer) {
-                Some(value) => serde_json::from_value(value.clone())
-                    .map(Some)
-                    .map_err(|e| SFError::Config(format!("{} {pointer}: {e}", path.display()))),
-                None => Ok(None),
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(SFError::Config(format!("{}: {e}", path.display()))),
-    }
-}
-
 /// Self-review quality gate configuration for PGE actors.
 /// Disabled by default so existing behavior is unchanged unless opted in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
