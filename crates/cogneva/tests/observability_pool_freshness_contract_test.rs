@@ -47,6 +47,7 @@
 use crate::common;
 
 use common::routes::{read_repo, repo_root};
+use common::rust_production::crate_tree_sources;
 use common::service_topology;
 
 use std::collections::BTreeSet;
@@ -413,35 +414,46 @@ fn every_gauge_written_per_upstream_is_on_the_retirement_roster() {
          的合计），写者对每一个这样的标签值都还活着，退休它就是删一个仍在写的合计",
     )];
 
-    let gateway = read_repo("crates/cog-gateway/src/security_gateway.rs");
-    // The test module holds a stub backend with its own `record_gauge`, and a
-    // `#[cfg(test)]` helper above it. Cut at the test module's opening line, so
-    // the scan reads production call sites only.
-    let production = gateway
-        .split_once("\n#[cfg(test)]\nmod tests {")
-        .map(|(before, _)| before)
-        .expect("测试模块的开头变了，这条判据会扫到自己的桩实现");
-
+    // Every crate's production code, not one file: today the whole family is
+    // written in the gateway's pool loop, and the day a second writer appears
+    // it must not be able to appear outside the scan. A `#[cfg(test)]` module
+    // holds its own stubs, so each file is cut at its test module's opening
+    // line first.
     let mut per_upstream: BTreeSet<String> = BTreeSet::new();
-    let mut from = 0;
-    while let Some(rel) = production[from..].find("record_gauge(") {
-        let at = from + rel;
-        // One past the opening, not past the span: a call inside another one's
-        // span is a call too, and a scan that skips it goes green by not
-        // looking.
-        from = at + 1;
-        let Some(call) = balanced_span(&production[at..]) else {
-            continue;
-        };
-        if !call.contains("\"upstream\"") {
-            continue;
-        }
-        for (ident, metric) in cog_core::metric_names::IDENTIFIED {
-            if call.contains(&format!("metric_names::{ident}")) {
-                per_upstream.insert(metric.as_str().to_string());
+    let mut scanned = 0usize;
+    for path in crate_tree_sources(&repo_root()) {
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        let production = text
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(text.as_str(), |(before, _)| before);
+        scanned += 1;
+        let mut from = 0;
+        while let Some(rel) = production[from..].find("record_gauge(") {
+            let at = from + rel;
+            // One past the opening, not past the span: a call inside another
+            // one's span is a call too, and a scan that skips it goes green by
+            // not looking.
+            from = at + 1;
+            let Some(call) = balanced_span(&production[at..]) else {
+                continue;
+            };
+            if !call.contains("\"upstream\"") {
+                continue;
+            }
+            for (ident, metric) in cog_core::metric_names::IDENTIFIED {
+                if call.contains(&format!("metric_names::{ident}")) {
+                    per_upstream.insert(metric.as_str().to_string());
+                }
             }
         }
     }
+    // 2026-11-02 实测这棵树是 790 个 crate 生产源文件（`tests/` 除外）；下限取一半，
+    // 读到的数量掉下去时这条判据先红，而不是安静地扫过几份文件就说全绿。
+    assert!(
+        scanned >= 500,
+        "只读到 {scanned} 个 crate 源文件——这份普查没有扫到树"
+    );
 
     let roster: BTreeSet<&str> = cog_storage::ROSTERED_LABEL_SERIES.iter().copied().collect();
     assert!(
