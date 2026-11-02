@@ -224,14 +224,47 @@ const ACTOR_MEANINGS: Record<string, string> = {
 };
 
 /**
- * 闭集里的执行者名，不含占位符 `unknown`。
+ * 两族里的角色名：平台会为它建 agent 的那些名字。
+ *
+ * 闭集不止上面那 11 个固定名——`agent:<角色>` / `self_review:<角色>` 是两族前缀，
+ * 族员是配置里的角色名。族员不写出来，「闭集共 11 个」这句话就读成全集，而表里
+ * 实际会出现 20 来行；读者数不出「2 族到底几个」，也没法和表对上。
+ *
+ * 正本是 `cog_core::roles::ALL`。这里抄的是**会以 agent 身份调用模型的角色**：
+ * `external-worker` 不在其中——它是靠心跳占位的登记角色，从不跑 agent，永远不会有
+ * 它的一行（列出来就是一行永远「本窗口没有调用」的假名字）。门
+ * （`check-web-token-panel.sh` 第 7 段）把这张表与那个常量逐名比对，多一个少一个都红。
+ */
+export const AGENT_ROLES = ['planner', 'generator', 'evaluator', 'moderator', 'merger'];
+
+/** 两族前缀。正本是网关的 `ACTOR_LABEL_PREFIXES`，门同名逐条比对。 */
+export const ACTOR_FAMILY_PREFIXES = ['agent:', 'self_review:'] as const;
+
+/**
+ * 两族的全体成员：每个角色在每个前缀下各一个名字。
+ *
+ * 两个族员数相同，因为同一位角色既以 `agent:<角色>` 干活，又以
+ * `self_review:<角色>` 审自己刚写的那份输出——同一个人干的第二件事，不是另一个
+ * 执行者。
+ */
+export function familyActorNames(): string[] {
+  return ACTOR_FAMILY_PREFIXES.flatMap((prefix) =>
+    AGENT_ROLES.map((role) => `${prefix}${role}`)
+  );
+}
+
+/**
+ * 闭集里的执行者名，不含占位符 `unknown`：固定名 ＋ 两族成员，个数由表算出。
  *
  * 「谁在花」那张表也要按闭集列全：本窗口没出现过的名字照样占一行，标「本窗口
  * 没有调用」。只列出现过的，读者会把这个数当成全集——而闭集才是「平台上有哪些
  * 执行者」。名字只有这一份正本，表与计数格都从这里取。
  */
 export function registeredActorNames(): string[] {
-  return Object.keys(ACTOR_MEANINGS).filter((name) => name !== UNKNOWN_ACTOR_NAME);
+  return [
+    ...Object.keys(ACTOR_MEANINGS).filter((name) => name !== UNKNOWN_ACTOR_NAME),
+    ...familyActorNames(),
+  ];
 }
 
 const ACTOR: Dimension = {
@@ -249,13 +282,19 @@ const ACTOR: Dimension = {
   note: (counted, absent) => {
     // 表里还留着一格 `unknown`，它是占位不是名字：读法要留着（否则它显示成
     // 「不在闭集里」），但不算进「登记了几个名字」。
-    const named = Object.keys(ACTOR_MEANINGS).length - 1;
+    const fixed = Object.keys(ACTOR_MEANINGS).length - 1;
+    const perFamily = AGENT_ROLES.length;
+    const familyTotal = familyActorNames().length;
+    const named = fixed + familyTotal;
+    const shape =
+      `闭集共 ${named} 个：${fixed} 个固定名 ＋ 2 族共 ${familyTotal} 个` +
+      `（agent: ${perFamily} 个、self_review: ${perFamily} 个）`;
     return absent.length > 0
-      ? `本窗口出现 ${counted.length} 个，闭集共 ${named} 个固定名＋2 族（明细见下表）`
-      : `见下表（闭集 ${named} 个固定名＋2 族）`;
+      ? `本窗口出现 ${counted.length} 个；${shape}。明细见下表，表底有总计。`
+      : `见下表：${shape}，表底有总计。`;
   },
   footnote: () =>
-    '执行者名来自网关的闭集：固定的阶段名（eval、memory、ralph…），加 `agent:<角色>` / `self_review:<被评的角色>` 两族前缀。没声明自己是谁的调用方记成 `unknown`——名字缺席是调用方没报，不是网关丢的，所以它不算进「几个执行者」，只把那段花销照实列出来。闭集里登记了、这段窗口没出现过的名字也列在下面，标「本窗口没有调用」：出现过几个不是全集。',
+    '执行者名来自网关的闭集：固定的阶段名（eval、memory、ralph…），加 `agent:<角色>` / `self_review:<被评的角色>` 两族前缀。两族的族员是同一份角色名单——每位角色既以 `agent:<角色>` 干活，又以 `self_review:<角色>` 审自己刚写的那份输出，所以两族一样大。没声明自己是谁的调用方记成 `unknown`——名字缺席是调用方没报，不是网关丢的，所以它不算进「几个执行者」，只把那段花销照实列出来。闭集里登记了、这段窗口没出现过的名字也列在下面，标「本窗口没有调用」：出现过几个不是全集，表底那一行总计才是这一屏所有行的和。',
 };
 
 const UPSTREAM: Dimension = {

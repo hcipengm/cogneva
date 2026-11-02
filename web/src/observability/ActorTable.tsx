@@ -44,6 +44,13 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
   const grand = groups.reduce((sum, group) => sum + group.input + group.output, 0);
   const totalCalls = groups.reduce((sum, group) => sum + group.calls, 0);
   const totalFailed = groups.reduce((sum, group) => sum + group.failed, 0);
+  const totalInput = groups.reduce((sum, group) => sum + group.input, 0);
+  const totalOutput = groups.reduce((sum, group) => sum + group.output, 0);
+  const totalCached = groups.reduce((sum, group) => sum + group.cached, 0);
+  const totalLatency = groups.reduce((sum, group) => sum + group.latencyWeighted, 0);
+  // 缓存写入是「有多少行量过」的三态，不是三个数相加：合计要按行集重算，
+  // 不能把几十个执行者各自的「还没进账」拼起来。
+  const allRows = groups.flatMap((group) => group.rows);
   const spenders = groups.filter((group) => group.input + group.output > 0);
   const toggle = (actor: string) => setOpen((prev) => ({ ...prev, [actor]: !prev[actor] }));
 
@@ -247,6 +254,63 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
               </td>
             </tr>
           ))}
+          {/* 总计：这一屏所有有数的行相加。它答的是「表里这些行加起来是多少」，
+              不是「平台上有几个执行者」——闭集里本窗口没出现的那几行是零，加不加一样。 */}
+          <tr style={{ borderTop: '1px solid var(--brass)' }}>
+            <td>
+              <Note
+                className="mono flex w-full items-baseline gap-1 text-[11px]"
+                text={`上面 ${groups.length} 个执行者的合计；闭集里本窗口没出现的 ${absent.length} 行是零，不在加数里，加进去也不变。这一行与表头的「闭集」不是一个数：一个答这一屏加总多少，一个答平台上有几个名字。`}
+              >
+                <span className="w-2 shrink-0" />
+                <span className="min-w-0 truncate">总计</span>
+              </Note>
+            </td>
+            <td className={NUM}>{percent(grand, grand)}</td>
+            <td className={NUM}>{totalCalls.toLocaleString()}</td>
+            <td
+              className={NUM}
+              style={{ color: totalFailed > 0 ? 'var(--danger)' : 'var(--muted)' }}
+            >
+              {totalFailed.toLocaleString()}
+            </td>
+            <td className={NUM}>{totalInput.toLocaleString()}</td>
+            <td className={NUM}>{totalOutput.toLocaleString()}</td>
+            <td className={NUM} style={{ color: 'var(--muted)' }}>
+              {totalCached.toLocaleString()}
+            </td>
+            <td className={NUM} style={{ color: 'var(--muted)' }}>
+              <Note className="text-[var(--muted)]" text={cacheWriteNote(allRows)}>
+                {cacheWriteValue(allRows)}
+              </Note>
+            </td>
+            <td className={NUM}>
+              <Note
+                className="text-[var(--muted)]"
+                text={cacheFormula(
+                  [...new Set(groups.flatMap((group) => group.styles))].join('、'),
+                  totalInput,
+                  totalCached
+                )}
+              >
+                {hitRate(totalInput, totalCached)}
+              </Note>
+            </td>
+            <td className={NUM} style={{ color: 'var(--muted)' }}>
+              {totalCalls > 0 ? (
+                <Note text={perCallNote('未命中输入', totalInput, totalCalls)}>
+                  {Math.round(totalInput / totalCalls).toLocaleString()}
+                </Note>
+              ) : (
+                '—'
+              )}
+            </td>
+            <td className={NUM} style={{ color: 'var(--muted)' }}>
+              {totalCalls > 0 && totalLatency > 0
+                ? `${Math.round(totalLatency / totalCalls)} ms`
+                : '—'}
+            </td>
+          </tr>
         </tbody>
       </table>
 

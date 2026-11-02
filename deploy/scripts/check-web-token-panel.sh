@@ -259,10 +259,18 @@ else:
 # 判的是**名单相等**，不是「屏上写了几个名字」：少一个多一个都红。读法本身（那句
 # 中文）判不了——它是对名字的解释，不是可以被机器复核的事实。
 LABELS_RS = "crates/cog-gateway/src/actor_labels.rs"
+ROLES_RS = "crates/cog-core/src/roles.rs"
 BACKEND_FIXED = re.compile(r"pub\s+const\s+ACTOR_LABELS\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];", re.S)
 BACKEND_UNKNOWN = re.compile(r'pub\s+const\s+UNKNOWN_ACTOR\s*:\s*&str\s*=\s*"([^"]+)"')
+BACKEND_PREFIXES = re.compile(
+    r"pub\s+const\s+ACTOR_LABEL_PREFIXES\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];", re.S
+)
+ROLES_CONST = re.compile(r'pub\s+const\s+([A-Z][A-Z_]*)\s*:\s*&str\s*=\s*"([^"]+)"')
+ROLES_ALL = re.compile(r"pub\s+const\s+ALL\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];", re.S)
 FRONT_MAP = re.compile(r"const\s+ACTOR_MEANINGS\s*:\s*Record<string,\s*string>\s*=\s*\{(.*?)\n\};", re.S)
 FRONT_KEY = re.compile(r"^\s*(?:'([^']+)'|([A-Za-z_][\w-]*))\s*:", re.M)
+FRONT_ROLES = re.compile(r"export\s+const\s+AGENT_ROLES\b[^=]*=\s*\[(.*?)\]", re.S)
+FRONT_PREFIXES = re.compile(r"export\s+const\s+ACTOR_FAMILY_PREFIXES\b[^=]*=\s*\[(.*?)\]", re.S)
 
 labels_path = os.path.join(ROOT, LABELS_RS)
 if not os.path.isfile(labels_path):
@@ -311,6 +319,61 @@ else:
                 )
             if not missing and not foreign:
                 summary.append(f"执行者名单: {len(declared)} 个名字，{rel} 与之逐名相等")
+
+            # ── 两族的族员 ──
+            # 闭集不止固定名：`agent:<角色>` / `self_review:<角色>` 是两族前缀，
+            # 族员是配置里的角色名。屏上不写族员，那句「闭集共 11 个」就被读成
+            # 全集——而表里其实有二十来行，读者数不出「2 族到底几个」，也没法
+            # 和表对上。
+            #
+            # 族员的正本是 `cog_core::roles::ALL`，**减去 `external-worker`**：
+            # 那是靠心跳占位的登记角色，从不以 agent 身份调用模型，列出来就是
+            # 一行永远「本窗口没有调用」的假名字。前缀的正本是网关的
+            # `ACTOR_LABEL_PREFIXES`。两处都比名单相等，不只比「写了几个」。
+            roles_path = os.path.join(ROOT, ROLES_RS)
+            roles_src = open(roles_path, encoding="utf-8").read() if os.path.isfile(roles_path) else ""
+            src = read(rel)
+            consts = dict(ROLES_CONST.findall(roles_src))
+            all_decl = ROLES_ALL.search(roles_src)
+            prefixes_decl = BACKEND_PREFIXES.search(backend_src)
+            front_prefixes = FRONT_PREFIXES.search(src)
+            front_roles = FRONT_ROLES.search(src)
+            if not all_decl or not prefixes_decl or not consts:
+                problems.append(
+                    f"{ROLES_RS} / {LABELS_RS} 里找不到 roles::ALL、ACTOR_LABEL_PREFIXES "
+                    "的声明——两族的族员没有可比的正本，这段比对在空转"
+                )
+            elif not front_roles or not front_prefixes:
+                problems.append(
+                    f"{rel}: 找不到 AGENT_ROLES / ACTOR_FAMILY_PREFIXES 的声明——"
+                    "两族的族员没有列在屏上，「闭集共几个」这句话就对不上表"
+                )
+            else:
+                want_roles = [
+                    consts[name]
+                    for name in re.findall(r"[A-Z_]+", all_decl.group(1))
+                    if consts.get(name) and consts[name] != consts.get("EXTERNAL_WORKER")
+                ]
+                got_roles = re.findall(r"['\"]([^'\"]+)['\"]", front_roles.group(1))
+                want_prefixes = re.findall(r'"([^"]+)"', prefixes_decl.group(1))
+                got_prefixes = re.findall(r"['\"]([^'\"]+)['\"]", front_prefixes.group(1))
+                if want_roles != got_roles:
+                    problems.append(
+                        f"{rel}: AGENT_ROLES 是 {', '.join(got_roles) or '（空）'}，"
+                        f"而 {ROLES_RS}::ALL 声明的是 {', '.join(want_roles)}"
+                        "（不含 external-worker）——族员名单漂了，屏上的闭集总数就不对"
+                    )
+                elif want_prefixes != got_prefixes:
+                    problems.append(
+                        f"{rel}: ACTOR_FAMILY_PREFIXES 是 {', '.join(got_prefixes) or '（空）'}，"
+                        f"而 {LABELS_RS} 声明的是 {', '.join(want_prefixes)}——"
+                        "族的个数与名字对不上"
+                    )
+                else:
+                    summary.append(
+                        f"两族: 前缀 {len(want_prefixes)} 个 × 族员 {len(want_roles)} 个 = "
+                        f"{len(want_prefixes) * len(want_roles)} 个名字"
+                    )
 
 # 环境那一维的闭集住在这儿（`LlmOrigin` 的 `declared` / `as_str` 是一份契约）。
 # 与上面那条闭集源同一个理由写成一列而不是一个路径：搬家的那一天，红的是「读不
