@@ -1220,11 +1220,15 @@ metric_names! {
     // cog-gateway — LLM pool and upstream health.
     LLM_CALLS_TOTAL => "llm_calls_total",
     LLM_CALL_LATENCY_MS => "llm_call_latency_ms",
-    // Published at zero as well as at a value. An absent cell says the metering
-    // path never ran for that upstream and actor, while a cell holding zero says
-    // it ran and had nothing to add -- and an upstream that sends no usage frame
-    // produces the second, not the first, so without the zero the two read the
-    // same.
+    // Rendered from the usage ledger on the pool's cadence, never accumulated
+    // on the request path: the call that spent the tokens already landed a row,
+    // so a tally beside the ledger is a second book that parts company with it
+    // at the first restart. Cumulative over the whole folded record and never
+    // reset by the day, so a reader may take a window difference without
+    // measuring the ledger's own rollover. A pair that spent nothing is absent
+    // rather than zero; the age of the whole family is the store's own
+    // observed-timestamp companion, which is why every cell has to be
+    // rewritten each tick.
     LLM_TOKENS_TOTAL => "llm_tokens_total",
     // What the read of each finished response found, by `upstream` and
     // `outcome`. A series of its own rather than more labels on the counts

@@ -1321,17 +1321,23 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "llm_tokens_total",
-        "Tokens the ledger says were spent since the start of the UTC day, \
-         split by `kind` into input, output and cached. Rendered from the \
-         ledger's rows on the pool's cadence, never tallied on the request \
-         path: the call that spent the tokens already landed a row, so a \
-         process that also counted it would be keeping a second book and the \
+        "Tokens the ledger says were spent, split by `kind` into input, output \
+         and cached. The span is the whole folded record, not the day: the \
+         value only ever rises, so a window difference over it measures \
+         spending rather than the ledger's own midnight rollover. Rendered \
+         from the ledger's rows on the pool's cadence, never tallied on the \
+         request path: the call that spent the tokens already landed a row, so \
+         a process that also counted it would be keeping a second book and the \
          two would part company at the first restart. `cached` is the part of \
          the input the upstream served from its own cache and `input` is only \
          the rest, so the whole prompt is `input + cached` on both protocols \
-         and a hit share is `cached / (input + cached)`. Read the age beside \
-         it -- `llm_tokens_measured_at_unix` -- before believing a number that \
-         has stopped moving. The `actor` axis is the same closed set as on \
+         and a hit share is `cached / (input + cached)`. Every cell is \
+         rewritten each heartbeat whether or not it moved, so a flat number is \
+         not by itself news -- what it means is read off `(time() - \
+         llm_tokens_total_observed_timestamp_seconds)`, because a projection \
+         that cannot reach the ledger goes on serving the last numbers it \
+         rendered and those are indistinguishable from a platform that stopped \
+         spending. The `actor` axis is the same closed set as on \
          `llm_calls_total`: spend under `unknown` is spend by a caller that did \
          not declare itself, so it is real money that no per-actor view \
          accounts for",
