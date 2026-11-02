@@ -898,13 +898,9 @@ pub async fn restore_postgres(
                 "restore: 连接的角色没有超级用户位，按依赖顺序装载，外键检查开着"
             );
         }
-        let quoted: Vec<String> = tables.iter().map(|t| format!("\"{t}\"")).collect();
-        sqlx::query(&format!(
-            "TRUNCATE {} RESTART IDENTITY CASCADE",
-            quoted.join(", ")
-        ))
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query(&truncate_statement(&tables))
+            .execute(&mut *tx)
+            .await?;
         // 装的是 `load` 不是 `tables`：超权那条路两者相同，受限角色那条路里面是
         // 排好依赖的顺序。报告里仍然给 `tables`（包里有哪几张），顺序不是它的答案。
         for table in &load {
@@ -4414,6 +4410,17 @@ fn quoted_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// 装载前清空目标表的那一句。
+///
+/// 表名是数据库自己给出的标识符（包里的 `public.<表名>.csv` 就是它的来源），所以它
+/// 与库名走同一个引用：引号翻倍，不丢字符。写成 `format!("\"{}\"", name)` 的版本在
+/// 常见名字上逐字相同，只有一个名字里本来就带引号时才会拼出一句语法错的 SQL——而那
+/// 恰好是恢复一份包、目标是「这次一定装回去」的时刻。
+fn truncate_statement(tables: &[String]) -> String {
+    let quoted: Vec<String> = tables.iter().map(|t| quoted_identifier(t)).collect();
+    format!("TRUNCATE {} RESTART IDENTITY CASCADE", quoted.join(", "))
+}
+
 /// 那个库上此刻的连接。
 ///
 /// `signalable` 是这条连接能不能对那个 pid 发信号：自己是超级用户时全都算；否则
@@ -5411,6 +5418,24 @@ mod tests {
         assert_eq!(
             load_order(&tables, &edges).unwrap(),
             vec!["users".to_string(), "members".to_string()]
+        );
+    }
+
+    /// 表名进 `TRUNCATE` 时按标识符引用：名字里的引号翻倍，点号不做分段。
+    ///
+    /// 包里的表名来自数据库自己的目录，所以「带引号的名字」不是假想的输入。旧写法
+    /// `format!("\"{}\"", name)` 在普通名字上与现在逐字相同，只在这一个名字上拼出一句
+    /// 语法错的 SQL——而它出现在恢复路径上，那正是「这个包一定要装回去」的时刻。
+    #[test]
+    fn a_table_name_is_quoted_with_its_own_quotes_doubled() {
+        assert_eq!(
+            truncate_statement(&["users".to_string(), "weird\"name".to_string()]),
+            "TRUNCATE \"users\", \"weird\"\"name\" RESTART IDENTITY CASCADE"
+        );
+        // 点号在表名里是普通字符：分段会把它拼成两张表，而库里只有一张。
+        assert_eq!(
+            truncate_statement(&["a.b".to_string()]),
+            "TRUNCATE \"a.b\" RESTART IDENTITY CASCADE"
         );
     }
 

@@ -39,11 +39,20 @@ use common::routes::repo_root;
 use common::rust_production::{production_lines, production_sources, relative_name};
 
 /// 允许存在的 `quote…` 函数：文件、函数名、以及它为什么不是同一份拼法。
-const REGISTERED: &[(&str, &str, &str)] = &[(
-    "crates/cog-core/src/sql.rs",
-    "quote_relation",
-    "把关系名写进 SQL 的那一份——树上唯一的拼法，别的 crate 引用它",
-)];
+const REGISTERED: &[(&str, &str, &str)] = &[
+    (
+        "crates/cog-core/src/sql.rs",
+        "quote_relation",
+        "把关系名写进 SQL 的那一份——树上唯一的拼法，别的 crate 引用它",
+    ),
+    (
+        "crates/cogneva/src/backup.rs",
+        "quoted_identifier",
+        "引的是一个库名，不是一个关系名：`DROP DATABASE` 只收单个标识符，点号在库名里是\
+         普通字符，按 `quote_relation` 那样分段拼出来的是 `\"a\".\"b\"`，语法上就不成立。\
+         引号翻倍这一半与那份拼法相同，分段那一半不能有",
+    ),
+];
 
 /// 一处定义：文件与该文件的函数名。
 type Site = (String, String);
