@@ -14,7 +14,8 @@
 #
 # 后三段判的是另外三件事，坏起来同样是静默的：额度窗整段消失（花销面答得出「花了
 # 多少」却答不出「还够不够」）、时区名消失（本地时刻被当成 UTC 读）、执行者的名字
-# 与网关的闭集各写各的（新名字被报成笔误，旧名字的读法永远不上屏）。
+# 与网关的闭集各写各的（新名字被报成笔误，旧名字的读法永远不上屏）、两族的族员
+# 与 `cog_core::roles` 各写各的（屏上的闭集总数比真正会调用模型的角色多出或少掉几个）。
 #
 # 最后一条断言是在**真树**上跑：夹具全绿而真树红，说明这条门只是在测自己。
 set -euo pipefail
@@ -34,7 +35,8 @@ fixture() {
   rm -rf "${work}/web" "${work}/crates"
   mkdir -p "${work}/web/src/api" "${work}/web/src/hooks" "${work}/web/src/overlay" \
     "${work}/web/src/topology" "${work}/web/src/ui" "${work}/web/src/styles" \
-    "${work}/web/src/observability" "${work}/crates/cog-gateway/src"
+    "${work}/web/src/observability" "${work}/crates/cog-gateway/src" \
+    "${work}/crates/cog-core/src"
   # 执行者的闭集：第 7 段跨这条边界比名单，所以夹具两侧都要有。
   cat >"${work}/crates/cog-gateway/src/actor_labels.rs" <<'EOF'
 pub const ACTOR_LABELS: &[&str] = &[
@@ -47,6 +49,18 @@ pub const ACTOR_LABEL_PREFIXES: &[&str] = &["agent:", "self_review:"];
 
 /// Where a caller that declared no usable actor lands.
 pub const UNKNOWN_ACTOR: &str = "unknown";
+EOF
+  # 两族的族员：`agent:<角色>` / `self_review:<角色>` 的族员是角色名，正本是
+  # `cog_core::roles::ALL` 减掉 `external-worker`（那是靠心跳占位的登记角色，
+  # 从不以 agent 身份调用模型）。夹具里少了这一侧，第 43 段起就没有可比的正本。
+  cat >"${work}/crates/cog-core/src/roles.rs" <<'EOF'
+pub const PLANNER: &str = "planner";
+
+pub const GENERATOR: &str = "generator";
+
+pub const EXTERNAL_WORKER: &str = "external-worker";
+
+pub const ALL: &[&str] = &[PLANNER, GENERATOR, EXTERNAL_WORKER];
 EOF
   cat >"${work}/web/src/topology/format.ts" <<'EOF'
 export function localZoneLabel(): string {
@@ -80,6 +94,8 @@ const ACTOR_MEANINGS: Record<string, string> = {
   web_chat: 'WebUI 对话',
   unknown: '没声明自己是谁',
 };
+export const AGENT_ROLES = ['planner', 'generator'];
+export const ACTOR_FAMILY_PREFIXES = ['agent:', 'self_review:'] as const;
 const UNKNOWN_ORIGIN = 'unknown';
 const UNKNOWN_ACTOR_NAME = 'unknown';
 const ACTOR: Dimension = {
@@ -764,6 +780,29 @@ grep -qF "td:first-child" "${work}/web/src/styles/tokens.css" \
   && fail "改动没落到 tokens.css：首列归零那条规则还在"
 confirm "${work}/web/src/styles/tokens.css" ".rail {"
 expect_red "表首列没归零" "没有把表首列的左边距归零"
+
+# 43. 角色的正本少一个族员、屏上还列着它：屏上的「闭集共 N 个」比平台真正会
+#     以 agent 身份调模型的角色多一个，而那个名字在表里永远「本窗口没有调用」。
+fixture
+sed -i 's/^pub const ALL: &\[&str\] = &\[PLANNER, GENERATOR, EXTERNAL_WORKER\];/pub const ALL: \&[\&str] = \&[PLANNER, EXTERNAL_WORKER];/' \
+  "${work}/crates/cog-core/src/roles.rs"
+confirm "${work}/crates/cog-core/src/roles.rs" "&[PLANNER, EXTERNAL_WORKER]"
+expect_red "族员名单漂了" "族员名单漂了"
+
+# 44. 前缀的正本少一族、屏上还画着它：那一族的每个名字都会出现在表里，而任何一次
+#     调用都不会落在那组名字上——屏上多出整整一族虚构的出入口。
+fixture
+sed -i "s/export const ACTOR_FAMILY_PREFIXES = \['agent:', 'self_review:'\] as const;/export const ACTOR_FAMILY_PREFIXES = ['agent:'] as const;/" \
+  "${work}/web/src/overlay/TokenPanel.tsx"
+confirm "${work}/web/src/overlay/TokenPanel.tsx" "ACTOR_FAMILY_PREFIXES = ['agent:']"
+expect_red "族的个数漂了" "族的个数与名字对不上"
+
+# 45. 角色的正本整个读不到：两族的族员没有可比的那一侧，这段比对在空转。
+#     空转必须红——它绿着的时候，屏上的族员数可以是任何一个数。
+fixture
+rm "${work}/crates/cog-core/src/roles.rs"
+[ -f "${work}/crates/cog-core/src/roles.rs" ] && fail "删不掉 roles.rs"
+expect_red "没有角色的正本" "找不到 roles::ALL"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
