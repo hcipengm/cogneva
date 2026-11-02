@@ -12,6 +12,8 @@
 #   4. 删掉默认的 1 GiB 地板：小阶段那一格必须红——否则 300→400 MiB 的噪声也会响；
 #   4d. 把折叠键从 `(phase, job)` 退回 `(phase)`：跨工作负载那一格必须红——否则应用会被
 #       拿去和同一批阶段名的进化 Pod 比，报出 47 倍而那是两个进程；
+#   4e. 把缓存命中率的折叠键从 `(actor, api_style)` 退回 `(actor)`：两个协议面那一格必须
+#       红——否则同一个角色健康的一面会把掉到地上的那一面加成一个中庸的数，一声不响；
 #   5. 夹具点名一条库里没有的规则：必须非零，而不是「没取到规则所以没判」；
 #   5b. 夹具目录里每一份 `cogneva-json-*.test.yaml` 都必须真跑绿——覆盖门只按夹具头
 #       记「已证明」，一份红着的或从没被执行过的夹具在它眼里与绿的完全一样；
@@ -100,6 +102,17 @@ mutate "${work}/c4d.json" 'rule["promql"] = rule["promql"].replace("max by (phas
 run "${work}/c4d.json"
 [ "$rc" -eq 1 ] && ok "退回只按 phase 折叠：单测红（跨工作负载的比值重新算数）" \
     || bad "退回只按 phase 折叠应红" "1" "$rc"
+
+# 4e) 把缓存命中率的折叠键从 `(actor, api_style)` 退回 `(actor)`：两个协议面那一格必须红。
+# 同一个角色的 prompt 会落到同一家的两个协议面上，两面的缓存行为可以差六倍（2026-11-02
+# 在账本上量的：OpenAI 兼容面 38.6%，Anthropic 面 6.2%，角色都一样）。只按 actor 折叠时，
+# 健康的一面把掉到地上的那一面加成 0.38，规则在那一小时一声不响——而那个面此刻正为每个
+# token 付全价。这一格证明缓存命中率那份夹具真的在为「面要分开判」站岗。
+cache_case="${repo}/deploy/k3s/observability/tests/cogneva-json-llm-cache-hit.test.yaml"
+mutate "${work}/c4e.json" 'rule["promql"] = rule["promql"].replace("sum by (actor, api_style)", "sum by (actor)").replace("and on (actor, api_style)", "and on (actor)").replace("max by (actor, api_style)", "max by (actor)")' llm_cache_hit_share_collapsed
+run "${work}/c4e.json" "${cache_case}"
+[ "$rc" -eq 1 ] && ok "退回只按 actor 折叠缓存命中率：单测红（健康的面会盖住掉到地上的面）" \
+    || bad "退回只按 actor 折叠缓存命中率应红" "1" "$rc"
 
 # 4b) 只改 `condition` 的阈值（表达式一个字节不动）：单测必须红。
 # 这一格的存在本身是那条判据：不把 condition 折进表达式，Prometheus 看到的是「表达式返回

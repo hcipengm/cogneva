@@ -74,3 +74,38 @@ tests:
       - eval_time: 4h
         alertname: llm_cache_hit_share_collapsed
         exp_alerts: []
+
+  # 一个角色，两个协议面，同一小时：OpenAI 兼容面 240,000 token 里 200,000 来自缓存
+  # （0.83，健康），Anthropic 面 280,000 token 一个都没命中（0，掉到地上）。两面各自
+  # 都过了量阈。
+  #
+  # 这一格钉的是「面要分开判」。把两面加起来读：520,000 里 200,000 = 0.38，健康得像
+  # 什么都没发生——而 Anthropic 面此刻正为每一个 token 付全价。2026-11-02 在账本上量到
+  # 的就是这个形状（同一家厂商两个面：38.6% 对 6.2%，角色都同），所以判据必须落在
+  # 面上，报告里也要点名是哪一个面。
+  - interval: 15m
+    input_series:
+      - series: 'llm_tokens_total{kind="cached",actor="a3",api_style="openai"}'
+        values: '0+50000x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="cached",actor="a3",api_style="openai"}'
+        values: '0+900x16'
+      - series: 'llm_tokens_total{kind="input",actor="a3",api_style="openai"}'
+        values: '0+10000x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a3",api_style="openai"}'
+        values: '0+900x16'
+      - series: 'llm_tokens_total{kind="cached",actor="a3",api_style="anthropic"}'
+        values: '0+0x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="cached",actor="a3",api_style="anthropic"}'
+        values: '0+900x16'
+      - series: 'llm_tokens_total{kind="input",actor="a3",api_style="anthropic"}'
+        values: '0+70000x16'
+      - series: 'llm_tokens_total_observed_timestamp_seconds{kind="input",actor="a3",api_style="anthropic"}'
+        values: '0+900x16'
+    alert_rule_test:
+      - eval_time: 4h
+        alertname: llm_cache_hit_share_collapsed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              actor: a3
+              api_style: anthropic

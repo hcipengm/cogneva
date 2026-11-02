@@ -33,7 +33,8 @@ use common::rules::rule_document;
 /// 是「这两格怎么用」的唯一一处白纸黑字，下一份读到它的人先看这里。
 const CACHED_READERS: &[(&str, &str)] = &[(
     "llm_cache_hit_share_collapsed",
-    "命中率 = cached / (input + cached)，只在分母过二十万 token 时判下界 0.15",
+    "命中率 = cached / (input + cached)，逐协议面各算一份（两个面合成一个数时，一个面\
+     的健康会盖住另一个面掉到地上），只在某一面的分母过二十万 token 时判该面下界 0.15",
 )];
 
 /// 规则库里每一条 `(名字, 表达式)`。
