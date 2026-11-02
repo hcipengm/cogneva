@@ -744,7 +744,7 @@ async fn an_upstream_that_left_the_pool_leaves_the_store() {
     let quiet = long_quiet();
     for (name, upstream, age_hours) in [
         // The roster: only `a` is still configured.
-        (cog_storage::ROSTER_SERIES, "a", 0.0),
+        (cog_storage::ROSTER_SERIES.as_str(), "a", 0.0),
         ("llm_upstream_healthy", "a", 0.0),
         // `b` left the pool: its last write is far behind the quiet bound.
         ("llm_upstream_healthy", "b", quiet),
@@ -804,7 +804,7 @@ async fn no_fresh_roster_releases_nothing() {
 
     for (name, age_hours) in [
         // The roster exists but is older than the freshness bound.
-        (cog_storage::ROSTER_SERIES, 24.0),
+        (cog_storage::ROSTER_SERIES.as_str(), 24.0),
         ("llm_upstream_healthy", long_quiet()),
     ] {
         insert_aged_samples(
@@ -855,7 +855,7 @@ async fn a_recent_row_survives_even_when_the_roster_does_not_name_it() {
     insert_aged_samples(
         &pool,
         &probe.samples,
-        cog_storage::ROSTER_SERIES,
+        cog_storage::ROSTER_SERIES.as_str(),
         r#"{"upstream":"a"}"#,
         0.0,
         1,

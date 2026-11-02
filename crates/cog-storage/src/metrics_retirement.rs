@@ -128,21 +128,25 @@ pub const SUPERSEDED_SHAPES: &[(&str, &str)] = &[
 /// 已经安静超过 [`SUPERSEDED_QUIET_SECS`]。名册不新鲜时**一条都不删**——名册缺席
 /// 不是「池空了」，那是写者停了或进程刚起，而按缺席删会把还活着的一族整族删掉。
 pub const ROSTERED_LABEL_SERIES: &[&str] = &[
-    "llm_upstream_healthy",
-    "llm_upstream_position",
-    "llm_upstream_shape_errored",
-    "llm_upstream_face_answers",
-    "llm_upstream_quota_window_secs",
-    "llm_upstream_quota_reset_unix",
-    "llm_upstream_consecutive_failures",
-    "llm_upstream_refusal_kind",
-    "llm_pool_upstream_with_ruler",
-    "llm_temperature_verdict_measured",
-    "llm_tool_calls_verdict_measured",
+    cog_core::metric_names::LLM_UPSTREAM_HEALTHY.as_str(),
+    cog_core::metric_names::LLM_UPSTREAM_POSITION.as_str(),
+    cog_core::metric_names::LLM_UPSTREAM_SHAPE_ERRORED.as_str(),
+    cog_core::metric_names::LLM_UPSTREAM_FACE_ANSWERS.as_str(),
+    cog_core::metric_names::LLM_UPSTREAM_QUOTA_WINDOW_SECS.as_str(),
+    cog_core::metric_names::LLM_UPSTREAM_QUOTA_RESET_UNIX.as_str(),
+    cog_core::metric_names::LLM_UPSTREAM_CONSECUTIVE_FAILURES.as_str(),
+    cog_core::metric_names::LLM_UPSTREAM_REFUSAL_KIND.as_str(),
+    cog_core::metric_names::LLM_POOL_UPSTREAM_WITH_RULER.as_str(),
+    cog_core::metric_names::LLM_TEMPERATURE_VERDICT_MEASURED.as_str(),
+    cog_core::metric_names::LLM_TOOL_CALLS_VERDICT_MEASURED.as_str(),
 ];
 
 /// 上面这一族共用的名册序列，以及它用来指认一条上游的那个标签。
-pub const ROSTER_SERIES: &str = "llm_upstream_position";
+///
+/// 序列名读的是声明本身：这一族每一条都是 `metric_names` 登记过的名字，在这里再拼
+/// 一遍就是第二个写者——改名只落到一处时，读旧拼写的那一侧照旧去找一个再也不会
+/// 出现的东西，而「没找到」与「本来就没有」在读数上同形。
+pub use cog_core::metric_names::LLM_UPSTREAM_POSITION as ROSTER_SERIES;
 pub const ROSTER_LABEL: &str = "upstream";
 
 /// 名册的一行要有多新，才算「写者这一拍确实在说话」。
@@ -526,7 +530,7 @@ impl MetricsRetirement {
             None => Ok(sqlx::query(&sql)
                 .bind(&names)
                 .bind(ROSTER_LABEL)
-                .bind(ROSTER_SERIES)
+                .bind(ROSTER_SERIES.as_str())
                 .bind(fresh)
                 .bind(quiet)
                 .execute(&self.pool)
@@ -539,7 +543,7 @@ impl MetricsRetirement {
                     let deleted = sqlx::query(&sql)
                         .bind(&names)
                         .bind(ROSTER_LABEL)
-                        .bind(ROSTER_SERIES)
+                        .bind(ROSTER_SERIES.as_str())
                         .bind(fresh)
                         .bind(quiet)
                         .bind(RELEASE_BATCH)
