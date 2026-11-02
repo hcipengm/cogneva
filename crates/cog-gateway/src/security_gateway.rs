@@ -2063,6 +2063,8 @@ struct AppState {
     /// 自上次池判定以来是否有**一件真实的活**被承接。探测 ping 不算：它只证明这家
     /// 还肯回一个 token。这一格只喂 [`pool_alert_verdict`]，不参与准入判定。
     pool_served_job: Arc<AtomicBool>,
+    /// 本进程是否已经从 PG 接过开着的池告警行。一次就够，见 `sync_pool_alert`。
+    pool_alert_seeded: Arc<AtomicBool>,
     /// 最近一次**真实请求**被判失败的时刻（unix 秒），0 = 本进程还没见过。
     ///
     /// 与探测的结果分开记，因为两者的证据强度不同：一条 `max_tokens: 1` 的 ping
@@ -4527,6 +4529,18 @@ async fn sync_pool_alert(state: &AppState, down: bool) {
             return;
         }
     };
+    // 进程刚起来时，PG 里那条开着的行本身就是"这一池还在断供"的凭据：这一代进程
+    // 没看见那次下沿，健康表可能只恢复出一段已经到期的嫌疑窗，两样合起来正好读成
+    // "没人在供、也没断供过"。第一次读到开着的行就把告警锁存接过来；这一拍的判词
+    // 是按没接上的锁存算的，所以判成"可以关"也要跳过，下一拍再按接上的算。
+    // 不跳过的话，一次滚动升级正好落在准入试探的那一分钟里，就会替一次还在持续的
+    // 断供关掉那一行——重启不该比进程内的一条锁存更有权威。
+    if !state.pool_alert_seeded.swap(true, Ordering::SeqCst) && open_key.is_some() {
+        state.pool_alert_down.store(true, Ordering::SeqCst);
+        if !down {
+            return;
+        }
+    }
     let bounds = state
         .llm_health
         .recovery_bounds(&state.config.llm_upstreams);
@@ -9741,6 +9755,7 @@ pub async fn run(
         pool_recovered: Arc::new(AtomicBool::new(false)),
         pool_alert_down: Arc::new(AtomicBool::new(false)),
         pool_served_job: Arc::new(AtomicBool::new(false)),
+        pool_alert_seeded: Arc::new(AtomicBool::new(false)),
         last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pool_seeded: Arc::new(AtomicBool::new(false)),
         window_pace: Arc::new(std::sync::Mutex::new(WindowPaceReading::default())),
@@ -12877,6 +12892,72 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert!(!state.pool_down.load(Ordering::SeqCst));
     }
 
+    /// 池告警对账用的假告警面：记下每次对账的 condition，`firing` 回答"PG 里开着
+    /// 哪一行"。判据落在实际写进去的那一格上，而不是进程内的某个字段——字段对、
+    /// 调用点仍旧传错也是要拦的坏法。
+    #[derive(Default)]
+    struct RecordingPoolAlertSink {
+        calls: std::sync::Mutex<Vec<(bool, String)>>,
+        firing: Option<String>,
+    }
+
+    impl RecordingPoolAlertSink {
+        fn with_open_row(key: &str) -> Self {
+            Self {
+                calls: Default::default(),
+                firing: Some(key.to_string()),
+            }
+        }
+
+        fn last_condition(&self) -> Option<bool> {
+            self.calls.lock().unwrap().last().map(|c| c.0)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::PersistentAlertSink for RecordingPoolAlertSink {
+        async fn set_persistent_alert(
+            &self,
+            condition: bool,
+            draft: &cog_core::PersistentAlertDraft,
+        ) -> Result<cog_core::AlertTransition, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((condition, draft.message.clone()));
+            Ok(if condition {
+                cog_core::AlertTransition::Fired
+            } else {
+                cog_core::AlertTransition::Resolved
+            })
+        }
+        async fn firing_key_for_rule(&self, _rule: &str) -> Result<Option<String>, String> {
+            Ok(self.firing.clone())
+        }
+        async fn list_active_persistent_alerts(
+            &self,
+            _rule_prefix: &str,
+            _limit: i64,
+        ) -> Vec<cog_core::PersistedAlert> {
+            Vec::new()
+        }
+    }
+
+    fn with_alert_sink(
+        mut state: AppState,
+        alerts: Arc<dyn cog_core::PersistentAlertSink>,
+    ) -> AppState {
+        state.pool_obs = Arc::new(PoolObservability {
+            metrics: state.pool_obs.metrics.clone(),
+            analytics: None,
+            alerts: Some(alerts),
+            usage: None,
+            usage_write_health: state.pool_obs.usage_write_health.clone(),
+            durable: None,
+        });
+        state
+    }
+
     /// 探测放开的只是准入，告警不许跟着说"已恢复"。
     ///
     /// 池锁着的时候 LLM 依赖型任务全停，真实请求一条都没有——"探测窗内没有真实
@@ -12886,55 +12967,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 恢复作证。真实承接成功才是告警的解除凭据。
     #[tokio::test]
     async fn a_probe_pass_opens_admission_without_claiming_the_pool_recovered() {
-        use cog_core::{AlertTransition, PersistentAlertDraft, PersistentAlertSink};
-
-        /// 只记下每次对账的 (condition, message)，判据落在实际写进告警面的那一格上，
-        /// 而不是进程内的某个字段——字段对、调用点仍旧传错也是要拦的坏法。
-        #[derive(Default)]
-        struct RecordingSink {
-            calls: std::sync::Mutex<Vec<(bool, String)>>,
-        }
-
-        #[async_trait::async_trait]
-        impl PersistentAlertSink for RecordingSink {
-            async fn set_persistent_alert(
-                &self,
-                condition: bool,
-                draft: &PersistentAlertDraft,
-            ) -> Result<AlertTransition, String> {
-                self.calls
-                    .lock()
-                    .unwrap()
-                    .push((condition, draft.message.clone()));
-                Ok(if condition {
-                    AlertTransition::Fired
-                } else {
-                    AlertTransition::Resolved
-                })
-            }
-            async fn firing_key_for_rule(&self, _rule: &str) -> Result<Option<String>, String> {
-                Ok(Some("llm_upstream_pool_down@1".into()))
-            }
-            async fn list_active_persistent_alerts(
-                &self,
-                _rule_prefix: &str,
-                _limit: i64,
-            ) -> Vec<cog_core::PersistedAlert> {
-                Vec::new()
-            }
-        }
-
-        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
         let u = stub_upstream("https://a.example.com", "m1");
-        let sink = Arc::new(RecordingSink::default());
-        state.pool_obs = Arc::new(PoolObservability {
-            metrics: state.pool_obs.metrics.clone(),
-            analytics: None,
-            alerts: Some(sink.clone()),
-            usage: None,
-            usage_write_health: state.pool_obs.usage_write_health.clone(),
-            durable: None,
-        });
+        let sink = Arc::new(RecordingPoolAlertSink::default());
+        let state = with_alert_sink(test_state(vec![u.clone()]), sink.clone());
 
         state
             .llm_health
@@ -12942,11 +12977,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         refresh_pool_state(&state).await;
         assert!(state.pool_down.load(Ordering::SeqCst));
         assert!(state.pool_alert_down.load(Ordering::SeqCst));
-        assert_eq!(
-            sink.calls.lock().unwrap().last().map(|c| c.0),
-            Some(true),
-            "低于下限要开一行"
-        );
+        assert_eq!(sink.last_condition(), Some(true), "低于下限要开一行");
 
         // 探测复通：准入解开（不放开就是死锁，没人能再试），告警不解。
         assert!(
@@ -12963,10 +12994,10 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "ping 通了不是承接证据，告警不许替一次没发生的恢复关闭"
         );
         assert_eq!(
-            sink.calls.lock().unwrap().last().map(|c| c.0),
+            sink.last_condition(),
             Some(true),
-            "准入被探测放开的那一拍，对告警面的对账必须仍是 firing；\
-             否则一次断供会被切成每十分钟一行，每行都声称已恢复：{:?}",
+            "准入被探测放开的那一拍，对告警面的对账必须仍是 firing，\
+             否则一次断供会被切成每十分钟一行、每行都声称已恢复：{:?}",
             sink.calls.lock().unwrap()
         );
 
@@ -12975,9 +13006,43 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         refresh_pool_state(&state).await;
         assert!(!state.pool_alert_down.load(Ordering::SeqCst));
         assert_eq!(
-            sink.calls.lock().unwrap().last().map(|c| c.0),
+            sink.last_condition(),
             Some(false),
             "真实承接成功之后才关这一行"
+        );
+    }
+
+    /// 滚动升级正好落在准入试探的那一分钟里，不许替还在持续的断供关掉那一行。
+    ///
+    /// 新进程的健康表是空的：没人在供，也没有任何一处证据说"断过"。PG 里开着的那
+    /// 一行因此是这一代进程唯一的凭据——不接过来，一次重启就等于给了断供一次
+    /// 「已恢复」，而这正是告警行按事件分行要避免的形状。
+    #[tokio::test]
+    async fn a_restart_that_reads_an_open_row_keeps_the_pool_alert_firing() {
+        let sink = Arc::new(RecordingPoolAlertSink::with_open_row(
+            "llm_upstream_pool_down@1",
+        ));
+        let state = with_alert_sink(
+            test_state(vec![stub_upstream("https://a.example.com", "m1")]),
+            sink.clone(),
+        );
+
+        refresh_pool_state(&state).await;
+        assert!(
+            state.pool_alert_down.load(Ordering::SeqCst),
+            "PG 里开着的那一行要把告警锁存接过来"
+        );
+        assert_eq!(
+            sink.last_condition(),
+            None,
+            "接过锁存的那一拍不按旧判词对账"
+        );
+
+        refresh_pool_state(&state).await;
+        assert_eq!(
+            sink.last_condition(),
+            Some(true),
+            "第二拍仍按未承接对账，不许把那一行关掉"
         );
     }
 
@@ -15739,6 +15804,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             pool_recovered: Arc::new(AtomicBool::new(false)),
             pool_alert_down: Arc::new(AtomicBool::new(false)),
             pool_served_job: Arc::new(AtomicBool::new(false)),
+            pool_alert_seeded: Arc::new(AtomicBool::new(false)),
             last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pool_seeded: Arc::new(AtomicBool::new(true)),
             window_pace: Arc::new(std::sync::Mutex::new(WindowPaceReading::default())),
