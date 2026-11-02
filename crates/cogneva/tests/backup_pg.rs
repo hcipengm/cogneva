@@ -27,7 +27,9 @@ use common::routes::repo_root;
 
 use sqlx::PgPool;
 
-use cogneva::backup::{backup_postgres, claim_drill_lock, discover_tables, restore_postgres};
+use cogneva::backup::{
+    backup_postgres, claim_drill_lock, discover_tables, drop_scratch_database, restore_postgres,
+};
 
 use cog_test_support::database_url;
 
@@ -836,5 +838,96 @@ async fn the_drill_schema_builds_on_a_role_without_the_superuser_bit() {
     );
 
     pool.close().await;
+    drop_restricted_database(&admin, ROLE, DB).await;
+}
+
+/// 演练库上留着一个**这条连接没有权限发信号**的会话时，清库必须照样试着去删，
+/// 并且把占着库的人指名道姓地报出来。
+///
+/// 原先的实现逐个 `pg_terminate_backend` 并让错误往上冒：对带超级用户位的会话它会
+/// 直接报 `permission denied to terminate process`，而这句错误之后紧随的
+/// `DROP DATABASE` 一次都没执行。现场形状（2026-11-02 03:52:46 与 03:54:22 两次）：
+/// 上一趟演练的收尾杀不掉自己的连接，残库留到下一趟；下一趟**在打开包之前**就被
+/// 这句权限错误挡住，报出来的却是「演练没有证明这个包可恢复」——把一个「没开工」
+/// 写成了一个关于包的结论。
+///
+/// 这条腿要的形状只有真库能造：一个非超级用户的调用者、一个超级用户的会话、一个
+/// 属于调用者的一次性库。断言落在三件事上——错误文本点名了占着库的用户、给出了
+/// 「这些连接不由当前角色控制」这个结论、那条别人的会话没有被掐掉。
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn a_backend_the_reaper_may_not_signal_is_named_rather_than_raised_as_a_permission_error() {
+    const ROLE: &str = "cog_restore_probe_reaper";
+    const DB: &str = "cog_restore_probe_reaper_own";
+    const SCRATCH: &str = "cog_restore_probe_scratch";
+
+    let base = database_url();
+    let cut = base
+        .rfind('/')
+        .expect("a database URL has a path holding the database name");
+    let server = &base[..cut];
+
+    // 上一次跑在这条腿上挂掉时，那个库还挂在角色名下：角色因此删不掉，而这个
+    // 测试要建的正是同一个角色名。先清现场，`restricted_role_database` 只清它自己
+    // 那一个库。
+    {
+        let admin = PgPool::connect(&format!("{server}/postgres"))
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP DATABASE IF EXISTS {SCRATCH} WITH (FORCE)"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        sqlx::query(&format!("DROP ROLE IF EXISTS {ROLE}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+    }
+
+    let (admin, low, _url) = restricted_role_database(ROLE, DB).await;
+    let superuser: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+    // 属主是受限角色：`DROP DATABASE` 的权限那一关要能过，剩下的失败才只可能来自
+    // 那条清不掉的会话，测试才是在说它想说的事。
+    sqlx::query(&format!("CREATE DATABASE {SCRATCH} OWNER {ROLE}"))
+        .execute(&admin)
+        .await
+        .unwrap();
+
+    // 超级用户的会话挂在要删的库上，直到这条腿自己关掉它。
+    let holder = PgPool::connect(&format!("{server}/{SCRATCH}"))
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1").execute(&holder).await.unwrap();
+
+    let err = drop_scratch_database(&low, SCRATCH)
+        .await
+        .expect_err("超级用户的会话挂着时，删库不可能成功");
+    assert!(
+        err.contains(&format!("删不掉 {SCRATCH}")),
+        "错误文本说的得是「库删不掉」：{err}"
+    );
+    assert!(
+        err.contains("还挂着") && err.contains(&superuser),
+        "错误文本必须点名是谁占着库（{superuser}）：{err}"
+    );
+    assert!(
+        err.contains("不由当前角色控制"),
+        "错误文本要给出结论——库删不了是因为别人还连在上面——而不是让人去查一句\
+         「permission denied」自己的权限：{err}"
+    );
+    sqlx::query("SELECT 1")
+        .execute(&holder)
+        .await
+        .expect("清库不许掐掉它没有权限发的信号：那条会话必须还在");
+
+    holder.close().await;
+    sqlx::query(&format!("DROP DATABASE IF EXISTS {SCRATCH} WITH (FORCE)"))
+        .execute(&admin)
+        .await
+        .unwrap();
     drop_restricted_database(&admin, ROLE, DB).await;
 }

@@ -4323,23 +4323,115 @@ fn with_database(url: &str, database: &str) -> String {
     }
 }
 
-/// 删掉演练库，连同它上面可能还挂着的连接。
+/// 临时库上一条挂着不走、这一次清不掉的连接。
+///
+/// 只记判断要用到的三格：是不是这条连接有权发信号、以及报给人看时能指名道姓的
+/// 用户与状态。
+struct ScratchBackend {
+    pid: i32,
+    user: String,
+    state: String,
+    signalable: bool,
+}
+
+impl ScratchBackend {
+    fn describe(&self) -> String {
+        format!("pid={} user={} state={}", self.pid, self.user, self.state)
+    }
+}
+
+/// 删掉一个一次性数据库，连同它上面可能还挂着的连接。
 ///
 /// `DROP DATABASE` 在有别的连接时拒绝执行，而崩溃过一次的演练会在服务端留下
 /// 一个自己的连接直到 TCP 超时。先掐掉再删，否则「重新开始」会被上一次的残骸
 /// 挡住，且挡住的形状是一个数据库错误而不是「上次没清干净」。
-async fn drop_drill_database(live: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
-         WHERE datname = $1 AND pid <> pg_backend_pid()",
-    )
-    .bind(DRILL_DATABASE)
-    .execute(live)
-    .await?;
-    sqlx::query(&format!("DROP DATABASE IF EXISTS {DRILL_DATABASE}"))
+///
+/// **掐得动的才掐**：`pg_terminate_backend` 对不属于自己的角色（尤其带超级用户位
+/// 的角色）会让整条语句报错，而报错之后紧随其后的 `DROP DATABASE` 一次都不执行。
+/// 于是一个别的角色留在演练库上的连接，会被读成「上一次没清干净」，而报出来的
+/// 是一句权限错误——既指不出是谁占着，也说不清删没删过。实测 2026-11-02
+/// 03:52:46 与 03:54:22 两次：`Only roles with the SUPERUSER attribute may
+/// terminate processes of roles with the SUPERUSER attribute`，一趟演练因此
+/// 在打开包之前就判了「这个包不可恢复」。
+///
+/// 所以这里只挑这条连接确实有权发信号的 pid，把清不掉的留在错误文本里点名。
+///
+/// 库名由调用方给：这条路径对「一次性数据库」通用，演练只是它的一个调用者，
+/// 而测试必须能用一个自己的库名跑，不能去动服务端上真在用的那个。
+pub async fn drop_scratch_database(live: &PgPool, database: &str) -> Result<(), String> {
+    let backends = backends_on(live, database).await?;
+    for backend in backends.iter().filter(|b| b.signalable) {
+        if let Err(e) = sqlx::query("SELECT pg_terminate_backend($1)")
+            .bind(backend.pid)
+            .execute(live)
+            .await
+        {
+            // 挑过权限之后仍可能失败（进程刚退出、语句正处在不可中断的段里）。
+            // 那几种都由下面那一问回答，不需要在这里提前收场。
+            tracing::warn!(pid = backend.pid, error = %e, "演练库上的连接没掐掉");
+        }
+    }
+    // `WITH (FORCE)` 收掉掐信号与 DROP 之间新冒出来的同角色连接：两步之间池子
+    // 的后台关闭正好落地时，就是这一步差。它挡不住别的角色的连接——那一档要
+    // 由上面那次筛选和下面这句错误文本回答。
+    if let Err(e) = sqlx::query(&format!("DROP DATABASE IF EXISTS {database} WITH (FORCE)"))
         .execute(live)
-        .await?;
+        .await
+    {
+        let left = backends_on(live, database).await.unwrap_or_default();
+        let who = if left.is_empty() {
+            "此刻没有别的连接".to_string()
+        } else {
+            // 全都不由当前角色控制时，`WITH (FORCE)` 自己的报错也是一句权限错误：
+            // 读的人会去查「为什么我没有权限删这个库」，而真相是「库删不了是因为
+            // 别人还连在上面，只能等它自己断」。把结论写在括号里，别让他去猜。
+            let all_foreign = left.iter().all(|b| !b.signalable);
+            let list = left
+                .iter()
+                .map(ScratchBackend::describe)
+                .collect::<Vec<_>>()
+                .join("；");
+            if all_foreign {
+                format!("还挂着：{list}（这些连接不由当前角色控制，只能等它们自己断开）")
+            } else {
+                format!("还挂着：{list}")
+            }
+        };
+        return Err(format!("删不掉 {database}：{e}（{who}）"));
+    }
     Ok(())
+}
+
+/// 那个库上此刻的连接。
+///
+/// `signalable` 是这条连接能不能对那个 pid 发信号：自己是超级用户时全都算；否则
+/// 只有与自己同角色的进程算。`usesysid` 为空的是后台进程（自动清理一类），非超级
+/// 用户碰不得，所以也落在不可发信号那一档——把它算成可发信号，整条语句又会因为
+/// 一个不是连接的东西而失败。
+async fn backends_on(live: &PgPool, database: &str) -> Result<Vec<ScratchBackend>, String> {
+    let rows: Vec<(i32, Option<String>, Option<String>, bool)> = sqlx::query_as(
+        "SELECT a.pid, a.usename::text, a.state, \
+                coalesce((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false) \
+                    OR (a.usesysid IS NOT NULL \
+                        AND pg_has_role(current_user, a.usesysid, 'MEMBER')) AS signalable \
+         FROM pg_stat_activity a \
+         WHERE a.datname = $1 AND a.pid <> pg_backend_pid()",
+    )
+    .bind(database)
+    .fetch_all(live)
+    .await
+    .map_err(|e| format!("读不到 {database} 上的连接：{e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|(pid, user, state, signalable)| ScratchBackend {
+            pid,
+            user: user
+                .filter(|u| !u.is_empty())
+                .unwrap_or_else(|| "(后台进程)".to_string()),
+            state: state.unwrap_or_else(|| "-".to_string()),
+            signalable,
+        })
+        .collect())
 }
 
 /// `backup_runs` 逐格比对的摘要：把给定标识的那些行按列文本拼起来取 md5。
@@ -4508,7 +4600,7 @@ pub async fn run_drill(cfg: &DrillConfig, live: &PgPool) -> BackupDrillRecord {
             mark_pass_timed_out(&mut drill, cfg.pass_budget);
             // 临时库这一趟是收不了尾了。下一次开工本来也会先删它，但一份照着包大小
             // 铺开的残库不该留到明晚：删不掉也只是警告，那本来就是下一趟的第一次开工。
-            if let Err(e) = drop_drill_database(live).await {
+            if let Err(e) = drop_scratch_database(live, DRILL_DATABASE).await {
                 tracing::warn!(error = %e, "演练超时的临时库没删掉，下一次开工时会再删一次");
             }
         }
@@ -4725,7 +4817,12 @@ async fn drill_once(
 
     // 空库：先删上一次的残骸，再建。删在建之前而不是用完就删，是因为「崩溃
     // 留下了一份旧数据」和「这次装回来的数据」混在一起时，计数会照样对得上。
-    drop_drill_database(live).await?;
+    // 清不掉上一趟的残库时，这一趟其实**连包都没打开**：报出来的话要说「开工
+    // 没开始」，不能说成「这个包装不回去」。两件事的修法差得很远——一处是清理，
+    // 一处是包——而一句「演练没有证明这个包可恢复」会把前者写成后者。
+    drop_scratch_database(live, DRILL_DATABASE)
+        .await
+        .map_err(|e| format!("上一趟演练的临时库清不掉，这一趟没有开工：{e}"))?;
     sqlx::query(&format!("CREATE DATABASE {DRILL_DATABASE}"))
         .execute(live)
         .await?;
@@ -4739,7 +4836,7 @@ async fn drill_once(
 
     let result = restore_and_compare(cfg, live, &scratch_url, &pkg_dir, &manifest, drill).await;
     // 无论成败都把库删掉：留着它下一次会先删，但磁盘里那份 1 GB 的残库会一直在。
-    if let Err(e) = drop_drill_database(live).await {
+    if let Err(e) = drop_scratch_database(live, DRILL_DATABASE).await {
         tracing::warn!(error = %e, "drill: 临时库没删掉，下一次演练开工时会再删一次");
     }
     drop(tree);
