@@ -78,9 +78,10 @@ pub use postgres::{
     PostgresChangeLedgerStore, PostgresChatTurnStore, PostgresDatasetCatalog,
     PostgresDecisionStatsStore, PostgresGovernanceStore, PostgresHookArchive,
     PostgresMetricsBackend, PostgresNotificationStore, PostgresObservabilityGateway,
-    PostgresPrincipleLedgerStore, PostgresRawLogIndexStore, PostgresResourceEventStore,
-    PostgresSnapshotStore, PostgresStateBackend, PostgresTasteIntentStore, PostgresUserStore,
-    SendOutcome, EVENTS_PAGE_SQL, ROWS_KEPT_PER_PEER, ROWS_KEPT_PER_SESSION,
+    PostgresPgeStageStore, PostgresPrincipleLedgerStore, PostgresRawLogIndexStore,
+    PostgresResourceEventStore, PostgresSnapshotStore, PostgresStateBackend,
+    PostgresTasteIntentStore, PostgresUserStore, SendOutcome, EVENTS_PAGE_SQL, ROWS_KEPT_PER_PEER,
+    ROWS_KEPT_PER_SESSION,
 };
 
 #[cfg(feature = "redis")]

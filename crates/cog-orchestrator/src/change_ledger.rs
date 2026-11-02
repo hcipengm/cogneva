@@ -965,7 +965,7 @@ fn dispatch_task(row: &ChangeLedgerRow, generation: u32) -> Task {
             "goal": dispatch_goal(row),
             (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
             (cog_core::INPUT_TASK_KIND): DISPATCH_TASK_KIND,
-            "change_identity": {
+            (cog_core::INPUT_CHANGE_IDENTITY): {
                 "kind": row.identity.kind,
                 "scope": row.identity.scope,
                 "literal": row.identity.literal,

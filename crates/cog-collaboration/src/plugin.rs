@@ -76,6 +76,7 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             let agent_manager = ctx.consume_service::<dyn cog_core::AgentManager>();
             let skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
             let state_backend = ctx.consume_service::<dyn cog_core::StateBackend>();
+            let stage_store = ctx.consume_service::<dyn cog_core::PgeStageStore>();
 
             // self_review / pge / boundary 是 cog-collaboration 自有配置段，
             // 自读 cogneva.json（core config.rs 不聚合单 crate 配置）。
@@ -92,10 +93,17 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
                 collab = collab.with_pge_schemas(pge.schemas.clone());
             }
             collab = collab.with_local_repair_max(pge.local_repair_max);
-            // 每一轮生成的 diff 在评估之前就落到那块跨重启的盘上：这条流水线
-            // 一次运行要串起最多七通推理调用，任何一通因为上游配额耗尽而失败
-            // 都会把已经付过费的那份 diff 一起带走。
-            collab = collab.with_generation_dir(pge.envelope_dir());
+            // 每个阶段产物在下一通调用之前就记下来：这条流水线一次运行要串起
+            // 最多七通推理调用，任何一通因为上游配额耗尽而失败都会把已经付过费
+            // 的计划、diff 与判词一起带走——而下一趟还会再买一遍。
+            match stage_store {
+                Some(store) => collab = collab.with_stage_store(store),
+                None => warn!(
+                    "no PGE stage-product store published; a run that dies between two \
+                     inference calls loses its plan, diff and verdict and the next pass \
+                     buys them again"
+                ),
+            }
 
             collab = collab.with_ralph_config(crate::RalphSettings::load()?.to_loop_config());
 

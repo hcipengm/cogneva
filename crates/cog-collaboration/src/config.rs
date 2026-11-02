@@ -49,14 +49,6 @@ fn load_pointer<T: serde::de::DeserializeOwned>(path: &Path, pointer: &str) -> S
     }
 }
 
-/// 变更队列目录在没人配置时的取值，与 `cog_core` 的默认值同一个字符串。
-const DEFAULT_CHANGE_DIR: &str = "./evolution-changes";
-
-/// 生成信封目录的默认位置。
-fn default_envelope_dir(change_dir: &str) -> std::path::PathBuf {
-    std::path::Path::new(change_dir).join("generations")
-}
-
 /// Self-review quality gate configuration for PGE actors.
 /// Disabled by default so existing behavior is unchanged unless opted in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,11 +117,6 @@ pub struct PgeSettings {
     /// path off, and then every failure pays for a fresh plan even when the
     /// failure lies in a generation the plan already described.
     pub local_repair_max: u32,
-    /// 每一轮生成的信封落到哪个目录。未配置时落在
-    /// `<self_evolution.change_dir>/generations`——生成信封是和变更队列一起
-    /// 要跨重启活下来的东西，默认就该放在同一块盘上。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub envelope_dir: Option<String>,
 }
 
 /// The repair budget a run gets when nothing sets one. Two, not one and not
@@ -150,8 +137,8 @@ impl Default for PgeSettings {
     fn default() -> Self {
         Self {
             schemas: HashMap::new(),
+
             local_repair_max: DEFAULT_LOCAL_REPAIR_MAX,
-            envelope_dir: None,
         }
     }
 }
@@ -163,28 +150,6 @@ impl PgeSettings {
 
     pub fn load_from(path: &Path) -> SFResult<Self> {
         load_section_from(path, "/pge")
-    }
-
-    /// 信封目录，未配置时落在变更队列旁边。
-    ///
-    /// 默认值从同一份配置里的 `self_evolution.change_dir` 算，而不是写死一个
-    /// 相对路径：变更队列可以换盘，换了之后信封必须跟着换——它们要一起跨重启
-    /// 活下来，落在两块盘上就等于没落。
-    pub fn envelope_dir(&self) -> std::path::PathBuf {
-        self.envelope_dir_beside(Path::new(&cog_core::paths::config_file()))
-    }
-
-    /// 同 [`PgeSettings::envelope_dir`]，但以 `config_path` 为「同一份配置」。
-    pub fn envelope_dir_beside(&self, config_path: &Path) -> std::path::PathBuf {
-        if let Some(dir) = self.envelope_dir.as_deref() {
-            if !dir.trim().is_empty() {
-                return std::path::PathBuf::from(dir);
-            }
-        }
-        let change_dir: Option<String> = load_pointer(config_path, "/self_evolution/change_dir")
-            .ok()
-            .flatten();
-        default_envelope_dir(change_dir.as_deref().unwrap_or(DEFAULT_CHANGE_DIR))
     }
 
     /// Return the configured schema for `actor`, if any.
@@ -288,55 +253,6 @@ mod tests {
         // not overrule the deployment.
         std::fs::write(&path, r#"{"pge": {"local_repair_max": 0}}"#).unwrap();
         assert_eq!(PgeSettings::load_from(&path).unwrap().local_repair_max, 0);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// 生成信封默认落在变更队列旁边，队列换盘它就跟着换。
-    ///
-    /// 写死一个相对路径也「能跑」，但队列一旦被指到别的卷上，信封会留在旧卷
-    /// 里——而信封存在的全部意义是「运行断掉之后那份 diff 还在」，落在另一块
-    /// 盘上就等于没落。
-    #[test]
-    fn the_generation_envelope_default_follows_the_change_queue() {
-        let dir = std::env::temp_dir().join(format!("cog-collab-envelope-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("cogneva.json");
-
-        std::fs::write(&path, r#"{"pge": {}}"#).unwrap();
-        assert_eq!(
-            PgeSettings::load_from(&path)
-                .unwrap()
-                .envelope_dir_beside(&path),
-            Path::new(DEFAULT_CHANGE_DIR).join("generations"),
-            "no change_dir configured: the envelope follows the built-in queue location"
-        );
-
-        std::fs::write(
-            &path,
-            r#"{"self_evolution": {"change_dir": "/vol/changes"}, "pge": {}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            PgeSettings::load_from(&path)
-                .unwrap()
-                .envelope_dir_beside(&path),
-            Path::new("/vol/changes").join("generations"),
-            "a queue moved to another volume takes its generations directory with it"
-        );
-
-        std::fs::write(
-            &path,
-            r#"{"self_evolution": {"change_dir": "/vol/changes"}, "pge": {"envelope_dir": "/envelopes"}}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            PgeSettings::load_from(&path)
-                .unwrap()
-                .envelope_dir_beside(&path),
-            Path::new("/envelopes"),
-            "an explicit location is not overruled by the default"
-        );
-
         std::fs::remove_dir_all(&dir).ok();
     }
 

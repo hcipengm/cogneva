@@ -110,28 +110,49 @@ pub struct PgePipeline {
     archive: Option<GenerationArchive>,
 }
 
-/// Where each generation of a task is written down as it is produced.
+/// Where each stage of a task's run is written down as it is produced.
 ///
-/// The diff a generator produces is the only part of a run that cannot be
-/// bought again for nothing: the plan, the evaluation and the repair feedback
-/// are all cheap relative to it, and a run that dies after producing it (an
-/// upstream quota running out mid-pass is the observed case) has already paid
-/// for the expensive half. Keeping it only in memory means that payment is
-/// thrown away by the next inference call that fails — the run returns an
-/// error and the diff, complete and buildable, is dropped with it.
+/// A run is a chain of up to seven inference calls, and every one of them
+/// produces something the next one consumes and nobody can rebuild for free.
+/// Keeping them only in memory means a run that dies halfway — an upstream
+/// quota running out between two calls is the observed case — throws away
+/// everything it had already paid for, and the next pass over the same task
+/// buys the same bytes again.
 ///
-/// One directory per `(task, generation)`, one file per stage inside it. The
-/// file is rewritten as each stage completes, so a reader always finds the
-/// furthest point this generation reached without having to ask the process
-/// that wrote it — and the next pass over the same task starts from there
-/// instead of buying the same bytes again.
+/// One row per `(task, generation, repair iteration, stage)`. The row is
+/// rewritten when the same stage is reached a second time, so a reader always
+/// finds how far this generation got without having to ask the process that
+/// wrote it — and the next pass over the same task starts from there instead of
+/// buying the same bytes again.
 ///
-/// Everything it needs is on the persistent volume the change queue already
-/// uses, so the bytes survive the process as well as the run.
-#[derive(Debug, Clone)]
+/// The rows live in the same database as the change ledger, keyed by the task's
+/// own id, which a dispatched change already fixes from its identity. The
+/// previous form of this kept one file per generation on the evolution volume;
+/// a local volume is bound to the node it was written on and invisible to every
+/// reader except the process that owns the directory.
+#[derive(Clone)]
 pub struct GenerationArchive {
-    dir: std::path::PathBuf,
+    store: std::sync::Arc<dyn cog_core::PgeStageStore>,
     task_id: String,
+}
+
+impl std::fmt::Debug for GenerationArchive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerationArchive")
+            .field("task_id", &self.task_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What an earlier pass over this task already bought for one generation.
+///
+/// Three independent halves, because a run can stop between any two of them: a
+/// plan with no generation is a planner that was paid for and a generator that
+/// never reached its upstream, and the next pass should buy only the second.
+struct ResumedAttempt {
+    plan: Option<PlannerOutput>,
+    generation: Option<GeneratorOutput>,
+    evaluation: Option<EvaluationResult>,
 }
 
 /// Where an attempt's plan comes from.
@@ -194,146 +215,200 @@ impl PgePipeline {
         }
     }
 
-    /// Write every generation envelope under `dir` the moment it is produced.
+    /// Write every stage product to `store` the moment it is produced.
     ///
     /// `task_id` is the task the run is on behalf of, which is not the id of
-    /// the throwaway request each pass is issued under: the envelope is read
+    /// the throwaway request each pass is issued under: the record is read
     /// later to answer "what did this task's run produce", and the per-pass id
     /// answers no such question.
-    pub fn with_generation_archive(
+    pub fn with_stage_store(
         mut self,
-        dir: impl Into<std::path::PathBuf>,
+        store: std::sync::Arc<dyn cog_core::PgeStageStore>,
         task_id: impl Into<String>,
     ) -> Self {
         self.archive = Some(GenerationArchive {
-            dir: dir.into(),
+            store,
             task_id: task_id.into(),
         });
         self
     }
 
-    /// 把这一轮生成的信封写进盘上，供本次运行之外的读者取用。
+    /// 把一个阶段的产物写下来，供本次运行之外的读者取用。
     ///
-    /// 写失败不终止运行：信封是这次生成多出来的一份保险，不是运行的前置条件，
+    /// 写失败不终止运行：这份记录是这次生成多出来的一份保险，不是运行的前置条件，
     /// 为它放弃一份已经付费的 diff 就本末倒置了。但失败要留下一条具名日志，
     /// 否则「以为存了」与「存了」在任何读数上都没有分别。
-    async fn archive_generation(
+    async fn archive_stage(
         &self,
         task: &cog_core::Task,
         attempt: u32,
         repair_iteration: u32,
-        plan: &PlannerOutput,
-        generation: &GeneratorOutput,
+        stage: cog_core::PgeStage,
+        product: serde_json::Value,
     ) {
         let Some(archive) = self.archive.as_ref() else {
             return;
         };
-        // 空信封里没有任何可以重建的东西；写它只会让目录里多一份读不出内容的
-        // 文件，并让「这里存了几份生成」这个读数失真。
-        if generation.artifacts.is_empty() {
-            return;
-        }
-        let record = |evaluation: Option<&EvaluationResult>, stage: &str| {
-            serde_json::json!({
-                "task_id": archive.task_id,
-                "attempt": attempt,
-                "repair_iteration": repair_iteration,
-                "stage": stage,
-                "request": &task.input,
-                "task_type": format!("{:?}", task.task_type),
-                "plan": plan,
-                "generation": generation,
-                "evaluation": evaluation,
-            })
+        let record = cog_core::PgeStageProduct {
+            task_id: archive.task_id.clone(),
+            generation: attempt,
+            repair_iteration,
+            stage,
+            request_sha256: GenerationArchive::request_sha256(&task.input),
+            change_identity: task
+                .input
+                .get(cog_core::INPUT_CHANGE_IDENTITY)
+                .filter(|v| !v.is_null())
+                .cloned(),
+            product,
         };
-        match archive
-            .write_stage(attempt, &record(None, "generated"))
-            .await
-        {
-            Ok(path) => tracing::info!(
+        match archive.store.record(&record).await {
+            Ok(()) => tracing::debug!(
                 task_id = %archive.task_id,
                 attempt,
                 repair_iteration,
-                path = %path.display(),
-                "Generation envelope archived before it could be lost with the run"
+                stage = stage.as_str(),
+                "stage product recorded"
             ),
             Err(e) => tracing::warn!(
                 task_id = %archive.task_id,
                 attempt,
                 repair_iteration,
+                stage = stage.as_str(),
                 error = %e,
-                "could not archive this run's generation envelope; the diff lives only in memory until the run ends"
+                "could not record this stage's product; what it produced lives only in memory \
+                 until the run ends, and a later pass over this task will buy it again"
             ),
         }
     }
 
-    /// The evaluation, written over the same generation's record.
+    /// The plan, written down before any generation is asked for.
     ///
-    /// The file keeps the plan and the generation it judged, so a later reader
-    /// gets the verdict together with what it was about rather than a score
-    /// with nothing attached.
+    /// The generator is the expensive call, and it is the one most likely not to
+    /// be reached: a run that dies between the two has already paid for a plan,
+    /// and without this row the next pass pays for it a second time.
+    async fn archive_plan(&self, task: &cog_core::Task, attempt: u32, plan: &PlannerOutput) {
+        self.archive_stage(
+            task,
+            attempt,
+            0,
+            cog_core::PgeStage::Planned,
+            serde_json::to_value(plan).unwrap_or_default(),
+        )
+        .await;
+    }
+
+    /// 这一轮生成的信封。
+    ///
+    /// 空信封里没有任何可以重建的东西；写它只会让「这里存了几份生成」这个读数
+    /// 失真。
+    async fn archive_generation(
+        &self,
+        task: &cog_core::Task,
+        attempt: u32,
+        repair_iteration: u32,
+        generation: &GeneratorOutput,
+    ) {
+        if generation.artifacts.is_empty() {
+            return;
+        }
+        self.archive_stage(
+            task,
+            attempt,
+            repair_iteration,
+            cog_core::PgeStage::Generated,
+            serde_json::to_value(generation).unwrap_or_default(),
+        )
+        .await;
+    }
+
+    /// 判词写在它所判的那一代下面，而不是写成一份没有对象的分数。
     async fn archive_evaluation(
         &self,
         task: &cog_core::Task,
         attempt: u32,
         repair_iteration: u32,
-        plan: &PlannerOutput,
         generation: &GeneratorOutput,
         evaluation: &EvaluationResult,
     ) {
-        let Some(archive) = self.archive.as_ref() else {
-            return;
-        };
         if generation.artifacts.is_empty() {
             return;
         }
-        let record = serde_json::json!({
-            "task_id": archive.task_id,
-            "attempt": attempt,
-            "repair_iteration": repair_iteration,
-            "stage": "evaluated",
-            "request": &task.input,
-            "task_type": format!("{:?}", task.task_type),
-            "plan": plan,
-            "generation": generation,
-            "evaluation": evaluation,
-        });
-        if let Err(e) = archive.write_stage(attempt, &record).await {
-            tracing::warn!(
-                task_id = %archive.task_id,
-                attempt,
-                error = %e,
-                "could not write this attempt's verdict beside its generation"
-            );
-        }
+        self.archive_stage(
+            task,
+            attempt,
+            repair_iteration,
+            cog_core::PgeStage::Evaluated,
+            serde_json::to_value(evaluation).unwrap_or_default(),
+        )
+        .await;
     }
 
     /// What an earlier pass over this task already bought for this generation.
     ///
-    /// Only reused when the request is byte-identical to the one recorded: the
-    /// same task id can be re-issued against a different goal, and a generation
-    /// produced for the previous one is not an answer to this one.
+    /// Only reused when the request is the same one recorded: the same task id
+    /// can be re-issued against a different goal, and a generation produced for
+    /// the previous one is not an answer to this one. The comparison is over the
+    /// request's hash, which is what the row keeps — the request text itself is
+    /// in the exchange ledger, not copied onto every stage row.
+    ///
+    /// A read that fails is treated as "nothing to resume", with a log: a store
+    /// that is briefly unreachable must cost a run its savings, not its result.
     async fn archived_attempt(
         &self,
         task: &cog_core::Task,
         attempt: u32,
-    ) -> Option<(PlannerOutput, GeneratorOutput, Option<EvaluationResult>)> {
+    ) -> Option<ResumedAttempt> {
         let archive = self.archive.as_ref()?;
-        let record = archive.read_stage(attempt).await?;
-        if record.get("request") != Some(&task.input) {
-            return None;
+        let rows = match archive.store.generation(&archive.task_id, attempt).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %archive.task_id,
+                    attempt,
+                    error = %e,
+                    "could not read what an earlier pass bought for this generation; \
+                     this pass buys its plan and diff again"
+                );
+                return None;
+            }
+        };
+        let want = GenerationArchive::request_sha256(&task.input);
+        let mut resumed = ResumedAttempt {
+            plan: None,
+            generation: None,
+            evaluation: None,
+        };
+        // Rows arrive in the order they were reached (repair iteration, then
+        // stage), so walking them forward leaves the furthest point of this
+        // generation in hand. A generation reached by a repair replaces the one
+        // before it, and with it the verdict: that verdict was passed on a
+        // different diff.
+        for row in rows.iter().filter(|row| row.request_sha256 == want) {
+            match row.stage {
+                cog_core::PgeStage::Planned => {
+                    resumed.plan = serde_json::from_value(row.product.clone()).ok();
+                }
+                cog_core::PgeStage::Generated => {
+                    resumed.generation = serde_json::from_value(row.product.clone()).ok();
+                    resumed.evaluation = None;
+                }
+                cog_core::PgeStage::Evaluated => {
+                    resumed.evaluation = serde_json::from_value(row.product.clone()).ok();
+                }
+            }
         }
-        let plan: PlannerOutput = serde_json::from_value(record.get("plan")?.clone()).ok()?;
-        let generation: GeneratorOutput =
-            serde_json::from_value(record.get("generation")?.clone()).ok()?;
-        if generation.artifacts.is_empty() {
-            return None;
+        // An empty envelope is not a generation: the pipeline treats it by its
+        // own cause, and resuming it would only repeat that judgement.
+        if resumed
+            .generation
+            .as_ref()
+            .is_some_and(|generation| generation.artifacts.is_empty())
+        {
+            resumed.generation = None;
+            resumed.evaluation = None;
         }
-        let evaluation = record
-            .get("evaluation")
-            .filter(|e| !e.is_null())
-            .and_then(|e| serde_json::from_value(e.clone()).ok());
-        Some((plan, generation, evaluation))
+        (resumed.plan.is_some() || resumed.generation.is_some()).then_some(resumed)
     }
 
     /// Build the failing result for a deterministic environment/protocol
@@ -454,35 +529,37 @@ impl PgePipeline {
         let mut stall = StallDetector::new(self.config.stall_threshold);
 
         for attempt in 1..=max_attempts {
-            // 重入：这一代上一次已经买过的计划、生成与判词都在盘上。上游在半路
-            // 断掉时，付过钱的东西不该跟着进程一起没——这一次从盘上接着跑，
+            // 重入：这一代上一次已经买过的计划、生成与判词都记在库里。上游在半路
+            // 断掉时，付过钱的东西不该跟着进程一起没——这一次从记录接着跑，
             // 不重买一遍。
             let resumed = self.archived_attempt(task, attempt).await;
             if resumed.is_some() {
                 tracing::info!(
                     task_id = %task.id,
                     attempt,
-                    "re-entering this generation from what the last pass left on disk"
+                    "re-entering this generation from what the last pass recorded"
                 );
             }
 
             // Stage 1: Planner — or, on a declared scope, the plan the request
             // already states.
-            let plan = match (&resumed, scope) {
-                (Some((plan, _, _)), _) => plan.clone(),
-                (None, PlanScope::Planned(planner)) => {
-                    planner
-                        .plan(
-                            task,
-                            attempt,
-                            last_evaluation.as_ref().map(|e| e.feedback.as_str()),
-                            last_evaluation.as_ref().and_then(|e| e.score),
-                            None,
-                            None,
-                        )
-                        .await
-                }
-                (None, PlanScope::Declared(declared)) => (*declared).clone(),
+            let plan = match resumed.as_ref().and_then(|r| r.plan.clone()) {
+                Some(plan) => plan,
+                None => match scope {
+                    PlanScope::Planned(planner) => {
+                        planner
+                            .plan(
+                                task,
+                                attempt,
+                                last_evaluation.as_ref().map(|e| e.feedback.as_str()),
+                                last_evaluation.as_ref().and_then(|e| e.score),
+                                None,
+                                None,
+                            )
+                            .await
+                    }
+                    PlanScope::Declared(declared) => (*declared).clone(),
+                },
             };
 
             // 计划侧的确定性环境失败：planner 的 prompt 没到上游，重试必然同样
@@ -499,6 +576,10 @@ impl PgePipeline {
                 return Self::terminal_result(attempt, plan, generation, None, history);
             }
 
+            // 计划一拿到就记下来：生成是这条链上最贵、也最可能没被问到的那一通，
+            // 运行死在两者之间时，已经付过费的计划不该在下一趟里再买一次。
+            self.archive_plan(task, attempt, &plan).await;
+
             // Stage 2: Generator (initial attempt).
             let prev_eval_json = last_evaluation
                 .as_ref()
@@ -507,8 +588,8 @@ impl PgePipeline {
                 .as_ref()
                 .map(|g| serde_json::to_value(g).unwrap_or_default());
             let plan_json = serde_json::to_value(&plan).unwrap_or_default();
-            let mut generation = match &resumed {
-                Some((_, generation, _)) => generation.clone(),
+            let mut generation = match resumed.as_ref().and_then(|r| r.generation.clone()) {
+                Some(generation) => generation,
                 None => {
                     generator
                         .generate(
@@ -541,8 +622,7 @@ impl PgePipeline {
             // 信封在评估之前落盘：从这里往后每一通调用都可能因为上游配额耗尽而
             // 中断整条流水线，而中断带走的是内存里的这一份 generation。落盘放在
             // 评估之前，才有「下一通调用失败时 diff 已经在盘上」这个性质。
-            self.archive_generation(task, attempt, 0, &plan, &generation)
-                .await;
+            self.archive_generation(task, attempt, 0, &generation).await;
 
             let eval_history: Vec<serde_json::Value> = history
                 .iter()
@@ -582,9 +662,11 @@ impl PgePipeline {
             // so the evaluator's only possible answer is "there is nothing
             // here". Judge it deterministically under its own cause instead, and
             // hand the repair loop a name it can act on.
-            let mut evaluation = if let Some((_, _, Some(recorded))) = &resumed {
-                // 上一次已经问过判词，而且它和这一份生成是一起记下来的。
-                recorded.clone()
+            let mut evaluation = if let Some(recorded) =
+                resumed.as_ref().and_then(|r| r.evaluation.clone())
+            {
+                // 上一次已经问过判词，而且它判的就是这一份生成。
+                recorded
             } else if generation.is_empty_envelope() {
                 tracing::warn!(
                     attempt,
@@ -629,7 +711,7 @@ impl PgePipeline {
 
             // 判词与它判的那份生成写在同一份记录里：读的人不会拿到一个没有对象
             // 的分数，重入时也不用再问一次。
-            self.archive_evaluation(task, attempt, 0, &plan, &generation, &evaluation)
+            self.archive_evaluation(task, attempt, 0, &generation, &evaluation)
                 .await;
 
             let mut local_repairs: Vec<LocalRepairAttempt> = Vec::new();
@@ -672,7 +754,7 @@ impl PgePipeline {
                 }
 
                 // 与首轮同一条：修复出来的信封在下一次调用之前就落盘。
-                self.archive_generation(task, attempt, repair_iteration, &plan, &generation)
+                self.archive_generation(task, attempt, repair_iteration, &generation)
                     .await;
 
                 // Same rule as the initial generation: a repair that delivered
@@ -719,15 +801,8 @@ impl PgePipeline {
 
                 // 修复出来的那一代同样把判词写在自己的记录里：重入时读到的是
                 // 「这一代已经判过了」，而不是「还要再问一次」。
-                self.archive_evaluation(
-                    task,
-                    attempt,
-                    repair_iteration,
-                    &plan,
-                    &generation,
-                    &evaluation,
-                )
-                .await;
+                self.archive_evaluation(task, attempt, repair_iteration, &generation, &evaluation)
+                    .await;
 
                 local_repairs.push(LocalRepairAttempt {
                     repair_iteration,
@@ -895,107 +970,26 @@ impl PgePipeline {
     }
 }
 
-/// 把任务 id 变成一个目录名。
-///
-/// 任务 id 来自外部（协作调用方），可能带 `/`、空格或点号；原样拼进路径会让
-/// 「这个任务的信封」落到别的任务的目录里，甚至落到信封目录之外。
-fn sanitize_path_component(raw: &str) -> String {
-    let cleaned: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = cleaned.trim_matches('.').to_string();
-    if trimmed.is_empty() {
-        "unknown-task".to_string()
-    } else {
-        trimmed
-    }
-}
-
 impl GenerationArchive {
-    fn task_dir(&self) -> std::path::PathBuf {
-        self.dir.join(sanitize_path_component(&self.task_id))
-    }
-
-    /// One directory per `(task, generation)`: `gen-0001` is the first pass
-    /// over this task. The number is the pipeline's own generation counter,
-    /// not a timestamp, so the same generation always lands in the same place
-    /// however many processes or restarts it took to get there.
-    fn generation_dir(&self, generation: u32) -> std::path::PathBuf {
-        self.task_dir().join(format!("gen-{generation:04}"))
-    }
-
-    fn stage_path(&self, generation: u32, repair_iteration: u32) -> std::path::PathBuf {
-        self.generation_dir(generation)
-            .join(format!("r{repair_iteration:02}.json"))
-    }
-
-    /// Write one generation's record, replacing the previous stage of it.
-    async fn write_stage(
-        &self,
-        generation: u32,
-        record: &serde_json::Value,
-    ) -> std::io::Result<std::path::PathBuf> {
-        let repair_iteration = record
-            .get("repair_iteration")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
-        let path = self.stage_path(generation, repair_iteration);
-        // 整份替换走 core 里那一条规则：读的人可能恰好在写的同时打开这一份，
-        // 半份 JSON 会被读成「这份信封坏了」而不是「还没写完」，而临时名、改名
-        // 的先后与要不要 fsync 只在那边改一次。读端与写端在同一个内核上（同一
-        // 个卷上的目录），所以不需要抗断电那一档。
-        cog_core::atomic_write::write_json_async(
-            &path,
-            record,
-            cog_core::atomic_write::Durability::SameKernel,
-        )
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(path)
-    }
-
-    /// What this generation recorded the last time it was reached.
-    async fn read_stage(&self, generation: u32) -> Option<serde_json::Value> {
-        let dir = self.generation_dir(generation);
-        let mut entries = tokio::fs::read_dir(&dir).await.ok()?;
-        let mut best: Option<(u32, serde_json::Value)> = None;
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let repair = name
-                .strip_prefix('r')
-                .and_then(|rest| rest.strip_suffix(".json"))
-                .and_then(|n| n.parse::<u32>().ok());
-            let Some(repair) = repair else {
-                continue;
-            };
-            if best.as_ref().is_some_and(|(seen, _)| *seen >= repair) {
-                continue;
-            }
-            let Ok(text) = tokio::fs::read_to_string(entry.path()).await else {
-                continue;
-            };
-            match serde_json::from_str(&text) {
-                Ok(value) => best = Some((repair, value)),
-                // 半份或坏掉的那一份不能当作「这一代没买过」：让它把整代跳过，
-                // 于是这一代会重跑一次，而不是拿一份读不动的记录当答案。
-                Err(e) => {
-                    tracing::warn!(
-                        path = %entry.path().display(),
-                        error = %e,
-                        "this generation's record cannot be parsed; ignoring it"
-                    );
-                }
-            }
-        }
-        best.map(|(_, value)| value)
+    /// The request a stage answered, as the row keeps it.
+    ///
+    /// Hashed rather than stored: the request text is copied onto every stage
+    /// row otherwise, and it already lives verbatim in the gateway's exchange
+    /// ledger. What a resume has to answer is "is this the same request", and a
+    /// hash answers exactly that.
+    ///
+    /// A request that cannot be serialized hashes to nothing, which matches no
+    /// row — resume then buys the stage again rather than reusing a product
+    /// that was produced for something this build cannot compare.
+    fn request_sha256(request: &serde_json::Value) -> String {
+        use sha2::{Digest, Sha256};
+        let Ok(bytes) = serde_json::to_vec(request) else {
+            return String::new();
+        };
+        Sha256::digest(&bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
     }
 }
 
@@ -2264,37 +2258,88 @@ mod tests {
         );
     }
 
-    /// 生成信封在评估之前就在盘上。
+    /// 一份只活在测试进程里的阶段产物记录。
     ///
-    /// 一次运行要串起最多七通推理调用，任何一通因为上游配额耗尽而失败都会把
-    /// 内存里那份已经付过费的 diff 一起带走——2026-11-01 起这条流水线上「diff
-    /// 存下来了」只对跑完的运行成立，而跑不完的运行恰恰是最需要那份 diff 的。
-    /// 这里让评估这一格直接炸掉：它能被证明的唯一方式是信封在它被问到之前
-    /// 已经落盘，而不是运行结束时顺手写的。
-    #[tokio::test]
-    async fn a_generation_is_on_disk_before_the_evaluator_is_asked_for_a_verdict() {
-        use futures::FutureExt;
-        let temp = tempfile::tempdir().unwrap();
-        let pipeline = PgePipeline::new(PgePipelineConfig {
+    /// 与真库同一条读写语义：同一个 `(task, generation, repair, stage)` 只留
+    /// 最后写的那一份，读出来的顺序是「先修复轮次、后阶段」。
+    #[derive(Default)]
+    struct MemoryStageStore {
+        rows: std::sync::Mutex<Vec<cog_core::PgeStageProduct>>,
+    }
+
+    impl MemoryStageStore {
+        fn stage(
+            &self,
+            task_id: &str,
+            generation: u32,
+            stage: cog_core::PgeStage,
+        ) -> Option<cog_core::PgeStageProduct> {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|row| {
+                    row.task_id == task_id && row.generation == generation && row.stage == stage
+                })
+                .cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::PgeStageStore for MemoryStageStore {
+        async fn record(&self, product: &cog_core::PgeStageProduct) -> cog_core::SFResult<()> {
+            let mut rows = self.rows.lock().unwrap();
+            rows.retain(|row| {
+                !(row.task_id == product.task_id
+                    && row.generation == product.generation
+                    && row.repair_iteration == product.repair_iteration
+                    && row.stage == product.stage)
+            });
+            rows.push(product.clone());
+            Ok(())
+        }
+
+        async fn generation(
+            &self,
+            task_id: &str,
+            generation: u32,
+        ) -> cog_core::SFResult<Vec<cog_core::PgeStageProduct>> {
+            let mut rows: Vec<_> = self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.task_id == task_id && row.generation == generation)
+                .cloned()
+                .collect();
+            rows.sort_by_key(|row| (row.repair_iteration, row.stage.rank()));
+            Ok(rows)
+        }
+    }
+
+    fn config() -> PgePipelineConfig {
+        PgePipelineConfig {
             max_retries: 1,
             timeout_ms: 5_000,
             local_repair_max: 2,
             stall_threshold: 2,
             independent_review: false,
-        })
-        .with_generation_archive(temp.path(), "change-ledger-abc");
+        }
+    }
 
-        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+    fn planning_agent() -> PlannerActor {
+        PlannerActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
                 "summary": "s",
                 "plan": {"steps": ["edit"]},
                 "sub_tasks": [],
                 "acceptance_criteria": []
             }),
-        }));
-        let diff =
-            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n";
-        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
+        }))
+    }
+
+    fn diff_generator(diff: &str) -> GeneratorActor {
+        GeneratorActor::new(std::sync::Arc::new(MockAgent {
             response: serde_json::json!({
                 "content": {"note": "done"},
                 "artifacts": [{
@@ -2303,10 +2348,44 @@ mod tests {
                     "content": diff,
                 }],
             }),
-        }));
-        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+        }))
+    }
+
+    fn passing_evaluator() -> EvaluatorActor {
+        EvaluatorActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "verdict": "pass",
+                "score": 92,
+                "feedback": "good",
+                "criteria": [],
+            }),
+        }))
+    }
+
+    fn never_asked() -> MockAgent {
+        MockAgent {
             response: serde_json::json!(PANIC_ON_PROMPT),
-        }));
+        }
+    }
+
+    /// 生成在评估之前就记下来了。
+    ///
+    /// 一次运行要串起最多七通推理调用，任何一通因为上游配额耗尽而失败都会把
+    /// 内存里那份已经付过费的 diff 一起带走——而跑不完的运行恰恰是最需要那份
+    /// diff 的。这里让评估这一格直接炸掉：它能被证明的唯一方式是记录在它被
+    /// 问到之前已经写下，而不是运行结束时顺手写的。
+    #[tokio::test]
+    async fn a_generation_is_recorded_before_the_evaluator_is_asked_for_a_verdict() {
+        use futures::FutureExt;
+        let store = std::sync::Arc::new(MemoryStageStore::default());
+        let pipeline =
+            PgePipeline::new(config()).with_stage_store(store.clone(), "change-ledger-abc");
+
+        let planner = planning_agent();
+        let diff =
+            "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+        let generator = diff_generator(diff);
+        let evaluator = EvaluatorActor::new(std::sync::Arc::new(never_asked()));
 
         let task = test_task("edit x.rs");
         let outcome = std::panic::AssertUnwindSafe(pipeline.execute_task(
@@ -2323,131 +2402,240 @@ mod tests {
             "the evaluator must have panicked, or this test proves nothing about ordering"
         );
 
-        let generation_dir = temp.path().join("change-ledger-abc").join("gen-0001");
-        let envelope: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(generation_dir.join("r00.json"))
-                .expect("the generation's record exists at the moment the evaluator was asked"),
-        )
-        .unwrap();
+        let plan = store
+            .stage("change-ledger-abc", 1, cog_core::PgeStage::Planned)
+            .expect("the plan was written before the evaluator was asked");
         assert_eq!(
-            envelope["task_id"], "change-ledger-abc",
-            "the envelope must name the task whose run produced it"
+            plan.product["plan"]["steps"][0], "edit",
+            "the planner's own output is what the record carries"
         );
+        let generation = store
+            .stage("change-ledger-abc", 1, cog_core::PgeStage::Generated)
+            .expect("the generation was written before the evaluator was asked");
         assert_eq!(
-            envelope["generation"]["artifacts"][0]["content"], diff,
-            "the archived envelope must carry the diff itself, not a pointer to one"
+            generation.product["artifacts"][0]["content"], diff,
+            "the record must carry the diff itself, not a pointer to one"
         );
-        assert_eq!(
-            envelope["stage"], "generated",
-            "the record says how far this generation got, not merely that a file exists"
+        assert!(
+            store
+                .stage("change-ledger-abc", 1, cog_core::PgeStage::Evaluated)
+                .is_none(),
+            "the evaluator never answered, so no verdict can be on record"
         );
     }
 
-    /// 第二次跑同一个任务时，上一趟买过的生成与判词从盘上接着用。
+    /// A dispatched change's stage products carry the change they belong to.
     ///
-    /// 盘上这份记录的全部意义在此：上游在半路断掉之后，再跑一趟不该第二次
-    /// 付钱。这里让第二趟的三个角色都炸掉——它能跑完，唯一的原因是它们根本
-    /// 没被问到。
+    /// The ledger recomputes a change's task id from the identity it holds, so
+    /// the id alone can lead back to the change; the identity is also copied onto
+    /// the row so a reader of this table alone can place the product without
+    /// knowing that hash scheme. A row that lost it would make "which change
+    /// produced this diff" a question only the ledger's own reader could answer.
+    #[tokio::test]
+    async fn a_dispatched_change_stamps_its_identity_on_every_stage_row() {
+        let store = std::sync::Arc::new(MemoryStageStore::default());
+        let pipeline =
+            PgePipeline::new(config()).with_stage_store(store.clone(), "change-ledger-abc");
+
+        let mut task = test_task("edit x.rs");
+        task.input[cog_core::INPUT_CHANGE_IDENTITY] = serde_json::json!({
+            "kind": "grep",
+            "scope": "crates/a",
+            "literal": "fn thing",
+        });
+
+        let _ = pipeline
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &planning_agent(),
+                &diff_generator("diff --git a/x.rs b/x.rs\n"),
+                &passing_evaluator(),
+            )
+            .await;
+
+        let rows = store.rows.lock().unwrap();
+        assert!(!rows.is_empty(), "the run produced stage products");
+        for row in rows.iter() {
+            assert_eq!(
+                row.change_identity.as_ref().and_then(|v| v.get("literal")),
+                Some(&serde_json::json!("fn thing")),
+                "the {} row lost the change it was produced for",
+                row.stage.as_str()
+            );
+        }
+    }
+
+    /// 第二次跑同一个任务时，上一趟买过的生成与判词接着用。
+    ///
+    /// 这份记录的全部意义在此：上游在半路断掉之后，再跑一趟不该第二次付钱。
+    /// 这里让第二趟的三个角色都炸掉——它能跑完，唯一的原因是它们根本没说上话。
     #[tokio::test]
     async fn a_second_pass_over_the_same_task_buys_neither_plan_nor_generation_again() {
-        let temp = tempfile::tempdir().unwrap();
-        let archive = || {
-            PgePipeline::new(PgePipelineConfig {
-                max_retries: 1,
-                timeout_ms: 5_000,
-                local_repair_max: 2,
-                stall_threshold: 2,
-                independent_review: false,
-            })
-            .with_generation_archive(temp.path(), "change-ledger-abc")
-        };
+        let store = std::sync::Arc::new(MemoryStageStore::default());
+        let archive =
+            || PgePipeline::new(config()).with_stage_store(store.clone(), "change-ledger-abc");
 
         let task = test_task("edit x.rs");
         let diff =
             "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n";
 
-        // 第一趟：正常的三个角色，跑出一份能通过的判词。
-        let first = archive();
-        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({
-                "summary": "s",
-                "plan": {"steps": ["edit"]},
-                "sub_tasks": [],
-                "acceptance_criteria": []
-            }),
-        }));
-        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({
-                "content": {"note": "done"},
-                "artifacts": [{
-                    "name": "change.diff",
-                    "artifact_type": "change",
-                    "content": diff,
-                }],
-            }),
-        }));
-        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!({
-                "verdict": "pass",
-                "score": 92,
-                "feedback": "good",
-                "criteria": [],
-            }),
-        }));
-        let bought = first
+        let bought = archive()
             .execute_task(
                 &task,
                 serde_json::json!({}),
-                &planner,
-                &generator,
-                &evaluator,
+                &planning_agent(),
+                &diff_generator(diff),
+                &passing_evaluator(),
             )
             .await;
         assert!(
             bought.passed,
             "the first pass has to pass for the second to resume"
         );
-
-        let generation_dir = temp.path().join("change-ledger-abc").join("gen-0001");
-        let record: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(generation_dir.join("r00.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            record["stage"], "evaluated",
-            "the verdict is written beside the generation it judged"
+        assert!(
+            store
+                .stage("change-ledger-abc", 1, cog_core::PgeStage::Evaluated)
+                .is_some(),
+            "the verdict is recorded under the generation it judged"
         );
 
         // 第二趟：三个角色都被问到就炸，跑完即证明一次上游都没打过。
-        let second = archive();
-        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!(PANIC_ON_PROMPT),
-        }));
-        let generator = GeneratorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!(PANIC_ON_PROMPT),
-        }));
-        let evaluator = EvaluatorActor::new(std::sync::Arc::new(MockAgent {
-            response: serde_json::json!(PANIC_ON_PROMPT),
-        }));
-        let resumed = second
+        let resumed = archive()
             .execute_task(
                 &task,
                 serde_json::json!({}),
-                &planner,
-                &generator,
-                &evaluator,
+                &PlannerActor::new(std::sync::Arc::new(never_asked())),
+                &GeneratorActor::new(std::sync::Arc::new(never_asked())),
+                &EvaluatorActor::new(std::sync::Arc::new(never_asked())),
             )
             .await;
 
         assert!(
             resumed.passed,
-            "the second pass judged what the first pass left, got: {:?}",
+            "the second pass judged what the first pass recorded, got: {:?}",
             resumed.final_evaluation.feedback
         );
         assert_eq!(
             resumed.final_generation.artifacts.len(),
             1,
             "the resumed pass carries the generation the first pass paid for"
+        );
+    }
+
+    /// 只买到计划的运行，下一趟只补生成，不重买计划。
+    ///
+    /// 计划与生成是两条独立的付款：运行死在两者之间时，上一趟买到的是计划。
+    /// 把两份产物合成一条记录，会让「有生成才算买到过」变成唯一的重用条件，
+    /// 于是下一趟把那份已经付过费的计划再买一次。
+    #[tokio::test]
+    async fn a_run_that_stopped_after_planning_resumes_without_buying_the_plan_again() {
+        use futures::FutureExt;
+        let store = std::sync::Arc::new(MemoryStageStore::default());
+        let archive =
+            || PgePipeline::new(config()).with_stage_store(store.clone(), "change-ledger-abc");
+
+        let task = test_task("edit x.rs");
+        let diff = "diff --git a/x.rs b/x.rs\n";
+
+        // 第一趟：计划买到了，生成这一格直接炸掉。
+        let stopped = std::panic::AssertUnwindSafe(archive().execute_task(
+            &task,
+            serde_json::json!({}),
+            &planning_agent(),
+            &GeneratorActor::new(std::sync::Arc::new(never_asked())),
+            &passing_evaluator(),
+        ))
+        .catch_unwind()
+        .await;
+        assert!(
+            stopped.is_err(),
+            "the generator panicked, so the run stopped"
+        );
+        assert!(
+            store
+                .stage("change-ledger-abc", 1, cog_core::PgeStage::Planned)
+                .is_some(),
+            "the plan was recorded before the generator was asked"
+        );
+        assert!(
+            store
+                .stage("change-ledger-abc", 1, cog_core::PgeStage::Generated)
+                .is_none(),
+            "nothing generated, so nothing to record"
+        );
+
+        // 第二趟：planer 被问到就炸。跑完即证明计划是从记录里拿的。
+        let resumed = archive()
+            .execute_task(
+                &task,
+                serde_json::json!({}),
+                &PlannerActor::new(std::sync::Arc::new(never_asked())),
+                &diff_generator(diff),
+                &passing_evaluator(),
+            )
+            .await;
+        assert!(
+            resumed.passed,
+            "the second pass bought only the missing half, got: {:?}",
+            resumed.final_evaluation.feedback
+        );
+        assert_eq!(
+            resumed.final_plan.plan["steps"][0], "edit",
+            "the plan handed to the generator is the one the first pass paid for"
+        );
+    }
+
+    /// 同一个任务换了请求，就不许拿旧产物顶上。
+    ///
+    /// 任务 id 可以被重新用作另一件事的编号；上一趟那份 diff 回答的是上一个
+    /// 目标，拿它当这一次的答案就是答非所问，而且这个错永远不会以失败的形式
+    /// 出现——它会长成一份看起来能通过的生成。
+    #[tokio::test]
+    async fn a_different_request_under_the_same_task_id_buys_its_own_generation() {
+        let store = std::sync::Arc::new(MemoryStageStore::default());
+        let archive =
+            || PgePipeline::new(config()).with_stage_store(store.clone(), "change-ledger-abc");
+
+        let first = test_task("edit x.rs");
+        let _ = archive()
+            .execute_task(
+                &first,
+                serde_json::json!({}),
+                &planning_agent(),
+                &diff_generator("diff --git a/x.rs b/x.rs\n"),
+                &passing_evaluator(),
+            )
+            .await;
+
+        // 同一个任务 id、不同的请求：计划与生成都必须是这一趟自己的。
+        let second = test_task("edit y.rs");
+        let planner = PlannerActor::new(std::sync::Arc::new(MockAgent {
+            response: serde_json::json!({
+                "summary": "another goal",
+                "plan": {"steps": ["edit differently"]},
+                "sub_tasks": [],
+                "acceptance_criteria": []
+            }),
+        }));
+        let fresh_diff = "diff --git a/y.rs b/y.rs\n";
+        let resumed = archive()
+            .execute_task(
+                &second,
+                serde_json::json!({}),
+                &planner,
+                &diff_generator(fresh_diff),
+                &passing_evaluator(),
+            )
+            .await;
+
+        assert_eq!(
+            resumed.final_plan.plan["steps"][0], "edit differently",
+            "the plan is the one this request bought, not the one a previous goal did"
+        );
+        assert_eq!(
+            resumed.final_generation.artifacts[0].content, fresh_diff,
+            "the diff answers this request, not the previous one"
         );
     }
 }

@@ -68,6 +68,7 @@ pub use contract::observability::*;
 pub use contract::orchestrator::*;
 pub use contract::owner_lease;
 pub use contract::owner_lease::{OwnerLease, OwnerLeaseBroker, Ownership, RoleClaim, RoleHold};
+pub use contract::pge_stage::*;
 pub use contract::plugin::*;
 pub use contract::principle_ledger::*;
 pub use contract::project_audit::*;

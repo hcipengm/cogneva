@@ -80,7 +80,9 @@ pub struct CollaborationExecutor {
     ralph: Option<crate::squad::ralph::RalphLoopConfig>,
     /// 局部修复预算（配置面 `pge` 段；None = [`crate::DEFAULT_LOCAL_REPAIR_MAX`]）。
     local_repair_max: Option<u32>,
-    generation_dir: Option<std::path::PathBuf>,
+    /// 阶段产物的持久化存储；每个任务现建的 SquadExecutor 都要拿到它，
+    /// 否则一次运行断在两条调用之间，已经付过费的计划和 diff 就跟着进程没了。
+    stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
 }
 
 /// What the producer said about itself, at the two stages the record keeps.
@@ -118,7 +120,7 @@ impl CollaborationExecutor {
             meta_learning: None,
             ralph: None,
             local_repair_max: None,
-            generation_dir: None,
+            stage_store: None,
         }
     }
 
@@ -238,9 +240,9 @@ impl CollaborationExecutor {
         self
     }
 
-    /// 每一轮生成在评估之前落盘的位置（配置面 `pge.envelope_dir`）。
-    pub fn with_generation_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
-        self.generation_dir = Some(dir.into());
+    /// 每个阶段产物在下一通调用之前记下来的位置。
+    pub fn with_stage_store(mut self, store: Arc<dyn cog_core::PgeStageStore>) -> Self {
+        self.stage_store = Some(store);
         self
     }
 }
@@ -603,8 +605,8 @@ impl CollaborationExecutor {
         if let Some(max) = self.local_repair_max {
             squad_executor = squad_executor.with_local_repair_max(max);
         }
-        if let Some(ref dir) = self.generation_dir {
-            squad_executor = squad_executor.with_generation_dir(dir.clone());
+        if let Some(ref store) = self.stage_store {
+            squad_executor = squad_executor.with_stage_store(store.clone());
         }
 
         let result = squad_executor
@@ -734,8 +736,8 @@ impl CollaborationExecutor {
         if let Some(max) = self.local_repair_max {
             squad_executor = squad_executor.with_local_repair_max(max);
         }
-        if let Some(ref dir) = self.generation_dir {
-            squad_executor = squad_executor.with_generation_dir(dir.clone());
+        if let Some(ref store) = self.stage_store {
+            squad_executor = squad_executor.with_stage_store(store.clone());
         }
 
         let mut context = Self::goal_context(task);

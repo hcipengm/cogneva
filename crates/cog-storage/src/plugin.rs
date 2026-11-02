@@ -1166,6 +1166,43 @@ impl cog_core::SystemPlugin for StoragePlugin {
             warn!("No PostgreSQL pool; decision counters stay in the engine's own snapshot");
         }
 
+        // ── PgeStageStore ──
+        // A pass writes its plan, its diff and its verdict here as each is
+        // produced. They used to live in the pipeline's local variables, so a
+        // run that stopped between two calls — an upstream quota running out is
+        // the observed case — lost everything it had already paid for and the
+        // next pass bought it again. The table is the same database the change
+        // ledger lives in, so one join answers "what did this change's run
+        // produce"; nothing is derived from the pod's own disk, which is where
+        // the previous attempt at this kept it and why it did not survive a
+        // reschedule.
+        if let Some(pool) = self.pg_pool.clone() {
+            let store = crate::PostgresPgeStageStore::new(pool);
+            match store.init_schema().await {
+                Ok(()) => {
+                    let store: Arc<dyn cog_core::PgeStageStore> = Arc::new(store);
+                    ctx.publish_service(store);
+                    info!("StoragePlugin PGE stage-product store published");
+                }
+                Err(e) => {
+                    if strict_persistence {
+                        return Err(cog_core::SFError::Config(format!(
+                            "PostgresPgeStageStore init_schema failed (strict_persistence=true): {e}"
+                        )));
+                    }
+                    warn!(
+                        "PostgresPgeStageStore init_schema failed: {e}. PGE runs will not be \
+                         re-enterable and their stage products live only as long as the process."
+                    );
+                }
+            }
+        } else {
+            warn!(
+                "No PostgreSQL pool; PGE stage products are not stored and a run that dies \
+                 halfway has to buy its plan, diff and verdict again"
+            );
+        }
+
         // ── GovernanceStore ──
         // Faces and their readings are task-graph rows, not a second account.
         // The store is published only where the task table lives, for the same
