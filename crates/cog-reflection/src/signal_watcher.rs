@@ -284,7 +284,7 @@ fn alert_work(existing: Option<&Task>, may_redrive: bool) -> AlertWork {
     let Some(task) = existing else {
         return AlertWork::NeverFiled;
     };
-    match intent_action(Some(&task.status), may_redrive) {
+    match intent_action(Some(task), may_redrive) {
         IntentAction::None => AlertWork::InHand,
         IntentAction::Redrive => AlertWork::Unfinished,
         IntentAction::Submit => AlertWork::NeverFiled,
@@ -644,14 +644,30 @@ enum IntentAction {
 /// work the pool cannot run. A held-off round still does the first; it does not
 /// do the second, and a row it leaves alone is picked up by the first round
 /// after the pool is back rather than by every round in between.
-fn intent_action(existing: Option<&TaskStatus>, may_redrive: bool) -> IntentAction {
-    match existing {
-        None => IntentAction::Submit,
-        Some(TaskStatus::Failed) if may_redrive => IntentAction::Redrive,
-        Some(TaskStatus::Completed | TaskStatus::Cancelled) if may_redrive => {
+fn intent_action(existing: Option<&Task>, may_redrive: bool) -> IntentAction {
+    let Some(task) = existing else {
+        return IntentAction::Submit;
+    };
+    if !may_redrive {
+        return IntentAction::None;
+    }
+    match task.status {
+        // A failed row is re-driven only when re-driving it can put work in
+        // front of an executor. The orphan reconciler terminates exactly the
+        // rows that cannot run -- non-executable, childless, Pending -- and the
+        // failure it leaves behind is that same non-executable row.
+        // `retry_task` moves a row back to Pending and changes nothing else, so
+        // re-driving one of those hands the reconciler's next pass the same
+        // placeholder: a reap, an alert and a retry every stall window, and not
+        // one runnable row ever created. The alert says the work is re-driven as
+        // a new intent, and that is what clearing the row makes true. Measured
+        // 2026-11-02 on `self-signal-alert-c770d6810d2e5a93`: terminated
+        // 02:04:48, back to Pending at 02:07:32, still not executable.
+        TaskStatus::Failed if task.is_executable => IntentAction::Redrive,
+        TaskStatus::Failed | TaskStatus::Completed | TaskStatus::Cancelled => {
             IntentAction::Resubmit
         }
-        Some(_) => IntentAction::None,
+        _ => IntentAction::None,
     }
 }
 
@@ -1166,7 +1182,7 @@ async fn submit_intent(
     may_redrive: bool,
 ) -> IntentOutcome {
     let existing = orch.get_task(&task_id).await;
-    let action = intent_action(existing.as_ref().map(|t| &t.status), may_redrive);
+    let action = intent_action(existing.as_ref(), may_redrive);
     let resubmitting = action == IntentAction::Resubmit;
     match action {
         IntentAction::None => IntentOutcome::Tracked,
@@ -1185,7 +1201,7 @@ async fn submit_intent(
                 }
                 info!(
                     task_id = %task_id,
-                    "cleared a finished task for a signal that is still firing"
+                    "cleared a finished or unrunnable task for a signal that is still firing"
                 );
             }
             // Read the project off the detail before the payload takes it:
@@ -2135,11 +2151,24 @@ mod tests {
         }
     }
 
+    /// A row in the state a caller asks for; these tests differ only in these
+    /// two fields, and both are what the decision turns on.
+    fn intent_row(status: TaskStatus, is_executable: bool) -> Task {
+        let mut task = Task::new(
+            "intent",
+            TaskType::Custom("self_signal".into()),
+            serde_json::json!({}),
+        );
+        task.status = status;
+        task.is_executable = is_executable;
+        task
+    }
+
     #[test]
     fn intent_action_maps_task_state_to_the_right_move() {
         assert_eq!(intent_action(None, true), IntentAction::Submit);
         assert_eq!(
-            intent_action(Some(&TaskStatus::Failed), true),
+            intent_action(Some(&intent_row(TaskStatus::Failed, true)), true),
             IntentAction::Redrive
         );
         for live in [
@@ -2148,11 +2177,30 @@ mod tests {
             TaskStatus::Running,
         ] {
             assert_eq!(
-                intent_action(Some(&live), true),
+                intent_action(Some(&intent_row(live, true)), true),
                 IntentAction::None,
                 "{live:?} 不该再提交或重驱动"
             );
         }
+    }
+
+    /// A failed row that cannot run is cleared rather than re-driven.
+    ///
+    /// The orphan reconciler terminates exactly these rows -- non-executable,
+    /// childless, Pending -- and the failure it leaves behind is that same
+    /// non-executable row. `retry_task` moves a row back to Pending and changes
+    /// nothing else, so re-driving one puts the reconciler's next pass in front
+    /// of the same placeholder: a reap, an alert and a retry every stall window,
+    /// with no runnable row ever created. The shape is one-way
+    /// (`missing_enrichment` refuses to make a placeholder executable again), so
+    /// clearing the row is the only move that can produce work.
+    #[test]
+    fn a_failed_row_that_cannot_run_is_cleared_rather_than_redriven() {
+        assert_eq!(
+            intent_action(Some(&intent_row(TaskStatus::Failed, false)), true),
+            IntentAction::Resubmit,
+            "不可执行的行被重驱动以后还是不可执行，一次活也开不出来"
+        );
     }
 
     /// A round the pool gate holds off files the signal and drives nothing, so
@@ -2169,11 +2217,13 @@ mod tests {
             TaskStatus::Cancelled,
             TaskStatus::Pending,
         ] {
-            assert_eq!(
-                intent_action(Some(&existing), false),
-                IntentAction::None,
-                "{existing:?} 在池关门时不该被驱动"
-            );
+            for is_executable in [true, false] {
+                assert_eq!(
+                    intent_action(Some(&intent_row(existing, is_executable)), false),
+                    IntentAction::None,
+                    "{existing:?}（executable={is_executable}）在池关门时不该被驱动"
+                );
+            }
         }
     }
 
@@ -2185,11 +2235,11 @@ mod tests {
     #[test]
     fn a_finished_task_is_resubmitted_rather_than_redriven() {
         assert_eq!(
-            intent_action(Some(&TaskStatus::Completed), true),
+            intent_action(Some(&intent_row(TaskStatus::Completed, true)), true),
             IntentAction::Resubmit
         );
         assert_eq!(
-            intent_action(Some(&TaskStatus::Cancelled), true),
+            intent_action(Some(&intent_row(TaskStatus::Cancelled, true)), true),
             IntentAction::Resubmit
         );
     }
