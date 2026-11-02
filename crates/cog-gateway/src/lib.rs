@@ -59,6 +59,7 @@ pub mod memory;
 pub mod notifications;
 pub mod observability;
 pub mod observable;
+pub mod pace_reservations;
 pub mod plugin;
 pub mod process_reports;
 pub mod processes;

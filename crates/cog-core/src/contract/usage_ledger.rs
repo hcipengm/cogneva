@@ -183,9 +183,16 @@ pub struct PaceEvidence {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PaceUpstreamEvidence {
     pub upstream: String,
+    /// 判定用的允许量：窗口的允许量减去 `held_tokens`。两者一起读才复原得出
+    /// 这一次判定，只留一个就分不清"窗口就这么大"与"其中一部分已经被许出去"。
     pub allowance_tokens: u64,
     pub spent_tokens: u64,
     pub reserve_tokens: u64,
+    /// 这一家已经放行、账上还没落地的任务占着的额度。它们的花销还没发生，
+    /// 却已经被许出去；不写上来，一行"允许量还剩这么多、却拒了"的账就自相矛盾。
+    /// 旧行没有这一格，缺省读作 0。
+    #[serde(default)]
+    pub held_tokens: u64,
     pub window_start_unix: i64,
     /// 这一家自己最早什么时候承接得下下一件任务。
     pub wait_secs: u64,

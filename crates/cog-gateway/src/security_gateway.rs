@@ -2082,6 +2082,13 @@ struct AppState {
     /// 是"没有新调用落库"，而那恰好是请求路自己会打破的。速率与判定一起存，
     /// 是因为它只能按上游各自的容量／窗口分别算再相加，聚合后的三个数反推不出来。
     window_pace: Arc<std::sync::Mutex<WindowPaceReading>>,
+    /// 已经放行、还没在账上落地的任务占着的额度。
+    ///
+    /// 配速的判据读的是账上已经花掉多少，而账只在一发调用结束之后才多一行。
+    /// 同一份快照上连着判过的一批任务因此都读到同一份"还没花"，而一窗只装得
+    /// 下一件——把已经许出去的额度从允许量里先减掉，判据才与"许了多少"对得上。
+    /// 清账按拍做，见 [`crate::pace_reservations`]。
+    pace_reservations: Arc<std::sync::Mutex<crate::pace_reservations::PaceReservations>>,
     /// 逐上游**实测到的窗口容量**，按上游键暂存。
     ///
     /// 它必须被暂存而不是每拍重算：额度用尽那一刻账上的"最后一次成功"就是那次
@@ -2634,42 +2641,83 @@ fn paced_refusal_usage(
     }
 }
 
+/// 这一拍对候选集的判定。三种结局互斥，出自同一遍遍历：拒与不拒，以及与它一起
+/// 落账的那份证据，不能分两遍算——两次快照之间表就可能变，读者拿到的就不是这
+/// 一次判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaceVerdict {
+    /// 候选里有一家没量到窗口：不配速拦它，也不占任何一家的额度。
+    Unpaced,
+    /// 这一家自己的窗口还装得下一件整任务，`job_tokens` 是这一件要占的额度。
+    Free { upstream: String, job_tokens: u64 },
+    /// 每一家都被自己的尺子拦下。
+    Blocked(PaceEvidence),
+}
+
 /// 这一拍拒的是谁、按哪个数拒的：`None` 表示候选里至少有一家还没被判拦。
 ///
-/// 判定与证据出自同一遍遍历，拒与不拒出自同一个 `Option`——分成两遍算，两边
-/// 就可能在两次快照之间看到不同的表，读者拿到的那一行说的就不是这一次判定。
+/// 只给测试用；请求路要的是 [`pace_verdict`]，它还得知道放行的那一家是谁好记账。
+#[cfg(test)]
 fn pace_evidence(
     reading: &WindowPaceReading,
+    reservations: &crate::pace_reservations::PaceReservations,
     candidates: &[&LlmUpstream],
     now_unix: i64,
 ) -> Option<PaceEvidence> {
+    match pace_verdict(reading, reservations, candidates, now_unix) {
+        PaceVerdict::Blocked(evidence) => Some(evidence),
+        PaceVerdict::Unpaced | PaceVerdict::Free { .. } => None,
+    }
+}
+
+/// 判这一拍的候选。
+///
+/// `reservations` 答的是"这一家已经许出去多少、账上还没出现"：允许量先减去它，
+/// 再问 [`cog_core::LlmWindowPace::blocked`]。不减去它，同一份快照上连着判过的
+/// N 件事就都读到同一份"还没花"，一件窗只装得下一件的额度会开出 N 件——那正是
+/// 并行开跑、没有一件走到产出那条路径。
+fn pace_verdict(
+    reading: &WindowPaceReading,
+    reservations: &crate::pace_reservations::PaceReservations,
+    candidates: &[&LlmUpstream],
+    now_unix: i64,
+) -> PaceVerdict {
     let mut blocked = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let key = LlmHealthTable::key(candidate);
         let Some(entry) = reading.by_upstream.get(&key) else {
             // 没量到窗口的一家在候选集里，就是"有一家能承接"。没量过不等于
             // 没有额度，这里按没量过处理，不替它编一个界。
-            return None;
+            return PaceVerdict::Unpaced;
         };
-        if !entry.pace.blocked() {
-            return None;
+        let held = reservations.held_tokens(&key);
+        let mut pace = entry.pace;
+        // 判据与落账用同一个数：证据上写"允许量还剩这么多"而判的时候用的是
+        // 另一份，看账的人就再也复原不出这一次判定。
+        pace.allowance_tokens = pace.allowance_tokens.saturating_sub(held);
+        if !pace.blocked() {
+            return PaceVerdict::Free {
+                upstream: key,
+                job_tokens: entry.pace.reserve_tokens,
+            };
         }
         blocked.push(PaceUpstreamEvidence {
             upstream: key,
-            allowance_tokens: entry.pace.allowance_tokens,
-            spent_tokens: entry.pace.spent_tokens,
-            reserve_tokens: entry.pace.reserve_tokens,
-            window_start_unix: entry.pace.window_start_unix,
+            allowance_tokens: pace.allowance_tokens,
+            spent_tokens: pace.spent_tokens,
+            reserve_tokens: pace.reserve_tokens,
+            held_tokens: held,
+            window_start_unix: pace.window_start_unix,
             wait_secs: entry.wait_secs(now_unix),
         });
     }
     if blocked.is_empty() {
-        return None;
+        return PaceVerdict::Unpaced;
     }
     // 标量取池级报表，与 429 body 上那组数是同一份；逐家各自的尺子在
     // `upstreams` 里。两样都落，缺一样就有一半的拒绝读不准。
     let pool = reading.pool;
-    Some(PaceEvidence {
+    PaceVerdict::Blocked(PaceEvidence {
         measured_upstreams: u32::try_from(pool.measured_upstreams).unwrap_or(u32::MAX),
         allowance_tokens: pool.allowance_tokens,
         spent_tokens: pool.spent_tokens,
@@ -2704,6 +2752,13 @@ struct PaceRefusal {
 /// ——任何一家可用就够了，取最大的那个是把可用的那家一起等掉。没量到窗口的
 /// 上游不在表里，因此永远不因配速被拦：它的保护是上游自己的 429 与池级熔断，
 /// 而不是另一家的额度。
+///
+/// **放行要记账**。判据读的是账上已经花掉多少，而账只在一发调用结束之后才多
+/// 一行：同一份快照上连着判过的 N 件都读到"还没花"，一窗只装一件的额度就会
+/// 同时放行 N 件，而它们谁都没走到产出——并行开跑、整池烧空，额度却记在每一
+/// 件事上。所以放行的那一刻就把这一件的预留量记进 [`crate::pace_reservations`]，
+/// 后面的判定先把它减掉。记账与判定在同一把锁里、中间没有 `.await`，否则两个
+/// 并发进来的判定各自都会看到"还没许出去"。
 async fn paced_refusal(
     state: &AppState,
     candidates: &[&LlmUpstream],
@@ -2722,13 +2777,50 @@ async fn paced_refusal(
     if origin == LlmOrigin::Interactive.as_str() {
         return None;
     }
-    let evidence = {
+    let now_unix = Utc::now().timestamp();
+    // 判与记必须在同一把锁里、且中间没有 `.await`：放行一件活之后立刻把它要占
+    // 的额度记上，后面同一次快照里判过的第二件才看得见这份占位。分成两步，两个
+    // 并发进来的判定就会各自读到"还没许出去"，与没有这张表时一模一样。
+    //
+    // 已经开跑、账上有行的任务也照样记：记了只多挂到下一次清账（三十秒），方向
+    // 是让闸门更紧；不记则要在锁里再查一次库，而那次查询会把这份原子性打开。
+    let verdict = {
         let guard = state.window_pace.lock().unwrap();
-        pace_evidence(&guard, candidates, Utc::now().timestamp())?
+        let mut booked = state.pace_reservations.lock().unwrap();
+        let verdict = pace_verdict(&guard, &booked, candidates, now_unix);
+        if let (
+            PaceVerdict::Free {
+                upstream,
+                job_tokens,
+            },
+            Some(task),
+        ) = (&verdict, task)
+        {
+            booked.admit(task, upstream, *job_tokens, now_unix);
+        }
+        verdict
     };
+    match verdict {
+        PaceVerdict::Free { .. } | PaceVerdict::Unpaced => None,
+        PaceVerdict::Blocked(evidence) => {
+            refuse_on_pace(state, evidence, style, actor, origin, task, owner).await
+        }
+    }
+}
+
+/// 每一家都被自己的尺子拦下：落一行拒绝，回一个要等的秒数。
+async fn refuse_on_pace(
+    state: &AppState,
+    evidence: PaceEvidence,
+    style: &str,
+    actor: &str,
+    origin: &str,
+    task: Option<&str>,
+    owner: Option<&str>,
+) -> Option<PaceRefusal> {
     if let Some(task) = task {
-        let store = state.pool_obs.usage.as_ref()?;
-        match store.task_has_started(task).await {
+        match task_has_landed_a_row(state, task).await {
+            // 进行中的任务不拦：拦在半路，它已经花掉的 token 全白费。
             Ok(true) => return None,
             Ok(false) => {}
             Err(e) => {
@@ -2762,6 +2854,20 @@ async fn paced_refusal(
         wait_secs,
         blocked_upstreams,
     })
+}
+
+/// 这件任务在账上有没有已经落过行（ok 或 error 都算）。
+///
+/// 落过就是进行中：它已经花掉的那部分在账上，此后的花销由账本自己算，所以它
+/// 既不该再占一份预留，也不该被拦在半路。没有账可查时按"没有"回答。
+async fn task_has_landed_a_row(state: &AppState, task: &str) -> Result<bool, String> {
+    let Some(store) = state.pool_obs.usage.as_ref() else {
+        return Ok(false);
+    };
+    store
+        .task_has_started(task)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// 把一次真实花销记到这件任务的当日预算上。
@@ -5062,6 +5168,40 @@ async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> 
     }
 }
 
+/// 撤掉那些已经在账上落过行、或者已经老过头的占位。
+///
+/// 只在发布循环里做：请求路每一发都要过判定，那里只能做算术，问账的代价要按拍付。
+/// 撤慢一拍不改变判据的正确性，只让下一件多等一会儿——方向是安全的。
+async fn sweep_pace_reservations(state: &AppState) {
+    let now_unix = Utc::now().timestamp();
+    let pending = {
+        let guard = state.pace_reservations.lock().unwrap();
+        if !guard.due_for_sweep(now_unix) {
+            return;
+        }
+        guard.tasks()
+    };
+    let mut started = std::collections::HashSet::new();
+    if let Some(store) = state.pool_obs.usage.as_ref() {
+        for task in &pending {
+            match store.task_has_started(task).await {
+                Ok(true) => {
+                    started.insert(task.clone());
+                }
+                Ok(false) => {}
+                // 答不上就不撤：这一拍按岁数作废那一腿还在，下一拍再问。
+                Err(e) => tracing::warn!(
+                    task = %task,
+                    error = %e,
+                    "窗口配速：清账查不出任务是否已开始，这一件先按岁数作废"
+                ),
+            }
+        }
+    }
+    let mut guard = state.pace_reservations.lock().unwrap();
+    guard.retire(&started, now_unix);
+}
+
 /// Whether the upstream's newest observation of this window is a quota refusal.
 ///
 /// The two instants come from the same ledger: the newest success and the
@@ -5581,6 +5721,9 @@ async fn refresh_pool_state(state: &AppState) {
         publish_window_pace_gauges(state, &pace).await;
         *state.window_pace.lock().unwrap() = pace;
     }
+    // 占位的清账与配速同一拍：两者读的是同一本账，分两拍就会有一段时间里
+    // 判定还按着上拍的角度算"已经许出去多少"。
+    sweep_pace_reservations(state).await;
 
     // 今日花费与配速同一处置、同一拍：先算、再发、最后换掉共享的那一格。三条顺序
     // 不能反——先换读数再发 gauge，观测面上就会有一段时间显示上一拍的数。
@@ -9759,6 +9902,9 @@ pub async fn run(
         last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         pool_seeded: Arc::new(AtomicBool::new(false)),
         window_pace: Arc::new(std::sync::Mutex::new(WindowPaceReading::default())),
+        pace_reservations: Arc::new(std::sync::Mutex::new(
+            crate::pace_reservations::PaceReservations::default(),
+        )),
         measured_windows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         spend_reading: Arc::new(std::sync::Mutex::new(
             crate::spend_reading::Reading::default(),
@@ -13676,6 +13822,70 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
     }
 
+    /// 同一份快照上先后判过的两件活：第一件放行并记下它的占位，第二件被这份
+    /// 占位挡在外面。
+    ///
+    /// 这条走的是请求路本身（[`paced_refusal`]），不是判定函数：判与记必须在同一步
+    /// 里发生——分开写，两个并发进来的调用会各自读到"还没许出去"，一窗只装得下一
+    /// 件的额度照样开出两件。
+    #[tokio::test]
+    async fn the_first_admission_holds_the_room_the_second_one_would_have_taken() {
+        let state = test_state(vec![stub_upstream("https://tight.example.com", "m1")]);
+        let candidates: Vec<&LlmUpstream> = state.config.llm_upstreams.iter().collect();
+        let now = Utc::now().timestamp();
+        let key = LlmHealthTable::key(&state.config.llm_upstreams[0]);
+        state.window_pace.lock().unwrap().by_upstream.insert(
+            key.clone(),
+            UpstreamPace::measured(
+                cog_core::LlmWindowPace {
+                    measured_upstreams: 1,
+                    allowance_tokens: 1_500_000,
+                    spent_tokens: 0,
+                    reserve_tokens: 1_000_000,
+                    reserve_population: 7,
+                    window_secs: 2_592_000,
+                    window_start_unix: now - 60,
+                },
+                1.0,
+            ),
+        );
+        assert!(
+            paced_refusal(
+                &state,
+                &candidates,
+                "openai",
+                "agent:generator",
+                "resident_worker",
+                Some("task-a"),
+                None,
+            )
+            .await
+            .is_none(),
+            "the first job fits in this window"
+        );
+        let refusal = paced_refusal(
+            &state,
+            &candidates,
+            "openai",
+            "agent:generator",
+            "resident_worker",
+            Some("task-b"),
+            None,
+        )
+        .await
+        .expect("the room task-a was promised is not task-b's to take");
+        assert_eq!(refusal.blocked_upstreams, vec![key]);
+        assert_eq!(
+            state
+                .pace_reservations
+                .lock()
+                .unwrap()
+                .held_tokens(&LlmHealthTable::key(&state.config.llm_upstreams[0])),
+            1_000_000,
+            "one hold per admitted job, and it is the whole-job reserve"
+        );
+    }
+
     /// 配速量的是**逐家**的窗口，拒的也必须是同一批：候选里只要有一家自己的
     /// 窗口还装得下一件整任务，这次调用就该放行。把"没量到窗口的一家"算进来
     /// 尤其重要——它没有尺子，不是没有额度；用别家的尺子关掉它，就是 2026-10-18
@@ -13830,7 +14040,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 ),
             );
         }
-        let evidence = pace_evidence(&reading, &candidates, now)
+        let no_holds = crate::pace_reservations::PaceReservations::default();
+        let evidence = pace_evidence(&reading, &no_holds, &candidates, now)
             .expect("both candidates are over their own line");
         assert_eq!(evidence.measured_upstreams, 2);
         assert_eq!(
@@ -13853,7 +14064,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         unmeasured
             .by_upstream
             .remove(&LlmHealthTable::key(&upstreams[1]));
-        assert!(pace_evidence(&unmeasured, &candidates, now).is_none());
+        assert!(pace_evidence(&unmeasured, &no_holds, &candidates, now).is_none());
 
         // 一家自己的窗口还装得下 ⇒ 同样不拒。
         let mut roomy = reading;
@@ -13861,7 +14072,97 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let mut entry = roomy.by_upstream[&key];
         entry.pace.allowance_tokens = 1_000_000;
         roomy.by_upstream.insert(key, entry);
-        assert!(pace_evidence(&roomy, &candidates, now).is_none());
+        assert!(pace_evidence(&roomy, &no_holds, &candidates, now).is_none());
+    }
+
+    /// 同一份快照上连着判的 N 件事，只放过装得下的那么多件。
+    ///
+    /// 这一窗的允许量是 1,500,000，一件整任务的预留是 1,000,000：第一件放行，
+    /// 它要占的额度记在放行它的那一家头上，第二件就得看到这份占位而被拒。少了
+    /// 这份占位，两件读到的都是"账上还没花"，一窗装一件的额度会开出两件——那
+    /// 正是并行开跑、没有一件走到产出那条路径。
+    #[test]
+    fn a_second_job_on_the_same_snapshot_does_not_get_the_first_ones_room() {
+        let upstreams = [stub_upstream("https://tight.example.com", "m1")];
+        let candidates: Vec<&LlmUpstream> = upstreams.iter().collect();
+        let key = LlmHealthTable::key(&upstreams[0]);
+        let now = Utc::now().timestamp();
+        let reading = WindowPaceReading {
+            // 池级是报表：它说的是这一窗有多大、账上花了多少，不掺"许出去多少"
+            // ——那一份逐家记在 `by_upstream` 里，拒绝行上就在同名上游那一项旁边。
+            pool: cog_core::LlmWindowPace {
+                measured_upstreams: 1,
+                allowance_tokens: 1_500_000,
+                spent_tokens: 0,
+                reserve_tokens: 1_000_000,
+                reserve_population: 9,
+                window_secs: 1_000,
+                window_start_unix: now - 10,
+            },
+            by_upstream: [(
+                key.clone(),
+                UpstreamPace::measured(
+                    cog_core::LlmWindowPace {
+                        measured_upstreams: 1,
+                        allowance_tokens: 1_500_000,
+                        spent_tokens: 0,
+                        reserve_tokens: 1_000_000,
+                        reserve_population: 9,
+                        window_secs: 1_000,
+                        window_start_unix: now - 10,
+                    },
+                    1_500.0,
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let mut held = crate::pace_reservations::PaceReservations::default();
+
+        let first = pace_verdict(&reading, &held, &candidates, now);
+        assert_eq!(
+            first,
+            PaceVerdict::Free {
+                upstream: key.clone(),
+                job_tokens: 1_000_000,
+            },
+            "the first job fits in this window"
+        );
+        held.admit("task-one", &key, 1_000_000, now);
+
+        // 第二件：账上仍然一行没花，但那 1,000,000 已经被许出去了。
+        assert_eq!(
+            pace_verdict(&reading, &held, &candidates, now),
+            PaceVerdict::Blocked(PaceEvidence {
+                measured_upstreams: 1,
+                allowance_tokens: 1_500_000,
+                spent_tokens: 0,
+                reserve_tokens: 1_000_000,
+                window_start_unix: now - 10,
+                upstreams: vec![PaceUpstreamEvidence {
+                    upstream: key.clone(),
+                    allowance_tokens: 500_000,
+                    spent_tokens: 0,
+                    reserve_tokens: 1_000_000,
+                    held_tokens: 1_000_000,
+                    window_start_unix: now - 10,
+                    wait_secs: reading.by_upstream[&key].wait_secs(now),
+                }],
+            }),
+            "the room the first job was promised is not the second job's to take"
+        );
+
+        // 占在别家头上的额度关不了这一家。
+        let mut elsewhere = crate::pace_reservations::PaceReservations::default();
+        elsewhere.admit("task-two", "https://other.example.com|m9", 1_000_000, now);
+        assert_eq!(pace_verdict(&reading, &elsewhere, &candidates, now), first);
+
+        // 那件活真的开跑之后，账本自己算它的花销，占位撤掉，窗口重新开张。
+        let started: std::collections::HashSet<String> =
+            ["task-one".to_string()].into_iter().collect();
+        held.retire(&started, now + 1);
+        assert_eq!(pace_verdict(&reading, &held, &candidates, now), first);
     }
 
     /// 表里该有谁：没有量到窗口的上游不进去。给它一个默认值就等于把"没量过"
@@ -15808,6 +16109,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             last_caller_failure_unix: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             pool_seeded: Arc::new(AtomicBool::new(true)),
             window_pace: Arc::new(std::sync::Mutex::new(WindowPaceReading::default())),
+            pace_reservations: Arc::new(std::sync::Mutex::new(
+                crate::pace_reservations::PaceReservations::default(),
+            )),
             measured_windows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             spend_reading: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::spend_reading::Reading::default(),

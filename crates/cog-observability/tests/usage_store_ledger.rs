@@ -416,6 +416,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
             allowance_tokens: 400,
             spent_tokens: 900,
             reserve_tokens: 300,
+            held_tokens: 250,
             window_start_unix: 1_700_000_000,
             wait_secs: 120,
         }],
@@ -455,6 +456,11 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     let first = &upstreams[0];
     assert_eq!(first["upstream"], "https://a.example.com|m1");
     assert_eq!(first["wait_secs"], 120);
+    assert_eq!(
+        first["held_tokens"], 250,
+        "the part already promised to jobs that have not spent it yet has to land beside \
+         the allowance it was subtracted from, or the row's own arithmetic does not close"
+    );
 
     // A row that was not paced has no reading to carry, and `NULL` is that
     // absence. A zero here would recompute as "the gap was closed exactly",
