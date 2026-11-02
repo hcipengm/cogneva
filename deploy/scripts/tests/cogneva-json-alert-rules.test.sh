@@ -103,11 +103,11 @@ run "${work}/c4d.json"
 [ "$rc" -eq 1 ] && ok "退回只按 phase 折叠：单测红（跨工作负载的比值重新算数）" \
     || bad "退回只按 phase 折叠应红" "1" "$rc"
 
-# 4e) 把缓存命中率的折叠键从 `(actor, api_style)` 退回 `(actor)`：两个协议面那一格必须红。
-# 同一个角色的 prompt 会落到同一家的两个协议面上，两面的缓存行为可以差六倍（2026-11-02
-# 在账本上量的：OpenAI 兼容面 38.6%，Anthropic 面 6.2%，角色都一样）。只按 actor 折叠时，
-# 健康的一面把掉到地上的那一面加成 0.38，规则在那一小时一声不响——而那个面此刻正为每个
-# token 付全价。这一格证明缓存命中率那份夹具真的在为「面要分开判」站岗。
+# 4e) 把缓存命中率的折叠键从 `(actor, api_style)` 退回 `(actor)`：两个准入面那一格必须红。
+# 同一个角色的 prompt 会落到同一家地址上两个准入面的条目，两条的缓存行为可以差六倍
+# （2026-11-02 在账本上量的：38.6% 对 6.2%，角色都一样）。只按 actor 折叠时，健康的那面
+# 把掉到地上的那面加成 0.38，规则在那一小时一声不响——而那一面此刻正为每个 token 付全价。
+# 这一格证明缓存命中率那份夹具真的在为「面要分开判」站岗。
 cache_case="${repo}/deploy/k3s/observability/tests/cogneva-json-llm-cache-hit.test.yaml"
 mutate "${work}/c4e.json" 'rule["promql"] = rule["promql"].replace("sum by (actor, api_style)", "sum by (actor)").replace("and on (actor, api_style)", "and on (actor)").replace("max by (actor, api_style)", "max by (actor)")' llm_cache_hit_share_collapsed
 run "${work}/c4e.json" "${cache_case}"
