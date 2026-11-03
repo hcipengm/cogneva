@@ -12,6 +12,7 @@ pub mod observable;
 pub mod profile;
 pub mod resume;
 pub mod squad;
+pub mod upstream_gate;
 
 /// The label naming how a reading ended.
 ///

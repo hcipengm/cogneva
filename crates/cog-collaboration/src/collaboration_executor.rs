@@ -292,7 +292,28 @@ impl cog_core::TaskExecutor for CollaborationExecutor {
 
 impl CollaborationExecutor {
     /// [`cog_core::TaskExecutor::execute`] 的主体，不含回收。
+    ///
+    /// 池级闸门在这里，不在各条执行的内部：入口之下三条路（意图判定、分解、原子
+    /// 执行）都要调上游，而闸门要挡下的正是“整条链跑起来才发现第一次调用被拒”。
+    /// 见 [`crate::upstream_gate`]。
     async fn execute_unretired(&self, task: &Task) -> SFResult<TaskResult> {
+        if let Some(wait) = crate::upstream_gate::blocked_now() {
+            return Err(crate::upstream_gate::refusal(wait));
+        }
+        let result = self.run_the_task(task).await;
+        match &result {
+            // 一次被服务的执行是池子这一面还有成员能干活的最直接的证据。
+            Ok(_) => crate::upstream_gate::served(),
+            Err(e) => {
+                if let Some(wait) = crate::upstream_gate::trip_from(&e.to_string()) {
+                    crate::upstream_gate::refused(wait);
+                }
+            }
+        }
+        result
+    }
+
+    async fn run_the_task(&self, task: &Task) -> SFResult<TaskResult> {
         // External-intent actionability assessment is a lightweight single-agent
         // multimodal call, not the Squad→PGE→SelfReview codegen pipeline. It must
         // be intercepted before the squad paths (the task carries no
