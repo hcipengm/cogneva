@@ -787,6 +787,29 @@ spec:
             summary: "有 {{ $value }} 面声明要读的读数按名字取不到"
             description: "面表（`scripts/host/cogneva-reading-witness-reading.sh` 读的那份名册）里逐面写了这一面欠哪个读数，而那个读数名在宿主端点上取不到值。逐面点名读 `reading_witness_face_resolved{face=…} == 0`。修的是面表那一行的名字或那一面的生产者，不是读数本身——同一条链上「读数没有」与「面表写错了」是两件事，这一条只管后者。"
 
+        # 自足表每一格点名的名字，在它自己的正本里还解不解析得到。判据是「写下这个名字的
+        # 那一刻它存在」（2026-10-17 两起：一格写着早已被覆盖的状态，另一格读着一个 systemd
+        # 根本没有的属性），而名字只会在重构、单元改名、规则换名时失效——静态读法看不见，
+        # 只有按拍问一次才看得见。这一条就是那个按拍判词的读者。
+        #
+        # 为什么留半小时：改名通常落在一笔提交里，两侧（声明表与正本）在同一棵树上是同一步
+        # 改完的；半小时之内自己就抹平了。留下的只有跨仓的那种——声明表在脑库、规则正本在
+        # 公开仓，一侧先落、另一侧还没跟上，那正是要有人动手的时刻。
+        #
+        # 为什么不写成 `> 0` 而用 `== 1`：判词本身是 0/1（见生产者表头），计数不在这里；
+        # 这一拍解析了几个名字看 `cogneva_declared_identifiers_checked`——名单被读窄时
+        # 判词也会是 0，而分母不会跟着说谎。
+        - alert: CognevaDeclaredIdentifiersMissing
+          expr: max(cogneva_declared_identifiers_missing) == 1
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "读数正确性"
+            severity: warning
+          annotations:
+            summary: "自足表的声明点到了不存在的名字"
+            description: "`scripts/host/cogneva-declared-identifiers-reading.sh` 每一拍把自足声明表里能被机器检查的名字（反引号里的 `backup_*`／`COGNEVA_BACKUP_*` 标识符、`systemctl show … -p <属性>` 的属性名）拿去它自己的正本里解析（规则名查告警规则正本与公开仓树，systemd 属性查该单元自己的属性名册）。`checked` 是这一拍解析了几个名字（分母——表读窄时判词也是 0），判词 1 表示至少有一个名字指向空。跑 `bash scripts/host/cogneva-declared-identifiers-reading.sh --key-value` 与门本身（`scripts/gates/check-declared-identifiers.py`）会逐条点名它在哪一行的哪一格。修的是声明里那个名字（改成正本里此刻的名字，或者把已经不存在的那条声明删掉），不是把名字摘成散文来绕过判据。读不到正本、表或 systemd 时生产者退 3、一条序列都不印，宁可空集也不印 `missing=0`。"
+
         # 每一面的**第一条读数**有没有读者。读数长出来、每拍都在印、却没有任何规则、面板或
         # 代码读它——这样的读数在读数面上与「这一面压根没写生产者」逐字同形：都是一条决定
         # 也不产生。这一环此前没有任何机器可读的答案，2026-10-28 实测 13 面里 2 面无读者

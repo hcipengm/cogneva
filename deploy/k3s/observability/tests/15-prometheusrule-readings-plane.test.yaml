@@ -327,6 +327,35 @@ tests:
         alertname: CognevaReadingWitnessUnresolved
         exp_alerts: []
 
+  # 自足表的声明点到不存在的名字。`max()` 去掉抓取者身份维，标签只剩规则自己的三个。
+  - name: 自足表点到空名字会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_declared_identifiers_missing{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x50'
+      - series: 'cogneva_declared_identifiers_checked{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '10x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaDeclaredIdentifiersMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 读数正确性
+
+  - name: 自足表这一拍名字都解析得到不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_declared_identifiers_missing{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x50'
+      - series: 'cogneva_declared_identifiers_checked{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '10x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaDeclaredIdentifiersMissing
+        exp_alerts: []
+
   - name: 两份发布者名单不一致会响
     interval: 1m
     input_series:
