@@ -5,10 +5,13 @@
 # 把 `changes(...) == 0` 写成 `>= 0`（恒真）、把 `for:` 写成 `15y`、把比值界写成 `>= 0`，
 # 结构门全都绿。这里让 Prometheus 自己的规则引擎跑一遍，每一格都带一份反向证据。
 #
-# 反向证据分三种，因为「什么时候不该响」有三种：
-#   * 池子关着（`eval_pool_available=0`）——已知原因，不是新故障；
+# 反向证据分几种，因为「什么时候不该响」有几种：
+#   * 池子关着（`eval_pool_available=0`）——已知原因，不是新故障（但只对第一条规则成立：
+#     `CognevaEvalArmNoRowsInDays` 故意不看池子，见第七格的注释）；
 #   * 已判数在涨——它在干活；
-#   * 用例数为 0——那个比值是 0/0，不是「一个都没丢」。
+#   * 用例数为 0——那个比值是 0/0，不是「一个都没丢」；
+#   * 题判完了（`remaining=0`）——不涨是对的；
+#   * 读数自己死了（`host_reading_producer_up=0`）——读的是死读数，要修的不是评测臂。
 #
 # 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
 #         deploy/k3s/observability/manifests/15-prometheusrule-host-readings.yaml \
@@ -113,4 +116,72 @@ tests:
     alert_rule_test:
       - eval_time: 150m
         alertname: CognevaEvalBenchCasesUnattributed
+        exp_alerts: []
+
+  # 七、还差着题、判过用例整整三天一题没涨、读数活着 ⇒ 三天之前不许响，之后必须响。
+  # 这一格用的是「从没判出过任何一题」那种形状（`eval_judged_cases` 一直是 0）：
+  # `eval_last_progress_age_seconds` 在这时是缺席的，判据只有 `changes(...[24h])`
+  # 一条路——它必须自己也盖得住这一种。
+  - interval: 1m
+    input_series:
+      - series: 'host_reading_producer_up{producer="eval_evidence"}'
+        values: '1x4500'
+      - series: 'eval_judged_remaining'
+        values: '198x4500'
+      - series: 'eval_judged_cases'
+        values: '0x4500'
+    alert_rule_test:
+      - eval_time: 48h
+        alertname: CognevaEvalArmNoRowsInDays
+        exp_alerts: []
+      - eval_time: 74h
+        alertname: CognevaEvalArmNoRowsInDays
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "商用交付"
+
+  # 八、负对照：已判数在涨。这一格抓的是「拿池子开没开来当条件」的写法被删掉之后，
+  # `changes(...) == 0` 跟着被写成恒真——那样「在涨」也会被报成三天没动。
+  - interval: 1m
+    input_series:
+      - series: 'host_reading_producer_up{producer="eval_evidence"}'
+        values: '1x4500'
+      - series: 'eval_judged_remaining'
+        values: '198x4500'
+      - series: 'eval_judged_cases'
+        values: '0+1x4500'
+    alert_rule_test:
+      - eval_time: 74h
+        alertname: CognevaEvalArmNoRowsInDays
+        exp_alerts: []
+
+  # 九、负对照：读数本身死了（生产者每拍都没跑成）。这时「没在涨」读的是一份死掉的
+  # 读数，要修的是读数、不是评测臂；这一格抓的是在场证明那一叶被删掉。
+  - interval: 1m
+    input_series:
+      - series: 'host_reading_producer_up{producer="eval_evidence"}'
+        values: '0x4500'
+      - series: 'eval_judged_remaining'
+        values: '198x4500'
+      - series: 'eval_judged_cases'
+        values: '0x4500'
+    alert_rule_test:
+      - eval_time: 74h
+        alertname: CognevaEvalArmNoRowsInDays
+        exp_alerts: []
+
+  # 十、负对照：题判完了（`remaining=0`）。这时不涨是对的，与第一条规则同一个理由。
+  - interval: 1m
+    input_series:
+      - series: 'host_reading_producer_up{producer="eval_evidence"}'
+        values: '1x4500'
+      - series: 'eval_judged_remaining'
+        values: '0x4500'
+      - series: 'eval_judged_cases'
+        values: '198x4500'
+    alert_rule_test:
+      - eval_time: 74h
+        alertname: CognevaEvalArmNoRowsInDays
         exp_alerts: []

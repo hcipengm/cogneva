@@ -1025,6 +1025,45 @@ spec:
             summary: "{{ $value }} 的用例归不到任何一个基准上"
             description: "`eval_bench_unattributed / eval_bench_cases` 超过一成：这些行不进任何基准的得分，也不进任何基准的失败，两个方向都看不见。查：评测轮那一侧的基准名与检查点里的 `scaffold`/`benchmark` 字段是不是同一套写法（改名、大小写、前缀都会让归并落空）。读数：`bash scripts/host/eval-evidence-reading.sh` 的 `bench_unattributed=`。"
 
+        # 还差着题、已判数连续三天一行没涨，不管池子开没开。
+        #
+        # 与前一条问的不是同一件事。前一条问「池子开着、题还剩着，为什么一行都不涨」，
+        # 它**故意**把池子关着的那一段排除在外——那一段的成因已知，报它就是拿已知状况
+        # 当新故障。可知不等于有人知道：2026-10-19 到 11-04，判过用例停在 0、池子关了
+        # 八天，读数面每一格都正常，没有任何规则、面板或人被告知，这一臂就这样空转了
+        # 半个月。这一条补的正是那个空档：不判成因，只判「还差着题，而三天里一行都没
+        # 判出来」。成因看 `eval_verdict` 与 `eval_last_run_cause`，前者说能不能成表、
+        # 后者说最近一轮的失败是不是全被上游拒了。
+        #
+        # 为什么界是三天而不是一天：这一臂的等待按小时到天算（配额窗口复位、实例镜像
+        # 拉取），一天的界会把一次正常的等待报成故障；三天的界漏不掉半个月。
+        # 为什么用 `for: 72h` 而不是一个 72 小时的窗口函数：从未判出过任何一题的臂上
+        # `eval_judged_cases` **一直**是 0，`changes(...[72h])` 同样是 0（两种形状都
+        # 盖得住），而 `eval_last_progress_age_seconds` 在「从没涨过」时是缺席的
+        # （读数印的是 `age_s=-`），拿它当唯一判据会让最坏的那种局面恰好读不到。
+        #
+        # 代价写在明面上：`for:` 的计时在规则引擎里，Prometheus 重启一次就从头计。这条只
+        # 因此会**迟到**，不会早响也不会假绿——本平台的监控栈是装一次、很少重启的那一类，
+        # 重启间隔远长于三天。真要连这一层也去掉，就得让读数自己印「已多久没判出一行」
+        # 的年龄（把「从没判出过」也算成年龄），那是改生产者，不是改这条规则。
+        #
+        # `host_reading_producer_up` 是这条规则自己的在场证明：生产者死掉以后，它最后
+        # 一次写下的值会一直挂在那儿装活着，那时「没在涨」读的是一份**死掉的读数**，
+        # 报出来的是假故障，要修的是读数而不是评测臂。
+        - alert: CognevaEvalArmNoRowsInDays
+          expr: |
+            max(host_reading_producer_up{producer="eval_evidence"}) == 1
+              and max(eval_judged_remaining) > 0
+              and max(changes(eval_judged_cases[24h])) == 0
+          for: 72h
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "商用交付"
+            severity: warning
+          annotations:
+            summary: "评测臂还差着题，三天里一行都没判出来"
+            description: "`eval_judged_remaining > 0` 而 `eval_judged_cases` 连续三天没有变化，且读数本身是活的（`host_reading_producer_up{producer=\"eval_evidence\"}=1`）。这一条不看池子开没开：池子关着时「不涨」虽是已知原因，但『已知』要有人知道才算数。先看 `eval_verdict`（这一跑成不成表）与 `eval_last_run_cause`（最近一轮的失败是不是全被上游拒了，`upstream-refused` 还带 `eval_last_run_retry_after_seconds`），再看 `eval_runs_by_outcome` 与 `eval_bench_cases`：轮次根本没起、起而不判、判而不归，三种的修法各不相同。读数：`bash scripts/host/eval-evidence-reading.sh`。"
+
     # 端到端十环：一笔变更从被提出到用户真的用上它。这一族此前一条规则都没有，
     # 而它恰恰是最不能靠肉眼的一族——2026-10-20 与 2026-10-22 两次实测都是「每一环
     # 各自的尺子都合格，整条链却断了」：主线上没有对应镜像（第 3 环），部署器最后

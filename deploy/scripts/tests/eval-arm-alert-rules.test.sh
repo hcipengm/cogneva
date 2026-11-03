@@ -8,7 +8,9 @@
 #      否则「停住」与「在涨」在夹具上分不开；
 #   2. 卡死那一条的 `for: 1h` 改成 `for: 15y`：第一格 firing 必须红——否则「永远不会亮」也绿；
 #   3. `eval_bench_unattributed / eval_bench_cases > 0.1` 改成 `>= 0`：第五格负对照必须红
-#      ——否则「一条都归得上」也会被报成「丢了一成」。
+#      ——否则「一条都归得上」也会被报成「丢了一成」；
+#   4. 三天没判出来那一条的 `for: 72h` 改成 `for: 15y`：第七格 firing 必须红——那条规则的
+#      全部重量都在这个 `for` 上，改没了它与「永远不响」在夹具上同形。
 # 另有两格证明它**不会**白红：真文件必须绿；拿不到 promtool 时必须退 3（看不了 ≠ 一致），
 # 不许把「没跑」报成「通过」。
 #
@@ -44,12 +46,16 @@ if [ "$rc" -eq 3 ]; then
 fi
 
 # 1) `changes(...) == 0` -> `>= 0`：恒真，第三格负对照必须红。
+#
+# 这条叶子两处出现（池开着那一条，与「三天没判出来」那一条），两处一起改坏才有意义：
+# 只改一处时另一处还会拦住负对照，夹具照样红，看上去像这一格在守，其实守的是别处。
+# 所以这里数的是两处，不是「唯一」。
 python3 - "$manifest" "${work}/m1.yaml" <<'PY'
 import sys
 src, out = sys.argv[1], sys.argv[2]
 s = open(src, encoding="utf-8").read()
 old = "and max(changes(eval_judged_cases[24h])) == 0"
-assert s.count(old) == 1, "锚点不唯一"
+assert s.count(old) == 2, "锚点不唯一"
 open(out, "w", encoding="utf-8").write(s.replace(old, "and max(changes(eval_judged_cases[24h])) >= 0"))
 PY
 grep -q 'max(changes(eval_judged_cases\[24h\])) >= 0' "${work}/m1.yaml" \
@@ -87,7 +93,21 @@ run "${work}/m3.yaml"
 [ "$rc" -eq 1 ] && ok "比值界写成 >= 0：单测红（负对照抓得住「一条都没丢」）" \
     || bad "比值界写成 >= 0 应红" "1" "$rc"
 
-# 4) 拿不到 promtool：必须退 3，不许报绿。
+# 4) 「三天没判出来」那一条的 `for: 72h` -> `for: 15y`：永远不会亮，第七格 firing 必须红。
+python3 - "$manifest" "${work}/m4.yaml" <<'PY'
+import sys
+src, out = sys.argv[1], sys.argv[2]
+s = open(src, encoding="utf-8").read()
+i = s.index("- alert: CognevaEvalArmNoRowsInDays")
+j = s.index("for: 72h", i)
+open(out, "w", encoding="utf-8").write(s[:j] + "for: 15y" + s[j + len("for: 72h"):])
+PY
+grep -q 'for: 15y' "${work}/m4.yaml" && ok "改坏三天界那一格改到了" || bad "三天界那一格没改到" "已改坏" "原样"
+run "${work}/m4.yaml"
+[ "$rc" -eq 1 ] && ok "三天界写成 15y：单测红（抓得住「永远不会亮」）" \
+    || bad "三天界写成 15y 应红" "1" "$rc"
+
+# 5) 拿不到 promtool：必须退 3，不许报绿。
 PROMTOOL=/nonexistent/promtool bash "$runner" "$manifest" "$case_file" >"${work}/out4" 2>&1; rc=$?
 [ "$rc" -eq 3 ] && ok "拿不到 promtool：退 3（看不了 ≠ 一致）" || bad "拿不到 promtool 应退 3" "3" "$rc"
 
