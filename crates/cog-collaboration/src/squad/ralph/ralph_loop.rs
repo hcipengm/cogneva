@@ -73,6 +73,29 @@ pub struct RalphIteration {
     /// nothing, which is exactly what the stall verdict is looking for.
     #[serde(default)]
     pub progress: Option<ProgressSignals>,
+    /// 这一轮属于哪一次执行——同一个 `RalphLoop` 实例同一个 id，也就是运行名字
+    /// 末尾那截短码。
+    ///
+    /// 身份此前只活在名字里（日志、沙箱目录），归档里没有它；而 `iteration`
+    /// 每次执行都从 1 重新数。于是一件活被几任 ralph 接力跑过之后，归档历史
+    /// 里出现回退的轮次时，读不出这是换了一任还是同一任换了手段。日子一久
+    /// 日志轮转掉，"这件活被跑过几任、每任跑到第几轮"就再也读不回来。
+    ///
+    /// 「第几个 ralph」不需要另立一个计数器：在**完整**归档里（`archived_iterations`
+    /// 按 offset 读全部事件）这一列第几次出现，它就是这一任的序号。计数器还要跨
+    /// 进程对齐，序号不必。注意 board 上那份 `ralph_history` 只留尾窗
+    /// （`stagnation_window` 条），拿它数出来的是"这段尾窗里的第几任"，不是绝对
+    /// 序号——问绝对值要读归档，不读 board。
+    ///
+    /// `None` 只出现在加这一列之前归档的条目上：没记过就是没记过，不补一个
+    /// 假身份。
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// 这一轮结束的时刻（Unix 秒）。board 上的历史没有时间戳，冷归档的时间
+    /// 在一次一行的事件上、不在条目里——于是只看归档的人说不出这段历史跨了
+    /// 多久、哪几轮是上游停供期间白跑的。只在这一轮自己的记录上带。
+    #[serde(default)]
+    pub finished_at: Option<u64>,
 }
 
 /// 全局重置策略。
@@ -177,6 +200,15 @@ fn iteration_run_id(owner: Option<&str>, stage: &str, iteration: u32, nonce: &st
         Some(owner) => format!("{owner}-ralph-{stage}-i{iteration}-{nonce}"),
         None => format!("ralph-{stage}-i{iteration}-{nonce}"),
     }
+}
+
+/// 现在几点（Unix 秒）。读不到系统钟时退到 0：一条时刻记错的迭代好过一条
+/// 因为读不到钟就写不进去的迭代（后者会让整段归档缺一轮）。
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Ralph Loop 外层质量控制循环。
@@ -383,7 +415,12 @@ impl RalphLoop {
     /// archive in full, and write the board tail. The three are one step
     /// because an iteration that reaches only some of them is exactly the loss
     /// this separation is meant to prevent.
-    async fn record_iteration(&mut self, iteration: RalphIteration) {
+    ///
+    /// 身份与时刻在这一处盖，不在三个构造点上各写一遍：归档只有一个入口，
+    /// 而漏盖一处的那个轮次，恰好就是事后要靠它来定位的那一轮。
+    async fn record_iteration(&mut self, mut iteration: RalphIteration) {
+        iteration.run_id = Some(self.run_nonce.clone());
+        iteration.finished_at = Some(now_unix());
         self.history.push(iteration);
         if let Some(latest) = self.history.last() {
             self.archive_iteration(latest).await;
@@ -573,6 +610,8 @@ impl RalphLoop {
                     feedback: reason.clone(),
                     snapshot: serde_json::json!({ "plan": &plan, "reason": &reason }),
                     progress: None,
+                    run_id: None,
+                    finished_at: None,
                 })
                 .await;
                 if sleep_through_pace(&reason).await {
@@ -605,6 +644,8 @@ impl RalphLoop {
                 feedback: feedback.clone(),
                 snapshot: snapshot.clone(),
                 progress,
+                run_id: None,
+                finished_at: None,
             })
             .await;
 
@@ -769,6 +810,8 @@ impl RalphLoop {
                 feedback: feedback.clone(),
                 snapshot,
                 progress,
+                run_id: None,
+                finished_at: None,
             })
             .await;
 
@@ -867,6 +910,8 @@ impl RalphLoop {
                 feedback: feedback.clone(),
                 snapshot: snapshot.clone(),
                 progress,
+                run_id: None,
+                finished_at: None,
             })
             .await;
 
@@ -1615,6 +1660,8 @@ mod tests {
                 feedback: "Code needs improvement".into(),
                 snapshot: serde_json::Value::Null,
                 progress: None,
+                run_id: None,
+                finished_at: None,
             },
             RalphIteration {
                 iteration: 2,
@@ -1623,6 +1670,8 @@ mod tests {
                 feedback: "Code needs improvement".into(),
                 snapshot: serde_json::Value::Null,
                 progress: None,
+                run_id: None,
+                finished_at: None,
             },
         ];
 
@@ -1736,6 +1785,9 @@ mod tests {
             feedback: feedback.to_string(),
             snapshot: serde_json::json!({}),
             progress: None,
+            // 这些夹具判的是停滞窗口，不是身份：照加列之前归档的条目来贴。
+            run_id: None,
+            finished_at: None,
         }
     }
 
@@ -2071,6 +2123,8 @@ mod tests {
             feedback: feedback.to_string(),
             snapshot: serde_json::json!({}),
             progress: Some(progress),
+            run_id: None,
+            finished_at: None,
         }
     }
 
@@ -2994,6 +3048,61 @@ mod tests {
             .expect("history field must be persisted");
         let stored: Vec<RalphIteration> = serde_json::from_str(&raw).unwrap();
         assert_eq!(stored.len(), 3);
+
+        // 归档要能回答「这是第几任 ralph 在跑」。轮次号答不了：它每次执行都从
+        // 1 重数，上面 history[0] 与 history[1] 都是 1。身份才是那一半。
+        assert_eq!(stored[0].run_id.as_deref(), Some(first.run_nonce.as_str()));
+        assert_eq!(stored[1].run_id.as_deref(), Some(second.run_nonce.as_str()));
+        assert_eq!(stored[2].run_id.as_deref(), Some(second.run_nonce.as_str()));
+        // 序号不是新立的计数器，而是这一列在有序历史里第几次出现——不跨进程
+        // 对齐任何状态，重启之后读到的仍是同一段历史。
+        let mut seen: Vec<&str> = Vec::new();
+        let mut ordinals = Vec::new();
+        for it in &stored {
+            let id = it.run_id.as_deref().expect("每一轮都要带身份");
+            match seen.iter().position(|s| *s == id) {
+                Some(pos) => ordinals.push(pos as u32 + 1),
+                None => {
+                    seen.push(id);
+                    ordinals.push(seen.len() as u32);
+                }
+            }
+        }
+        assert_eq!(ordinals, vec![1, 2, 2]);
+
+        // 绝对序号读的是归档、不是 board：board 只留尾窗，一件活被跑过很多任
+        // 之后，尾窗里数出来的「第 1 任」其实是第 N 任。归档按 offset 读全量。
+        let archived = archived_iterations(backend.as_ref(), "task-1", 100)
+            .await
+            .expect("cold archive must be readable");
+        assert_eq!(archived.len(), 3);
+        assert_eq!(archived[0].run_id, stored[0].run_id);
+        assert_eq!(archived[2].run_id, stored[2].run_id);
+
+        // 每一轮都带时刻：board 上这段历史没有别的地方能问出它跨了多久。
+        let now = now_unix();
+        for it in &stored {
+            let at = it.finished_at.expect("每一轮都要带时刻");
+            assert!(at > 1_700_000_000 && at <= now, "{at} not in {now}'s past");
+        }
+        assert!(stored[0].finished_at <= stored[2].finished_at);
+    }
+
+    /// 加列之前归档的条目照旧读得出来：没记过身份就是 `None`，不补一个假的，
+    /// 那样下一次归档时它会被读成"另一任 ralph"。
+    #[test]
+    fn a_legacy_iteration_record_without_identity_still_loads() {
+        let legacy = serde_json::json!({
+            "iteration": 4,
+            "reset_strategy": "Modified",
+            "pge_passed": false,
+            "feedback": "still bad",
+            "snapshot": {"plan": {}},
+        });
+        let it: RalphIteration = serde_json::from_value(legacy).unwrap();
+        assert_eq!(it.iteration, 4);
+        assert!(it.run_id.is_none());
+        assert!(it.finished_at.is_none());
     }
 
     /// 冷归档要留住 board 不再留的那部分。一轮不收敛的执行在 board 上只剩

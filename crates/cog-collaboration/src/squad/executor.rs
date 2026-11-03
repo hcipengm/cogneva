@@ -1463,6 +1463,8 @@ mod tests {
                 feedback: "evaluator: criteria unmet".into(),
                 snapshot: pipeline_snapshot("fail", "evaluator: criteria unmet"),
                 progress: None,
+                run_id: None,
+                finished_at: None,
             }],
         };
         let contributions = build_contributions_from_verdict(&verdict, "squad-x");
@@ -1523,6 +1525,8 @@ mod tests {
                     "evaluation": evaluation_json("partial", "roundtable rejected"),
                 }),
                 progress: None,
+                run_id: None,
+                finished_at: None,
             }],
         };
         let contributions = build_contributions_from_verdict(&verdict, "squad-z");
@@ -1553,6 +1557,8 @@ mod tests {
                 feedback: String::new(),
                 snapshot: serde_json::json!({"plan": {}, "evaluation": "not-an-object"}),
                 progress: None,
+                run_id: None,
+                finished_at: None,
             }],
         };
         let contributions = build_contributions_from_verdict(&verdict, "squad-w");
