@@ -50,18 +50,33 @@ pub use cog_core::FACE_WITHOUT_A_MEMBER;
 /// 前缀（`API error (HTTP 503): `）由 provider 加在同一行里，所以从第一个 `{` 起
 /// 取；取不到合法 JSON 就是没这句话。
 fn names_a_face_without_a_member(msg: &str) -> bool {
-    let Some(start) = msg.find('{') else {
-        return false;
-    };
+    refusal_body(msg)
+        .is_some_and(|v| v.get("reason").and_then(|r| r.as_str()) == Some(FACE_WITHOUT_A_MEMBER))
+}
+
+/// 网关那条池级拒绝自己报的"下次值得再问"的时刻，从同一份正文里取。
+///
+/// 与 [`names_a_face_without_a_member`] 读的是同一个对象：那句话在正文里留了原因，
+/// 也留了时钟，两个都在这格 JSON 里。不另找一份来源（响应头也行），是因为换后端
+/// 那一跳手上只有这段正文——事件里没有头，而为了拿头去等那一条失败的响应结束，
+/// 会把换后端压在一个与我们无关的写日志动作后面。
+fn declared_wait_in_body(msg: &str) -> Option<u64> {
+    refusal_body(msg)?.get("retry_after_seconds")?.as_u64()
+}
+
+/// 网关那条拒绝正文的对象本身。取不到合法 JSON 就是没有这段正文。
+fn refusal_body(msg: &str) -> Option<serde_json::Value> {
+    let start = msg.find('{')?;
     let body = &msg[start..];
-    let parsed = serde_json::from_str::<serde_json::Value>(body).or_else(|_| {
-        // 后面可能还跟着别的散文；取到最后一个 `}` 为止。
-        match body.rfind('}') {
-            Some(end) => serde_json::from_str::<serde_json::Value>(&body[..=end]),
-            None => serde_json::from_str::<serde_json::Value>(body),
-        }
-    });
-    parsed.is_ok_and(|v| v.get("reason").and_then(|r| r.as_str()) == Some(FACE_WITHOUT_A_MEMBER))
+    serde_json::from_str::<serde_json::Value>(body)
+        .or_else(|_| {
+            // 后面可能还跟着别的散文；取到最后一个 `}` 为止。
+            match body.rfind('}') {
+                Some(end) => serde_json::from_str::<serde_json::Value>(&body[..=end]),
+                None => serde_json::from_str::<serde_json::Value>(body),
+            }
+        })
+        .ok()
 }
 
 /// 既没有类型化原因、也取不回我们自己的代号时，退到上游惯用的措辞上认。
@@ -159,6 +174,69 @@ impl RoutingProvider {
         (rate && self.retry_on_429) || (quota && self.retry_on_402)
     }
 
+    /// 换后端之前，把这一面说过的池级判词留下来；几条里留等得最久的那条。
+    ///
+    /// 每条拒绝都带着自己的证据，而这些证据不等价：`face_has_no_serving_member`
+    /// 是池级判词（网关一个上游都没试），其余是单成员的说法。留下等得最久的那条
+    /// 不是因为悲观，是因为它答的是"这一面最早什么时候可能有成员能接"——按更早
+    /// 的那条定节拍，就是按一条已知不成立的时刻把下一次执行送进一个空的面上。
+    fn keep_the_furthest_pool_refusal(
+        kept: Option<ChatResponse>,
+        seen: ChatResponse,
+    ) -> Option<ChatResponse> {
+        if !seen
+            .error_message
+            .as_deref()
+            .is_some_and(names_a_face_without_a_member)
+        {
+            return kept;
+        }
+        match kept {
+            Some(k) if k.retry_after_secs.unwrap_or(0) >= seen.retry_after_secs.unwrap_or(0) => {
+                Some(k)
+            }
+            _ => Some(seen),
+        }
+    }
+
+    /// [`Self::keep_the_furthest_pool_refusal`] 的流内版本：手上只有正文。
+    fn keep_the_furthest_refusal_text(kept: Option<String>, seen: String) -> Option<String> {
+        if !names_a_face_without_a_member(&seen) {
+            return kept;
+        }
+        match kept {
+            Some(k)
+                if declared_wait_in_body(&k).unwrap_or(0)
+                    >= declared_wait_in_body(&seen).unwrap_or(0) =>
+            {
+                Some(k)
+            }
+            _ => Some(seen),
+        }
+    }
+
+    /// 换无可换时交回去的那一条：带着池级判词的那一条，不是最后试的那一个。
+    ///
+    /// 按"最后试的那一个"挑，最先试的那一面说的"这一面没有成员能服务"就被后一条
+    /// 单成员的 429 盖掉：调用侧的闸门认的是前一句话里那格机器可读的原因，读不到
+    /// 就不关闸，于是它按自己的节拍重来。2026-11-03 实测：openai 面每十分钟回一次
+    /// 503、自报 7113 秒，紧跟着的另一面回 429，进程级闸门四十五分钟里一次都没关
+    /// 上，同一个目标每十分钟再问一遍。最后那一条自己就是池级判词时以它为准——它
+    /// 是这番话的最后一句。
+    fn refuse_with_the_pool(carried: Option<ChatResponse>, last: ChatResponse) -> ChatResponse {
+        let Some(pool) = carried else {
+            return last;
+        };
+        if last
+            .error_message
+            .as_deref()
+            .is_some_and(names_a_face_without_a_member)
+        {
+            return last;
+        }
+        pool
+    }
+
     /// Wrap a backend stream so a rate-limit/quota `Error` event that arrives
     /// before the first content delta transparently fails over to the next
     /// backend. Non-content marker events (Start/TextStart/...) seen before the
@@ -185,6 +263,10 @@ impl RoutingProvider {
             let probe = RoutingProvider::new(backends, attempts as u32, retry_on_429, retry_on_402);
             let mut current = first;
             let mut idx = first_idx;
+            // 换走之前，这一面说过的那句池级判词得跟着走。留正文而不留整条响应：
+            // 事件里拿得到正文，拿响应还得等那一条流走到 `end()`——而 `end()` 之前
+            // 还挂着一个与本跳无关的原始日志写。
+            let mut carried: Option<String> = None;
 
             'backend: loop {
                 let result_fut = current.result();
@@ -206,6 +288,10 @@ impl RoutingProvider {
                                     "Backend {} stream failed pre-content ({}), failing over to backend {}",
                                     idx, text, idx + 1
                                 );
+                                // 这一跳就是那条判词唯一会被丢掉的地方：换后端之后
+                                // 读者只看得到最后一个后端的失败。
+                                carried =
+                                    RoutingProvider::keep_the_furthest_refusal_text(carried, text);
                                 idx += 1;
                                 match probe.backends[idx].chat_stream(&messages, &options).await {
                                     Ok(s) => {
@@ -254,7 +340,21 @@ impl RoutingProvider {
                         return;
                     }
                 }
-                producer.end(result_fut.await);
+                let mut last = result_fut.await;
+                if let Some(text) = carried.take() {
+                    if !last
+                        .error_message
+                        .as_deref()
+                        .is_some_and(names_a_face_without_a_member)
+                    {
+                        last.upstream_failure = status_from_own_message(&text)
+                            .map(UpstreamFailure::from_status)
+                            .or(Some(UpstreamFailure::ServerError));
+                        last.retry_after_secs = declared_wait_in_body(&text);
+                        last.error_message = Some(text);
+                    }
+                }
+                producer.end(last);
                 return;
             }
         });
@@ -306,6 +406,8 @@ impl LLMProvider for RoutingProvider {
 
     async fn chat(&self, messages: &[Message], options: &ChatOptions) -> SFResult<ChatResponse> {
         let attempts = self.backends.len().min(self.max_attempts).max(1);
+        // 同 [`Self::refuse_with_the_pool`]：换后端不能把前面那一面说过的池级判词弄丢。
+        let mut carried: Option<ChatResponse> = None;
 
         for i in 0..attempts {
             let backend = &self.backends[i];
@@ -347,8 +449,10 @@ impl LLMProvider for RoutingProvider {
                         error = response.error_message.as_deref().unwrap_or("unknown"),
                         "Backend refused this call; failing over to the next backend"
                     );
+                    carried = Self::keep_the_furthest_pool_refusal(carried, response);
                     continue;
                 }
+                let response = Self::refuse_with_the_pool(carried.take(), response);
                 // 换无可换：把**这次失败的原始原因**带出去，而不是另造一句
                 // 笼统的话。下游据此区分该等窗口复位还是该重试，丢在这里就
                 // 只能再猜一遍文本。
@@ -647,6 +751,116 @@ mod tests {
         assert_eq!(err.upstream_failure(), Some(UpstreamFailure::RateLimited));
         assert_eq!(err.retry_after_secs(), Some(90));
         assert!(!err.is_terminal_upstream_failure(), "限流是瞬时信号");
+    }
+
+    /// 一面说「这一面没有成员能服务」、另一面回 429 时，交回去的必须是前者。
+    ///
+    /// 后一条描述的是一个成员，前一条描述的是整面；把前者按"最后试的那一个"丢掉，
+    /// 调用侧的池级闸门就认不出这句话了（它认的是正文里那格机器可读的原因），
+    /// 于是只能按自己的节拍重来。2026-11-03 的现场：openai 面每十分钟回一次 503、
+    /// 自报 7113 秒，紧随其后的另一面回 429，闸门四十五分钟里一次都没关上。
+    fn a_pool_refusal() -> Arc<MockProvider> {
+        Arc::new(MockProvider {
+            response_text: "".into(),
+            error_msg: Some(format!(
+                "API error (HTTP 503): {{\"error\":\"所有 LLM 上游当前不可用\",\"face\":\"openai\",\
+                 \"reason\":\"{FACE_WITHOUT_A_MEMBER}\",\"retry_after_seconds\":7113}}"
+            )),
+            mid_stream_error: false,
+            upstream_failure: Some(UpstreamFailure::ServerError),
+            retry_after_secs: Some(7113),
+        })
+    }
+
+    fn a_single_member_refusal() -> Arc<MockProvider> {
+        Arc::new(MockProvider {
+            response_text: "".into(),
+            error_msg: Some("API error (HTTP 429): {\"error\":\"rate limited\"}".into()),
+            mid_stream_error: false,
+            upstream_failure: Some(UpstreamFailure::RateLimited),
+            retry_after_secs: Some(20),
+        })
+    }
+
+    /// 调用侧真正走的那条路：`chat_stream` + `result()`。
+    #[tokio::test]
+    async fn a_stream_that_ends_on_a_member_refusal_still_reports_the_pool_refusal() {
+        let router = RoutingProvider::new(
+            vec![a_pool_refusal(), a_single_member_refusal()],
+            3,
+            true,
+            true,
+        );
+        let mut stream = router
+            .chat_stream(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .expect("换后端在流里发生，连接本身是成功的");
+        while stream.next().await.is_some() {}
+        let response = stream.result().await;
+
+        assert!(
+            response
+                .error_message
+                .as_deref()
+                .is_some_and(names_a_face_without_a_member),
+            "最后一面的 429 把前一面的池级判词盖掉了：{:?}",
+            response.error_message
+        );
+        assert_eq!(
+            response.retry_after_secs,
+            Some(7113),
+            "交回去的等待要是池子自己报的那个，不是最后一个成员自己的"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chat_that_ends_on_a_member_refusal_still_reports_the_pool_refusal() {
+        let router = RoutingProvider::new(
+            vec![a_pool_refusal(), a_single_member_refusal()],
+            3,
+            true,
+            true,
+        );
+        let err = router
+            .chat(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .expect_err("两面都拒了");
+
+        assert!(
+            err.to_string().contains(FACE_WITHOUT_A_MEMBER),
+            "被后一条拒绝盖掉之后，调用侧的闸门认不出这句池级判词：{err}"
+        );
+        assert_eq!(err.retry_after_secs(), Some(7113));
+    }
+
+    /// 最后一面自己就是池级判词时以它为准：它是这番话的最后一句。
+    #[tokio::test]
+    async fn the_last_word_wins_when_it_is_itself_a_pool_refusal() {
+        let router = RoutingProvider::new(
+            vec![a_pool_refusal(), {
+                let mut later = MockProvider {
+                    response_text: "".into(),
+                    error_msg: None,
+                    mid_stream_error: false,
+                    upstream_failure: Some(UpstreamFailure::ServerError),
+                    retry_after_secs: Some(9_000),
+                };
+                later.error_msg = Some(format!(
+                    "API error (HTTP 503): {{\"reason\":\"{FACE_WITHOUT_A_MEMBER}\",\
+                     \"retry_after_seconds\":9000}}"
+                ));
+                Arc::new(later)
+            }],
+            3,
+            true,
+            true,
+        );
+        let err = router
+            .chat(&[Message::user("hi")], &ChatOptions::default())
+            .await
+            .expect_err("两面都拒了");
+
+        assert_eq!(err.retry_after_secs(), Some(9_000));
     }
 
     #[tokio::test]
