@@ -41,7 +41,7 @@ use cog_eval::adapters::{
     SweProToolkit, ToolathlonBackend, ToolathlonToolkit,
 };
 use cog_eval::scaffolds::{table_scaffolds, ForeignFlow, PlatformRunner};
-use cog_eval::{Benchmark, CaseSubset, Checkpoint, Rig, RunConfig, Table};
+use cog_eval::{Benchmark, CaseSubset, Checkpoint, Rig, RunConfig, Table, ToolFactory};
 use cog_observability::usage_store::LlmOrigin;
 use sha2::Digest;
 
@@ -837,6 +837,15 @@ pub struct Wiring {
     /// `toolathlon` 为 `None` 时的那句原因，与上面那条同一个理由：这一列今天缺的不再是
     /// 「树里没有实现」，而是**这台宿主上没有能起 Pod 的机器**、或者被开关关掉了。
     pub toolathlon_reason: Option<String>,
+    /// HLE 那一列的工具面：`web_search` + `web_fetch` + `python`，三件都是平台已有的实现
+    /// （前两件是主应用用的那两个工具，第三件跑在沙箱执行器里）。
+    ///
+    /// 存工厂而不是商店面：这一列今天不按题变，但 `Toolkit` 那一层是按题造清单的，
+    /// 存成工厂就不必在将来某题要绑环境时再改一次形状。
+    pub hle: Option<Arc<ToolFactory>>,
+    /// `hle` 为 `None` 时的那句原因，与上面两条同一个理由：缺的可能是端点（网页检索 /
+    /// 抓取没接）、执行面（没有沙箱执行器），每一件的处置不同，所以照原因念。
+    pub hle_reason: Option<String>,
     /// 这次声明进来的外部流派（按声明顺序）。空 ＝ 这次跑只有仓里那四行。
     pub foreign_flows: Vec<crate::eval_container::ForeignFlowSpec>,
     /// 声明读不出来时的那句原因。它是**整块**不成立的原因：一块声明里有一行写坏，
@@ -1253,6 +1262,23 @@ fn missing_dependencies(
                 .unwrap_or_else(|| "the container backend is not wired into this run".to_string()),
         ));
     }
+    // HLE 这一列与上面两条同形：三件工具在树里都有实现，缺的只可能是这一跑没把它接进来
+    // （网页端点没配、沙箱执行器没接上）。`NotWired` 而不是 `NotImplemented`：把读的人送去
+    // 等一个已经落地的功能，是这类缺席最贵的一种误读。
+    //
+    // 只在这一列**收了工具臂**时才报：诊断臂本来就不带工具，那条缺席由上面 `tools` 那一行
+    // 说过了，这里再说一遍会把「按定义没给」读成「没接上」。
+    if tools.is_table_arm() && benchmarks.contains(&"hle") && wiring.hle.is_none() {
+        missing.push(Missing::new(
+            "hle",
+            MissingScope::Column("hle".to_string()),
+            Absence::NotWired,
+            wiring
+                .hle_reason
+                .clone()
+                .unwrap_or_else(|| "the tool face is not wired into this run".to_string()),
+        ));
+    }
     // 这一条与 swe-bench-pro 同形：树里有实现（Pod 后端与工具面都在），缺的只可能是这次
     // 没把它接进来。写成 `NotImplemented` 会把读的人送去等一个已经落地的功能。
     if benchmarks.contains(&"toolathlon") && wiring.toolathlon.is_none() {
@@ -1508,23 +1534,44 @@ pub(crate) fn build_benchmark(
     tools: ToolArm,
 ) -> Result<Benchmark> {
     // 工具臂在这一处收口：`None` 是诊断臂。有工具臂（主表那一臂）要一整套工具实现，而组合根
-    // 今天接得上两束：swe-bench-pro 的 bash/file_edit（落在这道题自己的容器里）与 toolathlon
-    // 按题面声明的 MCP server 现造的那一束；HLE 点名的 web_search/python 还没有实现。
+    // 今天接得上三束：swe-bench-pro 的 bash/file_edit（落在这道题自己的容器里）、toolathlon
+    // 按题面声明的 MCP server 现造的那一束，以及 HLE 的 web_search/web_fetch/python（前两件
+    // 是平台自己那两个工具，第三件跑在沙箱执行器里）。
     //
     // 少给几个工具会让这一格因为「工具面不同」得分——那是在量别的东西，所以宁可不跑：一个
-    // 基准只要**有一件**工具没有实现，就整个不收工具臂，而不是拿半束工具顶上去。
+    // 基准只要**有一件**工具没有实现，就整个不收工具臂，而不是拿半束工具顶上去。实现存在但
+    // 这一跑没接上（端点没配、执行器没起）是另一回事：那种情况按列记一条 `NotWired`，见
+    // `missing_dependencies`。
     let with_tools = tools == ToolArm::Platform;
     if with_tools && !has_tool_implementations(name) {
         bail!(
             "--tools platform (the default): `{name}` pins tools the composition root has no \
              implementation for, and running it with a smaller tool face would score a different \
-             thing. Today two faces are implemented: swe-bench-pro's (bash/file_edit, bound to \
-             the instance's own container) and toolathlon's (the MCP servers each task declares, \
-             built per task); pass `--tools none` explicitly if all you want is a diagnostic run."
+             thing. Today three faces are implemented: hle's (web_search/web_fetch/python), \
+             swe-bench-pro's (bash/file_edit, bound to the instance's own container) and \
+             toolathlon's (the MCP servers each task declares, built per task); pass `--tools \
+             none` explicitly if all you want is a diagnostic run."
         );
     }
     Ok(match name {
-        "hle" => hle_benchmark(judge, HleToolkit::without_tools()),
+        "hle" => hle_benchmark(
+            judge,
+            if with_tools {
+                // 没接上时交回一个**每次造工具都报错**的工厂，而不是空面：空面对这一列
+                // 不报错，只会把分数拉低成一个「模型不太会查资料」的读数。报错让每格记成
+                // `errored`、整列由 `missing_dependencies` 记成缺席——与 swe-bench-pro
+                // 后端缺席时同一形状（那一列的格子也是这么红的），表照出，其余列照成表行。
+                HleToolkit::with_factory(wiring.hle.clone().unwrap_or_else(|| {
+                    let why = wiring
+                        .hle_reason
+                        .clone()
+                        .unwrap_or_else(|| "the tool face is not wired into this run".into());
+                    Arc::new(move |_, _| anyhow::bail!("HLE's tool face is absent: {why}"))
+                }))
+            } else {
+                HleToolkit::without_tools()
+            },
+        ),
         "swe-bench-pro" => swe_pro_benchmark(
             wiring.swe_pro.clone(),
             if with_tools {
@@ -1545,7 +1592,7 @@ pub(crate) fn build_benchmark(
 /// 与 [`build_benchmark`] 分开，是为了让「哪一列收工具臂」是一条**读得出来的**判据，而不是
 /// 埋在 match 分支里的一个 if：加一列的工具实现时，改的是这里一处。
 fn has_tool_implementations(name: &str) -> bool {
-    matches!(name, "swe-bench-pro" | "toolathlon")
+    matches!(name, "hle" | "swe-bench-pro" | "toolathlon")
 }
 
 /// toolathlon 那一列的工具面：带工具臂时绑上**按题现造**的工厂，只有诊断臂才关掉。
@@ -2065,6 +2112,52 @@ async fn wiring_from_config(args: &EvalTableArgs) -> Wiring {
                 "the data root could not be resolved, so this instance's run scripts cannot be \
                  located: {e}"
             ))
+        }
+    }
+    // HLE 的工具面同样是两条互不相干的依赖：检索/抓取端点与沙箱执行器。诊断臂也照样要
+    // 把它们读出来——「这一列在带工具的臂上接没接得上」不该被骨干缺席一起吞掉。
+    //
+    // 三件都由平台已有的实现供：两件网页工具取主应用同一个 `agent_loop` 配置节里的端点，
+    // `python` 走 `system.sandbox_executor_url`（主应用与进化 worker 的 `run_command`
+    // 走的就是它）。评测台不另起一套，否则表里量的就不是平台能做的事。
+    {
+        let system = &crate::config_loader::load().core.system;
+        let web = cog_agent::AgentLoopConfig::load().unwrap_or_else(|e| {
+            tracing::warn!("agent_loop is unreadable ({e}); HLE's web tools have no endpoints");
+            Default::default()
+        });
+        match http.as_ref() {
+            Some(http) => {
+                match cog_extension::executor_backend(system.sandbox_executor_url.clone()) {
+                    Ok(sandbox) => {
+                        match crate::eval_hle::hle_tool_factory(crate::eval_hle::HleToolInputs {
+                            http: http.clone(),
+                            web_search_base: web.web_search_base.clone(),
+                            web_search_fallback_base: web.web_search_fallback_base.clone(),
+                            web_fetch_base: web.web_fetch_base.clone(),
+                            web_fetch_fallback_base: None,
+                            sandbox,
+                            python_timeout: std::time::Duration::from_secs(
+                                system.tool_timeout_secs,
+                            ),
+                        }) {
+                            Ok(factory) => wiring.hle = Some(factory),
+                            Err(why) => wiring.hle_reason = Some(format!("{why:#}")),
+                        }
+                    }
+                    Err(why) => {
+                        wiring.hle_reason = Some(format!(
+                            "no sandbox executor for HLE's `python` tool: {why}"
+                        ))
+                    }
+                }
+            }
+            None => {
+                wiring.hle_reason = Some(
+                    "no http client could be built, so HLE's web tools have no transport"
+                        .to_string(),
+                )
+            }
         }
     }
     // toolathlon 与上游同样是两条互不相干的依赖：关工具的诊断臂一样要起 Pod、一样要跑
@@ -3649,17 +3742,37 @@ mod tests {
         );
     }
 
+    /// 注册表里的**每一列**都收工具臂。
+    ///
+    /// 这条是「`--tools platform` 一进来就 bail」那半个多月的根：登记的命令行带的是
+    /// `--tools none`，因为带工具的那一臂上只要有一列没有实现，整条套件就被切掉。判据
+    /// 落在**注册表**上而不是某两个名字上——新加一列而没有实现时，这里当场红，而不是等
+    /// 登记跑一遍、发现表里没有它。
+    #[test]
+    fn every_registered_column_takes_the_tool_arm() {
+        for name in BENCHMARKS {
+            assert!(
+                has_tool_implementations(name),
+                "`{name}` is a registered column but the composition root has no tool face \
+                 for it: a suite naming it under `--tools platform` would lose the whole run"
+            );
+        }
+        let (runnable, unarmable) = arm_split(ToolArm::Platform, &BENCHMARKS);
+        assert_eq!(runnable, BENCHMARKS.to_vec());
+        assert!(unarmable.is_empty());
+    }
+
     /// 一列的工具面没有实现时，缺的是**这一列**，不是整次跑。
     ///
     /// 以前 `build_benchmark` 一撞上这样的列就 bail：一条套件里只要有一列还没实现，整条
-    /// 套件一行都跑不出来，而报错说的是「改用 `--tools none` 做诊断」——于是带工具的那两列
-    /// 也跟着只剩诊断读数。今天带工具的列各自有实现、HLE 点名的 web_search/python 还没有，
-    /// 一条注册的套件刚好同时含这两类。
+    /// 套件一行都跑不出来，而报错说的是「改用 `--tools none` 做诊断」——于是带工具的
+    /// 那两列也跟着只剩诊断读数。今天三列都有实现，判据因此拿一个**还没有实现的名字**
+    /// 来钉那条机制：它守的是将来加列时的那一步，不是今天的某一列。
     #[test]
     fn a_column_whose_tool_face_is_missing_leaves_the_column_out_not_the_run() {
-        let (runnable, unarmable) = arm_split(ToolArm::Platform, &["hle", "swe-bench-pro"]);
-        assert_eq!(runnable, vec!["swe-bench-pro"]);
-        assert_eq!(unarmable, vec!["hle"]);
+        let (runnable, unarmable) = arm_split(ToolArm::Platform, &["hle", "not-implemented-yet"]);
+        assert_eq!(runnable, vec!["hle"]);
+        assert_eq!(unarmable, vec!["not-implemented-yet"]);
 
         let missing = missing_dependencies(
             ToolArm::Platform,
@@ -3670,19 +3783,54 @@ mod tests {
         );
         let column = missing
             .iter()
-            .find(|m| m.subject == "hle")
+            .find(|m| m.subject == "not-implemented-yet")
             .expect("这一列没有工具面实现，必须说出来，而不是悄悄少掉");
         // `Column` 而不是 `Run`：同一次跑里的另外那几列照跑照成表行。
-        assert_eq!(column.scope, MissingScope::Column("hle".to_string()));
+        assert_eq!(
+            column.scope,
+            MissingScope::Column("not-implemented-yet".to_string())
+        );
         // `NotImplemented` 而不是 `NotWired`：下一步是写这一列的工具面，不是改配置。
         assert_eq!(column.kind, Absence::NotImplemented);
-        assert!(!column.covers("swe-bench-pro", "gepa"), "只盖它自己那一列");
+        assert!(!column.covers("hle", "gepa"), "只盖它自己那一列");
 
         // 诊断臂整列都收：那里缺的是这一臂按定义不给工具，不是这一列缺实现——
         // 那条缺席由 `Run` 记一次，不能再按列记第二遍。
-        let (all, none) = arm_split(ToolArm::None, &["hle", "swe-bench-pro"]);
-        assert_eq!(all, vec!["hle", "swe-bench-pro"]);
+        let (all, none) = arm_split(ToolArm::None, &["hle", "not-implemented-yet"]);
+        assert_eq!(all, vec!["hle", "not-implemented-yet"]);
         assert!(none.is_empty());
+    }
+
+    /// 实现存在、这一跑没接上，是**另一条**缺席：`NotWired`，理由是接线那一步写下的那句。
+    ///
+    /// 两种缺席的下一步动作相反：`NotImplemented` 是去写代码，`NotWired` 是去配端点 /
+    /// 起执行器。把后者报成前者会把读的人送去等一个已经落地的功能。
+    #[test]
+    fn a_column_whose_tool_face_is_unwired_says_which_dependency_is_missing() {
+        let wiring = Wiring {
+            hle_reason: Some("COGNEVA_WEB_SEARCH_BASE is not set in this run".into()),
+            ..Default::default()
+        };
+        let missing = missing_dependencies(ToolArm::Platform, &["hle"], &[], &[], &wiring);
+        let column = missing
+            .iter()
+            .find(|m| m.subject == "hle")
+            .expect("工具面没接上必须按列说出来");
+        assert_eq!(column.scope, MissingScope::Column("hle".to_string()));
+        assert_eq!(column.kind, Absence::NotWired);
+        assert!(
+            column.why.contains("COGNEVA_WEB_SEARCH_BASE"),
+            "{}",
+            column.why
+        );
+
+        // 诊断臂不带工具，同一个 `Wiring` 下不该多出这一条：那里是「按定义没给」，
+        // 不是「没接上」。
+        let off = missing_dependencies(ToolArm::None, &["hle"], &[], &[], &wiring);
+        assert!(
+            !off.iter().any(|m| m.subject == "hle"),
+            "诊断臂的缺席由 `tools` 那一行说，不再按列说第二遍"
+        );
     }
 
     /// 另一向的整次跑缺席：骨干与裁判缺了，**每一格**都没读数，所以它们算没轮到跑。

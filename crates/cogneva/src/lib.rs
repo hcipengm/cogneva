@@ -14,6 +14,7 @@ pub mod config_loader;
 pub mod config_watcher;
 pub mod daemon;
 pub mod eval_container;
+pub mod eval_hle;
 pub mod eval_mcp_in_pod;
 pub mod eval_platform;
 pub mod eval_subset;

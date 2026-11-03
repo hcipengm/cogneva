@@ -1,6 +1,7 @@
 //! HLE（Humanity's Last Exam）的四件适配器：数据、环境、工具包、判分。
 //!
-//! 这一列与另两列的关键分野：它**没有环境**（纯 API），工具面是「web search + Python」，
+//! 这一列与另两列的关键分野：它**没有环境**（纯 API），工具面是「web search + web fetch +
+//! Python」，
 //! 而且是三个基准里**唯一要生成式裁判**的一列——另两列跑确定性脚本，上游模型死活与否
 //! 都能出分。所以这里的判分器在裁判上游缺席时的行为必须清楚：**报错，不是判错**。
 //! 报错让运行器记成 `errored`（这一格不是这一行的数，是上游的），判错会让它读成
@@ -151,6 +152,7 @@ impl CaseSource for HleCaseSource {
 /// HLE 工具名的钉死值。工具集由**基准**定、不由方法定：四个外壳在同一列上拿到的
 /// 是同一束工具，多一件少一件都会让表里的差掺进「谁的工具多」。
 pub const HLE_TOOL_WEB_SEARCH: &str = "web_search";
+pub const HLE_TOOL_WEB_FETCH: &str = "web_fetch";
 pub const HLE_TOOL_PYTHON: &str = "python";
 
 /// HLE 的工具包。
@@ -186,18 +188,24 @@ impl HleToolkit {
     }
 }
 
-/// HLE 的工具面**恰好**是这两件，名字按钉死的值来。
+/// HLE 的工具面**恰好**是这三件，名字按钉死的值来。
+///
+/// 检索与抓取分两件不是把一个能力拆成两个名：官方那一侧的一件搜索工具同时给出
+/// 排名摘要与正文，而这个部署的两件各自只做一半——只给 `web_search` 的话，模型
+/// 拿到的是摘要，读不到任何一个需要点进去的页面，量的就不是「会不会查资料」而是
+/// 「摘要够不够用」。`python` 是官方那一侧本来就有的那一件，跑在沙箱执行器里。
 ///
 /// 造出来的清单每次都要过这一关，不只是构造期核一次——工厂是能按题变的，判据因此
 /// 要落在**真正交出去的**那一束上。
 fn check_face(tools: &[Tool]) -> anyhow::Result<()> {
     let mut names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     names.sort_unstable();
-    let mut wanted = [HLE_TOOL_WEB_SEARCH, HLE_TOOL_PYTHON];
+    let mut wanted = [HLE_TOOL_WEB_SEARCH, HLE_TOOL_WEB_FETCH, HLE_TOOL_PYTHON];
     wanted.sort_unstable();
     if names != wanted {
         anyhow::bail!(
-            "HLE's tool face is exactly [{HLE_TOOL_WEB_SEARCH}, {HLE_TOOL_PYTHON}]; got {names:?}"
+            "HLE's tool face is exactly [{HLE_TOOL_WEB_SEARCH}, {HLE_TOOL_WEB_FETCH}, \
+             {HLE_TOOL_PYTHON}]; got {names:?}"
         );
     }
     Ok(())
@@ -430,21 +438,34 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_face_is_exactly_two_pinned_tools() {
+    fn the_tool_face_is_exactly_the_pinned_tools() {
         assert!(HleToolkit::with_tools(vec![
             mk_tool(HLE_TOOL_PYTHON),
-            mk_tool(HLE_TOOL_WEB_SEARCH)
+            mk_tool(HLE_TOOL_WEB_SEARCH),
+            mk_tool(HLE_TOOL_WEB_FETCH)
         ])
         .is_ok());
-        // 多一件、少一件、换个名字，都不是 HLE 的那一束。
+        // 多一件、少一件、换个名字，都不是 HLE 的那一束。少掉 web_fetch 单列一条：
+        // 那一件缺席时模型拿得到摘要、读不到页面，而分数只会低，不会报错。
         assert!(HleToolkit::with_tools(vec![mk_tool(HLE_TOOL_WEB_SEARCH)]).is_err());
         assert!(HleToolkit::with_tools(vec![
             mk_tool(HLE_TOOL_WEB_SEARCH),
+            mk_tool(HLE_TOOL_PYTHON)
+        ])
+        .is_err());
+        assert!(HleToolkit::with_tools(vec![
+            mk_tool(HLE_TOOL_WEB_SEARCH),
+            mk_tool(HLE_TOOL_WEB_FETCH),
             mk_tool(HLE_TOOL_PYTHON),
             mk_tool("bash")
         ])
         .is_err());
-        assert!(HleToolkit::with_tools(vec![mk_tool("search"), mk_tool(HLE_TOOL_PYTHON)]).is_err());
+        assert!(HleToolkit::with_tools(vec![
+            mk_tool("search"),
+            mk_tool(HLE_TOOL_WEB_FETCH),
+            mk_tool(HLE_TOOL_PYTHON)
+        ])
+        .is_err());
         let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
         let empty_case = case("hle-x", "exactMatch", "q", "a");
         assert!(HleToolkit::without_tools()
@@ -462,15 +483,20 @@ mod tests {
         let env: Arc<dyn CaseEnv> = Arc::new(NoEnv);
         let c = case("hle-y", "exactMatch", "q", "a");
 
-        let good: Arc<ToolFactory> =
-            Arc::new(|_, _| Ok(vec![mk_tool(HLE_TOOL_WEB_SEARCH), mk_tool(HLE_TOOL_PYTHON)]));
+        let good: Arc<ToolFactory> = Arc::new(|_, _| {
+            Ok(vec![
+                mk_tool(HLE_TOOL_WEB_SEARCH),
+                mk_tool(HLE_TOOL_WEB_FETCH),
+                mk_tool(HLE_TOOL_PYTHON),
+            ])
+        });
         assert_eq!(
             HleToolkit::with_factory(good)
                 .toolset(&c, &env)
                 .unwrap()
                 .definitions()
                 .len(),
-            2
+            3
         );
 
         let short: Arc<ToolFactory> = Arc::new(|_, _| Ok(vec![mk_tool(HLE_TOOL_WEB_SEARCH)]));

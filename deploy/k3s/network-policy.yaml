@@ -448,7 +448,8 @@ spec:
         - protocol: TCP
           port: 443
 ---
-# 入站面：只有跑 agent 循环、真的会调 `web_fetch` 的两个工作负载够得到 11235。
+# 入站面：只有真的会调 `web_fetch` 的三个工作负载够得到 11235——主应用的 agent 循环、
+# 进化 worker，以及评测台（HLE 那一列量的是这个部署实际能做的事，所以走同一个渲染后端）。
 # 写了 Ingress 类型就等于对这个 Pod 默认拒绝入站；kubelet 的探针从节点发起而不是
 # 从 Pod，所以它不受这条策略约束，探针照常。
 apiVersion: networking.k8s.io/v1
@@ -475,6 +476,11 @@ spec:
         - podSelector:
             matchLabels:
               app.kubernetes.io/component: evolution
+        # 评测台的 Pod 由宿主上的评测臂拉起（`cogneva eval-table`），不归 chart 管，
+        # 所以按它自己声明的标签选：那个标签是它与评测臂之间的约定，两处同名。
+        - podSelector:
+            matchLabels:
+              app: eval-table
       ports:
         - protocol: TCP
           port: 11235

@@ -19,7 +19,7 @@ pub use agentbench_loader::AgentBenchLoader;
 pub use gaia_runner::GaiaRunner;
 pub use hle::{
     hle_benchmark, HleCaseSource, HleJudge, HleToolkit, HLE_JSONL, HLE_JUDGE_TEMPLATE_VERSION,
-    HLE_TOOL_PYTHON, HLE_TOOL_WEB_SEARCH,
+    HLE_TOOL_PYTHON, HLE_TOOL_WEB_FETCH, HLE_TOOL_WEB_SEARCH,
 };
 pub use humaneval_loader::HumanEvalLoader;
 pub use swe_pro::{

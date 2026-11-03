@@ -449,7 +449,10 @@ data:
             "max_iterations": 10,
             "eval_max_iterations": 5,
             "context_window_size": 64000,
-            "skill_cache_ttl_secs": 30
+            "skill_cache_ttl_secs": 30,
+            "_comment_web": "网页检索与抓取两个端点：`web_search` / `web_fetch` 只问这两处，评测台的 HLE 列也读同一对（`cogneva eval-table` 的工具面里那两件就是这两个工具）。写在文件里而不是只写在各部署的 env 上：挂这份文件的 Pod 不止主应用与进化 worker——评测台与 mcp 服务也挂，只写 env 的那两处会让它们读到「这个部署没接网页能力」，而能力其实在。地址由 chart 按 values 替换，见 templates/app-config.yaml 的替换表。",
+            "web_search_base": "http://searxng:8080",
+            "web_fetch_base": "http://crawl4ai:11235"
           },
           "observability": {
             "loki": {

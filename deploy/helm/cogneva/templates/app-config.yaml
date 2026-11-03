@@ -45,6 +45,10 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
 不会红，它只会让文件里那个地址留在旧值上，所以另有一条测试把 JSON 里出现的每个
 `主机:端口` 与本表对一遍。
 
+网页检索与抓取那两行（`agent_loop.web_search_base` / `web_fetch_base`）按 values
+派生，与 gateway / evolution 模板里的 env 同源：读这两项的进程不止那两个部署——评测台
+与 mcp 服务也挂这份文件，只写 env 的话它们读到的是「这个部署没接网页能力」。
+
 观测栈的三条同理，只是它们不是本 chart 起的服务：Loki 与 Prometheus 住在观测栈自己的
 命名空间里，地址同样是集群事实，改一处不能留下另一处。
 */ -}}
@@ -61,6 +65,8 @@ JSON 不经过 Helm 渲染（文件里的双花括号是应用自己的 prompt �
       (printf "meilisearch.%s.svc.cluster.local:7700" $ns) (printf "meilisearch.%s.svc.cluster.local:%d" $ns (int .Values.backends.meilisearch.port))
       (printf "redis-0.redis.%s.svc.cluster.local:6379" $ns) (printf "redis-0.redis.%s.svc.cluster.local:%d" $ns (int .Values.backends.redis.port))
       "cogneva-sandbox-executor:9090" (printf "cogneva-sandbox-executor:%d" (int .Values.sandboxExecutor.metricsPort))
+      "http://searxng:8080" (include "cogneva.searxngBase" .)
+      "http://crawl4ai:11235" (include "cogneva.crawl4aiBase" .)
       "nats-service:4222" (printf "nats-service:%d" (int .Values.backends.nats.port))
       "cogneva-security-gateway:8081" (printf "cogneva-security-gateway:%d" (int .Values.securityGateway.llmProxyPort))
       "http://loki.monitoring.svc.cluster.local:3100" (printf "%s" .Values.observability.loki.endpoint)
