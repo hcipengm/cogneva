@@ -519,12 +519,19 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         if paths.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        // 命中几条所问的路径，就排多前。调用方总是先问要改的那个文件、再补一层
+        // 它所在的 crate 根，而 crate 根是路径的前缀：一条记在这个文件上的门两条
+        // 都命中，一条记在 `crates/X/tests/` 上的门只命中 crate 根那一层。条数少
+        // 于上限时这个排序没有意义，撞上上限时它就是「留下的那些是不是真正站在
+        // 这次要改的东西上」——按 slug 排留下的是字母靠前的那几条，与它们管不管
+        // 这条路无关。同一次问法问两遍得同一个顺序，缓存前缀照旧留得住。
         let rows = sqlx::query(&read_sql(
             "FROM principle_ledger \
-             WHERE EXISTS (SELECT 1 FROM unnest($1::text[]) AS p \
+             JOIN LATERAL (SELECT count(*) AS hits FROM unnest($1::text[]) AS p \
                            WHERE principle_ledger.platform_gate LIKE '%' || p || '%' \
-                              OR principle_ledger.where_red LIKE '%' || p || '%') \
-             ORDER BY slug \
+                              OR principle_ledger.where_red LIKE '%' || p || '%') h ON TRUE \
+             WHERE h.hits > 0 \
+             ORDER BY h.hits DESC, slug \
              LIMIT $2",
         ))
         .bind(paths)

@@ -178,6 +178,67 @@ async fn the_answer_is_ordered_and_bounded() {
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn the_gate_on_the_file_outranks_the_gate_on_its_crate() {
+    let (store, pool, marker) = store().await;
+
+    // 两条只记在 crate 的契约测试上（crate 根命中一层），一条记在这次真要改的
+    // 文件上（文件与 crate 根各命中一层）。上限只留一条时，留下的必须是后者：
+    // 调用方问的两种路径里，只有它对这一条是「门就写在这个文件上」。
+    // slug 顺序是特意反着设的——按字母排会留下 `a-crate-only`，与它管不管这个
+    // 文件毫无关系。
+    file(
+        &store,
+        &format!("{marker}/a-crate-only"),
+        Some("crates/cog-gateway/tests/some_contract_test.rs"),
+    )
+    .await;
+    file(
+        &store,
+        &format!("{marker}/b-crate-only"),
+        Some("crates/cog-gateway/tests/another_contract_test.rs"),
+    )
+    .await;
+    file(
+        &store,
+        &format!("{marker}/c-this-file"),
+        Some("crates/cog-gateway/src/progress.rs"),
+    )
+    .await;
+
+    let rows = store
+        .gating_paths(
+            &[
+                "crates/cog-gateway/src/progress.rs".to_string(),
+                "crates/cog-gateway".to_string(),
+            ],
+            1,
+        )
+        .await
+        .expect("read the account");
+
+    let mine: Vec<&str> = rows
+        .iter()
+        .map(|r| r.slug.as_str())
+        .filter(|s| s.starts_with(&marker))
+        .collect();
+    assert_eq!(
+        mine,
+        vec![format!("{marker}/c-this-file").as_str()],
+        "只留一条时留下的不是门写在这个文件上的那条：撞上上限被丢掉的，恰好是该被\
+         先说出来的那一类"
+    );
+
+    for table in ["principle_ledger", "principle_ledger_declared"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE slug LIKE $1"))
+            .bind(format!("{marker}%"))
+            .execute(&pool)
+            .await
+            .expect("clean up");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn nothing_to_ask_about_is_not_a_reason_to_scan() {
     let (store, _pool, _marker) = store().await;
     let rows = store

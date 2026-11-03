@@ -1177,7 +1177,10 @@ impl CollaborationExecutor {
         if paths.is_empty() {
             return None;
         }
-        match ledger.gating_paths(&paths, PRINCIPLES_PER_TASK).await {
+        // 多问一条：恰好问到上限与「账里还多着」是两种情形，只问上限就分不开。
+        // 分不开的后果不是少几条，是读的人以为这就是全部——一个被丢掉的第 13 条
+        // 与账里根本没有更多条，在上下文里长得一模一样。
+        match ledger.gating_paths(&paths, PRINCIPLES_PER_TASK + 1).await {
             Ok(rows) if rows.is_empty() => {
                 // 有路径、账也读到了、一条都没匹配上：这是一次真实的「这些文件
                 // 上没有记录门」，不是读不到。留痕，免得与「没接上账」混为一谈。
@@ -1188,13 +1191,30 @@ impl CollaborationExecutor {
                 );
                 None
             }
-            Ok(rows) => match serde_json::to_value(&rows) {
-                Ok(value) => Some(value),
-                Err(e) => {
-                    tracing::warn!(task_id = %task.id, error = %e, "principle rows did not serialize");
-                    None
+            Ok(rows) => {
+                let (rows, more) = carried(rows, PRINCIPLES_PER_TASK);
+                if more {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        carried = PRINCIPLES_PER_TASK,
+                        paths = ?paths,
+                        "the account records a gate on more principles than this round carries; \
+                         the ones naming the most of these paths are the ones kept, and this \
+                         round should probably be split"
+                    );
                 }
-            },
+                match serde_json::to_value(&rows) {
+                    Ok(value) => Some(value),
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task.id,
+                            error = %e,
+                            "principle rows did not serialize"
+                        );
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     task_id = %task.id,
@@ -1521,6 +1541,19 @@ impl CollaborationExecutor {
 /// 太大，该先拆，不该靠多塞原则解决。
 // cap: bound — 选出来的一道界，不是量出来的容量
 const PRINCIPLES_PER_TASK: usize = 12;
+
+/// 这一轮真正递出去的那几条，以及账里是不是还多着。
+///
+/// 两件事分开返回，是因为它们读起来是两件事：`kept` 是这一轮看到的东西，
+/// `more` 是「边界之外还有」这句话本身。只返回 `kept` 的话，把全部原则都和盘
+/// 托出与只递了前几条，在下游的上下文里一模一样。
+fn carried<T>(mut rows: Vec<T>, cap: usize) -> (Vec<T>, bool) {
+    if rows.len() <= cap {
+        return (rows, false);
+    }
+    rows.truncate(cap);
+    (rows, true)
+}
 
 /// 任务点名的那些路径，从哪里点就从哪里读。
 ///
@@ -3085,5 +3118,36 @@ mod named_paths_tests {
             ]
         );
         assert_eq!(a, b, "两次问出的顺序不一样，缓存前缀每一轮都会被丢掉");
+    }
+}
+
+#[cfg(test)]
+mod carried_tests {
+    use super::carried;
+
+    /// 没撞上界时一条不少，也不说「还多着」。
+    #[test]
+    fn everything_is_carried_when_it_fits() {
+        let (kept, more) = carried(vec![1, 2, 3], 12);
+        assert_eq!(kept, vec![1, 2, 3]);
+        assert!(!more, "账里只有三条，却说了「还多着」");
+    }
+
+    /// 撞上界时递出去的正好是上限条，且「还多着」这句话必须出现：一条被丢掉的
+    /// 原则与账里根本没有更多条，在生成端读到的上下文里长得一模一样，静默截断
+    /// 就是让生成端以为自己看到了全部。
+    #[test]
+    fn a_bound_is_carried_and_said() {
+        let (kept, more) = carried((0..13).collect(), 12);
+        assert_eq!(kept.len(), 12);
+        assert!(more, "还有一条没递出去，却什么都没说");
+    }
+
+    /// 恰好等于上限不是「还多着」。
+    #[test]
+    fn exactly_the_bound_is_not_more() {
+        let (kept, more) = carried((0..12).collect(), 12);
+        assert_eq!(kept.len(), 12);
+        assert!(!more, "恰好装下，却报成了截断");
     }
 }

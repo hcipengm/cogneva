@@ -814,9 +814,13 @@ pub trait PrincipleLedgerStore: Send + Sync {
     /// account. An ungated principle is the account's debt, recorded as such by
     /// the census -- it is not a finding about any one path.
     ///
-    /// Ordered by slug so two callers asking the same question hand the writer
-    /// the same bytes: a prompt that reorders itself between rounds is a prompt
-    /// whose cached prefix is thrown away between rounds.
+    /// Ordered by how many of `paths` the row's gate names, then by slug, so two
+    /// callers asking the same question hand the writer the same bytes: a prompt
+    /// that reorders itself between rounds is a prompt whose cached prefix is
+    /// thrown away between rounds. The count leads because a caller that reaches
+    /// past `limit` should lose the rows whose gate merely shares a directory
+    /// with the work, not the rows whose gate names the file itself -- and the
+    /// count is a property of the question, not of the clock.
     async fn gating_paths(&self, paths: &[String], limit: usize) -> SFResult<Vec<PrincipleRow>>;
 
     /// Every slug the account holds.
