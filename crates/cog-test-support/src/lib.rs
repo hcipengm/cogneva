@@ -130,17 +130,19 @@ impl Drop for ScratchDir {
     }
 }
 
-/// 一次用例独占的那个 schema：名字由 `label` 加上本次的进程号与纳秒数拼成。
+/// 一次用例独占的那个 schema：名字由 `label` 加上本次的进程号、纳秒数与一格序号拼成。
 ///
 /// `label` 由调用方说，它只是这个名字的前半截——谁建的 schema 谁按名字删它，所以这个
 /// 标签是调用方自己的事实，不在这里替它们编一个。它会被直接拼进 DDL，因此必须是合法的
 /// 标识符片段（全小写字母与下划线）。
 pub async fn own_schema(url: &str, label: &str) -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let schema = format!("{label}_{}_{nanos}", std::process::id());
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let schema = own_schema_name(label, std::process::id(), nanos, seq);
     let mut admin = sqlx::PgConnection::connect(url)
         .await
         .expect("the throwaway database is reachable");
@@ -149,6 +151,15 @@ pub async fn own_schema(url: &str, label: &str) -> String {
         .await
         .expect("the probe schema is created");
     schema
+}
+
+/// 名字本身，与建库分开——这样「同一纳秒取两次名」可以直接判，而不必先有一个库。
+///
+/// 序号那一格是补上来的：时钟只保证「不同时刻的数不同」，不保证「同一进程里两次取名字
+/// 不会拿到同一个时刻」。2026-11-03 的 CI 上两个用例正是撞在同一纳秒上，`CREATE SCHEMA`
+/// 撞名、整条 Test 作业红、主线被扣住——一次纯粹的读时钟在并发下不是唯一键。
+fn own_schema_name(label: &str, pid: u32, nanos: u128, seq: u64) -> String {
+    format!("{label}_{pid}_{nanos}_{seq}")
 }
 
 /// 删掉 [`own_schema`] 建的那一个。
@@ -217,6 +228,29 @@ impl cog_core::SchemaRunner for SchemaTextRunner {
             .await
             .map_err(|e| cog_core::SFError::Database(e.to_string()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod schema_name_tests {
+    use super::own_schema_name;
+
+    /// 同一进程、同一纳秒取两次名字，仍然要是两个名字。
+    ///
+    /// 判的正是并发下读时钟不是唯一键这件事：两个线程各自 `SystemTime::now()`，读到的是
+    /// 同一个时刻，而进程号一样、`label` 一样——名字就撞了，`CREATE SCHEMA` 报 23505，
+    /// 一条与这次改动毫无关系的作业因此变红。把时钟钉死在这里，就等于把那次撞车搬到了
+    /// 每一条 `cargo test` 里：去掉序号那一格，这条当场红。
+    #[test]
+    fn two_names_taken_in_the_same_nanosecond_are_still_two_names() {
+        let nanos = 1_793_664_758_110_285_517_u128;
+        let a = own_schema_name("exchange_retention_test", 32342, nanos, 0);
+        let b = own_schema_name("exchange_retention_test", 32342, nanos, 1);
+        assert_ne!(a, b, "同一纳秒取两次名字时，唯一把它们分开的就是序号那一格");
+        assert!(
+            a.len() <= 63 && b.len() <= 63,
+            "标识符超过 63 字节会被 PostgreSQL 截断，截断之后两个名字又可能相等：{a}"
+        );
     }
 }
 

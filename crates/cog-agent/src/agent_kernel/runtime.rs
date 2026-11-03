@@ -15,6 +15,7 @@ use crate::tools::{ToolRegistry, ToolRunError};
 ///
 /// Below this a repeated result is a tool answering a different question with
 /// the same few words, and the pointer would not be shorter than the answer.
+// cap: bound — 指针本身是一段固定的话；结果比它长不了多少时，换成指针既省不下字节，又让模型多跳一次去读上面那份。这个界是「省下的字节」与「多一跳」相抵的位置，不是从机器上量出来的
 const REPEATED_TOOL_RESULT_MIN_CHARS: usize = 2_000;
 
 /// A single ReAct iteration: Thought -> Action -> Observation.
