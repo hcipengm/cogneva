@@ -2493,6 +2493,8 @@ pub(crate) struct SettledCiFixes {
 /// How many rows one pass may close. A backlog of dead rows costs one GitHub
 /// read per branch and workflow, so the bound is on the burst, not on the work:
 /// the next round picks up where this one stopped.
+// cap: bound — this bounds one round's burst of upstream reads (one read per
+// branch and workflow), not the number of dead rows waiting; no reading moves it
 const CI_SETTLE_BATCH: usize = 40;
 
 /// Is the run this row was filed for already behind a green one?
