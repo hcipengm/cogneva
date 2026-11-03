@@ -162,8 +162,24 @@ pub async fn archived_iterations(
         .collect()
 }
 
+/// 一轮运行的名字：先说它在替谁干活，再说这是第几轮、哪一次执行。
+///
+/// 旧名字是 `ralph-pipeline-<uuid>`，只说了"有过一次运行"。账上 14.5 万行摊在
+/// 9.96 万个这样的 id 上（每个 1.5 行），任何一行都答不出它属于哪件活——归属
+/// 那时只能靠这个 id，于是成本恒读作 0。归属现在按所属任务记，这个名字补的是
+/// 另一半：日志、沙箱目录、工具产物上的名字要能直接读出任务，不用回去查一次。
+///
+/// 没有所属任务时不编一个假任务名（编出来的会被读成一件真花过钱的任务），
+/// 退回可认的 `ralph-*` 前缀。轮次隔开同一次执行里的两轮，短码隔开同一件活的
+/// 两次执行——沙箱工作目录就按这个名字分。
+fn iteration_run_id(owner: Option<&str>, stage: &str, iteration: u32, nonce: &str) -> String {
+    match owner {
+        Some(owner) => format!("{owner}-ralph-{stage}-i{iteration}-{nonce}"),
+        None => format!("ralph-{stage}-i{iteration}-{nonce}"),
+    }
+}
+
 /// Ralph Loop 外层质量控制循环。
-#[derive(Default)]
 pub struct RalphLoop {
     config: RalphLoopConfig,
     llm_provider: Option<Arc<dyn cog_core::LlmClient>>,
@@ -180,6 +196,25 @@ pub struct RalphLoop {
     /// 的花销记在这件活名下——账本按任务读成本时，没有这一格就少算了它。
     task_id: Option<String>,
     state_backend: Option<Arc<dyn cog_core::StateBackend>>,
+    /// 这个循环对象自己这一次执行的短码，只出现在每一轮运行的名字里。
+    ///
+    /// 它不参与归属——账本按所属任务记。它挡的是另一件事：沙箱工作目录按运行
+    /// 名字分目录，同一个任务在另一个进程里重新开跑时必须落到另一个目录里，
+    /// 否则一个人半路死掉的检出就成了另一个人的起点。
+    run_nonce: String,
+}
+
+impl Default for RalphLoop {
+    fn default() -> Self {
+        Self {
+            config: RalphLoopConfig::default(),
+            llm_provider: None,
+            history: Vec::new(),
+            task_id: None,
+            state_backend: None,
+            run_nonce: uuid::Uuid::new_v4().simple().to_string()[..8].to_string(),
+        }
+    }
 }
 
 impl RalphLoop {
@@ -204,6 +239,11 @@ impl RalphLoop {
     pub fn with_task(mut self, task_id: impl Into<String>) -> Self {
         self.task_id = Some(task_id.into());
         self
+    }
+
+    /// 这一轮运行挂在哪个名字下：所属任务优先，其次才是"ralph 的一次运行"。
+    fn iteration_task_id(&self, stage: &str, iteration: u32) -> String {
+        iteration_run_id(self.task_id.as_deref(), stage, iteration, &self.run_nonce)
     }
 
     /// Persist the iteration history on the owning task's context board.
@@ -500,7 +540,7 @@ impl RalphLoop {
             let mut input = context.clone();
             input["goal"] = serde_json::json!(goal);
             let task = Task::new(
-                format!("ralph-plan-{}", uuid::Uuid::new_v4()),
+                self.iteration_task_id("plan", iteration),
                 TaskType::Custom("ralph_plan_goal".into()),
                 input,
             );
@@ -668,7 +708,7 @@ impl RalphLoop {
             let mut input = request.clone();
             input["goal"] = serde_json::json!(goal);
             let task = Task::new(
-                format!("ralph-pipeline-{}", uuid::Uuid::new_v4()),
+                self.iteration_task_id("pipeline", iteration),
                 TaskType::Custom("ralph_pipeline_goal".into()),
                 input,
             );
@@ -787,7 +827,7 @@ impl RalphLoop {
             let mut input = request.clone();
             input["goal"] = serde_json::json!(goal);
             let task = Task::new(
-                format!("ralph-roundtable-{}", uuid::Uuid::new_v4()),
+                self.iteration_task_id("roundtable", iteration),
                 TaskType::Custom("ralph_roundtable_goal".into()),
                 input,
             );
@@ -1203,6 +1243,51 @@ mod tests {
     use crate::squad::pge::types::{StopCause, StoppedProduct};
     use crate::squad::pge::{PgePipeline, PgePipelineConfig, PgeRoundtable, PgeRoundtableConfig};
     use std::sync::Arc;
+
+    /// 一轮运行的名字要说出它在替哪件活干活，同时轮与轮、执行与执行都撞不上。
+    #[test]
+    fn an_iteration_run_names_the_task_it_serves() {
+        let owner = "change-ledger-d0e09fc7e1c368e2";
+        let first = iteration_run_id(Some(owner), "pipeline", 1, "1a2b3c4d");
+        assert!(first.starts_with(owner), "{first}");
+        assert!(first.ends_with("-i1-1a2b3c4d"), "{first}");
+        // 两轮之间不是同一个运行。
+        assert_ne!(
+            first,
+            iteration_run_id(Some(owner), "pipeline", 2, "1a2b3c4d")
+        );
+        // 同一件活在另一个进程里重新开跑时，沙箱工作目录不能是同一个。
+        assert_ne!(
+            first,
+            iteration_run_id(Some(owner), "pipeline", 1, "5e6f7a8b")
+        );
+        // 三条循环各用各的 stage，彼此也撞不上。
+        assert_ne!(first, iteration_run_id(Some(owner), "plan", 1, "1a2b3c4d"));
+        // 没有所属任务时不编一个假任务名，退回可认的 ralph-* 前缀。
+        let orphan = iteration_run_id(None, "roundtable", 7, "1a2b3c4d");
+        assert!(orphan.starts_with("ralph-roundtable-i7-"), "{orphan}");
+        // 沙箱工作目录路由只接受这些字节，长度也有上限。
+        assert!(first
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')));
+        assert!(first.len() <= 128, "{first}");
+        assert!(orphan.len() <= 128, "{orphan}");
+    }
+
+    /// 本文件造出来的每一件任务都必须从所属任务那里取名。
+    ///
+    /// 只测取名函数管不住"有没有人绕过它"：多出一条自己拿 uuid 起名的循环路径，
+    /// 账本就又变回 2026-10-26 之前那样——每一行都看不出属于哪件活。
+    #[test]
+    fn every_task_this_loop_mints_is_named_after_its_task() {
+        let source = include_str!("ralph_loop.rs");
+        let production = source.split("mod tests").next().unwrap_or_default();
+        assert_eq!(
+            production.matches("Task::new(").count(),
+            production.matches("self.iteration_task_id(").count(),
+            "有一条造任务的路径没从所属任务取名"
+        );
+    }
 
     /// 被配速拒绝时睡多久：取拒绝自报的那个数，不再在本地按斜坡重算一遍。
     /// 窗口花光后旧算式给的是 41 分钟（稳态放行间隔），而真正能再花的时刻在

@@ -64,7 +64,7 @@ const META_DIR_NAME: &str = ".meta";
 
 /// Maximum task id length, keeps the on-disk directory name clear of
 /// `ENAMETOOLONG` while accommodating generated ids such as
-/// `ralph-roundtable-<uuid>`.
+/// `<owner-task>-ralph-roundtable-i12-<8 hex>`.
 // cap: bound — 目录名要躲开 ENAMETOOLONG，又要装得下生成的 id
 const MAX_TASK_ID_LEN: usize = 128;
 
