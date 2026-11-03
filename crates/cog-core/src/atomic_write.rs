@@ -100,6 +100,15 @@ pub async fn write_bytes_async(path: &Path, bytes: &[u8], durability: Durability
     let written = async {
         let mut file = tokio::fs::File::create(&tmp).await?;
         file.write_all(bytes).await?;
+        // 这一步不是可选的收尾。tokio 的 `poll_write` 把字节拷进它自己的缓冲
+        // 就返回 `Ready`，真正的 `write` 交给一个阻塞任务；`write_all` 只为
+        // 「下一块」等它，**最后一块不等**，而 `tokio::fs::File` 没有会在丢弃
+        // 时等待的 Drop。于是下面那一步 rename 会与还在飞的写赛跑，赢了就把一
+        // 份零字节（或半份）当作新文件发布出去，而调用方已经拿到 `Ok`。
+        // 2026-11-03 实测：96 字节的 sidecar 形状，读者在 rename 之后撞上零字节
+        // 的第 371389 次读取——这正是任务工作树 sidecar 与已批准计划记录那两条
+        // 「文件在、内容解析不出来」的偶发红。
+        file.flush().await?;
         if durability == Durability::SurvivesPowerLoss {
             file.sync_all().await?;
         }
@@ -138,4 +147,56 @@ pub async fn write_json_async<T: Serialize>(
     let body = serde_json::to_vec_pretty(value)
         .map_err(|e| SFError::IO(format!("serialize {}: {e}", path.display())))?;
     write_bytes_async(path, &body, durability).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 异步写返回之后，盘上必须是整份——发布那一步是 rename，而 rename 跑在字节
+    /// 落盘之前就会把半份（或空文件）发布出去。
+    ///
+    /// 这不是假想的：`tokio::fs::File::poll_write` 把字节交给一个阻塞任务就返回，
+    /// 真正的 write 还在飞；丢掉句柄并不等它。于是在 `write_all` 之后立刻 rename，
+    /// 会与那一次写赛跑，而且常常赢——读者看到的是一份写全了的文件的零长版本。
+    /// 2026-11-03 实测：两个「写完立刻读回」的调用点（任务工作树 sidecar、已批准
+    /// 计划的记录）在整包并行跑的轮次里约三分之一会红。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_awaited_write_has_landed_before_it_is_published() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("published.json");
+        // sidecar 那样的一小份，而不是几 MiB：够大就会被拆成多块，`write_all`
+        // 为每一块都等一次，只有最后一块不等——份量越大，那个窗口反而越窄。
+        // 轮数是量出来的：去掉 flush 重跑五轮，五轮都在第 1 万～9 万次读取之间红。
+        let body = vec![b'x'; 96];
+        let reader_path = path.clone();
+        let reader_body = body.clone();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_stop = std::sync::Arc::clone(&stop);
+        let reader = std::thread::spawn(move || {
+            let mut reads = 0u64;
+            while !reader_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(seen) = std::fs::read(&reader_path) {
+                    reads += 1;
+                    assert_eq!(
+                        seen.len(),
+                        reader_body.len(),
+                        "read {reads} caught the file mid-publish: {} of {} bytes, so the \
+                         rename ran before the bytes it was publishing had landed",
+                        seen.len(),
+                        reader_body.len()
+                    );
+                }
+            }
+            reads
+        });
+        for _ in 0..30_000 {
+            write_bytes_async(&path, &body, Durability::SameKernel)
+                .await
+                .unwrap();
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let reads = reader.join().unwrap();
+        assert!(reads > 1, "the reader never ran while the writer did");
+    }
 }
