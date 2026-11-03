@@ -1776,6 +1776,10 @@ impl DagExecutorRuntime {
 /// earliest time at which it is allowed to resolve.
 struct OrphanWatch {
     parent_id: String,
+    /// The goal the alert names, when it names one. Only `decomposition_wbs`
+    /// is re-judged from it: the verdict is about a plan, and the rows the
+    /// goal holds are what the current plan is.
+    goal_id: Option<String>,
     resolve_after: chrono::DateTime<chrono::Utc>,
 }
 
@@ -1807,10 +1811,17 @@ async fn adopt_owned_alerts(
         else {
             continue;
         };
+        let goal_id = alert
+            .labels
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty() && *s != "-")
+            .map(str::to_string);
         firing.insert(
             alert.dedup_key.clone(),
             OrphanWatch {
                 parent_id: parent.to_string(),
+                goal_id,
                 resolve_after: alert.fired_at + *dwell,
             },
         );
@@ -1867,6 +1878,7 @@ async fn orphan_reconcile_tick(
             dedup_key.clone(),
             OrphanWatch {
                 parent_id: task_id.clone(),
+                goal_id: (!goal_id.is_empty() && goal_id != "-").then(|| goal_id.to_string()),
                 resolve_after: chrono::Utc::now() + *dwell,
             },
         );
@@ -1904,7 +1916,18 @@ async fn orphan_reconcile_tick(
             ),
             None => true,
         };
-        if done {
+        // A work-breakdown verdict is about one proposed plan, and it is only
+        // re-evaluated when its goal is decomposed again. A goal that keeps
+        // taking pre-planned filings never goes back through the planner, so
+        // the row outlives the plan it described and no writer comes back to
+        // it: measured on 2026-11-03, two rows had been firing since 11-01 on
+        // goals whose rows all carry an acceptance now. The predicate is
+        // re-run against the rows the goal holds today rather than retired on
+        // age -- the row is retired only when the thing it asserted is gone.
+        let stale = !done
+            && key.split(':').next() == Some(cog_core::ALERT_RULE_DECOMPOSITION_WBS)
+            && wbs_verdict_no_longer_holds(orchestrator, watch.goal_id.as_deref()).await;
+        if done || stale {
             resolved.push(key.clone());
         }
     }
@@ -1926,6 +1949,55 @@ async fn orphan_reconcile_tick(
         firing.remove(&key);
         tracing::info!(key = %key, "decomposition alert resolved");
     }
+}
+
+/// Whether a `decomposition_wbs` verdict has stopped describing the plan its
+/// goal holds now.
+///
+/// The verdict judges one proposed plan, and the only writer that re-evaluates
+/// it is the next decomposition of that goal. A goal that keeps taking
+/// pre-planned filings never goes back through the planner, so the row outlives
+/// its plan and no writer ever comes back to it -- measured on 2026-11-03: two
+/// rows firing since 11-01 on goals whose rows all carry an acceptance by now,
+/// unsighted for two days and unowned besides.
+///
+/// The answer comes from running the same predicate over the rows the goal
+/// holds, never from the row's age: a verdict that is merely old is still a
+/// verdict, and retiring it on age would hide a plan that is still broken. A
+/// goal with no rows left is not a plan that passes -- it is no plan at all --
+/// so it answers no.
+async fn wbs_verdict_no_longer_holds(
+    orchestrator: &Arc<DagExecutor>,
+    goal_id: Option<&str>,
+) -> bool {
+    let Some(goal_id) = goal_id else {
+        return false;
+    };
+    let plan: Vec<cog_core::AtomicTask> = orchestrator
+        .get_all_tasks()
+        .await
+        .iter()
+        .filter(|task| task.goal_id.as_deref() == Some(goal_id))
+        .map(|task| cog_core::AtomicTask {
+            id: task.id.clone(),
+            name: task.id.clone(),
+            skill_id: None,
+            description: None,
+            estimated_tokens: 0,
+            skill_gap: false,
+            blocked_by: task.blocked_by.clone(),
+            blocks: task.blocks.clone(),
+            input: task.input.clone(),
+            output_entities: Vec::new(),
+            estimated_seconds: 0,
+            parent_id: task.parent_task_id.clone(),
+            acceptance: task.acceptance.clone(),
+        })
+        .collect();
+    if plan.is_empty() {
+        return false;
+    }
+    crate::wbs::check(&plan).is_empty()
 }
 
 #[cfg(test)]
@@ -4293,6 +4365,163 @@ mod orphan_reconciler_tests {
         assert_eq!(
             dag.get_task("orphan-x").await.unwrap().status,
             TaskStatus::Pending
+        );
+    }
+
+    /// A plan under one goal: a non-executable anchor with one child hanging
+    /// off it. `acceptance` is what the work-breakdown check judges on a leaf.
+    async fn plan_under(dag: &DagExecutor, goal: &str, child_acceptance: &[&str]) {
+        let mut anchor = Task::new("anchor-1", TaskType::Generator, serde_json::json!({}));
+        anchor.is_executable = false;
+        anchor.goal_id = Some(goal.into());
+        dag.add_task(anchor).await.unwrap();
+
+        let mut child = Task::new("child-1", TaskType::Generator, serde_json::json!({}));
+        child.goal_id = Some(goal.into());
+        child.parent_task_id = Some("anchor-1".into());
+        child.acceptance = child_acceptance.iter().map(|s| s.to_string()).collect();
+        dag.add_task(child).await.unwrap();
+    }
+
+    /// A plan that keeps taking pre-planned filings never goes back through
+    /// the planner, so a `decomposition_wbs` verdict written against the plan
+    /// it rejected is never re-evaluated by anyone -- the row fires until
+    /// someone closes it by hand. Re-running the same predicate over the rows
+    /// the goal holds now is how the row learns its condition is gone.
+    #[tokio::test]
+    async fn a_work_breakdown_verdict_whose_plan_now_passes_is_resolved() {
+        let dag = Arc::new(DagExecutor::new("ws-wbs-resolved".into()));
+        plan_under(&dag, "goal-wbs", &["接口对这条请求返回 200"]).await;
+
+        let recording = Arc::new(RecordingAlertSink::default());
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
+        let key = format!(
+            "{}:goal-wbs:anchor-1",
+            cog_core::ALERT_RULE_DECOMPOSITION_WBS
+        );
+        let mut firing = std::collections::HashMap::new();
+        firing.insert(
+            key.clone(),
+            OrphanWatch {
+                parent_id: "anchor-1".into(),
+                goal_id: Some("goal-wbs".into()),
+                resolve_after: chrono::Utc::now() - chrono::Duration::seconds(1),
+            },
+        );
+
+        orphan_reconcile_tick(
+            &dag,
+            Some(&sink),
+            &chrono::Duration::minutes(30),
+            &chrono::Duration::zero(),
+            &mut firing,
+        )
+        .await;
+
+        assert!(
+            recording
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(condition, _, k)| !*condition && k == &key),
+            "the verdict was not retired: {:?}",
+            recording.calls.lock().unwrap()
+        );
+        assert!(firing.is_empty());
+    }
+
+    /// The same re-check must not retire a verdict that still describes the
+    /// plan: a leaf with no acceptance is exactly the defect it reported.
+    #[tokio::test]
+    async fn a_work_breakdown_verdict_whose_plan_still_violates_keeps_firing() {
+        let dag = Arc::new(DagExecutor::new("ws-wbs-kept".into()));
+        plan_under(&dag, "goal-wbs", &[]).await;
+
+        let recording = Arc::new(RecordingAlertSink::default());
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
+        let key = format!(
+            "{}:goal-wbs:anchor-1",
+            cog_core::ALERT_RULE_DECOMPOSITION_WBS
+        );
+        let mut firing = std::collections::HashMap::new();
+        firing.insert(
+            key.clone(),
+            OrphanWatch {
+                parent_id: "anchor-1".into(),
+                goal_id: Some("goal-wbs".into()),
+                resolve_after: chrono::Utc::now() - chrono::Duration::seconds(1),
+            },
+        );
+
+        orphan_reconcile_tick(
+            &dag,
+            Some(&sink),
+            &chrono::Duration::minutes(30),
+            &chrono::Duration::zero(),
+            &mut firing,
+        )
+        .await;
+
+        assert!(
+            !recording
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(condition, _, k)| !*condition && k == &key),
+            "a verdict that still holds was retired: {:?}",
+            recording.calls.lock().unwrap()
+        );
+        assert!(firing.contains_key(&key));
+    }
+
+    /// A goal whose rows are all gone is not a plan that passes the check:
+    /// retiring on that would turn "the work disappeared" into "the work is
+    /// well-formed". The parent row moves to another goal here so the
+    /// question "is the parent terminal?" answers no and only the plan check
+    /// is under test.
+    #[tokio::test]
+    async fn a_work_breakdown_verdict_with_no_rows_left_keeps_firing() {
+        let dag = Arc::new(DagExecutor::new("ws-wbs-empty".into()));
+        let mut parent = placeholder("anchor-moved", 1);
+        parent.goal_id = Some("somewhere-else".into());
+        dag.add_task(parent).await.unwrap();
+
+        let recording = Arc::new(RecordingAlertSink::default());
+        let sink: Arc<dyn cog_core::PersistentAlertSink> = recording.clone();
+        let key = format!(
+            "{}:goal-empty:anchor-moved",
+            cog_core::ALERT_RULE_DECOMPOSITION_WBS
+        );
+        let mut firing = std::collections::HashMap::new();
+        firing.insert(
+            key.clone(),
+            OrphanWatch {
+                parent_id: "anchor-moved".into(),
+                goal_id: Some("goal-empty".into()),
+                resolve_after: chrono::Utc::now() - chrono::Duration::seconds(1),
+            },
+        );
+
+        orphan_reconcile_tick(
+            &dag,
+            Some(&sink),
+            &chrono::Duration::minutes(30),
+            &chrono::Duration::zero(),
+            &mut firing,
+        )
+        .await;
+
+        assert!(
+            !recording
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(condition, _, k)| !*condition && k == &key),
+            "an empty plan was read as a passing one: {:?}",
+            recording.calls.lock().unwrap()
         );
     }
 }
