@@ -34,6 +34,7 @@ pub mod observable;
 pub mod pg_summary_pool;
 pub mod postgres_entry_store;
 pub mod postgres_schema;
+pub mod refusal_sweep;
 pub mod reranker;
 pub mod schema_backend;
 pub mod types;

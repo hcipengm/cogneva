@@ -814,6 +814,7 @@ async fn test_decay_maintenance_loop_drives_a_real_pass() {
             decay_age_threshold_secs: 3600,
             decay_importance_threshold: 0.5,
             decay_namespaces: vec!["default".into()],
+            ..cog_memory::MaintenanceConfig::default()
         },
         None,
         cog_core::ShutdownSignal::default(),

@@ -460,9 +460,20 @@ impl cog_core::SystemPlugin for MemoryPlugin {
                     .map(|s| (*s).clone())
                     .unwrap_or_default();
                 crate::maintenance::spawn_decay_loop(
+                    backend.clone(),
+                    metrics.clone(),
+                    memory.maintenance.clone(),
+                    role.clone(),
+                    shutdown.clone(),
+                );
+                // 清扫「环境拒绝被写成学习」的存量：写入端已经不再产出这一类，
+                // 而它以前写下的行还在共用条目存储里，读学习库的每一次都要把
+                // 它们整份拉进内存。判据与写入端同源，删的是本来就不该存在的行。
+                crate::refusal_sweep::spawn_refusal_sweep_loop(
                     backend,
                     metrics,
-                    memory.maintenance.clone(),
+                    std::time::Duration::from_secs(memory.maintenance.refusal_sweep_interval_secs),
+                    memory.maintenance.refusal_sweep_namespaces.clone(),
                     role,
                     shutdown,
                 );

@@ -90,6 +90,15 @@ pub struct MaintenanceConfig {
     /// 扫描哪些命名空间。默认只有自动摄取写入的那一个——系统衰减**它自己**的记忆；
     /// 手工摄取写进别的命名空间是调用方的记忆，除非在这里显式列出，否则不动。
     pub decay_namespaces: Vec<String>,
+    /// 两次「清扫环境拒绝条目」之间的间隔（秒）；0 表示关掉这条清扫循环。
+    ///
+    /// 它清的是写入端已经不再产出的那一类条目（见 [`crate::refusal_sweep`]），
+    /// 所以节拍不需要贴着事件走：一条已经不再增长的行，早半小时删晚半小时删，
+    /// 差别只是那半小时里每次读学习库仍然多读它一次。
+    pub refusal_sweep_interval_secs: u64,
+    /// 清扫哪些命名空间。默认只有反思层写入的那一个——那是唯一会写学习的命名
+    /// 空间，别处的内容没有这条判据要处理的东西。
+    pub refusal_sweep_namespaces: Vec<String>,
 }
 
 impl Default for MaintenanceConfig {
@@ -99,6 +108,8 @@ impl Default for MaintenanceConfig {
             decay_age_threshold_secs: 7 * 24 * 3600,
             decay_importance_threshold: 0.5,
             decay_namespaces: vec!["default".into()],
+            refusal_sweep_interval_secs: 1800,
+            refusal_sweep_namespaces: vec!["reflection".into()],
         }
     }
 }

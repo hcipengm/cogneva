@@ -38,6 +38,10 @@ name = "memory_decay_plugin_test"
 path = "tests/memory_decay_plugin_test.rs"
 
 [[test]]
+name = "memory_refusal_sweep_plugin_test"
+path = "tests/memory_refusal_sweep_plugin_test.rs"
+
+[[test]]
 name = "store_derived_reading"
 path = "tests/store_derived_reading.rs"
 
