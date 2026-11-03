@@ -62,12 +62,6 @@ const DEFAULT_MAX_WORKSPACES: usize = 8;
 
 const META_DIR_NAME: &str = ".meta";
 
-/// Distinguishes the temporary files two concurrent sidecar writes stage under.
-///
-/// Only ever grows: it names a file that lives for the length of one rename, so
-/// there is nothing to count and nothing to reset.
-static META_STAGING: AtomicU64 = AtomicU64::new(0);
-
 /// Maximum task id length, keeps the on-disk directory name clear of
 /// `ENAMETOOLONG` while accommodating generated ids such as
 /// `<owner-task>-ralph-roundtable-i12-<8 hex>`.
@@ -1624,24 +1618,15 @@ impl WorkdirRouter {
     /// sidecar (`meta_dir` readers only ever accept `*.json`) nor with a
     /// concurrent write of the same tree (the id is per-process and per-call).
     async fn write_meta(&self, meta: &TaskMeta) -> SFResult<()> {
-        tokio::fs::create_dir_all(&self.meta_dir)
-            .await
-            .map_err(|e| SFError::IO(format!("create meta dir: {e}")))?;
         let text = serde_json::to_string_pretty(meta)?;
-        let path = self.meta_path(&meta.task_id);
-        let staged = path.with_extension(format!(
-            "json.tmp-{}-{}",
-            std::process::id(),
-            META_STAGING.fetch_add(1, Ordering::Relaxed)
-        ));
-        tokio::fs::write(&staged, text)
-            .await
-            .map_err(|e| SFError::IO(format!("stage task meta: {e}")))?;
-        if let Err(e) = tokio::fs::rename(&staged, &path).await {
-            let _ = tokio::fs::remove_file(&staged).await;
-            return Err(SFError::IO(format!("publish task meta: {e}")));
-        }
-        Ok(())
+        // A sidecar is recomputable from the tree it describes, so a reader on
+        // the same kernel seeing the whole file is the whole requirement.
+        cog_core::atomic_write::write_bytes_async(
+            &self.meta_path(&meta.task_id),
+            text.as_bytes(),
+            cog_core::atomic_write::Durability::SameKernel,
+        )
+        .await
     }
 
     fn read_meta(&self, task_id: &str) -> Option<TaskMeta> {
