@@ -361,15 +361,35 @@ impl DagExecutorRuntime {
     /// A task whose artifact is only readable by its producer does not go on
     /// the queue every worker competes for; see [`crate::ready_queue`].
     pub async fn publish_ready_tasks(&self) -> SFResult<()> {
-        let work = self.orchestrator.ready_work().await;
-        let columns = work.columns;
-        let (ready_tasks, in_flight) = (work.ready, work.in_flight);
         // What the pool's window can still pay for, together with how much of
         // the pool the measurement covered. No bound admits everything: a
         // missing reading is not a closed window, and a publisher that stopped
         // on a missing reading would be driving the platform by the presence
         // of a metric rather than by the quota.
         let pays_for = self.admission_bound().await;
+        // A pool that says it cannot serve until a named instant makes every
+        // pass before that instant a scan of a backlog nothing may leave plus a
+        // refusal line per stream — for hours, on a quota reset. Skipping the
+        // pass is not hiding the hold: the admission cells keep the values of
+        // the pass that decided to back off (`unavailable=1` and the instant in
+        // `retry_at_unix`), and their age is what tells a reader the publisher
+        // is waiting rather than dead.
+        if let Some(bound) = pays_for {
+            if let Some(until) = crate::ready_queue::publisher_backoff_until(
+                bound.unavailable,
+                bound.retry_at_unix,
+                chrono::Utc::now().timestamp(),
+            ) {
+                tracing::debug!(
+                    retry_at_unix = until,
+                    "pool declared itself unavailable until a named instant; not scanning the ready queue again before then"
+                );
+                return Ok(());
+            }
+        }
+        let work = self.orchestrator.ready_work().await;
+        let columns = work.columns;
+        let (ready_tasks, in_flight) = (work.ready, work.in_flight);
         let window_jobs = pays_for.and_then(|bound| bound.window_jobs);
 
         // Serialise and group first, changing no state.

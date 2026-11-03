@@ -2,7 +2,8 @@ use crate::common;
 
 use cog_agent::GlobalAgentManager;
 use cog_core::{
-    AgentManager, DagMessage, MessageBackend, ShutdownSignal, StateBackend, Task, TaskStatus,
+    AgentManager, DagMessage, MessageBackend, MetricsBackend, ShutdownSignal, StateBackend, Task,
+    TaskStatus,
 };
 use cog_orchestrator::dag_executor::{DagExecutorConfig, DagExecutorRuntime};
 use cog_storage::{MemoryAgentRegistry, MemoryStateBackend};
@@ -569,6 +570,111 @@ async fn a_spent_window_holds_ready_tasks_back_until_it_can_pay() {
         "once the window can pay, the held tasks go out"
     );
     assert_eq!(count_status(&runtime, TaskStatus::Pending).await, 0);
+}
+
+/// 池说了「到某个时刻我再值得被问一次」之后，发布者在那之前不该再扫一遍就绪
+/// 队列、再写一遍拒绝行。
+///
+/// 停摆的那几个小时里每一拍都写一次准入读数，读起来和「一直在试」同形：能分开
+/// 两者的只有「上一拍写的是什么」与「那一拍之后有没有新的一拍」。这里用准入面
+/// 自己的写次数判：退避期间的拍一次都不写，池子回来说可用时立刻写回并放行。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publisher_waits_for_the_instant_the_pool_named() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// 池自报不可用，并把下次探测时刻写在快照里；开关让用例把它翻回可用。
+    struct ScriptedPool {
+        unavailable: Arc<AtomicBool>,
+        next_attempt_unix: Arc<std::sync::atomic::AtomicI64>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for ScriptedPool {
+        async fn status(&self) -> Option<cog_core::LlmPoolStatus> {
+            Some(cog_core::LlmPoolStatus {
+                unavailable: self.unavailable.load(Ordering::Relaxed),
+                next_attempt_unix: self.next_attempt_unix.load(Ordering::Relaxed),
+                pool_size: 1,
+                ..Default::default()
+            })
+        }
+    }
+
+    async fn admission_writes(metrics: &cog_test_support::MemoryMetricsBackend) -> usize {
+        let now = chrono::Utc::now();
+        metrics
+            .query_gauge_range(
+                cog_core::metric_names::READY_ADMISSION_READINGS.as_str(),
+                now - chrono::Duration::hours(1),
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .expect("the in-memory board answers")
+            .len()
+    }
+
+    let backend = MemoryMessageBackend::new();
+    let runtime = DagExecutorRuntime::new_with_backend(
+        DagExecutorConfig {
+            redis_url: "redis://localhost".into(),
+            workspace_id: "ws-backoff".into(),
+            consumer_group: "cg-backoff".into(),
+            max_retries: 3,
+            ..DagExecutorConfig::default()
+        },
+        backend.clone(),
+    );
+    let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
+    runtime.orchestrator().attach_metrics(metrics.clone());
+
+    // 第一拍就是「池子说了不可用，但那个时刻已经过去了」：这一拍该照常判、照常写，
+    // 判词是按下不动。退避只认**未来**的时刻，一个过去的时刻不是闭窗。
+    let unavailable = Arc::new(AtomicBool::new(true));
+    let next_attempt_unix = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    runtime.attach_pool_status_source(Arc::new(ScriptedPool {
+        unavailable: unavailable.clone(),
+        next_attempt_unix: next_attempt_unix.clone(),
+    }));
+
+    runtime
+        .submit_goal("backoff-goal", vec![make_test_task("backoff-task")])
+        .await
+        .unwrap();
+
+    runtime.publish_ready_tasks().await.unwrap();
+    assert_eq!(
+        count_status(&runtime, TaskStatus::Pending).await,
+        1,
+        "an unavailable pool admits nothing"
+    );
+    let after_deciding = admission_writes(&metrics).await;
+    assert!(
+        after_deciding > 0,
+        "the pass that decided the hold is written down"
+    );
+
+    // 池子把复问时刻推到一小时后：这之间的每一拍都不该再扫队列、再写一遍读数。
+    next_attempt_unix.store(chrono::Utc::now().timestamp() + 3_600, Ordering::Relaxed);
+    runtime.publish_ready_tasks().await.unwrap();
+    assert_eq!(
+        admission_writes(&metrics).await,
+        after_deciding,
+        "a pass that skipped itself must not write an admission reading: it decided nothing"
+    );
+    assert_eq!(count_status(&runtime, TaskStatus::Pending).await, 1);
+
+    // 池子提前回来说可用：退避跟着池子的判定走，不由那个时刻独占。
+    unavailable.store(false, Ordering::Relaxed);
+    runtime.publish_ready_tasks().await.unwrap();
+    assert_eq!(
+        count_status(&runtime, TaskStatus::Scheduled).await,
+        1,
+        "the first pass after the pool is back admits the held task"
+    );
+    assert!(
+        admission_writes(&metrics).await > after_deciding,
+        "the pass that admitted work is written down again"
+    );
 }
 
 async fn count_status(runtime: &DagExecutorRuntime, status: TaskStatus) -> usize {

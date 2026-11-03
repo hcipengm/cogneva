@@ -209,6 +209,27 @@ pub fn jobs_the_window_can_pay_for_status(status: &cog_core::LlmPoolStatus) -> O
     jobs_the_window_can_pay_for(&status.pace, measurable_pool_size(status))
 }
 
+/// The instant before which a ready-queue pass may be skipped outright.
+///
+/// A pool that declares itself unavailable names, in `next_attempt_unix`, the
+/// earliest instant the gateway will probe it again. Until then nothing in a
+/// pass can change: no reading it takes can flip the verdict, and no task it
+/// finds is admissible. Running anyway is not free — it scans the whole ready
+/// backlog and writes one refusal line per stream per cadence, so on a multi-hour
+/// outage the log reads as a platform that never stops trying, and buries the one
+/// instant that actually matters.
+///
+/// `None` runs the pass. A pool that is available, a snapshot that names no probe
+/// instant (`0`), and an instant already in the past all run it: an unread clock
+/// is not a closed window, the same way an unread pool is not an empty one.
+pub fn publisher_backoff_until(
+    unavailable: bool,
+    retry_at_unix: i64,
+    now_unix: i64,
+) -> Option<i64> {
+    (unavailable && retry_at_unix > now_unix).then_some(retry_at_unix)
+}
+
 /// Why a pass held work back, as the closed label the held counter carries.
 ///
 /// The zeros arrive at the same place and mean different things: a spent window
@@ -618,6 +639,25 @@ mod tests {
             )),
             Some(4)
         );
+    }
+
+    #[test]
+    fn a_publisher_only_skips_a_pass_the_pool_itself_closed_with_a_clock() {
+        // The pool is down and named when it will be probed again: every pass
+        // before that instant would decide the same zero.
+        assert_eq!(
+            publisher_backoff_until(true, 1_000, 400),
+            Some(1_000),
+            "a closed pool with a future probe instant is a pass worth skipping"
+        );
+        // The instant has passed: the verdict may have changed, so ask again.
+        assert_eq!(publisher_backoff_until(true, 1_000, 1_000), None);
+        assert_eq!(publisher_backoff_until(true, 1_000, 2_000), None);
+        // Down with no clock is not "sleep forever": an unread instant is not a
+        // promise, and skipping on it would freeze the queue behind a zero.
+        assert_eq!(publisher_backoff_until(true, 0, 2_000), None);
+        // An available pool always runs the pass, whatever the clock says.
+        assert_eq!(publisher_backoff_until(false, 1_000, 400), None);
     }
 
     #[test]

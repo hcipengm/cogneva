@@ -3,6 +3,7 @@ use cog_core::{
     ToolDefinition,
 };
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -363,6 +364,75 @@ impl RunUsage {
 
 /// Try to extract a JSON object or array from free-form text.
 /// Handles both raw JSON and JSON embedded inside markdown fences or reasoning.
+/// A digest of the exact request a call would put on the wire.
+///
+/// The conversation and the tool list are the request. Options that only decide
+/// how the answer is billed or labelled — cache retention, the actor stamp, the
+/// task id — are left out on purpose: two attempts that differ in nothing the
+/// model reads are the same question, and re-asking it inside a wait the upstream
+/// named buys the same refusal at full price.
+///
+/// What the model reads is the message *content*, so every field that is only
+/// bookkeeping stays out of the digest. The timestamp above all: it is stamped
+/// when the message is built, so two sends of the same prompt differ in it on
+/// every call, and hashing the serialized message would make every pair of
+/// attempts look like different requests — which is exactly the case this guard
+/// exists for.
+fn request_digest(messages: &[Message], options: &cog_core::ChatOptions) -> String {
+    let mut hasher = Sha256::new();
+    let mut put = |part: &[u8]| {
+        hasher.update(part);
+        hasher.update([0u8]);
+    };
+    for message in messages {
+        match message {
+            Message::System { content, .. } => {
+                put(b"system");
+                put(content.as_bytes());
+            }
+            Message::User { content, .. } => {
+                put(b"user");
+                put(&serde_json::to_vec(content).unwrap_or_default());
+            }
+            Message::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                put(b"assistant");
+                put(&serde_json::to_vec(content).unwrap_or_default());
+                put(&serde_json::to_vec(tool_calls).unwrap_or_default());
+            }
+            Message::ToolResult {
+                tool_call_id,
+                tool_name,
+                content,
+                is_error,
+                ..
+            } => {
+                put(b"tool");
+                put(tool_call_id.as_bytes());
+                put(tool_name.as_bytes());
+                put(&[u8::from(*is_error)]);
+                put(&serde_json::to_vec(content).unwrap_or_default());
+            }
+        }
+    }
+    if let Some(tools) = options.tools.as_ref() {
+        for tool in tools {
+            let parameters = tool.parameters.to_string();
+            for part in [
+                tool.name.as_str(),
+                tool.description.as_str(),
+                parameters.as_str(),
+            ] {
+                put(part.as_bytes());
+            }
+        }
+    }
+    hex::encode(hasher.finalize())
+}
+
 fn try_extract_json(text: &str) -> Option<serde_json::Value> {
     let trimmed = text.trim();
 
@@ -2122,6 +2192,26 @@ impl AgentRuntime {
         .with_actor(&format!("agent:{}", self.config.role));
         let options = self.stamp_task(options);
 
+        // 同一份请求在上游自报的等待之内只发一次。上面重放它的那些层（pipeline
+        // 的 attempt、ralph 的下一轮）拿不到这一层发过的字节，所以它们以为自己在
+        // 重试，实际上是在同一个窗口里把同一个问题再买一遍，而答案只可能是同一句
+        // 拒绝。判据是整份请求的摘要：换了一份请求就是换了一个问题，那是该发出去的。
+        let request = request_digest(&messages, &options);
+        if let Some((cause, refusal, remaining)) =
+            crate::agent_kernel::replay_guard::suppressed(&request, chrono::Utc::now())
+        {
+            tracing::warn!(
+                agent_id = %self.config.agent_id,
+                wait_secs = remaining,
+                "the upstream refused this exact request and named when to ask again; not sending it again before then"
+            );
+            return Err(SFError::upstream_refused_after(
+                cause,
+                refusal,
+                Some(remaining as u64),
+            ));
+        }
+
         // Stall-based hang protection: the clock resets on every stream event,
         // so a slow-but-alive generation is never aborted — only a connection
         // that stops making progress for the full window is treated as dead.
@@ -2143,7 +2233,10 @@ impl AgentRuntime {
         .await
         {
             Ok(Ok(stream)) => stream,
-            Ok(Err(e)) => return Err(e),
+            Ok(Err(e)) => {
+                self.remember_refusal(&request, &e);
+                return Err(e);
+            }
             Err(_) => {
                 let err = stall_err("establishing the stream");
                 tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime think_stream stall timeout");
@@ -2226,14 +2319,16 @@ impl AgentRuntime {
             // stated wait must reach the delay rather than be re-derived. The
             // sentence is kept as the message's text either way, so the wording
             // readers already have does not change.
-            return Err(match response.upstream_failure {
+            let refusal = match response.upstream_failure {
                 Some(cause) => SFError::upstream_refused_after(
                     cause,
                     format!("LLM stream error: {error}"),
                     response.retry_after_secs,
                 ),
                 None => SFError::Agent(format!("LLM stream error: {error}")),
-            });
+            };
+            self.remember_refusal(&request, &refusal);
+            return Err(refusal);
         }
 
         // Build the final message from response content
@@ -2259,7 +2354,31 @@ impl AgentRuntime {
         })
         .await?;
 
+        // An answer retires the guard: whatever was refused before, this request
+        // is now known to be answerable.
+        crate::agent_kernel::replay_guard::forget(&request);
+
         Ok(assistant_msg)
+    }
+
+    /// Hold a refusal long enough that the same bytes are not re-sent inside the
+    /// wait the upstream named; see [`crate::agent_kernel::replay_guard`].
+    ///
+    /// Only a refusal that states a wait is remembered. A timeout, a stall or an
+    /// untyped error says nothing about when the same request would work, and
+    /// remembering those would turn a transient blip into a silence — the guard
+    /// would hold a request the upstream is perfectly willing to answer.
+    fn remember_refusal(&mut self, request: &str, error: &SFError) {
+        let (Some(cause), Some(secs)) = (error.upstream_failure(), error.retry_after_secs()) else {
+            return;
+        };
+        crate::agent_kernel::replay_guard::remember(
+            request,
+            cause,
+            secs,
+            error.to_string(),
+            chrono::Utc::now(),
+        );
     }
 
     async fn build_result(
@@ -3912,6 +4031,101 @@ mod tests {
         assert_eq!(
             runtime.run_usage.llm_calls, 2,
             "the reformat fallback is a billed call and must be counted"
+        );
+    }
+
+    /// 上游说了「多久之后再来」的拒绝，在那一档之内不许把逐字节相同的请求
+    /// 再发一遍。
+    ///
+    /// 重跑往往换一个新的 agent 实例（名字按 task+role 推，ralph 每轮铸一个新
+    /// 任务 id），所以这里用两个独立实例发同一份请求：闸若只挂在实例上，第二个
+    /// 实例照样会再买一次同一个拒绝；挂在进程上才对，因为说这句话的是上游。
+    #[tokio::test]
+    async fn an_identical_request_is_not_re_sent_inside_the_wait_the_upstream_named() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// 第一次流事件就是拒绝，并在终态响应里带上等待时长——这条正是
+        /// 熔断拒绝的形状（503 + Retry-After）。
+        struct RefusingLlm {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl cog_core::LlmClient for RefusingLlm {
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let (stream, producer) = cog_core::EventStream::with_capacity(4);
+                tokio::spawn(async move {
+                    let mut producer = producer;
+                    let _ = producer
+                        .push(AssistantMessageEvent::Error {
+                            reason: cog_core::StopReason::Error,
+                            error: Message::assistant_text("the pool has no member for this face"),
+                            timestamp: chrono::Utc::now(),
+                        })
+                        .await;
+                    let mut response = cog_core::ChatResponse::default();
+                    response.upstream_failure =
+                        Some(cog_core::contract::llm::UpstreamFailure::RateLimited);
+                    response.retry_after_secs = Some(600);
+                    producer.end(response);
+                });
+                Ok(stream)
+            }
+
+            async fn complete_stream(
+                &self,
+                _prompt: &str,
+                _options: &cog_core::CompleteOptions,
+            ) -> SFResult<cog_core::AssistantMessageEventStream> {
+                unimplemented!()
+            }
+
+            async fn chat(
+                &self,
+                _messages: &[Message],
+                _options: &cog_core::ChatOptions,
+            ) -> SFResult<cog_core::ChatResponse> {
+                unimplemented!()
+            }
+
+            async fn health_check(&self) -> bool {
+                true
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let llm = RefusingLlm {
+            calls: calls.clone(),
+        };
+        // 内容对每个用例唯一：这道闸是进程级的，两条用例用同一份请求会互相看见。
+        let input =
+            serde_json::json!({"task": "replay-guard: an identical request is not re-sent"});
+
+        let mut first = census_runtime("replay-guard-first");
+        first
+            .run_scoped(input.clone(), &llm, Some("task-replay"))
+            .await
+            .expect_err("the refusal propagates");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut second = census_runtime("replay-guard-second");
+        let err = second
+            .run_scoped(input, &llm, Some("task-replay"))
+            .await
+            .expect_err("a replay is refused with the same failure");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the second send is a replay, not a retry: the upstream named when to ask again"
+        );
+        assert!(
+            err.retry_after_secs().is_some(),
+            "the wait has to survive the suppression, or the layer above re-derives one: {err}"
         );
     }
 
