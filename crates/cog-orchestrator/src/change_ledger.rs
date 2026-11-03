@@ -580,6 +580,25 @@ fn dispatch_task_id(identity: &ChangeIdentity, generation: u32) -> String {
     }
 }
 
+/// Every task id a change has been, or could have been, worked under.
+///
+/// The whole closed set, not the ones the event stream shows somebody used:
+/// what a change cost is the sum over its handovers, and a handover whose events
+/// were pruned or never read is still a handover that spent tokens. Enumerating
+/// the set the dispatcher can produce therefore costs one id per generation that
+/// cannot exist, and it is what keeps the reading exact -- a pattern query would
+/// also match a change whose hash shares the prefix's first sixteen hex digits
+/// only by the accident of a shared prefix being a string prefix.
+///
+/// Public because the reading side is a different crate: the ledger owns the edge
+/// from identity to id, and a caller that recomputed it would be a second copy of
+/// the rule that can drift from this one.
+pub fn dispatch_task_ids(identity: &ChangeIdentity) -> Vec<String> {
+    (0..=dispatch_rearm_limit())
+        .map(|generation| dispatch_task_id(identity, generation))
+        .collect()
+}
+
 /// How far back one pass reads the commit log for delivery trailers.
 ///
 /// A count rather than a revision range: a delivery that arrived while this
@@ -6553,6 +6572,26 @@ mod tests {
         assert_ne!(dispatch_task_id(&id, 1), base);
         assert_ne!(dispatch_task_id(&id, 1), dispatch_task_id(&id, 2));
         assert!(!dispatch_task_id(&id, 1).starts_with(&format!("{base}-r0")));
+    }
+
+    /// A reader that wants every id under which one change was worked has to be
+    /// handed the whole closed set by the crate that owns the rule. Two things
+    /// go wrong otherwise: a caller that recomputes them is a second copy of the
+    /// hash rule, and a caller that stops at generation 0 reports the tokens of
+    /// a re-armed change as its first attempt's alone -- an undercount that
+    /// reads exactly like a cheap change.
+    #[test]
+    fn every_generation_a_change_can_be_worked_under_is_handed_to_the_reader() {
+        let id = ChangeIdentity::new("grep", "crates/x", "fn thing");
+        let ids = dispatch_task_ids(&id);
+        assert_eq!(ids.len() as u32, dispatch_rearm_limit() + 1);
+        assert_eq!(ids[0], dispatch_task_id(&id, 0));
+        assert_eq!(ids[0], handover_task_prefix(&id));
+        let unique: std::collections::BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "generations must not share an id");
+        // The ids of one change never read as the ids of another.
+        let other = ChangeIdentity::new("grep", "crates/x", "fn other");
+        assert!(dispatch_task_ids(&other).iter().all(|id| !ids.contains(id)));
     }
 
     /// Two identities that render the same string must not share an id. The

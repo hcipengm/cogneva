@@ -161,6 +161,23 @@ pub trait OrchestratorControl: Send + Sync {
 
     /// Replay a task from the DLQ if present. Returns true when replayed.
     async fn replay_dlq(&self, task_id: &str) -> SFResult<bool>;
+
+    /// Every task id a change could have been worked under, or `None` when this
+    /// control plane does not dispatch changes at all.
+    ///
+    /// Here rather than in the crate that owns the rule because a reader reaches
+    /// every other crate through this one: a read face that recomputed the id
+    /// from the identity would be a second copy of a hash that decides which
+    /// rows belong to which change, and the two copies would keep agreeing
+    /// right up until the day one of them was edited.
+    ///
+    /// The default is `None`, not an empty vec: an empty set is the answer "this
+    /// change has no handovers", which a cost read turns into a confident zero.
+    /// `None` says the question cannot be answered by this implementation, and a
+    /// caller is expected to report the figure as unmeasurable instead.
+    fn change_dispatch_ids(&self, _identity: &crate::ChangeIdentity) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Core DAG execution engine interface.

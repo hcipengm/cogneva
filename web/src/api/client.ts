@@ -2209,6 +2209,20 @@ export interface ChangeTimeline {
   literal: string;
   /** 新的在前。 */
   events: ChangeTimelineEvent[];
+  /** 这一条变更自己花掉的 token，按它可能的每一次交接求和。 */
+  cost: ChangeCost;
+}
+
+export interface ChangeCost {
+  /** 求和覆盖的 id 个数（这条变更可能被派发的全部代际，不是实际派发次数）。 */
+  ids_covered: number;
+  /**
+   * 这些 id 下花掉的 token。`null` 不是 0——进程里没有账，与这条变更什么都没花，
+   * 是两个相反的状态，而前一个不会自己好。
+   */
+  tokens: number | null;
+  /** 读不到时的原因。 */
+  unreadable: string | null;
 }
 
 export async function getChangeTimeline(

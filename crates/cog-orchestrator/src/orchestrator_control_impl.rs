@@ -111,6 +111,14 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.crew_retry_all(task_ids).await
     }
 
+    /// The dispatch ids, from the one rule that derives them. This control plane
+    /// runs the loop that hands changes over, so it can answer; a stand-in that
+    /// cannot keeps the trait's `None` and a reader reports the cost as
+    /// unmeasurable rather than as zero.
+    fn change_dispatch_ids(&self, identity: &cog_core::ChangeIdentity) -> Option<Vec<String>> {
+        Some(crate::change_ledger::dispatch_task_ids(identity))
+    }
+
     async fn get_ready_tasks(&self) -> Vec<Task> {
         self.dag_executor.get_ready_tasks().await
     }

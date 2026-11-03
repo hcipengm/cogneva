@@ -468,6 +468,75 @@ pub struct ChangeTimelineResponse {
     pub literal: String,
     /// Newest first, the order the store returns.
     pub events: Vec<cog_core::ChangeLedgerEvent>,
+    /// What this one change cost, measured over its own handovers.
+    pub cost: ChangeCost,
+}
+
+/// What one change cost, summed over every handover it could have made.
+///
+/// The figure is the change's own, not a fleet share: it is the ledger rows
+/// filed under the ids this change's identity fixes, so a change that took
+/// three handovers sums three attempts and a change nobody picked up reads
+/// zero. Dividing a day's spend by the day's landings answers a different
+/// question -- what the fleet costs per landing -- and cannot be read as what
+/// any particular change cost, because the two numbers move independently.
+#[derive(Debug, Serialize)]
+pub struct ChangeCost {
+    /// How many ids the sum was taken over -- the whole closed set a change can
+    /// be worked under, not the number of handovers it actually made.
+    ///
+    /// The denominator travels with the figure because a reading of one
+    /// generation is not a reading of a change: a change that was re-armed two
+    /// times and reports its first attempt's tokens reads exactly like a cheap
+    /// change. Named for what it counts, so a reader cannot mistake it for a
+    /// count of attempts.
+    pub ids_covered: usize,
+    /// Tokens spent under those ids, or `None` when the ledger could not be
+    /// read. `None` is not zero: a process with no ledger and a change that
+    /// cost nothing would otherwise be one row, and the first is a fault that
+    /// never clears on its own.
+    pub tokens: Option<u64>,
+    /// Why the figure is missing, when it is.
+    pub unreadable: Option<String>,
+}
+
+/// One change's cost, read from the ledger under the ids its identity fixes.
+///
+/// The ids come from the control plane rather than being recomputed here: the
+/// hash that turns an identity into a task id is one rule, and this crate
+/// reaches every other crate through `cog-core`, so a second copy would be the
+/// only way to have it here at all.
+pub async fn change_cost(
+    ledger: Option<&Arc<dyn cog_core::LlmUsageLedger>>,
+    ids: Option<Vec<String>>,
+) -> ChangeCost {
+    let Some(ids) = ids else {
+        return ChangeCost {
+            ids_covered: 0,
+            tokens: None,
+            unreadable: Some("this control plane does not dispatch changes".into()),
+        };
+    };
+    let ids_covered = ids.len();
+    let Some(ledger) = ledger else {
+        return ChangeCost {
+            ids_covered,
+            tokens: None,
+            unreadable: Some("this process holds no token ledger".into()),
+        };
+    };
+    match ledger.spend_by_task(&ids).await {
+        Ok(rows) => ChangeCost {
+            ids_covered,
+            tokens: Some(rows.iter().map(|(_, tokens)| *tokens).sum()),
+            unreadable: None,
+        },
+        Err(e) => ChangeCost {
+            ids_covered,
+            tokens: None,
+            unreadable: Some(e),
+        },
+    }
 }
 
 /// How many moves one history returns unless the caller asks for fewer. The
@@ -512,12 +581,18 @@ pub async fn change_timeline_handler(
     let events = ledger
         .events(&identity, timeline_limit(query.limit))
         .await?;
+    let cost = change_cost(
+        state.llm_usage.as_ref(),
+        state.orchestrator.change_dispatch_ids(&identity),
+    )
+    .await;
     Ok(Json(ChangeTimelineResponse {
         identity: identity.as_key(),
         kind: identity.kind,
         scope: identity.scope,
         literal: identity.literal,
         events,
+        cost,
     }))
 }
 

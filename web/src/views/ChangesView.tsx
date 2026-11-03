@@ -52,6 +52,16 @@ function ChangeHistory({ row, onClose }: { row: ChangeLedgerRow; onClose: () => 
         <dd className="mono text-[var(--paper-dim)]">
           {row.measured_rev ?? '还没有人以某个版本看过它'}
         </dd>
+        <dt className="text-[var(--muted)]">这条花了</dt>
+        <dd className="mono text-[var(--paper-dim)]">
+          {/* 按这条身份自己的交接 id 求和，不是「全队一天的均摊」：均摊回答不了
+              任何一条变更花了多少，它把差一百倍的两条读成同一个数。 */}
+          {timeline.data
+            ? timeline.data.cost.tokens === null
+              ? `量不了：${timeline.data.cost.unreadable ?? '没有账'}`
+              : `${timeline.data.cost.tokens.toLocaleString()} token（按 ${timeline.data.cost.ids_covered} 个交接号求和）`
+            : '—'}
+        </dd>
       </dl>
       {timeline.error ? (
         <ReadError what="变更时间线" error={timeline.error} onRetry={timeline.refresh} />

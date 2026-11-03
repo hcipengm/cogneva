@@ -359,7 +359,127 @@ impl QuotaManager for OpenQuota {
 
 /// The gateway state the router is built over. Everything is absent except the
 /// account under test.
+/// A token ledger that answers one question: what the named task ids spent.
+///
+/// Every other method panics on purpose. A read route that lands a row or reads
+/// a window through this stand-in would be answering a question these cases do
+/// not ask, and absorbing that silently is how a read face grows a write.
+struct FakeUsage {
+    spent: Vec<(String, u64)>,
+}
+
+#[async_trait::async_trait]
+impl cog_core::LlmUsageLedger for FakeUsage {
+    async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn upstream_window(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<cog_core::UpstreamWindowReading, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn burned_between(&self, _: &str, _: i64, _: i64) -> Result<u64, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn record_window(&self, _: &cog_core::StoredWindow) -> Result<(), String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn stored_window(
+        &self,
+        _: &str,
+        _: u64,
+    ) -> Result<Option<cog_core::StoredWindow>, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn stored_windows(&self, _: &str) -> Result<Vec<cog_core::StoredWindow>, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn spent_since(&self, _: &str, _: i64) -> Result<u64, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn spend_by_actor_since(
+        &self,
+        _: i64,
+    ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn spend_by_upstream_and_actor(
+        &self,
+    ) -> Result<Vec<cog_core::UpstreamActorSpend>, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn task_cost_quantile(&self, _: i64, _: f64) -> Result<Option<(u64, u64, i64)>, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn task_has_started(&self, _: &str) -> Result<bool, String> {
+        unimplemented!("read-only stand-in")
+    }
+    /// The one method these cases use: the real store silently drops ids it
+    /// has no rows for, and the route has to keep that shape -- an absent id
+    /// that came back as a zero row would make "never ran" and "ran free" one
+    /// reading here too.
+    async fn spend_by_task(&self, task_ids: &[String]) -> Result<Vec<(String, u64)>, String> {
+        Ok(self
+            .spent
+            .iter()
+            .filter(|(id, _)| task_ids.contains(id))
+            .cloned()
+            .collect())
+    }
+    async fn unattributed_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn outcomes_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::OutcomeCount>, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn metering_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::MeteringCount>, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn skips_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::SkippedWorkLine>, String> {
+        unimplemented!("read-only stand-in")
+    }
+    async fn verdicts_between(
+        &self,
+        _: chrono::DateTime<chrono::Utc>,
+        _: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::SpendVerdictLine>, String> {
+        unimplemented!("read-only stand-in")
+    }
+}
+
 fn state(change_ledger: Option<Arc<FakeLedger>>) -> Arc<GatewayState> {
+    state_with(change_ledger, None)
+}
+
+/// The same router with a token ledger behind it, for the cases that read what
+/// a change cost. Kept as a second entry point rather than an argument on
+/// [`state`] so the cases that never ask about cost keep saying nothing about
+/// it.
+fn state_with(
+    change_ledger: Option<Arc<FakeLedger>>,
+    llm_usage: Option<Arc<dyn cog_core::LlmUsageLedger>>,
+) -> Arc<GatewayState> {
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(cog_storage::MemoryRawLogger::new());
@@ -453,7 +573,7 @@ fn state(change_ledger: Option<Arc<FakeLedger>>) -> Arc<GatewayState> {
         audit_stream: None,
         taste_intent_sink: None,
         llm_usage_reader: None,
-        llm_usage: None,
+        llm_usage,
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
         agent_messages: None,
@@ -631,6 +751,108 @@ async fn one_rows_history_is_read_by_the_three_parts_of_its_identity() {
         status,
         StatusCode::BAD_REQUEST,
         "a rendered key is not an identity: {body}"
+    );
+}
+
+/// What one change cost, summed over the handovers its identity fixes.
+///
+/// The reading this replaces was the fleet's day: spend divided by landings.
+/// That is an average over changes that have nothing to do with each other, and
+/// it cannot answer what any one of them cost -- two changes a hundredfold
+/// apart report the same number. The ledger already keys its rows by task, and
+/// a change's task ids are fixed by its identity, so the exact figure is one
+/// read: sum the ids. Three things go wrong if this is left to a caller.
+///
+/// 1. Stopping at generation 0 reports a re-armed change's first attempt as the
+///    whole cost -- an undercount that reads like a cheap change.
+/// 2. Summing a prefix as a pattern picks up another change whose hash shares
+///    the first sixteen hex digits.
+/// 3. Letting an unreadable ledger answer zero makes every change free on the
+///    day the store is not wired up, which is exactly when the number matters.
+#[tokio::test]
+async fn a_changes_cost_is_summed_over_its_own_handovers() {
+    let identity = ChangeIdentity::new(
+        "grep",
+        "crates/cog-gateway/src",
+        "literal-in-crates/cog-gateway/src",
+    );
+    let ids = cog_orchestrator::change_ledger::dispatch_task_ids(&identity);
+    assert!(ids.len() > 1, "a change has more than one handover id");
+
+    let other = ChangeIdentity::new("grep", "crates/cog-gateway/src", "another literal");
+    let other_ids = cog_orchestrator::change_ledger::dispatch_task_ids(&other);
+
+    // Two handovers of this change spent; a third change's id did too, and the
+    // last one is a generation this change could not have been worked under.
+    let usage = Arc::new(FakeUsage {
+        spent: vec![
+            (ids[0].clone(), 400),
+            (ids[1].clone(), 250),
+            (other_ids[0].clone(), 9_000),
+        ],
+    });
+    let state = state_with(
+        Some(Arc::new(FakeLedger::new(
+            vec![row(
+                ChangeState::Landed,
+                "doc-a.md",
+                "crates/cog-gateway/src",
+            )],
+            0,
+            0,
+        ))),
+        Some(usage),
+    );
+    let token = bearer(&state).await;
+
+    let (status, body) = get(
+        state,
+        "/api/v1/governance/changes/events?kind=grep&scope=crates/cog-gateway/src&literal=literal-in-crates/cog-gateway/src",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cost"]["tokens"], 650, "{body}");
+    assert_eq!(body["cost"]["ids_covered"], ids.len(), "{body}");
+    assert!(
+        body["cost"]["unreadable"].is_null(),
+        "a ledger that answered leaves nothing unexplained: {body}"
+    );
+}
+
+/// No ledger is not a free change.
+///
+/// The two states this route can be in without a figure are opposite faults: a
+/// change that spent nothing is a change nothing picked up, and a process with
+/// no ledger will never report a cost again. A zero covers both and hides the
+/// second, which is the one that needs a repair.
+#[tokio::test]
+async fn a_change_with_no_ledger_behind_it_costs_unknown_not_zero() {
+    let state = state(Some(Arc::new(FakeLedger::new(
+        vec![row(
+            ChangeState::Landed,
+            "doc-a.md",
+            "crates/cog-gateway/src",
+        )],
+        0,
+        0,
+    ))));
+    let token = bearer(&state).await;
+
+    let (status, body) = get(
+        state,
+        "/api/v1/governance/changes/events?kind=grep&scope=crates/cog-gateway/src&literal=literal-in-crates/cog-gateway/src",
+        Some(&token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["cost"]["tokens"].is_null(),
+        "an absent ledger must not read as a change that cost nothing: {body}"
+    );
+    assert!(
+        body["cost"]["unreadable"].is_string(),
+        "the missing figure has to say why: {body}"
     );
 }
 
