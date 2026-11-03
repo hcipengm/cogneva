@@ -134,6 +134,26 @@ pub trait OrchestratorControl: Send + Sync {
     /// Cancel a task and return cascaded cancellations.
     async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>>;
 
+    /// [`Self::cancel_task`] with a reason that says why, not just that.
+    ///
+    /// A cancelled row keeps no other trace: it never ran, so there is no
+    /// result to read and no failure to explain it, and "someone cancelled it"
+    /// is what a reader of the graph is left with. A sweep that knows more --
+    /// the alert this work was filed for is no longer firing, the predecessor
+    /// it waited on can never settle -- has to be able to say so on the row,
+    /// because the row is the only place the answer survives the round.
+    ///
+    /// The default drops the reason rather than refusing the call: an
+    /// orchestrator that cannot record one still has to be able to cancel, and
+    /// a test double that ignores it is not a caller that has to be fixed.
+    async fn cancel_task_with_reason(
+        &self,
+        task_id: &str,
+        _reason: String,
+    ) -> SFResult<Vec<String>> {
+        self.cancel_task(task_id).await
+    }
+
     /// Look up a single task by id.
     async fn get_task(&self, task_id: &str) -> Option<Task>;
 
@@ -249,6 +269,16 @@ pub trait DagExecutor: Send + Sync {
 
     /// Cancel a task and cascade-cancel all downstream dependents.
     async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>>;
+
+    /// [`Self::cancel_task`] with the reason the row keeps; see
+    /// [`OrchestratorControl::cancel_task_with_reason`].
+    async fn cancel_task_with_reason(
+        &self,
+        task_id: &str,
+        _reason: String,
+    ) -> SFResult<Vec<String>> {
+        self.cancel_task(task_id).await
+    }
 
     /// Retry a failed task (reset to Pending).
     async fn retry_task(&self, task_id: &str) -> SFResult<()>;

@@ -3910,6 +3910,14 @@ impl cog_core::DagExecutor for DagExecutor {
         self.cancel_task(task_id).await
     }
 
+    async fn cancel_task_with_reason(
+        &self,
+        task_id: &str,
+        reason: String,
+    ) -> SFResult<Vec<String>> {
+        self.cancel_task_with_reason(task_id, reason).await
+    }
+
     async fn retry_task(&self, task_id: &str) -> SFResult<()> {
         self.retry_task(task_id).await
     }

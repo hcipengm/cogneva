@@ -43,7 +43,7 @@
 //! an outward side effect: a control plane doing it too submits every signal
 //! twice, and the loser only learns of it as a duplicate-task error.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -374,6 +374,51 @@ fn select_alerts<'a>(
     }
 }
 
+/// The alert work a round retires: rows filed for an alert that has stopped
+/// firing, and that never started.
+///
+/// An alert's acceptance is that its rule is no longer firing, so a `Pending`
+/// row whose alert has left the firing set is work nobody can finish by doing
+/// it: the condition it was filed for is already gone. Measured 2026-11-03:
+/// 1181 `self-signal-alert-*` rows `Pending` under alerts that had all
+/// resolved, every one of them ready and unowned, left by a pool outage in
+/// which one alert per squad agent fired and then cleared. They are not idle:
+/// a `Pending` row is what the executor admits next, so the pool's return
+/// would have gone to investigating agents that no longer exist, one squad
+/// each, out of the budget the outage had just given back.
+///
+/// Only rows that never started are retired. `Scheduled` means a message is
+/// carrying the row and `Running` means a process is, so cancelling either
+/// would race work that is already moving; the transport reclaims a
+/// `Scheduled` row nobody ran by itself.
+///
+/// Absence from the firing list is evidence only when the list was not
+/// truncated: a full page says nothing about what is behind it, and a row
+/// whose alert is simply the next one down would read as cleared work.
+fn cleared_alert_work<'a>(
+    tasks: &'a [Task],
+    firing: &HashSet<String>,
+    truncated: bool,
+) -> Vec<&'a Task> {
+    if truncated {
+        return Vec::new();
+    }
+    tasks
+        .iter()
+        .filter(|t| t.status == TaskStatus::Pending && is_alert_work(&t.id))
+        .filter(|t| !firing.contains(&t.id))
+        .collect()
+}
+
+/// Why a row the sweep retires is retired.
+///
+/// The cancelled row keeps no other trace -- it never ran, so there is no
+/// result and no failure -- and this text is what a reader of the graph is
+/// left with when asking why work disappeared.
+const CLEARED_ALERT_REASON: &str =
+    "the alert this row was filed for is no longer firing and the row \
+     never started: the condition it was filed for is gone, so it is retired rather than run";
+
 /// The alerts one tick acts on, and what it left alone.
 ///
 /// These are returned together rather than counted apart: "an alert was in
@@ -502,9 +547,51 @@ fn alert_signal_key(dedup_key: &str) -> String {
 /// and the writer cannot come to disagree about which row an alert owns.
 fn alert_task_id(dedup_key: &str) -> String {
     format!(
-        "self-signal-alert-{}",
+        "{ALERT_TASK_PREFIX}{}",
         short_hash(&alert_signal_key(dedup_key))
     )
+}
+
+/// Where every alert's work id starts: [`alert_task_id`]'s one spelling of the
+/// shape, so the sweep that retires cleared work reads the same name the
+/// filing wrote.
+const ALERT_TASK_PREFIX: &str = "self-signal-alert-";
+
+/// How many firing alerts a round reads.
+///
+/// The per-tick filing cap is what bounds the work a round creates, so this
+/// limit must not be the thing that hides alerts from it: the store answers
+/// newest-first, and a hundred newly fired alerts under a standing fault would
+/// hide the standing one behind them for as long as they kept firing. It is
+/// also the page that says whether the round may conclude anything from
+/// absence, which it may only do when the page came back short.
+// cap: bound — 页的大小不是量出来的界：高到一场风暴藏不住站着的那条，低到一轮仍读得完。
+const ALERT_LIST_LIMIT: i64 = 1000;
+
+/// How many cleared rows one round retires.
+///
+/// The same rule the filing cap follows, for the same reason: one round does a
+/// bounded amount of work, and whatever it did not reach this round it reaches
+/// next round, because the evidence -- the row is Pending and its alert is not
+/// firing -- is still there. Without it a storm that left a thousand rows
+/// behind would be undone in one round that blocks the loop for as long as a
+/// thousand cancellations take, and the rounds after it are what read the new
+/// alerts.
+// cap: bound — 与收行的上限同一档：一轮的活有界，够不着的下一轮还看得见同一份证据。
+const ALERT_RETIRE_MAX_PER_ROUND: usize = 200;
+
+/// Whether `task_id` is a row [`alert_task_id`] minted.
+///
+/// The prefix alone is not enough. Other channels that raise alerts file
+/// under names of their own that share it (`self-signal-alert-pool-<round>`),
+/// and those are keyed on something the firing list does not name, so a sweep
+/// matching the prefix would read every one of them as work whose alert had
+/// cleared. The sixteen hex digits after the prefix are the shape, and they
+/// are the hash of the dedup key the firing list does name.
+fn is_alert_work(task_id: &str) -> bool {
+    task_id
+        .strip_prefix(ALERT_TASK_PREFIX)
+        .is_some_and(|tail| tail.len() == 16 && tail.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The report-cooldown key a taste submission's signal is filed under.
@@ -1735,9 +1822,23 @@ async fn take_alerts_in(
     // bookkeeping is left untouched so the next tick retries with the
     // same slate. It also must not be read as "the alerts cleared":
     // nothing here concludes anything from absence.
-    let Some(alerts) = source.list_active_alerts(100).await else {
+    let Some(alerts) = source.list_active_alerts(ALERT_LIST_LIMIT).await else {
         return;
     };
+    // A full page is a page with something behind it, and this round is about
+    // to conclude from absence: the work filed for an alert that is not on the
+    // list is work whose alert cleared. That conclusion is only worth drawing
+    // from a list that could have held every firing alert.
+    let truncated = alerts.len() as i64 >= ALERT_LIST_LIMIT;
+    let firing: HashSet<String> = alerts
+        .iter()
+        .map(|alert| alert_task_id(&alert.dedup_key))
+        .collect();
+    // Before anything is filed: the queue this round is about to add to is the
+    // one the outage left behind, and the rows whose alerts already cleared are
+    // the part of it that can never help. This runs before the selection so a
+    // round that can file nothing -- a closed pool -- still retires them.
+    retire_cleared_alert_work(orch, tasks, &firing, truncated).await;
     let SelectedAlerts {
         selected,
         in_hand,
@@ -1780,6 +1881,44 @@ async fn take_alerts_in(
         // The report clock belongs to this function's state, so the account is
         // taken here rather than by the round.
         report_outcome(state, &key, outcome, now, readings);
+    }
+}
+
+/// Retire the alert work whose alert has stopped firing, and say why on each
+/// row.
+///
+/// A cancel that fails leaves the row where it was, which is the safe side of
+/// the mistake: the next round reads the same absence and tries again, and a
+/// row nobody retires is a row that still holds its place in the queue rather
+/// than one whose alert came back with nowhere to file. What the sweep did is
+/// read off the rows rather than counted beside them: each retired row carries
+/// the reason, so how much of the queue a cleared storm had left behind stays
+/// answerable after the queue has shrunk back.
+async fn retire_cleared_alert_work(
+    orch: &Arc<dyn OrchestratorControl>,
+    tasks: &[Task],
+    firing: &HashSet<String>,
+    truncated: bool,
+) {
+    for task in cleared_alert_work(tasks, firing, truncated)
+        .into_iter()
+        .take(ALERT_RETIRE_MAX_PER_ROUND)
+    {
+        match orch
+            .cancel_task_with_reason(&task.id, CLEARED_ALERT_REASON.to_string())
+            .await
+        {
+            Ok(cancelled) => info!(
+                task_id = %task.id,
+                cascaded = cancelled.len(),
+                "retired alert work whose alert has stopped firing"
+            ),
+            Err(e) => warn!(
+                task_id = %task.id,
+                error = %e,
+                "alert work whose alert cleared could not be retired; it keeps its place in the queue"
+            ),
+        }
     }
 }
 
@@ -2399,8 +2538,26 @@ mod tests {
         ) -> cog_core::SFResult<(bool, Vec<String>, bool)> {
             unimplemented!()
         }
-        async fn cancel_task(&self, _t: &str) -> cog_core::SFResult<Vec<String>> {
-            unimplemented!()
+        async fn cancel_task(&self, t: &str) -> cog_core::SFResult<Vec<String>> {
+            self.cancel_task_with_reason(t, "cancelled".into()).await
+        }
+
+        /// Marks the row cancelled and keeps the text, so a test can read back
+        /// what the round said about the row rather than only that it moved.
+        async fn cancel_task_with_reason(
+            &self,
+            t: &str,
+            reason: String,
+        ) -> cog_core::SFResult<Vec<String>> {
+            let mut held = self.tasks.lock().unwrap();
+            let Some(slot) = held.iter_mut().find(|x| x.id == t) else {
+                return Err(cog_core::SFError::Internal(format!(
+                    "cancel_task: no row {t}"
+                )));
+            };
+            slot.status = TaskStatus::Cancelled;
+            slot.error = Some(reason);
+            Ok(Vec::new())
         }
         async fn schedule_task(&self, _t: &str) -> cog_core::SFResult<()> {
             unimplemented!()
@@ -2503,6 +2660,190 @@ mod tests {
             state.reported.contains_key(&alert_signal_key("k")),
             "a filed alert has to spend its report clock, or the next round files it again"
         );
+    }
+
+    /// A row filed for an alert that has since cleared is work nobody can
+    /// finish: the condition it was filed for is gone, and a `Pending` row is
+    /// what the executor admits next.
+    ///
+    /// Measured 2026-11-03: 1181 such rows under alerts that had all resolved,
+    /// every one of them ready and unowned, left by one pool outage in which an
+    /// alert per squad agent fired and then cleared. Kept, they are what the
+    /// pool's return is spent on -- squads investigating agents that no longer
+    /// exist -- so the row is retired, and the reason goes on the row because a
+    /// cancelled row has nothing else to explain it with.
+    #[tokio::test]
+    async fn alert_work_whose_alert_cleared_is_retired_with_its_reason() {
+        let cleared = pending_alert_row("gone");
+        let orch: Arc<dyn OrchestratorControl> =
+            Arc::new(FilingOrchestrator::holding(vec![cleared.clone()]));
+        let source: Arc<dyn cog_core::ActiveAlertSource> =
+            Arc::new(FiringAlerts(vec![firing("k")]));
+        let config = SignalWatcherConfig::default();
+        let readings = SignalWatcherReadings::new();
+        let mut state = SignalGuardState::default();
+        let mut dirty = false;
+
+        take_alerts_in(
+            &orch,
+            &config,
+            &source,
+            &[cleared],
+            &mut state,
+            &mut dirty,
+            Utc::now(),
+            &readings,
+            false,
+        )
+        .await;
+
+        let row = orch
+            .get_task(&alert_task_id("gone"))
+            .await
+            .expect("the retired row is still in the store, as a cancelled row");
+        assert_eq!(row.status, TaskStatus::Cancelled);
+        assert_eq!(
+            row.error.as_deref(),
+            Some(CLEARED_ALERT_REASON),
+            "a row that never ran has no failure and no result; the reason is the only trace it keeps"
+        );
+    }
+
+    /// The same row, filed for an alert that is still firing, is work in hand.
+    /// Retiring it would throw away the only record that the alert was taken
+    /// up, and the next round would file it again.
+    #[tokio::test]
+    async fn alert_work_whose_alert_still_fires_keeps_its_place() {
+        let live = pending_alert_row("k");
+        let orch: Arc<dyn OrchestratorControl> =
+            Arc::new(FilingOrchestrator::holding(vec![live.clone()]));
+        let source: Arc<dyn cog_core::ActiveAlertSource> =
+            Arc::new(FiringAlerts(vec![firing("k")]));
+        let config = SignalWatcherConfig::default();
+        let readings = SignalWatcherReadings::new();
+        let mut state = SignalGuardState::default();
+        let mut dirty = false;
+
+        take_alerts_in(
+            &orch,
+            &config,
+            &source,
+            &[live],
+            &mut state,
+            &mut dirty,
+            Utc::now(),
+            &readings,
+            false,
+        )
+        .await;
+
+        let row = orch
+            .get_task(&alert_task_id("k"))
+            .await
+            .expect("the row a firing alert owns stays in the store");
+        assert_eq!(
+            row.status,
+            TaskStatus::Pending,
+            "work in hand is not the sweep's to retire"
+        );
+    }
+
+    /// A full page says nothing about what is behind it, so a round that read
+    /// one cannot conclude that a row's alert cleared. The rows stay; the next
+    /// round, on a shorter page, is the one that may retire them.
+    #[tokio::test]
+    async fn a_page_that_came_back_full_retires_nothing() {
+        let stranger = pending_alert_row("not_on_this_page");
+        let orch: Arc<dyn OrchestratorControl> =
+            Arc::new(FilingOrchestrator::holding(vec![stranger.clone()]));
+        let page: Vec<cog_core::PersistedAlert> = (0..ALERT_LIST_LIMIT)
+            .map(|i| firing(&format!("k{i}")))
+            .collect();
+        let source: Arc<dyn cog_core::ActiveAlertSource> = Arc::new(FiringAlerts(page));
+        let config = SignalWatcherConfig::default();
+        let readings = SignalWatcherReadings::new();
+        let mut state = SignalGuardState::default();
+        let mut dirty = false;
+
+        take_alerts_in(
+            &orch,
+            &config,
+            &source,
+            &[stranger],
+            &mut state,
+            &mut dirty,
+            Utc::now(),
+            &readings,
+            false,
+        )
+        .await;
+
+        let row = orch
+            .get_task(&alert_task_id("not_on_this_page"))
+            .await
+            .expect("the row is still there");
+        assert_eq!(
+            row.status,
+            TaskStatus::Pending,
+            "absence from a truncated page is not evidence that the alert cleared"
+        );
+    }
+
+    /// One round retires at most [`ALERT_RETIRE_MAX_PER_ROUND`] rows, and the
+    /// rest keep their place until the next round reads the same absence.
+    ///
+    /// The bound is the point: a storm that left a thousand rows behind is
+    /// undone over five rounds rather than in one round that blocks the loop
+    /// for as long as a thousand cancellations take.
+    #[tokio::test]
+    async fn one_round_retires_no_more_than_its_bound() {
+        let rows: Vec<Task> = (0..ALERT_RETIRE_MAX_PER_ROUND + 1)
+            .map(|i| pending_alert_row(&format!("gone{i}")))
+            .collect();
+        let orch: Arc<dyn OrchestratorControl> =
+            Arc::new(FilingOrchestrator::holding(rows.clone()));
+        let source: Arc<dyn cog_core::ActiveAlertSource> = Arc::new(FiringAlerts(vec![]));
+        let config = SignalWatcherConfig::default();
+        let readings = SignalWatcherReadings::new();
+        let mut state = SignalGuardState::default();
+        let mut dirty = false;
+
+        take_alerts_in(
+            &orch,
+            &config,
+            &source,
+            &rows,
+            &mut state,
+            &mut dirty,
+            Utc::now(),
+            &readings,
+            false,
+        )
+        .await;
+
+        let remaining = orch
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .filter(|t| t.status == TaskStatus::Pending)
+            .count();
+        assert_eq!(
+            remaining, 1,
+            "the round retires its bound and leaves the rest for the next one"
+        );
+    }
+
+    /// The sweep's name test has to be the hash shape, not the prefix: other
+    /// alert-shaped channels file under the same prefix and are keyed on
+    /// something the firing list does not name.
+    #[test]
+    fn alert_work_is_the_hash_shape_and_not_the_prefix() {
+        assert!(is_alert_work(&alert_task_id("k")));
+        assert!(!is_alert_work("self-signal-alert-pool-7"));
+        assert!(!is_alert_work(&format!(
+            "{ALERT_TASK_PREFIX}zzzzzzzzzzzzzzzz"
+        )));
+        assert!(!is_alert_work("self-signal-taste-abc"));
     }
 
     /// 同一个条件响两轮：两行挂在**同一个**根下面，那个根是锚点，不是其中任何一行。
@@ -3071,6 +3412,18 @@ mod tests {
             1,
             "an open pool has to drive the failure"
         );
+    }
+
+    /// The row an alert files, as the channel would have left it before it
+    /// ever started.
+    fn pending_alert_row(dedup_key: &str) -> Task {
+        let mut task = Task::new(
+            alert_task_id(dedup_key),
+            TaskType::Custom(SIGNAL_TASK_TYPE.into()),
+            serde_json::json!({ "goal": "fix the alert" }),
+        );
+        task.status = TaskStatus::Pending;
+        task
     }
 
     fn firing(dedup_key: &str) -> cog_core::PersistedAlert {

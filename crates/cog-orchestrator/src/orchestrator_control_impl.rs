@@ -187,6 +187,16 @@ impl OrchestratorControl for OrchestratorControlImpl {
         self.dag_executor.cancel_task(task_id).await
     }
 
+    async fn cancel_task_with_reason(
+        &self,
+        task_id: &str,
+        reason: String,
+    ) -> SFResult<Vec<String>> {
+        self.dag_executor
+            .cancel_task_with_reason(task_id, reason)
+            .await
+    }
+
     async fn get_task(&self, task_id: &str) -> Option<Task> {
         self.dag_executor.get_task(task_id).await
     }
