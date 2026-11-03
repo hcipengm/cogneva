@@ -78,6 +78,11 @@ async fn file(store: &PostgresPrincipleLedgerStore, slug: &str, where_red: Optio
 async fn a_principle_whose_gate_names_the_path_is_the_answer() {
     let (store, pool, marker) = store().await;
 
+    // 一条原则记下的门几乎总是 `crates/X/tests/` 里那个契约测试，而任务点名的是
+    // `crates/X/src/` 里要改的文件。两级路径逐字不同，唯一的公共前缀是 crate 根，
+    // 这一段就是这件事的两半：只拿文件路径去问，问不出这条原则；把 crate 根也问上，
+    // 才问得出。两半都断言，是因为只写后一半的话，把匹配换成「凡同 crate 即算」也照样
+    // 绿——那样账里任何一条同 crate 的原则都会被说成管着这个文件。
     file(
         &store,
         &format!("{marker}/on-the-path"),
@@ -86,15 +91,32 @@ async fn a_principle_whose_gate_names_the_path_is_the_answer() {
     .await;
     file(&store, &format!("{marker}/nowhere-in-particular"), None).await;
 
-    let rows = store
+    let file_only = store
         .gating_paths(&["crates/cog-gateway/src/progress.rs".to_string()], 10)
+        .await
+        .expect("read the account");
+    let file_only: Vec<&str> = file_only.iter().map(|r| r.slug.as_str()).collect();
+    assert!(
+        !file_only.contains(&format!("{marker}/on-the-path").as_str()),
+        "只按文件路径就问出了门记在别的文件上的原则：那已经不是「门里写着这条路径」，\
+         而是猜的：{file_only:?}"
+    );
+
+    let rows = store
+        .gating_paths(
+            &[
+                "crates/cog-gateway/src/progress.rs".to_string(),
+                "crates/cog-gateway".to_string(),
+            ],
+            10,
+        )
         .await
         .expect("read the account");
 
     let slugs: Vec<&str> = rows.iter().map(|r| r.slug.as_str()).collect();
     assert!(
         slugs.contains(&format!("{marker}/on-the-path").as_str()),
-        "这次要改的路径上有门，账里那条原则却没被取出来：{slugs:?}"
+        "这条路上站着门，把 crate 根也问上了，账里那条原则却没被取出来：{slugs:?}"
     );
     assert!(
         !slugs.contains(&format!("{marker}/nowhere-in-particular").as_str()),
