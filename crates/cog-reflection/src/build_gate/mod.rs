@@ -700,10 +700,10 @@ struct HostLoad {
     ///
     /// This is the reading as taken, and it is what the host series publishes.
     /// The cpu dimension is sized from [`Self::sustained_busy_cores`] instead:
-    /// see [`CPU_READING_HORIZON_WINDOWS`].
+    /// see [`READING_HORIZON_WINDOWS`].
     busy_cores: f64,
     /// [`Self::busy_cores`] as the median of the last
-    /// [`CPU_READING_HORIZON_WINDOWS`] samples of it, filled in by the caller
+    /// [`READING_HORIZON_WINDOWS`] samples of it, filled in by the caller
     /// that keeps the history between windows.
     ///
     /// `None` means this sample has no history behind it: the first window of a
@@ -711,6 +711,14 @@ struct HostLoad {
     /// dimension then reads the instant, which is what a gate that has watched
     /// nothing can honestly do.
     sustained_busy_cores: Option<f64>,
+    /// The cgroup dimension's answer as the median of the last
+    /// [`READING_HORIZON_WINDOWS`] windows, filled in by the caller that keeps
+    /// the history between windows.
+    ///
+    /// The raw answer is in [`Self::cgroup_memory`]. `None` means this sample
+    /// has no history behind it, and the dimension then reads the instant --
+    /// the same rule as the cpu one above.
+    sustained_cgroup_memory: Option<f64>,
     /// Cores this host has, counted from the same file the busy time came from.
     cores: usize,
     /// The ceiling of the cgroup the builds run in, when they run in one.
@@ -946,6 +954,7 @@ impl HostLoad {
             pressure,
             busy_cores,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores,
             budget: BuildBudget::read(),
             disk_free_bytes: disk_bytes(dir),
@@ -1094,10 +1103,13 @@ impl HostLoad {
         });
         let io = (self.tuning.io_stall_budget_pct / per_build.unwrap_or(shown).max(0.01))
             .clamp(1.0, cores);
+        // Sizable from an instant it is not: the cgroup's charge carries the page
+        // cache of whatever was just built -- and, measured on a day with none of
+        // our builds running, of whatever else was -- so the raw answer steps by
+        // a whole build and back. See [`READING_HORIZON_WINDOWS`].
         let cgroup_memory = self
-            .budget
-            .as_ref()
-            .map(|b| (in_flight + b.ceiling(self.tuning.build_peak_rss_bytes)).clamp(1.0, cores))
+            .sustained_cgroup_memory
+            .or_else(|| self.cgroup_memory())
             .unwrap_or(cores);
         [
             (DIM_CPU, cpu),
@@ -1105,6 +1117,20 @@ impl HostLoad {
             (DIM_IO, io),
             (DIM_CGROUP_MEMORY, cgroup_memory),
         ]
+    }
+
+    /// The cgroup dimension's answer from this window alone, before it is
+    /// handed to the horizon.
+    ///
+    /// Separate from [`Self::dimensions`] because the caller that keeps the
+    /// history has to see the raw answer to record it: a median of numbers that
+    /// had already been through the median would never follow the cgroup again.
+    fn cgroup_memory(&self) -> Option<f64> {
+        let cores = self.cores.max(1) as f64;
+        let in_flight = self.pressure.builds_in_flight as f64;
+        self.budget
+            .as_ref()
+            .map(|b| (in_flight + b.ceiling(self.tuning.build_peak_rss_bytes)).clamp(1.0, cores))
     }
 
     /// What this sample saw, in the form the readings are published from.
@@ -1226,18 +1252,39 @@ const HOST_DISK_FREE_BYTES: &str = "cogneva_host_disk_free_bytes";
 /// the noise is measured in the same unit the answer is.
 // cap: bound — 死区宽度就是读数在它取整的那个整数上的自身噪声，不是趋势
 const CEILING_DEAD_BAND: f64 = 0.15;
-/// How many windows the cpu reading is taken over before it may size a bound.
+/// How many windows a dimension read at an instant is taken over before it may
+/// size a bound.
 ///
 /// The bound is a decision about the next tens of minutes, because that is how
-/// long a build takes. The cpu dimension was the one input read at an instant:
-/// two `/proc/stat` reads 200 ms apart, which on this host is the whole range of
-/// the machine rather than the machine -- `cogneva_host_cpu_busy_cores` spans
-/// 1.9 to 24.0 cores of a 24-core host within twenty-four hours, and the
-/// published answer of this dimension moves between 1 and 5 across the same
-/// day, because that is the range of a fifth of a second on this machine.
-/// The bound followed it: on 2026-11-03, of the 209 falls in a day 171 came from
-/// this dimension, and the ledger wrote 456 bound changes -- taking back the
-/// slot it had just handed out every few minutes.
+/// long a build takes. Two dimensions are read at an instant and both were sized
+/// from the sample the window closed on.
+///
+/// The cpu one first: two `/proc/stat` reads 200 ms apart, which on this host is
+/// the whole range of the machine rather than the machine --
+/// `cogneva_host_cpu_busy_cores` spans 1.9 to 24.0 cores of a 24-core host
+/// within twenty-four hours, and the published answer of this dimension moves
+/// between 1 and 5 across the same day, because that is the range of a fifth of
+/// a second on this machine. The bound followed it: on 2026-11-03, of the 209
+/// falls in a day 171 came from this dimension, and the ledger wrote 456 bound
+/// changes -- taking back the slot it had just handed out every few minutes.
+///
+/// Then the cgroup one, which the cpu median left as the only flapping input:
+/// the same day, once the cpu dimension had settled, the bound still moved 19
+/// times an hour and every one of those moves was this dimension's -- sampled at
+/// thirty seconds it read 3, 3, 3, 4, 4, 4, 3, 3, over a host whose other
+/// dimensions were answering 4 and up. What moves it is the page cache charged
+/// to the cgroup: the charge steps by about a whole build's worth of headroom
+/// and back on a six-minute period while the room the box actually has does not
+/// change. A step of exactly one build is larger than [`CEILING_DEAD_BAND`], so
+/// the dead band does not hold it either.
+///
+/// That this window was measured while this deployment had nothing in flight --
+/// 2026-11-03 from 09:40 the ready queue admitted no task at all, the pool being
+/// out of quota -- is the half that rules out the obvious answer. The step is
+/// not ours to stop: it is another writer's charge on the same cgroup, so
+/// reducing it to "a build of ours fills the cache and the kernel hands it back"
+/// would name a cause that was not running, and any repair that keys on our own
+/// builds would leave it moving.
 ///
 /// A median over the horizon rather than over the last sample, because the
 /// quantity being estimated is "how many builds this host carries", which is a
@@ -1247,7 +1294,7 @@ const CEILING_DEAD_BAND: f64 = 0.15;
 /// span that guarantees it. It is a count of windows rather than a duration
 /// because the window is the unit the derivation already runs in.
 // cap: bound — 窗口数由「一次构建的时长」定，不是由收紧告警的阈值反推
-const CPU_READING_HORIZON_WINDOWS: usize = 30;
+const READING_HORIZON_WINDOWS: usize = 30;
 /// What each dimension answers on its own, beside the ceiling that takes the
 /// smallest of them.
 ///
@@ -2173,11 +2220,18 @@ pub struct BuildGate {
     /// them.
     ///
     /// The cpu dimension is sized from their median rather than from the sample
-    /// the current window took: see [`CPU_READING_HORIZON_WINDOWS`]. In memory
+    /// the current window took: see [`READING_HORIZON_WINDOWS`]. In memory
     /// beside the io cost rather than in the slot directory, for the same reason
     /// -- it is this process's reading of the host, not a decision about it, and
     /// a restart pays one window to fill the history again.
     cpu_history: Mutex<VecDeque<f64>>,
+    /// The cgroup dimension's answers over the same last few windows.
+    ///
+    /// Beside [`Self::cpu_history`] and for the same reason: the cgroup's
+    /// charge moves by a whole build's worth of page cache while the room the
+    /// box has does not, and a bound that follows it takes back the slot it
+    /// just handed out. See [`READING_HORIZON_WINDOWS`].
+    cgroup_memory_history: Mutex<VecDeque<f64>>,
     /// The dimension the ceiling came from.
     dimension: Mutex<&'static str>,
     /// The sample that derivation was made from, published beside it.
@@ -2327,6 +2381,7 @@ impl BuildGate {
             per_build_io: AtomicU64::new(0),
             occupancy_avg: AtomicU64::new(0),
             cpu_history: Mutex::new(VecDeque::new()),
+            cgroup_memory_history: Mutex::new(VecDeque::new()),
             dimension: Mutex::new(DIM_UNMEASURED),
             host: Mutex::new(None),
             measured_build_cost: Mutex::new(VecDeque::new()),
@@ -2589,7 +2644,7 @@ impl BuildGate {
     }
 
     /// Records this window's busy-core reading and answers the median of the
-    /// last [`CPU_READING_HORIZON_WINDOWS`] of them.
+    /// last [`READING_HORIZON_WINDOWS`] of them.
     ///
     /// Median rather than mean: the quantity wanted is "how busy this host is
     /// over a build", and one window in which something else saturated the
@@ -2600,7 +2655,27 @@ impl BuildGate {
     fn sustained_busy_cores(&self, measured: f64) -> f64 {
         let mut history = self.cpu_history.lock().unwrap_or_else(|e| e.into_inner());
         history.push_back(measured);
-        while history.len() > CPU_READING_HORIZON_WINDOWS {
+        while history.len() > READING_HORIZON_WINDOWS {
+            history.pop_front();
+        }
+        let mut sorted: Vec<f64> = history.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted[sorted.len() / 2]
+    }
+
+    /// Records this window's cgroup answer and answers the median of the last
+    /// [`READING_HORIZON_WINDOWS`] of them.
+    ///
+    /// The same shape as [`Self::sustained_busy_cores`] and for the same reason:
+    /// what is being estimated is how many builds the cgroup carries over a
+    /// build's life, not what one window's charge happened to be.
+    fn sustained_cgroup_memory(&self, measured: f64) -> f64 {
+        let mut history = self
+            .cgroup_memory_history
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        history.push_back(measured);
+        while history.len() > READING_HORIZON_WINDOWS {
             history.pop_front();
         }
         let mut sorted: Vec<f64> = history.iter().copied().collect();
@@ -2719,11 +2794,14 @@ impl BuildGate {
         // reading, taken before the dimension reads it.
         load.occupancy_avg60 = self.learn_occupancy(load.pressure.builds_in_flight, elapsed);
         load.per_build_io = self.learned_io_cost();
-        // The cpu dimension is the one sized from a history rather than from
-        // this window's instant; see `CPU_READING_HORIZON_WINDOWS`. Filled in
-        // before any ceiling is derived from the sample, so the reading
+        // The two dimensions read at an instant are sized from a history rather
+        // than from this window's sample; see `READING_HORIZON_WINDOWS`. Filled
+        // in before any ceiling is derived from the sample, so the reading
         // published beside the decision is the one the decision was made on.
         load.sustained_busy_cores = Some(self.sustained_busy_cores(load.busy_cores));
+        load.sustained_cgroup_memory = load
+            .cgroup_memory()
+            .map(|answer| self.sustained_cgroup_memory(answer));
         let previous = self.held_ceiling.load(Ordering::Relaxed) as usize;
         let (measured_ceiling, dimension) = load.ceiling();
         let (ceiling, _) = load.ceiling_held_since(previous);
@@ -4531,6 +4609,7 @@ mod tests {
             },
             busy_cores: 0.0,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: None,
             disk_free_bytes: None,
@@ -5375,6 +5454,7 @@ mod tests {
             },
             busy_cores: 0.0,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: None,
             disk_free_bytes: None,
@@ -5447,6 +5527,7 @@ mod tests {
             },
             busy_cores: 0.0,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -5507,6 +5588,7 @@ mod tests {
                 },
                 busy_cores: n as f64 * tuning.build_demand_cores,
                 sustained_busy_cores: None,
+                sustained_cgroup_memory: None,
                 cores: 24,
                 budget: None,
                 disk_free_bytes: Some(1 << 40),
@@ -5570,6 +5652,7 @@ mod tests {
                 },
                 busy_cores: n as f64 * tuning.build_demand_cores,
                 sustained_busy_cores: None,
+                sustained_cgroup_memory: None,
                 cores: 24,
                 budget: None,
                 disk_free_bytes: Some(1 << 40),
@@ -5662,6 +5745,7 @@ mod tests {
             },
             busy_cores: 0.0,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -5712,6 +5796,7 @@ mod tests {
             },
             busy_cores: 0.0,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -5766,6 +5851,7 @@ mod tests {
                 },
                 busy_cores: 0.0,
                 sustained_busy_cores: None,
+                sustained_cgroup_memory: None,
                 cores: 24,
                 budget: None,
                 disk_free_bytes: Some(1 << 40),
@@ -5808,6 +5894,7 @@ mod tests {
             },
             busy_cores: busy,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -5867,7 +5954,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gate = gate(dir.path(), 1, 1);
         let steady = 8.0;
-        for _ in 0..CPU_READING_HORIZON_WINDOWS {
+        for _ in 0..READING_HORIZON_WINDOWS {
             let sustained = gate.sustained_busy_cores(steady);
             assert_eq!(sustained, steady);
         }
@@ -5876,7 +5963,7 @@ mod tests {
             sustained, steady,
             "一个饱和窗口在 {} 个窗口的历史里不改变中位数；改了它就等于把界交给\n\
              这一瞬间的读数，而界管的是接下来几十分钟",
-            CPU_READING_HORIZON_WINDOWS
+            READING_HORIZON_WINDOWS
         );
     }
 
@@ -5897,6 +5984,7 @@ mod tests {
             },
             busy_cores: 24.0,
             sustained_busy_cores: sustained,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -5920,6 +6008,81 @@ mod tests {
             cpu(&load(Some(8.0))),
             (24.0 - 8.0) / shipped().build_demand_cores,
             "有历史时这一维按中位数出答案，与这一瞬间的 24 个忙核无关"
+        );
+    }
+
+    /// 2026-11-03 的第二现场：cpu 那一维压平之后，界仍在每小时动 19 次，动的全是
+    /// cgroup 那一维——按三十秒采样它在 3 与 4 之间以六分钟为周期摆，而同一台机器
+    /// 上另外三维答的是 4 及以上。抬动它的是这次构建刚填满的页缓存，不是箱子真的
+    /// 多了一个构建的位置。
+    ///
+    /// 判据与 cpu 那条一样落在「一个窗口不许把刚发出去的槽收回来」：历史里 30 个
+    /// 窗口都答 4，只夹一个答 3 的窗口，这一维必须仍答 4。
+    #[test]
+    fn one_charged_window_does_not_take_back_the_slot_it_just_handed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 1);
+        let steady = 4.0;
+        for _ in 0..READING_HORIZON_WINDOWS {
+            assert_eq!(gate.sustained_cgroup_memory(steady), steady);
+        }
+        assert_eq!(
+            gate.sustained_cgroup_memory(3.0),
+            steady,
+            "一个窗口的页缓存把整个构建的位置吃掉又还回来，不该动这一维；动了就是\n\
+             把界交给这次构建自己写下的缓存"
+        );
+    }
+
+    /// 同一个样本，两种取法：按瞬间取 cgroup 那一维答 2，按历史的取法答 3。界与
+    /// 已发布的那一维必须是后者。
+    #[test]
+    fn the_cgroup_dimension_is_sized_from_the_sustained_answer() {
+        let peak = shipped().build_peak_rss_bytes;
+        let mem_max = 16 * 1024 * 1024 * 1024u64;
+        let load = |sustained: Option<f64>| HostLoad {
+            pressure: Pressure {
+                cpu_avg10: 0.0,
+                cpu_avg60: 0.0,
+                io_avg10: 0.0,
+                io_avg60: 0.0,
+                mem_avg10: 0.0,
+                mem_avg60: 0.0,
+                mem_available_bytes: 64 * 1024 * 1024 * 1024,
+                builds_in_flight: 0,
+            },
+            busy_cores: 1.0,
+            sustained_busy_cores: Some(1.0),
+            sustained_cgroup_memory: sustained,
+            cores: 24,
+            // 两个构建的位置是空的：这一瞬间的答案是 2。
+            budget: Some(BuildBudget {
+                mem_max,
+                mem_current: mem_max - 2 * peak,
+                mem_reclaimable: 0,
+            }),
+            disk_free_bytes: Some(1 << 40),
+            tuning: shipped(),
+            per_build_io: None,
+            occupancy_avg60: 0.0,
+        };
+        let cgroup = |l: &HostLoad| {
+            l.dimensions()
+                .iter()
+                .find(|(name, _)| *name == DIM_CGROUP_MEMORY)
+                .expect("the cgroup dimension is published")
+                .1
+        };
+        assert_eq!(
+            load(None).cgroup_memory(),
+            Some(2.0),
+            "没有历史的样本只能读这一瞬间"
+        );
+        assert_eq!(cgroup(&load(None)), 2.0, "没有历史时这一维读这一瞬间");
+        assert_eq!(
+            cgroup(&load(Some(3.0))),
+            3.0,
+            "有历史时这一维按中位数出答案，与这一瞬间被缓存吃掉的那一份无关"
         );
     }
 
@@ -6044,6 +6207,7 @@ mod tests {
             },
             busy_cores: 0.0,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: Some(BuildBudget {
                 mem_max,
@@ -6323,6 +6487,7 @@ unevictable 28532736
             },
             busy_cores: 1.0,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: None,
             disk_free_bytes: None,
@@ -7744,6 +7909,7 @@ unevictable 28532736
             },
             busy_cores: 1.0,
             sustained_busy_cores: None,
+            sustained_cgroup_memory: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
