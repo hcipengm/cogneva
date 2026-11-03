@@ -726,9 +726,20 @@ impl TaskGraphObservable {
                     // 没人接」在这个面上逐字同形——2026-11-01 起一直亮的
                     // `unowned_task_untouched_past_pickup` 就是被 75 条这样的登记行点亮的。
                     //
+                    // 面节点是同一族里最容易被漏掉的一支：它不可执行，但它带着
+                    // `goal_id`——面节点是自己那个项目的根——所以只按「有没有目标」
+                    // 分不出来。它的寿命是无限的：面一直在那儿，没有任何东西会把它写回
+                    // 终态。2026-11-03 实测：最老的一条「没人接的活」是 10-24 建的
+                    // `写操作窗口`，两条工作区各一份（roster 里那份，加上发布到执行
+                    // 工作区、和它的职责行放在一起的那份），都已经站了十天。
+                    // 按类型认，不按工作区认：发布出去的那一份按设计躺在执行工作区里，
+                    // 它照样不是活。
+                    //
                     // 目标承载行留在这组里：它同样不可执行，但它会被收口任务写回终态，
                     // 所以「它一动不动」是真的异常，不是一条站着不动的声明。
-                    if !task.is_executable && task.goal_id.is_none() {
+                    let is_face_row = matches!(&task.task_type, cog_core::TaskType::Custom(kind)
+                            if kind == cog_core::FACE_TASK_TYPE);
+                    if !task.is_executable && (task.goal_id.is_none() || is_face_row) {
                         continue;
                     }
                     let agent = task.agent_id.clone().filter(|id| !id.is_empty());
@@ -1610,6 +1621,77 @@ mod tests {
             "欠着的活是两条：真的活与目标承载行；登记行不是活"
         );
         // 总数那一格仍然数整张图：登记行是图里的一行，只是不欠谁。
+        assert_eq!(
+            labeled(
+                &metrics,
+                TASKS_READINGS_METRIC,
+                crate::LABEL_READOUT,
+                TASKS_ROWS_READOUT
+            )
+            .value,
+            3.0
+        );
+    }
+
+    /// 面节点不是欠着的活，哪怕它带着 `goal_id`。
+    ///
+    /// 面节点是自己那个项目的根，所以「不可执行」这一条分不出它和一条真的目标
+    /// 承载行；而它没有终态——面一直在那儿，谁也不会把它写回完成。2026-11-03
+    /// 实测就是这么亮的：`unowned_task_untouched_past_pickup` 点名的最老一行是
+    /// 10-24 建的 `写操作窗口`，两份（roster 里的定义，以及发布到执行工作区、
+    /// 和它的职责行放在一起的那一份），站着不动是它们的常态。
+    ///
+    /// 这条测试同时钉住「按类型认」：发布出去的那一份住在执行工作区里，用工作区
+    /// 认面会漏掉它，读数就还是会被一条永远不会动的行点着。
+    #[tokio::test]
+    async fn a_face_node_is_not_owed_work_even_though_it_names_a_goal() {
+        let dag = Arc::new(crate::DagExecutor::new("ws-faces".into()));
+        let now = chrono::Utc::now();
+
+        // roster 里那份面节点。
+        let mut roster = task("写操作窗口", cog_core::TaskStatus::Pending);
+        roster.task_type = cog_core::TaskType::Custom(cog_core::FACE_TASK_TYPE.into());
+        roster.workspace_id = Some(cog_core::GOVERNANCE_WORKSPACE.to_string());
+        roster.goal_id = Some("写操作窗口".into());
+        roster.is_executable = false;
+        roster.updated_at = now - chrono::Duration::days(10);
+        // 发布到执行工作区的那一份：同一张面，住在职责行旁边。图里按 id 存，
+        // 所以这里换一个 id 让两份同时在一张图上——生产里它们分在两个工作区，
+        // 各自按 (工作区, id) 存。
+        let mut published = task("通信", cog_core::TaskStatus::Pending);
+        published.task_type = cog_core::TaskType::Custom(cog_core::FACE_TASK_TYPE.into());
+        published.workspace_id = Some("ws-faces".into());
+        published.goal_id = Some("通信".into());
+        published.is_executable = false;
+        published.updated_at = now - chrono::Duration::days(9);
+        // 真的活：可执行，没人领，等了两分钟。
+        let mut real = task("t-real-work", cog_core::TaskStatus::Pending);
+        real.updated_at = now - chrono::Duration::seconds(120);
+
+        for row in [roster, published, real] {
+            dag.add_task(row).await.unwrap();
+        }
+
+        let observable = TaskGraphObservable::new(dag);
+        let metrics = observable.collect_metrics("").await.unwrap();
+
+        let oldest = labeled(
+            &metrics,
+            TASK_OLDEST_UNTOUCHED_METRIC,
+            "agent",
+            UNASSIGNED_AGENT,
+        )
+        .value;
+        assert!(
+            (115.0..=125.0).contains(&oldest),
+            "最老的一条该是那条真的活（两分钟），不是站着不动的面节点（十天）：{oldest}"
+        );
+        assert_eq!(
+            labeled(&metrics, TASK_UNOWNED_ROWS_METRIC, "status", "pending").value,
+            1.0,
+            "欠着的活只有那一条真的活；两份面节点都不是活"
+        );
+        // 总数那一格仍然数整张图：面节点是图里的行，只是不欠谁。
         assert_eq!(
             labeled(
                 &metrics,
