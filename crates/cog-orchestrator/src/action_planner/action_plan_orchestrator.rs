@@ -758,7 +758,22 @@ impl ActionPlanOrchestrator {
         // integrations opt in with the `evolution_mode` input marker while
         // keeping their own task type. Decomposing one of those drops the
         // marker into children that never generate a change.
-        let all_self_evolution = !tasks.is_empty() && tasks.iter().all(|t| t.is_self_evolution());
+        //
+        // A row that is not work is not an intent either. Submitters group
+        // their intents under an anchor -- `signal_project_root` is one: a
+        // non-executable row that nothing runs and that carries no evolution
+        // marker -- and reading the anchor as an intent makes every such
+        // submission fail this test, so it goes to decomposition instead. That
+        // costs one LLM call per filing, and the price is invisible until the
+        // pool is down: from 2026-11-01 21:19 no `self-signal-alert-*` row was
+        // filed at all, while `CognevaAlertUnattended` was lit and the two
+        // readings should be evidence of each other. What the set has to
+        // satisfy is therefore "there is work here, and every row that is work
+        // is a self-evolution intent".
+        let all_self_evolution = tasks.iter().any(|t| t.is_executable)
+            && tasks
+                .iter()
+                .all(|t| !t.is_executable || t.is_self_evolution());
 
         if all_self_evolution {
             tracing::info!(
@@ -777,7 +792,11 @@ impl ActionPlanOrchestrator {
                 let mut batch = Vec::with_capacity(tasks.len());
                 for mut task in tasks {
                     task.goal_id = Some(goal_id.clone());
-                    task.is_executable = true;
+                    // The anchor stays an anchor. Turning it executable would
+                    // hand the scheduler a row whose only job is to be the
+                    // parent pointer its siblings hang from, and nothing about
+                    // the branch's own work makes that row runnable.
+                    task.is_executable = task.is_executable || task.is_self_evolution();
                     task.timeout_seconds = self.self_evolution_timeout_secs;
                     task.action_planner_meta = Some(cog_core::ActionPlannerMeta {
                         verified: true,
@@ -3776,6 +3795,79 @@ mod tests {
         assert!(stored.is_executable);
         assert_eq!(stored.timeout_seconds, 3600);
         assert_eq!(dag.get_all_tasks().await.len(), 1);
+    }
+
+    /// A filing that brings its own anchor is still a filing.
+    ///
+    /// The signal watcher submits every intent as two rows: a non-executable
+    /// project anchor and the self-evolution leaf that hangs under it. The
+    /// anchor carries no evolution marker because it is not an intent — it is
+    /// the parent pointer — so a test that asks "is every row an intent"
+    /// answers no, and the submission is decomposed instead. Decomposition is
+    /// an LLM call, which means filing an alert costs one, which means no
+    /// alert is filed while the pool is down. That is not a hypothesis: from
+    /// 2026-11-01 21:19 the graph took no `self-signal-alert-*` row at all
+    /// while the pool was unavailable and `CognevaAlertUnattended` was lit, so
+    /// "the machine attends the alerts" and "nothing attends the alerts" were
+    /// the same reading for two days.
+    ///
+    /// The recording executor makes the branch visible: a decomposition would
+    /// put `child-from-decomposition` into the graph, and this test says the
+    /// graph holds the two submitted rows and nothing else.
+    #[tokio::test]
+    async fn a_submission_carrying_its_anchor_is_not_decomposed() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-anchor-with-leaf".to_string()));
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![vec![atomic_task("child-from-decomposition")]]),
+            }))
+            .with_dag_executor(dag.clone());
+        let registry = SkillRegistry::new();
+
+        let mut anchor = Task::new(
+            "signal-project-root:alert/r",
+            TaskType::Custom("signal_project".into()),
+            serde_json::json!({"goal": "signals filed under signal:alert/r", "task_kind": "signal_project"}),
+        );
+        anchor.goal_id = Some("signal:alert/r".to_string());
+        anchor.is_executable = false;
+        let leaf = Task::new(
+            "self-signal-alert-abc",
+            TaskType::Custom("self_signal".into()),
+            serde_json::json!({
+                "goal": "fix the firing alert",
+                "task_kind": "self_signal",
+                "evolution_mode": "generate_change",
+            }),
+        );
+
+        let ids = planner
+            .process_goal_impl("fix the firing alert", vec![anchor, leaf], &registry)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ids,
+            vec![
+                "signal-project-root:alert/r".to_string(),
+                "self-signal-alert-abc".to_string()
+            ],
+            "both submitted rows reach the graph, and in the order they were given"
+        );
+        assert!(
+            dag.get_task("child-from-decomposition").await.is_none(),
+            "nothing was decomposed: the executor would have put its reply into the graph"
+        );
+        let stored_anchor = dag.get_task("signal-project-root:alert/r").await.unwrap();
+        assert!(
+            !stored_anchor.is_executable,
+            "the anchor is where work hangs, not work: the scheduler must not be handed it"
+        );
+        let stored_leaf = dag.get_task("self-signal-alert-abc").await.unwrap();
+        assert!(stored_leaf.is_executable);
+        assert_eq!(stored_leaf.timeout_seconds, 3600);
+        assert_eq!(stored_leaf.goal_id.as_deref(), Some("signal:alert/r"));
     }
 
     #[tokio::test]
