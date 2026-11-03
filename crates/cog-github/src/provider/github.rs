@@ -526,15 +526,18 @@ impl CodePlatformProvider for GitHubProvider {
             .await
             .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
 
-        Ok(runs
-            .items
-            .into_iter()
-            .find(|r| r.name == workflow)
-            .map(|r| CiRunSummary {
-                run_id: r.id.into_inner(),
-                head_sha: r.head_sha,
-                conclusion: r.conclusion.unwrap_or_default(),
-            }))
+        Ok(newest_finished_run(
+            runs.items.into_iter().map(|r| {
+                let conclusion = r.conclusion;
+                let summary = CiRunSummary {
+                    run_id: r.id.into_inner(),
+                    head_sha: r.head_sha,
+                    conclusion: conclusion.clone().unwrap_or_default(),
+                };
+                (r.name, conclusion, summary)
+            }),
+            workflow,
+        ))
     }
 
     async fn ci_verdict_for_sha(&self, sha: &str) -> Result<Option<bool>> {
@@ -705,6 +708,24 @@ fn run_holding_the_failure(runs: &[CiRunSummary], sha: &str) -> Option<u64> {
         .map(|r| r.run_id)
 }
 
+/// The newest run of `workflow` that has *finished*, out of a newest-first page.
+///
+/// A run still in flight has no conclusion and cannot say whether the workflow
+/// now passes; only a finished one can. Position is not a substitute: every
+/// push starts the workflow, so the newest entry is usually still going, and a
+/// reader that took it would report "no verdict" exactly while fixes are
+/// landing and the branch is being built hardest — which is when the caller
+/// asks whether an old failure has been left behind. Runs of other workflows
+/// share the same page, so they are passed through and skipped by name.
+fn newest_finished_run(
+    runs: impl IntoIterator<Item = (String, Option<String>, CiRunSummary)>,
+    workflow: &str,
+) -> Option<CiRunSummary> {
+    runs.into_iter()
+        .find(|(name, conclusion, _)| name == workflow && conclusion.is_some())
+        .map(|(_, _, summary)| summary)
+}
+
 /// Whether one line of a job log is the step saying what failed.
 ///
 /// Deliberately not `##[error]` alone. The runner ends every failed job with
@@ -866,6 +887,57 @@ mod tests {
     fn no_run_for_the_commit_offers_no_log() {
         let runs = [run_summary(1, "other", "failure")];
         assert_eq!(run_holding_the_failure(&runs, "abc"), None);
+    }
+
+    fn page_entry(
+        name: &str,
+        conclusion: Option<&str>,
+        run_id: u64,
+    ) -> (String, Option<String>, CiRunSummary) {
+        (
+            name.to_string(),
+            conclusion.map(str::to_string),
+            run_summary(run_id, "sha", conclusion.unwrap_or("")),
+        )
+    }
+
+    /// A push starts the workflow again, so the newest entry is usually one that
+    /// has not finished. Reading it as "the workflow's latest state" answers
+    /// nothing exactly while the branch is being built, and the caller asking
+    /// whether an old failure is gone would be told "no verdict" instead of the
+    /// last thing the workflow actually said.
+    #[test]
+    fn a_run_still_going_is_not_the_newest_verdict_of_its_workflow() {
+        let page = [
+            page_entry("CI", None, 30),
+            page_entry("CI", Some("success"), 20),
+            page_entry("CI", Some("failure"), 10),
+        ];
+        assert_eq!(newest_finished_run(page, "CI").map(|r| r.run_id), Some(20));
+    }
+
+    /// Every push starts each workflow at once, so other workflows' runs sit
+    /// between this one's. The first finished run of the page is not the answer
+    /// unless it also names the workflow that failed.
+    #[test]
+    fn another_workflows_finished_run_is_not_this_workflows_verdict() {
+        let page = [
+            page_entry("pages build and deployment", Some("success"), 40),
+            page_entry("CI", Some("failure"), 39),
+        ];
+        assert_eq!(newest_finished_run(page, "CI").map(|r| r.run_id), Some(39));
+    }
+
+    /// Nothing of this workflow has finished (only in flight, or only other
+    /// workflows): the answer is "unknown", so the row it was asked about stays
+    /// open rather than being closed on a verdict that was never given.
+    #[test]
+    fn a_workflow_with_no_finished_run_has_no_verdict() {
+        let page = [
+            page_entry("CI", None, 30),
+            page_entry("pages build and deployment", Some("success"), 29),
+        ];
+        assert!(newest_finished_run(page, "CI").is_none());
     }
 
     #[test]

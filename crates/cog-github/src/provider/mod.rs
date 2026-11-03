@@ -173,13 +173,19 @@ pub trait CodePlatformProvider: Send + Sync {
         Ok(None)
     }
 
-    /// The newest run of one named workflow on a branch.
+    /// The newest *finished* run of one named workflow on a branch.
     ///
     /// [`Self::latest_branch_ci_run`] answers "has the branch moved on", which
     /// is the question when deciding whether to *file* a fix and the wrong one
     /// when deciding whether to *close* it: a green run of some other workflow
     /// says nothing about the one that failed, so settling on that reading
     /// would cancel a real compile failure on the strength of a docs build.
+    ///
+    /// Finished, not merely newest: a run still in flight carries no verdict,
+    /// and since every push starts the workflow again, the newest entry is the
+    /// one still going whenever the branch is being built. A caller that read
+    /// position as state would be told "no verdict" for as long as fixes keep
+    /// landing — which is exactly when it asks.
     ///
     /// Default: unsupported — providers return `None`, and a caller that asked
     /// to settle a row leaves it open.
