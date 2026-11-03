@@ -339,6 +339,17 @@ jobs:
         run: cargo test -p cog-storage --test principle_refusal_shapes -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # Which principle governs a path is a question only the store can answer:
+      # the answer is a row whose `where_red` names the path, so it is the
+      # match the predicate evaluates and the order the rows come back in --
+      # both decided on the server, and the order is what makes two rounds of
+      # the same task see one arrangement rather than two. A database-free
+      # double would restate the caller's own assumption about both.
+      - name: Live-DB principle gating paths
+        if: ${{ !cancelled() }}
+        run: cargo test -p cog-storage --test principle_gating_paths -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The sample-log sweep is expressed almost entirely as one DELETE, so its
       # correctness cannot be checked without a server; the DB-free tests beside
       # it only cover the sweep period. Leaving these out of the gate is how a
