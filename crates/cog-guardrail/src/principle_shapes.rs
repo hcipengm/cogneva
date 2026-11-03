@@ -245,8 +245,28 @@ pub fn principle_of(shape: &str) -> Option<&'static str> {
 /// that cannot fire rather than as a match, since blocking on a broken regex
 /// would refuse every call.
 pub fn first_match(text: &str) -> Option<&'static str> {
-    if deferral_match(text) {
-        return Some("DEFERRAL_SHAPES");
+    first_span(text).map(|(shape, _)| shape)
+}
+
+/// The first shape `text` matches, together with the text it matched.
+///
+/// The same reader as [`first_match`], by construction rather than by agreement:
+/// the name is taken from this function, so a refusal and the evidence recorded
+/// beside it cannot name different shapes. The matched run is the gate's own
+/// words -- the phrase the host hook would have refused -- which is what makes a
+/// refusal row replayable long after the call that produced it is gone.
+///
+/// It is the text the gate *judged*, which for every shape but the AI trailer is
+/// the text with quoted interiors removed. A replay has to read it the same way:
+/// `git commit -m ''` is what a bare-commit refusal carries when the message it
+/// pasted was quoted, and searching the refusal's span in the original call
+/// would miss a row that is telling the truth.
+///
+/// A circled numeral is its own span: the shape is the character, not the
+/// sentence around it.
+pub fn first_span(text: &str) -> Option<(&'static str, String)> {
+    if let Some(span) = deferral_span(text) {
+        return Some(("DEFERRAL_SHAPES", span));
     }
     let named = strip_named_spans(text);
     for (name, pattern) in ALL_SHAPES {
@@ -260,14 +280,14 @@ pub fn first_match(text: &str) -> Option<&'static str> {
         } else {
             named.as_str()
         };
-        if matches(pattern, subject) {
-            return Some(name);
+        if let Some(found) = compile(pattern).ok().and_then(|re| re.find(subject)) {
+            return Some((name, found.as_str().to_string()));
         }
     }
     // Circled numerals are judged on the original text: the owner forbade the
     // character outright, quoting included.
-    if text.chars().any(|c| CIRCLED_CHARS.contains(&c)) {
-        return Some("CIRCLED_CHARS");
+    if let Some(c) = text.chars().find(|c| CIRCLED_CHARS.contains(c)) {
+        return Some(("CIRCLED_CHARS", c.to_string()));
     }
     None
 }
@@ -282,9 +302,27 @@ pub fn first_match(text: &str) -> Option<&'static str> {
 /// line-at-a-time reading is also what keeps `等` on one line from being joined
 /// to `你` on the next.
 fn deferral_match(text: &str) -> bool {
-    strip_named_spans(text)
-        .lines()
-        .any(|line| !deferral_exempt(line) && DEFERRAL_SHAPES.iter().any(|p| matches(p, line)))
+    deferral_span(text).is_some()
+}
+
+/// The first deferral phrase on a line the exemptions do not clear.
+///
+/// The companion to [`deferral_match`] rather than a second reader: the bool is
+/// this function's `is_some`, so a line the host would let through can never
+/// produce the evidence for a refusal it does not make.
+fn deferral_span(text: &str) -> Option<String> {
+    let stripped = strip_named_spans(text);
+    for line in stripped.lines() {
+        if deferral_exempt(line) {
+            continue;
+        }
+        for pattern in DEFERRAL_SHAPES {
+            if let Some(found) = compile(pattern).ok().and_then(|re| re.find(line)) {
+                return Some(found.as_str().to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The two shapes the host judges on a finished turn: a decision handed to a
@@ -432,7 +470,145 @@ fn collect_strings(value: &serde_json::Value, out: &mut Vec<String>) {
 /// are not applied to prose, which would refuse a reply that merely names a
 /// file. Incoming messages are not judged: the host does not judge them either,
 /// and a message quoting a rule to have it fixed must reach the reader.
-pub struct PrincipleShapeGuard;
+pub struct PrincipleShapeGuard {
+    /// Where a refusal goes, resolved on first refusal rather than at
+    /// construction: the ledger is published by another plugin and this guard
+    /// is built into the composite during this one's `init`, so a read there
+    /// would be a read whose timing decides whether the account ever hears
+    /// about a refusal.
+    ledger: Option<cog_core::LateService<dyn cog_core::PrincipleLedgerStore>>,
+    /// Set once, at the first refusal the handle could not answer. A guard built
+    /// with no handle at all says nothing: that is a caller which never asked to
+    /// record. A guard built with one that resolved to nothing is a deployment
+    /// whose account is missing, and it says so exactly once.
+    unrecorded: std::sync::Once,
+}
+
+impl PrincipleShapeGuard {
+    /// A guard that refuses without recording. Kept for the callers that hold
+    /// no account -- an embedded run, a test -- rather than as a default that
+    /// quietly applies to a deployment.
+    pub fn new() -> Self {
+        Self {
+            ledger: None,
+            unrecorded: std::sync::Once::new(),
+        }
+    }
+
+    /// A guard that records every refusal it makes against `ledger`.
+    pub fn reporting_to(ledger: cog_core::LateService<dyn cog_core::PrincipleLedgerStore>) -> Self {
+        Self {
+            ledger: Some(ledger),
+            unrecorded: std::sync::Once::new(),
+        }
+    }
+
+    /// Report one refusal, without letting the report change the verdict.
+    ///
+    /// The refusal has already been decided by the time this runs: a ledger
+    /// that is absent, slow or failing must not turn a blocked call into a
+    /// permitted one. So every failure here is a log line, and the block that
+    /// the caller returns is the same one it would have returned anyway. What
+    /// the log is for: "the gate refused nothing" and "the gate refused and the
+    /// account never heard" are identical in every count the ledger serves.
+    async fn report(&self, shape: &str, span: &str) {
+        let Some(handle) = self.ledger.as_ref() else {
+            return;
+        };
+        let Some(store) = handle.get() else {
+            self.unrecorded.call_once(|| {
+                tracing::warn!(
+                    "the shape gate made a refusal and no principle ledger was published, so \
+                     this refusal and every one after it go uncounted; the call was refused \
+                     all the same"
+                );
+            });
+            return;
+        };
+        record_refusal(store.as_ref(), shape, span).await;
+    }
+}
+
+impl Default for PrincipleShapeGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Write one refusal, and say whether it landed.
+///
+/// The bool is what a caller can act on; nothing here can. A write that fails is
+/// logged with the row's own slug and rule so the loss is at least attributable,
+/// and the refusal stands either way -- a store outage turning a blocked call
+/// into a permitted one is the one outcome the gate may not have.
+async fn record_refusal<S: RefusalLedger + ?Sized>(sink: &S, shape: &str, span: &str) -> bool {
+    let event = refusal_for(shape, span);
+    match sink.report_refusals(std::slice::from_ref(&event)).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::warn!(
+                slug = %event.slug,
+                rule = %event.criterion,
+                "a principle-shaped refusal was made and could not be recorded; the call was \
+                 refused, but the account will not count it: {e}"
+            );
+            false
+        }
+    }
+}
+
+/// The one row a refusal reports, built from what the gate saw.
+///
+/// A free function rather than a method so the shape of the row can be read and
+/// tested without a ledger: the slug is the principle the shape table attributes
+/// the shape to, the criterion is the shape's own name, and the span is the
+/// matched text. A shape the table attributes to no principle is filed under the
+/// shape itself rather than dropped -- an unattributed refusal is still a refusal
+/// somebody should be able to count.
+pub fn refusal_for(shape: &str, span: &str) -> cog_core::PrincipleRefusal {
+    cog_core::PrincipleRefusal {
+        slug: principle_of(shape).unwrap_or(shape).to_string(),
+        refused_at: chrono::Utc::now(),
+        source: REFUSAL_SOURCE.to_string(),
+        count: 1,
+        criterion: shape.to_string(),
+        span: span.to_string(),
+    }
+}
+
+/// What a runtime refusal is attributed to.
+///
+/// The guard judges a call and a reply, and neither carries the task it belongs
+/// to, so the row says "the runtime" and stops there. A source that guessed at a
+/// task id would be worse than one that admits it does not know: the count is
+/// still attributable to the gate that made it.
+pub const REFUSAL_SOURCE: &str = "runtime";
+
+/// The half of the ledger a refusal needs.
+///
+/// Narrower than [`cog_core::PrincipleLedgerStore`] on purpose: a guard that
+/// refuses has evidence for exactly one row, and a port that also carried the
+/// reads would make every test of the refusal path stand up a whole account.
+/// The blanket impl is what keeps the production wiring honest -- anything that
+/// is a ledger is a sink, so a deployment cannot end up with a guard that writes
+/// to a second, private path.
+#[async_trait::async_trait]
+pub trait RefusalLedger: Send + Sync {
+    async fn report_refusals(
+        &self,
+        events: &[cog_core::PrincipleRefusal],
+    ) -> cog_core::SFResult<usize>;
+}
+
+#[async_trait::async_trait]
+impl<T: cog_core::PrincipleLedgerStore + ?Sized> RefusalLedger for T {
+    async fn report_refusals(
+        &self,
+        events: &[cog_core::PrincipleRefusal],
+    ) -> cog_core::SFResult<usize> {
+        cog_core::PrincipleLedgerStore::report_refusals(self, events).await
+    }
+}
 
 #[async_trait::async_trait]
 impl cog_core::Guardrail for PrincipleShapeGuard {
@@ -451,29 +627,40 @@ impl cog_core::Guardrail for PrincipleShapeGuard {
     /// or a path, so those shapes have nothing to read there.
     async fn check_output(&self, response: &str) -> cog_core::GuardResult {
         match sentence_form_match(response) {
-            Some(shape) => cog_core::GuardResult::Block {
-                reason: match principle_of(shape) {
-                    Some(slug) => format!("回复里带着形状表禁止的一项（{shape}，原则 {slug}）"),
-                    None => format!("回复里带着形状表禁止的一项（{shape}）"),
-                },
-                rule: format!("principle_shapes:{shape}"),
-            },
+            Some(shape) => {
+                let span = first_span(response)
+                    .map(|(_, span)| span)
+                    .unwrap_or_else(|| shape.to_string());
+                self.report(shape, &span).await;
+                cog_core::GuardResult::Block {
+                    reason: match principle_of(shape) {
+                        Some(slug) => format!("回复里带着形状表禁止的一项（{shape}，原则 {slug}）"),
+                        None => format!("回复里带着形状表禁止的一项（{shape}）"),
+                    },
+                    rule: format!("principle_shapes:{shape}"),
+                }
+            }
             None => cog_core::GuardResult::Pass,
         }
     }
 
     async fn check_tool_call(&self, tool: &cog_core::ToolCall) -> cog_core::GuardResult {
-        match subjects(tool)
-            .iter()
-            .find_map(|subject| first_match(subject))
-        {
-            Some(shape) => cog_core::GuardResult::Block {
-                reason: match principle_of(shape) {
-                    Some(slug) => format!("工具调用带着形状表禁止的一项（{shape}，原则 {slug}）"),
-                    None => format!("工具调用带着形状表禁止的一项（{shape}）"),
-                },
-                rule: format!("principle_shapes:{shape}"),
-            },
+        let matched = subjects(tool)
+            .into_iter()
+            .find_map(|subject| first_span(&subject));
+        match matched {
+            Some((shape, span)) => {
+                self.report(shape, &span).await;
+                cog_core::GuardResult::Block {
+                    reason: match principle_of(shape) {
+                        Some(slug) => {
+                            format!("工具调用带着形状表禁止的一项（{shape}，原则 {slug}）")
+                        }
+                        None => format!("工具调用带着形状表禁止的一项（{shape}）"),
+                    },
+                    rule: format!("principle_shapes:{shape}"),
+                }
+            }
             None => cog_core::GuardResult::Pass,
         }
     }
@@ -847,7 +1034,7 @@ mod tests {
     async fn the_guard_refuses_by_shape_and_names_it() {
         use cog_core::Guardrail;
 
-        let guard = PrincipleShapeGuard;
+        let guard = PrincipleShapeGuard::new();
         let blocked = cog_core::ToolCall {
             id: "1".into(),
             name: "bash".into(),
@@ -894,7 +1081,7 @@ mod tests {
     #[tokio::test]
     async fn the_guard_judges_a_finished_reply_by_the_turns_own_shapes() {
         use cog_core::Guardrail;
-        let guard = PrincipleShapeGuard;
+        let guard = PrincipleShapeGuard::new();
 
         for (reply, rule) in [
             ("归属主定。", "principle_shapes:DEFERRAL_SHAPES"),
@@ -936,7 +1123,7 @@ mod tests {
     #[tokio::test]
     async fn every_shape_fires_on_the_call_it_was_written_for() {
         use cog_core::Guardrail;
-        let guard = PrincipleShapeGuard;
+        let guard = PrincipleShapeGuard::new();
         let call = |name: &str, arguments: serde_json::Value| cog_core::ToolCall {
             id: "x".into(),
             name: name.into(),
@@ -1040,5 +1227,124 @@ mod tests {
                 cog_core::GuardResult::Pass
             );
         }
+    }
+
+    /// The span a refusal carries is text the gate actually matched, and the
+    /// shape it is filed under is the one the verdict names.
+    ///
+    /// Both halves matter for the same reason: a row whose span is not in the
+    /// refused text cannot be replayed, and a row filed under a shape the
+    /// verdict does not name sends its reader to fix the wrong rule. A
+    /// synthesised span -- the shape's name printed where the phrase belongs --
+    /// would satisfy neither while looking like evidence.
+    #[test]
+    fn a_refusal_span_is_text_the_gate_matched() {
+        for text in [
+            "等你确认之后再改",
+            "git commit -m 'x'",
+            "Co-Authored-By: Claude <noreply@anthropic.com>",
+            "one is ① and two is ②",
+        ] {
+            let (shape, span) =
+                first_span(text).unwrap_or_else(|| panic!("{text:?} carries a shape"));
+            assert_eq!(
+                first_match(text),
+                Some(shape),
+                "{text:?}: 判词与证据指的不是同一个形状"
+            );
+            assert!(
+                text.contains(&span) || strip_named_spans(text).contains(&span),
+                "{text:?}: 记录下来的证据 {span:?} 既不在原文里，也不在门真正读的那一版里，\
+                 这一行没法回放"
+            );
+            assert!(!span.is_empty(), "{text:?}: 空的证据不是证据");
+        }
+    }
+
+    /// A refusal is filed under the principle the shape table attributes the
+    /// shape to, not under the shape's own name.
+    ///
+    /// The ledger is read by principle: a row filed as `DEFERRAL_SHAPES` would
+    /// sit beside the slugs and never be counted against the rule it broke,
+    /// which is the whole reason the table carries both columns.
+    #[test]
+    fn a_refusal_names_the_principle_that_owns_the_shape() {
+        let event = refusal_for("NARROW_ADD_RE", "git add -A");
+        assert_eq!(
+            principle_of("NARROW_ADD_RE"),
+            Some(event.slug.as_str()),
+            "拒绝记在了形状名下，而不是它属于的那条原则下"
+        );
+        assert_eq!(event.criterion, "NARROW_ADD_RE");
+        assert_eq!(event.span, "git add -A");
+        assert_eq!(event.count, 1);
+        assert_eq!(event.source, REFUSAL_SOURCE);
+    }
+
+    /// A shape the table attributes to no principle is still recorded, under the
+    /// shape itself.
+    ///
+    /// Dropping it would be the same silence as never writing the row: the gate
+    /// refused, and the account would show nothing. The slug column then holds
+    /// something that is not a slug, which is what tells the reader this row's
+    /// rule has no owner yet.
+    #[test]
+    fn an_unattributed_shape_is_recorded_rather_than_dropped() {
+        let event = refusal_for("SOME_SHAPE_WITH_NO_RULE", "the phrase");
+        assert_eq!(event.slug, "SOME_SHAPE_WITH_NO_RULE");
+        assert_eq!(event.criterion, "SOME_SHAPE_WITH_NO_RULE");
+    }
+
+    use std::sync::Mutex;
+
+    struct RecordingLedger {
+        written: Mutex<Vec<cog_core::PrincipleRefusal>>,
+        refusal: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl RefusalLedger for RecordingLedger {
+        async fn report_refusals(
+            &self,
+            events: &[cog_core::PrincipleRefusal],
+        ) -> cog_core::SFResult<usize> {
+            if let Some(reason) = &self.refusal {
+                return Err(cog_core::SFError::Database(reason.clone()));
+            }
+            self.written.lock().unwrap().extend(events.iter().cloned());
+            Ok(events.len())
+        }
+    }
+
+    fn recording() -> RecordingLedger {
+        RecordingLedger {
+            written: Mutex::new(Vec::new()),
+            refusal: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_that_is_written_reaches_the_ledger_with_its_evidence() {
+        let ledger = recording();
+        assert!(record_refusal(&ledger, "CIRCLED_CHARS", "①").await);
+        let written = ledger.written.lock().unwrap().clone();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].criterion, "CIRCLED_CHARS");
+        assert_eq!(written[0].span, "①");
+    }
+
+    /// A ledger that refuses the write is a lost count, not a permitted call.
+    ///
+    /// `record_refusal` is the whole of what a failing store can reach: the
+    /// verdict is returned by the caller after this returns, so the only thing
+    /// this can do is say the row did not land.
+    #[tokio::test]
+    async fn a_write_that_fails_does_not_turn_into_a_pass() {
+        let ledger = RecordingLedger {
+            written: Mutex::new(Vec::new()),
+            refusal: Some("ledger is gone".into()),
+        };
+        assert!(!record_refusal(&ledger, "CIRCLED_CHARS", "①").await);
+        assert!(ledger.written.lock().unwrap().is_empty());
     }
 }

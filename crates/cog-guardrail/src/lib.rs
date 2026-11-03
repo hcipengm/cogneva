@@ -157,12 +157,39 @@ impl Guardrail for CompositeGuardrail {
 /// 子护栏清单——抄一遍的下场是有一天主应用多了一层、这一份没跟上，而两个调用点都
 /// 在报「护栏已就绪」，看起来完全一样。
 pub fn build_default_guardrail(audit: Arc<dyn GuardAuditRecorder>) -> Arc<dyn Guardrail> {
+    compose(audit, principle_shapes::PrincipleShapeGuard::new())
+}
+
+/// The same set, with the shape gate writing every refusal into `ledger`.
+///
+/// A second entry point rather than a parameter on the first: a caller that
+/// holds an account and one that does not are different deployments, and an
+/// argument every caller had to pass `None` to would make "the run that records
+/// nothing" the shape of an ordinary call.
+pub fn build_default_guardrail_reporting_to(
+    audit: Arc<dyn GuardAuditRecorder>,
+    ledger: cog_core::LateService<dyn cog_core::PrincipleLedgerStore>,
+) -> Arc<dyn Guardrail> {
+    compose(
+        audit,
+        principle_shapes::PrincipleShapeGuard::reporting_to(ledger),
+    )
+}
+
+/// The one list. Both entry points differ in the shape gate they take and in
+/// nothing else, so the gate is the parameter rather than the list being written
+/// twice -- the drift this file warns about is a second copy, whichever of the
+/// two ends up stale.
+fn compose(
+    audit: Arc<dyn GuardAuditRecorder>,
+    shape_guard: principle_shapes::PrincipleShapeGuard,
+) -> Arc<dyn Guardrail> {
     let mut composite = CompositeGuardrail::new(audit);
     composite.add_guard(Box::new(PromptGuard::new(PromptGuardConfig::default())));
     composite.add_guard(Box::new(ContentFilter::new(ContentFilterConfig::default())));
     composite.add_guard(Box::new(PiiDetector::new(PiiDetectorConfig::default())));
     composite.add_guard(Box::new(ToolGuard::new(ToolGuardConfig::default())));
-    composite.add_guard(Box::new(principle_shapes::PrincipleShapeGuard));
+    composite.add_guard(Box::new(shape_guard));
     Arc::new(composite)
 }
 
@@ -447,5 +474,139 @@ mod tests {
             }
             other => panic!("a blocked pattern must be blocked, got {other:?}"),
         }
+    }
+
+    /// Everything the ledger port needs, and nothing it does not: the reads
+    /// panic, so a guard that went looking for one is caught rather than served
+    /// an empty answer that reads like a clean account.
+    #[derive(Default)]
+    struct RefusalRecorder {
+        written: std::sync::Mutex<Vec<cog_core::PrincipleRefusal>>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::PrincipleLedgerStore for RefusalRecorder {
+        async fn record_readings(
+            &self,
+            _: &[cog_core::PrincipleReading],
+        ) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn declare(&self, _: &[cog_core::PrincipleReading]) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn fold_declarations(&self, _: usize) -> cog_core::SFResult<cog_core::PrincipleFold> {
+            unimplemented!()
+        }
+        async fn pending_declarations(&self) -> cog_core::SFResult<u64> {
+            unimplemented!()
+        }
+        async fn apply_principle_measurement(
+            &self,
+            _: &cog_core::PrincipleMeasurement,
+        ) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn record_human_only(&self, _: &str, _: Option<&str>) -> cog_core::SFResult<()> {
+            unimplemented!()
+        }
+        async fn unsettled_judgement(
+            &self,
+            _: usize,
+        ) -> cog_core::SFResult<Vec<cog_core::PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn outstanding(&self, _: usize) -> cog_core::SFResult<Vec<cog_core::PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn reopen_platform_gate_drift(
+            &self,
+            _: &std::collections::HashMap<String, String>,
+        ) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn refused(&self, _: usize) -> cog_core::SFResult<Vec<cog_core::PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn get(&self, _: &str) -> cog_core::SFResult<Option<cog_core::PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn gating_paths(
+            &self,
+            _: &[String],
+            _: usize,
+        ) -> cog_core::SFResult<Vec<cog_core::PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {
+            unimplemented!()
+        }
+        async fn census(&self) -> cog_core::SFResult<cog_core::PrincipleCensus> {
+            unimplemented!()
+        }
+        async fn check_kind_census(
+            &self,
+        ) -> cog_core::SFResult<cog_core::PrincipleCheckKindCensus> {
+            unimplemented!()
+        }
+        async fn report_refusals(
+            &self,
+            events: &[cog_core::PrincipleRefusal],
+        ) -> cog_core::SFResult<usize> {
+            self.written.lock().unwrap().extend(events.iter().cloned());
+            Ok(events.len())
+        }
+        async fn fold_refusals(&self, _: usize) -> cog_core::SFResult<usize> {
+            unimplemented!()
+        }
+        async fn pending_refusals(&self) -> cog_core::SFResult<u64> {
+            unimplemented!()
+        }
+    }
+
+    /// A refusal the composite makes is the row the account gets.
+    ///
+    /// This is the whole chain the runtime gate is: a caller asks the guardrail
+    /// it was published, the guardrail refuses, and the ledger the guardrail was
+    /// built with has the refusal. Every link held before this test existed only
+    /// by construction -- the shape table matched, the host refused, and the
+    /// count of what the project's rules actually stopped was zero.
+    #[tokio::test]
+    async fn a_refusal_through_the_published_guardrail_reaches_the_ledger() {
+        let ctx = cog_core::PluginContext::new(cog_core::Config::default());
+        let mut plugin = plugin::GuardrailPlugin::new();
+        cog_core::SystemPlugin::init(&mut plugin, &ctx)
+            .await
+            .expect("the guardrail plugin initialises");
+
+        // 账是后发布的：真实启动里插件按层并行 init，护栏必然先于账就绪。
+        // 这一句排在 init 之后，就是要证明「建时没有账」不会变成「之后也不记」。
+        let ledger = Arc::new(RefusalRecorder::default());
+        ctx.publish_service::<dyn cog_core::PrincipleLedgerStore>(ledger.clone());
+
+        let guardrail = ctx
+            .consume_service::<dyn Guardrail>()
+            .expect("the plugin published its guardrail");
+        let verdict = guardrail
+            .check_tool_call(&ToolCall {
+                id: "call-1".into(),
+                name: "Bash".into(),
+                arguments: serde_json::json!({"command": "git add -A"}),
+            })
+            .await;
+        assert!(
+            matches!(verdict, GuardResult::Block { .. }),
+            "形状表认得的调用没有被拦：{verdict:?}"
+        );
+
+        let written = ledger.written.lock().unwrap().clone();
+        assert_eq!(
+            written.len(),
+            1,
+            "这一笔被拦下了，账里却没有对应的拒绝：拦了不记与没拦在账面上同形"
+        );
+        assert_eq!(written[0].criterion, "NARROW_ADD_RE");
+        assert!(!written[0].slug.is_empty());
+        assert!(!written[0].span.is_empty());
     }
 }

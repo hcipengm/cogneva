@@ -39,9 +39,13 @@ impl cog_core::SystemPlugin for GuardrailPlugin {
                 std::sync::Arc::new(crate::InMemoryAuditRecorder::new())
             };
 
+        // 原则账在建时不一定已经发布（插件按层并行 init），所以这里只拿一个
+        // 句柄：第一次拒绝时再去取，那时所有 init 都已结束。
+        let ledger = cog_core::LateService::<dyn cog_core::PrincipleLedgerStore>::new(ctx.clone());
+
         // 组装在 `build_default_guardrail` 里，这样「和主应用同一套护栏」不是一份
         // 需要各自维护的清单，而是一次调用。
-        let guardrail = crate::build_default_guardrail(audit);
+        let guardrail = crate::build_default_guardrail_reporting_to(audit, ledger);
         info!("Guardrail initialized (Prompt + Content + PII + Tool + PrincipleShapes)");
 
         ctx.publish_service(guardrail);
