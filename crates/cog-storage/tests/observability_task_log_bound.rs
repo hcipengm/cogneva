@@ -95,18 +95,22 @@ async fn a_task_keeps_only_its_newest_lines_and_a_second_task_keeps_its_own() {
         "a task holds its bound, not one under it and not one over"
     );
 
-    let newest = gateway
+    let kept_lines = gateway
         .get_task_logs(&busy, LOG_LINES_PER_TASK as usize)
         .await
         .expect("read the task's lines");
-    assert_eq!(newest.len() as i64, LOG_LINES_PER_TASK);
+    assert_eq!(kept_lines.len() as i64, LOG_LINES_PER_TASK);
+    // Both backends answer in the order the lines were written — the last N,
+    // oldest first — and the route hands that list on unchanged. The bound is
+    // what this reads: the list ends at the newest line.
+    let newest = format!("line {}", written - 1);
     assert_eq!(
-        newest[0].message,
-        format!("line {}", written - 1),
-        "the reader asks for the newest first and gets the newest first"
+        kept_lines.last().map(|row| row.message.as_str()),
+        Some(newest.as_str()),
+        "the trim took the oldest lines and left the newest one standing"
     );
     assert!(
-        !newest.iter().any(|row| row.message == "line 0"),
+        !kept_lines.iter().any(|row| row.message == "line 0"),
         "the oldest lines are the ones the trim took"
     );
 
