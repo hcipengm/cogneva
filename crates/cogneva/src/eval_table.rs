@@ -1149,6 +1149,18 @@ fn platform_absence(wiring: &Wiring) -> String {
     }
 }
 
+/// 这次跑在哪几列上收工具臂：返回（要跑的列，收不了工具臂因而**不跑**的列）。
+///
+/// 诊断臂（`--tools none`）每一列都收——它按定义就不给工具面，缺的那一面已经由
+/// `missing_dependencies` 里那条 `Run` 记下了。主表那一臂只收组合根真有实现的列：
+/// 一列的工具面少一件，拿剩下的顶上去量到的就是另一个东西。
+fn arm_split<'a>(tools: ToolArm, benchmarks: &[&'a str]) -> (Vec<&'a str>, Vec<&'a str>) {
+    benchmarks
+        .iter()
+        .copied()
+        .partition(|name| tools != ToolArm::Platform || has_tool_implementations(name))
+}
+
 /// 开跑**之前**就看得出来缺什么。收窄到这几样而不是整份参数：判词只跟「哪一列、哪个外壳、
 /// 哪条臂」有关，跟数据根、闸门那些无关，所以它是一条纯函数，能被单测直接钉住。
 ///
@@ -1160,6 +1172,7 @@ fn platform_absence(wiring: &Wiring) -> String {
 fn missing_dependencies(
     tools: ToolArm,
     benchmarks: &[&str],
+    unarmable: &[&str],
     scaffolds: &[String],
     wiring: &Wiring,
 ) -> Vec<Missing> {
@@ -1191,6 +1204,22 @@ fn missing_dependencies(
                  code tool, so every case would refuse to run rather than measure something",
             ));
         }
+    }
+    // 一列的工具面在组合根里没有实现：这次跑不建这一列。`Column` 而不是 `Run`——同一次跑里
+    // 其余列照跑照成表行，这一条只盖它自己那一列；也不盖格子，因为这一列根本没有格子。
+    // `NotImplemented` 而不是 `NotWired`：缺的不是一段配置，是这一列工具面的代码。
+    for name in unarmable {
+        missing.push(Missing::new(
+            name,
+            MissingScope::Column((*name).to_string()),
+            Absence::NotImplemented,
+            format!(
+                "this column pins its own tool face and the composition root has no \
+                 implementation for it; running the column with a smaller face would score a \
+                 different thing, so the column is left out of this run's rows (implement the \
+                 face, or run the column alone with `--tools none` as a diagnostic)"
+            ),
+        ));
     }
     if wiring.backbone.is_none() {
         missing.push(Missing::new(
@@ -1298,14 +1327,30 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
         None => None,
     };
 
+    // 工具臂按**列**分：一列的工具面在组合根里没有实现时，这一列不进这次的表，其余列照跑。
+    // 整跑退出（以前的样子）把「一条注册的套件里有一列还没实现」变成「这条套件永远跑不出
+    // 任何一行」——2026-11-04 实测：登记的那条命令行带着 HLE（它点的 web_search/python 没有
+    // 实现）与两列带工具的基准，`--tools platform` 一进来就 bail，于是同一条跑法在半个月里
+    // 重启了 319 次、一次都没跑到判题。少给工具会让这一列量成别的东西，所以这一列不是
+    // 「降级跑」，是**不跑**；缺席记在报表的 `## wiring` 里，其余列照成表行。
+    let (runnable, unarmable) = arm_split(args.tools, &args.benchmarks);
+    // 一列都收不了工具臂时没有表可跑：这不是「跑一次空表」，是这次命令行的组合本身不成表。
+    // 单独说一句，而不是让空的列集一路走到 rig 里去。
+    if runnable.is_empty() {
+        bail!(
+            "no column in this run can take the tool face it pins: {}. Implement one of those \
+             faces, or run a column alone with `--tools none` as a diagnostic",
+            unarmable.join(", ")
+        );
+    }
+
     // 子集先读、先查覆盖面，在核 pins 之前：存档是本机一个小文件，核 pins 要按哈希逐份
     // 读数据。先在便宜的那一步把「这次跑的是哪一批题」定下来，指错了当场就知道，不必
     // 先扫一遍几百 MB 的题面；覆盖不到某个基准也要在开跑之前说，而不是跑到那一列才发现。
     let subset = match &args.subset {
         Some(path) => {
             let subset = Arc::new(CaseSubset::load(path)?);
-            let uncovered: Vec<&str> = args
-                .benchmarks
+            let uncovered: Vec<&str> = runnable
                 .iter()
                 .copied()
                 .filter(|name| subset.count(name).is_none())
@@ -1326,11 +1371,12 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
         None => None,
     };
 
-    let verified = pins.verify(&data_root, &args.benchmarks)?;
+    let verified = pins.verify(&data_root, &runnable)?;
 
     // 每一处缺席都记名字：报表里缺什么、怎么补，比一个非零退出码有用。跑起来之后才发现的
     // 缺席（读不出题的列）在下面追加，两批各写各的。
-    let mut missing = missing_dependencies(args.tools, &args.benchmarks, &args.scaffolds, wiring);
+    let mut missing =
+        missing_dependencies(args.tools, &runnable, &unarmable, &args.scaffolds, wiring);
 
     let backbone: Arc<dyn LlmClient> = wiring
         .backbone
@@ -1378,7 +1424,7 @@ pub async fn run_table(args: &EvalTableArgs, wiring: &Wiring, pins: &Pins) -> Re
     }
 
     let mut benchmarks = Vec::new();
-    for name in &args.benchmarks {
+    for name in &runnable {
         benchmarks.push(build_benchmark(
             name,
             wiring.judge.clone(),
@@ -2460,6 +2506,7 @@ mod tests {
         let missing = missing_dependencies(
             ToolArm::Platform,
             &["swe-bench-pro"],
+            &[],
             &["swe-agent".to_string()],
             &wiring,
         );
@@ -2479,7 +2526,7 @@ mod tests {
             foreign_reason: Some("`COGNEVA_EVAL_FOREIGN_FLOWS` has a line that is not ...".into()),
             ..Default::default()
         };
-        let missing = missing_dependencies(ToolArm::Platform, &["hle"], &[], &wiring);
+        let missing = missing_dependencies(ToolArm::Platform, &["hle"], &[], &[], &wiring);
         let declaration = missing
             .iter()
             .find(|m| m.subject == "foreign-flows")
@@ -3253,8 +3300,13 @@ mod tests {
             no_transport: Some("cannot build an http client from http_client (boom)".into()),
             ..Default::default()
         };
-        let missing =
-            missing_dependencies(ToolArm::Platform, &["hle"], &["nql".to_string()], &wiring);
+        let missing = missing_dependencies(
+            ToolArm::Platform,
+            &["hle"],
+            &[],
+            &["nql".to_string()],
+            &wiring,
+        );
         let backbone = missing
             .iter()
             .find(|m| m.subject == "backbone")
@@ -3286,8 +3338,13 @@ mod tests {
     #[test]
     fn an_unconfigured_platform_names_the_variable_both_faces_read() {
         let wiring = Wiring::default();
-        let missing =
-            missing_dependencies(ToolArm::Platform, &["hle"], &["nql".to_string()], &wiring);
+        let missing = missing_dependencies(
+            ToolArm::Platform,
+            &["hle"],
+            &[],
+            &["nql".to_string()],
+            &wiring,
+        );
         let nql = missing
             .iter()
             .find(|m| m.subject == "nql")
@@ -3569,7 +3626,7 @@ mod tests {
     fn the_tools_off_arm_declares_codeact_out_of_arm_as_a_whole_row() {
         let wiring = Wiring::default();
         let scaffolds = ["codeact".to_string(), "gepa".to_string()];
-        let off = missing_dependencies(ToolArm::None, &["hle"], &scaffolds, &wiring);
+        let off = missing_dependencies(ToolArm::None, &["hle"], &[], &scaffolds, &wiring);
         let codeact = off
             .iter()
             .find(|m| m.subject == "codeact")
@@ -3580,11 +3637,53 @@ mod tests {
         assert!(codeact.covers("hle", "codeact"));
         assert!(!codeact.covers("hle", "gepa"));
 
-        let platform = missing_dependencies(ToolArm::Platform, &["hle"], &scaffolds, &wiring);
+        let platform = missing_dependencies(
+            ToolArm::Platform,
+            &["swe-bench-pro"],
+            &["hle"],
+            &scaffolds,
+            &wiring,
+        );
         assert!(
             !platform.iter().any(|m| m.subject == "codeact"),
             "主表那一臂给 codeact 工具，不该把它声明成缺席"
         );
+    }
+
+    /// 一列的工具面没有实现时，缺的是**这一列**，不是整次跑。
+    ///
+    /// 以前 `build_benchmark` 一撞上这样的列就 bail：一条套件里只要有一列还没实现，整条
+    /// 套件一行都跑不出来，而报错说的是「改用 `--tools none` 做诊断」——于是带工具的那两列
+    /// 也跟着只剩诊断读数。今天带工具的列各自有实现、HLE 点名的 web_search/python 还没有，
+    /// 一条注册的套件刚好同时含这两类。
+    #[test]
+    fn a_column_whose_tool_face_is_missing_leaves_the_column_out_not_the_run() {
+        let (runnable, unarmable) = arm_split(ToolArm::Platform, &["hle", "swe-bench-pro"]);
+        assert_eq!(runnable, vec!["swe-bench-pro"]);
+        assert_eq!(unarmable, vec!["hle"]);
+
+        let missing = missing_dependencies(
+            ToolArm::Platform,
+            &runnable,
+            &unarmable,
+            &[],
+            &Wiring::default(),
+        );
+        let column = missing
+            .iter()
+            .find(|m| m.subject == "hle")
+            .expect("这一列没有工具面实现，必须说出来，而不是悄悄少掉");
+        // `Column` 而不是 `Run`：同一次跑里的另外那几列照跑照成表行。
+        assert_eq!(column.scope, MissingScope::Column("hle".to_string()));
+        // `NotImplemented` 而不是 `NotWired`：下一步是写这一列的工具面，不是改配置。
+        assert_eq!(column.kind, Absence::NotImplemented);
+        assert!(!column.covers("swe-bench-pro", "gepa"), "只盖它自己那一列");
+
+        // 诊断臂整列都收：那里缺的是这一臂按定义不给工具，不是这一列缺实现——
+        // 那条缺席由 `Run` 记一次，不能再按列记第二遍。
+        let (all, none) = arm_split(ToolArm::None, &["hle", "swe-bench-pro"]);
+        assert_eq!(all, vec!["hle", "swe-bench-pro"]);
+        assert!(none.is_empty());
     }
 
     /// 另一向的整次跑缺席：骨干与裁判缺了，**每一格**都没读数，所以它们算没轮到跑。
@@ -3622,7 +3721,8 @@ mod tests {
         let args = EvalTableArgs::parse(&raw).unwrap();
         let declared = missing_dependencies(
             ToolArm::Platform,
-            &["hle", "swe-bench-pro", "toolathlon"],
+            &["swe-bench-pro", "toolathlon"],
+            &["hle"],
             &["nql".to_string()],
             &Wiring::default(),
         );
@@ -3678,7 +3778,7 @@ mod tests {
             ..Default::default()
         };
         let line = |wiring: &Wiring| {
-            missing_dependencies(ToolArm::Platform, &["swe-bench-pro"], &[], wiring)
+            missing_dependencies(ToolArm::Platform, &["swe-bench-pro"], &[], &[], wiring)
                 .iter()
                 .find(|m| m.subject == "swe-bench-pro")
                 .expect("这一列在这里是缺席的")
