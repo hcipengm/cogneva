@@ -697,7 +697,20 @@ struct HostLoad {
     /// was idle nor one that was waiting on the disk: a core blocked on IO is a
     /// core a build can have, and folding it in would read a disk problem as a
     /// cpu one and hold the bound down for the wrong reason.
+    ///
+    /// This is the reading as taken, and it is what the host series publishes.
+    /// The cpu dimension is sized from [`Self::sustained_busy_cores`] instead:
+    /// see [`CPU_READING_HORIZON_WINDOWS`].
     busy_cores: f64,
+    /// [`Self::busy_cores`] as the median of the last
+    /// [`CPU_READING_HORIZON_WINDOWS`] samples of it, filled in by the caller
+    /// that keeps the history between windows.
+    ///
+    /// `None` means this sample has no history behind it: the first window of a
+    /// process, or a sample taken by a caller that is not deriving a bound. The
+    /// dimension then reads the instant, which is what a gate that has watched
+    /// nothing can honestly do.
+    sustained_busy_cores: Option<f64>,
     /// Cores this host has, counted from the same file the busy time came from.
     cores: usize,
     /// The ceiling of the cgroup the builds run in, when they run in one.
@@ -932,6 +945,7 @@ impl HostLoad {
         Some(Self {
             pressure,
             busy_cores,
+            sustained_busy_cores: None,
             cores,
             budget: BuildBudget::read(),
             disk_free_bytes: disk_bytes(dir),
@@ -1036,8 +1050,12 @@ impl HostLoad {
         // Measured on this host over ten days, the bound moved 231-409 times a
         // day in that loop, a median 148 seconds apart against a window of 60.
         let in_flight = self.pressure.builds_in_flight as f64;
-        let cpu = (in_flight + (cores - self.busy_cores) / self.tuning.build_demand_cores)
-            .clamp(1.0, cores);
+        // Over the horizon rather than at the instant: the sample is a fifth of
+        // a second of this host, and what the bound is a decision about is the
+        // next tens of minutes.
+        let busy_cores = self.sustained_busy_cores.unwrap_or(self.busy_cores);
+        let cpu =
+            (in_flight + (cores - busy_cores) / self.tuning.build_demand_cores).clamp(1.0, cores);
         let memory = (in_flight
             + self
                 .pressure
@@ -1208,6 +1226,28 @@ const HOST_DISK_FREE_BYTES: &str = "cogneva_host_disk_free_bytes";
 /// the noise is measured in the same unit the answer is.
 // cap: bound — 死区宽度就是读数在它取整的那个整数上的自身噪声，不是趋势
 const CEILING_DEAD_BAND: f64 = 0.15;
+/// How many windows the cpu reading is taken over before it may size a bound.
+///
+/// The bound is a decision about the next tens of minutes, because that is how
+/// long a build takes. The cpu dimension was the one input read at an instant:
+/// two `/proc/stat` reads 200 ms apart, which on this host is the whole range of
+/// the machine rather than the machine -- `cogneva_host_cpu_busy_cores` spans
+/// 1.9 to 24.0 cores of a 24-core host within twenty-four hours, and the
+/// published answer of this dimension moves between 1 and 5 across the same
+/// day, because that is the range of a fifth of a second on this machine.
+/// The bound followed it: on 2026-11-03, of the 209 falls in a day 171 came from
+/// this dimension, and the ledger wrote 456 bound changes -- taking back the
+/// slot it had just handed out every few minutes.
+///
+/// A median over the horizon rather than over the last sample, because the
+/// quantity being estimated is "how many builds this host carries", which is a
+/// property of the next build's lifetime and not of the instant the window
+/// closed. The horizon is longer than one build on purpose: a build's own start
+/// and finish must not be able to move the bound, and one build is the shortest
+/// span that guarantees it. It is a count of windows rather than a duration
+/// because the window is the unit the derivation already runs in.
+// cap: bound — 窗口数由「一次构建的时长」定，不是由收紧告警的阈值反推
+const CPU_READING_HORIZON_WINDOWS: usize = 30;
 /// What each dimension answers on its own, beside the ceiling that takes the
 /// smallest of them.
 ///
@@ -2050,6 +2090,7 @@ fn bound_move_event(
     dir: &Path,
     cores: usize,
     busy_cores: f64,
+    sustained_busy_cores: Option<f64>,
 ) -> Option<ResourceEvent> {
     if next == current {
         // A decision not to move is not an event: the account records what
@@ -2073,6 +2114,12 @@ fn bound_move_event(
             "dir": dir.display().to_string(),
             "cores": cores,
             "busy_cores": busy_cores,
+            // Both numbers, because they answer different questions and only
+            // one of them moved the bound: `busy_cores` is the instant the
+            // window closed on, `sustained_busy_cores` is the median the cpu
+            // dimension was sized from. A row that carried only the first would
+            // leave a cpu-driven move unexplained by its own reading.
+            "sustained_busy_cores": sustained_busy_cores,
         }),
         count: 1,
     })
@@ -2122,6 +2169,15 @@ pub struct BuildGate {
     /// two have to fade at the same rate, and why a count taken at the instant
     /// the window closes is not the same thing.
     occupancy_avg: AtomicU64,
+    /// The busy-core readings of the last few windows, as each window measured
+    /// them.
+    ///
+    /// The cpu dimension is sized from their median rather than from the sample
+    /// the current window took: see [`CPU_READING_HORIZON_WINDOWS`]. In memory
+    /// beside the io cost rather than in the slot directory, for the same reason
+    /// -- it is this process's reading of the host, not a decision about it, and
+    /// a restart pays one window to fill the history again.
+    cpu_history: Mutex<VecDeque<f64>>,
     /// The dimension the ceiling came from.
     dimension: Mutex<&'static str>,
     /// The sample that derivation was made from, published beside it.
@@ -2270,6 +2326,7 @@ impl BuildGate {
             held_ceiling: AtomicU64::new(0),
             per_build_io: AtomicU64::new(0),
             occupancy_avg: AtomicU64::new(0),
+            cpu_history: Mutex::new(VecDeque::new()),
             dimension: Mutex::new(DIM_UNMEASURED),
             host: Mutex::new(None),
             measured_build_cost: Mutex::new(VecDeque::new()),
@@ -2531,6 +2588,26 @@ impl BuildGate {
         false
     }
 
+    /// Records this window's busy-core reading and answers the median of the
+    /// last [`CPU_READING_HORIZON_WINDOWS`] of them.
+    ///
+    /// Median rather than mean: the quantity wanted is "how busy this host is
+    /// over a build", and one window in which something else saturated the
+    /// machine is not evidence that the host's capacity fell -- it is a spike,
+    /// and a mean carries a third of a spike into the answer while a median
+    /// carries none of it. Sorted on every window because the history is thirty
+    /// numbers and the window runs once a minute.
+    fn sustained_busy_cores(&self, measured: f64) -> f64 {
+        let mut history = self.cpu_history.lock().unwrap_or_else(|e| e.into_inner());
+        history.push_back(measured);
+        while history.len() > CPU_READING_HORIZON_WINDOWS {
+            history.pop_front();
+        }
+        let mut sorted: Vec<f64> = history.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sorted[sorted.len() / 2]
+    }
+
     /// The io cost of one build this process has learned, or `None` before a
     /// window with a build in it has been seen.
     fn learned_io_cost(&self) -> Option<f64> {
@@ -2642,6 +2719,11 @@ impl BuildGate {
         // reading, taken before the dimension reads it.
         load.occupancy_avg60 = self.learn_occupancy(load.pressure.builds_in_flight, elapsed);
         load.per_build_io = self.learned_io_cost();
+        // The cpu dimension is the one sized from a history rather than from
+        // this window's instant; see `CPU_READING_HORIZON_WINDOWS`. Filled in
+        // before any ceiling is derived from the sample, so the reading
+        // published beside the decision is the one the decision was made on.
+        load.sustained_busy_cores = Some(self.sustained_busy_cores(load.busy_cores));
         let previous = self.held_ceiling.load(Ordering::Relaxed) as usize;
         let (measured_ceiling, dimension) = load.ceiling();
         let (ceiling, _) = load.ceiling_held_since(previous);
@@ -2698,6 +2780,10 @@ impl BuildGate {
                 calm,
                 controller,
                 busy_cores = load.busy_cores,
+                // The reading the cpu dimension was sized from, which is the
+                // median over the horizon rather than the sample above: a move
+                // whose `dimension` is `cpu` is explained by this number.
+                sustained_busy_cores = load.sustained_busy_cores,
                 cores = load.cores,
                 cpu_stall_avg60 = load.pressure.cpu_avg60,
                 io_stall_avg60 = load.pressure.io_avg60,
@@ -2722,6 +2808,7 @@ impl BuildGate {
                     &self.dir,
                     load.cores,
                     load.busy_cores,
+                    load.sustained_busy_cores,
                 ) {
                     self.record_event(event);
                 }
@@ -4443,6 +4530,7 @@ mod tests {
                 builds_in_flight: 0,
             },
             busy_cores: 0.0,
+            sustained_busy_cores: None,
             cores: 24,
             budget: None,
             disk_free_bytes: None,
@@ -5286,6 +5374,7 @@ mod tests {
                 builds_in_flight: 0,
             },
             busy_cores: 0.0,
+            sustained_busy_cores: None,
             cores: 24,
             budget: None,
             disk_free_bytes: None,
@@ -5357,6 +5446,7 @@ mod tests {
                 builds_in_flight: 0,
             },
             busy_cores: 0.0,
+            sustained_busy_cores: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -5416,6 +5506,7 @@ mod tests {
                     builds_in_flight: n,
                 },
                 busy_cores: n as f64 * tuning.build_demand_cores,
+                sustained_busy_cores: None,
                 cores: 24,
                 budget: None,
                 disk_free_bytes: Some(1 << 40),
@@ -5478,6 +5569,7 @@ mod tests {
                     builds_in_flight: n,
                 },
                 busy_cores: n as f64 * tuning.build_demand_cores,
+                sustained_busy_cores: None,
                 cores: 24,
                 budget: None,
                 disk_free_bytes: Some(1 << 40),
@@ -5569,6 +5661,7 @@ mod tests {
                 builds_in_flight: n,
             },
             busy_cores: 0.0,
+            sustained_busy_cores: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -5618,6 +5711,7 @@ mod tests {
                 builds_in_flight: n,
             },
             busy_cores: 0.0,
+            sustained_busy_cores: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -5671,6 +5765,7 @@ mod tests {
                     builds_in_flight: n,
                 },
                 busy_cores: 0.0,
+                sustained_busy_cores: None,
                 cores: 24,
                 budget: None,
                 disk_free_bytes: Some(1 << 40),
@@ -5712,6 +5807,7 @@ mod tests {
                 builds_in_flight: 0,
             },
             busy_cores: busy,
+            sustained_busy_cores: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -5757,6 +5853,74 @@ mod tests {
                 "no dimension answers below the ceiling that took the smallest of them"
             );
         }
+    }
+
+    /// 2026-11-03 的现场：一天的 209 次下调里 171 次由 cpu 那一维给出，界线在
+    /// 1 与 3 之间来回——按 2026-11-03 的 24 小时读数，这一维本身在 1 与 7 之间
+    /// 走过，因为它是唯一按「两个 /proc/stat 相隔 200 毫秒」取的一维，而界是
+    /// 关于接下来几十分钟（一次构建的时长）的决定。
+    ///
+    /// 判据落在「一次窗口的尖峰不许把刚发出去的槽收回来」：历史里 30 个窗口
+    /// 都是 8 个忙核，只夹一个 24 个忙核的窗口，界必须仍然按历史那一维出答案。
+    #[test]
+    fn one_saturated_window_does_not_take_back_the_slot_it_just_handed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let gate = gate(dir.path(), 1, 1);
+        let steady = 8.0;
+        for _ in 0..CPU_READING_HORIZON_WINDOWS {
+            let sustained = gate.sustained_busy_cores(steady);
+            assert_eq!(sustained, steady);
+        }
+        let sustained = gate.sustained_busy_cores(24.0);
+        assert_eq!(
+            sustained, steady,
+            "一个饱和窗口在 {} 个窗口的历史里不改变中位数；改了它就等于把界交给\n\
+             这一瞬间的读数，而界管的是接下来几十分钟",
+            CPU_READING_HORIZON_WINDOWS
+        );
+    }
+
+    /// 同一个样本，两种取法：按瞬间取 cpu 那一维答 1，按历史的取法答 3。界与
+    /// 已发布的那一维必须是后者，否则读的人会看见一条比自己所有输入都低的界。
+    #[test]
+    fn the_cpu_dimension_is_sized_from_the_sustained_reading() {
+        let load = |sustained: Option<f64>| HostLoad {
+            pressure: Pressure {
+                cpu_avg10: 0.0,
+                cpu_avg60: 0.0,
+                io_avg10: 0.0,
+                io_avg60: 0.0,
+                mem_avg10: 0.0,
+                mem_avg60: 0.0,
+                mem_available_bytes: 64 * 1024 * 1024 * 1024,
+                builds_in_flight: 0,
+            },
+            busy_cores: 24.0,
+            sustained_busy_cores: sustained,
+            cores: 24,
+            budget: None,
+            disk_free_bytes: Some(1 << 40),
+            tuning: shipped(),
+            per_build_io: None,
+            occupancy_avg60: 0.0,
+        };
+        let cpu = |l: &HostLoad| {
+            l.dimensions()
+                .iter()
+                .find(|(name, _)| *name == DIM_CPU)
+                .expect("the cpu dimension is published")
+                .1
+        };
+        assert_eq!(
+            cpu(&load(None)),
+            1.0,
+            "没有历史的样本只能读这一瞬间：24 个核全忙就是没有余地"
+        );
+        assert_eq!(
+            cpu(&load(Some(8.0))),
+            (24.0 - 8.0) / shipped().build_demand_cores,
+            "有历史时这一维按中位数出答案，与这一瞬间的 24 个忙核无关"
+        );
     }
 
     /// The host readings carry the numbers the bound was derived from, one row
@@ -5879,6 +6043,7 @@ mod tests {
                 builds_in_flight: 0,
             },
             busy_cores: 0.0,
+            sustained_busy_cores: None,
             cores: 24,
             budget: Some(BuildBudget {
                 mem_max,
@@ -6157,6 +6322,7 @@ unevictable 28532736
                 builds_in_flight: 0,
             },
             busy_cores: 1.0,
+            sustained_busy_cores: None,
             cores: 24,
             budget: None,
             disk_free_bytes: None,
@@ -7577,6 +7743,7 @@ unevictable 28532736
                 builds_in_flight: 0,
             },
             busy_cores: 1.0,
+            sustained_busy_cores: None,
             cores: 24,
             budget: None,
             disk_free_bytes: Some(1 << 40),
@@ -7607,7 +7774,19 @@ unevictable 28532736
             bool,
         );
         let fields: [Field; 7] = [
-            (HOST_CPU_BUSY_CORES, None, |l| l.busy_cores = 23.0, true),
+            (
+                HOST_CPU_BUSY_CORES,
+                None,
+                // Both, because the dimension is sized from the median of the
+                // history when the caller filled one in and from the instant
+                // only when it did not. Moving one and not the other would test
+                // the fallback path while claiming to test the host reading.
+                |l| {
+                    l.busy_cores = 23.0;
+                    l.sustained_busy_cores = Some(23.0);
+                },
+                true,
+            ),
             (HOST_CPU_CORES, None, |l| l.cores = 10, true),
             (
                 HOST_MEMORY_AVAILABLE_BYTES,
@@ -7846,7 +8025,7 @@ unevictable 28532736
     #[test]
     fn a_bound_that_moved_is_an_event_with_both_ends() {
         let dir = Path::new("/tmp/gate-dir");
-        let moved = bound_move_event(1, 3, 3, DIM_IO, true, dir, 24, 20.0)
+        let moved = bound_move_event(1, 3, 3, DIM_IO, true, dir, 24, 20.0, Some(14.5))
             .expect("a move from 1 to 3 is an event");
         assert_eq!(moved.kind, ResourceEventKind::BoundChange);
         assert_eq!(moved.outcome, ResourceEventOutcome::Applied);
@@ -7857,8 +8036,12 @@ unevictable 28532736
         assert_eq!(moved.to_value, Some(3));
         assert_eq!(moved.detail["dimension"], DIM_IO);
         assert_eq!(moved.detail["calm"], true);
+        assert_eq!(
+            moved.detail["sustained_busy_cores"], 14.5,
+            "the row carries the reading the cpu dimension was sized from, not only the instant"
+        );
         assert!(
-            bound_move_event(2, 2, 2, DIM_IO, false, dir, 24, 24.0).is_none(),
+            bound_move_event(2, 2, 2, DIM_IO, false, dir, 24, 24.0, None).is_none(),
             "a bound that stayed where it was is not a move"
         );
     }
