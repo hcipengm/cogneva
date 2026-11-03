@@ -136,6 +136,13 @@ const SAME_VALUE_DIFFERENT_THING: &[(&str, &str, &str)] = &[
          牵动另一个人手里的租约",
     ),
     (
+        "cog-memory",
+        "memory_refusal_sweep",
+        "同 `memory_decay`：循环名与租约角色名是两个通道，改名不该牵动另一\
+         个人手里的租约；两个名字今天取同一个词，是因为这条循环的读数与租约\
+         本就该按同一个名字被人找到，不是因为它们是同一个声明",
+    ),
+    (
         "cog-orchestrator",
         "backup_runs",
         "同上：循环名与租约角色名是两个通道",
