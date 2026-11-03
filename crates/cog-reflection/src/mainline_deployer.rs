@@ -4939,7 +4939,7 @@ impl MainlineDeployer {
         };
         for reason in CiHoldOwner::ALL {
             let mut labels = std::collections::HashMap::new();
-            labels.insert("reason".to_string(), reason.label().to_string());
+            labels.insert(crate::LABEL_REASON.to_string(), reason.label().to_string());
             let value = if reason == owner { reason.value() } else { 0.0 };
             let _ = metrics
                 .record_gauge(
