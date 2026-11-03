@@ -3748,6 +3748,61 @@
           "severity": "warning",
           "summary": "The gateway's probe could not read {resource} from the apiserver {value} times in the last fifteen minutes. The topology, workload and quota panels read those collections on demand and draw nothing when a read fails, so on screen a refused read is indistinguishable from an empty cluster -- and because those reads only happen while someone has the page open, nothing noticed when a narrowed ClusterRole blanked the whole topology panel for hours. The probe issues the same reads at limit=1 once a minute whether or not anyone is looking, so this counter says the read path still works. Read it by resource and by the deployment label on this alert, because the grant has two halves and they fail the same way: the resource named is either a rule missing from the ClusterRole or a service account that serves this face without being named in its ClusterRoleBinding, and the deployment label says which of the processes carrying this face is the one being refused -- the first rollout after the probe landed found both at once, four cluster-scope reads refused in one process while its sibling deployment, running the same binary under another service account, was refused the same four. One resource failing beside the rest succeeding is a grant that was narrowed, not an apiserver that is down (an apiserver that is down fails every resource, and the nodes read fails first). It cannot distinguish a 403 from a wrong path or a renamed collector -- the probe records only that the read did not answer with a list -- so the fix starts by asking the pod's own log for the apiserver's status line",
           "face": "可观测与告警"
+        },
+        {
+          "name": "capability_verdict_red",
+          "promql": "max by (capability) (cogneva_capability_verdict)",
+          "condition": {
+            "equal": 1.0
+          },
+          "for_seconds": 0,
+          "severity": "warning",
+          "summary": "能力 {capability} 的判词是红：附着在它上面的那条承诺此刻不成立，理由在应用日志里 `capability does not hold` 那一行（带 `capability` 与 `reason` 两个字段）。判词是 0/1/3 的闭集，这条只认 1，读的是表达式算出来的那个数而不是「有没有样点」——3 走旁边那条规则，「读不到」与「不成立」是两件事，前者第一步修数据来源，后者第一步修那个面。不叠保持时长：判词本身就是按这个能力自己声明的节拍算出来的，红了已经是一轮的结论，再叠一个窗口只会让一个已知不成立的承诺多当一阵子绿的。",
+          "face": "落地≠生效"
+        },
+        {
+          "name": "capability_cannot_be_judged",
+          "promql": "max by (capability) (cogneva_capability_verdict)",
+          "condition": {
+            "equal": 3.0
+          },
+          "for_seconds": 7200,
+          "severity": "warning",
+          "summary": "能力 {capability} 连续两小时以上判不出来（判词 3）：判定循环在跑，但它要读的那份输入读不到，所以这一面既没有绿也没有红，只有一句「我没看成」。两小时是这类投影自己声明的滞后界（两倍窗口）：新装的部署在第一格窗口定案之前本来就没有可判的东西，那一段自己就好；过了两倍窗口还是 3，说的就不是刚起来，而是它读的那份东西一直不在。它不并进红档，是因为两边第一步处置不同。",
+          "face": "落地≠生效"
+        },
+        {
+          "name": "capability_never_judged",
+          "promql": "max by (capability) (cogneva_capability_measured)",
+          "condition": {
+            "less_than": 0.5
+          },
+          "for_seconds": 900,
+          "severity": "warning",
+          "summary": "能力 {capability} 被声明了，却一次都没判过：`measured` 停在 0 说的不是「结果是 0」，而是「没有人看过」。这一族其余序列都在能力声明处才存在，所以一个没人判的承诺在读数面上与一个健康的面长得一模一样——这正是这条规则存在的理由。界取小于 0.5 而不是等于 0：这是「有过」与「没有」的两档，不是一次计数。十五分钟只够跨过一次滚动：判定循环在启动后立刻跑第一轮，判过一轮就是 1。",
+          "face": "落地≠生效"
+        },
+        {
+          "name": "capability_none_declared",
+          "promql": "max without (pod, container, instance) (1 - cogneva_capability_declared) or absent(cogneva_capability_declared)",
+          "condition": {
+            "greater_than": 0.5
+          },
+          "for_seconds": 900,
+          "severity": "warning",
+          "summary": "这个进程声明了零条关于自身的能力承诺，或者根本不再发布这个数。`cogneva_capability_declared` 是这一族唯一恒定发布的序列，存在的理由是把「什么都没有」变成一个数：其余序列只在有声明的地方出现，把声明全删掉之后它们一起消失，而不存在读起来与安静一模一样。所以这条红的意思是账本接上了、但没人往里声明，查的是声明处与插件的接线，不是某个面本身；同时也接住「这个数整条都不见了」那个更旧的形状，所以两边用 `or absent(...)` 合成一个数再比。十五分钟跨过一次滚动。",
+          "face": "落地≠生效"
+        },
+        {
+          "name": "capability_judgement_overdue",
+          "promql": "max by (capability) (cogneva_capability_verdict_age_seconds - 2 * cogneva_capability_cadence_seconds)",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "for_seconds": 600,
+          "severity": "warning",
+          "summary": "能力 {capability} 的上一份判词已经比它自己声明的节拍旧了两倍以上：判定循环还在被登记、没有记录成死亡，但它已经连着两轮以上没交出结论。这条补的是循环存活读数看不见的那一半——循环心跳只看它有没有醒来，而一次醒着却卡在判定里（读数据库挂了、上游不答）同样能让判词停在那里不动，两种坏法的第一步处置不同。界不写在规则里，是两条读数算出来的：`verdict_age` 减两倍 `cadence`，能力改节拍时判据跟着动，不会留下一处需要人去它对。两倍而不是一倍：稳态下年龄本来就从 0 长到一拍，按一拍当界会让每个健康的能力在自己的节拍末尾都红了。十分钟保持跨过一次抓取抖动。",
+          "face": "落地≠生效"
         }
       ]
     },

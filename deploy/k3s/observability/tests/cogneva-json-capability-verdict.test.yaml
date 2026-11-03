@@ -1,0 +1,192 @@
+# 「这条承诺现在成不成立」那一族的单测夹具：红、判不出来、从没判过、一条都没声明。
+#
+# 这一族读的序列由应用发布（`cogneva_capability_*`，每个能力一条），它的规则不在
+# PrometheusRule 清单里，而在部署配置的进程内 watcher 那一库——所以这里点名规则名，
+# 由跑者从 `deploy/helm/cogneva/files/cogneva.json` 按名字取正文：
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-capability-verdict.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+#
+# 每条规则要证明的不只是「会响」，还有它该安静的那几格：
+#   - `capability_verdict_red` 只认判词 1；判词 0（成立）与 3（判不出来）都不归它问，
+#     3 有自己那条规则，因为两边第一步处置不同。
+#   - `capability_cannot_be_judged` 叠两小时：新装的部署在第一格窗口定案前本来就没有
+#     可判的东西；一小时时它必须还只是 pending。
+#   - `capability_never_judged` 只认 `measured=0`：判过一轮就是 1，判词是什么都不影响它。
+#   - `capability_none_declared` 认的是账本恒发的那一格为 0。它是这一族唯一在「什么都
+#     没有」时还存在的那条序列——其余序列连声明都不存在时一起消失，而消失读起来与安静
+#     一模一样。
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: capability_verdict_red
+# rule: capability_cannot_be_judged
+# rule: capability_never_judged
+# rule: capability_none_declared
+# rule: capability_judgement_overdue
+
+evaluation_interval: 1m
+
+tests:
+  # 判过、结论是红：红档立刻响（不叠保持时长），其余三条静。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_capability_declared'
+        values: '1x30'
+      - series: 'cogneva_capability_measured{capability="spend_verdict_current"}'
+        values: '1x30'
+      - series: 'cogneva_capability_verdict{capability="spend_verdict_current"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: capability_verdict_red
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              capability: spend_verdict_current
+      - eval_time: 5m
+        alertname: capability_cannot_be_judged
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: capability_never_judged
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: capability_none_declared
+        exp_alerts: []
+
+  # 判过、结论是成立：四条全静。一个健康的面不该有任何一条规则亮着。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_capability_declared'
+        values: '1x30'
+      - series: 'cogneva_capability_measured{capability="spend_verdict_current"}'
+        values: '1x30'
+      - series: 'cogneva_capability_verdict{capability="spend_verdict_current"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: capability_verdict_red
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: capability_cannot_be_judged
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: capability_never_judged
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: capability_none_declared
+        exp_alerts: []
+
+  # 判不出来（3）：一小时时还只是 pending（新部署的同一种形状先被这一段时间放过），
+  # 两小时零一分才响；红档在这两格都不许亮——「读不到」不是「不成立」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_capability_declared'
+        values: '1x200'
+      - series: 'cogneva_capability_measured{capability="spend_verdict_current"}'
+        values: '1x200'
+      - series: 'cogneva_capability_verdict{capability="spend_verdict_current"}'
+        values: '3x200'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: capability_cannot_be_judged
+        exp_alerts: []
+      - eval_time: 60m
+        alertname: capability_verdict_red
+        exp_alerts: []
+      - eval_time: 130m
+        alertname: capability_cannot_be_judged
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              capability: spend_verdict_current
+      - eval_time: 130m
+        alertname: capability_verdict_red
+        exp_alerts: []
+
+  # 声明了、从没判过：`measured` 停在 0。十五分钟之内不响（判定循环启动后立刻跑第一轮），
+  # 二十分钟时响——说的不是「结果是 0」，是「没有人看过」。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_capability_declared'
+        values: '1x30'
+      - series: 'cogneva_capability_measured{capability="spend_verdict_current"}'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: capability_never_judged
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: capability_never_judged
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              capability: spend_verdict_current
+      - eval_time: 20m
+        alertname: capability_verdict_red
+        exp_alerts: []
+
+  # 判词比自己的节拍旧了两倍：循环活着、判词不动。界是两条读数算出来的——年龄减两倍
+  # 节拍——所以这里同时给 cadence 那一格。一小时节拍下两倍的界是 120 分钟：73 分钟时
+  # 静（还没到），125 分钟时响（过界并且已经压过十分钟的保持时长）。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_capability_declared'
+        values: '1x200'
+      - series: 'cogneva_capability_measured{capability="spend_verdict_current"}'
+        values: '1x200'
+      - series: 'cogneva_capability_verdict{capability="spend_verdict_current"}'
+        values: '0x200'
+      - series: 'cogneva_capability_verdict_age_seconds{capability="spend_verdict_current"}'
+        values: '4380x60 7500x140'
+      - series: 'cogneva_capability_cadence_seconds{capability="spend_verdict_current"}'
+        values: '3600x200'
+    alert_rule_test:
+      # 73 分钟的年龄对两小时（7200 秒）的界：静。
+      - eval_time: 30m
+        alertname: capability_judgement_overdue
+        exp_alerts: []
+      # 125 分钟的年龄：过了界十分钟以上，响。
+      - eval_time: 130m
+        alertname: capability_judgement_overdue
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              capability: spend_verdict_current
+      # 判词本身是 0（成立）：别的三条在这两格里都不许亮。
+      - eval_time: 130m
+        alertname: capability_verdict_red
+        exp_alerts: []
+      - eval_time: 130m
+        alertname: capability_never_judged
+        exp_alerts: []
+
+  # 更旧的那个形状：连 `cogneva_capability_declared` 都不发布了（账本没接上，或者
+  # 进程还是旧镜像）。`or absent(...)` 让它与「声明为零」报同一句，而不是一起消失。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_capability_measured{capability="spend_verdict_current"}'
+        values: '1x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: capability_none_declared
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  # 账本在、一条声明都没有：其余序列一起消失，只有这一格还说得出来。十分钟不响，
+  # 二十分钟响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_capability_declared'
+        values: '0x30'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: capability_none_declared
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: capability_none_declared
+        exp_alerts:
+          - exp_labels:
+              severity: warning

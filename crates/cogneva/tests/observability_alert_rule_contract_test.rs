@@ -72,6 +72,26 @@ const PRODUCED: &[(&str, &str)] = &[
         "crates/cog-observability/src/boot_footprint.rs",
     ),
     (
+        "cogneva_capability_cadence_seconds",
+        "crates/cog-observability/src/capability.rs",
+    ),
+    (
+        "cogneva_capability_declared",
+        "crates/cog-observability/src/capability.rs",
+    ),
+    (
+        "cogneva_capability_measured",
+        "crates/cog-observability/src/capability.rs",
+    ),
+    (
+        "cogneva_capability_verdict",
+        "crates/cog-observability/src/capability.rs",
+    ),
+    (
+        "cogneva_capability_verdict_age_seconds",
+        "crates/cog-observability/src/capability.rs",
+    ),
+    (
         "cogneva_claim_scan_age_seconds",
         "crates/cog-observability/src/claim_store.rs",
     ),

@@ -68,6 +68,7 @@ const FOREIGN: &[(&str, &str)] = &[
 const WRITTEN_BY_CODE: &[(&str, &str)] = &[
     ("asker", "crates/cog-reflection/src/build_gate/mod.rs"),
     ("category", "crates/cog-github/src/landing.rs"),
+    ("capability", "crates/cog-observability/src/capability.rs"),
     ("cause", "crates/cog-observability/src/observable.rs"),
     ("clause", "crates/cog-reflection/src/mainline_deployer.rs"),
     ("consumer", "crates/cog-supervisor/src/consumer_lag.rs"),

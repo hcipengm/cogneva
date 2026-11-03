@@ -779,6 +779,140 @@ pub fn spawn(
     )
 }
 
+/// The capability id this face reports under.
+pub const FRESHNESS_CAPABILITY_ID: &str = "spend_verdict_current";
+
+/// How far behind the clock the newest judged window may be before the
+/// projection counts as stopped.
+///
+/// Two windows, not one: the loop judges a window once it closes, so at steady
+/// state the newest judged window ended one window ago. A bound of one window
+/// would be red half the time on a healthy system, and a bound nobody can be
+/// inside is the same as no bound.
+// cap: bound — 稳态滞后就是一个窗口，留一个窗口的余量；两倍窗口是「漏了一整趟」的界
+pub const FRESHNESS_MAX_LAG: Duration = Duration::from_secs(2 * WINDOW_SECS as u64);
+
+/// Where the projection's watermark comes from.
+///
+/// A trait rather than a direct call so the judgement can be exercised without
+/// a database: the interesting cases are "a window was never judged" and "the
+/// newest one is hours old", and both of those are states a test has to be able
+/// to produce, not states a live database happens to be in.
+#[async_trait::async_trait]
+pub trait WindowWatermark: Send + Sync {
+    async fn newest_window_end(&self) -> anyhow::Result<Option<DateTime<Utc>>>;
+}
+
+#[async_trait::async_trait]
+impl WindowWatermark for SpendVerdictStore {
+    async fn newest_window_end(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
+        self.last_verdicted_window_end().await
+    }
+}
+
+/// "The spend projection keeps up with the clock."
+///
+/// The loop has its own liveness reading, and that is not this: a loop that
+/// ticks but cannot write (the window is unreadable, the table refuses the
+/// insert) beats on time and leaves the projection frozen, and a frozen
+/// projection reports last month's spend as this hour's. The two failures have
+/// different repairs — restart the loop, versus fix what it cannot write —
+/// which is why this is judged from the watermark rather than from the beat.
+/// The claim is declared whether or not this process got a store. A claim that
+/// disappears when its input is missing is the shape this layer exists to
+/// remove: the deployment would simply stop promising anything, and a reader
+/// would see a series that is absent exactly like every other absent series.
+/// No store is a verdict — `Unmeasured` — not an undeclared claim.
+pub struct SpendVerdictFreshness<W: WindowWatermark + 'static> {
+    source: Option<Arc<W>>,
+    now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+}
+
+impl<W: WindowWatermark + 'static> SpendVerdictFreshness<W> {
+    pub fn new(source: Option<Arc<W>>) -> Self {
+        Self {
+            source,
+            now: Arc::new(Utc::now),
+        }
+    }
+
+    /// Pin the clock. Used by tests, which cannot wait two hours to see the
+    /// lag bound work.
+    pub fn with_clock(
+        source: Option<Arc<W>>,
+        now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    ) -> Self {
+        Self { source, now }
+    }
+
+    /// Judge a watermark against a clock. Pure, so the boundary is testable
+    /// without either the store or the loop.
+    pub fn judge_watermark(
+        watermark: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> crate::capability::Verdict {
+        use crate::capability::Verdict;
+        let Some(end) = watermark else {
+            // A projection with no judged window is not current, but it is also
+            // not evidence of a defect: a deployment that just came up has
+            // nothing to judge yet. Unmeasured says exactly that, and it is not
+            // `Ok` — an alert may fire on it, which is the intended safety.
+            return Verdict::Unmeasured(
+                "no window has been judged yet; the projection has nothing to be behind".into(),
+            );
+        };
+        let lag = now.signed_duration_since(end);
+        if lag.num_seconds() < 0 {
+            // A watermark in the future is a clock or a writer disagreement, not
+            // freshness. Folding it into `Ok` would make a skewed writer the
+            // quietest possible configuration.
+            return Verdict::Unmeasured(format!(
+                "the newest judged window ends in the future ({end}); the clock and the writer disagree"
+            ));
+        }
+        if lag.to_std().unwrap_or_default() > FRESHNESS_MAX_LAG {
+            return Verdict::Red(format!(
+                "the newest judged window ended {} s ago, past the {} s bound",
+                lag.num_seconds(),
+                FRESHNESS_MAX_LAG.as_secs()
+            ));
+        }
+        Verdict::Ok
+    }
+}
+
+#[async_trait::async_trait]
+impl<W: WindowWatermark + 'static> crate::capability::Capability for SpendVerdictFreshness<W> {
+    fn id(&self) -> &'static str {
+        FRESHNESS_CAPABILITY_ID
+    }
+
+    fn cadence(&self) -> cog_core::loop_health::Cadence {
+        // The judgement is one row lookup over a table whose newest row is an
+        // hour old; asking faster than the window closes cannot produce a new
+        // answer, and asking slower than that would let a stopped projection go
+        // unnoticed for two windows.
+        cog_core::loop_health::Cadence::Periodic(Duration::from_secs(WINDOW_SECS as u64))
+    }
+
+    async fn judge(&self) -> crate::capability::Verdict {
+        let now = (self.now)();
+        let Some(source) = self.source.as_ref() else {
+            return crate::capability::Verdict::Unmeasured(
+                "this process built no spend verdict store, so nothing here keeps the \
+                 projection current"
+                    .into(),
+            );
+        };
+        match source.newest_window_end().await {
+            Ok(watermark) => Self::judge_watermark(watermark, now),
+            Err(e) => crate::capability::Verdict::Unmeasured(format!(
+                "the verdict projection could not be read: {e}"
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

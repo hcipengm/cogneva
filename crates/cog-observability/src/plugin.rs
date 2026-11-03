@@ -45,6 +45,10 @@ pub struct ObservabilityPlugin {
     /// usage ledger does: a verdict about a spend that cannot be read is not a
     /// verdict, and the loop has nothing to resume from.
     verdict_store: Option<Arc<crate::spend_verdict::SpendVerdictStore>>,
+    /// What this build claims about itself, each claim with its own judgement
+    /// and its own cadence. Filled in `init` by whoever owns a face, so no
+    /// central list has to be kept in step with the code; started in `start`.
+    capabilities: Option<Arc<crate::capability::CapabilityLedger>>,
     /// Per-agent trace buffer budget, read in `init` from config and applied
     /// to the collection task in `start`.
     trace_buffer_max_bytes: usize,
@@ -66,6 +70,7 @@ impl ObservabilityPlugin {
             usage_store: None,
             skip_store: None,
             verdict_store: None,
+            capabilities: None,
             trace_buffer_max_bytes: crate::config::TraceCollectorConfig::default().buffer_max_bytes,
             data_volume: Vec::new(),
         }
@@ -583,6 +588,32 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
             }
         }
 
+        // ── Capabilities: what this build claims about itself ──
+        // Each face declares its own claim beside the code that owns it, and
+        // the ledger is filled from those declarations — there is no list here
+        // to fall out of step, and a face that stops declaring stops being
+        // claimed. The verdicts are published as an observable (a scrape-time
+        // read of the ledger), so they leave with this process like every other
+        // in-process reading rather than being written to the metric store by a
+        // producer that may already be gone.
+        let mut capabilities = crate::capability::CapabilityLedger::new();
+        // The spend projection is the first claim with a judge: the loop's own
+        // liveness cannot tell a working fold from one that ticks and cannot
+        // write, and a frozen projection reports last month's spend as this
+        // hour's. Declared even when there is no store — a deployment that lost
+        // its database must still be told the projection is not current, and a
+        // claim that vanishes with its input is a claim nobody can read.
+        let claim: Arc<dyn crate::capability::Capability> = Arc::new(
+            crate::spend_verdict::SpendVerdictFreshness::new(self.verdict_store.clone()),
+        );
+        if let Err(e) = capabilities.declare(claim) {
+            warn!(error = %e, "capability not declared; nothing will judge it");
+        }
+        let capabilities = Arc::new(capabilities);
+        ctx.publish_observable(capabilities.clone());
+        info!(declared = capabilities.len(), "capability ledger published");
+        self.capabilities = Some(capabilities);
+
         self.initialized = true;
         Ok(())
     }
@@ -713,6 +744,25 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
                 .map(|s| (*s).clone())
                 .unwrap_or_default();
             drop(crate::spend_verdict::spawn(store, shutdown));
+        }
+
+        // ── Capability judgements ──
+        // One supervised loop per claim, each on its own cadence: the cadence
+        // belongs to the judgement (an hourly fact is not worth asking about
+        // every minute), and a claim whose loop dies reads as a dead loop under
+        // its own name instead of as a verdict that simply stopped moving.
+        if let Some(ref capabilities) = self.capabilities {
+            if !capabilities.is_empty() {
+                let shutdown = ctx
+                    .consume::<cog_core::ShutdownSignal>()
+                    .map(|s| (*s).clone())
+                    .unwrap_or_default();
+                capabilities.start_all(shutdown);
+                info!(
+                    judgments = capabilities.len(),
+                    "capability judgements started"
+                );
+            }
         }
 
         // ── Data directory footprint ──
