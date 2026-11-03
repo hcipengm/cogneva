@@ -9554,12 +9554,9 @@ fn parse_undeliver_args(args: &[String]) -> Result<UndeliverRequest, String> {
 /// 轮询上，而不是与循环并发地 apply 一遍。返回值只报告「钉写成了」，是否已经落
 /// 到目标版本由循环的日志与心跳回答。
 pub async fn run_undeliver_cli() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // 订阅者由装配层在派发前装（`cogneva` 的 main.rs）：本 crate 只许依赖
+    // cog-core，够不到 cog-observability，而这一行日志要活过 Job 本身，
+    // 靠的正是那边装上的 Loki 镜像。
     let args: Vec<String> = std::env::args().skip(2).collect();
     let request = parse_undeliver_args(&args)?;
     let cfg = crate::MainlineDeployerConfig::load()?;

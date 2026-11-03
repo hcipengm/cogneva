@@ -5979,14 +5979,9 @@ impl RollbackVerdict {
 /// 内置默认四条（Job 不挂 configmap，与部署侧配置默认值同源）；回滚目标
 /// 由 Job 启动时快照各部署当前镜像得到，不通过参数传入。
 pub async fn run_rollout_cli() -> Result<(), Box<dyn std::error::Error>> {
-    // Job Pod 直接调这个子命令，不经 run_app；不初始化订阅者的话滚动/回滚
-    // 日志全部不落，Job 失败时 kubectl logs 是空的，无法诊断。
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // 订阅者由装配层在派发前装（`cogneva` 的 main.rs）：本 crate 只许依赖
+    // cog-core，够不到 cog-observability，而这一行日志要活过 Job 本身，
+    // 靠的正是那边装上的 Loki 镜像。
     let args: Vec<String> = std::env::args().skip(2).collect();
     let parsed = parse_rollout_args(&args)?;
     let cfg = MainlineDeployerConfig::default();

@@ -1524,7 +1524,6 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "tracing-subscriber",
  "urlencoding",
  "uuid",
  "walkdir",
@@ -1839,7 +1838,6 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 

@@ -587,13 +587,9 @@ async fn documents_rollback_handler(
 /// [`executor_port_from_env`]: a missing or unusable value falls back to
 /// [`DEFAULT_EXECUTOR_PORT`], the port the executor's Service targets.
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    // 独立子命令不经 run_app，需自行初始化日志，否则请求审计行不落地。
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // 订阅者由装配层在派发前装（`cogneva` 的 main.rs）：本 crate 只许依赖
+    // cog-core，够不到 cog-observability，而这一行日志要活过 Job 本身，
+    // 靠的正是那边装上的 Loki 镜像。
     let port = executor_port_from_env();
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
 

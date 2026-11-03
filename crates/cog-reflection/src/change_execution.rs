@@ -708,15 +708,9 @@ fn report_termination_message(text: &str) {
 /// 参数只有两个文件路径：请求从哪读、结果往哪写。世界本身在请求里，命令行不重复
 /// 声明它——两处声明同一件事，就一定有一处会先过期。
 pub async fn run_execute_change_cli() -> Result<(), Box<dyn std::error::Error>> {
-    // 这个进程不经 run_app，不初始化订阅者的话日志全部不落，Job 失败时
-    // kubectl logs 是空的，无法诊断。
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    // 订阅者由装配层在派发前装（`cogneva` 的 main.rs）：本 crate 只许依赖
+    // cog-core，够不到 cog-observability，而这一行日志要活过 Job 本身，
+    // 靠的正是那边装上的 Loki 镜像。
     let args: Vec<String> = std::env::args().skip(2).collect();
     let mut request_path: Option<String> = None;
     let mut outcome_path: Option<String> = None;

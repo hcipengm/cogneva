@@ -17,7 +17,6 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 async-trait = "0.1"
 # The build gate is a set of flock'd files under `libc`; it moved here from
 # cog-core, and this is the crate that now needs the syscalls.
