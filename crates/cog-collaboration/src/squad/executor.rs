@@ -1079,6 +1079,16 @@ fn build_contributions_from_verdict(
 
     let evaluation = extract_evaluation(&snapshot);
     let learnings = match unrecoverable_reason.as_deref() {
+        // 环境拒绝不是对这份工作的判决：上游断供、被限速、确定性环境失败说的
+        // 都是"这次调用没到达上游"，同一个断言已经在模式选择器上成立（那一轮
+        // 不算这个模式的试验）。学习层若照写一条 Correction，断供期间就变成
+        // 每一轮落一条一模一样的条目，内容还是整段上游错误正文——而每一次复发
+        // 匹配都要把整个命名空间读进内存、逐条嵌入一遍。实测 2026-11-03 的
+        // 读数：reflection 命名空间 9860 条里 4735 条是这类，
+        // 实测占掉该命名空间 202 MB 中的 190 MB。
+        // 真正的记录是下面的 ErrorEntry：它说明这次没跑成，不该冒充一条关于
+        // 工作的经验。
+        Some(reason) if !reason_speaks_of_the_mode(Some(reason)) => Vec::new(),
         // 终止原因是这一轮真正的结论，最后一条迭代的反馈只是过程。用过程
         // 当摘要会把死因写错：预算耗尽被记成"生成器没有产出"，于是整条
         // 自省链路照着错误的方向找病根。
@@ -1177,6 +1187,30 @@ fn extract_evaluation(
     serde_json::from_value(raw.clone()).ok()
 }
 
+/// 一条学习的 details 最多保留这么多字符。
+///
+/// 终止原因走的是上游的错误正文：实测一条 `upstream_unavailable` 原因带 84 KB
+/// 的 HTTP 响应体，同一条记忆的 details 就照抄这个长度。细节是给复发匹配和读的
+/// 人看的，超出这个长度的部分既读不动，又让每次全量读取按行数乘上去。
+// cap: bound — 细节是给人读的，超出这个长度的部分既读不动，又让每次全量读取按行数乘上去
+pub const LEARNING_DETAILS_CHARS: usize = 4096;
+
+/// 把细节截到 [`LEARNING_DETAILS_CHARS`]，并在截断处写明留了多少、原本多少。
+///
+/// 静默截断会让"正文就到这里"和"正文被切掉"读起来一样，而这两件事对读的人是
+/// 不同的信息。
+fn bounded_details(details: String) -> String {
+    let total = details.chars().count();
+    if total <= LEARNING_DETAILS_CHARS {
+        return details;
+    }
+    let mut out: String = details.chars().take(LEARNING_DETAILS_CHARS).collect();
+    out.push_str(&format!(
+        "\n…[kept {LEARNING_DETAILS_CHARS} of {total} characters]"
+    ));
+    out
+}
+
 /// 非 Pass 判定 → 一条 Correction 学习：摘要取反馈，细节带全部评分细则，
 /// 让复发匹配能按内容聚合同类失败。Pass 没有需要纠正的东西，不产出学习。
 fn learnings_from_evaluation(
@@ -1207,10 +1241,10 @@ fn learnings_from_evaluation(
         priority,
         cog_core::Area::Backend,
         evaluation.feedback.chars().take(200).collect::<String>(),
-        format!(
+        bounded_details(format!(
             "{:?}:{}{}",
             evaluation.verdict, evaluation.feedback, criteria_detail
-        ),
+        )),
         &evaluation.feedback,
         cog_core::LearningSource::SelfReview,
     );
@@ -1242,8 +1276,8 @@ fn learning_from_termination(
         cog_core::Priority::High,
         cog_core::Area::Backend,
         reason.chars().take(200).collect::<String>(),
-        format!("{reason}{context_detail}"),
-        reason,
+        bounded_details(format!("{reason}{context_detail}")),
+        bounded_details(reason.to_string()),
         cog_core::LearningSource::SelfReview,
     );
     learning.tags.push("squad-reflection".into());
@@ -1490,6 +1524,92 @@ mod tests {
             "unrecoverable verdict must yield an error entry"
         );
         assert_eq!(generator.errors[0].error_message, "stagnation");
+    }
+
+    /// 上游断供那一轮不产出学习，只留下说明"这次没跑成"的 ErrorEntry。
+    ///
+    /// 这条断言与模式选择器上那条是同一条：环境拒绝不是对模式的判决。它落在
+    /// 学习层之前是漏的——断供期间每一轮都写一条内容相同、正文是整段上游错误的
+    /// Correction，记忆层因此变成一份断供日志，而每次复发匹配都要把它整个读进
+    /// 内存并嵌入一遍。
+    #[test]
+    fn an_environment_refusal_writes_no_learning() {
+        use cog_core::contract::outcome::UPSTREAM_UNAVAILABLE_PREFIX;
+
+        let verdict = RalphVerdict::Unrecoverable {
+            reason: format!(
+                "{UPSTREAM_UNAVAILABLE_PREFIX}: environment_error: LLM upstream refused \
+                 (server_error): API error (HTTP 429)"
+            ),
+            iterations: 1,
+            history: vec![],
+        };
+        let contributions = build_contributions_from_verdict(&verdict, "squad-r");
+        let generator = contributions
+            .iter()
+            .find(|c| c.role == "generator")
+            .expect("generator contribution");
+        assert!(
+            generator.learnings.is_empty(),
+            "an upstream refusal says nothing about the work: {:?}",
+            generator
+                .learnings
+                .iter()
+                .map(|l| l.summary.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            generator.errors.len(),
+            1,
+            "the round still failed, and the error entry is what says so"
+        );
+
+        // 这一条不该靠"环境失败一律不写"通过：这个模式自己的失败照旧要落一条。
+        let about_the_mode = RalphVerdict::Unrecoverable {
+            reason: "evaluator: criteria unmet".into(),
+            iterations: 2,
+            history: vec![],
+        };
+        let contributions = build_contributions_from_verdict(&about_the_mode, "squad-r");
+        let generator = contributions
+            .iter()
+            .find(|c| c.role == "generator")
+            .expect("generator contribution");
+        assert_eq!(
+            generator.learnings.len(),
+            1,
+            "a failure that is the mode's own still becomes a learning"
+        );
+    }
+
+    /// 终止原因再长，写进记忆的那条也有界，并且截断处说明被切掉了。
+    #[test]
+    fn a_huge_reason_is_bounded_before_it_reaches_memory() {
+        let body = "x".repeat(200_000);
+        let verdict = RalphVerdict::Unrecoverable {
+            reason: format!("evaluator: criteria unmet: {body}"),
+            iterations: 1,
+            history: vec![],
+        };
+        let contributions = build_contributions_from_verdict(&verdict, "squad-b");
+        let generator = contributions
+            .iter()
+            .find(|c| c.role == "generator")
+            .expect("generator contribution");
+        let learning = &generator.learnings[0];
+        assert!(
+            learning.details.chars().count() <= LEARNING_DETAILS_CHARS + 100,
+            "details must stay bounded, got {} characters",
+            learning.details.chars().count()
+        );
+        assert!(
+            learning.details.contains("characters]"),
+            "a cut must say it was cut"
+        );
+        assert!(
+            learning.details.starts_with("evaluator: criteria unmet"),
+            "the head is the part worth keeping"
+        );
     }
 
     #[test]
