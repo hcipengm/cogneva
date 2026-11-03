@@ -173,6 +173,24 @@ pub trait CodePlatformProvider: Send + Sync {
         Ok(None)
     }
 
+    /// The newest run of one named workflow on a branch.
+    ///
+    /// [`Self::latest_branch_ci_run`] answers "has the branch moved on", which
+    /// is the question when deciding whether to *file* a fix and the wrong one
+    /// when deciding whether to *close* it: a green run of some other workflow
+    /// says nothing about the one that failed, so settling on that reading
+    /// would cancel a real compile failure on the strength of a docs build.
+    ///
+    /// Default: unsupported — providers return `None`, and a caller that asked
+    /// to settle a row leaves it open.
+    async fn latest_workflow_ci_run(
+        &self,
+        _branch: &str,
+        _workflow: &str,
+    ) -> Result<Option<CiRunSummary>> {
+        Ok(None)
+    }
+
     /// Combined CI verdict for one commit on the base branch: `Some(true)`
     /// when every reported run completed green, `Some(false)` when at least
     /// one did not, `None` while runs are pending or nothing has reported yet.

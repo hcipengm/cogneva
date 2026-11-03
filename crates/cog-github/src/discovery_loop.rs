@@ -21,7 +21,7 @@ use crate::conversation::{ConversationState, IssueConversation};
 use crate::discovery::IssueDiscovery;
 use crate::error::{CogGitHubError, Result};
 use crate::outcome_recorder::OutcomeRecorder;
-use crate::provider::{CiFailureEvent, CodePlatformProvider, PlatformIssue};
+use crate::provider::{CiFailureEvent, CiRunSummary, CodePlatformProvider, PlatformIssue};
 use crate::triage::{IssueTriage, TriageDecision};
 
 /// 发现循环在共用库上争的那行租约。按工作命名而不是按循环命名：两个平台轮询是同一
@@ -1082,6 +1082,20 @@ impl GitHubDiscoveryLoop {
 
     /// Run one discovery round. Returns the number of issues scanned.
     pub async fn run_once(&mut self) -> Result<usize> {
+        // 结掉前提已经消失的 CI 修复单。放在池暂停的早退之前，是因为它读的是
+        // 平台上的 CI 结论、不是生成——而池停住的那一刻，正是队列只进不出、
+        // 这种单开始堆积的时候。
+        if let Some(orch) = self.orchestrator.clone() {
+            let settled = self.settle_superseded_ci_fixes(&orch).await;
+            if settled.closed > 0 || settled.failed > 0 {
+                tracing::info!(
+                    closed = settled.closed,
+                    failed = settled.failed,
+                    remaining = settled.remaining,
+                    "closed CI fixes whose failure is already gone"
+                );
+            }
+        }
         // Pool down: every interesting path below is LLM-dependent (triage
         // assessment, cross-validation, fix submission). Skip the round
         // instead of paying a doomed attempt chain; the guard clears itself
@@ -2467,6 +2481,30 @@ pub(crate) struct SettledCriteria {
     pub(crate) remaining: usize,
 }
 
+/// One pass of closing CI fixes whose failure the branch has left behind.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettledCiFixes {
+    pub(crate) closed: usize,
+    pub(crate) failed: usize,
+    /// CI repair rows still open after this pass.
+    pub(crate) remaining: usize,
+}
+
+/// How many rows one pass may close. A backlog of dead rows costs one GitHub
+/// read per branch and workflow, so the bound is on the burst, not on the work:
+/// the next round picks up where this one stopped.
+const CI_SETTLE_BATCH: usize = 40;
+
+/// Is the run this row was filed for already behind a green one?
+///
+/// Both halves are load-bearing. A green run older than the failure says
+/// nothing — the branch was green, then broke. And a run of another workflow
+/// says nothing either; that is why the caller asks per workflow rather than
+/// for the branch's newest run.
+fn ci_fix_is_superseded(failed_run_id: u64, newest: &CiRunSummary) -> bool {
+    newest.conclusion == "success" && newest.run_id > failed_run_id
+}
+
 /// The criterion a row filed by this loop would carry today, rebuilt from the
 /// payload it kept.
 ///
@@ -2575,6 +2613,104 @@ impl GitHubDiscoveryLoop {
                 }
             }
         }
+        settled
+    }
+
+    /// 结掉那些失败已经被别人修掉的 CI 修复单。
+    ///
+    /// 一张修复单点名的是一条 run。提交时的新鲜度门只挡住「为一个已经过去的分支
+    /// 再开一张」，对已经开出去的单什么也没说，而修好它的往往不是这张单的执行者：
+    /// 分支后来一次跑绿了，却没有谁会去认领一件已经做完的事。实测 2026-11-04
+    /// 队列里躺着十张 `platform_ci_fix`，run 从九月到前一天，点名的每一个 rev
+    /// 都已经是绿色 main 的祖先。
+    ///
+    /// 判据只能向前看：失败那条 rev 自己的 check 永远是红的，所以问的不是它，
+    /// 而是「同一个 workflow 在这条分支上最新一次跑，绿没绿、是不是在这次失败
+    /// 之后」。按 workflow 问而不按分支上最新的一次 run 问，是因为别的 workflow
+    /// 跑绿不能替这条背书——那样一次文档构建成功就会结掉一次真的编译失败。
+    ///
+    /// 有归属的行不结：那是某个 unit 手上的活，该由它自己关。这里收的是既没人
+    /// 认领、前提又已经不在的那些。
+    pub(crate) async fn settle_superseded_ci_fixes(
+        &self,
+        orch: &Arc<dyn OrchestratorControl>,
+    ) -> SettledCiFixes {
+        let mut settled = SettledCiFixes::default();
+        let candidates: Vec<Task> = orch
+            .get_all_tasks()
+            .await
+            .into_iter()
+            .filter(
+                |row| matches!(&row.task_type, TaskType::Custom(kind) if kind == "platform_ci_fix"),
+            )
+            .filter(|row| matches!(row.status, TaskStatus::Pending | TaskStatus::Scheduled))
+            .filter(|row| row.owner_unit.is_none())
+            .collect();
+        if candidates.is_empty() {
+            return settled;
+        }
+        // 一问一分支一流水线：同一批死单几乎都压在 main 的同一个 workflow 上，
+        // 逐张去问就是自己把自己问进限流。
+        let mut asked: HashMap<(String, String), Option<CiRunSummary>> = HashMap::new();
+        for row in candidates.iter().take(CI_SETTLE_BATCH) {
+            let (Some(branch), Some(workflow), Some(run_id)) = (
+                row.input.get("head_branch").and_then(|v| v.as_str()),
+                row.input.get("workflow_name").and_then(|v| v.as_str()),
+                row.input.get("run_id").and_then(|v| v.as_u64()),
+            ) else {
+                // 改道单（落地被回滚后开的那张）按变更点名、不点名 run，
+                // 没有可以比对的绿跑，留给它自己的判据去关。
+                continue;
+            };
+            let key = (branch.to_string(), workflow.to_string());
+            if !asked.contains_key(&key) {
+                let answer = match self.provider.latest_workflow_ci_run(&key.0, &key.1).await {
+                    Ok(answer) => answer,
+                    Err(e) => {
+                        tracing::warn!(
+                            branch = %key.0,
+                            workflow = %key.1,
+                            error = %e,
+                            "cannot read the workflow's newest run; the CI fix rows on it stay open"
+                        );
+                        None
+                    }
+                };
+                asked.insert(key.clone(), answer);
+            }
+            let Some(newest) = asked.get(&key).and_then(|answer| answer.as_ref()) else {
+                continue;
+            };
+            if !ci_fix_is_superseded(run_id, newest) {
+                continue;
+            }
+            let reason = format!(
+                "分支 {branch} 上流水线「{workflow}」的最新一次运行 run {}（rev {}）判绿，\
+                 晚于这张单点名的 run {run_id}：它要修的那次失败已经不在了，判据由别人\
+                 的那次修复满足",
+                newest.run_id,
+                newest.head_sha.chars().take(8).collect::<String>(),
+            );
+            match orch.cancel_task_with_reason(&row.id, reason.clone()).await {
+                Ok(_) => {
+                    settled.closed += 1;
+                    tracing::info!(
+                        task = %row.id,
+                        green_run = newest.run_id,
+                        "settled a CI fix whose failure is already gone"
+                    );
+                }
+                Err(e) => {
+                    settled.failed += 1;
+                    tracing::warn!(
+                        task = %row.id,
+                        error = %e,
+                        "a superseded CI fix could not be closed and stays in the queue"
+                    );
+                }
+            }
+        }
+        settled.remaining = candidates.len().saturating_sub(settled.closed);
         settled
     }
 }
@@ -2809,6 +2945,7 @@ pub(crate) mod tests {
                     comments: Mutex::new(vec![]),
                     ci_logs: vec![],
                     ci_runs: Mutex::new(vec![]),
+                    ci_green_runs: Mutex::new(Vec::new()),
                     prs: vec![],
                     pr_details: HashMap::new(),
                 }),
@@ -2866,6 +3003,7 @@ pub(crate) mod tests {
                 comments: Mutex::new(vec![]),
                 ci_logs: vec![],
                 ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
                 prs: vec![],
                 pr_details: HashMap::new(),
             }),
@@ -2899,6 +3037,7 @@ pub(crate) mod tests {
                     comments: Mutex::new(vec![]),
                     ci_logs: vec![],
                     ci_runs: Mutex::new(vec![]),
+                    ci_green_runs: Mutex::new(Vec::new()),
                     prs: vec![],
                     pr_details: HashMap::new(),
                 }),
@@ -3000,6 +3139,7 @@ pub(crate) mod tests {
                 comments: Mutex::new(vec![]),
                 ci_logs: vec![],
                 ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
                 prs: vec![],
                 pr_details: HashMap::new(),
             }),
@@ -3034,6 +3174,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3109,6 +3250,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3160,6 +3302,10 @@ pub(crate) mod tests {
         comments: Mutex<Vec<(u64, String)>>,
         ci_logs: Vec<CiJobLog>,
         ci_runs: Mutex<Vec<CiFailureEvent>>,
+        /// (branch, workflow) → that workflow's newest run, as the settlement
+        /// pass reads it. Successes never appear in `ci_runs`, which only
+        /// carries failures, so they need their own cell.
+        ci_green_runs: Mutex<Vec<(String, String, CiRunSummary)>>,
         prs: Vec<PlatformPullRequest>,
         pr_details: HashMap<u64, PullRequestDetail>,
     }
@@ -3211,6 +3357,20 @@ pub(crate) mod tests {
         async fn list_recent_ci_failures(&self, _max: usize) -> Result<Vec<CiFailureEvent>> {
             Ok(self.ci_runs.lock().unwrap().clone())
         }
+        async fn latest_workflow_ci_run(
+            &self,
+            branch: &str,
+            workflow: &str,
+        ) -> Result<Option<CiRunSummary>> {
+            Ok(self
+                .ci_green_runs
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(b, w, _)| b == branch && w == workflow)
+                .map(|(_, _, run)| run.clone()))
+        }
     }
 
     pub(crate) struct MockOrchestrator {
@@ -3220,6 +3380,8 @@ pub(crate) mod tests {
         criteria: Mutex<Vec<(String, Vec<String>)>>,
         /// 图里已有的行，供回填那趟读与改。
         rows: Mutex<Vec<Task>>,
+        /// 按原因结掉的行，连同那句话——结案的理由只有行上有。
+        cancelled: Mutex<Vec<(String, String)>>,
         /// Verdict returned for a `platform_intent_assess` task. `None` reports
         /// the task as Failed so the fallback path can be exercised without
         /// waiting out the real poll timeout.
@@ -3245,6 +3407,7 @@ pub(crate) mod tests {
                 task_types: Mutex::new(vec![]),
                 criteria: Mutex::new(vec![]),
                 rows: Mutex::new(vec![]),
+                cancelled: Mutex::new(vec![]),
                 assess_verdict: Mutex::new(Some(serde_json::json!({
                     "decision": "fix",
                     "question": "",
@@ -3303,6 +3466,11 @@ pub(crate) mod tests {
         /// 问题：这一行交出去时有没有说清怎样算做完。
         pub(crate) fn filed_criteria(&self) -> Vec<(String, Vec<String>)> {
             self.criteria.lock().unwrap().clone()
+        }
+
+        /// 按原因结掉的行，按结案顺序。
+        pub(crate) fn cancelled(&self) -> Vec<(String, String)> {
+            self.cancelled.lock().unwrap().clone()
         }
 
         fn with_cv_verdict(self, verdict: serde_json::Value) -> Self {
@@ -3414,6 +3582,17 @@ pub(crate) mod tests {
         }
         async fn cancel_task(&self, _t: &str) -> cog_core::SFResult<Vec<String>> {
             unimplemented!()
+        }
+        async fn cancel_task_with_reason(
+            &self,
+            task_id: &str,
+            reason: String,
+        ) -> cog_core::SFResult<Vec<String>> {
+            self.cancelled
+                .lock()
+                .unwrap()
+                .push((task_id.to_string(), reason));
+            Ok(vec![])
         }
         async fn get_task(&self, id: &str) -> Option<Task> {
             // A row the test put in the graph is the row, before any of the
@@ -3535,6 +3714,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3576,6 +3756,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3634,6 +3815,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3704,6 +3886,7 @@ pub(crate) mod tests {
                 comments: Mutex::new(vec![]),
                 ci_logs: vec![],
                 ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
                 prs: vec![],
                 pr_details: HashMap::new(),
             });
@@ -3774,6 +3957,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3821,6 +4005,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3869,6 +4054,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3901,6 +4087,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3941,6 +4128,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -3988,6 +4176,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -4026,6 +4215,7 @@ pub(crate) mod tests {
                 log_tail: "error: clippy::question_mark".into(),
             }],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -4047,6 +4237,220 @@ pub(crate) mod tests {
         assert!(goals[0].contains("clippy::question_mark"));
     }
 
+    /// 一条修复单点名的失败已经被别人修掉时，这张单要被结掉。
+    ///
+    /// 修好它的从来不是这张单的执行者：分支后来自己跑绿了，而队列里那张单
+    /// 没有任何入口可以关——不结，它就永远 pending，读作「还有一件没修完的
+    /// CI 失败」，而那件失败早就不在了。
+    #[tokio::test]
+    async fn a_ci_fix_is_closed_when_its_workflow_later_ran_green() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(vec![(
+                "main".into(),
+                "CI".into(),
+                CiRunSummary {
+                    run_id: 2002,
+                    head_sha: "def5678".into(),
+                    conclusion: "success".into(),
+                },
+            )]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::holding(vec![ci_fix_row(
+            "gh-ci-run-1001",
+            "main",
+            "CI",
+            1001,
+            None,
+        )]));
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        // 走整轮而不是直接调那趟：只测那趟的话，把调用点摘掉测试照样绿——
+        // 而这件事的全部意义在于它每轮都发生。
+        loop_.run_once().await.unwrap();
+
+        let cancelled = orchestrator.cancelled();
+        assert_eq!(
+            cancelled.len(),
+            1,
+            "绿跑之后的修复单没有结掉：{cancelled:?}"
+        );
+        assert_eq!(cancelled[0].0, "gh-ci-run-1001");
+        assert!(
+            cancelled[0].1.contains("2002") && cancelled[0].1.contains("1001"),
+            "结案的理由要说清是哪一次绿跑替掉了它：{}",
+            cancelled[0].1
+        );
+    }
+
+    /// 绿的是别的流水线，不算数。
+    ///
+    /// 分支上最新的一次 run 可能是文档构建，它跑绿对一次编译失败一个字也没说。
+    /// 按分支问而不按 workflow 问，就会拿一次文档构建去结掉一次真的编译失败。
+    #[tokio::test]
+    async fn a_green_run_of_another_workflow_does_not_close_it() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(vec![(
+                "main".into(),
+                "Docs".into(),
+                CiRunSummary {
+                    run_id: 3003,
+                    head_sha: "def5678".into(),
+                    conclusion: "success".into(),
+                },
+            )]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::holding(vec![ci_fix_row(
+            "gh-ci-run-1001",
+            "main",
+            "CI",
+            1001,
+            None,
+        )]));
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        loop_.run_once().await.unwrap();
+
+        assert!(
+            orchestrator.cancelled().is_empty(),
+            "别的流水线跑绿被当成了这条的修复：{:?}",
+            orchestrator.cancelled()
+        );
+    }
+
+    /// 绿的那次如果在那次失败之前，什么也证明不了：分支先绿、后坏。
+    #[tokio::test]
+    async fn a_green_run_older_than_the_failure_does_not_close_it() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(vec![(
+                "main".into(),
+                "CI".into(),
+                CiRunSummary {
+                    run_id: 900,
+                    head_sha: "0001112".into(),
+                    conclusion: "success".into(),
+                },
+            )]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::holding(vec![ci_fix_row(
+            "gh-ci-run-1001",
+            "main",
+            "CI",
+            1001,
+            None,
+        )]));
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        loop_.run_once().await.unwrap();
+
+        assert!(
+            orchestrator.cancelled().is_empty(),
+            "失败之前那次绿被当成了修复：{:?}",
+            orchestrator.cancelled()
+        );
+    }
+
+    /// 已经归属到某个 unit 的单不结：那是它手上的活，收尾该由它自己写下。
+    #[tokio::test]
+    async fn a_ci_fix_claimed_by_a_unit_is_left_to_that_unit() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(vec![(
+                "main".into(),
+                "CI".into(),
+                CiRunSummary {
+                    run_id: 2002,
+                    head_sha: "def5678".into(),
+                    conclusion: "success".into(),
+                },
+            )]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::holding(vec![ci_fix_row(
+            "gh-ci-run-1001",
+            "main",
+            "CI",
+            1001,
+            Some("f5".into()),
+        )]));
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        loop_.run_once().await.unwrap();
+
+        assert!(
+            orchestrator.cancelled().is_empty(),
+            "有归属的行被平台自己结掉了：{:?}",
+            orchestrator.cancelled()
+        );
+    }
+
+    fn ci_fix_row(
+        id: &str,
+        branch: &str,
+        workflow: &str,
+        run_id: u64,
+        owner_unit: Option<String>,
+    ) -> Task {
+        let mut row = Task::new(
+            id,
+            TaskType::Custom("platform_ci_fix".into()),
+            serde_json::json!({
+                "goal": format!("Fix CI failure in workflow {workflow} run {run_id}"),
+                "run_id": run_id,
+                "workflow_name": workflow,
+                "head_sha": "abc123",
+                "head_branch": branch,
+            }),
+        );
+        row.owner_unit = owner_unit;
+        row
+    }
+
     /// 交出去的 CI 修复行要自带「怎样算修好」，且那句话得读平台。
     ///
     /// 修复任务自己结束于完成，只说明它产出了一段变更；失败的那个 run 会不会
@@ -4063,6 +4467,7 @@ pub(crate) mod tests {
                 log_tail: "error: clippy::question_mark".into(),
             }],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -4159,6 +4564,7 @@ pub(crate) mod tests {
                 comments: Mutex::new(vec![]),
                 ci_logs: vec![],
                 ci_runs: Mutex::new(vec![]),
+                ci_green_runs: Mutex::new(Vec::new()),
                 prs: vec![],
                 pr_details: HashMap::new(),
             }),
@@ -4239,6 +4645,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -4287,6 +4694,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -4312,6 +4720,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -4332,6 +4741,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![ci_event(4001), ci_event(4002)]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -4362,6 +4772,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![ci_event(5001)]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
         });
@@ -4487,6 +4898,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![cv_pr(31, "cogneva-bot", "Bob#b81c0e9f")],
             pr_details: HashMap::from([(31u64, cv_detail(31, head_sha))]),
         });
@@ -4564,6 +4976,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![self_pr, unlabeled],
             pr_details: HashMap::from([
                 (
@@ -4609,6 +5022,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![cv_pr(41, "cogneva-bot", "Bob#b81c0e9f")],
             pr_details: HashMap::from([(
                 41u64,
@@ -4660,6 +5074,7 @@ pub(crate) mod tests {
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
             ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![cv_pr(51, "cogneva-bot", "Bob#b81c0e9f")],
             pr_details: HashMap::from([(51u64, cv_detail(51, head_sha))]),
         });

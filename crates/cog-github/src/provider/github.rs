@@ -506,6 +506,37 @@ impl CodePlatformProvider for GitHubProvider {
         }))
     }
 
+    async fn latest_workflow_ci_run(
+        &self,
+        branch: &str,
+        workflow: &str,
+    ) -> Result<Option<CiRunSummary>> {
+        // A page, not one item: every push starts each workflow at once, so the
+        // run that names this workflow sits a few entries down the newest-first
+        // list. Fifty covers ten pushes' worth of fan-out, which is more than
+        // one poll interval can produce unless the branch is being built
+        // hard -- and a miss only means the row stays open one round longer.
+        let runs = self
+            .client
+            .workflows(&self.owner, &self.repo)
+            .list_all_runs()
+            .branch(branch)
+            .per_page(50)
+            .send()
+            .await
+            .map_err(|e| CogGitHubError::Provider(e.to_string()))?;
+
+        Ok(runs
+            .items
+            .into_iter()
+            .find(|r| r.name == workflow)
+            .map(|r| CiRunSummary {
+                run_id: r.id.into_inner(),
+                head_sha: r.head_sha,
+                conclusion: r.conclusion.unwrap_or_default(),
+            }))
+    }
+
     async fn ci_verdict_for_sha(&self, sha: &str) -> Result<Option<bool>> {
         let signals = self.check_run_signals(&self.owner, &self.repo, sha).await;
         let conclusions: Vec<String> = signals
