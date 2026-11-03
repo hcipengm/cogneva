@@ -173,6 +173,22 @@ struct AdmissionBound {
     /// not evidence about the upstreams -- `evidenced_recovery_unix` is that --
     /// so a reader must not present it as when the window reopens.
     retry_at_unix: i64,
+    /// When an upstream itself said its quota returns, unix seconds; `0` when
+    /// none named one.
+    ///
+    /// Carried beside `retry_at_unix` and never folded into it, because the two
+    /// are different claims and the difference is the whole length of an
+    /// outage. The cadence is this platform's own "try again then"; the evidence
+    /// is the seller's statement about its own quota. A hold that publishes only
+    /// the cadence reads as a hiccup that will clear in seconds, and that is how
+    /// a spent thirty-day quota was read on 2026-11-03: every pass held with the
+    /// next look five seconds away while the upstream had named
+    /// 2026-11-04 16:00.
+    ///
+    /// Zero is not an instant at zero. A weekly window that has to run out
+    /// names no time, and inventing one would present this path's guess as the
+    /// seller's word.
+    evidenced_recovery_unix: i64,
 }
 
 /// The board's per-column WIP limits for this process, read once.
@@ -525,6 +541,18 @@ impl DagExecutorRuntime {
                                     self.config.ready_task_poll_interval_secs as i64
                                 )
                             ),
+                            // The two clocks a hold has: this loop looks again
+                            // at `next_look_unix`, the gateway probes at
+                            // `retry_at_unix`, and the upstream said its quota
+                            // returns at `evidenced_recovery_unix`. Only the
+                            // last one answers "when does this end"; printing
+                            // the first alone made a twenty-hour quota outage
+                            // read as a five-second poll that keeps failing.
+                            // Absent, not zero, when no upstream named a time.
+                            retry_at_unix = ?(bound.retry_at_unix > 0)
+                                .then_some(bound.retry_at_unix),
+                            evidenced_recovery_unix = ?(bound.evidenced_recovery_unix > 0)
+                                .then_some(bound.evidenced_recovery_unix),
                             // Which gate said zero, read off the admission this
                             // pass actually made -- the same value the held
                             // counter is labelled with, so the line and the
@@ -987,6 +1015,7 @@ impl DagExecutorRuntime {
             pool_size: status.pool_size,
             unavailable: status.unavailable,
             retry_at_unix: status.next_attempt_unix,
+            evidenced_recovery_unix: status.evidenced_recovery_unix,
         })
     }
 
@@ -1057,6 +1086,16 @@ impl DagExecutorRuntime {
             (
                 "retry_at_unix",
                 bound.map_or(0.0, |bound| bound.retry_at_unix as f64),
+            ),
+            // The other clock, and the one a reader waiting out a long outage
+            // actually needs: when an upstream said its own quota returns. It
+            // sits beside the cadence rather than replacing it because neither
+            // answers the other's question -- the cadence says when this
+            // platform looks again, this says when the seller promised
+            // capacity. `0` means nobody named a time, not a time of zero.
+            (
+                "recovery_at_unix",
+                bound.map_or(0.0, |bound| bound.evidenced_recovery_unix as f64),
             ),
             // The traffic face: whether this pass had anything to decide. An
             // output of zero with an input of zero says nothing about how the

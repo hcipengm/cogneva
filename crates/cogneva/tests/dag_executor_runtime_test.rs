@@ -677,6 +677,109 @@ async fn a_publisher_waits_for_the_instant_the_pool_named() {
     );
 }
 
+/// 停摆期间，账上要同时有「我们什么时候再问」和「上游说什么时候回来」两个时刻。
+///
+/// 只有前者的时候，一次月度配额耗尽读起来和一次五秒钟的轮询失败同形：日志里
+/// 每一拍都写着五秒后再看，而真正该等的那个日子在别处。2026-11-03 就是这样被
+/// 读错的——每一拍都写 `next_look_unix` 五秒后，上游其实已经说了
+/// 2026-11-04 16:00。这里判的是那份证据有没有进到准入读数里，以及没有上游说过
+/// 时刻时它写成 0 而不是沿用上一拍的数。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hold_publishes_the_instant_the_upstream_named_apart_from_our_own_retry() {
+    use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+
+    /// 池自报不可用；`next_attempt_unix` 一直留在过去，所以每一拍都真的判一遍
+    /// （退避只认未来的时刻），而 `evidenced_recovery_unix` 是上游自己说的那个
+    /// 日子，只由开关翻动。
+    struct ScriptedPool {
+        unavailable: Arc<AtomicBool>,
+        recovery_unix: Arc<AtomicI64>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmPoolStatusSource for ScriptedPool {
+        async fn status(&self) -> Option<cog_core::LlmPoolStatus> {
+            Some(cog_core::LlmPoolStatus {
+                unavailable: self.unavailable.load(Ordering::Relaxed),
+                next_attempt_unix: 0,
+                evidenced_recovery_unix: self.recovery_unix.load(Ordering::Relaxed),
+                pool_size: 1,
+                ..Default::default()
+            })
+        }
+    }
+
+    /// 一个 `kind` 在准入读数里的最新值，`None` 表示这一拍没写它。
+    async fn cell(metrics: &cog_test_support::MemoryMetricsBackend, kind: &str) -> Option<f64> {
+        let now = chrono::Utc::now();
+        metrics
+            .query_gauge_range(
+                cog_core::metric_names::READY_ADMISSION_READINGS.as_str(),
+                now - chrono::Duration::hours(1),
+                now + chrono::Duration::hours(1),
+            )
+            .await
+            .expect("the in-memory board answers")
+            .into_iter()
+            .filter(|sample| {
+                sample
+                    .labels
+                    .get(cog_orchestrator::LABEL_KIND)
+                    .is_some_and(|value| value == kind)
+            })
+            .max_by_key(|sample| sample.timestamp)
+            .map(|sample| sample.value)
+    }
+
+    let backend = MemoryMessageBackend::new();
+    let runtime = DagExecutorRuntime::new_with_backend(
+        DagExecutorConfig {
+            redis_url: "redis://localhost".into(),
+            workspace_id: "ws-recovery".into(),
+            consumer_group: "cg-recovery".into(),
+            max_retries: 3,
+            ..DagExecutorConfig::default()
+        },
+        backend.clone(),
+    );
+    let metrics = Arc::new(cog_test_support::MemoryMetricsBackend::new());
+    runtime.orchestrator().attach_metrics(metrics.clone());
+
+    let unavailable = Arc::new(AtomicBool::new(true));
+    let recovery_unix = Arc::new(AtomicI64::new(1_793_807_999));
+    runtime.attach_pool_status_source(Arc::new(ScriptedPool {
+        unavailable: unavailable.clone(),
+        recovery_unix: recovery_unix.clone(),
+    }));
+    runtime
+        .submit_goal("recovery-goal", vec![make_test_task("recovery-task")])
+        .await
+        .unwrap();
+
+    runtime.publish_ready_tasks().await.unwrap();
+    assert_eq!(
+        cell(&metrics, "recovery_at_unix").await,
+        Some(1_793_807_999.0),
+        "上游说了它的额度什么时候回来，这一格却没写进去：读者只剩我们自己那个五秒的轮询间隔"
+    );
+    assert_eq!(
+        cell(&metrics, "retry_at_unix").await,
+        Some(0.0),
+        "两个时刻混成了一个：这一次没有待探测的时刻，而它不该被上游那个日子填上"
+    );
+
+    // 池子回来、上游也不再说明时刻：这一格要写回 0。仪表不写就留着上一拍的值，
+    // 而留下的那个值在账面上与「上游刚说过」同形。
+    unavailable.store(false, Ordering::Relaxed);
+    recovery_unix.store(0, Ordering::Relaxed);
+    runtime.publish_ready_tasks().await.unwrap();
+    assert_eq!(
+        cell(&metrics, "recovery_at_unix").await,
+        Some(0.0),
+        "没有上游报时刻的这一拍要写 0，否则上一拍那个日子会一直挂在账上"
+    );
+}
+
 async fn count_status(runtime: &DagExecutorRuntime, status: TaskStatus) -> usize {
     runtime
         .orchestrator()

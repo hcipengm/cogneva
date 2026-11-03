@@ -1459,7 +1459,13 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          deferral with a next decision rather than a silent freeze -- the held \
          tasks are not dropped, they stay ready and ask again on the next \
          pass, and this instant is our own retry cadence, not the upstream's \
-         promise, so it must not be read as when the window reopens). \
+         promise, so it must not be read as when the window reopens), and \
+         recovery_at_unix (when an upstream itself said its quota returns, 0 \
+         when none named a time: the one cell that answers how long a hold \
+         lasts, as opposed to retry_at_unix which answers when this platform \
+         will ask again. A spent thirty-day quota publishes both and they are \
+         days apart, so a reader given only the cadence sees an outage that \
+         clears in seconds). \
          window_jobs is written only \
          when bounded is \
          1: an unmeasured window is not a window that pays for zero jobs, and \
