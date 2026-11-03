@@ -1,0 +1,127 @@
+# `llm_pool_window_will_be_gone_before_it_resets` 的单测夹具，单独一份。
+#
+# 它不和 `cogneva-json-llm-pool.test.yaml` 放一起，理由与那条要七天分位样本的规则相同：
+# 这一条是**预测**，它的三个算子（窗口长度、窗口起点、额度斜坡）在一段健康窗口里都是常量，
+# 每个用例都要铺满一小时才喂得出一条斜率；塞进那一份就是把它的每个用例都拖长一倍。
+#
+# 判的是「会不会响」，而且**只在会响的地方响**：
+#   - 用例一：按窗均速烧（每分钟 99 个 token，恰是容量除以窗口），一小时后的外推落在容量
+#     之内 ⇒ 静。这一格是这条规则的**误报面**：把 1.1 的余量删掉、或者把容量除错，它就会亮。
+#   - 用例二：同样的窗口，烧速是窗均速的三倍多 ⇒ 响。这一格是它的**漏报面**：把外推换成
+#     现值比较（`spent > allowance`）也许还亮，但把 `predict_linear` 删掉改成直读，它同样亮；
+#     真正只有这一格能抓住的是「比较对象用错」——比如拿 allowance 当容量。
+#   - 用例三：与用例二同形，只有池子已经读成不可用 ⇒ 静。那已经是烧穿之后的状态，由
+#     `llm_pool_down_on_a_quota_cycle` 一族负责，这条不在别人的现场重复喊一遍。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-llm-burn.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: llm_pool_window_will_be_gone_before_it_resets
+
+evaluation_interval: 1m
+
+# 三个用例共用的一张窗口：七天（604800 秒），起点是 t=0，求值点是 t=60m，所以已过
+# 3600 秒、离复位还有 601200 秒。额度给 5952 —— 它是容量 999936 按 3600/604800 摊出来的
+# 那一格，于是表达式里「额度 × 长度 ÷ 已过秒数」正好还原出 999936，1.1 倍是 1099929.6。
+#
+#   窗均速   = 999936 / 604800 = 1.653 个 token/秒 = 99.2 个/分钟
+#   用例一   每分钟 +99 ⇒ 外推 5841 + 1.65 × 601200 ≈ 997821 < 1099930 ⇒ 静
+#   用例二   每分钟 +333 ⇒ 外推 19647 + 5.55 × 601200 ≈ 3357000 > 1099930 ⇒ 响
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_window_secs'
+        values: '604800x61'
+      - series: 'llm_pool_window_secs_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_window_start_unix'
+        values: '0x61'
+      - series: 'llm_pool_window_start_unix_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_allowance_tokens'
+        values: '5952x61'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_paced_upstreams'
+        values: '1x61'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_available'
+        values: '1x61'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_spent_tokens'
+        values: '0+99x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x61'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_window_will_be_gone_before_it_resets
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_window_secs'
+        values: '604800x61'
+      - series: 'llm_pool_window_secs_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_window_start_unix'
+        values: '0x61'
+      - series: 'llm_pool_window_start_unix_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_allowance_tokens'
+        values: '5952x61'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_paced_upstreams'
+        values: '1x61'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_available'
+        values: '1x61'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_spent_tokens'
+        values: '0+333x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x61'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_window_will_be_gone_before_it_resets
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+
+  - interval: 1m
+    input_series:
+      - series: 'llm_pool_window_secs'
+        values: '604800x61'
+      - series: 'llm_pool_window_secs_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_window_start_unix'
+        values: '0x61'
+      - series: 'llm_pool_window_start_unix_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_allowance_tokens'
+        values: '5952x61'
+      - series: 'llm_pool_allowance_tokens_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_paced_upstreams'
+        values: '1x61'
+      - series: 'llm_pool_paced_upstreams_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_available'
+        values: '0x61'
+      - series: 'llm_pool_available_observed_timestamp_seconds'
+        values: '3500x61'
+      - series: 'llm_pool_spent_tokens'
+        values: '0+333x60'
+      - series: 'llm_pool_spent_tokens_observed_timestamp_seconds'
+        values: '3500x61'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: llm_pool_window_will_be_gone_before_it_resets
+        exp_alerts: []

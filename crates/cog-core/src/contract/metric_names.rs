@@ -1391,6 +1391,20 @@ metric_names! {
     // `pool_size - paced` because the pool's size is on no metric face.
     LLM_POOL_UPSTREAM_WITH_RULER => "llm_pool_upstream_with_ruler",
     LLM_POOL_UPSTREAMS_WITHOUT_RULER => "llm_pool_upstreams_without_ruler",
+    // The window the pool is pacing against, as a length and a start. Both are
+    // already inside the snapshot the request path decides from; what they were
+    // missing from is the reading face, and without them a projection cannot be
+    // made at all: allowance and spend say how much is left, not how long is
+    // left to spend it in, and "this window will be gone before it resets" is a
+    // sentence about the second. Capacity is recovered from the same three
+    // readings (`allowance * window_secs / (now - window_start)`), so it is not
+    // published a second time and cannot drift from the ramp it divides.
+    //
+    // Both read 0 when the measured members are not all in one window, which is
+    // the same state the contract payload reports: a sum is still true over
+    // mixed windows, a length is not.
+    LLM_POOL_WINDOW_SECS => "llm_pool_window_secs",
+    LLM_POOL_WINDOW_START_UNIX => "llm_pool_window_start_unix",
     LLM_POOL_SIGNAL_CONNECTED => "llm_pool_signal_connected",
     // What the ledger says was spent since the start of the UTC day, and which
     // tick that sum came from. Two series because neither is a reading alone:

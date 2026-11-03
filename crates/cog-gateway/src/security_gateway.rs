@@ -1790,6 +1790,12 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     cog_core::metric_names::LLM_POOL_RESERVE_POPULATION,
     cog_core::metric_names::LLM_POOL_RESERVE_SINCE_UNIX,
     cog_core::metric_names::LLM_POOL_PACED_UPSTREAMS,
+    // 窗口的长度与起点。和额度那几条一样，它们在一段健康窗口里是常量：一条
+    // 七天的窗口只有复位那一下才动，起点要到下一圈才变。存储只在心跳上重写
+    // 一个不动的值，所以读它们的窗口必须宽过心跳，否则一个健康的写者会被读成
+    // 停了 —— 而停了的写者会让"复位前烧穿"那条判据悄悄变成空表达式。
+    cog_core::metric_names::LLM_POOL_WINDOW_SECS,
+    cog_core::metric_names::LLM_POOL_WINDOW_START_UNIX,
 ];
 
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
@@ -4884,6 +4890,25 @@ async fn publish_window_pace_gauges(state: &AppState, reading: &WindowPaceReadin
         state,
         cog_core::metric_names::LLM_POOL_PACED_UPSTREAMS,
         pace.measured_upstreams as f64,
+        &[],
+    )
+    .await;
+    // 窗口本身的两条：多长、从何时起。额度那几条说的都是"还剩多少"，没有
+    // 一条说"还剩多久"；而"按当前烧速，这窗会在复位前烧穿"问的是后一句。
+    // 两半都从这一拍的同一份快照里取，所以由它们推出的复位时刻与闸门判定的
+    // 时刻是同一个。混窗时契约面本来就不报窗口，这里跟着报 0：和仍然成立，
+    // 长度不成立。
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_WINDOW_SECS,
+        pace.window_secs as f64,
+        &[],
+    )
+    .await;
+    record_gauge(
+        state,
+        cog_core::metric_names::LLM_POOL_WINDOW_START_UNIX,
+        pace.window_start_unix as f64,
         &[],
     )
     .await;

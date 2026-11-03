@@ -26,7 +26,7 @@ spec:
       annotations:
         # 同主应用：这个 Pod 也挂 cogneva-json、也经 envFrom 取 cogneva-config，
         # 两份配置里任何一份变了它都得跟着重启，否则进程读到的仍是启动时那份。
-        checksum/config: 1f5fdca590bfb38390991a2f3d38c4ed588fa0cd85c60591aa098b72a8c46bc2
+        checksum/config: 928645d6218a7fcf5f30049ebd7afb75d92e830fc0b674ea10a45d6033a2c878
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution

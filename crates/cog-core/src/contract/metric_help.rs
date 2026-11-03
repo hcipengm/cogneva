@@ -2006,6 +2006,30 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          sum that has not succeeded, not a day nobody spent",
     ),
     (
+        "llm_pool_window_secs",
+        "How long the window the pace is computed against lasts, in seconds; \
+         zero when nothing is paced or when the measured members are not all in \
+         one window. It is the denominator of the ramp (the allowance grows \
+         from the window's start toward the measured capacity over this length) \
+         and, with llm_pool_window_start_unix, the only way to say how much of \
+         the window is left: the token gauges say how much allowance remains, \
+         not how long remains to spend it in. A projection of the window's \
+         final spend needs both halves of that sentence, which is why this pair \
+         is published even though neither is a budget reading on its own",
+    ),
+    (
+        "llm_pool_window_start_unix",
+        "When the window the pace is computed against started, as a Unix \
+         timestamp; zero when nothing is paced or when the measured members are \
+         not all in one window. With llm_pool_window_secs it gives the reset \
+         instant (start plus length) and the elapsed fraction (now minus start, \
+         over the length), and the measured capacity is recoverable from the \
+         same snapshot the request path decides on: allowance multiplied by the \
+         length and divided by the elapsed seconds. Publish the capacity \
+         separately and there would be two answers to one question, free to \
+         disagree with the ramp the gate is actually paced by",
+    ),
+    (
         "llm_pool_paced_upstreams",
         "How many upstreams the pace measured a window for this pass. Zero is \
          'nothing is paced' -- no ruler for any member, or the status could not \
