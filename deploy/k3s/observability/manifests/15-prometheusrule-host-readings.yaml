@@ -867,6 +867,27 @@ spec:
             summary: "任务面的发布者对不上"
             description: "同一批任务经两条路径发布（正本与投影），两边报出来的状态不一致。先跑 `bash scripts/host/cogneva-tasks-face-reading.sh`（不带参数）——它逐个发布者印一行，指出是谁跟谁对不上。修的是让两边读同一份正本，不是把差异抹平。"
 
+        # 「被拒形状 → 它守哪条原则」是**手写的两份表**：宿主提交门的 `PRINCIPLE_CHECKS`
+        # （bash）与平台变更账的 `SHAPE_PRINCIPLES`（rust）。一边改名、一边指向另一条原则时，
+        # 两份表各自看都完整——宿主按这条拦下提交，平台的账把这次拒绝记在另一条原则上，
+        # 而没有一条读数是不同意的。判词由宿主读数每拍比出来（`differs`，同一形状归不同
+        # 原则记在 `mismatched`，只有一侧有的记在 `host_only`／`platform_only`，三种修法
+        # 不同），这里只是给它一个会有人动手的读者。
+        #
+        # 为什么留半小时：两张表只在有人改的时候变，一次提交落下分歧就一直在，半小时
+        # 漏不掉真的不一致；而刚落地的一次改名会在下一拍就把它消掉，不必让提交者当天
+        # 收到一条只活了几分钟的红。
+        - alert: CognevaShapeParityDiffers
+          expr: max(cogneva_shape_parity_differs) == 1
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "变更管理"
+            severity: warning
+          annotations:
+            summary: "宿主与平台两张「被拒形状 → 原则」表有分歧"
+            description: "同一次拒绝在两边被记到不同的原则上，或者同一形状只有一侧有。跑 `bash scripts/host/cogneva-shape-parity-reading.sh`：`mismatched` 是两边归了不同原则的形状，`host_only`／`platform_only` 是只有一侧有的形状，`shapes` 是这一拍比了几个形状（分母——两份表都读窄时判词也是 0）。修的是把两份表改成一致：哪一份写错了就改哪一份，不要为了让读数变绿去删形状。"
+
         # 拒绝在挡，但没有任何免费重投：规则拦下了动作，却没有把它交回请求方。这是
         # 这一族里最贵的断点——拒绝本身是对的行为，缺的是拒绝之后那一步。
         - alert: CognevaRefusalRedispatchBroken

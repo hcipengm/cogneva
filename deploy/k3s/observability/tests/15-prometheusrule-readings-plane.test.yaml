@@ -354,6 +354,33 @@ tests:
         alertname: CognevaTasksPublishersDisagree
         exp_alerts: []
 
+  # 两张「被拒形状 → 原则」表对不上。`max()` 把抓取者的身份维去掉，所以这一格的标签
+  # 只剩规则自己的那三个——另两格（宿主读数那一族）证明的是同一个表达式，那一头也按同一
+  # 个形状写。
+  - name: 两张形状表有分歧会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_shape_parity_differs{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '1x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaShapeParityDiffers
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 变更管理
+
+  - name: 两张形状表这一刻对得上不会响
+    interval: 1m
+    input_series:
+      - series: 'cogneva_shape_parity_differs{instance="cogneva",job="cogneva-host-readings",node="cogneva"}'
+        values: '0x50'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: CognevaShapeParityDiffers
+        exp_alerts: []
+
   - name: 拒绝却没把动作交回去会响
     interval: 1m
     input_series:
