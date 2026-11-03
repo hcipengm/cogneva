@@ -29,5 +29,6 @@ pub use task::{
     task_result_stream, ActionPlannerMeta, ActionPlannerSource, DagMessage, EvolutionIntent,
     GoalClass, GoalClassSource, GoalMessage, GoalSource, Task, TaskDAG, TaskFilter, TaskKindRecord,
     TaskPayload, TaskPlan, TaskStatus, TaskStatusCounts, TaskType, EVOLUTION_MODE_GENERATE_CHANGE,
-    INPUT_EVOLUTION_MODE, INPUT_TASK_KIND, TASK_RESULT_STREAM_PREFIX, UNGROUPED_PROJECT,
+    INPUT_EVOLUTION_MODE, INPUT_PRINCIPLES, INPUT_TASK_KIND, TASK_RESULT_STREAM_PREFIX,
+    UNGROUPED_PROJECT,
 };

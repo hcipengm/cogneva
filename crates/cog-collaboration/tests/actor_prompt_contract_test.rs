@@ -516,3 +516,48 @@ async fn two_rounds_of_one_loop_share_the_request_byte_for_byte() {
          is not the defect this pins"
     );
 }
+
+/// 任务带来的原则要真的走到生成端的提示词里，而且落在稳定半边。
+///
+/// 稳定半边是可缓存的那一份：同一件任务重试时它逐字节相同。原则在这里而不是
+/// 在每轮变化的那半，是因为「这一次受哪几条约束」不随尝试变化——它在提交时就
+/// 定下了，重试只是又花一轮钱把它再说一遍。
+///
+/// 反过来的那半同样要紧：任务没带原则时，契约里不该出现这一块。空的块与没有
+/// 块在这里是同一个意思（这一次没有原则被递进来），但一个空数组摆在模型眼前
+/// 会被读成「这次不受任何约束」——那是一条它自己编出来的豁免。
+#[tokio::test]
+async fn principles_a_task_carries_reach_the_generators_stable_half() {
+    let plan = serde_json::json!({"summary": "s", "sub_tasks": []});
+    let reply = serde_json::json!({"content": "c", "artifacts": []});
+
+    let mut carrying = gate_task();
+    carrying.input[cog_core::INPUT_PRINCIPLES] = serde_json::json!([
+        {"slug": "feedback_a", "lead": "先给结论：动手前先说这件事现在是什么样"}
+    ]);
+    let with_agent = Recorder::new(reply.clone());
+    GeneratorActor::new(with_agent.clone())
+        .generate(&carrying, &plan, 1, PreviousAttempt::default(), None)
+        .await;
+
+    let shown = stable_half(with_agent.inputs()[0].clone());
+    assert!(
+        shown.contains("先给结论：动手前先说这件事现在是什么样"),
+        "原则没有走到提示词里：生成端仍然看不见任何一条项目原则。稳定半边是 {shown}"
+    );
+    assert!(
+        shown.contains("binding"),
+        "原则到了，但没有任何一句说它们是必须遵守的：模型读到的只是一份参考资料"
+    );
+
+    let without_agent = Recorder::new(reply);
+    GeneratorActor::new(without_agent.clone())
+        .generate(&gate_task(), &plan, 1, PreviousAttempt::default(), None)
+        .await;
+    let shown = stable_half(without_agent.inputs()[0].clone());
+    assert!(
+        !shown.contains("\"principles\""),
+        "任务没带原则，契约里却出现了这一块——空的块会被读成「这次不受任何约束」。\
+         稳定半边是 {shown}"
+    );
+}

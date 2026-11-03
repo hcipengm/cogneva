@@ -735,6 +735,17 @@ pub const EVOLUTION_MODE_GENERATE_CHANGE: &str = "generate_change";
 /// The `task.input` key that names which entry point submitted the task.
 pub const INPUT_TASK_KIND: &str = "task_kind";
 
+/// The `task.input` key that carries the principles this unit of work is held
+/// to, as the reading named them.
+///
+/// The producer fills it because the producer is the only one that knows which
+/// principles bear on this piece of work — the face it serves, the paths it will
+/// touch. The generator reads it and prints it; it does not select. A key rather
+/// than a sentence laid out at each call site, for the same reason as the two
+/// above: a caller that spells the word by hand and a reader that compares
+/// against a constant are two spellings that drift apart silently.
+pub const INPUT_PRINCIPLES: &str = "principles";
+
 impl Task {
     pub fn new(id: impl Into<String>, task_type: TaskType, input: serde_json::Value) -> Self {
         let now = Utc::now();

@@ -149,6 +149,18 @@ impl GeneratorActor {
             crate::actors::apply_prompt_skill(&mut contract, skill, self.output_schema.as_ref());
         }
 
+        // 项目自己的原则，随任务带进来。集群内的生成端此前看不见任何一条：事后
+        // 有形状门，事前只有这份手写的变更格式契约。这一次该看哪几条由提交方说了
+        // 算——只有它知道这条改动的面与要动哪些路径——所以这里不挑，只如实摆放；
+        // 任务没带就是不摆，不补一段泛泛的提醒（那种提醒读起来像原则，实际不指着
+        // 任何一条，也就没有一条会在它被违反时变红）。
+        //
+        // 进的是稳定半边：同一件任务的重试之间这一份逐字节相同，与变更格式契约
+        // 一样该落在可缓存的那一半里，而不是每一轮重新付一遍。
+        if let Some(block) = principles_block(&task.input) {
+            contract["principles"] = block;
+        }
+
         // Inject reference implementations if knowledge backend is wired.
         if let Some(ref k) = self.knowledge {
             let task_type = format!("{:?}", task.task_type);
@@ -440,6 +452,38 @@ fn apply_workspace_change(
 /// added the publishing half and never the reading half. `repo_contracts` is
 /// where those conventions are written down, because "the test suite runs" tells
 /// the writer that it will be judged and not what it will be judged against.
+/// 任务带来的原则，排成生成端读得懂的那一块；任务没带就是 `None`。
+///
+/// 一条都没有与没有带是两件事，读法却应该一样：空数组不是「这次不受任何原则
+/// 约束」，只是提交方没有东西可放。两种都返回 `None`，于是「契约里没有这一块」
+/// 永远只表示一件事——这一次没有原则被递进来。
+///
+/// 只认带 `statement` 或 `lead` 的行。一个只有 slug 的条目对模型是一串不认识
+/// 的标识符，摆进去只会让它以为自己看见了规则。
+fn principles_block(input: &serde_json::Value) -> Option<serde_json::Value> {
+    let rows: Vec<&serde_json::Value> = input
+        .get(cog_core::INPUT_PRINCIPLES)
+        .and_then(|v| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| {
+                    row.get("statement")
+                        .or_else(|| row.get("lead"))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.trim().is_empty())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if rows.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "binding": "These are this project's own recorded principles for the work you are about to do. They are binding: a change that violates one is refused by a gate that names it, and the refusal cites the principle rather than a style rule. Read every one of them before you write code, and treat a conflict between one of them and your own judgement as a reason to look again at the code, not at the principle.",
+        "rows": rows,
+    }))
+}
+
 fn change_generation_contract() -> serde_json::Value {
     serde_json::json!({
         "output_format": "unified_diff",
@@ -860,5 +904,48 @@ index 0000000..2222222\n--- /dev/null\n+++ b/prompts/notes.md\n@@ -0,0 +1,2 @@\n
             }],
         };
         assert!(artifact_files_to_exclude(&source_named).is_empty());
+    }
+
+    /// 带原则来的任务，原则真的排在这一块里；每一条都带着它自己那句话。
+    #[test]
+    fn principles_the_task_carries_are_laid_out_with_their_own_sentences() {
+        let block = principles_block(&serde_json::json!({
+            cog_core::INPUT_PRINCIPLES: [
+                {"slug": "feedback_a", "lead": "先给结论"},
+                {"slug": "feedback_b", "statement": "写不出门的记忆不新开文件"},
+            ]
+        }))
+        .expect("两条原则都带正文，应该有这一块");
+
+        let rows = block["rows"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["lead"], "先给结论");
+        assert_eq!(rows[1]["statement"], "写不出门的记忆不新开文件");
+        assert!(
+            block["binding"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("binding"),
+            "没有一句话说清它们是必须遵守的，模型读到的就只是一份参考资料"
+        );
+    }
+
+    /// 只有 slug 的条目对模型是一串不认识的标识符，摆进去等于让它以为自己
+    /// 看见了规则。一条都排不出来时整块不出现——「没有这一块」于是永远只表示
+    /// 一件事：这一次没有原则被递进来。
+    #[test]
+    fn a_row_with_no_sentence_is_not_a_principle_the_model_can_follow() {
+        for input in [
+            serde_json::json!({}),
+            serde_json::json!({ cog_core::INPUT_PRINCIPLES: [] }),
+            serde_json::json!({ cog_core::INPUT_PRINCIPLES: [{"slug": "feedback_a"}] }),
+            serde_json::json!({ cog_core::INPUT_PRINCIPLES: [{"slug": "x", "lead": "   "}] }),
+            serde_json::json!({ cog_core::INPUT_PRINCIPLES: "not a list" }),
+        ] {
+            assert!(
+                principles_block(&input).is_none(),
+                "这一份不该排出原则块：{input}"
+            );
+        }
     }
 }
