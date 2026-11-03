@@ -100,7 +100,7 @@ fn log_wired_variants(root: &Path) -> BTreeMap<String, String> {
                 .unwrap_or("")
                 .to_owned(),
             None => entry
-                .trim_end_matches(|c| matches!(c, ',' | ')' | '\n' | ' '))
+                .trim_end_matches([',', ')', '\n', ' '])
                 .trim()
                 .to_owned(),
         };

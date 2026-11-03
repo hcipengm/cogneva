@@ -3762,6 +3762,11 @@ mod tests {
             wait: Some(5578),
         };
         let mut runtime = stall_test_runtime("refused-typed");
+        // The replay guard is process-wide and keyed by the bytes of the request:
+        // two tests sending the same empty conversation are one request, and
+        // whichever of them was refused first would answer the other. A prompt of
+        // its own makes each test a different request.
+        runtime.context.add_message(Message::user("refused-typed"));
         let err = runtime
             .think_stream(&llm)
             .await
@@ -3791,6 +3796,13 @@ mod tests {
             wait: None,
         };
         let mut runtime = stall_test_runtime("refused-untyped");
+        // Same reason as the typed case above: without a prompt of its own this
+        // test would be the same request as any other empty conversation, and a
+        // refusal another test remembered first would be read as this call's
+        // type -- the exact defect this test exists to rule out.
+        runtime
+            .context
+            .add_message(Message::user("refused-untyped"));
         let err = runtime
             .think_stream(&llm)
             .await
@@ -4068,10 +4080,13 @@ mod tests {
                             timestamp: chrono::Utc::now(),
                         })
                         .await;
-                    let mut response = cog_core::ChatResponse::default();
-                    response.upstream_failure =
-                        Some(cog_core::contract::llm::UpstreamFailure::RateLimited);
-                    response.retry_after_secs = Some(600);
+                    let response = cog_core::ChatResponse {
+                        upstream_failure: Some(
+                            cog_core::contract::llm::UpstreamFailure::RateLimited,
+                        ),
+                        retry_after_secs: Some(600),
+                        ..Default::default()
+                    };
                     producer.end(response);
                 });
                 Ok(stream)
