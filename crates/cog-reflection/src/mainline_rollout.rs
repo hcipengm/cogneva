@@ -40,9 +40,9 @@ use crate::mainline_deployer::{
     bounded, carries_deployment, config_consumer_jsonpath, exit_code, failure_signature, field,
     is_admission_policy_denied, is_authorization_denied, is_cluster_unreachable,
     is_observation_tool_failure, namespace_docs, primary_message, render_docs, sample_fields,
-    split_docs, target_manifest_key, workload_kind, workload_kind_of_resource, CiNoVerdictReason,
-    ConfigConsumer, FailureClass, FailureLocus, MainlineDeployer, PodSample, RolloutTarget,
-    WaitingState, WorkloadKind, CLUSTER_UNREACHABLE_MARKER, FATAL_WAITING_REASONS,
+    split_docs, target_manifest_key, workload_kind, workload_kind_of_resource, CancelledCheck,
+    CiNoVerdictReason, ConfigConsumer, FailureClass, FailureLocus, MainlineDeployer, PodSample,
+    RolloutTarget, WaitingState, WorkloadKind, CLUSTER_UNREACHABLE_MARKER, FATAL_WAITING_REASONS,
     IMAGE_SOURCE_UNAVAILABLE_MARKER, OBSERVATION_TOOL_MARKER, ROLLOUT_EXIT_ENVIRONMENT,
     ROLLOUT_PRECHECK_STAGE, SUPPORT_CAUSE_MESSAGE_CHARS, SUPPORT_CAUSE_SEPARATOR, WORKLOAD_KINDS,
 };
@@ -150,6 +150,26 @@ pub(crate) fn ci_red_hold_reason(
         reason.push_str(&format!("; not answered yet: {}", owed.join("; ")));
     }
     reason
+}
+
+/// 判红的**全部**是被取消的检查，且这些取消已经站满了重跑所需的窗口。
+///
+/// 这一处没有部署器那份「第一次判它 fail」的账，只能拿平台自己写的取消时刻当起点：
+/// 一次取消站过一个窗口还没有被重跑取代，就是没人会再来回答的那一次。窗口之内照旧
+/// 扣着——重跑可能就在这一次；读不出取消时刻的那几条不算满窗，因为「说不出它站了
+/// 多久」不是「站了很久」。
+pub(crate) fn cancelled_only_and_past_the_window(
+    cancelled: &[CancelledCheck],
+    failed_len: usize,
+    now_unix: i64,
+) -> bool {
+    failed_len > 0
+        && cancelled.len() == failed_len
+        && cancelled.iter().all(|c| {
+            c.completed_unix.is_some_and(|t| {
+                now_unix.saturating_sub(t) >= MainlineDeployer::CANCELLED_WAIVER_WINDOW_SECS
+            })
+        })
 }
 
 /// 「还在跑」这一答到手之后，这一轮还该不该再问一次。
@@ -5010,8 +5030,12 @@ impl RolloutExecutor {
         // 真的读完并放行的上游。它与上面两列一起决定「问不到」该不该扣：扣住要的是
         // 「这一版没人核对过」，不是「每个平台都开过口」。
         let mut answered: Vec<String> = Vec::new();
+        // 判红但只由取消撑着的检查，且取消已经站满窗口：按没有结论处置，名字留在这里，
+        // 让「带着一次取消滚上去」这一件事在判词面上说得出来，而不是悄悄变绿。
+        let mut waived: Vec<String> = Vec::new();
+        let now_unix = chrono::Utc::now().timestamp();
         for up in &ask.upstreams {
-            let (verdict, reason, names, excluded, _cancelled, machine) =
+            let (verdict, reason, names, excluded, cancelled, machine) =
                 MainlineDeployer::platform_ci_verdict(&up.api_base, &up.repo, &ask.rev).await;
             if !machine.is_empty() {
                 // 这条红不判这一版。留一行话，否则「上游有检查判红却滚了」在事后
@@ -5041,6 +5065,32 @@ impl RolloutExecutor {
             }
             match verdict {
                 Some(false) => {
+                    // 判红的**全部**是被取消的检查时，这一版其实没有人回答过：取消说的
+                    // 是「这一问没有结论」。部署器那一层已经按同一个窗口处置过它（没有
+                    // 部署器那份状态的这一处，改用平台自己给的取消时刻判同一件事），
+                    // 这里再把它读成一次失败，就把已经放行的版本原样扣回来——主线于是
+                    // 卡在一个永远不会再有人回答的 rev 上，直到有人手工重跑。
+                    if cancelled_only_and_past_the_window(&cancelled, names.len(), now_unix) {
+                        info!(
+                            rev = %ask.rev,
+                            platform = %up.platform,
+                            cancelled = %cancelled
+                                .iter()
+                                .map(|c| c.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(","),
+                            window_secs = MainlineDeployer::CANCELLED_WAIVER_WINDOW_SECS,
+                            "every check that failed on this revision was cancelled, and the \
+                             cancellation outlived the window a rerun would have needed; it is not \
+                             a verdict on this tree, so this round is not held by it"
+                        );
+                        waived.extend(
+                            cancelled
+                                .iter()
+                                .map(|c| format!("{}:{}", up.platform, c.name)),
+                        );
+                        continue;
+                    }
                     failures += 1;
                     failed.extend(names.into_iter().map(|n| format!("{}:{n}", up.platform)));
                 }
@@ -5068,7 +5118,10 @@ impl RolloutExecutor {
             }
         }
         if failures > 0 {
-            let reason = ci_red_hold_reason(&ask.rev, &failed, &still_running, &not_asked);
+            let mut reason = ci_red_hold_reason(&ask.rev, &failed, &still_running, &not_asked);
+            if !waived.is_empty() {
+                reason.push_str(&format!("; waived as no evidence: {}", waived.join(",")));
+            }
             return Some((CiHoldKind::Red, reason));
         }
         if still_running.is_empty() && not_asked.is_empty() {

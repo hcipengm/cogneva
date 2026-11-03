@@ -2619,6 +2619,38 @@ enum PlatformReadFailure {
     UnusableBody,
 }
 
+/// 一条判这棵树的检查落在了 `cancelled`：它没有给出结论。
+///
+/// 三个字段各自喂给一条判据。名字让「为什么红」说得出来；`started` 区分「排到超时」
+/// 与「跑到一半」，前者永远不会自己给出结论；`completed_unix` 是取消落定的时刻，它让
+/// **第二扇门**（派 Job 之前那一处）不必另起一份账就问出同一个问题：这取消站了多久。
+/// 那一处没有部署器那份状态，只有平台自己给的这份时间戳。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CancelledCheck {
+    /// 检查名，**不带平台前缀**——前缀在需要的地方拼，拼早了同名检查会被读成两件事。
+    pub name: String,
+    /// 这次 run 有没有拿到过 runner（`started_at` 非空）。
+    pub started: bool,
+    /// 取消落定的 unix 秒。读不出时间就是 `None`：那不是「刚被取消」，是
+    /// **说不出它站了多久**，此时按窗口扣着，不拿读不到当证据。
+    pub completed_unix: Option<i64>,
+}
+
+impl CancelledCheck {
+    /// 把平台回的那一行变成这一条。时间读不出时留 `None`，不填一个假的现在。
+    fn from_run(name: &str, run: &serde_json::Value) -> Self {
+        Self {
+            name: name.to_string(),
+            started: run.get("started_at").and_then(|t| t.as_str()).is_some(),
+            completed_unix: run
+                .get("completed_at")
+                .and_then(|t| t.as_str())
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.timestamp()),
+        }
+    }
+}
+
 /// 一轮问下来没有结论时，**为什么**没有。
 ///
 /// `None` 在判据里是一个值，却有三个来源：被问的一方还没给结论、这条读的路没走通、
@@ -4011,7 +4043,7 @@ impl MainlineDeployer {
         Option<CiNoVerdictReason>,
         Vec<String>,
         Vec<(String, String)>,
-        Vec<(String, bool)>,
+        Vec<CancelledCheck>,
         Vec<String>,
     ) {
         let mut attempt = 0usize;
@@ -4083,7 +4115,7 @@ impl MainlineDeployer {
         Option<CiNoVerdictReason>,
         Vec<String>,
         Vec<(String, String)>,
-        Vec<(String, bool)>,
+        Vec<CancelledCheck>,
         Vec<String>,
     ) {
         let mut conclusions: Vec<String> = Vec::new();
@@ -4099,10 +4131,10 @@ impl MainlineDeployer {
         // 上层能把「扣满一个窗口仍然没有结论」与「上游真说了不通过」分开处置——两者在
         // `Some(false)` 这一面上同形，而处置相反。
         //
-        // 名字带着第二个字段：这次 run **有没有拿到过 runner**（`started_at` 非空）。
-        // 排队到超时被取消的检查从头到尾没跑过，它永远不会自己给出结论，等一个窗口
-        // 也是白等；而跑到一半被取消的是"有人在跑"这件事，给它窗口才有意义。
-        let mut cancelled_checks: Vec<(String, bool)> = Vec::new();
+        // 每一条还带着「有没有拿到过 runner」与「什么时候落的取消」：前者区分排队
+        // 超时与跑到一半，后者让下游那扇门也能问出「这取消站了多久」——它没有这份
+        // 状态，只有平台自己给的时间戳。
+        let mut cancelled_checks: Vec<CancelledCheck> = Vec::new();
         // 判红、但红的是**跑它的那台机器**（runner 磁盘满、被回收）的那几条。它们
         // 不进折判据：机器没撑住不是对这棵树的判决。与 `cancelled_checks` 一样带出去，
         // 让上层能给出具名的一格而不是让「没有判词」盖住两种完全不同的理由。
@@ -4227,10 +4259,7 @@ impl MainlineDeployer {
                                 // 要按它决定该不该一直扣着：取消没有结论，扣满一个窗口
                                 // 就是拿着零信息量挡整条主线。
                                 if c == "cancelled" {
-                                    cancelled_checks.push((
-                                        real.to_string(),
-                                        run.get("started_at").and_then(|t| t.as_str()).is_some(),
-                                    ));
+                                    cancelled_checks.push(CancelledCheck::from_run(real, run));
                                 }
                             }
                         }
@@ -4634,12 +4663,12 @@ impl MainlineDeployer {
         Vec<String>,
         Vec<String>,
         Vec<String>,
-        Vec<(String, bool)>,
+        Vec<CancelledCheck>,
     ) {
         let mut verdicts = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         let mut excluded: Vec<String> = Vec::new();
-        let mut cancelled: Vec<(String, bool)> = Vec::new();
+        let mut cancelled: Vec<CancelledCheck> = Vec::new();
         let mut reasons: Vec<(&'static str, CiNoVerdictReason)> = Vec::new();
         for up in &self.cfg.upstreams {
             let platform = up.platform.slug();
@@ -4670,11 +4699,10 @@ impl MainlineDeployer {
                 );
             }
             failed.extend(names.into_iter().map(|n| format!("{platform}:{n}")));
-            cancelled.extend(
-                cancelled_names
-                    .into_iter()
-                    .map(|(n, started)| (format!("{platform}:{n}"), started)),
-            );
+            cancelled.extend(cancelled_names.into_iter().map(|mut c| {
+                c.name = format!("{platform}:{}", c.name);
+                c
+            }));
             for (name, workflow) in skipped {
                 self.record_ci_check_excluded_reading(platform, &workflow)
                     .await;
@@ -4727,7 +4755,7 @@ impl MainlineDeployer {
     /// 结论时它不被刷新，所以它是窗口的起点而不是最后一次提问的时刻）。宿主实测一段冷
     /// 构建约 8 分钟，窗口给到 30 分钟，足够让一次重跑跑完还留出排队的余量。
     // cap: bound — 冷构建约 8 分钟，窗口给 30 分钟，够一次重跑跑完还留排队的余量
-    const CANCELLED_WAIVER_WINDOW_SECS: i64 = 30 * 60;
+    pub(crate) const CANCELLED_WAIVER_WINDOW_SECS: i64 = 30 * 60;
 
     /// 见 [`Self::CANCELLED_WAIVER_WINDOW_SECS`]。返回新的判词与原因列；没有可以放行的
     /// 东西时原样返回。
@@ -4735,7 +4763,7 @@ impl MainlineDeployer {
         verdict: Option<bool>,
         reasons: Vec<String>,
         failed_checks: &[String],
-        cancelled_checks: &[(String, bool)],
+        cancelled_checks: &[CancelledCheck],
         held_since_unix: Option<i64>,
         now_unix: i64,
     ) -> (Option<bool>, Vec<String>) {
@@ -4749,7 +4777,7 @@ impl MainlineDeployer {
         // 一次都没跑起来的那几条不必等窗口：排队到超时被取消的检查永远不会自己
         // 产生结论，等待买不到任何东西。等到窗口只是给"跑到一半被取消"的那几条
         // 留出重跑的机会，所以只要还有一条真的跑过，就按窗口来。
-        let all_never_started = cancelled_checks.iter().all(|(_, started)| !*started);
+        let all_never_started = cancelled_checks.iter().all(|c| !c.started);
         if !all_never_started {
             // 第一次见到这一笔的时候窗口才开始走，这一轮不可能是满窗。
             let Some(since) = held_since_unix else {
@@ -4760,8 +4788,8 @@ impl MainlineDeployer {
             }
         }
         let mut waived: Vec<String> = Vec::new();
-        for (name, _) in cancelled_checks {
-            let platform = name.split(':').next().unwrap_or_default();
+        for check in cancelled_checks {
+            let platform = check.name.split(':').next().unwrap_or_default();
             let slug = format!("{platform}:{}", CiNoVerdictReason::CancelledWaived.label());
             if !waived.contains(&slug) {
                 waived.push(slug);
@@ -4770,7 +4798,7 @@ impl MainlineDeployer {
         info!(
             cancelled = %cancelled_checks
                 .iter()
-                .map(|(n, _)| n.as_str())
+                .map(|c| c.name.as_str())
                 .collect::<Vec<_>>()
                 .join(","),
             held_seconds = ?held_since_unix.map(|since| now_unix.saturating_sub(since)),
@@ -11196,6 +11224,17 @@ impl ConfigConsumer {
 mod tests {
     use super::*;
     use crate::checkout::repo_root;
+
+    /// 一条被判 `cancelled` 的检查。`completed_unix` 在判窗口那几条判据里是输入，
+    /// 在只看「跑没跑过」的那几条里不参与，所以这里显式给。
+    fn cancelled_check(name: &str, started: bool, completed_unix: Option<i64>) -> CancelledCheck {
+        CancelledCheck {
+            name: name.to_string(),
+            started,
+            completed_unix,
+        }
+    }
+
     use crate::rust_production::production_text;
     use crate::test_support::http_200;
 
@@ -17241,7 +17280,7 @@ exec {real} "$@"
         assert!(excluded.is_empty(), "{excluded:?}");
         // 但它必须被单独认出来——"扣满窗口就放行"只能靠这一列把取消从真失败里分
         // 出来。混在一堆失败名里，取消就永远是永久的扣。
-        assert_eq!(cancelled, vec![("github:Test".to_string(), false)]);
+        assert_eq!(cancelled, vec![cancelled_check("github:Test", false, None)]);
         let _ = handle.await.unwrap();
     }
 
@@ -17255,7 +17294,8 @@ exec {real} "$@"
         let root = tmp.path();
         let (endpoint, handle) = fake_registry(vec![http_200(
             r#"{"check_runs":[
-                {"name":"Test","conclusion":"cancelled","started_at":"2026-10-30T01:00:00Z"}]}"#,
+                {"name":"Test","conclusion":"cancelled","started_at":"2026-10-30T01:00:00Z",
+                 "completed_at":"2026-10-30T01:15:00Z"}]}"#,
         )])
         .await;
         let mut cfg = upstream_config(root, Path::new("/nonexistent"));
@@ -17266,8 +17306,110 @@ exec {real} "$@"
         let (_verdict, _failed, _reasons, _excluded, cancelled) = deployer
             .ci_verdict_with_failures("abc123", CiAsk::RoundHead)
             .await;
-        assert_eq!(cancelled, vec![("github:Test".to_string(), true)]);
+        assert_eq!(
+            cancelled,
+            vec![cancelled_check(
+                "github:Test",
+                true,
+                Some(
+                    chrono::DateTime::parse_from_rfc3339("2026-10-30T01:15:00Z")
+                        .unwrap()
+                        .timestamp()
+                )
+            )]
+        );
         let _ = handle.await.unwrap();
+    }
+
+    /// 派 Job 之前那一扇门（`ask_upstreams`）与部署器那一层用同一个窗口，但它没有
+    /// 部署器那份「第一次判 fail」的账，只能读平台自己写的取消时刻。
+    ///
+    /// 今天的现场：`248bd700` 的 macos 检查排队 15 分钟后被平台取消，其余 16 条全绿。
+    /// 部署器那一层扣满窗口之后按「没有证据」放行并派了 Job，而这一层把同一次取消又
+    /// 读成一次失败，Job 于是立在那儿失败——放行换来的只是下一扇门上同一个扣。没有这一
+    /// 条，主线就会一直卡在一个永远不会再有人回答的 rev 上。
+    #[tokio::test]
+    async fn a_cancellation_past_the_window_does_not_hold_the_pre_apply_gate() {
+        let cancelled_ago = chrono::Utc::now() - chrono::Duration::minutes(31);
+        let body = format!(
+            r#"{{"check_runs":[
+                {{"name":"Bootstrap Cross-Platform Check (macos-latest)","conclusion":"cancelled",
+                  "started_at":"2026-11-03T21:18:54Z","completed_at":"{}"}}]}}"#,
+            cancelled_ago.to_rfc3339()
+        );
+        let (endpoint, handle) = fake_registry(vec![http_200(&body)]).await;
+        let executor = crate::mainline_rollout::RolloutExecutor::new("true", "ns", 0, 0, 0, 0);
+
+        let hold = executor
+            .ask_upstreams(&UpstreamCiAsk {
+                rev: "abc123".to_string(),
+                upstreams: vec![UpstreamCiTarget {
+                    platform: "github".to_string(),
+                    api_base: format!("http://{endpoint}/github"),
+                    repo: "o/r".to_string(),
+                }],
+            })
+            .await;
+        assert!(hold.is_none(), "满窗的取消不是判词，这一轮不该扣：{hold:?}");
+        let _ = handle.await.unwrap();
+    }
+
+    /// 对照：同一份取消，只站了五分钟——重跑可能就在这五分钟里，照旧扣。
+    ///
+    /// 缺这一格，上面那条「满窗才放行」就退化成「取消一律放行」，一次抖动里的取消
+    /// 会把一条还没跑完的检查直接放过去。
+    #[tokio::test]
+    async fn a_fresh_cancellation_still_holds_the_pre_apply_gate() {
+        let cancelled_ago = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let body = format!(
+            r#"{{"check_runs":[
+                {{"name":"Bootstrap Cross-Platform Check (macos-latest)","conclusion":"cancelled",
+                  "started_at":"2026-11-03T21:18:54Z","completed_at":"{}"}}]}}"#,
+            cancelled_ago.to_rfc3339()
+        );
+        let (endpoint, handle) = fake_registry(vec![http_200(&body)]).await;
+        let executor = crate::mainline_rollout::RolloutExecutor::new("true", "ns", 0, 0, 0, 0);
+
+        let hold = executor
+            .ask_upstreams(&UpstreamCiAsk {
+                rev: "abc123".to_string(),
+                upstreams: vec![UpstreamCiTarget {
+                    platform: "github".to_string(),
+                    api_base: format!("http://{endpoint}/github"),
+                    repo: "o/r".to_string(),
+                }],
+            })
+            .await;
+        let (kind, reason) = hold.expect("窗口没到的取消仍然扣住这一轮");
+        assert_eq!(kind, CiHoldKind::Red);
+        assert!(
+            reason.contains("macos-latest"),
+            "扣住的判词必须点得出是哪一条：{reason}"
+        );
+        let _ = handle.await.unwrap();
+    }
+
+    /// 一条真失败混着一条满窗的取消：真失败自己就够扣住，取消不背这个锅。
+    #[test]
+    fn a_real_failure_riding_along_is_not_waived_by_the_rollout_side() {
+        let cancelled = vec![cancelled_check("github:Test", true, Some(1_000))];
+        assert!(
+            !crate::mainline_rollout::cancelled_only_and_past_the_window(
+                &cancelled,
+                2,
+                1_000 + MainlineDeployer::CANCELLED_WAIVER_WINDOW_SECS,
+            )
+        );
+        assert!(crate::mainline_rollout::cancelled_only_and_past_the_window(
+            &cancelled,
+            1,
+            1_000 + MainlineDeployer::CANCELLED_WAIVER_WINDOW_SECS,
+        ));
+        // 读不出取消时刻的那一条永远不算满窗：「说不出它站了多久」不是「站了很久」。
+        let undated = vec![cancelled_check("github:Test", true, None)];
+        assert!(
+            !crate::mainline_rollout::cancelled_only_and_past_the_window(&undated, 1, i64::MAX,)
+        );
     }
 
     /// 满窗之后按「没有证据」放行，而且必须把这件事写成具名的一格。
@@ -17277,7 +17419,7 @@ exec {real} "$@"
     #[test]
     fn a_hold_that_only_cancellations_hold_up_is_released_once_the_window_is_spent() {
         let failed = vec!["github:Test".to_string()];
-        let cancelled = vec![("github:Test".to_string(), true)];
+        let cancelled = vec![cancelled_check("github:Test", true, None)];
         let (verdict, reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
             Some(false),
             vec!["github:pending".to_string()],
@@ -17294,7 +17436,7 @@ exec {real} "$@"
     #[test]
     fn a_cancelled_check_inside_the_window_still_holds() {
         let failed = vec!["github:Test".to_string()];
-        let cancelled = vec![("github:Test".to_string(), true)];
+        let cancelled = vec![cancelled_check("github:Test", true, None)];
         let (verdict, reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
             Some(false),
             vec!["github:pending".to_string()],
@@ -17315,7 +17457,7 @@ exec {real} "$@"
     #[test]
     fn the_window_starts_at_the_first_failing_verdict() {
         let failed = vec!["github:Test".to_string()];
-        let cancelled = vec![("github:Test".to_string(), true)];
+        let cancelled = vec![cancelled_check("github:Test", true, None)];
         let (verdict, _reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
             Some(false),
             Vec::new(),
@@ -17334,7 +17476,7 @@ exec {real} "$@"
     #[test]
     fn a_real_failure_riding_along_keeps_the_hold() {
         let failed = vec!["github:Test".to_string(), "github:Clippy".to_string()];
-        let cancelled = vec![("github:Test".to_string(), true)];
+        let cancelled = vec![cancelled_check("github:Test", true, None)];
         let (verdict, _reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
             Some(false),
             Vec::new(),
@@ -17351,8 +17493,8 @@ exec {real} "$@"
     fn the_waived_reason_carries_the_platform_of_the_cancelled_check() {
         let failed = vec!["github:Test".to_string(), "gitee:Test".to_string()];
         let cancelled = vec![
-            ("github:Test".to_string(), true),
-            ("gitee:Test".to_string(), true),
+            cancelled_check("github:Test", true, None),
+            cancelled_check("gitee:Test", true, None),
         ];
         let (verdict, reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
             Some(false),
@@ -17473,7 +17615,7 @@ exec {real} "$@"
     #[test]
     fn a_cancellation_that_never_got_a_runner_releases_the_hold_at_once() {
         let failed = vec!["github:Test".to_string()];
-        let cancelled = vec![("github:Test".to_string(), false)];
+        let cancelled = vec![cancelled_check("github:Test", false, None)];
         let (verdict, reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
             Some(false),
             Vec::new(),
@@ -17491,8 +17633,8 @@ exec {real} "$@"
     fn one_cancellation_that_did_run_keeps_the_window() {
         let failed = vec!["github:Test".to_string(), "github:Clippy".to_string()];
         let cancelled = vec![
-            ("github:Test".to_string(), false),
-            ("github:Clippy".to_string(), true),
+            cancelled_check("github:Test", false, None),
+            cancelled_check("github:Clippy", true, None),
         ];
         let (verdict, _reasons) = MainlineDeployer::waive_a_hold_that_only_cancellations_hold_up(
             Some(false),
