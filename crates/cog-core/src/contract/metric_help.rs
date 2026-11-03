@@ -2686,10 +2686,14 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          that had already been replaced. 0 is written on every round that is \
          not held, for the reason the duration gauge gives -- the store only \
          adds and overwrites, so a 1 nobody takes back is a rule that stays \
-         lit. No reason label: an unwired orchestrator and a refused submission \
-         both mean nobody owns the hold, and a labelled gauge would leave the \
-         cells it did not write this round standing at their old values; the \
-         distinction is in the log of the same round",
+         lit. Carries a `reason` label: `owned`, `no_orchestrator` or \
+         `submit_error`, one cell per value written **every** round (the current \
+         one at its value, the rest at 0), so a cell this round did not write \
+         never stands at an old value -- which is what kept the label off until \
+         2026-11-03. Until that day the two ways of being unowned were told \
+         apart only in the log of the same round, and the log dies with the pod: \
+         the hold of that day's 10:40 left a bare 1 on disk and its report could \
+         not say which side to fix",
     ),
     (
         crate::metric_names::MAINLINE_CI_HOLD_ACTIVE.as_str(),

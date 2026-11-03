@@ -1020,13 +1020,17 @@ metric_names! {
     // left one warning line that the pod took with it on the next rollout. The
     // hold itself was visible; "nobody owns it" was not.
     //
-    // Two ways to be unowned, and both are recorded as 1 rather than split by
-    // label: no orchestrator is wired (nobody was asked) and a submission that
-    // came back an error (asked and refused). The gauge answers "is there an
-    // owner right now" -- a labelled gauge writing one cell per round would
-    // leave the other cells' last values standing in a store that only adds and
-    // overwrites, which reads as several causes being true at once. Which one
-    // it was is in the log of the same round.
+    // Two ways to be unowned -- no orchestrator is wired (nobody was asked) and
+    // a submission that came back an error (asked and refused) -- carried as a
+    // `reason` label (`owned` / `no_orchestrator` / `submit_error`). It was one
+    // unlabelled 0-or-1 cell until 2026-11-03, because a labelled gauge writing
+    // one cell per round would leave the other cells' last values standing in a
+    // store that only adds and overwrites, which reads as several causes being
+    // true at once. What changed the trade is that the log of the same round
+    // dies with the pod: the hold of that day's 10:40 left a bare 1 on disk and
+    // its report could not say which of the two sides to fix. Every round now
+    // writes every value (the current one at its value, the rest at 0), so no
+    // cell survives an earlier round, and the rule reads the run per reason.
     //
     // 0 is written by the round that releases the hold, for the reason the
     // duration gauge above gives: a 1 nobody takes back stays lit forever.

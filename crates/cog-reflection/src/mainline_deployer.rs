@@ -1501,6 +1501,43 @@ pub(crate) fn ci_hold_goal_id(rev: &str, day: &str) -> String {
     format!("ci-red-{}-{day}", rev12(rev))
 }
 
+/// 这一轮**谁在管**这次扣住。0/1 只答「有没有人管」，而「没人管」有两种，修法在
+/// 完全不同的两侧：没有编排器是部署器的装配问题，提交被拒是被提交的那一侧拒了。
+///
+/// 这几种取值写成读数上的 `reason` 标签，而不是只写日志：日志活到 Pod 被换掉为止
+/// （2026-11-03 10:40 那次扣住，去看的时候 Pod 已经换了），而告警行是持久的。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CiHoldOwner {
+    /// 单子开出去了，或者当天那张单子本来就在。
+    Owned,
+    /// 部署器没有编排器：这条路连一次提交都不会发生。
+    NoOrchestrator,
+    /// 提交被拒。
+    SubmitError,
+}
+
+impl CiHoldOwner {
+    /// 每一轮都写全部取值——只写当轮那一格的话，其余几格会停在上一次的旧值，
+    /// 读起来像几件事同时成立。
+    pub(crate) const ALL: [Self; 3] = [Self::Owned, Self::NoOrchestrator, Self::SubmitError];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Owned => "owned",
+            Self::NoOrchestrator => "no_orchestrator",
+            Self::SubmitError => "submit_error",
+        }
+    }
+
+    /// 这一格问的是「有没有人接住」，所以只有 `Owned` 是 0。
+    fn value(self) -> f64 {
+        match self {
+            Self::Owned => 0.0,
+            Self::NoOrchestrator | Self::SubmitError => 1.0,
+        }
+    }
+}
+
 /// 交给规划器的那段话。
 ///
 /// 首行是落地抬头，接着写判词、失败的检查名与「关掉它长什么样」。刻意不写步骤：
@@ -4687,7 +4724,7 @@ impl MainlineDeployer {
             // 而「在不在扣住」此刻是一条事实。放行那一支必须把上一轮写下的 1 收
             // 回来，理由与时长那一格相同——库里只增不改，收不回的 1 永远亮着。
             self.record_ci_hold_active(false).await;
-            self.record_ci_hold_unowned(false).await;
+            self.record_ci_hold_unowned(CiHoldOwner::Owned).await;
             return Ok(false);
         }
         warn!(
@@ -4739,11 +4776,11 @@ impl MainlineDeployer {
         // After the hold is on disk: a submission that fails must not cost the
         // record of how long this revision has been held, which is the reading
         // the alert rests on.
-        let owned = self.dispatch_ci_remediation(rev, &failed_checks).await;
+        let owner = self.dispatch_ci_remediation(rev, &failed_checks).await;
         // 紧接着写这一格，「扣住了」与「谁在处理」才是同一个时点上的两个事实。
-        // 写在这里而不是 dispatch 里面：没有编排器那一支从来走不进 dispatch，
-        // 而它同样意味着没人被问过。
-        self.record_ci_hold_unowned(!owned).await;
+        // 写在这里而不是 dispatch 里面：没有编排器那一支同样意味着没人被问过，
+        // 而它连一次提交都不会发生。
+        self.record_ci_hold_unowned(owner).await;
         Ok(true)
     }
 
@@ -4766,9 +4803,17 @@ impl MainlineDeployer {
     /// failed or there is no orchestrator to ask at all. The caller publishes
     /// that as a reading, because a hold nobody can work on and a hold waiting
     /// on work in flight read the same everywhere else.
-    async fn dispatch_ci_remediation(&self, rev: &str, failed_checks: &[String]) -> bool {
+    async fn dispatch_ci_remediation(&self, rev: &str, failed_checks: &[String]) -> CiHoldOwner {
         let Some(orchestrator) = self.orchestrator.as_ref() else {
-            return false;
+            // 这一支此前一句话都不说：告警的判词写着「两种没人管分得开，靠的是当轮
+            // 日志」，而没有编排器这一种恰恰是唯一不留日志的那一种。它也是唯一一种
+            // 修法在部署器自己身上的，读的人需要知道该看哪一侧。
+            warn!(
+                rev = %rev12(rev),
+                "this deployer has no orchestrator wired: a CI hold can never become a goal, \
+                 so it is a held rollout with no owner"
+            );
+            return CiHoldOwner::NoOrchestrator;
         };
         let id = ci_hold_goal_id(
             rev,
@@ -4791,7 +4836,7 @@ impl MainlineDeployer {
                     "this revision already has today's CI remediation goal; nothing new queued"
                 );
                 // 已持有同一天的同一张单子也算有主：这一轮没有新任务，不是没人接。
-                true
+                CiHoldOwner::Owned
             }
             Ok(added) => {
                 info!(
@@ -4804,7 +4849,7 @@ impl MainlineDeployer {
                     evidence_lines = evidence.len(),
                     "the CI hold was handed to the action planner"
                 );
-                true
+                CiHoldOwner::Owned
             }
             Err(e) => {
                 warn!(
@@ -4812,7 +4857,7 @@ impl MainlineDeployer {
                     error = %e,
                     "the CI hold could not be submitted; it is a held rollout with no owner"
                 );
-                false
+                CiHoldOwner::SubmitError
             }
         }
     }
@@ -4877,19 +4922,33 @@ impl MainlineDeployer {
     /// 时长那一格答不了这件事，而「在等合并」与「每一轮都被拒、没人接到单子」
     /// 在别的读数上完全同形——2026-10-31 的一场扣住就是这么站着：上游全部 503，
     /// 部署器每一轮都拿回 `face_has_no_serving_member`，留一行 warn 跟着 Pod
-    /// 一起被换掉。0/1 而不是带标签的计数：写者每轮只写其中一格，其余几格的旧值
-    /// 会留在只增不改的库里，读起来像几件事同时成立；原因是哪一路在当轮日志里。
-    async fn record_ci_hold_unowned(&self, unowned: bool) {
+    /// 一起被换掉。
+    ///
+    /// 为什么现在带 `reason` 标签：那一行 warn 并不持久——2026-11-03 10:40 那一场
+    /// 扣住亮起了告警，等到有人去看时 Pod 已经换了，日志跟着它一起没了，留在盘上的
+    /// 只有一格 1，连「根本没有编排器」与「提交被拒」都分不出来，而这两者的修法在
+    /// 完全不同的两侧。告警行本身是持久的，于是成因得写进这一格的标签里，判词才能
+    /// 用 `{reason}` 把它印在告警上。
+    ///
+    /// 带标签不违反当初「0/1 而不是带标签的计数」那条理由：那条怕的是**只写一格**，
+    /// 其余几格停在上一次的旧值、读起来像几件事同时成立。这里每一轮把**全部**取值
+    /// 都写一遍（当轮那个 1、其余全 0），库里不会留下只属于上一轮的行。
+    async fn record_ci_hold_unowned(&self, owner: CiHoldOwner) {
         let Some(metrics) = &self.metrics else {
             return;
         };
-        let _ = metrics
-            .record_gauge(
-                cog_core::metric_names::MAINLINE_CI_HOLD_UNOWNED,
-                if unowned { 1.0 } else { 0.0 },
-                std::collections::HashMap::new(),
-            )
-            .await;
+        for reason in CiHoldOwner::ALL {
+            let mut labels = std::collections::HashMap::new();
+            labels.insert("reason".to_string(), reason.label().to_string());
+            let value = if reason == owner { reason.value() } else { 0.0 };
+            let _ = metrics
+                .record_gauge(
+                    cog_core::metric_names::MAINLINE_CI_HOLD_UNOWNED,
+                    value,
+                    labels,
+                )
+                .await;
+        }
     }
 
     /// 一轮在被拒分支之前就返回时，把还挂着的换手请求续上。
@@ -6920,7 +6979,7 @@ impl MainlineDeployer {
             // 那一格在 `rev_no_longer_tracked` 上故意不停（问题还没答案），
             // 「在不在扣住」这一格必须停：此时确实没有扣住。
             self.record_ci_hold_active(false).await;
-            self.record_ci_hold_unowned(false).await;
+            self.record_ci_hold_unowned(CiHoldOwner::Owned).await;
             state.ci_hold_ends.push(ended);
             let excess = state.ci_hold_ends.len().saturating_sub(CI_HOLD_END_KEEP);
             if excess > 0 {
@@ -16126,6 +16185,8 @@ exec {real} "$@"
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
             .with_orchestrator(planner.clone())
             .with_metrics(metrics.clone());
+        // 读数现在按 `reason` 分成几格，规则读的是 `max(...)`，所以这里也取最大：
+        // 判据与告警判据读同一个数。
         let read = || {
             let metrics = metrics.clone();
             async move {
@@ -16133,8 +16194,29 @@ exec {real} "$@"
                     .query_gauge_latest(MAINLINE_CI_HOLD_UNOWNED.as_str())
                     .await
                     .unwrap()
-                    .first()
+                    .iter()
                     .map(|s| s.value)
+                    .fold(None, |acc: Option<f64>, v| {
+                        Some(acc.map_or(v, |a| a.max(v)))
+                    })
+            }
+        };
+        // 谁会回答「为什么没人接」：每一轮都把全部取值写一遍，当轮那个是 1、其余 0，
+        // 于是「哪一格是 1」就是这一轮的成因。没有这一列，告警只说「没人管」，
+        // 而「没有编排器」与「提交被拒」的修法在完全不同的两侧。
+        let reason = || {
+            let metrics = metrics.clone();
+            async move {
+                let mut hit: Vec<String> = metrics
+                    .query_gauge_latest(MAINLINE_CI_HOLD_UNOWNED.as_str())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|s| s.value == 1.0)
+                    .map(|s| s.labels.get("reason").cloned().unwrap_or_default())
+                    .collect();
+                hit.sort();
+                hit
             }
         };
 
@@ -16148,6 +16230,11 @@ exec {real} "$@"
             read().await.expect("扣住这一支必须写这一格"),
             1.0,
             "提交失败就是没人接住，读数上必须与「已派出去」分得开"
+        );
+        assert_eq!(
+            reason().await,
+            vec!["submit_error".to_string()],
+            "没人接住时要说出是**哪一种**：提交被拒与根本没有编排器的修法在两侧"
         );
 
         // 规划器恢复：同一版再问一次，单子开出，这一格收回 0。
@@ -16164,6 +16251,24 @@ exec {real} "$@"
             0.0,
             "单子开出去了，这一格要跟着收回，不能停在上一轮的 1"
         );
+        // 有主那一轮没有哪一格是 1；`owned` 也是 0（这一格问的是「有没有人接住」）。
+        // 上一轮的 `submit_error` 必须被写回 0，不能停在 1 上。
+        assert!(
+            reason().await.is_empty(),
+            "有主那一轮不该有任何一格是 1，实为 {:?}",
+            reason().await
+        );
+        let owned_zero = metrics
+            .query_gauge_latest(MAINLINE_CI_HOLD_UNOWNED.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.labels.get("reason").map(String::as_str) == Some("owned"));
+        assert_eq!(
+            owned_zero.map(|s| s.value),
+            Some(0.0),
+            "每一轮把全部取值都写一遍：owned 这一格也要写，不是靠缺席表达"
+        );
 
         // 上游放行：不再扣住，这一格同样是 0——库里只增不改，不写回就一直亮着。
         let mut state = deployer.load_state();
@@ -16172,6 +16277,56 @@ exec {real} "$@"
             .await
             .unwrap());
         assert_eq!(read().await.unwrap(), 0.0);
+        settle(handle).await;
+    }
+
+    /// 没有编排器的那一支：**没有一次提交**，此前连一行日志都不留，而告警的判词
+    /// 却写着「两种没人管靠当轮日志分得开」。这一格让读数自己说出是哪一种，
+    /// 于是「部署器没装规划器」不再需要靠猜。
+    #[tokio::test]
+    async fn a_deployer_without_an_orchestrator_says_so_in_the_reading() {
+        use cog_core::metric_names::MAINLINE_CI_HOLD_UNOWNED;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        // 注意：**不接**编排器。
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_metrics(metrics.clone());
+
+        let mut state = MainlineState::default();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+
+        let samples = metrics
+            .query_gauge_latest(MAINLINE_CI_HOLD_UNOWNED.as_str())
+            .await
+            .unwrap();
+        let one: Vec<&str> = samples
+            .iter()
+            .filter(|s| s.value == 1.0)
+            .map(|s| s.labels.get("reason").map(String::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            one,
+            vec!["no_orchestrator"],
+            "没有编排器是「没人管」里的另一种，读数要分开：{samples:?}"
+        );
+        let zeros = samples.iter().filter(|s| s.value == 0.0).count();
+        assert_eq!(
+            zeros,
+            CiHoldOwner::ALL.len() - 1,
+            "每一轮把全部取值都写一遍，剩下的几格必须是 0，不是上一轮的旧值：{samples:?}"
+        );
         settle(handle).await;
     }
 
