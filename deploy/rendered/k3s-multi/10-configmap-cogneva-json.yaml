@@ -1437,6 +1437,10 @@ data:
             },
             {
               "name": "task_graph_measure_failed",
+              "dormancy": {
+                "reason": "lazy_counter",
+                "why": "The counter is created by its first failure, not by the process starting: `crates/cog-orchestrator/src/observable.rs` publishes it only once `snapshot.measure_failures > 0`, because a graph nobody has read yet must publish no zeros. On a cluster where every read has succeeded, no series exists, and \"no read failed\" and \"the counter was never created\" are the same shape here. The rule still fires on the first failure; the counter is absent only while there is nothing to count."
+              },
               "promql": "sum by (namespace) (increase(cogneva_task_graph_measure_failures_total[15m])) > 0",
               "condition": {
                 "greater_than": 0.0
