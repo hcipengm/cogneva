@@ -2673,7 +2673,7 @@ impl GitHubDiscoveryLoop {
                             branch = %key.0,
                             workflow = %key.1,
                             error = %e,
-                            "cannot read the workflow's newest run; the CI fix rows on it stay open"
+                            "cannot read the workflow's newest finished run; the CI fix rows on it stay open"
                         );
                         None
                     }
@@ -2687,9 +2687,9 @@ impl GitHubDiscoveryLoop {
                 continue;
             }
             let reason = format!(
-                "分支 {branch} 上流水线「{workflow}」的最新一次运行 run {}（rev {}）判绿，\
-                 晚于这张单点名的 run {run_id}：它要修的那次失败已经不在了，判据由别人\
-                 的那次修复满足",
+                "分支 {branch} 上流水线「{workflow}」最新一次已结束的运行 run {}（rev {}）\
+                 判绿，晚于这张单点名的 run {run_id}：它要修的那次失败已经不在了，判据由\
+                 别人的那次修复满足",
                 newest.run_id,
                 newest.head_sha.chars().take(8).collect::<String>(),
             );
@@ -4383,6 +4383,54 @@ pub(crate) mod tests {
         assert!(
             orchestrator.cancelled().is_empty(),
             "失败之前那次绿被当成了修复：{:?}",
+            orchestrator.cancelled()
+        );
+    }
+
+    /// 比这张单新的那次运行**还没结束**，不是结论：它跑完可能红。
+    ///
+    /// 每次推送都会把流水线重新起一次，所以最新那条常常就是在跑的那条——
+    /// 拿它结单，等于用「还没判」当成「判绿了」。线上第一版就是这么栽的：
+    /// 十张单纹丝不动，而几条街外那次已结束的运行早就绿了。
+    #[tokio::test]
+    async fn a_run_still_going_does_not_close_it() {
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(vec![(
+                "main".into(),
+                "CI".into(),
+                CiRunSummary {
+                    run_id: 2002,
+                    head_sha: "def5678".into(),
+                    conclusion: String::new(),
+                },
+            )]),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::holding(vec![ci_fix_row(
+            "gh-ci-run-1001",
+            "main",
+            "CI",
+            1001,
+            None,
+        )]));
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        loop_.run_once().await.unwrap();
+
+        assert!(
+            orchestrator.cancelled().is_empty(),
+            "还在跑的那次被当成了判绿：{:?}",
             orchestrator.cancelled()
         );
     }
