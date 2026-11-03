@@ -1213,12 +1213,11 @@ fn missing_dependencies(
             name,
             MissingScope::Column((*name).to_string()),
             Absence::NotImplemented,
-            format!(
-                "this column pins its own tool face and the composition root has no \
-                 implementation for it; running the column with a smaller face would score a \
-                 different thing, so the column is left out of this run's rows (implement the \
-                 face, or run the column alone with `--tools none` as a diagnostic)"
-            ),
+            "this column pins its own tool face and the composition root has no implementation \
+             for it; running the column with a smaller face would score a different thing, so \
+             the column is left out of this run's rows (implement the face, or run the column \
+             alone with `--tools none` as a diagnostic)"
+                .to_string(),
         ));
     }
     if wiring.backbone.is_none() {
