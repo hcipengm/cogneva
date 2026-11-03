@@ -39,11 +39,11 @@
 //! true — and is absent for the same reason.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use cog_core::observability::{DimensionSpec, Observable, RawMetric};
 use cog_core::SFResult;
 
@@ -155,6 +155,59 @@ pub trait Capability: Send + Sync {
     async fn judge(&self) -> Verdict;
 }
 
+/// Where the newest closed window a face has processed comes from.
+///
+/// A trait rather than a direct call so the judgement can be exercised without
+/// a database: the interesting cases are "no window was ever processed" and
+/// "the newest one is hours old", and both of those are states a test has to be
+/// able to produce, not states a live database happens to be in.
+#[async_trait]
+pub trait WindowWatermark: Send + Sync {
+    async fn newest_window_end(&self) -> anyhow::Result<Option<DateTime<Utc>>>;
+}
+
+/// Judge "the newest window this face processed" against a clock.
+///
+/// Two faces read windows on a clock — the spend projection and the usage
+/// rollup — and the distinction between their states is the same distinction:
+/// nothing processed yet is not a pass, a watermark ahead of the clock is a
+/// writer/clock disagreement rather than freshness, and a watermark older than
+/// the bound is the face having stopped. Sharing the judgement keeps those
+/// three answers one sentence each across faces; the bound stays with the
+/// caller because it belongs to the window length, not to the code here.
+pub fn judge_window_freshness(
+    watermark: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    max_lag: Duration,
+) -> Verdict {
+    let Some(end) = watermark else {
+        // A face with no processed window is not current, but it is also not
+        // evidence of a defect: a deployment that just came up has nothing to
+        // process yet. Unmeasured says exactly that, and it is not `Ok` — an
+        // alert may fire on it, which is the intended safety.
+        return Verdict::Unmeasured(
+            "no window has been processed yet; there is nothing to be behind".into(),
+        );
+    };
+    let lag = now.signed_duration_since(end);
+    if lag.num_seconds() < 0 {
+        // A watermark in the future is a clock or a writer disagreement, not
+        // freshness. Folding it into `Ok` would make a skewed writer the
+        // quietest possible configuration.
+        return Verdict::Unmeasured(format!(
+            "the newest window ends in the future ({end}); the clock and the writer disagree"
+        ));
+    }
+    if lag.to_std().unwrap_or_default() > max_lag {
+        return Verdict::Red(format!(
+            "the newest window ended {} s ago, past the {} s bound",
+            lag.num_seconds(),
+            max_lag.as_secs()
+        ));
+    }
+    Verdict::Ok
+}
+
 /// Why a declaration was refused.
 ///
 /// Both variants are refusals rather than silent repairs: a duplicate id makes
@@ -211,7 +264,6 @@ struct EntryState {
 struct Entry {
     capability: Arc<dyn Capability>,
     state: Mutex<EntryState>,
-    judged_total: AtomicU64,
 }
 
 impl Entry {
@@ -222,14 +274,7 @@ impl Entry {
             state.last = Some((verdict.clone(), Instant::now()));
             state.judged += 1;
         }
-        self.judged_total.fetch_add(1, Ordering::Relaxed);
         verdict
-    }
-
-    fn record(&self) {
-        // Kept for the read side: the count is per process, so a restart resets
-        // it, and the age series is what answers "is this still being judged".
-        let _ = self.judged_total.load(Ordering::Relaxed);
     }
 }
 
@@ -277,7 +322,6 @@ impl CapabilityLedger {
                     last: None,
                     judged: 0,
                 }),
-                judged_total: AtomicU64::new(0),
             }),
         );
         Ok(())
@@ -364,7 +408,6 @@ impl CapabilityLedger {
                             "capability could not be judged"
                         ),
                     }
-                    entry.record();
                 }
             });
         }

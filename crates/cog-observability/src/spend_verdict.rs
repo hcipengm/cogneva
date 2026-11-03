@@ -794,14 +794,10 @@ pub const FRESHNESS_MAX_LAG: Duration = Duration::from_secs(2 * WINDOW_SECS as u
 
 /// Where the projection's watermark comes from.
 ///
-/// A trait rather than a direct call so the judgement can be exercised without
-/// a database: the interesting cases are "a window was never judged" and "the
-/// newest one is hours old", and both of those are states a test has to be able
-/// to produce, not states a live database happens to be in.
-#[async_trait::async_trait]
-pub trait WindowWatermark: Send + Sync {
-    async fn newest_window_end(&self) -> anyhow::Result<Option<DateTime<Utc>>>;
-}
+/// Defined beside the other window faces and re-exported here, so the store
+/// that implements it and the tests that fake it keep naming it through the
+/// face it belongs to.
+pub use crate::capability::WindowWatermark;
 
 #[async_trait::async_trait]
 impl WindowWatermark for SpendVerdictStore {
@@ -851,33 +847,7 @@ impl<W: WindowWatermark + 'static> SpendVerdictFreshness<W> {
         watermark: Option<DateTime<Utc>>,
         now: DateTime<Utc>,
     ) -> crate::capability::Verdict {
-        use crate::capability::Verdict;
-        let Some(end) = watermark else {
-            // A projection with no judged window is not current, but it is also
-            // not evidence of a defect: a deployment that just came up has
-            // nothing to judge yet. Unmeasured says exactly that, and it is not
-            // `Ok` — an alert may fire on it, which is the intended safety.
-            return Verdict::Unmeasured(
-                "no window has been judged yet; the projection has nothing to be behind".into(),
-            );
-        };
-        let lag = now.signed_duration_since(end);
-        if lag.num_seconds() < 0 {
-            // A watermark in the future is a clock or a writer disagreement, not
-            // freshness. Folding it into `Ok` would make a skewed writer the
-            // quietest possible configuration.
-            return Verdict::Unmeasured(format!(
-                "the newest judged window ends in the future ({end}); the clock and the writer disagree"
-            ));
-        }
-        if lag.to_std().unwrap_or_default() > FRESHNESS_MAX_LAG {
-            return Verdict::Red(format!(
-                "the newest judged window ended {} s ago, past the {} s bound",
-                lag.num_seconds(),
-                FRESHNESS_MAX_LAG.as_secs()
-            ));
-        }
-        Verdict::Ok
+        crate::capability::judge_window_freshness(watermark, now, FRESHNESS_MAX_LAG)
     }
 }
 

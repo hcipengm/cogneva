@@ -609,6 +609,16 @@ impl cog_core::SystemPlugin for ObservabilityPlugin {
         if let Err(e) = capabilities.declare(claim) {
             warn!(error = %e, "capability not declared; nothing will judge it");
         }
+        // The usage fold has the same two-failure shape and the same repair
+        // question: a loop that beats but cannot land a window leaves the fold
+        // answering last week's question, and only the watermark tells the two
+        // apart. Declared beside the loop that owns it.
+        let claim: Arc<dyn crate::capability::Capability> = Arc::new(
+            crate::llm_usage_rollup::UsageRollupFreshness::new(self.usage_store.clone()),
+        );
+        if let Err(e) = capabilities.declare(claim) {
+            warn!(error = %e, "capability not declared; nothing will judge it");
+        }
         let capabilities = Arc::new(capabilities);
         ctx.publish_observable(capabilities.clone());
         info!(declared = capabilities.len(), "capability ledger published");

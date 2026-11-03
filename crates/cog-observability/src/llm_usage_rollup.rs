@@ -27,9 +27,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
+use crate::capability::{judge_window_freshness, Capability, Verdict, WindowWatermark};
 use crate::usage_store::{windows_before, windows_to_roll, LlmUsageStore};
 
 /// The loop, as the liveness readings name it. A loop whose whole job is to run
@@ -149,6 +150,94 @@ pub fn spawn(
             }
         },
     )
+}
+
+/// The capability id this face reports under.
+pub const FRESHNESS_CAPABILITY_ID: &str = "usage_rollup_current";
+
+/// How far behind the clock the newest folded window may be before the fold
+/// counts as stopped.
+///
+/// Two windows: the loop folds a window once it closes and looks for work every
+/// `PERIOD`, so at steady state the newest folded window ended somewhere
+/// between one window and one window plus one pass ago. One window would be red
+/// on a healthy system every time a pass ran late, and a bound nobody can be
+/// inside is the same as no bound.
+// cap: bound — 稳态滞后在一个窗到「一个窗加一趟」之间；两倍窗是「漏了一整趟」的界
+pub const FRESHNESS_MAX_LAG: Duration = Duration::from_secs(2 * WINDOW_SECS as u64);
+
+#[async_trait::async_trait]
+impl WindowWatermark for LlmUsageStore {
+    async fn newest_window_end(&self) -> anyhow::Result<Option<DateTime<Utc>>> {
+        self.last_rolled_window_end().await
+    }
+}
+
+/// "The usage fold keeps up with the clock."
+///
+/// The loop's liveness reading says the loop is beating; it cannot say the fold
+/// is landing. A pass that ticks and fails to write — the table refusing the
+/// insert, the ledger query erroring — beats on time and leaves the fold where
+/// it was, and a fold standing still answers "where did the tokens go" with a
+/// history that stops at the last successful pass. The loop's own log line is
+/// not a reading: nobody selects it, and it is gone with the pod.
+///
+/// The claim is declared whether or not this process built a store. A
+/// deployment whose database was never configured has a fold that is not
+/// current, and a claim that disappears with its input is the shape this layer
+/// removes — `Unmeasured`, not an undeclared claim.
+pub struct UsageRollupFreshness<W: WindowWatermark + 'static> {
+    store: Option<Arc<W>>,
+    now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+}
+
+impl<W: WindowWatermark + 'static> UsageRollupFreshness<W> {
+    pub fn new(store: Option<Arc<W>>) -> Self {
+        Self {
+            store,
+            now: Arc::new(Utc::now),
+        }
+    }
+
+    /// Pin the clock. Used by tests, which cannot wait two windows to see the
+    /// lag bound work.
+    pub fn with_clock(
+        store: Option<Arc<W>>,
+        now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    ) -> Self {
+        Self { store, now }
+    }
+
+    /// Judge a watermark against a clock, without either the store or the loop.
+    pub fn judge_watermark(watermark: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Verdict {
+        judge_window_freshness(watermark, now, FRESHNESS_MAX_LAG)
+    }
+}
+
+#[async_trait::async_trait]
+impl<W: WindowWatermark + 'static> Capability for UsageRollupFreshness<W> {
+    fn id(&self) -> &'static str {
+        FRESHNESS_CAPABILITY_ID
+    }
+
+    fn cadence(&self) -> cog_core::loop_health::Cadence {
+        // A new answer can only appear when a window closes, so asking once a
+        // window is the fastest the judgement can change.
+        cog_core::loop_health::Cadence::Periodic(Duration::from_secs(WINDOW_SECS as u64))
+    }
+
+    async fn judge(&self) -> Verdict {
+        let now = (self.now)();
+        let Some(store) = self.store.as_ref() else {
+            return Verdict::Unmeasured(
+                "this process built no usage ledger, so nothing here folds its windows".into(),
+            );
+        };
+        match store.newest_window_end().await {
+            Ok(watermark) => Self::judge_watermark(watermark, now),
+            Err(e) => Verdict::Unmeasured(format!("the usage fold could not be read: {e}")),
+        }
+    }
 }
 
 #[cfg(test)]
