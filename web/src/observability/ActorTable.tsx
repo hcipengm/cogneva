@@ -100,7 +100,11 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
             const expanded = expandable && !!open[group.actor];
             return (
               <Fragment key={group.actor}>
-                <tr style={total === 0 ? { opacity: 0.6 } : undefined}>
+                {/* 压暗这一行用颜色，不用 `opacity`：名字那一格挂着注释面板，面板是
+                    触发元素的子节点，行级的 `opacity` 会连面板里的字一起压成半透明——
+                    悬停出来的解释反倒比表里任何一格都难读。颜色只被格子继承，面板自己
+                    的规则会给它重新上色——淡下来的是这一行继承颜色的字，不是解释。 */}
+                <tr className={total === 0 ? 'text-[var(--muted)]' : undefined}>
                   <td>
                     <Note
                       as={expandable ? 'button' : 'span'}

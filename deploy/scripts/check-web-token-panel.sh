@@ -583,6 +583,26 @@ else:
     else:
         summary.append(f"注释: {note_rel}，{len(rendered_by)} 个文件在用它")
 
+# 面板是**触发元素的子节点**（`position: fixed` 让它跳出布局，但没跳出 DOM），所以祖先
+# 身上的 `opacity` 会乘到面板的字上——悬停出来的解释比表里任何一格都难读，而它恰恰是
+# 唯一说清「这一行为什么是空的」的地方。表格的行与格是最容易按行压暗的地方，也正好是
+# 注释最密的地方，所以这一条判在那儿：`<tr>`／`<td>` 不许带 `opacity`（写样式或写类名
+# 都算）。要压暗就改字色——`.note-panel` 有自己的颜色，格子继承不到它身上。
+DIM_ON_ROW = re.compile(r"<t[rd]\b[^>]*\bopacity")
+dimmed = [
+    rel
+    for rel in sorted(graph)
+    if rel.endswith(".tsx") and DIM_ON_ROW.search(strip_comments(read(rel)))
+]
+if dimmed:
+    problems.append(
+        "表格的行／格上用了 opacity（"
+        + "、".join(dimmed[:4])
+        + (f"…共 {len(dimmed)} 处" if len(dimmed) > 4 else "")
+        + "）：面板是触发元素的子节点，祖先的 opacity 会把面板里的字一起压透明——"
+        "压暗请改字色"
+    )
+
 # 面板的字要能选中、复制。判的是**面板自己的规则块**里有这两条：写在别处（或根本没有）
 # 与「能选中」是两件事，而 `position: fixed` 是它能在表格里活下来的原因——`absolute`
 # 会被表格与滚动容器裁掉，那些容器正是注释最多的地方。
