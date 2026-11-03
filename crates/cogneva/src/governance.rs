@@ -30,7 +30,10 @@ use cog_core::{
     TaskStatus, HANDOVER_TASK_TYPE,
 };
 use cog_orchestrator::face_drift::UnexplainedOwner;
-use cog_storage::{PostgresGovernanceStore, PostgresStateBackend, RedisAgentRegistry};
+use cog_storage::{
+    PostgresChangeLedgerStore, PostgresGovernanceStore, PostgresPrincipleLedgerStore,
+    PostgresStateBackend, RedisAgentRegistry,
+};
 
 /// Columns of a roster row, in the order the file writes them.
 ///
@@ -101,6 +104,16 @@ SUBCOMMANDS:
                            act that removes it. `--from -` reads stdin, which is
                            how a host with no database credentials feeds it in:
                            `kubectl exec -i ... import-readings --from -`.
+    progress [--json]
+                           One reading of three ledgers at the same instant: the
+                           task graph by the unit it names, the change account,
+                           and the principle account. The task section says who
+                           holds each open row and whether that unit still
+                           answers, because a name in the owner column with
+                           nobody behind it is the one way ownership fails while
+                           every count still looks calm. Rows nobody owns are
+                           counted on their own rather than folded into an
+                           unnamed remainder.
     assign [--face <id>] [--workspace <id>]
                            Give every staffed face one standing work row,
                            owned by the face's owner and carrying its face id,
@@ -143,6 +156,10 @@ pub enum Action {
     Assign {
         face: Option<String>,
         workspace: Option<String>,
+    },
+    /// 三本账的一拍进度：谁负责什么、他还在不在、落地了多少。
+    Progress {
+        json: bool,
     },
     /// The host-reading roster, four columns, straight from the graph.
     Readings,
@@ -248,6 +265,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             keep_ownership,
         },
         Some("assign") => Action::Assign { face, workspace },
+        Some("progress") => Action::Progress { json },
         Some("readings") => Action::Readings,
         Some("import-readings") => Action::ImportReadings {
             from: from.ok_or("import-readings needs --from <file>")?,
@@ -310,6 +328,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
 
     let pool = sqlx::PgPool::connect(&database_url).await?;
     let assign_pool = pool.clone();
+    let progress_pool = pool.clone();
     let store: Arc<dyn GovernanceStore> = Arc::new(PostgresGovernanceStore::new(pool));
 
     match request.action {
@@ -346,6 +365,31 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
                     .map(|p| p as &dyn crate::governance_acts::PresenceProbe),
             )
             .await?;
+        }
+        Action::Progress { json } => {
+            // 在岗账读不出来时这条读数照样成立：每个 unit 的 `presence` 会落成
+            // `unreadable`，而不是把所有人读成「不在」。
+            let (registry, note) = agent_registry(redis_url.as_deref()).await;
+            if let Some(note) = note {
+                eprintln!("cogneva governance: {note}");
+            }
+            let backend = PostgresStateBackend::new(progress_pool.clone());
+            let change: Arc<dyn cog_core::ChangeLedgerStore> =
+                Arc::new(PostgresChangeLedgerStore::new(progress_pool.clone()));
+            let principle: Arc<dyn cog_core::PrincipleLedgerStore> =
+                Arc::new(PostgresPrincipleLedgerStore::new(progress_pool));
+            progress(
+                &*store,
+                &backend,
+                change.as_ref(),
+                principle.as_ref(),
+                registry
+                    .as_deref()
+                    .map(|r| r as &dyn cog_core::AgentRegistry),
+                &config.dag_executor.workspace_id,
+                json,
+            )
+            .await?
         }
         Action::Readings => readings_roster(&*store).await?,
         Action::ImportReadings { from } => import_readings(&*store, &from).await?,
@@ -533,6 +577,85 @@ async fn drift(
             join_or_dash(&reading.yellow_rules),
             reading.detail.as_deref().unwrap_or("-"),
         );
+    }
+    Ok(())
+}
+
+/// 三本账的一拍进度。
+///
+/// 任务行取这个工作区的那一片，面节点由 `collect` 从治理工作区补上并去重：一个
+/// 进程只读得到自己工作区的行，而「进度」问的是整个平台。
+#[allow(clippy::too_many_arguments)]
+async fn progress(
+    store: &dyn GovernanceStore,
+    backend: &dyn StateBackend,
+    change: &dyn cog_core::ChangeLedgerStore,
+    principle: &dyn cog_core::PrincipleLedgerStore,
+    registry: Option<&dyn cog_core::AgentRegistry>,
+    workspace: &str,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let tasks = backend.dag_get_all_tasks(workspace).await?;
+    let read = cog_gateway::progress::collect(
+        tasks,
+        cog_gateway::progress::Sources {
+            governance: Some(store),
+            change_ledger: Some(change),
+            principle_ledger: Some(principle),
+            registry,
+        },
+    )
+    .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&read)?);
+        return Ok(());
+    }
+
+    let tasks = &read.tasks;
+    println!(
+        "tasks\trows={} open={} unowned_open={} unowned_goals={} returned_to_line={}",
+        tasks.rows, tasks.open, tasks.unowned_open, tasks.unowned_goals, tasks.returned_to_line
+    );
+    println!("\tstate\trows");
+    for cell in &tasks.by_state {
+        println!("\t{}\t{}", cell.state, cell.rows);
+    }
+    println!("unit\tpresence\topen\tcompleted\tfailed\tcancelled\toldest_open");
+    for owner in &tasks.owners {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            owner.unit,
+            owner.presence.as_str(),
+            owner.open,
+            owner.completed,
+            owner.failed,
+            owner.cancelled,
+            owner
+                .oldest_open_at
+                .map(|at| at.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "-".into()),
+        );
+    }
+    match &read.changes {
+        Some(changes) => {
+            println!(
+                "changes\trows={} outstanding={} settled={}",
+                changes.rows, changes.outstanding, changes.settled
+            );
+        }
+        // 一把零会被读成「没有欠账」，而那与「这一本没接上」是两件事。
+        None => println!("changes\tunavailable"),
+    }
+    match &read.principles {
+        Some(principles) => println!(
+            "principles\trows={} enforced={} unenforced={} unmeasured={} retired={}",
+            principles.rows,
+            principles.enforced,
+            principles.unenforced,
+            principles.unmeasured,
+            principles.retired,
+        ),
+        None => println!("principles\tunavailable"),
     }
     Ok(())
 }

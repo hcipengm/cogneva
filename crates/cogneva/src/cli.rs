@@ -142,9 +142,10 @@ COMMANDS:
                            reading
     governance <SUB>       Read the face graph, print its verdict, write its projection,
                            or import the roster; <SUB> is one of faces, drift,
-                           project, import-faces
+                           project, import-faces, progress
     work <SUB> --unit <u>  Act on the tasks the graph assigns to one unit; <SUB> is one
-                           of queue, claim, start, heartbeat, complete, fail, release
+                           of queue, claim, start, heartbeat, complete, fail, release,
+                           inbox
 
     With no COMMAND the full application starts.
 

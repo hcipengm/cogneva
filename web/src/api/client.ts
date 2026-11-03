@@ -2268,6 +2268,73 @@ export async function getGovernanceChanges(): Promise<ChangesPage> {
   return api.get<ChangesPage>('/api/v1/governance/changes');
 }
 
+// ── 三本账的一拍进度 ──
+
+/** 一个 unit 还答不答话。三档：`unreadable` 是「这一拍没问出答案」，不是「不在」。 */
+export type Presence = 'present' | 'absent' | 'unreadable';
+
+export interface ProgressStateCell {
+  state: string;
+  open: boolean;
+  rows: number;
+}
+
+/** 一个责任人名下有什么。只有持有未结活的 unit 会出现在这张表里。 */
+export interface OwnerProgress {
+  unit: string;
+  presence: Presence;
+  open: number;
+  completed: number;
+  failed: number;
+  cancelled: number;
+  oldest_open_at?: string | null;
+}
+
+export interface TaskProgress {
+  rows: number;
+  open: number;
+  /** 开着、行上却没有 `owner_unit`、而且本来该有人领的活。它们不在任何一个责任人名下。 */
+  unowned_open: number;
+  /** 开着、没有归属、但本来就不该被谁领的行：没闭上的目标占位行。 */
+  unowned_goals: number;
+  /** 还是 pending、行上却带着错的活：被放回队里、从未开工的那一批。 */
+  returned_to_line: number;
+  by_state: ProgressStateCell[];
+  owners: OwnerProgress[];
+}
+
+export interface ChangeProgress {
+  rows: number;
+  outstanding: number;
+  settled: number;
+  by_state: ProgressStateCell[];
+}
+
+export interface PrincipleProgress {
+  rows: number;
+  enforced: number;
+  unenforced: number;
+  unmeasured: number;
+  retired: number;
+}
+
+/**
+ * 三本账在同一个时刻的一份读数。
+ *
+ * `changes` / `principles` 缺席表示这个部署没接上那一本，不是「那一本没有欠账」：
+ * 一串零会被读成后者，而两件事要的处置相反。
+ */
+export interface ProgressPage {
+  generated_at: string;
+  tasks: TaskProgress;
+  changes?: ChangeProgress | null;
+  principles?: PrincipleProgress | null;
+}
+
+export async function getProgress(): Promise<ProgressPage> {
+  return api.get<ProgressPage>('/api/v1/governance/progress');
+}
+
 // ── 变更队列 ──
 
 /** 一条变更候选。`status` 是它在流水线上的位置，服务端给的是原字符串。 */

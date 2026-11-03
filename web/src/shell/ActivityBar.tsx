@@ -20,6 +20,7 @@ const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'flow', label: '流程', icon: 'flow' },
   { id: 'comms', label: '通信', icon: 'comms' },
   { id: 'agents', label: '智能体', icon: 'agents' },
+  { id: 'progress', label: '进度', icon: 'platform' },
   { id: 'changes', label: '变更', icon: 'changes' },
   { id: 'governance', label: '治理', icon: 'governance' },
   { id: 'observability', label: '观测', icon: 'observability' },

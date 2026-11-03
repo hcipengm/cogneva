@@ -20,6 +20,7 @@ export type ActivityId =
   | 'flow'
   | 'comms'
   | 'alerts'
+  | 'progress'
   | 'changes'
   | 'governance'
   | 'observability'
@@ -44,6 +45,7 @@ export const VIEW_TITLES: Record<ActivityId, string> = {
   flow: '流程',
   comms: '通信',
   alerts: '告警',
+  progress: '进度',
   changes: '变更',
   governance: '治理',
   observability: '观测',

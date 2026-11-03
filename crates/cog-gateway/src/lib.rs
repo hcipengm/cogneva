@@ -63,6 +63,7 @@ pub mod pace_reservations;
 pub mod plugin;
 pub mod process_reports;
 pub mod processes;
+pub mod progress;
 pub mod project_audit;
 pub mod project_control;
 pub mod project_rate_limit;
@@ -1034,6 +1035,10 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/v1/governance/faces", get(governance::faces_handler))
         .route("/api/v1/governance/drift", get(governance::drift_handler))
+        .route(
+            "/api/v1/governance/progress",
+            get(progress::progress_handler),
+        )
         .route(
             "/api/v1/governance/principles",
             get(governance::principles_handler),
