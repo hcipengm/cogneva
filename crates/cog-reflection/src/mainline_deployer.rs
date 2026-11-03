@@ -17326,8 +17326,8 @@ exec {real} "$@"
     ///
     /// 今天的现场：`248bd700` 的 macos 检查排队 15 分钟后被平台取消，其余 16 条全绿。
     /// 部署器那一层扣满窗口之后按「没有证据」放行并派了 Job，而这一层把同一次取消又
-    /// 读成一次失败，Job 于是立在那儿失败——放行换来的只是下一扇门上同一个扣。没有这一
-    /// 条，主线就会一直卡在一个永远不会再有人回答的 rev 上。
+    /// 读成一次失败，Job 于是立在那儿失败——放行换来的只是下一扇门上同一个扣，这一版
+    /// 永远不会落地，每一轮还重走一遍窗口加一次构建。
     #[tokio::test]
     async fn a_cancellation_past_the_window_does_not_hold_the_pre_apply_gate() {
         let cancelled_ago = chrono::Utc::now() - chrono::Duration::minutes(31);
