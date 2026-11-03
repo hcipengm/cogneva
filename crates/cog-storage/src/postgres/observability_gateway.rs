@@ -31,6 +31,8 @@ use super::state_reads::{
 /// old they are, because nothing here has an opinion about age. A deployment
 /// that wants the other rule needs a sweep with a clock in it, which this is
 /// deliberately not.
+// cap: bound — from what a run report is for (a year of daily runs), not from a
+// measurement on any host
 pub const LOG_LINES_PER_TASK: i64 = 200;
 
 /// This store's schema, and the one a restore replays.
