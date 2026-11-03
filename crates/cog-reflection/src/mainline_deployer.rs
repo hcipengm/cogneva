@@ -18237,6 +18237,9 @@ exec {real} "$@"
             (R::Http(429), "http_rate_limited"),
             (R::Http(500), "http_upstream_error"),
             (R::Http(418), "http_other"),
+            // 唯一一格不是「这一问没发生」也不是「问到了、没有可判的东西」：回答来了，
+            // 而那个回答说的是跑检查的机器，不是这棵树。
+            (R::InfrastructureFailed, "infrastructure_failed"),
         ];
         for (reason, label) in cases {
             assert_eq!(reason.label(), label);
