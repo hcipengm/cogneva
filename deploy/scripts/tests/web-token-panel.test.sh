@@ -216,9 +216,15 @@ export function cacheWriteValue(rows: any[]): string {
   return rows.every((row: any) => row.api_style !== 'anthropic') ? '这家不报' : '还没进账';
 }
 export function cacheWriteNote(rows: any[]): string {
-  return cacheWrite(rows) === null
-    ? '这一半要等一次成功调用把用量带回来才有数（现网镜像还没有这一列）'
-    : '上游报的缓存写入量';
+  const tokens = cacheWrite(rows);
+  if (tokens === null) {
+    return '这一半要等一次成功调用把用量带回来才有数（现网镜像还没有这一列）';
+  }
+  const readBack = rows.reduce((sum, row) => sum + (row.tokens_cached ?? 0), 0);
+  if (tokens === 0 && readBack > 0) {
+    return '没有写过的缓存读不回来，所以这个 0 不是「这段没建过缓存」';
+  }
+  return '上游报的缓存写入量';
 }
 export function cacheWriteLanding(
   pool: any,
@@ -803,6 +809,22 @@ fixture
 rm "${work}/crates/cog-core/src/roles.rs"
 [ -f "${work}/crates/cog-core/src/roles.rs" ] && fail "删不掉 roles.rs"
 expect_red "没有角色的正本" "找不到 roles::ALL"
+
+# 46. 写入报 0 时不去读同一窗的读回量：那一个 0 单看只能说「这段没建过缓存」，
+#     而它也可能是「前缀每发都在变」——两种读法的修法相反，屏上却只有一种。
+fixture
+sed -i 's/(row.tokens_cached ?? 0)/0/' "${work}/web/src/observability/usageRows.ts"
+grep -qF "tokens_cached" "${work}/web/src/observability/usageRows.ts" \
+  && fail "改动没落到 usageRows.ts：读回量还在"
+expect_red "没读读回量" "没有读同一窗的读回量"
+
+# 47. 读了读回量却没把矛盾说出来：两个数并在同一句里而不断言它们互斥，读者照样
+#     可以按「前缀不稳」去改一整条提示词装配路径，而问题不在这里。
+fixture
+sed -i 's/没有写过的缓存读不回来/上游这一格可能不逐次报/' \
+  "${work}/web/src/observability/usageRows.ts"
+confirm "${work}/web/src/observability/usageRows.ts" "上游这一格可能不逐次报"
+expect_red "没说矛盾" "没有把「写了 0、读了 N」判成互相矛盾"
 
 # 真树：今天必须绿，否则这条门守的是夹具、不是这棵树。
 got=0
