@@ -4193,6 +4193,8 @@ fn name_unclosable_kinds(unclosable: &std::collections::BTreeMap<String, Vec<Str
         if named.insert(kind.clone()) {
             // The first few are enough to go and look; a kind with hundreds
             // would otherwise put the same text on one line forever.
+            // cap: bound — 前几行够照着去查；行数本身在同一条日志里另印（rows=），
+            // 截断不丢事实，只丢重复
             const NAMED_ROWS: usize = 5;
             let shown: Vec<&str> = ids.iter().take(NAMED_ROWS).map(String::as_str).collect();
             tracing::warn!(
