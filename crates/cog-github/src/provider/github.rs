@@ -441,13 +441,9 @@ impl CodePlatformProvider for GitHubProvider {
                     let text = String::from_utf8_lossy(&resp.body).into_owned();
                     let remaining = MAX_TOTAL_LOG_BYTES - total_bytes;
                     let cap = MAX_JOB_LOG_BYTES.min(remaining);
-                    let tail = log_tail(&text, cap);
-                    total_bytes += tail.len();
-                    logs.push(CiJobLog {
-                        job_id: job.id.into_inner(),
-                        job_name: job.name,
-                        log_tail: tail,
-                    });
+                    let record = job_log_record(job.id.into_inner(), job.name, &text, cap);
+                    total_bytes += record.log_tail.len();
+                    logs.push(record);
                 }
                 Ok(resp) => {
                     tracing::warn!(
@@ -678,6 +674,106 @@ fn run_holding_the_failure(runs: &[CiRunSummary], sha: &str) -> Option<u64> {
         .map(|r| r.run_id)
 }
 
+/// Whether one line of a job log is the step saying what failed.
+///
+/// Deliberately not `##[error]` alone. The runner ends every failed job with
+/// `##[error]Process completed with exit code N.`, which reports that the step
+/// failed and nothing about why, so anchoring there hands the reader the line it
+/// already knew. Cargo is worse than silent here: it prints no `##[error]` at
+/// all, so the only lines in the log that name the failing test carry none of
+/// the runner's markers.
+fn reports_a_failure(line: &str) -> bool {
+    let text = line.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return false;
+    }
+    if text.contains("##[error]") {
+        // The runner's own summary of how the step ended: an exit code, or the
+        // cancellation notice. Both say "it failed", neither says where.
+        return !text.contains("process completed with exit code")
+            && !text.contains("the operation was canceled");
+    }
+    // Not a bare `error:`. The service containers a job runs — Postgres among
+    // them — write `ERROR:` on every line of the shutdown this is trying to
+    // skip, so a loose marker hands the anchor straight back to them.
+    [
+        "test result: failed",
+        "panicked at",
+        "failures:",
+        "error[e",
+        "error: could not compile",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+/// The part of a failed job's log that says what failed.
+///
+/// The last bytes of a failed GitHub job are not the failure. The runner tears
+/// down the job's service containers after the steps, and streams their shutdown
+/// into the same log, so a window measured backwards from the end can land
+/// entirely inside a database's startup banner. Measured 2026-11-03 on run
+/// 41706590741: the `Test` job's sixteen-kilobyte tail was sixteen kilobytes of
+/// Postgres, and the fix task built from it carried not one line of the cargo
+/// output it was supposed to repair.
+///
+/// Anchored on the last line that reports a failure — [`reports_a_failure`] —
+/// and cut back to `cap` bytes before it. Nothing after the anchor is kept:
+/// being the last such line, everything following it is the runner's account of
+/// the aftermath, and one blank line is not what separates the two — the
+/// teardown streams without any.
+///
+/// A log that carries no such line keeps its own tail: a missing anchor is not
+/// evidence that nothing failed, and answering with nothing would leave the
+/// reader worse off than the end of the log does.
+///
+/// This is not the deployer's tail, which anchors on `##[error]` on purpose: it
+/// answers "did this step fail", and here the question is "where".
+fn failure_evidence(text: &str, cap: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(anchor) = lines.iter().rposition(|line| reports_a_failure(line)) else {
+        return log_tail(text, cap);
+    };
+    let mut kept: Vec<&str> = Vec::new();
+    let mut budget = cap;
+    for line in lines[..=anchor].iter().rev() {
+        let width = line.len() + 1;
+        if width > budget {
+            // One line can be larger than the whole budget; keep its end, which
+            // is where that line says what it has to say.
+            if kept.is_empty() {
+                let start = line.len().saturating_sub(budget);
+                let start = line
+                    .char_indices()
+                    .map(|(at, _)| at)
+                    .find(|at| *at >= start)
+                    .unwrap_or(line.len());
+                kept.push(&line[start..]);
+            }
+            break;
+        }
+        budget -= width;
+        kept.push(line);
+    }
+    kept.reverse();
+    kept.join("\n")
+}
+
+/// One failed job's contribution to this run's evidence.
+///
+/// The whole record is built here rather than at the call site so that what a
+/// job passes on is one function, and a test can reach it without a GitHub: the
+/// loop around it needs a live octocrab client to list the jobs, which is how a
+/// tail that answers the wrong question could sit in the loop with every test
+/// green.
+fn job_log_record(job_id: u64, job_name: String, text: &str, cap: usize) -> CiJobLog {
+    CiJobLog {
+        job_id,
+        job_name,
+        log_tail: failure_evidence(text, cap),
+    }
+}
+
 /// Keep the last `cap` bytes of `text`, starting on a char boundary.
 fn log_tail(text: &str, cap: usize) -> String {
     if text.len() <= cap {
@@ -799,6 +895,50 @@ mod tests {
         // Unknown conclusions fail closed.
         let unknown = vec!["startup_failure".to_string()];
         assert_eq!(fold_ci_signals(true, false, &unknown), Some(false));
+    }
+
+    /// The shape of run 41706590741's `Test` job: the cargo failure, then a
+    /// service container's shutdown streamed over it, then the runner's own
+    /// one-line summary. A tail measured from the end reads as a platform whose
+    /// tests failed somewhere a reader is never shown.
+    #[test]
+    fn the_evidence_is_the_test_that_failed_not_the_service_container_shutdown() {
+        let mut log = String::new();
+        log.push_str("2026-11-03T20:05:10.0000000Z      Running tests/suite.rs\n");
+        log.push_str(
+            "2026-11-03T20:05:11.0000000Z  thread 'main' panicked at crates/x/src/lib.rs:12:\n",
+        );
+        log.push_str("2026-11-03T20:05:11.0000000Z  the fixture never settled\n");
+        log.push_str("2026-11-03T20:05:12.0000000Z  test result: FAILED. 3 passed; 1 failed\n");
+        for i in 0..4000 {
+            log.push_str(&format!(
+                "2026-11-03T20:06:{:02}.0000000Z  2026-11-03 20:06:01.416 UTC [1792] ERROR:  \
+                 column role does not exist at {i}\n",
+                i % 60
+            ));
+        }
+        log.push_str(
+            "2026-11-03T20:06:20.0000000Z ##[error]Process completed with exit code 101.\n",
+        );
+        log.push_str("2026-11-03T20:06:20.1000000Z Cleaning up orphan processes\n");
+
+        let tail = job_log_record(1, "Test".into(), &log, 16 * 1024).log_tail;
+        assert!(
+            tail.contains("test result: FAILED"),
+            "取到的日志里没有那条失败的测试，接手的 agent 拿到的是容器停机日志：{tail}"
+        );
+        assert!(
+            !tail.contains("[1792] ERROR"),
+            "服务容器的停机日志被当成了失败证据：{tail}"
+        );
+        assert!(tail.len() <= 16 * 1024, "证据超出了这一条 job 的字节上限");
+    }
+
+    /// The runner's exit-code line is a summary, not a place.
+    #[test]
+    fn a_job_that_ends_with_only_the_runners_summary_keeps_its_tail() {
+        let log = "step output\n##[error]Process completed with exit code 1.\n";
+        assert_eq!(failure_evidence(log, 1024), log);
     }
 
     #[test]
