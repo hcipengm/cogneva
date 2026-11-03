@@ -193,6 +193,126 @@ pub fn init_subscriber_with_pusher(
     handle
 }
 
+/// Log level and console format for a process that reads them from the
+/// environment rather than from a plugin context.
+///
+/// `COGNEVA_LOG_LEVEL` wins over `RUST_LOG` because the former is what the
+/// deployment renders for a workload that has no `cogneva.json`; the latter is
+/// the operator's shell override. Both absent means `info`.
+pub fn level_and_format() -> (String, crate::LogFormat) {
+    let level = std::env::var(cog_core::env::LOG_LEVEL)
+        .or_else(|_| std::env::var("RUST_LOG"))
+        .unwrap_or_else(|_| "info".into());
+    let format = if std::env::var("COGNEVA_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false)
+    {
+        crate::LogFormat::Json
+    } else {
+        crate::LogFormat::Pretty
+    };
+    (level, format)
+}
+
+/// Install the subscriber for a process that never reaches the plugin
+/// assembly: a node-side daemon, a one-shot Job, or a subcommand entry point.
+///
+/// The reason this exists at all is that stdout belongs to the container, and
+/// the container is deleted the moment anyone wants to read it. A process that
+/// only writes stdout therefore loses the narrative of every failure that
+/// killed it, at exactly the moment the failure matters — the deploy that
+/// rolled back, the Job that exited non-zero, the daemon that crash-looped.
+/// The verdicts these processes produce are already written to files and
+/// tables; what is lost is why.
+///
+/// It reads the same `observability` section and the same env overrides as the
+/// assembled application, so `COGNEVA_LOKI_ENDPOINT` alone decides whether a
+/// workload's lines outlive its pod. Nothing set means `loki.enabled` stays at
+/// its default of false and the process keeps the plain stdout subscriber it
+/// had before — a missing observability backend must never keep a daemon from
+/// starting.
+///
+/// `service` becomes the stream's `service_name`. It has to be the workload's
+/// own name: by the time anyone reads the stream the pod that wrote a line is
+/// gone, so one stream shared by several processes leaves no way to tell which
+/// of them went silent.
+///
+/// Jaeger is deliberately not consulted here. Its initializer owns the global
+/// subscriber in the assembled application, but no standalone entry point runs
+/// that initializer, so skipping Loki on `jaeger.enabled` would drop these
+/// processes' logs for a mirror that was never installed.
+/// `make_client` builds the outbound client only when this process is
+/// configured to push. It is a closure rather than a client because the
+/// implementation lives in a crate this one may not depend on: components talk
+/// to each other through `cog-core`, and the assembly layer is the one place
+/// allowed to know which HTTP implementation the process runs. Calling it only
+/// when a push is configured keeps a stdout-only process from paying for an
+/// HTTP stack it will never use.
+pub fn init_from_env<F>(service: &str, make_client: F) -> LogFilterHandle
+where
+    F: FnOnce() -> Result<Arc<dyn HttpClient>, String>,
+{
+    let (level, format) = level_and_format();
+
+    let config = match crate::ObservabilityExportersConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            // The subscriber goes in first: the warning below is itself a
+            // tracing event, and without a subscriber it lands nowhere.
+            let handle = init_subscriber(&level, format);
+            tracing::warn!(
+                error = %e,
+                "观测配置读不出来，这个进程只写标准输出，日志随容器一起消失"
+            );
+            return handle;
+        }
+    };
+
+    if !config.loki.enabled {
+        return init_subscriber_with_pusher(&level, format, None, service);
+    }
+
+    let client = match make_client() {
+        Ok(client) => client,
+        Err(e) => {
+            let handle = init_subscriber_with_pusher(&level, format, None, service);
+            tracing::warn!(
+                error = %e,
+                "造不出出站 HTTP 客户端，日志只写标准输出，日志随容器一起消失"
+            );
+            return handle;
+        }
+    };
+
+    let push_client = Arc::new(
+        LokiPushClient::new(&config.loki.endpoint)
+            .with_max_retries(config.loki.max_retries.max(1))
+            .with_timeout(config.loki.timeout_secs)
+            .with_label(crate::LABEL_SERVICE, service)
+            .with_client(client),
+    );
+    let pusher = Arc::new(LokiBackgroundPusher::new(
+        push_client,
+        std::time::Duration::from_secs(config.loki.flush_interval_sec.max(1)),
+        config.loki.max_batch_size.max(1),
+    ));
+    let handle = init_subscriber_with_pusher(&level, format, Some(pusher.clone()), service);
+
+    // `run_loop` spawns its own task, so there is nothing to await here — but
+    // spawning needs a runtime. Every current caller is an async entry point;
+    // a future synchronous one should get stdout-only logging rather than a
+    // panic, which is what the guard is for.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        drop(pusher.run_loop());
+    } else {
+        tracing::warn!(
+            service,
+            "没有 async 运行时，Loki 推手起不了循环，日志只写标准输出"
+        );
+    }
+    handle
+}
+
 /// `tracing` layer that mirrors events to a [`LokiBackgroundPusher`].
 ///
 /// Without this the Loki client has nothing feeding it — the structured logs

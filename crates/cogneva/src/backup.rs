@@ -5368,19 +5368,8 @@ fn scrub_error(text: &str, database_url: &str) -> String {
     scrubbed.chars().take(ERROR_TEXT_MAX_CHARS).collect()
 }
 
-fn install_subscriber() {
-    // 子命令不经 run_app，没有早鸟订阅者；Job Pod 日志全靠这里装。
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-}
-
 /// `cogneva backup`：CronJob 与手动共用入口。
 pub async fn run_backup_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    install_subscriber();
     let cfg = BackupConfig::from_env()?;
     let package = run_backup(&cfg).await?;
     println!("{}", package.display());
@@ -5393,7 +5382,6 @@ pub async fn run_backup_from_env() -> Result<(), Box<dyn std::error::Error>> {
 /// 用，但两者都要有——只落库不退出非零，集群面看不到这次失败；只退出非零不落库，
 /// 读数面看不到为什么。
 pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    install_subscriber();
     let cfg = DrillConfig::from_env()?;
     let live = PgPool::connect(&cfg.database_url).await?;
     let store = PostgresBackupRunStore::new(live.clone());
@@ -5458,7 +5446,6 @@ pub async fn run_drill_from_env() -> Result<(), Box<dyn std::error::Error>> {
 
 /// `cogneva restore <pkg>`：换机/重装的一次性恢复 Job 入口。
 pub async fn run_restore_from_env() -> Result<(), Box<dyn std::error::Error>> {
-    install_subscriber();
     let pkg = std::env::args()
         .nth(2)
         .ok_or("usage: cogneva restore <package.tar.zst|dir>")?;

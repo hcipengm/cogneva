@@ -40,6 +40,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: claim-store
+        cogneva.io/logs: self
         app.kubernetes.io/version: "0.5.10"
     spec:
       # 不挂 ServiceAccount token：这个进程只读宿主文件，从不与 apiserver 说话，
@@ -60,6 +61,10 @@ spec:
           command: ["/opt/cogneva/cogneva"]
           args: ["claim-store"]
           env:
+            - name: COGNEVA_LOKI_ENABLED
+              value: "true"
+            - name: COGNEVA_LOKI_ENDPOINT
+              value: "http://loki.monitoring.svc.cluster.local:3100"
             - name: COGNEVA_CLAIM_STORE_PORT
               value: "9100"
             - name: COGNEVA_CLAIM_STORE_ROOT

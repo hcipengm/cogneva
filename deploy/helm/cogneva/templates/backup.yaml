@@ -53,6 +53,7 @@ spec:
           labels:
             app.kubernetes.io/name: cogneva
             app.kubernetes.io/component: backup
+            cogneva.io/logs: self
         spec:
           restartPolicy: Never
           # 备份以专用非 root uid 运行：它以 root 跑的时候「包只有属主可读」不成立，
@@ -112,6 +113,7 @@ spec:
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               args: ["backup"]
               env:
+                {{- include "cogneva.logEnv" . | nindent 16 }}
                 # 导出用 cog_app：它是这些表的属主，pg_dump 读得到全部内容。
                 - name: APP_PASSWORD
                   valueFrom:
@@ -299,6 +301,7 @@ spec:
           labels:
             app.kubernetes.io/name: cogneva
             app.kubernetes.io/component: backup-drill
+            cogneva.io/logs: self
         spec:
           restartPolicy: Never
           # 同备份：演练必须与备份跑在同一个专用非 root uid 上。它读的正是备份
@@ -343,6 +346,7 @@ spec:
               # 窗口的其余成员，而旧包与读端不同步的问题只在旧包上出现。
               args: ["backup-drill", "--also-unproven"]
               env:
+                {{- include "cogneva.logEnv" . | nindent 16 }}
                 # 单趟预算：一份包从解包到对数完。到点由这一跑自己收尾并落一行
                 # `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟账上
                 # 一行都不留，「被杀」于是读作「没跑过」。与

@@ -316,13 +316,12 @@ pub fn router(
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     // Standalone modes do not go through `run_app`, so they own their logging
     // setup; without it the lines below (where an unreadable root is visible)
-    // would go nowhere.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // would go nowhere. Routing it through the shared initializer is what gives
+    // this daemon's lines a life beyond its pod: a container that crash-loops
+    // takes its stdout with it, and the walk it was in the middle of is exactly
+    // what the next person needs to read.
+    // 订阅者由装配层（main.rs）在派发前装：组件不许依赖 cog-observability，
+    // 而这里要的那份日志面（Loki 镜像）住在那儿。
 
     let node = node_from_env();
     let observable = Arc::new(ClaimStoreObservable::new(root_from_env(), node.clone()));

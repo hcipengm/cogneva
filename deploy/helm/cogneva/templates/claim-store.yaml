@@ -52,6 +52,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: claim-store
+        cogneva.io/logs: self
     spec:
       # 不挂 ServiceAccount token：这个进程只读宿主文件，从不与 apiserver 说话，
       # 一份它用不到的集群凭证只会把「跑成 root」的后果放大。
@@ -72,6 +73,7 @@ spec:
           command: ["/opt/cogneva/cogneva"]
           args: ["claim-store"]
           env:
+            {{- include "cogneva.logEnv" . | nindent 12 }}
             - name: COGNEVA_CLAIM_STORE_PORT
               value: {{ .Values.claimStore.port | quote }}
             - name: COGNEVA_CLAIM_STORE_ROOT

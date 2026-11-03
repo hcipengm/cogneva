@@ -1,0 +1,143 @@
+# 节点级日志采集器（Grafana Alloy，`27-log-collector.yaml`）自己的活体。
+#
+# 它停了以后**没有任何一格会变红**：Loki 照常健康、面板照常出图，只是「第三方容器的
+# 日志」这一整类读数从那一刻起不再增长——与「这台机器上没有第三方容器在说话」同形。
+# 缺口只在有人真去查一条日志时才会被发现，而那时已经丢了。
+#
+# 四条判据分工，与进程采集器那一族同一把尺子：
+#
+# 1. **起来了没有**——读 kube-state-metrics 的 DaemonSet 就绪数与应调度数。这条不依赖
+#    平台自己的二进制：DaemonSet 是否就绪是 apiserver 的账。
+# 2. **这个 DaemonSet 还在不在**——`absent`。第 1 条在对象整个消失时什么都不返回，
+#    于是「一台都没起来」与「一切正常」在告警面上同形。
+# 3. **它有东西可跟吗**——读采集器自己报的活跃文件数。前两条都绿、而这一条是零，
+#    正是 2026-11-03 实测到的那个失效形态：Pod Running、探针全绿、一行也不采。
+#    它不按「送上去多少行」判——安静是正常的，库和缓存完全可能几个钟头不吐一个字；
+#    按「有没有目标」判不随流量起伏，`cogneva` 命名空间里只要还有 Pod 就必须非零。
+# 4. **收下的都写进去了吗**——往 Loki 写时被拒的行只有采集器自己记着；Loki 那边
+#    什么也不会说，查询只会少几行。
+#
+# 第 2 条挂了 Loki 在场的条件：`BACKENDS=0` 的安装本来就不装日志后端，那里采集器
+# 缺席是对的，按缺席报红就是一条永远亮着、只能被关掉的规则。判 Loki 在不在用
+# kube-state-metrics 的 `kube_pod_info`（它一直在跑）。第 3 条同理：采集器缺席时它
+# 的指标本来就不存在，所以要挂「DaemonSet 已就绪」这个前提。
+#
+# 第 3、4 条读的是采集器自己导出的指标，抓取目标在同目录的
+# `29-podmonitor-log-collector.yaml`——那份没落地，这两条就是两条永远不存在的规则。
+#
+# 每条规则都带 `cogneva_io_managed` 与 `cogneva_io_face`：前者进告警镜像的投递名单，
+# 后者回答「这一行响了该谁动」。门在 `check-alert-rule-faces.sh`。
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cogneva-log-collector
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: cogneva-log-collector
+      rules:
+        # 有节点没跑起来，或者跑起来之后反复重启到不了 Ready。
+        #
+        # 两边都 `max by (namespace, daemonset)`：KSM 的序列还带它自己 Pod 的名字，
+        # 那个名字在一次 KSM 滚动里就变了，不该出现在告警行上，也不该参与配对。
+        # `for` 取 10 分钟：DaemonSet 滚动时旧 Pod 先删、新 Pod 后起，中间有一小段
+        # Ready 数掉下去，把界压到一分钟等于把每次正常滚动报成故障。
+        - alert: CognevaLogCollectorDown
+          expr: |
+            max by (namespace, daemonset) (
+              kube_daemonset_status_number_ready{namespace="monitoring",daemonset="log-collector"}
+            )
+            <
+            max by (namespace, daemonset) (
+              kube_daemonset_status_desired_number_scheduled{namespace="monitoring",daemonset="log-collector"}
+            )
+          for: 10m
+          labels:
+            severity: warning
+            cogneva_io_managed: "true"
+            cogneva_io_face: 可观测与告警
+          annotations:
+            summary: 节点日志采集器有节点没在跑（Ready {{ $value }}）
+            description: >-
+              DaemonSet `log-collector` 的就绪数少于应调度数。这些节点上第三方容器的标准输出
+              从此刻起不再进 Loki，而 Loki 与面板都不会显示任何异常。看 Pod 为什么没起来：
+              /var/log/pods 与 /var/lib/log-collector 挂载失败、配置解析不过（探针读的是 /-/ready）、
+              或者它在重启。
+
+        # DaemonSet 对象整个不见了。此时第 1 条返回空集、不响，必须由这条来喊。
+        #
+        # `for` 取 5 分钟：收敛循环重放清单时会短暂重建对象，那个窗口不该报红。
+        - alert: CognevaLogCollectorAbsent
+          expr: |
+            absent(
+              max by (namespace, daemonset) (
+                kube_daemonset_status_desired_number_scheduled{namespace="monitoring",daemonset="log-collector"}
+              )
+            )
+            and on()
+            count(kube_pod_info{namespace="monitoring",pod=~"loki-.*"}) > 0
+          for: 5m
+          labels:
+            severity: warning
+            cogneva_io_managed: "true"
+            cogneva_io_face: 可观测与告警
+          annotations:
+            summary: 节点日志采集器整个不见了（Loki 还在）
+            description: >-
+              Loki 在跑，但 `monitoring` 里没有名为 `log-collector` 的 DaemonSet。`cogneva`
+              命名空间里第三方容器的日志此刻只写在节点磁盘上，随 Pod 删除一起消失。
+              别人手工删过它，或者收敛循环这一族清单没落地。
+
+        # 采集器在跑，却一台容器都没在跟。
+        #
+        # 这正是 2026-11-03 实测到的失效形态：Pod Running、就绪绿、探针全绿，
+        # 而它一个文件都没跟——日志面上与「没人在说话」同形。前两条都看不见它：
+        # 对象在、Pod 就绪，读的都是 apiserver 的账。判据必须读采集器自己报的
+        # 「当前跟了几个文件」，那是它唯一说得出口的「我看得见东西」。
+        #
+        # 为什么不是「送上去多少行」：安静是正常的，库和缓存可以几个钟头不吐一个字。
+        # 「有没有目标」不随流量起伏：`cogneva` 命名空间里只要还有 Pod，这个数就
+        # 必须非零。`for` 取 30 分钟：采集器重启后的第一轮同步、单个文件轮转都在
+        # 这个量级以内自己恢复。
+        - alert: CognevaLogCollectorBlind
+          expr: |
+            max(loki_source_file_files_active_total{component_id="loki.source.file.pods"}) == 0
+            and on()
+            max(kube_daemonset_status_number_ready{namespace="monitoring",daemonset="log-collector"}) > 0
+            and on()
+            count(kube_pod_info{namespace="cogneva"}) > 0
+          for: 30m
+          labels:
+            severity: warning
+            cogneva_io_managed: "true"
+            cogneva_io_face: 可观测与告警
+          annotations:
+            summary: 节点日志采集器在跑，但一台容器的日志都没在跟
+            description: >-
+              采集器报的当前跟踪文件数是 0，而 `cogneva` 命名空间里有 Pod、DaemonSet
+              也已就绪。此刻第三方容器的标准输出没有任何去处，且 Loki 与面板都不会显示
+              异常。先看它的日志里有没有「failed to tail file」：文件路径拼错（目录名是
+              `<命名空间>_<Pod>_<uid>`）与 pod 发现拿不到目标，是这条读数归零的两种常见
+              原因。
+
+        # 采集器收下了，往 Loki 写的时候丢掉了。
+        #
+        # 沉掉的行在 Loki 那边不存在，查询看不见缺了哪一行，只有采集器自己记着。
+        # 按 30 分钟增量判而不是按总量：这是只增不减的计数器，按总量判会让第一次
+        # 丢包永久点亮。
+        - alert: CognevaLogCollectorDroppingEntries
+          expr: |
+            sum(increase(loki_write_dropped_entries_total{component_id="loki.write.default"}[30m])) > 0
+          for: 5m
+          labels:
+            severity: warning
+            cogneva_io_managed: "true"
+            cogneva_io_face: 可观测与告警
+          annotations:
+            summary: 节点日志采集器往 Loki 写的时候在丢行（30 分钟 {{ $value }} 行）
+            description: >-
+              `reason` 标签说明为什么：`rate_limited` 是 Loki 的摄入限流、
+              `line_too_long` 是单行超过上限、`ingester_error` 是后端拒绝。
+              这些行只有节点磁盘上一份，过一会儿随 Pod 删除一起消失。

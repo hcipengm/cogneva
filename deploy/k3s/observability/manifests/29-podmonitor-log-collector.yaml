@@ -1,0 +1,33 @@
+# PodMonitor — 抓节点级日志采集器（`27-log-collector.yaml` 的 Alloy）自己的读数。
+#
+# 为什么需要这份：采集器的两种失效在别处都看不见。第一种是 2026-11-03 实测到的
+# ——Pod Running、探针全绿、一行也不采（promtail 3.4.1 在本集群 pod 发现返回零
+# 目标），日志面上它与「这台机器上没有容器在说话」同形；第二种是往 Loki 写的时候
+# 被拒（限流、单行超长），行在采集器里被丢掉，Loki 那边什么也不会说。
+# 前者靠 `loki_source_file_files_active_total`，后者靠
+# `loki_write_dropped_entries_total`，两条都在这个端点上。
+#
+# 按 Pod 抓、不经 Service：采集器是每节点一个的 DaemonSet，没有稳定的服务面，
+# 而这份读数的语义就是「每台节点自己的采集器」，按 Pod 抓正好一台一条。
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: log-collector
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/part-of: cog-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - monitoring
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: log-collector
+  podMetricsEndpoints:
+    # 端口名必须与 27 里声明的端口名一致：抓一个没人提供的端口，等于这两条
+    # 告警在每条查询里都不存在，而「不存在」看起来和「没发生」一样。
+    - port: http-metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      honorLabels: true

@@ -24,6 +24,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva-evolution
         app.kubernetes.io/component: evolution
+        cogneva.io/logs: self
         app.kubernetes.io/version: "0.5.10"
     spec:
       serviceAccountName: cogneva-evolution

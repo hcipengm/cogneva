@@ -117,13 +117,11 @@ pub fn router(observable: Arc<HostLedgerObservable>) -> Router {
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     // Standalone modes do not go through `run_app`, so they own their logging
     // setup; without it the lines below (the only place an unreachable slice is
-    // visible) would go nowhere.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // visible) would go nowhere. Through the shared initializer they also
+    // outlive the container, so a node that keeps failing to read its cgroup
+    // tree leaves a history instead of a single restart count.
+    // 订阅者由装配层（main.rs）在派发前装：组件不许依赖 cog-observability，
+    // 而这里要的那份日志面（Loki 镜像）住在那儿。
 
     let observable = Arc::new(HostLedgerObservable::new(root_from_env(), node_from_env()));
     let listening = observable.readable_slices();

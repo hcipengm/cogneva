@@ -328,6 +328,17 @@ spec:
       ports:
         - protocol: TCP
           port: 443
+    # 观测栈的日志入口（Loki 的 push 端点）。沙箱执行器现在也把日志镜像到
+    # 那里：它的容器日志里是「这段代码为什么跑不过」，而容器一删就只剩退出码。
+    # 少了这一条，推手每轮都在重试，而「被策略丢掉的日志」与「本来就没产生
+    # 日志」从外面看一样。
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 3100
 ---
 # 主应用 Pod 的入站面。这条策略存在的唯一理由是给内部端口（8085）一道判据：
 # 那几条 memory 路由必须让零凭证的 Pod 够到，所以它们不能按角色判；换个地方判，

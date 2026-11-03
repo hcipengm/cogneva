@@ -47,6 +47,24 @@ containerd 那一条恒在（它就是 `imageStoreMountPath`），其余来自
 {{- end -}}
 
 {{/*
+日志后端的两行环境变量，给**不挂 `cogneva-json`** 的工作负载用。
+
+主应用与进化进程从 files/cogneva.json 的 observability 段读同一组值（app-config.yaml
+在渲染时把这里的值改写成那边的一份）；节点侧守护进程与一次性 Job 不挂那份配置，
+它们的订阅者只从环境读。两处都指向 `observability.loki`，地址因此仍只有一份。
+
+为什么这些工作负载也要接上去：它们的日志此前只写容器 stdout，容器一删就没了，
+而「这个 Job 为什么失败」「这台节点的走查为什么起不来」正需要那段日志——留下
+的退出码说不出它停在哪一步。
+*/}}
+{{- define "cogneva.logEnv" -}}
+- name: COGNEVA_LOKI_ENABLED
+  value: {{ .Values.observability.loki.enabled | quote }}
+- name: COGNEVA_LOKI_ENDPOINT
+  value: {{ .Values.observability.loki.endpoint | quote }}
+{{- end -}}
+
+{{/*
 网页检索与渲染后端的地址：`webSearch.base` / `webFetch.base` 留空时按 port 与
 Service 名派生。
 

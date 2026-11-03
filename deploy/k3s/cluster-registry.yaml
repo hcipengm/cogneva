@@ -159,6 +159,10 @@ spec:
           # 二进制。
           imagePullPolicy: Always
           env:
+            - name: COGNEVA_LOKI_ENABLED
+              value: "true"
+            - name: COGNEVA_LOKI_ENDPOINT
+              value: "http://loki.monitoring.svc.cluster.local:3100"
             # 声明照卷族既有格式写（`claim=路径`），量出来的数挂在同名卷上，
             # 与其它工作负载自量挂载产出的是同一条序列。
             - name: COGNEVA_DATA_VOLUME_MOUNTS

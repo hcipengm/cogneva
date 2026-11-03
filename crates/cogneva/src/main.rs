@@ -57,6 +57,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cogneva::process_report::spawn();
     }
 
+    // 独立模式的日志订阅者由此处装，而不是由各入口自己装。理由是依赖方向：
+    // 这些入口分别住在 cog-reflection / cog-extension 里，而组件之间只许依赖
+    // cog-core，让它们各自去够 cog-observability 就是把星形图连成格子。装配层
+    // 本来就负责「把零件接起来」，装订阅者正是这件事。
+    //
+    // 装在这里还有一个顺序上的好处：入口函数里的第一行之前的一切——参数解析、
+    // 配置加载、根目录不可用这类判断——此前发生在订阅者装上之前，落进 no-op
+    // 默认订阅者，容器日志里只剩 main.rs 那句 eprintln。挪到这里，这些行就有了。
+    //
+    // 只给常驻与一次性 Job 模式装：其余子命令的标准输出是协议本身（MCP 的
+    // JSON-RPC、评测表的表格），一个默认写标准输出的订阅者会把它们污染。
+    if let Some(service) = standalone_log_service(&command) {
+        // 出站 HTTP 客户端由装配层造：实现住在 cog-net，而组件之间只许依赖
+        // cog-core。这些模式不挂 cogneva.json，`HttpClientConfig::load` 读不到时
+        // 退回默认值——它们唯一要够到的地址，是自己的 env 里那个 Loki 端点。
+        cog_observability::logs::init_from_env(service, || {
+            let config = cog_net::HttpClientConfig::load()
+                .map_err(|e| format!("HTTP 客户端配置读不出来: {e}"))?;
+            let client = cog_net::ReqwestHttpClient::from_config(&config)
+                .map_err(|e| format!("HTTP 客户端造不出来: {e}"))?;
+            Ok(std::sync::Arc::new(client) as std::sync::Arc<dyn cog_core::HttpClient>)
+        });
+    }
+
     match command {
         // 完整应用（无参数时的默认行为）。
         //
@@ -211,3 +235,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
+
+/// The stream name for a command that runs as its own workload in the cluster.
+///
+/// The name is the workload's own, because it is what a reader filters on after
+/// the pod is gone. `None` covers everything that is not a workload: the
+/// assembled application and the gateway install their own logging through the
+/// plugin assembly, and the stdout-protocol commands must not have a subscriber
+/// writing into their output.
+fn standalone_log_service(command: &Command) -> Option<&'static str> {
+    STANDALONE_LOG_SERVICES
+        .iter()
+        .find(|(wired, _)| wired == command)
+        .map(|(_, service)| *service)
+}
+
+/// Which command writes its logs under which stream name.
+///
+/// A table rather than a `match` arm set: the dispatch below is a `match` over
+/// the same enum, and a second one makes every reader of the arms — including
+/// the gates that resolve an arm's Rust path to the code it starts — read the
+/// wrong one.
+const STANDALONE_LOG_SERVICES: &[(Command, &str)] = &[
+    // The workload's own name, declared once in the base for the one that the
+    // object-name gate protects.
+    (
+        Command::SandboxExecutor,
+        cog_core::topology::SANDBOX_EXECUTOR,
+    ),
+    (Command::VolumeWalker, "cogneva-volume-walker"),
+    (Command::HostLedger, "cogneva-host-ledger"),
+    (Command::ProcessCensus, "cogneva-process-census"),
+    (Command::ClaimStore, "cogneva-claim-store"),
+    (Command::MainlineRollout, "cogneva-mainline-rollout"),
+    (Command::MainlineUndeliver, "cogneva-mainline-undeliver"),
+    (Command::ExecuteChange, "cogneva-execute-change"),
+    (Command::Backup, "cogneva-backup"),
+    (Command::Restore, "cogneva-restore"),
+    (Command::BackupDrill, "cogneva-backup-drill"),
+];

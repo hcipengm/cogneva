@@ -207,6 +207,9 @@ pub fn root_is_usable(root: &Path) -> Result<(), String> {
 
 /// 采集器自己的入口。
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
+    // 这个入口此前一条订阅者都没装：进程里所有 tracing 事件落进 no-op 默认
+    // 订阅者，容器日志里只剩 main.rs 那句 eprintln。现在由装配层在派发前装上，
+    // 下面每一处判断（根可用、镜像表读失败）才在日志里有痕迹。
     let root = PathBuf::from(
         std::env::var(ROOT_ENV)
             .ok()

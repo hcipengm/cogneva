@@ -61,6 +61,8 @@ mod a_job_inner_wait_budget_widens_the_job_deadline_test;
 mod a_label_name_is_the_same_wherever_it_is_declared_test;
 #[path = "a_node_capacity_probe_is_written_once_test.rs"]
 mod a_node_capacity_probe_is_written_once_test;
+#[path = "a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test.rs"]
+mod a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test;
 #[path = "a_relation_reading_is_one_query_test.rs"]
 mod a_relation_reading_is_one_query_test;
 #[path = "a_retention_knob_says_what_zero_means_test.rs"]
@@ -73,6 +75,8 @@ mod a_successful_write_rings_the_bell;
 mod a_waiting_reason_is_declared_once_test;
 #[path = "a_word_written_out_is_the_word_read_back_test.rs"]
 mod a_word_written_out_is_the_word_read_back_test;
+#[path = "a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test.rs"]
+mod a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test;
 #[path = "agent_consumer_test.rs"]
 mod agent_consumer_test;
 #[path = "agent_context_test.rs"]

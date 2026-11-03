@@ -1,0 +1,258 @@
+# 节点级日志采集：每台节点一个 pod，把 `cogneva` 命名空间里每个容器的标准输出
+# 送进 Loki。
+#
+# 为什么需要它：网关、进化、安全网关与各独立子命令在自己的进程里直推 Loki，这条路
+# 只覆盖「本平台的二进制」。同命名空间里还跑着库、缓存、向量库、入口代理、镜像仓库
+# 与各种边车——这些第三方容器的日志此前只写节点上的 /var/log/pods，容器一删就没了。
+# 「postgres 为什么拒绝连接」「registry 为什么推不上去」正是要读那一段的时候。
+#
+# 谁不采：已经在进程里直推的容器，采集一次就等于同一行日志进 Loki 两遍。判据是 Pod
+# 上的标签 `cogneva.io/logs: self`——**凡该 Pod 的非 init 容器都在自己直推**的 Pod 才
+# 带这个标签（init 容器永远不直推：它们跑的是 sh 脚本）。所以丢弃规则两头都限住：
+#
+#   self;(false)?  —— 标签是 self 且不是 init 容器 ⇒ 丢
+#
+# 读法：两个源标签用 `;` 连起来再整串匹配。标签在而 `__meta_kubernetes_pod_container_init`
+# 缺（非 init 容器）时得到 `self;`，同样落进上面那个正则——失效方向是「多丢」而不是
+# 「重复写」，因为重复写会一直涨、而少采的那一行下一次部署就能补。
+#
+# 为什么是 Alloy 而不是 promtail：promtail 自 2025-03 起停止维护，3.4.1 在本集群
+# （k8s 1.36）上 pod 发现静默返回零目标——进程活着、/ready 报「没有日志可跟」、一行
+# 也不采，而日志面上它与「没有容器在说话」同形。Alloy 是它的官方继任者，relabel
+# 语义逐条相同，所以上面那条两源标签的规则可以原样搬过来。
+#
+# 也不能换成按 Pod 标签过滤的那类采集器（Vector 一类）：它们只认 Pod 标签选择器，
+# 标签为 self 的 Pod 是整台丢掉，**init 容器跟着一起丢**——而那正是「Pod 为什么卡在
+# Init」唯一的第一现场。init 与非 init 两分只有 relabel 的
+# `__meta_kubernetes_pod_container_init` 能给。
+#
+# 有一处刻意不贴标签：cogneva-registry。同一个 Pod 里 registry 容器是第三方镜像、
+# 不直推，贴了标签就等于把镜像仓库自己的日志一起丢掉——而它是「镜像推不上去」这类
+# 故障唯一的第一现场。代价是同 Pod 的 volume-walker 边车（它会直推）多进一份原始
+# 行。这条边车每轮只说几句话，重复量按行算得出来；换掉它是让 registry 变哑。
+# 门禁 `crates/cogneva/tests/a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test.rs`
+# 把这条界线钉在树上：贴了标签的 Pod 里每个非 init 容器都必须自己直推。
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: log-collector
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: log-collector
+    app.kubernetes.io/part-of: cog-observability
+---
+# 只读 Pod/Namespace 列表：发现「这一刻有哪些 Pod、在哪个节点、叫什么名字」，以及
+# Pod 所在命名空间的元数据。日志文件由 hostPath 直接读，不经过 apiserver，所以不需要
+# logs 子资源。
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: log-collector
+  labels:
+    app.kubernetes.io/name: log-collector
+    app.kubernetes.io/part-of: cog-observability
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: log-collector
+  labels:
+    app.kubernetes.io/name: log-collector
+    app.kubernetes.io/part-of: cog-observability
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: log-collector
+subjects:
+  - kind: ServiceAccount
+    name: log-collector
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: log-collector-config
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: log-collector
+    app.kubernetes.io/part-of: cog-observability
+data:
+  config.alloy: |
+    // 发现本节点上的 Pod，并把元数据摊成 Loki 的流标签。
+    discovery.kubernetes "pods" {
+      role = "pod"
+
+      namespaces {
+        names = ["cogneva"]
+      }
+    }
+
+    discovery.relabel "pods" {
+      targets = discovery.kubernetes.pods.targets
+
+      rule {
+        source_labels = ["__meta_kubernetes_namespace"]
+        target_label  = "namespace"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_name"]
+        target_label  = "pod"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_container_name"]
+        target_label  = "container"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_node_name"]
+        target_label  = "node"
+      }
+
+      // 服务名与进程内直推用的是同一把尺子（`app.kubernetes.io/component`），
+      // 两边的流在查询时按同一个 service 过滤得到。没有那个标签的 Pod 退化成
+      // 容器名——空着一个 service 会让「按服务查」漏掉整台 Pod。
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_component"]
+        target_label  = "service"
+      }
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_app_kubernetes_io_component", "__meta_kubernetes_pod_container_name"]
+        separator     = ";"
+        regex         = "^;(.*)$"
+        target_label  = "service"
+        replacement   = "$1"
+      }
+
+      rule {
+        source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+        separator     = "/"
+        target_label  = "__path__"
+        replacement   = "/var/log/pods/*$1/*.log"
+      }
+
+      // 已经在进程里直推的容器（见文件头）。init 容器不在此列：它们跑的是
+      // 种子、迁移、GC 这类脚本，日志只有标准输出这一条路。
+      rule {
+        source_labels = ["__meta_kubernetes_pod_label_cogneva_io_logs", "__meta_kubernetes_pod_container_init"]
+        separator     = ";"
+        regex         = "self;(false)?"
+        action        = "drop"
+      }
+    }
+
+    // `loki.source.file` 只认精确文件路径；上面的 `__path__` 里那几个 `*`
+    // （节点上目录名是 `<命名空间>_<Pod>_<uid>`，文件名是第几次重启）由这一层
+    // 摊开。少了它，采集器会拿带 `*` 的字符串去 stat，每一行都报 no such file，
+    // 而进程本身是绿的。
+    local.file_match "pods" {
+      path_targets = discovery.relabel.pods.output
+      sync_period  = "10s"
+    }
+
+    // containerd 写的是 CRI 格式（`<时间> <流> <P|F> <正文>`）；loki.source.file
+    // 默认按 CRI 解析（`cri = true`），时间戳与流标记拆出来，正文才是正文。
+    loki.source.file "pods" {
+      targets    = local.file_match.pods.targets
+      forward_to = [loki.write.default.receiver]
+    }
+
+    loki.write "default" {
+      endpoint {
+        url        = "http://loki.monitoring.svc.cluster.local:3100/loki/api/v1/push"
+        batch_wait = "1s"
+        batch_size = "1MiB"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: log-collector
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: log-collector
+    app.kubernetes.io/part-of: cog-observability
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: log-collector
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: log-collector
+        app.kubernetes.io/part-of: cog-observability
+    spec:
+      serviceAccountName: log-collector
+      # 控制面节点上也要有：它的 Pod 日志与别处一样会消失。
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.9.2
+          args:
+            - run
+            - /etc/alloy/config.alloy
+            - --storage.path=/var/lib/alloy/data
+            - --server.http.listen-addr=0.0.0.0:12345
+          ports:
+            - name: http-metrics
+              containerPort: 12345
+          # 就绪与存活都读 Alloy 自己的健康端点。`/-/ready` 答 200 当且仅当配置
+          # 解析成功、各组件已经起来；只探端口的话，一份语法坏的配置会让进程活着、
+          # 一行都不采。
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http-metrics
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http-metrics
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              cpu: 400m
+              memory: 512Mi
+          securityContext:
+            # 宿主上的 /var/log/pods 归 root，非 root 读不到；只读挂载把能做的事
+            # 限在「读日志文件」。
+            runAsUser: 0
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alloy
+              readOnly: true
+            - name: pods
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/alloy
+      volumes:
+        - name: config
+          configMap:
+            name: log-collector-config
+        - name: pods
+          hostPath:
+            path: /var/log/pods
+            type: Directory
+        # 读到哪了落在这张卷上。放在容器文件系统里的话，一次重启就从文件头重读
+        # 一遍，同样的行会再进一次 Loki。
+        - name: data
+          hostPath:
+            path: /var/lib/log-collector
+            type: DirectoryOrCreate

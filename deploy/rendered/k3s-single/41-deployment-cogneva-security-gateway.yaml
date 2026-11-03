@@ -37,6 +37,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: security-gateway
+        cogneva.io/logs: self
         app.kubernetes.io/version: "0.5.10"
     spec:
       # 它自己的身份，不复用主应用那个：下面那群后台循环要按 apiserver 的权限判决

@@ -6,8 +6,10 @@
 # 单二进制 + filesystem + tsdb（单节点形态，kvstore 用 inmemory，不起 memberlist）。
 # 存储走 volumeClaimTemplates，跟随集群默认 SC，不绑厂商。
 #
-# 这里不自带 promtail：网关自身直推 Loki，验收面（网关日志入 Loki）已覆盖。
-# 需要采集全部 Pod stdout 时再加 promtail（DaemonSet），与本清单互不依赖。
+# 采集器在同目录的 `27-log-collector.yaml`：网关这类自己直推的容器不归它管（Pod 上的
+# `cogneva.io/logs: self` 把它们挡在外面），它采的是同命名空间里跑第三方镜像的那些
+# 容器——库、缓存、向量库、镜像仓库、边车。两者互不依赖：没有 Loki 时采集器
+# 推不出去也只会重试，没有采集器时直推那条路照旧。
 apiVersion: v1
 kind: Service
 metadata:

@@ -35,6 +35,7 @@ spec:
           labels:
             app.kubernetes.io/name: cogneva
             app.kubernetes.io/component: backup-drill
+            cogneva.io/logs: self
         spec:
           restartPolicy: Never
           # 演练与备份同一个专用非 root uid；与 chart 逐字段对齐（parity 门）。
@@ -74,6 +75,10 @@ spec:
               # 保留窗口的其余成员。
               args: ["backup-drill", "--also-unproven"]
               env:
+                - name: COGNEVA_LOKI_ENABLED
+                  value: "true"
+                - name: COGNEVA_LOKI_ENDPOINT
+                  value: "http://loki.monitoring.svc.cluster.local:3100"
                 # 单趟预算：一份包从解包到对数完。到点由这一跑自己收尾并落一行
                 # `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟账上
                 # 一行都不留，「被杀」于是读作「没跑过」。与 jobTemplate 的

@@ -48,6 +48,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
+        cogneva.io/logs: self
         app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     spec:
       serviceAccountName: cogneva

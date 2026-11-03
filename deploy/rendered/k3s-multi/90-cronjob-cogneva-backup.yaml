@@ -32,6 +32,7 @@ spec:
           labels:
             app.kubernetes.io/name: cogneva
             app.kubernetes.io/component: backup
+            cogneva.io/logs: self
         spec:
           restartPolicy: Never
           # 备份以专用非 root uid 运行：它以 root 跑的时候「包只有属主可读」不成立，
@@ -84,6 +85,10 @@ spec:
               imagePullPolicy: Always
               args: ["backup"]
               env:
+                - name: COGNEVA_LOKI_ENABLED
+                  value: "true"
+                - name: COGNEVA_LOKI_ENDPOINT
+                  value: "http://loki.monitoring.svc.cluster.local:3100"
                 # 导出用 cog_app：它是这些表的属主，pg_dump 读得到全部内容。
                 - name: APP_PASSWORD
                   valueFrom:

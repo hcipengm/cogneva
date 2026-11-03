@@ -46,6 +46,10 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: cluster-registry
+        # 刻意**不**贴 `cogneva.io/logs: self`：节点级采集按 Pod 判，贴了这个标签，
+        # 同 Pod 里 registry 容器（第三方镜像、日志只有 stdout）就一起被丢掉了，
+        # 而「镜像推不上去」的第一现场正是它那几行。代价是这个 Pod 里会直推的
+        # volume-walker 边车多进一份原始行——按行算得出量，比让 registry 变哑便宜。
     spec:
       initContainers:
         # 回收。`garbage-collect -m` 删的是"没有任何 tag 指向的 manifest 及其独占层"，
@@ -147,6 +151,7 @@ spec:
           # 二进制。
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
+            {{- include "cogneva.logEnv" . | nindent 12 }}
             # 声明照卷族既有格式写（`claim=路径`），量出来的数就挂在同名卷上，
             # 与其它工作负载自量挂载产出的是同一条序列。
             - name: COGNEVA_DATA_VOLUME_MOUNTS

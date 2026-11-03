@@ -35,6 +35,7 @@ spec:
           labels:
             app.kubernetes.io/name: cogneva
             app.kubernetes.io/component: backup
+            cogneva.io/logs: self
         spec:
           restartPolicy: Never
           # 备份以专用非 root uid 运行；与 chart 逐字段对齐（parity 门）。
@@ -81,6 +82,10 @@ spec:
               imagePullPolicy: Always
               args: ["backup"]
               env:
+                - name: COGNEVA_LOKI_ENABLED
+                  value: "true"
+                - name: COGNEVA_LOKI_ENDPOINT
+                  value: "http://loki.monitoring.svc.cluster.local:3100"
                 # 连库用的是 cog_app，不是上面那个实例超级用户：注入到任意一条 SQL 里的
                 # 东西，拿到的是 cogneva 库的读写，不是整台实例。
                 - name: APP_PASSWORD

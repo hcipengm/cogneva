@@ -49,6 +49,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: gateway
+        cogneva.io/logs: self
         app.kubernetes.io/version: "0.5.10"
     spec:
       serviceAccountName: cogneva

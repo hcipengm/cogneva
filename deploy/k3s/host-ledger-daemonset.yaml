@@ -33,6 +33,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: host-ledger
+        cogneva.io/logs: self
         app.kubernetes.io/version: "0.5.10"
     spec:
       securityContext:
@@ -54,6 +55,10 @@ spec:
           command: ["/opt/cogneva/cogneva"]
           args: ["host-ledger"]
           env:
+            - name: COGNEVA_LOKI_ENABLED
+              value: "true"
+            - name: COGNEVA_LOKI_ENDPOINT
+              value: "http://loki.monitoring.svc.cluster.local:3100"
             - name: COGNEVA_HOST_LEDGER_PORT
               value: "9100"
             - name: COGNEVA_HOST_CGROUP_ROOT

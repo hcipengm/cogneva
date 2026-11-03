@@ -37,6 +37,7 @@ spec:
       labels:
         app.kubernetes.io/name: cogneva
         app.kubernetes.io/component: sandbox-executor
+        cogneva.io/logs: self
         app.kubernetes.io/version: "0.5.10"
     spec:
       automountServiceAccountToken: false
@@ -135,6 +136,10 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
+            - name: COGNEVA_LOKI_ENABLED
+              value: "true"
+            - name: COGNEVA_LOKI_ENDPOINT
+              value: "http://loki.monitoring.svc.cluster.local:3100"
             # 本进程的花费属于哪个环境：沙盒执行器是**实验性**代码跑的地方，
             # 它的花费必须能与控制面分开读——混进 gateway_pool 就没有任何读数
             # 能把「沙盒烧掉的」从「平台自己烧掉的」里分出来。值的闭集在代码里，

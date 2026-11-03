@@ -116,13 +116,11 @@ pub fn router(observables: Vec<Arc<DataVolumeObservable>>) -> Router {
 pub async fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     // Standalone modes do not go through `run_app`, so they own their logging
     // setup; without it the lines below (the only place a bad declaration is
-    // visible) would go nowhere.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // visible) would go nowhere. Through the shared initializer they also
+    // outlive the container, which matters here more than elsewhere: a walker
+    // that keeps restarting is the reading, and its stdout dies with it.
+    // 订阅者由装配层（main.rs）在派发前装：组件不许依赖 cog-observability，
+    // 而这里要的那份日志面（Loki 镜像）住在那儿。
 
     let (observables, problems) = data_volume::observables_from_env();
     for problem in &problems {
