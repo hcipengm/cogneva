@@ -447,7 +447,7 @@ fn submission(face_id: &str, unit_id: Option<&str>) -> String {
         "tasks": [{
             "id": "t1",
             "task_type": "dag_node",
-            "input": {},
+            "input": {"acceptance": ["面主认领这一行"]},
             "planner": {"verified": true},
             "face_id": face_id,
             "unit_id": unit_id,

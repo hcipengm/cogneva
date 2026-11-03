@@ -60,9 +60,14 @@ pub fn carries_an_owner(task: &Task) -> bool {
 /// The other is a row that does not [`states_what_done_means`]. Held is the safe
 /// half of the two: the row stays pending and stays on the board, so a kind that
 /// files one is visible as work that never starts rather than as work that
-/// starts and can never be closed. Everything this platform files carries a
-/// criterion at filing time; the ones that did not were written before their
-/// kind did, and the settle passes reach them on the rounds after a deploy.
+/// starts and can never be closed.
+///
+/// Being held is not a repair, though: a row filed without a criterion stays
+/// that way until someone gives it one, and the dispatcher was for a while the
+/// only reader that noticed. So the held rows are named where they are counted,
+/// and the door that files rows refuses an injected row that states none. A
+/// submission path that accepted such a row -- and dropped the criterion its
+/// caller had stated -- is how two live rows sat here for a day.
 pub fn is_dispatchable_work(task: &Task) -> bool {
     task.is_executable && !is_face_duty(task) && states_what_done_means(task)
 }

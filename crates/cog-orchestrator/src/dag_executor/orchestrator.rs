@@ -1942,17 +1942,10 @@ impl DagExecutor {
         let by_id: std::collections::HashMap<&str, &Task> =
             tasks.iter().map(|t| (t.id.as_str(), t)).collect();
         // Work the dispatcher would have started had it said what done means.
-        // Counted by kind and named once per process: holding the row is the
+        // Grouped by kind and named once per process: holding the row is the
         // safe half of this rule, and a kind that files one has to be findable
         // rather than merely stuck.
-        let mut unclosable: std::collections::BTreeMap<String, usize> =
-            std::collections::BTreeMap::new();
-        for t in tasks.iter().filter(|t| t.status == TaskStatus::Pending) {
-            if crate::ready_queue::held_for_want_of_a_criterion(t) {
-                *unclosable.entry(t.task_type.kind_key()).or_default() += 1;
-            }
-        }
-        name_unclosable_kinds(&unclosable);
+        name_unclosable_kinds(&unclosable_kinds(&tasks));
         let mut ready: Vec<Task> = tasks
             .iter()
             .filter(|t| t.status == TaskStatus::Pending)
@@ -4025,6 +4018,22 @@ impl cog_core::DagExecutor for DagExecutor {
     }
 }
 
+/// The pending rows the dispatcher is holding for want of a criterion, grouped
+/// by the kind of work they are.
+fn unclosable_kinds(tasks: &[Task]) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut unclosable: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for t in tasks.iter().filter(|t| t.status == TaskStatus::Pending) {
+        if crate::ready_queue::held_for_want_of_a_criterion(t) {
+            unclosable
+                .entry(t.task_type.kind_key())
+                .or_default()
+                .push(t.id.clone());
+        }
+    }
+    unclosable
+}
+
 /// Say which kinds have pending work the dispatcher is holding for want of a
 /// criterion, once per process per kind.
 ///
@@ -4033,18 +4042,28 @@ impl cog_core::DagExecutor for DagExecutor {
 /// reader to skip it, which is the same as not logging at all. Once per kind is
 /// what makes it actionable -- the reader learns the kind, fixes its producer or
 /// adds it to a settle pass, and the next deploy says whether that worked.
-fn name_unclosable_kinds(unclosable: &std::collections::BTreeMap<String, usize>) {
+///
+/// The line names the rows, not just how many. A reader given only a kind and a
+/// count cannot act on it: the first two rows found this way had to be hunted
+/// down in the database by hand, and one of them was holding a criterion the
+/// whole time, in a field the dispatcher does not read.
+fn name_unclosable_kinds(unclosable: &std::collections::BTreeMap<String, Vec<String>>) {
     static NAMED: std::sync::OnceLock<std::sync::Mutex<HashSet<String>>> =
         std::sync::OnceLock::new();
     let named = NAMED.get_or_init(|| std::sync::Mutex::new(HashSet::new()));
     let Ok(mut named) = named.lock() else {
         return;
     };
-    for (kind, rows) in unclosable {
+    for (kind, ids) in unclosable {
         if named.insert(kind.clone()) {
+            // The first few are enough to go and look; a kind with hundreds
+            // would otherwise put the same text on one line forever.
+            const NAMED_ROWS: usize = 5;
+            let shown: Vec<&str> = ids.iter().take(NAMED_ROWS).map(String::as_str).collect();
             tracing::warn!(
                 kind,
-                rows,
+                rows = ids.len(),
+                task_ids = ?shown,
                 "pending work is not dispatched because it states no acceptance criterion; the \
                  rows stay on the board until their producer or a settle pass gives them one"
             );
@@ -4087,6 +4106,29 @@ mod tests {
             TaskType::Generator,
             serde_json::json!({ "evolution_mode": "generate_change" }),
         )
+    }
+
+    /// 被扣住的行要带名字，不能只报数。
+    ///
+    /// 现场第一次遇到时，日志只有「kind: t, rows: 1」——reader 只能去数据库里
+    /// 手捞；而其中一条一直带着验收标准，只是写在派发器不读的那个字段里。
+    #[test]
+    fn held_rows_are_named_by_kind_and_id() {
+        let held = evolution_task("held-without-a-criterion");
+        let mut stated = evolution_task("states-a-criterion");
+        stated.acceptance = vec!["有产出".into()];
+        let mut closed = evolution_task("already-done");
+        closed.status = TaskStatus::Completed;
+        let mut duty = evolution_task("face-duty");
+        duty.task_type = TaskType::Custom(crate::governance_acts::FACE_DUTY_TASK_TYPE.into());
+
+        let by_kind = unclosable_kinds(&[held, stated, closed, duty]);
+        assert_eq!(
+            by_kind.get("generator"),
+            Some(&vec!["held-without-a-criterion".to_string()]),
+            "只有「pending、可执行、说不出怎样算完」的那一行被扣住: {by_kind:?}"
+        );
+        assert_eq!(by_kind.len(), 1, "{by_kind:?}");
     }
 
     /// 欠账计数只算「有人可能正在花这个窗口」的行。

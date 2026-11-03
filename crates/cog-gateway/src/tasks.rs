@@ -629,6 +629,47 @@ async fn resolve_bindings(
     Ok(())
 }
 
+/// The acceptance criteria a submission states under `acceptance` in a row's
+/// input.
+///
+/// Blank entries are dropped: a list of empty strings is a list that says
+/// nothing, and a dispatcher that only asks whether the list is empty would take
+/// it as an answer.
+fn stated_acceptance(input: &serde_json::Value) -> Vec<String> {
+    input
+        .get("acceptance")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The first row in this submission that is injected as submitted and states no
+/// acceptance criterion.
+///
+/// Such a row is dispatched by nobody: the graph holds it until a criterion
+/// appears, and the producer learns that only from a log line it never reads.
+/// Two live rows were sitting that way when this check was written -- one that
+/// did state its criteria in the input and lost them here, one that never stated
+/// any. The first is fixed by carrying the statement onto the row; this check is
+/// what keeps the second from being accepted in silence.
+fn injected_row_without_acceptance(req: &CreateTaskRequest) -> Option<&str> {
+    if req.intent_kind != IntentKind::Task {
+        return None;
+    }
+    req.tasks.as_ref()?.iter().find_map(|item| {
+        let injected = item.planner.as_ref().is_some_and(|claim| claim.verified);
+        (injected && stated_acceptance(&item.input).is_empty()).then_some(item.id.as_str())
+    })
+}
+
 fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
     let mut rows: Vec<Task> = req
         .tasks
@@ -667,6 +708,15 @@ fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
                                 confidence: None,
                                 timestamp: Some(chrono::Utc::now()),
                             });
+                            // This row never passes through decomposition, so no
+                            // planner will ever write "what done means" onto it.
+                            // The submitter's own statement is the only source,
+                            // and `acceptance` in the input is where a submission
+                            // says it. The copy in the input stays: it is what
+                            // the caller sent, and an audit that reads the row
+                            // back has to see the submission as it arrived. The
+                            // row field is what dispatch and execution read.
+                            task.acceptance = stated_acceptance(&item.input);
                         }
                     }
                     task
@@ -740,6 +790,19 @@ pub async fn create_task_handler(
         return Err(ApiError::bad_request(
             "intent_kind=task needs at least one task; a submission with no rows is a goal",
         ));
+    }
+
+    // A row injected as submitted and stating no acceptance criterion is
+    // refused here rather than queued: nothing downstream will ever fill one in,
+    // and a row that sits on the board forever reads to its submitter exactly
+    // like work in progress.
+    if let Some(id) = injected_row_without_acceptance(&req) {
+        return Err(ApiError::bad_request(format!(
+            "task {id} is submitted as verified, so no planner runs on it and nothing else \
+             will state what done means. Put the acceptance criteria under `acceptance` in \
+             the task's input; without them the row is held and never runs."
+        ))
+        .with_code("acceptance_required"));
     }
 
     // A row that names a face or a unit is checked against the roster here,
@@ -1559,7 +1622,7 @@ pub async fn save_task_plan_handler(
                      zero will read as 'nothing was planned'"
                 ),
                 "budget_required",
-            ))
+            ));
         }
     };
 
@@ -2385,6 +2448,77 @@ mod tests {
             tasks[0].action_planner_meta.is_none(),
             "a goal's rows are decomposed even when one of them claims to be verified"
         );
+    }
+
+    /// 直注的行不经过分解，没有规划器会替它写「怎样算做完」；提交者在输入里写的
+    /// 那一条就该落在行上。少了这一步，行进了图也永远不被派发，而提交者读到的
+    /// 是 202——一次「已受理」与一件永远不开工的事在回执上同形。
+    #[test]
+    fn a_verified_row_carries_the_acceptance_stated_in_its_input() {
+        let mut item = task_item("t1", Some(true));
+        item.input = serde_json::json!({
+            "goal": "do the thing",
+            "acceptance": ["接口对这条请求返回 200", "  ", "删掉这一步用例当场红"],
+        });
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "do the thing".into(),
+            tasks: Some(vec![item]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let tasks = submitted_tasks(&req, "g");
+        assert_eq!(
+            tasks[0].acceptance,
+            vec![
+                "接口对这条请求返回 200".to_string(),
+                "删掉这一步用例当场红".to_string()
+            ],
+            "the criteria the submitter stated are the row's criteria; a blank \
+             entry is not one of them"
+        );
+    }
+
+    /// 一条什么都不说的直注行在门口就被点名，而不是被收下以后静静躺在板上。
+    #[test]
+    fn a_verified_row_that_states_no_acceptance_is_named_at_the_door() {
+        let submission = |items: Vec<TaskItem>| CreateTaskRequest {
+            goal_id: None,
+            goal: "do the thing".into(),
+            tasks: Some(items),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let mut stated = task_item("stated", Some(true));
+        stated.input = serde_json::json!({ "acceptance": ["有产出"] });
+        // 说过的行不被误伤：只有什么都不说的那一行该被点出来，而且点的是它。
+        assert_eq!(
+            injected_row_without_acceptance(&submission(vec![stated])),
+            None
+        );
+        assert_eq!(
+            injected_row_without_acceptance(&submission(vec![
+                task_item("silent-1", Some(true)),
+                task_item("silent-2", Some(true)),
+            ])),
+            Some("silent-1")
+        );
+    }
+
+    /// 目标提交不受这条约束：它交给分解，验收标准由规划给出，提交时不要求写。
+    #[test]
+    fn a_goal_submission_is_not_asked_for_acceptance() {
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "plan this".into(),
+            tasks: Some(vec![task_item("t1", Some(true))]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Goal,
+        };
+        assert_eq!(injected_row_without_acceptance(&req), None);
     }
 
     /// 凭据类键名一律拒；只描述数量的名字（`token_budget`、`max_tokens`）不拒——

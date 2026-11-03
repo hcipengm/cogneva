@@ -351,7 +351,10 @@ async fn e2e_task_create_then_list() {
                     {
                         "id": "e2e-task-1",
                         "task_type": "echo",
-                        "input": {"payload": "hello e2e"},
+                        "input": {
+                            "payload": "hello e2e",
+                            "acceptance": ["这一行在列表里读得回来"]
+                        },
                         "blocked_by": [],
                         "priority": 1,
                         "planner": {"verified": true}
