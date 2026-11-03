@@ -1525,7 +1525,7 @@ impl DagExecutor {
         // 环境付账的失败不进任务的预算账：回队列等上游回来，`retry_count`
         // 原样不动。与内存路径同一判据、同一个回投动作（界的说明见
         // [`Self::the_environment_pays`]）。
-        if Self::the_environment_pays(&error, cause, retry_after_secs) {
+        if Self::the_environment_pays(&error, cause) {
             let requeued = self
                 .requeue_without_charge_store(
                     task_id,
@@ -1771,9 +1771,12 @@ impl DagExecutor {
         if !expected.contains(&cur.status) {
             return Ok(false);
         }
-        let delay =
-            self.retry_matrix
-                .delay_with_hint(&cur.task_type, cur.retry_count, retry_after_secs);
+        let delay = Self::environment_delay(
+            &self.retry_matrix,
+            &cur.task_type,
+            cur.retry_count,
+            retry_after_secs,
+        );
         let next = Self::requeued_without_charge(&cur, error, cause, delay);
         let next = match plant {
             Some(refusal) => match Self::with_the_refusal_planted(next, refusal) {
@@ -2729,24 +2732,61 @@ impl DagExecutor {
     /// 另一半——"这笔账记在谁头上"。两条读同一组输入（类型通道 + 带内标记），
     /// 所以这不是第二条判定链，是同一个判决点上的第二个问题。
     ///
-    /// 判据是**上游给出了一次测量**：它说了什么时候值得再来。"282 秒后重试"
-    /// 是上游对自己复位时刻的测量，任务只是恰好在那一刻问了，判它一份预算等于
-    /// 让问的人替答的人付账。没有这句话的失败（一次 5xx、一次传输抖动）不是
-    /// 窗口，是一次抖动，仍然记在任务的预算上；`is_terminal` 的环境因（配额
-    /// 耗尽、凭证被拒）同样判死——环境不是一律不记账。
+    /// 判据是**拒绝自己承认这是环境**：`upstream_unavailable` 是产出端写下的
+    /// 那句话，它说的就是"这一次不是这件活的错"，任务只是恰好在那一刻问了，
+    /// 判它一份预算等于让问的人替答的人付账。`is_terminal` 的环境因（配额耗尽、
+    /// 凭证被拒）仍然判死——环境不是一律不记账。
     ///
-    /// 界就长在这个判据里，不在别处另定：回投的等待取"上游明说的时长"与策略
-    /// 退避的较大者（[`RetryMatrix::delay_with_hint`]），所以每一次回投之前都
-    /// 必须先有上游的一次新测量。没有测量就不回投，也没有哪个数字是这里发明的。
-    fn the_environment_pays(
-        error: &str,
-        cause: Option<UpstreamFailure>,
+    /// 上游顺带有没有说出要等多久，答的是**另一个问题**——回投要等多久，不决定
+    /// 这笔账记在谁头上。两条判据曾经合成一个输入（有数字才付账），代价是三家
+    /// 上游连着回三条不带 `Retry-After` 的 429，就把一件从头到尾没跑起来过的活
+    /// 记满三轮预算判死。实测 2026-11-03：121 件 `change-ledger-*` 停在 failed，
+    /// 其中一件从 10-18 到 11-01 被真实拒了三十多次，最后死在三条上游的
+    /// "usage limit" 上，而它一次都没跑起来过。
+    ///
+    /// 回投的等待见 [`Self::environment_delay`]：没有数字的那几轮退到策略自己
+    /// 的最后一档，不发明新的数。
+    fn the_environment_pays(error: &str, cause: Option<UpstreamFailure>) -> bool {
+        Self::names_the_environment(error) && Self::is_retryable_failure(error, cause)
+    }
+
+    /// 正文里有没有一句"这次不是这件活的错"。
+    ///
+    /// 两种声明都算：`upstream_unavailable`（上游说这一面现在没人能服务）与
+    /// `terminal_env_failure`（角色说这句话根本没到上游）。只有 `is_terminal`
+    /// 的因（配额耗尽、凭证被拒）与"重跑也改不了"的因（退化循环、护栏拒绝）
+    /// 才走回"任务自己付账"那一支——那由 [`Self::is_retryable_failure`] 判，
+    /// 不在这里再判一遍。
+    ///
+    /// 迭代预算耗尽那个标记不算：那是这件活自己的 ReAct 循环烧完了额度，
+    /// 它恰好被包在同一层环境信封里，账该记在它头上。
+    fn names_the_environment(error: &str) -> bool {
+        use cog_core::contract::outcome::{
+            ITERATION_BUDGET_EXHAUSTED_MARKER, TERMINAL_ENV_FAILURE_PREFIX,
+            UPSTREAM_UNAVAILABLE_PREFIX,
+        };
+        let t = error.to_ascii_lowercase();
+        (t.contains(UPSTREAM_UNAVAILABLE_PREFIX) || t.contains(TERMINAL_ENV_FAILURE_PREFIX))
+            && !t.contains(ITERATION_BUDGET_EXHAUSTED_MARKER)
+    }
+
+    /// 环境付账时回投要等多久。
+    ///
+    /// 有数字就按数字（与策略退避取较大者，[`RetryMatrix::delay_with_hint`]）。
+    /// 没有数字时档位取策略**最后一档**而不是 `retry_count`：环境付账的那几轮
+    /// 不动预算，拿冻结的 `retry_count` 当档位等于每一轮都退到同一格，退了个
+    /// 寂寞。这一档是策略本来就有的数（同一张 `RetryMatrix`），不是这里另发明的。
+    fn environment_delay(
+        matrix: &RetryMatrix,
+        task_type: &TaskType,
+        retry_count: u32,
         retry_after_secs: Option<u64>,
-    ) -> bool {
-        let stated_a_wait = retry_after_secs
-            .or_else(|| cog_core::contract::llm::retry_after_hint_in(error))
-            .is_some();
-        stated_a_wait && Self::is_retryable_failure(error, cause)
+    ) -> std::time::Duration {
+        let tier = match retry_after_secs {
+            Some(_) => retry_count,
+            None => matrix.max_retries(task_type),
+        };
+        matrix.delay_with_hint(task_type, tier, retry_after_secs)
     }
 
     /// Fail a task with the given error.
@@ -2853,12 +2893,14 @@ impl DagExecutor {
         }
 
         // 环境付账的失败不进任务的预算账：回队列等上游回来，`retry_count`
-        // 原样不动。等待就是上游自己报的那个时长（界的说明见
-        // [`Self::the_environment_pays`]）——没有那条测量就走不到这里。
-        if Self::the_environment_pays(&error, cause, retry_after_secs) {
-            let delay =
-                self.retry_matrix
-                    .delay_with_hint(&task_type, retry_count, retry_after_secs);
+        // 原样不动。等多久的说明见 [`Self::environment_delay`]。
+        if Self::the_environment_pays(&error, cause) {
+            let delay = Self::environment_delay(
+                &self.retry_matrix,
+                &task_type,
+                retry_count,
+                retry_after_secs,
+            );
             let now = chrono::Utc::now();
             let task = inner.tasks.get_mut(task_id).expect("task exists");
             task.status = TaskStatus::Pending;
@@ -5582,6 +5624,61 @@ mod tests {
             assert!(due > chrono::Utc::now() + chrono::Duration::seconds(240));
         }
 
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+        dag.complete_task(&task_id, serde_json::json!({"ok": true}))
+            .await
+            .unwrap();
+        assert_eq!(
+            dag.get_task(&task_id).await.unwrap().status,
+            TaskStatus::Completed
+        );
+    }
+
+    /// 同一条判据的另一半：拒绝**没说**要等多久时，这笔账仍然不记在任务头上。
+    ///
+    /// 旧判据要求"上游给了一次测量"才付账，于是三条不带 `Retry-After` 的 429
+    /// （上游只写"额度用完了"）就能把一件从头到尾没跑起来过的活记满预算判死：
+    /// 实测 2026-11-03，121 件 `change-ledger-*` 停在 failed。
+    #[tokio::test]
+    async fn store_mode_lets_the_environment_pay_without_a_stated_wait() {
+        let backend: Arc<dyn StateBackend> = Arc::new(cog_test_support::MemoryStateBackend::new());
+        let dag = DagExecutor::new("ws-outage-nowait".into()).with_state_backend(backend);
+        let task = Task::new("t-outage-nowait", TaskType::DagNode, serde_json::json!({}));
+        let task_id = task.id.clone();
+        dag.add_task(task).await.unwrap();
+        dag.schedule_task(&task_id).await.unwrap();
+        dag.start_task(&task_id).await.unwrap();
+
+        // 上游只说"这一窗的额度用完了"，没有一个数字。
+        let refusal =
+            "Agent execution error: upstream_unavailable: environment_error: LLM upstream \
+                       refused (rate_limited): LLM stream error: API error (HTTP 429): \
+                       {\"error\":{\"message\":\"You've reached your 5-hour usage limit\"}}"
+                .to_string();
+
+        // 比这张矩阵里任何一种任务的预算都多。
+        const REFUSALS: u32 = 8;
+        for i in 0..REFUSALS {
+            let (retried, _, _) = dag
+                .fail_task_after(
+                    &task_id,
+                    refusal.clone(),
+                    Some(UpstreamFailure::RateLimited),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(retried, "第 {i} 次被拒后任务必须还在队列里");
+            let view = dag.get_task(&task_id).await.unwrap();
+            assert_eq!(view.status, TaskStatus::Pending, "第 {i} 次被拒后");
+            assert_eq!(
+                view.retry_count, 0,
+                "没写等待时长不等于这笔账该由任务付（第 {i} 次）"
+            );
+        }
+
+        // 环境回来了，同一件活接着干完。
         dag.schedule_task(&task_id).await.unwrap();
         dag.start_task(&task_id).await.unwrap();
         dag.complete_task(&task_id, serde_json::json!({"ok": true}))
