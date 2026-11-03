@@ -5011,8 +5011,20 @@ impl RolloutExecutor {
         // 「这一版没人核对过」，不是「每个平台都开过口」。
         let mut answered: Vec<String> = Vec::new();
         for up in &ask.upstreams {
-            let (verdict, reason, names, excluded, _cancelled) =
+            let (verdict, reason, names, excluded, _cancelled, machine) =
                 MainlineDeployer::platform_ci_verdict(&up.api_base, &up.repo, &ask.rev).await;
+            if !machine.is_empty() {
+                // 这条红不判这一版。留一行话，否则「上游有检查判红却滚了」在事后
+                // 只剩一个放行，谁也答不上为什么。混着真红时也印：它说的是那几条
+                // **没有**参与判定，不是整轮放行。
+                info!(
+                    rev = %ask.rev,
+                    platform = %up.platform,
+                    checks = %machine.join(","),
+                    "these checks failed because of the machine that ran them, not because of this \
+                     tree; they are left out of the verdict"
+                );
+            }
             if !excluded.is_empty() {
                 // 排掉的那几条要留话：这个 rev 上游确实有一条红检查，只是那条不判
                 // 这棵树，所以它没有进判词。不写这一行，事后只剩一个"放行"。

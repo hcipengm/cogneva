@@ -1658,6 +1658,31 @@ fn annotation_says_nothing(message: &str) -> bool {
     rest.trim_end_matches('.').trim().parse::<i32>().is_ok()
 }
 
+/// 一条判红的检查说的话，是不是**跑它的那台机器**自己没撑住。
+///
+/// 那不是对这棵树的判决，处置也该不同：照常判红会让这一版被永久扣住（`UpstreamCi`
+/// 按版本类，同一份红版本在冷却窗后无限重试），并开出一条「修 CI」的自愈任务，而
+/// 那一版没有任何东西需要修。2026-11-03 实测两次：GitHub 托管 runner 磁盘满，
+/// `Test` 与 `Code Coverage` 都落 `failure`，注解正文是
+/// `System.IO.IOException: No space left on device :
+/// '/home/runner/actions-runner/cached/2.338.2/_diag/Worker_...log'`——同一形状在
+/// 两次不同的 run 上复现，而它们与代码一个字节的关系都没有。
+///
+/// 这张表只登记**实测见过**的串。表外的一律照旧判红：把一条真失败认成机器失败，
+/// 代价是它滚上去；把一个不认识的机器失败照常判红，代价只是等一个新 rev。两侧
+/// 代价不对称，所以宁窄不宁宽。新的形状要连着实测的 run 一起加进来。
+// cap: bound — 每一串都是要维护的实测凭据，不是越长越好的黑名单
+const INFRASTRUCTURE_FAILURE_SIGNATURES: &[&str] = &["no space left on device"];
+
+/// 这句话点名了跑它的那台机器（磁盘、runner 自身进程）。比较不区分大小写：
+/// 上游同一件事会写成 `No space left on device` 与 `ENOSPC`。
+fn annotation_reports_infrastructure(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    INFRASTRUCTURE_FAILURE_SIGNATURES
+        .iter()
+        .any(|signature| lowered.contains(signature))
+}
+
 /// GitHub 作业日志每一行前面那个 `2026-11-01T00:58:16.1656654Z `。
 fn strip_log_stamp(line: &str) -> &str {
     match line.split_once(' ') {
@@ -2619,6 +2644,16 @@ pub(crate) enum CiNoVerdictReason {
     /// 结论就按这一格放行——扣着整条主线换不到信息量，而它挡掉的风险由这一格自己
     /// 说清楚，不是悄悄变绿。
     CancelledWaived,
+    /// 这一版上判红的检查**全部**是跑它的机器自己没撑住（runner 磁盘满、被回收），
+    /// 没有一条说得出这棵树哪里错了。
+    ///
+    /// 与 [`Self::CancelledWaived`] 同一个位置、不同的理由：那一种是「还没跑到」，
+    /// 这一种是「跑完了、但跑它的机器坏了」。两者的处置相同（不按 `Some(false)` 扣住
+    /// 这一版），但读数必须分开——前者该等重跑，后者该修 runner 所在的机器，而
+    /// 「这一版到底有没有问题」在两者上都是**没人回答过**。
+    ///
+    /// 它不是 [`Self::is_absent_answer`]：回答来了，只是那个回答不是对树的判决。
+    InfrastructureFailed,
     /// 非 200 的状态码，按主人分格见 [`Self::label`]。
     Http(u16),
 }
@@ -2651,6 +2686,7 @@ impl CiNoVerdictReason {
             Self::ConnectFailed => "connect_failed",
             Self::UnusableBody => "unusable_body",
             Self::CancelledWaived => "cancelled_waived",
+            Self::InfrastructureFailed => "infrastructure_failed",
             // 401/403 是同一件事的两张脸：凭证被拒，或凭证所带的额度被限（GitHub 的
             // 二级限流也回 403）。两脸同一主人，所以同一格。
             Self::Http(401) | Self::Http(403) => "http_auth_rejected",
@@ -3976,6 +4012,7 @@ impl MainlineDeployer {
         Vec<String>,
         Vec<(String, String)>,
         Vec<(String, bool)>,
+        Vec<String>,
     ) {
         let mut attempt = 0usize;
         loop {
@@ -4047,6 +4084,7 @@ impl MainlineDeployer {
         Vec<String>,
         Vec<(String, String)>,
         Vec<(String, bool)>,
+        Vec<String>,
     ) {
         let mut conclusions: Vec<String> = Vec::new();
         // 判不通过的那几条检查的名字（判这棵树的那些）。日志只说「有一项」时，
@@ -4065,6 +4103,10 @@ impl MainlineDeployer {
         // 排队到超时被取消的检查从头到尾没跑过，它永远不会自己给出结论，等一个窗口
         // 也是白等；而跑到一半被取消的是"有人在跑"这件事，给它窗口才有意义。
         let mut cancelled_checks: Vec<(String, bool)> = Vec::new();
+        // 判红、但红的是**跑它的那台机器**（runner 磁盘满、被回收）的那几条。它们
+        // 不进折判据：机器没撑住不是对这棵树的判决。与 `cancelled_checks` 一样带出去，
+        // 让上层能给出具名的一格而不是让「没有判词」盖住两种完全不同的理由。
+        let mut infrastructure_checks: Vec<String> = Vec::new();
         let mut saw_signal = false;
         let mut pending = false;
         // 原因由这一段的形状决定（读到内容 / 读失败），没有"默认值"这种中间态：
@@ -4164,6 +4206,14 @@ impl MainlineDeployer {
                                 }
                                 continue;
                             }
+                            // 机器自己没撑住 ≠ 这棵树红了。这一步只对判红的检查发生，
+                            // 且一次读——通过的检查问不出影响判词的东西。
+                            if Self::check_run_reports_infrastructure(api_base, repo, run).await {
+                                if let Some(real) = named {
+                                    infrastructure_checks.push(real.to_string());
+                                }
+                                continue;
+                            }
                         }
                         conclusions.push(c.to_string());
                         // 进了这张表的是**判这棵树**的检查，所以它记的是「为什么红」；
@@ -4197,12 +4247,27 @@ impl MainlineDeployer {
         if let Some(verdict) =
             cog_core::contract::ci::fold_ci_signals(saw_signal, pending, &conclusions)
         {
+            // 一条真红就给红，不管别的检查红在哪儿。反过来说，判红的**全部**是机器
+            // 故障时这一版**没有人回答过**，而 `fold_ci_signals` 此刻会说 `Some(true)`
+            // ——那不是通过，是把「没人判」读成「判了没问题」。翻成没有判词，并让原因
+            // 自己带名字，读数上才看得见是哪一种。
+            if verdict && !infrastructure_checks.is_empty() {
+                return (
+                    None,
+                    Some(CiNoVerdictReason::InfrastructureFailed),
+                    failed_checks,
+                    excluded_checks,
+                    cancelled_checks,
+                    infrastructure_checks,
+                );
+            }
             return (
                 Some(verdict),
                 None,
                 failed_checks,
                 excluded_checks,
                 cancelled_checks,
+                infrastructure_checks,
             );
         }
         // 只用提交状态上报 CI 的仓库（没有 check runs），与落地通道同一条兜底。
@@ -4217,6 +4282,7 @@ impl MainlineDeployer {
                         failed_checks,
                         excluded_checks,
                         cancelled_checks,
+                        infrastructure_checks,
                     );
                 }
                 Some("failure") | Some("error") => {
@@ -4226,6 +4292,7 @@ impl MainlineDeployer {
                         failed_checks,
                         excluded_checks,
                         cancelled_checks,
+                        infrastructure_checks,
                     );
                 }
                 // 接口答了、状态字段却不可判。只有 check-runs 那边本来就什么也没说时才
@@ -4243,6 +4310,7 @@ impl MainlineDeployer {
             failed_checks,
             excluded_checks,
             cancelled_checks,
+            infrastructure_checks,
         )
     }
 
@@ -4277,6 +4345,65 @@ impl MainlineDeployer {
             .iter()
             .find(|known| **known == path)
             .map(|known| (*known).to_string())
+    }
+
+    /// 这条判红的检查，红的是**这棵树**，还是跑它的那台机器。
+    ///
+    /// 判据读的是上游自己写下的失败级注解（`/check-runs/{id}/annotations`），不是
+    /// 检查名，也不是结论字符串——`Test` 这个 job 磁盘满与测试真失败，在结论上完全是
+    /// 同一个 `failure`。名字在这一层帮不上忙，说的那句话才是唯一的证据。
+    ///
+    /// 两条一起要求，两侧各有一个反例：
+    ///
+    /// - 只要求「至少有一条注解点名了机器」：真测试失败与磁盘满同时发生时，那条真
+    ///   失败会被一条机器注解盖掉，一个真坏的版本滚上去。
+    /// - 只要求「没有一条说得出树的坏」：runner 有时只写一句 `Process completed with
+    ///   exit code 1.`（`annotation_says_nothing` 认得这种套话），此时任何检查的红
+    ///   都会变成「机器问题」。
+    ///
+    /// 所以：**至少一条**点名了机器，且**没有一条**在说这棵树的坏。
+    ///
+    /// 读不到注解就返回 `false`——读不到不是证据，照常判红。
+    async fn check_run_reports_infrastructure(
+        api_base: &str,
+        repo: &str,
+        run: &serde_json::Value,
+    ) -> bool {
+        let Some(id) = run.get("id").and_then(|id| id.as_i64()) else {
+            return false;
+        };
+        let Ok(annotations) = Self::platform_get_json(
+            api_base,
+            &format!("/repos/{repo}/check-runs/{id}/annotations"),
+        )
+        .await
+        else {
+            return false;
+        };
+        let Some(items) = annotations.get("annotations").and_then(|a| a.as_array()) else {
+            return false;
+        };
+        let mut machine = false;
+        for item in items {
+            if item.get("annotation_level").and_then(|l| l.as_str()) != Some("failure") {
+                continue;
+            }
+            let Some(message) = item
+                .get("message")
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+            else {
+                continue;
+            };
+            if annotation_reports_infrastructure(message) {
+                machine = true;
+            } else if !annotation_says_nothing(message) {
+                // 这句在说这棵树的坏，不管同一批里还有别的是什么。
+                return false;
+            }
+        }
+        machine
     }
 
     /// 一条失败的检查最多把几句话带进目标里。
@@ -4528,8 +4655,20 @@ impl MainlineDeployer {
                 continue;
             };
             let repo = up.repo.trim().trim_end_matches(".git");
-            let (verdict, reason, names, skipped, cancelled_names) =
+            let (verdict, reason, names, skipped, cancelled_names, machine) =
                 Self::platform_ci_verdict(base, repo, rev).await;
+            if !machine.is_empty() {
+                // 这一版有检查判红，而红的是跑它的机器。写成一条独立的话：它们不进判词，
+                // 所以「为什么有红检查却放行」在读数面上只剩这一行。混着真红时这句话
+                // 同样要印——它说明的是那几条**没有**参与判定，不是整轮放行。
+                info!(
+                    rev = %rev12(rev),
+                    platform = %platform,
+                    checks = %machine.join(","),
+                    "these checks failed because of the machine that ran them, not because of this \
+                     tree; they are left out of the verdict"
+                );
+            }
             failed.extend(names.into_iter().map(|n| format!("{platform}:{n}")));
             cancelled.extend(
                 cancelled_names
@@ -15669,7 +15808,7 @@ exec {real} "$@"
             )),
         ])
         .await;
-        let (verdict, reason, failed, _cancelled, _excluded) =
+        let (verdict, reason, failed, _cancelled, _excluded, _machine) =
             MainlineDeployer::platform_ci_verdict(
                 &format!("http://{endpoint}/github"),
                 "o/r",
@@ -15939,6 +16078,11 @@ exec {real} "$@"
         let runs = r#"{"check_runs":[{"name":"Test","conclusion":"failure","id":4242},{"name":"Clippy","conclusion":"success"}]}"#;
         let (endpoint, handle) = fake_registry(vec![
             http_200(runs),
+            // 判词那一次先问一句「这条红是不是跑它的机器自己没撑住」：这条检查名下的
+            // 注解说的是 cargo 的失败测试，所以它照常判红。
+            http_200(
+                r#"{"annotations":[{"annotation_level":"failure","message":"cargo test --workspace: 1 failing test -- rust_capacity_constants_registry_test::every_capacity_number_in_rust_says_where_it_comes_from"}]}"#,
+            ),
             // 证据那一次重读同一份 check-runs：它要从中找出这条 run 的 id。
             http_200(runs),
             http_200(
@@ -15996,6 +16140,136 @@ exec {real} "$@"
         let _ = handle.await.unwrap();
     }
 
+    /// 上游说「这条检查红了」不等于「这棵树坏了」。
+    ///
+    /// 2026-11-03 实测两次：GitHub 托管 runner 磁盘满，`Test` 与 `Code Coverage` 都落
+    /// `failure`，注解正文是 `System.IO.IOException: No space left on device :
+    /// '/home/runner/actions-runner/cached/2.338.2/_diag/Worker_20261103-140306-utc.log'`
+    /// ——与这棵树一个字节的关系都没有。按红处置的话，这一版会被永久扣住（`UpstreamCi`
+    /// 是版本类，同一份红版本在冷却窗后无限重试），还会开出一张「修 CI」的单子让人去
+    /// 修一个不存在的东西。
+    ///
+    /// 判据读的是上游自己写下的注解，不是检查名：`Test` 这个作业磁盘满与测试真失败，
+    /// 在结论上完全是同一个 `failure`，名字在这一层帮不上忙。
+    #[tokio::test]
+    async fn a_run_the_machine_failed_is_not_a_verdict_on_the_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(
+                r#"{"check_runs":[
+                    {"name":"Test","conclusion":"failure","id":4242},
+                    {"name":"Code Coverage","conclusion":"failure","id":4243},
+                    {"name":"Clippy","conclusion":"success","id":4244}
+                ]}"#,
+            ),
+            http_200(
+                r#"{"annotations":[{"annotation_level":"failure","message":"System.IO.IOException: No space left on device : '/home/runner/actions-runner/cached/2.338.2/_diag/Worker_20261103-140306-utc.log'"}]}"#,
+            ),
+            // 同一批里的 warning 不是失败级：它连参与判定的资格都没有。
+            http_200(
+                r#"{"annotations":[
+                    {"annotation_level":"warning","message":"coverage is below 40% of new lines"},
+                    {"annotation_level":"failure","message":"No space left on device"}
+                ]}"#,
+            ),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let mut state = MainlineState::default();
+        assert!(
+            !deployer
+                .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+                .await
+                .unwrap(),
+            "the machine ran out of disk; that is not a verdict on this revision"
+        );
+        assert!(
+            planner.submissions().is_empty(),
+            "nothing is handed to the planner: there is nothing on this revision to fix"
+        );
+        let record = state
+            .last_ci_verdict
+            .as_ref()
+            .expect("the question was answered");
+        assert_eq!(record.verdict, "no_evidence");
+        assert_eq!(
+            record.reasons,
+            vec!["github:infrastructure_failed".to_string()],
+            "the reading says which of the no-evidence shapes this was"
+        );
+        assert!(
+            record.failed_checks.is_empty(),
+            "the machine's failure is not listed as a check that judged this tree: {:?}",
+            record.failed_checks
+        );
+        let _ = handle.await.unwrap();
+    }
+
+    /// 机器故障与真失败同批出现时，**仍然判红**。
+    ///
+    /// 放宽的边界画在这里：一条真失败说得出这棵树的坏，它不会被同批里一条机器注解
+    /// 盖掉。只要求「至少有一条注解点名了机器」的那一版会把这棵树放行，代价是一个
+    /// 真坏的版本滚上生产——比扣住一个没问题的版本贵得多，所以两条一起要求。
+    #[tokio::test]
+    async fn a_machine_failure_beside_a_real_one_is_still_a_red_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let runs = r#"{"check_runs":[
+            {"name":"Test","conclusion":"failure","id":4242},
+            {"name":"Code Coverage","conclusion":"failure","id":4243}
+        ]}"#;
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(runs),
+            http_200(
+                r#"{"annotations":[{"annotation_level":"failure","message":"cargo test --workspace: 1 failing test -- registry::a_number_says_where_it_comes_from"}]}"#,
+            ),
+            http_200(
+                r#"{"annotations":[{"annotation_level":"failure","message":"No space left on device"}]}"#,
+            ),
+            // 扣住之后取失败点：重读 check-runs，再问那一条真红的注解。
+            http_200(runs),
+            http_200(
+                r#"{"annotations":[{"annotation_level":"failure","message":"cargo test --workspace: 1 failing test -- registry::a_number_says_where_it_comes_from"}]}"#,
+            ),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let mut state = MainlineState::default();
+        assert!(
+            deployer
+                .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+                .await
+                .unwrap(),
+            "one check said this tree is broken; a machine fault beside it does not erase that"
+        );
+        let record = state
+            .last_ci_verdict
+            .as_ref()
+            .expect("the question was answered");
+        assert_eq!(record.verdict, "fail");
+        assert_eq!(
+            record.failed_checks,
+            vec!["github:Test".to_string()],
+            "only the check that judged this tree is named: {:?}",
+            record.failed_checks
+        );
+        assert_eq!(planner.submissions().len(), 1);
+        let _ = handle.await.unwrap();
+    }
+
     /// 只有 runner 那句「退出码 1」时，退到作业日志末尾去取原因。
     ///
     /// 2026-11-01 实测就是这个形状：`Entry Scripts Lint` 的失败级注解只有
@@ -16014,6 +16288,14 @@ exec {real} "$@"
                    2026-11-01T00:58:17.0000000Z Post job cleanup.\n";
         let (endpoint, handle) = fake_registry(vec![
             http_200(runs),
+            // 「这台机器自己没撑住吗」那一问：注解只有 runner 那句套话，没有一句点名
+            // 机器——读不到证据就是照常判红。
+            http_200(
+                r#"{"annotations":[
+                    {"annotation_level":"failure","message":"Process completed with exit code 1."},
+                    {"annotation_level":"notice","message":"Node.js 20 is deprecated"}
+                ]}"#,
+            ),
             http_200(runs),
             http_200(
                 r#"{"annotations":[
@@ -16114,8 +16396,12 @@ exec {real} "$@"
         let (endpoint, handle) = fake_registry(vec![
             // 第一轮：有结论、没有名字。判词到这里就结束了，不会去问注解。
             http_200(r#"{"check_runs":[{"conclusion":"failure"}]}"#),
-            // 第二轮：判词 + 取失败点的那次重读。
+            // 第二轮：判词 + 取失败点的那次重读。中间那一问答的是「这条红是不是跑它
+            // 的机器自己没撑住」——注解说的是真失败的测试，所以它照常判红。
             http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure","id":77}]}"#),
+            http_200(
+                r#"{"annotations":[{"annotation_level":"failure","message":"one test failed: volume_capacity::a_stamp_that_never_lands_still_lets_the_bound_elapse"}]}"#,
+            ),
             http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure","id":77}]}"#),
             http_200(
                 r#"{"annotations":[{"annotation_level":"failure","message":"one test failed: volume_capacity::a_stamp_that_never_lands_still_lets_the_bound_elapse"}]}"#,
