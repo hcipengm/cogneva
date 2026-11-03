@@ -138,10 +138,14 @@ export function styleCells(
  * 加起来会得到一个像模像样的数，而它只盖住了这一组的一半，屏上没有任何东西
  * 能把「残的」与「全的」分开。
  */
-/** 这一列的行；`calls`／`failed_calls` 只用来判「这段到底有没有成功过」。 */
+/**
+ * 这一列的行；`calls`／`failed_calls` 只用来判「这段到底有没有成功过」，
+ * `tokens_cached` 只用来判同一个窗口里**读回**了多少——见 [`cacheWriteNote`]。
+ */
 type WriteRow = {
   api_style: string;
   tokens_cache_created?: number | null;
+  tokens_cached?: number;
   calls?: number;
   failed_calls?: number;
 };
@@ -202,6 +206,23 @@ export function cacheWriteValue(rows: WriteRow[]): string {
 export function cacheWriteNote(rows: WriteRow[]): string {
   const tokens = cacheWrite(rows);
   if (tokens !== null) {
+    // 报上来的 0 与同一窗的读回量一起读，才是这一格的意思。
+    //
+    // 「写了 0」单看是一个结论，而它有两个互不相容的成因：这段窗口的每一条
+    // 都在读一段更早写下的前缀（5 分钟 TTL 之内，一次写可以被后面好几条读），
+    // 或者这家面根本不逐次报写入。唯一能把两者分开的证据就在隔壁那一列——
+    // 读回量大于 0 说明缓存确实存在，于是这个 0 不再是「没建过缓存」。
+    // 2026-11-01 21 时实测：148 次调用、命中 45.8%，写入一栏 127 行全报 0，
+    // 按旧的读法这一屏会告诉读者「前缀每发都在变」，而读回量正反驳它。
+    const readBack = rows.reduce((sum, row) => sum + (row.tokens_cached ?? 0), 0);
+    if (tokens === 0 && readBack > 0) {
+      return (
+        `上游报的缓存写入量 = 0，但同一批调用从缓存读回了 ${readBack.toLocaleString()} token。` +
+        `这两半互相矛盾：没有写过的缓存读不回来。所以这个 0 不是「这段没建过缓存」，` +
+        `要么这批前缀是更早的窗口写下的（每次写入可以被 TTL 内的后面几条读走），` +
+        `要么这家面不逐次报写入。判前缀稳不稳看「缓存命中率」那一列，不要用这一格。`
+      );
+    }
     return `上游报的缓存写入量（cache_creation_input_tokens）= ${tokens.toLocaleString()}；这一半与「缓存」那一列的读回量不相加、不互为分母。`;
   }
   const state = writeState(rows);
