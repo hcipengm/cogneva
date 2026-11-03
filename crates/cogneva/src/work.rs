@@ -30,7 +30,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 
-use cog_core::{DagMessage, MessageBackend, StateBackend, Task, TaskDAG, TaskStatus};
+use cog_core::{
+    ActionPlannerMeta, DagMessage, Face, MessageBackend, StateBackend, Task, TaskDAG, TaskStatus,
+    TaskType,
+};
 
 pub const USAGE: &str = "\
 cogneva work <SUBCOMMAND> --unit <unit> [OPTIONS]
@@ -39,6 +42,11 @@ Acts on the tasks the graph assigns to one unit. Every subcommand reads the
 owner named on the task row; a task owned by another unit is refused.
 
 SUBCOMMANDS:
+    file    --task <id> --goal <text> --face <face> --acceptance <text>...
+                           Put this unit's own work into the graph: a Pending row
+                           owned by this unit and bound to the face it serves, so
+                           the publisher holds it for this unit rather than
+                           offering it to whoever polls first.
     queue                  List this unit's Pending, Scheduled and Running tasks.
     next                   Print the one task this unit can start right now.
     claim   --task <id>    Reserve a ready task (Pending -> Scheduled).
@@ -60,7 +68,17 @@ SUBCOMMANDS:
 
 OPTIONS:
     --unit <unit>          The unit this caller acts for (required).
-    --task <id>            The task to act on (claim, start, complete, fail, release).
+    --task <id>            The task to act on (claim, start, complete, fail, release),
+                           or the id to file under (file).
+    --goal <text>          What the work is, in one statement (file).
+    --face <face>          The face the work serves (file); it must be staffed, and
+                           by this unit.
+    --acceptance <text>    What done means (file); repeat for several criteria.
+    --priority <n>         Higher runs first (file; default 1).
+    --blocked-by <id>      A task that must finish first (file); repeatable.
+    --timeout-secs <n>     How long the row may stay open before the graph fails
+                           it (file; default a week -- the lease, renewed by
+                           heartbeat, is what says the holder is still there).
     --result <json|@file>  The result payload for complete; @file reads a file.
     --error <text>         The failure text for fail.
     --json                 Print raw task rows instead of a table (queue).
@@ -71,6 +89,15 @@ OPTIONS:
 /// What the caller asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
+    File {
+        task: String,
+        goal: String,
+        face: String,
+        acceptance: Vec<String>,
+        priority: i32,
+        blocked_by: Vec<String>,
+        timeout_secs: u64,
+    },
     Queue {
         json: bool,
     },
@@ -119,6 +146,12 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut task: Option<String> = None;
     let mut result: Option<serde_json::Value> = None;
     let mut error: Option<String> = None;
+    let mut goal: Option<String> = None;
+    let mut face: Option<String> = None;
+    let mut acceptance: Vec<String> = Vec::new();
+    let mut priority: Option<i32> = None;
+    let mut blocked_by: Vec<String> = Vec::new();
+    let mut timeout_secs: Option<u64> = None;
     let mut json = false;
     let mut workspace = None;
     let mut database_url = None;
@@ -149,6 +182,24 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
                 );
             }
             "--error" => error = Some(value("--error")?),
+            "--goal" => goal = Some(value("--goal")?),
+            "--face" => face = Some(value("--face")?),
+            "--acceptance" => acceptance.push(value("--acceptance")?),
+            "--blocked-by" => blocked_by.push(value("--blocked-by")?),
+            "--priority" => {
+                let raw = value("--priority")?;
+                priority = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--priority is not a number: {raw}"))?,
+                );
+            }
+            "--timeout-secs" => {
+                let raw = value("--timeout-secs")?;
+                timeout_secs = Some(
+                    raw.parse()
+                        .map_err(|_| format!("--timeout-secs is not a number: {raw}"))?,
+                );
+            }
             "--workspace" => workspace = Some(value("--workspace")?),
             "--database-url" => database_url = Some(value("--database-url")?),
             "--redis-url" => redis_url = Some(value("--redis-url")?),
@@ -169,6 +220,22 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     }
     let task = || task.clone().ok_or_else(|| "--task is required".to_string());
     let action = match sub {
+        Some("file") => {
+            // Missing is a parse error; present but made of blanks is a row
+            // error, decided where the rest of the row is built.
+            if acceptance.is_empty() {
+                return Err("--acceptance is required for file".into());
+            }
+            Action::File {
+                task: task()?,
+                goal: goal.ok_or("--goal is required for file")?,
+                face: face.ok_or("--face is required for file")?,
+                acceptance,
+                priority: priority.unwrap_or(1),
+                blocked_by,
+                timeout_secs: timeout_secs.unwrap_or(UNIT_WORK_BUDGET_SECS),
+            }
+        }
         Some("queue") => Action::Queue { json },
         Some("next") => Action::Next { json },
         Some("claim") => Action::Claim { task: task()? },
@@ -273,11 +340,35 @@ fn endpoints(request: &Request) -> Result<Endpoints, Box<dyn Error>> {
 async fn run(request: Request) -> Result<(), Box<dyn Error>> {
     let endpoints = endpoints(&request)?;
     let pool = sqlx::PgPool::connect(&endpoints.database_url).await?;
-    let backend: Arc<dyn StateBackend> = Arc::new(cog_storage::PostgresStateBackend::new(pool));
+    let backend: Arc<dyn StateBackend> =
+        Arc::new(cog_storage::PostgresStateBackend::new(pool.clone()));
     let unit = request.unit.as_str();
     let workspace = endpoints.workspace.as_str();
 
     match request.action {
+        Action::File {
+            task,
+            goal,
+            face,
+            acceptance,
+            priority,
+            blocked_by,
+            timeout_secs,
+        } => {
+            let filing = Filing {
+                id: &task,
+                goal: &goal,
+                face: &face,
+                acceptance: &acceptance,
+                priority,
+                blocked_by: &blocked_by,
+                timeout_secs,
+            };
+            let row =
+                filed_row(&filing, unit, workspace).map_err(|e| format!("cogneva work: {e}"))?;
+            file(&*backend, &pool, workspace, unit, &row).await?;
+            println!("{} filed (face={}, owner={})", row.id, face, unit);
+        }
         Action::Queue { json } => queue(&*backend, workspace, unit, json).await?,
         Action::Next { json } => next(&*backend, workspace, unit, json).await?,
         Action::Claim { task } => {
@@ -390,6 +481,198 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+/// The kind a unit's own work is filed under.
+///
+/// Not a self-evolution kind. Those name the producers that detect work about
+/// the platform -- a red CI run, a tracked issue, a gate's refusal -- and a
+/// unit that decided what to do is not one of them: reading it as one would put
+/// work the platform chose into the funnel that measures work the platform was
+/// told about. The kind is what the census groups these rows by.
+const UNIT_WORK_KIND: &str = "unit_work";
+
+/// What the caller said about the work, as one value, so the builder cannot be
+/// called with two operands swapped. The unit and the workspace are not part of
+/// it: they come from the command, and a row that named a unit other than the
+/// one filing it would be work addressed to somebody who never asked for it.
+struct Filing<'a> {
+    id: &'a str,
+    goal: &'a str,
+    face: &'a str,
+    acceptance: &'a [String],
+    priority: i32,
+    blocked_by: &'a [String],
+    timeout_secs: u64,
+}
+
+/// How long a filed row may stay open before the graph fails it, unless the
+/// caller says otherwise.
+///
+/// The executor default is five minutes, which fits a dispatched unit of work
+/// and not this one: an out-of-band worker holds its row across many
+/// heartbeats, and the over-budget rule reads the age of the row rather than
+/// the liveness of its holder -- so the default would fail work whose owner
+/// was demonstrably alive at the time. Liveness is the lease's question, and
+/// the heartbeat answers it; this budget answers "how long may this stay
+/// open at all", and a week is longer than a unit of work is meant to take.
+const UNIT_WORK_BUDGET_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// The row this unit's own work enters the graph as.
+///
+/// The row is written as the shape a submission that is injected unplanned
+/// takes: executable, owned by the unit that filed it, bound to the face it
+/// serves, and stating in `acceptance` what done means. Every one of those
+/// fields is read by somebody downstream -- the publisher holds a row that
+/// names an owner instead of offering it to whoever polls first, the dispatcher
+/// holds a row that states no criterion, and the drift reading counts a row's
+/// face against its owner -- so a row filed without them would sit Pending
+/// looking exactly like work in progress.
+///
+/// The statement and the criteria are also left in `input`, where a submission
+/// carries them: a reader that shows a task's own words reads them there, and
+/// the two copies say the same thing at the moment they are written.
+fn filed_row(filing: &Filing, unit: &str, workspace: &str) -> Result<Task, String> {
+    let Filing {
+        id,
+        goal,
+        face,
+        acceptance,
+        priority,
+        blocked_by,
+        timeout_secs,
+    } = *filing;
+    if id.trim().is_empty() {
+        return Err("--task is empty".into());
+    }
+    if goal.trim().is_empty() {
+        return Err("--goal is empty: a row nobody can read is a row nobody can pick up".into());
+    }
+    // Blank entries are dropped the same way the submission door drops them: a
+    // list of empty strings is a list that says nothing, and a dispatcher that
+    // only asks whether the list is empty would take it as an answer.
+    let stated: Vec<String> = acceptance
+        .iter()
+        .map(|criterion| criterion.trim())
+        .filter(|criterion| !criterion.is_empty())
+        .map(str::to_string)
+        .collect();
+    if stated.is_empty() {
+        return Err(format!(
+            "task {id} states no acceptance criterion; nothing downstream will invent one, \
+             and a row filed without one sits on the board reading like work in progress. \
+             Say what done means with --acceptance"
+        ));
+    }
+    let mut row = Task::new(
+        id,
+        TaskType::Custom(UNIT_WORK_KIND.to_string()),
+        serde_json::json!({ "goal": goal.trim(), "acceptance": stated }),
+    );
+    row.workspace_id = Some(workspace.to_string());
+    row.owner_unit = Some(unit.to_string());
+    row.face_id = Some(face.to_string());
+    row.acceptance = stated;
+    row.priority = priority;
+    row.blocked_by = blocked_by.to_vec();
+    row.timeout_seconds = timeout_secs;
+    row.action_planner_meta = Some(ActionPlannerMeta {
+        verified: true,
+        version: None,
+        note: Some("filed by its owning unit; injected without decomposition".into()),
+        source: None,
+        confidence: None,
+        timestamp: Some(Utc::now()),
+    });
+    Ok(row)
+}
+
+/// Put one filed row into the graph, once.
+///
+/// Written through the graph's own store rather than a door of its own: the
+/// publisher scans the store for ready rows on every pass, so a row inserted
+/// here is offered by the same code that offers every other row, and the unit
+/// takes it back out with `claim` like any task it was handed. There is no
+/// second queue and no second state machine.
+///
+/// The two checks below are the ones whose failure is silent. A row under an id
+/// the graph already holds would be replaced by the insertion, and the work it
+/// described would disappear while the id kept reading as filed. A blocker that
+/// is not in the graph is not a dependency: readiness is computed over rows
+/// that exist, so a name nobody holds never completes and the row would wait
+/// forever -- visible only as a task that never starts.
+async fn file(
+    backend: &dyn StateBackend,
+    pool: &sqlx::PgPool,
+    workspace: &str,
+    unit: &str,
+    row: &Task,
+) -> Result<(), Box<dyn Error>> {
+    if let Some(held) = backend.dag_get_task(workspace, &row.id).await? {
+        return Err(format!(
+            "task {} is already in the graph as {:?} (owner {}); file under a different id, \
+             or act on it with queue, next or claim",
+            row.id,
+            held.status,
+            held.owner_unit.as_deref().unwrap_or("nobody")
+        )
+        .into());
+    }
+    for blocker in &row.blocked_by {
+        if backend.dag_get_task(workspace, blocker).await?.is_none() {
+            return Err(format!(
+                "task {} waits on {blocker}, which is not in the graph; readiness is computed \
+                 over rows that exist, so this row would wait forever",
+                row.id
+            )
+            .into());
+        }
+    }
+    let face = row.face_id.as_deref().unwrap_or_default();
+    face_answers_to(pool, face, unit).await?;
+    backend.dag_set_task(workspace, &row.id, row).await?;
+    Ok(())
+}
+
+/// Refuse work filed on a face that is not this unit's.
+///
+/// The rule is the submission door's, and it is checked at the door rather than
+/// left to the drift pass: drift would report the mismatch only after the row
+/// had already been filed, and its verdict would describe work that was
+/// addressed to nobody the face answers to. Filing under another unit's face
+/// is the one way this command could take a colleague's work, so it is refused
+/// rather than warned about.
+async fn face_answers_to(
+    pool: &sqlx::PgPool,
+    face_id: &str,
+    unit: &str,
+) -> Result<(), Box<dyn Error>> {
+    use cog_core::GovernanceStore as _;
+    let store = cog_storage::PostgresGovernanceStore::new(pool.clone());
+    let nodes = store.face_nodes().await?;
+    let face = nodes
+        .iter()
+        .filter_map(Face::from_task)
+        .find(|face| face.face_id == face_id);
+    let Some(face) = face else {
+        return Err(format!(
+            "face '{face_id}' is not on the roster; a row bound to a face nobody declared \
+             would read as drift instead of as work"
+        )
+        .into());
+    };
+    match face.owner_unit.as_deref() {
+        None => Err(format!(
+            "face '{face_id}' has no owner; work cannot be filed under it until it is staffed"
+        )
+        .into()),
+        Some(owner) if owner != unit => Err(format!(
+            "face '{face_id}' is owned by '{owner}', not '{unit}'; a unit files work on the \
+             face it answers for, not on a colleague's"
+        )
+        .into()),
+        Some(_) => Ok(()),
+    }
 }
 
 /// The task a caller named, provided this unit owns it.
@@ -905,6 +1188,172 @@ mod tests {
         high.priority = 9;
         let (picked, _) = ready_owned(vec![low, high], &dag, "8b");
         assert_eq!(picked[0].id, "high");
+    }
+
+    fn file_args() -> Vec<String> {
+        args(&[
+            "file",
+            "--unit",
+            "8b",
+            "--task",
+            "close-the-ci-gap",
+            "--goal",
+            "Close the gap on the ci-build-deploy face",
+            "--face",
+            "ci-build-deploy",
+            "--acceptance",
+            "CI is green on main",
+        ])
+    }
+
+    /// The same invocation with one flag and its value taken out.
+    fn file_without(flag: &str) -> Vec<String> {
+        let mut items = file_args();
+        let at = items
+            .iter()
+            .position(|item| item == flag)
+            .unwrap_or_else(|| panic!("{flag} is not in the fixture"));
+        items.drain(at..=at + 1);
+        items
+    }
+
+    #[test]
+    fn file_parses_and_refuses_each_operand_it_goes_on_to_need() {
+        let request = parse_args(&file_args()).unwrap();
+        assert_eq!(
+            request.action,
+            Action::File {
+                task: "close-the-ci-gap".into(),
+                goal: "Close the gap on the ci-build-deploy face".into(),
+                face: "ci-build-deploy".into(),
+                acceptance: vec!["CI is green on main".into()],
+                priority: 1,
+                blocked_by: Vec::new(),
+                timeout_secs: UNIT_WORK_BUDGET_SECS,
+            }
+        );
+        // Each of these would otherwise reach a row that says less than a row
+        // has to: no face means an owner the roster cannot be asked about, no
+        // goal means nothing a reader could act on, no criterion means nothing
+        // that says when it is done, and no id means a row nobody can name.
+        for flag in ["--task", "--goal", "--face", "--acceptance"] {
+            assert!(
+                parse_args(&file_without(flag)).is_err(),
+                "file accepted a missing {flag}"
+            );
+        }
+        let mut bad_priority = file_args();
+        bad_priority.push("--priority".into());
+        bad_priority.push("high".into());
+        assert!(parse_args(&bad_priority).is_err());
+    }
+
+    /// The filed row has to satisfy the readers, not just this command: the
+    /// publisher holds a row that carries an owner instead of offering it on
+    /// the shared stream, and the dispatcher holds a row that states no
+    /// criterion. A row that failed either would sit Pending looking exactly
+    /// like work in progress, and its own unit could not pick it up either.
+    #[test]
+    fn a_filed_row_is_work_its_own_unit_can_start() {
+        let request = parse_args(&file_args()).unwrap();
+        let Action::File {
+            task,
+            goal,
+            face,
+            acceptance,
+            priority,
+            blocked_by,
+            timeout_secs,
+        } = request.action
+        else {
+            panic!("file must parse as file");
+        };
+        let filing = Filing {
+            id: &task,
+            goal: &goal,
+            face: &face,
+            acceptance: &acceptance,
+            priority,
+            blocked_by: &blocked_by,
+            timeout_secs,
+        };
+        let row = filed_row(&filing, &request.unit, "cogneva").unwrap();
+
+        assert_eq!(row.status, TaskStatus::Pending);
+        assert_eq!(row.owner_unit.as_deref(), Some("8b"));
+        assert_eq!(row.face_id.as_deref(), Some("ci-build-deploy"));
+        assert!(row.is_executable, "a row with no body to run is not work");
+        assert_eq!(row.acceptance, vec!["CI is green on main".to_string()]);
+        assert_eq!(row.priority, 1);
+        assert!(
+            cog_orchestrator::ready_queue::carries_an_owner(&row),
+            "the publisher offers an ownerless row on the shared stream, where whoever \
+             polls first runs it instead of the unit that filed it"
+        );
+        assert!(
+            cog_orchestrator::ready_queue::states_what_done_means(&row),
+            "the dispatcher holds a row that states no acceptance criterion"
+        );
+
+        let (ready, owned) = ready_owned(vec![row.clone()], &TaskDAG::default(), "8b");
+        assert_eq!(owned, 1, "the filing unit owns it");
+        assert_eq!(
+            ready.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+            vec!["close-the-ci-gap"],
+            "next must offer the row its unit just filed"
+        );
+
+        // The statement and the criteria travel in the input as well, where a
+        // submission carries them and where a task's own words are read from.
+        assert_eq!(
+            row.input["goal"],
+            "Close the gap on the ci-build-deploy face"
+        );
+        assert_eq!(row.input["acceptance"][0], "CI is green on main");
+    }
+
+    /// A criterion made of blanks is a list that says nothing. Filed as it
+    /// arrives, it would pass every "is there an acceptance" test downstream
+    /// while stating nothing at all.
+    fn filing<'a>(id: &'a str, goal: &'a str, acceptance: &'a [String]) -> Filing<'a> {
+        Filing {
+            id,
+            goal,
+            face: "ci-build-deploy",
+            acceptance,
+            priority: 1,
+            blocked_by: &[],
+            timeout_secs: UNIT_WORK_BUDGET_SECS,
+        }
+    }
+
+    #[test]
+    fn a_blank_acceptance_criterion_is_not_an_answer() {
+        let nobody: Vec<String> = Vec::new();
+        assert!(
+            filed_row(&filing("t", "g", &nobody), "8b", "ws").is_err(),
+            "no criterion at all"
+        );
+        let blanks = vec!["   ".to_string(), String::new()];
+        assert!(filed_row(&filing("t", "g", &blanks), "8b", "ws").is_err());
+        let stated = vec!["a".to_string()];
+        assert!(filed_row(&filing("  ", "g", &stated), "8b", "ws").is_err());
+        assert!(filed_row(&filing("t", " ", &stated), "8b", "ws").is_err());
+    }
+
+    /// The executor's own default is five minutes, and the over-budget rule
+    /// reads the age of the row rather than whether its holder is still there.
+    /// A filed row left on that default would fail under a unit that was
+    /// heartbeating at the time -- the row's own unit, on work it just started.
+    #[test]
+    fn a_filed_row_outlives_a_five_minute_executor_run() {
+        let stated = vec!["CI is green on main".to_string()];
+        let row = filed_row(&filing("t", "g", &stated), "8b", "ws").unwrap();
+        assert!(
+            row.timeout_seconds > 300,
+            "a filed row defaulting to the executor's budget fails while its owner is alive"
+        );
+        assert_eq!(row.timeout_seconds, UNIT_WORK_BUDGET_SECS);
     }
 
     #[test]
