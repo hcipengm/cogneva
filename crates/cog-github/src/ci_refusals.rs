@@ -423,6 +423,9 @@ mod tests {
         async fn get(&self, _: &str) -> SFResult<Option<PrincipleRow>> {
             unimplemented!()
         }
+        async fn gating_paths(&self, _: &[String], _: usize) -> SFResult<Vec<PrincipleRow>> {
+            unimplemented!()
+        }
         async fn slugs(&self) -> SFResult<Vec<String>> {
             unimplemented!()
         }

@@ -601,6 +601,13 @@ impl cog_core::PrincipleLedgerStore for Ledger {
     async fn get(&self, _: &str) -> cog_core::SFResult<Option<cog_core::PrincipleRow>> {
         Ok(None)
     }
+    async fn gating_paths(
+        &self,
+        _: &[String],
+        _: usize,
+    ) -> cog_core::SFResult<Vec<cog_core::PrincipleRow>> {
+        Ok(Vec::new())
+    }
     async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {
         Ok(Vec::new())
     }

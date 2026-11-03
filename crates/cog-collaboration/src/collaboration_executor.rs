@@ -89,6 +89,10 @@ pub struct CollaborationExecutor {
     /// 阶段产物的持久化存储；每个任务现建的 SquadExecutor 都要拿到它，
     /// 否则一次运行断在两条调用之间，已经付过费的计划和 diff 就跟着进程没了。
     stage_store: Option<Arc<dyn cog_core::PgeStageStore>>,
+    /// 原则账；生成端事前要看的那几条原则从这里按路径取。没有它时生成端
+    /// 仍旧照跑——只是这一次没有任何一条项目原则被递进来，与「这个仓库没有
+    /// 原则管着这些文件」不是一回事，所以缺它要留一条具名日志。
+    principle_ledger: Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
 }
 
 /// What the producer said about itself, at the two stages the record keeps.
@@ -127,6 +131,7 @@ impl CollaborationExecutor {
             ralph: None,
             local_repair_max: None,
             stage_store: None,
+            principle_ledger: None,
         }
     }
 
@@ -249,6 +254,15 @@ impl CollaborationExecutor {
     /// 每个阶段产物在下一通调用之前记下来的位置。
     pub fn with_stage_store(mut self, store: Arc<dyn cog_core::PgeStageStore>) -> Self {
         self.stage_store = Some(store);
+        self
+    }
+
+    /// 接上原则账：生成端在动手前就能看到管着这次要动的文件的那些原则。
+    pub fn with_principle_ledger(
+        mut self,
+        ledger: Arc<dyn cog_core::PrincipleLedgerStore>,
+    ) -> Self {
+        self.principle_ledger = Some(ledger);
         self
     }
 }
@@ -770,6 +784,13 @@ impl CollaborationExecutor {
         let mut context = Self::goal_context(task);
         if is_self_evolution {
             context = Self::build_self_evolution_context(context, &goal);
+            // 原则随上下文进流水线：那条链把它克隆成管线自己那个任务行的 input，
+            // 生成端的契约再从 input 里取出这一块摆到稳定半边。规划与评估拿到的是
+            // 同一份上下文，因此也会读到这几条——把它们只递给其中一个角色，就得
+            // 在这里另造一份上下文，而那一份下一秒就会与这一份漂开。
+            if let Some(principles) = self.principles_governing(task).await {
+                context[cog_core::INPUT_PRINCIPLES] = principles;
+            }
         }
 
         let squad_start = std::time::Instant::now();
@@ -1140,6 +1161,52 @@ impl CollaborationExecutor {
         mode.as_str().to_string()
     }
 
+    /// 这条活点名的路径上站着门的原则，交给生成端事前看。
+    ///
+    /// 问的是原则账里「哪几条原则的门写在这些路径上」——一条原则的门就是它会
+    /// 在哪里变红，而那正是生成端最需要先知道的事：改这个文件会让哪一条判据
+    /// 不满意。
+    ///
+    /// 任务没点名路径时返回 `None`，而不是把与路径无关的原则全摆进去。账里
+    /// 三千多条原则绝大多数没有记录门在哪里，无法回答「管不管这条路」；把它们
+    /// 一次全递给模型，等于把一份四千行的清单当作原则指引，而真正管着这条路的
+    /// 那几条会淹没在里面。没有路径就没有这一次的答案，这不等于没有原则。
+    async fn principles_governing(&self, task: &Task) -> Option<serde_json::Value> {
+        let ledger = self.principle_ledger.as_ref()?;
+        let paths = named_paths(&task.input);
+        if paths.is_empty() {
+            return None;
+        }
+        match ledger.gating_paths(&paths, PRINCIPLES_PER_TASK).await {
+            Ok(rows) if rows.is_empty() => {
+                // 有路径、账也读到了、一条都没匹配上：这是一次真实的「这些文件
+                // 上没有记录门」，不是读不到。留痕，免得与「没接上账」混为一谈。
+                tracing::info!(
+                    task_id = %task.id,
+                    paths = ?paths,
+                    "no principle records a gate on the paths this task names"
+                );
+                None
+            }
+            Ok(rows) => match serde_json::to_value(&rows) {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    tracing::warn!(task_id = %task.id, error = %e, "principle rows did not serialize");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "the principle account could not be read; this round writes without \
+                     the principles that govern its paths"
+                );
+                None
+            }
+        }
+    }
+
     fn build_self_evolution_context(mut base: serde_json::Value, goal: &str) -> serde_json::Value {
         // Only mark the mode; generator/evaluator add their own role-specific
         // schemas. Putting detailed change instructions here leaks into the
@@ -1442,6 +1509,108 @@ impl CollaborationExecutor {
             240
         };
         base + size_factor + type_factor
+    }
+}
+
+/// 一次递给生成端的原则条数上限。
+///
+/// 这是一道**选的界**，不是量出来的容量：这张表记的是哪几条门站在这次要动的
+/// 文件上，正常的改动只落在几个文件里，真实匹配数通常是个位数。界在这里是因为
+/// 一次任务点名几百个路径时（整仓改名的活会这样）匹配可以是几百条，而几百条
+/// 原则正文会把提示词里真正的任务挤到读不到的地方。撞上界说明这次要动的东西
+/// 太大，该先拆，不该靠多塞原则解决。
+// cap: bound — 选出来的一道界，不是量出来的容量
+const PRINCIPLES_PER_TASK: usize = 12;
+
+/// 任务点名的那些路径，从哪里点就从哪里读。
+///
+/// 先读 `named_files`——那是显式声明，一个词就是一个路径。再扫任务输入里其余
+/// 的字符串，把看起来像仓库内路径的片段取出来：拒单回炉的任务把编译器指的
+/// 位置写在摘要里（`clippy::x at crates/a/src/b.rs:411`），信号链的任务把路径
+/// 写在目标描述里，两种都没有 `named_files`，而它们说的是同一件事。
+///
+/// 只认带扩展名、带一个以上目录分隔符的片段：`main` 这样的词是散文中到处都
+/// 有的，认成路径会让每一次任务都匹配到同一批原则。去重并按字典序排，两轮同一
+/// 件任务问出同一个顺序——提示词的缓存前缀就靠这一点才留得住。
+fn named_paths(input: &serde_json::Value) -> Vec<String> {
+    let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    if let Some(declared) = input.get("named_files").and_then(|v| v.as_array()) {
+        for one in declared.iter().filter_map(|v| v.as_str()) {
+            if let Some(path) = path_token(one) {
+                found.insert(path.to_string());
+            }
+        }
+    }
+
+    let mut scratch = String::new();
+    collect_strings(input, &mut scratch);
+    for token in scratch.split(|c: char| c.is_whitespace() || "\"'`,;()[]{}<>".contains(c)) {
+        if let Some(path) = path_token(token) {
+            found.insert(path.to_string());
+        }
+    }
+
+    // 再把每一个 crate 根也当作一层问法。一条原则记下的门几乎总是 `crates/X/tests/`
+    // 里的一个契约测试，而任务点名的是 `crates/X/src/` 里要改的那个文件——两级路径
+    // 逐字不同，只按整条路径问，改任何源码都问不出管着这个 crate 的那几条。crate
+    // 根是这两级唯一对得上的那一层。
+    for crate_root in found
+        .iter()
+        .filter_map(|path| path.strip_prefix("crates/")?.split('/').next())
+        .map(|name| format!("crates/{name}"))
+        .collect::<Vec<_>>()
+    {
+        found.insert(crate_root);
+    }
+
+    found.into_iter().collect()
+}
+
+/// 一个片段如果是仓库内的路径，返回它的路径本身。
+///
+/// 编译器与告警把行号缀在路径后面（`crates/a/src/b.rs:411`），那是路径之外的
+/// 东西：不剥掉它，扩展名就成了 `rs:411`，一条真实得不能再真实的路径反而不算
+/// 路径。只剥纯数字的尾巴，`crates/a/src/window:size` 这种名字一个字符都不动。
+fn path_token(token: &str) -> Option<&str> {
+    let token = token.trim_matches(|c: char| matches!(c, '.' | ',' | ')' | ';'));
+    let token = match token.rsplit_once(':') {
+        Some((head, line)) if !line.is_empty() && line.chars().all(|c| c.is_ascii_digit()) => head,
+        _ => token,
+    };
+    let (_, ext) = token.rsplit_once('.')?;
+    let known = matches!(
+        ext,
+        "rs" | "toml" | "yaml" | "yml" | "json" | "md" | "ts" | "tsx" | "js" | "sh" | "sql"
+    );
+    let looks_right = known
+        && token.contains('/')
+        && !token.starts_with('/')
+        && !token.contains("..")
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | '*'));
+    looks_right.then_some(token)
+}
+
+/// 把一个 JSON 里所有的字符串接起来，用空白隔开——扫描只需要字节。
+fn collect_strings(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(s) => {
+            out.push_str(s);
+            out.push(' ');
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values() {
+                collect_strings(item, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2838,5 +3007,83 @@ mod tests {
             CollaborationExecutor::extract_execution_result(&squad_result),
             serde_json::Value::Null
         );
+    }
+}
+
+#[cfg(test)]
+mod named_paths_tests {
+    use super::named_paths;
+
+    /// 显式声明过的路径一个不少地读出来——这条是整件事的主路：任务说了要动
+    /// 哪些文件，原则就按那些文件去问。
+    #[test]
+    fn declared_files_are_read_as_they_are_written() {
+        let paths = named_paths(&serde_json::json!({
+            "goal": "修一处 lint",
+            "named_files": ["crates/bootstrap/src/main.rs", "crates/cog-core/src/types/task.rs"],
+        }));
+        assert_eq!(
+            paths,
+            vec![
+                "crates/bootstrap".to_string(),
+                "crates/bootstrap/src/main.rs".to_string(),
+                "crates/cog-core".to_string(),
+                "crates/cog-core/src/types/task.rs".to_string(),
+            ],
+            "点名的文件与它所在的 crate 都该被问一遍：门几乎总记在 crate 的 tests/ 里"
+        );
+    }
+
+    /// 没声明 `named_files` 的那几种任务，路径写在散文里：拒单回炉把编译器的
+    /// 报点抄进摘要，信号链把目标路径写进描述。读不到这两处，绝大多数自进化
+    /// 任务就永远问不出任何一条原则。
+    #[test]
+    fn a_path_written_inside_a_sentence_is_still_a_path() {
+        let paths = named_paths(&serde_json::json!({
+            "failure_digest": "clippy::unnecessary_map_or at crates/bootstrap/src/main.rs:411",
+            "reason": "the check named `deploy/helm/cogneva/values.yaml` twice",
+        }));
+        assert_eq!(
+            paths,
+            vec![
+                "crates/bootstrap".to_string(),
+                "crates/bootstrap/src/main.rs".to_string(),
+                "deploy/helm/cogneva/values.yaml".to_string(),
+            ]
+        );
+    }
+
+    /// 散文里的词不是路径。`main`、`src`、`list.rs` 这些一旦被当成路径，每一次
+    /// 任务都会匹配到同一批原则，注入就退化成一段与这次改动无关的噪声。
+    #[test]
+    fn a_word_that_looks_like_a_name_is_not_a_path() {
+        let paths = named_paths(&serde_json::json!({
+            "goal": "make the main loop stop早退 and keep list.rs correct",
+            "notes": ["see 1.2.3 and /etc/passwd and ../outside/lib.rs"],
+        }));
+        assert!(paths.is_empty(), "散文里的词被读成了路径：{paths:?}");
+    }
+
+    /// 同一个文件被点两次只问一次；两轮之间顺序一样，提示词的缓存前缀才留得住。
+    #[test]
+    fn the_same_path_is_asked_about_once_and_always_in_the_same_order() {
+        let a = named_paths(&serde_json::json!({
+            "named_files": ["crates/b/src/x.rs", "crates/a/src/y.rs"],
+            "goal": "also crates/b/src/x.rs and crates/a/src/y.rs",
+        }));
+        let b = named_paths(&serde_json::json!({
+            "goal": "crates/a/src/y.rs then crates/b/src/x.rs",
+            "named_files": ["crates/a/src/y.rs"],
+        }));
+        assert_eq!(
+            a,
+            vec![
+                "crates/a".to_string(),
+                "crates/a/src/y.rs".to_string(),
+                "crates/b".to_string(),
+                "crates/b/src/x.rs".to_string(),
+            ]
+        );
+        assert_eq!(a, b, "两次问出的顺序不一样，缓存前缀每一轮都会被丢掉");
     }
 }

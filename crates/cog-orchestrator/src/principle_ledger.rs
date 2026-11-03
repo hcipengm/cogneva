@@ -1699,6 +1699,13 @@ mod tests {
                 .clone()
                 .filter(|row| row.slug == slug))
         }
+        async fn gating_paths(
+            &self,
+            _: &[String],
+            _: usize,
+        ) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            unimplemented!()
+        }
         async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {
             Ok(self
                 .row
@@ -1875,6 +1882,13 @@ mod tests {
             let mut held = row(slug, Some("-"), None);
             held.check_kind = Some(PrincipleCheckKind::Judgement);
             Ok(Some(held))
+        }
+        async fn gating_paths(
+            &self,
+            _: &[String],
+            _: usize,
+        ) -> cog_core::SFResult<Vec<PrincipleRow>> {
+            unimplemented!()
         }
         async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {
             Ok(vec![
@@ -2100,6 +2114,13 @@ mod tests {
                 .collect())
         }
         async fn get(&self, _: &str) -> cog_core::SFResult<Option<PrincipleRow>> {
+            unimplemented!()
+        }
+        async fn gating_paths(
+            &self,
+            _: &[String],
+            _: usize,
+        ) -> cog_core::SFResult<Vec<PrincipleRow>> {
             unimplemented!()
         }
         async fn slugs(&self) -> cog_core::SFResult<Vec<String>> {

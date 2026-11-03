@@ -512,6 +512,29 @@ impl PrincipleLedgerStore for PostgresPrincipleLedgerStore {
         Self::entries(rows)
     }
 
+    async fn gating_paths(&self, paths: &[String], limit: usize) -> SFResult<Vec<PrincipleRow>> {
+        // 空路径集是「这次没有要动的文件」，不是「什么都管不着」：一条查询都不发，
+        // 返回空。否则全表会被 EXISTS 里的空数组判成假，结果一样，代价却是每次
+        // 生成都扫一遍账。
+        if paths.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(&read_sql(
+            "FROM principle_ledger \
+             WHERE EXISTS (SELECT 1 FROM unnest($1::text[]) AS p \
+                           WHERE principle_ledger.platform_gate LIKE '%' || p || '%' \
+                              OR principle_ledger.where_red LIKE '%' || p || '%') \
+             ORDER BY slug \
+             LIMIT $2",
+        ))
+        .bind(paths)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SFError::Database(e.to_string()))?;
+        Self::entries(rows)
+    }
+
     async fn reopen_platform_gate_drift(
         &self,
         gates: &HashMap<String, String>,

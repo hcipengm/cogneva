@@ -77,6 +77,7 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
             let skill_registry = ctx.consume_service::<dyn cog_core::ExternalSkillRegistry>();
             let state_backend = ctx.consume_service::<dyn cog_core::StateBackend>();
             let stage_store = ctx.consume_service::<dyn cog_core::PgeStageStore>();
+            let principle_ledger = ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>();
 
             // self_review / pge / boundary 是 cog-collaboration 自有配置段，
             // 自读 cogneva.json（core config.rs 不聚合单 crate 配置）。
@@ -102,6 +103,17 @@ impl cog_core::SystemPlugin for CollaborationPlugin {
                     "no PGE stage-product store published; a run that dies between two \
                      inference calls loses its plan, diff and verdict and the next pass \
                      buys them again"
+                ),
+            }
+
+            // 原则账没接上时不拦启动：生成照样跑，只是这一轮没有任何一条项目原则
+            // 被递进来。这里要的是一条具名日志——「这次没带原则」与「这些文件上
+            // 没有原则」在输出上看不出分别，只有这条日志能把两者分开。
+            match principle_ledger {
+                Some(ledger) => collab = collab.with_principle_ledger(ledger),
+                None => warn!(
+                    "no principle ledger published; a generation round writes without the \
+                     principles that record a gate on the paths it touches"
                 ),
             }
 

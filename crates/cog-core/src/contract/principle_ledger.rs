@@ -800,6 +800,25 @@ pub trait PrincipleLedgerStore: Send + Sync {
     /// One row, by the slug that names it.
     async fn get(&self, slug: &str) -> SFResult<Option<PrincipleRow>>;
 
+    /// The rows whose recorded gate names one of `paths`.
+    ///
+    /// "Names" is a substring test against `platform_gate` and `where_red`, the
+    /// two columns in which a reading records where a rule goes red. It is the
+    /// question a caller asks before it writes to those paths: which of this
+    /// project's rules has a gate standing on the file I am about to change.
+    ///
+    /// A row with neither column recorded is not returned, and that is a real
+    /// limit rather than a filter. Nothing in the account says the rule governs
+    /// this path; returning it here would put a rule in front of a writer while
+    /// pretending to know it applies, and it would do so for two thirds of the
+    /// account. An ungated principle is the account's debt, recorded as such by
+    /// the census -- it is not a finding about any one path.
+    ///
+    /// Ordered by slug so two callers asking the same question hand the writer
+    /// the same bytes: a prompt that reorders itself between rounds is a prompt
+    /// whose cached prefix is thrown away between rounds.
+    async fn gating_paths(&self, paths: &[String], limit: usize) -> SFResult<Vec<PrincipleRow>>;
+
     /// Every slug the account holds.
     ///
     /// Read as a set rather than as rows because that is how the reverse
