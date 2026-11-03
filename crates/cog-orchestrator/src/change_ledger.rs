@@ -435,6 +435,27 @@ const DISPATCH_TASK_KIND: &str = "change_ledger";
 /// loop in the graph.
 const DISPATCH_PROJECT_PREFIX: &str = "change-ledger:";
 
+/// The face a dispatched change's project belongs to.
+///
+/// Named by the loop that hands the rows over, not by what a change is about:
+/// the ledger dispatches work for every area of the tree and has nothing that
+/// says which area a given file belongs to, so a subject-level face here would
+/// be a guess dressed as a fact. What it can state is whose work it is that the
+/// row exists at all — and that is the answer the ownership reading needs when
+/// such a goal fails to decompose: 2026-11-03, one of the two firing
+/// `decomposition_wbs` rows came from a dispatched change, and with no face
+/// anywhere on the goal every downstream verdict could only read `no_face`.
+///
+/// It is written on the project's **anchor only**. The anchor is the goal's
+/// identity row, and that is what the planner reads the goal's face from; the
+/// leaves stay faceless on purpose. A face on a dispatched change would make it
+/// face-bound work, and the staffing pass binds every unbound row of a face to
+/// that face's unit — which would take the several thousand rows this loop
+/// keeps in the shared queue and hand them to one unit. Their rank is already
+/// the loop's own statement about how they compete for the queue; ownership of
+/// the project is a different claim.
+const DISPATCH_FACE: &str = "变更管理";
+
 /// The task kind of the row that anchors a dispatched change's project.
 ///
 /// Not [`DISPATCH_TASK_KIND`]: a reader that counts dispatched work must not
@@ -1041,6 +1062,7 @@ fn dispatch_project_root_for(project: &str) -> Task {
     );
     root.goal_id = Some(project.to_string());
     root.parent_task_id = None;
+    root.face_id = Some(DISPATCH_FACE.to_string());
     // The anchor is where work hangs, not work: nothing reads it as a change,
     // and the queue must not start it.
     root.is_executable = false;
@@ -6452,6 +6474,32 @@ mod tests {
         assert!(task.id.starts_with(DISPATCH_TASK_PREFIX));
         assert_eq!(task.input["task_kind"], DISPATCH_TASK_KIND);
         assert_eq!(task.input["evolution_mode"], "generate_change");
+    }
+
+    /// 一个派出项目说得出自己属于哪一面，而它的变更行不带面。
+    ///
+    /// 面写在锚点上，是因为分解器与归属读数都从目标那一行取：这条目标分解不了时，
+    /// 判退行带着的就是这一格；空着，那一行只能读成 `no_face`，谁也说不清该谁动
+    /// ——2026-11-03 实测的两条正 firing 里有一条就是这么来的。
+    ///
+    /// 变更行不带面是**故意的**：带上面它就成了某个面的活，而人员那一路会把该面
+    /// 所有没主的行绑到那个面上的人，等于把这几千条共享队列里的行交到一个人手上。
+    /// 所以这一格钉两头，缺一头都是错。
+    #[test]
+    fn a_dispatched_project_declares_its_face_and_leaves_its_changes_in_the_queue() {
+        let row = row(ChangeState::Pending, Some(1_760_000_000));
+        let anchor = dispatch_project_root(&row);
+        assert_eq!(
+            anchor.face_id.as_deref(),
+            Some(DISPATCH_FACE),
+            "锚点没有面，这条目标判退时就只能读成 no_face"
+        );
+        let task = dispatch_task(&row, 0);
+        assert_eq!(task.goal_id, anchor.goal_id);
+        assert_eq!(
+            task.face_id, None,
+            "派出的变更带上面会把共享队列里的行绑到一个人手上"
+        );
     }
 
     /// 交出去的每一条变更都说清「做完」是什么意思，而且说的就是账自己那个终态。

@@ -62,6 +62,12 @@ const DEFAULT_MAX_WORKSPACES: usize = 8;
 
 const META_DIR_NAME: &str = ".meta";
 
+/// Distinguishes the temporary files two concurrent sidecar writes stage under.
+///
+/// Only ever grows: it names a file that lives for the length of one rename, so
+/// there is nothing to count and nothing to reset.
+static META_STAGING: AtomicU64 = AtomicU64::new(0);
+
 /// Maximum task id length, keeps the on-disk directory name clear of
 /// `ENAMETOOLONG` while accommodating generated ids such as
 /// `<owner-task>-ralph-roundtable-i12-<8 hex>`.
@@ -1598,14 +1604,43 @@ impl WorkdirRouter {
         self.meta_dir.join(format!("{task_id}.json"))
     }
 
+    /// Publish one tree's sidecar in a single step.
+    ///
+    /// The write goes to a sibling file first and is then renamed into place.
+    /// A plain write truncates before it fills: between those two moments the
+    /// sidecar is a zero-length or half-written file, and every reader of it is
+    /// lock-free — a reclaim pass, a cap ranking, another writer's
+    /// read-modify-write. A reader that catches that window parses nothing and
+    /// concludes the tree has no sidecar, and the reclamation rule for a tree
+    /// without one is to *adopt* it rather than reap it, so a live fault reads
+    /// as a stale tree kept alive. Measured on 2026-11-03: a tree was routed,
+    /// the claim on it was released (which re-stamps `last_used` from a task of
+    /// its own), and the very next `gc_once` counted zero reaps where one tree
+    /// was idle — the test holding that claim failed on roughly a quarter of
+    /// its runs.
+    ///
+    /// Rename within one directory is atomic, so a reader sees either the whole
+    /// old file or the whole new one. The temporary name cannot collide with a
+    /// sidecar (`meta_dir` readers only ever accept `*.json`) nor with a
+    /// concurrent write of the same tree (the id is per-process and per-call).
     async fn write_meta(&self, meta: &TaskMeta) -> SFResult<()> {
         tokio::fs::create_dir_all(&self.meta_dir)
             .await
             .map_err(|e| SFError::IO(format!("create meta dir: {e}")))?;
         let text = serde_json::to_string_pretty(meta)?;
-        tokio::fs::write(self.meta_path(&meta.task_id), text)
+        let path = self.meta_path(&meta.task_id);
+        let staged = path.with_extension(format!(
+            "json.tmp-{}-{}",
+            std::process::id(),
+            META_STAGING.fetch_add(1, Ordering::Relaxed)
+        ));
+        tokio::fs::write(&staged, text)
             .await
-            .map_err(|e| SFError::IO(format!("write task meta: {e}")))?;
+            .map_err(|e| SFError::IO(format!("stage task meta: {e}")))?;
+        if let Err(e) = tokio::fs::rename(&staged, &path).await {
+            let _ = tokio::fs::remove_file(&staged).await;
+            return Err(SFError::IO(format!("publish task meta: {e}")));
+        }
         Ok(())
     }
 
@@ -2618,6 +2653,17 @@ pub(crate) mod tests {
 
     /// The TTL rule asks the same question as the cap: a tree idle past the TTL
     /// is not idle if a command is running in it.
+    ///
+    /// What this pins is the in-use exception, not how the TTL is derived. The
+    /// pass prefers a TTL derived from how fast trees arrive over the one
+    /// configured, and arrival is stamped in whole seconds: two trees whose
+    /// creation straddles a second boundary give a span of two, which derives
+    /// `MIN_TTL_SECS` and reaps nothing at all. That made this assertion fail
+    /// on CI on 2026-11-03 (reaped 0 where it asserts 1) on a runner slow
+    /// enough for the two routes below to land in different seconds. So the
+    /// premise this test needs — "the configured TTL is the one in force" — is
+    /// written down instead of hoped for: both trees are stamped as arriving at
+    /// the same instant, which is what makes the derivation decline to answer.
     #[tokio::test]
     async fn ttl_reaps_idle_trees_but_not_one_in_use() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2625,6 +2671,13 @@ pub(crate) mod tests {
         let r = router(tmp.path(), &bare, 8, Duration::ZERO);
         let (running, _in_use) = r.route("running").await.unwrap();
         let (idle, _) = r.route("idle").await.unwrap();
+        let arriving_together = unix_now();
+        for id in ["running", "idle"] {
+            let mut meta = r.read_meta(id).expect("a routed tree has a sidecar");
+            meta.created_at_unix = arriving_together;
+            meta.last_used_unix = arriving_together;
+            r.write_meta(&meta).await.unwrap();
+        }
 
         assert_eq!(
             r.gc_once().await.unwrap(),
@@ -2636,6 +2689,53 @@ pub(crate) mod tests {
             "a tree with a command in it is not idle, whatever its stamp says"
         );
         assert!(!idle.exists(), "an idle tree past the TTL is reaped");
+    }
+
+    /// The sidecar is published whole, so a reader never catches it empty.
+    ///
+    /// Nothing synchronises a reader of a sidecar with its writer: a reclaim
+    /// pass, a cap ranking and another writer's read-modify-write all read it
+    /// with no lock. A write that empties the file first leaves a window in
+    /// which the parse fails and the tree reads as having no sidecar at all —
+    /// and the reclaim rule for that tree is to adopt it, so the fault reads as
+    /// a stale tree kept alive. This holds a writer and a reader against one
+    /// tree and fails on the first read that comes back empty.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sidecar_is_replaced_whole_so_a_concurrent_reader_never_sees_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = seed_bare(tmp.path());
+        let r = router(tmp.path(), &bare, 8, DEFAULT_TTL_SECS_FALLBACK);
+        r.route("reader").await.unwrap();
+
+        let writer_router = Arc::clone(&r);
+        let writer = tokio::spawn(async move {
+            for stamp in 1..=200i64 {
+                writer_router
+                    .write_meta(&TaskMeta {
+                        task_id: "reader".to_string(),
+                        created_at_unix: 1,
+                        last_used_unix: stamp,
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let mut reads = 0u64;
+        loop {
+            let seen = r.read_meta("reader");
+            reads += 1;
+            assert!(
+                seen.is_some(),
+                "read {reads} caught the sidecar mid-publish: the file a reader sees must always \
+                 be one whole version, never a truncated one"
+            );
+            if writer.is_finished() {
+                break;
+            }
+        }
+        writer.await.unwrap();
+        assert!(reads > 1, "the writer finished before the reader ran once");
     }
 
     /// A command ending is the tree's last use, and the sidecar is what the next

@@ -432,6 +432,28 @@ fn alert_intent(
     (goal, detail)
 }
 
+/// The face the alert behind this signal declared, if it declared one.
+///
+/// An alert row says which face moves when it fires — that is the cell the
+/// ownership reading answers "who is this for" from. The work filed here is the
+/// fix for that alert, so it belongs to the same face; dropping the cell at this
+/// hop makes everything downstream faceless. Measured on 2026-11-03: the two
+/// firing `decomposition_wbs` rows came off `signal:persisted_alert/...` goals
+/// that had been filed without one, so the ownership reading could only say
+/// `no_face` about work whose alert had named its face all along.
+///
+/// Empty is not a face name: it would read as a face called "", which the roster
+/// has no row for. Absent and blank both mean "this signal declared no face".
+fn alert_face(detail: &serde_json::Value) -> Option<String> {
+    detail
+        .get("labels")?
+        .get(cog_core::ALERT_FACE_LABEL)?
+        .as_str()
+        .map(str::trim)
+        .filter(|face| !face.is_empty())
+        .map(str::to_string)
+}
+
 /// Normalize a task error into a recurrence signature: same root cause must
 /// map to the same signature regardless of run ids, numbers, timestamps.
 fn error_signature(error: &str) -> String {
@@ -810,7 +832,12 @@ const SIGNAL_PROJECT_ROOT_PREFIX: &str = "signal-project:";
 /// root is one of its own rows loses the parent of everything under it at the
 /// first resubmission. The anchor is submitted with every filing and is never a
 /// signal, so it is never the row that gets cleared.
-fn signal_project_root(project: &str) -> Task {
+///
+/// The anchor carries the project's face. It is the row a goal is identified by
+/// — the planner reads `face_id` off the goal's own row and hands it to every
+/// piece it breaks the goal into — so an anchor without one makes the whole
+/// project faceless however well each filing below it is labelled.
+fn signal_project_root(project: &str, face: Option<&str>) -> Task {
     let mut root = Task::new(
         signal_project_root_id(project),
         TaskType::Custom(SIGNAL_PROJECT_ROOT_KIND.into()),
@@ -821,6 +848,7 @@ fn signal_project_root(project: &str) -> Task {
     );
     root.goal_id = Some(project.to_string());
     root.parent_task_id = None;
+    root.face_id = face.map(str::to_string);
     // The anchor is where work hangs, not work: nothing ever runs it.
     root.is_executable = false;
     root
@@ -941,7 +969,11 @@ async fn settle_signal_parents(
             continue;
         }
         if !anchored {
-            match orch.add_task(signal_project_root(project)).await {
+            // Back-filling an anchor takes the project's face from the rows
+            // already there: this pass writes the anchor for a group filed
+            // before the anchor existed, and those rows are where the face is.
+            let face = rows.iter().find_map(|row| row.face_id.as_deref());
+            match orch.add_task(signal_project_root(project, face)).await {
                 Ok(()) => settled.anchored += 1,
                 Err(e) => {
                     settled.failed += 1;
@@ -1208,6 +1240,11 @@ async fn submit_intent(
             // `json!` moves the value in, so a key derived afterwards would be
             // derived from nothing.
             let project = signal_project_key(&detail);
+            // Same reason the project key is read before the payload moves: the
+            // face has to be taken off the alert's labels while they are still
+            // reachable, and the row filed here is the one the fix will be
+            // worked on.
+            let face = alert_face(&detail);
             // What "done" means for this row, taken from the reading that filed
             // it: see `signal_acceptance`. A leaf carrying none is work nobody
             // can close.
@@ -1230,6 +1267,7 @@ async fn submit_intent(
             // condition that keeps asking is what turns "one thousand and
             // fourteen projects" into "the alert rules that are firing".
             task.goal_id = project.clone();
+            task.face_id = face.clone();
             task.acceptance.push(acceptance);
             // And the row hangs under the project's anchor rather than being a
             // root of its own -- a group whose every round is a root is a group
@@ -1237,7 +1275,7 @@ async fn submit_intent(
             let mut filing = Vec::with_capacity(2);
             if let Some(project) = &project {
                 task.parent_task_id = Some(signal_project_root_id(project));
-                filing.push(signal_project_root(project));
+                filing.push(signal_project_root(project, face.as_deref()));
             }
             filing.push(task);
             match orch.submit_goal_auto(&goal, filing).await {
@@ -2522,6 +2560,87 @@ mod tests {
         }
     }
 
+    /// 告警自己说了该谁动，它派生出来的活就得带着那句话。
+    ///
+    /// 归属读数按行问「这一行带没带面」：规则申报的面随 labels 抄进告警行，而由它
+    /// 派生的修复目标如果在这一跳把面丢了，后面关于这份工作的每一条判退都只能读成
+    /// `no_face`——面一直在源头写着，却在第一跳被丢掉。2026-11-03 实测：两条正 firing
+    /// 的 `decomposition_wbs` 就是 `signal:persisted_alert/...` 目标派生的，面全空。
+    ///
+    /// 面必须同时落在**锚点**上：目标的身份行是锚点，分解器从那一行取面，再发给它拆
+    /// 出来的每一片。
+    #[tokio::test]
+    async fn a_signal_filed_for_an_alert_carries_the_face_the_alert_declared() {
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(vec![]));
+        let detail = serde_json::json!({
+            "kind": "persisted_alert",
+            "rule": "llm_upstream_pool_down",
+            "labels": { cog_core::ALERT_FACE_LABEL: "可观测与告警" },
+        });
+        let outcome = submit_intent(
+            &orch,
+            "self-signal-alert-face".to_string(),
+            "self_signal",
+            "修掉 pool_down".to_string(),
+            detail.clone(),
+            true,
+        )
+        .await;
+        assert!(matches!(outcome, IntentOutcome::Registered), "{outcome:?}");
+
+        let project = signal_project_key(&detail).expect("这份 detail 指名了项目");
+        let filed = orch.get_all_tasks().await;
+        let anchor = filed
+            .iter()
+            .find(|t| t.id == signal_project_root_id(&project))
+            .expect("锚点必须写出来");
+        assert_eq!(
+            anchor.face_id.as_deref(),
+            Some("可观测与告警"),
+            "锚点是目标的身份行，面丢在这里整组都是无主的"
+        );
+        let row = filed
+            .iter()
+            .find(|t| t.id == "self-signal-alert-face")
+            .expect("信号行必须写出来");
+        assert_eq!(row.face_id.as_deref(), Some("可观测与告警"));
+    }
+
+    /// 告警没说面，就不要编一个：空字符串会被读成一个名叫「空」的面，比缺席更糟。
+    #[tokio::test]
+    async fn a_signal_whose_alert_names_no_face_stays_faceless() {
+        let orch: Arc<dyn OrchestratorControl> = Arc::new(FilingOrchestrator::holding(vec![]));
+        // 空白面先放进变量，不直接写进标签那一格：源码里「标签名后面紧跟一个字面量」
+        // 的那一形是「写者给告警行挂的面」，会被载体对账逐条读成声明，而这一格要造的
+        // 恰恰是一个不该被当成面的值。
+        let blank = "   ";
+        let detail = serde_json::json!({
+            "kind": "persisted_alert",
+            "rule": "pool_down",
+            "labels": { cog_core::ALERT_FACE_LABEL: blank },
+        });
+        let outcome = submit_intent(
+            &orch,
+            "self-signal-alert-blank".to_string(),
+            "self_signal",
+            "修掉 pool_down".to_string(),
+            detail.clone(),
+            true,
+        )
+        .await;
+        assert!(matches!(outcome, IntentOutcome::Registered), "{outcome:?}");
+
+        let project = signal_project_key(&detail).expect("这份 detail 指名了项目");
+        for row in orch
+            .get_all_tasks()
+            .await
+            .iter()
+            .filter(|t| t.goal_id.as_deref() == Some(project.as_str()))
+        {
+            assert_eq!(row.face_id, None, "{} 不该凭空长出一个面", row.id);
+        }
+    }
+
     /// 早先写下的、两个根的一组，一次结算后回到一个根——这是那 9 个项目的修法。
     ///
     /// 同时钉住射程：别的项目（这里是 UUID 项目）一行都不动，而不是「凡是
@@ -2614,7 +2733,7 @@ mod tests {
                 serde_json::json!({"goal": "g", "signal": detail}),
             ),
             // 锚点：不是活，也不带读数。
-            signal_project_root(project),
+            signal_project_root(project, None),
             // 没有留下读数的一行：没有东西可说，就不说。
             row(
                 "self-signal-bare",
