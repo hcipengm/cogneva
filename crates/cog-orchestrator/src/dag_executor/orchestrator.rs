@@ -1088,12 +1088,35 @@ impl DagExecutor {
             return self.add_tasks_batch_store(tasks).await;
         }
         let mut inner = self.inner.write().await;
+        // Rows already in the graph that state their acceptance in their own
+        // input get it before this batch is looked at -- see
+        // [`acceptance_left_in_input`] for why nobody re-submits them.
+        for (id, kind, rows) in inner.tasks.values_mut().filter_map(carry_stated_acceptance) {
+            tracing::info!(
+                task_id = %id,
+                kind = %kind,
+                criteria = rows,
+                "carried the acceptance the row's own input states"
+            );
+        }
         // Phase 1: collect new tasks and their dependencies, skipping duplicates
         let mut validated: Vec<(String, HashSet<String>, Task)> = Vec::new();
         let mut reused: Vec<String> = Vec::new();
         let mut promotions: Vec<Task> = Vec::new();
         let plan_shaped = tasks.iter().any(|t| !t.blocked_by.is_empty());
-        for task in tasks {
+        for mut task in tasks {
+            // The graph is the one place every row passes through, whichever
+            // door it came in by; a row whose own input states its acceptance
+            // leaves here carrying it, so no dispatcher ever holds it for want
+            // of a copy step.
+            if let Some((id, kind, criteria)) = carry_stated_acceptance(&mut task) {
+                tracing::info!(
+                    task_id = %id,
+                    kind = %kind,
+                    criteria = criteria,
+                    "carried the acceptance the row's own input states"
+                );
+            }
             let task_id = task.id.clone();
             if let Some(held) = inner.tasks.get(&task_id) {
                 if plan_shaped && !may_be_skipped(held, &task) {
@@ -1224,9 +1247,20 @@ impl DagExecutor {
         Ok(())
     }
 
-    pub async fn add_task(&self, task: Task) -> SFResult<()> {
+    pub async fn add_task(&self, mut task: Task) -> SFResult<()> {
         if self.fg().is_some() {
             return self.add_task_store(task).await;
+        }
+        // Same normalisation the batch path applies: a row that states its
+        // acceptance in its own input is inserted carrying it, so the
+        // dispatcher never holds a row for want of a copy step.
+        if let Some((id, kind, criteria)) = carry_stated_acceptance(&mut task) {
+            tracing::info!(
+                task_id = %id,
+                kind = %kind,
+                criteria = criteria,
+                "carried the acceptance the row's own input states"
+            );
         }
         let mut inner = self.inner.write().await;
         let task_id = task.id.clone();
@@ -1365,7 +1399,31 @@ impl DagExecutor {
 
     async fn add_tasks_batch_store(&self, tasks: Vec<Task>) -> SFResult<Vec<String>> {
         let be = self.fg().expect("store mode");
-        let existing = be.dag_get_all_tasks(&self.workspace_id).await?;
+        let mut existing = be.dag_get_all_tasks(&self.workspace_id).await?;
+        // Same repair as the in-memory path: a row that states its acceptance in
+        // its own input is given it, so the row does not sit pending for the
+        // rest of the platform's life for want of a copy step that used to be
+        // missing. A failed write here must not fail the submission that
+        // happened to touch the graph.
+        for held in existing.iter_mut() {
+            let Some((id, kind, criteria)) = carry_stated_acceptance(held) else {
+                continue;
+            };
+            if let Err(e) = be.dag_set_task(&self.workspace_id, &id, held).await {
+                tracing::warn!(
+                    task_id = %id,
+                    error = %e,
+                    "could not persist the acceptance the row's own input states"
+                );
+                continue;
+            }
+            tracing::info!(
+                task_id = %id,
+                kind = %kind,
+                criteria,
+                "carried the acceptance the row's own input states"
+            );
+        }
         let mut graph: HashMap<String, HashSet<String>> = existing
             .iter()
             .map(|t| (t.id.clone(), t.blocked_by.iter().cloned().collect()))
@@ -1377,7 +1435,19 @@ impl DagExecutor {
         let mut reused: Vec<String> = Vec::new();
         let mut promotions: Vec<Task> = Vec::new();
         let plan_shaped = tasks.iter().any(|t| !t.blocked_by.is_empty());
-        for task in tasks {
+        for mut task in tasks {
+            // Same normalisation as the in-memory path: every row passes
+            // through the graph, so this is the one place a row can be given
+            // the acceptance its own input states without asking each door to
+            // remember to copy it.
+            if let Some((id, kind, criteria)) = carry_stated_acceptance(&mut task) {
+                tracing::info!(
+                    task_id = %id,
+                    kind = %kind,
+                    criteria = criteria,
+                    "carried the acceptance the row's own input states"
+                );
+            }
             if let Some(held) = held_by_id.get(task.id.as_str()) {
                 if plan_shaped && !may_be_skipped(held, &task) {
                     reused.push(reused_id_note(held, &task));
@@ -3776,6 +3846,63 @@ fn missing_enrichment(held: &Task, incoming: &Task) -> Vec<&'static str> {
     missing
 }
 
+/// The acceptance criteria this row's own submission stated, for a row that
+/// never received them.
+///
+/// A row submitted as verified skips decomposition, so no planner ever writes
+/// "what done means" onto it: the submission is the only statement, and it
+/// travels under `acceptance` in the row's input. Until the door that accepts
+/// verified rows copied that field, the statement stayed in the input and the
+/// row was held by the dispatcher forever -- it never starts, while the 202 the
+/// caller got back reads exactly like work in progress. Three rows were live
+/// that way on 2026-11-03, two of them with their criteria already written in
+/// the input they still carry.
+///
+/// Absences only: a row that already carries criteria keeps them, whatever its
+/// input says. Blank entries are dropped -- a list of empty strings is a list
+/// that says nothing, and a dispatcher that only asks whether the list is empty
+/// would take it as an answer.
+fn acceptance_left_in_input(row: &Task) -> Vec<String> {
+    if !row.acceptance.is_empty() {
+        return Vec::new();
+    }
+    row.input
+        .get("acceptance")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Give a row that states its acceptance in its own input the criteria it
+/// states, and report what was given.
+///
+/// This is meant to run whenever the graph is touched by a submission, which is
+/// what makes the repair independent of anybody re-submitting the same id: the
+/// row carries its own statement, so nobody has to be told which rows are
+/// broken. It is also the backstop for a writer that builds a row without going
+/// through the door that now carries the criteria for verified submissions.
+///
+/// Returns `(task id, kind, number of criteria)` so the caller can log the names:
+/// a count alone cannot be acted on.
+fn carry_stated_acceptance(row: &mut Task) -> Option<(String, String, usize)> {
+    let stated = acceptance_left_in_input(row);
+    if stated.is_empty() {
+        return None;
+    }
+    let given = (row.id.clone(), row.task_type.kind_key(), stated.len());
+    row.acceptance = stated;
+    row.updated_at = chrono::Utc::now();
+    Some(given)
+}
+
 /// Fill what the held row lacks from the submission that carried it. Absences
 /// only -- see [`missing_enrichment`] for why this never overwrites.
 fn carry_enrichment(held: &mut Task, incoming: &Task) {
@@ -4129,6 +4256,90 @@ mod tests {
             "只有「pending、可执行、说不出怎样算完」的那一行被扣住: {by_kind:?}"
         );
         assert_eq!(by_kind.len(), 1, "{by_kind:?}");
+    }
+
+    /// 行自己的提交写了判据，行上就必须有。
+    ///
+    /// 带 `planner.verified` 的提交不经过分解，没有 planner 会把「怎样算做完」
+    /// 写到行上；提交是唯一的出处，而它写在 `input.acceptance` 里。这一格判的是
+    /// 图这个共同写者把它接过来：否则派发器永远扣住这条行，调用方拿到的 202 读起来
+    /// 却像活正在做。
+    #[tokio::test]
+    async fn a_row_whose_input_states_its_acceptance_is_given_it() {
+        let dag = DagExecutor::new("ws-carried-acceptance".into());
+        let mut stated = evolution_task("states-it-in-input");
+        stated.input = serde_json::json!({
+            "goal": "把判据写在提交里",
+            "acceptance": ["这条行的判据在行上读得回来", "  ", "第二句不为空白也留着"],
+        });
+        dag.add_task(stated).await.unwrap();
+
+        let held = dag.get_task("states-it-in-input").await.unwrap();
+        assert_eq!(
+            held.acceptance,
+            vec![
+                "这条行的判据在行上读得回来".to_string(),
+                "第二句不为空白也留着".to_string()
+            ],
+            "空白条目不进判据，其余原样搬上来: {:?}",
+            held.acceptance
+        );
+        assert!(
+            crate::ready_queue::is_dispatchable_work(&held),
+            "带着判据的行必须可派发，否则这一格什么都没证明"
+        );
+    }
+
+    /// 没说判据的行照旧被扣住：这条修的是「说了却没接过来」，不是替谁编一句。
+    #[tokio::test]
+    async fn a_row_that_states_no_acceptance_is_still_held() {
+        let dag = DagExecutor::new("ws-no-acceptance".into());
+        dag.add_task(evolution_task("says-nothing")).await.unwrap();
+
+        let held = dag.get_task("says-nothing").await.unwrap();
+        assert!(held.acceptance.is_empty());
+        assert!(
+            crate::ready_queue::held_for_want_of_a_criterion(&held),
+            "说不出判据的行仍然要被扣住，而不是随便找一句话填上"
+        );
+    }
+
+    /// 已经带着判据的行不被输入覆盖：输入是提交时说的，行上是活的当前判据。
+    #[test]
+    fn a_row_that_already_carries_criteria_keeps_them() {
+        let mut row = evolution_task("already-states-it");
+        row.acceptance = vec!["行上的这一句".into()];
+        row.input = serde_json::json!({ "acceptance": ["输入里的那一句"] });
+
+        assert!(
+            carry_stated_acceptance(&mut row).is_none(),
+            "不该报告「补上了」"
+        );
+        assert_eq!(row.acceptance, vec!["行上的这一句".to_string()]);
+    }
+
+    /// 盘上那批先落行、判据留在输入里的旧行，靠这趟补上——不需要谁重新提交同一个 id。
+    #[test]
+    fn a_row_written_before_the_copy_step_is_healed_in_place() {
+        let mut row = evolution_task("written-before-the-door");
+        row.input = serde_json::json!({ "acceptance": ["旧行自己的判据"] });
+        row.updated_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        let before = row.updated_at;
+
+        let healed = carry_stated_acceptance(&mut row);
+        assert_eq!(
+            healed,
+            Some((
+                "written-before-the-door".to_string(),
+                "generator".to_string(),
+                1
+            ))
+        );
+        assert_eq!(row.acceptance, vec!["旧行自己的判据".to_string()]);
+        assert!(
+            row.updated_at > before,
+            "补过的行要推进 updated_at，否则按它排序的读面看不出这一行动过"
+        );
     }
 
     /// 欠账计数只算「有人可能正在花这个窗口」的行。
