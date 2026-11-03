@@ -31,7 +31,7 @@ use crate::common;
 
 use common::routes::repo_root;
 
-use common::rust_production::{all_crate_files, production_text};
+use common::rust_production::{all_crate_files, production_sources, production_text};
 
 use cog_gateway::actor_labels::{declared, ACTOR_LABELS, ACTOR_LABEL_PREFIXES, UNKNOWN_ACTOR};
 
@@ -581,4 +581,163 @@ fn the_task_scan_sees_a_stamp() {
     assert!(!stamps_a_task(&production_text(
         r#"let o = ChatOptions::default().with_actor("ralph");"#
     )));
+}
+
+// ============================================================================
+// 第三格：这棵树里有哪些地方能把请求交给模型
+// ============================================================================
+//
+// 上面两格读的是「写了身份的那些调用点」：它们从文本里认出 `with_actor(...)`
+// 并判那一格的值。一个**完全没写身份**的调用点在那里是不可见的——它不带任何
+// 字面量，认字面量的普查当然看不见它。那个案子只有到运行时才露出来：网关
+// 把这次调用拒成 400，或者落进 `actor="unknown"` 那一格。
+//
+// 这一格补的是源头那一半：生产代码里**每一处**把请求交给模型的地方，都必须在这里
+// 有一行，说清它的身份从哪来。新增一个调用点、而没在这里登记，就直接红——那时
+// 要回答的问题不是「该填哪个值」，是「这一处该不该有身份」。
+//
+// 它判不到的东西也写在明处：`Forwards` 说的是「它传的是调用方的 `ChatOptions`」，
+// 而这份普查读不出调用方传进来的那一份里有没有身份。那条链的尽头是 `Stamps`
+// 那些文件，它们由上面第一格逐个判过字面量。
+
+/// 一处调用的身份从哪来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorSource {
+    /// 它自己把身份写在这次请求上（第一格看得见这个字面量）。
+    Stamps,
+    /// 它把调用方造好的 `ChatOptions` 原样传下去——身份是调用方的，它既不能
+    /// 凭空造一个，也不会把它弄丢。
+    Forwards,
+}
+
+/// 生产代码里把请求交给模型的每一处，以及它的身份从哪来。
+///
+/// 判的是**文件集合**，不是行号：一处换位置不算新调用点，一个文件里多出第二个
+/// 悄悄不盖身份的调用点算——而这一点也能被看见，因为同一个文件已经登记过一次。
+const CALL_SITES: &[(&str, ActorSource)] = &[
+    ("crates/cog-agent/src/agent.rs", ActorSource::Stamps),
+    (
+        "crates/cog-agent/src/agent_kernel/runtime.rs",
+        ActorSource::Stamps,
+    ),
+    ("crates/cog-agent/src/self_review.rs", ActorSource::Stamps),
+    (
+        "crates/cog-collaboration/src/collaboration_executor.rs",
+        ActorSource::Stamps,
+    ),
+    (
+        "crates/cog-collaboration/src/squad/ralph/ralph_loop.rs",
+        ActorSource::Stamps,
+    ),
+    // `json_mode` 就在这份契约里：它把调用方给的 `ChatOptions` 原样递下去。
+    // 头与 setter 也定义在这份文件里，但那次调用不带自己的身份——它是调用方的。
+    ("crates/cog-core/src/contract/llm.rs", ActorSource::Forwards),
+    ("crates/cog-eval/src/backoff.rs", ActorSource::Forwards),
+    ("crates/cog-eval/src/rig.rs", ActorSource::Forwards),
+    (
+        "crates/cog-eval/src/scaffolds/codeact.rs",
+        ActorSource::Forwards,
+    ),
+    ("crates/cog-eval/src/scaffolds/mod.rs", ActorSource::Stamps),
+    ("crates/cog-gateway/src/chat.rs", ActorSource::Stamps),
+    ("crates/cog-llm/src/hot_swap.rs", ActorSource::Forwards),
+    ("crates/cog-llm/src/observed.rs", ActorSource::Forwards),
+    (
+        "crates/cog-llm/src/provider/anthropic.rs",
+        ActorSource::Forwards,
+    ),
+    (
+        "crates/cog-llm/src/provider/google.rs",
+        ActorSource::Forwards,
+    ),
+    (
+        "crates/cog-llm/src/provider/ollama.rs",
+        ActorSource::Forwards,
+    ),
+    (
+        "crates/cog-llm/src/provider/openai.rs",
+        ActorSource::Forwards,
+    ),
+    (
+        "crates/cog-llm/src/provider/responses.rs",
+        ActorSource::Forwards,
+    ),
+    ("crates/cog-llm/src/resilience.rs", ActorSource::Forwards),
+    ("crates/cog-llm/src/routing.rs", ActorSource::Forwards),
+    ("crates/cogneva/src/eval_table.rs", ActorSource::Stamps),
+    (
+        "crates/cog-reflection/src/evolution.rs",
+        ActorSource::Stamps,
+    ),
+    (
+        "crates/cog-reflection/src/extractor.rs",
+        ActorSource::Stamps,
+    ),
+    ("crates/cog-wiki/src/llm_maintainer.rs", ActorSource::Stamps),
+];
+
+/// 生产代码里出现了对模型的调用（`chat` / `chat_stream`）的那些文件。
+///
+/// 读的是产出面：`#[cfg(test)] mod tests` 里的替身也在调 `chat`，而替身不
+/// 替任何东西花真钱，把它们算进来会让这张名单一半是夹具、一半是产出。
+fn call_site_files(root: &Path) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for file in production_sources(root) {
+        let rel = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .display()
+            .to_string();
+        let text = std::fs::read_to_string(&file)
+            .unwrap_or_else(|e| panic!("{} unreadable: {e}", file.display()));
+        let production = production_text(&text);
+        if production.contains(".chat(") || production.contains(".chat_stream(") {
+            out.insert(rel);
+        }
+    }
+    out
+}
+
+#[test]
+fn every_place_that_hands_a_request_to_a_model_says_where_its_actor_comes_from() {
+    let root = repo_root();
+    let actual = call_site_files(&root);
+    let expected: BTreeSet<String> = CALL_SITES
+        .iter()
+        .map(|(path, _)| path.to_string())
+        .collect();
+
+    let added: Vec<_> = actual.difference(&expected).collect();
+    assert!(
+        added.is_empty(),
+        "these production files call a model without being listed here: {added:?}\n\
+         每一处都要回答「它的身份从哪来」：自己盖（`Stamps`，第一格看得见那个字面量）、\n\
+         还是原样传下去（`Forwards`）。\n\
+         答不出来的时候，那不是一格登记，是这一处不该有身份。"
+    );
+
+    let gone: Vec<_> = expected.difference(&actual).collect();
+    assert!(
+        gone.is_empty(),
+        "these files are listed as calling a model but no longer do: {gone:?}\n\
+         名单只增不减时会慢慢变成一张历史表，它就不再回答「现在谁能碰到模型」。"
+    );
+}
+
+#[test]
+fn a_call_site_that_stamps_an_actor_is_one_the_literal_census_sees() {
+    let producers: BTreeSet<&str> = PRODUCERS.iter().map(|(path, _)| *path).collect();
+    let liars: Vec<_> = CALL_SITES
+        .iter()
+        .filter(|(_, source)| *source == ActorSource::Stamps)
+        .map(|(path, _)| *path)
+        .filter(|path| !producers.contains(path))
+        .collect();
+    assert!(
+        liars.is_empty(),
+        "these files are declared to stamp an actor, but the literal census does not see \
+         one in them: {liars:?}\n\
+         两格读的是同一件事的两面：这里说「它自己盖」，第一格就该读得出那个字面量。\n\
+         读不出只有两种可能——它其实在往下传（改成 `Forwards`），或者它把身份忘了。"
+    );
 }
