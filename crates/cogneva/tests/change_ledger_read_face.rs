@@ -856,6 +856,87 @@ async fn a_change_with_no_ledger_behind_it_costs_unknown_not_zero() {
     );
 }
 
+/// Every row on the page carries its own cost, from one read.
+///
+/// The list is where a person decides what to work on next, and until this
+/// column existed the only cost reading on the account was the fleet's day
+/// divided by the fleet's landings -- an average that gives two changes a
+/// hundredfold apart the same number. A caller told "one read per row" would
+/// build a page of a hundred round trips; the rows and their ids are known at
+/// once, so the page is one read.
+#[tokio::test]
+async fn each_row_of_the_page_carries_the_cost_of_that_change() {
+    let a = ChangeIdentity::new("grep", "crates/a", "literal-in-crates/a");
+    let b = ChangeIdentity::new("grep", "crates/b", "literal-in-crates/b");
+    let ids_a = cog_orchestrator::change_ledger::dispatch_task_ids(&a);
+    let ids_b = cog_orchestrator::change_ledger::dispatch_task_ids(&b);
+
+    let usage = Arc::new(FakeUsage {
+        spent: vec![
+            (ids_a[0].clone(), 700),
+            // The other change's figure sits under a later generation: a page
+            // read that stopped at generation 0 would report this row as free.
+            (ids_b[1].clone(), 300),
+        ],
+    });
+    let state = state_with(
+        Some(Arc::new(FakeLedger::new(
+            vec![
+                row(ChangeState::Pending, "doc-a.md", "crates/a"),
+                row(ChangeState::Pending, "doc-b.md", "crates/b"),
+            ],
+            0,
+            0,
+        ))),
+        Some(usage),
+    );
+    let token = bearer(&state).await;
+
+    let (status, body) = get(state, "/api/v1/governance/changes", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["cost_unreadable"].is_null(),
+        "a page whose costs were all measured explains nothing: {body}"
+    );
+    let rows = body["outstanding"].as_array().expect("rows");
+    let cost_of = |identity: &str| {
+        rows.iter()
+            .find(|r| r["identity"] == identity)
+            .unwrap_or_else(|| panic!("no row {identity} in {body}"))["cost"]
+            .as_u64()
+    };
+    assert_eq!(cost_of("grep:crates/a:literal-in-crates/a"), Some(700));
+    assert_eq!(cost_of("grep:crates/b:literal-in-crates/b"), Some(300));
+}
+
+/// A page with no ledger says so once, instead of printing a column of zeros.
+///
+/// The rows themselves are still readable -- this route answers "what does the
+/// account owe" and that question does not depend on the spend ledger -- so the
+/// column has to be reported as unmeasured rather than emptied or filled.
+#[tokio::test]
+async fn a_page_with_no_ledger_says_the_cost_column_is_unmeasured() {
+    let state = state(Some(Arc::new(FakeLedger::new(
+        vec![row(ChangeState::Pending, "doc-a.md", "crates/a")],
+        0,
+        0,
+    ))));
+    let token = bearer(&state).await;
+
+    let (status, body) = get(state, "/api/v1/governance/changes", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["cost_unreadable"].is_string(),
+        "the page has to say why the column is empty: {body}"
+    );
+    let rows = body["outstanding"].as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "{body}");
+    assert!(
+        rows[0]["cost"].is_null(),
+        "an unmeasured cost is not zero: {body}"
+    );
+}
+
 /// Every state is a cell even when it holds nothing, and the two totals are
 /// taken over the census rather than over the page.
 #[tokio::test]

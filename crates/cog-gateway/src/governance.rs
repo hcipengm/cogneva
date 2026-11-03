@@ -275,6 +275,13 @@ pub struct ChangesResponse {
     /// Retirements queued and not yet folded, the same reading for the other
     /// intake.
     pub pending_retirements: u64,
+    /// Why the per-row cost column is empty, when it is.
+    ///
+    /// Null means every row below carries a measured figure. A string means
+    /// none of them does, and names the reason: a page of nulls with nothing
+    /// said about why reads as a fleet of changes that all cost nothing, which
+    /// is the one conclusion the column must never invite.
+    pub cost_unreadable: Option<String>,
     /// How many rows are outstanding, over the whole set rather than the list
     /// below it. `outstanding.len()` is a page length and answering this
     /// question with it would make the backlog look as small as the page.
@@ -346,6 +353,13 @@ pub struct ChangeLedgerRowView {
     /// The face this change is filed under, or `none` when the documents that
     /// ask for it name none or name different ones.
     pub block: String,
+    /// What this one change cost, over every handover its identity fixes.
+    ///
+    /// `None` when the column could not be measured for this page at all; the
+    /// response's `cost_unreadable` says why. `Some(0)` is a real answer -- a
+    /// change nothing ever picked up -- and the two are kept apart for the same
+    /// reason `spend_by_task` keeps them apart.
+    pub cost: Option<u64>,
 }
 
 /// One ledger row as the changes read hands it out.
@@ -353,7 +367,7 @@ pub struct ChangeLedgerRowView {
 /// Split from the handler so the mapping has a reader that needs no database:
 /// which facts a row view keeps is about the row, not about whether the store
 /// answered.
-fn change_row_view(row: cog_core::ChangeLedgerRow) -> ChangeLedgerRowView {
+fn change_row_view(row: cog_core::ChangeLedgerRow, cost: Option<u64>) -> ChangeLedgerRowView {
     let priority = row.priority().as_str().to_string();
     let block = row.block().as_str().to_string();
     let holds_the_line = row.holds_the_line();
@@ -378,7 +392,48 @@ fn change_row_view(row: cog_core::ChangeLedgerRow) -> ChangeLedgerRowView {
         unsettled_reason: row.unsettled_reason,
         priority,
         block,
+        cost,
     }
+}
+
+/// What each row of one page cost, keyed by identity, or the reason the whole
+/// column could not be measured.
+///
+/// One ledger read for the page rather than one per row: the rows are known at
+/// once, the ids are fixed by their identities, and a per-row read would put a
+/// hundred round trips behind a single screen.
+///
+/// Nothing here invents a zero. A row whose ids this control plane cannot name,
+/// a page with no ledger behind it, and a failed read all produce `None` and a
+/// reason; only an answered read produces figures.
+async fn page_costs(
+    ledger: Option<&Arc<dyn cog_core::LlmUsageLedger>>,
+    orchestrator: &Arc<dyn cog_core::OrchestratorControl>,
+    rows: &[cog_core::ChangeLedgerRow],
+) -> Result<std::collections::BTreeMap<String, u64>, String> {
+    let mut per_row: Vec<(String, Vec<String>)> = Vec::with_capacity(rows.len());
+    for row in rows {
+        let ids = orchestrator
+            .change_dispatch_ids(&row.identity)
+            .ok_or_else(|| "this control plane does not dispatch changes".to_string())?;
+        per_row.push((row.identity.as_key(), ids));
+    }
+    let Some(ledger) = ledger else {
+        return Err("this process holds no token ledger".into());
+    };
+    let all: Vec<String> = per_row.iter().flat_map(|(_, ids)| ids.clone()).collect();
+    let spent: std::collections::BTreeMap<String, u64> =
+        ledger.spend_by_task(&all).await?.into_iter().collect();
+    Ok(per_row
+        .into_iter()
+        .map(|(key, ids)| {
+            let total = ids
+                .iter()
+                .map(|id| spent.get(id).copied().unwrap_or(0))
+                .sum();
+            (key, total)
+        })
+        .collect())
 }
 
 /// How many outstanding rows the route returns. The account can hold thousands;
@@ -430,7 +485,26 @@ pub async fn changes_handler(
         })
         .collect();
 
-    let outstanding = rows.into_iter().map(change_row_view).collect();
+    let costs = page_costs(state.llm_usage.as_ref(), &state.orchestrator, &rows).await;
+    let (cost_of, cost_unreadable) = match costs {
+        Ok(by_identity) => (Some(by_identity), None),
+        Err(reason) => {
+            tracing::warn!(%reason, "governance: per-change cost is not measurable on this page");
+            (None, Some(reason))
+        }
+    };
+    let outstanding = rows
+        .into_iter()
+        .map(|row| {
+            let cost = cost_of.as_ref().map(|by_identity| {
+                by_identity
+                    .get(&row.identity.as_key())
+                    .copied()
+                    .unwrap_or(0)
+            });
+            change_row_view(row, cost)
+        })
+        .collect();
 
     Ok(Json(ChangesResponse {
         generated_at: now,
@@ -439,6 +513,7 @@ pub async fn changes_handler(
         owed_by_band,
         pending_declarations,
         pending_retirements,
+        cost_unreadable,
         outstanding_total,
         outstanding,
     }))
@@ -674,7 +749,7 @@ mod tests {
     /// 都丢在台账行里。看见这两格才知道该去修树还是该去修判据。
     #[test]
     fn a_row_that_was_delivered_and_is_still_owed_says_so() {
-        let view = change_row_view(ledger_row());
+        let view = change_row_view(ledger_row(), None);
         assert_eq!(view.delivered_rev.as_deref(), Some("def456"));
         assert!(view.holds_the_line);
         assert_eq!(
@@ -693,7 +768,7 @@ mod tests {
     fn a_row_nothing_delivered_does_not_hold_the_line() {
         let mut row = ledger_row();
         row.delivered_rev = None;
-        let view = change_row_view(row);
+        let view = change_row_view(row, None);
         assert_eq!(view.delivered_rev, None);
         assert!(!view.holds_the_line);
     }

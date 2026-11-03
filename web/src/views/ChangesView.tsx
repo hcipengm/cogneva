@@ -193,6 +193,22 @@ export function ChangesView() {
                 ) : (
                   <span className="text-[11px] text-[var(--muted)]">—</span>
                 ) },
+              // 这一条自己的花销，按它的全部交接代际求和。以前这一面只有
+              // 「全队一天的花费 ÷ 全队一天的落地数」，那是平均：差一百倍的两条
+              // 变更在它上面是同一个数，答不了「这条花了多少」。
+              { key: 'cost', title: '花了', width: '110px', render: (r) =>
+                r.cost === null ? (
+                  <Note
+                    className="text-[11px] text-[var(--muted)]"
+                    text={page.cost_unreadable ?? '这一页没有账可读'}
+                  >
+                    量不了
+                  </Note>
+                ) : (
+                  <span className="mono text-[11px] text-[var(--paper-dim)]">
+                    {r.cost.toLocaleString()}
+                  </span>
+                ) },
               { key: 'why', title: '还差什么', width: '150px', render: (r) =>
                 r.holds_the_line ? (
                   <Note

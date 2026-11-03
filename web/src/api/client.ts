@@ -2185,6 +2185,13 @@ export interface ChangeLedgerRow {
   priority: string;
   /** 这一条落在哪一面；`none` 表示没有文档点名或点名不一致。 */
   block: string;
+  /**
+   * 这一条自己花掉的 token，按它的全部交接代际求和。
+   *
+   * `null` 是「这一页量不了」，原因在响应上的 `cost_unreadable`；`0` 是量到的
+   * 结论（这条没人接手过）。两者不能互相顶替。
+   */
+  cost: number | null;
 }
 
 /**
@@ -2251,6 +2258,8 @@ export interface ChangesPage {
   owed_by_band: ChangeBandCell[];
   pending_declarations: number;
   pending_retirements: number;
+  /** 每次成本列读不到的原因；`null` 表示这一页每一行都有实测成本。 */
+  cost_unreadable: string | null;
   outstanding_total: number;
   outstanding: ChangeLedgerRow[];
 }
