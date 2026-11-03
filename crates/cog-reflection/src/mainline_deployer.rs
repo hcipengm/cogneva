@@ -17386,6 +17386,10 @@ exec {real} "$@"
             reason.contains("macos-latest"),
             "扣住的判词必须点得出是哪一条：{reason}"
         );
+        assert!(
+            reason.contains("cancelled"),
+            "扣的是「一次取消还在窗口里」，不是「上游判了这一版不通过」：{reason}"
+        );
         let _ = handle.await.unwrap();
     }
 

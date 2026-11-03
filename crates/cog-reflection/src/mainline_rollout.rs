@@ -5033,6 +5033,9 @@ impl RolloutExecutor {
         // 判红但只由取消撑着的检查，且取消已经站满窗口：按没有结论处置，名字留在这里，
         // 让「带着一次取消滚上去」这一件事在判词面上说得出来，而不是悄悄变绿。
         let mut waived: Vec<String> = Vec::new();
+        // 同一件事还没满窗：照旧扣，但判词必须说清扣的是「一次取消还在窗口里」而不是
+        // 「上游判了这一版不通过」。只说后者，读的人会去翻代码找一条根本不存在的红。
+        let mut cancelled_holding: Vec<String> = Vec::new();
         let now_unix = chrono::Utc::now().timestamp();
         for up in &ask.upstreams {
             let (verdict, reason, names, excluded, cancelled, machine) =
@@ -5091,6 +5094,13 @@ impl RolloutExecutor {
                         );
                         continue;
                     }
+                    if !cancelled.is_empty() && cancelled.len() == names.len() {
+                        cancelled_holding.extend(
+                            cancelled
+                                .iter()
+                                .map(|c| format!("{}:{}", up.platform, c.name)),
+                        );
+                    }
                     failures += 1;
                     failed.extend(names.into_iter().map(|n| format!("{}:{n}", up.platform)));
                 }
@@ -5119,6 +5129,13 @@ impl RolloutExecutor {
         }
         if failures > 0 {
             let mut reason = ci_red_hold_reason(&ask.rev, &failed, &still_running, &not_asked);
+            if !cancelled_holding.is_empty() {
+                reason.push_str(&format!(
+                    "; cancelled rather than judged, still inside the window a rerun \
+                     would need: {}",
+                    cancelled_holding.join(",")
+                ));
+            }
             if !waived.is_empty() {
                 reason.push_str(&format!("; waived as no evidence: {}", waived.join(",")));
             }
