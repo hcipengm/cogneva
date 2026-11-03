@@ -77,7 +77,11 @@ async fn test_gateway_metrics_and_logs() {
         timestamp: Utc::now(),
     });
 
-    gw.record_log(
+    // Through the contract, not the inherent method: the route the platform
+    // serves reads logs through this trait, and an inherent writer beside it
+    // proves only that this test can call itself.
+    ObservabilityGateway::record_task_log(
+        &gw,
         "t-1",
         LogEntry {
             timestamp: Utc::now(),
@@ -86,7 +90,9 @@ async fn test_gateway_metrics_and_logs() {
             message: "started".into(),
             metadata: serde_json::json!(null),
         },
-    );
+    )
+    .await
+    .unwrap();
 
     let metrics = gw.get_task_metrics("t-1").await.unwrap();
     assert_eq!(metrics.total_tokens, 100);

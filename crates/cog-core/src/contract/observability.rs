@@ -610,6 +610,18 @@ pub trait ObservabilityGateway: Send + Sync {
 
     async fn get_task_logs(&self, task_id: &str, limit: usize) -> SFResult<Vec<LogEntry>>;
 
+    /// Persist one structured log line against the task that produced it -- the
+    /// write side of [`Self::get_task_logs`].
+    ///
+    /// Required, with no default, for the reason [`Self::record_task_metrics`]
+    /// is: until this existed the two storage backends each carried their own
+    /// inherent `record_log` and nothing in the tree ever called it, so
+    /// `/api/v1/tasks/{id}/logs` answered `[]` for every task ever run. An
+    /// empty answer from a route that has a reader is not the same reading as
+    /// "this task logged nothing"; it is the reader being told a false thing
+    /// about a table no producer writes.
+    async fn record_task_log(&self, task_id: &str, entry: LogEntry) -> SFResult<()>;
+
     async fn get_snapshot_url(&self, snapshot_id: &str) -> SFResult<String>;
 
     async fn get_raw_log_index(

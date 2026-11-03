@@ -18,6 +18,21 @@ use super::state_reads::{
 
 // ─── DDL ───
 
+/// How many log lines one task keeps.
+///
+/// Sized by what the route is for: a per-task log answers "what happened at the
+/// end of this run", and the run report is its unit. Two hundred is about a
+/// year of a task that runs daily, and leaves a task that runs in a loop for an
+/// hour with the last few hours of its own history. The bound is per task, so
+/// the table's size is the number of live tasks times this — not the platform's
+/// uptime times its run rate, which is what an unbounded append-only table is.
+///
+/// It is a cap, not a retention period: a quiet task keeps its lines however
+/// old they are, because nothing here has an opinion about age. A deployment
+/// that wants the other rule needs a sweep with a clock in it, which this is
+/// deliberately not.
+pub const LOG_LINES_PER_TASK: i64 = 200;
+
 /// This store's schema, and the one a restore replays.
 pub const OBSERVABILITY_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS cog_observability_events (
@@ -197,6 +212,29 @@ impl PostgresObservabilityGateway {
     }
 
     /// Record a structured log entry for the given task.
+    ///
+    /// The insert is followed by a trim that keeps the task's newest
+    /// [`LOG_LINES_PER_TASK`] rows. Without it this table is append-only and
+    /// its size is the platform's uptime times its run rate — the shape the
+    /// event log already had to be bounded for, on a table a thousand times
+    /// larger.
+    ///
+    /// Per task rather than per table because the reader asks in tasks: it
+    /// names one task id and a count. A table-wide capacity would let one busy
+    /// task push a quiet task's only line out, and that task's reader would
+    /// then get an empty list — the exact false answer this table exists to
+    /// stop giving.
+    ///
+    /// The trim is a separate statement from the insert because one statement
+    /// cannot see its own CTE's rows: a `DELETE` beside the `INSERT` in the
+    /// same statement counts the table as it was before the row landed and
+    /// would therefore take one line too many. Two statements can leave the
+    /// task one row over its bound between them, which is a row a reader can
+    /// see and the next write removes; losing the newest line is not.
+    ///
+    /// A failed trim does not fail the write. The line is in; the bound is the
+    /// part that did not hold, and saying so is more useful to the caller than
+    /// telling it the write it can already read back did not happen.
     pub async fn record_log(&self, task_id: &str, entry: LogEntry) -> SFResult<()> {
         sqlx::query(
             r#"
@@ -213,6 +251,31 @@ impl PostgresObservabilityGateway {
         .execute(&self.pool)
         .await
         .map_err(|e| SFError::Database(format!("record_log failed: {}", e)))?;
+
+        if let Err(e) = sqlx::query(
+            r#"
+            DELETE FROM cog_observability_logs
+            WHERE task_id = $1
+              AND id NOT IN (
+                  SELECT id FROM cog_observability_logs
+                  WHERE task_id = $1
+                  ORDER BY id DESC
+                  LIMIT $2
+              )
+            "#,
+        )
+        .bind(task_id)
+        .bind(LOG_LINES_PER_TASK)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(
+                task_id,
+                error = %e,
+                kept = LOG_LINES_PER_TASK,
+                "this task's log lines were written but not trimmed to the bound"
+            );
+        }
         Ok(())
     }
 
@@ -476,6 +539,10 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
 
     async fn record_task_metrics(&self, metrics: TaskMetrics) -> SFResult<()> {
         self.record_metrics(&metrics).await
+    }
+
+    async fn record_task_log(&self, task_id: &str, entry: LogEntry) -> SFResult<()> {
+        self.record_log(task_id, entry).await
     }
 
     async fn get_task_logs(&self, task_id: &str, limit: usize) -> SFResult<Vec<LogEntry>> {

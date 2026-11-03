@@ -3405,6 +3405,13 @@ mod consumer_ack_tests {
         ) -> cog_core::SFResult<()> {
             unimplemented!("the budget path never writes the census")
         }
+        async fn record_task_log(
+            &self,
+            _task_id: &str,
+            _entry: cog_core::LogEntry,
+        ) -> cog_core::SFResult<()> {
+            unimplemented!("the budget path never writes logs")
+        }
         async fn get_task_logs(
             &self,
             _task_id: &str,

@@ -1257,6 +1257,51 @@ impl AgentRuntime {
             duration_ms: elapsed.as_millis() as u64,
             timestamp: chrono::Utc::now(),
         };
+        // 与清点行同一身份、同一时刻：`/api/v1/tasks/{id}/logs` 上读到的这一行
+        // 说的就是这次运行。没有它，那条路由对每个任务都答 `[]`，而那读起来
+        // 和「这个任务什么都没记」一模一样——读者分不出「跑了但没记」与「记录
+        // 从来没接上」。写失败不改变运行的结局，只让这一格空着，所以它也只告警。
+        let ending = self.run_outcome;
+        let (message, ending_label) = match ending {
+            Some(e) => (
+                format!(
+                    "run finished as {e:?} after {} iterations and {} tool calls",
+                    metrics.iterations, metrics.tool_calls
+                ),
+                Some(format!("{e:?}")),
+            ),
+            None => (
+                format!(
+                    "run finished after {} iterations and {} tool calls, with no ending recorded",
+                    metrics.iterations, metrics.tool_calls
+                ),
+                None,
+            ),
+        };
+        let entry = cog_core::LogEntry {
+            timestamp: metrics.timestamp,
+            level: "info".to_string(),
+            source: "agent_kernel".to_string(),
+            message,
+            metadata: serde_json::json!({
+                "agent_id": self.config.agent_id,
+                "ending": ending_label,
+                "total_tokens": metrics.total_tokens,
+                "prompt_tokens": metrics.prompt_tokens,
+                "completion_tokens": metrics.completion_tokens,
+                "tool_calls": metrics.tool_calls,
+                "iterations": metrics.iterations,
+                "duration_ms": metrics.duration_ms,
+            }),
+        };
+        if let Err(e) = gateway.record_task_log(task_id, entry).await {
+            tracing::warn!(
+                agent_id = %self.config.agent_id,
+                task_id,
+                error = %e,
+                "run log write failed; this task's log route will not show this run"
+            );
+        }
         if let Err(e) = gateway.record_task_metrics(metrics).await {
             tracing::warn!(
                 agent_id = %self.config.agent_id,
@@ -3821,11 +3866,16 @@ mod tests {
     #[derive(Default)]
     struct CensusSpy {
         rows: std::sync::Mutex<Vec<cog_core::TaskMetrics>>,
+        logs: std::sync::Mutex<Vec<(String, cog_core::LogEntry)>>,
     }
 
     impl CensusSpy {
         fn rows(&self) -> Vec<cog_core::TaskMetrics> {
             self.rows.lock().unwrap().clone()
+        }
+
+        fn logs(&self) -> Vec<(String, cog_core::LogEntry)> {
+            self.logs.lock().unwrap().clone()
         }
     }
 
@@ -3855,6 +3905,11 @@ mod tests {
 
         async fn record_task_metrics(&self, metrics: cog_core::TaskMetrics) -> SFResult<()> {
             self.rows.lock().unwrap().push(metrics);
+            Ok(())
+        }
+
+        async fn record_task_log(&self, task_id: &str, entry: cog_core::LogEntry) -> SFResult<()> {
+            self.logs.lock().unwrap().push((task_id.to_string(), entry));
             Ok(())
         }
 
@@ -4249,6 +4304,51 @@ mod tests {
         assert_eq!(rows.len(), 1, "a failed run is not a missing run");
         assert_eq!(rows[0].task_id, "task-2");
         assert_eq!(rows[0].iterations, 1);
+    }
+
+    /// A finished run leaves one ending line where `/api/v1/tasks/{id}/logs`
+    /// reads it, keyed the same way its census row is.
+    ///
+    /// Before this the write side of that route did not exist in the contract at
+    /// all: both backends carried an inherent `record_log` and nothing in the
+    /// tree called it, so the route answered `[]` for every task ever run. An
+    /// empty list from a route with a reader reads as "this task logged
+    /// nothing", which is a claim about the task; the truth was a claim about
+    /// the wiring.
+    #[tokio::test]
+    async fn a_finished_run_leaves_one_log_line_under_its_task() {
+        let spy = Arc::new(CensusSpy::default());
+        let llm = CensusLlm {
+            text: r#"{"result":"ok"}"#,
+            stream_usage: usage(10, 10, 20),
+            chat_usage: cog_core::Usage::default(),
+            error: false,
+        };
+        let mut runtime = census_runtime("census-log").with_observability(spy.clone());
+
+        runtime
+            .run_scoped(
+                serde_json::json!({"task": "census"}),
+                &llm,
+                Some("task-log"),
+            )
+            .await
+            .expect("the run delivers");
+
+        let logs = spy.logs();
+        assert_eq!(logs.len(), 1, "one run leaves one ending line");
+        let (task_id, entry) = &logs[0];
+        assert_eq!(
+            task_id, "task-log",
+            "the line is keyed the way the census row is, or a per-task reader finds neither"
+        );
+        assert_eq!(entry.source, "agent_kernel");
+        assert!(
+            entry.message.contains("Delivered"),
+            "the line has to name how the run ended, actual: {}",
+            entry.message
+        );
+        assert_eq!(entry.metadata["total_tokens"], 20);
     }
 
     /// An unscoped run has no task to key a row under, and inventing one would

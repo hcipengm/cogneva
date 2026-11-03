@@ -50,7 +50,7 @@ pub use governance_store::PostgresGovernanceStore;
 pub use hook_archive::{HookArchiveRow, PostgresHookArchive};
 pub use metrics_backend::{gauge_latest_sql, PostgresMetricsBackend};
 pub use notification_store::PostgresNotificationStore;
-pub use observability_gateway::PostgresObservabilityGateway;
+pub use observability_gateway::{PostgresObservabilityGateway, LOG_LINES_PER_TASK};
 pub use pge_stage_store::PostgresPgeStageStore;
 pub use principle_ledger_store::PostgresPrincipleLedgerStore;
 pub use project_audit_log::{AuditEntry, AuditRow, PgProjectAuditLog, ProjectAuditLog};

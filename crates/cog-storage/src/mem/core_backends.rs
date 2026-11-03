@@ -1460,6 +1460,11 @@ impl ObservabilityGateway for MemoryObservabilityGateway {
         Ok(())
     }
 
+    async fn record_task_log(&self, task_id: &str, entry: LogEntry) -> SFResult<()> {
+        self.record_log(task_id, entry);
+        Ok(())
+    }
+
     async fn get_task_logs(&self, task_id: &str, limit: usize) -> SFResult<Vec<LogEntry>> {
         let logs = self.logs.read().unwrap();
         match logs.get(task_id) {
