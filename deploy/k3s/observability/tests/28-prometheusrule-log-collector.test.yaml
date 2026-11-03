@@ -1,0 +1,166 @@
+# 节点日志采集器四条判词的 promtool 单测：每条都要有「会响」与「不响」两格。
+#
+# 为什么这四条非证明不可：采集器自己坏掉时，平台其余每一面都是绿的——Loki 健康、
+# 面板出图、探针全过，只是第三方容器的日志不再进库。这四条是唯一会说话的地方，
+# 而它们的坏法恰好都不改形状：
+#   * `absent(...)` 少了 `and on() count(kube_pod_info{loki}) > 0`：`BACKENDS=0` 的
+#     安装上永远亮，一条只能被关掉的告警；
+#   * 就绪数与应调度数两侧的 `max by` 有一条漏掉：单侧无标签，比较配不上，规则永远静默；
+#   * 跟踪文件数用 `>= 0` 判：0 也是「有数」，永远不响；
+#   * 丢行用总量而不是窗口增量判：第一次丢包之后永久点亮。
+#
+# 输入取自 KSM 与采集器导出的真序列形状（2026-11-03 现网读数）；会不会响由 promtool
+# 自己的规则引擎判，不看表达式里有没有某个词。
+#
+# 跑法：bash deploy/scripts/test-acceptance-census-alert-rules.sh \
+#         deploy/k3s/observability/manifests/28-prometheusrule-log-collector.yaml \
+#         deploy/k3s/observability/tests/28-prometheusrule-log-collector.test.yaml
+rule_files:
+  - ../manifests/28-prometheusrule-log-collector.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # 一、有节点没起来：1 就绪 / 3 应调度，超过 10 分钟必须响。
+  - name: 就绪数少于应调度数会响
+    interval: 1m
+    input_series:
+      - series: 'kube_daemonset_status_number_ready{namespace="monitoring",daemonset="log-collector",pod="ksm-0",instance="ksm:8080"}'
+        values: '1x30'
+      - series: 'kube_daemonset_status_desired_number_scheduled{namespace="monitoring",daemonset="log-collector",pod="ksm-0",instance="ksm:8080"}'
+        values: '3x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: CognevaLogCollectorDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: CognevaLogCollectorDown
+        exp_alerts:
+          - exp_labels:
+              namespace: monitoring
+              daemonset: log-collector
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  # 二、干净的负对照：就绪数等于应调度数，全程不许响。
+  - name: 全部就绪时不会响
+    interval: 1m
+    input_series:
+      - series: 'kube_daemonset_status_number_ready{namespace="monitoring",daemonset="log-collector",pod="ksm-0",instance="ksm:8080"}'
+        values: '3x30'
+      - series: 'kube_daemonset_status_desired_number_scheduled{namespace="monitoring",daemonset="log-collector",pod="ksm-0",instance="ksm:8080"}'
+        values: '3x30'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaLogCollectorDown
+        exp_alerts: []
+
+  # 三、DaemonSet 整个不见了而 Loki 还在：`absent` 那一格必须响。
+  - name: DaemonSet 缺失而 Loki 在时会响
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_info{namespace="monitoring",pod="loki-0",node="cogneva"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CognevaLogCollectorAbsent
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: CognevaLogCollectorAbsent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  # 四、DaemonSet 在的时候不是「缺席」；这也是 `BACKENDS=0` 那类安装的安静格。
+  - name: DaemonSet 在时不会报缺席
+    interval: 1m
+    input_series:
+      - series: 'kube_daemonset_status_desired_number_scheduled{namespace="monitoring",daemonset="log-collector",pod="ksm-0",instance="ksm:8080"}'
+        values: '3x20'
+      - series: 'kube_pod_info{namespace="monitoring",pod="loki-0",node="cogneva"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CognevaLogCollectorAbsent
+        exp_alerts: []
+
+  # 五、没有 Loki 的安装（`BACKENDS=0`）里 DaemonSet 本来就不装：缺席是对的，
+  # 不许响。这一格是 Absent 里 `and on() count(kube_pod_info{loki}) > 0` 存在的理由。
+  - name: 没有 Loki 时采集器缺席不会响
+    interval: 1m
+    input_series:
+      - series: 'kube_pod_info{namespace="cogneva",pod="cogneva-0",node="cogneva"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: CognevaLogCollectorAbsent
+        exp_alerts: []
+
+  # 六、采集器在跑却一个文件都没跟：跟踪文件数为 0，三十分钟后必须响。
+  - name: 采集器在跑但没有跟踪任何文件会响
+    interval: 1m
+    input_series:
+      - series: 'loki_source_file_files_active_total{component_id="loki.source.file.pods"}'
+        values: '0x50'
+      - series: 'kube_daemonset_status_number_ready{namespace="monitoring",daemonset="log-collector",pod="ksm-0",instance="ksm:8080"}'
+        values: '2x50'
+      - series: 'kube_pod_info{namespace="cogneva",pod="cogneva-0",node="cogneva"}'
+        values: '1x50'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaLogCollectorBlind
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: CognevaLogCollectorBlind
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  # 七、负对照：采集器跟着一批文件，不许响。
+  - name: 采集器有跟踪文件时不会响
+    interval: 1m
+    input_series:
+      - series: 'loki_source_file_files_active_total{component_id="loki.source.file.pods"}'
+        values: '42x50'
+      - series: 'kube_daemonset_status_number_ready{namespace="monitoring",daemonset="log-collector",pod="ksm-0",instance="ksm:8080"}'
+        values: '2x50'
+      - series: 'kube_pod_info{namespace="cogneva",pod="cogneva-0",node="cogneva"}'
+        values: '1x50'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaLogCollectorBlind
+        exp_alerts: []
+
+  # 八、往 Loki 写时丢行：30 分钟窗口内的增量大于 0 必须响。
+  - name: 窗口内有丢行会响
+    interval: 1m
+    input_series:
+      - series: 'loki_write_dropped_entries_total{component_id="loki.write.default",reason="rate_limited"}'
+        values: '0x10 7x40'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: CognevaLogCollectorDroppingEntries
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: CognevaLogCollectorDroppingEntries
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: 可观测与告警
+
+  # 九、负对照：计数器平着走，没有增量，不许响。
+  - name: 没有丢行时不会响
+    interval: 1m
+    input_series:
+      - series: 'loki_write_dropped_entries_total{component_id="loki.write.default",reason="rate_limited"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaLogCollectorDroppingEntries
+        exp_alerts: []

@@ -114,6 +114,18 @@ def last_arg(e):
         elif ch == ',' and depth == 0: last = i + 1
     return e[last:].strip()
 
+def first_arg(e):
+    """实参列表里第一个实参。与 [`last_arg`] 相反的那一族：`clamp_min(v, 1)`、
+    `round(v, 5)`、`clamp(v, lo, hi)` 的**向量**是第一个实参，其余是标量参数。
+    把它们也按最后一个实参读，标签集就落在一个常量上，判词会指向 `, 1` 这段
+    文本、把一条读全局聚合量的规则判成未收敛。"""
+    depth = 0
+    for i, ch in enumerate(e):
+        if ch in '([{': depth += 1
+        elif ch in ')]}': depth -= 1
+        elif ch == ',' and depth == 0: return e[:i].strip()
+    return e.strip()
+
 def close_of(e, open_idx):
     d = 0
     for i in range(open_idx, len(e)):
@@ -130,9 +142,15 @@ def top_ops(e):
         if ch in '([{': depth += 1
         elif ch in ')]}': depth -= 1
         elif depth == 0 and i > 0:
-            for tok in (' and ', ' or ', ' unless '):
-                if e.startswith(tok, i):
-                    out.append((tok.strip(), e[:i], e[i + len(tok):])); i += len(tok); break
+            # 关键字两侧的分隔不只是**一个空格**：清单里的表达式是 YAML 块标量，
+            # 把 `and` 写在行首（前面是换行）是最常见的排版。按 `' and '` 精确匹配
+            # 时那种写法整段读成一个叶子、判成带了报信者标签——判词方向错了；反过来，
+            # 它也让一条真的没收敛的规则逃过检查。这里按「任意空白 + 关键字 + 不是标识符
+            # 下一字符」认，与 PromQL 的词法一致。
+            m = re.match(r'\s+(and|or|unless)(?![A-Za-z0-9_:])', e[i:])
+            if m:
+                k = m.end()
+                out.append((m.group(1), e[:i], e[i + k:].lstrip())); i += k
             else:
                 for tok in ('group_left', 'group_right'):
                     if e.startswith(tok, i):
@@ -160,7 +178,7 @@ def lint(expr, depth=0):
     m = re.match(NOLABEL + r'\s*\(', e)
     if m and close_of(e, m.end() - 1) == len(e) - 1: return None
     m = re.match(PASSTHRU + r'\s*\(', e)
-    if m and close_of(e, m.end() - 1) == len(e) - 1: return lint(e[m.end():-1], depth + 1)
+    if m and close_of(e, m.end() - 1) == len(e) - 1: return lint(first_arg(e[m.end():-1]), depth + 1)
     # `absent` / `absent_over_time` 与下面那族区间函数**方向相反**：区间函数把内层的标签
     # 带出来，缺席函数不从被选的序列上继承任何标签，只把**实参选择器里的等值（`=`）匹配器**
     # 抄成身份。实测（2026-10-16，cog-observability-prometheus；用一个不存在的度量名逼出
@@ -227,7 +245,7 @@ def side_arity(e, depth=0):
         return SIDE_EMPTY if m.group(1) == 'vector' else SIDE_SCALAR
     m = re.match(PASSTHRU + r'\s*\(', e)
     if m and close_of(e, m.end() - 1) == len(e) - 1:
-        return side_arity(e[m.end():-1], depth + 1)
+        return side_arity(first_arg(e[m.end():-1]), depth + 1)
     m = re.match(ABSENT + r'\s*\(', e)
     if m and close_of(e, m.end() - 1) == len(e) - 1:
         # arity 这一面不细究实参形态：实参是选择器时结果确实带那几个等值标签（LABELLED），

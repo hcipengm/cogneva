@@ -139,6 +139,38 @@ for r in prose_bare:
         r['summary'] = r['summary'] + f' 这一行讲的是 {retired_name} 的沿革，裸名字。'
 dump('prose_quoted', prose_quoted)
 dump('prose_bare', prose_bare)
+
+# 12. 换行分隔的 `and`：YAML 块标量里最常见的排版。两侧都收敛 -> 绿（旧的分词只认
+#     `' and '` 这一个空格，会把它整段读成一个叶子、判成带了报信者标签）；左侧是裸
+#     选择器 -> 仍然要红（修法不能把这一支整个放过）。
+and_newline_ok = json.loads(json.dumps(rules))
+and_newline_bad = json.loads(json.dumps(rules))
+for r in and_newline_ok:
+    if r['name'] == 'background_loop_restarted':
+        r['promql'] = ('max by (loop) (cogneva_loop_role_declared)\n'
+                       'and on()\n'
+                       'max(cogneva_loop_owner_held) > 0')
+for r in and_newline_bad:
+    if r['name'] == 'background_loop_restarted':
+        r['promql'] = ('cogneva_loop_role_declared\n'
+                       'and on()\n'
+                       'max(cogneva_loop_owner_held) > 0')
+dump('and_newline_ok', and_newline_ok)
+dump('and_newline_bad', and_newline_bad)
+
+# 13. 透传函数的**第一个**实参才是向量：`clamp_min(v, 1)`、`round(v, 5)` 都是这样。
+#     按最后一个实参读，标签集落在常量上——判词会指向 `, 1` 那段文本，把一条读全局
+#     聚合量的规则判成未收敛（而这正是把报信者聚合掉的那条规则会撞上的形状）。
+first_arg_ok = json.loads(json.dumps(rules))
+first_arg_bad = json.loads(json.dumps(rules))
+for r in first_arg_ok:
+    if r['name'] == 'background_loop_restarted':
+        r['promql'] = 'clamp_min(time() - max(cogneva_loop_owner_held), 1)'
+for r in first_arg_bad:
+    if r['name'] == 'background_loop_restarted':
+        r['promql'] = 'clamp_min(cogneva_loop_role_declared, 1)'
+dump('first_arg_ok', first_arg_ok)
+dump('first_arg_bad', first_arg_bad)
 PYEOF
 
 run() { # run <config> [manifest 目录] -> 打印合并输出，回传退出码
@@ -296,6 +328,28 @@ rc=0
 out="$(bash "${gate}" "${config}" "${work}/empty-manifests" 2>&1)" || rc=$?
 [ "${rc}" -eq 3 ] || fail "清单里一条 PrometheusRule 都没有时 rc=${rc}，应为 3 —— ${out}"
 grep -q '一条 PrometheusRule 规则' <<<"${out}" || fail "没有说清是一条规则都没读到：${out}"
+
+# 12a. `and` 写在行首、两侧都收敛 -> 绿。旧分词只认 `' and '`，这一格会红。
+if ! out="$(run "${work}/and_newline_ok.json")"; then
+  fail "换行分隔的 and 两侧都收敛，却被判红：${out}"; fi
+grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
+
+# 12b. 同一个排版、左侧是裸选择器 -> 红（修法不能把这一支整个放过）
+if out="$(run "${work}/and_newline_bad.json")"; then
+  fail "换行分隔的 and 左侧未收敛，却被判绿：${out}"; fi
+grep -q 'background_loop_restarted' <<<"${out}" || fail "判红却没点名那条规则：${out}"
+grep -q 'LEAF' <<<"${out}" || fail "判词要给出没收敛的那段子表达式：${out}"
+
+# 13a. 透传函数按第一个实参判：向量是 `time() - max(...)`（已收敛）-> 绿
+if ! out="$(run "${work}/first_arg_ok.json")"; then
+  fail "clamp_min 的向量实参已收敛，却被判红：${out}"; fi
+grep -q 'ALERT SUBJECT OK' <<<"${out}" || fail "绿的时候也要报判词：${out}"
+
+# 13b. 第一个实参是裸选择器 -> 红
+if out="$(run "${work}/first_arg_bad.json")"; then
+  fail "clamp_min 的向量实参没收敛，却被判绿：${out}"; fi
+grep -q 'background_loop_restarted' <<<"${out}" || fail "判红却没点名那条规则：${out}"
+grep -q 'LEAF' <<<"${out}" || fail "判词要给出没收敛的那段子表达式：${out}"
 
 # 显式的 --chart-only 仍然是合法的：那是调用方选的，不是目录恰好没读到。
 out="$(bash "${gate}" "${config}" --chart-only 2>&1)" || fail "--chart-only 应当绿：${out}"
