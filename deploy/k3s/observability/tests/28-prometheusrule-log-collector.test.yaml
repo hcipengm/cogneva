@@ -140,8 +140,11 @@ tests:
   - name: 窗口内有丢行会响
     interval: 1m
     input_series:
+      # 跳变放在窗口内部（25 分钟处）：`[30m]` 是左开的，压在 `eval-30m`
+      # 那个采样上的跳变根本不进范围，表达式读到一条平序列、算出来的增量是 0，
+      # 而「规则永远不响」与「这一格写对了」在 promtool 眼里同形。
       - series: 'loki_write_dropped_entries_total{component_id="loki.write.default",reason="rate_limited"}'
-        values: '0x10 7x40'
+        values: '0x25 7x15'
     alert_rule_test:
       - eval_time: 2m
         alertname: CognevaLogCollectorDroppingEntries

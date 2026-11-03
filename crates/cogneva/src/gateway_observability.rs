@@ -328,8 +328,6 @@ async fn build_pool_observability(
 
     // 建表文本归各 store 自己，跑表的是存储 crate 的 runner：把锁等待限死是
     // 数据库的性质，不是某个 store 的。
-    // 建表文本归各 store 自己，跑表的是存储 crate 的 runner：把锁等待限死是
-    // 数据库的性质，不是某个 store 的。
     //
     // 接不上的结局是「还没接上」而不是「这一代进程没有告警面」：出口是一个会自己
     // 接上的槽（见 `alert_sink`）。2026-11-03 实测：滚动重叠期旧 Pod 还占着那张表，
