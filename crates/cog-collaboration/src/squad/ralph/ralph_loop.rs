@@ -1237,6 +1237,13 @@ async fn sleep_through_pace(reason: &str) -> bool {
     true
 }
 
+// 「产出面在哪里」只许有一份算法：自己按 `mod tests` 切一刀，会在文件中间出现
+// 一个测试专用的项时把后面的产出整段丢掉，而「那里没有」与「那里没读」在判词上
+// 是同一句话。共享的那份在测试夹具里，这里按路径挂进来。
+#[cfg(test)]
+#[path = "../../../../cogneva/tests/common/rust_production.rs"]
+mod rust_production;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1280,8 +1287,7 @@ mod tests {
     /// 账本就又变回 2026-10-26 之前那样——每一行都看不出属于哪件活。
     #[test]
     fn every_task_this_loop_mints_is_named_after_its_task() {
-        let source = include_str!("ralph_loop.rs");
-        let production = source.split("mod tests").next().unwrap_or_default();
+        let production = rust_production::production_text(include_str!("ralph_loop.rs"));
         assert_eq!(
             production.matches("Task::new(").count(),
             production.matches("self.iteration_task_id(").count(),

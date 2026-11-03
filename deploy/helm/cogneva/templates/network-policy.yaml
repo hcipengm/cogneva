@@ -133,8 +133,7 @@ spec:
           {{- /* lit: 9090 fixed — prometheus's own listen port on the operator-provided monitoring endpoint (same shape as loki's 3100 above): the endpoint's URL carries the number, and no chart workload renames it */}}
           port: 9090
         - protocol: TCP
-          {{- /* lit: 3100 fixed — loki's default port on an operator-provided endpoint; the endpoint's own URL carries the same number */}}
-          port: 3100
+          port: {{ include "cogneva.lokiPushPort" . }}
     # kube-apiserver：主线部署器构建侧在 Pod 内调 kubectl（查四部署镜像、
     # apply 滚动 Job）。in-cluster 经 kubernetes Service ClusterIP:443
     # （K3s Service CIDR 默认 10.43.0.0/16，标准 kubeadm 常用 10.96.0.0/12，
@@ -360,8 +359,7 @@ spec:
               kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace | quote }}
       ports:
         - protocol: TCP
-          {{- /* lit: 3100 fixed — loki's default port on an operator-provided endpoint; the endpoint's URL carries the same number */}}
-          port: 3100
+          port: {{ include "cogneva.lokiPushPort" . }}
 ---
 # 主应用 Pod 的入站面。这条策略存在的唯一理由是给内部端口（8085）一道判据：
 # 那几条 memory 路由必须让零凭证的 Pod 够到，所以它们不能按角色判；换个地方判，

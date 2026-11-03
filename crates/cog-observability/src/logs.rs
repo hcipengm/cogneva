@@ -193,6 +193,13 @@ pub fn init_subscriber_with_pusher(
     handle
 }
 
+/// The console-format switch, declared here because this crate owns both
+/// readers of it: the node-side subscriber below and the assembled
+/// application's gateway subscriber. Two literals would keep compiling after a
+/// rename and leave one of them reading a name nothing sets, which is
+/// indistinguishable from "the operator left it alone".
+pub const LOG_FORMAT: &str = "COGNEVA_LOG_FORMAT";
+
 /// Log level and console format for a process that reads them from the
 /// environment rather than from a plugin context.
 ///
@@ -203,7 +210,7 @@ pub fn level_and_format() -> (String, crate::LogFormat) {
     let level = std::env::var(cog_core::env::LOG_LEVEL)
         .or_else(|_| std::env::var("RUST_LOG"))
         .unwrap_or_else(|_| "info".into());
-    let format = if std::env::var("COGNEVA_LOG_FORMAT")
+    let format = if std::env::var(LOG_FORMAT)
         .map(|v| v.eq_ignore_ascii_case("json"))
         .unwrap_or(false)
     {

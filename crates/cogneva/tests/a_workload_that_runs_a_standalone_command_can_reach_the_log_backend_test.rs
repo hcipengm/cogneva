@@ -23,111 +23,12 @@
 
 use crate::common;
 
+use common::routes::read;
 use common::routes::repo_root;
+use common::routes::walk;
+use common::rust_text;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
-
-/// `("sandbox-executor", Command::SandboxExecutor)` rows from the argument
-/// table: the argv spelling of every subcommand.
-fn argv_tokens(root: &Path) -> BTreeMap<String, String> {
-    let text = read(&root.join("crates/cogneva/src/cli.rs"));
-    let mut out = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("(\"") else {
-            continue;
-        };
-        let Some((token, tail)) = rest.split_once("\", Command::") else {
-            continue;
-        };
-        let Some(variant) = tail.strip_suffix("),") else {
-            continue;
-        };
-        out.insert(variant.trim().to_owned(), token.to_owned());
-    }
-    out
-}
-
-/// The variants `standalone_log_service` maps to a stream name, and the names
-/// themselves.
-///
-/// Read by scanning for `(Command::` inside the table rather than by splitting
-/// each line on `", "`: entries are allowed to wrap, and one of them does
-/// (`Command::SandboxExecutor` puts its service name on the next line). A line
-/// shaped parser quietly skipped that row — which is also the row a workload
-/// shipped without the endpoint would have gone unnoticed on.
-fn log_wired_variants(root: &Path) -> BTreeMap<String, String> {
-    let text = read(&root.join("crates/cogneva/src/main.rs"));
-    let start = text
-        .find("const STANDALONE_LOG_SERVICES")
-        .expect("STANDALONE_LOG_SERVICES is gone: this gate reads the wiring from it");
-    let region = &text[start..];
-    let region = &region[..region.find("\n];").unwrap_or(region.len())];
-    // An entry starts either as a one-liner (`(Command::X, name),`) or as a bare
-    // `(` with the variant on the next line — which is how the sandbox executor's
-    // row is written, and the row a line-at-a-time parser silently loses.
-    let entries = region
-        .lines()
-        .filter(|line| {
-            let line = line.trim();
-            line == "(" || line.starts_with("(Command::")
-        })
-        .count();
-    let mut out = BTreeMap::new();
-    let mut rest = region;
-    while let Some(at) = rest.find("Command::") {
-        rest = &rest[at + "Command::".len()..];
-        let variant: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if variant.is_empty() {
-            continue;
-        }
-        // The service name is either a string literal or a constant path; both
-        // are only ever used in the failure message below.
-        let tail = &rest[variant.len()..];
-        let entry = &tail[..tail.find("(Command::").unwrap_or(tail.len())];
-        let service = match entry.find('"') {
-            Some(quote) => entry[quote + 1..]
-                .split('"')
-                .next()
-                .unwrap_or("")
-                .to_owned(),
-            None => entry
-                .trim_end_matches([',', ')', '\n', ' '])
-                .trim()
-                .to_owned(),
-        };
-        out.insert(variant, service);
-    }
-    assert_eq!(
-        out.len(),
-        entries,
-        "STANDALONE_LOG_SERVICES 有 {entries} 行以 `(Command::` 开头的条目，却只解析出 {} \
-         个（{:?}）：解析器认不出的那些子命令，其工作负载在这条判据里整条消失",
-        out.len(),
-        out
-    );
-    out
-}
-
-fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            yaml_files(&path, out);
-        } else if path.extension().map(|e| e == "yaml").unwrap_or(false) {
-            out.push(path);
-        }
-    }
-}
 
 /// Every container object anywhere in the document, whatever workload kind
 /// carries it. The paths differ per kind and per profile, and a walk that only
@@ -186,8 +87,8 @@ fn env_names(container: &serde_yaml::Mapping) -> BTreeSet<String> {
 #[test]
 fn every_workload_that_runs_a_standalone_command_can_reach_the_log_backend() {
     let root = repo_root();
-    let tokens = argv_tokens(&root);
-    let wired = log_wired_variants(&root);
+    let tokens = rust_text::cli_argv_tokens(&read(&root.join("crates/cogneva/src/cli.rs")));
+    let wired = rust_text::standalone_log_services(&read(&root.join("crates/cogneva/src/main.rs")));
     assert!(
         wired.len() >= 5,
         "standalone_log_service maps only {} commands; either the function \
@@ -210,7 +111,7 @@ fn every_workload_that_runs_a_standalone_command_can_reach_the_log_backend() {
     }
 
     let mut files = Vec::new();
-    yaml_files(&root.join("deploy/rendered"), &mut files);
+    walk(&root.join("deploy/rendered"), &["yaml"], &mut files);
     assert!(
         files.len() > 10,
         "read {} rendered manifests; the walk is not seeing the trees",

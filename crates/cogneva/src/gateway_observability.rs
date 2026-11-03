@@ -79,17 +79,9 @@ fn init_gateway_logging(
     obs: &cog_observability::ObservabilityExportersConfig,
     http_client: &Arc<dyn cog_core::HttpClient>,
 ) -> Option<Arc<LokiBackgroundPusher>> {
-    let level = std::env::var(cog_core::env::LOG_LEVEL)
-        .or_else(|_| std::env::var("RUST_LOG"))
-        .unwrap_or_else(|_| "info".into());
-    let format = if std::env::var("COGNEVA_LOG_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or(false)
-    {
-        cog_observability::LogFormat::Json
-    } else {
-        cog_observability::LogFormat::Pretty
-    };
+    // 与节点侧守护进程同一份读法：两处各写一遍时，改名只会让其中一处去读一个
+    // 再没人设置的名字，而读不到与「本来就没配」在调用点上同形。
+    let (level, format) = cog_observability::logs::level_and_format();
     let pusher = if obs.loki.enabled {
         let client = Arc::new(
             LokiPushClient::new(&obs.loki.endpoint)
@@ -169,7 +161,9 @@ impl<T: ?Sized> DeferredSink<T> {
 /// ——撞锁的那一瞬旧 Pod 还在写，几秒之后就没了，重试太密只是把已经撞过的那把锁
 /// 再撞一遍。封顶一分钟：库真的不通时，每多试一次就多一条连接与一行日志，而一分
 /// 钟一次足够在恢复后的第一分钟里接上。
+// cap: bound — 要长过一次正常滚动的重叠期（撞锁的那一瞬旧 Pod 还在写、几秒后就走），又要短到恢复后第一分钟里接得上；没有一处读数能把它变成分位数
 const SINK_RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(5);
+// cap: bound — 库真的不通时每多试一次就多一条连接与一行日志；一分钟一次已经够在恢复后的第一分钟里接上，再密只是把不通的库再敲一遍
 const SINK_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 一直重试到接上为止，然后停下。

@@ -33,89 +33,37 @@
 
 use crate::common;
 
+use common::routes::read;
 use common::routes::repo_root;
+use common::routes::walk;
+use common::rust_text;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde_yaml::Value;
-
-fn read(path: &Path) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()))
-}
 
 /// The pod label the chart puts on templates whose containers ship their own
 /// logs. Written once here so the checks below cannot disagree about it.
 const OPT_OUT_LABEL: &str = "cogneva.io/logs";
 const OPT_OUT_VALUE: &str = "self";
 
-/// `("sandbox-executor", Command::SandboxExecutor)` rows from the argument
-/// table: the argv spelling of every subcommand.
-fn argv_tokens(root: &Path) -> BTreeMap<String, String> {
-    let text = read(&root.join("crates/cogneva/src/cli.rs"));
-    let mut out = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("(\"") else {
-            continue;
-        };
-        let Some((token, tail)) = rest.split_once("\", Command::") else {
-            continue;
-        };
-        let Some(variant) = tail.strip_suffix("),") else {
-            continue;
-        };
-        out.insert(variant.trim().to_owned(), token.to_owned());
-    }
-    out
-}
-
-/// The variants `STANDALONE_LOG_SERVICES` installs a subscriber for.
+/// The pods allowed to duplicate a self-shipping container, and why.
 ///
-/// Read by scanning for `(Command::` inside the table rather than by splitting
-/// each line on `", "`: entries are allowed to wrap, and one of them does
-/// (`Command::SandboxExecutor` puts its service name on the next line). A line
-/// shaped parser quietly skipped that row, and the gate then judged every
-/// sandbox-executor pod as "does not self-ship".
-fn log_wired_variants(root: &Path) -> BTreeSet<String> {
-    let text = read(&root.join("crates/cogneva/src/main.rs"));
-    let start = text
-        .find("const STANDALONE_LOG_SERVICES")
-        .expect("STANDALONE_LOG_SERVICES is gone: this gate reads the wiring from it");
-    let region = &text[start..];
-    let region = &region[..region.find("\n];").unwrap_or(region.len())];
-    // An entry starts either as a one-liner (`(Command::X, name),`) or as a bare
-    // `(` with the variant on the next line — which is how the sandbox executor's
-    // row is written, and the row a line-at-a-time parser silently loses.
-    let entries = region
-        .lines()
-        .filter(|line| {
-            let line = line.trim();
-            line == "(" || line.starts_with("(Command::")
-        })
-        .count();
-    let mut out = BTreeSet::new();
-    let mut rest = region;
-    while let Some(at) = rest.find("Command::") {
-        rest = &rest[at + "Command::".len()..];
-        let variant: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if !variant.is_empty() {
-            out.insert(variant);
-        }
-    }
-    assert_eq!(
-        out.len(),
-        entries,
-        "STANDALONE_LOG_SERVICES 有 {entries} 行以 `(Command::` 开头的条目，却只解析出 {} \
-         个（{:?}）：解析器认不出的那些子命令，从这条判据里整条消失",
-        out.len(),
-        out
-    );
-    out
-}
+/// Labelling skips the whole pod, so a pod that mixes a self-shipping container
+/// with one that cannot ship has to choose: label it and lose the second
+/// container's lines, or leave it unlabelled and pay for the duplicate. The
+/// registry is the one pod where the duplicate is the cheaper mistake — its own
+/// lines are worth more than the second copy costs, while the sidecar beside it
+/// has nowhere else to go.
+///
+/// This is a list, not a count. A count would have let a fourth profile's copy
+/// of the same pod, or a second pod with the same problem, slide in without
+/// anyone deciding it was acceptable.
+const DUPLICATE_IS_ACCEPTED: &[(&str, &str)] = &[(
+    "cogneva-registry",
+    "同 Pod 的卷搬移 sidecar 不推日志，贴标签会把它那半边也丢掉",
+)];
 
 /// The subcommands that write log lines to Loki from inside the process.
 ///
@@ -125,9 +73,10 @@ fn log_wired_variants(root: &Path) -> BTreeSet<String> {
 /// out here rather than read out of the dispatch arm — an arm-shaped search is
 /// what the table in `main.rs` exists to avoid.
 fn self_shipping_tokens(root: &Path) -> BTreeSet<String> {
-    let argv = argv_tokens(root);
+    let argv = rust_text::cli_argv_tokens(&read(&root.join("crates/cogneva/src/cli.rs")));
     let mut out = BTreeSet::new();
-    for variant in log_wired_variants(root) {
+    let wired = rust_text::standalone_log_services(&read(&root.join("crates/cogneva/src/main.rs")));
+    for variant in wired.into_keys() {
         let token = argv.get(&variant).unwrap_or_else(|| {
             panic!(
                 "STANDALONE_LOG_SERVICES names Command::{variant}, which the \
@@ -149,22 +98,14 @@ fn self_shipping_tokens(root: &Path) -> BTreeSet<String> {
     out
 }
 
-fn yaml_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            yaml_files(&path, out);
-        } else if path.extension().map(|e| e == "yaml").unwrap_or(false) {
-            out.push(path);
-        }
-    }
-}
-
 /// One pod template: its labels and its containers, with init containers marked.
 struct PodTemplate {
+    /// The workload's name, which is the same pod in every tree that renders it.
+    /// The trees carry three copies of the chart's output plus the static
+    /// baseline; judging "how many pods duplicate their lines" by file path
+    /// makes that count scale with the number of profiles instead of with the
+    /// number of workloads.
+    name: String,
     origin: String,
     labels: BTreeMap<String, String>,
     /// (is_init, container)
@@ -218,6 +159,7 @@ fn pod_templates(value: &Value, origin: &str, out: &mut Vec<PodTemplate>) {
         }
     }
     out.push(PodTemplate {
+        name: name.to_owned(),
         origin: format!("{origin} [{name}]"),
         labels,
         containers,
@@ -467,25 +409,27 @@ fn a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips() {
     );
 
     // 2. The value the templates use is the value the rule matches.
-    let mut trees = vec![root.join("deploy/k3s")];
-    yaml_files(&root.join("deploy/rendered"), &mut trees);
+    //
+    // 两条投递面都读：`deploy/k3s` 是 apply 路径的静态清单，`deploy/rendered` 是
+    // 三种 profile 渲染出来的那一份。此前这里把渲染面当成「一棵树」再走一遍，而
+    // 走树收的是文件——渲染面的每一份都被当成目录去读，读不到就悄悄退出，于是
+    // 这条判据一直只扫到 `deploy/k3s`：少读一块与那一块都合规在判词上同形。
+    let mut files = Vec::new();
+    walk(&root.join("deploy/k3s"), &["yaml"], &mut files);
+    walk(&root.join("deploy/rendered"), &["yaml"], &mut files);
     let mut pods = Vec::new();
-    for tree in &trees {
-        let mut files = Vec::new();
-        yaml_files(tree, &mut files);
-        for file in &files {
-            let text = read(file);
-            let origin = file
-                .strip_prefix(&root)
-                .unwrap_or(file)
-                .display()
-                .to_string();
-            for document in text.split("\n---") {
-                let Ok(value) = serde_yaml::from_str::<Value>(document) else {
-                    continue;
-                };
-                pod_templates(&value, &origin, &mut pods);
-            }
+    for file in &files {
+        let text = read(file);
+        let origin = file
+            .strip_prefix(&root)
+            .unwrap_or(file)
+            .display()
+            .to_string();
+        for document in text.split("\n---") {
+            let Ok(value) = serde_yaml::from_str::<Value>(document) else {
+                continue;
+            };
+            pod_templates(&value, &origin, &mut pods);
         }
     }
     assert!(
@@ -517,8 +461,10 @@ fn a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips() {
     //    pod may only contain a self-shipping container when another container
     //    there has nowhere else to send its lines.
     let mut labelled = 0;
-    let mut unlabelled_with_self_shipper = BTreeSet::new();
-    let mut problems = Vec::new();
+    let mut unlabelled_with_self_shipper: BTreeSet<String> = BTreeSet::new();
+    // Keyed by workload name: the same pod is rendered into three profiles plus
+    // the static baseline, and one defect listed four times reads like four.
+    let mut problems: BTreeMap<String, String> = BTreeMap::new();
     for pod in &pods {
         let has_label = pod
             .labels
@@ -552,31 +498,37 @@ fn a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips() {
         };
 
         if has_label && !silent.is_empty() {
-            problems.push(format!(
-                "{} 贴着 `{OPT_OUT_LABEL}: {OPT_OUT_VALUE}`，但里面的 {} 不自己推日志——\n\
-                 采集器按 Pod 跳过，这些容器的标准输出从此没有任何去处",
-                pod.origin,
-                silent
-                    .iter()
-                    .map(|c| format!("`{}`", named(c)))
-                    .collect::<Vec<_>>()
-                    .join("、")
-            ));
-        }
-        if !has_label && !shippers.is_empty() {
-            if silent.is_empty() {
-                problems.push(format!(
-                    "{} 跑着会自己推日志的 {}，却没贴 `{OPT_OUT_LABEL}: {OPT_OUT_VALUE}`：\n\
-                     采集器会把这些行再送一遍",
+            problems.insert(
+                pod.name.clone(),
+                format!(
+                    "{} 贴着 `{OPT_OUT_LABEL}: {OPT_OUT_VALUE}`，但里面的 {} 不自己推日志——\n\
+                     采集器按 Pod 跳过，这些容器的标准输出从此没有任何去处",
                     pod.origin,
-                    shippers
+                    silent
                         .iter()
                         .map(|c| format!("`{}`", named(c)))
                         .collect::<Vec<_>>()
                         .join("、")
-                ));
+                ),
+            );
+        }
+        if !has_label && !shippers.is_empty() {
+            if silent.is_empty() {
+                problems.insert(
+                    pod.name.clone(),
+                    format!(
+                        "{} 跑着会自己推日志的 {}，却没贴 `{OPT_OUT_LABEL}: {OPT_OUT_VALUE}`：\n\
+                         采集器会把这些行再送一遍",
+                        pod.origin,
+                        shippers
+                            .iter()
+                            .map(|c| format!("`{}`", named(c)))
+                            .collect::<Vec<_>>()
+                            .join("、")
+                    ),
+                );
             } else {
-                unlabelled_with_self_shipper.insert(pod.origin.clone());
+                unlabelled_with_self_shipper.insert(pod.name.clone());
             }
         }
     }
@@ -586,7 +538,11 @@ fn a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips() {
         "日志投递面两边的说法对不上：\n  {}\n\n\
          贴标签的判据是「这个 Pod 里每个非 init 容器都在自己推日志」；采集器按 Pod 跳过。\n\
          自推的 Pod 没贴标签会被采两遍，贴了标签却有容器不自推则那些行一条也留不下。",
-        problems.join("\n  ")
+        problems
+            .values()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n  ")
     );
 
     // Both sides of the line have to be populated for the two checks above to
@@ -596,11 +552,23 @@ fn a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips() {
         "只有 {labelled} 个 Pod 贴了 `{OPT_OUT_LABEL}`；这个数掉了的时候，第 3 条判据\n\
          对绝大多数工作负载其实是空转"
     );
+    let accepted: BTreeSet<String> = DUPLICATE_IS_ACCEPTED
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
+        .collect();
+    let undeclared: Vec<&String> = unlabelled_with_self_shipper.difference(&accepted).collect();
     assert!(
-        unlabelled_with_self_shipper.len() <= 1,
-        "有 {} 个 Pod 不贴标签、却把自推容器的日志又采了一遍：{:?}。多出来的这些是\n\
-         漏贴（该贴的），不是「同 Pod 有采不了的容器」这个理由能解释的",
-        unlabelled_with_self_shipper.len(),
-        unlabelled_with_self_shipper
+        undeclared.is_empty(),
+        "这些 Pod 不贴标签、却把自推容器的日志又采了一遍：{undeclared:?}。\n\
+         它们要么漏贴了 `{OPT_OUT_LABEL}: {OPT_OUT_VALUE}`，要么得在\n\
+         `DUPLICATE_IS_ACCEPTED` 里写明「同 Pod 有采不了的容器」这个理由——\n\
+         不写理由的多采一遍是账单上的一笔，不是判据里的一个例外"
     );
+    for (name, why) in DUPLICATE_IS_ACCEPTED {
+        assert!(
+            unlabelled_with_self_shipper.contains(*name),
+            "`DUPLICATE_IS_ACCEPTED` 里留着 `{name}`（{why}），但树里已经没有这个\n\
+             「不贴标签又混着自推容器」的 Pod 了：豁免不是永久免检，它得跟着理由一起消失"
+        );
+    }
 }

@@ -116,6 +116,13 @@ const EXEMPT: &[Exempt] = &[
         why: "同上：子命令名",
     },
     Exempt {
+        file: "crates/cogneva/src/main.rs",
+        value: "cogneva-backup-",
+        why: "子命令名 `cogneva-backup-drill`，是 argv 里那个词：它与备份包名的前缀同形，\
+              但没有人按它去找一个包。跟着包名一起改会把运维脚本和文档里敲的那个词打断，\
+              而包名前缀的读者（发布目录与恢复路径）根本看不到子命令表",
+    },
+    Exempt {
         file: "crates/cogneva/src/backup.rs",
         value: "cluster-registry",
         why: "换机损失清单里的一行，写的是这一行的主题而不是选择器",

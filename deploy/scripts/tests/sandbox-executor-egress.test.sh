@@ -33,6 +33,11 @@ trap 'rm -rf "${work}"' EXIT
 # read the same value, so it is taken from the render here too -- change the port
 # and the policy follows (getting it wrong is what fails).
 audited_port=8083
+# The executor mirrors its own container logs to Loki, so the push endpoint is on
+# its reachable set. Declared here so the closed-set assertion below still names
+# every widening: the port is a fact about the monitoring endpoint (the chart's
+# `cogneva.lokiPushPort`), not something this pod may choose.
+loki_push_port=3100
 # 额度是渲染集投影出来的（见 templates/resource-quota.yaml），这里不核治理，
 # 所以关掉它而不是传一份没有的投影产物。
 helm template cogneva "${chart}" --set secrets.create=false \
@@ -40,10 +45,10 @@ helm template cogneva "${chart}" --set secrets.create=false \
   --set resourceGovernance.enabled=false > "${work}/rendered.yaml"
 
 check_file() {
-  python3 - "${1}" "${audited_port}" <<'PYEOF'
+  python3 - "${1}" "${audited_port}" "${loki_push_port}" <<'PYEOF'
 import sys, yaml
 
-path, audited = sys.argv[1], int(sys.argv[2])
+path, audited, loki_push = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 docs = [d for d in yaml.safe_load_all(open(path)) if d and d.get("kind")]
 
 # This pod can be selected by several policies at once. NetworkPolicy is a union,
@@ -67,7 +72,7 @@ for d in selected:
             ports.add(int(p["port"]))
             protos.add(p.get("protocol", "TCP"))
 
-expected = {audited, 53, 443}
+expected = {audited, 53, 443, loki_push}
 if ports != expected:
     extra = sorted(ports - expected)
     missing = sorted(expected - ports)
@@ -84,7 +89,10 @@ for forbidden in (8080, 8081, 8082):
 if "UDP" not in protos:
     sys.exit("no UDP 53: DNS does not resolve, so the seed repositories cannot be fetched")
 
-print(f"OK: executor egress = {sorted(ports)} (UDP+TCP), audited={audited}")
+print(
+    f"OK: executor egress = {sorted(ports)} (UDP+TCP), audited={audited}, "
+    f"loki-push={loki_push}"
+)
 PYEOF
 }
 

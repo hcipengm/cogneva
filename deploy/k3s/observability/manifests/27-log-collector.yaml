@@ -208,18 +208,25 @@ spec:
           # 就绪与存活都读 Alloy 自己的健康端点。`/-/ready` 答 200 当且仅当配置
           # 解析成功、各组件已经起来；只探端口的话，一份语法坏的配置会让进程活着、
           # 一行都不采。
+          #
+          # 探针预算显式给出：kubelet 对 timeoutSeconds 默认 1 秒、failureThreshold
+          # 默认 3 次，省略就是按空闲节点取值——共址构建把节点 load 拉到 20+ 时，
+          # kubelet 连自己的 Pod IP 都 dial 不进去，采集器会被 liveness 杀掉。
           readinessProbe:
             httpGet:
               path: /-/ready
               port: http-metrics
             initialDelaySeconds: 10
             periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /-/healthy
               port: http-metrics
             initialDelaySeconds: 30
             periodSeconds: 20
+            timeoutSeconds: 10
             failureThreshold: 3
           resources:
             requests:

@@ -1840,6 +1840,26 @@ const FOREIGN: &[(&str, &str)] = &[
         "roster_rows_not_in_graph",
         "同一生产者：名册声明的面主与图里记的 `owner_unit` 对不上有几行。它是**状态**不是计数——两种收口方向（改名册或开交接）都能把它降回 0，所以规则 `CognevaGovernanceRosterDrift` 拿它直接判而不取窗口：一个停住的写者留下的最后一行在图上读起来与此刻的对不上一样，而这一条读的本来就是「没人打算收口」这件事本身。写者读不到名册或图时它不印这一格，那是 `CognevaHostReadingProducerUnreadable` 的判词",
     ),
+    (
+        "cogneva_declared_identifiers_missing",
+        "宿主读数 `scripts/host/cogneva-declared-identifiers-reading.sh`（不在本仓，登记行 `declared_identifiers`）：自足声明表里能被机器检查的名字（规则名、`systemctl show … -p <属性>` 的属性名）这一拍有没有一个在它自己的正本里解析不到。它必须外来：被查的那份表与它点名的正本都住在本仓看不见的那棵树里。分母是同族的 `cogneva_declared_identifiers_checked`；表或正本读不到时一条序列都不印（退 3），与「查过、一个名字都没点空」不同形",
+    ),
+    (
+        "cogneva_shape_parity_differs",
+        "宿主读数 `scripts/host/cogneva-shape-parity-reading.sh`（不在本仓，登记行 `shape_parity`）：跨仓两张「被拒形状 → 它守哪条原则」的表（宿主侧 bash 与平台侧 Rust）这一拍还对不对得上。两张表分居两棵树，本仓只有其中一张，所以只能由宿主那一侧的读法去比。同族的 `_mismatched`／`_host_only`／`_platform_only` 把三种分歧分开——归到不同原则、只有宿主有、只有平台有，修法各不同；读不到任何一侧时一条序列都不印，那是生产者自己的缺席，不是「一致」",
+    ),
+    (
+        "kube_pod_info",
+        "kube-state-metrics（每个 Pod 一条常量序列，带它所在的 namespace 与 pod 名）。节点日志采集那两条规则拿它判**在不在场**：`CognevaLogCollectorAbsent` 要的正是「这台集群上有没有 Loki 的 Pod」——没有后端时采集器缺席是装的本来就没有，不该报；而集群里根本没有 kube-state-metrics 时这一格也缺席，两者在表达式的空集上同形，所以缺席由看这个源的规则承担，不在这两条里冒充「没有 Loki」",
+    ),
+    (
+        "loki_source_file_files_active_total",
+        "节点日志采集器（Grafana Alloy）自己的组件读数：`loki.source.file` 这一刻跟着几个文件。它判的是采集器**盲了**——进程在、目标也在，却一个文件都没跟：Pod 名换了、路径规则没跟上、或宿主的日志目录布局变了，三种都表现为「日志不再进来」，而进程存活、DaemonSet 就绪数、抓取目标三面全是绿的。生产者是采集器本身，不在本仓，本仓只能登记；采集器没起时这条序列同样缺席，那一格由上面两条规则读",
+    ),
+    (
+        "loki_write_dropped_entries_total",
+        "同一采集器（`loki.write` 组件）的计数器：写往 Loki 时被丢掉的条目累计。它是「日志在采集、在发、但到不了」唯一会涨的那一格——后端拒收、队列满、限流都只在这里留下痕迹，而进程与就绪数照旧正常。规则读的是窗口增量而不是总量：这是一个只增计数，绝对值回答不了「此刻在丢」",
+    ),
 ];
 
 /// A registered name that no rule reads yet, and what will judge it meanwhile.
@@ -4720,7 +4740,9 @@ const UNREAD: &[(&str, Unread)] = &[
     // rule authorable the moment the suite lands.
     (
         "cogneva_eval_gate_outcomes_total",
-        Unread::Gap("what would make a run of self-exempted or unavailable gate runs a fault is whether a fixed eval suite is expected to exist, and the repository ships none, so no threshold is declarable yet"),
+        Unread::Gap(
+            "what would make a run of self-exempted or unavailable gate runs a fault is whether a fixed eval suite is expected to exist, and the repository ships none, so no threshold is declarable yet",
+        ),
     ),
     // The denominator of the rule on the aged-out backlog: the sibling counts
     // every raw whose summary is still owed, this one counts the part past the
@@ -4748,27 +4770,39 @@ const UNREAD: &[(&str, Unread)] = &[
     // back into the debt on the next pass.
     (
         "memory_dead_letter_raw",
-        Unread::Gap("the stock of raw the ingest path has given up on. Nothing prunes the dead-letter namespace, so a rule would have to declare how much stock is too much, and that is a reclaim policy nobody has stated -- and reclaim cannot be a deletion, since the backlog exclusion is derived from these records and removing one sends its raw back into the debt on the next pass. Removing this entry means a rule now reads the series, and that rule carries an obligation this table cannot state mechanically while the entry is here: the stock freezes on exactly the outcome the sibling backlog readings freeze on, so its age bound must be the same one memory_unextracted_scan_failed is guarded on -- and the pair must be added to a_pass_outcome_rule_is_guarded_on_the_same_horizon_as_its_sibling, which today asserts a non-empty bound for both halves and so cannot name a series with no rule yet"),
+        Unread::Gap(
+            "the stock of raw the ingest path has given up on. Nothing prunes the dead-letter namespace, so a rule would have to declare how much stock is too much, and that is a reclaim policy nobody has stated -- and reclaim cannot be a deletion, since the backlog exclusion is derived from these records and removing one sends its raw back into the debt on the next pass. Removing this entry means a rule now reads the series, and that rule carries an obligation this table cannot state mechanically while the entry is here: the stock freezes on exactly the outcome the sibling backlog readings freeze on, so its age bound must be the same one memory_unextracted_scan_failed is guarded on -- and the pair must be added to a_pass_outcome_rule_is_guarded_on_the_same_horizon_as_its_sibling, which today asserts a non-empty bound for both halves and so cannot name a series with no rule yet",
+        ),
     ),
     (
         "memory_operation_latency_ms",
-        Unread::Gap("memory backend operation latency; no latency bound is declared anywhere in the repository to hang a threshold on"),
+        Unread::Gap(
+            "memory backend operation latency; no latency bound is declared anywhere in the repository to hang a threshold on",
+        ),
     ),
     (
         "metrics_samples_bytes",
-        Unread::NotAReading("the help says it lags the row count and is never the pruning criterion; the capacity verdict is the reading with a criterion"),
+        Unread::NotAReading(
+            "the help says it lags the row count and is never the pruning criterion; the capacity verdict is the reading with a criterion",
+        ),
     ),
     (
         "cogneva_observability_events_bytes",
-        Unread::NotAReading("on-disk size of the event log, and it lags the row count for the same reason the sample log's does -- PostgreSQL returns deleted space only when it vacuums -- so a bound here would fire on the volume doing its job. The capacity verdict is the reading with a criterion; the bytes are what the volume is paying for it"),
+        Unread::NotAReading(
+            "on-disk size of the event log, and it lags the row count for the same reason the sample log's does -- PostgreSQL returns deleted space only when it vacuums -- so a bound here would fire on the volume doing its job. The capacity verdict is the reading with a criterion; the bytes are what the volume is paying for it",
+        ),
     ),
     (
         "cogneva_checkpoints_bytes",
-        Unread::NotAReading("on-disk size of the checkpoint store, and it lags the row count for the same reason the other two do -- PostgreSQL returns the space a DELETE freed only when it vacuums -- so a bound here would fire on the volume doing its job. The capacity verdict is the reading with a criterion; the bytes are what the backup the drill restores is actually paying for"),
+        Unread::NotAReading(
+            "on-disk size of the checkpoint store, and it lags the row count for the same reason the other two do -- PostgreSQL returns the space a DELETE freed only when it vacuums -- so a bound here would fire on the volume doing its job. The capacity verdict is the reading with a criterion; the bytes are what the backup the drill restores is actually paying for",
+        ),
     ),
     (
         "gateway_llm_exchange_bytes",
-        Unread::NotAReading("on-disk size of the prompt-and-response archive, and it lags what the retention deletes for the same reason the other three do -- PostgreSQL returns the space a DELETE freed only when it vacuums -- so a bound here would fire on the volume doing its job. The age rule is the reading with a criterion; the bytes say what the bodies are actually costing, which is why the archive is bounded by age rather than by a row count"),
+        Unread::NotAReading(
+            "on-disk size of the prompt-and-response archive, and it lags what the retention deletes for the same reason the other three do -- PostgreSQL returns the space a DELETE freed only when it vacuums -- so a bound here would fire on the volume doing its job. The age rule is the reading with a criterion; the bytes say what the bodies are actually costing, which is why the archive is bounded by age rather than by a row count",
+        ),
     ),
     (
         "tier_migration_total",
@@ -4783,11 +4817,15 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_version_declared_info",
-        Unread::NotAReading("the help calls it an identity label rather than a measurement; the declared version is also on the image tag and in the release tag the artifact is built from"),
+        Unread::NotAReading(
+            "the help calls it an identity label rather than a measurement; the declared version is also on the image tag and in the release tag the artifact is built from",
+        ),
     ),
     (
         "cogneva_version_commits_since_release",
-        Unread::Gap("how far the running code has moved past the release; no bound is declared, so a rule would have to invent the policy it is meant to enforce"),
+        Unread::Gap(
+            "how far the running code has moved past the release; no bound is declared, so a rule would have to invent the policy it is meant to enforce",
+        ),
     ),
     (
         "cogneva_registry_pruned_tags_total",
@@ -4798,55 +4836,81 @@ const UNREAD: &[(&str, Unread)] = &[
     ),
     (
         "cogneva_registry_rebuild_hold_secs_total",
-        Unread::Gap("seconds the tag server was held away per induced restart. The pair the help's ratio needs exists -- cogneva_registry_pruned_tags_total, itself filed as read elsewhere -- so what is missing is a bound on how long a hold may last, and the mechanism declares none on purpose: the hold lifts when the server answers, which is readable on the spot rather than after a budget, and a hold that never lifts is the unpaid reclaim debt that registry_reclaim_debt_unpaid already reads on cogneva_registry_gc_owed. The ratio would say whether the trigger lets the volume grow too full, and that is a policy nobody has stated"),
+        Unread::Gap(
+            "seconds the tag server was held away per induced restart. The pair the help's ratio needs exists -- cogneva_registry_pruned_tags_total, itself filed as read elsewhere -- so what is missing is a bound on how long a hold may last, and the mechanism declares none on purpose: the hold lifts when the server answers, which is readable on the spot rather than after a budget, and a hold that never lifts is the unpaid reclaim debt that registry_reclaim_debt_unpaid already reads on cogneva_registry_gc_owed. The ratio would say whether the trigger lets the volume grow too full, and that is a policy nobody has stated",
+        ),
     ),
     (
         "cogneva_buildah_store_pruned_images_total",
-        Unread::Gap("written only when a round freed an image, so its absence is not a zero. It is a volume, and this store deliberately has no volume bound: the plan says in as many words that there is no cap and none is wanted, because the retention set is already the bound and it answers in the unit that matters -- revisions, not bytes -- which the same round publishes as cogneva_buildah_store_kept_images and cogneva_buildah_store_live_images. The cadence this entry used to call unpublished is published as well: cogneva_buildah_store_reading_unix is stamped by every completed round, cogneva_buildah_store_rounds_total counts the attempts beside it, and buildah_store_round_incomplete reads the pair. The family's fault-worthy states are read on those siblings -- a round attempted and never completed, and a keep set computed from an empty cluster read -- and neither of them needs this count"),
+        Unread::Gap(
+            "written only when a round freed an image, so its absence is not a zero. It is a volume, and this store deliberately has no volume bound: the plan says in as many words that there is no cap and none is wanted, because the retention set is already the bound and it answers in the unit that matters -- revisions, not bytes -- which the same round publishes as cogneva_buildah_store_kept_images and cogneva_buildah_store_live_images. The cadence this entry used to call unpublished is published as well: cogneva_buildah_store_reading_unix is stamped by every completed round, cogneva_buildah_store_rounds_total counts the attempts beside it, and buildah_store_round_incomplete reads the pair. The family's fault-worthy states are read on those siblings -- a round attempted and never completed, and a keep set computed from an empty cluster read -- and neither of them needs this count",
+        ),
     ),
     (
         "cogneva_buildah_store_pruned_layers_total",
-        Unread::Gap("the help's own point is that this is not a fixed multiple of the image count, so it is a second volume under a store that has no volume bound on purpose -- the retention set is the bound and it counts revisions; the completion cadence it shares is published by cogneva_buildah_store_reading_unix and read, so what stands in the way is the unit the bound is stated in rather than the cadence or the reading"),
+        Unread::Gap(
+            "the help's own point is that this is not a fixed multiple of the image count, so it is a second volume under a store that has no volume bound on purpose -- the retention set is the bound and it counts revisions; the completion cadence it shares is published by cogneva_buildah_store_reading_unix and read, so what stands in the way is the unit the bound is stated in rather than the cadence or the reading",
+        ),
     ),
     (
         "cogneva_buildah_store_freed_bytes_total",
-        Unread::Gap("bytes freed, written only when both ends of the round were measurable; the help calls the number apparent rather than real, and the cadence is published and read as above, so what a rule would need is a volume bound this store deliberately does not have"),
+        Unread::Gap(
+            "bytes freed, written only when both ends of the round were measurable; the help calls the number apparent rather than real, and the cadence is published and read as above, so what a rule would need is a volume bound this store deliberately does not have",
+        ),
     ),
     (
         "cogneva_buildah_store_kept_images",
-        Unread::Gap("the help calls it the reading that says the keep set is doing something; what would count as the keep set doing something is a policy nobody declared, and the pass publishes the number every completed round, so the missing half is a bound rather than a reader"),
+        Unread::Gap(
+            "the help calls it the reading that says the keep set is doing something; what would count as the keep set doing something is a policy nobody declared, and the pass publishes the number every completed round, so the missing half is a bound rather than a reader",
+        ),
     ),
     (
         "cogneva_rollout_job_cpu_throttled_ratio",
-        Unread::Gap("share of the newest judgement run's CFS periods throttled by its own limit; no throttling bound is declared"),
+        Unread::Gap(
+            "share of the newest judgement run's CFS periods throttled by its own limit; no throttling bound is declared",
+        ),
     ),
     (
         "cogneva_rollout_job_memory_peak_ratio",
-        Unread::Gap("peak against the declared limit; the help warns a healthy run reads near the top of a narrow band, so the ratio itself is not a usable threshold and the bound that would be is not declared"),
+        Unread::Gap(
+            "peak against the declared limit; the help warns a healthy run reads near the top of a narrow band, so the ratio itself is not a usable threshold and the bound that would be is not declared",
+        ),
     ),
     (
         "cogneva_rollout_job_reading_unix",
-        Unread::Gap("ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series -- every published name in this family was enumerated, and none counts judgement runs. The nearest is cogneva_mainline_rollout_attempts_total, whose help calls it the only published cadence of a promotion attempt, and it is not the run count: it is written where the round reaches the decision whether to roll, so a revision the upstream has already left reaches that decision and stops there, and reading it as the run cadence would pair a climbing counter with a timestamp that has no run to advance it on every superseded revision. The one reading that would not need the cadence is this timestamp's own age, and the store does render a companion that carries it -- cogneva_rollout_job_reading_unix_observed_timestamp_seconds, frozen while the writer is gone. That family is now inside the gate's view, so a rule may name it (see the derived half of every_series_an_alert_rule_reads_is_one_something_produces); what still keeps the reader unopened is the same missing bound, since an age is only a fault against a cadence, and the run happens per change rather than on a declared period. The bound the judgement itself runs under is declared -- the job's activeDeadlineSeconds is computed from the startup, rollout and soak budgets -- but it is a value in the job spec rather than a published series, so no rule can name it"),
+        Unread::Gap(
+            "ties the two readings above to the run that produced them; a reader needs the run cadence, which is per-rollout and published by no series -- every published name in this family was enumerated, and none counts judgement runs. The nearest is cogneva_mainline_rollout_attempts_total, whose help calls it the only published cadence of a promotion attempt, and it is not the run count: it is written where the round reaches the decision whether to roll, so a revision the upstream has already left reaches that decision and stops there, and reading it as the run cadence would pair a climbing counter with a timestamp that has no run to advance it on every superseded revision. The one reading that would not need the cadence is this timestamp's own age, and the store does render a companion that carries it -- cogneva_rollout_job_reading_unix_observed_timestamp_seconds, frozen while the writer is gone. That family is now inside the gate's view, so a rule may name it (see the derived half of every_series_an_alert_rule_reads_is_one_something_produces); what still keeps the reader unopened is the same missing bound, since an age is only a fault against a cadence, and the run happens per change rather than on a declared period. The bound the judgement itself runs under is declared -- the job's activeDeadlineSeconds is computed from the startup, rollout and soak budgets -- but it is a value in the job spec rather than a published series, so no rule can name it",
+        ),
     ),
     (
         "cogneva_mainline_superseded_rollout_total",
-        Unread::Gap("the share of rounds the guard saved by leaving the carried revision alone. It counts answers, not questions: the producer writes a zero on an unskipped round and a zero sample does not move a counter's value, so this series cannot say whether a quiet stretch was a guard that kept answering no or a guard that stopped being called -- that half is now carried by a pair of its own, cogneva_mainline_rollout_attempts_total against cogneva_mainline_supersession_checks_total, which is what mainline_supersession_question_stopped reads. What is left here is the share itself, and what would make a run of skips a fault is how much upstream movement counts as normal on this repository: a bound nobody declared, so the missing half is a bound rather than a reader"),
+        Unread::Gap(
+            "the share of rounds the guard saved by leaving the carried revision alone. It counts answers, not questions: the producer writes a zero on an unskipped round and a zero sample does not move a counter's value, so this series cannot say whether a quiet stretch was a guard that kept answering no or a guard that stopped being called -- that half is now carried by a pair of its own, cogneva_mainline_rollout_attempts_total against cogneva_mainline_supersession_checks_total, which is what mainline_supersession_question_stopped reads. What is left here is the share itself, and what would make a run of skips a fault is how much upstream movement counts as normal on this repository: a bound nobody declared, so the missing half is a bound rather than a reader",
+        ),
     ),
     (
         "llm_request_param_clamped_total",
-        Unread::Gap("fields the gateway rewrote before sending, by field and upstream. This entry used to be an Elsewhere citing llm_usage_verdict_measured, and that citation is what kills it: the producer's own comment on the usage verdict states that the verdict has two readings and that neither of them is this series, so the sentence offered as the reason is the sentence that excludes it. The two facts are different -- the gauge answers whether one input to one of the adaptations was settled from evidence, the counter answers what happened to a request that was already sent. No rule and no panel on either face names it, and it is not a store series either: the durable face carries only the declared gauge list and this is a counter, so it lives and dies with the gateway process. A rewrite is not a fault by construction -- the temperature clamp fires only where the pool entry or the compat profile says the upstream demands 1, and the max_tokens, store, reasoning_effort, strict and stream_options adaptations follow that same profile -- so a rule would have to declare which rewrites are fault-worthy. What that declaration turns on is evidence, and that picture has moved twice since this entry was written. It used to read that of the three verdicts the admission probe settles (tool calls, temperature, usage) only usage publishes a reading at all, so a clamp decided from a probe result and one decided from a profile guess were the same shape on every series. All three publish now, and the role rewrite is recorded here too -- that was the one rewrite that happened nowhere, since a response never echoes the messages it was sent, so nothing on any series could have shown it. That moves the question rather than answering it: pairing this counter with llm_temperature_verdict_measured does say which of the two inputs decided a temperature clamp, but the counter alone does not, and the other four profile decisions (the max_tokens spelling, store, reasoning_effort, strict) have no probe behind them at all and so can never be decided from measurement. Until somebody states the condition, a rule would report the gateway's own adaptation habits back at us"),
+        Unread::Gap(
+            "fields the gateway rewrote before sending, by field and upstream. This entry used to be an Elsewhere citing llm_usage_verdict_measured, and that citation is what kills it: the producer's own comment on the usage verdict states that the verdict has two readings and that neither of them is this series, so the sentence offered as the reason is the sentence that excludes it. The two facts are different -- the gauge answers whether one input to one of the adaptations was settled from evidence, the counter answers what happened to a request that was already sent. No rule and no panel on either face names it, and it is not a store series either: the durable face carries only the declared gauge list and this is a counter, so it lives and dies with the gateway process. A rewrite is not a fault by construction -- the temperature clamp fires only where the pool entry or the compat profile says the upstream demands 1, and the max_tokens, store, reasoning_effort, strict and stream_options adaptations follow that same profile -- so a rule would have to declare which rewrites are fault-worthy. What that declaration turns on is evidence, and that picture has moved twice since this entry was written. It used to read that of the three verdicts the admission probe settles (tool calls, temperature, usage) only usage publishes a reading at all, so a clamp decided from a probe result and one decided from a profile guess were the same shape on every series. All three publish now, and the role rewrite is recorded here too -- that was the one rewrite that happened nowhere, since a response never echoes the messages it was sent, so nothing on any series could have shown it. That moves the question rather than answering it: pairing this counter with llm_temperature_verdict_measured does say which of the two inputs decided a temperature clamp, but the counter alone does not, and the other four profile decisions (the max_tokens spelling, store, reasoning_effort, strict) have no probe behind them at all and so can never be decided from measurement. Until somebody states the condition, a rule would report the gateway's own adaptation habits back at us",
+        ),
     ),
     (
         "llm_upstream_shape_errored",
-        Unread::Gap("a rule cannot state it, and the premise is measured rather than assumed: the mark is cleared by the next probe outcome of either sign -- both the failure path and the success path remove it -- and a marked upstream is due for the very next probe tick, so its lifetime is one tick and its content is its two edges. A window over it would certify a transient, and a window long enough to outlast a restart would report the prober's own cadence back at us. It exists because a handoff that runs and one that was never wired used to look the same on every other series, and telling those apart is a question asked once per change, not a standing bound. What could keep it open is the prober not running, and that is a fact about the pool face's writer rather than about this gauge: the durable pool family is rewritten on a heartbeat, no rule reads that family's freshness, and a reader for it would be that family's entry to make. What is missing here is therefore neither a reader nor a bound on this series but a reading of the pool face's own liveness"),
+        Unread::Gap(
+            "a rule cannot state it, and the premise is measured rather than assumed: the mark is cleared by the next probe outcome of either sign -- both the failure path and the success path remove it -- and a marked upstream is due for the very next probe tick, so its lifetime is one tick and its content is its two edges. A window over it would certify a transient, and a window long enough to outlast a restart would report the prober's own cadence back at us. It exists because a handoff that runs and one that was never wired used to look the same on every other series, and telling those apart is a question asked once per change, not a standing bound. What could keep it open is the prober not running, and that is a fact about the pool face's writer rather than about this gauge: the durable pool family is rewritten on a heartbeat, no rule reads that family's freshness, and a reader for it would be that family's entry to make. What is missing here is therefore neither a reader nor a bound on this series but a reading of the pool face's own liveness",
+        ),
     ),
     (
         "cogneva_landing_ci_failure_inherited_total",
-        Unread::Gap("landings whose red verdict was traced to the commit they were replayed onto rather than to the change, so the change was kept instead of reverted. The underlying condition -- the base branch's tip is red -- is what mainline_ci_verdict_failed reads, but this series does not carry that fact: it carries the non-action taken because of it, and that warn line names the change and the checks it passed through. A rule would have to declare how many spared landings are a fault, which is a bound on how long the branch may stay red while landings keep landing: a policy nobody stated, so the missing half is a bound rather than a reader"),
+        Unread::Gap(
+            "landings whose red verdict was traced to the commit they were replayed onto rather than to the change, so the change was kept instead of reverted. The underlying condition -- the base branch's tip is red -- is what mainline_ci_verdict_failed reads, but this series does not carry that fact: it carries the non-action taken because of it, and that warn line names the change and the checks it passed through. A rule would have to declare how many spared landings are a fault, which is a bound on how long the branch may stay red while landings keep landing: a policy nobody stated, so the missing half is a bound rather than a reader",
+        ),
     ),
     (
         "cogneva_mainline_ci_check_excluded_total",
-        Unread::Gap("checks left out of the mainline's CI verdict because they belong to a workflow that does not judge this tree -- the Pages deployment, which answers whether a site can be published rather than whether this revision can roll. The per-revision fact is not this series: the state file records the excluded names and workflow paths under excluded_checks, and the release path writes an info line naming them, so what the counter adds is the count rather than the what. A rule would have to declare how many exclusions are a fault, and the bound is not a number on this series but a claim about the table: the list is meant to stay one entry long, so the fault shape is the list growing, which no rule can see from a count of exclusions alone. The assertion that would make the list's length a checked fact does not exist on this tree: nothing goes red when the list grows to a second entry, and no reading states how many exclusions are normal. That is a missing criterion, not a bound that has not arrived yet -- written as a bound it could be read as explained, and it is not"),
+        Unread::Gap(
+            "checks left out of the mainline's CI verdict because they belong to a workflow that does not judge this tree -- the Pages deployment, which answers whether a site can be published rather than whether this revision can roll. The per-revision fact is not this series: the state file records the excluded names and workflow paths under excluded_checks, and the release path writes an info line naming them, so what the counter adds is the count rather than the what. A rule would have to declare how many exclusions are a fault, and the bound is not a number on this series but a claim about the table: the list is meant to stay one entry long, so the fault shape is the list growing, which no rule can see from a count of exclusions alone. The assertion that would make the list's length a checked fact does not exist on this tree: nothing goes red when the list grows to a second entry, and no reading states how many exclusions are normal. That is a missing criterion, not a bound that has not arrived yet -- written as a bound it could be read as explained, and it is not",
+        ),
     ),
     // Tool outputs cut to fit the context window, by tool. The count and its
     // character total were one debt until the fidelity panel landed: a cut is
@@ -4862,11 +4926,15 @@ const UNREAD: &[(&str, Unread)] = &[
     // a series that has a reader.
     (
         "cogneva_tool_output_fetch_budget_exhausted_total",
-        Unread::Gap("reads of an archived tool output that stopped short of the bytes because the payload outgrew the caller's byte budget, by tool. The budget is the caller's own, so a bounded read is expected traffic like the truncation counter beside it, not a fault: a caller reading back a large archived output sets the budget it can afford and is told when the source is bigger. What would make a run of them a fault is a bound nobody declared, since the right budget follows what the reads ask for, and the repair for one is local to the caller -- raise the budget or fetch the source directly -- rather than a standing condition a rule could hold open"),
+        Unread::Gap(
+            "reads of an archived tool output that stopped short of the bytes because the payload outgrew the caller's byte budget, by tool. The budget is the caller's own, so a bounded read is expected traffic like the truncation counter beside it, not a fault: a caller reading back a large archived output sets the budget it can afford and is told when the source is bigger. What would make a run of them a fault is a bound nobody declared, since the right budget follows what the reads ask for, and the repair for one is local to the caller -- raise the budget or fetch the source directly -- rather than a standing condition a rule could hold open",
+        ),
     ),
     (
         "cogneva_project_kind_total",
-        Unread::Gap("changes the pipeline dispatched, by the landing recipe it used and by whether the project declared that recipe or the built-in supplied it. A rule would have to say how much of a fleet running on the built-in is a fault, and that is a policy nobody has declared: at the moment this name is minted not one project carries a declaration, so every dispatch lands in the `builtin` cell and any bound set now would fire on the ordinary case. What makes the reading worth publishing before that bound exists is that it is the only place the fallback is visible at all -- a project landing as a built-in Rust workspace and a project that chose to land that way dispatch identically on every other series, and neither is a fault until somebody says which projects are expected to declare. The composition a rule would want is the one already published on the rejection side: a project whose declaration cannot be read is refused, and that refusal is counted under `cogneva_change_rejected_total{cause=project_kind_unusable}`, so the population that needs a threshold here is the one that silently took the built-in rather than the one that failed loudly"),
+        Unread::Gap(
+            "changes the pipeline dispatched, by the landing recipe it used and by whether the project declared that recipe or the built-in supplied it. A rule would have to say how much of a fleet running on the built-in is a fault, and that is a policy nobody has declared: at the moment this name is minted not one project carries a declaration, so every dispatch lands in the `builtin` cell and any bound set now would fire on the ordinary case. What makes the reading worth publishing before that bound exists is that it is the only place the fallback is visible at all -- a project landing as a built-in Rust workspace and a project that chose to land that way dispatch identically on every other series, and neither is a fault until somebody says which projects are expected to declare. The composition a rule would want is the one already published on the rejection side: a project whose declaration cannot be read is refused, and that refusal is counted under `cogneva_change_rejected_total{cause=project_kind_unusable}`, so the population that needs a threshold here is the one that silently took the built-in rather than the one that failed loudly",
+        ),
     ),
     // The three readings minted with the SOP dispatch loop. The loop's own
     // liveness is not a gap: it reports through the background-loop family like
@@ -4875,15 +4943,21 @@ const UNREAD: &[(&str, Unread)] = &[
     // reason rather than for a missing reader.
     (
         "sop_dispatch_total",
-        Unread::Gap("what the SOP dispatch loop did with each configured face on each tick, by `face` and a closed `result` set (compiled, skipped_unchanged, fetch_error, compile_error). The loop starts only where the environment names at least one face, so on a deployment that names none the series is absent rather than zero -- which is why no rule can treat absence as a fault, and why a rule would have to fire on the outcome cells instead. The cell that looks rule-worthy is the failure pair, and what is missing is how many failed ticks a face may have before it is a fault: a document being edited, a platform briefly refusing, and a face whose path is wrong all read as a run of `fetch_error`, and nothing declares how long a stretch of those is expected to be repaired by the next tick. The per-face cadence a reader would otherwise use to bound that stretch is the one number that never appears on the wire -- the intervals live in the configuration the loop reads and are published nowhere -- so a rule would have to derive them from this counter's own rate, which is circular"),
+        Unread::Gap(
+            "what the SOP dispatch loop did with each configured face on each tick, by `face` and a closed `result` set (compiled, skipped_unchanged, fetch_error, compile_error). The loop starts only where the environment names at least one face, so on a deployment that names none the series is absent rather than zero -- which is why no rule can treat absence as a fault, and why a rule would have to fire on the outcome cells instead. The cell that looks rule-worthy is the failure pair, and what is missing is how many failed ticks a face may have before it is a fault: a document being edited, a platform briefly refusing, and a face whose path is wrong all read as a run of `fetch_error`, and nothing declares how long a stretch of those is expected to be repaired by the next tick. The per-face cadence a reader would otherwise use to bound that stretch is the one number that never appears on the wire -- the intervals live in the configuration the loop reads and are published nowhere -- so a rule would have to derive them from this counter's own rate, which is circular",
+        ),
     ),
     (
         "sop_tasks_injected_total",
-        Unread::Gap("how many tasks each face's plan put into the DAG, summed over ticks. It exists because a compile that injects nothing and one that injects ten are the same `compiled` cell on the tick counter beside it. What a rule would need is how much a face is expected to keep planned, and that is a property of the face's document rather than of this repository: a face whose plan is five tasks and one whose plan is fifty are both healthy, and the workload a deployment is willing to carry is a policy nobody has declared. It is a volume under no declared bound, which is the same shape as the change and build-store volumes filed above and not a reader anyone could write today"),
+        Unread::Gap(
+            "how many tasks each face's plan put into the DAG, summed over ticks. It exists because a compile that injects nothing and one that injects ten are the same `compiled` cell on the tick counter beside it. What a rule would need is how much a face is expected to keep planned, and that is a property of the face's document rather than of this repository: a face whose plan is five tasks and one whose plan is fifty are both healthy, and the workload a deployment is willing to carry is a policy nobody has declared. It is a volume under no declared bound, which is the same shape as the change and build-store volumes filed above and not a reader anyone could write today",
+        ),
     ),
     (
         "sop_unmapped_role_total",
-        Unread::Gap("tasks whose declared `role` named no row in the executor table, by `face`. The role is carried through verbatim and the dispatch path maps it to nothing, so a task can be injected with `is_executable` set and a role no hand answers to -- and that is a fact no other series states, since the injected count beside it is the same whether or not anything can pick the work up. The lookup itself is not missing: the executor table already answers it through its own role-to-skill mapping, and the count is taken against that answer rather than against a table spelled here. What a rule would have to say is which of these are faults, and that turns on a mapping nobody has declared: the roles a face's document uses and the role kinds the executor table registers are two vocabularies with no published correspondence between them, so at the moment this name is minted every role a face declares is unmapped until an operator adds a row for it, and a rule firing on any nonzero would flag the wiring of a new face rather than a fault. The bound is what the actor loop's own entry says is missing -- the population that needs a threshold is the one that took a fallback -- and here the fallback is simply that nobody picks the task up"),
+        Unread::Gap(
+            "tasks whose declared `role` named no row in the executor table, by `face`. The role is carried through verbatim and the dispatch path maps it to nothing, so a task can be injected with `is_executable` set and a role no hand answers to -- and that is a fact no other series states, since the injected count beside it is the same whether or not anything can pick the work up. The lookup itself is not missing: the executor table already answers it through its own role-to-skill mapping, and the count is taken against that answer rather than against a table spelled here. What a rule would have to say is which of these are faults, and that turns on a mapping nobody has declared: the roles a face's document uses and the role kinds the executor table registers are two vocabularies with no published correspondence between them, so at the moment this name is minted every role a face declares is unmapped until an operator adds a row for it, and a rule firing on any nonzero would flag the wiring of a new face rather than a fault. The bound is what the actor loop's own entry says is missing -- the population that needs a threshold is the one that took a fallback -- and here the fallback is simply that nobody picks the task up",
+        ),
     ),
     // The pair minted when a batch consumer's handoff turned out to be
     // unreadable. Neither can be read by a rule, and both are gaps for the same
@@ -4891,11 +4965,15 @@ const UNREAD: &[(&str, Unread)] = &[
     // which no query over the metric store can address.
     (
         "cogneva_event_bus_handoff_total",
-        Unread::Gap("what one drain pass took off a broadcast channel and how much of that it handed on, by `consumer` and `stage`. It was minted because the loss counters either side of it cannot express the defect that prompted it: a pass that takes events and hands none on leaves `cogneva_event_bus_lagged_total` flat, exactly like a consumer with nothing to do, and leaves the store it writes to empty, exactly like a channel nothing was offered. A rule cannot close that, because the operand that decides it is the row count of the table the handoff writes -- a number that no query over the metric store can read -- so the comparison is a reading-script job rather than a threshold: `stage=\"taken\"` greater than `stage=\"attempted\"` over the same window is the fault, and it needs the second sample a rule would also have. Filed as a gap rather than given an invented threshold because any bound on its own would fire on an idle channel"),
+        Unread::Gap(
+            "what one drain pass took off a broadcast channel and how much of that it handed on, by `consumer` and `stage`. It was minted because the loss counters either side of it cannot express the defect that prompted it: a pass that takes events and hands none on leaves `cogneva_event_bus_lagged_total` flat, exactly like a consumer with nothing to do, and leaves the store it writes to empty, exactly like a channel nothing was offered. A rule cannot close that, because the operand that decides it is the row count of the table the handoff writes -- a number that no query over the metric store can read -- so the comparison is a reading-script job rather than a threshold: `stage=\"taken\"` greater than `stage=\"attempted\"` over the same window is the fault, and it needs the second sample a rule would also have. Filed as a gap rather than given an invented threshold because any bound on its own would fire on an idle channel",
+        ),
     ),
     (
         "cogneva_observability_event_persist_failed_total",
-        Unread::Gap("observability events whose insert failed, one per failed write, counted in the store where the outcome is known. A rule on any increase would look writable and is not, because the series it should be read against is the handoff attempt count above, and a failure there is already a loss by construction rather than a condition that turns into one at some level -- what a rule would add is a page for a defect the empty table already states, on a path whose repair is the write itself. The reason it stays a gap rather than becoming a rule is the same one the handoff entry gives: subtracting the two is what says how many events reached the table, and the row count it would be checked against is not on the metric surface. It is registered here so the census sees that this pair arrives together and that neither is dismissed for want of a reader nobody could write"),
+        Unread::Gap(
+            "observability events whose insert failed, one per failed write, counted in the store where the outcome is known. A rule on any increase would look writable and is not, because the series it should be read against is the handoff attempt count above, and a failure there is already a loss by construction rather than a condition that turns into one at some level -- what a rule would add is a page for a defect the empty table already states, on a path whose repair is the write itself. The reason it stays a gap rather than becoming a rule is the same one the handoff entry gives: subtracting the two is what says how many events reached the table, and the row count it would be checked against is not on the metric surface. It is registered here so the census sees that this pair arrives together and that neither is dismissed for want of a reader nobody could write",
+        ),
     ),
     // The other half of the pair the sweep writes when it decides whether the
     // message it cannot see is lost. Its sibling has a reader -- the reclaim the
@@ -4910,7 +4988,9 @@ const UNREAD: &[(&str, Unread)] = &[
     // is filed rather than given a threshold.
     (
         "cogneva_dag_stalled_scheduled_deferred_for_backlog_total",
-        Unread::Gap("rows the sweep left in Scheduled because their queue still held undelivered entries. Any nonzero is the wait working as designed, so a rule on it would page on a healthy backlog; what would make a run of deferrals a fault is a backlog that never drains, and the sweep cannot state that -- it counts the rows it left alone, not the messages still waiting, and the queue's undelivered count is read inside the process that asks rather than published as a series. Closing this entry means publishing that backlog depth and reading the two together, not inventing a threshold for this one"),
+        Unread::Gap(
+            "rows the sweep left in Scheduled because their queue still held undelivered entries. Any nonzero is the wait working as designed, so a rule on it would page on a healthy backlog; what would make a run of deferrals a fault is a backlog that never drains, and the sweep cannot state that -- it counts the rows it left alone, not the messages still waiting, and the queue's undelivered count is read inside the process that asks rather than published as a series. Closing this entry means publishing that backlog depth and reading the two together, not inventing a threshold for this one",
+        ),
     ),
     // The pair minted when the publisher started holding ready tasks back --
     // one on what the window can pay for, one on the board column that is full
@@ -4935,7 +5015,9 @@ const UNREAD: &[(&str, Unread)] = &[
     // rules and panels, which is why it does not close this entry.
     (
         "cogneva_change_write_windows",
-        Unread::Gap("the write windows the account holds, counted by what the record says about each: approved, overlapping scopes, rows that are both approved and revoked, and live windows their own writer approved. A rule cannot close it: `approved` is zero whenever nobody is writing, which is the ordinary state, and neither overlap nor self-approval has a declared bound -- how many accounts may write one path at once, and whether a self-approved window is a fault or merely a record to be corrected, are policies nobody has stated. Its reader is a panel in the change-ledger group drawing the four cells together; no such panel was written in this pass"),
+        Unread::Gap(
+            "the write windows the account holds, counted by what the record says about each: approved, overlapping scopes, rows that are both approved and revoked, and live windows their own writer approved. A rule cannot close it: `approved` is zero whenever nobody is writing, which is the ordinary state, and neither overlap nor self-approval has a declared bound -- how many accounts may write one path at once, and whether a self-approved window is a fault or merely a record to be corrected, are policies nobody has stated. Its reader is a panel in the change-ledger group drawing the four cells together; no such panel was written in this pass",
+        ),
     ),
     // The outlet list, published for the first time in this pass for the same
     // reason the write-window record was: the face that owes the reading had
@@ -4951,7 +5033,9 @@ const UNREAD: &[(&str, Unread)] = &[
     // repository's rules and panels, which is why it does not close this entry.
     (
         "cogneva_alert_channels_configured",
-        Unread::Gap("which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, and no such row is written when there is no outlet -- a placeholder name would read as a kind that exists and is switched off -- and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. The in-app alert surface counts as an outlet: it has no address, so nothing about it can be misconfigured, and the WebUI reads the same rows the external channels would carry. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound"),
+        Unread::Gap(
+            "which outlets this deployment can deliver an alert through. Two kinds of row with opposite polarity, told apart by `state`: `state=\"configured\"` rows name one outlet each in `channel` at 1, and no such row is written when there is no outlet -- a placeholder name would read as a kind that exists and is switched off -- and one `state=\"verdict\"` row carries no `channel` but the `readout` name the communication face owes, at 1 when there is no outlet at all and 0 when there is at least one -- written in both directions, since the configured rows exist only when there is an outlet and so could never say there is none. The in-app alert surface counts as an outlet: it has no address, so nothing about it can be misconfigured, and the WebUI reads the same rows the external channels would carry. A reader must select one kind by `state` before aggregating; summing the family answers yes either way. Every value is a constant per process, so a reader takes one series rather than adding the copies. It is filed rather than given a threshold because every cell is the configuration itself: 1 is the ordinary state of a deployment with an outlet and 0 the ordinary state of one without, so neither number is a condition that turns into a fault at some level. What makes a deployment without an outlet wrong is a decision about that deployment, not something this series can bound",
+        ),
     ),
     // The same account counted the other way, by the tier each carrier said its
     // principle would be checked at. No rule reads it, and the reason is not
@@ -4979,19 +5063,27 @@ const UNREAD: &[(&str, Unread)] = &[
     // on 2026-10-27), and the backup drill is sized from exactly this pair.
     (
         "cogneva_task_events_rows",
-        Unread::Gap("how many events the per-task archive holds. The retention that bounds this table works on age rather than size: a stream is retired when it has been quiet past the retention, so at any fixed write rate the row count settles on its own and no row budget for it is declared anywhere in the tree. A threshold invented here would page on traffic instead of on a sweep that stopped, and that fault already has a reader in task_event_archive_behind, which compares the oldest surviving row against the retention the loop publishes. It is published anyway because the table reached 211 MB with nothing reading it, and the nightly backup's budget is sized from it"),
+        Unread::Gap(
+            "how many events the per-task archive holds. The retention that bounds this table works on age rather than size: a stream is retired when it has been quiet past the retention, so at any fixed write rate the row count settles on its own and no row budget for it is declared anywhere in the tree. A threshold invented here would page on traffic instead of on a sweep that stopped, and that fault already has a reader in task_event_archive_behind, which compares the oldest surviving row against the retention the loop publishes. It is published anyway because the table reached 211 MB with nothing reading it, and the nightly backup's budget is sized from it",
+        ),
     ),
     (
         "cogneva_task_events_tasks",
-        Unread::Gap("how many distinct task streams the per-task archive holds, published beside cogneva_task_events_rows because a pass that retires many events out of one stream and one that retires the same events out of a thousand are different pictures of the same sweep. That is what makes it worth storing; it does not make it judgeable, and the bound it would be read against is the same undeclared row budget its sibling is missing"),
+        Unread::Gap(
+            "how many distinct task streams the per-task archive holds, published beside cogneva_task_events_rows because a pass that retires many events out of one stream and one that retires the same events out of a thousand are different pictures of the same sweep. That is what makes it worth storing; it does not make it judgeable, and the bound it would be read against is the same undeclared row budget its sibling is missing",
+        ),
     ),
     (
         "gateway_llm_exchange_rows",
-        Unread::Gap("how many prompt-and-response bodies the archive holds. Its two sibling readings are read -- llm_exchange_retention_behind compares the oldest body's age against the retention the loop publishes -- and this one has nothing to be compared with: the archive is bounded by age, so the body count follows the call volume and how large a body is, and no budget for either is declared. It is published because the table reached 307 MB before any retention ran, and the backup drill is sized from it"),
+        Unread::Gap(
+            "how many prompt-and-response bodies the archive holds. Its two sibling readings are read -- llm_exchange_retention_behind compares the oldest body's age against the retention the loop publishes -- and this one has nothing to be compared with: the archive is bounded by age, so the body count follows the call volume and how large a body is, and no budget for either is declared. It is published because the table reached 307 MB before any retention ran, and the backup drill is sized from it",
+        ),
     ),
     (
         "cogneva_llm_usage_rows",
-        Unread::Gap("how many per-call token rows the ledger holds. Everything that can be judged about this table is judged from age instead: llm_usage_retention_behind compares the oldest surviving row against the retention the loop publishes, and llm_usage_fold_behind compares the rows the hourly fold never reached against what the sweep is allowed to delete. Neither is a statement about how many rows is too many -- one call writes one row whatever the task was doing, so the count tracks call volume rather than the sweep, and no row budget for it is declared anywhere in the tree. It is published because the table reached 312,803 rows and 32 days' worth of history with no reading at all until 2026-10-27, and the nightly backup's budget is sized from it"),
+        Unread::Gap(
+            "how many per-call token rows the ledger holds. Everything that can be judged about this table is judged from age instead: llm_usage_retention_behind compares the oldest surviving row against the retention the loop publishes, and llm_usage_fold_behind compares the rows the hourly fold never reached against what the sweep is allowed to delete. Neither is a statement about how many rows is too many -- one call writes one row whatever the task was doing, so the count tracks call volume rather than the sweep, and no row budget for it is declared anywhere in the tree. It is published because the table reached 312,803 rows and 32 days' worth of history with no reading at all until 2026-10-27, and the nightly backup's budget is sized from it",
+        ),
     ),
     // The re-measurement intake publishes two numbers from the same pass and only
     // the age got a rule. The reason is not that the depth is uninteresting: it
@@ -5011,7 +5103,9 @@ const UNREAD: &[(&str, Unread)] = &[
     // is a comparison of two curves, so the reader owed is a panel, not a rule.
     (
         "cogneva_change_ledger_remeasure_pending",
-        Unread::Gap("how many re-measurement requests are waiting to be folded, written on every change-ledger pass beside the oldest pending age. Its help says a depth above zero across two passes is the intake failing, but the pass cadence is not published as a series, so the rule that sentence describes has no window to be sampled over: the queue's ordinary life is one pass, and every minute-based rendering of 'two passes' would fire on a queue caught mid-turn. The fault the depth would catch is already read from the age by change_ledger_remeasure_stuck, and telling one row the tree cannot settle from a writer that has stopped is a comparison of the two curves over time, which is a panel's job"),
+        Unread::Gap(
+            "how many re-measurement requests are waiting to be folded, written on every change-ledger pass beside the oldest pending age. Its help says a depth above zero across two passes is the intake failing, but the pass cadence is not published as a series, so the rule that sentence describes has no window to be sampled over: the queue's ordinary life is one pass, and every minute-based rendering of 'two passes' would fire on a queue caught mid-turn. The fault the depth would catch is already read from the age by change_ledger_remeasure_stuck, and telling one row the tree cannot settle from a writer that has stopped is a comparison of the two curves over time, which is a panel's job",
+        ),
     ),
     // The other half of the pool-wait pair, filed for the opposite reason to the
     // entry above: here the shape is known -- a stamp that outlives the pool's
@@ -5022,7 +5116,9 @@ const UNREAD: &[(&str, Unread)] = &[
     // rises with the backlog is not a fault while the backlog is legitimate.
     (
         "cogneva_change_dispatch_pool_blocked_rows",
-        Unread::Gap("how many outstanding changes are stamped as waiting on the LLM pool, written on every dispatch pass beside the age of the oldest one. The rule reads the age: a stamp that outlives the pool's recovery is a wait nobody is going to release, and one pass is its whole ordinary life, so that shape has a bound the writer's own interval settles. The depth is the population that age is about, and a bound on it would have to say what fraction of an owed queue waiting on a pool is too many -- the queue's size is published per pass but no policy states a level, and the same depth is legitimate while the pool really is down. Read together with the age by a panel, which is the reader it owes. The intake's depth above was filed on the same reasoning from the other side: there the age had a bound and the depth had none. That sentence about the rule was false when it was first written and is true only from the pass that fixed the selection: the rule reached the verdict by a label key the producer never writes, so it matched the empty set and could not fire, while this census reads a reader off the rule's text and kept the seat filled. The key is now `pool_reading`, the one the emitter writes, and the fixture's seven cells run against the real chart"),
+        Unread::Gap(
+            "how many outstanding changes are stamped as waiting on the LLM pool, written on every dispatch pass beside the age of the oldest one. The rule reads the age: a stamp that outlives the pool's recovery is a wait nobody is going to release, and one pass is its whole ordinary life, so that shape has a bound the writer's own interval settles. The depth is the population that age is about, and a bound on it would have to say what fraction of an owed queue waiting on a pool is too many -- the queue's size is published per pass but no policy states a level, and the same depth is legitimate while the pool really is down. Read together with the age by a panel, which is the reader it owes. The intake's depth above was filed on the same reasoning from the other side: there the age had a bound and the depth had none. That sentence about the rule was false when it was first written and is true only from the pass that fixed the selection: the rule reached the verdict by a label key the producer never writes, so it matched the empty set and could not fire, while this census reads a reader off the rule's text and kept the seat filled. The key is now `pool_reading`, the one the emitter writes, and the fixture's seven cells run against the real chart",
+        ),
     ),
 ];
 

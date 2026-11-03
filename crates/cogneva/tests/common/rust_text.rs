@@ -14,6 +14,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+
 /// `CamelCase` → `camel_case`：一个类型名与它写出去／读进来的词之间的换算。
 ///
 /// 三份夹具都靠它把变体名折成线上的字段名。折法只有一种，所以它只有一份：
@@ -120,4 +122,89 @@ pub fn trailing_identifier(text: &str) -> String {
         .chars()
         .rev()
         .collect()
+}
+
+/// `cli.rs` 的参数表：`Command::X` 变体 → argv 里那个词。
+///
+/// 判决面与投递面分开读：一条判据知道哪些工作负载「跑的是哪个词」，另一条知道
+/// 「哪些词起了订阅者」，两条要放在一起才判得出「起了订阅者的那个词，它的工作
+/// 负载接上日志后端了没有」。所以这份表只有一份——抄歪的那一份会让某一侧认不出
+/// 一行（比如 `(\"x\", Command::Y),` 写成两行），而认不出的一行在判决上就是
+/// 「这棵树里没有这种工作负载」，与「全都接上了」同形。
+pub fn cli_argv_tokens(source: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for line in source.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("(\"") else {
+            continue;
+        };
+        let Some((token, tail)) = rest.split_once("\", Command::") else {
+            continue;
+        };
+        let Some(variant) = tail.strip_suffix("),") else {
+            continue;
+        };
+        out.insert(variant.trim().to_owned(), token.to_owned());
+    }
+    out
+}
+
+/// `main.rs` 里 `STANDALONE_LOG_SERVICES` 那张表：变体 → 它写出的流名。
+///
+/// 按 `Command::` 扫，不按行切：条目允许折行（`Command::SandboxExecutor` 的服务名
+/// 就写在下一行），按行切的解析器会悄悄丢掉那一行，而丢掉的正是「沙盒执行器接没接
+/// 日志后端」这一条。
+pub fn standalone_log_services(source: &str) -> BTreeMap<String, String> {
+    let start = source
+        .find("const STANDALONE_LOG_SERVICES")
+        .expect("STANDALONE_LOG_SERVICES is gone: the log gates read the wiring from it");
+    let region = &source[start..];
+    let region = &region[..region.find("\n];").unwrap_or(region.len())];
+    // An entry starts either as a one-liner (`(Command::X, name),`) or as a bare
+    // `(` with the variant on the next line — which is how the sandbox executor's
+    // row is written, and the row a line-at-a-time parser silently loses.
+    let entries = region
+        .lines()
+        .filter(|line| {
+            let line = line.trim();
+            line == "(" || line.starts_with("(Command::")
+        })
+        .count();
+    let mut out = BTreeMap::new();
+    let mut rest = region;
+    while let Some(at) = rest.find("Command::") {
+        rest = &rest[at + "Command::".len()..];
+        let variant: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if variant.is_empty() {
+            continue;
+        }
+        // The service name is either a string literal or a constant path; both are
+        // only ever used in a failure message.
+        let tail = &rest[variant.len()..];
+        let entry = &tail[..tail.find("(Command::").unwrap_or(tail.len())];
+        let service = match entry.find('"') {
+            Some(quote) => entry[quote + 1..]
+                .split('"')
+                .next()
+                .unwrap_or("")
+                .to_owned(),
+            None => entry
+                .trim_end_matches([',', ')', '\n', ' '])
+                .trim()
+                .to_owned(),
+        };
+        out.insert(variant, service);
+    }
+    assert_eq!(
+        out.len(),
+        entries,
+        "STANDALONE_LOG_SERVICES 有 {entries} 行以 `(Command::` 开头的条目，却只解析出 {} \
+         个（{:?}）：解析器认不出的那些子命令，在用它判决的门里整条消失",
+        out.len(),
+        out
+    );
+    out
 }

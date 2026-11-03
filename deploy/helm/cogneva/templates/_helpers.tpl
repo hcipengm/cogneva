@@ -65,6 +65,17 @@ containerd 那一条恒在（它就是 `imageStoreMountPath`），其余来自
 {{- end -}}
 
 {{/*
+日志推手要连的端口：监控栈 Loki 的 push 端点。地址在
+`.Values.observability.loki.endpoint` 里（URL 自带这个数），而 egress 白名单要的是
+端口本身。两个工作负载各写一遍时，换掉端点端口只会改到其中几处：推送被策略静默丢弃，
+日志里只剩反复重试的 warn，而「被丢掉的日志」与「本来就没有日志」从外面看一样。
+*/}}
+{{- define "cogneva.lokiPushPort" -}}
+{{- /* lit: 3100 fixed — loki's own listen port on the operator-provided monitoring endpoint; the endpoint's URL carries the same number, and no chart workload renames it */ -}}
+3100
+{{- end -}}
+
+{{/*
 网页检索与渲染后端的地址：`webSearch.base` / `webFetch.base` 留空时按 port 与
 Service 名派生。
 
