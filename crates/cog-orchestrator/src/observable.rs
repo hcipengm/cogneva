@@ -719,6 +719,18 @@ impl TaskGraphObservable {
                     if !movable.contains(&task.status) {
                         continue;
                     }
+                    // 一条**执行者永远不会开走**的行不是「欠着的活」。读数的名字说的是
+                    // 「还有多少活没人接手，最老的一条等了多久」，而 `is_executable=false`
+                    // 的行按定义不在任何执行者的队列里：读数登记行（`Custom("reading")`，
+                    // 那一族是被读的清单，不是要跑的活）在 `pending` 上停十天，与「积压
+                    // 没人接」在这个面上逐字同形——2026-11-01 起一直亮的
+                    // `unowned_task_untouched_past_pickup` 就是被 75 条这样的登记行点亮的。
+                    //
+                    // 目标承载行留在这组里：它同样不可执行，但它会被收口任务写回终态，
+                    // 所以「它一动不动」是真的异常，不是一条站着不动的声明。
+                    if !task.is_executable && task.goal_id.is_none() {
+                        continue;
+                    }
                     let agent = task.agent_id.clone().filter(|id| !id.is_empty());
                     // Counted before the age, because an unowned row is exactly
                     // the one whose cell in the age reading is the shared
@@ -1543,6 +1555,71 @@ mod tests {
             "a measured graph must carry the timestamp its staleness is judged against"
         );
         assert!(metric(&metrics, TASK_GRAPH_MEASURE_FAILURES_METRIC).is_none());
+    }
+
+    /// 一条执行者永远开不走的行，不是「欠着的活」。
+    ///
+    /// 两个读数的名字都在说「还有多少活没人接手、最老的一条等了多久」。而
+    /// `is_executable=false` 的行按定义不在任何执行者的队列里——读数登记行
+    /// （`Custom("reading")`）是被读的清单，不是要跑的活，它在 `pending` 上停十天，
+    /// 与「积压没人接」在这一面上逐字同形：2026-11-01 起一直亮的
+    /// `unowned_task_untouched_past_pickup` 就是被 75 条这样的登记行点亮的，而它
+    /// 点名的「最老的一条」自 10-29 起一次都没动过——因为它本来就不会动。
+    ///
+    /// 目标承载行留在这组里：它同样不可执行，但它会被收口任务写回终态，「一动不动」
+    /// 对它才是异常。这条判据的两半都要，缺了后半句，一个永远等不到答案的目标提交
+    /// 会从这张面上消失。
+    #[tokio::test]
+    async fn a_row_no_executor_can_start_is_not_owed_work() {
+        let dag = Arc::new(crate::DagExecutor::new("ws-not-executable".into()));
+        let now = chrono::Utc::now();
+
+        // 登记行：不可执行，停在 pending 十天。
+        let mut roster = task("reading:a2a_tck", cog_core::TaskStatus::Pending);
+        roster.is_executable = false;
+        roster.updated_at = now - chrono::Duration::days(10);
+        // 真的活：可执行，没人领，等了两分钟。
+        let mut real = task("t-real-work", cog_core::TaskStatus::Pending);
+        real.updated_at = now - chrono::Duration::seconds(120);
+        // 目标承载行：不可执行，但它会被写回，等十分钟是异常。
+        let mut goal = cog_core::Task::goal_row("t-goal", "把这一版滚上去");
+        goal.status = cog_core::TaskStatus::Pending;
+        goal.updated_at = now - chrono::Duration::seconds(600);
+
+        for row in [roster, real, goal] {
+            dag.add_task(row).await.unwrap();
+        }
+
+        let observable = TaskGraphObservable::new(dag);
+        let metrics = observable.collect_metrics("").await.unwrap();
+
+        let oldest = labeled(
+            &metrics,
+            TASK_OLDEST_UNTOUCHED_METRIC,
+            "agent",
+            UNASSIGNED_AGENT,
+        )
+        .value;
+        assert!(
+            (595.0..=605.0).contains(&oldest),
+            "最老的一条该是那条目标承载行（600 秒），不是停着不动的登记行（十天）：{oldest}"
+        );
+        assert_eq!(
+            labeled(&metrics, TASK_UNOWNED_ROWS_METRIC, "status", "pending").value,
+            2.0,
+            "欠着的活是两条：真的活与目标承载行；登记行不是活"
+        );
+        // 总数那一格仍然数整张图：登记行是图里的一行，只是不欠谁。
+        assert_eq!(
+            labeled(
+                &metrics,
+                TASKS_READINGS_METRIC,
+                crate::LABEL_READOUT,
+                TASKS_ROWS_READOUT
+            )
+            .value,
+            3.0
+        );
     }
 
     /// Rows the dispatcher refuses for want of a criterion are on the graph and
