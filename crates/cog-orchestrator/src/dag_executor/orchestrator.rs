@@ -3892,7 +3892,15 @@ fn acceptance_left_in_input(row: &Task) -> Vec<String> {
 ///
 /// Returns `(task id, kind, number of criteria)` so the caller can log the names:
 /// a count alone cannot be acted on.
+///
+/// Only a pending row: a row that already started had a criterion or the
+/// dispatcher would not have opened it, and a terminal row's verdict does not
+/// change because a field arrived late -- touching it would only move a
+/// timestamp readers sort by.
 fn carry_stated_acceptance(row: &mut Task) -> Option<(String, String, usize)> {
+    if row.status != TaskStatus::Pending {
+        return None;
+    }
     let stated = acceptance_left_in_input(row);
     if stated.is_empty() {
         return None;
@@ -4316,6 +4324,19 @@ mod tests {
             "不该报告「补上了」"
         );
         assert_eq!(row.acceptance, vec!["行上的这一句".to_string()]);
+    }
+
+    /// 终态行不动：它已经有过判词，晚到的字段改不了那个判词，只会挪动读面排序的时钟。
+    #[test]
+    fn a_row_that_is_already_over_is_not_touched() {
+        let mut row = evolution_task("already-over");
+        row.status = TaskStatus::Completed;
+        row.input = serde_json::json!({ "acceptance": ["迟到的判据"] });
+        let before = row.updated_at;
+
+        assert!(carry_stated_acceptance(&mut row).is_none());
+        assert!(row.acceptance.is_empty());
+        assert_eq!(row.updated_at, before);
     }
 
     /// 盘上那批先落行、判据留在输入里的旧行，靠这趟补上——不需要谁重新提交同一个 id。
