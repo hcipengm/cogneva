@@ -632,7 +632,7 @@ async fn progress(
             owner.cancelled,
             owner
                 .oldest_open_at
-                .map(|at| at.format("%Y-%m-%d").to_string())
+                .map(|at| at.format(cog_core::DAY_KEY_FORMAT).to_string())
                 .unwrap_or_else(|| "-".into()),
         );
     }
