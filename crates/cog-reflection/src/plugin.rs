@@ -2221,6 +2221,8 @@ async fn run_discovery_round<F, Fut>(
     tool_names: &[String],
     skill_ids: &[String],
     max_tasks: usize,
+    beat: &cog_core::loop_health::Beat,
+    deadline: std::time::Instant,
 ) -> DiscoveryRound
 where
     F: Fn(String, cog_core::Task) -> Fut + Send,
@@ -2232,9 +2234,17 @@ where
     let generated = tasks.len();
     let mut submitted = 0usize;
     let mut refused = 0usize;
+    let mut deferred = 0usize;
     let mut handed_over: Vec<(String, crate::types::DiscoveryTask, u64)> = Vec::new();
 
-    for probe in tasks {
+    let mut remaining = tasks.into_iter();
+    while let Some(probe) = remaining.next() {
+        // 过了这一轮的墙就不再开始新的交接，剩下的原样留给下一轮：没交出去的组合
+        // 不该因为「这一拍没时间」而退场，见 `discovery_round_wall`。
+        if std::time::Instant::now() >= deadline {
+            deferred += 1 + remaining.count();
+            break;
+        }
         let (goal, task) = discovery_probe_task(&probe);
         // 交出去之前把这条任务**自己声明的执行契约**取下来：它决定这条探针多久
         // 没结局就该作废，见 `outcome_deadline`。取在这里是因为 `task` 下面那一步
@@ -2268,12 +2278,18 @@ where
                 );
             }
         }
+        // 每交完一条就心跳一次。这条环两拍之间隔着的是一**条**探针的往返，不是一整
+        // 轮：声明在 `Cadence::PeriodicWithWork` 上的工期界量的正是这个间隔，而一条
+        // 探针最多跑多久由它自己的执行契约说了算（`discovery_round_wall`）。少了这一
+        // 心跳，界就只能按整轮的时长申报，而整轮取决于工具面有多大。
+        beat.beat();
     }
 
     DiscoveryRound {
         generated,
         submitted,
         refused,
+        deferred,
         handed_over,
     }
 }
@@ -2287,6 +2303,8 @@ pub(crate) struct DiscoveryRound {
     pub generated: usize,
     pub submitted: usize,
     pub refused: usize,
+    /// 这一轮的墙到了还没轮到的条数：它们没退场，下一轮会原样再生成。
+    pub deferred: usize,
     /// 每条是（编排器给的任务 id，探针本体，这条任务声明的执行契约秒数）。
     pub handed_over: Vec<(String, crate::types::DiscoveryTask, u64)>,
 }
@@ -2323,6 +2341,31 @@ fn outcome_deadline(timeout_secs: u64, period: std::time::Duration) -> std::time
 /// 的覆盖位，所以是一个标了来源的数，而不是一条实测出来的界。
 // cap: bound — 是 outcome_deadline 那段没有声明的排队时间的覆盖位，所以标来源而不是实测
 const OUTCOME_QUEUE_MARGIN_ROUNDS: u32 = 3;
+
+/// 一条探针的执行契约（秒）：`Task::new` 给每一条任务写的 `timeout_seconds`。
+///
+/// 这里写一份是为了让**一轮的工期**有一个可读的来源——一轮把几条探针依次交给编排器，
+/// 每一次交接等的是同一条流水线，那条流水线对「最多跑多久」的声明就是它。真值仍在
+/// `Task::new` 里：`discovery_probe_declares_the_contract_its_round_is_sized_from`
+/// 那条测试盯着两处一致，那边改了而这里没跟，它会红。
+const DISCOVERY_PROBE_CONTRACT_SECS: u64 = 300;
+
+/// 一轮最多能把多久花在「开始新的交接」上。
+///
+/// 与 `outcome_deadline` 用的是同一个窗口：一次交接等的是同一条流水线，于是「这条
+/// 探针多久没结局该作废」与「一轮最多交多久」量的是同一段时间。过了这条线，这一轮
+/// 不再开始新的交接，剩下的探针**原样留到下一轮**（不 `mark_explored`）。
+///
+/// 为什么要有这条线：轮不是总账，是这一拍愿意等的那一段。一轮按工具面大小生成
+/// `tool_names.len()` 条，池不可用时每条要等一整条协作流水线才拿到 429；串行跑完
+/// 这样一轮是几个钟头，而这期间下一拍要收的结局一个也收不回来。更直接的代价在
+/// 告警面：这条环要是按「健康的一轮能跑多久」申报工期，墙就被拉到数小时，`background_
+/// loop_stalled` 从此对这条环失去意义；不申报，则「健康但慢」与「停摆」同形——
+/// 2026-11-03 那次 `tick_age 690 > 6×60` 的红就是这个形状。
+fn discovery_round_wall(period: std::time::Duration) -> std::time::Duration {
+    std::time::Duration::from_secs(DISCOVERY_PROBE_CONTRACT_SECS)
+        + period * OUTCOME_QUEUE_MARGIN_ROUNDS
+}
 
 /// 把已经交出去的探针的结局收回来：每条只读一次，**不等它跑完**。
 ///
@@ -2551,9 +2594,20 @@ fn spawn_discovery_loop(
     // （`cog-core/src/contract/owner_lease.rs:201-204`），于是「没仲裁者」与
     // 「我持有」在读数上同形。只印后者会让这个进程多一个安静的正常值。
     let broker_present = role_broker.is_some();
+    // 这条环的一拍里包着一件它不控制时长的事：把探针交给编排器，等它走完一整条协作
+    // 流水线。`Cadence::Periodic` 只声明「多久醒一次」，于是每一轮健康但慢的拍都会
+    // 老过「六倍周期」那条墙——2026-11-03 实测 `tick_age 690 > 6×60`，池耗尽时每条
+    // 探针要等 ~90s 才拿到 429，这一轮串行跑完就是把「在干活」读成「停摆」。
+    //
+    // 工期界从探针自己的执行契约导出（`discovery_round_wall`），而且轮内每交完一条
+    // 就心跳一次：界要盖住的是**两条心跳之间**那一段，也就是一条探针的往返，不是
+    // 一整轮。整轮另有自己的墙（同一个数），到了就停手、把剩下的留给下一拍。
     drop(cog_core::loop_health::spawn_unstoppable(
         DISCOVERY_LOOP,
-        cog_core::loop_health::Cadence::Periodic(period),
+        cog_core::loop_health::Cadence::PeriodicWithWork {
+            period,
+            work: discovery_round_wall(period),
+        },
         // 每轮重建，所以循环体要用到的都先克隆出来。
         move |beat| {
             let tool_registry = tool_registry.clone();
@@ -2724,6 +2778,8 @@ fn spawn_discovery_loop(
                         &tool_names,
                         &skill_ids,
                         max_tasks,
+                        &beat,
+                        std::time::Instant::now() + discovery_round_wall(period),
                     )
                     .await;
                     // 受理了就要欠着一条结局——**这一句是回程的入口**。少了它，
@@ -2749,6 +2805,7 @@ fn spawn_discovery_loop(
                         skills = skill_ids.len(),
                         submitted = round.submitted,
                         refused = round.refused,
+                        deferred = round.deferred,
                         "autonomous discovery round"
                     );
                 }
@@ -5436,6 +5493,11 @@ mod tests {
             &tools,
             &[],
             64,
+            &cog_core::loop_health::registry().register(
+                "discovery_round_probe",
+                cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
+            ),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
         )
         .await;
 
@@ -5466,6 +5528,106 @@ mod tests {
                 "被拒的 {key} 也要留在池子里等下一轮，否则一次拒绝就把组合花掉了：{after_keys:?}"
             );
         }
+    }
+
+    /// 一轮的墙到了就停手，**不是**把剩下的探针退场掉。
+    ///
+    /// 墙存在的理由有两条，这条测试守的是第二条的破坏面：一轮按工具面大小生成
+    /// `tool_names.len()` 条，池不可用时每条要等一整条协作流水线才拿到 429；没有墙，
+    /// 这样一轮串行跑几个钟头，下一拍该收的结局一个也收不回来。而有墙没这条判据，
+    /// 最省事的写法是「超时就当试过了」——`mark_explored` 一写，那些组合从此不再
+    /// 出现，池子被「这一拍没时间」清空，与「搜索空间已穷尽」同形。
+    #[tokio::test]
+    async fn a_round_out_of_time_defers_probes_instead_of_retiring_them() {
+        let tools: Vec<String> = ["read_file", "run_command", "write_file"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let engine = crate::DiscoveryEngine::new(std::sync::Arc::new(
+            crate::recorder::InMemoryRecorder::new(),
+        ));
+        let before: Vec<String> = engine
+            .generate_tasks(&tools, &[], 64)
+            .await
+            .iter()
+            .map(|t| t.explored_key.clone())
+            .collect();
+        assert!(!before.is_empty(), "前提：这一轮本来有组合可交");
+
+        // 墙已经过去了：这一轮一条也不该开始交接。
+        let round = run_discovery_round(
+            &engine,
+            |_goal, task| async move { Ok(vec![task.id.clone()]) },
+            &tools,
+            &[],
+            64,
+            &cog_core::loop_health::registry().register(
+                "discovery_deferred_probe",
+                cog_core::loop_health::Cadence::Periodic(std::time::Duration::from_secs(60)),
+            ),
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            (round.submitted, round.refused),
+            (0, 0),
+            "墙过了就不该再有交接：交出去就是要等一条流水线"
+        );
+        assert_eq!(
+            round.deferred, round.generated,
+            "被留下的必须是**整批**：{} 条生成、{} 条记账",
+            round.generated, round.deferred
+        );
+
+        let after: Vec<String> = engine
+            .generate_tasks(&tools, &[], 64)
+            .await
+            .iter()
+            .map(|t| t.explored_key.clone())
+            .collect();
+        assert_eq!(
+            after, before,
+            "没交出去的组合要原样留在池子里：这一次没时间不是试过一次"
+        );
+    }
+
+    /// 轮的墙与告警的工期界都从探针自己的执行契约导出，而契约的真值在 `Task::new`。
+    ///
+    /// 这一条盯的是那两处的一致性：`Task::new` 的默认 `timeout_seconds` 改了而
+    /// `DISCOVERY_PROBE_CONTRACT_SECS` 没跟，`background_loop_stalled` 就会按一个
+    /// 比真实往返短的界判这条环——池一慢它就红，而环其实在干活。反过来，这里要是
+    /// 比真值大，红会晚到，迟到的红等于没有。
+    #[tokio::test]
+    async fn discovery_probe_declares_the_contract_its_round_is_sized_from() {
+        let engine = crate::DiscoveryEngine::new(std::sync::Arc::new(
+            crate::recorder::InMemoryRecorder::new(),
+        ));
+        let tools: Vec<String> = ["read_file", "run_command"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let probe = engine
+            .generate_tasks(&tools, &[], 8)
+            .await
+            .into_iter()
+            .next()
+            .expect("no probe proposed");
+        let (_goal, task) = discovery_probe_task(&probe);
+        assert_eq!(
+            task.timeout_seconds, DISCOVERY_PROBE_CONTRACT_SECS,
+            "一轮的工期界是按这个数算的：`Task::new` 的契约改了这一行也得跟着改"
+        );
+
+        let one = discovery_round_wall(std::time::Duration::from_secs(60));
+        assert!(
+            one >= std::time::Duration::from_secs(DISCOVERY_PROBE_CONTRACT_SECS),
+            "墙至少得盖住一条探针的契约，否则每一条探针都会把这一轮走成超时"
+        );
+        assert!(
+            discovery_round_wall(std::time::Duration::from_secs(120)) > one,
+            "排队余量按这条环自己的节拍算：周期翻倍，墙就得跟着放宽"
+        );
     }
 
     /// 一条探针的结局在册子上长什么样：一条跑完的任务行。
