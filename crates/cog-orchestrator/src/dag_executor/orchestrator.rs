@@ -5690,6 +5690,55 @@ mod tests {
         );
     }
 
+    /// 判据要认生产上真实出现的那个形状，不只是测试里顺手写的那个。
+    ///
+    /// 与上一条同一个判决点，换的是输入：这条是从库里抄下来的原样字节——一条
+    /// 带 `quota_window_secs`、带 `retry_after_seconds`、末尾带
+    /// `[retry_after_secs=192]` 的 503，前面还套了两层包装。判据若只认得自己
+    /// 造的那种短句，生产上的长句就会走到记账那条路上：实测 2026-11-03 之前
+    /// 有 165 次带等待、自称环境的拒绝照样记到了任务的预算上。
+    ///
+    /// 两种承载都要过：角色把错误写进自己 content 之后是一条纯文本（`cause`
+    /// 为空），传输层直接透传时则带类型。账记在谁头上不该取决于错误走了哪条路。
+    #[tokio::test]
+    async fn store_mode_does_not_charge_for_the_refusal_shape_seen_in_production() {
+        // 抄自 `change-ledger-*` 的 `retry_history`，只把时长换了。
+        const REFUSAL: &str = "Agent execution error: upstream_unavailable: environment_error: \
+             LLM upstream refused (server_error): LLM stream error: API error (HTTP 503): \
+             {\"error\":\"所有 LLM 上游当前不可用\",\"face\":\"anthropic\",\
+             \"quota_window_secs\":604800,\"reason\":\"face_has_no_serving_member\",\
+             \"retry_after_seconds\":192} [retry_after_secs=192]";
+
+        for cause in [None, Some(UpstreamFailure::ServerError)] {
+            let backend: Arc<dyn StateBackend> =
+                Arc::new(cog_test_support::MemoryStateBackend::new());
+            let dag = DagExecutor::new("ws-outage-shape".into()).with_state_backend(backend);
+            let task = Task::new("t-outage-shape", TaskType::DagNode, serde_json::json!({}));
+            let task_id = task.id.clone();
+            dag.add_task(task).await.unwrap();
+            dag.schedule_task(&task_id).await.unwrap();
+            dag.start_task(&task_id).await.unwrap();
+
+            for i in 0..8 {
+                let (retried, _, _) = dag
+                    .fail_task_after(&task_id, REFUSAL.to_string(), cause, None)
+                    .await
+                    .unwrap();
+                assert!(retried, "cause={cause:?} 第 {i} 次被拒后任务必须还在队列里");
+                let view = dag.get_task(&task_id).await.unwrap();
+                assert_eq!(
+                    view.status,
+                    TaskStatus::Pending,
+                    "cause={cause:?} 第 {i} 次"
+                );
+                assert_eq!(
+                    view.retry_count, 0,
+                    "这条拒绝说的是环境，写了等待也不改变账记在谁头上（cause={cause:?} 第 {i} 次）"
+                );
+            }
+        }
+    }
+
     /// 走唯一入口拿到执行权的任务必然带租约。没有租约的 Running 行没有"到期
     /// 时刻"这条证据，也就没有任何东西会去回收它——它到不了任何终态。
     #[tokio::test]
