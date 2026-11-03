@@ -42,6 +42,18 @@ use std::path::{Path, PathBuf};
 /// The workflow whose `--ignored` steps name the corpus.
 const WORKFLOW: &str = ".github/workflows/ci.yml";
 
+/// The wrapper a step hands its command to, so a red one says which test broke.
+///
+/// The wrapper does not change the command -- it runs it, keeps its exit code,
+/// and writes the failing names into an annotation, because the job log is
+/// behind a token and a red step otherwise reads as `Process completed with
+/// exit code 101` with the service container's teardown behind it. It does
+/// change the first word of the line, so the read below has to take it off
+/// before it can recognise `cargo test`. Left on, every one of these steps
+/// would look like a shape this contract does not understand, and the census
+/// would lose the whole corpus rather than gain a reason for it.
+const STEP_WRAPPER: &str = "bash deploy/scripts/run-a-ci-step.sh ";
+
 /// The attribute that marks a test as not part of the default run, spelled in
 /// two pieces on purpose.
 ///
@@ -184,6 +196,7 @@ fn ignored_steps(workflow: &str) -> Vec<Step> {
             continue;
         };
         let command = command.trim();
+        let command = command.strip_prefix(STEP_WRAPPER).unwrap_or(command).trim();
         if !command.split_whitespace().any(|word| word == "--ignored") {
             continue;
         }

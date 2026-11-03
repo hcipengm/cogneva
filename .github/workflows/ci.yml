@@ -118,7 +118,7 @@ jobs:
       # account the live-DB steps below settle. It is fast, and it panics
       # rather than passes when the binary is missing, so it cannot go quiet.
       - name: The generated SSH keypair is readable by ssh-keygen
-        run: cargo test -p cog-gateway --lib -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-gateway --lib -- --ignored
       # The capped agent log is the first state this backend can get wrong only
       # after the cap fires: a trim moves every list position, so a reader that
       # indexes by position skips as many records as were dropped and a next
@@ -136,7 +136,7 @@ jobs:
       # rather than a silence that looks like agreement.
       - name: Live-Redis capped agent log
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test wal_redis_trim -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test wal_redis_trim -- --ignored
         env:
           COGNEVA_TEST_REDIS_URL: redis://127.0.0.1:6379
       # The two retirement passes are judged on the one thing a fixture cannot
@@ -152,12 +152,12 @@ jobs:
       # server rather than a stand-in.
       - name: Live-Redis inbox retirement
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test inbox_retirement -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test inbox_retirement -- --ignored
         env:
           COGNEVA_TEST_REDIS_URL: redis://127.0.0.1:6379
       - name: Live-Redis agent log retirement
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test wal_retirement -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test wal_retirement -- --ignored
         env:
           COGNEVA_TEST_REDIS_URL: redis://127.0.0.1:6379
       # The registry answers two questions through one key: who holds a name,
@@ -170,12 +170,12 @@ jobs:
       # server, and the registry is asked what it makes of it.
       - name: Live-Redis agent registry liveness
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test agent_registry_liveness -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test agent_registry_liveness -- --ignored
         env:
           COGNEVA_TEST_REDIS_URL: redis://127.0.0.1:6379
       - name: Live-DB partition tests
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test partition_maintainer -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The metering readings are a column the ledger gained later, so the three
@@ -188,7 +188,7 @@ jobs:
       # column nobody can see.
       - name: Live-DB metering readings
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test usage_metering -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test usage_metering -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A schema statement's wait for its locks is a fact about the server's
@@ -201,7 +201,7 @@ jobs:
       # serving -- and it is only visible as one session blocking another.
       - name: Live-DB schema lock bounds
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test schema_ddl_lock -- --ignored --test-threads=1
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test schema_ddl_lock -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Splitting a store's schema into several lists buys the readers the
@@ -215,7 +215,7 @@ jobs:
       # startup, on an old shape -- which is to say in production.
       - name: Live-DB memory schema lists
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-memory --test schema_lists_land_in_order_on_a_legacy_table -- --ignored --test-threads=1
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-memory --test schema_lists_land_in_order_on_a_legacy_table -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The decision counters are a sum the database keeps, and the one read a
@@ -227,7 +227,7 @@ jobs:
       # not have it at all.
       - name: Live-DB decision counters
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test decision_stats_store -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test decision_stats_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The change ledger's reason column is written through one statement and
@@ -238,7 +238,7 @@ jobs:
       # round trip that the reason column exists to make possible is never run.
       - name: Live-DB change-ledger store
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test change_ledger_store -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test change_ledger_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The backup account's write path is statements whose whole content is what
@@ -253,7 +253,7 @@ jobs:
       # not a check in the caller.
       - name: Live-DB backup-run store
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test backup_run_store -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test backup_run_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The transcript's three claims are the database's: that a turn is written
@@ -263,7 +263,7 @@ jobs:
       # being the whole point, since what this replaced lived in one process.
       - name: Live-DB chat turn store
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test chat_turn_store -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test chat_turn_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The agent conversation's two claims are the database's rather than the
@@ -276,7 +276,7 @@ jobs:
       # without a server.
       - name: Live-DB agent message store
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test agent_message_store -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test agent_message_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The catalog's one invariant is a unique constraint and its optional
@@ -286,7 +286,7 @@ jobs:
       # the server, so no in-memory fake can see them.
       - name: Live-DB dataset catalog
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test dataset_catalog -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test dataset_catalog -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The principle ledger's intake is keyed on `(slug, source)`, so every
@@ -300,7 +300,7 @@ jobs:
       # gets. Without this step that shape passes everything.
       - name: Live-DB principle-ledger intake
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test principle_ledger_intake -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test principle_ledger_intake -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The set a measuring pass looks at is a bounded query, and what the bound
@@ -312,7 +312,7 @@ jobs:
       # which rows a `NULLS FIRST` ordering hands back.
       - name: Live-DB principle-ledger outstanding set
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test principle_ledger_outstanding -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test principle_ledger_outstanding -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The census counts the corpus, and the account also holds rows that are
@@ -323,7 +323,7 @@ jobs:
       # run against a server.
       - name: Live-DB principle-ledger census
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test principle_ledger_census -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test principle_ledger_census -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A refusal now carries the shape that caused it, and the shapes are rows
@@ -336,7 +336,7 @@ jobs:
       # database-free double reproduces.
       - name: Live-DB principle refusal shapes
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test principle_refusal_shapes -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test principle_refusal_shapes -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Which principle governs a path is a question only the store can answer:
@@ -347,7 +347,7 @@ jobs:
       # double would restate the caller's own assumption about both.
       - name: Live-DB principle gating paths
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test principle_gating_paths -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test principle_gating_paths -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The sample-log sweep is expressed almost entirely as one DELETE, so its
@@ -357,7 +357,7 @@ jobs:
       # local gate and CI.
       - name: Live-DB metrics sample capacity sweep
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test metrics_sample_cap -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test metrics_sample_cap -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Same shape one table over: the event log's sweep is one DELETE whose
@@ -367,7 +367,7 @@ jobs:
       # exists in the statement the server executes.
       - name: Live-DB observability event capacity sweep
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test observability_event_cap -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test observability_event_cap -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The checkpoint sweep has two floors rather than one: the read window and
@@ -377,7 +377,7 @@ jobs:
       # an anti-join that excludes from one that returns the same rows.
       - name: Live-DB checkpoint capacity sweep
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test checkpoint_cap -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test checkpoint_cap -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Retention is one DELETE, and the exception inside it is what keeps the
@@ -388,7 +388,7 @@ jobs:
       # reader sees it. Only the server can say which rows a WHERE kept.
       - name: Live-DB notification retention
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test notification_retention -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test notification_retention -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The sweep that closes the alert rows a dead process left firing is two
@@ -400,7 +400,7 @@ jobs:
       # Both regressions still close *some* rows and still report a count.
       - name: Live-DB alert row sweep
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test alert_row_sweep -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test alert_row_sweep -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The prompt-and-response archive is retired by age, and the three claims
@@ -415,7 +415,7 @@ jobs:
       # stopped for as long as that run lasts.
       - name: Live-DB LLM exchange retention
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test exchange_retention -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test exchange_retention -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The per-task event archive retires whole streams, and every claim that
@@ -431,7 +431,7 @@ jobs:
       # backlog and a loop that reads as stopped for as long as that run lasts.
       - name: Live-DB task event retention
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test task_event_retention -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test task_event_retention -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The per-call token ledger is the one archive here whose rows are a
@@ -448,7 +448,7 @@ jobs:
       # anything the moment the fold started catching up.
       - name: Live-DB LLM usage retention
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test usage_retention -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test usage_retention -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Which replica may act is decided by one statement, and the acceptance
@@ -459,7 +459,7 @@ jobs:
       # that takes, so this is the half that holds.
       - name: Live-DB owner-lease arbitration
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test owner_lease -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test owner_lease -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Which transitions the owner guard lets through is decided in the
@@ -470,7 +470,7 @@ jobs:
       # they create the same types at once and the catalog refuses the second.
       - name: Live-DB task ownership guard
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test task_ownership_store -- --ignored --test-threads=1
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test task_ownership_store -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A face is a task row, and every rule the governance layer trusts is a
@@ -485,7 +485,7 @@ jobs:
       # refuses the second.
       - name: Live-DB governance store reads
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test governance_store -- --ignored --test-threads=1
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test governance_store -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # What a single pruning statement costs, and which rows it takes. The
@@ -494,7 +494,7 @@ jobs:
       # statement's text shows.
       - name: Live-DB metrics surplus-delete statement
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test metrics_surplus_delete -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test metrics_surplus_delete -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The gauge read and the retirement pass were written as live tests and
@@ -504,7 +504,7 @@ jobs:
       # the claim is checked rather than asserted.
       - name: Live-DB metrics latest-sample read
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test metrics_latest_reading -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test metrics_latest_reading -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A `_total` series is read by differencing two scrapes, so the stored
@@ -515,7 +515,7 @@ jobs:
       # every call site.
       - name: Live-DB counter totals accumulate
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test metrics_counter_accumulation -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test metrics_counter_accumulation -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # One task id is not one run: the pipeline hands the same id to its
@@ -526,7 +526,7 @@ jobs:
       # every role but the last, which no DB-free test can see.
       - name: Live-DB task census accumulates runs
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test observability_task_census -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test observability_task_census -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A task's log is written append-only and read in tasks, so the writer
@@ -536,7 +536,7 @@ jobs:
       # quiet one's log without changing any total.
       - name: Live-DB task log stays inside its bound
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test observability_task_log_bound -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test observability_task_log_bound -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A task's event offsets are the backend's to assign, and Postgres derives
@@ -547,7 +547,7 @@ jobs:
       # both questions only a server answers.
       - name: Live-DB event offset sequence
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test events_offset_sequence -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test events_offset_sequence -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The same append read back through `get_events` must mean the same event
@@ -558,7 +558,7 @@ jobs:
       # that is the implementation that was right.
       - name: Live-DB event payload round trip
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test events_payload_round_trip -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test events_payload_round_trip -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Whether an event published through the trait object reaches the table
@@ -569,12 +569,12 @@ jobs:
       # row and the schema it lands in are both the server's to settle.
       - name: Live-DB observability event persistence
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test observability_event_persistence -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test observability_event_persistence -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - name: Live-DB retires a metrics name
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test metrics_retirement -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test metrics_retirement -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # One test in this binary restores a package written by an older image and
@@ -586,7 +586,7 @@ jobs:
       # and runs on a host that was given an extracted package.
       - name: Live-DB backup/restore round trip
         if: ${{ !cancelled() }}
-        run: cargo test -p cogneva --test backup_pg -- --ignored --skip=pg_restore_loads_a_package_written_before_the_schema_moved_on
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cogneva --test backup_pg -- --ignored --skip=pg_restore_loads_a_package_written_before_the_schema_moved_on
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The platform-identity lookup fails at parse time against the real
@@ -595,7 +595,7 @@ jobs:
       # on a first login stays broken while every DB-free test passes.
       - name: Live-DB platform identity lookup
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test platform_identity -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test platform_identity -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The notification store's insert is a statement only the server parses,
@@ -605,7 +605,7 @@ jobs:
       # DB-free test green.
       - name: Live-DB notification store
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test notification_store -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test notification_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The token ledger's cache column is added by an ALTER that has to land on
@@ -616,7 +616,7 @@ jobs:
       # test green.
       - name: Live-DB LLM usage ledger
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test usage_store_ledger -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test usage_store_ledger -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The window fold's three claims are all decisions the server makes: that
@@ -633,7 +633,7 @@ jobs:
       # list, and only a server can say which windows exist to be summed.
       - name: Live-DB LLM usage window rollup
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test usage_rollup -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test usage_rollup -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The saved calls a call site decided not to make and the verdict a
@@ -650,7 +650,7 @@ jobs:
       # any single assertion.
       - name: Live-DB LLM skip and spend verdict
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test skip_and_verdict_round_trip -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test skip_and_verdict_round_trip -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The alert DDL is one multi-statement string sent through the simple
@@ -663,7 +663,7 @@ jobs:
       # firing episode clears the mark so the next episode is announced.
       - name: Live-DB alert schema and notification mark
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test alert_schema -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test alert_schema -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Every store in the tree creates its schema through the shared bounded
@@ -677,7 +677,7 @@ jobs:
       # the stores in other crates know the contract and not the wait.
       - name: Live-DB schema lock bounds
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test schema_lock_bound -- --ignored --test-threads=1
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test schema_lock_bound -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The alert mirror decides what to close by subtracting the keys it just
@@ -701,12 +701,12 @@ jobs:
       # writes name, silently, on a tree where every DB-free test still passes.
       - name: Live-DB alert writer identity and verdicts
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test alert_writer_divergence -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test alert_writer_divergence -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       - name: Live-DB alert mirror ownership
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test alert_mirror_source -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test alert_mirror_source -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Adoption and retirement ask the store "which of my rules still have a
@@ -729,7 +729,7 @@ jobs:
       # both.
       - name: Live-DB watcher adoption, retirement and close
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --lib -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --lib -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A taste submission is evidence and a claimable row at once, and both
@@ -741,7 +741,7 @@ jobs:
       # whose recorded fate or wording disagrees with the work filed for it.
       - name: Live-DB taste intent claims
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test taste_intent_store -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test taste_intent_store -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A finished task's work duration is taken from two stamps inside the
@@ -752,7 +752,7 @@ jobs:
       # the task table last.
       - name: Live-DB task work samples
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test task_kind_samples -- --ignored --test-threads=1
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test task_kind_samples -- --ignored --test-threads=1
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The status census is one GROUP BY plus a branch that decides what a
@@ -761,7 +761,7 @@ jobs:
       # table on entry and exit.
       - name: Live-DB task status census
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-storage --test task_status_counts -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test task_status_counts -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # Whether a ledger row that names something counts as attributed is a
@@ -770,7 +770,7 @@ jobs:
       # disturbs what the steps above leave behind.
       - name: Live-DB unattributed spend
         if: ${{ !cancelled() }}
-        run: cargo test -p cog-observability --test usage_unattributed -- --ignored
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test usage_unattributed -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
 
