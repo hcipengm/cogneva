@@ -193,10 +193,44 @@ async fn connect(client: &redis::Client) -> SFResult<ConnectionManager> {
 
 /// Create a stream's consumer group, tolerating the group already being there.
 ///
-/// `$` rather than `0`: this makes the same claim the startup path makes — begin
-/// where the stream is now. An empty stream answers both the same way, and a
-/// stream that still holds entries is one this process already consumed from, so
-/// reading it from the start again would deliver work it has already handled.
+/// `0` rather than `$`, and the difference is a silent loss rather than a
+/// preference. A group created at `$` is positioned at the stream's tip, so
+/// every entry already in the stream is skipped: it is never handed to this
+/// group and never will be, and the group reports itself caught up while it
+/// happens. Measured on a live Redis 7.4 with three entries in a group-less
+/// stream: creating at `$` answered `OK`, delivered nothing, and reported
+/// `lag 0`; creating the same group at `0` reported `lag 3` and handed all
+/// three out. The two states are indistinguishable from the readings an
+/// operator has — `pending 0`, `length 0` after the next ack, and `entries-read`
+/// back-filled to `entries-added` the moment the group catches up.
+///
+/// The comment this replaces argued the opposite: that a stream still holding
+/// entries is one this process already consumed from, and replaying it would
+/// deliver work already handled. That holds only for a stream that outlives its
+/// own group's handling of it, and these queues are not that. A group is
+/// recreated here whenever it disappears — the server restarts without the key,
+/// the key is dropped, [`recover_refused_read`] puts it back after a `NOGROUP`
+/// — and it is created for the first time whenever a producer has already been
+/// writing to a queue whose only reader had not started yet. In both cases the
+/// entries in the stream are work **nobody** has been handed, not work already
+/// handled. The ready queue makes the second case routine rather than rare: the
+/// publisher of a deployment that does not read the process-local ready stream
+/// writes to it anyway, so that stream can hold a backlog before any reader
+/// exists.
+///
+/// Replay is the cheap half of the trade the trait already made. Delivery is
+/// at-least-once and every consumer of this trait answers a message whose work
+/// is no longer current by acking it without re-running it, so handing out an
+/// entry twice costs one refusal; skipping one costs the work, permanently, and
+/// with no reading that says so — `lag` reports zero for exactly the state
+/// where a batch was skipped. The replay is bounded rather than historical:
+/// [`trim_handled_prefix`] removes an entry as soon as every group has acked
+/// it, so what a new group replays from `0` is what is still outstanding, not
+/// the stream's lifetime traffic.
+///
+/// `BUSYGROUP` is what keeps this idempotent: an existing group keeps its own
+/// position, so `0` only ever decides where a group that is being created now
+/// starts.
 async fn ensure_stream_group(
     conn: &mut ConnectionManager,
     stream: &str,
@@ -206,7 +240,7 @@ async fn ensure_stream_group(
         .arg("CREATE")
         .arg(stream)
         .arg(group)
-        .arg("$")
+        .arg("0")
         .arg("MKSTREAM")
         .query_async(conn)
         .await;
@@ -897,9 +931,11 @@ mod tests {
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next()).await;
 
+        // A read that stops answering is the failure this test is about: the
+        // connection above already ruled out "no Redis here".
         match result {
             Ok(Some(Ok((_, bytes)))) => assert_eq!(bytes, b"hello"),
-            _ => eprintln!("SKIP: Redis stream read timed out or failed"),
+            other => panic!("expected the published message, got {other:?}"),
         }
     }
 
@@ -934,10 +970,11 @@ mod tests {
         let (id, bytes) =
             match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
                 Ok(Some(Ok(msg))) => msg,
-                _ => {
-                    eprintln!("SKIP: Redis stream read timed out or failed");
-                    return;
-                }
+                // The message was published before the group existed, which is
+                // the ordering this test can no longer afford to excuse: a read
+                // that times out here is the entry having been skipped, not a
+                // missing server.
+                other => panic!("expected the entry published before the group, got {other:?}"),
             };
         assert_eq!(bytes, b"one");
         assert_eq!(pending_count(&mut raw, stream, group).await, 1);
@@ -960,23 +997,31 @@ mod tests {
             .expect("XLEN")
     }
 
-    /// Read `count` messages in order, or `None` when the stream stops
-    /// answering — the caller turns that into a skip, as the tests above do.
+    /// Read `count` messages in order, panicking if they do not arrive.
+    ///
+    /// It used to answer `None` and every caller turned that into a skip, which
+    /// made the one outcome these tests exist to catch — work that was
+    /// published and never delivered — indistinguishable from a machine without
+    /// Redis. Availability is already settled by the connection the caller
+    /// opened above, so a read that stops answering here is the defect.
     async fn read_n(
         backend: &Arc<dyn MessageBackend>,
         stream: &str,
         group: &str,
         count: usize,
-    ) -> Option<Vec<(String, Vec<u8>)>> {
-        let mut sub = backend.subscribe(stream, group).await.ok()?;
+    ) -> Vec<(String, Vec<u8>)> {
+        let mut sub = backend.subscribe(stream, group).await.expect("subscribe");
         let mut out = Vec::new();
         for _ in 0..count {
             match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
                 Ok(Some(Ok(msg))) => out.push(msg),
-                _ => return None,
+                other => panic!(
+                    "{stream}/{group}: expected {count} messages, got {} before {other:?}",
+                    out.len()
+                ),
             }
         }
-        Some(out)
+        out
     }
 
     /// 一条流「做完了」不能和「积压着」长得一样。XACK 只把 id 从 PEL 里摘掉，
@@ -1008,10 +1053,7 @@ mod tests {
         for payload in [b"one".as_slice(), b"two", b"three"] {
             backend.publish(stream, payload).await.unwrap();
         }
-        let Some(messages) = read_n(&backend, stream, group, 3).await else {
-            eprintln!("SKIP: Redis stream read timed out or failed");
-            return;
-        };
+        let messages = read_n(&backend, stream, group, 3).await;
         assert_eq!(xlen(&mut raw, stream).await, 3, "三条都在流里，等着被 ack");
 
         let ids: Vec<String> = messages.into_iter().map(|(id, _)| id).collect();
@@ -1057,10 +1099,7 @@ mod tests {
         for payload in [b"one".as_slice(), b"two", b"three"] {
             backend.publish(stream, payload).await.unwrap();
         }
-        let Some(messages) = read_n(&backend, stream, group, 3).await else {
-            eprintln!("SKIP: Redis stream read timed out or failed");
-            return;
-        };
+        let messages = read_n(&backend, stream, group, 3).await;
         let ids: Vec<String> = messages.into_iter().map(|(id, _)| id).collect();
 
         // 第一条与第三条 ack，中间那条留着——它才是裁剪点。
@@ -1125,10 +1164,7 @@ mod tests {
             .await
             .expect("XGROUP CREATE");
 
-        let Some(messages) = read_n(&backend, stream, fast, 3).await else {
-            eprintln!("SKIP: Redis stream read timed out or failed");
-            return;
-        };
+        let messages = read_n(&backend, stream, fast, 3).await;
         let ids: Vec<String> = messages.into_iter().map(|(id, _)| id).collect();
         backend.ack(stream, fast, &ids).await.unwrap();
         assert_eq!(
@@ -1138,10 +1174,7 @@ mod tests {
         );
 
         // 第二个组补上之后，三条才成为两个组共同的过去。
-        let Some(second) = read_n(&backend, stream, slow, 3).await else {
-            eprintln!("SKIP: Redis stream read timed out or failed");
-            return;
-        };
+        let second = read_n(&backend, stream, slow, 3).await;
         let ids: Vec<String> = second.into_iter().map(|(id, _)| id).collect();
         backend.ack(stream, slow, &ids).await.unwrap();
         assert_eq!(
@@ -1199,10 +1232,8 @@ mod tests {
         let (id, bytes) =
             match tokio::time::timeout(std::time::Duration::from_secs(5), sub.next()).await {
                 Ok(Some(Ok(msg))) => msg,
-                _ => {
-                    eprintln!("SKIP: Redis stream read timed out or failed");
-                    return;
-                }
+                // The group was created first here, so this entry is owed to it.
+                other => panic!("expected the entry published after the group, got {other:?}"),
             };
         assert_eq!(bytes, b"one");
 
@@ -1808,6 +1839,68 @@ mod tests {
                 .unwrap()
                 .map(|stats| stats.count),
             Some(1)
+        );
+
+        let _: i64 = redis::cmd("DEL")
+            .arg(stream.as_str())
+            .query_async(&mut raw)
+            .await
+            .expect("del");
+    }
+
+    /// 组在积压之后才被建出来时，那份积压必须还是活的。
+    ///
+    /// 三个现场都是这个形状，而且都不是异常：服务端重启没带上流键之后
+    /// `recover_refused_read` 补建组；发布器先往还没人读的 local 流里写了一
+    /// 阵；一个组被删掉再建。组若建在队尾，流里已有的条目就被整批跳过——
+    /// 不投递、不进 PEL、`lag` 报 0，三个读数同时说「干净」，没有任何一边能
+    /// 发现丢了活。实测：三条无组时建在 `$` 上，交付零条、`lag 0`；同一条流
+    /// 建在 `0` 上，`lag 3` 且三条全交出。
+    #[tokio::test]
+    async fn a_group_created_after_work_was_published_is_still_handed_that_work() {
+        let redis_url = cog_test_support::redis_url();
+        let raw_client = redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut raw = match raw_client.get_multiplexed_async_connection().await {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("SKIP: Redis not available");
+                return;
+            }
+        };
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let stream = format!("cog-test:late-group-{suffix}");
+        let group = format!("late-group-{suffix}");
+
+        let backend: Arc<dyn MessageBackend> =
+            Arc::new(RedisMessageBackend::new(&redis_url).await.unwrap());
+
+        // Work first, group second.
+        backend.publish(&stream, b"one").await.unwrap();
+        backend.publish(&stream, b"two").await.unwrap();
+        backend.publish(&stream, b"three").await.unwrap();
+        backend
+            .create_consumer_group(&stream, &group)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            backend.stream_lag(&stream, &group).await.unwrap(),
+            Some(3),
+            "this group has been handed none of the three entries on the stream"
+        );
+
+        let messages = read_n(&backend, &stream, &group, 3).await;
+        let payloads: Vec<Vec<u8>> = messages
+            .iter()
+            .map(|(_, payload)| payload.clone())
+            .collect();
+        assert_eq!(
+            payloads,
+            vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+            "the entries published before the group existed are owed to it, in order"
         );
 
         let _: i64 = redis::cmd("DEL")

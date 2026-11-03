@@ -59,7 +59,11 @@ async fn key(agent_id: &str) -> String {
         .arg("CREATE")
         .arg(cog_core::agent_inbox_stream(agent_id))
         .arg(format!("agent-{agent_id}"))
-        .arg("$")
+        // `0`, as the backend creates one: on an empty stream that is the same
+        // position, and a fixture that spells the group differently from the
+        // consumer would stop standing in for it the moment the stream is not
+        // empty.
+        .arg("0")
         .arg("MKSTREAM")
         .query_async(&mut conn)
         .await

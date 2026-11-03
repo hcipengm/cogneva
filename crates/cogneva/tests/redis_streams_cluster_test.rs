@@ -114,9 +114,9 @@ async fn test_three_instances_share_ready_queue() {
     let _rt_b = Arc::new(make_runtime("b", ws).await.expect("runtime b"));
     let _rt_c = Arc::new(make_runtime("c", ws).await.expect("runtime c"));
 
-    // Instance B and C must create consumer groups BEFORE messages are
-    // published — Redis XGROUP CREATE with "$" only tracks messages
-    // arriving after creation.
+    // Instances B and C join the group before the work exists, which is the
+    // steady-state shape; joining later would also receive these entries, since
+    // a group this backend creates starts at the oldest entry on the stream.
     let ready_stream = format!("orchestrator:ready:{}", ws);
 
     let backend_b = RedisMessageBackend::new(REDIS_URL).await.unwrap();

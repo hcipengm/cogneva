@@ -138,6 +138,28 @@ impl NatsMessageBackend {
         })
     }
 
+    /// The config for a group on a subject this crate's callers read as a work
+    /// queue — everything the caller ever asks [`MessageBackend`] for here.
+    ///
+    /// `DeliverPolicy::All`, never `New`. A durable created at `New` is
+    /// positioned at the subject's tip, so every message already on the stream
+    /// is skipped: never delivered to this durable and never will be, while the
+    /// durable goes on reporting itself caught up. The queue is created — not
+    /// resumed — whenever it disappears (the server restarted without it), and
+    /// whenever a producer has been writing to a subject whose only reader had
+    /// not started yet; in both cases what is already on the stream is work
+    /// nobody has been handed, not work already handled. The same choice was
+    /// live in the redis backend, where it was measured rather than argued:
+    /// creating a group at the tip over three published entries delivered
+    /// nothing and reported `lag 0`.
+    ///
+    /// Replay is the cheaper half of that trade, and the trait already made it:
+    /// delivery is at-least-once and every consumer answers a message whose
+    /// work is no longer current by acking it without re-running it.
+    fn work_queue_config(&self, group: &str) -> pull::Config {
+        self.consumer_config(group, DeliverPolicy::All)
+    }
+
     /// Build the pull consumer config with the deployment's tuning applied.
     /// `ack_wait` must exceed the worst-case per-message processing latency
     /// (memory ingest: archive + two LLM calls + retries, minutes), otherwise
@@ -348,7 +370,7 @@ impl MessageBackend for NatsMessageBackend {
     async fn subscribe(&self, subject: &str, group: &str) -> SFResult<MessageStream> {
         let (stream, _limit) = self.ensure_stream(subject).await?;
         let consumer: jetstream::consumer::Consumer<pull::Config> = stream
-            .get_or_create_consumer(group, self.consumer_config(group, DeliverPolicy::New))
+            .get_or_create_consumer(group, self.work_queue_config(group))
             .await
             .map_err(|e| SFError::DagExecutor(format!("JetStream consumer create failed: {e}")))?;
 
@@ -485,7 +507,7 @@ impl MessageBackend for NatsMessageBackend {
     async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()> {
         let (js_stream, _limit) = self.ensure_stream(stream).await?;
         let _: jetstream::consumer::Consumer<pull::Config> = js_stream
-            .get_or_create_consumer(group, self.consumer_config(group, DeliverPolicy::New))
+            .get_or_create_consumer(group, self.work_queue_config(group))
             .await
             .map_err(|e| SFError::DagExecutor(format!("JetStream consumer create failed: {e}")))?;
         Ok(())
@@ -537,7 +559,7 @@ impl MessageBackend for NatsMessageBackend {
     async fn stream_lag(&self, stream: &str, group: &str) -> SFResult<Option<u64>> {
         let (js_stream, _limit) = self.ensure_stream(stream).await?;
         let mut consumer: jetstream::consumer::Consumer<pull::Config> = js_stream
-            .get_or_create_consumer(group, self.consumer_config(group, DeliverPolicy::New))
+            .get_or_create_consumer(group, self.work_queue_config(group))
             .await
             .map_err(|e| SFError::DagExecutor(format!("JetStream consumer create failed: {e}")))?;
         let info = consumer

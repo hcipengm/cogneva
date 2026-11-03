@@ -91,7 +91,11 @@ pub trait MessageBackend: Send + Sync {
     /// Returns a stream of `(message_id, payload)` tuples.  The caller is
     /// responsible for acking individual messages if the implementation
     /// requires it.
-    /// This variant starts at the current tip ("new messages only").
+    /// This variant resumes from the group's own position, which for a group
+    /// this call has to create is the oldest entry the stream still holds —
+    /// see [`Self::create_consumer_group`]. A group that already exists was
+    /// left at the last entry it was handed, so the ordinary steady state is
+    /// "new messages only".
     async fn subscribe(&self, subject: &str, group: &str) -> SFResult<MessageStream>;
 
     /// Subscribe from a specific message ID, enabling replay / catch-up.
@@ -154,6 +158,21 @@ pub trait MessageBackend: Send + Sync {
     }
 
     /// Create a consumer group on the target stream if it does not exist.
+    ///
+    /// A group that did not exist has no position, and the position it is
+    /// given is the difference between a queue that delivers what it already
+    /// held and one that silently drops it. It must begin at the **oldest**
+    /// entry the stream still holds, not at the tip: a group is created here
+    /// whenever it disappeared (the server restarted without it) and whenever
+    /// a producer has been writing to a subject whose only reader had not
+    /// started yet, and in both of those the entries already on the stream are
+    /// work no one has been handed. Beginning at the tip makes them invisible
+    /// to every reading at once — not delivered, not pending, and lag zero —
+    /// so nothing can repair them. Replaying from the oldest entry costs at
+    /// most a duplicate, which the at-least-once delivery this trait promises
+    /// already asks every consumer to tolerate.
+    ///
+    /// An existing group keeps its own position; only creation is affected.
     async fn create_consumer_group(&self, stream: &str, group: &str) -> SFResult<()>;
 
     /// Acknowledge one or more message IDs in a consumer group.
