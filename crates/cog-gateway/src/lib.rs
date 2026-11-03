@@ -584,6 +584,17 @@ pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/cluster/process-report",
             post(process_reports::process_report_handler),
         )
+        // 提交口：把一条指令变成任务行走的正是运营面上那个处理函数，一个字都没
+        // 改——同一套归属校验（face_id 与 unit_id 必须与面主一致）、同一条拒收
+        // 凭据形状输入的规定、同一份配额评估，最后同样经 `submit_goal_auto` 分解
+        // 注入。挂在这里而不是另写一条写入路径，是因为宿主上的会话与集群内业务
+        // Pod 都零凭证（红线），而它们是这个平台的合法参与者：给它们单开一条自己
+        // 拼行的路，就等于让归属与配额只在其中一扇门后面成立。
+        //
+        // 边界仍是网络事实：这条端口只接受本命名空间里跑本平台镜像的工作负载与
+        // 进化组件（见 ingress 策略），浏览器到不了。要提交的东西本该被拒绝时，
+        // 拒绝它的仍是处理函数自己那几条判据，不是"谁能连上"。
+        .route("/api/v1/tasks", post(tasks::create_task_handler))
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())
