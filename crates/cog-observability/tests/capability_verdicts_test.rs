@@ -267,3 +267,89 @@ async fn a_red_verdict_keeps_its_reason() {
     );
     assert_eq!(snaps[0].judged_total, 1);
 }
+
+/// 一条能力环不是「判一次就结束」：判词是某一刻的读数，而能力是持续的状态。
+///
+/// 2026-11-03 的现场：`start_all` 起的循环判完第一轮就 return，而
+/// `loop_health::spawn` 把一次 normal return 读成「这条环自己决定结束了」——它不重启，
+/// 只记一次死亡。于是两个已声明的能力在同一分钟里各死一次
+/// （`background_loop_died{loop=capability_spend_verdict_current}` 与
+/// `..._usage_rollup_current}`），判词冻在启动那一刻，随后
+/// `capability_judgement_overdue` 一直响：读的人看见的是「跑到一半不跑了」，
+/// 而这一面没有任何别的读数能区分它和「一切都好」。
+///
+/// 判据落在**第二拍**上：一拍之内，写错的版本和写对的版本都判过一次，读数完全一样。
+/// 只有等到节拍过去还不再判，才说明这条环死了。
+#[tokio::test]
+async fn a_capability_is_judged_again_on_its_own_cadence() {
+    struct Counting {
+        judged: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait]
+    impl Capability for Counting {
+        fn id(&self) -> &'static str {
+            "counts_its_rounds"
+        }
+
+        fn cadence(&self) -> Cadence {
+            // 这个数只为测试存在：真的能力按分钟到小时判，而这条判据要的是
+            // 「第二拍发生了没有」，不是任何一条能力的真实节拍。
+            Cadence::Periodic(Duration::from_millis(20))
+        }
+
+        async fn judge(&self) -> Verdict {
+            self.judged
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Verdict::Ok
+        }
+    }
+
+    let capability = Arc::new(Counting {
+        judged: std::sync::atomic::AtomicU64::new(0),
+    });
+    let mut ledger = CapabilityLedger::new();
+    ledger
+        .declare(capability.clone())
+        .expect("declare the counting capability");
+
+    let shutdown = cog_core::ShutdownSignal::new();
+    ledger.start_all(shutdown.clone());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let judged = capability.judged.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        judged >= 2,
+        "一条能力环必须按自己的节拍一直判下去，{} 毫秒里只判了 {judged} 次：\
+         判完第一拍就 return 的那版会让这一面停在启动那一刻的读数上",
+        Duration::from_millis(200).as_millis()
+    );
+    let snaps = ledger.snapshot();
+    assert_eq!(
+        snaps[0].judged_total, judged,
+        "账上记的次数要与真的判过的次数一致"
+    );
+
+    // 停机是所有者要的结束，不是这条环自己死掉：死亡计数两边都不许动。
+    shutdown.trigger();
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let metrics = cog_core::loop_health::registry()
+        .collect_metrics("")
+        .await
+        .expect("collect loop health");
+    let deaths = metrics
+        .iter()
+        .find(|m| {
+            m.name == cog_core::loop_health::LOOP_DEATHS_TOTAL
+                && m.labels
+                    .get("loop")
+                    .map(String::as_str)
+                    .is_some_and(|v| v == "capability_counts_its_rounds")
+        })
+        .expect(
+            "死亡计数这一格必须存在：读不到它，「没死」与「没人记」就是同一个空集，\
+             而这条判据的后半句会变成空断言",
+        )
+        .value;
+    assert_eq!(deaths, 0.0, "按停机信号结束的能力环不该被记成死亡");
+}

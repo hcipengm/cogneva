@@ -379,10 +379,28 @@ impl CapabilityLedger {
     /// The loops are named [`loop_name`]`(id)` and registered with the
     /// platform's loop-liveness family, so a capability whose loop dies reads as
     /// a dead loop rather than as a verdict that stopped moving.
+    ///
+    /// Each loop judges **on its own cadence, for as long as the process runs**.
+    /// A capability has no "done": its verdict is a reading of a state at a
+    /// moment, and a body that judged once and returned was read by the liveness
+    /// family exactly as it was written — `background_loop_died` within the
+    /// minute, then `capability_judgement_overdue` for every reader still asking
+    /// a question the verdict stopped answering (2026-11-03: both declared
+    /// capabilities died on the round they were started on, and their verdicts
+    /// froze at startup).
     pub fn start_all(&self, shutdown: cog_core::ShutdownSignal) {
         for (id, entry) in &self.entries {
             let entry = Arc::clone(entry);
             let cadence = entry.capability.cadence();
+            // 下一拍在多久之后。`EventDriven` 给不出这个数（它的声明就是「没有节拍」），
+            // 而能力是按节拍判的，所以那种声明只判一次、之后只等停机——照它自己声明的
+            // 意思办，不替它发明一个间隔。`period_secs()==0` 同时让 `background_loop_
+            // stalled` 不判它（规则要求 period>0），两处说的是同一件事。
+            let period = match cadence {
+                cog_core::loop_health::Cadence::Periodic(d) => Some(d),
+                cog_core::loop_health::Cadence::PeriodicWithWork { period, .. } => Some(period),
+                cog_core::loop_health::Cadence::EventDriven => None,
+            };
             // The name is bound here rather than built inside the call because
             // a loop name is a declaration, not an expression: the liveness
             // family selects by it, so it has to be one identifier a reader can
@@ -391,22 +409,40 @@ impl CapabilityLedger {
             // where the duplicate can still be reported instead of silently
             // sharing a series.
             let name = loop_name(id);
-            cog_core::loop_health::spawn(name, cadence, shutdown.clone(), move |_beat| {
+            let stop = shutdown.clone();
+            cog_core::loop_health::spawn(name, cadence, shutdown.clone(), move |beat| {
                 let entry = Arc::clone(&entry);
+                let stop = stop.clone();
                 async move {
-                    let verdict = entry.judge_once().await;
-                    match &verdict {
-                        Verdict::Ok => {}
-                        Verdict::Red(reason) => tracing::warn!(
-                            capability = entry.capability.id(),
-                            reason = %reason,
-                            "capability does not hold"
-                        ),
-                        Verdict::Unmeasured(reason) => tracing::warn!(
-                            capability = entry.capability.id(),
-                            reason = %reason,
-                            "capability could not be judged"
-                        ),
+                    loop {
+                        beat.beat();
+                        let verdict = entry.judge_once().await;
+                        match &verdict {
+                            Verdict::Ok => {}
+                            Verdict::Red(reason) => tracing::warn!(
+                                capability = entry.capability.id(),
+                                reason = %reason,
+                                "capability does not hold"
+                            ),
+                            Verdict::Unmeasured(reason) => tracing::warn!(
+                                capability = entry.capability.id(),
+                                reason = %reason,
+                                "capability could not be judged"
+                            ),
+                        }
+                        // 等到下一拍，或者等到停机——先到的那个决定这一段怎么结束。
+                        // 停机走 return：那是所有者要的结束，不是这条环自己死掉，所以
+                        // 死亡计数不记它。
+                        match period {
+                            Some(period) => tokio::select! {
+                                _ = tokio::time::sleep(period) => {}
+                                _ = stop.wait() => return,
+                            },
+                            None => {
+                                stop.wait().await;
+                                return;
+                            }
+                        }
                     }
                 }
             });
