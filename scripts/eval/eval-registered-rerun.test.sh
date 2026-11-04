@@ -115,8 +115,12 @@ out=$(bash "$SCRIPT" --dry-run "$TMP/nope" 2>&1); rc=$?
 #    进去，部署器按设计扣住不动，连续两轮 mainline 一个 rev 都没上去。所以只改一边必须红。
 REPO="${COGNEVA_REPO:-$(cd "$HERE/../.." && pwd)}"
 VALUES="$REPO/deploy/helm/cogneva/values.yaml"
+pod_rendered=1
 bash "$SCRIPT" --print-pod >"$TMP/pod.yaml" 2>"$TMP/pod.err"; rc=$?
 if [ "$rc" -ne 0 ]; then
+  # 清单没渲染出来时 pod.yaml 里是那句错误本身，而第 8 格如果只判「文件在」就会拿这段
+  # 文本去喂 YAML——报出来的是 Python 的 TypeError，与真正的原因（清单没生成）无关。
+  pod_rendered=0
   bad "--print-pod 退 $rc，拿不到清单（$(head -1 "$TMP/pod.err")）"
 elif [ ! -f "$VALUES" ]; then
   bad "找不到 chart values：$VALUES（用 COGNEVA_REPO 指路）"
@@ -183,7 +187,7 @@ fi
 #    main-table row」——判词一直是对的，命令行却一直没改，于是轮次再多也进不了表。
 #    这一条同时钉住两件事：臂选对了，且钉住的镜像**含 HLE 工具面那一笔**（缺了它，
 #    `--tools platform` 会因为「hle 没有工具实现」整跑 bail，比诊断臂退得更早）。
-if [ -f "$TMP/pod.yaml" ]; then
+if [ "${pod_rendered:-0}" -eq 1 ]; then
   arm=$(python3 - "$TMP/pod.yaml" <<'PY' 2>&1
 import sys, yaml
 pod = yaml.safe_load(open(sys.argv[1]))

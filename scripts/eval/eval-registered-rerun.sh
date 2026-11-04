@@ -301,10 +301,6 @@ dry_run() {
 
 if [ -n "$DRY_RUN" ]; then dry_run "$DRY_RUN"; exit $?; fi
 
-# 前置条件问不出来就判 3，别让它跑成一串「0 例」。
-$KUBECTL -n "$NAMESPACE" auth can-i create pods >/dev/null 2>&1 || { log "cannot ask the cluster whether pods may be created"; exit 3; }
-[ -f "$CKPT" ] || [ "$(judged)" = 0 ] || { log "the checkpoint cannot be read: $CKPT"; exit 3; }
-
 # 一条 Pod：与登记跑法逐字相同的参数，只换 pod 名与镜像 tag（登记里写明这两样不属于跑法）。
 manifest() {
   cat <<EOF
@@ -350,6 +346,13 @@ EOF
 
 # 打印就到此为止：下面每一行都会连集群。
 if [ -n "$PRINT_POD" ]; then manifest "${PRINT_POD_NAME:-eval-registered-rerun-shape}"; exit 0; fi
+
+# 前置条件问不出来就判 3，别让它跑成一串「0 例」。
+# 这一段排在 `--print-pod` **之后**：打印清单是纯渲染，不连集群，也不读检查点。
+# 排在前面时，任何一台没有集群的机器（CI、刚克隆下来读形状的人）拿到的都是 3，
+# 而不是那份清单——判据看起来最严，实际把这个功能关在了只有集群机器上。
+$KUBECTL -n "$NAMESPACE" auth can-i create pods >/dev/null 2>&1 || { log "cannot ask the cluster whether pods may be created"; exit 3; }
+[ -f "$CKPT" ] || [ "$(judged)" = 0 ] || { log "the checkpoint cannot be read: $CKPT"; exit 3; }
 
 deadline=$(( $(date +%s) + HORIZON ))
 log "start image=$IMAGE deployed=$(deployed_rev) out=$OUT target=$TARGET judged=$(judged)"
