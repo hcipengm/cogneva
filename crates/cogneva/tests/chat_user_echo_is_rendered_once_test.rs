@@ -65,7 +65,7 @@ fn server_sends_the_echo_as_a_delta(source: &str) -> Option<String> {
 
     // 第四个实参就是这句话的正文。
     let payload = delta_args.get(3)?;
-    payload.contains("content").then(|| id)
+    payload.contains("content").then_some(id)
 }
 
 /// 这个函数收的那一句，确实是调用方传进来的那句话。
