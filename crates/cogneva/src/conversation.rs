@@ -15,7 +15,10 @@ use std::sync::Arc;
 // 工具表的写入方法在 `cog_core` 的契约 trait 上，实现是内核的注册表：两个同名，
 // 这里要的是前者的方法，实现按后者取。
 use cog_core::contract::tool::{Tool, ToolHandler, ToolImplementation, ToolRegistry as _};
-use cog_core::{AgentEvent, OrchestratorControl, RuntimeConfig, SFError, SFResult};
+use cog_core::{
+    AgentEvent, AuditKind, AuditStream, HierarchyManager, OrchestratorControl, QuotaContext,
+    RuntimeConfig, SFError, SFResult,
+};
 use cog_gateway::chat::{ConversationRequest, ConversationTurn};
 
 /// 这段对话的角色名。它出现在运行清点与日志里；真正落到账上的 actor 是
@@ -42,11 +45,26 @@ const LIST_TASKS_DEFAULT: usize = 20;
 /// 装配层交给网关的那条循环：一轮对话就是内核的一次运行。
 pub struct PlatformConversation {
     orchestrator: Arc<dyn OrchestratorControl>,
+    /// 派活之前要过的那道准入。与 HTTP 提交面读的是同一个管理器、同一份估值：
+    /// 少这一道，一个人今天用光的额度只挡得住 HTTP，挡不住界面上的一句话，
+    /// 而两者要的是同一份钱。
+    admission: Option<Arc<dyn HierarchyManager>>,
+    /// 拒绝也要落一条。提交面拒单时写 `AuditKind::QuotaEnforcement`；界面上
+    /// 同一句话被同一条规则挡住却不写，账上就只剩「有人今天没派活」。
+    audit: Option<Arc<dyn AuditStream>>,
 }
 
 impl PlatformConversation {
-    pub fn new(orchestrator: Arc<dyn OrchestratorControl>) -> Self {
-        Self { orchestrator }
+    pub fn new(
+        orchestrator: Arc<dyn OrchestratorControl>,
+        admission: Option<Arc<dyn HierarchyManager>>,
+        audit: Option<Arc<dyn AuditStream>>,
+    ) -> Self {
+        Self {
+            orchestrator,
+            admission,
+            audit,
+        }
     }
 }
 
@@ -64,7 +82,12 @@ impl ConversationTurn for PlatformConversation {
                 ..Default::default()
             };
             let tools = cog_agent::ToolRegistry::new();
-            for tool in control_plane_tools(self.orchestrator.clone()) {
+            for tool in control_plane_tools(
+                self.orchestrator.clone(),
+                self.admission.clone(),
+                self.audit.clone(),
+                request.owner.clone(),
+            ) {
                 tools.register(tool);
             }
             let mut runtime = cog_agent::AgentRuntime::new(config, events)
@@ -184,9 +207,15 @@ impl ControlPlaneOp {
     }
 
     /// 这一项装成内核认的工具：名字、说明、参数结构，以及那个一定存在的执行分支。
-    fn tool(self, orchestrator: Arc<dyn OrchestratorControl>) -> Tool {
+    fn tool(
+        self,
+        orchestrator: Arc<dyn OrchestratorControl>,
+        admission: Option<Arc<dyn HierarchyManager>>,
+        audit: Option<Arc<dyn AuditStream>>,
+        owner: String,
+    ) -> Tool {
         let handler = match self {
-            ControlPlaneOp::DispatchGoal => dispatch_handler(orchestrator),
+            ControlPlaneOp::DispatchGoal => dispatch_handler(orchestrator, admission, audit, owner),
             ControlPlaneOp::ListTasks => list_handler(orchestrator),
             ControlPlaneOp::GetTask => get_handler(orchestrator),
             ControlPlaneOp::RetryTask => retry_handler(orchestrator),
@@ -202,10 +231,22 @@ impl ControlPlaneOp {
 }
 
 /// 这段对话的工具集。
-fn control_plane_tools(orchestrator: Arc<dyn OrchestratorControl>) -> Vec<Tool> {
+fn control_plane_tools(
+    orchestrator: Arc<dyn OrchestratorControl>,
+    admission: Option<Arc<dyn HierarchyManager>>,
+    audit: Option<Arc<dyn AuditStream>>,
+    owner: String,
+) -> Vec<Tool> {
     CONTROL_PLANE
         .iter()
-        .map(|op| op.tool(orchestrator.clone()))
+        .map(|op| {
+            op.tool(
+                orchestrator.clone(),
+                admission.clone(),
+                audit.clone(),
+                owner.clone(),
+            )
+        })
         .collect()
 }
 
@@ -226,11 +267,96 @@ fn require_str<'a>(args: &'a serde_json::Value, key: &str) -> SFResult<&'a str> 
         .ok_or_else(|| SFError::Validation(format!("{key} 不能为空")))
 }
 
-fn dispatch_handler(orchestrator: Arc<dyn OrchestratorControl>) -> ToolHandler {
+/// 派活之前的那道准入，与 HTTP 提交面同一条：同一个 5 级配额管理器、同一份
+/// 估值口径（[`cog_gateway::tasks::estimated_goal_tokens`]）。
+///
+/// 拦住时回一句给人看的话，不回错误：拒绝是这一轮的结果，模型该把它说出来，
+/// 而不是把同一次派发重试一遍。没有配额管理器时放行——与提交面一致，「没人配过
+/// 上限」不等于「谁都不许提交」。
+async fn admission_refusal(
+    admission: Option<&Arc<dyn HierarchyManager>>,
+    owner: &str,
+    goal: &str,
+) -> Option<QuotaRefusal> {
+    let hierarchy = admission?;
+    let context = QuotaContext {
+        // 没有身份的连接不编一个人：编出来的名字会把这次提交记到别人头上。
+        user_id: (!owner.is_empty()).then(|| owner.to_string()),
+        workspace_id: None,
+        team_id: None,
+        organization_id: None,
+        global_id: None,
+    };
+    let estimated = cog_gateway::tasks::estimated_goal_tokens(goal, 0);
+    let decision = hierarchy.check(&context, estimated).await;
+    if decision.allowed {
+        return None;
+    }
+    Some(QuotaRefusal {
+        estimated,
+        blocked_by: decision.blocked_by.len(),
+    })
+}
+
+/// 一次被准入挡下的派活。它带着读数，因为写入账面的那条要落同样的两个数。
+struct QuotaRefusal {
+    estimated: u64,
+    blocked_by: usize,
+}
+
+impl QuotaRefusal {
+    fn sentence(&self) -> String {
+        format!(
+            "今天的额度不够这一次提交：估计要 {} token，被 {} 层上限挡住。\
+             等额度恢复再提交，或请管理员调整上限。",
+            self.estimated, self.blocked_by
+        )
+    }
+}
+
+/// 被挡下的这一次写进审计链：与提交面同一个 kind、同一个动作名，目标号那一栏
+/// 是 `-`——这一次根本没有目标，编一个 id 会让账上的拒绝看起来像一次派发。
+async fn record_refusal(audit: Option<&Arc<dyn AuditStream>>, owner: &str, refusal: &QuotaRefusal) {
+    let Some(stream) = audit else { return };
+    let _ = stream
+        .append(
+            AuditKind::QuotaEnforcement,
+            if owner.is_empty() { "anonymous" } else { owner },
+            "-",
+            "quota.dispatch_rejected",
+            serde_json::json!({
+                "surface": "web_chat",
+                "estimated_tokens": refusal.estimated,
+                "blocked_by": refusal.blocked_by,
+            }),
+        )
+        .await;
+}
+
+fn dispatch_handler(
+    orchestrator: Arc<dyn OrchestratorControl>,
+    admission: Option<Arc<dyn HierarchyManager>>,
+    audit: Option<Arc<dyn AuditStream>>,
+    owner: String,
+) -> ToolHandler {
     native(move |args| {
         let orchestrator = orchestrator.clone();
+        let admission = admission.clone();
+        let audit = audit.clone();
+        let owner = owner.clone();
         async move {
             let goal = require_str(&args, "goal")?.to_string();
+            if let Some(refusal) = admission_refusal(admission.as_ref(), &owner, &goal).await {
+                // 与提交面同一格：拒绝写 `QuotaEnforcement`，目标号那一栏是
+                // `-`——这一次根本没有目标，编一个 id 会让账上的拒绝看起来像
+                // 一次派发。
+                record_refusal(audit.as_ref(), &owner, &refusal).await;
+                return Ok(serde_json::json!({
+                    "status": "refused",
+                    "reason": refusal.sentence(),
+                    "note": "这一次没有派出去，也没有目标号。把原因说给用户听，不要重试同一次提交"
+                }));
+            }
             let goal_id = uuid::Uuid::new_v4().to_string();
             let row = cog_core::Task::goal_row(goal_id.clone(), &goal);
             // 分解是异步的（规划要几十秒），所以这一条不在工具调用里等：把目标号交
@@ -398,5 +524,145 @@ mod tests {
     #[test]
     fn the_chat_is_recorded_under_an_actor_the_ledger_declares() {
         assert!(cog_gateway::actor_labels::declared(WEB_CHAT_ACTOR));
+    }
+
+    /// 一个只剩硬上限的管理器：每一级都已经用完。
+    struct Exhausted;
+
+    #[async_trait::async_trait]
+    impl HierarchyManager for Exhausted {
+        async fn check(&self, _ctx: &QuotaContext, _tokens: u64) -> cog_core::HierarchyDecision {
+            let blocked = cog_core::ScopeStatus {
+                scope: cog_core::QuotaScope::User,
+                target_id: "someone".into(),
+                remaining: 0,
+                used_today: 1_000_000,
+                limits: cog_core::QuotaLimits::new(1_000_000, 1_000_000),
+                blocking: true,
+                warning: false,
+            };
+            cog_core::HierarchyDecision {
+                allowed: false,
+                warnings: Vec::new(),
+                blocked_by: vec![blocked.clone()],
+                scopes: vec![blocked],
+            }
+        }
+
+        async fn set_used(
+            &self,
+            _scope: cog_core::QuotaScope,
+            _target_id: &str,
+            _tokens: u64,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn history(
+            &self,
+            _scope: cog_core::QuotaScope,
+            _target_id: &str,
+            _days: u32,
+        ) -> SFResult<Vec<cog_core::UsageHistoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn limits(
+            &self,
+            _scope: cog_core::QuotaScope,
+            _target_id: &str,
+        ) -> SFResult<Option<cog_core::QuotaLimits>> {
+            Ok(None)
+        }
+
+        async fn set_limits(
+            &self,
+            _scope: cog_core::QuotaScope,
+            _target_id: &str,
+            _limits: cog_core::QuotaLimits,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+
+        async fn clear_limits(
+            &self,
+            _scope: cog_core::QuotaScope,
+            _target_id: &str,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 额度用尽时，界面上的一句话也派不出去——与 HTTP 提交面同一个答案。
+    ///
+    /// 不加这一道，同一个人今天在 HTTP 上已经提交不了，在聊天框里却还能派；
+    /// 而两条路要的是同一份钱，账上看得出来，准入上却看不见。
+    #[tokio::test]
+    async fn a_dispatch_over_the_day_s_quota_is_refused_before_it_reaches_the_orchestrator() {
+        let admission: Arc<dyn HierarchyManager> = Arc::new(Exhausted);
+        let refusal = admission_refusal(Some(&admission), "someone", "把首页的颜色改一下")
+            .await
+            .expect("额度用尽时必须拒绝");
+        let sentence = refusal.sentence();
+        assert!(sentence.contains("额度"), "{sentence}");
+    }
+
+    /// 一条只记不读的审计流，用来数拒绝有没有落账。
+    #[derive(Default)]
+    struct RecordingAudit(std::sync::Mutex<Vec<(AuditKind, String, String, String)>>);
+
+    #[async_trait::async_trait]
+    impl AuditStream for RecordingAudit {
+        async fn append(
+            &self,
+            kind: AuditKind,
+            actor: &str,
+            target: &str,
+            action: &str,
+            _detail: serde_json::Value,
+        ) -> SFResult<cog_core::AuditEvent> {
+            self.0.lock().unwrap().push((
+                kind,
+                actor.to_string(),
+                target.to_string(),
+                action.to_string(),
+            ));
+            Err(SFError::Internal("只记不读".into()))
+        }
+
+        async fn read_all(&self) -> SFResult<Vec<cog_core::AuditEvent>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// 被挡下的派活要在审计链上留一条：提交面拒单写的那一格，界面同样写。
+    ///
+    /// 不写的话，同一条规则在两个入口上一个留痕一个不留——账上只看得见「今天
+    /// 有人没派活」，看不出是被额度挡下的。
+    #[tokio::test]
+    async fn a_refused_dispatch_leaves_the_same_audit_row_the_submit_face_writes() {
+        let audit = Arc::new(RecordingAudit::default());
+        let refusal = QuotaRefusal {
+            estimated: 128,
+            blocked_by: 1,
+        };
+        let stream: Arc<dyn AuditStream> = audit.clone();
+        record_refusal(Some(&stream), "someone", &refusal).await;
+
+        let rows = audit.0.lock().unwrap();
+        assert_eq!(rows.len(), 1, "拒绝没有落账");
+        let (kind, actor, target, action) = &rows[0];
+        assert_eq!(*kind, AuditKind::QuotaEnforcement);
+        assert_eq!(actor, "someone");
+        assert_eq!(target, "-", "这一次没有目标，账上不该编一个 id");
+        assert_eq!(action, "quota.dispatch_rejected");
+    }
+
+    /// 没人配过上限时不拦：与提交面一致，「没人管」不等于「谁都不许提交」。
+    #[tokio::test]
+    async fn a_dispatch_without_a_quota_manager_is_not_refused() {
+        assert!(admission_refusal(None, "someone", "把首页的颜色改一下")
+            .await
+            .is_none());
     }
 }

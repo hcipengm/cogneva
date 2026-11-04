@@ -121,6 +121,55 @@ fn the_slot_is_published_empty_before_plugins_start_and_filled_after() {
     );
 }
 
+/// 界面上派活的那一道准入，与 HTTP 提交面是同一条。
+///
+/// 少这一道，同一个人今天在提交面上已经提交不了了，在聊天框里却还能派——两条
+/// 路要的是同一份钱，账上看得出来，准入上却看不见。估值也必须读同一条规则：
+/// 各写一条除法，两处对同一句话给出不同的数，被挡住的那一侧就说不清为什么。
+#[test]
+fn a_dispatch_from_the_chat_asks_the_same_quota_as_the_submit_face() {
+    let text = source(ASSEMBLY);
+
+    assert!(
+        text.contains("HierarchyManager"),
+        "装配层没有拿配额管理器：界面上派活是一道没人看的门"
+    );
+    let check = text
+        .find("admission_refusal(")
+        .expect("装配层没有在派活前过准入");
+    let submit = text
+        .find("submit_goal_auto(")
+        .expect("装配层不再直接提交目标，这条判据失去锚");
+    assert!(
+        check < submit,
+        "准入必须挡在提交之前：放在后面就只是先派出去再问一句能不能派"
+    );
+    assert!(
+        text.contains("cog_gateway::tasks::estimated_goal_tokens"),
+        "估值不是那条共享规则：两处各写一条除法，同一句话会得到两个数"
+    );
+    // 拒绝同样要落账：提交面写的那一格，界面这一侧也写。少这一条，同一条规则
+    // 在两个入口上一个留痕一个不留。
+    assert!(
+        text.contains("AuditKind::QuotaEnforcement"),
+        "界面上的拒绝没有写进审计链：账上只看得见「今天有人没派活」"
+    );
+    assert!(
+        text.contains("quota.dispatch_rejected"),
+        "拒绝的动作名不是与提交面同一族（`quota.*`），读账的人会把两处当成两件事"
+    );
+
+    let boot = source(BOOT);
+    assert!(
+        boot.contains("consume_service::<dyn cog_core::HierarchyManager>()"),
+        "装配根没有把配额管理器交给这段对话：准入拿不到管理器，就只会放行"
+    );
+    assert!(
+        boot.contains("consume_service::<dyn cog_core::AuditStream>()"),
+        "装配根没有把审计流交给这段对话：拒绝会静默丢掉"
+    );
+}
+
 #[test]
 fn the_one_tool_that_changes_the_system_is_dispatch() {
     let text = source(ASSEMBLY);

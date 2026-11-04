@@ -512,13 +512,21 @@ pub struct TaskSummary {
 
 /// 估算一次 goal 提交的 token 规模：goal 文本 + 各 task input 序列化长度 / 4。
 fn estimate_goal_tokens(req: &CreateTaskRequest) -> u64 {
-    let mut chars = req.goal.len();
-    if let Some(ref items) = req.tasks {
-        for item in items {
-            chars += item.input.to_string().len();
-        }
-    }
-    ((chars / 4) as u64).max(1)
+    let payload_chars: usize = req
+        .tasks
+        .as_ref()
+        .map(|items| items.iter().map(|item| item.input.to_string().len()).sum())
+        .unwrap_or(0);
+    estimated_goal_tokens(&req.goal, payload_chars)
+}
+
+/// 上面那条估算规则本身，按「一句话 + 它带的载荷有多长」取。
+///
+/// 界面上那句对话派活时走的是同一条准入（同一份 5 级配额、同一份估值口径），
+/// 只是它手里没有 `CreateTaskRequest`：把规则放这里，两处读的是同一个数，
+/// 而不是各写一条除法。
+pub fn estimated_goal_tokens(goal: &str, payload_chars: usize) -> u64 {
+    (((goal.len() + payload_chars) / 4) as u64).max(1)
 }
 
 /// 把一次提交展开成进 DAG 的初始任务。

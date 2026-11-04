@@ -208,9 +208,17 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     // 填不上就明说——界面据此回答「还没接上」，而不是让网关自己另跑一条循环。
     match ctx.consume_service::<dyn cog_core::OrchestratorControl>() {
         Some(orchestrator) => {
+            // 派活要过的那道准入：与 HTTP 提交面同一个管理器。没人配过上限时它
+            // 本来就是 `Option::None`，那时提交面也放行，两处读的是同一个答案。
+            let admission = ctx.consume_service::<dyn cog_core::HierarchyManager>();
+            // 拒绝也要落一条，和提交面同一格。审计流同样是可选服务：没装它的
+            // 进程本来也不写账，这里不替它编一条。
+            let audit = ctx.consume_service::<dyn cog_core::AuditStream>();
             if conversation
                 .set(Arc::new(crate::conversation::PlatformConversation::new(
                     orchestrator,
+                    admission,
+                    audit,
                 )))
                 .is_err()
             {
