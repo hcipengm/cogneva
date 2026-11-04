@@ -228,7 +228,15 @@ export function QuotaLimitsPanel() {
                           {row.id}
                         </Note>
                       </td>
-                      <td className="py-0.5 pr-3 text-right">{row.tokens.toLocaleString()}</td>
+                      {/* soft 是「先提醒、还放行」的那条线，跨过它现在只留一行日志，
+                          日志随 Pod 消失。把这件事画在读数上：运维在这一列才看得见
+                          「谁已经进了余量，hard 之前只剩这么点」。 */}
+                      <td className="py-0.5 pr-3 text-right">
+                        <div>{row.tokens.toLocaleString()}</div>
+                        {row.soft_limit !== null && row.tokens >= row.soft_limit && (
+                          <div className="text-[10px] text-[var(--warn)]">越过 soft</div>
+                        )}
+                      </td>
                       {/* 花销为零、拒绝数不为零的一行，正是这一面存在的理由：那个人
                           今天每一发都被自己那格上限挡下了，花销排行里只有他一个零。 */}
                       <td
@@ -253,6 +261,7 @@ export function QuotaLimitsPanel() {
                   : '这个部署没有上限库，读不到任何一格声明过的上限；这一列的空值是「读不到」，不是「没人配过」。'}
                 {' '}
                 「今天被拒」只数被这一格自己的上限挡下的调用：花销为零而这一列不为零，就是今天每一发都被挡了；任务预算用尽是另一堵墙，不记在这里。
+                「越过 soft」是这一格今天已经进了 soft 与 hard 之间那截余量——调用仍然放行，但它就是 hard 之前最后一次提醒。
               </p>
             </>
           )}
