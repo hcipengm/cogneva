@@ -5080,45 +5080,6 @@ fn token_kind_readings(row: &cog_core::UpstreamActorSpend) -> [(&'static str, Op
     ]
 }
 
-#[cfg(test)]
-mod token_kind_readings_tests {
-    use super::*;
-
-    fn row(cache_created: Option<u64>) -> cog_core::UpstreamActorSpend {
-        cog_core::UpstreamActorSpend {
-            upstream: "https://upstream.invalid/v1|m".into(),
-            api_style: "anthropic".into(),
-            actor: "agent:generator".into(),
-            input: 100,
-            output: 10,
-            cached: 40,
-            cache_created,
-        }
-    }
-
-    /// 没量到的写半格（`None`）不出序列。
-    ///
-    /// 这条盯的是「写 0」的形状：`cache_created` 只有部分协议面会报，没报的格子
-    /// 如果被写成一个 0，读数面就会说「上游写了零字节」，而真实情况是「没人说过」。
-    /// 前者指向前缀不稳定，后者指向请求没带断点——两个修法相反，读数面必须分得开。
-    #[test]
-    fn a_cell_nobody_measured_writes_no_series() {
-        let kinds = token_kind_readings(&row(None));
-        assert_eq!(kinds[3], ("cache_created", None));
-        assert!(
-            kinds[..3].iter().all(|(_, v)| v.is_some()),
-            "三个总量永远有读数：它们是从账本求和得来的"
-        );
-    }
-
-    /// 量到的 0 是一个读数，照写。
-    #[test]
-    fn a_measured_zero_is_still_written() {
-        let kinds = token_kind_readings(&row(Some(0)));
-        assert_eq!(kinds[3], ("cache_created", Some(0)));
-    }
-}
-
 /// 逐上游各算一份，池级那份只是把它们相加得到的报表：额度不是一份，能力也不是
 /// 一份，用一家的尺子关掉另一家，就是把"没量到"读成"没有"。
 async fn refresh_window_pace(state: &AppState, readings: &[UpstreamReading]) -> WindowPaceReading {
@@ -18672,5 +18633,44 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["error"], "task_id_required");
+    }
+}
+
+#[cfg(test)]
+mod token_kind_readings_tests {
+    use super::*;
+
+    fn row(cache_created: Option<u64>) -> cog_core::UpstreamActorSpend {
+        cog_core::UpstreamActorSpend {
+            upstream: "https://upstream.invalid/v1|m".into(),
+            api_style: "anthropic".into(),
+            actor: "agent:generator".into(),
+            input: 100,
+            output: 10,
+            cached: 40,
+            cache_created,
+        }
+    }
+
+    /// 没量到的写半格（`None`）不出序列。
+    ///
+    /// 这条盯的是「写 0」的形状：`cache_created` 只有部分协议面会报，没报的格子
+    /// 如果被写成一个 0，读数面就会说「上游写了零字节」，而真实情况是「没人说过」。
+    /// 前者指向前缀不稳定，后者指向请求没带断点——两个修法相反，读数面必须分得开。
+    #[test]
+    fn a_cell_nobody_measured_writes_no_series() {
+        let kinds = token_kind_readings(&row(None));
+        assert_eq!(kinds[3], ("cache_created", None));
+        assert!(
+            kinds[..3].iter().all(|(_, v)| v.is_some()),
+            "三个总量永远有读数：它们是从账本求和得来的"
+        );
+    }
+
+    /// 量到的 0 是一个读数，照写。
+    #[test]
+    fn a_measured_zero_is_still_written() {
+        let kinds = token_kind_readings(&row(Some(0)));
+        assert_eq!(kinds[3], ("cache_created", Some(0)));
     }
 }
