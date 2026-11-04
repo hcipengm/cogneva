@@ -247,6 +247,61 @@ fn raise_after_a_deadline_cut(task: &mut Task) {
     }
 }
 
+/// One lane's share of what a stall sweep did.
+///
+/// The three totals used to be one number per sweep, and a sweep reads every
+/// queue this deployment serves: a repair row starving in the priority lane and
+/// an ordinary row starving in the shared lane added up to the same reading.
+/// The repair is what makes a row wait again, so a total that cannot say which
+/// lane it came from cannot say which lane is starving -- the question the
+/// count exists to answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LaneTally {
+    reclaimed: usize,
+    with_backlog: usize,
+    deferred: usize,
+}
+
+impl LaneTally {
+    fn is_empty(self) -> bool {
+        self.reclaimed == 0 && self.with_backlog == 0 && self.deferred == 0
+    }
+}
+
+/// Flatten one sweep's per-lane tallies into the cells it writes.
+///
+/// Kept pure and separate from the recorder so the attribution can be read
+/// without a metrics backend: a lane appears once per cell it has a non-zero
+/// count in, and the order is the lane order (names are `&'static str` from a
+/// closed set), so the same sweep always writes the same cells in the same
+/// order.
+fn stalled_cells(
+    tallies: &std::collections::BTreeMap<&'static str, LaneTally>,
+) -> Vec<(cog_core::MetricName, &'static str, usize)> {
+    let mut cells = Vec::new();
+    for (lane, tally) in tallies {
+        for (name, count) in [
+            (
+                cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED,
+                tally.reclaimed,
+            ),
+            (
+                cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG,
+                tally.with_backlog,
+            ),
+            (
+                cog_core::metric_names::DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG,
+                tally.deferred,
+            ),
+        ] {
+            if count > 0 {
+                cells.push((name, *lane, count));
+            }
+        }
+    }
+    cells
+}
+
 impl DagExecutor {
     pub fn new(workspace_id: String) -> Self {
         Self {
@@ -327,54 +382,43 @@ impl DagExecutor {
     /// So this total cannot say whether the repair worked: being re-armed is
     /// what the repair does either way. The reading that does say so is the
     /// charge's absence — a re-armed task keeps the `retry_count` it had.
+    ///
+    /// Each cell carries the lane it happened in. Without that label a repair
+    /// row that is scheduled and reclaimed, sweep after sweep, on the priority
+    /// lane is the same number as ordinary work waiting on the shared lane --
+    /// and the two want opposite responses: one is a priority that is not
+    /// being honoured, the other is a pool that is short.
     async fn record_stalled_scheduled_reclaimed(
         &self,
-        reclaimed: usize,
-        reclaimed_with_backlog: usize,
-        deferred: usize,
+        tallies: &std::collections::BTreeMap<&'static str, LaneTally>,
     ) {
-        if reclaimed == 0 && reclaimed_with_backlog == 0 && deferred == 0 {
+        if tallies.values().all(|tally| tally.is_empty()) {
             return;
         }
         let Some(backend) = self.metrics_backend() else {
             tracing::debug!(
-                reclaimed,
-                reclaimed_with_backlog,
-                deferred,
+                tallies = ?tallies,
                 "reclaimed stalled scheduled tasks; no metrics backend attached"
             );
             return;
         };
-        // Three cells, recorded together: `reclaimed` counts the repair's
-        // ordinary work, `with_backlog` the rows it took back although their
-        // queue still held undelivered entries (the wait ran out of credit),
-        // and `deferred` the rows it left alone because that queue still held
-        // them. Separate totals, because one total cannot tell a drain from a
-        // loss -- and the loss is the case this sweep exists for.
-        for (name, count) in [
-            (
-                cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED,
-                reclaimed,
-            ),
-            (
-                cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG,
-                reclaimed_with_backlog,
-            ),
-            (
-                cog_core::metric_names::DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG,
-                deferred,
-            ),
-        ] {
-            if count == 0 {
-                continue;
-            }
-            if let Err(e) = backend
-                .record_counter(name, count as f64, HashMap::new())
-                .await
-            {
+        // Three cells per lane, recorded together: `reclaimed` counts the
+        // repair's ordinary work, `with_backlog` the rows it took back although
+        // their queue still held undelivered entries (the wait ran out of
+        // credit), and `deferred` the rows it left alone because that queue
+        // still held them. Separate cells, because one cell cannot tell a drain
+        // from a loss -- and the loss is the case this sweep exists for. The
+        // lane label separates the two queues a sweep reads, which the cells
+        // alone cannot: the same repair row reclaimed from the priority lane and
+        // from the shared lane are the same number until it is there.
+        for (name, lane, count) in stalled_cells(tallies) {
+            let mut labels = HashMap::new();
+            labels.insert(crate::LABEL_STREAM.to_string(), lane.to_string());
+            if let Err(e) = backend.record_counter(name, count as f64, labels).await {
                 tracing::warn!(
                     error = %e,
                     series = name.as_str(),
+                    lane,
                     "cannot record the stalled-scheduled reclaim count"
                 );
             }
@@ -464,9 +508,13 @@ impl DagExecutor {
         let stall_before = chrono::Utc::now() - chrono::Duration::seconds(stall_after_secs as i64);
         let stalled = self.find_stalled_scheduled_tasks(stall_before).await;
         let mut reclaimed = 0usize;
-        let mut reclaimed_with_backlog = 0usize;
         let mut unserved = 0usize;
         let mut deferred = 0usize;
+        // Keyed by lane, not by stream name: the reading exists to say which
+        // queue is starving, and the stream name carries the workspace while the
+        // lane is the closed set a reader can group on.
+        let mut lanes: std::collections::BTreeMap<&'static str, LaneTally> =
+            std::collections::BTreeMap::new();
         let now = chrono::Utc::now();
         for task in stalled {
             let stream = crate::ready_queue::ready_stream_for(&task, &self.workspace_id);
@@ -474,6 +522,7 @@ impl DagExecutor {
                 unserved += 1;
                 continue;
             }
+            let lane = crate::ready_queue::stream_kind(&stream, &self.workspace_id);
             // `None` (no reading, or a transport that cannot say) keeps the
             // ordinary path: silence is not evidence of a backlog.
             let lag = undelivered.get(&stream).copied().flatten();
@@ -486,6 +535,7 @@ impl DagExecutor {
                 // because nothing could run it is not a queue nobody reads.
                 if pool_declares_unavailable || age_secs < cap_secs {
                     deferred += 1;
+                    lanes.entry(lane).or_default().deferred += 1;
                     continue;
                 }
             }
@@ -495,8 +545,10 @@ impl DagExecutor {
             match self.reclaim_one_stalled(&task.id, error).await {
                 Ok(true) => {
                     reclaimed += 1;
+                    let tally = lanes.entry(lane).or_default();
+                    tally.reclaimed += 1;
                     if has_backlog {
-                        reclaimed_with_backlog += 1;
+                        tally.with_backlog += 1;
                     }
                 }
                 Ok(false) => {}
@@ -522,8 +574,7 @@ impl DagExecutor {
                 "tasks stayed in Scheduled because their ready stream still reports undelivered entries"
             );
         }
-        self.record_stalled_scheduled_reclaimed(reclaimed, reclaimed_with_backlog, deferred)
-            .await;
+        self.record_stalled_scheduled_reclaimed(&lanes).await;
         reclaimed
     }
 
@@ -4526,9 +4577,19 @@ mod tests {
         );
     }
 
-    /// 记下每一次计数的序列名：断言的是「这条曲线被记过没有」，不是内部原子。
+    /// 一次计数：序列名、值、以及它带来的标签。
+    ///
+    /// 标签要留着，因为「记过没有」之外还有一问——这一笔算在谁头上。把标签
+    /// 丢掉的记录器只能证明某个总数动过，证明不了动的那个是不是该动的。
+    struct Recorded {
+        name: &'static str,
+        value: f64,
+        labels: HashMap<String, String>,
+    }
+
+    /// 记下每一次计数：断言的是「这条曲线被记过没有、带没带 lane」，不是内部原子。
     #[derive(Default)]
-    struct RecordingMetrics(std::sync::Mutex<Vec<&'static str>>);
+    struct RecordingMetrics(std::sync::Mutex<Vec<Recorded>>);
 
     impl RecordingMetrics {
         fn recorded(&self, name: cog_core::MetricName) -> usize {
@@ -4536,8 +4597,34 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|recorded| **recorded == name.as_str())
+                .filter(|recorded| recorded.name == name.as_str())
                 .count()
+        }
+
+        /// 某条曲线的每一次写入，形如 `(lane, 值)`，按 lane 排好。
+        ///
+        /// 没带 `stream` 标签的记在空串上：那正是要和「带着某个 lane」区分开的
+        /// 形状，读它的人不该因为它缺席就跳过。
+        fn cells(&self, name: cog_core::MetricName) -> Vec<(String, f64)> {
+            let mut cells: Vec<(String, f64)> = self
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|recorded| recorded.name == name.as_str())
+                .map(|recorded| {
+                    (
+                        recorded
+                            .labels
+                            .get(crate::LABEL_STREAM)
+                            .cloned()
+                            .unwrap_or_default(),
+                        recorded.value,
+                    )
+                })
+                .collect();
+            cells.sort_by(|a, b| a.0.cmp(&b.0));
+            cells
         }
     }
 
@@ -4554,10 +4641,14 @@ mod tests {
         async fn record_counter(
             &self,
             name: cog_core::MetricName,
-            _value: f64,
-            _labels: HashMap<String, String>,
+            value: f64,
+            labels: HashMap<String, String>,
         ) -> SFResult<()> {
-            self.0.lock().unwrap().push(name.as_str());
+            self.0.lock().unwrap().push(Recorded {
+                name: name.as_str(),
+                value,
+                labels,
+            });
             Ok(())
         }
         async fn record_histogram(
@@ -6722,6 +6813,12 @@ mod tests {
             1,
             "a wait nobody counts is indistinguishable from a sweep that never ran"
         );
+        assert_eq!(
+            metrics.cells(cog_core::metric_names::DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG),
+            vec![("shared".to_string(), 1.0)],
+            "waiting is a fact about one queue; a total that cannot say which one \
+             reads the same for the priority lane and for ordinary work"
+        );
 
         // 积压排空的那一刻，同一个年龄就该被收回。
         undelivered.insert(stream, Some(0));
@@ -6734,6 +6831,80 @@ mod tests {
             metrics.recorded(cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG),
             0,
             "no backlog at the moment of the reclaim, so this one is the ordinary repair"
+        );
+    }
+
+    /// 同一次清扫读着两条队列：回收计数要按 lane 分开。
+    ///
+    /// 优先道上那条修复行被排上又被收回，与共享道上普通任务被排上又被收回，
+    /// 在只看总数的读数里是同一个数，而它们要的处置相反——前一个是优先级没被
+    /// 兑现，后一个是池子不够。判据：两笔同龄的停摆行，一笔在优先道、一笔在
+    /// 共享道，同一次清扫各记一笔，各带各的 lane。
+    #[tokio::test]
+    async fn a_reclaim_is_counted_against_the_lane_it_happened_in() {
+        let dag = DagExecutor::new("ws-stalled-lanes".into());
+        // 优先道上的那笔正是 CI 红派下来的修复行：输入里点名了这条通道。
+        let mut lane = Task::new(
+            "ci-red-fix",
+            TaskType::Custom("platform_issue_fix".into()),
+            serde_json::json!({ (cog_core::INPUT_READY_LANE): cog_core::READY_LANE_STOP_THE_LINE }),
+        );
+        lane.status = TaskStatus::Scheduled;
+        lane.updated_at = chrono::Utc::now() - chrono::Duration::minutes(30);
+        dag.add_task(lane).await.unwrap();
+        let mut ordinary = Task::new("ordinary", TaskType::LlmCall, serde_json::json!({}));
+        ordinary.status = TaskStatus::Scheduled;
+        ordinary.updated_at = chrono::Utc::now() - chrono::Duration::minutes(30);
+        dag.add_task(ordinary).await.unwrap();
+
+        let metrics = Arc::new(RecordingMetrics::default());
+        dag.attach_metrics(metrics.clone());
+        assert_eq!(sweep(&dag, 600, &served("ws-stalled-lanes", true)).await, 2);
+        assert_eq!(
+            metrics.cells(cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED),
+            vec![
+                ("shared".to_string(), 1.0),
+                ("stop_the_line".to_string(), 1.0)
+            ],
+            "一笔回收算在谁头上，只能由它排队的那条通道回答：两笔都记在同一个 \
+             lane 上（或者都不带 lane）时，优先道被饿死这件事在指标面读不到"
+        );
+    }
+
+    /// 没有可报的计数就不写格子：零值会凭空造出一条「量过」的曲线。
+    #[test]
+    fn a_lane_with_nothing_to_report_writes_no_cell() {
+        let mut tallies = std::collections::BTreeMap::new();
+        tallies.insert("shared", LaneTally::default());
+        tallies.insert(
+            "stop_the_line",
+            LaneTally {
+                reclaimed: 2,
+                with_backlog: 1,
+                deferred: 0,
+            },
+        );
+
+        let cells = stalled_cells(&tallies);
+        assert_eq!(
+            cells
+                .iter()
+                .map(|(name, lane, count)| (name.as_str(), *lane, *count))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED.as_str(),
+                    "stop_the_line",
+                    2
+                ),
+                (
+                    cog_core::metric_names::DAG_STALLED_SCHEDULED_RECLAIMED_WITH_BACKLOG.as_str(),
+                    "stop_the_line",
+                    1
+                ),
+            ],
+            "空着的那条通道不该出现在读数里，出事的那条该把自己的两个数写在 \
+             自己的 lane 下"
         );
     }
 
