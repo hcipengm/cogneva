@@ -235,6 +235,8 @@ spec:
             # cadence_secs?, max_items?} 的 JSON 列表。缺这个值＝不出去看，
             # 循环不启动、零出网；值读不懂同样不启动，并被记为「配了但读不懂」
             # 而不是静默当作没配。问的是上面那个 SearXNG，查询文本不出集群。
+            - name: COGNEVA_OUTWARD_QUERIES
+              value: "[{\"cadence_secs\":86400,\"max_items\":2,\"name\":\"rust-runtime\",\"query\":\"tokio axum production reliability incident\"},{\"cadence_secs\":86400,\"max_items\":2,\"name\":\"agent-evaluation\",\"query\":\"LLM agent evaluation benchmark results\"}]"
             # 检索的后备端点（安全网关的 /search-fallback 透传）：只在自建 SearXNG 一个
             # 引擎都没应答时才问。空值＝查询永不外发，这个部署选择的是「没有
             # 答案」而不是用别处冒充。

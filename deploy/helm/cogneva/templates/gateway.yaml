@@ -232,7 +232,7 @@ spec:
             # 而不是静默当作没配。问的是上面那个 SearXNG，查询文本不出集群。
             {{- if .Values.outward.queries }}
             - name: COGNEVA_OUTWARD_QUERIES
-              value: {{ .Values.outward.queries | quote }}
+              value: {{ .Values.outward.queries | toJson | quote }}
             {{- end }}
             # 检索的后备端点（安全网关的 /search-fallback 透传）：只在自建 SearXNG 一个
             # 引擎都没应答时才问。空值＝查询永不外发，这个部署选择的是「没有

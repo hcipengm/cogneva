@@ -59,3 +59,23 @@ buildah:
   # K3s 的 containerd socket 在 /run/k3s/containerd（标准 containerd 是
   # /run/containerd，见 k8s-standard profile）。
   containerdSocket: /run/k3s/containerd
+
+outward:
+  # 单节点这一档是这套系统实际跑着的形态，出树去看的那条循环因此在这里打开：
+  # 能力建好却在每个部署里都关着，等于没有——读数会一直停在「没配」，学不到
+  # 东西的系统也不会有人说它坏了。chart 默认仍然是空列表（谁部署谁决定），
+  # 这一档是我们自己的部署，由自己决定。
+  #
+  # 两件事、一天一轮、每件最多两条：一天最多四条新账。数量按「读得过来」定，
+  # 不按「能搜到多少」定——搜到的东西要有人接，没人接就是没人接的账，而账是
+  # 有限的管理面。同一条 URL 只进图一次（id 由 URL 派生），所以重复搜索结果
+  # 不涨账。问的是集群内 SearXNG，查询文本不出集群。
+  queries:
+    - name: rust-runtime
+      query: "tokio axum production reliability incident"
+      cadence_secs: 86400
+      max_items: 2
+    - name: agent-evaluation
+      query: "LLM agent evaluation benchmark results"
+      cadence_secs: 86400
+      max_items: 2

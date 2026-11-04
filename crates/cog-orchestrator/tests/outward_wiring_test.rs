@@ -48,10 +48,10 @@ fn the_deployment_sets_the_variable_the_loop_reads() {
 fn the_switch_is_a_value_whose_default_is_off() {
     let values = read("deploy/helm/cogneva/values.yaml");
     assert!(
-        values.contains("outward:\n  queries: \"\""),
-        "outward.queries must default to empty: every result the loop finds becomes \
-         work somebody is asked to do, so a deployment that has not asked for this \
-         must not make the outbound calls"
+        values.contains("outward:\n  queries: []"),
+        "outward.queries must default to an empty list: every result the loop finds \
+         becomes work somebody is asked to do, so a deployment that has not asked for \
+         this must not make the outbound calls"
     );
     let template = read("deploy/helm/cogneva/templates/gateway.yaml");
     assert!(
@@ -59,6 +59,36 @@ fn the_switch_is_a_value_whose_default_is_off() {
         "the variable is set unconditionally, so an empty value still reaches the \
          process and the deployment cannot tell 'asked for nothing' from 'the switch \
          is wired'"
+    );
+    assert!(
+        template.contains(".Values.outward.queries | toJson"),
+        "values are a YAML list and the process parses JSON: rendering the list with \
+         anything but toJson hands the loop a string it cannot read, and the readings \
+         would say 'configured and unparsable' for a configuration that looks right \
+         in the values file"
+    );
+}
+
+/// The one profile this platform actually runs on turns the loop on.
+///
+/// This is a decision on record, not a mechanism: the chart default stays empty so
+/// that whoever deploys decides for themselves. Our own single-node deployment
+/// decided, and a capability that is built but dark in every deployment has no
+/// reading that ever says it works -- the configuration cell sits at "unset" and
+/// nobody is told the system is blind to everything outside it. Turning it back
+/// off is fine; doing it silently is what this assertion refuses.
+#[test]
+fn the_profile_we_run_names_something_to_look_for() {
+    let profile = read("deploy/helm/cogneva/profiles/k3s-single.yaml");
+    assert!(
+        profile.contains("\n  queries:\n") || profile.contains("\n  queries: ["),
+        "the k3s-single profile names no outward queries, so the loop this platform \
+         runs is dark there: nothing outside the tree is ever read"
+    );
+    assert!(
+        profile.contains("query: \""),
+        "the profile has a queries key but no subject in it: an empty list still \
+         leaves the loop dark"
     );
 }
 

@@ -1588,11 +1588,20 @@ webFetch:
 # 由接下这道任务的人判断它影不影响这个平台——影响就用 `propose_self_change`
 # 提一条变更申请，不影响就说明为什么。它自己不判任何事，也不写任何账。
 #
-# 值是 `{name, query, cadence_secs?, max_items?}` 的 JSON 列表；空＝不出去看，
+# 值是 `{name, query, cadence_secs?, max_items?}` 的 YAML 列表（chart 渲染成
+# JSON 交给进程，所以在这里写列表而不是转义过的字符串）；空列表＝不出去看，
 # 循环不启动、零出网。问的是集群内那个 SearXNG，查询文本不出集群；同一条
 # 结果只会进图一次（id 由 URL 决定，重启也认得）。
+#
+# 示例：
+#   outward:
+#     queries:
+#       - name: rust-runtime
+#         query: "tokio axum production reliability"
+#         cadence_secs: 86400
+#         max_items: 2
 outward:
-  queries: ""
+  queries: []
 
 networkPolicy:
   enabled: true
