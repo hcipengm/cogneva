@@ -1131,6 +1131,13 @@ struct SettledClosures {
     retired: usize,
     /// Rows hanging under a closed one, which the graph cancelled with it.
     cascaded: usize,
+    /// Rows hanging under a closed one that the sweep cancelled itself.
+    ///
+    /// A planner's decomposition hangs its children under `parent_task_id` and
+    /// not under `blocked_by`, so the graph's own cascade does not reach them:
+    /// they keep retrying the same settled change one level down, which is the
+    /// defect this sweep exists to remove.
+    descendants: usize,
     /// Open rows whose identity the account does not hold at all. Left in
     /// place: not being on the account is not the account saying it is done.
     unaccounted: usize,
@@ -1142,14 +1149,24 @@ struct SettledClosures {
 
 impl SettledClosures {
     fn moved_anything(&self) -> bool {
-        self.landed > 0 || self.retired > 0 || self.cascaded > 0 || self.failed > 0
+        self.landed > 0
+            || self.retired > 0
+            || self.cascaded > 0
+            || self.descendants > 0
+            || self.failed > 0
     }
 
     fn line(&self) -> String {
         format!(
             "closed hand-over rows the account had settled: landed={} retired={} cascaded={} \
-             unaccounted={} failed={} remaining={}",
-            self.landed, self.retired, self.cascaded, self.unaccounted, self.failed, self.remaining
+             descendants={} unaccounted={} failed={} remaining={}",
+            self.landed,
+            self.retired,
+            self.cascaded,
+            self.descendants,
+            self.unaccounted,
+            self.failed,
+            self.remaining
         )
     }
 }
@@ -1168,6 +1185,56 @@ fn settled_row_reason(row: &ChangeLedgerRow) -> String {
     )
 }
 
+/// Close the open rows hanging under a row this sweep just closed.
+///
+/// The graph's own cancellation follows `blocked_by`, and a planner's
+/// decomposition hangs its children under `parent_task_id` instead -- so the
+/// children of a closed hand-over stay open and keep being scheduled for a
+/// change the account has already settled. They are closed here by the same
+/// criterion, one level down at a time, and only the ones nothing is running:
+/// the `children` map was built from the same filter the candidates were.
+///
+/// The reason travels down so a reader of a grandchild reads the account's
+/// answer as well; it is not rewritten into "the parent was cancelled", which
+/// would lose the fact that settled it.
+async fn close_descendants(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    children: &HashMap<String, Vec<String>>,
+    root: &str,
+    reason: &str,
+) -> usize {
+    let mut closed = 0usize;
+    let mut seen: HashSet<String> = HashSet::from([root.to_string()]);
+    let mut stack = vec![root.to_string()];
+    while let Some(parent) = stack.pop() {
+        let Some(ids) = children.get(&parent) else {
+            continue;
+        };
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            match orchestrator
+                .cancel_task_with_reason(id, reason.to_string())
+                .await
+            {
+                Ok(_) => {
+                    closed += 1;
+                    stack.push(id.clone());
+                }
+                Err(e) => warn!(
+                    task = %id,
+                    parent = %parent,
+                    error = %e,
+                    "change ledger: a row hanging under a closed hand-over could not be \
+                     closed, so it stays queued for a change the account has already settled"
+                ),
+            }
+        }
+    }
+    closed
+}
+
 /// Close the hand-over rows whose change the account has already settled.
 ///
 /// `owed` is the identity set the account still holds as outstanding -- what
@@ -1181,11 +1248,20 @@ async fn close_settled_dispatch_rows(
 ) -> SettledClosures {
     let mut closed = SettledClosures::default();
     let mut candidates: Vec<(String, ChangeIdentity)> = Vec::new();
+    // Every open row by the row it hangs under, so a closed hand-over takes its
+    // own decomposition with it in the same pass.
+    let mut children: HashMap<String, Vec<String>> = HashMap::new();
     for task in orchestrator.get_all_tasks().await {
         // Only rows that nothing is running. A settled account is not a reason
         // to interrupt a run: see [`SettledClosures`].
         if !matches!(task.status, TaskStatus::Pending | TaskStatus::Scheduled) {
             continue;
+        }
+        if let Some(parent) = task.parent_task_id.as_deref() {
+            children
+                .entry(parent.to_string())
+                .or_default()
+                .push(task.id.clone());
         }
         if !matches!(&task.task_type, TaskType::Custom(kind) if kind == DISPATCH_TASK_KIND) {
             continue;
@@ -1210,8 +1286,9 @@ async fn close_settled_dispatch_rows(
             // question, so the row is not this sweep's to close.
             Ok(Some(row)) if row.state.is_outstanding() => {}
             Ok(Some(row)) => {
+                let reason = settled_row_reason(&row);
                 match orchestrator
-                    .cancel_task_with_reason(id, settled_row_reason(&row))
+                    .cancel_task_with_reason(id, reason.clone())
                     .await
                 {
                     Ok(cascaded) => {
@@ -1222,6 +1299,8 @@ async fn close_settled_dispatch_rows(
                             _ => {}
                         }
                         closed.cascaded += cascaded.len();
+                        closed.descendants +=
+                            close_descendants(orchestrator, &children, id, &reason).await;
                         closed.remaining -= 1;
                     }
                     Err(e) => {
@@ -8532,6 +8611,21 @@ mod tests {
             self
         }
 
+        /// A row hanging under a hand-over by `parent_task_id`, the way the
+        /// planner's decomposition does -- with no `blocked_by` edge, so the
+        /// graph's own cancellation does not reach it.
+        fn holding_child_of(self, row: &ChangeLedgerRow, id: &str, status: TaskStatus) -> Self {
+            let mut task = Task::new(
+                id.to_string(),
+                TaskType::Custom("replan".into()),
+                serde_json::json!({}),
+            );
+            task.parent_task_id = Some(dispatch_task_id(&row.identity, 0));
+            task.status = status;
+            self.tasks.lock().unwrap().insert(id.to_string(), task);
+            self
+        }
+
         fn cancelled(&self) -> Vec<(String, String)> {
             self.cancelled.lock().unwrap().clone()
         }
@@ -9989,7 +10083,10 @@ mod tests {
             FakeGraph::default()
                 .holding_handover(&landed, TaskStatus::Pending)
                 .holding_handover(&retired, TaskStatus::Scheduled)
-                .holding_handover(&owed, TaskStatus::Pending),
+                .holding_handover(&owed, TaskStatus::Pending)
+                // The planner hangs its decomposition under `parent_task_id`,
+                // which the graph's own cascade does not follow.
+                .holding_child_of(&landed, "replan-schedule-dead", TaskStatus::Pending),
         );
         let control: Arc<dyn OrchestratorControl> = graph.clone();
 
@@ -10028,6 +10125,14 @@ mod tests {
                 .status,
             TaskStatus::Pending,
             "账上还欠着的变更，它那一行不能被当成历史关掉"
+        );
+        // The decomposition under a closed hand-over goes with it: the graph's
+        // cascade follows `blocked_by`, and these rows hang under
+        // `parent_task_id`, so nothing else would ever reach them.
+        assert_eq!(
+            graph.held("replan-schedule-dead").unwrap().status,
+            TaskStatus::Cancelled,
+            "挂在已结案行下面的子任务还开着，它会继续为一条结了的变更排队"
         );
     }
 
