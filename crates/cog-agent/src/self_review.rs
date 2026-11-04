@@ -167,6 +167,16 @@ impl SelfReviewLoop {
         llm: &dyn LlmClient,
     ) -> SFResult<(String, SelfReviewResult)> {
         let mut current_output = output.to_string();
+        // 打过分的正文里最好的那一份，连同它拿到的分与判词。
+        //
+        // 循环原来的写法是把最后一轮改写出来的正文直接交出去，而那一份**没有
+        // 任何人打过分数**：改写是循环的最后一个动作，判词属于它前面那一版。
+        // 于是一次降了分的改写会被原样交出去，而它上一版是这轮评审里最好的
+        // 一份——代价付了，质量反而退了。这里把每一版被审过的正文连同分数记下来，
+        // 收尾时交最该交的那一份。
+        let mut best: Option<(String, f32, SelfReviewResult)> = None;
+        // 上一轮打过分的正文拿了多少分，用来判断改写还值不值得再付一次。
+        let mut previous_score: Option<f32> = None;
 
         for iteration in 0..self.config.max_iterations {
             // Step 1: Observe
@@ -198,11 +208,35 @@ impl SelfReviewLoop {
             let result =
                 SelfReviewLoop::decide(&critique, &comparison, self.config.quality_threshold);
 
+            let score = comparison.score;
+            if best
+                .as_ref()
+                .map_or(true, |(_, best_score, _)| score > *best_score)
+            {
+                best = Some((current_output.clone(), score, result.clone()));
+            }
+
             match &result {
                 SelfReviewResult::Pass { .. } => {
                     return Ok((current_output, result));
                 }
                 SelfReviewResult::NeedRevision { .. } => {
+                    // 分数没有往上走，就不再一次改写它。
+                    //
+                    // 改写一次要重写整篇正文（这一族上实测每次约三千个输出
+                    // token），而它存在的理由是「上一版还不够好」；如果这一轮
+                    // 拿到的分不比上一轮高，说明这条改写路径已经不再朝评审要的
+                    // 方向走，再付一次只是把同一个问题重问一遍，问出来的东西
+                    // 也没有人打分。交回已经打过分里最好的那一份，判词也用它
+                    // 自己那一轮的。
+                    if let Some(previous_score) = previous_score {
+                        if score <= previous_score {
+                            let (text, _, verdict) = best.expect("刚写进去过");
+                            return Ok((text, verdict));
+                        }
+                    }
+                    previous_score = Some(score);
+
                     // Step 5: Revise
                     let previous = current_output.clone();
                     current_output = SelfReviewLoop::revise(
@@ -223,7 +257,8 @@ impl SelfReviewLoop {
                     // Stop here and report the judgement already reached. The
                     // caller sees the unchanged text and counts it.
                     if current_output == previous {
-                        return Ok((current_output, result));
+                        let (text, _, verdict) = best.expect("刚写进去过");
+                        return Ok((text, verdict));
                     }
 
                     // If this was the last allowed iteration, return the revised output
@@ -576,5 +611,146 @@ mod tests {
                  or the shared head is the part that differs first: {prompt}"
             );
         }
+    }
+
+    /// 按顺序发分数、按顺序改写：每轮一次 critique、一次 compare、一次 revise。
+    ///
+    /// `compare` 的分从 `scores` 里按次序取；`critique` 的正文里那个分不被读。
+    /// 改写走的是 Text，结构化两步走的是 Json，所以两者在同一个 `chat` 上分得开。
+    struct ScoringLlm {
+        scores: Mutex<std::collections::VecDeque<f32>>,
+        json_calls: std::sync::atomic::AtomicUsize,
+        revise_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ScoringLlm {
+        fn new(scores: &[f32]) -> Self {
+            Self {
+                scores: Mutex::new(scores.iter().copied().collect()),
+                json_calls: std::sync::atomic::AtomicUsize::new(0),
+                revise_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn revise_calls(&self) -> usize {
+            self.revise_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ScoringLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("self-review asks non-streaming")
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("self-review asks non-streaming")
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            options: &ChatOptions,
+        ) -> SFResult<ChatResponse> {
+            if options.response_format == ResponseFormat::Text {
+                let n = self
+                    .revise_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                return Ok(ChatResponse {
+                    content: vec![cog_core::ContentBlock::text(format!("REV-{n}"))],
+                    ..Default::default()
+                });
+            }
+            let n = self
+                .json_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // 偶数次是 critique，奇数次是 compare。
+            let score = if n % 2 == 1 {
+                self.scores
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("每轮 compare 都要有分可发")
+            } else {
+                0.0
+            };
+            let body = format!(
+                r#"{{"issues":[],"missing":[],"strengths":[],"gaps":[],"aligned":[],"score":{score}}}"#
+            );
+            Ok(ChatResponse {
+                content: vec![cog_core::ContentBlock::text(body)],
+                ..Default::default()
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn loop_with_two_rounds() -> SelfReviewLoop {
+        SelfReviewLoop::new(SelfReviewConfig {
+            max_iterations: 2,
+            quality_threshold: 0.8,
+            ..Default::default()
+        })
+    }
+
+    /// 分数没有往上走的那一轮不再改写，交回已经打过分里最好的那一份。
+    ///
+    /// 改写一次要重写整篇正文，而它存在的理由是「上一版还不够好」。第一轮
+    /// 0.6、第二轮 0.5 时，这条路径已经不再朝评审要的方向走：再付一次改写只是
+    /// 把同一个问题重问一遍，问出来的正文甚至不会被评分——原来的写法却正是把它
+    /// 交了出去，比循环开始时那一份还差。这条测试钉住两件事：只改写了一次，
+    /// 交出去的是拿过最高分的那一版。
+    #[tokio::test]
+    async fn a_revision_that_scored_worse_does_not_buy_another_rewrite() {
+        let llm = ScoringLlm::new(&[0.6, 0.5]);
+
+        let (text, verdict) = loop_with_two_rounds()
+            .review("ORIGINAL", &llm)
+            .await
+            .unwrap();
+
+        assert_eq!(llm.revise_calls(), 1, "第二轮分数没涨，就不该再买一次改写");
+        assert_eq!(
+            text, "ORIGINAL",
+            "交出去的是打过分里最好的那一份，不是没人评过分的新改写"
+        );
+        match verdict {
+            SelfReviewResult::NeedRevision { score, .. } => {
+                assert!(
+                    (score - 0.6).abs() < 1e-6,
+                    "判词跟着那一节的分数走：{score}"
+                )
+            }
+            other => panic!("这是一次没过的评审：{other:?}"),
+        }
+    }
+
+    /// 分数往上走的那一轮照常改写，最后一版交出去。
+    ///
+    /// 这条是上一条的反面：判据不能把「还在变好」的评审也一并停掉——那样省下的
+    /// 就是该花的钱。
+    #[tokio::test]
+    async fn a_revision_that_scored_better_is_revised_again() {
+        let llm = ScoringLlm::new(&[0.6, 0.7]);
+
+        let (text, _) = loop_with_two_rounds()
+            .review("ORIGINAL", &llm)
+            .await
+            .unwrap();
+
+        assert_eq!(llm.revise_calls(), 2, "两轮都在变好，两轮都改写");
+        assert_eq!(text, "REV-2", "最后一版是更好的那一版");
     }
 }
