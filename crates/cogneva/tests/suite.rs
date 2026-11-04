@@ -141,6 +141,8 @@ mod change_ledger_read_face;
 mod chart_declared_ports_reach_the_process_test;
 #[path = "chart_template_literals_contract_test.rs"]
 mod chart_template_literals_contract_test;
+#[path = "chat_user_echo_is_rendered_once_test.rs"]
+mod chat_user_echo_is_rendered_once_test;
 #[path = "ci_gate_parity_contract_test.rs"]
 mod ci_gate_parity_contract_test;
 #[path = "claim_label_joins_the_deployed_rules_test.rs"]

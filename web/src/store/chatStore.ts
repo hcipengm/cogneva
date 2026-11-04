@@ -236,10 +236,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
             // 服务端把用户那一句原样回声回来了：把本地那一条换成它的身份，
             // 不新开一条。不换就是同一句话在屏幕上出现两遍，而消息 id 一变，
             // 接下来那几帧增量也就没有落点了。
+            //
+            // 正文也要清空，而且只能由这里清：服务端紧接着把这句话当**增量**再发
+            // 一遍（`start` → `text_delta(content)` → `end`），那是这句话在屏幕上
+            // 唯一的来源。留着本地那份抄本，增量一拼上去就是同一句连着写两遍
+            // ——没有分隔、没有气泡边界，读起来像用户把话打重了（实测 2026-11-04，
+            // 属主在 Live 面板里为此提了两次）。本地那份本来就是猜的，服务端的字节
+            // 才是这句话。
             pendingEcho.set(frame.sessionId, pending);
             session = withMessage(session, awaited, (message) => ({
               ...message,
               id: frame.messageId,
+              text: '',
               status: 'streaming',
             }));
           } else {
