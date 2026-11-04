@@ -227,7 +227,7 @@ pub(crate) fn pool_change_detail(
 pub(crate) fn union_size(existing: &[String], arriving: &[String]) -> usize {
     let mut names: Vec<&String> = existing.iter().collect();
     for name in arriving {
-        if !names.iter().any(|n| *n == name) {
+        if !names.contains(&name) {
             names.push(name);
         }
     }
