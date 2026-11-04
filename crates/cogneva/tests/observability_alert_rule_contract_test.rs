@@ -1349,6 +1349,10 @@ const FOREIGN: &[(&str, &str)] = &[
         "宿主读数 `scripts/host/cogneva-face-first-reading-consumers-reading.sh`（不在本仓，私有仓的登记行 `face_first_reading_consumers`）：这一拍里「第一面（第一条读数）没有任何读者」的面数。它必须外来：三处读者面里有两处（宿主 `scripts/`、面表与登记表）住在本仓看不见的那棵树里，作者也在那边；本仓只能看见 `crates/` 与 `deploy/` 这一侧，自己印不出一个完整的计数",
     ),
     (
+        "face_first_reading_consumers_unregistered",
+        "同一宿主读数（`scripts/host/cogneva-face-first-reading-consumers-reading.sh`，登记行 `face_first_reading_consumers`）：这一拍里「首读数有消费者、但那消费者的名字在登记表上找不到」的面数。方向与 `_unread` 相反：那条说的是没人读，这条说的是有人读而读的人没报名。2026-11-04 出事时 `_unread` 印 0、这条本该印 2——缺口判据一度把公开仓契约测试里出现的名字当成登记，读数面于是把事故印成了绿。同样必须外来，理由与上一条相同",
+    ),
+    (
         "a2a_conformance_drift_cells",
         "宿主读数 `scripts/host/cogneva-a2a-conformance-reading.sh`（不在本仓，登记行 `a2a_conformance`）：这一拍里答得不是协议说的那样的格数，每拍真打十五个请求量出来。它与 `a2a_conformance_cells` 一起印，是因为没有分母的 0 证不了「比过」——生产者读不到时两条一起缺席，那种「没量」由宿主读数的生产者契约报，不在这里另立一条规则",
     ),
