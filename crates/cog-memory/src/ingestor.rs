@@ -40,6 +40,19 @@ pub const MEMORY_BUS_CONSUME_LOOP: &str = "memory_ingest_bus_consume";
 /// 这条路上的一次具名跳过。
 const SKIP_IN_FLIGHT_OPERATION: &str = "extract_skipped_in_flight";
 
+/// `memory_operations_total` 上「同一份抽取又被发了一遍」的 operation 取值。
+///
+/// 重发是这条路上最贵的一件事：输入那半还能靠上游的前缀缓存便宜些，输出
+/// 那半是全新生成的，一次重发就是几千 token。它原先只活在一句随 Pod 消失的
+/// warn 里（本机实测容器日志只留一分钟），于是「重发率是多少、这次改动有没有
+/// 把它压下去」只能靠翻账本逐条对账——那正是门要替掉的手工活。一格计数
+/// 让这件事在抓取面上可读，也让下一次「模型开始写别的形状」在这里立刻抬高。
+const EXTRACT_RETRIED_OPERATION: &str = "extract_retried";
+
+/// 归档失败后的重发。与上一格分开：归档与抽取是两条不同的失败面，合成一格
+/// 就分不出「模型答得不对」与「对象存储写不进去」。
+const ARCHIVE_RETRIED_OPERATION: &str = "archive_retried";
+
 /// 认领循环每一轮的结局在 `memory_operations_total` 上的三个 operation 取值：
 /// 认领跑成、认领失败、这一轮被拉取闸门折掉。一轮恰好加其中一个。
 ///
@@ -1350,7 +1363,7 @@ impl MemoryIngestor {
 
         let label = format!("archive {}", raw.id);
         if let Err(e) = self
-            .retry_with_backoff(&label, || async {
+            .retry_with_backoff(&label, ARCHIVE_RETRIED_OPERATION, || async {
                 self.backend.archive_raw(&raw).await.map(|_| ())
             })
             .await
@@ -1371,7 +1384,9 @@ impl MemoryIngestor {
 
         let label = format!("ingest {}", raw.id);
         match self
-            .retry_with_backoff(&label, || self.ingest_missing(&raw))
+            .retry_with_backoff(&label, EXTRACT_RETRIED_OPERATION, || {
+                self.ingest_missing(&raw)
+            })
             .await
         {
             Ok(done) => {
@@ -1875,7 +1890,12 @@ impl MemoryIngestor {
             .collect())
     }
 
-    async fn retry_with_backoff<F, Fut, T>(&self, label: &str, mut op: F) -> SFResult<T>
+    async fn retry_with_backoff<F, Fut, T>(
+        &self,
+        label: &str,
+        retried_operation: &'static str,
+        mut op: F,
+    ) -> SFResult<T>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = SFResult<T>>,
@@ -1899,6 +1919,9 @@ impl MemoryIngestor {
                             e,
                             delay_ms
                         );
+                        // 记在发之前：重发的代价是这次尝试本身，退避期间进程
+                        // 被停掉时这一格已经写过，读数不会比事实少。
+                        self.record_retried(retried_operation).await;
                         last_error = Some(e);
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     } else {
@@ -1909,6 +1932,26 @@ impl MemoryIngestor {
         }
         Err(last_error
             .unwrap_or_else(|| cog_core::SFError::Agent(format!("{label}: unknown error"))))
+    }
+
+    /// 记一次「同一份活又被发了一遍」。
+    ///
+    /// 与抽取跳过那一格同一条理由：省下的如果没有读数，它读起来只是缺席。
+    async fn record_retried(&self, operation: &'static str) {
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let mut labels = HashMap::new();
+        labels.insert(
+            crate::observable::HOLDER_LABEL.to_string(),
+            operation.to_string(),
+        );
+        if let Err(e) = metrics
+            .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 1.0, labels)
+            .await
+        {
+            warn!("Failed to record a retried memory operation: {}", e);
+        }
     }
 
     async fn write_dlq(&self, raw: &RawSource, error_msg: &str) -> SFResult<()> {
@@ -2159,7 +2202,7 @@ mod tests {
 
         let attempts = std::sync::atomic::AtomicUsize::new(0);
         let err = ingestor
-            .retry_with_backoff("probe", || async {
+            .retry_with_backoff("probe", EXTRACT_RETRIED_OPERATION, || async {
                 let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                 Err::<(), _>(cog_core::SFError::Agent(format!("failure #{n}")))
             })
@@ -2175,6 +2218,58 @@ mod tests {
             err.to_string()
                 .contains(&format!("failure #{}", max_retries + 1)),
             "the returned error must be the last one, got {err}"
+        );
+    }
+
+    /// 每一次重发都在 `memory_operations_total` 上留一格。
+    ///
+    /// 重发是这条路上最贵的一件事（同一段提示词再生成一份几千 token 的答案），
+    /// 而它原先只活在一句随 Pod 消失的 warn 里。没有这一格，「重发被压下去了」
+    /// 与「这一族压根没被观测」在抓取面上同形，下一次模型改形状导致的回潮只能
+    /// 靠翻账本逐条对账才看得见。
+    #[tokio::test]
+    async fn every_resend_leaves_a_reading_on_the_operations_counter() {
+        let metrics = Arc::new(RecordingMetrics::default());
+        let config = MemoryIngestorConfig {
+            retry_base_delay_ms: 0,
+            max_retries: 2,
+            ..Default::default()
+        };
+        let ingestor = MemoryIngestor::new(
+            Arc::new(MemoryMemoryBackend::new()),
+            Arc::new(RuleBasedExtractor::new()),
+        )
+        .with_config(config)
+        .with_metrics(metrics.clone());
+
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        ingestor
+            .retry_with_backoff("probe", EXTRACT_RETRIED_OPERATION, || async {
+                let n = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err::<(), _>(cog_core::SFError::Agent(format!("failure #{n}")))
+                } else {
+                    Ok(())
+                }
+            })
+            .await
+            .expect("the third attempt answers");
+
+        assert_eq!(
+            metrics.counter_total(
+                cog_core::metric_names::MEMORY_OPERATIONS_TOTAL.as_str(),
+                EXTRACT_RETRIED_OPERATION
+            ),
+            Some(2.0),
+            "two failures before the answering attempt are two resends, each counted"
+        );
+        assert_eq!(
+            metrics.counter_total(
+                cog_core::metric_names::MEMORY_OPERATIONS_TOTAL.as_str(),
+                ARCHIVE_RETRIED_OPERATION
+            ),
+            None,
+            "an extraction retry must not land in the archive's cell"
         );
     }
 
