@@ -590,9 +590,13 @@ impl SelfReviewLoop {
     /// byte-identical across calls, because it is the head of the request and
     /// the only part an upstream prefix cache can hold across tasks.
     fn judging_rubric(actor: &str) -> &'static str {
+        // 名字从 `cog_core::roles` 读，不在这里再拼一遍：这五个词是配置、代码与
+        // 存下来的标识三者必须同意的一份声明，第二处拼写改了名不会报错，只会让
+        // 这个角色悄悄落在 `_` 那一臂上、拿默认判据去判。
+        use cog_core::roles::{EVALUATOR, MERGER, MODERATOR, PLANNER};
         let role = actor.rsplit(':').next().unwrap_or(actor);
         match role {
-            "planner" => {
+            PLANNER => {
                 "The text under judgement is a PLAN: a decomposition of a task into sub-tasks. \
                  A plan is not expected to answer the task or to carry out any step -- that is \
                  what its sub-tasks are for -- so \"it does not give the answer\", \"it does not \
@@ -607,7 +611,7 @@ impl SelfReviewLoop {
                  character against the text, whitespace aside, and a quote that is not there is \
                  not a `met`."
             }
-            "evaluator" => {
+            EVALUATOR => {
                 "The text under judgement is a JUDGEMENT about someone else's work. Judge it as \
                  a judgement: whether it names what it assessed, states a verdict, and says what \
                  the verdict rests on. Whether the work itself is good is not this text's \
@@ -616,7 +620,7 @@ impl SelfReviewLoop {
                  or undetermined, and for `met` quote the words of the text that carry it, \
                  character for character, whitespace aside."
             }
-            "moderator" | "merger" => {
+            MODERATOR | MERGER => {
                 "The text under judgement is a FINAL ANSWER to the task. List every requirement \
                  the specification states. For each one decide met, unmet or undetermined, and \
                  for `met` quote the words of the text that carry it, character for character, \
