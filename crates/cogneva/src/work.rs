@@ -45,14 +45,17 @@ Acts on the tasks the graph assigns to one unit. Every subcommand reads the
 owner named on the task row; a task owned by another unit is refused.
 
 SUBCOMMANDS:
-    file    --task <id> --goal <text> --face <face> --acceptance <text>...
+    file    --task <id> --goal <text> [--face <face>] --acceptance <text>...
                            File this unit's own work through the platform's
                            submission door: the same handler the owner's input
-                           goes through, so the row is bound to the face it
-                           serves, refused if it states no acceptance, and
-                           injected by the orchestrator like any other. The
-                           publisher then holds it for this unit rather than
-                           offering it to whoever polls first.
+                           goes through, so a row naming a face is bound to the
+                           unit the roster names for it, refused if it states no
+                           acceptance, and injected by the orchestrator like any
+                           other. The publisher then holds it for this unit
+                           rather than offering it to whoever polls first.
+                           Without --face the row serves no face and is simply
+                           this unit's own: a unit that owns no face has none to
+                           name, and its work still has to exist in the graph.
     queue                  List this unit's Pending, Scheduled and Running tasks.
     next                   Print the one task this unit can start right now.
     claim   --task <id>    Reserve a ready task (Pending -> Scheduled).
@@ -78,7 +81,7 @@ OPTIONS:
                            or the id to file under (file).
     --goal <text>          What the work is, in one statement (file).
     --face <face>          The face the work serves (file); it must be staffed, and
-                           by this unit.
+                           by this unit. Omit it for work that serves no face.
     --acceptance <text>    What done means (file); repeat for several criteria.
     --priority <n>         Higher runs first (file; default 1).
     --blocked-by <id>      A task that must finish first (file); repeatable.
@@ -101,7 +104,7 @@ pub enum Action {
     File {
         task: String,
         goal: String,
-        face: String,
+        face: Option<String>,
         acceptance: Vec<String>,
         priority: i32,
         blocked_by: Vec<String>,
@@ -243,7 +246,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             Action::File {
                 task: task()?,
                 goal: goal.ok_or("--goal is required for file")?,
-                face: face.ok_or("--face is required for file")?,
+                face,
                 acceptance,
                 priority: priority.unwrap_or(1),
                 blocked_by,
@@ -377,7 +380,7 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             let filing = Filing {
                 id: &task,
                 goal: &goal,
-                face: &face,
+                face: face.as_deref(),
                 acceptance: &acceptance,
                 priority,
                 blocked_by: &blocked_by,
@@ -398,7 +401,11 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
             match await_row(&*backend, workspace, &task).await? {
                 Some(row) => println!(
                     "{} filed (face={}, owner={}, status={:?}, goal_id={})",
-                    row.id, face, unit, row.status, goal_id
+                    row.id,
+                    face.as_deref().unwrap_or("-"),
+                    unit,
+                    row.status,
+                    goal_id
                 ),
                 None => println!(
                     "{} accepted by the submission door (goal_id={}) but not in the graph yet; \
@@ -538,7 +545,7 @@ const UNIT_WORK_KIND: &str = "unit_work";
 struct Filing<'a> {
     id: &'a str,
     goal: &'a str,
-    face: &'a str,
+    face: Option<&'a str>,
     acceptance: &'a [String],
     priority: i32,
     blocked_by: &'a [String],
@@ -599,8 +606,12 @@ fn filing_body(filing: &Filing, unit: &str, workspace: &str) -> Result<serde_jso
     if goal.trim().is_empty() {
         return Err("--goal is empty: a row nobody can read is a row nobody can pick up".into());
     }
-    if face.trim().is_empty() {
-        return Err("--face is empty: work is filed on the face it serves, or not at all".into());
+    if face.is_some_and(|face| face.trim().is_empty()) {
+        return Err(
+            "--face is empty: name the face this work serves, or leave the flag off for work \
+             that serves none"
+                .into(),
+        );
     }
     // Blank entries are dropped the same way the door drops them: a list of
     // empty strings is a list that says nothing, and a dispatcher that only
@@ -618,21 +629,26 @@ fn filing_body(filing: &Filing, unit: &str, workspace: &str) -> Result<serde_jso
              Say what done means with --acceptance"
         ));
     }
+    let mut row = serde_json::json!({
+        "id": id,
+        "task_type": UNIT_WORK_KIND,
+        "input": { "goal": goal.trim(), "acceptance": stated },
+        "blocked_by": blocked_by,
+        "priority": priority,
+        "unit_id": unit,
+        "timeout_seconds": timeout_secs,
+        "planner": { "verified": true, "source": "user_provided" },
+    });
+    // Absent rather than empty: a `face_id` of `""` names a face that is not on
+    // the roster, and the door would refuse the row for a face nobody meant.
+    if let Some(face) = face {
+        row["face_id"] = serde_json::Value::String(face.trim().to_string());
+    }
     Ok(serde_json::json!({
         "goal": goal.trim(),
         "workspace_id": workspace,
         "intent_kind": "task",
-        "tasks": [{
-            "id": id,
-            "task_type": UNIT_WORK_KIND,
-            "input": { "goal": goal.trim(), "acceptance": stated },
-            "blocked_by": blocked_by,
-            "priority": priority,
-            "face_id": face,
-            "unit_id": unit,
-            "timeout_seconds": timeout_secs,
-            "planner": { "verified": true, "source": "user_provided" },
-        }],
+        "tasks": [row],
     }))
 }
 
@@ -1311,7 +1327,7 @@ mod tests {
             Action::File {
                 task: "close-the-ci-gap".into(),
                 goal: "Close the gap on the ci-build-deploy face".into(),
-                face: "ci-build-deploy".into(),
+                face: Some("ci-build-deploy".into()),
                 acceptance: vec!["CI is green on main".into()],
                 priority: 1,
                 blocked_by: Vec::new(),
@@ -1319,10 +1335,11 @@ mod tests {
             }
         );
         // Each of these would otherwise reach a row that says less than a row
-        // has to: no face means an owner the roster cannot be asked about, no
-        // goal means nothing a reader could act on, no criterion means nothing
-        // that says when it is done, and no id means a row nobody can name.
-        for flag in ["--task", "--goal", "--face", "--acceptance"] {
+        // has to: no goal means nothing a reader could act on, no criterion
+        // means nothing that says when it is done, and no id means a row nobody
+        // can name. The face is not in this list: a unit that owns no face
+        // still files its own work, and the row then serves none.
+        for flag in ["--task", "--goal", "--acceptance"] {
             assert!(
                 parse_args(&file_without(flag)).is_err(),
                 "file accepted a missing {flag}"
@@ -1361,7 +1378,7 @@ mod tests {
         let filing = Filing {
             id: &task,
             goal: &goal,
-            face: &face,
+            face: face.as_deref(),
             acceptance: &acceptance,
             priority,
             blocked_by: &blocked_by,
@@ -1422,7 +1439,7 @@ mod tests {
         let filing = Filing {
             id: &task,
             goal: &goal,
-            face: &face,
+            face: face.as_deref(),
             acceptance: &acceptance,
             priority,
             blocked_by: &blocked_by,
@@ -1446,6 +1463,43 @@ mod tests {
         );
     }
 
+    /// A unit that owns no face has none to name, and its work still has to
+    /// exist in the graph: the row says who holds it and nothing about a face.
+    ///
+    /// Absent is not empty. An empty `face_id` names a face the roster does not
+    /// have, so the door would refuse the row over a face nobody meant -- and a
+    /// caller who wrote `--face ""` meant "no face", not "a face called blank".
+    #[test]
+    fn a_filing_with_no_face_is_the_units_own_row() {
+        use cog_gateway::tasks::{CreateTaskRequest, IntentKind};
+
+        let stated = vec!["the row is filed and started".to_string()];
+        let mut own = filing("own-work", "do the thing", &stated);
+        own.face = None;
+        let body = filing_body(&own, "89", "cogneva").unwrap();
+
+        let rows = body["tasks"].as_array().expect("one row");
+        assert!(
+            rows[0].get("face_id").is_none(),
+            "no face is absent, not a name the roster would be asked about"
+        );
+        assert_eq!(rows[0]["unit_id"], "89");
+
+        let read: CreateTaskRequest =
+            serde_json::from_value(body).expect("the door's own type must accept this body");
+        assert_eq!(read.intent_kind, IntentKind::Task);
+        let rows = read.tasks.expect("one row");
+        assert_eq!(rows[0].face_id, None);
+        assert_eq!(rows[0].unit_id.as_deref(), Some("89"));
+
+        let mut blank = filing("own-work", "do the thing", &stated);
+        blank.face = Some("   ");
+        assert!(
+            filing_body(&blank, "89", "cogneva").is_err(),
+            "a blank face is neither a face nor an omission"
+        );
+    }
+
     /// A criterion made of blanks is a list that says nothing. Filed as it
     /// arrives, it would pass every "is there an acceptance" test downstream
     /// while stating nothing at all.
@@ -1453,7 +1507,7 @@ mod tests {
         Filing {
             id,
             goal,
-            face: "ci-build-deploy",
+            face: Some("ci-build-deploy"),
             acceptance,
             priority: 1,
             blocked_by: &[],

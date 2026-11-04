@@ -544,20 +544,30 @@ fn estimate_goal_tokens(req: &CreateTaskRequest) -> u64 {
 /// A face's owner is the answer to "who does this face's work", so a row that
 /// names a face and no unit is bound to that owner instead of being left free:
 /// a face-bound row with no owner reads as drifted from the moment it is
-/// queued. Naming both is allowed only when they agree -- accepting a mismatch
-/// here and letting the drift pass report it later is a row written with an
-/// answer the writer already knew to be wrong.
+/// queued. Naming a unit on a face-bound row is allowed only when the roster
+/// already names that unit for the face -- accepting a mismatch here and
+/// letting the drift pass report it later is a row written with an answer the
+/// writer already knew to be wrong.
+///
+/// A unit with no face is a different row, not a mismatched one. It serves no
+/// face, so there is no binding to contradict; it says only who holds it, and
+/// an owned row is not offered to the shared queue -- the unit it names asks
+/// for it. That is how a unit that is on no face still authors its own work:
+/// the alternative, refusing the name, left every session that is not a face's
+/// owner able to file nothing at all, so its work existed nowhere but in its
+/// transcript.
 fn binding_of(
     item: &TaskItem,
     face: Option<&cog_core::Face>,
 ) -> Result<(Option<String>, Option<String>), String> {
     match (item.face_id.as_deref(), item.unit_id.as_deref()) {
         (None, None) => Ok((None, None)),
-        (None, Some(unit)) => Err(format!(
-            "task {} names unit '{unit}' but no face; ownership is checked against the face the \
-             work serves",
+        (None, Some(unit)) if unit.trim().is_empty() => Err(format!(
+            "task {} names an empty unit; a row held by nobody in particular has no owner to \
+             ask for it",
             item.id
         )),
+        (None, Some(unit)) => Ok((None, Some(unit.to_string()))),
         (Some(face_id), _) => {
             let Some(face) = face else {
                 return Err(format!(
@@ -2401,11 +2411,18 @@ mod tests {
             .unwrap_err()
             .contains("has no owner"));
 
-        let mut ownerless = task_item("t5", None);
-        ownerless.unit_id = Some("worker".into());
-        assert!(binding_of(&ownerless, None)
+        // A row that serves no face has no binding to contradict, so naming its
+        // holder is not a claim about any face. Refusing it left a unit that is
+        // on no face unable to author any row at all.
+        let mut own_work = task_item("t5", None);
+        own_work.unit_id = Some("89".into());
+        assert_eq!(binding_of(&own_work, None), Ok((None, Some("89".into()))));
+
+        let mut nameless = task_item("t5b", None);
+        nameless.unit_id = Some("  ".into());
+        assert!(binding_of(&nameless, None)
             .unwrap_err()
-            .contains("but no face"));
+            .contains("names an empty unit"));
 
         assert_eq!(binding_of(&task_item("t6", None), None), Ok((None, None)));
     }
