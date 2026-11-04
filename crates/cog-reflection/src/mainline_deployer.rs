@@ -1698,11 +1698,17 @@ fn annotation_says_nothing(message: &str) -> bool {
 /// '/home/runner/actions-runner/cached/2.338.2/_diag/Worker_...log'`——同一形状在
 /// 两次不同的 run 上复现，而它们与代码一个字节的关系都没有。
 ///
+/// 第二种是**机器根本没被派过来**。2026-11-04 实测 `34ebc754`：13 条作业里 12 条绿，
+/// `Bootstrap Cross-Platform Check (macos-latest)` 在队列里等满 15 分钟被取消，注解正文
+/// `The job was not acquired by Runner of type hosted even after multiple attempts`，
+/// 一条步骤都没跑过。整轮于是落 `failure`，而这份代码里没有任何东西被判过红。
+///
 /// 这张表只登记**实测见过**的串。表外的一律照旧判红：把一条真失败认成机器失败，
 /// 代价是它滚上去；把一个不认识的机器失败照常判红，代价只是等一个新 rev。两侧
 /// 代价不对称，所以宁窄不宁宽。新的形状要连着实测的 run 一起加进来。
 // cap: bound — 每一串都是要维护的实测凭据，不是越长越好的黑名单
-const INFRASTRUCTURE_FAILURE_SIGNATURES: &[&str] = &["no space left on device"];
+const INFRASTRUCTURE_FAILURE_SIGNATURES: &[&str] =
+    &["no space left on device", "was not acquired by runner"];
 
 /// 这句话点名了跑它的那台机器（磁盘、runner 自身进程）。比较不区分大小写：
 /// 上游同一件事会写成 `No space left on device` 与 `ENOSPC`。
@@ -1711,6 +1717,47 @@ fn annotation_reports_infrastructure(message: &str) -> bool {
     INFRASTRUCTURE_FAILURE_SIGNATURES
         .iter()
         .any(|signature| lowered.contains(signature))
+}
+
+#[cfg(test)]
+mod infrastructure_signature_tests {
+    use super::*;
+
+    /// 机器没被派过来是「这棵树没有被判过」，不是「这棵树被判决红」。
+    ///
+    /// 认不出它的时候，一次托管 runner 短缺就把整轮判黑：2026-11-04 `34ebc754` 上
+    /// 十二条作业全绿、一条作业没拿到机器，主线按版本类的红被反复扣住，而那一版
+    /// 没有任何东西需要修。
+    #[test]
+    fn a_runner_that_was_never_acquired_is_not_a_verdict_about_the_tree() {
+        assert!(annotation_reports_infrastructure(
+            "The job was not acquired by Runner of type hosted even after multiple attempts"
+        ));
+        // 上游同一件事的大小写不保证一致。
+        assert!(annotation_reports_infrastructure(
+            "the job was not acquired by runner of type hosted even after multiple attempts"
+        ));
+        // 之前实测过的那一支仍在表上：这次改动是加一条，不是换一条。
+        assert!(annotation_reports_infrastructure(
+            "System.IO.IOException: No space left on device : \
+             '/home/runner/actions-runner/cached/2.338.2/_diag/Worker_x.log'"
+        ));
+    }
+
+    /// 判这棵树的话不能被这张表认领：认领了真失败就会滚上去。
+    #[test]
+    fn a_failure_about_the_tree_is_not_read_as_a_failure_about_the_machine() {
+        for message in [
+            "assertion `left == right` failed: the fold took a row another case was holding",
+            "error[E0308]: mismatched types",
+            "Process completed with exit code 1.",
+        ] {
+            assert!(
+                !annotation_reports_infrastructure(message),
+                "把一句判这棵树的话读成了机器故障：{message}"
+            );
+        }
+    }
 }
 
 /// GitHub 作业日志每一行前面那个 `2026-11-01T00:58:16.1656654Z `。
