@@ -562,17 +562,28 @@ struct Filing<'a> {
 /// was demonstrably alive at the time. Liveness is the lease's question, and
 /// the heartbeat answers it; this budget answers "how long may this stay
 /// open at all", and a week is longer than a unit of work is meant to take.
+// cap: bound — a week is the outer edge of "a unit of work", chosen so a live
+// holder is never failed by the default; how long real rows actually stay open
+// is the lease's reading, not this number's.
 const UNIT_WORK_BUDGET_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// How long one filing request may take. The door answers as soon as it has
 /// judged the submission; the decomposition it starts runs behind the answer.
+// cap: bound — the answer is a judgement over one submission, not a run: thirty
+// seconds is the wait past which a door that has not answered is not slow but
+// stuck, and no decomposition timing should move it.
 const SUBMIT_TIMEOUT_SECS: u64 = 30;
 
 /// How long to wait for the accepted row to show up in the graph, and how often
 /// to look. Bounded on purpose: the row is usually there within a second, and a
 /// caller that waits forever has no way to tell a slow injector from a
 /// submission that was dropped.
+// cap: bound — ten seconds is the ceiling for "the injector took it", picked so
+// a dropped submission is reported rather than waited on forever. A slower
+// injector is a case for the caller to retry, not for the wait to grow.
 const SUBMIT_POLL_ATTEMPTS: u32 = 20;
+// cap: bound — the two read as one wait: 20 x 500 ms is the ten seconds above,
+// and the split only decides how often the graph is asked, not how long.
 const SUBMIT_POLL_INTERVAL_MS: u64 = 500;
 
 /// The submission this unit's own work is filed as.
@@ -637,8 +648,12 @@ fn filing_body(filing: &Filing, unit: &str, workspace: &str) -> Result<serde_jso
         "priority": priority,
         "unit_id": unit,
         "timeout_seconds": timeout_secs,
-        "planner": { "verified": true, "source": "user_provided" },
     });
+    // The role name is read from its one declaration: a second spelling here keeps
+    // working after a rename while every reader that picks a schema or a checkpoint
+    // by role answers `None` and proceeds without one.
+    row[cog_core::roles::PLANNER] =
+        serde_json::json!({ "verified": true, "source": "user_provided" });
     // Absent rather than empty: a `face_id` of `""` names a face that is not on
     // the roster, and the door would refuse the row for a face nobody meant.
     if let Some(face) = face {
