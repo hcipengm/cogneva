@@ -1394,6 +1394,58 @@ mod tests {
         assert_eq!(row["input"]["goal"], goal);
     }
 
+    /// The body has to be read by the door as what this command meant.
+    ///
+    /// Both sides spell the submission in JSON, and serde ignores a key it does
+    /// not know: renaming `face_id` on either side would leave the request
+    /// valid, the row unbound, and the drift reading to report the mismatch
+    /// later. Deserialising into the door's own type is what holds the two
+    /// spellings together -- a field either arrives under the name the door
+    /// reads or it does not arrive at all.
+    #[test]
+    fn the_door_reads_the_filing_as_the_task_it_was_meant_to_be() {
+        use cog_gateway::tasks::{CreateTaskRequest, IntentKind};
+
+        let request = parse_args(&file_args()).unwrap();
+        let Action::File {
+            task,
+            goal,
+            face,
+            acceptance,
+            priority,
+            blocked_by,
+            timeout_secs,
+        } = request.action
+        else {
+            panic!("file must parse as file");
+        };
+        let filing = Filing {
+            id: &task,
+            goal: &goal,
+            face: &face,
+            acceptance: &acceptance,
+            priority,
+            blocked_by: &blocked_by,
+            timeout_secs,
+        };
+        let body = filing_body(&filing, &request.unit, "cogneva").unwrap();
+        let read: CreateTaskRequest =
+            serde_json::from_value(body).expect("the door's own type must accept this body");
+
+        assert_eq!(read.intent_kind, IntentKind::Task);
+        assert_eq!(read.workspace_id, "cogneva");
+        let rows = read.tasks.expect("one row");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "close-the-ci-gap");
+        assert_eq!(rows[0].face_id.as_deref(), Some("ci-build-deploy"));
+        assert_eq!(rows[0].unit_id.as_deref(), Some("8b"));
+        assert_eq!(rows[0].timeout_seconds, Some(UNIT_WORK_BUDGET_SECS));
+        assert!(
+            rows[0].planner.as_ref().is_some_and(|claim| claim.verified),
+            "the row is injected without decomposition only if this claim arrives"
+        );
+    }
+
     /// A criterion made of blanks is a list that says nothing. Filed as it
     /// arrives, it would pass every "is there an acceptance" test downstream
     /// while stating nothing at all.
