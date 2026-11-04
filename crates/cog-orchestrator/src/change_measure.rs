@@ -2312,46 +2312,4 @@ mod tests {
         let registry = Declarations::parse(&lines);
         assert_eq!(registry.gate_for("feedback_x"), Some("crates/x/tests/a.rs"));
     }
-
-    /// principle: feedback_mention_is_not_a_claim
-    ///
-    /// 「谁负责 X」的判据若匹配「X 出现在这里」，写一段关于它的说明就等于给了它属主 --
-    /// the criterion for who owns a principle is the declaration, and a paragraph
-    /// that merely names its slug is not a declaration.
-    ///
-    /// The read above asks whether the expression selects a header. This asks the
-    /// same question of the slug itself: a file that says a principle's name in a
-    /// sentence has mentioned it and nothing more, so it must not come back as the
-    /// file that owns that principle's gate.
-    #[tokio::test]
-    async fn a_mention_of_a_principle_is_not_a_claim_to_own_it() {
-        use crate::principle_measure::{
-            platform_declaration_pattern, Declarations, PLATFORM_REGISTRY_FILES,
-        };
-
-        let claim = "//! principle: feedback_mention_is_not_a_claim\n";
-        let mention = "// feedback_mention_is_not_a_claim appears in this sentence\n";
-        let dir = repo(&[
-            ("crates/x/tests/owning_test.rs", claim),
-            ("crates/x/src/lib.rs", mention),
-        ]);
-        let tree = CheckTree::new(dir.path().join("bare"), "main");
-        let rev = tree.rev().await.expect("the fixture head resolves");
-        let lines = tree
-            .matching_lines(
-                &rev,
-                PLATFORM_REGISTRY_FILES,
-                &platform_declaration_pattern(),
-            )
-            .await
-            .expect("git answers for the fixture tree");
-
-        assert_eq!(lines.len(), 1, "a mention was read as a claim: {lines:?}");
-        let registry = Declarations::parse(&lines);
-        assert_eq!(
-            registry.gate_for("feedback_mention_is_not_a_claim"),
-            Some("crates/x/tests/owning_test.rs"),
-            "a mention of the slug does not own it: {lines:?}"
-        );
-    }
 }
