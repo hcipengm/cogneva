@@ -544,9 +544,17 @@ fn estimate_goal_tokens(req: &CreateTaskRequest) -> u64 {
 /// A face's owner is the answer to "who does this face's work", so a row that
 /// names a face and no unit is bound to that owner instead of being left free:
 /// a face-bound row with no owner reads as drifted from the moment it is
-/// queued. Naming both is allowed only when they agree -- accepting a mismatch
-/// here and letting the drift pass report it later is a row written with an
-/// answer the writer already knew to be wrong.
+/// queued. Naming a unit is allowed only when the roster already puts that unit
+/// on the face -- the owner, or the deputy that carries a slice of it. Both
+/// answers are the roster's, so a row cannot be written with an answer the
+/// writer already knew to be wrong; anything else is refused here rather than
+/// accepted and read as drift later.
+///
+/// The row belongs to the unit that named it, not to the face's owner. A row
+/// says only its owner may start and finish it, so handing a deputy's
+/// submission to the owner would produce work the submitter cannot execute --
+/// the deputy slot would exist on the roster and nothing could be filed under
+/// it.
 fn binding_of(
     item: &TaskItem,
     face: Option<&cog_core::Face>,
@@ -570,6 +578,9 @@ fn binding_of(
                     "face '{face_id}' has no owner; a task cannot be bound to it until it is \
                      staffed"
                 )),
+                (Some(_), Some(unit)) if face.spec.deputy_unit.as_deref() == Some(unit) => {
+                    Ok((Some(face_id.to_string()), Some(unit.to_string())))
+                }
                 (Some(owner), Some(unit)) if owner != unit => Err(format!(
                     "task {} names unit '{unit}' but face '{face_id}' is owned by '{owner}'",
                     item.id
@@ -2408,6 +2419,31 @@ mod tests {
             .contains("but no face"));
 
         assert_eq!(binding_of(&task_item("t6", None), None), Ok((None, None)));
+    }
+
+    /// 副手是名册已经写在面上的一格，它交上来的行归它自己，不归面主。
+    ///
+    /// 归面主会让这一行谁也开不了工——带归属的行只许它的 owner 开始与完成——于是
+    /// 「谁在这面上干活」的那一格在名册上有名字，却交不上去任何东西。
+    #[test]
+    fn a_deputys_row_belongs_to_the_deputy_and_not_to_the_face_owner() {
+        let mut delegated = face("task-management", Some("worker"));
+        delegated.spec.deputy_unit = Some("6e".into());
+
+        let mut filed = task_item("t1", None);
+        filed.face_id = Some("task-management".into());
+        filed.unit_id = Some("6e".into());
+        assert_eq!(
+            binding_of(&filed, Some(&delegated)),
+            Ok((Some("task-management".into()), Some("6e".into()))),
+            "the row is the deputy's, or the deputy can never execute what it filed"
+        );
+
+        let mut stranger = task_item("t2", None);
+        stranger.face_id = Some("task-management".into());
+        stranger.unit_id = Some("not-on-this-face".into());
+        let refusal = binding_of(&stranger, Some(&delegated)).unwrap_err();
+        assert!(refusal.contains("owned by 'worker'"), "{refusal}");
     }
 
     /// 走规划的行会被规划器返回的东西替换，点在上面的面与 unit 一个字都到不了图。
