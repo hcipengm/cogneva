@@ -140,7 +140,44 @@ pub async fn guard(req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
+    //! principle: feedback_a_bound_reading_is_not_the_population_it_governs
+    //!
+    //! 读数报的是「界」不是「在用」：限速器的 `per_min` 是一个界，`buckets` 是它
+    //! 此刻真正握着的调用方。两个数是同一个实例上同时读出来的两份事实，不是同一
+    //! 个数——把界往下调，已经持有桶的调用方一个都不会被驱逐，所以界和在用的数目
+    //! 会同时读出来、且不相等。任何把这二者合成一个读数的写法，都让「界收紧了」
+    //! 看起来像「这些人被清掉了」，而后者从未发生。
     use super::*;
+
+    /// 界和在用的数目是两份读数：界下调不驱逐已经持有桶的调用方，两个数同时读
+    /// 出来且不相等。
+    #[test]
+    fn a_lowered_bound_is_not_an_eviction_of_the_population_it_governs() {
+        let mut limiter = ProjectReadLimiter::new(600);
+        for caller in ["u1", "u2", "u3"] {
+            assert!(limiter.take(caller).is_ok(), "{caller} 的桶一开始是满的");
+        }
+
+        // 同一个实例上同时读出的两份事实：界，和限速器此刻握着的调用方。
+        let bound = limiter.per_min;
+        let held = u32::try_from(limiter.buckets.lock().unwrap().len()).expect("桶数在 u32 之内");
+        assert_eq!(held, 3, "三个调用方各占一个桶");
+        assert_ne!(bound, held, "界不是在用的数目：两个数同时读出来且不相等");
+
+        // 把界往下调：它收紧的是往后每分钟的预算，不是已经在用的人。
+        limiter.per_min = 2;
+        let lowered = limiter.per_min;
+        let still_held =
+            u32::try_from(limiter.buckets.lock().unwrap().len()).expect("桶数在 u32 之内");
+        assert_eq!(
+            still_held, held,
+            "界下调不驱逐持有者：读数说收紧了，人口一个都没少"
+        );
+        assert_ne!(
+            lowered, still_held,
+            "界和在用是两个数，同一次读出来仍然不相等"
+        );
+    }
 
     /// 一分钟的预算用完就拒，并且说出还要等多久。
     #[test]
