@@ -19092,7 +19092,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         let samples =
             metrics.matching(cog_core::metric_names::LLM_QUOTA_PROJECTION_FAILED.as_str());
-        let axes: Vec<(&str, f64)> = samples
+        let mut axes: Vec<(&str, f64)> = samples
             .iter()
             .map(|s| {
                 (
@@ -19101,9 +19101,12 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 )
             })
             .collect();
+        // 读数面按标签排序返回，不按写入次序——与「读成了的那一拍写 0」那条同一个
+        // 读法。判的是三根轴都在、都写着失败，不是谁先写。
+        axes.sort_by(|a, b| a.0.cmp(b.0));
         assert_eq!(
             axes,
-            vec![("person", 1.0), ("workspace", 1.0), ("global", 1.0)],
+            vec![("global", 1.0), ("person", 1.0), ("workspace", 1.0)],
             "层级管理器一配，人、工作区、全局三根轴就都在；没配的任务轴不写——给没配\
              的轴写 0 会把「没有上限」读成「刚更新过」"
         );
