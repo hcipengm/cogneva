@@ -45,6 +45,17 @@ pub const CLAIM_CONCURRENCY_ENV: &str = "COGNEVA_TASK_CLAIM_CONCURRENCY";
 // cap: bound — 进程级许可：本进程读的每条就绪队列共用同一份，多读一条队列不该把在途执行翻倍
 pub const DEFAULT_CLAIM_CONCURRENCY: usize = 4;
 
+/// How many stop-the-line tasks one process runs at once.
+///
+/// Not [`claim_concurrency()`]: that number sizes how many ordinary changes may
+/// spend the token window together, and a red main is not ordinary work -- it
+/// is the reason nothing newer can be deployed at all. It gets a budget of one
+/// so that it can run while every ordinary permit is held, and stays at one so
+/// that the cost of the exception is bounded by a single extra task in flight.
+/// One is enough because a red main is one finding: the deployer files one row
+/// per revision per day and the row names the whole failing set.
+pub const STOP_THE_LINE_CLAIM_CONCURRENCY: usize = 1;
+
 /// 读一条在途执行上限。
 ///
 /// `0` 被拒而不是被当成「不限」：两者在配置里是同一个字符，而误读成停摆
@@ -172,16 +183,33 @@ impl TaskExecutorRouter {
             slots: claim_slots,
             limit: claim_concurrency,
         };
+        // 停线那条通道的许可不来自上面那一份：它的整条理由就是「别的活占满
+        // 所有许可时它仍然要跑」。共用一份时，优先级最高的那条变更会和排队
+        // 的普通变更一样，等前一条跑完——2026-11-04 实测：主线 CI 判红之后
+        // 部署器确实开了修复单，但那一条前面压着 18,032 条未读的就绪消息，
+        // 一条普通的变更跑十几分钟，等于永远轮不到它，主线因此一直红着、
+        // 一直滚不上去。它自己的一份是这条例外的代价上界：红的只有主线，
+        // 同时最多一条修复在跑。
+        let stop_the_line = crate::ready_queue::stop_the_line_ready_stream(workspace_id);
+        let preempting = ClaimBudget {
+            slots: Arc::new(tokio::sync::Semaphore::new(STOP_THE_LINE_CLAIM_CONCURRENCY)),
+            limit: STOP_THE_LINE_CLAIM_CONCURRENCY,
+        };
 
         let loops = crate::ready_queue::consumed_ready_streams(workspace_id, owns_executor_role)
             .into_iter()
             .map(|ready_stream| {
+                let budget = if ready_stream == stop_the_line {
+                    preempting.clone()
+                } else {
+                    claim.clone()
+                };
                 self.run_one_ready_stream(
                     task_backend.clone(),
                     result_backend.clone(),
                     ready_stream,
                     workspace_id.to_string(),
-                    claim.clone(),
+                    budget,
                     shutdown.clone(),
                 )
             });

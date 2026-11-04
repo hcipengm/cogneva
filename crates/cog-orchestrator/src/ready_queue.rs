@@ -34,6 +34,25 @@ pub fn process_local_ready_stream(workspace_id: &str) -> String {
     format!("orchestrator:ready:{workspace_id}:local")
 }
 
+/// The ready queue for work that must run before the ordinary queue drains.
+///
+/// A stream is a first-in-first-out log and a task's place in it is fixed the
+/// moment its message is appended: the highest priority in the graph cannot
+/// overtake a message that is already ahead of it. And the ordinary queue does
+/// get deep -- on 2026-11-04 the process-local ready stream held 18,032
+/// unread entries, so a message appended then would have been read weeks
+/// later. Priority therefore has to be expressed as a queue, not as a number:
+/// this stream is drained by a consumer whose budget is its own, so a stop-the-
+/// line task runs while the ordinary queue is still full, instead of waiting
+/// for it to empty.
+///
+/// Read only by the deployment that owns the executor role, for the same reason
+/// as [`process_local_ready_stream`]: the artifact of a change-generation task
+/// is written into that process's change directory.
+pub fn stop_the_line_ready_stream(workspace_id: &str) -> String {
+    format!("orchestrator:ready:{workspace_id}:stop-the-line")
+}
+
 /// Whether this task names the unit that must run it.
 ///
 /// A task with an owner is not offered to the shared queue. The queue is a
@@ -106,7 +125,14 @@ pub fn is_face_duty(task: &Task) -> bool {
 /// The queue a ready task is published to. One definition, because the
 /// publisher and the consumer must answer the same question the same way.
 pub fn ready_stream_for(task: &Task, workspace_id: &str) -> String {
-    if task.is_self_evolution() {
+    if task
+        .input
+        .get(cog_core::INPUT_READY_LANE)
+        .and_then(|lane| lane.as_str())
+        == Some(cog_core::READY_LANE_STOP_THE_LINE)
+    {
+        stop_the_line_ready_stream(workspace_id)
+    } else if task.is_self_evolution() {
         process_local_ready_stream(workspace_id)
     } else {
         ready_stream(workspace_id)
@@ -383,7 +409,9 @@ pub fn admission_for_pass(
 /// caller is a label value that will one day hold a task id, and a series named
 /// by a value that changes with the tick is a series per tick.
 pub fn stream_kind(stream: &str, workspace_id: &str) -> &'static str {
-    if stream == process_local_ready_stream(workspace_id) {
+    if stream == stop_the_line_ready_stream(workspace_id) {
+        "stop_the_line"
+    } else if stream == process_local_ready_stream(workspace_id) {
         "local"
     } else {
         "shared"
@@ -396,6 +424,7 @@ pub fn consumed_ready_streams(workspace_id: &str, owns_executor_role: bool) -> V
     let mut streams = vec![ready_stream(workspace_id)];
     if owns_executor_role {
         streams.push(process_local_ready_stream(workspace_id));
+        streams.push(stop_the_line_ready_stream(workspace_id));
     }
     streams
 }
@@ -442,6 +471,63 @@ mod tests {
             "orchestrator:ready:ws:local"
         );
         assert_ne!(ready_stream("ws"), process_local_ready_stream("ws"));
+        assert_eq!(
+            stop_the_line_ready_stream("ws"),
+            "orchestrator:ready:ws:stop-the-line"
+        );
+        assert_ne!(ready_stream("ws"), stop_the_line_ready_stream("ws"));
+        assert_ne!(
+            process_local_ready_stream("ws"),
+            stop_the_line_ready_stream("ws")
+        );
+    }
+
+    /// A task that says it may not wait goes to the lane nothing else uses.
+    ///
+    /// This is the whole mechanism behind "the red build is repaired first":
+    /// the other queue is a first-in-first-out log, so the only way to run
+    /// ahead of what is already in it is not to be in it. A task that keeps
+    /// travelling on the ordinary queue waits behind every message already
+    /// appended -- on 2026-11-04 the local queue held 18,032 of them.
+    #[test]
+    fn a_task_that_may_not_wait_travels_in_its_own_lane() {
+        let mut urgent = task(
+            "t1",
+            TaskType::Custom("ci_hold_fix".into()),
+            serde_json::json!({"goal": "make CI green", "evolution_mode": "generate_change"}),
+        );
+        urgent.input[cog_core::INPUT_READY_LANE] =
+            serde_json::json!(cog_core::READY_LANE_STOP_THE_LINE);
+        assert_eq!(
+            ready_stream_for(&urgent, "ws"),
+            stop_the_line_ready_stream("ws"),
+            "a stop-the-line task must not queue behind the ordinary generation backlog"
+        );
+        assert_eq!(
+            stream_kind(&ready_stream_for(&urgent, "ws"), "ws"),
+            "stop_the_line"
+        );
+
+        // The marker is read as a value, not as "any lane": a task naming some
+        // other lane keeps the routing it had.
+        let mut other = urgent.clone();
+        other.input[cog_core::INPUT_READY_LANE] = serde_json::json!("ordinary-ish");
+        assert_eq!(
+            ready_stream_for(&other, "ws"),
+            process_local_ready_stream("ws")
+        );
+    }
+
+    /// Only the deployment that owns the executor role reads the lane: the
+    /// change a stop-the-line repair produces is written into that process's
+    /// change directory, exactly like an ordinary generation task's.
+    #[test]
+    fn only_the_executor_role_reads_the_stop_the_line_lane() {
+        let worker = consumed_ready_streams("ws", false);
+        assert_eq!(worker, vec![ready_stream("ws")]);
+        let executor = consumed_ready_streams("ws", true);
+        assert!(executor.contains(&stop_the_line_ready_stream("ws")));
+        assert!(executor.contains(&process_local_ready_stream("ws")));
     }
 
     #[test]
@@ -511,7 +597,11 @@ mod tests {
         let executor = consumed_ready_streams("ws", true);
         assert_eq!(
             executor,
-            vec![ready_stream("ws"), process_local_ready_stream("ws")]
+            vec![
+                ready_stream("ws"),
+                process_local_ready_stream("ws"),
+                stop_the_line_ready_stream("ws"),
+            ]
         );
     }
 

@@ -757,6 +757,31 @@ pub const INPUT_TASK_KIND: &str = "task_kind";
 /// against a constant are two spellings that drift apart silently.
 pub const INPUT_PRINCIPLES: &str = "principles";
 
+/// The `task.input` key that names the ready-queue lane this task must travel in.
+///
+/// The queue is a first-in-first-out stream with one consumer: a message
+/// appended today is read after every message already in front of it. That is
+/// the right shape for ordinary work — it lets a slow producer meet a fast
+/// consumer without losing anything — and the wrong shape for work whose whole
+/// value is that it happens now. A producer that says "nothing else may go
+/// first" needs a lane of its own, because no priority, however high, reorders
+/// a message that was already handed to the stream.
+///
+/// The producer writes the lane; the queue reads it when it decides where a
+/// ready task is published. One key rather than a string spelled at both ends,
+/// for the reason the markers above state.
+pub const INPUT_READY_LANE: &str = "ready_lane";
+
+/// The lane for work that must run before ordinary work, whether or not the
+/// ordinary lane is full.
+///
+/// Its one user is the repair of a red main: the mainline deployer holds every
+/// rollout while upstream CI reports a failure, so every fix waiting behind the
+/// ordinary queue is a fix the whole platform waits on. The lane is served by a
+/// consumer with a budget of its own, which is what makes the word "priority"
+/// mean something here rather than only describing the order of a list.
+pub const READY_LANE_STOP_THE_LINE: &str = "stop_the_line";
+
 impl Task {
     pub fn new(id: impl Into<String>, task_type: TaskType, input: serde_json::Value) -> Self {
         let now = Utc::now();

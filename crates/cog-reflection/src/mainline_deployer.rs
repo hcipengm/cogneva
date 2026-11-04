@@ -5172,6 +5172,13 @@ impl MainlineDeployer {
                 "rev": rev,
                 "failed_checks": failed_checks,
                 "evidence": seen,
+                // 这一行是停线单：判红的主线让整个部署器扣住，每一版新构建都
+                // 滚不上去，所以它在它变绿之前比任何普通变更都该先跑。写进输入
+                // 而不是只写进优先级：就绪队列是先进先出的日志，一条已经排在前
+                // 面的消息不会因为后来者的优先级更高而让路——2026-11-04 实测，
+                // 这一单开出来时前面压着 18,032 条未读的就绪消息，于是它一直
+                // 停在 Scheduled，被清扫器当作「从没被启动」反复回填。
+                (cog_core::INPUT_READY_LANE): cog_core::READY_LANE_STOP_THE_LINE,
             }),
         );
         // 面与验收都挂在行上，不只在目标文字里：验收是「这一行关掉长什么样」被读的
@@ -17201,6 +17208,54 @@ exec {real} "$@"
             planner.status(&second_fix),
             Some(cog_core::TaskStatus::Pending),
             "读数说有主，图里就得有一行活的单子：{second_rows:?}"
+        );
+    }
+
+    /// 修复单必须走停线通道，而不是排在普通变更后面。
+    ///
+    /// 就绪队列是先进先出的日志：一条已经排在前面的消息不会因为后来者的优先级
+    /// 更高而让路。实测（2026-11-04）这一单开出来时前面压着 18,032 条未读消息，
+    /// 于是它一直停在 `Scheduled`、被清扫器当作「从没被启动」反复回填，主线从
+    /// 判红到那时一条修复都没跑过。把这一行输入里的 lane 去掉，它就会回到那条
+    /// 18,032 深的队列里——这条断言红。
+    #[tokio::test]
+    async fn the_repair_row_travels_in_the_stop_the_line_lane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        planner
+            .refuse_decomposition
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let checks = vec!["github:Test".to_string()];
+        let (owner, rows) = deployer
+            .dispatch_ci_remediation("abc123", &checks, 100)
+            .await;
+        assert_eq!(owner, CiHoldOwner::Owned);
+
+        let fix_id = ci_hold_fix_task_id(
+            "abc123",
+            &Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string(),
+            100,
+        );
+        assert!(rows.contains(&fix_id), "{rows:?}");
+        let submitted = planner
+            .rows()
+            .into_iter()
+            .flatten()
+            .find(|task| task.id == fix_id)
+            .expect("the fix row was submitted through the orchestrator");
+        assert_eq!(
+            submitted
+                .input
+                .get(cog_core::INPUT_READY_LANE)
+                .and_then(|lane| lane.as_str()),
+            Some(cog_core::READY_LANE_STOP_THE_LINE),
+            "a red main's repair must not queue behind ordinary change generation"
         );
     }
 

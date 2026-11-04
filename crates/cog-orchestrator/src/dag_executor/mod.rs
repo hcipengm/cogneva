@@ -478,9 +478,15 @@ impl DagExecutorRuntime {
         // closed set defaults to whichever member is written first.
         let mut admitted_by_stream: HashMap<String, crate::ready_queue::PassAdmission> =
             HashMap::new();
+        // Every queue this deployment publishes to, including the stop-the-line
+        // lane: a stream missing from this list is published with no admission
+        // reading at all, and its owed count is spent on nothing -- the task
+        // goes out, but the reading that says whether it was allowed to is
+        // blank, which is the one state a hold and an idle queue share.
         for stream in [
             crate::ready_queue::ready_stream(&self.config.workspace_id),
             crate::ready_queue::process_local_ready_stream(&self.config.workspace_id),
+            crate::ready_queue::stop_the_line_ready_stream(&self.config.workspace_id),
         ] {
             let ready = by_stream.get(&stream).map(|e| e.len()).unwrap_or(0) as u64;
             let owed = in_flight.get(&stream).copied().unwrap_or(0) as u64;
