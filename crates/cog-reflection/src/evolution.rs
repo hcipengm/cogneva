@@ -7,6 +7,10 @@
 //!
 //! L2 (semi-automatic, medium risk):
 //!   - Generate Rust code changes and write them to `evolution-changes/`.
+//!     - A change whose diff exceeds the changed-line budget the landing policy
+//!       also reads is refused before the diff is written, so an over-budget
+//!       change costs the generation round rather than the whole pipeline; the
+//!       budget comes from that shared configuration key, not from this module.
 //!   - The system **never** auto-merges into `main`; changes await review.
 
 use std::sync::Arc;
