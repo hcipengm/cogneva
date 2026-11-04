@@ -227,6 +227,16 @@ jobs:
         run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test observability_events_batch_writes -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # A stream delta is the one event class produced per token, so it is both
+      # the most numerous thing in the event log and the only one whose reader
+      # is a live subscriber rather than a query. Keeping it out of the table
+      # therefore has two halves, and dropping the write without keeping the
+      # broadcast would pass a test that only looks at the table.
+      - name: Live-DB stream deltas stay out of the event log
+        if: ${{ !cancelled() }}
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test stream_deltas_reach_live_readers_but_not_the_event_log -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A schema statement's wait for its locks is a fact about the server's
       # lock queue across two sessions, so nothing that runs without a server
       # can see any of it: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes

@@ -815,6 +815,25 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     fn publish_event(&self, event: AgentEvent) {
         let _ = self.event_tx.send(event.clone());
 
+        // 流式增量只发给订阅方，不落这张表。
+        //
+        // 一个增量携带的是它自己那一小段（正文这里只加，不重复整段），所以单条不贵。
+        // 贵的是条数：它是唯一按 token 生成的事件，集群库实测（2026-11-04）三分钟内
+        // 11813 条，表里 856042 行是它、占全部事件的八成四。读者要的是消息完成时的
+        // 那一份，`MessageEnd` 已经给了；增量本身只有实时视图要，而实时视图读的是
+        // 上面那次广播。
+        //
+        // 它挤占的是历史那一面。历史事件查询取「最近一天的前一万条」，被增量填满之后
+        // 这个窗口实际只剩最后几十秒：想读回任何一件非增量的事，都得先翻过这一万条
+        // 增量，而它们一条也翻不完。它同时把容量上限变成天花板上的滑动门——表按行数
+        // 封顶，增量占八成，别的读窗口就被挤到最小值。
+        //
+        // 工具进度增量（`ToolExecutionUpdate`）形状相同，但今天没有量：先按量到的
+        // 那一条改，不替没量过的通路拍板。
+        if matches!(event, AgentEvent::MessageUpdate { .. }) {
+            return;
+        }
+
         self.start_event_writer();
 
         // 队列满时**不丢**，改为立刻单独写这一条：排队的代价由这一条自己承担，
