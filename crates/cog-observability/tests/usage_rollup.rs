@@ -123,6 +123,7 @@ async fn a_window_folds_the_ledger_and_reruns_in_place_with_zeros_for_the_idle()
     };
 
     let record = |actor: &str, result: &str, input: u64, output: u64, cached: u64| LlmUsageRecord {
+        refused_scope: None,
         upstream: upstream.clone(),
         api_style: api_style.clone(),
         model: "rollup-test-model".to_string(),
@@ -314,6 +315,7 @@ async fn the_rolled_reader_sums_the_fold_over_the_windows_in_range() {
     };
 
     let record = |input: u64, output: u64, latency: u64| LlmUsageRecord {
+        refused_scope: None,
         upstream: upstream.clone(),
         api_style: api_style.clone(),
         model: "rolled-read-model".to_string(),
@@ -493,6 +495,7 @@ async fn the_summed_read_leaves_out_a_combination_the_range_never_used() {
 
     store
         .record(&LlmUsageRecord {
+            refused_scope: None,
             upstream: upstream.clone(),
             api_style: "openai".to_string(),
             model: "idle-combo-model".to_string(),
@@ -618,6 +621,7 @@ async fn the_outcome_breakdown_keeps_the_verdict_that_explains_a_failed_range() 
         async move {
             store
                 .record(&LlmUsageRecord {
+                    refused_scope: None,
                     upstream,
                     api_style: "openai".to_string(),
                     model: "outcome-model".to_string(),
@@ -869,6 +873,7 @@ async fn the_fold_carries_the_written_half_and_keeps_no_reading_apart_from_zero(
     };
 
     let record = |actor: &str, cached: u64, created: Option<u64>| LlmUsageRecord {
+        refused_scope: None,
         upstream: upstream.clone(),
         // The Anthropic face is the one that reports what it wrote; the
         // OpenAI-compatible face never does, which is the whole reason the
@@ -1018,6 +1023,7 @@ async fn one_upstream_answering_on_two_faces_spends_as_two_rows() {
     };
 
     let record = |api_style: &str, input: u64, cached: u64| LlmUsageRecord {
+        refused_scope: None,
         upstream: upstream.clone(),
         api_style: api_style.to_string(),
         model: "rollup-faces-model".to_string(),

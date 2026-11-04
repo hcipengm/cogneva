@@ -405,6 +405,14 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS pace_upstreams JSONB;
 -- 这个数的**量级**——窗口翻页黑障是几十秒到几分钟，额度烧穿是几千秒。
 -- 可空且无默认值：非熔断行上 `NULL` 读作"不适用"，写 0 会读成"立刻可以重试"。
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS retry_after_secs BIGINT;
+-- 拒掉这一发的是哪一级上限（`user` / `ws`）。结果词
+-- `refused_by_owner_budget` 对两级共用，人没满而租户满了与这个人自己满了写在
+-- 同一格里；按人与按租户的两路拒绝数要各按自己这一级筛，不筛的话每一笔拒绝都
+-- 同时记进人和租户两份数，两份读数都答不出「这一级的上限咬没咬到人」。
+-- 可空且无默认值：别的结果行上 `NULL` 读作「不适用」，本列存在之前写下的拒绝
+-- 行也是 `NULL`（没有记录），那些行不进任何一份计数——发布当天宁可少算，
+-- 不把同一笔数两遍。
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS refused_scope TEXT;
 CREATE INDEX IF NOT EXISTS idx_gateway_llm_usage_ts ON gateway_llm_usage (ts);
 -- 窗口配速那一次读按 `(upstream, result)` 与 `(upstream, refusal_kind)` 各取一
 -- 小撮，而表里绝大多数行是熔断拒绝（`upstream = '-'`，与任何一家都不匹配）。没有
@@ -607,9 +615,9 @@ impl LlmUsageStore {
                  estimated_input, task_id, latency_ms, refusal_kind, retry_after_secs,
                  pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
                  pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
-                 usage_outcome, owner_id)
+                 usage_outcome, owner_id, refused_scope)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -636,6 +644,7 @@ impl LlmUsageStore {
         .bind(pace_upstreams)
         .bind(r.usage_outcome.map(|o| o.as_str()))
         .bind(r.owner.as_deref())
+        .bind(r.refused_scope.as_deref())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1208,9 +1217,12 @@ impl LlmUsageStore {
 
     /// 今天这个人被自己的上限拒了几发，`(person, refusals)`。
     ///
-    /// 只数 `refused_by_owner_budget` 一种结果词：那是唯一一种「是这个人的上限
-    /// 拒的」的拒绝。旁边那几种拒绝各有各的格子与修法（任务自己的预算用完、
-    /// 配速、熔断），合在一起数会让读的人去抬一个根本没碰过的上限。
+    /// 只数 `refused_by_owner_budget` 且 `refused_scope = 'user'` 的行：结果词
+    /// 一种、两级共用，只说「某个主体今天额度用完了」。不按级筛的话，租户上限
+    /// 拒掉的一发也会记进这个人名下，于是这一列读不出「他自己的上限咬没咬到
+    /// 人」——而这正是「该给他加额度」这个处置的判据。旁边那几种拒绝各有各的
+    /// 格子与修法（任务自己的预算用完、配速、熔断），合在一起数会让读的人去抬
+    /// 一个根本没碰过的上限。
     ///
     /// 这是花销汇总看不见的那一半：被拒的一发不花钱，所以一个整天被拒的人
     /// 在花销账上要么不出现，要么是一行 0——而 0 与「今天没来过」长得一模一样。
@@ -1236,6 +1248,7 @@ impl LlmUsageStore {
                    ) t ON TRUE
                   WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
                     AND u.result = $2
+                    AND u.refused_scope = $3
              ) s
              WHERE person IS NOT NULL
              GROUP BY person
@@ -1243,6 +1256,7 @@ impl LlmUsageStore {
         ))
         .bind(since_unix as f64)
         .bind(refused)
+        .bind(cog_core::QuotaScope::User.as_str())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -1258,10 +1272,11 @@ impl LlmUsageStore {
 
     /// 今天这个租户被自己的上限拒了几发，`(workspace_id, refusals)`。
     ///
-    /// 与按人那一份同一批行、同一个结果词，折叠的那个域换成任务行上的工作区
-    /// ——这正是 [`Self::spend_by_workspace_since`] 折叠的那个域。被拒的那一发
-    /// 自己带着 `owner_id`（可能为空），租户身份只能从 `task_id` 连回任务图，
-    /// 与花销账同一条规则。
+    /// 与按人那一份同一批行、同一个结果词，两处筛选各按自己这一级
+    /// （`refused_scope = 'ws'`），折叠的那个域换成任务行上的工作区——这正是
+    /// [`Self::spend_by_workspace_since`] 折叠的那个域。被拒的那一发自己带着
+    /// `owner_id`（可能为空），租户身份只能从 `task_id` 连回任务图，与花销账
+    /// 同一条规则。
     pub async fn refusals_by_workspace_since(
         &self,
         since_unix: i64,
@@ -1280,6 +1295,7 @@ impl LlmUsageStore {
                    ) t ON TRUE
                   WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
                     AND u.result = $2
+                    AND u.refused_scope = $3
              ) s
              WHERE workspace_id IS NOT NULL AND workspace_id <> ''
              GROUP BY workspace_id
@@ -1287,6 +1303,7 @@ impl LlmUsageStore {
         ))
         .bind(since_unix as f64)
         .bind(refused)
+        .bind(cog_core::QuotaScope::Workspace.as_str())
         .fetch_all(&self.pool)
         .await?;
         Ok(rows

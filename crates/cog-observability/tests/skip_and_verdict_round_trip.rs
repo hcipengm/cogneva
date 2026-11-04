@@ -105,6 +105,7 @@ fn hour(y: i32, mo: u32, d: u32, h: u32) -> DateTime<Utc> {
 async fn spend(store: &LlmUsageStore, actor: &str, tokens_input: u64, tokens_output: u64) {
     store
         .record(&LlmUsageRecord {
+            refused_scope: None,
             upstream: "probe-upstream".into(),
             api_style: "openai".into(),
             model: PROBE_MODEL.into(),

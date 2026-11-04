@@ -2508,6 +2508,7 @@ fn failed_attempt_usage(
         return None;
     }
     Some(LlmUsageRecord {
+        refused_scope: None,
         upstream: LlmHealthTable::key(upstream),
         api_style: upstream.api_style.clone(),
         model: upstream.model.clone(),
@@ -2571,6 +2572,7 @@ fn pooled_refusal_usage(
     retry_after_secs: u64,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
+        refused_scope: None,
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
         model: POOLED_REFUSAL_UNNAMED.to_string(),
@@ -2621,6 +2623,7 @@ fn paced_refusal_usage(
     pace: PaceEvidence,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
+        refused_scope: None,
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
         model: POOLED_REFUSAL_UNNAMED.to_string(),
@@ -2669,6 +2672,7 @@ fn unidentified_refusal_usage(
     owner: Option<&str>,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
+        refused_scope: None,
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
         model: POOLED_REFUSAL_UNNAMED.to_string(),
@@ -3021,6 +3025,7 @@ fn task_budget_refusal_usage(
     retry_after_secs: u64,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
+        refused_scope: None,
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
         model: POOLED_REFUSAL_UNNAMED.to_string(),
@@ -3238,6 +3243,9 @@ fn owner_budget_refusal_usage(
     refusal: &OwnerBudgetRefusal,
 ) -> LlmUsageRecord {
     LlmUsageRecord {
+        // 拒掉它的是哪一级：事后读这笔拒绝的人要能分开「该给这个人加额度」与
+        // 「该给这个租户加额度」，而结果词本身只有一种。
+        refused_scope: Some(refusal.scope.as_str().to_string()),
         upstream: POOLED_REFUSAL_UNNAMED.to_string(),
         api_style: style.to_string(),
         model: POOLED_REFUSAL_UNNAMED.to_string(),
@@ -3864,6 +3872,7 @@ async fn record_llm_tokens(
     land_usage_record(
         state,
         LlmUsageRecord {
+            refused_scope: None,
             upstream: key,
             api_style: upstream.api_style.clone(),
             model: upstream.model.clone(),
@@ -19548,6 +19557,12 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         let row =
             owner_budget_refusal_usage("openai", "web_chat", "interactive", Some("t-9"), &refusal);
         assert_eq!(row.result, "refused_by_owner_budget");
+        assert_eq!(
+            row.refused_scope.as_deref(),
+            Some("user"),
+            "结果词两级共用，拒掉它的是哪一级只能从这一格读；不写的话事后审这笔\
+             拒绝分不出该找属主还是该找租户管理员"
+        );
         assert_eq!(row.task.as_deref(), Some("t-9"), "工作那一格照请求声明照抄");
         // 这一行存在的理由就是「谁被拒了」，所以人那一格不能空：拒绝之后花销
         // 计数不再动，事后靠计数追不出这个人。
@@ -19565,6 +19580,35 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         assert_eq!(
             row.upstream, POOLED_REFUSAL_UNNAMED,
             "拒绝发生在选上游之前，挂到任何一家名下都会读成「那一家拒的」"
+        );
+    }
+
+    /// 租户那一级拒的，行上写的是租户；按人的拒绝数不数它。
+    ///
+    /// 结果词两级共用，事后审一笔拒绝（谁该加额度）只能读这一格。两种被拒写同一
+    /// 格的话，按人的那份会把租户上限拒掉的每一发都记进当事人名下，于是运维去给
+    /// 一个根本没碰过上限的人加额度。
+    #[test]
+    fn a_workspace_refusal_names_the_workspace_level_it_was_judged_at() {
+        let refusal = OwnerBudgetRefusal {
+            scope: cog_core::QuotaScope::Workspace,
+            target: "ws-1".to_string(),
+            owner: Some("u-1".to_string()),
+            spent_today: 1200,
+            hard_limit: 1000,
+            wait_secs: 3600,
+        };
+        let row = owner_budget_refusal_usage("openai", "web_chat", "interactive", None, &refusal);
+        assert_eq!(row.result, "refused_by_owner_budget");
+        assert_eq!(
+            row.refused_scope.as_deref(),
+            Some("ws"),
+            "越线的是租户那一格：只写结果词的话，人与租户两份数会把这一发都算上"
+        );
+        assert_eq!(
+            row.owner.as_deref(),
+            Some("u-1"),
+            "当事人照写，但它是被租户上限挡下的"
         );
     }
 

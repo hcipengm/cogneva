@@ -361,6 +361,23 @@ pub struct LlmUsageRecord {
     /// empty rather than gathering unattributed calls into one placeholder
     /// person.
     pub owner: Option<String>,
+    /// 拒掉这一发的是哪一级的上限，`QuotaScope::as_str()` 的取值
+    /// （`user` / `ws`）；只在 `result = "refused_by_owner_budget"` 的行上有。
+    ///
+    /// 结果词只说「某个主体的当日额度用完了」，说不出是哪一级：人还没满而它所属
+    /// 的工作区满了，与这个人自己满了，写在同一格里。而这两句话指向两个不同的
+    /// 处置者——给自己加额度的属主，和给工作区加额度的租户管理员——事后审这笔
+    /// 拒绝（比如一次账单争议）时，答案只能从这一格读出。响应正文已经把 `scope`
+    /// 交给了调用方，可那是当场就读完即走的；账本是唯一留得下来的地方。
+    ///
+    /// 按人与按工作区的两路拒绝计数各按自己这一级筛：不筛的话，一个人的每次被拒
+    /// 都会同时记进人和他所在租户两份数里，两份读数就都答不出「这一级的上限
+    /// 到底咬没咬到人」。
+    ///
+    /// `None` 在别的行上是「不适用」，在本次列存在之前写下的行上是「没有记录」：
+    /// 推进滚动发布的那一天，旧进程写下的拒绝数不进任何一份，比把它们同时算进
+    /// 两份数要好——后者会在发布当天把每一笔拒绝数两遍。
+    pub refused_scope: Option<String>,
     /// Wall time of the call; for streams this is first-byte to last-byte.
     pub latency_ms: u64,
     /// 窗口配速那一拍的读数，只在 `result = "refused_by_pace"` 的行上有。
@@ -766,12 +783,14 @@ pub trait LlmUsageLedger: Send + Sync {
     /// How many calls were turned away because a person's own day was spent,
     /// since `since_unix`, per person, `(person, refusals)`.
     ///
-    /// Counted from [`crate::UsageResult::RefusedByOwnerBudget`] rows, which is the one
-    /// result word that means "this person's ceiling did the refusing". The
-    /// neighbouring refusals deliberately do not count here: a job's own budget
-    /// running out is a different cell with a different remedy, and folding the
-    /// two together would send the reader to raise a ceiling that was never
-    /// touched.
+    /// Counted from [`crate::UsageResult::RefusedByOwnerBudget`] rows whose
+    /// `refused_scope` is `user` -- the one result word for a spent allowance,
+    /// narrowed to the level that spent it. The word alone cannot answer this:
+    /// it is shared with the workspace level, so without the level a call the
+    /// tenant's ceiling turned away would be counted against the person, and
+    /// the reader would raise a ceiling that was never touched. The
+    /// neighbouring refusals deliberately do not count here either: a job's own
+    /// budget running out is a different cell with a different remedy.
     ///
     /// This is the half of the day the spend folds cannot show. A refused call
     /// spends nothing, so a person who was refused all day has a spend row of
@@ -794,9 +813,12 @@ pub trait LlmUsageLedger: Send + Sync {
     /// calls refused because the workspace's day was spent, folded onto the
     /// workspace of the task the call was made for.
     ///
-    /// Same result word and the same reason for the same word: the row records
-    /// which ceiling refused, and the fold onto the tenant is the one
-    /// [`spend_by_workspace_since`](Self::spend_by_workspace_since) makes.
+    /// Same result word, opposite side of the same `refused_scope` split: the
+    /// fold onto the tenant is the one
+    /// [`spend_by_workspace_since`](Self::spend_by_workspace_since) makes, and
+    /// only rows the workspace's own ceiling refused count here. A refused row
+    /// written before `refused_scope` existed counts in neither list -- one day
+    /// of undercounting beside a lifetime of counting the same call twice.
     async fn refusals_by_workspace_since(
         &self,
         _since_unix: i64,

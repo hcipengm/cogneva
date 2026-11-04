@@ -29,6 +29,7 @@ use cog_test_support::database_url;
 
 fn row(actor: &str, result: &str, outcome: Option<MeteringOutcome>) -> LlmUsageRecord {
     LlmUsageRecord {
+        refused_scope: None,
         upstream: "metering-test-upstream".to_string(),
         api_style: "openai".to_string(),
         model: "metering-test-model".to_string(),

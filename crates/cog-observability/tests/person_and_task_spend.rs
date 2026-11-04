@@ -56,19 +56,21 @@ async fn refused_row(
     pool: &PgPool,
     ts: chrono::DateTime<Utc>,
     result: cog_core::UsageResult,
+    refused_scope: Option<&str>,
     owner: Option<&str>,
     task: Option<&str>,
 ) {
     sqlx::query(
         "INSERT INTO gateway_llm_usage
-             (id, ts, upstream, api_style, model, result, tokens_input, tokens_output, task_id, owner_id)
-         VALUES ($1, $2, 'test-upstream', 'openai', 'test-model', $3, 0, 0, $4, $5)",
+             (id, ts, upstream, api_style, model, result, tokens_input, tokens_output, task_id, owner_id, refused_scope)
+         VALUES ($1, $2, 'test-upstream', 'openai', 'test-model', $3, 0, 0, $4, $5, $6)",
     )
     .bind(uuid::Uuid::new_v4())
     .bind(ts)
     .bind(result.as_str())
     .bind(task)
     .bind(owner)
+    .bind(refused_scope)
     .execute(pool)
     .await
     .expect("write a refusal row");
@@ -389,49 +391,76 @@ async fn a_refusal_is_counted_against_the_subject_the_ceiling_that_refused_belon
         .expect("write a task");
     }
 
-    // 属主自己那一格的上限拒的，且没有任务身份：只算人，不进任何租户。
+    // 这个人自己那一格的上限拒的，且没有任务身份：只算人，不进任何租户。
     refused_row(
         &pool,
         day + chrono::Duration::hours(1),
         cog_core::UsageResult::RefusedByOwnerBudget,
+        Some("user"),
         Some(&person_a),
         None,
     )
     .await;
-    // 没有属主，靠任务连到提交人；同一行也连到任务跑的租户。
+    // 没有属主、靠任务连到提交人，拒的是这个人自己那一格：租户那一列不该跟着
+    // 记一笔——这正是不按级筛时会出的错。
     refused_row(
         &pool,
         day + chrono::Duration::hours(2),
         cog_core::UsageResult::RefusedByOwnerBudget,
+        Some("user"),
         None,
         Some(&task_a),
     )
     .await;
-    // 属主与提交人都在：人那一列属主优先，租户那一列仍跟着任务走。
+    // 租户那一格的上限拒的。属主只是这一发的当事人，人那一列不该记他的账；
+    // 租户那一列跟着任务走，落到 tenant_b。
     refused_row(
         &pool,
         day + chrono::Duration::hours(3),
         cog_core::UsageResult::RefusedByOwnerBudget,
+        Some("ws"),
         Some(&person_c),
         Some(&task_b),
+    )
+    .await;
+    // 租户上限拒的、没有属主：只算它跑在的那个租户。
+    refused_row(
+        &pool,
+        day + chrono::Duration::hours(4),
+        cog_core::UsageResult::RefusedByOwnerBudget,
+        Some("ws"),
+        None,
+        Some(&task_a),
     )
     .await;
     // 花掉钱的一发不是拒绝，不许进这一列。
     ledger_row(
         &pool,
-        day + chrono::Duration::hours(4),
+        day + chrono::Duration::hours(5),
         Some(&person_a),
         None,
         90,
     )
     .await;
-    // 任务预算拒的：那是这件活的预算，不是这个人的上限，谁也不该被记一笔。
+    // 任务预算拒的：那是这件活的预算，不是谁的当日额度，谁也不该被记一笔。
     refused_row(
         &pool,
-        day + chrono::Duration::hours(5),
+        day + chrono::Duration::hours(6),
         cog_core::UsageResult::RefusedByBudget,
+        None,
         Some(&person_d),
         Some(&task_b),
+    )
+    .await;
+    // 这一列存在之前写下的额度拒绝：没有级别可读。两份数都不收它——发布那一
+    // 天宁可少算，也不能把同一笔拒绝同时记进人和租户两份账。
+    refused_row(
+        &pool,
+        day + chrono::Duration::hours(7),
+        cog_core::UsageResult::RefusedByOwnerBudget,
+        None,
+        Some(&person_d),
+        None,
     )
     .await;
     // 前一天被拒的一发：这个读的窗口与花销同一个，从当日零点起算。
@@ -439,6 +468,7 @@ async fn a_refusal_is_counted_against_the_subject_the_ceiling_that_refused_belon
         &pool,
         day - chrono::Duration::hours(1),
         cog_core::UsageResult::RefusedByOwnerBudget,
+        Some("user"),
         Some(&person_d),
         None,
     )
@@ -450,9 +480,9 @@ async fn a_refusal_is_counted_against_the_subject_the_ceiling_that_refused_belon
         .expect("read the refusals by person");
     assert_eq!(
         people,
-        vec![(person_a.clone(), 2), (person_c.clone(), 1)],
-        "属主那一行 + 靠任务连到提交人的那一行；两处都在时属主优先而不重复记；\
-         任务预算拒的不算给谁；昨天的不在今天的窗口里"
+        vec![(person_a.clone(), 2)],
+        "只数人这一级的拒绝：属主那一行 + 靠任务连到提交人的那一行；租户上限拒的\
+         不记给人；任务预算拒的不算给谁；没有级别的那一行与昨天的那一行都不在"
     );
 
     let workspaces = store
@@ -461,8 +491,9 @@ async fn a_refusal_is_counted_against_the_subject_the_ceiling_that_refused_belon
         .expect("read the refusals by workspace");
     assert_eq!(
         workspaces,
-        vec![(tenant_a.clone(), 1), (tenant_b.clone(), 2)],
-        "没有任务身份的那一行不进任何租户；同一件活上的两次拒绝都算它跑在的那个租户"
+        vec![(tenant_a.clone(), 1), (tenant_b.clone(), 1)],
+        "只数租户这一级的拒绝：人这一级拒掉的两发不进租户，没有任务身份的那一发\
+         不进任何租户，缺级别的那一发两份都不进"
     );
     assert!(
         workspaces.iter().all(|(id, _)| !id.is_empty()),

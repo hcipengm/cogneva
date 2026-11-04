@@ -55,6 +55,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
                   estimated: Option<u64>,
                   task: Option<&str>,
                   refusal_kind: Option<&str>| LlmUsageRecord {
+        refused_scope: None,
         upstream: "ledger-test-upstream".to_string(),
         api_style: "openai".to_string(),
         model: "ledger-test-model".to_string(),
