@@ -15,6 +15,8 @@
 //! makes a queue that did its job look like a leak — the whole reason the walk
 //! asks the group state instead of the length.
 //!
+//! principle: feedback_pel_is_not_queue_depth
+//!
 //! Four series, all from one walk:
 //!
 //! - `agent_inbox_orphaned_streams{state="empty"}` — unowned inboxes with no
