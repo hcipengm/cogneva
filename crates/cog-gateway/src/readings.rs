@@ -318,36 +318,7 @@ pub const LLM_UPSTREAMS_HEALTHY: ReadingSpec = ReadingSpec {
     dashboard_uid: None,
 };
 
-/// How long the connection headroom lasts at the growth rate seen now.
-///
-/// The row beside [`PG_CONNECTIONS`], and the one that answers what raising
-/// `maxclients` actually buys. `PG_CONNECTIONS` counts the connections in use:
-/// a number under its threshold reads healthy whether the ceiling is a month
-/// away or an hour away, and the action it invites — raising the cap — leaves
-/// the slope untouched. At an unchanged slope the ceiling moves out in
-/// proportion to the headroom added, so the cap buys time and this is the
-/// price: headroom divided by the growth per second.
-///
-/// The slope is `deriv` over an hour rather than the difference of two scrapes:
-/// connections open and close, and one pair of samples turns a closed pool into
-/// a cliff. `clamp_min` keeps a flat or falling trend from dividing by zero —
-/// a system that is not growing has no projected ceiling at all — and the
-/// reading is in seconds because that is the unit the decision is made in.
-pub const PG_CONNECTION_TIME_BUY: ReadingSpec = ReadingSpec {
-    id: "pg_connection_time_buy_seconds",
-    title: "连接上限还能撑多久",
-    group: ReadingGroup::Infra,
-    query: r#"clamp_min((max(pg_settings_max_connections) - sum(pg_stat_database_numbackends{datname="cogneva"})) / clamp_min(deriv(pg_stat_database_numbackends{datname="cogneva"}[1h]), 1e-9), 0)"#,
-    unit: "秒",
-    warn: Some(30.0 * 86400.0),
-    crit: Some(7.0 * 86400.0),
-    higher_is_worse: false,
-    series: "deriv(pg_stat_database_numbackends[1h]) → (max_connections - backends) / slope",
-    produced_by: "postgres-exporter（数据库 Pod 内的边车）",
-    dashboard_uid: None,
-};
-
-pub const READINGS: [&ReadingSpec; 12] = [
+pub const READINGS: [&ReadingSpec; 11] = [
     &DISK_FREE,
     &PG_CONNECTIONS,
     &PG_OLDEST_TX,
@@ -359,7 +330,6 @@ pub const READINGS: [&ReadingSpec; 12] = [
     &MAINLINE_CI_HOLD_ACTIVE,
     &CHANGE_POOL_BLOCKED_OLDEST,
     &LLM_UPSTREAMS_HEALTHY,
-    &PG_CONNECTION_TIME_BUY,
 ];
 
 /// The word a reading carries about its own value.
@@ -692,30 +662,6 @@ mod tests {
             verdict_of(&PG_CONNECTIONS, Some(120.0)),
             ReadingVerdict::Critical
         );
-    }
-
-    /// principle: feedback_raising_a_connection_cap_postpones_the_limit_it_does_not_stop_the_leak
-    ///
-    /// 抬 `maxclients` 只是把撞限推后：斜率不变时，买到的时长等于新增的余量除以
-    /// 每秒增长的连接数。所以这条读数报的是「还剩多久」而不是「还剩多少」——
-    /// 后者在撞限前一个月和撞限前一小时是同一个数，而它引出的那个动作（抬上限）
-    /// 对斜率什么都没改。
-    #[test]
-    fn the_connection_ceiling_is_read_as_time_not_as_headroom() {
-        let spec = &PG_CONNECTION_TIME_BUY;
-        // 时长越少越坏：一个月告警，一周严重。
-        assert!(!spec.higher_is_worse);
-        assert!(spec.warn > spec.crit);
-        assert_eq!(verdict_of(spec, Some(90.0 * 86400.0)), ReadingVerdict::Ok);
-        assert_eq!(
-            verdict_of(spec, Some(20.0 * 86400.0)),
-            ReadingVerdict::Warning
-        );
-        assert_eq!(verdict_of(spec, Some(86400.0)), ReadingVerdict::Critical);
-        assert_eq!(verdict_of(spec, None), ReadingVerdict::Unknown);
-        // 分子是余量，分母是斜率；少了这条除法就退回成「还剩多少」。
-        assert!(spec.query.contains(" / ") && spec.query.contains("deriv("));
-        assert!(spec.query.contains("max_connections"));
     }
 
     /// 交付链那三条的判词方向：两个方向都在这一族里，写反了不会报错，只会安静地
