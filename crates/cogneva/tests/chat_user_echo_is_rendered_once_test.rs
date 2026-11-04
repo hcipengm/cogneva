@@ -23,14 +23,10 @@
 //! 判不了的：这两个文件里没有一条断言跑得起来界面。它判的是两侧对「谁供字节」
 //! 的约定一致，不是屏幕上真的只有一个气泡。
 
-use crate::common::{fsio, root};
+use crate::common::routes::read_repo;
 
 const CLIENT: &str = "web/src/store/chatStore.ts";
 const SERVER: &str = "crates/cog-gateway/src/chat.rs";
-
-fn read(rel: &str) -> String {
-    fsio::read(&root::repo_root().join(rel))
-}
 
 /// 服务端那一半：回声了一条 `user` 的 `start` 之后，把同一句当成增量再发一遍。
 ///
@@ -109,8 +105,8 @@ fn the_client_clears_its_copy_on_the_echo(source: &str) -> bool {
 
 #[test]
 fn the_users_own_sentence_has_exactly_one_source_of_bytes() {
-    let client = read(CLIENT);
-    let server = read(SERVER);
+    let client = read_repo(CLIENT);
+    let server = read_repo(SERVER);
 
     assert!(
         the_client_appends_deltas(&client),

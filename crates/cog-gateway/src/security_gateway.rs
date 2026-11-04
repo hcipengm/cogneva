@@ -3262,10 +3262,7 @@ async fn owner_budget_refusal(
 ///
 /// `scope` 照 [`cog_core::QuotaScope::as_str`] 的闭集取词，与账本行上的
 /// `refused_scope`、以及响应正文里的级别是同一个词，三处对得上才读得通。
-fn budget_subject_labels<'a>(
-    scope: cog_core::QuotaScope,
-    target: &'a str,
-) -> [(&'static str, &'a str); 3] {
+fn budget_subject_labels(scope: cog_core::QuotaScope, target: &str) -> [(&'static str, &str); 3] {
     match scope {
         cog_core::QuotaScope::User => [
             ("scope", scope.as_str()),

@@ -76,6 +76,17 @@ async fn refused_row(
     .expect("write a refusal row");
 }
 
+/// 建表要在这个进程里串行。PostgreSQL 的 `CREATE TABLE IF NOT EXISTS` 不是
+/// 原子的：两个用例并发走到建表这一步时，一个建成了，另一个拿到
+/// `23505 duplicate key ... pg_type_typname_nsp_index`。竞态在夹具里，不在被测
+/// 代码里——被测的读只读已经存在的表。这条错误实测让 CI 红过一次
+/// （`cog_dag_tasks` 的建表）。
+static SCHEMA_DDL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn schema_ddl_lock() -> &'static tokio::sync::Mutex<()> {
+    SCHEMA_DDL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 async fn prepare(url: &str) -> (PgPool, LlmUsageStore) {
     let pool = PgPool::connect(url)
         .await
@@ -83,6 +94,7 @@ async fn prepare(url: &str) -> (PgPool, LlmUsageStore) {
     let store = LlmUsageStore::connect(url)
         .await
         .expect("connect the store");
+    let _ddl = schema_ddl_lock().lock().await;
     let schema_runner = cog_test_support::SchemaTextRunner::new(pool.clone());
     store
         .init_schema(&schema_runner)
