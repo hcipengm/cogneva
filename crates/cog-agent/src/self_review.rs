@@ -61,6 +61,43 @@ struct ComparisonOutput {
     score: f32,
 }
 
+/// 一条要求在这份正文里的三种状态。闭集，没有第四种。
+///
+/// `undetermined` 不是「没判」，是「从这段正文里判不出来」——「测试通过」这类
+/// 要求要的是跑一遍，不是读一遍。让它说判不出来，比让它猜一个答案强：猜出来的
+/// 那个分与猜出来的那条理由，下游都当证据用。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+enum RowStatus {
+    Met,
+    Unmet,
+    Undetermined,
+}
+
+/// 一条要求、它的状态、以及正文里说到它的那几句话。
+///
+/// `evidence` 不是给人看的摘要：下面 [`SelfReviewLoop::judge_table`] 会拿它去
+/// 正文里逐字找。找不到的 `met` 不算 `met`——这一格是整套一次调用评审的支柱，
+/// 把「评审者的判断」换成「可以核对的事实」。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+struct RequirementRow {
+    /// 这条要求，一行，写成一句对正文真假可判的话。
+    requirement: String,
+    status: RowStatus,
+    /// 正文里说到这条要求的原话，逐字，不要转述。
+    #[serde(default)]
+    evidence: String,
+}
+
+/// 一次评审的全部答案：一张表，一个要求一行。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
+struct RequirementTable {
+    #[serde(default)]
+    rows: Vec<RequirementRow>,
+}
+
 // ---------------------------------------------------------------------------
 // Request bodies
 // ---------------------------------------------------------------------------
@@ -74,6 +111,20 @@ struct ComparisonOutput {
 /// 评审请求：先是被对照的标准，再是这一轮要审的正文。
 #[derive(serde::Serialize)]
 struct CritiqueRequest<'a> {
+    spec: &'a str,
+    output: &'a str,
+}
+
+/// 判定请求：判定规则、标准、正文，按这个顺序。
+///
+/// 规则不是一条单独的系统消息，因为有的上游只读第一条系统消息
+/// （`crates/cog-llm` 的 anthropic 适配取 `find_map` 的第一条），而
+/// `execute_structured` 已经把自己的 schema 放在那一条里——第二条系统消息会
+/// 被静默丢掉，判据就没了。放进正文最前面既不丢，也仍是逐字节稳定的前缀：
+/// 规则每次相同，标准次之，正文最后。
+#[derive(serde::Serialize)]
+struct JudgeRequest<'a> {
+    rubric: &'a str,
     spec: &'a str,
     output: &'a str,
 }
@@ -176,6 +227,16 @@ impl SelfReviewLoop {
         output: &str,
         llm: &dyn LlmClient,
     ) -> SFResult<(String, SelfReviewResult)> {
+        // Judge-only buys one call and hands the text back untouched. It does
+        // not enter the loop above because the loop's every other step exists
+        // to produce and re-judge a rewrite: with no rewrite there is no second
+        // round to run, and a second critique of the same text against the same
+        // standard is the same question paid for twice.
+        if !self.config.revise {
+            let verdict = self.judge_table(output, llm).await?;
+            return Ok((output.to_string(), verdict));
+        }
+
         let mut current_output = output.to_string();
         // 打过分的正文里最好的那一份，连同它拿到的分与判词。
         //
@@ -224,21 +285,6 @@ impl SelfReviewLoop {
                 .is_none_or(|(_, best_score, _)| score > *best_score)
             {
                 best = Some((current_output.clone(), score, result.clone()));
-            }
-
-            // Judge-only: hand back the text that was just judged, with the
-            // verdict that names what it failed to satisfy.
-            //
-            // The rewrite below exists to replace an output the review found
-            // wanting, but it is judged by nothing: the loop has to pay another
-            // critique and comparison to score it, and on this family the
-            // rewrite was the single largest line (64% of a review's spend) for
-            // text that the producer's own retry path could produce again with
-            // the gap list in hand. So the caller gets the judgement and keeps
-            // its own text; what to do about the gaps is the caller's decision,
-            // made on the same standard the output was already asked to meet.
-            if !self.config.revise {
-                return Ok((current_output, result));
             }
 
             match &result {
@@ -398,6 +444,191 @@ impl SelfReviewLoop {
             score: output.score,
             raw,
         })
+    }
+
+    /// Judge the text against the requirements it was asked to meet, in one
+    /// call, and compute the score here rather than asking for it.
+    ///
+    /// The two-call shape this replaces asked a model for a number between 0
+    /// and 1 and compared that number with a threshold. Measured over a day of
+    /// production that number was a mood: 226 reviews, mean 0.449, three of them
+    /// at or above 0.8. What replaces it is a table -- one row per stated
+    /// requirement, each row `met`, `unmet`, or `undetermined` -- and a fraction
+    /// computed from the table. A model can be wrong about a row; it cannot be
+    /// vague about a fraction, and the row it is wrong about is a sentence a
+    /// person can read and disagree with.
+    ///
+    /// The evidence column is what stops a `met` from being an opinion. Every
+    /// `met` row quotes the text, and [`SelfReviewLoop::quotes_the_text`] looks
+    /// for that quote in the text; a quote that is not there does not count as
+    /// met, whatever the status says. That is the whole of the independence the
+    /// second call used to buy, and it is paid for in bytes compared instead of
+    /// in tokens generated.
+    async fn judge_table(&self, output: &str, llm: &dyn LlmClient) -> SFResult<SelfReviewResult> {
+        let spec = self.config.spec.as_deref().unwrap_or("");
+        let user_payload = serde_json::to_string(&JudgeRequest {
+            rubric: SelfReviewLoop::judging_rubric(&self.actor),
+            spec,
+            output,
+        })?;
+        let messages = vec![Message::user(user_payload)];
+        let options = stamp(ChatOptions::default(), &self.actor, self.task.as_deref());
+
+        let table = execute_structured::<RequirementTable>(llm, &messages, &options).await?;
+
+        // 一条要求都没列出来的「评审」不是一次通过的评审，是一次没做的评审。
+        // 交回 `Pass` 会把「没人看过」写成「全过」——这正是这张表存在的理由。
+        if table.rows.is_empty() {
+            return Err(SFError::Validation(
+                "the review stated no requirement, so nothing was judged".into(),
+            ));
+        }
+
+        let mut met = 0usize;
+        let mut unmet: Vec<&RequirementRow> = Vec::new();
+        let mut undetermined: Vec<&RequirementRow> = Vec::new();
+        let mut unsupported: Vec<&RequirementRow> = Vec::new();
+
+        for row in &table.rows {
+            match row.status {
+                RowStatus::Met => {
+                    // A `met` whose quote is not in the text is not a `met`. It
+                    // is also not a `unmet` -- the row was never established
+                    // either way, and calling it a failure would turn a
+                    // hallucinated quote into a defect of the text under review.
+                    if SelfReviewLoop::quotes_the_text(&row.evidence, output) {
+                        met += 1;
+                    } else {
+                        unsupported.push(row);
+                    }
+                }
+                RowStatus::Unmet => unmet.push(row),
+                RowStatus::Undetermined => undetermined.push(row),
+            }
+        }
+
+        // 分母是「被判过的条目」：`met`、`unmet`，以及自称 `met` 却没有引文支撑的
+        // 那几条。最后一种不能留在分母外——它既不是通过也不是无法判断，是一次没
+        // 兑现的声称，把它排除会让一条查无此句的 `met` 白拿一分。
+        let judged = met + unmet.len() + unsupported.len();
+
+        // 一条都没判出来时，分数没有分母。这不是 0 分也不是满分，是一次没有结论
+        // 的评审：调用方保留自己的正文，读数记在这次失败上。
+        if judged == 0 {
+            return Err(SFError::Validation(format!(
+                "no requirement could be judged from the text: {} undetermined",
+                undetermined.len()
+            )));
+        }
+
+        let score = met as f32 / judged as f32;
+
+        if unmet.is_empty() && unsupported.is_empty() {
+            let summary = if undetermined.is_empty() {
+                format!("all {} stated requirements are met", met)
+            } else {
+                format!(
+                    "all {} stated requirements that this text can settle are met; \
+                     {} cannot be settled from the text",
+                    met,
+                    undetermined.len()
+                )
+            };
+            return Ok(SelfReviewResult::Pass { score, summary });
+        }
+
+        let mut findings: Vec<String> = unmet
+            .iter()
+            .map(|row| format!("{}: no part of the text carries it", row.requirement))
+            .collect();
+        findings.extend(unsupported.iter().map(|row| {
+            format!(
+                "{}: quoted as met, but the quote is not in the text",
+                row.requirement
+            )
+        }));
+
+        Ok(SelfReviewResult::NeedRevision {
+            critique: findings.join("; "),
+            suggestions: unmet
+                .iter()
+                .map(|row| row.requirement.clone())
+                .chain(unsupported.iter().map(|row| row.requirement.clone()))
+                .collect(),
+            score,
+        })
+    }
+
+    /// Whether `evidence` is a quote from `text`, whitespace aside.
+    ///
+    /// Whitespace is dropped on both sides because a quote copied across a line
+    /// break is the same quote, and a check that fails on reflowing would be a
+    /// check that punishes formatting. Nothing else is forgiven: case,
+    /// punctuation and every word have to be the text's own, or the quote is
+    /// the reviewer's paraphrase and the `met` it supports is the reviewer's
+    /// opinion.
+    fn quotes_the_text(evidence: &str, text: &str) -> bool {
+        let tight = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let quote = tight(evidence);
+        // 空引文在每一段正文里都「找得到」，那不是证据。
+        !quote.is_empty() && tight(text).contains(&quote)
+    }
+
+    /// What the text under judgement is, and therefore what a `met` means for
+    /// it.
+    ///
+    /// The first version of this review handed every actor the same standard:
+    /// the task's own acceptance criteria. For the planner that is the wrong
+    /// standard outright -- those criteria describe the deliverable, and a plan
+    /// is not the deliverable. Measured on ten consecutive production verdicts,
+    /// half of them faulted the plan for "never stating a verdict" or "not
+    /// executing", which is what a plan is not supposed to do. A review that
+    /// asks a plan to answer the task cannot be passed by any plan, and a gate
+    /// that never opens teaches its readers to ignore it.
+    ///
+    /// The text is chosen by the role the review is charged to. It has to stay
+    /// byte-identical across calls, because it is the head of the request and
+    /// the only part an upstream prefix cache can hold across tasks.
+    fn judging_rubric(actor: &str) -> &'static str {
+        let role = actor.rsplit(':').next().unwrap_or(actor);
+        match role {
+            "planner" => {
+                "The text under judgement is a PLAN: a decomposition of a task into sub-tasks. \
+                 A plan is not expected to answer the task or to carry out any step -- that is \
+                 what its sub-tasks are for -- so \"it does not give the answer\", \"it does not \
+                 execute anything\" and \"it defers the work to its sub-tasks\" are not defects \
+                 in a plan and must not be scored as such.\n\n\
+                 List every requirement the specification states. For each one decide:\n\
+                 - met: some sub-task's acceptance criteria carry this requirement, and the words \
+                 that carry it are in the text. Quote them.\n\
+                 - unmet: no sub-task carries it, or the sub-tasks contradict it or each other.\n\
+                 - undetermined: a plan cannot show it either way.\n\n\
+                 Quote the text, do not paraphrase it: every `met` is checked character for \
+                 character against the text, whitespace aside, and a quote that is not there is \
+                 not a `met`."
+            }
+            "evaluator" => {
+                "The text under judgement is a JUDGEMENT about someone else's work. Judge it as \
+                 a judgement: whether it names what it assessed, states a verdict, and says what \
+                 the verdict rests on. Whether the work itself is good is not this text's \
+                 question.\n\n\
+                 List every requirement the specification states. For each one decide met, unmet \
+                 or undetermined, and for `met` quote the words of the text that carry it, \
+                 character for character, whitespace aside."
+            }
+            "moderator" | "merger" => {
+                "The text under judgement is a FINAL ANSWER to the task. List every requirement \
+                 the specification states. For each one decide met, unmet or undetermined, and \
+                 for `met` quote the words of the text that carry it, character for character, \
+                 whitespace aside."
+            }
+            _ => {
+                "The text under judgement is a WORK PRODUCT the task asked for. List every \
+                 requirement the specification states. For each one decide met, unmet or \
+                 undetermined, and for `met` quote the words of the text that carry it, \
+                 character for character, whitespace aside."
+            }
+        }
     }
 
     /// Step 4: Decide — PASS or NEED_REVISION based on score vs threshold.
@@ -794,10 +1025,6 @@ mod tests {
         fn revise_calls(&self) -> usize {
             self.revise_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
-
-        fn json_calls(&self) -> usize {
-            self.json_calls.load(std::sync::atomic::Ordering::SeqCst)
-        }
     }
 
     #[async_trait]
@@ -851,6 +1078,60 @@ mod tests {
             );
             Ok(ChatResponse {
                 content: vec![cog_core::ContentBlock::text(body)],
+                ..Default::default()
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// 按一张固定的要求表作答，并数一次评审买了几次调用。
+    struct TableLlm {
+        body: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TableLlm {
+        fn new(body: &'static str) -> Self {
+            Self {
+                body,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for TableLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("self-review asks non-streaming")
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("self-review asks non-streaming")
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<ChatResponse> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ChatResponse {
+                content: vec![cog_core::ContentBlock::text(self.body)],
                 ..Default::default()
             })
         }
@@ -942,47 +1223,56 @@ mod tests {
     /// 既没有 critique 也没有 compare 去评它，所以只会被丢掉。生产上这一族
     /// 没有一次达到阈值，每一轮评审都停在最后一格上——这条测试钉住那一格不再
     /// 付费，而交出去的仍是第一轮改写出来、第二轮打过分的 `REV-1`。
-    ///
-    /// 只判不写：一次评审只买 critique 与 compare 两次调用。
-    ///
-    /// 改写是这条流水线上最贵的一步，而它只是把同一个标准再问一遍；配置成
-    /// 只判时，交回去的必须是**被审过的那一份原文**——不是改写，也不是空白——
-    /// 判词里带着分数与没满足的条目，由调用方自己的重试路径去处理。这条测试
-    /// 钉住代价与产出两头：两次调用、零次改写、原文原样交回。
     #[tokio::test]
     async fn judge_only_buys_the_verdict_and_no_rewrite() {
-        let llm = ScoringLlm::new(&[0.6]);
+        let llm = TableLlm::new(
+            r#"{"rows":[
+                 {"requirement":"names a sub-task","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"names a rollback","status":"unmet"}]}"#,
+        );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             max_iterations: 2,
             quality_threshold: 0.8,
             revise: false,
             ..Default::default()
-        });
+        })
+        .with_actor("self_review:planner");
 
-        let (text, verdict) = judge_only.review("ORIGINAL", &llm).await.unwrap();
+        let (text, verdict) = judge_only
+            .review("t1: read the file, then t2: deploy", &llm)
+            .await
+            .unwrap();
 
+        assert_eq!(llm.calls(), 1, "只判不写是一次调用：一张表，一个要求一行");
         assert_eq!(
-            llm.json_calls(),
-            2,
-            "只判只买一次 critique 加一次 compare，不是循环跑满两轮"
+            text, "t1: read the file, then t2: deploy",
+            "交回的是被审过的那一份原文"
         );
-        assert_eq!(llm.revise_calls(), 0, "只判不买改写");
-        assert_eq!(text, "ORIGINAL", "交回去的是被审过的那一份原文");
         match verdict {
-            SelfReviewResult::NeedRevision { score, .. } => {
+            SelfReviewResult::NeedRevision {
+                score,
+                suggestions,
+                critique,
+            } => {
+                assert!((score - 0.5).abs() < 1e-6, "两条要求满足一条：{score}");
+                assert_eq!(suggestions, vec!["names a rollback".to_string()]);
                 assert!(
-                    (score - 0.6).abs() < 1e-6,
-                    "判词带着这一份真实拿到的分：{score}"
-                )
+                    critique.contains("names a rollback"),
+                    "判词点名没满足的那一条：{critique}"
+                );
             }
-            other => panic!("0.6 低于阈值，这是一次没过的评审：{other:?}"),
+            other => panic!("有一条要求没人接住，这是一次没过的评审：{other:?}"),
         }
     }
 
-    /// 只判不写时，过线的输出同样原样交回，不多买一次改写。
+    /// 每条要求都被引文支撑时才是通过，而且仍然只买一次调用。
     #[tokio::test]
     async fn judge_only_passes_without_a_rewrite() {
-        let llm = ScoringLlm::new(&[0.9]);
+        let llm = TableLlm::new(
+            r#"{"rows":[
+                 {"requirement":"names a sub-task","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"names a second step","status":"met","evidence":"then t2: deploy"}]}"#,
+        );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             max_iterations: 2,
             quality_threshold: 0.8,
@@ -990,12 +1280,144 @@ mod tests {
             ..Default::default()
         });
 
-        let (text, verdict) = judge_only.review("ORIGINAL", &llm).await.unwrap();
+        let (text, verdict) = judge_only
+            .review("t1: read the file, then t2: deploy", &llm)
+            .await
+            .unwrap();
 
-        assert_eq!(llm.json_calls(), 2);
-        assert_eq!(llm.revise_calls(), 0);
-        assert_eq!(text, "ORIGINAL");
-        assert!(matches!(verdict, SelfReviewResult::Pass { .. }));
+        assert_eq!(llm.calls(), 1);
+        assert_eq!(text, "t1: read the file, then t2: deploy");
+        match verdict {
+            SelfReviewResult::Pass { score, .. } => assert!((score - 1.0).abs() < 1e-6),
+            other => panic!("每条要求都有引文支撑，这是通过：{other:?}"),
+        }
+    }
+
+    /// 自称 `met` 的那一条，引文在正文里找不到，就不是 `met`。
+    ///
+    /// 这是整套一次调用评审的支柱：把「评审者的判断」换成「可以核对的事实」。
+    /// 引文查无此句时不能留在分母外——留在外面等于让一条编出来的引文白拿一分。
+    #[tokio::test]
+    async fn a_met_whose_quote_is_not_in_the_text_does_not_count() {
+        let llm = TableLlm::new(
+            r#"{"rows":[
+                 {"requirement":"names a sub-task","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"names a rollback","status":"met","evidence":"t9: roll back"}]}"#,
+        );
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            revise: false,
+            ..Default::default()
+        });
+
+        let (_, verdict) = judge_only
+            .review("t1: read the file, then t2: deploy", &llm)
+            .await
+            .unwrap();
+
+        match verdict {
+            SelfReviewResult::NeedRevision {
+                score, critique, ..
+            } => {
+                assert!(
+                    (score - 0.5).abs() < 1e-6,
+                    "查无此句的那一条仍在分母里：{score}"
+                );
+                assert!(
+                    critique.contains("names a rollback"),
+                    "判词要说清它为什么不算：{critique}"
+                );
+            }
+            other => panic!("一条引文在正文里找不到，这次评审不算通过：{other:?}"),
+        }
+    }
+
+    /// 引文跨行折断仍是同一句：空白不算差别。
+    #[tokio::test]
+    async fn a_quote_across_a_line_break_is_the_same_quote() {
+        let llm = TableLlm::new(
+            r#"{"rows":[
+                 {"requirement":"names a rollback","status":"met","evidence":"t3: roll\n back to the previous revision"}]}"#,
+        );
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            revise: false,
+            ..Default::default()
+        });
+
+        let (_, verdict) = judge_only
+            .review("t1: plan\nt3: roll back to the previous revision", &llm)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(verdict, SelfReviewResult::Pass { .. }),
+            "折行不是转述：{verdict:?}"
+        );
+    }
+
+    /// 分数是算出来的：回答里自带一个数字也不算数。
+    ///
+    /// 旧的两步评审把 `score` 交给模型填，实测那是评审者的心情（226 次、均分
+    /// 0.449、过 3 次）。这里把 `score` 放进回答正文，表里的行仍按真实状态判，
+    /// 算出来的分不该被它带走。
+    #[tokio::test]
+    async fn a_score_in_the_answer_is_not_the_score() {
+        let llm = TableLlm::new(
+            r#"{"score":1.0,"rows":[
+                 {"requirement":"names a sub-task","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"names a rollback","status":"unmet"}]}"#,
+        );
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            revise: false,
+            ..Default::default()
+        });
+
+        let (_, verdict) = judge_only.review("t1: read the file", &llm).await.unwrap();
+
+        match verdict {
+            SelfReviewResult::NeedRevision { score, .. } => assert!(
+                (score - 0.5).abs() < 1e-6,
+                "答案是表里的行算出来的，不是模型写的那个数：{score}"
+            ),
+            other => panic!("有一行 unmet，这次评审不通过：{other:?}"),
+        }
+    }
+
+    /// 一条要求都没列出来的「评审」不是通过，是一次没做的评审。
+    #[tokio::test]
+    async fn a_table_with_no_requirement_is_not_a_pass() {
+        let llm = TableLlm::new(r#"{"rows":[]}"#);
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            revise: false,
+            ..Default::default()
+        });
+
+        let outcome = judge_only.review("anything", &llm).await;
+        assert!(
+            outcome.is_err(),
+            "没有任何要求的判词不能读成通过：{outcome:?}"
+        );
+    }
+
+    /// 判据跟着被审的东西走：计划不因为「没有回答任务」被扣分。
+    ///
+    /// 实测十次生产判词里有一半是在说「这是计划，不是答案」——拿交付物的标准
+    /// 去判计划，计划永远过不了，这道门也就永远开不了。
+    #[test]
+    fn a_plan_is_judged_as_a_plan() {
+        let plan = SelfReviewLoop::judging_rubric("self_review:planner");
+        assert!(
+            plan.contains("is not expected to answer the task"),
+            "计划这条判据必须把「没有回答任务」划出缺陷之外：{plan}"
+        );
+        assert!(
+            !SelfReviewLoop::judging_rubric("self_review:generator")
+                .contains("is not expected to answer the task"),
+            "生成物就是答案，不能沿用计划那条豁免"
+        );
+        assert!(
+            SelfReviewLoop::judging_rubric("self_review:evaluator").contains("JUDGEMENT"),
+            "判词按判词判"
+        );
     }
 
     #[tokio::test]

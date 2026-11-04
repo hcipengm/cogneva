@@ -7,14 +7,21 @@ pub struct SelfReviewConfig {
     /// Maximum number of review-revision cycles before accepting the output.
     pub max_iterations: u32,
     /// Quality threshold (0.0–1.0). Scores above this are considered a pass.
+    ///
+    /// Only the rewrite loop (`revise: true`) compares a score against this. The
+    /// one-call table review does not: it passes when no stated requirement is
+    /// `unmet` and none claims `met` without a quote from the text, and it
+    /// reports the fraction it computed for readers, not as a criterion.
     pub quality_threshold: f32,
     /// Whether a judgement below the threshold buys a rewrite of the output.
     ///
     /// `true` is the full loop: judge, then have a model rewrite the whole text
-    /// and judge the rewrite again. `false` is judge-only: the critique and the
-    /// comparison still run, the verdict still names what the output failed to
-    /// satisfy, but no rewrite is bought — the text handed back is the one that
-    /// was judged, and the caller's own retry path is what acts on the gaps.
+    /// and judge the rewrite again. `false` is judge-only, and it is a single
+    /// call: the output is judged against the requirements the task states, one
+    /// table row per requirement, each row `met`/`unmet`/`undetermined`, and a
+    /// `met` only counts if the quote it gives is found in the text. No rewrite
+    /// is bought — the text handed back is the one that was judged, and the
+    /// caller's own retry path is what acts on the gaps the table names.
     ///
     /// The rewrite is the expensive half (one full-output call, measured at
     /// roughly twice the critique and four times the comparison) and it is
