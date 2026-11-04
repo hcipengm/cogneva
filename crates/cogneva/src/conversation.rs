@@ -4,9 +4,9 @@
 //! 智能体内核的工具表，再用调用方给好的历史跑一轮。循环、守卫、预算、token 账与
 //! 总线事件都在内核里发生——与一件任务的一次尝试是同一条，不是并排的两条。
 //!
-//! 工具集里**没有执行工具**，这是职责的位置而不是能力的裁剪：这段对话看清事实、
-//! 把活派给编排器、回来读进展；真正动手的是任务图里的 squad。给它 `run_command`
-//! 就等于在系统外面再开一条执行路径——那件事不进任务图、不进账、不经过任何门。
+//! 工具集就是**这个进程装配好的那一份**：它有什么工具由身体决定，不由"它是个什么
+//! 角色"决定。界面上的员工与 worker 池、小队是同一种数字员工，只是生命周期挂在会话
+//! 上——会话开时它在，会话关时它走，实例可以换，名字与 id 不换。
 
 use std::future::Future;
 use std::pin::Pin;
@@ -26,8 +26,14 @@ use cog_gateway::chat::{ConversationRequest, ConversationTurn};
 /// 要分开看的两件事。
 const CHAT_ROLE: &str = WEB_CHAT_ACTOR;
 
-/// 界面上那次对话在账上的 actor。取自网关声明的闭集，不在这里另写一个值。
+/// 界面上那次对话在账上的角色。取自网关声明的闭集，不在这里另写一个值。
 const WEB_CHAT_ACTOR: &str = "web_chat";
+
+/// 这一段对话在名册里属于哪个分组。
+///
+/// 分组只参与名字的哈希材料，把界面上这些员工与 worker 池、进化池的同号槽位
+/// 分开。它是清单里写得出来的字面量，所以同一个会话滚一次 Pod 还是同一个名字。
+const CHAT_GROUP: &str = "web";
 
 /// 一段对话里最多几轮「想—用工具」。
 ///
@@ -43,6 +49,44 @@ const LIST_TASKS_LIMIT: usize = 40;
 // cap: bound — 默认页只有上限的一半：上限是显式要多的人能拿到的，默认值给的是「一眼扫完、还能接着问」的量
 const LIST_TASKS_DEFAULT: usize = 20;
 
+/// 这一段对话在名册里的身份：名字与 id。
+///
+/// 生命周期就是会话——同一个 `session_id` 跨轮、跨重启都是同一个员工，换一次
+/// 实例不换名字。名字用的与本进程 worker 池同一个纯函数（人名 ＋ 指纹短码），
+/// 所以账上、名册上、消息上读到的都是同一个人；而"每轮一个 `web-chat-<uuid>`"
+/// 读起来像每轮换一个从没见过的员工，按 id 记下的归属也就跟着换人。
+///
+/// 指纹缺失时退回进程自身的装配标识：名字仍然唯一，但它只稳定到下一次滚动，
+/// 于是 `stable` 如实置 false——这是"滚一次会不会换名"的那一位，不能糊。
+pub fn employee_for(session_id: &str) -> cog_agent::identity::AgentName {
+    let fingerprint = std::env::var(cog_core::env::INSTANCE_FINGERPRINT)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    employee_named(fingerprint.as_deref(), session_id)
+}
+
+/// 名字的算法本体：种子是「实例指纹 ＋ 会话」，两样都变才换人。
+///
+/// 单独拆出来是为了让判据问得到它——环境变量在同一个测试进程里是全局的，
+/// 平行跑的两条测试互相改它，读到的就不是自己设的那个值。
+fn employee_named(fingerprint: Option<&str>, session_id: &str) -> cog_agent::identity::AgentName {
+    match fingerprint {
+        Some(seed) => cog_agent::identity::name_for(&format!("{seed}:{session_id}"), CHAT_GROUP, 0),
+        // 指纹缺失时用进程自身的装配标识顶上：名字仍然唯一，但滚一次 Pod 就换一个
+        // 人，于是 `stable` 如实置 false——这一位说的是「跨重启还是不是同一个人」。
+        None => {
+            let mut name = cog_agent::identity::name_for(
+                &format!("{}:{}", cog_agent::identity::agent_instance(), session_id),
+                CHAT_GROUP,
+                0,
+            );
+            name.stable = false;
+            name
+        }
+    }
+}
+
 /// 装配层交给网关的那条循环：一轮对话就是内核的一次运行。
 pub struct PlatformConversation {
     orchestrator: Arc<dyn OrchestratorControl>,
@@ -53,6 +97,16 @@ pub struct PlatformConversation {
     /// 拒绝也要落一条。提交面拒单时写 `AuditKind::QuotaEnforcement`；界面上
     /// 同一句话被同一条规则挡住却不写，账上就只剩「有人今天没派活」。
     audit: Option<Arc<dyn AuditStream>>,
+    /// 这个进程装配好的那份工具表——与 worker 池、小队用的是同一份。
+    ///
+    /// 这里不另列一份工具清单：手上有什么工具由**身体所在的进程**决定（有没有
+    /// 消息队列、有没有沙盒、有没有出门的客户端），不是由"它是个什么角色"决定。
+    /// 另写一份短表就等于在没有沙盒的进程里假装没有执行能力，在有沙盒的进程里
+    /// 又把能力藏起来——两种都是把一个数字员工做成一个按钮。
+    ///
+    /// 取的是内核那份具体注册表而不是 `dyn` 契约：契约只有 `register` 与
+    /// `names`，能把一只工具装进去、能报出名字，却读不回工具本身，也就复制不了。
+    tools: Option<Arc<cog_agent::ToolRegistry>>,
 }
 
 impl PlatformConversation {
@@ -60,11 +114,13 @@ impl PlatformConversation {
         orchestrator: Arc<dyn OrchestratorControl>,
         admission: Option<Arc<dyn HierarchyManager>>,
         audit: Option<Arc<dyn AuditStream>>,
+        tools: Option<Arc<cog_agent::ToolRegistry>>,
     ) -> Self {
         Self {
             orchestrator,
             admission,
             audit,
+            tools,
         }
     }
 }
@@ -76,18 +132,30 @@ impl ConversationTurn for PlatformConversation {
         events: tokio::sync::mpsc::Sender<AgentEvent>,
     ) -> Pin<Box<dyn Future<Output = SFResult<serde_json::Value>> + Send + 'a>> {
         Box::pin(async move {
+            // 这一段对话是谁：名字由会话推出，跨轮不变。派活与记账都按这个名字。
+            let employee = employee_for(&request.session_id);
             let config = RuntimeConfig {
-                agent_id: format!("web-chat-{}", uuid::Uuid::new_v4()),
+                agent_id: employee.id.clone(),
                 role: CHAT_ROLE.to_string(),
                 max_iterations: CHAT_ITERATIONS,
                 ..Default::default()
             };
+            // 工具面 = 这个进程装配好的那一份 ＋ 控制面五只。
+            //
+            // 整份复制而不是共用同一个注册表：控制面这五只只属于这一段对话，
+            // 注册进共用表里会变成每个 agent 都能派活。
             let tools = cog_agent::ToolRegistry::new();
+            if let Some(shared) = self.tools.as_ref() {
+                for tool in shared.list() {
+                    tools.register(tool);
+                }
+            }
             for tool in control_plane_tools(
                 self.orchestrator.clone(),
                 self.admission.clone(),
                 self.audit.clone(),
                 request.owner.clone(),
+                employee.id.clone(),
             ) {
                 tools.register(tool);
             }
@@ -214,9 +282,12 @@ impl ControlPlaneOp {
         admission: Option<Arc<dyn HierarchyManager>>,
         audit: Option<Arc<dyn AuditStream>>,
         owner: String,
+        actor: String,
     ) -> Tool {
         let handler = match self {
-            ControlPlaneOp::DispatchGoal => dispatch_handler(orchestrator, admission, audit, owner),
+            ControlPlaneOp::DispatchGoal => {
+                dispatch_handler(orchestrator, admission, audit, owner, actor)
+            }
             ControlPlaneOp::ListTasks => list_handler(orchestrator),
             ControlPlaneOp::GetTask => get_handler(orchestrator),
             ControlPlaneOp::RetryTask => retry_handler(orchestrator),
@@ -237,6 +308,7 @@ fn control_plane_tools(
     admission: Option<Arc<dyn HierarchyManager>>,
     audit: Option<Arc<dyn AuditStream>>,
     owner: String,
+    actor: String,
 ) -> Vec<Tool> {
     CONTROL_PLANE
         .iter()
@@ -246,6 +318,7 @@ fn control_plane_tools(
                 admission.clone(),
                 audit.clone(),
                 owner.clone(),
+                actor.clone(),
             )
         })
         .collect()
@@ -317,16 +390,24 @@ impl QuotaRefusal {
 
 /// 被挡下的这一次写进审计链：与提交面同一个 kind、同一个动作名，目标号那一栏
 /// 是 `-`——这一次根本没有目标，编一个 id 会让账上的拒绝看起来像一次派发。
-async fn record_refusal(audit: Option<&Arc<dyn AuditStream>>, owner: &str, refusal: &QuotaRefusal) {
+async fn record_refusal(
+    audit: Option<&Arc<dyn AuditStream>>,
+    actor: &str,
+    owner: &str,
+    refusal: &QuotaRefusal,
+) {
     let Some(stream) = audit else { return };
     let _ = stream
         .append(
             AuditKind::QuotaEnforcement,
-            if owner.is_empty() { "anonymous" } else { owner },
+            actor,
             "-",
             "quota.dispatch_rejected",
             serde_json::json!({
                 "surface": "web_chat",
+                // 人和员工是两个名字：这一次是谁（员工）替谁（owner）派的。
+                // 只记 owner 时，同一个人开两个会话的两笔拒绝在账上分不开。
+                "owner": owner,
                 "estimated_tokens": refusal.estimated,
                 "blocked_by": refusal.blocked_by,
             }),
@@ -339,19 +420,21 @@ fn dispatch_handler(
     admission: Option<Arc<dyn HierarchyManager>>,
     audit: Option<Arc<dyn AuditStream>>,
     owner: String,
+    actor: String,
 ) -> ToolHandler {
     native(move |args| {
         let orchestrator = orchestrator.clone();
         let admission = admission.clone();
         let audit = audit.clone();
         let owner = owner.clone();
+        let actor = actor.clone();
         async move {
             let goal = require_str(&args, "goal")?.to_string();
             if let Some(refusal) = admission_refusal(admission.as_ref(), &owner, &goal).await {
                 // 与提交面同一格：拒绝写 `QuotaEnforcement`，目标号那一栏是
                 // `-`——这一次根本没有目标，编一个 id 会让账上的拒绝看起来像
                 // 一次派发。
-                record_refusal(audit.as_ref(), &owner, &refusal).await;
+                record_refusal(audit.as_ref(), &actor, &owner, &refusal).await;
                 return Ok(serde_json::json!({
                     "status": "refused",
                     "reason": refusal.sentence(),
@@ -487,12 +570,13 @@ fn task_summary(task: &cog_core::Task) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// 工具集是闭集，而且里面没有执行工具。
+    /// 控制面这一组是闭集，而且里面没有执行工具。
     ///
-    /// 出现一个 `run_command` 之类的东西，界面上就多出一条执行路径：它做的事不进
-    /// 任务图、不进账、不经过任何门，而屏幕上看起来与编排器派出去的活一模一样。
+    /// 执行能力本身不在这里长：它随进程的注册表来（`run_command` 之类的在内核
+    /// 装好的那一份里）。这一组只负责读台账与派活——在这里再出现一个执行工具，
+    /// 界面上就多出一条编排器看不见的活。加一项要在这里说清它是读还是派活。
     #[test]
-    fn the_conversation_reads_and_dispatches_but_never_executes() {
+    fn the_control_plane_group_reads_and_dispatches_but_never_executes() {
         let names: Vec<&str> = CONTROL_PLANE.iter().map(|op| op.name()).collect();
         assert_eq!(
             names,
@@ -525,6 +609,62 @@ mod tests {
     #[test]
     fn the_chat_is_recorded_under_an_actor_the_ledger_declares() {
         assert!(cog_gateway::actor_labels::declared(WEB_CHAT_ACTOR));
+    }
+
+    /// 会话是生命周期：同一段对话跨轮、跨重启都是同一个员工。
+    ///
+    /// 换成每轮一个新 id（`web-chat-<uuid>` 那种），账上读到的就是每轮换一个从没
+    /// 见过的员工，按 id 记的归属跟着换人，而屏幕上是同一段对话。
+    #[test]
+    fn a_session_is_one_employee_across_calls_and_restarts() {
+        let first = employee_named(Some("inst-7f3a"), "session-abc");
+        let second = employee_named(Some("inst-7f3a"), "session-abc");
+        assert_eq!(first.id, second.id);
+        assert_eq!(first.handle, second.handle);
+        assert!(first.stable, "有指纹时名字跨重启稳定");
+        assert!(!first.persona.is_empty());
+    }
+
+    /// 换一段会话就是换一个员工：账上要能分开两个人。
+    #[test]
+    fn two_sessions_are_two_employees() {
+        let a = employee_named(Some("inst-7f3a"), "session-a");
+        let b = employee_named(Some("inst-7f3a"), "session-b");
+        assert_ne!(a.id, b.id);
+    }
+
+    /// 没有指纹时名字仍然唯一，但它只稳定到下一次滚动——这一位必须如实是 false。
+    #[test]
+    fn an_employee_without_a_fingerprint_says_it_is_not_stable() {
+        let name = employee_named(None, "session-a");
+        assert!(!name.stable, "没有指纹却说稳定：滚一次 Pod 就换人");
+        assert!(!name.id.is_empty());
+        assert!(employee_named(Some("inst-7f3a"), "session-a").stable);
+    }
+
+    /// id 直接当 Redis 的 key 与消费者组名用：只含 `[a-z0-9-]`，不为空，也不叫 unknown。
+    ///
+    /// 名字里带上会话本身（中文、空格、斜杠、超长）时，这些字不能漏进 id——
+    /// 漏进去的那一段会让收件箱的 key 建不出来，消息读成「投出去了」而没人收到。
+    #[test]
+    fn an_employee_id_is_a_key_nobody_has_to_guess() {
+        let long = "x".repeat(4096);
+        let sessions: [&str; 4] = ["", "会话", "a b/c", &long];
+        for seed in [Some("inst-7f3a"), None] {
+            for session in sessions {
+                let name = employee_named(seed, session);
+                assert!(!name.id.is_empty(), "员工没有 id：名册上只能记成 unknown");
+                assert!(!name.id.contains("unknown"), "{}", name.id);
+                assert!(
+                    name.id
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                    "{} 不是能直接当 stream key 的 id",
+                    name.id
+                );
+                assert!(!name.persona.is_empty(), "员工没有名字");
+            }
+        }
     }
 
     /// 一个只剩硬上限的管理器：每一级都已经用完。
@@ -648,13 +788,15 @@ mod tests {
             blocked_by: 1,
         };
         let stream: Arc<dyn AuditStream> = audit.clone();
-        record_refusal(Some(&stream), "someone", &refusal).await;
+        record_refusal(Some(&stream), "luna-1822ab0e", "someone", &refusal).await;
 
         let rows = audit.0.lock().unwrap();
         assert_eq!(rows.len(), 1, "拒绝没有落账");
         let (kind, actor, target, action) = &rows[0];
         assert_eq!(*kind, AuditKind::QuotaEnforcement);
-        assert_eq!(actor, "someone");
+        // 落账的是那个员工，不是「谁在用这个界面」：同一个人开两个会话，
+        // 两笔拒绝是两个人做的。
+        assert_eq!(actor, "luna-1822ab0e");
         assert_eq!(target, "-", "这一次没有目标，账上不该编一个 id");
         assert_eq!(action, "quota.dispatch_rejected");
     }

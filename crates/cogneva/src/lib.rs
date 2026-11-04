@@ -214,11 +214,15 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 拒绝也要落一条，和提交面同一格。审计流同样是可选服务：没装它的
             // 进程本来也不写账，这里不替它编一条。
             let audit = ctx.consume_service::<dyn cog_core::AuditStream>();
+            // 它手上有什么工具＝这个进程装配了什么。取内核那份具体注册表：
+            // 契约 trait 只报得出名字，复制不了工具本身。
+            let tools = ctx.consume::<cog_agent::ToolRegistry>();
             if conversation
                 .set(Arc::new(crate::conversation::PlatformConversation::new(
                     orchestrator,
                     admission,
                     audit,
+                    tools,
                 )))
                 .is_err()
             {
