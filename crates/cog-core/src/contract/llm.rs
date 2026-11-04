@@ -170,9 +170,21 @@ pub fn retry_after_hint_in(text: &str) -> Option<u64> {
         .map(|secs| secs.min(MAX_RECOVERED_RETRY_AFTER_SECS))
 }
 
+/// How much the model should deliberate before answering, when the caller has
+/// an opinion.
+///
+/// The floor is `Off`, and it is not the same request as leaving the field
+/// unset. Unset means "send no preference", and a vendor whose model reasons
+/// by default then spends thinking tokens nobody asked for: measured on the
+/// requirement-table judge, 90% of the completion tokens were reasoning the
+/// caller never read. A caller that wants the answer without the deliberation
+/// has to say so — vendors spell it `"none"`, and the level with no thinking
+/// is the only spelling of that request this contract has.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
+    /// Deliberate none: ask for the answer, not for the thinking behind it.
+    Off,
     #[default]
     Minimal,
     Low,

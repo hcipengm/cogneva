@@ -72,6 +72,9 @@ pub fn adjust_max_tokens_for_thinking(
     let budgets = custom_budgets.cloned().unwrap_or_default();
     let level = clamp_reasoning(reasoning_level).unwrap_or(ThinkingLevel::High);
     let thinking_budget = match level {
+        // Nothing to reserve: the request asks the model not to think, so the
+        // caller's cap is the whole cap.
+        ThinkingLevel::Off => 0,
         ThinkingLevel::Minimal => budgets.minimal,
         ThinkingLevel::Low => budgets.low,
         ThinkingLevel::Medium => budgets.medium,

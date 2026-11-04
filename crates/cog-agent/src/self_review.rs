@@ -1,6 +1,6 @@
 use cog_core::{
     execute_structured, ChatOptions, ChatResponse, LlmClient, Message, ResponseFormat, SFError,
-    SFResult, SelfReviewConfig, SelfReviewResult,
+    SFResult, SelfReviewConfig, SelfReviewResult, ThinkingLevel,
 };
 
 /// Observation of an agent output.
@@ -493,7 +493,13 @@ impl SelfReviewLoop {
             output,
         })?;
         let messages = vec![Message::user(user_payload)];
-        let options = stamp(ChatOptions::default(), &self.actor, self.task.as_deref());
+        let mut options = stamp(ChatOptions::default(), &self.actor, self.task.as_deref());
+        // 这是一张「规格里的每句话，正文接住了没有」的表，不是一个需要推理的
+        // 判断题：要判的东西全在请求里，模型多想的那些不改变表格，只改变账单。
+        // 实测同一批请求重放，思考开着时 completion 的九成是 reasoning（1245 里
+        // 1139），关掉后正文行数反而从 1 行涨到 2–17 行、每一行的 spec_quote 都
+        // 仍能在规格里逐字找到。所以这里按表问，不按辩论问。
+        options.reasoning = Some(ThinkingLevel::Off);
 
         let table = execute_structured::<RequirementTable>(llm, &messages, &options).await?;
 
@@ -1189,6 +1195,7 @@ mod tests {
     struct TableLlm {
         body: &'static str,
         calls: std::sync::atomic::AtomicUsize,
+        levels: std::sync::Mutex<Vec<Option<ThinkingLevel>>>,
     }
 
     impl TableLlm {
@@ -1196,11 +1203,17 @@ mod tests {
             Self {
                 body,
                 calls: std::sync::atomic::AtomicUsize::new(0),
+                levels: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         fn calls(&self) -> usize {
             self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// 每次请求带出去的思考档，按调用顺序。
+        fn levels(&self) -> Vec<Option<ThinkingLevel>> {
+            self.levels.lock().unwrap().clone()
         }
     }
 
@@ -1225,9 +1238,10 @@ mod tests {
         async fn chat(
             &self,
             _messages: &[Message],
-            _options: &ChatOptions,
+            options: &ChatOptions,
         ) -> SFResult<ChatResponse> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.levels.lock().unwrap().push(options.reasoning);
             Ok(ChatResponse {
                 content: vec![cog_core::ContentBlock::text(self.body)],
                 ..Default::default()
@@ -1362,6 +1376,37 @@ mod tests {
             }
             other => panic!("有一条要求没人接住，这是一次没过的评审：{other:?}"),
         }
+    }
+
+    /// 判表的请求要明确说「不要思考」，不是把这一格空着。
+    ///
+    /// 空着不是关掉：上游模型默认就在想，实测这一族 24 小时 2317 次调用、
+    /// 每次 completion 里九成是 reasoning（1245 里 1139），而这张表要判的东西
+    /// 全在请求体内——多想不改变任何一行，只把输出按四倍单价买一遍。同一批请求
+    /// 重放后正文行数从 1 行涨到 2–17 行、每行引文仍逐字在规格里，所以这里
+    /// 少花的不是判据，是空转。
+    #[tokio::test]
+    async fn the_table_is_asked_for_without_deliberation() {
+        let llm = TableLlm::new(
+            r#"{"rows":[
+                 {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"}]}"#,
+        );
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            revise: false,
+            spec: Some("t1 and t2 must be done".into()),
+            ..Default::default()
+        });
+
+        let _ = judge_only
+            .review("t1: read the file, then t2: deploy", &llm)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            llm.levels(),
+            vec![Some(ThinkingLevel::Off)],
+            "判表这一步要的是覆盖检查，不是一次辩论：请求必须明确关掉思考"
+        );
     }
 
     /// 每条要求都被引文支撑时才是通过，而且仍然只买一次调用。

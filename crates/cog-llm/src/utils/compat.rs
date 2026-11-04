@@ -378,6 +378,11 @@ pub fn apply_reasoning_effort(
         .get(&level)
         .cloned()
         .unwrap_or_else(|| match level {
+            // `Off` is a rung of its own, not a cheaper `Minimal`: vendors that
+            // take an effort string read `"none"` as "do not think", and a
+            // model that thinks by default will otherwise spend the whole
+            // budget one rung above whatever `Minimal` maps to.
+            ThinkingLevel::Off => "none".into(),
             ThinkingLevel::Minimal | ThinkingLevel::Low => "low".into(),
             ThinkingLevel::Medium => "medium".into(),
             ThinkingLevel::High => "high".into(),
@@ -392,10 +397,11 @@ pub fn apply_reasoning_effort(
             body["reasoning"] = json!({ "effort": effort_str });
         }
         ThinkingFormat::Zai | ThinkingFormat::Qwen => {
-            body["enable_thinking"] = json!(true);
+            body["enable_thinking"] = json!(level != ThinkingLevel::Off);
         }
         ThinkingFormat::QwenChatTemplate => {
-            body["chat_template_kwargs"] = json!({ "enable_thinking": true });
+            body["chat_template_kwargs"] =
+                json!({ "enable_thinking": level != ThinkingLevel::Off });
         }
     }
 }
@@ -470,6 +476,51 @@ mod tests {
         // way, as doubao on the same vendor does.
         assert!(compat.supports_usage_in_streaming);
         assert_eq!(compat.max_tokens_field, MaxTokensField::MaxCompletionTokens);
+    }
+
+    /// 关掉思考要真的说出「关」，不是少说一句话。
+    ///
+    /// 上游模型默认就在想：不写这一格时，测试过的响应用例 completion 里九成
+    /// 是 reasoning。写 `"none"` 之后 reasoning 归零，而 `Minimal` 与 `Low`
+    /// 都还落在 `"low"` 上——在同一台上游实测，"low" 比什么都不写还想得多，
+    /// 所以「最省的一档」不能靠省略表达，只能靠这一格。
+    #[test]
+    fn off_asks_for_no_thinking_and_is_not_an_omitted_field() {
+        let empty = HashMap::new();
+        let mut body = json!({});
+        apply_reasoning_effort(
+            &mut body,
+            Some(ThinkingLevel::Off),
+            ThinkingFormat::OpenAI,
+            &empty,
+        );
+        assert_eq!(body["reasoning_effort"], json!("none"));
+
+        let mut body = json!({});
+        apply_reasoning_effort(&mut body, None, ThinkingFormat::OpenAI, &empty);
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "没意见就是不写，与「不要思考」是两件事"
+        );
+
+        // 关掉思考的格式只有一种说法：那些用开关而不是档位的画像也必须关，
+        // 而不是照旧写 `enable_thinking: true`。
+        for format in [ThinkingFormat::Zai, ThinkingFormat::Qwen] {
+            let mut body = json!({});
+            apply_reasoning_effort(&mut body, Some(ThinkingLevel::Off), format, &empty);
+            assert_eq!(body["enable_thinking"], json!(false), "{format:?}");
+        }
+        let mut body = json!({});
+        apply_reasoning_effort(
+            &mut body,
+            Some(ThinkingLevel::Off),
+            ThinkingFormat::QwenChatTemplate,
+            &empty,
+        );
+        assert_eq!(
+            body["chat_template_kwargs"]["enable_thinking"],
+            json!(false)
+        );
     }
 
     #[test]

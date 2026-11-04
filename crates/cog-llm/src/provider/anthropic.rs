@@ -268,8 +268,18 @@ impl AnthropicProvider {
         }
 
         // Thinking / reasoning budget
-        if let Some(level) = options.reasoning {
+        if let Some(level) = options
+            .reasoning
+            .filter(|l| *l != crate::ThinkingLevel::Off)
+        {
+            // `Off` never reaches here: this face asks for thinking by sending
+            // a budget, so "off" is the absence of the field. The vendor's
+            // default without it is not to think, and a zero budget would be a
+            // different request — thinking on, with nothing to spend — that
+            // some tiers reject.
             let budget = match level {
+                // Filtered out above; kept so the match stays exhaustive.
+                crate::ThinkingLevel::Off => 0,
                 crate::ThinkingLevel::Minimal => 1024,
                 crate::ThinkingLevel::Low => 2048,
                 crate::ThinkingLevel::Medium => 8192,

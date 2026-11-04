@@ -242,6 +242,20 @@ impl OpenAIResponsesProvider {
         if options.response_format == crate::ResponseFormat::Json {
             body["text"] = json!({"format": {"type": "json_object"}});
         }
+        if let Some(level) = options.reasoning {
+            // This face names the effort under `reasoning.effort` instead of
+            // the chat face's `reasoning_effort`. Leaving it out is not "off" —
+            // a model that reasons by default reads an absent field as "you
+            // choose", so the caller's level has to be carried across.
+            let effort = match level {
+                crate::ThinkingLevel::Off => "none",
+                crate::ThinkingLevel::Minimal => "minimal",
+                crate::ThinkingLevel::Low => "low",
+                crate::ThinkingLevel::Medium => "medium",
+                crate::ThinkingLevel::High | crate::ThinkingLevel::Xhigh => "high",
+            };
+            body["reasoning"] = json!({ "effort": effort });
+        }
         body
     }
 }
@@ -1043,6 +1057,31 @@ mod tests {
         assert_eq!(items[2]["type"], json!("function_call_output"));
         assert_eq!(items[2]["call_id"], json!("call_7"));
         assert_eq!(items[2]["output"], json!("sunny"));
+    }
+
+    /// 这一面把思考档放在 `reasoning.effort` 下，而不是 chat 面的
+    /// `reasoning_effort`；漏掉它的后果与 chat 面相反——不写这一格时上游
+    /// 按自己的默认想，调用方以为已经省下的那一半输出照样花出去。
+    #[test]
+    fn the_caller_thinking_level_travels_on_this_face() {
+        let provider = OpenAIResponsesProvider::new(test_model(), "key");
+        let messages = vec![Message::user("judge this")];
+
+        let body = provider.build_request_body(
+            &messages,
+            &ChatOptions {
+                reasoning: Some(crate::ThinkingLevel::Off),
+                ..Default::default()
+            },
+        );
+        assert_eq!(body["reasoning"]["effort"], json!("none"), "{body}");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "另一面的名字不在这里"
+        );
+
+        let body = provider.build_request_body(&messages, &ChatOptions::default());
+        assert!(body.get("reasoning").is_none(), "没意见就不写：{body}");
     }
 
     /// A streamed turn on this face arrives as items: text deltas, a call that
