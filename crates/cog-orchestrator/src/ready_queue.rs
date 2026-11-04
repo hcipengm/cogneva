@@ -37,14 +37,12 @@ pub fn process_local_ready_stream(workspace_id: &str) -> String {
 /// The ready queue for work that must run before the ordinary queue drains.
 ///
 /// A stream is a first-in-first-out log and a task's place in it is fixed the
-/// moment its message is appended: the highest priority in the graph cannot
-/// overtake a message that is already ahead of it. And the ordinary queue does
-/// get deep -- on 2026-11-04 the process-local ready stream held 18,032
-/// unread entries, so a message appended then would have been read weeks
-/// later. Priority therefore has to be expressed as a queue, not as a number:
-/// this stream is drained by a consumer whose budget is its own, so a stop-the-
-/// line task runs while the ordinary queue is still full, instead of waiting
-/// for it to empty.
+/// moment its message is appended: no priority in the graph can overtake a
+/// message that is already ahead of it, and the ordinary queue can be
+/// arbitrarily deep. Priority therefore has to be expressed as a queue and not
+/// as a number: this stream is drained by a consumer whose budget is its own,
+/// so a stop-the-line task runs while the ordinary queue is still full instead
+/// of waiting for it to empty.
 ///
 /// Read only by the deployment that owns the executor role, for the same reason
 /// as [`process_local_ready_stream`]: the artifact of a change-generation task
@@ -488,7 +486,7 @@ mod tests {
     /// the other queue is a first-in-first-out log, so the only way to run
     /// ahead of what is already in it is not to be in it. A task that keeps
     /// travelling on the ordinary queue waits behind every message already
-    /// appended -- on 2026-11-04 the local queue held 18,032 of them.
+    /// appended, however deep that queue has grown.
     #[test]
     fn a_task_that_may_not_wait_travels_in_its_own_lane() {
         let mut urgent = task(

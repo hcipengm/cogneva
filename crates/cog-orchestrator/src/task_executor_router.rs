@@ -184,12 +184,9 @@ impl TaskExecutorRouter {
             limit: claim_concurrency,
         };
         // 停线那条通道的许可不来自上面那一份：它的整条理由就是「别的活占满
-        // 所有许可时它仍然要跑」。共用一份时，优先级最高的那条变更会和排队
-        // 的普通变更一样，等前一条跑完——2026-11-04 实测：主线 CI 判红之后
-        // 部署器确实开了修复单，但那一条前面压着 18,032 条未读的就绪消息，
-        // 一条普通的变更跑十几分钟，等于永远轮不到它，主线因此一直红着、
-        // 一直滚不上去。它自己的一份是这条例外的代价上界：红的只有主线，
-        // 同时最多一条修复在跑。
+        // 所有许可时它仍然要跑」。共用一份时，优先级最高的那条变更也只是排在
+        // 普通变更后面等前一条跑完。它自己的一份是这条例外的代价上界：同时
+        // 最多一条修复在跑。
         let stop_the_line = crate::ready_queue::stop_the_line_ready_stream(workspace_id);
         let preempting = ClaimBudget {
             slots: Arc::new(tokio::sync::Semaphore::new(STOP_THE_LINE_CLAIM_CONCURRENCY)),
