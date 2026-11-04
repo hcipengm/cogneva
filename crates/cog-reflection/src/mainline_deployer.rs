@@ -2216,10 +2216,13 @@ struct CiHold {
     failed_checks: Vec<String>,
     /// 这一次扣住在图里开了哪几行（目标行，以及分解不了时兜底那一行）。
     ///
-    /// 记下来，是因为闭嘴的那一刻只有这里还知道它们叫什么：行 id 由 rev 与**开单那
-    /// 一天**推出，跨过午夜再按今天重算就对不上了，而 `ci_hold` 一被 take 掉，扣住
-    /// 期间每一轮都在重开的那几条路也到此为止。没有这一栏，扣住结束时就没有任何人
-    /// 记得去把它们收掉，它们永远停在队列里等着一个已经不存在的红。
+    /// 记下来，是因为闭嘴的那一刻只有这里还知道它们叫什么：行 id 由 rev、扣住起点与
+    /// **开单那一天**推出，跨过午夜再按今天重算就对不上了，而 `ci_hold` 一被 take
+    /// 掉，扣住期间每一轮都在重开的那几条路也到此为止。没有这一栏，扣住结束时就没有
+    /// 任何人记得去把它们收掉，它们永远停在队列里等着一个已经不存在的红。
+    ///
+    /// 名单里是这一次提交**真正进图的每一行**：锚点，以及规划器把这道目标拆出来的
+    /// 子任务。只记锚点，收尾就只收得回锚点，而真正在花人力的子任务留了下来。
     #[serde(default)]
     rows: Vec<String>,
 }
@@ -5092,7 +5095,15 @@ impl MainlineDeployer {
                     evidence_lines = evidence.len(),
                     "the CI hold was handed to the action planner"
                 );
-                (CiHoldOwner::Owned, vec![id])
+                // 交回来的是**这一笔真正进图的每一行**，不只是我们递出去的那个锚点：
+                // 规划器把这道目标拆成了几条子任务，那些子任务同样是这次扣住开出去
+                // 的活。只记锚点，收尾时它们就留了下来——扣住已经结束，而图里还有
+                // 人在为一条早已变绿的检查改代码。
+                let mut rows = added;
+                if !rows.iter().any(|landed| landed == &id) {
+                    rows.push(id);
+                }
+                (CiHoldOwner::Owned, rows)
             }
             Err(e) => {
                 // 分解这一步失败了，扣住本身还没有。写一条已经拆好的行重新提交：
@@ -5105,7 +5116,7 @@ impl MainlineDeployer {
                     error = %e,
                     "the planner could not take the CI hold; filing the change itself instead"
                 );
-                let (owner, fix_id) = self
+                let (owner, fix_rows) = self
                     .file_ci_hold_fix(
                         orchestrator,
                         rev,
@@ -5115,9 +5126,11 @@ impl MainlineDeployer {
                         since_unix,
                     )
                     .await;
-                // 兜底那一行的 id 不论成没成都记下：它已经在图里时，收尾要能一起收；
-                // 没落库时 `get_task` 读不到，收尾那一步自然跳过。
-                (owner, vec![id, fix_id])
+                // 目标行的 id 也记下：这一轮它被拒了，可上一轮也许落下过，收尾要能
+                // 一起收；没落库时 `get_task` 读不到，收尾那一步自然跳过。
+                let mut rows = vec![id];
+                rows.extend(fix_rows);
+                (owner, rows)
             }
         }
     }
@@ -5140,7 +5153,7 @@ impl MainlineDeployer {
         goal: &str,
         evidence: &[CheckEvidence],
         since_unix: i64,
-    ) -> (CiHoldOwner, String) {
+    ) -> (CiHoldOwner, Vec<String>) {
         let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
         let id = ci_hold_fix_task_id(rev, &day, since_unix);
         // 证据照原样放进来：接手的人先要读的就是那几条检查自己写下的失败点，而它们
@@ -5176,8 +5189,10 @@ impl MainlineDeployer {
                     queued = added.len(),
                     "the CI hold landed as a pre-decomposed self-evolution row"
                 );
-                // 已持有同一行同样算有主：这一轮没有新增，不是没人接。
-                (CiHoldOwner::Owned, id)
+                // 已持有同一行同样算有主：这一轮没有新增，不是没人接。空的 `added`
+                // 说的正是这个——那一行还在图里办着，收尾照样要能收它。
+                let rows = if added.is_empty() { vec![id] } else { added };
+                (CiHoldOwner::Owned, rows)
             }
             Err(e) => {
                 // 两条路都走不通，这一轮就是没人接得住。判词要留下是哪一侧拒的：
@@ -5188,7 +5203,7 @@ impl MainlineDeployer {
                     error = %e,
                     "the orchestrator refused the pre-decomposed CI hold row too; this hold has no owner this round"
                 );
-                (CiHoldOwner::SubmitError, id)
+                (CiHoldOwner::SubmitError, vec![id])
             }
         }
     }
@@ -16300,6 +16315,10 @@ exec {real} "$@"
         /// 那一步，而带自演化标记的行本来就不叫模型。混成同一个开关键是让"兜底也
         /// 走通了"与"两条路都断了"在测试里无法区分。
         refuse_decomposition: std::sync::atomic::AtomicBool,
+        /// 拆出来挂在锚点下的子任务 id：真实规划器会把一道目标变成几条子任务，并在
+        /// 交回时如实把它们算进「进图的那几行」。替身不摆这一手，"记不记得住子任务"
+        /// 这件事在测试里就无从问起——而它正是收尾收不收得到它们的全部依据。
+        decompose_into: std::sync::Mutex<Vec<String>>,
     }
 
     impl RecordingPlanner {
@@ -16371,6 +16390,33 @@ exec {real} "$@"
                 }
                 fresh
             };
+            // 这一次提交要分解时，把摆好的子任务挂到锚点下面，并算进交回的那几行：
+            // 真实规划器交给 DAG 的是一整批，回的是真正进图的每一个 id。
+            if needs_decomposition {
+                let planned: Vec<String> = self.decompose_into.lock().unwrap().clone();
+                let anchor = ids.first().cloned();
+                let mut fresh = fresh;
+                let mut graph = self.graph.lock().unwrap();
+                for child in planned {
+                    if graph.contains_key(&child) {
+                        continue;
+                    }
+                    let mut row = cog_core::Task::new(
+                        child.clone(),
+                        cog_core::TaskType::Custom("generated".into()),
+                        serde_json::json!({ "goal": goal }),
+                    );
+                    row.parent_task_id = anchor.clone();
+                    graph.insert(child.clone(), row);
+                    fresh.push(child);
+                }
+                drop(graph);
+                self.submissions
+                    .lock()
+                    .unwrap()
+                    .push((goal.to_string(), ids, fresh.clone()));
+                return Ok(fresh);
+            }
             self.submissions
                 .lock()
                 .unwrap()
@@ -17155,6 +17201,58 @@ exec {real} "$@"
             planner.status(&second_fix),
             Some(cog_core::TaskStatus::Pending),
             "读数说有主，图里就得有一行活的单子：{second_rows:?}"
+        );
+    }
+
+    /// 规划器把扣住拆成子任务之后，那些子任务也算这次扣住开出去的活。
+    ///
+    /// 收尾是按 `CiHold::rows` 收的，而那一栏记的是提交门交回来的行。只记我们递出去
+    /// 的锚点，拆出来、真正在花人力的子任务就留在图里：扣住已经结束，还有人在为一条
+    /// 早已变绿的检查改代码，而面读数还数着这份活。
+    ///
+    /// 把交回来的那一批换成 `vec![id]`，下面「子任务也收掉了」立刻红。
+    #[tokio::test]
+    async fn a_hold_the_planner_decomposed_records_the_children_it_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        planner
+            .decompose_into
+            .lock()
+            .unwrap()
+            .push("child-1".into());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let checks = vec!["github:Test".to_string()];
+        let (owner, rows) = deployer
+            .dispatch_ci_remediation("abc123", &checks, 100)
+            .await;
+        assert_eq!(owner, CiHoldOwner::Owned);
+        assert!(
+            rows.contains(&"child-1".to_string()),
+            "拆出来的子任务也是这次扣住开的活，收尾要知道它叫什么：{rows:?}"
+        );
+        assert_eq!(
+            planner.status("child-1"),
+            Some(cog_core::TaskStatus::Pending)
+        );
+
+        let ended = CiHoldEnd {
+            rev: "abc123".into(),
+            since_unix: 100,
+            ended_unix: 200,
+            outcome: "pass".into(),
+            reasons: Vec::new(),
+            failed_checks: checks,
+        };
+        deployer.retire_ci_hold_rows(&rows, &ended).await;
+        assert_eq!(
+            planner.status("child-1"),
+            Some(cog_core::TaskStatus::Cancelled),
+            "扣住结束了，为它拆出来的活也到此为止"
         );
     }
 
