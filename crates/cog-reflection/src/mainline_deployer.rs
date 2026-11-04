@@ -31137,4 +31137,77 @@ exit 0
             None => std::env::remove_var(WEB_NPM_REGISTRY_ENV),
         }
     }
+
+    /// 同一版的判词会被重判，所以读它必须带着它是哪一刻做出的。
+    ///
+    /// 判词按 rev 落成一格，而 rev 不变、结论会变：派发前那一问常常先答
+    /// `no_evidence`（上游的检查还在跑），几分钟后同一版再问就是 `pass`。读状态
+    /// 文件的人因此读到的可能是重判之前的结论，也可能是重判之后的，而两者说的是
+    /// 同一版——只看结论，就分不出这一版是「没结论就放行」还是「判过才放行」，也
+    /// 分不出手上这份读数是不是已经被改写过。
+    ///
+    /// 同一个 rev 的 CI 判词会被重判（no_evidence → pass），读它必须带 decided_unix。
+    ///
+    /// principle: feedback_a_verdict_that_can_be_rejudged_must_be_read_with_its_timestamp
+    #[tokio::test]
+    async fn a_rejudged_verdict_is_read_with_its_own_instant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 第一问上游还在跑（一次 check-runs，一次提交状态兜底）；第二问同一版给出了结论。
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"name":"Test","status":"in_progress"}]}"#),
+            http_200("{}"),
+            http_200(r#"{"check_runs":[{"conclusion":"success"}]}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+
+        let mut state = MainlineState::default();
+        assert!(!deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+        let first = state.last_ci_verdict.clone().expect("没结论也要留判词");
+        assert_eq!(first.rev, "abc123");
+        assert_eq!(first.verdict, "no_evidence");
+        assert!(
+            first.decided_unix > 0,
+            "判词要带它做出来的那一刻，否则同一版的两份读数排不出先后，读到的是 {}",
+            first.decided_unix
+        );
+
+        // 把这份读数改成「一小时前做的」，再让同一版被重判一次：新的读数要是沿用
+        // 了旧那一刻、或者根本没写这一格，下面两条都会读出来。
+        let an_hour_ago = chrono::Utc::now().timestamp() - 3600;
+        state.last_ci_verdict.as_mut().unwrap().decided_unix = an_hour_ago;
+        deployer.save_state(&state).unwrap();
+
+        assert!(!deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+        let second = deployer
+            .load_state()
+            .last_ci_verdict
+            .expect("改判也要留判词");
+        assert_eq!(second.rev, "abc123", "重判的还是同一版");
+        assert_eq!(
+            second.verdict, "pass",
+            "同一版被重判成了 pass：这一版是判过才放行的"
+        );
+        assert!(
+            second.decided_unix > an_hour_ago,
+            "改判要带上它自己那一刻，读到的却仍是重判之前的那一刻（{}）",
+            second.decided_unix
+        );
+        assert!(
+            (chrono::Utc::now().timestamp() - second.decided_unix).abs() < 5,
+            "读出来的该是这一次判词自己的时刻，读到的是 {}",
+            second.decided_unix
+        );
+        handle.await.unwrap();
+    }
 }
