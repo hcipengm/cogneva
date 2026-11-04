@@ -180,6 +180,9 @@ impl GeneratorActor {
         }
 
         let input = crate::actors::actor_input(task, contract, ctx);
+        // 自进化的一轮要在收尾时问工作树「它改了什么」，问不到就得让这一轮
+        // 重来一次；重来的请求是这一次的请求加一句，所以留一份。别的角色不留。
+        let repair_base = is_self_evolution.then(|| input.clone());
 
         let (mut output, review_basis) = match self.agent.prompt_for_task(&task.id, input).await {
             Ok(result) => {
@@ -261,10 +264,90 @@ impl GeneratorActor {
         // Last, so it also covers a revision the self-review wrote: whatever
         // artifact the round ends up with is the one the tree is asked about.
         if is_self_evolution {
-            output = prefer_workspace_change(self.agent.as_ref(), &task.id, output).await;
+            let (out, source) =
+                prefer_workspace_change(self.agent.as_ref(), &task.id, output).await;
+            output = match (source, repair_base) {
+                (Some(crate::observable::CHANGE_DIFF_SOURCE_MODEL), Some(base)) => {
+                    self.repair_untouched_checkout(task, base, out).await
+                }
+                _ => out,
+            };
         }
         output
     }
+
+    /// 树没动的时候，让这一轮把改动真的写进检出，而不是把 diff 写在答复里。
+    ///
+    /// 实测（2026-11-04）：生成端每轮拿到文件工具，却在 74 轮里一次写工具都没
+    /// 调用——它读两三个文件，然后把一份凭记忆手写的 unified diff 当成产物交上来。
+    /// 手写的 hunk 计数与上下文行对不上，`git apply --check` 就挂，这一轮的生成、
+    /// 评审、执行全部白付。取树那条路在同样的窗口里只命中 3 次。
+    ///
+    /// 所以只在这一个条件下重问一次：这一轮**产出了变更产物**、而工作树读回来
+    /// 没有改动。重问的话只说一件它能做的事——把改动写进检出，然后从 `git diff`
+    /// 取产物。第二次也没动树的，仍然收第一份答复：这里只补一次机会，不改判据，
+    /// 也不把一轮答复换成一无所有。
+    async fn repair_untouched_checkout(
+        &self,
+        task: &Task,
+        base: serde_json::Value,
+        first: GeneratorOutput,
+    ) -> GeneratorOutput {
+        let repair = checkout_repair_request(base);
+        let result = match self.agent.prompt_for_task(&task.id, repair).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "the round's checkout was untouched and asking again failed; keeping the answer it gave"
+                );
+                return first;
+            }
+        };
+        let second = crate::squad::pge::parse_generator_output(&result);
+        if !has_change_artifact(&second) {
+            tracing::warn!(
+                task_id = %task.id,
+                "the round's checkout was untouched and the second answer carried no change; keeping the first"
+            );
+            return first;
+        }
+        let (out, source) = prefer_workspace_change(self.agent.as_ref(), &task.id, second).await;
+        if source == Some(crate::observable::CHANGE_DIFF_SOURCE_TREE) {
+            return out;
+        }
+        tracing::warn!(
+            task_id = %task.id,
+            "the round's checkout was still untouched after asking again; keeping the first answer"
+        );
+        first
+    }
+}
+
+/// 重问时要加进请求的那一句话，以及它落在请求的哪个位置。
+///
+/// 落在 `context` 里而不是契约里：契约是逐字节相同的那一半，随每次尝试变化的
+/// 东西放进去就不再可缓存。这一句只属于这一轮。
+fn checkout_repair_request(mut base: serde_json::Value) -> serde_json::Value {
+    let sentence = serde_json::Value::String(
+        "Your checkout is unchanged: this round answered with a diff it wrote from memory, \
+         and only the checkout is read back -- a diff in the answer is not applied for you. \
+         Make the change in the checkout itself with your tools (write_file, or a shell \
+         command that edits the file), then answer again with the same artifact, taking its \
+         content from `git --no-pager diff`. If the change you described is not the right \
+         one, change your mind and write the right one into the checkout instead."
+            .to_string(),
+    );
+    match base.get_mut("context").and_then(|c| c.as_object_mut()) {
+        Some(context) => {
+            context.insert("checkout_unchanged".to_string(), sentence);
+        }
+        None => {
+            base["context"] = serde_json::json!({ "checkout_unchanged": sentence });
+        }
+    }
+    base
 }
 
 /// Take the change from the run's checkout when the checkout holds one.
@@ -287,11 +370,11 @@ async fn prefer_workspace_change(
     agent: &dyn Agent,
     task_id: &str,
     output: GeneratorOutput,
-) -> GeneratorOutput {
+) -> (GeneratorOutput, Option<&'static str>) {
     // A round with no change artifact is never asked about, so a report-only
     // round does not pay a sandbox command to be told there is nothing to swap.
     if !has_change_artifact(&output) {
-        return output;
+        return (output, None);
     }
     let excluded = artifact_files_to_exclude(&output);
     let harvested = match agent.workspace_change(task_id, &excluded).await {
@@ -311,7 +394,7 @@ async fn prefer_workspace_change(
             .record_change_diff_source(source)
             .await;
     }
-    output
+    (output, source)
 }
 
 fn has_change_artifact(output: &GeneratorOutput) -> bool {
@@ -821,6 +904,44 @@ mod tests {
             apply_workspace_change(typed.clone(), Some("nothing changed\n".into()));
         assert_eq!(source, Some("model"));
         assert_eq!(output.artifacts[0].content, typed.artifacts[0].content);
+    }
+
+    /// 重问的那一句要落在这一轮的上下文里，并且**不动**原来那半：这一轮的
+    /// 目标、计划、上一轮反馈都还在，模型才有东西可改。
+    #[test]
+    fn the_repair_round_carries_the_original_request_and_says_what_was_wrong() {
+        let base = serde_json::json!({
+            "task": {"id": "t1", "goal": "fix the thing"},
+            "context": {"goal": "fix the thing", "plan": {"steps": ["a"]}},
+            "change_generation": {"output_format": "unified_diff"},
+        });
+        let repair = checkout_repair_request(base.clone());
+        assert_eq!(repair["task"], base["task"]);
+        assert_eq!(repair["context"]["goal"], base["context"]["goal"]);
+        assert_eq!(repair["context"]["plan"], base["context"]["plan"]);
+        assert_eq!(
+            repair["change_generation"], base["change_generation"],
+            "契约那半必须逐字节不变，否则这一轮的重试就不再可缓存"
+        );
+        let sentence = repair["context"]["checkout_unchanged"]
+            .as_str()
+            .expect("重问要说明树没动");
+        assert!(
+            sentence.contains("checkout is unchanged"),
+            "要先说清事实：{sentence}"
+        );
+        assert!(
+            sentence.contains("git --no-pager diff"),
+            "要给出取产物的那一条命令：{sentence}"
+        );
+    }
+
+    /// 请求里没有上下文那一半也不能把话丢掉：`context` 整个建出来。
+    #[test]
+    fn a_request_with_no_context_still_gets_the_repair_sentence() {
+        let repair = checkout_repair_request(serde_json::json!({"task": {"id": "t1"}}));
+        assert!(repair["context"]["checkout_unchanged"].is_string());
+        assert_eq!(repair["task"]["id"], "t1");
     }
 
     /// A round with no change artifact has no diff whose source could be
