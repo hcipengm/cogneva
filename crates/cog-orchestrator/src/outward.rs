@@ -659,6 +659,7 @@ async fn hand_over(
 /// rest. Three is enough for a refusal that is a collision or a momentary
 /// outage to clear, and bounded so that an item the goal path will never take
 /// stops costing a submission every five minutes for the rest of the day.
+// cap: bound — 一次交接被拒多是撞车或片刻不可用，下一两个唤醒就过去了；界设在「今天剩下的每一拍都再交一次」之前
 const HANDOVER_ATTEMPTS: u32 = 3;
 
 /// An item whose hand-over failed, waiting for the next wake.

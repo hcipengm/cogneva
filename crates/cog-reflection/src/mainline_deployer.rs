@@ -1536,6 +1536,7 @@ const CI_HOLD_FIX_KIND: &str = "ci_hold_fix";
 ///
 /// 轮次不是时间表，是「上一行已经终结了，而扣住还站着」的计数：每一轮都要有一行
 /// 真的办完才会走到下一轮，所以这个上界只在别的地方出错时才会被撞到。
+// cap: bound — 正常一轮一条活，三十二轮只在上游判据自己出错时才会被撞到；撞到就换带时刻的新 id
 const CI_HOLD_FIX_ROUNDS: usize = 32;
 
 /// 这一轮**谁在管**这次扣住。0/1 只答「有没有人管」，而「没人管」有两种，修法在
@@ -5138,7 +5139,10 @@ impl MainlineDeployer {
                 // 与后面那一处同一个判据，问的也是同一件事：这张单子**还**有人跑吗。
                 // 只读 `is_executable` 会把办完的单子读成有人在办——2026-11-05 实测
                 // `…-fix` 已经 `completed` 而扣住仍然站着，这一支于是每轮都回「有主」。
-                if self.any_row_can_run(orchestrator, &[fix_id.clone()]).await {
+                if self
+                    .any_row_can_run(orchestrator, std::slice::from_ref(&fix_id))
+                    .await
+                {
                     info!(
                         rev = %rev12(rev),
                         goal_id = %id,
