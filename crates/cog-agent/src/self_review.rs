@@ -211,7 +211,7 @@ impl SelfReviewLoop {
             let score = comparison.score;
             if best
                 .as_ref()
-                .map_or(true, |(_, best_score, _)| score > *best_score)
+                .is_none_or(|(_, best_score, _)| score > *best_score)
             {
                 best = Some((current_output.clone(), score, result.clone()));
             }
@@ -237,6 +237,18 @@ impl SelfReviewLoop {
                     }
                     previous_score = Some(score);
 
+                    // 最后一轮不再买改写。
+                    //
+                    // 改写是循环里的最后一个动作，之后没有 critique、没有
+                    // compare：改写出来的正文不会被任何人打分。按这一族的规矩
+                    // ——交出去的只能是打过分的正文——它也不会被交出去。买它
+                    // 就是把整篇正文重新生成一遍然后丢掉；生产上这一族没有一次
+                    // 达到阈值，所以每一轮评审都在最后一格上付这笔钱。
+                    if iteration == self.config.max_iterations - 1 {
+                        let (text, _, verdict) = best.expect("刚写进去过");
+                        return Ok((text, verdict));
+                    }
+
                     // Step 5: Revise
                     let previous = current_output.clone();
                     current_output = SelfReviewLoop::revise(
@@ -259,12 +271,6 @@ impl SelfReviewLoop {
                     if current_output == previous {
                         let (text, _, verdict) = best.expect("刚写进去过");
                         return Ok((text, verdict));
-                    }
-
-                    // If this was the last allowed iteration, return the revised output
-                    // with the last NeedRevision result so callers can log it.
-                    if iteration == self.config.max_iterations - 1 {
-                        return Ok((current_output, result));
                     }
                 }
             }
@@ -705,6 +711,14 @@ mod tests {
         })
     }
 
+    fn loop_with_three_rounds() -> SelfReviewLoop {
+        SelfReviewLoop::new(SelfReviewConfig {
+            max_iterations: 3,
+            quality_threshold: 0.8,
+            ..Default::default()
+        })
+    }
+
     /// 分数没有往上走的那一轮不再改写，交回已经打过分里最好的那一份。
     ///
     /// 改写一次要重写整篇正文，而它存在的理由是「上一版还不够好」。第一轮
@@ -737,20 +751,63 @@ mod tests {
         }
     }
 
-    /// 分数往上走的那一轮照常改写，最后一版交出去。
+    /// 分数往上走的那一轮照常改写。
     ///
     /// 这条是上一条的反面：判据不能把「还在变好」的评审也一并停掉——那样省下的
-    /// 就是该花的钱。
+    /// 就是该花的钱。三轮里两轮的分都在涨，两轮都改写；第三轮的分拿到之后没有
+    /// 下一轮可以审改写了，所以交回的是第二轮改写出来的、已经拿过分的
+    /// `REV-2`。
     #[tokio::test]
     async fn a_revision_that_scored_better_is_revised_again() {
-        let llm = ScoringLlm::new(&[0.6, 0.7]);
+        let llm = ScoringLlm::new(&[0.6, 0.7, 0.78]);
 
-        let (text, _) = loop_with_two_rounds()
+        let (text, verdict) = loop_with_three_rounds()
             .review("ORIGINAL", &llm)
             .await
             .unwrap();
 
-        assert_eq!(llm.revise_calls(), 2, "两轮都在变好，两轮都改写");
-        assert_eq!(text, "REV-2", "最后一版是更好的那一版");
+        assert_eq!(llm.revise_calls(), 2, "前两轮都在变好，那两轮都改写");
+        assert_eq!(text, "REV-2", "交出去的是最后一版被审过的正文");
+        match verdict {
+            SelfReviewResult::NeedRevision { score, .. } => {
+                assert!(
+                    (score - 0.78).abs() < 1e-6,
+                    "判词跟着那一节的分数走：{score}"
+                )
+            }
+            other => panic!("这是一次没过的评审：{other:?}"),
+        }
+    }
+
+    /// 最后一轮不买改写：改写出来没有人打分，也就交不出去。
+    ///
+    /// 两轮的循环里，第二轮的分数是最后一次评审读数；这一轮再改写，产出的正文
+    /// 既没有 critique 也没有 compare 去评它，所以只会被丢掉。生产上这一族
+    /// 没有一次达到阈值，每一轮评审都停在最后一格上——这条测试钉住那一格不再
+    /// 付费，而交出去的仍是第一轮改写出来、第二轮打过分的 `REV-1`。
+    #[tokio::test]
+    async fn the_last_round_buys_no_revision_it_cannot_score() {
+        let llm = ScoringLlm::new(&[0.6, 0.7]);
+
+        let (text, verdict) = loop_with_two_rounds()
+            .review("ORIGINAL", &llm)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            llm.revise_calls(),
+            1,
+            "最后一轮的改写不会被评分，也不该被买"
+        );
+        assert_eq!(text, "REV-1", "交出去的是打过分的最后一版");
+        match verdict {
+            SelfReviewResult::NeedRevision { score, .. } => {
+                assert!(
+                    (score - 0.7).abs() < 1e-6,
+                    "判词跟着那一节的分数走：{score}"
+                )
+            }
+            other => panic!("这是一次没过的评审：{other:?}"),
+        }
     }
 }

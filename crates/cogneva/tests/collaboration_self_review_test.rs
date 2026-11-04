@@ -620,6 +620,12 @@ async fn test_full_review_revises_once_then_passes() {
     );
 }
 
+/// 用完最后一轮时，交出去的是最后一版**被审过**的正文。
+///
+/// 旧契约是交出最后一轮改写的那份，而那份没有任何人打过分：改写是循环的最后
+/// 一个动作，判词属于它前面那一版。现在最后一轮不再买改写——改写出来也没人评、
+/// 也就交不出去——所以这里拿到的是第二轮打过分的 `revision 1`，判词是那一轮的
+/// 分数。分数必须往上走才买改写，所以第二轮给 0.4（比 0.3 高、仍低于阈值）。
 #[tokio::test]
 async fn test_full_review_max_iterations_exceeded() {
     let provider = DummyProvider::new(vec![
@@ -631,10 +637,8 @@ async fn test_full_review_max_iterations_exceeded() {
         "revision 1".into(),
         // critique (cycle 2)
         r#"{"issues":["bug2"],"missing":[],"strengths":[]}"#.into(),
-        // comparison (cycle 2 — below threshold)
-        r#"{"gaps":["bug2"],"aligned":[],"score":0.3}"#.into(),
-        // revise
-        "revision 2".into(),
+        // comparison (cycle 2 — better, still below threshold: the last one)
+        r#"{"gaps":["bug2"],"aligned":[],"score":0.4}"#.into(),
     ]);
 
     let config = SelfReviewConfig {
@@ -646,9 +650,9 @@ async fn test_full_review_max_iterations_exceeded() {
     let loop_ = SelfReviewLoop::new(config);
     let (output, result) = loop_.review("my output", &provider).await.unwrap();
 
-    assert_eq!(output, "revision 2");
+    assert_eq!(output, "revision 1");
     assert!(
-        matches!(result, SelfReviewResult::NeedRevision { score, .. } if (score - 0.3).abs() < f32::EPSILON)
+        matches!(result, SelfReviewResult::NeedRevision { score, .. } if (score - 0.4).abs() < f32::EPSILON)
     );
 }
 
