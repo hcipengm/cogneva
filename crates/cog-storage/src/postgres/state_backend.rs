@@ -145,6 +145,16 @@ CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_face
 CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_owner_unit
             ON cog_dag_tasks(workspace_id, owner_unit, status)
 ;
+-- 按任务 id 单点找「最近的那一行」，不走工作区。
+--
+-- 主键是 `(workspace_id, task_id)`，所以只带 task_id 的查询用不上它：额度判定在
+-- LLM 代理路径上每一次任务调用都要问一次「这件活是谁交的、跑在哪个租户」（一次
+-- 请求一次的读），没有这条索引就是每发都全表顺序扫描，表随任务数增长而每次请求
+-- 都更慢。按花销把调用折到人／工作区的两个当日汇总也走同一个形状，取的都是
+-- `ORDER BY updated_at DESC LIMIT 1`，所以排序列进索引，取数不必再排序。
+CREATE INDEX IF NOT EXISTS idx_cog_dag_tasks_task_updated
+            ON cog_dag_tasks(task_id, updated_at DESC)
+;
 -- 一条任务的计划基线：它「打算怎么做」。
 --
 -- 与 cog_dag_tasks 并排而不是加列进去：后者每次状态流转都要整行重写，
