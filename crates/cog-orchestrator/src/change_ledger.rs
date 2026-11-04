@@ -630,6 +630,14 @@ pub fn dispatch_task_ids(identity: &ChangeIdentity) -> Vec<String> {
 // cap: bound — 落地机一天写几笔提交；这个界挡的是「一个多年历史仓把一轮变成走一遍历史」
 const LANDING_LOG_COMMITS: usize = 2_000;
 
+/// The part of the tree whose commits are expected to answer to the account.
+///
+/// Narrow on purpose: docs, deploy manifests and the operator scripts have no
+/// change to owe, and counting them would make "how much work reached the tree
+/// without a change" a number nobody can act on. A commit that touches this
+/// path changed what the product does.
+const PRODUCT_CODE_PATH: &str = "crates/";
+
 /// The changes a commit log says it landed, keyed by the id each commit names.
 ///
 /// Read off the tree rather than written by the landing machine, because the
@@ -663,6 +671,74 @@ fn trailer_named_change(line: &str) -> Option<&str> {
 /// one commit may name more than one change. First sighting wins as the log is
 /// read newest first, so a change that was landed twice is attributed to the
 /// later commit.
+/// The revisions in the log that name a change, whichever change they name.
+///
+/// A different question from [`landing_trailers`], and read by a different
+/// reader: this one asks whether a commit answered to the account at all, not
+/// which row it answered for. Paraphrased to "did this commit name anything",
+/// so a commit whose change the ledger does not hold still counts as having
+/// answered -- that it named a change the account never read is a different
+/// reading (the delivery one), and folding the two would let a missing row
+/// report itself as work nobody accounted for.
+fn trailered_revisions(log: &str) -> HashSet<String> {
+    let mut named = HashSet::new();
+    for record in log.split('\u{1e}') {
+        let mut fields = record.splitn(2, '\u{1f}');
+        let (Some(rev), Some(body)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let rev = rev.trim();
+        if rev.is_empty() {
+            continue;
+        }
+        if body
+            .lines()
+            .any(|line| trailer_named_change(line).is_some())
+        {
+            named.insert(rev.to_string());
+        }
+    }
+    named
+}
+
+/// How many of the window's commits touched product code, and how many of those
+/// named a change.
+///
+/// The pair is read together because the difference is the reading: a window
+/// count alone cannot say whether the commits that reached the tree answered to
+/// the account, and a trailered count alone is a number with no denominator.
+fn product_commits(window: &[(String, i64)], trailered: &HashSet<String>) -> (usize, usize) {
+    let named = window
+        .iter()
+        .filter(|(rev, _)| trailered.contains(rev))
+        .count();
+    (window.len(), named)
+}
+
+/// Say it out loud when product code reached the line without naming a change,
+/// and the commit is new.
+///
+/// Only fresh ones: the window holds commits that predate the account, and a
+/// warning about those every pass is a warning nobody reads. A commit younger
+/// than two passes is one that arrived while the account was running and that
+/// the account heard nothing about -- the only version of this reading that is
+/// about something happening now. The counts are published either way; this
+/// line exists because a number going up is not a moment, and this is.
+fn note_fresh_unclaimed_commit(newest: Option<&(String, i64)>) {
+    let Some((rev, at)) = newest else {
+        return;
+    };
+    let age = Utc::now().timestamp() - at;
+    if age >= 0 && age <= (CHANGE_LEDGER_PASS_INTERVAL.as_secs() * 2) as i64 {
+        warn!(
+            rev = %rev,
+            age_seconds = age,
+            "change ledger: a commit that touched product code named no change, and it is \
+             newer than two pass intervals -- work is reaching the tree around the account"
+        );
+    }
+}
+
 fn landing_trailers(log: &str) -> HashMap<String, String> {
     let mut landed = HashMap::new();
     for record in log.split('\u{1e}') {
@@ -1913,8 +1989,34 @@ pub fn spawn_change_ledger_loop(
                     // whose check still failed, so the column would hold the
                     // ones that did not land and stay empty for the ones that
                     // did -- the exact inversion the trailer exists to prevent.
+                    // The same log answers one more question: which of the
+                    // commits that touched product code named a change at all.
+                    // A commit that named nothing leaves no delivery to miss and
+                    // no row to settle, so nothing else in the platform reports
+                    // it -- this window is the only place it is countable.
+                    let mut commits_read = None;
                     let deliveries = match tree.landing_log(LANDING_LOG_COMMITS).await {
-                        Ok(log) => Some(landing_trailers(&log)),
+                        Ok(log) => {
+                            let named = trailered_revisions(&log);
+                            match tree
+                                .landing_log_touching(LANDING_LOG_COMMITS, PRODUCT_CODE_PATH)
+                                .await
+                            {
+                                Ok(window) => {
+                                    commits_read = Some(product_commits(&window, &named));
+                                    note_fresh_unclaimed_commit(
+                                        window.iter().find(|(rev, _)| !named.contains(rev)),
+                                    );
+                                }
+                                Err(why) => warn!(
+                                    why = %why,
+                                    "change ledger: the commits that touched product code could \
+                                     not be read this pass, so whether any of them named a \
+                                     change went unmeasured"
+                                ),
+                            }
+                            Some(landing_trailers(&log))
+                        }
                         Err(why) => {
                             warn!(
                                 why = %why,
@@ -2000,6 +2102,7 @@ pub fn spawn_change_ledger_loop(
                             events.as_deref(),
                             &sources_unread,
                             deliveries.as_ref(),
+                            commits_read,
                             firing.as_deref(),
                         )
                         .await
@@ -4249,6 +4352,10 @@ async fn dispatch_pass(
     // The changes the commit log says it landed, by task id. `None` when the
     // log could not be read: delivery is then unmeasured, not zero.
     deliveries: Option<&HashMap<String, String>>,
+    // How many commits in that same window touched product code and how many of
+    // them named a change. Read by the caller from the same log, so the delivery
+    // cells and these describe one window; `None` when the tree could not say.
+    commits: Option<(usize, usize)>,
     // The firing alerts this pass could read. `None` is "nobody could look",
     // which is a different finding from "nothing is ringing", and the face
     // lifecycle reads it as a second intake of work nobody has a name on.
@@ -4651,6 +4758,7 @@ async fn dispatch_pass(
         // `None`, not zero, when the log could not be read: a failed read is
         // not a pass that found nothing delivered.
         deliveries.map(|_| counts.delivered as u64),
+        commits,
         alerts,
     )
     .await;
@@ -4901,6 +5009,20 @@ enum DispatchReadout {
     /// the reading these two exist to make visible.
     DemandSatisfied,
     DemandOwed,
+    /// The tree's own account of what reached it: how many commits in the
+    /// landing window touched product code, and how many of those named a change
+    /// in their body.
+    ///
+    /// Read from the window the delivery reading uses, and beside it, because
+    /// these answer the question the delivery cells cannot: a delivery says a
+    /// commit named a change the ledger already holds, and a commit that named
+    /// nothing reaches the tree and leaves the account untouched -- no delivery
+    /// to miss, no row to settle, nothing that fails anywhere. That silence is
+    /// what these two cells make countable. Split rather than published as one
+    /// "unaccounted" number because the window slides: the plain difference is
+    /// only meaningful next to the count it was taken from.
+    CommitsInWindow,
+    CommitsTrailered,
     /// What the account is holding in front of the rest of itself: how many
     /// changes a commit delivered while the account still owes them, and how
     /// many other rows are measured at a revision one of them delivered.
@@ -4942,6 +5064,8 @@ impl DispatchReadout {
         DispatchReadout::StateUndecided,
         DispatchReadout::DemandSatisfied,
         DispatchReadout::DemandOwed,
+        DispatchReadout::CommitsInWindow,
+        DispatchReadout::CommitsTrailered,
         DispatchReadout::BlockingRows,
         DispatchReadout::HeldLandings,
         DispatchReadout::BlockConflicts,
@@ -5000,6 +5124,8 @@ impl DispatchReadout {
             Self::StateUndecided => "state_undecided",
             Self::DemandSatisfied => "demand_satisfied",
             Self::DemandOwed => "demand_owed",
+            Self::CommitsInWindow => "commits_in_window",
+            Self::CommitsTrailered => "commits_trailered",
             Self::BlockingRows => "blocking_rows",
             Self::HeldLandings => "held_landings",
             Self::BlockConflicts => "block_conflicts",
@@ -5034,6 +5160,12 @@ async fn publish_dispatch_rows(
     census: Option<&[(ChangeState, u64)]>,
     demand: Option<DemandClosure>,
     blocking: Option<BlockingSurface>,
+    // (commits that touched product code, of those how many named a change),
+    // read off the same window as the deliveries. `None` when the window could
+    // not be read: not writing the cells leaves the last read visible with its
+    // timestamp, which is a known earlier tick -- writing two zeros would say
+    // the tree's whole window answered to the account.
+    commits: Option<(usize, usize)>,
 ) {
     let Some(metrics) = metrics else {
         return;
@@ -5068,6 +5200,17 @@ async fn publish_dispatch_rows(
             // "held landings" count with no "holding rows" beside it cannot be
             // read as anything, and a conflict count taken from a store that
             // could not answer would say the documents agree.
+            DispatchReadout::CommitsInWindow | DispatchReadout::CommitsTrailered => {
+                let Some((touching, named)) = commits else {
+                    continue;
+                };
+                let count = if matches!(readout, DispatchReadout::CommitsInWindow) {
+                    touching
+                } else {
+                    named
+                };
+                u64::try_from(count).unwrap_or(u64::MAX)
+            }
             DispatchReadout::BlockingRows
             | DispatchReadout::HeldLandings
             | DispatchReadout::BlockConflicts => {
@@ -5468,6 +5611,8 @@ async fn record_dispatch_state(
     counts: &TickCounts,
     sources_unread: &[&'static str],
     delivered: Option<u64>,
+    // The tree's window reading, read by the caller beside the deliveries.
+    commits: Option<(usize, usize)>,
     // The firing alerts this pass could read, or `None` when nobody could look.
     // Read by the caller so that one pass reads the surface once.
     alerts: Option<&[cog_core::PersistedAlert]>,
@@ -5623,6 +5768,7 @@ async fn record_dispatch_state(
         census.as_deref(),
         demand,
         blocking,
+        commits,
     )
     .await;
     // The same account, grouped by the face its documents named. Read here and
@@ -10371,6 +10517,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await;
 
@@ -10540,6 +10687,7 @@ mod tests {
             None,
             &[],
             None,
+            None,
             Some(&alerts),
         )
         .await;
@@ -10564,6 +10712,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             Some(&[firing(Some("tasks")), firing(Some("tasks"))]),
         )
@@ -10607,6 +10756,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -10673,6 +10823,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await;
 
@@ -10725,6 +10876,7 @@ mod tests {
             None,
             &[],
             Some(&deliveries),
+            None,
             None,
         )
         .await;
@@ -10783,6 +10935,7 @@ mod tests {
             &[],
             Some(&deliveries),
             None,
+            None,
         )
         .await;
 
@@ -10823,6 +10976,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -10871,6 +11025,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -10945,6 +11100,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -10970,6 +11126,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -11028,6 +11185,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await;
         assert_eq!(
@@ -11057,6 +11215,7 @@ mod tests {
             Some(&metrics),
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -11091,6 +11250,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await;
         assert!(
@@ -11122,6 +11282,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -11160,6 +11321,7 @@ mod tests {
             &[INTAKE_PRINCIPLES],
             None,
             None,
+            None,
         )
         .await;
         let state = store.written().pop().expect("the pass wrote its row");
@@ -11181,6 +11343,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -11206,6 +11369,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -11243,6 +11407,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -11292,6 +11457,7 @@ mod tests {
             &[],
             None,
             None,
+            None,
         )
         .await;
 
@@ -11324,6 +11490,7 @@ mod tests {
             None,
             None,
             &[],
+            None,
             None,
             None,
         )
@@ -11659,6 +11826,7 @@ mod tests {
             Some(&metrics),
             Some(&events),
             &[],
+            None,
             None,
             None,
         )
@@ -12005,6 +12173,7 @@ mod tests {
             Some(&census),
             Some(demand),
             Some(blocking),
+            Some((7, 3)),
         )
         .await;
         publish_dispatch_verdict(Some(&metrics), &state).await;
@@ -12059,6 +12228,11 @@ mod tests {
         assert_eq!(published["held_back"], 120.0);
         assert_eq!(published["rearmed"], 2.0);
         assert_eq!(published["unmeasurable"], 5.0);
+        // The tree's own window: the count and the part of it that named a
+        // change, so the difference a reader takes is a subtraction of two
+        // numbers the same pass read off the same history.
+        assert_eq!(published["commits_in_window"], 7.0);
+        assert_eq!(published["commits_trailered"], 3.0);
         // The readback's own cells, and the difference between the two that is
         // the whole reason there are two: 40 changes still have handovers on
         // record and 6 of them left a deliverable, so the reading says 34 ran
@@ -12347,7 +12521,7 @@ mod tests {
         };
         let metrics: Arc<dyn MetricsBackend> =
             Arc::new(cog_test_support::MemoryMetricsBackend::new());
-        publish_dispatch_rows(Some(&metrics), &state, None, None, None, None).await;
+        publish_dispatch_rows(Some(&metrics), &state, None, None, None, None, None).await;
 
         let end = Utc::now() + chrono::Duration::seconds(1);
         let start = end - chrono::Duration::seconds(600);
@@ -12398,6 +12572,79 @@ mod tests {
             Some(&"aaaa".to_string())
         );
         assert_eq!(landed.len(), 1, "a body with no trailer names nothing");
+    }
+
+    /// The window reading has two numbers because the difference is the
+    /// reading: how many commits touched product code, and how many of those
+    /// answered to the account. One number alone would have no denominator.
+    #[test]
+    fn the_window_counts_the_commits_that_named_nothing_beside_the_ones_that_did() {
+        let log = [
+            commit("aaaa", "fix(x): one\n\nLanding change change-1\n"),
+            commit("bbbb", "fix(x): two\n"),
+            commit("cccc", "fix(x): three\n\nChange-Id: change-3\n"),
+        ]
+        .concat();
+        let named = trailered_revisions(&log);
+        assert_eq!(
+            named,
+            ["aaaa", "cccc"]
+                .iter()
+                .map(|rev| rev.to_string())
+                .collect::<HashSet<_>>(),
+            "a commit counts as having answered when it names a change at all, in either \
+             trailer form -- not only when it names one the account holds"
+        );
+        let window = vec![
+            ("aaaa".to_string(), 300),
+            ("bbbb".to_string(), 200),
+            ("cccc".to_string(), 100),
+        ];
+        assert_eq!(
+            product_commits(&window, &named),
+            (3, 2),
+            "one commit in three reached product code and named no change"
+        );
+    }
+
+    /// The count is taken over the commits that touched product code: a commit
+    /// that only wrote prose owes the account nothing and must not sit in the
+    /// denominator.
+    #[tokio::test]
+    async fn the_window_names_only_commits_that_touched_the_path_it_was_asked_about() {
+        let (dir, bare, work) = scratch_repo();
+        std::fs::create_dir_all(std::path::Path::new(&work).join("crates/thing"))
+            .expect("the fixture directory");
+        std::fs::write(
+            std::path::Path::new(&work).join("crates/thing/x"),
+            "fn thing() {}",
+        )
+        .expect("the fixture file");
+        let touched = commit_all(&bare, &work, "add a thing");
+        std::fs::create_dir_all(std::path::Path::new(&work).join("docs"))
+            .expect("the fixture directory");
+        std::fs::write(std::path::Path::new(&work).join("docs/y.md"), "prose")
+            .expect("the fixture file");
+        let prose = commit_all(&bare, &work, "write prose");
+
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let window = tree
+            .landing_log_touching(LANDING_LOG_COMMITS, PRODUCT_CODE_PATH)
+            .await
+            .expect("the window reads");
+        assert_eq!(
+            window
+                .iter()
+                .map(|(rev, _)| rev.as_str())
+                .collect::<Vec<_>>(),
+            vec![touched.as_str()],
+            "the commit that only touched docs ({prose}) is not work that owes the account"
+        );
+        assert!(
+            window[0].1 > 0,
+            "the commit time travels with the revision, so a reader can say how long ago the \
+             newest one landed"
+        );
     }
 
     #[test]

@@ -672,6 +672,51 @@ impl CheckTree {
             .map_err(|e| format!("the commit log at {} cannot be read: {e}", self.reference))
     }
 
+    /// The most recent `limit` commits on the reference that touched `path`,
+    /// newest first, as `(revision, commit time in unix seconds)`.
+    ///
+    /// Reads the same stretch of history [`Self::landing_log`] does, and takes
+    /// the same bound, so the two readings describe one window: one says what
+    /// the commits claim, this says which of them touched a part of the tree.
+    /// A count read off a different window could not be compared with the other
+    /// -- the difference would move whenever either window slid, and nothing in
+    /// the number would say which one it was. The commit time travels with the
+    /// revision because how long ago the newest of them landed is the difference
+    /// between old history and a path in use right now.
+    pub async fn landing_log_touching(
+        &self,
+        limit: usize,
+        path: &str,
+    ) -> Result<Vec<(String, i64)>, String> {
+        let bound = format!("-{limit}");
+        let listing = self
+            .git(&[
+                "log",
+                bound.as_str(),
+                "--format=%H %ct",
+                self.reference.as_str(),
+                "--",
+                path,
+            ])
+            .await
+            .map_err(|e| format!("the commit log for {path} cannot be read: {e}"))?;
+        listing
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                let (rev, at) = line
+                    .trim()
+                    .split_once(' ')
+                    .ok_or_else(|| format!("a commit line from {path} has no time: {line}"))?;
+                let at = at
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|e| format!("a commit time from {path} is not a number: {e}"))?;
+                Ok((rev.to_owned(), at))
+            })
+            .collect()
+    }
+
     /// The line of development `revision` sits on, or why it could not be read.
     ///
     /// The revision is resolved rather than compared as written, because the two
