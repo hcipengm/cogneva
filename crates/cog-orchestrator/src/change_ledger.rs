@@ -1076,6 +1076,182 @@ fn dispatch_project_root_id(project: &str) -> String {
     format!("{DISPATCH_PROJECT_ROOT_PREFIX}{scope}")
 }
 
+/// How many hand-over rows one pass is allowed to close.
+///
+/// Closing a row is a graph write that reads the whole workspace's task table
+/// in one transaction, so this bounds the burst and not the work: a row this
+/// pass did not reach is reached by the next one, and waiting costs nothing --
+/// it is work nothing is going to do, which is the whole reason the sweep
+/// exists.
+// cap: bound — 关一行要把整个工作区的任务表读进一个事务，界的是突发；没轮到的下一拍接着关
+const CLOSE_SETTLED_PER_PASS: usize = 200;
+
+/// The change a hand-over row was submitted for.
+///
+/// Read back from the row's own payload rather than recomputed from its id: the
+/// id carries a hash of the identity, and a reader that rebuilt the identity
+/// through the hash would need the hash's input to already be the identity.
+/// `None` for a row that carries no identity at all -- the rows the goal path
+/// decomposed under a hand-over, and every other kind of task in the graph.
+fn dispatched_identity(task: &Task) -> Option<ChangeIdentity> {
+    let identity = task.input.get(cog_core::INPUT_CHANGE_IDENTITY)?;
+    Some(ChangeIdentity::new(
+        identity.get("kind")?.as_str()?,
+        identity.get("scope")?.as_str()?,
+        identity.get("literal")?.as_str()?,
+    ))
+}
+
+/// One pass's sweep of hand-over rows the account has already settled.
+///
+/// The hand-over row lives as long as the graph remembers it, and the account
+/// settles underneath it: a change another hand-over landed, a fixture the
+/// classifier retired. The row is then work nothing will ever do, and left open
+/// it is indistinguishable from work still queued -- same kind, same status,
+/// same place in every unread reading -- while the executor keeps picking it up
+/// and failing it on a change the account already closed. Measured on
+/// 2026-11-04: 2150 open `change_ledger` rows in the default workspace, 456 of
+/// them for identities the account already held as `landed` (84) or `retired`
+/// (372).
+///
+/// What closes a row here is the row's own criterion, [`DISPATCH_ACCEPTANCE`]:
+/// the account's row for the same identity is `landed` or `retired`. That is a
+/// fact about the account, read from it this pass, and not a claim the sweep
+/// makes. A row nothing is holding is left exactly as it is -- an identity the
+/// account does not hold at all is counted rather than guessed about, because
+/// "the account has no such row" says nothing about whether the change is owed.
+///
+/// Rows that are running are left alone too. The account settling a change
+/// while somebody works on it is not a reason to yank the run: the diff being
+/// written may be what lands next, and a cancelled run that had already written
+/// its change would report nothing of what it wrote.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct SettledClosures {
+    landed: usize,
+    retired: usize,
+    /// Rows hanging under a closed one, which the graph cancelled with it.
+    cascaded: usize,
+    /// Open rows whose identity the account does not hold at all. Left in
+    /// place: not being on the account is not the account saying it is done.
+    unaccounted: usize,
+    /// Rows this pass could not read the account for, or could not close.
+    failed: usize,
+    /// Settled rows still open after this pass, for the next one to take.
+    remaining: usize,
+}
+
+impl SettledClosures {
+    fn moved_anything(&self) -> bool {
+        self.landed > 0 || self.retired > 0 || self.cascaded > 0 || self.failed > 0
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "closed hand-over rows the account had settled: landed={} retired={} cascaded={} \
+             unaccounted={} failed={} remaining={}",
+            self.landed, self.retired, self.cascaded, self.unaccounted, self.failed, self.remaining
+        )
+    }
+}
+
+/// The sentence written on a row the sweep closes.
+///
+/// The reason is the only trace a cancelled row keeps -- it never ran, so there
+/// is no result and no failure to explain it -- and a reader of the graph has to
+/// be able to tell this from a row somebody cancelled by hand.
+fn settled_row_reason(row: &ChangeLedgerRow) -> String {
+    format!(
+        "变更账上 {identity} 已经是 {state}，这条执行行不会再被做：判据取账上那一行的状态，\
+         而那一条已经结了",
+        identity = row.identity,
+        state = row.state.as_str()
+    )
+}
+
+/// Close the hand-over rows whose change the account has already settled.
+///
+/// `owed` is the identity set the account still holds as outstanding -- what
+/// this pass read, so the two readings are one instant. An open row whose
+/// identity is in it is neither read nor moved: the account still owes that
+/// change, and the pass below is where it is handed over.
+async fn close_settled_dispatch_rows(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    store: &dyn ChangeLedgerStore,
+    owed: &HashSet<ChangeIdentity>,
+) -> SettledClosures {
+    let mut closed = SettledClosures::default();
+    let mut candidates: Vec<(String, ChangeIdentity)> = Vec::new();
+    for task in orchestrator.get_all_tasks().await {
+        // Only rows that nothing is running. A settled account is not a reason
+        // to interrupt a run: see [`SettledClosures`].
+        if !matches!(task.status, TaskStatus::Pending | TaskStatus::Scheduled) {
+            continue;
+        }
+        if !matches!(&task.task_type, TaskType::Custom(kind) if kind == DISPATCH_TASK_KIND) {
+            continue;
+        }
+        let Some(identity) = dispatched_identity(&task) else {
+            continue;
+        };
+        if owed.contains(&identity) {
+            continue;
+        }
+        candidates.push((task.id.clone(), identity));
+    }
+    closed.remaining = candidates.len();
+
+    for (id, identity) in candidates.iter().take(CLOSE_SETTLED_PER_PASS) {
+        match store.get(identity).await {
+            // The account does not hold this identity at all. Not a settling:
+            // a row the account has no opinion about is left for a reader.
+            Ok(None) => closed.unaccounted += 1,
+            // Still outstanding by a state that is not handed over (`undecided`
+            // and the two states nobody can act on). The account still owns the
+            // question, so the row is not this sweep's to close.
+            Ok(Some(row)) if row.state.is_outstanding() => {}
+            Ok(Some(row)) => {
+                match orchestrator
+                    .cancel_task_with_reason(id, settled_row_reason(&row))
+                    .await
+                {
+                    Ok(cascaded) => {
+                        match row.state {
+                            ChangeState::Landed => closed.landed += 1,
+                            ChangeState::Retired => closed.retired += 1,
+                            // `is_outstanding` let only these two through.
+                            _ => {}
+                        }
+                        closed.cascaded += cascaded.len();
+                        closed.remaining -= 1;
+                    }
+                    Err(e) => {
+                        closed.failed += 1;
+                        warn!(
+                            task = %id,
+                            change = %identity,
+                            error = %e,
+                            "change ledger: a row for a change the account has settled could \
+                             not be closed, so it stays in the queue as work that will never \
+                             be done"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                closed.failed += 1;
+                warn!(
+                    task = %id,
+                    change = %identity,
+                    error = %e,
+                    "change ledger: the account could not be read for a row whose change may \
+                     have settled, so this pass closes none of its kind"
+                );
+            }
+        }
+    }
+    closed
+}
+
 /// How many rows one settle is allowed to rewrite.
 ///
 /// The first settle after a hand-over starts writing a criterion has thousands
@@ -3990,6 +4166,22 @@ async fn dispatch_pass(
         .filter(|row| row.state == ChangeState::Pending)
         .filter(|row| unsettled.contains_key(&row.identity))
         .count();
+
+    // Hand-over rows the account settled since they were filed are closed
+    // before anything is handed over, so the queue this pass works on is only
+    // work somebody could still do. It reads the graph once per pass, which is
+    // the same order of cost as the handover readback below, and it is asked on
+    // paused passes too: the account settling a change has nothing to do with
+    // whether an upstream can serve the ones still owed.
+    //
+    // Every row the account still holds as outstanding is excluded by identity
+    // before anything is looked up, so the per-row reads grow with the number of
+    // changes that settled, not with the size of the queue.
+    let owed: HashSet<ChangeIdentity> = rows.iter().map(|row| row.identity.clone()).collect();
+    let closed = close_settled_dispatch_rows(orchestrator, store, &owed).await;
+    if closed.moved_anything() {
+        info!("change ledger: {}", closed.line());
+    }
 
     // Three cases, and the middle one is why this is not one call to
     // `pool_verdict`: no source published at all, a snapshot that says the pool
@@ -8270,6 +8462,10 @@ mod tests {
         tasks: std::sync::Mutex<HashMap<String, Task>>,
         refuse_submissions: bool,
         submitted: std::sync::Mutex<Vec<String>>,
+        /// Every cancellation the code under test asked for, with the reason it
+        /// gave. Kept apart from the row so a test can read *why* a row was
+        /// closed without parsing the sentence back out of its error column.
+        cancelled: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl FakeGraph {
@@ -8324,6 +8520,20 @@ mod tests {
             );
             self.tasks.lock().unwrap().insert(id.to_string(), task);
             self
+        }
+
+        /// The hand-over row this loop would file for `row`, held by the graph
+        /// in `status`: the payload carries the change's identity, which is what
+        /// the sweep reads a row back by.
+        fn holding_handover(self, row: &ChangeLedgerRow, status: TaskStatus) -> Self {
+            let mut task = dispatch_task(row, 0);
+            task.status = status;
+            self.tasks.lock().unwrap().insert(task.id.clone(), task);
+            self
+        }
+
+        fn cancelled(&self) -> Vec<(String, String)> {
+            self.cancelled.lock().unwrap().clone()
         }
 
         /// The row stored under `id`, as the graph now holds it.
@@ -8414,6 +8624,34 @@ mod tests {
             Ok((false, Vec::new(), false))
         }
         async fn cancel_task(&self, _task_id: &str) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn cancel_task_with_reason(
+            &self,
+            task_id: &str,
+            reason: String,
+        ) -> SFResult<Vec<String>> {
+            let mut tasks = self.tasks.lock().unwrap();
+            let Some(task) = tasks.get_mut(task_id) else {
+                return Err(SFError::TaskFailed {
+                    task_id: task_id.to_string(),
+                    reason: "not in this graph".into(),
+                });
+            };
+            // The real store refuses a terminal row, and the sweep relies on
+            // that refusal staying where it is rather than on its own filter.
+            if task.status.is_terminal() {
+                return Err(SFError::TaskFailed {
+                    task_id: task_id.to_string(),
+                    reason: format!("Cannot cancel task in {:?} state", task.status),
+                });
+            }
+            task.status = TaskStatus::Cancelled;
+            task.error = Some(reason.clone());
+            self.cancelled
+                .lock()
+                .unwrap()
+                .push((task_id.to_string(), reason));
             Ok(Vec::new())
         }
         async fn get_task(&self, task_id: &str) -> Option<Task> {
@@ -9718,6 +9956,135 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
         }
+    }
+
+    /// A change the account has settled cannot keep a hand-over row open.
+    ///
+    /// The row exists to be worked on, and the account closing the change
+    /// underneath it is the row's own criterion met: leaving it open puts work
+    /// nothing will ever do into the same pending count as work still owed, and
+    /// the executor keeps picking it up for a change already closed. Measured on
+    /// 2026-11-04: 456 of 2150 open hand-over rows were for identities the
+    /// account already held as `landed` or `retired`.
+    ///
+    /// The third row is the other side of the same reading: a change the account
+    /// still owes keeps its row, because closing that one would throw away work.
+    #[tokio::test]
+    async fn a_pass_closes_the_rows_of_changes_the_account_has_settled() {
+        let landed = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/a/src/landed.rs", "fn landed()"),
+            ..row(ChangeState::Landed, Some(1_760_000_100))
+        };
+        let retired = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/a/src/retired.rs", "fn retired()"),
+            retire_reason: Some(RetireReason::Fixture),
+            ..row(ChangeState::Retired, None)
+        };
+        let owed = pending_row("crates/a/src/owed.rs");
+        let store = FakeLedger {
+            rows: vec![landed.clone(), retired.clone(), owed.clone()],
+            ..Default::default()
+        };
+        let graph = Arc::new(
+            FakeGraph::default()
+                .holding_handover(&landed, TaskStatus::Pending)
+                .holding_handover(&retired, TaskStatus::Scheduled)
+                .holding_handover(&owed, TaskStatus::Pending),
+        );
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        dispatch_pass(
+            &store,
+            &control,
+            &HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+        )
+        .await;
+
+        for (row, state) in [(&landed, "landed"), (&retired, "retired")] {
+            let id = dispatch_task_id(&row.identity, 0);
+            let held = graph.held(&id).expect("这一行还该在图里");
+            assert_eq!(
+                held.status,
+                TaskStatus::Cancelled,
+                "账上已经是 {state} 的行还开着，它会一直排在未结里"
+            );
+            let why = held.error.unwrap_or_default();
+            assert!(
+                why.contains(state),
+                "关掉时的理由没有点名账上的终态 {state}：{why}"
+            );
+        }
+        assert_eq!(
+            graph
+                .held(&dispatch_task_id(&owed.identity, 0))
+                .unwrap()
+                .status,
+            TaskStatus::Pending,
+            "账上还欠着的变更，它那一行不能被当成历史关掉"
+        );
+    }
+
+    /// A settled account is not a reason to interrupt a run, and not a verdict
+    /// about a row the account has no opinion of.
+    ///
+    /// A running row may be writing the diff that lands next, so cancelling it
+    /// would discard the work in flight. A row whose identity the account does
+    /// not hold at all says nothing about whether the change is owed -- it is
+    /// counted and asked again rather than closed on a silence.
+    #[tokio::test]
+    async fn a_run_in_flight_and_a_row_the_account_cannot_place_are_left_open() {
+        let landed = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/a/src/landed.rs", "fn landed()"),
+            ..row(ChangeState::Landed, Some(1_760_000_100))
+        };
+        let absent = ChangeLedgerRow {
+            identity: ChangeIdentity::new("grep", "crates/gone.rs", "fn gone()"),
+            ..row(ChangeState::Pending, None)
+        };
+        let store = FakeLedger {
+            rows: vec![landed.clone()],
+            ..Default::default()
+        };
+        let graph = Arc::new(
+            FakeGraph::default()
+                .holding_handover(&landed, TaskStatus::Running)
+                .holding_handover(&absent, TaskStatus::Pending)
+                .holding_other_kind("a-decomposed-leaf", "generated"),
+        );
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        let closed = close_settled_dispatch_rows(&control, &store, &HashSet::new()).await;
+
+        assert_eq!(
+            graph
+                .held(&dispatch_task_id(&landed.identity, 0))
+                .unwrap()
+                .status,
+            TaskStatus::Running,
+            "正在跑的那一行被账上的终态打断了"
+        );
+        assert_eq!(closed.unaccounted, 1);
+        assert_eq!(
+            closed.remaining, 1,
+            "身份在账上找不到的那一行还开着，下一拍要再问一次"
+        );
+        assert!(
+            graph.cancelled().is_empty(),
+            "这一拍没有任何一行该被关：{:?}",
+            graph.cancelled()
+        );
+        assert_eq!(
+            graph.held("a-decomposed-leaf").unwrap().status,
+            TaskStatus::Pending,
+            "没有身份的行不是这个循环交给图的行，不该被它关"
+        );
     }
 
     /// The alert surface is the second place work with no owner shows up, and a
