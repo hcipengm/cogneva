@@ -3877,10 +3877,12 @@
     }
   },
   "self_review": {
-    "_comment": "PGE actor self-review quality gate. enabled=true 时 Planner/Generator/Evaluator/Moderator/Merger 的输出会经过 SelfReviewLoop 审查并用修订结果替换原始输出。",
+    "_comment": "PGE actor self-review quality gate. enabled=true 时 Planner/Generator/Evaluator/Moderator/Merger 的输出会经过 SelfReviewLoop 审查。",
+    "_comment_revise": "revise=true 是完整循环：判完再让模型把整篇改写一次，再判改写。false 是只判不写：critique 与 compare 照跑，判词点名没满足的条目，正文原样交回调用方，由它自己的重试路径重做。改写约占一次评审的 64%，且它评判的标准与生产者已经拿到的标准是同一份。不写这一键的旧配置仍是 true。",
     "enabled": true,
     "max_iterations": 2,
     "quality_threshold": 0.8,
+    "revise": false,
     "spec": null,
     "best_practices": []
   },

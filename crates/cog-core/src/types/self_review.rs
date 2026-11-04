@@ -8,10 +8,32 @@ pub struct SelfReviewConfig {
     pub max_iterations: u32,
     /// Quality threshold (0.0–1.0). Scores above this are considered a pass.
     pub quality_threshold: f32,
+    /// Whether a judgement below the threshold buys a rewrite of the output.
+    ///
+    /// `true` is the full loop: judge, then have a model rewrite the whole text
+    /// and judge the rewrite again. `false` is judge-only: the critique and the
+    /// comparison still run, the verdict still names what the output failed to
+    /// satisfy, but no rewrite is bought — the text handed back is the one that
+    /// was judged, and the caller's own retry path is what acts on the gaps.
+    ///
+    /// The rewrite is the expensive half (one full-output call, measured at
+    /// roughly twice the critique and four times the comparison) and it is
+    /// judged against the same standard the producer was already given. A
+    /// producer that can be asked again through its normal path does not need
+    /// a second model paid to rewrite its answer in prose.
+    #[serde(default = "revise_by_default")]
+    pub revise: bool,
     /// Optional specification the output is compared against.
     pub spec: Option<String>,
     /// Optional list of best-practice guidelines.
     pub best_practices: Vec<String>,
+}
+
+/// The rewrite the loop has always bought, kept for configurations written
+/// before the knob existed: a missing key must keep the old behaviour, not
+/// silently switch every deployment to judge-only.
+fn revise_by_default() -> bool {
+    true
 }
 
 impl SelfReviewConfig {
@@ -48,6 +70,7 @@ impl Default for SelfReviewConfig {
         Self {
             max_iterations: 2,
             quality_threshold: 0.8,
+            revise: true,
             spec: None,
             best_practices: Vec::new(),
         }
@@ -129,6 +152,33 @@ mod tests {
             !SelfReviewConfig::default().has_external_criterion(),
             "an empty configuration compares the output against nothing outside the review"
         );
+    }
+
+    #[test]
+    fn a_configuration_written_before_the_rewrite_knob_keeps_rewriting() {
+        // Every deployment config in the tree predates this field. A missing
+        // key must read as the behaviour those deployments were tuned against,
+        // not as the cheaper mode switched on by a default.
+        let read: SelfReviewConfig = serde_json::from_str(
+            r#"{"max_iterations": 2, "quality_threshold": 0.8,
+                "spec": null, "best_practices": []}"#,
+        )
+        .expect("a config without the knob is still a config");
+        assert!(
+            read.revise,
+            "an absent `revise` must not turn the rewrite off"
+        );
+        assert!(SelfReviewConfig::default().revise);
+    }
+
+    #[test]
+    fn judge_only_is_a_readable_configuration() {
+        let read: SelfReviewConfig = serde_json::from_str(
+            r#"{"max_iterations": 2, "quality_threshold": 0.8,
+                "spec": null, "best_practices": [], "revise": false}"#,
+        )
+        .expect("the knob is a field");
+        assert!(!read.revise);
     }
 
     #[test]

@@ -226,6 +226,21 @@ impl SelfReviewLoop {
                 best = Some((current_output.clone(), score, result.clone()));
             }
 
+            // Judge-only: hand back the text that was just judged, with the
+            // verdict that names what it failed to satisfy.
+            //
+            // The rewrite below exists to replace an output the review found
+            // wanting, but it is judged by nothing: the loop has to pay another
+            // critique and comparison to score it, and on this family the
+            // rewrite was the single largest line (64% of a review's spend) for
+            // text that the producer's own retry path could produce again with
+            // the gap list in hand. So the caller gets the judgement and keeps
+            // its own text; what to do about the gaps is the caller's decision,
+            // made on the same standard the output was already asked to meet.
+            if !self.config.revise {
+                return Ok((current_output, result));
+            }
+
             match &result {
                 SelfReviewResult::Pass { .. } => {
                     return Ok((current_output, result));
@@ -779,6 +794,10 @@ mod tests {
         fn revise_calls(&self) -> usize {
             self.revise_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
+
+        fn json_calls(&self) -> usize {
+            self.json_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
@@ -923,6 +942,62 @@ mod tests {
     /// 既没有 critique 也没有 compare 去评它，所以只会被丢掉。生产上这一族
     /// 没有一次达到阈值，每一轮评审都停在最后一格上——这条测试钉住那一格不再
     /// 付费，而交出去的仍是第一轮改写出来、第二轮打过分的 `REV-1`。
+    ///
+    /// 只判不写：一次评审只买 critique 与 compare 两次调用。
+    ///
+    /// 改写是这条流水线上最贵的一步，而它只是把同一个标准再问一遍；配置成
+    /// 只判时，交回去的必须是**被审过的那一份原文**——不是改写，也不是空白——
+    /// 判词里带着分数与没满足的条目，由调用方自己的重试路径去处理。这条测试
+    /// 钉住代价与产出两头：两次调用、零次改写、原文原样交回。
+    #[tokio::test]
+    async fn judge_only_buys_the_verdict_and_no_rewrite() {
+        let llm = ScoringLlm::new(&[0.6]);
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            max_iterations: 2,
+            quality_threshold: 0.8,
+            revise: false,
+            ..Default::default()
+        });
+
+        let (text, verdict) = judge_only.review("ORIGINAL", &llm).await.unwrap();
+
+        assert_eq!(
+            llm.json_calls(),
+            2,
+            "只判只买一次 critique 加一次 compare，不是循环跑满两轮"
+        );
+        assert_eq!(llm.revise_calls(), 0, "只判不买改写");
+        assert_eq!(text, "ORIGINAL", "交回去的是被审过的那一份原文");
+        match verdict {
+            SelfReviewResult::NeedRevision { score, .. } => {
+                assert!(
+                    (score - 0.6).abs() < 1e-6,
+                    "判词带着这一份真实拿到的分：{score}"
+                )
+            }
+            other => panic!("0.6 低于阈值，这是一次没过的评审：{other:?}"),
+        }
+    }
+
+    /// 只判不写时，过线的输出同样原样交回，不多买一次改写。
+    #[tokio::test]
+    async fn judge_only_passes_without_a_rewrite() {
+        let llm = ScoringLlm::new(&[0.9]);
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            max_iterations: 2,
+            quality_threshold: 0.8,
+            revise: false,
+            ..Default::default()
+        });
+
+        let (text, verdict) = judge_only.review("ORIGINAL", &llm).await.unwrap();
+
+        assert_eq!(llm.json_calls(), 2);
+        assert_eq!(llm.revise_calls(), 0);
+        assert_eq!(text, "ORIGINAL");
+        assert!(matches!(verdict, SelfReviewResult::Pass { .. }));
+    }
+
     #[tokio::test]
     async fn the_last_round_buys_no_revision_it_cannot_score() {
         let llm = ScoringLlm::new(&[0.6, 0.7]);

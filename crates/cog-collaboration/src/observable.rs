@@ -51,6 +51,14 @@ pub const SELF_REVIEW_SKIP_SELF_EVOLUTION: &str = "self_evolution";
 pub const SELF_REVIEW_REVISION_CHANGED: &str = "changed";
 pub const SELF_REVIEW_REVISION_UNCHANGED: &str = "unchanged";
 
+/// A review configured judge-only reached `need_revision` and bought no rewrite.
+///
+/// Its own cell rather than `unchanged`: that one counts a rewrite that handed
+/// the text back as it found it, which is a call that was paid for. Folding the
+/// two together would make the saving this mode exists to make read as a
+/// rewrite that kept failing to rewrite.
+pub const SELF_REVIEW_REVISION_JUDGED_ONLY: &str = "judged_only";
+
 /// How the pipeline's independent-review gate ended for one authoring verdict.
 ///
 /// The gate is a second evaluator call asked to confirm a `Pass`, and it is the

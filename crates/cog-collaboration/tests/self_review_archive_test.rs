@@ -345,6 +345,7 @@ fn self_review_config() -> SelfReviewConfig {
     SelfReviewConfig {
         max_iterations: 1,
         quality_threshold: 0.8,
+        revise: true,
         spec: None,
         best_practices: Vec::new(),
     }

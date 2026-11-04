@@ -81,6 +81,7 @@ async fn a_review_on_behalf_of_a_task_carries_both_identities_on_every_call() {
     let review = SelfReviewLoop::new(SelfReviewConfig {
         max_iterations: 1,
         quality_threshold: 0.5,
+        revise: true,
         spec: Some("the plan names the file".into()),
         best_practices: Vec::new(),
     })
@@ -114,6 +115,7 @@ async fn a_review_with_no_task_carries_no_task_header() {
     let review = SelfReviewLoop::new(SelfReviewConfig {
         max_iterations: 1,
         quality_threshold: 0.5,
+        revise: true,
         spec: Some("anything".into()),
         best_practices: Vec::new(),
     })
@@ -150,6 +152,7 @@ async fn the_agent_entry_point_forwards_the_task_to_every_review_call() {
     let config = SelfReviewConfig {
         max_iterations: 1,
         quality_threshold: 0.5,
+        revise: true,
         spec: Some("the plan names the file".into()),
         best_practices: Vec::new(),
     };
@@ -187,6 +190,7 @@ async fn the_agent_entry_point_without_a_task_carries_no_task_header() {
     let config = SelfReviewConfig {
         max_iterations: 1,
         quality_threshold: 0.5,
+        revise: true,
         spec: Some("anything".into()),
         best_practices: Vec::new(),
     };

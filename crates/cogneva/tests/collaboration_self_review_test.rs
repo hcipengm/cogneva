@@ -578,6 +578,7 @@ async fn test_full_review_passes_immediately() {
     let config = SelfReviewConfig {
         max_iterations: 2,
         quality_threshold: 0.8,
+        revise: true,
         spec: None,
         best_practices: vec![],
     };
@@ -608,6 +609,7 @@ async fn test_full_review_revises_once_then_passes() {
     let config = SelfReviewConfig {
         max_iterations: 3,
         quality_threshold: 0.8,
+        revise: true,
         spec: None,
         best_practices: vec![],
     };
@@ -644,6 +646,7 @@ async fn test_full_review_max_iterations_exceeded() {
     let config = SelfReviewConfig {
         max_iterations: 2,
         quality_threshold: 0.8,
+        revise: true,
         spec: None,
         best_practices: vec![],
     };

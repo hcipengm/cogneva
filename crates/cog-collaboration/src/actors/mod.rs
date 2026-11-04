@@ -179,6 +179,11 @@ pub(crate) enum ReviewBasis {
 /// Returns the revised output text when the review loop produced a revision;
 /// callers are responsible for re-parsing it into their structured output.
 ///
+/// A configuration with `revise` off never yields a revision: the judgement
+/// still runs and is still counted, the text comes back as it went in, and the
+/// caller keeps its own output — the gaps travel in the verdict, not in a
+/// rewritten text.
+///
 /// The basis is taken only when the configuration declares no specification of
 /// its own. Either way the outcome is counted on the metric plane — the verdict
 /// when a review ran, the skip and its reason when one did not — so a stage
@@ -248,7 +253,9 @@ pub(crate) async fn maybe_self_review(
             // read the same.
             observable.record_self_review_revision(
                 agent_kind,
-                if revised == output {
+                if !cfg.revise {
+                    crate::observable::SELF_REVIEW_REVISION_JUDGED_ONLY
+                } else if revised == output {
                     crate::observable::SELF_REVIEW_REVISION_UNCHANGED
                 } else {
                     crate::observable::SELF_REVIEW_REVISION_CHANGED
@@ -790,6 +797,59 @@ mod tests {
         assert_eq!(
             revision_cell(
                 "revision_probe_noop",
+                crate::observable::SELF_REVIEW_REVISION_CHANGED
+            )
+            .await,
+            0.0
+        );
+    }
+
+    /// 只判不写的那一次，在改写面上自成格。
+    ///
+    /// 它不能落进 `unchanged`：那一格记的是一次**付过钱**、交回原文的改写。
+    /// 把两者并在一起，这个模式省下来的开销就读成「改写一直没改成」。
+    #[tokio::test]
+    async fn a_judge_only_review_is_not_counted_as_a_rewrite_that_changed_nothing() {
+        let (agent, _) = ReviewRecorder::recording(false);
+        let config = cog_core::SelfReviewConfig {
+            revise: false,
+            ..Default::default()
+        };
+
+        let revised = maybe_self_review(
+            agent.as_ref(),
+            &Some(config),
+            "draft",
+            "judge_only_probe",
+            crate::actors::ReviewBasis::HeldTo("spec".into()),
+            "t-1",
+        )
+        .await;
+
+        assert!(
+            revised.is_none(),
+            "只判不写：调用方拿回自己的原文，判词里带着没满足的条目"
+        );
+        assert_eq!(
+            revision_cell(
+                "judge_only_probe",
+                crate::observable::SELF_REVIEW_REVISION_JUDGED_ONLY
+            )
+            .await,
+            1.0
+        );
+        assert_eq!(
+            revision_cell(
+                "judge_only_probe",
+                crate::observable::SELF_REVIEW_REVISION_UNCHANGED
+            )
+            .await,
+            0.0,
+            "没买改写不等于买了一次什么都没改的改写"
+        );
+        assert_eq!(
+            revision_cell(
+                "judge_only_probe",
                 crate::observable::SELF_REVIEW_REVISION_CHANGED
             )
             .await,

@@ -336,6 +336,7 @@ async fn run_declared(task: Task) -> (bool, Arc<CallLog>) {
         .with_self_review(SelfReviewConfig {
             max_iterations: 1,
             quality_threshold: 0.8,
+            revise: true,
             spec: None,
             best_practices: Vec::new(),
         });

@@ -40,6 +40,11 @@ pub struct SelfReviewSettings {
     pub enabled: bool,
     pub max_iterations: u32,
     pub quality_threshold: f32,
+    /// Whether a verdict below the threshold buys a rewrite of the output.
+    /// `false` keeps the critique and the comparison and drops the rewrite:
+    /// the gap list goes back with the actor's own output, and the actor's
+    /// normal retry path is what produces the next attempt.
+    pub revise: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<String>,
     pub best_practices: Vec<String>,
@@ -51,6 +56,7 @@ impl Default for SelfReviewSettings {
             enabled: false,
             max_iterations: 2,
             quality_threshold: 0.8,
+            revise: true,
             spec: None,
             best_practices: Vec::new(),
         }
@@ -74,6 +80,7 @@ impl SelfReviewSettings {
         Some(cog_core::SelfReviewConfig {
             max_iterations: self.max_iterations,
             quality_threshold: self.quality_threshold,
+            revise: self.revise,
             spec: self.spec.clone(),
             best_practices: self.best_practices.clone(),
         })
@@ -542,6 +549,37 @@ mod tests {
         let r = RalphSettings::load_from(p).unwrap();
         assert_eq!(r.max_iterations, 50);
         assert_eq!(r.stagnation_window, 5);
+    }
+
+    /// 只判不写是配置里的一个开关，而且缺省仍是原来的完整循环。
+    ///
+    /// 两件事都要钉住：写进去的 `false` 必须一路传到 `SelfReviewConfig`（否则
+    /// 开关读了没人用，面板上是关的、账上是开的），没写这一键的既有部署必须
+    /// 保持原来买改写的口径（否则一次升级把所有部署悄悄切到了另一种口径）。
+    #[test]
+    fn the_rewrite_knob_reaches_the_loop_and_defaults_on() {
+        let dir = std::env::temp_dir().join(format!("cog-collab-revise-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cogneva.json");
+
+        std::fs::write(&path, r#"{"self_review": {"enabled": true}}"#).unwrap();
+        let unset = SelfReviewSettings::load_from(&path).unwrap();
+        assert!(unset.revise, "没写这一键的既有配置仍是「判完再改写」");
+        assert!(unset.to_config().expect("enabled").revise);
+
+        std::fs::write(
+            &path,
+            r#"{"self_review": {"enabled": true, "revise": false}}"#,
+        )
+        .unwrap();
+        let judge_only = SelfReviewSettings::load_from(&path).unwrap();
+        assert!(!judge_only.revise);
+        assert!(
+            !judge_only.to_config().expect("enabled").revise,
+            "开关必须传到循环读的那份配置上"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
