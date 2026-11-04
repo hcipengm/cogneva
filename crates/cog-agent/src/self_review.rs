@@ -85,6 +85,19 @@ enum RowStatus {
 struct RequirementRow {
     /// 这条要求，一行，写成一句对正文真假可判的话。
     requirement: String,
+    /// 规格里写下这条要求的那句话，逐字，不要转述。
+    ///
+    /// 这一格回答的是「这条要求是不是真的写在规格里」，与 `evidence` 回答的
+    /// 「正文有没有接住它」是两件事。没有它，要求表由评审者自己拟：正文里
+    /// 少写了一条要求，评审者只要不把那一条列进来，表就是满的。有了它，每一行
+    /// 都得指着规格里的一句话，指不到的行不算数——表的大小因此不再由评审者
+    /// 单方面决定，漏列的条目至少会以「规格里这句话没有被任何一行引到」的形状
+    /// 留在读数里。
+    ///
+    /// 这一格没有 `default`：它是 schema 里的必填项，模型在生成时就知道每行都
+    /// 得带着它。给了默认值，模型漏填的每一行都会走成「指不到规格」，整张表被
+    /// 判成没做成，而拒绝的理由会从「你没引规格」变成一句更远的话。
+    spec_quote: String,
     status: RowStatus,
     /// 正文里说到这条要求的原话，逐字，不要转述。
     #[serde(default)]
@@ -496,8 +509,17 @@ impl SelfReviewLoop {
         let mut unmet: Vec<&RequirementRow> = Vec::new();
         let mut undetermined: Vec<&RequirementRow> = Vec::new();
         let mut unsupported: Vec<&RequirementRow> = Vec::new();
+        let mut unfounded: Vec<&RequirementRow> = Vec::new();
 
         for row in &table.rows {
+            // 每一行都得指着规格里的一句话。指不到的行不是「这条要求没满足」，
+            // 是「这条要求不是规格说的」：它既不进通过也不进未满足，进的是评审
+            // 自己的缺陷——把一个规格没写的要求交回去，生产者只能照着它改出一件
+            // 没人要的东西。
+            if !SelfReviewLoop::quotes_the_text(&row.spec_quote, spec) {
+                unfounded.push(row);
+                continue;
+            }
             match row.status {
                 RowStatus::Met => {
                     // A `met` whose quote is not in the text is not a `met`. It
@@ -518,7 +540,7 @@ impl SelfReviewLoop {
         // 分母是「被判过的条目」：`met`、`unmet`，以及自称 `met` 却没有引文支撑的
         // 那几条。最后一种不能留在分母外——它既不是通过也不是无法判断，是一次没
         // 兑现的声称，把它排除会让一条查无此句的 `met` 白拿一分。
-        let judged = met + unmet.len() + unsupported.len();
+        let judged = met + unmet.len() + unsupported.len() + unfounded.len();
 
         // 一条都没判出来时，分数没有分母。这不是 0 分也不是满分，是一次没有结论
         // 的评审：调用方保留自己的正文，读数记在这次失败上。
@@ -529,17 +551,31 @@ impl SelfReviewLoop {
             )));
         }
 
-        let score = met as f32 / judged as f32;
+        // 一行都指不到规格里时，这次评审没有判过任何规格说过的事。它与空表同一
+        // 类：不是通过，也不是没满足，是一次没做成的评审。
+        if unfounded.len() == table.rows.len() {
+            return Err(SFError::Validation(
+                "no requirement the review stated is quoted from the specification".into(),
+            ));
+        }
 
-        if unmet.is_empty() && unsupported.is_empty() {
+        let score = met as f32 / judged as f32;
+        let (quoted, segments) = SelfReviewLoop::spec_coverage(spec, &table.rows);
+
+        if unmet.is_empty() && unsupported.is_empty() && unfounded.is_empty() {
             let summary = if undetermined.is_empty() {
-                format!("all {} stated requirements are met", met)
+                format!(
+                    "all {} stated requirements are met; {} of {} specification sentences are quoted",
+                    met, quoted, segments
+                )
             } else {
                 format!(
                     "all {} stated requirements that this text can settle are met; \
-                     {} cannot be settled from the text",
+                     {} cannot be settled from the text; {} of {} specification sentences are quoted",
                     met,
-                    undetermined.len()
+                    undetermined.len(),
+                    quoted,
+                    segments
                 )
             };
             return Ok(SelfReviewResult::Pass { score, summary });
@@ -555,6 +591,12 @@ impl SelfReviewLoop {
                 row.requirement
             )
         }));
+        findings.extend(unfounded.iter().map(|row| {
+            format!(
+                "{}: the review quotes no such sentence from the specification",
+                row.requirement
+            )
+        }));
 
         Ok(SelfReviewResult::NeedRevision {
             critique: findings.join("; "),
@@ -562,6 +604,7 @@ impl SelfReviewLoop {
                 .iter()
                 .map(|row| row.requirement.clone())
                 .chain(unsupported.iter().map(|row| row.requirement.clone()))
+                .chain(unfounded.iter().map(|row| row.requirement.clone()))
                 .collect(),
             score,
         })
@@ -580,6 +623,39 @@ impl SelfReviewLoop {
         let quote = tight(evidence);
         // 空引文在每一段正文里都「找得到」，那不是证据。
         !quote.is_empty() && tight(text).contains(&quote)
+    }
+
+    /// 规格里有多少句被某一行引到了，以及一共数出多少句。
+    ///
+    /// 这是给读数用的，不是判据：数的是「规格写下的这几句里，有几句落进了
+    /// 要求表」。判据只管每一行引得到规格里的一句话（见 `spec_quote`），因为
+    /// 一段规格里哪些句子写的是要求、哪些是背景，机器分不出来——把没被引到的
+    /// 句子一律当缺陷，会把「失败的检查：Code Coverage、Clippy」这类现场描述
+    /// 也判成没做的事。可是「模型只列了一条，规格写了七句」这个形状必须看得见，
+    /// 所以它印在判词里：读者一眼能看出这次评审是把规格读全了，还是只读了一句。
+    fn spec_coverage(spec: &str, rows: &[RequirementRow]) -> (usize, usize) {
+        let tight = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+        let segments: Vec<String> = spec
+            .split(|c: char| {
+                c == '\n' || c == '。' || c == '！' || c == '？' || c == '!' || c == '?' || c == ';'
+            })
+            .map(tight)
+            .filter(|s| s.chars().count() >= 8)
+            .collect();
+        let quotes: Vec<String> = rows
+            .iter()
+            .map(|r| tight(&r.spec_quote))
+            .filter(|q| !q.is_empty())
+            .collect();
+        let quoted = segments
+            .iter()
+            .filter(|seg| {
+                quotes
+                    .iter()
+                    .any(|q| seg.contains(q.as_str()) || q.contains(seg.as_str()))
+            })
+            .count();
+        (quoted, segments.len())
     }
 
     /// What the text under judgement is, and therefore what a `met` means for
@@ -615,6 +691,10 @@ impl SelfReviewLoop {
                  that carry it are in the text. Quote them.\n\
                  - unmet: no sub-task carries it, or the sub-tasks contradict it or each other.\n\
                  - undetermined: a plan cannot show it either way.\n\n\
+                 Every row also quotes the sentence of the specification that states the \
+                 requirement, in `spec_quote`, verbatim. A row whose quote is not found in the \
+                 specification is a row the review made up, and it counts against the review, \
+                 not against the text.\n\n\
                  Quote the text, do not paraphrase it: every `met` is checked character for \
                  character against the text, whitespace aside, and a quote that is not there is \
                  not a `met`."
@@ -626,19 +706,25 @@ impl SelfReviewLoop {
                  question.\n\n\
                  List every requirement the specification states. For each one decide met, unmet \
                  or undetermined, and for `met` quote the words of the text that carry it, \
-                 character for character, whitespace aside."
+                 character for character, whitespace aside. Every row also quotes the sentence of \
+                 the specification that states the requirement, in `spec_quote`, verbatim; a \
+                 quote that is not in the specification does not count."
             }
             MODERATOR | MERGER => {
                 "The text under judgement is a FINAL ANSWER to the task. List every requirement \
                  the specification states. For each one decide met, unmet or undetermined, and \
                  for `met` quote the words of the text that carry it, character for character, \
-                 whitespace aside."
+                 whitespace aside. Every row also quotes the sentence of the specification that \
+                 states the requirement, in `spec_quote`, verbatim; a quote that is not in the \
+                 specification does not count."
             }
             _ => {
                 "The text under judgement is a WORK PRODUCT the task asked for. List every \
                  requirement the specification states. For each one decide met, unmet or \
                  undetermined, and for `met` quote the words of the text that carry it, \
-                 character for character, whitespace aside."
+                 character for character, whitespace aside. Every row also quotes the sentence of \
+                 the specification that states the requirement, in `spec_quote`, verbatim; a \
+                 quote that is not in the specification does not count."
             }
         }
     }
@@ -1239,8 +1325,8 @@ mod tests {
     async fn judge_only_buys_the_verdict_and_no_rewrite() {
         let llm = TableLlm::new(
             r#"{"rows":[
-                 {"requirement":"names a sub-task","status":"met","evidence":"t1: read the file"},
-                 {"requirement":"names a rollback","status":"unmet"}]}"#,
+                 {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"names a rollback","spec_quote":"t1 and t2 must be done","status":"unmet"}]}"#,
         );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             max_iterations: 2,
@@ -1283,8 +1369,8 @@ mod tests {
     async fn judge_only_passes_without_a_rewrite() {
         let llm = TableLlm::new(
             r#"{"rows":[
-                 {"requirement":"names a sub-task","status":"met","evidence":"t1: read the file"},
-                 {"requirement":"names a second step","status":"met","evidence":"then t2: deploy"}]}"#,
+                 {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"names a second step","spec_quote":"t1 and t2 must be done","status":"met","evidence":"then t2: deploy"}]}"#,
         );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             max_iterations: 2,
@@ -1315,8 +1401,8 @@ mod tests {
     async fn a_met_whose_quote_is_not_in_the_text_does_not_count() {
         let llm = TableLlm::new(
             r#"{"rows":[
-                 {"requirement":"names a sub-task","status":"met","evidence":"t1: read the file"},
-                 {"requirement":"names a rollback","status":"met","evidence":"t9: roll back"}]}"#,
+                 {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"names a rollback","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t9: roll back"}]}"#,
         );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             revise: false,
@@ -1346,12 +1432,110 @@ mod tests {
         }
     }
 
+    /// 一行要求如果指不到规格里的任何一句话，那它不是「要求没满足」，是评审自己
+    /// 编的：它不进通过也不算正文的缺陷，但它留在分母里，并点名说出为什么。
+    ///
+    /// 没有这一格，要求表由评审者单方面拟定——正文少写了一条要求，评审者只要
+    /// 不把它列进来，表就是满的，分数照样 1.0。
+    #[tokio::test]
+    async fn a_requirement_the_specification_does_not_state_is_not_judged() {
+        let llm = TableLlm::new(
+            r#"{"rows":[
+                 {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"drops the legacy table","spec_quote":"the legacy table must be dropped","status":"unmet"}]}"#,
+        );
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            revise: false,
+            spec: Some("t1 and t2 must be done".into()),
+            ..Default::default()
+        });
+
+        let (_, verdict) = judge_only
+            .review("t1: read the file, then t2: deploy", &llm)
+            .await
+            .unwrap();
+
+        match verdict {
+            SelfReviewResult::NeedRevision {
+                score, critique, ..
+            } => {
+                assert!(
+                    (score - 0.5).abs() < 1e-6,
+                    "规格没写过的那一行不能白拿一分：{score}"
+                );
+                assert!(
+                    critique.contains("drops the legacy table")
+                        && critique.contains("no such sentence from the specification"),
+                    "判词要说清它错在哪一边：{critique}"
+                );
+            }
+            other => panic!("有一行不是规格说的，这次评审不能读成通过：{other:?}"),
+        }
+    }
+
+    /// 一行都指不到规格里时，这不是一次没通过的评审，是一次没做成的评审。
+    #[tokio::test]
+    async fn a_review_that_quotes_nothing_from_the_specification_is_not_a_pass() {
+        let llm = TableLlm::new(
+            r#"{"rows":[
+                 {"requirement":"names a sub-task","spec_quote":"write a haiku about the sea","status":"met","evidence":"t1: read the file"}]}"#,
+        );
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            revise: false,
+            spec: Some("t1 and t2 must be done".into()),
+            ..Default::default()
+        });
+
+        let outcome = judge_only
+            .review("t1: read the file, then t2: deploy", &llm)
+            .await;
+        assert!(
+            outcome.is_err(),
+            "引文全都不在规格里，这次评审没有判过规格说过的事：{outcome:?}"
+        );
+    }
+
+    /// 判词里印出规格被引到了几成。
+    ///
+    /// 这是读数不是门：规格里哪些句子是要求、哪些是现场描述，机器分不出来，
+    /// 拿它当门会把上下文句也判成没做的事。可是「只列了一条、规格写了三句」
+    /// 这个形状必须看得见，否则评审者仍然可以靠少列几行把表做满。
+    #[tokio::test]
+    async fn the_verdict_says_how_much_of_the_specification_was_quoted() {
+        let llm = TableLlm::new(
+            r#"{"rows":[
+                 {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"names a second step","spec_quote":"t1 and t2 must be done","status":"met","evidence":"then t2: deploy the service"}]}"#,
+        );
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            revise: false,
+            spec: Some(
+                "t1 and t2 must be done\n\nAcceptance criteria: read the file; deploy the service"
+                    .into(),
+            ),
+            ..Default::default()
+        });
+
+        let (_, verdict) = judge_only
+            .review("t1: read the file, then t2: deploy the service", &llm)
+            .await
+            .unwrap();
+
+        match verdict {
+            SelfReviewResult::Pass { summary, .. } => assert!(
+                summary.contains("1 of 3 specification sentences"),
+                "规格写了三句、只引到一句，这个形状要留在判词里：{summary}"
+            ),
+            other => panic!("两行都接住了，这是通过：{other:?}"),
+        }
+    }
+
     /// 引文跨行折断仍是同一句：空白不算差别。
     #[tokio::test]
     async fn a_quote_across_a_line_break_is_the_same_quote() {
         let llm = TableLlm::new(
             r#"{"rows":[
-                 {"requirement":"names a rollback","status":"met","evidence":"t3: roll\n back to the previous revision"}]}"#,
+                 {"requirement":"names a rollback","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t3: roll\n back to the previous revision"}]}"#,
         );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             revise: false,
@@ -1379,8 +1563,8 @@ mod tests {
     async fn a_score_in_the_answer_is_not_the_score() {
         let llm = TableLlm::new(
             r#"{"score":1.0,"rows":[
-                 {"requirement":"names a sub-task","status":"met","evidence":"t1: read the file"},
-                 {"requirement":"names a rollback","status":"unmet"}]}"#,
+                 {"requirement":"names a sub-task","spec_quote":"t1 and t2 must be done","status":"met","evidence":"t1: read the file"},
+                 {"requirement":"names a rollback","spec_quote":"t1 and t2 must be done","status":"unmet"}]}"#,
         );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             revise: false,
