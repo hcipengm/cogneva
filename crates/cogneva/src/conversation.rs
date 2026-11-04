@@ -24,7 +24,7 @@ use cog_gateway::chat::{ConversationRequest, ConversationTurn};
 /// 这段对话的角色名。它出现在运行清点与日志里；真正落到账上的 actor 是
 /// [`WEB_CHAT_ACTOR`]——按角色名记账会把界面花的钱混进 agent 池那一族，而那正是
 /// 要分开看的两件事。
-const CHAT_ROLE: &str = "web_chat";
+const CHAT_ROLE: &str = WEB_CHAT_ACTOR;
 
 /// 界面上那次对话在账上的 actor。取自网关声明的闭集，不在这里另写一个值。
 const WEB_CHAT_ACTOR: &str = "web_chat";
@@ -40,6 +40,7 @@ const CHAT_ITERATIONS: u32 = 6;
 // cap: bound — 一次读台账回多少行；整张图会把上下文和这次回答一起淹掉
 const LIST_TASKS_LIMIT: usize = 40;
 /// 调用方没给 `limit` 时回多少行。
+// cap: bound — 默认页只有上限的一半：上限是显式要多的人能拿到的，默认值给的是「一眼扫完、还能接着问」的量
 const LIST_TASKS_DEFAULT: usize = 20;
 
 /// 装配层交给网关的那条循环：一轮对话就是内核的一次运行。
