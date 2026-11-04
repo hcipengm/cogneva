@@ -101,15 +101,36 @@ def env_entries(tpl):
             yield c.get("name"), e
 
 
-# 树里的生产者：`with_origin(...)` 的实参指名了闭集里的哪一项。按调用形式认，
-# 不按裸子串认——一个值名出现在别的地方（注释、别的 API）不构成有人声明它。
+# 树里的生产者：调用点的实参指名了闭集里的哪一项。按调用形式认，不按裸子串
+# 认——一个值名出现在别的地方（注释、别的 API）不构成有人声明它。
+#
+# 两种形式都算：`ChatOptions::with_origin` 是给单次调用盖章，`AgentRuntime::
+# with_call_identity` 是给一整轮运行盖章（人 + 环境一次说完，见 `runtime.rs`
+# 里 `call_origin` 的注释）。只认第一种时，把一处 `with_origin("interactive")`
+# 搬进「整轮运行」那条路径，接线还在、生产者却在门的读数里消失了——判据要说
+# 的是「有没有人声明这个值」，不是「用的是哪个 API」。
+def call_arguments(text, name):
+    for m in re.finditer(re.escape(name) + r"\s*\(", text):
+        depth = 1
+        j = m.end()
+        while j < len(text) and depth:
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+            j += 1
+        if depth == 0:
+            yield text[m.end():j - 1]
+
+
 source_producers = set()
 for path in glob.glob(os.path.join(CRATES, "**", "*.rs"), recursive=True):
     try:
         text = open(path).read()
     except (OSError, UnicodeDecodeError):
         continue
-    for arg in re.findall(r"with_origin\(\s*([^)]*)\)", text):
+    for arg in list(call_arguments(text, "with_origin")) + list(
+            call_arguments(text, "with_call_identity")):
         for value, variant in declarable.items():
             if variant in arg:
                 source_producers.add(value)
