@@ -28,7 +28,8 @@
 #      Secret 由安装期生成、不经清单，它的缺席是设计而不是缺陷）；
 #   6. Ingress 的 backend 必须指向存在的 Service 与存在的 service port。
 #   7. NetworkPolicy 的选择器与端口落在树里真的存在的 Pod 与端口上：
-#      - 同命名空间的对端 podSelector 至少选中一条工作负载（选不中 ⇒ 这条放行通不到
+#      - 同命名空间的对端 podSelector 至少选中一条工作负载或一个登记的运行时 Pod
+#        （见 `deploy/runtime-pods.yaml`；选不中 ⇒ 这条放行通不到
 #        任何 Pod；反向也一样，一条规则被写窄成没人匹配时，被它挡住的那条通道**静默
 #        丢掉**，日志里只有连接超时，与「对端本来不响应」同形）；
 #      - 跨命名空间的对端按 `kubernetes.io/metadata.name` 指名时，那个名字得是 deploy/
@@ -51,9 +52,11 @@
 # 端口对得上树里的对象」为止：CNI 是否真的按它执行、放行集合与设计意图是否一致，
 # 不是读清单能读出来的。subject 选择器选不中动态 Pod（运行时 Job）是合法的，那一面
 # 的漂移由 `crates/cogneva/tests/network_policy_subjects_name_a_component_the_code_writes_test.rs`
-# 判——它读得到代码里的组件常量，这里读不到。对端也有同样的一面：今天没有一条放行
-# 指向运行时创建的 Pod，真出现了这里会红——那是在要求把那份 Pod 的标签变成可读的，
-# 不是判据错了。
+# 判——它读得到代码里的组件常量，这里读不到。对端也有同样的一面：一条放行指向运行时
+# 创建的 Pod 时，这里读不到那个 Pod 的标签，于是红——那是在要求把那份标签变成可读的，
+# 不是判据错了。可读的那一处是 `deploy/runtime-pods.yaml`：运行时 Pod 在那里登记
+# name / namespace / labels 三项，门把它与清单建出来的 Pod 一视同仁地拿去匹配对端
+# （端口、卷、探针不登记——那些由创建者决定，本仓没有可比对象）。
 #
 # `deploy/k3s/observability/` 整棵不在本门内：那 21 份清单由安装脚本与收敛循环交付，
 # 它们指向的 Service（grafana / prometheus）由 kube-prometheus-stack 提供、Secret 由
@@ -269,6 +272,41 @@ def apply_tree_sources(apply_dir):
     return sources
 
 
+def runtime_pods(apply_dir):
+    """运行时创建的 Pod：不由任何清单建出来，创建现场不在本仓，能读的就只剩「它带着
+    哪些标签」这一句——写在 `deploy/runtime-pods.yaml` 里。
+
+    没有这份文件返回空表：一棵树里没有运行时 Pod 是常态，不因此判不了。写了却读不懂
+    （缺 namespace、缺 labels）才是判不了——那时每一族都在拿一个空壳比对。
+    """
+    path = os.path.join(os.path.dirname(apply_dir.rstrip("/")), "runtime-pods.yaml")
+    if not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8") as fh:
+        try:
+            entries = [d for d in yaml.safe_load_all(fh) if d]
+        except yaml.YAMLError as exc:
+            print("判不了：%s 解析失败：%s" % (path, exc), file=sys.stderr)
+            sys.exit(2)
+    pods = []
+    for doc in entries:
+        for entry in doc.get("pods") or []:
+            name = entry.get("name")
+            nspace = entry.get("namespace")
+            labels = entry.get("labels") or {}
+            if not name or not nspace or not labels:
+                print("判不了：%s 里的 %r 缺 name / namespace / labels——这三样缺一样，"
+                      "这份声明就不说明任何 Pod 的形状" % (path, name), file=sys.stderr)
+                sys.exit(2)
+            pods.append({
+                "kind": "Pod",
+                "metadata": {"name": name, "namespace": nspace, "labels": labels},
+                # 端口不在声明里：这些 Pod 的容器由创建者决定，本仓没有可比对象。
+                "spec": {"containers": []},
+            })
+    return pods
+
+
 problems = []
 trees = []  # (名字, 清单文件)
 profiles = sorted(d for d in glob.glob(os.path.join(RENDERED, "*")) if os.path.isdir(d))
@@ -285,6 +323,9 @@ trees.append((APPLY, apply_tree_sources(APPLY)))
 
 judged = 0
 namespaces = declared_namespaces()
+# 只有标签：`local` 里给它们一个空的容器表，端口那两族对它们没有可比对象。
+runtime = [(d, {"metadata": d["metadata"], "spec": {"containers": []}})
+           for d in runtime_pods(APPLY)]
 for pname, sources in trees:
     docs = []
     for path in sources:
@@ -434,6 +475,8 @@ for pname, sources in trees:
         nspace = np["metadata"].get("namespace")
         nspec = np.get("spec") or {}
         local = [(d, t) for (d, t) in workloads if d["metadata"].get("namespace") == nspace]
+        # 运行时创建的 Pod 与清单建出来的一视同仁：选不中它们的那条放行同样通不到人。
+        local += [(d, t) for (d, t) in runtime if d["metadata"].get("namespace") == nspace]
 
         # policyTypes 是权威声明：写了它，某个方向不在名单里就等于这份策略不管那个方向，
         # 该方向下写的规则一条都不生效（不写时 K8s 才按规则自动推出名单）。

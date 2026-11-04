@@ -36,7 +36,10 @@
 #   22. Ingress 注解里的中间件名在树里没有同名对象 -> 红（traefik 会丢弃整条路由）；
 #   23. 中间件注解少了 provider 后缀 -> 红（这条引用同样解析不到）；
 #   24. 中间件注解只写对象名、没带命名空间前缀 -> 红，判词给出 `<ns>-<name>@kubernetescrd`
-#       （traefik 按「命名空间-名字」登记中间件；2026-10-29 这条注解就是整站 404 的成因）。
+#       （traefik 按「命名空间-名字」登记中间件；2026-10-29 这条注解就是整站 404 的成因）；
+#   25. 运行时创建的 Pod 没在 `deploy/runtime-pods.yaml` 里登记 -> 红（那条放行读成
+#       选不中任何 Pod）；登记删掉这一改只动声明文件，证明放它过的是声明本身；
+#   26. 登记写了却缺 labels -> 2（判不了，不是全过）。
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,6 +57,7 @@ base="${work}/base"
 mkdir -p "${base}/deploy"
 cp -a "${repo}/deploy/rendered" "${base}/deploy/rendered"
 cp -a "${repo}/deploy/k3s" "${base}/deploy/k3s"
+cp -a "${repo}/deploy/runtime-pods.yaml" "${base}/deploy/runtime-pods.yaml"
 
 case_tree() { # case_tree <名字> -> 打印一份可以随便改的树根
   local d="${work}/$1"
@@ -304,4 +308,25 @@ def mutate(d):
 edit("60-ingress-cogneva.yaml", mutate)
 '
 
-echo "control-plane-reachability.test.sh: 24 用例全过"
+# 25. 运行时创建的 Pod 只有登记了标签才算数：删掉那条登记，`crawl4ai-ingress` 对着
+#     评测台的那条放行立刻读成「选不中任何 Pod」——证明放它过的是那份声明，不是判据
+#     被放宽了。
+expect_red "runtime-pod-undeclared" "NetworkPolicy crawl4ai-ingress 的 ingress 来源对端" '
+def mutate(d):
+    d["pods"] = []
+edit("runtime-pods.yaml", mutate)
+' "deploy"
+
+# 26. 登记了却读不懂（缺 labels）同样是判不了，不是全过：那时每一族都在拿一个空壳比对。
+broken="$(case_tree runtime-pods-broken)"
+printf 'pods:\n  - name: eval-table\n    namespace: cogneva\n' \
+  > "${broken}/deploy/runtime-pods.yaml"
+set +e
+out="$(bash "${gate}" "${broken}" 2>&1)"
+rc=$?
+set -e
+[ "${rc}" -eq 2 ] || fail "runtime-pods-broken: 期望退出码 2，实得 ${rc}；输出：${out}"
+printf '%s' "${out}" | grep -Fq "判不了" || fail "runtime-pods-broken: 输出里没有「判不了」；输出：${out}"
+echo "ok   runtime-pods-broken：登记读不懂时退出码 2（不是 0）"
+
+echo "control-plane-reachability.test.sh: 26 用例全过"
