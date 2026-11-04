@@ -9,6 +9,7 @@ import {
   type QuotaScopeName,
   type TokenSpenders,
 } from '@/api/client';
+import { Note } from '@/ui/Note';
 import { Button, Reading, Readings } from '@/ui/primitives';
 import { Meter } from '@/ui/plots';
 import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
@@ -211,17 +212,18 @@ export function QuotaLimitsPanel() {
                   {spenders.spenders.map((row) => (
                     <tr key={row.id}>
                       <td className="py-0.5 pr-3">
-                        <button
+                        <Note
+                          as="button"
                           type="button"
                           className="underline-offset-2 hover:underline"
-                          title="把这一格填进上面的输入框并读出来"
+                          text="把这一格填进上面的输入框并读出来"
                           onClick={() => {
                             setTargetId(row.id);
                             void run(() => getQuotaLimits(scope, row.id));
                           }}
                         >
                           {row.id}
-                        </button>
+                        </Note>
                       </td>
                       <td className="py-0.5 pr-3 text-right">{row.tokens.toLocaleString()}</td>
                       <td className="py-0.5 pr-3 text-right">
