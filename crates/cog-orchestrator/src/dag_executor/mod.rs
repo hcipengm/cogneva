@@ -242,6 +242,22 @@ pub struct DagExecutorRuntime {
     board_wip_limits: cog_core::BoardWipLimits,
 }
 
+/// What a hold says about the pass that made it.
+///
+/// The branch that logs this runs whenever the queue is larger than its slice,
+/// and the ordinary case is a partial slice: a pass admitting 200 of 369 ready
+/// entries printed "nothing may be admitted this pass" next to `admitted: 200`.
+/// The numbers and the words disagreed, and the words were the part that read
+/// like a verdict: a reader who took them would go looking for a pool that was
+/// down while 200 jobs had just gone out.
+fn hold_back_message(admitted: u64) -> &'static str {
+    if admitted == 0 {
+        "holding ready tasks back: nothing may be admitted this pass, so they stay pending until the pool can serve them"
+    } else {
+        "holding ready tasks back: this pass's slice takes the first of them, the rest stays pending for the next one"
+    }
+}
+
 impl DagExecutorRuntime {
     pub fn new_with_backend(
         config: DagExecutorConfig,
@@ -592,7 +608,7 @@ impl DagExecutorRuntime {
                                 bound.unavailable,
                                 admitted.bound,
                             ),
-                            "holding ready tasks back: nothing may be admitted this pass, so they stay pending until the pool can serve them"
+                            message = %hold_back_message(admitted.jobs),
                         );
                     } else {
                         // This branch is reached on exactly one condition: no
@@ -4598,5 +4614,32 @@ mod orphan_reconciler_tests {
             "an empty plan was read as a passing one: {:?}",
             recording.calls.lock().unwrap()
         );
+    }
+}
+
+/// 一条只说了一半真话的日志，会把人送到错的地方去。
+#[cfg(test)]
+mod hold_back_tests {
+    use super::hold_back_message;
+
+    /// 派发了一批的 pass，不许说自己一笔都没派发。
+    ///
+    /// 现场是 `ready: 369, admitted: 200` 那一行：同一行里的数字说这一趟放了
+    /// 200 笔出去，文字却说「这一趟一笔都不能放」，据文字去查的人会去找一个停摆
+    /// 的池子，而池子刚放出去 200 笔。两个分支都断言：零笔的时候那句话仍然
+    /// 要说，这正是它该出现的地方。
+    #[test]
+    fn a_pass_that_admitted_something_does_not_say_nothing_may_be_admitted() {
+        assert!(
+            hold_back_message(0).contains("nothing may be admitted"),
+            "一笔都没派发的这一趟，恰恰是这句话该出现的地方"
+        );
+        for admitted in [1u64, 200, 1_000] {
+            assert!(
+                !hold_back_message(admitted).contains("nothing may be admitted"),
+                "这一趟放出去 {admitted} 笔，文字却说一笔都不能放：同一行里的数字\
+                 与它互相否证，而读者按文字行事"
+            );
+        }
     }
 }
