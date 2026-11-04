@@ -412,15 +412,37 @@ impl LlmMemoryExtractor {
          scale of 1-10, where 10 is critical information that will be valuable in future \
          conversations, and 1 is trivial.";
 
+    /// The two halves of one prompt, kept apart so the stable one can stand first.
+    ///
+    /// 上游的前缀缓存从第一个字节开始比对：两次请求从这个字节起逐字相同的部分
+    /// 按缓存价读回，第一个不同的字节之后的整段按全价重买。任务说明在一次运行里
+    /// 逐字不变，transcript 每次都变，所以稳定的一半排在前面。
+    ///
+    /// 稳定块里不放任何随请求变化的值（source id、时间戳、transcript 的任何
+    /// 片段）：混进去一个，它后面整段就再也命中不了。变动块就是正文，怎么装仍
+    /// 由 [`Self::bounded_payload`] 决定——分块不新增读数，`PayloadOutcome` 还是
+    /// 从那一次计算里出来的同一个值。
+    fn split_prompt(
+        tasks: &str,
+        source: &RawSource,
+        input_budget_tokens: usize,
+    ) -> (String, String, PayloadOutcome) {
+        let (payload, outcome) = Self::bounded_payload(&source.payload, input_budget_tokens);
+        (tasks.to_string(), payload, outcome)
+    }
+
     /// The source is appended to the instructions exactly here, so every prompt
     /// path pays for the payload the same number of times — once.
+    ///
+    /// 稳定块在前、变动块在后：[`Self::split_prompt`] 决定哪一半是哪一半，这里
+    /// 只决定顺序。
     fn prompt(
         tasks: &str,
         source: &RawSource,
         input_budget_tokens: usize,
     ) -> (String, PayloadOutcome) {
-        let (payload, outcome) = Self::bounded_payload(&source.payload, input_budget_tokens);
-        (format!("{tasks}\n\n{payload}"), outcome)
+        let (stable, variable, outcome) = Self::split_prompt(tasks, source, input_budget_tokens);
+        (format!("{stable}\n\n{variable}"), outcome)
     }
 
     /// 一次抽取发出去的正文：装得下就原样，装不下就留头留尾、省掉中间。
@@ -526,26 +548,38 @@ impl LlmMemoryExtractor {
         )
     }
 
+    /// 一次运行里逐字不变的那段任务说明，写作一处。三个调用点各自拼一份「看起来
+    /// 一样」的字符串就谈不上稳定了，测试也只能拿真实的那一份去比。
+    fn schema_tasks() -> String {
+        format!("{} {}", Self::SCHEMA_TASK, Self::IMPORTANCE_TASK)
+    }
+
+    fn summary_tasks() -> String {
+        format!("{} {}", Self::SUMMARY_TASK, Self::IMPORTANCE_TASK)
+    }
+
+    fn combined_tasks() -> String {
+        format!(
+            "{} {}\n\n{} {}",
+            Self::SCHEMA_TASK,
+            Self::IMPORTANCE_TASK,
+            Self::SUMMARY_TASK,
+            Self::IMPORTANCE_TASK
+        )
+    }
+
     fn build_schema_prompt(
         source: &RawSource,
         input_budget_tokens: usize,
     ) -> (String, PayloadOutcome) {
-        Self::prompt(
-            &format!("{} {}", Self::SCHEMA_TASK, Self::IMPORTANCE_TASK),
-            source,
-            input_budget_tokens,
-        )
+        Self::prompt(&Self::schema_tasks(), source, input_budget_tokens)
     }
 
     fn build_summary_prompt(
         source: &RawSource,
         input_budget_tokens: usize,
     ) -> (String, PayloadOutcome) {
-        Self::prompt(
-            &format!("{} {}", Self::SUMMARY_TASK, Self::IMPORTANCE_TASK),
-            source,
-            input_budget_tokens,
-        )
+        Self::prompt(&Self::summary_tasks(), source, input_budget_tokens)
     }
 
     /// One prompt carrying both tasks, so one call can answer both. The two
@@ -555,17 +589,7 @@ impl LlmMemoryExtractor {
         source: &RawSource,
         input_budget_tokens: usize,
     ) -> (String, PayloadOutcome) {
-        Self::prompt(
-            &format!(
-                "{} {}\n\n{} {}",
-                Self::SCHEMA_TASK,
-                Self::IMPORTANCE_TASK,
-                Self::SUMMARY_TASK,
-                Self::IMPORTANCE_TASK
-            ),
-            source,
-            input_budget_tokens,
-        )
+        Self::prompt(&Self::combined_tasks(), source, input_budget_tokens)
     }
 
     /// Turn a schema extraction into store entries. The schema-only call and
@@ -1328,5 +1352,37 @@ mod tests {
         let (schema, summary) = unconfigured.ingest(&source).await.expect("ordinary path");
         assert!(!schema.is_empty());
         assert_eq!(summary.namespace, "benchmark");
+    }
+
+    /// 前缀缓存从第一个字节开始比对，所以稳定的一半必须逐字不变：同一份任务
+    /// 说明、同样的预算，两份内容不同的 source 组装出的稳定块要一模一样，而且
+    /// 不许夹带 payload 的任何片段——混进去一个字，它后面整段就按全价重买。
+    #[test]
+    fn the_stable_half_is_byte_identical_across_sources() {
+        const FIRST: &str = "SENTINEL-FIRST-9a1";
+        const SECOND: &str = "SENTINEL-SECOND-4c7";
+        let budget = crate::config::DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS;
+
+        let tasks = LlmMemoryExtractor::schema_tasks();
+        let (first, first_body, _) =
+            LlmMemoryExtractor::split_prompt(&tasks, &raw("raw-a", FIRST), budget);
+        let (second, _, _) =
+            LlmMemoryExtractor::split_prompt(&tasks, &raw("raw-b", SECOND), budget);
+
+        assert_eq!(first, second, "the stable half moved between two sources");
+        assert!(
+            !first.contains(FIRST) && !first.contains(SECOND),
+            "the stable half must not carry the payload: {first}"
+        );
+
+        // 组装出来的提示词以稳定块开头、以变动块收尾：分块改的是顺序，不是内容。
+        let (prompt, _) = LlmMemoryExtractor::prompt(&tasks, &raw("raw-a", FIRST), budget);
+        assert!(prompt.starts_with(&first), "{prompt}");
+        assert!(prompt.ends_with(&first_body), "{prompt}");
+
+        // 三个调用点各有自己的一段说明，但都走同一条组装：谁的那段排在最前，
+        // 谁就被缓存读到。
+        let standalone = LlmMemoryExtractor::build_schema_prompt(&raw("raw-a", FIRST), budget);
+        assert_eq!(prompt, standalone.0);
     }
 }
