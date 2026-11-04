@@ -62,11 +62,14 @@ fn emitted_frames(text: &str) -> BTreeMap<String, BTreeSet<String>> {
             continue;
         }
         let open = start + "emit".len();
-        let Some(close) = matching_paren(text, open, Dialect::JavaScript) else {
+        // 写者是一份 Rust 源码：按 Rust 读。同一段在 JavaScript 方言下，`fn turn<'a>`
+        // 里的那个 `'` 会被当成字符串开头，一直吞到下一个 `'`——中间那些 `)` 全变成
+        // 「不是括号」，于是第一个 `emit(` 就配不上对自己，整份文件读出 0 个帧。
+        let Some(close) = matching_paren(text, open, Dialect::Rust) else {
             break;
         };
         cursor = close + 1;
-        let arguments = split_top_level(&text[open + 1..close], Dialect::JavaScript);
+        let arguments = split_top_level(&text[open + 1..close], Dialect::Rust);
         let Some(name) = arguments.get(2).and_then(|a| quoted_word(a)) else {
             continue;
         };
@@ -79,7 +82,7 @@ fn emitted_frames(text: &str) -> BTreeMap<String, BTreeSet<String>> {
                 Some(offset) => at + offset,
                 None => continue,
             };
-            let Some(end) = matching_brace(payload, brace, Dialect::JavaScript) else {
+            let Some(end) = matching_brace(payload, brace, Dialect::Rust) else {
                 continue;
             };
             if let Some(keys_in) = top_level_keys(&payload[brace + 1..end], KeyWords::Identifiers) {

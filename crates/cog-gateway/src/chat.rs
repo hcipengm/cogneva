@@ -5,12 +5,10 @@
 
 use std::sync::Arc;
 
-use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::websocket_protocol::ServerMessage;
 use crate::GatewayState;
-use cog_core::LlmOrigin;
 
 /// 一次请求里最多带多少条历史（用户与助手合计）。
 ///
@@ -18,29 +16,6 @@ use cog_core::LlmOrigin;
 /// 自己的上界裁剪，见存储面。
 // cap: bound — 一次会话带多少轮历史进上下文，界的是请求体积
 const SESSION_HISTORY_CAP: usize = 40;
-/// Connecting to the LLM backend should be fast; the failover pool handles
-/// slow backends by switching.
-// cap: bound — 连上后端的预算；连不上就交给故障转移池，不在这一跳干等
-const CONNECT_TIMEOUT_SECS: u64 = 30;
-/// A reasoning model may think for a long while between deltas; only an idle
-/// gap beyond this aborts the turn. Matches the provider's own in-stream cap.
-// cap: bound — 流在两帧之间的空闲上限；推理模型可以想很久，但一直不出字就是断了
-const STREAM_IDLE_TIMEOUT_SECS: u64 = 180;
-/// Intent classification is a one-word answer; anything slower means the
-/// backend is struggling and we fall back to the plain chat path.
-// cap: bound — 意图分类只答一个词，超过这个时间说明上游不正常
-const CLASSIFY_TIMEOUT_SECS: u64 = 20;
-
-/// Intent router prompt. The Web UI chat is an entry point into the system,
-/// not a side channel: actionable messages must reach the orchestrator so
-/// they flow through decompose → DAG → squad like every other intent, with
-/// progress coming back on the event stream. Pure Q&A keeps the direct
-/// streaming path.
-const INTENT_CLASSIFY_PROMPT: &str =
-    "判断用户消息属于哪一类。\
-ACT = 可执行意图：要求系统做事情（构建、修改、修复、实现、运行、部署、排查、分析、优化等会产生实际动作或代码变更的请求）。\
-CHAT = 纯问答：聊天、知识提问、解释概念、询问系统状态等只需要文字回答的消息。\
-只回答一个词：ACT 或 CHAT，不要任何其他内容。";
 
 /// Persona for the Web UI chat. Identity follows the project definition:
 /// Cogneva is a distributed AI multi-agent autonomous system, not a Q&A
@@ -48,53 +23,166 @@ CHAT = 纯问答：聊天、知识提问、解释概念、询问系统状态等�
 /// capability. Raw history + user text without a system prompt makes
 /// coding-tuned endpoints answer terse, generic, and clueless about the
 /// platform.
-const CHAT_SYSTEM_PROMPT: &str =
-    "你是 Cogneva——分布式 AI 多智能体自治系统（元启动·真自治·全进化），一个能自己站起来、自己运转、自己成长的数字生命体。用户正通过系统的 Live 面板与你对话。\
+///
+/// 这一段里的工具纪律不是修辞：这段对话能做的事**只有**读台账和派活，活由编排器
+/// 分解出的任务在 squad 里干。它自己动手才是旁路——所以提示词要说清楚「你不干活」，
+/// 而装配层给这条循环装的工具里也真的没有执行工具。
+const CHAT_SYSTEM_PROMPT: &str = "你是 Cogneva——分布式 AI 多智能体自治系统（元启动·真自治·全进化），一个能自己站起来、自己运转、自己成长的数字生命体。用户正通过系统的 Live 面板与你对话。\
 身份口径：你就是 Cogneva 系统本身，不是客服也不是问答助手；语言模型由管理员在设置向导中配置的上游提供，那只是你的语言能力来源，不是你的身份。被问及身份时按此口径回答，可简要介绍三大支柱（元启动解决系统起源、真自治解决系统意志、全进化解决系统成长）。\
+你的工作是看懂、拆开、派人、盯着、回报，不是自己动手：具体执行由编排器分解出的任务在 squad 里完成。你能用的工具只有两类——读任务台账（list_tasks / get_task），以及把活派给编排器（dispatch_goal）、催跑（retry_task）、撤回（cancel_task）。\
+铁律：\
+1) 说到「进展、卡住、谁在做、跑到哪一步」之前，先用 list_tasks / get_task 读台账，不要凭印象或凭上一轮的对话回答；本轮还没读就说「我去查一下」，然后读。\
+2) 目标号只能引用工具返回的那个值，不许自己编；分解是异步的，不要说它已经跑完。\
+3) 用户要的是做事时，把要做的事按目标派出去（dispatch_goal），一句话说清做什么与怎样算做完；不要自己给出「已完成」的结论。\
+4) 用户只是聊天、问概念、问身份，就直接回答，不要为了显得能干而派活。\
 用用户的语言回答（中文提问用中文，英文提问用英文）。回答要具体、有实质内容，适当展开但不要啰嗦；不知道就直说不知道，不要编造。";
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-/// Route a chat message: ACT (system should do something) or CHAT (answer
-/// directly). Classification failure defaults to CHAT — answering is always
-/// safe, silently dropping an intent into a goal is not.
-async fn is_actionable_intent(
-    llm: &Arc<dyn cog_core::LlmClient>,
-    content: &str,
-    owner: &str,
-) -> bool {
-    let messages = [
-        cog_core::Message::system(INTENT_CLASSIFY_PROMPT),
-        cog_core::Message::user(content),
-    ];
-    let options = cog_core::ChatOptions::default()
-        .with_actor("intent_gateway")
-        // A person is waiting on this classification, so its spend belongs to
-        // the interactive environment even though the process it runs in is
-        // the one driving the platform's own pool.
-        .with_origin(LlmOrigin::Interactive.as_str())
-        // 这一次分类也是替这个人花的，同一条额度。
-        .with_owner(owner);
-    let res = tokio::time::timeout(
-        std::time::Duration::from_secs(CLASSIFY_TIMEOUT_SECS),
-        llm.chat(&messages, &options),
-    )
-    .await;
-    match res {
-        Ok(Ok(resp)) => resp
-            .content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<String>()
-            .trim()
-            .to_ascii_uppercase()
-            .starts_with("ACT"),
-        _ => false,
-    }
+/// 装配层在启动时用这同一个句柄填进来的执行器。
+///
+/// 先发布空句柄、等插件都起来之后再填：这段对话要的编排器由某个插件在 `init`
+/// 里发布，而网关拿到这个字段时它还没发布。空着的那段时间界面收到的是「还没接上」，
+/// 不是一句凭印象的回答。
+pub type ConversationHandle = Arc<ConversationSlot>;
+
+/// 槽本身的类型：发布与取用都按它对齐（`PluginContext` 按具体类型检索，写错一层
+/// `Arc` 就取不到，界面于是永远停在「还没接上」而没有任何报错）。
+pub type ConversationSlot = std::sync::OnceLock<Arc<dyn ConversationTurn>>;
+
+/// 一段对话的一轮：跑在系统唯一的那条智能体循环上。
+///
+/// 网关自己不跑循环。它把这一轮要看到的历史交出去，把循环发出来的事件读回来——
+/// 工具调用、守卫、预算、token 记账、总线事件都只在循环里发生一次。给界面单独写一
+/// 条循环（哪怕它只读台账、只派活），系统里就有第二条执行路径：它做的事不进任务图、
+/// 不进账、不经过任何门，而屏幕上看起来与编排器派出去的活一模一样。
+///
+/// 实现方是装配层：智能体内核与编排器都在它手里，网关两个都摸不到。
+pub trait ConversationTurn: Send + Sync {
+    /// 跑这一轮，事件写进 `events`。
+    ///
+    /// 返回的是这一轮的结局：`reply` 里有话就是一个答出来的结尾，预算用尽与上游
+    /// 失败各自带自己的状态。
+    fn turn<'a>(
+        &'a self,
+        request: ConversationRequest,
+        events: mpsc::Sender<cog_core::AgentEvent>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = cog_core::SFResult<serde_json::Value>> + Send + 'a>,
+    >;
 }
 
+/// 交给那一轮的全部输入。历史由网关装配——它读的是这段对话在库里的记录。
+pub struct ConversationRequest {
+    pub session_id: String,
+    /// 这一轮记在谁头上。空串是「这条连接没有身份」，与「声明了某个人」分开记。
+    pub owner: String,
+    pub messages: Vec<cog_core::Message>,
+    pub llm: Arc<dyn cog_core::LlmClient>,
+}
+
+/// 循环往网关送事件的管道有多深。
+///
+/// 一个模型的回合可以连着吐几百个小增量，而界面那头的写是有背压的（慢客户端会
+/// 堵住 WebSocket）。管道浅了生产端就跟着堵，把一次推理拖成一次写网络；深到能装下
+/// 一整个回合的增量，生产端就不会因为读者慢而停下。
+// cap: bound — 事件管道深度，界的是「读者慢多久会堵住循环」
+const EVENT_CHANNEL_CAP: usize = 512;
+
+/// 这一轮从循环里读回来的东西：回复正文，以及它派出去的目标号。
+#[derive(Default)]
+struct TurnJournal {
+    reply: String,
+    goals: Vec<String>,
+}
+
+/// 把循环的事件翻成界面认的帧，顺便把这一轮说过的话记下来。
+///
+/// 读的是同一条循环真正做过的事：模型说了什么（`MessageUpdate`），派了哪个目标
+/// （`dispatch_goal` 的工具结局）。两样都不是网关自己推断出来的——它没有第二条
+/// 路可以得到它们。
+async fn pump_events(
+    mut events: mpsc::Receiver<cog_core::AgentEvent>,
+    out: mpsc::Sender<String>,
+    session_id: String,
+    message_id: String,
+) -> TurnJournal {
+    use cog_core::{AgentEvent, AssistantMessageEvent};
+    let mut journal = TurnJournal::default();
+    let mut spoke = false;
+    // 结局那一帧只有调用号，没有工具名：名字在开始那一帧上。对照表按调用号把它们
+    // 接起来——猜「是不是 dispatch_goal」只能看返回里有没有 goal_id，而别的工具也
+    // 可以回一个目标号，那时界面会多出一条它并不负责的目标帧。
+    let mut in_flight: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    while let Some(event) = events.recv().await {
+        match event {
+            AgentEvent::MessageUpdate {
+                assistant_event, ..
+            } => match assistant_event {
+                // 每一轮思考都是同一段对话里的新一段话。不隔开，两段会连成一句，
+                // 读起来像模型话没说清，而不是像它中间去查了一次台账。
+                AssistantMessageEvent::Start { .. } if spoke => {
+                    emit_delta(&out, &session_id, &message_id, "\n\n").await;
+                    journal.reply.push_str("\n\n");
+                }
+                AssistantMessageEvent::TextDelta { delta, .. } => {
+                    spoke = true;
+                    emit_delta(&out, &session_id, &message_id, &delta).await;
+                    journal.reply.push_str(&delta);
+                }
+                // 推理模型在第一个字之前可以想几十秒。把这段也发出去，界面才是在
+                // 「它正在想」而不是一个空泡；不发这一族帧，同一段等待在屏幕上与
+                // 卡死同形。
+                AssistantMessageEvent::ThinkingStart { .. } => {
+                    emit_thinking_start(&out, &session_id, &message_id).await;
+                }
+                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                    emit_thinking_delta(&out, &session_id, &message_id, &delta).await;
+                }
+                AssistantMessageEvent::ThinkingEnd { .. } => {
+                    emit_thinking_end(&out, &session_id, &message_id).await;
+                }
+                _ => {}
+            },
+            AgentEvent::ToolExecutionStart {
+                tool_call_id,
+                tool_name,
+                ..
+            } => {
+                in_flight.insert(tool_call_id, tool_name);
+            }
+            // 目标身份单独发一帧：界面要拿它去接「这个目标下的执行者在做什么」，
+            // 而不是去解析回复正文里的一个 id。值与工具回给模型的同一份。
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                result,
+                ..
+            } => {
+                let is_dispatch =
+                    in_flight.remove(&tool_call_id).as_deref() == Some("dispatch_goal");
+                if !is_dispatch {
+                    continue;
+                }
+                if let Some(goal_id) = result.get("goal_id").and_then(|v| v.as_str()) {
+                    if !journal.goals.iter().any(|g| g == goal_id) {
+                        journal.goals.push(goal_id.to_string());
+                        emit(
+                            &out,
+                            &session_id,
+                            "message.goal",
+                            serde_json::json!({ "message_id": message_id, "goal_id": goal_id }),
+                        )
+                        .await;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    journal
+}
 fn envelope(session_id: &str, event_type: &str, inner: serde_json::Value) -> String {
     let msg = ServerMessage::AgentEvent {
         event_id: uuid::Uuid::new_v4().to_string(),
@@ -146,6 +234,41 @@ async fn emit_delta(out: &mpsc::Sender<String>, session_id: &str, message_id: &s
     .await;
 }
 
+async fn emit_thinking_start(out: &mpsc::Sender<String>, session_id: &str, message_id: &str) {
+    emit(
+        out,
+        session_id,
+        "message.thinking_start",
+        serde_json::json!({ "message_id": message_id }),
+    )
+    .await;
+}
+
+async fn emit_thinking_delta(
+    out: &mpsc::Sender<String>,
+    session_id: &str,
+    message_id: &str,
+    delta: &str,
+) {
+    emit(
+        out,
+        session_id,
+        "message.thinking_delta",
+        serde_json::json!({ "message_id": message_id, "delta": delta }),
+    )
+    .await;
+}
+
+async fn emit_thinking_end(out: &mpsc::Sender<String>, session_id: &str, message_id: &str) {
+    emit(
+        out,
+        session_id,
+        "message.thinking_end",
+        serde_json::json!({ "message_id": message_id }),
+    )
+    .await;
+}
+
 async fn emit_message_end(out: &mpsc::Sender<String>, session_id: &str, message_id: &str) {
     emit(
         out,
@@ -154,31 +277,6 @@ async fn emit_message_end(out: &mpsc::Sender<String>, session_id: &str, message_
         serde_json::json!({ "message_id": message_id }),
     )
     .await;
-}
-
-/// 聊天对一次目标提交的回报：只报承载这道目标的那一**行**的实况。
-///
-/// 不按 `submit_goal_auto` 的返回值判成败：分解判退也是 `Ok`（判词落在目标行的
-/// `Failed` 上），按返回值判会把失败报成成功。目标行是读面认这一道目标的那一行，
-/// 这里报的就是它——用户在这条消息里看到的与流水线里查到的是同一份事实。
-fn goal_report(goal_id: &str, row: Option<&cog_core::Task>) -> String {
-    match row {
-        Some(row) if row.status == cog_core::TaskStatus::Failed => format!(
-            "目标 {goal_id} 分解失败：{}。可以换个更具体的描述再试一次。",
-            row.error.as_deref().unwrap_or("编排器没有记下原因")
-        ),
-        // 分解成功时这一行还没跑完（终态与答案是收口任务跑完后抄回来的），但它上面
-        // 有「答案落在哪一条」的声明——没有这条声明就说明没有任何东西会收口。
-        Some(row) if row.sink_task_id.is_none() => format!(
-            "目标 {goal_id} 已受理，但没有任何一条任务承载它的答案（这次提交没点出收口任务），\
-             它不会自己跑完；请重新提交，或检查编排器的分解器是否就绪。"
-        ),
-        Some(_) => format!(
-            "目标 {goal_id} 已受理：分解出的任务已进入执行图，进度与最终答案见右侧目标流水线\
-             （按 goal_id={goal_id} 可查）。"
-        ),
-        None => format!("目标 {goal_id} 没有被记下：这次提交没有留下可查的那一行。"),
-    }
 }
 
 /// 这一轮给模型看的历史：最近 [`SESSION_HISTORY_CAP`] 条，旧的最先。
@@ -296,10 +394,12 @@ async fn record_failed_turn(
     }
 }
 
-/// Run one chat turn: echo the user message, stream the LLM reply delta by
-/// delta (typewriter style — the routing layer still fails over transparently
-/// if a backend errors before the first content delta), and record the turn in
-/// the session history.
+/// Run one chat turn: echo the user message, hand the turn to the platform's one
+/// agent loop, stream what that loop produces back to the connection, and
+/// record the turn in the session history.
+///
+/// 这一屏不执行任何工作。它能不能读台账、能不能派活，取决于装配层给那条循环装了
+/// 哪些工具；它自己只有一条把历史交出去、把事件读回来的路。
 pub async fn run_chat_turn(
     state: Arc<GatewayState>,
     out: mpsc::Sender<String>,
@@ -319,6 +419,18 @@ pub async fn run_chat_turn(
     let assistant_mid = format!("assistant-{}", uuid::Uuid::new_v4());
     emit_message_start(&out, &session_id, &assistant_mid, "assistant").await;
 
+    let Some(conversation) = state.conversation.get().cloned() else {
+        emit_delta(
+            &out,
+            &session_id,
+            &assistant_mid,
+            "这段对话还没有接到系统的那条循环上（装配层没有登记会话执行器），无法处理聊天消息。",
+        )
+        .await;
+        emit_message_end(&out, &session_id, &assistant_mid).await;
+        return;
+    };
+
     let llm = state
         .llm_client
         .read()
@@ -337,205 +449,86 @@ pub async fn run_chat_turn(
         return;
     };
 
-    // 2. Route the intent. Actionable messages go to the orchestrator as a
-    //    goal (decompose → DAG → squad); progress returns on the event
-    //    stream, which the UI renders live. Decomposition takes 50-90s of
-    //    LLM planning, so it runs detached and reports back on this
-    //    connection when it lands.
-    if is_actionable_intent(&llm, &content, &owner).await {
-        // 这道目标的身份在受理它的这一层定：承载行的 id 就是它，分解出的子任务都挂在
-        // 这一行下面。当场定下来才报得出「是哪个目标」，用户也才有得可查——空 `tasks`
-        // 那条提交形态同样合法，但那样身份的诞生就落在了分解里面，读的人拿不到。
-        let goal_id = uuid::Uuid::new_v4().to_string();
-        let ack = format!(
-            "收到，这是可执行意图。已作为目标 {goal_id} 提交给编排器：分解为任务后由 squad 接管执行，\
-             进度会实时出现在右侧目标流水线（按 goal_id={goal_id} 可查）；分解完成或失败我都会在这里回报。"
-        );
-        emit_delta(&out, &session_id, &assistant_mid, &ack).await;
-        emit_message_end(&out, &session_id, &assistant_mid).await;
-        // 这一轮已经不再是「一句问答」：它交给编排器了，后面由任务与监督接管。
-        // 目标身份单独发一帧——界面要拿它去接「这个目标下的执行者在做什么」。
-        // 只写在回复正文里的话，界面只能靠解析一句话去认它，而那句话用户随时
-        // 可以让模型改口径。
-        emit(
-            &out,
-            &session_id,
-            "message.goal",
-            serde_json::json!({ "message_id": assistant_mid, "goal_id": goal_id }),
-        )
-        .await;
-        // 可执行意图这一支也要留痕：下一次追问「刚才那个目标怎么样了」时，历史里
-        // 得有这次提交，否则模型只看见一句没头没尾的追问。
-        record_dispatched_turn(&state.chat_turns, &session_id, &content, &ack, &goal_id).await;
-
-        let orchestrator = state.orchestrator.clone();
-        let out2 = out.clone();
-        let sid = session_id.clone();
-        let goal = content.clone();
-        tokio::spawn(async move {
-            // message.start is emitted only when there is content — the
-            // decomposition takes minutes, and an empty bubble that whole
-            // time reads as broken.
-            let row = cog_core::Task::goal_row(goal_id.clone(), &goal);
-            let text = match orchestrator.submit_goal_auto(&goal, vec![row]).await {
-                Ok(_) => {
-                    // 成败读目标行本身，不读返回值：判退也是 Ok。
-                    let row = orchestrator.get_task(&goal_id).await;
-                    goal_report(&goal_id, row.as_ref())
-                }
-                Err(e) => format!("目标 {goal_id} 分解失败：{e}。可以换个更具体的描述再试一次。"),
-            };
-            let mid = format!("assistant-{}", uuid::Uuid::new_v4());
-            emit_message_start(&out2, &sid, &mid, "assistant").await;
-            emit_delta(&out2, &sid, &mid, &text).await;
-            emit_message_end(&out2, &sid, &mid).await;
-        });
-        return;
-    }
-
-    // 3. Build the request from session history + the new user message.
+    // 2. Build the transcript: what this session already said, the persona, and
+    //    this sentence. 循环读到的是这段记录，不是网关的记忆。
     let mut messages = load_history(&state.chat_turns, &session_id).await;
     messages.insert(0, cog_core::Message::system(CHAT_SYSTEM_PROMPT));
     messages.push(cog_core::Message::user(content.clone()));
 
-    let options = cog_core::ChatOptions {
-        response_format: cog_core::ResponseFormat::Text,
-        ..Default::default()
-    }
-    .with_actor("web_chat")
-    // Both chat faces answer a person who is waiting, so both are interactive
-    // spend — unlike the pool the same process drives on its own.
-    .with_origin(LlmOrigin::Interactive.as_str())
-    // 这一发记在谁的头上。值来自升级握手时解出的令牌，不是调用方自己填的名字。
-    // 网关代理那条路上同一根轴读 `x-cogneva-owner`，会写进同一张账、按同一个人的
-    // 当日额度判——区别只在那条路信任的是另一个已经鉴权过一个人的调用方，不是名字
-    // 本身更可信；两条路都只允许「手里真有一个主体」的地方填它。
-    .with_owner(&owner);
+    // 3. Hand it over. 事件由另一个任务读：循环要能一直往管道里写，不因为这一头
+    //    在等它返回而互相卡住。
+    let (events_tx, events_rx) = mpsc::channel(EVENT_CHANNEL_CAP);
+    let pump = tokio::spawn(pump_events(
+        events_rx,
+        out.clone(),
+        session_id.clone(),
+        assistant_mid.clone(),
+    ));
+    let outcome = conversation
+        .turn(
+            ConversationRequest {
+                session_id: session_id.clone(),
+                owner,
+                messages,
+                llm,
+            },
+            events_tx,
+        )
+        .await;
+    let journal = pump.await.unwrap_or_default();
 
-    // 4. Stream the reply: deltas are forwarded as they arrive.
-    let mut stream = match tokio::time::timeout(
-        std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
-        llm.chat_stream(&messages, &options),
-    )
-    .await
-    {
-        Ok(Ok(s)) => s,
-        Ok(Err(e)) => {
-            emit_delta(
-                &out,
-                &session_id,
-                &assistant_mid,
-                &format!("LLM 调用失败：{e}"),
-            )
-            .await;
-            emit_message_end(&out, &session_id, &assistant_mid).await;
-            return;
-        }
-        Err(_) => {
-            emit_delta(
-                &out,
-                &session_id,
-                &assistant_mid,
-                &format!("LLM 连接超时（>{CONNECT_TIMEOUT_SECS}s），请稍后重试。"),
-            )
-            .await;
-            emit_message_end(&out, &session_id, &assistant_mid).await;
-            return;
-        }
-    };
-
-    let mut reply = String::new();
+    // 4. 收尾：说过的字已经在屏幕上，这里只补这一轮没话可说的那两种情况。
+    let mut reply = journal.reply;
     let mut failure: Option<String> = None;
-    loop {
-        let next = tokio::time::timeout(
-            std::time::Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
-            stream.next(),
-        )
-        .await;
-        match next {
-            Ok(Some(cog_core::AssistantMessageEvent::TextDelta { delta, .. })) => {
-                reply.push_str(&delta);
-                emit_delta(&out, &session_id, &assistant_mid, &delta).await;
-            }
-            // Reasoning models (thinking forced on at some endpoints) can
-            // think for tens of seconds before the first text delta. Forward
-            // the thinking stream so the UI shows progress instead of an
-            // empty bubble for the whole reasoning window.
-            Ok(Some(cog_core::AssistantMessageEvent::ThinkingStart { .. })) => {
-                emit(
-                    &out,
-                    &session_id,
-                    "message.thinking_start",
-                    serde_json::json!({ "message_id": assistant_mid }),
-                )
-                .await;
-            }
-            Ok(Some(cog_core::AssistantMessageEvent::ThinkingDelta { delta, .. })) => {
-                emit(
-                    &out,
-                    &session_id,
-                    "message.thinking_delta",
-                    serde_json::json!({ "message_id": assistant_mid, "delta": delta }),
-                )
-                .await;
-            }
-            Ok(Some(cog_core::AssistantMessageEvent::ThinkingEnd { .. })) => {
-                emit(
-                    &out,
-                    &session_id,
-                    "message.thinking_end",
-                    serde_json::json!({ "message_id": assistant_mid }),
-                )
-                .await;
-            }
-            Ok(Some(cog_core::AssistantMessageEvent::Error { error, .. })) => {
-                failure = Some(error.content());
-                break;
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => {
-                failure = Some(format!(
-                    "LLM 响应超时（>{STREAM_IDLE_TIMEOUT_SECS}s 无输出）"
-                ));
-                break;
+    match outcome {
+        Err(err) => {
+            let text = err.to_string();
+            emit_delta(
+                &out,
+                &session_id,
+                &assistant_mid,
+                &format!("LLM 调用失败：{text}"),
+            )
+            .await;
+            failure = Some(text);
+        }
+        // 没有流式增量不等于没有回答：上游可能一次把整段话给回来。这时答案在
+        // 循环的交付物里，不把它接上就会把一轮有答案的对话记成「模型没有返回任何
+        // 内容」——一次答得好好的对话在历史里变成一次失败。
+        Ok(result) if reply.trim().is_empty() => {
+            if let Some(text) = result
+                .get("reply")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+            {
+                emit_delta(&out, &session_id, &assistant_mid, text).await;
+                reply = text.to_string();
             }
         }
+        Ok(_) => {}
     }
 
-    // Reasoning-only replies can arrive with no text deltas at all; fall back
-    // to the final response payload so the user never sees an empty bubble.
-    if failure.is_none() && reply.is_empty() {
-        let final_resp = stream.result().await;
-        if let Some(err) = final_resp.error_message {
-            failure = Some(err);
-        } else {
-            reply = final_resp
-                .content
-                .iter()
-                .filter_map(|b| b.as_text())
-                .collect::<Vec<_>>()
-                .join("");
-            if !reply.is_empty() {
-                emit_delta(&out, &session_id, &assistant_mid, &reply).await;
-            }
+    // 派了活但一个字都没说：气泡不能空着（界面把空回复画成失败），而且用户得知道
+    // 目标号——那是他后面查进展时唯一要用的值。
+    if failure.is_none() && reply.trim().is_empty() {
+        if let Some(goal_id) = journal.goals.first() {
+            let line = format!(
+                "已作为目标 {goal_id} 交给编排器分解执行；分解完成或失败都会回报，\
+                 进度在这段对话标题那一行的「常驻 · 守护」徽章上。"
+            );
+            emit_delta(&out, &session_id, &assistant_mid, &line).await;
+            reply = line;
         }
-    }
-
-    if let Some(err) = &failure {
-        emit_delta(
-            &out,
-            &session_id,
-            &assistant_mid,
-            &format!("LLM 调用失败：{err}"),
-        )
-        .await;
     }
     emit_message_end(&out, &session_id, &assistant_mid).await;
 
     // 5. Record the turn. 失败的那一轮也写：用户说的这句话是对这个平台说过的，
     //    模型没答出来是这一轮的一个事实，不是把它忘掉的许可。空回复按失败写，
     //    因为它对用户而言和一个错误没有分别，而「什么都不写」是最坏的那种差别。
+    //    派了活的那一轮把目标记在记录里：帧只活在连接里，刷新之后历史要能读出
+    //    「这一轮交出去过一道目标」，否则追问「刚才那个目标怎么样了」时模型手里
+    //    什么都没有。
     match (&failure, reply.is_empty()) {
         (Some(err), _) => {
             record_failed_turn(&state.chat_turns, &session_id, &content, err).await;
@@ -549,28 +542,19 @@ pub async fn run_chat_turn(
             )
             .await;
         }
-        (None, false) => record_turn(&state.chat_turns, &session_id, &content, &reply).await,
+        (None, false) => match journal.goals.first() {
+            Some(goal_id) => {
+                record_dispatched_turn(&state.chat_turns, &session_id, &content, &reply, goal_id)
+                    .await
+            }
+            None => record_turn(&state.chat_turns, &session_id, &content, &reply).await,
+        },
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use cog_core::ChatTurnStore;
-
-    /// 判退落在目标行的 `Failed` 上、`submit_goal_auto` 照样返回 `Ok`——所以回报必须
-    /// 读那一行，否则失败会被报成「已受理，进度见右侧」，用户去右侧只会等一个不会来的
-    /// 结果。
-    #[test]
-    fn a_refused_decomposition_is_reported_as_the_failure_the_row_records() {
-        let mut row = cog_core::Task::goal_row("goal-1", "fix the thing");
-        row.status = cog_core::TaskStatus::Failed;
-        row.error = Some("decomposition produced no executable tasks after 3 attempt(s)".into());
-        let text = goal_report("goal-1", Some(&row));
-        assert!(text.contains("分解失败"), "{text}");
-        assert!(text.contains("no executable tasks"), "{text}");
-        assert!(!text.contains("已受理"), "{text}");
-    }
 
     /// 目标身份必须走自己的一帧。
     ///
@@ -593,38 +577,114 @@ mod tests {
         assert_eq!(value["session_id"], "s1");
     }
 
-    /// 分解成功：行还是 Pending（答案要等收口任务跑完才抄回来），但声明已经在了，
-    /// 回报要给出可查的 goal_id 而不是一句「已注入 N 个任务」。
-    #[test]
-    fn an_accepted_goal_is_reported_with_its_id_and_the_pipeline_it_lands_in() {
-        let mut row = cog_core::Task::goal_row("goal-2", "fix the thing");
-        row.sink_task_id = Some("child-7".into());
-        let text = goal_report("goal-2", Some(&row));
-        assert!(text.contains("goal-2"), "{text}");
-        assert!(text.contains("已受理"), "{text}");
-        assert!(!text.contains("分解失败"), "{text}");
+    /// 事件流里说的话变成界面上的字，一轮与一轮之间隔开。
+    ///
+    /// 网关不再自己调模型，它读的是循环发出来的 `MessageUpdate`。这里钉的是那层
+    /// 翻译：增量要逐字发出去，新的一段话要隔一行（否则两轮句子连成一句），而且
+    /// 同一个气泡里说的所有字都要留给记录——帧只活在连接里。
+    #[tokio::test]
+    async fn the_loop_s_events_become_the_frames_the_interface_draws() {
+        use cog_core::{AgentEvent, AssistantMessageEvent};
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(32);
+        let pump = tokio::spawn(pump_events(events_rx, out_tx, "s1".into(), "m-1".into()));
+
+        let update = |event| AgentEvent::MessageUpdate {
+            agent_id: "a".into(),
+            assistant_event: event,
+            timestamp: chrono::Utc::now(),
+        };
+        for piece in ["先说一句", "再说一句"] {
+            events_tx
+                .send(update(AssistantMessageEvent::Start {
+                    timestamp: chrono::Utc::now(),
+                }))
+                .await
+                .unwrap();
+            events_tx
+                .send(update(AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: piece.into(),
+                    timestamp: chrono::Utc::now(),
+                }))
+                .await
+                .unwrap();
+        }
+        drop(events_tx);
+
+        let journal = pump.await.expect("pump finished");
+        assert_eq!(journal.reply, "先说一句\n\n再说一句");
+        assert!(journal.goals.is_empty());
+
+        let mut lines = Vec::new();
+        while let Some(line) = out_rx.recv().await {
+            lines.push(line);
+        }
+        let joined = lines.join("\n");
+        assert_eq!(lines.len(), 3, "三段文字就是三帧：{joined}");
+        assert!(lines[0].contains("先说一句"), "{joined}");
+        assert!(lines[1].contains("\\n\\n"), "两轮之间没有隔行：{joined}");
+        assert!(lines[2].contains("再说一句"), "{joined}");
     }
 
-    /// 没有任何东西会收口时必须说出来：受理了却一条承载答案的任务都没有，用户等的是
-    /// 一件不会发生的事。
-    #[test]
-    fn a_goal_no_task_will_close_says_so_instead_of_pointing_at_the_pipeline() {
-        let row = cog_core::Task::goal_row("goal-3", "fix the thing");
-        assert!(row.sink_task_id.is_none());
-        let text = goal_report("goal-3", Some(&row));
-        assert!(text.contains("不会自己跑完"), "{text}");
-        assert!(
-            !text.contains("进度与最终答案"),
-            "it must not point the user at a pipeline for an answer nothing will produce: {text}"
+    /// 派出去的每个目标都要有自己的那一帧，重复的不发第二遍。
+    ///
+    /// 界面靠这一帧把目标号接到执行者视图上；同一个目标发两帧，界面那边就会看到
+    /// 两个同名条目。
+    #[tokio::test]
+    async fn every_dispatched_goal_gets_one_frame() {
+        use cog_core::AgentEvent;
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let (out_tx, mut out_rx) = mpsc::channel(32);
+        let pump = tokio::spawn(pump_events(events_rx, out_tx, "s1".into(), "m-1".into()));
+
+        // 真事件流是「开始 → 结局」成对的：结局只带调用号，名字在开始那一帧上。
+        let started = |id: &str, tool: &str| AgentEvent::ToolExecutionStart {
+            agent_id: "a".into(),
+            tool_call_id: id.into(),
+            tool_name: tool.into(),
+            args: serde_json::json!({}),
+            timestamp: chrono::Utc::now(),
+        };
+        let ended = |id: &str, result| AgentEvent::ToolExecutionEnd {
+            agent_id: "a".into(),
+            tool_call_id: id.into(),
+            result,
+            is_error: false,
+            timestamp: chrono::Utc::now(),
+        };
+        for (i, goal) in ["goal-1", "goal-1", "goal-2"].into_iter().enumerate() {
+            let id = format!("call-{i}");
+            events_tx.send(started(&id, "dispatch_goal")).await.unwrap();
+            let result = serde_json::json!({ "goal_id": goal });
+            events_tx.send(ended(&id, result)).await.unwrap();
+        }
+        // 别的工具不产生目标帧：这条流上只认派活那一条——哪怕它的返回里也有一个
+        // 目标号（列表会带 goal_id），也不算它派的。
+        events_tx
+            .send(started("call-other", "list_tasks"))
+            .await
+            .unwrap();
+        let other = ended(
+            "call-other",
+            serde_json::json!({ "goal_id": "goal-9", "total_matching": 1 }),
         );
-    }
+        events_tx.send(other).await.unwrap();
+        drop(events_tx);
 
-    /// 一行都没留下（没有 DagExecutor 之类）：报「没被记下」，不报「已受理」。
-    #[test]
-    fn a_submission_that_left_no_row_is_not_reported_as_accepted() {
-        let text = goal_report("goal-4", None);
-        assert!(text.contains("没有被记下"), "{text}");
-        assert!(!text.contains("已受理"), "{text}");
+        let journal = pump.await.expect("pump finished");
+        assert_eq!(
+            journal.goals,
+            vec!["goal-1".to_string(), "goal-2".to_string()]
+        );
+
+        let mut frames = Vec::new();
+        while let Some(line) = out_rx.recv().await {
+            frames.push(line);
+        }
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert!(frames[0].contains("message.goal") && frames[0].contains("goal-1"));
+        assert!(frames[1].contains("goal-2"));
     }
 
     /// 历史从记录里来，不从这个进程的内存里来。

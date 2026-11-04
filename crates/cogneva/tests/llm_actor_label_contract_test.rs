@@ -73,10 +73,9 @@ const PRODUCERS: &[(&str, &[&str])] = &[
         "crates/cog-extension/src/hostdocs_assist.rs",
         &["sandbox-document-organizer"],
     ),
-    (
-        "crates/cog-gateway/src/chat.rs",
-        &["intent_gateway", "web_chat"],
-    ),
+    // 界面上那段对话跑在系统那条循环上，是装配层把脸名装上去的：网关里没有
+    // 循环，也就没有写 actor 的调用点。
+    ("crates/cogneva/src/conversation.rs", &["web_chat"]),
     ("crates/cog-memory/src/extractor.rs", &["memory"]),
     ("crates/cog-reflection/src/evolution.rs", &["evolution"]),
     (
@@ -99,6 +98,11 @@ const THREADED: &[(&str, &str)] = &[
         "reports under the self-review role the agent itself is configured with",
     ),
     (
+        "crates/cog-agent/src/agent_kernel/runtime.rs",
+        "the loop writes whatever face its builder declared; the role family is \
+         only the default — the Web UI conversation gives it a face of its own",
+    ),
+    (
         "crates/cog-agent/src/self_review.rs",
         "each step takes the actor the loop was built with",
     ),
@@ -118,11 +122,16 @@ const EXCLUDED: &[(&str, &str)] = &[
 
 /// Declared values that no call site writes directly, and what writes them.
 ///
-/// Empty as of 2026-11-02: `self_review` was the last entry, and it is written
-/// at a call site now that the review loop stamps its own actor header. The
-/// table stays because the next value a caller stops naming needs a place to
-/// say so with a reason.
-const NOT_WRITTEN_AT_A_CALL_SITE: &[(&str, &str)] = &[];
+/// `self_review` was the last entry before 2026-11-02, and it is written at a
+/// call site now that the review loop stamps its own actor header. The table
+/// stays because the next value a caller stops naming needs a place to say so
+/// with a reason.
+const NOT_WRITTEN_AT_A_CALL_SITE: &[(&str, &str)] = &[(
+    "intent_gateway",
+    "the gateway's own /llm/intent endpoint names it as a value it carries into \
+     `call_one_upstream` and `record_llm_call`, not through `with_actor`; the census \
+     reads call sites, and this one is a variable threaded into the ledger writer",
+)];
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Site {
@@ -140,9 +149,12 @@ enum Site {
 fn sites_in(text: &str) -> Vec<Site> {
     let consts = const_strings(text);
     let mut sites = Vec::new();
+    // 两个入口都读：循环自己挂的那条（`.with_actor(...)` 在请求选项上），以及
+    // 装配方给整条循环换一张脸的那条（`.with_actor_label(...)`）。只读前者会把
+    // 「给某条产出线换了个脸名」这件事整个漏出名单，而那正是这张名单要管的。
     let mut rest = text;
-    while let Some(at) = rest.find(".with_actor(") {
-        rest = &rest[at + ".with_actor(".len()..];
+    while let Some((at, span)) = earliest_actor_call(rest) {
+        rest = &rest[at + span..];
         let Some(arg) = argument(rest) else { continue };
         sites.push(classify(arg, &consts));
     }
@@ -161,6 +173,18 @@ fn sites_in(text: &str) -> Vec<Site> {
     }
     sites.sort();
     sites
+}
+
+/// Where the next actor-writing call begins, and how long its name is.
+///
+/// Both spellings count: `.with_actor` puts a face on one request, and
+/// `.with_actor_label` puts one on a whole loop. Reading only the first would
+/// let a producer declare its face somewhere the census never looks.
+fn earliest_actor_call(text: &str) -> Option<(usize, usize)> {
+    [".with_actor(", ".with_actor_label("]
+        .iter()
+        .filter_map(|needle| text.find(needle).map(|at| (at, needle.len())))
+        .min_by_key(|(at, _)| *at)
 }
 
 /// The text of the first argument of a call whose `(` has just been consumed,
@@ -441,7 +465,7 @@ const TASK_KEYING: &[(&str, TaskKeying)] = &[
         TaskKeying::KeyedBy("沙盒里的那份文档"),
     ),
     (
-        "crates/cog-gateway/src/chat.rs",
+        "crates/cogneva/src/conversation.rs",
         TaskKeying::KeyedBy("一段对话，不是任务"),
     ),
     (
@@ -639,7 +663,9 @@ const CALL_SITES: &[(&str, ActorSource)] = &[
         ActorSource::Forwards,
     ),
     ("crates/cog-eval/src/scaffolds/mod.rs", ActorSource::Stamps),
-    ("crates/cog-gateway/src/chat.rs", ActorSource::Stamps),
+    // 界面的这一轮不再自己叫模型：它把对话交给内核那条循环，身份由
+    // `crates/cogneva/src/conversation.rs` 在构造循环时盖下（那一条在 PRODUCERS 里）。
+    // 这一格删掉而不是改成 `Forwards`——网关手里已经没有请求可递。
     ("crates/cog-llm/src/hot_swap.rs", ActorSource::Forwards),
     ("crates/cog-llm/src/observed.rs", ActorSource::Forwards),
     (

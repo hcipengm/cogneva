@@ -97,6 +97,12 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         // 只是不写下来——那与「写失败」在读数面上是两件事，前者是装配的事。
         let chat_turns: crate::ChatTurnHandle =
             ctx.consume_service::<dyn cog_core::ChatTurnStore>();
+        // 这一段对话要跑的那条循环：句柄由装配层发布，装配层在本插件 `init` 之后
+        // 才把它填上（它要的智能体内核与编排器那时才齐）。空句柄不是错误——它让
+        // 界面上的这一轮明确回答「还没接上」，而不是由网关自己另跑一条循环。
+        let conversation: crate::chat::ConversationHandle = ctx
+            .consume::<crate::chat::ConversationSlot>()
+            .unwrap_or_default();
         let agent_messages: crate::AgentMessageHandle =
             ctx.consume_service::<dyn cog_core::AgentMessageStore>();
         let datasets: Option<Arc<dyn cog_core::DatasetStore>> =
@@ -301,6 +307,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &ctx.consume_service::<dyn cog_core::ChangeLedgerStore>(),
             &key_value,
             &chat_turns,
+            conversation,
             &agent_messages,
             &object_backend,
             &datasets,

@@ -383,6 +383,18 @@ pub struct GatewayState {
     /// Per-session chat history for the WebSocket chat handler
     /// (session_id → messages, oldest first, capped).
     pub chat_turns: ChatTurnHandle,
+    /// The system's own agent loop, handed a conversation turn.
+    ///
+    /// The gateway does not run that loop: reading the ledger, dispatching work
+    /// and watching it happen are the capabilities of the one loop the platform
+    /// runs, and a second implementation of it beside this file would answer
+    /// the same questions with calls no guardrail sees and tokens no census
+    /// counts. The assembly layer implements [`chat::ConversationTurn`] over
+    /// the agent kernel and fills this handle after its plugins are up — the
+    /// orchestrator it needs is published by one of them, so the handle is
+    /// empty at construction and the chat says the wiring is missing rather
+    /// than quietly answering with half the capability.
+    pub conversation: chat::ConversationHandle,
     /// Every command sent to an agent, with what came back. Written by the
     /// send route, read by the conversation view.
     pub agent_messages: AgentMessageHandle,

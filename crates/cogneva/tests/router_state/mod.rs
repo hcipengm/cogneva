@@ -322,6 +322,7 @@ fn build(
         llm_usage: None,
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
+        conversation: Default::default(),
         agent_messages,
         datasets,
     })

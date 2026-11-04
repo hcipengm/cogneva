@@ -12,6 +12,7 @@ pub mod claim_store;
 pub mod cli;
 pub mod config_loader;
 pub mod config_watcher;
+pub mod conversation;
 pub mod daemon;
 pub mod eval_container;
 pub mod eval_hle;
@@ -194,8 +195,34 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
         cog_protocol::convert::ProtoCodec,
     ));
 
+    // 界面上那一轮对话跑的那条循环。槽先发布成空的：填它要的编排器由某个插件在
+    // 下面 `init_all` 里才发布，而网关在同一个 `init_all` 里就要拿到这个槽。空着
+    // 的那段时间界面收到的是「还没接上」——这是有意的读数，不是要藏起来的错误。
+    let conversation: cog_gateway::chat::ConversationHandle = Default::default();
+    ctx.publish(conversation.clone());
+
     plugin_runner.init_all(&ctx).await?;
     cog_observability::boot_footprint::mark("plugins-initialized");
+
+    // 插件都起来了，编排器在手里了：把这一轮对话接到系统唯一的那条智能体循环上。
+    // 填不上就明说——界面据此回答「还没接上」，而不是让网关自己另跑一条循环。
+    match ctx.consume_service::<dyn cog_core::OrchestratorControl>() {
+        Some(orchestrator) => {
+            if conversation
+                .set(Arc::new(crate::conversation::PlatformConversation::new(
+                    orchestrator,
+                )))
+                .is_err()
+            {
+                tracing::warn!("conversation slot was already filled; keeping the first wiring");
+            }
+        }
+        None => {
+            tracing::warn!(
+                "no orchestrator control published — the Web UI chat will answer that it is not wired"
+            );
+        }
+    }
 
     // Register shutdown hook now that RawLogger is available
     if let Some(raw_logger) = ctx.consume_service::<dyn cog_core::RawLogger>() {

@@ -317,6 +317,27 @@ pub struct AgentRuntime {
     /// signal into a hum, and the reader would stop seeing the first one — which
     /// is the only one that says when it started.
     context_overrun_reported: bool,
+    /// Whether this run's deliverable is the reply text itself.
+    ///
+    /// A task run answers with a document the downstream steps read fields out
+    /// of, so its last thought is turned into JSON (and, when the model did not
+    /// write JSON, converted by one more model call). A conversation turn's
+    /// deliverable is the sentence a person is reading on screen: asking a model
+    /// to restate it as JSON would spend a call to change the answer's shape and
+    /// hand back something the interface cannot print.
+    reply_is_the_result: bool,
+    /// The actor label this run's calls carry, when the role family is not the
+    /// right grouping for them. `None` means `agent:<role>`.
+    actor_label: Option<String>,
+    /// Who these calls are spent for, when the caller knows a person.
+    ///
+    /// The task identity on the ledger answers "which job", the owner answers
+    /// "whose quota" — a call made from an interface is charged to the person
+    /// typing, and without this header it lands in the unattributed bucket.
+    call_owner: Option<String>,
+    /// The environment these calls are made from (interactive, pool, ...).
+    /// `None` leaves the upstream default in place.
+    call_origin: Option<String>,
     /// Identity of the run in flight, declared on every LLM call it makes.
     ///
     /// The same id the run reports its own token census under: without it the
@@ -615,6 +636,13 @@ const RESULT_BUILD_TIMEOUT: Duration = Duration::from_secs(180);
 // cap: bound — 它是一次短补全，所以按一回合的一个零头来限：上游慢只该赔掉这个兜底，不该赔掉整轮
 const REFORMAT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The status a conversation turn's result carries when it ends on an answer.
+///
+/// The other endings name themselves in the result already (the budget one is
+/// [`cog_core::contract::outcome::MAX_ITERATIONS_STATUS`]); this is the one an
+/// interface has to tell apart from them to know it has a sentence to print.
+const CONVERSATION_REPLY_STATUS: &str = "completed";
+
 impl AgentRuntime {
     /// Access the loop configuration.
     pub fn config(&self) -> &RuntimeConfig {
@@ -660,6 +688,10 @@ impl AgentRuntime {
             run_iterations: 0,
             run_outcome: None,
             context_overrun_reported: false,
+            reply_is_the_result: false,
+            actor_label: None,
+            call_owner: None,
+            call_origin: None,
         }
     }
 
@@ -741,6 +773,21 @@ impl AgentRuntime {
     /// decision that cannot change is exactly the spend this bounds.
     pub fn with_refusal_policy(mut self, policy: RefusalPolicy) -> Self {
         self.refusal_policy = policy;
+        self
+    }
+
+    /// Declare this run's calls under a face of their own instead of the role
+    /// family. The value must be one the actor label set admits.
+    pub fn with_actor_label(mut self, label: impl Into<String>) -> Self {
+        self.actor_label = Some(label.into());
+        self
+    }
+
+    /// Charge this run's calls to a person, and declare the environment they
+    /// are made from.
+    pub fn with_call_identity(mut self, owner: impl Into<String>, origin: &str) -> Self {
+        self.call_owner = Some(owner.into());
+        self.call_origin = Some(origin.to_string());
         self
     }
 
@@ -1057,7 +1104,7 @@ impl AgentRuntime {
             cache_retention: cog_core::CacheRetention::Short,
             ..Default::default()
         }
-        .with_actor(&format!("agent:{}", self.config.role));
+        .with_actor(&self.actor_label());
         let options = self.stamp_task(options);
 
         llm.chat_stream(&messages, &options).await
@@ -1078,6 +1125,18 @@ impl AgentRuntime {
         self.config.owner_task_id.as_deref().or(run_task_id)
     }
 
+    /// The actor label this run's calls carry.
+    ///
+    /// A role's runs group under the role family (`agent:<role>`), which is what
+    /// the cost views read. A run whose calls belong to a face of their own —
+    /// the interface conversation is the one that exists — names it here, and
+    /// the label still comes from the closed set the edge admits.
+    fn actor_label(&self) -> String {
+        self.actor_label
+            .clone()
+            .unwrap_or_else(|| format!("agent:{}", self.config.role))
+    }
+
     /// Put the run's identity on a call's headers, when there is one.
     ///
     /// The task identity is known only to whoever started the run; the
@@ -1086,6 +1145,16 @@ impl AgentRuntime {
     /// without an identity makes unlabelled calls rather than a made-up one,
     /// because a made-up id reads as a real job on the ledger.
     fn stamp_task(&self, options: cog_core::ChatOptions) -> cog_core::ChatOptions {
+        // Charged to a person, when there is one: the same call the interface's
+        // own completion path used to stamp, now stamped where the call is made.
+        let options = match self.call_owner.as_deref() {
+            Some(owner) => options.with_owner(owner),
+            None => options,
+        };
+        let options = match self.call_origin.as_deref() {
+            Some(origin) => options.with_origin(origin),
+            None => options,
+        };
         match self.ledger_task_id(self.run_task_id.as_deref()) {
             Some(task) => options.with_task(task),
             None => options,
@@ -1110,11 +1179,56 @@ impl AgentRuntime {
         llm: &dyn cog_core::LlmClient,
         run_task_id: Option<&str>,
     ) -> SFResult<serde_json::Value> {
-        // The census is a property of this run, so it starts here and is
-        // reported from exactly one place — the run's only exit. Doing it at
-        // the answer-recording site instead would leave every run that ended
-        // any other way (budget spent, upstream error, stall) unmeasured, and
-        // those are the runs a token investigation is about.
+        let started = self.begin_scoped_run(run_task_id);
+        let outcome = self.run_turns(input, llm, run_task_id).await;
+        self.finish_scoped_run(run_task_id, started, outcome).await
+    }
+
+    /// Run one turn of a conversation the caller has already assembled.
+    ///
+    /// This is the entry the interface conversation uses. It exists because the
+    /// capability that conversation needs — read the ledgers, dispatch work,
+    /// watch it — is the loop this file already runs, and a second loop written
+    /// beside it would answer the same questions a second way: its tool calls
+    /// would not pass the guardrail, its tokens would not reach the census, and
+    /// the events it produced would not be on the bus. What differs between a
+    /// task attempt and a conversation turn is only where the input comes from:
+    /// here the caller hands over the whole history (system prompt, earlier
+    /// exchanges, this turn's sentence) and the loop starts from it.
+    pub async fn run_conversation(
+        &mut self,
+        messages: Vec<Message>,
+        llm: &dyn cog_core::LlmClient,
+    ) -> SFResult<serde_json::Value> {
+        let started = self.begin_scoped_run(None);
+        let outcome = self.run_conversation_turns(messages, llm).await;
+        self.finish_scoped_run(None, started, outcome).await
+    }
+
+    async fn run_conversation_turns(
+        &mut self,
+        messages: Vec<Message>,
+        llm: &dyn cog_core::LlmClient,
+    ) -> SFResult<serde_json::Value> {
+        self.reply_is_the_result = true;
+        self.begin_run(None).await?;
+        // The caller's history is this turn's whole context. Anything left from
+        // an earlier turn would be a conversation the model was never given.
+        self.context.clear();
+        for message in messages {
+            self.context.add_message(message);
+        }
+        self.run_loop(llm, None).await
+    }
+
+    /// The prologue every run shares, whichever way its input arrives.
+    ///
+    /// The census is a property of this run, so it starts here and is reported
+    /// from exactly one place — the run's only exit. Doing it at the
+    /// answer-recording site instead would leave every run that ended any other
+    /// way (budget spent, upstream error, stall) unmeasured, and those are the
+    /// runs a token investigation is about.
+    fn begin_scoped_run(&mut self, run_task_id: Option<&str>) -> std::time::Instant {
         self.run_usage = RunUsage::default();
         self.run_iterations = 0;
         // 换了一次运行就是一个新的额度：上一轮报过的那次超大 prompt，不能替这一轮
@@ -1124,11 +1238,19 @@ impl AgentRuntime {
         // Set before the first call and cleared at the only exit, so a run that
         // was started without an identity cannot inherit the previous one.
         self.run_task_id = run_task_id.map(str::to_string);
-        let started = std::time::Instant::now();
-        let outcome = self.run_turns(input, llm, run_task_id).await;
+        std::time::Instant::now()
+    }
+
+    /// ... and its epilogue, for the same reason.
+    async fn finish_scoped_run(
+        &mut self,
+        run_task_id: Option<&str>,
+        started: std::time::Instant,
+        outcome: SFResult<serde_json::Value>,
+    ) -> SFResult<serde_json::Value> {
         self.report_run_census(run_task_id, started.elapsed()).await;
         self.report_skill_outcome(started.elapsed()).await;
-        // 一跑以错误收场，就在这一处报出去：`run_turns` 的三个出口都汇到这里，
+        // 一跑以错误收场，就在这一处报出去：`run_loop` 的三个出口都汇到这里，
         // 逐出口去报就得在每一处重写一遍「报过没有」，而漏掉的那一处正好是
         // 读者最想知道的那一种结局。
         if let Err(ref e) = outcome {
@@ -1432,13 +1554,13 @@ impl AgentRuntime {
         Message::tool_result_text(tool_call_id, tool_name, cut.text)
     }
 
-    /// The run itself, from the first turn to its answer.
-    async fn run_turns(
-        &mut self,
-        input: serde_json::Value,
-        llm: &dyn cog_core::LlmClient,
-        run_task_id: Option<&str>,
-    ) -> SFResult<serde_json::Value> {
+    /// 一次运行的开头：清空这次运行的状态，并在总线上宣布开跑。
+    ///
+    /// 任务的一次尝试（[`Self::run_turns`]）与调用方给好历史的一段对话
+    /// （[`Self::run_conversation`]）都要这一下。放在一处，两条入口就不会
+    /// 用两种方式声明同一次开始；而循环本身同在一处，两条入口也就不会跑出
+    /// 两种工具行为。
+    async fn begin_run(&mut self, run_task_id: Option<&str>) -> SFResult<()> {
         tracing::info!(agent_id = %self.config.agent_id, task_id = run_task_id.unwrap_or(""), "AgentRuntime::run started");
         self.state = RuntimeState::Idle;
         self.steps.clear();
@@ -1450,7 +1572,17 @@ impl AgentRuntime {
             squad_id: None,
             timestamp: self.start_time.unwrap(),
         })
-        .await?;
+        .await
+    }
+
+    /// The run itself, from the first turn to its answer.
+    async fn run_turns(
+        &mut self,
+        input: serde_json::Value,
+        llm: &dyn cog_core::LlmClient,
+        run_task_id: Option<&str>,
+    ) -> SFResult<serde_json::Value> {
+        self.begin_run(run_task_id).await?;
 
         // The stable half of the input document (the answer contract) is hoisted
         // to the front on its own. The whole document serializes in JSON key
@@ -1491,6 +1623,18 @@ impl AgentRuntime {
             .unwrap_or_else(|| cog_core::contract::prompt::render_varying_half(&payload));
         self.context.add_message(Message::user(rendered));
 
+        self.run_loop(llm, run_task_id).await
+    }
+
+    /// 一段运行的主体：从第一条回合到三个出口之一（交付、预算用尽、被规则拦下）。
+    ///
+    /// 与任务输入那一段分开，不是给对话开一条新路：输入怎么来是两条入口唯一的
+    /// 差别，进来之后怎样调工具、怎样过守卫、怎样记预算与结局，只有这一份。
+    async fn run_loop(
+        &mut self,
+        llm: &dyn cog_core::LlmClient,
+        run_task_id: Option<&str>,
+    ) -> SFResult<serde_json::Value> {
         // Guardrail refusals, counted per identical call for this run. A refusal
         // is a decision about the call as written: the same name and the same
         // arguments will be refused again, so a second one is not a retry that
@@ -2071,22 +2215,27 @@ impl AgentRuntime {
             }
         };
         self.state = RuntimeState::Complete;
-        let result = match tokio::time::timeout(
-            RESULT_BUILD_TIMEOUT,
-            self.build_result(&draft, llm),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                let err = SFError::Agent(format!(
-                    "AgentRuntime::build_result timed out after {}s for agent {}",
-                    RESULT_BUILD_TIMEOUT.as_secs(),
-                    self.config.agent_id
-                ));
-                tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime build_result timeout");
-                return Err(err);
+        let result = if self.reply_is_the_result {
+            // The reply is the answer. It was already through the output gate
+            // above; nothing downstream reads a field out of it, and the reader
+            // is the person in front of the screen.
+            serde_json::json!({
+                "status": CONVERSATION_REPLY_STATUS,
+                "reply": draft.clone(),
+            })
+        } else {
+            match tokio::time::timeout(RESULT_BUILD_TIMEOUT, self.build_result(&draft, llm)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    let err = SFError::Agent(format!(
+                        "AgentRuntime::build_result timed out after {}s for agent {}",
+                        RESULT_BUILD_TIMEOUT.as_secs(),
+                        self.config.agent_id
+                    ));
+                    tracing::warn!(agent_id = %self.config.agent_id, error = %err, "AgentRuntime build_result timeout");
+                    return Err(err);
+                }
             }
         };
 
@@ -2234,7 +2383,7 @@ impl AgentRuntime {
             cache_retention: cog_core::CacheRetention::Short,
             ..Default::default()
         }
-        .with_actor(&format!("agent:{}", self.config.role));
+        .with_actor(&self.actor_label());
         let options = self.stamp_task(options);
 
         // 同一份请求在上游自报的等待之内只发一次。上面重放它的那些层（pipeline
@@ -2473,7 +2622,7 @@ impl AgentRuntime {
             temperature: Some(0.1),
             ..Default::default()
         }
-        .with_actor(&format!("agent:{}", self.config.role));
+        .with_actor(&self.actor_label());
         let options = self.stamp_task(options);
 
         match tokio::time::timeout(REFORMAT_TIMEOUT, llm.chat(&[user_msg], &options)).await {

@@ -91,6 +91,7 @@ pub async fn build_gateway_state(
     change_ledger: &Option<Arc<dyn cog_core::ChangeLedgerStore>>,
     key_value: &Option<Arc<dyn cog_core::KeyValueStore>>,
     chat_turns: &crate::ChatTurnHandle,
+    conversation: crate::chat::ConversationHandle,
     agent_messages: &crate::AgentMessageHandle,
     object_backend: &Option<Arc<dyn cog_core::ObjectBackend>>,
     datasets: &Option<Arc<dyn cog_core::DatasetStore>>,
@@ -195,6 +196,7 @@ pub async fn build_gateway_state(
         llm_usage: llm_usage.clone(),
         llm_client: Arc::new(std::sync::RwLock::new(None)),
         chat_turns: chat_turns.clone(),
+        conversation,
         agent_messages: agent_messages.clone(),
         datasets: datasets.clone(),
     });

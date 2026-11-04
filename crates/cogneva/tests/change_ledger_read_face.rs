@@ -599,6 +599,7 @@ fn state_with(
         llm_usage,
         llm_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
         chat_turns: None,
+        conversation: Default::default(),
         agent_messages: None,
         datasets: None,
     })
