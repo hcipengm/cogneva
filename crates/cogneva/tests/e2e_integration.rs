@@ -79,10 +79,14 @@ async fn spawn_app_full(
     let jwt_manager: Arc<dyn cog_core::AuthProvider> =
         Arc::new(JwtManager::new(JwtConfig::default()));
     // Generous default so a single request doesn't exhaust quota during E2E.
-    let quota_manager = Arc::new(QuotaManager::new(
+    // The quota view reads the hierarchy's projected cells; it keeps no account
+    // of its own, so this ceiling is the same one enforcement would judge a
+    // call against.
+    let quota_hierarchy = Arc::new(cog_quota::HierarchyManager::new(
         Arc::new(cog_storage::RedisKeyValueStore::new(redis_conn)),
-        1_000_000_000,
+        cog_core::QuotaLimits::new(800_000_000, 1_000_000_000),
     ));
+    let quota_manager = Arc::new(QuotaManager::new(quota_hierarchy));
 
     let raw_logger = Arc::new(MemoryRawLogger::new());
     let raw_logger_clone: Arc<dyn RawLogger> = raw_logger.clone();
@@ -564,8 +568,17 @@ async fn e2e_a_management_call_is_not_refused_by_the_token_allowance() {
         let Some(mut conn) = common::redis::open().await else {
             return;
         };
-        let key = format!("quota:remaining:{}", user_id);
-        let _: () = conn.set_ex(&key, 0u64, 60u64).await.unwrap();
+        // Exhaust the ceiling the way a deployment does: the projection cell
+        // carries today's spend, and the ceiling is the declared pair. Seeding
+        // a balance of its own would be a second book — and this endpoint used
+        // to read exactly such a key, which nothing wrote.
+        let limits = format!("quota:user:limits:{user_id}");
+        let used = format!("quota:user:used:{user_id}");
+        let _: () = conn
+            .set_ex(&limits, r#"{"soft_limit":80,"hard_limit":100}"#, 60u64)
+            .await
+            .unwrap();
+        let _: () = conn.set_ex(&used, 100u64, 60u64).await.unwrap();
     }
 
     // Build a token for that exact user so the middleware matches user_id.

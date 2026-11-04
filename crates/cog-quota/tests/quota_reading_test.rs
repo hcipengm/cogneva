@@ -16,12 +16,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use cog_core::{KeyValueStore, Observable};
+use cog_core::{HierarchyManager as _, KeyValueStore, Observable};
 use cog_quota::{QuotaManager, QuotaObservable};
 
-/// An in-memory [`KeyValueStore`] holding the shapes the quota manager uses:
-/// strings with an optional expiry it does not honour, and the integer
-/// increments `finalize` applies to the daily counters. The set and hash
+/// An in-memory [`KeyValueStore`] holding the shapes the quota hierarchy uses:
+/// strings with an optional expiry it does not honour. The set and hash
 /// operations are the driver's, and no test here reaches them.
 #[derive(Default)]
 struct FakeStore {
@@ -115,8 +114,17 @@ impl KeyValueStore for FakeStore {
     }
 }
 
-fn manager(daily_limit: u64) -> QuotaManager {
-    QuotaManager::new(Arc::new(FakeStore::default()), daily_limit)
+/// A manager reading a hierarchy whose default ceiling is `daily_limit`.
+///
+/// The hierarchy is returned beside the view because the spend a test compares
+/// against is written by the projection, not by the view: `set_used` is the one
+/// writer of a day's cell, exactly as the ledger projection is in a deployment.
+fn manager(daily_limit: u64) -> (QuotaManager, Arc<cog_quota::HierarchyManager>) {
+    let hierarchy = Arc::new(cog_quota::HierarchyManager::new(
+        Arc::new(FakeStore::default()),
+        cog_core::QuotaLimits::new(daily_limit * 4 / 5, daily_limit),
+    ));
+    (QuotaManager::new(hierarchy.clone()), hierarchy)
 }
 
 /// The value of the cell carrying `allowed=<value>`, or `None` when the family
@@ -135,7 +143,7 @@ fn cell(metrics: &[cog_core::RawMetric], allowed: &str) -> Option<f64> {
 
 #[tokio::test]
 async fn a_decision_moves_the_counter_that_reports_it() {
-    let quota = manager(100);
+    let (quota, hierarchy) = manager(100);
     let observable = QuotaObservable::new(quota.readings());
 
     // An empty process reports both cells at zero rather than reporting
@@ -146,7 +154,14 @@ async fn a_decision_moves_the_counter_that_reports_it() {
     assert_eq!(cell(&before, "false"), Some(0.0), "{before:?}");
 
     assert!(quota.pre_check("u1", None, 50).await.allowed);
-    // 50 of the 100 are gone, so a check costing 100 cannot be admitted.
+    // 50 of the 100 are gone, so a check costing 100 cannot be admitted. The
+    // spend is written where the projection writes it; asking the check must
+    // not move the cell itself, or the reading would drift from the ledger it
+    // is computed from.
+    hierarchy
+        .set_used(cog_core::QuotaScope::User, "u1", 50)
+        .await
+        .unwrap();
     assert!(!quota.pre_check("u1", None, 100).await.allowed);
 
     let after = observable.collect_metrics("").await.unwrap();
@@ -159,7 +174,7 @@ async fn the_counters_are_shared_with_every_clone_of_the_manager() {
     // The gateway holds its own clone of the manager and refuses through that
     // one, while the observable was built over the original. Per-instance
     // counters would leave this reading at zero through every refusal.
-    let quota = manager(100);
+    let (quota, _hierarchy) = manager(100);
     let observable = QuotaObservable::new(quota.readings());
     let as_the_gateway_holds_it: Arc<dyn cog_core::QuotaManager> = Arc::new(quota.clone());
 
@@ -176,7 +191,7 @@ async fn the_counters_are_shared_with_every_clone_of_the_manager() {
 
 #[tokio::test]
 async fn the_family_renders_as_a_counter_under_the_name_the_rule_reads() {
-    let quota = manager(100);
+    let (quota, _hierarchy) = manager(100);
     let observable = QuotaObservable::new(quota.readings());
     assert!(!quota.pre_check("u1", None, 101).await.allowed);
 
@@ -208,7 +223,7 @@ async fn the_reading_is_the_same_under_every_dimension() {
     // empty declaration is the truth only while the reading does not vary by
     // dimension -- otherwise the collector would be asking once and publishing
     // one dimension's number for all of them.
-    let quota = manager(100);
+    let (quota, _hierarchy) = manager(100);
     let observable = QuotaObservable::new(quota.readings());
     quota.pre_check("u1", None, 10).await;
 

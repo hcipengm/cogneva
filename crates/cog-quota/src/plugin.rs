@@ -34,7 +34,13 @@ impl cog_core::SystemPlugin for QuotaPlugin {
 
         let store = ctx.require_service::<dyn cog_core::KeyValueStore>()?;
 
-        let quota_manager = Arc::new(crate::QuotaManager::new(store.clone(), 50_000));
+        // The hierarchy is built first and handed to the single-level view, so
+        // both read the same cells and the same default ceiling. Building two
+        // managers over one store would let a reader and the enforcement
+        // disagree about what "the ceiling" is whenever nobody declared one.
+        let hierarchy_manager = Arc::new(crate::HierarchyManager::from_store(store.clone()));
+        let hm_service: Arc<dyn cog_core::HierarchyManager> = hierarchy_manager.clone();
+        let quota_manager = Arc::new(crate::QuotaManager::new(hm_service.clone()));
         ctx.publish(quota_manager.clone());
         // The manager's decisions, published while initialising: the metrics
         // endpoint takes its snapshot of the observables during init, so a
@@ -48,7 +54,6 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         ctx.publish_service(workspace_quota_dyn);
         info!("QuotaPlugin quota manager published");
 
-        let hierarchy_manager = Arc::new(crate::HierarchyManager::from_store(store.clone()));
         ctx.publish(hierarchy_manager.clone());
         // The reader takes `dyn cog_core::HierarchyManager` through the
         // service table, which is a different pin than the concrete value
@@ -57,7 +62,6 @@ impl cog_core::SystemPlugin for QuotaPlugin {
         // silently skipped. Published both ways, exactly as the quota
         // manager is just above: the value-typed pin for a concrete
         // reader, the service pin for the trait-object one.
-        let hm_service: Arc<dyn cog_core::HierarchyManager> = hierarchy_manager;
         ctx.publish_service(hm_service);
         info!("QuotaPlugin hierarchy manager published");
 

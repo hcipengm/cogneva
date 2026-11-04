@@ -1,10 +1,13 @@
-//! Helpers shared by the managers that keep counters in a key-value store.
+//! Helpers for the managers that keep counters in a key-value store.
 //!
-//! Both [`crate::quota::QuotaManager`] and
-//! [`crate::hierarchy::HierarchyManager`] read the same shapes out of the same
-//! contract, so the two conversions live here once rather than once per
-//! manager — two copies would be two answers to "what does an unreadable
-//! counter mean".
+//! [`crate::hierarchy::HierarchyManager`] and the per-task budget keep the same
+//! shapes out of the same contract, so the two conversions live here once rather
+//! than once per manager — two copies would be two answers to "what does an
+//! unreadable counter mean".
+//!
+//! The single-level view ([`crate::quota::QuotaManager`]) is not one of them: it
+//! keeps nothing in the store and reads the hierarchy instead, so it never
+//! interprets a stored value of its own.
 
 use crate::error::QuotaError;
 use cog_core::KeyValueStore;

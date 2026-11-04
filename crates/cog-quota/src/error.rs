@@ -13,6 +13,9 @@ pub enum QuotaError {
     #[error("Invalid task type: {0}")]
     InvalidTaskType(String),
 
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+
     #[error("Database error: {0}")]
     DatabaseError(String),
 

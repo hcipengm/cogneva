@@ -33,7 +33,9 @@
 //! the ledger on a period, and a call is judged against whatever ceiling an
 //! operator declared for the person whose names that ledger resolves to. The
 //! cell and the ledger are one fact, so there is nothing to reconcile between
-//! them.
+//! them. The routes that report a balance read that same cell
+//! ([`quota::QuotaManager`]); they keep no balance of their own, so what a
+//! customer is shown cannot drift from what enforcement allowed.
 //!
 //! The workspace, team and organization levels above it still have no writer,
 //! and that stays deliberate: nothing on the platform says which of those a
@@ -63,7 +65,7 @@ pub use hierarchy::{refusal_for, DailyCapRefusal, HierarchyManager};
 pub use metrics::QuotaMetrics;
 pub use model::{ModelConfig, ModelRegistry, TaskType};
 pub use observable::{QuotaObservable, QuotaReadings};
-pub use quota::{DailyUsage, QuotaChecker, QuotaManager};
+pub use quota::{QuotaChecker, QuotaManager};
 pub use task_budget::{verdict as task_budget_verdict, TaskBudgetDecision, TaskBudgetManager};
 
 // Re-export core DTOs so consumers see them under cog_quota::* as before.

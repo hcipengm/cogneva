@@ -106,10 +106,11 @@ async fn build_test_state() -> Option<AutonomousTestState> {
     // Redis, and a red run there would be a statement about the sandbox
     // rather than about the change under test.
     let redis_conn = common::redis::open().await?;
-    let quota_manager = Arc::new(cog_quota::QuotaManager::new(
+    let quota_hierarchy = Arc::new(cog_quota::HierarchyManager::new(
         Arc::new(cog_storage::RedisKeyValueStore::new(redis_conn)),
-        1_000_000_000,
+        cog_core::QuotaLimits::new(800_000_000, 1_000_000_000),
     ));
+    let quota_manager = Arc::new(cog_quota::QuotaManager::new(quota_hierarchy));
 
     let raw_logger: Arc<dyn cog_core::RawLogger> = Arc::new(NoopRawLogger::new());
     let metrics_backend: Arc<dyn cog_core::MetricsBackend> = Arc::new(MemoryMetricsBackend::new());

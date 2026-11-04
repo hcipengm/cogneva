@@ -339,6 +339,8 @@ mod project_contract;
 mod promotion_eval_row_is_dispatchable_contract_test;
 #[path = "publish_paths_share_one_wiring_ledger.rs"]
 mod publish_paths_share_one_wiring_ledger;
+#[path = "quota_read_face_is_the_projection_test.rs"]
+mod quota_read_face_is_the_projection_test;
 #[path = "raw_stream_words_are_words_both_sides_write_test.rs"]
 mod raw_stream_words_are_words_both_sides_write_test;
 #[path = "reading_series_have_a_producer_test.rs"]
