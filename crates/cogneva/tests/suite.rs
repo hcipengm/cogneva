@@ -77,6 +77,8 @@ mod a_successful_write_rings_the_bell;
 mod a_waiting_reason_is_declared_once_test;
 #[path = "a_word_written_out_is_the_word_read_back_test.rs"]
 mod a_word_written_out_is_the_word_read_back_test;
+#[path = "a_worker_can_ask_to_change_the_system_test.rs"]
+mod a_worker_can_ask_to_change_the_system_test;
 #[path = "a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test.rs"]
 mod a_workload_that_runs_a_standalone_command_can_reach_the_log_backend_test;
 #[path = "agent_consumer_test.rs"]

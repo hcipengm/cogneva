@@ -205,6 +205,24 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
     plugin_runner.init_all(&ctx).await?;
     cog_observability::boot_footprint::mark("plugins-initialized");
 
+    // 申请改自己：装在**共用**的那张工具表上，不是某一段对话私有的那张。
+    //
+    // 出去干活的同事拿的就是这张表（派活的那个池子按它建每个 worker），所以装
+    // 在这里它们才说得出「我想把这里改成那样」。只给界面装，等于只有坐在聊天框
+    // 里的那一位有这条通道，而系统里真正在改自己的是别的同事。
+    //
+    // 不装进内核的 `register_builtins`：那只构造函数不认识判据载体那份名单，
+    // 而申请要拒绝的正好是那份名单——名单在反射那一侧，装配根是唯一同时看得见
+    // 两边的地方。申请人由调用时的派发方给出，见 `self_change::tool_for_caller`。
+    if let Some(tools) = ctx.consume::<cog_agent::ToolRegistry>() {
+        cog_core::ToolRegistry::register(
+            &*tools,
+            crate::self_change::tool_for_caller(
+                ctx.consume_service::<dyn cog_core::ChangeLedgerStore>(),
+            ),
+        );
+    }
+
     // 插件都起来了，编排器在手里了：把这一轮对话接到系统唯一的那条智能体循环上。
     // 填不上就明说——界面据此回答「还没接上」，而不是让网关自己另跑一条循环。
     match ctx.consume_service::<dyn cog_core::OrchestratorControl>() {

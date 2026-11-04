@@ -328,11 +328,11 @@ pub fn goal_for(source: &OutwardSource, item: &OutwardItem) -> String {
         }
         goal.push('\n');
     }
-    // The tool is named rather than assumed: this process registers it on the
-    // chat surface today, and a taker in a process that does not have it still
-    // has to produce the three things a change application consists of. Asking
-    // for the answer rather than for a particular call keeps the item workable
-    // wherever it lands.
+    // The tool is named rather than assumed: an assembly that publishes a change
+    // account registers it on the shared tool table, and a taker in one that does
+    // not still has to produce the three things a change application consists of.
+    // Asking for the answer rather than for a particular call keeps the item
+    // workable wherever it lands.
     goal.push_str(
         "这是本系统之外的一条动态。判断它是否影响这个平台：有影响就说清影响到哪里\
          （哪个文件、哪条配置、哪条行为），并把它变成一条变更申请——要改的路径、\

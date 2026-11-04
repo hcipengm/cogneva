@@ -154,6 +154,35 @@ fn one_line(text: &str) -> String {
 /// 账缺席时不假装「已经记下了」——一个没有账的进程记不住任何申请，回一句
 /// 「已受理」会让申请者以为它在账上等着，而它哪儿也没去。
 pub fn tool(changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>, asker: String) -> Tool {
+    let fixed = Arc::new(asker);
+    build(changes, Arc::new(move || (*fixed).clone()))
+}
+
+/// 派发方没有声明身份时，这条申请在账上读作谁提的。
+///
+/// 编一个名字会让「没有人说」读成「就是这个人要的」，而账的那一列是申请人。
+/// 说「没有人说」至少读得出这一点：这一行是真的，只是提它的人没被记下。
+pub const UNATTRIBUTED_ASKER: &str = "unattributed";
+
+/// 同一个工具，申请人由**调用时**的派发方给出。
+///
+/// 工具在进程里只注册一次、每个 agent 共用一张表，所以处理函数自己的状态说不
+/// 出是谁在调用；派活的那一侧知道，它在 await 期间把 agent id 放在任务局部
+/// 里（`cog_agent::tools::caller_agent_id`）。写死一个名字会让所有同事的申请
+/// 都记成同一个人提的——「谁要的」不是能从别处推出来的，它是账上那一行的字段。
+pub fn tool_for_caller(changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>) -> Tool {
+    build(
+        changes,
+        Arc::new(|| {
+            cog_agent::tools::caller_agent_id().unwrap_or_else(|| UNATTRIBUTED_ASKER.to_string())
+        }),
+    )
+}
+
+fn build(
+    changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
+    asker: Arc<dyn Fn() -> String + Send + Sync>,
+) -> Tool {
     let handler: ToolHandler = Arc::new(move |args: serde_json::Value| {
         let changes = changes.clone();
         let asker = asker.clone();
@@ -175,7 +204,7 @@ pub fn tool(changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>, asker: String
                     .unwrap_or_default()
                     .to_string(),
             };
-            let reading = match proposal.reading(&asker) {
+            let reading = match proposal.reading(&asker()) {
                 Ok(reading) => reading,
                 Err(refusal) => return Ok(refusal.answer()),
             };
