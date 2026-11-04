@@ -1012,11 +1012,15 @@ async fn declare_unclaimed_commits(
         if !(0..=horizon).contains(&age) {
             continue;
         }
-        announced.insert(rev.clone());
-        handled += 1;
         let form = match declaration_form(tree, at, rev).await {
-            Ok(Ok(form)) => form,
+            Ok(Ok(form)) => {
+                announced.insert(rev.clone());
+                handled += 1;
+                form
+            }
             Ok(Err(why)) => {
+                announced.insert(rev.clone());
+                handled += 1;
                 warn!(
                     rev = %rev,
                     age_seconds = age,
@@ -1028,12 +1032,17 @@ async fn declare_unclaimed_commits(
                 continue;
             }
             Err(why) => {
+                // Neither answered nor charged against the cap: a tree that
+                // could not be read this pass says nothing about the commit, and
+                // the commit is fresh for only a couple of passes -- giving up
+                // on it here would leave the work unaccounted for the one reason
+                // that might not be true.
                 warn!(
                     rev = %rev,
                     age_seconds = age,
                     why = %why,
                     "change ledger: a commit that touched product code named no change, and \
-                     its diff cannot be read, so no declaration can be queued for it"
+                     its diff cannot be read, so no declaration can be queued for it this pass"
                 );
                 continue;
             }
@@ -13223,6 +13232,54 @@ diff --git a/x.rs b/x.rs
         assert!(
             store.declarations().is_empty(),
             "an old commit is counted, not declared"
+        );
+    }
+
+    /// A tree that cannot be read is not an answer about the commit: the next
+    /// pass asks again rather than leaving the work unaccounted for the one
+    /// reason that might not be true.
+    #[tokio::test]
+    async fn a_commit_whose_tree_cannot_be_read_is_asked_again_on_the_next_pass() {
+        let (dir, bare, work) = scratch_repo();
+        let work_path = std::path::Path::new(&work);
+        std::fs::create_dir_all(work_path.join("crates/thing")).expect("the fixture directory");
+        std::fs::write(work_path.join("crates/thing/kept.rs"), "pub struct Kept;\n")
+            .expect("the fixture file");
+        commit_all(&bare, &work, "add the thing");
+
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let window = tree
+            .landing_log_touching(LANDING_LOG_COMMITS, PRODUCT_CODE_PATH)
+            .await
+            .expect("the window reads");
+        let store = FakeLedger::default();
+        let mut announced = HashSet::new();
+
+        declare_unclaimed_commits(
+            &store,
+            &tree,
+            "no-such-revision",
+            &window,
+            &HashSet::new(),
+            &mut announced,
+        )
+        .await;
+        assert!(
+            store.declarations().is_empty(),
+            "nothing can be declared about a tree that was not read"
+        );
+        assert!(
+            announced.is_empty(),
+            "the commit is unanswered, not answered with a failure"
+        );
+
+        let at = tree.rev().await.expect("the fixture resolves");
+        declare_unclaimed_commits(&store, &tree, &at, &window, &HashSet::new(), &mut announced)
+            .await;
+        assert_eq!(
+            store.declarations().len(),
+            1,
+            "the pass that can read the tree declares what the blind one could not"
         );
     }
 
