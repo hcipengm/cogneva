@@ -9,12 +9,17 @@
 //! For each `(scope, id)`:
 //! | key                                   | meaning                         |
 //! |---------------------------------------|---------------------------------|
-//! | `quota:<scope>:remaining:<id>`        | remaining tokens (today)        |
 //! | `quota:<scope>:used:<id>`             | tokens spent today (ledger projection) |
 //! | `quota:<scope>:limits:<id>`           | JSON `QuotaLimits`              |
 //! | `quota:<scope>:history:<id>:<YYYYMMDD>` | per-day used token history    |
 //! All counters carry a TTL until the next UTC midnight, so daily reset is
 //! automatic.
+//!
+//! Remaining has no key. It is `hard_limit - used` computed at each decision,
+//! because a stored remainder would be a second number that can disagree with
+//! the spend it is derived from -- a second book, which is exactly what the
+//! projection above replaced. A reader asking for it should ask
+//! [`HierarchyManager::check`], not a key.
 
 use chrono::Utc;
 use std::sync::Arc;

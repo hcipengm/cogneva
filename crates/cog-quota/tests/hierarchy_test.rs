@@ -275,6 +275,41 @@ async fn projecting_the_same_ledger_twice_leaves_the_cell_at_that_value() {
     assert_eq!(history[0].tokens_used, 35);
 }
 
+/// 剩余额度是一个**算出来的**数，没有键：存一份剩余就是存第二个数。
+///
+/// 格子已经被投影接管之后，再存一个 `remaining` 就等于给同一件事留两处记录——
+/// 投影覆盖了花销、没人覆盖余量，两处第一次有人手工改或者键被淘汰时就开始分叉，
+/// 而分叉之后没有任何读数比得出来。判定读的是 `hard_limit - used`，两样都是当场
+/// 就能读到的正本：上限在 limits 键里，花销在投影格子里。
+#[tokio::test]
+async fn remaining_is_derived_at_the_decision_and_never_stored() {
+    let store = Arc::new(FakeStore::default());
+    let mgr = HierarchyManager::new(store.clone(), QuotaLimits::new(80, 100));
+    let user = "ti8:user";
+    let ctx = QuotaContext {
+        user_id: Some(user.to_string()),
+        ..Default::default()
+    };
+    mgr.project_used(QuotaScope::User, user, 35)
+        .await
+        .expect("project ok");
+
+    let d = mgr.check(&ctx, 0).await;
+    assert_eq!(d.scopes[0].used_today, 35);
+    assert_eq!(
+        d.scopes[0].remaining, 65,
+        "剩余额度是 hard_limit - used 算出来的，不是另存的一个数"
+    );
+    assert!(
+        store
+            .get(&format!("quota:user:remaining:{}", user))
+            .await
+            .expect("read ok")
+            .is_none(),
+        "没有任何一处写 quota:<scope>:remaining:<id>：存下来就是第二本账"
+    );
+}
+
 /// 账上改小之后，格子跟着改小——这是「账本是正本」的可观测后果。
 #[tokio::test]
 async fn a_corrected_ledger_pulls_the_cell_down_on_the_next_pass() {
