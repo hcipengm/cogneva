@@ -283,8 +283,10 @@ impl PostgresMetricsBackend {
     ///
     /// Reads call this first. A reader asking for a value it just recorded is
     /// asking a question about the store, and answering it out of a queue that
-    /// has not landed yet would say the series is missing.
-    async fn flush_pending(&self) -> SFResult<()> {
+    /// has not landed yet would say the series is missing. Public for the same
+    /// reason: a caller that reads the tables itself has taken over the read
+    /// the backend would have done, and the queue is invisible from out there.
+    pub async fn flush_pending(&self) -> SFResult<()> {
         let Some(queue) = self.queue.get() else {
             return Ok(());
         };

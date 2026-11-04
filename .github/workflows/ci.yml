@@ -178,6 +178,15 @@ jobs:
         run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test partition_maintainer -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The claim is a count of commits per burst, and a stand-in has no commit
+      # to count: the reading is whatever the server's own log says. An ignored
+      # test whose file says how to run it still ran nowhere until a step named
+      # it, which is what this step is.
+      - name: Live-DB metric writes batch
+        if: ${{ !cancelled() }}
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test metric_writes_batch_into_few_commits -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The metering readings are a column the ledger gained later, so the three
       # shapes that matter are the ones a server leaves behind and no fixture can
       # hold: a row that spoke, a row whose upstream said nothing, and a row

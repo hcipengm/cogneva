@@ -50,7 +50,14 @@ fn labels(series: &str) -> HashMap<String, String> {
 /// The distinction is the point of half of this test: a zero and a missing row
 /// are the same number to a reader that only sums, and the seed exists to tell
 /// them apart.
-async fn total(pool: &PgPool, series: &str) -> Option<f64> {
+async fn total(backend: &PostgresMetricsBackend, pool: &PgPool, series: &str) -> Option<f64> {
+    // The write goes into a queue and lands in a batch of its own time. A reader
+    // that queries the table directly has taken over the read the backend would
+    // have done, so it also has to take over the first half: waiting for what it
+    // recorded to be written. Without this the assertion asks about the queue,
+    // not about the upsert, and answers "missing" for a series that is on its
+    // way.
+    backend.flush_pending().await.unwrap();
     sqlx::query_scalar(
         "SELECT value FROM cog_metric_counter_totals WHERE name = $1 AND labels = $2",
     )
@@ -94,7 +101,7 @@ async fn a_counter_write_adds_to_the_total_and_a_zero_write_only_creates_it() {
         .await
         .unwrap();
     assert_eq!(
-        total(&pool, "seed-only").await,
+        total(&backend, &pool, "seed-only").await,
         Some(0.0),
         "a zero increment did not create the series: a boot with nothing to \
          consult would publish nothing at all"
@@ -106,7 +113,7 @@ async fn a_counter_write_adds_to_the_total_and_a_zero_write_only_creates_it() {
         .await
         .unwrap();
     assert_eq!(
-        total(&pool, "counted").await,
+        total(&backend, &pool, "counted").await,
         Some(5.0),
         "the first write did not land its value in the total"
     );
@@ -119,7 +126,7 @@ async fn a_counter_write_adds_to_the_total_and_a_zero_write_only_creates_it() {
         .await
         .unwrap();
     assert_eq!(
-        total(&pool, "counted").await,
+        total(&backend, &pool, "counted").await,
         Some(5.0),
         "a zero increment cleared a total another process had counted up: every \
          restart would reset the family"
@@ -132,7 +139,7 @@ async fn a_counter_write_adds_to_the_total_and_a_zero_write_only_creates_it() {
         .await
         .unwrap();
     assert_eq!(
-        total(&pool, "counted").await,
+        total(&backend, &pool, "counted").await,
         Some(7.0),
         "a second write did not add to the total"
     );
