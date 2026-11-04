@@ -724,12 +724,16 @@ fn product_commits(window: &[(String, i64)], trailered: &HashSet<String>) -> (us
 /// the account heard nothing about -- the only version of this reading that is
 /// about something happening now. The counts are published either way; this
 /// line exists because a number going up is not a moment, and this is.
-fn note_fresh_unclaimed_commit(newest: Option<&(String, i64)>) {
+fn note_fresh_unclaimed_commit(newest: Option<&(String, i64)>, announced: &mut Option<String>) {
     let Some((rev, at)) = newest else {
         return;
     };
+    if announced.as_deref() == Some(rev.as_str()) {
+        return;
+    }
     let age = Utc::now().timestamp() - at;
     if age >= 0 && age <= (CHANGE_LEDGER_PASS_INTERVAL.as_secs() * 2) as i64 {
+        *announced = Some(rev.clone());
         warn!(
             rev = %rev,
             age_seconds = age,
@@ -1903,6 +1907,13 @@ pub fn spawn_change_ledger_loop(
                 // written before the anchor existed back into shape. Once, not
                 // per pass: see `settle_dispatch_parents`.
                 let mut parents_settled = false;
+                // The last commit this process warned about for reaching the
+                // tree without naming a change. Kept so the warning is one per
+                // commit: hand-committed work is the ordinary case today, so
+                // the warning is not what says the practice is wrong -- it says
+                // one more commit just went around the account, and repeating
+                // it every pass is the way that sentence stops being read.
+                let mut announced_unclaimed: Option<String> = None;
                 loop {
                     beat.beat();
                     tokio::select! {
@@ -2006,6 +2017,7 @@ pub fn spawn_change_ledger_loop(
                                     commits_read = Some(product_commits(&window, &named));
                                     note_fresh_unclaimed_commit(
                                         window.iter().find(|(rev, _)| !named.contains(rev)),
+                                        &mut announced_unclaimed,
                                     );
                                 }
                                 Err(why) => warn!(
