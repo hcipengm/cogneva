@@ -191,6 +191,19 @@ jobs:
         run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test usage_metering -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The two daily spend reads feed projections that overwrite a quota cell,
+      # and the whole point of a projection is that the cell equals the ledger.
+      # Both answers are decided in SQL: a person's spend comes from two pieces
+      # of evidence (the row's owner, or the submitter of the task it names) and
+      # the task read has to be day-scoped rather than lifetime-scoped. Neither
+      # can be restated without a server, and a wrong window or a missing half
+      # of the evidence makes a ceiling that never moves on the path that spends
+      # the most -- in production, where no fixture can see it.
+      - name: Live-DB person and task spend
+        if: ${{ !cancelled() }}
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test person_and_task_spend -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A schema statement's wait for its locks is a fact about the server's
       # lock queue across two sessions, so nothing that runs without a server
       # can see any of it: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes

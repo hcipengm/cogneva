@@ -409,6 +409,8 @@ mod task_resume_wiring_contract_test;
 mod the_fixture_reading_steps_are_written_once_test;
 #[path = "the_production_cut_is_defined_once_test.rs"]
 mod the_production_cut_is_defined_once_test;
+#[path = "the_quota_cells_are_written_by_a_projection_test.rs"]
+mod the_quota_cells_are_written_by_a_projection_test;
 #[path = "the_repo_root_is_computed_in_one_place_test.rs"]
 mod the_repo_root_is_computed_in_one_place_test;
 #[path = "the_token_counters_are_a_projection_of_the_ledger_test.rs"]

@@ -702,6 +702,47 @@ pub trait LlmUsageLedger: Send + Sync {
     /// this run cost so far", and only the caller knows which one it asked.
     async fn spend_by_task(&self, task_ids: &[String]) -> Result<Vec<(String, u64)>, String>;
 
+    /// Tokens spent since `since_unix`, per person, `(person, tokens)`.
+    ///
+    /// Two rows resolve to the same person by different evidence, and both are
+    /// written down at the moment the call is made rather than reconstructed
+    /// here: a call that stated an owner carries it on the row; a call made for
+    /// a task carries the task, and the person is whoever submitted that task.
+    /// The second half is a join rather than a second accumulator because the
+    /// task row is where a submitter is written once for a whole piece of work
+    /// — asking every call site to restate it would be the same fact kept in
+    /// two places, and the two disagree the first time one is forgotten.
+    ///
+    /// People who spent nothing are absent, not zero: this feeds a projection
+    /// that rewrites cells a ceiling is judged against, and writing a zero for
+    /// everyone in the graph would create a cell per idle person per day.
+    async fn spend_by_person_since(&self, since_unix: i64) -> Result<Vec<(String, u64)>, String>;
+
+    /// Tokens each of the named tasks spent since `since_unix`, `(task_id, tokens)`.
+    ///
+    /// The day-scoped counterpart of [`spend_by_task`](Self::spend_by_task): that
+    /// one answers "what has this job cost so far" for the cost face, this one
+    /// feeds the per-task daily budget cell, which resets at midnight. Tasks that
+    /// spent nothing are absent — the caller knows which tasks it asked about and
+    /// writes the zero itself.
+    async fn spend_by_task_since(
+        &self,
+        task_ids: &[String],
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String>;
+
+    /// The person who submitted the named task, as the graph records it.
+    ///
+    /// This is the same resolution [`spend_by_person_since`](Self::spend_by_person_since)
+    /// makes when it folds a task's calls onto a person, exposed on its own so the
+    /// enforcement point can judge the person the ledger charged. Two readers
+    /// resolving the person by different rules is how a call gets counted against
+    /// one person and refused for another.
+    ///
+    /// `None` covers both "no such task" and "that task names no submitter": the
+    /// caller may not know which, and neither has anyone to charge.
+    async fn task_submitter(&self, task_id: &str) -> Result<Option<String>, String>;
+
     /// Tokens spent in `[since, until)` that no task in the graph owns.
     ///
     /// The rows are calls that really were paid for, so dropping them would

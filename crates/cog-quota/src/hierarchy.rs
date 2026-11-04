@@ -10,8 +10,7 @@
 //! | key                                   | meaning                         |
 //! |---------------------------------------|---------------------------------|
 //! | `quota:<scope>:remaining:<id>`        | remaining tokens (today)        |
-//! | `quota:<scope>:used:<id>`             | tokens consumed today           |
-//! | `quota:<scope>:requests:<id>`         | request count today             |
+//! | `quota:<scope>:used:<id>`             | tokens spent today (ledger projection) |
 //! | `quota:<scope>:limits:<id>`           | JSON `QuotaLimits`              |
 //! | `quota:<scope>:history:<id>:<YYYYMMDD>` | per-day used token history    |
 //! All counters carry a TTL until the next UTC midnight, so daily reset is
@@ -230,70 +229,47 @@ impl HierarchyManager {
         }
     }
 
-    /// Apply real consumption to every applicable scope. Returns the
-    /// post-consumption decision so callers can read final remaining counts.
-    pub async fn consume(
+    /// Write one cell's "used today" as an absolute value, from the ledger.
+    ///
+    /// Overwrites rather than adds, and it is the **only** writer of that cell:
+    /// the number a ceiling is judged against is a projection of the token
+    /// ledger, so a pass that runs twice writes the same value, a key lost to
+    /// eviction or a restart is repaired on the next pass, and no code path can
+    /// make the cell and the ledger drift apart — there is only one of them.
+    /// An additive surface beside this one would be a second book, and the two
+    /// disagree the first time either side loses a write.
+    ///
+    /// The day's history cell takes the same value for the same reason: it is
+    /// what a reader asks for "what did this person spend yesterday", and a
+    /// second accumulator beside the projection would be exactly the book this
+    /// replaces.
+    pub async fn project_used(
         &self,
-        ctx: &QuotaContext,
-        actual_tokens: u64,
-    ) -> QuotaResult<HierarchyDecision> {
+        scope: QuotaScope,
+        target_id: &str,
+        tokens: u64,
+    ) -> QuotaResult<()> {
         let ttl = Self::seconds_until_midnight();
         let today = Utc::now().date_naive().to_string();
-
-        for scope in QuotaScope::cascade_order() {
-            if let Some(target) = ctx.target(scope) {
-                let used_key = Self::key(scope, "used", target);
-                let req_key = Self::key(scope, "requests", target);
-                let history_key = Self::history_key(scope, target, &today);
-
-                let store = self.store.lock().await;
-                let _ = store.incr(&used_key, actual_tokens as i64).await;
-                let _ = store.expire(&used_key, ttl as i64).await;
-                let _ = store.incr(&req_key, 1).await;
-                let _ = store.expire(&req_key, ttl as i64).await;
-                let _ = store.incr(&history_key, actual_tokens as i64).await;
-                let _ = store
-                    .expire(&history_key, (self.history_days as i64) * 86_400)
-                    .await;
-            }
-        }
-
-        Ok(self.check(ctx, 0).await)
-    }
-
-    /// Refund a previous over-deduction. Equivalent to `consume(-amount)`.
-    pub async fn refund(&self, ctx: &QuotaContext, tokens: u64) -> QuotaResult<()> {
-        for scope in QuotaScope::cascade_order() {
-            if let Some(target) = ctx.target(scope) {
-                let store = self.store.lock().await;
-                let used_key = Self::key(scope, "used", target);
-                let _ = store.decr(&used_key, tokens as i64).await;
-            }
-        }
+        let store = self.store.lock().await;
+        store
+            .set(&Self::key(scope, "used", target_id), &tokens.to_string())
+            .await
+            .map_err(store_error)?;
+        store
+            .expire(&Self::key(scope, "used", target_id), ttl as i64)
+            .await
+            .map_err(store_error)?;
+        let history_key = Self::history_key(scope, target_id, &today);
+        store
+            .set(&history_key, &tokens.to_string())
+            .await
+            .map_err(store_error)?;
+        store
+            .expire(&history_key, (self.history_days as i64) * 86_400)
+            .await
+            .map_err(store_error)?;
         Ok(())
-    }
-
-    /// Pre-deduct estimated tokens up-front. Returns Err if any scope is
-    /// already at or past its hard limit.
-    pub async fn pre_deduct(
-        &self,
-        ctx: &QuotaContext,
-        estimated_tokens: u64,
-    ) -> QuotaResult<HierarchyDecision> {
-        let decision = self.check(ctx, estimated_tokens).await;
-        if !decision.allowed {
-            return Err(QuotaError::InsufficientQuota {
-                required: estimated_tokens,
-                remaining: decision
-                    .blocked_by
-                    .first()
-                    .map(|s| s.remaining)
-                    .unwrap_or(0),
-            });
-        }
-        // No mutation in pre_deduct; counters move only in `consume`. This
-        // avoids double-counting refunds when `actual ≠ estimated`.
-        Ok(decision)
     }
 
     /// Read the recent N-day history for one `(scope, target)` cell.
@@ -371,28 +347,13 @@ impl cog_core::HierarchyManager for HierarchyManager {
         self.check(ctx, tokens).await
     }
 
-    async fn consume(
+    async fn set_used(
         &self,
-        ctx: &QuotaContext,
+        scope: QuotaScope,
+        target_id: &str,
         tokens: u64,
-    ) -> cog_core::SFResult<HierarchyDecision> {
-        self.consume(ctx, tokens)
-            .await
-            .map_err(|e| cog_core::SFError::Internal(e.to_string()))
-    }
-
-    async fn refund(&self, ctx: &QuotaContext, tokens: u64) -> cog_core::SFResult<()> {
-        self.refund(ctx, tokens)
-            .await
-            .map_err(|e| cog_core::SFError::Internal(e.to_string()))
-    }
-
-    async fn pre_deduct(
-        &self,
-        ctx: &QuotaContext,
-        tokens: u64,
-    ) -> cog_core::SFResult<HierarchyDecision> {
-        self.pre_deduct(ctx, tokens)
+    ) -> cog_core::SFResult<()> {
+        self.project_used(scope, target_id, tokens)
             .await
             .map_err(|e| cog_core::SFError::Internal(e.to_string()))
     }

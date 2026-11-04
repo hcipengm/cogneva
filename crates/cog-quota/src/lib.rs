@@ -6,7 +6,10 @@
 //!   with per-scope soft (warning) and hard (block) limits — see
 //!   [`hierarchy::HierarchyManager`].
 //! - Per-day usage history with TTL-based daily resets at UTC midnight.
-//! - Two-phase quota consumption (`pre_deduct` → `consume` / `refund`).
+//! - One writer per counter: "used today" is a **projection** of the token
+//!   ledger ([`hierarchy::HierarchyManager::project_used`]), overwritten on a
+//!   period rather than added to, so a lost key heals and the cell cannot drift
+//!   from the ledger it is computed from.
 //! - The two facts a refused caller needs from that reset: the UTC day boundary
 //!   as a pure function ([`day`]) and the named refusal with its wait
 //!   ([`hierarchy::refusal_for`]), so a request-facing caller can answer with
@@ -24,11 +27,13 @@
 //! body: those calls spend no model tokens, so the figure it deducted had
 //! nothing to do with what the platform spends for that user, and once the
 //! balance reached zero it refused the request that reads the balance. It is
-//! gone. Spend is charged instead where it happens — the gateway's LLM proxy,
-//! by the tokens the upstream reported — and the person axis is the first one
-//! with a writer: a call that declared an owner is charged to that person and
-//! judged against whatever ceiling an operator declared for them, in the same
-//! daily counters the management face reads.
+//! gone. Spend is written instead where it happens — the gateway's LLM proxy
+//! lands one ledger row per call, by the tokens the upstream reported — and the
+//! person axis is computed from those rows: the counted cell is rewritten from
+//! the ledger on a period, and a call is judged against whatever ceiling an
+//! operator declared for the person whose names that ledger resolves to. The
+//! cell and the ledger are one fact, so there is nothing to reconcile between
+//! them.
 //!
 //! The workspace, team and organization levels above it still have no writer,
 //! and that stays deliberate: nothing on the platform says which of those a

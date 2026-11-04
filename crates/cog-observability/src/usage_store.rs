@@ -1068,6 +1068,121 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// 从 `since_unix` 起按人汇总的花销，`(person, tokens)`。
+    ///
+    /// 一个人的花销有两处证据，两处都是**调用发生时就写下的**：调用方声明了
+    /// 属主，行上就有 `owner_id`；调用是为某件任务做的，人就是提交这件任务的人。
+    /// 第二种靠与任务表连一次，而不是让每个调用点再抄一遍名字——提交人对一件活
+    /// 只写一次，抄在每次调用上就是同一个事实存两份，两份在有人漏抄时开始分叉。
+    ///
+    /// 花销为零的人不出现（不是 0）：读它的是一份会覆盖额度格子的投影，给图里
+    /// 每个闲着的人都写一个 0，等于每天给每个人建一个格子。
+    ///
+    /// 连任务表那一支走 `LATERAL ... LIMIT 1`，不是普通 join：任务表的主键是
+    /// `(workspace_id, task_id)`，同一个 id 在两个工作区里各有一行是它允许的形状。
+    /// 一次普通 join 碰上这种重复，那一行的 token 会被数两遍——格子里的数凭空变大，
+    /// 而「这个人今天花了多少」只会表现为他比实际更早被拒。取最近更新的那一行，
+    /// 与 [`Self::task_submitter`] 用同一条规则，两处才不会各认一个提交人。
+    pub async fn spend_by_person_since(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let rows = sqlx::query(&format!(
+            "SELECT person, SUM(tokens)::BIGINT AS tokens FROM (
+                 SELECT COALESCE(NULLIF(u.owner_id, ''), t.person) AS person,
+                        (u.tokens_input + u.tokens_output) AS tokens
+                   FROM {LEDGER_TABLE} u
+                   LEFT JOIN LATERAL (
+                        SELECT d.task->>'submitted_by' AS person
+                          FROM cog_dag_tasks d
+                         WHERE d.task_id = u.task_id
+                         ORDER BY d.updated_at DESC
+                         LIMIT 1
+                   ) t ON TRUE
+                  WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
+             ) s
+             WHERE person IS NOT NULL
+             GROUP BY person
+             ORDER BY person"
+        ))
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("person"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
+    /// 从 `since_unix` 起，这些任务各自花掉的 token，`(task_id, tokens)`。
+    ///
+    /// 与 [`Self::spend_by_task`] 分开而不是加一个可选参数：那一份答的是「这件工作
+    /// 到今天一共花了多少」（成本面），这一份答的是「它今天花了多少」（当日预算
+    /// 格子）。两者的边界不同，混成一个参数会让调用方要读文档才知道自己该传什么。
+    ///
+    /// 没有花销的任务不出现，与按人的那份同一个理由：读它的是一份覆盖写的投影，
+    /// 没出现的格子由调用方按自己知道的集合补 0，而不是由这里替它编。
+    pub async fn spend_by_task_since(
+        &self,
+        task_ids: &[String],
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        if task_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(&format!(
+            "SELECT task_id, COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT AS tokens
+               FROM {LEDGER_TABLE}
+              WHERE task_id = ANY($1)
+                AND ts >= to_timestamp($2::DOUBLE PRECISION)
+              GROUP BY task_id
+              ORDER BY task_id"
+        ))
+        .bind(task_ids)
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("task_id"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
+    /// 这件活是谁交的，任务图里那一个答案。
+    ///
+    /// 判额度与记账读的是同一处：`spend_by_person_since` 把为任务做的调用算在提交
+    /// 人头上，这里让判定也能拿到同一个人。两处各认各的，会出现「按 A 记了花销、
+    /// 按 B 判了额度」——被判的那个人永远没花过，被记的那个人从来没被拦过。
+    ///
+    /// 任务图里没有这件活、或者它没有提交人，都答 `None`：两者在判定上同形（没有
+    /// 人该被拦），但调用方不能因此编一个名字。
+    pub async fn task_submitter(&self, task_id: &str) -> anyhow::Result<Option<String>> {
+        // 取最近更新的那一行，与 `spend_by_person_since` 同一条规则：任务表的主键是
+        // `(workspace_id, task_id)`，同一个 id 可能有两个工作区的两行，而这两处要是
+        // 各挑一行，就会出现「按 A 记了花销、按 B 判了额度」。
+        let row = sqlx::query(
+            "SELECT task->>'submitted_by' AS person
+               FROM cog_dag_tasks
+              WHERE task_id = $1
+              ORDER BY updated_at DESC
+              LIMIT 1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| r.get::<Option<String>, _>("person")))
+    }
+
     /// 同一窗口里**归不到任何一件任务**的用量合计。
     ///
     /// 这个数不属于任何一个项目，所以它不能并进哪个项目的成本；它要报出来，
@@ -1905,6 +2020,28 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
 
     async fn spend_by_task(&self, task_ids: &[String]) -> Result<Vec<(String, u64)>, String> {
         LlmUsageStore::spend_by_task(self, task_ids)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn spend_by_person_since(&self, since_unix: i64) -> Result<Vec<(String, u64)>, String> {
+        LlmUsageStore::spend_by_person_since(self, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn spend_by_task_since(
+        &self,
+        task_ids: &[String],
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        LlmUsageStore::spend_by_task_since(self, task_ids, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn task_submitter(&self, task_id: &str) -> Result<Option<String>, String> {
+        LlmUsageStore::task_submitter(self, task_id)
             .await
             .map_err(|e| e.to_string())
     }

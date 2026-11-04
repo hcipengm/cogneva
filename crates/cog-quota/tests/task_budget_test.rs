@@ -179,19 +179,19 @@ async fn a_task_without_a_declared_budget_has_no_ceiling_and_is_let_through() {
 }
 
 #[tokio::test]
-async fn charges_accumulate_and_the_ceiling_refuses_the_call_that_would_cross_it() {
+async fn the_ceiling_refuses_the_call_that_would_cross_it() {
     let m = manager();
     m.set_budget("task-b", QuotaLimits::new(80, 100))
         .await
         .unwrap();
 
-    assert_eq!(m.charge("task-b", 60, NOON).await.unwrap(), 60);
+    m.project_spent("task-b", 60, NOON).await.unwrap();
     assert!(
         m.check("task-b", 40, NOON).await.unwrap().allowed,
         "60+40 恰好到界，放行"
     );
 
-    assert_eq!(m.charge("task-b", 40, NOON).await.unwrap(), 100);
+    m.project_spent("task-b", 100, NOON).await.unwrap();
     let d = m.check("task-b", 1, NOON).await.unwrap();
     assert!(!d.allowed);
     assert_eq!(d.spent_today, 100);
@@ -210,7 +210,7 @@ async fn the_counter_carries_a_ttl_that_ends_at_the_next_utc_midnight() {
     m.set_budget("task-c", QuotaLimits::new(80, 100))
         .await
         .unwrap();
-    m.charge("task-c", 10, NOON).await.unwrap();
+    m.project_spent("task-c", 10, NOON).await.unwrap();
 
     // 计数器的过期必须落在当天末尾：没有它，这条日上限就是终身上限，
     // 而「今天花得多」与「这条预算再也不会重置」在读数上同形。
@@ -233,7 +233,7 @@ async fn raising_the_ceiling_is_not_a_fresh_grant() {
     m.set_budget("task-d", QuotaLimits::new(80, 100))
         .await
         .unwrap();
-    m.charge("task-d", 90, NOON).await.unwrap();
+    m.project_spent("task-d", 90, NOON).await.unwrap();
 
     m.set_budget("task-d", QuotaLimits::new(200, 300))
         .await
@@ -251,7 +251,7 @@ async fn clearing_the_budget_returns_the_task_to_unbudgeted() {
     m.set_budget("task-e", QuotaLimits::new(1, 1))
         .await
         .unwrap();
-    m.charge("task-e", 5, NOON).await.unwrap();
+    m.project_spent("task-e", 5, NOON).await.unwrap();
     assert!(!m.check("task-e", 0, NOON).await.unwrap().allowed);
 
     m.clear_budget("task-e").await.unwrap();
@@ -278,13 +278,23 @@ async fn a_stored_budget_that_does_not_parse_is_an_error_not_an_absent_budget() 
     );
 }
 
+/// 投影写的是**当天累计的绝对值**：同一份账重算两遍，格子还是那个数。
+///
+/// 这条格子的唯一写者是账本投影，所以幂等是它成立的全部理由——账上有了更正，
+/// 下一拍把格子往回改；键丢了，下一拍补回来。累加的写法两件都做不到。
 #[tokio::test]
-async fn the_request_count_is_kept_beside_the_tokens() {
+async fn projecting_the_same_ledger_twice_leaves_the_cell_at_that_value() {
     let m = manager();
-    m.charge("task-g", 1, NOON).await.unwrap();
-    m.charge("task-g", 2, NOON).await.unwrap();
-    assert_eq!(m.requests_today("task-g").await, 2);
+    m.project_spent("task-g", 3, NOON).await.unwrap();
+    m.project_spent("task-g", 3, NOON).await.unwrap();
     assert_eq!(m.spent_today("task-g").await, 3);
+
+    m.project_spent("task-g", 1, NOON).await.unwrap();
+    assert_eq!(
+        m.spent_today("task-g").await,
+        1,
+        "账说 1，格子就得是 1；往回改也是投影的职责"
+    );
 }
 
 /// 名册列出的是**真的**有上限的任务：撤销掉的不在，崩在中间的孤儿成员也不在。

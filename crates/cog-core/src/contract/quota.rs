@@ -215,9 +215,18 @@ pub trait QuotaManager: Send + Sync {
 #[async_trait::async_trait]
 pub trait HierarchyManager: Send + Sync {
     async fn check(&self, ctx: &QuotaContext, tokens: u64) -> HierarchyDecision;
-    async fn consume(&self, ctx: &QuotaContext, tokens: u64) -> SFResult<HierarchyDecision>;
-    async fn refund(&self, ctx: &QuotaContext, tokens: u64) -> SFResult<()>;
-    async fn pre_deduct(&self, ctx: &QuotaContext, tokens: u64) -> SFResult<HierarchyDecision>;
+
+    /// Set one cell's "used today" to an absolute value.
+    ///
+    /// This is the **only** writer of that cell: the count is a projection of
+    /// the token ledger, recomputed on a period, so a lost key is repaired by
+    /// the next pass instead of resetting a customer's day to zero. Adding to it
+    /// from the request path would be a second book beside the ledger, and two
+    /// books disagree the first time either side loses a write — which is why
+    /// the incremental surface is not part of this trait. A caller holding real
+    /// spend lands the ledger row and lets the projection carry it here.
+    async fn set_used(&self, scope: QuotaScope, target_id: &str, tokens: u64) -> SFResult<()>;
+
     async fn history(
         &self,
         scope: QuotaScope,
@@ -294,8 +303,13 @@ pub trait TaskBudgetGate: Send + Sync {
     /// 给出多少等待，而「午夜前一秒」那一格只有把时钟交进来才测得了。
     async fn check(&self, task_id: &str, now_unix: i64) -> SFResult<TaskBudgetVerdict>;
 
-    /// 记一次真实花销，返回记完之后今天这件任务的累计。
-    async fn charge(&self, task_id: &str, tokens: u64, now_unix: i64) -> SFResult<u64>;
+    /// 把一件任务今天的花销写成绝对值，由账本的投影来写。
+    ///
+    /// 这是那个计数器的**唯一**写者，理由与 [`HierarchyManager::set_used`] 逐字相同：
+    /// 判定用的数是账本的投影，覆盖写在重算两遍时得同一个值、键丢了下一拍补回来，
+    /// 而请求路径上再开一条累加的路，就成了与账本并行的第二本账。所以这个契约上
+    /// 没有增量写的入口。
+    async fn set_spent(&self, task_id: &str, tokens: u64, now_unix: i64) -> SFResult<()>;
 }
 
 /// 一次按任务预算的判定。

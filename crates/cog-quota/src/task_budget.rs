@@ -18,8 +18,7 @@
 //! | 键                            | 含义                     |
 //! |-------------------------------|--------------------------|
 //! | `quota:task:limits:<id>`      | JSON `QuotaLimits`       |
-//! | `quota:task:used:<id>`        | 今天已花的 token         |
-//! | `quota:task:requests:<id>`    | 今天的调用次数           |
+//! | `quota:task:used:<id>`        | 今天已花的 token（账本投影） |
 //! | `quota:task:index`            | 声明过预算的任务名册     |
 //!
 //! 限值键**不带 TTL**：预算是对这件工作整体说的，午夜不该把它抹掉。计数器带
@@ -201,39 +200,28 @@ impl TaskBudgetManager {
         ))
     }
 
-    /// 把一次真实花销记到这件任务上，返回记完之后今天的花销。
+    /// 把一件任务今天的花销写成绝对值，由账本的投影来写。
     ///
-    /// 账只在调用真的发生之后记：预扣要配一次回滚，而回滚那条路径在中途崩溃时会留下
-    /// 一笔从没发生过的花销。先放行后记账的代价是并发下的最后一发可以略微越过上限
-    /// ——越过的是「同时在路上」的那几发各自的估算误差，而不是一整窗的量。
-    pub async fn charge(
+    /// 覆盖而不是相加：这个格子**是**账本的投影，重算两遍得同一个数，键丢了或进程
+    /// 重启之后下一拍补回来，账上有了更正下一拍跟着改。请求路径上再累加一次，就是
+    /// 与账本并行的第二本账，两本在任一侧丢写之后开始分叉，而分叉之后没有任何一处
+    /// 能把它们对回来。
+    ///
+    /// 过期与写在同一步：分成 `set` + `expire` 两步时，中间崩溃留下的计数器没有
+    /// TTL，于是这件任务的花销从此永不重置——一条日上限变成了终身上限。
+    pub async fn project_spent(
         &self,
         task_id: &str,
-        actual_tokens: u64,
+        tokens: u64,
         now_unix: i64,
-    ) -> QuotaResult<u64> {
+    ) -> QuotaResult<()> {
         let ttl = seconds_to_next_day(now_unix);
         let store = self.store.lock().await;
-        let used_key = Self::key("used", task_id);
-        let req_key = Self::key("requests", task_id);
-        // 加与设过期是一步：分成 `incr` + `expire` 两步时，中间崩溃留下的计数器
-        // 没有 TTL，于是这件任务的花销从此永不重置——一条日上限变成了终身上限，
-        // 而它读上去和「今天花得多」一模一样。
-        let spent = store
-            .incr_ex(&used_key, actual_tokens as i64, ttl)
+        store
+            .set_ex(&Self::key("used", task_id), &tokens.to_string(), ttl)
             .await
             .map_err(store_error)?;
-        let _ = store.incr_ex(&req_key, 1, ttl).await;
-        Ok(spent.max(0) as u64)
-    }
-
-    /// 今天这件任务被放行（也含被拒）了多少次。读不到按 0。
-    pub async fn requests_today(&self, task_id: &str) -> u64 {
-        let store = self.store.lock().await;
-        read_int(&**store, &Self::key("requests", task_id))
-            .await
-            .unwrap_or(0)
-            .max(0) as u64
+        Ok(())
     }
 }
 
@@ -331,8 +319,8 @@ impl cog_core::TaskBudgetGate for TaskBudgetManager {
         })
     }
 
-    async fn charge(&self, task_id: &str, tokens: u64, now_unix: i64) -> cog_core::SFResult<u64> {
-        TaskBudgetManager::charge(self, task_id, tokens, now_unix)
+    async fn set_spent(&self, task_id: &str, tokens: u64, now_unix: i64) -> cog_core::SFResult<()> {
+        TaskBudgetManager::project_spent(self, task_id, tokens, now_unix)
             .await
             .map_err(sf_error)
     }

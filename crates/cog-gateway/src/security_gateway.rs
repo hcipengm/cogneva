@@ -2040,7 +2040,9 @@ struct AppState {
     ///
     /// 与 [`Self::task_budget`] 不是同一个问题：那一格的上限挂在「这件工作」上，
     /// 这一格挂在「这个人今天能花多少」上。上限本身由管理面写进同一个键值面
-    /// （`quota:user:limits:<id>`），本进程只负责在 LLM 代理路径上判与记。
+    /// （`quota:user:limits:<id>`），本进程在 LLM 代理路径上**判**，并把格子里那个
+    /// 数按拍从账本**投影**回来（[`project_quota_usage`]）——请求路径上不记，记在
+    /// 账本里，格子只是它的一个读法。
     ///
     /// `None` 与「这个人没有额度」是两回事：前者是没配键值面、无从判定，后者是
     /// 有人声明了上限而他用完了。两者在拒绝面上都表现为放行——见
@@ -2908,29 +2910,6 @@ async fn task_has_landed_a_row(state: &AppState, task: &str) -> Result<bool, Str
         .map_err(|e| e.to_string())
 }
 
-/// 把一次真实花销记到这件任务的当日预算上。
-///
-/// 记不上只 WARN：预算是判据，不是请求路径的一部分，为一次记账失败把一次已经付过钱
-/// 的调用变成错误，方向反了。代价要说清楚——这一发的花销不计入，此后这件任务的判定
-/// 会偏小，偏到下一次它越线为止。
-async fn charge_task_budget(state: &AppState, task: Option<&str>, tokens: u64) {
-    let Some(task) = task else { return };
-    let Some(gate) = state.task_budget.as_ref() else {
-        return;
-    };
-    if tokens == 0 {
-        return;
-    }
-    if let Err(e) = gate.charge(task, tokens, Utc::now().timestamp()).await {
-        tracing::warn!(
-            task = %task,
-            tokens,
-            error = %e,
-            "按任务预算：这一发的花销没记上，此后这件任务的判据会偏小"
-        );
-    }
-}
-
 /// 按任务预算的拒绝：这件工作由调用方自己声明了当日上限，它已经用完了。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TaskBudgetRefusal {
@@ -3079,12 +3058,54 @@ struct OwnerBudgetRefusal {
 /// 没做过的决定，而代价是某个人在一天中间被切断、且没有任何一处写着为什么。配过
 /// 上限之后，判定用的就是那一对，与 `/api/v1/quota/limits/user/<id>` 读到的同一个。
 ///
-/// 不拒的另外三种：请求没声明人（没有主体，就没有「这个人花了多少」这个说法）、
-/// 本进程没有层级管理器（没配键值面，无从判定）、读不出配过的上限（答不上「花了
-/// 多少」时放行——拦错方向的代价不对称，见 [`task_budget_refusal`]）。
+/// 不拒的另外三种：这一发既没声明属主、也不属于任何一件有提交人的任务（没有主体，
+/// 就没有「这个人花了多少」这个说法）、本进程没有层级管理器（没配键值面，无从判定）、
+/// 读不出配过的上限（答不上「花了多少」时放行——拦错方向的代价不对称，见
+/// [`task_budget_refusal`]）。
 ///
 /// 估算不参与判定，理由与按任务预算那一条相同：这一发要花多少只有上游知道，而这里
 /// 拒的是「已经越线之后再来的任何一发」。
+/// 这一发的花销该记在谁头上、就按谁判——两处用的是同一条解析规则。
+///
+/// 账上把为一件任务做的调用算在**提交这件活的人**头上（见账本那次的 join）；
+/// 判定要是只认调用方自己声明的属主，就会出现「记在 A 头上、按 B 判」，而任务
+/// 调用根本不声明属主——那条路上的额度格子会涨、却永远不拦人，一天的上限成了
+/// 一句只有事后读得出来的话。
+///
+/// 所以没声明属主时，去任务图里问同一个问题。问不出来（没有这件活、没有提交人、
+/// 读失败）都答 `None`：答不上「谁该被拦」时放行，与这一面其他几处同一个方向。
+async fn owner_budget_person(
+    state: &AppState,
+    task: Option<&str>,
+    owner: Option<&str>,
+) -> Option<String> {
+    if owner.is_some() {
+        return person_of_a_call(owner, None);
+    }
+    let task = task?;
+    let ledger = state.pool_obs.usage.as_ref()?;
+    match ledger.task_submitter(task).await {
+        Ok(submitter) => person_of_a_call(owner, submitter.as_deref()),
+        Err(e) => {
+            tracing::warn!(
+                task = %task,
+                error = %e,
+                "按人额度：读不出这件活的提交人，这一发不拦"
+            );
+            None
+        }
+    }
+}
+
+/// 一条调用的花销算在谁头上：声明了属主就是属主，否则是提交这件活的人。
+///
+/// 这个次序与账本那次 join 的 `COALESCE` 逐字相同，是两条路读同一份证据的地方。
+/// 声明了自己的调用不因为任务挂着别人的名字而换人——那是调用方当场说的，比任务
+/// 行上那个「谁交的活」更近。
+fn person_of_a_call(owner: Option<&str>, task_submitter: Option<&str>) -> Option<String> {
+    owner.or(task_submitter).map(str::to_string)
+}
+
 async fn owner_budget_refusal(
     state: &AppState,
     style: &str,
@@ -3093,8 +3114,11 @@ async fn owner_budget_refusal(
     task: Option<&str>,
     owner: Option<&str>,
 ) -> Option<OwnerBudgetRefusal> {
-    let owner = owner?;
+    // 先看这一面在不在：不在就连「这件活是谁交的」都不用去问——那是一次库读，
+    // 为一个判不了的决定付它，等于让每一发任务调用替一个没配的额度面买单。
     let hierarchy = state.owner_budget.as_ref()?;
+    let owner = owner_budget_person(state, task, owner).await?;
+    let owner = owner.as_str();
     match hierarchy.limits(cog_core::QuotaScope::User, owner).await {
         Ok(None) => return None,
         Ok(Some(_)) => {}
@@ -3136,36 +3160,6 @@ async fn owner_budget_refusal(
         owner_budget_refusal_usage(style, actor, origin, task, &refusal),
     );
     Some(refusal)
-}
-
-/// 把一次真实花销记到这个人今天的额度上。
-///
-/// **每一发都记**，不是「配过额度才记」：额度可以在一天中间才被配，只从配置那一刻
-/// 开始记，会让上半天花掉的那部分不计入——配额度的人看到的是「还剩一整份」，而账上
-/// 说这个人今天已经花过。多一次自增的代价远小于一个会偏小的判据。
-///
-/// 记不上只 WARN，理由与 [`charge_task_budget`] 相同：为一次记账失败把一次已经付过
-/// 钱的调用变成错误，方向反了。
-async fn charge_owner_budget(state: &AppState, owner: Option<&str>, tokens: u64) {
-    let Some(owner) = owner else { return };
-    let Some(hierarchy) = state.owner_budget.as_ref() else {
-        return;
-    };
-    if tokens == 0 {
-        return;
-    }
-    let ctx = cog_core::QuotaContext {
-        user_id: Some(owner.to_string()),
-        ..Default::default()
-    };
-    if let Err(e) = hierarchy.consume(&ctx, tokens).await {
-        tracing::warn!(
-            owner = %owner,
-            tokens,
-            error = %e,
-            "按人额度：这一发的花销没记上，此后这个人的判据会偏小"
-        );
-    }
 }
 
 /// 按人额度拒绝的台账落点。
@@ -3756,18 +3750,10 @@ async fn record_llm_tokens(
             .property("estimated_input", serde_json::json!(estimated_input))
             .property("latency_ms", serde_json::json!(latency_ms)),
     );
-    // 记到这件任务的当日预算上。**每一发都记**，不是「有预算才记」：预算可以在一天
-    // 中间才被声明，只从声明那一刻开始记，会让上午花掉的那部分不计入——声明的人
-    // 看到的是「还剩一整份」，而账上说这件工作今天已经花过。多一次自增的代价远小于
-    // 一个会偏小的判据。
-    charge_task_budget(state, task.as_deref(), reading.input + reading.output).await;
-    // 同一个道理记到这个人今天的额度上：这里也每一发都记，不只看有没有配过上限。
-    charge_owner_budget(
-        state,
-        request.owner.as_deref(),
-        reading.input + reading.output,
-    )
-    .await;
+    // 预算格子里不在这里记：任务与人那两格都是账本的投影，由
+    // `project_quota_usage` 按拍从下面这一行重算并覆盖。这里只落账——请求路径上
+    // 再多加一笔就是与账本并行的第二本账，而两本账在没有一处能比对的时候不会自己
+    // 合上。
     land_usage_record(
         state,
         LlmUsageRecord {
@@ -3791,9 +3777,9 @@ async fn record_llm_tokens(
             // 真实调用的一行：熔断没拒过它，没有"下次再来"可报。
             retry_after_secs: None,
             task,
-            // 这一发的花销记在谁头上，与 [`charge_owner_budget`] 往计数里加的
-            // 是同一个人：账上的一行与额度上的一笔必须指着同一个标识，否则
-            // 「这个人今天花了多少」有两个答案。
+            // 这一发的花销记在谁头上。额度格子上的那个数是这一行的投影
+            // （见 `project_quota_usage`），所以人只能写在这里、只写一次：
+            // 两处各记一遍，「这个人今天花了多少」就会有两个答案。
             owner: request.owner.clone(),
             latency_ms,
             // 真实调用的一行：配速没参与这一次的判定。
@@ -5988,6 +5974,147 @@ fn spawn_pool_state_publisher(state: AppState) -> tokio::task::JoinHandle<()> {
             }
         },
     )
+}
+
+/// Loop name reported through the background-loop liveness family.
+pub const QUOTA_PROJECTION_LOOP: &str = "gateway_quota_projection";
+
+/// 额度格子跟着账本走的节拍。
+///
+/// 这是**投影的滞后上界**，不是一条策略：格子里的数与账本最多差这么多秒的花销。
+/// 不能为 0（那样每一发都要连一次库），也不该更大——一天的额度是粗控，半分钟
+/// 的滞后远小于一次普通运行的花销。
+// cap: bound — 是投影滞后的上界不是旋钮；更短就要每发连库，更长就放跑了超额
+const QUOTA_PROJECTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 额度格子投影循环：把今天按人与按任务花的 token 从账本重算一遍，覆盖到格子上。
+fn spawn_quota_projection(state: AppState) -> tokio::task::JoinHandle<()> {
+    // Nothing hands this loop a stop signal: it runs for the life of the gateway
+    // process, and a gateway that stops projecting leaves every ceiling judging
+    // yesterday's number.
+    cog_core::loop_health::spawn_unstoppable(
+        QUOTA_PROJECTION_LOOP,
+        cog_core::loop_health::Cadence::Periodic(QUOTA_PROJECTION_PERIOD),
+        move |beat| {
+            let state = state.clone();
+            async move {
+                let mut ticker = tokio::time::interval(QUOTA_PROJECTION_PERIOD);
+                loop {
+                    beat.beat();
+                    ticker.tick().await;
+                    project_quota_usage(&state).await;
+                }
+            }
+        },
+    )
+}
+
+/// 把「这个人今天花了多少」「这件任务今天花了多少」从账本算出来，**覆盖**到
+/// 两个预算格子上。
+///
+/// 覆盖而不是相加，是这条循环存在的全部理由：格子里的那两个数**是**账本的投影，
+/// 不是与它并行的第二本账。请求路径上 `incr` 的写法在 Redis 丢一个键、或者某条
+/// 账本行落库失败之后就开始与账本分叉，而分叉之后没有任何一处能把两者对回来
+/// ——今天线上没有任何一条读数比得出这个差，也就没有人会去对。
+///
+/// 读不出来就维持上一拍的值并告警：清零会让所有人当天的额度凭空回满，那是把
+/// 一次读故障变成一次放行。
+async fn project_quota_usage(state: &AppState) {
+    let Some(ledger) = state.pool_obs.usage.as_ref() else {
+        return;
+    };
+    let now_unix = chrono::Utc::now().timestamp();
+    let since = cog_core::day::day_start_unix(now_unix);
+
+    if let Some(hierarchy) = state.owner_budget.as_ref() {
+        match ledger.spend_by_person_since(since).await {
+            Ok(people) => project_person_spend(hierarchy.as_ref(), &people).await,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "按人额度：这一拍读不出账本，格子维持上一拍的值"
+                );
+            }
+        }
+    }
+
+    // 任务那一格同一件事，只是域不同：格子的集合由「有人声明过预算」给出，没人
+    // 声明过的任务没有格子可写——替它建一个，等于把「没人管」写成「额度为零」。
+    let Some(gate) = state.task_budget.as_ref() else {
+        return;
+    };
+    let budgeted = match gate.budgeted_tasks().await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "按任务预算：这一拍读不出名册，格子维持上一拍的值"
+            );
+            return;
+        }
+    };
+    let spent = match ledger.spend_by_task_since(&budgeted, since).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "按任务预算：这一拍读不出账本，格子维持上一拍的值"
+            );
+            return;
+        }
+    };
+    project_task_spend(gate.as_ref(), &budgeted, &spent, now_unix).await;
+}
+
+/// 把 `(person, tokens)` 覆盖写到各自的额度格子上。
+///
+/// 与读账本分开，判据才测得出来：这一半要保证的是「账上的每一个人各写各的格子、
+/// 写的是绝对值」，那两件事与账本连没连上无关。
+async fn project_person_spend(
+    hierarchy: &dyn cog_core::HierarchyManager,
+    people: &[(String, u64)],
+) {
+    for (person, tokens) in people {
+        if let Err(e) = hierarchy
+            .set_used(cog_core::QuotaScope::User, person, *tokens)
+            .await
+        {
+            tracing::warn!(
+                person = %person,
+                tokens,
+                error = %e,
+                "按人额度：这一拍没写进格子，下一拍照旧重算"
+            );
+        }
+    }
+}
+
+/// 把每件**声明过预算**的任务今天的花销覆盖写到它自己的格子上。
+///
+/// 格子的域是名册而不是账本的行：账上今天没有花销的任务写成 0，而不是跳过。留着
+/// 昨天的数，那件任务会在今天第一次调用之前就被自己的上限拒掉，而拒绝的理由是
+/// 「已经花完了」——它昨天确实花完了，今天一分没花。
+async fn project_task_spend(
+    gate: &dyn cog_core::TaskBudgetGate,
+    budgeted: &[String],
+    spent: &[(String, u64)],
+    now_unix: i64,
+) {
+    let by_task: std::collections::HashMap<&str, u64> = spent
+        .iter()
+        .map(|(id, tokens)| (id.as_str(), *tokens))
+        .collect();
+    for task_id in budgeted {
+        let tokens = by_task.get(task_id.as_str()).copied().unwrap_or(0);
+        if let Err(e) = gate.set_spent(task_id, tokens, now_unix).await {
+            tracing::warn!(
+                task = %task_id,
+                tokens,
+                error = %e,
+                "按任务预算：这一拍没写进格子，下一拍照旧重算"
+            );
+        }
+    }
 }
 
 /// Credential-leak patterns and the name each one reports. A hit is blocked and
@@ -9975,9 +10102,10 @@ fn identity_default_headers(identity: &str) -> reqwest::header::HeaderMap {
 /// 门时写预算会答 503，因为写下去了而没有东西执行它。
 ///
 /// `owner_budget` 是同一个层级管理器在「人」那一级上的用法：上限由管理面写进
-/// 同一个键值面，判定与记账发生在这条代理路径上。它必须与持有管理面的那个进程
-/// 指向同一个存储才算数——上限写在一处、账记在另一处，读出来就是「有上限但没人
-/// 撞过」。交 `None` 表示本进程判不了人的额度（没配键值面），于是只放行、不记账。
+/// 同一个键值面，本进程在代理路径上判、并把自己写下的那些账本行按拍投影成格子
+/// 里的数。它必须与持有管理面的那个进程指向同一个存储才算数——上限写在一处、
+/// 格子由另一处算，读出来就是「有上限但没人撞过」。交 `None` 表示本进程判不了
+/// 人的额度（没配键值面），于是只放行、不投影。
 ///
 /// 独立安全网关进程。
 ///
@@ -10061,6 +10189,7 @@ pub async fn run(
     }
     drop(spawn_llm_health_prober(state.clone()));
     drop(spawn_pool_state_publisher(state.clone()));
+    drop(spawn_quota_projection(state.clone()));
     // git 身份自举：网关自己得有上游身份，否则装完机没人给它配密钥。它落在本进程
     // 而不是主应用里，因为这条链要用的东西都只在这边——挂进来的生效私钥（自证握手读
     // 的就是它）、到上游的 SSH 通道、以及带外那一片 Secret 的写权。该由哪个进程跑
@@ -17847,7 +17976,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     struct StubBudgetGate {
         verdict: cog_core::TaskBudgetVerdict,
         broken: bool,
-        charged: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+        /// 投影写进来的值，按调用顺序。这里不该出现「请求路径记了一笔」——
+        /// 网关侧已经没有那条路，这条记录是给投影的测试看的。
+        projected: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
         /// 名册上的任务。`budget` 只对这些答得出来，与真实现（限值键存在与否）
         /// 同一个形状：名册上的每一条都该有一条限值。
         tasks: Vec<String>,
@@ -17858,7 +17989,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             Self {
                 verdict,
                 broken: false,
-                charged: Arc::new(std::sync::Mutex::new(Vec::new())),
+                projected: Arc::new(std::sync::Mutex::new(Vec::new())),
                 tasks: Vec::new(),
             }
         }
@@ -17911,17 +18042,17 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             Ok(self.verdict)
         }
 
-        async fn charge(
+        async fn set_spent(
             &self,
             task_id: &str,
             tokens: u64,
             _now_unix: i64,
-        ) -> cog_core::SFResult<u64> {
-            self.charged
+        ) -> cog_core::SFResult<()> {
+            self.projected
                 .lock()
                 .unwrap()
                 .push((task_id.to_string(), tokens));
-            Ok(tokens)
+            Ok(())
         }
     }
 
@@ -18031,42 +18162,61 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
     }
 
-    /// 一次真实花销要回到这件任务上；没声明任务、没有门、零 token 时什么都不记。
+    /// 账上今天花掉的那些人，各自写进自己的格子，写的是绝对值。
     ///
-    /// 零 token 那一格不是洁癖：账本里每天有大量零用量的行，把它们也算成一次调用
-    /// 会让「这件任务今天被问了多少次」变成一个与花销无关的数。
+    /// 这一半的判据只有两件事：人和数对得上（不是把总量平均或堆到一个人头上），
+    /// 以及写的是账上那个数而不是累计。请求路径上已经没有第二条写格子的路——
+    /// `HierarchyManager` 契约上只剩 `set_used` 这一个写入口。
     #[tokio::test]
-    async fn a_real_charge_reaches_the_task_and_nothing_else_does() {
-        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
-        let gate = Arc::new(StubBudgetGate::new(budgeted(true, 0, 1000)));
-        state.task_budget = Some(gate.clone());
-
-        charge_task_budget(&state, None, 50).await;
-        charge_task_budget(&state, Some("t-1"), 0).await;
-        assert!(gate.charged.lock().unwrap().is_empty());
-
-        charge_task_budget(&state, Some("t-1"), 50).await;
+    async fn the_person_projection_writes_each_person_their_own_total() {
+        let hierarchy = StubHierarchy::new(&[]);
+        project_person_spend(
+            &hierarchy,
+            &[("u-1".to_string(), 1200), ("u-2".to_string(), 30)],
+        )
+        .await;
         assert_eq!(
-            gate.charged.lock().unwrap().as_slice(),
-            &[("t-1".to_string(), 50)]
+            hierarchy.projected.lock().unwrap().as_slice(),
+            &[("u-1".to_string(), 1200), ("u-2".to_string(), 30)],
+            "一个人一格，各写账上那个绝对值；堆成一个人或相加都是第二本账"
         );
+    }
 
-        // 没有预算门时也不 panic、不记：这一格是装配事实，不是判定结果。
-        state.task_budget = None;
-        charge_task_budget(&state, Some("t-1"), 50).await;
-        assert_eq!(gate.charged.lock().unwrap().len(), 1);
+    /// 一件今天还没花钱的任务写成 0，而不是跳过；名册外的任务一个字节都不写。
+    ///
+    /// 跳过没花过的那件，是让昨天的数留在格子上——它会在今天第一次调用之前就被
+    /// 拒，理由写着「已经花完了」，而它昨天确实花完了、今天一分没花。名册外那一条
+    /// 是反向的：账上有一行，但没人声明过预算，给它建格子等于把「没人管」写成
+    /// 「额度为零」。
+    #[tokio::test]
+    async fn the_task_projection_covers_the_roster_and_zeroes_the_idle_one() {
+        let gate = StubBudgetGate::new(budgeted(false, 0, 1000)).with_tasks(&["t-1", "t-2"]);
+        project_task_spend(
+            &gate,
+            &["t-1".to_string(), "t-2".to_string()],
+            &[("t-1".to_string(), 500), ("t-9".to_string(), 700)],
+            1_600_000_000,
+        )
+        .await;
+
+        assert_eq!(
+            gate.projected.lock().unwrap().as_slice(),
+            &[("t-1".to_string(), 500), ("t-2".to_string(), 0)],
+            "名册上的每一件都写一次，账上没有花销的那件写 0；名册外的 t-9 不写"
+        );
     }
 
     // ---- 按人的当日额度：同一份层级管理器，判与记在这条路径上 ---------------
 
     /// 一格里的人：今天花了多少、上限是多少。没登记的格子就是「没人配过」。
     ///
-    /// 这个替身只摆判定与记账的那两步真值（越界拒、每发都记），逐格的日界与级联
-    /// 在 cog-quota 里钉过；这里要钉的是网关拿到判定之后做什么。
+    /// 这个替身只摆判定的那一步真值（越界拒），逐格的日界与级联在 cog-quota 里
+    /// 钉过；这里要钉的是网关拿到判定之后做什么。记账那一面没有替身可摆——
+    /// 网关不再往格子里加数，`set_used` 收到的值原样记下，好让测试看见投影写了什么。
     struct StubHierarchy {
         cells: Vec<(String, u64, cog_core::QuotaLimits)>,
         broken: bool,
-        consumed: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+        projected: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
     }
 
     impl StubHierarchy {
@@ -18083,7 +18233,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     })
                     .collect(),
                 broken: false,
-                consumed: Arc::new(std::sync::Mutex::new(Vec::new())),
+                projected: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -18144,31 +18294,19 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             }
         }
 
-        async fn consume(
+        async fn set_used(
             &self,
-            ctx: &cog_core::QuotaContext,
+            scope: cog_core::QuotaScope,
+            target_id: &str,
             tokens: u64,
-        ) -> cog_core::SFResult<cog_core::HierarchyDecision> {
-            if let Some(id) = ctx.user_id.as_deref() {
-                self.consumed.lock().unwrap().push((id.to_string(), tokens));
-            }
-            Ok(self.check(ctx, 0).await)
-        }
-
-        async fn refund(
-            &self,
-            _ctx: &cog_core::QuotaContext,
-            _tokens: u64,
         ) -> cog_core::SFResult<()> {
+            if scope == cog_core::QuotaScope::User {
+                self.projected
+                    .lock()
+                    .unwrap()
+                    .push((target_id.to_string(), tokens));
+            }
             Ok(())
-        }
-
-        async fn pre_deduct(
-            &self,
-            ctx: &cog_core::QuotaContext,
-            tokens: u64,
-        ) -> cog_core::SFResult<cog_core::HierarchyDecision> {
-            Ok(self.check(ctx, tokens).await)
         }
 
         async fn history(
@@ -18367,6 +18505,30 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
     }
 
+    /// 一条调用算在谁头上：声明了属主的算属主，没声明的算提交这件活的人。
+    ///
+    /// 这个次序必须与账本那次 join 的 `COALESCE` 相同，否则同一个事实在两处有两
+    /// 个答案：账把花销记在 A 头上，判定按 B 去问他花完了没有。B 永远没花过，
+    /// A 从来没被拦过。
+    #[test]
+    fn a_call_belongs_to_the_person_it_declared_or_else_the_one_who_submitted_the_task() {
+        assert_eq!(
+            person_of_a_call(Some("declared"), Some("submitter")),
+            Some("declared".to_string()),
+            "调用方当场声明的属主比任务行上那个「谁交的活」更近"
+        );
+        assert_eq!(
+            person_of_a_call(None, Some("submitter")),
+            Some("submitter".to_string()),
+            "没声明属主时，为这件活做的调用算在提交人头上——账就是这么记的"
+        );
+        assert_eq!(
+            person_of_a_call(None, None),
+            None,
+            "两处都没有主体时不许编一个名字"
+        );
+    }
+
     /// 没有人给这个人配过额度就不判，哪怕今天已经花了天文数字。
     ///
     /// 层级管理器对没配过的格子有一份默认上限——那是「读起来是多少」，不是「谁定的」。
@@ -18405,31 +18567,6 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 .is_none(),
             "本进程没有层级管理器时判不了，只能放行"
         );
-    }
-
-    /// 每一发真实花销都记到这个人头上——包括还没人给他配额度的时候。
-    ///
-    /// 只在「配过额度」之后才记，会让上半天花掉的那部分不计入：配额度的人看到的是
-    /// 「还剩一整份」，而账上说这个人今天已经花过。零 token 与没有主体仍然不记。
-    #[tokio::test]
-    async fn a_real_charge_reaches_the_person_even_before_any_ceiling_is_set() {
-        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
-        let hierarchy = Arc::new(StubHierarchy::new(&[("u-1", 0, 800, 1000)]));
-        state.owner_budget = Some(hierarchy.clone());
-
-        charge_owner_budget(&state, None, 50).await;
-        charge_owner_budget(&state, Some("u-1"), 0).await;
-        assert!(hierarchy.consumed.lock().unwrap().is_empty());
-
-        charge_owner_budget(&state, Some("u-1"), 50).await;
-        assert_eq!(
-            hierarchy.consumed.lock().unwrap().as_slice(),
-            &[("u-1".to_string(), 50)]
-        );
-
-        state.owner_budget = None;
-        charge_owner_budget(&state, Some("u-1"), 50).await;
-        assert_eq!(hierarchy.consumed.lock().unwrap().len(), 1);
     }
 
     /// 拒绝在账上落下的是它自己那个词。

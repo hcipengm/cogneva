@@ -179,9 +179,11 @@ async fn test_check_warns_at_soft_limit() {
         user_id: Some(user.clone()),
         ..Default::default()
     };
-    // Default soft=80, hard=100. Consume 80 → next 5 would project 85 ≥ 80
-    // but < 100, so we should warn but not block.
-    mgr.consume(&ctx, 80).await.expect("consume ok");
+    // Default soft=80, hard=100. The cell stands at 80 → the next 5 projects
+    // 85 ≥ 80 but < 100, so we should warn but not block.
+    mgr.project_used(QuotaScope::User, &user, 80)
+        .await
+        .expect("project ok");
     let decision = mgr.check(&ctx, 5).await;
     assert!(decision.allowed);
     assert_eq!(decision.warnings.len(), 1);
@@ -197,7 +199,9 @@ async fn test_check_blocks_at_hard_limit() {
         user_id: Some(user.clone()),
         ..Default::default()
     };
-    mgr.consume(&ctx, 95).await.expect("consume ok");
+    mgr.project_used(QuotaScope::User, &user, 95)
+        .await
+        .expect("project ok");
     let decision = mgr.check(&ctx, 10).await;
     assert!(!decision.allowed);
     assert_eq!(decision.blocked_by.len(), 1);
@@ -238,72 +242,58 @@ async fn test_full_hierarchy_blocks_at_team() {
     assert!(d.blocked_by.iter().any(|s| s.scope == QuotaScope::Team));
 }
 
+/// 投影写的是**当天累计的绝对值**，不是一笔增量：跑两遍同一份账，格子还是那个数。
+///
+/// 这一格是账本的投影，所以重算幂等是它成立的全部理由——丢了键，下一拍写回来；
+/// 账上有了更正，下一拍把格子往回改。累加的写法两条都做不到：跑两遍翻一倍，
+/// 键丢了也永远抹平不了。
 #[tokio::test]
-async fn test_consume_increments_history() {
-    let prefix = "ti6";
+async fn projecting_the_same_ledger_twice_leaves_the_cell_at_that_value() {
     let mgr = fresh_manager();
-    let user = format!("{}:user", prefix);
+    let user = "ti6:user";
     let ctx = QuotaContext {
-        user_id: Some(user.clone()),
+        user_id: Some(user.to_string()),
         ..Default::default()
     };
-    mgr.consume(&ctx, 10).await.expect("consume ok");
-    mgr.consume(&ctx, 25).await.expect("consume ok");
+    mgr.project_used(QuotaScope::User, user, 35)
+        .await
+        .expect("project ok");
+    mgr.project_used(QuotaScope::User, user, 35)
+        .await
+        .expect("project ok");
+
+    let d = mgr.check(&ctx, 0).await;
+    assert_eq!(
+        d.scopes[0].used_today, 35,
+        "投影跑两遍还是 35；65 说明它在一笔一笔地加"
+    );
     let history = mgr
-        .history(QuotaScope::User, &user, 1)
+        .history(QuotaScope::User, user, 1)
         .await
         .expect("history ok");
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].tokens_used, 35);
 }
 
+/// 账上改小之后，格子跟着改小——这是「账本是正本」的可观测后果。
 #[tokio::test]
-async fn test_refund_undoes_consumption() {
-    let prefix = "ti7";
+async fn a_corrected_ledger_pulls_the_cell_down_on_the_next_pass() {
     let mgr = fresh_manager();
-    let user = format!("{}:user", prefix);
+    let user = "ti7:user";
     let ctx = QuotaContext {
-        user_id: Some(user.clone()),
+        user_id: Some(user.to_string()),
         ..Default::default()
     };
-    mgr.consume(&ctx, 30).await.expect("consume ok");
-    mgr.refund(&ctx, 20).await.expect("refund ok");
+    mgr.project_used(QuotaScope::User, user, 30)
+        .await
+        .expect("project ok");
+    mgr.project_used(QuotaScope::User, user, 10)
+        .await
+        .expect("project ok");
     let d = mgr.check(&ctx, 0).await;
-    assert!(d.allowed);
-    let user_status = d
-        .scopes
-        .iter()
-        .find(|s| s.scope == QuotaScope::User)
-        .expect("user scope present");
-    assert_eq!(user_status.used_today, 10);
-}
-
-#[tokio::test]
-async fn test_pre_deduct_returns_decision_when_allowed() {
-    let prefix = "ti8";
-    let mgr = fresh_manager();
-    let ctx = QuotaContext {
-        user_id: Some(format!("{}:user", prefix)),
-        ..Default::default()
-    };
-    let d = mgr.pre_deduct(&ctx, 10).await.expect("ok");
-    assert!(d.allowed);
-}
-
-#[tokio::test]
-async fn test_pre_deduct_returns_err_when_blocked() {
-    let prefix = "ti9";
-    let mgr = fresh_manager();
-    let user = format!("{}:user", prefix);
-    let ctx = QuotaContext {
-        user_id: Some(user.clone()),
-        ..Default::default()
-    };
-    mgr.consume(&ctx, 99).await.expect("consume ok");
-    let res = mgr.pre_deduct(&ctx, 10).await;
-    assert!(
-        res.is_err(),
-        "should error when projected exceeds hard limit"
+    assert_eq!(
+        d.scopes[0].used_today, 10,
+        "投影写的是绝对值：账说 10，格子就得是 10"
     );
 }
 
@@ -323,7 +313,9 @@ async fn test_refusal_names_the_blocked_scope_and_the_reset() {
         workspace_id: Some(format!("{}:ws", prefix)),
         ..Default::default()
     };
-    mgr.consume(&ctx, 95).await.expect("consume ok");
+    mgr.project_used(QuotaScope::User, &format!("{}:user", prefix), 95)
+        .await
+        .expect("project ok");
 
     let decision = mgr.check(&ctx, 10).await;
     assert!(!decision.allowed);
@@ -470,7 +462,7 @@ async fn a_stored_limit_that_does_not_parse_is_an_error_not_an_absence() {
 /// 判的依据是记账记出来的那个数。
 ///
 /// 这一条把两步钉在一起：`limits()` 的答案决定判不判（`None` = 没人配过，不许拿
-/// 默认上限去拒人），而 `consume()` 记下的花销必须出现在之后的判定里——两处各写
+/// 默认上限去拒人），而投影写进格子的花销必须出现在之后的判定里——两处各写
 /// 各的键时，读出来永远是「一分没花」。
 #[tokio::test]
 async fn the_person_axis_answers_only_what_an_operator_declared_and_counts_what_was_spent() {
@@ -502,7 +494,9 @@ async fn the_person_axis_answers_only_what_an_operator_declared_and_counts_what_
         .expect("an override was just written");
     assert_eq!(declared.hard_limit, 1000);
 
-    mgr.consume(&ctx, 1200).await.expect("consume ok");
+    mgr.project_used(QuotaScope::User, "ti9:user", 1200)
+        .await
+        .expect("project ok");
     let decision = mgr.check(&ctx, 0).await;
     assert!(!decision.allowed, "记进去的花销必须出现在下一次判定里");
     assert_eq!(decision.blocked_by[0].used_today, 1200);
