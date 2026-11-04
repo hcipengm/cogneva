@@ -2833,11 +2833,13 @@ mod tests {
     #[tokio::test]
     async fn the_early_verdict_is_the_one_landing_gives() {
         let chan = channel(crate::config::LandingPolicy::default());
+        // 被拒的那条路径要是**仍然**在白名单外的形状：成员的集成测试目录已经
+        // 放开（cargo 与 CI 都判它），同一个目录下的非 Rust 文件才是仍然拒的形状。
         let denied = change(
             "c1",
             &diff_touching(&[
                 "crates/cog-github/src/lib.rs",
-                "crates/cog-github/tests/it.rs",
+                "crates/cog-github/tests/fixtures/payload.json",
             ]),
         );
 
@@ -2849,7 +2851,9 @@ mod tests {
             "提前判的拒绝要走终局那一支，否则调用方会把它当成环境问题再跑一遍：{early:?}"
         );
         assert!(
-            early.to_string().contains("crates/cog-github/tests/it.rs"),
+            early
+                .to_string()
+                .contains("crates/cog-github/tests/fixtures/payload.json"),
             "点名要落在被拒的路径上：{early}"
         );
 
@@ -2861,7 +2865,8 @@ mod tests {
             "提前判与落地判要落在同一个出口上，否则调用方对同一个拒绝会用两种做法：{late:?}"
         );
         assert!(
-            late.to_string().contains("crates/cog-github/tests/it.rs"),
+            late.to_string()
+                .contains("crates/cog-github/tests/fixtures/payload.json"),
             "落地给的读数必须点同一条路径：{late}"
         );
 
