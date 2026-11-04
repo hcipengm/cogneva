@@ -4246,6 +4246,13 @@ pub(crate) mod tests {
     /// CI 失败」，而那件失败早就不在了。
     #[tokio::test]
     async fn a_ci_fix_is_closed_when_its_workflow_later_ran_green() {
+        // 这一轮会读写状态文件，而状态目录是进程级的 `COGNEVA_DATA_DIR`：
+        // 不占这把锁、不给自己一份临时目录，就会把并发跑的另一个测试的
+        // `discovery-guards.json` 覆盖掉（吞掉它刚写的答案，或把它的守卫带进来）。
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+
         let provider = Arc::new(MockProvider {
             issues: vec![],
             comments: Mutex::new(vec![]),
@@ -4294,6 +4301,7 @@ pub(crate) mod tests {
             "结案的理由要说清是哪一次绿跑替掉了它：{}",
             cancelled[0].1
         );
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     /// 绿的是别的流水线，不算数。
@@ -4302,6 +4310,13 @@ pub(crate) mod tests {
     /// 按分支问而不按 workflow 问，就会拿一次文档构建去结掉一次真的编译失败。
     #[tokio::test]
     async fn a_green_run_of_another_workflow_does_not_close_it() {
+        // 这一轮会读写状态文件，而状态目录是进程级的 `COGNEVA_DATA_DIR`：
+        // 不占这把锁、不给自己一份临时目录，就会把并发跑的另一个测试的
+        // `discovery-guards.json` 覆盖掉（吞掉它刚写的答案，或把它的守卫带进来）。
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+
         let provider = Arc::new(MockProvider {
             issues: vec![],
             comments: Mutex::new(vec![]),
@@ -4341,11 +4356,19 @@ pub(crate) mod tests {
             "别的流水线跑绿被当成了这条的修复：{:?}",
             orchestrator.cancelled()
         );
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     /// 绿的那次如果在那次失败之前，什么也证明不了：分支先绿、后坏。
     #[tokio::test]
     async fn a_green_run_older_than_the_failure_does_not_close_it() {
+        // 这一轮会读写状态文件，而状态目录是进程级的 `COGNEVA_DATA_DIR`：
+        // 不占这把锁、不给自己一份临时目录，就会把并发跑的另一个测试的
+        // `discovery-guards.json` 覆盖掉（吞掉它刚写的答案，或把它的守卫带进来）。
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+
         let provider = Arc::new(MockProvider {
             issues: vec![],
             comments: Mutex::new(vec![]),
@@ -4385,6 +4408,7 @@ pub(crate) mod tests {
             "失败之前那次绿被当成了修复：{:?}",
             orchestrator.cancelled()
         );
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     /// 比这张单新的那次运行**还没结束**，不是结论：它跑完可能红。
@@ -4394,6 +4418,13 @@ pub(crate) mod tests {
     /// 十张单纹丝不动，而几条街外那次已结束的运行早就绿了。
     #[tokio::test]
     async fn a_run_still_going_does_not_close_it() {
+        // 这一轮会读写状态文件，而状态目录是进程级的 `COGNEVA_DATA_DIR`：
+        // 不占这把锁、不给自己一份临时目录，就会把并发跑的另一个测试的
+        // `discovery-guards.json` 覆盖掉（吞掉它刚写的答案，或把它的守卫带进来）。
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+
         let provider = Arc::new(MockProvider {
             issues: vec![],
             comments: Mutex::new(vec![]),
@@ -4433,11 +4464,19 @@ pub(crate) mod tests {
             "还在跑的那次被当成了判绿：{:?}",
             orchestrator.cancelled()
         );
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     /// 已经归属到某个 unit 的单不结：那是它手上的活，收尾该由它自己写下。
     #[tokio::test]
     async fn a_ci_fix_claimed_by_a_unit_is_left_to_that_unit() {
+        // 这一轮会读写状态文件，而状态目录是进程级的 `COGNEVA_DATA_DIR`：
+        // 不占这把锁、不给自己一份临时目录，就会把并发跑的另一个测试的
+        // `discovery-guards.json` 覆盖掉（吞掉它刚写的答案，或把它的守卫带进来）。
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+
         let provider = Arc::new(MockProvider {
             issues: vec![],
             comments: Mutex::new(vec![]),
@@ -4477,6 +4516,7 @@ pub(crate) mod tests {
             "有归属的行被平台自己结掉了：{:?}",
             orchestrator.cancelled()
         );
+        std::env::remove_var("COGNEVA_DATA_DIR");
     }
 
     fn ci_fix_row(
@@ -5317,5 +5357,72 @@ pub(crate) mod tests {
             .map
             .contains_key("intent-assess-github-issue-7-aaaaaaaaaaaaaaaa"));
         assert!(store.map.contains_key("unrelated-key"));
+    }
+
+    /// The name of every test that runs a round without taking the process-wide
+    /// state directory for itself.
+    ///
+    /// A round both reads and writes `discovery-guards.json` under the state
+    /// directory, and that directory comes from a process-wide environment
+    /// variable. Two tests running at once therefore write the same file: one
+    /// of them loses the answers it just recorded, or inherits the other's
+    /// guards. The symptom is a test that is green on its own and red under
+    /// `cargo test` -- the worst kind, because the next person reads it as
+    /// flakiness and reruns it.
+    fn tests_running_a_round_without_the_lock(source: &str) -> Vec<String> {
+        let Some(tests_module) = source.find("pub(crate) mod tests {") else {
+            return Vec::new();
+        };
+        let mut offenders = Vec::new();
+        for chunk in source[tests_module..].split("#[tokio::test]").skip(1) {
+            if !chunk.contains(".run_once(") || chunk.contains("ENV_LOCK") {
+                continue;
+            }
+            let name: String = chunk
+                .find("async fn ")
+                .map(|at| &chunk[at + "async fn ".len()..])
+                .unwrap_or("")
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            offenders.push(name);
+        }
+        offenders
+    }
+
+    /// Reads this file's own source rather than running the rounds: a run that
+    /// loses its file another way still has to be red, and the check has to be
+    /// red *before* the flake is observed, on the commit that introduces it.
+    #[test]
+    fn a_test_that_runs_a_round_holds_the_state_directory() {
+        let offenders = tests_running_a_round_without_the_lock(include_str!("discovery_loop.rs"));
+        assert!(
+            offenders.is_empty(),
+            "these tests run a round without ENV_LOCK and a tempdir, so they will \
+             overwrite another test's discovery-guards.json: {offenders:?}"
+        );
+    }
+
+    /// The gate above is only worth its line if it can go red.
+    ///
+    /// The attribute is assembled from two pieces so this fixture does not
+    /// itself look like a test to the scanner, which reads raw text.
+    #[test]
+    fn the_state_directory_gate_names_a_test_that_forgets_it() {
+        let attr = concat!("#[tokio::", "test]");
+        let source = format!(
+            "pub(crate) mod tests {{\n\
+             {attr}\n\
+             async fn forgets() {{\n    \
+             loop_.run_once().await;\n}}\n\
+             {attr}\n\
+             async fn remembers() {{\n    \
+             let _g = ENV_LOCK.lock();\n    \
+             loop_.run_once().await;\n}}\n"
+        );
+        assert_eq!(
+            tests_running_a_round_without_the_lock(&source),
+            vec!["forgets".to_string()]
+        );
     }
 }
