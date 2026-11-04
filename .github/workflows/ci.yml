@@ -204,6 +204,18 @@ jobs:
         run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-observability --test person_and_task_spend -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The quota path asks the task graph who submitted a task once per request,
+      # and that read is served by an index whose first column has to be the one
+      # the lookup filters on. Neither half can be answered without a server: an
+      # index's leading column is what the planner reads out of `pg_index`, and
+      # whether the read uses it shows up only in a plan taken with sequential
+      # scans disabled. A name-only check stays green after the column order is
+      # swapped, which is the failure this is here to see.
+      - name: Live-DB task attribution index
+        if: ${{ !cancelled() }}
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test task_attribution_index -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A schema statement's wait for its locks is a fact about the server's
       # lock queue across two sessions, so nothing that runs without a server
       # can see any of it: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes
