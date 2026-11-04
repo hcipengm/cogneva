@@ -524,6 +524,23 @@ impl OutwardCensus {
         self.state.lock().await.config = Some((cell, sources));
     }
 
+    /// 这条源的四格结局从见到它那一刻起就存在，值可以是 0。
+    ///
+    /// 计数只在事情发生时加一，于是「一条也没交出去」与「这一格没接上」在读数面
+    /// 上长得一样：两条都是序列缺席。外循环最要紧的那个问题恰好是前一种——它跑
+    /// 了、抓到了、却一条也没交出去——所以四格先落到 0，之后只往上加。
+    pub async fn declare_source(&self, source: &str) {
+        let mut state = self.state.lock().await;
+        for cell in [
+            Handover::Handed.cell(),
+            Handover::AlreadyHeld.cell(),
+            Handover::Failed.cell(),
+            "unusable",
+        ] {
+            bump(&mut state.items, source, cell, 0);
+        }
+    }
+
     pub async fn record_pass(&self, source: &str, cell: &str) {
         bump(&mut self.state.lock().await.passes, source, cell, 1);
     }
@@ -753,6 +770,11 @@ pub fn spawn_outward_loop(
                 // Items a pass found but could not hand over. They are asked
                 // again on the next wake, not on the source's next cadence.
                 let mut pending: Vec<Retry> = Vec::new();
+                // 每一格先落到 0：这条源跑起来了、一条也没交出去，读数是 0，不是
+                // 一条缺席的序列。
+                for source in &sources {
+                    census.declare_source(&source.name).await;
+                }
                 loop {
                     beat.beat();
                     tokio::select! {
@@ -1306,6 +1328,37 @@ mod tests {
             census_items(&census).await,
             vec![("rust".to_string(), "handed".to_string(), 1.0)]
         );
+    }
+
+    /// 一条也没交出去，读数要说 0，而不是整条缺席。
+    ///
+    /// 缺席的序列与「跑了一整天、一条都没交出去」在面板上是同一片空白，而后者
+    /// 正是外循环要回答的问题。四格在见到源的那一刻就落到 0。
+    #[tokio::test]
+    async fn a_source_that_handed_nothing_reads_zero_rather_than_nothing() {
+        let census = OutwardCensus::new();
+        census.declare_source("rust").await;
+
+        let mut cells = census_items(&census).await;
+        cells.sort_by(|a, b| a.1.cmp(&b.1));
+        assert_eq!(
+            cells,
+            vec![
+                ("rust".to_string(), "already_held".to_string(), 0.0),
+                ("rust".to_string(), "failed".to_string(), 0.0),
+                ("rust".to_string(), "handed".to_string(), 0.0),
+                ("rust".to_string(), "unusable".to_string(), 0.0),
+            ],
+            "四格先落到 0：读者要能分清「一条都没交出去」与「这一格没接上」"
+        );
+
+        census.record_items("rust", "handed", 1).await;
+        let handed = census_items(&census)
+            .await
+            .into_iter()
+            .find(|(_, cell, _)| cell == "handed")
+            .expect("handed 还在");
+        assert_eq!(handed.2, 1.0, "落到 0 之后照常往上加");
     }
 
     /// 一直交不出去的那一条最终要算一次 `failed`，而不是无声消失。
