@@ -2934,6 +2934,14 @@ export interface QuotaLimitsReading {
   effective: QuotaLimitPair;
   used_today: number;
   remaining: number;
+  /**
+   * 这一级的上限写下来之后，有没有一条路径会真的拒一发。
+   *
+   * 团队 / 组织 / 全局是 `false`：没有任何一处能把一次调用归到它们名下，写进
+   * 去的上限永远不会被读到，服务端因此拒写。读面把它带出来，是为了让已经存在
+   * 的覆盖不至于在页面上读起来像在生效。
+   */
+  enforced: boolean;
 }
 
 function quotaLimitsPath(scope: string, id: string): string {

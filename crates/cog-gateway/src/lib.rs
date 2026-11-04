@@ -2520,9 +2520,74 @@ struct QuotaLimitsResponse {
     /// 检查面此刻会用的那一对（没有覆盖时就是默认值）。
     effective: cog_core::QuotaLimits,
     /// 这一格今天的计数器读数。计数器由记账方推进，读数本身不区分
-    /// 「没人用」与「没人记」。
+    /// 「没人用」与「没人记」。只有人与工作空间两格有记账方；其余三级这个数
+    /// 永远是 0，读它的人要配合 `enforced` 才知道那是「没人花」还是「没人记」。
     used_today: u64,
     remaining: u64,
+    /// 这一级的上限写下来之后，有没有一条路径会真的拒一发。
+    ///
+    /// `false` 的三级（团队、组织、全局）没有任何一处能把一次调用归到它们名下
+    /// ——任务图只有工作区，代理路径也不会从请求里猜调用方属于哪个团队。写在那
+    /// 里的上限永远不会被读到，所以写入面直接拒绝；读面把它标出来，让已经存在
+    /// 的覆盖不至于读起来像在生效。
+    enforced: bool,
+}
+
+/// 有执法路径的那几级，以及各自靠什么把一次调用归到它名下。
+///
+/// 返回 `Some` 的层级，上限写下来之后会在花销越过它时拒掉下一发；`None` 的
+/// 层级写下来的只是一行永远没人读的配置。写入面、读面与测试都用这一个判断，
+/// 三处各写一份的话，改了一处另两处就开始说谎。
+fn scope_enforcement(scope: cog_core::QuotaScope) -> Option<&'static str> {
+    match scope {
+        // 代理路径按「调用方声明的属主，否则是任务提交人」判，与账本折叠花销
+        // 用的是同一条解析。
+        cog_core::QuotaScope::User => Some("the LLM proxy path judges the call's person"),
+        // 代理路径按任务行上的 `workspace_id` 判：这一级的标识只有任务图知道。
+        cog_core::QuotaScope::Workspace => {
+            Some("the LLM proxy path judges the workspace of the task the call is made for")
+        }
+        // 没有任何一处能把一次调用归到下面三级：任务图只有工作区，请求里也没有
+        // 团队／组织字段。要开一级，先给它一个归属来源，再把它加到这里。
+        cog_core::QuotaScope::Team
+        | cog_core::QuotaScope::Organization
+        | cog_core::QuotaScope::Global => None,
+    }
+}
+
+#[cfg(test)]
+mod quota_scope_enforcement_tests {
+    use super::*;
+
+    /// 管理面接受的每一级，必须同时有一条判定路径与一条投影写者。
+    ///
+    /// 缺任何一条都是静默失效：只判不投，格子永远是 0，上限永远不会被撞；只投
+    /// 不判，格子一路涨上去而没有任何一发被拒。判据读的是代理路径的源码而不是
+    /// 一份名单——名单会和代码脱节，源码不会：删掉那条判定，这一格当场红。
+    #[test]
+    fn every_scope_the_write_path_accepts_is_judged_and_projected_on_the_proxy_path() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/security_gateway.rs");
+        let text = std::fs::read_to_string(&path).expect("读得到代理路径的源码");
+        // 测试替身里有同名调用，先切掉测试模块：那里证明不了生产路径怎么做。
+        let production = text.split("\n#[cfg(test)]\nmod ").next().unwrap_or("");
+        let squeezed: String = production.chars().filter(|c| !c.is_whitespace()).collect();
+
+        for scope in cog_core::QuotaScope::cascade_order() {
+            let variant = format!("{scope:?}");
+            let accepted = scope_enforcement(scope).is_some();
+            let judged = squeezed.contains(&format!("limits(cog_core::QuotaScope::{variant},"));
+            let projected =
+                squeezed.contains(&format!("set_used(cog_core::QuotaScope::{variant},"));
+            assert_eq!(
+                accepted, judged,
+                "{scope:?}: 写入面接受的层级必须有一条判定路径，反之亦然（accepted={accepted} judged={judged}）"
+            );
+            assert_eq!(
+                accepted, projected,
+                "{scope:?}: 有判定的层级必须也有投影写者——只判不投，格子永远是 0，上限永远不会被撞"
+            );
+        }
+    }
 }
 
 /// 上限的写入载体。
@@ -2596,6 +2661,7 @@ async fn quota_limits_body(
         effective: status.map(|s| s.limits).unwrap_or_default(),
         used_today: status.map(|s| s.used_today).unwrap_or(0),
         remaining: status.map(|s| s.remaining).unwrap_or(0),
+        enforced: scope_enforcement(scope).is_some(),
     })
 }
 
@@ -2642,6 +2708,11 @@ async fn quota_limits_handler(
 /// 写一格的日上限。写完读回同一条形状，所以调用方看到的是写进去的
 /// 那个值——`soft` 高于 `hard` 时会被压到 `hard`，不压的话生效值会比
 /// 声明值小，而读的人只会看见声明值。
+///
+/// 没有执法路径的那三级（团队、组织、全局）拒写：一条永远不会被读到的上限，
+/// 管理面会把它显示成「配过了」，花销越过它时却没有任何一发被拒——那是平台替
+/// 属主做了一个自己兑现不了的承诺。拒绝里点名哪几级有执法路径，读面同时用
+/// `enforced` 标出旧覆盖。
 async fn quota_set_limits_handler(
     State(state): State<Arc<GatewayState>>,
     axum::extract::Path((scope, target_id)): axum::extract::Path<(String, String)>,
@@ -2654,6 +2725,25 @@ async fn quota_set_limits_handler(
         Ok(scope) => scope,
         Err(response) => return *response,
     };
+    if scope_enforcement(scope).is_none() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "quota_scope_not_enforced",
+                "message": format!(
+                    "no spend path attributes a call to scope {:?}; a ceiling written here would never be read. Enforced scopes: {}",
+                    scope.as_str(),
+                    cog_core::QuotaScope::cascade_order()
+                        .into_iter()
+                        .filter(|scope| scope_enforcement(*scope).is_some())
+                        .map(|scope| scope.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            })),
+        )
+            .into_response();
+    }
     let limits = cog_core::QuotaLimits::new(payload.soft_limit, payload.hard_limit);
     if let Err(e) = hierarchy.set_limits(scope, &target_id, limits).await {
         tracing::warn!("Quota limits write failed: {}", e);

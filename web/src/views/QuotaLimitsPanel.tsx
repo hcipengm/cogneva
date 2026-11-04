@@ -16,7 +16,7 @@ import { resourceKey } from '@/store/frameTick';
  * 日上限的管理面：给某一格（人 / 工作空间 / 团队 / 组织 / 全局）写下
  * 一对 soft / hard，或把覆盖删掉、让它回到默认值。
  *
- * 这一面只写声明，不写计数：计数由安全网关逐调用记（今天只有「个人」这一格有写者）。
+ * 这一面只写声明，不写计数：计数由安全网关按账本投影（今天人与工作空间两格有写者）。
  * 两个读法必须同时给出，因为它们答的不是同一个问题：
  * 声明（`limits`）答「这一格配过没有」，生效（`effective`）答「检查会怎么判」。
  * 没有覆盖时生效值就是默认值——只显示它会让人以为默认值是自己配的，于是
@@ -145,9 +145,9 @@ export function QuotaLimitsPanel() {
           caveat="「声明」是有人为这一格写过的那一对，「生效」是检查此刻真正会用的那一对——没有覆盖时后者就是默认值。"
         >
           {/* 这一格配的是一对什么数：soft 落在 hard 之内的哪里，中间那截就是 soft
-              拦下调用之前预留的余量。用量那条只在「个人」这一格画——五级里只有它
-              有写者（安全网关按每次调用声明的属主记真实 token），其余四格至今没有，
-              把它们画成一根零长度的条就是拿「没量过」冒充「一条都没有」。 */}
+              拦下调用之前预留的余量。用量那条只在「人」与「工作空间」两格画——五级里
+              只有它们有投影写者（安全网关按账本把这一格的真实花销写回来），其余三级
+              至今没有，把它们画成一根零长度的条就是拿「没量过」冒充「一条都没有」。 */}
           {shownPair !== null && shownPair.hard_limit > 0 && (
             <Meter
               label={reading.limits ? '声明：soft 落在 hard 之内的哪里' : '生效：soft 落在 hard 之内的哪里'}
@@ -156,7 +156,7 @@ export function QuotaLimitsPanel() {
               note={`${shownPair.soft_limit.toLocaleString()} / ${shownPair.hard_limit.toLocaleString()}`}
             />
           )}
-          {reading.scope === 'user' && reading.effective.hard_limit > 0 && (
+          {reading.enforced && reading.effective.hard_limit > 0 && (
             <Meter
               label="这个人今天已花 / 生效的 hard"
               value={reading.used_today}
@@ -182,6 +182,11 @@ export function QuotaLimitsPanel() {
             <Reading label="今天已记" value={reading.used_today.toLocaleString()} />
             <Reading label="剩余" value={reading.remaining.toLocaleString()} />
             <Reading label="这一格" value={<span className="mono text-[11px]">{reading.target_id}</span>} />
+            <Reading
+              label="执法"
+              value={reading.enforced ? '有' : '没有'}
+              note={reading.enforced ? '越过之后会拒下一发' : '这一级写不进去'}
+            />
           </div>
         </Readings>
       ) : (
@@ -207,7 +212,7 @@ export function QuotaLimitsPanel() {
           className="mono w-24 px-2 py-0.5 text-[11px]"
           style={{ background: 'var(--paper)', color: 'var(--ink-1000)', border: '1px solid var(--line)' }}
         />
-        <Button onClick={write} disabled={!canAct}>
+        <Button onClick={write} disabled={!canAct || (reading !== null && !reading.enforced)}>
           写入
         </Button>
         <Button onClick={() => void run(() => clearQuotaLimits(scope, target))} disabled={!canAct}>
@@ -219,11 +224,12 @@ export function QuotaLimitsPanel() {
       </div>
 
       <p className="px-4 pb-3 text-[11px] text-[var(--muted)]">
-        个人的「今天已记」是实数：安全网关按每次调用声明的属主，把上游报的 token 记进这一格；
-        越过属主为此人声明过的 hard 之后，下一发会被拒（429，结果词 refused_by_owner_budget，
-        观测页的结局分布里单列一行）。没配过的人不会被这个默认值拦下，它只决定读出来是多少。
-        其余四格（工作空间 / 团队 / 组织 / 全局）今天仍然没有写者，它们读到的 0 只说明没人记，
-        不说明没人用。逐笔花销的真账在观测页的 Token 面。
+        「今天已记」是账本的投影：安全网关按「调用方声明的属主，否则是任务提交人」把花销记到
+        人那一格，按任务行上的 workspace_id 记到工作空间那一格。越过某一格声明过的 hard 之后，
+        下一发会被拒（402，结果词 refused_by_owner_budget，正文的 scope 说明越线的是人或租户，
+        观测页的结局分布里单列一行）。没配过的格子不会被默认值拦下，默认值只决定读出来是多少。
+        团队 / 组织 / 全局三级今天没有任何一处能把一次调用归到它们名下，写在那里的上限永远
+        不会被读到，所以服务端拒写、这一面也给出「没有执法」。逐笔花销的真账在观测页的 Token 面。
       </p>
     </section>
   );
