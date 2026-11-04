@@ -5076,33 +5076,91 @@ impl MainlineDeployer {
         row.face_id = Some(CI_HOLD_FACE.to_string());
         match orchestrator.submit_goal_auto(&goal, vec![row]).await {
             Ok(added) if added.is_empty() => {
-                info!(
-                    rev = %rev12(rev),
-                    goal_id = %id,
-                    "this revision already has today's CI remediation goal; nothing new queued"
-                );
-                // 已持有同一天的同一张单子也算有主：这一轮没有新任务，不是没人接。
-                (CiHoldOwner::Owned, vec![id])
+                // 已持有同一天的目标行：这一轮没有新任务。但目标行不是活，它只是一条
+                // 身份标记——修复单在不在要单独问一次。不问，第一轮兜底被拒之后就
+                // 会在每一轮这里读到「有主」，而图里其实一条能跑的都没有。
+                let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
+                let fix_id = ci_hold_fix_task_id(rev, &day, since_unix);
+                if orchestrator
+                    .get_task(&fix_id)
+                    .await
+                    .is_some_and(|task| task.is_executable)
+                {
+                    info!(
+                        rev = %rev12(rev),
+                        goal_id = %id,
+                        "this revision already has today's CI remediation goal and its repair row; \
+                         nothing new queued"
+                    );
+                    // 已持有同一天的同一张单子也算有主：这一轮没有新任务，不是没人接。
+                    (CiHoldOwner::Owned, vec![id])
+                } else {
+                    warn!(
+                        rev = %rev12(rev),
+                        goal_id = %id,
+                        fix_id = %fix_id,
+                        "today's CI hold has an anchor but no row that can run; filing the change"
+                    );
+                    let (owner, fix_rows) = self
+                        .file_ci_hold_fix(
+                            orchestrator,
+                            rev,
+                            failed_checks,
+                            &goal,
+                            &evidence,
+                            since_unix,
+                        )
+                        .await;
+                    let mut rows = vec![id];
+                    rows.extend(fix_rows);
+                    (owner, rows)
+                }
             }
             Ok(added) => {
-                info!(
-                    rev = %rev12(rev),
-                    goal_id = %id,
-                    tasks = added.len(),
-                    failed_checks = %failed_checks.join(","),
-                    // 0 是「上游没给出可读的注解」，不是「没有人失败」：失败的检查名在
-                    // 上一格，这一格数的只是它们各自说了几句。
-                    evidence_lines = evidence.len(),
-                    "the CI hold was handed to the action planner"
-                );
                 // 交回来的是**这一笔真正进图的每一行**，不只是我们递出去的那个锚点：
                 // 规划器把这道目标拆成了几条子任务，那些子任务同样是这次扣住开出去
                 // 的活。只记锚点，收尾时它们就留了下来——扣住已经结束，而图里还有
                 // 人在为一条早已变绿的检查改代码。
                 let mut rows = added;
                 if !rows.iter().any(|landed| landed == &id) {
-                    rows.push(id);
+                    rows.push(id.clone());
                 }
+                // 「规划器收了」不等于「有人能动手」。分解失败时规划器的回答仍是
+                // `Ok`，进图的是我们递出去的那个锚点本身，而锚点不执行——它是目标
+                // 的身份行。判据因此是**进图的行里有没有一条能跑的**，不是这一笔
+                // 有没有被拒。
+                if !self.any_row_can_run(orchestrator, &rows).await {
+                    warn!(
+                        rev = %rev12(rev),
+                        goal_id = %id,
+                        landed = rows.len(),
+                        failed_checks = %failed_checks.join(","),
+                        "the planner accepted the CI hold but opened no row that can run; \
+                         filing the change itself as well"
+                    );
+                    let (owner, fix_rows) = self
+                        .file_ci_hold_fix(
+                            orchestrator,
+                            rev,
+                            failed_checks,
+                            &goal,
+                            &evidence,
+                            since_unix,
+                        )
+                        .await;
+                    rows.extend(fix_rows);
+                    return (owner, rows);
+                }
+                info!(
+                    rev = %rev12(rev),
+                    goal_id = %id,
+                    tasks = rows.len(),
+                    failed_checks = %failed_checks.join(","),
+                    // 0 是「上游没给出可读的注解」，不是「没有人失败」：失败的检查名在
+                    // 上一格，这一格数的只是它们各自说了几句。
+                    evidence_lines = evidence.len(),
+                    "the CI hold was handed to the action planner"
+                );
                 (CiHoldOwner::Owned, rows)
             }
             Err(e) => {
@@ -5133,6 +5191,27 @@ impl MainlineDeployer {
                 (owner, rows)
             }
         }
+    }
+
+    /// 这一笔进图的行里，有没有至少一条是能跑的。
+    ///
+    /// 判据读的是行自己的 `is_executable`，不是它所在的种类、也不是它的状态：
+    /// 一条 `Pending` 的锚点行与一条 `Pending` 的工作行在状态上完全相同，只有
+    /// 这一格分得开「有人会去修」与「只有一行身份标记」。读不到的行按不能跑算
+    /// ——多开一张单是无害的（id 由 rev、当天与扣住起点推出，图按幂等跳过），
+    /// 少开一张就是一条没人接住的扣住。
+    async fn any_row_can_run(
+        &self,
+        orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
+        rows: &[String],
+    ) -> bool {
+        for id in rows {
+            match orchestrator.get_task(id).await {
+                Some(task) if task.is_executable => return true,
+                _ => continue,
+            }
+        }
+        false
     }
 
     /// 把这条扣住落成一条**已经拆好的**行，绕开规划器的分解。
@@ -5173,11 +5252,9 @@ impl MainlineDeployer {
                 "failed_checks": failed_checks,
                 "evidence": seen,
                 // 这一行是停线单：判红的主线让整个部署器扣住，每一版新构建都
-                // 滚不上去，所以它在它变绿之前比任何普通变更都该先跑。写进输入
-                // 而不是只写进优先级：就绪队列是先进先出的日志，一条已经排在前
-                // 面的消息不会因为后来者的优先级更高而让路——2026-11-04 实测，
-                // 这一单开出来时前面压着 18,032 条未读的就绪消息，于是它一直
-                // 停在 Scheduled，被清扫器当作「从没被启动」反复回填。
+                // 滚不上去，所以它在变绿之前比任何普通变更都该先跑。写进输入
+                // 而不是只写进优先级：就绪队列是先进先出的日志，一条已经排在
+                // 前面的消息不会因为后来者的优先级更高而让路。
                 (cog_core::INPUT_READY_LANE): cog_core::READY_LANE_STOP_THE_LINE,
             }),
         );
@@ -16577,12 +16654,21 @@ exec {real} "$@"
         );
 
         let submissions = planner.submissions();
-        assert_eq!(submissions.len(), 1, "{submissions:?}");
+        // 两笔：目标行先交出去，而规划器只回了一个不执行的锚点，于是兜底那一笔
+        // 再开一条能跑的修复单（见 `any_row_can_run`）。
+        assert_eq!(submissions.len(), 2, "{submissions:?}");
         let (goal, ids, added) = &submissions[0];
         let day = Utc::now().format("%Y-%m-%d").to_string();
         let since = state.ci_hold.as_ref().expect("扣住记下来了").since_unix;
         assert_eq!(ids, &vec![ci_hold_goal_id("abc123", &day, since)]);
         assert_eq!(added, ids, "the first submission is the one that lands");
+        let (_, fix_ids, fix_added) = &submissions[1];
+        assert_eq!(
+            fix_ids,
+            &vec![ci_hold_fix_task_id("abc123", &day, since)],
+            "the row that can actually be picked up is filed after the anchor"
+        );
+        assert_eq!(fix_added, fix_ids);
         assert!(goal.contains("abc123"), "the revision is named: {goal}");
         assert!(
             goal.contains("github:Test"),
@@ -16734,7 +16820,8 @@ exec {real} "$@"
             "only the check that judged this tree is named: {:?}",
             record.failed_checks
         );
-        assert_eq!(planner.submissions().len(), 1);
+        // 目标行一笔，规划器没开出能跑的活，兜底再开一笔修复单。
+        assert_eq!(planner.submissions().len(), 2);
         let _ = handle.await.unwrap();
     }
 
@@ -16798,7 +16885,8 @@ exec {real} "$@"
         );
 
         let submissions = planner.submissions();
-        assert_eq!(submissions.len(), 1, "{submissions:?}");
+        // 目标行一笔，规划器没开出能跑的活，兜底再开一笔修复单。
+        assert_eq!(submissions.len(), 2, "{submissions:?}");
         let goal = &submissions[0].0;
         assert!(
             goal.contains("日志末尾：") && goal.contains("缺少 web/node_modules/.bin/tsc"),
@@ -16839,12 +16927,15 @@ exec {real} "$@"
                 .unwrap());
         }
 
+        // 第一轮两笔：目标行一笔，规划器没开出能跑的活，兜底再开一笔修复单。
+        // 第二轮目标行的 id 已由图持有，而修复单已经在图里，于是不再提交。
         let submissions = planner.submissions();
-        assert_eq!(submissions.len(), 2, "{submissions:?}");
-        assert_eq!(submissions[0].1, submissions[1].1, "the id is derived");
+        assert_eq!(submissions.len(), 3, "{submissions:?}");
+        assert_eq!(submissions[0].1, submissions[2].1, "the id is derived");
         assert_eq!(submissions[0].2.len(), 1);
+        assert_eq!(submissions[1].2.len(), 1);
         assert!(
-            submissions[1].2.is_empty(),
+            submissions[2].2.is_empty(),
             "the graph already held that id, so nothing new is queued: {submissions:?}"
         );
         settle(handle).await;
@@ -16892,13 +16983,14 @@ exec {real} "$@"
         }
 
         let submissions = planner.submissions();
-        assert_eq!(submissions.len(), 2, "{submissions:?}");
+        // 三轮提交：第一轮目标行 + 修复单，第二轮目标行（修复单已在图里）。
+        assert_eq!(submissions.len(), 3, "{submissions:?}");
         assert!(
             !submissions[0].0.contains("a_stamp_that_never_lands"),
             "the first round had no check to ask: {submissions:?}"
         );
         assert!(
-            submissions[1]
+            submissions[2]
                 .0
                 .contains("volume_capacity::a_stamp_that_never_lands_still_lets_the_bound_elapse"),
             "the round that learned the name also asked that check what it saw: {submissions:?}"
@@ -17214,10 +17306,9 @@ exec {real} "$@"
     /// 修复单必须走停线通道，而不是排在普通变更后面。
     ///
     /// 就绪队列是先进先出的日志：一条已经排在前面的消息不会因为后来者的优先级
-    /// 更高而让路。实测（2026-11-04）这一单开出来时前面压着 18,032 条未读消息，
-    /// 于是它一直停在 `Scheduled`、被清扫器当作「从没被启动」反复回填，主线从
-    /// 判红到那时一条修复都没跑过。把这一行输入里的 lane 去掉，它就会回到那条
-    /// 18,032 深的队列里——这条断言红。
+    /// 更高而让路，而普通变更把队列压得很深时，修复单会一直停在 `Scheduled`、
+    /// 被清扫器当作「从没被启动」反复回填。把这一行输入里的 lane 去掉，它就回
+    /// 到那条队列里——这条断言红。
     #[tokio::test]
     async fn the_repair_row_travels_in_the_stop_the_line_lane() {
         let tmp = tempfile::tempdir().unwrap();
@@ -17256,6 +17347,53 @@ exec {real} "$@"
                 .and_then(|lane| lane.as_str()),
             Some(cog_core::READY_LANE_STOP_THE_LINE),
             "a red main's repair must not queue behind ordinary change generation"
+        );
+    }
+
+    /// 规划器收了这一笔、却只落下一个不执行的锚点，仍要开出能跑的单子。
+    ///
+    /// 分解失败时规划器的回答仍是 `Ok`，进图的是那条 `is_executable=false` 的
+    /// 目标行。判据若是「提交有没有被拒」，这一支就不会走到兜底，读数写着有主
+    /// 而图里没有一条可以去修的行。
+    #[tokio::test]
+    async fn a_hold_the_planner_accepts_without_opening_work_still_gets_a_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        // 默认替身：收下这一笔，不拒绝，也不拆出任何子任务——正是「分解失败但
+        // 回答 Ok」在图上留下的形状。
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let checks = vec!["github:Code Coverage".to_string()];
+        let (owner, rows) = deployer
+            .dispatch_ci_remediation("abc123", &checks, 100)
+            .await;
+        assert_eq!(owner, CiHoldOwner::Owned);
+
+        let fix_id = ci_hold_fix_task_id(
+            "abc123",
+            &Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string(),
+            100,
+        );
+        assert!(
+            rows.contains(&fix_id),
+            "an anchor nobody can execute is not a repair: {rows:?}"
+        );
+        let fix = planner
+            .rows()
+            .into_iter()
+            .flatten()
+            .find(|task| task.id == fix_id)
+            .expect("the executable row was submitted");
+        assert!(fix.is_executable);
+        assert_eq!(
+            fix.input
+                .get(cog_core::INPUT_READY_LANE)
+                .and_then(|lane| lane.as_str()),
+            Some(cog_core::READY_LANE_STOP_THE_LINE)
         );
     }
 
