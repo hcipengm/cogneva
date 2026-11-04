@@ -9508,7 +9508,10 @@ async fn trace_server_failures(
 /// reqwest 的 Display 是「error sending request for url (<完整 URL>)」，而 Gitee
 /// 的 token 就拼在 query 上：原样写进日志或回给调用方，等于把凭证抄了一份出去。
 /// 所以取错误链里更内层的成因（连接被拒、DNS 解析不到、TLS 握手、连接被重置各自
-/// 的原文），最外层只在没有更内层时才用，且那也要把 URL 换掉。
+/// 的原文）——那一层才分得出下一步查什么。
+///
+/// 内层也不保证没有地址：连接错误会把「连谁失败了」回显出来，而日志一旦采走就
+/// 收不回来。所以无论成因来自哪一层，只要这一句里出现这次请求的地址，就换掉。
 fn transport_reason(error: &reqwest::Error) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut source = std::error::Error::source(error);
@@ -9516,13 +9519,15 @@ fn transport_reason(error: &reqwest::Error) -> String {
         parts.push(cause.to_string());
         source = cause.source();
     }
-    if !parts.is_empty() {
-        return parts.join(": ");
+    let mut reason = if parts.is_empty() {
+        error.to_string()
+    } else {
+        parts.join(": ")
+    };
+    if let Some(url) = error.url() {
+        reason = reason.replace(url.as_str(), "上游地址");
     }
-    match error.url() {
-        Some(url) => error.to_string().replace(url.as_str(), "上游地址"),
-        None => error.to_string(),
-    }
+    reason
 }
 
 /// 转发失败的一句话：留一行在网关日志里，再原样回给调用方。
@@ -17418,8 +17423,14 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             !logged.contains("127.0.0.1"),
             "上游地址不进日志：Gitee 的 token 拼在 query 上，整句 URL 会把凭证抄出去：{logged}"
         );
+        // 判据按形状判，不按这一个地址判：内层成因（hyper 的 connect error 一类）
+        // 也可能回显它连的是谁，而那正是日志里最容易被采走的形态。
         assert!(
-            !err.1.contains("127.0.0.1"),
+            !logged.contains("://") && !logged.contains("access_token"),
+            "日志行里不许出现任何 URL 或 token 参数——内层成因同样会回显地址：{logged}"
+        );
+        assert!(
+            !err.1.contains("127.0.0.1") && !err.1.contains("://"),
             "回给调用方的那句也不带 URL（同一条理由）：{}",
             err.1
         );
