@@ -465,7 +465,15 @@ impl SelfReviewLoop {
     /// second call used to buy, and it is paid for in bytes compared instead of
     /// in tokens generated.
     async fn judge_table(&self, output: &str, llm: &dyn LlmClient) -> SFResult<SelfReviewResult> {
-        let spec = self.config.spec.as_deref().unwrap_or("");
+        let spec = self.config.spec.as_deref().unwrap_or("").trim();
+        // 没有标准就没有判据。让模型对着空标准「列出要求」，它会自己编一批，
+        // 编出来的那批与任务无关，判词却和真判词长得一样——一次付费的假评审。
+        // 交回调用方原样正文、把这次记成失败，比这便宜也比这诚实。
+        if spec.is_empty() {
+            return Err(SFError::Validation(
+                "the review has no specification to hold the text to".into(),
+            ));
+        }
         let user_payload = serde_json::to_string(&JudgeRequest {
             rubric: SelfReviewLoop::judging_rubric(&self.actor),
             spec,
@@ -1238,6 +1246,7 @@ mod tests {
             max_iterations: 2,
             quality_threshold: 0.8,
             revise: false,
+            spec: Some("t1 and t2 must be done".into()),
             ..Default::default()
         })
         .with_actor("self_review:planner");
@@ -1281,6 +1290,7 @@ mod tests {
             max_iterations: 2,
             quality_threshold: 0.8,
             revise: false,
+            spec: Some("t1 and t2 must be done".into()),
             ..Default::default()
         });
 
@@ -1310,6 +1320,7 @@ mod tests {
         );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             revise: false,
+            spec: Some("t1 and t2 must be done".into()),
             ..Default::default()
         });
 
@@ -1344,6 +1355,7 @@ mod tests {
         );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             revise: false,
+            spec: Some("t1 and t2 must be done".into()),
             ..Default::default()
         });
 
@@ -1372,6 +1384,7 @@ mod tests {
         );
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             revise: false,
+            spec: Some("t1 and t2 must be done".into()),
             ..Default::default()
         });
 
@@ -1392,6 +1405,7 @@ mod tests {
         let llm = TableLlm::new(r#"{"rows":[]}"#);
         let judge_only = SelfReviewLoop::new(SelfReviewConfig {
             revise: false,
+            spec: Some("t1 and t2 must be done".into()),
             ..Default::default()
         });
 
@@ -1400,6 +1414,24 @@ mod tests {
             outcome.is_err(),
             "没有任何要求的判词不能读成通过：{outcome:?}"
         );
+    }
+
+    /// 没有标准时一次调用都不买。
+    ///
+    /// 空标准下让模型「列出要求」，它会自己编一批与任务无关的要求，判词却和
+    /// 真判词长得一样——一次付费的假评审。
+    #[tokio::test]
+    async fn a_review_with_no_standard_costs_nothing() {
+        let llm = TableLlm::new(r#"{"rows":[]}"#);
+        let judge_only = SelfReviewLoop::new(SelfReviewConfig {
+            revise: false,
+            spec: Some("   ".into()),
+            ..Default::default()
+        });
+
+        let outcome = judge_only.review("anything", &llm).await;
+        assert!(outcome.is_err(), "没有标准就没有判据：{outcome:?}");
+        assert_eq!(llm.calls(), 0, "空标准不该买到一次调用");
     }
 
     /// 判据跟着被审的东西走：计划不因为「没有回答任务」被扣分。
