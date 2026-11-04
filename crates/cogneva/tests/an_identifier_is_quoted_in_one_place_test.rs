@@ -46,6 +46,12 @@ const REGISTERED: &[(&str, &str, &str)] = &[
         "把关系名写进 SQL 的那一份——树上唯一的拼法，别的 crate 引用它",
     ),
     (
+        "crates/cog-agent/src/self_review.rs",
+        "quotes_the_text",
+        "这里「引」的是引文不是标识符：判一段证据是否原样出现在正文里，\
+         与拼进 SQL 的名字无关，这个函数一个字节的 SQL 都不产生",
+    ),
+    (
         "crates/cogneva/src/backup.rs",
         "quoted_identifier",
         "引的是一个库名，不是一个关系名：`DROP DATABASE` 只收单个标识符，点号在库名里是\

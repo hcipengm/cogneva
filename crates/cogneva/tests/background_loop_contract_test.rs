@@ -82,6 +82,14 @@ const NOT_REGISTERED: &[(&str, &str)] = &[
          a defect, and the age of a demand-driven flush means nothing",
     ),
     (
+        "crates/cogneva/src/conversation.rs",
+        "not-a-loop: the lease heartbeat belongs to one chat turn — it is aborted \
+         when the turn releases its lease, so every end but a panic is the intended \
+         one, and its label would be one series per turn. Whether the employee is \
+         still on the roster is what the registry's TTL reports, and a failed \
+         renewal already leaves a warning naming the employee",
+    ),
+    (
         "crates/cog-core/src/contract/owner_lease.rs",
         "not-a-loop: the ticker asks the arbiter again on behalf of a loop that is \
          itself registered — it ends when the holder is dropped or the process shuts \

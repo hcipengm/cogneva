@@ -96,6 +96,12 @@ const EXEMPT: &[Exempt] = &[
         why: "写回给向导的出处字段，说明这份配置是谁落的盘",
     },
     Exempt {
+        file: "crates/cog-gateway/src/llm_admin.rs",
+        value: "llm_config",
+        why: "审计的类别名，回答「这次改动落在哪份配置上」；那个同形声明是池里一个上游的\
+              来源字段。两者同形不同物：跟着改会让账上的旧类别从此读不出来",
+    },
+    Exempt {
         file: "crates/cog-reflection/src/config.rs",
         value: "security-gateway",
         why: "Pod 里那个容器的名字，不是工作负载的组件标签",
