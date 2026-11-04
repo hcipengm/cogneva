@@ -138,7 +138,39 @@ pub struct PostgresObservabilityGateway {
     failed_pending: Arc<std::sync::atomic::AtomicU64>,
     /// 上一次把待落量写进库的时刻。
     failed_last_flush: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// 正在排队的待落事件。见 [`EVENT_BATCH_MAX`]：这条通路每秒能产生几百条
+    /// 事件，一条一次 INSERT 就是几百次提交，而提交要等 WAL 落盘。
+    persist_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    /// 队列的收端，由写者任务取走一次。放在锁里是因为写者要在第一次发布时才
+    /// 起（[`PostgresObservabilityGateway::new`] 是同步函数，可能不在运行时里）。
+    persist_rx: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<AgentEvent>>>>,
+    /// 写者任务起来了没有。
+    persist_writer_started: Arc<std::sync::Once>,
 }
+
+/// 一批最多写几条。
+///
+/// 这不是从容量导出的数：它由「一次提交的固定成本摊到多少条上才不亏」定。
+/// 按本机实测的行宽估（2026-11-04，一条事件的行约 300 字节），64 条一次提交，
+/// 一次提交的 WAL 页与提交记录摊到 64 条上就低到可以忽略；再往上加行，省下的
+/// 提交成本已经小于一条提交持有连接、占着 WAL 的时间，而队列满时整批变慢的
+/// 方差更大。
+// cap: bound — 使一次提交的固定成本摊到 64 条上可忽略，不是从任何容量读数导出
+const EVENT_BATCH_MAX: usize = 64;
+
+/// 第一条到了之后最多再等多久凑批。
+///
+/// 事件是持续来的（实测约每秒 180 条），凑够一批通常不用等；这个等待只对
+/// 安静时段起作用，让单条事件不因为「等下一批」而延迟上分钟。
+// cap: bound — 与事件到达间隔（毫秒级）相比足够短，只用来收尾一批
+const EVENT_BATCH_LINGER_MS: u64 = 50;
+
+/// 队列能排多少条。满了不丢事件，改为立刻单独写一条（见
+/// [`PostgresObservabilityGateway::publish_event`]）。
+///
+/// 按「数据库停住多久还不丢」定：每秒约 180 条时，四千条约是 22 秒的积压。
+// cap: bound — 按事件速率（约 180/秒）乘一段可等待的数据库停顿估出
+const EVENT_WRITE_QUEUE: usize = 4096;
 
 /// 失败计数最多多久落一次库。选 5 秒是因为它要明显短于一条告警的判定窗
 /// （分钟级），又足以把「每次失败一行」压成「每 5 秒一行」。
@@ -182,6 +214,7 @@ impl PostgresObservabilityGateway {
 
     pub fn new(pool: PgPool) -> Self {
         let (event_tx, _event_rx) = broadcast::channel(256);
+        let (persist_tx, persist_rx) = tokio::sync::mpsc::channel(EVENT_WRITE_QUEUE);
         Self {
             pool,
             event_tx,
@@ -190,6 +223,9 @@ impl PostgresObservabilityGateway {
             metrics: None,
             failed_pending: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             failed_last_flush: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            persist_tx,
+            persist_rx: Arc::new(std::sync::Mutex::new(Some(persist_rx))),
+            persist_writer_started: Arc::new(std::sync::Once::new()),
         }
     }
 
@@ -392,27 +428,56 @@ impl PostgresObservabilityGateway {
 
     // ─── Internal helpers ───
 
-    async fn persist_event(pool: &PgPool, event: &AgentEvent) -> SFResult<()> {
-        let (event_type, agent_id, task_id, crew_id, squad_id, timestamp) =
-            extract_event_meta(event);
-        let payload = serde_json::to_value(event).map_err(SFError::Serialization)?;
+    /// 把一批事件写成**一次**提交。
+    ///
+    /// 一条一次 INSERT 与一次批量 INSERT 的差别不在语句，在提交：每次提交都要
+    /// 等 WAL 落盘，而这条通路实测每秒约 180 条事件，就是一秒 180 次「等盘」。
+    /// 宿主同时跑着构建和集群时，每次等盘的延迟被拉长到秒级，池里的连接全被
+    /// 这些提交占着，读的人拿到连接要等十秒——2026-11-04 现场就是这样：慢的不
+    /// 是这条插入的语句时间，而是它背后那次提交。
+    ///
+    /// 一批在同一个事务里，所以「整批都没写进去」与「整批都写进去了」只有两种
+    /// 结局，没有写了一半的一批：失败按条数计（见调用方），不按批计。
+    async fn persist_events(pool: &PgPool, events: &[AgentEvent]) -> SFResult<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        // 先序列化再建语句：`push_values` 的闭包不能返回错误，把可能失败的
+        // 这一步放在外面，一条坏事件不会让半个批进入语句构造。
+        let mut rows = Vec::with_capacity(events.len());
+        for event in events {
+            let (event_type, agent_id, task_id, crew_id, squad_id, timestamp) =
+                extract_event_meta(event);
+            let payload = serde_json::to_value(event).map_err(SFError::Serialization)?;
+            rows.push((
+                event_type, agent_id, task_id, crew_id, squad_id, payload, timestamp,
+            ));
+        }
 
-        sqlx::query(
-            r#"
-            INSERT INTO cog_observability_events (event_type, agent_id, task_id, crew_id, squad_id, payload, timestamp)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            "#,
-        )
-        .bind(event_type)
-        .bind(agent_id)
-        .bind(task_id)
-        .bind(crew_id)
-        .bind(squad_id)
-        .bind(payload)
-        .bind(timestamp)
-        .execute(pool)
-        .await
-        .map_err(|e| SFError::Database(format!("persist_event failed: {}", e)))?;
+        let mut tx = pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(format!("persist_events begin failed: {}", e)))?;
+        let mut qb = sqlx::QueryBuilder::new(
+            "INSERT INTO cog_observability_events \
+             (event_type, agent_id, task_id, crew_id, squad_id, payload, timestamp) ",
+        );
+        qb.push_values(rows, |mut b, row| {
+            b.push_bind(row.0)
+                .push_bind(row.1)
+                .push_bind(row.2)
+                .push_bind(row.3)
+                .push_bind(row.4)
+                .push_bind(row.5)
+                .push_bind(row.6);
+        });
+        qb.build()
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(format!("persist_events insert failed: {}", e)))?;
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(format!("persist_events commit failed: {}", e)))?;
         Ok(())
     }
 
@@ -732,9 +797,12 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     /// "no events happened". The two implementations had the same name, so
     /// every call site looked like it persisted.
     ///
-    /// The write is spawned so the caller never blocks on PostgreSQL: this sits
-    /// on the event-gateway-sink path, and a subscriber that blocks there slows
-    /// the broadcast it is reading from.
+    /// The write never blocks the caller: this sits on the event-gateway-sink
+    /// path, and a subscriber that blocks there slows the broadcast it is
+    /// reading from. It does not write one row per call either — the event goes
+    /// on a queue that a single writer drains in batches (see
+    /// [`run_event_writer`]), because a commit per event turns the event rate
+    /// into a commit rate and every commit waits on the WAL.
     ///
     /// A failed write is counted, not only logged. The log line dies with the
     /// pod, and the reading that matters afterwards -- "the events were
@@ -747,18 +815,107 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
     fn publish_event(&self, event: AgentEvent) {
         let _ = self.event_tx.send(event.clone());
 
+        self.start_event_writer();
+
+        // 队列满时**不丢**，改为立刻单独写这一条：排队的代价由这一条自己承担，
+        // 而不是把它从表里抹掉——表少一条与「这件事没发生」在读的人眼里同形。
+        match self.persist_tx.try_send(event) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                self.write_one_now(event, "the write queue is full");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
+                // 只会发生在写者任务已经退出之后（本进程不再收事件）；同样不丢。
+                self.write_one_now(event, "the batch writer is gone");
+            }
+        }
+    }
+}
+
+impl PostgresObservabilityGateway {
+    /// 第一次发布时把写者任务起来。取收端这件事只做一次；`Once` 保证并发发布
+    /// 不会起出第二个写者（两个写者对同一队列取事件会互相偷，批就永远凑不满）。
+    fn start_event_writer(&self) {
+        self.persist_writer_started.call_once(|| {
+            let rx = match self.persist_rx.lock() {
+                Ok(mut slot) => slot.take(),
+                Err(poisoned) => poisoned.into_inner().take(),
+            };
+            if let Some(rx) = rx {
+                tokio::spawn(run_event_writer(
+                    self.pool.clone(),
+                    rx,
+                    self.metrics.clone(),
+                    Arc::clone(&self.failed_pending),
+                    Arc::clone(&self.failed_last_flush),
+                ));
+            }
+        });
+    }
+
+    /// 越过队列直接写一条，理由写进告警里：这条通路自己失败了，读的人要知道。
+    fn write_one_now(&self, event: AgentEvent, why: &'static str) {
+        tracing::warn!("writing one observability event outside the batch queue: {why}");
         let pool = self.pool.clone();
         let metrics = self.metrics.clone();
         let failed_pending = Arc::clone(&self.failed_pending);
         let failed_last_flush = Arc::clone(&self.failed_last_flush);
         tokio::spawn(async move {
-            if let Err(e) = Self::persist_event(&pool, &event).await {
+            if let Err(e) = PostgresObservabilityGateway::persist_events(&pool, &[event]).await {
                 tracing::warn!("Failed to persist observability event: {}", e);
                 if let Some(metrics) = metrics {
                     note_persist_failure(&metrics, &failed_pending, &failed_last_flush).await;
                 }
             }
         });
+    }
+}
+
+/// 批量落库的写者：收够一批（或等够 [`EVENT_BATCH_LINGER_MS`]）就写一次。
+///
+/// 一开始一条就写一条、每条各起一个任务。事件是持续来的，那样等于把「每秒多少
+/// 条事件」直接变成「每秒多少次提交」，而每次提交都要等 WAL 落盘；宿主被构建和
+/// 集群同时占着的时候，连接就都被这些提交占住，读的人拿连接要等十秒。
+///
+/// 队列关了才退出：进程收尾时最后一批照样写出去。
+async fn run_event_writer(
+    pool: PgPool,
+    mut rx: tokio::sync::mpsc::Receiver<AgentEvent>,
+    metrics: Option<Arc<dyn cog_core::MetricsBackend>>,
+    failed_pending: Arc<std::sync::atomic::AtomicU64>,
+    failed_last_flush: Arc<std::sync::Mutex<std::time::Instant>>,
+) {
+    let linger = std::time::Duration::from_millis(EVENT_BATCH_LINGER_MS);
+    let mut batch: Vec<AgentEvent> = Vec::with_capacity(EVENT_BATCH_MAX);
+    loop {
+        // 第一条阻塞等，之后最多再等一个 linger 把这一批凑满。
+        let Some(first) = rx.recv().await else {
+            return;
+        };
+        batch.clear();
+        batch.push(first);
+        let deadline = tokio::time::Instant::now() + linger;
+        while batch.len() < EVENT_BATCH_MAX {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(event)) => batch.push(event),
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        let written = batch.len() as u64;
+        if let Err(e) = PostgresObservabilityGateway::persist_events(&pool, &batch).await {
+            tracing::warn!(
+                events = written,
+                error = %e,
+                "Failed to persist a batch of observability events"
+            );
+            if let Some(ref metrics) = metrics {
+                for _ in 0..written {
+                    note_persist_failure(metrics, &failed_pending, &failed_last_flush).await;
+                }
+            }
+        }
     }
 }
 
