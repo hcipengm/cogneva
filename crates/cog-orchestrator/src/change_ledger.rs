@@ -811,9 +811,15 @@ fn product_commits(
 /// and every candidate costs a tree-wide read -- so the longest ones are tried
 /// first and only a bounded number of them, which picks the most specific line
 /// the commit wrote rather than the first one in diff order.
+// cap: bound — a floor chosen to put the tree's stock lines (`return true;`, `let x = 1;`) below it, not
+// a measurement: below this the candidate is a shape many files share, and above it nothing is lost
+// because the longest lines are tried first.
 const DECLARATION_MIN_LINE_LENGTH: usize = 12;
 
 /// How many of the commit's lines are tried as an identity, longest first.
+// cap: bound — every candidate costs a tree-wide read; twelve keeps one commit's declaration a fixed
+// cost rather than one that grows with the size of the diff, and the longest lines are the ones worth
+// spending those reads on.
 const DECLARATION_MAX_LINE_CANDIDATES: usize = 12;
 
 /// How many files may hold a literal before it stops identifying anything.
@@ -821,6 +827,8 @@ const DECLARATION_MAX_LINE_CANDIDATES: usize = 12;
 /// A name most of the tree spells identifies none of it: a row filed under it
 /// would read as settled for as long as any unrelated file still said it, and
 /// the account would call a deleted change landed.
+// cap: bound — three is where a literal stops naming one place and starts naming a phrase the tree
+// repeats; the read it gates is a tree-wide search, so a larger number buys ambiguity, not evidence.
 const DECLARATION_MAX_MATCH_FILES: usize = 3;
 
 /// How many declarations one pass may queue.
@@ -830,13 +838,19 @@ const DECLARATION_MAX_MATCH_FILES: usize = 3;
 /// sake of history. Commits that arrive while the loop is running are the ones
 /// this closes, and those are a handful; a backlog is caught up by running the
 /// same question over more of the window, not by making every pass expensive.
+// cap: bound — what one beat can afford, not a measurement: each declaration is a diff read plus one
+// tree-wide read per candidate, and the queue drains over further passes rather than in one long one.
 const DECLARATION_MAX_PER_PASS: usize = 4;
 
 /// The widths the intake columns hold. A row wider than its column is refused
 /// here rather than truncated by the writer: a shortened identity is a
 /// different change sharing a row.
+// cap: derived — the declared `VARCHAR` widths of the columns these values are written to, read from the
+// store's own DDL; a value here that the column cannot hold is the truncation this refuses.
 const DECLARATION_WIDTH_SCOPE: usize = 191;
+// cap: derived — the `literal` column's declared width, same source as the scope width above.
 const DECLARATION_WIDTH_LITERAL: usize = 512;
+// cap: derived — the `doc` column's declared width, same source as the scope width above.
 const DECLARATION_WIDTH_DOC: usize = 512;
 
 /// What one out-of-band commit left behind that a check can settle.
