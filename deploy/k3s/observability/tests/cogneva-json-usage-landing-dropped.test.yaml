@@ -1,0 +1,51 @@
+# 花销没进账本那一条的夹具：丢了一笔就响，而只响「还在丢」的那十五分钟。
+#
+# 这条规则判的是 `increase`，不是绝对值：计数是单调涨的，用 `> 0` 读它会在第一笔
+# 丢掉之后永远亮着，把「修好了」读成「还在丢」。反过来若判成「某个窗口里出现过非零」，
+# 一次瞬时故障也会长期占着告警面。
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: llm_usage_landing_dropped
+
+evaluation_interval: 1m
+
+tests:
+  # 一、没有账本的网关：每分钟丢十笔，第十五分钟已经有增量，必须响，且原因带出来
+  # （两种成因的修法相反，规则按 reason 分组）。
+  - interval: 1m
+    input_series:
+      - series: 'llm_usage_landing_dropped_total{reason="no_ledger",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+10x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_usage_landing_dropped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              reason: no_ledger
+
+  # 二、负对照：计数一直停在五、不再涨。绝对值非零但窗口里没有增量——这一格是
+  # 「判成绝对值」那个写法的反例，它若把 `increase` 换成裸比较就会在这里亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_usage_landing_dropped_total{reason="no_ledger",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '5x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_usage_landing_dropped
+        exp_alerts: []
+
+  # 三、写不进去的那一支：同一个计数器、另一个原因。它必须单独成一格告警——
+  # 求和并成一个数，修法相反的两件事就读成同一件。
+  - interval: 1m
+    input_series:
+      - series: 'llm_usage_landing_dropped_total{reason="write_failed",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+3x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_usage_landing_dropped
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              reason: write_failed

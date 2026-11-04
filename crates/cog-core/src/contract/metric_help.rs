@@ -134,6 +134,23 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          the two series is a reading that was never written at all",
     ),
     (
+        crate::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL.as_str(),
+        "Finished calls whose spend never reached the token ledger, by `reason`. \
+         `no_ledger` is a process that assembled with no usage store: the store \
+         is built once at startup, so the state holds until the pod is replaced \
+         and every call served in between is spend the token totals, today's \
+         spend and the quota cells will never count. `write_failed` is a store \
+         that was there and refused every attempt for that row. The two are \
+         kept apart because the repairs point in opposite directions -- the \
+         deployment's database for the first, the store's health for the \
+         second -- and summing them would report one cause twice. Neither the \
+         call counters nor the metering readings can stand in for this: the \
+         counters move on the request path whether or not a row landed, and the \
+         readings are about what the upstream reported, not about what was \
+         recorded. One dropped call is permanent, because the ledger has no \
+         backfill",
+    ),
+    (
         "llm_upstream_client_errors_total",
         "Total LLM upstream calls rejected as malformed requests",
     ),

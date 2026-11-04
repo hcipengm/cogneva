@@ -277,6 +277,7 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
         MetricDerivation::Process,
     ),
     ("llm_upstream_failures_total", MetricDerivation::Process),
+    ("llm_usage_landing_dropped_total", MetricDerivation::Process),
     ("llm_usage_readings_total", MetricDerivation::Process),
 ];
 

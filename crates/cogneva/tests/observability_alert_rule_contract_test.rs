@@ -977,6 +977,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_usage_readings_total",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // Spend that never reached the ledger, by `reason`: the process had no usage
+    // store, or the store refused every attempt. Both are permanent loss, and
+    // nothing else on this face can say so -- the call counters move on the
+    // request path regardless, and the metering readings are about what the
+    // upstream reported.
+    (
+        "llm_usage_landing_dropped_total",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     // The quota cells' projection: 0 or 1 per pass and per axis, written by the
     // loop that rewrites the cells from the ledger. The loop's beat is stamped
     // before its body runs, so a loop that cannot read the ledger looks alive on

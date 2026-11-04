@@ -3242,10 +3242,23 @@ fn pooled_refusal(
 /// [`crate::usage_landing`]。
 fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
     let Some(store) = state.pool_obs.usage.clone() else {
+        // 没有账本时这一笔连「写失败」都不算：没有写，也就没有那条告警。它仍然是
+        // 一次永远读不出来的花销，而且在下次重启之前每一笔都是——账本是在启动时
+        // 装配的，中途不会长回来。所以由这一格说出来，并且带上原因。
+        let state = state.clone();
+        tokio::spawn(async move {
+            record_counter(
+                &state,
+                cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
+                &[("reason", crate::usage_landing::NO_LEDGER_REASON)],
+            )
+            .await;
+        });
         return;
     };
     let health = state.pool_obs.usage_write_health.clone();
     let alerts = state.pool_obs.alerts.clone();
+    let state = state.clone();
     tokio::spawn(async move {
         let outcome =
             crate::usage_landing::persist_with_retry(crate::usage_landing::WRITE_ATTEMPTS, || {
@@ -3264,6 +3277,12 @@ fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
                     attempts,
                     "LLM 计量明细落库失败：这一笔的花销不会进任何窗口"
                 );
+                record_counter(
+                    &state,
+                    cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
+                    &[("reason", crate::usage_landing::WRITE_FAILED_REASON)],
+                )
+                .await;
                 if health.note_lost() {
                     fire_ledger_write_alert(alerts, attempts, &error.to_string()).await;
                 }
@@ -3369,7 +3388,26 @@ const USAGE_OUTCOMES: [UsageOutcome; 5] = UsageOutcome::ALL;
 /// are the two readings that have to stay apart, and they differ only by
 /// whether the cells exist. Publishing them at startup makes the second one a
 /// count that climbs rather than a cell that appears out of nowhere.
+///
+/// The landing-drop cells are published here for the same reason and are not
+/// per-upstream: they count spend that never reached the ledger, which happens
+/// before any upstream label is known to the reader -- and happens most on a
+/// fresh process, the one a series born from the event would hide.
 async fn publish_usage_vocabulary(state: &AppState) {
+    // Drop cells first, and outside the upstream loop: they do not belong to an
+    // upstream, and they are the ones a fresh process most needs. Every drop on a
+    // series created by that drop reads as zero under `increase()`, so without
+    // this the first loss after a restart -- which is when a broken ledger is most
+    // likely still broken -- is the one the rule stays silent about.
+    for reason in crate::usage_landing::LANDING_DROP_REASONS {
+        record_counter_add(
+            state,
+            cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL,
+            0.0,
+            &[("reason", reason)],
+        )
+        .await;
+    }
     for upstream in &state.config.llm_upstreams {
         let key = LlmHealthTable::key(upstream);
         for outcome in USAGE_OUTCOMES {
@@ -3489,6 +3527,10 @@ pub enum RangeReadBaseline {
 pub const RANGE_READ_BASELINES: &[(&str, RangeReadBaseline)] = &[
     (
         cog_core::metric_names::LLM_USAGE_READINGS_TOTAL.as_str(),
+        RangeReadBaseline::SeededAtZero,
+    ),
+    (
+        cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL.as_str(),
         RangeReadBaseline::SeededAtZero,
     ),
     (
@@ -11560,6 +11602,42 @@ mod tests {
         );
     }
 
+    /// 丢弃这一族的每一格也要先摆出来，而且有几格由原因清单说，不由这里另抄一遍。
+    ///
+    /// 这一族最要紧的一格是重启后的第一笔：进程刚起、账本还没装配好，或者库刚挂。
+    /// 若那一笔自己创建系列，它的首个样本里已经带着 1，`increase()` 对它读零——
+    /// 规则恰好在最该响的那一刻沉默。所以格子必须在第一次丢弃之前就在。
+    #[tokio::test]
+    async fn the_landing_drop_reasons_are_published_at_zero() {
+        use crate::usage_landing::LANDING_DROP_REASONS;
+
+        let state = test_state(vec![test_upstream()]);
+        publish_usage_vocabulary(&state).await;
+
+        let totals = state
+            .pool_obs
+            .metrics
+            .query_counter_totals(cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL.as_str())
+            .await
+            .expect("published counter reading");
+        let published: std::collections::BTreeSet<String> = totals
+            .iter()
+            .map(|s| s.labels.get("reason").cloned().unwrap_or_default())
+            .collect();
+        let expected: std::collections::BTreeSet<String> = LANDING_DROP_REASONS
+            .iter()
+            .map(|r| (*r).to_string())
+            .collect();
+        assert_eq!(
+            published, expected,
+            "每一格原因都要在启动时以零发布：漏一格，那个原因的第一次丢弃就在差分读法下看不见"
+        );
+        assert!(
+            totals.iter().all(|s| s.value == 0.0),
+            "启动种子里只有「还什么都没丢」，丢弃由计数加"
+        );
+    }
+
     /// 后备出口只放行 `POST /search` 与 `POST /fetch`。
     ///
     /// 那条路由是给两个工具用的，不是一条通用代理；放行面就是这条测试画的那条
@@ -18532,6 +18610,58 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             axes,
             vec![("person", 0.0), ("task", 0.0)],
             "两根轴都配了、都读成了：每拍各写一个 0"
+        );
+    }
+
+    /// 没有账本的网关，每一笔花销都要在读数上留下一次丢弃，而不是静默返回。
+    ///
+    /// 账本是在启动时装配一次的：启动时连不上库、或 schema 建不出来的进程会一直
+    /// 服务到下次重启，这期间的每一笔完成调用都不进任何窗口，而「写失败」那条告警
+    /// 看不到它——没有写可失败。计量读数那条规则也看不到：计量在请求路径上照常走。
+    /// 少这一格，「这个网关今天一分钱都没花」与「它没在记账」在读数面上逐字同形。
+    #[tokio::test]
+    async fn a_call_with_no_ledger_is_counted_as_dropped_rather_than_silently_returned() {
+        let metrics = Arc::new(ScrapeRecorder::default());
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        assert!(
+            state.pool_obs.usage.is_none(),
+            "前提：这个部署没有账本，正是这条读数要覆盖的形状"
+        );
+        let write_health = state.pool_obs.usage_write_health.clone();
+        state.pool_obs = Arc::new(PoolObservability {
+            metrics: metrics.clone(),
+            analytics: None,
+            alerts: None,
+            usage: None,
+            usage_write_health: write_health,
+            durable: None,
+        });
+
+        land_usage_record(
+            &state,
+            pooled_refusal_usage("openai", "a", "cli", None, None, 5),
+        );
+
+        // 计数写在派生的任务里（落库那条路本来就不在请求路径上等），等它落地。
+        let mut samples = Vec::new();
+        for _ in 0..100 {
+            samples =
+                metrics.matching(cog_core::metric_names::LLM_USAGE_LANDING_DROPPED_TOTAL.as_str());
+            if !samples.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            samples.len(),
+            1,
+            "一笔花销在没有账本时丢了，就要有一条丢弃读数；零条说明它被静默丢了"
+        );
+        assert_eq!(samples[0].value, 1.0);
+        assert_eq!(
+            samples[0].labels.get("reason").map(String::as_str),
+            Some("no_ledger"),
+            "原因要分开：没有账本与写不进去，修法相反"
         );
     }
 

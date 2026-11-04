@@ -33,6 +33,33 @@ pub(crate) const WRITE_FAILED_RULE: &str = "llm_usage_ledger_write_failed";
 /// path's own configuration or its database, not a reader.
 const WRITE_FAILED_FACE: &str = "token 管理";
 
+/// The `reason` label on `llm_usage_landing_dropped_total` when the process has
+/// no ledger at all.
+///
+/// Assembled once at startup, so this is a run-long state and not a hiccup: the
+/// gateway keeps serving and every call it finishes is spend no window will
+/// ever count. The repair is on the deployment's database URL or its schema,
+/// then a restart -- which is why it must not be summed together with the other
+/// reason.
+pub(crate) const NO_LEDGER_REASON: &str = "no_ledger";
+
+/// The `reason` label when the ledger exists and refused every attempt.
+///
+/// The durable alert fires once per streak and says who to call; this counts
+/// the calls it cost, which the alert cannot. Read the two together: the alert
+/// says whether it is still happening, this says how much is gone.
+pub(crate) const WRITE_FAILED_REASON: &str = "write_failed";
+
+/// Every reason a completed call's spend can fail to reach the ledger, in the
+/// order they are published at startup.
+///
+/// The list exists so the cells are created before the first drop rather than by
+/// it: a series born with the event already inside its first sample reads as zero
+/// to `increase()`, and the one loss a fresh process suffers would be the one the
+/// rule cannot see. A reason added to a call site and not here leaves a blind
+/// cell, so the vocabulary test compares this list against what is published.
+pub(crate) const LANDING_DROP_REASONS: [&str; 2] = [NO_LEDGER_REASON, WRITE_FAILED_REASON];
+
 /// How many times one row is offered to the store before the loss is declared.
 ///
 /// Three, not more: this is a detached task, so extra attempts cost nothing on
