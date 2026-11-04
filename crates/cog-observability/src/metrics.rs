@@ -461,6 +461,7 @@ impl MetricsBackend for PrometheusMetricsBackend {
 #[cfg(test)]
 mod tests {
     //! principle: feedback_a_series_name_that_is_only_a_prefix_of_its_literal_escapes_the_census
+    //! principle: feedback_two_counters_in_one_family_can_count_two_different_buses
     //!
     //! 这个模块带着从当前树、单一修订回答该原则的门：抓取面普查的反向扫描只
     //! 认「整条字面量就是序列名」的出现，嵌在 `# HELP` 更长字面量里的不算。
@@ -652,6 +653,78 @@ mod tests {
         assert!(
             census_reads_series(&with_reader, name),
             "整条字面量就是名字时普查必须数到: {with_reader}"
+        );
+    }
+    /// 一个家族、两支总线：`cogneva_event_bus_emitted_total` 记的是 TaskEvent
+    /// 广播上执行器递出去的每个事件（按 `kind`），`cogneva_event_bus_lagged_total`
+    /// 记的是批消费者在这条广播上漏掉的事件（按 `consumer`）。家族词相同，测量
+    /// 不同，所以两者相加不是一个总数：这条门从注册表自己的读数回答，一支上的
+    /// 增量不挪动另一支。
+    #[tokio::test]
+    async fn one_family_carries_two_buses_that_move_independently() {
+        let backend = PrometheusMetricsBackend::new("");
+        let emitted = cog_core::metric_names::EVENT_BUS_EMITTED_TOTAL.as_str();
+        let lagged = cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL.as_str();
+        assert!(emitted.starts_with("cogneva_event_bus_"), "{emitted}");
+        assert!(lagged.starts_with("cogneva_event_bus_"), "{lagged}");
+        // 说明文本从登记表读：家族词一样，测量不一样。
+        assert_ne!(
+            cog_core::metric_help_text(cog_core::MetricType::Counter, emitted),
+            cog_core::metric_help_text(cog_core::MetricType::Counter, lagged),
+            "一个家族里的两条序列要有各自的说明"
+        );
+
+        backend
+            .record_counter(
+                cog_core::metric_names::EVENT_BUS_EMITTED_TOTAL,
+                3.0,
+                HashMap::from([("kind".to_string(), "task_assigned".to_string())]),
+            )
+            .await
+            .unwrap();
+        backend
+            .record_counter(
+                cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
+                0.0,
+                HashMap::from([("consumer".to_string(), "memory_ingestor".to_string())]),
+            )
+            .await
+            .unwrap();
+
+        let emitted_rows = backend.query_counter_totals(emitted).await.unwrap();
+        let lagged_rows = backend.query_counter_totals(lagged).await.unwrap();
+        assert_eq!(emitted_rows.len(), 1, "TaskEvent 总线只有一条序列");
+        assert_eq!(lagged_rows.len(), 1, "消费者总线只有一条序列");
+        assert!(emitted_rows[0].labels.contains_key("kind"));
+        assert!(lagged_rows[0].labels.contains_key("consumer"));
+        assert_eq!(emitted_rows[0].value, 3.0);
+        assert_eq!(lagged_rows[0].value, 0.0);
+
+        // 只在消费者总线上加：TaskEvent 总线上的读数不动。
+        backend
+            .record_counter(
+                cog_core::metric_names::EVENT_BUS_LAGGED_TOTAL,
+                2.0,
+                HashMap::from([("consumer".to_string(), "memory_ingestor".to_string())]),
+            )
+            .await
+            .unwrap();
+        let emitted_after = backend.query_counter_totals(emitted).await.unwrap();
+        let lagged_after = backend.query_counter_totals(lagged).await.unwrap();
+        assert_eq!(emitted_after[0].value, 3.0, "另一支上的增量不挪动这一支");
+        assert_eq!(lagged_after[0].value, 2.0, "被加的那一支自己动了");
+        assert!(!emitted_after[0].labels.contains_key("consumer"));
+        assert!(!lagged_after[0].labels.contains_key("kind"));
+
+        // 抓取面自己说的话：两条序列各有各的名字和标签轴。
+        let body = String::from_utf8(backend.encode().unwrap()).unwrap();
+        assert!(
+            body.contains("cogneva_event_bus_emitted_total{kind=\"task_assigned\"} 3"),
+            "{body}"
+        );
+        assert!(
+            body.contains("cogneva_event_bus_lagged_total{consumer=\"memory_ingestor\"} 2"),
+            "{body}"
         );
     }
 }
