@@ -197,6 +197,56 @@ fn reclaim_cause(
     None
 }
 
+/// 一次执行被它自己的时限截断时，错误文本里出现的那一句的开头。
+///
+/// 生产它的是执行路由（`task_executor_router`），读它的是这里：两边读同一个
+/// 常量，改一处不会让另一处静默失配——两处各写一份字面量时，改了一边的那天，
+/// 判定与生产就会分家，而分家的表现是「这条规则从某天起不再触发」，没有红。
+pub(crate) const DEADLINE_CUT_PREFIX: &str = "Task execution timed out after ";
+
+/// 一次尝试能拿到的最大时限。
+// cap: bound — 一小时是平台给一份 LLM 密集工作声明的量级（自进化任务用这个数），两小时是最后一次翻倍；再往上截断的，缺的不是时间
+const MAX_ATTEMPT_BUDGET_SECS: u64 = 7200;
+
+/// 上一次尝试是不是被它自己的时限截断的，截断时声明的是多少秒。
+///
+/// 按形状读，不按裸子串读：要的是「<开头><数字> seconds」这一整句。错误文本在
+/// 到达这里之前可能被别的层包过（`Agent execution error: ` 之流），所以不要求
+/// 出现在开头；但只认这一句，不认散文里恰好提到这些词。
+fn deadline_cut_seconds(error: &str) -> Option<u64> {
+    let at = error.find(DEADLINE_CUT_PREFIX)? + DEADLINE_CUT_PREFIX.len();
+    let rest = &error[at..];
+    let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+    let secs = rest[..digits].parse::<u64>().ok()?;
+    rest[digits..].starts_with(" seconds").then_some(secs)
+}
+
+/// 新一次尝试的执行时限：上一次被自己的时限截断，这一次就该给更多。
+///
+/// 被截断说的是「这份活需要的时间比声明的多」，不是「这份活做不成」。同一个
+/// 时限重来一遍是同一个实验：同样的输入、同样的墙，结果必然相同——那笔重试
+/// 预算买到的是零。集群库实测（2026-11-04）的表现正是这样：一条重规划连着
+/// 三次在 300 秒处被截断，然后报「Global retry budget exhausted」。耗尽的不是
+/// 上游的能力，是这条活从来没有拿到过比第一次更多的时间。
+///
+/// 翻倍是能用证据买到的最小增量：它不猜这份活要多久，只保证这一轮比上一轮多，
+/// 多的那一份由「上一轮用光了」这件事本身证明。封顶
+/// [`MAX_ATTEMPT_BUDGET_SECS`]——过了那里还截断的，缺的不是时间。
+///
+/// 只在一次运行的开始时调用：那一刻读到的 `error` 是上一次尝试的判词，而这一
+/// 轮还没开始，改的正是这一轮要用的契约。
+fn raise_after_a_deadline_cut(task: &mut Task) {
+    let Some(spent) = task.error.as_deref().and_then(deadline_cut_seconds) else {
+        return;
+    };
+    // 用上一次声明的那个数做基准，而不是行上现在的数：行上的数可能已经被抬过
+    // 一次（同一条错误在几次派发里都读得到），按它翻倍会一次翻两档。
+    let raised = spent.saturating_mul(2).min(MAX_ATTEMPT_BUDGET_SECS);
+    if raised > task.timeout_seconds {
+        task.timeout_seconds = raised;
+    }
+}
+
 impl DagExecutor {
     pub fn new(workspace_id: String) -> Self {
         Self {
@@ -2488,7 +2538,10 @@ impl DagExecutor {
                     task_id,
                     &[TaskStatus::Scheduled],
                     "Cannot start task in {} state",
-                    |t| t.begin_run(&owner, lease, chrono::Utc::now()),
+                    |t| {
+                        raise_after_a_deadline_cut(t);
+                        t.begin_run(&owner, lease, chrono::Utc::now())
+                    },
                     Some(cog_core::TaskEvent::TaskStarted {
                         task_id: task_id.into(),
                         timestamp: chrono::Utc::now(),
@@ -2513,6 +2566,7 @@ impl DagExecutor {
             });
         }
 
+        raise_after_a_deadline_cut(task);
         task.begin_run(&self.run_id, self.task_lease, chrono::Utc::now());
         let task_snapshot = task.clone();
         drop(inner);
@@ -4243,6 +4297,67 @@ mod tests {
             TaskType::Generator,
             serde_json::json!({ "evolution_mode": "generate_change" }),
         )
+    }
+
+    /// 时限截断按形状认：整句「<开头><数字> seconds」才算，散文里提到这些词不算。
+    #[test]
+    fn a_deadline_cut_is_recognised_only_in_its_whole_sentence() {
+        assert_eq!(
+            deadline_cut_seconds("Task execution timed out after 300 seconds"),
+            Some(300)
+        );
+        assert_eq!(
+            deadline_cut_seconds(
+                "Agent execution error: Task execution timed out after 600 seconds"
+            ),
+            Some(600),
+            "错误在到达编排侧之前会被别的层包一层，包过之后仍然要认得出来"
+        );
+        assert_eq!(
+            deadline_cut_seconds("Task execution timed out after 300 second"),
+            None,
+            "少了那个词就不是同一句话"
+        );
+        assert_eq!(
+            deadline_cut_seconds("the run mentioned a deadline cut, 300 seconds"),
+            None,
+            "散文里恰好写到时限与秒数，不是一次截断的判词"
+        );
+        assert_eq!(deadline_cut_seconds("boom"), None);
+    }
+
+    /// 被自己的时限截断之后，下一轮拿到的是更多的时间。
+    ///
+    /// 行上的 `error` 只在下一次失败时被覆盖，所以同一条截断在几次派发里都读得
+    /// 到；判据因此按错误里声明的那个数翻倍，而不是把行上的数越翻越大。
+    #[test]
+    fn a_deadline_cut_buys_the_next_attempt_more_time() {
+        let mut cut = evolution_task("cut-once");
+        assert_eq!(cut.timeout_seconds, 300, "前提：这是造出来时的默认值");
+        cut.error = Some("Task execution timed out after 300 seconds".into());
+        raise_after_a_deadline_cut(&mut cut);
+        assert_eq!(
+            cut.timeout_seconds, 600,
+            "同一个时限重跑一遍是同一个实验：那笔重试预算买到的是零"
+        );
+
+        // 还没开始跑就又被派发一次：同一条错误读第二遍，不该再翻一档。
+        raise_after_a_deadline_cut(&mut cut);
+        assert_eq!(cut.timeout_seconds, 600);
+
+        // 上一轮实际声明得更多，这一轮就按它翻倍，封顶在最后一次。
+        cut.error = Some("Task execution timed out after 3600 seconds".into());
+        raise_after_a_deadline_cut(&mut cut);
+        assert_eq!(
+            cut.timeout_seconds, MAX_ATTEMPT_BUDGET_SECS,
+            "封顶在最后一次翻倍：再往上是这份活在空转，不是时限问题"
+        );
+
+        // 不是时限截断的失败，预算原样不动。
+        let mut plain = evolution_task("plain-failure");
+        plain.error = Some("upstream_unavailable: LLM upstream refused (rate_limited)".into());
+        raise_after_a_deadline_cut(&mut plain);
+        assert_eq!(plain.timeout_seconds, 300);
     }
 
     /// 被扣住的行要带名字，不能只报数。

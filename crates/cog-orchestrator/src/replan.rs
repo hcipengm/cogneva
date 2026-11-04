@@ -37,6 +37,20 @@ const ID_PREFIX: &str = "replan";
 // cap: bound — 三次都没有交货，缺的不是第四次尝试，是有人去看这三条；再往下就是每轮往队列里添一条注定失败的活
 pub const MAX_ATTEMPTS: usize = 3;
 
+/// 一次重规划尝试的执行预算。
+///
+/// 这条活自己声明预算，不继承任务行造出来时的那一格：那一格是 300 秒，而集群
+/// 库实测（2026-11-04）一条重规划跑一次要 6～27 次 LLM 调用、光模型时间就
+/// 87～311 秒，墙钟还要等工具与编排的空隙。挂在默认值上的每一条都是同一个结局：
+/// 跑到 300 秒被截断，三次重试是同一个实验原样做三遍，最后以「Global retry
+/// budget exhausted」判死——库里 13 条重规划一条也没有交付过。
+///
+/// 取一小时：这是平台给「一份 LLM 密集的活」声明的量级，自进化任务用的是同一
+/// 个数。口径不同才是奇怪的——都是让模型把一件事想完，凭什么一种有一小时、
+/// 另一种只有五分钟。
+// cap: bound — 一份 LLM 密集工作的执行上限，与自进化任务同一量级
+pub const BUDGET_SECS: u64 = 3600;
+
 /// 造任务这一侧的判断结果。
 ///
 /// 与交给判定侧的 [`ReplanOutcome`] 是两个东西：那一个是「这件事落定了没有」，
@@ -209,6 +223,9 @@ pub fn replan_task(
     task.goal_id = Some(breach.project.clone());
     task.parent_task_id = Some(root.to_string());
     task.acceptance = acceptance_for(breach, revision);
+    // 预算在这里声明，见 [`BUDGET_SECS`]：造出来的那一格默认是 300 秒，比这份
+    // 活的一次尝试还短，落上去的每一条都会在同一个地方被截断。
+    task.timeout_seconds = BUDGET_SECS;
     task.created_at = now;
     task.updated_at = now;
 
@@ -383,6 +400,28 @@ mod tests {
         assert_eq!(facts["index"], "schedule");
         assert_eq!(facts["gap_tokens"], 3_800);
         assert_eq!(facts["baseline_rev"], REV);
+    }
+
+    /// 造出来的活带着自己的预算，不是任务行造出来时那一格。
+    ///
+    /// 判据落在「比一次尝试实际需要的还短」这件事上：默认的 300 秒比库里实测
+    /// 的一次尝试（光模型时间就到 311 秒，墙钟还要等工具与编排）还紧，落上去
+    /// 的重试只是把同一个超时重放三遍，第三遍之后任务被判「重试预算耗尽」——
+    /// 那不是任务失败，是预算从一开始就不可能成立。
+    #[test]
+    fn a_minted_replan_declares_a_budget_that_fits_one_attempt() {
+        let found = breach(PerformanceIndex::Schedule, 0.62, 6_200, 10_000);
+        let task = minted(replan_task(&found, REV, &group(vec![]), at(0)));
+
+        assert_eq!(
+            task.timeout_seconds, BUDGET_SECS,
+            "预算必须由造它的地方声明：继承默认值就是在 300 秒处截断这份活"
+        );
+        assert!(
+            task.timeout_seconds > 300,
+            "缺省的 300 秒比一次尝试实际需要的还短（实测 87～311 秒的模型时间，\
+             墙钟更久），预算落在那里等于每一条重规划都是三次注定一样的超时"
+        );
     }
 
     /// 这条活有活要干，但不欠任何一条变更，而且它在行上就这么说。

@@ -474,7 +474,7 @@ impl TaskExecutorRouter {
         bytes: &[u8],
         hold: &crate::observable::ClaimHold,
     ) {
-        let task: Task = match serde_json::from_slice(bytes) {
+        let mut task: Task = match serde_json::from_slice(bytes) {
             Ok(t) => t,
             Err(e) => {
                 // 毒消息永远不会反序列化成功，不 ack 会被清扫器每 10 分钟
@@ -600,6 +600,16 @@ impl TaskExecutorRouter {
             }
         }
 
+        // 这一轮要用的时限以行上那一格为准：开始之前它可能刚被抬过——上一次
+        // 被自己的时限截断，行上的预算因此翻倍（判据与抬法在编排侧那一处）。
+        // 手里这份是从就绪消息里反序列化来的，落在抬高之前；照它跑就是在旧的
+        // 时限上再截断一次，而回改那一轮预算的读者是行——两边必须读同一个数。
+        if let Some(ref orch) = self.orchestrator {
+            if let Some(fresh) = orch.get_task(&task.id).await {
+                task.timeout_seconds = fresh.timeout_seconds;
+            }
+        }
+
         // timeout_seconds 是任务自带的执行契约。编排侧的超时检查器只会把
         // Running 任务标记失败/重试，并不取消这里的执行 future；不在此兑
         // 现，失控的 agent 任务会无限期占住串行消费位置（实测 90+ 分钟不
@@ -613,7 +623,8 @@ impl TaskExecutorRouter {
         let result = match tokio::time::timeout(timeout, self.execute(&task)).await {
             Ok(result) => result,
             Err(_) => Err(SFError::Agent(format!(
-                "Task execution timed out after {} seconds",
+                "{}{} seconds",
+                crate::dag_executor::orchestrator::DEADLINE_CUT_PREFIX,
                 task.timeout_seconds
             ))),
         };
