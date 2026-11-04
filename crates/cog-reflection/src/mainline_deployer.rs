@@ -1492,13 +1492,20 @@ pub(crate) fn upstream_ci_no_verdict_signatures() -> [String; 2] {
     ]
 }
 
-/// 「上游判了这一版红」这条待办的行 id：一版一份、一天一份。
+/// 「上游判了这一版红」这条待办的行 id：一次扣住一份、一天一份。
 ///
-/// 由 rev 与日期推出而不是随机：图把已持有的 id 当幂等空操作，而这一支在扣住期间
-/// 每一轮都会走到。换一天换一个 id，因为一版红到第二天还没人动，那是另一个发现，
-/// 不是同一张单子。
-pub(crate) fn ci_hold_goal_id(rev: &str, day: &str) -> String {
-    format!("ci-red-{}-{day}", rev12(rev))
+/// 由 rev、这次扣住的起点与日期推出而不是随机：图把已持有的 id 当幂等空操作，而这
+/// 一支在扣住期间每一轮都会走到，随机 id 会让每一轮都多开一张单子。
+///
+/// 起点在键里，是因为同一个 id 一旦被收掉就不再代表「有人在办」：扣住结束的那一刻
+/// 它开出去的行会被回收（见 [`MainlineDeployer::retire_ci_hold_rows`]），而同一版当天
+/// 再次被判红是一件新事——那是又一次扣住，要有一行还活着的新单子。只按
+/// rev+日期取键，第二次扣住会撞上一个已经作废的 id，图按幂等跳过，读数说有主、
+/// 图里却一行活的都没有。
+///
+/// 换一天也换 id：一版红到第二天还没人动，那是另一个发现，不是同一张单子。
+pub(crate) fn ci_hold_goal_id(rev: &str, day: &str, since_unix: i64) -> String {
+    format!("ci-red-{}-{day}-h{since_unix}", rev12(rev))
 }
 
 /// 这一次扣住落在**哪个面**上。
@@ -1511,10 +1518,10 @@ const CI_HOLD_FACE: &str = "CI/构建/部署";
 /// 分解不了时那条「改这棵树，让这些检查过」的行。
 ///
 /// 与目标行分开：目标行是不可执行的锚点，读面靠它认「一次提交」；这一行是活本身。
-/// id 同样由 rev 与日期推出，理由与 [`ci_hold_goal_id`] 相同——扣住期间每一轮都会
-/// 走到这里。
-pub(crate) fn ci_hold_fix_task_id(rev: &str, day: &str) -> String {
-    format!("{}-fix", ci_hold_goal_id(rev, day))
+/// id 同样由 rev、扣住起点与日期推出，理由与 [`ci_hold_goal_id`] 相同——扣住期间每
+/// 一轮都会走到这里。
+pub(crate) fn ci_hold_fix_task_id(rev: &str, day: &str, since_unix: i64) -> String {
+    format!("{}-fix", ci_hold_goal_id(rev, day, since_unix))
 }
 
 /// 这一行交给的执行路径的拼写。
@@ -4978,7 +4985,16 @@ impl MainlineDeployer {
         // After the hold is on disk: a submission that fails must not cost the
         // record of how long this revision has been held, which is the reading
         // the alert rests on.
-        let (owner, rows) = self.dispatch_ci_remediation(rev, &failed_checks).await;
+        // 这次扣住的起点是它的身份：同一版当天被第二次扣住是另一次扣住，行就得是
+        // 另一行（见 [`ci_hold_goal_id`]）。上面刚保证过 `state.ci_hold` 说的就是这一版。
+        let since_unix = state
+            .ci_hold
+            .as_ref()
+            .map(|held| held.since_unix)
+            .unwrap_or(now);
+        let (owner, rows) = self
+            .dispatch_ci_remediation(rev, &failed_checks, since_unix)
+            .await;
         // 开了哪几行也落盘：扣住结束的那一刻，只有这里还知道它们叫什么（见
         // [`CiHold::rows`]）。同一行每轮都会重开一次，所以只收没记过的。
         if let Some(held) = state.ci_hold.as_mut() {
@@ -5009,10 +5025,13 @@ impl MainlineDeployer {
     /// entry every other goal uses, so the pieces land in the DAG and the
     /// ordinary executors carry them.
     ///
-    /// One goal per revision and day, derived rather than random: the id is held
-    /// by the graph as an idempotent no-op, and this branch runs on every
-    /// polling cycle while the hold stands. A new day gets a new id, because a
-    /// revision still red tomorrow is a finding nobody acted on.
+    /// One goal per hold-and-day, derived rather than random: the id is held by
+    /// the graph as an idempotent no-op, and this branch runs on every polling
+    /// cycle while the hold stands. The hold's own start is part of the key
+    /// because a hold that ended takes its rows with it: a second hold on the
+    /// same revision that day is a new finding and needs a row that is still
+    /// alive. A new day gets a new id too, because a revision still red
+    /// tomorrow is a finding nobody acted on.
     ///
     /// Answers whether this hold has an owner: true when a goal was queued or
     /// one already stood from an earlier round today, false when the submission
@@ -5023,6 +5042,7 @@ impl MainlineDeployer {
         &self,
         rev: &str,
         failed_checks: &[String],
+        since_unix: i64,
     ) -> (CiHoldOwner, Vec<String>) {
         let Some(orchestrator) = self.orchestrator.as_ref() else {
             // 这一支此前一句话都不说：告警的判词写着「两种没人管分得开，靠的是当轮
@@ -5038,6 +5058,7 @@ impl MainlineDeployer {
         let id = ci_hold_goal_id(
             rev,
             &Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string(),
+            since_unix,
         );
         let evidence = self.ci_failure_evidence(&id, rev, failed_checks).await;
         let goal = ci_hold_goal_text(rev, failed_checks, &evidence);
@@ -5085,7 +5106,14 @@ impl MainlineDeployer {
                     "the planner could not take the CI hold; filing the change itself instead"
                 );
                 let (owner, fix_id) = self
-                    .file_ci_hold_fix(orchestrator, rev, failed_checks, &goal, &evidence)
+                    .file_ci_hold_fix(
+                        orchestrator,
+                        rev,
+                        failed_checks,
+                        &goal,
+                        &evidence,
+                        since_unix,
+                    )
                     .await;
                 // 兜底那一行的 id 不论成没成都记下：它已经在图里时，收尾要能一起收；
                 // 没落库时 `get_task` 读不到，收尾那一步自然跳过。
@@ -5101,8 +5129,9 @@ impl MainlineDeployer {
     /// 变成「不记这一笔」。带 `evolution_mode=generate_change` 的行走的正是主流程
     /// 本来就有的那条免分解注入：规划器见「全是自演化意图」就直接交给 DAG，不叫模型。
     ///
-    /// 与目标行同一个日程：id 由 rev 与日期推出，扣住期间每一轮都会走到这里，而图对
-    /// 已持有的 id 是幂等空操作——同一天同一版不会因此多出第二行。
+    /// 与目标行同一个日程：id 由 rev、这次扣住的起点与日期推出，扣住期间每一轮都会
+    /// 走到这里，而图对已持有的 id 是幂等空操作——同一次扣住、同一天不会因此多出第
+    /// 二行。
     async fn file_ci_hold_fix(
         &self,
         orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
@@ -5110,9 +5139,10 @@ impl MainlineDeployer {
         failed_checks: &[String],
         goal: &str,
         evidence: &[CheckEvidence],
+        since_unix: i64,
     ) -> (CiHoldOwner, String) {
         let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
-        let id = ci_hold_fix_task_id(rev, &day);
+        let id = ci_hold_fix_task_id(rev, &day, since_unix);
         // 证据照原样放进来：接手的人先要读的就是那几条检查自己写下的失败点，而它们
         // 只在内存里活到这一段结束。
         let seen: Vec<serde_json::Value> = evidence
@@ -16291,6 +16321,14 @@ exec {real} "$@"
                 task.status = cog_core::TaskStatus::Running;
             }
         }
+
+        /// 图里这一行现在是什么状态；不存在的 id 给 `None`。
+        ///
+        /// 「提交成功」与「图里有一行活的」是两件事：同一个 id 再提交一次，真实 DAG
+        /// 按幂等跳过并如实回一个空的新增列表，读起来像是收下了。
+        fn status(&self, id: &str) -> Option<cog_core::TaskStatus> {
+            self.graph.lock().unwrap().get(id).map(|task| task.status)
+        }
     }
 
     #[async_trait::async_trait]
@@ -16317,20 +16355,26 @@ exec {real} "$@"
                 ));
             }
             self.rows.lock().unwrap().push(tasks.clone());
-            {
-                let mut graph = self.graph.lock().unwrap();
-                for task in &tasks {
-                    graph.entry(task.id.clone()).or_insert_with(|| task.clone());
-                }
-            }
             let ids: Vec<String> = tasks.iter().map(|task| task.id.clone()).collect();
-            let mut held = self.submissions.lock().unwrap();
-            let fresh: Vec<String> = ids
-                .iter()
-                .filter(|id| !held.iter().any(|(_, held_ids, _)| held_ids.contains(id)))
-                .cloned()
-                .collect();
-            held.push((goal.to_string(), ids, fresh.clone()));
+            // 已有的 id 一律跳过，与真实 DAG 同一条幂等规矩：替身若不跳，「同一个 id
+            // 被重新提交」这件事在测试里就永远看不见，而这正是扣住第二回撞上已作废
+            // 那一行时的现场。
+            let fresh: Vec<String> = {
+                let mut graph = self.graph.lock().unwrap();
+                let mut fresh = Vec::new();
+                for task in &tasks {
+                    if graph.contains_key(&task.id) {
+                        continue;
+                    }
+                    graph.insert(task.id.clone(), task.clone());
+                    fresh.push(task.id.clone());
+                }
+                fresh
+            };
+            self.submissions
+                .lock()
+                .unwrap()
+                .push((goal.to_string(), ids, fresh.clone()));
             Ok(fresh)
         }
         async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
@@ -16483,7 +16527,8 @@ exec {real} "$@"
         assert_eq!(submissions.len(), 1, "{submissions:?}");
         let (goal, ids, added) = &submissions[0];
         let day = Utc::now().format("%Y-%m-%d").to_string();
-        assert_eq!(ids, &vec![ci_hold_goal_id("abc123", &day)]);
+        let since = state.ci_hold.as_ref().expect("扣住记下来了").since_unix;
+        assert_eq!(ids, &vec![ci_hold_goal_id("abc123", &day, since)]);
         assert_eq!(added, ids, "the first submission is the one that lands");
         assert!(goal.contains("abc123"), "the revision is named: {goal}");
         assert!(
@@ -16975,6 +17020,7 @@ exec {real} "$@"
             .unwrap());
 
         let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
+        let since = state.ci_hold.as_ref().expect("扣住记下来了").since_unix;
         // 替身只记收下的那一笔（被拒的连记都不记），所以「只有一笔且是兜底那一笔」
         // 本身就说完了这一轮发生的事：目标行的提交被拒了，兜底的行收下了。
         let submissions = planner.submissions();
@@ -16985,8 +17031,8 @@ exec {real} "$@"
         );
         assert_eq!(
             submissions[0].1,
-            vec![ci_hold_fix_task_id("abc123", &day)],
-            "兜底那一行与目标行同日同版，图对已持有的 id 是幂等空操作"
+            vec![ci_hold_fix_task_id("abc123", &day, since)],
+            "兜底那一行与目标行同一次扣住、同一天，图对已持有的 id 是幂等空操作"
         );
         assert_eq!(
             submissions[0].2, submissions[0].1,
@@ -17027,8 +17073,8 @@ exec {real} "$@"
         assert_eq!(
             state.ci_hold.as_ref().map(|held| held.rows.clone()),
             Some(vec![
-                ci_hold_goal_id("abc123", &day),
-                ci_hold_fix_task_id("abc123", &day)
+                ci_hold_goal_id("abc123", &day, since),
+                ci_hold_fix_task_id("abc123", &day, since)
             ]),
             "两条都开出去了（目标行 + 兜底行），两条都要记下来"
         );
@@ -17043,6 +17089,73 @@ exec {real} "$@"
             "兜底落库了就是有主，读数不该有任何一格是 1：{samples:?}"
         );
         settle(handle).await;
+    }
+
+    /// 同一版当天第二次被扣住，要留下一行**还活着**的单子。
+    ///
+    /// 扣住结束时会把它开出去的行收掉，而一个已经作废的 id 不再代表「有人在办」。
+    /// 只按 rev 与日期取键，第二次扣住撞上的就是那一行作废的 id：图按幂等跳过，
+    /// 读数写「有主」，图里却一行活的都没有——那正是这条改动本身要消灭的形状。
+    ///
+    /// 键里加回扣住起点之后，第二次扣住是一条新行。把这一维去掉，下面「图里那一行
+    /// 还活着」立刻红。
+    #[tokio::test]
+    async fn a_second_hold_on_the_same_revision_leaves_a_row_that_is_still_alive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        // 只留兜底那一支：一行活本身，读起来不用在「目标行分解出什么」上分心。
+        planner
+            .refuse_decomposition
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
+        let checks = vec!["github:Test".to_string()];
+        let first_fix = ci_hold_fix_task_id("abc123", &day, 100);
+
+        let (owner, first_rows) = deployer
+            .dispatch_ci_remediation("abc123", &checks, 100)
+            .await;
+        assert_eq!(owner, CiHoldOwner::Owned);
+        assert!(first_rows.contains(&first_fix), "{first_rows:?}");
+        assert_eq!(
+            planner.status(&first_fix),
+            Some(cog_core::TaskStatus::Pending)
+        );
+
+        // 扣住结束：真实路径上这一步在 `poll_once` 里，删掉那次改动它就不发生。
+        let ended = CiHoldEnd {
+            rev: "abc123".into(),
+            since_unix: 100,
+            ended_unix: 200,
+            outcome: "pass".into(),
+            reasons: Vec::new(),
+            failed_checks: checks.clone(),
+        };
+        deployer.retire_ci_hold_rows(&first_rows, &ended).await;
+        assert_eq!(
+            planner.status(&first_fix),
+            Some(cog_core::TaskStatus::Cancelled),
+            "收掉之后这一行不再代表有人在办"
+        );
+
+        // 同一天、同一版，又一次扣住。
+        let (owner, second_rows) = deployer
+            .dispatch_ci_remediation("abc123", &checks, 300)
+            .await;
+        assert_eq!(owner, CiHoldOwner::Owned);
+        let second_fix = ci_hold_fix_task_id("abc123", &day, 300);
+        assert_ne!(second_fix, first_fix, "另一次扣住是另一行");
+        assert!(second_rows.contains(&second_fix), "{second_rows:?}");
+        assert_eq!(
+            planner.status(&second_fix),
+            Some(cog_core::TaskStatus::Pending),
+            "读数说有主，图里就得有一行活的单子：{second_rows:?}"
+        );
     }
 
     /// 扣住结束时，它开出去的那几行要跟着收掉；跑起来的那一行不碰。
