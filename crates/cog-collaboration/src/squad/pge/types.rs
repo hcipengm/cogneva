@@ -14,6 +14,22 @@ pub struct TaskSpec {
     pub input: serde_json::Value,
     #[serde(alias = "blockedBy")]
     pub blocked_by: Vec<String>,
+    /// 这一片自己的验收标准：说完与没说完拿什么判。
+    ///
+    /// 必须有这一格。分解门的判据是「工作包（没有人挂在它下面）要说得出怎样算
+    /// 做完」，而计划这一侧此前只有**整份计划**一份 `acceptance_criteria`——没
+    /// 有任何字段能把一条标准挂到某一片上。于是每一片到了入图那一刻都是空验收，
+    /// 分解门按设计整份打回，而打回的理由读起来像「planner 质量差」：集群库实测
+    /// （2026-11-04）六小时里 11 条分解全部因此判死，没有一条走到入图。
+    ///
+    /// 空着仍然是被拒的：这道门要的就是「说得出来」，不是「有一格」。所以这里
+    /// 只是让计划**说得出**，不是把门放宽。
+    #[serde(
+        default,
+        alias = "acceptance_criteria",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub acceptance: Vec<String>,
 }
 
 /// Output produced by a Planner agent.

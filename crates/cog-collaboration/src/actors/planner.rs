@@ -179,7 +179,8 @@ impl PlannerActor {
                     "name": "string: short task name",
                     "task_type": "string: the id of the executor this sub-task should be handed to, from task.input.executors, or a generic executor type if none of them fits",
                     "input": {"query": "string: everything the executor needs to accomplish this task"},
-                    "blocked_by": ["string: ids of tasks that must finish first, empty if none"]
+                    "blocked_by": ["string: ids of tasks that must finish first, empty if none"],
+                    "acceptance": ["string: this sub-task's own criteria; at least one per entry, each checkable true/false"]
                 }],
                 "acceptance_criteria": ["string: one verifiable criterion per entry; each must be checkable as true/false against the final output"]
             });
@@ -192,6 +193,10 @@ impl PlannerActor {
                  every other sub-task has to feed into it, nothing may depend on it, and it has to be the only such sub-task. \
                  If the work naturally branches into several independent results, add one closing sub-task that combines them \
                  into that single answer instead of leaving the branches as separate ends. \
+                 Every sub_task also carries its own acceptance list: the conditions that say whether THAT \
+                 sub-task is finished (e.g. 'the file names the exact version number', 'the test covers both branches'). \
+                 A sub-task whose work nobody hangs under it needs at least one such criterion — a plan whose leaves \
+                 cannot say how they are judged done is refused before it is ever scheduled. \
                  Also produce acceptance_criteria: concrete, verifiable conditions the final output must satisfy \
                  (e.g. 'the answer states the exact version number', 'the summary covers every sub-task'). \
                  Each criterion must be checkable as true or false; do NOT write vague ones like 'implementation is complete'. \

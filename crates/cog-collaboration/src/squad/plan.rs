@@ -92,6 +92,7 @@ mod tests {
             task_type: "generate".into(),
             input: serde_json::json!({ "query": "do it" }),
             blocked_by: Vec::new(),
+            acceptance: Vec::new(),
         }
     }
 

@@ -1483,10 +1483,11 @@ impl CollaborationExecutor {
             input: spec.input.clone(),
             output_entities: vec![],
             estimated_seconds: Self::estimate_seconds(&spec.name, &spec.input),
-            // 这一段来自协作分配而不是目标分解，没有 WBS 可挂，也没有人给出验收
-            // 标准。空着是实话：分解门只判分解产出的计划，不判这一条路。
+            // 验收标准随计划一起来：计划说得出每一片怎样算做完，这里就照抄；
+            // 说不出就是空的，分解门按它的判据整份打回——空着从来不是可以蒙过去
+            // 的形状，只是此前计划这一侧根本没有字段能装它。
             parent_id: None,
-            acceptance: vec![],
+            acceptance: spec.acceptance.clone(),
         }
     }
 
@@ -1672,6 +1673,29 @@ mod tests {
             }
             panic!("nothing reached the archive");
         }
+    }
+
+    /// 计划说得出每一片怎样算做完，这里就照着搬到那一行上。
+    ///
+    /// 这一格此前是写死的空列表，而计划那一侧根本没有字段能装它：每一片入图
+    /// 前都是空验收，分解门按自己的判据整份打回。集群库实测（2026-11-04）六小时
+    /// 里 11 条分解全部死在这一条上，没有一条走到入图——而失败原因读起来像
+    /// 「planner 质量差」，正是因为它被写成了「这一条路不归门管」的谎。
+    #[test]
+    fn a_sub_tasks_own_criteria_travel_onto_the_atomic_task() {
+        let spec = crate::TaskSpec {
+            id: "t1".into(),
+            name: "implement the thing".into(),
+            task_type: "generator".into(),
+            input: serde_json::json!({ "query": "do it" }),
+            blocked_by: Vec::new(),
+            acceptance: vec!["the test covers both branches".into()],
+        };
+        let atomic = CollaborationExecutor::task_spec_to_atomic(&spec);
+        assert_eq!(
+            atomic.acceptance, spec.acceptance,
+            "计划说的验收标准必须原样落到任务行上：丢掉它，分解门就永远说不出来这片怎样算做完"
+        );
     }
 
     #[async_trait::async_trait]
@@ -2479,6 +2503,7 @@ mod tests {
             task_type: "generator".to_string(),
             input: serde_json::json!({ "body": "x".repeat(chars) }),
             blocked_by: Vec::new(),
+            acceptance: Vec::new(),
         }
     }
 
