@@ -694,20 +694,24 @@ fn door_base(
 /// and reports what the door said.
 async fn submit(door: &str, body: &serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
     let url = format!("{door}/api/v1/tasks");
-    let response = reqwest::Client::new()
-        .post(&url)
-        .timeout(Duration::from_secs(SUBMIT_TIMEOUT_SECS))
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| {
-            format!(
-                "could not reach the submission door at {url}: {e}. A call from outside the \
+    // The client comes from the shared factory: timeouts and the connection
+    // pool have one definition in this repo, and a hand-built one here would be
+    // the second set of numbers -- discovered only when a change to the first
+    // fails to reach this path. No proxy: this traffic goes to the platform's
+    // own face inside the cluster.
+    let client = cog_net::build_client(&cog_net::HttpClientConfig {
+        timeout_secs: SUBMIT_TIMEOUT_SECS,
+        proxy_url: None,
+        ..Default::default()
+    })?;
+    let response = client.post(&url).json(body).send().await.map_err(|e| {
+        format!(
+            "could not reach the submission door at {url}: {e}. A call from outside the \
                  cluster has to be pointed at the service's cluster IP: set {} to \
                  http://<cluster-ip>:<internal-port>",
-                cog_core::MEMORY_API_BASE_ENV
-            )
-        })?;
+            cog_core::MEMORY_API_BASE_ENV
+        )
+    })?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     if !status.is_success() {
