@@ -338,8 +338,7 @@
   "agent_loop": {
     "agent_id": "agent-001",
     "role": "planner",
-    "max_iterations": 10,
-    "eval_max_iterations": 5,
+    "_comment_max_iterations": "不写轮数 = 不设天花板：一轮什么时候结束由模型自己不再要工具来定。可写 `max_iterations` / `eval_max_iterations` 给这个部署设一个具体的界。",
     "context_window_size": 64000,
     "skill_cache_ttl_secs": 30
   },

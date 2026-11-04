@@ -430,7 +430,7 @@ impl cog_core::SystemPlugin for AgentPlugin {
         let eval_config = cog_core::RuntimeConfig {
             agent_id: "eval-agent".into(),
             role: cog_core::roles::EVALUATOR.into(),
-            max_iterations: agent_loop_config.eval_max_iterations,
+            max_iterations: agent_loop_config.eval_max_iterations.unwrap_or(u32::MAX),
             context_window_size: 32000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,

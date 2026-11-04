@@ -99,12 +99,21 @@ const AGENT_POOL_ENV: &[(&str, &str)] = &[
 pub struct AgentLoopConfig {
     pub agent_id: String,
     pub role: String,
-    pub max_iterations: u32,
-    /// Iteration budget of the dedicated evaluator runtime. It differs from
-    /// [`Self::max_iterations`] on purpose: judging a delivered result needs
-    /// fewer turns than producing one. Kept here rather than as a literal at
-    /// the construction site so raising it does not require a new image.
-    pub eval_max_iterations: u32,
+    /// 这一份部署给智能体写下的轮数天花板；`None` 表示**不设天花板**。
+    ///
+    /// 不设的时候，一轮什么时候结束由模型自己不再要工具来定——这正是交互面板
+    /// 里那个员工跑的同一套循环。它在这里曾经是一个写死的数（10），而那个数对
+    /// 每一件活都是同一个断言：比它长的活不存在。事实并非如此，撞上它的那些轮
+    /// 只在读数里留下一句「预算用完」，读的人看不出这是界在裁剪工作还是工作在
+    /// 迷路。写下一个数仍然有效——那是一个具体的部署决定，不是平台的缺省。
+    ///
+    /// 止损不靠轮数：单步停滞超时管「不吭声」，上下文窗口管「装不下」，成本记
+    /// 在使用账上，任务由心跳回收。轮数是这三样都缺时的替代品。
+    pub max_iterations: Option<u32>,
+    /// 评测运行那一侧的天花板，语义同上。它比生产那一侧窄曾经是有理由的
+    /// （判一份交上来的结果用不了那么多轮），但同样是一个断言而不是一条度量，
+    /// 所以同样交给部署去写。
+    pub eval_max_iterations: Option<u32>,
     pub context_window_size: usize,
     /// TTL for the available_skills cache in AgentRuntime (seconds).
     pub skill_cache_ttl_secs: u64,
@@ -172,8 +181,8 @@ impl Default for AgentLoopConfig {
         Self {
             agent_id: "agent-001".into(),
             role: cog_core::roles::PLANNER.into(),
-            max_iterations: 10,
-            eval_max_iterations: 5,
+            max_iterations: None,
+            eval_max_iterations: None,
             context_window_size: 32000,
             skill_cache_ttl_secs: 30,
             think_stall_timeout_secs: 240,
@@ -202,7 +211,9 @@ impl From<AgentLoopConfig> for cog_core::RuntimeConfig {
         Self {
             agent_id: c.agent_id,
             role: c.role,
-            max_iterations: c.max_iterations,
+            // 没有写下的天花板就是没有天花板：运行面只有一个数表示「不设界」，
+            // 不让「没配置」在别处变成一个新的缺省数。
+            max_iterations: c.max_iterations.unwrap_or(u32::MAX),
             context_window_size: c.context_window_size,
             skill_cache_ttl_secs: c.skill_cache_ttl_secs,
             think_stall_timeout_secs: c.think_stall_timeout_secs,
@@ -258,14 +269,61 @@ mod tests {
         let l = AgentLoopConfig::default();
         assert_eq!(l.agent_id, "agent-001");
         assert_eq!(l.role, "planner");
-        assert_eq!(l.max_iterations, 10);
-        // The evaluator budget defaults to the value the runtime used to carry
-        // as a literal; moving it here must not change it on its own.
-        assert_eq!(l.eval_max_iterations, 5);
+        // No number written means no ceiling: a default here would be an
+        // assertion about every job, made before any of them has run.
+        assert_eq!(l.max_iterations, None);
+        assert_eq!(l.eval_max_iterations, None);
         let p = AgentManagerConfig::default();
         assert!(p.enabled);
         // 0 = 不声明上限：默认并发由资源读数决定，不再是一个写死的数。
         assert_eq!(p.worker_count, 0);
+    }
+
+    /// 没写下的天花板，转成运行配置后就是不设天花板。
+    ///
+    /// 这一跳是整条链上唯一把「部署没有表态」翻译成运行面数字的地方。它要是自己
+    /// 补一个数，前面那些「不写就是不设界」的注释就全是假话，而读配置的人会以为
+    /// 这个部署已经把轮数交回给模型了。
+    #[test]
+    fn a_ceiling_nobody_wrote_does_not_appear_in_the_runtime_config() {
+        let runtime: cog_core::RuntimeConfig = AgentLoopConfig::default().into();
+        assert_eq!(runtime.max_iterations, u32::MAX);
+
+        let written: cog_core::RuntimeConfig = AgentLoopConfig {
+            max_iterations: Some(12),
+            ..AgentLoopConfig::default()
+        }
+        .into();
+        assert_eq!(written.max_iterations, 12);
+    }
+
+    /// 随这份仓发布的配置不给智能体写轮数。
+    ///
+    /// 写一个数就是对每一件活下的同一个断言：比它长的活不存在。撞上它的那些轮只在
+    /// 读数里留一句「预算用完」，读的人分不出这是界在裁剪工作还是工作在迷路。部署
+    /// 真要设界，写在它自己的 values / 配置里——那是这个部署的决定，不是随产品发出去
+    /// 的缺省。
+    #[test]
+    fn the_shipped_config_writes_no_iteration_ceiling() {
+        let root = crate::checkout::repo_root();
+        for rel in [
+            "deploy/helm/cogneva/files/cogneva.json",
+            "cogneva.example.json",
+        ] {
+            let path = root.join(rel);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} unreadable: {e}", path.display()));
+            let root_json: serde_json::Value = serde_json::from_str(&text).expect("config is JSON");
+            let section = root_json
+                .pointer("/agent_loop")
+                .unwrap_or_else(|| panic!("{rel}: agent_loop section present"));
+            for key in ["max_iterations", "eval_max_iterations"] {
+                assert!(
+                    section.get(key).is_none(),
+                    "{rel}: agent_loop.{key} 又写了一个数——这是给所有活下的同一个断言"
+                );
+            }
+        }
     }
 
     #[test]
@@ -310,8 +368,8 @@ mod tests {
         .unwrap();
         let l = AgentLoopConfig::load_from(&path).unwrap();
         assert_eq!(l.role, "evaluator");
-        assert_eq!(l.max_iterations, 3);
-        assert_eq!(l.eval_max_iterations, 7);
+        assert_eq!(l.max_iterations, Some(3));
+        assert_eq!(l.eval_max_iterations, Some(7));
         assert_eq!(l.memory_api_base.as_deref(), Some("http://cogneva:8080"));
         assert_eq!(
             AgentManagerConfig::load_from(&path).unwrap().worker_count,
