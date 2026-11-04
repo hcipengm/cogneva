@@ -237,6 +237,15 @@ jobs:
         run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test stream_deltas_reach_live_readers_but_not_the_event_log -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # A stalled writer used to turn every surplus event into its own task
+      # waiting for a connection -- the repair cost more than the fault, and on
+      # 2026-11-04 it was the whole pool. Only the commit counter separates the
+      # two spellings, because both eventually write the rows.
+      - name: Live-DB full event queue does not fan out
+        if: ${{ !cancelled() }}
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test a_full_write_queue_does_not_give_each_event_its_own_connection -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # A schema statement's wait for its locks is a fact about the server's
       # lock queue across two sessions, so nothing that runs without a server
       # can see any of it: `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` takes

@@ -138,6 +138,9 @@ pub struct PostgresObservabilityGateway {
     failed_pending: Arc<std::sync::atomic::AtomicU64>,
     /// 上一次把待落量写进库的时刻。
     failed_last_flush: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// 队列满时扔掉了几条。计数只为让日志按 2 的幂次打印：这条路径在故障时可以
+    /// 每秒被走几百次，逐条打印会把日志面变成第二个故障源。
+    dropped: std::sync::atomic::AtomicU64,
     /// 正在排队的待落事件。见 [`EVENT_BATCH_MAX`]：这条通路每秒能产生几百条
     /// 事件，一条一次 INSERT 就是几百次提交，而提交要等 WAL 落盘。
     persist_tx: tokio::sync::mpsc::Sender<AgentEvent>,
@@ -223,6 +226,7 @@ impl PostgresObservabilityGateway {
             metrics: None,
             failed_pending: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             failed_last_flush: Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            dropped: std::sync::atomic::AtomicU64::new(0),
             persist_tx,
             persist_rx: Arc::new(std::sync::Mutex::new(Some(persist_rx))),
             persist_writer_started: Arc::new(std::sync::Once::new()),
@@ -836,16 +840,25 @@ impl ObservabilityGateway for PostgresObservabilityGateway {
 
         self.start_event_writer();
 
-        // 队列满时**不丢**，改为立刻单独写这一条：排队的代价由这一条自己承担，
-        // 而不是把它从表里抹掉——表少一条与「这件事没发生」在读的人眼里同形。
+        // 队列满时**不排队也就到此为止**：这条事件不会进表，计数并留下一条日志。
+        //
+        // 之前这里反过来：满了就起一个任务单独写这一条，理由是「表少一条与这件事
+        // 没发生同形」。那个理由成立，做法却把故障放大了——队列满意味着写者拿不到
+        // 连接，而每条事件的救兵也是一个等连接的任务；集群库实测（2026-11-04）
+        // 十分钟里记下三千多条 `pool timed out`，全是这些救兵，它们既没救回事件，
+        // 又把池占得更死。队列的长度正是给它这个用途的：写者慢时先堆在队列里，
+        // 堆满了才承认这条路此刻写不进去，而承认的方式必须比事件本身便宜。
+        //
+        // 丢掉的条数照样记进 `observability_event_persist_failed_total`：那个计数器
+        // 的含义是「到了网关、没到表」，队列满正是其中一种。
         match self.persist_tx.try_send(event) {
             Ok(()) => {}
-            Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
-                self.write_one_now(event, "the write queue is full");
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.note_dropped("the write queue is full");
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(event)) => {
-                // 只会发生在写者任务已经退出之后（本进程不再收事件）；同样不丢。
-                self.write_one_now(event, "the batch writer is gone");
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // 只会发生在写者任务已经退出之后（本进程不再收事件）。
+                self.note_dropped("the batch writer is gone");
             }
         }
     }
@@ -872,21 +885,31 @@ impl PostgresObservabilityGateway {
         });
     }
 
-    /// 越过队列直接写一条，理由写进告警里：这条通路自己失败了，读的人要知道。
-    fn write_one_now(&self, event: AgentEvent, why: &'static str) {
-        tracing::warn!("writing one observability event outside the batch queue: {why}");
-        let pool = self.pool.clone();
-        let metrics = self.metrics.clone();
-        let failed_pending = Arc::clone(&self.failed_pending);
-        let failed_last_flush = Arc::clone(&self.failed_last_flush);
-        tokio::spawn(async move {
-            if let Err(e) = PostgresObservabilityGateway::persist_events(&pool, &[event]).await {
-                tracing::warn!("Failed to persist observability event: {}", e);
-                if let Some(metrics) = metrics {
-                    note_persist_failure(&metrics, &failed_pending, &failed_last_flush).await;
-                }
+    /// 一条事件没进队列，就当它没写进表：计数、留一句话、不做别的。
+    ///
+    /// 日志按条数节流而不是按时间：队列满的时候这条路径每秒被走几百次，一句一日志
+    /// 会把磁盘和日志面一起打满，而读者要的只是「有东西在丢，丢了多少」。
+    fn note_dropped(&self, why: &'static str) {
+        let dropped = self
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if dropped.is_power_of_two() {
+            tracing::warn!("observability event not queued: {why}; dropped so far: {dropped}");
+        }
+        if let Some(batch) = take_failure_batch(&self.failed_pending, &self.failed_last_flush) {
+            if let Some(metrics) = self.metrics.clone() {
+                tokio::spawn(async move {
+                    let _ = metrics
+                        .record_counter(
+                            cog_core::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL,
+                            batch as f64,
+                            std::collections::HashMap::new(),
+                        )
+                        .await;
+                });
             }
-        });
+        }
     }
 }
 
@@ -954,31 +977,43 @@ async fn note_persist_failure(
     pending: &std::sync::atomic::AtomicU64,
     last: &std::sync::Mutex<std::time::Instant>,
 ) {
+    if let Some(batch) = take_failure_batch(pending, last) {
+        let _ = metrics
+            .record_counter(
+                cog_core::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL,
+                batch as f64,
+                std::collections::HashMap::new(),
+            )
+            .await;
+    }
+}
+
+/// 失败计数加一；到了落账间隔就把攒下的条数交出去，否则交回 `None`。
+///
+/// 同步完成、不起任务：调用点在发布路径上，而这里绝大多数时候只是加一个原子数。
+/// 只有真的到点时才由调用方起一个任务去写库——每次失败一个任务正是这条通路在
+/// 2026-11-04 把池压死的形状。
+fn take_failure_batch(
+    pending: &std::sync::atomic::AtomicU64,
+    last: &std::sync::Mutex<std::time::Instant>,
+) -> Option<u64> {
     use std::sync::atomic::Ordering;
 
     pending.fetch_add(1, Ordering::Relaxed);
-    {
-        // 这段不 await：std 的锁跨 await 会同时挡住 tokio 的任务迁移和下一个失败。
-        let mut last = match last.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if last.elapsed() < std::time::Duration::from_secs(FAILURE_FLUSH_SECS) {
-            return;
-        }
-        *last = std::time::Instant::now();
+    let mut last = match last.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if last.elapsed() < std::time::Duration::from_secs(FAILURE_FLUSH_SECS) {
+        return None;
     }
+    *last = std::time::Instant::now();
     let batch = pending.swap(0, Ordering::Relaxed);
     if batch == 0 {
-        return;
+        None
+    } else {
+        Some(batch)
     }
-    let _ = metrics
-        .record_counter(
-            cog_core::metric_names::OBSERVABILITY_EVENT_PERSIST_FAILED_TOTAL,
-            batch as f64,
-            std::collections::HashMap::new(),
-        )
-        .await;
 }
 
 // ─── Event meta extraction ───
