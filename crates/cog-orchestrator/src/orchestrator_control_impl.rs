@@ -8,6 +8,7 @@ use tracing::{info, warn};
 /// 这条扫描挂在回注这一轮上，一轮的时间要留给越界本身：一次退役几千条会把
 /// 这一轮压成一条批量更新，而它们已经在队列里排了很久，晚几分钟没有代价。
 /// 剩下的下一轮接着退——判据是行上的那个键，不是轮次，重跑是幂等的。
+// cap: bound — 一轮的时间要留给越界本身；剩下的每十分钟退一批，几小时清完
 const STALE_REPLANS_PER_PASS: usize = 300;
 
 /// High-level orchestrator control that composes a [`cog_core::DagExecutor`]
