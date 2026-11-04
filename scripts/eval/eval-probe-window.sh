@@ -63,7 +63,7 @@ last_code=
 while [ "$(date +%s)" -lt "$UNTIL" ]; do
   # 锚在「bash 后面直接跟这个脚本」：排队中的提交把路径写在参数里，裸的路径子串
   # 会把它误读成「循环在跑」。
-  if pgrep -f '^bash [^ ]*host/eval-registered-rerun\.sh' >/dev/null 2>&1; then
+  if pgrep -f '^bash ([^ ]*/)?scripts/eval/eval-registered-rerun[.]sh( |$)' >/dev/null 2>&1; then
     log "probe: a loop is running; standing down"
     exit 0
   fi

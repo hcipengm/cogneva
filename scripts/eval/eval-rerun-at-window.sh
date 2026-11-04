@@ -17,8 +17,11 @@ now=$(date +%s)
 if [ "$at" -gt "$now" ]; then sleep $(( at - now )); fi
 # 匹配要锚在「bash 后面直接跟这个脚本」上：排队中的提交把路径写在参数里，
 # 一条裸的 `pgrep -f '...eval-registered-rerun.sh'` 会把它当成循环在跑（2026-10-19 实测：
-# 探针刚起来就误报「a loop is running」并退出）。
-if pgrep -f '^bash [^ ]*host/eval-registered-rerun\.sh' >/dev/null 2>&1; then
+# 探针刚起来就误报「a loop is running」并退出）。路径段指的是**循环脚本所在的那一段**：
+# 它随目录搬过一次，写死旧目录时这条判断静默变成「永远没有循环在跑」，于是窗口到了会起
+# 第二条与第一条抢同一份 checkpoint。`eval-loop-standdown.test.sh` 拿这里实际会出现的
+# 命令行校这条模式，三处写法不一致或跟不上搬家都当场红。
+if pgrep -f '^bash ([^ ]*/)?scripts/eval/eval-registered-rerun[.]sh( |$)' >/dev/null 2>&1; then
   printf '%s the window arrived and a loop is already running; leaving it alone\n' \
     "$(date -u +%FT%TZ)" >> "${LOG:-$HOME/eval-runs/.runner/rerun.log}"
   exit 0
