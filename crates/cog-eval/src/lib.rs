@@ -219,8 +219,8 @@ mod feedback_feed_a_reading_the_artifact_the_pipeline_already_paid_for {
         case_id: &str,
         passed: bool,
         duration_ms: u64,
-        token_usage: u64,
-        cost: f64,
+        token_usage: Option<u64>,
+        cost: Option<f64>,
         error: Option<&str>,
     ) -> EvalResult {
         EvalResult {
@@ -247,9 +247,16 @@ mod feedback_feed_a_reading_the_artifact_the_pipeline_already_paid_for {
     /// than to a coincidence of equal values.
     fn fixture_artifacts() -> Vec<EvalResult> {
         vec![
-            paid_artifact("case-a", true, 120, 800, 0.0025, None),
-            paid_artifact("case-b", true, 340, 1500, 0.0040, None),
-            paid_artifact("case-c", false, 900, 2600, 0.0110, Some("assertion failed")),
+            paid_artifact("case-a", true, 120, Some(800), Some(0.0025), None),
+            paid_artifact("case-b", true, 340, Some(1500), Some(0.0040), None),
+            paid_artifact(
+                "case-c",
+                false,
+                900,
+                Some(2600),
+                Some(0.0110),
+                Some("assertion failed"),
+            ),
         ]
     }
 
@@ -269,11 +276,11 @@ mod feedback_feed_a_reading_the_artifact_the_pipeline_already_paid_for {
         assert_eq!(report.pass_rate, passed as f64 / total as f64);
         assert_eq!(
             report.total_cost,
-            artifacts.iter().map(|r| r.cost).sum::<f64>()
+            Some(artifacts.iter().filter_map(|r| r.cost).sum::<f64>())
         );
         assert_eq!(
             report.avg_token_usage,
-            artifacts.iter().map(|r| r.token_usage).sum::<u64>() as f64 / total as f64
+            Some(artifacts.iter().filter_map(|r| r.token_usage).sum::<u64>() as f64 / total as f64)
         );
         assert_eq!(
             report.avg_duration_ms,
@@ -339,19 +346,19 @@ mod feedback_feed_a_reading_the_artifact_the_pipeline_already_paid_for {
         let report = EvalReport::from_results("priced", &artifacts);
 
         // What the upstream step paid, read back from the artifacts it produced.
-        let upstream_paid: f64 = artifacts.iter().map(|r| r.cost).sum();
-        assert_eq!(report.total_cost, upstream_paid);
+        let upstream_paid: f64 = artifacts.iter().filter_map(|r| r.cost).sum();
+        assert_eq!(report.total_cost, Some(upstream_paid));
 
         // The rejected reading pays each case's price again to re-derive what the
         // artifact already carries: its bill is the upstream bill exactly.
-        let redundant_reading_paid: f64 = artifacts.iter().map(|r| r.cost).sum();
+        let redundant_reading_paid: f64 = artifacts.iter().filter_map(|r| r.cost).sum();
         assert_eq!(redundant_reading_paid, upstream_paid);
 
         // One answer paid for twice: the extra half is neither more nor less than
         // the money the upstream step already spent.
         let total_paid = upstream_paid + redundant_reading_paid;
         assert_eq!(total_paid, 2.0 * upstream_paid);
-        assert_eq!(total_paid - upstream_paid, report.total_cost);
+        assert_eq!(total_paid - upstream_paid, report.total_cost.unwrap());
     }
 }
 

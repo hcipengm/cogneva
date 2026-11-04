@@ -49,11 +49,11 @@ pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f
         EvalMetric::CompressionRatio { threshold } => {
             // 系统级指标，但基于 output 大小 vs token_usage 做近似
             let v = trace_value(result, &["compression_ratio"]).unwrap_or_else(|| {
-                if result.token_usage > 0 {
-                    (result.agent_output.to_string().len() as f64).max(1.0)
-                        / result.token_usage as f64
-                } else {
-                    0.2
+                match result.token_usage {
+                    Some(t) if t > 0 => {
+                        (result.agent_output.to_string().len() as f64).max(1.0) / t as f64
+                    }
+                    _ => 0.2,
                 }
             });
             (v, v <= *threshold)
@@ -175,8 +175,8 @@ mod tests {
             metrics: vec![],
             agent_output: serde_json::Value::Null,
             duration_ms,
-            token_usage: 50,
-            cost: 0.001,
+            token_usage: Some(50),
+            cost: Some(0.001),
             error: None,
             steps,
             trace_json,

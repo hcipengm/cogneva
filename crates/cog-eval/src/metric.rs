@@ -32,8 +32,28 @@ pub struct EvalResult {
     pub metrics: Vec<MetricValue>,
     pub agent_output: serde_json::Value,
     pub duration_ms: u64,
-    pub token_usage: u64,
-    pub cost: f64,
+    /// Tokens the run spent, as the upstream reported them -- `None` when no
+    /// usage frame ever arrived.
+    ///
+    /// `Option` rather than a number because the two things this field could
+    /// hold are not the same reading: a run that spent nothing and a run whose
+    /// spend nobody measured both used to land here as `0`, and every cost
+    /// metric downstream then judged the second one as if it had been free.
+    /// The runtime this harness drives ([`cog_core::AgentRuntime::run`]) hands
+    /// back an opaque value with no usage frame in it, so for that runtime the
+    /// honest answer is `None` -- and a case that declares a cost metric gets
+    /// no cost reading rather than a made-up one.
+    ///
+    /// `serde(default)` so an artifact written before this field could be
+    /// empty still loads: a payload with no count becomes "not measured"
+    /// rather than failing to deserialize.
+    #[serde(default)]
+    pub token_usage: Option<u64>,
+    /// Money the run spent, in USD -- `None` for the same reason, and only ever
+    /// filled from a metered usage frame plus a real price, never estimated
+    /// from the length of an answer.
+    #[serde(default)]
+    pub cost: Option<f64>,
     pub error: Option<String>,
     pub steps: Vec<StepRecord>,
     pub trace_json: Option<serde_json::Value>,

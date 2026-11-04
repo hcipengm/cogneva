@@ -107,27 +107,26 @@ impl Default for ModelRegistry {
 }
 
 impl ModelRegistry {
+    /// An empty registry: this deployment's price list is the operator's to
+    /// declare, not a library's to guess.
+    ///
+    /// It used to be seeded with four vendor models and their list prices. Two
+    /// things were wrong with that. The numbers were never this deployment's
+    /// contract -- a price read off a vendor's page is a guess about a bill that
+    /// arrives in a different currency, with different cache rates and different
+    /// negotiated terms -- and the names were vendor names, which the platform
+    /// keeps out of everything except the gateway's own upstream list. Nothing
+    /// in production ever called it, so the table only ever answered a question
+    /// nobody asked, with numbers nobody checked.
     pub fn new() -> Self {
-        let mut models = HashMap::new();
+        Self {
+            models: HashMap::new(),
+        }
+    }
 
-        models.insert(
-            "kimi-k1.5".to_string(),
-            ModelConfig::new("kimi-k1.5", 0.012, 0.048, 128_000, "USD"),
-        );
-        models.insert(
-            "deepseek-v3".to_string(),
-            ModelConfig::new("deepseek-v3", 0.002, 0.008, 64_000, "USD"),
-        );
-        models.insert(
-            "qwen-2.5-72b".to_string(),
-            ModelConfig::new("qwen-2.5-72b", 0.004, 0.012, 128_000, "USD"),
-        );
-        models.insert(
-            "gpt-4o".to_string(),
-            ModelConfig::new("gpt-4o", 0.036, 0.108, 128_000, "USD"),
-        );
-
-        Self { models }
+    /// Add or replace the price entry for one model.
+    pub fn register(&mut self, model: ModelConfig) {
+        self.models.insert(model.name.clone(), model);
     }
 
     /// Look up a model by name.
@@ -138,18 +137,5 @@ impl ModelRegistry {
     /// List all registered models.
     pub fn list(&self) -> Vec<&ModelConfig> {
         self.models.values().collect()
-    }
-
-    /// Return the default model for a given task type.
-    /// Chooses based on task characteristics.
-    pub fn get_default_for_task(&self, task_type: TaskType) -> Option<&ModelConfig> {
-        match task_type {
-            TaskType::CodeGeneration => self.get("deepseek-v3"),
-            TaskType::CodeReview => self.get("qwen-2.5-72b"),
-            TaskType::TextSummary => self.get("kimi-k1.5"),
-            TaskType::DataAnalysis => self.get("gpt-4o"),
-            TaskType::SimpleQA => self.get("deepseek-v3"),
-            TaskType::Translation => self.get("qwen-2.5-72b"),
-        }
     }
 }

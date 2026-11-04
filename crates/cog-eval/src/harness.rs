@@ -214,8 +214,8 @@ mod tests {
             }],
             agent_output: serde_json::Value::Null,
             duration_ms,
-            token_usage: 50,
-            cost: 0.001,
+            token_usage: Some(50),
+            cost: Some(0.001),
             error: None,
             steps: vec![StepRecord {
                 step_index: 0,

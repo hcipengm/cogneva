@@ -6,16 +6,25 @@ use crate::metric::{EvalMetric, EvalResult};
 /// 计算 D9 指标。
 pub fn compute(metric: &EvalMetric, _case: &EvalCase, result: &EvalResult) -> (f64, bool) {
     match metric {
-        EvalMetric::CostPerStep { threshold } => {
-            let steps = result.steps.len().max(1) as f64;
-            let cost_per_step = result.cost / steps;
-            (cost_per_step, cost_per_step <= *threshold)
-        }
-        EvalMetric::TokenPerStep { threshold } => {
-            let steps = result.steps.len().max(1) as f64;
-            let token_per_step = result.token_usage as f64 / steps;
-            (token_per_step, token_per_step <= *threshold)
-        }
+        // 这两条只在花销/用量真的量到时才有意义。调用方（runner）在读数缺失时
+        // 已经跳过整条指标；这里再挡一次，是因为 `dimensions::compute` 还能从
+        // 别处被直接调用，而 `Some` 之外的分支在这里等于「没量到」。
+        EvalMetric::CostPerStep { threshold } => match result.cost {
+            Some(cost) => {
+                let steps = result.steps.len().max(1) as f64;
+                let cost_per_step = cost / steps;
+                (cost_per_step, cost_per_step <= *threshold)
+            }
+            None => (0.0, true),
+        },
+        EvalMetric::TokenPerStep { threshold } => match result.token_usage {
+            Some(tokens) => {
+                let steps = result.steps.len().max(1) as f64;
+                let token_per_step = tokens as f64 / steps;
+                (token_per_step, token_per_step <= *threshold)
+            }
+            None => (0.0, true),
+        },
         EvalMetric::InferenceLatency { threshold_ms } => {
             let latency = result.duration_ms as f64;
             (latency, latency <= *threshold_ms as f64)
@@ -42,8 +51,8 @@ mod tests {
     fn mk_result(
         steps: Vec<StepRecord>,
         duration_ms: u64,
-        token_usage: u64,
-        cost: f64,
+        token_usage: Option<u64>,
+        cost: Option<f64>,
     ) -> EvalResult {
         EvalResult {
             case_id: "t1".into(),
@@ -75,8 +84,8 @@ mod tests {
                 4
             ],
             100,
-            50,
-            0.004,
+            Some(50),
+            Some(0.004),
         );
         let metric = EvalMetric::CostPerStep { threshold: 0.002 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
@@ -100,8 +109,8 @@ mod tests {
                 5
             ],
             100,
-            100,
-            0.001,
+            Some(100),
+            Some(0.001),
         );
         let metric = EvalMetric::TokenPerStep { threshold: 25.0 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
@@ -111,7 +120,7 @@ mod tests {
 
     #[test]
     fn inference_latency_within_threshold() {
-        let result = mk_result(vec![], 150, 50, 0.001);
+        let result = mk_result(vec![], 150, Some(50), Some(0.001));
         let metric = EvalMetric::InferenceLatency { threshold_ms: 200 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 150.0);
@@ -120,7 +129,7 @@ mod tests {
 
     #[test]
     fn inference_latency_exceeds_threshold() {
-        let result = mk_result(vec![], 300, 50, 0.001);
+        let result = mk_result(vec![], 300, Some(50), Some(0.001));
         let metric = EvalMetric::InferenceLatency { threshold_ms: 200 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 300.0);
@@ -151,8 +160,8 @@ mod tests {
                 },
             ],
             100,
-            50,
-            0.001,
+            Some(50),
+            Some(0.001),
         );
         let metric = EvalMetric::TimeToFirstToken { threshold_ms: 100 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
@@ -162,7 +171,7 @@ mod tests {
 
     #[test]
     fn time_to_first_token_fallback() {
-        let result = mk_result(vec![], 120, 50, 0.001);
+        let result = mk_result(vec![], 120, Some(50), Some(0.001));
         let metric = EvalMetric::TimeToFirstToken { threshold_ms: 100 };
         let (value, passed) = compute(&metric, &mk_case(), &result);
         assert_eq!(value, 120.0); // fallback to duration_ms when no steps

@@ -136,8 +136,6 @@ async fn run_single_case(
     }
 
     let duration_ms = start.elapsed().as_millis() as u64;
-    let output_str = output.to_string();
-    let token_estimate = (output_str.len() / 4) as u64; // Rough estimate: 4 chars per token
 
     // 构建 StepRecord 列表（当前 agent.run 不返回 steps，使用占位）
     let steps = vec![StepRecord {
@@ -156,8 +154,14 @@ async fn run_single_case(
         metrics: vec![],
         agent_output: output,
         duration_ms,
-        token_usage: token_estimate,
-        cost: estimate_cost(token_estimate),
+        // `AgentRuntime::run` hands back the agent's own value, not the turns'
+        // usage frames, so no reading of what this run spent reaches the
+        // harness. Leaving these empty is the whole point: an answer's length
+        // is not a token count, and a cost derived from it would pass a
+        // cost-per-task gate by construction while telling nobody what was
+        // actually paid.
+        token_usage: None,
+        cost: None,
         error: last_error,
         steps,
         trace_json: None,
@@ -169,7 +173,7 @@ async fn run_single_case(
 
     for metric in &case.metrics {
         let metric_name = metric.name();
-        let (value, metric_passed) = compute_metric_value(
+        let Some((value, metric_passed)) = compute_metric_value(
             metric,
             &case,
             &result,
@@ -177,7 +181,12 @@ async fn run_single_case(
             llm.clone(),
             config.judge_enabled,
         )
-        .await;
+        .await
+        else {
+            // 量不出来的指标不出行。写成 0 会被下游读成「花得很少、通过」，
+            // 而它真正的意思是「这一轮没人量」。两者在表上必须长得不一样。
+            continue;
+        };
 
         if !metric_passed {
             passed = false;
@@ -335,12 +344,6 @@ fn tool_call_accuracy(expected: &[String], actual: &[String]) -> f64 {
     }
 }
 
-/// 估算成本（USD/1K tokens，默认 $0.002）。
-fn estimate_cost(token_count: u64) -> f64 {
-    let per_1k = 0.002;
-    (token_count as f64 / 1000.0) * per_1k
-}
-
 /// 计算单个指标的值与通过状态。
 /// 对于客观指标（ExactMatch、SemanticSimilarity 等）使用确定性算法；
 /// 对于主观指标（GoalFulfillment、PlanQuality 等）在 `judge_enabled` 时调用 LLM-as-a-Judge，
@@ -352,8 +355,17 @@ async fn compute_metric_value(
     embedder: &Option<Arc<dyn EmbeddingProvider>>,
     llm: Arc<dyn cog_core::LlmClient>,
     judge_enabled: bool,
-) -> (f64, bool) {
-    match metric {
+) -> Option<(f64, bool)> {
+    // 先问「这一指标要的量，这一轮到底量到了没有」。花销与用量都只有上游的
+    // usage 帧能给，给不出时 `cost` / `token_usage` 是 `None`；再往下算就会把
+    // 「没量到」折成 0 并判通过——那不是通过，那是没测。
+    if measures_cost(metric) && result.cost.is_none() {
+        return None;
+    }
+    if measures_tokens(metric) && result.token_usage.is_none() {
+        return None;
+    }
+    Some(match metric {
         EvalMetric::ExactMatch => {
             let expected = case
                 .expected_output
@@ -389,12 +401,17 @@ async fn compute_metric_value(
         EvalMetric::LatencyP50 => (result.duration_ms as f64, result.duration_ms <= 5000),
         EvalMetric::LatencyP99 => (result.duration_ms as f64, result.duration_ms <= 30000),
         EvalMetric::TokenEfficiency => {
-            let output_str = result.agent_output.to_string();
-            let output_len = output_str.len().max(1) as f64;
-            let efficiency = result.token_usage as f64 / output_len;
+            // 前面已经按 `measures_tokens` 挡掉了 `None`。
+            let tokens = result.token_usage.unwrap_or(0) as f64;
+            let output_len = result.agent_output.to_string().len().max(1) as f64;
+            let efficiency = tokens / output_len;
             (efficiency, efficiency <= 0.5)
         }
-        EvalMetric::CostPerTask => (result.cost, result.cost <= 0.01),
+        EvalMetric::CostPerTask => {
+            // 同上：没有真实花销读数时这一行根本不出。
+            let spent = result.cost.unwrap_or(0.0);
+            (spent, spent <= 0.01)
+        }
         EvalMetric::Custom { .. } => (0.0, true),
         // 主观指标：优先使用 LLM-as-a-Judge
         _ if judge_enabled => match judge_subjective(metric, case, result, llm).await {
@@ -406,7 +423,26 @@ async fn compute_metric_value(
         },
         // D1-D9 扩展指标统一路由到 dimensions 模块
         other => crate::dimensions::compute(other, case, result),
-    }
+    })
+}
+
+/// 这一指标要不要钱的读数？
+///
+/// 与 [`measures_tokens`] 分开列，因为两者可能一个有一个没有：上游报了
+/// usage 帧就可以有 token 数，而金额还要另有一份真实价目。
+fn measures_cost(metric: &EvalMetric) -> bool {
+    matches!(
+        metric,
+        EvalMetric::CostPerTask | EvalMetric::CostPerStep { .. }
+    )
+}
+
+/// 这一指标要不要本轮用量的读数？
+fn measures_tokens(metric: &EvalMetric) -> bool {
+    matches!(
+        metric,
+        EvalMetric::TokenEfficiency | EvalMetric::TokenPerStep { .. }
+    )
 }
 
 /// 对主观指标调用 LLM-as-a-Judge。
@@ -487,5 +523,153 @@ mod tests {
             std::time::Duration::ZERO,
             "an unstated wait must not be a zero-length one"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 花销读数缺失时不许出分
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod spend_readings_are_readings_tests {
+    use super::*;
+    use crate::dataset::EvalCase;
+    use crate::metric::EvalMetric;
+    use async_trait::async_trait;
+    use cog_core::{ChatOptions, ChatResponse, Message, SFResult};
+
+    /// 这几条路径都不该碰上游：判的是「读数缺了怎么处理」，不是模型答得如何。
+    struct NeverCalled;
+
+    #[async_trait]
+    impl cog_core::LlmClient for NeverCalled {
+        async fn chat_stream(
+            &self,
+            _m: &[Message],
+            _o: &ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unreachable!()
+        }
+        async fn complete_stream(
+            &self,
+            _p: &str,
+            _o: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unreachable!()
+        }
+        async fn chat(&self, _m: &[Message], _o: &ChatOptions) -> SFResult<ChatResponse> {
+            unreachable!()
+        }
+        async fn health_check(&self) -> bool {
+            false
+        }
+    }
+
+    /// 交得出一份答案，但**不交用量**——真实运行时就是这个形状：
+    /// `AgentRuntime::run` 的返回值里没有 usage 帧。
+    struct AnswerOnly;
+
+    #[async_trait]
+    impl AgentRuntime for AnswerOnly {
+        async fn run(
+            &mut self,
+            _input: serde_json::Value,
+            _llm: &dyn cog_core::LlmClient,
+        ) -> SFResult<serde_json::Value> {
+            Ok(serde_json::json!({ "answer": "ok" }))
+        }
+        fn agent_id(&self) -> &str {
+            "a"
+        }
+        fn role(&self) -> &str {
+            "r"
+        }
+    }
+
+    fn cost_case() -> EvalCase {
+        EvalCase {
+            id: "c1".into(),
+            name: "c1".into(),
+            input: serde_json::json!("q"),
+            expected_output: None,
+            expected_tools: None,
+            tags: vec![],
+            metrics: vec![
+                EvalMetric::CostPerTask,
+                EvalMetric::TokenEfficiency,
+                EvalMetric::CostPerStep { threshold: 0.002 },
+                EvalMetric::TokenPerStep { threshold: 25.0 },
+            ],
+            metadata: Default::default(),
+        }
+    }
+
+    /// 没有 usage 帧时，花销与用量是 `None`，不是 0；四条依赖它们的指标一条都不出。
+    ///
+    /// 这条测试盯的是原先那种形状：`(answer.len() / 4)` 当 token 数、再乘一个
+    /// 写死的 $0.002/1K 当钱——于是 `CostPerTask` 的 `cost <= 0.01` 由算式本身
+    /// 保证通过，谁也没真的量过。把估算删掉之后，这里读到的是「没量到」。
+    #[tokio::test]
+    async fn a_run_that_reported_no_usage_produces_no_spend_metric() {
+        let case = cost_case();
+        let result = run_single_case(
+            Arc::new(Mutex::new(AnswerOnly)),
+            Arc::new(NeverCalled),
+            None,
+            case,
+            RunnerConfig::default(),
+        )
+        .await;
+
+        assert_eq!(result.cost, None, "没量到钱就不能写一个数进去");
+        assert_eq!(result.token_usage, None, "没量到用量就不能写一个数进去");
+
+        let names: Vec<&str> = result.metrics.iter().map(|m| m.metric.as_str()).collect();
+        for absent in [
+            "cost_usd",
+            "token_efficiency",
+            "cost_per_step",
+            "token_per_step",
+        ] {
+            assert!(
+                !names.contains(&absent),
+                "{absent} 没有读数却出现在结果里：{names:?}"
+            );
+        }
+        assert!(result.passed, "指标缺席不等于这条 case 判红：它只是没被测");
+    }
+
+    /// 反过来：真拿到读数时这四条指标照样出，证明上面那条不是「一律跳过」。
+    #[tokio::test]
+    async fn a_measured_reading_still_produces_its_metric() {
+        let case = cost_case();
+        let result = EvalResult {
+            case_id: "c1".into(),
+            passed: true,
+            metrics: vec![],
+            agent_output: serde_json::json!("ok"),
+            duration_ms: 10,
+            token_usage: Some(40),
+            cost: Some(0.004),
+            error: None,
+            steps: vec![],
+            trace_json: None,
+        };
+
+        let mut metrics = vec![];
+        for metric in &case.metrics {
+            let Some((value, passed)) =
+                compute_metric_value(metric, &case, &result, &None, Arc::new(NeverCalled), false)
+                    .await
+            else {
+                continue;
+            };
+            metrics.push((metric.name(), value, passed));
+        }
+        let names: Vec<&str> = metrics.iter().map(|(n, _, _)| n.as_str()).collect();
+        assert!(names.contains(&"cost_usd"), "{names:?}");
+        assert!(names.contains(&"token_efficiency"), "{names:?}");
+        assert!(names.contains(&"cost_per_step"), "{names:?}");
+        assert!(names.contains(&"token_per_step"), "{names:?}");
     }
 }

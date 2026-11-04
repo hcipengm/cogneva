@@ -1,57 +1,35 @@
 use cog_quota::{BillingRecord, ModelConfig, ModelRegistry, QuotaMetrics, TaskType};
 
+/// 新建的价目表是空的：价目由本部署的运维声明，不由库猜。
+///
+/// 这条替代的是原先那张写死四个厂商型号与标价的表。它没有任何生产消费者，
+/// 却在那里回答「这个型号多少钱」——读的人没法知道那是一次真实报价还是一次
+/// 抄来的数字。空表至少诚实地说明「还没人声明」。
 #[test]
-fn test_model_registry_lookup() {
+fn a_fresh_registry_declares_no_price() {
     let registry = ModelRegistry::new();
-
-    let kimi = registry.get("kimi-k1.5").expect("kimi-k1.5 should exist");
-    assert_eq!(kimi.input_price, 0.012);
-    assert_eq!(kimi.output_price, 0.048);
-    assert_eq!(kimi.context_window, 128_000);
-
-    let deepseek = registry
-        .get("deepseek-v3")
-        .expect("deepseek-v3 should exist");
-    assert_eq!(deepseek.input_price, 0.002);
-    assert_eq!(deepseek.context_window, 64_000);
-
-    let qwen = registry
-        .get("qwen-2.5-72b")
-        .expect("qwen-2.5-72b should exist");
-    assert_eq!(qwen.input_price, 0.004);
-
-    let gpt4o = registry.get("gpt-4o").expect("gpt-4o should exist");
-    assert_eq!(gpt4o.input_price, 0.036);
-    assert_eq!(gpt4o.output_price, 0.108);
-
-    // List should return all 4 models
-    let list = registry.list();
-    assert_eq!(list.len(), 4);
-
-    // Unknown model
-    assert!(registry.get("unknown-model").is_none());
+    assert!(registry.list().is_empty(), "空表才是没声明过的形状");
+    assert!(registry.get("gpt-4o").is_none());
+    assert!(registry.get("deepseek-v3").is_none());
 }
 
 #[test]
-fn test_model_registry_default_for_task() {
-    let registry = ModelRegistry::new();
+fn a_registry_holds_what_the_operator_registers() {
+    let mut registry = ModelRegistry::new();
+    registry.register(ModelConfig::new(
+        "upstream-a/model-x",
+        0.01,
+        0.03,
+        100_000,
+        "USD",
+    ));
 
-    assert!(registry
-        .get_default_for_task(TaskType::CodeGeneration)
-        .is_some());
-    assert!(registry
-        .get_default_for_task(TaskType::CodeReview)
-        .is_some());
-    assert!(registry
-        .get_default_for_task(TaskType::TextSummary)
-        .is_some());
-    assert!(registry
-        .get_default_for_task(TaskType::DataAnalysis)
-        .is_some());
-    assert!(registry.get_default_for_task(TaskType::SimpleQA).is_some());
-    assert!(registry
-        .get_default_for_task(TaskType::Translation)
-        .is_some());
+    let model = registry
+        .get("upstream-a/model-x")
+        .expect("声明过的型号要读得回来");
+    assert_eq!(model.input_price, 0.01);
+    assert_eq!(model.context_window, 100_000);
+    assert_eq!(registry.list().len(), 1);
 }
 
 #[test]

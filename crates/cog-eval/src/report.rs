@@ -33,8 +33,11 @@ pub struct EvalReport {
     pub p50_duration_ms: f64,
     pub p95_duration_ms: f64,
     pub p99_duration_ms: f64,
-    pub avg_token_usage: f64,
-    pub total_cost: f64,
+    /// Mean tokens per case, over the cases that actually reported a usage
+    /// frame. `None` when no case did -- an average of nothing is not zero.
+    pub avg_token_usage: Option<f64>,
+    /// Summed money over the cases that reported one; `None` when none did.
+    pub total_cost: Option<f64>,
     pub metric_aggregates: HashMap<String, MetricAggregate>,
     pub dimension_summaries: HashMap<String, DimensionSummary>,
     pub failures: Vec<FailureDetail>,
@@ -74,8 +77,8 @@ pub struct PerCaseResult {
     pub case_name: String,
     pub passed: bool,
     pub duration_ms: u64,
-    pub token_usage: u64,
-    pub cost: f64,
+    pub token_usage: Option<u64>,
+    pub cost: Option<f64>,
     pub metric_values: Vec<MetricValue>,
     pub error: Option<String>,
 }
@@ -175,8 +178,18 @@ impl EvalReport {
         let p95_duration = percentile_u64(&durations, 0.95);
         let p99_duration = percentile_u64(&durations, 0.99);
 
-        let avg_tokens = results.iter().map(|r| r.token_usage).sum::<u64>() as f64 / denom;
-        let total_cost = results.iter().map(|r| r.cost).sum::<f64>();
+        let measured_tokens: Vec<u64> = results.iter().filter_map(|r| r.token_usage).collect();
+        let avg_tokens = if measured_tokens.is_empty() {
+            None
+        } else {
+            Some(measured_tokens.iter().sum::<u64>() as f64 / measured_tokens.len() as f64)
+        };
+        let measured_costs: Vec<f64> = results.iter().filter_map(|r| r.cost).collect();
+        let total_cost = if measured_costs.is_empty() {
+            None
+        } else {
+            Some(measured_costs.iter().sum::<f64>())
+        };
 
         // Per-metric aggregates.
         let metric_aggregates = build_metric_aggregates(results);
@@ -260,8 +273,14 @@ impl EvalReport {
             "- **Duration**: avg {:.0} ms, p50 {:.0} ms, p95 {:.0} ms, p99 {:.0} ms\n",
             self.avg_duration_ms, self.p50_duration_ms, self.p95_duration_ms, self.p99_duration_ms,
         ));
-        md.push_str(&format!("- **Tokens**: avg {:.0}\n", self.avg_token_usage));
-        md.push_str(&format!("- **Total Cost**: ${:.4}\n\n", self.total_cost));
+        match self.avg_token_usage {
+            Some(avg) => md.push_str(&format!("- **Tokens**: avg {avg:.0}\n")),
+            None => md.push_str("- **Tokens**: not measured in this run\n"),
+        }
+        match self.total_cost {
+            Some(cost) => md.push_str(&format!("- **Total Cost**: ${cost:.4}\n\n")),
+            None => md.push_str("- **Total Cost**: not measured in this run\n\n"),
+        }
 
         // Dimension summary table.
         if !self.dimension_summaries.is_empty() {
@@ -377,8 +396,14 @@ impl EvalReport {
             "<li>Duration: avg {:.0} ms, p50 {:.0} ms, p95 {:.0} ms, p99 {:.0} ms</li>",
             self.avg_duration_ms, self.p50_duration_ms, self.p95_duration_ms, self.p99_duration_ms,
         ));
-        html.push_str(&format!("<li>Tokens: avg {:.0}</li>", self.avg_token_usage));
-        html.push_str(&format!("<li>Total cost: ${:.4}</li>", self.total_cost));
+        match self.avg_token_usage {
+            Some(avg) => html.push_str(&format!("<li>Tokens: avg {avg:.0}</li>")),
+            None => html.push_str("<li>Tokens: not measured in this run</li>"),
+        }
+        match self.total_cost {
+            Some(cost) => html.push_str(&format!("<li>Total cost: ${cost:.4}</li>")),
+            None => html.push_str("<li>Total cost: not measured in this run</li>"),
+        }
         html.push_str("</ul>");
 
         if !self.dimension_summaries.is_empty() {
@@ -841,8 +866,8 @@ mod tests {
                 .collect(),
             agent_output: serde_json::Value::Null,
             duration_ms: duration,
-            token_usage: 100,
-            cost: 0.001,
+            token_usage: Some(100),
+            cost: Some(0.001),
             error: None,
             steps: vec![],
             trace_json: None,
