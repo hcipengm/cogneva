@@ -18,7 +18,7 @@
 
 mod common;
 
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 
 use cog_core::{PrincipleCheckKind, PrincipleLedgerStore, PrincipleReading};
 use cog_storage::PostgresPrincipleLedgerStore;
@@ -29,21 +29,56 @@ const PASS_BOUND: usize = 200;
 
 use cog_test_support::database_url;
 
-async fn store() -> (PostgresPrincipleLedgerStore, PgPool, String) {
+/// Hold the fold seat to one case at a time.
+///
+/// The marker each case owns scopes what a *cleanup* deletes. It does not scope
+/// what a *fold* takes: `fold_declarations` takes whatever is queued, another case's
+/// readings included, and the claim it makes on them (`FOR UPDATE SKIP LOCKED`)
+/// is visible to a second folder. So `file` -- declare, then fold until the
+/// queue reads empty -- can see `folded == 0` because a concurrent case has
+/// just claimed this case's reading, take that for an empty queue, stop, and
+/// read an account the other transaction has not committed yet. The row is in
+/// flight, and the assertion reports "no principle names this path" about it.
+///
+/// That is the failure this lock removes: the queue is one, so the cases that
+/// fold through it are one at a time. It is the same seat the change ledger's
+/// suite takes for its own queue, under a key of its own. Closing the
+/// connection releases it, including when a case panics. The empty-question
+/// case neither files nor folds, so it takes nothing.
+async fn fold_seat() -> sqlx::PgConnection {
+    let url = database_url();
+    let mut conn = sqlx::PgConnection::connect(&url)
+        .await
+        .expect("connect to take the fold seat");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(97_102_i64)
+        .execute(&mut conn)
+        .await
+        .expect("take the fold seat");
+    conn
+}
+
+/// The cases in this file run side by side against one database, so the marker
+/// each of them owns is scoped to the case as well as to the run: a cleanup
+/// that matched the whole probe prefix would delete the rows another case had
+/// just filed, and the assertion that follows would be about the wipe rather
+/// than about the read. The scope also keeps a crashed run's leftovers
+/// removable -- the per-run half is random, the per-case half is not.
+async fn store(scope: &str) -> (PostgresPrincipleLedgerStore, PgPool, String) {
     let url = database_url();
     common::migrate_once(&url, 97_101).await;
     let pool = PgPool::connect(&url)
         .await
         .expect("connect to the database");
     let store = PostgresPrincipleLedgerStore::new(pool.clone());
-    let marker = format!("probe-gating-paths:{}", uuid::Uuid::new_v4());
+    let prefix = format!("probe-gating-paths:{scope}:");
+    let marker = format!("{prefix}{}", uuid::Uuid::new_v4());
     for table in ["principle_ledger", "principle_ledger_declared"] {
-        sqlx::query(&format!(
-            "DELETE FROM {table} WHERE slug LIKE 'probe-gating-paths:%'"
-        ))
-        .execute(&pool)
-        .await
-        .unwrap_or_else(|e| panic!("clear leftover rows in {table}: {e}"));
+        sqlx::query(&format!("DELETE FROM {table} WHERE slug LIKE $1"))
+            .bind(format!("{prefix}%"))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("clear leftover rows in {table}: {e}"));
     }
     (store, pool, marker)
 }
@@ -76,7 +111,8 @@ async fn file(store: &PostgresPrincipleLedgerStore, slug: &str, where_red: Optio
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn a_principle_whose_gate_names_the_path_is_the_answer() {
-    let (store, pool, marker) = store().await;
+    let _seat = fold_seat().await;
+    let (store, pool, marker) = store("gate-on-the-path").await;
 
     // 一条原则记下的门几乎总是 `crates/X/tests/` 里那个契约测试，而任务点名的是
     // `crates/X/src/` 里要改的文件。两级路径逐字不同，唯一的公共前缀是 crate 根，
@@ -136,7 +172,8 @@ async fn a_principle_whose_gate_names_the_path_is_the_answer() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn the_answer_is_ordered_and_bounded() {
-    let (store, pool, marker) = store().await;
+    let _seat = fold_seat().await;
+    let (store, pool, marker) = store("answer-ordered-and-bounded").await;
 
     // 三条都站在同一个文件上，写进来的顺序与 slug 的顺序相反：取出来若是写入
     // 顺序，两轮同一件任务就会把同一批原则排成两个顺序，缓存前缀每一轮作废。
@@ -179,7 +216,8 @@ async fn the_answer_is_ordered_and_bounded() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn the_gate_on_the_file_outranks_the_gate_on_its_crate() {
-    let (store, pool, marker) = store().await;
+    let _seat = fold_seat().await;
+    let (store, pool, marker) = store("file-outranks-crate").await;
 
     // 两条只记在 crate 的契约测试上（crate 根命中一层），一条记在这次真要改的
     // 文件上（文件与 crate 根各命中一层）。上限只留一条时，留下的必须是后者：
@@ -240,7 +278,7 @@ async fn the_gate_on_the_file_outranks_the_gate_on_its_crate() {
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
 async fn nothing_to_ask_about_is_not_a_reason_to_scan() {
-    let (store, _pool, _marker) = store().await;
+    let (store, _pool, _marker) = store("empty-question").await;
     let rows = store
         .gating_paths(&[], 10)
         .await
