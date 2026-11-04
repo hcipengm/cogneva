@@ -1,6 +1,14 @@
 use async_trait::async_trait;
 use cog_core::{OrchestratorControl, SFError, SFResult, Task, UpstreamFailure};
 use std::sync::Arc;
+use tracing::{info, warn};
+
+/// 一轮里最多退役多少条旧键的重规划。
+///
+/// 这条扫描挂在回注这一轮上，一轮的时间要留给越界本身：一次退役几千条会把
+/// 这一轮压成一条批量更新，而它们已经在队列里排了很久，晚几分钟没有代价。
+/// 剩下的下一轮接着退——判据是行上的那个键，不是轮次，重跑是幂等的。
+const STALE_REPLANS_PER_PASS: usize = 300;
 
 /// High-level orchestrator control that composes a [`cog_core::DagExecutor`]
 /// and an [`cog_core::ActionPlanner`] to provide the unified
@@ -53,6 +61,58 @@ impl OrchestratorControlImpl {
     ) -> Self {
         self.skill_registry = registry;
         self
+    }
+
+    /// 退役那些把「另一条重规划自己的估算」当成项目基线的重规划行。
+    ///
+    /// 这些行是旧基线算法的产物：排期给每条新活写一行带当下时刻的估算，而旧
+    /// 算法把项目的最新计划行当成当前基线，于是重规划单一造出来就换了键。现在
+    /// 基线跳过重规划的计划行（见 [`current_revisions`]），那个键再也算不出来，
+    /// 这些行既不会被去重认成「已经造过」，也不会随交付前进，只剩一遍遍排队。
+    ///
+    /// 退役而不是删：行是判据的来源，理由写在行上，读它的人能看到这件事为什么
+    /// 结束。只碰还没走完的行——已经有终态的，它自己的终态比这里更早、也更准确。
+    async fn retire_stale_replans(&self, tasks: &[Task]) {
+        let stale: Vec<&Task> = tasks
+            .iter()
+            .filter(|task| !task.status.is_terminal())
+            .filter(|task| crate::replan::keyed_on_a_replans_own_estimate(task))
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        let batch = stale.len().min(STALE_REPLANS_PER_PASS);
+        for task in &stale[..batch] {
+            let reason = format!(
+                "this replan was keyed on another replan's own estimate ({}), a baseline this \
+                 project control no longer reads: it can never be matched as an attempt already \
+                 made and never advances with a delivery, so it is retired instead of run",
+                task.input
+                    .get(crate::replan::REPLAN_INPUT_KEY)
+                    .and_then(|facts| facts.get("baseline_rev"))
+                    .and_then(|rev| rev.as_str())
+                    .unwrap_or("")
+            );
+            match self.cancel_task_with_reason(&task.id, reason).await {
+                Ok(cascaded) => info!(
+                    task_id = %task.id,
+                    cascaded = cascaded.len(),
+                    "retired a replan whose key was another replan's own estimate"
+                ),
+                Err(e) => warn!(
+                    task_id = %task.id,
+                    error = %e,
+                    "a stale replan could not be retired; it keeps its place in the queue"
+                ),
+            }
+        }
+        if stale.len() > batch {
+            info!(
+                retired = batch,
+                left = stale.len() - batch,
+                "more replans are keyed on another replan's own estimate; the rest go next round"
+            );
+        }
     }
 }
 
@@ -250,6 +310,11 @@ impl cog_core::ReplanMinter for OrchestratorControlImpl {
         }
         // 一轮只扫一遍图：判定侧报上来的是一批越界，不是一条。
         let tasks = self.get_all_tasks().await;
+        // 顺手退役旧基线算法留下的重规划行：它们的键再也不会被算出来，留着
+        // 只会一遍遍排队、每轮占掉一个时段（判据与理由见
+        // `replan::keyed_on_a_replans_own_estimate`）。用的是这一轮已经读过的
+        // 那份图，不另读一遍。
+        self.retire_stale_replans(&tasks).await;
         // 基线读不到时一条也不造：没有版本就没有去重键，硬造会让每一轮都多一条
         // 一模一样的活。这个错误往上抛，判成「这一轮判不了」，而不是「没有越界」。
         let plans = self.task_plans().await.map_err(|e| {
@@ -495,6 +560,69 @@ mod tests {
                 .map(String::as_str),
             Some("rev-new"),
             "真交付留下的新计划仍然是这个项目当前的那一版"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stale_replan_tests {
+    use super::*;
+    use cog_core::{TaskStatus, TaskType};
+
+    /// 一条重规划行，记着它是按哪一版基线造的。
+    fn replan_row(id: &str, revision: &str) -> Task {
+        Task::new(
+            id,
+            TaskType::Custom(crate::replan::REPLAN_TASK_KIND.into()),
+            serde_json::json!({
+                "goal": "重规划这个项目",
+                crate::replan::REPLAN_INPUT_KEY: {
+                    "project": "change-ledger:crates",
+                    "index": "schedule",
+                    "baseline_rev": revision,
+                    "attempt": 1,
+                },
+            }),
+        )
+    }
+
+    /// 旧键的重规划行退役，理由写在行上；按真基线记的那条不动。
+    ///
+    /// 判据只认一种键：基线版本本身是**另一条重规划的估算**。那种键现在的基线
+    /// 算法再也不会算出来，所以这种行既不会被去重认下来，也不会随交付前进，
+    /// 留着就是每轮再排一次队。按工作行的估算记的那些是真尝试，留着。
+    #[tokio::test]
+    async fn a_replan_keyed_on_another_replans_estimate_is_retired_not_queued_again() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-stale-replans".to_string()));
+        let stale = replan_row(
+            "replan-stale",
+            "estimate/work-time-v1/replan/n5/2026-11-04T21:07:59Z",
+        );
+        let live = replan_row(
+            "replan-live",
+            "estimate/work-time-v1/change_ledger/n9/2026-11-04T12:26:47Z",
+        );
+        dag.add_task(stale.clone()).await.unwrap();
+        dag.add_task(live.clone()).await.unwrap();
+
+        OrchestratorControlImpl::new(dag.clone())
+            .retire_stale_replans(&[stale.clone(), live.clone()])
+            .await;
+
+        let settled = dag.get_task(&stale.id).await.expect("行还在，退役不删行");
+        assert_eq!(settled.status, TaskStatus::Cancelled, "旧键的行该被退役");
+        assert!(
+            settled
+                .error
+                .unwrap_or_default()
+                .contains("another replan's own estimate"),
+            "理由要写在行上：读它的人得知道这条为什么结束"
+        );
+        assert_eq!(
+            dag.get_task(&live.id).await.unwrap().status,
+            TaskStatus::Pending,
+            "按真基线记的那条是这一版上的一次尝试，不该被退役"
         );
     }
 }

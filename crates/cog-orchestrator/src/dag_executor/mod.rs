@@ -30,7 +30,7 @@ pub const MIN_ESTIMATE_SAMPLES: u64 = 5;
 ///
 /// 分解算出来的、人排的基线写的是别的（有的直接是时刻），它们不是估算，
 /// 估算器不重算也不覆盖。
-const ESTIMATE_REV_PREFIX_ANY: &str = "estimate/";
+pub(crate) const ESTIMATE_REV_PREFIX_ANY: &str = "estimate/";
 
 /// 估算基线版本串的开头，连同量出这条工期的尺子：`estimate/work-time-v1/…`。
 ///
@@ -39,13 +39,13 @@ const ESTIMATE_REV_PREFIX_ANY: &str = "estimate/";
 /// 「哪把尺子」只能从行上读，日志不会留在库里。旧写法
 /// `estimate/<kind>/n<samples>/<rfc3339>` 的第三段就是时刻，没有位置记尺子，
 /// 所以改成把尺子放在种类前面：种类里即便带斜杠，也挤不到它前面去。
-const ESTIMATE_REV_PREFIX: &str = "estimate/work-time-v1/";
+pub(crate) const ESTIMATE_REV_PREFIX: &str = "estimate/work-time-v1/";
 
 /// 从估算器自己写的版本串里取回种类。
 ///
 /// 尾两段是样本条数与时刻，中间剩下的全部是种类——种类可能带斜杠，所以两头
 /// 各剥一段，不按位置取。
-fn estimate_rev_kind(rev: &str) -> Option<String> {
+pub(crate) fn estimate_rev_kind(rev: &str) -> Option<String> {
     let rest = rev.strip_prefix(ESTIMATE_REV_PREFIX_ANY)?;
     let (rest, _written_at) = rest.rsplit_once('/')?;
     let (kind, _samples) = rest.rsplit_once('/')?;

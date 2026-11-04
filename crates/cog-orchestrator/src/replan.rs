@@ -102,6 +102,46 @@ pub fn is_replan_task(task: &Task) -> bool {
     matches!(&task.task_type, TaskType::Custom(kind) if kind == REPLAN_TASK_KIND)
 }
 
+/// 这条重规划记下的基线版本，是**另一条重规划自己排期时写下的估算**吗。
+///
+/// 排期给每条新任务写一行 `estimate/<口径>/<kind>/n<样本>/<时刻>` 的计划；一条
+/// 重规划若把另一条重规划的这一行读成了项目的当前基线，它记下的键就只属于那个
+/// 旧算法。现在基线不再看重规划的计划行（见 `current_revisions`），这个键再也
+/// 算不出来第二次：它既不会被去重认成「已经造过」，也不会随交付往前走，于是
+/// 只剩在队列里一遍遍排队。认出它们是为了把话说在行上地退役，而不是删掉。
+pub fn keyed_on_a_replans_own_estimate(task: &Task) -> bool {
+    if !is_replan_task(task) {
+        return false;
+    }
+    let Some(revision) = task
+        .input
+        .get(REPLAN_INPUT_KEY)
+        .and_then(|facts| facts.get("baseline_rev"))
+        .and_then(|rev| rev.as_str())
+    else {
+        return false;
+    };
+    estimate_kind(revision) == Some(REPLAN_TASK_KIND)
+}
+
+/// 排期器写的版本串说的是哪一类的工期：`estimate/[<尺子>/]<kind>/n<样本>/<时刻>`。
+///
+/// 两种写法都认——尺子是后来才加进版本串的，之前在估算器里的行还是旧写法。
+/// 这里不借用估算器那个按旧写法写的解析函数：它对带尺子的写法会把尺子读成
+/// 种类的一部分（`work-time-v1/replan`），而它自己的调用点只喂旧行，所以一直
+/// 没暴露出来。
+fn estimate_kind(revision: &str) -> Option<&str> {
+    let rest = revision
+        .strip_prefix(crate::dag_executor::ESTIMATE_REV_PREFIX)
+        .or_else(|| revision.strip_prefix(crate::dag_executor::ESTIMATE_REV_PREFIX_ANY))?;
+    let (rest, _written_at) = rest.rsplit_once('/')?;
+    let (kind, samples) = rest.rsplit_once('/')?;
+    samples
+        .strip_prefix('n')
+        .filter(|digits| digits.chars().all(|c| c.is_ascii_digit()))?;
+    (!kind.is_empty()).then_some(kind)
+}
+
 /// 这一行是不是给（项目、指数、基线版本）这处越界造的重规划。
 ///
 /// 按输入里记的三格认，不按 id 认：id 里只有一段摘要，读不出它说的是哪一版；
