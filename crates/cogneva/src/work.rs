@@ -1311,6 +1311,14 @@ mod tests {
         assert_eq!(picked[0].id, "high");
     }
 
+    /// The face travels as the roster spells it, not as an invented ASCII name.
+    ///
+    /// Every real face id is Chinese and some carry a slash; a fixture with a
+    /// hyphenated ASCII id proves the field is copied and says nothing about
+    /// whether the spelling the roster actually uses survives the trip -- a
+    /// normalisation that mangles `/` or non-ASCII would leave every row filed
+    /// under a face the readings never count, and every assertion here would
+    /// still pass.
     fn file_args() -> Vec<String> {
         args(&[
             "file",
@@ -1319,9 +1327,9 @@ mod tests {
             "--task",
             "close-the-ci-gap",
             "--goal",
-            "Close the gap on the ci-build-deploy face",
+            "Close the gap on the CI/构建/部署 face",
             "--face",
-            "ci-build-deploy",
+            "CI/构建/部署",
             "--acceptance",
             "CI is green on main",
         ])
@@ -1345,8 +1353,8 @@ mod tests {
             request.action,
             Action::File {
                 task: "close-the-ci-gap".into(),
-                goal: "Close the gap on the ci-build-deploy face".into(),
-                face: Some("ci-build-deploy".into()),
+                goal: "Close the gap on the CI/构建/部署 face".into(),
+                face: Some("CI/构建/部署".into()),
                 acceptance: vec!["CI is green on main".into()],
                 priority: 1,
                 blocked_by: Vec::new(),
@@ -1415,7 +1423,7 @@ mod tests {
         let row = &rows[0];
         assert_eq!(row["id"], "close-the-ci-gap");
         assert_eq!(row["task_type"], UNIT_WORK_KIND);
-        assert_eq!(row["face_id"], "ci-build-deploy");
+        assert_eq!(row["face_id"], "CI/构建/部署");
         assert_eq!(row["unit_id"], "8b");
         assert_eq!(row["priority"], 1);
         assert_eq!(row["timeout_seconds"], UNIT_WORK_BUDGET_SECS);
@@ -1473,7 +1481,7 @@ mod tests {
         let rows = read.tasks.expect("one row");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, "close-the-ci-gap");
-        assert_eq!(rows[0].face_id.as_deref(), Some("ci-build-deploy"));
+        assert_eq!(rows[0].face_id.as_deref(), Some("CI/构建/部署"));
         assert_eq!(rows[0].unit_id.as_deref(), Some("8b"));
         assert_eq!(rows[0].timeout_seconds, Some(UNIT_WORK_BUDGET_SECS));
         assert!(
@@ -1526,7 +1534,7 @@ mod tests {
         Filing {
             id,
             goal,
-            face: Some("ci-build-deploy"),
+            face: Some("CI/构建/部署"),
             acceptance,
             priority: 1,
             blocked_by: &[],

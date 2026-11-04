@@ -1501,6 +1501,29 @@ pub(crate) fn ci_hold_goal_id(rev: &str, day: &str) -> String {
     format!("ci-red-{}-{day}", rev12(rev))
 }
 
+/// 这一次扣住落在**哪个面**上。
+///
+/// 「这一版过不了上游的判据」是 CI/构建/部署这一面自己的活，不是某个恰好在线的人
+/// 的活。写在行上，面读数才数得到它，面主不在了改派也才轮得到它——不写的话，这条
+/// 待办在图里是一行不属于任何面的孤活，谁都说不出它该归谁。
+const CI_HOLD_FACE: &str = "CI/构建/部署";
+
+/// 分解不了时那条「改这棵树，让这些检查过」的行。
+///
+/// 与目标行分开：目标行是不可执行的锚点，读面靠它认「一次提交」；这一行是活本身。
+/// id 同样由 rev 与日期推出，理由与 [`ci_hold_goal_id`] 相同——扣住期间每一轮都会
+/// 走到这里。
+pub(crate) fn ci_hold_fix_task_id(rev: &str, day: &str) -> String {
+    format!("{}-fix", ci_hold_goal_id(rev, day))
+}
+
+/// 这一行交给的执行路径的拼写。
+///
+/// 带 `evolution_mode` 标记的行由规划器直接注入、不叫模型分解（那是
+/// `process_goal_impl` 里「全部都是自演化意图」那一支）：分解正是这里要绕开的那
+/// 一步——模型不可用的时候，扣住不能连一行都不落。
+const CI_HOLD_FIX_KIND: &str = "ci_hold_fix";
+
 /// 这一轮**谁在管**这次扣住。0/1 只答「有没有人管」，而「没人管」有两种，修法在
 /// 完全不同的两侧：没有编排器是部署器的装配问题，提交被拒是被提交的那一侧拒了。
 ///
@@ -4998,6 +5021,8 @@ impl MainlineDeployer {
         // than the share of the work it is asking for, and an owned row that no
         // present unit holds waits forever in the shared queue.
         row.is_executable = false;
+        // 这一行属于哪个面：扣住期间每一轮都写，读面与改派才有得读。
+        row.face_id = Some(CI_HOLD_FACE.to_string());
         match orchestrator.submit_goal_auto(&goal, vec![row]).await {
             Ok(added) if added.is_empty() => {
                 info!(
@@ -5022,10 +5047,85 @@ impl MainlineDeployer {
                 CiHoldOwner::Owned
             }
             Err(e) => {
+                // 分解这一步失败了，扣住本身还没有。写一条已经拆好的行重新提交：
+                // 带自演化标记的行不经过分解（规划器见「全是自演化意图」就直接注入），
+                // 于是模型不可用时这条待办仍然落在图里，而不是变成一轮没人接得住的
+                // 扣住。2026-11-04 的现场就是这样：模型窗口打满，扣住每一轮都失败，
+                // 而这一版进不了主线，谁都不知道该谁动手。
                 warn!(
                     rev = %rev12(rev),
                     error = %e,
-                    "the CI hold could not be submitted; it is a held rollout with no owner"
+                    "the planner could not take the CI hold; filing the change itself instead"
+                );
+                self.file_ci_hold_fix(orchestrator, rev, failed_checks, &goal, &evidence)
+                    .await
+            }
+        }
+    }
+
+    /// 把这条扣住落成一条**已经拆好的**行，绕开规划器的分解。
+    ///
+    /// 分解失败有两种：模型回 429（窗口打满）与被规划器当场拒掉。两种情形下扣住本身
+    /// 都还成立——上游的判据确实红着，这一版确实进不了主线——所以「分解不了」不能
+    /// 变成「不记这一笔」。带 `evolution_mode=generate_change` 的行走的正是主流程
+    /// 本来就有的那条免分解注入：规划器见「全是自演化意图」就直接交给 DAG，不叫模型。
+    ///
+    /// 与目标行同一个日程：id 由 rev 与日期推出，扣住期间每一轮都会走到这里，而图对
+    /// 已持有的 id 是幂等空操作——同一天同一版不会因此多出第二行。
+    async fn file_ci_hold_fix(
+        &self,
+        orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
+        rev: &str,
+        failed_checks: &[String],
+        goal: &str,
+        evidence: &[CheckEvidence],
+    ) -> CiHoldOwner {
+        let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
+        let id = ci_hold_fix_task_id(rev, &day);
+        // 证据照原样放进来：接手的人先要读的就是那几条检查自己写下的失败点，而它们
+        // 只在内存里活到这一段结束。
+        let seen: Vec<serde_json::Value> = evidence
+            .iter()
+            .map(|e| serde_json::json!({ "check": e.check, "said": e.said }))
+            .collect();
+        let mut task = cog_core::Task::new(
+            id.clone(),
+            cog_core::TaskType::Custom(CI_HOLD_FIX_KIND.to_string()),
+            serde_json::json!({
+                "goal": goal,
+                (cog_core::INPUT_EVOLUTION_MODE): cog_core::EVOLUTION_MODE_GENERATE_CHANGE,
+                (cog_core::INPUT_TASK_KIND): CI_HOLD_FIX_KIND,
+                "rev": rev,
+                "failed_checks": failed_checks,
+                "evidence": seen,
+            }),
+        );
+        // 面与验收都挂在行上，不只在目标文字里：验收是「这一行关掉长什么样」被读的
+        // 那一处，面是它该归谁。
+        task.face_id = Some(CI_HOLD_FACE.to_string());
+        task.acceptance.push(format!(
+            "新版 main 提交在上游 CI 的同一组检查上全绿，且它取代了被判红的 {}——部署器放开滚动即算关闭。",
+            rev12(rev)
+        ));
+        match orchestrator.submit_goal_auto(goal, vec![task]).await {
+            Ok(added) => {
+                info!(
+                    rev = %rev12(rev),
+                    task_id = %id,
+                    queued = added.len(),
+                    "the CI hold landed as a pre-decomposed self-evolution row"
+                );
+                // 已持有同一行同样算有主：这一轮没有新增，不是没人接。
+                CiHoldOwner::Owned
+            }
+            Err(e) => {
+                // 两条路都走不通，这一轮就是没人接得住。判词要留下是哪一侧拒的：
+                // 分解失败与被拒是同一件事的两种强度，但都属 SubmitError。
+                warn!(
+                    rev = %rev12(rev),
+                    task_id = %id,
+                    error = %e,
+                    "the orchestrator refused the pre-decomposed CI hold row too; this hold has no owner this round"
                 );
                 CiHoldOwner::SubmitError
             }
@@ -15984,14 +16084,29 @@ exec {real} "$@"
     #[derive(Default)]
     struct RecordingPlanner {
         submissions: std::sync::Mutex<Vec<Submission>>,
+        /// 与 `submissions` 同一个下标上那一笔带的整行，供断言读面与验收。
+        ///
+        /// 不并进 `Submission`：那条元组有几处旧断言在按位置拆，加一格会让它们全体
+        /// 变得不可读，而这里要问的只是"那一行带着什么"。
+        rows: std::sync::Mutex<Vec<Vec<cog_core::Task>>>,
         /// 让提交失败的那一档：2026-10-31 整天都是它（每个上游 503，变成
         /// `face_has_no_serving_member`），而"拒了"与"收了"在回读上必须分得开。
         refuse: std::sync::atomic::AtomicBool,
+        /// 只拒**要分解**的那一笔（任务里有不是自演化意图的行），已经拆好的行照收。
+        ///
+        /// 这是模型不可用时的真实形状：拿回 `face_has_no_serving_member` 的是分解
+        /// 那一步，而带自演化标记的行本来就不叫模型。混成同一个开关键是让"兜底也
+        /// 走通了"与"两条路都断了"在测试里无法区分。
+        refuse_decomposition: std::sync::atomic::AtomicBool,
     }
 
     impl RecordingPlanner {
         fn submissions(&self) -> Vec<Submission> {
             self.submissions.lock().unwrap().clone()
+        }
+
+        fn rows(&self) -> Vec<Vec<cog_core::Task>> {
+            self.rows.lock().unwrap().clone()
         }
     }
 
@@ -16005,11 +16120,20 @@ exec {real} "$@"
             goal: &str,
             tasks: Vec<cog_core::Task>,
         ) -> SFResult<Vec<String>> {
-            if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+            // 规划器在真实实现里会先看这一笔要不要叫模型（全是自演化意图就直接注入），
+            // 所以「分解被拒」只能落在要分解的那一笔上——替身也照这个边界拒。
+            let needs_decomposition = !tasks.iter().all(|task| task.is_self_evolution());
+            let refused = self.refuse.load(std::sync::atomic::Ordering::Relaxed)
+                || (needs_decomposition
+                    && self
+                        .refuse_decomposition
+                        .load(std::sync::atomic::Ordering::Relaxed));
+            if refused {
                 return Err(cog_core::SFError::LLM(
                     cog_core::contract::llm::FACE_WITHOUT_A_MEMBER.to_string(),
                 ));
             }
+            self.rows.lock().unwrap().push(tasks.clone());
             let ids: Vec<String> = tasks.iter().map(|task| task.id.clone()).collect();
             let mut held = self.submissions.lock().unwrap();
             let fresh: Vec<String> = ids
@@ -16605,6 +16729,105 @@ exec {real} "$@"
             .await
             .unwrap());
         assert_eq!(read().await.unwrap(), 0.0);
+        settle(handle).await;
+    }
+
+    /// 分解不了的时候，扣住本身还得落在图里。
+    ///
+    /// 2026-11-04 的现场：上游 CI 判红，部署器按住发版（门是对的），而模型窗口打满
+    /// 之后每一次提交都拿回 `retry_after_seconds`——于是这条扣住**一行都没有**：
+    /// 没有目标、没有子任务、没有面，谁都不知道该谁动手。修法不是在这一层另开一条
+    /// 提交路，而是把这条扣住本身写成一条已经拆好的自演化行——带
+    /// `evolution_mode=generate_change` 的行规划器直接注入、不叫模型，所以模型不在
+    /// 它照样落库。
+    ///
+    /// 删掉这次改动，第一次提交被拒之后就再没有第二次，下面的 `len() == 2` 立刻红。
+    #[tokio::test]
+    async fn a_hold_the_planner_cannot_decompose_is_filed_as_a_change_itself() {
+        use cog_core::metric_names::MAINLINE_CI_HOLD_UNOWNED;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        planner
+            .refuse_decomposition
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone())
+            .with_metrics(metrics.clone());
+
+        let mut state = MainlineState::default();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+            .await
+            .unwrap());
+
+        let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
+        // 替身只记收下的那一笔（被拒的连记都不记），所以「只有一笔且是兜底那一笔」
+        // 本身就说完了这一轮发生的事：目标行的提交被拒了，兜底的行收下了。
+        let submissions = planner.submissions();
+        assert_eq!(
+            submissions.len(),
+            1,
+            "分解被拒之后必须还有第二次提交，而不是这一轮就此作罢：{submissions:?}"
+        );
+        assert_eq!(
+            submissions[0].1,
+            vec![ci_hold_fix_task_id("abc123", &day)],
+            "兜底那一行与目标行同日同版，图对已持有的 id 是幂等空操作"
+        );
+        assert_eq!(
+            submissions[0].2, submissions[0].1,
+            "第一次见到的行要报成新加的，否则读的人会以为图里早就有它"
+        );
+
+        let rows = planner.rows();
+        let fix = &rows[0][0];
+        assert!(
+            fix.is_self_evolution(),
+            "免分解靠的就是这个标记：没有它，规划器又会叫一次模型，兜底等于绕回原点"
+        );
+        assert!(!fix.is_goal_row(), "这一行是活本身，不是目标的锚点");
+        assert_eq!(
+            fix.face_id.as_deref(),
+            Some(CI_HOLD_FACE),
+            "这一行要落在 CI/构建/部署 上，面读数与改派才轮得到它"
+        );
+        assert_eq!(
+            fix.acceptance.len(),
+            1,
+            "验收要挂在行上：它才是「这一行关掉长什么样」被读的那一处"
+        );
+        assert!(
+            fix.acceptance[0].contains("abc123"),
+            "验收得点名是哪一版被判红的：{}",
+            fix.acceptance[0]
+        );
+        assert!(
+            fix.input["failed_checks"]
+                .as_array()
+                .is_some_and(|v| v.iter().any(|c| c == "github:Test")),
+            "哪几条检查红了跟着行一起走：{}",
+            fix.input
+        );
+
+        // 有主：这一格不能停在 1 上，否则告警会把「模型不可用但已经落库」读成没人管。
+        let samples = metrics
+            .query_gauge_latest(MAINLINE_CI_HOLD_UNOWNED.as_str())
+            .await
+            .unwrap();
+        assert!(
+            samples.iter().all(|s| s.value == 0.0),
+            "兜底落库了就是有主，读数不该有任何一格是 1：{samples:?}"
+        );
         settle(handle).await;
     }
 
