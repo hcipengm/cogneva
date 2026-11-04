@@ -6094,11 +6094,30 @@ async fn project_quota_usage(state: &AppState) -> QuotaProjectionOutcome {
         },
     };
 
+    // 工作区那一格问的是同一份账，换个域：为一件活做的调用算在它跑在的那个租户
+    // 头上。这一格读数的两个消费者——管理面的 `/quota/workspace/<id>` 与 supervisor
+    // 的暂停闸门——在此之前读的都是「没配过的默认上限减 0」，也就是说工作区上限
+    // 配了也不执法。写进来之后它们读到的就是账上的数。
+    let workspace = match state.owner_budget.as_ref() {
+        None => AxisOutcome::NotConfigured,
+        Some(hierarchy) => match ledger.spend_by_workspace_since(since).await {
+            Ok(workspaces) => project_workspace_spend(hierarchy.as_ref(), &workspaces).await,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "按工作区额度：这一拍读不出账本，格子维持上一拍的值"
+                );
+                AxisOutcome::Failed
+            }
+        },
+    };
+
     // 任务那一格同一件事，只是域不同：格子的集合由「有人声明过预算」给出，没人
     // 声明过的任务没有格子可写——替它建一个，等于把「没人管」写成「额度为零」。
     let Some(gate) = state.task_budget.as_ref() else {
         return QuotaProjectionOutcome {
             person,
+            workspace,
             ..Default::default()
         };
     };
@@ -6111,6 +6130,7 @@ async fn project_quota_usage(state: &AppState) -> QuotaProjectionOutcome {
             );
             return QuotaProjectionOutcome {
                 person,
+                workspace,
                 task: AxisOutcome::Failed,
             };
         }
@@ -6124,12 +6144,17 @@ async fn project_quota_usage(state: &AppState) -> QuotaProjectionOutcome {
             );
             return QuotaProjectionOutcome {
                 person,
+                workspace,
                 task: AxisOutcome::Failed,
             };
         }
     };
     let task = project_task_spend(gate.as_ref(), &budgeted, &spent, now_unix).await;
-    QuotaProjectionOutcome { person, task }
+    QuotaProjectionOutcome {
+        person,
+        workspace,
+        task,
+    }
 }
 
 /// 一拍投影在一根轴上的结局。
@@ -6145,10 +6170,13 @@ enum AxisOutcome {
     Failed,
 }
 
-/// 一拍投影里两根轴各自的结局。
+/// 一拍投影里每根轴各自的结局。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct QuotaProjectionOutcome {
     person: AxisOutcome,
+    /// 工作区那一格与按人那一格共用同一个层级管理器（两者都是它的一段），所以
+    /// 配没配同一件事；读账本却是两次，一处失败不影响另一处。
+    workspace: AxisOutcome,
     task: AxisOutcome,
 }
 
@@ -6171,6 +6199,33 @@ async fn project_person_spend(
                 tokens,
                 error = %e,
                 "按人额度：这一拍没写进格子，下一拍照旧重算"
+            );
+            outcome = AxisOutcome::Failed;
+        }
+    }
+    outcome
+}
+
+/// 把 `(workspace, tokens)` 覆盖写到各自的工作区格子上。
+///
+/// 与按人那份形状相同，理由也相同：一次调用属于哪个租户由任务图回答，这里只负责
+/// 「一个租户一格、写绝对值」。账上没有花销的租户不出现——格子按 UTC 日过期，
+/// 昨天写进去的数今天零点就没了，不写就是清零，不需要重写一个 0。
+async fn project_workspace_spend(
+    hierarchy: &dyn cog_core::HierarchyManager,
+    workspaces: &[(String, u64)],
+) -> AxisOutcome {
+    let mut outcome = AxisOutcome::Ok;
+    for (workspace, tokens) in workspaces {
+        if let Err(e) = hierarchy
+            .set_used(cog_core::QuotaScope::Workspace, workspace, *tokens)
+            .await
+        {
+            tracing::warn!(
+                workspace = %workspace,
+                tokens,
+                error = %e,
+                "按工作区额度：这一拍没写进格子，下一拍照旧重算"
             );
             outcome = AxisOutcome::Failed;
         }
@@ -6219,7 +6274,11 @@ async fn project_task_spend(
 /// 会把前者读成后者。每拍都写，所以窗口最小值说「每一拍都失败」，而一次瞬时故障
 /// 不会被读成持续故障。
 async fn report_projection_outcome(state: &AppState, outcome: QuotaProjectionOutcome) {
-    for (axis, outcome) in [("person", outcome.person), ("task", outcome.task)] {
+    for (axis, outcome) in [
+        ("person", outcome.person),
+        ("workspace", outcome.workspace),
+        ("task", outcome.task),
+    ] {
         let failed = match outcome {
             AxisOutcome::NotConfigured => continue,
             AxisOutcome::Ok => false,
@@ -18457,6 +18516,38 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         );
     }
 
+    /// 一拍投影把每个工作区今天的花销写进它自己的格子。
+    ///
+    /// 这一格先前没有任何写入方：格子永远不存在，「工作区今天花了多少」读成 0，
+    /// 而它同时是管理面的读数与 supervisor 的暂停闸门——一个配了上限的工作区，
+    /// 花多少都不会被拦。现在这一拍就是唯一的写者。
+    #[tokio::test]
+    async fn a_projection_pass_writes_each_workspace_what_its_tasks_spent() {
+        let ledger =
+            StubLedger::with(&[("u-1", 900)], &[]).with_workspaces(&[("ws-1", 400), ("ws-2", 25)]);
+        let (mut state, _metrics) = state_with_projection(ledger, true, false);
+        let hierarchy = Arc::new(StubHierarchy::new(&[]));
+        state.owner_budget = Some(hierarchy.clone());
+
+        let outcome = project_quota_usage(&state).await;
+
+        assert_eq!(
+            outcome.workspace,
+            AxisOutcome::Ok,
+            "工作区那一根轴配了、也读成了"
+        );
+        assert_eq!(
+            hierarchy.projected_workspaces.lock().unwrap().as_slice(),
+            &[("ws-1".to_string(), 400), ("ws-2".to_string(), 25)],
+            "一个工作区一格，写账上那个绝对值"
+        );
+        assert_eq!(
+            hierarchy.projected.lock().unwrap().as_slice(),
+            &[("u-1".to_string(), 900)],
+            "两根轴各写各的格子：工作区的数不许落进人的格子"
+        );
+    }
+
     /// 一件今天还没花钱的任务写成 0，而不是跳过；名册外的任务一个字节都不写。
     ///
     /// 跳过没花过的那件，是让昨天的数留在格子上——它会在今天第一次调用之前就被
@@ -18488,6 +18579,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     struct StubLedger {
         people: Vec<(String, u64)>,
         by_task: Vec<(String, u64)>,
+        by_workspace: Vec<(String, u64)>,
         failing: bool,
     }
 
@@ -18502,8 +18594,18 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     .iter()
                     .map(|(id, tokens)| ((*id).to_string(), *tokens))
                     .collect(),
+                by_workspace: Vec::new(),
                 failing: false,
             }
+        }
+
+        /// 同一份账，工作区那一根轴上回答这些行。
+        fn with_workspaces(mut self, by_workspace: &[(&str, u64)]) -> Self {
+            self.by_workspace = by_workspace
+                .iter()
+                .map(|(id, tokens)| ((*id).to_string(), *tokens))
+                .collect();
+            self
         }
 
         fn failing() -> Self {
@@ -18577,6 +18679,12 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 return Err("账本连不上".into());
             }
             Ok(self.people.clone())
+        }
+        async fn spend_by_workspace_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+            if self.failing {
+                return Err("账本连不上".into());
+            }
+            Ok(self.by_workspace.clone())
         }
         async fn spend_by_task_since(
             &self,
@@ -18677,6 +18785,11 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "账本读不出来，这一拍就不是一次成功的投影"
         );
         assert_eq!(
+            outcome.workspace,
+            AxisOutcome::Failed,
+            "工作区那一格问的是同一份账，读不出来同样是一拍失败"
+        );
+        assert_eq!(
             outcome.task,
             AxisOutcome::NotConfigured,
             "这个部署没配任务预算门：那是没有这道上限，不是一次失败"
@@ -18685,16 +18798,20 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         let samples =
             metrics.matching(cog_core::metric_names::LLM_QUOTA_PROJECTION_FAILED.as_str());
+        let axes: Vec<(&str, f64)> = samples
+            .iter()
+            .map(|s| {
+                (
+                    s.labels.get("axis").map(String::as_str).unwrap_or(""),
+                    s.value,
+                )
+            })
+            .collect();
         assert_eq!(
-            samples.len(),
-            1,
-            "只配了人这一根轴，读数里就只有这一格：给没配的轴写 0 会把「没有上限」\
-             读成「刚更新过」"
-        );
-        assert_eq!(samples[0].value, 1.0);
-        assert_eq!(
-            samples[0].labels.get("axis").map(String::as_str),
-            Some("person")
+            axes,
+            vec![("person", 1.0), ("workspace", 1.0)],
+            "层级管理器一配，人与工作区两根轴就都在；没配的任务轴不写——给没配的轴\
+             写 0 会把「没有上限」读成「刚更新过」"
         );
     }
 
@@ -18712,6 +18829,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             outcome,
             QuotaProjectionOutcome {
                 person: AxisOutcome::Ok,
+                workspace: AxisOutcome::Ok,
                 task: AxisOutcome::Ok
             }
         );
@@ -18719,7 +18837,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         let samples =
             metrics.matching(cog_core::metric_names::LLM_QUOTA_PROJECTION_FAILED.as_str());
-        let axes: Vec<(&str, f64)> = samples
+        let mut axes: Vec<(&str, f64)> = samples
             .iter()
             .map(|s| {
                 (
@@ -18728,10 +18846,13 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 )
             })
             .collect();
+        // 读数面按标签排序返回，不按写入次序——这条断言判的是「三根轴都写了 0」，
+        // 不是哪一根先写。
+        axes.sort_by(|a, b| a.0.cmp(b.0));
         assert_eq!(
             axes,
-            vec![("person", 0.0), ("task", 0.0)],
-            "两根轴都配了、都读成了：每拍各写一个 0"
+            vec![("person", 0.0), ("task", 0.0), ("workspace", 0.0)],
+            "三根轴都配了、都读成了：每拍各写一个 0"
         );
     }
 
@@ -18798,6 +18919,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         cells: Vec<(String, u64, cog_core::QuotaLimits)>,
         broken: bool,
         projected: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+        /// 工作区那一格写进去的值。与人那一格分开记：两根轴共用一个替身，混在
+        /// 一个表里就分不出这一拍写的是谁。
+        projected_workspaces: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
     }
 
     impl StubHierarchy {
@@ -18815,6 +18939,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     .collect(),
                 broken: false,
                 projected: Arc::new(std::sync::Mutex::new(Vec::new())),
+                projected_workspaces: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -18881,11 +19006,20 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             target_id: &str,
             tokens: u64,
         ) -> cog_core::SFResult<()> {
-            if scope == cog_core::QuotaScope::User {
-                self.projected
+            match scope {
+                cog_core::QuotaScope::User => self
+                    .projected
                     .lock()
                     .unwrap()
-                    .push((target_id.to_string(), tokens));
+                    .push((target_id.to_string(), tokens)),
+                cog_core::QuotaScope::Workspace => self
+                    .projected_workspaces
+                    .lock()
+                    .unwrap()
+                    .push((target_id.to_string(), tokens)),
+                // 其余三级没有任何一条投影会写；写了就是替一个没人算过的层级
+                // 编了一个数，替身当场炸掉比把它咽下去好。
+                other => panic!("投影只写人与工作区两级，收到 {other:?}"),
             }
             Ok(())
         }

@@ -1158,6 +1158,54 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// 从 `since_unix` 起按工作区汇总的花销，`(workspace_id, tokens)`。
+    ///
+    /// 一次调用属于哪个工作区，证据与「属于哪个人」是同一行：任务图里那条任务
+    /// 记录着它跑在哪个租户里。调用方不声明工作区，任务行只写一次，所以这里连
+    /// 一次任务表，而不是让每个调用点各抄一遍。
+    ///
+    /// 没有任务身份的调用不出现，而不是折进某个占位工作区：它不属于任何租户，
+    /// 编一个 id 给它，会让那个「工作区」凭空长出一笔谁都不认的花销。
+    ///
+    /// 连任务表同样走 `LATERAL ... LIMIT 1`，理由与 [`Self::spend_by_person_since`]
+    /// 相同：主键是 `(workspace_id, task_id)`，普通 join 碰上重复会把那一行的 token
+    /// 数两遍，而按租户判额度只会表现为它比实际更早被拦。
+    pub async fn spend_by_workspace_since(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let rows = sqlx::query(&format!(
+            "SELECT workspace_id, SUM(tokens)::BIGINT AS tokens FROM (
+                 SELECT t.workspace_id AS workspace_id,
+                        (u.tokens_input + u.tokens_output) AS tokens
+                   FROM {LEDGER_TABLE} u
+                   JOIN LATERAL (
+                        SELECT d.workspace_id
+                          FROM {TASK_GRAPH_TABLE} d
+                         WHERE d.task_id = u.task_id
+                         ORDER BY d.updated_at DESC
+                         LIMIT 1
+                   ) t ON TRUE
+                  WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
+             ) s
+             WHERE workspace_id IS NOT NULL AND workspace_id <> ''
+             GROUP BY workspace_id
+             ORDER BY workspace_id"
+        ))
+        .bind(since_unix as f64)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("workspace_id"),
+                    row.get::<i64, _>("tokens").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
     /// 这件活是谁交的，任务图里那一个答案。
     ///
     /// 判额度与记账读的是同一处：`spend_by_person_since` 把为任务做的调用算在提交
@@ -2026,6 +2074,15 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
 
     async fn spend_by_person_since(&self, since_unix: i64) -> Result<Vec<(String, u64)>, String> {
         LlmUsageStore::spend_by_person_since(self, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn spend_by_workspace_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        LlmUsageStore::spend_by_workspace_since(self, since_unix)
             .await
             .map_err(|e| e.to_string())
     }

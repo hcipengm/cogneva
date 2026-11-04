@@ -37,11 +37,19 @@
 //! ([`quota::QuotaManager`]); they keep no balance of their own, so what a
 //! customer is shown cannot drift from what enforcement allowed.
 //!
-//! The workspace, team and organization levels above it still have no writer,
-//! and that stays deliberate: nothing on the platform says which of those a
-//! given call belongs to, so a figure charged against them would be a number
-//! nobody measured. A level with a declared ceiling and no spend is inert, and
-//! reads as exactly that.
+//! The workspace level is projected the same way, out of the same rows: a call
+//! belongs to the workspace of the task it was made for, and the task graph is
+//! where a piece of work records the tenant it runs in. That projection is what
+//! makes a declared workspace ceiling bite — the supervisor's pause gate reads
+//! the same cell, and before anything wrote it that gate could not tell a spent
+//! workspace from an untouched one. A workspace nobody declared a ceiling for
+//! is never cut off by the default pair: the gate asks "is there a limit", and
+//! the default is what a cell reads as, not a decision anyone made.
+//!
+//! The team and organization levels above it still have no writer, and that
+//! stays deliberate: a task names a workspace, not a team, so a figure charged
+//! against those levels would be a number nobody measured. A level with a
+//! declared ceiling and no spend is inert, and reads as exactly that.
 
 pub mod agent_budget;
 pub mod billing;

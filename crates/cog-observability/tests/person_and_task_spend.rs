@@ -210,6 +210,122 @@ async fn a_persons_day_is_what_the_ledger_charges_them_by_either_evidence() {
     }
 }
 
+/// 按工作区的那份：为一件活做的调用算在它跑在的那个租户头上，谁的都不算的行
+/// 不进任何工作区。
+///
+/// 这一格是「按租户额度」执法的唯一输入。它错一分，工作区的格子就跟着错一分，
+/// 而那个格子同时是管理面的读数与 supervisor 的暂停闸门——读出来的数与拦下来
+/// 的动作会是同一句谎话。
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_workspaces_day_is_the_calls_made_for_the_tasks_it_runs() {
+    let url = database_url();
+    let (pool, store) = prepare(&url).await;
+
+    let run = uuid::Uuid::new_v4();
+    let day = Utc.with_ymd_and_hms(2004, 3, 4, 0, 0, 0).unwrap();
+    let since = day.timestamp();
+    let tenant = format!("ws-tenant-{run}");
+    let other = format!("ws-other-{run}");
+    let twin_home = format!("ws-twin-home-{run}");
+    let first = format!("ws-first-{run}");
+    let second = format!("ws-second-{run}");
+    let elsewhere = format!("ws-elsewhere-{run}");
+
+    for (workspace, task_id) in [(&tenant, &first), (&tenant, &second), (&other, &elsewhere)] {
+        sqlx::query(
+            "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
+             VALUES ($1, $2, '{}'::jsonb, 'pending')",
+        )
+        .bind(workspace)
+        .bind(task_id)
+        .execute(&pool)
+        .await
+        .expect("write a task");
+    }
+    // 同一个 task_id 在第二个工作区里还有一行，且更新——任务图允许这个形状。
+    // 普通 join 会把那一行的 token 数两遍，租户会比实际更早被拦。
+    sqlx::query(
+        "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status, updated_at)
+         VALUES ($1, $2, '{}'::jsonb, 'pending', NOW() + interval '1 hour')",
+    )
+    .bind(&twin_home)
+    .bind(&second)
+    .execute(&pool)
+    .await
+    .expect("write the twin task");
+
+    // 两件都在 tenant 里：100 + 50。
+    ledger_row(
+        &pool,
+        day + chrono::Duration::hours(1),
+        None,
+        Some(&first),
+        100,
+    )
+    .await;
+    ledger_row(
+        &pool,
+        day + chrono::Duration::hours(2),
+        None,
+        Some(&second),
+        50,
+    )
+    .await;
+    // 另一件活跑在另一个租户里。
+    ledger_row(
+        &pool,
+        day + chrono::Duration::hours(3),
+        None,
+        Some(&elsewhere),
+        7,
+    )
+    .await;
+    // 没有任务身份的行：不属于任何租户，不许被编进一个占位工作区。
+    ledger_row(&pool, day + chrono::Duration::hours(4), None, None, 11).await;
+
+    let rows = store
+        .spend_by_workspace_since(since)
+        .await
+        .expect("read the workspace totals");
+    let of = |workspace: &str| {
+        rows.iter()
+            .find(|(id, _)| id == workspace)
+            .map(|(_, tokens)| *tokens)
+    };
+
+    assert_eq!(
+        of(&tenant),
+        Some(100),
+        "twin 那行更新，这一笔按它算（与按人同一条规则）"
+    );
+    assert_eq!(of(&twin_home), Some(50), "同一个 task_id 的调用只算一次");
+    assert_eq!(of(&other), Some(7), "另一件活自己那个租户");
+    assert_eq!(
+        rows.iter().map(|(_, tokens)| tokens).sum::<u64>(),
+        157,
+        "没任务身份的那 11 个 token 不进任何工作区：总数必须是 100 + 50 + 7，数成 207 就是同一笔算了两遍"
+    );
+    assert!(
+        rows.iter().all(|(id, _)| !id.is_empty()),
+        "空 id 不是工作区，不许成一个格子"
+    );
+
+    sqlx::query("DELETE FROM gateway_llm_usage WHERE ts >= $1 AND ts < $2")
+        .bind(day)
+        .bind(day + chrono::Duration::days(1))
+        .execute(&pool)
+        .await
+        .expect("leave the ledger as it was found");
+    for workspace in [&tenant, &other, &twin_home] {
+        sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
+            .bind(workspace)
+            .execute(&pool)
+            .await
+            .expect("leave the graph as it was found");
+    }
+}
+
 /// 按任务的那份只数当天的：更早的花销不进格子，没花过的不出现。
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]

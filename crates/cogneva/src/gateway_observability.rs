@@ -332,6 +332,13 @@ impl cog_core::LlmUsageLedger for DeferredSink<dyn cog_core::LlmUsageLedger> {
         self.ledger()?.spend_by_person_since(since_unix).await
     }
 
+    async fn spend_by_workspace_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        self.ledger()?.spend_by_workspace_since(since_unix).await
+    }
+
     async fn spend_by_task_since(
         &self,
         task_ids: &[String],
@@ -773,6 +780,9 @@ mod tests {
         async fn spend_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
             self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(vec![("someone".to_string(), 7)])
+        }
+        async fn spend_by_workspace_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("这一格只读不写")
         }
         async fn spend_by_task_since(
             &self,

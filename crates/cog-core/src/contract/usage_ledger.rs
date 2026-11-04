@@ -718,6 +718,28 @@ pub trait LlmUsageLedger: Send + Sync {
     /// everyone in the graph would create a cell per idle person per day.
     async fn spend_by_person_since(&self, since_unix: i64) -> Result<Vec<(String, u64)>, String>;
 
+    /// Tokens spent since `since_unix`, per workspace, `(workspace_id, tokens)`.
+    ///
+    /// A call belongs to a workspace through the task it was made for: the task
+    /// row is where a piece of work records which tenant it runs in, written
+    /// once when the work is submitted. Folding the calls up that row rather
+    /// than asking each call site to restate the workspace is the same reason
+    /// the person axis joins the task row — one fact, one place.
+    ///
+    /// Absent, not zero:
+    /// - a call no task owns belongs to no workspace, and there is no id to
+    ///   file it under;
+    /// - a workspace that spent nothing today is not reported. This feeds a
+    ///   projection that rewrites the cell a ceiling is judged against, and a
+    ///   zero for every quiet workspace would create a cell per tenant per day.
+    ///
+    /// A task id can be carried by one row per workspace (the graph's key is
+    /// `(workspace_id, task_id)`), so the join takes the most recently updated
+    /// row — a plain join would count that call once per row and the workspace
+    /// would read as having spent more than it did.
+    async fn spend_by_workspace_since(&self, since_unix: i64)
+        -> Result<Vec<(String, u64)>, String>;
+
     /// Tokens each of the named tasks spent since `since_unix`, `(task_id, tokens)`.
     ///
     /// The day-scoped counterpart of [`spend_by_task`](Self::spend_by_task): that

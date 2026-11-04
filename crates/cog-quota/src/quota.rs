@@ -312,15 +312,40 @@ impl QuotaManager {
 
 #[async_trait::async_trait]
 impl cog_core::WorkspaceQuotaSource for QuotaManager {
-    /// The supervisor asks one question: how much room a workspace has left.
+    /// The supervisor asks one question: is this workspace near a ceiling?
     ///
-    /// Workspace-level spend has no writer yet — nothing on the platform says
-    /// which workspace a given call belongs to — so this answers the declared
-    /// ceiling with no spend against it. That is the same number enforcement
-    /// would use, which is the point: a gate that reads a counter nothing
-    /// writes cannot tell a quiet workspace from an unwired one.
+    /// Only a workspace someone declared a ceiling for can answer yes. The
+    /// hierarchy manager's default pair is what an undeclared cell *reads* as,
+    /// not a decision anyone made, and the supervisor's gate pauses the whole
+    /// scheduler — answering it with the default would stop the platform the
+    /// first day a workspace's spend passed a number nobody chose.
+    ///
+    /// "No ceiling" is reported as having no room constraint rather than as a
+    /// large remainder, because the caller compares this against a threshold
+    /// and that is the only thing it can do with it. A reading of *what is
+    /// left* is [`Self::get_workspace_summary`], which keeps reporting the
+    /// default ceiling minus the projected spend.
+    ///
+    /// A ceiling that cannot be read answers the same way: a cache outage must
+    /// not pause work (the same direction every other gate here takes, since
+    /// pausing wrongly costs more than letting a call through).
     async fn workspace_remaining(&self, workspace_id: &str) -> u64 {
-        self.get_workspace_remaining(workspace_id).await
+        match self
+            .hierarchy
+            .limits(QuotaScope::Workspace, workspace_id)
+            .await
+        {
+            Ok(Some(_)) => self.get_workspace_remaining(workspace_id).await,
+            Ok(None) => u64::MAX,
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace_id,
+                    error = %e,
+                    "工作区额度：读不出这个工作区有没有上限，暂停闸门这一拍不拦"
+                );
+                u64::MAX
+            }
+        }
     }
 }
 

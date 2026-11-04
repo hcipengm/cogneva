@@ -252,6 +252,45 @@ async fn a_workspace_reads_the_same_way_as_a_person() {
     );
 }
 
+/// 暂停闸门只被「有人声明过的上限」触发。
+///
+/// 层级管理器对每个格子都有一份默认上限，那是「读起来是多少」，不是谁做的决定。
+/// 拿它回答闸门的问题，等于在平台自己的花销越过这个默认数的那一天把整个调度器
+/// 停下——而那不是一个任何人按下的开关。所以没人声明过的工作区答「没有约束」，
+/// 声明过之后答的才是「上限减账上的花销」。
+#[tokio::test]
+async fn a_workspace_nobody_declared_a_ceiling_for_never_pauses_the_platform() {
+    use cog_core::WorkspaceQuotaSource as _;
+
+    let (quota, hierarchy, _store) = manager();
+    hierarchy
+        .set_used(QuotaScope::Workspace, "ws1", 900_000)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        quota.workspace_remaining("ws1").await,
+        u64::MAX,
+        "没人声明过上限的工作区，闸门这一侧没有要拦的东西——花得再多也不许\
+         由默认值来停平台"
+    );
+    assert_eq!(
+        quota.get_workspace_summary("ws1").await.used_today,
+        900_000,
+        "读数面照旧报账上的数：不拦不等于看不见"
+    );
+
+    hierarchy
+        .set_limits(QuotaScope::Workspace, "ws1", QuotaLimits::new(400, 500))
+        .await
+        .unwrap();
+    assert_eq!(
+        quota.workspace_remaining("ws1").await,
+        0,
+        "声明过上限之后，闸门读的就是上限减账上的花销"
+    );
+}
+
 /// 已经退休的那几族键，不允许再从生产源码里长回来。
 ///
 /// 判据按出现形式判：只看会随产物跑的 Rust 源（`crates/*/src` 与 crate 根的

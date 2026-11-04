@@ -434,6 +434,9 @@ impl cog_core::LlmUsageLedger for FakeUsage {
     async fn spend_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
         unimplemented!("read-only stand-in")
     }
+    async fn spend_by_workspace_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+        unimplemented!("read-only stand-in")
+    }
     async fn spend_by_task_since(
         &self,
         _: &[String],
