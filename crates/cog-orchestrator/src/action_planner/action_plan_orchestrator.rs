@@ -1067,9 +1067,16 @@ impl ActionPlanOrchestrator {
             // travels with it for the same reason -- a goal submitted for one
             // unit's work must not come back as unassigned pieces every unit
             // may claim.
-            let goal_binding = tasks
-                .first()
-                .map(|t| (t.face_id.clone(), t.owner_unit.clone()));
+            // 提交人跟着同一份绑定走，理由比上面两条更硬：钱是子任务花的，而账上
+            // 按人取数只能靠这一格。子任务要是丢了它，一次提交的钱就会落回「平台
+            // 自己花的」，而这恰好是最容易被读成「没人该负责」的那一格。
+            let goal_binding = tasks.first().map(|t| {
+                (
+                    t.face_id.clone(),
+                    t.owner_unit.clone(),
+                    t.submitted_by.clone(),
+                )
+            });
             // Priority travels with the work for the same reason the ownership
             // above does, and it is the one that decides *when* it runs: the
             // scheduler admits highest-priority first, so a child that fell
@@ -1107,9 +1114,10 @@ impl ActionPlanOrchestrator {
                 if let Some(priority) = goal_priority {
                     task.priority = priority;
                 }
-                if let Some((face_id, owner_unit)) = &goal_binding {
+                if let Some((face_id, owner_unit, submitted_by)) = &goal_binding {
                     task.face_id = face_id.clone();
                     task.owner_unit = owner_unit.clone();
+                    task.submitted_by = submitted_by.clone();
                 }
                 task.parent_task_id = match at.parent_id.as_deref() {
                     Some(parent) if plan_ids.contains(parent) => Some(parent.to_string()),
@@ -3300,6 +3308,7 @@ mod tests {
 
         let mut hint = hint_task("goal-row");
         hint.priority = 7;
+        hint.submitted_by = Some("u-7".into());
         let registry = SkillRegistry::new();
         planner
             .process_goal_impl("do this today", vec![hint], &registry)
@@ -3315,6 +3324,13 @@ mod tests {
             dag.get_task("child-1").await.unwrap().priority,
             7,
             "a decomposed piece is the same work, so it is claimed at the same rank"
+        );
+        // 钱是子任务花的，按人取数也只能靠这一格：子任务丢了提交人，一次提交的
+        // 花销就会落回「平台自己花的」，而那一格读起来恰好像「没人该负责」。
+        assert_eq!(
+            dag.get_task("child-1").await.unwrap().submitted_by,
+            Some("u-7".to_string()),
+            "the person who asked for the goal is the person the pieces are spent for"
         );
     }
 

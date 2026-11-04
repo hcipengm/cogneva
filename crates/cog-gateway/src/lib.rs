@@ -2539,6 +2539,14 @@ struct QuotaLimitsResponse {
     enforced: bool,
 }
 
+/// 全局那一格的名字。
+///
+/// 全局只有一个格子，所以它有一个固定名字而不是「调用方传什么就是什么」：判定的
+/// 一侧读的就是这一个名字，写到一个别的 id 上的上限永远不会被读到——管理面会把它
+/// 显示成「配过了」，花的钱越过它时没有任何一发被拒。读、写、清三面都拿它做校
+/// 验，名字只有一个来源。
+pub(crate) const GLOBAL_QUOTA_TARGET: &str = "platform";
+
 /// 有执法路径的那几级，以及各自靠什么把一次调用归到它名下。
 ///
 /// 返回 `Some` 的层级，上限写下来之后会在花销越过它时拒掉下一发；`None` 的
@@ -2553,12 +2561,44 @@ fn scope_enforcement(scope: cog_core::QuotaScope) -> Option<&'static str> {
         cog_core::QuotaScope::Workspace => {
             Some("the LLM proxy path judges the workspace of the task the call is made for")
         }
-        // 没有任何一处能把一次调用归到下面三级：任务图只有工作区，请求里也没有
+        // 全局这一级不需要归属字段：每一发都算在它名下，包括没有提交人、没有租户
+        // 的后台工作——那些正是按人/按租户两级看不见的部分。投影把账本当天的
+        // 总量写进这一个格子（`spend_total_since`），判定在每一发上调它，所以
+        // 这一级的上限写下来是真的会被读到的。
+        cog_core::QuotaScope::Global => {
+            Some("every proxied call, attributed or not, is charged to the one global cell")
+        }
+        // 没有任何一处能把一次调用归到下面两级：任务图只有工作区，请求里也没有
         // 团队／组织字段。要开一级，先给它一个归属来源，再把它加到这里。
-        cog_core::QuotaScope::Team
-        | cog_core::QuotaScope::Organization
-        | cog_core::QuotaScope::Global => None,
+        cog_core::QuotaScope::Team | cog_core::QuotaScope::Organization => None,
     }
+}
+
+/// 全局那一格只认 [`GLOBAL_QUOTA_TARGET`] 一个名字。
+///
+/// 写到别的 id 上的上限没人读；读到别的 id 上的格子会拿默认值冒充「这一格」的
+/// 读数。两者都是「管理面说有、执法面没看」的形状，所以在入口就答 400，并点名
+/// 那唯一合法的名字。
+fn global_target_guard(
+    scope: cog_core::QuotaScope,
+    target_id: &str,
+) -> Option<axum::response::Response> {
+    if scope != cog_core::QuotaScope::Global || target_id == GLOBAL_QUOTA_TARGET {
+        return None;
+    }
+    Some(
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "global_quota_target_is_fixed",
+                "message": format!(
+                    "the global ceiling is one cell named {GLOBAL_QUOTA_TARGET:?}; \
+                     a ceiling written under {target_id:?} would never be read"
+                ),
+            })),
+        )
+            .into_response(),
+    )
 }
 
 #[cfg(test)]
@@ -2705,6 +2745,9 @@ async fn quota_limits_handler(
         Ok(scope) => scope,
         Err(response) => return *response,
     };
+    if let Some(response) = global_target_guard(scope, &target_id) {
+        return response;
+    }
     match quota_limits_body(hierarchy, scope, &target_id).await {
         Ok(body) => (StatusCode::OK, Json(body)).into_response(),
         Err(response) => *response,
@@ -2715,7 +2758,7 @@ async fn quota_limits_handler(
 /// 那个值——`soft` 高于 `hard` 时会被压到 `hard`，不压的话生效值会比
 /// 声明值小，而读的人只会看见声明值。
 ///
-/// 没有执法路径的那三级（团队、组织、全局）拒写：一条永远不会被读到的上限，
+/// 没有执法路径的那两级（团队、组织）拒写：一条永远不会被读到的上限，
 /// 管理面会把它显示成「配过了」，花销越过它时却没有任何一发被拒——那是平台替
 /// 属主做了一个自己兑现不了的承诺。拒绝里点名哪几级有执法路径，读面同时用
 /// `enforced` 标出旧覆盖。
@@ -2731,6 +2774,9 @@ async fn quota_set_limits_handler(
         Ok(scope) => scope,
         Err(response) => return *response,
     };
+    if let Some(response) = global_target_guard(scope, &target_id) {
+        return response;
+    }
     if scope_enforcement(scope).is_none() {
         return (
             StatusCode::CONFLICT,
@@ -2778,6 +2824,9 @@ async fn quota_clear_limits_handler(
         Ok(scope) => scope,
         Err(response) => return *response,
     };
+    if let Some(response) = global_target_guard(scope, &target_id) {
+        return response;
+    }
     if let Err(e) = hierarchy.clear_limits(scope, &target_id).await {
         tracing::warn!("Quota limits clear failed: {}", e);
         return (

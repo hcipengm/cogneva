@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 fn make_test_task(id: &str) -> Task {
     Task {
+        submitted_by: None,
         id: id.into(),
         task_type: cog_core::TaskType::DagNode,
         status: TaskStatus::Pending,

@@ -2304,6 +2304,7 @@ mod consumer_ack_tests {
     fn ready_task(id: &str, input: serde_json::Value) -> cog_core::Task {
         let now = chrono::Utc::now();
         cog_core::Task {
+            submitted_by: None,
             id: id.into(),
             task_type: cog_core::TaskType::DagNode,
             status: cog_core::TaskStatus::Pending,
@@ -2930,6 +2931,7 @@ mod consumer_ack_tests {
         let runtime = test_runtime_with(backend.clone(), config);
 
         let task = cog_core::Task {
+            submitted_by: None,
             id: "task-reclaimed".into(),
             task_type: cog_core::TaskType::DagNode,
             status: cog_core::TaskStatus::Pending,

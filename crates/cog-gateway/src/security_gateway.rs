@@ -3127,6 +3127,9 @@ async fn call_subject(state: &AppState, task: Option<&str>, owner: Option<&str>)
 
 /// 判这一发要不要按人 / 按工作区的当日额度拒。
 ///
+/// 三个层级由同一处判：人、租户、全局。前两级要有归属（提交人 / 任务的工作区），
+/// 全局那一级不需要——每一发都算在它名下，包括没有主体的后台工作。
+///
 /// 只有**有人给这个主体配过额度**时才判，且只有配过上限的主体进得去判定上下文。
 /// 层级管理器对没配过的格子有一份默认上限，那是「读起来是多少」，不是「谁定的」
 /// ——把它放进去，等于平台替属主做了一个谁都没做过的决定，代价是某个人或某个
@@ -3190,6 +3193,27 @@ async fn owner_budget_refusal(
             }
         }
     }
+    // 全局那一格没有归属字段可填：它数的是**每一发**，所以它总是参与判定——
+    // 只要有人为它写过一对上限。这一格正是按人/按租户两级看不见的那部分花销
+    // 的闸门：没有提交人、没有租户的后台工作（主线程、进化、评测）不属于任何
+    // 人，却与别人一样烧钱，此前没有任何一处为它们的总量设过界。
+    match hierarchy
+        .limits(cog_core::QuotaScope::Global, crate::GLOBAL_QUOTA_TARGET)
+        .await
+    {
+        Ok(Some(_)) => {
+            ctx.global_id = Some(crate::GLOBAL_QUOTA_TARGET.to_string());
+            any_declared = true;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "按额度：读不出全局那一格的上限，这一发不按全局判"
+            );
+        }
+    }
+
     if !any_declared {
         return None;
     }
@@ -3205,6 +3229,7 @@ async fn owner_budget_refusal(
                 hard_limit = warning.limits.hard_limit,
                 "按额度：这一发跨过了软上限，仍然放行"
             );
+            note_owner_budget_soft_crossing(state, warning.scope, warning.target_id.as_str()).await;
         }
         return None;
     }
@@ -3219,11 +3244,83 @@ async fn owner_budget_refusal(
         hard_limit: blocked.limits.hard_limit,
         wait_secs: cog_core::day::seconds_to_next_day(Utc::now().timestamp()),
     };
+    note_owner_budget_refusal(state, &refusal).await;
     land_usage_record(
         state,
         owner_budget_refusal_usage(style, actor, origin, task, &refusal),
     );
     Some(refusal)
+}
+
+/// 一次额度拒绝在抓取面上的标签。
+///
+/// 被越线的主体按级落进它自己的那一格：人级进 `owner`，租户级进 `workspace`，
+/// 另一格留空。不用一个 `subject` 键装两种 id——前一次修过的正是这个错：同一个键
+/// 里混着人与租户，读的人按 `subject` 求和就把两种东西加在一起，而它们的修法
+/// （给一个人加额度 / 给一个租户加额度）不是一件事。空着的那一半是空的，不抄另
+/// 一个 id 进来充数。
+///
+/// `scope` 照 [`cog_core::QuotaScope::as_str`] 的闭集取词，与账本行上的
+/// `refused_scope`、以及响应正文里的级别是同一个词，三处对得上才读得通。
+fn budget_subject_labels<'a>(
+    scope: cog_core::QuotaScope,
+    target: &'a str,
+) -> [(&'static str, &'a str); 3] {
+    match scope {
+        cog_core::QuotaScope::User => [
+            ("scope", scope.as_str()),
+            ("owner", target),
+            ("workspace", ""),
+        ],
+        cog_core::QuotaScope::Workspace => [
+            ("scope", scope.as_str()),
+            ("owner", ""),
+            ("workspace", target),
+        ],
+        // 全局那一格没有主体名可填：它数的是整个平台，owner 与 workspace 都空着，
+        // `scope=global` 就是全部的身份。团队与组织两级今天没有执法路径，真出现了
+        // 也不编一个主体名，只把级别记下来，宁可少一格可归因的读数。
+        _ => [("scope", scope.as_str()), ("owner", ""), ("workspace", "")],
+    }
+}
+
+fn owner_budget_refusal_labels(refusal: &OwnerBudgetRefusal) -> [(&'static str, &str); 3] {
+    budget_subject_labels(refusal.scope, refusal.target.as_str())
+}
+
+/// 把一次额度拒绝记进抓取面。
+///
+/// 拒绝的调用一个上游都没碰过，所以 `llm_calls_total` 上没有它的一格；只靠账本行
+/// 的话，一个人当天被切断这件事在抓取面读起来和「没花过钱」一模一样。这个 counter
+/// 补的就是那一格，并且按主体分格，让告警能直接点名该找谁。
+async fn note_owner_budget_refusal(state: &AppState, refusal: &OwnerBudgetRefusal) {
+    let labels = owner_budget_refusal_labels(refusal);
+    record_counter(
+        state,
+        cog_core::metric_names::LLM_OWNER_BUDGET_REFUSALS_TOTAL,
+        &labels,
+    )
+    .await;
+}
+
+/// 把一次「越过软上限仍然放行」记进抓取面。
+///
+/// 软上限不拦任何调用，只在日志里留一行；只靠那一行的话，一个已经跨过软线还在继续
+/// 花钱的主体，与一个从没跨过的主体在抓取面同形——两边的花销都还在涨。硬拒绝是同族
+/// 的另一条序列，不记在这一格里：被拒的调用没有发出去，记进来会把「已经停了」读成
+/// 「还在放行」。
+async fn note_owner_budget_soft_crossing(
+    state: &AppState,
+    scope: cog_core::QuotaScope,
+    target: &str,
+) {
+    let labels = budget_subject_labels(scope, target);
+    record_counter(
+        state,
+        cog_core::metric_names::LLM_OWNER_BUDGET_SOFT_CROSSINGS_TOTAL,
+        &labels,
+    )
+    .await;
 }
 
 /// 按人 / 按工作区额度拒绝的台账落点。
@@ -3606,6 +3703,31 @@ pub const RANGE_READ_BASELINES: &[(&str, RangeReadBaseline)] = &[
     (
         cog_core::metric_names::LLM_UPSTREAM_CLIENT_ERRORS_TOTAL.as_str(),
         RangeReadBaseline::SeededAtZero,
+    ),
+    // 额度拒绝与软跨越两族的 `owner` / `workspace` 两维是外部文本（人与租户的
+    // id），格子集合无法在启动时从配置枚举，理由与 `llm_calls_total` 逐字相同。
+    // 读者因此看不见的也是同一件事：一个新主体第一次越线时，那个格子带着第一笔
+    // 自增出现在首个样本里，差分函数读成 0。拒绝规则要比三次，少掉的那一次不
+    // 影响判词；软跨越规则少掉的是「一个从没越线的主体第一次越线」——那一次之
+    // 后它的硬拒绝会走拒绝那一族，而当天的花销在额度面板上，所以它不落空，只是
+    // 不经这条规则出现。
+    (
+        cog_core::metric_names::LLM_OWNER_BUDGET_REFUSALS_TOTAL.as_str(),
+        RangeReadBaseline::Exempt {
+            readers: &["llm_owner_budget_refusals_sustained"],
+            reason: "格子是 (scope, owner, workspace)，两维是人与租户的 id、来自账本与任务图，\
+                     调用前无法枚举；猜一个 id 种下去，发布的是一条没有调用能推动的序列。读者看不见\
+                     的是一个新主体那一格的第一个增量；这一条规则要求窗口里超过两次，所以判词方向不受影响。",
+        },
+    ),
+    (
+        cog_core::metric_names::LLM_OWNER_BUDGET_SOFT_CROSSINGS_TOTAL.as_str(),
+        RangeReadBaseline::Exempt {
+            readers: &["llm_owner_budget_over_soft_limit"],
+            reason: "同上，两维是无法枚举的外部 id。读者看不见的是一个主体第一次越线的那一笔；\
+                     之后的每一次都在这一族上可读，而它继续走到硬上限时由拒绝那一族报出，所以\
+                     这条规则少报的是一次性的首笔，不是一整类事件。",
+        },
     ),
     (
         cog_core::metric_names::LLM_CALLS_TOTAL.as_str(),
@@ -6178,12 +6300,30 @@ async fn project_quota_usage(state: &AppState) -> QuotaProjectionOutcome {
         },
     };
 
+    // 全局那一格：整本账当天花了多少，一个数。它不按身份折叠，所以没有提交人的
+    // 后台工作也在里面——按人、按租户两格看不见的那部分，正是「平台在烧钱」最
+    // 常发生的地方，而写到这里之后它就有了一个会被判定读取的格子。
+    let global = match state.owner_budget.as_ref() {
+        None => AxisOutcome::NotConfigured,
+        Some(hierarchy) => match ledger.spend_total_since(since).await {
+            Ok(total) => project_global_spend(hierarchy.as_ref(), total).await,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "全局额度：这一拍读不出账本，格子维持上一拍的值"
+                );
+                AxisOutcome::Failed
+            }
+        },
+    };
+
     // 任务那一格同一件事，只是域不同：格子的集合由「有人声明过预算」给出，没人
     // 声明过的任务没有格子可写——替它建一个，等于把「没人管」写成「额度为零」。
     let Some(gate) = state.task_budget.as_ref() else {
         return QuotaProjectionOutcome {
             person,
             workspace,
+            global,
             ..Default::default()
         };
     };
@@ -6197,6 +6337,7 @@ async fn project_quota_usage(state: &AppState) -> QuotaProjectionOutcome {
             return QuotaProjectionOutcome {
                 person,
                 workspace,
+                global,
                 task: AxisOutcome::Failed,
             };
         }
@@ -6211,6 +6352,7 @@ async fn project_quota_usage(state: &AppState) -> QuotaProjectionOutcome {
             return QuotaProjectionOutcome {
                 person,
                 workspace,
+                global,
                 task: AxisOutcome::Failed,
             };
         }
@@ -6219,6 +6361,7 @@ async fn project_quota_usage(state: &AppState) -> QuotaProjectionOutcome {
     QuotaProjectionOutcome {
         person,
         workspace,
+        global,
         task,
     }
 }
@@ -6243,6 +6386,9 @@ struct QuotaProjectionOutcome {
     /// 工作区那一格与按人那一格共用同一个层级管理器（两者都是它的一段），所以
     /// 配没配同一件事；读账本却是两次，一处失败不影响另一处。
     workspace: AxisOutcome,
+    /// 全局那一格：整本账当天的总量，一个数。它与上面两根轴读的是同一张表，
+    /// 但不按任何身份折叠——没有提交人的后台工作只在这一格里。
+    global: AxisOutcome,
     task: AxisOutcome,
 }
 
@@ -6299,6 +6445,37 @@ async fn project_workspace_spend(
     outcome
 }
 
+/// 把平台今天花掉的总量覆盖写到全局那一格上。
+///
+/// 一格，不是每个主体一格：这一级问的是「整个平台还能花多少」，它没有身份要
+/// 摊开。写绝对值与另外两根轴同一条理由——格子是账本的投影，不是第二本账。
+///
+/// 没配全局上限也照写：格子先有数，才有「还剩多少」可读；不写的话，一个刚写
+/// 上限的操作者要等到第一次判定才看得见当天的花销，而那时它已经在拦人了。
+async fn project_global_spend(
+    hierarchy: &dyn cog_core::HierarchyManager,
+    tokens: u64,
+) -> AxisOutcome {
+    match hierarchy
+        .set_used(
+            cog_core::QuotaScope::Global,
+            crate::GLOBAL_QUOTA_TARGET,
+            tokens,
+        )
+        .await
+    {
+        Ok(()) => AxisOutcome::Ok,
+        Err(e) => {
+            tracing::warn!(
+                tokens,
+                error = %e,
+                "全局额度：这一拍没写进格子，下一拍照旧重算"
+            );
+            AxisOutcome::Failed
+        }
+    }
+}
+
 /// 把每件**声明过预算**的任务今天的花销覆盖写到它自己的格子上。
 ///
 /// 格子的域是名册而不是账本的行：账上今天没有花销的任务写成 0，而不是跳过。留着
@@ -6343,6 +6520,7 @@ async fn report_projection_outcome(state: &AppState, outcome: QuotaProjectionOut
     for (axis, outcome) in [
         ("person", outcome.person),
         ("workspace", outcome.workspace),
+        ("global", outcome.global),
         ("task", outcome.task),
     ] {
         let failed = match outcome {
@@ -7212,6 +7390,9 @@ async fn stream_forward(
                 serde_json::json!({
                     "error": match refusal.scope {
                         cog_core::QuotaScope::Workspace => "这个工作区今天的额度已经用完",
+                        // 全局那一格没有「哪个人」可点：越线的是整个平台当天的
+                        // 总量，处置是给平台加额度或等日界，不是去找某个属主。
+                        cog_core::QuotaScope::Global => "整个平台今天的额度已经用完",
                         _ => "这个人今天的额度已经用完",
                     },
                     // 同一个 429 也来自配速与按任务预算，三句话指向三种处置：
@@ -18656,6 +18837,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         people: Vec<(String, u64)>,
         by_task: Vec<(String, u64)>,
         by_workspace: Vec<(String, u64)>,
+        /// 整本账当天的总量：全局那一格写的数。默认 0——一条都没花的账本。
+        total: u64,
         /// 任务图上这件活的归属。`None` 是「图里没有这件活」。
         attribution: Option<cog_core::TaskAttribution>,
         failing: bool,
@@ -18673,9 +18856,17 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     .map(|(id, tokens)| ((*id).to_string(), *tokens))
                     .collect(),
                 by_workspace: Vec::new(),
+                total: 0,
                 attribution: None,
                 failing: false,
             }
+        }
+
+        /// 整本账当天的总量：不按身份折叠，所以可以与人、租户两份对不上，
+        /// 这正是「没有提交人的后台工作」那一部分。
+        fn with_total(mut self, total: u64) -> Self {
+            self.total = total;
+            self
         }
 
         /// 任务图上这件活归谁、跑在哪个租户。
@@ -18773,6 +18964,18 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 return Err("账本连不上".into());
             }
             Ok(self.by_workspace.clone())
+        }
+        async fn spend_total_since(&self, _: i64) -> Result<u64, String> {
+            if self.failing {
+                return Err("账本连不上".into());
+            }
+            Ok(self.total)
+        }
+        async fn refusals_total_since(&self, _: i64) -> Result<u64, String> {
+            if self.failing {
+                return Err("账本连不上".into());
+            }
+            Ok(0)
         }
         async fn spend_by_task_since(
             &self,
@@ -18900,9 +19103,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             .collect();
         assert_eq!(
             axes,
-            vec![("person", 1.0), ("workspace", 1.0)],
-            "层级管理器一配，人与工作区两根轴就都在；没配的任务轴不写——给没配的轴\
-             写 0 会把「没有上限」读成「刚更新过」"
+            vec![("person", 1.0), ("workspace", 1.0), ("global", 1.0)],
+            "层级管理器一配，人、工作区、全局三根轴就都在；没配的任务轴不写——给没配\
+             的轴写 0 会把「没有上限」读成「刚更新过」"
         );
     }
 
@@ -18921,6 +19124,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             QuotaProjectionOutcome {
                 person: AxisOutcome::Ok,
                 workspace: AxisOutcome::Ok,
+                global: AxisOutcome::Ok,
                 task: AxisOutcome::Ok
             }
         );
@@ -18937,13 +19141,18 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 )
             })
             .collect();
-        // 读数面按标签排序返回，不按写入次序——这条断言判的是「三根轴都写了 0」，
+        // 读数面按标签排序返回，不按写入次序——这条断言判的是「四根轴都写了 0」，
         // 不是哪一根先写。
         axes.sort_by(|a, b| a.0.cmp(b.0));
         assert_eq!(
             axes,
-            vec![("person", 0.0), ("task", 0.0), ("workspace", 0.0)],
-            "三根轴都配了、都读成了：每拍各写一个 0"
+            vec![
+                ("global", 0.0),
+                ("person", 0.0),
+                ("task", 0.0),
+                ("workspace", 0.0)
+            ],
+            "四根轴都配了、都读成了：每拍各写一个 0"
         );
     }
 
@@ -19011,11 +19220,15 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         /// 工作区那一级的格子：判定与 `limits` 都按级分开读，合成一张表就分不出
         /// 同一个 id 是人还是租户。
         workspace_cells: Vec<(String, u64, cog_core::QuotaLimits)>,
+        /// 全局那一级的格子。至多一格，名字由生产代码固定。
+        global_cells: Vec<(String, u64, cog_core::QuotaLimits)>,
         broken: bool,
         projected: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
         /// 工作区那一格写进去的值。与人那一格分开记：两根轴共用一个替身，混在
         /// 一个表里就分不出这一拍写的是谁。
         projected_workspaces: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
+        /// 全局那一格写进去的值，同上分开记。
+        projected_global: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
     }
 
     impl StubHierarchy {
@@ -19032,9 +19245,11 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     })
                     .collect(),
                 workspace_cells: Vec::new(),
+                global_cells: Vec::new(),
                 broken: false,
                 projected: Arc::new(std::sync::Mutex::new(Vec::new())),
                 projected_workspaces: Arc::new(std::sync::Mutex::new(Vec::new())),
+                projected_global: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
         }
 
@@ -19050,6 +19265,16 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     )
                 })
                 .collect();
+            self
+        }
+
+        /// 给全局那一级配上格子。全局只有一格，所以这里收的是三个数而不是一张表。
+        fn with_global(mut self, used: u64, soft: u64, hard: u64) -> Self {
+            self.global_cells = vec![(
+                crate::GLOBAL_QUOTA_TARGET.to_string(),
+                used,
+                cog_core::QuotaLimits::new(soft, hard),
+            )];
             self
         }
 
@@ -19069,6 +19294,13 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         fn workspace_cell(&self, id: &str) -> Option<(u64, cog_core::QuotaLimits)> {
             self.workspace_cells
+                .iter()
+                .find(|(cell, _, _)| cell == id)
+                .map(|(_, used, limits)| (*used, *limits))
+        }
+
+        fn global_cell(&self, id: &str) -> Option<(u64, cog_core::QuotaLimits)> {
+            self.global_cells
                 .iter()
                 .find(|(cell, _, _)| cell == id)
                 .map(|(_, used, limits)| (*used, *limits))
@@ -19104,6 +19336,12 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     ctx.workspace_id
                         .as_deref()
                         .and_then(|id| self.workspace_cell(id).map(|c| (id, c))),
+                ),
+                (
+                    cog_core::QuotaScope::Global,
+                    ctx.global_id
+                        .as_deref()
+                        .and_then(|id| self.global_cell(id).map(|c| (id, c))),
                 ),
             ] {
                 if let Some((id, (used, limits))) = cell {
@@ -19147,9 +19385,14 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     .lock()
                     .unwrap()
                     .push((target_id.to_string(), tokens)),
-                // 其余三级没有任何一条投影会写；写了就是替一个没人算过的层级
-                // 编了一个数，替身当场炸掉比把它咽下去好。
-                other => panic!("投影只写人与工作区两级，收到 {other:?}"),
+                cog_core::QuotaScope::Global => self
+                    .projected_global
+                    .lock()
+                    .unwrap()
+                    .push((target_id.to_string(), tokens)),
+                // 团队与组织两级没有任何一条投影会写；写了就是替一个没人算过的
+                // 层级编了一个数，替身当场炸掉比把它咽下去好。
+                other => panic!("投影只写人、工作区、全局三级，收到 {other:?}"),
             }
             Ok(())
         }
@@ -19171,6 +19414,7 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             let cell = match scope {
                 cog_core::QuotaScope::User => self.cell(target_id),
                 cog_core::QuotaScope::Workspace => self.workspace_cell(target_id),
+                cog_core::QuotaScope::Global => self.global_cell(target_id),
                 _ => None,
             };
             Ok(cell.map(|(_, limits)| limits))
@@ -19381,6 +19625,88 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 .await
                 .is_none(),
             "租户确实有花销、也确实有一个默认上限——可没人配过，就不许拿它拦"
+        );
+    }
+
+    /// 平台的日额度要咬住**没有主体**的那些调用。
+    ///
+    /// 按人、按租户两格只看得见「有归属」的花销，而主线程、进化、评测这些后台
+    /// 工作不属于任何人：它们花的钱在两格里都不出现，也就从来没有一道上限为它们
+    /// 设过界。全局那一格数的是每一发，所以它是这一级唯一的判据来源——没有任何
+    /// 归属字段的请求也必须被它拦下。
+    #[tokio::test]
+    async fn a_background_call_with_no_subject_is_refused_when_the_platform_day_is_spent() {
+        use tower::ServiceExt;
+
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        // 人、租户都没有格子；全局这一格配过上限且今天已经越线。
+        state.owner_budget = Some(Arc::new(
+            StubHierarchy::new(&[]).with_global(1200, 800, 1000),
+        ));
+        let app = router(state, true);
+
+        // 没有属主头、没有任务头：这正是主线程与后台工作的形状。
+        let req = proxy_request()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
+            .body(axum::body::Body::from(
+                serde_json::json!({"model": "m1", "messages": []}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "平台当天的量已经越线：没有主体的调用同样要被拦在碰上游之前"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["reason"], cog_core::REFUSED_BY_OWNER_BUDGET);
+        assert_eq!(
+            v["scope"], "global",
+            "越线的是平台那一格：读的人据此去加平台额度，而不是去找某个属主：{v}"
+        );
+        assert_eq!(v["target"], crate::GLOBAL_QUOTA_TARGET);
+        assert!(
+            v["owner"].is_null(),
+            "全局那一格没有主体名可填，不许抄一个 id 进来充数：{v}"
+        );
+        assert_eq!(v["spent_today"], 1200);
+        assert_eq!(v["hard_limit"], 1000);
+    }
+
+    /// 一拍投影把账本当天的总量写进 `platform` 那一格。
+    ///
+    /// 这一格与人的那一格写的不是同一个数：它不按身份折叠，所以没有提交人的后台
+    /// 花销也在里面。把人的合计抄过来会让平台上限只看见「有归属的那部分」，正是
+    /// 它要防的那一半不见了。
+    #[tokio::test]
+    async fn a_projection_pass_writes_the_ledger_total_into_the_platform_cell() {
+        let ledger = StubLedger::with(&[("u-1", 900)], &[]).with_total(5_000);
+        let (mut state, _metrics) = state_with_projection(ledger, true, false);
+        let hierarchy = Arc::new(StubHierarchy::new(&[]));
+        state.owner_budget = Some(hierarchy.clone());
+
+        let outcome = project_quota_usage(&state).await;
+
+        assert_eq!(
+            outcome.global,
+            AxisOutcome::Ok,
+            "全局那一根轴配了、也读成了"
+        );
+        assert_eq!(
+            hierarchy.projected_global.lock().unwrap().as_slice(),
+            &[(crate::GLOBAL_QUOTA_TARGET.to_string(), 5_000)],
+            "写的是账本总量；与下面人那一格的 900 差的那部分正是没有归属的花销"
+        );
+        assert_eq!(
+            hierarchy.projected.lock().unwrap().as_slice(),
+            &[("u-1".to_string(), 900)],
+            "总量不许落进人的格子"
         );
     }
 
@@ -19609,6 +19935,44 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             row.owner.as_deref(),
             Some("u-1"),
             "当事人照写，但它是被租户上限挡下的"
+        );
+    }
+
+    /// 抓取面上的拒绝按级分格，主体落在它自己那一格。
+    ///
+    /// 拒绝的调用一个上游都没碰过，`llm_calls_total` 上没有它；只靠账本行的话，
+    /// 一个人当天被切断在抓取面读起来与「没花过钱」同形。这个 counter 是那件事在
+    /// 抓取面唯一的读数，标签写错就等于告警点名点错人。
+    #[test]
+    fn a_refusal_publishes_under_the_subject_that_holds_the_ceiling() {
+        let user_refusal = OwnerBudgetRefusal {
+            scope: cog_core::QuotaScope::User,
+            target: "u-1".to_string(),
+            owner: Some("u-1".to_string()),
+            spent_today: 1000,
+            hard_limit: 1000,
+            wait_secs: 3600,
+        };
+        assert_eq!(
+            owner_budget_refusal_labels(&user_refusal),
+            [("scope", "user"), ("owner", "u-1"), ("workspace", "")],
+            "人级拒绝只能出现在 owner 那一格；把 id 抄进 workspace 会让按租户求和\
+             把它算成一次租户越线"
+        );
+
+        let workspace_refusal = OwnerBudgetRefusal {
+            scope: cog_core::QuotaScope::Workspace,
+            target: "ws-1".to_string(),
+            owner: Some("u-1".to_string()),
+            spent_today: 1200,
+            hard_limit: 1000,
+            wait_secs: 3600,
+        };
+        assert_eq!(
+            owner_budget_refusal_labels(&workspace_refusal),
+            [("scope", "ws"), ("owner", ""), ("workspace", "ws-1")],
+            "租户级拒绝的主体是租户；`owner` 留空而不是抄当事人，否则按人求和会\
+             把租户上限挡下的每一发都记到这个人头上"
         );
     }
 

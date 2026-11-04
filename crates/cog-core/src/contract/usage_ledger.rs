@@ -780,6 +780,23 @@ pub trait LlmUsageLedger: Send + Sync {
     async fn spend_by_workspace_since(&self, since_unix: i64)
         -> Result<Vec<(String, u64)>, String>;
 
+    /// Tokens the whole ledger spent since `since_unix`, as one number.
+    ///
+    /// The fold with no subject. Every call is in it -- including the ones made
+    /// for no person and no task, which is exactly the part the per-person and
+    /// per-workspace folds cannot see: the platform's own background work
+    /// (main thread, evolution, evaluation) spends without naming anyone, so a
+    /// ceiling built only on the attributed folds leaves it uncapped by
+    /// construction.
+    ///
+    /// A ledger that cannot total its rows answers with an error rather than
+    /// zero: zero is a claim that nothing was spent today, and a caller
+    /// projecting a spend ceiling would write it into the cell the next call is
+    /// judged against.
+    async fn spend_total_since(&self, _since_unix: i64) -> Result<u64, String> {
+        Err("this ledger does not report a total spend".into())
+    }
+
     /// How many calls were turned away because a person's own day was spent,
     /// since `since_unix`, per person, `(person, refusals)`.
     ///
@@ -824,6 +841,21 @@ pub trait LlmUsageLedger: Send + Sync {
         _since_unix: i64,
     ) -> Result<Vec<(String, u64)>, String> {
         Err("this ledger does not report refusals by workspace".into())
+    }
+
+    /// The subjectless counterpart of the two folds above: how many calls were
+    /// turned away because the platform's own day was spent, since `since_unix`,
+    /// as one number.
+    ///
+    /// Same result word as the per-subject folds, narrowed to `refused_scope`
+    /// `global`. The three lists partition the refusals rather than overlapping
+    /// them: a call refused for a person is not also counted here, so the three
+    /// add up to the refusal rows that name a level at all.
+    ///
+    /// Without this read a spent platform ceiling is visible only as a spend
+    /// that stopped growing, which is what a quiet platform looks like too.
+    async fn refusals_total_since(&self, _since_unix: i64) -> Result<u64, String> {
+        Err("this ledger does not report a total refusal count".into())
     }
 
     /// Tokens each of the named tasks spent since `since_unix`, `(task_id, tokens)`.

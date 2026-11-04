@@ -213,6 +213,17 @@ pub struct Task {
     /// 两份快照去猜谁先谁后。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound_by_handover_id: Option<String>,
+    /// 这件活是**谁交上来的**。
+    ///
+    /// 与 `owner_unit` 和 `agent_id` 答的是三个不同的问题：`owner_unit` 是「指定谁
+    /// 来做」，`agent_id` 是「结果谁交的」，这一列是「谁为这件活付钱」。它只由提交
+    /// 口在验过令牌之后写，调用方在请求体里自报的名字不算——那一格决定人的当日额度，
+    /// 一个能自己填它的调用方等于能把自己的花销记到别人头上。
+    ///
+    /// 放在任务行上而不是只在请求上过一遍，是因为钱是在**任务跑起来之后**才花的：
+    /// 分解出的子任务、重试、后台重跑，没有一处在处理那次请求，它们只有这一行可读。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submitted_by: Option<String>,
     /// 这条活包**怎样算做完**，来自分解时给出的验收标准。
     ///
     /// 放在任务行上而不是计划基线表里，有两个理由。验收标准是范围（这片活答应
@@ -779,6 +790,7 @@ impl Task {
             face_id: None,
             owner_unit: None,
             bound_by_handover_id: None,
+            submitted_by: None,
             acceptance: Vec::new(),
         }
     }

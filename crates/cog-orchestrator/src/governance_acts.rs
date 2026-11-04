@@ -887,6 +887,7 @@ fn governance_task(
     now: DateTime<Utc>,
 ) -> Task {
     Task {
+        submitted_by: None,
         id: id.to_string(),
         task_type: TaskType::Custom(task_type.to_string()),
         status,

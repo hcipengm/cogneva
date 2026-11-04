@@ -278,6 +278,19 @@ pub const METRIC_DERIVATIONS: &[(&str, MetricDerivation)] = &[
     ),
     ("llm_upstream_failures_total", MetricDerivation::Process),
     ("llm_usage_landing_dropped_total", MetricDerivation::Process),
+    // Counted at the refusal in the gateway process, and a refusal happens in
+    // exactly one gateway, so summing across processes counts events rather
+    // than multiplying a fact. There is no store-side rendering of it: the
+    // ledger row is the durable record, and this counter is the reading a rule
+    // can fire on.
+    ("llm_owner_budget_refusals_total", MetricDerivation::Process),
+    // Counted on the request path in the gateway that served the call, so a
+    // sum over processes counts calls rather than multiplying a fact; the
+    // spend itself is elsewhere, on the ledger-derived token totals.
+    (
+        "llm_owner_budget_soft_crossings_total",
+        MetricDerivation::Process,
+    ),
     ("llm_usage_readings_total", MetricDerivation::Process),
 ];
 

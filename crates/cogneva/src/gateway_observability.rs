@@ -339,6 +339,17 @@ impl cog_core::LlmUsageLedger for DeferredSink<dyn cog_core::LlmUsageLedger> {
         self.ledger()?.spend_by_workspace_since(since_unix).await
     }
 
+    /// 整本账当天的总量：平台那一格唯一的数据来源。漏掉这条转发，全局摸到的是
+    /// trait 的默认实现——每一拍都答「这个账本不报总量」，平台的日上限就永远
+    /// 停在没人写过的 0 上，配了也不执法。
+    async fn spend_total_since(&self, since_unix: i64) -> Result<u64, String> {
+        self.ledger()?.spend_total_since(since_unix).await
+    }
+
+    async fn refusals_total_since(&self, since_unix: i64) -> Result<u64, String> {
+        self.ledger()?.refusals_total_since(since_unix).await
+    }
+
     /// 两路拒绝数与两路花销走同一个出口：它们读的是同一批行，接不上时要说
     /// 「读不到」。漏掉这两条转发的后果不是少一列数，而是整条排行 500——
     /// 花销读得出、拒绝读不出，调用方得到的是一张读不成的表。
@@ -814,6 +825,16 @@ mod tests {
         ) -> Result<Vec<(String, u64)>, String> {
             unimplemented!("这一格只读不写")
         }
+        // 平台那一格读的是这两个数。它们同样走槽的转发：漏掉的话，trait 的默认
+        // 实现会让全局投影与平台排行都答「这个账本不报」——配了的平台上限永远不执法。
+        async fn spend_total_since(&self, _: i64) -> Result<u64, String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(5_000)
+        }
+        async fn refusals_total_since(&self, _: i64) -> Result<u64, String> {
+            self.refusal_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(4)
+        }
         // 两路拒绝数与花销在同一张排行上，替身也得答得出：转发漏掉任何一条，
         // 生产上拿到的是「花销读得出、拒绝读不出」，整条排行报错。
         async fn refusals_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
@@ -950,6 +971,31 @@ mod tests {
             refusal_reads.load(Ordering::SeqCst),
             2,
             "两路拒绝数各要走一次转发：少了哪一条，那一级排行就整条读不出来"
+        );
+
+        // 平台那一格的两读同样要落到真账本上。它们不在这条排行之外：全局投影每拍
+        // 读一次总量，配额排行按 `scope=global` 读同一条。
+        assert_eq!(
+            slot.spend_total_since(0).await.expect("总量要落到真账本"),
+            5_000,
+            "整本账当天的总量走同一条转发"
+        );
+        assert_eq!(
+            slot.refusals_total_since(0)
+                .await
+                .expect("平台的拒绝数要落到真账本"),
+            4,
+            "平台那一级的拒绝数走同一条转发"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "总量那一读也要经过账本，而不是被槽答了"
+        );
+        assert_eq!(
+            refusal_reads.load(Ordering::SeqCst),
+            3,
+            "平台的拒绝数是第三路，缺它全局排行就只有花销没有拒绝"
         );
     }
 }

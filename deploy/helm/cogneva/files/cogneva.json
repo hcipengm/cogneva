@@ -2333,6 +2333,26 @@
           "face": "token 管理"
         },
         {
+          "name": "llm_owner_budget_refusals_sustained",
+          "promql": "sum by (scope, owner, workspace) (increase(llm_owner_budget_refusals_total[15m])) > 2",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "info",
+          "summary": "Calls refused by a person's or a tenant's daily quota -- {value} of them in the last fifteen minutes for `owner`/`workspace` at `scope`. A single refusal is the ceiling doing its job and the caller was told when it resets, so it is not news. Three or more inside one window is not a caller being told once: it is a workload that keeps asking after it was stopped, and there are two ways to arrive here -- the ceiling is too low for the work it is supposed to fund, or the caller is retrying a call that cannot succeed until the next UTC midnight. The `scope` label names which repair: `user` is one person's ceiling (raise it, or move the work under a person with room), `ws` is the tenant's (raise the tenant's ceiling, or the work does not belong to a tenant with that budget), and `global` is the platform's whole day (raise it in the quota admin under `global/platform`, or find which work is spending past what the platform is meant to fund). The subject is split across `owner` and `workspace` rather than a single key because the two ids come from different tables, and a sum over one key holding both would merge a person with a tenant without saying so; the half that does not apply is empty, and an empty subject means the level enforced had no id to name. Refused calls spend nothing -- they never reached an upstream -- so this is not a spend reading, and `llm_calls_total` does not carry them. Counted at the refusal, so a gateway that rolled inside the window reads low here; the ledger rows are the durable record of each refusal, and today's refusals by subject are on the quota panel. Repair by finding the subject the labels name and asking why the work keeps asking: a ceiling that is right should be explained to the caller once, and one that is wrong is changed in the quota admin rather than by waiting for midnight.",
+          "face": "token 管理"
+        },
+        {
+          "name": "llm_owner_budget_over_soft_limit",
+          "promql": "sum by (scope, owner, workspace) (increase(llm_owner_budget_soft_crossings_total[30m])) > 0",
+          "condition": {
+            "greater_than": 0.0
+          },
+          "severity": "warning",
+          "summary": "Calls are still being served to `owner`/`workspace` after it passed its soft ceiling -- {value} of them in the last thirty minutes at `scope`. A soft ceiling stops nothing; it exists so this warning arrives while there is still room before the hard ceiling stops the work. The scrape could not show it until this counter existed: a subject spending past its soft line and one that never crossed look identical everywhere else, because spend and calls keep rising in both. The `scope` label says which ceiling is being approached and therefore which repair: `user` is one person's, `ws` is the tenant's, and `global` is the platform's whole day -- including the background work no person or tenant is charged for, which is the part only this level can bound; all three are changed in the quota admin rather than by anything the caller can do. Read it beside the refusal sibling: this series firing means the work is still going through, and a refusal series for the same subject means the hard ceiling has now stopped it -- the two together are the whole progression. Refused calls are not counted here; they never reached an upstream, and mixing them in would read 'already stopped' as 'still serving'. Counted on the request path, so it resets with the process; today's spend by subject is on the quota panel, and the ledger rows are the durable record of the calls that were let through.",
+          "face": "token 管理"
+        },
+        {
           "name": "llm_usage_ledger_incomplete",
           "promql": "sum by (upstream) (increase(llm_calls_total{result=\"ok\"}[1h] offset 15m)) - sum by (upstream) (increase(llm_usage_readings_total[1h15m])) > 0",
           "condition": {

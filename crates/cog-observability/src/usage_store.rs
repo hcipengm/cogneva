@@ -1317,6 +1317,48 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// 今天整个平台花掉多少 token，一个数。
+    ///
+    /// 与按人、按租户那两份读的是同一张表，但**不按任何身份折叠**：没有提交人、
+    /// 没有租户的后台工作（主线程、进化、评测）也在这一个数里。按人那一份天然
+    /// 看不见它们——没有主体就没有那一行——所以「平台今天花了多少」问不出这个
+    /// 数，只能问这里。
+    ///
+    /// 口径与那两份逐字相同（`tokens_input + tokens_output`，不含缓存命中）：
+    /// 三个格子判的是同一本账，混进第三种口径会让「全局还剩多少」与「个人剩多少」
+    /// 相加对不上，而这两个数正是操作者会并排看的那一对。
+    pub async fn spend_total_since(&self, since_unix: i64) -> anyhow::Result<u64> {
+        let row: (i64,) = sqlx::query_as(&format!(
+            "SELECT COALESCE(SUM(tokens_input + tokens_output), 0)::BIGINT
+               FROM {LEDGER_TABLE}
+              WHERE ts >= to_timestamp($1::DOUBLE PRECISION)"
+        ))
+        .bind(since_unix as f64)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.max(0) as u64)
+    }
+
+    /// 今天全局上限拒了几发。
+    ///
+    /// 与按人/按租户两份同一批行，筛的是 `refused_scope = 'global'`——结果词
+    /// 一级一个，拒绝行自己记得是哪一级咬到的，所以这里不需要再折叠一次身份。
+    pub async fn refusals_total_since(&self, since_unix: i64) -> anyhow::Result<u64> {
+        let row: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*)::BIGINT
+               FROM {LEDGER_TABLE}
+              WHERE ts >= to_timestamp($1::DOUBLE PRECISION)
+                AND result = $2
+                AND refused_scope = $3"
+        ))
+        .bind(since_unix as f64)
+        .bind(cog_core::UsageResult::RefusedByOwnerBudget.as_str())
+        .bind(cog_core::QuotaScope::Global.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0.max(0) as u64)
+    }
+
     /// 这件活算在谁头上、跑在哪个租户里，任务图里那一个答案。
     ///
     /// 判额度与记账读的是同一处：`spend_by_person_since` 把为任务做的调用算在提交
@@ -2213,6 +2255,18 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         since_unix: i64,
     ) -> Result<Vec<(String, u64)>, String> {
         LlmUsageStore::spend_by_task_since(self, task_ids, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn spend_total_since(&self, since_unix: i64) -> Result<u64, String> {
+        LlmUsageStore::spend_total_since(self, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn refusals_total_since(&self, since_unix: i64) -> Result<u64, String> {
+        LlmUsageStore::refusals_total_since(self, since_unix)
             .await
             .map_err(|e| e.to_string())
     }

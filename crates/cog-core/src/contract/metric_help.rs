@@ -109,6 +109,38 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          appearing",
     ),
     (
+        crate::metric_names::LLM_OWNER_BUDGET_REFUSALS_TOTAL.as_str(),
+        "Calls the platform's own quota refused for the day before they reached \
+         any upstream, by the level that refused (`scope`) and the subject whose \
+         ceiling was crossed (`owner` for a person, `workspace` for a tenant; \
+         the half that does not apply is empty). This is not a second reading of \
+         `llm_calls_total`: a refused call never left the gateway, so it has no \
+         cell there, and before this series existed a person stopped by their \
+         ceiling for the rest of the day was invisible on the scrape -- the same \
+         silence as someone who used nothing. The two subject keys are separate \
+         for the same reason the level is: a person id and a tenant id come \
+         from different tables, and one key holding both would merge them \
+         without saying so. Read it as a refusal rate per subject, not as spend: \
+         a refused call spent zero tokens, and the ledger row is where the \
+         refused call itself is recorded. Counted at the refusal and reset with \
+         the process, like the rest of this face",
+    ),
+    (
+        crate::metric_names::LLM_OWNER_BUDGET_SOFT_CROSSINGS_TOTAL.as_str(),
+        "Calls that were served while their subject was already past the soft \
+         ceiling, by `scope` and the subject (`owner` for a person, `workspace` \
+         for a tenant; the other key is empty). A soft ceiling stops nothing: \
+         the call goes out and the only record used to be a warning line, so \
+         the scrape could not tell a subject still spending past its soft line \
+         from one that never crossed it -- both simply kept spending. The hard \
+         refusal is the sibling series, not a cell here, because a refused call \
+         never reached an upstream and counting it would read 'already \
+         stopped' as 'still serving'. Read it as a rate of calls let through \
+         after the line was crossed; the amount spent is on the token totals, \
+         and the ledger rows say which calls they were. Counted on the request \
+         path and reset with the process",
+    ),
+    (
         crate::metric_names::LLM_USAGE_READINGS_TOTAL.as_str(),
         "What the read of each finished LLM response found, by upstream and \
          outcome. `absent` and `not_asked` both mean no number arrived, and \

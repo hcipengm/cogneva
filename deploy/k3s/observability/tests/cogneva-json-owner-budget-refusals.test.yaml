@@ -1,0 +1,131 @@
+# 额度拒绝那一条的夹具：它判的是「同一个主体在窗口里被拒了不止一次」，不是「被拒过」。
+#
+# 这条规则量的是按人/按租户的当日额度在拒绝调用时的计数。拒绝的调用一个上游都没碰过，
+# 所以 `llm_calls_total` 上没有它们的一格；在它出现之前，一个人当天被切断在抓取面上
+# 与「没花过钱」同形。夹具要钉住三件事：
+#   - 持续撞线要响，且标签里点名的是被越线那一级的主体；
+#   - 计数非零但窗口里不再涨不响（把判断写成绝对值就会在这里亮）；
+#   - 阈值是**每个主体**的，不是全平台合计：两个人各被拒一次不该凑成一条告警。
+#
+#   RULES_MANIFEST=deploy/helm/cogneva/files/cogneva.json \
+#   RULES_CASE=deploy/k3s/observability/tests/cogneva-json-owner-budget-refusals.test.yaml \
+#   bash deploy/scripts/test-acceptance-census-alert-rules.sh
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: llm_owner_budget_refusals_sustained
+# rule: llm_owner_budget_over_soft_limit
+
+evaluation_interval: 1m
+
+tests:
+  # 一、一个人每分钟被拒一次，十五分钟十五条：持续撞线，必须响，且点名这个人。
+  - interval: 1m
+    input_series:
+      - series: 'llm_owner_budget_refusals_total{scope="user",owner="u-1",workspace="",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+1x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_owner_budget_refusals_sustained
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              scope: user
+              owner: u-1
+
+  # 二、负对照：计数一直停在五、窗口里不再涨。绝对值非零但增量是零——这一格是
+  # 「判成存在性」那个写法的反例，它若把 `increase` 换成裸比较就会在这里亮。
+  - interval: 1m
+    input_series:
+      - series: 'llm_owner_budget_refusals_total{scope="user",owner="u-1",workspace="",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '5x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_owner_budget_refusals_sustained
+        exp_alerts: []
+
+  # 三、窗口里只被拒了一次：告诉过调用方一次就该由他自己调整，不该叫醒运维。
+  - interval: 1m
+    input_series:
+      - series: 'llm_owner_budget_refusals_total{scope="user",owner="u-1",workspace="",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+1x1 1x19'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_owner_budget_refusals_sustained
+        exp_alerts: []
+
+  # 四、阈值按主体算：两个人各自被拒一次、合计两次，不凑成一条。规则按
+  # `scope, owner, workspace` 分组，这条就是那个分组在说「别把人合并掉」。
+  - interval: 1m
+    input_series:
+      - series: 'llm_owner_budget_refusals_total{scope="user",owner="u-1",workspace="",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+1x1 1x19'
+      - series: 'llm_owner_budget_refusals_total{scope="user",owner="u-2",workspace="",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+1x1 1x19'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_owner_budget_refusals_sustained
+        exp_alerts: []
+
+  # 五、租户那一级：越线的是租户，主体落在 `workspace`，`owner` 留空。同一窗口里
+  # 另有一个人的拒绝只被拒一次——它不该出现在这条告警里，否则读的人会把租户的越线
+  # 读成某个人的。
+  - interval: 1m
+    input_series:
+      - series: 'llm_owner_budget_refusals_total{scope="ws",owner="",workspace="ws-1",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+1x20'
+      - series: 'llm_owner_budget_refusals_total{scope="user",owner="u-1",workspace="",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+1x1 1x19'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_owner_budget_refusals_sustained
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              scope: ws
+              workspace: ws-1
+
+  # 六、软上限：越线之后**仍然放行**的调用按次计数，窗口里还在放行就响。它回答的是
+  # 「硬拒绝之前还有没有余地」——软线不拦任何调用，所以只在日志里留一行的时候，这个
+  # 主体在抓取面上与一个从没越线的主体同形。
+  - interval: 1m
+    input_series:
+      - series: 'llm_owner_budget_soft_crossings_total{scope="user",owner="u-1",workspace="",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_owner_budget_over_soft_limit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scope: user
+              owner: u-1
+
+  # 七、负对照：计数停在七、窗口里不再有放行的调用。越线过一次但已经不来了，这条就
+  # 该安静——绝对值非零不构成「还在放行」。
+  - interval: 1m
+    input_series:
+      - series: 'llm_owner_budget_soft_crossings_total{scope="user",owner="u-1",workspace="",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '7x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_owner_budget_over_soft_limit
+        exp_alerts: []
+
+  # 八、租户软线：主体落在 `workspace`；同一窗口里另一个人的硬拒绝不该被这一条读成
+  # 软跨越——被拒的调用没有发出去，两条序列分开正是因为「已经停了」与「还在放行」的
+  # 修法相反。
+  - interval: 1m
+    input_series:
+      - series: 'llm_owner_budget_soft_crossings_total{scope="ws",owner="",workspace="ws-1",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+1x40'
+      - series: 'llm_owner_budget_refusals_total{scope="user",owner="u-2",workspace="",pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: llm_owner_budget_over_soft_limit
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              scope: ws
+              workspace: ws-1

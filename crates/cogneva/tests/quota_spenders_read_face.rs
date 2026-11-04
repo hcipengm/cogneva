@@ -37,8 +37,11 @@ use crate::router_state;
 struct FakeSpend {
     people: Vec<(String, u64)>,
     workspaces: Vec<(String, u64)>,
+    /// 整本账当天的总量：全局那一级读的就是这一个数。
+    total: u64,
     refused_people: Vec<(String, u64)>,
     refused_workspaces: Vec<(String, u64)>,
+    refused_total: u64,
     /// 读面交给账本的起点。判据用它确认窗口是 UTC 日，不是「最近 N 小时」。
     since: AtomicI64,
 }
@@ -54,10 +57,32 @@ impl FakeSpend {
         Arc::new(Self {
             people: pairs(people),
             workspaces: pairs(workspaces),
+            total: 0,
             refused_people: Vec::new(),
             refused_workspaces: Vec::new(),
+            refused_total: 0,
             since: AtomicI64::new(0),
         })
+    }
+
+    /// 整本账当天的总量。与人、租户两份故意可以不一致：差的正是没有归属的花销。
+    fn with_total(self: Arc<Self>, total: u64) -> Arc<Self> {
+        let mut me = match Arc::try_unwrap(self) {
+            Ok(me) => me,
+            Err(_) => panic!("还握着第二个句柄"),
+        };
+        me.total = total;
+        Arc::new(me)
+    }
+
+    /// 平台那一格今天拒掉了这么多发。
+    fn refusing_in_total(self: Arc<Self>, refusals: u64) -> Arc<Self> {
+        let mut me = match Arc::try_unwrap(self) {
+            Ok(me) => me,
+            Err(_) => panic!("还握着第二个句柄"),
+        };
+        me.refused_total = refusals;
+        Arc::new(me)
     }
 
     /// 同一天里另外还有这些拒绝。单独一个入口，只给判「被拒」的用例用。
@@ -89,6 +114,20 @@ impl LlmUsageLedger for FakeSpend {
     ) -> Result<Vec<(String, u64)>, String> {
         self.since.store(since_unix, Ordering::SeqCst);
         Ok(self.workspaces.clone())
+    }
+
+    async fn spend_total_since(&self, since_unix: i64) -> Result<u64, String> {
+        self.since.store(since_unix, Ordering::SeqCst);
+        Ok(self.total)
+    }
+
+    async fn refusals_total_since(&self, since_unix: i64) -> Result<u64, String> {
+        assert_eq!(
+            since_unix,
+            self.since.load(Ordering::SeqCst),
+            "花销与拒绝必须读同一个窗口"
+        );
+        Ok(self.refused_total)
     }
 
     async fn refusals_by_person_since(
@@ -218,6 +257,8 @@ impl LlmUsageLedger for FakeSpend {
 struct FakeCeilings {
     user: Vec<(String, QuotaLimits)>,
     workspace: Vec<(String, QuotaLimits)>,
+    /// 全局只有一格；`None` 是「没人给平台配过上限」。
+    global: Option<QuotaLimits>,
 }
 
 impl FakeCeilings {
@@ -231,7 +272,18 @@ impl FakeCeilings {
                 .into_iter()
                 .map(|(id, limits)| (id.to_string(), limits))
                 .collect(),
+            global: None,
         })
+    }
+
+    /// 给平台那一格配一对上限。
+    fn with_global(self: Arc<Self>, limits: QuotaLimits) -> Arc<Self> {
+        let mut me = match Arc::try_unwrap(self) {
+            Ok(me) => me,
+            Err(_) => panic!("还握着第二个句柄"),
+        };
+        me.global = Some(limits);
+        Arc::new(me)
     }
 }
 
@@ -255,6 +307,8 @@ impl HierarchyManager for FakeCeilings {
         let table = match scope {
             QuotaScope::User => &self.user,
             QuotaScope::Workspace => &self.workspace,
+            // 全局只有一格，名字由读出面的那一行给出。
+            QuotaScope::Global => return Ok(self.global),
             // 这两级根本没有花销路径，路由在到达这里之前就拒了。
             other => unimplemented!("{other:?} 没有读面"),
         };
@@ -423,11 +477,47 @@ async fn a_workspace_scope_reads_tenant_totals_with_their_own_ceilings() {
     );
 }
 
+/// 平台那一级读的是整本账当天的总量，一行，且是那一格自己的上限。
+///
+/// 不按身份折叠：没有提交人、没有租户的后台花销也在里面。读面若把它折叠成人的
+/// 合计，读的人就会拿「有归属的那部分」去比平台上限，而它要防的正是另一半。
+#[tokio::test]
+async fn the_global_scope_reads_one_row_of_the_whole_day_beside_the_platform_ceiling() {
+    // 人、租户两份都比总量小：差的那部分是没人认领的花销。
+    let ledger = FakeSpend::with(vec![("u-heavy", 900)], vec![("ws-big", 700)])
+        .with_total(5_000)
+        .refusing_in_total(3);
+    let ceilings = FakeCeilings::with(vec![("u-heavy", QuotaLimits::new(800, 1000))], vec![])
+        .with_global(QuotaLimits::new(4_000, 5_000));
+    let (status, body) = get(
+        state(ledger, Some(ceilings)),
+        "/api/v1/observability/token-usage/spenders?scope=global",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(body["scope"], "global");
+    assert_eq!(body["total"], 5_000, "总数是整本账当天的量");
+    let rows = body["spenders"].as_array().expect("排行是数组");
+    assert_eq!(rows.len(), 1, "平台只有一格：它列出来正好一行");
+    assert_eq!(rows[0]["id"], "platform", "这一格的名字是固定的");
+    assert_eq!(rows[0]["tokens"], 5_000);
+    assert_eq!(
+        rows[0]["refusals"], 3,
+        "平台这一级被拒的发数就是 `refused_scope = global` 那一行"
+    );
+    assert_eq!(
+        rows[0]["hard_limit"], 5_000,
+        "带的是平台自己那一格的上限，不是某个人或某个租户的"
+    );
+    assert_eq!(rows[0]["remaining"], 0, "已经越过硬上限时余量是 0");
+}
+
 /// 没有花销路径的层级拒答；答一份空账会被读成「今天没人花」。
 #[tokio::test]
 async fn a_level_no_call_is_charged_to_is_refused_rather_than_read_as_an_empty_day() {
     let ledger = FakeSpend::with(vec![("u-1", 10)], vec![]);
-    for scope in ["team", "org", "global"] {
+    for scope in ["team", "org"] {
         let (status, body) = get(
             state(ledger.clone(), None),
             &format!("/api/v1/observability/token-usage/spenders?scope={scope}"),

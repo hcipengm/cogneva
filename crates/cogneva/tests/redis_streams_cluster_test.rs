@@ -31,6 +31,7 @@ async fn redis_available() -> bool {
 fn make_task(id: &str, task_type: TaskType, blocked_by: Vec<String>, workspace: &str) -> Task {
     let now = Utc::now();
     Task {
+        submitted_by: None,
         id: id.into(),
         task_type,
         status: TaskStatus::Pending,

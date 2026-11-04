@@ -1242,6 +1242,47 @@ metric_names! {
     // cog-gateway — LLM pool and upstream health.
     LLM_CALLS_TOTAL => "llm_calls_total",
     LLM_CALL_LATENCY_MS => "llm_call_latency_ms",
+    // A call the platform's own quota refused before it ever reached an
+    // upstream, by the level that refused (`scope`: `user` or `ws`) and the
+    // subject holding the ceiling.
+    //
+    // `llm_calls_total` cannot carry this: it counts calls that were made, and
+    // a refused call never left the gateway. So the only places a refusal was
+    // visible were the ledger row and the caller's own 402 -- an operator
+    // watching the scrape saw a person or a tenant stopped for the day as
+    // exactly the same silence as one that simply used nothing. The subject is
+    // split into `owner` and `workspace` rather than one `subject` keyed by
+    // `scope`, because the two ids come from different tables and a single key
+    // holding both would let a sum mix a person with a tenant without saying
+    // so; the half that does not apply is empty, never invented. A series
+    // exists only for a subject an operator has given a ceiling to -- that set
+    // is configuration, not request input, so its size is bounded by the quota
+    // table rather than by traffic.
+    //
+    // Counted at the refusal, so it starts over with the process like every
+    // other counter on this face. The ledger row stays the durable record of
+    // which call was refused; this is the reading a rule can fire on, and the
+    // two are written from one branch so they cannot disagree about whether a
+    // refusal happened.
+    LLM_OWNER_BUDGET_REFUSALS_TOTAL => "llm_owner_budget_refusals_total",
+    // Calls that were let through while their subject was already past the soft
+    // ceiling, by the same `scope` / `owner` / `workspace` axes as the refusals
+    // above.
+    //
+    // A soft ceiling does not stop anything: the call is served, a warning line
+    // is logged, and until this counter existed that was the whole record. The
+    // scrape therefore showed a subject that had crossed its soft ceiling and
+    // one that had not as the same shape -- spend and calls keep rising in both
+    // -- so the cheap early warning, the one that arrives before the hard
+    // ceiling stops the work, was unreadable exactly when it mattered. Read it
+    // as "still spending past the soft ceiling", not as spend: the amount is on
+    // the token totals, and this says whether anything is still coming through
+    // after the line was crossed.
+    //
+    // The hard refusal is the sibling series, not a cell here: a refused call
+    // never reached an upstream, so counting it as a soft crossing would mix
+    // "still serving" with "already stopped".
+    LLM_OWNER_BUDGET_SOFT_CROSSINGS_TOTAL => "llm_owner_budget_soft_crossings_total",
     // Rendered from the usage ledger on the pool's cadence, never accumulated
     // on the request path: the call that spent the tokens already landed a row,
     // so a tally beside the ledger is a second book that parts company with it

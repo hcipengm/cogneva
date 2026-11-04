@@ -838,11 +838,18 @@ pub async fn token_spenders_handler(
     let rows = match scope {
         cog_core::QuotaScope::User => ledger.spend_by_person_since(since_unix).await,
         cog_core::QuotaScope::Workspace => ledger.spend_by_workspace_since(since_unix).await,
+        // 全局只有一个主体，所以它列出来正好一行：整个平台今天花掉的量。这一行
+        // 必须出现（哪怕值为 0），因为读它的人要拿它去比「配过的上限还剩多少」，
+        // 而空列表会读成「今天没人花」，那与「后台工作全停了」同形。
+        cog_core::QuotaScope::Global => ledger
+            .spend_total_since(since_unix)
+            .await
+            .map(|total| vec![(crate::GLOBAL_QUOTA_TARGET.to_string(), total)]),
         // Refused above by the same judge that accepted the write face; a new
         // enforceable level has to pass through `scope_enforcement` first.
-        cog_core::QuotaScope::Team
-        | cog_core::QuotaScope::Organization
-        | cog_core::QuotaScope::Global => unreachable!("refused by scope_enforcement"),
+        cog_core::QuotaScope::Team | cog_core::QuotaScope::Organization => {
+            unreachable!("refused by scope_enforcement")
+        }
     }
     .map_err(|e| ApiError::internal(format!("failed to read today's spend: {e}")))?;
     // The refusals are a second read of the same day and the same rows: a
@@ -853,9 +860,15 @@ pub async fn token_spenders_handler(
     let refusals = match scope {
         cog_core::QuotaScope::User => ledger.refusals_by_person_since(since_unix).await,
         cog_core::QuotaScope::Workspace => ledger.refusals_by_workspace_since(since_unix).await,
-        cog_core::QuotaScope::Team
-        | cog_core::QuotaScope::Organization
-        | cog_core::QuotaScope::Global => unreachable!("refused by scope_enforcement"),
+        // 全局那一格的拒绝行自己带着 `refused_scope = 'global'`，不需要再折叠一次
+        // 身份；今天的拒绝总数就是这一行。
+        cog_core::QuotaScope::Global => ledger
+            .refusals_total_since(since_unix)
+            .await
+            .map(|n| vec![(crate::GLOBAL_QUOTA_TARGET.to_string(), n)]),
+        cog_core::QuotaScope::Team | cog_core::QuotaScope::Organization => {
+            unreachable!("refused by scope_enforcement")
+        }
     }
     .map_err(|e| ApiError::internal(format!("failed to read today's refusals: {e}")))?;
 

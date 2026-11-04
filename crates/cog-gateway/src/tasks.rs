@@ -705,7 +705,11 @@ fn row_with_zero_budget(req: &CreateTaskRequest) -> Option<&str> {
         .map(|item| item.id.as_str())
 }
 
-fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
+fn submitted_tasks(
+    req: &CreateTaskRequest,
+    goal_id: &str,
+    submitted_by: Option<&str>,
+) -> Vec<Task> {
     let mut rows: Vec<Task> = req
         .tasks
         .as_ref()
@@ -725,6 +729,9 @@ fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
                     task.agent_id = item.agent_id.clone();
                     task.face_id = item.face_id.clone();
                     task.owner_unit = item.unit_id.clone();
+                    // 提交人从令牌来，不从请求体来：这一格决定谁的当日额度，一个
+                    // 能自己填它的调用方等于能把自己的花销记到别人头上。
+                    task.submitted_by = submitted_by.map(str::to_string);
                     // The stated budget replaces the row default rather than
                     // being layered under it: a submitter that says "this stays
                     // open for a week" is answering the same question the
@@ -908,7 +915,11 @@ pub async fn create_task_handler(
         }
     }
 
-    let tasks: Vec<Task> = submitted_tasks(&req, &goal_id);
+    // 提交人取自已验过的令牌，和上面那两处判据读的是同一个字段：一处判权限，
+    // 一处记在账上，两处要是各读各的，会出现「按 A 判了权限、记到 B 头上」。
+    // 没有令牌的提交（平台自己的零凭证面）不编一个名字。
+    let submitted_by = claims.as_ref().map(|axum::Extension(c)| c.sub.clone());
+    let tasks: Vec<Task> = submitted_tasks(&req, &goal_id, submitted_by.as_deref());
 
     // 异步受理：goal 分解需要多轮 LLM 调用（实测 50-90s），远超网关超时层。
     // 同步等待会在超时后丢弃 future，分解结果永远注入不了 DAG（2026-08-06
@@ -2289,7 +2300,7 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Goal,
         };
-        let tasks = submitted_tasks(&req, "goal-1");
+        let tasks = submitted_tasks(&req, "goal-1", None);
         assert_eq!(tasks.len(), 1, "a bare goal must still be addressable");
         assert_eq!(
             tasks[0].id, "goal-1",
@@ -2325,7 +2336,7 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Goal,
         };
-        let tasks = submitted_tasks(&req, "goal-9");
+        let tasks = submitted_tasks(&req, "goal-9", None);
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].id, "case-1");
         assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-9"));
@@ -2343,7 +2354,7 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Goal,
         };
-        let tasks = submitted_tasks(&req, "goal-empty");
+        let tasks = submitted_tasks(&req, "goal-empty", None);
         assert_eq!(tasks.len(), 1, "an empty array is still a bare goal");
         assert_eq!(tasks[0].id, "goal-empty");
         assert_eq!(tasks[0].goal_id.as_deref(), Some("goal-empty"));
@@ -2462,7 +2473,7 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Task,
         };
-        let tasks = submitted_tasks(&req, "g");
+        let tasks = submitted_tasks(&req, "g", None);
         assert_eq!(tasks[0].face_id.as_deref(), Some("task-management"));
         assert_eq!(tasks[0].owner_unit.as_deref(), Some("worker"));
     }
@@ -2482,7 +2493,7 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Task,
         };
-        let tasks = submitted_tasks(&req, "g");
+        let tasks = submitted_tasks(&req, "g", None);
         assert_eq!(tasks.len(), 2);
         for t in &tasks {
             let meta = t
@@ -2505,7 +2516,7 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Goal,
         };
-        let tasks = submitted_tasks(&req, "g");
+        let tasks = submitted_tasks(&req, "g", None);
         assert!(
             tasks[0].action_planner_meta.is_none(),
             "a goal's rows are decomposed even when one of them claims to be verified"
@@ -2530,7 +2541,7 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Task,
         };
-        let tasks = submitted_tasks(&req, "g");
+        let tasks = submitted_tasks(&req, "g", None);
         assert_eq!(
             tasks[0].acceptance,
             vec![
@@ -2557,7 +2568,7 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Task,
         };
-        let tasks = submitted_tasks(&req, "g");
+        let tasks = submitted_tasks(&req, "g", None);
         assert_eq!(
             tasks[0].timeout_seconds,
             7 * 24 * 60 * 60,
@@ -2576,7 +2587,7 @@ mod tests {
             priority: None,
             intent_kind: IntentKind::Task,
         };
-        let tasks = submitted_tasks(&req, "g");
+        let tasks = submitted_tasks(&req, "g", None);
         assert_eq!(tasks[0].timeout_seconds, 300);
     }
 
@@ -2622,6 +2633,26 @@ mod tests {
             ])),
             Some("silent-1")
         );
+    }
+
+    /// 提交人跟着任务行走，而且只从令牌来。
+    ///
+    /// 这一格决定谁的当日额度，所以「没有令牌」必须读作「没有这个人」而不是某个
+    /// 默认名：编一个出来会让平台自己的活记到一个不存在的人头上，比不记更难查。
+    #[test]
+    fn a_submitted_row_carries_the_person_the_token_named() {
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "do the thing".into(),
+            tasks: Some(vec![task_item("t1", None)]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let named = submitted_tasks(&req, "goal-1", Some("u-1"));
+        assert_eq!(named[0].submitted_by.as_deref(), Some("u-1"));
+        let anonymous = submitted_tasks(&req, "goal-1", None);
+        assert_eq!(anonymous[0].submitted_by, None);
     }
 
     /// 目标提交不受这条约束：它交给分解，验收标准由规划给出，提交时不要求写。
