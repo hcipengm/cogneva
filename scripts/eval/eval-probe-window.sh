@@ -11,8 +11,11 @@
 #
 # 用法：eval-probe-window.sh [--interval 180] [--until <unix>]
 set -u
-URL=${URL:-http://10.43.158.118:8081/v1/chat/completions}
-MODEL=${MODEL:-ark-code-latest}
+# 打哪一面、问哪个模型，都由调用方给：这里的默认值曾经是一个集群内地址和一个厂商的
+# 模型名，两者都不该跟着这个脚本走——地址换个集群就不对，模型名把「用哪一家」写进了
+# 探针本身，而这套平台的对等要求是业务侧零厂商名。缺了就明说缺什么，不猜一个默认值
+# 去发一个必然失败的请求（那会读成「池子关着」）。这条只在真发请求时才问：离线读一份
+# 历史正文（--pace / --estimate）不需要知道打哪一面。
 INTERVAL=${INTERVAL:-180}
 UNTIL=${UNTIL:-$(( $(date +%s) + 21600 ))}
 LOG=${LOG:-$HOME/eval-runs/.runner/rerun.log}
@@ -55,6 +58,9 @@ while [ $# -gt 0 ]; do
     *) echo "unknown option: $1" >&2; exit 2;;
   esac
 done
+
+URL=${URL:?set URL to the gateway chat-completions endpoint for the face this run uses}
+MODEL=${MODEL:?set MODEL to the model this run asks for}
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" | tee -a "$LOG"; }
 

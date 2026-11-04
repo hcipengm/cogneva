@@ -62,6 +62,23 @@ report "$(bash "$PROBE" --estimate 48516 392578 0)" "unknown" \
 report "$(bash "$PROBE" --estimate "" 392578 200)" "unknown" \
     "缺一个量时报 unknown，不当成 0 算"
 
+# 探针要打哪一面、问哪个模型，调用方给；脚本里不带默认值。默认值曾经是一个集群内地址
+# 和一个厂商的模型名——地址换个集群就不对，模型名把「用哪一家」写死进了探针。缺了就
+# 明说缺什么，退出码不为 0：静默地拿一个默认地址发请求，读出来的是「池子关着」，与
+# 「没人配过这一面」同形。
+err=$(bash "$PROBE" --until 0 2>&1); rc=$?
+case "$rc:$err" in
+    0:*) printf 'FAIL  缺 URL 时它照常跑起来了（rc=0）——默认值又回来了？\n' >&2; fail=$((fail + 1)) ;;
+    *"set URL"*) report "named" "named" "缺 URL 时点名要 URL，不猜一个默认地址" ;;
+    *) printf 'FAIL  缺 URL 时报的不是那件事：rc=%s 输出=%s\n' "$rc" "$err" >&2; fail=$((fail + 1)) ;;
+esac
+err=$(URL=http://127.0.0.1:1/v1/chat/completions bash "$PROBE" --until 0 2>&1); rc=$?
+case "$rc:$err" in
+    0:*) printf 'FAIL  缺 MODEL 时它照常跑起来了（rc=0）——默认值又回来了？\n' >&2; fail=$((fail + 1)) ;;
+    *"set MODEL"*) report "named" "named" "缺 MODEL 时点名要 MODEL，不猜一个厂商的名字" ;;
+    *) printf 'FAIL  缺 MODEL 时报的不是那件事：rc=%s 输出=%s\n' "$rc" "$err" >&2; fail=$((fail + 1)) ;;
+esac
+
 if [ "$fail" -ne 0 ]; then
     printf '\n%d 通过，%d 失败\n' "$pass" "$fail" >&2
     exit 1
