@@ -910,6 +910,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/admin/llm-config",
             post(llm_admin::llm_config_handler),
         )
+        // 从池里点名删掉几家。保存只会新增或更新，减少池只有这一条路——页面上的
+        // "删除"按钮走这里。
+        .route(
+            "/api/v1/admin/llm-config/remove",
+            post(llm_admin::remove_upstreams_handler),
+        )
         // The search/fetch fallback pool: the page writes keys here, the
         // gateway patches the out-of-band Secret and rolls itself. Reading
         // never returns key material.
@@ -1281,6 +1287,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route(
             "/api/v1/audit/events",
             get(audit::list_audit_events_handler),
+        )
+        // 另一本账：平台自己做过的事（配额拒绝、授权、变更、上游池改成了什么样）。
+        // 上面那一本记的是 hook 归档，两本各回答一种问题。
+        .route(
+            "/api/v1/audit/stream",
+            get(audit::list_audit_stream_handler),
         )
         .route(
             "/api/v1/audit/events/{id}",

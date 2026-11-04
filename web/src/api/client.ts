@@ -356,6 +356,44 @@ export interface LlmBackend {
 export interface LlmStatus {
   configured: boolean;
   backends: LlmBackend[];
+  /**
+   * 池里现有的成员，每格是 `base_url|model`。只有名字、没有 key——凭证从不
+   * 回显。设置页靠这一格把"池里已经有哪些"画出来，删除按钮点名的也是它。
+   */
+  upstream_names?: string[];
+}
+
+/**
+ * 平台自己那本账上的一条（哈希链）。与审计归档（hook 事件）是两本账：
+ * 这一本记的是平台做过的事——配额拒绝、授权、变更、上游池被谁改成什么样。
+ */
+export interface AuditStreamEvent {
+  seq: number;
+  timestamp: string;
+  kind: unknown;
+  actor: string;
+  target: string;
+  action: string;
+  detail: unknown;
+}
+
+export interface AuditStreamPage {
+  /** 符合筛选条件的有几条（这一页只给最近 `limit` 条）。 */
+  matched: number;
+  items: AuditStreamEvent[];
+}
+
+export async function listAuditStream(params: {
+  action?: string;
+  actor?: string;
+  limit?: number;
+} = {}): Promise<AuditStreamPage> {
+  const q = new URLSearchParams();
+  if (params.action) q.set('action', params.action);
+  if (params.actor) q.set('actor', params.actor);
+  if (params.limit) q.set('limit', String(params.limit));
+  const suffix = q.toString();
+  return api.get<AuditStreamPage>(`/api/v1/audit/stream${suffix ? `?${suffix}` : ''}`);
 }
 
 export interface LlmConfigPayload {
@@ -378,8 +416,32 @@ export async function getLlmStatus(): Promise<LlmStatus> {
  * 声明一个没人读的形状，就等于给下一个读者留一份会与手写的响应悄悄分家的
  * 第二份字段表。
  */
-export async function saveLlmConfig(payload: LlmConfigPayload): Promise<void> {
-  await api.post<unknown>('/api/v1/admin/llm-config', payload);
+/**
+ * 一次写入之后池里是哪几家。
+ *
+ * 服务端写完之后重新读一遍池再回报，所以这一格是"改后"的实测，不是请求里那几家：
+ * 保存只并入、不删没点名的成员，按请求回报会把留下来的别人漏掉。读不到时是
+ * `null`——那表示"这一读没成功"，不是"池空了"。
+ */
+export interface LlmPoolAfter {
+  upstream_names?: string[] | null;
+  min_healthy?: number | null;
+}
+
+export async function saveLlmConfig(payload: LlmConfigPayload): Promise<LlmPoolAfter> {
+  return api.post<LlmPoolAfter>('/api/v1/admin/llm-config', payload);
+}
+
+/**
+ * 从池里删掉一家。保存只会新增或更新，减少池只有这一条路——所以这个函数只在
+ * 运营者明确点了"删除"之后被调用，不能在任何"保存"路径里出现。
+ *
+ * `name` 用 `base_url|model`，与 `upstream_names` 的每一格同形。
+ */
+export async function removeLlmUpstream(name: string): Promise<LlmPoolAfter> {
+  return api.post<LlmPoolAfter>('/api/v1/admin/llm-config/remove', {
+    names: [name],
+  });
 }
 
 // ── 上网检索与抓取的后备池 ──

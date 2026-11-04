@@ -590,7 +590,7 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
   -d '{"base_url":"https://api.deepseek.com","model":"deepseek-flash","api_key":"sk-..."}'
 ```
 
-安全网关持有上游故障转移池：主上游 429（限流）/ 402（额度耗尽）时自动切下一个上游。通过 `extra_upstreams` 追加备用上游——所有 key 只落在网关 Secret：
+安全网关持有上游故障转移池：主上游 429（限流）/ 402（额度耗尽）时自动切下一个上游。保存只会新增或更新这次点名的上游，池里其他成员原样保留；删除是另一次明确的调用 `POST /api/v1/admin/llm-config/remove`，体是 `{"names":["https://api.deepseek.com|deepseek-flash"]}`（与状态接口列出的 `base_url|model` 同形）。通过 `extra_upstreams` 追加备用上游——所有 key 只落在网关 Secret：
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/admin/llm-config \

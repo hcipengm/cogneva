@@ -594,7 +594,7 @@ curl -X POST http://localhost:8080/api/v1/admin/llm-config \
   -d '{"base_url":"https://api.deepseek.com","model":"deepseek-flash","api_key":"sk-..."}'
 ```
 
-The security gateway holds a failover pool of upstreams: on 429 (rate limit) / 402 (quota exhausted) it switches to the next upstream. Add backups via `extra_upstreams` — all keys stay in the gateway Secret only:
+The security gateway holds a failover pool of upstreams: on 429 (rate limit) / 402 (quota exhausted) it switches to the next upstream. Saving only ever adds or updates the upstreams it names — an entry already in the pool is replaced, everything else stays. Removing one is a separate, explicit call: `POST /api/v1/admin/llm-config/remove` with `{"names":["https://api.deepseek.com|deepseek-flash"]}` (the same `base_url|model` spelling the status API lists). Add backups via `extra_upstreams` — all keys stay in the gateway Secret only:
 
 ```bash
 curl -X POST http://localhost:8080/api/v1/admin/llm-config \

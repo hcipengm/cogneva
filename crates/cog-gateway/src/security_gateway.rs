@@ -10345,17 +10345,18 @@ async fn internal_llm_status_handler(
         Ok(kube) => kube.secret_pool_policy().await.ok().flatten(),
         Err(_) => None,
     };
-    let (upstreams, declared) = match from_file {
-        Some(pool) => (
-            pool.get("upstreams").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-            pool.get("min_healthy")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize),
-        ),
+    let (upstreams, declared, names) = match from_file {
+        Some(pool) => (pool.upstreams, pool.min_healthy, pool.names),
         // 读不到文件就报本进程正在用的那份：那不是「没配」，那是「正在用的」。
         None => (
             state.config.llm_upstreams.len(),
             state.config.llm_pool_min_healthy,
+            state
+                .config
+                .llm_upstreams
+                .iter()
+                .map(|u| format!("{}|{}", u.base_url, u.model))
+                .collect(),
         ),
     };
     (
@@ -10364,6 +10365,9 @@ async fn internal_llm_status_handler(
             "configured": upstreams > 0,
             "upstreams": upstreams,
             "min_healthy": declared,
+            // 名字不带 key：主应用要用它把「改前是哪几家」写进审计，而凭证只留在
+            // 这个进程里。指标的 `upstream` 标签本来就是同一串。
+            "names": names,
         })),
     )
         .into_response()
@@ -10389,6 +10393,17 @@ async fn secret_patch_handler(
         b64: bool,
         #[serde(default)]
         restart: bool,
+        /// 上游池的编辑指令。主应用看不见别家的 key，所以"并入"只能在这里做：
+        /// 这一支要读一遍现有的池，把请求没提到的成员原样带进这次写入。
+        #[serde(default)]
+        pool_edit: Option<PoolEditRequest>,
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct PoolEditRequest {
+        #[serde(default)]
+        keep_unnamed: bool,
+        #[serde(default)]
+        remove: Vec<String>,
     }
     let req: PatchRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -10400,8 +10415,25 @@ async fn secret_patch_handler(
                 .into_response();
         }
     };
+    let mut fields = req.fields;
+    if let Some(edit) = req.pool_edit {
+        match crate::llm_admin::merge_pool_edit_into_fields(fields, edit.keep_unnamed, &edit.remove)
+            .await
+        {
+            Ok(merged) => fields = merged,
+            Err(e) => {
+                // 拒绝的理由（"池里没有名叫 X 的上游"、"不能把池删空"）是写给运营者
+                // 看的，原样回给主应用，别压成一个 502。
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "pool_edit_refused", "message": e})),
+                )
+                    .into_response();
+            }
+        }
+    }
     use crate::secret_write::Restart;
-    match crate::secret_write::apply(req.fields, req.b64, req.restart).await {
+    match crate::secret_write::apply(fields, req.b64, req.restart).await {
         Ok(Restart::Rolled) => (
             StatusCode::OK,
             Json(serde_json::json!({"ok": true, "restart": "rolled"})),

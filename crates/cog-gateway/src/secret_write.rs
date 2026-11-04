@@ -89,6 +89,46 @@ pub(crate) async fn apply(fields: Value, b64: bool, restart: bool) -> Result<Res
 /// 拒绝——宁可让向导报错，也不退回本进程直接 patch：那会悄悄把权限面又打开，
 /// 而且没人看得出来今天写的是哪一条路。
 pub(crate) async fn forward(fields: Value, b64: bool, restart: bool) -> Result<Restart, String> {
+    forward_with(fields, b64, restart, Value::Null).await
+}
+
+/// 主应用侧：同上，但把一条**池编辑指令**一起交过去。
+///
+/// 上游池的成员各带一把 key，只有网关那一侧读得到；所以「保留请求没提到的成员」
+/// 这种事只能在网关里做——主应用连别家的 key 都拿不到，它若自己拼一份"完整"的池，
+/// 拼出来的必然少了别人。指令的两种形态：
+///
+/// - `keep_unnamed: true`：请求给出的条目按名字并进现有池（同名更新，异名追加），
+///   现有池里没被点名的成员原样保留。WebUI 的保存走这一支——页面上没有"池"这个
+///   概念，它只会说"这一家"，所以一次保存不该是"把池清成这一家"。
+/// - `remove: [名字…]`：点名删除。这是唯一会减少池的路径，也只能由一次明确的
+///   删除动作走。
+pub(crate) async fn forward_pool_edit(
+    fields: Value,
+    keep_unnamed: bool,
+    remove: &[String],
+    restart: bool,
+) -> Result<Restart, String> {
+    forward_with(
+        fields,
+        false,
+        restart,
+        serde_json::json!({
+            "pool_edit": {
+                "keep_unnamed": keep_unnamed,
+                "remove": remove,
+            }
+        }),
+    )
+    .await
+}
+
+async fn forward_with(
+    fields: Value,
+    b64: bool,
+    restart: bool,
+    extra: Value,
+) -> Result<Restart, String> {
     let base = crate::contribution_admin::security_gateway_base()?;
     let secret = std::env::var(WEBHOOK_INTERNAL_SECRET_ENV)
         .ok()
@@ -97,12 +137,18 @@ pub(crate) async fn forward(fields: Value, b64: bool, restart: bool) -> Result<R
             "主应用未配置内部转发凭证（COGNEVA_WEBHOOK_INTERNAL_SECRET），无法把 Secret 写入交给安全网关"
                 .to_string()
         })?;
-    let body = serde_json::to_vec(&serde_json::json!({
+    let mut envelope = serde_json::json!({
         "fields": fields,
         "b64": b64,
         "restart": restart,
-    }))
-    .map_err(|e| format!("写入请求序列化失败: {e}"))?;
+    });
+    // 附加指令是**加进来**的，不是逐个抄进来的：抄一份的写法下，新加一种指令就得
+    // 改这里一次，而漏改不会有编译错误——网关收到的是一个没有那条指令的写入，
+    // 它会安静地按旧语义执行。
+    if let (Some(map), Value::Object(extra)) = (envelope.as_object_mut(), extra) {
+        map.extend(extra);
+    }
+    let body = serde_json::to_vec(&envelope).map_err(|e| format!("写入请求序列化失败: {e}"))?;
     let request = cog_core::HttpRequest::post(format!(
         "{}{}",
         base.trim_end_matches('/'),

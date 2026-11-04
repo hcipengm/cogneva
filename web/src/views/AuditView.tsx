@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { listAuditEvents, type AuditEvent } from '@/api/client';
+import {
+  listAuditEvents,
+  listAuditStream,
+  type AuditEvent,
+  type AuditStreamEvent,
+} from '@/api/client';
 import { useStreamDrivenRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { Button, Empty, Loading, Moment, ReadError, Reading, Readings, Table, ViewFrame } from '@/ui/primitives';
 import { BarList } from '@/ui/plots';
@@ -50,6 +55,22 @@ function summarise(payload: unknown): string {
   }
 }
 
+/**
+ * 一次池改动的「改前 → 改后」。
+ *
+ * 上游池那几行本来就带着这几格，直接印出来；其余动作退回整份 detail。读不到
+ * 改前/改后时印「读不到」，**不印空列表**——这一条账存在的意义正是把「没变」
+ * 与「这一读没成功」分开。
+ */
+function poolChange(detail: unknown): string {
+  if (!detail || typeof detail !== 'object') return summarise(detail);
+  const d = detail as { before?: string[] | null; after?: string[] | null };
+  if (!('before' in d) || !('after' in d)) return summarise(detail);
+  const side = (names: string[] | null | undefined) =>
+    names === null || names === undefined ? '读不到' : names.length ? names.join('、') : '（空）';
+  return `${side(d.before)} → ${side(d.after)}`;
+}
+
 export function AuditView() {
   const [events, setEvents] = useState<AuditEvent[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -95,6 +116,33 @@ export function AuditView() {
     void load();
   }, [load]);
 
+  // ── 平台自己的账（哈希链）──
+  // 与上面那张表不是同一本：上面记"哪个 hook 来过"，这里记"平台做过什么"。上游池
+  // 被谁改成什么样、配额拒了谁，都只在这一本里。
+  const [streamRows, setStreamRows] = useState<AuditStreamEvent[] | null>(null);
+  const [streamMatched, setStreamMatched] = useState(0);
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const [actionPrefix, setActionPrefix] = useState('');
+
+  const loadStream = useCallback(async () => {
+    try {
+      const page = await listAuditStream({
+        action: actionPrefix.trim() || undefined,
+        limit,
+      });
+      setStreamRows(page.items);
+      setStreamMatched(page.matched);
+      setStreamError(null);
+    } catch (e) {
+      setStreamError((e as { message?: string }).message ?? '读取失败');
+      setStreamRows(null);
+    }
+  }, [actionPrefix, limit]);
+
+  useEffect(() => {
+    void loadStream();
+  }, [loadStream]);
+
   // 这一面答的是「那一刻总线上到底来过什么」，订的是**全部**帧：审计表里多出来的
   // 一行可能来自任何一种变体，按种类挑就等于先把可能漏掉的那几种排除了。全局那
   // 一条信号正好是这个意思。
@@ -118,7 +166,13 @@ export function AuditView() {
             : '读取中'
       }
       actions={
-        <Button onClick={() => void load()} disabled={loading}>
+        <Button
+          onClick={() => {
+            void load();
+            void loadStream();
+          }}
+          disabled={loading}
+        >
           {loading ? '读取中…' : '重读'}
         </Button>
       }
@@ -263,6 +317,75 @@ export function AuditView() {
         <pre className="mono m-0 overflow-auto border-t border-[var(--line)] bg-[var(--ink-900)] px-4 py-2 text-[11px] text-[var(--paper-dim)]">
           {JSON.stringify(rows.find((row) => row.id === open)?.payload ?? null, null, 2)}
         </pre>
+      )}
+
+      <div className="flex flex-wrap items-center gap-2 border-y border-[var(--line)] px-4 py-2">
+        <span className="text-[11px] font-medium text-[var(--paper-dim)]">平台自己的账</span>
+        <input
+          value={actionPrefix}
+          onChange={(event) => setActionPrefix(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') void loadStream();
+          }}
+          placeholder="动作前缀（例如 llm. 或 quota.）"
+          className="mono w-56 border border-[var(--line)] bg-[var(--ink-900)] px-2 py-1 text-[11px] outline-none focus:border-[var(--brass)]"
+          style={{ color: 'var(--paper)' }}
+        />
+        <span className="text-[11px] text-[var(--muted)]">
+          {streamRows
+            ? `命中 ${streamMatched} 条，显示最近 ${streamRows.length} 条`
+            : streamError
+              ? '读不到'
+              : '读取中'}
+        </span>
+      </div>
+
+      {streamError ? (
+        <ReadError what="平台自己的账" error={streamError} onRetry={() => void loadStream()} />
+      ) : !streamRows ? (
+        <Loading what="平台自己的账" />
+      ) : streamRows.length === 0 ? (
+        <Empty>
+          这一条前缀下没有记录。上游池的改动记在「llm.upstream_saved」与
+          「llm.upstream_removed」两个动作下。
+        </Empty>
+      ) : (
+        <Table<AuditStreamEvent>
+          columns={[
+            { key: 'at', title: '时间', width: '150px', render: (row) => <Moment iso={row.timestamp} /> },
+            {
+              key: 'action',
+              title: '动作',
+              width: '190px',
+              render: (row) => <span className="mono text-[11px]">{row.action}</span>,
+            },
+            {
+              key: 'actor',
+              title: '谁做的',
+              width: '150px',
+              render: (row) => (
+                <span className="mono text-[11px] text-[var(--muted)]">{row.actor || '—'}</span>
+              ),
+            },
+            {
+              key: 'target',
+              title: '对象',
+              width: '150px',
+              render: (row) => (
+                <span className="mono text-[11px] text-[var(--muted)]">{row.target || '—'}</span>
+              ),
+            },
+            {
+              key: 'detail',
+              title: '改前 / 改后',
+              render: (row) => (
+                <span className="mono text-[11px] text-[var(--paper-dim)]">{poolChange(row.detail)}</span>
+              ),
+            },
+          ]}
+          rows={streamRows}
+          rowKey={(row) => String(row.seq)}
+        />
       )}
     </ViewFrame>
   );

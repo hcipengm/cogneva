@@ -89,12 +89,13 @@ pub async fn llm_status_handler(State(_state): State<Arc<crate::GatewayState>>) 
     // 池的真值只注入安全网关那个 Deployment（`llm-upstreams` 在带外那一片），
     // 主应用没有读它的权限，也不该有。所以这一屏只有一条来源：问网关要派生读数。
     match forwarded_llm_status().await {
-        Ok((configured, pool)) => (
+        Ok(pool) => (
             StatusCode::OK,
             Json(json!({
-                "configured": configured,
+                "configured": pool.configured,
                 "backends": local_backends(),
-                "pool": pool,
+                "pool": pool.policy,
+                "upstream_names": pool.names,
                 "source": "security-gateway",
             })),
         )
@@ -129,12 +130,21 @@ pub(crate) fn pool_policy_json(upstreams: usize, declared: Option<usize>) -> ser
     })
 }
 
+/// 池的转发读数：家数与声明下限，加上池里每一家的名字。
+pub(crate) struct ForwardedPool {
+    pub configured: bool,
+    pub policy: serde_json::Value,
+    /// 池里每一家的 `base_url|model`——与网关指标上的标签同形，不含 key。
+    pub names: Vec<String>,
+}
+
 /// 主应用侧：问安全网关要池的状态。
 ///
-/// 返回的是派生读数（家数、声明下限），不是上游池本身：`llm-upstreams` 里每条都
-/// 带一把 key，把它回传给零凭证的进程等于把刚搬走的凭证又发回去。签名用与
+/// 返回的是派生读数（家数、声明下限）与成员名字，不是上游池本身：
+/// `llm-upstreams` 里每条都带一把 key，把它回传给零凭证的进程等于把刚搬走的
+/// 凭证又发回去；名字不带 key，网关的指标本来就已经按这个名字打标签。签名用与
 /// `secret-patch` 同一条内部 HMAC——两个进程之间本来只有这一条信任边界。
-pub(crate) async fn forwarded_llm_status() -> Result<(bool, serde_json::Value), String> {
+pub(crate) async fn forwarded_llm_status() -> Result<ForwardedPool, String> {
     let body = crate::secret_write::forward_internal(
         crate::security_gateway::INTERNAL_LLM_STATUS_PATH,
         Vec::new(),
@@ -149,7 +159,199 @@ pub(crate) async fn forwarded_llm_status() -> Result<(bool, serde_json::Value), 
         .get("min_healthy")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
-    Ok((configured, pool_policy_json(upstreams, declared)))
+    let names = body
+        .get("names")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ForwardedPool {
+        configured,
+        policy: pool_policy_json(upstreams, declared),
+        names,
+    })
+}
+
+/// 落盘那一份池的读数：家数、声明下限，以及成员名字。
+pub(crate) struct PoolSnapshot {
+    pub upstreams: usize,
+    pub min_healthy: Option<usize>,
+    pub names: Vec<String>,
+}
+
+/// 池里一条的名字：`base_url|model`。与网关指标的 `upstream` 标签同形，读账的
+/// 人不用在两套写法之间翻译；key 永远不进这个名字。
+fn pool_member_name(entry: &serde_json::Value) -> Option<String> {
+    let base = entry.get("base_url")?.as_str()?.trim();
+    let model = entry.get("model")?.as_str()?.trim();
+    if base.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some(format!("{base}|{model}"))
+}
+
+/// 一次池写入在账上的那一行：改前、改后、被这次写入摘掉的、被加进来的。
+///
+/// 只记名字，不记 key。两头读不到时都是 `null` 而不是 `[]`——「没有上游」与
+/// 「这一次没读到」是两件事，压成一格会让一次读失败看起来像一次清空。
+///
+/// `after` 尤其要分：写入之后网关正在滚动重启，这一读有可能落空。把落空当成
+/// 「池里只剩这次提交的那一家」，账上就凭空多出几条「被删掉了」——那正是这张
+/// 账要回答的问题，答错比不答更糟。
+pub(crate) fn pool_change_detail(
+    before: Option<&[String]>,
+    after: Option<&[String]>,
+    min_healthy: Option<usize>,
+) -> serde_json::Value {
+    let removed: Vec<&String> = match (before, after) {
+        (Some(before), Some(after)) => before.iter().filter(|name| !after.contains(name)).collect(),
+        _ => Vec::new(),
+    };
+    let added: Vec<&String> = match (before, after) {
+        (Some(before), Some(after)) => after.iter().filter(|name| !before.contains(name)).collect(),
+        _ => Vec::new(),
+    };
+    json!({
+        "before": before,
+        "after": after,
+        "removed": removed,
+        "added": added,
+        "min_healthy": min_healthy,
+    })
+}
+
+/// 并入之后池里有几家：现有池与这次请求按名字取并集（同名算一家）。
+pub(crate) fn union_size(existing: &[String], arriving: &[String]) -> usize {
+    let mut names: Vec<&String> = existing.iter().collect();
+    for name in arriving {
+        if !names.iter().any(|n| *n == name) {
+            names.push(name);
+        }
+    }
+    names.len()
+}
+
+/// 把一次请求并入现有池。
+///
+/// `keep_unnamed` 是保存的那一支：请求给出的条目同名覆盖、异名追加，池里没被
+/// 点名的成员原样留在后面。`remove` 是删除的那一支——唯一会减少池的路径，点名
+/// 删；名字不在池里时整单拒绝，因为一次拼错的名字在账上会读成"删过了"。
+///
+/// 两支持一：既给条目又给删除名单是两种意图，混在一次写入里没法解释成一句话。
+pub(crate) fn merge_pool(
+    current: &[serde_json::Value],
+    arriving: &[serde_json::Value],
+    keep_unnamed: bool,
+    remove: &[String],
+) -> Result<Vec<serde_json::Value>, String> {
+    if !remove.is_empty() {
+        if !arriving.is_empty() {
+            return Err("同一次写入不能既新增上游又删除上游".to_string());
+        }
+        let known: Vec<String> = current.iter().filter_map(pool_member_name).collect();
+        for name in remove {
+            if !known.contains(name) {
+                return Err(format!("池里没有名叫 {name} 的上游"));
+            }
+        }
+        let kept: Vec<serde_json::Value> = current
+            .iter()
+            .filter(|entry| match pool_member_name(entry) {
+                // 名字认不出来的条目原样保留：删不掉的东西不该被顺手删掉。
+                Some(name) => !remove.contains(&name),
+                None => true,
+            })
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            return Err("不能把上游池删空：至少保留一家".to_string());
+        }
+        return Ok(kept);
+    }
+
+    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut arriving_names: Vec<String> = Vec::new();
+    for entry in arriving {
+        match pool_member_name(entry) {
+            Some(name) => {
+                if let Some(pos) = merged
+                    .iter()
+                    .position(|e| pool_member_name(e).as_deref() == Some(name.as_str()))
+                {
+                    merged[pos] = entry.clone();
+                } else {
+                    arriving_names.push(name);
+                    merged.push(entry.clone());
+                }
+            }
+            None => merged.push(entry.clone()),
+        }
+    }
+    if keep_unnamed {
+        for entry in current {
+            match pool_member_name(entry) {
+                Some(name) if arriving_names.contains(&name) => {}
+                _ => merged.push(entry.clone()),
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// 网关侧：把一次池编辑并进这次要落盘的字段。
+///
+/// 这一步只能发生在持写入权限的那个进程里——"保留请求没提到的成员"要用到它们
+/// 各自的 key，而主应用从来读不到别家的 key。
+pub(crate) async fn merge_pool_edit_into_fields(
+    mut fields: serde_json::Value,
+    keep_unnamed: bool,
+    remove: &[String],
+) -> Result<serde_json::Value, String> {
+    let kube = KubeClient::in_cluster()?;
+    // 现有池与现有下限来自同一次读取：分成两次就是两个时刻的两份读数，而这次
+    // 写入恰好把两者一起改。
+    let existing = kube.secret_oob_fields().await?;
+    let current: Vec<serde_json::Value> = existing
+        .as_ref()
+        .and_then(|fields| fields.get(SECRET_UPSTREAMS_KEY))
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let arriving: Vec<serde_json::Value> = fields
+        .get(SECRET_UPSTREAMS_KEY)
+        .and_then(|v| v.as_str())
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or_default();
+    let merged = merge_pool(&current, &arriving, keep_unnamed, remove)?;
+    let text =
+        serde_json::to_string(&merged).map_err(|e| format!("合并后的上游池序列化失败: {e}"))?;
+    fields[SECRET_UPSTREAMS_KEY] = json!(text);
+    // 池变小之后，原来声明的下限可能已经不可达成。夹到池的实际大小而不是拒单：
+    // 拒绝会让运营者在页面上删不掉任何一家（页面不发这个字段），而夹下来的值
+    // 是这次删除本来就必须做出的结论，账上"改动前后"两栏都读得出来。
+    //
+    // 这一支也要看 Secret 里已有的声明：删除那次请求只交名字，不带下限，而不可
+    // 达的界正是"删掉了一家"造成的。
+    let declared = fields
+        .get(SECRET_MIN_HEALTHY_KEY)
+        .and_then(|v| v.as_str())
+        .and_then(crate::security_gateway::parse_min_healthy)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|map| map.get(SECRET_MIN_HEALTHY_KEY))
+                .map(String::as_str)
+                .and_then(crate::security_gateway::parse_min_healthy)
+        });
+    if let Some(declared) = declared {
+        let clamped = declared.min(merged.len()).max(1);
+        if clamped != declared {
+            fields[SECRET_MIN_HEALTHY_KEY] = json!(clamped.to_string());
+        }
+    }
+    Ok(fields)
 }
 
 /// Backends declared in the local cogneva.json (informational only — after
@@ -192,10 +394,15 @@ fn key_resolves(raw: &str) -> bool {
 /// POST /api/v1/admin/llm-config — persist provider settings and roll the
 /// deployments that consume them.
 pub async fn llm_config_handler(
-    State(_state): State<Arc<crate::GatewayState>>,
+    State(state): State<Arc<crate::GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
     Json(req): Json<LlmConfigRequest>,
 ) -> Response {
     let skip_verify = req.skip_verify.unwrap_or(false);
+    // 改前是哪几家要先读下来——写入之后再去问，读到的就是自己刚写的那一份，
+    // 账上会写成一次「什么都没变」。这一读同时决定这次写入并进池之后的规模，
+    // 下限要按那个规模校验。
+    let before = forwarded_llm_status().await.ok().map(|pool| pool.names);
     let primary = LlmUpstreamRequest {
         base_url: req.base_url.clone(),
         model: req.model.clone(),
@@ -204,21 +411,33 @@ pub async fn llm_config_handler(
     };
     let mut requests = vec![primary];
     requests.extend(req.extra_upstreams.unwrap_or_default());
+    let arriving_names: Vec<String> = requests
+        .iter()
+        .map(|r| format!("{}|{}", r.base_url.trim(), r.model.trim()))
+        .collect();
 
-    // 声明的下限在落库前对**这次要落的那个池**校验：超过池大小的界永远达不成，
-    // 0 的界永远满足，两者都不是运营者想写的那条规则，而它们都会安静地生效。
+    // 这次写入是**并入**，不是整池替换：同名更新、异名追加，请求没提到的成员
+    // 原样留在池里。页面只认识"这一家"，它的保存动作不该顺带把别人删掉——删除
+    // 只有一条路，是显式点名的那一次（`remove_upstreams_handler`）。
+    //
+    // 于是下限要按**并完之后的池**校验：超过池大小的界永远达不成，0 的界永远
+    // 满足，两者都不是运营者想写的那条规则，而它们都会安静地生效。
     if let Some(declared) = req.min_healthy {
-        if declared == 0 || declared > requests.len() {
+        let expected = match before.as_deref() {
+            Some(existing) => union_size(existing, &arriving_names),
+            // 读不到现有池时这里算不出规模，交给网关在合并之后判——那一侧读得到。
+            None => arriving_names.len(),
+        };
+        if declared == 0 || declared > expected {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(json!({
                     "error": "min_healthy_out_of_range",
                     "message": format!(
-                        "冗余下限必须在 1..={} 之间（这次声明了 {} 个上游）",
-                        requests.len(),
-                        requests.len()
+                        "冗余下限必须在 1..={} 之间（并完之后的池有 {} 个上游）",
+                        expected, expected
                     ),
-                    "upstreams": requests.len(),
+                    "upstreams": expected,
                     "min_healthy": declared,
                 })),
             )
@@ -258,26 +477,48 @@ pub async fn llm_config_handler(
         }
     };
 
-    // 两个键同一次写入：池与它的下限是同一份声明的两半。缺省写空串而不是删键
-    // ——merge patch 删键要靠 null，而那与"把值写成空的 base64"在这一层分不开；
-    // 空串在读者那侧就是「没有声明」（见 `min_healthy_from_env`）。旧镜像读到这个
-    // 键不认，也不受影响：它按 `COGNEVA_LLM_UPSTREAMS` 一个键判池。
-    let min_healthy_value = req.min_healthy.map(|n| n.to_string()).unwrap_or_default();
-    if let Err(e) = crate::secret_write::forward(
-        json!({
-            SECRET_UPSTREAMS_KEY: pool_json,
-            SECRET_MIN_HEALTHY_KEY: min_healthy_value,
-        }),
-        false,
-        true,
-    )
-    .await
-    {
+    // 下限只在这次**明确声明**时才写。缺省不是"撤销声明"：页面从不发这个字段，
+    // 若按缺省写空串，运营者每保存一次就悄悄丢掉一条他从没提过的规则。
+    let mut fields = json!({ SECRET_UPSTREAMS_KEY: pool_json });
+    if let Some(declared) = req.min_healthy {
+        fields[SECRET_MIN_HEALTHY_KEY] = json!(declared.to_string());
+    }
+    // 并入而不是覆盖：网关那一侧才读得到别家的 key，合并只能在它那里做。
+    if let Err(e) = crate::secret_write::forward_pool_edit(fields, true, &[], true).await {
         return (
             StatusCode::BAD_GATEWAY,
             Json(json!({"error": "secret_patch_failed", "message": e})),
         )
             .into_response();
+    }
+
+    // 写完之后再读一次池：这一读才是"改后是哪几家"。请求里只有这一家，而池里
+    // 还有别人留下的成员——按请求记账会把保留下来的人记成"被摘掉了"。读不到就
+    // 记 null，不拿请求里那几家顶上去。
+    let measured = forwarded_llm_status().await.ok();
+    let after: Option<Vec<String>> = measured.as_ref().map(|pool| pool.names.clone());
+    let effective_min_healthy = measured
+        .as_ref()
+        .and_then(|pool| pool.policy.get("min_healthy"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
+    // 写成功了才记账：一次失败的写入不该在账上留下「池变了」。
+    //
+    // 这一行回答的是「谁在什么时候把池从哪几家改成了哪几家」。没有它，一次保存
+    // 把别家上游摘掉之后，平台自己的账上一个字都读不到——时间线只能从 Secret 的
+    // managedFields 与指标序列反推，而那里没有人的身份。
+    if let Some(stream) = state.audit_stream.as_ref() {
+        let actor = audit_actor(&claims);
+        let _ = stream
+            .append(
+                cog_core::AuditKind::Custom("llm_config".to_string()),
+                &actor,
+                SECRET_UPSTREAMS_KEY,
+                "llm.upstream_saved",
+                pool_change_detail(before.as_deref(), after.as_deref(), effective_min_healthy),
+            )
+            .await;
     }
 
     // restartedAt 注解触发网关滚动重启，新 Pod 启动时从 Secret 读
@@ -287,14 +528,132 @@ pub async fn llm_config_handler(
         Json(json!({
             "ok": true,
             "restarted": [GATEWAY_DEPLOYMENT],
-            "upstreams": pool.len(),
-            "min_healthy": req.min_healthy,
-            "min_healthy_source": cog_core::min_healthy_source(req.min_healthy),
+            "upstreams": after.as_ref().map(|names| names.len()),
+            "upstream_names": after,
+            "min_healthy": effective_min_healthy,
+            "min_healthy_source": cog_core::min_healthy_source(effective_min_healthy),
             "unverified_upstreams": unverified,
             "message": "配置已保存，安全网关正在滚动重启，约一分钟后生效",
         })),
     )
         .into_response()
+}
+
+/// POST /api/v1/admin/llm-config/remove — 从池里点名删掉几家上游。
+///
+/// 这是唯一会减少池的动作，必须由运营者在页面上明确点"删除"才走得到这里；
+/// 保存（`llm_config_handler`）只会新增或更新。池里的成员各带一把 key，只有
+/// 安全网关读得到，所以真正的过滤在那一侧做，这里只负责把名字与身份交过去。
+pub async fn remove_upstreams_handler(
+    State(state): State<Arc<crate::GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+    Json(req): Json<RemoveUpstreamsRequest>,
+) -> Response {
+    let mut names: Vec<String> = Vec::new();
+    for raw in &req.names {
+        let name = raw.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+    }
+    if names.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "nothing_to_remove",
+                "message": "没有点名任何一个上游：删除必须说清删的是哪一家",
+            })),
+        )
+            .into_response();
+    }
+
+    let before = forwarded_llm_status().await.ok().map(|pool| pool.names);
+
+    if let Err(e) = crate::secret_write::forward_pool_edit(json!({}), false, &names, true).await {
+        // 网关的拒绝原样转给页面：那几句话（"池里没有名叫 X 的上游"、"不能把池删空"）
+        // 本来就是写给运营者看的，压成一个 BAD_GATEWAY 只会把它藏掉。
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "upstream_remove_refused", "message": refusal_sentence(&e)})),
+        )
+            .into_response();
+    }
+
+    let measured = forwarded_llm_status().await.ok();
+    let after: Option<Vec<String>> = measured.as_ref().map(|pool| pool.names.clone());
+    // 池变小之后网关会把不可达的下限夹下来，账上要记夹完之后的那一个数——
+    // 记请求里的那个数，读账的人会以为声明还是原来那条。
+    let effective_min_healthy = measured
+        .as_ref()
+        .and_then(|pool| pool.policy.get("min_healthy"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
+    if let Some(stream) = state.audit_stream.as_ref() {
+        let mut detail =
+            pool_change_detail(before.as_deref(), after.as_deref(), effective_min_healthy);
+        detail["requested"] = json!(names);
+        let actor = audit_actor(&claims);
+        let _ = stream
+            .append(
+                cog_core::AuditKind::Custom("llm_config".to_string()),
+                &actor,
+                SECRET_UPSTREAMS_KEY,
+                "llm.upstream_removed",
+                detail,
+            )
+            .await;
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "restarted": [GATEWAY_DEPLOYMENT],
+            "removed": names,
+            "upstreams": after.as_ref().map(|names| names.len()),
+            "upstream_names": after,
+            "message": "已删除选中的上游，安全网关正在滚动重启，约一分钟后生效",
+        })),
+    )
+        .into_response()
+}
+
+/// 这一行账记在谁名下。
+///
+/// 没有会话身份时写 `unattributed` 而不是 `system`：两者在账上读起来不同——
+/// 前者是"到这里就断了，谁做的不知道"，后者是"系统自己做的"，而这张账存在的
+/// 意义正是把这两种情况分开。
+fn audit_actor(claims: &Option<axum::Extension<cog_core::Claims>>) -> String {
+    claims
+        .as_ref()
+        .map(|axum::Extension(c)| c.sub.clone())
+        .unwrap_or_else(|| "unattributed".to_string())
+}
+
+/// 把一次转发失败压成一句话。
+///
+/// 转发那一层只交出 `安全网关返回 400: {"error":…,"message":…}`，而里面那句
+/// `message` 本来就是写给运营者看的；把整串原样贴到页面上，读的人要先在 JSON
+/// 里找出那句话。
+fn refusal_sentence(raw: &str) -> String {
+    if let Some(start) = raw.find('{') {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw[start..]) {
+            if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+                return message.to_string();
+            }
+        }
+    }
+    raw.to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RemoveUpstreamsRequest {
+    /// 要删掉的成员，形状与指标标签一致：`base_url|model`。
+    pub names: Vec<String>,
 }
 
 /// 校验单条上游并定协议面：返回可写入池的 JSON 条目；验证失败返回
@@ -1023,7 +1382,39 @@ impl KubeClient {
     ///
     /// 读不到 Secret 时返回 `Ok(None)` 而不是一个默认值：这一面无话可说与「池里
     /// 一家都没有」是两件事，把前者印成后者等于替一次读失败编一个池。
-    pub(crate) async fn secret_pool_policy(&self) -> Result<Option<serde_json::Value>, String> {
+    pub(crate) async fn secret_pool_policy(&self) -> Result<Option<PoolSnapshot>, String> {
+        let Some(fields) = self.secret_oob_fields().await? else {
+            return Ok(None);
+        };
+        let Some(upstreams_raw) = fields.get(SECRET_UPSTREAMS_KEY) else {
+            // 池那个键都读不出来（没有、或不是我们写的形状）：这一面无话可说。
+            return Ok(None);
+        };
+        let entries =
+            serde_json::from_str::<Vec<serde_json::Value>>(upstreams_raw).unwrap_or_default();
+        let upstreams = entries.len();
+        let names = entries.iter().filter_map(pool_member_name).collect();
+        // 同一条语法由判定那一路定义：这一面若自己再写一遍"trim、非空、大于 0"，
+        // 两处就会漂——配置面读得出一个界、判定面读不出，而两边都自报成功。
+        let declared = fields
+            .get(SECRET_MIN_HEALTHY_KEY)
+            .map(String::as_str)
+            .and_then(crate::security_gateway::parse_min_healthy);
+        Ok(Some(PoolSnapshot {
+            upstreams,
+            min_healthy: declared,
+            names,
+        }))
+    }
+
+    /// 带外片那两把与池有关的键，解码后的明文。读不到 Secret 时 `Ok(None)`。
+    ///
+    /// 这里交出的是**原样**的值（上游条目含 key）：它与 `secret_pool_policy` 的
+    /// 差别正是"能不能看见凭证"，所以调用点必须同在这个持写入权限的进程里，
+    /// 不能经任何转发面。
+    async fn secret_oob_fields(
+        &self,
+    ) -> Result<Option<std::collections::BTreeMap<String, String>>, String> {
         let resp = self
             .http
             .get(format!(
@@ -1035,8 +1426,15 @@ impl KubeClient {
             .send()
             .await
             .map_err(|e| format!("读取 secret 失败: {e}"))?;
-        if !resp.status().is_success() {
+        // 「还没有这个 Secret」（首次安装）与「读不到这个 Secret」（被拒、apiserver
+        // 出错）在这里必须分开：前者是一个空池，后者是"看不见现有池"——把它读成
+        // 空池，一次并入就会把读不到的那些成员当成不存在而清掉，那正是这次事故的
+        // 形状。
+        if resp.status().as_u16() == 404 {
             return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(format!("读取 secret 失败: HTTP {}", resp.status()));
         }
         let secret: serde_json::Value = resp
             .json()
@@ -1045,25 +1443,20 @@ impl KubeClient {
         let Some(data) = secret.get("data") else {
             return Ok(None);
         };
-        let decode = |key: &str| -> Option<String> {
-            let raw = data.get(key)?.as_str()?;
+        let mut fields = std::collections::BTreeMap::new();
+        if let Some(map) = data.as_object() {
             use base64::Engine as _;
-            let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
-            String::from_utf8(bytes).ok()
-        };
-        let Some(upstreams_raw) = decode(SECRET_UPSTREAMS_KEY) else {
-            // 池那个键都读不出来（没有、或不是我们写的形状）：这一面无话可说。
-            return Ok(None);
-        };
-        let upstreams = serde_json::from_str::<Vec<serde_json::Value>>(&upstreams_raw)
-            .map(|list| list.len())
-            .unwrap_or(0);
-        // 同一条语法由判定那一路定义：这一面若自己再写一遍"trim、非空、大于 0"，
-        // 两处就会漂——配置面读得出一个界、判定面读不出，而两边都自报成功。
-        let declared = decode(SECRET_MIN_HEALTHY_KEY)
-            .as_deref()
-            .and_then(crate::security_gateway::parse_min_healthy);
-        Ok(Some(pool_policy_json(upstreams, declared)))
+            for (key, value) in map {
+                let Some(raw) = value.as_str() else { continue };
+                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(raw) else {
+                    continue;
+                };
+                if let Ok(text) = String::from_utf8(bytes) {
+                    fields.insert(key.clone(), text);
+                }
+            }
+        }
+        Ok(Some(fields))
     }
 
     /// 滚动重启安全网关：上游池整体在 Secret 里（env 引用 Secret 条目，
@@ -1094,7 +1487,8 @@ impl KubeClient {
 mod tests {
     use super::{
         api_base_from, apiserver_denies_ownership, classify_probe, classify_temperature_probe,
-        classify_usage_probe, detect_api_style, protocol_probe_url, ApiStyleProbe, ProbeOutcome,
+        classify_usage_probe, detect_api_style, merge_pool, pool_change_detail, pool_member_name,
+        protocol_probe_url, union_size, ApiStyleProbe, ProbeOutcome,
     };
 
     /// apiserver 的地址来自这个 Pod 拿到的两个变量，而不是一个写死的服务名。
@@ -1378,6 +1772,172 @@ mod tests {
         assert_eq!(
             classify_usage_probe(400, r#"{"error":{"message":"invalid request body"}}"#),
             None
+        );
+    }
+
+    /// 一次保存把别的上游摘掉时，账上要读得出「摘的是哪一家」。
+    ///
+    /// 这正是出过事的形状：WebUI 保存只带一家，服务端按整池覆盖，另一家安静地
+    /// 消失；事后再问「谁删的」，账上只剩一个改后的池。
+    #[test]
+    fn a_pool_write_names_what_it_removed() {
+        let before = vec![
+            "https://api.kimi.com/coding/v1|k3".to_string(),
+            "https://api.deepseek.com|deepseek-flash".to_string(),
+        ];
+        let after = vec!["https://api.deepseek.com|deepseek-flash".to_string()];
+        let detail = pool_change_detail(Some(&before), Some(&after), None);
+
+        assert_eq!(
+            detail["removed"],
+            serde_json::json!(["https://api.kimi.com/coding/v1|k3"])
+        );
+        assert_eq!(detail["added"], serde_json::json!([]));
+        assert_eq!(detail["before"], serde_json::json!(before));
+        assert_eq!(detail["after"], serde_json::json!(after));
+        // 名字里不会出现 key：这一行是要进链的。
+        assert_eq!(
+            detail["removed"][0]
+                .as_str()
+                .unwrap()
+                .matches("key")
+                .count(),
+            0
+        );
+    }
+
+    /// 读不到改前的池时，账上写 `null`，不写成「一家都没有」。
+    #[test]
+    fn an_unreadable_before_is_not_an_empty_pool() {
+        let after = vec!["https://api.deepseek.com|deepseek-flash".to_string()];
+        let detail = pool_change_detail(None, Some(&after), Some(1));
+        assert!(detail["before"].is_null());
+        assert_eq!(detail["removed"], serde_json::json!([]));
+        assert_eq!(detail["min_healthy"], 1);
+    }
+
+    /// 写完之后那一次读落空时，账上不写"被删掉了谁"。
+    ///
+    /// 写入之后网关正在滚动重启，这一读本来就可能落空。把落空当成"池里只剩这次
+    /// 提交的那一家"，账上就凭空多出几条删除记录——而这张账存在的全部意义就是
+    /// 回答"谁删的"。
+    #[test]
+    fn an_unreadable_after_reports_no_removals() {
+        let before = vec!["https://api.deepseek.com|deepseek-flash".to_string()];
+        let detail = pool_change_detail(Some(&before), None, None);
+        assert!(detail["after"].is_null());
+        assert_eq!(detail["removed"], serde_json::json!([]));
+        assert_eq!(detail["added"], serde_json::json!([]));
+    }
+
+    /// 保存只并入：请求没提到的成员原样留在池里。
+    ///
+    /// 这就是出过事的那一次——页面上只填了一家，保存之后池里只剩这家。池里
+    /// 别人手里的 key 页面从来没有、服务端也不回显，所以一次保存不可能表达
+    /// "把别人也重写一遍"；它只能被读成"加上/更新这一家"。
+    #[test]
+    fn a_save_keeps_the_members_it_did_not_mention() {
+        let current = vec![
+            serde_json::json!({"base_url": "https://api.kimi.com/coding/v1", "model": "k3", "api_key": "sk-kimi"}),
+            serde_json::json!({"base_url": "https://api.deepseek.com", "model": "deepseek-flash", "api_key": "sk-old"}),
+        ];
+        let arriving = vec![serde_json::json!({
+            "base_url": "https://api.deepseek.com",
+            "model": "deepseek-flash",
+            "api_key": "sk-new",
+        })];
+        let merged = merge_pool(&current, &arriving, true, &[]).expect("并入不该被拒");
+
+        let names: Vec<String> = merged.iter().filter_map(pool_member_name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "https://api.deepseek.com|deepseek-flash".to_string(),
+                "https://api.kimi.com/coding/v1|k3".to_string(),
+            ],
+            "同名更新应当留在原位，没提到的成员应当被保留"
+        );
+        // 同名的那条被这次写入覆盖：key 换成了新的。
+        assert_eq!(merged[0]["api_key"], "sk-new");
+        assert_eq!(merged[1]["api_key"], "sk-kimi");
+    }
+
+    /// 删除只删点名的：其余成员原样保留，顺序不动。
+    #[test]
+    fn a_removal_drops_only_the_named_member() {
+        let current = vec![
+            serde_json::json!({"base_url": "https://api.kimi.com/coding/v1", "model": "k3"}),
+            serde_json::json!({"base_url": "https://api.deepseek.com", "model": "deepseek-flash"}),
+        ];
+        let merged = merge_pool(
+            &current,
+            &[],
+            false,
+            &["https://api.kimi.com/coding/v1|k3".to_string()],
+        )
+        .expect("点名删一家应当成功");
+
+        let names: Vec<String> = merged.iter().filter_map(pool_member_name).collect();
+        assert_eq!(
+            names,
+            vec!["https://api.deepseek.com|deepseek-flash".to_string()]
+        );
+    }
+
+    /// 点了一个池里不存在的名字：整单拒绝，而不是安静地删掉零家。
+    #[test]
+    fn a_removal_of_a_name_the_pool_does_not_hold_is_refused() {
+        let current = vec![
+            serde_json::json!({"base_url": "https://api.deepseek.com", "model": "deepseek-flash"}),
+        ];
+        let err = merge_pool(
+            &current,
+            &[],
+            false,
+            &["https://api.kimi.com|k3".to_string()],
+        )
+        .expect_err("池里没有这条，删除应当被拒");
+        assert!(err.contains("池里没有"), "拒绝的理由要说清是哪一种：{err}");
+    }
+
+    /// 删到一家不剩：拒绝。把池删空等于关掉 LLM，那不是一次"删除上游"。
+    #[test]
+    fn a_removal_that_would_empty_the_pool_is_refused() {
+        let current = vec![
+            serde_json::json!({"base_url": "https://api.deepseek.com", "model": "deepseek-flash"}),
+        ];
+        let err = merge_pool(
+            &current,
+            &[],
+            false,
+            &["https://api.deepseek.com|deepseek-flash".to_string()],
+        )
+        .expect_err("删空应当被拒");
+        assert!(err.contains("删空"), "{err}");
+    }
+
+    /// 并完之后的池规模：同名算一家。
+    #[test]
+    fn the_pool_size_is_a_union_not_a_sum() {
+        let existing = vec![
+            "https://api.kimi.com/coding/v1|k3".to_string(),
+            "https://api.deepseek.com|deepseek-flash".to_string(),
+        ];
+        let arriving = vec!["https://api.deepseek.com|deepseek-flash".to_string()];
+        assert_eq!(union_size(&existing, &arriving), 2);
+    }
+
+    /// 名字与网关指标的标签同形：`base_url|model`，两头都 trim。
+    #[test]
+    fn a_pool_member_name_is_the_same_label_the_metrics_carry() {
+        let entry = serde_json::json!({
+            "base_url": " https://api.deepseek.com ",
+            "model": " deepseek-flash ",
+            "api_key": "sk-should-never-appear",
+        });
+        assert_eq!(
+            pool_member_name(&entry).as_deref(),
+            Some("https://api.deepseek.com|deepseek-flash")
         );
     }
 }

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   getLlmStatus,
+  removeLlmUpstream,
   saveLlmConfig,
   type LlmBackend,
 } from '@/api/client';
@@ -113,6 +114,11 @@ export function LlmSetupOverlay({
   const [verifyFailed, setVerifyFailed] = useState(false);
   const [timedOut, setTimedOut] = useState(false);
   const deadlineRef = useRef(0);
+  // 池里现有的成员（`base_url|model`）。页面在这里只做一件事：把"已经有哪些"
+  // 摆出来，让删除变成一次点得着的动作。保存从不删人，所以没有这一栏时，
+  // 运营者根本不知道池里还留着谁。
+  const [poolNames, setPoolNames] = useState<string[]>([]);
+  const [poolNotice, setPoolNotice] = useState<string | null>(null);
 
   // 保存成功后轮询等待滚动重启完成（期间本 Pod 可能短暂不可达，属正常）
   useEffect(() => {
@@ -137,6 +143,39 @@ export function LlmSetupOverlay({
     return () => clearInterval(timer);
   }, [phase, onConfigured]);
 
+  // 池里已经有谁。读不到时留空而不是报错：这一栏是辅助信息，读不到不该让
+  // 整个设置页打不开——保存与删除各有自己的错误出口。
+  const refreshPool = async () => {
+    try {
+      const s = await getLlmStatus();
+      setPoolNames(s.upstream_names ?? []);
+    } catch {
+      setPoolNames([]);
+    }
+  };
+
+  useEffect(() => {
+    void refreshPool();
+  }, []);
+
+  const removeUpstream = async (name: string) => {
+    const label = name.replace('|', ' · ');
+    if (!window.confirm(`从上游池中删除「${label}」？删除后它不再参与故障转移。`)) {
+      return;
+    }
+    setPoolNotice(null);
+    try {
+      const after = await removeLlmUpstream(name);
+      // 用服务端写完之后读到的那一份：网关马上要滚动，这一刻再发一次读请求
+      // 很可能落在旧 Pod 已经下线、新 Pod 还没就绪的窗口里。
+      setPoolNames(after.upstream_names ?? poolNames.filter((n) => n !== name));
+      setPoolNotice(`已删除「${label}」，安全网关正在重启，约一分钟后生效。`);
+    } catch (err) {
+      const msg = (err as { message?: string }).message ?? '删除失败';
+      setError(msg);
+    }
+  };
+
   const applyPreset = (idx: number) => {
     setPresetIdx(idx);
     const p = PRESETS[idx];
@@ -148,13 +187,16 @@ export function LlmSetupOverlay({
   };
 
   const doSave = async (skipVerify: boolean) => {
-    await saveLlmConfig({
+    const after = await saveLlmConfig({
       base_url: baseUrl.trim(),
       model: model.trim(),
       api_key: apiKey.trim(),
       api_style: styleHint,
       skip_verify: skipVerify,
     });
+    // 保存只并入：池里没被点名的成员留在原处，所以"改后是哪几家"只能由服务端
+    // 写完之后读一遍告诉我们，照着这次填的那一家更新会把别人从这一栏里抹掉。
+    if (after.upstream_names) setPoolNames(after.upstream_names);
   };
 
   const submit = async (e: React.FormEvent) => {
@@ -278,6 +320,36 @@ export function LlmSetupOverlay({
           </div>
         )}
 
+        {poolNames.length > 0 && (
+          <div className="mb-4 rounded-lg border border-slate-700/60 bg-slate-800/40 p-3">
+            <p className="mb-2 text-xs font-medium text-slate-300">
+              已在池中的上游
+            </p>
+            <ul className="space-y-1">
+              {poolNames.map((name) => (
+                <li
+                  key={name}
+                  className="flex items-center justify-between gap-2 text-xs text-slate-400"
+                >
+                  <span className="truncate font-mono">{name}</span>
+                  <button
+                    type="button"
+                    onClick={() => void removeUpstream(name)}
+                    className="shrink-0 rounded-md px-2 py-0.5 text-red-400 transition hover:bg-red-500/10"
+                  >
+                    删除
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {poolNotice && (
+          <div className="mb-4 rounded-lg bg-emerald-500/10 p-3 text-sm text-emerald-400">
+            {poolNotice}
+          </div>
+        )}
+
         <div className="space-y-4">
           <div>
             <label className="mb-1 block text-sm font-medium text-slate-300">
@@ -350,6 +422,10 @@ export function LlmSetupOverlay({
           >
             {phase === 'saving' ? '保存中...' : '保存并生效'}
           </button>
+          <p className="text-xs text-slate-500">
+            保存只会新增或更新这一家，不会删除池里的其他上游；删除要点上面每一行
+            后面的「删除」。
+          </p>
           {verifyFailed && (
             <button
               type="button"
