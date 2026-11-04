@@ -73,6 +73,7 @@ spec:
           command: ["/opt/cogneva/cogneva"]
           args: ["claim-store"]
           env:
+            {{- include "cogneva.timeEnv" . | nindent 12 }}
             {{- include "cogneva.logEnv" . | nindent 12 }}
             - name: COGNEVA_CLAIM_STORE_PORT
               value: {{ .Values.claimStore.port | quote }}

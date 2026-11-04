@@ -75,6 +75,8 @@ spec:
               # 保留窗口的其余成员。
               args: ["backup-drill", "--also-unproven"]
               env:
+                - name: TZ
+                  value: "Asia/Shanghai"
                 - name: COGNEVA_LOKI_ENABLED
                   value: "true"
                 - name: COGNEVA_LOKI_ENDPOINT

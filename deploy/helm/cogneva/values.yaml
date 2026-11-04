@@ -1,5 +1,10 @@
 global:
   namespace: cogneva
+  # 集群的民用时间：每个一线工作负载都带上它，读日志、看文件名日期、判「今天」时
+  # 与本机墙上的钟一致。镜像里有 /usr/share/zoneinfo，所以这是个纯 env。
+  # 库（Postgres）不跟这一项走：分区边界与额度日界是按 UTC 定义的判定，改库的时区
+  # 改的是判定本身，不只是显示。
+  timezone: Asia/Shanghai
 
 # 存储类适配（空字符串 = 不设置 storageClassName，跟随集群默认 SC）：
 # postgres/redis/qdrant 一律跟随默认 SC（K3s 默认 local-path，生产设 Longhorn 为默认）；

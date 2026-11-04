@@ -57,6 +57,7 @@ spec:
           command: ["/opt/cogneva/cogneva"]
           args: ["host-ledger"]
           env:
+            {{- include "cogneva.timeEnv" . | nindent 12 }}
             {{- include "cogneva.logEnv" . | nindent 12 }}
             - name: COGNEVA_HOST_LEDGER_PORT
               value: {{ .Values.hostLedger.port | quote }}

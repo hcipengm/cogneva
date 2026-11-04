@@ -28,6 +28,33 @@ const BACKOFF_BASE_MS: u64 = 100;
 pub type LogFilterHandle =
     tracing_subscriber::reload::Handle<EnvFilter, tracing_subscriber::Registry>;
 
+/// 控制台日志的时间戳按容器本机时区打印，并把偏移量写进那一行。
+///
+/// 默认定时器是 `SystemTime`：它一律按 UTC 打印、结尾写 `Z`。容器默认没有本地时区，
+/// 于是运维在 `kubectl logs` 里读到 09:41，墙上的钟是 17:41——同一件事两个时刻，
+/// 差额只存在于读它的人脑子里，而且这件事不出现在任何一处读数上。清单给每个容器
+/// 带上 `TZ` 之后，进程照本机时区打印即可。
+///
+/// 偏移量必须印出来，不能只印钟面：日志会和账本（存 UTC）、Prometheus（epoch）
+/// 并排放，同一次事故要在两处对上；一行没有偏移的 `17:41:29` 在那时有两种读法。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LocalTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", local_stamp(chrono::Local::now().fixed_offset()))
+    }
+}
+
+/// 一个时刻在日志里的写法：本机钟面 ＋ 显式偏移（`2026-11-04T17:41:29.123456+08:00`）。
+///
+/// 参数收的是带固定偏移的时刻而不是本机时刻，为的是这一条可以直接验：给定
+/// `09:41:29Z` 与 `+08:00`，它必须印出 `17:41:29.123456+08:00`，且读回来还是同一个
+/// 瞬间——钟面错了会把同一行日志指到别的时刻，偏移丢了则读它的人得自己猜。
+pub fn local_stamp(at: chrono::DateTime<chrono::FixedOffset>) -> String {
+    at.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string()
+}
+
 /// An owned, type-erased output layer stack that can sit on subscriber `S`.
 pub(crate) type BoxedLayer<S> = Box<dyn Layer<S> + Send + Sync + 'static>;
 
@@ -72,6 +99,7 @@ pub fn install_early_subscriber() {
     let (reloadable_filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
     let early_output = tracing_subscriber::fmt::layer()
         .compact()
+        .with_timer(LocalTime)
         .with_target(true)
         .with_line_number(true)
         .with_writer(std::io::stdout);
@@ -132,6 +160,7 @@ where
         crate::LogFormat::Json => {
             let json_layer = tracing_subscriber::fmt::layer()
                 .json()
+                .with_timer(LocalTime)
                 .with_span_events(FmtSpan::CLOSE)
                 .with_current_span(true)
                 .with_target(true)
@@ -144,6 +173,7 @@ where
         crate::LogFormat::Pretty => {
             let pretty_layer = tracing_subscriber::fmt::layer()
                 .pretty()
+                .with_timer(LocalTime)
                 .with_span_events(FmtSpan::CLOSE)
                 .with_target(true)
                 .with_thread_ids(true)

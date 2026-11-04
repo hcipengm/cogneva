@@ -113,6 +113,7 @@ spec:
               imagePullPolicy: {{ .Values.image.pullPolicy }}
               args: ["backup"]
               env:
+                {{- include "cogneva.timeEnv" . | nindent 16 }}
                 {{- include "cogneva.logEnv" . | nindent 16 }}
                 # 导出用 cog_app：它是这些表的属主，pg_dump 读得到全部内容。
                 - name: APP_PASSWORD
@@ -346,6 +347,7 @@ spec:
               # 窗口的其余成员，而旧包与读端不同步的问题只在旧包上出现。
               args: ["backup-drill", "--also-unproven"]
               env:
+                {{- include "cogneva.timeEnv" . | nindent 16 }}
                 {{- include "cogneva.logEnv" . | nindent 16 }}
                 # 单趟预算：一份包从解包到对数完。到点由这一跑自己收尾并落一行
                 # `failed`，而不是等 Job 的界把进程杀掉——被杀掉的那一趟账上

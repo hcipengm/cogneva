@@ -73,6 +73,8 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
+            - name: TZ
+              value: "Asia/Shanghai"
             # 网关代持全部敏感凭证：LLM 上游唯一来源 COGNEVA_LLM_UPSTREAMS
             # （JSON 数组，llm-config 管理）；GitHub/Gitee token 用于 API 与
             # git 透传出口注入；webhook 凭证验平台签名。业务 Pod 零持有。

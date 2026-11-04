@@ -157,6 +157,7 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
+            {{- include "cogneva.timeEnv" . | nindent 12 }}
             {{- include "cogneva.logEnv" . | nindent 12 }}
             # 本进程的花费属于哪个环境：沙盒执行器是**实验性**代码跑的地方，
             # 它的花费必须能与控制面分开读——混进 gateway_pool 就没有任何读数

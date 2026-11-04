@@ -151,6 +151,7 @@ spec:
           # 二进制。
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
+            {{- include "cogneva.timeEnv" . | nindent 12 }}
             {{- include "cogneva.logEnv" . | nindent 12 }}
             # 声明照卷族既有格式写（`claim=路径`），量出来的数就挂在同名卷上，
             # 与其它工作负载自量挂载产出的是同一条序列。

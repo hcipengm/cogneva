@@ -91,6 +91,8 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
+            - name: TZ
+              value: "Asia/Shanghai"
             # LLM 与代码平台凭证只注入安全网关，主应用零持有、经网关代理访问。
             # 连库用的是 cog_app，不是上面那个实例超级用户：注入到任意一条 SQL 里的
             # 东西，拿到的是 cogneva 库的读写，不是整台实例。

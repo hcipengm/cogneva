@@ -89,6 +89,8 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
+            - name: TZ
+              value: "Asia/Shanghai"
             # Secret overrides — must use env names that apply_env_overrides() recognises.
             # LLM 与代码平台凭证只注入安全网关，主应用零持有、经网关代理访问，
             # 因此这里不再挂 OPENAI/ANTHROPIC/GitHub/Gitee 任何凭证。

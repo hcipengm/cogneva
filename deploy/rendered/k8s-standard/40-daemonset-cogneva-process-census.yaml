@@ -74,6 +74,8 @@ spec:
           command: ["/opt/cogneva/cogneva"]
           args: ["process-census"]
           env:
+            - name: TZ
+              value: "Asia/Shanghai"
             - name: COGNEVA_LOKI_ENABLED
               value: "true"
             - name: COGNEVA_LOKI_ENDPOINT

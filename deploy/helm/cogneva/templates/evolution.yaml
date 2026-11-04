@@ -298,6 +298,7 @@ spec:
             - configMapRef:
                 name: cogneva-evolution-config
           env:
+            {{- include "cogneva.timeEnv" . | nindent 12 }}
             - name: COGNEVA_CONFIG_PATH
               value: "/etc/cogneva/cogneva.json"
             # 本 Pod 的名字：按变更派出的执行 Job 要跑**同一份代码**，而"同一份"

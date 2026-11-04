@@ -57,6 +57,21 @@ containerd 那一条恒在（它就是 `imageStoreMountPath`），其余来自
 而「这个 Job 为什么失败」「这台节点的走查为什么起不来」正需要那段日志——留下
 的退出码说不出它停在哪一步。
 */}}
+{{/*
+容器的民用时区。
+
+不带它就退回镜像默认的 UTC：`kubectl logs` 每行印 UTC 时刻、结尾一个 `Z`，而读它
+的人墙上是 +08——同一件事两个时刻，差额只存在于人脑子里；按本机日切的文件名也跟着
+偏。时间是部署的属性、不是代码里的常量，所以它来自 values：一处改，所有工作负载一起改。
+
+库不跟这一项走。分区边界（`FOR VALUES FROM` 的字面量按会话时区解释）与额度日界都
+是按 UTC 定义的判定，改库的时区改变的是判定本身，不只是显示。
+*/}}
+{{- define "cogneva.timeEnv" -}}
+- name: TZ
+  value: {{ .Values.global.timezone | quote }}
+{{- end -}}
+
 {{- define "cogneva.logEnv" -}}
 - name: COGNEVA_LOKI_ENABLED
   value: {{ .Values.observability.loki.enabled | quote }}

@@ -72,6 +72,8 @@ spec:
             - configMapRef:
                 name: cogneva-config
           env:
+            - name: TZ
+              value: "Asia/Shanghai"
             # LLM 上游池（LLM 通道唯一配置来源）：Secret llm-upstreams 条目，
             # JSON 数组，每元素 {api_style, base_url, model, api_key}。
             # 单 LLM 即单元素数组；多上游时按声明顺序在 429/402/连接失败时
