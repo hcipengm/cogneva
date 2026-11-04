@@ -33,21 +33,25 @@ pub(crate) const WRITE_FAILED_RULE: &str = "llm_usage_ledger_write_failed";
 /// path's own configuration or its database, not a reader.
 const WRITE_FAILED_FACE: &str = "token 管理";
 
-/// The `reason` label on `llm_usage_landing_dropped_total` when the process has
-/// no ledger at all.
+/// The `reason` label on `llm_usage_landing_dropped_total` when the deployment
+/// configured no ledger at all.
 ///
-/// Assembled once at startup, so this is a run-long state and not a hiccup: the
-/// gateway keeps serving and every call it finishes is spend no window will
-/// ever count. The repair is on the deployment's database URL or its schema,
-/// then a restart -- which is why it must not be summed together with the other
-/// reason.
+/// This is the one state that cannot heal by itself: the database URL is read at
+/// startup, so nothing short of a corrected deployment and a new pod turns it
+/// into a ledger. The gateway keeps serving and every call it finishes is spend
+/// no window will ever count. A deployment that named a database but could not
+/// reach it is the other reason, not this one -- that slot retries in the
+/// background and lands once the database answers.
 pub(crate) const NO_LEDGER_REASON: &str = "no_ledger";
 
-/// The `reason` label when the ledger exists and refused every attempt.
+/// The `reason` label when a ledger was configured and the write did not land.
 ///
-/// The durable alert fires once per streak and says who to call; this counts
-/// the calls it cost, which the alert cannot. Read the two together: the alert
-/// says whether it is still happening, this says how much is gone.
+/// Covers both "the store refused every attempt" and "the slot has not connected
+/// yet": in each case the next attempt is the one that might succeed, and the
+/// repair is on the database or its schema, not on the deployment. The durable
+/// alert fires once per streak and says who to call; this counts the calls it
+/// cost, which the alert cannot. Read the two together: the alert says whether
+/// it is still happening, this says how much is gone.
 pub(crate) const WRITE_FAILED_REASON: &str = "write_failed";
 
 /// Every reason a completed call's spend can fail to reach the ledger, in the

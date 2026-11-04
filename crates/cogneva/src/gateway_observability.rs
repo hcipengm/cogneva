@@ -244,6 +244,210 @@ impl cog_core::PersistentAlertSink for DeferredSink<dyn cog_core::PersistentAler
     }
 }
 
+/// 账本这一格没接上时，每个调用都如实退错，而不是答一个「没有」。
+///
+/// 二十一条方法全都返回 `Result`，所以接不上这件事可以对每一条都说出来——
+/// 而这正是它和告警出口不同的地方：那边 `list_active_persistent_alerts` 没有
+/// 错误通道，只能答空。账本没有这个缺口：一次没落成的调用要能被计成一次失败，
+/// 不能读成「账本里本来就没有这一笔」。
+#[async_trait::async_trait]
+impl cog_core::LlmUsageLedger for DeferredSink<dyn cog_core::LlmUsageLedger> {
+    async fn record(&self, record: &cog_core::LlmUsageRecord) -> Result<(), String> {
+        self.ledger()?.record(record).await
+    }
+
+    async fn record_exchange(&self, record: &cog_core::LlmExchangeRecord) -> Result<(), String> {
+        self.ledger()?.record_exchange(record).await
+    }
+
+    async fn upstream_window(
+        &self,
+        upstream: &str,
+        window_secs: u64,
+    ) -> Result<cog_core::UpstreamWindowReading, String> {
+        self.ledger()?.upstream_window(upstream, window_secs).await
+    }
+
+    async fn burned_between(
+        &self,
+        upstream: &str,
+        since_unix: i64,
+        until_unix: i64,
+    ) -> Result<u64, String> {
+        self.ledger()?
+            .burned_between(upstream, since_unix, until_unix)
+            .await
+    }
+
+    async fn record_window(&self, window: &cog_core::StoredWindow) -> Result<(), String> {
+        self.ledger()?.record_window(window).await
+    }
+
+    async fn stored_window(
+        &self,
+        upstream: &str,
+        window_secs: u64,
+    ) -> Result<Option<cog_core::StoredWindow>, String> {
+        self.ledger()?.stored_window(upstream, window_secs).await
+    }
+
+    async fn stored_windows(&self, upstream: &str) -> Result<Vec<cog_core::StoredWindow>, String> {
+        self.ledger()?.stored_windows(upstream).await
+    }
+
+    async fn spent_since(&self, upstream: &str, since_unix: i64) -> Result<u64, String> {
+        self.ledger()?.spent_since(upstream, since_unix).await
+    }
+
+    async fn spend_by_actor_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
+        self.ledger()?.spend_by_actor_since(since_unix).await
+    }
+
+    async fn spend_by_upstream_and_actor(
+        &self,
+    ) -> Result<Vec<cog_core::UpstreamActorSpend>, String> {
+        self.ledger()?.spend_by_upstream_and_actor().await
+    }
+
+    async fn task_cost_quantile(
+        &self,
+        days: i64,
+        quantile: f64,
+    ) -> Result<Option<(u64, u64, i64)>, String> {
+        self.ledger()?.task_cost_quantile(days, quantile).await
+    }
+
+    async fn task_has_started(&self, task: &str) -> Result<bool, String> {
+        self.ledger()?.task_has_started(task).await
+    }
+
+    async fn spend_by_task(&self, task_ids: &[String]) -> Result<Vec<(String, u64)>, String> {
+        self.ledger()?.spend_by_task(task_ids).await
+    }
+
+    async fn spend_by_person_since(&self, since_unix: i64) -> Result<Vec<(String, u64)>, String> {
+        self.ledger()?.spend_by_person_since(since_unix).await
+    }
+
+    async fn spend_by_task_since(
+        &self,
+        task_ids: &[String],
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        self.ledger()?
+            .spend_by_task_since(task_ids, since_unix)
+            .await
+    }
+
+    async fn task_submitter(&self, task_id: &str) -> Result<Option<String>, String> {
+        self.ledger()?.task_submitter(task_id).await
+    }
+
+    async fn unattributed_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, String> {
+        self.ledger()?.unattributed_between(since, until).await
+    }
+
+    async fn outcomes_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::OutcomeCount>, String> {
+        self.ledger()?.outcomes_between(since, until).await
+    }
+
+    async fn metering_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::MeteringCount>, String> {
+        self.ledger()?.metering_between(since, until).await
+    }
+
+    async fn skips_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::SkippedWorkLine>, String> {
+        self.ledger()?.skips_between(since, until).await
+    }
+
+    async fn verdicts_between(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<cog_core::SpendVerdictLine>, String> {
+        self.ledger()?.verdicts_between(since, until).await
+    }
+}
+
+impl DeferredSink<dyn cog_core::LlmUsageLedger> {
+    /// 现在接上的账本；没接上就如实说「还没接上」。
+    ///
+    /// 这句话与「账本说没有」是两件事：前者是这一代进程还没造出账本，后者是一个
+    /// 真的读过了的答案。调用方按 `Result` 分开，正是为了不让两者同形。
+    fn ledger(&self) -> Result<Arc<dyn cog_core::LlmUsageLedger>, String> {
+        self.ready()
+            .ok_or_else(|| format!("{} 出口还没接上：后台在退避重试", self.name))
+    }
+}
+
+/// 接一次计量账本：连接、建表。
+///
+/// 与 [`connect_alert_sink`] 同一个形状，理由也一样：它同时是启动那一次与后台
+/// 每一次重试调用的函数，两条路只要有一处不一样，「重试接上的账本」就与「启动
+/// 就接上的账本」不是同一个东西。
+async fn connect_usage_ledger(url: &str) -> Result<Arc<dyn cog_core::LlmUsageLedger>, String> {
+    let runner = cog_storage::schema_ddl::PgSchemaRunner::connect(url)
+        .await
+        .map_err(|e| format!("schema runner 连接失败: {e}"))?;
+    let store = LlmUsageStore::connect(url)
+        .await
+        .map_err(|e| format!("PostgreSQL 连接失败: {e}"))?;
+    // 留底表（含正文）的保留期不在这里管：它由主应用里的
+    // `observability_exchange_retention` 循环按同一个库定期清，并把"最老一行多老 /
+    // 保留期是多少 / 占多少字节"发布成读数。放在启动时清一次等于把"一行能活多久"
+    // 绑在网关的滚动频率上。
+    store
+        .init_schema(&runner)
+        .await
+        .map_err(|e| format!("gateway_llm_usage 建表失败: {e}"))?;
+    Ok(Arc::new(store))
+}
+
+/// 计量账本：现在就接一次，接不上就给一个会自己接上的槽。
+///
+/// 不接上的代价与告警出口不同：告警出口关掉是「这一面没人喊」，账本关掉是
+/// **每一笔花销都不进任何窗口，而且没有回填**。所以这里不留一个直到下次滚动
+/// 才可能改变的 `None`。
+async fn usage_ledger(url: &str) -> Arc<dyn cog_core::LlmUsageLedger> {
+    match connect_usage_ledger(url).await {
+        Ok(store) => {
+            tracing::info!("LLM token 计量明细已落 PostgreSQL");
+            store
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "计量账本启动时没接上，先降级为「还没接上」；后台按退避一直重试到接上为止"
+            );
+            let deferred = Arc::new(DeferredSink::<dyn cog_core::LlmUsageLedger>::new("usage"));
+            let url = url.to_string();
+            spawn_retry(Arc::clone(&deferred), SINK_RETRY_FIRST, move || {
+                let url = url.clone();
+                async move { connect_usage_ledger(&url).await }
+            });
+            deferred
+        }
+    }
+}
+
 /// 接一次告警库：连接、建表、挂上指标。
 ///
 /// 成功与失败完全由这一次的结局决定、不留半截状态，因为它同时是启动那一次与
@@ -343,33 +547,12 @@ async fn build_pool_observability(
             None => None,
         };
 
-    let usage = match config.database_url.as_deref() {
-        Some(url) => match cog_storage::schema_ddl::PgSchemaRunner::connect(url).await {
-            Ok(schema_runner) => match LlmUsageStore::connect(url).await {
-                Ok(store) => match store.init_schema(&schema_runner).await {
-                    Ok(()) => {
-                        tracing::info!("LLM token 计量明细已落 PostgreSQL");
-                        // 留底表（含正文）的保留期不在这里管：它由主应用里的
-                        // `observability_exchange_retention` 循环按同一个库定期清，
-                        // 并把"最老一行多老 / 保留期是多少 / 占多少字节"发布成读数。
-                        // 放在启动时清一次等于把"一行能活多久"绑在网关的滚动频率上。
-                        Some(Arc::new(store))
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "gateway_llm_usage 建表失败，计量明细降级为关闭");
-                        None
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(error = %e, "PostgreSQL 连接失败，计量明细降级为关闭");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(error = %e, "schema runner 连接失败，计量明细降级为关闭");
-                None
-            }
-        },
+    // 账本与告警出口同一条处置：接不上是「还没接上」，不是「这一代进程没有
+    // 账本」。区别在于账本丢的是钱：一次装配失败（库没起来、滚动重叠期等不到
+    // 建表的锁）会让这一代进程此后每一笔花销都不进任何窗口，而账本没有回填——
+    // 直到 Pod 被换掉为止。后台按退避一直重试到接上，接上之后落库按正常节拍走。
+    let usage: Option<Arc<dyn cog_core::LlmUsageLedger>> = match config.database_url.as_deref() {
+        Some(url) => Some(usage_ledger(url).await),
         None => None,
     };
 
@@ -400,8 +583,6 @@ async fn build_pool_observability(
 
     let analytics: Option<Arc<dyn cog_core::AnalyticsSink>> =
         analytics.map(|sink| sink as Arc<dyn cog_core::AnalyticsSink>);
-    let usage: Option<Arc<dyn cog_core::LlmUsageLedger>> =
-        usage.map(|store| store as Arc<dyn cog_core::LlmUsageLedger>);
     let metrics: Arc<dyn cog_core::ScrapableMetrics> = metrics;
 
     Arc::new(PoolObservability::new(
@@ -412,7 +593,7 @@ async fn build_pool_observability(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cog_core::PersistentAlertSink;
+    use cog_core::{LlmUsageLedger, PersistentAlertSink};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// 一个记下自己被调了几次的出口，用来证明「接上之后的调用落到谁身上」。
@@ -523,6 +704,180 @@ mod tests {
         assert!(
             slot.set_persistent_alert(true, &draft()).await.is_ok(),
             "接上之后的调用要落到真的出口上"
+        );
+    }
+
+    /// 只回答「谁花了多少」的账本替身：这一格证明的是调用落到了真账本上。
+    struct CountingLedger {
+        reads: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmUsageLedger for CountingLedger {
+        async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn upstream_window(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<cog_core::UpstreamWindowReading, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn burned_between(&self, _: &str, _: i64, _: i64) -> Result<u64, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn record_window(&self, _: &cog_core::StoredWindow) -> Result<(), String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn stored_window(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<cog_core::StoredWindow>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn stored_windows(&self, _: &str) -> Result<Vec<cog_core::StoredWindow>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spent_since(&self, _: &str, _: i64) -> Result<u64, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_by_actor_since(
+            &self,
+            _: i64,
+        ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_by_upstream_and_actor(
+            &self,
+        ) -> Result<Vec<cog_core::UpstreamActorSpend>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn task_cost_quantile(
+            &self,
+            _: i64,
+            _: f64,
+        ) -> Result<Option<(u64, u64, i64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn task_has_started(&self, _: &str) -> Result<bool, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn spend_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![("someone".to_string(), 7)])
+        }
+        async fn spend_by_task_since(
+            &self,
+            _: &[String],
+            _: i64,
+        ) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn task_submitter(&self, _: &str) -> Result<Option<String>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn unattributed_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<u64, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn outcomes_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::OutcomeCount>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn metering_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::MeteringCount>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn skips_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::SkippedWorkLine>, String> {
+            unimplemented!("这一格只读不写")
+        }
+        async fn verdicts_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::SpendVerdictLine>, String> {
+            unimplemented!("这一格只读不写")
+        }
+    }
+
+    /// 账本启动时没接上：先如实退错，后台接上之后同一个调用落到真账本上。
+    ///
+    /// 没有这一格，账本接不上的那一代进程就是「直到滚动都没有账本」：每笔花销
+    /// 都不进任何窗口，而账本没有回填。退错也不能退成「没有账目」——那会让读者
+    /// 把「读不到」读成一个真的答案，一天的花费于是显示为零。
+    #[tokio::test]
+    async fn a_ledger_that_starts_down_takes_reads_once_it_connects() {
+        let slot = Arc::new(DeferredSink::<dyn cog_core::LlmUsageLedger>::new("usage"));
+
+        let error = slot
+            .spend_by_person_since(0)
+            .await
+            .expect_err("没接上时不能答「没有账目」");
+        assert!(
+            error.contains("还没接上"),
+            "调用方要能读出这是「还没接上」而不是「账本说没有人花过钱」：{error}"
+        );
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let counted = Arc::clone(&reads);
+        spawn_retry(
+            Arc::clone(&slot),
+            std::time::Duration::from_millis(1),
+            move || {
+                let seen = Arc::clone(&seen);
+                let counted = Arc::clone(&counted);
+                async move {
+                    if seen.fetch_add(1, Ordering::SeqCst) < 2 {
+                        return Err("PostgreSQL 还没起来".to_string());
+                    }
+                    Ok(Arc::new(CountingLedger { reads: counted })
+                        as Arc<dyn cog_core::LlmUsageLedger>)
+                }
+            },
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while slot.ready().is_none() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            slot.ready().is_some(),
+            "重试成功之后槽里要有人；没有的话这一代进程的每一笔花销都会丢到下次滚动"
+        );
+        assert_eq!(
+            slot.spend_by_person_since(0)
+                .await
+                .expect("接上之后要落到真账本"),
+            vec![("someone".to_string(), 7)],
+            "接上之后的读要来自账本本身"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "那一次读要真的经过账本，而不是被槽答了"
         );
     }
 }

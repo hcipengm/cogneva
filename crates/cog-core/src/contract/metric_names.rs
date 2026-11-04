@@ -1261,18 +1261,18 @@ metric_names! {
     // the producer.
     LLM_USAGE_READINGS_TOTAL => "llm_usage_readings_total",
     // A finished call whose spend could not be handed to the ledger at all, by
-    // `reason`: `no_ledger` when this process assembled without a usage store,
-    // `write_failed` when the store was there and every attempt to insert the
-    // row failed.
+    // `reason`: `no_ledger` when the deployment configured no ledger, and
+    // `write_failed` when a ledger was configured and the row did not land --
+    // either the store refused it or its slot had not connected yet.
     //
     // Both are spend that no window will ever count, and both read exactly like
     // a quieter hour everywhere else on this face: the call counters live on the
     // request path and move anyway, so "we served calls and none of them were
     // costed" has no other series. The durable alert beside this one speaks to
     // whoever is on call; this is the scrape face that also says how much went
-    // missing. A process with no ledger is the shape a failing-write alert
-    // cannot see -- there is no write to fail -- and it is the shape that lasts
-    // until the next restart, because the store is assembled once at startup.
+    // missing. The first reason is the shape a failing-write alert cannot see --
+    // there is no write to fail -- and it is the one that lasts until the
+    // deployment changes, because the database URL is read once at startup.
     LLM_USAGE_LANDING_DROPPED_TOTAL => "llm_usage_landing_dropped_total",
     // Whether the decision behind `stream_options` rests on something measured
     // about this upstream, by `upstream`. 1 = it does (the pool entry carries a

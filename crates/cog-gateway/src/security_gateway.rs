@@ -3242,9 +3242,10 @@ fn pooled_refusal(
 /// [`crate::usage_landing`]。
 fn land_usage_record(state: &AppState, record: LlmUsageRecord) {
     let Some(store) = state.pool_obs.usage.clone() else {
-        // 没有账本时这一笔连「写失败」都不算：没有写，也就没有那条告警。它仍然是
-        // 一次永远读不出来的花销，而且在下次重启之前每一笔都是——账本是在启动时
-        // 装配的，中途不会长回来。所以由这一格说出来，并且带上原因。
+        // 这一格只在部署里根本没配账本时走到（`database_url` 为空）：配了但连不上
+        // 的部署拿到的是一个会自己接上的槽，那期间的失败走下面的 write_failed。
+        // 这一种没有可等的下一次尝试——配置在启动时读，只有换一个 Pod 才会变——
+        // 所以它自己成一条原因，而不是混进「写失败」里。
         let state = state.clone();
         tokio::spawn(async move {
             record_counter(
