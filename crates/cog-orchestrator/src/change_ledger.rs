@@ -1196,13 +1196,25 @@ fn settled_row_reason(row: &ChangeLedgerRow) -> String {
 /// a writer and a reader that agree today and are free to disagree later.
 const SETTLED_HANDOVER_PREFIX: &str = "account_settled";
 
+/// The sentence the sweep wrote before it declared itself, kept only so the rows
+/// closed in the minutes that version ran can still reopen.
+///
+/// It was on the line for one revision and nothing else writes it: the first
+/// half is the sweep's own opening, the second half a clause no other producer
+/// spells. Read-only acceptance -- nothing writes this form any more -- and it
+/// goes away with the rows it covers.
+const SETTLED_HANDOVER_UNNAMED: &str = "这条执行行不会再被做";
+
 /// Whether this row was closed by the settlement sweep rather than by the work.
 fn closed_as_settled(task: &Task) -> bool {
-    task.status == TaskStatus::Cancelled
-        && task
-            .error
-            .as_deref()
-            .is_some_and(|reason| declares(reason, SETTLED_HANDOVER_PREFIX))
+    if task.status != TaskStatus::Cancelled {
+        return false;
+    }
+    let Some(reason) = task.error.as_deref() else {
+        return false;
+    };
+    declares(reason, SETTLED_HANDOVER_PREFIX)
+        || (reason.starts_with("变更账上") && reason.contains(SETTLED_HANDOVER_UNNAMED))
 }
 
 /// Close the open rows hanging under a row this sweep just closed.
@@ -8617,6 +8629,20 @@ mod tests {
             self
         }
 
+        /// A cancelled hand-over whose reason is given rather than written: the
+        /// forms a reader has to recognise without a live writer.
+        fn holding_cancelled_with(self, id: &str, reason: &str) -> Self {
+            let mut task = Task::new(
+                id.to_string(),
+                TaskType::Custom(DISPATCH_TASK_KIND.into()),
+                serde_json::json!({}),
+            );
+            task.status = TaskStatus::Cancelled;
+            task.error = Some(reason.to_string());
+            self.tasks.lock().unwrap().insert(id.to_string(), task);
+            self
+        }
+
         /// A row of the shape the hand-over wrote before the project anchor
         /// existed: a change in a project, and a root of it.
         fn holding_root_change(self, id: &str, project: &str) -> Self {
@@ -11122,6 +11148,31 @@ mod tests {
         assert!(matches!(
             owed_row(&settled, &reopened, limit).await,
             Owed::NoTask { generation: 1 }
+        ));
+
+        // The same closure in the form the sweep used before it declared itself.
+        // Those rows are on the line too, and a spelling change must not strand
+        // them where a fresh reopening would have been handed over again.
+        let unnamed: Arc<dyn OrchestratorControl> =
+            Arc::new(FakeGraph::default().holding_cancelled_with(
+                &dispatch_task_id(&reopened.identity, 0),
+                "变更账上 grep:crates/a::fn thing 已经是 landed，这条执行行不会再被做：\
+                 判据取账上那一行的状态，而那一条已经结了",
+            ));
+        assert!(matches!(
+            owed_row(&unnamed, &reopened, limit).await,
+            Owed::NoTask { generation: 1 }
+        ));
+
+        // A cancellation for any other reason is still the row's answer.
+        let cancelled_by_hand: Arc<dyn OrchestratorControl> =
+            Arc::new(FakeGraph::default().holding_cancelled_with(
+                &dispatch_task_id(&reopened.identity, 0),
+                "superseded by a different plan for this crate",
+            ));
+        assert!(matches!(
+            owed_row(&cancelled_by_hand, &reopened, limit).await,
+            Owed::Held(Handover::DeadWork)
         ));
 
         // Every generation the budget allows was refused by the environment, so
