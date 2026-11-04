@@ -48,6 +48,16 @@ struct ComparisonOutput {
     gaps: Vec<String>,
     #[serde(default)]
     aligned: Vec<String>,
+    /// How well the output meets the standard it was handed, from 0.0 to 1.0.
+    ///
+    /// Score what that standard states, not how good the output feels: list
+    /// the requirements the specification and the best practices name, and
+    /// score the fraction of them the output meets. A gap that no stated
+    /// requirement covers is still worth naming, but it does not lower the
+    /// number -- a reviewer that can always find something to say otherwise
+    /// never passes anything, and its number measures its own mood rather than
+    /// the output. `1.0` means every stated requirement is met, `0.0` means
+    /// none is. Length is not a requirement: padding meets nothing.
     score: f32,
 }
 
@@ -276,13 +286,14 @@ impl SelfReviewLoop {
             }
         }
 
-        // Should never reach here, but fall back to returning the output as-is.
-        Ok((
-            current_output,
-            SelfReviewResult::Pass {
-                score: 1.0,
-                summary: "Fallback pass after max iterations".into(),
-            },
+        // A loop that ran zero iterations judged nothing: `best` is empty, and
+        // there is no text that carries a score. The fallback that used to sit
+        // here returned the untouched output labelled `Pass` with a score of
+        // `1.0` -- a verdict and a number nobody produced, published as a
+        // review of text no reviewer ever read. A caller that configured zero
+        // iterations gets an error it can see, and keeps its own output.
+        Err(SFError::Config(
+            "self-review ran zero iterations (max_iterations is 0), so no text was judged".into(),
         ))
     }
 
@@ -355,10 +366,21 @@ impl SelfReviewLoop {
         let output = execute_structured::<ComparisonOutput>(llm, &[user_msg], &options).await?;
         let raw = serde_json::to_string(&output).unwrap_or_default();
 
+        // 分数只在 0.0–1.0 上可比。走出这个区间的数不是「差一点」，是另一把
+        // 尺子（8/10、85 分），夹紧之后会变成 1.0——一次越界的读数被读成满分
+        // 通过。宁可让这次评审报错，由调用方保留自己的正文，也不要把它当成判据。
+        if !(0.0..=1.0).contains(&output.score) {
+            return Err(SFError::Validation(format!(
+                "comparison scored {}, outside the 0.0-1.0 scale its schema states; \
+                 a number on another scale cannot be compared with the threshold",
+                output.score
+            )));
+        }
+
         Ok(Comparison {
             gaps: output.gaps,
             aligned: output.aligned,
-            score: output.score.clamp(0.0, 1.0),
+            score: output.score,
             raw,
         })
     }
@@ -505,20 +527,26 @@ mod tests {
     use async_trait::async_trait;
     use std::sync::Mutex;
 
-    /// 记下每次请求里最后一条用户消息，并按结构化的两种答案作答。
+    /// 记下每次请求里最后一条用户消息与第一条系统消息，并按结构化的两种答案作答。
     struct RecordingLlm {
         prompts: Mutex<Vec<String>>,
+        systems: Mutex<Vec<String>>,
     }
 
     impl RecordingLlm {
         fn new() -> Self {
             Self {
                 prompts: Mutex::new(Vec::new()),
+                systems: Mutex::new(Vec::new()),
             }
         }
 
         fn prompts(&self) -> Vec<String> {
             self.prompts.lock().unwrap().clone()
+        }
+
+        fn systems(&self) -> Vec<String> {
+            self.systems.lock().unwrap().clone()
         }
     }
 
@@ -549,6 +577,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(messages.last().map(|m| m.content()).unwrap_or_default());
+            self.systems
+                .lock()
+                .unwrap()
+                .push(messages.first().map(|m| m.content()).unwrap_or_default());
             // 一份同时满足 CritiqueOutput 与 ComparisonOutput 的正文：两步问的
             // 是同一段话，这条测试量的是请求里的先后，不是循环走几轮。
             let body =
@@ -617,6 +649,112 @@ mod tests {
                  or the shared head is the part that differs first: {prompt}"
             );
         }
+    }
+
+    /// 给分的那一步必须带着一把尺子。
+    ///
+    /// 请求里只有一份 JSON Schema 与一行「按这个 schema 回答」。schema 里
+    /// `score` 若只写一个 `number`，0.8 这个阈值对模型就是一件没听过的事：
+    /// 它按自己的心情给一个数，循环拿这个数与阈值比。实测生产 24 小时 226 次
+    /// 比对、均分 0.449、达到 0.8 的只有 3 次——分数不是被标准决定的。
+    /// 这条测试钉住的是 schema 里那段描述：它把分数定义成「标准列出的要求里
+    /// 满足了几成」，并说明篇幅不算要求。
+    #[tokio::test]
+    async fn the_comparison_is_asked_for_coverage_not_for_an_impression() {
+        let llm = RecordingLlm::new();
+        let critique = Critique {
+            issues: vec![],
+            missing: vec![],
+            strengths: vec![],
+            raw: String::new(),
+        };
+        SelfReviewLoop::compare(
+            &critique,
+            "SPEC-8f2c: every plan names an acceptance criterion",
+            &[],
+            "self_review:planner",
+            None,
+            &llm,
+        )
+        .await
+        .unwrap();
+
+        let system = llm.systems().pop().expect("compare sends a system message");
+        assert!(
+            system.contains("fraction of them the output meets"),
+            "the score needs a stated ruler, or the threshold compares against a number \
+             the model invented: {system}"
+        );
+        assert!(
+            system.contains("Length is not a requirement"),
+            "the schema must say that padding meets nothing: {system}"
+        );
+    }
+
+    /// 越界的分数不是「差一点」，是另一把尺子。
+    ///
+    /// 模型若按百分制回 85，夹紧之后就是 1.0——一次越界的读数被读成满分通过。
+    /// 这一步宁可报错：调用方保留自己的正文，判据面看见的是一次失败的评审，
+    /// 而不是一个假的满分。
+    #[tokio::test]
+    async fn a_score_from_another_scale_is_not_clamped_into_a_pass() {
+        let llm = ScoringLlm::new(&[85.0]);
+        SelfReviewLoop::critique(
+            &SelfReviewLoop::observe("OUTPUT-2b90"),
+            "SPEC-4a1d",
+            "self_review:planner",
+            None,
+            &llm,
+        )
+        .await
+        .unwrap();
+        let critique = Critique {
+            issues: vec![],
+            missing: vec![],
+            strengths: vec![],
+            raw: String::new(),
+        };
+
+        let err = SelfReviewLoop::compare(
+            &critique,
+            "SPEC-4a1d",
+            &[],
+            "self_review:planner",
+            None,
+            &llm,
+        )
+        .await
+        .expect_err("85 is not a score on the 0.0-1.0 scale");
+
+        assert!(matches!(err, SFError::Validation(_)), "{err}");
+    }
+
+    /// 一轮也没跑的循环没有判词可交。
+    ///
+    /// 旧实现在循环之外写死了一条 `Pass { score: 1.0 }` 的兜底：`max_iterations`
+    /// 配成 0 时它把没被任何人读过的正文标成「通过、满分」交出去。那不是默认
+    /// 值，是一条伪造的判定；配置错了就该在调用处看见。
+    #[tokio::test]
+    async fn a_loop_with_no_iterations_returns_no_verdict() {
+        let llm = RecordingLlm::new();
+        let config = SelfReviewConfig {
+            max_iterations: 0,
+            ..SelfReviewConfig::default()
+        };
+
+        let err = SelfReviewLoop::new(config)
+            .review("ORIGINAL-7f31", &llm)
+            .await
+            .expect_err("zero iterations cannot produce a verdict");
+
+        assert!(
+            matches!(err, SFError::Config(_)),
+            "a loop that never ran is a configuration error, not a pass: {err}"
+        );
+        assert!(
+            llm.prompts().is_empty(),
+            "and it must not spend a call to say so"
+        );
     }
 
     /// 按顺序发分数、按顺序改写：每轮一次 critique、一次 compare、一次 revise。
