@@ -271,22 +271,26 @@ mod tests {
         assert_eq!(out["stderr"], "warn\n");
         assert_eq!(out["exit_code"], 0);
 
-        let requests = seen.seen.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let request = &requests[0];
-        match &request.payload {
-            SandboxPayload::Command { command } => {
-                assert!(command.contains("python3 -c 'print(2 + 2)'"), "{command}");
-                assert!(command.starts_with("cd /tmp"), "{command}");
+        // 锁在块里取、块里放：拿到的 `request` 是从 guard 上借的，把放手写成
+        // `drop(guard)` 时这个借用仍在作用域里，读代码的人分不清下一次 await 之前
+        // 锁到底有没有松开。块结束即松手，不用读者去追一遍借用。
+        {
+            let requests = seen.seen.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let request = &requests[0];
+            match &request.payload {
+                SandboxPayload::Command { command } => {
+                    assert!(command.contains("python3 -c 'print(2 + 2)'"), "{command}");
+                    assert!(command.starts_with("cd /tmp"), "{command}");
+                }
+                other => panic!("python must go to the executor as a command, got {other:?}"),
             }
-            other => panic!("python must go to the executor as a command, got {other:?}"),
+            assert_eq!(
+                request.task_id, "",
+                "a benchmark call belongs to no task tree"
+            );
+            assert_eq!(request.timeout, Duration::from_secs(7));
         }
-        assert_eq!(
-            request.task_id, "",
-            "a benchmark call belongs to no task tree"
-        );
-        assert_eq!(request.timeout, Duration::from_secs(7));
-        drop(requests);
 
         // 代码里的单引号不会把命令拆开：整段经单引号包住。
         let tool = python_tool(sandbox(seen.clone()), Duration::from_secs(7));
