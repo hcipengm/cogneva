@@ -1131,6 +1131,20 @@ impl ActionPlanOrchestrator {
             // otherwise. Clients state urgency on the goal they submit; the
             // pieces we broke it into are that same work.
             let goal_priority = tasks.first().map(|t| t.priority);
+            // The ready lane travels with the work as well, and it decides more
+            // than the priority above does: which queue a row publishes to is
+            // this key alone. A stop-the-line goal broken into four pieces that
+            // name no lane hands those pieces to the shared queue, where they
+            // wait behind everything already there -- the standing the
+            // submission asked for is gone at the first step, and the rows are
+            // re-armed every stall window without ever starting. Measured on
+            // CI-red remediation rows (2026-11-04): 11 of 11 children without a
+            // lane never started, 4 of 4 with one ran.
+            let goal_lane = tasks
+                .first()
+                .and_then(|t| t.input.get(cog_core::INPUT_READY_LANE))
+                .and_then(|lane| lane.as_str())
+                .map(str::to_string);
             // Ids of the original rows in submission order; every id after
             // these in `all_injected_ids` is a decomposed child.
             let placeholder_ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
@@ -1164,6 +1178,15 @@ impl ActionPlanOrchestrator {
                     task.face_id = face_id.clone();
                     task.owner_unit = owner_unit.clone();
                     task.submitted_by = submitted_by.clone();
+                }
+                // A child that named its own lane keeps it; one that named none
+                // is standing where its goal stands, not in the default queue.
+                if let Some(lane) = goal_lane.as_ref() {
+                    if let serde_json::Value::Object(input) = &mut task.input {
+                        input
+                            .entry(cog_core::INPUT_READY_LANE.to_string())
+                            .or_insert_with(|| serde_json::Value::String(lane.clone()));
+                    }
                 }
                 task.parent_task_id = match at.parent_id.as_deref() {
                     Some(parent) if plan_ids.contains(parent) => Some(parent.to_string()),
@@ -3156,6 +3179,56 @@ mod tests {
         assert_eq!(child.parent_task_id.as_deref(), Some("sig-alert-2"));
         assert_eq!(child.goal_id, parent.goal_id);
         assert!(sink.calls.lock().unwrap().is_empty());
+    }
+
+    /// 停线单被拆成几件活之后，那几件活仍然站在停线上。
+    ///
+    /// 排在哪个就绪队列只由输入里那一格决定，别的地方都决定不了它。拆出来的子任务
+    /// 丢掉这一格，就是整份工作退回共享队列，排在已经积压的几百条后面——提交时说的
+    /// 「这一版比什么都该先跑」在第一步就没了，而这些行此后每过一个停摆窗被重新
+    /// 排上、又从来没开始过。反例半边同样要断言：普通目标不因为有一个停线目标存在
+    /// 就跟着上停线。
+    #[tokio::test]
+    async fn a_stop_the_line_goal_hands_its_lane_to_the_work_it_is_broken_into() {
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-decomp-lane".to_string()));
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                // 两份计划，一份给停线目标，一份给普通目标。
+                replies: std::sync::Mutex::new(vec![vec![atomic_task("child-1")]; 2]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+        let registry = SkillRegistry::new();
+
+        let mut stop_the_line = hint_task("ci-red-row");
+        stop_the_line.input[cog_core::INPUT_READY_LANE] =
+            serde_json::json!(cog_core::READY_LANE_STOP_THE_LINE);
+        for goal in [stop_the_line, hint_task("ordinary-row")] {
+            let row = goal.id.clone();
+            planner
+                .process_goal_impl("fix the red build", vec![goal], &registry)
+                .await
+                .expect("这一片过得了分解门");
+            let child = dag
+                .get_task(&scoped(&row, "child-1"))
+                .await
+                .expect("拆出来的那一件活进了图");
+            let lane = child.input.get(cog_core::INPUT_READY_LANE);
+            if row == "ci-red-row" {
+                assert_eq!(
+                    lane.and_then(|lane| lane.as_str()),
+                    Some(cog_core::READY_LANE_STOP_THE_LINE),
+                    "停线单拆出来的活丢了停线身份，就退回共享队列排在积压后面：\
+                     提交时说的优先级在第一步就没了"
+                );
+            } else {
+                assert_eq!(
+                    lane, None,
+                    "普通目标拆出来的活不该自己长出一条停线：它是被另一个目标带出来的"
+                );
+            }
+        }
     }
 
     /// 两份分解各自写 `t1` 时，两张单子都进得了图。
