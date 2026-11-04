@@ -1008,4 +1008,44 @@ mod tests {
             );
         }
     }
+
+    /// The long horizon belongs to the account, not to the session: a look that
+    /// could not settle a row writes no state, so nothing this module answers can
+    /// be taken from a memory or from a task description, and what does carry a
+    /// run across a session is the state a full read of both registries left on
+    /// the row.
+    ///
+    /// Every reason of the closed set is walked, because the mapping from
+    /// `Unsettled` to a state is the one place a second, quieter writer could
+    /// appear: a `Some` added for any single reason would turn "this look could
+    /// not tell" into a verdict the next session reads as an answer.
+    ///
+    /// principle: feedback_longhorizon_lives_in_the_ledger_not_the_session
+    #[test]
+    fn an_unsettled_look_writes_no_state_the_ledger_would_have_to_carry() {
+        for reason in UnsettledReason::ALL {
+            let look = Verdict::unsettled(reason, "the registries could not be read");
+            assert_eq!(look.state(), None, "{reason:?}");
+            assert_eq!(look.reason(), Some(reason), "{reason:?}");
+            assert!(look.why().is_some(), "{reason:?}");
+        }
+        // The unsettled shapes the judge itself produces, read off a row rather
+        // than built by hand: a column that never arrived, a carrier its tree no
+        // longer holds, and a declaration nothing can key on.
+        for host in [None, Some(""), Some("stale:gone")] {
+            let verdict = judge(&row("feedback_x", host), &Declarations::default());
+            assert_eq!(verdict.state(), None, "{host:?}");
+            assert!(verdict.reason().is_some(), "{host:?}");
+        }
+        let unreadable = declarations(&[("crates/x/tests/a.rs", "//! principle: Feedback-X")]);
+        let missing = judge(&row("feedback_x", Some("-")), &unreadable);
+        assert_eq!(missing.state(), None);
+        // The contrast that makes the rule sayable: a full read of both
+        // registries does move the row, so the state the next session starts from
+        // is one a look wrote down and not one this pass remembered.
+        assert_eq!(
+            judge(&row("feedback_x", Some("-")), &Declarations::default()).state(),
+            Some(cog_core::PrincipleState::Unenforced)
+        );
+    }
 }
