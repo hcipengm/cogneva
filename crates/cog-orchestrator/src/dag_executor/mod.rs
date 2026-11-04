@@ -642,7 +642,11 @@ impl DagExecutorRuntime {
                     }
                 }
                 if let Err(e) = self.orchestrator.schedule_task(&task.id).await {
-                    tracing::warn!(task_id = %task.id, "schedule_task failed during publish: {e}");
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %e,
+                        "schedule_task failed during publish: the task was not moved to Scheduled, so it stays Pending and the next pass offers it again"
+                    );
                     continue;
                 }
                 payloads.push(payload);
