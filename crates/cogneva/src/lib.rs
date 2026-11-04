@@ -217,12 +217,18 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
             // 它手上有什么工具＝这个进程装配了什么。取内核那份具体注册表：
             // 契约 trait 只报得出名字，复制不了工具本身。
             let tools = ctx.consume::<cog_agent::ToolRegistry>();
+            // 名册与收件箱是两半：有前者同事才发现得了它，有后者消息才有人读。
+            // 缺哪一半都由进程如实缺席，这里不替它编一个内存实现。
+            let roster = ctx.consume_service::<dyn cog_core::AgentRegistry>();
+            let inbox = ctx.consume_service::<dyn cog_core::MessageBackend>();
             if conversation
                 .set(Arc::new(crate::conversation::PlatformConversation::new(
                     orchestrator,
                     admission,
                     audit,
                     tools,
+                    roster,
+                    inbox,
                 )))
                 .is_err()
             {

@@ -11,6 +11,9 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
+
+use futures::StreamExt;
 
 // 工具表的写入方法在 `cog_core` 的契约 trait 上，实现是内核的注册表：两个同名，
 // 这里要的是前者的方法，实现按后者取。
@@ -34,6 +37,44 @@ const WEB_CHAT_ACTOR: &str = "web_chat";
 /// 分组只参与名字的哈希材料，把界面上这些员工与 worker 池、进化池的同号槽位
 /// 分开。它是清单里写得出来的字面量，所以同一个会话滚一次 Pod 还是同一个名字。
 const CHAT_GROUP: &str = "web";
+
+/// 名册上那一条多久续一次。
+///
+/// 名册的过期是 30 秒：一轮对话动不动就超过它，不续的话它会在自己还在说话的
+/// 时候从名册上消失——同事这时候发给它的消息就投进一个没人认领的收件箱。
+// cap: bound — 名册过期 30 秒，续约间隔取它的三分之一
+const REGISTRATION_HEARTBEAT_SECS: u64 = 10;
+
+/// 一次开跑最多读几条积压消息。
+///
+/// 上下文的容量是有限的，收件箱不是：一晚上攒了五十条，全塞进这一轮会把这一轮
+/// 自己的问题挤出去。读不完的留在流里，下一轮接着读。
+// cap: bound — 一轮对话的上下文里，收件箱这一块最多占几条
+const INBOX_DRAIN_MAX: usize = 16;
+
+/// 读收件箱时，等一条新消息等多久算「这一轮没有更多了」。
+///
+/// 这是人正等着的一段对话，不是后台消费者：静默窗口按人的耐心取，而不是按
+/// 总线的延迟上限取。
+// cap: bound — 收件箱排空的静默窗口，按一段对话能接受的额外等待取
+const INBOX_QUIET_MS: u64 = 200;
+
+/// 一次开跑花在读收件箱上的总预算。
+///
+/// 消息接连不断地来也不无限读：这条界与条数界互为兜底，谁先到谁停。
+// cap: bound — 开跑前读收件箱的总时间预算
+const INBOX_DRAIN_BUDGET_MS: u64 = 1_500;
+
+/// 领回「上一轮读到一半就断了」的消息，等它闲置多久。
+///
+/// 与后台消费者同一个取法：同一段会话的两轮不会同时在跑，所以这个窗口只要
+/// 大过一轮正常对话的读耗时，就不会把另一个人正在读的那条抢过来。
+// cap: bound — 回收待处理消息的最小闲置时长
+const INBOX_TAKEOVER_IDLE_MS: u64 = 5_000;
+
+/// 一次回收调用要多少条。
+// cap: bound — 一次回收调用要多少条待处理消息
+const INBOX_TAKEOVER_BATCH: usize = 16;
 
 /// 一段对话里最多几轮「想—用工具」。
 ///
@@ -107,6 +148,12 @@ pub struct PlatformConversation {
     /// 取的是内核那份具体注册表而不是 `dyn` 契约：契约只有 `register` 与
     /// `names`，能把一只工具装进去、能报出名字，却读不回工具本身，也就复制不了。
     tools: Option<Arc<cog_agent::ToolRegistry>>,
+    /// 名册。有它，这个员工在说话的那段时间里对同事是可见的——`list_agents`
+    /// 列得出它的名字，`send_to_agent` 找得到这个地址。
+    roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+    /// 收件箱。与名册是两半：只有名册没有收件箱，消息投进一个没人读的流；只有
+    /// 收件箱没有名册，同事根本发现不了这个地址。缺哪一半都由进程如实缺席。
+    inbox: Option<Arc<dyn cog_core::MessageBackend>>,
 }
 
 impl PlatformConversation {
@@ -115,12 +162,16 @@ impl PlatformConversation {
         admission: Option<Arc<dyn HierarchyManager>>,
         audit: Option<Arc<dyn AuditStream>>,
         tools: Option<Arc<cog_agent::ToolRegistry>>,
+        roster: Option<Arc<dyn cog_core::AgentRegistry>>,
+        inbox: Option<Arc<dyn cog_core::MessageBackend>>,
     ) -> Self {
         Self {
             orchestrator,
             admission,
             audit,
             tools,
+            roster,
+            inbox,
         }
     }
 }
@@ -167,10 +218,250 @@ impl ConversationTurn for PlatformConversation {
                     request.owner.clone(),
                     cog_core::LlmOrigin::Interactive.as_str(),
                 );
-            runtime
-                .run_conversation(request.messages, request.llm.as_ref())
-                .await
+
+            // 开跑前先读收件箱：同事在它不在的时候发来的话，这一轮要看得见。
+            // 读完就确认，下一轮只读新的；回信地址跟着消息一起带进来，等这一轮
+            // 有了答案再投回去。
+            let mut askers: Vec<String> = Vec::new();
+            let mut history: Vec<cog_core::Message> = Vec::new();
+            if let Some(backend) = self.inbox.as_ref() {
+                for msg in drain_inbox(backend, &employee.id).await {
+                    if let cog_core::InboxMessage::Prompt {
+                        reply_stream: Some(stream),
+                        ..
+                    } = &msg
+                    {
+                        askers.push(stream.clone());
+                    }
+                    if let Some(text) = inbox_as_message(&msg) {
+                        history.push(cog_core::Message::user(format!("[同事发来的消息]\n{text}")));
+                    }
+                }
+            }
+            history.extend(request.messages);
+
+            // 说话的这一段时间它在名册上活着：续约间隔比名册的过期短，否则一轮
+            // 长对话会在自己还在说的时候从名册上消失。
+            let lease = match self.roster.as_ref() {
+                Some(roster) => Some(EmployeeLease::take(roster.clone(), &employee).await),
+                None => None,
+            };
+
+            let answer = runtime
+                .run_conversation(history, request.llm.as_ref())
+                .await;
+
+            // 说完就下线：名下没有常驻进程，名册上留着一条过期的记录只会让同事
+            // 以为它还醒着。
+            if let Some(lease) = lease {
+                lease.release().await;
+            }
+
+            // 问它的人要的是答案。等这一轮跑完，把结果投给每一个带回来的回信地址；
+            // 投不出去要说出来——发送方那边正在等，而这边已经没什么可重试的了。
+            if let (Some(backend), Ok(value)) = (self.inbox.as_ref(), answer.as_ref()) {
+                for stream in &askers {
+                    match serde_json::to_vec(value) {
+                        Ok(payload) => {
+                            if let Err(e) = backend.publish(stream, &payload).await {
+                                tracing::warn!(stream = %stream, error = %e, "回信没有投出去");
+                            }
+                        }
+                        Err(e) => tracing::warn!(stream = %stream, error = %e, "回信序列化失败"),
+                    }
+                }
+            }
+            answer
         })
+    }
+}
+
+/// 这个员工在名册上活着的那一段时间：一轮对话。
+///
+/// 它名下没有常驻进程，所以「活着」是一次登记加一条续约；说完话就注销。崩掉
+/// 的那一轮由名册自己的过期兜底——最多多留一个过期周期，不会永远挂在那儿。
+struct EmployeeLease {
+    roster: Arc<dyn cog_core::AgentRegistry>,
+    agent_id: String,
+    beat: tokio::task::JoinHandle<()>,
+}
+
+impl EmployeeLease {
+    async fn take(
+        roster: Arc<dyn cog_core::AgentRegistry>,
+        employee: &cog_agent::identity::AgentName,
+    ) -> Self {
+        let registration = cog_core::AgentRegistration::new(
+            employee.id.clone(),
+            cog_agent::identity::agent_instance(),
+            "127.0.0.1",
+            CHAT_ROLE.to_string(),
+            "default",
+            vec![CHAT_ROLE.to_string()],
+            cog_core::ResourceInfo::default(),
+        );
+        if let Err(e) = roster.register(&registration).await {
+            // 登记不上不是这一轮的失败：它照样能说话、能派活，只是同事在名册上
+            // 看不到它。这一句就是那个差别的唯一读数。
+            tracing::warn!(
+                agent_id = %employee.id,
+                error = %e,
+                "名册登记失败：这一轮同事看不到它"
+            );
+        }
+        let beat = tokio::spawn(heartbeat_loop(roster.clone(), registration));
+        Self {
+            roster,
+            agent_id: employee.id.clone(),
+            beat,
+        }
+    }
+
+    async fn release(self) {
+        self.beat.abort();
+        if let Err(e) = self.roster.deregister(&self.agent_id).await {
+            tracing::warn!(agent_id = %self.agent_id, error = %e, "名册注销失败");
+        }
+    }
+}
+
+/// 续约到这一轮结束为止。
+///
+/// 心跳失败时重新登记：名册里的键有有效期，丢了的那一条不该让这个员工在剩下的
+/// 对话里一直隐身，而日志里除了一行警告什么都看不出来。
+async fn heartbeat_loop(
+    roster: Arc<dyn cog_core::AgentRegistry>,
+    registration: cog_core::AgentRegistration,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(REGISTRATION_HEARTBEAT_SECS));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        ticker.tick().await;
+        if let Err(e) = roster.heartbeat(&registration.agent_id).await {
+            if let Err(re) = roster.register(&registration).await {
+                tracing::warn!(
+                    agent_id = %registration.agent_id,
+                    error = %e,
+                    reregister = %re,
+                    "名册续约失败"
+                );
+            }
+        }
+    }
+}
+
+/// 把收件箱里积压的消息读出来，读了就确认。
+///
+/// 位置记在组上，不记在这个进程里：所以它不在的那段时间收到的消息，下一轮开跑
+/// 时照样读得到——员工本身无状态，队列就是它的状态。
+async fn drain_inbox(
+    backend: &Arc<dyn cog_core::MessageBackend>,
+    agent_id: &str,
+) -> Vec<cog_core::InboxMessage> {
+    let stream = cog_core::agent_inbox_stream(agent_id);
+    // 与后台消费者同一个组名：一个员工只有一条收件箱，谁读都从同一个位置接着读。
+    let group = format!("agent-{agent_id}");
+    if let Err(e) = backend.create_consumer_group(&stream, &group).await {
+        tracing::warn!(agent_id, error = %e, "收件箱的组建不出来：这一轮读不到消息");
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+
+    // 上一轮读到一半就断了（Pod 被滚掉、连接断）的条目还在待处理队列里，组的
+    // 位置没有越过它们。先领回来，否则它们要等下一次有人认领才动。
+    loop {
+        match backend
+            .claim_pending(
+                &stream,
+                &group,
+                INBOX_TAKEOVER_IDLE_MS,
+                INBOX_TAKEOVER_BATCH,
+            )
+            .await
+        {
+            Ok(Some(batch)) if !batch.is_empty() => {
+                let full = batch.len() == INBOX_TAKEOVER_BATCH;
+                let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
+                for (_, bytes) in &batch {
+                    push_or_log(&mut out, bytes, agent_id);
+                }
+                if let Err(e) = backend.ack(&stream, &group, &ids).await {
+                    tracing::warn!(agent_id, error = %e, "领回来的消息确认不了，下一轮会再读到");
+                }
+                if !full || out.len() >= INBOX_DRAIN_MAX {
+                    return out;
+                }
+            }
+            Ok(_) => break,
+            Err(e) => {
+                tracing::warn!(agent_id, error = %e, "回收待处理消息失败");
+                break;
+            }
+        }
+    }
+
+    let mut reader = match backend.subscribe(&stream, &group).await {
+        Ok(reader) => reader,
+        Err(e) => {
+            tracing::warn!(agent_id, error = %e, "订阅收件箱失败");
+            return out;
+        }
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(INBOX_DRAIN_BUDGET_MS);
+    while out.len() < INBOX_DRAIN_MAX {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let window = left.min(Duration::from_millis(INBOX_QUIET_MS));
+        match tokio::time::timeout(window, reader.next()).await {
+            Ok(Some(Ok((id, bytes)))) => {
+                push_or_log(&mut out, &bytes, agent_id);
+                if let Err(e) = backend.ack(&stream, &group, &[id]).await {
+                    tracing::warn!(agent_id, error = %e, "消息确认不了，下一轮会再读到");
+                }
+            }
+            Ok(Some(Err(e))) => {
+                tracing::warn!(agent_id, error = %e, "收件箱读到一半出错");
+                break;
+            }
+            Ok(None) => break,
+            // 静默窗口里没有新消息：这一轮就这些。读被打断的那一条若服务端已经
+            // 发出来了，它留在组里的待处理队列上，下一轮按闲置时长领回来。
+            Err(_) => break,
+        }
+    }
+    out
+}
+
+/// 一条读得懂就收下，读不懂就跳过。
+///
+/// 认不出来的字节重试也不会认出来，留在流里等于把这个收件箱卡死。跳过是有意的：
+/// 它响应的是「这一条读不懂」，不是「这一条以后能读懂」。
+fn push_or_log(out: &mut Vec<cog_core::InboxMessage>, bytes: &[u8], agent_id: &str) {
+    match serde_json::from_slice(bytes) {
+        Ok(msg) => out.push(msg),
+        Err(e) => tracing::warn!(agent_id, error = %e, "收件箱里有一条读不懂的消息，已跳过"),
+    }
+}
+
+/// 收件箱里的一条怎么进这一轮的历史。
+///
+/// 线上没有发信人：命令的线上形态只带指令，不带谁写的（发信人那半在看到回执的
+/// 发送方手里）。所以这里只说「同事发来的」，不编一个名字。
+fn inbox_as_message(msg: &cog_core::InboxMessage) -> Option<String> {
+    use cog_core::InboxMessage;
+    match msg {
+        InboxMessage::Prompt { goal, .. } => Some(match goal {
+            serde_json::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        }),
+        InboxMessage::Continue { instruction } | InboxMessage::Steering { instruction } => {
+            Some(instruction.clone())
+        }
+        // 撤停与重置是给正在跑的那一轮的指令，不是一条要说的话。
+        InboxMessage::Abort | InboxMessage::Reset => None,
     }
 }
 
@@ -665,6 +956,74 @@ mod tests {
                 assert!(!name.persona.is_empty(), "员工没有名字");
             }
         }
+    }
+
+    /// 同事发来的话怎么进这一轮的历史。
+    ///
+    /// 一条 prompt 就是一句话；continue 与 steering 是同一件事的两种口吻，都
+    /// 照原文进。撤停与重置不是话，是给正在跑的那一轮的指令——把「abort」当成
+    /// 一句用户消息读进去，模型会回答它，而发信人等的是「它停了」。
+    #[test]
+    fn an_inbox_command_becomes_a_sentence_or_nothing() {
+        use cog_core::InboxMessage;
+        assert_eq!(
+            inbox_as_message(&InboxMessage::Prompt {
+                goal: serde_json::json!("把首页配色改一下"),
+                reply_stream: None,
+            })
+            .as_deref(),
+            Some("把首页配色改一下")
+        );
+        assert_eq!(
+            inbox_as_message(&InboxMessage::Prompt {
+                goal: serde_json::json!({"step": 2}),
+                reply_stream: None,
+            })
+            .as_deref(),
+            Some("{\"step\":2}")
+        );
+        assert_eq!(
+            inbox_as_message(&InboxMessage::Continue {
+                instruction: "接着做".into()
+            })
+            .as_deref(),
+            Some("接着做")
+        );
+        assert_eq!(
+            inbox_as_message(&InboxMessage::Steering {
+                instruction: "换个方向".into()
+            })
+            .as_deref(),
+            Some("换个方向")
+        );
+        assert_eq!(inbox_as_message(&InboxMessage::Abort), None);
+        assert_eq!(inbox_as_message(&InboxMessage::Reset), None);
+    }
+
+    /// 同事发来的消息，开跑前被读出来；读完就确认，不会在下一轮再读一遍。
+    #[tokio::test]
+    async fn what_arrived_while_it_was_away_is_read_before_the_run() {
+        let backend: Arc<dyn cog_core::MessageBackend> =
+            Arc::new(cog_test_support::MemoryMessageBackend::new());
+        let agent_id = "luna-test-0001";
+        let msg = cog_core::InboxMessage::Prompt {
+            goal: serde_json::json!("帮我看一下昨天那次发布为什么红了"),
+            reply_stream: None,
+        };
+        backend
+            .publish(
+                &cog_core::agent_inbox_stream(agent_id),
+                &serde_json::to_vec(&msg).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let drained = drain_inbox(&backend, agent_id).await;
+        assert_eq!(drained.len(), 1, "收件箱里有一条，读出来了一条");
+        assert_eq!(
+            inbox_as_message(&drained[0]).as_deref(),
+            Some("帮我看一下昨天那次发布为什么红了")
+        );
     }
 
     /// 一个只剩硬上限的管理器：每一级都已经用完。

@@ -240,3 +240,40 @@ fn a_refused_dispatch_is_booked_under_the_employee() {
         "拒绝的 actor 不是那个员工：账上只剩「有人被挡过」"
     );
 }
+
+/// 它是一段对话里的员工：说话的时候在名册上，说完下线；同事发来的话开跑前读到。
+///
+/// 两半缺一不可。只有名册没有收件箱，别人找得到地址、投进去没人读；只有收件箱
+/// 没有名册，消息能收，可谁也不知道该往哪投。
+#[test]
+fn the_employee_is_on_the_roster_and_listens_before_it_speaks() {
+    let boot = source(BOOT);
+    assert!(
+        boot.contains("consume_service::<dyn cog_core::AgentRegistry>()"),
+        "装配根没有把名册交给这段对话：同事在名单上找不到它"
+    );
+    assert!(
+        boot.contains("consume_service::<dyn cog_core::MessageBackend>()"),
+        "装配根没有把收件箱交给这段对话：发给它的话没人读"
+    );
+
+    let text = source(ASSEMBLY);
+    assert!(
+        text.contains("EmployeeLease::take"),
+        "说话的时候没有把自己登记进名册：这一轮里它不可达"
+    );
+    assert!(
+        text.contains("lease.release()"),
+        "说完没有注销：名册上留一条过期记录，同事会以为它还醒着"
+    );
+    let drain = text
+        .find("drain_inbox(backend")
+        .expect("开跑前没有读收件箱：同事的话要等到下一轮才看得见");
+    let run = text
+        .find("run_conversation(")
+        .expect("找不到跑对话的那一行，这条判据失去锚");
+    assert!(
+        drain < run,
+        "收件箱要在开跑之前读：跑完再读，这一轮的上下文里就没有同事的话"
+    );
+}
