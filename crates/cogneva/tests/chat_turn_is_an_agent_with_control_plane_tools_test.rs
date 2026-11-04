@@ -11,7 +11,8 @@
 //!   员工不换，账上也不能出现 unknown。
 //!
 //! 所以这里判：网关里没有循环只有交接；控制面五只装在唯一那条循环上；工具表来自
-//! 进程；每一轮的 agent_id 是这段会话的员工；句柄在插件起来前发布、起来后填上。
+//! 进程；每一轮的 agent_id 是这段会话的员工；句柄在插件起来前发布、起来后填上；
+//! 系统自己那三本账（变更、原则、告警）它读得到，而且只读。
 
 use crate::common::{fsio, root};
 
@@ -275,5 +276,81 @@ fn the_employee_is_on_the_roster_and_listens_before_it_speaks() {
     assert!(
         drain < run,
         "收件箱要在开跑之前读：跑完再读，这一轮的上下文里就没有同事的话"
+    );
+}
+
+/// 它读得到系统自己的三本账：变更、原则、告警。
+///
+/// 「这件事落地了没有」的答案写在账上，不在谁的印象里。这三只工具读的是本进程
+/// 里已经发布的服务——与网关上那些面板读的是同一批行，不是两次转发、也不是第二份
+/// 拷贝。而账缺席时必须说出来：回一个空列表就是把「读不到」说成「一条都不欠」，
+/// 这两个读数正好相反。
+#[test]
+fn the_employee_reads_the_three_accounts_the_system_keeps() {
+    let text = source(ASSEMBLY);
+    for name in [
+        "list_changes",
+        "get_change",
+        "list_principles",
+        "active_alerts",
+    ] {
+        assert!(
+            text.contains(&format!("\"{name}\"")),
+            "缺 {name}：它读不到系统自己的账，只能凭印象回答「那件事落地了没有」"
+        );
+    }
+    assert!(
+        text.contains("ledger_absent("),
+        "账缺席时没有一句话把它说出来：空列表会被读成「一条都不欠」"
+    );
+    // 读账的工具不许写账：判一条需求做完了没有，只能由看树的那一侧写。工具层
+    // 出现其中一个写入口，读账的人就成了给自己发完成证明的人。
+    for writer in [
+        "apply_measurement",
+        "record_delivery",
+        "report_refusals",
+        "record_human_only",
+        "record_dispatch_state",
+    ] {
+        assert!(
+            !text.contains(writer),
+            "读账的这一层出现了写入口 `{writer}`：完成由看树的那一侧判定，不由读账的人写"
+        );
+    }
+
+    let boot = source(BOOT);
+    for service in ["ChangeLedgerStore", "PrincipleLedgerStore", "AlertStore"] {
+        assert!(
+            boot.contains(&format!("consume_service::<dyn cog_core::{service}>()")),
+            "装配根没有把 {service} 交给这段对话：这一面在界面上就是瞎的"
+        );
+    }
+}
+
+/// 界面上的员工没有轮数天花板：一轮什么时候结束，由模型自己不再要工具来定。
+///
+/// 「界面上那位只许想六轮」看起来只是省一点钱，实际是让它比任何同事都早被要求
+/// 「别查了，先答」——而它答不出来「这件事落地了没有」，一半原因就在这里。会话
+/// 是人一句、它一句，什么时候查够了该由它自己知道，不由一份常量代答。
+#[test]
+fn the_turn_carries_no_iteration_ceiling_of_its_own() {
+    let text = source(ASSEMBLY);
+    assert!(
+        text.contains("max_iterations: u32::MAX"),
+        "这一段对话又给轮数写了一个数：界面上这位会比同事更早被要求「别查了，先答」"
+    );
+    assert!(
+        !text.contains("CHAT_ITERATIONS"),
+        "又长回一个只属于这个界面的轮数常量"
+    );
+
+    let chat = source(CHAT);
+    assert!(
+        !chat.contains("工具只有两类"),
+        "系统提示词又把工具写成一张闭集：手上有什么由进程装配决定，不由提示词裁剪"
+    );
+    assert!(
+        !chat.contains("按此口径回答"),
+        "系统提示词又硬编码了一套身份口径：员工是谁不该由一段预设写完"
     );
 }

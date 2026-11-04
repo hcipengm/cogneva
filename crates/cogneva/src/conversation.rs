@@ -1,8 +1,13 @@
 //! 界面上一段对话的一轮，跑在系统唯一的那条智能体循环上。
 //!
-//! 这里只做接线：把编排器的控制面做成一组工具（读台账、派活、催跑、撤回），装进
-//! 智能体内核的工具表，再用调用方给好的历史跑一轮。循环、守卫、预算、token 账与
-//! 总线事件都在内核里发生——与一件任务的一次尝试是同一条，不是并排的两条。
+//! 这里只做接线：把编排器的控制面做成一组工具（读台账、派活、催跑、撤回），把
+//! 系统自己那三本账（变更、原则、告警）做成另一组只读工具，装进智能体内核的
+//! 工具表，再用调用方给好的历史跑一轮。循环、守卫、预算、token 账与总线事件都在
+//! 内核里发生——与一件任务的一次尝试是同一条，不是并排的两条。
+//!
+//! 三本账让「这件事到哪一步了」由员工自己读出来：账上写着什么它就看见什么，不
+//! 必等谁去翻一下再回来告诉它。进化闭环的反馈就落在这三本账里——哪条需求还没落
+//! 地、哪条原则还没有门、哪里正亮着，读到的是读数而不是印象。
 //!
 //! 工具集就是**这个进程装配好的那一份**：它有什么工具由身体决定，不由"它是个什么
 //! 角色"决定。界面上的员工与 worker 池、小队是同一种数字员工，只是生命周期挂在会话
@@ -76,19 +81,34 @@ const INBOX_TAKEOVER_IDLE_MS: u64 = 5_000;
 // cap: bound — 一次回收调用要多少条待处理消息
 const INBOX_TAKEOVER_BATCH: usize = 16;
 
-/// 一段对话里最多几轮「想—用工具」。
-///
-/// 用完还想要工具的那一轮，内核不再给工具而直接要一个答案：问的是结论，不是又
-/// 一次动作。空转比答不出来更糟——人正等着。
-// cap: bound — 一段对话里允许的工具往返次数
-const CHAT_ITERATIONS: u32 = 6;
-
 /// 一次 `list_tasks` 最多回多少行。
 // cap: bound — 一次读台账回多少行；整张图会把上下文和这次回答一起淹掉
 const LIST_TASKS_LIMIT: usize = 40;
 /// 调用方没给 `limit` 时回多少行。
 // cap: bound — 默认页只有上限的一半：上限是显式要多的人能拿到的，默认值给的是「一眼扫完、还能接着问」的量
 const LIST_TASKS_DEFAULT: usize = 20;
+
+/// 一次读变更账向账本要多少行，也是调用方能要到的上限。
+///
+/// 未了结的那本账有几千行，全取回来会把这一轮的上下文和这次回答一起淹掉。取回来
+/// 再按调用方的 `match`/`state` 筛，所以窗口要够筛而不是刚好够看。
+// cap: bound — 一次读变更账向账本要多少行
+const LIST_CHANGES_WINDOW: usize = 40;
+/// 调用方没给 `limit` 时回多少行。
+// cap: bound — 默认页是窗口的一半：够扫一眼，也留得住接着追问的余地
+const LIST_CHANGES_DEFAULT: usize = 20;
+/// 一条变更的历史最多回几步。
+// cap: bound — 一次 `get_change` 回多少条状态迁移；更早的那几步读不出「现在在哪」以外的信息
+const CHANGE_HISTORY_LIMIT: usize = 20;
+/// 一次读原则账向账本要多少行，也是调用方能要到的上限。
+// cap: bound — 一次读原则账向账本要多少行
+const LIST_PRINCIPLES_WINDOW: usize = 40;
+/// 调用方没给 `limit` 时回多少行。
+// cap: bound — 默认页是窗口的一半，理由同变更账那一对
+const LIST_PRINCIPLES_DEFAULT: usize = 20;
+/// 一次读告警最多回几条。
+// cap: bound — 一次读告警回几条；亮着的告警多到看不完时，本身就是要先说出来的事
+const ACTIVE_ALERTS_LIMIT: usize = 20;
 
 /// 这一段对话在名册里的身份：名字与 id。
 ///
@@ -154,6 +174,9 @@ pub struct PlatformConversation {
     /// 收件箱。与名册是两半：只有名册没有收件箱，消息投进一个没人读的流；只有
     /// 收件箱没有名册，同事根本发现不了这个地址。缺哪一半都由进程如实缺席。
     inbox: Option<Arc<dyn cog_core::MessageBackend>>,
+    /// 三本只读账。读它们回答的是「这件事现在到哪一步了」——答案来自账，不是
+    /// 来自印象，也不是从某面墙上抄下来的一段话。
+    ledgers: Ledgers,
 }
 
 impl PlatformConversation {
@@ -164,6 +187,7 @@ impl PlatformConversation {
         tools: Option<Arc<cog_agent::ToolRegistry>>,
         roster: Option<Arc<dyn cog_core::AgentRegistry>>,
         inbox: Option<Arc<dyn cog_core::MessageBackend>>,
+        ledgers: Ledgers,
     ) -> Self {
         Self {
             orchestrator,
@@ -172,6 +196,7 @@ impl PlatformConversation {
             tools,
             roster,
             inbox,
+            ledgers,
         }
     }
 }
@@ -188,7 +213,14 @@ impl ConversationTurn for PlatformConversation {
             let config = RuntimeConfig {
                 agent_id: employee.id.clone(),
                 role: CHAT_ROLE.to_string(),
-                max_iterations: CHAT_ITERATIONS,
+                // 没有轮数上限：这一轮什么时候结束，由**模型自己不再要工具**来定，
+                // 就像人说话——问一句「你查完了没有」不该由一份常量代答。这里曾经
+                // 写着一个比平台默认还小的数，界面上这位于是比任何同事都早被要求
+                // 「别查了，先答」，而那正是它答不出「这件事落地了没有」的一半原因。
+                //
+                // 止损不靠轮数：卡住由内核的单步停滞超时兜底，上下文有自己的窗口，
+                // 花销记在使用账上。轮数是这三样缺位时的替代品，这里不再拿它当尺。
+                max_iterations: u32::MAX,
                 ..Default::default()
             };
             // 工具面 = 这个进程装配好的那一份 ＋ 控制面五只。
@@ -200,6 +232,11 @@ impl ConversationTurn for PlatformConversation {
                 for tool in shared.list() {
                     tools.register(tool);
                 }
+            }
+            // 三本只读账与控制面五只同一处装：它们读的也是这个进程里已发布的
+            // 服务，缺的那本由进程如实缺席，而工具会把它说出来。
+            for tool in ledger_tools(&self.ledgers) {
+                tools.register(tool);
             }
             for tool in control_plane_tools(
                 self.orchestrator.clone(),
@@ -615,6 +652,414 @@ fn control_plane_tools(
         .collect()
 }
 
+/// 三本只读账：变更、原则、告警。
+///
+/// 它们在本进程里就是已发布的服务——与网关上那些面板读的是同一批行，没有第二份
+/// 拷贝、没有第二个口径。员工因此不必等谁去翻一下再回来告诉它：一件事现在到哪
+/// 一步、有没有门管着、哪里正亮着，它自己读得到，读到的就是账上写着的。
+///
+/// 只读是这一层的边界，不是员工能力的边界：要改账就得走它自己的那条门（派活、
+/// 提交、拒绝），而「判定这件事做完了没有」永远由看树的那一侧写，不由声称做完
+/// 的那一侧写。
+#[derive(Clone, Default)]
+pub struct Ledgers {
+    /// 变更账：一条需求现在在哪一步，最后一次量是什么时候、读的哪个版本。
+    pub changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>,
+    /// 原则账：一条原则的正文、载体、它在哪会红、现在有没有门。
+    pub principles: Option<Arc<dyn cog_core::PrincipleLedgerStore>>,
+    /// 告警：现在亮着的那几条。
+    pub alerts: Option<Arc<dyn cog_core::AlertStore>>,
+}
+
+/// 三本账装成四只工具：两只看变更（列表与单条），一只看原则，一只看告警。
+fn ledger_tools(ledgers: &Ledgers) -> Vec<Tool> {
+    vec![
+        list_changes_tool(ledgers.changes.clone()),
+        get_change_tool(ledgers.changes.clone()),
+        list_principles_tool(ledgers.principles.clone()),
+        active_alerts_tool(ledgers.alerts.clone()),
+    ]
+}
+
+/// 一本账在这个进程里缺席时回的那一条。
+///
+/// 不能回一个空列表：「这个进程没接到账」与「账上一条都不欠」是两个相反的读数，
+/// 而把它们读成同一个的正是正在追这件事的人——一条真欠着的活就此消失，谁也不会
+/// 再去问它。
+fn ledger_absent(what: &str) -> serde_json::Value {
+    serde_json::json!({
+        "available": false,
+        "note": format!(
+            "这个进程没有接到{what}：本部署里它没有被发布，所以这里读不到。\
+             这是「读不到」，不是「{what}上没有东西」——别把这一句转述成「没有」。"
+        ),
+    })
+}
+
+/// 账上的时刻按 RFC 3339 回：模型引用它时要照抄，而抄一个半句话的调试格式会在
+/// 下一次引用时对不上。
+fn stamp(at: Option<chrono::DateTime<chrono::Utc>>) -> Option<String> {
+    at.map(|t| t.to_rfc3339())
+}
+
+fn limit_of(args: &serde_json::Value, ceiling: usize, default: usize) -> usize {
+    args.get("limit")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(1, ceiling))
+        .unwrap_or(default)
+}
+
+/// 一个词形的参数：去空白、转小写，空串当没给。
+fn word_arg(args: &serde_json::Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+}
+
+fn make_tool(
+    name: &str,
+    description: &str,
+    parameters: serde_json::Value,
+    handler: ToolHandler,
+) -> Tool {
+    Tool {
+        name: name.to_string(),
+        description: description.to_string(),
+        parameters,
+        implementation: ToolImplementation::Native(handler),
+    }
+}
+
+/// 一条变更压成模型读得动的一小段。
+///
+/// 「落地了没有」的答案由四列一起给：`state` 说最后一次看树看到了什么，
+/// `delivered_rev` 说这条改动进过哪个提交，`landed_at` 说哪一次量它满足了，
+/// `measured_rev` 说那次量读的是哪个树。缺了后两列，「landed」会被读成「刚才量的」，
+/// 而它可能是一个月前量的。
+fn change_summary(row: &cog_core::ChangeLedgerRow) -> serde_json::Value {
+    serde_json::json!({
+        "identity": row.identity.as_key(),
+        "kind": row.identity.kind,
+        "scope": row.identity.scope,
+        "literal": row.identity.literal,
+        "state": row.state.as_str(),
+        "priority": row.priority().as_str(),
+        "block": row.block().as_str(),
+        "title": row.title,
+        "assertion": row.assertion,
+        "measured_at": stamp(row.measured_at),
+        "measured_rev": row.measured_rev,
+        "delivered_rev": row.delivered_rev,
+        "landed_at": stamp(row.landed_at),
+        "unsettled_reason": row.unsettled_reason,
+        "holds_the_line": row.holds_the_line(),
+        "sources": row
+            .sources
+            .iter()
+            .map(|source| {
+                serde_json::json!({
+                    "doc": source.doc,
+                    "verdict": source.verdict,
+                    "priority": source.priority.as_str(),
+                    "block": source.block.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn event_summary(event: &cog_core::ChangeLedgerEvent) -> serde_json::Value {
+    serde_json::json!({
+        "observed_at": event.observed_at.to_rfc3339(),
+        "from": event.from_state.map(|state| state.as_str()),
+        "to": event.to_state.as_str(),
+        "measured_rev": event.measured_rev,
+        "retire_reason": event.retire_reason.map(|reason| reason.as_str()),
+        "unsettled_reason": event.unsettled_reason,
+    })
+}
+
+/// 这一行有没有在说这几个字：身份、标题、正文三处都算。
+fn change_says(row: &cog_core::ChangeLedgerRow, needle: &str) -> bool {
+    let haystack = format!(
+        "{} {} {}",
+        row.identity.as_key(),
+        row.title.as_deref().unwrap_or_default(),
+        row.assertion.as_deref().unwrap_or_default()
+    );
+    haystack.to_lowercase().contains(needle)
+}
+
+fn list_changes_tool(changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>) -> Tool {
+    make_tool(
+        "list_changes",
+        "读变更账：哪些需求还没落地、各自停在哪一步、上一次量到的是什么。\
+         回答「这件事做完了没有、卡在哪」之前先读它，按 `match` 找到那几条再看 state、\
+         delivered_rev、landed_at。这是只读：它改不了账，也不会把哪一条标成做完——\
+         做完只有看树的那一侧量得出来。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "match": {
+                    "type": "string",
+                    "description": "只看身份、标题或正文里含这几个字的行"
+                },
+                "state": {
+                    "type": "string",
+                    "description": "只看这一种状态：conflict / pending / partial / undecided——这四种是还没落地的"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "最多回几行，默认 20"
+                }
+            }
+        }),
+        native(move |args| {
+            let changes = changes.clone();
+            async move {
+                let Some(store) = changes else {
+                    return Ok(ledger_absent("变更账"));
+                };
+                let limit = limit_of(&args, LIST_CHANGES_WINDOW, LIST_CHANGES_DEFAULT);
+                let wanted = word_arg(&args, "state");
+                let needle = word_arg(&args, "match");
+
+                let census = store.census().await?;
+                let mut rows = store.outstanding(LIST_CHANGES_WINDOW).await?;
+                if let Some(wanted) = &wanted {
+                    rows.retain(|row| row.state.as_str() == wanted);
+                }
+                if let Some(needle) = &needle {
+                    rows.retain(|row| change_says(row, needle));
+                }
+                rows.truncate(limit);
+
+                // 欠账总额从普查来，不从这一页来：这一页是筛过的、截过的，
+                // 拿它当总数会把「还有多少没做完」读成一句谎话。
+                let owed: u64 = census
+                    .iter()
+                    .filter(|(state, _)| state.is_outstanding())
+                    .map(|(_, rows)| rows)
+                    .sum();
+                let terminal_asked = wanted
+                    .as_deref()
+                    .and_then(|word| word.parse::<cog_core::ChangeState>().ok())
+                    .is_some_and(|state| !state.is_outstanding());
+
+                Ok(serde_json::json!({
+                    "available": true,
+                    "owed_total": owed,
+                    "census": census
+                        .iter()
+                        .map(|(state, rows)| serde_json::json!({
+                            "state": state.as_str(),
+                            "rows": rows,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "returned": rows.len(),
+                    "changes": rows.iter().map(change_summary).collect::<Vec<_>>(),
+                    "note": terminal_asked.then_some(
+                        "landed 与 retired 是两种了结的结局，不进未了结的那本账，所以这里只\
+                         回得出它们的条数（在上面的 census 里）。问某一条就用 get_change。"
+                    ),
+                }))
+            }
+        }),
+    )
+}
+
+fn get_change_tool(changes: Option<Arc<dyn cog_core::ChangeLedgerStore>>) -> Tool {
+    make_tool(
+        "get_change",
+        "读变更账里的一条：它现在在哪一步、什么时候量过、是不是某次提交交付的，\
+         以及它是怎么一步步走到这里的（history）。身份是三段，照抄 list_changes 回给你的\
+         那三段——不要自己把 `kind:scope:literal` 这串拆开，正文里常带冒号，拆错了问的\
+         就是另一条变更。这是只读：它不会把这一条标成做完。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": { "type": "string", "description": "检查的种类，如 grep / absent / exists" },
+                "scope": { "type": "string", "description": "检查看哪里：一个路径或一个目录" },
+                "literal": { "type": "string", "description": "逐字匹配的那段正文" }
+            },
+            "required": ["kind", "scope", "literal"]
+        }),
+        native(move |args| {
+            let changes = changes.clone();
+            async move {
+                let Some(store) = changes else {
+                    return Ok(ledger_absent("变更账"));
+                };
+                let identity = cog_core::ChangeIdentity::new(
+                    require_str(&args, "kind")?,
+                    require_str(&args, "scope")?,
+                    require_str(&args, "literal")?,
+                );
+                let Some(row) = store.get(&identity).await? else {
+                    return Ok(serde_json::json!({
+                        "available": true,
+                        "found": false,
+                        "note": "账上没有这条身份。三段里任何一段差一个字都是一条不同的变更；\
+                                 用 list_changes 按字面找一遍。",
+                    }));
+                };
+                let events = store.events(&identity, CHANGE_HISTORY_LIMIT).await?;
+                Ok(serde_json::json!({
+                    "available": true,
+                    "found": true,
+                    "change": change_summary(&row),
+                    "history": events.iter().map(event_summary).collect::<Vec<_>>(),
+                }))
+            }
+        }),
+    )
+}
+
+fn principle_summary(row: &cog_core::PrincipleRow) -> serde_json::Value {
+    serde_json::json!({
+        "slug": row.slug,
+        "lead": row.lead,
+        "carrier_path": row.carrier_path,
+        "host_gate": row.host_gate,
+        "where_red": row.where_red,
+        "platform_gate": row.platform_gate,
+        "check_kind": row.check_kind.map(|kind| kind.as_str()),
+        "state": row.state.map(|state| state.as_str()),
+        "priority": row.priority.as_str(),
+        "refusals": row.refusals,
+        "measured_at": stamp(row.measured_at),
+        "measured_rev": row.measured_rev,
+    })
+}
+
+fn list_principles_tool(principles: Option<Arc<dyn cog_core::PrincipleLedgerStore>>) -> Tool {
+    make_tool(
+        "list_principles",
+        "读原则账。给了 `paths` 就回答「我要改这几个文件，哪几条原则管着它、在哪会红」——\
+         动手前先读它；不给 `paths` 就回答「哪些原则还没有门」。每一行带触发条件与判据：\
+         `where_red` 是它在哪会红，`check_kind` 是它按哪种方式判（shape 是动手之前判、\
+         tree 是事后走一遍树、live 是读运行中的系统、judgement 归人）。这是只读。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "要改的路径；给了就只回门立在这些路径上的原则"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "最多回几行，默认 20"
+                }
+            }
+        }),
+        native(move |args| {
+            let principles = principles.clone();
+            async move {
+                let Some(store) = principles else {
+                    return Ok(ledger_absent("原则账"));
+                };
+                let limit = limit_of(&args, LIST_PRINCIPLES_WINDOW, LIST_PRINCIPLES_DEFAULT);
+                let paths: Vec<String> = args
+                    .get("paths")
+                    .and_then(|v| v.as_array())
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_str())
+                            .map(str::trim)
+                            .filter(|path| !path.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                let census = store.census().await?;
+                let kinds = store.check_kind_census().await?;
+                let (mode, mut rows) = if paths.is_empty() {
+                    (
+                        "outstanding",
+                        store.outstanding(LIST_PRINCIPLES_WINDOW).await?,
+                    )
+                } else {
+                    (
+                        "gating",
+                        store.gating_paths(&paths, LIST_PRINCIPLES_WINDOW).await?,
+                    )
+                };
+                rows.truncate(limit);
+
+                Ok(serde_json::json!({
+                    "available": true,
+                    "mode": mode,
+                    "paths": paths,
+                    "census": {
+                        "enforced": census.enforced,
+                        "unenforced": census.unenforced,
+                        "unmeasured": census.unmeasured,
+                        "retired": census.retired,
+                        "rows": census.rows(),
+                        "coverage": census.coverage(),
+                    },
+                    "check_kind_census": {
+                        "shape": kinds.shape,
+                        "tree": kinds.tree,
+                        "live": kinds.live,
+                        "judgement": kinds.judgement,
+                        "undeclared": kinds.undeclared,
+                    },
+                    "returned": rows.len(),
+                    "principles": rows.iter().map(principle_summary).collect::<Vec<_>>(),
+                }))
+            }
+        }),
+    )
+}
+
+fn active_alerts_tool(alerts: Option<Arc<dyn cog_core::AlertStore>>) -> Tool {
+    make_tool(
+        "active_alerts",
+        "读现在亮着的告警，新的在前。回答「系统现在有没有事」之前先读它。\
+         这是只读：它不消警、不确认，也不替谁判断这条告警该不该处理。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "最多回几条，默认 20"
+                }
+            }
+        }),
+        native(move |args| {
+            let alerts = alerts.clone();
+            async move {
+                let Some(store) = alerts else {
+                    return Ok(ledger_absent("告警账"));
+                };
+                let limit = limit_of(&args, ACTIVE_ALERTS_LIMIT, ACTIVE_ALERTS_LIMIT);
+                let rows = store.list_active(limit);
+                Ok(serde_json::json!({
+                    "available": true,
+                    "returned": rows.len(),
+                    "alerts": rows
+                        .iter()
+                        .map(|alert| serde_json::json!({
+                            "id": alert.id,
+                            "severity": alert.severity.as_str(),
+                            "event_type": alert.event_type,
+                            "message": alert.message,
+                            "agent_id": alert.agent_id,
+                            "task_id": alert.task_id,
+                            "timestamp": alert.timestamp.to_rfc3339(),
+                        }))
+                        .collect::<Vec<_>>(),
+                }))
+            }
+        }),
+    )
+}
+
 /// 把一次工具调用包成内核认的 handler：一个值进、一个值出。
 fn native<F, Fut>(f: F) -> ToolHandler
 where
@@ -956,6 +1401,119 @@ mod tests {
                 assert!(!name.persona.is_empty(), "员工没有名字");
             }
         }
+    }
+
+    /// 三本账装成四只只读工具，每一只都说得出它读的是哪一本。
+    ///
+    /// 「只读」是这一层的边界：判一条需求做完了没有只能由看树的那一侧写，读账的
+    /// 人也去写就成了自己给自己发完成证明。加一只工具要在这里说清它读什么，而名字
+    /// 里出现派活、撤回、重跑这类动作的，就不是读账。
+    #[test]
+    fn the_ledger_tools_read_the_three_accounts_and_change_nothing() {
+        let tools = ledger_tools(&Ledgers::default());
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "list_changes",
+                "get_change",
+                "list_principles",
+                "active_alerts"
+            ],
+            "账工具是闭集：加一只就要在这里说清它读哪本账"
+        );
+        for tool in &tools {
+            assert!(!tool.description.trim().is_empty(), "{}", tool.name);
+            assert_eq!(tool.parameters["type"], "object", "{}", tool.name);
+            assert!(
+                tool.description.contains("只读"),
+                "{} 没有说自己是只读的：模型会以为它能替谁把账改了",
+                tool.name
+            );
+            for banned in ["dispatch", "cancel", "retry", "write", "run", "exec"] {
+                assert!(!tool.name.contains(banned), "{} 不是读账", tool.name);
+            }
+        }
+    }
+
+    /// 账缺席时说的必须是「读不到」，不能是「没有」。
+    ///
+    /// 回一个空列表，读者会把「这个进程没接到账」读成「账上一条都不欠」——两个
+    /// 相反的读数，而正要追这件事的人看到的正好是后者，于是这条活谁也不会再去问。
+    #[tokio::test]
+    async fn an_absent_ledger_says_it_cannot_read_rather_than_that_nothing_is_owed() {
+        for tool in ledger_tools(&Ledgers::default()) {
+            let ToolImplementation::Native(handler) = tool.implementation else {
+                panic!("{} 不是原生工具", tool.name);
+            };
+            let answer = handler(serde_json::json!({}))
+                .await
+                .unwrap_or_else(|e| panic!("{} 连一句「读不到」都没给出来：{e}", tool.name));
+            assert_eq!(answer["available"], false, "{}", tool.name);
+            assert!(
+                answer["note"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("读不到"),
+                "{} 把缺席说成了别的什么：{}",
+                tool.name,
+                answer["note"]
+            );
+            for list in ["changes", "principles", "alerts"] {
+                assert!(
+                    answer.get(list).is_none(),
+                    "{} 在账缺席时回了一份 {list}：空的清单读起来就是「一条都不欠」",
+                    tool.name
+                );
+            }
+        }
+    }
+
+    /// 一条变更的那几列要一起给。
+    ///
+    /// 只给 state 是不够的：「landed」只说某一次量看到了，不说量的是哪个树、是不
+    /// 是某个提交交付的。缺了后两列，一个月前量的 landed 会被读成刚才量的。
+    #[test]
+    fn a_change_row_carries_which_tree_it_measured_and_which_commit_delivered_it() {
+        let identity = cog_core::ChangeIdentity::new("grep", "crates/x/src", "a:b");
+        let row = cog_core::ChangeLedgerRow {
+            identity: identity.clone(),
+            state: cog_core::ChangeState::Pending,
+            title: Some("把 a:b 写进去".into()),
+            assertion: Some("这一行必须出现".into()),
+            sources: vec![cog_core::ChangeSource {
+                doc: "internal-docs/2026-11-04_x.md".into(),
+                verdict: Some("pending".into()),
+                priority: cog_core::ChangePriority::P1,
+                block: cog_core::ChangeBlock::NONE,
+            }],
+            first_seen_at: chrono::Utc::now(),
+            measured_at: Some(chrono::Utc::now()),
+            measured_rev: Some("def456".into()),
+            delivered_rev: Some("abc123".into()),
+            landed_at: None,
+            unsettled_reason: None,
+            retire_reason: None,
+            retired_at: None,
+        };
+        let summary = change_summary(&row);
+        // 三段分开给：正文里带冒号时，`kind:scope:literal` 这串拆不回来，而
+        // `get_change` 要的正是三段。
+        assert_eq!(summary["kind"], "grep");
+        assert_eq!(summary["scope"], "crates/x/src");
+        assert_eq!(summary["literal"], "a:b");
+        assert_eq!(summary["state"], "pending");
+        assert_eq!(summary["priority"], "p1");
+        assert_eq!(summary["measured_rev"], "def456");
+        assert_eq!(summary["delivered_rev"], "abc123");
+        assert_eq!(
+            summary["holds_the_line"], true,
+            "交付了却还欠着＝这条改动正压在线上，必须读得出来"
+        );
+        assert_eq!(
+            summary["sources"][0]["doc"],
+            "internal-docs/2026-11-04_x.md"
+        );
     }
 
     /// 同事发来的话怎么进这一轮的历史。
