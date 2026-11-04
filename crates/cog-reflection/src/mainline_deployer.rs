@@ -1519,7 +1519,8 @@ const CI_HOLD_FACE: &str = "CI/构建/部署";
 ///
 /// 与目标行分开：目标行是不可执行的锚点，读面靠它认「一次提交」；这一行是活本身。
 /// id 同样由 rev、扣住起点与日期推出，理由与 [`ci_hold_goal_id`] 相同——扣住期间每
-/// 一轮都会走到这里。
+/// 一轮都会走到这里。这是**第一轮**的那个 id；它办完之后扣住还站着，下一轮从图里
+/// 读出来，见 `MainlineDeployer::live_ci_hold_fix_id`。
 pub(crate) fn ci_hold_fix_task_id(rev: &str, day: &str, since_unix: i64) -> String {
     format!("{}-fix", ci_hold_goal_id(rev, day, since_unix))
 }
@@ -1530,6 +1531,12 @@ pub(crate) fn ci_hold_fix_task_id(rev: &str, day: &str, since_unix: i64) -> Stri
 /// `process_goal_impl` 里「全部都是自演化意图」那一支）：分解正是这里要绕开的那
 /// 一步——模型不可用的时候，扣住不能连一行都不落。
 const CI_HOLD_FIX_KIND: &str = "ci_hold_fix";
+
+/// 同一版、同一次扣住、同一天里，修复单最多往后开到第几轮。
+///
+/// 轮次不是时间表，是「上一行已经终结了，而扣住还站着」的计数：每一轮都要有一行
+/// 真的办完才会走到下一轮，所以这个上界只在别的地方出错时才会被撞到。
+const CI_HOLD_FIX_ROUNDS: usize = 32;
 
 /// 这一轮**谁在管**这次扣住。0/1 只答「有没有人管」，而「没人管」有两种，修法在
 /// 完全不同的两侧：没有编排器是部署器的装配问题，提交被拒是被提交的那一侧拒了。
@@ -5128,11 +5135,10 @@ impl MainlineDeployer {
                 // 会在每一轮这里读到「有主」，而图里其实一条能跑的都没有。
                 let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
                 let fix_id = ci_hold_fix_task_id(rev, &day, since_unix);
-                if orchestrator
-                    .get_task(&fix_id)
-                    .await
-                    .is_some_and(|task| task.is_executable)
-                {
+                // 与后面那一处同一个判据，问的也是同一件事：这张单子**还**有人跑吗。
+                // 只读 `is_executable` 会把办完的单子读成有人在办——2026-11-05 实测
+                // `…-fix` 已经 `completed` 而扣住仍然站着，这一支于是每轮都回「有主」。
+                if self.any_row_can_run(orchestrator, &[fix_id.clone()]).await {
                     info!(
                         rev = %rev12(rev),
                         goal_id = %id,
@@ -5240,13 +5246,18 @@ impl MainlineDeployer {
         }
     }
 
-    /// 这一笔进图的行里，有没有至少一条是能跑的。
+    /// 这一笔进图的行里，有没有至少一条是**还能跑**的。
     ///
-    /// 判据读的是行自己的 `is_executable`，不是它所在的种类、也不是它的状态：
-    /// 一条 `Pending` 的锚点行与一条 `Pending` 的工作行在状态上完全相同，只有
-    /// 这一格分得开「有人会去修」与「只有一行身份标记」。读不到的行按不能跑算
-    /// ——多开一张单是无害的（id 由 rev、当天与扣住起点推出，图按幂等跳过），
-    /// 少开一张就是一条没人接住的扣住。
+    /// 判据读的是行自己的 `is_executable`，不是它所在的种类：一条 `Pending` 的
+    /// 锚点行与一条 `Pending` 的工作行在状态上完全相同，只有这一格分得开「有人
+    /// 会去修」与「只有一行身份标记」。读不到的行按不能跑算——多开一张单是无害的
+    /// （id 由 rev、当天与扣住起点推出，图按幂等跳过），少开一张就是一条没人接住
+    /// 的扣住。
+    ///
+    /// 终结的行也不算能跑：`is_executable` 说的是这一行**能不能**被执行，不是它
+    /// **还**有没有人要执行。2026-11-05 实测，`ci-red-4262e261f755-…-fix` 已经
+    /// `completed` 而 CI 仍然红着，这一格把那条走完的单子读成「有人在办」，读数
+    /// `cogneva_ci_hold_unowned` 一直是 0，整条扣住就此停在一张没人会再跑的单子上。
     async fn any_row_can_run(
         &self,
         orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
@@ -5254,11 +5265,51 @@ impl MainlineDeployer {
     ) -> bool {
         for id in rows {
             match orchestrator.get_task(id).await {
-                Some(task) if task.is_executable => return true,
+                Some(task) if task.is_executable && !task.status.is_terminal() => return true,
                 _ => continue,
             }
         }
         false
+    }
+
+    /// 这一次扣住该落在哪一行上。
+    ///
+    /// 基础 id 由 rev、扣住起点与日期推出，扣住还在的每一轮读到的都是它；可这一行
+    /// 在图上只活到终结为止——办完之后同一个 id 再提交就是幂等空操作，扣住会一直
+    /// 等一条没有人会再跑的单子（见 [`Self::any_row_can_run`] 的现场）。所以轮次从
+    /// 图里读：第一个还没终结的那一行就是这一轮该办的那一行，全都终结了就顺着往后
+    /// 开一行新的。轮次不另存一份计数，图自己就是那本账——两个副本在同一轮里问同
+    /// 一张图，读到的也是同一个答案。
+    ///
+    /// 一行都没有时报基础 id 而不是往后跳：这个 id 的幂等正是「同一轮里两个副本
+    /// 都递同一张单」不变成两张单的全部依据。
+    async fn live_ci_hold_fix_id(
+        orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
+        rev: &str,
+        day: &str,
+        since_unix: i64,
+    ) -> String {
+        let base = ci_hold_fix_task_id(rev, day, since_unix);
+        let mut last = base.clone();
+        for round in 1..=CI_HOLD_FIX_ROUNDS {
+            let id = if round == 1 {
+                base.clone()
+            } else {
+                format!("{base}-r{round}")
+            };
+            match orchestrator.get_task(&id).await {
+                Some(task) if task.status.is_terminal() => last = id,
+                _ => return id,
+            }
+        }
+        // 一天里把这条扣住修满这么多轮仍然没修好，就已经不是「这一行办完了」而是
+        // 别的地方在错：换一个按此刻计时的新 id，至少不会再把扣住挂在一张死单上。
+        warn!(
+            rev = %rev12(rev),
+            rounds = CI_HOLD_FIX_ROUNDS,
+            "every repair round for this hold has already ended; opening a fresh one"
+        );
+        format!("{last}-{}", Utc::now().timestamp())
     }
 
     /// 把这条扣住落成一条**已经拆好的**行，绕开规划器的分解。
@@ -5269,8 +5320,9 @@ impl MainlineDeployer {
     /// 本来就有的那条免分解注入：规划器见「全是自演化意图」就直接交给 DAG，不叫模型。
     ///
     /// 与目标行同一个日程：id 由 rev、这次扣住的起点与日期推出，扣住期间每一轮都会
-    /// 走到这里，而图对已持有的 id 是幂等空操作——同一次扣住、同一天不会因此多出第
-    /// 二行。
+    /// 走到这里，而图对已持有的 id 是幂等空操作——同一行还在办的时候，多问几轮不会
+    /// 多出第二行。它办完之后才有下一轮：扣住还站着说明这一版仍然没有可用的修法，
+    /// 见 [`Self::live_ci_hold_fix_id`]。
     async fn file_ci_hold_fix(
         &self,
         orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
@@ -5281,7 +5333,7 @@ impl MainlineDeployer {
         since_unix: i64,
     ) -> (CiHoldOwner, Vec<String>) {
         let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
-        let id = ci_hold_fix_task_id(rev, &day, since_unix);
+        let id = Self::live_ci_hold_fix_id(orchestrator, rev, &day, since_unix).await;
         // 证据照原样放进来：接手的人先要读的就是那几条检查自己写下的失败点，而它们
         // 只在内存里活到这一段结束。
         let seen: Vec<serde_json::Value> = evidence
@@ -16472,6 +16524,13 @@ exec {real} "$@"
             }
         }
 
+        /// 把一行标成办完了：图上它还占着那个 id，但已经没有人会再跑它。
+        fn mark_completed(&self, id: &str) {
+            if let Some(task) = self.graph.lock().unwrap().get_mut(id) {
+                task.status = cog_core::TaskStatus::Completed;
+            }
+        }
+
         /// 图里这一行现在是什么状态；不存在的 id 给 `None`。
         ///
         /// 「提交成功」与「图里有一行活的」是两件事：同一个 id 再提交一次，真实 DAG
@@ -17441,6 +17500,97 @@ exec {real} "$@"
                 .get(cog_core::INPUT_READY_LANE)
                 .and_then(|lane| lane.as_str()),
             Some(cog_core::READY_LANE_STOP_THE_LINE)
+        );
+    }
+
+    /// 办完的修复单不再算「有人在办」。
+    ///
+    /// `is_executable` 答的是「这一行**能**被执行」，不是「**还**有人要执行它」。
+    /// 2026-11-05 的现场：`ci-red-4262e261f755-…-fix` 已经 `completed` 而 CI 仍
+    /// 红着，这一格把走完的单子读成有人接着干，`cogneva_ci_hold_unowned` 一直是 0。
+    #[tokio::test]
+    async fn a_completed_row_is_not_someone_working_on_the_hold() {
+        use cog_core::OrchestratorControl as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cfg = upstream_config(root, Path::new("/nonexistent"));
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")));
+        let orchestrator: std::sync::Arc<dyn cog_core::OrchestratorControl> = planner.clone();
+
+        let mut row = cog_core::Task::new(
+            "done-row".to_string(),
+            cog_core::TaskType::Custom("ci_hold_fix".into()),
+            serde_json::json!({}),
+        );
+        row.is_executable = true;
+        planner
+            .submit_goal_auto("hold", vec![row])
+            .await
+            .expect("the stand-in takes the row");
+        assert!(
+            deployer
+                .any_row_can_run(&orchestrator, &["done-row".to_string()])
+                .await,
+            "一步都没走的行是有人能接的"
+        );
+
+        planner.mark_completed("done-row");
+        assert!(
+            !deployer
+                .any_row_can_run(&orchestrator, &["done-row".to_string()])
+                .await,
+            "办完的行占着 id，但没有人会再跑它；读成有人办就是让整条扣住停在这张死单上"
+        );
+    }
+
+    /// 修复单办完之后，扣住还站着就再开一轮，而不是把同一张死单再交一次。
+    ///
+    /// 同一个 id 再提交是幂等空操作，图的回答仍然是「收下了」，于是读数写着有主、
+    /// 图里一行活的单子都没有。2026-11-05 的现场就是这样：`…-fix` 已经 `completed`，
+    /// 上游仍然红着，而部署器每一轮都在把这张单子重新递一遍。
+    #[tokio::test]
+    async fn a_repair_row_that_ended_opens_the_next_round() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        // 默认替身：收下这一笔，不拆子任务——每轮都会走到「自己开一张修复单」。
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let checks = vec!["github:Test".to_string()];
+        let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
+        let first = ci_hold_fix_task_id("abc123", &day, 100);
+
+        let (owner, rows) = deployer
+            .dispatch_ci_remediation("abc123", &checks, 100)
+            .await;
+        assert_eq!(owner, CiHoldOwner::Owned);
+        assert!(rows.contains(&first), "{rows:?}");
+        assert_eq!(planner.status(&first), Some(cog_core::TaskStatus::Pending));
+
+        // 这一行办完了，而扣住还站着：CI 仍然红。
+        planner.mark_completed(&first);
+        let (owner, rows) = deployer
+            .dispatch_ci_remediation("abc123", &checks, 100)
+            .await;
+        assert_eq!(owner, CiHoldOwner::Owned);
+        let second = format!("{first}-r2");
+        assert!(
+            rows.contains(&second),
+            "办完的那一行不能算这一轮有人接住了：{rows:?}"
+        );
+        assert_eq!(
+            planner.status(&second),
+            Some(cog_core::TaskStatus::Pending),
+            "读数说有主，图里就得有一行活的单子"
+        );
+        assert_eq!(
+            planner.status(&first),
+            Some(cog_core::TaskStatus::Completed),
+            "下一轮是新行，上一轮那行的结局不该被改写"
         );
     }
 
