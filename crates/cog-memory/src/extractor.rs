@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use cog_core::{EmbeddingProvider, SFResult};
 use cog_core::{RawSource, SchemaEntry, SchemaKind, SourceRef, SummaryEntry, NO_EMBEDDING_MODEL};
@@ -249,7 +249,7 @@ impl cog_core::MemoryIngestor for IngestionPipeline<RuleBasedExtractor> {
 // LLM-driven MemoryExtractor
 // ---------------------------------------------------------------------------
 
-use cog_core::{execute_structured, ChatOptions, LlmClient};
+use cog_core::{execute_structured, ChatOptions, LlmClient, SFError};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 struct ExtractedEntity {
@@ -335,6 +335,45 @@ impl CombinedExtraction {
     }
 }
 
+/// How many distinct prompts one process keeps an answer for.
+///
+/// The duplicates this exists for arrive within about a minute of each other:
+/// one conversation published once per run of the same task, each run carrying
+/// its own event timestamp and therefore its own raw id. A small window covers
+/// that, and the cap is on the number of answers (not on their inputs, which
+/// are not retained) simply so a long-lived process cannot accumulate them.
+const EXTRACTION_MEMO_CAPACITY: usize = 128;
+
+/// Answers already obtained for byte-identical prompts.
+///
+/// Two raw sources can carry the same text. Deduplicating by raw id does not
+/// catch that — the ids differ, and the prompt carries no id — so every copy
+/// used to be a full extraction over the same bytes. What is shared here is the
+/// *answer*: the store entries are still built per source, with that source's
+/// id and namespace, by the caller.
+#[derive(Default)]
+struct ExtractionMemo {
+    order: VecDeque<String>,
+    answers: HashMap<String, serde_json::Value>,
+}
+
+impl ExtractionMemo {
+    fn get(&self, key: &str) -> Option<serde_json::Value> {
+        self.answers.get(key).cloned()
+    }
+
+    fn put(&mut self, key: String, answer: serde_json::Value) {
+        if self.answers.insert(key.clone(), answer).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > EXTRACTION_MEMO_CAPACITY {
+            if let Some(old) = self.order.pop_front() {
+                self.answers.remove(&old);
+            }
+        }
+    }
+}
+
 /// LLM-driven [`MemoryExtractor`] implementation.
 /// Uses a configured [`LlmClient`] to perform:
 /// - Named-entity recognition (NER) + relation extraction + event extraction
@@ -350,6 +389,7 @@ pub struct LlmMemoryExtractor {
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     /// 一次抽取最多把多少估算 token 的 transcript 发出去（0 = 不设界）。
     input_budget_tokens: usize,
+    memo: Arc<Mutex<ExtractionMemo>>,
 }
 
 impl std::fmt::Debug for LlmMemoryExtractor {
@@ -368,7 +408,46 @@ impl LlmMemoryExtractor {
             options: ChatOptions::default().with_actor("memory"),
             embedder: None,
             input_budget_tokens: crate::config::DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
+            memo: Arc::new(Mutex::new(ExtractionMemo::default())),
         }
+    }
+
+    /// Ask the model for one structured answer, unless this process already has
+    /// the answer to this exact prompt.
+    ///
+    /// Keyed on the layer and the prompt text — which carries both the task
+    /// wording and the payload — so the two layers can never answer for each
+    /// other. The key is a digest because retaining the prompts themselves would
+    /// keep a copy of every transcript that was extracted.
+    ///
+    /// The lock is never held across the call: a duplicate that arrives while
+    /// the first is still running waits its turn rather than sharing it, which
+    /// is what the observed duplicates do anyway (the upstream is serialized).
+    async fn structured_cached<T>(&self, layer: &str, prompt: &str) -> SFResult<T>
+    where
+        T: schemars::JsonSchema + serde::de::DeserializeOwned + serde::Serialize,
+    {
+        let key = format!("{layer}:{}", blake3::hash(prompt.as_bytes()).to_hex());
+        let remembered = self
+            .memo
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&key);
+        if let Some(answer) = remembered {
+            return serde_json::from_value(answer).map_err(SFError::Serialization);
+        }
+        let answer: T = execute_structured(
+            &*self.provider,
+            &[cog_core::Message::user(prompt)],
+            &self.options,
+        )
+        .await?;
+        let value = serde_json::to_value(&answer).map_err(SFError::Serialization)?;
+        self.memo
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .put(key, value);
+        Ok(answer)
     }
 
     pub fn with_options(mut self, options: ChatOptions) -> Self {
@@ -412,37 +491,15 @@ impl LlmMemoryExtractor {
          scale of 1-10, where 10 is critical information that will be valuable in future \
          conversations, and 1 is trivial.";
 
-    /// The two halves of one prompt, kept apart so the stable one can stand first.
-    ///
-    /// 上游的前缀缓存从第一个字节开始比对：两次请求从这个字节起逐字相同的部分
-    /// 按缓存价读回，第一个不同的字节之后的整段按全价重买。任务说明在一次运行里
-    /// 逐字不变，transcript 每次都变，所以稳定的一半排在前面。
-    ///
-    /// 稳定块里不放任何随请求变化的值（source id、时间戳、transcript 的任何
-    /// 片段）：混进去一个，它后面整段就再也命中不了。变动块就是正文，怎么装仍
-    /// 由 [`Self::bounded_payload`] 决定——分块不新增读数，`PayloadOutcome` 还是
-    /// 从那一次计算里出来的同一个值。
-    fn split_prompt(
-        tasks: &str,
-        source: &RawSource,
-        input_budget_tokens: usize,
-    ) -> (String, String, PayloadOutcome) {
-        let (payload, outcome) = Self::bounded_payload(&source.payload, input_budget_tokens);
-        (tasks.to_string(), payload, outcome)
-    }
-
     /// The source is appended to the instructions exactly here, so every prompt
     /// path pays for the payload the same number of times — once.
-    ///
-    /// 稳定块在前、变动块在后：[`Self::split_prompt`] 决定哪一半是哪一半，这里
-    /// 只决定顺序。
     fn prompt(
         tasks: &str,
         source: &RawSource,
         input_budget_tokens: usize,
     ) -> (String, PayloadOutcome) {
-        let (stable, variable, outcome) = Self::split_prompt(tasks, source, input_budget_tokens);
-        (format!("{stable}\n\n{variable}"), outcome)
+        let (payload, outcome) = Self::bounded_payload(&source.payload, input_budget_tokens);
+        (format!("{tasks}\n\n{payload}"), outcome)
     }
 
     /// 一次抽取发出去的正文：装得下就原样，装不下就留头留尾、省掉中间。
@@ -548,38 +605,26 @@ impl LlmMemoryExtractor {
         )
     }
 
-    /// 一次运行里逐字不变的那段任务说明，写作一处。三个调用点各自拼一份「看起来
-    /// 一样」的字符串就谈不上稳定了，测试也只能拿真实的那一份去比。
-    fn schema_tasks() -> String {
-        format!("{} {}", Self::SCHEMA_TASK, Self::IMPORTANCE_TASK)
-    }
-
-    fn summary_tasks() -> String {
-        format!("{} {}", Self::SUMMARY_TASK, Self::IMPORTANCE_TASK)
-    }
-
-    fn combined_tasks() -> String {
-        format!(
-            "{} {}\n\n{} {}",
-            Self::SCHEMA_TASK,
-            Self::IMPORTANCE_TASK,
-            Self::SUMMARY_TASK,
-            Self::IMPORTANCE_TASK
-        )
-    }
-
     fn build_schema_prompt(
         source: &RawSource,
         input_budget_tokens: usize,
     ) -> (String, PayloadOutcome) {
-        Self::prompt(&Self::schema_tasks(), source, input_budget_tokens)
+        Self::prompt(
+            &format!("{} {}", Self::SCHEMA_TASK, Self::IMPORTANCE_TASK),
+            source,
+            input_budget_tokens,
+        )
     }
 
     fn build_summary_prompt(
         source: &RawSource,
         input_budget_tokens: usize,
     ) -> (String, PayloadOutcome) {
-        Self::prompt(&Self::summary_tasks(), source, input_budget_tokens)
+        Self::prompt(
+            &format!("{} {}", Self::SUMMARY_TASK, Self::IMPORTANCE_TASK),
+            source,
+            input_budget_tokens,
+        )
     }
 
     /// One prompt carrying both tasks, so one call can answer both. The two
@@ -589,7 +634,17 @@ impl LlmMemoryExtractor {
         source: &RawSource,
         input_budget_tokens: usize,
     ) -> (String, PayloadOutcome) {
-        Self::prompt(&Self::combined_tasks(), source, input_budget_tokens)
+        Self::prompt(
+            &format!(
+                "{} {}\n\n{} {}",
+                Self::SCHEMA_TASK,
+                Self::IMPORTANCE_TASK,
+                Self::SUMMARY_TASK,
+                Self::IMPORTANCE_TASK
+            ),
+            source,
+            input_budget_tokens,
+        )
     }
 
     /// Turn a schema extraction into store entries. The schema-only call and
@@ -716,12 +771,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
     async fn extract_schema(&self, source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
         let (prompt, outcome) = Self::build_schema_prompt(source, self.input_budget_tokens);
         note_payload_outcome(outcome);
-        let extraction: SchemaExtraction = execute_structured(
-            &*self.provider,
-            &[cog_core::Message::user(prompt)],
-            &self.options,
-        )
-        .await?;
+        let extraction: SchemaExtraction = self.structured_cached("schema", &prompt).await?;
 
         Ok(Self::schema_entries(source, extraction))
     }
@@ -729,12 +779,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
     async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry> {
         let (prompt, outcome) = Self::build_summary_prompt(source, self.input_budget_tokens);
         note_payload_outcome(outcome);
-        let extraction: SummaryExtraction = execute_structured(
-            &*self.provider,
-            &[cog_core::Message::user(prompt)],
-            &self.options,
-        )
-        .await?;
+        let extraction: SummaryExtraction = self.structured_cached("summary", &prompt).await?;
 
         self.summary_entry(source, extraction).await
     }
@@ -746,12 +791,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
     async fn extract_all(&self, source: &RawSource) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
         let (prompt, outcome) = Self::build_combined_prompt(source, self.input_budget_tokens);
         note_payload_outcome(outcome);
-        let extraction: CombinedExtraction = execute_structured(
-            &*self.provider,
-            &[cog_core::Message::user(prompt)],
-            &self.options,
-        )
-        .await?;
+        let extraction: CombinedExtraction = self.structured_cached("combined", &prompt).await?;
 
         let (schema, summary) = extraction.split();
         let entries = Self::schema_entries(source, schema);
@@ -900,6 +940,39 @@ mod tests {
         );
         assert_eq!(summary.text, "The gateway routed a deploy to the cluster.");
         assert_eq!(summary.importance, cog_core::importance_from_rating(6));
+    }
+
+    /// 同一段正文会以不同的 raw id 到达：同一次任务被跑了几遍，每遍的
+    /// AgentEnd 时间戳不同，于是 raw id 不同、而提示词逐字节相同。按 raw id
+    /// 去重看不见它们，提示词里也没有 id，所以每一份都曾是一次整段重抽。
+    /// 这条钉住的是「同一段正文只问一次」，同时钉住「复用答案不等于复用条目」：
+    /// 第二份的条目仍归它自己的 raw id。
+    #[tokio::test]
+    async fn the_same_transcript_is_extracted_once() {
+        let provider = Arc::new(ScriptedLlm::new(COMBINED_ANSWER));
+        let extractor = LlmMemoryExtractor::new(provider.clone());
+        let body = "gateway routed a deploy to the cluster";
+
+        let first = extractor.extract_all(&raw("raw-a", body)).await.unwrap();
+        let second = extractor.extract_all(&raw("raw-b", body)).await.unwrap();
+
+        assert_eq!(
+            provider.calls(),
+            1,
+            "one transcript reaching two raw ids must cost one call, not two"
+        );
+        assert_eq!(first.1.id, "summary-raw-a");
+        assert_eq!(
+            second.1.id, "summary-raw-b",
+            "the reused answer must still be stored under the source that asked"
+        );
+
+        // 不同的正文仍然各自去问：这条不是「一律只问一次」。
+        extractor
+            .extract_all(&raw("raw-c", "a different transcript"))
+            .await
+            .unwrap();
+        assert_eq!(provider.calls(), 2);
     }
 
     /// 模型在 `properties` 里写的就是它手上内容的形状：名单是数组、计数是
@@ -1352,37 +1425,5 @@ mod tests {
         let (schema, summary) = unconfigured.ingest(&source).await.expect("ordinary path");
         assert!(!schema.is_empty());
         assert_eq!(summary.namespace, "benchmark");
-    }
-
-    /// 前缀缓存从第一个字节开始比对，所以稳定的一半必须逐字不变：同一份任务
-    /// 说明、同样的预算，两份内容不同的 source 组装出的稳定块要一模一样，而且
-    /// 不许夹带 payload 的任何片段——混进去一个字，它后面整段就按全价重买。
-    #[test]
-    fn the_stable_half_is_byte_identical_across_sources() {
-        const FIRST: &str = "SENTINEL-FIRST-9a1";
-        const SECOND: &str = "SENTINEL-SECOND-4c7";
-        let budget = crate::config::DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS;
-
-        let tasks = LlmMemoryExtractor::schema_tasks();
-        let (first, first_body, _) =
-            LlmMemoryExtractor::split_prompt(&tasks, &raw("raw-a", FIRST), budget);
-        let (second, _, _) =
-            LlmMemoryExtractor::split_prompt(&tasks, &raw("raw-b", SECOND), budget);
-
-        assert_eq!(first, second, "the stable half moved between two sources");
-        assert!(
-            !first.contains(FIRST) && !first.contains(SECOND),
-            "the stable half must not carry the payload: {first}"
-        );
-
-        // 组装出来的提示词以稳定块开头、以变动块收尾：分块改的是顺序，不是内容。
-        let (prompt, _) = LlmMemoryExtractor::prompt(&tasks, &raw("raw-a", FIRST), budget);
-        assert!(prompt.starts_with(&first), "{prompt}");
-        assert!(prompt.ends_with(&first_body), "{prompt}");
-
-        // 三个调用点各有自己的一段说明，但都走同一条组装：谁的那段排在最前，
-        // 谁就被缓存读到。
-        let standalone = LlmMemoryExtractor::build_schema_prompt(&raw("raw-a", FIRST), budget);
-        assert_eq!(prompt, standalone.0);
     }
 }
