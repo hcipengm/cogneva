@@ -88,6 +88,22 @@ pub async fn drop_probe(pool: &PgPool, table: &str) {
         .unwrap();
 }
 
+/// How many transactions this database has committed since it started.
+///
+/// Two suites ask the same question for opposite reasons — one to show a burst
+/// costs a handful of commits, one to show a full queue does not turn every
+/// surplus event into its own connection and its own commit. The number is the
+/// only place that difference is visible: statement time is the same either
+/// way. The copy this replaces was already verbatim in both.
+pub async fn commits_on_this_database(pool: &PgPool) -> i64 {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT xact_commit FROM pg_stat_database WHERE datname = current_database()",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("read xact_commit")
+}
+
 /// Delete the ledger rows a case filed under `marker`.
 ///
 /// The marker is a slug prefix, so a case's own rows are named by the case and

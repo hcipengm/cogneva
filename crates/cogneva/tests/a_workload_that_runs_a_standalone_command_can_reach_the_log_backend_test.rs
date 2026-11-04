@@ -27,36 +27,9 @@ use common::routes::read;
 use common::routes::repo_root;
 use common::routes::walk;
 use common::rust_text;
+use common::yaml;
 
 use std::collections::{BTreeMap, BTreeSet};
-
-/// Every container object anywhere in the document, whatever workload kind
-/// carries it. The paths differ per kind and per profile, and a walk that only
-/// knew one of them would pass over the others silently.
-fn containers(value: &serde_yaml::Value, out: &mut Vec<serde_yaml::Mapping>) {
-    match value {
-        serde_yaml::Value::Mapping(map) => {
-            for (key, child) in map {
-                if key.as_str() == Some("containers") {
-                    if let serde_yaml::Value::Sequence(items) = child {
-                        for item in items {
-                            if let serde_yaml::Value::Mapping(container) = item {
-                                out.push(container.clone());
-                            }
-                        }
-                    }
-                }
-                containers(child, out);
-            }
-        }
-        serde_yaml::Value::Sequence(items) => {
-            for item in items {
-                containers(item, out);
-            }
-        }
-        _ => {}
-    }
-}
 
 fn strings_of(container: &serde_yaml::Mapping, key: &str) -> Vec<String> {
     container
@@ -127,7 +100,7 @@ fn every_workload_that_runs_a_standalone_command_can_reach_the_log_backend() {
                 continue;
             };
             let mut found = Vec::new();
-            containers(&value, &mut found);
+            yaml::containers(&value, &mut found);
             for container in &found {
                 let argv = strings_of(container, "args");
                 let Some(token) = argv.iter().find(|arg| watched.contains_key(arg.as_str())) else {

@@ -25,19 +25,12 @@ use sqlx::PgPool;
 
 use cog_test_support::database_url;
 
+mod common;
+
 /// 这一轮发多少条。要明显大于一批的上限（64），才看得出「按批提交」与
 /// 「按条提交」的差别；又要小到一次轮询能在几秒内等完。
 // cap: bound — 远大于批上限（64）以显出差别，又小到能在几秒内写完
 const BURST: usize = 300;
-
-async fn commits_on_this_database(pool: &PgPool) -> i64 {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT xact_commit FROM pg_stat_database WHERE datname = current_database()",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("read xact_commit")
-}
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
@@ -54,7 +47,7 @@ async fn a_burst_of_events_does_not_cost_one_commit_each() {
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
 
-    let before = commits_on_this_database(&pool).await;
+    let before = common::commits_on_this_database(&pool).await;
 
     // 走 trait 对象，与生产调用同一条路。
     let publisher: &dyn ObservabilityGateway = &gateway;
@@ -85,7 +78,7 @@ async fn a_burst_of_events_does_not_cost_one_commit_each() {
         "批写没有把每一条都写进表：{landed} / {BURST}"
     );
 
-    let after = commits_on_this_database(&pool).await;
+    let after = common::commits_on_this_database(&pool).await;
     let commits = after - before;
 
     // 先清理，再断言：判据红了也要把库留在接手时的样子。

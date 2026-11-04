@@ -22,9 +22,10 @@ use chrono::Utc;
 use cog_core::{AgentEvent, ObservabilityGateway};
 use cog_storage::PostgresObservabilityGateway;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
 
 use cog_test_support::database_url;
+
+mod common;
 
 /// 发多少条。要明显多过写队列的长度，才能保证发布期间队列一定满；队列长度是
 /// 实现细节，这里不抄它的值，只为「一定溢出」取个足够大的数。
@@ -35,15 +36,6 @@ const BURST: usize = 12000;
 /// 就不少于几千次。中间这一大片空白让判据不必贴着实现调。
 // cap: bound — 两种写法差一个数量级，取在中间
 const MAX_COMMITS: i64 = 1000;
-
-async fn commits_on_this_database(pool: &PgPool) -> i64 {
-    sqlx::query_scalar::<_, i64>(
-        "SELECT xact_commit FROM pg_stat_database WHERE datname = current_database()",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("read xact_commit")
-}
 
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
@@ -63,7 +55,7 @@ async fn a_stalled_writer_does_not_turn_each_surplus_event_into_a_connection_wai
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap_or_default()
     );
-    let before = commits_on_this_database(&pool).await;
+    let before = common::commits_on_this_database(&pool).await;
 
     // 占住唯一那条连接：发布期间写者拿不到它，队列因此堆满。
     let held = pool.acquire().await.expect("hold the only connection");
@@ -88,7 +80,7 @@ async fn a_stalled_writer_does_not_turn_each_surplus_event_into_a_connection_wai
     .fetch_one(&pool)
     .await
     .expect("count the rows");
-    let commits = commits_on_this_database(&pool).await - before;
+    let commits = common::commits_on_this_database(&pool).await - before;
 
     // 先清理，再断言：判据红了也要把库留在接手时的样子。
     sqlx::query("DELETE FROM cog_observability_events WHERE agent_id LIKE $1")

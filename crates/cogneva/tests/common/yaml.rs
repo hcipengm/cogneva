@@ -44,6 +44,39 @@ pub fn values_entry(file: &str, block: &str, key: &str) -> Option<String> {
     None
 }
 
+/// 文档里任何一支 `containers:` 下的容器对象，按出现顺序收进 `out`。
+///
+/// 逐层递归而不只认一条路径：工作负载的种类不同，容器在哪一层也不同，只认得
+/// 其中一种的走法会把其余几种静静放过去。init 容器不在其中——它们跑的是
+/// `sh -c` 的一两步，不产日志。
+///
+/// 这段遍历在两份清单测试里逐字写过两遍，各自只测一面（时区、日志后端）；抄件
+/// 各自演化的时候，两面读到的容器集合就不再是同一个。
+pub fn containers(value: &serde_yaml::Value, out: &mut Vec<serde_yaml::Mapping>) {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            for (key, child) in map {
+                if key.as_str() == Some("containers") {
+                    if let serde_yaml::Value::Sequence(items) = child {
+                        for item in items {
+                            if let serde_yaml::Value::Mapping(container) = item {
+                                out.push(container.clone());
+                            }
+                        }
+                    }
+                }
+                containers(child, out);
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                containers(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// `text` 里的每一篇 YAML 文档，按出现顺序；空文档（`---` 之间什么都没有）不算一篇。
 ///
 /// 解析不出来的文档是**失败**，不是跳过：丢掉它就把它带的规则一起丢掉了，闸门会在一片

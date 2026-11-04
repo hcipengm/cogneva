@@ -21,33 +21,7 @@ use crate::common;
 use common::routes::read;
 use common::routes::repo_root;
 use common::routes::walk;
-
-/// 文档里任何一支 `containers:` 下的容器对象。init 容器不在其中：它们跑的是
-/// `sh -c` 的一两步，不产日志。
-fn containers(value: &serde_yaml::Value, out: &mut Vec<serde_yaml::Mapping>) {
-    match value {
-        serde_yaml::Value::Mapping(map) => {
-            for (key, child) in map {
-                if key.as_str() == Some("containers") {
-                    if let serde_yaml::Value::Sequence(items) = child {
-                        for item in items {
-                            if let serde_yaml::Value::Mapping(container) = item {
-                                out.push(container.clone());
-                            }
-                        }
-                    }
-                }
-                containers(child, out);
-            }
-        }
-        serde_yaml::Value::Sequence(items) => {
-            for item in items {
-                containers(item, out);
-            }
-        }
-        _ => {}
-    }
-}
+use common::yaml;
 
 fn env_pairs(container: &serde_yaml::Mapping) -> Vec<(String, Option<String>)> {
     container
@@ -107,7 +81,7 @@ fn first_party_containers_carry_the_clusters_timezone_and_the_database_does_not(
                 continue;
             };
             let mut found = Vec::new();
-            containers(&value, &mut found);
+            yaml::containers(&value, &mut found);
             for container in &found {
                 let name = container
                     .get("name")
