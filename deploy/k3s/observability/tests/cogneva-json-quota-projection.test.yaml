@@ -1,0 +1,72 @@
+# quota 投影失败那一条的单测夹具：每一趟投影都失败时它响，好起来的那一趟把它清掉。
+#
+# 这条规则读的是 0/1 判词，不是计数器，所以它的坏法有两种，都只有夹具看得见：
+#   - 恒响：把窗口最小值写成「近四十分钟里出现过 1」就够了，一次好转之后仍然亮着；
+#   - 恒静：覆盖那一腿（八十个点的窗口里存在得比四十个点更久）写反或者写漏，
+#     最先漏掉的正是它想拦的那种情形——刚起来的进程拿第一拍就满足「四十分钟都失败」。
+# 结构门对这两种一视同仁地绿，promtool 跑一遍夹具才会红。
+
+rule_files:
+  - ../../../../deploy/helm/cogneva/files/cogneva.json
+
+# rule: quota_projection_failing_every_pass
+
+evaluation_interval: 1m
+
+tests:
+  # 一、一个人轴上的投影连续九十分钟每一趟都失败：判词一直是 1，同伴时间戳跟着时间走
+  # （所以新鲜那一腿成立），四十个点的窗口里最小值仍是 1，而这条序列在八十个点的窗口里
+  # 存在得比四十个点更久（覆盖那一腿成立）。此刻它必须响。
+  - interval: 1m
+    input_series:
+      - series: 'llm_quota_projection_failed{pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway",axis="person"}'
+        values: '1x90'
+      - series: 'llm_quota_projection_failed_observed_timestamp_seconds{pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway",axis="person"}'
+        values: '0+60x90'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: quota_projection_failing_every_pass
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              axis: person
+
+  # 二、负对照：同一份数据里判词一直是 0（每一趟都成功）。上面那一格若把判据写成
+  # `>= 0` 或者干脆不比较，这一格仍然会过——所以要它有，而不是拿「有人响过」当证明。
+  - interval: 1m
+    input_series:
+      - series: 'llm_quota_projection_failed{pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway",axis="person"}'
+        values: '0x90'
+      - series: 'llm_quota_projection_failed_observed_timestamp_seconds{pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway",axis="person"}'
+        values: '0+60x90'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: quota_projection_failing_every_pass
+        exp_alerts: []
+
+  # 三、刚起来的进程：判词从第三十六分钟才出现，到第四十五分钟只攒了十个点。窗口最小值
+  # 是 1，可它在八十个点的窗口里与四十个点的窗口里存在得一样久——覆盖那一腿不成立，
+  # 所以不许响。没有这一格，第一拍就亮的误报会被读成「投影真的坏了」。
+  - interval: 1m
+    input_series:
+      - series: 'llm_quota_projection_failed{pod="gw-2",container="gateway",instance="gw-2:8080",job="cogneva-gateway",axis="person"}'
+        values: '_x35 1x60'
+      - series: 'llm_quota_projection_failed_observed_timestamp_seconds{pod="gw-2",container="gateway",instance="gw-2:8080",job="cogneva-gateway",axis="person"}'
+        values: '0+60x90'
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: quota_projection_failing_every_pass
+        exp_alerts: []
+
+  # 四、好转了一趟：前五十分钟每一趟都失败，之后连续四十趟都成功。那时窗口最小值是 0，
+  # 这条规则必须已经灭了——规则说的是「每一趟都失败」，不是「曾经失败过很久」。
+  - interval: 1m
+    input_series:
+      - series: 'llm_quota_projection_failed{pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway",axis="person"}'
+        values: '1x50 0x40'
+      - series: 'llm_quota_projection_failed_observed_timestamp_seconds{pod="gw-1",container="gateway",instance="gw-1:8080",job="cogneva-gateway",axis="person"}'
+        values: '0+60x90'
+    alert_rule_test:
+      - eval_time: 89m
+        alertname: quota_projection_failing_every_pass
+        exp_alerts: []
