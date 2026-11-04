@@ -38,6 +38,7 @@ pub mod process_census;
 pub mod process_report;
 pub mod schema_bundle;
 pub mod scraper_endpoint;
+pub mod self_change;
 pub mod shutdown_coordinator;
 pub mod startup_guard;
 pub mod validate_config;

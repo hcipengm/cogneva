@@ -238,6 +238,13 @@ impl ConversationTurn for PlatformConversation {
             for tool in ledger_tools(&self.ledgers) {
                 tools.register(tool);
             }
+            // 改自己：一只，只申请不执行。它与上面那四只同一处装、同一本能读也能
+            // 写的账——读账是「现在到哪一步」，申请是「把它往前推一步」，两件事
+            // 用的是同一条记录，所以问「我提的那条呢」时答案就在它刚读过的地方。
+            tools.register(crate::self_change::tool(
+                self.ledgers.changes.clone(),
+                employee.id.clone(),
+            ));
             for tool in control_plane_tools(
                 self.orchestrator.clone(),
                 self.admission.clone(),

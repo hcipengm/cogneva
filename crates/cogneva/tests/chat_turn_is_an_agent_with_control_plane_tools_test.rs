@@ -354,3 +354,42 @@ fn the_turn_carries_no_iteration_ceiling_of_its_own() {
         "系统提示词又硬编码了一套身份口径：员工是谁不该由一段预设写完"
     );
 }
+
+/// 员工申请改自己：进的是账的入口，不是账的状态；尺子的名单复用系统那一份。
+///
+/// 「自己改自己」与「自己宣布自己改好了」是两件事，这一条钉的正是那道缝：申请
+/// 走的是 `declare`——账的读入队列，写进去的是一条没有状态的行；判它落没落地的
+/// 只有看树的那一侧。这一层要是出现了 `apply_measurement` 之类的入口，提的人
+/// 就成了给自己发完成证明的人，账上「落地了」这四个字也就不再是别人的读数。
+///
+/// 另一半是那把尺子：拒绝改判据载体用的必须是全系统一直在用的那份名单。另抄
+/// 一份的话，两份迟早说的不是同一件事，而这份名单正是决定「什么算尺子」的那一处。
+#[test]
+fn the_employee_can_ask_to_change_the_system_but_not_to_mark_it_done() {
+    let assembly = source(ASSEMBLY);
+    assert!(
+        assembly.contains("self_change::tool("),
+        "界面上的员工没有申请改自己的入口：它连「我想把这里改成那样」都说不出来"
+    );
+
+    let module = source("crates/cogneva/src/self_change.rs");
+    assert!(
+        module.contains("store.declare("),
+        "申请没有进账的读入队列：那它就哪儿也没去"
+    );
+    for writer in [
+        "apply_measurement",
+        "record_delivery",
+        "record_dispatch_state",
+        "record_human_only",
+    ] {
+        assert!(
+            !module.contains(writer),
+            "自改这一层出现了写完成状态的入口 `{writer}`：提的人能宣布自己改完了"
+        );
+    }
+    assert!(
+        module.contains("criteria_face::is_carrier_path"),
+        "尺子的名单没有复用系统那一份：抄出来的第二份迟早与第一份说的不是同一件事"
+    );
+}
