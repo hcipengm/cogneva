@@ -1,11 +1,13 @@
-import { useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   clearQuotaLimits,
   getQuotaLimits,
+  getTokenSpenders,
   QUOTA_SCOPES,
   setQuotaLimits,
   type QuotaLimitsReading,
   type QuotaScopeName,
+  type TokenSpenders,
 } from '@/api/client';
 import { Button, Reading, Readings } from '@/ui/primitives';
 import { Meter } from '@/ui/plots';
@@ -34,6 +36,35 @@ export function QuotaLimitsPanel() {
   const [readAt, setReadAt] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 这一级今天谁在花。只有人与工作空间两级有这条路，其余三级是 `null`。 */
+  const [spenders, setSpenders] = useState<TokenSpenders | null>(null);
+  const [spendersAt, setSpendersAt] = useState<string | null>(null);
+  const [spendersError, setSpendersError] = useState<string | null>(null);
+
+  const spendable = scope === 'user' || scope === 'ws';
+  const loadSpenders = useCallback(() => {
+    if (scope !== 'user' && scope !== 'ws') {
+      setSpenders(null);
+      setSpendersError(null);
+      return;
+    }
+    void getTokenSpenders(scope).then(
+      (next) => {
+        setSpenders(next);
+        setSpendersAt(new Date().toISOString());
+        setSpendersError(null);
+      },
+      (e) => {
+        // 读不出来与「今天没人花」不是一回事：后者是空数组，前者只能说读不到。
+        setSpenders(null);
+        setSpendersError(describe(e));
+      }
+    );
+  }, [scope]);
+
+  useEffect(() => {
+    loadSpenders();
+  }, [loadSpenders]);
 
   const target = targetId.trim();
   const canAct = target.length > 0 && !busy;
@@ -65,6 +96,9 @@ export function QuotaLimitsPanel() {
   // 用服务端的值盖上去就是边打字边被改。也不再对齐输入框——对齐只在读回自己那次写的
   // 时候做（`run`），那一次用户是看着结果按下去的。
   useKindTickedRefresh([resourceKey('quota')], () => {
+    // 排行与单格读数一起重读：额度帧既可能来自别人给某一行写了上限，也可能只是
+    // 投影推进了这一格的计数。排行读失败时不抹掉屏幕上已有的那一份。
+    loadSpenders();
     if (!reading || reading.scope !== scope || reading.target_id !== target) return;
     void getQuotaLimits(reading.scope, reading.target_id).then(
       (next) => {
@@ -136,6 +170,78 @@ export function QuotaLimitsPanel() {
         <p className="px-4 pb-2 text-[11px]" style={{ color: 'var(--danger)' }}>
           {error}
         </p>
+      )}
+
+      {/* 今天谁在花：写入面收的是一个 id，而运维在看见这一列之前不知道该填谁。
+          窗口是 UTC 日，与额度判定数的那个日同一个——读出来的排行就是「谁快被拒了」。
+          点一行把那格的 id 填进输入框并直接读，从「看见」到「改」不用手抄 id。 */}
+      {spendable && (
+        <div className="px-4 pb-2">
+          <div className="flex flex-wrap items-baseline gap-2 py-1">
+            <span className="text-[11px] text-[var(--muted)]">
+              今天（UTC 日）在这一级花钱的格子，按花销降序
+            </span>
+            {spenders && (
+              <span className="mono ml-auto text-[11px] text-[var(--muted)]">
+                合计 {spenders.total.toLocaleString()} token
+                {spendersAt ? ` · 读于 ${new Date(spendersAt).toLocaleTimeString()}` : ''}
+              </span>
+            )}
+          </div>
+          {spendersError && (
+            <p className="text-[11px]" style={{ color: 'var(--danger)' }}>
+              排行读不到：{spendersError}
+            </p>
+          )}
+          {spenders && spenders.spenders.length === 0 && (
+            <p className="text-[11px] text-[var(--muted)]">今天这一级还没有花销。</p>
+          )}
+          {spenders && spenders.spenders.length > 0 && (
+            <>
+              <table className="mono w-full text-[11px]">
+                <thead>
+                  <tr className="text-left text-[var(--muted)]">
+                    <th className="py-0.5 pr-3 font-normal">格子</th>
+                    <th className="py-0.5 pr-3 text-right font-normal">今天已花</th>
+                    <th className="py-0.5 pr-3 text-right font-normal">声明的 hard</th>
+                    <th className="py-0.5 text-right font-normal">剩余</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {spenders.spenders.map((row) => (
+                    <tr key={row.id}>
+                      <td className="py-0.5 pr-3">
+                        <button
+                          type="button"
+                          className="underline-offset-2 hover:underline"
+                          title="把这一格填进上面的输入框并读出来"
+                          onClick={() => {
+                            setTargetId(row.id);
+                            void run(() => getQuotaLimits(scope, row.id));
+                          }}
+                        >
+                          {row.id}
+                        </button>
+                      </td>
+                      <td className="py-0.5 pr-3 text-right">{row.tokens.toLocaleString()}</td>
+                      <td className="py-0.5 pr-3 text-right">
+                        {row.hard_limit === null ? '—' : row.hard_limit.toLocaleString()}
+                      </td>
+                      <td className="py-0.5 text-right">
+                        {row.remaining === null ? '—' : row.remaining.toLocaleString()}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <p className="py-1 text-[11px] text-[var(--muted)]">
+                {spenders.ceilings_readable
+                  ? '「—」是这一格没人声明过上限，它跟着默认值走；「剩余」按账本当场算，判定读的是每 30 秒覆盖一次的格子，两者可能差最近这几十秒的花销。'
+                  : '这个部署没有上限库，读不到任何一格声明过的上限；这一列的空值是「读不到」，不是「没人配过」。'}
+              </p>
+            </>
+          )}
+        </div>
       )}
 
       {reading ? (

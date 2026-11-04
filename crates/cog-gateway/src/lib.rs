@@ -1226,6 +1226,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/observability/token-usage/account",
             get(observability::token_account_handler),
         )
+        // 按主体看当天花销：额度写入面收的是一个 id，而运维在看见「谁在花」之前
+        // 不知道该给谁写上限。窗口就是额度判定的那个 UTC 日，不是「最近 N 小时」。
+        .route(
+            "/api/v1/observability/token-usage/spenders",
+            get(observability::token_spenders_handler),
+        )
         .route(
             "/api/v1/tasks/{id}/logs",
             get(observability::task_logs_handler),

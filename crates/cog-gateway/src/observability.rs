@@ -710,6 +710,185 @@ fn account_response(
     }
 }
 
+// ─── Who is spending today ───
+
+/// Query parameters for [`token_spenders_handler`].
+///
+/// There is deliberately no window parameter: this read answers "who is close
+/// to a ceiling", and a ceiling is counted per UTC day by
+/// [`cog_core::day::day_start_unix`]. A trailing-hours window would answer a
+/// different question and read as if it were the same one — a person who spent
+/// 90% of their allowance in the last hour and one who spent it over three days
+/// would look identical.
+#[derive(Debug, Deserialize)]
+pub struct TokenSpendersQuery {
+    /// `user` or `ws`, the two levels a call can be charged to.
+    #[serde(default = "default_spenders_scope")]
+    pub scope: String,
+}
+
+fn default_spenders_scope() -> String {
+    cog_core::QuotaScope::User.as_str().to_string()
+}
+
+/// One subject's day: what the ledger charged it, and the ceiling it declared.
+#[derive(Debug, Serialize)]
+pub struct SpenderLine {
+    /// The person or workspace id, exactly as the ledger resolved it.
+    pub id: String,
+    /// Tokens the ledger charged this subject today.
+    pub tokens: u64,
+    /// The ceiling somebody declared for this subject; `null` means nobody did,
+    /// which is not the same as "unlimited" — the judge then falls back to the
+    /// manager's default. Read [`TokenSpendersResponse::ceilings_readable`]
+    /// before taking `null` to mean "nobody declared one".
+    pub hard_limit: Option<u64>,
+    pub soft_limit: Option<u64>,
+    /// `hard_limit - tokens`, floored at zero; `null` when no ceiling is
+    /// declared or the ceilings could not be read.
+    ///
+    /// Computed from the ledger, so it is exact for this read. The judge reads a
+    /// counter that the projection refreshes on a period, so the two can differ
+    /// by whatever was spent since the last projection pass — a subject can show
+    /// ten tokens of room here and still be refused on the next call.
+    pub remaining: Option<u64>,
+}
+
+/// Everyone the ledger charged today, at one level.
+#[derive(Debug, Serialize)]
+pub struct TokenSpendersResponse {
+    /// The level asked for: `user` or `ws`.
+    pub scope: &'static str,
+    pub since: String,
+    pub until: String,
+    /// Tokens charged today across every subject at this level — the sum of
+    /// every row, not of the rows a caller might choose to look at first.
+    pub total: u64,
+    /// Whether `hard_limit` / `soft_limit` mean anything on these rows. `false`
+    /// means this deployment has no hierarchy manager, so no ceiling could be
+    /// read and every row's null says "unread", not "undeclared".
+    pub ceilings_readable: bool,
+    /// Descending by tokens; ties break on id so two reads of the same day
+    /// return the same order.
+    pub spenders: Vec<SpenderLine>,
+}
+
+/// Today's spend per person or per workspace, beside the ceilings those
+/// subjects declared.
+///
+/// This is the read that closes the operator loop for per-subject quotas: the
+/// write face takes an id, but nobody knows which ids to write ceilings for
+/// until someone can see who is spending. Without it the only way to find a
+/// heavy spender is to query the ledger table by hand, which is exactly the
+/// manual reconciliation the platform is not supposed to need.
+///
+/// Only the two levels a call is actually charged to can be asked. The list of
+/// those levels comes from the same judge the write face uses, so a level that
+/// this route accepts but the proxy never charges would be caught as a
+/// mismatch rather than reported as an empty day.
+pub async fn token_spenders_handler(
+    State(state): State<Arc<GatewayState>>,
+    Query(q): Query<TokenSpendersQuery>,
+) -> Result<Json<TokenSpendersResponse>, ApiError> {
+    let scope = cog_core::QuotaScope::parse(&q.scope).ok_or_else(|| {
+        let declared: Vec<&str> = cog_core::QuotaScope::cascade_order()
+            .iter()
+            .filter(|s| crate::scope_enforcement(**s).is_some())
+            .map(|s| s.as_str())
+            .collect();
+        ApiError::bad_request(format!(
+            "unknown quota scope {:?}; spend is recorded for {}",
+            q.scope,
+            declared.join(", ")
+        ))
+        .with_code("unknown_quota_scope")
+    })?;
+    if crate::scope_enforcement(scope).is_none() {
+        // No call is ever charged to these levels, so there are no spenders to
+        // list. Answering an empty list would assert "nobody spent", which is
+        // the one thing this platform cannot know — the truth is that nothing
+        // records it.
+        return Err(ApiError::conflict(format!(
+            "no call is ever charged to a {:?} level, so there is no day to read",
+            scope
+        ))
+        .with_code("quota_scope_not_enforced"));
+    }
+
+    let ledger = state
+        .llm_usage
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("token usage ledger not configured"))?;
+    let until = chrono::Utc::now();
+    let since_unix = cog_core::day::day_start_unix(until.timestamp());
+    let rows = match scope {
+        cog_core::QuotaScope::User => ledger.spend_by_person_since(since_unix).await,
+        cog_core::QuotaScope::Workspace => ledger.spend_by_workspace_since(since_unix).await,
+        // Refused above by the same judge that accepted the write face; a new
+        // enforceable level has to pass through `scope_enforcement` first.
+        cog_core::QuotaScope::Team
+        | cog_core::QuotaScope::Organization
+        | cog_core::QuotaScope::Global => unreachable!("refused by scope_enforcement"),
+    }
+    .map_err(|e| ApiError::internal(format!("failed to read today's spend: {e}")))?;
+
+    let mut spenders = Vec::with_capacity(rows.len());
+    let mut ceilings_readable = state.hierarchy_manager.is_some();
+    for (id, tokens) in rows {
+        // A ceiling read that fails is a failure, not "nobody declared one":
+        // the second answer would tell an operator there is room to spare.
+        let limits = match state.hierarchy_manager.as_ref() {
+            Some(hierarchy) => hierarchy.limits(scope, &id).await.map_err(|e| {
+                ApiError::internal(format!("failed to read the ceiling for {id}: {e}"))
+            })?,
+            None => {
+                ceilings_readable = false;
+                None
+            }
+        };
+        spenders.push(SpenderLine {
+            id,
+            tokens,
+            remaining: limits.as_ref().map(|l| l.hard_limit.saturating_sub(tokens)),
+            hard_limit: limits.as_ref().map(|l| l.hard_limit),
+            soft_limit: limits.as_ref().map(|l| l.soft_limit),
+        });
+    }
+
+    Ok(Json(spenders_response(
+        scope,
+        chrono::DateTime::<chrono::Utc>::from_timestamp(since_unix, 0)
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH),
+        until,
+        spenders,
+        ceilings_readable,
+    )))
+}
+
+/// Order and total the rows onto the response face.
+///
+/// The total is taken from every row before anything is ordered: it is the
+/// day's spend, and a caller that reads only the first page of `spenders` still
+/// has to be able to tell how much the rest accounts for.
+fn spenders_response(
+    scope: cog_core::QuotaScope,
+    since: chrono::DateTime<chrono::Utc>,
+    until: chrono::DateTime<chrono::Utc>,
+    mut spenders: Vec<SpenderLine>,
+    ceilings_readable: bool,
+) -> TokenSpendersResponse {
+    let total = spenders.iter().map(|row| row.tokens).sum();
+    spenders.sort_by(|a, b| b.tokens.cmp(&a.tokens).then_with(|| a.id.cmp(&b.id)));
+    TokenSpendersResponse {
+        scope: scope.as_str(),
+        since: since.to_rfc3339(),
+        until: until.to_rfc3339(),
+        total,
+        ceilings_readable,
+        spenders,
+    }
+}
+
 // ─── Task Metrics ───
 
 pub async fn task_metrics_handler(

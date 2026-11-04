@@ -199,6 +199,29 @@ pub fn with_eval_service(
     build(None, None, None, None, Some(eval_service), data_dir)
 }
 
+/// The same state, with the two stores the quota reading faces ask.
+///
+/// Taken apart and put back rather than threaded through [`build`]: every other
+/// slot is already the stand-in this fixture wants, and two more parameters
+/// there would have to be passed through four call sites that never ask about
+/// quota. The hierarchy store is optional because a deployment without one is a
+/// state the reading faces have to describe rather than one they may assume
+/// away.
+pub fn with_quota_stores(
+    llm_usage: Arc<dyn cog_core::LlmUsageLedger>,
+    hierarchy_manager: Option<Arc<dyn cog_core::HierarchyManager>>,
+) -> Arc<GatewayState> {
+    // `GatewayState` is not `Debug`, so `expect` cannot report the handle it
+    // failed to take apart; the message is the whole diagnosis anyway.
+    let mut state = match Arc::try_unwrap(stateless()) {
+        Ok(state) => state,
+        Err(_) => panic!("the fixture just built it, so this is the only handle"),
+    };
+    state.llm_usage = Some(llm_usage);
+    state.hierarchy_manager = hierarchy_manager;
+    Arc::new(state)
+}
+
 fn build(
     datasets: Option<Arc<dyn cog_storage::DatasetStore>>,
     message_backend: Option<Arc<dyn cog_core::MessageBackend>>,

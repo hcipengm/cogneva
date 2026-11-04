@@ -2965,6 +2965,40 @@ export async function clearQuotaLimits(scope: string, id: string): Promise<Quota
   return api.delete<QuotaLimitsReading>(quotaLimitsPath(scope, id));
 }
 
+/** 当天在这一级花了钱的一格，以及它自己声明的上限。 */
+export interface TokenSpender {
+  id: string;
+  tokens: number;
+  /** 有人为这一格声明过的硬上限；`null` 是「没人声明」，不是「不限」。 */
+  hard_limit: number | null;
+  soft_limit: number | null;
+  /** `hard_limit - tokens`，最低为 0；没有声明上限时为 `null`。 */
+  remaining: number | null;
+}
+
+/**
+ * 当天按人 / 按租户的花销排行。
+ *
+ * 窗口是 UTC 日，与额度判定数的那个窗口逐字相同——所以它回答的正是「谁快被
+ * 拒了」，而不是「最近一段时间谁花得多」。`ceilings_readable` 为 `false` 时，
+ * 每一行的 `hard_limit: null` 是「这个部署读不到上限」，不是「没人配过」。
+ */
+export interface TokenSpenders {
+  scope: QuotaScopeName;
+  since: string;
+  until: string;
+  total: number;
+  ceilings_readable: boolean;
+  spenders: TokenSpender[];
+}
+
+/** 只有人和工作空间两级有花销路径；其余三级服务端会拒答。 */
+export async function getTokenSpenders(scope: 'user' | 'ws'): Promise<TokenSpenders> {
+  return api.get<TokenSpenders>(
+    `/api/v1/observability/token-usage/spenders?scope=${encodeURIComponent(scope)}`
+  );
+}
+
 /**
  * 一件任务的当日上限。
  *
