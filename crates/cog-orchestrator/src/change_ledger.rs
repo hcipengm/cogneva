@@ -701,18 +701,88 @@ fn trailered_revisions(log: &str) -> HashSet<String> {
     named
 }
 
-/// How many of the window's commits touched product code, and how many of those
-/// named a change.
+/// How many commits touched product code, how many of them named a change, and
+/// how many of them the account carries a row for.
 ///
-/// The pair is read together because the difference is the reading: a window
-/// count alone cannot say whether the commits that reached the tree answered to
-/// the account, and a trailered count alone is a number with no denominator.
-fn product_commits(window: &[(String, i64)], trailered: &HashSet<String>) -> (usize, usize) {
+/// The three are read together because each one alone is a number a reader would
+/// finish into the wrong sentence. A window count has no denominator; a
+/// trailered count says nothing about the commits that named no change but were
+/// declared anyway; and the accounted count is the only one that answers "did
+/// the ledger hear about this work", which is a different question from "did the
+/// commit say what it was". A commit can be accounted for without a trailer (a
+/// document names it) and trailered without a row (the landing did not write
+/// back yet), so the three counts are not nested and cannot be folded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CommitWindow {
+    touching: usize,
+    trailered: usize,
+    claimed: usize,
+}
+
+/// The revision the account compares on: twelve characters, because that is how
+/// long an image tag and a `git:` document may spell it, and a revision shorter
+/// than that is its own prefix.
+fn revision_prefix(rev: &str) -> &str {
+    match rev.char_indices().nth(12) {
+        Some((at, _)) => &rev[..at],
+        None => rev,
+    }
+}
+
+/// Which of the window's revisions the account already carries, or `None` when
+/// the account could not answer.
+///
+/// The question is asked with the window's own prefixes, not with every revision
+/// the account ever recorded: the account grows without bound and the window does
+/// not, so an unfiltered read would pay for the whole history to answer about
+/// two thousand commits.
+///
+/// A failed read is not an empty set. The three window cells are published
+/// together or not at all, and a claim count of zero in a pass that never asked
+/// would say the account missed every commit in the window -- the one reading
+/// that would make a store answering nothing look like a tree nobody accounts
+/// for.
+async fn claimed_in_window(
+    store: &dyn ChangeLedgerStore,
+    window: &[(String, i64)],
+) -> Option<HashSet<String>> {
+    let mut prefixes: Vec<String> = window
+        .iter()
+        .map(|(rev, _)| revision_prefix(rev).to_string())
+        .collect();
+    prefixes.sort();
+    prefixes.dedup();
+    match store.claimed_revisions(&prefixes).await {
+        Ok(claimed) => Some(claimed),
+        Err(why) => {
+            warn!(
+                why = %why,
+                "change ledger: the account could not say which of the window's commits it \
+                 carries, so this pass publishes no commit cell"
+            );
+            None
+        }
+    }
+}
+
+fn product_commits(
+    window: &[(String, i64)],
+    trailered: &HashSet<String>,
+    claimed: &HashSet<String>,
+) -> CommitWindow {
     let named = window
         .iter()
         .filter(|(rev, _)| trailered.contains(rev))
         .count();
-    (window.len(), named)
+    let accounted = window
+        .iter()
+        .filter(|(rev, _)| claimed.contains(revision_prefix(rev)))
+        .count();
+    CommitWindow {
+        touching: window.len(),
+        trailered: named,
+        claimed: accounted,
+    }
 }
 
 /// The literal a commit's line has to be at least, in bytes, before it can name
@@ -2365,7 +2435,9 @@ pub fn spawn_change_ledger_loop(
                                 .await
                             {
                                 Ok(window) => {
-                                    commits_read = Some(product_commits(&window, &named));
+                                    commits_read = claimed_in_window(&*store, &window)
+                                        .await
+                                        .map(|claimed| product_commits(&window, &named, &claimed));
                                     // The reading says how many commits reached the
                                     // tree without naming a change; this walks the
                                     // fresh ones into the account, because a count
@@ -4726,10 +4798,11 @@ async fn dispatch_pass(
     // The changes the commit log says it landed, by task id. `None` when the
     // log could not be read: delivery is then unmeasured, not zero.
     deliveries: Option<&HashMap<String, String>>,
-    // How many commits in that same window touched product code and how many of
-    // them named a change. Read by the caller from the same log, so the delivery
-    // cells and these describe one window; `None` when the tree could not say.
-    commits: Option<(usize, usize)>,
+    // The commits in that same window: how many touched product code, how many
+    // of them named a change, how many the account already carries. Read by the
+    // caller from the same log, so the delivery cells and these describe one
+    // window; `None` when the tree, or the account, could not say.
+    commits: Option<CommitWindow>,
     // The firing alerts this pass could read. `None` is "nobody could look",
     // which is a different finding from "nothing is ringing", and the face
     // lifecycle reads it as a second intake of work nobody has a name on.
@@ -5397,6 +5470,17 @@ enum DispatchReadout {
     /// only meaningful next to the count it was taken from.
     CommitsInWindow,
     CommitsTrailered,
+    /// How many of those commits the account carries a row for -- a landing
+    /// wrote the revision back, or a document named the commit as its source.
+    ///
+    /// The third side of the same window, and the only one read from the
+    /// account rather than from the tree. It exists because the other two can
+    /// only say whether the commit *said* what it was: a commit declared from
+    /// its diff names no change in its body and is accountable all the same, and
+    /// a commit that names one is not accountable until the landing writes the
+    /// revision back. Read from outside the process this is the one cell a
+    /// reader had to take by hand over the database; it is a product reading now.
+    CommitsClaimed,
     /// What the account is holding in front of the rest of itself: how many
     /// changes a commit delivered while the account still owes them, and how
     /// many other rows are measured at a revision one of them delivered.
@@ -5440,6 +5524,7 @@ impl DispatchReadout {
         DispatchReadout::DemandOwed,
         DispatchReadout::CommitsInWindow,
         DispatchReadout::CommitsTrailered,
+        DispatchReadout::CommitsClaimed,
         DispatchReadout::BlockingRows,
         DispatchReadout::HeldLandings,
         DispatchReadout::BlockConflicts,
@@ -5500,6 +5585,7 @@ impl DispatchReadout {
             Self::DemandOwed => "demand_owed",
             Self::CommitsInWindow => "commits_in_window",
             Self::CommitsTrailered => "commits_trailered",
+            Self::CommitsClaimed => "commits_claimed",
             Self::BlockingRows => "blocking_rows",
             Self::HeldLandings => "held_landings",
             Self::BlockConflicts => "block_conflicts",
@@ -5534,12 +5620,12 @@ async fn publish_dispatch_rows(
     census: Option<&[(ChangeState, u64)]>,
     demand: Option<DemandClosure>,
     blocking: Option<BlockingSurface>,
-    // (commits that touched product code, of those how many named a change),
-    // read off the same window as the deliveries. `None` when the window could
-    // not be read: not writing the cells leaves the last read visible with its
-    // timestamp, which is a known earlier tick -- writing two zeros would say
-    // the tree's whole window answered to the account.
-    commits: Option<(usize, usize)>,
+    // The three counts off the same window as the deliveries. `None` when the
+    // window, or the account's answer about it, could not be read: not writing
+    // the cells leaves the last read visible with its timestamp, which is a
+    // known earlier tick -- writing zeros would say the tree's whole window
+    // answered to the account.
+    commits: Option<CommitWindow>,
 ) {
     let Some(metrics) = metrics else {
         return;
@@ -5574,14 +5660,16 @@ async fn publish_dispatch_rows(
             // "held landings" count with no "holding rows" beside it cannot be
             // read as anything, and a conflict count taken from a store that
             // could not answer would say the documents agree.
-            DispatchReadout::CommitsInWindow | DispatchReadout::CommitsTrailered => {
-                let Some((touching, named)) = commits else {
+            DispatchReadout::CommitsInWindow
+            | DispatchReadout::CommitsTrailered
+            | DispatchReadout::CommitsClaimed => {
+                let Some(window) = commits else {
                     continue;
                 };
-                let count = if matches!(readout, DispatchReadout::CommitsInWindow) {
-                    touching
-                } else {
-                    named
+                let count = match readout {
+                    DispatchReadout::CommitsInWindow => window.touching,
+                    DispatchReadout::CommitsTrailered => window.trailered,
+                    _ => window.claimed,
                 };
                 u64::try_from(count).unwrap_or(u64::MAX)
             }
@@ -5986,7 +6074,7 @@ async fn record_dispatch_state(
     sources_unread: &[&'static str],
     delivered: Option<u64>,
     // The tree's window reading, read by the caller beside the deliveries.
-    commits: Option<(usize, usize)>,
+    commits: Option<CommitWindow>,
     // The firing alerts this pass could read, or `None` when nobody could look.
     // Read by the caller so that one pass reads the surface once.
     alerts: Option<&[cog_core::PersistedAlert]>,
@@ -8912,6 +9000,11 @@ mod tests {
         /// on the *next* fold, so a test that read rows would see nothing and
         /// could not tell "declared" from "refused".
         declarations: std::sync::Mutex<Vec<ChangeReading>>,
+        /// Whether the account's answer about which revisions it carries fails.
+        /// A failed answer and an account holding none of them are the same
+        /// shape and different readings, and only a double that can fail tells
+        /// a reader that the pass kept them apart.
+        claims_unreadable: bool,
     }
 
     impl FakeLedger {
@@ -9090,6 +9183,43 @@ mod tests {
         }
         async fn pending_retirements(&self) -> SFResult<u64> {
             Ok(0)
+        }
+        async fn claimed_revisions(
+            &self,
+            revisions: &[String],
+        ) -> SFResult<std::collections::HashSet<String>> {
+            // Answered from the same two columns the statement reads -- the
+            // delivery stamp and a document that names the revision -- rather
+            // than from a set a test seeds by hand. A double with its own
+            // answer would agree with the test that built it and say nothing
+            // about whether the product asks the store the right question.
+            if self.claims_unreadable {
+                return Err(SFError::Database("the account cannot answer".into()));
+            }
+            let asked: std::collections::HashSet<&str> =
+                revisions.iter().map(String::as_str).collect();
+            let mut claimed = std::collections::HashSet::new();
+            for row in &self.rows {
+                let docs = row.delivered_rev.iter().map(String::as_str).chain(
+                    row.sources
+                        .iter()
+                        .filter_map(|source| source.doc.strip_prefix("git:")),
+                );
+                for rev in docs {
+                    let prefix = revision_prefix(rev);
+                    if asked.contains(prefix) {
+                        claimed.insert(prefix.to_string());
+                    }
+                }
+            }
+            // A delivery this double just stamped is not yet on a row.
+            for (_, rev) in self.delivered.lock().unwrap().iter() {
+                let prefix = revision_prefix(rev);
+                if asked.contains(prefix) {
+                    claimed.insert(prefix.to_string());
+                }
+            }
+            Ok(claimed)
         }
         async fn apply_measurement(&self, measurement: &ChangeMeasurement) -> SFResult<()> {
             self.measured.lock().unwrap().push(measurement.clone());
@@ -12571,7 +12701,11 @@ mod tests {
             Some(&census),
             Some(demand),
             Some(blocking),
-            Some((7, 3)),
+            Some(CommitWindow {
+                touching: 7,
+                trailered: 3,
+                claimed: 5,
+            }),
         )
         .await;
         publish_dispatch_verdict(Some(&metrics), &state).await;
@@ -12631,6 +12765,13 @@ mod tests {
         // numbers the same pass read off the same history.
         assert_eq!(published["commits_in_window"], 7.0);
         assert_eq!(published["commits_trailered"], 3.0);
+        // The account's own answer about the same window, and a number neither
+        // of the other two gives: five of the seven revisions are already on a
+        // row, so two of them are work the account has never heard of -- more
+        // than the four that named no change, because a commit can be claimed by
+        // a document without a trailer and trailered before the landing writes
+        // back. The cells are not nested, which is why they are not folded.
+        assert_eq!(published["commits_claimed"], 5.0);
         // The readback's own cells, and the difference between the two that is
         // the whole reason there are two: 40 changes still have handovers on
         // record and 6 of them left a deliverable, so the reading says 34 ran
@@ -12972,9 +13113,10 @@ mod tests {
         assert_eq!(landed.len(), 1, "a body with no trailer names nothing");
     }
 
-    /// The window reading has two numbers because the difference is the
-    /// reading: how many commits touched product code, and how many of those
-    /// answered to the account. One number alone would have no denominator.
+    /// The window reading has three numbers because each difference is the
+    /// reading: how many commits touched product code, how many of those named a
+    /// change, and how many the account already carries. One number alone would
+    /// have no denominator.
     #[test]
     fn the_window_counts_the_commits_that_named_nothing_beside_the_ones_that_did() {
         let log = [
@@ -12998,10 +13140,63 @@ mod tests {
             ("bbbb".to_string(), 200),
             ("cccc".to_string(), 100),
         ];
+        // The account carries `aaaa` (the delivery wrote back) and `bbbb` (a
+        // document names the commit); `cccc` named a change but its landing has
+        // not written the row yet. So the claimed count is neither the trailered
+        // one nor its complement, which is the point of publishing it.
+        let claimed: HashSet<String> = ["aaaa", "bbbb"].iter().map(|rev| rev.to_string()).collect();
         assert_eq!(
-            product_commits(&window, &named),
-            (3, 2),
-            "one commit in three reached product code and named no change"
+            product_commits(&window, &named, &claimed),
+            CommitWindow {
+                touching: 3,
+                trailered: 2,
+                claimed: 2,
+            },
+            "one commit in three reached product code and named no change, and one of \
+             the two that did name one is not on a row yet"
+        );
+    }
+
+    /// The claim question is asked about the window, in the account's own
+    /// revision form, and a store that cannot answer yields nothing rather than
+    /// an empty set.
+    ///
+    /// The distinction is the whole reason the cells are skipped rather than
+    /// zeroed: an empty set means the account carries none of these commits,
+    /// which is a reading; `None` means nobody asked successfully, and writing
+    /// it as zero would make a broken store indistinguishable from a tree whose
+    /// work the ledger never heard about.
+    #[tokio::test]
+    async fn the_claim_question_is_asked_about_the_window_and_a_failed_read_is_not_an_empty_set() {
+        let ledger = FakeLedger {
+            rows: vec![ChangeLedgerRow {
+                delivered_rev: Some("abcdef1234567".to_string()),
+                ..row(ChangeState::Landed, Some(1_760_000_100))
+            }],
+            ..Default::default()
+        };
+        // The row names a full revision; the window carries the twelve-character
+        // prefix an image tag and a `git:` document are allowed to spell.
+        let window = vec![
+            ("abcdef123456".to_string(), 300),
+            ("9999999999999".to_string(), 200),
+        ];
+        let claimed = claimed_in_window(&ledger, &window)
+            .await
+            .expect("the double answers");
+        assert_eq!(
+            claimed,
+            ["abcdef123456".to_string()].into_iter().collect(),
+            "the answer comes back in the prefixes that were asked about"
+        );
+
+        let broken = FakeLedger {
+            claims_unreadable: true,
+            ..Default::default()
+        };
+        assert!(
+            claimed_in_window(&broken, &window).await.is_none(),
+            "a store that failed to answer must not read as a set of none"
         );
     }
 

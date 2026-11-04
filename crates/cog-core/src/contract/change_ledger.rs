@@ -1071,6 +1071,31 @@ pub trait ChangeLedgerStore: Send + Sync {
     /// says the account has not caught up with what the classifier retired.
     async fn pending_retirements(&self) -> SFResult<u64>;
 
+    /// Which of these revisions the account carries a row for, given as the
+    /// twelve-character prefixes the caller asked about.
+    ///
+    /// The question is asked with the caller's list rather than with an empty
+    /// one and filtered afterwards, because the account grows without bound and
+    /// the caller's window does not: a reader of a bounded window that first
+    /// pulled every revision the ledger ever recorded would pay for the whole
+    /// history to answer about two thousand commits.
+    ///
+    /// A revision counts as the account's when a landing wrote it back
+    /// (`delivered_rev`) or when a document named the commit as its source
+    /// (`git:<rev>` in `sources`). Both are twelve-character-prefix comparisons
+    /// because the two sides spell a revision differently -- an image tag carries
+    /// as many characters as fit in it, a trailer carries the whole sha -- and
+    /// comparing them as text would report every revision as unknown.
+    ///
+    /// An empty answer is an answer: none of the revisions asked about is in the
+    /// account. A caller that could not read the account gets an error instead,
+    /// because "we heard about none of them" and "we could not look" are the two
+    /// readings this method exists to keep apart.
+    async fn claimed_revisions(
+        &self,
+        revisions: &[String],
+    ) -> SFResult<std::collections::HashSet<String>>;
+
     /// Apply one measurement: move the row's state, stamp `measured_at`, and
     /// stamp or clear `landed_at` to match.
     ///

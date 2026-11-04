@@ -2309,16 +2309,22 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          and telling the two apart is the whole point of the reading. \
          handover_unreadable counts the rows whose handovers could not be read at \
          all, so a failed read cannot pass for changes that produced nothing. \
-         commits_in_window and commits_trailered answer the tree's side of the \
-         same window the deliveries are read from: how many of its commits \
-         touched product code, and how many of those named a change in their \
-         body. They are separate cells because the difference is the reading -- \
-         a commit that named nothing reached the tree and left the account \
-         untouched, with no delivery to miss and no row to settle, so nothing \
-         else in the platform reports it. Published apart rather than as a \
-         single unaccounted number because the window slides: the difference is \
-         meaningful beside the count it was taken from. A pass that could not \
-         read the window writes neither cell, and never two zeros. \
+         commits_in_window, commits_trailered and commits_claimed answer the \
+         tree's side of the same window the deliveries are read from: how many \
+         of its commits touched product code, how many of those named a change \
+         in their body, and how many of the window's revisions the account \
+         already carries a row for -- through a delivery stamp or a document \
+         that names the commit. They are separate cells because the differences \
+         are the reading -- a commit that named nothing reached the tree and \
+         left the account untouched, with no delivery to miss and no row to \
+         settle, so nothing else in the platform reports it, and a commit can be \
+         claimed without a trailer (a document named it) or trailered without \
+         being claimed yet (the landing has not written back). The three are not \
+         nested, so they are published apart rather than folded into one \
+         unaccounted number, and because the window slides: a difference is \
+         meaningful only beside the count it was taken from. A pass that could \
+         not read the window, or could not ask the account which revisions it \
+         carries, writes none of the three cells, and never zeros. \
          Written once per pass, so a pass that \
          stops writing is visible as the stored sample's own timestamp going \
          stale rather than as a value that stops changing -- not through this \

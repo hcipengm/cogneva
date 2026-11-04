@@ -112,6 +112,13 @@ impl ChangeLedgerStore for FakeLedger {
         Ok(self.pending_retirements)
     }
 
+    async fn claimed_revisions(
+        &self,
+        _revisions: &[String],
+    ) -> SFResult<std::collections::HashSet<String>> {
+        unimplemented!("the read route does not ask which revisions are claimed")
+    }
+
     async fn apply_measurement(&self, _measurement: &cog_core::ChangeMeasurement) -> SFResult<()> {
         unimplemented!("the read route does not measure")
     }

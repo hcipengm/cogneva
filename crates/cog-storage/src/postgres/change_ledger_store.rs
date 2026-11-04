@@ -765,6 +765,29 @@ WHERE folded_at IS NULL AND kind = $1 AND scope = $2 AND literal = $3 AND doc = 
 const PENDING_SQL: &str =
     "SELECT count(*) AS n FROM change_ledger_declared WHERE folded_at IS NULL";
 
+/// Which of the revisions a caller asks about the account carries, by the
+/// twelve-character prefix both sides are compared on.
+///
+/// The two arms are the two ways a revision can be the account's: a landing wrote
+/// it back (`delivered_rev`), or a document named the commit as its source
+/// (`git:<rev>` in `sources`). Left-joining one arm into the other would drop a
+/// revision whose only record is a declaration, which is exactly the kind this
+/// reading exists to count -- the commits the pipeline did not land.
+///
+/// The caller's list bounds the read. Without it the statement would return every
+/// revision the account has ever recorded, every pass, to answer about one window.
+const CLAIMED_REVISIONS_SQL: &str = "\
+WITH known AS (
+    SELECT left(delivered_rev, 12) AS rev
+      FROM change_ledger
+     WHERE delivered_rev IS NOT NULL AND delivered_rev <> ''
+    UNION
+    SELECT left(substr(src->>'doc', 5), 12) AS rev
+      FROM change_ledger, jsonb_array_elements(sources) AS src
+     WHERE src->>'doc' LIKE 'git:%'
+)
+SELECT DISTINCT rev FROM known WHERE rev = ANY($1::text[])";
+
 /// The retirements one fold takes, oldest first.
 ///
 /// The identity breaks ties on `declared_at` for the same reason the declaration
@@ -1065,6 +1088,32 @@ impl ChangeLedgerStore for PostgresChangeLedgerStore {
             .try_get("n")
             .map_err(|e| SFError::Database(format!("pending count: {e}")))?;
         Ok(n.max(0) as u64)
+    }
+
+    async fn claimed_revisions(
+        &self,
+        revisions: &[String],
+    ) -> SFResult<std::collections::HashSet<String>> {
+        // Nothing asked about is not a read: an empty `ANY` would still cost a
+        // scan on some planners, and the answer is the same either way.
+        if revisions.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let rows = sqlx::query(CLAIMED_REVISIONS_SQL)
+            .bind(revisions)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| {
+                SFError::Database(format!("read the revisions the account carries: {e}"))
+            })?;
+        let mut claimed = std::collections::HashSet::with_capacity(rows.len());
+        for row in rows {
+            let rev: String = row
+                .try_get("rev")
+                .map_err(|e| SFError::Database(format!("claimed revision: {e}")))?;
+            claimed.insert(rev);
+        }
+        Ok(claimed)
     }
 
     async fn pending_retirements(&self) -> SFResult<u64> {
