@@ -1178,11 +1178,31 @@ impl SettledClosures {
 /// be able to tell this from a row somebody cancelled by hand.
 fn settled_row_reason(row: &ChangeLedgerRow) -> String {
     format!(
-        "变更账上 {identity} 已经是 {state}，这条执行行不会再被做：判据取账上那一行的状态，\
-         而那一条已经结了",
+        "{SETTLED_HANDOVER_PREFIX}: 变更账上 {identity} 已经是 {state}，这条执行行不会再被做：\
+         判据取账上那一行的状态，而那一条已经结了",
         identity = row.identity,
         state = row.state.as_str()
     )
+}
+
+/// What a row this sweep closed says about itself, in the form
+/// [`owed_row`] reads back.
+///
+/// The reason is the only trace a cancelled row keeps, so it is also the only
+/// place the fact "closed because the account had settled it" can live. Written
+/// and read through one constant rather than a phrase both sides spell out: an
+/// environment failure is recognised the same way ([`declares`] on
+/// [`TERMINAL_ENV_FAILURE_PREFIX`]), and a second spelling of the same fact is
+/// a writer and a reader that agree today and are free to disagree later.
+const SETTLED_HANDOVER_PREFIX: &str = "account_settled";
+
+/// Whether this row was closed by the settlement sweep rather than by the work.
+fn closed_as_settled(task: &Task) -> bool {
+    task.status == TaskStatus::Cancelled
+        && task
+            .error
+            .as_deref()
+            .is_some_and(|reason| declares(reason, SETTLED_HANDOVER_PREFIX))
 }
 
 /// Close the open rows hanging under a row this sweep just closed.
@@ -4625,6 +4645,16 @@ async fn owed_row(
             // spent, and then the change is left owed and named instead of
             // re-filed forever.
             Handover::DeadEnvironment if generation < rearm_limit => generation += 1,
+            // A row this loop closed because the account had already settled the
+            // change says nothing about the work: it never ran. A landed row
+            // that stops being true -- a regression, a decision taken back --
+            // comes back owed, and counting the closed hand-over as this
+            // change's answer would leave the reopened row reading as "already
+            // handed over" for the rest of the account's life. The next
+            // generation is where it goes, like an environment refusal.
+            Handover::DeadWork if generation < rearm_limit && closed_as_settled(&task) => {
+                generation += 1
+            }
             verdict => return Owed::Held(verdict),
         }
     }
@@ -8576,6 +8606,17 @@ mod tests {
             self
         }
 
+        /// A hand-over the settlement sweep closed, in the shape it leaves it:
+        /// the reason comes from the sweep's own writer, so a reader that
+        /// stopped recognising it would fail here rather than in production.
+        fn holding_closed_as_settled(self, row: &ChangeLedgerRow) -> Self {
+            let mut task = dispatch_task(row, 0);
+            task.status = TaskStatus::Cancelled;
+            task.error = Some(settled_row_reason(row));
+            self.tasks.lock().unwrap().insert(task.id.clone(), task);
+            self
+        }
+
         /// A row of the shape the hand-over wrote before the project anchor
         /// existed: a change in a project, and a root of it.
         fn holding_root_change(self, id: &str, project: &str) -> Self {
@@ -10117,6 +10158,10 @@ mod tests {
                 why.contains(state),
                 "关掉时的理由没有点名账上的终态 {state}：{why}"
             );
+            assert!(
+                declares(&why, SETTLED_HANDOVER_PREFIX),
+                "关掉时的理由没有声明「这是账上已结、不是活干完了」，重开时读不回来：{why}"
+            );
         }
         assert_eq!(
             graph
@@ -11018,8 +11063,10 @@ mod tests {
 
     /// The generation a row's handover goes out under, read off the graph
     /// without submitting anything: nothing held is generation zero, an
-    /// environment refusal moves it on, and anything else the graph holds is the
-    /// row's answer rather than a reason to file it again.
+    /// environment refusal moves it on, a hand-over this loop closed because the
+    /// account had settled the change moves it on as well (it never ran, so it is
+    /// not the change's answer), and anything else the graph holds is the row's
+    /// answer rather than a reason to file it again.
     #[tokio::test]
     async fn the_generation_walk_stops_at_the_first_slot_nothing_holds() {
         let limit = dispatch_rearm_limit();
@@ -11056,6 +11103,25 @@ mod tests {
         assert!(matches!(
             owed_row(&dead_work, &row, limit).await,
             Owed::Held(Handover::DeadWork)
+        ));
+
+        // A row this loop itself closed because the account had already settled
+        // the change never ran, so it says nothing about the work. The account
+        // coming back to the row -- a landed change that stopped being true, a
+        // retirement a later decision took back -- makes it owed again, and
+        // holding the closure as the change's fate would keep it from ever being
+        // handed over a second time.
+        let reopened = pending_row("crates/a/src/reopened.rs");
+        let settled_version = ChangeLedgerRow {
+            state: ChangeState::Landed,
+            landed_at: Some(Utc.timestamp_opt(1_760_000_100, 0).unwrap()),
+            ..reopened.clone()
+        };
+        let settled: Arc<dyn OrchestratorControl> =
+            Arc::new(FakeGraph::default().holding_closed_as_settled(&settled_version));
+        assert!(matches!(
+            owed_row(&settled, &reopened, limit).await,
+            Owed::NoTask { generation: 1 }
         ));
 
         // Every generation the budget allows was refused by the environment, so
