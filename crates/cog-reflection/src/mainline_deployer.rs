@@ -2207,6 +2207,14 @@ struct CiHold {
     /// 保留最初的答案——「是什么让它被扣住的」问的是起点，不是最近一拍。
     #[serde(default)]
     failed_checks: Vec<String>,
+    /// 这一次扣住在图里开了哪几行（目标行，以及分解不了时兜底那一行）。
+    ///
+    /// 记下来，是因为闭嘴的那一刻只有这里还知道它们叫什么：行 id 由 rev 与**开单那
+    /// 一天**推出，跨过午夜再按今天重算就对不上了，而 `ci_hold` 一被 take 掉，扣住
+    /// 期间每一轮都在重开的那几条路也到此为止。没有这一栏，扣住结束时就没有任何人
+    /// 记得去把它们收掉，它们永远停在队列里等着一个已经不存在的红。
+    #[serde(default)]
+    rows: Vec<String>,
 }
 
 /// 一条判红的检查**自己写下的**一句话：哪个检查（`<platform>:<name>`），它说了什么。
@@ -4947,6 +4955,7 @@ impl MainlineDeployer {
                 rev: rev.to_string(),
                 since_unix: now,
                 failed_checks: failed_checks.clone(),
+                rows: Vec::new(),
             });
             changed = true;
         } else if let Some(held) = state.ci_hold.as_mut() {
@@ -4969,7 +4978,21 @@ impl MainlineDeployer {
         // After the hold is on disk: a submission that fails must not cost the
         // record of how long this revision has been held, which is the reading
         // the alert rests on.
-        let owner = self.dispatch_ci_remediation(rev, &failed_checks).await;
+        let (owner, rows) = self.dispatch_ci_remediation(rev, &failed_checks).await;
+        // 开了哪几行也落盘：扣住结束的那一刻，只有这里还知道它们叫什么（见
+        // [`CiHold::rows`]）。同一行每轮都会重开一次，所以只收没记过的。
+        if let Some(held) = state.ci_hold.as_mut() {
+            let mut added = false;
+            for id in rows {
+                if !held.rows.contains(&id) {
+                    held.rows.push(id);
+                    added = true;
+                }
+            }
+            if added {
+                self.save_state(state)?;
+            }
+        }
         // 紧接着写这一格，「扣住了」与「谁在处理」才是同一个时点上的两个事实。
         // 写在这里而不是 dispatch 里面：没有编排器那一支同样意味着没人被问过，
         // 而它连一次提交都不会发生。
@@ -4996,7 +5019,11 @@ impl MainlineDeployer {
     /// failed or there is no orchestrator to ask at all. The caller publishes
     /// that as a reading, because a hold nobody can work on and a hold waiting
     /// on work in flight read the same everywhere else.
-    async fn dispatch_ci_remediation(&self, rev: &str, failed_checks: &[String]) -> CiHoldOwner {
+    async fn dispatch_ci_remediation(
+        &self,
+        rev: &str,
+        failed_checks: &[String],
+    ) -> (CiHoldOwner, Vec<String>) {
         let Some(orchestrator) = self.orchestrator.as_ref() else {
             // 这一支此前一句话都不说：告警的判词写着「两种没人管分得开，靠的是当轮
             // 日志」，而没有编排器这一种恰恰是唯一不留日志的那一种。它也是唯一一种
@@ -5006,7 +5033,7 @@ impl MainlineDeployer {
                 "this deployer has no orchestrator wired: a CI hold can never become a goal, \
                  so it is a held rollout with no owner"
             );
-            return CiHoldOwner::NoOrchestrator;
+            return (CiHoldOwner::NoOrchestrator, Vec::new());
         };
         let id = ci_hold_goal_id(
             rev,
@@ -5031,7 +5058,7 @@ impl MainlineDeployer {
                     "this revision already has today's CI remediation goal; nothing new queued"
                 );
                 // 已持有同一天的同一张单子也算有主：这一轮没有新任务，不是没人接。
-                CiHoldOwner::Owned
+                (CiHoldOwner::Owned, vec![id])
             }
             Ok(added) => {
                 info!(
@@ -5044,7 +5071,7 @@ impl MainlineDeployer {
                     evidence_lines = evidence.len(),
                     "the CI hold was handed to the action planner"
                 );
-                CiHoldOwner::Owned
+                (CiHoldOwner::Owned, vec![id])
             }
             Err(e) => {
                 // 分解这一步失败了，扣住本身还没有。写一条已经拆好的行重新提交：
@@ -5057,8 +5084,12 @@ impl MainlineDeployer {
                     error = %e,
                     "the planner could not take the CI hold; filing the change itself instead"
                 );
-                self.file_ci_hold_fix(orchestrator, rev, failed_checks, &goal, &evidence)
-                    .await
+                let (owner, fix_id) = self
+                    .file_ci_hold_fix(orchestrator, rev, failed_checks, &goal, &evidence)
+                    .await;
+                // 兜底那一行的 id 不论成没成都记下：它已经在图里时，收尾要能一起收；
+                // 没落库时 `get_task` 读不到，收尾那一步自然跳过。
+                (owner, vec![id, fix_id])
             }
         }
     }
@@ -5079,7 +5110,7 @@ impl MainlineDeployer {
         failed_checks: &[String],
         goal: &str,
         evidence: &[CheckEvidence],
-    ) -> CiHoldOwner {
+    ) -> (CiHoldOwner, String) {
         let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
         let id = ci_hold_fix_task_id(rev, &day);
         // 证据照原样放进来：接手的人先要读的就是那几条检查自己写下的失败点，而它们
@@ -5116,7 +5147,7 @@ impl MainlineDeployer {
                     "the CI hold landed as a pre-decomposed self-evolution row"
                 );
                 // 已持有同一行同样算有主：这一轮没有新增，不是没人接。
-                CiHoldOwner::Owned
+                (CiHoldOwner::Owned, id)
             }
             Err(e) => {
                 // 两条路都走不通，这一轮就是没人接得住。判词要留下是哪一侧拒的：
@@ -5127,7 +5158,61 @@ impl MainlineDeployer {
                     error = %e,
                     "the orchestrator refused the pre-decomposed CI hold row too; this hold has no owner this round"
                 );
-                CiHoldOwner::SubmitError
+                (CiHoldOwner::SubmitError, id)
+            }
+        }
+    }
+
+    /// 收掉这一次扣住开出去、还一行都没动过的行。
+    ///
+    /// 行是「让这一版通过上游 CI」这件事本身，它的验收写着「部署器放开滚动才算关闭」。
+    /// 扣住结束的一刻正是那一刻，可没有任何人会回来把行关掉：开单的是部署器，收单的
+    /// 也只能是部署器。不收，这些行就带着一个已经不成立的判词永远停在队列里，面读数
+    /// 数着一个永远不会动的缺口，而接手的人找到的是一件已经不需要做的事。
+    ///
+    /// 只收**还没动过的**（`Pending`/`Scheduled`）：跑起来的那一行已经有人在里面花了
+    /// 功夫，收掉它等于把一次正在进行的改动扔掉，而它自己会走到终态。终态的行不碰——
+    /// 取消一个终态行本身就是一次失败的回写。
+    ///
+    /// 失败只留一行日志：下一轮读到的是同一件事，而扣住已经结束，没有下一轮会再来。
+    async fn retire_ci_hold_rows(&self, rows: &[String], ended: &CiHoldEnd) {
+        let Some(orchestrator) = self.orchestrator.as_ref() else {
+            return;
+        };
+        for id in rows {
+            let Some(task) = orchestrator.get_task(id).await else {
+                // 记下的 id 不一定真的落过库：兜底那一次提交也可能被拒。
+                continue;
+            };
+            if !matches!(
+                task.status,
+                cog_core::TaskStatus::Pending | cog_core::TaskStatus::Scheduled
+            ) {
+                info!(
+                    task_id = %id,
+                    status = ?task.status,
+                    "a CI hold ended and this row is already in flight or settled; left as it is"
+                );
+                continue;
+            }
+            let reason = format!(
+                "the hold on {} ended ({}) and this row never started: the rollout it asked to \
+                 unblock is no longer held, so the row is retired rather than run",
+                rev12(&ended.rev),
+                ended.outcome
+            );
+            match orchestrator.cancel_task_with_reason(id, reason).await {
+                Ok(cascaded) => info!(
+                    task_id = %id,
+                    cascaded = cascaded.len(),
+                    outcome = %ended.outcome,
+                    "retired a CI hold's row; the hold it was filed for has ended"
+                ),
+                Err(e) => warn!(
+                    task_id = %id,
+                    error = %e,
+                    "a CI hold's row could not be retired; it keeps its place in the queue"
+                ),
             }
         }
     }
@@ -7250,6 +7335,9 @@ impl MainlineDeployer {
             // 「在不在扣住」这一格必须停：此时确实没有扣住。
             self.record_ci_hold_active(false).await;
             self.record_ci_hold_unowned(CiHoldOwner::Owned).await;
+            // 它开出去的那几行也到此为止：它们的验收本来就是「部署器放开滚动」，
+            // 而这一刻已经到了。不在这里收，它们就永远停在队列里等一个已经不存在的红。
+            self.retire_ci_hold_rows(&held.rows, &ended).await;
             state.ci_hold_ends.push(ended);
             let excess = state.ci_hold_ends.len().saturating_sub(CI_HOLD_END_KEEP);
             if excess > 0 {
@@ -12978,6 +13066,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
                 rev: "deadbeef0011".into(),
                 since_unix: 300,
                 failed_checks: vec!["github:Code Coverage".into()],
+                rows: Vec::new(),
             }),
             // 这一段的起点比这一版早得多：两个时长在这一行上必须分得开。
             ci_hold_run_since_unix: Some(100),
@@ -13078,6 +13167,7 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             rev: "aaaa1111bbbb".into(),
             since_unix: 100,
             failed_checks: vec!["github:Deploy Parity".into()],
+            rows: Vec::new(),
         };
         let verdict = |v: &str| CiVerdictRecord {
             rev: "aaaa1111bbbb".into(),
@@ -15574,6 +15664,84 @@ exit 0
         );
     }
 
+    /// 扣住结束的那一拍，把它开出去、还没动过的行一起收掉。
+    ///
+    /// 这条走完整的 `poll_once`，因为它量的是**接线**：收尾那一步写在「take 掉
+    /// `ci_hold`」的同一处，少那一行调用，行会永远停在队列里，而只考那个函数本身的
+    /// 用例照样绿。判据是行从「等着」变成 Cancelled，理由点名是哪种结局。
+    #[tokio::test]
+    async fn a_tick_that_ends_a_hold_retires_the_rows_it_filed() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        // 集群停在上一版、bare 在下一版：这一拍才会走到「要不要推这一版」那一步，
+        // 而问 CI 的那一问就在那里（已经在这一版上的轮在它之前就早退了）。
+        let deployed = main_image("localhost:30500", &rev_a);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        // 这一拍问到的每一问都是全绿：扣住要在这里结束。多给的几份不会被消费，
+        // `settle` 自己会超时收尾。
+        let green = || http_200(r#"{"check_runs":[{"name":"Test","conclusion":"success"}]}"#);
+        let (endpoint, handle) = fake_registry(vec![green(), green(), green(), green()]).await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.upstreams = vec![crate::config::UpstreamTrackConfig {
+            platform: crate::config::CodePlatform::Github,
+            repo: "owner/repo".into(),
+            api_base: Some(format!("http://{endpoint}/github")),
+        }];
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare))
+            .with_orchestrator(planner.clone());
+
+        let row = cog_core::Task::goal_row("ci-red-abc123-2026-11-04", "make CI green");
+        planner
+            .graph
+            .lock()
+            .unwrap()
+            .insert(row.id.clone(), row.clone());
+        let now = Utc::now().timestamp();
+        let mut state = deployer.load_state();
+        state.ci_hold = Some(CiHold {
+            rev: rev_b.clone(),
+            since_unix: now - 600,
+            failed_checks: vec!["github:Test".into()],
+            rows: vec![row.id.clone()],
+        });
+        state.ci_hold_run_since_unix = Some(now - 600);
+        deployer.save_state(&state).unwrap();
+
+        // 这一拍的后半段要真的构建这一版，而夹具的工作树里没有可构建的包；判据只看
+        // 扣住收尾那一段，所以那一半的失败不吞掉这里的结论，只当它没发生。
+        let _ = deployer.poll_once().await;
+
+        let cancels = planner.cancels();
+        assert!(
+            deployer.load_state().ci_hold.is_none(),
+            "扣住已经结束，状态里不该再留着它"
+        );
+        assert_eq!(
+            cancels
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec![row.id.as_str()],
+            "扣住结束了，它开出去的那一行要跟着收：{cancels:?}"
+        );
+        assert!(
+            cancels[0].1.contains("pass"),
+            "理由要说得出是哪一种结局：{}",
+            cancels[0].1
+        );
+        assert!(
+            deployer.load_state().ci_hold.is_none(),
+            "扣住已经结束，状态里不该再留着它"
+        );
+        settle(handle).await;
+    }
+
     /// 两拍之间落了两个 rev、而部署器每拍只追当时的头：中间那个从没被任何一拍
     /// 当过目标，既没被构建也没被 hold，日志里它不存在。这一格是它唯一的载体。
     #[tokio::test]
@@ -16089,6 +16257,10 @@ exec {real} "$@"
         /// 不并进 `Submission`：那条元组有几处旧断言在按位置拆，加一格会让它们全体
         /// 变得不可读，而这里要问的只是"那一行带着什么"。
         rows: std::sync::Mutex<Vec<Vec<cog_core::Task>>>,
+        /// 提交收下的行按 id 摆在这张图上，好让 `get_task` 答得出它的状态。
+        graph: std::sync::Mutex<std::collections::HashMap<String, cog_core::Task>>,
+        /// 被收掉的行与它得到的理由。
+        cancels: std::sync::Mutex<Vec<(String, String)>>,
         /// 让提交失败的那一档：2026-10-31 整天都是它（每个上游 503，变成
         /// `face_has_no_serving_member`），而"拒了"与"收了"在回读上必须分得开。
         refuse: std::sync::atomic::AtomicBool,
@@ -16107,6 +16279,17 @@ exec {real} "$@"
 
         fn rows(&self) -> Vec<Vec<cog_core::Task>> {
             self.rows.lock().unwrap().clone()
+        }
+
+        fn cancels(&self) -> Vec<(String, String)> {
+            self.cancels.lock().unwrap().clone()
+        }
+
+        /// 把一行标成有人在跑：收尾那一步要能看见「已经在飞的不收」。
+        fn mark_running(&self, id: &str) {
+            if let Some(task) = self.graph.lock().unwrap().get_mut(id) {
+                task.status = cog_core::TaskStatus::Running;
+            }
         }
     }
 
@@ -16134,6 +16317,12 @@ exec {real} "$@"
                 ));
             }
             self.rows.lock().unwrap().push(tasks.clone());
+            {
+                let mut graph = self.graph.lock().unwrap();
+                for task in &tasks {
+                    graph.entry(task.id.clone()).or_insert_with(|| task.clone());
+                }
+            }
             let ids: Vec<String> = tasks.iter().map(|task| task.id.clone()).collect();
             let mut held = self.submissions.lock().unwrap();
             let fresh: Vec<String> = ids
@@ -16198,11 +16387,26 @@ exec {real} "$@"
         ) -> SFResult<(bool, Vec<String>, bool)> {
             unimplemented!("the hold submits through submit_goal_auto")
         }
-        async fn cancel_task(&self, _task_id: &str) -> SFResult<Vec<String>> {
-            unimplemented!("the hold submits through submit_goal_auto")
+        async fn cancel_task(&self, task_id: &str) -> SFResult<Vec<String>> {
+            self.cancel_task_with_reason(task_id, "cancelled".into())
+                .await
         }
-        async fn get_task(&self, _task_id: &str) -> Option<cog_core::Task> {
-            unimplemented!("the hold submits through submit_goal_auto")
+        async fn cancel_task_with_reason(
+            &self,
+            task_id: &str,
+            reason: String,
+        ) -> SFResult<Vec<String>> {
+            self.cancels
+                .lock()
+                .unwrap()
+                .push((task_id.to_string(), reason));
+            if let Some(task) = self.graph.lock().unwrap().get_mut(task_id) {
+                task.status = cog_core::TaskStatus::Cancelled;
+            }
+            Ok(Vec::new())
+        }
+        async fn get_task(&self, task_id: &str) -> Option<cog_core::Task> {
+            self.graph.lock().unwrap().get(task_id).cloned()
         }
         async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
             unimplemented!("the hold submits through submit_goal_auto")
@@ -16819,6 +17023,16 @@ exec {real} "$@"
             fix.input
         );
 
+        // 开了哪几行要跟着扣住一起落盘：扣住结束的那一刻，只有这里还知道该收谁。
+        assert_eq!(
+            state.ci_hold.as_ref().map(|held| held.rows.clone()),
+            Some(vec![
+                ci_hold_goal_id("abc123", &day),
+                ci_hold_fix_task_id("abc123", &day)
+            ]),
+            "两条都开出去了（目标行 + 兜底行），两条都要记下来"
+        );
+
         // 有主：这一格不能停在 1 上，否则告警会把「模型不可用但已经落库」读成没人管。
         let samples = metrics
             .query_gauge_latest(MAINLINE_CI_HOLD_UNOWNED.as_str())
@@ -16829,6 +17043,77 @@ exec {real} "$@"
             "兜底落库了就是有主，读数不该有任何一格是 1：{samples:?}"
         );
         settle(handle).await;
+    }
+
+    /// 扣住结束时，它开出去的那几行要跟着收掉；跑起来的那一行不碰。
+    ///
+    /// 行的验收写的是「部署器放开滚动才算关闭」，而扣住结束的那一刻正是那一刻——可
+    /// 没有任何人会回来关它：开单的是部署器，收单的也只能是部署器。不收，这些行就带
+    /// 着一个已经不成立的判词永远停在队列里；面读数数着一个永远不会动的缺口，而接手
+    /// 的人找到的是一件已经不需要做的事。
+    ///
+    /// 两条边界也钉在这里：跑起来的那一行不收（收掉它等于把一次正在进行的改动扔掉，
+    /// 而它自己会走到终态），以及理由要说得出是哪一种结局——「判过了才放」与「上游
+    /// 换版了」对读的人来说不是同一件事。
+    #[tokio::test]
+    async fn a_ci_hold_that_ends_retires_only_the_rows_nobody_started() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 这一条测试不走 `poll_once`：收尾那一步在那里，而那需要一整套 bare 与集群的
+        // 夹具。它直接考那个函数，替身图上摆着两条待收的行。
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let queued = cog_core::Task::goal_row("ci-red-abc123-2026-11-04", "make CI green");
+        let started = cog_core::Task::new(
+            "ci-red-abc123-2026-11-04-fix",
+            cog_core::TaskType::Custom(CI_HOLD_FIX_KIND.into()),
+            serde_json::json!({ "goal": "make CI green" }),
+        );
+        for row in [&queued, &started] {
+            planner
+                .graph
+                .lock()
+                .unwrap()
+                .insert(row.id.clone(), row.clone());
+        }
+        planner.mark_running(&started.id);
+
+        let ended = CiHoldEnd {
+            rev: "abc123".into(),
+            since_unix: 100,
+            ended_unix: 200,
+            outcome: "pass".into(),
+            reasons: Vec::new(),
+            failed_checks: vec!["github:Test".into()],
+        };
+        deployer
+            .retire_ci_hold_rows(
+                &[
+                    queued.id.clone(),
+                    started.id.clone(),
+                    // 记下的 id 不一定真的落过库：兜底那一次提交也可能被拒。
+                    "ci-red-never-landed-2026-11-04".to_string(),
+                ],
+                &ended,
+            )
+            .await;
+
+        let cancels = planner.cancels();
+        let ids: Vec<&str> = cancels.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![queued.id.as_str()],
+            "只收还没动过的那一行：跑起来的不收，没落库的读不到就该跳过：{cancels:?}"
+        );
+        assert!(
+            cancels[0].1.contains("pass") && cancels[0].1.contains("abc123"),
+            "理由要说得出是哪一种结局、哪一版：{}",
+            cancels[0].1
+        );
     }
 
     /// 没有编排器的那一支：**没有一次提交**，此前连一行日志都不留，而告警的判词
@@ -18058,6 +18343,7 @@ exec {real} "$@"
             rev: "abc123".into(),
             since_unix: an_hour_ago,
             failed_checks: Vec::new(),
+            rows: Vec::new(),
         });
         state.ci_hold_run_since_unix = Some(an_hour_ago);
         deployer.save_state(&state).unwrap();
