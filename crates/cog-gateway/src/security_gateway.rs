@@ -8426,9 +8426,11 @@ async fn code_platform_forward(
         builder = builder.body(body.to_vec());
     }
     let resp = builder.send().await.map_err(|e| {
-        (
+        forward_failure(
             StatusCode::BAD_GATEWAY,
-            format!("连接 {name} 上游失败: {e}"),
+            name,
+            &path,
+            format!("连接 {name} 上游失败: {}", transport_reason(&e)),
         )
     })?;
     state.code_stats.record(start.elapsed().as_millis() as u64);
@@ -8863,10 +8865,14 @@ async fn attach_proxy(
         }
     }
 
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("连接附件上游失败: {e}")))?;
+    let resp = builder.send().await.map_err(|e| {
+        forward_failure(
+            StatusCode::BAD_GATEWAY,
+            "附件",
+            url.path(),
+            format!("连接附件上游失败: {}", transport_reason(&e)),
+        )
+    })?;
     if !resp.status().is_success() {
         return Err((
             StatusCode::BAD_GATEWAY,
@@ -9169,15 +9175,19 @@ async fn git_https_forward(
     let resp = tokio::time::timeout(timeout, builder.send())
         .await
         .map_err(|_| {
-            (
+            forward_failure(
                 StatusCode::GATEWAY_TIMEOUT,
+                name,
+                upstream_path,
                 format!("连接 {name} git 上游超时（{}s）", timeout.as_secs()),
             )
         })?
         .map_err(|e| {
-            (
+            forward_failure(
                 StatusCode::BAD_GATEWAY,
-                format!("连接 {name} git 上游失败: {e}"),
+                name,
+                upstream_path,
+                format!("连接 {name} git 上游失败: {}", transport_reason(&e)),
             )
         })?;
     state.code_stats.record(start.elapsed().as_millis() as u64);
@@ -9267,7 +9277,14 @@ async fn webhook_forward(
         .body(body.to_vec())
         .send()
         .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("转发主应用失败: {e}")))?;
+        .map_err(|e| {
+            forward_failure(
+                StatusCode::BAD_GATEWAY,
+                "主应用",
+                path,
+                format!("转发主应用失败: {}", transport_reason(&e)),
+            )
+        })?;
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let text = resp.text().await.unwrap_or_default();
     Ok(axum::response::Response::builder()
@@ -9484,6 +9501,49 @@ async fn trace_server_failures(
         );
     }
     resp
+}
+
+/// 一次出站失败的那句成因，去掉 URL。
+///
+/// reqwest 的 Display 是「error sending request for url (<完整 URL>)」，而 Gitee
+/// 的 token 就拼在 query 上：原样写进日志或回给调用方，等于把凭证抄了一份出去。
+/// 所以取错误链里更内层的成因（连接被拒、DNS 解析不到、TLS 握手、连接被重置各自
+/// 的原文），最外层只在没有更内层时才用，且那也要把 URL 换掉。
+fn transport_reason(error: &reqwest::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    if !parts.is_empty() {
+        return parts.join(": ");
+    }
+    match error.url() {
+        Some(url) => error.to_string().replace(url.as_str(), "上游地址"),
+        None => error.to_string(),
+    }
+}
+
+/// 转发失败的一句话：留一行在网关日志里，再原样回给调用方。
+///
+/// 统一的那层（[`trace_server_failures`]）只知道方法、路径与状态码；调用方那边
+/// 也只看得见 502。于是「502」这一个数同时代表 DNS 解析不到、连接被拒、TLS 握手
+/// 失败与连接被重置，而这四种下一步查的东西完全不同。错误对象只在转发点手里，
+/// 所以成因记在这里，且只记这一处——每一位自己拼一句日志，就会有一处忘了拼。
+fn forward_failure(
+    status: StatusCode,
+    channel: &str,
+    path: &str,
+    message: String,
+) -> (StatusCode, String) {
+    tracing::warn!(
+        channel,
+        path,
+        error = %message,
+        "安全网关：转发上游失败"
+    );
+    (status, message)
 }
 
 /// 代码平台通道：API 透传、git 转发、附件、OAuth 兑换。这些路径没有自己的
@@ -17313,6 +17373,56 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(logged.is_empty(), "4xx 不该留痕：{logged}");
+    }
+
+    /// 转发失败的那句成因要进网关自己的日志，不止回给调用方。
+    ///
+    /// 上面那层只知道方法、路径与状态码，于是「502」同时代表 DNS 解析不到、
+    /// 连接被拒、TLS 握手失败与连接被重置——这四种下一步查的东西完全不同。
+    /// 成因只在错误对象里，而错误对象只在转发点手里。
+    ///
+    /// 反向也钉住：那句成因**不能带 URL**。Gitee 的 token 拼在 query 上，整句
+    /// URL 落进日志等于把凭证抄了一份。
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_forward_failure_leaves_its_reason_in_the_gateway_log() {
+        let (buf, _guard) = capture_logs();
+        let mut state = test_state(Vec::new());
+        state.config.webhook_internal_secret = Some("内部签名".into());
+        // 必然拒绝连接的地址：失败是确定的、快的，且不依赖外网。
+        state.config.webhook_forward_url = "http://127.0.0.1:1".into();
+
+        let err = webhook_forward(
+            &state,
+            "/webhooks/github",
+            ("x-github-event", "push".into()),
+            b"{}",
+        )
+        .await
+        .expect_err("连不上时这条路径必须失败，而不是回一个成功的空响应");
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+
+        let logged = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logged.contains("转发上游失败"),
+            "应有一行点名失败的转发：{logged}"
+        );
+        assert!(
+            logged.contains("/webhooks/github"),
+            "行里要点名哪条路径：{logged}"
+        );
+        assert!(
+            logged.to_ascii_lowercase().contains("connect"),
+            "行里要有成因（连接被拒 / DNS / TLS …）；只有路径与状态码等于什么都没说：{logged}"
+        );
+        assert!(
+            !logged.contains("127.0.0.1"),
+            "上游地址不进日志：Gitee 的 token 拼在 query 上，整句 URL 会把凭证抄出去：{logged}"
+        );
+        assert!(
+            !err.1.contains("127.0.0.1"),
+            "回给调用方的那句也不带 URL（同一条理由）：{}",
+            err.1
+        );
     }
 
     /// 走一次真实的签名路由，读回状态与 JSON 体。
