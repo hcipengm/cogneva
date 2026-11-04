@@ -339,6 +339,23 @@ impl cog_core::LlmUsageLedger for DeferredSink<dyn cog_core::LlmUsageLedger> {
         self.ledger()?.spend_by_workspace_since(since_unix).await
     }
 
+    /// 两路拒绝数与两路花销走同一个出口：它们读的是同一批行，接不上时要说
+    /// 「读不到」。漏掉这两条转发的后果不是少一列数，而是整条排行 500——
+    /// 花销读得出、拒绝读不出，调用方得到的是一张读不成的表。
+    async fn refusals_by_person_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        self.ledger()?.refusals_by_person_since(since_unix).await
+    }
+
+    async fn refusals_by_workspace_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        self.ledger()?.refusals_by_workspace_since(since_unix).await
+    }
+
     async fn spend_by_task_since(
         &self,
         task_ids: &[String],
@@ -720,6 +737,9 @@ mod tests {
     /// 只回答「谁花了多少」的账本替身：这一格证明的是调用落到了真账本上。
     struct CountingLedger {
         reads: Arc<AtomicUsize>,
+        /// 两路拒绝数各自数一次：花销那一格与拒绝这两格要各自证明自己真的
+        /// 走了转发，共用一个计数器时一条转发被删掉、另一条被调用，总数照样对。
+        refusal_reads: Arc<AtomicUsize>,
     }
 
     #[async_trait::async_trait]
@@ -794,6 +814,16 @@ mod tests {
         ) -> Result<Vec<(String, u64)>, String> {
             unimplemented!("这一格只读不写")
         }
+        // 两路拒绝数与花销在同一张排行上，替身也得答得出：转发漏掉任何一条，
+        // 生产上拿到的是「花销读得出、拒绝读不出」，整条排行报错。
+        async fn refusals_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+            self.refusal_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![("someone".to_string(), 2)])
+        }
+        async fn refusals_by_workspace_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+            self.refusal_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![("ws-one".to_string(), 3)])
+        }
         async fn task_attribution(
             &self,
             _: &str,
@@ -857,20 +887,25 @@ mod tests {
 
         let attempts = Arc::new(AtomicUsize::new(0));
         let reads = Arc::new(AtomicUsize::new(0));
+        let refusal_reads = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&attempts);
         let counted = Arc::clone(&reads);
+        let counted_refusals = Arc::clone(&refusal_reads);
         spawn_retry(
             Arc::clone(&slot),
             std::time::Duration::from_millis(1),
             move || {
                 let seen = Arc::clone(&seen);
                 let counted = Arc::clone(&counted);
+                let counted_refusals = Arc::clone(&counted_refusals);
                 async move {
                     if seen.fetch_add(1, Ordering::SeqCst) < 2 {
                         return Err("PostgreSQL 还没起来".to_string());
                     }
-                    Ok(Arc::new(CountingLedger { reads: counted })
-                        as Arc<dyn cog_core::LlmUsageLedger>)
+                    Ok(Arc::new(CountingLedger {
+                        reads: counted,
+                        refusal_reads: counted_refusals,
+                    }) as Arc<dyn cog_core::LlmUsageLedger>)
                 }
             },
         );
@@ -890,10 +925,31 @@ mod tests {
             vec![("someone".to_string(), 7)],
             "接上之后的读要来自账本本身"
         );
+        // 排行一次读两路：花销与拒绝。转发少一条，接口在真账本上答得出花销、
+        // 答不出拒绝，调用方拿到的是整条 500——所以这两条也要过同一道门。
+        assert_eq!(
+            slot.refusals_by_person_since(0)
+                .await
+                .expect("接上之后的拒绝读也要落到真账本"),
+            vec![("someone".to_string(), 2)],
+            "按人的拒绝数走同一条转发"
+        );
+        assert_eq!(
+            slot.refusals_by_workspace_since(0)
+                .await
+                .expect("接上之后的租户拒绝读也要落到真账本"),
+            vec![("ws-one".to_string(), 3)],
+            "按租户的拒绝数走同一条转发"
+        );
         assert_eq!(
             reads.load(Ordering::SeqCst),
             1,
             "那一次读要真的经过账本，而不是被槽答了"
+        );
+        assert_eq!(
+            refusal_reads.load(Ordering::SeqCst),
+            2,
+            "两路拒绝数各要走一次转发：少了哪一条，那一级排行就整条读不出来"
         );
     }
 }

@@ -737,7 +737,19 @@ pub struct SpenderLine {
     /// The person or workspace id, exactly as the ledger resolved it.
     pub id: String,
     /// Tokens the ledger charged this subject today.
+    ///
+    /// Zero is two different days: with refusals beside it, every call this
+    /// subject made was turned away before it could spend anything; without
+    /// them, the calls that landed charged nothing — an unmetered response
+    /// lands as zero. The refusal column is what tells the two apart.
     pub tokens: u64,
+    /// Calls today that this subject's own ceiling turned away.
+    ///
+    /// A refusal spends nothing, so it moves no counter anywhere; this is the
+    /// only number on the row that says a ceiling actually bit. Only the
+    /// refusals charged to this subject count — a job's own budget running out
+    /// is a different wall with a different remedy, and it is not in here.
+    pub refusals: u64,
     /// The ceiling somebody declared for this subject; `null` means nobody did,
     /// which is not the same as "unlimited" — the judge then falls back to the
     /// manager's default. Read [`TokenSpendersResponse::ceilings_readable`]
@@ -768,19 +780,21 @@ pub struct TokenSpendersResponse {
     /// means this deployment has no hierarchy manager, so no ceiling could be
     /// read and every row's null says "unread", not "undeclared".
     pub ceilings_readable: bool,
-    /// Descending by tokens; ties break on id so two reads of the same day
-    /// return the same order.
+    /// Descending by tokens, then by refusals, then by id — every tie-break is
+    /// read from the row itself, so two reads of the same day return the same
+    /// order.
     pub spenders: Vec<SpenderLine>,
 }
 
-/// Today's spend per person or per workspace, beside the ceilings those
-/// subjects declared.
+/// Today's spend and refusals per person or per workspace, beside the ceilings
+/// those subjects declared.
 ///
 /// This is the read that closes the operator loop for per-subject quotas: the
 /// write face takes an id, but nobody knows which ids to write ceilings for
-/// until someone can see who is spending. Without it the only way to find a
-/// heavy spender is to query the ledger table by hand, which is exactly the
-/// manual reconciliation the platform is not supposed to need.
+/// until someone can see who is spending — and nobody learns that a ceiling is
+/// too low until someone can see who is being refused against one. Without it
+/// the only way to find either is to query the ledger table by hand, which is
+/// exactly the manual reconciliation the platform is not supposed to need.
 ///
 /// Only the two levels a call is actually charged to can be asked. The list of
 /// those levels comes from the same judge the write face uses, so a level that
@@ -831,10 +845,31 @@ pub async fn token_spenders_handler(
         | cog_core::QuotaScope::Global => unreachable!("refused by scope_enforcement"),
     }
     .map_err(|e| ApiError::internal(format!("failed to read today's spend: {e}")))?;
+    // The refusals are a second read of the same day and the same rows: a
+    // subject whose calls were all turned away has nothing in the spend fold,
+    // so a list built from spend alone would leave out exactly the people the
+    // ceilings are biting. A failed read is a failure here for the same reason
+    // it is above — an empty list would claim nobody was refused.
+    let refusals = match scope {
+        cog_core::QuotaScope::User => ledger.refusals_by_person_since(since_unix).await,
+        cog_core::QuotaScope::Workspace => ledger.refusals_by_workspace_since(since_unix).await,
+        cog_core::QuotaScope::Team
+        | cog_core::QuotaScope::Organization
+        | cog_core::QuotaScope::Global => unreachable!("refused by scope_enforcement"),
+    }
+    .map_err(|e| ApiError::internal(format!("failed to read today's refusals: {e}")))?;
 
-    let mut spenders = Vec::with_capacity(rows.len());
-    let mut ceilings_readable = state.hierarchy_manager.is_some();
+    let mut days: std::collections::BTreeMap<String, (u64, u64)> = Default::default();
     for (id, tokens) in rows {
+        days.entry(id).or_default().0 = tokens;
+    }
+    for (id, refusals) in refusals {
+        days.entry(id).or_default().1 = refusals;
+    }
+
+    let mut spenders = Vec::with_capacity(days.len());
+    let mut ceilings_readable = state.hierarchy_manager.is_some();
+    for (id, (tokens, refusals)) in days {
         // A ceiling read that fails is a failure, not "nobody declared one":
         // the second answer would tell an operator there is room to spare.
         let limits = match state.hierarchy_manager.as_ref() {
@@ -849,6 +884,7 @@ pub async fn token_spenders_handler(
         spenders.push(SpenderLine {
             id,
             tokens,
+            refusals,
             remaining: limits.as_ref().map(|l| l.hard_limit.saturating_sub(tokens)),
             hard_limit: limits.as_ref().map(|l| l.hard_limit),
             soft_limit: limits.as_ref().map(|l| l.soft_limit),
@@ -878,7 +914,15 @@ fn spenders_response(
     ceilings_readable: bool,
 ) -> TokenSpendersResponse {
     let total = spenders.iter().map(|row| row.tokens).sum();
-    spenders.sort_by(|a, b| b.tokens.cmp(&a.tokens).then_with(|| a.id.cmp(&b.id)));
+    // Ties break on refusals before the id: among the subjects that were
+    // turned away without spending anything, the one refused most often is the
+    // one the reader is looking for.
+    spenders.sort_by(|a, b| {
+        b.tokens
+            .cmp(&a.tokens)
+            .then_with(|| b.refusals.cmp(&a.refusals))
+            .then_with(|| a.id.cmp(&b.id))
+    });
     TokenSpendersResponse {
         scope: scope.as_str(),
         since: since.to_rfc3339(),

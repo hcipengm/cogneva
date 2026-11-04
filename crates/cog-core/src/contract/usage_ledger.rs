@@ -763,6 +763,47 @@ pub trait LlmUsageLedger: Send + Sync {
     async fn spend_by_workspace_since(&self, since_unix: i64)
         -> Result<Vec<(String, u64)>, String>;
 
+    /// How many calls were turned away because a person's own day was spent,
+    /// since `since_unix`, per person, `(person, refusals)`.
+    ///
+    /// Counted from [`crate::UsageResult::RefusedByOwnerBudget`] rows, which is the one
+    /// result word that means "this person's ceiling did the refusing". The
+    /// neighbouring refusals deliberately do not count here: a job's own budget
+    /// running out is a different cell with a different remedy, and folding the
+    /// two together would send the reader to raise a ceiling that was never
+    /// touched.
+    ///
+    /// This is the half of the day the spend folds cannot show. A refused call
+    /// spends nothing, so a person who was refused all day has a spend row of
+    /// zero — when they appear at all — and zero is exactly what a person who
+    /// made no call looks like. The refusal rows are the only record that a
+    /// ceiling bit, and without this read the only way to find out is to query
+    /// the ledger table by hand.
+    ///
+    /// A ledger that does not report refusals answers with an error rather than
+    /// an empty list: an empty list is a claim that nobody was refused, which is
+    /// the one thing a reader with no data cannot say.
+    async fn refusals_by_person_since(
+        &self,
+        _since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        Err("this ledger does not report refusals by person".into())
+    }
+
+    /// The tenant counterpart of [`refusals_by_person_since`](Self::refusals_by_person_since):
+    /// calls refused because the workspace's day was spent, folded onto the
+    /// workspace of the task the call was made for.
+    ///
+    /// Same result word and the same reason for the same word: the row records
+    /// which ceiling refused, and the fold onto the tenant is the one
+    /// [`spend_by_workspace_since`](Self::spend_by_workspace_since) makes.
+    async fn refusals_by_workspace_since(
+        &self,
+        _since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        Err("this ledger does not report refusals by workspace".into())
+    }
+
     /// Tokens each of the named tasks spent since `since_unix`, `(task_id, tokens)`.
     ///
     /// The day-scoped counterpart of [`spend_by_task`](Self::spend_by_task): that

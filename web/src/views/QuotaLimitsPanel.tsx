@@ -195,7 +195,9 @@ export function QuotaLimitsPanel() {
             </p>
           )}
           {spenders && spenders.spenders.length === 0 && (
-            <p className="text-[11px] text-[var(--muted)]">今天这一级还没有花销。</p>
+            <p className="text-[11px] text-[var(--muted)]">
+              今天这一级没有花销，也没有被上限拒掉的调用。
+            </p>
           )}
           {spenders && spenders.spenders.length > 0 && (
             <>
@@ -204,6 +206,7 @@ export function QuotaLimitsPanel() {
                   <tr className="text-left text-[var(--muted)]">
                     <th className="py-0.5 pr-3 font-normal">格子</th>
                     <th className="py-0.5 pr-3 text-right font-normal">今天已花</th>
+                    <th className="py-0.5 pr-3 text-right font-normal">今天被拒</th>
                     <th className="py-0.5 pr-3 text-right font-normal">声明的 hard</th>
                     <th className="py-0.5 text-right font-normal">剩余</th>
                   </tr>
@@ -226,6 +229,14 @@ export function QuotaLimitsPanel() {
                         </Note>
                       </td>
                       <td className="py-0.5 pr-3 text-right">{row.tokens.toLocaleString()}</td>
+                      {/* 花销为零、拒绝数不为零的一行，正是这一面存在的理由：那个人
+                          今天每一发都被自己那格上限挡下了，花销排行里只有他一个零。 */}
+                      <td
+                        className="py-0.5 pr-3 text-right"
+                        style={row.refusals > 0 ? { color: 'var(--danger)' } : undefined}
+                      >
+                        {row.refusals === 0 ? '—' : row.refusals.toLocaleString()}
+                      </td>
                       <td className="py-0.5 pr-3 text-right">
                         {row.hard_limit === null ? '—' : row.hard_limit.toLocaleString()}
                       </td>
@@ -240,6 +251,8 @@ export function QuotaLimitsPanel() {
                 {spenders.ceilings_readable
                   ? '「—」是这一格没人声明过上限，它跟着默认值走；「剩余」按账本当场算，判定读的是每 30 秒覆盖一次的格子，两者可能差最近这几十秒的花销。'
                   : '这个部署没有上限库，读不到任何一格声明过的上限；这一列的空值是「读不到」，不是「没人配过」。'}
+                {' '}
+                「今天被拒」只数被这一格自己的上限挡下的调用：花销为零而这一列不为零，就是今天每一发都被挡了；任务预算用尽是另一堵墙，不记在这里。
               </p>
             </>
           )}

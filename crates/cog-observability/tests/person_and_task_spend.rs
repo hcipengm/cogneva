@@ -51,6 +51,29 @@ async fn ledger_row(
     .expect("write a ledger row");
 }
 
+/// 一行被拒的账：哪一种拒绝、谁、哪件活。被拒的一发不花钱。
+async fn refused_row(
+    pool: &PgPool,
+    ts: chrono::DateTime<Utc>,
+    result: cog_core::UsageResult,
+    owner: Option<&str>,
+    task: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO gateway_llm_usage
+             (id, ts, upstream, api_style, model, result, tokens_input, tokens_output, task_id, owner_id)
+         VALUES ($1, $2, 'test-upstream', 'openai', 'test-model', $3, 0, 0, $4, $5)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(ts)
+    .bind(result.as_str())
+    .bind(task)
+    .bind(owner)
+    .execute(pool)
+    .await
+    .expect("write a refusal row");
+}
+
 async fn prepare(url: &str) -> (PgPool, LlmUsageStore) {
     let pool = PgPool::connect(url)
         .await
@@ -318,6 +341,141 @@ async fn a_workspaces_day_is_the_calls_made_for_the_tasks_it_runs() {
         .await
         .expect("leave the ledger as it was found");
     for workspace in [&tenant, &other, &twin_home] {
+        sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
+            .bind(workspace)
+            .execute(&pool)
+            .await
+            .expect("leave the graph as it was found");
+    }
+}
+
+/// 被上限拒掉的一发算在被那条上限约束的主体头上，别的拒绝不算给任何人。
+///
+/// 这一份读喂的是排行里的「今天被拒」一列，也是「这个人今天每一发都被拒、花了零」
+/// 在读数面上唯一能被看见的地方：花销读不出来他，只有拒绝数能。所以它只数
+/// `refused_by_owner_budget`——那是唯一一种「是这个人的上限拒的」；任务预算拒的
+/// 那一种算在任务头上，算到人身上就会把「这件活预算超了」读成「这个人超了」。
+#[tokio::test]
+#[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
+async fn a_refusal_is_counted_against_the_subject_the_ceiling_that_refused_belongs_to() {
+    let url = database_url();
+    let (pool, store) = prepare(&url).await;
+
+    let run = uuid::Uuid::new_v4();
+    let day = Utc.with_ymd_and_hms(2005, 5, 6, 0, 0, 0).unwrap();
+    let since = day.timestamp();
+    let tenant_a = format!("refusal-ws-a-{run}");
+    let tenant_b = format!("refusal-ws-b-{run}");
+    let task_a = format!("refusal-task-a-{run}");
+    let task_b = format!("refusal-task-b-{run}");
+    let person_a = format!("refusal-person-a-{run}");
+    let person_b = format!("refusal-person-b-{run}");
+    let person_c = format!("refusal-person-c-{run}");
+    let person_d = format!("refusal-person-d-{run}");
+
+    for (workspace, task_id, submitted_by) in [
+        (&tenant_a, &task_a, &person_a),
+        (&tenant_b, &task_b, &person_b),
+    ] {
+        sqlx::query(
+            "INSERT INTO cog_dag_tasks (workspace_id, task_id, task, status)
+             VALUES ($1, $2, $3, 'pending')",
+        )
+        .bind(workspace)
+        .bind(task_id)
+        .bind(serde_json::json!({ "submitted_by": submitted_by }))
+        .execute(&pool)
+        .await
+        .expect("write a task");
+    }
+
+    // 属主自己那一格的上限拒的，且没有任务身份：只算人，不进任何租户。
+    refused_row(
+        &pool,
+        day + chrono::Duration::hours(1),
+        cog_core::UsageResult::RefusedByOwnerBudget,
+        Some(&person_a),
+        None,
+    )
+    .await;
+    // 没有属主，靠任务连到提交人；同一行也连到任务跑的租户。
+    refused_row(
+        &pool,
+        day + chrono::Duration::hours(2),
+        cog_core::UsageResult::RefusedByOwnerBudget,
+        None,
+        Some(&task_a),
+    )
+    .await;
+    // 属主与提交人都在：人那一列属主优先，租户那一列仍跟着任务走。
+    refused_row(
+        &pool,
+        day + chrono::Duration::hours(3),
+        cog_core::UsageResult::RefusedByOwnerBudget,
+        Some(&person_c),
+        Some(&task_b),
+    )
+    .await;
+    // 花掉钱的一发不是拒绝，不许进这一列。
+    ledger_row(
+        &pool,
+        day + chrono::Duration::hours(4),
+        Some(&person_a),
+        None,
+        90,
+    )
+    .await;
+    // 任务预算拒的：那是这件活的预算，不是这个人的上限，谁也不该被记一笔。
+    refused_row(
+        &pool,
+        day + chrono::Duration::hours(5),
+        cog_core::UsageResult::RefusedByBudget,
+        Some(&person_d),
+        Some(&task_b),
+    )
+    .await;
+    // 前一天被拒的一发：这个读的窗口与花销同一个，从当日零点起算。
+    refused_row(
+        &pool,
+        day - chrono::Duration::hours(1),
+        cog_core::UsageResult::RefusedByOwnerBudget,
+        Some(&person_d),
+        None,
+    )
+    .await;
+
+    let people = store
+        .refusals_by_person_since(since)
+        .await
+        .expect("read the refusals by person");
+    assert_eq!(
+        people,
+        vec![(person_a.clone(), 2), (person_c.clone(), 1)],
+        "属主那一行 + 靠任务连到提交人的那一行；两处都在时属主优先而不重复记；\
+         任务预算拒的不算给谁；昨天的不在今天的窗口里"
+    );
+
+    let workspaces = store
+        .refusals_by_workspace_since(since)
+        .await
+        .expect("read the refusals by workspace");
+    assert_eq!(
+        workspaces,
+        vec![(tenant_a.clone(), 1), (tenant_b.clone(), 2)],
+        "没有任务身份的那一行不进任何租户；同一件活上的两次拒绝都算它跑在的那个租户"
+    );
+    assert!(
+        workspaces.iter().all(|(id, _)| !id.is_empty()),
+        "空 id 不是工作区，不许成一个格子"
+    );
+
+    sqlx::query("DELETE FROM gateway_llm_usage WHERE ts >= $1 AND ts < $2")
+        .bind(day - chrono::Duration::days(1))
+        .bind(day + chrono::Duration::days(1))
+        .execute(&pool)
+        .await
+        .expect("leave the ledger as it was found");
+    for workspace in [&tenant_a, &tenant_b] {
         sqlx::query("DELETE FROM cog_dag_tasks WHERE workspace_id = $1")
             .bind(workspace)
             .execute(&pool)

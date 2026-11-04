@@ -2969,6 +2969,14 @@ export async function clearQuotaLimits(scope: string, id: string): Promise<Quota
 export interface TokenSpender {
   id: string;
   tokens: number;
+  /**
+   * 今天被这一格自己的上限拒掉的发数。
+   *
+   * 与花销一起读，因为 `tokens === 0` 有两种意思：`refusals > 0` 是「每一发都
+   * 被拒」，等于 0 是「落了行但没计到钱」。只数这一格上限拒的；任务预算拒的
+   * 是另一堵墙，不在此列。
+   */
+  refusals: number;
   /** 有人为这一格声明过的硬上限；`null` 是「没人声明」，不是「不限」。 */
   hard_limit: number | null;
   soft_limit: number | null;

@@ -5,11 +5,13 @@
 //! 的排行与「谁会被拒」不是同一件事——一个人今天花光额度、另一个人三天里慢慢花
 //! 光，在「最近 72 小时」的排行里长得一模一样。
 //!
-//! 四条判据，每条都对应一种曾经会静默错误的读法：
+//! 五条判据，每条都对应一种曾经会静默错误的读法：
 //!
 //! - 排行按 token 降序、总数是全部行之和，不是前几行之和；
 //! - 每行带的是**声明过的**上限，不是判定时退到的默认值——后者会让每一行都读成
 //!   「配过上限」，而运维真正要问的是「谁还没配」；
+//! - 被自己上限拒掉的那几发也在列：被拒的一发不花钱，只读花销的话，最该被看见的
+//!   那个主体恰好不在名单上；
 //! - 没有花销路径的层级直接拒答，不答一份空账：空账会被读成「今天没人花」；
 //! - 这一版没有上限库时，响应自己说 `ceilings_readable: false`，而不是让每一行
 //!   的空值冒充「没人声明过上限」。
@@ -31,27 +33,46 @@ use cog_gateway::{create_router, GatewayState};
 
 use crate::router_state;
 
-/// 只答按主体汇总的那两读；其余读口一律不该被这条路由碰到。
+/// 只答按主体汇总的那四读；其余读口一律不该被这条路由碰到。
 struct FakeSpend {
     people: Vec<(String, u64)>,
     workspaces: Vec<(String, u64)>,
+    refused_people: Vec<(String, u64)>,
+    refused_workspaces: Vec<(String, u64)>,
     /// 读面交给账本的起点。判据用它确认窗口是 UTC 日，不是「最近 N 小时」。
     since: AtomicI64,
+}
+
+fn pairs(rows: Vec<(&str, u64)>) -> Vec<(String, u64)> {
+    rows.into_iter()
+        .map(|(id, n)| (id.to_string(), n))
+        .collect()
 }
 
 impl FakeSpend {
     fn with(people: Vec<(&str, u64)>, workspaces: Vec<(&str, u64)>) -> Arc<Self> {
         Arc::new(Self {
-            people: people
-                .into_iter()
-                .map(|(id, tokens)| (id.to_string(), tokens))
-                .collect(),
-            workspaces: workspaces
-                .into_iter()
-                .map(|(id, tokens)| (id.to_string(), tokens))
-                .collect(),
+            people: pairs(people),
+            workspaces: pairs(workspaces),
+            refused_people: Vec::new(),
+            refused_workspaces: Vec::new(),
             since: AtomicI64::new(0),
         })
+    }
+
+    /// 同一天里另外还有这些拒绝。单独一个入口，只给判「被拒」的用例用。
+    fn refusing_to(
+        self: Arc<Self>,
+        people: Vec<(&str, u64)>,
+        workspaces: Vec<(&str, u64)>,
+    ) -> Arc<Self> {
+        let mut me = match Arc::try_unwrap(self) {
+            Ok(me) => me,
+            Err(_) => panic!("还握着第二个句柄"),
+        };
+        me.refused_people = pairs(people);
+        me.refused_workspaces = pairs(workspaces);
+        Arc::new(me)
     }
 }
 
@@ -68,6 +89,30 @@ impl LlmUsageLedger for FakeSpend {
     ) -> Result<Vec<(String, u64)>, String> {
         self.since.store(since_unix, Ordering::SeqCst);
         Ok(self.workspaces.clone())
+    }
+
+    async fn refusals_by_person_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        assert_eq!(
+            since_unix,
+            self.since.load(Ordering::SeqCst),
+            "花销与拒绝必须读同一个窗口；两读各算一个日界就是两本账"
+        );
+        Ok(self.refused_people.clone())
+    }
+
+    async fn refusals_by_workspace_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        assert_eq!(
+            since_unix,
+            self.since.load(Ordering::SeqCst),
+            "花销与拒绝必须读同一个窗口"
+        );
+        Ok(self.refused_workspaces.clone())
     }
 
     async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
@@ -279,6 +324,7 @@ async fn todays_spend_is_listed_per_person_beside_the_ceiling_they_declared() {
         "降序：读这一面就是来找花销最大的人的"
     );
     assert_eq!(rows[0]["tokens"], 900);
+    assert_eq!(rows[0]["refusals"], 0, "没人被拒就是 0，不是缺席");
     assert_eq!(
         rows[0]["hard_limit"], 1000,
         "带上声明过的硬上限：没有它，排行只说谁花得多，不说谁快被拒了"
@@ -300,13 +346,52 @@ async fn todays_spend_is_listed_per_person_beside_the_ceiling_they_declared() {
     assert!(since >= cog_core::day::day_start_unix(before));
 }
 
+/// 被上限拒掉的那几发也在名单上，哪怕这一行一个 token 都没花。
+///
+/// 这是这一面存在的第二个理由：被拒的一发不落花销，一个整天被拒的主体在账上
+/// 要么不出现、要么是一行 0，而 0 与「今天没来过」长得一样。只读花销的话，
+/// 最该被看见的那个主体恰好就是看不见的那个。
+#[tokio::test]
+async fn a_subject_that_was_refused_list_no_spend_is_still_on_the_list() {
+    let ledger = FakeSpend::with(vec![("u-spent", 900)], vec![])
+        .refusing_to(vec![("u-spent", 2), ("u-blocked", 7)], vec![]);
+    // u-blocked 自己声明过 100，可拒他的是租户那一级：余量仍按他自己的上限算，
+    // 这一行说明的正是「不是你自己的上限咬到的」，运维据此去找租户而不是找他。
+    let ceilings = FakeCeilings::with(vec![("u-blocked", QuotaLimits::new(100, 100))], vec![]);
+    let (status, body) = get(
+        state(ledger, Some(ceilings)),
+        "/api/v1/observability/token-usage/spenders",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let rows = body["spenders"].as_array().expect("排行是数组");
+    assert_eq!(rows.len(), 2, "只有拒绝、没有花销的主体也必须占一行");
+    assert_eq!(rows[0]["id"], "u-spent");
+    assert_eq!(rows[0]["tokens"], 900);
+    assert_eq!(rows[0]["refusals"], 2, "花销与被拒数是同一行上的两格");
+    assert_eq!(rows[1]["id"], "u-blocked");
+    assert_eq!(rows[1]["tokens"], 0);
+    assert_eq!(rows[1]["refusals"], 7);
+    assert_eq!(
+        rows[1]["remaining"], 100,
+        "他自己那一格还有余量——咬到他的是租户的上限，这一读不许把这层差别抹掉"
+    );
+    assert_eq!(
+        body["total"], 900,
+        "总数只数花掉的 token；被拒的一发花的是 0，把它加进总数就是凭空造钱"
+    );
+}
+
 /// 租户那一级读的是同一本账的另一个折叠，上限也从同一处来。
 #[tokio::test]
 async fn a_workspace_scope_reads_tenant_totals_with_their_own_ceilings() {
     let ledger = FakeSpend::with(
         vec![("u-heavy", 900)],
         vec![("ws-small", 20), ("ws-big", 700)],
-    );
+    )
+    // 人那一级也有一条拒绝：租户这一读不许把它数进来。
+    .refusing_to(vec![("u-heavy", 5)], vec![("ws-big", 4)]);
     let ceilings = FakeCeilings::with(
         vec![("u-heavy", QuotaLimits::new(800, 1000))],
         vec![("ws-big", QuotaLimits::new(500, 600))],
@@ -322,6 +407,10 @@ async fn a_workspace_scope_reads_tenant_totals_with_their_own_ceilings() {
     assert_eq!(body["total"], 720, "按人那一行的 900 不进租户这一读");
     let rows = body["spenders"].as_array().expect("排行是数组");
     assert_eq!(rows[0]["id"], "ws-big");
+    assert_eq!(
+        rows[0]["refusals"], 4,
+        "租户这一级读的是按租户折叠的那一份拒绝；人那一级的 5 不许漏进来"
+    );
     assert_eq!(rows[0]["hard_limit"], 600);
     assert_eq!(
         rows[0]["remaining"], 0,

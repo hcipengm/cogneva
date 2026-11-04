@@ -1206,6 +1206,100 @@ impl LlmUsageStore {
             .collect())
     }
 
+    /// 今天这个人被自己的上限拒了几发，`(person, refusals)`。
+    ///
+    /// 只数 `refused_by_owner_budget` 一种结果词：那是唯一一种「是这个人的上限
+    /// 拒的」的拒绝。旁边那几种拒绝各有各的格子与修法（任务自己的预算用完、
+    /// 配速、熔断），合在一起数会让读的人去抬一个根本没碰过的上限。
+    ///
+    /// 这是花销汇总看不见的那一半：被拒的一发不花钱，所以一个整天被拒的人
+    /// 在花销账上要么不出现，要么是一行 0——而 0 与「今天没来过」长得一模一样。
+    /// 拒绝行是唯一记得「上限咬到了」的地方，这一读就是把它按主体摊开。
+    ///
+    /// 归属规则与 [`Self::spend_by_person_since`] 逐字相同（`COALESCE(owner,
+    /// 任务提交人)`）：两处各认各的，会出现「按 A 记了花销、按 B 数了拒绝」。
+    pub async fn refusals_by_person_since(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let refused = cog_core::UsageResult::RefusedByOwnerBudget.as_str();
+        let rows = sqlx::query(&format!(
+            "SELECT person, COUNT(*)::BIGINT AS refusals FROM (
+                 SELECT COALESCE(NULLIF(u.owner_id, ''), t.person) AS person
+                   FROM {LEDGER_TABLE} u
+                   LEFT JOIN LATERAL (
+                        SELECT NULLIF(d.task->>'submitted_by', '') AS person
+                          FROM {TASK_GRAPH_TABLE} d
+                         WHERE d.task_id = u.task_id
+                         ORDER BY d.updated_at DESC
+                         LIMIT 1
+                   ) t ON TRUE
+                  WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
+                    AND u.result = $2
+             ) s
+             WHERE person IS NOT NULL
+             GROUP BY person
+             ORDER BY person"
+        ))
+        .bind(since_unix as f64)
+        .bind(refused)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("person"),
+                    row.get::<i64, _>("refusals").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
+    /// 今天这个租户被自己的上限拒了几发，`(workspace_id, refusals)`。
+    ///
+    /// 与按人那一份同一批行、同一个结果词，折叠的那个域换成任务行上的工作区
+    /// ——这正是 [`Self::spend_by_workspace_since`] 折叠的那个域。被拒的那一发
+    /// 自己带着 `owner_id`（可能为空），租户身份只能从 `task_id` 连回任务图，
+    /// 与花销账同一条规则。
+    pub async fn refusals_by_workspace_since(
+        &self,
+        since_unix: i64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let refused = cog_core::UsageResult::RefusedByOwnerBudget.as_str();
+        let rows = sqlx::query(&format!(
+            "SELECT workspace_id, COUNT(*)::BIGINT AS refusals FROM (
+                 SELECT t.workspace_id AS workspace_id
+                   FROM {LEDGER_TABLE} u
+                   JOIN LATERAL (
+                        SELECT d.workspace_id
+                          FROM {TASK_GRAPH_TABLE} d
+                         WHERE d.task_id = u.task_id
+                         ORDER BY d.updated_at DESC
+                         LIMIT 1
+                   ) t ON TRUE
+                  WHERE u.ts >= to_timestamp($1::DOUBLE PRECISION)
+                    AND u.result = $2
+             ) s
+             WHERE workspace_id IS NOT NULL AND workspace_id <> ''
+             GROUP BY workspace_id
+             ORDER BY workspace_id"
+        ))
+        .bind(since_unix as f64)
+        .bind(refused)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<String, _>("workspace_id"),
+                    row.get::<i64, _>("refusals").max(0) as u64,
+                )
+            })
+            .collect())
+    }
+
     /// 这件活算在谁头上、跑在哪个租户里，任务图里那一个答案。
     ///
     /// 判额度与记账读的是同一处：`spend_by_person_since` 把为任务做的调用算在提交
@@ -2102,6 +2196,24 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
         since_unix: i64,
     ) -> Result<Vec<(String, u64)>, String> {
         LlmUsageStore::spend_by_task_since(self, task_ids, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn refusals_by_person_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        LlmUsageStore::refusals_by_person_since(self, since_unix)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn refusals_by_workspace_since(
+        &self,
+        since_unix: i64,
+    ) -> Result<Vec<(String, u64)>, String> {
+        LlmUsageStore::refusals_by_workspace_since(self, since_unix)
             .await
             .map_err(|e| e.to_string())
     }
