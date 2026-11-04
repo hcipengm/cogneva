@@ -22,6 +22,12 @@
 //! could not already reach. What the guard buys is the accident it prevents --
 //! a worker picking up or finishing work that belongs to another unit -- not
 //! protection from a peer who deliberately names someone else's unit.
+//!
+//! The one subcommand that authors rather than transitions is `file`, and it
+//! authors nothing itself: it hands the submission to the platform's
+//! zero-credential submission face, which judges it with the same code that
+//! judges the owner's own input. Having the database connection is not a
+//! reason to write a row the door would have refused.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -30,10 +36,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 
-use cog_core::{
-    ActionPlannerMeta, DagMessage, Face, MessageBackend, StateBackend, Task, TaskDAG, TaskStatus,
-    TaskType,
-};
+use cog_core::{DagMessage, MessageBackend, StateBackend, Task, TaskDAG, TaskStatus};
 
 pub const USAGE: &str = "\
 cogneva work <SUBCOMMAND> --unit <unit> [OPTIONS]
@@ -43,9 +46,12 @@ owner named on the task row; a task owned by another unit is refused.
 
 SUBCOMMANDS:
     file    --task <id> --goal <text> --face <face> --acceptance <text>...
-                           Put this unit's own work into the graph: a Pending row
-                           owned by this unit and bound to the face it serves, so
-                           the publisher holds it for this unit rather than
+                           File this unit's own work through the platform's
+                           submission door: the same handler the owner's input
+                           goes through, so the row is bound to the face it
+                           serves, refused if it states no acceptance, and
+                           injected by the orchestrator like any other. The
+                           publisher then holds it for this unit rather than
                            offering it to whoever polls first.
     queue                  List this unit's Pending, Scheduled and Running tasks.
     next                   Print the one task this unit can start right now.
@@ -81,6 +87,9 @@ OPTIONS:
                            heartbeat, is what says the holder is still there).
     --result <json|@file>  The result payload for complete; @file reads a file.
     --error <text>         The failure text for fail.
+    --door-url <url>       The zero-credential submission face to file through
+                           (file). Defaults to COGNEVA_MEMORY_API_BASE, then to
+                           http://cogneva:<gateway.internal_port>.
     --json                 Print raw task rows instead of a table (queue).
     --workspace <id>       Override dag_executor.workspace_id.
     --database-url <url>   Override the graph's database URL.
@@ -132,6 +141,9 @@ pub struct Request {
     pub workspace: Option<String>,
     pub database_url: Option<String>,
     pub redis_url: Option<String>,
+    /// Where the submission door is, when the caller names it rather than
+    /// letting the environment or the configured port decide.
+    pub door_url: Option<String>,
 }
 
 /// Parse the arguments after `work`.
@@ -156,6 +168,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
     let mut workspace = None;
     let mut database_url = None;
     let mut redis_url = None;
+    let mut door_url = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -203,6 +216,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
             "--workspace" => workspace = Some(value("--workspace")?),
             "--database-url" => database_url = Some(value("--database-url")?),
             "--redis-url" => redis_url = Some(value("--redis-url")?),
+            "--door-url" => door_url = Some(value("--door-url")?),
             "--json" => json = true,
             other if other.starts_with('-') => return Err(format!("unknown flag {other}")),
             other => {
@@ -262,6 +276,7 @@ pub fn parse_args(args: &[String]) -> Result<Request, String> {
         workspace,
         database_url,
         redis_url,
+        door_url,
     })
 }
 
@@ -286,6 +301,9 @@ struct Endpoints {
     database_url: String,
     redis_url: String,
     nats_urls: Vec<String>,
+    /// The port the zero-credential face listens on, as this deployment is
+    /// configured. 0 means it is not open.
+    internal_port: u16,
 }
 
 fn endpoints(request: &Request) -> Result<Endpoints, Box<dyn Error>> {
@@ -334,6 +352,7 @@ fn endpoints(request: &Request) -> Result<Endpoints, Box<dyn Error>> {
             .clone()
             .unwrap_or_else(|| config.dag_executor.redis_url.clone()),
         nats_urls: config.dag_executor.nats.urls.clone(),
+        internal_port: config.gateway.internal_port,
     })
 }
 
@@ -364,10 +383,30 @@ async fn run(request: Request) -> Result<(), Box<dyn Error>> {
                 blocked_by: &blocked_by,
                 timeout_secs,
             };
-            let row =
-                filed_row(&filing, unit, workspace).map_err(|e| format!("cogneva work: {e}"))?;
-            file(&*backend, &pool, workspace, unit, &row).await?;
-            println!("{} filed (face={}, owner={})", row.id, face, unit);
+            let body = filing_body(&filing, unit, workspace)?;
+            preflight(&*backend, workspace, &task, &blocked_by).await?;
+            let door = door_base(
+                request.door_url.as_deref(),
+                std::env::var(cog_core::MEMORY_API_BASE_ENV).ok().as_deref(),
+                endpoints.internal_port,
+            )?;
+            let accepted = submit(&door, &body).await?;
+            let goal_id = accepted
+                .get("message_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("-");
+            match await_row(&*backend, workspace, &task).await? {
+                Some(row) => println!(
+                    "{} filed (face={}, owner={}, status={:?}, goal_id={})",
+                    row.id, face, unit, row.status, goal_id
+                ),
+                None => println!(
+                    "{} accepted by the submission door (goal_id={}) but not in the graph yet; \
+                     it appears once the orchestrator injects it -- check with `cogneva work \
+                     queue --unit {unit}`",
+                    task, goal_id
+                ),
+            }
         }
         Action::Queue { json } => queue(&*backend, workspace, unit, json).await?,
         Action::Next { json } => next(&*backend, workspace, unit, json).await?,
@@ -518,21 +557,33 @@ struct Filing<'a> {
 /// open at all", and a week is longer than a unit of work is meant to take.
 const UNIT_WORK_BUDGET_SECS: u64 = 7 * 24 * 60 * 60;
 
-/// The row this unit's own work enters the graph as.
+/// How long one filing request may take. The door answers as soon as it has
+/// judged the submission; the decomposition it starts runs behind the answer.
+const SUBMIT_TIMEOUT_SECS: u64 = 30;
+
+/// How long to wait for the accepted row to show up in the graph, and how often
+/// to look. Bounded on purpose: the row is usually there within a second, and a
+/// caller that waits forever has no way to tell a slow injector from a
+/// submission that was dropped.
+const SUBMIT_POLL_ATTEMPTS: u32 = 20;
+const SUBMIT_POLL_INTERVAL_MS: u64 = 500;
+
+/// The submission this unit's own work is filed as.
 ///
-/// The row is written as the shape a submission that is injected unplanned
-/// takes: executable, owned by the unit that filed it, bound to the face it
-/// serves, and stating in `acceptance` what done means. Every one of those
-/// fields is read by somebody downstream -- the publisher holds a row that
-/// names an owner instead of offering it to whoever polls first, the dispatcher
-/// holds a row that states no criterion, and the drift reading counts a row's
-/// face against its owner -- so a row filed without them would sit Pending
-/// looking exactly like work in progress.
+/// The body is the one the platform's submission door already reads: a task
+/// submission carrying a single verified row. Everything the row needs is a
+/// field that door reads today -- the face and the unit it is bound to (checked
+/// against the roster at the door), the criteria that say what done means
+/// (carried onto the row by the door, and kept in `input` where the submitter
+/// wrote them), the declared budget, and the blockers.
 ///
-/// The statement and the criteria are also left in `input`, where a submission
-/// carries them: a reader that shows a task's own words reads them there, and
-/// the two copies say the same thing at the moment they are written.
-fn filed_row(filing: &Filing, unit: &str, workspace: &str) -> Result<Task, String> {
+/// This command could have written the row straight into the graph -- it holds
+/// the database connection either way. It does not, because a second writer
+/// would have to re-implement every judgement the door makes (the roster
+/// binding, the refusal of credential-shaped input, the acceptance requirement,
+/// the quota check) and any one of those re-implementations silently drifting
+/// would leave two kinds of task row in the same graph, judged differently.
+fn filing_body(filing: &Filing, unit: &str, workspace: &str) -> Result<serde_json::Value, String> {
     let Filing {
         id,
         goal,
@@ -548,9 +599,12 @@ fn filed_row(filing: &Filing, unit: &str, workspace: &str) -> Result<Task, Strin
     if goal.trim().is_empty() {
         return Err("--goal is empty: a row nobody can read is a row nobody can pick up".into());
     }
-    // Blank entries are dropped the same way the submission door drops them: a
-    // list of empty strings is a list that says nothing, and a dispatcher that
-    // only asks whether the list is empty would take it as an answer.
+    if face.trim().is_empty() {
+        return Err("--face is empty: work is filed on the face it serves, or not at all".into());
+    }
+    // Blank entries are dropped the same way the door drops them: a list of
+    // empty strings is a list that says nothing, and a dispatcher that only
+    // asks whether the list is empty would take it as an answer.
     let stated: Vec<String> = acceptance
         .iter()
         .map(|criterion| criterion.trim())
@@ -564,115 +618,147 @@ fn filed_row(filing: &Filing, unit: &str, workspace: &str) -> Result<Task, Strin
              Say what done means with --acceptance"
         ));
     }
-    let mut row = Task::new(
-        id,
-        TaskType::Custom(UNIT_WORK_KIND.to_string()),
-        serde_json::json!({ "goal": goal.trim(), "acceptance": stated }),
-    );
-    row.workspace_id = Some(workspace.to_string());
-    row.owner_unit = Some(unit.to_string());
-    row.face_id = Some(face.to_string());
-    row.acceptance = stated;
-    row.priority = priority;
-    row.blocked_by = blocked_by.to_vec();
-    row.timeout_seconds = timeout_secs;
-    row.action_planner_meta = Some(ActionPlannerMeta {
-        verified: true,
-        version: None,
-        note: Some("filed by its owning unit; injected without decomposition".into()),
-        source: None,
-        confidence: None,
-        timestamp: Some(Utc::now()),
-    });
-    Ok(row)
+    Ok(serde_json::json!({
+        "goal": goal.trim(),
+        "workspace_id": workspace,
+        "intent_kind": "task",
+        "tasks": [{
+            "id": id,
+            "task_type": UNIT_WORK_KIND,
+            "input": { "goal": goal.trim(), "acceptance": stated },
+            "blocked_by": blocked_by,
+            "priority": priority,
+            "face_id": face,
+            "unit_id": unit,
+            "timeout_seconds": timeout_secs,
+            "planner": { "verified": true, "source": "user_provided" },
+        }],
+    }))
 }
 
-/// Put one filed row into the graph, once.
+/// Where the submission door is.
 ///
-/// Written through the graph's own store rather than a door of its own: the
-/// publisher scans the store for ready rows on every pass, so a row inserted
-/// here is offered by the same code that offers every other row, and the unit
-/// takes it back out with `claim` like any task it was handed. There is no
-/// second queue and no second state machine.
-///
-/// The two checks below are the ones whose failure is silent. A row under an id
-/// the graph already holds would be replaced by the insertion, and the work it
-/// described would disappear while the id kept reading as filed. A blocker that
-/// is not in the graph is not a dependency: readiness is computed over rows
-/// that exist, so a name nobody holds never completes and the row would wait
-/// forever -- visible only as a task that never starts.
-async fn file(
-    backend: &dyn StateBackend,
-    pool: &sqlx::PgPool,
-    workspace: &str,
-    unit: &str,
-    row: &Task,
-) -> Result<(), Box<dyn Error>> {
-    if let Some(held) = backend.dag_get_task(workspace, &row.id).await? {
+/// The door is the zero-credential face the platform already runs for callers
+/// that hold no token, and it is addressed the way every other caller of that
+/// face addresses it: `COGNEVA_MEMORY_API_BASE` if the deployment named one,
+/// otherwise the service name and the configured internal port. A deployment
+/// that opens no internal face (port 0) has no door to file through, and says
+/// so instead of failing at connect time with an address nobody meant.
+fn door_base(
+    override_url: Option<&str>,
+    named_by_deployment: Option<&str>,
+    internal_port: u16,
+) -> Result<String, String> {
+    let base = override_url
+        .or(named_by_deployment)
+        .map(str::to_string)
+        .filter(|base| !base.trim().is_empty());
+    if let Some(base) = base {
+        return Ok(base.trim().trim_end_matches('/').to_string());
+    }
+    if internal_port == 0 {
         return Err(format!(
-            "task {} is already in the graph as {:?} (owner {}); file under a different id, \
+            "this deployment opens no zero-credential submission face (gateway.internal_port \
+             is 0), so there is nowhere to file. Point {} at the face this deployment does \
+             run, e.g. http://<service>:<port>",
+            cog_core::MEMORY_API_BASE_ENV
+        ));
+    }
+    Ok(format!("http://cogneva:{internal_port}"))
+}
+
+/// Put one filed row into the graph, through the platform's own submission door.
+///
+/// The door judges the submission with the same code that judges the owner's
+/// own input: the row's face and unit are resolved against the roster, input
+/// carrying a credential-shaped key is refused, a verified row without an
+/// acceptance criterion is refused, quota is evaluated, and the accepted rows
+/// go to the orchestrator's injection path. Nothing about that is re-decided
+/// here -- this side only turns the arguments into the request the door reads
+/// and reports what the door said.
+async fn submit(door: &str, body: &serde_json::Value) -> Result<serde_json::Value, Box<dyn Error>> {
+    let url = format!("{door}/api/v1/tasks");
+    let response = reqwest::Client::new()
+        .post(&url)
+        .timeout(Duration::from_secs(SUBMIT_TIMEOUT_SECS))
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "could not reach the submission door at {url}: {e}. A call from outside the \
+                 cluster has to be pointed at the service's cluster IP: set {} to \
+                 http://<cluster-ip>:<internal-port>",
+                cog_core::MEMORY_API_BASE_ENV
+            )
+        })?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        // The door's own words, not a paraphrase: a refusal names the operand
+        // that was wrong, and restating it here would be a second copy of the
+        // rule that could drift from the one that actually refused.
+        return Err(format!("the submission door refused it with {status}: {text}").into());
+    }
+    serde_json::from_str(&text).map_err(|e| {
+        format!("the submission door answered {status} with something unreadable: {e}: {text}")
+            .into()
+    })
+}
+
+/// Wait, for a bounded time, for the accepted row to appear in the graph.
+///
+/// The door answers 202 before the orchestrator has injected anything, so a
+/// successful answer alone does not mean a row exists -- it means the request
+/// passed every judgement. The difference matters to the caller: a row that
+/// never appears is work that will never be offered, and printing "filed" on
+/// the strength of the 202 would be exactly the reading this command exists to
+/// avoid.
+async fn await_row(
+    backend: &dyn StateBackend,
+    workspace: &str,
+    id: &str,
+) -> Result<Option<Task>, Box<dyn Error>> {
+    for _ in 0..SUBMIT_POLL_ATTEMPTS {
+        if let Some(row) = backend.dag_get_task(workspace, id).await? {
+            return Ok(Some(row));
+        }
+        tokio::time::sleep(Duration::from_millis(SUBMIT_POLL_INTERVAL_MS)).await;
+    }
+    Ok(None)
+}
+
+/// The checks whose failure the door would not catch, done before the request.
+///
+/// Both are reads, not writes: a row under an id the graph already holds would
+/// be dropped by the injector without a word, leaving the caller believing the
+/// work was filed, and a blocker that is not in the graph never completes, so
+/// the row would wait forever while reading as queued.
+async fn preflight(
+    backend: &dyn StateBackend,
+    workspace: &str,
+    id: &str,
+    blocked_by: &[String],
+) -> Result<(), Box<dyn Error>> {
+    if let Some(held) = backend.dag_get_task(workspace, id).await? {
+        return Err(format!(
+            "task {id} is already in the graph as {:?} (owner {}); file under a different id, \
              or act on it with queue, next or claim",
-            row.id,
             held.status,
             held.owner_unit.as_deref().unwrap_or("nobody")
         )
         .into());
     }
-    for blocker in &row.blocked_by {
+    for blocker in blocked_by {
         if backend.dag_get_task(workspace, blocker).await?.is_none() {
             return Err(format!(
-                "task {} waits on {blocker}, which is not in the graph; readiness is computed \
-                 over rows that exist, so this row would wait forever",
-                row.id
+                "task {id} waits on {blocker}, which is not in the graph; readiness is computed \
+                 over rows that exist, so this row would wait forever"
             )
             .into());
         }
     }
-    let face = row.face_id.as_deref().unwrap_or_default();
-    face_answers_to(pool, face, unit).await?;
-    backend.dag_set_task(workspace, &row.id, row).await?;
     Ok(())
-}
-
-/// Refuse work filed on a face that is not this unit's.
-///
-/// The rule is the submission door's, and it is checked at the door rather than
-/// left to the drift pass: drift would report the mismatch only after the row
-/// had already been filed, and its verdict would describe work that was
-/// addressed to nobody the face answers to. Filing under another unit's face
-/// is the one way this command could take a colleague's work, so it is refused
-/// rather than warned about.
-async fn face_answers_to(
-    pool: &sqlx::PgPool,
-    face_id: &str,
-    unit: &str,
-) -> Result<(), Box<dyn Error>> {
-    use cog_core::GovernanceStore as _;
-    let store = cog_storage::PostgresGovernanceStore::new(pool.clone());
-    let nodes = store.face_nodes().await?;
-    let face = nodes
-        .iter()
-        .filter_map(Face::from_task)
-        .find(|face| face.face_id == face_id);
-    let Some(face) = face else {
-        return Err(format!(
-            "face '{face_id}' is not on the roster; a row bound to a face nobody declared \
-             would read as drift instead of as work"
-        )
-        .into());
-    };
-    match face.owner_unit.as_deref() {
-        None => Err(format!(
-            "face '{face_id}' has no owner; work cannot be filed under it until it is staffed"
-        )
-        .into()),
-        Some(owner) if owner != unit => Err(format!(
-            "face '{face_id}' is owned by '{owner}', not '{unit}'; a unit files work on the \
-             face it answers for, not on a colleague's"
-        )
-        .into()),
-        Some(_) => Ok(()),
-    }
 }
 
 /// The task a caller named, provided this unit owns it.
@@ -1248,13 +1334,17 @@ mod tests {
         assert!(parse_args(&bad_priority).is_err());
     }
 
-    /// The filed row has to satisfy the readers, not just this command: the
-    /// publisher holds a row that carries an owner instead of offering it on
-    /// the shared stream, and the dispatcher holds a row that states no
-    /// criterion. A row that failed either would sit Pending looking exactly
-    /// like work in progress, and its own unit could not pick it up either.
+    /// What this command sends has to be a submission the door accepts and
+    /// turns into the row its readers expect.
+    ///
+    /// Every field asserted here is one the door copies onto the row: the face
+    /// and the unit it is bound to (resolved against the roster at the door),
+    /// the criteria that say what done means (carried onto the row, and left in
+    /// `input` where a reader shows a task's own words), the declared budget,
+    /// the blockers and the verified claim. A submission that dropped any of
+    /// them would be accepted as something else than what the caller meant.
     #[test]
-    fn a_filed_row_is_work_its_own_unit_can_start() {
+    fn the_filing_is_a_submission_the_door_turns_into_the_row() {
         let request = parse_args(&file_args()).unwrap();
         let Action::File {
             task,
@@ -1277,39 +1367,31 @@ mod tests {
             blocked_by: &blocked_by,
             timeout_secs,
         };
-        let row = filed_row(&filing, &request.unit, "cogneva").unwrap();
+        let body = filing_body(&filing, &request.unit, "cogneva").unwrap();
 
-        assert_eq!(row.status, TaskStatus::Pending);
-        assert_eq!(row.owner_unit.as_deref(), Some("8b"));
-        assert_eq!(row.face_id.as_deref(), Some("ci-build-deploy"));
-        assert!(row.is_executable, "a row with no body to run is not work");
-        assert_eq!(row.acceptance, vec!["CI is green on main".to_string()]);
-        assert_eq!(row.priority, 1);
-        assert!(
-            cog_orchestrator::ready_queue::carries_an_owner(&row),
-            "the publisher offers an ownerless row on the shared stream, where whoever \
-             polls first runs it instead of the unit that filed it"
-        );
-        assert!(
-            cog_orchestrator::ready_queue::states_what_done_means(&row),
-            "the dispatcher holds a row that states no acceptance criterion"
-        );
-
-        let (ready, owned) = ready_owned(vec![row.clone()], &TaskDAG::default(), "8b");
-        assert_eq!(owned, 1, "the filing unit owns it");
         assert_eq!(
-            ready.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
-            vec!["close-the-ci-gap"],
-            "next must offer the row its unit just filed"
+            body["intent_kind"], "task",
+            "a goal submission is decomposed; this one is already decided"
         );
-
-        // The statement and the criteria travel in the input as well, where a
-        // submission carries them and where a task's own words are read from.
+        assert_eq!(body["workspace_id"], "cogneva");
+        let rows = body["tasks"].as_array().expect("one row");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["id"], "close-the-ci-gap");
+        assert_eq!(row["task_type"], UNIT_WORK_KIND);
+        assert_eq!(row["face_id"], "ci-build-deploy");
+        assert_eq!(row["unit_id"], "8b");
+        assert_eq!(row["priority"], 1);
+        assert_eq!(row["timeout_seconds"], UNIT_WORK_BUDGET_SECS);
         assert_eq!(
-            row.input["goal"],
-            "Close the gap on the ci-build-deploy face"
+            row["planner"]["verified"], true,
+            "without the verified claim the orchestrator plans the row again"
         );
-        assert_eq!(row.input["acceptance"][0], "CI is green on main");
+        assert_eq!(
+            row["input"]["acceptance"][0], "CI is green on main",
+            "a verified row states what done means, or the door refuses it"
+        );
+        assert_eq!(row["input"]["goal"], goal);
     }
 
     /// A criterion made of blanks is a list that says nothing. Filed as it
@@ -1331,14 +1413,14 @@ mod tests {
     fn a_blank_acceptance_criterion_is_not_an_answer() {
         let nobody: Vec<String> = Vec::new();
         assert!(
-            filed_row(&filing("t", "g", &nobody), "8b", "ws").is_err(),
+            filing_body(&filing("t", "g", &nobody), "8b", "ws").is_err(),
             "no criterion at all"
         );
         let blanks = vec!["   ".to_string(), String::new()];
-        assert!(filed_row(&filing("t", "g", &blanks), "8b", "ws").is_err());
+        assert!(filing_body(&filing("t", "g", &blanks), "8b", "ws").is_err());
         let stated = vec!["a".to_string()];
-        assert!(filed_row(&filing("  ", "g", &stated), "8b", "ws").is_err());
-        assert!(filed_row(&filing("t", " ", &stated), "8b", "ws").is_err());
+        assert!(filing_body(&filing("  ", "g", &stated), "8b", "ws").is_err());
+        assert!(filing_body(&filing("t", " ", &stated), "8b", "ws").is_err());
     }
 
     /// The executor's own default is five minutes, and the over-budget rule
@@ -1348,12 +1430,54 @@ mod tests {
     #[test]
     fn a_filed_row_outlives_a_five_minute_executor_run() {
         let stated = vec!["CI is green on main".to_string()];
-        let row = filed_row(&filing("t", "g", &stated), "8b", "ws").unwrap();
+        let body = filing_body(&filing("t", "g", &stated), "8b", "ws").unwrap();
+        let stated_budget = body["tasks"][0]["timeout_seconds"]
+            .as_u64()
+            .expect("the budget travels with the submission");
         assert!(
-            row.timeout_seconds > 300,
-            "a filed row defaulting to the executor's budget fails while its owner is alive"
+            stated_budget > 300,
+            "a filed row left on the executor's budget fails while its owner is alive"
         );
-        assert_eq!(row.timeout_seconds, UNIT_WORK_BUDGET_SECS);
+        assert_eq!(stated_budget, UNIT_WORK_BUDGET_SECS);
+    }
+
+    /// The door is addressed the way every other caller of that face addresses
+    /// it, and a deployment that opens no such face says so instead of failing
+    /// at connect time with an address nobody meant.
+    #[test]
+    fn the_door_is_addressed_by_the_deployment_name_or_the_port() {
+        assert_eq!(
+            door_base(Some("http://10.0.0.5:8085/"), None, 8085).unwrap(),
+            "http://10.0.0.5:8085",
+            "an explicit address wins, without its trailing slash"
+        );
+        assert_eq!(
+            door_base(None, Some("http://cogneva:8085"), 9999).unwrap(),
+            "http://cogneva:8085",
+            "the name the deployment gave this face wins over the default"
+        );
+        assert_eq!(door_base(None, None, 8085).unwrap(), "http://cogneva:8085");
+        let refused = door_base(None, None, 0).unwrap_err();
+        assert!(
+            refused.contains(cog_core::MEMORY_API_BASE_ENV),
+            "a deployment with no face to file through must name the setting that points at one: {refused}"
+        );
+    }
+
+    /// `--door-url` is an operand of `file`, not a free-floating flag: it must
+    /// reach the request, and it must not become a way to smear the subcommand.
+    #[test]
+    fn file_takes_the_door_address_as_an_operand() {
+        let mut items = file_args();
+        items.push("--door-url".into());
+        items.push("http://10.0.0.5:8085".into());
+        let request = parse_args(&items).unwrap();
+        assert_eq!(request.door_url.as_deref(), Some("http://10.0.0.5:8085"));
+        items.pop();
+        assert!(
+            parse_args(&items).is_err(),
+            "--door-url without its value must not parse"
+        );
     }
 
     #[test]

@@ -162,6 +162,16 @@ pub struct TaskItem {
     /// with a face and only when it agrees with the face's owner.
     #[serde(default)]
     pub unit_id: Option<String>,
+    /// How long this row may stay open before the graph fails it.
+    ///
+    /// The default on a task is sized for one dispatched round. A row a worker
+    /// holds across many heartbeats is a different shape, and the over-budget
+    /// rule reads the age of the row rather than the liveness of its holder --
+    /// so without a stated budget such a row is failed while its owner is
+    /// demonstrably alive. That is the submitter's call to make, not something
+    /// to infer from the row's type.
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -670,6 +680,21 @@ fn injected_row_without_acceptance(req: &CreateTaskRequest) -> Option<&str> {
     })
 }
 
+/// The first row in this submission that states a budget of zero seconds.
+///
+/// Zero is not "no limit" -- the over-budget rule compares the age of the row
+/// against this number, so zero reads as "over budget before it started": the
+/// row is accepted, queued, and failed on the first sweep. A submitter that
+/// meant "no limit" has to say a length, and this check is what tells them
+/// their row was read the other way.
+fn row_with_zero_budget(req: &CreateTaskRequest) -> Option<&str> {
+    req.tasks
+        .as_ref()?
+        .iter()
+        .find(|item| item.timeout_seconds == Some(0))
+        .map(|item| item.id.as_str())
+}
+
 fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
     let mut rows: Vec<Task> = req
         .tasks
@@ -690,6 +715,13 @@ fn submitted_tasks(req: &CreateTaskRequest, goal_id: &str) -> Vec<Task> {
                     task.agent_id = item.agent_id.clone();
                     task.face_id = item.face_id.clone();
                     task.owner_unit = item.unit_id.clone();
+                    // The stated budget replaces the row default rather than
+                    // being layered under it: a submitter that says "this stays
+                    // open for a week" is answering the same question the
+                    // default answers.
+                    if let Some(secs) = item.timeout_seconds {
+                        task.timeout_seconds = secs;
+                    }
                     // Only a submission that says it is a task can carry the
                     // "no planning needed" claim. A goal is decomposed by
                     // definition; letting a verified flag on one of its rows
@@ -803,6 +835,17 @@ pub async fn create_task_handler(
              the task's input; without them the row is held and never runs."
         ))
         .with_code("acceptance_required"));
+    }
+
+    // A budget of zero is refused here rather than read as "no limit": it is
+    // the number the over-budget sweep compares against, so the row would be
+    // failed before it ever ran -- while the submitter read a 202.
+    if let Some(id) = row_with_zero_budget(&req) {
+        return Err(ApiError::bad_request(format!(
+            "task {id} states a budget of 0 seconds, which is over budget before it starts; \
+             say how long the row may stay open"
+        ))
+        .with_code("timeout_required"));
     }
 
     // A row that names a face or a unit is checked against the roster here,
@@ -2266,6 +2309,7 @@ mod tests {
                 agent_id: None,
                 face_id: None,
                 unit_id: None,
+                timeout_seconds: None,
             }]),
             workspace_id: "ws".into(),
             priority: None,
@@ -2310,6 +2354,7 @@ mod tests {
             agent_id: None,
             face_id: None,
             unit_id: None,
+            timeout_seconds: None,
         }
     }
 
@@ -2478,6 +2523,61 @@ mod tests {
             "the criteria the submitter stated are the row's criteria; a blank \
              entry is not one of them"
         );
+    }
+
+    /// 提交者声明的预算要真的落到行上。超预算判据读的是**行的年龄**、不看心跳，
+    /// 所以一条跨很多次心跳的行如果在这里丢掉预算，就会在它主人还活着的时候被判
+    /// 超时——而门口回的是 202。
+    #[test]
+    fn a_stated_budget_lands_on_the_row() {
+        let mut item = task_item("t1", Some(true));
+        item.timeout_seconds = Some(7 * 24 * 60 * 60);
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "hold this for a while".into(),
+            tasks: Some(vec![item]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let tasks = submitted_tasks(&req, "g");
+        assert_eq!(
+            tasks[0].timeout_seconds,
+            7 * 24 * 60 * 60,
+            "the submitter's budget is the one the sweep will read"
+        );
+    }
+
+    /// 没声明预算的行保持原来的默认值：这条口子不许把「没说话」读成「无限期」。
+    #[test]
+    fn a_row_that_states_no_budget_keeps_the_executor_default() {
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "one round".into(),
+            tasks: Some(vec![task_item("t1", Some(true))]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        let tasks = submitted_tasks(&req, "g");
+        assert_eq!(tasks[0].timeout_seconds, 300);
+    }
+
+    /// 0 秒不是「不限时」：判据拿它比行的年龄，所以 0 读作「还没开始就超预算」。
+    /// 这一条要在门口点名，而不是收下以后在第一次扫描里判死。
+    #[test]
+    fn a_zero_budget_is_named_at_the_door() {
+        let mut item = task_item("t1", Some(true));
+        item.timeout_seconds = Some(0);
+        let req = CreateTaskRequest {
+            goal_id: None,
+            goal: "no limit".into(),
+            tasks: Some(vec![item]),
+            workspace_id: "ws".into(),
+            priority: None,
+            intent_kind: IntentKind::Task,
+        };
+        assert_eq!(row_with_zero_budget(&req), Some("t1"));
     }
 
     /// 一条什么都不说的直注行在门口就被点名，而不是被收下以后静静躺在板上。
