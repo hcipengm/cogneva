@@ -636,6 +636,66 @@ async fn hand_over(
     }
 }
 
+/// How many wakes one item's hand-over is tried across before it is given up on.
+///
+/// The pass that found an item is the first attempt; the next wakes carry the
+/// rest. Three is enough for a refusal that is a collision or a momentary
+/// outage to clear, and bounded so that an item the goal path will never take
+/// stops costing a submission every five minutes for the rest of the day.
+const HANDOVER_ATTEMPTS: u32 = 3;
+
+/// An item whose hand-over failed, waiting for the next wake.
+struct Retry {
+    /// Which source found it: the census is per source, and so is the text the
+    /// goal carries.
+    source: usize,
+    item: OutwardItem,
+    /// How many attempts have already been made.
+    attempts: u32,
+}
+
+/// Ask again for the items whose hand-over failed on an earlier wake.
+///
+/// A source asked once a day would otherwise lose a finding for the whole day
+/// to a single refusal — and the graph can refuse for reasons that pass: a
+/// submission landing between another replica's read and its insert, a store
+/// that is briefly unavailable. The census records an item once, when its fate
+/// is decided: counting the failed attempts would turn `items_total` from "what
+/// this pass found and what became of it" into a count of tries, and the pass
+/// reading beside it already says how often the source was asked.
+async fn drain_retries(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    sources: &[OutwardSource],
+    pending: &mut Vec<Retry>,
+    census: &Arc<OutwardCensus>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut still = Vec::new();
+    for mut retry in pending.drain(..) {
+        let Some(source) = sources.get(retry.source) else {
+            // The source list of this process is the one it was started with;
+            // an index that names nothing is a bookkeeping error, not an item to
+            // count against a source that does not exist.
+            warn!(
+                index = retry.source,
+                url = %retry.item.url,
+                "outward: a retry names a source this loop does not have"
+            );
+            continue;
+        };
+        let outcome = hand_over(orchestrator, source, &retry.item).await;
+        if outcome == Handover::Failed && retry.attempts + 1 < HANDOVER_ATTEMPTS {
+            retry.attempts += 1;
+            still.push(retry);
+            continue;
+        }
+        census.record_items(&source.name, outcome.cell(), 1).await;
+    }
+    *pending = still;
+}
+
 /// Start the resident outward loop.
 ///
 /// The loop asks each source on its own cadence, hands what it found to the goal
@@ -690,6 +750,9 @@ pub fn spawn_outward_loop(
                 ticker.tick().await;
                 let now = Instant::now();
                 let mut next_due: Vec<Instant> = sources.iter().map(|_| now).collect();
+                // Items a pass found but could not hand over. They are asked
+                // again on the next wake, not on the source's next cadence.
+                let mut pending: Vec<Retry> = Vec::new();
                 loop {
                     beat.beat();
                     tokio::select! {
@@ -699,8 +762,11 @@ pub fn spawn_outward_loop(
                     if !hold.may_act().await {
                         continue;
                     }
+                    drain_retries(&orchestrator, &sources, &mut pending, &census).await;
                     let now = Instant::now();
-                    for (source, due) in sources.iter().zip(next_due.iter_mut()) {
+                    for (index, (source, due)) in
+                        sources.iter().zip(next_due.iter_mut()).enumerate()
+                    {
                         if now < *due {
                             continue;
                         }
@@ -717,7 +783,15 @@ pub fn spawn_outward_loop(
                             .await;
                         for item in &tick.items {
                             let outcome = hand_over(&orchestrator, source, item).await;
-                            census.record_items(&source.name, outcome.cell(), 1).await;
+                            if outcome == Handover::Failed && HANDOVER_ATTEMPTS > 1 {
+                                pending.push(Retry {
+                                    source: index,
+                                    item: item.clone(),
+                                    attempts: 1,
+                                });
+                            } else {
+                                census.record_items(&source.name, outcome.cell(), 1).await;
+                            }
                         }
                     }
                 }
@@ -1023,6 +1097,17 @@ mod tests {
     struct RememberingOrchestrator {
         held: StdMutex<std::collections::HashSet<String>>,
         submissions: StdMutex<Vec<String>>,
+        /// How many more submissions to refuse before the graph starts taking
+        /// them: a refusal that passes, which is what the retry is for.
+        refusals_left: StdMutex<usize>,
+    }
+
+    impl RememberingOrchestrator {
+        fn refusing(times: usize) -> Self {
+            let this = Self::default();
+            *this.refusals_left.lock().unwrap() = times;
+            this
+        }
     }
 
     #[async_trait]
@@ -1031,6 +1116,15 @@ mod tests {
             Ok(())
         }
         async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+            {
+                let mut left = self.refusals_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err(SFError::Internal(
+                        "the graph refused this submission".into(),
+                    ));
+                }
+            }
             let mut held = self.held.lock().unwrap();
             let mut added = Vec::new();
             for task in tasks {
@@ -1154,6 +1248,96 @@ mod tests {
         // The second pass never reached the submission path: the graph answered
         // first, so nothing was decomposed twice.
         assert_eq!(orchestrator.submissions.lock().unwrap().len(), 1);
+    }
+
+    async fn census_items(census: &OutwardCensus) -> Vec<(String, String, f64)> {
+        let metrics = census.collect_metrics("").await.expect("a reading");
+        metrics
+            .into_iter()
+            .filter(|m| m.name == ITEMS_METRIC)
+            .map(|m| {
+                (
+                    m.labels.get(LABEL_SOURCE).cloned().unwrap_or_default(),
+                    m.labels
+                        .get(crate::LABEL_RESULT)
+                        .cloned()
+                        .unwrap_or_default(),
+                    m.value,
+                )
+            })
+            .collect()
+    }
+
+    /// 一次拒绝不该让这条发现丢一整天。
+    ///
+    /// 源是每天问一次的：一轮里交不出去、就此算掉，这条发现在明天之前都不会再
+    /// 被问。2026-11-05 的第一版外循环就是这样——四条发现全部交不出去，读数上
+    /// 只有 `failed`，而下一次提问在二十四小时之后。
+    #[tokio::test]
+    async fn an_item_whose_hand_over_failed_is_asked_again_on_the_next_wake() {
+        let orchestrator = Arc::new(RememberingOrchestrator::refusing(1));
+        let sources = vec![OutwardSource {
+            name: "rust".into(),
+            query: "rust".into(),
+            ..OutwardSource::default()
+        }];
+        let control: Arc<dyn OrchestratorControl> = orchestrator.clone();
+        let census = Arc::new(OutwardCensus::new());
+        let mut pending = vec![Retry {
+            source: 0,
+            item: OutwardItem {
+                url: "https://x/1".into(),
+                title: "t".into(),
+                excerpt: "c".into(),
+            },
+            attempts: 1,
+        }];
+
+        drain_retries(&control, &sources, &mut pending, &census).await;
+        assert_eq!(pending.len(), 1, "被拒的那一条留在队里等下一拍");
+        assert!(
+            census_items(&census).await.is_empty(),
+            "还没定局的东西不记进 items：这一格数的是发现的下场，不是尝试次数"
+        );
+
+        drain_retries(&control, &sources, &mut pending, &census).await;
+        assert!(pending.is_empty());
+        assert_eq!(
+            census_items(&census).await,
+            vec![("rust".to_string(), "handed".to_string(), 1.0)]
+        );
+    }
+
+    /// 一直交不出去的那一条最终要算一次 `failed`，而不是无声消失。
+    #[tokio::test]
+    async fn an_item_that_never_lands_is_counted_once_and_given_up_on() {
+        let orchestrator = Arc::new(RememberingOrchestrator::refusing(usize::MAX));
+        let sources = vec![OutwardSource {
+            name: "rust".into(),
+            query: "rust".into(),
+            ..OutwardSource::default()
+        }];
+        let control: Arc<dyn OrchestratorControl> = orchestrator.clone();
+        let census = Arc::new(OutwardCensus::new());
+        let mut pending = vec![Retry {
+            source: 0,
+            item: OutwardItem {
+                url: "https://x/1".into(),
+                title: "t".into(),
+                excerpt: "c".into(),
+            },
+            attempts: 1,
+        }];
+
+        for _ in 0..HANDOVER_ATTEMPTS {
+            drain_retries(&control, &sources, &mut pending, &census).await;
+        }
+        assert!(pending.is_empty(), "给过的尝试次数用完就不再占着队");
+        assert_eq!(
+            census_items(&census).await,
+            vec![("rust".to_string(), "failed".to_string(), 1.0)],
+            "一条发现只记一次下场"
+        );
     }
 
     #[tokio::test]
