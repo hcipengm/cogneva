@@ -6090,10 +6090,11 @@ async fn project_quota_usage(state: &AppState) -> QuotaProjectionOutcome {
 }
 
 /// 一拍投影在一根轴上的结局。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum AxisOutcome {
     /// 这个部署没有这根轴（没配层级管理器／任务预算门）：没有要更新的格子，
     /// 也就没有可失败的东西。写 0 会把「这个上限不存在」读成「它刚更新过」。
+    #[default]
     NotConfigured,
     Ok,
     /// 这一拍没能把每个格子都重算并写回。格子留着上一拍的值——那可能已经不是
@@ -6106,12 +6107,6 @@ enum AxisOutcome {
 struct QuotaProjectionOutcome {
     person: AxisOutcome,
     task: AxisOutcome,
-}
-
-impl Default for AxisOutcome {
-    fn default() -> Self {
-        AxisOutcome::NotConfigured
-    }
 }
 
 /// 把 `(person, tokens)` 覆盖写到各自的额度格子上。
