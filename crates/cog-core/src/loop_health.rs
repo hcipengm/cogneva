@@ -74,6 +74,33 @@
 //! wrap does not appear at all — it has no series rather than a zero, so no rule
 //! over this family can fire on it. That state is a property of the configuration
 //! that decides which plugins run, and it is judged there.
+//!
+//! The readings are also the identity of a management driver, and that identity
+//! already exists: a driver is legible once it registers a loop name, and the
+//! group above says who it is — [`LOOP_REGISTERED`] is the census entry,
+//! [`LOOP_PERIOD_SECONDS`] the rhythm it declared, [`LOOP_TICK_AGE_SECONDS`]
+//! whether it is still cycling, [`LOOP_DEATHS_TOTAL`] and
+//! [`LOOP_RESTARTS_TOTAL`] whether it ended and whether a repair hid that, and
+//! [`LOOP_ROLE_DECLARED`] with [`LOOP_OWNER_HELD`] who is supposed to be doing
+//! the work and who is. Three of the four ledger drivers hold their identity
+//! that way, each through a loop-name constant beside the loop that registers
+//! it: the change ledger's `CHANGE_LEDGER_LOOP` in
+//! `cog-orchestrator/src/change_ledger.rs`, the principle ledger's
+//! `PRINCIPLE_LEDGER_LOOP` in `cog-orchestrator/src/principle_ledger.rs`, and
+//! the resource ledger's `RESOURCE_LEDGER_LOOP` in
+//! `cog-orchestrator/src/resource_ledger.rs`.
+//!
+//! The fourth — the host's own account, the cgroup decomposition — starts no
+//! loop at all, so not one series above answers for it and its absence is not a
+//! registration someone forgot. Its carrier is a DaemonSet
+//! (`deploy/helm/cogneva/templates/host-ledger.yaml`): one process per node,
+//! whose liveness is the pod's and is judged where deployments are read. A
+//! reader who comes here looking for a fourth `{loop=...}` series has to be told
+//! that, rather than left to conclude that one died.
+//!
+//! The ledger's open item on "driver identity" is therefore not undecided work
+//! waiting for a taker: the carrier exists and is read, in the two shapes above,
+//! and there is nothing left to build.
 
 use std::collections::BTreeMap;
 use std::future::Future;
