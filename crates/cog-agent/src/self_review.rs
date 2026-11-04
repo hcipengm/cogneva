@@ -51,6 +51,33 @@ struct ComparisonOutput {
     score: f32,
 }
 
+// ---------------------------------------------------------------------------
+// Request bodies
+// ---------------------------------------------------------------------------
+//
+// 这两份请求体用结构体而不是 `serde_json::json!` 拼，因为字段的书写顺序就是
+// 线上字节的顺序，而上游的前缀缓存只认从第一个字节起的逐字节相同：`json!`
+// 建的是按键排序的 map（没有开 `preserve_order`），`json!({"spec": …, "output": …})`
+// 上线是 `{"output": …, "spec": …}`，标准又落回正文后面，等于没改。
+// serde 按声明顺序写字段，所以这里的声明顺序就是刻意排的。
+
+/// 评审请求：先是被对照的标准，再是这一轮要审的正文。
+#[derive(serde::Serialize)]
+struct CritiqueRequest<'a> {
+    spec: &'a str,
+    output: &'a str,
+}
+
+/// 对照请求：先是被对照的标准，再是这一轮重新生成的发现。
+#[derive(serde::Serialize)]
+struct CompareRequest<'a> {
+    spec: &'a str,
+    best_practices: &'a [String],
+    issues: &'a [String],
+    missing: &'a [String],
+    strengths: &'a [String],
+}
+
 /// Actor label for reviews whose caller did not identify itself. Self-review
 /// runs on behalf of every agent, so a fixed label here would merge all of
 /// their review spend into one bucket and make a per-agent budget impossible;
@@ -234,11 +261,16 @@ impl SelfReviewLoop {
         task: Option<&str>,
         llm: &dyn LlmClient,
     ) -> SFResult<Critique> {
-        let user_payload = serde_json::json!({
-            "output": obs.output,
-            "spec": spec,
-        });
-        let user_msg = Message::user(user_payload.to_string());
+        // 标准在前、被审的正文在后。两者每轮都在变的一次评审里只有标准是
+        // 同一份：第二轮审的是改过的正文，但仍是同一件活、同一段标准，把它
+        // 放在首位让这一段逐字节相同，上游的前缀缓存才有东西可留。反过来的
+        // 顺序在这一族上是实测的形状——24 小时 174 次调用、命中率 0.2%，
+        // 因为第一块就是那段只此一份的正文。
+        let user_payload = serde_json::to_string(&CritiqueRequest {
+            spec,
+            output: &obs.output,
+        })?;
+        let user_msg = Message::user(user_payload);
         let options = stamp(ChatOptions::default(), actor, task);
 
         let output = execute_structured::<CritiqueOutput>(llm, &[user_msg], &options).await?;
@@ -266,14 +298,17 @@ impl SelfReviewLoop {
         task: Option<&str>,
         llm: &dyn LlmClient,
     ) -> SFResult<Comparison> {
-        let user_payload = serde_json::json!({
-            "issues": critique.issues,
-            "missing": critique.missing,
-            "strengths": critique.strengths,
-            "spec": spec,
-            "best_practices": best_practices,
-        });
-        let user_msg = Message::user(user_payload.to_string());
+        // 与 critique 同一条规矩：被对照的标准在前，这一轮的发现（`issues`
+        // 等，每一轮都由上一轮重新生成）在后。第二轮拿的还是同一段标准，
+        // 于是它的请求从第一个字节起就与第一轮相同，直到发现那一块为止。
+        let user_payload = serde_json::to_string(&CompareRequest {
+            spec,
+            best_practices,
+            issues: &critique.issues,
+            missing: &critique.missing,
+            strengths: &critique.strengths,
+        })?;
+        let user_msg = Message::user(user_payload);
         let options = stamp(ChatOptions::default(), actor, task);
 
         let output = execute_structured::<ComparisonOutput>(llm, &[user_msg], &options).await?;
@@ -421,4 +456,125 @@ fn extract_text(response: &ChatResponse) -> String {
         .filter_map(|b| b.as_text())
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    /// 记下每次请求里最后一条用户消息，并按结构化的两种答案作答。
+    struct RecordingLlm {
+        prompts: Mutex<Vec<String>>,
+    }
+
+    impl RecordingLlm {
+        fn new() -> Self {
+            Self {
+                prompts: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.prompts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for RecordingLlm {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("self-review asks non-streaming")
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("self-review asks non-streaming")
+        }
+
+        async fn chat(
+            &self,
+            messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<ChatResponse> {
+            self.prompts
+                .lock()
+                .unwrap()
+                .push(messages.last().map(|m| m.content()).unwrap_or_default());
+            // 一份同时满足 CritiqueOutput 与 ComparisonOutput 的正文：两步问的
+            // 是同一段话，这条测试量的是请求里的先后，不是循环走几轮。
+            let body =
+                r#"{"issues":[],"missing":[],"strengths":[],"gaps":[],"aligned":[],"score":1.0}"#;
+            Ok(ChatResponse {
+                content: vec![cog_core::ContentBlock::text(body)],
+                ..Default::default()
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// 评审的请求以被对照的标准开头，不以这一轮要审的正文开头。
+    ///
+    /// 第二轮审的是改过的正文，标准却是同一份；正文放在最前面时第一个字节
+    /// 就与上一轮不同，上游前缀缓存连一个字都留不下（实测这一族 24 小时
+    /// 174 次调用只命中 0.2%）。把标准放在首位，第二轮从开头到正文之前
+    /// 逐字节相同，这一段才有得可留。
+    #[tokio::test]
+    async fn the_standard_a_review_is_held_to_leads_the_payload() {
+        const SPEC: &str =
+            "SPEC-8f2c: every plan names an acceptance criterion that can be judged true or false";
+        const OUTPUT: &str = "OUTPUT-1a77: the plan under review";
+        let llm = RecordingLlm::new();
+
+        SelfReviewLoop::critique(
+            &SelfReviewLoop::observe(OUTPUT),
+            SPEC,
+            "self_review:planner",
+            None,
+            &llm,
+        )
+        .await
+        .unwrap();
+        let critique = Critique {
+            issues: vec!["ISSUE-c4d1".into()],
+            missing: vec![],
+            strengths: vec![],
+            raw: String::new(),
+        };
+        SelfReviewLoop::compare(&critique, SPEC, &[], "self_review:planner", None, &llm)
+            .await
+            .unwrap();
+
+        let prompts = llm.prompts();
+        assert_eq!(prompts.len(), 2);
+        for (step, prompt) in ["critique", "compare"].iter().zip(&prompts) {
+            let spec_at = prompt.find(SPEC).unwrap_or_else(|| {
+                panic!("{step} must carry the standard it judges against: {prompt}")
+            });
+            let varying_at = if *step == "critique" {
+                prompt
+                    .find(OUTPUT)
+                    .expect("the critique carries the text it reviews")
+            } else {
+                prompt
+                    .find("ISSUE-c4d1")
+                    .expect("the comparison carries the findings")
+            };
+            assert!(
+                spec_at < varying_at,
+                "{step}: the standard must come before what changes every round, \
+                 or the shared head is the part that differs first: {prompt}"
+            );
+        }
+    }
 }
