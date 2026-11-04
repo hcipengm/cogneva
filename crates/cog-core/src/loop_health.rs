@@ -1044,6 +1044,63 @@ mod tests {
         let _ = handle.await;
     }
 
+    /// principle: feedback_repair_must_leave_its_own_reading
+    ///
+    /// The gate: every run-again of a panicked loop moves `LOOP_RESTARTS_TOTAL`
+    /// for that loop and leaves `LOOP_DEATHS_TOTAL` at zero, so the repair
+    /// publishes a reading of its own instead of borrowing the counter that says
+    /// the loop is not running. Two repairs read as two, and a repair that left
+    /// no reading at all would read as zero here -- a defect made quiet -- which
+    /// is what falsifies this: either number showing up in the other's series, or
+    /// a repaired loop publishing no restart at all.
+    #[tokio::test(start_paused = true)]
+    async fn every_repair_of_a_panicked_loop_leaves_its_own_reading() {
+        let attempts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let handle = spawn_with_policy(
+            "repaired_twice_probe",
+            Cadence::EventDriven,
+            None,
+            policy(3, 100),
+            {
+                let attempts = Arc::clone(&attempts);
+                move |beat| {
+                    let attempts = Arc::clone(&attempts);
+                    Box::pin(async move {
+                        beat.beat();
+                        let attempt = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                        if attempt <= 2 {
+                            panic!("attempt {attempt} panicked on purpose");
+                        }
+                        // The third attempt is the loop back at work and it stays
+                        // there: the scrape below is taken while it is running,
+                        // which is what makes the reading a repair rather than a
+                        // death.
+                        std::future::pending::<()>().await;
+                    }) as std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+                }
+            },
+        );
+        // Two panics and the wait after each: a loop that was repaired twice is
+        // not the same reading as one that was repaired once, which is the count
+        // this gate is about.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let metrics = collect(&registry()).await;
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            metric(&metrics, LOOP_RESTARTS_TOTAL, "repaired_twice_probe"),
+            Some(2.0)
+        );
+        // The counter that means "this loop is not running" has nothing to say
+        // about a loop that is running: a repair counted there would make the
+        // attempt above indistinguishable from the loop having stayed dead.
+        assert_eq!(
+            metric(&metrics, LOOP_DEATHS_TOTAL, "repaired_twice_probe"),
+            Some(0.0)
+        );
+        handle.abort();
+        let _ = handle.await;
+    }
+
     /// The budget is what makes the repair honest: a loop that cannot survive a
     /// fresh start is left dead and reported, rather than run again forever.
     #[tokio::test(start_paused = true)]
