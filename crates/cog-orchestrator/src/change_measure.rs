@@ -717,6 +717,101 @@ impl CheckTree {
             .collect()
     }
 
+    /// The paths one commit added and the paths it removed, as `(added, gone)`.
+    ///
+    /// A rename is read as both -- `--no-renames` asks git to spell it as a
+    /// deletion beside an addition -- because a producer that took the rename
+    /// as an edit to an existing path would file a row pointing at a path the
+    /// tree no longer has.
+    ///
+    /// The listing is NUL-separated and read as such: a path with a space in it
+    /// is ordinary in this tree, and a line-oriented read splits those into two
+    /// paths that each name nothing.
+    pub async fn commit_paths(&self, rev: &str) -> Result<(Vec<String>, Vec<String>), String> {
+        let out = self
+            .git(&[
+                "show",
+                "--format=",
+                "--name-status",
+                "-z",
+                "--no-renames",
+                rev,
+            ])
+            .await
+            .map_err(|e| format!("the paths of commit {rev} cannot be read: {e}"))?;
+        let mut fields = out.split('\u{0}');
+        let mut added = Vec::new();
+        let mut gone = Vec::new();
+        while let Some(status) = fields.next() {
+            if status.is_empty() {
+                continue;
+            }
+            let Some(path) = fields.next() else {
+                break;
+            };
+            match status.chars().next() {
+                Some('A') => added.push(path.to_owned()),
+                Some('D') => gone.push(path.to_owned()),
+                _ => {}
+            }
+        }
+        Ok((added, gone))
+    }
+
+    /// What one commit wrote, as unified diff with no context lines.
+    ///
+    /// Zero context on purpose: every `+` line in the answer is then a line the
+    /// commit wrote, and a reader that had to tell context from additions by
+    /// eye would count the surrounding code as the commit's own.
+    pub async fn commit_diff(&self, rev: &str) -> Result<String, String> {
+        self.git(&["show", "--format=", "--unified=0", "--no-renames", rev])
+            .await
+            .map_err(|e| format!("the diff of commit {rev} cannot be read: {e}"))
+    }
+
+    /// The subject line of one commit.
+    pub async fn commit_subject(&self, rev: &str) -> Result<String, String> {
+        self.git(&["show", "--format=%s", "-s", rev])
+            .await
+            .map(|out| out.trim().to_owned())
+            .map_err(|e| format!("the subject of commit {rev} cannot be read: {e}"))
+    }
+
+    /// Whether `path` exists at `rev`.
+    ///
+    /// Asked with `ls-tree` rather than `cat-file`, because this is a yes/no
+    /// question and `ls-tree` answers it with output rather than an exit code:
+    /// success-with-nothing is absent, and a failure to run git stays a failure
+    /// instead of reading as an absence.
+    pub async fn path_present(&self, rev: &str, path: &str) -> Result<bool, String> {
+        let out = self
+            .git(&["ls-tree", "--name-only", rev, "--", path])
+            .await
+            .map_err(|e| format!("whether {path} exists at {rev} cannot be read: {e}"))?;
+        Ok(out.lines().any(|line| !line.trim().is_empty()))
+    }
+
+    /// How many files at `rev` hold `literal`, judged the way [`Self::holds`]
+    /// judges it.
+    ///
+    /// The same flags, not merely similar ones: "rare" is only a usable proxy for
+    /// "identifying" if the rareness and the later check look for the same
+    /// string in the same way. A literal bounded by word characters gets `-w`
+    /// here for the reason it gets it there -- `principle` must not be counted
+    /// as held by `principle_ledger`.
+    pub async fn files_holding(&self, rev: &str, literal: &str) -> Result<usize, String> {
+        let mut args = vec!["grep", "-l", "-F"];
+        if needs_word_boundaries(literal) {
+            args.push("-w");
+        }
+        args.extend(["-e", literal, rev]);
+        match self.git(&args).await {
+            Ok(out) => Ok(out.lines().filter(|line| !line.trim().is_empty()).count()),
+            Err(e) if e.starts_with(NO_MATCH) => Ok(0),
+            Err(e) => Err(e),
+        }
+    }
+
     /// The line of development `revision` sits on, or why it could not be read.
     ///
     /// The revision is resolved rather than compared as written, because the two
@@ -1044,7 +1139,7 @@ impl CheckTree {
     /// (a call's `foo(` is followed by its argument), and anchoring it would make
     /// a fragment the tree does hold read as missing, so it keeps the plain
     /// fixed-string search.
-    async fn holds(&self, rev: &str, scope: &str, literal: &str) -> Result<bool, String> {
+    pub async fn holds(&self, rev: &str, scope: &str, literal: &str) -> Result<bool, String> {
         let mut args = vec!["grep", "-q", "-F"];
         if needs_word_boundaries(literal) {
             args.push("-w");

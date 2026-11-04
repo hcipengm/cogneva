@@ -715,31 +715,373 @@ fn product_commits(window: &[(String, i64)], trailered: &HashSet<String>) -> (us
     (window.len(), named)
 }
 
-/// Say it out loud when product code reached the line without naming a change,
-/// and the commit is new.
+/// The literal a commit's line has to be at least, in bytes, before it can name
+/// the commit's change.
 ///
-/// Only fresh ones: the window holds commits that predate the account, and a
-/// warning about those every pass is a warning nobody reads. A commit younger
-/// than two passes is one that arrived while the account was running and that
-/// the account heard nothing about -- the only version of this reading that is
-/// about something happening now. The counts are published either way; this
-/// line exists because a number going up is not a moment, and this is.
-fn note_fresh_unclaimed_commit(newest: Option<&(String, i64)>, announced: &mut Option<String>) {
-    let Some((rev, at)) = newest else {
-        return;
-    };
-    if announced.as_deref() == Some(rev.as_str()) {
-        return;
+/// Shorter than this and the line is a shape the tree is full of (`return true;`),
+/// and every candidate costs a tree-wide read -- so the longest ones are tried
+/// first and only a bounded number of them, which picks the most specific line
+/// the commit wrote rather than the first one in diff order.
+const DECLARATION_MIN_LINE_LENGTH: usize = 12;
+
+/// How many of the commit's lines are tried as an identity, longest first.
+const DECLARATION_MAX_LINE_CANDIDATES: usize = 12;
+
+/// How many files may hold a literal before it stops identifying anything.
+///
+/// A name most of the tree spells identifies none of it: a row filed under it
+/// would read as settled for as long as any unrelated file still said it, and
+/// the account would call a deleted change landed.
+const DECLARATION_MAX_MATCH_FILES: usize = 3;
+
+/// How many declarations one pass may queue.
+///
+/// Each one costs a diff read plus a tree-wide read per candidate, and a pass
+/// that spent an unbounded amount of that would hold the loop's beat for the
+/// sake of history. Commits that arrive while the loop is running are the ones
+/// this closes, and those are a handful; a backlog is caught up by running the
+/// same question over more of the window, not by making every pass expensive.
+const DECLARATION_MAX_PER_PASS: usize = 4;
+
+/// The widths the intake columns hold. A row wider than its column is refused
+/// here rather than truncated by the writer: a shortened identity is a
+/// different change sharing a row.
+const DECLARATION_WIDTH_SCOPE: usize = 191;
+const DECLARATION_WIDTH_LITERAL: usize = 512;
+const DECLARATION_WIDTH_DOC: usize = 512;
+
+/// What one out-of-band commit left behind that a check can settle.
+///
+/// Only three kinds: the account's judge has a predicate for exactly these, and
+/// a row filed under anything else could never leave `undecided` -- it would add
+/// noise to the backlog and never settle. A commit that leaves none of them is
+/// refused and named, not declared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclarationForm {
+    /// A path the commit added and the tree still has.
+    Exists(String),
+    /// A path the commit removed and the tree no longer has.
+    Gone(String),
+    /// A literal the commit wrote that is still at the path it wrote it to.
+    Grep { scope: String, literal: String },
+}
+
+impl DeclarationForm {
+    fn identity(&self) -> ChangeIdentity {
+        match self {
+            DeclarationForm::Exists(path) => ChangeIdentity::new("exists", path.as_str(), ""),
+            DeclarationForm::Gone(path) => ChangeIdentity::new("gone", path.as_str(), ""),
+            DeclarationForm::Grep { scope, literal } => {
+                ChangeIdentity::new(GREP_KIND, scope.as_str(), literal.as_str())
+            }
+        }
     }
-    let age = Utc::now().timestamp() - at;
-    if age >= 0 && age <= (CHANGE_LEDGER_PASS_INTERVAL.as_secs() * 2) as i64 {
-        *announced = Some(rev.clone());
-        warn!(
-            rev = %rev,
-            age_seconds = age,
-            "change ledger: a commit that touched product code named no change, and it is \
-             newer than two pass intervals -- work is reaching the tree around the account"
-        );
+}
+
+/// Why a commit earns no declaration.
+const NO_JUDGEABLE_FORM: &str = "no_judgeable_form";
+/// The commit's candidate identity is no longer at the path it was written to.
+const ARTIFACT_MOVED_SINCE: &str = "artifact_moved_since";
+
+/// The declarations one commit adds, in the order the diff shows them.
+///
+/// Read off the `+` lines of a zero-context diff, so every line here is one the
+/// commit wrote. The keywords are kept in the literal so `fn x` cannot be
+/// satisfied by a struct field or by a word in a comment, and the modifiers are
+/// stripped so `pub async fn x` and `fn x` name the same thing -- two spellings
+/// of one declaration must not read as two.
+fn definitions_in_diff(diff: &str) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    for (path, line) in diff_additions(diff) {
+        if let Some(literal) = rust_definition(&line) {
+            found.push((path, literal));
+        }
+    }
+    found
+}
+
+/// The lines one commit wrote, longest first within each group.
+///
+/// Code before comments: a comment is the first thing a later edit rewrites and
+/// the longest line in a diff is usually a comment. Length is the cheapest proxy
+/// for specificity, so within a group the longest candidate is tried first.
+fn written_lines_in_diff(diff: &str) -> Vec<(String, String)> {
+    let mut found: Vec<(String, String)> = diff_additions(diff)
+        .into_iter()
+        .filter(|(_, line)| line.len() >= DECLARATION_MIN_LINE_LENGTH)
+        .collect();
+    found.sort_by(|a, b| {
+        let comment = |literal: &str| {
+            literal.starts_with("//")
+                || literal.starts_with("/*")
+                || literal.starts_with('*')
+                || literal.starts_with('#')
+                || literal.starts_with("--")
+                || literal.starts_with("<!--")
+        };
+        comment(&a.1)
+            .cmp(&comment(&b.1))
+            .then_with(|| b.1.len().cmp(&a.1.len()))
+    });
+    found
+}
+
+/// Every line the diff added, as `(path, trimmed text)`.
+///
+/// A `+++ b/<path>` line names the file the additions after it belong to; the
+/// `b/` prefix is git's side of the comparison, not part of the path. Leading
+/// and trailing whitespace is dropped because the check looks for the literal
+/// inside a line: an indentation a later edit changes must not break the only
+/// thing the row has to go on.
+fn diff_additions(diff: &str) -> Vec<(String, String)> {
+    let mut path = String::new();
+    let mut found = Vec::new();
+    for line in diff.lines() {
+        if let Some(target) = line.strip_prefix("+++ ") {
+            let target = target.trim();
+            path = match target.strip_prefix("b/") {
+                Some(rest) => rest.to_owned(),
+                None => target.to_owned(),
+            };
+            continue;
+        }
+        if path.is_empty() || !line.starts_with('+') {
+            continue;
+        }
+        found.push((path.clone(), line[1..].trim().to_owned()));
+    }
+    found
+}
+
+/// `fn name`, `struct name`, ... when the line defines one, with the modifiers
+/// (`pub`, `pub(...)`, `async`, `unsafe`, `extern "C"`) stripped first.
+fn rust_definition(line: &str) -> Option<String> {
+    const KEYWORDS: [&str; 8] = [
+        "fn", "struct", "enum", "trait", "const", "static", "type", "mod",
+    ];
+    let mut rest = line.trim_start();
+    loop {
+        if let Some(after) = rest.strip_prefix("pub(") {
+            rest = after.get(after.find(')')? + 1..)?.trim_start();
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("pub") {
+            if after.is_empty() || after.starts_with(char::is_whitespace) {
+                rest = after.trim_start();
+                continue;
+            }
+        }
+        let mut stripped = false;
+        for modifier in ["async", "unsafe"] {
+            if let Some(after) = rest.strip_prefix(modifier) {
+                if after.starts_with(char::is_whitespace) {
+                    rest = after.trim_start();
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if stripped {
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix("extern") {
+            if after.starts_with(char::is_whitespace) {
+                let after = after.trim_start();
+                rest = match after.strip_prefix('"') {
+                    Some(quoted) => quoted.get(quoted.find('"')? + 1..)?.trim_start(),
+                    None => after,
+                };
+                continue;
+            }
+        }
+        break;
+    }
+    let mut tokens = rest.split_whitespace();
+    let keyword = tokens.next()?;
+    if !KEYWORDS.contains(&keyword) {
+        return None;
+    }
+    let name = tokens.next()?;
+    let ident: String = name
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if ident.is_empty() || !ident.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+        return None;
+    }
+    Some(format!("{keyword} {ident}"))
+}
+
+/// The declaration one commit earns, or the reason it earns none.
+///
+/// Every candidate is checked against the tree at `at` before it is handed back.
+/// That is not a test of whether the change landed -- a declaration must be
+/// allowed to point at something that is not there, or it could only describe
+/// work already done. It is a test of whether this identity still names this
+/// place: the same `fn` is often added to two files and then dropped from one,
+/// and the first occurrence the diff shows is then the one that went away, which
+/// is a row that can never settle.
+///
+/// A candidate that is merely common is passed over rather than refused: nothing
+/// moved, the string simply cannot identify a change, and the next candidate
+/// gets a turn.
+async fn declaration_form(
+    tree: &CheckTree,
+    at: &str,
+    rev: &str,
+) -> Result<Result<DeclarationForm, &'static str>, String> {
+    let (added, gone) = tree.commit_paths(rev).await?;
+    let mut moved = false;
+    for path in &added {
+        if tree.path_present(at, path).await? {
+            return Ok(Ok(DeclarationForm::Exists(path.clone())));
+        }
+        moved = true;
+    }
+    for path in &gone {
+        // A removal asks for an absence, which the judge reads directly. Without
+        // this arm every "delete the dead path" commit would be refused, and
+        // that is a whole category of real work.
+        if !tree.path_present(at, path).await? {
+            return Ok(Ok(DeclarationForm::Gone(path.clone())));
+        }
+    }
+    let diff = tree.commit_diff(rev).await?;
+    let mut candidates = definitions_in_diff(&diff);
+    candidates.extend(
+        written_lines_in_diff(&diff)
+            .into_iter()
+            .take(DECLARATION_MAX_LINE_CANDIDATES)
+            .filter(|(_, literal)| literal.len() <= DECLARATION_WIDTH_LITERAL),
+    );
+    for (scope, literal) in candidates {
+        if !tree.holds(at, &scope, &literal).await? {
+            moved = true;
+            continue;
+        }
+        if tree.files_holding(at, &literal).await? <= DECLARATION_MAX_MATCH_FILES {
+            return Ok(Ok(DeclarationForm::Grep { scope, literal }));
+        }
+    }
+    Ok(Err(if moved {
+        ARTIFACT_MOVED_SINCE
+    } else {
+        NO_JUDGEABLE_FORM
+    }))
+}
+
+/// Queue a declaration for every fresh commit that touched product code and
+/// named no change, so the account hears about work that reached the tree
+/// around it.
+///
+/// This is the producer the intake never had inside the process: the pipeline's
+/// own commits name their change and get a row by themselves, and a commit made
+/// on the host reaches `main` with nothing queued for it. A reader of "每一件
+/// 交付变更" then takes an account that reads as if that work never happened.
+///
+/// Only fresh commits. The window holds years of history, and a row filed for a
+/// commit from a year ago would enter the account as an owed change and cost a
+/// measurement on every pass from then on; the newest ones are the only ones
+/// that arrived while the account was running. A commit that leaves nothing a
+/// check can settle is refused and named rather than filed: an empty check is
+/// not a smaller check, it is a row nobody can ever close.
+///
+/// One line per commit, and only the first time this process sees it: the
+/// warning is not what says the practice is wrong, it says what the account did
+/// with the commit, and repeating it every pass is the way that sentence stops
+/// being read.
+async fn declare_unclaimed_commits(
+    store: &dyn ChangeLedgerStore,
+    tree: &CheckTree,
+    at: &str,
+    window: &[(String, i64)],
+    named: &HashSet<String>,
+    announced: &mut HashSet<String>,
+) {
+    let now = Utc::now().timestamp();
+    let horizon = (CHANGE_LEDGER_PASS_INTERVAL.as_secs() * 2) as i64;
+    let mut handled = 0usize;
+    for (rev, commit_at) in window {
+        if handled >= DECLARATION_MAX_PER_PASS {
+            break;
+        }
+        if named.contains(rev) || announced.contains(rev) {
+            continue;
+        }
+        let age = now - commit_at;
+        if !(0..=horizon).contains(&age) {
+            continue;
+        }
+        announced.insert(rev.clone());
+        handled += 1;
+        let form = match declaration_form(tree, at, rev).await {
+            Ok(Ok(form)) => form,
+            Ok(Err(why)) => {
+                warn!(
+                    rev = %rev,
+                    age_seconds = age,
+                    why,
+                    "change ledger: a commit that touched product code named no change, and \
+                     what it left is not something a check can settle -- refused rather than \
+                     filed as a row nobody could close"
+                );
+                continue;
+            }
+            Err(why) => {
+                warn!(
+                    rev = %rev,
+                    age_seconds = age,
+                    why = %why,
+                    "change ledger: a commit that touched product code named no change, and \
+                     its diff cannot be read, so no declaration can be queued for it"
+                );
+                continue;
+            }
+        };
+        let identity = form.identity();
+        let doc = format!("git:{rev}");
+        if identity.scope.chars().count() > DECLARATION_WIDTH_SCOPE
+            || identity.literal.chars().count() > DECLARATION_WIDTH_LITERAL
+            || doc.len() > DECLARATION_WIDTH_DOC
+        {
+            warn!(
+                rev = %rev,
+                age_seconds = age,
+                why = "over_wide",
+                "change ledger: a commit that touched product code named no change, and the \
+                 declaration it earns is wider than the intake's columns -- refused rather \
+                 than truncated, because a shortened identity names a different change"
+            );
+            continue;
+        }
+        let reading = ChangeReading {
+            identity,
+            title: tree.commit_subject(rev).await.ok(),
+            assertion: None,
+            source: ChangeSource {
+                doc,
+                verdict: None,
+                priority: ChangePriority::Unstated,
+                block: ChangeBlock::NONE,
+            },
+        };
+        match store.declare(std::slice::from_ref(&reading)).await {
+            Ok(queued) => info!(
+                rev = %rev,
+                age_seconds = age,
+                queued,
+                "change ledger: a commit that touched product code named no change, so the \
+                 account was told about it -- the declaration is folded on a later pass"
+            ),
+            Err(why) => warn!(
+                rev = %rev,
+                age_seconds = age,
+                why = %why,
+                "change ledger: a commit that touched product code named no change, and the \
+                 site that found it could not queue it -- this commit is work done around \
+                 the account"
+            ),
+        }
     }
 }
 
@@ -1907,13 +2249,13 @@ pub fn spawn_change_ledger_loop(
                 // written before the anchor existed back into shape. Once, not
                 // per pass: see `settle_dispatch_parents`.
                 let mut parents_settled = false;
-                // The last commit this process warned about for reaching the
-                // tree without naming a change. Kept so the warning is one per
-                // commit: hand-committed work is the ordinary case today, so
-                // the warning is not what says the practice is wrong -- it says
-                // one more commit just went around the account, and repeating
-                // it every pass is the way that sentence stops being read.
-                let mut announced_unclaimed: Option<String> = None;
+                // The commits this process has already answered for -- warned
+                // about, declared, or refused with a reason. Kept so the line is
+                // one per commit: hand-committed work is the ordinary case
+                // today, so the line is not what says the practice is wrong --
+                // it says what the account did with the commit, and repeating it
+                // every pass is the way that sentence stops being read.
+                let mut announced_unclaimed: HashSet<String> = HashSet::new();
                 loop {
                     beat.beat();
                     tokio::select! {
@@ -2015,10 +2357,21 @@ pub fn spawn_change_ledger_loop(
                             {
                                 Ok(window) => {
                                     commits_read = Some(product_commits(&window, &named));
-                                    note_fresh_unclaimed_commit(
-                                        window.iter().find(|(rev, _)| !named.contains(rev)),
-                                        &mut announced_unclaimed,
-                                    );
+                                    // The reading says how many commits reached the
+                                    // tree without naming a change; this walks the
+                                    // fresh ones into the account, because a count
+                                    // that goes up is not a moment and this is.
+                                    if let Some(at) = first_seen_rev.as_deref() {
+                                        declare_unclaimed_commits(
+                                            &*store,
+                                            &tree,
+                                            at,
+                                            &window,
+                                            &named,
+                                            &mut announced_unclaimed,
+                                        )
+                                        .await;
+                                    }
                                 }
                                 Err(why) => warn!(
                                     why = %why,
@@ -8545,6 +8898,11 @@ mod tests {
         /// Whether reading back the pool stamps fails. Same distinction on the
         /// other intake: a count that was not taken is not a count of zero.
         pool_wait_unreadable: bool,
+        /// The readings a producer queued through the intake's door. A pass that
+        /// declares a commit is only observable here: the row it becomes enters
+        /// on the *next* fold, so a test that read rows would see nothing and
+        /// could not tell "declared" from "refused".
+        declarations: std::sync::Mutex<Vec<ChangeReading>>,
     }
 
     impl FakeLedger {
@@ -8587,6 +8945,11 @@ mod tests {
 
         fn reopens(&self) -> Vec<ChangeReopen> {
             self.reopened.lock().unwrap().clone()
+        }
+
+        /// What a producer queued through the intake, in the order it arrived.
+        fn declarations(&self) -> Vec<ChangeReading> {
+            self.declarations.lock().unwrap().clone()
         }
     }
 
@@ -8686,8 +9049,22 @@ mod tests {
                 oldest_seconds: Some(oldest),
             })
         }
-        async fn declare(&self, _readings: &[ChangeReading]) -> SFResult<usize> {
-            Ok(0)
+        async fn declare(&self, readings: &[ChangeReading]) -> SFResult<usize> {
+            // The real store is idempotent per (document, identity) and counts
+            // only what it newly queued; the double answers the same way so a
+            // pass that declares the same commit twice cannot read as two.
+            let mut queued = 0;
+            let mut held = self.declarations.lock().unwrap();
+            for reading in readings {
+                if held.iter().any(|seen| {
+                    seen.source.doc == reading.source.doc && seen.identity == reading.identity
+                }) {
+                    continue;
+                }
+                held.push(reading.clone());
+                queued += 1;
+            }
+            Ok(queued)
         }
         async fn fold_declarations(
             &self,
@@ -12656,6 +13033,196 @@ mod tests {
             window[0].1 > 0,
             "the commit time travels with the revision, so a reader can say how long ago the \
              newest one landed"
+        );
+    }
+
+    /// The diff reader names a declaration without its modifiers, and ranks a
+    /// comment below the code it wrote.
+    ///
+    /// Both rules are load-bearing for the identity that gets filed: `pub async
+    /// fn x` and `fn x` have to name the same thing or a later check looks for a
+    /// spelling the tree never had, and a comment is the first line a later edit
+    /// rewrites, so taking the longest line in the diff would systematically
+    /// pick the one least likely to still be there.
+    #[test]
+    fn the_diff_reader_strips_a_declarations_modifiers_and_ranks_comments_last() {
+        let diff = "\
+diff --git a/x.rs b/x.rs
+--- a/x.rs
++++ b/x.rs
+@@ -1,0 +1,3 @@
++pub(crate) async fn serve() {}
++    const MAX: usize = 4;
++// a comment that is much longer than either line of code above it
+";
+        assert_eq!(
+            definitions_in_diff(diff),
+            vec![
+                ("x.rs".to_string(), "fn serve".to_string()),
+                ("x.rs".to_string(), "const MAX".to_string()),
+            ],
+            "the modifiers are not part of the name, and the comment declares nothing"
+        );
+        let lines = written_lines_in_diff(diff);
+        assert_eq!(
+            lines.first().map(|(_, line)| line.as_str()),
+            Some("pub(crate) async fn serve() {}"),
+            "the longest line of code comes before the comment, however long the comment is"
+        );
+        assert!(
+            lines
+                .last()
+                .map(|(_, line)| line.starts_with("// a comment"))
+                .unwrap_or(false),
+            "the comment is tried last: {lines:?}"
+        );
+    }
+
+    /// The form a commit earns is the one the tree can still settle, and a
+    /// commit whose only identity has moved is refused rather than filed.
+    ///
+    /// Every arm is checked against the tree at one revision on purpose: a
+    /// declaration points at something the tree is asked about later, and a row
+    /// filed at a path the artifact has left can never settle.
+    #[tokio::test]
+    async fn the_declaration_a_commit_earns_is_the_one_the_tree_can_still_settle() {
+        let (dir, bare, work) = scratch_repo();
+        let work_path = std::path::Path::new(&work);
+        std::fs::create_dir_all(work_path.join("crates/thing")).expect("the fixture directory");
+        std::fs::write(
+            work_path.join("crates/thing/kept.rs"),
+            "pub struct Kept;\n\npub fn run() {\n    let timeout_seconds = 30;\n}\n",
+        )
+        .expect("the fixture file");
+        let added = commit_all(&bare, &work, "add the thing");
+
+        std::fs::write(work_path.join("crates/thing/gone.rs"), "pub struct Gone;\n")
+            .expect("the fixture file");
+        let wrote = commit_all(&bare, &work, "write the dead one");
+        std::fs::remove_file(work_path.join("crates/thing/gone.rs")).expect("remove it");
+        let removed = commit_all(&bare, &work, "remove the dead one");
+
+        std::fs::write(
+            work_path.join("crates/thing/kept.rs"),
+            "pub struct Kept;\n\npub fn run() {\n    let timeout_seconds = 47;\n}\n",
+        )
+        .expect("the fixture file");
+        let rewritten = commit_all(&bare, &work, "wait longer");
+
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let at = tree.rev().await.expect("the fixture resolves");
+
+        assert_eq!(
+            declaration_form(&tree, &at, &added).await.unwrap(),
+            Ok(DeclarationForm::Exists("crates/thing/kept.rs".to_string())),
+            "a file the commit added and the tree still has is named by its path"
+        );
+        assert_eq!(
+            declaration_form(&tree, &at, &removed).await.unwrap(),
+            Ok(DeclarationForm::Gone("crates/thing/gone.rs".to_string())),
+            "a removal asks for an absence, which the judge reads directly"
+        );
+        assert_eq!(
+            declaration_form(&tree, &at, &rewritten).await.unwrap(),
+            Ok(DeclarationForm::Grep {
+                scope: "crates/thing/kept.rs".to_string(),
+                literal: "let timeout_seconds = 47;".to_string(),
+            }),
+            "a commit that rewrote one line is named by that line, trimmed as the check will \
+             look for it"
+        );
+        assert_eq!(
+            declaration_form(&tree, &at, &wrote).await.unwrap(),
+            Err(ARTIFACT_MOVED_SINCE),
+            "the file this commit wrote is no longer at the path it wrote it to, so the row it \
+             would earn could never settle"
+        );
+    }
+
+    /// A fresh commit that touched product code is queued into the account once,
+    /// and nothing older is dragged in with it.
+    ///
+    /// The declaration is the only thing that moves the commit out of "work done
+    /// around the account": the counts published beside it say how many such
+    /// commits there are, and this is what makes the number smaller.
+    #[tokio::test]
+    async fn a_fresh_commit_that_named_no_change_is_declared_exactly_once() {
+        let (dir, bare, work) = scratch_repo();
+        let work_path = std::path::Path::new(&work);
+        std::fs::create_dir_all(work_path.join("crates/thing")).expect("the fixture directory");
+        std::fs::write(work_path.join("crates/thing/kept.rs"), "pub struct Kept;\n")
+            .expect("the fixture file");
+        let rev = commit_all(&bare, &work, "add the thing");
+
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let at = tree.rev().await.expect("the fixture resolves");
+        let window = tree
+            .landing_log_touching(LANDING_LOG_COMMITS, PRODUCT_CODE_PATH)
+            .await
+            .expect("the window reads");
+        let store = FakeLedger::default();
+        let mut announced = HashSet::new();
+
+        declare_unclaimed_commits(&store, &tree, &at, &window, &HashSet::new(), &mut announced)
+            .await;
+
+        let declared = store.declarations();
+        assert_eq!(declared.len(), 1, "{declared:?}");
+        assert_eq!(declared[0].identity.kind, "exists");
+        assert_eq!(declared[0].identity.scope, "crates/thing/kept.rs");
+        assert_eq!(declared[0].source.doc, format!("git:{rev}"));
+        assert_eq!(
+            declared[0].title.as_deref(),
+            Some("add the thing"),
+            "the row carries the commit's own words, so a reader does not have to resolve the \
+             revision to know what the work was"
+        );
+
+        // The next pass sees the same commit and says nothing new about it.
+        declare_unclaimed_commits(&store, &tree, &at, &window, &HashSet::new(), &mut announced)
+            .await;
+        assert_eq!(
+            store.declarations().len(),
+            1,
+            "one line per commit; a pass that re-declared it would read as a second commit"
+        );
+
+        // A commit that named its change is the pipeline's, not this producer's.
+        let named: HashSet<String> = [rev.clone()].into_iter().collect();
+        let mut fresh = HashSet::new();
+        declare_unclaimed_commits(&store, &tree, &at, &window, &named, &mut fresh).await;
+        assert_eq!(store.declarations().len(), 1);
+    }
+
+    /// History is not news: a commit older than two passes is one the account
+    /// never heard about and never will, and filing it now would enter a row
+    /// that costs a measurement on every pass from here on.
+    #[tokio::test]
+    async fn a_commit_older_than_two_passes_is_not_declared() {
+        let (dir, bare, work) = scratch_repo();
+        let work_path = std::path::Path::new(&work);
+        std::fs::create_dir_all(work_path.join("crates/thing")).expect("the fixture directory");
+        std::fs::write(work_path.join("crates/thing/kept.rs"), "pub struct Kept;\n")
+            .expect("the fixture file");
+        let rev = commit_all(&bare, &work, "add the thing");
+
+        let tree = CheckTree::new(dir.path().join("bare"), "main");
+        let at = tree.rev().await.expect("the fixture resolves");
+        let old = Utc::now().timestamp() - (CHANGE_LEDGER_PASS_INTERVAL.as_secs() as i64 * 10);
+        let store = FakeLedger::default();
+        let mut announced = HashSet::new();
+        declare_unclaimed_commits(
+            &store,
+            &tree,
+            &at,
+            &[(rev, old)],
+            &HashSet::new(),
+            &mut announced,
+        )
+        .await;
+        assert!(
+            store.declarations().is_empty(),
+            "an old commit is counted, not declared"
         );
     }
 
