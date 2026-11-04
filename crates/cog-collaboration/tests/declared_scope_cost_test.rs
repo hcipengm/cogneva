@@ -470,6 +470,30 @@ async fn a_run_with_no_readable_checkout_is_not_asked_twice() {
     );
 }
 
+/// A round whose tree came back untouched is asked again, once.
+///
+/// This is the case the re-ask was written for: the tree was read and it is
+/// there, so the second answer has somewhere to write the change the first one
+/// only described. It is also the half that keeps the rule from being read as
+/// "never ask twice" -- the cost the previous test measures is the same round
+/// answering a question that had no answer to give.
+#[tokio::test]
+async fn a_round_that_left_its_checkout_untouched_is_asked_again() {
+    let (_success, log) = run_declared_over(
+        Checkout::Untouched,
+        self_evolution_task("fix the wording in `docs/quickstart.md`"),
+    )
+    .await;
+
+    assert_eq!(
+        log.role("generator"),
+        2,
+        "the tree was read and had nothing in it, so the round gets one more \
+         chance to write: {:?}",
+        log.by_role.lock().unwrap()
+    );
+}
+
 /// The saving is a stage, not the judging: on a task whose evaluator is the LLM
 /// judge it is everywhere else, the shortcut still pays for it.
 #[tokio::test]
