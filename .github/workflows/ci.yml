@@ -1165,7 +1165,14 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
+      # Full history: one script test judges the pinned eval image by asking whether
+      # a named commit is an ancestor of the pinned rev, and that question needs
+      # both objects. On a depth-one checkout the reference commit is simply
+      # absent, and a test that cannot see it has to say so rather than agree --
+      # so give it something to see.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - name: Install shellcheck
         # 这一步要的是「shellcheck 可用」，不是「这台 runner 配置的每一个 apt 源都
         # 健康」。2026-10-27 一次红就是这个区别：runner 镜像自带的
@@ -1237,6 +1244,16 @@ jobs:
             sudo apt-get install -y --no-install-recommends prometheus
           }
           promtool --version
+      # The eval-host script tests read the registered Pod manifest with PyYAML.
+      # It is not part of the bare interpreter the runner image ships in every
+      # version of itself, and a test whose import fails reads as a red rule
+      # rather than a missing dependency -- the same confusion the Ensure steps
+      # above exist to remove.
+      - name: Ensure PyYAML
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -c 'import yaml' 2>/dev/null || python3 -m pip install --quiet pyyaml
+          python3 -c 'import yaml; print("pyyaml", yaml.__version__)'
       - name: Script tests
         # 这一步连真库。没有这个 `if:` 时，前面任何一处无关的红都会把它跳掉，而
         # 「跳过」在 job 摘要上与「通过」同形——库里那条链断没断，读的人看不出来。
@@ -1245,10 +1262,11 @@ jobs:
           # 只有需要真库的那几条读它；其余的门把它当一段普通字符串。
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: |
-          # Both roots, globbed rather than listed: the guard's own tests live
-          # beside it under .github/ and a hand-kept list is what goes quiet
-          # when one is added.
-          for t in deploy/scripts/tests/*.test.sh .github/scripts/tests/*.test.sh; do
+          # Every root that carries script tests, globbed rather than listed: the
+          # guard's own tests live beside it under .github/, the eval host scripts
+          # keep theirs beside them under scripts/eval/, and a hand-kept list is
+          # what goes quiet when one is added.
+          for t in deploy/scripts/tests/*.test.sh .github/scripts/tests/*.test.sh scripts/eval/*.test.sh; do
             echo "== ${t}"
             # 红在剧本自己的断言里，它的输出里往往没有一行带 `path:line`——而「红的一跑
             # 点名哪条原则」正是靠这样一行把日志接回文件头部的声明。所以红的这一份由
