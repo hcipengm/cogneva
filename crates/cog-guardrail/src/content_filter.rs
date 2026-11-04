@@ -152,7 +152,11 @@ impl ContentFilter {
         let mut patterns: Vec<String> = vec![
             // NSFW — explicit + euphemisms
             r"(?i)\b(nude|naked|porn|sexual|xxx|adult content|nsfw)\b".into(),
-            r"(?i)\b(explicit|graphic|mature content|adult material)\b".into(),
+            // `explicit` and `graphic` are ordinary technical English on their own
+            // ("an explicit verdict", "the graphic on the panel"), and this filter
+            // judges what an agent says about its own work. They are evidence only
+            // when they name the thing being described.
+            r"(?i)\b(?:(?:explicit|graphic)\s+(?:content|material|images?|scenes?|language|violence)|mature content|adult material)\b".into(),
             r"(?i)\b(nudity|intercourse|genital|erotic|obscene)\b".into(),
             // Violence
             r"(?i)\b(kill|murder|suicide|bomb|terrorist|attack|assassinate)\b".into(),
