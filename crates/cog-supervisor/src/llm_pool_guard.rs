@@ -418,3 +418,189 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod a_named_complement_is_a_sibling_that_exists {
+    //! principle: feedback_a_rule_whose_summary_names_a_sibling_that_does_not_exist
+    //!
+    //! A summary that points at its complement -- "beside the pool down event,
+    //! which says the serving half ..." -- reads as an aside, so the sibling it
+    //! names is checked by nothing: the prose compiles, the gate beside it stays
+    //! green, and a reader follows the name to an item that was renamed away or
+    //! never existed. This is the gate that aside is owed. It takes every
+    //! capitalised name the doc comments of this file cite with backticks and
+    //! asks whether something in the guard's own vocabulary answers to it: an
+    //! edge of PoolTransition, cited in full or by its bare variant name, or one
+    //! of the two upstream-pool events this module sends. The vocabulary is built
+    //! by naming those variants and constructing those events, so a rename breaks
+    //! this module's compilation instead of leaving a summary that cites a name
+    //! nothing defines.
+    //!
+    //! Read from the file's own text: no process, no store, no network. A summary
+    //! is checked where it is written, which is the only place it can go stale.
+
+    use super::*;
+
+    /// The two events the guard emits, named as its summaries cite them.
+    ///
+    /// Constructed rather than spelled: a variant that is renamed or removed
+    /// stops this gate compiling, which is the whole point of asking the code
+    /// instead of a second copy of its names.
+    fn events_this_module_sends() -> [&'static str; 2] {
+        let down = SupervisorEvent::LlmUpstreamPoolDown {
+            evidenced_recovery_unix: 0,
+            next_attempt_unix: 0,
+            unavailable: Vec::new(),
+            pool_size: 0,
+            declared_min_healthy: None,
+            quota_window_secs: 0,
+            timestamp: chrono::Utc::now(),
+        };
+        let recovered = SupervisorEvent::LlmUpstreamPoolRecovered {
+            timestamp: chrono::Utc::now(),
+        };
+        [pool_event_name(&down), pool_event_name(&recovered)]
+    }
+
+    /// The name a summary cites for one of those edges.
+    fn pool_event_name(event: &SupervisorEvent) -> &'static str {
+        match event {
+            SupervisorEvent::LlmUpstreamPoolDown { .. } => "LlmUpstreamPoolDown",
+            SupervisorEvent::LlmUpstreamPoolRecovered { .. } => "LlmUpstreamPoolRecovered",
+            _ => unreachable!("the guard sends the two upstream-pool edges and nothing else"),
+        }
+    }
+
+    /// Every edge one pass can report, so the vocabulary is made of the values
+    /// the enforcement above actually returns.
+    fn edges_this_module_can_report() -> [PoolTransition; 3] {
+        [
+            PoolTransition::Steady,
+            PoolTransition::Down(LlmPoolStatus::default()),
+            PoolTransition::Recovered,
+        ]
+    }
+
+    /// The full name a summary cites for one edge.
+    ///
+    /// Exhaustive on purpose: an edge added to the enum has to be named here
+    /// before this gate builds, so the vocabulary can never be one name shorter
+    /// than the enum it describes.
+    fn edge_name(edge: &PoolTransition) -> &'static str {
+        match edge {
+            PoolTransition::Steady => "PoolTransition::Steady",
+            PoolTransition::Down(_) => "PoolTransition::Down",
+            PoolTransition::Recovered => "PoolTransition::Recovered",
+        }
+    }
+
+    /// Whether something in this module's vocabulary answers to `name`: an edge
+    /// cited in full or by its bare variant name, or an event the guard sends.
+    fn exists(name: &str) -> bool {
+        let mut defined: Vec<&'static str> = events_this_module_sends().to_vec();
+        for edge in edges_this_module_can_report().iter() {
+            let full = edge_name(edge);
+            defined.push(full);
+            if let Some((_, bare)) = full.rsplit_once("::") {
+                defined.push(bare);
+            }
+        }
+        defined.contains(&name)
+    }
+
+    /// Every name a doc comment in `source` cites with backticks, with the line
+    /// that cites it.
+    ///
+    /// A cited name is capitalised, whitespace-free and not a call: a backticked
+    /// `status()` is a function the prose is talking about, while a backticked
+    /// `Recovered` is a thing the prose claims is there.
+    fn cited_names(source: &str) -> Vec<(usize, String)> {
+        let mut cited = Vec::new();
+        for (index, line) in source.lines().enumerate() {
+            let text = line.trim_start();
+            if !text.starts_with("//!") && !text.starts_with("///") {
+                continue;
+            }
+            for span in text.split('`').skip(1).step_by(2) {
+                let name = span.trim();
+                if is_a_cited_name(name) {
+                    cited.push((index + 1, name.to_string()));
+                }
+            }
+        }
+        cited
+    }
+
+    fn is_a_cited_name(text: &str) -> bool {
+        let mut chars = text.chars();
+        match chars.next() {
+            Some(first) => {
+                first.is_ascii_uppercase()
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_')
+            }
+            None => false,
+        }
+    }
+
+    /// The cited names in `source` that nothing in the vocabulary answers to.
+    fn dangling(source: &str) -> Vec<String> {
+        cited_names(source)
+            .into_iter()
+            .filter(|(_, name)| !exists(name))
+            .map(|(line, name)| format!("line {line}: `{name}`"))
+            .collect()
+    }
+
+    /// The positive half: the summaries this file ships today name only siblings
+    /// that exist. The two names asserted below are the ones the pool guard's own
+    /// doc cites -- the pool-down event, and the recovery half it names by the
+    /// bare variant it shares with the transition -- so a reader that stops
+    /// finding them has stopped reading the sentence this gate exists for.
+    #[test]
+    fn every_sibling_this_files_summaries_name_is_one_that_exists() {
+        let source = include_str!("llm_pool_guard.rs");
+        let cited = cited_names(source);
+        assert!(
+            !cited.is_empty(),
+            "the summaries in this file cite their complements with backticks; a reader that \
+             finds none has stopped reading the file it is the gate for"
+        );
+        for expected in ["LlmUpstreamPoolDown", "Recovered"] {
+            assert!(
+                cited.iter().any(|(_, name)| name == expected),
+                "this file's summaries no longer cite `{expected}`, so this gate no longer reads \
+                 the sentence it exists for"
+            );
+        }
+        let unresolved = dangling(source);
+        assert!(
+            unresolved.is_empty(),
+            "these siblings are named by a summary in this file and nothing in the guard's \
+             vocabulary answers to them:\n{}",
+            unresolved.join("\n")
+        );
+    }
+
+    /// The rejected shape, witnessed: the same sentence with the sibling it names
+    /// replaced by one the guard does not have. Nothing else in the wording
+    /// changes, so what the reader reports is the missing sibling rather than the
+    /// aside around it -- and the existing sibling in the control line is not
+    /// reported, which is what keeps the gate from passing on any text at all.
+    #[test]
+    fn a_summary_naming_a_sibling_that_does_not_exist_is_caught() {
+        let existing =
+            "//! It sits beside `PoolTransition::Recovered`, which says the pool serves again.\n";
+        let missing =
+            "//! It sits beside `PoolTransition::Draining`, which says the pool is on its way out.\n";
+        assert_eq!(
+            dangling(existing),
+            Vec::<String>::new(),
+            "a sibling that does exist must not be reported"
+        );
+        assert_eq!(
+            dangling(missing),
+            vec!["line 1: `PoolTransition::Draining`".to_string()],
+            "a summary naming a sibling that does not exist has to go red"
+        );
+    }
+}
