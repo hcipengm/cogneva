@@ -1175,6 +1175,45 @@ mod tests {
     use crate::test_support::declarations;
     use chrono::{TimeZone, Utc};
 
+    /// principle: feedback_a_judge_reads_a_tree_newer_than_its_own_binary
+    /// A verdict is about one resolved tree revision, and that revision travels
+    /// on the measurement rather than being implied by the row.
+    ///
+    /// The resident judge outlives the tree it reads: the binary that runs the
+    /// pass and the revision the declarations were read from are two facts, and
+    /// "this tree holds the gate" is true only of the second. Two looks that
+    /// agree on the state and on the gate therefore have to disagree on the
+    /// revision they name, or a reader cannot tell a verdict drawn from a tree
+    /// that holds the declaration from one drawn before it landed.
+    #[test]
+    fn a_verdict_carries_the_tree_revision_it_was_read_at() {
+        let registry = declarations(&[("crates/cogneva/tests/a.rs", "//! principle: feedback_x")]);
+        let judged = row("feedback_x", Some("-"), None);
+        let verdict = judge(&judged, &registry);
+        let before = measurement_of(&judged, &verdict, &registry, "rev-before")
+            .expect("a gate in the platform's registry settles the row");
+        let after = measurement_of(&judged, &verdict, &registry, "rev-after")
+            .expect("a gate in the platform's registry settles the row");
+
+        // The two looks are the same verdict read at two trees: the state and
+        // the gate agree, and the revision is the only field that says which
+        // tree each one answers for.
+        assert_eq!(before.state, after.state);
+        assert_eq!(before.platform_gate, after.platform_gate);
+        assert_eq!(before.measured_rev.as_deref(), Some("rev-before"));
+        assert_eq!(after.measured_rev.as_deref(), Some("rev-after"));
+        assert_ne!(before.measured_rev, after.measured_rev);
+
+        // And the revision is named, never inherited: a measurement built with
+        // none carries none, so an absent revision reads as "nobody said which
+        // tree" rather than as the running binary's own.
+        let unnamed = PrincipleMeasurement::new("feedback_x".to_string(), PrincipleState::Enforced);
+        assert_eq!(
+            unnamed.measured_rev, None,
+            "a measurement that named no revision must not answer for one"
+        );
+    }
+
     fn row(slug: &str, host: Option<&str>, state: Option<PrincipleState>) -> PrincipleRow {
         PrincipleRow {
             slug: slug.to_string(),
