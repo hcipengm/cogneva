@@ -3369,6 +3369,61 @@ data:
               }
             }
           }
+        },
+        {
+          "id": 79,
+          "title": "Outward Loop: What It Read and What It Handed Over",
+          "description": "The one loop in this platform that reads outside it, drawn as the four things it can say. The configuration is a single series valued 1 whose label names the cell start-up decided: `ok` means the queries parsed and the loop is running, and the cells beside it (`unset`, `unparsable`, `empty`, `incomplete`, `no_endpoint`) each mean the deployment asked for the loop and it is not running. `unset` is the shipped default, so a line there is a deployment that chose this off rather than a fault; the other cells are the state worth seeing, and a name in the legend says which fault it is. `sources configured` is the population the loop was given, drawn as its own line rather than folded into a count of passes -- zero sources and one source that never answers read the same otherwise. The two counters are drawn as increases over the trailing day instead of as totals: a total only ever rises, so a loop that stopped reading looks the same as one that is working, while a day with no step is exactly the shape of a loop that stopped. One tick is six hours by default, so a day holds four of them. Passes count fetches by the cell the fetch ended in (`ok`, `http_error`, `transport_error`, `unparsable`); items count what each fetched result became when it was offered to the task graph (`handed`, `already_held`, `failed`), plus `unusable` for a result whose link was not one that can be opened at all -- that one never reaches the graph, so it appears in no other cell. Read them against each other: passes rising with items flat is a loop that is looking and finding nothing new, which is the ordinary steady state once the graph already holds what is out there, and a failed-fetch cell that keeps growing is the loop going blind while every other line stays still.",
+          "type": "timeseries",
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 368
+          },
+          "targets": [
+            {
+              "expr": "cogneva_outward_config",
+              "legendFormat": "configured: {{result}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "cogneva_outward_sources_configured",
+              "legendFormat": "sources configured",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "increase(cogneva_outward_passes_total[24h])",
+              "legendFormat": "{{source}} pass {{result}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            },
+            {
+              "expr": "increase(cogneva_outward_items_total[24h])",
+              "legendFormat": "{{source}} item {{result}}",
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              }
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2
+              }
+            }
+          }
         }
       ],
       "templating": {

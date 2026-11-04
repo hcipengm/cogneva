@@ -1126,6 +1126,60 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
             }
         }
 
+        // Outward loop.
+        //
+        // The one loop in this function that reads something other than this
+        // platform: it asks the deployment's own search backend what is new on
+        // the subjects configuration names, and hands each result to the goal
+        // path -- the same handover every other piece of work arrives by.
+        // Whether a result matters is answered by whoever takes that goal; this
+        // loop only says what was found.
+        //
+        // With no subjects configured it makes no outbound call at all, and the
+        // reading says which of "not configured", "configured and unreadable"
+        // and "running" this process is in. That is why the census is published
+        // before the decision and records the decision itself: a capability
+        // that is quietly idle and one that is broken would otherwise read the
+        // same from a loop that never started.
+        let outward_census = std::sync::Arc::new(crate::outward::OutwardCensus::new());
+        ctx.publish_observable(outward_census.clone());
+        match crate::outward::OutwardConfig::from_env() {
+            Err(fault) => {
+                outward_census.record_config(fault.cell(), 0).await;
+                info!(reason = fault.why(), "outward loop not started");
+            }
+            Ok(config) => {
+                outward_census
+                    .record_config("ok", config.sources.len())
+                    .await;
+                match (
+                    ctx.consume_service::<dyn cog_core::OrchestratorControl>(),
+                    ctx.consume_service::<dyn cog_core::HttpClient>(),
+                ) {
+                    (Some(orchestrator), Some(http)) => {
+                        let shutdown = ctx
+                            .consume::<cog_core::ShutdownSignal>()
+                            .map(|s| (*s).clone())
+                            .unwrap_or_default();
+                        crate::outward::spawn_outward_loop(
+                            orchestrator,
+                            http,
+                            ctx.consume_service::<dyn cog_core::OwnerLeaseBroker>(),
+                            shutdown,
+                            config,
+                            outward_census,
+                        );
+                    }
+                    (orchestrator, http) => warn!(
+                        orchestrator = orchestrator.is_some(),
+                        http = http.is_some(),
+                        "outward loop not started: queries are configured but a collaborator \
+                         is not published"
+                    ),
+                }
+            }
+        }
+
         Ok(())
     }
 

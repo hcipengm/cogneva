@@ -966,6 +966,34 @@ const PRODUCED: &[(&str, &[&str], &str)] = &[
         &["block", "reading"],
         "crates/cog-orchestrator/src/change_ledger.rs",
     ),
+    // The outward loop's four readings. The configuration pair carries the
+    // start-up decision and the population it named, so the panel can say
+    // "asked for and refused" rather than reading a deployment that never
+    // turned the loop on as one that turned it on and found nothing. The two
+    // counters split by the cell they ended in: a pass's cell is why the fetch
+    // did or did not answer, an item's cell is what the task graph did with
+    // what came back, and one number over both would hide which of the two
+    // stopped moving.
+    (
+        "cogneva_outward_config",
+        &["result"],
+        "crates/cog-orchestrator/src/outward.rs",
+    ),
+    (
+        "cogneva_outward_sources_configured",
+        &[],
+        "crates/cog-orchestrator/src/outward.rs",
+    ),
+    (
+        "cogneva_outward_passes_total",
+        &["source", "result"],
+        "crates/cog-orchestrator/src/outward.rs",
+    ),
+    (
+        "cogneva_outward_items_total",
+        &["source", "result"],
+        "crates/cog-orchestrator/src/outward.rs",
+    ),
 ];
 
 /// Series the dashboard may read that this workspace does not produce, with the

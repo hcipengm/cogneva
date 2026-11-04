@@ -1,0 +1,1107 @@
+//! The outward loop: read what is happening outside this tree, and hand what
+//! matters to the goal path.
+//!
+//! Everything else in this process looks at itself — the tree, its own accounts,
+//! its own workloads. That is the inner loop, and a system that only looks
+//! inward can only refine what it already is: it cannot learn that a dependency
+//! shipped a release, that an interface it codes against changed, or that
+//! something it assumed about the world stopped being true. Those facts arrive
+//! from outside, and nothing here was going out to meet them. This loop is the
+//! outward half of the same cycle: it asks a search backend the deployment
+//! already runs what is new on chosen subjects, and hands each result to the
+//! one path that does work — the goal graph.
+//!
+//! What it deliberately does not do is decide anything. A result becomes a goal
+//! whose text says what was found and what to do with it; whether it matters is
+//! answered by whoever takes that goal, through the same handover every other
+//! piece of work arrives by. Nothing is written into the change account from
+//! here, and nothing is marked done: an item this loop hands over is an item
+//! *somebody was asked about*, which is the most it can honestly claim.
+//!
+//! Deduplication is the graph's job, not memory's. The id of the task that
+//! carries an item is a function of the item's URL, so an item the graph
+//! already holds is recognised across restarts, replica changes and a lost
+//! process — a `HashSet` in this loop would forget everything it knew the first
+//! time the pod restarted and re-ask the same questions every day. The loop
+//! still asks the graph first (`get_task`) so a repeat costs no planner call;
+//! the identity is what makes that check meaningful, not decoration.
+//!
+//! Everything it reads is configuration: with no queries configured it makes no
+//! outbound call at all, and says at start-up which of "not configured",
+//! "configured and unreadable" and "configured and running" it is in. A loop
+//! that quietly did nothing would leave a reader unable to tell an idle
+//! capability from a broken one.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use async_trait::async_trait;
+use cog_core::observability::{DimensionSpec, Observable, RawMetric};
+use cog_core::{
+    HttpClient, HttpRequest, OrchestratorControl, OwnerLeaseBroker, SFResult, ShutdownSignal, Task,
+};
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+/// Loop name reported through the background-loop liveness family.
+pub const OUTWARD_LOOP: &str = "orchestrator_outward";
+/// The role this loop contends for through the owner lease.
+pub const OUTWARD_ROLE: &str = "orchestrator_outward";
+
+/// The environment variable that names what to look for outside. Published so
+/// the deployment's own wiring can be held to it rather than described.
+pub const QUERIES_ENV: &str = "COGNEVA_OUTWARD_QUERIES";
+/// The search backend. The deployment already points this at its own metasearch
+/// instance for the agent tools; the outward loop reads the same value rather
+/// than taking a second endpoint to keep in step.
+const SEARCH_BASE_ENV: &str = "COGNEVA_WEB_SEARCH_BASE";
+
+/// Asked once per source unless the source says otherwise. Hours, not minutes:
+/// the world this reads changes on the scale of releases and articles, and a
+/// tighter cadence would spend the same money to find the same items and have
+/// them deduplicated.
+// cap: bound — 被读的那件事按发布与文章变化，不按秒；更密的节奏买的是同一批条目
+const DEFAULT_CADENCE_SECS: u64 = 6 * 60 * 60;
+/// How many results one source may hand over per pass. The backend returns its
+/// whole ranked list; an unbounded handover would turn one query into a day of
+/// work and bury everything else in the graph.
+// cap: bound — 一条查询变成一天的工作，图里其余的东西就都被埋了
+const DEFAULT_MAX_ITEMS: usize = 3;
+/// The backend runs inside this cluster, so a slow answer is a broken one: a
+/// request that needs longer than this is not going to be answered usefully,
+/// and holding the tick open costs every other source its turn.
+// cap: bound — SearXNG 就在集群里，三十秒还没答就是没在答
+const FETCH_TIMEOUT_SECS: u64 = 30;
+/// How much of a result's excerpt travels in the goal text. Enough to tell the
+/// taker whether it is worth opening; the URL is what they read when it is.
+// cap: bound — 够判断值不值得打开原文；要读细节的人去读 URL 那一页
+const EXCERPT_CHARS: usize = 600;
+
+/// One subject to look for, and how often.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OutwardSource {
+    pub name: String,
+    pub query: String,
+    pub cadence_secs: u64,
+    pub max_items: usize,
+}
+
+impl Default for OutwardSource {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            query: String::new(),
+            cadence_secs: DEFAULT_CADENCE_SECS,
+            max_items: DEFAULT_MAX_ITEMS,
+        }
+    }
+}
+
+/// What the outward loop reads from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutwardConfig {
+    /// Base of the search backend; `/search` is appended by the caller.
+    pub search_base: String,
+    pub sources: Vec<OutwardSource>,
+}
+
+/// Why there is no configuration to run with. Each variant is a different fact
+/// and each is reported as itself, because "nobody asked for this" and "someone
+/// asked and the ask does not parse" look identical from a stopped loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFault {
+    /// Nothing was configured.
+    Unset,
+    /// Configured, but not a list of sources this loop can read.
+    Unparsable,
+    /// Configured and readable, and the list is empty.
+    Empty,
+    /// A source is missing its name or its query.
+    Incomplete,
+    /// Sources are configured but no search backend is named.
+    NoEndpoint,
+}
+
+impl ConfigFault {
+    /// The value recorded under the `result` label of the configuration series.
+    pub fn cell(self) -> &'static str {
+        match self {
+            ConfigFault::Unset => "unset",
+            ConfigFault::Unparsable => "unparsable",
+            ConfigFault::Empty => "empty",
+            ConfigFault::Incomplete => "incomplete",
+            ConfigFault::NoEndpoint => "no_endpoint",
+        }
+    }
+
+    /// What a reader is meant to do about it.
+    pub fn why(self) -> &'static str {
+        match self {
+            ConfigFault::Unset => {
+                "no outward queries are configured, so nothing is looked for outside this tree"
+            }
+            ConfigFault::Unparsable => {
+                "outward queries are configured but do not parse as a list of \
+                 {name, query, cadence_secs?, max_items?}"
+            }
+            ConfigFault::Empty => "outward queries are configured but the list is empty",
+            ConfigFault::Incomplete => {
+                "an outward source is missing its name or its query, so the list is not usable \
+                 as written"
+            }
+            ConfigFault::NoEndpoint => {
+                "outward queries are configured but no search backend is named, so there is \
+                 nowhere to ask"
+            }
+        }
+    }
+}
+
+impl OutwardConfig {
+    /// Read the configuration from the process environment.
+    ///
+    /// Fail-closed, like the other configuration-gated loops here: anything
+    /// short of a complete list is not started, and the reason is returned
+    /// rather than swallowed, so the caller can record which of the five it was.
+    pub fn from_env() -> Result<Self, ConfigFault> {
+        let raw = std::env::var(QUERIES_ENV).ok();
+        let base = std::env::var(SEARCH_BASE_ENV).ok();
+        Self::resolve(raw.as_deref(), base.as_deref())
+    }
+
+    /// The pure half of [`Self::from_env`], so every refusal is testable
+    /// without touching a process-wide variable.
+    pub fn resolve(raw: Option<&str>, search_base: Option<&str>) -> Result<Self, ConfigFault> {
+        let raw = raw
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .ok_or(ConfigFault::Unset)?;
+        let mut sources: Vec<OutwardSource> =
+            serde_json::from_str(raw).map_err(|_| ConfigFault::Unparsable)?;
+        if sources.is_empty() {
+            return Err(ConfigFault::Empty);
+        }
+        // A blank field is not a source anybody meant: a name is what the
+        // readings are labelled by, and a query nothing asks is a source that
+        // would report "found nothing" on every pass forever.
+        if sources
+            .iter()
+            .any(|s| s.name.trim().is_empty() || s.query.trim().is_empty())
+        {
+            return Err(ConfigFault::Incomplete);
+        }
+        for source in &mut sources {
+            source.cadence_secs = source.cadence_secs.max(60);
+            source.max_items = source.max_items.clamp(1, 20);
+        }
+        let search_base = search_base
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .ok_or(ConfigFault::NoEndpoint)?;
+        Ok(Self {
+            search_base: search_base.trim_end_matches('/').to_string(),
+            sources,
+        })
+    }
+
+    /// The period the loop's own ticker runs at: the shortest cadence among the
+    /// sources. Each source is still only asked on its own schedule.
+    pub fn period(&self) -> Duration {
+        let least = self
+            .sources
+            .iter()
+            .map(|s| s.cadence_secs)
+            .min()
+            .unwrap_or(DEFAULT_CADENCE_SECS);
+        Duration::from_secs(least.max(60))
+    }
+}
+
+/// One result as the search backend hands it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutwardItem {
+    pub url: String,
+    pub title: String,
+    pub excerpt: String,
+}
+
+/// What reading one source ended in, for the `result` reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchFault {
+    /// The backend answered with a status that is not a success.
+    HttpError,
+    /// The request never got an answer.
+    Transport,
+    /// The backend answered, and the body is not a search answer.
+    Unparsable,
+}
+
+impl FetchFault {
+    pub fn cell(self) -> &'static str {
+        match self {
+            FetchFault::HttpError => "http_error",
+            FetchFault::Transport => "transport_error",
+            FetchFault::Unparsable => "unparsable",
+        }
+    }
+}
+
+/// What one source's turn produced: the items worth handing over, how many
+/// entries in the answer could not be read as an item, and what the fetch ended
+/// in when it failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceTick {
+    pub items: Vec<OutwardItem>,
+    pub unusable: usize,
+    pub fault: Option<FetchFault>,
+}
+
+/// A source's tick that produced nothing but a reason.
+fn faulted(fault: FetchFault) -> SourceTick {
+    SourceTick {
+        items: Vec::new(),
+        unusable: 0,
+        fault: Some(fault),
+    }
+}
+
+/// Percent-encode one query component. `ALPHA / DIGIT / "-" / "." / "_" / "~"`
+/// travel as themselves, everything else as `%XX` — the conservative rule, so a
+/// query carrying `&`, `#` or a space asks what it says instead of truncating
+/// into a different one.
+fn encode_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+/// The URL this loop asks for one source.
+pub fn search_url(base: &str, query: &str) -> String {
+    format!(
+        "{}/search?q={}&format=json&safesearch=1",
+        base.trim_end_matches('/'),
+        encode_component(query)
+    )
+}
+
+/// The identity of the task that carries one item.
+///
+/// A function of the URL and of nothing else. That is what lets the graph be
+/// the deduplication memory: the same page found by two different queries, or
+/// by the same query a week later, is one row. The 16 hex characters are the
+/// first half of a BLAKE3 digest — wide enough that the collision a wrong match
+/// would need is not a thing that happens, and short enough that the id stays
+/// legible in a task list.
+pub fn task_id_for(url: &str) -> String {
+    let digest = blake3::hash(url.as_bytes()).to_hex().to_string();
+    format!("outward-{}", &digest[..16])
+}
+
+/// What the taker is asked. The item is quoted, not summarised: a summary here
+/// would be this loop's opinion of the result, and the loop has none.
+pub fn goal_for(source: &OutwardSource, item: &OutwardItem) -> String {
+    let title = if item.title.trim().is_empty() {
+        item.url.as_str()
+    } else {
+        item.title.trim()
+    };
+    let mut goal = format!(
+        "外部信息评估（来源：{}）\n{}\n{}\n",
+        source.name, title, item.url
+    );
+    let excerpt = item.excerpt.trim();
+    if !excerpt.is_empty() {
+        let short: String = excerpt.chars().take(EXCERPT_CHARS).collect();
+        goal.push_str(&short);
+        if short.chars().count() < excerpt.chars().count() {
+            goal.push('…');
+        }
+        goal.push('\n');
+    }
+    // The tool is named rather than assumed: this process registers it on the
+    // chat surface today, and a taker in a process that does not have it still
+    // has to produce the three things a change application consists of. Asking
+    // for the answer rather than for a particular call keeps the item workable
+    // wherever it lands.
+    goal.push_str(
+        "这是本系统之外的一条动态。判断它是否影响这个平台：有影响就说清影响到哪里\
+         （哪个文件、哪条配置、哪条行为），并把它变成一条变更申请——要改的路径、\
+         落地后该出现的字面量、为什么。这个进程里配有 propose_self_change 就用它提交；\
+         没有就把这三项原样写进结果。没有影响就说明为什么不需要改，不要提交。\
+         拿不准的先去读原文再判断。",
+    );
+    goal
+}
+
+/// Read a search backend's answer into items.
+///
+/// Entries that carry no usable URL are counted rather than dropped silently: a
+/// backend that answers a hundred rows of which ninety are cards and engine
+/// suggestions is a different situation from one that answered ten results, and
+/// the two read the same once the unusable ones are gone.
+///
+/// Repeated URLs within one answer are folded: a metasearch backend asks several
+/// engines and overlaps them, and one page ranked twice is one page.
+pub fn items_from(body: &str, max_items: usize) -> Result<(Vec<OutwardItem>, usize), FetchFault> {
+    #[derive(Deserialize)]
+    struct Answer {
+        #[serde(default)]
+        results: Vec<Hit>,
+    }
+    #[derive(Deserialize)]
+    struct Hit {
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        content: String,
+    }
+
+    let answer: Answer = serde_json::from_str(body).map_err(|_| FetchFault::Unparsable)?;
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    let mut unusable = 0;
+    for hit in answer.results {
+        let url = hit.url.trim();
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            unusable += 1;
+            continue;
+        }
+        if !seen.insert(url.to_string()) {
+            continue;
+        }
+        if items.len() < max_items {
+            items.push(OutwardItem {
+                url: url.to_string(),
+                title: hit.title,
+                excerpt: hit.content,
+            });
+        }
+    }
+    Ok((items, unusable))
+}
+
+/// Ask one source and read the answer.
+async fn fetch_source(
+    http: &Arc<dyn HttpClient>,
+    base: &str,
+    source: &OutwardSource,
+) -> SourceTick {
+    let req = HttpRequest::get(search_url(base, &source.query))
+        .header("Accept", cog_core::CONTENT_TYPE_JSON)
+        .timeout(FETCH_TIMEOUT_SECS);
+    let resp = match http.execute(req).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            warn!(source = %source.name, error = %e, "outward: the search backend is unreachable");
+            return faulted(FetchFault::Transport);
+        }
+    };
+    if !resp.is_success() {
+        warn!(
+            source = %source.name,
+            status = resp.status,
+            "outward: the search backend refused the query"
+        );
+        return faulted(FetchFault::HttpError);
+    }
+    let body = match resp.text() {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(source = %source.name, error = %e, "outward: the answer was not readable text");
+            return faulted(FetchFault::Unparsable);
+        }
+    };
+    match items_from(&body, source.max_items) {
+        Ok((items, unusable)) => SourceTick {
+            items,
+            unusable,
+            fault: None,
+        },
+        Err(fault) => {
+            warn!(
+                source = %source.name,
+                "outward: the search backend answered with something that is not a search answer"
+            );
+            faulted(fault)
+        }
+    }
+}
+
+/// The readings this loop leaves behind.
+///
+/// Published as an `Observable` rather than written through the metrics backend
+/// because these series are counters this process alone knows: they have no rows
+/// to leave behind, so they cost nothing to hold here and need no name in the
+/// store's closed registry.
+#[derive(Default)]
+pub struct OutwardCensus {
+    state: Mutex<CensusState>,
+}
+
+#[derive(Default)]
+struct CensusState {
+    /// What start-up decided: the cell, and how many sources it found.
+    config: Option<(&'static str, usize)>,
+    /// Per source, counts keyed by outcome cell.
+    passes: BTreeMap<String, BTreeMap<String, u64>>,
+    items: BTreeMap<String, BTreeMap<String, u64>>,
+}
+
+/// Series names. `passes` counts ticks, `items` counts what a tick did with
+/// each result — the two are separate because a tick that answers cleanly and
+/// hands nothing over and one that hands ten over are the same `ok` pass.
+pub const PASSES_METRIC: &str = "cogneva_outward_passes_total";
+pub const ITEMS_METRIC: &str = "cogneva_outward_items_total";
+/// The configuration as start-up found it, and how many sources it named. The
+/// two are separate series because "this deployment asked for nothing" and "it
+/// asked for three sources" have the same absence otherwise: a deployment that
+/// never turned the loop on and one whose queries parsed but matched no source
+/// would both publish no `passes` at all.
+pub const CONFIG_METRIC: &str = "cogneva_outward_config";
+pub const SOURCES_METRIC: &str = "cogneva_outward_sources_configured";
+
+const LABEL_SOURCE: &str = "source";
+
+fn bump(map: &mut BTreeMap<String, BTreeMap<String, u64>>, source: &str, cell: &str, by: u64) {
+    *map.entry(source.to_string())
+        .or_default()
+        .entry(cell.to_string())
+        .or_insert(0) += by;
+}
+
+impl OutwardCensus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record what start-up decided. Called exactly once, before any pass, so
+    /// the configuration is a reading even when no loop was started.
+    pub async fn record_config(&self, cell: &'static str, sources: usize) {
+        self.state.lock().await.config = Some((cell, sources));
+    }
+
+    pub async fn record_pass(&self, source: &str, cell: &str) {
+        bump(&mut self.state.lock().await.passes, source, cell, 1);
+    }
+
+    pub async fn record_items(&self, source: &str, cell: &str, count: u64) {
+        if count > 0 {
+            bump(&mut self.state.lock().await.items, source, cell, count);
+        }
+    }
+}
+
+#[async_trait]
+impl Observable for OutwardCensus {
+    async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
+        let state = self.state.lock().await;
+        let mut out = Vec::new();
+        if let Some((cell, sources)) = state.config {
+            out.push(RawMetric::new(CONFIG_METRIC, 1.0).with_label(crate::LABEL_RESULT, cell));
+            out.push(RawMetric::new(SOURCES_METRIC, sources as f64));
+        }
+        for (source, cells) in &state.passes {
+            for (cell, count) in cells {
+                out.push(
+                    RawMetric::new(PASSES_METRIC, *count as f64)
+                        .with_label(LABEL_SOURCE, source.as_str())
+                        .with_label(crate::LABEL_RESULT, cell.as_str()),
+                );
+            }
+        }
+        for (source, cells) in &state.items {
+            for (cell, count) in cells {
+                out.push(
+                    RawMetric::new(ITEMS_METRIC, *count as f64)
+                        .with_label(LABEL_SOURCE, source.as_str())
+                        .with_label(crate::LABEL_RESULT, cell.as_str()),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    async fn collect_trace(
+        &self,
+        _task_id: &str,
+    ) -> SFResult<Vec<cog_core::observability::TraceFragment>> {
+        Ok(Vec::new())
+    }
+
+    /// None of this varies by dimension, so declaring none is what gets it
+    /// pulled once per scrape.
+    fn available_dimensions(&self) -> Vec<DimensionSpec> {
+        Vec::new()
+    }
+}
+
+/// What one item's handover ended in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Handover {
+    Handed,
+    AlreadyHeld,
+    Failed,
+}
+
+impl Handover {
+    fn cell(self) -> &'static str {
+        match self {
+            Handover::Handed => "handed",
+            Handover::AlreadyHeld => "already_held",
+            Handover::Failed => "failed",
+        }
+    }
+}
+
+/// Hand one item to the goal path.
+///
+/// The graph is asked first. `submit_goal_auto` would answer an already-held id
+/// by not returning it, but by then the planner has already been asked to
+/// decompose the goal — one model call per repeated item per pass, forever,
+/// which is exactly the price a deduplication that lives in memory would have
+/// looked like it avoided. `get_task` is the cheap question; the id is what
+/// makes it answerable.
+async fn hand_over(
+    orchestrator: &Arc<dyn OrchestratorControl>,
+    source: &OutwardSource,
+    item: &OutwardItem,
+) -> Handover {
+    let id = task_id_for(&item.url);
+    if orchestrator.get_task(&id).await.is_some() {
+        return Handover::AlreadyHeld;
+    }
+    let goal = goal_for(source, item);
+    let row = Task::goal_row(id.clone(), &goal);
+    match orchestrator.submit_goal_auto(&goal, vec![row]).await {
+        Ok(added) if added.is_empty() => {
+            // The graph took nothing: another replica handed the same item over
+            // between the read and the submission. The intent is in hand either
+            // way, which is what the empty answer means.
+            Handover::AlreadyHeld
+        }
+        Ok(_) => Handover::Handed,
+        Err(e) => {
+            warn!(
+                source = %source.name,
+                url = %item.url,
+                error = %e,
+                "outward: an item could not be handed to the goal path"
+            );
+            Handover::Failed
+        }
+    }
+}
+
+/// Start the resident outward loop.
+///
+/// The loop asks each source on its own cadence, hands what it found to the goal
+/// path, and reports what happened. A failed fetch is a reading, not a stall:
+/// the other sources still get their turn and the next tick asks again.
+pub fn spawn_outward_loop(
+    orchestrator: Arc<dyn OrchestratorControl>,
+    http: Arc<dyn HttpClient>,
+    role: Option<Arc<dyn OwnerLeaseBroker>>,
+    shutdown: ShutdownSignal,
+    config: OutwardConfig,
+    census: Arc<OutwardCensus>,
+) {
+    let period = config.period();
+    let sources = config.sources.clone();
+    let base = config.search_base.clone();
+    info!(
+        sources = sources.len(),
+        period_secs = period.as_secs(),
+        arbitrated = role.is_some(),
+        "outward loop enabled"
+    );
+
+    drop(cog_core::loop_health::spawn(
+        OUTWARD_LOOP,
+        cog_core::loop_health::Cadence::Periodic(period),
+        shutdown.clone(),
+        // Rebuilt per attempt, so everything the body consumes is cloned here.
+        move |beat| {
+            let orchestrator = orchestrator.clone();
+            let http = http.clone();
+            let role = role.clone();
+            let shutdown = shutdown.clone();
+            let sources = sources.clone();
+            let base = base.clone();
+            let census = census.clone();
+            async move {
+                // Only one replica asks and hands over at a time. The ids would
+                // make a second replica's work harmless, but the reads and the
+                // submissions would also be paid for twice.
+                let hold = cog_core::RoleHold::start(role, OUTWARD_ROLE, beat.clone(), &shutdown);
+                let mut ticker = tokio::time::interval(period);
+                // First tick fires immediately; consume it so the first pass
+                // lands one period in rather than racing start-up.
+                ticker.tick().await;
+                let now = Instant::now();
+                let mut next_due: Vec<Instant> = sources.iter().map(|_| now).collect();
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = shutdown.wait() => break,
+                    }
+                    if !hold.may_act().await {
+                        continue;
+                    }
+                    let now = Instant::now();
+                    for (source, due) in sources.iter().zip(next_due.iter_mut()) {
+                        if now < *due {
+                            continue;
+                        }
+                        *due = now + Duration::from_secs(source.cadence_secs);
+                        let tick = fetch_source(&http, &base, source).await;
+                        census
+                            .record_pass(
+                                &source.name,
+                                tick.fault.map(FetchFault::cell).unwrap_or("ok"),
+                            )
+                            .await;
+                        census
+                            .record_items(&source.name, "unusable", tick.unusable as u64)
+                            .await;
+                        for item in &tick.items {
+                            let outcome = hand_over(&orchestrator, source, item).await;
+                            census.record_items(&source.name, outcome.cell(), 1).await;
+                        }
+                    }
+                }
+            }
+        },
+    ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cog_core::{HttpRequest, HttpResponse, SFError};
+    use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn a_query_with_reserved_characters_asks_what_it_says() {
+        assert_eq!(encode_component("a b"), "a%20b");
+        assert_eq!(encode_component("x&y=z#1"), "x%26y%3Dz%231");
+        assert_eq!(encode_component("rust/1.85~beta"), "rust%2F1.85~beta");
+        assert_eq!(
+            search_url("http://searxng:8080/", "rust & tokio"),
+            "http://searxng:8080/search?q=rust%20%26%20tokio&format=json&safesearch=1"
+        );
+    }
+
+    #[test]
+    fn the_same_page_found_twice_is_one_task_and_a_new_page_is_another() {
+        let a = task_id_for("https://example.com/release");
+        assert_eq!(a, task_id_for("https://example.com/release"));
+        assert_ne!(a, task_id_for("https://example.com/release-notes"));
+        // Stable across processes: a literal, not a hash of this run.
+        assert_eq!(a, task_id_for("https://example.com/release"));
+        assert!(a.starts_with("outward-"));
+        assert_eq!(a.len(), "outward-".len() + 16);
+    }
+
+    #[test]
+    fn reading_an_answer_keeps_what_can_be_opened_and_counts_what_cannot() {
+        let body = r#"{
+            "results": [
+                {"url": "https://a.example/1", "title": "One", "content": "first"},
+                {"url": "javascript:void(0)", "title": "card", "content": ""},
+                {"url": "https://b.example/2", "title": "Two", "content": ""},
+                {"url": "https://a.example/1", "title": "One again", "content": "dup"}
+            ]
+        }"#;
+        let (items, unusable) = items_from(body, 10).expect("a search answer");
+        assert_eq!(
+            unusable, 1,
+            "the non-http entry should be counted, not silently dropped"
+        );
+        let urls: Vec<&str> = items.iter().map(|i| i.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://a.example/1", "https://b.example/2"]);
+    }
+
+    #[test]
+    fn an_answer_is_capped_at_what_the_source_asked_for() {
+        let body = r#"{"results":[
+            {"url":"https://a/1"},{"url":"https://a/2"},{"url":"https://a/3"}
+        ]}"#;
+        let (items, _) = items_from(body, 2).expect("a search answer");
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn something_that_is_not_a_search_answer_is_not_an_empty_answer() {
+        assert_eq!(
+            items_from("<html>blocked</html>", 3),
+            Err(FetchFault::Unparsable)
+        );
+        // A well-formed answer with nothing in it is a reading of the web and
+        // must not be reported as unreadable.
+        let (items, unusable) =
+            items_from(r#"{"results":[]}"#, 3).expect("an empty answer is an answer");
+        assert!(items.is_empty());
+        assert_eq!(unusable, 0);
+    }
+
+    #[test]
+    fn configuration_says_which_of_the_five_it_is_in() {
+        assert_eq!(
+            OutwardConfig::resolve(None, Some("http://s")),
+            Err(ConfigFault::Unset)
+        );
+        assert_eq!(
+            OutwardConfig::resolve(Some("   "), Some("http://s")),
+            Err(ConfigFault::Unset)
+        );
+        assert_eq!(
+            OutwardConfig::resolve(Some("not json"), Some("http://s")),
+            Err(ConfigFault::Unparsable)
+        );
+        assert_eq!(
+            OutwardConfig::resolve(Some("[]"), Some("http://s")),
+            Err(ConfigFault::Empty)
+        );
+        assert_eq!(
+            OutwardConfig::resolve(Some(r#"[{"name":"a","query":"  "}]"#), Some("http://s")),
+            Err(ConfigFault::Incomplete)
+        );
+        assert_eq!(
+            OutwardConfig::resolve(Some(r#"[{"name":"a","query":"b"}]"#), None),
+            Err(ConfigFault::NoEndpoint)
+        );
+
+        let ok = OutwardConfig::resolve(
+            Some(r#"[{"name":"rust","query":"rust release"}]"#),
+            Some("http://searxng:8080/"),
+        )
+        .expect("a complete configuration");
+        assert_eq!(ok.search_base, "http://searxng:8080");
+        assert_eq!(ok.sources[0].cadence_secs, DEFAULT_CADENCE_SECS);
+        assert_eq!(ok.sources[0].max_items, DEFAULT_MAX_ITEMS);
+    }
+
+    #[test]
+    fn every_refusal_has_its_own_cell_and_a_reason() {
+        let cells: Vec<&str> = [
+            ConfigFault::Unset,
+            ConfigFault::Unparsable,
+            ConfigFault::Empty,
+            ConfigFault::Incomplete,
+            ConfigFault::NoEndpoint,
+        ]
+        .iter()
+        .map(|f| f.cell())
+        .collect();
+        let unique: std::collections::HashSet<&&str> = cells.iter().collect();
+        assert_eq!(
+            unique.len(),
+            cells.len(),
+            "two refusals share a cell: {cells:?}"
+        );
+        assert!(ConfigFault::Unset.why().contains("nothing is looked for"));
+    }
+
+    #[test]
+    fn the_goal_carries_what_was_found_and_what_to_do_with_it() {
+        let source = OutwardSource {
+            name: "rust".into(),
+            query: "rust".into(),
+            ..OutwardSource::default()
+        };
+        let item = OutwardItem {
+            url: "https://blog.rust-lang.org/1.85".into(),
+            title: "Announcing Rust 1.85".into(),
+            excerpt: "edition 2024".into(),
+        };
+        let goal = goal_for(&source, &item);
+        for needle in [
+            "Announcing Rust 1.85",
+            "https://blog.rust-lang.org/1.85",
+            "propose_self_change",
+            "rust",
+        ] {
+            assert!(goal.contains(needle), "goal is missing {needle}: {goal}");
+        }
+    }
+
+    /// A client that answers one canned response and records every request.
+    #[derive(Debug)]
+    struct CannedClient {
+        status: u16,
+        body: Vec<u8>,
+        calls: StdMutex<Vec<String>>,
+    }
+
+    impl CannedClient {
+        fn new(status: u16, body: impl Into<Vec<u8>>) -> Arc<Self> {
+            Arc::new(Self {
+                status,
+                body: body.into(),
+                calls: StdMutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl HttpClient for CannedClient {
+        async fn execute(&self, req: HttpRequest) -> SFResult<HttpResponse> {
+            self.calls.lock().unwrap().push(req.url.clone());
+            Ok(HttpResponse {
+                status: self.status,
+                headers: std::collections::HashMap::new(),
+                body: self.body.clone(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_that_answers_is_asked_its_own_question() {
+        let client = CannedClient::new(
+            200,
+            r#"{"results":[{"url":"https://x/1","title":"t","content":"c"}]}"#,
+        );
+        let source = OutwardSource {
+            name: "x".into(),
+            query: "what is new".into(),
+            ..OutwardSource::default()
+        };
+        let tick = fetch_source(
+            &(client.clone() as Arc<dyn HttpClient>),
+            "http://s",
+            &source,
+        )
+        .await;
+        assert_eq!(tick.fault, None);
+        assert_eq!(tick.items.len(), 1);
+        assert_eq!(
+            client.calls.lock().unwrap().as_slice(),
+            ["http://s/search?q=what%20is%20new&format=json&safesearch=1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_refuses_reads_as_a_refusal_and_not_as_an_empty_web() {
+        let client = CannedClient::new(503, "");
+        let source = OutwardSource::default();
+        let tick = fetch_source(
+            &(client.clone() as Arc<dyn HttpClient>),
+            "http://s",
+            &source,
+        )
+        .await;
+        assert_eq!(tick.fault, Some(FetchFault::HttpError));
+        assert!(tick.items.is_empty());
+    }
+
+    /// An orchestrator that remembers the ids it was given, exactly like the
+    /// graph does, so the dedup path is exercised rather than assumed.
+    #[derive(Debug, Default)]
+    struct RememberingOrchestrator {
+        held: StdMutex<std::collections::HashSet<String>>,
+        submissions: StdMutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl OrchestratorControl for RememberingOrchestrator {
+        async fn submit_goal(&self, _goal: &str, _tasks: Vec<Task>) -> SFResult<()> {
+            Ok(())
+        }
+        async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+            let mut held = self.held.lock().unwrap();
+            let mut added = Vec::new();
+            for task in tasks {
+                self.submissions.lock().unwrap().push(task.id.clone());
+                if held.insert(task.id.clone()) {
+                    added.push(task.id.clone());
+                }
+            }
+            Ok(added)
+        }
+        async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn add_task(&self, _task: Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
+            false
+        }
+        async fn crew_retry_all(&self, _task_ids: &[String]) -> usize {
+            0
+        }
+        async fn get_ready_tasks(&self) -> Vec<Task> {
+            Vec::new()
+        }
+        async fn get_all_tasks(&self) -> Vec<Task> {
+            Vec::new()
+        }
+        async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn retry_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn dlq_len(&self) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn start_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn complete_task(
+            &self,
+            _task_id: &str,
+            _result: serde_json::Value,
+        ) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn fail_task(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::contract::llm::UpstreamFailure>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn fail_task_after(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::contract::llm::UpstreamFailure>,
+            _retry_after_secs: Option<u64>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn cancel_task(&self, _task_id: &str) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_task(&self, task_id: &str) -> Option<Task> {
+            self.held
+                .lock()
+                .unwrap()
+                .contains(task_id)
+                .then(|| Task::goal_row(task_id.to_string(), "held"))
+        }
+        async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            Vec::new()
+        }
+        async fn get_dependents(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_dependencies(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
+            (Vec::new(), Vec::new())
+        }
+        async fn delete_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn all_completed(&self) -> bool {
+            true
+        }
+        async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_is_handed_over_once_and_a_second_pass_asks_the_graph_not_the_planner() {
+        let orchestrator = Arc::new(RememberingOrchestrator::default());
+        let control: Arc<dyn OrchestratorControl> = orchestrator.clone();
+        let source = OutwardSource {
+            name: "rust".into(),
+            query: "rust".into(),
+            ..OutwardSource::default()
+        };
+        let item = OutwardItem {
+            url: "https://x/1".into(),
+            title: "t".into(),
+            excerpt: "c".into(),
+        };
+
+        assert_eq!(hand_over(&control, &source, &item).await, Handover::Handed);
+        assert_eq!(
+            hand_over(&control, &source, &item).await,
+            Handover::AlreadyHeld
+        );
+        // The second pass never reached the submission path: the graph answered
+        // first, so nothing was decomposed twice.
+        assert_eq!(orchestrator.submissions.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_census_keeps_refusals_and_results_apart() {
+        let census = OutwardCensus::new();
+        census.record_config("ok", 2).await;
+        census.record_pass("rust", "ok").await;
+        census.record_pass("rust", "http_error").await;
+        census.record_items("rust", "handed", 2).await;
+        census.record_items("rust", "failed", 1).await;
+
+        let metrics = census.collect_metrics("").await.expect("a reading");
+        let find = |name: &str, source: Option<&str>, result: Option<&str>| -> Option<f64> {
+            metrics
+                .iter()
+                .find(|m| {
+                    m.name == name
+                        && source.map_or(true, |s| {
+                            m.labels.get(LABEL_SOURCE).map(String::as_str) == Some(s)
+                        })
+                        && result.map_or(true, |r| {
+                            m.labels.get(crate::LABEL_RESULT).map(String::as_str) == Some(r)
+                        })
+                })
+                .map(|m| m.value)
+        };
+        assert_eq!(find(PASSES_METRIC, Some("rust"), Some("ok")), Some(1.0));
+        assert_eq!(
+            find(PASSES_METRIC, Some("rust"), Some("http_error")),
+            Some(1.0)
+        );
+        assert_eq!(find(ITEMS_METRIC, Some("rust"), Some("handed")), Some(2.0));
+        assert_eq!(find(ITEMS_METRIC, Some("rust"), Some("already_held")), None);
+        assert_eq!(find(CONFIG_METRIC, None, Some("ok")), Some(1.0));
+        assert_eq!(find(SOURCES_METRIC, None, None), Some(2.0));
+    }
+
+    #[test]
+    fn a_fetch_failure_has_its_own_cell() {
+        assert_ne!(FetchFault::HttpError.cell(), FetchFault::Transport.cell());
+        assert_ne!(FetchFault::Unparsable.cell(), FetchFault::HttpError.cell());
+        // Unreachable client: the transport cell, not an empty result set.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let client = Arc::new(FailingClient) as Arc<dyn HttpClient>;
+        let tick = rt.block_on(fetch_source(&client, "http://s", &OutwardSource::default()));
+        assert_eq!(tick.fault, Some(FetchFault::Transport));
+    }
+
+    #[derive(Debug)]
+    struct FailingClient;
+
+    #[async_trait]
+    impl HttpClient for FailingClient {
+        async fn execute(&self, _req: HttpRequest) -> SFResult<HttpResponse> {
+            Err(SFError::IO("no route to host".into()))
+        }
+    }
+}

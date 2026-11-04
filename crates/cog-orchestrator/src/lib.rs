@@ -9,6 +9,7 @@ pub mod face_staffing;
 pub mod governance_acts;
 pub mod observable;
 pub mod orchestrator_control_impl;
+pub mod outward;
 pub mod plugin;
 pub mod principle_ledger;
 pub mod principle_measure;
