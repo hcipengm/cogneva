@@ -255,8 +255,19 @@ use cog_core::{execute_structured, ChatOptions, LlmClient};
 struct ExtractedEntity {
     name: String,
     kind: String,
+    /// Free-form attributes, kept in whatever shape the model wrote them.
+    ///
+    /// 这一格收的是模型自己编的键值，值的形状不由我们决定：参与者是一张
+    /// 名单、计数是一个数、是否验证过是一个布尔。把它声明成 `String` 时，
+    /// schema 里就成了 `additionalProperties: {"type":"string"}`，于是模型
+    /// 写 `["Planner","Generator"]` 或 `true` 的每一次都被判为不合格——而
+    /// 一次抽取的报酬就是这一份答案，判它不合格只会上游把**同一段提示词**
+    /// 再发一遍。实测这条路上 24 小时 88 份 raw、150 次多余调用，多半是
+    /// 这样来的：输入靠前缀缓存付半价，输出却是全新的，每一次重发都要为
+    /// 几千个 token 的抽取结果重新付费。形状放开不损失任何东西——落库的
+    /// `SchemaEntry::properties` 本来就是 `serde_json::Value`。
     #[serde(default)]
-    properties: HashMap<String, String>,
+    properties: HashMap<String, serde_json::Value>,
     #[serde(default)]
     importance: u8, // 1-10
 }
@@ -865,6 +876,48 @@ mod tests {
         );
         assert_eq!(summary.text, "The gateway routed a deploy to the cluster.");
         assert_eq!(summary.importance, cog_core::importance_from_rating(6));
+    }
+
+    /// 模型在 `properties` 里写的就是它手上内容的形状：名单是数组、计数是
+    /// 数、判定是布尔。只收字符串的 schema 会把这些答案整份判为不合格，而
+    /// 抽取一方唯一的补救是把**同一段提示词**再发一遍——输入还能靠前缀缓存
+    /// 付便宜价，输出是全新的，一次重发就是几千 token 的重复抽取。这条测试
+    /// 钉住的是「模型这样写也算合格」，因为那正是它实际写出来的东西。
+    #[tokio::test]
+    async fn properties_the_model_actually_writes_are_not_a_reason_to_resend_the_prompt() {
+        const ANSWER: &str = r#"{
+            "entities": [
+                {"name": "roundtable", "kind": "process",
+                 "properties": {"participants": ["Planner", "Generator"], "rounds": 3, "converged": false},
+                 "importance": 8}
+            ],
+            "relations": [],
+            "events": [],
+            "summary": {"text": "The roundtable converged after three rounds.", "importance": 5}
+        }"#;
+        let provider = Arc::new(ScriptedLlm::new(ANSWER));
+        let extractor = LlmMemoryExtractor::new(provider.clone());
+
+        let (entries, _) = extractor
+            .extract_all(&raw("raw-shapes", "roundtable converged"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            provider.calls(),
+            1,
+            "an answer the model did write must not be sent back for a rewrite"
+        );
+        let entity = entries
+            .iter()
+            .find(|e| e.kind == SchemaKind::Entity)
+            .expect("the entity survived");
+        assert_eq!(
+            entity.properties["participants"],
+            serde_json::json!(["Planner", "Generator"])
+        );
+        assert_eq!(entity.properties["rounds"], serde_json::json!(3));
+        assert_eq!(entity.properties["converged"], serde_json::json!(false));
     }
 
     /// 合并本身不许把 payload 塞两遍——那正是这次要消掉的那笔开销；也不许
