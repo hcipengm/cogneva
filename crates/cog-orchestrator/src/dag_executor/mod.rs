@@ -483,15 +483,19 @@ impl DagExecutorRuntime {
         // reading at all, and its owed count is spent on nothing -- the task
         // goes out, but the reading that says whether it was allowed to is
         // blank, which is the one state a hold and an idle queue share.
-        // The order is the priority: the stop-the-line lane draws first, and
-        // the two ordinary lanes share what it leaves. The two peers' order
-        // between themselves decides nothing -- neither preempts the other --
-        // but it is fixed rather than incidental, because the same pass must
-        // hand the same queues the same batch twice running.
+        // The order is the priority, because the queues draw on one allowance:
+        // the stop-the-line lane first, then the platform's own evolution, then
+        // ordinary work. The middle place is a decision, not an accident --
+        // sharing one allowance made an order mean something, where judging
+        // each queue separately left it free. The evolution lane ranks above
+        // ordinary work because ordinary work is what the backlog is made of
+        // and this lane is what keeps the platform changing: sized by a shared
+        // remainder, a deep ordinary queue would hold every generation task
+        // back, and nothing about that backlog says it should.
         let lanes: Vec<String> = vec![
             crate::ready_queue::stop_the_line_ready_stream(&self.config.workspace_id),
-            crate::ready_queue::ready_stream(&self.config.workspace_id),
             crate::ready_queue::process_local_ready_stream(&self.config.workspace_id),
+            crate::ready_queue::ready_stream(&self.config.workspace_id),
         ];
         let ready_of: Vec<(u64, u64)> = lanes
             .iter()
