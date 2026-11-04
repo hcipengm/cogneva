@@ -1321,8 +1321,16 @@ const HISTOGRAM_HELP: &[(&str, &str)] = &[
 const GAUGE_HELP: &[(&str, &str)] = &[
     (
         "llm_tokens_total",
-        "Tokens the ledger says were spent, split by `kind` into input, output \
-         and cached. The span is the whole folded record, not the day: the \
+        "Tokens the ledger says were spent, split by `kind` into input, output, \
+         cached and cache_created. `cache_created` is the written half of the \
+         cache -- what this actor's requests caused the upstream to store -- and \
+         it is absent, not zero, for a cell where no window carried a reading: \
+         only some faces report it. Read it beside `cached`: an Anthropic face \
+         writes only what the request marks with `cache_control`, so created \
+         staying at zero while cached rises means the marks never landed and \
+         the reads come from the upstream's own caching -- two different \
+         repairs that one number cannot tell apart. The span is the whole \
+         folded record, not the day: the \
          value only ever rises, so a window difference over it measures \
          spending rather than the ledger's own midnight rollover. Rendered \
          from the ledger's rows on the pool's cadence, never tallied on the \

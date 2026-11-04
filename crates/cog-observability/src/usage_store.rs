@@ -1008,7 +1008,11 @@ impl LlmUsageStore {
                     actor,
                     COALESCE(SUM(tokens_input), 0)::BIGINT  AS tokens_input,
                     COALESCE(SUM(tokens_output), 0)::BIGINT AS tokens_output,
-                    COALESCE(SUM(tokens_cached), 0)::BIGINT AS tokens_cached
+                    COALESCE(SUM(tokens_cached), 0)::BIGINT AS tokens_cached,
+                    -- 不包 COALESCE：整组都没量到时它必须是 NULL，而不是 0。
+                    -- 0 是一个读数（标了断点、上游写了零字节），NULL 是「这一组
+                    -- 没人量过」，两种形状在度量面上要走不同的路。
+                    SUM(tokens_cache_created)::BIGINT AS tokens_cache_created
                FROM {ROLLUP_TABLE}
               GROUP BY upstream, api_style, actor
               ORDER BY upstream, api_style, actor"
@@ -1024,6 +1028,9 @@ impl LlmUsageStore {
                 input: row.get::<i64, _>("tokens_input").max(0) as u64,
                 output: row.get::<i64, _>("tokens_output").max(0) as u64,
                 cached: row.get::<i64, _>("tokens_cached").max(0) as u64,
+                cache_created: row
+                    .get::<Option<i64>, _>("tokens_cache_created")
+                    .map(|n| n.max(0) as u64),
             })
             .collect())
     }

@@ -5038,11 +5038,12 @@ async fn publish_token_totals_from_ledger(state: &AppState) {
         }
     };
     for row in &rows {
-        for (kind, value) in [
-            ("input", row.input),
-            ("output", row.output),
-            ("cached", row.cached),
-        ] {
+        for (kind, value) in token_kind_readings(row) {
+            // 没有读数的格子不写：写 0 是「量到了，是零」，而 `None` 是
+            // 「这一格没人量过」，两者在读数面上必须长得不一样。
+            let Some(value) = value else {
+                continue;
+            };
             record_gauge(
                 state,
                 cog_core::metric_names::LLM_TOKENS_TOTAL,
@@ -5061,6 +5062,60 @@ async fn publish_token_totals_from_ledger(state: &AppState) {
             )
             .await;
         }
+    }
+}
+
+/// 一条账本格要写的几个 `kind`，按写入顺序。
+///
+/// `cache_created` 与前三个不是一个形状：前三个的总量永远是个数，written
+/// 那一半只在部分协议面上报，没报过的格子是 `None`。把它写成一个 0 会把
+/// 「上游没说过」读成「上游写了零字节」——而这两件事的修法相反：前者要问
+/// 请求有没有带上 `cache_control`，后者要问前缀为什么每轮都不一样。
+fn token_kind_readings(row: &cog_core::UpstreamActorSpend) -> [(&'static str, Option<u64>); 4] {
+    [
+        ("input", Some(row.input)),
+        ("output", Some(row.output)),
+        ("cached", Some(row.cached)),
+        ("cache_created", row.cache_created),
+    ]
+}
+
+#[cfg(test)]
+mod token_kind_readings_tests {
+    use super::*;
+
+    fn row(cache_created: Option<u64>) -> cog_core::UpstreamActorSpend {
+        cog_core::UpstreamActorSpend {
+            upstream: "https://upstream.invalid/v1|m".into(),
+            api_style: "anthropic".into(),
+            actor: "agent:generator".into(),
+            input: 100,
+            output: 10,
+            cached: 40,
+            cache_created,
+        }
+    }
+
+    /// 没量到的写半格（`None`）不出序列。
+    ///
+    /// 这条盯的是「写 0」的形状：`cache_created` 只有部分协议面会报，没报的格子
+    /// 如果被写成一个 0，读数面就会说「上游写了零字节」，而真实情况是「没人说过」。
+    /// 前者指向前缀不稳定，后者指向请求没带断点——两个修法相反，读数面必须分得开。
+    #[test]
+    fn a_cell_nobody_measured_writes_no_series() {
+        let kinds = token_kind_readings(&row(None));
+        assert_eq!(kinds[3], ("cache_created", None));
+        assert!(
+            kinds[..3].iter().all(|(_, v)| v.is_some()),
+            "三个总量永远有读数：它们是从账本求和得来的"
+        );
+    }
+
+    /// 量到的 0 是一个读数，照写。
+    #[test]
+    fn a_measured_zero_is_still_written() {
+        let kinds = token_kind_readings(&row(Some(0)));
+        assert_eq!(kinds[3], ("cache_created", Some(0)));
     }
 }
 

@@ -514,6 +514,19 @@ pub struct UpstreamActorSpend {
     pub input: u64,
     pub output: u64,
     pub cached: u64,
+    /// The written half of the cache: tokens this actor caused the upstream to
+    /// store, summed over the fold. `None` when no window in the fold carried a
+    /// reading -- the writer reports it only on some faces, and a fold that
+    /// predates the column carries none.
+    ///
+    /// Read beside [`Self::cached`] because the pair is the only evidence that
+    /// mark-then-reuse is happening at all: an Anthropic face writes only what
+    /// the request marks with `cache_control`, so writes that stay at zero mean
+    /// the marks never landed -- while reads above zero mean the upstream is
+    /// caching on its own. Reporting one without the other cannot tell those
+    /// apart, and the repair differs: the first is our request, the second is
+    /// the prefix.
+    pub cache_created: Option<u64>,
 }
 
 /// How many successful calls in a range carried a usage reading, by what the
