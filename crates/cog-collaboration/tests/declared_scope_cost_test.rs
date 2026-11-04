@@ -64,10 +64,35 @@ const CHANGE_DIFF: &str = "--- a/docs/quickstart.md\n\
                             -Install the agent.\n\
                             +Install the agent and start it.\n";
 
+/// The same change as the checkout reports it: `git diff` writes the
+/// `diff --git` line first, and a read that does not carry it is not read as
+/// the tree's answer at all.
+const WORKSPACE_DIFF: &str = "diff --git a/docs/quickstart.md b/docs/quickstart.md\n\
+                              index 1111111..2222222 100644\n\
+                              --- a/docs/quickstart.md\n\
+                              +++ b/docs/quickstart.md\n\
+                              @@ -1 +1 @@\n\
+                              -Install the agent.\n\
+                              +Install the agent and start it.\n";
+
+/// What the checkout behind a round reads back as.
+///
+/// A producing round is asked about its tree, and the three answers are three
+/// different situations: a round that wrote its change, a round that left the
+/// tree alone, and a run with no tree to read. They cost differently, so the
+/// double says which one it is instead of leaving the default.
+#[derive(Clone)]
+enum Checkout {
+    Changed(String),
+    Untouched,
+    Unreadable,
+}
+
 struct StubAgent {
     role: String,
     response: serde_json::Value,
     log: Arc<CallLog>,
+    checkout: Checkout,
 }
 
 #[async_trait]
@@ -75,6 +100,22 @@ impl Agent for StubAgent {
     async fn prompt(&self, _input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
         self.log.record(&self.role);
         Ok(self.response.clone())
+    }
+
+    /// The diff the round left in its checkout, as the real agent harvests it
+    /// with `git diff`.
+    async fn workspace_change(
+        &self,
+        _task_id: &str,
+        _exclude: &[String],
+    ) -> cog_core::SFResult<Option<String>> {
+        match &self.checkout {
+            Checkout::Changed(diff) => Ok(Some(diff.clone())),
+            Checkout::Untouched => Ok(None),
+            Checkout::Unreadable => Err(cog_core::SFError::Internal(
+                "this run has no checkout to read".into(),
+            )),
+        }
     }
 
     async fn start(&self) {}
@@ -184,6 +225,7 @@ impl Agent for StubAgent {
 
 struct StubAgentManager {
     log: Arc<CallLog>,
+    checkout: Checkout,
 }
 
 #[async_trait]
@@ -200,11 +242,20 @@ impl AgentManager for StubAgentManager {
                 "content": { "summary": "wording fix" },
                 "artifacts": [{ "name": "change.diff", "content": CHANGE_DIFF, "artifact_type": "change" }],
             }),
+            // A pass that judged no declared criterion is downgraded to a fail,
+            // and the repair loop then buys another generation -- so the call
+            // count this file measures would be counting the stub's laziness
+            // rather than the topology. A real evaluator answers the criteria it
+            // was given; the double has to do the same.
             "evaluator" => serde_json::json!({
                 "verdict": "pass",
                 "score": 92,
                 "feedback": "the diff applies and matches the request",
-                "criteria": [],
+                "criteria": [{
+                    "name": "the wording is fixed",
+                    "score": 90,
+                    "comment": "the diff rewords the installation step",
+                }],
             }),
             // The moderator keeps the debate going; the second consecutive pass
             // is what ends it, so the round count does not depend on the stub.
@@ -218,6 +269,7 @@ impl AgentManager for StubAgentManager {
             role: role.to_string(),
             response,
             log: Arc::clone(&self.log),
+            checkout: self.checkout.clone(),
         }))
     }
 
@@ -319,7 +371,16 @@ fn squad_config(goal: &str, task: &Task, pge_mode: PgeMode) -> SquadConfig {
 
 /// Run one task under the topology its own declaration earns, and report the
 /// calls it cost.
+///
+/// The checkout a producing round reads back is the round's own: a round that
+/// did its job wrote the change, and this is the case every topology pays for
+/// the same way.
 async fn run_declared(task: Task) -> (bool, Arc<CallLog>) {
+    run_declared_over(Checkout::Changed(WORKSPACE_DIFF.to_string()), task).await
+}
+
+/// The same run, with the checkout stated instead of assumed.
+async fn run_declared_over(checkout: Checkout, task: Task) -> (bool, Arc<CallLog>) {
     let goal = task
         .input
         .get("goal")
@@ -332,6 +393,7 @@ async fn run_declared(task: Task) -> (bool, Arc<CallLog>) {
         .with_llm_provider(Arc::new(StubLlm))
         .with_agent_manager(Arc::new(StubAgentManager {
             log: Arc::clone(&log),
+            checkout,
         }))
         .with_self_review(SelfReviewConfig {
             max_iterations: 1,
@@ -380,6 +442,30 @@ async fn a_declared_prose_scope_never_asks_for_a_plan() {
         log.role("generator"),
         1,
         "one producing call, and no retry bought anything: {:?}",
+        log.by_role.lock().unwrap()
+    );
+}
+
+/// A run with no checkout to read is not asked a second time.
+///
+/// The re-ask exists for a round whose tree came back untouched: the round can
+/// write the change into that tree instead of describing it. When the tree
+/// could not be read at all there is nothing for the second answer to write
+/// into, and the two situations produce the same artifact source — a diff that
+/// came from the model — so a rule keyed on the source alone buys a generation
+/// that cannot change anything.
+#[tokio::test]
+async fn a_run_with_no_readable_checkout_is_not_asked_twice() {
+    let (_success, log) = run_declared_over(
+        Checkout::Unreadable,
+        self_evolution_task("fix the wording in `docs/quickstart.md`"),
+    )
+    .await;
+
+    assert_eq!(
+        log.role("generator"),
+        1,
+        "there is no tree to write into, so a second ask cannot change the answer: {:?}",
         log.by_role.lock().unwrap()
     );
 }

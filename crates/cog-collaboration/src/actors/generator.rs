@@ -264,10 +264,16 @@ impl GeneratorActor {
         // Last, so it also covers a revision the self-review wrote: whatever
         // artifact the round ends up with is the one the tree is asked about.
         if is_self_evolution {
-            let (out, source) =
+            let (out, source, checkout_read) =
                 prefer_workspace_change(self.agent.as_ref(), &task.id, output).await;
             output = match (source, repair_base) {
-                (Some(crate::observable::CHANGE_DIFF_SOURCE_MODEL), Some(base)) => {
+                // 只有「检出读得到且读回来没有改动」才重问。一个根本读不到的
+                // 检出（这一轮没有工作区、读失败）与一个没有改动的检出，在产物
+                // 来源上同形——都退回模型给的 diff。前者的成因是这里没有树可写，
+                // 再问一次仍然没有树可写，只会白付一通生成。
+                (Some(crate::observable::CHANGE_DIFF_SOURCE_MODEL), Some(base))
+                    if checkout_read =>
+                {
                     self.repair_untouched_checkout(task, base, out).await
                 }
                 _ => out,
@@ -278,15 +284,15 @@ impl GeneratorActor {
 
     /// 树没动的时候，让这一轮把改动真的写进检出，而不是把 diff 写在答复里。
     ///
-    /// 实测（2026-11-04）：生成端每轮拿到文件工具，却在 74 轮里一次写工具都没
-    /// 调用——它读两三个文件，然后把一份凭记忆手写的 unified diff 当成产物交上来。
-    /// 手写的 hunk 计数与上下文行对不上，`git apply --check` 就挂，这一轮的生成、
-    /// 评审、执行全部白付。取树那条路在同样的窗口里只命中 3 次。
+    /// 生成端拿到文件工具也可以一次都不调用：它读几个文件，然后把一份凭记忆
+    /// 手写的 unified diff 当成产物交上来。手写的 hunk 计数与上下文行对不上，
+    /// `git apply --check` 就挂，这一轮的生成、评审、执行全部白付。从树里取
+    /// 改动的那条路没有这个问题——树是它自己写的。
     ///
-    /// 所以只在这一个条件下重问一次：这一轮**产出了变更产物**、而工作树读回来
-    /// 没有改动。重问的话只说一件它能做的事——把改动写进检出，然后从 `git diff`
-    /// 取产物。第二次也没动树的，仍然收第一份答复：这里只补一次机会，不改判据，
-    /// 也不把一轮答复换成一无所有。
+    /// 所以只在这一个条件下重问一次：这一轮**产出了变更产物**、工作树读得到、
+    /// 而读回来没有改动。重问的话只说一件它能做的事——把改动写进检出，然后从
+    /// `git diff` 取产物。第二次也没动树的，仍然收第一份答复：这里只补一次机会，
+    /// 不改判据，也不把一轮答复换成一无所有。
     async fn repair_untouched_checkout(
         &self,
         task: &Task,
@@ -313,7 +319,10 @@ impl GeneratorActor {
             );
             return first;
         }
-        let (out, source) = prefer_workspace_change(self.agent.as_ref(), &task.id, second).await;
+        // Whether the re-read found a checkout is not asked here: this branch is
+        // reached only because a checkout was readable a moment ago, and the
+        // question it settles is where the second answer's diff came from.
+        let (out, source, _) = prefer_workspace_change(self.agent.as_ref(), &task.id, second).await;
         if source == Some(crate::observable::CHANGE_DIFF_SOURCE_TREE) {
             return out;
         }
@@ -366,26 +375,34 @@ fn checkout_repair_request(mut base: serde_json::Value) -> serde_json::Value {
 /// had. Which end was used is counted rather than inferred: a harvest that
 /// silently never fires and a model that never needed one leave the same
 /// absence otherwise.
+/// Returns the output to carry on with, where its diff came from, and whether
+/// the checkout behind it could be read at all.
+///
+/// The last piece is not implied by the second: a diff that came from the model
+/// is both what an unchanged checkout produces and what an unreadable one
+/// produces, and the two call for opposite answers -- one is a round that should
+/// be asked to write into the tree, the other is a run that has no tree to write
+/// into.
 async fn prefer_workspace_change(
     agent: &dyn Agent,
     task_id: &str,
     output: GeneratorOutput,
-) -> (GeneratorOutput, Option<&'static str>) {
+) -> (GeneratorOutput, Option<&'static str>, bool) {
     // A round with no change artifact is never asked about, so a report-only
     // round does not pay a sandbox command to be told there is nothing to swap.
     if !has_change_artifact(&output) {
-        return (output, None);
+        return (output, None, false);
     }
     let excluded = artifact_files_to_exclude(&output);
-    let harvested = match agent.workspace_change(task_id, &excluded).await {
-        Ok(diff) => diff,
+    let (harvested, checkout_read) = match agent.workspace_change(task_id, &excluded).await {
+        Ok(diff) => (diff, true),
         Err(e) => {
             tracing::warn!(
                 task_id,
                 error = %e,
                 "could not read the run's checkout; keeping the generated diff"
             );
-            None
+            (None, false)
         }
     };
     let (output, source) = apply_workspace_change(output, harvested);
@@ -394,7 +411,7 @@ async fn prefer_workspace_change(
             .record_change_diff_source(source)
             .await;
     }
-    (output, source)
+    (output, source, checkout_read)
 }
 
 fn has_change_artifact(output: &GeneratorOutput) -> bool {
