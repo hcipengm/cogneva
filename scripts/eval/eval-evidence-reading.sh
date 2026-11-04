@@ -12,7 +12,8 @@
 # 这里只做聚合，不再去敲集群：池读数由 eval-pool-watch.sh 每两分钟写一行。
 #
 # 退出码：0＝已到目标或在涨；1＝没在长（`verdict=` 分开成因：blocked-on-pool /
-#         blocked-on-stale-pool-sample / stalled-unknown）；
+#         blocked-on-stale-pool-sample / blocked-on-upstream-quota /
+#         blocked-on-incomplete-experiment / working / stalled-unknown）；
 #         3＝读不到（检查点或日志缺失／为空），不许当 0 读。
 set -u
 
@@ -41,6 +42,13 @@ TARGET=${TARGET:-198}
 # 报表判过的 78 行全是 gepa。每条腿的分摊＝目标 / 腿数（198 / 2 = 99 = 33 题 × 3 seed）。
 LEGS=${LEGS:-gepa,agentflow}
 WINDOW=${WINDOW:-3600}   # 到达率按这一段时间算，秒
+# 「停住」判据的窗口，与到达率的窗口不是同一个数。一轮从起 Pod 到被自己的 horizon 收掉
+# 最长 45 分钟（`eval-registered-rerun.sh` 给每轮定的界），所以 1 小时的到达窗口会在
+# 每一轮还没跑完时就报一次「窗口内零增量」。2026-11-04T22:54Z 实测过这一刻：有一个评测
+# Pod 正在跑，网关记着它 30 分钟里 200 多次成功的模型调用，判词却写着 stalled-unknown，
+# 面读数照着它把「商用交付」判红。停住要看的是「轮次跑完了也没落行」，那至少是两轮：
+# 两轮都空才算停住，两轮之内只是「这一轮还没跑完」。
+STALL_WINDOW=${STALL_WINDOW:-7200}
 
 # `--prometheus`：把同一份判词翻成文本暴露格式，交给宿主读数聚合器（它把各面并到一个
 # 端口上，面自己不再开端口、不再加单元）。这里**再调一次自己**再解析，而不是把中间量搬进
@@ -392,6 +400,8 @@ last_progress=$(printf '%s\n' "$all" | awk 'NF{t=$2} END{if(t) print t}')
 recent=$(gains "$(date -u -d "@$((now - WINDOW))" +%FT%TZ)")
 gained_w=$(printf '%s\n' "$recent" | awk 'NF{n+=$1} END{print n+0}')
 events_w=$(printf '%s\n' "$recent" | grep -c . )
+# 同一个聚合换一个下界：停住判据看两轮，到达率看一小时（见 STALL_WINDOW）。
+gained_stall=$(gains "$(date -u -d "@$((now - STALL_WINDOW))" +%FT%TZ)" | awk 'NF{n+=$1} END{print n+0}')
 
 if [ -n "$last_progress" ]; then
   lp_s=$(date -u -d "$last_progress" +%s 2>/dev/null || echo '')
@@ -460,5 +470,12 @@ if [ "$pa" = 0 ]; then
   echo "verdict=blocked-on-pool reason=no-rows-landed-in-${WINDOW}s-and-the-gateway-reports-the-pool-closed"
   exit 1
 fi
-echo "verdict=stalled-unknown reason=no-rows-landed-in-${WINDOW}s-and-pool_available=${pa}"
+# 走到这里：一小时内没落行，池开着，最后一轮也没有可归的成因。这一格曾经直接印
+# `stalled-unknown`，而它同时装着两件事——「两轮跑完了都没落行」与「这一轮还在跑」。
+# 分开印：两轮之内落过行的是 working（轮次在转，只是比到达窗口慢），两轮都空才是停住。
+if [ "$gained_stall" -gt 0 ]; then
+  echo "verdict=working reason=no-row-landed-in-${WINDOW}s-but-${gained_stall}-landed-within-${STALL_WINDOW}s-so-the-rounds-are-turning-just-slower-than-the-arrival-window"
+  exit 1
+fi
+echo "verdict=stalled-unknown reason=no-rows-landed-in-${STALL_WINDOW}s-and-pool_available=${pa}"
 exit 1

@@ -31,6 +31,7 @@ ckpt() { # ckpt <路径> <用例数> [只写这一条腿]
 
 # 时间戳：涨的那一行落在窗口内／窗口外，靠相对 now 生成，不写死日期。
 t_in()  { date -u -d '-5 minutes' +%FT%TZ; }
+t_mid() { date -u -d '-90 minutes' +%FT%TZ; }
 t_out() { date -u -d '-5 hours'  +%FT%TZ; }
 
 run() { # run <ckpt> <log> <pool> [env…] ；打印 "rc=<n> verdict=<词>"
@@ -76,6 +77,27 @@ printf '%s judged=78 llm_pool_available=1 llm_pool_next_attempt_unix=0 llm_pool_
 got=$(run "$TMP/ck_unk" "$TMP/log_unk" "$TMP/pool_unk")
 [ "$got" = "rc=1 verdict=stalled-unknown" ] && ok "零增量＋池开着＝stalled-unknown/1" \
   || bad "零增量＋池开：期望 rc=1 verdict=stalled-unknown，实得 $got"
+
+# 4b. 一小时内没落行，但两轮之内落过：轮次在转，只是比到达窗口慢 ⇒ working，不是停住。
+# 这一格是判据的地方：`stalled-unknown` 同时装着「两轮跑完都没落行」与「这一轮还在跑」，
+# 而后者一秒都不该报停住——一个跑着的 Pod 被读成停住，面读数会照它把「商用交付」判红。
+ckpt "$TMP/ck_mid" 78
+printf '%s run eval-rerun-1 phase=timeout dur=2704s judged=74->78\n' "$(t_mid)" >"$TMP/log_mid"
+got=$(run "$TMP/ck_mid" "$TMP/log_mid" "$TMP/pool_unk")
+[ "$got" = "rc=1 verdict=working" ] && ok "涨落在一小时外、两轮内＝working/1" \
+  || bad "两轮内落过行：期望 rc=1 verdict=working，实得 $got"
+
+# 4c. 消融：把停住窗口也压到一小时，同一份夹具必须回落到 stalled-unknown——
+# 证明上面那一格由 STALL_WINDOW 撑着，不是碰巧。
+got=$(run "$TMP/ck_mid" "$TMP/log_mid" "$TMP/pool_unk" STALL_WINDOW=3600)
+[ "$got" = "rc=1 verdict=stalled-unknown" ] && ok "停住窗口压回一小时即回落成 stalled-unknown（working 由窗口撑起）" \
+  || bad "working 消融：期望 rc=1 verdict=stalled-unknown，实得 $got"
+
+# 4d. 两轮之外也没落行 ⇒ 仍然是停住，窗口不是无限的：working 不许把真停住也盖上。
+printf '%s run eval-rerun-1 phase=timeout dur=2704s judged=74->78\n' "$(t_out)" >"$TMP/log_old"
+got=$(run "$TMP/ck_mid" "$TMP/log_old" "$TMP/pool_unk")
+[ "$got" = "rc=1 verdict=stalled-unknown" ] && ok "五小时前那一次涨救不了现在：仍是 stalled-unknown/1" \
+  || bad "两轮之外：期望 rc=1 verdict=stalled-unknown，实得 $got"
 
 # 5. 检查点不在 → 3/unreadable，不许当 0
 got=$(run "$TMP/nope" "$TMP/log_blk" "$TMP/pool_blk")
