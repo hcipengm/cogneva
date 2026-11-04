@@ -631,6 +631,40 @@ impl ActionPlanOrchestrator {
     /// below are the built-in kinds, and an id that matches none of them is not
     /// a lookup failure — `Custom(<id>)` is a hand the registry does not have to
     /// know about.
+    /// 把一份分解的 id 收进承载它的那道目标的作用域里。
+    ///
+    /// 只改 id，以及每一个指着 id 的字段：父子关系、前后依赖、计划图上的边。它们
+    /// 在作用域内外是同一张图，改一半就会让新 id 指着一条不存在的任务——那种计划
+    /// 入图之后照样跑，只是谁也等不到谁。
+    ///
+    /// 分隔符用 `/`：任务 id 里已经出现 `:`（SOP 的 `release-checks:build`）与 `-`，
+    /// 再拿它们做层级标记会与那些 id 自己的拼写撞上，而这一层只是作用域，不该被
+    /// 读成名字的一部分之外的任何含义。
+    fn scope_plan(plan: ActionPlan, scope: &str) -> ActionPlan {
+        let scoped = |id: &str| format!("{scope}/{id}");
+        let tasks = plan
+            .tasks
+            .into_iter()
+            .map(|mut at| {
+                at.id = scoped(&at.id);
+                at.parent_id = at.parent_id.as_deref().map(scoped);
+                at.blocked_by = at.blocked_by.iter().map(|dep| scoped(dep)).collect();
+                at.blocks = at.blocks.iter().map(|next| scoped(next)).collect();
+                at
+            })
+            .collect();
+        let edges = plan
+            .edges
+            .iter()
+            .map(|(from, to)| (scoped(from), scoped(to)))
+            .collect();
+        ActionPlan {
+            tasks,
+            edges,
+            ..plan
+        }
+    }
+
     fn atomic_task_to_task(at: &AtomicTask) -> Task {
         let task_type = match at.skill_id.as_deref() {
             Some(id) if id.eq_ignore_ascii_case(cog_core::roles::PLANNER) => TaskType::Planner,
@@ -990,6 +1024,18 @@ impl ActionPlanOrchestrator {
                     reason,
                 )
                 .await;
+        };
+
+        // 分解给出的 id 只在这一次分解里唯一，而图持有的不变式是全局的：一个 id 只
+        // 能命名一件活。计划面写出来的常常是 t1、t2、t3，于是第二道目标的分解在入图
+        // 那一刻被整份拒掉——一个子任务都进不来，拒绝只落进部署器的一行日志里。
+        // 2026-11-05 实测：外循环读到的每一条发现都停在这一步，「问过了」有读数、
+        // 「交出去了」永远是 0。作用域取承载这道目标的那一行 id：它是提交方自己的
+        // 稳定身份（同一个 URL 派生的同一个行、同一次重建的同一次提交），所以重投
+        // 拿到的还是同一批 id，幂等不变。
+        let plan = match tasks.first() {
+            Some(goal_row) => Self::scope_plan(plan, &goal_row.id),
+            None => plan,
         };
 
         // 「这道目标的答案落在哪一条上」必须由分解自己点出来，且只点一条：零条说明各片
@@ -1943,6 +1989,14 @@ mod tests {
 
     fn hint_task(id: &str) -> Task {
         Task::new(id, TaskType::Custom("fix".into()), serde_json::json!({}))
+    }
+
+    /// 一道目标分解出的子任务在图上叫什么：承载它的那一行给出作用域。
+    ///
+    /// 分解只保证 id 在自己这一份计划里唯一，图要的是全局唯一，所以入图时 id 被
+    /// 收进目标行的作用域里。测试照着写，才是在读图上真有的那个 id。
+    fn scoped(goal_row: &str, id: &str) -> String {
+        format!("{goal_row}/{id}")
     }
 
     #[test]
@@ -3085,17 +3139,66 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(ids, vec!["sig-alert-2".to_string(), "child-1".to_string()]);
+        assert_eq!(
+            ids,
+            vec!["sig-alert-2".to_string(), scoped("sig-alert-2", "child-1")]
+        );
 
         let parent = dag.get_task("sig-alert-2").await.unwrap();
         assert_eq!(parent.status, cog_core::TaskStatus::Pending);
         assert!(!parent.is_executable);
-        let child = dag.get_task("child-1").await.unwrap();
+        let child = dag
+            .get_task(&scoped("sig-alert-2", "child-1"))
+            .await
+            .unwrap();
         assert_eq!(child.status, cog_core::TaskStatus::Pending);
         assert!(child.is_executable);
         assert_eq!(child.parent_task_id.as_deref(), Some("sig-alert-2"));
         assert_eq!(child.goal_id, parent.goal_id);
         assert!(sink.calls.lock().unwrap().is_empty());
+    }
+
+    /// 两份分解各自写 `t1` 时，两张单子都进得了图。
+    ///
+    /// 分解只保证 id 在自己这一份计划里唯一，图的不变式是「一个 id 只能命名一件
+    /// 活」；同一份分解被送到两道不同的目标上时，两个 `t1` 会互相挤掉，第二份整份
+    /// 被拒——2026-11-05 生产实测外循环的每一条发现都停在这一步。
+    #[tokio::test]
+    async fn two_goals_whose_plans_name_the_same_piece_both_reach_the_graph() {
+        let plan = || {
+            let mut first = atomic_task("t1");
+            first.blocks = vec!["t2".into()];
+            let mut second = atomic_task("t2");
+            second.blocked_by = vec!["t1".into()];
+            vec![first, second]
+        };
+        let dag: Arc<dyn cog_core::DagExecutor> =
+            Arc::new(crate::DagExecutor::new("ws-two-goals".to_string()));
+        let planner = ActionPlanOrchestrator::new()
+            .with_task_executor(Arc::new(ScriptedAtomicExecutor {
+                replies: std::sync::Mutex::new(vec![plan(), plan()]),
+            }))
+            .with_dag_executor(dag.clone())
+            .with_decomposition_max_attempts(1);
+
+        let registry = SkillRegistry::new();
+        for goal_row in ["outward-a", "outward-b"] {
+            if let Err(e) = planner
+                .process_goal_impl("read this page", vec![hint_task(goal_row)], &registry)
+                .await
+            {
+                panic!("{goal_row} 的分解被整份拒掉了：两份计划都写 t1 不该互相挤掉：{e:?}");
+            }
+        }
+
+        let b_t2 = dag.get_task(&scoped("outward-b", "t2")).await.unwrap();
+        assert_eq!(
+            b_t2.blocked_by,
+            vec![scoped("outward-b", "t1")],
+            "依赖必须指向同一份计划里的那一件活，不能指到另一道目标的同名任务上"
+        );
+        let a_t1 = dag.get_task(&scoped("outward-a", "t1")).await.unwrap();
+        assert_eq!(a_t1.blocks, vec![scoped("outward-a", "t2")]);
     }
 
     /// `sinks_of` 读的是执行器真正据以定序的那个字段，且只看这一次分解给出的任务。
@@ -3148,11 +3251,11 @@ mod tests {
         assert_eq!(parent.status, cog_core::TaskStatus::Pending);
         assert_eq!(
             parent.sink_task_id.as_deref(),
-            Some("child-2"),
+            Some(scoped("goal-row", "child-2").as_str()),
             "the declaration must point at the task nothing else waits on"
         );
         // 声明落在子任务的回指那一行上：读面正是从这一行取答案。
-        let child = dag.get_task("child-2").await.unwrap();
+        let child = dag.get_task(&scoped("goal-row", "child-2")).await.unwrap();
         assert_eq!(child.parent_task_id.as_deref(), Some("goal-row"));
     }
 
@@ -3195,24 +3298,25 @@ mod tests {
                 .clone()
         };
         assert_eq!(
-            by_id("child-1").budget_tokens,
+            by_id(&scoped("goal-row", "child-1")).budget_tokens,
             12_000,
             "预算就是分解给出的 estimated_tokens，不许另估一次"
         );
-        assert_eq!(by_id("child-2").budget_tokens, 5_000);
+        assert_eq!(by_id(&scoped("goal-row", "child-2")).budget_tokens, 5_000);
         assert_eq!(
-            by_id("child-1").workspace_id,
+            by_id(&scoped("goal-row", "child-1")).workspace_id,
             "ws-plan-baseline",
             "基线与任务行同一个 workspace，否则读面按 id 一条也对不上"
         );
         assert_eq!(
-            by_id("child-1").baseline_rev,
-            by_id("child-2").baseline_rev,
+            by_id(&scoped("goal-row", "child-1")).baseline_rev,
+            by_id(&scoped("goal-row", "child-2")).baseline_rev,
             "一次分解是一版基线"
         );
         // 依赖决定先后：等别人的那一片不能在别人结束之前开始。
         assert!(
-            by_id("child-2").planned_start.unwrap() >= by_id("child-1").planned_end.unwrap(),
+            by_id(&scoped("goal-row", "child-2")).planned_start.unwrap()
+                >= by_id(&scoped("goal-row", "child-1")).planned_end.unwrap(),
             "child-2 等 child-1 做完才能开始"
         );
     }
@@ -3250,12 +3354,14 @@ mod tests {
 
         let plans = recorder.plans.lock().unwrap().clone();
         assert!(
-            !plans.iter().any(|p| p.task_id == "child-x"),
+            !plans
+                .iter()
+                .any(|p| p.task_id == scoped("goal-row", "child-x")),
             "没估算就没有基线：{plans:?}"
         );
         let y = plans
             .iter()
-            .find(|p| p.task_id == "child-y")
+            .find(|p| p.task_id == scoped("goal-row", "child-y"))
             .expect("有估算");
         assert!(y.planned_start.is_some(), "起期是知道的");
         assert_eq!(y.planned_end, None, "时长未知不等于零时长");
@@ -3287,7 +3393,7 @@ mod tests {
             .expect("plan store 写失败不该让整次提交失败");
 
         assert!(
-            dag.get_task("child-1").await.is_some(),
+            dag.get_task(&scoped("goal-row", "child-1")).await.is_some(),
             "任务已经在图里了，不因为基线没写成就消失"
         );
         assert!(recorder.plans.lock().unwrap().is_empty());
@@ -3321,14 +3427,20 @@ mod tests {
             "the submitted row keeps what the client declared"
         );
         assert_eq!(
-            dag.get_task("child-1").await.unwrap().priority,
+            dag.get_task(&scoped("goal-row", "child-1"))
+                .await
+                .unwrap()
+                .priority,
             7,
             "a decomposed piece is the same work, so it is claimed at the same rank"
         );
         // 钱是子任务花的，按人取数也只能靠这一格：子任务丢了提交人，一次提交的
         // 花销就会落回「平台自己花的」，而那一格读起来恰好像「没人该负责」。
         assert_eq!(
-            dag.get_task("child-1").await.unwrap().submitted_by,
+            dag.get_task(&scoped("goal-row", "child-1"))
+                .await
+                .unwrap()
+                .submitted_by,
             Some("u-7".to_string()),
             "the person who asked for the goal is the person the pieces are spent for"
         );
@@ -3370,10 +3482,13 @@ mod tests {
         assert_eq!(row.input["goal"], serde_json::json!("plan this for me"));
         assert_eq!(
             row.sink_task_id.as_deref(),
-            Some("child-1"),
+            Some(scoped(&goal_row_id, "child-1").as_str()),
             "the answer's landing point must be declared on the row this goal carries"
         );
-        let child = dag.get_task("child-1").await.unwrap();
+        let child = dag
+            .get_task(&scoped(&goal_row_id, "child-1"))
+            .await
+            .unwrap();
         assert_eq!(child.parent_task_id.as_deref(), Some(goal_row_id.as_str()));
         assert_eq!(child.goal_id, row.goal_id);
 
@@ -3565,8 +3680,11 @@ mod tests {
             .await
             .expect("没估算的工作包过得了门");
 
-        assert!(ids.contains(&"child-1".to_string()), "{ids:?}");
-        let row = dag.get_task("child-1").await.expect("工作包入图了");
+        assert!(ids.contains(&scoped("goal-row", "child-1")), "{ids:?}");
+        let row = dag
+            .get_task(&scoped("goal-row", "child-1"))
+            .await
+            .expect("工作包入图了");
         assert_eq!(
             row.acceptance,
             vec!["接口对这条请求返回 200".to_string()],
@@ -3642,10 +3760,19 @@ mod tests {
             .await
             .unwrap();
 
-        let leaf_row = dag.get_task("child-2").await.expect("leaf injected");
-        assert_eq!(leaf_row.parent_task_id.as_deref(), Some("child-1"));
+        let leaf_row = dag
+            .get_task(&scoped("goal-row", "child-2"))
+            .await
+            .expect("leaf injected");
+        assert_eq!(
+            leaf_row.parent_task_id.as_deref(),
+            Some(scoped("goal-row", "child-1").as_str())
+        );
         // 计划没给父指针的顶层工作包挂在目标行下面，读面才只有一个根。
-        let parent_row = dag.get_task("child-1").await.expect("parent injected");
+        let parent_row = dag
+            .get_task(&scoped("goal-row", "child-1"))
+            .await
+            .expect("parent injected");
         assert_eq!(parent_row.parent_task_id.as_deref(), Some("goal-row"));
     }
 
@@ -3908,10 +4035,16 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(ids, vec!["sig-alert-3".to_string(), "child-9".to_string()]);
+        assert_eq!(
+            ids,
+            vec!["sig-alert-3".to_string(), scoped("sig-alert-3", "child-9")]
+        );
         let parent = dag.get_task("sig-alert-3").await.unwrap();
         assert_eq!(parent.status, cog_core::TaskStatus::Pending);
-        assert!(dag.get_task("child-9").await.is_some());
+        assert!(dag
+            .get_task(&scoped("sig-alert-3", "child-9"))
+            .await
+            .is_some());
         assert!(sink.calls.lock().unwrap().is_empty());
     }
 
