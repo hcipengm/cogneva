@@ -84,6 +84,19 @@ const FETCH_TIMEOUT_SECS: u64 = 30;
 /// taker whether it is worth opening; the URL is what they read when it is.
 // cap: bound — 够判断值不值得打开原文；要读细节的人去读 URL 那一页
 const EXCERPT_CHARS: usize = 600;
+/// The longest the loop sleeps between wakes, whatever its sources ask for.
+///
+/// A source's cadence says how often that source may be asked *again*; it does
+/// not say how long a fresh process must stay silent. The loop keeps no record
+/// of the previous process's asks -- the census is in memory and starts empty --
+/// so a process whose first wake is one whole cadence away never asks at all in
+/// a deployment that rolls more often than the cadence. This platform rolls
+/// several times a day against daily sources, which is exactly that deployment:
+/// the loop reads as configured and permanently unexercised, and no reading ever
+/// says the outside world went unread. Waking sooner costs one timer, not one
+/// query -- each source is still only asked when its own cadence is due.
+// cap: bound — 一觉睡满一个节奏等于滚动比节奏快的部署里一次都不问
+const WAKE_CEILING_SECS: u64 = 5 * 60;
 
 /// One subject to look for, and how often.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +236,19 @@ impl OutwardConfig {
             .min()
             .unwrap_or(DEFAULT_CADENCE_SECS);
         Duration::from_secs(least.max(60))
+    }
+
+    /// How long the loop may sleep between wakes: its shortest source cadence,
+    /// bounded by [`WAKE_CEILING_SECS`].
+    ///
+    /// The two are different questions. The cadence says when a source may be
+    /// asked again; the wake says how long a loop may go without looking at
+    /// whether something is due. Tying the wake to a daily cadence makes a fresh
+    /// process wait a day before its first look, and a process that is replaced
+    /// before then never looks at all -- so the bound is what keeps the loop
+    /// reachable in a deployment whose restarts are faster than its cadence.
+    pub fn wake_interval(&self) -> Duration {
+        self.period().min(Duration::from_secs(WAKE_CEILING_SECS))
     }
 }
 
@@ -624,11 +650,13 @@ pub fn spawn_outward_loop(
     census: Arc<OutwardCensus>,
 ) {
     let period = config.period();
+    let wake = config.wake_interval();
     let sources = config.sources.clone();
     let base = config.search_base.clone();
     info!(
         sources = sources.len(),
         period_secs = period.as_secs(),
+        wake_secs = wake.as_secs(),
         arbitrated = role.is_some(),
         "outward loop enabled"
     );
@@ -651,9 +679,14 @@ pub fn spawn_outward_loop(
                 // make a second replica's work harmless, but the reads and the
                 // submissions would also be paid for twice.
                 let hold = cog_core::RoleHold::start(role, OUTWARD_ROLE, beat.clone(), &shutdown);
-                let mut ticker = tokio::time::interval(period);
+                // The wake is bounded separately from the source cadence, so a
+                // process whose sources are asked daily still looks at them
+                // within minutes of starting. The cadence itself is enforced by
+                // `next_due` below, not by how long this sleeps.
+                let mut ticker = tokio::time::interval(wake);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 // First tick fires immediately; consume it so the first pass
-                // lands one period in rather than racing start-up.
+                // lands one wake in rather than racing start-up.
                 ticker.tick().await;
                 let now = Instant::now();
                 let mut next_due: Vec<Instant> = sources.iter().map(|_| now).collect();
@@ -872,6 +905,77 @@ mod tests {
                 body: self.body.clone(),
             })
         }
+    }
+
+    /// A fresh process looks at its sources within its first wake, not one
+    /// cadence in.
+    ///
+    /// The cadence bounds how often a source may be asked again; it is not a
+    /// promise that a process lasts that long. This platform rolls several
+    /// times a day against sources configured daily, so a first pass one
+    /// cadence away is a first pass that never happens: the census says
+    /// "configured" and no pass is ever counted, which reads exactly like a
+    /// deployment that did not turn the loop on.
+    ///
+    /// Paused time makes the two behaviours distinguishable without waiting:
+    /// the runtime advances the clock to the next timer, so the assertion is
+    /// about *which* timer fired first, not about how long the test took.
+    #[tokio::test(start_paused = true)]
+    async fn a_source_is_asked_within_its_first_wake_not_one_cadence_later() {
+        let client = CannedClient::new(
+            200,
+            r#"{"results":[{"url":"https://x/1","title":"t","content":"c"}]}"#,
+        );
+        let config = OutwardConfig {
+            search_base: "http://s".into(),
+            sources: vec![OutwardSource {
+                name: "x".into(),
+                query: "q".into(),
+                cadence_secs: 86_400,
+                max_items: 2,
+            }],
+        };
+        assert!(
+            config.wake_interval() < config.period(),
+            "a daily source whose loop only wakes daily is a loop no rollout shorter \
+             than a day ever sees run"
+        );
+        spawn_outward_loop(
+            Arc::new(RememberingOrchestrator::default()),
+            client.clone() as Arc<dyn HttpClient>,
+            None,
+            ShutdownSignal::new(),
+            config,
+            Arc::new(OutwardCensus::new()),
+        );
+        // Let the loop reach its first wait before moving the clock: a ticker
+        // created after the clock moved would be one full wake later.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        // Past the wake ceiling and nowhere near the cadence: a loop that tied
+        // its wake to the cadence is still asleep here and asks nothing.
+        tokio::time::advance(Duration::from_secs(WAKE_CEILING_SECS + 60)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            client.calls.lock().unwrap().len(),
+            1,
+            "the loop never asked its only source: its first wake is as far away as \
+             the cadence, so a process replaced sooner asks nothing at all"
+        );
+        // Asked once, not on every wake: the cadence still governs the repeats.
+        tokio::time::advance(Duration::from_secs(WAKE_CEILING_SECS + 60)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            client.calls.lock().unwrap().len(),
+            1,
+            "the loop asked again before the source's cadence was due: the wake bound \
+             turned a daily source into a pass every few minutes"
+        );
     }
 
     #[tokio::test]
