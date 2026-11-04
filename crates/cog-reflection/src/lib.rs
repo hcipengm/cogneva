@@ -53,6 +53,8 @@ pub mod change_execution;
 pub mod change_pipeline;
 pub mod change_rework;
 pub(crate) mod cmd_timeout;
+pub mod command_absences;
+pub use command_absences::{serves_two_absences, TwoAbsences};
 pub mod config;
 pub mod crew;
 pub mod criteria_face;
