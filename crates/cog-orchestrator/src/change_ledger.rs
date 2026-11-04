@@ -729,6 +729,25 @@ fn revision_prefix(rev: &str) -> &str {
     }
 }
 
+/// Drops the announce marks of commits that have scrolled out of the window.
+///
+/// A revision can leave the window and never come back, and one old enough to
+/// have left is already refused by the freshness bound, so the set only has to
+/// remember the window's own commits -- left alone it would grow for the life of
+/// the process, which on this host is measured in weeks.
+///
+/// Pruned only once it outgrows the window, because rebuilding the window's set
+/// on every pass would cost more than the growth it prevents: the set gains at
+/// most [`DECLARATION_MAX_PER_PASS`] entries per pass and the window does not
+/// grow at all.
+fn prune_announced(announced: &mut HashSet<String>, window: &[(String, i64)]) {
+    if announced.len() <= window.len() {
+        return;
+    }
+    let in_window: HashSet<&str> = window.iter().map(|(rev, _)| rev.as_str()).collect();
+    announced.retain(|rev| in_window.contains(rev.as_str()));
+}
+
 /// Which of the window's revisions the account already carries, or `None` when
 /// the account could not answer.
 ///
@@ -2442,6 +2461,8 @@ pub fn spawn_change_ledger_loop(
                                     // tree without naming a change; this walks the
                                     // fresh ones into the account, because a count
                                     // that goes up is not a moment and this is.
+                                    //
+                                    prune_announced(&mut announced_unclaimed, &window);
                                     if let Some(at) = first_seen_rev.as_deref() {
                                         declare_unclaimed_commits(
                                             &*store,
@@ -13154,6 +13175,42 @@ mod tests {
             },
             "one commit in three reached product code and named no change, and one of \
              the two that did name one is not on a row yet"
+        );
+    }
+
+    /// The commit-window marks are bounded by the window they describe, so a
+    /// process that lives for weeks does not keep a revision for every commit it
+    /// ever answered for.
+    ///
+    /// Pruning is deliberately lazy: a set no larger than the window is left
+    /// exactly as it is, because the marks it still carries belong to commits
+    /// the next pass may see again, and forgetting one costs a second
+    /// declaration of a commit the account already answered -- harmless but
+    /// wrong in the log.
+    #[test]
+    fn the_announce_marks_are_dropped_only_once_they_outgrow_the_window() {
+        let window: Vec<(String, i64)> = ["aaaa", "bbbb", "cccc"]
+            .iter()
+            .map(|rev| (rev.to_string(), 0))
+            .collect();
+        let mut small: HashSet<String> =
+            ["aaaa", "old"].iter().map(|rev| rev.to_string()).collect();
+        prune_announced(&mut small, &window);
+        assert!(
+            small.contains("old"),
+            "a set no larger than the window is left alone: pruning it would forget a \
+             commit the next pass may still see"
+        );
+
+        let mut large: HashSet<String> = ["aaaa", "old", "older", "oldest"]
+            .iter()
+            .map(|rev| rev.to_string())
+            .collect();
+        prune_announced(&mut large, &window);
+        assert_eq!(
+            large,
+            ["aaaa".to_string()].into_iter().collect(),
+            "everything outside the window is dropped once the set outgrows it"
         );
     }
 
