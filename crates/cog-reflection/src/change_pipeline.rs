@@ -172,6 +172,23 @@ const TEST_BUDGET_RUNS_PER_CHANGE: u64 = 3;
 // cap: bound — 吃构建预算的只有发布构建那一条
 const BUILD_BUDGET_RUNS_PER_CHANGE: u64 = 1;
 
+/// 一条变更的验证最多收窄到几个包；超过就退回整棵 workspace。
+///
+/// 收窄的理由是分工与 CI 一致：这条管线判「改动的那几个包自己过不过」，整棵树
+/// 过不过由落地后的 CI 判（红了有 `watch_landed` 回滚）。改动到这么多个包时
+/// 「自己」已经接近整棵树，再收窄省不下什么，却要多担一层「哪些包被算进来了」
+/// 的读数——那种时候跑整棵是更简单的那个答案。
+// cap: bound — 超过这么多个包，收窄省下的编译已经小于它多担的那层读数
+const MAX_SCOPED_PACKAGES: usize = 6;
+
+/// 读一次工作区成员清单的墙钟界。
+///
+/// `cargo metadata --no-deps` 只读清单、不编译，实测在几十毫秒量级；这个界是
+/// 「挂住了」的那条线，不是预算——一条读清单的命令卡住时，收回整棵 workspace
+/// 比等它更接近正确的判断。
+// cap: bound — 只读清单的命令卡住时宁可退回整棵 workspace
+const METADATA_TIMEOUT_SECS: u64 = 120;
+
 /// 一条变更上不受节拍约束的那几段活的墙钟上界——一个心跳到下一个心跳之间最长
 /// 的一段。加的是三段：
 ///
@@ -216,6 +233,85 @@ fn verification_env(
         env.push(("CARGO_TARGET_DIR".to_string(), dir.display().to_string()));
     }
     env
+}
+
+/// The packages a change's verification is confined to, or `None` for the whole
+/// workspace.
+///
+/// The question this answers is the one every out-of-band change answers the
+/// same way: a change that edits one crate is judged by that crate's suite, and
+/// the tree it did not touch is judged after it lands. A pipeline that runs the
+/// whole workspace for each of them makes the tree's size, not the change's
+/// size, the cost of every change — and the tree only grows.
+///
+/// `members` is the workspace as cargo resolved it: `(package name, directory
+/// relative to the worktree root)`. Every affected path has to belong to one of
+/// them. A path outside all of them — the root manifest, `deploy/`, `prompts/`,
+/// a root document — returns `None`, because those files are read by the build
+/// of the whole tree rather than by one package's suite, and a scoped run would
+/// not judge them at all. `None` is always the safe answer: it is exactly what
+/// ran before there was a scope.
+fn verification_packages(affected: &[String], members: &[(String, String)]) -> Option<Vec<String>> {
+    if affected.is_empty() || members.is_empty() {
+        return None;
+    }
+    let mut packages: Vec<String> = Vec::new();
+    for path in affected {
+        let normalized = path.strip_prefix("./").unwrap_or(path).replace('\\', "/");
+        if normalized.starts_with('/') || normalized.split('/').any(|seg| seg == "..") {
+            return None;
+        }
+        // The longest member whose directory contains this path: nested members
+        // are legal in a workspace, and the inner one is the package the file
+        // is compiled into.
+        let owner = members
+            .iter()
+            .filter(|(_, dir)| {
+                dir.is_empty() || normalized == *dir || normalized.starts_with(&format!("{dir}/"))
+            })
+            .max_by_key(|(_, dir)| dir.len())?;
+        if !packages.iter().any(|known| known == &owner.0) {
+            packages.push(owner.0.clone());
+        }
+    }
+    if packages.is_empty() || packages.len() > MAX_SCOPED_PACKAGES {
+        return None;
+    }
+    Some(packages)
+}
+
+/// The argv of a cargo command, with `--workspace` replaced by one `-p` per
+/// package.
+///
+/// Only the word that names the scope is swapped. Every other argument —
+/// `--no-fail-fast`, `--all-targets`, `-D warnings`, the message format — says
+/// *how* the run judges, not *what* it judges, and dropping one of them to save
+/// a flag would be exactly the kind of silent weakening this gate exists to
+/// prevent. A command whose program is not `cargo`, or that carries no
+/// `--workspace`, is returned untouched: a program this pipeline does not
+/// understand must not have its arguments rewritten by guesswork.
+fn lint_command_line_for(packages: Option<&[String]>) -> String {
+    let Some(packages) = packages else {
+        return BUILTIN_LINT_LINE.to_string();
+    };
+    let line: Vec<String> = BUILTIN_LINT_LINE.split(' ').map(str::to_string).collect();
+    scoped_argv(&line, packages).join(" ")
+}
+
+fn scoped_argv(argv: &[String], packages: &[String]) -> Vec<String> {
+    if argv.first().map(String::as_str) != Some("cargo") {
+        return argv.to_vec();
+    }
+    let Some(position) = argv.iter().position(|arg| arg == "--workspace") else {
+        return argv.to_vec();
+    };
+    let mut scoped: Vec<String> = argv[..position].to_vec();
+    for package in packages {
+        scoped.push("-p".to_string());
+        scoped.push(package.clone());
+    }
+    scoped.extend_from_slice(&argv[position + 1..]);
+    scoped
 }
 
 /// What the pipeline decided about one change.
@@ -303,10 +399,17 @@ enum FailureAttribution {
     NotATestFailure,
 }
 
-/// Which tests a revision fails with no change applied, and the revision they
-/// were read at. Named because the pair travels through a lock and three
-/// methods, and spelling it out each time hides which part is the reading.
-type BaselineFailures = Option<(String, BTreeSet<String>)>;
+/// Which tests a revision fails with no change applied, the revision they were
+/// read at, and the packages whose suite produced them.
+///
+/// Named because it travels through a lock and three methods, and spelling it
+/// out each time hides which part is the reading. The package list is part of
+/// the key, not decoration: a baseline read over one crate's suite does not
+/// contain the other crates' tests at all, so reusing it for a change scoped
+/// somewhere else would read every pre-existing failure in that other scope as
+/// one this change introduced — the exact false conviction the comparison
+/// exists to prevent. Empty means the whole workspace.
+type BaselineFailures = Option<(String, Vec<String>, BTreeSet<String>)>;
 
 /// What this deployment's formatting stage read for a tree.
 #[derive(Debug)]
@@ -1268,7 +1371,30 @@ impl ChangePipeline {
         // does not compile is the suite's to answer for. Both are recorded
         // where the decision is made rather than left to be inferred from a
         // green run.
-        let clippy_note = match self.judge_lint(workdir, &change.artifact_id).await {
+        // Which packages the two compiling stages below are confined to. Read
+        // once, here, so the linter, the suite and the baseline that suite is
+        // compared against are all the same run: a change judged by one crate's
+        // tests and excused by the whole workspace's baseline would read every
+        // failure in that crate as one it introduced.
+        //
+        // `None` is the whole workspace, which is what every change was judged
+        // by before this scope existed and what a change touching anything
+        // outside `crates/<member>/` still is.
+        let scope = self.scoped_packages(workdir, &change.content).await;
+        match &scope {
+            Some(packages) => info!(
+                change_id = %change.artifact_id,
+                packages = %packages.join(","),
+                "Change is verified against the packages it edits"
+            ),
+            None => info!(
+                change_id = %change.artifact_id,
+                "Change is verified against the whole workspace"
+            ),
+        }
+        let scope = scope.as_deref();
+
+        let clippy_note = match self.judge_lint(workdir, &change.artifact_id, scope).await {
             Ok(LintVerdict::Clean(note)) => note,
             Ok(LintVerdict::NotDeclared) => NO_LINTER_NOTE.to_string(),
             Ok(LintVerdict::Unattributable(evidence)) => {
@@ -1401,7 +1527,7 @@ impl ChangePipeline {
             }
         };
 
-        let (test_passed, test_output) = match self.run_test_command(workdir).await {
+        let (test_passed, test_output) = match self.run_test_command(workdir, scope).await {
             Ok(result) => result,
             // No slot for the whole wait budget: the tests never ran, so nothing
             // about the change was judged. This stays an `Err` -- the caller
@@ -1454,7 +1580,7 @@ impl ChangePipeline {
         let mut pre_existing_failures = 0usize;
         if !test_passed {
             match self
-                .failures_beyond_baseline(workdir, &change.content, &test_output)
+                .failures_beyond_baseline(workdir, &change.content, &test_output, scope)
                 .await
             {
                 Ok(FailureAttribution::PreExisting(already)) => {
@@ -2530,6 +2656,59 @@ impl ChangePipeline {
         }
     }
 
+    /// The packages this change's verification is confined to, or `None` for
+    /// the whole workspace.
+    ///
+    /// The workspace has to come from cargo rather than from the directory
+    /// names under `crates/`: a member's directory and its package name are
+    /// two different things (`crates/bootstrap` builds `cogneva-bootstrap`),
+    /// and `-p` takes the package name. `--no-deps` reads manifests only — no
+    /// resolution, no compilation, no build slot — so this costs milliseconds
+    /// against the compile it lets the pipeline skip.
+    ///
+    /// Every failure returns `None`, which is the unscoped answer: a manifest
+    /// this run cannot read is not a fact about the change, and the judgement
+    /// must stay the one it already was.
+    async fn scoped_packages(&self, workdir: &Path, change_content: &str) -> Option<Vec<String>> {
+        let affected =
+            cog_core::contract::reflection::parse_diff_affected_files(change_content).ok()?;
+        let members = self.workspace_packages(workdir).await?;
+        verification_packages(&affected, &members)
+    }
+
+    /// The workspace's members as `(package name, directory relative to the
+    /// worktree root)`, or `None` when this run cannot read them.
+    async fn workspace_packages(&self, workdir: &Path) -> Option<Vec<(String, String)>> {
+        let mut cmd = tokio::process::Command::new("cargo");
+        cmd.args([
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--offline",
+        ])
+        .current_dir(workdir)
+        .kill_on_drop(true);
+        self.apply_verification_env(&mut cmd);
+        let output = tokio::time::timeout(Duration::from_secs(METADATA_TIMEOUT_SECS), cmd.output())
+            .await
+            .ok()?
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let doc: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        let root = workdir.canonicalize().ok()?;
+        let mut members = Vec::new();
+        for package in doc.get("packages")?.as_array()? {
+            let name = package.get("name")?.as_str()?.to_string();
+            let manifest = PathBuf::from(package.get("manifest_path")?.as_str()?);
+            let dir = manifest.parent()?.strip_prefix(&root).ok()?;
+            members.push((name, dir.to_string_lossy().replace('\\', "/")));
+        }
+        Some(members)
+    }
+
     /// Run the configured test command and return (success, combined_output).
     ///
     /// The command is the deployment's, not this crate's: a project that is not
@@ -2540,20 +2719,27 @@ impl ChangePipeline {
     /// accepting a change because no criterion was reachable is the one reading
     /// of a missing command that must not be available, and it is the reading a
     /// typo in a config file would produce.
-    async fn run_test_command(&self, workdir: &Path) -> SFResult<(bool, String)> {
+    async fn run_test_command(
+        &self,
+        workdir: &Path,
+        packages: Option<&[String]>,
+    ) -> SFResult<(bool, String)> {
         let Some(program) = self.test_command.first() else {
             return Err(SFError::Config(
                 "self_evolution.test_command is empty: no command would judge this change".into(),
             ));
         };
+        let argv = match packages {
+            Some(packages) => scoped_argv(&self.test_command, packages),
+            None => self.test_command.clone(),
+        };
+        let line = argv.join(" ");
         // The heaviest build this host runs, so it is the one the slot exists
         // for. Bound to a named variable, not `_`: an underscore drops the
         // permit on the spot and would bound nothing at all.
         let _slot = crate::build_gate::acquire("change verification").await?;
         let mut cmd = tokio::process::Command::new(program);
-        cmd.args(&self.test_command[1..])
-            .current_dir(workdir)
-            .kill_on_drop(true);
+        cmd.args(&argv[1..]).current_dir(workdir).kill_on_drop(true);
         self.apply_verification_env(&mut cmd);
 
         let started = Instant::now();
@@ -2561,9 +2747,8 @@ impl ChangePipeline {
         let output =
             match tokio::time::timeout(Duration::from_secs(budget_secs), cmd.output()).await {
                 Ok(result) => {
-                    let output = result.map_err(|e| {
-                        SFError::IO(format!("Failed to run {}: {}", self.test_command_line(), e))
-                    })?;
+                    let output =
+                        result.map_err(|e| SFError::IO(format!("Failed to run {line}: {e}")))?;
                     if let Some(budget) = &self.budget {
                         budget.record_run(
                             crate::verification_budget::KIND_TEST,
@@ -2577,9 +2762,7 @@ impl ChangePipeline {
                         budget.record_timeout(crate::verification_budget::KIND_TEST);
                     }
                     return Err(SFError::IO(format!(
-                        "{} exceeded the {}s verification budget and was killed",
-                        self.test_command_line(),
-                        budget_secs
+                        "{line} exceeded the {budget_secs}s verification budget and was killed"
                     )));
                 }
             };
@@ -2636,8 +2819,15 @@ impl ChangePipeline {
     /// No slot is taken here: the stage takes one for whichever linter it runs,
     /// so that this command and a deployment's own are one gated command each
     /// to the wall bound rather than two.
-    async fn run_cargo_clippy(&self, workdir: &Path) -> SFResult<(bool, String)> {
-        let argv: Vec<String> = BUILTIN_LINT.iter().map(|arg| (*arg).to_string()).collect();
+    async fn run_cargo_clippy(
+        &self,
+        workdir: &Path,
+        packages: Option<&[String]>,
+    ) -> SFResult<(bool, String)> {
+        let mut argv: Vec<String> = BUILTIN_LINT.iter().map(|arg| (*arg).to_string()).collect();
+        if let Some(packages) = packages {
+            argv = scoped_argv(&argv, packages);
+        }
         info!(command = %argv.join(" "), "Running the built-in linter");
         self.run_verification_command(workdir, &argv, self.test_budget_secs())
             .await
@@ -2676,7 +2866,12 @@ impl ChangePipeline {
     /// not found, the toolchain would not start, or the run died first. That
     /// answers [`LintVerdict::Unmeasured`] and never a clean tree, so a host
     /// without the linter cannot pass changes through the stage unlinted.
-    async fn judge_lint(&self, workdir: &Path, change_id: &str) -> SFResult<LintVerdict> {
+    async fn judge_lint(
+        &self,
+        workdir: &Path,
+        change_id: &str,
+        packages: Option<&[String]>,
+    ) -> SFResult<LintVerdict> {
         let declared = match self.lint_command.as_deref() {
             Some([]) => return Ok(LintVerdict::NotDeclared),
             Some(argv) => Some(argv),
@@ -2693,8 +2888,8 @@ impl ChangePipeline {
                 (line, passed, output)
             }
             None => {
-                let (passed, output) = self.run_cargo_clippy(workdir).await?;
-                (BUILTIN_LINT_LINE.to_string(), passed, output)
+                let (passed, output) = self.run_cargo_clippy(workdir, packages).await?;
+                (lint_command_line_for(packages).to_string(), passed, output)
             }
         };
         if passed {
@@ -2857,6 +3052,7 @@ impl ChangePipeline {
         workdir: &Path,
         change_content: &str,
         output: &str,
+        packages: Option<&[String]>,
     ) -> SFResult<FailureAttribution> {
         let failing = cog_core::contract::reflection::failing_tests(output);
         // A run can fail without naming a test — a compile error, a dead
@@ -2866,7 +3062,9 @@ impl ChangePipeline {
         if failing.is_empty() {
             return Ok(FailureAttribution::NotATestFailure);
         }
-        let baseline = self.baseline_failing_tests(workdir, change_content).await?;
+        let baseline = self
+            .baseline_failing_tests(workdir, change_content, packages)
+            .await?;
         let introduced: Vec<String> = failing.difference(&baseline).cloned().collect();
         if introduced.is_empty() {
             Ok(FailureAttribution::PreExisting(
@@ -2895,16 +3093,20 @@ impl ChangePipeline {
         &self,
         workdir: &Path,
         change_content: &str,
+        packages: Option<&[String]>,
     ) -> SFResult<BTreeSet<String>> {
         let rev = self.workspace_rev(workdir).await?;
-        if let Some((cached_rev, tests)) = self.baseline_failures.lock().await.as_ref() {
-            if *cached_rev == rev {
+        let scope: Vec<String> = packages.map(|list| list.to_vec()).unwrap_or_default();
+        if let Some((cached_rev, cached_scope, tests)) =
+            self.baseline_failures.lock().await.as_ref()
+        {
+            if *cached_rev == rev && *cached_scope == scope {
                 return Ok(tests.clone());
             }
         }
 
         self.git_reset_hard(workdir, change_content).await?;
-        let (_, baseline_output) = self.run_test_command(workdir).await?;
+        let (_, baseline_output) = self.run_test_command(workdir, packages).await?;
 
         self.git_apply(workdir, change_content).await.map_err(|e| {
             SFError::IO(format!(
@@ -2936,7 +3138,7 @@ impl ChangePipeline {
             count = tests.len(),
             "Read the tests this revision fails before any change is applied"
         );
-        *self.baseline_failures.lock().await = Some((rev, tests.clone()));
+        *self.baseline_failures.lock().await = Some((rev, scope, tests.clone()));
         Ok(tests)
     }
 
@@ -3297,7 +3499,7 @@ mod tests {
             .with_verification_budget(budget.clone());
 
         let err = pipeline
-            .run_test_command(root.path())
+            .run_test_command(root.path(), None)
             .await
             .expect_err("a run that cannot finish in a second must not be waited on");
 
@@ -3417,7 +3619,7 @@ impl Default for MetricsConfig {
             .with_verification_budget(budget.clone());
 
         let (passed, output) = pipeline
-            .run_test_command(root.path())
+            .run_test_command(root.path(), None)
             .await
             .expect("a run inside its budget must be waited on");
 
@@ -3446,7 +3648,7 @@ impl Default for MetricsConfig {
         let failing = ChangePipeline::new(root.path(), root.path(), false)
             .with_test_command(vec!["false".into()]);
         let (passed, _) = failing
-            .run_test_command(root.path())
+            .run_test_command(root.path(), None)
             .await
             .expect("`false` runs");
         assert!(!passed, "the configured command decides the verdict");
@@ -3454,7 +3656,7 @@ impl Default for MetricsConfig {
         let passing = ChangePipeline::new(root.path(), root.path(), false)
             .with_test_command(vec!["true".into()]);
         let (passed, _) = passing
-            .run_test_command(root.path())
+            .run_test_command(root.path(), None)
             .await
             .expect("`true` runs");
         assert!(passed);
@@ -3471,7 +3673,7 @@ impl Default for MetricsConfig {
             .with_test_command(vec!["cogneva-no-such-test-command".into()]);
 
         let err = pipeline
-            .run_test_command(root.path())
+            .run_test_command(root.path(), None)
             .await
             .expect_err("a command that does not exist cannot return a verdict");
         assert!(
@@ -3490,7 +3692,7 @@ impl Default for MetricsConfig {
             ChangePipeline::new(root.path(), root.path(), false).with_test_command(Vec::new());
 
         let err = pipeline
-            .run_test_command(root.path())
+            .run_test_command(root.path(), None)
             .await
             .expect_err("an empty command judges nothing and must not pass a change");
         assert!(err.to_string().contains("test_command is empty"), "{err}");
@@ -3559,7 +3761,7 @@ impl Default for MetricsConfig {
         };
 
         match declaring(vec!["true".into()])
-            .judge_lint(root.path(), "c")
+            .judge_lint(root.path(), "c", None)
             .await
             .unwrap()
         {
@@ -3572,7 +3774,7 @@ impl Default for MetricsConfig {
         // `false` speaks nothing, so nothing here can show its refusal is not
         // the change's doing.
         match declaring(vec!["false".into()])
-            .judge_lint(root.path(), "c")
+            .judge_lint(root.path(), "c", None)
             .await
             .unwrap()
         {
@@ -3585,7 +3787,7 @@ impl Default for MetricsConfig {
 
         assert!(matches!(
             declaring(Vec::new())
-                .judge_lint(root.path(), "c")
+                .judge_lint(root.path(), "c", None)
                 .await
                 .unwrap(),
             LintVerdict::NotDeclared
@@ -3609,7 +3811,7 @@ impl Default for MetricsConfig {
         .unwrap();
 
         let verdict = ChangePipeline::new(root.path(), root.path(), false)
-            .judge_lint(root.path(), "c")
+            .judge_lint(root.path(), "c", None)
             .await
             .unwrap();
         match verdict {
@@ -5479,6 +5681,177 @@ index 1111111..2222222 100644
                 "CARGO_TARGET_DIR".to_string(),
                 "/var/cache/cogneva-target".to_string()
             )]
+        );
+    }
+
+    fn members() -> Vec<(String, String)> {
+        vec![
+            ("cog-core".to_string(), "crates/cog-core".to_string()),
+            ("cog-github".to_string(), "crates/cog-github".to_string()),
+            (
+                "cogneva-bootstrap".to_string(),
+                "crates/bootstrap".to_string(),
+            ),
+        ]
+    }
+
+    /// 一条只落在 crate 目录里的变更，验证收窄到它改的那几个包。
+    ///
+    /// 这是这条管线与带外改动同构的地方：改一个 crate 就判那个 crate，整棵树
+    /// 由落地后的 CI 判。收窄不了的时候必须是整棵（下一条测试），所以这条与
+    /// 那条一起钉住的是「要么准确收窄，要么退回原样」，没有第三种。
+    #[test]
+    fn a_change_inside_the_crates_tree_is_verified_by_the_packages_it_edits() {
+        let affected =
+            |paths: &[&str]| -> Vec<String> { paths.iter().map(|p| (*p).to_string()).collect() };
+        assert_eq!(
+            verification_packages(&affected(&["crates/cog-github/src/landing.rs"]), &members()),
+            Some(vec!["cog-github".to_string()]),
+            "一个包里的改动只该判那个包"
+        );
+        assert_eq!(
+            verification_packages(
+                &affected(&[
+                    "./crates/cog-github/src/landing.rs",
+                    "crates/cog-github/tests/it.rs",
+                    "crates/cog-core/src/lib.rs",
+                ]),
+                &members()
+            ),
+            Some(vec!["cog-github".to_string(), "cog-core".to_string()]),
+            "多个包时按出现次序去重，且 `./` 前缀不影响归属"
+        );
+        assert_eq!(
+            verification_packages(&affected(&["crates/bootstrap/src/main.rs"]), &members()),
+            Some(vec!["cogneva-bootstrap".to_string()]),
+            "包名取的是 cargo 的包名，不是目录名（crates/bootstrap 建的是 \
+             cogneva-bootstrap）：按目录名传 `-p` 会一条命令都跑不起来"
+        );
+    }
+
+    /// 碰到 crate 目录之外的路径，或者一个都不认识，就退回整棵 workspace。
+    ///
+    /// 根清单、`deploy/`、`prompts/`、根文档这些路径的读者是整棵树的编译，
+    /// 只判一个包恰恰答不了它们。退回不是保守，是那层判据唯一说得通的形状。
+    #[test]
+    fn a_change_outside_the_crates_tree_is_verified_by_the_whole_workspace() {
+        let one = |path: &str| vec![path.to_string()];
+        for path in [
+            "Cargo.toml",
+            "deploy/k3s/evolution.yaml",
+            "prompts/generator.md",
+            "README.md",
+            "crates/not_a_member/src/lib.rs",
+            "../outside.rs",
+            "/etc/passwd",
+        ] {
+            assert_eq!(
+                verification_packages(&one(path), &members()),
+                None,
+                "{path} 不属于任何成员包，必须退回整棵 workspace"
+            );
+        }
+        assert_eq!(
+            verification_packages(&[], &members()),
+            None,
+            "空集合不是收窄"
+        );
+        assert_eq!(
+            verification_packages(&one("crates/cog-core/src/lib.rs"), &[]),
+            None,
+            "读不出成员清单时不许猜"
+        );
+
+        let mut many = Vec::new();
+        let mut workspace = Vec::new();
+        for index in 0..=MAX_SCOPED_PACKAGES {
+            let name = format!("cog-{index}");
+            workspace.push((name.clone(), format!("crates/cog-{index}")));
+            many.push(format!("crates/cog-{index}/src/lib.rs"));
+        }
+        assert_eq!(
+            verification_packages(&many, &workspace),
+            None,
+            "改到的包多到接近整棵树时，收窄省不下什么，该跑整棵"
+        );
+    }
+
+    /// 收窄只换 `--workspace` 这一个词，其余判据原样保留。
+    ///
+    /// `--all-targets` 是这里最要紧的一个：丢了它，只写在测试目标里的违规会
+    /// 过闸、再红在 CI 上——这条管线存在的意义正是拦这一类。`--no-fail-fast`
+    /// 和 `-D warnings` 同理说的是「怎么判」。
+    #[test]
+    fn scoping_replaces_the_scope_word_and_nothing_else() {
+        let lint: Vec<String> = BUILTIN_LINT.iter().map(|arg| (*arg).to_string()).collect();
+        let scoped = scoped_argv(&lint, &["cog-github".to_string()]);
+        assert!(
+            !scoped.iter().any(|arg| arg == "--workspace"),
+            "收窄后的命令里不该还有 --workspace：{scoped:?}"
+        );
+        assert_eq!(
+            scoped,
+            vec![
+                "cargo",
+                "clippy",
+                "--keep-going",
+                "-p",
+                "cog-github",
+                "--message-format=json",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+            "除了作用域，别的参数一个都不许动"
+        );
+
+        let test: Vec<String> = ["cargo", "test", "--workspace", "--no-fail-fast"]
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect();
+        assert_eq!(
+            scoped_argv(&test, &["cog-core".to_string(), "cog-github".to_string()]),
+            vec![
+                "cargo",
+                "test",
+                "-p",
+                "cog-core",
+                "-p",
+                "cog-github",
+                "--no-fail-fast"
+            ]
+        );
+
+        let declared: Vec<String> = ["make", "check"].iter().map(|a| a.to_string()).collect();
+        assert_eq!(
+            scoped_argv(&declared, &["cog-github".to_string()]),
+            declared,
+            "不是 cargo 的命令不许被猜着改参数"
+        );
+        let no_scope: Vec<String> = ["cargo", "test", "-p", "cog-core"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(
+            scoped_argv(&no_scope, &["cog-github".to_string()]),
+            no_scope,
+            "没有 --workspace 的命令说明它自己已经说清了作用域"
+        );
+    }
+
+    /// 变更的判据记录里写的是**实际跑的那条命令**：收窄时点名的包必须在里面，
+    /// 不然读记录的人会以为整棵树都被判过。
+    #[test]
+    fn the_record_names_the_packages_the_linter_actually_judged() {
+        assert_eq!(
+            lint_command_line_for(None),
+            BUILTIN_LINT_LINE.to_string(),
+            "没有收窄时记录与从前逐字相同"
+        );
+        assert_eq!(
+            lint_command_line_for(Some(&["cog-github".to_string()])),
+            "cargo clippy -p cog-github --all-targets"
         );
     }
 
