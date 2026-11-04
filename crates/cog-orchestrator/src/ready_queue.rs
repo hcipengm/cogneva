@@ -403,12 +403,14 @@ pub fn admission_for_pass(
 
 /// Which queue this is, as the label an admission reading carries.
 ///
-/// A closed set of two, derived rather than passed: a label value taken from a
+/// A closed set of three, derived rather than passed: a label value taken from a
 /// caller is a label value that will one day hold a task id, and a series named
 /// by a value that changes with the tick is a series per tick.
 pub fn stream_kind(stream: &str, workspace_id: &str) -> &'static str {
     if stream == stop_the_line_ready_stream(workspace_id) {
-        "stop_the_line"
+        // 与写出这条通道的输入键同一个拼写：两处各写一遍时，改一处的那天
+        // 另一个读者会去找一个再也不出现的东西，而「没找到」不报错。
+        cog_core::READY_LANE_STOP_THE_LINE
     } else if stream == process_local_ready_stream(workspace_id) {
         "local"
     } else {

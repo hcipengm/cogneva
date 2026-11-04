@@ -54,6 +54,7 @@ pub const DEFAULT_CLAIM_CONCURRENCY: usize = 4;
 /// that the cost of the exception is bounded by a single extra task in flight.
 /// One is enough because a red main is one finding: the deployer files one row
 /// per revision per day and the row names the whole failing set.
+// cap: bound — 这条例外的价钱就定在这一格：单开一份许可，同时最多多一条在跑的活；不是量出来的，是「例外不该翻倍」定的
 pub const STOP_THE_LINE_CLAIM_CONCURRENCY: usize = 1;
 
 /// 读一条在途执行上限。
