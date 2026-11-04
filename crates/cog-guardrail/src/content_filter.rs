@@ -34,6 +34,18 @@ pub fn is_harmful_content_rule(rule: &str) -> bool {
     rule == HARMFUL_CONTENT_RULE
 }
 
+/// 本门印在判词里的那几句话，一条规则一句。
+///
+/// 这些字面量有两个用途，而它们必须是同一份：`check` 用它们生成判词，
+/// [`own_verdict_phrases`] 用它们在判之前剥掉。写两遍的那天，「打印的句子」与
+/// 「剥掉的句子」会各自漂移，而漂移的后果不是多拦一次——是剥不掉，于是解释判词的
+/// 回执被自己的判词再拦一次，重试又转述上一轮，每轮多一处匹配，整轮判死。
+pub const NSFW_DETECTED: &str = "NSFW content detected";
+pub const VIOLENCE_DETECTED: &str = "Violence content detected";
+pub const HATE_SPEECH_DETECTED: &str = "Hate speech detected";
+pub const SELF_HARM_DETECTED: &str = "Self-harm content detected";
+pub const ILLEGAL_ACTS_DETECTED: &str = "Illegal acts content detected";
+
 /// 内容过滤器配置。
 #[derive(Debug, Clone)]
 pub struct ContentFilterConfig {
@@ -151,12 +163,16 @@ impl ContentFilter {
     fn build_regex_set(config: &ContentFilterConfig) -> (Vec<String>, RegexSet) {
         let mut patterns: Vec<String> = vec![
             // NSFW — explicit + euphemisms
-            r"(?i)\b(nude|naked|porn|sexual|xxx|adult content|nsfw)\b".into(),
+            // `nsfw` 是这一类内容的名字，不是一个在描述内容的词：智能体解释自己
+            // 为什么被判过时，句子里必然出现它（「NSFW 误判」「NSFW 判定」）。把它
+            // 当裸词拦，解释一次误判的回执自己就成了误判。与下面 `explicit` /
+            // `graphic` 同一条规矩：只有它点名描述的东西时才算证据。
+            r"(?i)\b(nude|naked|porn|sexual|xxx|adult content)\b".into(),
             // `explicit` and `graphic` are ordinary technical English on their own
             // ("an explicit verdict", "the graphic on the panel"), and this filter
             // judges what an agent says about its own work. They are evidence only
             // when they name the thing being described.
-            r"(?i)\b(?:(?:explicit|graphic)\s+(?:content|material|images?|scenes?|language|violence)|mature content|adult material)\b".into(),
+            r"(?i)\b(?:(?:explicit|graphic|nsfw)\s+(?:content|material|images?|scenes?|language|violence)|mature content|adult material)\b".into(),
             r"(?i)\b(nudity|intercourse|genital|erotic|obscene)\b".into(),
             // Violence
             r"(?i)\b(kill|murder|suicide|bomb|terrorist|attack|assassinate)\b".into(),
@@ -179,18 +195,23 @@ impl ContentFilter {
     }
 
     pub async fn check(&self, text: &str) -> GuardResult {
+        // 判词不是内容。一条解释「它为什么被拦」的回执必然转述本门印的那几短语；
+        // 不先剥掉，这条回执自己就会被同一条规则再拦一次，而重试时它又会转述上一
+        // 轮的判词，于是每一轮都比上一轮多一处匹配，直到整轮判死（实测 2026-11-04：
+        // WebUI 里两轮之后就变成 `terminal_env_failure`，分解再也跑不完）。
+        let stripped = own_verdict_phrases().replace_all(text, " ");
+        let text: &str = &stripped;
+
         // Layer 1: Regex pattern matching
         let regex_matches: Vec<usize> = self.patterns.matches(text).into_iter().collect();
         let regex_reasons: Vec<String> = regex_matches
             .iter()
             .filter_map(|&i| match i {
-                0..=2 if self.config.block_nsfw => Some("NSFW content detected".into()),
-                3..=5 if self.config.block_violence => Some("Violence content detected".into()),
-                6..=8 if self.config.block_hate_speech => Some("Hate speech detected".into()),
-                9 | 10 if self.config.block_self_harm => Some("Self-harm content detected".into()),
-                11 | 12 if self.config.block_illegal_acts => {
-                    Some("Illegal acts content detected".into())
-                }
+                0..=2 if self.config.block_nsfw => Some(NSFW_DETECTED.into()),
+                3..=5 if self.config.block_violence => Some(VIOLENCE_DETECTED.into()),
+                6..=8 if self.config.block_hate_speech => Some(HATE_SPEECH_DETECTED.into()),
+                9 | 10 if self.config.block_self_harm => Some(SELF_HARM_DETECTED.into()),
+                11 | 12 if self.config.block_illegal_acts => Some(ILLEGAL_ACTS_DETECTED.into()),
                 _ if i >= 13 => Some(format!("Custom pattern matched: index {}", i)),
                 _ => None,
             })
@@ -257,6 +278,28 @@ impl ContentFilter {
         }
         reasons
     }
+}
+
+/// 本门印在判词里的那几短语，供 [`ContentFilter::check`] 判之前剥掉。
+///
+/// 只认本门自己产出的写法（见 `check` 里那几行 `Some("… content detected")`），
+/// 不碰别的：同样一件事换个说法讲，仍要照旧命中规则。剥掉它们不会让真实内容漏网，
+/// 因为真实内容靠的是别的词，而这几个短语本身就是「有人在报告一次判定」的形状。
+fn own_verdict_phrases() -> &'static regex::Regex {
+    static PHRASES: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PHRASES.get_or_init(|| {
+        let alternatives: Vec<String> = [
+            NSFW_DETECTED,
+            VIOLENCE_DETECTED,
+            HATE_SPEECH_DETECTED,
+            SELF_HARM_DETECTED,
+            ILLEGAL_ACTS_DETECTED,
+        ]
+        .iter()
+        .map(|phrase| regex::escape(phrase))
+        .collect();
+        regex::Regex::new(&format!("(?i){}", alternatives.join("|"))).expect("本门判词的固定写法")
+    })
 }
 
 fn tokenize(text: &str) -> HashSet<String> {
