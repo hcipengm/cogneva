@@ -483,19 +483,32 @@ impl DagExecutorRuntime {
         // reading at all, and its owed count is spent on nothing -- the task
         // goes out, but the reading that says whether it was allowed to is
         // blank, which is the one state a hold and an idle queue share.
-        for stream in [
+        // The order is the priority: the stop-the-line lane draws first, and
+        // the two ordinary lanes share what it leaves. The two peers' order
+        // between themselves decides nothing -- neither preempts the other --
+        // but it is fixed rather than incidental, because the same pass must
+        // hand the same queues the same batch twice running.
+        let lanes: Vec<String> = vec![
+            crate::ready_queue::stop_the_line_ready_stream(&self.config.workspace_id),
             crate::ready_queue::ready_stream(&self.config.workspace_id),
             crate::ready_queue::process_local_ready_stream(&self.config.workspace_id),
-            crate::ready_queue::stop_the_line_ready_stream(&self.config.workspace_id),
-        ] {
-            let ready = by_stream.get(&stream).map(|e| e.len()).unwrap_or(0) as u64;
-            let owed = in_flight.get(&stream).copied().unwrap_or(0) as u64;
-            let admitted = crate::ready_queue::admission_for_pass(
-                ready,
-                owed,
-                window_jobs,
-                READY_TASKS_PER_PASS,
-            );
+        ];
+        let ready_of: Vec<(u64, u64)> = lanes
+            .iter()
+            .map(|stream| {
+                (
+                    by_stream.get(stream).map(|e| e.len()).unwrap_or(0) as u64,
+                    in_flight.get(stream).copied().unwrap_or(0) as u64,
+                )
+            })
+            .collect();
+        let admissions = crate::ready_queue::admissions_by_lane(
+            ready_of.iter().copied(),
+            window_jobs,
+            READY_TASKS_PER_PASS,
+        );
+        for ((stream, (ready, owed)), admitted) in lanes.iter().zip(ready_of).zip(admissions) {
+            let stream = stream.clone();
             admitted_by_stream.insert(stream.clone(), admitted);
             self.record_admission(
                 &stream,

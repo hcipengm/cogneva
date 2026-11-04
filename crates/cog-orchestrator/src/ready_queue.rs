@@ -401,6 +401,54 @@ pub fn admission_for_pass(
     }
 }
 
+/// How one pass's window is shared out among the queues, in the order given.
+///
+/// The queues draw on one allowance instead of each being judged against the
+/// whole of it. Judged separately, a pass over three queues may put three
+/// windows' worth of work in flight while the reading that sized them says the
+/// pool pays for one -- and that reading is the pool's answer, so the extra is
+/// refused upstream rather than run.
+///
+/// Drawing in order is what makes the first queue a priority rather than a
+/// second allowance: it takes what it needs, and what is left is what the next
+/// one may dispatch. Only a queue with work ready and unsatisfied is affected
+/// -- an empty high-priority queue takes nothing, so the ordinary queue gets
+/// the whole window whenever nothing is waiting to preempt it. That is the
+/// failure the equal split this replaced was written to avoid: a stalled
+/// queue's backlog sizing a healthy queue's batch.
+///
+/// The ceiling branch is unchanged per queue: `owed` is only meaningful against
+/// a known allowance, and subtracting it from a slice admits nothing as soon as
+/// the backlog exceeds one slice.
+pub fn admissions_by_lane(
+    lanes: impl IntoIterator<Item = (u64, u64)>,
+    window_jobs: Option<u64>,
+    ceiling: u64,
+) -> Vec<PassAdmission> {
+    let lanes: Vec<(u64, u64)> = lanes.into_iter().collect();
+    let mut remaining = window_jobs.map(|window| {
+        let owed: u64 = lanes.iter().map(|(_, owed)| *owed).sum();
+        window.saturating_sub(owed)
+    });
+    lanes
+        .into_iter()
+        .map(|(ready, _)| match remaining {
+            Some(left) => {
+                let jobs = ready.min(left);
+                remaining = Some(left - jobs);
+                PassAdmission {
+                    jobs,
+                    bound: PassBound::Window,
+                }
+            }
+            None => PassAdmission {
+                jobs: ready.min(ceiling),
+                bound: PassBound::Ceiling,
+            },
+        })
+        .collect()
+}
+
 /// Which queue this is, as the label an admission reading carries.
 ///
 /// A closed set of three, derived rather than passed: a label value taken from a
@@ -682,6 +730,42 @@ mod tests {
         assert_eq!(admission_for_pass(2_024, 1_729, None, 200).jobs, 200);
         // And a ready set smaller than a slice is still just the ready set.
         assert_eq!(admission_for_pass(7, 0, None, 200).jobs, 7);
+    }
+
+    #[test]
+    fn the_queues_draw_on_one_window_in_the_order_they_are_given() {
+        // Three queues with work ready, a pool that pays for four jobs. Judged
+        // one at a time against the whole window each would take four -- twelve
+        // in flight on a reading that says four, and the twelve are what the
+        // upstream refuses.
+        let jobs = |lanes: [(u64, u64); 3], window| -> Vec<u64> {
+            admissions_by_lane(lanes, window, 200)
+                .into_iter()
+                .map(|a| a.jobs)
+                .collect()
+        };
+        assert_eq!(jobs([(4, 0), (4, 0), (4, 0)], Some(4)), vec![4, 0, 0]);
+
+        // Work already in flight on any queue has been charged to the same
+        // window: eight owed across the three queues, ten to pay for, two left
+        // for the queue at the front of the order.
+        assert_eq!(jobs([(4, 2), (4, 3), (4, 3)], Some(10)), vec![2, 0, 0]);
+
+        // A queue with nothing ready takes nothing, whichever queue it is: the
+        // ordinary work gets the whole window when nothing is waiting to
+        // preempt it.
+        assert_eq!(jobs([(0, 0), (9, 0), (0, 0)], Some(5)), vec![0, 5, 0]);
+        assert_eq!(jobs([(4, 0), (0, 0), (0, 0)], Some(4)), vec![4, 0, 0]);
+
+        // Nothing measured the pool: every queue takes a slice, as before. A
+        // shared remainder here would admit nothing once the backlog passed one
+        // slice, which is the halt the ceiling branch exists to avoid.
+        let unmeasured = admissions_by_lane([(2_024, 0), (2_024, 1_729), (7, 0)], None, 200);
+        assert_eq!(
+            unmeasured.iter().map(|a| a.jobs).collect::<Vec<_>>(),
+            vec![200, 200, 7]
+        );
+        assert!(unmeasured.iter().all(|a| a.bound == PassBound::Ceiling));
     }
 
     fn bound_of(window_jobs: Option<u64>) -> PassBound {
