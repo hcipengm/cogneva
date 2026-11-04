@@ -93,12 +93,21 @@ pub fn replan_id(project: &str, index: PerformanceIndex, revision: &str, attempt
     format!("{ID_PREFIX}-{}-{}", index.code(), &hex.as_str()[..16])
 }
 
+/// 这一行是不是回注出来的重规划任务（按类型认，不看它说的是哪一版）。
+///
+/// 与 [`is_replan_for`] 分开：那个问「是不是这一版基线的这一处越界」，这个只问
+/// 「它是不是一张重规划单」。基线版本的算法要跳过重规划自己的计划行，用的就是
+/// 这一个——它不需要（也不该）知道具体是哪一版。
+pub fn is_replan_task(task: &Task) -> bool {
+    matches!(&task.task_type, TaskType::Custom(kind) if kind == REPLAN_TASK_KIND)
+}
+
 /// 这一行是不是给（项目、指数、基线版本）这处越界造的重规划。
 ///
 /// 按输入里记的三格认，不按 id 认：id 里只有一段摘要，读不出它说的是哪一版；
 /// 而将来如果有人手工补一条同形状的行，按输入认也能认出重复。
 pub fn is_replan_for(task: &Task, project: &str, index: PerformanceIndex, revision: &str) -> bool {
-    if !matches!(&task.task_type, TaskType::Custom(kind) if kind == REPLAN_TASK_KIND) {
+    if !is_replan_task(task) {
         return false;
     }
     let Some(facts) = task.input.get(REPLAN_INPUT_KEY) else {

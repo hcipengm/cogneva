@@ -332,21 +332,39 @@ impl cog_core::ReplanMinter for OrchestratorControlImpl {
 /// 取最新而不是取最早的：重规划写下的是一版新基线，判「这一版有没有过重规划」
 /// 要问的是最新那一版。按 `updated_at` 而不是按 `baseline_rev` 的字符串比——
 /// 后者是时间戳文本，字符串序只在同一格式同一时区下才对得上。
+///
+/// **重规划自己的计划行不参与**：每造一条新活，排期都会给它写一行形如
+/// `estimate/work-time-v1/<kind>/n<N>/<当前时刻>` 的计划。重规划单也是新活，
+/// 于是它一被造出来就把这个项目的「当前基线版本」推走一次，而下一轮拿去重比
+/// 的正是这个键——上一轮造的那条永远认不出来（`attempt` 恒为 1），
+/// `MAX_ATTEMPTS` 三条上限也永远够不到，每轮都再造一条。实测 2026-11-04 一个
+/// 项目三小时造了 62 条重规划，`attempt` 全是 1，图上排队的行里一半是它们。
+///
+/// 跳过它也不是放弃「交了货的基线要往前走」：交付物是**别的**任务（重规划自己
+/// 的工期不是这个项目的计划），那些行照样把版本推走，下一版仍是新的一轮。
 fn current_revisions(
     tasks: &[Task],
     plans: &[cog_core::TaskPlan],
 ) -> std::collections::BTreeMap<String, String> {
     use std::collections::BTreeMap;
-    let project_of: BTreeMap<&str, &str> = tasks
+    let project_of: BTreeMap<&str, (&str, bool)> = tasks
         .iter()
-        .map(|t| (t.id.as_str(), t.project_key()))
+        .map(|t| {
+            (
+                t.id.as_str(),
+                (t.project_key(), crate::replan::is_replan_task(t)),
+            )
+        })
         .collect();
     let mut latest: BTreeMap<String, (&chrono::DateTime<chrono::Utc>, &str)> = BTreeMap::new();
     for plan in plans {
-        let Some(project) = project_of.get(plan.task_id.as_str()) else {
+        let Some(&(project, is_replan)) = project_of.get(plan.task_id.as_str()) else {
             // 计划行比任务行活得久（任务归档了），它说不出这个项目现在是哪一版。
             continue;
         };
+        if is_replan {
+            continue;
+        }
         let entry = latest
             .entry(project.to_string())
             .or_insert((&plan.updated_at, plan.baseline_rev.as_str()));
@@ -358,4 +376,125 @@ fn current_revisions(
         .into_iter()
         .map(|(project, (_, rev))| (project, rev.to_string()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use cog_core::{BreachReport, PerformanceIndex, TaskPlan, TaskType};
+
+    /// 一次越界：项目、指数、读数。去重与造活都只读这几格。
+    fn breach(project: &str) -> BreachReport {
+        BreachReport {
+            project: project.to_string(),
+            index: PerformanceIndex::Schedule,
+            measured: 0.62,
+            earned: 6_200,
+            against: 10_000,
+        }
+    }
+
+    fn row(id: &str, project: &str, kind: &str) -> Task {
+        let mut task = Task::new(id, TaskType::Custom(kind.into()), serde_json::json!({}));
+        task.goal_id = Some(project.to_string());
+        task
+    }
+
+    /// 一条计划行。`at` 的先后就是「哪一版更新」的判据。
+    fn plan_of(task_id: &str, rev: &str, at: i64) -> TaskPlan {
+        TaskPlan {
+            workspace_id: "ws-replan-key".into(),
+            task_id: task_id.into(),
+            planned_start: None,
+            planned_end: None,
+            budget_tokens: 1,
+            baseline_rev: rev.into(),
+            updated_at: chrono::Utc.timestamp_opt(at, 0).unwrap(),
+        }
+    }
+
+    /// 重规划单自己排期的那一行，不许把「它将被拿去比对的基线」推走。
+    ///
+    /// 每造一条新活，排期都会写一行新的计划（`baseline_rev` 带着当下时刻）。
+    /// 重规划单也是新活：认它的话，第二轮读到的基线已经是它自己那一行，
+    /// 上一轮造的那条按 `is_replan_for` 永远认不出来——`attempt` 每轮都从 1
+    /// 起算，三条上限永远够不到。实测 2026-11-04 一个项目三小时造了 62 条
+    /// 重规划，`attempt` 全是 1。
+    #[test]
+    fn the_ticket_it_just_minted_does_not_move_the_baseline_it_will_be_judged_against() {
+        const PROJECT: &str = "change-ledger:crates";
+        const WORK: &str = "change-row-1";
+
+        // 工作行挂在根下面：一个项目只能有一条根行，多一条就成了「两条根，
+        // 挑哪条都是猜」——那与这里要问的基线版本是两件事。
+        let mut work_row = row(WORK, PROJECT, "change_ledger");
+        work_row.parent_task_id = Some("goal-root".into());
+        let mut tasks = vec![row("goal-root", PROJECT, "goal"), work_row];
+        let mut plans = vec![plan_of(
+            WORK,
+            "estimate/work-time-v1/change_ledger/n9/2026-11-04T12:26:47Z",
+            1_793_094_407,
+        )];
+        let found = breach(PROJECT);
+        let first_wake = chrono::Utc.timestamp_opt(1_793_125_279, 0).unwrap();
+
+        let revision = current_revisions(&tasks, &plans)
+            .remove(PROJECT)
+            .expect("有基线");
+        let first = match crate::replan::replan_task(&found, &revision, &tasks, first_wake) {
+            crate::replan::Decision::Mint(task) => *task,
+            other => panic!("第一轮就该造出一条：{other:?}"),
+        };
+
+        // 造出来之后，排期给它写了计划：时间比工作行更晚，也就是「项目的
+        // updated_at 最新的一行」换成了它自己。
+        tasks.push(first.clone());
+        plans.push(plan_of(
+            &first.id,
+            "estimate/work-time-v1/replan/n1/2026-11-04T21:07:59Z",
+            1_793_125_279,
+        ));
+
+        let revision = current_revisions(&tasks, &plans)
+            .remove(PROJECT)
+            .expect("有基线");
+        match crate::replan::replan_task(
+            &found,
+            &revision,
+            &tasks,
+            first_wake + chrono::Duration::seconds(60),
+        ) {
+            crate::replan::Decision::AlreadyMinted { task_id, open } => {
+                assert_eq!(task_id, first.id, "认出的是刚造的那一条");
+                assert!(open, "它还没走完，第二轮该等它而不是再造一条");
+            }
+            other => panic!(
+                "重规划自己的估算行把基线推走了，于是上一轮那条认不出来、又造了一条：{other:?}"
+            ),
+        }
+    }
+
+    /// 跳过重规划的行不等于放弃「交了货就是一版新基线」：别的任务排的新计划
+    /// 照样把版本推走，下一版仍是一轮新的尝试。
+    #[test]
+    fn an_estimate_from_any_other_task_still_moves_the_baseline() {
+        const PROJECT: &str = "change-ledger:crates";
+        let tasks = vec![
+            row("goal-root", PROJECT, "goal"),
+            row("change-row-1", PROJECT, "change_ledger"),
+            row("change-row-2", PROJECT, "change_ledger"),
+        ];
+        let plans = vec![
+            plan_of("change-row-1", "rev-old", 1_000),
+            plan_of("change-row-2", "rev-new", 2_000),
+        ];
+        assert_eq!(
+            current_revisions(&tasks, &plans)
+                .get(PROJECT)
+                .map(String::as_str),
+            Some("rev-new"),
+            "真交付留下的新计划仍然是这个项目当前的那一版"
+        );
+    }
 }
