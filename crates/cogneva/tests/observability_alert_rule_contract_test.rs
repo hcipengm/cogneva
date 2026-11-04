@@ -977,6 +977,15 @@ const PRODUCED: &[(&str, &str)] = &[
         "llm_usage_readings_total",
         "crates/cog-gateway/src/security_gateway.rs",
     ),
+    // The quota cells' projection: 0 or 1 per pass and per axis, written by the
+    // loop that rewrites the cells from the ledger. The loop's beat is stamped
+    // before its body runs, so a loop that cannot read the ledger looks alive on
+    // the liveness family; this is the cell that says the projection itself did
+    // not answer.
+    (
+        "llm_quota_projection_failed",
+        "crates/cog-gateway/src/security_gateway.rs",
+    ),
     // Five more found the same way. Each one's own help text says what to read
     // it with or what its non-zero means, and none of them was read.
     //
@@ -3350,6 +3359,15 @@ fn loop_cadences() -> Vec<LoopCadence> {
             config_path: &["self_evolution", "baseline_port", "poll_interval_secs"],
             default_secs: cog_reflection::BaselinePortConfig::default().poll_interval_secs,
             floor_secs: cog_reflection::baseline_port::MIN_POLL_INTERVAL_SECS,
+        },
+        // 节奏是网关里的常量而不是部署配置：投影滞后是这条循环的定义，不是
+        // 一个按部署调的旋钮。`config_path` 因此没有段可走，取默认值即常量本身。
+        LoopCadence {
+            rule: "quota_projection_failing_every_pass",
+            series: "llm_quota_projection_failed",
+            config_path: &[],
+            default_secs: cog_gateway::security_gateway::QUOTA_PROJECTION_PERIOD.as_secs(),
+            floor_secs: 1,
         },
         LoopCadence {
             rule: "memory_schema_repair_passes_all_failed",

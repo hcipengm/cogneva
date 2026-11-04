@@ -1818,6 +1818,25 @@ const GAUGE_HELP: &[(&str, &str)] = &[
          identical. Written on every pass",
     ),
     (
+        "llm_quota_projection_failed",
+        "Whether the last pass of the loop that rewrites the quota cells from \
+         the token ledger could not complete, 1 or 0, labelled by `axis`: \
+         `person` is the per-person daily cell a call is judged against, `task` \
+         the per-task one. Written on every pass, so the window minimum over it \
+         says every pass failed rather than that one did. The cells are a \
+         projection of the ledger, not a second book, which means the ceiling \
+         that refuses a caller reads a number only this loop can update -- and \
+         the loop's own liveness reading is stamped before its body runs, so a \
+         loop that ticks and cannot read the ledger is indistinguishable there \
+         from one with nothing to do. Absent for an axis this deployment does \
+         not configure (no hierarchy manager, no task budget gate): that is a \
+         deployment without that ceiling, not a failed projection. This gauge \
+         lives on the durable surface, where a value that did not move is \
+         rewritten only on the writer's half-hour heartbeat, so a rule taking a \
+         window over it must be longer than that heartbeat or it would read a \
+         healthy writer as silent",
+    ),
+    (
         "metrics_retired_rows_removed",
         "Rows of retired metric names the last release pass deleted, labelled \
          by the table they came from and by the deployment that ran the pass. \

@@ -1796,6 +1796,12 @@ pub const DURABLE_POOL_GAUGES: &[cog_core::MetricName] = &[
     // 停了 —— 而停了的写者会让"复位前烧穿"那条判据悄悄变成空表达式。
     cog_core::metric_names::LLM_POOL_WINDOW_SECS,
     cog_core::metric_names::LLM_POOL_WINDOW_START_UNIX,
+    // 额度格子的投影循环每拍写的结局。它比进程活得久的理由与上面那一族不同一
+    // 点点：池读数的反面是「这一代进程看见的池」，而这一条的反面是「格子最后一次
+    // 被账本重算过」——网关换代时格子留在 Redis 里，若这一条随进程消失，新一代
+    // 起来的头几十秒里「格子是旧的」这件事就没有任何读数说得出，而那正是新进程
+    // 还没跑满一拍的时间窗。
+    cog_core::metric_names::LLM_QUOTA_PROJECTION_FAILED,
 ];
 
 /// 一次共享写的上界。这条路径在池状态发布循环里（不是请求路径），但循环一停
@@ -1812,8 +1818,9 @@ const DURABLE_GAUGE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// 换自己每条 tick 一行，而一条 gauge 的耐久面要的是"最后一个值还在"，不是"每拍
 /// 都留一行"。写失败不更新记录 ⇒ 下一拍自动重试。
 ///
-/// 只覆盖池状态发布循环里的 gauge。请求路径上的计数器不走这里：那条路上不经任何
-/// 外部存储，是网关"始终可用"这条边界的原话。
+/// 覆盖进程里自己发起的读数循环所写的 gauge（池状态发布、额度格子投影）。请求
+/// 路径上的计数器不走这里：那条路上不经任何外部存储，是网关"始终可用"这条边界的
+/// 原话。
 struct DurableGauges {
     metrics: Arc<dyn MetricsBackend>,
     /// 序列 → 上一次写成功的值与时刻。缺席 = 这个序列还没写成功过（含刚启动）。
@@ -5985,7 +5992,10 @@ pub const QUOTA_PROJECTION_LOOP: &str = "gateway_quota_projection";
 /// 不能为 0（那样每一发都要连一次库），也不该更大——一天的额度是粗控，半分钟
 /// 的滞后远小于一次普通运行的花销。
 // cap: bound — 是投影滞后的上界不是旋钮；更短就要每发连库，更长就放跑了超额
-const QUOTA_PROJECTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+//
+// 公开是为了让读这条循环结局的告警规则按它自己的节拍取窗口：窗口写死一个数、
+// 而节拍改了，规则会在每一轮里只覆盖其中的一小段（或者跨了好几轮）。
+pub const QUOTA_PROJECTION_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// 额度格子投影循环：把今天按人与按任务花的 token 从账本重算一遍，覆盖到格子上。
 fn spawn_quota_projection(state: AppState) -> tokio::task::JoinHandle<()> {
@@ -6002,7 +6012,8 @@ fn spawn_quota_projection(state: AppState) -> tokio::task::JoinHandle<()> {
                 loop {
                     beat.beat();
                     ticker.tick().await;
-                    project_quota_usage(&state).await;
+                    let outcome = project_quota_usage(&state).await;
+                    report_projection_outcome(&state, outcome).await;
                 }
             }
         },
@@ -6019,29 +6030,34 @@ fn spawn_quota_projection(state: AppState) -> tokio::task::JoinHandle<()> {
 ///
 /// 读不出来就维持上一拍的值并告警：清零会让所有人当天的额度凭空回满，那是把
 /// 一次读故障变成一次放行。
-async fn project_quota_usage(state: &AppState) {
+async fn project_quota_usage(state: &AppState) -> QuotaProjectionOutcome {
     let Some(ledger) = state.pool_obs.usage.as_ref() else {
-        return;
+        return QuotaProjectionOutcome::default();
     };
     let now_unix = chrono::Utc::now().timestamp();
     let since = cog_core::day::day_start_unix(now_unix);
 
-    if let Some(hierarchy) = state.owner_budget.as_ref() {
-        match ledger.spend_by_person_since(since).await {
+    let person = match state.owner_budget.as_ref() {
+        None => AxisOutcome::NotConfigured,
+        Some(hierarchy) => match ledger.spend_by_person_since(since).await {
             Ok(people) => project_person_spend(hierarchy.as_ref(), &people).await,
             Err(e) => {
                 tracing::warn!(
                     error = %e,
                     "按人额度：这一拍读不出账本，格子维持上一拍的值"
                 );
+                AxisOutcome::Failed
             }
-        }
-    }
+        },
+    };
 
     // 任务那一格同一件事，只是域不同：格子的集合由「有人声明过预算」给出，没人
     // 声明过的任务没有格子可写——替它建一个，等于把「没人管」写成「额度为零」。
     let Some(gate) = state.task_budget.as_ref() else {
-        return;
+        return QuotaProjectionOutcome {
+            person,
+            ..Default::default()
+        };
     };
     let budgeted = match gate.budgeted_tasks().await {
         Ok(ids) => ids,
@@ -6050,7 +6066,10 @@ async fn project_quota_usage(state: &AppState) {
                 error = %e,
                 "按任务预算：这一拍读不出名册，格子维持上一拍的值"
             );
-            return;
+            return QuotaProjectionOutcome {
+                person,
+                task: AxisOutcome::Failed,
+            };
         }
     };
     let spent = match ledger.spend_by_task_since(&budgeted, since).await {
@@ -6060,10 +6079,39 @@ async fn project_quota_usage(state: &AppState) {
                 error = %e,
                 "按任务预算：这一拍读不出账本，格子维持上一拍的值"
             );
-            return;
+            return QuotaProjectionOutcome {
+                person,
+                task: AxisOutcome::Failed,
+            };
         }
     };
-    project_task_spend(gate.as_ref(), &budgeted, &spent, now_unix).await;
+    let task = project_task_spend(gate.as_ref(), &budgeted, &spent, now_unix).await;
+    QuotaProjectionOutcome { person, task }
+}
+
+/// 一拍投影在一根轴上的结局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AxisOutcome {
+    /// 这个部署没有这根轴（没配层级管理器／任务预算门）：没有要更新的格子，
+    /// 也就没有可失败的东西。写 0 会把「这个上限不存在」读成「它刚更新过」。
+    NotConfigured,
+    Ok,
+    /// 这一拍没能把每个格子都重算并写回。格子留着上一拍的值——那可能已经不是
+    /// 今天的数了——而判定照旧读它。
+    Failed,
+}
+
+/// 一拍投影里两根轴各自的结局。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct QuotaProjectionOutcome {
+    person: AxisOutcome,
+    task: AxisOutcome,
+}
+
+impl Default for AxisOutcome {
+    fn default() -> Self {
+        AxisOutcome::NotConfigured
+    }
 }
 
 /// 把 `(person, tokens)` 覆盖写到各自的额度格子上。
@@ -6073,7 +6121,8 @@ async fn project_quota_usage(state: &AppState) {
 async fn project_person_spend(
     hierarchy: &dyn cog_core::HierarchyManager,
     people: &[(String, u64)],
-) {
+) -> AxisOutcome {
+    let mut outcome = AxisOutcome::Ok;
     for (person, tokens) in people {
         if let Err(e) = hierarchy
             .set_used(cog_core::QuotaScope::User, person, *tokens)
@@ -6085,8 +6134,10 @@ async fn project_person_spend(
                 error = %e,
                 "按人额度：这一拍没写进格子，下一拍照旧重算"
             );
+            outcome = AxisOutcome::Failed;
         }
     }
+    outcome
 }
 
 /// 把每件**声明过预算**的任务今天的花销覆盖写到它自己的格子上。
@@ -6099,11 +6150,12 @@ async fn project_task_spend(
     budgeted: &[String],
     spent: &[(String, u64)],
     now_unix: i64,
-) {
+) -> AxisOutcome {
     let by_task: std::collections::HashMap<&str, u64> = spent
         .iter()
         .map(|(id, tokens)| (id.as_str(), *tokens))
         .collect();
+    let mut outcome = AxisOutcome::Ok;
     for task_id in budgeted {
         let tokens = by_task.get(task_id.as_str()).copied().unwrap_or(0);
         if let Err(e) = gate.set_spent(task_id, tokens, now_unix).await {
@@ -6113,7 +6165,35 @@ async fn project_task_spend(
                 error = %e,
                 "按任务预算：这一拍没写进格子，下一拍照旧重算"
             );
+            outcome = AxisOutcome::Failed;
         }
+    }
+    outcome
+}
+
+/// 把这一拍每根轴的结局落到读数上：失败 1、成功 0，每拍都写。
+///
+/// 这条读数是格子背后那件事唯一能被人看见的地方。循环的 beat 在拍首盖章，不管
+/// 这一拍读没读成，所以「活着但每拍都失败」在存活读数上与「无事可做」同形：格子
+/// 停在上一拍的值，判定照旧按它拦人，日志随 Pod 一起消失，也答不出「这样多久了」。
+///
+/// 没配的轴不写：那是「这个部署没有这道上限」，与「刚更新过」是两件事，写成 0
+/// 会把前者读成后者。每拍都写，所以窗口最小值说「每一拍都失败」，而一次瞬时故障
+/// 不会被读成持续故障。
+async fn report_projection_outcome(state: &AppState, outcome: QuotaProjectionOutcome) {
+    for (axis, outcome) in [("person", outcome.person), ("task", outcome.task)] {
+        let failed = match outcome {
+            AxisOutcome::NotConfigured => continue,
+            AxisOutcome::Ok => false,
+            AxisOutcome::Failed => true,
+        };
+        record_gauge(
+            state,
+            cog_core::metric_names::LLM_QUOTA_PROJECTION_FAILED,
+            if failed { 1.0 } else { 0.0 },
+            &[("axis", axis)],
+        )
+        .await;
     }
 }
 
@@ -18203,6 +18283,260 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             gate.projected.lock().unwrap().as_slice(),
             &[("t-1".to_string(), 500), ("t-2".to_string(), 0)],
             "名册上的每一件都写一次，账上没有花销的那件写 0；名册外的 t-9 不写"
+        );
+    }
+
+    /// 只回答投影问的那几问的账本替身；其余入口在测试里不会被走到。
+    ///
+    /// 每一条都写出来而不是靠默认实现：这些入口没有默认实现，而「读路由悄悄走了
+    /// 一条写」正是这个替身该当场炸掉的形状。
+    struct StubLedger {
+        people: Vec<(String, u64)>,
+        by_task: Vec<(String, u64)>,
+        failing: bool,
+    }
+
+    impl StubLedger {
+        fn with(people: &[(&str, u64)], by_task: &[(&str, u64)]) -> Self {
+            Self {
+                people: people
+                    .iter()
+                    .map(|(id, tokens)| ((*id).to_string(), *tokens))
+                    .collect(),
+                by_task: by_task
+                    .iter()
+                    .map(|(id, tokens)| ((*id).to_string(), *tokens))
+                    .collect(),
+                failing: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                failing: true,
+                ..Self::with(&[], &[])
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::LlmUsageLedger for StubLedger {
+        async fn record(&self, _: &cog_core::LlmUsageRecord) -> Result<(), String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn record_exchange(&self, _: &cog_core::LlmExchangeRecord) -> Result<(), String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn upstream_window(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<cog_core::UpstreamWindowReading, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn burned_between(&self, _: &str, _: i64, _: i64) -> Result<u64, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn record_window(&self, _: &cog_core::StoredWindow) -> Result<(), String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn stored_window(
+            &self,
+            _: &str,
+            _: u64,
+        ) -> Result<Option<cog_core::StoredWindow>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn stored_windows(&self, _: &str) -> Result<Vec<cog_core::StoredWindow>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn spent_since(&self, _: &str, _: i64) -> Result<u64, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn spend_by_actor_since(
+            &self,
+            _: i64,
+        ) -> Result<(u64, std::collections::BTreeMap<String, u64>), String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn spend_by_upstream_and_actor(
+            &self,
+        ) -> Result<Vec<cog_core::UpstreamActorSpend>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn task_cost_quantile(
+            &self,
+            _: i64,
+            _: f64,
+        ) -> Result<Option<(u64, u64, i64)>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn task_has_started(&self, _: &str) -> Result<bool, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn spend_by_task(&self, _: &[String]) -> Result<Vec<(String, u64)>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn spend_by_person_since(&self, _: i64) -> Result<Vec<(String, u64)>, String> {
+            if self.failing {
+                return Err("账本连不上".into());
+            }
+            Ok(self.people.clone())
+        }
+        async fn spend_by_task_since(
+            &self,
+            task_ids: &[String],
+            _: i64,
+        ) -> Result<Vec<(String, u64)>, String> {
+            if self.failing {
+                return Err("账本连不上".into());
+            }
+            Ok(self
+                .by_task
+                .iter()
+                .filter(|(id, _)| task_ids.contains(id))
+                .cloned()
+                .collect())
+        }
+        async fn task_submitter(&self, _: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        async fn unattributed_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<u64, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn outcomes_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::OutcomeCount>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn metering_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::MeteringCount>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn skips_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::SkippedWorkLine>, String> {
+            unimplemented!("projection stand-in")
+        }
+        async fn verdicts_between(
+            &self,
+            _: chrono::DateTime<chrono::Utc>,
+            _: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<cog_core::SpendVerdictLine>, String> {
+            unimplemented!("projection stand-in")
+        }
+    }
+
+    /// 把账本与两根轴挂到状态上，返回可读回的读数面。
+    fn state_with_projection(
+        ledger: StubLedger,
+        person_axis: bool,
+        task_axis: bool,
+    ) -> (AppState, Arc<ScrapeRecorder>) {
+        let metrics = Arc::new(ScrapeRecorder::default());
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        let write_health = state.pool_obs.usage_write_health.clone();
+        state.pool_obs = Arc::new(PoolObservability {
+            metrics: metrics.clone(),
+            analytics: None,
+            alerts: None,
+            usage: Some(Arc::new(ledger)),
+            usage_write_health: write_health,
+            durable: None,
+        });
+        if person_axis {
+            state.owner_budget = Some(Arc::new(StubHierarchy::new(&[])));
+        }
+        if task_axis {
+            state.task_budget = Some(Arc::new(
+                StubBudgetGate::new(budgeted(false, 0, 1000)).with_tasks(&["t-1"]),
+            ));
+        }
+        (state, metrics)
+    }
+
+    /// 读不出账本的一拍要在读数上留下失败，而不是只留一条随 Pod 消失的日志。
+    ///
+    /// 存活读数看不见它：beat 在拍首盖章，读没读成都会盖。而格子停在上一拍的值，
+    /// 判定照旧按那个数拦人——「循环活着且每拍都读不到账本」与「无事可做」在别的
+    /// 读数上逐字同形。
+    #[tokio::test]
+    async fn a_pass_that_cannot_read_the_ledger_reports_failure_on_that_axis() {
+        let (state, metrics) = state_with_projection(StubLedger::failing(), true, false);
+
+        let outcome = project_quota_usage(&state).await;
+        assert_eq!(
+            outcome.person,
+            AxisOutcome::Failed,
+            "账本读不出来，这一拍就不是一次成功的投影"
+        );
+        assert_eq!(
+            outcome.task,
+            AxisOutcome::NotConfigured,
+            "这个部署没配任务预算门：那是没有这道上限，不是一次失败"
+        );
+        report_projection_outcome(&state, outcome).await;
+
+        let samples =
+            metrics.matching(cog_core::metric_names::LLM_QUOTA_PROJECTION_FAILED.as_str());
+        assert_eq!(
+            samples.len(),
+            1,
+            "只配了人这一根轴，读数里就只有这一格：给没配的轴写 0 会把「没有上限」\
+             读成「刚更新过」"
+        );
+        assert_eq!(samples[0].value, 1.0);
+        assert_eq!(
+            samples[0].labels.get("axis").map(String::as_str),
+            Some("person")
+        );
+    }
+
+    /// 读成了的一拍写 0：读数要能自己清掉，否则一条瞬时故障会把它永久点亮。
+    #[tokio::test]
+    async fn a_pass_that_reads_the_ledger_reports_zero_and_clears_the_previous_failure() {
+        let (state, metrics) = state_with_projection(
+            StubLedger::with(&[("u-1", 1200)], &[("t-1", 500)]),
+            true,
+            true,
+        );
+
+        let outcome = project_quota_usage(&state).await;
+        assert_eq!(
+            outcome,
+            QuotaProjectionOutcome {
+                person: AxisOutcome::Ok,
+                task: AxisOutcome::Ok
+            }
+        );
+        report_projection_outcome(&state, outcome).await;
+
+        let samples =
+            metrics.matching(cog_core::metric_names::LLM_QUOTA_PROJECTION_FAILED.as_str());
+        let axes: Vec<(&str, f64)> = samples
+            .iter()
+            .map(|s| {
+                (
+                    s.labels.get("axis").map(String::as_str).unwrap_or(""),
+                    s.value,
+                )
+            })
+            .collect();
+        assert_eq!(
+            axes,
+            vec![("person", 0.0), ("task", 0.0)],
+            "两根轴都配了、都读成了：每拍各写一个 0"
         );
     }
 

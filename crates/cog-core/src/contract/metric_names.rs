@@ -275,6 +275,24 @@ metric_names! {
     LLM_USAGE_UNCOVERED_OLDEST_AGE_SECONDS => "cogneva_llm_usage_uncovered_oldest_age_seconds",
     LLM_USAGE_SWEEP_FAILED => "cogneva_llm_usage_sweep_failed",
 
+    // cog-gateway — the quota-cells projection loop's per-pass outcome, by
+    // `axis` (`person` or `task`): 0 for a pass that rewrote every cell from the
+    // ledger, 1 for one that could not.
+    //
+    // The ceiling that refuses a caller is judged against a cell that is
+    // *computed* from this ledger, and the computation is a loop. That loop's
+    // liveness has a reader -- `cogneva_loop_tick_age_seconds{loop="gateway_quota_projection"}`
+    // -- but the beat is stamped before the body runs, so a loop that ticks and
+    // cannot read the ledger is indistinguishable there from one with nothing to
+    // do: every pass fails, the cells keep yesterday's number, and the ceiling
+    // keeps judging a number nobody can update. That failure reached a `warn!`
+    // that dies with the pod. This is the missing face, one cell per axis,
+    // because the two axes read different queries and either can fail alone. A
+    // cell is written on every pass, so the window minimum (not the maximum)
+    // says "every pass failed"; an axis this deployment does not configure
+    // writes nothing at all, which is not a failure.
+    LLM_QUOTA_PROJECTION_FAILED => "llm_quota_projection_failed",
+
     // cog-storage — the monthly partition maintenance loop's per-round outcome.
     //
     // The loop keeps every time-series parent's window open ahead of the clock
