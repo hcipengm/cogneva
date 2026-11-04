@@ -2151,11 +2151,20 @@ fn identity_signoff(identity: &BotIdentityConfig) -> String {
 
 /// Whitelist gate for the paths a change may write. Every path the diff
 /// touches must fall inside a surface this platform knows how to judge:
-/// Rust sources under `crates/**/src/`, files under `prompts/`, the
-/// deployment topology under `deploy/`, or the root README/CHANGELOG.
+/// Rust sources under `crates/**/src/`, the crate's own integration tests
+/// under `crates/**/tests/`, files under `prompts/`, the deployment topology
+/// under `deploy/`, or the root README/CHANGELOG.
 /// Everything else — credentials, evaluation data, unrelated configs — is
 /// hard-rejected before anything is pushed. A diff from which no paths can be
 /// parsed is rejected as well (fail closed).
+///
+/// `tests/` is in the list beside `src/` for the same reason `deploy/` is:
+/// a change this platform is asked to make is often a check that only exists
+/// once someone writes it, and the crate's integration-test directory is where
+/// the workspace puts such checks. Refusing it did not make a change safer --
+/// cargo compiles and CI runs a file there exactly as it does one under src/ --
+/// it only sent that work to a surface the house rule does not name, and
+/// retired changes whose whole content was the missing check.
 ///
 /// `deploy/` is in the list because the topology is part of what this platform
 /// evolves: leaving it out did not keep the manifests safer, it only meant a
@@ -2169,8 +2178,8 @@ pub fn ensure_contribution_allowed(diff: &str) -> Result<()> {
     } else {
         Err(CogGitHubError::PrivacyRejected(format!(
             "change touches non-contributable paths: {} \
-             (whitelist: crates/<workspace member>/src/**/*.rs, prompts/**, \
-             deploy/**, root README/CHANGELOG)",
+             (whitelist: crates/<workspace member>/{{src,tests}}/**/*.rs, \
+             prompts/**, deploy/**, root README/CHANGELOG)",
             denied.join(", ")
         )))
     }
@@ -2205,18 +2214,22 @@ fn is_allowed_path(path: &str) -> bool {
     let p = path.strip_prefix("./").unwrap_or(path);
 
     if let Some(rest) = p.strip_prefix("crates/") {
-        // crates/<crate>/src/<...>.rs — the crate segment has to name a
-        // workspace member, the src segment is mandatory, and the final path
-        // segment must be a Rust source file. The membership test is what keeps
-        // the shape from being the whole rule: `crates/<anything>/src/x.rs`
-        // satisfies every other condition while naming a directory no compiler
-        // is pointed at, which is how a file comes to read as landed while
-        // nothing ever builds it.
+        // crates/<crate>/{src,tests}/<...>.rs — the crate segment has to name a
+        // workspace member, the second segment has to be one of the two
+        // directories cargo compiles, and the final path segment must be a Rust
+        // source file. The membership test is what keeps the shape from being
+        // the whole rule: `crates/<anything>/src/x.rs` satisfies every other
+        // condition while naming a directory no compiler is pointed at, which
+        // is how a file comes to read as landed while nothing ever builds it.
+        // The same reading covers both directories: cargo builds `tests/` with
+        // the member and CI runs what it builds, so a file there is judged by
+        // the same compiler as one under `src/`.
         let mut segs = rest.split('/');
         let Some(crate_dir) = segs.next().filter(|s| !s.is_empty()) else {
             return false;
         };
-        if segs.next() != Some("src") || !is_a_workspace_member(crate_dir) {
+        if !matches!(segs.next(), Some("src") | Some("tests")) || !is_a_workspace_member(crate_dir)
+        {
             return false;
         }
         return matches!(segs.next_back(), Some(file) if file.ends_with(".rs"));
@@ -2643,6 +2656,29 @@ mod tests {
         assert!(is_allowed_path("CHANGELOG.md"));
     }
 
+    /// 一条变更常常就是「缺的那个检查」本身，而检查住在 crate 的 `tests/` 里。
+    /// 这条判据只认能编译成测试的那一类文件：目录要在 workspace 成员下、文件要是
+    /// `.rs`——cargo 连成员一起编译 `tests/`，CI 跑它编出来的东西，所以它与
+    /// `src/` 下的文件由同一个编译器判。夹具、数据、别处的 `tests/` 依旧拒。
+    #[test]
+    fn whitelist_carries_a_members_own_integration_tests() {
+        for path in [
+            "crates/cog-github/tests/it.rs",
+            "crates/cogneva/tests/principle_ledger.rs",
+            "./crates/cog-orchestrator/tests/deep/one.rs",
+        ] {
+            assert!(is_allowed_path(path), "should allow {path}");
+        }
+        for path in [
+            "crates/cog-github/tests/fixtures/payload.json",
+            "crates/cog-github/tests",
+            "crates/not_a_workspace_member/tests/it.rs",
+            "tests/it.rs",
+        ] {
+            assert!(!is_allowed_path(path), "should deny {path}");
+        }
+    }
+
     /// 拓扑也是这个平台自己要演进的东西。
     ///
     /// 这里断言的是**通道存在**：`deploy/**` 的文件进得了落地流程。它该不该落
@@ -2672,7 +2708,7 @@ mod tests {
     fn whitelist_rejects_private_infra_config_and_secrets() {
         let denied = [
             ".github/workflows/release.yml",
-            "crates/cog-github/tests/it.rs",
+            "crates/cog-github/tests/fixtures/payload.json",
             "Cargo.toml",
             "cogneva.json",
             "secrets/id_rsa",
