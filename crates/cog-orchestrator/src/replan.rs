@@ -183,6 +183,14 @@ pub fn replan_task(
         TaskType::Custom(REPLAN_TASK_KIND.to_string()),
         serde_json::json!({
             "goal": goal_sentence(breach, revision),
+            // 这条活读的是项目的绩效指数，不是某一条变更账行：同一个项目下可以有
+            // 几十条变更，而它要回答的是「这整个项目的产能哪里漏了」。它也不该
+            // 继承项目下任何一条变更的身份——那会把一条面向项目的活记到某条恰好
+            // 排在前面的变更头上，而那一行的状态从此成了这条活的判据。
+            //
+            // 没有这一格的话，它与「绑定在树上某一步断了」在任务行上完全同形：
+            // 两者都只是没有 `change_identity`。前者本来就该没有，后者要去补。
+            (crate::change_ledger::INPUT_ACCOUNT_FREE): true,
             REPLAN_INPUT_KEY: {
                 "project": breach.project,
                 "index": breach.index.code(),
@@ -375,6 +383,29 @@ mod tests {
         assert_eq!(facts["index"], "schedule");
         assert_eq!(facts["gap_tokens"], 3_800);
         assert_eq!(facts["baseline_rev"], REV);
+    }
+
+    /// 这条活有活要干，但不欠任何一条变更，而且它在行上就这么说。
+    ///
+    /// 它读的是整个项目的绩效指数，项目下可能有几十条变更；继承其中任何一条
+    /// 的身份，都会把这条面向项目的活记到一条恰好排在前面的变更头上，那一行
+    /// 的状态从此成了这条活的判据。可是「不继承」与「绑定在树上某一步断了」
+    /// 在任务行上完全同形——两者都只是没有 `change_identity`。所以要明说：
+    /// 没有这一格，账上那一拍没法把「本来就不欠」与「丢了」分开数。
+    #[test]
+    fn a_replanned_task_declares_it_owes_no_change_of_its_own() {
+        let found = breach(PerformanceIndex::Schedule, 0.62, 6_200, 10_000);
+        let task = minted(replan_task(&found, REV, &group(vec![]), at(0)));
+
+        assert_eq!(
+            task.input[crate::change_ledger::INPUT_ACCOUNT_FREE],
+            serde_json::json!(true),
+            "没有这一格，这条活在任务行上与绑定断了的行同形"
+        );
+        assert!(
+            task.input.get(cog_core::INPUT_CHANGE_IDENTITY).is_none(),
+            "它不该继承项目下任何一条变更的身份"
+        );
     }
 
     /// 同一处越界重问一次不产生第二条活：判定侧每一轮都会再报一遍。

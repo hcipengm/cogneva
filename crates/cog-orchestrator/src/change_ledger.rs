@@ -1102,6 +1102,52 @@ fn dispatched_identity(task: &Task) -> Option<ChangeIdentity> {
     ))
 }
 
+/// Set to `true` on a row that has work to do and owes no change, by the code
+/// that minted it.
+///
+/// Absent is not the same answer. A row with neither this nor an identity has
+/// not answered the question, and the two are indistinguishable on the row --
+/// both simply have no `change_identity` -- while they call for opposite
+/// handling: a row that owes nothing is finished as far as the account is
+/// concerned, and a row that lost its binding needs that step repaired before
+/// anything it writes can be attributed. Whoever mints a row answers once, here.
+pub(crate) const INPUT_ACCOUNT_FREE: &str = "account_free";
+
+/// What a row says when asked which change it owes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OwedChange {
+    /// It is the hand-over the account dispatched for this change.
+    HandedOver(ChangeIdentity),
+    /// It has work to do and belongs to no change, and it says so.
+    DeclaredFree,
+    /// It did not answer. Not the same as owing nothing.
+    Unanswered,
+}
+
+fn owed_change(task: &Task) -> OwedChange {
+    if let Some(identity) = dispatched_identity(task) {
+        return OwedChange::HandedOver(identity);
+    }
+    match task.input.get(INPUT_ACCOUNT_FREE) {
+        Some(value) if value.as_bool() == Some(true) => OwedChange::DeclaredFree,
+        _ => OwedChange::Unanswered,
+    }
+}
+
+/// Whether this row is work filed under a hand-over project that owes an
+/// answer and did not give one.
+///
+/// The project's anchor is the one row under a hand-over project that
+/// legitimately has none: it is where work hangs, not work, and it is not
+/// executable.
+fn unanswered_under_handover_project(task: &Task) -> bool {
+    task.goal_id
+        .as_deref()
+        .is_some_and(|project| project.starts_with(DISPATCH_PROJECT_PREFIX))
+        && !matches!(&task.task_type, TaskType::Custom(kind) if kind == DISPATCH_PROJECT_ROOT_KIND)
+        && matches!(owed_change(task), OwedChange::Unanswered)
+}
+
 /// One pass's sweep of hand-over rows the account has already settled.
 ///
 /// The hand-over row lives as long as the graph remembers it, and the account
@@ -1145,6 +1191,16 @@ struct SettledClosures {
     failed: usize,
     /// Settled rows still open after this pass, for the next one to take.
     remaining: usize,
+    /// Rows under a hand-over project that neither name a change nor say they
+    /// belong to none.
+    ///
+    /// The project id says which group a row is in, never which change it owes,
+    /// so the answer has to be written by whatever minted it. A decomposition
+    /// path that forgets leaves rows that read exactly like rows which owe
+    /// nothing -- and the two need opposite handling, one is a break in the
+    /// binding and the other is fine as it is. Counted every pass rather than
+    /// left for somebody to notice by comparing two tables.
+    unanswered: usize,
 }
 
 impl SettledClosures {
@@ -1159,14 +1215,15 @@ impl SettledClosures {
     fn line(&self) -> String {
         format!(
             "closed hand-over rows the account had settled: landed={} retired={} cascaded={} \
-             descendants={} unaccounted={} failed={} remaining={}",
+             descendants={} unaccounted={} failed={} remaining={} unanswered={}",
             self.landed,
             self.retired,
             self.cascaded,
             self.descendants,
             self.unaccounted,
             self.failed,
-            self.remaining
+            self.remaining,
+            self.unanswered
         )
     }
 }
@@ -1294,6 +1351,9 @@ async fn close_settled_dispatch_rows(
                 .entry(parent.to_string())
                 .or_default()
                 .push(task.id.clone());
+        }
+        if unanswered_under_handover_project(&task) {
+            closed.unanswered += 1;
         }
         if !matches!(&task.task_type, TaskType::Custom(kind) if kind == DISPATCH_TASK_KIND) {
             continue;
@@ -4293,6 +4353,19 @@ async fn dispatch_pass(
     if closed.moved_anything() {
         info!("change ledger: {}", closed.line());
     }
+    // Said on its own because it is the opposite case: a decomposition that lost
+    // its binding has nothing to close, so the pass that would otherwise stay
+    // quiet is exactly the pass this reading exists for. A count that only
+    // reached the log when something else moved would be invisible for as long
+    // as the break was the only thing happening.
+    if closed.unanswered > 0 {
+        warn!(
+            unanswered = closed.unanswered,
+            "change ledger: work under a hand-over project never said which change it owes -- \
+             either a decomposition dropped the binding or whatever minted the row has not \
+             declared that it owes none"
+        );
+    }
 
     // Three cases, and the middle one is why this is not one call to
     // `pool_verdict`: no source published at all, a snapshot that says the pool
@@ -6251,6 +6324,125 @@ mod tests {
             retire_reason: None,
             retired_at: None,
         }
+    }
+
+    /// A row under work filed for a project says which change it owes; saying
+    /// nothing is not the same answer as owing nothing.
+    ///
+    /// The absence of a `change_identity` reads the same whichever way it came
+    /// about, so the row has to carry the third answer explicitly or the two
+    /// get confused with each other: work that lost its hand-over would be
+    /// read as work that never had one, and a row that genuinely belongs to no
+    /// change would be chased as a missing binding forever.
+    #[test]
+    fn a_row_that_never_answered_which_change_it_owes_is_not_one_that_owes_none() {
+        let handed_over = dispatch_task(&row(ChangeState::Pending, None), 0);
+        match owed_change(&handed_over) {
+            OwedChange::HandedOver(identity) => {
+                assert_eq!(Some(identity), dispatched_identity(&handed_over))
+            }
+            other => panic!("a hand-over owes the change it was submitted for: {other:?}"),
+        }
+
+        let declared = Task::new(
+            "declared".to_string(),
+            TaskType::Custom("replan".into()),
+            serde_json::json!({ (INPUT_ACCOUNT_FREE): true }),
+        );
+        assert_eq!(
+            owed_change(&declared),
+            OwedChange::DeclaredFree,
+            "一条明说自己不欠账的行就是明说过了"
+        );
+
+        let silent = Task::new(
+            "silent".to_string(),
+            TaskType::Custom("replan".into()),
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            owed_change(&silent),
+            OwedChange::Unanswered,
+            "没有身份也没声明不欠账，是没回答，不是不欠"
+        );
+
+        // The marker is a JSON value in a payload anybody can write, so the
+        // answer counts only in the one spelling that means yes. `"yes"`, `1`
+        // and `null` are all something other than the declared answer, and a
+        // reader that took any truthy value would accept them as one.
+        for spelling in [
+            serde_json::json!("yes"),
+            serde_json::json!(1),
+            serde_json::json!(null),
+        ] {
+            let row = Task::new(
+                "marked".to_string(),
+                TaskType::Custom("replan".into()),
+                serde_json::json!({ (INPUT_ACCOUNT_FREE): spelling.clone() }),
+            );
+            assert_eq!(
+                owed_change(&row),
+                OwedChange::Unanswered,
+                "{spelling} is not the declared answer"
+            );
+        }
+    }
+
+    /// Work hung under a project the account hands changes over into must answer
+    /// the question, and the project's anchor is the one row that legitimately
+    /// does not.
+    ///
+    /// The anchor is where work hangs, not work: nothing reads it as a change
+    /// and nothing runs it, so asking it which change it owes would count every
+    /// project by its own anchor.
+    #[test]
+    fn work_under_a_handover_project_that_owes_nothing_must_say_so() {
+        let project = dispatch_project_key(&row(ChangeState::Pending, None));
+        assert!(project.starts_with(DISPATCH_PROJECT_PREFIX));
+
+        let under = |input: serde_json::Value| {
+            let mut task = Task::new(
+                "child".to_string(),
+                TaskType::Custom("generated".into()),
+                input,
+            );
+            task.goal_id = Some(project.clone());
+            task
+        };
+
+        assert!(
+            unanswered_under_handover_project(&under(serde_json::json!({}))),
+            "项目下的活没说自己欠不欠账，这一拍要把它数出来"
+        );
+        assert!(
+            !unanswered_under_handover_project(&under(
+                serde_json::json!({ (INPUT_ACCOUNT_FREE): true })
+            )),
+            "明说自己不欠账的活是回答过的"
+        );
+
+        let handed_over = dispatch_task(&row(ChangeState::Pending, None), 0);
+        assert_eq!(
+            handed_over.goal_id.as_deref(),
+            Some(project.as_str()),
+            "这个用例的前提：交接行就落在这个项目里"
+        );
+        assert!(
+            !unanswered_under_handover_project(&handed_over),
+            "交接行带着它欠的那条变更"
+        );
+
+        assert!(
+            !unanswered_under_handover_project(&dispatch_project_root_for(&project)),
+            "项目锚点是挂活的地方，不是要被记到某条变更上的活"
+        );
+
+        let mut elsewhere = under(serde_json::json!({}));
+        elsewhere.goal_id = Some("goal-elsewhere".into());
+        assert!(
+            !unanswered_under_handover_project(&elsewhere),
+            "不在交接项目下的行不归这本账问"
+        );
     }
 
     /// A retirement that says another account answered it holds only while that
@@ -8656,6 +8848,17 @@ mod tests {
             self
         }
 
+        /// A row hung under a hand-over project with the payload given: what a
+        /// decomposition of a dispatched change leaves behind, and what the
+        /// same decomposition declares when it owes no change of its own.
+        fn holding_under(self, id: &str, project: &str, input: serde_json::Value) -> Self {
+            let mut task = Task::new(id.to_string(), TaskType::Custom("generated".into()), input);
+            task.goal_id = Some(project.to_string());
+            task.status = TaskStatus::Pending;
+            self.tasks.lock().unwrap().insert(id.to_string(), task);
+            self
+        }
+
         /// A row of some other kind, so a settle's scope can be read: this pass
         /// writes criteria on changes, not on everything the graph holds.
         fn holding_other_kind(self, id: &str, kind: &str) -> Self {
@@ -10204,6 +10407,53 @@ mod tests {
             graph.held("replan-schedule-dead").unwrap().status,
             TaskStatus::Cancelled,
             "挂在已结案行下面的子任务还开着，它会继续为一条结了的变更排队"
+        );
+    }
+
+    /// A pass says out loud how much work under a hand-over project never
+    /// answered which change it owes, and counts it without closing it.
+    ///
+    /// The row and the break look the same from the account's side: neither has
+    /// an identity. Counting is what tells the two apart -- a pass that stayed
+    /// silent let a decomposition lose its binding and nothing said so, and the
+    /// rows would keep being read as work that was never owed a change.
+    #[tokio::test]
+    async fn the_pass_counts_work_under_a_handover_that_never_said_which_change_it_owes() {
+        let handed = pending_row("crates/a/src/handed.rs");
+        let project = dispatch_project_key(&handed);
+        let store = FakeLedger {
+            rows: vec![handed.clone()],
+            ..Default::default()
+        };
+        let graph = Arc::new(
+            FakeGraph::default()
+                .holding_handover(&handed, TaskStatus::Pending)
+                .holding_under("a-decomposition", &project, serde_json::json!({}))
+                .holding_under(
+                    "a-declared-free-row",
+                    &project,
+                    serde_json::json!({ (INPUT_ACCOUNT_FREE): true }),
+                ),
+        );
+        let control: Arc<dyn OrchestratorControl> = graph.clone();
+
+        let closed = close_settled_dispatch_rows(&control, &store, &HashSet::new()).await;
+
+        assert_eq!(
+            closed.unanswered,
+            1,
+            "没说自己欠不欠账的那一行没被数出来：{}",
+            closed.line()
+        );
+        assert!(
+            closed.line().contains("unanswered=1"),
+            "这一拍的读数里读不到它：{}",
+            closed.line()
+        );
+        assert_eq!(
+            graph.held("a-decomposition").unwrap().status,
+            TaskStatus::Pending,
+            "数出来不等于关掉：没回答的行里也可能有活要干"
         );
     }
 
