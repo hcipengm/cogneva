@@ -46,17 +46,23 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// Loop name reported through the background-loop liveness family.
+///
+/// The role this loop contends for through the owner lease is the same word on
+/// purpose: a liveness reading and a lease row that name the same loop by two
+/// spellings are two things a reader has to know are the same. Declared once,
+/// so a rename cannot move one and leave the other behind.
 pub const OUTWARD_LOOP: &str = "orchestrator_outward";
 /// The role this loop contends for through the owner lease.
-pub const OUTWARD_ROLE: &str = "orchestrator_outward";
+pub const OUTWARD_ROLE: &str = OUTWARD_LOOP;
 
 /// The environment variable that names what to look for outside. Published so
 /// the deployment's own wiring can be held to it rather than described.
 pub const QUERIES_ENV: &str = "COGNEVA_OUTWARD_QUERIES";
 /// The search backend. The deployment already points this at its own metasearch
 /// instance for the agent tools; the outward loop reads the same value rather
-/// than taking a second endpoint to keep in step.
-const SEARCH_BASE_ENV: &str = "COGNEVA_WEB_SEARCH_BASE";
+/// than taking a second endpoint to keep in step. The name itself is declared
+/// in the contract crate, where both readers can see one spelling.
+const SEARCH_BASE_ENV: &str = cog_core::WEB_SEARCH_BASE_ENV;
 
 /// Asked once per source unless the source says otherwise. Hours, not minutes:
 /// the world this reads changes on the scale of releases and articles, and a
@@ -1061,10 +1067,10 @@ mod tests {
                 .iter()
                 .find(|m| {
                     m.name == name
-                        && source.map_or(true, |s| {
+                        && source.is_none_or(|s| {
                             m.labels.get(LABEL_SOURCE).map(String::as_str) == Some(s)
                         })
-                        && result.map_or(true, |r| {
+                        && result.is_none_or(|r| {
                             m.labels.get(crate::LABEL_RESULT).map(String::as_str) == Some(r)
                         })
                 })

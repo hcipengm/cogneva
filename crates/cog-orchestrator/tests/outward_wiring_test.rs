@@ -12,20 +12,18 @@
 //! call. Turning it on is a decision with a cost — every result becomes work —
 //! and it has to be taken deliberately, by setting a value.
 
-use std::path::Path;
+// Where the repository root is, and how a file is read, are each published
+// once for the whole tree; this test takes those two rather than a copy of each.
+#[path = "../../cogneva/tests/common/fsio.rs"]
+mod fsio;
+#[path = "../../cogneva/tests/common/root.rs"]
+mod root;
 
-/// The repository root, from this crate's manifest directory.
-fn repo_root() -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("crates/<crate> sits two levels under the root")
-        .to_path_buf()
-}
+use root::repo_root;
 
-fn read(relative: &str) -> String {
-    let path = repo_root().join(relative);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+/// One file, by its path from the repository root.
+fn text(relative: &str) -> String {
+    fsio::read(&repo_root().join(relative))
 }
 
 /// The chart sets the variable the loop reads — the same string, not a spelling
@@ -33,7 +31,7 @@ fn read(relative: &str) -> String {
 #[test]
 fn the_deployment_sets_the_variable_the_loop_reads() {
     let var = cog_orchestrator::outward::QUERIES_ENV;
-    let template = read("deploy/helm/cogneva/templates/gateway.yaml");
+    let template = text("deploy/helm/cogneva/templates/gateway.yaml");
     assert!(
         template.contains(&format!("- name: {var}")),
         "the outward loop reads {var}, and the chart never sets it: {template_file} \
@@ -46,14 +44,14 @@ fn the_deployment_sets_the_variable_the_loop_reads() {
 /// the template only sets the variable when that key is non-empty.
 #[test]
 fn the_switch_is_a_value_whose_default_is_off() {
-    let values = read("deploy/helm/cogneva/values.yaml");
+    let values = text("deploy/helm/cogneva/values.yaml");
     assert!(
         values.contains("outward:\n  queries: []"),
         "outward.queries must default to an empty list: every result the loop finds \
          becomes work somebody is asked to do, so a deployment that has not asked for \
          this must not make the outbound calls"
     );
-    let template = read("deploy/helm/cogneva/templates/gateway.yaml");
+    let template = text("deploy/helm/cogneva/templates/gateway.yaml");
     assert!(
         template.contains("{{- if .Values.outward.queries }}"),
         "the variable is set unconditionally, so an empty value still reaches the \
@@ -79,7 +77,7 @@ fn the_switch_is_a_value_whose_default_is_off() {
 /// off is fine; doing it silently is what this assertion refuses.
 #[test]
 fn the_profile_we_run_names_something_to_look_for() {
-    let profile = read("deploy/helm/cogneva/profiles/k3s-single.yaml");
+    let profile = text("deploy/helm/cogneva/profiles/k3s-single.yaml");
     assert!(
         profile.contains("\n  queries:\n") || profile.contains("\n  queries: ["),
         "the k3s-single profile names no outward queries, so the loop this platform \
@@ -96,7 +94,7 @@ fn the_profile_we_run_names_something_to_look_for() {
 /// publishing of its own readings.
 #[test]
 fn the_plugin_registers_the_loop_and_publishes_its_readings() {
-    let plugin = read("crates/cog-orchestrator/src/plugin.rs");
+    let plugin = text("crates/cog-orchestrator/src/plugin.rs");
     assert!(
         plugin.contains("spawn_outward_loop("),
         "nothing starts the outward loop, so the module is a library no process calls"

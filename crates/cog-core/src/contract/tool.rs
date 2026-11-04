@@ -4,6 +4,16 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+/// The environment variable that names the metasearch backend.
+///
+/// Declared here because two crates that cannot see each other read it: the
+/// agent's web tool, which asks the backend questions, and the orchestrator's
+/// outward loop, which asks the same backend what the outside world says. One
+/// deployment answers both with one address, so a second spelling would let the
+/// two drift apart with nothing failing — `env::var` answers a name nobody sets
+/// exactly the way it answers "this deployment did not wire it".
+pub const WEB_SEARCH_BASE_ENV: &str = "COGNEVA_WEB_SEARCH_BASE";
+
 /// Handler signature for native tool implementations.
 pub type ToolHandler = Arc<
     dyn Fn(

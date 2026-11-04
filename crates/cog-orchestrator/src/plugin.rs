@@ -57,6 +57,9 @@ pub struct OrchestratorPlugin {
     shared_orchestrator: Option<Arc<crate::DagExecutor>>,
     exec_loop: Option<Arc<crate::TaskExecutorRouter>>,
     action_planner: Option<Arc<crate::ActionPlanOrchestrator>>,
+    /// The outward loop's reading. Published in `init` because that is when
+    /// the scrapers take their snapshot; `start` attaches the loop to it.
+    outward_census: Option<Arc<crate::outward::OutwardCensus>>,
 }
 
 impl OrchestratorPlugin {
@@ -67,6 +70,7 @@ impl OrchestratorPlugin {
             shared_orchestrator: None,
             exec_loop: None,
             action_planner: None,
+            outward_census: None,
         }
     }
 }
@@ -340,6 +344,14 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         ctx.publish_observable(Arc::new(crate::observable::TaskGraphObservable::new(
             shared_orchestrator.clone(),
         )));
+        // The outward loop's reading. It goes up here, not in `start`: the
+        // scrapers take their snapshot at the end of init, and an observable
+        // published after that is one no reader ever sees -- a capability
+        // that is running would then read exactly like one that is not.
+        let outward_census = Arc::new(crate::outward::OutwardCensus::new());
+        ctx.publish_observable(outward_census.clone());
+        self.outward_census = Some(outward_census);
+
         // Face drift is a scrape-only reading over the graph and the agents'
         // heartbeats. The handle goes up here because that is when the readers
         // take their snapshot; `start` only attaches the dispatch loop to it.
@@ -1137,12 +1149,15 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         //
         // With no subjects configured it makes no outbound call at all, and the
         // reading says which of "not configured", "configured and unreadable"
-        // and "running" this process is in. That is why the census is published
-        // before the decision and records the decision itself: a capability
-        // that is quietly idle and one that is broken would otherwise read the
-        // same from a loop that never started.
-        let outward_census = std::sync::Arc::new(crate::outward::OutwardCensus::new());
-        ctx.publish_observable(outward_census.clone());
+        // and "running" this process is in. That is why the census records the
+        // decision itself: a capability that is quietly idle and one that is
+        // broken would otherwise read the same from a loop that never started.
+        // The handle was published in `init`, where the readers take their
+        // snapshot; this function only attaches the loop to it.
+        let Some(outward_census) = self.outward_census.clone() else {
+            warn!("outward loop not started: the census was never published");
+            return Ok(());
+        };
         match crate::outward::OutwardConfig::from_env() {
             Err(fault) => {
                 outward_census.record_config(fault.cell(), 0).await;

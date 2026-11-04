@@ -285,9 +285,9 @@ async fn an_unattributed_call_is_not_credited_to_anybody() {
 /// deployment that chose not to offer it.
 #[test]
 fn the_shared_registry_carries_the_tool() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
-    let source =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    // Compiled in, not read at run time: a path that is wrong is a build
+    // failure here rather than a test that silently reads nothing.
+    let source = include_str!("../src/lib.rs");
     assert!(
         source.contains("self_change::tool_for_caller("),
         "the assembly never registers the ask-to-change tool on the shared registry: \

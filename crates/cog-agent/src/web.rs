@@ -84,11 +84,13 @@ const SEARCH_ATTEMPTS: u32 = 2;
 
 /// The environment variable that names the SearXNG base URL.
 ///
-/// Named here, next to the tool that reads it, so the deployment's env table and
-/// the tool cannot disagree about the spelling. Empty means "this deployment
-/// chose not to wire web search", which the tool reports at call time rather
-/// than hiding by being absent from the list.
-pub const WEB_SEARCH_BASE_ENV: &str = "COGNEVA_WEB_SEARCH_BASE";
+/// Declared in the contract crate because the orchestrator's outward loop reads
+/// the same address and this crate cannot be reached from there. The name is
+/// re-published here so the deployment's env table and the tool keep quoting
+/// one spelling. Empty means "this deployment chose not to wire web search",
+/// which the tool reports at call time rather than hiding by being absent from
+/// the list.
+pub const WEB_SEARCH_BASE_ENV: &str = cog_core::WEB_SEARCH_BASE_ENV;
 
 /// The environment variable that names the second layer of web access, for the
 /// work the self-hosted layer could not do.
