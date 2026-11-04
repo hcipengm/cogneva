@@ -376,10 +376,10 @@ async fn a_tasks_cell_is_todays_spend_not_the_jobs_lifetime_total() {
         .expect("leave the ledger as it was found");
 }
 
-/// 「这件活是谁交的」在任务图上只有一处答案，判定与记账读的是同一个。
+/// 「这件活是谁交的、跑在哪个租户」在任务图上只有一处答案，判定与记账读的是同一个。
 #[tokio::test]
 #[ignore = "needs a live PostgreSQL via COGNEVA_TEST_DATABASE_URL"]
-async fn the_submitter_a_task_names_is_the_person_the_ledger_would_charge() {
+async fn the_attribution_a_task_names_is_what_the_ledger_charges_and_the_gateway_refuses_by() {
     let url = database_url();
     let (pool, store) = prepare(&url).await;
 
@@ -405,27 +405,37 @@ async fn the_submitter_a_task_names_is_the_person_the_ledger_would_charge() {
         .expect("write a task");
     }
 
+    let attribution = store
+        .task_attribution(&named)
+        .await
+        .expect("read the attribution")
+        .expect("the graph has this task");
     assert_eq!(
-        store
-            .task_submitter(&named)
-            .await
-            .expect("read the submitter"),
-        Some(person.clone()),
+        attribution.submitter.as_deref(),
+        Some(person.as_str()),
         "判定与账本读的是同一处：任务行上的那一个名字"
     );
     assert_eq!(
-        store
-            .task_submitter(&anonymous)
-            .await
-            .expect("read the submitter"),
-        None,
-        "没有提交人的活不许被编一个名字出来"
+        attribution.workspace_id.as_deref(),
+        Some(format!("ws-{run}").as_str()),
+        "同一行上的租户也要一并答出来：按工作区执法用的是这一格，"
     );
     assert_eq!(
         store
-            .task_submitter(&absent)
+            .task_attribution(&anonymous)
             .await
-            .expect("read the submitter"),
+            .expect("read the attribution"),
+        Some(cog_core::TaskAttribution {
+            submitter: None,
+            workspace_id: Some(format!("ws-{run}")),
+        }),
+        "没有提交人的活不许被编一个名字出来，可它确实跑在某个租户里——这两件事"
+    );
+    assert_eq!(
+        store
+            .task_attribution(&absent)
+            .await
+            .expect("read the attribution"),
         None,
         "图里没有这件活：答不上来，而不是答错一个人"
     );

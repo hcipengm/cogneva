@@ -138,10 +138,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::sync::Arc::new(cog_quota::TaskBudgetManager::new(store.clone()))
                         as std::sync::Arc<dyn cog_core::TaskBudgetGate>
                 });
-            // 按人的当日额度用同一份存储、同一个五级层级管理器：上限由主应用那边的
-            // 管理面写进 `quota:user:limits:<id>`，判定与记账发生在这条代理路径上。
-            // 两个进程必须指向同一个键值面，否则上限写在一处、账记在另一处，读出来
-            // 就是「有上限但没人撞过」。没有键值面时交 `None`：无从判定就不判。
+            // 按人、按工作区的当日额度用同一份存储、同一个五级层级管理器：上限由主
+            // 应用那边的管理面写进 `quota:user:limits:<id>` 与 `quota:ws:limits:<id>`，
+            // 判定与记账发生在这条代理路径上；工作区那一级的标识来自任务图，所以这条
+            // 路径还要能读账本。两个进程必须指向同一个键值面，否则上限写在一处、账记
+            // 在另一处，读出来就是「有上限但没人撞过」。没有键值面时交 `None`：无从
+            // 判定就不判。
             let owner_budget: Option<std::sync::Arc<dyn cog_core::HierarchyManager>> =
                 key_value.as_ref().map(|store| {
                     std::sync::Arc::new(cog_quota::HierarchyManager::from_store(store.clone()))

@@ -444,7 +444,7 @@ impl cog_core::LlmUsageLedger for FakeUsage {
     ) -> Result<Vec<(String, u64)>, String> {
         unimplemented!("read-only stand-in")
     }
-    async fn task_submitter(&self, _: &str) -> Result<Option<String>, String> {
+    async fn task_attribution(&self, _: &str) -> Result<Option<cog_core::TaskAttribution>, String> {
         unimplemented!("read-only stand-in")
     }
     async fn unattributed_between(

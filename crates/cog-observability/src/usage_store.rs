@@ -1082,7 +1082,7 @@ impl LlmUsageStore {
     /// `(workspace_id, task_id)`，同一个 id 在两个工作区里各有一行是它允许的形状。
     /// 一次普通 join 碰上这种重复，那一行的 token 会被数两遍——格子里的数凭空变大，
     /// 而「这个人今天花了多少」只会表现为他比实际更早被拒。取最近更新的那一行，
-    /// 与 [`Self::task_submitter`] 用同一条规则，两处才不会各认一个提交人。
+    /// 与 [`Self::task_attribution`] 用同一条规则，两处才不会各认一个提交人。
     pub async fn spend_by_person_since(
         &self,
         since_unix: i64,
@@ -1093,7 +1093,7 @@ impl LlmUsageStore {
                         (u.tokens_input + u.tokens_output) AS tokens
                    FROM {LEDGER_TABLE} u
                    LEFT JOIN LATERAL (
-                        SELECT d.task->>'submitted_by' AS person
+                        SELECT NULLIF(d.task->>'submitted_by', '') AS person
                           FROM cog_dag_tasks d
                          WHERE d.task_id = u.task_id
                          ORDER BY d.updated_at DESC
@@ -1206,20 +1206,26 @@ impl LlmUsageStore {
             .collect())
     }
 
-    /// 这件活是谁交的，任务图里那一个答案。
+    /// 这件活算在谁头上、跑在哪个租户里，任务图里那一个答案。
     ///
     /// 判额度与记账读的是同一处：`spend_by_person_since` 把为任务做的调用算在提交
-    /// 人头上，这里让判定也能拿到同一个人。两处各认各的，会出现「按 A 记了花销、
-    /// 按 B 判了额度」——被判的那个人永远没花过，被记的那个人从来没被拦过。
+    /// 人头上，`spend_by_workspace_since` 算在任务行的那个工作区上；这里让判定也
+    /// 拿到同样两个人。两处各认各的，会出现「按 A 记了花销、按 B 判了额度」——
+    /// 被判的那个主体永远没花过，被记的那个从来没被拦过。
     ///
-    /// 任务图里没有这件活、或者它没有提交人，都答 `None`：两者在判定上同形（没有
-    /// 人该被拦），但调用方不能因此编一个名字。
-    pub async fn task_submitter(&self, task_id: &str) -> anyhow::Result<Option<String>> {
-        // 取最近更新的那一行，与 `spend_by_person_since` 同一条规则：任务表的主键是
-        // `(workspace_id, task_id)`，同一个 id 可能有两个工作区的两行，而这两处要是
+    /// 任务图里没有这件活才答 `None`。有的活但没写提交人、或工作区是空串，都是
+    /// 「这一格没有主体」：空串在 `spend_by_workspace_since` 里被排除，判定这里
+    /// 同样不许把它当成一个工作区。
+    pub async fn task_attribution(
+        &self,
+        task_id: &str,
+    ) -> anyhow::Result<Option<cog_core::TaskAttribution>> {
+        // 取最近更新的那一行，与两个汇总读同一条规则：任务表的主键是
+        // `(workspace_id, task_id)`，同一个 id 可能有两个工作区的两行，而这几处要是
         // 各挑一行，就会出现「按 A 记了花销、按 B 判了额度」。
         let row = sqlx::query(
-            "SELECT task->>'submitted_by' AS person
+            "SELECT NULLIF(task->>'submitted_by', '') AS person,
+                    NULLIF(workspace_id, '') AS workspace_id
                FROM cog_dag_tasks
               WHERE task_id = $1
               ORDER BY updated_at DESC
@@ -1228,7 +1234,10 @@ impl LlmUsageStore {
         .bind(task_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.and_then(|r| r.get::<Option<String>, _>("person")))
+        Ok(row.map(|r| cog_core::TaskAttribution {
+            submitter: r.get::<Option<String>, _>("person"),
+            workspace_id: r.get::<Option<String>, _>("workspace_id"),
+        }))
     }
 
     /// 同一窗口里**归不到任何一件任务**的用量合计。
@@ -2097,8 +2106,11 @@ impl cog_core::LlmUsageLedger for LlmUsageStore {
             .map_err(|e| e.to_string())
     }
 
-    async fn task_submitter(&self, task_id: &str) -> Result<Option<String>, String> {
-        LlmUsageStore::task_submitter(self, task_id)
+    async fn task_attribution(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<cog_core::TaskAttribution>, String> {
+        LlmUsageStore::task_attribution(self, task_id)
             .await
             .map_err(|e| e.to_string())
     }

@@ -2046,13 +2046,16 @@ struct AppState {
     /// 按人的当日额度，五级层级里「人」那一级，由装配层交进来。
     ///
     /// 与 [`Self::task_budget`] 不是同一个问题：那一格的上限挂在「这件工作」上，
-    /// 这一格挂在「这个人今天能花多少」上。上限本身由管理面写进同一个键值面
-    /// （`quota:user:limits:<id>`），本进程在 LLM 代理路径上**判**，并把格子里那个
-    /// 数按拍从账本**投影**回来（[`project_quota_usage`]）——请求路径上不记，记在
-    /// 账本里，格子只是它的一个读法。
+    /// 这一格挂在「这个人今天能花多少」与「这个工作区今天能花多少」上。两级的上限
+    /// 由管理面写进同一个键值面（`quota:user:limits:<id>`、`quota:ws:limits:<id>`），
+    /// 本进程在 LLM 代理路径上**判**，并把格子里的数按拍从账本**投影**回来
+    /// （[`project_quota_usage`]）——请求路径上不记，记在账本里，格子只是它的一个读法。
     ///
-    /// `None` 与「这个人没有额度」是两回事：前者是没配键值面、无从判定，后者是
-    /// 有人声明了上限而他用完了。两者在拒绝面上都表现为放行——见
+    /// 工作区那一级的标识不在请求里：一发调用属于哪个租户，只有任务图知道（任务行
+    /// 上的 `workspace_id`），所以这一级的判定要先读一次任务归属。
+    ///
+    /// `None` 与「这个主体没有额度」是两回事：前者是没配键值面、无从判定，后者是
+    /// 有人声明了上限而它用完了。两者在拒绝面上都表现为放行——见
     /// [`owner_budget_refusal`] 里对这条边界的说明。
     owner_budget: Option<Arc<dyn cog_core::HierarchyManager>>,
     /// 跨进程初值是否已落地。建连失败过一次时它是 false，由发布循环按拍重试。
@@ -3044,64 +3047,36 @@ fn task_budget_refusal_usage(
     }
 }
 
-/// 按人当日的额度拒绝：这个人今天能花的已经花完了。
+/// 一次调用被判「今天的额度已经用完」时拒的那一发。
 ///
-/// 与 [`TaskBudgetRefusal`] 分成两个类型而不是合成一个：它们答的是两个不同的
-/// 问题（这件工作还能不能花 / 这个人今天还能不能花），响应体的 `reason` 与账上的
-/// 结果词也各是一个，合成一个会让调用侧与读者去查错的那一个。
+/// 主体可能是**一个人**，也可能是**一个工作区（租户）**：两者都是层级里声明过
+/// 上限的格子，判定做的是同一件事——把这一发该算账的主体里配过上限的那几个放进
+/// 层级，问「谁先越线」。与 [`TaskBudgetRefusal`] 分成两个类型：那一条的上限挂在
+/// 这件工作上，这一条挂在人或租户上，响应体的 `reason` 与账上的结果词也各是一个，
+/// 合成一个会让调用侧与读者去查错的那一个。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OwnerBudgetRefusal {
-    owner: String,
+    /// 越线的那一级。
+    scope: cog_core::QuotaScope,
+    /// 越线那一级上的标识：人 id 或工作区 id。
+    target: String,
+    /// 这一发归属的人。任务没有提交人、调用方也没声明时是 `None`：不编一个名字。
+    owner: Option<String>,
     spent_today: u64,
     hard_limit: u64,
     /// 到下一个 UTC 午夜的秒数。额度按 UTC 日归零，这个数就是「什么时候再来」。
     wait_secs: u64,
 }
 
-/// 判这一发要不要按人的当日额度拒。
+/// 一发调用在额度面上算在谁头上：人，与它跑在的那个租户。
 ///
-/// 只有**有人给这个人配过额度**时才判。层级管理器对没配过的格子有一份默认上限，
-/// 那是「读起来是多少」，不是「谁定的」——拿它去拒人，等于平台替属主做了一个谁都
-/// 没做过的决定，而代价是某个人在一天中间被切断、且没有任何一处写着为什么。配过
-/// 上限之后，判定用的就是那一对，与 `/api/v1/quota/limits/user/<id>` 读到的同一个。
-///
-/// 不拒的另外三种：这一发既没声明属主、也不属于任何一件有提交人的任务（没有主体，
-/// 就没有「这个人花了多少」这个说法）、本进程没有层级管理器（没配键值面，无从判定）、
-/// 读不出配过的上限（答不上「花了多少」时放行——拦错方向的代价不对称，见
-/// [`task_budget_refusal`]）。
-///
-/// 估算不参与判定，理由与按任务预算那一条相同：这一发要花多少只有上游知道，而这里
-/// 拒的是「已经越线之后再来的任何一发」。
-/// 这一发的花销该记在谁头上、就按谁判——两处用的是同一条解析规则。
-///
-/// 账上把为一件任务做的调用算在**提交这件活的人**头上（见账本那次的 join）；
-/// 判定要是只认调用方自己声明的属主，就会出现「记在 A 头上、按 B 判」，而任务
-/// 调用根本不声明属主——那条路上的额度格子会涨、却永远不拦人，一天的上限成了
-/// 一句只有事后读得出来的话。
-///
-/// 所以没声明属主时，去任务图里问同一个问题。问不出来（没有这件活、没有提交人、
-/// 读失败）都答 `None`：答不上「谁该被拦」时放行，与这一面其他几处同一个方向。
-async fn owner_budget_person(
-    state: &AppState,
-    task: Option<&str>,
-    owner: Option<&str>,
-) -> Option<String> {
-    if owner.is_some() {
-        return person_of_a_call(owner, None);
-    }
-    let task = task?;
-    let ledger = state.pool_obs.usage.as_ref()?;
-    match ledger.task_submitter(task).await {
-        Ok(submitter) => person_of_a_call(owner, submitter.as_deref()),
-        Err(e) => {
-            tracing::warn!(
-                task = %task,
-                error = %e,
-                "按人额度：读不出这件活的提交人，这一发不拦"
-            );
-            None
-        }
-    }
+/// 两个主体的证据不是同一条：人来自调用方声明的属主，或任务行上写的提交人；
+/// 租户只来自任务行。两处读的都是账本折叠花销时用的那套解析，判定与记账才不会
+/// 各认一个主体——账记在 A 头上、按 B 判，A 的格子永远涨而 B 永远不被拦。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CallSubject {
+    person: Option<String>,
+    workspace: Option<String>,
 }
 
 /// 一条调用的花销算在谁头上：声明了属主就是属主，否则是提交这件活的人。
@@ -3113,6 +3088,53 @@ fn person_of_a_call(owner: Option<&str>, task_submitter: Option<&str>) -> Option
     owner.or(task_submitter).map(str::to_string)
 }
 
+/// 解析这一发的两个主体。解析不出谁就留空，不编。
+///
+/// 没有任务时不必去问任务图——那是一次库读，为一个不存在的关联付它不划算。读
+/// 失败时退到「只有调用方自己声明的人」：那一半来自请求本身，不依赖这次读。
+async fn call_subject(state: &AppState, task: Option<&str>, owner: Option<&str>) -> CallSubject {
+    let mut subject = CallSubject {
+        person: person_of_a_call(owner, None),
+        workspace: None,
+    };
+    let Some(task) = task else {
+        return subject;
+    };
+    let Some(ledger) = state.pool_obs.usage.as_ref() else {
+        return subject;
+    };
+    match ledger.task_attribution(task).await {
+        Ok(Some(attribution)) => {
+            subject.person = person_of_a_call(owner, attribution.submitter.as_deref());
+            subject.workspace = attribution.workspace_id;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                task = %task,
+                error = %e,
+                "按额度：读不出这件活的归属，这一发只按调用方自己声明的主体判"
+            );
+        }
+    }
+    subject
+}
+
+/// 判这一发要不要按人 / 按工作区的当日额度拒。
+///
+/// 只有**有人给这个主体配过额度**时才判，且只有配过上限的主体进得去判定上下文。
+/// 层级管理器对没配过的格子有一份默认上限，那是「读起来是多少」，不是「谁定的」
+/// ——把它放进去，等于平台替属主做了一个谁都没做过的决定，代价是某个人或某个
+/// 租户在一天中间被切断、且没有任何一处写着为什么。配过之后，判定用的就是那一
+/// 对，与管理面读到的同一个。
+///
+/// 不拒的另外三种：这一发既没声明属主、也不属于任何一件有提交人或有租户的任务
+/// （没有主体，就没有「谁花了多少」这个说法）、本进程没有层级管理器（没配键值
+/// 面，无从判定）、读不出配过的上限（答不上「花了多少」时放行——拦错方向的代价
+/// 不对称，见 [`task_budget_refusal`]）。
+///
+/// 估算不参与判定，理由与按任务预算那一条相同：这一发要花多少只有上游知道，而这里
+/// 拒的是「已经越线之后再来的任何一发」。
 async fn owner_budget_refusal(
     state: &AppState,
     style: &str,
@@ -3124,40 +3146,70 @@ async fn owner_budget_refusal(
     // 先看这一面在不在：不在就连「这件活是谁交的」都不用去问——那是一次库读，
     // 为一个判不了的决定付它，等于让每一发任务调用替一个没配的额度面买单。
     let hierarchy = state.owner_budget.as_ref()?;
-    let owner = owner_budget_person(state, task, owner).await?;
-    let owner = owner.as_str();
-    match hierarchy.limits(cog_core::QuotaScope::User, owner).await {
-        Ok(None) => return None,
-        Ok(Some(_)) => {}
-        Err(e) => {
-            tracing::warn!(
-                owner = %owner,
-                error = %e,
-                "按人额度：读不出这个人配过的上限，这一发不拦"
-            );
-            return None;
+    let subject = call_subject(state, task, owner).await;
+
+    let mut ctx = cog_core::QuotaContext::default();
+    let mut any_declared = false;
+    if let Some(person) = subject.person.as_deref() {
+        match hierarchy.limits(cog_core::QuotaScope::User, person).await {
+            Ok(Some(_)) => {
+                ctx.user_id = Some(person.to_string());
+                any_declared = true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    owner = %person,
+                    error = %e,
+                    "按额度：读不出这个人配过的上限，这一发不按人判"
+                );
+            }
         }
     }
-    let ctx = cog_core::QuotaContext {
-        user_id: Some(owner.to_string()),
-        ..Default::default()
-    };
+    if let Some(workspace) = subject.workspace.as_deref() {
+        match hierarchy
+            .limits(cog_core::QuotaScope::Workspace, workspace)
+            .await
+        {
+            Ok(Some(_)) => {
+                ctx.workspace_id = Some(workspace.to_string());
+                any_declared = true;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    workspace = %workspace,
+                    error = %e,
+                    "按额度：读不出这个工作区配过的上限，这一发不按工作区判"
+                );
+            }
+        }
+    }
+    if !any_declared {
+        return None;
+    }
+
     let decision = hierarchy.check(&ctx, 0).await;
     if decision.allowed {
-        if let Some(warning) = decision.warnings.first() {
+        for warning in &decision.warnings {
             tracing::warn!(
-                owner = %owner,
+                scope = warning.scope.as_str(),
+                target = %warning.target_id,
                 spent_today = warning.used_today,
                 soft_limit = warning.limits.soft_limit,
                 hard_limit = warning.limits.hard_limit,
-                "按人额度：这一发跨过了软上限，仍然放行"
+                "按额度：这一发跨过了软上限，仍然放行"
             );
         }
         return None;
     }
+    // `cascade_order` 由窄到宽，所以第一个就是最窄的那个越线主体：人越线时报人，
+    // 人还没满而租户满了才报租户。调用方要问的是最近的那个能自己解的边界。
     let blocked = decision.blocked_by.first()?;
     let refusal = OwnerBudgetRefusal {
-        owner: owner.to_string(),
+        scope: blocked.scope,
+        target: blocked.target_id.clone(),
+        owner: subject.person,
         spent_today: blocked.used_today,
         hard_limit: blocked.limits.hard_limit,
         wait_secs: cog_core::day::seconds_to_next_day(Utc::now().timestamp()),
@@ -3169,11 +3221,15 @@ async fn owner_budget_refusal(
     Some(refusal)
 }
 
-/// 按人额度拒绝的台账落点。
+/// 按人 / 按工作区额度拒绝的台账落点。
 ///
 /// 形状与 [`task_budget_refusal_usage`] 相同，`task` 一列照请求声明照抄：这一发可能
-/// 同时属于一件工作，而拒绝说的是这个人。结果词不同是两者唯一的分界——读的人要能
-/// 分开「该收尾这件工作」与「该给这个人加额度」。
+/// 同时属于一件工作，而拒绝说的是人或租户。结果词不同是两者唯一的分界——读的人要能
+/// 分开「该收尾这件工作」与「该给这个人或这个租户加额度」。
+///
+/// 越线的是租户时 `owner` 仍写人（可能为空），不写租户 id：任务的租户在任务图上，
+/// 这一行的 `task` 指过去就够；而按租户读花销与按人读花销是两份投影，把两个标识
+/// 塞进同一列会让两份都读错。租户 id 在响应正文里，调用方当场就拿到了。
 fn owner_budget_refusal_usage(
     style: &str,
     actor: &str,
@@ -3196,9 +3252,10 @@ fn owner_budget_refusal_usage(
         refusal_kind: None,
         retry_after_secs: Some(refusal.wait_secs),
         task: task.map(str::to_string),
-        // 这一行存在的理由就是「谁被拒了」：`owner` 是判定用的那个标识，拒绝之后
-        // 花销计数不再动，所以事后靠计数追不出这个人——只有这一格记得住。
-        owner: Some(refusal.owner.clone()),
+        // 这一行存在的理由就是「谁被拒了」：拒绝之后花销计数不再动，所以事后靠
+        // 计数追不出这个人——只有这一格记得住。拒绝的主体是租户时这一格可能为空
+        // （任务没有提交人），那时的身份要从 `task` 连回任务图。
+        owner: refusal.owner.clone(),
         latency_ms: 0,
         pace: None,
         usage_outcome: None,
@@ -7110,10 +7167,10 @@ async fn stream_forward(
             .unwrap_or_else(|_| axum::response::Response::new(axum::body::Body::empty())));
     }
 
-    // 按人的当日额度：这个人今天能花的已经花完了。
+    // 按人 / 按工作区的当日额度：这个主体今天能花的已经花完了。
     // 位置在按任务预算之后：两者都是我们自己的上限，而这一件工作所花的是这个人
-    // 额度里的一部分——工作这一层是调用方自己就能收的尾，人的那一层要等日界或
-    // 属主。能自己解的那个先报，调用方少绕一圈。
+    // 或这个租户额度里的一部分——工作这一层是调用方自己就能收的尾，人／租户那一
+    // 层要等日界或属主。能自己解的那个先报，调用方少绕一圈。
     if let Some(refusal) = owner_budget_refusal(
         &state,
         style,
@@ -7126,11 +7183,13 @@ async fn stream_forward(
     {
         tracing::warn!(
             refused_by_owner_budget = true,
-            owner = %refusal.owner,
+            scope = refusal.scope.as_str(),
+            target = %refusal.target,
+            owner = refusal.owner.as_deref().unwrap_or(""),
             spent_today = refusal.spent_today,
             hard_limit = refusal.hard_limit,
             retry_after_secs = refusal.wait_secs,
-            "按人额度：这个人今天的额度已经用完，快速失败 402（额度用完，不是限流）"
+            "按额度：这个主体今天的额度已经用完，快速失败 402（额度用完，不是限流）"
         );
         return Ok(axum::response::Response::builder()
             .status(own_refusal_status(OwnRefusal::DayBudget))
@@ -7142,11 +7201,19 @@ async fn stream_forward(
             .header("content-type", cog_core::CONTENT_TYPE_JSON)
             .body(axum::body::Body::from(
                 serde_json::json!({
-                    "error": "这个人今天的额度已经用完",
+                    "error": match refusal.scope {
+                        cog_core::QuotaScope::Workspace => "这个工作区今天的额度已经用完",
+                        _ => "这个人今天的额度已经用完",
+                    },
                     // 同一个 429 也来自配速与按任务预算，三句话指向三种处置：
                     // 等窗口、收尾这件工作、等日界或加额度。调用侧与读者靠这一格
                     // 分开，不看正文。
                     "reason": cog_core::REFUSED_BY_OWNER_BUDGET,
+                    // 越线的是哪一级、叫什么。合成一格会让调用侧只得出「有人越线」，
+                    // 而「找属主给人加额度」与「找租户管理员给工作区加额度」是
+                    // 两个不同的人。
+                    "scope": refusal.scope.as_str(),
+                    "target": refusal.target,
                     "owner": refusal.owner,
                     "spent_today": refusal.spent_today,
                     "hard_limit": refusal.hard_limit,
@@ -18580,6 +18647,8 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
         people: Vec<(String, u64)>,
         by_task: Vec<(String, u64)>,
         by_workspace: Vec<(String, u64)>,
+        /// 任务图上这件活的归属。`None` 是「图里没有这件活」。
+        attribution: Option<cog_core::TaskAttribution>,
         failing: bool,
     }
 
@@ -18595,8 +18664,18 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                     .map(|(id, tokens)| ((*id).to_string(), *tokens))
                     .collect(),
                 by_workspace: Vec::new(),
+                attribution: None,
                 failing: false,
             }
+        }
+
+        /// 任务图上这件活归谁、跑在哪个租户。
+        fn with_attribution(mut self, submitter: Option<&str>, workspace: Option<&str>) -> Self {
+            self.attribution = Some(cog_core::TaskAttribution {
+                submitter: submitter.map(str::to_string),
+                workspace_id: workspace.map(str::to_string),
+            });
+            self
         }
 
         /// 同一份账，工作区那一根轴上回答这些行。
@@ -18701,8 +18780,11 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 .cloned()
                 .collect())
         }
-        async fn task_submitter(&self, _: &str) -> Result<Option<String>, String> {
-            Ok(None)
+        async fn task_attribution(
+            &self,
+            _: &str,
+        ) -> Result<Option<cog_core::TaskAttribution>, String> {
+            Ok(self.attribution.clone())
         }
         async fn unattributed_between(
             &self,
@@ -18917,6 +18999,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     /// 网关不再往格子里加数，`set_used` 收到的值原样记下，好让测试看见投影写了什么。
     struct StubHierarchy {
         cells: Vec<(String, u64, cog_core::QuotaLimits)>,
+        /// 工作区那一级的格子：判定与 `limits` 都按级分开读，合成一张表就分不出
+        /// 同一个 id 是人还是租户。
+        workspace_cells: Vec<(String, u64, cog_core::QuotaLimits)>,
         broken: bool,
         projected: Arc<std::sync::Mutex<Vec<(String, u64)>>>,
         /// 工作区那一格写进去的值。与人那一格分开记：两根轴共用一个替身，混在
@@ -18937,10 +19022,26 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                         )
                     })
                     .collect(),
+                workspace_cells: Vec::new(),
                 broken: false,
                 projected: Arc::new(std::sync::Mutex::new(Vec::new())),
                 projected_workspaces: Arc::new(std::sync::Mutex::new(Vec::new())),
             }
+        }
+
+        /// 给工作区那一级配上格子（id、今天花掉、软上限、硬上限）。
+        fn with_workspaces(mut self, cells: &[(&str, u64, u64, u64)]) -> Self {
+            self.workspace_cells = cells
+                .iter()
+                .map(|(id, used, soft, hard)| {
+                    (
+                        (*id).to_string(),
+                        *used,
+                        cog_core::QuotaLimits::new(*soft, *hard),
+                    )
+                })
+                .collect();
+            self
         }
 
         fn broken() -> Self {
@@ -18952,6 +19053,13 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
 
         fn cell(&self, id: &str) -> Option<(u64, cog_core::QuotaLimits)> {
             self.cells
+                .iter()
+                .find(|(cell, _, _)| cell == id)
+                .map(|(_, used, limits)| (*used, *limits))
+        }
+
+        fn workspace_cell(&self, id: &str) -> Option<(u64, cog_core::QuotaLimits)> {
+            self.workspace_cells
                 .iter()
                 .find(|(cell, _, _)| cell == id)
                 .map(|(_, used, limits)| (*used, *limits))
@@ -18975,12 +19083,25 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                 };
             }
             let mut scopes = Vec::new();
-            if let Some(id) = ctx.user_id.as_deref() {
-                if let Some((used, limits)) = self.cell(id) {
+            for (scope, cell) in [
+                (
+                    cog_core::QuotaScope::User,
+                    ctx.user_id
+                        .as_deref()
+                        .and_then(|id| self.cell(id).map(|c| (id, c))),
+                ),
+                (
+                    cog_core::QuotaScope::Workspace,
+                    ctx.workspace_id
+                        .as_deref()
+                        .and_then(|id| self.workspace_cell(id).map(|c| (id, c))),
+                ),
+            ] {
+                if let Some((id, (used, limits))) = cell {
                     let projected = used.saturating_add(tokens);
                     let blocking = projected > limits.hard_limit;
                     scopes.push(cog_core::ScopeStatus {
-                        scope: cog_core::QuotaScope::User,
+                        scope,
                         target_id: id.to_string(),
                         remaining: limits.hard_limit.saturating_sub(used),
                         used_today: used,
@@ -19038,10 +19159,12 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             scope: cog_core::QuotaScope,
             target_id: &str,
         ) -> cog_core::SFResult<Option<cog_core::QuotaLimits>> {
-            Ok(self
-                .cell(target_id)
-                .filter(|_| scope == cog_core::QuotaScope::User)
-                .map(|(_, limits)| limits))
+            let cell = match scope {
+                cog_core::QuotaScope::User => self.cell(target_id),
+                cog_core::QuotaScope::Workspace => self.workspace_cell(target_id),
+                _ => None,
+            };
+            Ok(cell.map(|(_, limits)| limits))
         }
 
         async fn set_limits(
@@ -19124,8 +19247,132 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
             "与按任务预算同值的话，读的人只能去找错的那个人"
         );
         assert_eq!(v["owner"], "u-1");
+        assert_eq!(v["scope"], "user");
         assert_eq!(v["hard_limit"], 1000);
         assert_eq!(v["spent_today"], 1200);
+    }
+
+    /// 租户（工作区）的额度要真的咬人：它跑的那些活花的钱越过上限之后，下一发
+    /// **在碰任何上游之前**就得被拒，且正文说得清越线的是哪个租户。
+    ///
+    /// 只把租户的花销投影进格子而不在这里判，`quota:ws:used:<id>` 就只是一个
+    /// 事后读得出来的数——上限写着，却没有任何一发因为它被拦下。主体来自任务图：
+    /// 调用方不会在请求里声明自己属于哪个租户，这件事只有任务行知道。
+    #[tokio::test]
+    async fn a_tenant_that_used_up_its_allowance_is_refused_by_name_before_any_upstream() {
+        use tower::ServiceExt;
+
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        // 人那一级没人配过上限，租户这一级配过且已经越线。
+        state.owner_budget = Some(Arc::new(
+            StubHierarchy::new(&[]).with_workspaces(&[("ws-1", 1200, 800, 1000)]),
+        ));
+        let write_health = state.pool_obs.usage_write_health.clone();
+        state.pool_obs = Arc::new(PoolObservability {
+            metrics: state.pool_obs.metrics.clone(),
+            analytics: None,
+            alerts: None,
+            usage: Some(Arc::new(
+                StubLedger::with(&[], &[]).with_attribution(Some("u-9"), Some("ws-1")),
+            )),
+            usage_write_health: write_health,
+            durable: None,
+        });
+        let app = router(state, true);
+
+        let req = proxy_request()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", cog_core::CONTENT_TYPE_JSON)
+            .header(cog_core::LLM_TASK_HEADER, "t-42")
+            .body(axum::body::Body::from(
+                serde_json::json!({"model": "m1", "messages": []}).to_string(),
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYMENT_REQUIRED,
+            "租户的额度也在日界才回来：429 说的「换一家／等一会」在这里不成立"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["reason"],
+            cog_core::REFUSED_BY_OWNER_BUDGET,
+            "与人那一级同一个结果词：两者的处置都是「等日界或加额度」，分开的是 scope：{v}"
+        );
+        assert_eq!(v["scope"], "ws", "越线的是租户那一级");
+        assert_eq!(v["target"], "ws-1", "要点名是哪个租户");
+        assert_eq!(
+            v["owner"], "u-9",
+            "这一发是谁做的也要在正文里：找属主加额度与找租户管理员是两个人"
+        );
+        assert_eq!(v["hard_limit"], 1000);
+        assert_eq!(v["spent_today"], 1200);
+    }
+
+    /// 人那一级与租户那一级同时越线时，报最窄的那一个。
+    ///
+    /// 调用方要问的是最近的那个能自己解的边界：人越线可以找属主加额度或等日界，
+    /// 租户越线要走租户管理员。报宽的那一个，人就会去问错的人。
+    #[tokio::test]
+    async fn the_narrowest_subject_that_is_over_its_ceiling_is_the_one_named() {
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.owner_budget = Some(Arc::new(
+            StubHierarchy::new(&[("u-9", 1200, 800, 1000)])
+                .with_workspaces(&[("ws-1", 5000, 800, 1000)]),
+        ));
+        let write_health = state.pool_obs.usage_write_health.clone();
+        state.pool_obs = Arc::new(PoolObservability {
+            metrics: state.pool_obs.metrics.clone(),
+            analytics: None,
+            alerts: None,
+            usage: Some(Arc::new(
+                StubLedger::with(&[], &[]).with_attribution(Some("u-9"), Some("ws-1")),
+            )),
+            usage_write_health: write_health,
+            durable: None,
+        });
+
+        let refusal = owner_budget_refusal(&state, "openai", "a", "o", Some("t-42"), None)
+            .await
+            .expect("两个主体都越线，必须拒");
+        assert_eq!(refusal.scope, cog_core::QuotaScope::User);
+        assert_eq!(refusal.target, "u-9");
+        assert_eq!(
+            refusal.owner.as_deref(),
+            Some("u-9"),
+            "人来自任务行的提交人：请求没有声明属主，判定仍要按账本记的那个人判"
+        );
+    }
+
+    /// 没人给这个租户配过上限就不判：默认的那一对只是读法，不是谁做的决定。
+    #[tokio::test]
+    async fn a_tenant_nobody_set_a_ceiling_for_is_never_refused() {
+        let mut state = test_state(vec![stub_upstream("https://a.example.com", "m1")]);
+        state.owner_budget = Some(Arc::new(StubHierarchy::new(&[])));
+        let write_health = state.pool_obs.usage_write_health.clone();
+        state.pool_obs = Arc::new(PoolObservability {
+            metrics: state.pool_obs.metrics.clone(),
+            analytics: None,
+            alerts: None,
+            usage: Some(Arc::new(
+                StubLedger::with(&[], &[]).with_attribution(None, Some("ws-unlimited")),
+            )),
+            usage_write_health: write_health,
+            durable: None,
+        });
+
+        assert!(
+            owner_budget_refusal(&state, "openai", "a", "o", Some("t-42"), None)
+                .await
+                .is_none(),
+            "租户确实有花销、也确实有一个默认上限——可没人配过，就不许拿它拦"
+        );
     }
 
     /// 我们自造的拒绝穿什么码，由恢复时刻决定：日界恢复的那种不许借 429 或 503。
@@ -19291,7 +19538,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
     #[test]
     fn a_person_refusal_lands_under_its_own_word() {
         let refusal = OwnerBudgetRefusal {
-            owner: "u-1".to_string(),
+            scope: cog_core::QuotaScope::User,
+            target: "u-1".to_string(),
+            owner: Some("u-1".to_string()),
             spent_today: 1000,
             hard_limit: 1000,
             wait_secs: 3600,

@@ -349,8 +349,11 @@ impl cog_core::LlmUsageLedger for DeferredSink<dyn cog_core::LlmUsageLedger> {
             .await
     }
 
-    async fn task_submitter(&self, task_id: &str) -> Result<Option<String>, String> {
-        self.ledger()?.task_submitter(task_id).await
+    async fn task_attribution(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<cog_core::TaskAttribution>, String> {
+        self.ledger()?.task_attribution(task_id).await
     }
 
     async fn unattributed_between(
@@ -791,7 +794,10 @@ mod tests {
         ) -> Result<Vec<(String, u64)>, String> {
             unimplemented!("这一格只读不写")
         }
-        async fn task_submitter(&self, _: &str) -> Result<Option<String>, String> {
+        async fn task_attribution(
+            &self,
+            _: &str,
+        ) -> Result<Option<cog_core::TaskAttribution>, String> {
             unimplemented!("这一格只读不写")
         }
         async fn unattributed_between(

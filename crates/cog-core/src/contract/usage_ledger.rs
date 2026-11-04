@@ -483,6 +483,29 @@ pub struct OutcomeCount {
     pub calls: i64,
 }
 
+/// Who and which tenant a call made for one piece of work is charged to, as
+/// the task graph records it.
+///
+/// The two subjects have different evidence: a person comes from the caller's
+/// declared owner or from the task row's submitter; a workspace only comes from
+/// the task row. The enforcement point reads this instead of deriving either
+/// one itself, so that what the ledger charges and what the gateway refuses are
+/// the same subject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskAttribution {
+    /// The person who submitted this piece of work, when the graph records one.
+    ///
+    /// Optional rather than an empty string: a task submitted by nobody in
+    /// particular has no person to charge, and an empty id would be a person.
+    pub submitter: Option<String>,
+    /// The workspace (tenant) this piece of work runs in, when it names one.
+    ///
+    /// The graph's key is `(workspace_id, task_id)`, so a task id alone does
+    /// not identify a tenant; the row the caller is handed is the one the
+    /// spend joins take, which is the most recently updated.
+    pub workspace_id: Option<String>,
+}
+
 /// What one `(upstream, actor)` pair spent since a point in time, split the
 /// same three ways the metric face splits it.
 ///
@@ -753,17 +776,23 @@ pub trait LlmUsageLedger: Send + Sync {
         since_unix: i64,
     ) -> Result<Vec<(String, u64)>, String>;
 
-    /// The person who submitted the named task, as the graph records it.
+    /// Who and which tenant a call made for the named task is charged to, as the
+    /// graph records it.
     ///
     /// This is the same resolution [`spend_by_person_since`](Self::spend_by_person_since)
-    /// makes when it folds a task's calls onto a person, exposed on its own so the
-    /// enforcement point can judge the person the ledger charged. Two readers
-    /// resolving the person by different rules is how a call gets counted against
-    /// one person and refused for another.
+    /// and [`spend_by_workspace_since`](Self::spend_by_workspace_since) make when
+    /// they fold a task's calls onto a person and a workspace, exposed on its own
+    /// so the enforcement point judges the subjects the ledger charged. Two
+    /// readers resolving the subject by different rules is how a call gets
+    /// counted against one person and refused for another.
     ///
-    /// `None` covers both "no such task" and "that task names no submitter": the
-    /// caller may not know which, and neither has anyone to charge.
-    async fn task_submitter(&self, task_id: &str) -> Result<Option<String>, String>;
+    /// `None` means the graph has no row for this task id. A row that names
+    /// neither a submitter nor a workspace still comes back as
+    /// [`TaskAttribution`] with both fields absent: "the task exists but names
+    /// nobody" and "there is no such task" are different answers, and the
+    /// caller has to be able to tell them apart when deciding what it could
+    /// not read.
+    async fn task_attribution(&self, task_id: &str) -> Result<Option<TaskAttribution>, String>;
 
     /// Tokens spent in `[since, until)` that no task in the graph owns.
     ///
