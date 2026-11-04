@@ -110,7 +110,7 @@ export function DimensionCounts({ actors }: { actors: ActorUsage[] }) {
                     失败 {member.failed.toLocaleString()}
                   </span>
                   <span className="mono w-28 shrink-0 text-right text-[var(--paper-dim)]">
-                    {(member.input + member.output).toLocaleString()} token
+                    {(member.input + member.cached + member.output).toLocaleString()} token
                   </span>
                   <span className="mono w-16 shrink-0 text-right text-[var(--muted)]">
                     {member.rows} 行
@@ -149,6 +149,8 @@ interface Member {
   calls: number;
   failed: number;
   input: number;
+  /** 缓存命中的输入：与 `input` 相加才是整个 prompt。 */
+  cached: number;
   output: number;
 }
 
@@ -435,18 +437,20 @@ function members(actors: ActorUsage[], dim: Dimension): Member[] {
       calls: 0,
       failed: 0,
       input: 0,
+      cached: 0,
       output: 0,
     };
     member.rows += 1;
     member.calls += actor.calls;
     member.failed += actor.failed_calls;
     member.input += actor.tokens_input;
+    member.cached += actor.tokens_cached;
     member.output += actor.tokens_output;
     byValue.set(value, member);
   }
   return [...byValue.values()].sort(
     (a, b) =>
-      b.input + b.output - (a.input + a.output) ||
+      b.input + b.cached + b.output - (a.input + a.cached + a.output) ||
       b.calls - a.calls ||
       a.value.localeCompare(b.value)
   );

@@ -9,6 +9,10 @@ import { localZoneLabel } from '@/topology/format';
  * 两支相邻的颜色在深色底上差异很小，而这条图的价值是把尖峰挑出来；拆分放在
  * 下面的读数行和表里，那里有地方写清楚。一列一个窗口，没有第二根纵轴。
  *
+ * 柱高与「合计」用同一口径：输入（含缓存命中）+ 输出。缓存命中的 token 仍然
+ * 是流进模型的输入，只是计价比未缓存的那部分低；把它们从合计里减掉，一小时的
+ * 读数就会比真实吞吐小三倍，而页面上没有任何一处说这是「只算贵的那部分」。
+ *
  * 没有折叠行的窗口画成虚线的空格，不画成零高的柱：折叠表里缺一格要么是那一
  * 小时没人用，要么是还没折到这里，两者在图上都是空，而零高的柱会把后者说成
  * 前者。缺口是这段图里唯一用虚线的形状，图例就写在标题里。
@@ -41,7 +45,8 @@ export function SpendBars({
   }
 
   const { slots: display, size } = bucket(base.slots, MAX_BARS);
-  const peak = Math.max(...display.map((slot) => slot.input + slot.output), 0);
+  const tokenTotal = (slot: Slot) => slot.input + slot.cached + slot.output;
+  const peak = Math.max(...display.map(tokenTotal), 0);
   // 悬停优先于钉住：钉住是为了腾出手去选中，所以指针一旦移到别的柱上，读数
   // 必须跟着走，否则用户看到的是上一次钉住的那一格在想什么。
   const active = display.find((slot) => slot.key === (hovered ?? pinned)) ?? null;
@@ -51,7 +56,7 @@ export function SpendBars({
     <div className="flex flex-col gap-2 px-4 py-3">
       <div className="flex items-baseline justify-between gap-3 text-[11px]">
         <span className="text-[var(--paper-dim)]">
-          每个窗口的 token（输入 + 输出）
+          每个窗口的 token（输入含缓存 + 输出）
           <span className="ml-2 text-[var(--muted)]">虚线格 = 这一格没有折叠行</span>
         </span>
         <span className="mono shrink-0 text-[var(--muted)]">
@@ -64,7 +69,7 @@ export function SpendBars({
 
       <div className="flex h-24 items-end gap-[2px] border-b border-[var(--line)]">
         {display.map((slot) => {
-          const total = slot.input + slot.output;
+          const total = tokenTotal(slot);
           const selected = active?.key === slot.key;
           const handlers = {
             onMouseEnter: () => setHovered(slot.key),
@@ -154,12 +159,17 @@ function SlotReading({
       </p>
     );
   }
-  const total = slot.input + slot.output;
+  // 合计与输入都按「流进模型的全部输入」算：缓存命中的 token 也是输入，只是
+  // 计价比未缓存的低。只把未缓存的那半叫「输入」会让这一小时的合计看起来只有
+  // 真实吞吐的三成，而页面上没有一处写「这里只算贵的部分」。
+  const totalInput = slot.input + slot.cached;
+  const total = totalInput + slot.output;
   const rows: { label: string; shown: string; raw: string }[] = [
     { label: '合计 token', shown: total.toLocaleString(), raw: String(total) },
-    { label: '输入', shown: slot.input.toLocaleString(), raw: String(slot.input) },
+    { label: '输入', shown: totalInput.toLocaleString(), raw: String(totalInput) },
+    { label: '其中未缓存', shown: slot.input.toLocaleString(), raw: String(slot.input) },
+    { label: '其中缓存命中', shown: slot.cached.toLocaleString(), raw: String(slot.cached) },
     { label: '输出', shown: slot.output.toLocaleString(), raw: String(slot.output) },
-    { label: '缓存', shown: slot.cached.toLocaleString(), raw: String(slot.cached) },
     { label: '调用', shown: slot.calls.toLocaleString(), raw: String(slot.calls) },
     {
       label: '失败',
@@ -305,8 +315,14 @@ function buildSlots(rows: WindowSpend[]): Built {
     }
     const sum = (pick: (row: WindowSpend) => number) => group.reduce((total, row) => total + pick(row), 0);
     const byActor = new Map<string, number>();
+    // 排序口径与合计一致：缓存命中也是这一小时流进模型的输入。只按未缓存输入
+    // 加输出排，命中率高的族（本机 eval 实测一小时 1930 万命中）会掉出前三，
+    // 而它恰恰是这一小时 token 吞吐最大的那一族。
     for (const row of group) {
-      byActor.set(row.actor, (byActor.get(row.actor) ?? 0) + row.tokens_input + row.tokens_output);
+      byActor.set(
+        row.actor,
+        (byActor.get(row.actor) ?? 0) + row.tokens_input + row.tokens_cached + row.tokens_output,
+      );
     }
     slots.push({
       key: `${at}`,
@@ -385,7 +401,7 @@ function bucket(slots: Slot[], max: number): { slots: Slot[]; size: number } {
 function describe(slot: Slot): string {
   const lines = [
     `${stamp(slot.at)} – ${stamp(slot.end)}`,
-    `${compact(slot.input + slot.output)} token（入 ${compact(slot.input)} / 出 ${compact(slot.output)}）`,
+    `${compact(slot.input + slot.cached + slot.output)} token（入 ${compact(slot.input + slot.cached)}，其中缓存命中 ${compact(slot.cached)} / 出 ${compact(slot.output)}）`,
     `${slot.calls} 次调用${slot.failed > 0 ? `，失败 ${slot.failed}` : ''}`,
   ];
   if (slot.missing > 0) lines.push(`${slot.missing}/${slot.windows} 格没有折叠行`);

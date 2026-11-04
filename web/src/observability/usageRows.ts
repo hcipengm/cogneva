@@ -62,14 +62,15 @@ export function actorTotals(actors: ActorUsage[]): ActorGroup[] {
   for (const group of groups) {
     group.rows.sort(
       (a, b) =>
-        b.tokens_input + b.tokens_output - (a.tokens_input + a.tokens_output) ||
+        b.tokens_input + b.tokens_cached + b.tokens_output -
+          (a.tokens_input + a.tokens_cached + a.tokens_output) ||
         b.calls - a.calls ||
         rowKey(a).localeCompare(rowKey(b))
     );
   }
   return groups.sort(
     (a, b) =>
-      b.input + b.output - (a.input + a.output) ||
+      b.input + b.cached + b.output - (a.input + a.cached + a.output) ||
       b.calls - a.calls ||
       a.actor.localeCompare(b.actor)
   );

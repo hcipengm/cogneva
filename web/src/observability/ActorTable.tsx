@@ -41,7 +41,11 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
   const absent = registeredActorNames().filter((name) => !present.has(name));
   const [open, setOpen] = useState<Record<string, boolean>>({});
 
-  const grand = groups.reduce((sum, group) => sum + group.input + group.output, 0);
+  // 分母与「合计」同一口径：缓存命中的 token 也是流进模型的输入，只是计价比
+  // 未命中的低。只把未命中输入算进来，命中率高的执行者（本机 eval 一小时读回
+  // 1930 万）会在「谁在花」里掉出去，而它恰恰是这一小时的最大吞吐方。
+  const tokenTotal = (group: ActorGroup) => group.input + group.cached + group.output;
+  const grand = groups.reduce((sum, group) => sum + tokenTotal(group), 0);
   const totalCalls = groups.reduce((sum, group) => sum + group.calls, 0);
   const totalFailed = groups.reduce((sum, group) => sum + group.failed, 0);
   const totalInput = groups.reduce((sum, group) => sum + group.input, 0);
@@ -51,7 +55,7 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
   // 缓存写入是「有多少行量过」的三态，不是三个数相加：合计要按行集重算，
   // 不能把几十个执行者各自的「还没进账」拼起来。
   const allRows = groups.flatMap((group) => group.rows);
-  const spenders = groups.filter((group) => group.input + group.output > 0);
+  const spenders = groups.filter((group) => tokenTotal(group) > 0);
   const toggle = (actor: string) => setOpen((prev) => ({ ...prev, [actor]: !prev[actor] }));
 
   return (
@@ -69,7 +73,7 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
             <span
               key={group.actor}
               style={{
-                width: `${((group.input + group.output) / grand) * 100}%`,
+                width: `${(tokenTotal(group) / grand) * 100}%`,
                 background:
                   index % 2 === 0
                     ? 'var(--brass)'
@@ -95,7 +99,7 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
         </thead>
         <tbody>
           {groups.map((group) => {
-            const total = group.input + group.output;
+            const total = tokenTotal(group);
             const expandable = group.calls > 0;
             const expanded = expandable && !!open[group.actor];
             return (
@@ -122,7 +126,7 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
                   </td>
                   <td className={NUM}>
                     <Note
-                      text={`${compact(total)} / ${compact(grand)}：这一行的「输入+输出」除以全场合计`}
+                      text={`${compact(total)} / ${compact(grand)}：这一行的「输入（含缓存）+输出」除以全场合计`}
                       className="text-[var(--paper)]"
                     >
                       {percent(total, grand)}
@@ -179,7 +183,7 @@ export function ActorTable({ actors }: { actors: ActorUsage[] }) {
                 </tr>
                 {expanded &&
                   group.rows.map((row) => {
-                    const rowTotal = row.tokens_input + row.tokens_output;
+                    const rowTotal = row.tokens_input + row.tokens_cached + row.tokens_output;
                     const up = splitUpstream(row.upstream);
                     return (
                       <tr key={`${group.actor}|${rowKeyOf(row)}`}>
