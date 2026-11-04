@@ -82,3 +82,60 @@ tests:
               severity: warning
               cogneva_io_managed: "true"
               cogneva_io_face: "读数正确性"
+
+  # 五、有面的首读数没有生产者 ⇒ `for: 30m` 之前不响，之后必须响。这一条与上面那条是一对
+  # 相反方向的缺口（一个没读者、一个没生产者），2026-11-04 评测读数搬走时响的该是这一条。
+  - interval: 1m
+    input_series:
+      - series: 'face_first_reading_consumers_unregistered{job="cogneva-host-readings",instance="cogneva"}'
+        values: '1x200'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: CognevaFaceFirstReadingUnregistered
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: CognevaFaceFirstReadingUnregistered
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "读数正确性"
+
+  # 六、负对照：每一面的首读数都有人认领（0/13）。抓的是界被写成 `>= 0`——没有这一格，
+  # 「今天没有缺口」与「永远在响」在夹具上分不开。
+  - interval: 1m
+    input_series:
+      - series: 'face_first_reading_consumers_unregistered{job="cogneva-host-readings",instance="cogneva"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaFaceFirstReadingUnregistered
+        exp_alerts: []
+
+  # 七、负对照：这一族序列整条缺席（生产者没跑／读不到）。缺席不是 0，也不等于缺口：
+  # 抓的是用 `absent()` 或默认 0 把那件事补出来的写法——那样一次抓取失败会被报成
+  # 「有面没有生产者」，而真正该报的是「这一跑没量」。
+  - interval: 1m
+    input_series:
+      - series: 'face_first_reading_consumers_faces{job="cogneva-host-readings",instance="cogneva"}'
+        values: '13x200'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaFaceFirstReadingUnregistered
+        exp_alerts: []
+
+  # 八、两片报信者各报一个数（一台 1、一台 0）⇒ 仍然只响一条，身份里不带 `job`／`instance`。
+  - interval: 1m
+    input_series:
+      - series: 'face_first_reading_consumers_unregistered{job="cogneva-host-readings",instance="cogneva"}'
+        values: '1x200'
+      - series: 'face_first_reading_consumers_unregistered{job="cogneva-host-readings",instance="cogneva-2"}'
+        values: '0x200'
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: CognevaFaceFirstReadingUnregistered
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              cogneva_io_managed: "true"
+              cogneva_io_face: "读数正确性"

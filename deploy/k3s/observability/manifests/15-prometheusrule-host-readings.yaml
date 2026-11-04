@@ -833,6 +833,35 @@ spec:
             summary: "有 {{ $value }} 面的第一条读数没有任何读者"
             description: "面表（`scripts/data/faces.tsv`）第 10 列点名的那条序列，在公开仓 `deploy/`、`crates/`、`scripts/`、`.github/` 与宿主 `scripts/` 里一处都没有被点名——没有规则读它，没有面板画它，没有代码按它取值。逐面点名读 `face_first_reading_consumer{face=…} == 0`，跑 `bash scripts/host/cogneva-face-first-reading-consumers-reading.sh` 会连同它属于哪个生产者一起印出来。修法只有两种：给这条序列立一个会做决定的读者（一条规则、一块面板、或按它取值的代码），或者把这一面的第一读数换成一条真有读者的读数——换哪一种都要改面表那一格。**不许**用「在注释里提一句」「在登记表里写一遍」充数：那两种都不算读者，普查已经把它们排掉了。"
 
+        # 每一面的第一条读数**有没有生产者**。与上面那条是一对相反方向的缺口：那条问
+        # 「印出来有人用吗」，这条问「印得出来吗」。两种缺法在读数面上都表现为「这一面
+        # hold」，而修法完全相反（一个要加读者，一个要把生产者接回来）。
+        #
+        # 2026-11-04 实测：`eval-evidence-reading.sh` 随公开仓那一笔搬到公开仓，宿主读数
+        # 聚合器只扫本树的名册，于是它从名册上消失了——`eval_judged_cases` /
+        # `eval_bench_cases` 从当天 00:49Z 起再没有样本，两个面的首读数印 absent，
+        # `CognevaEvalJudgedStalled` 之类以 `host_reading_producer_up{producer="eval_evidence"}`
+        # 为在场证明的规则同时变成空集。那一整天里能照出来的只有「这一面 hold」，
+        # 没有任何一格说「生产者搬走了」——而上面这条读者判据当时读的是 0（名字有读者）。
+        #
+        # 判据是「这个名字在两处登记里都找不到」：宿主名册的自声明，或平台侧的度量名册／
+        # `readout` 标签值／记录规则。测试文件提到名字**不算**登记（它只说明有人写过一个
+        # 断言，不说明谁在发这条序列）——2026-11-04 正是这一点让缺口读成 0。界取 `> 0`
+        # 与上面那条同理：分母只有十几个面，欠账从 0 变 1 就是一个整面没有生产者。
+        #
+        # 这一条不管「序列此刻缺席」：整族读不到由 `CognevaHostReadingSeriesVanished` 按
+        # 账本判，那时这里表达式为空集、不响——「这一跑没量」不是「没有缺口」。
+        - alert: CognevaFaceFirstReadingUnregistered
+          expr: max(face_first_reading_consumers_unregistered) > 0
+          for: 30m
+          labels:
+            cogneva_io_managed: "true"
+            cogneva_io_face: "读数正确性"
+            severity: warning
+          annotations:
+            summary: "有 {{ $value }} 面的第一条读数在任何登记里都找不到生产者"
+            description: "面表（`scripts/data/faces.tsv`）第 10 列点名的那条序列，在宿主读数名册（脚本头里的 `# reading: producer=` 自声明，本树与公开仓两棵都算）与平台侧登记（`metric_names.rs`、发 `readout` 的源文件、`- record:` 记录规则）里一处都没有出现——没有进程声称自己发它。逐面点名读 `face_first_reading_consumer{face=…,cause=\"unregistered\"}`，跑 `bash scripts/host/cogneva-face-first-reading-consumers-reading.sh` 会印出这一面属于哪个生产者（`producer=-` 就是这里判的那一种）。修法：把生产者的自声明放回一座**聚合器会扫**的树，或者确认那条序列确实停了并把面表那一格换掉——两种都不许靠「在测试里抄一遍名字」充数。"
+
         # 构建闸管的是**发数**与**每发多宽**，但只管得住走 `cogneva-build.sh` 的那些。
         # 会话里直接起的一发不取槽、不受宽度约束，却和闸里的构建抢同一批核；闸的水位只
         # 数得到闸里的，于是「这台机器被谁压着」在任何读数上都没有答案。2026-10-28 实测
