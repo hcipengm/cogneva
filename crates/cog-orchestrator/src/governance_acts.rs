@@ -1796,4 +1796,24 @@ mod tests {
             "closing was folded back into the drift pass's cadence"
         );
     }
+
+    #[test]
+    fn a_principle_decision_must_name_what_settled_it() {
+        // A principle decision records why a rule was applied. Without the
+        // principle and its rationale the record says a verdict was reached
+        // and hides what reached it, so it must not be accepted.
+        let mut spec = ballot();
+        spec.mode = DecisionMode::Principle;
+        spec.principle_slug = None;
+        spec.principle_rationale = None;
+        assert!(validate_principle(&spec).is_err());
+        spec.principle_slug = Some("an-error-branch-is-not-an-outcome".into());
+        assert!(validate_principle(&spec).is_err());
+        spec.principle_rationale = Some("the failure path was counted as a named outcome".into());
+        assert!(validate_principle(&spec).is_ok());
+        // A principle decision is not a ballot: asking it for the roster,
+        // quorum and deadline a ballot needs would refuse a record that is
+        // complete as what it is.
+        assert!(validate_ballot(&spec).is_err());
+    }
 }
