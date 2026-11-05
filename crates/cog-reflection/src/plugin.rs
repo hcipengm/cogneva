@@ -2174,6 +2174,13 @@ pub fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog
     // 这条探针停在 `Pending` 上，而发现这一环的结局要靠「交出去之后收回判词」才成立
     // ——一条永远不开工的探针，在账上与「这一轮什么都没生成」是同一格。
     task.acceptance.push(discovery_probe_acceptance(probe));
+    // 探针排在所有被要求的工作之后。这一部署只有一个执行槽
+    // （`COGNEVA_BOARD_WIP_LIMITS=running=1`），槽被一条探针占住的那段时间，一条会
+    // 把改动落进树的变更就得等着——而探针的产出是「这个组合能不能用」，不是一次
+    // 落地。调度只在这一处读优先级（`ready.sort_by_key(-priority)`），所以这一句
+    // 不拦探针能不能跑：队列里没有更高优先级的活儿时它照样跑。普通工作取的是
+    // `Task::new` 的默认 1，这里取比它低的一格。
+    task.priority = 0;
     (goal, task)
 }
 
@@ -4705,6 +4712,25 @@ mod tests {
         assert_eq!(
             task.task_type,
             cog_core::TaskType::Custom("capability_discovery".into())
+        );
+        // 探针排在所有被要求的工作后面：这一部署只有**一个**执行槽
+        // （`COGNEVA_BOARD_WIP_LIMITS=running=1`），槽被一条探针占住的那一分钟，
+        // 一条会把改动落进树的变更就得等着。默认的 1 是普通工作的priority，
+        // 探针取 0——比它低，别的都不动。这条只在排队时读（`ready.sort_by_key(-priority)`），
+        // 不限制探针能不能跑：队列里没有更高优先级的工作时它照样跑。
+        assert_eq!(
+            task.priority, 0,
+            "探针必须排在普通工作之后，否则它会占住唯一的执行槽"
+        );
+        assert!(
+            task.priority
+                < cog_core::Task::new(
+                    "x",
+                    cog_core::TaskType::Custom("t".into()),
+                    serde_json::json!({})
+                )
+                .priority,
+            "比较的基准变了：普通工作的默认优先级不再是 1"
         );
     }
 
