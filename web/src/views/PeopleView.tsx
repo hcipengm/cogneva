@@ -1,5 +1,7 @@
 import { useState } from 'react';
 import { useAgentConversation } from '@/hooks/useAgentConversation';
+import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
+import { resourceKey } from '@/store/frameTick';
 import { hireEmployee, type AgentConversationLine } from '@/api/client';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { Button, Empty, Loading, ReadError, ViewFrame } from '@/ui/primitives';
@@ -17,6 +19,9 @@ import { Note } from '@/ui/Note';
  *
  * 说话走 `POST /api/v1/agents/{id}/messages`：话进它的收件箱，回答从同一条路
  * 回来。属主与员工是平的——这条路由在操作者权限组，不在管理员组。
+ *
+ * 画面：这一面本身就是画面——左边是一排人，右边是和他们一来一往的对话正文。
+ * 每一行话的形状（谁说的、送达没有、回答是什么）就在版式里，不另画一张分布图。
  */
 
 /** 每种结局一句话，键取自端点类型本身：没配话的结局会把英文原词贴在灰字里。 */
@@ -78,6 +83,13 @@ export function PeopleView() {
     refreshAgents,
     refreshConversation,
   } = useAgentConversation(true, 60);
+  // 名单与这一屏的会话一起交给「执行者这一面变了」的帧：有人上岗、换态、走了，
+  // 或者有人往某个员工的收件箱里写过一句，立刻重读，不等下一拍 15 秒。两份读数
+  // 同一次触发一起读——分两次读，左栏已经多了一个人、右栏还对着旧的那份会话。
+  useKindTickedRefresh(['agents', resourceKey('agents')], [
+    refreshAgents,
+    refreshConversation,
+  ]);
   const [draft, setDraft] = useState('');
   const [hiring, setHiring] = useState(false);
   const [hireError, setHireError] = useState<string | null>(null);

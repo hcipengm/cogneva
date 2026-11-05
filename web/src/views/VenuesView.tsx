@@ -4,6 +4,7 @@ import { useKindTickedRefresh } from '@/hooks/useStreamDrivenRefresh';
 import { resourceKey } from '@/store/frameTick';
 import { Empty, Loading, Moment, ReadError, Reading, ViewFrame } from '@/ui/primitives';
 import { Note } from '@/ui/Note';
+import { BarList } from '@/ui/plots';
 
 /**
  * 场地这一维：同一批任务按「在哪儿做」分开看。
@@ -108,12 +109,29 @@ export function VenuesView() {
           评测题、进化活儿各自会给自己的任务打上那一栏的名字，标上了才会出现在这里。
         </Empty>
       ) : (
-        <div className="flex min-h-0 flex-1">
-          {data.venues.map((row) => (
-            <div key={row.venue} className="flex min-h-0 flex-1 flex-col">
-              <VenueColumn row={row} windowSecs={data.write_back_window_secs} />
-            </div>
-          ))}
+        <div className="flex min-h-0 flex-1 flex-col">
+          {/* 三栏读数答「这一栏现在怎么样」，这一幅答「几栏摆在一起谁积压」——
+              两件事分开画：前者要原值与判据，后者要形状。 */}
+          <BarList
+            label="各场地还没做完的活"
+            note="同一条任务图按场地标签折叠，没到终态的活都算待做；长度按这一屏最多的那一栏归一"
+            rows={data.venues.map((row) => ({
+              label: row.venue,
+              value: row.open,
+              note: `${row.open} 件`,
+              tone: row.open > 0 ? 'warn' : 'muted',
+              detail: row.latest
+                ? `最近一条到终态的任务是 ${row.latest.outcome}`
+                : '这一栏还没跑完过任何一件',
+            }))}
+          />
+          <div className="flex min-h-0 flex-1 border-t border-[var(--line)]">
+            {data.venues.map((row) => (
+              <div key={row.venue} className="flex min-h-0 flex-1 flex-col">
+                <VenueColumn row={row} windowSecs={data.write_back_window_secs} />
+              </div>
+            ))}
+          </div>
         </div>
       )}
       <Note text="场地与花销为什么不在同一张榜上">
