@@ -19,7 +19,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 
 use cog_core::{RawFileFormat, RawLogIndexEntry, RawLogIndexStore, RawLogQuery, StorageTier};
-use cog_storage::partition_maintainer::{PartitionMaintainer, PartitionedTable};
+use cog_storage::partition_maintainer::{KeyKind, PartitionMaintainer, PartitionedTable};
 use cog_storage::PostgresRawLogIndexStore;
 
 use cog_test_support::database_url;
@@ -30,7 +30,7 @@ use cog_test_support::database_url;
 /// and partitions are plain relations — two parents cannot both own a
 /// `probe_part_default`.
 fn probe_table(table: &str) -> PartitionedTable {
-    PartitionedTable::new(table, "ts", &format!("{table}_part"))
+    PartitionedTable::new(table, "ts", &format!("{table}_part"), KeyKind::Timestamptz)
 }
 
 /// Partition relation names for a probe table, mirroring `probe_table`.

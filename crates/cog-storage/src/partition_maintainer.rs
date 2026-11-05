@@ -15,11 +15,85 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{Datelike, Local, NaiveDate};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
 use cog_core::{SFError, SFResult, ShutdownSignal};
+
+/// What the partition key column holds.
+///
+/// It decides whether a boundary literal names a day or an instant. A `date`
+/// key names a day by itself. A `timestamptz` key names an instant, and a bare
+/// literal like `'2026-11-01'` is resolved against the database session's
+/// timezone — so two deployments that differ in that setting open partitions
+/// with boundaries eight hours apart and route the same row to different
+/// tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    Date,
+    Timestamptz,
+}
+
+impl KeyKind {
+    /// The SQL literal for the first instant of the boundary day.
+    ///
+    /// The zone is not chosen here: the day is resolved against the clock this
+    /// process runs on, which the cluster sets once for every part of itself.
+    /// A `timestamptz` literal then carries the resulting offset, so the
+    /// boundary is one definite instant however the database session happens
+    /// to be configured. Nothing about the layout is frozen into a name at
+    /// build time; moving the cluster's clock moves what month means.
+    pub fn bound_literal(self, day: NaiveDate) -> String {
+        match self {
+            KeyKind::Date => format!("'{}'", day.format("%Y-%m-%d")),
+            KeyKind::Timestamptz => format!("'{}'", first_instant_of(day).to_rfc3339()),
+        }
+    }
+
+    /// The predicate a row's key is tested with against two boundary literals.
+    ///
+    /// Both forms compare against the literal's own type, so neither goes
+    /// through the session timezone to decide what a day is.
+    pub fn range(self, key: &str, start: &str, end: &str) -> String {
+        let cast = match self {
+            KeyKind::Date => "::date",
+            KeyKind::Timestamptz => "::timestamptz",
+        };
+        format!("{key} >= {start}{cast} AND {key} < {end}{cast}")
+    }
+}
+
+/// The first instant the local clock reaches on `day`.
+///
+/// Taking midnight and converting it would fail in a zone whose clocks skip
+/// midnight on that date, so this walks forward to the first hour that exists.
+/// The earliest candidate wins when a clock falls back twice over the same
+/// wall time: both name the same day, and the earlier one is where the day
+/// starts.
+fn first_instant_of(day: NaiveDate) -> chrono::DateTime<chrono::FixedOffset> {
+    use chrono::{Duration, TimeZone};
+
+    let midnight = day
+        .and_hms_opt(0, 0, 0)
+        .expect("every civil day has a midnight");
+    let mut probe = midnight;
+    for _ in 0..=24 {
+        if let Some(instant) = Local.from_local_datetime(&probe).earliest() {
+            return instant.fixed_offset();
+        }
+        probe += Duration::hours(1);
+    }
+    // No wall time on this day exists anywhere in the representable range,
+    // which is reachable only through a zone database far stranger than any
+    // this platform deploys into. The day still has a start; name it by the
+    // offset the day after carries rather than panicking in a loop.
+    Local
+        .from_local_datetime(&midnight)
+        .single()
+        .unwrap_or_else(|| Local.from_utc_datetime(&midnight))
+        .fixed_offset()
+}
 
 /// A table partitioned by month.
 #[derive(Debug, Clone)]
@@ -30,15 +104,34 @@ pub struct PartitionedTable {
     /// Name prefix of this table's partitions. Not always the parent name:
     /// the explainability partitions predate the rename to `explainability_part`.
     pub prefix: String,
+    /// Whether the key column is a `date` or a `timestamptz`.
+    pub key_kind: KeyKind,
 }
 
 impl PartitionedTable {
-    pub fn new(parent: &str, key: &str, prefix: &str) -> Self {
+    pub fn new(parent: &str, key: &str, prefix: &str, key_kind: KeyKind) -> Self {
         Self {
             parent: parent.to_string(),
             key: key.to_string(),
             prefix: prefix.to_string(),
+            key_kind,
         }
+    }
+
+    /// The literal for one boundary day, in the zone this process runs on.
+    fn bound_literal(&self, day: NaiveDate) -> String {
+        self.key_kind.bound_literal(day)
+    }
+
+    /// The two boundary literals that fence the half-open range `[start, end)`.
+    fn bounds(&self, start: NaiveDate, end: NaiveDate) -> (String, String) {
+        (self.bound_literal(start), self.bound_literal(end))
+    }
+
+    /// The predicate that keeps this table's key inside `[start, end)`.
+    fn within(&self, start: &str, end: &str) -> String {
+        self.key_kind
+            .range(&cog_core::sql::quote_relation(&self.key), start, end)
     }
 }
 
@@ -54,10 +147,25 @@ impl PartitionedTable {
 /// table; nothing writes it and no migration recreates it.
 pub fn time_series_tables() -> Vec<PartitionedTable> {
     vec![
-        PartitionedTable::new("audit_logs", "created_at", "audit_logs"),
-        PartitionedTable::new("billing_records", "created_at", "billing_records"),
-        PartitionedTable::new("raw_log_index", "log_date", "raw_log_index"),
-        PartitionedTable::new("explainability_part", "timestamp", "explainability"),
+        PartitionedTable::new(
+            "audit_logs",
+            "created_at",
+            "audit_logs",
+            KeyKind::Timestamptz,
+        ),
+        PartitionedTable::new(
+            "billing_records",
+            "created_at",
+            "billing_records",
+            KeyKind::Timestamptz,
+        ),
+        PartitionedTable::new("raw_log_index", "log_date", "raw_log_index", KeyKind::Date),
+        PartitionedTable::new(
+            "explainability_part",
+            "timestamp",
+            "explainability",
+            KeyKind::Timestamptz,
+        ),
     ]
 }
 
@@ -205,7 +313,10 @@ impl PartitionMaintainer {
     /// still reconciled, since the failure is more likely to be specific to
     /// one table than to the connection.
     pub async fn maintain(&self) -> SFResult<()> {
-        let today = Utc::now().date_naive();
+        // Which month is "now" is a question about the cluster's clock, not
+        // about UTC: a round run in the eight hours after a month turns over
+        // must open the month the rest of the cluster is already writing into.
+        let today = Local::now().date_naive();
         let current = months_since_epoch(today);
         let from_month = current - MONTHS_BEHIND;
         let to_month = current + MONTHS_AHEAD;
@@ -286,12 +397,11 @@ impl PartitionMaintainer {
         start: NaiveDate,
         end: NaiveDate,
     ) -> SFResult<()> {
+        let (start, end) = table.bounds(start, end);
         let sql = format!(
-            "CREATE TABLE IF NOT EXISTS {name} PARTITION OF {parent} FOR VALUES FROM ('{start}') TO ('{end}')",
+            "CREATE TABLE IF NOT EXISTS {name} PARTITION OF {parent} FOR VALUES FROM ({start}) TO ({end})",
             name = cog_core::sql::quote_relation(name),
             parent = cog_core::sql::quote_relation(&table.parent),
-            start = start,
-            end = end,
         );
         sqlx::query(&sql)
             .execute(&self.pool)
@@ -317,6 +427,8 @@ impl PartitionMaintainer {
             .await
             .map_err(|e| SFError::Database(e.to_string()))?;
 
+        let (start, end) = table.bounds(start, end);
+        let within = table.within(&start, &end);
         for sql in [
             format!(
                 "ALTER TABLE {parent} DETACH PARTITION {default}",
@@ -324,22 +436,20 @@ impl PartitionMaintainer {
                 default = cog_core::sql::quote_relation(&default),
             ),
             format!(
-                "CREATE TABLE IF NOT EXISTS {name} PARTITION OF {parent} FOR VALUES FROM ('{start}') TO ('{end}')",
+                "CREATE TABLE IF NOT EXISTS {name} PARTITION OF {parent} FOR VALUES FROM ({start}) TO ({end})",
                 name = cog_core::sql::quote_relation(name),
                 parent = cog_core::sql::quote_relation(&table.parent),
             ),
             // Re-inserting through the parent routes each row to the partition
             // that now covers it.
             format!(
-                "INSERT INTO {parent} SELECT * FROM {default} WHERE {key} >= '{start}'::date AND {key} < '{end}'::date",
+                "INSERT INTO {parent} SELECT * FROM {default} WHERE {within}",
                 parent = cog_core::sql::quote_relation(&table.parent),
                 default = cog_core::sql::quote_relation(&default),
-                key = cog_core::sql::quote_relation(&table.key),
             ),
             format!(
-                "DELETE FROM {default} WHERE {key} >= '{start}'::date AND {key} < '{end}'::date",
+                "DELETE FROM {default} WHERE {within}",
                 default = cog_core::sql::quote_relation(&default),
-                key = cog_core::sql::quote_relation(&table.key),
             ),
             format!(
                 "ALTER TABLE {parent} ATTACH PARTITION {default} DEFAULT",
@@ -380,14 +490,13 @@ impl PartitionMaintainer {
         start: NaiveDate,
         end: NaiveDate,
     ) -> SFResult<bool> {
+        let (start, end) = table.bounds(start, end);
         let sql = format!(
-            "SELECT EXISTS (SELECT 1 FROM ONLY {default} WHERE {key} >= $1::date AND {key} < $2::date)",
+            "SELECT EXISTS (SELECT 1 FROM ONLY {default} WHERE {within})",
             default = cog_core::sql::quote_relation(&default_name(table)),
-            key = cog_core::sql::quote_relation(&table.key),
+            within = table.within(&start, &end),
         );
         let row = sqlx::query_scalar::<_, bool>(&sql)
-            .bind(start)
-            .bind(end)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| SFError::Database(e.to_string()))?;
@@ -489,6 +598,73 @@ mod tests {
         let (start, end) = month_bounds(months_since_epoch(date(2026, 12, 1)));
         assert_eq!(start, date(2026, 12, 1));
         assert_eq!(end, date(2027, 1, 1));
+    }
+
+    /// A boundary the database cannot misread.
+    ///
+    /// `'2026-11-01'` casts to `timestamptz` through whatever zone the session
+    /// carries, so two deployments open their November partition eight hours
+    /// apart and route the same row to different tables. The literal must
+    /// therefore name the offset itself, and the offset must be the one the
+    /// cluster's clock uses — which is why the day is resolved here rather
+    /// than written down.
+    #[test]
+    fn a_timestamptz_boundary_carries_the_offset_of_this_clock() {
+        let day = date(2026, 11, 1);
+        let literal = KeyKind::Timestamptz.bound_literal(day);
+        let parsed = chrono::DateTime::parse_from_rfc3339(literal.trim_matches('\''))
+            .expect("a boundary literal must name an offset, not leave it to the reader");
+        assert_eq!(
+            parsed.with_timezone(&Local).date_naive(),
+            day,
+            "the boundary is not the first instant of that day on this clock"
+        );
+        // The same clock, a year on: the literal follows it instead of pinning
+        // one offset for every month. A zone that changes offset over the year
+        // would otherwise put one month's boundary in the wrong instant.
+        let later = KeyKind::Timestamptz.bound_literal(date(2030, 1, 1));
+        assert_eq!(
+            chrono::DateTime::parse_from_rfc3339(later.trim_matches('\''))
+                .expect("a boundary literal must name an offset")
+                .with_timezone(&Local)
+                .date_naive(),
+            date(2030, 1, 1)
+        );
+    }
+
+    /// A `date` key names a day, and a day has no zone to name.
+    #[test]
+    fn a_date_boundary_names_a_day_and_no_instant() {
+        assert_eq!(
+            KeyKind::Date.bound_literal(date(2026, 11, 1)),
+            "'2026-11-01'"
+        );
+    }
+
+    /// The range predicate reads the boundary literal and nothing else.
+    ///
+    /// A predicate that binds two timestamps and lets the server cast them
+    /// brings the session zone back in through the side door: the row that
+    /// decides which table a write lands in would then depend on a setting
+    /// that only exists to decide how a time is printed.
+    #[test]
+    fn the_range_predicate_consults_no_session_zone() {
+        let table = PartitionedTable::new("probe", "ts", "probe_part", KeyKind::Timestamptz);
+        let (start, end) = table.bounds(date(2026, 11, 1), date(2026, 12, 1));
+        let within = table.within(&start, &end);
+        assert_eq!(
+            within,
+            format!("\"ts\" >= {start}::timestamptz AND \"ts\" < {end}::timestamptz")
+        );
+        assert!(!within.contains("AT TIME ZONE"));
+        assert!(!within.contains("$1"));
+
+        let by_day = PartitionedTable::new("probe", "log_date", "probe_part", KeyKind::Date);
+        let (start, end) = by_day.bounds(date(2026, 11, 1), date(2026, 12, 1));
+        assert_eq!(
+            by_day.within(&start, &end),
+            "\"log_date\" >= '2026-11-01'::date AND \"log_date\" < '2026-12-01'::date"
+        );
     }
 
     /// A table the chain retires has to leave this list in the same change.
@@ -633,7 +809,12 @@ mod tests {
         let pool = sqlx::PgPool::connect_lazy("postgres://127.0.0.1:1/cogneva").unwrap();
         let maintainer = PartitionMaintainer::new(
             pool,
-            vec![PartitionedTable::new("probe", "ts", "probe_part")],
+            vec![PartitionedTable::new(
+                "probe",
+                "ts",
+                "probe_part",
+                KeyKind::Timestamptz,
+            )],
         )
         .with_metrics(Some(metrics.clone()));
 
