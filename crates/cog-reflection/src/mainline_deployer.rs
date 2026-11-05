@@ -1607,7 +1607,15 @@ pub(crate) fn ci_hold_goal_text(
         for seen in evidence {
             said.push_str(&format!("- {}：{}\n", seen.check, seen.said));
         }
-        said.push_str("修好这些失败点再提交一个新版本。");
+        // 动作顺序写在这里，因为它是这件事与「按标题猜着改」的全部区别：上游 CI
+        // 一轮要十几分钟，而本地的同一条测试两分钟就能给出红绿。上一次上游还没
+        // 见过绿的提交，对上游来说就是又一次试错——2026-11-05 实测同一处 Test 红
+        // 在六个修订上反复返工，每一轮都交出了一个没在本地跑过的版本。
+        said.push_str(
+            "先在本地把点名的测试单独跑红（证据里写明了名字的，就按名字跑那几条），\
+             改到它变绿、再跑一遍这批检查覆盖的测试确认没有连带弄坏别的，然后才提交。\
+             没在本地见过它变绿的提交，等于把上游 CI 当成调试器。",
+        );
         said
     };
     format!(
@@ -1677,6 +1685,74 @@ pub(crate) fn ci_log_tail(text: &str) -> Option<String> {
     }
     kept.reverse();
     (!kept.is_empty()).then(|| kept.join(" / "))
+}
+
+/// 日志正文里点名了哪几条测试红了。
+///
+/// 交给修复方的「日志末尾」只说得出几条：cargo 在最后一行写
+/// `test result: FAILED. 1305 passed; 2 failed`，而红的是哪几条写在更早的
+/// `test path::name ... FAILED` 里，它们的名字永远落不进那六行尾巴。只给计数，
+/// 接手的人要么把整个测试二进制再跑一遍才知道红在哪，要么按标题猜着改——两条
+/// 都是返工的来源。这里把那几行名字直接读出来，随日志一起交下去。
+///
+/// 按行首的 `test ` 认，而不是按整行匹配某个 cargo 版本的确切措辞：libtest
+/// 的失败行是唯一会把测试名与 `FAILED` 放在同一行的形状，单元测试、集成测试
+/// 与文档测试都用它。去重是为了最后那段 `failures:` 复述——同一批名字在那里
+/// 再列一次，不去重就会把一条红说成两条。
+///
+/// 非 Rust 的作业（Web Build、脚本 lint）没有这种行，读出来是空：空在这里是
+/// 「这份日志不是这样说话的」，不是「没有失败」。
+pub(crate) fn ci_failed_test_names(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let plain = strip_ansi(line);
+        let line = strip_log_stamp(&plain).trim();
+        let Some(rest) = line.strip_prefix("test ") else {
+            continue;
+        };
+        let Some(name) = rest.strip_suffix(" ... FAILED") else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || out.iter().any(|seen| seen == name) {
+            continue;
+        }
+        out.push(name.to_string());
+        if out.len() == CI_FAILED_TEST_NAMES_MAX {
+            break;
+        }
+    }
+    out
+}
+
+/// 一份日志最多点几个名字。
+///
+/// 交下去的是「该去跑哪几条」，不是失败全表：一百条红的时候，前几个名字足以
+/// 让人找到那一族测试，而把一百个名字塞进上下文只会挤掉真正的原因。
+const CI_FAILED_TEST_NAMES_MAX: usize = 8;
+
+/// 去掉终端着色序列。
+///
+/// 作业日志是终端输出原样存下来的：cargo 给 `FAILED` 着红，那段转义码夹在
+/// 行首与词之间，按行前缀认形状时会整个认不出来。只处理 CSI（`ESC [` 到某个
+/// 字母为止）——日志里另一种转义是光标移动，同样以字母收尾，一并吃掉。
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// 这句话是不是 runner 在说「那一步没成功」，而不是那条检查在说哪里错了。
@@ -4652,9 +4728,21 @@ impl MainlineDeployer {
                     &format!("/repos/{repo}/actions/jobs/{id}/logs"),
                 )
                 .await
-                .ok()
-                .and_then(|body| ci_log_tail(&body));
-                if let Some(said) = log {
+                .ok();
+                // 名字排在末尾那句之前：末尾说的是「最后一行怎么收的」，名字说的是
+                // 「该去跑哪几条」。读到这句的人下一步就是动手，先看见名字才找得到
+                // 位置；只看见「2 failed」则只能把整族测试再跑一遍。
+                if let Some(names) = log
+                    .as_deref()
+                    .map(ci_failed_test_names)
+                    .filter(|names| !names.is_empty())
+                {
+                    out.push(CheckEvidence {
+                        check: name.clone(),
+                        said: format!("红了的测试：{}", names.join("、")),
+                    });
+                }
+                if let Some(said) = log.as_deref().and_then(ci_log_tail) {
                     out.push(CheckEvidence {
                         check: name.clone(),
                         said: format!("日志末尾：{said}"),
@@ -5364,8 +5452,12 @@ impl MainlineDeployer {
         // 面与验收都挂在行上，不只在目标文字里：验收是「这一行关掉长什么样」被读的
         // 那一处，面是它该归谁。
         task.face_id = Some(CI_HOLD_FACE.to_string());
+        // 两段，前一段在本地，后一段在上游。只写后一段等于没有可自证的部分：
+        // 上游 CI 十几分钟才给一次判词，而提交前能验的只有本地那几条测试。少了
+        // 前一段，这条验收在动手的人手里永远读成「等结果」，而等来的往往又是一次红。
         task.acceptance.push(format!(
-            "新版 main 提交在上游 CI 的同一组检查上全绿，且它取代了被判红的 {}——部署器放开滚动即算关闭。",
+            "证据里点名的那几条测试在本仓库里跑绿（提交前自己跑过，不是等上游告诉你），\
+             且新版 main 提交在上游 CI 的同一组检查上全绿、它取代了被判红的 {}——部署器放开滚动即算关闭。",
             rev12(rev)
         ));
         match orchestrator.submit_goal_auto(goal, vec![task]).await {
@@ -14082,6 +14174,45 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let said = ci_log_tail(&log).expect("tail");
         assert!(said.ends_with("最后一句"), "{said}");
         assert!(said.chars().count() <= MainlineDeployer::CI_EVIDENCE_MAX_CHARS);
+    }
+
+    /// 红的是哪几条测试，要从日志里读出来，不能只交一个计数。
+    ///
+    /// 2026-11-05 的现场：一份 `Test` 作业日志里，能落到「日志末尾」那六行的
+    /// 只有 `test result: FAILED. 1305 passed; 2 failed`，名字在更早的
+    /// `test … FAILED` 与最后的 `failures:` 复述里。只交计数，交给修复方的那一句
+    /// 就退化成「有一处红」，它要么把整个测试二进制再跑一遍去找，要么按标题猜着改。
+    #[test]
+    fn the_failed_test_names_are_read_out_of_the_log_not_just_counted() {
+        let log = "2026-11-05T03:00:43.9658769Z test loop_health::tests::every_repair ... ok\n\
+                   2026-11-05T03:00:43.9658769Z \u{1b}[31mtest deployer_rbac_covers_its_reads_test::the_role_grants_every_resource_the_loop_addresses ... FAILED\u{1b}[0m\n\
+                   2026-11-05T03:00:44.6188512Z test deployer_rbac_covers_its_reads_test::the_scan_sees_the_commands_it_is_supposed_to ... FAILED\n\
+                   2026-11-05T03:02:27.3175049Z test result: FAILED. 1305 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 135.70s\n\
+                   \n\
+                   failures:\n\
+                   \n\
+                   ---- deployer_rbac_covers_its_reads_test::the_role_grants_every_resource_the_loop_addresses stdout ----\n\
+                   2026-11-05T03:02:27.3170839Z test deployer_rbac_covers_its_reads_test::the_role_grants_every_resource_the_loop_addresses ... FAILED\n";
+        assert_eq!(
+            ci_failed_test_names(log),
+            vec![
+                "deployer_rbac_covers_its_reads_test::the_role_grants_every_resource_the_loop_addresses",
+                "deployer_rbac_covers_its_reads_test::the_scan_sees_the_commands_it_is_supposed_to",
+            ],
+            "a name that appears twice (its own line and the failures recap) is one red test, not two"
+        );
+
+        // 非 Rust 的作业没有这种行：读出来是空，而空是「这份日志不这样说话」。
+        assert!(
+            ci_failed_test_names("缺少 web/node_modules/.bin/tsc\n##[error]exit 1\n").is_empty()
+        );
+        assert!(ci_failed_test_names("").is_empty());
+
+        // 一百条红的时候交下去的是「先去跑哪一族」，不是失败全表。
+        let many: String = (0..40)
+            .map(|i| format!("test some_crate::case_{i} ... FAILED\n"))
+            .collect();
+        assert_eq!(ci_failed_test_names(&many).len(), CI_FAILED_TEST_NAMES_MAX);
     }
 
     #[test]
