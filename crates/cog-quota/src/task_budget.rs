@@ -35,6 +35,51 @@ use crate::error::{QuotaError, QuotaResult};
 use crate::store::{read_int, store_error};
 use cog_core::{KeyValueStore, QuotaLimits};
 
+/// 一个 `spent` 读数计的是哪一窗。
+///
+/// 计数器对「窗还没开」与「上一窗烧穿了、当天过期把格子抹掉」给的是同一个 `0`，在
+/// `spent=0` 那一格上两者逐字相同——那一格问不出是哪一个。答案不在格子里，而在格子
+/// 的**寿命**与进程时钟碰在一起的时候：投影写格子时给的正是「到窗末还有多少秒」，所以
+/// 寿命多久，格子记的那一窗就多久。判定把这个答案带在读数旁边，而不是让读的人拿一个
+/// `0` 去猜。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpentWindow {
+    /// 格子活着，寿命落在这一窗里：窗开着，`spent` 就是这一窗已经花掉的数（`0` 也算）。
+    ///
+    /// 上一窗烧穿之后重置成 `0` 的那一格落的也是这里：格子是这一窗的，只是这一窗还
+    /// 一个 token 都没花——两者的区别在账本上，不在这段读数里，所以这一句不假装分得开。
+    Open,
+    /// 格子的寿命长过这一窗的末尾：它记的那一窗比这一窗结束得晚，起点还在将来。
+    ///
+    /// 这里的 `0` 是「窗还没开」，不是「花光了」——同一个 `0`，两句相反的话。
+    NotYetOpen,
+    /// 格子不在，或者它身上没有能摆进某一窗的寿命：读数里没有东西能把 `now_unix` 放进
+    /// 一窗，于是照实回答分不开，而不是替调用方挑一个。
+    Unresolved,
+}
+
+/// 计数器的寿命把 `now_unix` 放在哪一窗。
+///
+/// 两个入参都是运行中这套部署自己的读数：`remaining_life` 是存储报回来的剩余寿命
+/// （`None` 表示格子不在），`now_unix` 是本进程的时钟。一窗开没开，只有这两件碰在
+/// 一起才答得出来——单看任何一个都答不出，这正是两个 `0` 同形的原因。
+///
+/// 边界用 [`seconds_to_next_day`]：它和投影写寿命时用的是同一个函数，所以「这一窗还剩
+/// 多少」在两处是同一个数，不会各自算出各自的一句。
+pub fn spent_window(remaining_life: Option<i64>, now_unix: i64) -> SpentWindow {
+    let Some(life) = remaining_life else {
+        return SpentWindow::Unresolved;
+    };
+    if life <= 0 {
+        // `-1`（没有寿命）与 `-2`（格子不在）都不是一窗的格子。
+        return SpentWindow::Unresolved;
+    }
+    if life as u64 > seconds_to_next_day(now_unix) {
+        return SpentWindow::NotYetOpen;
+    }
+    SpentWindow::Open
+}
+
 /// 一件任务的预算判定。判定与它所依据的读数同一次给出，调用方不必再回读一遍。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskBudgetDecision {
@@ -45,6 +90,11 @@ pub struct TaskBudgetDecision {
     pub limits: Option<QuotaLimits>,
     /// 今天这件任务已经花掉的 token。
     pub spent_today: u64,
+    /// 上面那个数是哪一窗的。
+    ///
+    /// 带在旁边而不是替掉它：`spent=0` 那一面一个字节都没���，读那一面的人照旧读到
+    /// `0`，而分得开两个 `0` 的那句话在这里。
+    pub spent_window: SpentWindow,
     /// 还剩多少（按硬上限减已花）。没有预算时没有这个数。
     pub remaining: Option<u64>,
     /// 这一次放不放行。
@@ -181,6 +231,22 @@ impl TaskBudgetManager {
             .max(0) as u64
     }
 
+    /// [`Self::spent_today`] 读到的那个数说的是哪一窗。
+    ///
+    /// 读的还是同一个格子，只是连它的寿命一起读：格子在不在、还剩多久到期，都是存储
+    /// 自己的读数，这里不另存一本账。格子不在时答案就是 [`SpentWindow::Unresolved`]
+    /// ——「还没写过」与「上一窗烧穿后过期抹掉」在键值面上是同一件事，替调用方挑一个
+    /// 会让两个相反的处境读成同一句话。
+    pub async fn spent_window(&self, task_id: &str, now_unix: i64) -> QuotaResult<SpentWindow> {
+        let store = self.store.lock().await;
+        let key = Self::key("used", task_id);
+        if store.get(&key).await.map_err(store_error)?.is_none() {
+            return Ok(spent_window(None, now_unix));
+        }
+        let life = store.ttl(&key).await.map_err(store_error)?;
+        Ok(spent_window(Some(life), now_unix))
+    }
+
     /// 判这一发放不放行，不落账。`now_unix` 是参数而不是读时钟：日界决定了拒绝时
     /// 给出多少等待，而「午夜前一秒」那一格只有把时钟交进来才测得了。
     pub async fn check(
@@ -191,10 +257,14 @@ impl TaskBudgetManager {
     ) -> QuotaResult<TaskBudgetDecision> {
         let limits = self.budget(task_id).await?;
         let spent_today = self.spent_today(task_id).await;
+        // 这里是唯一同时握着时钟与那一格的地方，所以「这个 0 是哪一窗的」只在这里
+        // 落定：别的任何一处再推一遍，都是同一件事的第二个出处。
+        let spent_window = self.spent_window(task_id, now_unix).await?;
         Ok(verdict(
             task_id,
             limits,
             spent_today,
+            spent_window,
             estimated_tokens,
             now_unix,
         ))
@@ -228,11 +298,14 @@ impl TaskBudgetManager {
 /// 判定本身，与存储无关。
 ///
 /// 单独成一个函数是因为这套判定要能在没有 Redis 的地方被逐格验：放行、只告警、
-/// 硬拒、没有预算、以及午夜前一秒的等待。
+/// 硬拒、没有预算、以及午夜前一秒的等待。`spent_window` 是读数那一侧交进来的：判定
+/// 自己不回读存储，所以「这个数计的是哪一窗」必须由握着时钟与格子的那个人给出，而不是
+/// 在这里从 `spent_today` 猜——那一格上两个 `0` 是同一个数。
 pub fn verdict(
     task_id: &str,
     limits: Option<QuotaLimits>,
     spent_today: u64,
+    spent_window: SpentWindow,
     estimated_tokens: u64,
     now_unix: i64,
 ) -> TaskBudgetDecision {
@@ -241,6 +314,7 @@ pub fn verdict(
             task_id: task_id.to_string(),
             limits: None,
             spent_today,
+            spent_window,
             remaining: None,
             allowed: true,
             warning: false,
@@ -254,6 +328,7 @@ pub fn verdict(
         task_id: task_id.to_string(),
         limits: Some(limits),
         spent_today,
+        spent_window,
         remaining: Some(remaining),
         allowed,
         // 只有放行的才有「告警」这一说：被拒的那一发已经写了它的理由，
@@ -341,7 +416,7 @@ mod tests {
 
     #[test]
     fn a_task_nobody_budgeted_is_allowed() {
-        let d = verdict("t1", None, 10_000_000, 100_000, NOON);
+        let d = verdict("t1", None, 10_000_000, SpentWindow::Open, 100_000, NOON);
         assert!(d.allowed);
         assert!(!d.warning);
         assert_eq!(d.remaining, None);
@@ -353,10 +428,10 @@ mod tests {
         let limits = QuotaLimits::new(80, 100);
         // 恰好到界放行：界是「用到这里为止」，不是「用到这里就停」。这一格同时已经
         // 越过软上限，所以它也是一个告警——放行与告警不矛盾，它们是两句话。
-        let at = verdict("t1", Some(limits), 100, 0, local_noon());
+        let at = verdict("t1", Some(limits), 100, SpentWindow::Open, 0, local_noon());
         assert!(at.allowed);
         assert!(at.warning);
-        let over = verdict("t1", Some(limits), 100, 1, local_noon());
+        let over = verdict("t1", Some(limits), 100, SpentWindow::Open, 1, local_noon());
         assert!(!over.allowed);
         assert_eq!(over.remaining, Some(0));
         // 正午到下一个午夜是半天，不是一整天：等待是「到那个午夜」，不是
@@ -370,14 +445,21 @@ mod tests {
         let limits = QuotaLimits::new(10, 10);
         // 午夜前一秒：从正午往后走半天再减一秒。
         let last_second = local_noon() + SECONDS_PER_DAY / 2 - 1;
-        let d = verdict("t1", Some(limits), 10, 1, last_second);
+        let d = verdict("t1", Some(limits), 10, SpentWindow::Open, 1, last_second);
         assert!(!d.allowed);
         assert_eq!(d.wait_secs, Some(1));
     }
 
     #[test]
     fn a_call_that_crosses_only_the_soft_limit_is_allowed_with_a_warning() {
-        let d = verdict("t1", Some(QuotaLimits::new(50, 100)), 60, 0, NOON);
+        let d = verdict(
+            "t1",
+            Some(QuotaLimits::new(50, 100)),
+            60,
+            SpentWindow::Open,
+            0,
+            NOON,
+        );
         assert!(d.allowed);
         assert!(d.warning);
         assert_eq!(d.wait_secs, None);
@@ -385,8 +467,59 @@ mod tests {
 
     #[test]
     fn a_refused_call_is_never_also_a_soft_warning() {
-        let d = verdict("t1", Some(QuotaLimits::new(50, 100)), 100, 1, NOON);
+        let d = verdict(
+            "t1",
+            Some(QuotaLimits::new(50, 100)),
+            100,
+            SpentWindow::Open,
+            1,
+            NOON,
+        );
         assert!(!d.allowed);
         assert!(!d.warning);
+    }
+
+    /// 窗还没开的那个 `spent=0` 与上一窗烧穿了、格子被当天过期抹掉的那个 `spent=0`，
+    /// 在 key=value 面上是同一个裸数；判定不能只读那一格。
+    ///
+    /// 两半都钉住。先钉那一格本身：两次判定的 `spent` 逐字相同，所以一个只读格子的
+    /// 实现必然把这两个相反的处境答成同一个值。再钉判定带在旁边的窗口读数：格子自己
+    /// 的寿命与本进程的时钟放在一起，一个是「窗已经开着，只是读数为 0」，一个是「这句
+    /// 0 说的是窗还没开」，两者不是同一个值。最后钉分不开的那一格——格子不在时既可能
+    /// 是还没写过，也可能是上一窗烧穿后被过期抹掉，读数照实说分不开，不挑一个。
+    ///
+    /// tier: live —— 两个 `0` 分不分得开，是运行中这套部署的时钟与格子寿命的读数；
+    /// 读源码只能读到它们会落在同一格上，读不到此刻是哪一个。
+    ///
+    /// principle: feedback_a_zero_in_the_future_and_a_zero_in_the_past_are_the_same_bare_number
+    #[test]
+    fn the_two_zeros_are_one_bare_number_and_two_windows() {
+        let limits = QuotaLimits::new(80, 100);
+        let now = local_noon();
+        let rest_of_window = seconds_to_next_day(now) as i64;
+
+        // 上一窗烧穿、格子在午夜被过期抹掉：这一窗开着，投影把 `0` 写回来，寿命正好是
+        // 这一窗剩下的部分。
+        let after_reset = spent_window(Some(rest_of_window), now);
+        // 起点还在将来：格子带着比这一窗剩下的部分更长的寿命，它记的那一窗结束得更晚。
+        let before_start = spent_window(Some(rest_of_window + SECONDS_PER_DAY), now);
+        assert_eq!(after_reset, SpentWindow::Open);
+        assert_eq!(before_start, SpentWindow::NotYetOpen);
+        assert_ne!(after_reset, before_start);
+
+        let exhausted = verdict("t1", Some(limits), 0, after_reset, 0, now);
+        let unopened = verdict("t1", Some(limits), 0, before_start, 0, now);
+        // 那一格：逐字相同。判定若只读它，这两次就该是同一个值——这就是本原则。
+        assert_eq!(exhausted.spent_today, 0);
+        assert_eq!(unopened.spent_today, 0);
+        assert_eq!(
+            format!("spent={}", exhausted.spent_today),
+            format!("spent={}", unopened.spent_today)
+        );
+        // 而判定本身不是同一个值：把两个 `0` 分开的那句话在格子旁边，不在格子里。
+        assert_ne!(exhausted, unopened);
+        // 格子不在时读数分不开这两件事，照实回答分不开。
+        assert_eq!(spent_window(None, now), SpentWindow::Unresolved);
+        assert_eq!(spent_window(Some(-1), now), SpentWindow::Unresolved);
     }
 }

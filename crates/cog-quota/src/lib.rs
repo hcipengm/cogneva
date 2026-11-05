@@ -74,7 +74,9 @@ pub use metrics::QuotaMetrics;
 pub use model::{ModelConfig, ModelRegistry, TaskType};
 pub use observable::{QuotaObservable, QuotaReadings};
 pub use quota::{QuotaChecker, QuotaManager};
-pub use task_budget::{verdict as task_budget_verdict, TaskBudgetDecision, TaskBudgetManager};
+pub use task_budget::{
+    verdict as task_budget_verdict, SpentWindow, TaskBudgetDecision, TaskBudgetManager,
+};
 
 // Re-export core DTOs so consumers see them under cog_quota::* as before.
 use cog_core::{
