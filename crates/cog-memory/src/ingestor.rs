@@ -35,9 +35,6 @@ pub const MEMORY_INGEST_EVENTS_LOOP: &str = "memory_ingest_events";
 /// `cogneva_event_bus_lagged_total` 上没有对应的 `consumer` 值。
 pub const MEMORY_BUS_CONSUME_LOOP: &str = "memory_ingest_bus_consume";
 
-/// `memory_operations_total` 上「这次没抽，因为同一份 raw 已有人在办」的
-/// operation 取值。放在这里而不是指标名常量里：它不是一条新的操作，是抽取
-/// 这条路上的一次具名跳过。
 /// The namespaces something searches, and therefore the only ones extraction
 /// runs in.
 ///
@@ -49,13 +46,17 @@ pub const MEMORY_BUS_CONSUME_LOOP: &str = "memory_ingest_bus_consume";
 ///
 /// `default` is deliberately absent: it is where extraction used to write, and
 /// no production search asks for it.
-const READ_NAMESPACES: [&str; 4] = [
+const READ_NAMESPACES: [&str; 5] = [
     "task_decomposition",
     "implementation",
     "failure_pattern",
     "task_execution",
+    "knowledge",
 ];
 
+/// `memory_operations_total` 上「这次没抽，因为同一份 raw 已有人在办」的
+/// operation 取值。放在这里而不是指标名常量里：它不是一条新的操作，是抽取
+/// 这条路上的一次具名跳过。
 const SKIP_IN_FLIGHT_OPERATION: &str = "extract_skipped_in_flight";
 
 /// `memory_operations_total` 上「这份 raw 的命名空间没有读者，所以没抽」的

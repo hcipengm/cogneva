@@ -6,9 +6,9 @@
 //! price only when a reader queries that namespace. On 2026-11-05 the two
 //! lists disagreed: extraction wrote to `default` (83,662 schema rows and
 //! 3,969 summaries by that afternoon) and every production search asked one of
-//! `task_decomposition`, `implementation`, `failure_pattern`, `task_execution`.
-//! Not one of the 83,662 rows had ever been retrieved, and the summary search
-//! method had never been called in production at all.
+//! `task_decomposition`, `implementation`, `failure_pattern`, `task_execution`,
+//! `knowledge`. Not one of the 83,662 rows had ever been retrieved, and the
+//! summary search method had never been called in production at all.
 //!
 //! The ingest gate reads the list the readers declare. This test pins the two
 //! together: the copy the extractor holds and the list the searches use must be

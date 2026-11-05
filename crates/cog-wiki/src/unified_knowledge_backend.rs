@@ -288,13 +288,20 @@ const NS_KNOWLEDGE: &str = "knowledge";
 /// extractor lives: the answer to "who reads this" is the set of searches
 /// below, and a second list somewhere else would be a second answer.
 ///
+/// `knowledge` is searched by [`retrieve_relevant`](KnowledgeBackend::retrieve_relevant),
+/// the whole-query retrieval, and so belongs on the list even though nothing
+/// writes it today: the list answers "is there a search for this", not "is
+/// there a writer", and a namespace that is only written once a writer appears
+/// must not have been excluded in the meantime.
+///
 /// `reflection` is deliberately absent: its rows are read by the reflection
 /// loop's own reader, not by the knowledge retrieval above.
-pub const READ_NAMESPACES: [&str; 4] = [
+pub const READ_NAMESPACES: [&str; 5] = [
     NS_DECOMPOSITION,
     NS_IMPLEMENTATION,
     NS_FAILURE,
     NS_EXECUTION,
+    NS_KNOWLEDGE,
 ];
 
 /// Which memory layer a retrieved row came from, as it appears in the row's
