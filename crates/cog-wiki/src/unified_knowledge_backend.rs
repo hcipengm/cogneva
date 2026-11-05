@@ -187,6 +187,30 @@ impl UnifiedKnowledgeBackend {
         }
     }
 
+    /// Stamp the schema rows a typed lookup handed to its caller.
+    ///
+    /// The four row-typed lookups below (decompositions, implementations,
+    /// failure patterns, task history) answer straight into the planner and the
+    /// generator, so each of them is the last point that knows a row was used.
+    /// Only [`Self::retrieve`] used to write that back, and it assembles a
+    /// mixed answer: on a deployment where the knowledge namespace is empty the
+    /// store's `retrieval_count` therefore stayed at zero for every row ever
+    /// written, and "this memory earned its extraction" could not be read for
+    /// any layer at all. Same contract as the sibling: a failed stamp is
+    /// logged and dropped, because the retrieval it describes has already
+    /// answered.
+    async fn stamp_schema_rows(&self, ids: &[String]) {
+        if ids.is_empty() {
+            return;
+        }
+        let Some(memory) = self.memory.resolve() else {
+            return;
+        };
+        if let Err(e) = memory.record_retrievals(ids, &[]).await {
+            tracing::warn!("recording a schema retrieval failed; the answer is unaffected: {e}");
+        }
+    }
+
     /// Wire a memory layer that is resolved on first use rather than now.
     ///
     /// This is the form the plugin uses: it runs while the memory plugin may
@@ -680,19 +704,24 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 return Err(e);
             }
         };
-        let mut patterns: Vec<TaskDecompositionPattern> = results
+        let mut patterns: Vec<(String, TaskDecompositionPattern)> = results
             .into_iter()
             .filter_map(|r| {
-                serde_json::from_value::<TaskDecompositionPattern>(r.entry.properties.clone()).ok()
+                let id = r.entry.id.clone();
+                serde_json::from_value::<TaskDecompositionPattern>(r.entry.properties.clone())
+                    .ok()
+                    .map(|pattern| (id, pattern))
             })
             .collect();
         patterns.sort_by(|a, b| {
-            shared_terms(goal, &b.goal_summary).cmp(&shared_terms(goal, &a.goal_summary))
+            shared_terms(goal, &b.1.goal_summary).cmp(&shared_terms(goal, &a.1.goal_summary))
         });
         patterns.truncate(top_k);
         self.record(LAYER_MEMORY, Outcome::of_rows(patterns.len()))
             .await;
-        Ok(patterns)
+        let ids: Vec<String> = patterns.iter().map(|(id, _)| id.clone()).collect();
+        self.stamp_schema_rows(&ids).await;
+        Ok(patterns.into_iter().map(|(_, pattern)| pattern).collect())
     }
 
     async fn retrieve_similar_implementations(
@@ -722,10 +751,13 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 return Err(e);
             }
         };
-        let mut examples: Vec<ImplementationExample> = results
+        let mut examples: Vec<(String, ImplementationExample)> = results
             .into_iter()
             .filter_map(|r| {
-                serde_json::from_value::<ImplementationExample>(r.entry.properties.clone()).ok()
+                let id = r.entry.id.clone();
+                serde_json::from_value::<ImplementationExample>(r.entry.properties.clone())
+                    .ok()
+                    .map(|example| (id, example))
             })
             .collect();
         // Rank what came back by how much of the summary it shares. The task
@@ -733,13 +765,15 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
         // only signal available: no vector layer on a host without the weights,
         // and every stored match comes back at the same score.
         examples.sort_by(|a, b| {
-            shared_terms(input_summary, &b.input_summary)
-                .cmp(&shared_terms(input_summary, &a.input_summary))
+            shared_terms(input_summary, &b.1.input_summary)
+                .cmp(&shared_terms(input_summary, &a.1.input_summary))
         });
         examples.truncate(top_k);
         self.record(LAYER_MEMORY, Outcome::of_rows(examples.len()))
             .await;
-        Ok(examples)
+        let ids: Vec<String> = examples.iter().map(|(id, _)| id.clone()).collect();
+        self.stamp_schema_rows(&ids).await;
+        Ok(examples.into_iter().map(|(_, example)| example).collect())
     }
 
     async fn retrieve_failure_patterns(
@@ -759,15 +793,20 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 return Err(e);
             }
         };
-        let patterns: Vec<FailurePattern> = results
+        let patterns: Vec<(String, FailurePattern)> = results
             .into_iter()
             .filter_map(|r| {
-                serde_json::from_value::<FailurePattern>(r.entry.properties.clone()).ok()
+                let id = r.entry.id.clone();
+                serde_json::from_value::<FailurePattern>(r.entry.properties.clone())
+                    .ok()
+                    .map(|pattern| (id, pattern))
             })
             .collect();
         self.record(LAYER_MEMORY, Outcome::of_rows(patterns.len()))
             .await;
-        Ok(patterns)
+        let ids: Vec<String> = patterns.iter().map(|(id, _)| id.clone()).collect();
+        self.stamp_schema_rows(&ids).await;
+        Ok(patterns.into_iter().map(|(_, pattern)| pattern).collect())
     }
 
     async fn retrieve_task_history(&self, task_id: &str) -> SFResult<Vec<TaskExecutionRecord>> {
@@ -783,15 +822,20 @@ impl KnowledgeBackend for UnifiedKnowledgeBackend {
                 return Err(e);
             }
         };
-        let records: Vec<TaskExecutionRecord> = results
+        let records: Vec<(String, TaskExecutionRecord)> = results
             .into_iter()
             .filter_map(|r| {
-                serde_json::from_value::<TaskExecutionRecord>(r.entry.properties.clone()).ok()
+                let id = r.entry.id.clone();
+                serde_json::from_value::<TaskExecutionRecord>(r.entry.properties.clone())
+                    .ok()
+                    .map(|record| (id, record))
             })
             .collect();
         self.record(LAYER_MEMORY, Outcome::of_rows(records.len()))
             .await;
-        Ok(records)
+        let ids: Vec<String> = records.iter().map(|(id, _)| id.clone()).collect();
+        self.stamp_schema_rows(&ids).await;
+        Ok(records.into_iter().map(|(_, record)| record).collect())
     }
 
     async fn archive_execution(&self, task: &Task, result: &TaskResult) -> SFResult<()> {
@@ -1913,13 +1957,35 @@ mod tests {
             unimplemented!("StampMemory stands in only for the stamping path")
         }
 
+        /// The store's real matching rule, reduced to what these tests depend
+        /// on: the query is a substring of the row's name or key. The typed
+        /// lookups below query with the dimension their namespace is keyed on,
+        /// so a row that should come back does.
         async fn search_schema(
             &self,
-            _namespace: &str,
-            _query: &str,
-            _limit: usize,
+            namespace: &str,
+            query: &str,
+            limit: usize,
         ) -> SFResult<Vec<cog_core::SchemaSearchResult>> {
-            unimplemented!("StampMemory stands in only for the stamping path")
+            let needle = query.to_lowercase();
+            let mut rows: Vec<SchemaEntry> = self
+                .schema
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((ns, _), e)| {
+                    ns == namespace
+                        && (e.name.to_lowercase().contains(&needle)
+                            || e.key.to_lowercase().contains(&needle))
+                })
+                .map(|(_, e)| e.clone())
+                .collect();
+            rows.sort_by(|a, b| a.id.cmp(&b.id));
+            rows.truncate(limit);
+            Ok(rows
+                .into_iter()
+                .map(|entry| cog_core::SchemaSearchResult { entry, score: 1.0 })
+                .collect())
         }
 
         async fn schema_for_raw(
@@ -2106,5 +2172,109 @@ mod tests {
             .unwrap();
         assert_eq!(schema.retrieval_count, 1);
         assert_eq!(summary.retrieval_count, 1);
+    }
+
+    /// A lookup that answers one kind of row is its own place to know that row
+    /// reached a model: it hands the row straight to the planner or the
+    /// generator and never assembles a mixed answer. Only `retrieve_relevant`
+    /// used to write the count back, so on a deployment whose knowledge
+    /// namespace is empty every row in the store read as never retrieved —
+    /// including the four lookups that do the real feeding. The count has to
+    /// move on this path too, or "did this memory earn its extraction" stays
+    /// unreadable.
+    #[tokio::test]
+    async fn a_typed_lookup_stamps_the_rows_it_hands_over() {
+        let memory = Arc::new(StampMemory::new());
+        memory
+            .store_schema(
+                NS_EXECUTION,
+                &cog_core::SchemaEntry::new(
+                    "exec-1",
+                    NS_EXECUTION,
+                    cog_core::SchemaKind::Event,
+                    "task-42",
+                    "task-42",
+                    cog_core::SourceRef::new("exec-1", "test/v1"),
+                )
+                .with_properties(serde_json::json!({
+                    "record_id": "exec-1",
+                    "task_id": "task-42",
+                    "task_type": "coding",
+                    "status": "success",
+                    "result_summary": "the deploy key lives in the gateway",
+                    "executed_at": Utc::now(),
+                })),
+            )
+            .await
+            .unwrap();
+
+        let backend =
+            UnifiedKnowledgeBackend::new().with_memory(memory.clone() as Arc<dyn MemoryBackend>);
+        let records = backend.retrieve_task_history("task-42").await.unwrap();
+        assert_eq!(records.len(), 1, "the row comes back as a typed record");
+
+        let stored = memory
+            .get_schema(NS_EXECUTION, "exec-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.retrieval_count, 1,
+            "a row handed to the caller carries the count"
+        );
+        assert!(stored.last_retrieved_at.is_some());
+    }
+
+    /// A row the lookup dropped is not stamped: the count is what reached the
+    /// caller, and a row filtered out never did.
+    #[tokio::test]
+    async fn a_row_the_lookup_dropped_is_not_stamped() {
+        let memory = Arc::new(StampMemory::new());
+        for (id, properties) in [
+            (
+                "exec-good",
+                serde_json::json!({
+                    "record_id": "exec-good",
+                    "task_id": "task-42",
+                    "task_type": "coding",
+                    "status": "success",
+                    "result_summary": "",
+                    "executed_at": Utc::now(),
+                }),
+            ),
+            // Shape the store accepted but the typed reader cannot decode.
+            ("exec-corrupt", serde_json::json!({"not": "a record"})),
+        ] {
+            memory
+                .store_schema(
+                    NS_EXECUTION,
+                    &cog_core::SchemaEntry::new(
+                        id,
+                        NS_EXECUTION,
+                        cog_core::SchemaKind::Event,
+                        "task-42",
+                        "task-42",
+                        cog_core::SourceRef::new(id, "test/v1"),
+                    )
+                    .with_properties(properties),
+                )
+                .await
+                .unwrap();
+        }
+
+        let backend =
+            UnifiedKnowledgeBackend::new().with_memory(memory.clone() as Arc<dyn MemoryBackend>);
+        let records = backend.retrieve_task_history("task-42").await.unwrap();
+        assert_eq!(records.len(), 1);
+
+        let corrupt = memory
+            .get_schema(NS_EXECUTION, "exec-corrupt")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            corrupt.retrieval_count, 0,
+            "a row the reader could not decode never reached the caller"
+        );
     }
 }
