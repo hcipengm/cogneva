@@ -234,4 +234,86 @@ mod tests {
         assert_eq!(metrics.len(), 9);
         assert!(metrics.iter().all(|m| m.value == 0.0), "{metrics:?}");
     }
+
+    /// principle: feedback_a_negated_selector_over_a_closed_set_is_the_same_series
+    /// A negated selector over the closed exit set names the same series as the
+    /// explicit complement it stands for.
+    ///
+    /// Every probe on the books sorts into exactly one of the nine exits, so
+    /// `outcome!="validated"` is not a second reading with a meaning of its own:
+    /// it is the other eight cells, name for name and value for value. A rule
+    /// author may write either shape, and the two have to agree -- a series that
+    /// joined the scrape without joining the closed set would be selected by the
+    /// negation and missed by the complement, which is a rule going quiet rather
+    /// than going red.
+    #[tokio::test]
+    async fn a_negated_selector_names_the_complement_of_the_closed_exit_set() {
+        let readings = DiscoveryOutcomeReadings::new();
+        readings.record(&OutcomeTally {
+            validated: 1,
+            rejected: 2,
+            inconclusive: 3,
+            unanswered: 4,
+            run_ended_without_result: 5,
+            row_missing: 6,
+            expired: 7,
+            still_open: 8,
+            not_recorded: 9,
+        });
+        let metrics = readings.collect_metrics("").await.expect("collect_metrics");
+
+        // The closed set, one row per exit, with the count this round gave it.
+        // Nine distinct values, so a value names the cell it came from.
+        let closed_set: [(&str, f64); 9] = [
+            (VALIDATED_METRIC, 1.0),
+            (REJECTED_METRIC, 2.0),
+            (INCONCLUSIVE_METRIC, 3.0),
+            (UNANSWERED_METRIC, 4.0),
+            (RUN_ENDED_WITHOUT_RESULT_METRIC, 5.0),
+            (ROW_MISSING_METRIC, 6.0),
+            (EXPIRED_METRIC, 7.0),
+            (STILL_OPEN_METRIC, 8.0),
+            (NOT_RECORDED_METRIC, 9.0),
+        ];
+
+        // Both selections below are read over this one set, so it has to be the
+        // set the scrape actually carries: a cell that joined the series without
+        // joining the roster would be compared against nothing at all.
+        let mut scraped: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+        let mut roster: Vec<&str> = closed_set.iter().map(|(name, _)| *name).collect();
+        scraped.sort_unstable();
+        roster.sort_unstable();
+        assert_eq!(
+            scraped, roster,
+            "the closed exit set is exactly what the scrape carries"
+        );
+
+        // `outcome!="validated"`, read the way a rule reads it: everything the
+        // scrape carries except the cell that was held out.
+        let mut negated: Vec<(&str, f64)> = metrics
+            .iter()
+            .filter(|m| m.name != VALIDATED_METRIC)
+            .map(|m| (m.name.as_str(), m.value))
+            .collect();
+
+        // The same selection written as the complement it stands for: the
+        // closed set minus the cell that was held out.
+        let mut complement: Vec<(&str, f64)> = closed_set
+            .iter()
+            .filter(|(name, _)| *name != VALIDATED_METRIC)
+            .copied()
+            .collect();
+
+        negated.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        complement.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(
+            complement.len(),
+            closed_set.len() - 1,
+            "one cell held out, eight left"
+        );
+        assert_eq!(
+            negated, complement,
+            "a negation over the closed exit set is the complement, not a second reading"
+        );
+    }
 }
