@@ -831,6 +831,31 @@ pub trait StateBackend: Send + Sync {
             .collect())
     }
 
+    /// The rows in a workspace that carry a venue label.
+    ///
+    /// The venue board answers three numbers per venue by folding
+    /// [`crate::Task::venue_label`], and every row without a label is read
+    /// only to be dropped. A workspace that has been running for a while is
+    /// almost entirely such rows -- 实测 2026-11-06: 9,987 of 9,991 rows
+    /// carried no label, read on every poll of a board that shows four tasks,
+    /// and a scan of the label took about a second. The default filters
+    /// [`Self::dag_get_all_tasks`], which is correct but reads everything; a
+    /// backend that stores the label should override this so the exclusion
+    /// happens in the query.
+    ///
+    /// Terminal rows belong to the answer: the board's latest-verdict and
+    /// written-back columns are read from tasks that are already done, so a
+    /// backend that excluded everything [`crate::TaskStatus::affects_dispatch`]
+    /// excludes would empty both columns while still returning rows.
+    async fn dag_get_venue_tasks(&self, workspace_id: &str) -> SFResult<Vec<crate::Task>> {
+        Ok(self
+            .dag_get_all_tasks(workspace_id)
+            .await?
+            .into_iter()
+            .filter(|task| task.venue_label().is_some())
+            .collect())
+    }
+
     /// Counts of the tasks this backend holds, by state, across every
     /// workspace it knows about.
     ///

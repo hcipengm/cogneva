@@ -807,6 +807,36 @@ impl StateBackend for PostgresStateBackend {
             .collect()
     }
 
+    /// 只有带场地标签的那些行；没有标签的整行不进结果。
+    ///
+    /// 这一列本来就没有索引——标签在 JSON 里，查询按 `task->>'venue'` 判，
+    /// 走的是顺序扫描；顺序扫的是整块 TOAST 过的正文。一次读回来是这些数
+    /// （实测 2026-11-06）：9,991 行里 9,987 行没有标签，正文合计 42 MB，
+    /// 扫一次 0.9 秒，换回来 4 行。
+    /// 迁移里那个部分索引把这次扫描变成按标签的定位：索引只收带标签的行，
+    /// 所以它的大小跟着场地上的活走，不跟着任务图长。
+    ///
+    /// 终态行必须留下：看板的「最近一条判据」和「写回量」两列读的就是已经
+    /// 做完的行，排掉它们会让两列变空，而空的读数和「今天没交活」长得一样。
+    async fn dag_get_venue_tasks(&self, workspace_id: &str) -> SFResult<Vec<cog_core::Task>> {
+        let rows: Vec<(serde_json::Value,)> = self
+            .retry(|| async {
+                sqlx::query_as(
+                    "SELECT task FROM cog_dag_tasks \
+                     WHERE workspace_id = $1 \
+                       AND task->>'venue' IS NOT NULL \
+                       AND btrim(task->>'venue') <> ''",
+                )
+                .bind(workspace_id)
+                .fetch_all(&self.pool)
+                .await
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .collect()
+    }
+
     /// 只有派发还要看的那些行；`failed` / `cancelled` 在查询里就被排掉。
     ///
     /// 排除的是哪几个状态由 [`cog_core::TaskStatus::affects_dispatch`] 一个

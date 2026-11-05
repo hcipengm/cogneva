@@ -637,6 +637,23 @@ impl Task {
             _ => UNGROUPED_PROJECT,
         }
     }
+
+    /// The venue this task is filed under, trimmed, or `None` when it carries
+    /// no label.
+    ///
+    /// Defined once because three readers decide membership by it -- the
+    /// board's fold, the store query that prefilters rows for it, and the
+    /// in-memory graph path -- and a row the query keeps but the fold drops
+    /// (or the other way round) is a column that silently disagrees with the
+    /// tasks it is supposed to be counting. A label of only spaces is not a
+    /// venue: the submit path already drops empty labels, and a row written by
+    /// something that did not would otherwise appear as a venue with no name.
+    pub fn venue_label(&self) -> Option<&str> {
+        self.venue
+            .as_deref()
+            .map(str::trim)
+            .filter(|venue| !venue.is_empty())
+    }
 }
 
 /// How the tasks a store holds distribute over the states the cluster
@@ -1045,6 +1062,25 @@ impl Task {
 mod tests {
     use super::*;
     use crate::checkout::repo_root;
+
+    /// 一个场地标签只有一种「算有」的拼法。
+    ///
+    /// 三个读者拿它判成员：看板的折叠、替它预筛行的存储查询、内存里那条
+    /// 图路径。任何一处自己再写一遍「非空」，就会有一行被查询留下、被折叠扔掉
+    /// （或者反过来），而两边的读数各自都说得通——一栏数出四件活、却只有三件的
+    /// 写回量。空格串也在这里落网：提交那一路已经丢掉了空标签，别处写进来的
+    /// `"   "` 若算作场地，看板上就多出一栏没有名字的。
+    #[test]
+    fn a_venue_label_is_what_it_says_after_trimming_and_nothing_else_counts() {
+        let mut task = Task::new("t1", TaskType::DagNode, serde_json::json!({}));
+        assert_eq!(task.venue_label(), None);
+        for spelled_as_empty in ["", "   ", "\t\n"] {
+            task.venue = Some(spelled_as_empty.to_string());
+            assert_eq!(task.venue_label(), None, "{spelled_as_empty:?}");
+        }
+        task.venue = Some("  memory ".to_string());
+        assert_eq!(task.venue_label(), Some("memory"));
+    }
 
     #[test]
     fn only_the_two_states_that_can_never_move_are_left_out_of_a_dispatch_read() {

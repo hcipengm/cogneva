@@ -1493,6 +1493,33 @@ impl DagExecutor {
         }
     }
 
+    /// 只有带场地标签的那些行。
+    ///
+    /// 场地看板按这一列折叠，没有标签的行读进来只为扔掉；任务图跑上几天之后
+    /// 九成以上都是这种行，见 [`Self::live_tasks_unified`] 旁边那条实测。
+    /// 读的结果与「取全图再筛」逐行相同，筛的位置不同——一条是 SQL 替它筛，
+    /// 一条是内存里筛。
+    pub async fn get_venue_tasks(&self) -> Vec<Task> {
+        self.venue_tasks_unified().await
+    }
+
+    async fn venue_tasks_unified(&self) -> Vec<Task> {
+        if let Some(be) = self.fg() {
+            be.dag_get_venue_tasks(&self.workspace_id)
+                .await
+                .unwrap_or_default()
+        } else {
+            self.inner
+                .read()
+                .await
+                .tasks
+                .values()
+                .filter(|task| task.venue_label().is_some())
+                .cloned()
+                .collect()
+        }
+    }
+
     /// 同上，但保留读失败。
     ///
     /// 内部的调用方把失败当成空图就够了——它们各自还有一层判据。读数不行：一次
@@ -4277,6 +4304,10 @@ impl cog_core::DagExecutor for DagExecutor {
 
     async fn get_all_tasks(&self) -> Vec<Task> {
         self.get_all_tasks().await
+    }
+
+    async fn get_venue_tasks(&self) -> Vec<Task> {
+        self.get_venue_tasks().await
     }
 
     async fn get_task(&self, task_id: &str) -> Option<Task> {

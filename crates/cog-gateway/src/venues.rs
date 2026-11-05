@@ -109,12 +109,7 @@ pub fn read_venues(tasks: &[cog_core::Task], now: DateTime<Utc>) -> Vec<VenueRea
         .collect();
 
     for task in tasks {
-        let Some(venue) = task
-            .venue
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        else {
+        let Some(venue) = task.venue_label() else {
             continue;
         };
         let row = by_venue.entry(venue).or_insert_with(|| VenueReading {
@@ -171,9 +166,11 @@ pub async fn venues_handler(
     claims: Option<Extension<cog_core::Claims>>,
 ) -> Response {
     let claims = claims.as_ref().map(|Extension(c)| c);
+    // 只要带场地标签的行：这张看板按标签折叠，别的行读进来只为扔掉。整图在
+    // 2026-11-06 是 9,991 行 / 42 MB 里挑出 4 行，而这张看板每 20 秒被拉一次。
     let tasks: Vec<cog_core::Task> = state
         .orchestrator
-        .get_all_tasks()
+        .get_venue_tasks()
         .await
         .into_iter()
         .filter(|t| visible_to_claims(claims, t))

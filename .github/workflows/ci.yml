@@ -189,6 +189,18 @@ jobs:
         run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test workspace_lock_takes_rows_in_one_order -- --ignored
         env:
           COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+      # The venue board is handed a subset of the task table, and both halves of
+      # that rule are the server's: the trim that decides which rows carry a
+      # label, and the terminal rows it has to keep -- `completed` and `failed`
+      # rows feed the board's latest-verdict and written-back columns, so a
+      # filter that reused the dispatch exclusion would empty those two columns
+      # while still returning rows, and an empty column reads like a venue where
+      # nothing has finished. A DB-free test can see neither half.
+      - name: Live-DB venue rows
+        if: ${{ !cancelled() }}
+        run: bash deploy/scripts/run-a-ci-step.sh cargo test -p cog-storage --test venue_tasks_are_the_only_rows_read -- --ignored
+        env:
+          COGNEVA_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # The claim is a count of commits per burst, and a stand-in has no commit
       # to count: the reading is whatever the server's own log says. An ignored
       # test whose file says how to run it still ran nowhere until a step named

@@ -76,6 +76,29 @@ pub trait OrchestratorControl: Send + Sync {
     /// Return every task currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
 
+    /// Return the tasks that carry a venue label, and only those.
+    ///
+    /// The venue board answers three numbers per venue by folding
+    /// [`Task::venue`], and every row without a label is read only to be
+    /// dropped. A workspace that has been running for a while is almost
+    /// entirely such rows -- 实测 2026-11-06: 9,987 of 9,991 rows carried no
+    /// label, and the board that reads them shows four tasks. The default
+    /// filters [`Self::get_all_tasks`],
+    /// which answers correctly and reads everything; an orchestrator backed by
+    /// a store that can exclude by label should override this.
+    ///
+    /// Terminal rows are part of the answer: the board's "latest verdict" and
+    /// "written back" columns are read from tasks that are already done, so a
+    /// reader that reused [`crate::TaskStatus::affects_dispatch`] here would
+    /// empty both columns and still look plausible.
+    async fn get_venue_tasks(&self) -> Vec<Task> {
+        self.get_all_tasks()
+            .await
+            .into_iter()
+            .filter(|task| task.venue_label().is_some())
+            .collect()
+    }
+
     /// 这个 workspace 里每条任务的计划基线。
     ///
     /// 与 [`Self::get_all_tasks`] 成对存在：任务图回答「现在是什么样」，基线回答
@@ -304,6 +327,22 @@ pub trait DagExecutor: Send + Sync {
 
     /// All tasks currently in the graph.
     async fn get_all_tasks(&self) -> Vec<Task>;
+
+    /// The tasks that carry a venue label, and only those.
+    ///
+    /// Same answer as filtering [`Self::get_all_tasks`] by
+    /// [`Task::venue_label`], which is what the default does. An executor whose
+    /// store can exclude unlabeled rows should override it: the venue board
+    /// reads this on every poll and the graph is mostly rows the board drops.
+    /// Terminal rows are part of the answer -- the board's latest-verdict and
+    /// written-back columns come from tasks that are already done.
+    async fn get_venue_tasks(&self) -> Vec<Task> {
+        self.get_all_tasks()
+            .await
+            .into_iter()
+            .filter(|task| task.venue_label().is_some())
+            .collect()
+    }
 
     /// Look up a single task by id.
     async fn get_task(&self, task_id: &str) -> Option<Task>;
