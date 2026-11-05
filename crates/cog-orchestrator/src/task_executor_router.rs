@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use cog_core::{
     DagMessage, MessageBackend, OrchestratorControl, SFError, SFResult, ShutdownSignal, Task,
-    TaskExecutor, TaskResult, TaskType,
+    TaskExecutor, TaskResult, TaskStatus, TaskType,
 };
 use futures::{FutureExt, StreamExt};
 use std::panic::AssertUnwindSafe;
@@ -415,18 +415,39 @@ impl TaskExecutorRouter {
                                     // 不会无限派发。
                                     Some(Ok((msg_id, bytes))) => {
                                         let claims = crate::observable::claim_slots_observable();
-                                        claims.wait_started(&ready_stream);
-                                        let acquired = tokio::select! {
-                                            _ = shutdown.wait() => {
-                                                claims.wait_ended(&ready_stream);
-                                                break 'subscribe;
-                                            }
-                                            acquired = claim_slots.clone().acquire_owned() => acquired,
-                                        };
-                                        claims.wait_ended(&ready_stream);
-                                        let permit = match acquired {
+                                        // 有空位就直接拿：排队不深的干净路径上不为这一格多读一次库。
+                                        let permit = match claim_slots.clone().try_acquire_owned() {
                                             Ok(permit) => permit,
-                                            Err(_) => break 'subscribe,
+                                            // 没有空位时才问一句「这条还跑不跑」。许可是在途
+                                            // 执行的界；一条任务已经终态、或者行已经不在时，
+                                            // 这条消息永远不会执行，它只需要被 ack 掉。让它排在
+                                            // 许可队列里，就是拿唯一一个执行位置去处理一件不执行
+                                            // 的事——积压越深，这类残留越多（实测队头 4000 条里
+                                            // 58% 的任务已终态），真正能跑的活被它们挡在后面。
+                                            // 停在积压后面等，等来的不是队头松动，而是队列自己。
+                                            Err(_) => {
+                                                if this
+                                                    .drop_if_its_task_cannot_run(
+                                                        &pipe, &msg_id, &bytes,
+                                                    )
+                                                    .await
+                                                {
+                                                    continue;
+                                                }
+                                                claims.wait_started(&ready_stream);
+                                                let acquired = tokio::select! {
+                                                    _ = shutdown.wait() => {
+                                                        claims.wait_ended(&ready_stream);
+                                                        break 'subscribe;
+                                                    }
+                                                    acquired = claim_slots.clone().acquire_owned() => acquired,
+                                                };
+                                                claims.wait_ended(&ready_stream);
+                                                match acquired {
+                                                    Ok(permit) => permit,
+                                                    Err(_) => break 'subscribe,
+                                                }
+                                            }
                                         };
                                         let hold = claims.permit_taken(&ready_stream);
                                         this.spawn_ready_processing(
@@ -489,6 +510,60 @@ impl TaskExecutorRouter {
                 );
             }
         });
+    }
+
+    /// 一条还没拿到执行许可的 ready 消息，如果它的任务已经不可能再跑，
+    /// 就地 ack 掉并返回 true；调用方据此跳过这一条、不占许可。
+    ///
+    /// 「不可能再跑」只认两种看得见的结局：行已经不在，或者行是终态。
+    /// 其余一律返回 false 交给正常路径——包括读不成 `Task` 的载荷（那一条
+    /// 要走死信队列，判据与记账都在正常路径上）和没有编排侧的部署（说不
+    /// 出结局就不替它下结论）。行还在、状态不是终态时也可能跑不成（例如
+    /// 另一份副本正把它跑着），那种情形留给 `start_task` 的领域拒绝去判，
+    /// 这里不猜。
+    async fn drop_if_its_task_cannot_run(
+        &self,
+        pipe: &ReadyPipeline,
+        msg_id: &str,
+        bytes: &[u8],
+    ) -> bool {
+        let Some(ref orch) = self.orchestrator else {
+            return false;
+        };
+        let Ok(task) = serde_json::from_slice::<Task>(bytes) else {
+            return false;
+        };
+        let cannot_run = match orch.get_task(&task.id).await {
+            None => true,
+            Some(row) => matches!(
+                row.status,
+                TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+            ),
+        };
+        if !cannot_run {
+            return false;
+        }
+        let ids = [msg_id.to_string()];
+        if let Err(e) = pipe
+            .task_backend
+            .ack(&pipe.ready_stream, &pipe.group, &ids)
+            .await
+        {
+            // ack 没落地就不算处理掉：这一条还在 PEL 里，下一轮清扫会再投一次，
+            // 那时许可可能已经空出来，正常路径会走到同一个结论。
+            tracing::warn!(
+                task_id = %task.id,
+                msg_id = %msg_id,
+                "failed to ack a ready message whose task can no longer run: {e}"
+            );
+            return false;
+        }
+        tracing::debug!(
+            task_id = %task.id,
+            msg_id = %msg_id,
+            "dropped a ready message whose task can no longer run, without taking an execution permit"
+        );
+        true
     }
 
     /// 执行一条 ready 消息的全管线：反序列化 → start_task → execute →
@@ -1434,6 +1509,288 @@ mod ready_pipeline_tests {
             backend.acks.lock().await.is_empty(),
             "panicked message must stay unacked for redelivery"
         );
+    }
+}
+
+/// 执行许可是「同时在跑的活有几条」的界，不是「一条消息要走多快」的界：一条
+/// 任务已经终态时它永远不会被执行，那条消息只需要被 ack 掉。让这种消息排在
+/// 许可队列里，唯一的作用是让真正能跑的活多等一轮——积压越深，死消息占比越
+/// 高，等得越久。
+#[cfg(test)]
+mod ready_permit_fast_lane_tests {
+    use super::*;
+    use async_trait::async_trait;
+    use cog_core::MessageStream;
+    use std::time::Instant;
+
+    /// 一条就绪流上放着预置的几条消息，读完之后保持打开。记下被 ack 的 id。
+    struct OneShotBackend {
+        messages: tokio::sync::Mutex<Vec<(String, Vec<u8>)>>,
+        acks: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl OneShotBackend {
+        fn new(messages: Vec<(String, Vec<u8>)>) -> Self {
+            Self {
+                messages: tokio::sync::Mutex::new(messages),
+                acks: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MessageBackend for OneShotBackend {
+        async fn payload_limit(&self, _subject: &str) -> SFResult<Option<usize>> {
+            Ok(None)
+        }
+        async fn publish(&self, _subject: &str, _payload: &[u8]) -> SFResult<()> {
+            Ok(())
+        }
+        async fn stop_stream(&self, _subject: &str, _group: &str) {}
+        async fn subscribe(&self, _subject: &str, _group: &str) -> SFResult<MessageStream> {
+            let items: Vec<(String, Vec<u8>)> = self.messages.lock().await.drain(..).collect();
+            Ok(Box::pin(
+                futures::stream::iter(items.into_iter().map(Ok)).chain(futures::stream::pending()),
+            ))
+        }
+        async fn subscribe_from(
+            &self,
+            _subject: &str,
+            _group: &str,
+            _start_id: &str,
+        ) -> SFResult<MessageStream> {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+        async fn create_consumer_group(&self, _stream: &str, _group: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn ack(&self, _stream: &str, _group: &str, ids: &[String]) -> SFResult<()> {
+            self.acks.lock().await.extend(ids.iter().cloned());
+            Ok(())
+        }
+        async fn claim_pending(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _min_idle_ms: u64,
+            _count: usize,
+        ) -> SFResult<Option<Vec<(String, Vec<u8>)>>> {
+            Ok(Some(Vec::new()))
+        }
+        async fn pending_stats(
+            &self,
+            _stream: &str,
+            _group: &str,
+            _idle_threshold_ms: u64,
+        ) -> SFResult<Option<cog_core::PendingStats>> {
+            Ok(None)
+        }
+        async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
+            Ok(None)
+        }
+        async fn dlq(
+            &self,
+            _stream: &str,
+            _msg_id: &str,
+            _payload: &[u8],
+            _reason: &str,
+        ) -> SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 一张只有这一行的图：`get_task` 永远回答它。
+    struct OneRowGraph {
+        task: Task,
+    }
+
+    #[async_trait]
+    impl OrchestratorControl for OneRowGraph {
+        async fn submit_goal(&self, _goal: &str, _tasks: Vec<Task>) -> SFResult<()> {
+            Ok(())
+        }
+        async fn submit_goal_auto(&self, _goal: &str, tasks: Vec<Task>) -> SFResult<Vec<String>> {
+            Ok(tasks.iter().map(|task| task.id.clone()).collect())
+        }
+        async fn assign_task(&self, _task_id: &str, _agent_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn add_task(&self, _task: Task) -> SFResult<()> {
+            Ok(())
+        }
+        async fn crew_can_retry(&self, _task_ids: &[String]) -> bool {
+            false
+        }
+        async fn crew_retry_all(&self, _task_ids: &[String]) -> usize {
+            0
+        }
+        async fn get_ready_tasks(&self) -> Vec<Task> {
+            Vec::new()
+        }
+        async fn get_all_tasks(&self) -> Vec<Task> {
+            Vec::new()
+        }
+        async fn push_to_dlq(&self, _task_id: &str, _error: String) -> SFResult<bool> {
+            Ok(false)
+        }
+        async fn retry_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn dlq_len(&self) -> SFResult<usize> {
+            Ok(0)
+        }
+        async fn start_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn complete_task(
+            &self,
+            _task_id: &str,
+            _result: serde_json::Value,
+        ) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn fail_task(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::contract::llm::UpstreamFailure>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn fail_task_after(
+            &self,
+            _task_id: &str,
+            _error: String,
+            _cause: Option<cog_core::contract::llm::UpstreamFailure>,
+            _retry_after_secs: Option<u64>,
+        ) -> SFResult<(bool, Vec<String>, bool)> {
+            Ok((false, Vec::new(), false))
+        }
+        async fn cancel_task(&self, _task_id: &str) -> SFResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn get_task(&self, _task_id: &str) -> Option<Task> {
+            Some(self.task.clone())
+        }
+        async fn schedule_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn check_timeouts(&self) -> Vec<(String, bool, Vec<String>, bool)> {
+            Vec::new()
+        }
+        async fn get_dependents(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_dependencies(&self, _task_id: &str) -> Option<Vec<Task>> {
+            None
+        }
+        async fn get_graph(&self) -> (Vec<Task>, Vec<(String, String)>) {
+            (Vec::new(), Vec::new())
+        }
+        async fn delete_task(&self, _task_id: &str) -> SFResult<()> {
+            Ok(())
+        }
+        async fn all_completed(&self) -> bool {
+            true
+        }
+        async fn replay_dlq(&self, _task_id: &str) -> SFResult<bool> {
+            Ok(false)
+        }
+    }
+
+    fn task_in(status: &str) -> Task {
+        let now = chrono::Utc::now();
+        serde_json::from_value(serde_json::json!({
+            "id": "t-fast-lane",
+            "task_type": {"custom": "slow"},
+            "status": status,
+            "input": {},
+            "blocked_by": [],
+            "blocks": [],
+            "priority": 1,
+            "created_at": now,
+            "updated_at": now,
+            "retry_count": 0,
+            "max_retries": 3,
+            "timeout_seconds": 5,
+            "is_executable": true
+        }))
+        .unwrap()
+    }
+
+    /// 把一条消息喂给读循环，许可为零（也就是「有一个位置，但它已经名花有主」）。
+    fn run_with_no_permit(
+        router: TaskExecutorRouter,
+        backend: Arc<OneShotBackend>,
+        shutdown: ShutdownSignal,
+    ) -> tokio::task::JoinHandle<SFResult<()>> {
+        tokio::spawn(async move {
+            let claim = ClaimBudget {
+                slots: Arc::new(tokio::sync::Semaphore::new(0)),
+                limit: 0,
+            };
+            router
+                .run_one_ready_stream(
+                    backend.clone() as Arc<dyn MessageBackend>,
+                    backend as Arc<dyn MessageBackend>,
+                    "ready".to_string(),
+                    "ws".to_string(),
+                    claim,
+                    shutdown,
+                )
+                .await
+        })
+    }
+
+    #[tokio::test]
+    async fn a_message_whose_task_is_already_terminal_leaves_without_a_permit() {
+        let payload = serde_json::to_vec(&task_in("cancelled")).unwrap();
+        let backend = Arc::new(OneShotBackend::new(vec![("m-dead".into(), payload)]));
+        let router = TaskExecutorRouter::new().with_orchestrator(Arc::new(OneRowGraph {
+            task: task_in("cancelled"),
+        }));
+
+        let shutdown = ShutdownSignal::new();
+        let runner = run_with_no_permit(router, backend.clone(), shutdown.clone());
+
+        let started = Instant::now();
+        loop {
+            if !backend.acks.lock().await.is_empty() {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a message for a cancelled task waited on the execution permit instead of leaving"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(backend.acks.lock().await.as_slice(), ["m-dead".to_string()]);
+
+        shutdown.trigger();
+        runner.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_message_whose_task_can_still_run_waits_for_the_permit() {
+        // 反面对照：这条判据只管「跑不成」的消息。任务还在排队时，它就该排在
+        // 许可后面等——先 ack 再等等于把活丢了。
+        let payload = serde_json::to_vec(&task_in("scheduled")).unwrap();
+        let backend = Arc::new(OneShotBackend::new(vec![("m-live".into(), payload)]));
+        let router = TaskExecutorRouter::new().with_orchestrator(Arc::new(OneRowGraph {
+            task: task_in("scheduled"),
+        }));
+
+        let shutdown = ShutdownSignal::new();
+        let runner = run_with_no_permit(router, backend.clone(), shutdown.clone());
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            backend.acks.lock().await.is_empty(),
+            "a runnable task's message was discarded while the permit was merely busy"
+        );
+
+        shutdown.trigger();
+        runner.await.unwrap().unwrap();
     }
 }
 
