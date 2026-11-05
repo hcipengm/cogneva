@@ -513,13 +513,49 @@ impl DagExecutorRuntime {
             crate::ready_queue::process_local_ready_stream(&self.config.workspace_id),
             crate::ready_queue::ready_stream(&self.config.workspace_id),
         ];
+        // What each queue still owes its reader: entries published and not yet
+        // handed to the consumer group. A queue in that state is where *no* new
+        // copy goes, and the reason is not throughput but order: an entry is
+        // delivered in publication order, so a copy added now reaches the
+        // reader after everything already queued -- hours later at the depths
+        // this pass allowed. Under the stall sweep's re-arm, that is a feedback
+        // loop and it was measured as one on 2026-11-05: 2,314 tasks occupied
+        // 69,012 entries of `default:local` (one task published 34 times, one
+        // copy per 30-minute stall window), the queue grew by about 86 a minute
+        // while two tasks ran, and no re-armed copy was ever the one that
+        // arrived first.
+        //
+        // A backend that cannot say is not a reading of an empty queue, so it
+        // keeps the previous behaviour; the same holds for a failed read.
+        let ready_group = crate::ready_queue::ready_group(&self.config.workspace_id);
+        let mut unread_by_stream: HashMap<String, u64> = HashMap::new();
+        for stream in &lanes {
+            match self.backend.stream_lag(stream, &ready_group).await {
+                Ok(Some(unread)) if unread > 0 => {
+                    unread_by_stream.insert(stream.clone(), unread);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(
+                    stream = %stream,
+                    error = %e,
+                    "cannot read how many entries this ready stream still owes its consumer; \
+                     publishing to it as if it owed none"
+                ),
+            }
+        }
         let ready_of: Vec<(u64, u64)> = lanes
             .iter()
             .map(|stream| {
-                (
-                    by_stream.get(stream).map(|e| e.len()).unwrap_or(0) as u64,
-                    in_flight.get(stream).copied().unwrap_or(0) as u64,
-                )
+                let ready = by_stream.get(stream).map(|e| e.len()).unwrap_or(0) as u64;
+                // Nothing is offered to a queue that still holds what it was
+                // given, so the admission below is asked about nothing there
+                // and no allowance is spent on a batch that would be held.
+                let offered = if unread_by_stream.contains_key(stream) {
+                    0
+                } else {
+                    ready
+                };
+                (offered, in_flight.get(stream).copied().unwrap_or(0) as u64)
             })
             .collect();
         let admissions = crate::ready_queue::admissions_by_lane(
@@ -543,7 +579,24 @@ impl DagExecutorRuntime {
 
         let mut first_error: Option<SFError> = None;
         let mut column_holds: HashMap<(String, &'static str), u64> = HashMap::new();
+        let mut unread_holds: HashMap<&'static str, u64> = HashMap::new();
         for (stream, mut entries) in by_stream {
+            // Held, not dropped: the rows stay `Pending` and this pass offers
+            // them again, which is the same state a row waiting on a dependency
+            // sits in. Nothing has been spent on them -- no message, no slot,
+            // no allowance.
+            if let Some(unread) = unread_by_stream.get(&stream).copied() {
+                let kind = crate::ready_queue::stream_kind(&stream, &self.config.workspace_id);
+                *unread_holds.entry(kind).or_insert(0) += entries.len() as u64;
+                tracing::debug!(
+                    stream = %stream,
+                    ready = entries.len(),
+                    unread,
+                    "holding this pass' ready rows back: the queue still holds entries its \
+                     consumer has not been handed, and a copy added now would arrive after them"
+                );
+                continue;
+            }
             if let Some(admitted) = admitted_by_stream.get(&stream).copied() {
                 if (entries.len() as u64) > admitted.jobs {
                     // The reading the refusal was decided on travels with it:
@@ -753,6 +806,30 @@ impl DagExecutorRuntime {
                     labels.insert(
                         crate::LABEL_REASON.to_string(),
                         crate::ready_queue::BUDGET_SPENT_REASON.to_string(),
+                    );
+                    drop(
+                        metrics
+                            .record_counter(
+                                cog_core::metric_names::READY_ADMISSION_HELD_TOTAL,
+                                held as f64,
+                                labels,
+                            )
+                            .await,
+                    );
+                }
+            }
+        }
+        // 这一拍因为队列还没被读走而没投出去的活，按队列记账。与上面两道闸同一个
+        // 计数器、同一个 `reason` 轴：读的人要能分辨「额度花完了」「这一拍切完了」
+        // 「队列还欠着」，三者的修法完全不同（调额度 / 加切片 / 等消费者）。
+        if !unread_holds.is_empty() {
+            if let Some(metrics) = self.orchestrator.metrics_backend() {
+                for (kind, held) in unread_holds {
+                    let mut labels = HashMap::new();
+                    labels.insert(crate::LABEL_STREAM.to_string(), kind.to_string());
+                    labels.insert(
+                        crate::LABEL_REASON.to_string(),
+                        crate::ready_queue::QUEUE_STILL_UNREAD_REASON.to_string(),
                     );
                     drop(
                         metrics
@@ -2148,6 +2225,12 @@ mod consumer_ack_tests {
         /// 各自有名字而不是攒成一个元组：元组里第 3 位和第 4 位都是「一串东西」，
         /// 断言写反了编译器也放行，而这条测试的全部意义就在于那串字节。
         dlq_writes: Arc<Mutex<Vec<DlqWrite>>>,
+        /// 这条流还欠消费组多少条，`None` 表示这个后端答不出。默认为 `None`：
+        /// 别的用例量的是发布之后的接线，不该被一个新闸门改变行为。
+        unread: Arc<Mutex<Option<u64>>>,
+        /// 每次发布记下它发到了哪条主题。发布次数本身就是一条读数：往一条读者还没
+        /// 追上的流里再塞一份，只会排在已经在那儿的所有东西之后，不会让任何一行早跑。
+        published: Arc<Mutex<Vec<String>>>,
     }
 
     impl ScriptedBackend {
@@ -2190,6 +2273,15 @@ mod consumer_ack_tests {
             *self.payload_limit.lock().unwrap() = limit;
         }
 
+        /// 这条流还欠消费组多少条；`None` 是「答不出」。
+        fn set_unread(&self, unread: Option<u64>) {
+            *self.unread.lock().unwrap() = unread;
+        }
+
+        fn published_topics(&self) -> Vec<String> {
+            self.published.lock().unwrap().clone()
+        }
+
         fn acked_ids(&self) -> Vec<String> {
             self.acks
                 .lock()
@@ -2210,7 +2302,8 @@ mod consumer_ack_tests {
             Ok(*self.payload_limit.lock().unwrap())
         }
 
-        async fn publish(&self, _subject: &str, payload: &[u8]) -> SFResult<()> {
+        async fn publish(&self, subject: &str, payload: &[u8]) -> SFResult<()> {
+            self.published.lock().unwrap().push(subject.to_string());
             if let Some(limit) = *self.payload_limit.lock().unwrap() {
                 if payload.len() > limit {
                     return Err(SFError::PayloadTooLarge {
@@ -2319,7 +2412,7 @@ mod consumer_ack_tests {
         /// is the other question; it keeps no unread position a group could be
         /// behind, so it answers "cannot say" rather than a made-up zero.
         async fn stream_lag(&self, _stream: &str, _group: &str) -> SFResult<Option<u64>> {
-            Ok(None)
+            Ok(*self.unread.lock().unwrap())
         }
     }
 
@@ -2799,6 +2892,72 @@ mod consumer_ack_tests {
         assert!(
             err.to_string().contains("already been offered"),
             "the refusal has to say why: {err}"
+        );
+    }
+
+    /// A queue that still owes its consumer takes no more copies.
+    ///
+    /// Measured 2026-11-05 on `default:local`: 2,314 tasks occupied 69,012
+    /// entries — one task published 34 times, one copy per stall window — while
+    /// the consumer had two tasks in flight. Each of those copies reached the
+    /// reader after everything already queued, so no re-armed copy was ever the
+    /// one that arrived first; the queue grew by about 86 a minute and nothing
+    /// ran any sooner for it.
+    #[tokio::test]
+    async fn a_queue_that_still_owes_its_reader_takes_no_more_copies() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-unread-gate".into(),
+            consumer_group: "grp-unread-gate".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-unread-gate",
+                vec![
+                    ready_task("task-a", serde_json::json!({})),
+                    ready_task("task-b", serde_json::json!({})),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // What the queue reports when the reader is 8,815 entries behind.
+        backend.set_unread(Some(8_815));
+        runtime.publish_ready_tasks().await.unwrap();
+        for id in ["task-a", "task-b"] {
+            assert_eq!(
+                runtime.orchestrator().get_task(id).await.unwrap().status,
+                cog_core::TaskStatus::Pending,
+                "a copy added to a queue the reader has not caught up with arrives after \
+                 everything already in it, so it cannot make anything run sooner"
+            );
+        }
+        assert!(
+            backend.published_topics().is_empty(),
+            "and not one copy was written: {:?}",
+            backend.published_topics()
+        );
+
+        // Caught up: the same rows go out on the next pass, so the hold costs a
+        // pass and never the work.
+        backend.set_unread(Some(0));
+        runtime.publish_ready_tasks().await.unwrap();
+        for id in ["task-a", "task-b"] {
+            assert_eq!(
+                runtime.orchestrator().get_task(id).await.unwrap().status,
+                cog_core::TaskStatus::Scheduled,
+                "the hold releases by itself once the reader has been handed what was queued"
+            );
+        }
+        assert_eq!(
+            backend.published_topics().len(),
+            2,
+            "and nothing was published twice: once per row, on the pass that was allowed"
         );
     }
 
