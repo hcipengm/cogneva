@@ -5867,7 +5867,19 @@ impl MainlineDeployer {
     /// 座位时连 ack 都不做。2026-11-05 18:2x 实测，一行针对六小时前那一版的修复
     /// 在跑，消费组 `idle` 五十四分钟、`pending` 十条，当前 head 的红连队列都没进。
     ///
-    /// 一个都收不到是常态，不打日志：部署器每一轮扣住都会走到这里。
+    /// 两个调用点，缺任何一个都会留下没人收的行：
+    ///
+    /// - 开新单之前（[`Self::file_ci_hold_fix`]），让座位给这一版；
+    /// - 一次扣住**结束**的那一刻（见 `poll_once` 里 `ci_hold` 的收尾），让座位给
+    ///   下一件还没来的事。
+    ///
+    /// 后一个不是可选的：只在开单时收，等于「上游一直不红，旧行就一直不收」。
+    /// 2026-11-06 05:1x 实测，上游已经判绿两个多小时，停线车道上还压着四条追着更早
+    /// 版本的行（一条在跑，正给一版早已进不了主线的树改代码），它们谁也等不到下一次
+    /// 开单——那不红的那一天就一直没有。收它们靠的是同一句判词：CI 按 push 判，那一
+    /// 版红了也不再拦得住任何人。
+    ///
+    /// 一个都收不到是常态，不打日志：这两处都不常有行可收。
     async fn retire_ci_holds_for_other_revs(
         &self,
         orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
@@ -8162,6 +8174,17 @@ impl MainlineDeployer {
             // 里那几十行 `ci-red-*` 一直没跑完、而 CI 一直是红的，正是这么来的。
             if ended.outcome != "rev_no_longer_tracked" {
                 self.retire_ci_hold_rows(&held.rows, &ended).await;
+                // 这一次收的只是**它自己**开出去的那几行（`held.rows`）。更早几次
+                // 扣住开出去的行不在这份名单里，而它们追的版本同样已经被这一版走
+                // 过去了——上游刚把这一版判绿，那一版的红再也拦不住任何人。
+                //
+                // 不在这里收，它们就只在「下一次开单」那一刻才有人管，而下一次开单
+                // 要求再来一次红：上游一直绿着的那段时间里，旧行一直占着停线车道
+                // 唯一的座位。2026-11-06 05:1x 实测就这么压着四条，一条还在跑。
+                if let Some(orchestrator) = self.orchestrator.as_ref() {
+                    self.retire_ci_holds_for_other_revs(orchestrator, &bare)
+                        .await;
+                }
             }
             state.ci_hold_ends.push(ended);
             let excess = state.ci_hold_ends.len().saturating_sub(CI_HOLD_END_KEEP);
@@ -16868,6 +16891,92 @@ exit 0
             cancels[0].1.contains("superseded") && cancels[0].1.contains(rev12(&rev_a)),
             "退行的理由要点名哪一种结局、哪一版：{}",
             cancels[0].1
+        );
+        settle(handle).await;
+    }
+
+    /// 扣住结束的那一拍，收的不能只是**这一次**开出去的行。
+    ///
+    /// 更早几次扣住开出去的行追的是更早的版本，而这一版刚被判绿——按 push 判，
+    /// 那一版的红再也拦不住任何人，那几行是死活，却还占着停线车道唯一的座位。
+    /// 它们只在「下一次开单」那一刻才有人收，而下一次开单要求再来一次红：上游
+    /// 一直绿着的那段时间里没人管它们。2026-11-06 05:1x 实测，上游判绿两个多小时
+    /// 后车道上还压着四条，其中一条在跑，正给一版早已进不了主线的树改代码。
+    ///
+    /// 走完整的 `poll_once`，量的是接线：只考 `retire_ci_holds_for_other_revs`
+    /// 本身的用例在它一个调用点都没有的时候照样绿。
+    #[tokio::test]
+    async fn a_tick_that_ends_a_hold_also_retires_the_rows_earlier_holds_filed() {
+        let _env = ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bare, _work, rev_a, _rev_b) = setup_repos(root).await;
+        let bin_dir = root.join("bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        let buildah = fake_buildah(&bin_dir, "");
+        let deployed = main_image("localhost:30500", &rev_a);
+        let kubectl = fake_kubectl(&bin_dir, &deployed);
+        let green = || http_200(r#"{"check_runs":[{"name":"Test","conclusion":"success"}]}"#);
+        let (endpoint, handle) = fake_registry(vec![green(), green(), green(), green()]).await;
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.upstreams = vec![crate::config::UpstreamTrackConfig {
+            platform: crate::config::CodePlatform::Github,
+            repo: "owner/repo".into(),
+            api_base: Some(format!("http://{endpoint}/github")),
+        }];
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare))
+            .with_orchestrator(planner.clone());
+
+        // 这一次扣住开的那一行（在 `held.rows` 里），以及更早一次扣住开的、
+        // 这一次的收尾根本不知道它存在的那一行。
+        let mine = cog_core::Task::new(
+            "ci-red-mine-2026-11-06-fix",
+            cog_core::TaskType::Custom(CI_HOLD_FIX_KIND.into()),
+            serde_json::json!({ "goal": "make CI green", "rev": rev_a }),
+        );
+        let older = cog_core::Task::new(
+            "ci-red-older-2026-11-05-fix",
+            cog_core::TaskType::Custom(CI_HOLD_FIX_KIND.into()),
+            serde_json::json!({ "goal": "make CI green", "rev": rev_a }),
+        );
+        for row in [&mine, &older] {
+            planner
+                .graph
+                .lock()
+                .unwrap()
+                .insert(row.id.clone(), row.clone());
+        }
+        let now = Utc::now().timestamp();
+        let mut state = deployer.load_state();
+        state.ci_hold = Some(CiHold {
+            rev: rev_a.clone(),
+            since_unix: now - 600,
+            opened_rev: rev_a.clone(),
+            opened_unix: now - 600,
+            failed_checks: vec!["github:Test".into()],
+            rows: vec![mine.id.clone()],
+        });
+        state.ci_hold_run_since_unix = Some(now - 600);
+        deployer.save_state(&state).unwrap();
+
+        let _ = deployer.poll_once().await;
+
+        let after = deployer.load_state();
+        assert!(after.ci_hold.is_none(), "上游判绿了，扣住该结束");
+        assert_eq!(
+            after.ci_hold_ends.last().map(|e| e.outcome.as_str()),
+            Some("superseded"),
+            "头已经走到被判绿的下一版上，被扣的那一版是被取代，不是「没人再问过」"
+        );
+        let mut cancelled: Vec<String> =
+            planner.cancels().iter().map(|(id, _)| id.clone()).collect();
+        cancelled.sort_unstable();
+        assert_eq!(
+            cancelled,
+            vec![mine.id.clone(), older.id.clone()],
+            "这一次开的那一行与更早那次开的那一行，都要在扣住结束时收掉——\
+             只收 `held.rows` 里那一条，另一条就一直占着车道唯一的座位"
         );
         settle(handle).await;
     }
