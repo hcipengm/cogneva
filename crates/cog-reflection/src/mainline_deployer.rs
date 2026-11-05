@@ -1559,18 +1559,26 @@ pub(crate) enum CiHoldOwner {
     NoOrchestrator,
     /// 提交被拒。
     SubmitError,
+    /// 红的全部是「取消」：没有一个可以被改动的地方，所以这一轮不派。
+    CancelledOnly,
 }
 
 impl CiHoldOwner {
     /// 每一轮都写全部取值——只写当轮那一格的话，其余几格会停在上一次的旧值，
     /// 读起来像几件事同时成立。
-    pub(crate) const ALL: [Self; 3] = [Self::Owned, Self::NoOrchestrator, Self::SubmitError];
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Owned,
+        Self::NoOrchestrator,
+        Self::SubmitError,
+        Self::CancelledOnly,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Owned => "owned",
             Self::NoOrchestrator => "no_orchestrator",
             Self::SubmitError => "submit_error",
+            Self::CancelledOnly => "cancelled_only",
         }
     }
 
@@ -1578,7 +1586,7 @@ impl CiHoldOwner {
     fn value(self) -> f64 {
         match self {
             Self::Owned => 0.0,
-            Self::NoOrchestrator | Self::SubmitError => 1.0,
+            Self::NoOrchestrator | Self::SubmitError | Self::CancelledOnly => 1.0,
         }
     }
 }
@@ -5516,6 +5524,33 @@ impl MainlineDeployer {
             .unwrap_or(0);
         self.record_ci_hold_reading(held_secs).await;
         self.record_ci_hold_active(true).await;
+        // 红的**全部是「取消」**的那一版不开修复单。
+        //
+        // 取消不是这棵树的问题：检查没有得出结论，没有一个可以被改动的地方。而这一
+        // 条路的唯一手段是提交代码，于是接手的那一轮只能为了「让 CI 再跑一次」去改
+        // 一棵没坏的东西——2026-11-06 实测，一次 macOS runner 在 901 秒处被取消，
+        // 部署器为此开出了 `ci-red-52fe919e3077-…-fix`，占着停线车道唯一的座位。
+        //
+        // 扣住照旧：取消下面可能压着一次真的没跑完，窗口（见
+        // [`Self::CANCELLED_WAIVER_WINDOW_SECS`]）之内不滚这一版是对的。要的是别把
+        // 「等一下」说成「有人去修」——这一格因此写 `cancelled_only`，读它的人分得
+        // 出「没人接住」的哪一种。
+        if !cancelled_checks.is_empty() && cancelled_checks.len() == failed_checks.len() {
+            info!(
+                rev = %rev12(rev),
+                cancelled = %cancelled_checks
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                "every failing check on this rev was cancelled; holding without opening a repair \
+                 goal, because the only way this path can act on a cancellation is to change code \
+                 that nothing has said is wrong"
+            );
+            self.record_ci_hold_unowned(CiHoldOwner::CancelledOnly)
+                .await;
+            return Ok(true);
+        }
         // After the hold is on disk: a submission that fails must not cost the
         // record of how long this revision has been held, which is the reading
         // the alert rests on.
@@ -19269,6 +19304,69 @@ exec {real} "$@"
             .unwrap());
         assert!(planner.submissions().is_empty());
         let _ = handle.await.unwrap();
+    }
+
+    /// 红的全部是「取消」的那一版：扣住，但不开修复单。
+    ///
+    /// 取消没有结论，没有一个可以被改动的地方，而这一条路唯一的手段是提交代码——
+    /// 接手的那一轮只能为了「让 CI 再跑一次」去改一棵没有人说它坏了的树。2026-11-06
+    /// 实测：一次 macOS runner 在 901 秒处被取消，部署器为此开出了
+    /// `ci-red-52fe919e3077-…-fix`，占着停线车道唯一的座位。
+    ///
+    /// 扣住照旧：取消下面可能压着一次真的没跑完，窗口之内不滚这一版是对的。要变的
+    /// 只是别把「等一下」说成「有人去修」——读数上这一格因此有自己的名字。
+    #[tokio::test]
+    async fn a_cancelled_only_verdict_holds_without_opening_a_goal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // 一个跑到一半被取消的检查：`started_at` 有值，所以它不属于「一次都没跑
+        // 起来」那一档，放行要等满窗口——这一问发生在窗口之前。
+        let (endpoint, _seen) = fake_ci_by_rev(|line| {
+            if line.contains("/annotations") {
+                http_200("{}")
+            } else {
+                http_200(
+                    r#"{"check_runs":[{"id":7,"name":"Bootstrap Cross-Platform Check (macos-latest)","conclusion":"cancelled","started_at":"2026-11-06T05:00:00Z","completed_at":"2026-11-06T05:15:00Z"}]}"#,
+                )
+            }
+        })
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone())
+            .with_metrics(metrics.clone());
+
+        let mut state = MainlineState::default();
+        assert!(
+            deployer
+                .hold_if_ci_reports_failure(&mut state, "abc123", CiAsk::RoundHead)
+                .await
+                .unwrap(),
+            "取消仍然要扣住：窗口之内不滚这一版"
+        );
+        assert!(
+            planner.submissions().is_empty(),
+            "取消不是这棵树的问题，没有可以派下去的事：{:?}",
+            planner.submissions()
+        );
+        let samples = metrics
+            .query_gauge_latest(cog_core::metric_names::MAINLINE_CI_HOLD_UNOWNED.as_str())
+            .await
+            .unwrap();
+        let one: Vec<&str> = samples
+            .iter()
+            .filter(|s| s.value == 1.0)
+            .map(|s| s.labels.get("reason").map(String::as_str).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            one,
+            vec!["cancelled_only"],
+            "「没人接住」的这一种要与别的几种分得开：{samples:?}"
+        );
     }
 
     /// 复问的位置在**第一处写动作之前**，判词落在签名里：这一版为什么没落地，
