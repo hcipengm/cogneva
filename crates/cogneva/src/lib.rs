@@ -248,6 +248,10 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                 principles: ctx.consume_service::<dyn cog_core::PrincipleLedgerStore>(),
                 alerts: ctx.consume_service::<dyn cog_core::AlertStore>(),
             };
+            // 它怎么说话是部署声明的，不是这段装配写死的一句。声明在 `prompts/`
+            // 里，随 ConfigMap 挂进进程；这里只把那个本子交过去。没装提示词插件
+            // 的进程就是没有这本子，员工按没有额外指示说话。
+            let prompts = ctx.consume_service::<dyn cog_core::PromptProvider>();
             if conversation
                 .set(Arc::new(crate::conversation::PlatformConversation::new(
                     orchestrator,
@@ -257,6 +261,7 @@ pub async fn run_app() -> Result<(), Box<dyn std::error::Error>> {
                     roster,
                     inbox,
                     ledgers,
+                    prompts,
                 )))
                 .is_err()
             {

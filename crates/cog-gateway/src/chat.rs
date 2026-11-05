@@ -17,22 +17,6 @@ use crate::GatewayState;
 // cap: bound — 一次会话带多少轮历史进上下文，界的是请求体积
 const SESSION_HISTORY_CAP: usize = 40;
 
-/// Persona for the Web UI chat.
-///
-/// 它只管两件事：怎么说话，和哪句话必须先读账。工具本身不在这段里裁剪——手上
-/// 有什么由**这个进程装配了什么**决定，所以这里不写「你只有这几只」。
-///
-/// 2026-11-05 带外实测后重写。上一版是一段「数字生命体」宣言加四条「铁律」，
-/// 结果是每次开口都先自我介绍、再列一遍能力清单，三句话能说完的事写成一份报告；
-/// 而且要「不要凭上一轮的对话回答」，可一追问上文它就只能说「我看不到」。这段
-/// 的判据只有一条：像同事一样说话，账上的事实仍然只从账上来。
-const CHAT_SYSTEM_PROMPT: &str = "你在 Cogneva 里工作——一个多智能体系统，用户正通过 Live 面板和你说话。你像一名得力的同事那样说话：先给结论，直接、具体、口语化；不自我介绍，不列能力清单，不把三句话能说清的事写成报告。\
-手上有什么工具由这个进程装配了什么决定，不由这句话裁剪：读账（任务、变更、原则、告警）、把活派给编排器、催跑与撤回，以及进程里装好的别的。\
-关于系统状态的话——进展、卡在哪、谁在做、落地了没有、有没有告警、哪条原则管着——以这一轮从账上读到的为准，不要凭印象或猜测；没读就先读一下再回答。任务号、目标号、变更身份只能照抄工具返回的值，不许自己编。派活是异步的，分解要时间，不要说它已经跑完。\
-「做完」不由你宣布：账上的读数说了算。你可以说「已派出，目标号是 X」，但不能替账说「已经完成」。\
-用户只是聊天、问概念、问你是谁，就直接回答，不用为了显得能干去查账或派活；要做事时，自己动手或派给编排器都行，按事情大小选。\
-对话上文就是你的上下文，正常引用和延续它；需要更早的记录或实时读数时，再去查。用用户的语言回答。不知道就说不知道。通常三五句话就够，用户要细节时再展开。";
-
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
 }
@@ -440,10 +424,10 @@ pub async fn run_chat_turn(
         return;
     };
 
-    // 2. Build the transcript: what this session already said, the persona, and
-    //    this sentence. 循环读到的是这段记录，不是网关的记忆。
+    // 2. Build the transcript: what this session already said, plus this
+    //    sentence. 循环读到的是这段记录，不是网关的记忆。员工的指示不在这里：
+    //    它是那位员工自己的事，由会话执行器按声明取，网关只搬对话。
     let mut messages = load_history(&state.chat_turns, &session_id).await;
-    messages.insert(0, cog_core::Message::system(CHAT_SYSTEM_PROMPT));
     messages.push(cog_core::Message::user(content.clone()));
 
     // 3. Hand it over. 事件由另一个任务读：循环要能一直往管道里写，不因为这一头
