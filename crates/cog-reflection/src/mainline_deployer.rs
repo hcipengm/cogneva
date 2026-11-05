@@ -25449,6 +25449,111 @@ spec:
         );
     }
 
+    /// 清单本身改了 `Job` 的 pod 模板时，重建那个对象，而不是让整轮发布停在它身上。
+    ///
+    /// 准入拒绝的是**整份清单**：支撑集里一个 `Job` 的模板与集群里那份不同，其余对象
+    /// 也一起交不出去，而此后每一版都会撞同一面墙。2026-11-05 的现场就是给所有容器
+    /// 加了同一个 `TZ` 之后，`cogneva-db-role-bootstrap` 停在 `field is immutable`，
+    /// 主线上滚从 09:57 起不再推进，live 版本停在七小时前那一版。
+    ///
+    /// 重建是一次性 bootstrap 的正常生命周期：名字被占着，模板一变就只能重来。这里
+    /// 的假 kubectl 第一次 apply 拒绝、重建之后的 apply 放行，断言的是三步的顺序：
+    /// apply、delete job、apply。
+    #[tokio::test]
+    async fn a_job_whose_template_changed_is_recreated_so_the_support_bundle_lands() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let applied = bin_dir.join("applied-once");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"apply -f"*)
+    if [ -f '{applied}' ]; then exit 0; fi
+    : > '{applied}'
+    echo 'The Job "cogneva-db-role-bootstrap" is invalid: spec.template: Invalid value: {{"spec":{{}}}}: field is immutable' >&2
+    exit 1 ;;
+  *"delete job cogneva-db-role-bootstrap"*) exit 0 ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+"#,
+            log = log.display(),
+            applied = applied.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+
+        let manifest = tmp.path().join("support.yaml");
+        std::fs::write(&manifest, "kind: ConfigMap\nmetadata:\n  name: x\n").unwrap();
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        executor
+            .apply_support_manifest(&manifest.to_string_lossy(), 30)
+            .await
+            .expect("a changed Job template must not stop the support bundle");
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        let lines: Vec<&str> = calls.lines().collect();
+        assert_eq!(lines.len(), 3, "expected apply, delete, apply: {calls}");
+        assert!(lines[0].contains("apply -f"), "{calls}");
+        assert!(
+            lines[1].contains("delete job cogneva-db-role-bootstrap"),
+            "the object named in the refusal is the one rebuilt: {calls}"
+        );
+        assert!(lines[2].contains("apply -f"), "{calls}");
+    }
+
+    /// 同一条拒绝原话里点名的是别的对象时，不删它。
+    ///
+    /// `Deployment` 的 selector 同样不可变，而删掉一个运行中的 Deployment 远不是
+    /// "重交一份清单"能收场的事。这里只认 pod 模板不可变的那一类。
+    #[tokio::test]
+    async fn an_immutable_field_on_a_mutable_kind_is_reported_not_deleted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().to_path_buf();
+        let log = bin_dir.join("kubectl.log");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{log}'
+case "$*" in
+  *"apply -f"*)
+    echo 'The Deployment "cogneva" is invalid: spec.selector: Invalid value: {{}}: field is immutable' >&2
+    exit 1 ;;
+  *) echo "unexpected kubectl call: $*" >&2; exit 2 ;;
+esac
+"#,
+            log = log.display()
+        );
+        write_fake_bin(&bin_dir, "fake-kubectl", &script);
+
+        let manifest = tmp.path().join("support.yaml");
+        std::fs::write(&manifest, "kind: ConfigMap\nmetadata:\n  name: x\n").unwrap();
+        let executor = RolloutExecutor::new(
+            bin_dir.join("fake-kubectl").to_string_lossy().as_ref(),
+            "cogneva",
+            1,
+            1,
+            60,
+            60,
+        );
+        assert!(executor
+            .apply_support_manifest(&manifest.to_string_lossy(), 30)
+            .await
+            .is_err());
+
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        assert!(
+            !calls.contains("delete"),
+            "a mutable kind is not rebuilt to get a manifest in: {calls}"
+        );
+    }
+
     /// 暂存路径**每次调用都不同**：同名部署的两个执行器写同一个路径时，
     /// `std::fs::write` 先截断再写，读到的那一方解析到的是被撕成两半的清单，
     /// 于是把它当成"这一版坏了"。

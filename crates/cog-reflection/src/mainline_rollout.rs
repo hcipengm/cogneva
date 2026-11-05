@@ -2960,6 +2960,63 @@ impl RolloutExecutor {
         .await
     }
 
+    /// 落一份支撑清单；清单要改的是 pod 模板不可变的那类对象（`Job`）时，先把旧
+    /// 对象删掉，让清单声明的规格能被创建出来。
+    ///
+    /// 准入不接受对 `Job` 的 pod 模板做原地修改，而 apply 是整份清单一起交的：只要
+    /// 有一个 `Job` 的模板与集群里那份不同，**整轮发布**就停在 `field is immutable`
+    /// 上，清单里其余对象也一起没交出去。2026-11-05 的现场：镜像里给所有容器加了同一个
+    /// `TZ`，`cogneva-db-role-bootstrap` 的模板因此多了一条 env，此后每一版主线上滚都
+    /// 在支撑集这一步失败，live 版本停在 07:18 那一版，而清单本身是对的。
+    ///
+    /// 重建是这个对象的正常生命周期——它是一次性 bootstrap，跑完就在那里占着名字，
+    /// 模板一变就只能重建。删掉它不会中断任何东西：新的一份随同一次 apply 被创建，
+    /// 并按新规格重新跑一遍。次数有界，一份真坏了的清单不会被重试成死循环。
+    pub(crate) async fn apply_support_manifest(
+        &self,
+        path: &str,
+        timeout_secs: u64,
+    ) -> SFResult<String> {
+        let mut refused = None;
+        for _ in 0..4 {
+            match self.apply_manifest_file(path, timeout_secs).await {
+                Ok(out) => return Ok(out),
+                Err(SFError::IO(text)) => {
+                    let Some((kind, name)) = immutable_object_in(&text) else {
+                        return Err(SFError::IO(text));
+                    };
+                    // 只有模板不可变的那些才需要这一步；别的对象报出同样的字眼时
+                    // 删掉它是另一回事，不能顺带做。
+                    if cog_core::contract::env_supersede::pod_template_is_mutable(kind) {
+                        return Err(SFError::IO(text));
+                    }
+                    warn!(
+                        kind,
+                        name,
+                        "the support manifest changes an object whose pod template cannot be \
+                         updated in place; deleting it so the declared spec can be created"
+                    );
+                    self.run_kubectl(
+                        &[
+                            "delete",
+                            &kind.to_lowercase(),
+                            name,
+                            "--ignore-not-found",
+                            "--cascade=foreground",
+                        ],
+                        60,
+                    )
+                    .await?;
+                    refused = Some(text);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(SFError::IO(refused.unwrap_or_else(|| {
+            "the support manifest kept being refused on an immutable pod template".to_string()
+        })))
+    }
+
     async fn set_image(&self, t: &RolloutTarget, image: &str) -> SFResult<()> {
         let image_arg = format!("{}={}", t.container, image);
         self.run_kubectl(
@@ -5348,7 +5405,7 @@ impl RolloutExecutor {
                         );
                         let outcome = async {
                             self.clear_superseded_env_values(&path).await?;
-                            self.apply_manifest_file(&support_arg, 120)
+                            self.apply_support_manifest(&support_arg, 120)
                                 .await
                                 .map(|_| ())
                         }
@@ -6339,6 +6396,25 @@ pub(crate) fn admission_hold_dimension(message: &str) -> Option<&'static str> {
     None
 }
 
+/// apply 因为 pod 模板不可变而拒绝的那个对象：kind 与 name。
+///
+/// 准入的原话是 `The Job "cogneva-db-role-bootstrap" is invalid: spec.template:
+/// Invalid value: …: field is immutable`，而它拒绝的是**整份清单**——名字后面那份
+/// 文档并没有单独失败，是整次交付停在它身上。只从这句原话里取名字：不在本地重算
+/// 两版模板的差（集群那份带着一堆默认值，比不出干净的结论），也不按对象类型猜。
+fn immutable_object_in(error: &str) -> Option<(&str, &str)> {
+    let at = error.find("field is immutable")?;
+    let head = &error[..at];
+    let open = head.rfind("\" is invalid")?;
+    let (pre, name) = head[..open].rsplit_once(" \"")?;
+    let kind = pre.rsplit(' ').next()?;
+    let before_kind = pre.strip_suffix(kind)?;
+    if kind.is_empty() || name.is_empty() || !before_kind.ends_with("The ") {
+        return None;
+    }
+    Some((kind, name))
+}
+
 // 这一侧的用例在 `crate::mainline_deployer::tests` 里，不在本模块。它们是搬迁前那唯一
 // 一份用例，与构建侧的用例共用夹具（伪造的 kubectl、临时清单目录、`RolloutExecutor`
 // 的搭台），按主题交错排布，逐条断的是「跑起来是什么样」——按模块切开反而会把一份场景
@@ -6378,6 +6454,33 @@ mod tests {
         // 剥掉的只是参与判据的那一半：判词本身仍带着现场，读日志的人看得到。
         assert!(msg.contains("connection refused"), "{msg}");
         assert!(msg.contains("Startup probe failed"), "{msg}");
+    }
+
+    /// 拒绝原话里点名的是哪个对象，只从那一句里读。
+    ///
+    /// 两种写法都要认：kubectl 自己的报错前后还可能多一行（校验失败时它会把整份
+    /// 对象打出来），所以取的是最后一句 `… "name" is invalid: … field is
+    /// immutable`，而不是第一行开头。名字前面那个 `The ` 是这句话的形状——没有它
+    /// 就不是准入对不可变字段的拒绝，不猜。
+    #[test]
+    fn the_refused_object_is_read_out_of_the_servers_sentence() {
+        let text = "kubectl apply -f /tmp/x.yaml failed: The Job \"cogneva-db-role-bootstrap\" is invalid: spec.template: Invalid value: {}: field is immutable\n";
+        assert_eq!(
+            immutable_object_in(text),
+            Some(("Job", "cogneva-db-role-bootstrap"))
+        );
+        assert_eq!(
+            immutable_object_in(
+                "The Deployment \"cogneva\" is invalid: spec.selector: field is immutable"
+            ),
+            Some(("Deployment", "cogneva"))
+        );
+        assert_eq!(immutable_object_in("some other failure"), None);
+        assert_eq!(
+            immutable_object_in("The Job is invalid: spec.template: field is immutable"),
+            None,
+            "a sentence without a quoted name is not this refusal"
+        );
     }
 
     /// 没有现场时判词保持原样：不许多出一个空的分隔段。
