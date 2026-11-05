@@ -38,7 +38,7 @@ pub mod fallback {
     /// Skill refinement: asks for an improved `SkillConfig` for one skill.
     pub fn skill_refinement(skill_json: &str, skill_id: &str) -> String {
         format!(
-            "You are evolving an existing agent skill based on production feedback.\n\n\
+            "Evolve an existing agent skill based on production feedback.\n\n\
              Current skill:\n{}\n\n\
              Generate an improved version as valid JSON with the same schema:\n\
              - skill_id (keep identical: '{}')\n\
@@ -55,7 +55,7 @@ pub mod fallback {
     /// the caller parses back out of the reply.
     pub fn tool_variant(tool_name: &str, error_patterns: &str) -> String {
         format!(
-            "You are a tool design expert for an AI agent system.\n\n\
+            "Design an improved variant of an existing tool.\n\n\
              Existing tool: {}\n\n\
              Observed error patterns:\n- {}\n\n\
              Generate an improved tool variant as JSON with these fields:\n\
@@ -616,7 +616,7 @@ impl EvolutionEngine {
         // 要么改正文（那是改行为），要么留下一份永远渲染失败的声明（那是假声明）。
         // 此前的调用正是后者：key 从未被声明 ⇒ `render` 每次都失败 ⇒ 这里每次都执行。
         let prompt = format!(
-            "You are a hook synthesis expert for an AI agent system.\n\n\
+            "Design a hook definition from an observed event pattern.\n\n\
              Observed event pattern:\n{}\n\n\
              Action outcomes:\n- {}\n\n\
              Generate a hook definition as JSON with these fields:\n\
@@ -1150,6 +1150,37 @@ fn repair_generated_diff(diff: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether a prompt assigns the model an identity: a sentence opening with
+    /// "you are …". That covers a determiner ("a tool design expert") and a
+    /// participle ("evolving an existing skill") alike -- both tell the model
+    /// what it is rather than what to do.
+    ///
+    /// These two fallbacks are what runs when no prompt manager is wired, and
+    /// the declared copies in `prompts/` are what runs when one is; both sides
+    /// have to say what to do rather than who to be.
+    fn role_claim(text: &str) -> Option<String> {
+        for sentence in text.split_inclusive(['.', '!', '?', '\n']) {
+            let lowered = sentence.trim_start().to_lowercase();
+            if lowered.starts_with("you are ") {
+                return Some(sentence.trim().to_string());
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_evolution_fallbacks_say_what_to_do_not_who_to_be() {
+        let skill = fallback::skill_refinement("{\"skill_id\":\"s\"}", "s");
+        let tool = fallback::tool_variant("read_file", "ENOENT");
+        for (what, prompt) in [("skill refinement", &skill), ("tool variant", &tool)] {
+            assert_eq!(
+                role_claim(prompt),
+                None,
+                "the {what} prompt hands the model a role to play instead of the work to do"
+            );
+        }
+    }
 
     #[test]
     fn extract_json_strips_markdown_fences() {

@@ -42,7 +42,7 @@ data:
       # ==========================================================================
       reflection:evolution_refinement:
         content: |
-          You are evolving an existing agent skill based on production feedback.
+          Evolve an existing agent skill based on production feedback.
 
           Current skill:
           {{ skill_json }}
@@ -69,7 +69,7 @@ data:
 
       reflection:evolution_tool:
         content: |
-          You are a tool design expert for an AI agent system.
+          Design an improved variant of an existing tool.
 
           Existing tool: {{ tool_name }}
 

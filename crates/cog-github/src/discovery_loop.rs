@@ -53,8 +53,8 @@ const ASSESS_JUDGE_EPOCH: &str = "v4";
 /// `cog_core::contract::prompt::PROMPT_CONTRACT_KEY` 渲染在请求最前面，所以
 /// 每条意图的请求共享同一段前缀，而不是各自重买一遍。
 const INTENT_ASSESS_CONTRACT: &str = "\
-You are a careful actionability judge for an autonomous software-engineering \
-agent. You output exactly one JSON verdict and nothing else.\n\
+Decide carefully whether this intent is actionable for an autonomous \
+software-engineering agent. Output exactly one JSON verdict and nothing else.\n\
 \n\
 The document carries the intent under \"task\": its kind, number, title, body, \
 labels, author and the follow-up comment thread. Attached media \
@@ -2801,6 +2801,27 @@ pub(crate) mod tests {
     use cog_core::contract::outcome::TERMINAL_ENV_FAILURE_PREFIX;
     use cog_core::{SFError, UpstreamFailure};
     use std::sync::Mutex;
+
+    /// The verdict contract is the instruction the judge model receives, so a
+    /// role assignment in it is a standing instruction the deployment never
+    /// wrote: it asks the model to be a careful judge instead of asking it to
+    /// decide the question in front of it. The rule is stated rather than the
+    /// old sentence merely being absent, because the next edit should be able
+    /// to change the wording without the gate going blind.
+    #[test]
+    fn the_verdict_contract_states_the_question_not_a_role() {
+        for sentence in INTENT_ASSESS_CONTRACT.split_inclusive(['.', '!', '?', '\n']) {
+            let lowered = sentence.trim_start().to_lowercase();
+            assert!(
+                !lowered.starts_with("you are "),
+                "the verdict contract assigns the model a role: {sentence:?}"
+            );
+        }
+        assert!(
+            INTENT_ASSESS_CONTRACT.contains("Decide carefully whether this intent is actionable"),
+            "the contract no longer opens with the question the verdict answers"
+        );
+    }
 
     /// The state directory is per process and nothing removes it, so the next
     /// run has to. It may only remove what is certainly not in use: a directory

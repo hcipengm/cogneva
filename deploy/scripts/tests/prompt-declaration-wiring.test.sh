@@ -112,6 +112,21 @@ for key in sorted(declared):
             "the registry is a map, so one of the two is silently overwritten"
         )
 
+# A declared prompt is an instruction the model receives. A sentence that opens
+# with "you are …" hands it an identity -- "a tool design expert", but equally
+# "evolving an existing skill" -- which is a standing instruction nobody in this
+# repo wrote and no operator edits; what the platform wants from a prompt is the
+# work in front of the model. The rule is the shape of the sentence rather than
+# any one phrase, so a rewording that keeps the property passes and one that
+# puts the costume back trips.
+ROLE = re.compile(r"(?i)(?:^|\n)\s*you are\b")
+for path in sorted((repo / "prompts").glob("*.yaml")):
+    for line in path.read_text().split("\n"):
+        if ROLE.search(line):
+            problems.append(
+                f"{path.relative_to(repo)} assigns the model a role: {line.strip()!r}"
+            )
+
 if problems:
     print("prompt declarations and their readers disagree:", file=sys.stderr)
     for p in problems:
