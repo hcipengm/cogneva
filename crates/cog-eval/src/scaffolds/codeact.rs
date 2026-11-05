@@ -17,7 +17,7 @@ use crate::metric::StepRecord;
 use crate::scaffold::{AgentOutput, AgentScaffold, FinishReason, SolveContext, ToolSet};
 
 const SYSTEM_PROMPT: &str = "\
-You are an agent whose only action is writing code. On each turn, either reply with a \
+Write code and nothing else. On each turn, either reply with a \
 single fenced code block to be executed, or reply with the final answer and no code block. \
 The execution result comes back to you as the next message.";
 
@@ -266,6 +266,17 @@ mod tests {
     fn the_action_space_is_the_interpreter_not_the_search_tool() {
         // 消融按角色切：CodeAct 的动作空间是代码解释器，不是别的方法也能用的搜索工具。
         assert_eq!(CodeAct::new().action_space(), &["python", "bash"][..]);
+    }
+
+    /// 提示词说的是这一步的动作空间，不是模型是谁。身份设定会被平台原样复用，
+    /// 而这一行与别的行的区别只在「动作只有跑代码」这一个契约上。
+    #[test]
+    fn the_codeact_prompt_says_what_the_action_is_not_who_the_model_is() {
+        assert_eq!(
+            crate::scaffolds::test_support::claims_a_role(SYSTEM_PROMPT),
+            None,
+            "the codeact prompt hands the model a role to play instead of the action space"
+        );
     }
 
     #[tokio::test]

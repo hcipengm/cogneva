@@ -514,6 +514,19 @@ pub(crate) mod test_support {
         messages.last().map(|m| m.content()).unwrap_or_default()
     }
 
+    /// 一句提示词是否在指派身份：句首是「you are …」。
+    ///
+    /// 覆盖冠词（「an expert evaluator」）与分词（「assessing whether …」）两种形状。
+    /// 只看句首是判据的一部分：「the failure you are handed」这类句子说的是活，不是身份。
+    pub fn claims_a_role(text: &str) -> Option<String> {
+        for sentence in text.split_inclusive(['.', '!', '?', '\n']) {
+            if sentence.trim_start().to_lowercase().starts_with("you are ") {
+                return Some(sentence.trim().to_string());
+            }
+        }
+        None
+    }
+
     /// 一段请求里的系统提示词。用来钉「这一代跑的是不是那一份提示词」。
     pub fn system_of(messages: &[Message]) -> String {
         for message in messages {

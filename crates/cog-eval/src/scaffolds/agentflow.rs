@@ -297,6 +297,24 @@ mod tests {
     use crate::scaffolds::test_support::{code_tool, ScriptedLlm, ToolRecorder};
     use std::sync::Arc;
 
+    /// 四个角色各问一件事，不替模型指定身份。这四条提示词逐字节复用，所以一句
+    /// 「你是谁」会随每一次调用被原样带上；句首是动作而不是身份。
+    #[test]
+    fn every_agentflow_prompt_says_what_to_do_not_who_to_be() {
+        for (name, prompt) in [
+            ("planner", PLANNER_PROMPT),
+            ("executor", EXECUTOR_PROMPT),
+            ("verifier", VERIFIER_PROMPT),
+            ("generator", GENERATOR_PROMPT),
+        ] {
+            assert_eq!(
+                crate::scaffolds::test_support::claims_a_role(prompt),
+                None,
+                "the agentflow {name} prompt hands the model a role to play instead of the job"
+            );
+        }
+    }
+
     fn case() -> EvalCase {
         EvalCase {
             id: "c1".into(),

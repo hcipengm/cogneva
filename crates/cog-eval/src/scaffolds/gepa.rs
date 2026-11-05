@@ -18,15 +18,15 @@ use crate::metric::StepRecord;
 use crate::scaffold::{AgentOutput, AgentScaffold, FinishReason, SolveContext};
 
 const BASE_PROMPT: &str = "\
-You are an agent solving a single task. Use the tools you are given when they help, and \
+Solve a single task. Use the tools you are given when they help, and \
 finish by stating the final answer plainly.";
 
 const CRITIQUE_PROMPT: &str = "\
-You are reviewing an attempt at a task. Say in two sentences what was strong and what was \
+Review an attempt at a task. Say in two sentences what was strong and what was \
 missing, then end with a line `SCORE: <a number between 0 and 1>`.";
 
 const MUTATE_PROMPT: &str = "\
-You are improving the instructions given to an agent. Rewrite them so the weaknesses in the \
+Improve the instructions given to an agent. Rewrite them so the weaknesses in the \
 review are addressed. Reply with the new instructions only.";
 
 /// 搜索的规模。
@@ -383,6 +383,23 @@ mod tests {
         assert_eq!(recorder.count(), 1);
         assert_eq!(out.trace.len(), 1);
         assert!(out.trace[0].success);
+    }
+
+    /// 三条提示词各问一件事，不替模型指定身份。身份设定是平台自己写死的一句设定，
+    /// 随每一次调用被原样复用；这一行的差别本来就该只在提示词的内容上。
+    #[test]
+    fn every_gepa_prompt_says_what_to_do_not_who_to_be() {
+        for (name, prompt) in [
+            ("base", BASE_PROMPT),
+            ("critique", CRITIQUE_PROMPT),
+            ("mutate", MUTATE_PROMPT),
+        ] {
+            assert_eq!(
+                crate::scaffolds::test_support::claims_a_role(prompt),
+                None,
+                "the gepa {name} prompt hands the model a role to play instead of the job"
+            );
+        }
     }
 
     #[test]

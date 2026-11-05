@@ -144,7 +144,7 @@ const PLATFORM_BUDGET_MARGIN_SECS: u64 = 30;
 ///
 /// 判分器读的是答复正文，所以「答案放正文里」必须写在活里，不能指望接活的人从题面猜：
 /// 把推理过程、markdown 围栏或一句「我查到了……」交回去，分数掉下去而原因不在题上。
-const CASE_CONTRACT: &str = "You are answering one benchmark question. The question is in \
+const CASE_CONTRACT: &str = "Answer one benchmark question. The question is in \
     `task`; answer it. The text of your reply is what gets scored, so put the answer itself \
     there -- not a description of how you would find it, and no markdown fence around it.";
 
@@ -641,6 +641,23 @@ fn digest(text: &str) -> String {
 mod tests {
     use super::*;
     use cog_eval::scaffold::Budget;
+
+    /// 这道桥交给接活人的是题与答复形状，不是身份。身份设定由平台写死、随每一道
+    /// 基准题原样复用，而判分看的是答复本身。
+    #[test]
+    fn the_case_contract_states_the_question_not_a_role() {
+        for sentence in CASE_CONTRACT.split_inclusive(['.', '!', '?', '\n']) {
+            assert!(
+                !sentence.trim_start().to_lowercase().starts_with("you are "),
+                "the case contract assigns the solver a role: {:?}",
+                sentence.trim()
+            );
+        }
+        assert!(
+            CASE_CONTRACT.contains("`task`"),
+            "the contract still has to say where the question is"
+        );
+    }
 
     #[tokio::test]
     async fn the_missing_backbone_refuses_every_call() {
