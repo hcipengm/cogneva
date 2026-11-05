@@ -521,9 +521,13 @@ const COUNTER_HELP: &[(&str, &str)] = &[
          same. The reason values are a closed set the producing module declares: \
          default_partition_missing and month_partition_missing when CREATE was \
          refused, default_backlog_unreadable when the parked-row count could \
-         not be read, and window_behind when the count came back non-zero -- \
+         not be read, window_behind when the count came back non-zero -- \
          rows in DEFAULT mean the window fell behind and they are outside every \
-         open range. Written only when its cause occurs, because the closed set \
+         open range -- and partition_bounds_disagree when a month partition \
+         exists but was cut for a different time reference: an empty one is \
+         re-cut in the same round, and one that holds rows is reported instead, \
+         because dropping rows to repair a layout is not a trade a maintenance \
+         round gets to make. Written only when its cause occurs, because the closed set \
          is declared in the code a reader can enumerate; a reader takes an \
          absent cell as zero, and the rising-against-flat shape is what tells a \
          failing loop from one with nothing to do",

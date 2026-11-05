@@ -19,7 +19,9 @@ use sqlx::PgPool;
 use std::sync::Arc;
 
 use cog_core::{RawFileFormat, RawLogIndexEntry, RawLogIndexStore, RawLogQuery, StorageTier};
-use cog_storage::partition_maintainer::{KeyKind, PartitionMaintainer, PartitionedTable};
+use cog_storage::partition_maintainer::{
+    KeyKind, MaintenanceFailure, PartitionMaintainer, PartitionedTable,
+};
 use cog_storage::PostgresRawLogIndexStore;
 
 use cog_test_support::database_url;
@@ -80,6 +82,46 @@ async fn insert_at(pool: &PgPool, table: &str, ts: &str) {
 
 fn maintainer(pool: PgPool, table: &str) -> PartitionMaintainer {
     PartitionMaintainer::new(pool, vec![probe_table(table)])
+}
+
+/// A pool whose every session says `zone`. The layout is cut in the session's
+/// clock, so a test that wants to watch a reference change needs the two
+/// sessions to disagree.
+async fn zoned_pool(zone: &str) -> PgPool {
+    let zone = zone.to_string();
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(move |conn, _meta| {
+            let zone = zone.clone();
+            Box::pin(async move {
+                sqlx::query(&format!("SET TIME ZONE '{zone}'"))
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&database_url())
+        .await
+        .unwrap()
+}
+
+/// The lower edge a partition was cut at, read back as an instant.
+async fn partition_start(pool: &PgPool, partition: &str) -> Option<chrono::DateTime<Utc>> {
+    sqlx::query_scalar(
+        r"WITH bound AS (
+             SELECT pg_get_expr(c.relpartbound, c.oid) AS expr
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relname = $1 AND n.nspname = current_schema()
+         ), literal AS (
+             SELECT (regexp_match(expr, 'FROM \(''([^'']+)''\)'))[1] AS at FROM bound
+         )
+         SELECT at::timestamptz FROM literal",
+    )
+    .bind(partition)
+    .fetch_optional(pool)
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -384,4 +426,99 @@ async fn a_month_boundary_comes_from_the_databases_clock_not_this_process() {
 
         drop_probe(&pool, table).await;
     }
+}
+
+/// A partition cut before the reference moved is re-cut once the reference
+/// does move, as long as it holds nothing.
+///
+/// This is the only month that is ever empty in a deployment where the
+/// reference changed after the tables had been in use for a while, and it is
+/// the month that would otherwise fail later: the next attach lands on top of
+/// the old range and the database refuses it, so the window stops opening and
+/// nothing says why.
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn an_empty_partition_cut_at_another_edge_is_recut() {
+    const TABLE: &str = "partition_maintainer_probe_recut";
+    let utc = zoned_pool("UTC").await;
+    fresh_probe(&utc, TABLE).await;
+    maintainer(utc.clone(), TABLE).maintain().await.unwrap();
+
+    let today = cog_core::day::local_date_naive(Utc::now().timestamp());
+    let (_, yprefix) = probe_names(TABLE);
+    let current = format!("{yprefix}{}m{:02}", today.year(), today.month());
+    let before = partition_start(&utc, &current).await;
+    assert_eq!(
+        before,
+        Some(
+            month_start(today.year(), today.month())
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+        ),
+        "the UTC session cut {current} at UTC midnight"
+    );
+
+    let east = zoned_pool("Asia/Shanghai").await;
+    maintainer(east.clone(), TABLE).maintain().await.unwrap();
+
+    let after = partition_start(&east, &current).await;
+    assert_eq!(
+        after,
+        Some(
+            month_start(today.year(), today.month())
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                - chrono::Duration::seconds(8 * 3600)
+        ),
+        "{current} was not re-cut after the session's reference moved"
+    );
+
+    drop_probe(&east, TABLE).await;
+}
+
+/// A partition that holds rows is reported, never re-cut.
+///
+/// Re-cutting means dropping the relation, which means dropping what is in it.
+/// A layout mismatch is a reason to ask a human, and the round says so with its
+/// own label instead of repairing the layout with the only tool it has.
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn a_loaded_partition_cut_at_another_edge_is_reported_not_dropped() {
+    use cog_core::MetricsBackend as _;
+    const TABLE: &str = "partition_maintainer_probe_loaded";
+    let utc = zoned_pool("UTC").await;
+    fresh_probe(&utc, TABLE).await;
+    maintainer(utc.clone(), TABLE).maintain().await.unwrap();
+    insert_at(&utc, TABLE, "now").await;
+
+    let east = zoned_pool("Asia/Shanghai").await;
+    let metrics = Arc::new(cog_storage::MemoryMetricsBackend::new());
+    let round = PartitionMaintainer::new(east.clone(), vec![probe_table(TABLE)])
+        .with_metrics(Some(metrics.clone()));
+    round
+        .maintain()
+        .await
+        .expect_err("a loaded stale partition is a failure, not a repair");
+
+    let totals = metrics
+        .query_counter_totals("cogneva_partition_maintenance_failures_total")
+        .await
+        .unwrap();
+    let disagree = totals.iter().find(|s| {
+        s.labels.get("reason").map(String::as_str)
+            == Some(MaintenanceFailure::PartitionBoundsDisagree.as_str())
+    });
+    assert!(
+        disagree.map(|s| s.value).unwrap_or(0.0) >= 1.0,
+        "the round did not report the layout disagreement under its own label: {totals:?}"
+    );
+    assert_eq!(
+        count_in(&east, TABLE).await,
+        1,
+        "the row must still be there: the round does not drop data to fix a layout"
+    );
+
+    drop_probe(&east, TABLE).await;
 }

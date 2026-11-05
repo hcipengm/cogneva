@@ -57,6 +57,26 @@ impl KeyKind {
         }
     }
 
+    /// SQL that compares a partition's lower edge, as the database renders it,
+    /// against the edge this clock cuts for that month.
+    ///
+    /// The left side is read back out of `pg_get_expr` and cast, the right side
+    /// is composed the same way [`Self::bound`] composes an attach, and both
+    /// happen inside the statement: rendering the stored edge in this process
+    /// would answer with this process's zone instead of the instant the layout
+    /// actually names.
+    pub fn edge_matches_sql(self, year: i32, month: u32) -> String {
+        const ACTUAL: &str = r"(regexp_match(expr, 'FROM \(''([^'']+)''\)'))[1]";
+        match self {
+            KeyKind::Date => {
+                format!("({ACTUAL}) = to_char(make_date({year}, {month}, 1), 'YYYY-MM-DD')")
+            }
+            KeyKind::Timestamptz => {
+                format!("({ACTUAL})::timestamptz = make_timestamptz({year}, {month}, 1, 0, 0, 0)")
+            }
+        }
+    }
+
     /// The predicate a row's key is tested with between two boundaries.
     ///
     /// Both sides use the same expression the bounds were cut with, so the
@@ -167,16 +187,21 @@ pub enum MaintenanceFailure {
     /// A table's DEFAULT partition holds rows: the window fell behind, and
     /// those rows are outside every open monthly range.
     WindowBehind,
+    /// A monthly partition exists but its lower edge is not the one this
+    /// clock cuts. It is left alone when it holds rows: re-cutting it would
+    /// drop them, and a silent drop is worse than a month that fails later.
+    PartitionBoundsDisagree,
 }
 
 impl MaintenanceFailure {
     /// Every cause, in the order the label values are listed, so a reader can
     /// enumerate the closed set without reading the match below.
-    pub const ALL: [MaintenanceFailure; 4] = [
+    pub const ALL: [MaintenanceFailure; 5] = [
         MaintenanceFailure::DefaultPartitionMissing,
         MaintenanceFailure::MonthPartitionMissing,
         MaintenanceFailure::DefaultBacklogUnreadable,
         MaintenanceFailure::WindowBehind,
+        MaintenanceFailure::PartitionBoundsDisagree,
     ];
 
     /// The label value, which is also the word to search the source for.
@@ -186,6 +211,7 @@ impl MaintenanceFailure {
             MaintenanceFailure::MonthPartitionMissing => "month_partition_missing",
             MaintenanceFailure::DefaultBacklogUnreadable => "default_backlog_unreadable",
             MaintenanceFailure::WindowBehind => "window_behind",
+            MaintenanceFailure::PartitionBoundsDisagree => "partition_bounds_disagree",
         }
     }
 }
@@ -335,7 +361,32 @@ impl PartitionMaintainer {
     async fn ensure_month(&self, table: &PartitionedTable, month: i32) -> SFResult<()> {
         let name = month_partition_name(table, month);
         if self.partition_exists(&name).await? {
-            return Ok(());
+            if self.partition_starts_at(table, &name, month).await? {
+                return Ok(());
+            }
+            // The edge moved: a partition cut before the reference changed
+            // does not meet the one this clock cuts now, and the month after
+            // it would land on top of it and be refused. An empty one carries
+            // nothing, so re-cutting it is free; a loaded one is left where it
+            // is and reported, because dropping rows to repair a layout is not
+            // a trade a maintenance round gets to make.
+            if !self.recut_if_empty(&name).await? {
+                warn!(
+                    table = table.parent,
+                    partition = name,
+                    "partition edge disagrees with the clock and the partition holds rows"
+                );
+                self.report_failure(MaintenanceFailure::PartitionBoundsDisagree)
+                    .await;
+                return Err(SFError::Database(format!(
+                    "{name} starts at a different month edge and holds rows"
+                )));
+            }
+            info!(
+                table = table.parent,
+                partition = name,
+                "Re-cut an empty partition whose edge disagreed with the clock"
+            );
         }
 
         let (start, end) = month_bounds(month);
@@ -449,6 +500,71 @@ impl PartitionMaintainer {
         .await
         .map_err(|e| SFError::Database(e.to_string()))?;
         Ok(row)
+    }
+
+    /// Whether the partition called `name` starts where this clock cuts `month`.
+    ///
+    /// Both sides of the comparison are computed by the database, so the answer
+    /// is about the instant the layout actually names rather than about how a
+    /// reader's session happens to render it.
+    async fn partition_starts_at(
+        &self,
+        table: &PartitionedTable,
+        name: &str,
+        month: i32,
+    ) -> SFResult<bool> {
+        let (year, month_of_year) = split_month(month);
+        let matches = table.key_kind.edge_matches_sql(year, month_of_year);
+        let sql = format!(
+            "WITH bound AS (
+                 SELECT pg_get_expr(c.relpartbound, c.oid) AS expr
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relname = $1 AND n.nspname = current_schema()
+             )
+             SELECT COALESCE((SELECT {matches} FROM bound), false)"
+        );
+        sqlx::query_scalar::<_, bool>(&sql)
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))
+    }
+
+    /// Drops `name` and reports `true`, or leaves it in place and reports
+    /// `false` when it holds anything.
+    ///
+    /// The emptiness test and the drop share one transaction under an ACCESS
+    /// EXCLUSIVE lock on the partition. Reading the count first and dropping
+    /// later would reopen the window the first read closed: an insert landing
+    /// between the two would be dropped with the partition, and the round
+    /// would report a clean re-cut while deleting a row it never saw.
+    async fn recut_if_empty(&self, name: &str) -> SFResult<bool> {
+        let table = cog_core::sql::quote_relation(name);
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        sqlx::query(&format!("LOCK TABLE {table} IN ACCESS EXCLUSIVE MODE"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        let holds_rows =
+            sqlx::query_scalar::<_, bool>(&format!("SELECT EXISTS (SELECT 1 FROM {table})"))
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| SFError::Database(e.to_string()))?;
+        if !holds_rows {
+            sqlx::query(&format!("DROP TABLE {table}"))
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| SFError::Database(e.to_string()))?;
+        }
+        tx.commit()
+            .await
+            .map_err(|e| SFError::Database(e.to_string()))?;
+        Ok(!holds_rows)
     }
 
     async fn default_holds_range(
@@ -592,6 +708,46 @@ mod tests {
                 "{kind:?} boundary carries a zone or a date literal: {bound}"
             );
         }
+    }
+
+    /// Comparing a stored edge with the clock's is done in the database, on
+    /// both sides.
+    ///
+    /// The stored edge renders in whatever zone the reader's session is in. If
+    /// the comparison happened in this process, the answer would be about the
+    /// reader rather than about the instant the layout names — the same
+    /// partition would be "wrong" or "right" depending on who asked. Handing
+    /// the month over as numbers and letting `make_timestamptz`/`make_date`
+    /// compose the right side keeps both sides in the same clock.
+    #[test]
+    fn an_edge_comparison_places_both_sides_in_the_database() {
+        let ts = KeyKind::Timestamptz.edge_matches_sql(2026, 11);
+        assert!(
+            ts.contains("regexp_match(expr"),
+            "the stored edge is not read back from relpartbound: {ts}"
+        );
+        assert!(
+            ts.contains("make_timestamptz(2026, 11, 1, 0, 0, 0)"),
+            "the right side is not composed from numbers: {ts}"
+        );
+        assert!(
+            !ts.contains("zone") && !ts.contains("+08") && !ts.contains("UTC"),
+            "the comparison names a zone: {ts}"
+        );
+        assert!(
+            !ts.contains("'2026-11-01'"),
+            "the comparison carries a rendered date literal: {ts}"
+        );
+
+        let date = KeyKind::Date.edge_matches_sql(2026, 11);
+        assert!(
+            date.contains("= to_char(make_date(2026, 11, 1), 'YYYY-MM-DD')"),
+            "a DATE edge is compared against the rendered form of the clock's month: {date}"
+        );
+        assert!(
+            !date.contains("::timestamptz"),
+            "a DATE edge must not be read as an instant: {date}"
+        );
     }
 
     /// The range predicate and the partition bounds are built from the same
