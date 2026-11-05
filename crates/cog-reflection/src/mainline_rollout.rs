@@ -2996,10 +2996,14 @@ impl RolloutExecutor {
                         "the support manifest changes an object whose pod template cannot be \
                          updated in place; deleting it so the declared spec can be created"
                     );
+                    // 资源槽位写字面量而不是 `kind.to_lowercase()`：上面的判据只放过
+                    // 一种 kind，走到这里必然是 Job；而 RBAC 门是从源码里静态读出
+                    // 「这条命令碰什么资源」的，拼出来的槽位它读不出——既证明不了
+                    // 角色授了 delete，也说不清这条命令要删的是什么。
                     self.run_kubectl(
                         &[
                             "delete",
-                            &kind.to_lowercase(),
+                            "job",
                             name,
                             "--ignore-not-found",
                             "--cascade=foreground",
