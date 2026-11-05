@@ -20205,6 +20205,9 @@ or upgrade your plan: https://www.kimi.com/membership/subscription?tab=quota",\
                         remaining: limits.hard_limit.saturating_sub(used),
                         used_today: used,
                         limits,
+                        // 这个替身只装得下声明的格子：它能答出来的每一对
+                        // 都是测试替某一级写进去的。
+                        enforced: true,
                         blocking,
                         warning: !blocking && projected >= limits.soft_limit,
                     });

@@ -2568,25 +2568,25 @@ async fn quota_workspace_handler(
         .into_response()
 }
 
-/// 一格的日上限：声明的那一对、检查时真正生效的那一对，和这一格今天的计数。
+/// 一格的日上限：声明的那一对，和这一格今天的计数。
 ///
-/// `limits` 与 `effective` 分开，是因为它们答的是两个问题。「这一格配过没有」
-/// 只有声明能答——检查面在没有覆盖时报出的是默认值，读那个答案的人分不出
-/// 「按默认值配的」与「没人配过」。而「检查会怎么判」只有生效值能答，因为覆盖
-/// 与默认值随时可能差开。
+/// 只有一对数，因为检查面只用一对：声明的。没人声明的格子不拿默认值去判任何人
+/// ——默认值只决定这一格**读**成多少，判定不读它——所以「生效的那一对」与
+/// 「声明的那一对」现在是同一个事实，留着两个字段就是同一件事的两处记录，
+/// 第一次有人只改一处就开始说谎。
 #[derive(Debug, serde::Serialize)]
 struct QuotaLimitsResponse {
     scope: String,
     target_id: String,
-    /// 有人为这一格写过的那一对；`null` 表示没有覆盖。
+    /// 有人为这一格写过的那一对；`null` 表示没人声明过，这一格不拦任何人。
     limits: Option<cog_core::QuotaLimits>,
-    /// 检查面此刻会用的那一对（没有覆盖时就是默认值）。
-    effective: cog_core::QuotaLimits,
     /// 这一格今天的计数器读数。计数器由记账方推进，读数本身不区分
     /// 「没人用」与「没人记」。只有人与工作空间两格有记账方；其余三级这个数
     /// 永远是 0，读它的人要配合 `enforced` 才知道那是「没人花」还是「没人记」。
     used_today: u64,
-    remaining: u64,
+    /// 声明的上限减今天花销；没人声明过上限的格子是 `None`——没有上限，也就
+    /// 没有「还剩多少」。
+    remaining: Option<u64>,
     /// 这一级的上限写下来之后，有没有一条路径会真的拒一发。
     ///
     /// `false` 的三级（团队、组织、全局）没有任何一处能把一次调用归到它们名下
@@ -2761,9 +2761,11 @@ async fn quota_limits_body(
         scope: scope.as_str().to_string(),
         target_id: target_id.to_string(),
         limits,
-        effective: status.map(|s| s.limits).unwrap_or_default(),
         used_today: status.map(|s| s.used_today).unwrap_or(0),
-        remaining: status.map(|s| s.remaining).unwrap_or(0),
+        // 没有声明过上限的格子没有「还剩多少」：算得出来（默认值减花销）的那个
+        // 数从来不是判定的依据，报出来会读成「只剩这么点了」，而那一格其实
+        // 谁也没拦。
+        remaining: status.filter(|s| s.enforced).map(|s| s.remaining),
         enforced: scope_enforcement(scope).is_some(),
     })
 }

@@ -3040,19 +3040,19 @@ export interface QuotaLimitPair {
 }
 
 /**
- * 一格的日上限：声明的那一对、检查时真正生效的那一对、这一格今天的计数。
+ * 一格的日上限：声明的那一对，和这一格今天的计数。
  *
- * `limits` 与 `effective` 必须分开读：没有覆盖时检查面报的是默认值，所以
- * 只看 `effective` 分不出「按默认值配过」与「没人配过」——而「清除覆盖」
- * 会不会改变行为，恰好取决于这个区别。
+ * 只有声明的那一对：没人声明的格子不拿默认值去判任何人——默认值只决定这一格
+ * 读成多少，判定不读它——所以「声明」与「生效」现在是同一个事实，`limits` 为
+ * `null` 就是「这一格不拦」，`remaining` 同时为 `null`（没有上限，就没有还剩
+ * 多少）。
  */
 export interface QuotaLimitsReading {
   scope: QuotaScopeName;
   target_id: string;
   limits: QuotaLimitPair | null;
-  effective: QuotaLimitPair;
   used_today: number;
-  remaining: number;
+  remaining: number | null;
   /**
    * 这一级的上限写下来之后，有没有一条路径会真的拒一发。
    *

@@ -17,13 +17,11 @@ import { resourceKey } from '@/store/frameTick';
 
 /**
  * 日上限的管理面：给某一格（人 / 工作空间 / 团队 / 组织 / 全局）写下
- * 一对 soft / hard，或把覆盖删掉、让它回到默认值。
+ * 一对 soft / hard，或把覆盖删掉、让这一格重新不受任何上限约束。
  *
  * 这一面只写声明，不写计数：计数由安全网关按账本投影（今天人与工作空间两格有写者）。
- * 两个读法必须同时给出，因为它们答的不是同一个问题：
- * 声明（`limits`）答「这一格配过没有」，生效（`effective`）答「检查会怎么判」。
- * 没有覆盖时生效值就是默认值——只显示它会让人以为默认值是自己配的，于是
- * 「清除」这个按钮看起来永远没有效果。
+ * 只有声明这一个数：没人声明的格子不拿默认值去判任何人，默认值只是它读起来的
+ * 样子，所以「清除」删掉的就是判定依据本身，不是把它换回另一个数。
  *
  * 每次写和删之后都读回服务端的那一份，而不是把输入框里的数当成结果：服务端会把
  * soft 压到 hard 以内，回显自己算出来的数就等于替它圆谎。
@@ -69,8 +67,8 @@ export function QuotaLimitsPanel() {
 
   const target = targetId.trim();
   const canAct = target.length > 0 && !busy;
-  /** 屏幕上此刻的那一对：有覆盖就是声明的那一对，没有就是默认值（生效值）。 */
-  const shownPair = reading ? (reading.limits ?? reading.effective) : null;
+  /** 屏幕上此刻的那一对：只有声明的那一对。没人声明过，这一格就不拦任何人。 */
+  const shownPair = reading ? reading.limits : null;
 
   const run = async (action: () => Promise<QuotaLimitsReading>) => {
     setBusy(true);
@@ -79,10 +77,13 @@ export function QuotaLimitsPanel() {
       const next = await action();
       setReading(next);
       setReadAt(new Date().toISOString());
-      // 读回之后把输入框对齐到声明值：没有覆盖时用生效值起步，改哪一格改哪一格。
-      const seed = next.limits ?? next.effective;
-      setSoft(String(seed.soft_limit));
-      setHard(String(seed.hard_limit));
+      // 读回之后把输入框对齐到声明值；清除覆盖之后没有声明值可对齐，就保留
+      // 用户刚敲的那一对。
+      const seed = next.limits;
+      if (seed) {
+        setSoft(String(seed.soft_limit));
+        setHard(String(seed.hard_limit));
+      }
     } catch (e) {
       setReading(null);
       setError(describe(e));
@@ -272,7 +273,7 @@ export function QuotaLimitsPanel() {
         <Readings
           from={{ what: `${SCOPE_LABELS[scope]} · ${reading.target_id}`, at: readAt }}
           source={`GET /api/v1/quota/limits/${reading.scope}/${reading.target_id}`}
-          caveat="「声明」是有人为这一格写过的那一对，「生效」是检查此刻真正会用的那一对——没有覆盖时后者就是默认值。"
+          caveat="「声明」是有人为这一格写过的那一对；没人声明过，这一格就不拦任何人，默认值只是它读起来的样子。"
         >
           {/* 这一格配的是一对什么数：soft 落在 hard 之内的哪里，中间那截就是 soft
               拦下调用之前预留的余量。用量那条只在「人」与「工作空间」两格画——五级里
@@ -280,18 +281,18 @@ export function QuotaLimitsPanel() {
               至今没有，把它们画成一根零长度的条就是拿「没量过」冒充「一条都没有」。 */}
           {shownPair !== null && shownPair.hard_limit > 0 && (
             <Meter
-              label={reading.limits ? '声明：soft 落在 hard 之内的哪里' : '生效：soft 落在 hard 之内的哪里'}
+              label="声明：soft 落在 hard 之内的哪里"
               value={shownPair.soft_limit}
               max={shownPair.hard_limit}
               note={`${shownPair.soft_limit.toLocaleString()} / ${shownPair.hard_limit.toLocaleString()}`}
             />
           )}
-          {reading.enforced && reading.effective.hard_limit > 0 && (
+          {shownPair !== null && shownPair.hard_limit > 0 && (
             <Meter
-              label="这个人今天已花 / 生效的 hard"
+              label="这个人今天已花 / 声明的 hard"
               value={reading.used_today}
-              max={reading.effective.hard_limit}
-              note={`${reading.used_today.toLocaleString()} / ${reading.effective.hard_limit.toLocaleString()}`}
+              max={shownPair.hard_limit}
+              note={`${reading.used_today.toLocaleString()} / ${shownPair.hard_limit.toLocaleString()}`}
             />
           )}
           <div className="flex flex-wrap py-2">
@@ -300,28 +301,33 @@ export function QuotaLimitsPanel() {
               value={
                 reading.limits
                   ? `${reading.limits.soft_limit.toLocaleString()} / ${reading.limits.hard_limit.toLocaleString()}`
-                  : '无覆盖'
+                  : '没人声明'
               }
-              note={reading.limits ? 'soft / hard' : '跟着默认值走'}
-            />
-            <Reading
-              label="生效"
-              value={`${reading.effective.soft_limit.toLocaleString()} / ${reading.effective.hard_limit.toLocaleString()}`}
-              note="soft / hard"
+              note={reading.limits ? 'soft / hard' : '这一格不拦任何人'}
             />
             <Reading label="今天已记" value={reading.used_today.toLocaleString()} />
-            <Reading label="剩余" value={reading.remaining.toLocaleString()} />
+            <Reading
+              label="剩余"
+              value={reading.remaining === null ? '—' : reading.remaining.toLocaleString()}
+              note={reading.remaining === null ? '没有声明上限' : undefined}
+            />
             <Reading label="这一格" value={<span className="mono text-[11px]">{reading.target_id}</span>} />
             <Reading
               label="执法"
               value={reading.enforced ? '有' : '没有'}
-              note={reading.enforced ? '越过之后会拒下一发' : '这一级写不进去'}
+              note={
+                reading.enforced
+                  ? reading.limits
+                    ? '越过之后会拒下一发'
+                    : '这一级能执法，但这一格还没声明上限'
+                  : '这一级写不进去'
+              }
             />
           </div>
         </Readings>
       ) : (
         <p className="px-4 pb-2 text-[11px] text-[var(--muted)]">
-          选层级、填 id、点「读」，这一格现在声明了什么、检查会怎么判，两个数会分开列出来。
+          选层级、填 id、点「读」，这一格有没有声明过上限、今天花了多少，会分开列出来。
         </p>
       )}
 

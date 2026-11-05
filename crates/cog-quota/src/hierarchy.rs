@@ -1,10 +1,16 @@
 //! 5-level quota hierarchy: user → workspace → team → organization → global.
-//! A request is allowed only when *all* applicable scopes have enough
-//! remaining quota. Each scope can be configured independently with a soft
-//! limit (warning) and a hard limit (block). When the soft limit is crossed
-//! the [`HierarchyDecision`] reports `warnings` so callers can emit telemetry
-//! or response headers; the hard limit triggers a block via
+//! A request is allowed unless *some* applicable scope an operator declared a
+//! pair for is out of quota. Each scope can be configured independently with a
+//! soft limit (warning) and a hard limit (block). When the soft limit is
+//! crossed the [`HierarchyDecision`] reports `warnings` so callers can emit
+//! telemetry or response headers; the hard limit triggers a block via
 //! [`HierarchyDecision::allowed = false`].
+//!
+//! A scope nobody declared a pair for has no ceiling: it is still read (spend
+//! is reported for it), but it can neither block nor warn. The default pair
+//! says what such a cell reads as, and it is orders of magnitude below a
+//! working day's real spend -- judging against it would refuse every request
+//! the moment the platform did any work.
 //! ## Redis keys
 //! For each `(scope, id)`:
 //! | key                                   | meaning                         |
@@ -36,9 +42,12 @@ use cog_core::KeyValueStore;
 // 这个数只决定「没配过的格子读成什么」，决定谁被拦下的是属主为那个人声明的那一对。
 /// The daily token ceiling a scope starts with before anyone configures it.
 ///
-/// It is a bound, not a policy: enforcement on the person axis applies only to
-/// cells an operator configured (see the LLM gateway's owner check), so this
-/// number decides what an unconfigured cell *reads* as, never who gets cut off.
+/// It is a bound, not a policy: every level refuses only against a pair an
+/// operator declared for that cell, so this number decides what an
+/// unconfigured cell *reads* as, never who gets cut off. The default is
+/// smaller than one working day of the platform's own spend by three orders of
+/// magnitude, which is exactly why it must never be the number a decision is
+/// made from.
 pub const PLATFORM_DAILY_TOKENS: u64 = 50_000;
 
 /// Hierarchy checker over a key-value store.
@@ -193,24 +202,50 @@ impl HierarchyManager {
 
     /// Evaluate a single `(scope, target)` cell against its limits without
     /// consuming.
+    ///
+    /// Only a cell an operator declared a pair for can refuse anything. The
+    /// default ceiling decides what an undeclared cell *reads* as, and it is
+    /// far below what a working day costs -- the platform's own workspace
+    /// spends tens of millions of tokens a day against a fifty-thousand
+    /// default. Judging that cell against the default does not bound spend; it
+    /// refuses every request the moment the platform does any work at all, and
+    /// it names a number nobody ever chose for that cell.
     async fn evaluate_scope(
         &self,
         scope: QuotaScope,
         target_id: &str,
         estimated_tokens: u64,
     ) -> ScopeStatus {
-        let limits = self.get_limits(scope, target_id).await;
+        // A declared pair that cannot be read is treated as undeclared rather
+        // than as the default: an unreadable ceiling must not be the one that
+        // cuts someone off, and the management read is where the broken value
+        // shows up.
+        let declared = match self.override_limits(scope, target_id).await {
+            Ok(declared) => declared,
+            Err(e) => {
+                tracing::warn!(
+                    scope = scope.as_str(),
+                    target_id,
+                    error = %e,
+                    "A declared quota ceiling could not be read; nothing is refused on this cell"
+                );
+                None
+            }
+        };
+        let limits = declared.unwrap_or(self.default_limits);
         let used = self.used_today(scope, target_id).await;
         let projected = used.saturating_add(estimated_tokens);
         let remaining = limits.hard_limit.saturating_sub(used);
-        let blocking = projected > limits.hard_limit;
-        let warning = !blocking && projected >= limits.soft_limit;
+        let enforced = declared.is_some();
+        let blocking = enforced && projected > limits.hard_limit;
+        let warning = enforced && !blocking && projected >= limits.soft_limit;
         ScopeStatus {
             scope,
             target_id: target_id.to_string(),
             remaining,
             used_today: used,
             limits,
+            enforced,
             blocking,
             warning,
         }

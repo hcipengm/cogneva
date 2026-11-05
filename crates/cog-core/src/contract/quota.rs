@@ -110,6 +110,16 @@ pub struct ScopeStatus {
     pub remaining: u64,
     pub used_today: u64,
     pub limits: QuotaLimits,
+    /// Whether an operator declared this cell's ceiling.
+    ///
+    /// `false` means nobody did: `limits` is then what the cell *reads* as,
+    /// not a pair the decision was made from, and nothing is refused on it.
+    /// A reader that folds the two together cannot tell a cell that is spent
+    /// from one no one ever set a ceiling for -- and the arithmetic below turns
+    /// the second into the first, because a default ceiling is smaller than a
+    /// working day's spend by orders of magnitude.
+    #[serde(default)]
+    pub enforced: bool,
     pub blocking: bool,
     pub warning: bool,
 }

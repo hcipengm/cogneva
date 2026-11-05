@@ -155,7 +155,18 @@ async fn a_decision_moves_the_counter_that_reports_it() {
 
     assert!(quota.pre_check("u1", None, 50).await.allowed);
     // 50 of the 100 are gone, so a check costing 100 cannot be admitted. The
-    // spend is written where the projection writes it; asking the check must
+    // ceiling has to be declared for that to be true: a cell nobody declared a
+    // pair for refuses nothing, and this case is about the refusal moving the
+    // counter, not about which cells are enforced.
+    hierarchy
+        .set_limits(
+            cog_core::QuotaScope::User,
+            "u1",
+            cog_core::QuotaLimits::new(80, 100),
+        )
+        .await
+        .unwrap();
+    // The spend is written where the projection writes it; asking the check must
     // not move the cell itself, or the reading would drift from the ledger it
     // is computed from.
     hierarchy
@@ -174,9 +185,17 @@ async fn the_counters_are_shared_with_every_clone_of_the_manager() {
     // The gateway holds its own clone of the manager and refuses through that
     // one, while the observable was built over the original. Per-instance
     // counters would leave this reading at zero through every refusal.
-    let (quota, _hierarchy) = manager(100);
+    let (quota, hierarchy) = manager(100);
     let observable = QuotaObservable::new(quota.readings());
     let as_the_gateway_holds_it: Arc<dyn cog_core::QuotaManager> = Arc::new(quota.clone());
+    hierarchy
+        .set_limits(
+            cog_core::QuotaScope::User,
+            "u1",
+            cog_core::QuotaLimits::new(80, 100),
+        )
+        .await
+        .unwrap();
 
     assert!(
         !as_the_gateway_holds_it
@@ -191,8 +210,16 @@ async fn the_counters_are_shared_with_every_clone_of_the_manager() {
 
 #[tokio::test]
 async fn the_family_renders_as_a_counter_under_the_name_the_rule_reads() {
-    let (quota, _hierarchy) = manager(100);
+    let (quota, hierarchy) = manager(100);
     let observable = QuotaObservable::new(quota.readings());
+    hierarchy
+        .set_limits(
+            cog_core::QuotaScope::User,
+            "u1",
+            cog_core::QuotaLimits::new(80, 100),
+        )
+        .await
+        .unwrap();
     assert!(!quota.pre_check("u1", None, 101).await.allowed);
 
     let rendered = cog_core::observability_text::render_raw_metrics(

@@ -1599,6 +1599,8 @@ mod tests {
                 remaining: 0,
                 used_today: 1_000_000,
                 limits: cog_core::QuotaLimits::new(1_000_000, 1_000_000),
+                // 这一格是声明的：只有声明过的上限才拦人。
+                enforced: true,
                 blocking: true,
                 warning: false,
             };

@@ -157,13 +157,27 @@ impl QuotaManager {
             allowed: decision.allowed,
             // The tightest ceiling the call was judged against: reporting the
             // user cell while a workspace cell is what refused it would name a
-            // number the refusal did not use.
+            // number the refusal did not use. An undeclared cell had no say in
+            // the decision, so its arithmetic is not reported as though it had
+            // -- a spent default would otherwise read as "nothing left" on a
+            // call that was admitted.
             remaining: decision
                 .scopes
                 .iter()
+                .filter(|scope| scope.enforced)
                 .map(|scope| scope.remaining)
                 .min()
-                .unwrap_or(0),
+                // Nothing was enforced, so no ceiling was the one this call was
+                // judged against. The narrowest cell's arithmetic is still what
+                // "remaining" has always meant, and it is the same number the
+                // quota read face shows for a cell with no declared pair.
+                .unwrap_or_else(|| {
+                    decision
+                        .scopes
+                        .first()
+                        .map(|scope| scope.remaining)
+                        .unwrap_or(0)
+                }),
             estimated_cost: 0.0,
         }
     }

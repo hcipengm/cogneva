@@ -179,8 +179,12 @@ async fn test_check_warns_at_soft_limit() {
         user_id: Some(user.clone()),
         ..Default::default()
     };
-    // Default soft=80, hard=100. The cell stands at 80 → the next 5 projects
-    // 85 ≥ 80 but < 100, so we should warn but not block.
+    // The person's cell stands at 80 → the next 5 projects 85 ≥ 80 but < 100,
+    // so we should warn but not block. The pair is declared: only a declared
+    // ceiling is judged, and these figures are the ones being judged.
+    mgr.set_limits(QuotaScope::User, &user, QuotaLimits::new(80, 100))
+        .await
+        .expect("set limits");
     mgr.project_used(QuotaScope::User, &user, 80)
         .await
         .expect("project ok");
@@ -199,6 +203,9 @@ async fn test_check_blocks_at_hard_limit() {
         user_id: Some(user.clone()),
         ..Default::default()
     };
+    mgr.set_limits(QuotaScope::User, &user, QuotaLimits::new(80, 100))
+        .await
+        .expect("set limits");
     mgr.project_used(QuotaScope::User, &user, 95)
         .await
         .expect("project ok");
@@ -206,6 +213,76 @@ async fn test_check_blocks_at_hard_limit() {
     assert!(!decision.allowed);
     assert_eq!(decision.blocked_by.len(), 1);
     assert_eq!(decision.blocked_by[0].scope, QuotaScope::User);
+}
+
+/// 没人声明的格子不拦任何人：默认值只决定它「读作多少」。
+///
+/// 现场读数：workspace `default` 一天花掉 47_746_019 token，而平台默认日上限
+/// 是 50_000。判定照默认值算，于是工作台往默认工作区派活一律 429——一条谁都
+/// 没为这个格子声明过的上限，把整个产品面挡死。默认值与真实一天的差距不是
+/// 调参能追上的量级，它本来就不该是判定的输入。
+#[tokio::test]
+async fn an_undeclared_ceiling_refuses_nothing() {
+    let mgr = fresh_manager();
+    let workspace = "undeclared:ws";
+    let ctx = QuotaContext {
+        user_id: Some("undeclared:user".into()),
+        workspace_id: Some(workspace.to_string()),
+        ..Default::default()
+    };
+    mgr.project_used(QuotaScope::Workspace, workspace, 47_746_019)
+        .await
+        .expect("project ok");
+
+    let decision = mgr.check(&ctx, 50).await;
+
+    assert!(
+        decision.allowed,
+        "没有人声明过这个格子的上限，所以没有上限可以越过"
+    );
+    assert!(decision.blocked_by.is_empty());
+    assert!(
+        decision.warnings.is_empty(),
+        "默认值上的告警同样是没有来路的"
+    );
+    for scope in &decision.scopes {
+        assert!(!scope.enforced, "{} 没被声明过", scope.target_id);
+        assert!(!scope.blocking);
+        assert!(!scope.warning);
+    }
+    assert_eq!(
+        decision.scopes[1].used_today, 47_746_019,
+        "花销照读：不拦不等于看不见花了多少"
+    );
+}
+
+/// 属主一旦为某个格子声明了一对，它就和以前一样拦。
+///
+/// 上一条改的是「没声明的默认值算不算数」，不是「声明的上限还算不算数」：
+/// 后者正是属主说的那句话的落地方式——上限由属主为某个人、某个场地声明，
+/// 不由代码里写死的数替他们声明。
+#[tokio::test]
+async fn a_declared_ceiling_still_refuses() {
+    let mgr = fresh_manager();
+    let workspace = "declared:ws";
+    mgr.set_limits(QuotaScope::Workspace, workspace, QuotaLimits::new(5, 10))
+        .await
+        .expect("set limits");
+    mgr.project_used(QuotaScope::Workspace, workspace, 8)
+        .await
+        .expect("project ok");
+    let ctx = QuotaContext {
+        user_id: Some("declared:user".into()),
+        workspace_id: Some(workspace.to_string()),
+        ..Default::default()
+    };
+
+    let decision = mgr.check(&ctx, 5).await;
+
+    assert!(!decision.allowed, "8 + 5 越过声明过的 10");
+    assert_eq!(decision.blocked_by.len(), 1);
+    assert_eq!(decision.blocked_by[0].scope, QuotaScope::Workspace);
+    assert_eq!(decision.blocked_by[0].target_id, workspace);
 }
 
 #[tokio::test]
@@ -290,6 +367,9 @@ async fn remaining_is_derived_at_the_decision_and_never_stored() {
         user_id: Some(user.to_string()),
         ..Default::default()
     };
+    mgr.set_limits(QuotaScope::User, user, QuotaLimits::new(80, 100))
+        .await
+        .expect("set limits");
     mgr.project_used(QuotaScope::User, user, 35)
         .await
         .expect("project ok");
@@ -348,6 +428,13 @@ async fn test_refusal_names_the_blocked_scope_and_the_reset() {
         workspace_id: Some(format!("{}:ws", prefix)),
         ..Default::default()
     };
+    mgr.set_limits(
+        QuotaScope::User,
+        &format!("{}:user", prefix),
+        QuotaLimits::new(80, 100),
+    )
+    .await
+    .expect("set limits");
     mgr.project_used(QuotaScope::User, &format!("{}:user", prefix), 95)
         .await
         .expect("project ok");
