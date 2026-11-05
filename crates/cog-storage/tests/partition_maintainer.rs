@@ -93,7 +93,7 @@ async fn opens_the_current_month_and_a_default_partition() {
     maintainer.maintain().await.unwrap();
 
     let (default, yprefix) = probe_names(TABLE);
-    let today = Utc::now().date_naive();
+    let today = cog_core::day::local_date_naive(Utc::now().timestamp());
     let current = format!("{yprefix}{}m{:02}", today.year(), today.month());
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1)")
@@ -130,7 +130,7 @@ async fn rows_parked_in_default_are_moved_when_their_partition_appears() {
     // Pick a month inside the maintained window, then remove its partition so
     // the next insert has only DEFAULT to fall into.
     let (default, yprefix) = probe_names(TABLE);
-    let target = Utc::now().date_naive() + chrono::Months::new(1);
+    let target = cog_core::day::local_date_naive(Utc::now().timestamp()) + chrono::Months::new(1);
     let name = format!("{yprefix}{}m{:02}", target.year(), target.month());
     sqlx::query(&format!("DROP TABLE {name}"))
         .execute(&pool)
@@ -174,7 +174,7 @@ async fn a_table_holding_rows_in_default_is_reported_as_behind() {
     // Far enough ahead that no partition this task opens covers it, so it can
     // only land in DEFAULT.
     let (default, _) = probe_names(TABLE);
-    let far = Utc::now().date_naive() + chrono::Months::new(24);
+    let far = cog_core::day::local_date_naive(Utc::now().timestamp()) + chrono::Months::new(24);
     let start = month_start(far.year(), far.month());
     insert_at(&pool, TABLE, &format!("{start} 12:00:00+00")).await;
     assert_eq!(count_in(&pool, &default).await, 1);
@@ -324,50 +324,64 @@ async fn raw_log_index_round_trips_every_tier() {
 #[tokio::test]
 #[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
 async fn a_month_boundary_comes_from_the_databases_clock_not_this_process() {
-    const TABLE: &str = "partition_maintainer_probe_zone";
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .after_connect(|conn, _meta| {
-            Box::pin(async move {
-                sqlx::query("SET TIME ZONE 'UTC'").execute(conn).await?;
-                Ok(())
+    // 同一个库、同一天、两个会话时区：切出来的瞬间必须差出那个偏移。只判 UTC 这一格
+    // 时，「从库的时钟算」与「从这里写死 0」在输出上同形——两者的答案都是 UTC 午夜。
+    for (table, zone, offset_secs) in [
+        ("partition_maintainer_probe_zone_utc", "UTC", 0i64),
+        (
+            "partition_maintainer_probe_zone_east",
+            "Asia/Shanghai",
+            8 * 3600,
+        ),
+    ] {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .after_connect(move |conn, _meta| {
+                let zone = zone.to_string();
+                Box::pin(async move {
+                    sqlx::query(&format!("SET TIME ZONE '{zone}'"))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
             })
-        })
-        .connect(&database_url())
+            .connect(&database_url())
+            .await
+            .unwrap();
+        fresh_probe(&pool, table).await;
+
+        let maintainer = maintainer(pool.clone(), table);
+        maintainer.maintain().await.unwrap();
+
+        let today = cog_core::day::local_date_naive(Utc::now().timestamp());
+        let (_, yprefix) = probe_names(table);
+        let current = format!("{yprefix}{}m{:02}", today.year(), today.month());
+        let start: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            r"WITH bound AS (
+                 SELECT pg_get_expr(c.relpartbound, c.oid) AS expr
+                 FROM pg_class c
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE c.relname = $1 AND n.nspname = current_schema()
+             ), literal AS (
+                 SELECT (regexp_match(expr, 'FROM \(''([^'']+)''\)'))[1] AS at FROM bound
+             )
+             SELECT at::timestamptz FROM literal",
+        )
+        .bind(&current)
+        .fetch_optional(&pool)
         .await
         .unwrap();
-    fresh_probe(&pool, TABLE).await;
 
-    let maintainer = maintainer(pool.clone(), TABLE);
-    maintainer.maintain().await.unwrap();
+        let expected = month_start(today.year(), today.month())
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            - chrono::Duration::seconds(offset_secs);
+        assert_eq!(
+            start,
+            Some(expected),
+            "{current} was cut at a zone other than the session's ({zone})"
+        );
 
-    let today = Utc::now().date_naive();
-    let (_, yprefix) = probe_names(TABLE);
-    let current = format!("{yprefix}{}m{:02}", today.year(), today.month());
-    let start: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
-        r"WITH bound AS (
-             SELECT pg_get_expr(c.relpartbound, c.oid) AS expr
-             FROM pg_class c
-             JOIN pg_namespace n ON n.oid = c.relnamespace
-             WHERE c.relname = $1 AND n.nspname = current_schema()
-         ), literal AS (
-             SELECT (regexp_match(expr, 'FROM \(''([^'']+)''\)'))[1] AS at FROM bound
-         )
-         SELECT at::timestamptz FROM literal",
-    )
-    .bind(&current)
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-
-    let expected = month_start(today.year(), today.month())
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
-        .and_utc();
-    assert_eq!(
-        start,
-        Some(expected),
-        "{current} was cut at this process's midnight instead of the database's"
-    );
-
-    drop_probe(&pool, TABLE).await;
+        drop_probe(&pool, table).await;
+    }
 }

@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, NaiveDate};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
@@ -283,7 +283,7 @@ impl PartitionMaintainer {
         // Which month is "now" is a question about the cluster's clock, not
         // about UTC: a round run in the eight hours after a month turns over
         // must open the month the rest of the cluster is already writing into.
-        let today = Local::now().date_naive();
+        let today = cog_core::day::local_date_naive(chrono::Utc::now().timestamp());
         let current = months_since_epoch(today);
         let from_month = current - MONTHS_BEHIND;
         let to_month = current + MONTHS_AHEAD;

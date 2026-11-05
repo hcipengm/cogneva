@@ -67,7 +67,7 @@ impl RawStreamWriter {
     /// Write a raw envelope to the appropriate stream file.
     /// Encoding: Length-delimited (4-byte big-endian length prefix + payload bytes).
     pub async fn write(&self, envelope: &RawEnvelope) -> std::io::Result<()> {
-        let date = chrono::Local::now().date_naive();
+        let date = cog_core::day::local_date_naive(Utc::now().timestamp());
         let file_name = format!(
             "{}_{}.raw",
             envelope.meta.stream_name,
@@ -118,7 +118,7 @@ impl RawStreamWriter {
         &self,
         stream: RawStreamName,
     ) -> std::io::Result<Option<PathBuf>> {
-        let date = chrono::Local::now().date_naive();
+        let date = cog_core::day::local_date_naive(Utc::now().timestamp());
         let file_name = format!("{}_{}.raw", stream.as_str(), date.format("%Y%m%d"));
         let file_path = self.hot_dir.join(&file_name);
 

@@ -354,8 +354,9 @@ async fn test_refusal_names_the_blocked_scope_and_the_reset() {
 
     let decision = mgr.check(&ctx, 10).await;
     assert!(!decision.allowed);
-    // Noon UTC: the pair below is the rest of the day.
-    let noon = 1_600_000_000 - 1_600_000_000 % 86_400 + 12 * 3600;
+    // Noon on this process's clock: the wait below is the rest of the day, and
+    // which instant that is belongs to the machine, not to the test.
+    let noon = cog_quota::day_start_unix(1_600_000_000) + 12 * 3600;
     let refusal = cog_quota::refusal_for(&decision, 10, noon).expect("blocked");
 
     assert_eq!(

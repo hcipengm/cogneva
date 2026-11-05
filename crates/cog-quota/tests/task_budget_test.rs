@@ -7,7 +7,7 @@
 //!
 //! - 没人声明过预算的任务放行，且 `remaining` 是 `None` 而不是 0——把「没有上限」
 //!   读成「上限为零」会让每一件没被预算管着的工作都被拒掉；
-//! - 记过账之后同日再判，超了硬上限就拒，并且带着到下一个 UTC 午夜的等待；
+//! - 记过账之后同日再判，超了硬上限就拒，并且带着到下一个午夜（本进程时钟）的等待；
 //! - 计数器身上真的挂着一个当天到期的 TTL：没有它，一条日上限会变成终身上限，
 //!   而读数上它与「今天花得多」一模一样；
 //! - 改上限**不是**发一笔新额度：已经花掉的那部分照样算数；
@@ -158,7 +158,10 @@ impl KeyValueStore for FakeStore {
 }
 
 /// 一个正午：用例里所有「现在」都从这里推，免得跨日在午夜附近跑出两种结果。
-const NOON: i64 = 1_600_000_000 - (1_600_000_000 % 86_400) + 12 * 3600;
+/// 本进程时钟上的正午：日界落在哪个时区是机器的属性，测试不自己钉一个 UTC 时刻。
+fn noon() -> i64 {
+    cog_quota::day_start_unix(1_600_000_000) + cog_quota::day::SECONDS_PER_DAY / 2
+}
 
 fn manager() -> TaskBudgetManager {
     TaskBudgetManager::new(Arc::new(FakeStore::default()))
@@ -167,7 +170,7 @@ fn manager() -> TaskBudgetManager {
 #[tokio::test]
 async fn a_task_without_a_declared_budget_has_no_ceiling_and_is_let_through() {
     let m = manager();
-    let d = m.check("task-a", 10_000, NOON).await.unwrap();
+    let d = m.check("task-a", 10_000, noon()).await.unwrap();
     assert!(d.allowed, "没有预算的任务不该被拒");
     assert_eq!(d.limits, None);
     assert_eq!(
@@ -185,21 +188,21 @@ async fn the_ceiling_refuses_the_call_that_would_cross_it() {
         .await
         .unwrap();
 
-    m.project_spent("task-b", 60, NOON).await.unwrap();
+    m.project_spent("task-b", 60, noon()).await.unwrap();
     assert!(
-        m.check("task-b", 40, NOON).await.unwrap().allowed,
+        m.check("task-b", 40, noon()).await.unwrap().allowed,
         "60+40 恰好到界，放行"
     );
 
-    m.project_spent("task-b", 100, NOON).await.unwrap();
-    let d = m.check("task-b", 1, NOON).await.unwrap();
+    m.project_spent("task-b", 100, noon()).await.unwrap();
+    let d = m.check("task-b", 1, noon()).await.unwrap();
     assert!(!d.allowed);
     assert_eq!(d.spent_today, 100);
     assert_eq!(d.remaining, Some(0));
     assert_eq!(
         d.wait_secs,
-        Some(43_200),
-        "正午被拒，等到下一个 UTC 午夜还有半天"
+        Some(cog_quota::day::SECONDS_PER_DAY as u64 / 2),
+        "正午被拒，等到下一个午夜还有半天"
     );
 }
 
@@ -210,13 +213,13 @@ async fn the_counter_carries_a_ttl_that_ends_at_the_next_utc_midnight() {
     m.set_budget("task-c", QuotaLimits::new(80, 100))
         .await
         .unwrap();
-    m.project_spent("task-c", 10, NOON).await.unwrap();
+    m.project_spent("task-c", 10, noon()).await.unwrap();
 
     // 计数器的过期必须落在当天末尾：没有它，这条日上限就是终身上限，
     // 而「今天花得多」与「这条预算再也不会重置」在读数上同形。
     assert_eq!(
         store.ttl("quota:task:used:task-c").await.unwrap(),
-        43_200,
+        cog_quota::day::SECONDS_PER_DAY / 2,
         "正午记的账，计数器活到当天结束"
     );
     // 限值键**不**带 TTL：预算是对这件工作整体说的，午夜不该把声明本身也抹掉。
@@ -233,13 +236,13 @@ async fn raising_the_ceiling_is_not_a_fresh_grant() {
     m.set_budget("task-d", QuotaLimits::new(80, 100))
         .await
         .unwrap();
-    m.project_spent("task-d", 90, NOON).await.unwrap();
+    m.project_spent("task-d", 90, noon()).await.unwrap();
 
     m.set_budget("task-d", QuotaLimits::new(200, 300))
         .await
         .unwrap();
 
-    let d = m.check("task-d", 0, NOON).await.unwrap();
+    let d = m.check("task-d", 0, noon()).await.unwrap();
     assert_eq!(d.spent_today, 90, "改上限不该把今天已经花掉的那部分抹掉");
     assert_eq!(d.limits, Some(QuotaLimits::new(200, 300)));
     assert!(d.allowed);
@@ -251,11 +254,11 @@ async fn clearing_the_budget_returns_the_task_to_unbudgeted() {
     m.set_budget("task-e", QuotaLimits::new(1, 1))
         .await
         .unwrap();
-    m.project_spent("task-e", 5, NOON).await.unwrap();
-    assert!(!m.check("task-e", 0, NOON).await.unwrap().allowed);
+    m.project_spent("task-e", 5, noon()).await.unwrap();
+    assert!(!m.check("task-e", 0, noon()).await.unwrap().allowed);
 
     m.clear_budget("task-e").await.unwrap();
-    let d = m.check("task-e", 0, NOON).await.unwrap();
+    let d = m.check("task-e", 0, noon()).await.unwrap();
     assert!(d.allowed);
     assert_eq!(d.limits, None);
     // 撤销预算不动计数器：再声明一次时，今天已经花掉的仍然算数。
@@ -271,7 +274,7 @@ async fn a_stored_budget_that_does_not_parse_is_an_error_not_an_absent_budget() 
         .unwrap();
     let m = TaskBudgetManager::new(store);
 
-    let err = m.check("task-f", 0, NOON).await;
+    let err = m.check("task-f", 0, noon()).await;
     assert!(
         err.is_err(),
         "读不出那条记录时要说「坏了」，不能说「没人声明过」——后者等于静默撤掉一条预算"
@@ -285,11 +288,11 @@ async fn a_stored_budget_that_does_not_parse_is_an_error_not_an_absent_budget() 
 #[tokio::test]
 async fn projecting_the_same_ledger_twice_leaves_the_cell_at_that_value() {
     let m = manager();
-    m.project_spent("task-g", 3, NOON).await.unwrap();
-    m.project_spent("task-g", 3, NOON).await.unwrap();
+    m.project_spent("task-g", 3, noon()).await.unwrap();
+    m.project_spent("task-g", 3, noon()).await.unwrap();
     assert_eq!(m.spent_today("task-g").await, 3);
 
-    m.project_spent("task-g", 1, NOON).await.unwrap();
+    m.project_spent("task-g", 1, noon()).await.unwrap();
     assert_eq!(
         m.spent_today("task-g").await,
         1,

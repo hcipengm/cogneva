@@ -329,9 +329,15 @@ impl cog_core::TaskBudgetGate for TaskBudgetManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::day::SECONDS_PER_DAY;
+    use crate::day::{day_start_unix, SECONDS_PER_DAY};
 
     const NOON: i64 = 1_600_000_000 - (1_600_000_000 % SECONDS_PER_DAY) + 12 * 3600;
+
+    /// 本进程时钟上的正午。测试不自己写 UTC 正午：日界在哪个时区是本机的属性，
+    /// 写死一个 UTC 时刻，这台机器上的「半天」就是错的。
+    fn local_noon() -> i64 {
+        day_start_unix(NOON) + SECONDS_PER_DAY / 2
+    }
 
     #[test]
     fn a_task_nobody_budgeted_is_allowed() {
@@ -347,14 +353,14 @@ mod tests {
         let limits = QuotaLimits::new(80, 100);
         // 恰好到界放行：界是「用到这里为止」，不是「用到这里就停」。这一格同时已经
         // 越过软上限，所以它也是一个告警——放行与告警不矛盾，它们是两句话。
-        let at = verdict("t1", Some(limits), 100, 0, NOON);
+        let at = verdict("t1", Some(limits), 100, 0, local_noon());
         assert!(at.allowed);
         assert!(at.warning);
-        let over = verdict("t1", Some(limits), 100, 1, NOON);
+        let over = verdict("t1", Some(limits), 100, 1, local_noon());
         assert!(!over.allowed);
         assert_eq!(over.remaining, Some(0));
-        // 正午到下一个 UTC 午夜是半天，不是一整天：等待是「到那个午夜」，不是
-        // 「再过 24 小时」。
+        // 正午到下一个午夜是半天，不是一整天：等待是「到那个午夜」，不是
+        // 「再过 24 小时」——而那个午夜是本进程时钟的午夜。
         assert_eq!(at.wait_secs, None);
         assert_eq!(over.wait_secs, Some(SECONDS_PER_DAY as u64 / 2));
     }
@@ -363,7 +369,7 @@ mod tests {
     fn the_wait_is_the_rest_of_the_day_not_a_fixed_number() {
         let limits = QuotaLimits::new(10, 10);
         // 午夜前一秒：从正午往后走半天再减一秒。
-        let last_second = NOON + SECONDS_PER_DAY / 2 - 1;
+        let last_second = local_noon() + SECONDS_PER_DAY / 2 - 1;
         let d = verdict("t1", Some(limits), 10, 1, last_second);
         assert!(!d.allowed);
         assert_eq!(d.wait_secs, Some(1));

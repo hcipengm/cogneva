@@ -7,4 +7,7 @@
 //! boundary agree only until one of them is edited, and the way they disagree is
 //! a caller told to come back one second before the counter actually resets.
 
-pub use cog_core::day::{day_start_unix, seconds_to_next_day, SECONDS_PER_DAY};
+pub use cog_core::day::{
+    date_at, day_start_unix, local_date_naive, local_offset_secs, seconds_to_next_day,
+    seconds_to_next_day_in, SECONDS_PER_DAY,
+};

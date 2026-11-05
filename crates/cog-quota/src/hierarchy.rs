@@ -255,7 +255,7 @@ impl HierarchyManager {
         tokens: u64,
     ) -> QuotaResult<()> {
         let ttl = Self::seconds_until_midnight();
-        let today = Utc::now().date_naive().to_string();
+        let today = crate::day::local_date_naive(Utc::now().timestamp()).to_string();
         let store = self.store.lock().await;
         store
             .set(&Self::key(scope, "used", target_id), &tokens.to_string())
@@ -287,7 +287,8 @@ impl HierarchyManager {
         let days = days.min(self.history_days).max(1);
         let mut out = Vec::with_capacity(days as usize);
         for n in 0..days {
-            let date = Utc::now().date_naive() - chrono::Duration::days(n as i64);
+            let date = crate::day::local_date_naive(Utc::now().timestamp())
+                - chrono::Duration::days(n as i64);
             let ymd = date.to_string();
             let store = self.store.lock().await;
             let key = Self::history_key(scope, target_id, &ymd);
