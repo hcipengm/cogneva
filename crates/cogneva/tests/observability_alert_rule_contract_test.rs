@@ -670,14 +670,9 @@ const PRODUCED: &[(&str, &str)] = &[
         "cogneva_process_zombies",
         "crates/cog-observability/src/process_zombies.rs",
     ),
-    // The replan loop's own account, in two halves: what each pass did with the
-    // breach it found, and why a pass could not measure one at all. Both are
-    // collected by the gateway process as it runs rather than by a scrape
-    // target, so the producer is the source file and not the chart.
-    (
-        "cogneva_project_control_outcomes_total",
-        "crates/cog-gateway/src/project_control.rs",
-    ),
+    // The coverage loop's own account: why a pass could not measure the plan
+    // baselines at all. Collected by the gateway process as it runs rather than
+    // by a scrape target, so the producer is the source file and not the chart.
     (
         "cogneva_project_control_unmeasured_total",
         "crates/cog-gateway/src/project_control.rs",

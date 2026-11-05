@@ -317,11 +317,6 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
         );
         let control: Arc<dyn cog_core::OrchestratorControl> = control_impl.clone();
         ctx.publish_service(control);
-        // 同一个对象再挂一个面：绩效越界要变成图上的一条活，而判得出越界的是另一
-        // 侧（它读得到逐笔 token 账）。回注因此走这个 trait，而不是让那一侧自己
-        // 拼一条任务行——去重读的是基线与图，那两件只有这里知道。
-        let replan_minter: Arc<dyn cog_core::ReplanMinter> = control_impl;
-        ctx.publish_service(replan_minter);
         info!("OrchestratorPlugin DAG executor control published");
 
         ctx.publish_service(planner);

@@ -14,7 +14,6 @@ pub mod plugin;
 pub mod principle_ledger;
 pub mod principle_measure;
 pub mod ready_queue;
-pub mod replan;
 pub mod resource_ledger;
 pub mod sop;
 pub mod subscribe_backoff;

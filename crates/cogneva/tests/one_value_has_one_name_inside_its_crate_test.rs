@@ -176,12 +176,6 @@ const SAME_VALUE_DIFFERENT_THING: &[(&str, &str, &str)] = &[
     ),
     (
         "cog-orchestrator",
-        "replan",
-        "改动编号前缀、任务类型与载荷键是三个通道；任务类型与载荷键那一对\
-         与本仓别处同形，前缀是另一件事",
-    ),
-    (
-        "cog-orchestrator",
         "resource_ledger",
         "同上：循环名与租约角色名是两个通道",
     ),
