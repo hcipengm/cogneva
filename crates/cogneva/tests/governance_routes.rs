@@ -263,6 +263,7 @@ fn state_with(
         raw_logger,
         memory_backend: None,
         memory_ingestor: None,
+        memory_entry_writer: None,
         metrics_backend: None,
         metrics_exporter: None,
         search_backend: None,

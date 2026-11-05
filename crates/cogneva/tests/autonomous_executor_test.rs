@@ -145,6 +145,7 @@ async fn build_test_state() -> Option<AutonomousTestState> {
         raw_logger: raw_logger.clone(),
         memory_backend: Some(memory_backend.clone()),
         memory_ingestor: None,
+        memory_entry_writer: None,
         metrics_backend: Some(metrics_backend.clone()),
         metrics_exporter: None,
         search_backend: None,

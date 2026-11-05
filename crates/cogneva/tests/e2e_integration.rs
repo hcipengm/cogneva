@@ -133,6 +133,7 @@ async fn spawn_app_full(
         raw_logger: raw_logger_clone,
         memory_backend: Some(memory_backend.clone()),
         memory_ingestor: Some(Arc::new(IngestionPipeline::new(RuleBasedExtractor::new()))),
+        memory_entry_writer: None,
         metrics_backend: Some(metrics.clone()),
         metrics_exporter: None,
         search_backend: None,

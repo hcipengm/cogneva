@@ -1191,6 +1191,47 @@ pub async fn metrics_handler(
 
 use serde_json::json;
 
+/// 写回一份已经判好的记忆。
+///
+/// 这份判词是谁下的、依据哪份原料，由请求体自己说（`judged_by` 与
+/// `raw_id`），不由一个专属执行者名代说——判断可以由任何一位员工做出，
+/// 服务端只补机械部分：id、来源归属、嵌入、去重。
+pub async fn judged_write_handler(
+    State(state): State<Arc<GatewayState>>,
+    claims: Option<axum::Extension<cog_core::Claims>>,
+    Json(judged): Json<serde_json::Value>,
+) -> Response {
+    let Some(writer) = state.memory_entry_writer.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "memory entry writer not wired"})),
+        )
+            .into_response();
+    };
+
+    let ns = effective_ns(claims_ref(&claims));
+    match writer.write_judged(&ns, &judged).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(json!({
+                "namespace": ns,
+                "schema_written": report.schema_written,
+                "summary_written": report.summary_written,
+            })),
+        )
+            .into_response(),
+        // 判词本身不合格（空判词、raw_id 不合法）：调用方能改，所以是 400。
+        Err(cog_core::SFError::Validation(reason)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({"error": reason}))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("judged write failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

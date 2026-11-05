@@ -225,6 +225,10 @@ pub struct GatewayState {
     pub raw_logger: Arc<dyn cog_core::RawLogger>,
     pub memory_backend: Option<Arc<dyn cog_core::MemoryBackend>>,
     pub memory_ingestor: Option<Arc<dyn cog_core::MemoryIngestor>>,
+    /// 判完写回的入口。与 `memory_ingestor` 是两条路：那条把原文交给抽取器，
+    /// 这条接受调用方已经判好的条目、只补机械部分（id、来源、嵌入）。
+    /// 缺了它时那条路由显式报「未接」，而不是收下一次写不进去的判断。
+    pub memory_entry_writer: Option<Arc<dyn cog_core::MemoryEntryWriter>>,
     pub metrics_backend: Option<Arc<dyn cog_core::MetricsBackend>>,
     pub metrics_exporter: Option<Arc<dyn cog_core::MetricsExporter>>,
     pub search_backend: Option<Arc<dyn cog_core::SearchBackend>>,
@@ -501,6 +505,14 @@ fn memory_ingest_routes() -> Router<Arc<GatewayState>> {
     Router::new().route(cog_core::MEMORY_INGEST_PATH, post(memory::ingest_handler))
 }
 
+/// 已判好条目的写回面（`POST /api/v1/memory/entries`）。
+///
+/// 与上面那条同样挂在两个 router 上：它必须能被集群内零凭证的智能体调到，
+/// 否则「任何员工都能写记忆」就只是一句设计。
+fn memory_judged_routes() -> Router<Arc<GatewayState>> {
+    Router::new().route("/api/v1/memory/entries", post(memory::judged_write_handler))
+}
+
 /// 项目面的读端点，单独成组是为了挂限速。
 ///
 /// 这一组每次请求都要把可见的任务图整体读进来再折一遍，成本随任务数线性上涨，
@@ -586,6 +598,7 @@ const MAX_REQUEST_BODY_BYTES: usize = 10 * 1024 * 1024;
 
 pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
     memory_ingest_routes()
+        .merge(memory_judged_routes())
         .merge(memory_raw_routes())
         // 容器的进程自报：容器把自己那一份 `/proc` 推上来，进程表就成了事件流
         // 里的一帧。挂在零凭证面上而不是登录后面，是因为跑在集群里的业务 Pod
@@ -817,6 +830,7 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             axum::routing::delete(hooks::delete_hook_handler),
         )
         .merge(memory_ingest_routes())
+        .merge(memory_judged_routes())
         .route(
             "/api/v1/memory/ingest/batch",
             post(memory::batch_ingest_handler),

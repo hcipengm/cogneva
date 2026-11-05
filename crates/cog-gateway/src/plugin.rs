@@ -80,6 +80,8 @@ impl cog_core::SystemPlugin for GatewayPlugin {
         let raw_logger = ctx.require_service::<dyn cog_core::RawLogger>()?;
         let memory_backend = ctx.consume_service::<dyn cog_core::MemoryBackend>();
         let memory_ingestor = ctx.consume_service::<dyn cog_core::MemoryIngestor>();
+        // 判完写回的入口，由记忆插件发布；缺席时那条路由报「未接」。
+        let memory_entry_writer = ctx.consume_service::<dyn cog_core::MemoryEntryWriter>();
         let metrics_backend = ctx.consume_service::<dyn cog_core::MetricsBackend>();
         let metrics_exporter: Option<Arc<dyn cog_core::MetricsExporter>> =
             ctx.consume_service::<dyn cog_core::MetricsExporter>();
@@ -248,6 +250,7 @@ impl cog_core::SystemPlugin for GatewayPlugin {
             &raw_logger,
             &memory_backend,
             &memory_ingestor,
+            &memory_entry_writer,
             &metrics_backend,
             &metrics_exporter,
             &search_backend,
