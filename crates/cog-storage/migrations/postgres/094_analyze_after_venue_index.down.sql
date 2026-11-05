@@ -1,0 +1,7 @@
+-- Migration: 094_analyze_after_venue_index (down)
+-- Nothing to undo, and that is a statement about what statistics are rather
+-- than an omission: they are not schema. The table's rows, the index and every
+-- reading the board takes are untouched by an `ANALYZE`, and the next one --
+-- the autovacuum's, within a day of writes -- writes them again. A statement
+-- that tried to "un-gather" them would have to restore a planner estimate that
+-- was wrong, and the restore would be gone before it was read.
