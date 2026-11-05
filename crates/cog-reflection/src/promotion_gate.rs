@@ -336,13 +336,28 @@ fn matches_any(path: &str, prefixes: &[String]) -> bool {
 /// `crates/<成员>/src/...`：工作区成员自己的源码。
 ///
 /// 按**分量**判而不是按前缀：`crates/x/src` 与 `crates/x/src2` 是两回事，而
-/// 前者是这一族的边界。测试与夹具不在 `src/` 下，也就自然不落进这一族——它们
-/// 没有对应的准入条件，走的是拒收那一格。
+/// 前者是这一族的边界。
 fn is_member_src(path: &str) -> bool {
+    is_member_under(path, "src")
+}
+
+/// `crates/<成员>/tests/...`：工作区成员自己的测试与夹具。
+///
+/// 与 [`is_member_src`] 同一个成员边界，只是第三段是 `tests`。这一族此前没有
+/// 准入条件，落进拒收那一格——而它恰恰是生成侧最常产出的形状（给一处代码补
+/// 用例），于是同一条台账行第二天再生成一遍、再被同一格拒掉一次。测试有没有
+/// 用，判据是沙盒里它跑过没有：跑红的变更到不了这一格。拒收不产生任何判断，
+/// 只是把「已经能执行的条件」换成「没有人会来的待办」。
+fn is_member_tests(path: &str) -> bool {
+    is_member_under(path, "tests")
+}
+
+/// `crates/<成员>/<leaf>/...`：成员的某一族（`src` / `tests`）。
+fn is_member_under(path: &str, leaf: &str) -> bool {
     let mut parts = path.split('/');
     parts.next() == Some("crates")
         && parts.next().is_some_and(|m| !m.is_empty())
-        && parts.next() == Some("src")
+        && parts.next() == Some(leaf)
 }
 
 /// `deploy/...`：部署拓扑这一族。
@@ -387,7 +402,8 @@ fn forbidden_dir_segments<'a>(
 ///    特例，必须先判；混入任何非配置文件会自然掉到后续判定）；
 /// 5. 全部文件是 `deploy/**` → AutoRollout（这一族的准入条件在应用侧执行）；
 /// 6. 任一文件命中 L2 核心路径 → RequireApproval（准入条件里缺的那一条写进理由）；
-/// 7. 全部文件是成员 crate 的 `src/` → AutoRollout（编译 + 测试已在沙盒跑过）；
+/// 7. 全部文件是成员 crate 的 `src/` 或 `tests/` → AutoRollout（编译 + 测试已在
+///    沙盒跑过；源码与它的用例是同一族的两种形状，混在一笔里也不改变这件事）；
 /// 8. 全部文件落在 L1 白名单 → AutoRollout；
 /// 9. 其余 → Reject（这条路径族没有准入条件）。
 pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfig) -> GateVerdict {
@@ -461,10 +477,14 @@ pub fn classify(files: &[String], diff_lines: usize, policy: &PromotionGateConfi
         };
     }
 
-    // 成员 crate 的源码族：准入条件是编译 + 测试，而这两件事在晋级门见到这条
-    // 变更之前就已经在沙盒里跑过了（沙盒 apply → test → build → switch 全过才
-    // 会有晋级判定）。所以这一族不需要人工，也不需要在这里重跑一遍。
-    if files.iter().all(|f| is_member_src(f)) {
+    // 成员 crate 的源码族与它的测试族：准入条件是编译 + 测试，而这两件事在晋级门
+    // 见到这条变更之前就已经在沙盒里跑过了（沙盒 apply → test → build → switch
+    // 全过才会有晋级判定）。所以这一族不需要人工，也不需要在这里重跑一遍。
+    //
+    // 测试与它守的源码是同一族的两种形状：一笔变更同时改 `src/` 与 `tests/` 时，
+    // 按 `src` 判就等于把「带用例的改动」判成另一族——而那正是整个平台最想让
+    // 它落地的形状。
+    if files.iter().all(|f| is_member_src(f) || is_member_tests(f)) {
         return GateVerdict::AutoRollout;
     }
 
@@ -654,6 +674,59 @@ mod tests {
         assert_eq!(v, GateVerdict::AutoRollout);
     }
 
+    /// 成员 crate 的测试族有自己的准入条件：用例在沙盒里跑过。它此前落在拒收
+    /// 那一格，而「给一处代码补用例」正是生成侧最常产出的形状——同一条台账行
+    /// 第二天再生成一遍、再被同一格拒一次。
+    #[test]
+    fn member_tests_are_auto_rollout() {
+        let v = classify(
+            &files(&[
+                "crates/cog-agent/tests/review_gate.rs",
+                "crates/cog-agent/tests/fixtures/sample.json",
+            ]),
+            100,
+            &policy(),
+        );
+        assert_eq!(v, GateVerdict::AutoRollout);
+    }
+
+    /// 源码与它守的用例是同一族的两种形状：一笔带用例的改动按 `src` 那一格判，
+    /// 会把它判成「不是成员源码」而拒收。
+    #[test]
+    fn member_src_with_its_own_tests_is_auto_rollout() {
+        let v = classify(
+            &files(&[
+                "crates/cog-agent/src/tools/review.rs",
+                "crates/cog-agent/tests/review_gate.rs",
+            ]),
+            100,
+            &policy(),
+        );
+        assert_eq!(v, GateVerdict::AutoRollout);
+    }
+
+    /// 放宽的是成员目录下**那两段**，不是「路径里有 tests 就行」：`tests2`
+    /// 是另一个族，`crates/tests` 根本没有成员。
+    #[test]
+    fn a_tests_lookalike_is_not_the_tests_family() {
+        for path in [
+            "crates/cog-agent/tests2/review_gate.rs",
+            "crates/tests/review_gate.rs",
+            "tools/tests/review_gate.rs",
+        ] {
+            let v = classify(&files(&[path]), 10, &policy());
+            assert!(matches!(v, GateVerdict::Reject { .. }), "{path}: {v:?}");
+        }
+    }
+
+    /// 核心路径优先于成员测试族：核心 crate 的用例改动仍要人批。这条顺序不是为了
+    /// 更严，是因为核心路径那一格缺的可执行条件（回滚实证）与 `tests/` 无关。
+    #[test]
+    fn core_member_tests_still_require_approval() {
+        let v = classify(&files(&["crates/cog-storage/tests/lock.rs"]), 10, &policy());
+        assert!(matches!(v, GateVerdict::RequireApproval { .. }), "{v:?}");
+    }
+
     #[test]
     fn whitelist_web_and_docs_is_auto_rollout() {
         let v = classify(
@@ -779,12 +852,13 @@ mod tests {
         assert_eq!(v, GateVerdict::AutoRollout);
     }
 
-    /// 但 `src/` 之外的东西不沾这一族的光：分量相等才是边界。
+    /// 但 `src/` 与 `tests/` 之外的东西不沾这一族的光：分量相等才是边界，
+    /// `src2` / `tests2` 是另外的两族，它们没有准入条件。
     #[test]
-    fn a_member_crate_test_file_is_not_in_the_src_family() {
+    fn a_member_crate_lookalike_directory_is_not_in_the_family() {
         for path in [
-            "crates/cog-memory/tests/causal.rs",
             "crates/cog-memory/src2/x.rs",
+            "crates/cog-memory/tests2/x.rs",
         ] {
             let v = classify(&files(&[path]), 10, &policy());
             assert!(matches!(v, GateVerdict::Reject { .. }), "{path}: {v:?}");
