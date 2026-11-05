@@ -856,14 +856,6 @@ impl DagExecutorRuntime {
     /// 一次读整张表而不是逐条 `task_plan`：这一拍要判的是全部就绪任务的预算，
     /// 逐条问是每条一次往返，而基线的行数比任务少一个量级。读不到（进程内后端
     /// 没有这个面、或者库这一下不可用）返回 `None`：不设界，但也不假装设了界。
-    ///
-    /// 只收**谁批过的**预算：`baseline_rev` 以 [`ESTIMATE_REV_PREFIX_ANY`] 开头的
-    /// 行是估算器按历史写下的中位数——它回答「这类活一般花多少」，不是「这条活可以
-    /// 花到哪」。中位数是分布的中间，拿它当硬停等于让一半的活必然停在半路；而停下
-    /// 来的那条没有任何出口：行留在 `Pending`，重规划已下线，于是每一拍重判一次。
-    /// 实测 2026-11-05：545 条 `Pending` 带基线，其中 95 条因此永久停在队列里，
-    /// `budget_spent` 每秒拦 9 条、拦了好几天。估算行照样留在表里给甘特读，
-    /// 这里只是不让它当闸门。
     /// 给还没有计划基线的就绪任务排一次期，并把按旧尺子写过期的基线重算一遍。
     ///
     /// 排期用的数是**量出来的**：同一种类已经跑完的任务里，token 清点的中位数
@@ -1033,7 +1025,6 @@ impl DagExecutorRuntime {
             Ok(rows) => Some(
                 rows.into_iter()
                     .filter(|plan| plan.budget_tokens > 0)
-                    .filter(|plan| !plan.baseline_rev.starts_with(ESTIMATE_REV_PREFIX_ANY))
                     .map(|plan| (plan.task_id, plan.budget_tokens))
                     .collect(),
             ),
@@ -3939,57 +3930,6 @@ mod consumer_ack_tests {
         assert_eq!(
             held[0].2.get(crate::LABEL_STREAM).map(String::as_str),
             Some("shared")
-        );
-    }
-
-    /// 估算器写下的那份预算拦不得：它是「这类活一般花多少」的中位数，不是谁批过
-    /// 的数。中位数是分布的中间，拿它当硬停等于让一半的活必然停在半路，而停下来的
-    /// 那条没有出口——重规划下线以后，行留在 `Pending` 里每一拍重判一次。
-    ///
-    /// 区分在这条上：若估算行也当闸门，`estimated-spent` 会留在 `Pending`，这条就红。
-    #[tokio::test]
-    async fn a_budget_estimated_from_history_does_not_stop_the_task() {
-        let mut estimated = plan("estimated-spent", 100);
-        estimated.baseline_rev = format!("{ESTIMATE_REV_PREFIX}cargo-test/n9/2026-11-05T00:00:00Z");
-        let runtime = budget_runtime(
-            Census::with(&[("estimated-spent", 150), ("intended-spent", 150)]),
-            vec![estimated, plan("intended-spent", 100)],
-        );
-
-        runtime
-            .orchestrator()
-            .submit_goal(
-                "goal-budget",
-                vec![
-                    ran_before(ready_task("estimated-spent", serde_json::json!({}))),
-                    ran_before(ready_task("intended-spent", serde_json::json!({}))),
-                ],
-            )
-            .await
-            .unwrap();
-        runtime.publish_ready_tasks().await.unwrap();
-
-        let orchestrator = runtime.orchestrator().clone();
-        let status = |id: &str| {
-            let orchestrator = orchestrator.clone();
-            let id = id.to_string();
-            async move {
-                orchestrator
-                    .get_task(&id)
-                    .await
-                    .unwrap_or_else(|| panic!("{id} present"))
-                    .status
-            }
-        };
-        assert_eq!(
-            status("estimated-spent").await,
-            cog_core::TaskStatus::Scheduled,
-            "估算出来的中位数不是批准的额度，它不该当闸门：停在它上面的是队列的一半"
-        );
-        assert_eq!(
-            status("intended-spent").await,
-            cog_core::TaskStatus::Pending,
-            "排期时写下的预算照拦——那才是有人批过的数"
         );
     }
 

@@ -696,7 +696,8 @@ impl cog_core::AgentManager for GlobalAgentManager {
         // 在 `Drop` 里中止。名字下仍然只有一个。
         if let Some(existing) = workers.iter().find(|w| w.agent_id == agent_id) {
             if !existing.agent.is_retired() {
-                return Ok(existing.agent.clone());
+                let agent: std::sync::Arc<dyn cog_core::Agent> = existing.agent.clone();
+                return Ok(agent);
             }
             // 名下那一个已经退役了。它不是「同一个名字还活着」，而是上一次
             // 生命留下的空壳：把它交出去，调用方拿到的消费者收得下消息、
