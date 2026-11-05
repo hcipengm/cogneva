@@ -3515,7 +3515,15 @@ impl ChangePipeline {
                 .kill_on_drop(true);
             let output = match tokio::time::timeout(remaining, cmd.output()).await {
                 Ok(Ok(output)) => output,
-                Ok(Err(e)) => return Err(SFError::IO(format!("could not run {line}: {e}"))),
+                // 启动不起来与门自己说「跑不了」是同一件事：这一条没被问过。差别只在
+                // 谁说的——门用退出码 2 说，操作系统用 errno 说。让一条启动不起来的
+                // 命令把整段门禁带走，这条变更就连别的门的结果都拿不到，而读数上看起来
+                // 是「这一段没跑完」，不是「这一条有问题」。
+                Ok(Err(e)) => {
+                    run.not_asked
+                        .push((line, format!("could not be launched: {e}")));
+                    continue;
+                }
                 Err(_) => {
                     run.interrupted = true;
                     break;
@@ -6637,6 +6645,49 @@ index 1111111..2222222 100644
         );
         assert!(run.not_asked[0].0.ends_with("check-silent.sh"));
         assert!(run.not_asked[0].1.contains("缺少依赖"));
+    }
+
+    /// 启动不起来的一条命令也算「没被问过」，而不是把整段门禁带走。
+    ///
+    /// 工作流里 `./deploy/scripts/check-x.sh` 这种写法靠可执行位，而可执行位是检出
+    /// 之间会丢的东西。丢掉它的那条门要是让整段门报 IO 错，这条变更就连其余六十条
+    /// 门的结果都拿不到——读数上写的是这一条没跑成，红绿两栏都是空的，看起来像这段
+    /// 活没跑完，而不是像这一条有问题。
+    #[tokio::test]
+    async fn a_gate_the_host_cannot_launch_is_not_asked_rather_than_a_dead_stage() {
+        let temp = tempfile::tempdir().unwrap();
+        let workflows = temp.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let scripts = temp.path().join("deploy/scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            workflows.join("ci.yml"),
+            concat!(
+                "        run: bash deploy/scripts/check-ok.sh\n",
+                "        run: ./deploy/scripts/check-no-exec.sh\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(scripts.join("check-ok.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        // 不给可执行位：这正是那条门在这台宿主上的样子。
+        std::fs::write(scripts.join("check-no-exec.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+
+        let run = ChangePipeline::run_repo_gates(temp.path(), None)
+            .await
+            .expect("一条启动不了的门不该让整段门禁报错");
+        assert_eq!(run.passed, 1, "另一条门照样跑、照样过：{:?}", run.asked);
+        assert!(
+            run.failed.is_empty(),
+            "启动失败不是这一棵树不成立：{:?}",
+            run.failed
+        );
+        assert_eq!(run.not_asked.len(), 1, "{:?}", run.not_asked);
+        assert!(run.not_asked[0].0.ends_with("check-no-exec.sh"));
+        assert!(
+            run.not_asked[0].1.contains("could not be launched"),
+            "读数要说清是启动不了，而不是门判了红：{:?}",
+            run.not_asked[0].1
+        );
     }
 
     /// 碰到 crate 目录之外的路径，或者一个都不认识，就退回整棵 workspace。
