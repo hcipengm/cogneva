@@ -249,7 +249,7 @@ impl cog_core::MemoryIngestor for IngestionPipeline<RuleBasedExtractor> {
 // The judgment half, handed to an employee
 // ---------------------------------------------------------------------------
 
-use cog_core::{SFError, Task, TaskStatus};
+use cog_core::{SFError, Task};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct ExtractedEntity {
@@ -397,9 +397,6 @@ const EXTRACT_TASK_TIMEOUT_SECS: u64 = 180;
 // cap: derived — ten seconds under the row's own ceiling (180): the waiter has to give up first, otherwise "we stopped waiting" and "it timed out" arrive together and the two readings cannot be told apart.
 const EXTRACT_WAIT_TIMEOUT_SECS: u64 = 170;
 
-// cap: bound — polling granularity: short enough that an answer is picked up the moment it lands, long enough that an idle pass is not load of its own; nothing was measured to choose it.
-const EXTRACT_POLL_INTERVAL_MS: u64 = 500;
-
 /// One work item in, one answer out.
 ///
 /// The extractor has no idea which employee took the item, which is the point:
@@ -437,47 +434,14 @@ impl std::fmt::Debug for OrchestratorWorkItems {
 #[async_trait]
 impl WorkItemRunner for OrchestratorWorkItems {
     async fn answer(&self, task: Task) -> SFResult<serde_json::Value> {
-        let id = task.id.clone();
-        let goal = format!("Judge what is worth remembering in {id}");
-        let submitted = self
-            .orchestrator
-            .submit_goal_auto(&goal, vec![task])
-            .await?;
-        // An id already in the graph is not in this set: the row is there, it
-        // just did not need inserting. Either way the poll below is what tells
-        // us whether it has an answer.
-        let id = submitted.into_iter().next().unwrap_or(id);
-
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(EXTRACT_WAIT_TIMEOUT_SECS);
-        loop {
-            if let Some(t) = self.orchestrator.get_task(&id).await {
-                match t.status {
-                    TaskStatus::Completed => {
-                        return t.result.ok_or_else(|| {
-                            SFError::Agent(format!(
-                                "work item {id} completed without an answer, so this transcript \
-                                 was not judged"
-                            ))
-                        });
-                    }
-                    TaskStatus::Failed | TaskStatus::Cancelled => {
-                        return Err(SFError::Agent(format!(
-                            "work item {id} ended {:?}: {}",
-                            t.status,
-                            t.error.unwrap_or_else(|| "no reason recorded".into())
-                        )));
-                    }
-                    _ => {}
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(SFError::Agent(format!(
-                    "work item {id} was still unanswered after {EXTRACT_WAIT_TIMEOUT_SECS}s"
-                )));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(EXTRACT_POLL_INTERVAL_MS)).await;
-        }
+        let goal = format!("Judge what is worth remembering in {}", task.id);
+        cog_core::contract::work_item::run_work_item(
+            self.orchestrator.as_ref(),
+            &goal,
+            task,
+            std::time::Duration::from_secs(EXTRACT_WAIT_TIMEOUT_SECS),
+        )
+        .await
     }
 }
 
@@ -985,26 +949,11 @@ pub(crate) async fn summary_entry(
 /// that one is reported, so a pass that produced nothing does not look like a
 /// pass that found nothing worth keeping.
 fn answer_body(answer: &serde_json::Value) -> SFResult<serde_json::Value> {
-    if let Some(text) = answer.get("result").and_then(|r| r.as_str()) {
-        let trimmed = text.trim();
-        if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
-            if start < end {
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end])
-                {
-                    return Ok(parsed);
-                }
-            }
-        }
-        return Err(SFError::Validation(
+    cog_core::contract::work_item::answer_object(answer).ok_or_else(|| {
+        SFError::Validation(
             "the answer carried no JSON object, so this transcript was not judged".into(),
-        ));
-    }
-    if answer.is_object() {
-        return Ok(answer.clone());
-    }
-    Err(SFError::Validation(
-        "the answer carried no JSON object, so this transcript was not judged".into(),
-    ))
+        )
+    })
 }
 
 #[async_trait]

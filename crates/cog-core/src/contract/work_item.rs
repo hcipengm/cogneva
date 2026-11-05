@@ -28,3 +28,245 @@
 ///
 /// 与那些绑在某个角色上的任务不同：这件活不挑人，材料与判据挑人。
 pub const PLATFORM_AGENT_TASK: &str = "platform_agent_task";
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+
+/// 交接读回任务行的间隔。
+// cap: bound — 答案被读到的延迟就是这一格；再密一点，安静的那一方也成了负载
+pub const WORK_ITEM_POLL: Duration = Duration::from_millis(500);
+
+/// 交接只向任务图问两个问题。
+///
+/// 单独成一个窄口，是因为来交活的一方只该知道「投进去」「读回来」两件事：
+/// 把整个编排器控制面交给它，等于让每个场景都能碰图上的别的东西。窄口也让
+/// 交接本身能在没有编排器的测试里跑。
+#[async_trait]
+pub trait WorkItemGraph: Send + Sync {
+    /// 把活投进图里，返回真正落下的行 id（已存在时可能只有返回、没有插入）。
+    async fn submit(&self, goal: &str, tasks: Vec<crate::Task>) -> crate::SFResult<Vec<String>>;
+    /// 按 id 读回一行；图里没有这一行时是 `None`，不是错误。
+    async fn row(&self, id: &str) -> Option<crate::Task>;
+}
+
+/// 编排器就是这样一个任务图：窄口的两问都已经是它公开的两问。
+#[async_trait]
+impl<T: crate::OrchestratorControl + ?Sized> WorkItemGraph for T {
+    async fn submit(&self, goal: &str, tasks: Vec<crate::Task>) -> crate::SFResult<Vec<String>> {
+        self.submit_goal_auto(goal, tasks).await
+    }
+
+    async fn row(&self, id: &str) -> Option<crate::Task> {
+        self.get_task(id).await
+    }
+}
+
+/// 投一件活进去，等它到终态，把答案交回来。
+///
+/// `wait` 要比任务行自己的 `timeout_seconds` 短：先放弃的是这边，这样「我们
+/// 不等了」与「这件活超时了」是两句不同的话。两处取同一个数的话，两种结局
+/// 会同时到达，读数上分不开。
+///
+/// 等待期间只读这一行，不重投：投递是幂等的，重投只会让「已存在的行」与
+/// 「刚插入的行」这两种情况在本函数的返回值里长得一样。
+pub async fn run_work_item<G: WorkItemGraph + ?Sized>(
+    graph: &G,
+    goal: &str,
+    task: crate::Task,
+    wait: Duration,
+) -> crate::SFResult<serde_json::Value> {
+    let id = task.id.clone();
+    let submitted = graph.submit(goal, vec![task]).await?;
+    let id = submitted.into_iter().next().unwrap_or(id);
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        if let Some(row) = graph.row(&id).await {
+            match row.status {
+                crate::TaskStatus::Completed => {
+                    return row.result.ok_or_else(|| {
+                        crate::SFError::Agent(format!(
+                            "the work item {id} completed and stored no answer"
+                        ))
+                    })
+                }
+                crate::TaskStatus::Failed | crate::TaskStatus::Cancelled => {
+                    return Err(crate::SFError::Agent(format!(
+                        "the work item {id} ended {}: {}",
+                        row.status.as_str(),
+                        row.error.as_deref().unwrap_or("it recorded no reason")
+                    )))
+                }
+                _ => {}
+            }
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(crate::SFError::Agent(format!(
+                "the work item {id} did not reach a terminal state within {}s",
+                wait.as_secs()
+            )));
+        }
+        tokio::time::sleep(WORK_ITEM_POLL.min(deadline - now)).await;
+    }
+}
+
+/// 员工答复里的那个 JSON 对象。
+///
+/// 答复的信封是 `{"result": "<text>"}`，正文里还可能再包一层围栏或一句解释；
+/// 两种都要读穿。取不到对象时返回 `None` —— 交活的一方各自知道这一次没读到
+/// 意味着什么，所以「没读到」的措辞留给它，不在这里写成一句通用的话。
+pub fn answer_object(answer: &serde_json::Value) -> Option<serde_json::Value> {
+    let text = match answer {
+        serde_json::Value::Object(map) => match map.get("result") {
+            Some(serde_json::Value::String(text)) => text,
+            Some(other) => return Some(other.clone()),
+            None => return Some(answer.clone()),
+        },
+        _ => return None,
+    };
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Some(value);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    if start >= end {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&trimmed[start..=end]).ok()
+}
+
+/// 员工答复的正文：信封里那个字符串，别的原样转成文本。
+///
+/// 判分、写页这些地方要的是答案本身；把信封原样交出去，被判的是一段 JSON
+/// 包装，而分数或页面掉下来时读的人只会以为答错了。
+pub fn answer_text(answer: &serde_json::Value) -> String {
+    match answer {
+        serde_json::Value::Object(map) => match map.get("result") {
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(other) => other.to_string(),
+            None => answer.to_string(),
+        },
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// 一个只会把行从 `Running` 翻到 `Completed` 的任务图。
+    struct ScriptedGraph {
+        row: Mutex<crate::Task>,
+        polls: Mutex<usize>,
+        complete_on_poll: usize,
+        answer: serde_json::Value,
+    }
+
+    impl ScriptedGraph {
+        fn new(complete_on_poll: usize, answer: serde_json::Value) -> Self {
+            let mut row = crate::Task::new(
+                "item-1",
+                crate::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
+                serde_json::json!({}),
+            );
+            row.status = crate::TaskStatus::Running;
+            Self {
+                row: Mutex::new(row),
+                polls: Mutex::new(0),
+                complete_on_poll,
+                answer,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkItemGraph for ScriptedGraph {
+        async fn submit(
+            &self,
+            _goal: &str,
+            _tasks: Vec<crate::Task>,
+        ) -> crate::SFResult<Vec<String>> {
+            Ok(vec!["item-1".into()])
+        }
+
+        async fn row(&self, id: &str) -> Option<crate::Task> {
+            let mut polls = self.polls.lock().unwrap();
+            *polls += 1;
+            let poll = *polls;
+            let mut row = self.row.lock().unwrap().clone();
+            if poll >= self.complete_on_poll {
+                row.status = crate::TaskStatus::Completed;
+                row.result = Some(self.answer.clone());
+            }
+            (row.id == id).then_some(row)
+        }
+    }
+
+    /// 一件活投进去，等它完成，答案原样交回来。
+    #[tokio::test]
+    async fn an_answer_comes_back_once_the_row_completes() {
+        let graph = ScriptedGraph::new(2, serde_json::json!({"result": "ok"}));
+        let task = crate::Task::new(
+            "item-1",
+            crate::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
+            serde_json::json!({}),
+        );
+        let answer = run_work_item(&graph, "judge it", task, Duration::from_secs(5))
+            .await
+            .expect("the row completes");
+        assert_eq!(answer["result"], "ok");
+    }
+
+    /// 一等再等不到终态时，「我们不等了」是一句和「活超时了」不同的话。
+    #[tokio::test]
+    async fn a_row_that_never_settles_ends_the_wait_with_its_own_reason() {
+        let graph = ScriptedGraph::new(usize::MAX, serde_json::json!({}));
+        let task = crate::Task::new(
+            "item-1",
+            crate::TaskType::Custom(PLATFORM_AGENT_TASK.into()),
+            serde_json::json!({}),
+        );
+        let err = run_work_item(&graph, "judge it", task, Duration::from_millis(50))
+            .await
+            .expect_err("nothing settles");
+        assert!(err.to_string().contains("did not reach a terminal state"));
+    }
+
+    /// 员工交回 `{"result": "<text>"}`，正文里可能带围栏或一句话。
+    #[test]
+    fn the_answer_envelope_is_read_through() {
+        let fenced = serde_json::json!({"result": "here you go:\n```json\n{\"a\": 1}\n```"});
+        assert_eq!(answer_object(&fenced), Some(serde_json::json!({"a": 1})));
+
+        let plain = serde_json::json!({"result": "{\"a\": 2}"});
+        assert_eq!(answer_object(&plain), Some(serde_json::json!({"a": 2})));
+
+        let direct = serde_json::json!({"a": 3});
+        assert_eq!(answer_object(&direct), Some(serde_json::json!({"a": 3})));
+    }
+
+    /// 要正文的地方拿到的是答案本身，不是包着它的那层信封。
+    #[test]
+    fn the_answer_text_is_the_text_inside_the_envelope() {
+        assert_eq!(answer_text(&serde_json::json!({"result": "4"})), "4");
+        assert_eq!(answer_text(&serde_json::json!("4")), "4");
+        assert_eq!(
+            answer_text(&serde_json::json!({"result": {"n": 4}})),
+            "{\"n\":4}"
+        );
+    }
+
+    /// 读不出对象就是没读到，不是一个空对象。
+    #[test]
+    fn an_answer_without_an_object_reads_as_nothing() {
+        assert_eq!(
+            answer_object(&serde_json::json!({"result": "I cannot tell."})),
+            None
+        );
+        assert_eq!(answer_object(&serde_json::json!("just text")), None);
+    }
+}

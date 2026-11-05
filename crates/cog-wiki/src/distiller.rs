@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use cog_core::{DistilledPage, SFError, SFResult, Task, TaskStatus, WikiBackend, WikiDistiller};
+use cog_core::{DistilledPage, SFError, SFResult, Task, WikiBackend, WikiDistiller};
 
 /// 一次蒸馏最多把多少字的来源发出去。
 ///
@@ -29,7 +29,6 @@ pub const DISTILL_SOURCE_CHARS: usize = 8_000;
 const DISTILL_TASK_TIMEOUT_SECS: u64 = 180;
 // cap: bound — 这里等答案的上界，比任务预算短，让平台先说出自己的终态与原因
 const DISTILL_WAIT_TIMEOUT_SECS: u64 = 170;
-const DISTILL_POLL_MS: u64 = 500;
 
 /// 把一件活交给名册、把答复拿回来的那一格。
 ///
@@ -67,39 +66,18 @@ impl WorkItemHandoff for OrchestratorHandoff {
                     .into(),
             ));
         };
-        let id = task.id.clone();
-        let submitted = orchestrator.submit_goal_auto(&id, vec![task]).await?;
-        let id = submitted.into_iter().next().unwrap_or(id);
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(DISTILL_WAIT_TIMEOUT_SECS);
-        loop {
-            if let Some(row) = orchestrator.get_task(&id).await {
-                match row.status {
-                    TaskStatus::Completed => {
-                        return row.result.ok_or_else(|| {
-                            SFError::Agent(format!(
-                                "the work item {id} completed and stored no answer"
-                            ))
-                        })
-                    }
-                    TaskStatus::Failed | TaskStatus::Cancelled => {
-                        return Err(SFError::Agent(format!(
-                            "the work item {id} ended {}: {}",
-                            row.status.as_str(),
-                            row.error.as_deref().unwrap_or("it recorded no reason")
-                        )))
-                    }
-                    _ => {}
-                }
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(SFError::Agent(format!(
-                    "the work item {id} did not reach a terminal state within \
-                     {DISTILL_WAIT_TIMEOUT_SECS}s"
-                )));
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(DISTILL_POLL_MS)).await;
-        }
+        let source = task.input["task"]["source_path"]
+            .as_str()
+            .unwrap_or("(unnamed source)")
+            .to_string();
+        let goal = format!("Read the wiki source {source} and write one page from it");
+        cog_core::contract::work_item::run_work_item(
+            orchestrator.as_ref(),
+            &goal,
+            task,
+            std::time::Duration::from_secs(DISTILL_WAIT_TIMEOUT_SECS),
+        )
+        .await
     }
 }
 
@@ -228,32 +206,11 @@ impl WikiDistiller for WorkItemDistiller {
 
 /// 员工的答复是 `{"result": "<text>"}` 这个信封；正文里再包一层 JSON。
 fn answer_body(answer: &serde_json::Value) -> SFResult<serde_json::Value> {
-    let text = match answer {
-        serde_json::Value::Object(map) => match map.get("result") {
-            Some(serde_json::Value::String(text)) => text.clone(),
-            Some(other) => other.to_string(),
-            None => return Ok(answer.clone()),
-        },
-        other => other.to_string(),
-    };
-    match serde_json::from_str::<serde_json::Value>(text.trim()) {
-        Ok(value) => Ok(value),
-        Err(_) => {
-            // 有些答复把对象包在围栏或一句话里；只取首个 `{` 到末个 `}`。
-            let start = text.find('{');
-            let end = text.rfind('}');
-            match (start, end) {
-                (Some(s), Some(e)) if s < e => serde_json::from_str(&text[s..=e]).map_err(|e| {
-                    SFError::Validation(format!(
-                        "the answer to the distillation item was not a JSON object: {e}"
-                    ))
-                }),
-                _ => Err(SFError::Validation(
-                    "the answer carried no JSON object, so this source was not distilled".into(),
-                )),
-            }
-        }
-    }
+    cog_core::contract::work_item::answer_object(answer).ok_or_else(|| {
+        SFError::Validation(
+            "the answer carried no JSON object, so this source was not distilled".into(),
+        )
+    })
 }
 
 /// 页面落点：来源路径的稳定函数。

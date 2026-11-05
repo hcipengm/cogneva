@@ -238,15 +238,9 @@ fn project(
     })?;
     // 接活的人交回的是 `{"result": …}` 这个信封（工具调用与步骤已经在轨迹里了）。
     // 拆开它，判分器才读得到答案本身：把信封原样交回去，被评的是一段 JSON 包装，
-    // 而分数掉下来时读表的人只会以为这一格答错了。
-    let final_answer = match result {
-        serde_json::Value::Object(map) => match map.get("result") {
-            Some(serde_json::Value::String(s)) => s.clone(),
-            _ => result.to_string(),
-        },
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
+    // 而分数掉下来时读表的人只会以为这一格答错了。信封的形状由交活的那一层定义，
+    // 三处场景读同一个函数，免得谁先改了措辞就有一处悄悄读不到。
+    let final_answer = cog_core::contract::work_item::answer_text(result);
 
     let steps = project_steps(&trace.events);
     if steps.is_empty() {
