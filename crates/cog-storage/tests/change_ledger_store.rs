@@ -847,6 +847,25 @@ async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
     // slice: five cells, every band present, summing to the outstanding census.
     // A band dropped by the group-by -- or a rank the store did not fold back
     // into a band -- shows up here as a sum that does not close.
+    //
+    // Both counts are of the whole table and they are two round trips, so a
+    // writer landing between them makes the sums disagree by a row even when
+    // the partition is sound. Every test in this binary writes here, and the
+    // ones that finish delete their rows -- the folder lock does not stop them,
+    // it only stops folds. Measured in CI 2026-11-05: bands 5, census 4, the
+    // gap being a row another test cleaned up between the two reads. The claim
+    // is about one instant, so take the instant: SHARE mode blocks INSERT,
+    // UPDATE and DELETE for as long as this transaction is open and still lets
+    // the two SELECTs through. A partition that is actually broken never closes
+    // under it, so the assertion keeps its teeth.
+    let mut frozen = pool
+        .begin()
+        .await
+        .expect("open the transaction that freezes the writers");
+    sqlx::query("LOCK TABLE change_ledger IN SHARE MODE")
+        .execute(&mut *frozen)
+        .await
+        .expect("freeze the table's writers for the comparison");
     let owed = store.owed_by_band().await.expect("count the owed set");
     assert_eq!(
         owed.iter().map(|(band, _)| *band).collect::<Vec<_>>(),
@@ -866,6 +885,10 @@ async fn the_outstanding_read_hands_out_the_most_urgent_band_first() {
         census,
         "the bands partition the outstanding set"
     );
+    frozen
+        .rollback()
+        .await
+        .expect("release the writers after the comparison");
 
     for id in [&unstated, &quiet, &urgent] {
         withdraw_declaration(&pool, id, &doc(id)).await;
