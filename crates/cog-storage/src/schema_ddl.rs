@@ -503,8 +503,28 @@ pub fn guard_reads(schema: &str) -> bool {
 enum Check {
     TableExists(String),
     IndexExists(String),
-    ColumnExists { table: String, column: String },
-    ColumnIsNotNull { table: String, column: String },
+    ColumnExists {
+        table: String,
+        column: String,
+    },
+    ColumnIsNotNull {
+        table: String,
+        column: String,
+    },
+    /// `ALTER TABLE … ALTER COLUMN … DROP NOT NULL`. A column that is already
+    /// nullable is a catalog fact, so the statement can be dropped before it
+    /// asks for ACCESS EXCLUSIVE -- and on the usage ledger, with a write
+    /// arriving every second, that wait is the whole start.
+    ColumnIsNullable {
+        table: String,
+        column: String,
+    },
+    /// `ALTER TABLE … ALTER COLUMN … DROP DEFAULT`, for the same reason: once
+    /// the default is gone, the statement has nothing left to do.
+    ColumnHasNoDefault {
+        table: String,
+        column: String,
+    },
 }
 
 /// The checks a schema text reduces to, or `None` when it holds anything this
@@ -529,8 +549,12 @@ fn catalog_checks(schema: &str) -> Option<Vec<Check>> {
 /// Only the leading tokens are read, and only as far as the object's name: the
 /// body of a `CREATE TABLE` holds types, defaults and constraints, and nothing
 /// there changes whether running it would be a no-op. A shape that is not one
-/// of the four below -- including the same words with `IF NOT EXISTS` missing,
-/// which is a statement that *fails* when the object is there -- is `None`.
+/// of the shapes below -- including the same words with `IF NOT EXISTS`
+/// missing, which is a statement that *fails* when the object is there -- is
+/// `None`, and a statement this cannot read is sent on every start with its
+/// lock. So a shape a store actually uses belongs here: the two `ALTER COLUMN`
+/// relaxations had been at the top of that list, and each of them took ACCESS
+/// EXCLUSIVE on a live table on every start purely because it could not be read.
 fn classify(statement: &str) -> Option<Check> {
     let words: Vec<String> = statement
         .split_whitespace()
@@ -580,16 +604,17 @@ fn classify(statement: &str) -> Option<Check> {
                     column: name(8)?,
                 });
             }
-            if word(3) == Some("alter")
-                && word(4) == Some("column")
-                && word(6) == Some("set")
-                && word(7) == Some("not")
-                && word(8) == Some("null")
-            {
-                return Some(Check::ColumnIsNotNull {
-                    table,
-                    column: name(5)?,
-                });
+            if word(3) == Some("alter") && word(4) == Some("column") {
+                let column = name(5)?;
+                if word(6) == Some("set") && word(7) == Some("not") && word(8) == Some("null") {
+                    return Some(Check::ColumnIsNotNull { table, column });
+                }
+                if word(6) == Some("drop") && word(7) == Some("not") && word(8) == Some("null") {
+                    return Some(Check::ColumnIsNullable { table, column });
+                }
+                if word(6) == Some("drop") && word(7) == Some("default") {
+                    return Some(Check::ColumnHasNoDefault { table, column });
+                }
             }
             None
         }
@@ -740,6 +765,8 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
 
     let mut wanted: Vec<(String, String)> = Vec::new();
     let mut must_be_not_null: Vec<(String, String)> = Vec::new();
+    let mut must_be_nullable: Vec<(String, String)> = Vec::new();
+    let mut must_have_no_default: Vec<(String, String)> = Vec::new();
     for check in checks {
         match check {
             Check::ColumnExists { table, column } => wanted.push((table.clone(), column.clone())),
@@ -747,17 +774,25 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
                 wanted.push((table.clone(), column.clone()));
                 must_be_not_null.push((table.clone(), column.clone()));
             }
+            Check::ColumnIsNullable { table, column } => {
+                wanted.push((table.clone(), column.clone()));
+                must_be_nullable.push((table.clone(), column.clone()));
+            }
+            Check::ColumnHasNoDefault { table, column } => {
+                wanted.push((table.clone(), column.clone()));
+                must_have_no_default.push((table.clone(), column.clone()));
+            }
             _ => {}
         }
     }
     if !wanted.is_empty() {
         // One round trip for every pair, and the answer carries `attnotnull`
-        // so the two questions are read off the same row rather than two reads
-        // that could disagree.
+        // and `atthasdef` so a column's three questions are read off the same
+        // row rather than reads that could disagree.
         let tables: Vec<String> = wanted.iter().map(|(table, _)| table.clone()).collect();
         let columns: Vec<String> = wanted.iter().map(|(_, column)| column.clone()).collect();
-        let rows: Vec<(String, String, bool)> = sqlx::query_as(
-            "SELECT c.relname, a.attname, a.attnotnull
+        let rows: Vec<(String, String, bool, bool)> = sqlx::query_as(
+            "SELECT c.relname, a.attname, a.attnotnull, a.atthasdef
                FROM unnest($1::text[], $2::text[]) AS want(tbl, col)
                JOIN pg_class c ON c.relname = want.tbl
                JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = current_schema()
@@ -772,11 +807,25 @@ async fn checks_hold(pool: &PgPool, checks: &[Check]) -> SFResult<bool> {
         if rows.len() != wanted.len() {
             return Ok(false);
         }
+        let field = |table: &String, column: &String| {
+            rows.iter()
+                .find(|(found_table, found_column, _, _)| {
+                    found_table == table && found_column == column
+                })
+                .map(|(_, _, not_null, has_default)| (*not_null, *has_default))
+        };
         for (table, column) in &must_be_not_null {
-            let held = rows.iter().any(|(found_table, found_column, not_null)| {
-                found_table == table && found_column == column && *not_null
-            });
-            if !held {
+            if field(table, column).is_none_or(|(not_null, _)| !not_null) {
+                return Ok(false);
+            }
+        }
+        for (table, column) in &must_be_nullable {
+            if field(table, column).is_none_or(|(not_null, _)| not_null) {
+                return Ok(false);
+            }
+        }
+        for (table, column) in &must_have_no_default {
+            if field(table, column).is_none_or(|(_, has_default)| has_default) {
                 return Ok(false);
             }
         }
@@ -926,6 +975,25 @@ mod tests {
         assert_eq!(
             read("ALTER TABLE entries ALTER COLUMN seen SET NOT NULL"),
             Some(Check::ColumnIsNotNull {
+                table: "entries".into(),
+                column: "seen".into()
+            })
+        );
+        // The two relaxations are the same question asked the other way: the
+        // statement is done when the column has the property it is removing.
+        // They are here because a store really uses both, and a statement the
+        // guard cannot read is one whose lock is taken on every start -- on
+        // the usage ledger that is a write a second, so the wait never ends.
+        assert_eq!(
+            read("ALTER TABLE entries ALTER COLUMN seen DROP NOT NULL"),
+            Some(Check::ColumnIsNullable {
+                table: "entries".into(),
+                column: "seen".into()
+            })
+        );
+        assert_eq!(
+            read("ALTER TABLE entries ALTER COLUMN seen DROP DEFAULT"),
+            Some(Check::ColumnHasNoDefault {
                 table: "entries".into(),
                 column: "seen".into()
             })

@@ -154,15 +154,21 @@ mod tests {
         for (name, text) in [
             (
                 "SCHEMA_ENTRIES_DDL",
-                cog_memory::postgres_schema::SCHEMA_ENTRIES_DDL,
+                cog_memory::postgres_schema::SCHEMA_ENTRIES_DDL.to_string(),
             ),
             (
                 "SCHEMA_ENTRIES_AFTER_REPAIR",
-                cog_memory::postgres_schema::SCHEMA_ENTRIES_AFTER_REPAIR,
+                cog_memory::postgres_schema::SCHEMA_ENTRIES_AFTER_REPAIR.to_string(),
             ),
+            // The alert table had one statement the guard could not read,
+            // `ALTER COLUMN role DROP DEFAULT`. Opaque, it was sent on every
+            // start, so it asked for ACCESS EXCLUSIVE on a live table every
+            // start -- for a statement with nothing left to do after the
+            // first. The shape is readable now; this entry is what keeps it so.
+            ("alert_store::ddl", cog_observability::alert_store::ddl()),
         ] {
             assert!(
-                cog_storage::schema_ddl::guard_reads(text),
+                cog_storage::schema_ddl::guard_reads(&text),
                 "{name} is catalog-only, so a start against a database that already \
                  has it must not take a lock for it -- and it does just that unless \
                  every statement in it is a shape the guard reads"
@@ -208,6 +214,37 @@ mod tests {
              no-op once the column has been renamed: {:.120}",
             opaque[0]
         );
+    }
+
+    /// The usage ledger's batch is the other text with statements a start
+    /// cannot be talked out of: its two key swaps, both `DO` blocks, because
+    /// no catalog read answers "is this constraint's definition the one I
+    /// want".
+    ///
+    /// Being opaque, they are re-sent on every start, which is why the count
+    /// is pinned here: the two blocks cost a catalog read each once the key is
+    /// right, but a *third* opaque statement would be a DDL shape nobody
+    /// taught the guard -- and that one takes ACCESS EXCLUSIVE on every start,
+    /// on a ledger that takes a write a second.
+    #[test]
+    fn the_usage_ledgers_startup_batch_is_opaque_only_where_it_must_be() {
+        let opaque = cog_storage::schema_ddl::statements_the_guard_cannot_read(
+            &cog_observability::usage_store::ddl(),
+        )
+        .expect("the runner splits this text with the same splitter");
+        assert_eq!(
+            opaque.len(),
+            2,
+            "a start re-sends every statement the guard cannot read: {opaque:#?}"
+        );
+        for statement in &opaque {
+            assert!(
+                statement.trim_start().starts_with("DO $"),
+                "only the conditional key swaps may stay opaque; anything else \
+                 here is a DDL shape to teach the guard: {:.120}",
+                statement
+            );
+        }
     }
 
     /// Gluing in a text that ends mid-statement makes the *next* statement
