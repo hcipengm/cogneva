@@ -212,7 +212,6 @@ const ORIGIN_LABELS: Record<string, string> = {
  */
 const ACTOR_MEANINGS: Record<string, string> = {
   eval: '评测跑批这个程序自己的调用（三个读成「评测」的名字里最外面的一个：`agent:evaluator` 是被评的那个角色，`self_review:evaluator` 是它审自己）',
-  evolution: '自进化循环',
   ralph: 'ralph 循环',
   self_review: '自检（没有指明被评对象的一侧）',
   'sandbox-document-organizer': '沙盒里的文档整理',
@@ -232,6 +231,7 @@ const RETIRED_ACTOR_MEANINGS: Record<string, string> = {
   intent_assess: '历史（2026-11-05 之前）：协作执行器里那条专门的意图判定分支；此后判定作为一件 `platform_agent_task` 交给常驻员工做',
   skill_extractor: '历史（2026-11-05 之前）：从成熟模式抽取技能配置；这条路径没有任何生产调用方，已删除',
   memory: '历史（2026-11-05 之前）：记忆抽取自己叫模型；此后抽取作为一件 `platform_agent_task` 交给名册上的员工，账记在接活的人 `agent:<id>` 上',
+  evolution: '历史（2026-11-05 之前）：自进化循环的几个判定（精炼技能、合成 hook、建议工具变体）自己叫模型；此后它们作为 `platform_agent_task` 交给名册上的员工，账记在接活的人 `agent:<id>` 上',
 };
 
 /**
