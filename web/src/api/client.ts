@@ -978,6 +978,12 @@ export async function markAllNotificationsRead(): Promise<void> {
 
 export interface AgentSummary {
   agent_id: string;
+  /**
+   * 名册给这个人写的名字，由 id 确定性地算出来（同一个人每次读都一样）。
+   * 服务端一直返回它；类型里漏了的话，界面就只能拿 id 当名字，读的人分不出
+   * 「这个名字是平台给的」还是「这串十六进制就是它」。
+   */
+  display_name: string;
   role: string;
   workspace_id: string;
   hostname: string;

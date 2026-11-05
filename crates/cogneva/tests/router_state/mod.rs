@@ -349,6 +349,31 @@ pub async fn admin_bearer_scoped_to(
     username: &str,
     workspaces: &[&str],
 ) -> String {
+    bearer_for(state, username, workspaces, UserType::Admin).await
+}
+
+/// A token for a signed-in person who is not an administrator.
+///
+/// The platform's owner and its members both land here: whoever runs the
+/// instance and whoever was invited into it can look at the workbench and talk
+/// to the agents in it, but neither can register, kill or restart one. A suite
+/// that judges what a person (rather than an operator) may do mints this.
+pub async fn member_bearer(state: &Arc<GatewayState>, username: &str) -> String {
+    bearer_for(state, username, &[], UserType::Standard).await
+}
+
+/// A token for a visitor: signed in, and below every route that acts on the
+/// platform.
+pub async fn visitor_bearer(state: &Arc<GatewayState>, username: &str) -> String {
+    bearer_for(state, username, &[], UserType::Guest).await
+}
+
+async fn bearer_for(
+    state: &Arc<GatewayState>,
+    username: &str,
+    workspaces: &[&str],
+    user_type: UserType,
+) -> String {
     let user = User {
         id: uuid::Uuid::new_v4(),
         phone: None,
@@ -357,7 +382,7 @@ pub async fn admin_bearer_scoped_to(
         display_name: None,
         avatar_url: None,
         status: UserStatus::Active,
-        user_type: UserType::Admin,
+        user_type,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };

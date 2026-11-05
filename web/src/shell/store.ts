@@ -11,6 +11,7 @@ import { create } from 'zustand';
 /** 左栏的活动项。每一项对应侧栏里的一个面板，与编辑器里的页不是一回事。 */
 export type ActivityId =
   | 'workspace'
+  | 'people'
   | 'files'
   | 'scm'
   | 'inbox'
@@ -36,6 +37,7 @@ export type ActivityId =
 /** 每一面在页签上写什么。切面时要能顺手开出这一页，名字就得在这里认得出。 */
 export const VIEW_TITLES: Record<ActivityId, string> = {
   workspace: '工作台',
+  people: '员工',
   files: '文件',
   scm: '源代码管理',
   inbox: '收件箱',

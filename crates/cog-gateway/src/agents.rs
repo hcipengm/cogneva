@@ -10,13 +10,13 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::GatewayState;
-use cog_core::{AgentRegistration, ResourceInfo};
+use cog_core::{AgentRegistration, Claims, ResourceInfo};
 use cog_core::{NewAgentMessage, SendOutcome};
 
 #[derive(Debug, Deserialize)]
@@ -192,18 +192,28 @@ pub async fn send_message_handler(
     State(state): State<Arc<GatewayState>>,
     Path(agent_id): Path<String>,
     Query(query): Query<MessageQuery>,
+    caller: Option<Extension<Claims>>,
     Json(mut msg): Json<cog_core::InboxMessage>,
 ) -> Response {
-    // Who said it, taken from the request rather than invented: this route has
-    // no authenticated caller, so the default names the channel the owner
-    // speaks through instead of guessing at a unit they may not be.
-    let from_unit = query
-        .from
-        .as_deref()
-        .map(str::trim)
-        .filter(|from| !from.is_empty())
-        .unwrap_or(WEBUI_SENDER)
-        .to_string();
+    // Who said it, taken from the request rather than invented. The
+    // authenticated principal wins over anything the caller says about itself:
+    // a caller that could name itself could put its words in someone else's
+    // mouth, and the record of who spoke is the whole point of this line. A
+    // request that arrives without that layer falls back to the name it
+    // supplies, and failing that to the channel it spoke through.
+    let from_unit = caller
+        .as_ref()
+        .map(|Extension(claims)| claims.preferred_username.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            query
+                .from
+                .as_deref()
+                .map(str::trim)
+                .filter(|from| !from.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| WEBUI_SENDER.to_string());
     // Read before delivery: opening the ask rewrites the reply stream on the
     // message, and the transcript is of what was said, not of what was
     // rewritten on the way out.

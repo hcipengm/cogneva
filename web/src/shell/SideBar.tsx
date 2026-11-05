@@ -98,6 +98,7 @@ export function SideBar() {
 
 const TITLES: Record<ActivityId, string> = {
   workspace: '工作台',
+  people: '员工',
   files: '资源管理器',
   scm: '源代码管理',
   inbox: '收件箱',
@@ -206,6 +207,27 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
   const activityRows = useStreamStore((s) => s.activity);
 
   switch (activity) {
+    case 'people':
+      return (
+        <>
+          <Section title="这一面怎么读">
+            <Row label="名单" note="现在能被叫到的员工，来自注册表" />
+            <Row label="状态" note="总线帧折出来的生命周期，不是轮询快照" />
+            <Row label="会话说" note="话进它的收件箱，回答从同一条路回来" />
+          </Section>
+          <Note>
+            这里不按活分人：场地是任务上的标签，不是长在身份上的职位。同一个员工明天做
+            别的场地，仍是这一个人。
+          </Note>
+          <CrossLinks
+            links={[
+              { id: 'agents', label: '智能体', note: '生命周期与心跳' },
+              { id: 'tasks', label: '任务', note: '谁在做哪件活' },
+            ]}
+          />
+        </>
+      );
+
     case 'workspace':
       return (
         <>

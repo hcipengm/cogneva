@@ -814,10 +814,6 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/agents/{id}/heartbeat",
             post(agents::heartbeat_handler),
         )
-        .route(
-            "/api/v1/agents/{id}/messages",
-            post(agents::send_message_handler).get(agents::conversation_handler),
-        )
         .route("/api/v1/agents/{id}/kill", post(agents::kill_handler))
         .route("/api/v1/agents/{id}/restart", post(agents::restart_handler))
         .route(
@@ -1170,6 +1166,13 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/v1/agents", get(agents::list_handler))
         .route("/api/v1/agents/{id}", get(agents::get_handler))
+        // 同事之间说话不需要管理员：平台上的人与智能体是平的，属主和成员都要能
+        // 对任何一个在岗的智能体开口。注册、杀掉、重启这些改变在岗名单的动作仍
+        // 留在管理员组；这一条只递一句话进去，并在库里留下是谁说的。
+        .route(
+            "/api/v1/agents/{id}/messages",
+            post(agents::send_message_handler).get(agents::conversation_handler),
+        )
         .route("/api/v1/hooks", get(hooks::list_hooks_handler))
         .route(
             "/api/v1/memory/search",

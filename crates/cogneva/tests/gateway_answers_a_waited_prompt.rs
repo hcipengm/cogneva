@@ -231,3 +231,35 @@ async fn a_command_with_no_answer_is_refused_a_wait() {
         "the refusal names the commands that do answer: {body}"
     );
 }
+
+/// 说话的人是平台的属主或成员，不是管理员。
+///
+/// 这条路一度只在管理员组：属主（Owner）读得到名册，却对册上任何一个人都说不上
+/// 一句话——工作台里那些对话框于是只对超级管理员开着。人与智能体是平的，说一句话
+/// 不改变在岗名单，不需要管理员；注册、杀掉、重启才需要，它们仍在管理员组。
+///
+/// 判据两头都要有：成员能进到投递那一步（这里是 `202`，话送出去了），访客仍在门外
+/// （`403`）。只断言前一半，一条谁都能过的路由也能通过。
+#[tokio::test]
+async fn a_member_may_speak_to_an_agent_and_a_visitor_may_not() {
+    let backend: Arc<dyn MessageBackend> = Arc::new(cog_stream::MemoryMessageBackend::new());
+    let state = state(backend);
+    let app = create_router(state.clone());
+    let body = r#"{"type":"prompt","goal":{"objective":"what are you working on"}}"#;
+
+    let member = router_state::member_bearer(&state, "member-probe").await;
+    let (status, detail) = post(&app, &member, ROUTE, body).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "a signed-in member may hand a prompt to a live agent: {detail}"
+    );
+
+    let visitor = router_state::visitor_bearer(&state, "visitor-probe").await;
+    let (status, detail) = post(&app, &visitor, ROUTE, body).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a visitor stays below the routes that act on the platform: {detail}"
+    );
+}

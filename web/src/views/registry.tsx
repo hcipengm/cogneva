@@ -12,6 +12,7 @@ import { GovernanceView } from '@/views/GovernanceView';
 import { InboxView } from '@/views/InboxView';
 import { ObservabilityView } from '@/views/ObservabilityView';
 import { ProgressView } from '@/views/ProgressView';
+import { PeopleView } from '@/views/PeopleView';
 import { ProjectsView } from '@/views/ProjectsView';
 import { ResourcesView } from '@/views/ResourcesView';
 import { SettingsView } from '@/views/SettingsView';
@@ -36,6 +37,8 @@ export function ViewFor({ view }: { view: string }) {
   switch (view) {
     case 'workspace':
       return <WorkspaceView />;
+    case 'people':
+      return <PeopleView />;
     case 'files':
       return <FilesView />;
     case 'scm':

@@ -11,6 +11,7 @@ import { Note } from '@/ui/Note';
  */
 const ITEMS: { id: ActivityId; label: string; icon: IconName }[] = [
   { id: 'workspace', label: '工作台', icon: 'workspace' },
+  { id: 'people', label: '员工', icon: 'agents' },
   { id: 'files', label: '文件', icon: 'folder' },
   { id: 'scm', label: '源代码管理', icon: 'scm' },
   { id: 'inbox', label: '收件箱', icon: 'inbox' },
