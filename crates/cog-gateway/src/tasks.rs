@@ -768,7 +768,7 @@ fn submitted_tasks(
                                 verified: true,
                                 version: None,
                                 note: Some(
-                                    "submitted as a verified task; injected without decomposition"
+                                    "Plan: the submission as written (verified by the submitter)"
                                         .into(),
                                 ),
                                 source: Some(parse_planner_source(claim.source.as_deref())),

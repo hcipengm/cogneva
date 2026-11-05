@@ -866,9 +866,10 @@ impl ActionPlanOrchestrator {
     /// High-level entry point: process a goal with optional pre-existing tasks,
     /// in this order:
     ///
-    /// 1. All self-evolution rows — straight into the [`cog_core::DagExecutor`].
+    /// 1. All self-evolution rows — the submission is the plan; into the
+    ///    [`cog_core::DagExecutor`] as written.
     /// 2. Every executable row states its own work (`task_kind` + `acceptance`) —
-    ///    the fixed-program branch passes them through, zero tokens.
+    ///    the same fixed-program answer, zero tokens.
     /// 3. All rows carry `action_planner_meta.verified` — straight in.
     /// 4. Otherwise decompose via collaboration (`TaskExecutor`), which covers
     ///    both an empty submission and rows that only state an intent.
@@ -912,7 +913,10 @@ impl ActionPlanOrchestrator {
             tracing::info!(
                 goal = %goal,
                 task_count = %tasks.len(),
-                "All tasks are self_evolution; skipping decomposition and injecting into DagExecutor"
+                plan = "as_written",
+                decided_by = "fixed_program",
+                "the submission is the plan: every row that does work is a self-evolution \
+                 intent, so the fixed program takes it as written"
             );
             let goal_id = tasks
                 .first()
@@ -935,7 +939,9 @@ impl ActionPlanOrchestrator {
                         verified: true,
                         version: Some("1.0.0".into()),
                         note: Some(
-                            "Self-evolution task routed directly to collaboration executor".into(),
+                            "Plan: the submission as written (self-evolution rows go straight \
+                             to the collaboration executor)"
+                                .into(),
                         ),
                         source: Some(cog_core::ActionPlannerSource::UserProvided),
                         confidence: None,
@@ -998,7 +1004,10 @@ impl ActionPlanOrchestrator {
                     task.action_planner_meta = Some(cog_core::ActionPlannerMeta {
                         verified: true,
                         version: Some("1.0.0".into()),
-                        note: Some("Program branch: the row states its own work".into()),
+                        note: Some(
+                            "Plan: the submission as written (every row states its own work)"
+                                .into(),
+                        ),
                         source: Some(cog_core::ActionPlannerSource::UserProvided),
                         confidence: None,
                         timestamp: Some(now),
@@ -1008,7 +1017,9 @@ impl ActionPlanOrchestrator {
                 tracing::info!(
                     goal = %goal,
                     task_count = %batch.len(),
-                    "the submission states its own work; passed through without decomposition"
+                    plan = "as_written",
+                    decided_by = "fixed_program",
+                    "the submission is the plan: every row states its own work"
                 );
                 let queued = dag.add_tasks_batch(batch).await?;
                 for held in requested.iter().filter(|id| !queued.contains(id)) {
@@ -1122,7 +1133,9 @@ impl ActionPlanOrchestrator {
                         goal = %goal,
                         task_id = %first.id,
                         status = ?held.status,
-                        "this goal's row is already planned and in the graph; not decomposing it again"
+                        plan = "already_in_graph",
+                        "the plan is already in the graph, stamped by an earlier submission; \
+                         this one adds nothing"
                     );
                     return Ok(Vec::new());
                 }
