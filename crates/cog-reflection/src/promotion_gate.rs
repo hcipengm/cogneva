@@ -352,12 +352,20 @@ fn is_member_tests(path: &str) -> bool {
     is_member_under(path, "tests")
 }
 
-/// `crates/<成员>/<leaf>/...`：成员的某一族（`src` / `tests`）。
+/// `crates/<成员>/<leaf>/...rs`：成员的某一族（`src` / `tests`）。
+///
+/// 最后一段必须是 Rust 源文件，与落地那一侧同一条边界：能推上去的
+/// `crates/**` 只有编译得到的那两个目录下的 `.rs`。这里放宽到「目录对就行」
+/// 会让一笔带夹具的变更过了这一格、进沙盒、编译测试跑完，才在推送时被拒——
+/// 同一件事，一个读者在这边点头、另一个在那边摇头，代价是一整轮构建。
 fn is_member_under(path: &str, leaf: &str) -> bool {
     let mut parts = path.split('/');
     parts.next() == Some("crates")
         && parts.next().is_some_and(|m| !m.is_empty())
         && parts.next() == Some(leaf)
+        && parts
+            .next_back()
+            .is_some_and(|file| file.len() > 3 && file.ends_with(".rs"))
 }
 
 /// `deploy/...`：部署拓扑这一族。
@@ -682,12 +690,26 @@ mod tests {
         let v = classify(
             &files(&[
                 "crates/cog-agent/tests/review_gate.rs",
-                "crates/cog-agent/tests/fixtures/sample.json",
+                "crates/cog-agent/tests/support/mod.rs",
             ]),
             100,
             &policy(),
         );
         assert_eq!(v, GateVerdict::AutoRollout);
+    }
+
+    /// 夹在 `tests/` 下但不是 Rust 源文件的，这一格不接：落地那一侧只许推
+    /// `{src,tests}/**/*.rs`。在这里点头，等于让它进沙盒、编译、跑测试，再在
+    /// 推送时被另一边摇头——同一件事两个答案，代价是一整轮构建。
+    #[test]
+    fn a_non_rust_file_under_tests_is_not_admitted() {
+        for path in [
+            "crates/cog-agent/tests/fixtures/sample.json",
+            "crates/cog-agent/src/data.txt",
+        ] {
+            let v = classify(&files(&[path]), 10, &policy());
+            assert!(matches!(v, GateVerdict::Reject { .. }), "{path}: {v:?}");
+        }
     }
 
     /// 源码与它守的用例是同一族的两种形状：一笔带用例的改动按 `src` 那一格判，
