@@ -222,17 +222,15 @@ fn basis_path(path: &std::path::Path) -> PathBuf {
 /// 不会读到写了一半的材料（那会让下一次续跑误判成「另一份实验」）。
 fn remember_basis(path: &std::path::Path, material: &str) -> anyhow::Result<()> {
     let target = basis_path(path);
-    let mut tmp = target.file_name().unwrap_or_default().to_os_string();
-    tmp.push(format!(".tmp-{}", std::process::id()));
-    let tmp = target.with_file_name(tmp);
-    std::fs::write(&tmp, material)
-        .map_err(|e| anyhow::anyhow!("cannot write the identity note {}: {e}", tmp.display()))?;
-    std::fs::rename(&tmp, &target).map_err(|e| {
-        anyhow::anyhow!(
-            "cannot move the identity note into {}: {e}",
-            target.display()
-        )
-    })?;
+    // 整份替换走共享的那一条：自己拼临时名再 rename，是树里已经收拢过五遍的规则，
+    // 第二份里改对的（fsync 目录、带写者身份、同目录）不会回到第一份。
+    // 这一份不能重算——记录的头里已经没有材料原文了——所以要求掉电后仍成立。
+    cog_core::atomic_write::write_bytes(
+        &target,
+        material.as_bytes(),
+        cog_core::atomic_write::Durability::SurvivesPowerLoss,
+    )
+    .map_err(|e| anyhow::anyhow!("cannot rewrite the identity note {}: {e}", target.display()))?;
     Ok(())
 }
 
