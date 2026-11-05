@@ -500,17 +500,28 @@ impl AgentObservable {
     ///
     /// With nothing observed about this role the seed stands — moving a number
     /// without evidence would be guesswork with extra steps. Once runs have
-    /// completed, the ceiling is the longest run this role needed plus one more
+    /// completed, the ceiling is the shape this role usually needs plus one more
     /// typical run's worth of room:
     ///
-    /// - the longest completed run is the floor of experience. A ceiling that
-    ///   will not admit a run of a shape this role is known to have needed is
-    ///   not a safety limit, it is a defect;
+    /// - the floor of experience is the ninetieth percentile of what the role
+    ///   has delivered, not the longest of it. A ceiling that will not admit the
+    ///   shape this role is known to need is a defect, and ninety in a hundred
+    ///   delivered runs is that shape. Taking the maximum makes a single outlier
+    ///   the ceiling for every run of every task until it ages out of the sample
+    ///   window, which is the opposite of following the workload: measured on
+    ///   2026-11-06 over 215 delivered generator runs in 24 hours, the median was
+    ///   5 iterations, the ninetieth percentile 32, the maximum 169. The 9.8% of
+    ///   runs above 32 carried 24.6% of every generator call, and the runs that
+    ///   spent a whole 3600s task budget without producing an artifact sat at
+    ///   63 — above the percentile, far below the maximum. A ceiling at the
+    ///   maximum was ~183 and bound nothing; at the percentile it is ~46 and
+    ///   binds exactly on the tail where the spend stops buying deliveries.
     /// - the headroom is what keeps the ceiling from being a claim about the
-    ///   past. A ceiling set exactly to the historical maximum cuts off the
-    ///   first run that is slightly harder than anything seen, and that cut is
-    ///   total: the run returns nothing and has already spent everything. One
-    ///   typical work unit (the mean) of slack absorbs that variance.
+    ///   past. A ceiling set exactly to the percentile cuts off the first run
+    ///   that is slightly harder than anything seen, and that cut is total: the
+    ///   run returns nothing and has already spent everything. One typical work
+    ///   unit (the mean) of slack absorbs that variance, and a run that is cut
+    ///   off still gets the forced final ask rather than nothing at all.
     ///
     /// Both terms are observed, so the ceiling follows the workload instead of
     /// needing to be retuned by hand whenever the workload changes.
@@ -536,14 +547,11 @@ impl AgentObservable {
         if calibration.delivered_iterations.is_empty() {
             return seed;
         }
-        let longest = *calibration
-            .delivered_iterations
-            .iter()
-            .max()
-            .expect("sample is not empty");
-        let sum: u32 = calibration.delivered_iterations.iter().sum();
-        let typical = sum.div_ceil(calibration.delivered_iterations.len() as u32);
-        let calibrated = longest.saturating_add(typical);
+        let mut sample: Vec<u32> = calibration.delivered_iterations.iter().copied().collect();
+        let admitted = ninetieth_percentile(&mut sample);
+        let sum: u32 = sample.iter().sum();
+        let typical = sum.div_ceil(sample.len() as u32);
+        let calibrated = admitted.saturating_add(typical);
         // `u32::MAX` is this field's spelling of "nobody stated a ceiling", not a
         // ceiling of four billion turns. Taking the max against it discards the
         // only measured number, so the calibration answers instead.
@@ -552,6 +560,20 @@ impl AgentObservable {
         }
         seed.max(calibrated)
     }
+}
+
+/// The ninetieth percentile of a sample of delivered run lengths, nearest rank.
+///
+/// Nearest rank rather than an interpolated one: the answer is the length of a
+/// run that actually happened, so it can be compared against an `iterations`
+/// reading without inventing a run nobody ran. With ten samples or fewer this is
+/// the maximum — that few runs cannot tell a tail from the shape of the work —
+/// so it only departs from the maximum once the window holds enough runs for the
+/// two to mean different things.
+fn ninetieth_percentile(sample: &mut [u32]) -> u32 {
+    sample.sort_unstable();
+    let rank = (9 * sample.len()).div_ceil(10).max(1);
+    sample[rank - 1]
 }
 
 #[async_trait]
@@ -1166,6 +1188,27 @@ mod tests {
         assert!(
             budget > 10,
             "two delivered runs of 6 and 8 say the seed was binding, not that 10 is right: {budget}"
+        );
+    }
+
+    /// 一次离群的交付不该成为所有人的天花板。它落在样本里，但按分位取的是这一族
+    /// 通常需要的形状：没有这一条，一次 169 轮的交付会给接下来整个窗口里的每一
+    /// 道活都开 169 轮的口子，而那正是实测里「一轮肥跑养肥所有人」的形状。
+    #[test]
+    fn one_outlier_does_not_raise_every_runs_ceiling() {
+        let o = AgentObservable::new();
+        for _ in 0..18 {
+            o.record_run("generator", RunOutcome::Delivered, 5, 20, 4);
+        }
+        o.record_run("generator", RunOutcome::Delivered, 169, 20, 4);
+        let budget = o.iteration_budget_for("generator", u32::MAX);
+        assert!(
+            budget < 60,
+            "an outlier must not become every run's ceiling: {budget}"
+        );
+        assert!(
+            budget > 5,
+            "but the ceiling still has to admit the shape this role usually needs: {budget}"
         );
     }
 
