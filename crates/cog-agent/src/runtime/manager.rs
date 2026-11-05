@@ -724,6 +724,7 @@ impl cog_core::AgentManager for GlobalAgentManager {
                 agent_id: w.agent_id,
                 role: w.role,
                 capabilities: w.capabilities,
+                owner_task: w.task_id,
             })
             .collect())
     }
@@ -783,7 +784,7 @@ mod tests {
 
         let skill: &SkillConfig = config.skill_config.as_ref().expect("skill installed");
         assert_eq!(skill.skill_id, "generator");
-        assert_eq!(skill.max_iterations, Some(17));
+        assert_eq!(skill.max_iterations, 17);
         assert_eq!(config.role, "generator");
         assert_eq!(config.agent_id, "squad-a-generator");
     }

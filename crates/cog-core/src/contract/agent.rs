@@ -37,13 +37,6 @@ pub struct RuntimeConfig {
     /// Constants are defined in `cog-agent::AgentRole` so new roles can be
     /// added without recompiling `cog-core`.
     pub role: String,
-    /// The turn ceiling for this run. `u32::MAX` is "no ceiling stated here".
-    ///
-    /// A run ends when the model stops asking for tools. What stops a run that
-    /// never stops asking is the stall timeout, the context window and the cost
-    /// ledger — not a turn count. A turn count is only ever the operator's own
-    /// decision for this deployment, and it reaches here through the config
-    /// surface or the role's skill, never as a default nobody measured.
     pub max_iterations: u32,
     pub context_window_size: usize,
     /// TTL for the available_skills cache in seconds.
@@ -91,11 +84,7 @@ impl Default for RuntimeConfig {
         Self {
             agent_id: "agent".into(),
             role: crate::roles::PLANNER.into(),
-            // No ceiling by default. Ten turns was the old default and it is
-            // shorter than one round of read-change-run-test: every repair run
-            // was cut off with a tool call still pending, and the round after
-            // it started the same work over from the top.
-            max_iterations: u32::MAX,
+            max_iterations: 10,
             // 32k fallback: 4k windows amputate tool-call history so badly that
             // CJK task prompts alone trigger trimming, leaving the model with
             // only the task text each iteration (amnesia → repeated work).
@@ -422,6 +411,15 @@ pub struct WorkerInfo {
     pub agent_id: String,
     pub role: String,
     pub capabilities: Vec<String>,
+    /// The task this worker was created for, when it has one.
+    ///
+    /// `None` is the worker that lives as long as the process — an employee of
+    /// the platform rather than a hand hired for one task. A caller that wants
+    /// to hand out work and get it back needs this distinction: a worker owned
+    /// by another task is already in the middle of that task's conversation,
+    /// and handing it a second piece of work either queues behind it or leaves
+    /// the two reading each other's steps.
+    pub owner_task: Option<String>,
 }
 
 /// Agent manager for creating, discovering, and communicating with agent instances.

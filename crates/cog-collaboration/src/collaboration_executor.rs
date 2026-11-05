@@ -20,7 +20,10 @@ const INTENT_ASSESS_ACTOR: &str = "intent_assess";
 
 /// 一件派给名册上任意员工的活。谁接都行——这件活由材料、做法与验收
 /// 判据说了算，不由接活的人的角色说了算。
-pub const PLATFORM_AGENT_TASK: &str = "platform_agent_task";
+///
+/// 种类名在 `cog_core::contract::work_item`：交活的一方（场景，如 cog-github）
+/// 与接活的一方（这里）是两个 crate，两边各拼一次就会有一边改了另一边不认。
+pub use cog_core::contract::work_item::PLATFORM_AGENT_TASK;
 
 /// 可执行性判据的稳定半段：角色、四条判定的定义、答案的形状。
 ///
@@ -396,7 +399,7 @@ impl CollaborationExecutor {
     ///
     /// Nothing about the work is decided here. The input document carries the
     /// material, what to do with it and how the answer will be judged — a
-    /// `prompt_contract` on it renders as the run's instructions — while the
+    /// `contract` on it renders as the run's instructions — while the
     /// employee brings the loop and the tools. That is what separates this
     /// branch from `platform_intent_assess`: a branch that knows how to judge
     /// one kind of material is an executor with a name, whereas a branch that
@@ -410,6 +413,10 @@ impl CollaborationExecutor {
         };
 
         let (agent_id, agent) = self.employee_for(manager.as_ref(), task).await?;
+        // 这件活与这个人手上上一件活无关。对话里留着上一件活的材料与步骤，
+        // 这一轮模型就会拿它们当上下文：钱多付一遍，判词也可能被上一件带偏。
+        // 重置只清对话，不动它装配时带上的工具、钩子与账。
+        agent.reset().await?;
         let answer = agent.prompt_for_task(&task.id, task.input.clone()).await?;
         info!(
             task_id = %task.id,
@@ -453,10 +460,19 @@ impl CollaborationExecutor {
             return Ok((id.to_string(), agent));
         }
 
-        let roster = manager.list_workers().await?;
+        // 只从**常驻**员工里挑。名册上还挂着为某件 DAG 任务现起的对象：它们正
+        // 在那件任务的对话里，接过一件无关的活要么排在它后面，要么让两边读到
+        // 彼此的步骤。`owner_task` 为空的那些才是「活着的时间比任何一件活都长」
+        // 的员工，也正是这里要找的人。
+        let roster: Vec<_> = manager
+            .list_workers()
+            .await?
+            .into_iter()
+            .filter(|worker| worker.owner_task.is_none())
+            .collect();
         if roster.is_empty() {
             return Err(SFError::Agent(
-                "no employee is on the roster to take the work item".into(),
+                "no standing employee is on the roster to take the work item".into(),
             ));
         }
         let start = self
@@ -3282,6 +3298,8 @@ mod employee_dispatch_tests {
     struct RecordingEmployee {
         answer: String,
         seen: std::sync::Mutex<Vec<serde_json::Value>>,
+        /// 每次接活前被要求清空对话的次数，按发生顺序与前缀记。
+        resets: std::sync::Mutex<usize>,
     }
 
     impl RecordingEmployee {
@@ -3289,11 +3307,16 @@ mod employee_dispatch_tests {
             Self {
                 answer: answer.to_string(),
                 seen: std::sync::Mutex::new(Vec::new()),
+                resets: std::sync::Mutex::new(0),
             }
         }
 
         fn seen(&self) -> Vec<serde_json::Value> {
             self.seen.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        }
+
+        fn resets(&self) -> usize {
+            *self.resets.lock().unwrap_or_else(|e| e.into_inner())
         }
     }
 
@@ -3336,7 +3359,9 @@ mod employee_dispatch_tests {
         }
 
         async fn reset(&self) -> cog_core::SFResult<()> {
-            unreachable!()
+            let mut resets = self.resets.lock().unwrap_or_else(|e| e.into_inner());
+            *resets += 1;
+            Ok(())
         }
 
         async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
@@ -3398,11 +3423,29 @@ mod employee_dispatch_tests {
     /// 「派给谁」与「派活本身」，不是建员工。
     struct RosterManager {
         roster: Vec<(String, std::sync::Arc<dyn cog_core::Agent>)>,
+        /// 名册上为正某件任务现起的对象：id → 它正在做的那件任务。
+        owned: Vec<(String, String)>,
     }
 
     impl RosterManager {
         fn new(roster: Vec<(String, std::sync::Arc<dyn cog_core::Agent>)>) -> Self {
-            Self { roster }
+            Self {
+                roster,
+                owned: Vec::new(),
+            }
+        }
+
+        /// 把名册上的某个人标成为一件任务现起的，而不是常驻员工。
+        fn with_task_owner(mut self, agent_id: &str, task_id: &str) -> Self {
+            self.owned.push((agent_id.to_string(), task_id.to_string()));
+            self
+        }
+
+        fn owner_of(&self, agent_id: &str) -> Option<String> {
+            self.owned
+                .iter()
+                .find(|(id, _)| id == agent_id)
+                .map(|(_, task)| task.clone())
         }
     }
 
@@ -3437,6 +3480,7 @@ mod employee_dispatch_tests {
                     agent_id: id.clone(),
                     role: "employee".into(),
                     capabilities: vec!["employee".into()],
+                    owner_task: self.owner_of(id),
                 })
                 .collect())
         }
@@ -3541,6 +3585,72 @@ mod employee_dispatch_tests {
             .await
             .expect_err("名册上一个人都没有，这件活接不了");
         assert!(err.to_string().contains("roster"), "{err}");
+    }
+
+    /// 为某件任务现起的对象不是员工，不能把无关的活交给它。
+    ///
+    /// 名册上两类东西混在一起：常驻员工，与正在做那件 DAG 任务时现起的
+    /// 作战小队。后者手里有一段与这件活无关的对话，接过去要么排在它后面，
+    /// 要么两边读到彼此的步骤。所以不指名的派活只从常驻的那几个里挑；如果
+    /// 名册上全是临时的，宁可报错也不占用别人的小队。
+    #[tokio::test]
+    async fn a_worker_that_belongs_to_a_task_is_not_an_employee() {
+        let borrowed = std::sync::Arc::new(RecordingEmployee::new("borrowed"));
+        let luna = std::sync::Arc::new(RecordingEmployee::new("luna"));
+        let manager = std::sync::Arc::new(
+            RosterManager::new(vec![
+                ("generator-for-task-9".to_string(), borrowed.clone()),
+                ("squad:luna".to_string(), luna.clone()),
+            ])
+            .with_task_owner("generator-for-task-9", "task-9"),
+        );
+        let executor = CollaborationExecutor::new().with_agent_manager(manager);
+
+        executor
+            .execute_agent_task(&work_item("work-1", serde_json::json!({})))
+            .await
+            .expect("名册上有常驻员工，这件活就该有人接");
+        assert!(borrowed.seen().is_empty(), "临时小队的对象不该接到这件活");
+        assert_eq!(luna.seen().len(), 1, "接活的只能是常驻员工");
+
+        // 只有临时对象时不算有员工：报错，而不是借一个人过来。
+        let only_borrowed = std::sync::Arc::new(
+            RosterManager::new(vec![(
+                "generator-for-task-9".to_string(),
+                std::sync::Arc::new(RecordingEmployee::new("borrowed"))
+                    as std::sync::Arc<dyn cog_core::Agent>,
+            )])
+            .with_task_owner("generator-for-task-9", "task-9"),
+        );
+        let err = CollaborationExecutor::new()
+            .with_agent_manager(only_borrowed)
+            .execute_agent_task(&work_item("work-2", serde_json::json!({})))
+            .await
+            .expect_err("名册上只有为任务现起的对象，没有员工");
+        assert!(err.to_string().contains("standing employee"), "{err}");
+    }
+
+    /// 每件活都从一段干净的对话开始。
+    ///
+    /// 员工是长的，活是短的：上一件活的材料与步骤留在对话里，这一轮模型就会
+    /// 拿它们当上下文——多付一遍钱，判词还可能被上一件带偏。
+    #[tokio::test]
+    async fn a_work_item_starts_on_a_clean_conversation() {
+        let luna = std::sync::Arc::new(RecordingEmployee::new("luna"));
+        let executor = CollaborationExecutor::new().with_agent_manager(std::sync::Arc::new(
+            RosterManager::new(vec![("squad:luna".to_string(), luna.clone())]),
+        ));
+
+        executor
+            .execute_agent_task(&work_item("work-1", serde_json::json!({"material": "a"})))
+            .await
+            .expect("这件活该有人接");
+        executor
+            .execute_agent_task(&work_item("work-2", serde_json::json!({"material": "b"})))
+            .await
+            .expect("这件活该有人接");
+
+        assert_eq!(luna.resets(), 2, "每件活开跑前都要清一次对话");
     }
 
     /// 点名的人不在名册上时不要悄悄换人。

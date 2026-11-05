@@ -68,8 +68,11 @@ pub enum AgentCommand {
     Steer {
         instruction: String,
     },
-    #[allow(dead_code)]
-    Reset,
+    Reset {
+        /// 清完回一句：调用方要的是「清干净了」这件事本身，不是「命令发出去了」。
+        /// 排在这条命令后面的那次 prompt 不能跑在一段还没清完的对话上。
+        result_tx: oneshot::Sender<SFResult<()>>,
+    },
     Snapshot {
         task_id: String,
         result_tx: oneshot::Sender<SFResult<cog_core::AgentCheckpoint>>,
@@ -1055,29 +1058,35 @@ impl Agent {
     }
 
     /// Reset the agent, clearing all context and state.
+    ///
+    /// The reset runs on the agent's own command loop instead of tearing that
+    /// loop down and building another. The command channel and the inbox
+    /// consumer are what make this object reachable: a reset that drops both
+    /// leaves an agent that still answers a prompt and receives nothing, because
+    /// the consumer is gone and only `start_consumer` brings one back — and
+    /// nothing calls it on a live agent. An employee waiting between work items
+    /// is exactly that object.
     pub async fn reset(&self) -> SFResult<()> {
-        if let Some(ref lifecycle) = self.lifecycle {
-            let agent_id = &self.config.agent_id;
-            let _ = lifecycle.stop_heartbeat(agent_id).await;
-            let _ = lifecycle.transition(agent_id, AgentState::Inactive).await;
-        }
-
-        {
-            let mut inner = self.inner.lock().await;
-            if let Some(handle) = inner.task_handle.take() {
-                handle.abort();
-            }
-            if let Some(handle) = inner.consumer_handle.take() {
-                handle.abort();
-            }
-            if let Some(handle) = inner.registry_heartbeat_handle.take() {
-                handle.abort();
-            }
-            inner.cmd_tx = None;
-            inner.state = AgentState::Inactive;
-        }
         self.start().await;
-        Ok(())
+        let (result_tx, result_rx) = oneshot::channel();
+        {
+            let inner = self.inner.lock().await;
+            let cmd_tx = inner
+                .cmd_tx
+                .as_ref()
+                .ok_or_else(|| SFError::Agent("Agent not started".into()))?;
+            cmd_tx
+                .send(AgentCommand::Reset { result_tx })
+                .await
+                .map_err(|_| SFError::Agent("Command channel closed".into()))?;
+        }
+        let result = result_rx
+            .await
+            .map_err(|_| SFError::Agent("reset channel closed".into()))?;
+        if result.is_ok() {
+            self.inner.lock().await.state = AgentState::Idle;
+        }
+        result
     }
 
     /// Get the current agent state.
@@ -1581,13 +1590,14 @@ async fn run_agent_task(
                 let _ = instruction;
                 let _ = context;
             }
-            AgentCommand::Reset => {
+            AgentCommand::Reset { result_tx } => {
                 // Clear the loop in place. Rebuilding it from its own config was
                 // the previous behaviour and silently dropped everything the
                 // caller had attached after construction — the tools first of
                 // all — so a reset loop answered with nothing to call while
                 // still running its state machine normally.
                 agent_loop.reset();
+                let _ = result_tx.send(Ok(()));
             }
             AgentCommand::Snapshot { task_id, result_tx } => {
                 let snap = agent_loop.checkpoint(&task_id);
