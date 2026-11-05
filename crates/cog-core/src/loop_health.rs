@@ -75,6 +75,18 @@
 //! over this family can fire on it. That state is a property of the configuration
 //! that decides which plugins run, and it is judged there.
 //!
+//! The role readings are a pair, and the rule that announces an abandoned role
+//! reads both halves: a declaration at `1` with no holder is what it fires on.
+//! The state it must therefore be able to tell apart from that one is a loop
+//! that stood down on purpose — its gate closed, the work paused — and the
+//! distinction has to be made on [`LOOP_ROLE_DECLARED`], not only on
+//! [`LOOP_OWNER_HELD`]: a yield that zeroed the holder alone would leave the
+//! declaration standing and turn every deliberate handover into an incident
+//! for as long as the pause lasts. Both go to zero together, and zero rather
+//! than absent, because the loop was given the role — absent says no process
+//! ever contended for it. Taking the role back restores both, so the zero is a
+//! state and not an amnesty.
+//!
 //! The readings are also the identity of a management driver, and that identity
 //! already exists: a driver is legible once it registers a loop name, and the
 //! group above says who it is — [`LOOP_REGISTERED`] is the census entry,
@@ -1488,6 +1500,21 @@ mod tests {
             metric(&metrics, LOOP_OWNER_LOSSES_TOTAL, "yield_probe"),
             Some(1.0),
             "the work stopped here, and that is a loss wherever it lands"
+        );
+
+        // A second cycle still standing down is the same handover observed
+        // again, not a second one: the loss is counted where the term was given
+        // up, so a long pause does not read as a role flapping.
+        beat.note_ownership(Ownership::Yielded);
+        let metrics = collect(&readings).await;
+        assert_eq!(
+            metric(&metrics, LOOP_ROLE_DECLARED, "yield_probe"),
+            Some(0.0)
+        );
+        assert_eq!(
+            metric(&metrics, LOOP_OWNER_LOSSES_TOTAL, "yield_probe"),
+            Some(1.0),
+            "still the same stand-down, not a second loss"
         );
 
         // Taking it back is a second acquisition, and the declaration comes
