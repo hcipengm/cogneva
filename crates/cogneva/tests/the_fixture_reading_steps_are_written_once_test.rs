@@ -193,6 +193,15 @@ const MIN_SUPPORT_CALLSITES: usize = 60;
 /// 它的本职，跨类边界不是副本。
 const ORCHESTRATOR_HOME: &str = "crates/cogneva/tests/common/orchestrator.rs";
 
+/// 产出那个控制面的 crate 自己的测试。
+///
+/// 上面那句「产出码不在这一面里」只把 `src/` 摘了出去，而 `cog-orchestrator` 的
+/// `tests/` 与产出码是同一侧：它造的是自己被测的那个对象，不是别人家的夹具。
+/// 2026-11-06 实测：`tests/a_ready_message_starts_the_row_it_names.rs` 造了一次，
+/// 判据就把「产出 crate 自己的测试」读成了它的第四份抄件——而它够不着另一侧的
+/// `cogneva/tests/common/`，这条判据在那里没有可执行的做法，只有红的份。
+const ORCHESTRATOR_CRATE: &str = "crates/cog-orchestrator/";
+
 /// 走它的调用点下限。今天 9 处。
 const MIN_ORCHESTRATOR_CALLSITES: usize = 8;
 
@@ -562,7 +571,11 @@ fn census(root: &std::path::Path, files_in: &[PathBuf]) -> Census {
         // 的变量名、缩进都可以不一样，但「在这里 new 一个控制面」这件事是一样的。
         // 这份门自己写着标本（那串判据里就有 `OrchestratorControlImpl::new`），
         // 所以它自己也摘出去——和上面那一族同一个理由。
-        if name.contains("/tests/") && name != ORCHESTRATOR_HOME && name != THE_PREDICATE {
+        if name.contains("/tests/")
+            && !name.starts_with(ORCHESTRATOR_CRATE)
+            && name != ORCHESTRATOR_HOME
+            && name != THE_PREDICATE
+        {
             for (index, line) in text.lines().enumerate() {
                 if line.trim_start().starts_with("//") {
                     continue;
