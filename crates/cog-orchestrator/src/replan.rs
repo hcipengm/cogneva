@@ -28,16 +28,7 @@ pub const REPLAN_INPUT_KEY: &str = "replan";
 /// id 的可读前缀。后面跟指数名与一段摘要。
 const ID_PREFIX: &str = "replan";
 
-/// 同一版基线上，同一条越界最多造几条重规划。
-///
-/// 三条：一条没跑起来、一条跑死在半路，都还留一次机会。三条都走完了而基线
-/// 还是那一版，缺的就不是第四次尝试，是有人去看这三条为什么都没交货——再往下
-/// 造就只是每轮往队列里添一条注定失败的活，而队列上那一堆长得一样的行会把真
-/// 正在等的那条埋掉。
-// cap: bound — 三次都没有交货，缺的不是第四次尝试，是有人去看这三条；再往下就是每轮往队列里添一条注定失败的活
-pub const MAX_ATTEMPTS: usize = 3;
-
-/// 一次重规划尝试的执行预算。
+/// 一条重规划尝试的执行预算。
 ///
 /// 这条活自己声明预算，不继承任务行造出来时的那一格：那一格是 300 秒，而集群
 /// 库实测（2026-11-04）一条重规划跑一次要 6～27 次 LLM 调用、光模型时间就
@@ -80,15 +71,19 @@ impl From<Decision> for ReplanOutcome {
     }
 }
 
-/// 一条重规划任务的 id：同一（项目、指数、基线版本、第几次尝试）永远同一个。
+/// 一条重规划任务的 id：同一（项目、指数、基线版本）永远同一个。
 ///
 /// 可读的那几个事实写在任务的输入里，不塞进 id：id 会进 URL 与日志，而基线版本
 /// 是一个带 `:` 与 `+` 的时间戳，塞进去只会让每个调用点各自转义一次。
 ///
-/// 尝试次数进摘要：一次尝试死掉之后，下一次要造的是一条**新**活——同一个 id 再
-/// 造一遍会被入图那一侧按「已经有过」顶掉，而它顶掉的那一行是死的。
-pub fn replan_id(project: &str, index: PerformanceIndex, revision: &str, attempt: u32) -> String {
-    let digest = blake3::hash(format!("{project}\u{0}{revision}\u{0}{attempt}").as_bytes());
+/// 尝试次数**不进**摘要。它曾经进过：一次尝试走完再问一遍就得是一条新 id，否则
+/// 入图那一侧会按「已经有过」顶掉它，而它顶掉的那一行是死的。代价是同一处越界
+/// 在同一版基线上留下三行长得一样的活——三份预算、三次模型调用、三份排在队列
+/// 里互相挡路的消息，而它们问的是同一个问题。身份该由「哪一处越界、哪一版基线」
+/// 决定，重试是**同一行**上的重试预算（`retry_count` / `max_retries`），不是新开
+/// 一门户口。
+pub fn replan_id(project: &str, index: PerformanceIndex, revision: &str) -> String {
+    let digest = blake3::hash(format!("{project}\u{0}{revision}").as_bytes());
     let hex = digest.to_hex();
     format!("{ID_PREFIX}-{}-{}", index.code(), &hex.as_str()[..16])
 }
@@ -210,21 +205,16 @@ pub fn replan_task(
         };
     }
 
-    // 全走完了。造下一条是因为这条越界还在，不是因为它值得再问一遍：同一条
-    // 越界在队列上堆到第四条的时候，缺的是有人去看前三条为什么没交货。
-    if attempts.len() >= MAX_ATTEMPTS {
-        let died: Vec<String> = attempts
-            .iter()
-            .map(|t| format!("{}={:?}", t.id, t.status))
-            .collect();
-        return rejected(format!(
-            "这一版基线（{revision}）上的重规划已经走过 {} 条都没交货（{}）：\
-             再造一条只是把同一个问题再问一遍，先看它们为什么都走完了而基线没动",
-            attempts.len(),
-            died.join("、")
-        ));
+    // 全走完了。这一版基线上已经有这一处越界的活，而且它已经结束：账上有人管过
+    // 这件事，结论就在那一行上。再造一条不会多出任何信息——身份相同就该是同一
+    // 条活，重试是那一行自己的预算（`retry_count` / `max_retries`），不是另开
+    // 一门户口。真的要再问一遍，得是基线动了（那时键不同，走的是新身份）。
+    if let Some(ended) = attempts.iter().max_by_key(|t| t.updated_at) {
+        return Decision::AlreadyMinted {
+            task_id: ended.id.clone(),
+            open: false,
+        };
     }
-    let attempt = attempts.len() as u32 + 1;
 
     // 挂在哪一行下面：这一组的根，而不是项目 id。
     //
@@ -240,7 +230,7 @@ pub fn replan_task(
         Err(reason) => return rejected(reason),
     };
 
-    let task_id = replan_id(&breach.project, breach.index, revision, attempt);
+    let task_id = replan_id(&breach.project, breach.index, revision);
     let mut task = Task::new(
         task_id,
         TaskType::Custom(REPLAN_TASK_KIND.to_string()),
@@ -262,7 +252,6 @@ pub fn replan_task(
                 "against": breach.against,
                 "gap_tokens": breach.gap_tokens(),
                 "baseline_rev": revision,
-                "attempt": attempt,
                 "observed_at": now.to_rfc3339(),
             },
         }),
@@ -513,14 +502,13 @@ mod tests {
         );
     }
 
-    /// 尝试走完了而基线还是那一版，说明它没交货：要造的是一条**新**活，而不是
-    /// 把「它走完了」读成「这件事有人管了」。
+    /// 走完的那一条就是这一处越界的账：同一版基线上不再造第二条。
     ///
-    /// 两种终态都算没交货，因为判据不读它的状态而读基线：交了货的重规划会把基线
-    /// 推到新的一版，那么下一次比较的根本不是这一版，这条重规划也就不会再被认
-    /// 出来。还认得出它，就说明基线没动。
+    /// 但它不等于「有人管了」——`open: false` 说的正是结论已经落地而基线没动。
+    /// 重试的余地不在新行上，在那一行自己的 `retry_count` / `max_retries` 上：
+    /// 同一处越界在同一版基线上只有一门户口，重试是这门户口里的重试。
     #[test]
-    fn an_attempt_that_ended_without_moving_the_baseline_gets_a_successor() {
+    fn an_identity_that_already_ended_is_not_minted_again() {
         let found = breach(PerformanceIndex::Schedule, 0.5, 1_000, 2_000);
         let first = minted(replan_task(&found, REV, &group(vec![]), at(0)));
 
@@ -530,58 +518,13 @@ mod tests {
         ] {
             let mut previous = first.clone();
             previous.status = ended;
-            let successor = minted(replan_task(
-                &found,
-                REV,
-                &group(vec![previous.clone()]),
-                at(120),
-            ));
-            assert_ne!(
-                successor.id, previous.id,
-                "{ended:?} 之后再造还得是一条新活"
-            );
-            assert_eq!(
-                successor.input[REPLAN_INPUT_KEY]["attempt"], 2,
-                "第几次尝试写在输入里：读面要分得开这两条是同一处越界的两次追问"
-            );
-            assert_eq!(
-                successor.input[REPLAN_INPUT_KEY]["baseline_rev"], REV,
-                "还是那一版基线：去重键没变，变的只是尝试次数"
-            );
-        }
-    }
-
-    /// 三条都走完还是那一版基线，就不再造第四条：这时候缺的是有人去看前三条，
-    /// 而不是队列上多一条注定一样的活。
-    #[test]
-    fn a_breach_that_outlived_its_attempts_is_refused_with_all_of_them_named() {
-        let found = breach(PerformanceIndex::Cost, 0.5, 1_000, 2_000);
-        let mut rows: Vec<Task> = Vec::new();
-        // 依次造出三条：每一条都按「前一条已死」走到下一个尝试号。
-        for attempt in 1..=MAX_ATTEMPTS {
-            let next = minted(replan_task(
-                &found,
-                REV,
-                &group(rows.clone()),
-                at(attempt as i64),
-            ));
-            assert_eq!(next.input[REPLAN_INPUT_KEY]["attempt"], attempt as u64);
-            let mut dead = next;
-            dead.status = cog_core::TaskStatus::Failed;
-            rows.push(dead);
-        }
-        match replan_task(&found, REV, &group(rows), at(600)) {
-            Decision::Refused { reason } => {
-                assert!(
-                    reason.contains(&MAX_ATTEMPTS.to_string()),
-                    "判词要说清走过几条：{reason}"
-                );
-                assert!(
-                    reason.contains("Failed"),
-                    "判词要点名它们各自的结局：{reason}"
-                );
+            match replan_task(&found, REV, &group(vec![previous.clone()]), at(120)) {
+                Decision::AlreadyMinted { task_id, open } => {
+                    assert_eq!(task_id, previous.id, "身份相同，就是同一条活");
+                    assert!(!open, "{ended:?} 之后结论已经落地，不能再报成还在路上");
+                }
+                other => panic!("expected AlreadyMinted, got {other:?}"),
             }
-            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 
@@ -603,8 +546,7 @@ mod tests {
             replan_id(
                 PROJECT,
                 PerformanceIndex::Schedule,
-                "2026-10-27T09:00:00+00:00",
-                1
+                "2026-10-27T09:00:00+00:00"
             )
         );
     }

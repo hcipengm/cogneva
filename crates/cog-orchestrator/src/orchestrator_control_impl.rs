@@ -402,9 +402,8 @@ impl cog_core::ReplanMinter for OrchestratorControlImpl {
 /// **重规划自己的计划行不参与**：每造一条新活，排期都会给它写一行形如
 /// `estimate/work-time-v1/<kind>/n<N>/<当前时刻>` 的计划。重规划单也是新活，
 /// 于是它一被造出来就把这个项目的「当前基线版本」推走一次，而下一轮拿去重比
-/// 的正是这个键——上一轮造的那条永远认不出来（`attempt` 恒为 1），
-/// `MAX_ATTEMPTS` 三条上限也永远够不到，每轮都再造一条。实测 2026-11-04 一个
-/// 项目三小时造了 62 条重规划，`attempt` 全是 1，图上排队的行里一半是它们。
+/// 的正是这个键——上一轮造的那条永远认不出来，于是每轮都再造一条。实测
+/// 2026-11-04 一个项目三小时造了 62 条重规划，图上排队的行里一半是它们。
 ///
 /// 跳过它也不是放弃「交了货的基线要往前走」：交付物是**别的**任务（重规划自己
 /// 的工期不是这个项目的计划），那些行照样把版本推走，下一版仍是新的一轮。
@@ -484,9 +483,8 @@ mod tests {
     ///
     /// 每造一条新活，排期都会写一行新的计划（`baseline_rev` 带着当下时刻）。
     /// 重规划单也是新活：认它的话，第二轮读到的基线已经是它自己那一行，
-    /// 上一轮造的那条按 `is_replan_for` 永远认不出来——`attempt` 每轮都从 1
-    /// 起算，三条上限永远够不到。实测 2026-11-04 一个项目三小时造了 62 条
-    /// 重规划，`attempt` 全是 1。
+    /// 上一轮造的那条按 `is_replan_for` 永远认不出来，于是每轮都再造一条。
+    /// 实测 2026-11-04 一个项目三小时造了 62 条重规划。
     #[test]
     fn the_ticket_it_just_minted_does_not_move_the_baseline_it_will_be_judged_against() {
         const PROJECT: &str = "change-ledger:crates";
@@ -581,7 +579,6 @@ mod stale_replan_tests {
                     "project": "change-ledger:crates",
                     "index": "schedule",
                     "baseline_rev": revision,
-                    "attempt": 1,
                 },
             }),
         )
