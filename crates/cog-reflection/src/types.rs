@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use cog_core::{Area, Learning, LearningCategory, LearningSource, LearningStatus, Priority};
 
@@ -349,13 +350,27 @@ pub struct DiscoveryTask {
 }
 
 impl DiscoveryTask {
-    pub fn generate_id() -> String {
-        let now = Utc::now();
-        format!(
-            "DSC-{}-{}",
-            now.format("%Y%m%d"),
-            uuid::Uuid::new_v4().to_string()[..8].to_uppercase()
-        )
+    /// 这条探针的身份：它问的那个**组合**，不是它被生成的那一拍。
+    ///
+    /// 从前这里取的是 `DSC-<日期>-<随机 8 位>`，于是同一个组合每生成一次就是
+    /// 一个新身份。生成器那边的 `explored` 是内存里的一张表（见
+    /// `DiscoveryEngine`），进程换了就是一张空表，而这条环每一拍都在跑：**每次
+    /// 滚版都按同一份工具面把整个组合池原样再交一遍，每一次都拿到新的 id，于是
+    /// 图里就多出一整套孪生探针**。2026-11-05 实测：一天生成 1902 条探针，其中
+    /// 只有 1006 个不同的假设——47% 是重复的；而当日完成的探针 48 条、失败的 83
+    /// 条，剩下 1766 条压在池子里，每拍被重新派发、重新花钱。
+    ///
+    /// 提交那一跳本来就是幂等的（同一个 id 再交一次只在图里留一行，见
+    /// `submit_goal_auto` 的空 id 返回），缺的只是**让同一个组合同一个 id**。
+    /// 由 `explored_key` 取哈希定死之后，重启不再是「再来一轮」，而是「再问一次
+    /// 同一件事」——图里没有就新建，有就落在原来那一行上，那一行的结局照旧由
+    /// `settle_discovery_outcomes` 按提交时拿到的 id 收回来。
+    ///
+    /// 哈希用 sha256 而不是 `DefaultHasher`：后者只保证**同一次运行内**稳定，
+    /// 编译产物一换就可能算出另一个值，那就等于把这条重复又请回来了。
+    pub fn id_for_key(explored_key: &str) -> String {
+        let digest = format!("{:x}", Sha256::digest(explored_key.as_bytes()));
+        format!("DSC-{}", digest[..16].to_uppercase())
     }
 }
 

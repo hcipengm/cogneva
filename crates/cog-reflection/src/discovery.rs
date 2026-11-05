@@ -87,7 +87,7 @@ impl DiscoveryEngine {
                     break;
                 }
                 tasks.push(DiscoveryTask {
-                    id: DiscoveryTask::generate_id(),
+                    id: DiscoveryTask::id_for_key(&combo),
                     explored_key: combo,
                     hypothesis: format!(
                         "Combining {} and {} may yield a new composite capability.",
@@ -125,7 +125,7 @@ impl DiscoveryEngine {
                 continue;
             }
             tasks.push(DiscoveryTask {
-                id: DiscoveryTask::generate_id(),
+                id: DiscoveryTask::id_for_key(&combo),
                 explored_key: combo,
                 hypothesis: format!(
                     "Varying parameters for {} reveals optimal usage patterns.",
@@ -156,7 +156,7 @@ impl DiscoveryEngine {
                 continue;
             }
             tasks.push(DiscoveryTask {
-                id: DiscoveryTask::generate_id(),
+                id: DiscoveryTask::id_for_key(&combo),
                 explored_key: combo,
                 hypothesis: format!("Skill {} may be applicable to an unrelated domain.", skill),
                 strategy: DiscoveryStrategy::CrossDomainTransfer,
@@ -175,7 +175,7 @@ impl DiscoveryEngine {
         let combo = "boundary:stress".to_string();
         if !guard.contains(&combo) && tasks.len() < max_tasks {
             tasks.push(DiscoveryTask {
-                id: DiscoveryTask::generate_id(),
+                id: DiscoveryTask::id_for_key(&combo),
                 explored_key: combo,
                 hypothesis: "The system handles extreme inputs gracefully.".into(),
                 strategy: DiscoveryStrategy::BoundaryStressTest,
@@ -358,6 +358,49 @@ mod tests {
                 keys(&again)
             );
         }
+    }
+
+    /// 换一个进程提同一个组合，拿到的必须是**同一个 id**：重启不是再试一次。
+    ///
+    /// 这条钉的是一个在生产里量到的结局，不是一个形状。`explored` 在内存里，每
+    /// 一次滚版都是空表，于是每一轮都把整份组合池原样再交一遍；而 id 从前取自
+    /// 随机数，交出去的每一条都是新身份，图里落成一整套孪生探针。2026-11-05 一
+    /// 天：1902 条探针 / 1006 个不同假设（47% 重复），完成 48、失败 83，其余 1766
+    /// 条压着，每拍被重新派发。生产里同一分钟涌进 10 条以上重复行，就是这条测试
+    /// 描述的坏法的放大版。
+    ///
+    /// 用两个**互不相识**的引擎（各自空表）替代「进程换了一个」，因为重启丢的正
+    /// 是那张表；比的是提交给图的那个 id。幂等提交本来就在（同一个 id 再交一次只
+    /// 留一行），缺的只是让同一个组合同一个 id。
+    #[tokio::test]
+    async fn a_probe_keeps_its_id_across_processes_so_a_restart_cannot_mint_twins() {
+        let tools = tools();
+        let before = engine().generate_tasks(&tools, &[], 64).await;
+        // 这个引擎没有见过 `before` 的任何一条：干净进程就是这副样子。
+        let after = engine().generate_tasks(&tools, &[], 64).await;
+
+        let mut ids_before: Vec<(String, String)> = before
+            .iter()
+            .map(|t| (t.explored_key.clone(), t.id.clone()))
+            .collect();
+        ids_before.sort();
+        let mut ids_after: Vec<(String, String)> = after
+            .iter()
+            .map(|t| (t.explored_key.clone(), t.id.clone()))
+            .collect();
+        ids_after.sort();
+
+        assert_eq!(
+            ids_before, ids_after,
+            "两个进程对同一批组合生成的 id 不一致：重启会在图里再落一整套同样的探针"
+        );
+
+        let unique: HashSet<&String> = ids_before.iter().map(|(_, id)| id).collect();
+        assert_eq!(
+            unique.len(),
+            ids_before.len(),
+            "同一个进程内两条探针共用一个 id：不同组合会互相盖掉"
+        );
     }
 
     /// 参数面与迁移面各是**整份名册**宽，不是一个槽位宽。
