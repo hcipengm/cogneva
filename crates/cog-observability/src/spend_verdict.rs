@@ -40,7 +40,8 @@
 //! condition — the site spent in the window immediately before, and the run is
 //! still live — turns it into a *stop*, and the same measurement puts it at 0
 //! cells for the planner over the 51 hours it spent, 2 for `memory` over 50
-//! hours, and 9 for the moderator over 36. A rate that low is what makes a cell
+//! hours (a name retired on 2026-11-05, when extraction became a work item
+//! charged to whoever took it), and 9 for the moderator over 36. A rate that low is what makes a cell
 //! worth looking at (the counts are re-measurable at any time with
 //! `scripts/host/cogneva-token-account-reading.sh verdict`; they are not
 //! repeated here as constants, because a number in a comment is a number that
@@ -243,10 +244,6 @@ pub const UNREGISTERED_SITES: &[UnregisteredSite] = &[
     UnregisteredSite {
         actor: "self_review:*",
         why: "same family, same reason: only the planner's and the moderator's reviews have been observed running often enough to say a missing window is a stop; every other configured self-review role is judged by the census over the writer, not by a window",
-    },
-    UnregisteredSite {
-        actor: "memory",
-        why: "driven by writes to the knowledge base rather than by the run loop: over the 30 days ending 2026-10-16 it spent in 50 hours but 2 of its stops followed a window it had spent in, so its silence is a quiet input rather than a stopped call site. Worth registering once the trigger it waits on has a reading of its own — today it does not, and inventing one would be a second opinion about when extraction is due",
     },
     UnregisteredSite {
         actor: "evolution",

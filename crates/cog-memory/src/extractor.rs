@@ -246,10 +246,10 @@ impl cog_core::MemoryIngestor for IngestionPipeline<RuleBasedExtractor> {
 }
 
 // ---------------------------------------------------------------------------
-// LLM-driven MemoryExtractor
+// The judgment half, handed to an employee
 // ---------------------------------------------------------------------------
 
-use cog_core::{execute_structured, ChatOptions, LlmClient, SFError};
+use cog_core::{SFError, Task, TaskStatus};
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 pub(crate) struct ExtractedEntity {
@@ -382,46 +382,184 @@ impl ExtractionMemo {
     }
 }
 
-/// LLM-driven [`MemoryExtractor`] implementation.
-/// Uses a configured [`LlmClient`] to perform:
-/// - Named-entity recognition (NER) + relation extraction + event extraction
-/// - Semantic summarization with optional embedding generation
+/// How long one extraction may run once an employee picks it up.
 ///
-/// The extraction prompts are schema-driven via [`execute_structured`],
-/// so the LLM is constrained to return valid JSON matching the expected
-/// shapes.
+/// A general employee answers through its own loop rather than one bounded
+/// completion, so the ceiling is the task row's, not a call's. It is set well
+/// above one model round because the loop may read a tool before it answers.
+const EXTRACT_TASK_TIMEOUT_SECS: u64 = 180;
+
+/// How long the ingest pass waits for that answer before giving up on this
+/// transcript. It sits just under the task's own ceiling, so a pass that runs
+/// out of patience and the task that runs out of time are two different
+/// statements rather than the same one made twice.
+const EXTRACT_WAIT_TIMEOUT_SECS: u64 = 170;
+
+const EXTRACT_POLL_INTERVAL_MS: u64 = 500;
+
+/// One work item in, one answer out.
+///
+/// The extractor has no idea which employee took the item, which is the point:
+/// what it knows is what it asked. Keeping that behind a narrow face is also
+/// what lets the caller be tested without a task graph — a fake that answers
+/// from a script says whether the question was asked, not who answered it.
+#[async_trait]
+pub trait WorkItemRunner: Send + Sync {
+    /// Hand over one item and return the answer it came back with.
+    async fn answer(&self, task: Task) -> SFResult<serde_json::Value>;
+}
+
+/// The production runner: submit into the task graph, then read the row back.
+///
+/// The id is the caller's, so a pass that dies after submitting leaves a row
+/// that the same transcript finds again — the orchestrator's idempotent insert
+/// turns the repeat into a read, and no second model call is paid for it.
+pub struct OrchestratorWorkItems {
+    orchestrator: Arc<dyn cog_core::OrchestratorControl>,
+}
+
+impl OrchestratorWorkItems {
+    pub fn new(orchestrator: Arc<dyn cog_core::OrchestratorControl>) -> Self {
+        Self { orchestrator }
+    }
+}
+
+impl std::fmt::Debug for OrchestratorWorkItems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OrchestratorWorkItems")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl WorkItemRunner for OrchestratorWorkItems {
+    async fn answer(&self, task: Task) -> SFResult<serde_json::Value> {
+        let id = task.id.clone();
+        let goal = format!("Judge what is worth remembering in {id}");
+        let submitted = self
+            .orchestrator
+            .submit_goal_auto(&goal, vec![task])
+            .await?;
+        // An id already in the graph is not in this set: the row is there, it
+        // just did not need inserting. Either way the poll below is what tells
+        // us whether it has an answer.
+        let id = submitted.into_iter().next().unwrap_or(id);
+
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(EXTRACT_WAIT_TIMEOUT_SECS);
+        loop {
+            if let Some(t) = self.orchestrator.get_task(&id).await {
+                match t.status {
+                    TaskStatus::Completed => {
+                        return t.result.ok_or_else(|| {
+                            SFError::Agent(format!(
+                                "work item {id} completed without an answer, so this transcript \
+                                 was not judged"
+                            ))
+                        });
+                    }
+                    TaskStatus::Failed | TaskStatus::Cancelled => {
+                        return Err(SFError::Agent(format!(
+                            "work item {id} ended {:?}: {}",
+                            t.status,
+                            t.error.unwrap_or_else(|| "no reason recorded".into())
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SFError::Agent(format!(
+                    "work item {id} was still unanswered after {EXTRACT_WAIT_TIMEOUT_SECS}s"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(EXTRACT_POLL_INTERVAL_MS)).await;
+        }
+    }
+}
+
+/// The same runner, resolved from the plugin context on first use.
+///
+/// The memory plugin's `init` runs in a layer that says nothing about the
+/// orchestrator's: a strong edge would make a memory-only assembly refuse to
+/// start, and reading the service during `init` without one would race the
+/// orchestrator's own publish. Resolving on first use is neither — by the time
+/// an ingest pass asks, every plugin has finished `init`, and "nothing
+/// published one" is answered once and honestly instead of as an empty graph.
+pub struct LateOrchestratorWorkItems {
+    orchestrator: cog_core::LateService<dyn cog_core::OrchestratorControl>,
+}
+
+impl LateOrchestratorWorkItems {
+    pub fn new(ctx: cog_core::PluginContext) -> Self {
+        Self {
+            orchestrator: cog_core::LateService::new(ctx),
+        }
+    }
+}
+
+impl std::fmt::Debug for LateOrchestratorWorkItems {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LateOrchestratorWorkItems")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl WorkItemRunner for LateOrchestratorWorkItems {
+    async fn answer(&self, task: Task) -> SFResult<serde_json::Value> {
+        let orchestrator = self.orchestrator.get().ok_or_else(|| {
+            SFError::Agent(
+                "memory extraction has no task graph to hand its work to: no plugin published an \
+                 orchestrator, so no employee could take the item"
+                    .into(),
+            )
+        })?;
+        OrchestratorWorkItems::new(orchestrator).answer(task).await
+    }
+}
+
+/// The model-driven [`MemoryExtractor`] implementation.
+///
+/// The judgment — what in this transcript is worth remembering — is handed to
+/// whichever employee is free as one work item. Nothing here names an executor
+/// or holds a prompt of its own beyond the wording of the question: the
+/// material, the question and the answer's schema all travel in the item, and
+/// the answer comes back to be stored by the mechanics below.
+///
+/// Layers, in the item:
+/// - schema: named-entity, relation and event extraction;
+/// - summary: one to three sentences, with an importance rating;
+/// - combined: both, in one item, so a transcript is paid for once.
 #[derive(Clone)]
-pub struct LlmMemoryExtractor {
-    provider: Arc<dyn LlmClient>,
-    options: ChatOptions,
+pub struct AgentMemoryExtractor {
+    runner: Arc<dyn WorkItemRunner>,
     embedder: Option<Arc<dyn EmbeddingProvider>>,
     /// 一次抽取最多把多少估算 token 的 transcript 发出去（0 = 不设界）。
     input_budget_tokens: usize,
     memo: Arc<Mutex<ExtractionMemo>>,
 }
 
-impl std::fmt::Debug for LlmMemoryExtractor {
+impl std::fmt::Debug for AgentMemoryExtractor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlmMemoryExtractor")
-            .field("options", &self.options)
+        f.debug_struct("AgentMemoryExtractor")
             .field("embedder", &self.embedder.is_some())
             .finish_non_exhaustive()
     }
 }
 
-impl LlmMemoryExtractor {
-    pub fn new(provider: Arc<dyn LlmClient>) -> Self {
+impl AgentMemoryExtractor {
+    pub fn new(runner: Arc<dyn WorkItemRunner>) -> Self {
         Self {
-            provider,
-            options: ChatOptions::default().with_actor("memory"),
+            runner,
             embedder: None,
             input_budget_tokens: crate::config::DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
             memo: Arc::new(Mutex::new(ExtractionMemo::default())),
         }
     }
 
-    /// Ask the model for one structured answer, unless this process already has
-    /// the answer to this exact prompt.
+    /// Ask for one judged answer, unless this process already has the answer to
+    /// this exact prompt.
     ///
     /// Keyed on the layer and the prompt text — which carries both the task
     /// wording and the payload — so the two layers can never answer for each
@@ -431,11 +569,17 @@ impl LlmMemoryExtractor {
     /// The lock is never held across the call: a duplicate that arrives while
     /// the first is still running waits its turn rather than sharing it, which
     /// is what the observed duplicates do anyway (the upstream is serialized).
-    async fn structured_cached<T>(&self, layer: &str, prompt: &str) -> SFResult<T>
+    ///
+    /// The schema is part of the item rather than of a request option: the
+    /// answer arrives as text from a loop that nothing here controls, so
+    /// "conforming to this schema" has to be something the employee was told,
+    /// and it is read back with the same tolerance a reader owes any reply.
+    async fn judged<T>(&self, layer: &str, prompt: &str) -> SFResult<T>
     where
         T: schemars::JsonSchema + serde::de::DeserializeOwned + serde::Serialize,
     {
-        let key = format!("{layer}:{}", blake3::hash(prompt.as_bytes()).to_hex());
+        let digest = blake3::hash(prompt.as_bytes()).to_hex();
+        let key = format!("{layer}:{digest}");
         let remembered = self
             .memo
             .lock()
@@ -444,23 +588,47 @@ impl LlmMemoryExtractor {
         if let Some(answer) = remembered {
             return serde_json::from_value(answer).map_err(SFError::Serialization);
         }
-        let answer: T = execute_structured(
-            &*self.provider,
-            &[cog_core::Message::user(prompt)],
-            &self.options,
-        )
-        .await?;
-        let value = serde_json::to_value(&answer).map_err(SFError::Serialization)?;
+
+        let schema = schemars::gen::SchemaGenerator::default().root_schema_for::<T>();
+        let schema_json = serde_json::to_string_pretty(&schema).map_err(SFError::Serialization)?;
+        let contract = format!(
+            "Answer with one JSON object conforming to this JSON Schema and nothing else -- \
+             no markdown fences and no commentary. What to judge is in `task`.\n\n{schema_json}"
+        );
+        let input = serde_json::json!({
+            cog_core::contract::prompt::PROMPT_CONTRACT_KEY: contract,
+            "task": prompt,
+        });
+        let task_id = format!("memory-extract-{layer}-{}", &digest[..16]);
+        let mut task = Task::new(
+            task_id,
+            cog_core::TaskType::Custom(cog_core::contract::work_item::PLATFORM_AGENT_TASK.into()),
+            input,
+        );
+        task.action_planner_meta = Some(cog_core::ActionPlannerMeta {
+            verified: true,
+            version: Some("1.0.0".into()),
+            note: Some("Memory extraction; route to a standing employee".into()),
+            source: Some(cog_core::ActionPlannerSource::UserProvided),
+            confidence: None,
+            timestamp: Some(chrono::Utc::now()),
+        });
+        task.timeout_seconds = EXTRACT_TASK_TIMEOUT_SECS;
+        task.acceptance.push(
+            "The reply is one JSON object that parses against the schema the item carries, and \
+             every extracted item rates its importance on the shared 1-10 scale"
+                .to_string(),
+        );
+
+        let answer = self.runner.answer(task).await?;
+        let value = answer_body(&answer)?;
+        let typed: T = serde_json::from_value(value).map_err(SFError::Serialization)?;
+        let value = serde_json::to_value(&typed).map_err(SFError::Serialization)?;
         self.memo
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .put(key, value);
-        Ok(answer)
-    }
-
-    pub fn with_options(mut self, options: ChatOptions) -> Self {
-        self.options = options;
-        self
+        Ok(typed)
     }
 
     pub fn with_embedder(mut self, embedder: Arc<dyn EmbeddingProvider>) -> Self {
@@ -804,12 +972,44 @@ pub(crate) async fn summary_entry(
     .with_importance(importance))
 }
 
+/// The JSON object inside an answer.
+///
+/// An employee answers in the loop's own envelope (`{"result": "<text>"}`),
+/// and the text is a chat reply, not a typed value: fences are common, and so
+/// is one sentence before the object. Both are read through, because the
+/// alternative is paying for an answer and then throwing it away over its
+/// packaging. What is *not* forgiven is a reply with no object in it at all --
+/// that one is reported, so a pass that produced nothing does not look like a
+/// pass that found nothing worth keeping.
+fn answer_body(answer: &serde_json::Value) -> SFResult<serde_json::Value> {
+    if let Some(text) = answer.get("result").and_then(|r| r.as_str()) {
+        let trimmed = text.trim();
+        if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}')) {
+            if start < end {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&trimmed[start..=end])
+                {
+                    return Ok(parsed);
+                }
+            }
+        }
+        return Err(SFError::Validation(
+            "the answer carried no JSON object, so this transcript was not judged".into(),
+        ));
+    }
+    if answer.is_object() {
+        return Ok(answer.clone());
+    }
+    Err(SFError::Validation(
+        "the answer carried no JSON object, so this transcript was not judged".into(),
+    ))
+}
+
 #[async_trait]
-impl MemoryExtractor for LlmMemoryExtractor {
+impl MemoryExtractor for AgentMemoryExtractor {
     async fn extract_schema(&self, source: &RawSource) -> SFResult<Vec<SchemaEntry>> {
         let (prompt, outcome) = Self::build_schema_prompt(source, self.input_budget_tokens);
         note_payload_outcome(outcome);
-        let extraction: SchemaExtraction = self.structured_cached("schema", &prompt).await?;
+        let extraction: SchemaExtraction = self.judged("schema", &prompt).await?;
 
         Ok(schema_entries(
             &source.namespace,
@@ -821,7 +1021,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
     async fn generate_summary(&self, source: &RawSource) -> SFResult<SummaryEntry> {
         let (prompt, outcome) = Self::build_summary_prompt(source, self.input_budget_tokens);
         note_payload_outcome(outcome);
-        let extraction: SummaryExtraction = self.structured_cached("summary", &prompt).await?;
+        let extraction: SummaryExtraction = self.judged("summary", &prompt).await?;
 
         self.summary_entry(source, extraction).await
     }
@@ -833,7 +1033,7 @@ impl MemoryExtractor for LlmMemoryExtractor {
     async fn extract_all(&self, source: &RawSource) -> SFResult<(Vec<SchemaEntry>, SummaryEntry)> {
         let (prompt, outcome) = Self::build_combined_prompt(source, self.input_budget_tokens);
         note_payload_outcome(outcome);
-        let extraction: CombinedExtraction = self.structured_cached("combined", &prompt).await?;
+        let extraction: CombinedExtraction = self.judged("combined", &prompt).await?;
 
         let (schema, summary) = extraction.split();
         let entries = schema_entries(
@@ -855,21 +1055,22 @@ mod tests {
         RawSource::new(id, "default", "text/plain", body.as_bytes().to_vec())
     }
 
-    /// 抽取走的是 `execute_structured`，最终落在一次 `chat` 上，所以调用次数
-    /// 就是"这段 payload 被发了几遍"。它同时记下每次收到的正文，供断言
-    /// payload 出现次数用。
-    struct ScriptedLlm {
+    /// 抽取是一件活，交出去一次就是"这段 payload 被发了几遍"。这个假执行者
+    /// 同时记下每次收到的单据全文，供断言 payload 出现次数用。
+    struct ScriptedRunner {
         answer: String,
         calls: std::sync::atomic::AtomicUsize,
         prompts: std::sync::Mutex<Vec<String>>,
+        tasks: std::sync::Mutex<Vec<Task>>,
     }
 
-    impl ScriptedLlm {
+    impl ScriptedRunner {
         fn new(answer: &str) -> Self {
             Self {
                 answer: answer.to_string(),
                 calls: std::sync::atomic::AtomicUsize::new(0),
                 prompts: std::sync::Mutex::new(Vec::new()),
+                tasks: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -880,50 +1081,23 @@ mod tests {
         fn prompts(&self) -> Vec<String> {
             self.prompts.lock().unwrap().clone()
         }
+
+        fn tasks(&self) -> Vec<Task> {
+            self.tasks.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
-    impl LlmClient for ScriptedLlm {
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &ChatOptions,
-        ) -> SFResult<cog_core::AssistantMessageEventStream> {
-            let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(1);
-            producer.end(cog_core::ChatResponse::default());
-            Ok(stream)
-        }
-
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> SFResult<cog_core::AssistantMessageEventStream> {
-            self.chat_stream(&[], &ChatOptions::default()).await
-        }
-
-        async fn chat(
-            &self,
-            messages: &[cog_core::Message],
-            _options: &ChatOptions,
-        ) -> SFResult<cog_core::ChatResponse> {
+    impl WorkItemRunner for ScriptedRunner {
+        async fn answer(&self, task: Task) -> SFResult<serde_json::Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            self.prompts.lock().unwrap().push(
-                messages
-                    .iter()
-                    .map(|m| m.content())
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
-
-            Ok(cog_core::ChatResponse {
-                content: vec![cog_core::ContentBlock::text(self.answer.clone())],
-                ..Default::default()
-            })
-        }
-
-        async fn health_check(&self) -> bool {
-            true
+            self.prompts
+                .lock()
+                .unwrap()
+                .push(serde_json::to_string(&task.input).unwrap());
+            self.tasks.lock().unwrap().push(task);
+            // 员工回答的封装形态：正文在 `result` 里，是人类可读的文本。
+            Ok(serde_json::json!({ "result": self.answer }))
         }
     }
 
@@ -961,8 +1135,8 @@ mod tests {
     /// payload 发两遍、按两遍计费；合并之后两层必须来自同一次请求。
     #[tokio::test]
     async fn both_layers_come_from_one_call() {
-        let provider = Arc::new(ScriptedLlm::new(COMBINED_ANSWER));
-        let extractor = LlmMemoryExtractor::new(provider.clone());
+        let provider = Arc::new(ScriptedRunner::new(COMBINED_ANSWER));
+        let extractor = AgentMemoryExtractor::new(provider.clone());
 
         let (schema, summary) = extractor
             .extract_all(&raw("raw-a", "gateway routed a deploy to the cluster"))
@@ -977,8 +1151,8 @@ mod tests {
         // 那一次请求必须是合并提示词，否则"省一半"就退化成只问了其中一层。
         let sent = provider.prompts();
         assert_eq!(sent.len(), 1);
-        assert!(sent[0].contains(LlmMemoryExtractor::SCHEMA_TASK));
-        assert!(sent[0].contains(LlmMemoryExtractor::SUMMARY_TASK));
+        assert!(sent[0].contains(AgentMemoryExtractor::SCHEMA_TASK));
+        assert!(sent[0].contains(AgentMemoryExtractor::SUMMARY_TASK));
         assert_eq!(
             schema.len(),
             3,
@@ -988,6 +1162,70 @@ mod tests {
         assert_eq!(summary.importance, cog_core::importance_from_rating(6));
     }
 
+    /// 判定是交出去的一件活，不是一个场景自己叫的模型。
+    ///
+    /// 这条钉的是形状：种类必须是 `platform_agent_task`，做法与答案的 schema
+    /// 必须在单据的契约里，材料必须在请求那一格。三者任一搬走，接活的就从一个
+    /// 通用员工退化成一段写死在这个场景里的调用——而账面上会重新出现一个
+    /// 不是人的名字。
+    #[tokio::test]
+    async fn the_judgment_travels_as_a_work_item() {
+        let runner = Arc::new(ScriptedRunner::new(COMBINED_ANSWER));
+        let extractor = AgentMemoryExtractor::new(runner.clone());
+
+        extractor
+            .extract_schema(&raw("raw-a", "gateway routed a deploy"))
+            .await
+            .unwrap();
+
+        let tasks = runner.tasks();
+        assert_eq!(tasks.len(), 1);
+        let task = &tasks[0];
+        assert_eq!(
+            task.task_type,
+            cog_core::TaskType::Custom(cog_core::contract::work_item::PLATFORM_AGENT_TASK.into()),
+            "抽取不是一件 platform_agent_task：接活的会不是一个通用员工"
+        );
+        assert_eq!(
+            task.action_planner_meta.as_ref().map(|m| m.verified),
+            Some(true),
+            "单据没被判过，分解侧会把它当目标重新拆一遍，材料就未必还能到员工手上"
+        );
+
+        let contract = task.input[cog_core::contract::prompt::PROMPT_CONTRACT_KEY]
+            .as_str()
+            .expect("the item carries its contract");
+        assert!(
+            contract.contains("JSON Schema"),
+            "契约没把答案的 schema 说出来，员工不知道要回什么形状：{contract}"
+        );
+        let material = task.input["task"]
+            .as_str()
+            .expect("the item carries the request");
+        assert!(material.contains("gateway routed a deploy"));
+        assert!(material.contains(AgentMemoryExtractor::SCHEMA_TASK));
+    }
+
+    /// 员工的回答是聊天文本，不是类型化的值：围栏与一句前缀都读得过去。
+    #[test]
+    fn an_answer_wrapped_in_a_fence_is_read_through() {
+        let answer = serde_json::json!({
+            "result": "Here is the judgment:\n```json\n{\"entities\": []}\n```"
+        });
+        assert_eq!(
+            answer_body(&answer).unwrap(),
+            serde_json::json!({"entities": []})
+        );
+    }
+
+    /// 回答里根本没有对象时不许读成「这份材料没什么值得记的」：一个是没判，
+    /// 一个是判了没有，落库的后果完全不同。
+    #[test]
+    fn an_answer_with_no_object_is_an_error_not_an_empty_judgment() {
+        let answer = serde_json::json!({ "result": "nothing worth keeping" });
+        assert!(answer_body(&answer).is_err());
+    }
+
     /// 同一段正文会以不同的 raw id 到达：同一次任务被跑了几遍，每遍的
     /// AgentEnd 时间戳不同，于是 raw id 不同、而提示词逐字节相同。按 raw id
     /// 去重看不见它们，提示词里也没有 id，所以每一份都曾是一次整段重抽。
@@ -995,8 +1233,8 @@ mod tests {
     /// 第二份的条目仍归它自己的 raw id。
     #[tokio::test]
     async fn the_same_transcript_is_extracted_once() {
-        let provider = Arc::new(ScriptedLlm::new(COMBINED_ANSWER));
-        let extractor = LlmMemoryExtractor::new(provider.clone());
+        let provider = Arc::new(ScriptedRunner::new(COMBINED_ANSWER));
+        let extractor = AgentMemoryExtractor::new(provider.clone());
         let body = "gateway routed a deploy to the cluster";
 
         let first = extractor.extract_all(&raw("raw-a", body)).await.unwrap();
@@ -1038,8 +1276,8 @@ mod tests {
             "events": [],
             "summary": {"text": "The roundtable converged after three rounds.", "importance": 5}
         }"#;
-        let provider = Arc::new(ScriptedLlm::new(ANSWER));
-        let extractor = LlmMemoryExtractor::new(provider.clone());
+        let provider = Arc::new(ScriptedRunner::new(ANSWER));
+        let extractor = AgentMemoryExtractor::new(provider.clone());
 
         let (entries, _) = extractor
             .extract_all(&raw("raw-shapes", "roundtable converged"))
@@ -1068,7 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn the_merged_prompt_carries_the_payload_once() {
         const SENTINEL: &str = "SENTINEL-4682f1";
-        let (prompt, _) = LlmMemoryExtractor::build_combined_prompt(
+        let (prompt, _) = AgentMemoryExtractor::build_combined_prompt(
             &raw("raw-a", SENTINEL),
             crate::config::DEFAULT_EXTRACTION_INPUT_BUDGET_TOKENS,
         );
@@ -1078,8 +1316,8 @@ mod tests {
             1,
             "the payload must appear exactly once: {prompt}"
         );
-        assert!(prompt.contains(LlmMemoryExtractor::SCHEMA_TASK));
-        assert!(prompt.contains(LlmMemoryExtractor::SUMMARY_TASK));
+        assert!(prompt.contains(AgentMemoryExtractor::SCHEMA_TASK));
+        assert!(prompt.contains(AgentMemoryExtractor::SUMMARY_TASK));
     }
 
     /// 一份 transcript 的 raw：真链路上 `build_raw` 发出去的就是这个形状。
@@ -1099,7 +1337,7 @@ mod tests {
     #[test]
     fn a_transcript_within_budget_is_sent_verbatim() {
         let source = transcript(&["alpha one", "beta two"]);
-        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 64_000);
+        let (prompt, outcome) = AgentMemoryExtractor::build_combined_prompt(&source, 64_000);
         let payload = String::from_utf8(source.payload.clone()).unwrap();
 
         assert_eq!(
@@ -1125,7 +1363,7 @@ mod tests {
             "alpha four",
         ]);
         // 每条两个英文词（8 token），预算 24 = 头尾各一条。
-        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 24);
+        let (prompt, outcome) = AgentMemoryExtractor::build_combined_prompt(&source, 24);
 
         assert_eq!(
             outcome,
@@ -1156,7 +1394,7 @@ mod tests {
     fn a_single_message_over_budget_is_still_sent_whole() {
         let long = "alpha ".repeat(200);
         let source = transcript(&[&long]);
-        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 8);
+        let (prompt, outcome) = AgentMemoryExtractor::build_combined_prompt(&source, 8);
 
         // 超界但省不下任何一条整消息：报成这一支，而不是报成"没超界"。
         // 前者是"界在这里管不住"，后者是"界管住了"，调预算时是两件事。
@@ -1181,7 +1419,7 @@ mod tests {
             "这一份按估算早就超预算了，所以下面量的是字符界不是估算界"
         );
 
-        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 50);
+        let (prompt, outcome) = AgentMemoryExtractor::build_combined_prompt(&source, 50);
         assert_eq!(outcome, PayloadOutcome::CharCut);
         assert_eq!(prompt.matches('~').count(), 50);
         assert!(prompt.contains("unrecognized payload"), "{prompt}");
@@ -1193,7 +1431,7 @@ mod tests {
     #[test]
     fn an_unparsable_payload_that_fits_is_not_counted_as_cut() {
         let source = raw("raw-not-a-transcript", "~short blob~");
-        let (_, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 50);
+        let (_, outcome) = AgentMemoryExtractor::build_combined_prompt(&source, 50);
 
         assert_eq!(outcome, PayloadOutcome::Verbatim);
     }
@@ -1203,7 +1441,7 @@ mod tests {
     fn a_zero_budget_sends_the_whole_payload() {
         let long = "alpha ".repeat(200);
         let source = transcript(&[&long]);
-        let (prompt, outcome) = LlmMemoryExtractor::build_combined_prompt(&source, 0);
+        let (prompt, outcome) = AgentMemoryExtractor::build_combined_prompt(&source, 0);
 
         assert_eq!(outcome, PayloadOutcome::Verbatim);
         assert!(prompt.contains(&long));
@@ -1213,8 +1451,8 @@ mod tests {
     /// 必须产出同样的 id、kind 与 importance，否则"优化"会静默改掉记忆。
     #[tokio::test]
     async fn the_merged_call_stores_what_the_layered_call_stores() {
-        let layered = LlmMemoryExtractor::new(Arc::new(ScriptedLlm::new(SCHEMA_ANSWER)));
-        let merged = LlmMemoryExtractor::new(Arc::new(ScriptedLlm::new(COMBINED_ANSWER)));
+        let layered = AgentMemoryExtractor::new(Arc::new(ScriptedRunner::new(SCHEMA_ANSWER)));
+        let merged = AgentMemoryExtractor::new(Arc::new(ScriptedRunner::new(COMBINED_ANSWER)));
         let source = raw("raw-a", "gateway routed a deploy to the cluster");
 
         let mut alone = layered.extract_schema(&source).await.unwrap();
@@ -1234,8 +1472,8 @@ mod tests {
     /// 的代价：调用失败后什么都没落库，重驱动会把两层一起补上。
     #[tokio::test]
     async fn a_failed_merged_call_stores_nothing() {
-        let provider = Arc::new(ScriptedLlm::new("{\"entities\": []}"));
-        let extractor = LlmMemoryExtractor::new(provider.clone());
+        let provider = Arc::new(ScriptedRunner::new("{\"entities\": []}"));
+        let extractor = AgentMemoryExtractor::new(provider.clone());
 
         assert!(extractor
             .extract_all(&raw("raw-a", "gateway routed a deploy"))

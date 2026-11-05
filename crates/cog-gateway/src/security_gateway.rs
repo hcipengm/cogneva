@@ -11480,7 +11480,7 @@ mod tests {
             ),
             10,
             &RequestSide {
-                actor: "memory".to_string(),
+                actor: "eval".to_string(),
                 origin: "gateway_pool".to_string(),
                 task: None,
                 owner: None,

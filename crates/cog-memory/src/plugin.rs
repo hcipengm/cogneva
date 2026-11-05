@@ -529,23 +529,23 @@ impl cog_core::SystemPlugin for MemoryPlugin {
         }
 
         let embed_provider = ctx.consume_service::<dyn cog_core::EmbeddingProvider>();
-        let llm_provider = ctx.consume_service::<dyn cog_core::LlmClient>();
         let event_tx = ctx
             .consume::<tokio::sync::broadcast::Sender<cog_core::AgentEvent>>()
             .map(|h| (*h).clone());
 
         if let Some(backend) = memory_backend {
-            let extractor: Arc<dyn cog_core::MemoryExtractor> =
-                if let Some(ref provider) = llm_provider {
-                    let mut extractor = crate::LlmMemoryExtractor::new(provider.clone())
-                        .with_input_budget_tokens(memory.ingest.extraction_input_budget_tokens);
-                    if let Some(ref embedder) = embed_provider {
-                        extractor = extractor.with_embedder(embedder.clone());
-                    }
-                    Arc::new(extractor)
-                } else {
-                    Arc::new(crate::RuleBasedExtractor::new())
-                };
+            // 判定交给名册上的任意一位员工：抽取器只交出一件活，不自己叫模型。
+            // 编排器在第一次真正抽取时才解析得到——装配期读到与否取决于插件
+            // 图的分层，而分层里没有这条边；缺席时那条活会报出来，而不是悄悄
+            // 退化成规则抽取、让「没人判」看起来像「没什么值得记」。
+            let mut extractor = crate::AgentMemoryExtractor::new(Arc::new(
+                crate::LateOrchestratorWorkItems::new(ctx.clone()),
+            ))
+            .with_input_budget_tokens(memory.ingest.extraction_input_budget_tokens);
+            if let Some(ref embedder) = embed_provider {
+                extractor = extractor.with_embedder(embedder.clone());
+            }
+            let extractor: Arc<dyn cog_core::MemoryExtractor> = Arc::new(extractor);
             let isolation = crate::BenchmarkIsolation::new(
                 memory.ingest.benchmark_namespaces.clone(),
                 memory.ingest.benchmark_canary_markers.clone(),

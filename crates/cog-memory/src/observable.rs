@@ -108,10 +108,11 @@ impl PayloadOutcome {
 ///
 /// What this publishes is memory *operation* behaviour: how many backend
 /// operations this process ran and how long they took. Token spend is
-/// deliberately not among them. The layer does make model calls -- the
-/// extractor labels them with actor `memory` -- but the tokens an upstream
-/// charges are settled by the upstream's own answer, which arrives at the
-/// gateway, and the gateway is the single point all model traffic converges on.
+/// deliberately not among them. The layer does cause model calls -- the
+/// extractor hands its judgment to an employee, whose spend is charged to that
+/// employee's own `agent:<id>` -- but the tokens an upstream charges are settled
+/// by the upstream's own answer, which arrives at the gateway, and the gateway
+/// is the single point all model traffic converges on.
 /// A counter here could only ever restate what the gateway already attributes,
 /// one process at a time, and a second record of one fact is a second thing to
 /// disagree with. This type carried such a counter and a context-overflow

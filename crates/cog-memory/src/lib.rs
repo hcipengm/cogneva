@@ -50,7 +50,10 @@ pub use composite::CompositeMemoryBackend;
 pub use consolidator::{ConsolidationStrategy, MemoryConsolidator};
 pub use embedding_provider::FastEmbedProvider;
 pub use entry_store::{MemoryEntryStore, SummaryEntryStore};
-pub use extractor::{IngestionPipeline, LlmMemoryExtractor, RuleBasedExtractor};
+pub use extractor::{
+    AgentMemoryExtractor, IngestionPipeline, LateOrchestratorWorkItems, OrchestratorWorkItems,
+    RuleBasedExtractor, WorkItemRunner,
+};
 pub use ingestor::{MemoryIngestor, MemoryIngestorConfig};
 pub use isolation::{BenchmarkIsolation, BenchmarkRefusal};
 pub use judged::{JudgedEntryWriter, JUDGED_BY_ANONYMOUS};

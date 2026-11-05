@@ -69,9 +69,9 @@ const PRODUCERS: &[(&str, &[&str])] = &[
         "crates/cog-extension/src/hostdocs_assist.rs",
         &["sandbox-document-organizer"],
     ),
-    // 界面上那段对话跑在系统那条循环上，是装配层把脸名装上去的：网关里没有
-    // 循环，也就没有写 actor 的调用点。
-    ("crates/cog-memory/src/extractor.rs", &["memory"]),
+    // 记忆抽取不再自己叫模型：它把「这段材料里什么值得记」当成一件活交给
+    // 名册上的员工，账记在接活的那个人身上（`agent:<id>`），所以这里没有
+    // 属于场景自己的名字可写。
     ("crates/cog-reflection/src/evolution.rs", &["evolution"]),
     ("crates/cogneva/src/eval_table.rs", &["eval"]),
     (
@@ -444,10 +444,6 @@ const TASK_KEYING: &[(&str, TaskKeying)] = &[
     (
         "crates/cog-extension/src/hostdocs_assist.rs",
         TaskKeying::KeyedBy("沙盒里的那份文档"),
-    ),
-    (
-        "crates/cog-memory/src/extractor.rs",
-        TaskKeying::KeyedBy("被抽取的那份原始材料"),
     ),
     (
         "crates/cog-reflection/src/evolution.rs",

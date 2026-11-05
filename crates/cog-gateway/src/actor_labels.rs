@@ -26,7 +26,6 @@
 pub const ACTOR_LABELS: &[&str] = &[
     "eval",
     "evolution",
-    "memory",
     "ralph",
     "sandbox-document-organizer",
     "self_review",

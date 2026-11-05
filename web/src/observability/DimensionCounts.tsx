@@ -213,7 +213,6 @@ const ORIGIN_LABELS: Record<string, string> = {
 const ACTOR_MEANINGS: Record<string, string> = {
   eval: '评测跑批这个程序自己的调用（三个读成「评测」的名字里最外面的一个：`agent:evaluator` 是被评的那个角色，`self_review:evaluator` 是它审自己）',
   evolution: '自进化循环',
-  memory: '记忆读写',
   ralph: 'ralph 循环',
   self_review: '自检（没有指明被评对象的一侧）',
   'sandbox-document-organizer': '沙盒里的文档整理',
@@ -232,6 +231,7 @@ const RETIRED_ACTOR_MEANINGS: Record<string, string> = {
   wiki: '历史（2026-11-05 之前）：知识库维护者；该维护者从未被装配，已删除',
   intent_assess: '历史（2026-11-05 之前）：协作执行器里那条专门的意图判定分支；此后判定作为一件 `platform_agent_task` 交给常驻员工做',
   skill_extractor: '历史（2026-11-05 之前）：从成熟模式抽取技能配置；这条路径没有任何生产调用方，已删除',
+  memory: '历史（2026-11-05 之前）：记忆抽取自己叫模型；此后抽取作为一件 `platform_agent_task` 交给名册上的员工，账记在接活的人 `agent:<id>` 上',
 };
 
 /**
@@ -305,7 +305,7 @@ const ACTOR: Dimension = {
       : `见下表：${shape}，表底有总计。`;
   },
   footnote: () =>
-    '执行者名来自网关的闭集：固定的阶段名（eval、memory、ralph…），加 `agent:<角色>` / `self_review:<被评的角色>` 两族前缀。两族的族员是同一份角色名单——每位角色既以 `agent:<角色>` 干活，又以 `self_review:<角色>` 审自己刚写的那份输出，所以两族一样大。身份是网关的前提条件：没带执行者头的调用在付钱之前就被 400 拒掉，所以 `unknown` 那一格的花销只该有历史；2026-11-03 之后它的调用数再涨，涨的是被拒的匿名请求，不是一类执行者。闭集里登记了、这段窗口没出现过的名字也列在下面，标「本窗口没有调用」：出现过几个不是全集，表底那一行总计才是这一屏所有行的和。',
+    '执行者名来自网关的闭集：固定的阶段名（eval、ralph…），加 `agent:<角色>` / `self_review:<被评的角色>` 两族前缀。两族的族员是同一份角色名单——每位角色既以 `agent:<角色>` 干活，又以 `self_review:<角色>` 审自己刚写的那份输出，所以两族一样大。身份是网关的前提条件：没带执行者头的调用在付钱之前就被 400 拒掉，所以 `unknown` 那一格的花销只该有历史；2026-11-03 之后它的调用数再涨，涨的是被拒的匿名请求，不是一类执行者。闭集里登记了、这段窗口没出现过的名字也列在下面，标「本窗口没有调用」：出现过几个不是全集，表底那一行总计才是这一屏所有行的和。',
 };
 
 const UPSTREAM: Dimension = {
