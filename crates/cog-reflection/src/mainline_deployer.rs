@@ -5342,6 +5342,14 @@ impl MainlineDeployer {
         row.is_executable = false;
         // 这一行属于哪个面：扣住期间每一轮都写，读面与改派才有得读。
         row.face_id = Some(CI_HOLD_FACE.to_string());
+        // 这一行自己也站在停线上，理由与兜底那一条相同：就绪队列是先进先出的
+        // 日志，排在积压后面的消息不会因为后来的优先级更高而让路。不同的是这一
+        // 条决定的不只是它自己——分解把 lane 交给它拆出来的每一件活，而锚点不
+        // 带 lane 时，那些活一件都拿不到。2026-11-05 实测：两条普通就绪队列积压
+        // 九万五千条，其中一百八十四条是这些修复单的消息，停线那条队列是空的，
+        // 而它们从提交起就在等一条永远不会轮到自己的队首。
+        row.input[cog_core::INPUT_READY_LANE] =
+            serde_json::json!(cog_core::READY_LANE_STOP_THE_LINE);
         match orchestrator.submit_goal_auto(&goal, vec![row]).await {
             Ok(added) if added.is_empty() => {
                 // 已持有同一天的目标行：这一轮没有新任务。但目标行不是活，它只是一条
@@ -17845,6 +17853,51 @@ exec {real} "$@"
                 .get(cog_core::INPUT_READY_LANE)
                 .and_then(|lane| lane.as_str()),
             Some(cog_core::READY_LANE_STOP_THE_LINE)
+        );
+    }
+
+    /// 锚点行也站在停线上：它拆出来的每一件活都从它那里继承 lane。
+    ///
+    /// 排在哪个就绪队列只由输入里那一格决定，而分解是把目标行那一格抄给子任务的
+    /// 唯一一站。锚点不带 lane，拆出来的四件活就一件都不带——它们落回共享队列，
+    /// 排在已经积压的几条工作后面。2026-11-05 实测：两条普通就绪队列积压九万五千
+    /// 条，其中一百八十四条是这些修复单的消息，而停线那条队列自始至终是空的。
+    /// 把这一句删掉，这条断言红。
+    #[tokio::test]
+    async fn the_anchor_row_stands_where_its_pieces_will_stand() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        // 分解被收下那一支：锚点进图，兜底不再触发。
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let checks = vec!["github:Clippy".to_string()];
+        let since_unix = 100;
+        deployer
+            .dispatch_ci_remediation("abc123", &checks, since_unix, &[])
+            .await;
+
+        let anchor_id = ci_hold_goal_id(
+            "abc123",
+            &Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string(),
+            since_unix,
+        );
+        let anchor = planner
+            .rows()
+            .into_iter()
+            .flatten()
+            .find(|task| task.id == anchor_id)
+            .expect("the anchor row was submitted through the orchestrator");
+        assert_eq!(
+            anchor
+                .input
+                .get(cog_core::INPUT_READY_LANE)
+                .and_then(|lane| lane.as_str()),
+            Some(cog_core::READY_LANE_STOP_THE_LINE),
+            "锚点是分解时 lane 唯一的来源；它不带，拆出来的活就全部退回积压后面"
         );
     }
 
