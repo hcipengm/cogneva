@@ -2145,6 +2145,14 @@ fn spawn_skill_effectiveness_loop(
     ));
 }
 
+/// 一条探针在队列里的档位。
+///
+/// 取负数是刻意的：这个平台上有两档已经用掉了 0 与 1——变更派发器的地板是 0，
+/// `Task::new` 的默认是 1——而探针要比**这两档都低**。用一个负数表达「比所有
+/// 落地的活儿都低」，就不会在下一档工作下沉到 0 时再次与探针打平。
+// cap: bound — 比派发变更（0）与默认工作（1）都低一档：探针只在没有别的活儿时跑
+pub const PROBE_PRIORITY: i32 = -1;
+
 /// 一条探针怎么变成任务图里的一行。
 ///
 /// 抽成纯函数是为了让它能被单独量：这里的字段名拼错了不会让那条环停下来，
@@ -2174,13 +2182,21 @@ pub fn discovery_probe_task(probe: &crate::types::DiscoveryTask) -> (String, cog
     // 这条探针停在 `Pending` 上，而发现这一环的结局要靠「交出去之后收回判词」才成立
     // ——一条永远不开工的探针，在账上与「这一轮什么都没生成」是同一格。
     task.acceptance.push(discovery_probe_acceptance(probe));
-    // 探针排在所有被要求的工作之后。这一部署只有一个执行槽
-    // （`COGNEVA_BOARD_WIP_LIMITS=running=1`），槽被一条探针占住的那段时间，一条会
-    // 把改动落进树的变更就得等着——而探针的产出是「这个组合能不能用」，不是一次
-    // 落地。调度只在这一处读优先级（`ready.sort_by_key(-priority)`），所以这一句
-    // 不拦探针能不能跑：队列里没有更高优先级的活儿时它照样跑。普通工作取的是
-    // `Task::new` 的默认 1，这里取比它低的一格。
-    task.priority = 0;
+    // 探针排在**所有**别的活儿之后：比 `Task::new` 的默认 1 低，也比变更派发器的
+    // 地板 0 低（`crates/cog-orchestrator/src/change_ledger.rs` 的
+    // `DISPATCH_TASK_PRIORITY`）。
+    //
+    // 原先这里写 0，理由写的是「普通工作取 Task::new 的默认 1，所以 0 比它低一档」。
+    // 那个前提在派发器把自己的地板定成 0 之后就不成立了：探针与真正会落地进树的变更
+    // 同权重排队，而这一部署每个执行进程只有一份许可（`claimConcurrency`），于是谁
+    // 先占住槽谁就赢。2026-11-05 实测：21:01–22:26 的 85 分钟里执行槽只跑探针（每
+    // 条 2–5 分钟、首尾相接），同一时间图里有 1985 条变更在等，当天变更只跑完 45
+    // 条。探针的产出是「这个组合能不能用」，不是一次落地；让它与落地同权重，等于
+    // 用一个不会落地的活儿去和会落地的活儿抢同一份预算。
+    //
+    // 只在排队时读（`ready.sort_by_key(-priority)`），不限制探针能不能跑：队列里
+    // 没有别的活儿时它照样跑，所以发现这一环不会僵住。
+    task.priority = PROBE_PRIORITY;
     (goal, task)
 }
 
@@ -4713,24 +4729,35 @@ mod tests {
             task.task_type,
             cog_core::TaskType::Custom("capability_discovery".into())
         );
-        // 探针排在所有被要求的工作后面：这一部署只有**一个**执行槽
-        // （`COGNEVA_BOARD_WIP_LIMITS=running=1`），槽被一条探针占住的那一分钟，
-        // 一条会把改动落进树的变更就得等着。默认的 1 是普通工作的priority，
-        // 探针取 0——比它低，别的都不动。这条只在排队时读（`ready.sort_by_key(-priority)`），
-        // 不限制探针能不能跑：队列里没有更高优先级的工作时它照样跑。
+        // 探针排在**所有**会落地的活儿后面。比较的基准不是「普通工作的默认 1」——
+        // 那个基准 2026-11-05 已经不成立了：变更派发器的地板就是 0
+        // （`crates/cog-orchestrator/src/change_ledger.rs` 的
+        // `DISPATCH_TASK_PRIORITY`），探针原先的 0 与它打平，于是 85 分钟的执行槽
+        // 被首尾相接的探针占满、1985 条变更在队列里等。这里钉的是两档：
+        // `Task::new` 的默认，以及派发变更真正用的地板。
         assert_eq!(
-            task.priority, 0,
-            "探针必须排在普通工作之后，否则它会占住唯一的执行槽"
+            task.priority, PROBE_PRIORITY,
+            "探针的档位改了：它只在没有别的活儿时才该跑"
         );
+        let default_rank = cog_core::Task::new(
+            "x",
+            cog_core::TaskType::Custom("t".into()),
+            serde_json::json!({}),
+        )
+        .priority;
         assert!(
+            task.priority < default_rank,
+            "探针必须比默认工作低：{} 不小于 {default_rank}",
             task.priority
-                < cog_core::Task::new(
-                    "x",
-                    cog_core::TaskType::Custom("t".into()),
-                    serde_json::json!({})
-                )
-                .priority,
-            "比较的基准变了：普通工作的默认优先级不再是 1"
+        );
+        // 派发变更的地板，从它自己的定义抄来（那个常量在另一个 crate 里，且不是
+        // pub）。抄这一格而不是写 `task.priority < 0`，是为了让「派发地板哪天又
+        // 下沉」这件事在这里红，而不是在调度器里悄悄地再打平一次。
+        const DISPATCHED_CHANGE_FLOOR: i32 = 0;
+        assert!(
+            task.priority < DISPATCHED_CHANGE_FLOOR,
+            "探针与派发的变更打平了：两条同权重排在一条队伍里，先占住执行槽的赢，\
+             而探针不会落地。现场见 2026-11-05 21:01–22:26 的执行槽记录"
         );
     }
 
