@@ -206,13 +206,15 @@ impl GeneratorActor {
                 // sentence nobody wrote in answer to the task, so it is skipped
                 // under the same named reason the planner uses — the calls this
                 // saves stay a reading rather than an absence.
-                let basis = if output.is_terminal_env_failure() {
-                    crate::actors::ReviewBasis::Skipped(
-                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
-                    )
-                } else {
-                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[]))
-                };
+                let basis = crate::actors::review_basis(
+                    task,
+                    crate::actors::ReviewFacts {
+                        upstream_failed: output.is_terminal_env_failure(),
+                        self_evolution: is_self_evolution,
+                        ..Default::default()
+                    },
+                    &[],
+                );
                 (output, basis)
             }
             Err(e) => {
@@ -230,23 +232,13 @@ impl GeneratorActor {
                         ),
                         artifacts: Vec::new(),
                     },
-                    crate::actors::ReviewBasis::Skipped(
-                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    crate::actors::ReviewBasis::Passed(
+                        crate::observable::SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,
                     ),
                 )
             }
         };
         let output_str = serde_json::to_string_pretty(&output).unwrap_or_default();
-        // Skip self-review for self-evolution change generation. Reasoning-only
-        // models often return natural-language explanations instead of strict
-        // JSON, so the self-review reformat step can hang for the full timeout
-        // without adding value once the change has been extracted. The skip is
-        // named so the calls it saves are a reading rather than an absence.
-        let review_basis = if is_self_evolution {
-            crate::actors::ReviewBasis::Skipped(crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION)
-        } else {
-            review_basis
-        };
         if let Some(revised) = crate::actors::maybe_self_review(
             self.agent.as_ref(),
             &self.self_review,

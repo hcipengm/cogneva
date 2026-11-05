@@ -18,33 +18,50 @@ pub const ROUTING_DECLARATION_FACE_GONE_RULE: &str = "routing_declaration_face_g
 
 static GLOBAL: OnceLock<Arc<CollaborationObservable>> = OnceLock::new();
 
-/// 自审的判定取值域。三个值都是结局，不是过程：`failed` 这一格存在的理由与
-/// 另外两格相同——只按成功发布结局的族没有失败面，一次都答不上来的自审会
-/// 与「没有自审」在读数上完全同形。
+/// 自审的判定取值域。四个值都是结局，不是过程，而且**每一份产物都落进其中一格**：
+/// 有没有花钱调用模型是 `decided_by` 说的，不是这一格说的。
+///
+/// `pass`：这一笔原样交回调用方。可能是模型判过（`decided_by="model"`），也可能
+/// 是第一段固定程序在花调用之前就判过的（`decided_by` 写着那条理由）。合在一格
+/// 里，是因为对调用方而言它们是同一个结局——**不审即过也是自审下的一个判**，
+/// 分成两族就得由读的人自己把两族加起来，而加漏一族的那张面板看不出自己漏了。
+/// `need_revision`：模型判过，有条目没满足，判词交回调用方自己的重做路径。
+/// `not_judged`：没有可判的产物。`failed` 是一次都答不上来的自审——只按成功发布
+/// 结局的族没有失败面，它会与「没有自审」在读数上完全同形。
+///
+/// **`upstream_unavailable` 记 `not_judged`，不记 `pass`**：把它算成通过，会让上游
+/// 挂掉的那一小时在「通过率」上变好，而读数在系统更坏时变好是最坏的一种读错。
 pub const SELF_REVIEW_VERDICT_PASS: &str = "pass";
 pub const SELF_REVIEW_VERDICT_NEED_REVISION: &str = "need_revision";
 pub const SELF_REVIEW_VERDICT_FAILED: &str = "failed";
+pub const SELF_REVIEW_VERDICT_NOT_JUDGED: &str = "not_judged";
 
 /// 判据面：自审这次比对有没有外部判据（配置里的 spec、best_practices，或调用点
 /// 交上来的任务说明）。`absent` 不是错误态，是「这次打分的输入只有它自己上一步
-/// 写出来的文本」——分数能不能被反驳，全看这一格。
+/// 写出来的文本」——分数能不能被反驳，全看这一格。`not_asked`：没有问模型，
+/// 判据面没被使用——它与 `absent` 不同，后者是问了、但没有外部判据可给。
 pub const SELF_REVIEW_CRITERIA_DECLARED: &str = "declared";
 pub const SELF_REVIEW_CRITERIA_ABSENT: &str = "absent";
+pub const SELF_REVIEW_CRITERIA_NOT_ASKED: &str = "not_asked";
 
-/// 自审被跳过的原因取值域。与判定面分开一处：跳过不是一次判定，读「门说了不」
-/// 的那一格不能把「门根本没开」算进去。
+/// 判决是谁下的。`model` 是唯一花了调用的那一格；其余四格都是第一段固定程序
+/// 在花调用之前就下了结论，四个理由各自成闭集取值，因为它们要求四种不同的处置
+/// （上游要看、开关是人开的、自进化按记录不审、程序判据已经判过同一份产物）。
 ///
 /// `upstream_unavailable`：actor 自己都没到上游，输出是占位符——省下的是两次
 /// 注定无效的调用（判据：输出来自 fallback 分支）。`disabled`：这段输出整个
 /// 不属于自审覆盖的面（配置没开）。`self_evolution`：自进化产出按记录在案的
-/// 理由不审（推理型模型会吐自然语言，改写步会挂满超时）。
-pub const SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE: &str = "upstream_unavailable";
-pub const SELF_REVIEW_SKIP_DISABLED: &str = "disabled";
-pub const SELF_REVIEW_SKIP_SELF_EVOLUTION: &str = "self_evolution";
-/// `program_judged`：这份产物在它被交给的那条循环里已经由程序判据逐条判过，
-/// 判词还会回到下一轮。同一个产物用第二个模型再判一遍，买到的是同一份判断，
-/// 而判据与产物的种类已经对上了（结构判据判结构产物）。
-pub const SELF_REVIEW_SKIP_PROGRAM_JUDGED: &str = "program_judged";
+/// 理由不审（推理型模型会吐自然语言，改写步会挂满超时）。`program_judged`：
+/// 这份产物在它被交给的那条循环里已经由程序判据逐条判过，判词还会回到下一轮；
+/// 同一个产物用第二个模型再判一遍，买到的是同一份判断。
+///
+/// 这四个字符串同时是持久化省单（`cog_llm_skip.reason`）的取值：同一笔省下的
+/// 调用，实时面与落库面用同一个词命名。
+pub const SELF_REVIEW_DECIDED_BY_MODEL: &str = "model";
+pub const SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE: &str = "upstream_unavailable";
+pub const SELF_REVIEW_DECIDED_BY_DISABLED: &str = "disabled";
+pub const SELF_REVIEW_DECIDED_BY_SELF_EVOLUTION: &str = "self_evolution";
+pub const SELF_REVIEW_DECIDED_BY_PROGRAM_JUDGED: &str = "program_judged";
 
 /// The two ends of a revision step inside a self-review that did run. Both
 /// cells answer a question the verdict cannot: a review that ended in
@@ -426,11 +443,9 @@ pub fn global_observable() -> Arc<CollaborationObservable> {
 
 use tokio::sync::Mutex;
 
-/// 自审判定的单元：(stage, criteria, verdict)。三段都取自闭集，所以单元数有界。
-type SelfReviewCell = (String, String, String);
-
-/// 自审跳过的单元：(stage, reason)。
-type SelfReviewSkipCell = (String, String);
+/// 自审判定的单元：(stage, criteria, verdict, decided_by)。四段都取自闭集，
+/// 所以单元数有界。
+type SelfReviewCell = (String, String, String, String);
 
 /// Collaboration-layer observable state.
 #[derive(Default)]
@@ -516,7 +531,14 @@ pub struct CollaborationObservable {
     /// along; when one stops, the rows still come back and only this face says
     /// they now name the run instead of the work.
     goal_class_sources: Arc<std::sync::Mutex<HashMap<String, u64>>>,
-    /// Self-review verdicts, keyed by (stage, criteria, verdict).
+    /// Self-review verdicts, keyed by (stage, criteria, verdict, decided_by).
+    ///
+    /// One cell per (stage, outcome, who decided, what it was held to). The
+    /// `decided_by` leg is what keeps the gate's pass — an outcome reached
+    /// before any call was made — countable beside the model's pass without the
+    /// two becoming the same number: the saving is the difference between them,
+    /// and a pass rate that must not move when the upstream goes down is read
+    /// from `decided_by="model"` alone.
     ///
     /// The three faces answer three different questions a review's log line
     /// cannot: which stages review at all, how often the gate said no (the
@@ -527,14 +549,6 @@ pub struct CollaborationObservable {
     /// identical from the score alone, which is why the score alone was never
     /// enough to decide whether the gate was doing anything.
     self_review_verdicts: Arc<std::sync::Mutex<HashMap<SelfReviewCell, u64>>>,
-    /// Self-review skips, keyed by (stage, reason).
-    ///
-    /// A review that is not run is a saving, and an unread saving is not one:
-    /// two calls per skipped review are the difference between the review
-    /// surface costing what it is supposed to and costing double while it
-    /// closes nothing. Kept apart from the verdict cells so "the gate objected"
-    /// and "the gate never opened" never add up to the same number.
-    self_review_skips: Arc<std::sync::Mutex<HashMap<SelfReviewSkipCell, u64>>>,
     /// The two ends of a self-review's revision step, keyed by (stage, outcome).
     ///
     /// See [`SELF_REVIEW_REVISION_CHANGED`]: the saving this face measures is the
@@ -737,7 +751,7 @@ impl CollaborationObservable {
         .await;
     }
 
-    /// Record one self-review verdict.
+    /// Record one self-review verdict reached by the model.
     ///
     /// A synchronous lock: this counter is the evidence of how often the quality
     /// gate said no — and a dropped count would read as a gate that never
@@ -757,33 +771,60 @@ impl CollaborationObservable {
             .self_review_verdicts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *map.entry((stage.to_string(), criteria.to_string(), verdict.to_string()))
-            .or_insert(0) += 1;
+        *map.entry((
+            stage.to_string(),
+            criteria.to_string(),
+            verdict.to_string(),
+            SELF_REVIEW_DECIDED_BY_MODEL.to_string(),
+        ))
+        .or_insert(0) += 1;
     }
 
-    /// Record one self-review that was not run, and why.
+    /// Record a verdict the first stage settled before any call was made.
+    ///
+    /// This is a pass, not the absence of a review: the fixed program looked at
+    /// the facts and concluded the artifact goes through as it is. It lands in
+    /// the same family as the model's verdict with `decided_by` naming the
+    /// reason, so "self-review decided" is one sum and "what did the model say"
+    /// is a filter on it. `upstream_unavailable` is the one reason that is not
+    /// a pass — nothing was produced, so nothing was passed — and it is written
+    /// as `not_judged` to keep an outage out of the pass rate.
     ///
     /// Two faces, written together. The in-process cell is the realtime one a
     /// panel scrapes, and it is written under a synchronous lock for the same
-    /// reason as the verdict counter: a dropped count would read as reviews
-    /// that were run, and the calls they cost, coming back. The durable ledger
-    /// is the other half of the spend account — the saving survives the process
-    /// that made it, so a window with no spend can be read as a decision rather
-    /// than as a hole. Both carry the same `stage` and `reason`, so they name
+    /// reason as the model's: a dropped count would read as reviews that were
+    /// run, and the calls they cost, coming back. The durable ledger is the
+    /// other half of the spend account — the saving survives the process that
+    /// made it, so a window with no spend can be read as a decision rather than
+    /// as a hole. Both carry the same `stage` and the same word, so they name
     /// one cell read on two clocks.
     ///
     /// The reason is a `&'static str` rather than free text: it is a cell of a
     /// closed vocabulary, and a value built at run time could open a cell no
     /// reader was ever told about while looking exactly like a reason that
     /// stopped happening.
-    pub async fn record_self_review_skip(&self, stage: &str, reason: &'static str) {
+    pub async fn record_self_review_settled_without_a_call(
+        &self,
+        stage: &str,
+        reason: &'static str,
+    ) {
+        let verdict = if reason == SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE {
+            SELF_REVIEW_VERDICT_NOT_JUDGED
+        } else {
+            SELF_REVIEW_VERDICT_PASS
+        };
         {
             let mut map = self
-                .self_review_skips
+                .self_review_verdicts
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *map.entry((stage.to_string(), reason.to_string()))
-                .or_insert(0) += 1;
+            *map.entry((
+                stage.to_string(),
+                SELF_REVIEW_CRITERIA_NOT_ASKED.to_string(),
+                verdict.to_string(),
+                reason.to_string(),
+            ))
+            .or_insert(0) += 1;
         }
         let Some(sink) = self.skip_sink.get() else {
             if !self
@@ -1097,24 +1138,13 @@ impl Observable for CollaborationObservable {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            for ((stage, criteria, verdict), count) in reviews.iter() {
+            for ((stage, criteria, verdict, decided_by), count) in reviews.iter() {
                 metrics.push(
                     RawMetric::new("self_review_verdict_total", *count as f64)
                         .with_label(crate::LABEL_STAGE, stage)
                         .with_label(crate::LABEL_CRITERIA, criteria)
-                        .with_label(crate::LABEL_VERDICT, verdict),
-                );
-            }
-            let skips = self
-                .self_review_skips
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .clone();
-            for ((stage, reason), count) in skips.iter() {
-                metrics.push(
-                    RawMetric::new("self_review_skipped_total", *count as f64)
-                        .with_label(crate::LABEL_STAGE, stage)
-                        .with_label(crate::LABEL_REASON, reason),
+                        .with_label(crate::LABEL_VERDICT, verdict)
+                        .with_label(crate::LABEL_DECIDED_BY, decided_by),
                 );
             }
 
@@ -1543,21 +1573,99 @@ mod tests {
             .filter(|m| m.name == "self_review_verdict_total")
             .collect();
         assert_eq!(reviews.len(), 2);
-        let cell = |stage: &str, criteria: &str, verdict: &str| {
+        let cell = |stage: &str, criteria: &str, verdict: &str, decided_by: &str| {
             reviews
                 .iter()
                 .find(|m| {
                     m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
                         && m.labels.get(crate::LABEL_CRITERIA).map(String::as_str) == Some(criteria)
                         && m.labels.get(crate::LABEL_VERDICT).map(String::as_str) == Some(verdict)
+                        && m.labels.get(crate::LABEL_DECIDED_BY).map(String::as_str)
+                            == Some(decided_by)
                 })
                 .map(|m| m.value)
-                .unwrap_or_else(|| panic!("{stage}/{criteria}/{verdict} is reported"))
+                .unwrap_or_else(|| panic!("{stage}/{criteria}/{verdict}/{decided_by} is reported"))
         };
-        assert_eq!(cell("planner", SELF_REVIEW_CRITERIA_DECLARED, "pass"), 1.0);
         assert_eq!(
-            cell("moderator", SELF_REVIEW_CRITERIA_ABSENT, "need_revision"),
+            cell(
+                "planner",
+                SELF_REVIEW_CRITERIA_DECLARED,
+                "pass",
+                SELF_REVIEW_DECIDED_BY_MODEL
+            ),
             1.0
+        );
+        assert_eq!(
+            cell(
+                "moderator",
+                SELF_REVIEW_CRITERIA_ABSENT,
+                "need_revision",
+                SELF_REVIEW_DECIDED_BY_MODEL
+            ),
+            1.0
+        );
+    }
+
+    /// 不审即过也是自审下的一格判定，而「上游没接住」不是过。
+    ///
+    /// 两件事钉在同一个族里：读「自审判了多少笔」的那张面板只要求一次 sum，
+    /// 不必记得再去找第二族；而通过率用 `decided_by="model"` 取，上游挂掉的
+    /// 那一小时因此不会把通过率抬起来——读数在系统更坏时变好的那种错法。
+    #[tokio::test]
+    async fn a_pass_settled_without_a_call_is_the_same_family_and_an_outage_is_not_a_pass() {
+        let obs = CollaborationObservable::new();
+        obs.record_self_review_settled_without_a_call(
+            "planner",
+            SELF_REVIEW_DECIDED_BY_PROGRAM_JUDGED,
+        )
+        .await;
+        obs.record_self_review_settled_without_a_call(
+            "generator",
+            SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,
+        )
+        .await;
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let verdict_of = |stage: &str| -> (String, String) {
+            let row = metrics
+                .iter()
+                .find(|m| {
+                    m.name == "self_review_verdict_total"
+                        && m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
+                })
+                .unwrap_or_else(|| panic!("{stage} has a verdict row"));
+            assert_eq!(
+                row.labels.get(crate::LABEL_CRITERIA).map(String::as_str),
+                Some(SELF_REVIEW_CRITERIA_NOT_ASKED),
+                "no model was asked, so no standard was applied"
+            );
+            (
+                row.labels
+                    .get(crate::LABEL_VERDICT)
+                    .cloned()
+                    .unwrap_or_default(),
+                row.labels
+                    .get(crate::LABEL_DECIDED_BY)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        };
+
+        assert_eq!(
+            verdict_of("planner"),
+            (
+                SELF_REVIEW_VERDICT_PASS.to_string(),
+                SELF_REVIEW_DECIDED_BY_PROGRAM_JUDGED.to_string()
+            ),
+            "the gate decided this artifact goes through, and says who decided"
+        );
+        assert_eq!(
+            verdict_of("generator"),
+            (
+                SELF_REVIEW_VERDICT_NOT_JUDGED.to_string(),
+                SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE.to_string()
+            ),
+            "nothing was produced, so nothing passed: an outage must not read as quality"
         );
     }
 

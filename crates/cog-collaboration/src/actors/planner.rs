@@ -382,17 +382,15 @@ impl PlannerActor {
         //
         // 第三种：调用方自己会用程序判据判这份计划（分解循环就是这样，判词还会
         // 回到下一轮）。那时自审是给同一个产物买第二个判官，理由同样具名。
-        let review_basis = if output.is_terminal_env_failure() {
-            crate::actors::ReviewBasis::Skipped(
-                crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
-            )
-        } else if is_self_evolution {
-            crate::actors::ReviewBasis::Skipped(crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION)
-        } else if program_judged {
-            crate::actors::ReviewBasis::Skipped(crate::observable::SELF_REVIEW_SKIP_PROGRAM_JUDGED)
-        } else {
-            crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[]))
-        };
+        let review_basis = crate::actors::review_basis(
+            task,
+            crate::actors::ReviewFacts {
+                upstream_failed: output.is_terminal_env_failure(),
+                self_evolution: is_self_evolution,
+                program_judged,
+            },
+            &[],
+        );
         if let Some(revised) = crate::actors::maybe_self_review(
             self.agent.as_ref(),
             &self.self_review,

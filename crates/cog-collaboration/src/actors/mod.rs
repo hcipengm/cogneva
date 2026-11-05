@@ -156,34 +156,82 @@ pub(crate) fn review_spec(task: &cog_core::Task, declared: &[&str]) -> String {
     }
 }
 
-/// Count a review that was not run, for call sites that stop before the funnel.
+/// What the caller knows about this output that bears on whether a review of it
+/// is worth buying.
+///
+/// The first stage of a self-review is not the model: it is this program. A
+/// stage whose upstream never answered, a change the evolution loop judges by
+/// its own deterministic validation, and a plan the caller is about to judge
+/// with a structural gate are all cases where a review would be a second answer
+/// to a question that already has one. Those are decided here, once, for every
+/// actor — five call sites each spelling the ladder out for themselves is five
+/// places for the rules to drift apart, and they already had.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReviewFacts {
+    /// The actor never reached its upstream, so the output is a placeholder.
+    pub upstream_failed: bool,
+    /// The work is a self-evolution change, judged by the validation, not read.
+    pub self_evolution: bool,
+    /// The caller holds a program verdict on this output already.
+    pub program_judged: bool,
+}
+
+/// Whether this output is reviewed, and what a review of it would be held to.
+///
+/// The whole of stage two of a self-review: every actor reaches it with the same
+/// three facts and gets the same answer, so "which stages are reviewed" is one
+/// table a reader can check rather than a ladder per actor. Only when none of
+/// the facts holds does this return [`ReviewBasis::HeldTo`], and only that arm
+/// costs a model call.
+pub(crate) fn review_basis(
+    task: &cog_core::Task,
+    facts: ReviewFacts,
+    declared: &[&str],
+) -> ReviewBasis {
+    if facts.upstream_failed {
+        ReviewBasis::Passed(crate::observable::SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE)
+    } else if facts.self_evolution {
+        ReviewBasis::Passed(crate::observable::SELF_REVIEW_DECIDED_BY_SELF_EVOLUTION)
+    } else if facts.program_judged {
+        ReviewBasis::Passed(crate::observable::SELF_REVIEW_DECIDED_BY_PROGRAM_JUDGED)
+    } else {
+        ReviewBasis::HeldTo(review_spec(task, declared))
+    }
+}
+
+/// Record a verdict settled without a call, for call sites that stop before the
+/// funnel.
 ///
 /// An actor that returns early — a self-evolution evaluation whose verdict is
 /// already deterministic, for instance — never reaches [`maybe_self_review`],
 /// and the calls it saved would otherwise be indistinguishable from a stage
 /// that stopped being reached at all.
-pub(crate) async fn note_self_review_skip(stage: &str, reason: &'static str) {
+pub(crate) async fn note_self_review_settled_without_a_call(stage: &str, reason: &'static str) {
     crate::observable::global_observable()
-        .record_self_review_skip(stage, reason)
+        .record_self_review_settled_without_a_call(stage, reason)
         .await;
 }
 
-/// What a review of an actor's output would be held to, or why it is not run
-/// at all.
+/// What a review of an actor's output would be held to, or who settled it
+/// without one.
+///
+/// Both arms are outcomes of the same gate, not "reviewed" and "not reviewed":
+/// the second is the pass the fixed program reached before any call was made,
+/// and the word it carries is published as `decided_by`.
 pub(crate) enum ReviewBasis {
     /// The actor's own output, held to what it was asked to satisfy (see
     /// [`review_spec`]).
     HeldTo(String),
-    /// No review of this output, for the stated reason from
-    /// [`crate::observable`]'s skip vocabulary.
+    /// No call: this program settled the artifact, for the stated reason from
+    /// [`crate::observable`]'s decided-by vocabulary.
     ///
     /// The two common reasons are an actor that never reached its upstream —
     /// what the funnel was handed is a placeholder, and reviewing it would buy
     /// two calls for the same unavailable upstream while a revision of a
     /// placeholder replaces a real cause with a plausible-looking answer — and
     /// a stage whose output is deliberately outside the review's remit. Both
-    /// are savings, so both are counted where the review would have been.
-    Skipped(&'static str),
+    /// are settled here, so both are counted where the review would have been.
+    Passed(&'static str),
 }
 
 /// Optional self-review helper shared by all actors.
@@ -196,10 +244,11 @@ pub(crate) enum ReviewBasis {
 /// rewritten text.
 ///
 /// The basis is taken only when the configuration declares no specification of
-/// its own. Either way the outcome is counted on the metric plane — the verdict
-/// when a review ran, the skip and its reason when one did not — so a stage
-/// reviewing with nothing but its own output to compare against, and a stage
-/// that was not reviewed at all, are readings rather than assumptions.
+/// its own. Either way a verdict is counted on the metric plane — the model's
+/// when a review ran, this program's pass and the word that settled it when one
+/// did not — so a stage reviewing with nothing but its own output to compare
+/// against, and a stage the program already settled, are readings rather than
+/// assumptions.
 pub(crate) async fn maybe_self_review(
     agent: &dyn cog_core::Agent,
     config: &Option<cog_core::SelfReviewConfig>,
@@ -211,14 +260,19 @@ pub(crate) async fn maybe_self_review(
     let observable = crate::observable::global_observable();
     let Some(config) = config.as_ref() else {
         observable
-            .record_self_review_skip(agent_kind, crate::observable::SELF_REVIEW_SKIP_DISABLED)
+            .record_self_review_settled_without_a_call(
+                agent_kind,
+                crate::observable::SELF_REVIEW_DECIDED_BY_DISABLED,
+            )
             .await;
         return None;
     };
     let spec = match basis {
         ReviewBasis::HeldTo(spec) => spec,
-        ReviewBasis::Skipped(reason) => {
-            observable.record_self_review_skip(agent_kind, reason).await;
+        ReviewBasis::Passed(reason) => {
+            observable
+                .record_self_review_settled_without_a_call(agent_kind, reason)
+                .await;
             return None;
         }
     };
@@ -349,11 +403,17 @@ pub(crate) fn validate_against_schema(
 
 #[cfg(test)]
 mod tests {
-    use super::{actor_input, maybe_self_review, review_spec, validate_against_schema};
+    use super::{
+        actor_input, maybe_self_review, review_basis, review_spec, validate_against_schema,
+        ReviewBasis, ReviewFacts,
+    };
     use crate::observable::{
         global_observable, SELF_REVIEW_CRITERIA_ABSENT, SELF_REVIEW_CRITERIA_DECLARED,
-        SELF_REVIEW_SKIP_DISABLED, SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
-        SELF_REVIEW_VERDICT_NEED_REVISION, SELF_REVIEW_VERDICT_PASS,
+        SELF_REVIEW_CRITERIA_NOT_ASKED, SELF_REVIEW_DECIDED_BY_DISABLED,
+        SELF_REVIEW_DECIDED_BY_MODEL, SELF_REVIEW_DECIDED_BY_PROGRAM_JUDGED,
+        SELF_REVIEW_DECIDED_BY_SELF_EVOLUTION, SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,
+        SELF_REVIEW_VERDICT_NEED_REVISION, SELF_REVIEW_VERDICT_NOT_JUDGED,
+        SELF_REVIEW_VERDICT_PASS,
     };
     use cog_core::observability::Observable;
     use std::sync::{Arc, Mutex};
@@ -448,10 +508,10 @@ mod tests {
         format!("{role} ({case}; own stage)")
     }
 
-    /// What one cell of the review counter reads. The stage has to be one the
+    /// What one cell of the verdict counter reads. The stage has to be one the
     /// caller owns (see [`own_stage`]): an exact count of a cell that other
     /// tests also write is a count of what they wrote.
-    async fn cell(stage: &str, criteria: &str, verdict: &str) -> f64 {
+    async fn cell(stage: &str, criteria: &str, verdict: &str, decided_by: &str) -> f64 {
         global_observable()
             .collect_metrics("D8")
             .await
@@ -462,23 +522,26 @@ mod tests {
                     && m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
                     && m.labels.get(crate::LABEL_CRITERIA).map(String::as_str) == Some(criteria)
                     && m.labels.get(crate::LABEL_VERDICT).map(String::as_str) == Some(verdict)
+                    && m.labels.get(crate::LABEL_DECIDED_BY).map(String::as_str) == Some(decided_by)
             })
             .map(|m| m.value)
             .unwrap_or(0.0)
     }
 
-    /// What one cell of the skip counter reads, on the same terms as [`cell`]:
-    /// the stage has to be one the caller owns.
-    async fn skip_cell(stage: &str, reason: &str) -> f64 {
+    /// What one verdict the program settled reads, on the same terms as
+    /// [`cell`]: the stage has to be one the caller owns. Matched on who decided
+    /// rather than on the verdict, so the assertion is about the saving and not
+    /// about which word the outcome happened to land on.
+    async fn settled_cell(stage: &str, decided_by: &str) -> f64 {
         global_observable()
             .collect_metrics("D8")
             .await
             .unwrap()
             .iter()
             .find(|m| {
-                m.name == "self_review_skipped_total"
+                m.name == "self_review_verdict_total"
                     && m.labels.get(crate::LABEL_STAGE).map(String::as_str) == Some(stage)
-                    && m.labels.get("reason").map(String::as_str) == Some(reason)
+                    && m.labels.get(crate::LABEL_DECIDED_BY).map(String::as_str) == Some(decided_by)
             })
             .map(|m| m.value)
             .unwrap_or(0.0)
@@ -648,6 +711,7 @@ mod tests {
             &stage,
             SELF_REVIEW_CRITERIA_DECLARED,
             SELF_REVIEW_VERDICT_PASS,
+            SELF_REVIEW_DECIDED_BY_MODEL,
         )
         .await;
 
@@ -675,7 +739,8 @@ mod tests {
             cell(
                 &stage,
                 SELF_REVIEW_CRITERIA_DECLARED,
-                SELF_REVIEW_VERDICT_PASS
+                SELF_REVIEW_VERDICT_PASS,
+                SELF_REVIEW_DECIDED_BY_MODEL,
             )
             .await,
             before + 1.0,
@@ -723,6 +788,7 @@ mod tests {
             &stage,
             SELF_REVIEW_CRITERIA_ABSENT,
             SELF_REVIEW_VERDICT_NEED_REVISION,
+            SELF_REVIEW_DECIDED_BY_MODEL,
         )
         .await;
 
@@ -744,7 +810,8 @@ mod tests {
             cell(
                 &stage,
                 SELF_REVIEW_CRITERIA_ABSENT,
-                SELF_REVIEW_VERDICT_NEED_REVISION
+                SELF_REVIEW_VERDICT_NEED_REVISION,
+                SELF_REVIEW_DECIDED_BY_MODEL,
             )
             .await,
             before + 1.0,
@@ -872,19 +939,19 @@ mod tests {
     /// deliverable. The two calls a review would spend would go to the same
     /// unavailable upstream, and a revision of a placeholder replaces a real
     /// cause with a plausible-looking answer — so no review is run, and the
-    /// calls it saved are counted rather than silently skipped.
+    /// calls it saved are counted rather than silently passed over.
     #[tokio::test]
     async fn a_placeholder_is_not_reviewed_and_the_calls_it_saved_are_counted() {
         let (agent, seen) = ReviewRecorder::recording(true);
         let stage = own_stage("evaluator", "placeholder");
-        let before = skip_cell(&stage, SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE).await;
+        let before = settled_cell(&stage, SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE).await;
 
         let revised = maybe_self_review(
             agent.as_ref(),
             &Some(cog_core::SelfReviewConfig::default()),
             "{\"verdict\":\"Fail\"}",
             &stage,
-            crate::actors::ReviewBasis::Skipped(SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE),
+            crate::actors::ReviewBasis::Passed(SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE),
             "t-1",
         )
         .await;
@@ -898,18 +965,30 @@ mod tests {
             "no LLM call is bought for an upstream that just failed"
         );
         assert_eq!(
-            skip_cell(&stage, SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE).await,
+            settled_cell(&stage, SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE).await,
             before + 1.0
+        );
+        assert_eq!(
+            cell(
+                &stage,
+                SELF_REVIEW_CRITERIA_NOT_ASKED,
+                SELF_REVIEW_VERDICT_NOT_JUDGED,
+                SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,
+            )
+            .await,
+            before + 1.0,
+            "an outage is not a pass: counted as one it would make the pass rate rise \
+             exactly in the hour the upstream was down"
         );
     }
 
     /// A stage with reviews turned off is a saving too, and reads as its own
-    /// reason: it was not a gate that objected.
+    /// decided-by: it was not a gate that objected.
     #[tokio::test]
-    async fn a_stage_with_reviews_disabled_reports_the_skip_it_is() {
+    async fn a_stage_with_reviews_disabled_is_counted_as_passing_without_a_call() {
         let (agent, seen) = ReviewRecorder::recording(true);
         let stage = own_stage("moderator", "reviews off");
-        let before = skip_cell(&stage, SELF_REVIEW_SKIP_DISABLED).await;
+        let before = settled_cell(&stage, SELF_REVIEW_DECIDED_BY_DISABLED).await;
 
         let revised = maybe_self_review(
             agent.as_ref(),
@@ -924,7 +1003,7 @@ mod tests {
         assert!(revised.is_none());
         assert!(seen.lock().unwrap().is_empty());
         assert_eq!(
-            skip_cell(&stage, SELF_REVIEW_SKIP_DISABLED).await,
+            settled_cell(&stage, SELF_REVIEW_DECIDED_BY_DISABLED).await,
             before + 1.0
         );
     }
@@ -946,6 +1025,67 @@ mod tests {
             "",
             "a task that declares nothing leaves the specification empty"
         );
+    }
+
+    /// 这一笔过不过，是 self-review 自己的第一段判决，不是各位员工各自拍的。
+    /// 三个事实里任何一个成立，程序就已经下得了「过」；三个都不成立才轮到
+    /// 模型。这条表是那一段的全部：改了这里的顺序或条件，五处调用会一起变，
+    /// 所以它必须钉在一处。
+    #[test]
+    fn the_review_gate_is_one_table_for_every_actor() {
+        let mut task = task_with_goal("ship it");
+        task.acceptance = vec!["no rollback step".to_string()];
+
+        let cases = [
+            (
+                ReviewFacts {
+                    upstream_failed: true,
+                    ..Default::default()
+                },
+                SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,
+            ),
+            (
+                ReviewFacts {
+                    self_evolution: true,
+                    ..Default::default()
+                },
+                SELF_REVIEW_DECIDED_BY_SELF_EVOLUTION,
+            ),
+            (
+                ReviewFacts {
+                    program_judged: true,
+                    ..Default::default()
+                },
+                SELF_REVIEW_DECIDED_BY_PROGRAM_JUDGED,
+            ),
+            // 上游没接住优先于另外两条：产物是占位符时，另外两个理由描述的
+            // 是一件根本没发生的事，读数里挂着它们会点错方向。
+            (
+                ReviewFacts {
+                    upstream_failed: true,
+                    self_evolution: true,
+                    program_judged: true,
+                },
+                SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,
+            ),
+        ];
+        for (facts, reason) in cases {
+            match review_basis(&task, facts, &[]) {
+                ReviewBasis::Passed(held) => assert_eq!(held, reason, "{facts:?}"),
+                ReviewBasis::HeldTo(spec) => {
+                    panic!("{facts:?} should have concluded a pass, not bought a review: {spec}")
+                }
+            }
+        }
+
+        // 一个事实都不成立：这一笔才真的进模型，规格是任务自己写下的话。
+        match review_basis(&task, ReviewFacts::default(), &[]) {
+            ReviewBasis::HeldTo(spec) => assert_eq!(
+                spec, "ship it\n\nAcceptance criteria: no rollback step",
+                "the review is held to what the task itself declared"
+            ),
+            ReviewBasis::Passed(reason) => panic!("nothing holds, yet it passed by {reason}"),
+        }
     }
 
     /// 提交方自己写的「怎样算完」必须进规格：评审表每一行都要引一句规格里的

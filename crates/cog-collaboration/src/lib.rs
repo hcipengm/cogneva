@@ -4,7 +4,7 @@
 //!
 //! 一个产物只买一个判官：调用方自己会用程序判据判的东西，产它的 actor 不再向
 //! 模型买一次改写式的自审。分解循环就是这一条（`judge_plan` 逐条读计划，判词
-//! 回到下一轮），省下的调用记在 `observable::SELF_REVIEW_SKIP_PROGRAM_JUDGED`
+//! 回到下一轮），省下的调用记在 `observable::SELF_REVIEW_DECIDED_BY_PROGRAM_JUDGED`
 //! 这一格上，于是「省了」与「根本没接上」在读数上不同形。反过来，没有哪个调用
 //! 方可以因为「下游还有一道门」就省掉自己该判的那一步：这一条说的是同一个产物
 //! 上的重复判断，不是把判断推给别人。
@@ -52,6 +52,10 @@ pub const LABEL_CRITERIA: &str = "criteria";
 
 /// 读数按「这一格给出什么结局」归属时用的标签键。
 pub const LABEL_VERDICT: &str = "verdict";
+
+/// 读数按「这个判决是谁下的」归属时用的标签键：模型，还是花调用之前就已经
+/// 下得了结论的那段固定程序。
+pub const LABEL_DECIDED_BY: &str = "decided_by";
 
 /// 读数按「用哪种模式跑」归属时用的标签键。
 pub const LABEL_MODE: &str = "mode";

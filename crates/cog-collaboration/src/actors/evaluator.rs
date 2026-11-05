@@ -121,9 +121,9 @@ impl EvaluatorActor {
             // question, and a model asked it again would add a second, less
             // reliable answer. Counted, so the calls this early return saves are
             // a reading rather than an absence.
-            crate::actors::note_self_review_skip(
+            crate::actors::note_self_review_settled_without_a_call(
                 cog_core::roles::EVALUATOR,
-                crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION,
+                crate::observable::SELF_REVIEW_DECIDED_BY_SELF_EVOLUTION,
             )
             .await;
             let _ = output_str;
@@ -206,13 +206,14 @@ impl EvaluatorActor {
                 // own payload names a deterministic cause is a budget the loop
                 // spent, not a judgement — the roundtable already stops on it —
                 // so a self-review here would be grading the absence of a verdict.
-                let basis = if output.is_terminal_env_failure() {
-                    crate::actors::ReviewBasis::Skipped(
-                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
-                    )
-                } else {
-                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, criteria))
-                };
+                let basis = crate::actors::review_basis(
+                    task,
+                    crate::actors::ReviewFacts {
+                        upstream_failed: output.is_terminal_env_failure(),
+                        ..Default::default()
+                    },
+                    criteria,
+                );
                 (output, basis)
             }
             Err(e) => {
@@ -225,8 +226,8 @@ impl EvaluatorActor {
                         criteria: Vec::new(),
                         details: None,
                     },
-                    crate::actors::ReviewBasis::Skipped(
-                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    crate::actors::ReviewBasis::Passed(
+                        crate::observable::SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,
                     ),
                 )
             }

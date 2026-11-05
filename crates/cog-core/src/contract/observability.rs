@@ -817,9 +817,10 @@ pub trait LlmUsageReader: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LlmSkipRecord {
     /// The stage whose calls were saved, named by the call site itself. It is
-    /// the same string the realtime `self_review_skipped_total` series labels
-    /// `stage` with, so the durable record and the live series name one cell
-    /// rather than two that have to be matched up by hand.
+    /// the same string the realtime `self_review_verdict_total` series labels
+    /// `stage` with, and `reason` is that series' `decided_by`, so the durable
+    /// record and the live series name one cell rather than two that have to be
+    /// matched up by hand.
     pub stage: String,
     /// Why the call was not made, from the call site's own closed set of
     /// reasons. A `&'static str` rather than a `String` on purpose: the reason

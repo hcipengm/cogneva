@@ -26,7 +26,8 @@
 //!
 //! What it cannot judge, in the open: a stage passed as a variable rather than
 //! a literal is invisible to a text census, and so is a call site that reaches
-//! `record_self_review_skip` with a name built at run time. Both are readable
+//! `record_self_review_settled_without_a_call` with a name built at run time.
+//! Both are readable
 //! only at run time, as the loop's own warning about an undeclared stage, and
 //! the reader for that is the log rather than this test. Same division as the
 //! actor-label census: the text bounds the vocabulary, the runtime reading
@@ -53,7 +54,7 @@ use cog_observability::spend_verdict::{
 /// what the stage means in each: one names the stage whose calls were saved,
 /// the other names the stage whose output is being reviewed.
 const STAGE_ARGUMENTS: &[(&str, usize)] = &[
-    ("note_self_review_skip(", 0),
+    ("note_self_review_settled_without_a_call(", 0),
     ("crate::actors::maybe_self_review(", 3),
 ];
 
@@ -365,12 +366,12 @@ fn the_census_reports_an_actor_no_roster_entry_covers() {
 #[test]
 fn the_stage_reader_recognises_the_call_shape() {
     let sample = r#"
-        crate::actors::note_self_review_skip(
+        crate::actors::note_self_review_settled_without_a_call(
             "planner",
-            crate::observable::SELF_REVIEW_SKIP_DISABLED,
+            crate::observable::SELF_REVIEW_DECIDED_BY_DISABLED,
         )
     "#;
-    let found = call_arguments(sample, "note_self_review_skip(");
+    let found = call_arguments(sample, "note_self_review_settled_without_a_call(");
     assert_eq!(found.len(), 1);
     assert_eq!(found[0][0], "\"planner\"");
 

@@ -12,12 +12,13 @@
 //! reads as "this never happened". The two tables are joined by (stage, window)
 //! at the reading end, which is what keeps a saving a saving.
 //!
-//! **It is not the realtime metric either.** `self_review_skipped_total` is the
+//! **It is not the realtime metric either.** `self_review_verdict_total` is the
 //! in-process face a panel scrapes; it starts over at zero on every rollout and
 //! is dropped with the scrape retention, so a question asked after a restart
-//! ("was this review ever skipped last week, or did the call site go away")
-//! cannot be answered from it. The two faces carry the same `stage` label on
-//! purpose: they name one cell of the account, read on two clocks.
+//! ("was this review ever settled last week, or did the call site go away")
+//! cannot be answered from it. The two faces carry the same `stage` label and
+//! the same word (`reason` here, `decided_by` there) on purpose: they name one
+//! cell of the account, read on two clocks.
 //!
 //! Written by whichever process makes the decision (`cog-collaboration`, today
 //! the main application), read by the verdict fold, which joins it against the

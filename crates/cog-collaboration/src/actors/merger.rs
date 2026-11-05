@@ -119,15 +119,22 @@ impl MergerActor {
                 }
                 (
                     parse_merge_result(&result, branches),
-                    crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[])),
+                    crate::actors::review_basis(
+                        task,
+                        crate::actors::ReviewFacts {
+                            self_evolution: task.is_self_evolution(),
+                            ..Default::default()
+                        },
+                        &[],
+                    ),
                 )
             }
             Err(e) => {
                 tracing::warn!("Merger prompt failed: {}", e);
                 (
                     fallback_best_branch(branches),
-                    crate::actors::ReviewBasis::Skipped(
-                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    crate::actors::ReviewBasis::Passed(
+                        crate::observable::SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,
                     ),
                 )
             }

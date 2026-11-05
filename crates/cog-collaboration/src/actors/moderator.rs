@@ -182,21 +182,22 @@ impl ModeratorActor {
                     // 之前已经被解析成结构体，改写只能重写解析器已经接受过的散文，
                     // 而推理型模型会退回自然语言、把改写步挂满整个超时。跳过用同一个
                     // 具名理由，省下的调用因此是读数而不是缺席。
-                    if task.is_self_evolution() {
-                        crate::actors::ReviewBasis::Skipped(
-                            crate::observable::SELF_REVIEW_SKIP_SELF_EVOLUTION,
-                        )
-                    } else {
-                        crate::actors::ReviewBasis::HeldTo(crate::actors::review_spec(task, &[]))
-                    },
+                    crate::actors::review_basis(
+                        task,
+                        crate::actors::ReviewFacts {
+                            self_evolution: task.is_self_evolution(),
+                            ..Default::default()
+                        },
+                        &[],
+                    ),
                 )
             }
             Err(e) => {
                 tracing::warn!("Moderator prompt failed: {}", e);
                 (
                     ModeratorOutput::default(),
-                    crate::actors::ReviewBasis::Skipped(
-                        crate::observable::SELF_REVIEW_SKIP_UPSTREAM_UNAVAILABLE,
+                    crate::actors::ReviewBasis::Passed(
+                        crate::observable::SELF_REVIEW_DECIDED_BY_UPSTREAM_UNAVAILABLE,
                     ),
                 )
             }

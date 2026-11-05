@@ -1868,7 +1868,7 @@ mod tests {
         let planner = PlannerActor::new(scripted.clone())
             .with_self_review(cog_core::SelfReviewConfig::default());
 
-        let before = planner_review_skips().await;
+        let before = planner_reviews_the_gate_settled().await;
 
         let verdict = ralph
             .run_plan("decompose the goal", serde_json::json!({}), &planner)
@@ -1887,14 +1887,14 @@ mod tests {
             "a review was bought for a plan the loop already judges"
         );
         assert!(
-            planner_review_skips().await >= before + 2.0,
-            "the two skipped reviews have to be counted under their own reason"
+            planner_reviews_the_gate_settled().await >= before + 2.0,
+            "the two passes the program settled have to be counted under their own decided-by"
         );
     }
 
-    /// 本进程里 planner 的「由程序判据判过」跳过数。读的是差值，所以同一进程
+    /// 本进程里 planner 的「由程序判据判过」的通过数。读的是差值，所以同一进程
     /// 里别的用例写这一格不影响结论。
-    async fn planner_review_skips() -> f64 {
+    async fn planner_reviews_the_gate_settled() -> f64 {
         use cog_core::observability::Observable;
         crate::observable::global_observable()
             .collect_metrics("D8")
@@ -1902,11 +1902,11 @@ mod tests {
             .unwrap()
             .iter()
             .find(|m| {
-                m.name == "self_review_skipped_total"
+                m.name == "self_review_verdict_total"
                     && m.labels.get(crate::LABEL_STAGE).map(String::as_str)
                         == Some(cog_core::roles::PLANNER)
-                    && m.labels.get("reason").map(String::as_str)
-                        == Some(crate::observable::SELF_REVIEW_SKIP_PROGRAM_JUDGED)
+                    && m.labels.get(crate::LABEL_DECIDED_BY).map(String::as_str)
+                        == Some(crate::observable::SELF_REVIEW_DECIDED_BY_PROGRAM_JUDGED)
             })
             .map(|m| m.value)
             .unwrap_or(0.0)
