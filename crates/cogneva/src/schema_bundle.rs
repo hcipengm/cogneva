@@ -179,6 +179,37 @@ mod tests {
         );
     }
 
+    /// The statements a start cannot be talked out of are the ones it must not
+    /// be talked out of: a conditional block or a row repair, which do their
+    /// work once, not a DDL shape the guard happens not to recognise -- that
+    /// one is sent on every start, and its lock is taken on every start.
+    ///
+    /// Measured 2026-11-06: one opaque `DO` block in this text kept the whole
+    /// batch running, and an incoming replica never started it -- it waited on
+    /// `cog_dag_tasks` behind a `SELECT` that had been running for ninety
+    /// minutes, for columns that had been there for months. The per-statement
+    /// guard fixed that; this test is what stops the next unreadable DDL from
+    /// re-arming it, because the fix then is one line here rather than a
+    /// revision reported as undeployable.
+    #[test]
+    fn the_state_backends_startup_batch_is_opaque_only_where_it_must_be() {
+        let opaque = cog_storage::schema_ddl::statements_the_guard_cannot_read(
+            cog_storage::postgres::state_backend::DDL,
+        )
+        .expect("the runner splits this text with the same splitter");
+        assert_eq!(
+            opaque.len(),
+            1,
+            "a start re-sends every statement the guard cannot read: {opaque:#?}"
+        );
+        assert!(
+            opaque[0].trim_start().starts_with("DO $$"),
+            "the one that may stay opaque is the conditional rename, which is a \
+             no-op once the column has been renamed: {:.120}",
+            opaque[0]
+        );
+    }
+
     /// Gluing in a text that ends mid-statement makes the *next* statement
     /// the one the error names, so the boundary is checked here rather than
     /// left to be rediscovered from a syntax error pointing at the wrong line.

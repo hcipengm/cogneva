@@ -53,18 +53,25 @@
 //!
 //! So the wait is not where the steady state should live. Every statement this
 //! module can prove is already in the catalog is dropped before the batch is
-//! sent: [`already_in_effect`] reads the text, keeps only the shapes whose
-//! effect is a catalog fact (`CREATE TABLE IF NOT EXISTS`,
+//! sent: [`outstanding`] splits the text, keeps only the shapes whose effect is
+//! a catalog fact (`CREATE TABLE IF NOT EXISTS`,
 //! `CREATE INDEX IF NOT EXISTS`, `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`,
-//! `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL`), and answers whether every
-//! one of them already holds. A text holding anything else -- a statement whose
-//! effect is rows rather than catalog, a shape this cannot read, a body it
-//! cannot split -- is run as it always was, unread.
+//! `ALTER TABLE ... ALTER COLUMN ... SET NOT NULL`), and drops each of those
+//! the catalog already satisfies.
+//!
+//! What is left is sent: a statement whose effect is rows rather than catalog,
+//! a shape this cannot read, and -- when the text cannot be split at all -- the
+//! whole text. The unit of that answer is the statement, not the text, and the
+//! difference was measured: a text of catalog facts with one `DO` block in it
+//! re-armed every lock in it on every start, because the block made the guard
+//! answer "run it" for the whole batch. An incoming replica then could not
+//! start behind one long `SELECT` on a table whose columns had been there for
+//! months.
 //!
 //! The guard only ever removes work. It cannot skip a statement that would have
-//! changed something: a check it cannot evaluate makes the whole text run, and
-//! the shapes it does read are the ones PostgreSQL itself defines as no-ops
-//! when the object is there.
+//! changed something: a check it cannot evaluate keeps that statement, and the
+//! shapes it does read are the ones PostgreSQL itself defines as no-ops when
+//! the object is there.
 
 use cog_core::{SFError, SFResult};
 use sqlx::PgPool;
@@ -212,14 +219,28 @@ fn mark(tag: &str) -> String {
 /// lock wait would still be holding every lock the earlier statements took,
 /// and there would be no point at which they could be released.
 pub async fn apply(pool: &PgPool, schema: &str) -> SFResult<()> {
-    // Before anything asks for a lock: is there anything left to do? The
-    // common start is a table that already has every column and index the text
-    // names, and there the honest cost of the batch is zero -- asking for
-    // ACCESS EXCLUSIVE to find that out is what put the outgoing replica's
-    // readers at the back of a queue behind a statement with no work to do.
-    if already_in_effect(pool, schema).await {
-        return Ok(());
-    }
+    // Before anything asks for a lock: what is there left to do? The common
+    // start is a table that already has every column and index the text names,
+    // and there the honest cost of the batch is zero -- asking for ACCESS
+    // EXCLUSIVE to find that out is what put the outgoing replica's readers at
+    // the back of a queue behind a statement with no work to do.
+    //
+    // The answer is per statement, and it has to be: a text that is mostly
+    // catalog facts plus one statement nothing can answer for -- today the
+    // `DO $$ ... RENAME COLUMN ... $$` beside the promotions table -- used to
+    // be sent whole, which armed an ACCESS EXCLUSIVE on every table in it on
+    // every start. Measured 2026-11-06: an incoming replica never started,
+    // because that batch waited on `cog_dag_tasks` while every column those
+    // `ALTER`s name had been there for months -- the only thing holding the
+    // table was one `SELECT` that had been running for ninety minutes. The pod
+    // was killed on its startup probe with that as its only symptom, and the
+    // deploy reported a revision that was fine as undeployable.
+    let schema: std::borrow::Cow<'_, str> = match outstanding(pool, schema).await {
+        Some(rest) if rest.trim().is_empty() => return Ok(()),
+        Some(rest) => std::borrow::Cow::Owned(rest),
+        None => std::borrow::Cow::Borrowed(schema),
+    };
+    let schema = schema.as_ref();
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -343,30 +364,123 @@ pub async fn apply_all(pool: &PgPool, schemas: &[&str]) -> SFResult<()> {
     Ok(())
 }
 
-/// Whether every statement in `schema` is one the catalog already satisfies,
-/// so sending the batch would take locks to change nothing.
+/// The statements in `schema` that still have work to do, or `None` when the
+/// text cannot be split into statements and must be sent as it is.
 ///
-/// `false` is the safe answer and the one every uncertainty resolves to: a
-/// statement this cannot read, a check that does not hold, a catalog that
-/// cannot be read. The batch then runs exactly as it did before this existed.
+/// `Some("")` is a text the catalog already satisfies completely, which is the
+/// common start.
+///
+/// Dropping is per statement. A statement this cannot read is kept, and it is
+/// kept *beside* the ones it shares a text with rather than instead of them:
+/// sending the whole text because one of its statements is opaque means every
+/// other statement in it asks for its lock again, and one unreadable statement
+/// is enough to keep that true on every start for the life of the schema.
+///
+/// The rule is unchanged -- this only ever removes work. A statement is
+/// dropped only when a check the module could read says the catalog already
+/// has its object, and the statements around it do not make its object exist
+/// in a different shape: they are dropped only when the catalog has theirs.
 ///
 /// A catalog read that fails is reported and treated as "no answer": a start
 /// that cannot read `pg_catalog` has a larger problem than the lock, and
 /// turning it into a different failure here would hide it.
-async fn already_in_effect(pool: &PgPool, schema: &str) -> bool {
-    let Some(checks) = catalog_checks(schema) else {
-        return false;
-    };
-    match checks_hold(pool, &checks).await {
-        Ok(all) => all,
+async fn outstanding(pool: &PgPool, schema: &str) -> Option<String> {
+    let statements: Vec<String> = statements(schema)?
+        .into_iter()
+        .filter(|statement| !statement.trim().is_empty())
+        .collect();
+    let checks: Vec<Option<Check>> = statements
+        .iter()
+        .map(|statement| classify(statement.trim()))
+        .collect();
+    let known: Vec<Check> = checks.iter().flatten().cloned().collect();
+
+    // One round trip for the whole text first: a start whose schema is already
+    // there -- which is almost every start -- must not pay a read per
+    // statement, because this runs against a pool another replica is already
+    // draining.
+    let all_held = match checks_hold(pool, &known).await {
+        Ok(all_held) => all_held,
         Err(e) => {
-            warn!(
-                error = %e,
-                "schema_ddl: the catalog could not be read, so the schema is sent unread"
-            );
-            false
+            catalog_unreadable(&e);
+            return None;
         }
+    };
+    if all_held {
+        return Some(still_to_run(&statements, &checks, |_| true));
     }
+
+    // Something in the text is not in the catalog yet. Ask one statement at a
+    // time so the ones that already are do not come back with it.
+    let mut answers: Vec<(Check, bool)> = Vec::new();
+    for check in &known {
+        if answers.iter().any(|(asked, _)| asked == check) {
+            continue;
+        }
+        let held = match checks_hold(pool, std::slice::from_ref(check)).await {
+            Ok(held) => held,
+            Err(e) => {
+                catalog_unreadable(&e);
+                return None;
+            }
+        };
+        answers.push((check.clone(), held));
+    }
+    Some(still_to_run(&statements, &checks, |check| {
+        answers
+            .iter()
+            .find(|(asked, _)| asked == check)
+            .is_some_and(|(_, held)| *held)
+    }))
+}
+
+fn catalog_unreadable(e: &SFError) {
+    warn!(
+        error = %e,
+        "schema_ddl: the catalog could not be read, so the schema is sent unread"
+    );
+}
+
+/// The statements of a split text that are not already in the catalog, given
+/// whether each check holds.
+///
+/// Split out from the database so the decision that matters -- a statement the
+/// guard cannot read stays, and the readable ones around it still go -- can be
+/// asserted without a server.
+fn still_to_run(
+    statements: &[String],
+    checks: &[Option<Check>],
+    holds: impl Fn(&Check) -> bool,
+) -> String {
+    statements
+        .iter()
+        .zip(checks)
+        .filter(|(_, check)| match check {
+            None => true,
+            Some(check) => !holds(check),
+        })
+        .map(|(statement, _)| statement.trim())
+        .collect::<Vec<_>>()
+        .join(";\n")
+}
+
+/// The statements of `schema` this module cannot answer from the catalog, or
+/// `None` when the text cannot be split at all.
+///
+/// Public because the invariant it serves belongs to the texts, which the
+/// stores own: a statement the guard cannot read is sent on every start, and a
+/// statement that takes a lock is therefore taken every start. The ones worth
+/// leaving opaque are the ones that change rows or are conditional -- they do
+/// their work once -- not a DDL shape this happens not to recognise.
+pub fn statements_the_guard_cannot_read(schema: &str) -> Option<Vec<String>> {
+    Some(
+        statements(schema)?
+            .into_iter()
+            .filter(|statement| !statement.trim().is_empty())
+            .filter(|statement| classify(statement.trim()).is_none())
+            .map(|statement| statement.trim().to_string())
+            .collect(),
+    )
 }
 
 /// Whether the guard reads every statement in `schema` as a catalog fact, so
@@ -846,11 +960,15 @@ mod tests {
         }
     }
 
-    /// One unreadable statement makes the batch run -- the guard is
-    /// all-or-nothing per text, because the statements share one implicit
-    /// transaction and skipping half of it would skip the half that matters.
+    /// Whether a text can be answered *entirely* from the catalog -- the
+    /// question the assembly root asks of every store's text, so that a store
+    /// adding a row-changing statement has to say so instead of quietly making
+    /// its DDL re-arm every start.
+    ///
+    /// It is no longer the question the runner asks; see
+    /// [`an_unreadable_statement_does_not_bring_its_neighbours_back`].
     #[test]
-    fn one_statement_the_guard_cannot_read_runs_the_whole_text() {
+    fn the_guard_reads_every_statement_or_says_it_does_not() {
         assert!(
             guard_reads(
                 "CREATE TABLE IF NOT EXISTS entries (id TEXT);\n\
@@ -868,6 +986,64 @@ mod tests {
         assert!(
             guard_reads(" \n-- nothing but a comment\n"),
             "a text with no statements has nothing to do, which the guard can say"
+        );
+    }
+
+    fn split_checked(text: &str) -> (Vec<String>, Vec<Option<Check>>) {
+        let statements: Vec<String> = statements(text)
+            .expect("every construct here is one the splitter follows")
+            .into_iter()
+            .filter(|statement| !statement.trim().is_empty())
+            .collect();
+        let checks = statements
+            .iter()
+            .map(|statement| classify(statement.trim()))
+            .collect();
+        (statements, checks)
+    }
+
+    /// One statement the guard cannot read used to send the text it sits in
+    /// whole, which put the neighbouring catalog facts back on the wire and
+    /// with them an ACCESS EXCLUSIVE on every table they name -- on every
+    /// start, for the life of the schema, for statements with nothing to do.
+    ///
+    /// Measured 2026-11-06: the `DO` block that renames a column on
+    /// `cog_evolution_promotions` kept the whole startup batch running, and a
+    /// rolling deploy could not start for an hour behind one long `SELECT` on
+    /// `cog_dag_tasks`.
+    #[test]
+    fn an_unreadable_statement_does_not_bring_its_neighbours_back() {
+        let (statements, checks) = split_checked(
+            "CREATE TABLE IF NOT EXISTS entries (id TEXT);\n\
+             ALTER TABLE entries ADD COLUMN IF NOT EXISTS seen TIMESTAMPTZ;\n\
+             DO $$ BEGIN PERFORM 1; END $$;",
+        );
+        assert_eq!(
+            checks.iter().filter(|check| check.is_none()).count(),
+            1,
+            "only the block should be opaque: {checks:?}"
+        );
+        assert_eq!(
+            still_to_run(&statements, &checks, |_| true),
+            "DO $$ BEGIN PERFORM 1; END $$",
+            "the catalog already has both facts, so the block is all that is left"
+        );
+    }
+
+    /// ... and the drop is still per statement on the other side: what the
+    /// catalog lacks stays even when everything beside it is already there.
+    #[test]
+    fn a_statement_the_catalog_lacks_runs_beside_the_ones_it_does_not() {
+        let (statements, checks) = split_checked(
+            "CREATE TABLE IF NOT EXISTS entries (id TEXT);\n\
+             ALTER TABLE entries ADD COLUMN IF NOT EXISTS seen TIMESTAMPTZ;",
+        );
+        assert_eq!(
+            still_to_run(&statements, &checks, |check| matches!(
+                check,
+                Check::TableExists(_)
+            )),
+            "ALTER TABLE entries ADD COLUMN IF NOT EXISTS seen TIMESTAMPTZ"
         );
     }
 }
