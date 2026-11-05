@@ -409,6 +409,19 @@ pub struct TaskQuery {
     /// 只看这一类任务：一个状态词，或就绪队列（`ready`，队列本身，不是某行携带的状态）。
     /// 大小写不敏感，取值就是 [`TaskFilter::ALL`] 印出来的那些词。
     pub status: Option<String>,
+    /// 最多要几行，最新的在前。不写就是不翻页，整张表。
+    ///
+    /// 从前这个参数根本不在这一面：浏览器带着 `?limit=300` 发过来，服务端当作
+    /// 不认识的 query 丢掉，整张表照发，客户端收完再截掉。屏上写着「最近三百
+    /// 条」，网络上走的是九千行、三十八兆——截在收完之后，省下的只是内存里的
+    /// 那一截。现在截在这里，代价是传输之前就没了。
+    ///
+    /// 只对 `/tasks/list` 生效：`/tasks/graph` 也吃这个结构，但它画的是整张图，
+    /// 少一半节点就不是那张图了，所以那边照旧读全量。
+    ///
+    /// `0` 就是零行，不是「不限」——零当不限是个陷阱，两种意思共用一个值，写错
+    /// 的一方永远看不出来。
+    pub limit: Option<usize>,
 }
 
 /// 一条任务是否属于被查询的 goal。没有 goal 条件时一律留下（既有行为不变）。
@@ -1021,18 +1034,59 @@ pub async fn list_tasks_handler(
 ) -> Result<Json<Vec<TaskView>>, ApiError> {
     let claims = claims.as_ref().map(|axum::Extension(c)| c);
     let filter = status_filter(&query)?;
+    let page = page_limit(&query)?;
     let ready = ready_ids(&state, filter).await;
     let tasks = state.orchestrator.get_all_tasks().await;
-    let views: Vec<TaskView> = tasks
+    let mut rows: Vec<Task> = tasks
         .into_iter()
         .filter(|t| {
             matches_query(&query, t)
                 && matches_status(filter, ready.as_ref(), t)
                 && visible_to_claims(claims, t)
         })
-        .map(|t| t.into())
         .collect();
-    Ok(Json(views))
+    if let Some(limit) = page {
+        rows = newest_page(rows, limit);
+    }
+    Ok(Json(rows.into_iter().map(TaskView::from).collect()))
+}
+
+/// 一页最多几行。
+///
+/// 这个数不是从哪条读数推出来的，是「一个读者真的会读几条」定的：浏览器上的
+/// 那一屏最多同时看得到三百行，台账读口一页五十行。超了不截、不静默降级——
+/// 一个要一万行的调用方想要的不是一页，是整张表，而那张表今天九千多行、三十
+/// 八兆，收到之后它只会截掉再看，字节一个没少。
+pub const MAX_TASKS_PER_PAGE: usize = 1000;
+
+/// 调用方要的这一页有几行。`None` 是「不翻页」，与从前逐字相同。
+///
+/// 不认 `offset`：今天没有任何读者在读第二页——工作台看的是最近三百行，台账
+/// 读口看的是最老的五十行且不翻页。真有人要往下走的时候，要加的不止一个
+/// `offset`：还得有一条总数，因为裸数组说不出「后面还有」。
+fn page_limit(query: &TaskQuery) -> Result<Option<usize>, ApiError> {
+    match query.limit {
+        None => Ok(None),
+        Some(want) if want > MAX_TASKS_PER_PAGE => Err(ApiError::bad_request(format!(
+            "limit {want} is above the page cap {MAX_TASKS_PER_PAGE}: ask for a page, not the table"
+        ))),
+        Some(want) => Ok(Some(want)),
+    }
+}
+
+/// 最新的 `limit` 行，新的在前。
+///
+/// 定这个顺序是因为「前 N 行」只有在顺序定下来之后才是一个说法：从前这里是存
+/// 储层给的顺序，浏览器那头照样截前三百行，屏上写的是「最近」，拿到的却是任
+/// 意三行。创建时刻相同的两行按 id 排，否则同一份数据两次读到两个顺序。
+fn newest_page(mut rows: Vec<Task>, limit: usize) -> Vec<Task> {
+    rows.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    rows.truncate(limit);
+    rows
 }
 
 pub async fn get_ready_tasks_handler(
@@ -2327,6 +2381,82 @@ mod tests {
             !in_goal(&only_g1, &goal_less),
             "a task with no goal belongs to no goal"
         );
+    }
+
+    /// 一页就是最新的那几行，新的在前。`age_secs` 越小的越新。
+    fn at(id: &str, age_secs: i64) -> Task {
+        let mut t = task(id, cog_core::TaskStatus::Pending, "t", age_secs);
+        t.created_at = chrono::Utc::now() - chrono::Duration::seconds(age_secs);
+        t
+    }
+
+    /// 不写 `limit` 就是从前那一份：每一行都在，顺序不动。翻页是个可选的说法，
+    /// 不是给所有调用方换一种读法。
+    #[test]
+    fn no_limit_still_answers_the_whole_set() {
+        assert_eq!(page_limit(&TaskQuery::default()).unwrap(), None);
+    }
+
+    /// 一页是「最新的 N 行」，不是存储层给的前 N 行。
+    ///
+    /// 从前这个截断在浏览器里做，做的方向是「把收到的数组切一段」——收到的顺序
+    /// 没有任何人定义过。屏上写「最近」而拿到的是任意三行，这是这个参数在服务
+    /// 端不存在时的全部后果。
+    #[test]
+    fn a_page_is_the_newest_rows_with_the_newest_first() {
+        let rows = vec![at("old", 900), at("new", 10), at("middle", 300)];
+        let page = newest_page(rows, 2);
+        let ids: Vec<&str> = page.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["new", "middle"], "the page is the newest two");
+    }
+
+    /// 同一时刻创建的两行按 id 排。没有这一条，同一份数据两次读到两个顺序，
+    /// 而「前 N 行」在两次读数之间换了内容。
+    #[test]
+    fn rows_created_at_the_same_instant_keep_one_order() {
+        let moment = chrono::Utc::now();
+        let mut a = at("a", 0);
+        let mut b = at("b", 0);
+        a.created_at = moment;
+        b.created_at = moment;
+        let first: Vec<String> = newest_page(vec![a.clone(), b.clone()], 2)
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        let second: Vec<String> = newest_page(vec![b, a], 2)
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        assert_eq!(first, second, "the same rows must read in the same order");
+    }
+
+    /// 上限之上是拒绝，不是静默截到上限。静默截断的读数是假的：读者以为要到的
+    /// 是一千行，其实是整张表的前一千行，而它没有别的地方能看出这个差。
+    #[test]
+    fn a_limit_above_the_cap_is_refused_rather_than_silently_cut() {
+        let query = TaskQuery {
+            limit: Some(MAX_TASKS_PER_PAGE + 1),
+            ..Default::default()
+        };
+        let err = page_limit(&query).expect_err("above the cap is not a page");
+        assert_eq!(err.error, "BadRequest");
+        assert!(
+            err.message.contains(&MAX_TASKS_PER_PAGE.to_string()),
+            "the refusal must name the cap; got {}",
+            err.message
+        );
+    }
+
+    /// 零行就是零行。让它读成「不限」是个陷阱：两种意思共用一个值，写错的那
+    /// 一方永远看不出来。
+    #[test]
+    fn a_limit_of_zero_is_zero_rows_not_every_row() {
+        let query = TaskQuery {
+            limit: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(page_limit(&query).unwrap(), Some(0));
+        assert!(newest_page(vec![at("a", 1), at("b", 2)], 0).is_empty());
     }
 
     /// 裸 goal：客户端拿到的 goal_id 必须落在一条行上，否则 `?goal_id=` 恒空，

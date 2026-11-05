@@ -36,6 +36,14 @@ const FILTERS = ['全部', 'running', 'ready', 'completed', 'failed'] as const;
 
 type Mode = 'list' | 'graph';
 
+/**
+ * 表里最多几行。服务端按最新的这些行给，新的在前。
+ *
+ * 表头那一行必须说出来：不算这一句，读者看到「共 9991」和一张三百行的表，会
+ * 以为库里就这三百行；而这一屏本来就是一份被截过的读法。
+ */
+const LIST_PAGE = 300;
+
 export function TasksView() {
   const [filter, setFilter] = useState<(typeof FILTERS)[number]>('全部');
   const [mode, setMode] = useState<Mode>('list');
@@ -47,7 +55,8 @@ export function TasksView() {
   const summary = useResource('任务汇总', getTaskSummary, 15_000);
   const list = useResource(
     filter === '全部' ? '任务列表' : `任务列表（${filter}）`,
-    () => listTasks(filter === '全部' ? { limit: 300 } : { status: filter, limit: 300 }),
+    () =>
+      listTasks(filter === '全部' ? { limit: LIST_PAGE } : { status: filter, limit: LIST_PAGE }),
     15_000
   );
   const graph = useResource(
@@ -83,7 +92,13 @@ export function TasksView() {
   return (
     <ViewFrame
       title="任务"
-      meta={counts ? `共 ${counts.total} · 运行 ${counts.running} · 就绪 ${counts.ready} · 失败 ${counts.failed}` : '按 15 秒重读'}
+      meta={
+        counts
+          ? `共 ${counts.total} · 运行 ${counts.running} · 就绪 ${counts.ready} · 失败 ${counts.failed}${
+              tasks.length >= LIST_PAGE ? ` · 表里是最新 ${LIST_PAGE} 条` : ''
+            }`
+          : '按 15 秒重读'
+      }
       actions={
         <div className="flex items-center gap-3">
           <div className="flex gap-1">

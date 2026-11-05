@@ -1725,10 +1725,11 @@ export async function downloadProjectCsv(
 }
 
 /**
- * 任务行。过滤条件只有服务端认的三个：`goal_id`、`agent_id`、`status`。
+ * 任务行。过滤条件：`goal_id`、`agent_id`、`status`，以及 `limit`。
  *
- * `limit` 在本地截：端点不认它，发过去也会被忽略——带着一个看着生效、实际
- * 没生效的参数，读者会以为看到的是「最近 50 条」，其实是全部。
+ * `limit` 发给服务端，由它截：最新的几行，新的在前。以前这一下截在收完之后
+ * ——端点不认这个参数，整张表照发，九千多行、三十八兆收进来再切掉一段，省
+ * 下的只是内存里那一截。
  */
 export async function listTasks(params: {
   status?: string;
@@ -1740,9 +1741,9 @@ export async function listTasks(params: {
   if (params.status) query.set('status', params.status);
   if (params.goal_id) query.set('goal_id', params.goal_id);
   if (params.agent_id) query.set('agent_id', params.agent_id);
+  if (params.limit) query.set('limit', String(params.limit));
   const suffix = query.toString() ? `?${query.toString()}` : '';
-  const rows = await api.get<TaskRow[]>(`/api/v1/tasks/list${suffix}`);
-  return params.limit ? rows.slice(0, params.limit) : rows;
+  return api.get<TaskRow[]>(`/api/v1/tasks/list${suffix}`);
 }
 
 /** 一条交接边：`source` 的结局引出了 `target`。 */
