@@ -831,6 +831,32 @@ pub trait StateBackend: Send + Sync {
             .collect())
     }
 
+    /// The rows in a workspace that sit in one state.
+    ///
+    /// One question on the dispatch path asks about a single board column --
+    /// "is this project's running column full?" -- and it is asked once per
+    /// start attempt, which under a backlog is once per redelivery of a ready
+    /// message. Answering it out of [`Self::dag_get_all_tasks`] reads the whole
+    /// graph to count a handful of rows: on one host that was 9,901 rows and
+    /// 72 MB per attempt, 1.7-6.4 s each (本机实测，2026-11-06), on a database
+    /// whose every other reader was already waiting seconds for its turn.
+    ///
+    /// The default filters [`Self::dag_get_all_tasks`], which is correct but
+    /// reads everything; a backend that stores the state in a column should
+    /// override this so the selection happens in the query.
+    async fn dag_get_tasks_in_status(
+        &self,
+        workspace_id: &str,
+        status: crate::TaskStatus,
+    ) -> SFResult<Vec<crate::Task>> {
+        Ok(self
+            .dag_get_all_tasks(workspace_id)
+            .await?
+            .into_iter()
+            .filter(|task| task.status == status)
+            .collect())
+    }
+
     /// The rows in a workspace that carry a venue label.
     ///
     /// The venue board answers three numbers per venue by folding

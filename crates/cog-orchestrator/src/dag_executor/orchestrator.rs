@@ -1493,6 +1493,30 @@ impl DagExecutor {
         }
     }
 
+    /// 只有某一状态的那些行。
+    ///
+    /// 看板列上限那一问只取决于同状态的行（「这个项目的 running 列满了吗」），
+    /// 而它在每一次开工尝试上都会被问一次——积压时一条就绪消息每被重投一次就是
+    /// 一次。用整表读回答它，是读回近万行、几十 MB 的一整张图，只为数其中几行
+    /// （本机实测 2026-11-06，见 [`Self::live_tasks_unified`] 旁边那条）：两者
+    /// 差的是三个数量级，而答案一字不差。
+    async fn tasks_in_status_unified(&self, status: TaskStatus) -> Vec<Task> {
+        if let Some(be) = self.fg() {
+            be.dag_get_tasks_in_status(&self.workspace_id, status)
+                .await
+                .unwrap_or_default()
+        } else {
+            self.inner
+                .read()
+                .await
+                .tasks
+                .values()
+                .filter(|task| task.status == status)
+                .cloned()
+                .collect()
+        }
+    }
+
     /// 只有带场地标签的那些行。
     ///
     /// 场地看板按这一列折叠，没有标签的行读进来只为扔掉；任务图跑上几天之后
@@ -2644,10 +2668,10 @@ impl DagExecutor {
         };
         let project = task.project_key();
         let running = self
-            .all_tasks_unified()
+            .tasks_in_status_unified(TaskStatus::Running)
             .await
             .iter()
-            .filter(|t| t.status == TaskStatus::Running && t.project_key() == project)
+            .filter(|t| t.project_key() == project)
             .count();
         if running < limit {
             return Ok(());
@@ -4966,6 +4990,15 @@ mod tests {
         async fn load_dag_state(&self, _workspace_id: &str) -> SFResult<Option<serde_json::Value>> {
             Ok(None)
         }
+        async fn dag_get_task(&self, _workspace_id: &str, task_id: &str) -> SFResult<Option<Task>> {
+            Ok(self
+                .tasks
+                .lock()
+                .await
+                .iter()
+                .find(|t| t.id == task_id)
+                .cloned())
+        }
         async fn dag_get_all_tasks(&self, _workspace_id: &str) -> SFResult<Vec<Task>> {
             self.wide_reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4980,6 +5013,22 @@ mod tests {
                 .await
                 .iter()
                 .filter(|t| t.status.affects_dispatch())
+                .cloned()
+                .collect())
+        }
+        async fn dag_get_tasks_in_status(
+            &self,
+            _workspace_id: &str,
+            status: TaskStatus,
+        ) -> SFResult<Vec<Task>> {
+            self.narrow_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(self
+                .tasks
+                .lock()
+                .await
+                .iter()
+                .filter(|t| t.status == status)
                 .cloned()
                 .collect())
         }
@@ -6491,6 +6540,49 @@ mod tests {
             backend.wide_reads(),
             0,
             "整表读在这个库里是秒级开销，心跳每拍都付一次，付的是一整个控制面的响应"
+        );
+    }
+
+    /// 看板列上限那一问只读同状态的行，不读整张图。
+    ///
+    /// 「这个项目的 running 列满了吗」在每一次开工尝试上都要问一次，而积压时
+    /// 一条就绪消息每被重投一次就是一次尝试：整表读读回的是近万行、几十 MB 的
+    /// 一整张图（本机实测 2026-11-06），而要数的只是其中一个看板列的那几行。答案
+    /// 两种读法都一样，只有请求的字节数不一样，所以这里钉的是读的范围。
+    #[tokio::test]
+    async fn the_column_limit_check_reads_only_the_column_it_counts() {
+        let backend = Arc::new(CountingTaskStore::default());
+        let dag = DagExecutor::new("ws-column-read".into()).with_state_backend(backend.clone());
+        let (limits, problems) = cog_core::BoardWipLimits::from_spec("running=1");
+        assert!(problems.is_empty(), "这条规格发布侧读不动: {problems:?}");
+        dag.set_board_wip_limits(limits);
+
+        let mut running = Task::new(
+            "t-already-running",
+            TaskType::DagNode,
+            serde_json::json!({}),
+        );
+        running.status = TaskStatus::Running;
+        let next = Task::new("t-wants-to-run", TaskType::DagNode, serde_json::json!({}));
+        let next_id = next.id.clone();
+        backend.tasks.lock().await.extend([running, next]);
+
+        let refusal = dag
+            .start_task(&next_id)
+            .await
+            .expect_err("running 列已满（1/1）时第二条不该开工");
+        assert!(
+            refusal.to_string().contains("running 列已满"),
+            "拒绝的理由必须点名是哪一列满了: {refusal}"
+        );
+        assert_eq!(
+            backend.wide_reads(),
+            0,
+            "数一列不该付整表读的价钱：这条问句在每次开工尝试上都要问一次"
+        );
+        assert!(
+            backend.narrow_reads() >= 1,
+            "这一问至少要读一次 running 那些行，否则答案是从别处猜的"
         );
     }
 

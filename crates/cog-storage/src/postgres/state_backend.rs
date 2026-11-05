@@ -892,6 +892,34 @@ impl StateBackend for PostgresStateBackend {
             .collect()
     }
 
+    /// 只读某一状态的行。
+    ///
+    /// 走 `(workspace_id, status)` 上那条索引，换回的是这一列的那几行，而不是整张
+    /// 图。判据只取决于同状态的行，读的范围就跟着判据走：同一个库上整表读
+    /// 9,901 行 / 72 MB / 1.7–6.4 秒一次（本机实测，2026-11-06），而 `running`
+    /// 列只有 8 行。
+    async fn dag_get_tasks_in_status(
+        &self,
+        workspace_id: &str,
+        status: cog_core::TaskStatus,
+    ) -> SFResult<Vec<cog_core::Task>> {
+        let rows: Vec<(serde_json::Value,)> = self
+            .retry(|| async {
+                sqlx::query_as(
+                    "SELECT task FROM cog_dag_tasks \
+                     WHERE workspace_id = $1 AND status = $2",
+                )
+                .bind(workspace_id)
+                .bind(status.as_str())
+                .fetch_all(&self.pool)
+                .await
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .collect()
+    }
+
     // ─── 计划基线（task_plan）───
 
     async fn save_task_plan(&self, plan: &cog_core::TaskPlan) -> SFResult<()> {
