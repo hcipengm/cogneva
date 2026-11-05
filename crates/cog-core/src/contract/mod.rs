@@ -67,3 +67,4 @@ pub mod transport;
 pub mod usage_ledger;
 pub mod version;
 pub mod wiki;
+pub mod work_item;
