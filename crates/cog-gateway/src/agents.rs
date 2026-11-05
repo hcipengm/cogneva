@@ -127,20 +127,46 @@ pub async fn create_handler(
     };
 
     let agent_id = format!("employee:{}", new_employee_suffix());
+    let words = caller
+        .as_ref()
+        .map(|Extension(claims)| claims.preferred_username.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| WEBUI_SENDER.to_string());
     match pool.create_agent(&agent_id, EMPLOYEE_ROLE, llm, None).await {
         Ok(_) => {
-            let words = caller
-                .as_ref()
-                .map(|Extension(claims)| claims.preferred_username.trim().to_string())
-                .filter(|name| !name.is_empty())
-                .unwrap_or_else(|| WEBUI_SENDER.to_string());
-            tracing::info!(agent_id, hired_by = %words, "an employee joined the roster");
+            // 写名册写在建人成功之后：反过来的话，一次建失败会在名册上留下
+            // 一个从没存在过的人，维护环每次对账都要替它失败一遍。
+            let persistence: Option<String> = match state.key_value.as_ref() {
+                Some(kv) => match enroll(kv, &agent_id, EMPLOYEE_ROLE, &words).await {
+                    Ok(()) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            agent_id = %agent_id,
+                            error = %e,
+                            "the employee exists in this process but could not be written to the roster"
+                        );
+                        Some(e)
+                    }
+                },
+                None => Some(
+                    "this deployment keeps no key-value store, so the roster cannot outlive this process"
+                        .to_string(),
+                ),
+            };
+            tracing::info!(
+                agent_id,
+                hired_by = %words,
+                persisted = persistence.is_none(),
+                "an employee joined the roster"
+            );
             (
                 StatusCode::CREATED,
                 Json(serde_json::json!({
                     "agent_id": agent_id,
                     "display_name": cog_core::display_name_for(&agent_id),
                     "hired_by": words,
+                    "persisted": persistence.is_none(),
+                    "persistence_error": persistence,
                 })),
             )
                 .into_response()
@@ -165,6 +191,247 @@ fn new_employee_suffix() -> String {
         .chars()
         .take(8)
         .collect()
+}
+
+/// 名册在持久存储里的那一份。
+///
+/// 进程里的员工池是内存的：Pod 重启，池里一个人都不剩。名册不能跟着池一起
+/// 归零——「一直在岗」说的正是重启之后这些人还在。所以每位员工入职时写一行到
+/// 共享存储，维护环按这一份把人重新建回来。
+///
+/// 用一张 hash 而不是每人一个键：恢复时要一次读出全部，而键空间没有遍历。
+pub const ROSTER_KEY: &str = "cogneva:roster";
+
+/// 名册维护环的名字。意外退出会按这个名字记一次重启，读面上认得出来。
+pub const ROSTER_KEEPER_LOOP: &str = "gateway_roster_keeper";
+
+/// 名册维护的节拍。
+///
+/// 一分钟一次：要盯的事只有「池里少了名册上的人」，那只有进程重启或员工被收走
+/// 时才会发生；比这更密只是对同一条 hash 做无谓的读。
+pub const ROSTER_KEEPER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 名册上的一行。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RosterRow {
+    /// 入职时登记的用途标签。它不限制这个人能做什么——能力来自同一套工具与同
+    /// 一条基础指令——这一列只是读面上与小队成员分开的那一格。
+    pub role: String,
+    /// 谁招的：认证主体上的名字，不是请求里自报的那一个。
+    #[serde(default)]
+    pub hired_by: String,
+    pub hired_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// 把一个人写进名册。
+pub async fn enroll(
+    kv: &Arc<dyn cog_core::KeyValueStore>,
+    agent_id: &str,
+    role: &str,
+    hired_by: &str,
+) -> Result<(), String> {
+    let row = RosterRow {
+        role: role.to_string(),
+        hired_by: hired_by.to_string(),
+        hired_at: chrono::Utc::now(),
+    };
+    let text = serde_json::to_string(&row).map_err(|e| e.to_string())?;
+    kv.hset(ROSTER_KEY, agent_id, &text)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 一次读名册的结果。
+///
+/// 读不出来与读出来是空的必须分得开：两者都返回一份空名单，维护环就会把
+/// 「存里没有人」和「存读不到、其实可能有人」当成同一件事，而后者正是人丢掉的
+/// 那一刻。所以失败条数与错误原因都带出来，由调用方写进日志。
+#[derive(Debug, Default)]
+pub struct RosterRead {
+    pub rows: Vec<(String, RosterRow)>,
+    /// 有字段、但那一行解析不出来的条数。
+    pub unreadable: usize,
+    /// 整张名册读失败的原因。
+    pub error: Option<String>,
+}
+
+pub async fn read_roster(kv: &Arc<dyn cog_core::KeyValueStore>) -> RosterRead {
+    let pairs = match kv.hgetall(ROSTER_KEY).await {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            return RosterRead {
+                rows: Vec::new(),
+                unreadable: 0,
+                error: Some(e.to_string()),
+            }
+        }
+    };
+    let mut read = RosterRead::default();
+    for (agent_id, text) in pairs {
+        match serde_json::from_str::<RosterRow>(&text) {
+            Ok(row) => read.rows.push((agent_id, row)),
+            Err(e) => {
+                read.unreadable += 1;
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "a roster row does not parse; skipping it rather than guessing who it was"
+                );
+            }
+        }
+    }
+    read
+}
+
+/// 对账里「把一个人弄回池子」这一个动作，由调用方提供。
+///
+/// 收成一个闭包而不是直接吃一个 `AgentManager`：对账逻辑本身只做「按名册逐人
+/// 问一句」，把它和池子的建对象路径分开，才能在测试里不造一个完整的 Agent。
+pub enum Summon {
+    /// 池里本来就有人，什么都没建。
+    Held,
+    /// 池里没有，这一次建回来了。
+    Built,
+}
+
+pub type SummonFn = Box<
+    dyn FnMut(String, String) -> futures::future::BoxFuture<'static, Result<Summon, String>> + Send,
+>;
+
+/// 一次名册对账的结果。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RosterPass {
+    /// 名册上读得出、要照顾的有几个人。
+    pub named: usize,
+    /// 其中池里本来就有的。
+    pub present: usize,
+    /// 这一次被重新建回来的。
+    pub restored: usize,
+    /// 名册读不出、行解析不了或人建不回来的总数。
+    pub failed: usize,
+}
+
+/// 按名册逐人对账一次。
+///
+/// 名册是持久的、池是内存的，两边不一致只说明「这个进程是新的」。对账不删除、
+/// 不改名：名册上的一行就是一个人，池里没有就把人建回来，池里有的不动。
+pub async fn restore_roster_from(
+    kv: &Arc<dyn cog_core::KeyValueStore>,
+    summon: &mut SummonFn,
+) -> RosterPass {
+    let read = read_roster(kv).await;
+    let mut pass = RosterPass {
+        named: read.rows.len(),
+        failed: read.unreadable + usize::from(read.error.is_some()),
+        ..RosterPass::default()
+    };
+    if let Some(error) = read.error.as_deref() {
+        tracing::warn!(
+            error,
+            "the roster could not be read; nobody is restored this pass"
+        );
+    }
+    for (agent_id, row) in read.rows {
+        match summon(agent_id.clone(), row.role.clone()).await {
+            Ok(Summon::Held) => pass.present += 1,
+            Ok(Summon::Built) => {
+                pass.restored += 1;
+                tracing::info!(
+                    agent_id = %agent_id,
+                    name = %cog_core::display_name_for(&agent_id),
+                    hired_by = %row.hired_by,
+                    "an employee named by the roster is back on the pool"
+                );
+            }
+            Err(e) => {
+                pass.failed += 1;
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    error = %e,
+                    "an employee named by the roster could not be put back on the pool"
+                );
+            }
+        }
+    }
+    pass
+}
+
+/// 生产环境的 summon：池里有人就交回，没有就建一个进程生命周期的人。
+pub fn pool_summoner(
+    pool: Arc<dyn cog_core::AgentManager>,
+    llm: Arc<dyn cog_core::LlmClient>,
+) -> SummonFn {
+    Box::new(move |agent_id, role| {
+        let pool = pool.clone();
+        let llm = llm.clone();
+        Box::pin(async move {
+            match pool.get_agent(&agent_id).await {
+                Ok(Some(_)) => Ok(Summon::Held),
+                Ok(None) => pool
+                    .create_agent(&agent_id, &role, llm, None)
+                    .await
+                    .map(|_| Summon::Built)
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+        })
+    })
+}
+
+/// 这个进程能做的事少了一样，名册对账就没有可判的对象：没有存，名册本就不存在；
+/// 没有池或没有模型，读出来的名字也建不成人。按「这一趟没有人要照顾」返回。
+pub async fn restore_roster(state: &GatewayState) -> RosterPass {
+    let (Some(kv), Some(pool)) = (state.key_value.as_ref(), state.agent_pool.as_ref()) else {
+        return RosterPass::default();
+    };
+    let llm = state
+        .llm_client
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(llm) = llm else {
+        return RosterPass::default();
+    };
+    let mut summon = pool_summoner(pool.clone(), llm);
+    restore_roster_from(kv, &mut summon).await
+}
+
+/// 名册维护环：池是内存的，名册不是，这条环让两者在重启后重新对得上。
+pub fn spawn_roster_keeper(
+    state: Arc<GatewayState>,
+    shutdown: cog_core::ShutdownSignal,
+) -> tokio::task::JoinHandle<()> {
+    cog_core::loop_health::spawn(
+        ROSTER_KEEPER_LOOP,
+        cog_core::loop_health::Cadence::Periodic(ROSTER_KEEPER_INTERVAL),
+        shutdown.clone(),
+        move |beat| {
+            let state = state.clone();
+            let stop = shutdown.clone();
+            async move {
+                let mut tick = tokio::time::interval(ROSTER_KEEPER_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    beat.beat();
+                    tokio::select! {
+                        biased;
+                        _ = stop.wait() => return,
+                        _ = tick.tick() => {}
+                    }
+                    let pass = restore_roster(&state).await;
+                    if pass.named > 0 || pass.failed > 0 {
+                        tracing::info!(
+                            named = pass.named,
+                            present = pass.present,
+                            restored = pass.restored,
+                            failed = pass.failed,
+                            "roster pass"
+                        );
+                    }
+                }
+            }
+        },
+    )
 }
 
 pub async fn heartbeat_handler(
@@ -1297,8 +1564,265 @@ pub async fn checkpoint_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{agent_view, caller_named_reply_stream, roster_split};
+    use super::{
+        agent_view, caller_named_reply_stream, enroll, read_roster, restore_roster_from,
+        roster_split, RosterRow, Summon, SummonFn, ROSTER_KEY,
+    };
     use cog_core::InboxMessage;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// 名册只用得到 hash：其余方法不是这条路径的一部分，落到它们身上说明
+    /// 被测代码问了不该问的东西。
+    #[derive(Default)]
+    struct FakeRosterStore {
+        hashes: Mutex<HashMap<String, HashMap<String, String>>>,
+        /// 让整张名册读失败：验证「读不出来」与「读出来是空的」不是同一个答案。
+        broken: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::KeyValueStore for FakeRosterStore {
+        async fn get(&self, _key: &str) -> cog_core::SFResult<Option<String>> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn set(&self, _key: &str, _value: &str) -> cog_core::SFResult<()> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn set_ex(&self, _key: &str, _value: &str, _ttl_secs: u64) -> cog_core::SFResult<()> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn del(&self, _key: &str) -> cog_core::SFResult<()> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn expire(&self, _key: &str, _ttl_secs: i64) -> cog_core::SFResult<()> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn ttl(&self, _key: &str) -> cog_core::SFResult<i64> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn incr(&self, _key: &str, _by: i64) -> cog_core::SFResult<i64> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn decr(&self, _key: &str, _by: i64) -> cog_core::SFResult<i64> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn incr_ex(&self, _key: &str, _by: i64, _ttl_secs: u64) -> cog_core::SFResult<i64> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn sadd(&self, _key: &str, _member: &str) -> cog_core::SFResult<()> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn srem(&self, _key: &str, _member: &str) -> cog_core::SFResult<()> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn smembers(&self, _key: &str) -> cog_core::SFResult<Vec<String>> {
+            unreachable!("the roster is a hash")
+        }
+
+        async fn hset(&self, key: &str, field: &str, value: &str) -> cog_core::SFResult<()> {
+            self.hashes
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_default()
+                .insert(field.to_string(), value.to_string());
+            Ok(())
+        }
+
+        async fn hget(&self, key: &str, field: &str) -> cog_core::SFResult<Option<String>> {
+            Ok(self
+                .hashes
+                .lock()
+                .unwrap()
+                .get(key)
+                .and_then(|hash| hash.get(field).cloned()))
+        }
+
+        async fn hdel(&self, _key: &str, _field: &str) -> cog_core::SFResult<()> {
+            unreachable!("the roster is only ever added to here")
+        }
+
+        async fn hvals(&self, _key: &str) -> cog_core::SFResult<Vec<String>> {
+            unreachable!("the roster is read by field and value together")
+        }
+
+        async fn hgetall(&self, key: &str) -> cog_core::SFResult<Vec<(String, String)>> {
+            if self.broken {
+                return Err(cog_core::SFError::Internal(
+                    "the roster store is unreachable".into(),
+                ));
+            }
+            Ok(self
+                .hashes
+                .lock()
+                .unwrap()
+                .get(key)
+                .map(|hash| hash.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+                .unwrap_or_default())
+        }
+
+        async fn hlen(&self, _key: &str) -> cog_core::SFResult<u64> {
+            unreachable!("the roster is read whole")
+        }
+    }
+
+    /// 记下每一次「把人弄回池子」的请求，按脚本回答。
+    fn recording_summoner(
+        seen: Arc<Mutex<Vec<(String, String)>>>,
+        answer: impl Fn(&str) -> Result<Summon, String> + Send + 'static,
+    ) -> SummonFn {
+        Box::new(move |agent_id, role| {
+            let seen = Arc::clone(&seen);
+            let answer = answer(agent_id.as_str());
+            Box::pin(async move {
+                seen.lock().unwrap().push((agent_id, role));
+                answer
+            })
+        })
+    }
+
+    /// 入职写在名册上，重启后读得到同一个人。这是「一直在岗」的全部内容：
+    /// 进程换了，id、角色与招他的人一个字节都不变。
+    #[tokio::test]
+    async fn a_roster_row_survives_the_process_that_hired_it() {
+        let store: Arc<dyn cog_core::KeyValueStore> = Arc::new(FakeRosterStore::default());
+        enroll(&store, "employee:abc12345", "employee", "owner")
+            .await
+            .unwrap();
+
+        let read = read_roster(&store).await;
+        assert!(read.error.is_none());
+        assert_eq!(read.rows.len(), 1);
+        let (agent_id, row) = &read.rows[0];
+        assert_eq!(agent_id, "employee:abc12345");
+        assert_eq!(row.role, "employee");
+        assert_eq!(row.hired_by, "owner");
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut summon = recording_summoner(Arc::clone(&seen), |_| Ok(Summon::Built));
+        let pass = restore_roster_from(&store, &mut summon).await;
+
+        assert_eq!(pass.named, 1);
+        assert_eq!(pass.restored, 1);
+        assert_eq!(pass.present, 0);
+        assert_eq!(pass.failed, 0);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[("employee:abc12345".to_string(), "employee".to_string())]
+        );
+    }
+
+    /// 池里已经有的人不重建：对账是「补缺」不是「重来」。第二趟必须报
+    /// present 而不是再算一次 restored，否则每分钟的 restore 计数会把一个
+    /// 常驻的人数成新来的。
+    #[tokio::test]
+    async fn a_person_already_on_the_pool_is_not_built_again() {
+        let store: Arc<dyn cog_core::KeyValueStore> = Arc::new(FakeRosterStore::default());
+        enroll(&store, "employee:abc12345", "employee", "owner")
+            .await
+            .unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut summon = recording_summoner(Arc::clone(&seen), |_| Ok(Summon::Held));
+        let pass = restore_roster_from(&store, &mut summon).await;
+
+        assert_eq!(pass.named, 1);
+        assert_eq!(pass.present, 1);
+        assert_eq!(pass.restored, 0);
+    }
+
+    /// 名册读不出来时不能报成「名册是空的」：后者会让维护环安静地什么都不做，
+    /// 而人就在存储里。失败必须计数。
+    #[tokio::test]
+    async fn a_roster_that_cannot_be_read_is_a_failure_not_an_empty_roster() {
+        let store: Arc<dyn cog_core::KeyValueStore> = Arc::new(FakeRosterStore {
+            broken: true,
+            ..FakeRosterStore::default()
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut summon = recording_summoner(Arc::clone(&seen), |_| Ok(Summon::Built));
+        let pass = restore_roster_from(&store, &mut summon).await;
+
+        assert_eq!(pass.named, 0);
+        assert_eq!(pass.failed, 1);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// 解析不了的那一行跳过并计数，不按位置猜它是谁：一次瞎猜会把一个陌生人
+    /// 建进池子，而那个名字已经有人在用。
+    #[tokio::test]
+    async fn a_row_that_does_not_parse_is_counted_not_guessed() {
+        let store = Arc::new(FakeRosterStore::default());
+        store
+            .hashes
+            .lock()
+            .unwrap()
+            .entry(ROSTER_KEY.to_string())
+            .or_default()
+            .insert("employee:broken1".to_string(), "{not json".to_string());
+        let store: Arc<dyn cog_core::KeyValueStore> = store;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut summon = recording_summoner(Arc::clone(&seen), |_| Ok(Summon::Built));
+        let pass = restore_roster_from(&store, &mut summon).await;
+
+        assert_eq!(pass.named, 0);
+        assert_eq!(pass.failed, 1);
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    /// 建不回来的人计一次失败，不挡住同一次对账里的下一个人。
+    #[tokio::test]
+    async fn one_employee_that_cannot_be_summoned_does_not_cost_the_next_its_turn() {
+        let store: Arc<dyn cog_core::KeyValueStore> = Arc::new(FakeRosterStore::default());
+        enroll(&store, "employee:first000", "employee", "owner")
+            .await
+            .unwrap();
+        enroll(&store, "employee:second00", "employee", "owner")
+            .await
+            .unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut summon = recording_summoner(Arc::clone(&seen), |agent_id| {
+            if agent_id == "employee:first000" {
+                Err("the pool refused".to_string())
+            } else {
+                Ok(Summon::Built)
+            }
+        });
+        let pass = restore_roster_from(&store, &mut summon).await;
+
+        assert_eq!(pass.named, 2);
+        assert_eq!(pass.restored, 1);
+        assert_eq!(pass.failed, 1);
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_roster_row_reads_back_with_the_role_it_was_hired_for() {
+        let row = RosterRow {
+            role: "employee".into(),
+            hired_by: "owner".into(),
+            hired_at: chrono::Utc::now(),
+        };
+        let text = serde_json::to_string(&row).unwrap();
+        let back: RosterRow = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.role, row.role);
+        assert_eq!(back.hired_by, row.hired_by);
+        assert_eq!(back.hired_at, row.hired_at);
+    }
 
     /// 名册上每一行都要读得成一个名字，而路由用的 id 一个字节都不能变：
     /// 有读 id 的调用方，动了它就断；名字只是给读的人看的那一列。

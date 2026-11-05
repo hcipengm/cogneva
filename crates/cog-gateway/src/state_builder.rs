@@ -265,5 +265,12 @@ pub async fn build_gateway_state(
         ));
     }
 
+    // 员工池是内存的、名册是持久的：这条环让两者在进程重启之后重新对得上，
+    // 否则「一直在岗」只在一个进程的寿命里成立。
+    drop(crate::agents::spawn_roster_keeper(
+        gateway_state.clone(),
+        shutdown.clone(),
+    ));
+
     Ok(gateway_state)
 }
