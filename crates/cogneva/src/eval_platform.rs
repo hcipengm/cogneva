@@ -470,7 +470,7 @@ impl PlatformApiRunner {
             serde_json::Value::String(CASE_CONTRACT.into());
         input[cog_core::contract::prompt::REQUEST_KEYS[0]] =
             serde_json::Value::String(request.task.clone());
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "goal": request.task,
             "workspace_id": "",
             "intent_kind": "task",
@@ -478,7 +478,6 @@ impl PlatformApiRunner {
                 "id": case_id,
                 "task_type": PLATFORM_TASK_KIND,
                 "input": input,
-                "planner": { "verified": true, "source": "user_provided" },
                 "timeout_seconds": self.settings.deadline_secs.saturating_sub(
                     PLATFORM_BUDGET_MARGIN_SECS
                 ).max(1),
@@ -486,6 +485,12 @@ impl PlatformApiRunner {
                 "priority": 0,
             }],
         });
+        // The claim key is the role name, so it is read from the role's one
+        // declaration: a second spelling here keeps working after a rename while
+        // the orchestrator, reading the declared name, plans a row that already
+        // says it is planned.
+        body["tasks"][0][cog_core::roles::PLANNER] =
+            serde_json::json!({ "verified": true, "source": "user_provided" });
         self.call("POST", "/api/v1/tasks", Some(body)).await?;
         Ok(())
     }

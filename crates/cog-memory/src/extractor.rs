@@ -387,14 +387,17 @@ impl ExtractionMemo {
 /// A general employee answers through its own loop rather than one bounded
 /// completion, so the ceiling is the task row's, not a call's. It is set well
 /// above one model round because the loop may read a tool before it answers.
+// cap: bound — one turn of the employee's loop is a model round plus whatever tool it chooses to read; the ceiling has to fit both, or a working extraction is killed halfway and reads as a failed one.
 const EXTRACT_TASK_TIMEOUT_SECS: u64 = 180;
 
 /// How long the ingest pass waits for that answer before giving up on this
 /// transcript. It sits just under the task's own ceiling, so a pass that runs
 /// out of patience and the task that runs out of time are two different
 /// statements rather than the same one made twice.
+// cap: derived — ten seconds under the row's own ceiling (180): the waiter has to give up first, otherwise "we stopped waiting" and "it timed out" arrive together and the two readings cannot be told apart.
 const EXTRACT_WAIT_TIMEOUT_SECS: u64 = 170;
 
+// cap: bound — polling granularity: short enough that an answer is picked up the moment it lands, long enough that an idle pass is not load of its own; nothing was measured to choose it.
 const EXTRACT_POLL_INTERVAL_MS: u64 = 500;
 
 /// One work item in, one answer out.
