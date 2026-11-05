@@ -42,9 +42,13 @@
 # 所以判据读两个数：checkpoint 的字节数**和**进程自己的 io 计数（/proc/1/io 的 rchar+wchar）。
 # 两个都不动才算停滞；io 在动说明它还在收流，继续等。
 #
-# 镜像**不许**换着试：checkpoint 首行写了 run_id，material 里含 software 版本，换镜像
-# 会在准备阶段整轮 bail、一格不跑，且已判例数不跟过来。见
-# memory/feedback_a_checkpoint_is_keyed_on_the_software_rev_so_an_image_change_starts_over.md。
+# 镜像跟线上走，不钉。2026-11-05 之前这里钉着一个 rev，理由是「checkpoint 的身份里有
+# software，换镜像会整轮 bail、已判例数不跟过来」。那条理由在 2026-11-05 修掉了：续跑判据
+# 现在是「除软件版本以外逐行相同」（`crates/cog-eval/src/rig.rs::same_experiment`），换版本
+# 只换每一例的来源戳，不丢已判的例。理由没了之后，钉住只剩副作用——钉着的 rev 会悄悄烂掉，
+# 而它烂掉时**没有任何读数会喊**（2026-11-04 钉的 main-ac2748167396 在 registry 里根本
+# 不存在，按它起的 Pod 只会 ImagePullBackOff，一轮都没跑起来过）。所以默认取线上正在跑的
+# 那个镜像。见 memory/feedback_a_checkpoint_is_keyed_on_the_software_rev_so_an_image_change_starts_over.md。
 #
 # 退出码：0＝到目标；1＝时间用尽仍未到目标（读数在日志里）；2＝参数错；
 #         3＝前置条件问不出来（kubectl 不可用／checkpoint 读不到），不许当 0 读。
@@ -53,27 +57,15 @@ set -u
 NAMESPACE=${NAMESPACE:-cogneva}
 # 部署器把「线上在跑哪个 rev」写在它的状态文件里，见 deployed_rev。
 STATE_POD=${COGNEVA_STATE_POD:-deploy/cogneva-evolution}
-# 镜像钉住一个 rev，而不是跟线上走：检查点的 run 头里有 `software` 那一行，换 rev 就换
-# run_id，跟线上等于每次部署都把这一张表从第一例重新开始——部署一天好几次，那一臂就
-# 永远画不出第二行。钉住的代价是**这个 tag 会悄悄烂掉**，所以钉的时候要连依据一起写。
+# 镜像默认**跟线上走**：取 deployment 的 image 字段（现网在跑哪一个，是那台机器自己的
+# 事实，不是这份脚本里的一个常量）。`--image` 仍可显式覆盖——跑登记的某一版，或线上坏了
+# 要拿一版已知好的对照。上面那一段讲了为什么钉住的代价大于收益。
 #
-# 2026-11-02 换掉 main-2d1fd99239a0（10-19 的 rev），依据是它之后的两个修复，缺一个
-# 这一臂就判不动：
-#   * 32c2ab3b（10-25）上游说的等待超过这一跑活得长度就不等——网关对关着的池回
-#     `retry-after: 4971`（openai 面）甚至 608242（kimi 周窗），老客户端把这当成要坐等
-#     的时刻，整轮就停在一次拒绝上：10-24 到 11-02 每一轮都是 1813 秒 `phase=stalled`、
-#     末行只有版本横幅，检查点一字节不涨。今天实测复现：08:41:34 四路 concurrency 各吃
-#     一个 503，之后直到人为收走这台 Pod 再没有第二次调用。
-#   * 9d24b626（11-01）每一例都有上界——否则一例卡住同样只留一行版本横幅。
-# 换 tag 时：先核对新 rev 含上面这两笔，再起一台 Pod 看首行 version 与它落在哪。
-#
-# 2026-11-04 换到 main-2e2d89301936（当前 main 尖），依据是 b339b42a——**HLE 点名的三件
-# 工具面**（web_search / web_fetch / python）是在那一笔接上的。臂要出主表行就得带工具跑，
-# 而不带这三件的镜像上 `--tools platform` 会整跑 bail。换掉的那个 tag 还有第二个问题：
-# `main-ac2748167396` 在 registry 里**根本不存在**（tags/list 里没有、manifest 404），
-# 也就是说按它起的 Pod 只会 ImagePullBackOff——钉一个拉不到的 tag，判据看起来最严，实际
-# 一轮都没跑起来过。换 tag 时这两件一起核对：rev 含工具面，**tag 在 registry 里能 GET 到**。
-IMAGE=${IMAGE:-localhost:30500/cogneva:main-2e2d89301936}
+# 取不到就是 3，不回落：回落成一个写死的 tag 会让「线上是什么」与「这一臂跑的是什么」
+# 在日志上重新同形，而那正是这次改动要拆开的东西。
+IMAGE=${IMAGE:-}
+# 线上镜像从哪个 deployment 取。换名的部署（多副本、另一个 release）用 --live-deployment。
+LIVE_DEPLOYMENT=${LIVE_DEPLOYMENT:-cogneva}
 OUT=${OUT:-/eval/20261018_post-recovery.md}
 RUNS_DIR=${RUNS_DIR:-$HOME/eval-runs}
 # 198 = 33 题 × 3 seed × 2 scaffold。写 240 会在跳过 42 行之后永远到不了；
@@ -126,8 +118,10 @@ usage() {
   cat <<'EOF'
 
 Usage: eval-registered-rerun.sh [options]
-  --image <ref>      image tag (default: main-2e2d89301936; see the note by IMAGE for why a
-                     pinned rev, and what the pin must contain)
+  --image <ref>      image ref (default: the image the live deployment runs; see the note by
+                     IMAGE for why this follows the deployment instead of a pinned tag)
+  --live-deployment <name>
+                     which deployment to read the live image from (default: cogneva)
   --out <path in pod> the report path the checkpoint is named after (default: /eval/20261018_post-recovery.md)
   --target <n>       stop once this many cases are judged (default: 198 = 33 x 3 x 2)
   --horizon <secs>   give up after this long (default: 14400)
@@ -148,6 +142,7 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     --image) IMAGE=$2; shift 2;;
+    --live-deployment) LIVE_DEPLOYMENT=$2; shift 2;;
     --out) OUT=$2; shift 2;;
     --target) TARGET=$2; shift 2;;
     --horizon) HORIZON=$2; shift 2;;
@@ -186,6 +181,14 @@ deployed_rev() {
     | sed -n 's/.*"last_good_rev"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{7,40\}\)".*/\1/p' \
     | cut -c1-12)
   printf '%s\n' "${rev:--}"
+}
+
+# 线上正在跑的那个镜像（deployment 的 image 字段）。问不出来就是空串，调用方判 3：
+# 这一臂跑的是哪一版，从这里读；读不到时**不许**回落成一个写死的 tag——那会让「线上是
+# 什么」与「这一臂跑的是什么」重新变成一个数，而这次改动的全部要点就是把它们分开。
+live_image() {
+  $KUBECTL -n "$NAMESPACE" get deployment "$LIVE_DEPLOYMENT" \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null
 }
 
 judged() {
@@ -315,7 +318,9 @@ spec:
   nodeName: $NODE_NAME
   containers:
   - name: eval
-    image: $IMAGE
+    # 空的只会出现在 --print-pod：那一分支是纯渲染、不连集群，所以问不到线上镜像。
+    # （这一段是不加引号的 heredoc，反引号会被当成命令替换执行，所以这里不用反引号。）
+    image: ${IMAGE:-localhost:30500/cogneva:live}
     env:
     # 网关的 \`llm_calls_total{actor="eval"}\` 不区分是哪一次跑，两边的读数会并进同一个
     # 计数器（2026-10-19 实测：两个会话同时跑，计数只多 1，谁也认不出自己那条）。
@@ -354,7 +359,25 @@ if [ -n "$PRINT_POD" ]; then manifest "${PRINT_POD_NAME:-eval-registered-rerun-s
 $KUBECTL -n "$NAMESPACE" auth can-i create pods >/dev/null 2>&1 || { log "cannot ask the cluster whether pods may be created"; exit 3; }
 [ -f "$CKPT" ] || [ "$(judged)" = 0 ] || { log "the checkpoint cannot be read: $CKPT"; exit 3; }
 
+# 显式给了 `--image` 就钉住不动；没给就每一轮重新问一次线上。
+#
+# 每一轮重问，是因为部署会在这一跑的几个小时里滚好几次：把第一轮读到的那个 tag 用在
+# 第六轮上，跑的就是一台已经不存在的线上。换版本对已判的例没有代价了（见 IMAGE 那一段），
+# 所以「跟着线上变」在这里是免费的。
+IMAGE_FIXED=${IMAGE:+1}
+resolve_image() {
+  [ -n "$IMAGE_FIXED" ] && return 0
+  local live
+  live=$(live_image)
+  [ -n "$live" ] || { log "cannot read the image of deployment/$LIVE_DEPLOYMENT in namespace $NAMESPACE"; exit 3; }
+  if [ -n "$IMAGE" ] && [ "$live" != "$IMAGE" ]; then
+    log "the live image moved: $IMAGE -> $live (cases already judged stay; each case carries its own revision)"
+  fi
+  IMAGE=$live
+}
+
 deadline=$(( $(date +%s) + HORIZON ))
+resolve_image
 log "start image=$IMAGE deployed=$(deployed_rev) out=$OUT target=$TARGET judged=$(judged)"
 
 # 为什么不拿 `llm_pool_available` 当开闸条件（2026-10-19 明确否掉）：池读数两个方向都骗过人，
@@ -364,6 +387,7 @@ log "start image=$IMAGE deployed=$(deployed_rev) out=$OUT target=$TARGET judged=
 while [ "$(date +%s)" -lt "$deadline" ]; do
   before=$(judged)
   if [ "$before" -ge "$TARGET" ]; then log "reached target: judged=$before"; exit 0; fi
+  resolve_image
   name="eval-rerun-$(date -u +%m%d%H%M)"
   $KUBECTL -n "$NAMESPACE" delete pod "$name" --ignore-not-found --wait=false >/dev/null 2>&1
   if ! manifest "$name" | $KUBECTL apply -f - >/dev/null 2>&1; then

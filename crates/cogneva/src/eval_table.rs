@@ -958,10 +958,13 @@ pub struct Outcome {
 /// 跑一次表并渲染。依赖由调用方注入：命令行注入真上游与真平台，测试注入替身。
 /// 这次跑的检查点：落在哪、以及它是谁。
 ///
-/// 身份把**这次跑要用的每一件东西**都收进来：数据的 pin、骨干与裁判的模型、工具臂、
-/// 基准与外壳清单、种子表、子集存档，以及**这份代码本身**。少了最后一项就够了不着的
-/// 那一种错——「同一个外壳改了代码重跑」会接上一次那条老记录，把旧代码的结果当成新代码
-/// 的读数交回来，而表上完全看不出来。
+/// 身份把**这次跑要用的每一件东西**都收进来：数据的 pin、骨干与裁判的模型、工具臂、视觉
+/// 臂、基准与外壳清单、种子表、子集存档，以及**这份代码本身**。
+///
+/// 最后一项进材料，但它**不参与续跑判据**：评测台比的是这份材料的每一行、跳过 `software`
+/// 那一行（见 `cog_eval::rig::Checkpoint`）。理由是部署频率：代码一换（一天好几次）就
+/// 让已经判过的例作废，这张表永远停在第一次部署判到的地方。软件版本改记在**每一行**上做
+/// 来源戳，报表按它说出这张表是几版拼的——合并不是靠拒绝回避，是靠说出来。
 ///
 /// 它与随表出去的 pins 是同一批东西（表里的 pins 让**别人**能复跑这张表，这里的身份让
 /// **这次**跑接得上自己上一次的半成品），所以两处都从这一份材料出，不各写一份。
@@ -1003,7 +1006,11 @@ fn run_checkpoint(
         // 跑不会互相顶掉，而身份仍然是文件里逐行核过的那一个。
         None => PathBuf::from(format!("eval-table-{}.cases.jsonl", &run_id[..12])),
     };
-    Checkpoint { path, run_id }
+    Checkpoint {
+        path,
+        run_id,
+        material,
+    }
 }
 
 /// 一条缺席声明**管到哪些格子**。
@@ -1705,6 +1712,14 @@ fn render(args: &EvalTableArgs, wiring: WiringReport<'_>, readings: Readings<'_>
          upstream failure) is run again on resume rather than remembered as failed, and a case \
          with no record counts as not resolved in its cell\n",
     );
+    // 这张表是几版软件的例拼起来的。续跑**不**按软件版本拒绝（一次部署换一次版本，按版本
+    // 拒接等于让这张表永远停在第一次部署判到的地方），代价就落在这里：每一例带自己那一版
+    // 的来源戳，按版本数出来。不印的话，「这一格是这一版跑出来的」与「这一格是几版拼的」
+    // 在表上同形，而后者要当成一份合并读数之前，先得知道它混了几版。`-` 是旧记录里没有
+    // 来源戳的那些（记的时候还没这一格），不是「另一版」。
+    for (software, cases) in &table.checkpoint_provenance {
+        out.push_str(&format!("checkpoint-provenance\t{software}\t{cases}\n"));
+    }
     // 跑的是哪一批题，跟基准数据是哪个版本一样，是这张表说的话的一部分：两次跑用了不同的
     // 子集（或一次全量一次子集），表头看不出区别的话，两个分就不该并排读。
     if let Some(subset) = subset {
@@ -2424,6 +2439,7 @@ mod tests {
         Checkpoint {
             path: PathBuf::from(format!("{out}.cases.jsonl")),
             run_id: "0123456789abcdef".into(),
+            material: "backbone\tmodel@1\n".into(),
         }
     }
 
@@ -2681,6 +2697,19 @@ mod tests {
         // 同一套参数重复算，身份相同：它要认得出自己上一次留下的半成品。
         assert_eq!(one.run_id, run_checkpoint(&base, &verified, None).run_id);
 
+        // 材料要原样带出去：续跑比的是它的每一行，不只是那串摘要。少了它，评测台只剩
+        // 「摘要不相等」这一条信息，分不出「换了软件」与「换了骨干」——而这两件事的处置
+        // 正相反（接着跑 vs 拒接）。
+        assert_eq!(
+            one.material,
+            run_checkpoint(&base, &verified, None).material
+        );
+        assert!(
+            one.material.contains("software\t"),
+            "材料里要有软件版本那一行，续跑才跳得掉它：{}",
+            one.material
+        );
+
         // 没有 `--out` 时文件名带身份前截，两套参数在同一目录里跑不会互相顶掉。
         assert!(
             one.path.to_string_lossy().contains(&one.run_id[..12]),
@@ -2751,6 +2780,7 @@ mod tests {
             backoff: None,
             // 这一列自己的隔离上界：hle 各例不共享状态，所以它不加界。
             column_ceilings: vec![("hle".into(), None)],
+            checkpoint_provenance: vec![],
         }
     }
 
@@ -3499,6 +3529,7 @@ mod tests {
             gate: None,
             backoff: None,
             column_ceilings: vec![("hle".into(), None), ("swe-bench-pro".into(), None)],
+            checkpoint_provenance: vec![],
         }
     }
 

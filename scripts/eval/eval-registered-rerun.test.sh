@@ -161,23 +161,25 @@ PY
   esac
 fi
 
-# 7. 钉住的镜像必须含有「上游说的等待超过这一跑活得长度就不等」（32c2ab3b）。
+# 7. 镜像**跟线上走**，不钉一个 rev。
 #
-#    这一条拦的是一次已经发生过的静默退化：钉的 rev 停在 10-19，而 10-25 落地的这一笔
-#    正是让客户端不再把 `retry-after: 4971` 当成要坐等的时刻。缺了它，池关着时一轮就
-#    停在第一次拒绝上——10-24 到 11-02 每一轮都是 1813 秒 `phase=stalled`、末行只有版本
-#    横幅，而「臂在跑」这件事在每一处读数上都还成立。钉住的 rev 与线上的距离没有读数会
-#    喊，所以把它写成用例：钉回一个缺这一笔的 rev，这里当场红。
-pin=$(sed -n 's/^IMAGE=${IMAGE:-\(.*\)}$/\1/p' "$SCRIPT" | head -1)
-prrev=${pin##*:main-}
-if [ -z "$pin" ] || [ "$prrev" = "$pin" ]; then
-  bad "读不出钉住的镜像 rev（IMAGE 默认值那行变了形状？实得「${pin}」）"
-elif ! git -C "$REPO" cat-file -e "${prrev}^{commit}" 2>/dev/null; then
-  bad "钉住的 rev ${prrev} 不在 $REPO 里（tag 与提交对不上）"
-elif git -C "$REPO" merge-base --is-ancestor 32c2ab3b "$prrev" 2>/dev/null; then
-  ok "钉住的镜像含「等待超过跑次寿命就不等」那一笔"
+#    2026-11-05 之前这里钉着一个 tag，理由是「检查点的身份里有 software，换镜像会整轮
+#    bail」——那条理由在 2026-11-05 修掉了（`crates/cog-eval/src/rig.rs::same_experiment`
+#    比材料时跳过 `software` 那一行），钉住的净值只剩副作用：钉着的 rev 会悄悄烂掉，而它
+#    烂掉时没有任何读数会喊（2026-11-04 钉的 main-ac2748167396 在 registry 里根本不存在，
+#    按它起的 Pod 只会 ImagePullBackOff，一轮都没跑起来过）。
+#
+#    所以这一格守两件事：默认读线上 deployment 的 image 字段；没有任何一处把 tag 写死
+#    在镜像位置上（写死了就等于又钉上了，而它不会再有任何读数替你喊）。
+pinline=$(grep -n '^IMAGE=\${IMAGE:-}$' "$SCRIPT" | head -1)
+if [ -z "$pinline" ]; then
+  bad "IMAGE 的默认值不是「跟线上走」（找不到 \`IMAGE=\${IMAGE:-}\` 那一行）"
+elif ! grep -q 'get deployment' "$SCRIPT" || ! grep -q "jsonpath='{.spec.template.spec.containers\[0\].image}'" "$SCRIPT"; then
+  bad "脚本没有从 deployment 的 image 字段取线上镜像"
+elif grep -nE '^[[:space:]]*(image:|IMAGE=\$\{IMAGE:-[^}]+\})$' "$SCRIPT" | grep -qE 'main-[0-9a-f]{12}'; then
+  bad "镜像位置上又写死了一个 main-<rev> tag：$(grep -nE '^[[:space:]]*(image:|IMAGE=\$\{IMAGE:-[^}]+\})$' "$SCRIPT" | grep -E 'main-[0-9a-f]{12}')"
 else
-  bad "钉住的 rev ${prrev} 早于 32c2ab3b：客户端会把整轮坐等在一次拒绝上"
+  ok "镜像默认取线上 deployment 的那一个，没有写死的 rev"
 fi
 
 # 8. 登记的必须是**主表臂**：`--tools platform`，不是 `--tools none`。
@@ -185,8 +187,8 @@ fi
 #    诊断臂把工具面关掉，按 cogneva 自己的定义（`ToolArm::is_table_arm`）它不是主表行，
 #    每一轮的退出理由里都写着「this run used the tools-off diagnostic arm, so it is not a
 #    main-table row」——判词一直是对的，命令行却一直没改，于是轮次再多也进不了表。
-#    这一条同时钉住两件事：臂选对了，且钉住的镜像**含 HLE 工具面那一笔**（缺了它，
-#    `--tools platform` 会因为「hle 没有工具实现」整跑 bail，比诊断臂退得更早）。
+#    （镜像里有没有 HLE 工具面以前靠比 rev 来判；现在跑的就是线上那一版，判它等于判
+#    线上能不能出主表行——那是另一条面的读数，不在这份脚本的判据里。）
 if [ "${pod_rendered:-0}" -eq 1 ]; then
   arm=$(python3 - "$TMP/pod.yaml" <<'PY' 2>&1
 import sys, yaml
@@ -202,17 +204,6 @@ PY
     platform) ok "登记的命令行用的是主表臂 --tools platform" ;;
     *) bad "登记的臂是「$arm」：诊断臂跑多少轮都不会成为主表行" ;;
   esac
-fi
-if [ -n "${prrev:-}" ]; then
-  # 「读不到那一笔」不许读成绿：浅克隆里这个对象根本不在，静默跳过时这一格与「核对过、
-  # 确实含」在摘要上同形，而它正是最该响的那一格（CI 默认就是 depth=1）。
-  if ! git -C "$REPO" cat-file -e b339b42a 2>/dev/null; then
-    bad "读不到 b339b42a：判不了钉住的镜像有没有 HLE 工具面（浅克隆？用 fetch-depth: 0）"
-  elif git -C "$REPO" merge-base --is-ancestor b339b42a "$prrev" 2>/dev/null; then
-    ok "钉住的镜像含 HLE 的三件工具面（web_search / web_fetch / python）"
-  else
-    bad "钉住的 rev ${prrev} 早于 b339b42a：它没有 HLE 工具面，--tools platform 会整跑 bail"
-  fi
 fi
 
 printf '%s passed, %s failed\n' "$pass" "$fail"

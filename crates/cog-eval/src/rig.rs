@@ -105,8 +105,17 @@ pub struct RunConfig {
 
 /// 检查点的落点与它的身份。
 ///
-/// 身份与记录写在一起：接的时候先比它，不一致就**拒绝**（不是从头再来）——两次实验的例
+/// 身份与记录写在一起：接的时候先比它，**同一次实验才接**（不是从头再来）。两次实验的例
 /// 混进同一张表，比丢掉一次重跑贵得多，而且从表上根本看不出来。
+///
+/// 但「同一次实验」不等于「同一串摘要」：身份材料里有一行是**这一跑的软件版本**，而它换得
+/// 比什么都勤——一次部署换一次。按整个摘要比，等于每换一版镜像就把这张表从第一例重新开始；
+/// 2026-11-05 实测到的就是这个形状：臂判到 33/198 之后，每次滚动都让它归零，于是它永远
+/// 画不出第二行（见 `memory/feedback_a_checkpoint_is_keyed_on_the_software_rev_so_an_image_change_starts_over.md`）。
+///
+/// 所以判据取在**材料原文**上：逐行比，跳过 `software` 那一行。软件版本不是丢掉，而是移到
+/// **每一行**上做来源戳（`CheckpointLine::Case::software`）——一张跨了几版软件的表现在把
+/// 这件事写在脸上，而不是靠「拒绝续跑」这一种手段回避它。
 ///
 /// **记哪些例，只此一条判据**：判分器给出过判词的才记。起不来环境、上游拒了这些**不记**，
 /// 续跑时重跑它们——它们是这一格之外的原因，记下来就等于把一次上游抖动钉成这一格的分数。
@@ -116,8 +125,12 @@ pub struct RunConfig {
 pub struct Checkpoint {
     pub path: PathBuf,
     /// 这次实验的身份。由调用方从它的 pins 导出（数据 rev 与 sha、骨干与裁判的模型名与
-    /// 版本、种子表、子集文件、外壳清单）——评测台不认识 pins，只负责把这一串原样带着走。
+    /// 版本、种子表、子集文件、外壳清单、软件版本）——评测台不认识 pins，只负责把这一串
+    /// 原样带着走。它是材料的 sha256，写进表头做「这份记录是谁起的」。
     pub run_id: String,
+    /// 身份材料的原文。续跑要的是**逐行比**它（见上），摘要比不了——
+    /// 摘要不相等分不出「换了软件」与「换了骨干」。
+    pub material: String,
 }
 
 /// 检查点里的一行。头一行记这次实验的身份，其余每行是**一个例**的坐标与结果。
@@ -125,11 +138,19 @@ pub struct Checkpoint {
 /// 坐标是四个：基准、外壳、种子、例 id。三个种子是三个独立运行，少一个坐标就会把
 /// 「第 2 个种子的第 7 题」读成「第 1 个种子的第 7 题」——那会让一张表看起来是三次
 /// 运行，其实是同一个数当了三份。
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum CheckpointLine {
     Header {
         run_id: String,
+        /// 写这一行那一跑的 `material` 原文。
+        ///
+        /// 存原文而不是只存摘要，因为续跑要比的是**它的每一行**（跳过 `software` 那行）：
+        /// 摘要不相等分不出「换了软件」与「换了骨干」，而这两件事的处置正相反。
+        /// 2026-11-05 之前写下的记录没有这一格——那时只存摘要，于是任何一次换版本都只能
+        /// 拒接；读回来是 `None`，按「没有可比的材料」处理。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        material: Option<String>,
     },
     Case {
         benchmark: String,
@@ -147,7 +168,72 @@ enum CheckpointLine {
         /// 旧记录没有这一格，读回来是 `None`——那是「当时没量」，不是「问了零次」。
         #[serde(default)]
         requests: Option<u64>,
+        /// 判这一例的是哪一版软件（写进材料的那个 `software` 值）。
+        ///
+        /// 这一格是「换镜像不重来」的另一半：续跑不再按软件版本拒绝，代价是同一张表里
+        /// 可能同时躺着几版软件判出来的例。来源戳在每一行上，报表按它数出「这张表是几版
+        /// 拼的」（`Table::checkpoint_provenance`）——两张表混在一起看不清，是这个字段
+        /// 要防的；它防的方式是**说出来**，不是**拒接**。
+        ///
+        /// 旧记录没有这一格，读回来是 `None`：那是「当时没记」，不是「不是这次跑的」。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        software: Option<String>,
     },
+}
+
+/// 两份身份材料说的是不是同一次实验：**逐行比，跳过 `software` 那一行**。
+///
+/// 为什么跳过的是它而不是别的：身份里其余每一行（pins、骨干、裁判、工具臂、视觉臂、基准、
+/// 外壳、种子、子集）换掉任何一项，旧判词的含义就变了——同一道题的同一个坐标会指向另一份
+/// 内容，接上去就是把两次实验并成一张表。软件版本不在这一列：它换的是跑它的那台机器的
+/// 代码，而这张表要量的东西不随部署滚动。
+fn same_experiment(a: &str, b: &str) -> bool {
+    fn lines(s: &str) -> Vec<&str> {
+        s.lines().filter(|l| !l.starts_with("software\t")).collect()
+    }
+    lines(a) == lines(b)
+}
+
+/// 材料里那一行 `software` 的值，用作每一例的来源戳。
+fn software_of(material: &str) -> Option<String> {
+    material
+        .lines()
+        .find_map(|line| line.strip_prefix("software\t"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// 判据材料的旁注文件：`<checkpoint>.identity`，内容是材料原文。
+///
+/// 为什么不写进记录本身：记录里只有两种行——表头与用例，而**所有数已判例数的读者**
+/// （跑臂脚本的 `judged()`、报表、值守）都是「非表头的行就是用例」。多一种行会让那几处
+/// 计数整体多一行，那是把另一个面的读数改坏来修这一面。
+///
+/// 它只在**旧格式记录**（表头里没有材料原文）第一次被接上时写一次。没有它，那份记录以后
+/// 每一次续跑都只能走「没有可比的材料 ⇒ 认下」那条路——于是它永远不会再拒绝任何一次
+/// 换了骨干的重跑，而那正是这份记录存在时要防的事。
+fn basis_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".identity");
+    path.with_file_name(name)
+}
+
+/// 记下这份记录下次续跑要比的材料。写临时文件再改名：读的一侧永远看到完整的一份，
+/// 不会读到写了一半的材料（那会让下一次续跑误判成「另一份实验」）。
+fn remember_basis(path: &std::path::Path, material: &str) -> anyhow::Result<()> {
+    let target = basis_path(path);
+    let mut tmp = target.file_name().unwrap_or_default().to_os_string();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = target.with_file_name(tmp);
+    std::fs::write(&tmp, material)
+        .map_err(|e| anyhow::anyhow!("cannot write the identity note {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, &target).map_err(|e| {
+        anyhow::anyhow!(
+            "cannot move the identity note into {}: {e}",
+            target.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// 已经在跑的那份检查点：接的时候读它，跑完一例追加一行。
@@ -155,19 +241,31 @@ struct CheckpointLog {
     file: std::sync::Mutex<std::fs::File>,
     /// 已经跑完的例：坐标 → 它当时的结果。
     done: std::collections::HashMap<(String, String, u64, String), CaseOutcome>,
+    /// 这一跑的来源戳（写进它追加的每一例）。
+    software: Option<String>,
+    /// 记录里每一例是哪一版软件判的：软件版本 → 例数，键 `-` 是旧记录里没有来源戳的那些。
+    /// 读回来时按行数，写出去时跟着加一——报表靠它说出「这张表是几版拼的」。
+    provenance: std::sync::Mutex<std::collections::BTreeMap<String, usize>>,
 }
 
 impl CheckpointLog {
     /// 打开（必要时新建）检查点，读回已经跑完的那些例，并**占住这一份记录**。
     ///
-    /// 四种情形分开处理，因为它们在文件系统上长得一样、处理却完全不同：
+    /// 五种情形分开处理，因为它们在文件系统上长得一样、处理却完全不同：
     /// - 还不存在：新建，写头一行。
-    /// - 头一行是**另一次实验**、并且后面跟着例：拒绝，不是从头再来。把两次实验的例
-    ///   装进同一份记录，表上完全看不出来，而它的读数会被当成一次完整实验读（这正是
-    ///   「id 已被占用」与「工作还在手上」是两件事的那一族）。
-    /// - 头一行是**另一次实验**、后面一条例都没有：按旧身份归档，这一份从表头重开。
-    ///   没有例可混，而软件身份换一次镜像就变一次，不归档的话每一条续跑都会撞在同一条
-    ///   拒绝上、一次也落不了地。
+    /// - 头一行的材料与这一跑**除软件版本以外逐行相同**、连软件版本也相同：接着跑。
+    /// - 头一行的材料**除软件版本以外逐行相同**、软件版本不同：**照样接着跑**，新记的例
+    ///   带上这一版软件的来源戳。一次部署换一次版本，按版本拒接等于让这张表永远停在
+    ///   第一次部署判到的地方。
+    /// - 头一行的材料在**别的行**上不同（换骨干、换裁判、换子集、换工具臂……）：拒绝。
+    ///   旧判词的坐标于是指向另一份内容，接上去就是把两次实验并成一张表——表上完全看不
+    ///   出来，而它的读数会被当成一次完整实验读（这正是「id 已被占用」与「工作还在手上」
+    ///   是两件事的那一族）。后面一条例都没有时改为按旧身份归档、从表头重开：没有例可混。
+    /// - 头一行是旧格式（只存摘要、没有材料原文）：摘要里卷着当时的软件版本，而那一版
+    ///   已经不在手上，没有可比的材料。**承载着例就认下**——那些例是现在唯一能接的东西，
+    ///   并算进来源统计的 `-` 那一档（「当时没记」）；一条例都没有就按旧身份归档、重开。
+    ///   认下的同时把这一份材料写进旁注（`basis_path`），**从下一次起它重新受判据约束**：
+    ///   不写的话，这一份记录会永远接任何重跑（包括换了骨干的），而那正是它要防的事。
     /// - 末行残缺：一次崩在追加中途留下的。截到最后一个换行，那一例按没跑过重跑——
     ///   半行 JSON 留在文件里的话，下次接会在中间那一行炸掉，把整份记录变成不可读。
     ///
@@ -191,41 +289,76 @@ impl CheckpointLog {
             .unwrap_or(0);
 
         let mut done = std::collections::HashMap::new();
+        let mut provenance: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        // 这一份记录下次续跑要比的材料：表头里写了就用它，没写就用旁注文件（旧格式第一次
+        // 被接上时留下），两处都没有才是「没有可比的材料」。
+        let mut basis_written = std::fs::read_to_string(basis_path(&cp.path)).ok();
         let text = String::from_utf8_lossy(&bytes[..usable]);
         let mut lines = text.lines();
         if let Some(first) = lines.next() {
             let mut restart = false;
             match serde_json::from_str::<CheckpointLine>(first) {
-                // 另一份实验的记录，而且里面还有例：人得决定怎么处置它（并档还是另起），
-                // 所以拒绝。它守的是「两份实验的例别混进一张表」——一条例都没承载的
-                // 记录里没有可混的东西，而软件身份每换一次镜像就变一次，留着它只会让
-                // 每一条无人值守的续跑都在同一条拒绝上撞死、一次也落不了地。
-                Ok(CheckpointLine::Header { run_id }) if run_id != cp.run_id => {
+                Ok(CheckpointLine::Header { run_id, material }) => {
+                    // 一条例都没承载的记录里没有可混的东西。先算它，因为旧格式那一路要用。
                     let carried = lines.clone().any(|line| !line.trim().is_empty());
-                    if carried {
-                        anyhow::bail!(
-                            "the checkpoint {} belongs to a different run ({} vs {}): resuming it \
-                             would put two experiments' cases in one table, so this run refuses \
-                             to continue -- move the file aside to start the new experiment",
-                            cp.path.display(),
-                            run_id,
-                            cp.run_id
-                        );
+                    // 旧格式（只存摘要）：摘要里卷着当时的软件版本，而那一版已经不在手上。
+                    // 没有可比的材料时，**承载着例就认下**——那些例是现在唯一能接的东西，
+                    // 而拒接的代价是把它们全部重跑一遍（2026-11-05 之前每换一次镜像都要付
+                    // 一次）。它们没有来源戳，落进 `-` 那一档：那是「当时没记」，不是
+                    // 「另一版软件」。一条例都没有就没有可丢的，按旧身份归档、重开。
+                    let basis = material.or_else(|| basis_written.clone());
+                    let same = match &basis {
+                        Some(written) => same_experiment(written, &cp.material),
+                        None => carried,
+                    };
+                    if !same {
+                        // 另一份实验的记录，而且里面还有例：人得决定怎么处置它（并档还是
+                        // 另起），所以拒绝。它守的是「两份实验的例别混进一张表」——一条例
+                        // 都没承载的记录里没有可混的东西，按旧身份归了档、从表头重开。
+                        if carried {
+                            anyhow::bail!(
+                                "the checkpoint {} belongs to a different run ({} vs {}): resuming \
+                                 it would put two experiments' cases in one table, so this run \
+                                 refuses to continue -- move the file aside to start the new \
+                                 experiment",
+                                cp.path.display(),
+                                run_id,
+                                cp.run_id
+                            );
+                        }
+                        let archived = archive_name(&cp.path, &run_id);
+                        std::fs::rename(&cp.path, &archived).map_err(|e| {
+                            anyhow::anyhow!(
+                                "the checkpoint {} is a header from another run and cannot be \
+                                 moved aside to {}: {e}",
+                                cp.path.display(),
+                                archived.display()
+                            )
+                        })?;
+                        // 归档之后这一份记录从表头重新开始：下面那段按 `usable` 判要不要写头。
+                        usable = 0;
+                        restart = true;
+                    } else {
+                        // 认下了、而记录自己没有留下可比的材料（旧格式、且没有旁注）：
+                        // 把这一份材料记到旁注里，从下一次起它就重新受判据约束——
+                        // 否则这一份记录**永远**接任何重跑，那正是它要防的事。
+                        if basis.is_none() {
+                            remember_basis(&cp.path, &cp.material)?;
+                            basis_written = Some(cp.material.clone());
+                        }
+                        if run_id != cp.run_id {
+                            // 同一次实验、换了一版软件：接着跑。来源戳会把这件事说出来，
+                            // 所以这里只需要留一条日志，让人从 pod 的日志能看出发生过换版。
+                            tracing::info!(
+                                checkpoint = %cp.path.display(),
+                                started_by = %&run_id[..run_id.len().min(12)],
+                                now = %&cp.run_id[..cp.run_id.len().min(12)],
+                                "resuming a checkpoint written by another software revision"
+                            );
+                        }
                     }
-                    let archived = archive_name(&cp.path, &run_id);
-                    std::fs::rename(&cp.path, &archived).map_err(|e| {
-                        anyhow::anyhow!(
-                            "the checkpoint {} is a header from another run and cannot be moved \
-                             aside to {}: {e}",
-                            cp.path.display(),
-                            archived.display()
-                        )
-                    })?;
-                    // 归档之后这一份记录从表头重新开始：下面那段按 `usable` 判要不要写头。
-                    usable = 0;
-                    restart = true;
                 }
-                Ok(CheckpointLine::Header { .. }) => {}
                 _ => anyhow::bail!(
                     "the checkpoint {} does not start with a run header: it is either not a \
                      checkpoint or it was written by something else",
@@ -256,7 +389,11 @@ impl CheckpointLog {
                         tokens,
                         steps,
                         requests,
+                        software,
                     } => {
+                        *provenance
+                            .entry(software.unwrap_or_else(|| "-".to_string()))
+                            .or_insert(0) += 1;
                         done.insert(
                             (benchmark, scaffold, seed, case_id.clone()),
                             CaseOutcome {
@@ -307,15 +444,33 @@ impl CheckpointLog {
                 file,
                 "{}",
                 serde_json::to_string(&CheckpointLine::Header {
-                    run_id: cp.run_id.clone()
+                    run_id: cp.run_id.clone(),
+                    material: Some(cp.material.clone()),
                 })?
             )?;
             file.flush()?;
+            // 记录是新起的（第一次、或刚把上一份归档）：旁注跟着换成这一份的材料。
+            // 不换的话，上一份记录留下的旁注会拿旧骨干去比这一份。
+            if basis_written.as_deref() != Some(cp.material.as_str()) {
+                remember_basis(&cp.path, &cp.material)?;
+            }
         }
         Ok(Self {
             file: std::sync::Mutex::new(file),
             done,
+            software: software_of(&cp.material),
+            provenance: std::sync::Mutex::new(provenance),
         })
+    }
+
+    /// 记录里每一例是哪一版软件判的，按键排序。报表按它说出「这张表是几版拼的」。
+    fn provenance(&self) -> Vec<(String, usize)> {
+        self.provenance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|(software, cases)| (software.clone(), *cases))
+            .collect()
     }
 
     fn get(
@@ -336,11 +491,29 @@ impl CheckpointLog {
     }
 
     /// 记下跑完的一例。写在判分之后——判词是这一行的一半。
+    ///
+    /// 来源戳在这里补上，不由调用方传：判这一例的是哪一版软件，是这份记录自己的事实，
+    /// 调用方（`run_seed`）拿不到，也不该为它多穿一个参数。
     fn record(&self, line: &CheckpointLine) -> anyhow::Result<()> {
         use std::io::Write;
+        let mut line = line.clone();
+        let mut written = String::from("-");
+        if let CheckpointLine::Case { software, .. } = &mut line {
+            *software = self.software.clone();
+            if let Some(s) = software {
+                written = s.clone();
+            }
+        }
         let mut file = self.file.lock().unwrap();
-        writeln!(file, "{}", serde_json::to_string(line)?)?;
+        writeln!(file, "{}", serde_json::to_string(&line)?)?;
         file.flush()?;
+        drop(file);
+        *self
+            .provenance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(written)
+            .or_insert(0) += 1;
         Ok(())
     }
 }
@@ -587,6 +760,13 @@ pub struct Table {
     /// 读的人就只能看到两个因子，「这一次放进来几个」还差一个数。
     #[serde(default)]
     pub column_ceilings: Vec<(String, Option<usize>)>,
+    /// 检查点里每一例是哪一版软件判的（软件版本 → 例数），`-` 是旧记录里没记来源的那些。
+    ///
+    /// 续跑不按软件版本拒绝，代价是同一张表可能由几版软件的例拼成。这件事必须在产物上
+    /// 说得出来：不说的话，「这一格是这一版跑出来的」与「这一格是几版拼的」在表上同形，
+    /// 而后者要读成一份合并读数之前，先得知道它混了几版。空 ＝ 这次跑没接检查点。
+    #[serde(default)]
+    pub checkpoint_provenance: Vec<(String, usize)>,
 }
 
 impl Table {
@@ -808,6 +988,7 @@ impl Rig {
                 .iter()
                 .map(|b| (b.name.clone(), b.column_ceiling))
                 .collect(),
+            checkpoint_provenance: log.as_ref().map(|log| log.provenance()).unwrap_or_default(),
         })
     }
 
@@ -973,6 +1154,8 @@ impl Rig {
                             tokens: outcome.tokens,
                             steps: outcome.steps,
                             requests: outcome.requests,
+                            // 由 `CheckpointLog::record` 填上这一跑的软件版本。
+                            software: None,
                         };
                         if let Err(e) = log.record(&line) {
                             tracing::warn!(case = %outcome.case_id, error = %e, "cannot append to the checkpoint: this case will be re-run next time");
@@ -1746,10 +1929,23 @@ mod tests {
         )
     }
 
+    /// 判据是**材料**，`run_id` 只是它的摘要戳。所以这里的材料整份从 `run_id` 派生：
+    /// 测试里说「换了一次实验」，指的就是身份本身变了（骨干那一行）。
     fn checkpoint_at(path: &std::path::Path, run_id: &str) -> Checkpoint {
         Checkpoint {
             path: path.to_path_buf(),
             run_id: run_id.into(),
+            material: format!("backbone\t{run_id}\n"),
+        }
+    }
+
+    /// 同一份实验、换了一版软件：只有 `software` 那一行不同（连摘要也跟着不同）。
+    fn checkpoint_at_rev(path: &std::path::Path, software: &str) -> Checkpoint {
+        let material = format!("backbone\tmodel@1\nsoftware\t{software}\n");
+        Checkpoint {
+            path: path.to_path_buf(),
+            run_id: format!("rev-{software}"),
+            material,
         }
     }
 
@@ -1962,6 +2158,95 @@ mod tests {
         );
     }
 
+    /// 换了一版软件（一次部署）**不**让已经判过的例作废：接着跑，不重来。
+    ///
+    /// 这一条守的是一件现场连续发生过半个月的事：臂判到 33/198 之后每一次滚动都把它从
+    /// 第一例重来，于是它永远画不出第二行——而「按身份拒接」在纸面上是一条保护（别把两次
+    /// 实验并成一张表），在天天部署的环境里就变成「一次也接不上」。身份里换的是软件版本，
+    /// 不是判词的含义：别的行一行不动时，接。
+    #[tokio::test]
+    async fn a_new_software_revision_resumes_the_cases_an_older_one_judged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.cases.jsonl");
+
+        rig_checkpointed(checkpoint_at_rev(&path, "rev-a"))
+            .with_scaffold(Arc::new(AlwaysRight))
+            .run(&[bench("hle", Arc::new(OkEnv))])
+            .await
+            .unwrap();
+
+        // 第二遍换一版软件，外壳「一叫到就炸」：读数只能来自检查点。
+        let second = rig_checkpointed(checkpoint_at_rev(&path, "rev-b"))
+            .with_scaffold(Arc::new(SameNameButBroken))
+            .run(&[bench("hle", Arc::new(OkEnv))])
+            .await
+            .unwrap();
+        let cell = second.cell("always-right", "hle").unwrap();
+        assert_eq!(cell.errored(), 0, "出错就说明它把旧例重跑了");
+        assert_eq!(cell.resumed(), 2, "两题都该从盘上接着来");
+
+        // 表上要能说出这一格是几版软件的例拼的。
+        assert_eq!(
+            second.checkpoint_provenance,
+            vec![("rev-a".to_string(), 2)],
+            "旧例的来源戳是判它们的那一版"
+        );
+    }
+
+    /// 换版本后**新记的**例带自己的那一版戳，旧行不被改写。
+    #[test]
+    fn a_case_written_after_a_revision_change_carries_its_own_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.cases.jsonl");
+        let case = |id: &str| CheckpointLine::Case {
+            benchmark: "hle".into(),
+            scaffold: "always-right".into(),
+            seed: 0,
+            case_id: id.into(),
+            verdict: Verdict::pass("ok"),
+            errored: false,
+            tokens: 0,
+            steps: 0,
+            requests: None,
+            software: None,
+        };
+
+        let first = CheckpointLog::open(&checkpoint_at_rev(&path, "rev-a")).unwrap();
+        first.record(&case("a")).unwrap();
+        drop(first);
+
+        let second = CheckpointLog::open(&checkpoint_at_rev(&path, "rev-b")).unwrap();
+        assert!(second.get("hle", "always-right", 0, "a").is_some());
+        second.record(&case("b")).unwrap();
+        assert_eq!(
+            second.provenance(),
+            vec![("rev-a".to_string(), 1), ("rev-b".to_string(), 1)],
+            "两行各带自己那一版"
+        );
+        drop(second);
+
+        let stamps: Vec<(String, Option<String>)> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .filter_map(
+                |line| match serde_json::from_str::<CheckpointLine>(line).ok()? {
+                    CheckpointLine::Case {
+                        case_id, software, ..
+                    } => Some((case_id, software)),
+                    CheckpointLine::Header { .. } => None,
+                },
+            )
+            .collect();
+        assert_eq!(
+            stamps,
+            vec![
+                ("a".to_string(), Some("rev-a".to_string())),
+                ("b".to_string(), Some("rev-b".to_string())),
+            ],
+            "旧行不被改写，新行带这一版"
+        );
+    }
+
     /// 表头属于另一次实验、却一条例都没承载：按旧身份归档，这一次从表头重新开始。
     ///
     /// 软件身份每换一次镜像就变一次，所以这条拒绝在无人值守的续跑里会一直撞下去，
@@ -1973,6 +2258,7 @@ mod tests {
         let path = dir.path().join("run.cases.jsonl");
         let mut text = serde_json::to_string(&CheckpointLine::Header {
             run_id: "run-old".into(),
+            material: None,
         })
         .unwrap();
         text.push('\n');
@@ -1984,7 +2270,7 @@ mod tests {
         let fresh = std::fs::read_to_string(&path).unwrap();
         let first: CheckpointLine = serde_json::from_str(fresh.lines().next().unwrap()).unwrap();
         assert!(
-            matches!(first, CheckpointLine::Header { ref run_id } if run_id == "run-new"),
+            matches!(first, CheckpointLine::Header { ref run_id, .. } if run_id == "run-new"),
             "这一份记录从这次实验的表头重新开始，不是接上一次的：{fresh}"
         );
 
@@ -2132,13 +2418,64 @@ mod tests {
         }
     }
 
+    /// 旧格式记录被认下之后，**下一次**换了骨干照样拒接：认下不能变成永久放行。
+    ///
+    /// 认下那一刻要把材料记到旁注里。不记的话，这份记录从此永远走「没有可比的材料 ⇒ 认」，
+    /// 于是它再也不拒绝任何重跑——包括换骨干、换裁判、换子集的那种，而那正是
+    /// 「两次实验的例别混进一张表」要防的事。
+    #[tokio::test]
+    async fn a_legacy_checkpoint_is_strict_again_once_it_has_been_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.cases.jsonl");
+        let mut text = serde_json::to_string(&CheckpointLine::Header {
+            run_id: "run-old".into(),
+            material: None,
+        })
+        .unwrap();
+        text.push('\n');
+        text.push_str(
+            &serde_json::to_string(&CheckpointLine::Case {
+                benchmark: "hle".into(),
+                scaffold: "always-right".into(),
+                seed: 7,
+                case_id: "a".into(),
+                verdict: Verdict::pass("ok"),
+                errored: false,
+                tokens: 0,
+                steps: 0,
+                requests: None,
+                software: None,
+            })
+            .unwrap(),
+        );
+        text.push('\n');
+        std::fs::write(&path, text).unwrap();
+
+        // 第一次：旧格式、承载着例 ⇒ 认下，并把材料记进旁注。
+        let log = CheckpointLog::open(&checkpoint_at(&path, "run-1")).unwrap();
+        assert!(log.get("hle", "always-right", 7, "a").is_some());
+        drop(log);
+        assert!(
+            basis_path(&path).exists(),
+            "认下之后要留下旁注，否则下一次又只能靠「没有可比的材料」放行"
+        );
+
+        // 第二次：换了骨干。旁注在，判据重新生效 ⇒ 拒接。
+        let err = CheckpointLog::open(&checkpoint_at(&path, "run-2"))
+            .err()
+            .expect("换了骨干就该拒接");
+        assert!(err.to_string().contains("different run"), "{err}");
+    }
+
     /// 旧记录里没有这一格：读回来是「当时没量」，不是「问了零次」。
     #[tokio::test]
     async fn a_record_from_before_the_request_count_reads_as_unmeasured_not_zero() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("run.cases.jsonl");
+        // 头也是旧形状：没有 `material`。这一格同时还守着「旧格式、承载着例 ⇒ 认下」。
         let mut text = serde_json::to_string(&CheckpointLine::Header {
             run_id: "run-1".into(),
+            material: None,
         })
         .unwrap();
         text.push('\n');
@@ -2166,6 +2503,7 @@ mod tests {
         let path = dir.path().join("run.cases.jsonl");
         let mut text = serde_json::to_string(&CheckpointLine::Header {
             run_id: "run-1".into(),
+            material: Some("backbone\trun-1\n".into()),
         })
         .unwrap();
         text.push('\n');
@@ -2180,6 +2518,7 @@ mod tests {
                 tokens: 0,
                 steps: 0,
                 requests: None,
+                software: None,
             })
             .unwrap(),
         );
