@@ -60,8 +60,35 @@ pub fn stop_the_line_ready_stream(workspace_id: &str) -> String {
 /// `Pending` until its owner asks for it, which is the same state a task
 /// waiting on a dependency sits in -- the ready scan offers it again on every
 /// pass, so nothing has to remember that it was held.
+///
+/// The stop-the-line lane is the one exception, and it is named here rather
+/// than in each caller because the three places that read ownership -- the
+/// publisher, the consumer that finds an owned payload on a shared stream, and
+/// the check that refuses a result from a unit other than the owner -- have to
+/// answer the same way or the row is stranded in a new way at each. That lane
+/// exists to run while everything else waits, and an owner is a routing
+/// preference, not a lock: whichever deployment is free runs the row, and its
+/// result is that deployment's to report. Measured 2026-11-05: the face
+/// restaffing pass stamped the CI face's owner onto every open row of that
+/// face, including the `-fix` row the deployer had just filed in the
+/// stop-the-line lane; the publisher then held that row out of every queue for
+/// ten hours while the dedicated lane sat drained, and the rollout stayed
+/// stopped on the revision it was filed for.
 pub fn carries_an_owner(task: &Task) -> bool {
-    task.owner_unit.is_some()
+    task.owner_unit.is_some() && !is_stop_the_line(task)
+}
+
+/// Whether this row travels in the lane that runs ahead of the ordinary queue.
+///
+/// One definition because the publisher's routing, the consumer's refusal and
+/// the ownership gate above all have to agree on it: a row that one of them
+/// reads as ordinary and another as stop-the-line is either held out of the
+/// lane it was filed for or handed to a queue that cannot pay for it.
+pub fn is_stop_the_line(task: &Task) -> bool {
+    task.input
+        .get(cog_core::INPUT_READY_LANE)
+        .and_then(|lane| lane.as_str())
+        == Some(cog_core::READY_LANE_STOP_THE_LINE)
 }
 
 /// Whether a task is work the dispatcher may start as a run.
@@ -123,12 +150,7 @@ pub fn is_face_duty(task: &Task) -> bool {
 /// The queue a ready task is published to. One definition, because the
 /// publisher and the consumer must answer the same question the same way.
 pub fn ready_stream_for(task: &Task, workspace_id: &str) -> String {
-    if task
-        .input
-        .get(cog_core::INPUT_READY_LANE)
-        .and_then(|lane| lane.as_str())
-        == Some(cog_core::READY_LANE_STOP_THE_LINE)
-    {
+    if is_stop_the_line(task) {
         stop_the_line_ready_stream(workspace_id)
     } else if task.is_self_evolution() {
         process_local_ready_stream(workspace_id)
@@ -630,6 +652,36 @@ mod tests {
             "an owned task on the shared queue would be run by whoever read it \
              first, and its owner would only learn that afterwards"
         );
+    }
+
+    /// The lane that runs while everything else waits must not be held by an
+    /// owner. Measured on 2026-11-05: the restaffing pass wrote the CI face's
+    /// owner onto the deployer's just-filed `-fix` row, the publisher held it
+    /// out of both queues, and the rollout stayed stopped for ten hours while
+    /// the stop-the-line stream sat drained.
+    #[test]
+    fn an_owned_row_in_the_stop_the_line_lane_is_still_offered() {
+        let mut owned = task(
+            "t7",
+            TaskType::Custom("ci_hold_fix".into()),
+            serde_json::json!({ (cog_core::INPUT_READY_LANE): cog_core::READY_LANE_STOP_THE_LINE }),
+        );
+        owned.owner_unit = Some("f5".into());
+        assert!(
+            !carries_an_owner(&owned),
+            "the lane outranks ownership: an owner is who the row is for, not a \
+             lock on who may run it, and holding it here strands the row in a \
+             lane nothing else can serve"
+        );
+        assert_eq!(
+            ready_stream_for(&owned, "ws"),
+            stop_the_line_ready_stream("ws")
+        );
+
+        // Everything else keeps the rule: the same owner, no lane, still held.
+        let mut ordinary = task("t8", TaskType::DagNode, serde_json::json!({}));
+        ordinary.owner_unit = Some("f5".into());
+        assert!(carries_an_owner(&ordinary));
     }
 
     #[test]

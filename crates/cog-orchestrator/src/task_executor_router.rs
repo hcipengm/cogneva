@@ -636,7 +636,16 @@ impl TaskExecutorRouter {
         // Pending, where the owner's own claim finds it. Leaving it unacked
         // instead would make the sweeper redeliver it every claim interval for
         // as long as the task exists.
-        if let Some(owner) = task.owner_unit.as_deref() {
+        //
+        // The stop-the-line lane is not the ordinary queue and is asked the
+        // same question through [`crate::ready_queue::carries_an_owner`]: a
+        // row filed there is meant for whoever is free, so a payload that
+        // still names a face's unit is run rather than dropped.
+        if let Some(owner) = task
+            .owner_unit
+            .as_deref()
+            .filter(|_| crate::ready_queue::carries_an_owner(&task))
+        {
             // Named per message rather than counted into one number: the
             // question this answers is "which task went where", and a bare
             // count cannot say it. Each occurrence is a publisher that has not
@@ -1239,6 +1248,43 @@ mod ready_pipeline_tests {
             )
             .await;
         assert_eq!(backend.published.lock().await.len(), 1);
+    }
+
+    /// 停线通道上的归属不是拒绝执行的理由。
+    ///
+    /// 停线单是给「谁空谁跑」的，派工那一侧（[`crate::ready_queue::carries_an_owner`]）
+    /// 已经不拿归属拦它；消费者如果仍按共享队列的规矩把这条 ack 掉，投递会被丢在
+    /// 最后一格，读起来和执行失败是一回事。
+    #[tokio::test]
+    async fn an_owned_stop_the_line_message_runs() {
+        let backend = Arc::new(ScriptedBackend::default());
+        let pipe = test_pipe(backend.clone());
+        let router = TaskExecutorRouter::new()
+            .with_executor(Arc::new(SlowExecutor {
+                sleep_secs: 0,
+                panic_instead: false,
+            }))
+            .await;
+
+        let mut lane = test_task(60);
+        lane.owner_unit = Some("f5".into());
+        lane.input[cog_core::INPUT_READY_LANE] =
+            serde_json::Value::String(cog_core::READY_LANE_STOP_THE_LINE.into());
+        router
+            .process_ready_message(
+                &pipe,
+                "m-lane".into(),
+                &serde_json::to_vec(&lane).unwrap(),
+                &test_hold(),
+            )
+            .await;
+
+        assert_eq!(
+            backend.published.lock().await.len(),
+            1,
+            "the lane's row has to run wherever it lands: nobody else will retry it \
+             once this message is acked away"
+        );
     }
 
     #[tokio::test]

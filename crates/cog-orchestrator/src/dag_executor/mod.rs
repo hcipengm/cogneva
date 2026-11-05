@@ -1398,12 +1398,21 @@ impl DagExecutorRuntime {
     /// mistake -- a look-alike id, a copied command, a unit that picked up the
     /// wrong row -- from finishing someone else's work. Refusing rather than
     /// applying keeps the row where its owner left it.
+    ///
+    /// A stop-the-line row is exempt for the reason the lane exists: whoever
+    /// was free ran it, so that unit -- not the face's staffer whose name the
+    /// restaffing pass wrote onto the row -- is the one that has the result.
+    /// Asking [`crate::ready_queue::carries_an_owner`] rather than testing the
+    /// lane again keeps this check and the two dispatch gates on one answer.
     async fn result_names_another_owner(&self, task_id: &str, sender: &str) -> bool {
         match self.orchestrator.get_task(task_id).await {
-            Some(task) => match task.owner_unit.as_deref() {
-                Some(owner) => owner != sender,
-                None => false,
-            },
+            Some(task) if crate::ready_queue::carries_an_owner(&task) => {
+                match task.owner_unit.as_deref() {
+                    Some(owner) => owner != sender,
+                    None => false,
+                }
+            }
+            Some(_) => false,
             // An unknown task is not this check's business: the transition
             // below rejects it on its own terms, with its own log line.
             None => false,
@@ -2790,6 +2799,144 @@ mod consumer_ack_tests {
         assert!(
             err.to_string().contains("already been offered"),
             "the refusal has to say why: {err}"
+        );
+    }
+
+    /// A row filed in the stop-the-line lane is published even when it names an
+    /// owner, and one that names no lane is still held.
+    ///
+    /// This is the reading the stranded rollout produced on 2026-11-05: the
+    /// deployer filed the CI repair as a stop-the-line row, the restaffing pass
+    /// wrote the CI face's owner onto it, and the publisher held it out of both
+    /// queues for ten hours -- the dedicated lane sat drained while the row it
+    /// exists for never arrived. The owner still travels on the row; only the
+    /// hold is what the lane takes away.
+    #[tokio::test]
+    async fn a_stop_the_line_row_is_published_although_it_names_an_owner() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-stop-the-line".into(),
+            consumer_group: "grp-stop-the-line".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-stop-the-line",
+                vec![
+                    ready_task(
+                        "task-lane",
+                        serde_json::json!({
+                            (cog_core::INPUT_READY_LANE): cog_core::READY_LANE_STOP_THE_LINE
+                        }),
+                    ),
+                    ready_task("task-plain", serde_json::json!({})),
+                ],
+            )
+            .await
+            .unwrap();
+
+        for id in ["task-lane", "task-plain"] {
+            runtime
+                .orchestrator()
+                .assign_task(id, "unit-f5")
+                .await
+                .expect("a pending task takes a binding");
+        }
+        runtime.publish_ready_tasks().await.unwrap();
+
+        let lane = runtime
+            .orchestrator()
+            .get_task("task-lane")
+            .await
+            .expect("task present");
+        assert_eq!(
+            lane.owner_unit.as_deref(),
+            Some("unit-f5"),
+            "the lane does not erase who the row is for; it only stops that name \
+             from keeping it off the queue"
+        );
+        assert_eq!(
+            lane.status,
+            cog_core::TaskStatus::Scheduled,
+            "the stop-the-line row has to be offered: its lane exists to run while \
+             everything else waits, and it has no other queue to arrive on"
+        );
+
+        let plain = runtime
+            .orchestrator()
+            .get_task("task-plain")
+            .await
+            .expect("task present");
+        assert_eq!(
+            plain.status,
+            cog_core::TaskStatus::Pending,
+            "without the lane the same owner still holds the row for its own claim"
+        );
+    }
+
+    /// The unit that ran a stop-the-line row is the one that has its result.
+    ///
+    /// Publishing the row is only half the exception: the run happens under
+    /// whichever unit was free, and the completion it sends names that unit.
+    /// Refusing it because the row still carries the face's owner would spend
+    /// the run and leave the row open -- the same strand, one step later.
+    #[tokio::test]
+    async fn a_stop_the_line_result_is_accepted_from_the_unit_that_ran_it() {
+        let backend = ScriptedBackend::default();
+        let config = DagExecutorConfig {
+            redis_url: "memory".into(),
+            workspace_id: "ws-stop-the-line-result".into(),
+            consumer_group: "grp-stop-the-line-result".into(),
+            max_retries: 1,
+            ..DagExecutorConfig::default()
+        };
+        let runtime = test_runtime_with(backend.clone(), config);
+        runtime
+            .orchestrator()
+            .submit_goal(
+                "goal-stop-the-line-result",
+                vec![
+                    ready_task(
+                        "task-lane",
+                        serde_json::json!({
+                            (cog_core::INPUT_READY_LANE): cog_core::READY_LANE_STOP_THE_LINE
+                        }),
+                    ),
+                    ready_task("task-plain", serde_json::json!({})),
+                ],
+            )
+            .await
+            .unwrap();
+        for id in ["task-lane", "task-plain"] {
+            runtime
+                .orchestrator()
+                .assign_task(id, "unit-f5")
+                .await
+                .expect("a pending task takes a binding");
+        }
+
+        assert!(
+            !runtime
+                .result_names_another_owner("task-lane", "unit-8b")
+                .await,
+            "the lane's whole point is that whoever is free runs it, so that \
+             unit's result is the row's result"
+        );
+        assert!(
+            runtime
+                .result_names_another_owner("task-plain", "unit-8b")
+                .await,
+            "outside the lane the owner check still refuses a stranger's result"
+        );
+        assert!(
+            !runtime
+                .result_names_another_owner("task-plain", "unit-f5")
+                .await,
+            "and the owner's own result is still accepted"
         );
     }
 
