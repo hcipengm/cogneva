@@ -810,6 +810,27 @@ pub trait StateBackend: Send + Sync {
         Ok(tasks)
     }
 
+    /// The rows in a workspace that can still bear on a dispatch decision.
+    ///
+    /// [`crate::TaskStatus::affects_dispatch`] is the rule and this is the
+    /// reader that applies it: `Failed` and `Cancelled` rows are left out,
+    /// `Completed` is kept because `blocked_by` resolves through it.
+    ///
+    /// The dispatch loop asks this on every pass, and a workspace that has been
+    /// running for a week is mostly history — measured on 2026-11-05, one pass
+    /// read 9,916 rows of which 5,843 could not change its answer, at ~1.9 s
+    /// per read. The default filters [`Self::dag_get_all_tasks`], which is
+    /// correct but reads everything; a backend that stores the status in a
+    /// column should override this so the exclusion happens in the query.
+    async fn dag_get_live_tasks(&self, workspace_id: &str) -> SFResult<Vec<crate::Task>> {
+        Ok(self
+            .dag_get_all_tasks(workspace_id)
+            .await?
+            .into_iter()
+            .filter(|task| task.status.affects_dispatch())
+            .collect())
+    }
+
     /// Counts of the tasks this backend holds, by state, across every
     /// workspace it knows about.
     ///

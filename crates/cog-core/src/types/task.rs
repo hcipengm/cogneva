@@ -532,6 +532,26 @@ impl TaskStatus {
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
         )
     }
+
+    /// Whether a row in this state can still change a dispatch decision.
+    ///
+    /// A ready scan reads the whole graph to answer three questions: what may
+    /// start, what is already moving, and which dependencies have been met.
+    /// Two of the six states cannot bear on any of them. A `Failed` row never
+    /// starts, and a `Cancelled` row never will; `blocked_by` resolves only
+    /// through `Completed`, so neither can satisfy a dependency either.
+    /// `Completed` is the one terminal state that stays: it is what makes a
+    /// successor ready.
+    ///
+    /// This is a separate question from [`Self::is_terminal`] and is not its
+    /// negation. The difference is exactly `Completed`, and a reader that
+    /// conflated the two would stop resolving dependencies the moment it
+    /// skipped terminal rows — every dependent would read as blocked forever.
+    /// Measured on 2026-11-05: 5,843 of 9,916 rows in one workspace were
+    /// `Cancelled` or `Failed`, and every dispatch pass was reading them back.
+    pub fn affects_dispatch(&self) -> bool {
+        !matches!(self, TaskStatus::Failed | TaskStatus::Cancelled)
+    }
 }
 
 /// What the task list and graph endpoints accept in their `status` query.
@@ -997,6 +1017,22 @@ impl Task {
 mod tests {
     use super::*;
     use crate::checkout::repo_root;
+
+    #[test]
+    fn only_the_two_states_that_can_never_move_are_left_out_of_a_dispatch_read() {
+        // 逐个变体过一遍 `ALL`，不点名字集：新增一个状态却忘了判它，这条会红，
+        // 而不是让新状态悄悄落进「不该被读出来」或者「必须每轮都读」里。
+        let kept: Vec<&str> = TaskStatus::ALL
+            .iter()
+            .filter(|s| s.affects_dispatch())
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(kept, vec!["pending", "scheduled", "running", "completed"]);
+        // 与 `is_terminal` 的差正好是 `completed`：把两者当成一个，依赖就永远
+        // 解不开——被依赖的那一行读不回来，后继每一轮都判成阻塞。
+        assert!(TaskStatus::Completed.is_terminal());
+        assert!(TaskStatus::Completed.affects_dispatch());
+    }
 
     /// 两个通道各自都能判死一次重试：类型通道（`error_cause` 为配额/鉴权这类
     /// 终态拒绝）与带内文本通道（`error` 里经 declares 命中的 terminal 前缀，

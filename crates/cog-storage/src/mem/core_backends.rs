@@ -1781,6 +1781,40 @@ mod owned_transition_tests {
         );
     }
 
+    /// 派发读回的行正好是「还能改变一个派发决定」的那些：`completed` 必须留下
+    /// （依赖只从它解开），`failed` / `cancelled` 必须走开。
+    ///
+    /// 反向那一半同样要立住——全量读仍然看得到全部六行，否则这条只证明了读得少，
+    /// 没证明读得对。
+    #[tokio::test]
+    async fn a_live_read_keeps_only_the_states_that_can_change_a_decision() {
+        let backend = MemoryStateBackend::new();
+        for status in TaskStatus::ALL {
+            let mut task = cog_core::Task::new(
+                format!("t-{}", status.as_str()),
+                cog_core::TaskType::DagNode,
+                serde_json::json!({}),
+            );
+            task.status = status;
+            let id = task.id.clone();
+            backend.dag_set_task("ws", &id, &task).await.unwrap();
+        }
+        let mut live: Vec<&str> = backend
+            .dag_get_live_tasks("ws")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|task| task.status.as_str())
+            .collect();
+        live.sort_unstable();
+        assert_eq!(live, vec!["completed", "pending", "running", "scheduled"]);
+        assert_eq!(
+            backend.dag_get_all_tasks("ws").await.unwrap().len(),
+            TaskStatus::ALL.len(),
+            "the narrowing belongs to the dispatch read, not to the store"
+        );
+    }
+
     #[tokio::test]
     async fn a_transition_cannot_move_a_task_to_another_owner() {
         // Ownership change is the handover's decision; a state transition that

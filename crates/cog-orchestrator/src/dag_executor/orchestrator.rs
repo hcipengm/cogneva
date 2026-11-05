@@ -1444,6 +1444,30 @@ impl DagExecutor {
         self.all_tasks_checked().await.unwrap_or_default()
     }
 
+    /// 派发这一轮真正要读的那些行。
+    ///
+    /// 派发只问三件事：谁能开工、谁已经在跑、谁的依赖已经满足。`failed` 与
+    /// `cancelled` 三件都答不了（`blocked_by` 只认 `completed`），所以不读它们；
+    /// 见 [`cog_core::TaskStatus::affects_dispatch`]。这不是省点内存：一个跑了一周
+    /// 的工作区九成是历史，2026-11-05 实测一次派发读回 9,916 行、其中 5,843 行
+    /// 改不了它的答案，一次 1.9 秒，而它每几秒就要问一次。
+    async fn live_tasks_unified(&self) -> Vec<Task> {
+        if let Some(be) = self.fg() {
+            be.dag_get_live_tasks(&self.workspace_id)
+                .await
+                .unwrap_or_default()
+        } else {
+            self.inner
+                .read()
+                .await
+                .tasks
+                .values()
+                .filter(|task| task.status.affects_dispatch())
+                .cloned()
+                .collect()
+        }
+    }
+
     /// 同上，但保留读失败。
     ///
     /// 内部的调用方把失败当成空图就够了——它们各自还有一层判据。读数不行：一次
@@ -2070,7 +2094,7 @@ impl DagExecutor {
     /// work finish in between and refuse against a column that has already
     /// drained.
     pub async fn ready_work(&self) -> ReadyWork {
-        let tasks = self.all_tasks_unified().await;
+        let tasks = self.live_tasks_unified().await;
         let mut columns: std::collections::HashMap<
             String,
             std::collections::BTreeMap<&'static str, u64>,

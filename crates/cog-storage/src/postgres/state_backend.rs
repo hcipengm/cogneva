@@ -793,6 +793,34 @@ impl StateBackend for PostgresStateBackend {
             .collect()
     }
 
+    /// 只有派发还要看的那些行；`failed` / `cancelled` 在查询里就被排掉。
+    ///
+    /// 排除的是哪几个状态由 [`cog_core::TaskStatus::affects_dispatch`] 一个
+    /// 地方决定，这里只把它的答案拼成参数——SQL 里再抄一遍字符串，两处就会
+    /// 各自漂移，而漂移的那一天表现为「某些行忽然不再被派发」。
+    async fn dag_get_live_tasks(&self, workspace_id: &str) -> SFResult<Vec<cog_core::Task>> {
+        let excluded: Vec<String> = cog_core::TaskStatus::ALL
+            .iter()
+            .filter(|status| !status.affects_dispatch())
+            .map(|status| status.as_str().to_string())
+            .collect();
+        let rows: Vec<(serde_json::Value,)> = self
+            .retry(|| async {
+                sqlx::query_as(
+                    "SELECT task FROM cog_dag_tasks \
+                     WHERE workspace_id = $1 AND status <> ALL($2::text[])",
+                )
+                .bind(workspace_id)
+                .bind(excluded.as_slice())
+                .fetch_all(&self.pool)
+                .await
+            })
+            .await?;
+        rows.into_iter()
+            .map(|(v,)| serde_json::from_value(v).map_err(SFError::Serialization))
+            .collect()
+    }
+
     // ─── 计划基线（task_plan）───
 
     async fn save_task_plan(&self, plan: &cog_core::TaskPlan) -> SFResult<()> {
