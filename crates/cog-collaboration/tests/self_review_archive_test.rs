@@ -188,7 +188,8 @@ impl AgentManager for MockAgentManager {
                 "summary": "mock plan",
                 "plan": {"approach": "mock"},
                 "sub_tasks": [
-                    {"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": []}
+                    {"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": [],
+                     "acceptance": ["the answer names the file it changed"]}
                 ],
             }),
         };

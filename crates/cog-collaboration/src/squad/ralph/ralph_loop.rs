@@ -1516,7 +1516,8 @@ mod tests {
             response: serde_json::json!({
                 "summary": "test analysis",
                 "plan": {"specification": "test spec", "design": "test design"},
-                "sub_tasks": [{"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": []}],
+                "sub_tasks": [{"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": [],
+                               "acceptance": ["the output states the exact version number"]}],
             }),
         }
     }
@@ -1598,6 +1599,182 @@ mod tests {
             }
             other => panic!("Expected Passed, got {:?}", other),
         }
+    }
+
+    /// 按轮次换答案的规划器：每轮取一条，同时记下这一轮收到的输入。
+    struct ScriptedPlanner {
+        responses: std::sync::Mutex<std::collections::VecDeque<serde_json::Value>>,
+        seen: std::sync::Mutex<Vec<serde_json::Value>>,
+    }
+
+    impl ScriptedPlanner {
+        fn new(responses: Vec<serde_json::Value>) -> Self {
+            Self {
+                responses: std::sync::Mutex::new(responses.into_iter().collect()),
+                seen: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn seen(&self) -> Vec<serde_json::Value> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl cog_core::Agent for ScriptedPlanner {
+        async fn prompt(&self, input: serde_json::Value) -> cog_core::SFResult<serde_json::Value> {
+            self.seen.lock().unwrap().push(input);
+            Ok(self.responses.lock().unwrap().pop_front().unwrap_or_else(
+                || serde_json::json!({"summary": "n/a", "plan": {}, "sub_tasks": []}),
+            ))
+        }
+
+        async fn start(&self) {}
+
+        async fn snapshot(
+            &self,
+            _task_id: String,
+        ) -> cog_core::SFResult<cog_core::AgentCheckpoint> {
+            Ok(cog_core::AgentCheckpoint {
+                checkpoint_id: String::new(),
+                task_id: String::new(),
+                agent_state: serde_json::Value::Null,
+                context_window: Vec::new(),
+                event_offset: 0,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
+        async fn restore(&self, _snapshot: &cog_core::AgentCheckpoint) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn continue_(
+            &self,
+            _input: serde_json::Value,
+        ) -> cog_core::SFResult<serde_json::Value> {
+            Ok(serde_json::json!({"summary": "n/a", "plan": {}, "sub_tasks": []}))
+        }
+
+        async fn steer(&self, _instruction: String) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn abort(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn reset(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn state(&self) -> cog_core::SFResult<cog_core::AgentState> {
+            Ok(cog_core::AgentState::Idle)
+        }
+
+        async fn wait_for_idle(&self) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn restore_from_id(&self, _checkpoint_id: &str) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<cog_core::AgentEvent> {
+            let (_tx, rx) = tokio::sync::broadcast::channel(1);
+            rx
+        }
+
+        async fn chat_stream(
+            &self,
+            _messages: &[cog_core::Message],
+            _options: &cog_core::ChatOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, mut producer) = cog_core::AssistantMessageEventStream::with_capacity(1);
+            producer.end(cog_core::ChatResponse::default());
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
+            self.chat_stream(&[], &cog_core::ChatOptions::default())
+                .await
+        }
+
+        async fn read_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+        ) -> cog_core::SFResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn write_board(
+            &self,
+            _task_id: &str,
+            _field: &str,
+            _value: &str,
+        ) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+
+        async fn receive_message(&self, _msg: cog_core::InboxMessage) -> cog_core::SFResult<()> {
+            Ok(())
+        }
+    }
+
+    /// 计划的结构缺陷必须回到**下一轮的提示**里，并且那一轮因此能改好。
+    ///
+    /// 这是把判据搬到分解循环里的全部理由：判词留在原地，生产者才有机会照它改；
+    /// 搬到入图那一刻再判，同一份缺陷只会变成一次整份打回，生产者从头问一遍，
+    /// 而两轮之间的输入除了轮次号没有任何差别。
+    #[tokio::test]
+    async fn a_plan_defect_reaches_the_next_round_and_gets_fixed_there() {
+        let mut ralph = RalphLoop::with_config(RalphLoopConfig {
+            max_iterations: 4,
+            stagnation_window: 0,
+        });
+        let scripted = Arc::new(ScriptedPlanner::new(vec![
+            serde_json::json!({
+                "summary": "first attempt",
+                "plan": {"specification": "s", "design": "d"},
+                "sub_tasks": [{"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": []}],
+            }),
+            serde_json::json!({
+                "summary": "second attempt",
+                "plan": {"specification": "s", "design": "d"},
+                "sub_tasks": [{"id": "t1", "name": "Task 1", "task_type": "generate", "input": {}, "blocked_by": [],
+                               "acceptance": ["the answer names the file it changed"]}],
+            }),
+        ]));
+        let planner = PlannerActor::new(scripted.clone());
+
+        let verdict = ralph
+            .run_plan("decompose the goal", serde_json::json!({}), &planner)
+            .await;
+
+        match verdict {
+            RalphVerdict::Passed { iterations, .. } => assert_eq!(iterations, 2),
+            other => panic!("Expected Passed on the second round, got {:?}", other),
+        }
+        let seen = scripted.seen();
+        assert_eq!(seen.len(), 2, "two rounds must have reached the planner");
+        let second = seen[1].to_string();
+        assert!(
+            second.contains(crate::squad::plan::PLAN_NO_ACCEPTANCE),
+            "the defect has to be in the second round's prompt, otherwise the round \
+             is a verbatim replay: {second}"
+        );
+        assert!(second.contains("`t1`"), "{second}");
+        assert!(
+            !seen[0]
+                .to_string()
+                .contains(crate::squad::plan::PLAN_NO_ACCEPTANCE),
+            "the first round cannot have been told about a defect that did not exist yet"
+        );
     }
 
     /// 空分解不是终止性失败：没有任何观测到的证据排除下一轮成功，第一轮就收摊
