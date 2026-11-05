@@ -12,6 +12,7 @@ import { create } from 'zustand';
 export type ActivityId =
   | 'workspace'
   | 'people'
+  | 'venues'
   | 'files'
   | 'scm'
   | 'inbox'
@@ -38,6 +39,7 @@ export type ActivityId =
 export const VIEW_TITLES: Record<ActivityId, string> = {
   workspace: '工作台',
   people: '员工',
+  venues: '场地',
   files: '文件',
   scm: '源代码管理',
   inbox: '收件箱',

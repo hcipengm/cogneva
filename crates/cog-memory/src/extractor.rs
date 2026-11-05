@@ -581,6 +581,9 @@ impl AgentMemoryExtractor {
             timestamp: Some(chrono::Utc::now()),
         });
         task.timeout_seconds = EXTRACT_TASK_TIMEOUT_SECS;
+        // 这件活落在 memory 这个场地上。场地是活上的标签，不是接活那个人的
+        // 身份：同一个员工明天接 wiki 的活，仍是同一个人。
+        task.venue = Some("memory".into());
         task.acceptance.push(
             "The reply is one JSON object that parses against the schema the item carries, and \
              every extracted item rates its importance on the shared 1-10 scale"
@@ -1144,6 +1147,9 @@ mod tests {
             "单据没被判过，分解侧会把它当目标重新拆一遍，材料就未必还能到员工手上"
         );
 
+        // 场地标签是工作台那一栏的唯一来源：漏了它，memory 的待做数与写回量
+        // 会落进「没有场地」那一堆，读的人看不出这一栏今天在不在动。
+        assert_eq!(task.venue.as_deref(), Some("memory"));
         let contract = task.input[cog_core::contract::prompt::PROMPT_CONTRACT_KEY]
             .as_str()
             .expect("the item carries its contract");

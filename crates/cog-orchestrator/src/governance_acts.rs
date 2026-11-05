@@ -919,6 +919,8 @@ fn governance_task(
         bound_by_handover_id: None,
         // 治理动作不来自分解，没有人给过验收标准。空着是实话。
         acceptance: Vec::new(),
+        // 治理动作不属于 memory / wiki / eval 任何一栏：它不产出要写回的东西。
+        venue: None,
     }
 }
 

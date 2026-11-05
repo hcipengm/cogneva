@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useAgentConversation } from '@/hooks/useAgentConversation';
-import type { AgentConversationLine } from '@/api/client';
+import { hireEmployee, type AgentConversationLine } from '@/api/client';
 import { useLiveAgentStore } from '@/store/liveAgentStore';
 import { Button, Empty, Loading, ReadError, ViewFrame } from '@/ui/primitives';
 import { Note } from '@/ui/Note';
@@ -79,6 +79,8 @@ export function PeopleView() {
     refreshConversation,
   } = useAgentConversation(true, 60);
   const [draft, setDraft] = useState('');
+  const [hiring, setHiring] = useState(false);
+  const [hireError, setHireError] = useState<string | null>(null);
   const liveRows = useLiveAgentStore((s) => s.rows);
 
   const chosen = agents.find((a) => a.agent_id === selected) ?? null;
@@ -89,12 +91,37 @@ export function PeopleView() {
     await send(text);
   };
 
+  const hire = async () => {
+    setHiring(true);
+    setHireError(null);
+    try {
+      await hireEmployee();
+      refreshAgents();
+    } catch (e) {
+      setHireError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setHiring(false);
+    }
+  };
+
   return (
     <ViewFrame
       title="员工"
       meta={`${agents.length} 个在岗 · 每人一个对话框 · 名单按 15 秒重读`}
-      actions={<Button onClick={refreshAgents}>重读名单</Button>}
+      actions={
+        <>
+          <Button onClick={hire} disabled={hiring} tone="accent">
+            {hiring ? '招人中…' : '招一个员工'}
+          </Button>
+          <Button onClick={refreshAgents}>重读名单</Button>
+        </>
+      }
     >
+      {hireError && (
+        <div className="mx-3 mb-1 border border-[var(--danger)]/40 px-2 py-1 text-[11px]" style={{ color: 'var(--danger)' }}>
+          没招成：{hireError}
+        </div>
+      )}
       {agentsError ? (
         <ReadError what="在岗名单" error={agentsError} onRetry={refreshAgents} />
       ) : agents.length === 0 ? (

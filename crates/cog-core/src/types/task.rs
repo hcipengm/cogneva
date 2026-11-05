@@ -199,6 +199,18 @@ pub struct Task {
     /// 「属于某个默认面」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_id: Option<String>,
+    /// 这道活落在**哪个场地**上：memory、wiki、eval…
+    ///
+    /// 三个问题是分开的：`owner_unit` / `agent_id` 回答「谁在做」，这一列回答
+    /// 「在哪儿做」，`acceptance` 回答「怎么算做完」。合成一列就会长出「memory
+    /// 员工」这种角色——同一个通用员工今天在这个场地、明天在另一个，场地跟着活
+    /// 走，不跟着身份走。
+    ///
+    /// 场地不是「面」（`face_id`）：面是组织上的责任归属，一个面可以同时往几个
+    /// 场地交活，一个场地也可以收几个面的活。`None` 表示这件活不属于任何场地
+    /// （平台内部任务、旧行），读面不得把「没填」读成某个默认场地。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub venue: Option<String>,
     /// 这道任务指定由谁执行。
     ///
     /// 与 `agent_id` 的区别是答的问题不同：`agent_id` 是「结果是谁交的」，
@@ -832,6 +844,7 @@ impl Task {
             parent_task_id: None,
             sink_task_id: None,
             is_executable: true,
+            venue: None,
             face_id: None,
             owner_unit: None,
             bound_by_handover_id: None,

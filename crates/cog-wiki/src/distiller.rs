@@ -170,6 +170,9 @@ impl WikiDistiller for WorkItemDistiller {
             timestamp: Some(chrono::Utc::now()),
         });
         task.timeout_seconds = DISTILL_TASK_TIMEOUT_SECS;
+        // 场地标签跟着活走，不跟着接活的人走：读「wiki 这一栏今天收了多少」
+        // 的人读的是这一列，而不是谁在这个场地上。
+        task.venue = Some("wiki".into());
         task.acceptance.push(
             "The reply is one JSON object with a non-empty title and body, and the body is a \
              page about this source rather than a copy of it"
@@ -398,6 +401,11 @@ mod tests {
             Some(true)
         );
         assert!(task.timeout_seconds > 0);
+        assert_eq!(
+            task.venue.as_deref(),
+            Some("wiki"),
+            "这一栏的读数按场地分组，漏了标签就落进「没有场地」"
+        );
         assert!(
             !task.acceptance.is_empty(),
             "a verified row needs acceptance"

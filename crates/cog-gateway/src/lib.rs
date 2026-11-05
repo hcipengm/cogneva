@@ -96,6 +96,7 @@ pub mod test_metrics;
 pub mod trace_fanout;
 pub mod upstream_pool;
 pub mod usage_landing;
+pub mod venues;
 pub mod websocket;
 pub mod websocket_protocol;
 pub mod wiki;
@@ -1102,6 +1103,9 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
         .route("/api/v1/tasks/ready", get(tasks::get_ready_tasks_handler))
         .route("/api/v1/tasks/status", get(tasks::task_summary_handler))
         .route("/api/v1/tasks/graph", get(tasks::get_task_graph_handler))
+        // 场地这一维读的是同一批任务行，只是按「在哪儿做」分组：谁在做、在
+        // 哪儿做、怎么算做完，三个问题各自回答自己那一格。
+        .route("/api/v1/venues", get(venues::venues_handler))
         // 项目面的读在下面的 `project_read_routes` 里单独成组，因为那一组要挂
         // 限速层；这里只留写端点。
         .route(
@@ -1164,7 +1168,12 @@ pub fn create_router(state: Arc<GatewayState>) -> Router {
             "/api/v1/tasks/{id}/blocking",
             get(tasks::get_task_dependencies_handler),
         )
-        .route("/api/v1/agents", get(agents::list_handler))
+        // 招人：属主与成员都能在工作台上添一个员工。这是名单上的加法，不是
+        // 对已有员工的处置，所以它与读名单同组；杀掉、重启仍在管理员组。
+        .route(
+            "/api/v1/agents",
+            get(agents::list_handler).post(agents::create_handler),
+        )
         .route("/api/v1/agents/{id}", get(agents::get_handler))
         // 同事之间说话不需要管理员：平台上的人与智能体是平的，属主和成员都要能
         // 对任何一个在岗的智能体开口。注册、杀掉、重启这些改变在岗名单的动作仍

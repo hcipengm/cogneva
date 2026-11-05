@@ -253,6 +253,7 @@ impl EvolutionEngine {
             timestamp: Some(Utc::now()),
         });
         task.timeout_seconds = timeout_secs;
+        task.venue = Some("evolution".into());
         task.acceptance.push(acceptance.to_string());
         let answer = cog_core::contract::work_item::run_work_item(
             graph.as_ref(),

@@ -339,6 +339,14 @@ pub struct TaskView {
     /// 由哪张交接单签来的归属。与 `owner_unit` 一起读，才知道归属是改派还是漂移。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bound_by_handover_id: Option<String>,
+    /// 这道活落在哪个场地（memory / wiki / eval …）。与 `face_id` 不是一列：
+    /// 面是组织上的责任归属，场地是活本身落在哪一栏。`None` 是不属于任何场地。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub venue: Option<String>,
+    /// 这道活怎样算做完，一句一句可证伪地写在行上。读任务的人要看的就是它：
+    /// 没有这一列，「做完了」只能靠读结果自己猜。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance: Vec<String>,
 }
 
 impl From<Task> for TaskView {
@@ -371,6 +379,8 @@ impl From<Task> for TaskView {
             timeout_seconds: t.timeout_seconds,
             face_id: t.face_id,
             bound_by_handover_id: t.bound_by_handover_id,
+            venue: t.venue,
+            acceptance: t.acceptance,
         }
     }
 }

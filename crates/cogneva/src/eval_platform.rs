@@ -471,6 +471,9 @@ impl PlatformApiRunner {
             "tasks": [{
                 "id": case_id,
                 "task_type": PLATFORM_TASK_KIND,
+                // 这一题落在 eval 这个场地上：题面、做法、判据都在活里，但
+                // 「在哪儿做」是另一列，场地读数靠它分组。
+                "venue": "eval",
                 "input": input,
                 "timeout_seconds": self.settings.deadline_secs.saturating_sub(
                     PLATFORM_BUDGET_MARGIN_SECS
@@ -1029,6 +1032,9 @@ mod tests {
         let sent = submitted.first().expect("the case was submitted").clone();
         assert_eq!(sent["tasks"][0]["id"], id_for_view);
         assert_eq!(sent["tasks"][0]["task_type"], PLATFORM_TASK_KIND);
+        // 场地是活上的标签：没有它，工作台的 eval 那一栏读不到这一题的待做数
+        // 与写回量，只能靠种类名去猜它属于哪一栏。
+        assert_eq!(sent["tasks"][0]["venue"], "eval");
         // 这是一件已经决定好的活：不带这两项，平台会把它当意图去拆解，投进去的这一行
         // 变成占位符，答案落在别处——量到的就不是「一个员工答这道题」了。
         assert_eq!(sent["intent_kind"], "task");

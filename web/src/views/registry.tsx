@@ -20,6 +20,7 @@ import { SourceControlView } from '@/views/SourceControlView';
 import { StorageView } from '@/views/StorageView';
 import { TasksView } from '@/views/TasksView';
 import { TimelineView } from '@/views/TimelineView';
+import { VenuesView } from '@/views/VenuesView';
 import { TokenView } from '@/views/TokenView';
 import { WorkspaceView } from '@/views/WorkspaceView';
 import { Empty } from '@/ui/primitives';
@@ -39,6 +40,8 @@ export function ViewFor({ view }: { view: string }) {
       return <WorkspaceView />;
     case 'people':
       return <PeopleView />;
+    case 'venues':
+      return <VenuesView />;
     case 'files':
       return <FilesView />;
     case 'scm':

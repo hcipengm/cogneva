@@ -997,6 +997,16 @@ export async function listAgents(): Promise<AgentSummary[]> {
   return page.agents ?? [];
 }
 
+/**
+ * 在工作台上招一个员工。
+ *
+ * 建出来的员工是平台上的一个人：有自己的 id 与名字、自己的收件箱与对话框，能接
+ * 任何一件落在任何场地上的活。这里不带角色、不带提示词——那些是把人写死的做法。
+ */
+export async function hireEmployee(): Promise<{ agent_id: string; display_name: string }> {
+  return api.post<{ agent_id: string; display_name: string }>('/api/v1/agents', {});
+}
+
 export interface AgentConversationLine {
   id: number;
   from_unit: string;
@@ -1223,6 +1233,43 @@ export async function getTaskSummary(): Promise<TaskSummaryCounts> {
   return api.get<TaskSummaryCounts>('/api/v1/tasks/status');
 }
 
+/** 一个场地最近一条到过终态的任务。判据过没过读的是这一格。 */
+export interface VenueVerdict {
+  task_id: string;
+  /** `completed` / `failed` / `cancelled`，与任务状态同一个拼法。 */
+  outcome: string;
+  at: string;
+}
+
+/**
+ * 一个场地的三条读数。
+ *
+ * 场地不是对象，是任务行上的标签：这里每一栏都是对同一批任务按标签分组折出来
+ * 的。场地不花 token，所以这里没有花销那一列——花销按员工 id 记。
+ */
+export interface VenueReading {
+  venue: string;
+  /** 还没到终态的活有多少件。 */
+  open: number;
+  /** 这一栏一共有多少件活，含已终态的。 */
+  tasks: number;
+  /** 一件都还没到过终态时为 `null`（服务端省略这一格）。 */
+  latest?: VenueVerdict;
+  /** 时间窗内交回的答案字节数。 */
+  written_back_bytes: number;
+}
+
+export interface VenuesReading {
+  generated_at: string;
+  /** 写回量的时间窗，秒。离开定义，那个字节数只是一个数。 */
+  write_back_window_secs: number;
+  venues: VenueReading[];
+}
+
+export async function getVenues(): Promise<VenuesReading> {
+  return api.get<VenuesReading>('/api/v1/venues');
+}
+
 export interface TaskRow {
   id: string;
   task_type: string;
@@ -1252,6 +1299,10 @@ export interface TaskRow {
   sink_task_id?: string | null;
   face_id?: string | null;
   bound_by_handover_id?: string | null;
+  /** 这道活落在哪个场地（memory / wiki / eval …）。与 `face_id` 不是一列。 */
+  venue?: string | null;
+  /** 这道活怎样算做完，一句一句写在行上。 */
+  acceptance?: string[];
   is_executable?: boolean;
   result?: Record<string, unknown> | null;
 }

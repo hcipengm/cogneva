@@ -1885,6 +1885,7 @@ impl GitHubDiscoveryLoop {
             timestamp: Some(chrono::Utc::now()),
         });
         task.timeout_seconds = ASSESS_TASK_TIMEOUT_SECS;
+        task.venue = Some("github".into());
         task.acceptance.push(assess_acceptance(&task_id));
 
         let ids = orchestrator.submit_goal_auto(&goal, vec![task]).await?;

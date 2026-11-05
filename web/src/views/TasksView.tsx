@@ -185,8 +185,13 @@ export function TasksView() {
               ) },
               { key: 'type', title: '类型', width: '130px', render: (t) => t.task_type },
               { key: 'status', title: '状态', width: '130px', render: (t) => <LiveStatus row={t} live={live} /> },
-              { key: 'owner', title: '归属', width: '150px', render: (t) => (
+              { key: 'owner', title: '谁在做', width: '150px', render: (t) => (
                 <span className="mono text-[11px] text-[var(--muted)]">{t.owner_unit ?? t.agent_id ?? '—'}</span>
+              ) },
+              // 场地与「谁在做」是两列：同一个员工今天在 memory、明天在 wiki，
+              // 场地跟着活走。合成一列就会读成「哪些人在做哪些活」是一回事。
+              { key: 'venue', title: '场地', width: '100px', render: (t) => (
+                <span className="mono text-[11px] text-[var(--muted)]">{t.venue ?? '—'}</span>
               ) },
               { key: 'blocked', title: '等谁', width: '70px', render: (t) => (
                 <span className="mono text-[11px]" style={{ color: (t.blocked_by?.length ?? 0) > 0 ? 'var(--warn)' : 'var(--muted)' }}>
@@ -383,7 +388,19 @@ function TaskDetail({
           {task.agent_id ? ` · 交付 ${task.agent_id}` : ''}
           {task.bound_by_handover_id ? ` · 交接单 ${task.bound_by_handover_id}` : ''}
         </Field>
+        <Field label="场地">{task.venue ?? '不属于任何场地'}</Field>
         <Field label="服务面">{task.face_id ?? '不服务任何面'}</Field>
+        <Field label="判据">
+          {task.acceptance && task.acceptance.length > 0 ? (
+            <ul className="list-disc pl-4">
+              {task.acceptance.map((line, i) => (
+                <li key={i}>{line}</li>
+              ))}
+            </ul>
+          ) : (
+            <span className="text-[var(--muted)]">行上没有写判据</span>
+          )}
+        </Field>
         <Field label="目标 / 父">
           {task.goal_id ?? '—'}
           {task.parent_task_id ? ` · 父 ${task.parent_task_id.slice(0, 18)}` : ''}

@@ -86,6 +86,87 @@ pub async fn register_handler(
     }
 }
 
+/// 属主在工作台上招一个员工。
+///
+/// 这一步之前，名册上的人只有两种来路：进程启动时自报的常驻工人，和一件任务派
+/// 生出来的小队成员。两者都不是「人可以在工作台上点出来」的那种——属主想多一个
+/// 能说话的员工，没有任何入口。
+///
+/// 建出来的就是一个进程生命周期内的通用员工：它自己订阅收件箱，谁都能对它说话，
+/// 它也能接平台上的活。它不带角色、不带提示词——角色是注册表上的一列标签，不是
+/// 一段写死的性格；能力来自它和别的员工同一套工具与同一条基础指令。
+///
+/// 名字由名册按 id 算出来（`display_name_for`），与每一个别的人同一个规则：一个
+/// id 永远对应同一个名字，重读不会改名。
+pub async fn create_handler(
+    State(state): State<Arc<GatewayState>>,
+    caller: Option<Extension<Claims>>,
+) -> Response {
+    let Some(pool) = state.agent_pool.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this deployment runs no agent pool in this process, so an employee hired here would have nothing to run it",
+            })),
+        )
+            .into_response();
+    };
+    let llm = state
+        .llm_client
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let Some(llm) = llm else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "no model is configured yet: an employee needs one before it can be hired",
+            })),
+        )
+            .into_response();
+    };
+
+    let agent_id = format!("employee:{}", new_employee_suffix());
+    match pool.create_agent(&agent_id, EMPLOYEE_ROLE, llm, None).await {
+        Ok(_) => {
+            let words = caller
+                .as_ref()
+                .map(|Extension(claims)| claims.preferred_username.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| WEBUI_SENDER.to_string());
+            tracing::info!(agent_id, hired_by = %words, "an employee joined the roster");
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "agent_id": agent_id,
+                    "display_name": cog_core::display_name_for(&agent_id),
+                    "hired_by": words,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// 员工 id 的后半截。
+///
+/// 取随机而不按名字派生：同一个属主可以把两个员工都叫「阿蓝」，名字不是身份，
+/// id 才是。短前缀让手写与日志里都认得出来这是一个员工，`employee:` 也是读面
+/// 分辨它与小队成员（`squad:`）的凭据。
+fn new_employee_suffix() -> String {
+    uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect()
+}
+
 pub async fn heartbeat_handler(
     State(state): State<Arc<GatewayState>>,
     Path(agent_id): Path<String>,
@@ -360,6 +441,13 @@ pub async fn send_message_handler(
 /// a unit name for them, because a transcript that attributes a person's words
 /// to an agent they may not hold would read as something an agent said.
 const WEBUI_SENDER: &str = "webui";
+
+/// 招一个员工时写进注册表的那一列角色。
+///
+/// 它不是一段人设，也不是一条提示词：名册与界面读它只是为了把「平台上的员工」
+/// 与「一件任务派生出来的小队成员」分开。员工能做什么由工具与基础指令决定，与
+/// 这一列无关，所以这里只有一个值，不按场地分叉——分叉就会长出「memory 员工」。
+pub const EMPLOYEE_ROLE: &str = "employee";
 
 /// Read the conversation with one agent, both directions, oldest first.
 ///

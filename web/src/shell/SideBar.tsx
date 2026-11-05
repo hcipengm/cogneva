@@ -99,6 +99,7 @@ export function SideBar() {
 const TITLES: Record<ActivityId, string> = {
   workspace: '工作台',
   people: '员工',
+  venues: '场地',
   files: '资源管理器',
   scm: '源代码管理',
   inbox: '收件箱',
@@ -223,6 +224,27 @@ function ActivityPanel({ activity }: { activity: ActivityId }) {
             links={[
               { id: 'agents', label: '智能体', note: '生命周期与心跳' },
               { id: 'tasks', label: '任务', note: '谁在做哪件活' },
+            ]}
+          />
+        </>
+      );
+
+    case 'venues':
+      return (
+        <>
+          <Section title="每一栏只报三条">
+            <Row label="待做" note="还没到终态的活有多少件" />
+            <Row label="判据" note="最近一条到过终态的任务成没成" />
+            <Row label="写回量" note="一天内交回的答案字节数" />
+          </Section>
+          <Note>
+            场地不花 token，也不在花销榜上。花销按员工 id 记：谁花的记在谁头上，
+            场地只是活上的一个标签。
+          </Note>
+          <CrossLinks
+            links={[
+              { id: 'tasks', label: '任务', note: '每条活都挂着场地与做它的人' },
+              { id: 'people', label: '员工', note: '同一个人的对话框' },
             ]}
           />
         </>

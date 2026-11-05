@@ -263,3 +263,36 @@ async fn a_member_may_speak_to_an_agent_and_a_visitor_may_not() {
         "a visitor stays below the routes that act on the platform: {detail}"
     );
 }
+
+/// 招人这条路由：属主与成员能用，访客不能，而且「这里招不了」要说出原因。
+///
+/// 判据取的是 503 而不是 201：这个夹具的进程里没有员工池，也还没有配模型，
+/// 所以一个真的能建的部署与这里的差别本来就是这一格。要判的是**这条路对谁说
+/// 话**——成员穿过了鉴权层走到处理函数，访客被挡在门外；把两者都断言一遍，一条
+/// 谁都能过的路由过不了这个测试。
+#[tokio::test]
+async fn a_member_may_hire_an_employee_and_a_visitor_may_not() {
+    let backend: Arc<dyn MessageBackend> = Arc::new(cog_stream::MemoryMessageBackend::new());
+    let state = state(backend);
+    let app = create_router(state.clone());
+
+    let member = router_state::member_bearer(&state, "hirer-probe").await;
+    let (status, detail) = post(&app, &member, "/api/v1/agents", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a member reaches the hiring route; this process has no pool, which is a sentence of its own: {detail}"
+    );
+    assert!(
+        detail.contains("pool"),
+        "the refusal says why nobody can be hired here: {detail}"
+    );
+
+    let visitor = router_state::visitor_bearer(&state, "visitor-probe").await;
+    let (status, detail) = post(&app, &visitor, "/api/v1/agents", "{}").await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a visitor stays below the routes that add to the roster: {detail}"
+    );
+}
