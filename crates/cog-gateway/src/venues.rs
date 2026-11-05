@@ -33,6 +33,14 @@ use serde::Serialize;
 use crate::tasks::visible_to_claims;
 use crate::GatewayState;
 
+/// 板子上常驻的三栏：memory 抽取、wiki 蒸馏、评测。
+///
+/// 这三栏是平台自己的活儿落脚的地方，所以没有活的时候也照样画出来，读数为
+/// 零；空板子会被读成「这一页坏了」，而不是「今天还没有活」。这张表说的是
+/// **哪些空栏存在**，不是**哪些标签合法**：一个不在这张表上的标签，只要有一
+/// 行任务带着它，就照样多出一栏。
+pub const STANDING_VENUES: &[&str] = &["memory", "wiki", "eval"];
+
 /// 写回量取多久以内交回的答案。
 ///
 /// 取一整天而不是「全部历史」：场地是每天在动的，从建库第一天起累加出来的
@@ -78,9 +86,27 @@ pub struct VenuesResponse {
 }
 
 /// 把任务行按场地折成读数。没有场地标签的行不进任何一栏。
+///
+/// 常驻的三栏（[`STANDING_VENUES`]）先摆上，读数为零；任务行只会往上加，不会
+/// 把一栏去掉。所以这一屏在「今天还没有活」和「板子坏了」之间能分开：前者是
+/// 三栏零，后者才是一条读数都没有。
 pub fn read_venues(tasks: &[cog_core::Task], now: DateTime<Utc>) -> Vec<VenueReading> {
     let since = now - WRITE_BACK_WINDOW;
-    let mut by_venue: BTreeMap<&str, VenueReading> = BTreeMap::new();
+    let mut by_venue: BTreeMap<&str, VenueReading> = STANDING_VENUES
+        .iter()
+        .map(|venue| {
+            (
+                *venue,
+                VenueReading {
+                    venue: venue.to_string(),
+                    open: 0,
+                    tasks: 0,
+                    latest: None,
+                    written_back_bytes: 0,
+                },
+            )
+        })
+        .collect();
 
     for task in tasks {
         let Some(venue) = task
@@ -197,11 +223,17 @@ mod tests {
         let venues = read_venues(&tasks, now);
         assert_eq!(
             venues.iter().map(|v| v.venue.as_str()).collect::<Vec<_>>(),
-            vec!["memory", "wiki"],
-            "没有场地标签的行不属于任何一栏"
+            vec!["eval", "memory", "wiki"],
+            "常驻三栏都在，没有场地标签的行不属于任何一栏"
         );
+        let by_name = |venue: &str| {
+            venues
+                .iter()
+                .find(|v| v.venue == venue)
+                .unwrap_or_else(|| panic!("{venue} 这一栏要在场"))
+        };
 
-        let memory = &venues[0];
+        let memory = by_name("memory");
         assert_eq!(memory.open, 1);
         assert_eq!(memory.tasks, 2);
         assert_eq!(
@@ -212,7 +244,7 @@ mod tests {
         let written = memory.written_back_bytes;
         assert!(written > 0, "交回的答案要算进写回量");
 
-        let wiki = &venues[1];
+        let wiki = by_name("wiki");
         assert_eq!(wiki.open, 0);
         assert_eq!(
             wiki.latest.as_ref().map(|v| v.outcome.as_str()),
@@ -228,11 +260,55 @@ mod tests {
         let mut old = row("m-old", Some("memory"), TaskStatus::Completed, 60 * 30);
         old.result = Some(serde_json::json!({"entries": ["a"]}));
         let venues = read_venues(&[old], now);
-        assert_eq!(venues[0].written_back_bytes, 0);
+        let memory = venues
+            .iter()
+            .find(|v| v.venue == "memory")
+            .expect("memory 这一栏要在场");
+        assert_eq!(memory.written_back_bytes, 0);
         assert_eq!(
-            venues[0].latest.as_ref().map(|v| v.outcome.as_str()),
+            memory.latest.as_ref().map(|v| v.outcome.as_str()),
             Some("completed"),
             "判据那一格不看时间窗：它问的是最后一条到了哪，不是今天的量"
         );
+    }
+
+    /// 一条活都没有的时候，板子上仍然摆着三栏，各自读数都是零。
+    ///
+    /// 这是「今天还没有活」和「这一页没读出来」之间唯一的分界：空数组在前端
+    /// 读成后者，读的人会以为板子坏了，而不是以为什么都还没发生。
+    #[test]
+    fn an_untouched_board_still_shows_the_standing_venues() {
+        let venues = read_venues(&[], Utc::now());
+        assert_eq!(
+            venues.iter().map(|v| v.venue.as_str()).collect::<Vec<_>>(),
+            vec!["eval", "memory", "wiki"]
+        );
+        for venue in &venues {
+            assert_eq!(venue.open, 0, "{} 没有等着的活", venue.venue);
+            assert_eq!(venue.tasks, 0);
+            assert!(venue.latest.is_none(), "{} 还没有跑完过一件", venue.venue);
+            assert_eq!(venue.written_back_bytes, 0);
+        }
+    }
+
+    /// 一个不在常驻表上的标签，照样是多出来的一栏。
+    ///
+    /// 常驻表说的是「哪些空栏存在」，不是「哪些标签合法」：谁往任务行上写了
+    /// 一个新场地，工作台就该多出一栏，而不是把那一行悄悄丢掉。
+    #[test]
+    fn a_label_outside_the_standing_list_still_gets_a_column() {
+        let venues = read_venues(
+            &[row("c1", Some("changes"), TaskStatus::Running, 1)],
+            Utc::now(),
+        );
+        assert_eq!(
+            venues.iter().map(|v| v.venue.as_str()).collect::<Vec<_>>(),
+            vec!["changes", "eval", "memory", "wiki"]
+        );
+        let changes = venues
+            .iter()
+            .find(|v| v.venue == "changes")
+            .expect("changes 这一栏要在场");
+        assert_eq!(changes.open, 1);
     }
 }
