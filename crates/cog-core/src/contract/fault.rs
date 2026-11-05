@@ -87,3 +87,81 @@ pub struct FaultClassification {
 pub trait FaultClassifier: Send + Sync {
     fn classify(&self, error_text: &str) -> FaultClassification;
 }
+
+#[cfg(test)]
+mod classification_stays_an_enum_until_the_boundary {
+    //! principle: feedback_category_not_via_strings_across_processes
+    //!
+    //! 分类结果在进程内必须是 enum 不是字符串。The verdict stays a
+    //! [`FaultCategory`] for as long as it is inside the process; text
+    //! appears only at the boundary where one process hands it to another.
+    //!
+    //! This gate holds both ends. In process the value is the enum, so no
+    //! decision is made by comparing strings. Across the boundary the form
+    //! is closed and total: every variant round-trips back to itself, two
+    //! variants never share one spelling, and a spelling that names no
+    //! variant is refused rather than read as a default -- a typo must not
+    //! become "no signal".
+
+    use super::*;
+
+    /// The wire spelling of every variant, as serde writes it.
+    fn wire_forms() -> Vec<String> {
+        let mut forms = Vec::new();
+        for category in FaultCategory::ALL {
+            let form = serde_json::to_string(&category).expect("serializes");
+            forms.push(form);
+        }
+        forms
+    }
+
+    #[test]
+    fn the_verdict_in_process_is_the_enum_and_not_its_text() {
+        // 进程内的字段类型就是 enum：这里取出来的是 `FaultCategory`，不是
+        // 它的一段文本，所以进程内的比较是变体之间的比较。
+        fn category_of(classification: &FaultClassification) -> FaultCategory {
+            classification.category
+        }
+
+        let classification = FaultClassification {
+            category: FaultCategory::Resource,
+            strategy: RecoveryStrategy::ScaleOrRebalance,
+            matched_rule: "resource".to_string(),
+            confidence: 1.0,
+        };
+        assert_eq!(category_of(&classification), FaultCategory::Resource);
+        assert_eq!(
+            category_of(&classification).default_strategy(),
+            RecoveryStrategy::ScaleOrRebalance
+        );
+    }
+
+    #[test]
+    fn every_variant_crosses_the_boundary_by_parsing_back_to_itself() {
+        let forms = wire_forms();
+        // 闭集的规模就是变体表的规模：一个只能由字符串到达的变体在这里
+        // 与 `FaultCategory::ALL` 对不上。
+        assert_eq!(forms.len(), FaultCategory::ALL.len());
+        let mut seen = std::collections::BTreeSet::new();
+        for (category, form) in FaultCategory::ALL.into_iter().zip(&forms) {
+            let parsed = serde_json::from_str::<FaultCategory>(form).expect("parses back");
+            assert_eq!(parsed, category);
+            assert!(seen.insert(form.as_str()), "two variants share {form}");
+        }
+    }
+
+    #[test]
+    fn a_form_that_names_no_variant_is_refused_rather_than_defaulted() {
+        // 没有静默兜底：读不回来的文本不能落成 `Unknown`，否则跨进程的一次
+        // 拼写错误就变成了一次「没有信号」的分类。
+        for text in ["\"nonsense\"", "\"\"", "null", "\"Network\""] {
+            assert!(
+                serde_json::from_str::<FaultCategory>(text).is_err(),
+                "{text} names no FaultCategory and must be refused"
+            );
+        }
+        // 未知不是缺席：`Unknown` 只能由显式的 `"unknown"` 得到。
+        let unknown = serde_json::from_str::<FaultCategory>("\"unknown\"");
+        assert_eq!(unknown.ok(), Some(FaultCategory::Unknown));
+    }
+}
