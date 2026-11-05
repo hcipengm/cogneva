@@ -43,7 +43,16 @@
 //! 两组真重复（Secret 里那个 SSH 键、`cog-reflection` 的 `source` 标签），
 //! 其余 27 组逐条登记在 [`SAME_VALUE_DIFFERENT_THING`] 里。cog-agent 的 `state`
 //! 与 `role` 是后来把指标标签名收进常量时才出现的第 28、29 组：标签键与检查点键，
-//! 同形不同事。
+//! 同形不同事。cog-collaboration 的 `model` 与 `not_judged` 是独立评审那批标签常量
+//! 落地时加进来的第 30、31 组：`SELF_REVIEW_DECIDED_BY_MODEL` 与
+//! `CHANGE_DIFF_SOURCE_MODEL` 是两个标签键各自的取值表（谁判的 / 这份 diff 从哪来），
+//! `SELF_REVIEW_VERDICT_NOT_JUDGED` 与 `CONSENSUS_FLOOR_NOT_JUDGED` 是两条路径各自
+//! 的「没判」，谁也不读对方的。
+//!
+//! 到今天数组里是 31 组（27 条落地登记 + 第 28～31 组）。条数以
+//! [`SAME_VALUE_DIFFERENT_THING`] 自己的长度为准，别在这里另记一个数：上面那组
+//! 2026-10-27 的普查（733 个源文件、845 个短值声明、27 组）是当天的读数，没有
+//! 重测；之后每加一条登记只动数组，这段跟着补的是「第几组」的编号。
 //!
 //! 消融（真树）：往 `crates/cog-storage/src/` 放一个只写着
 //! `const ABLATION_PROBE: &str = "consumed";` 的文件——红，点名 cog-storage 与
