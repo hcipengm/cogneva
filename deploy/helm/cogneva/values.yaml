@@ -1536,7 +1536,29 @@ taskRouter:
   # `cogneva_task_router_claim_slots` 在两个 Pod 上都报 4、`_in_flight` 各报 4，
   # 与看板上的 8 条 `running` 一一对应。改成可配置之后，这个指标仍然报每个流上
   # 的预算，所以「配了多少」与「生效了多少」在读数面是同一个数。
-  claimConcurrency: 3
+  #
+  # **2026-11-06 抬到 6：3 是量出来的天花板，不是要的产能。** 3 生效后的第一段读数
+  # （01:14 滚动完成起 40 分钟）：3 条变更在同一秒开跑，是此前 8 小时里第一次出现
+  # 多条变更并行——那 8 小时的变更开工只有 17:00、19:00、22:00 各一条。但
+  # 「进度 = 槽位 ÷ 单条时长」没变：这几条跑到 50 分钟仍未结束，与此前完工的
+  # 40~70 分钟一致，3 槽折合 3.6 笔/小时、约 86 笔/天，仍低于 120。队列不是瓶颈：
+  # 885 条 `scheduled` 变更分属 885 个不同 goal，没有一条被 `running=1` 拦住。
+  #
+  # 这一格的作用范围要读准：集群上限**就是**这个数，不是它的两倍。只有带 executor
+  # 角色的那个进程读本地就绪流（`consumed_ready_streams` 只在 `owns_executor_role`
+  # 时给出 `:local` 与 `:stop-the-line`），另一个进程只读共享流，而共享流的 lag
+  # 长期为 0。上面「最多是这个数的两倍」说的是许可的算式，不是变更的产能。
+  #
+  # 抬到 6 而不是 5：构建槽是 3 个（`/var/lib/cogneva-build-gate/slot-{0,1,2}.lock`），
+  # 但拿不到槽的变更不判负——`is_build_slot_refused` 那一路把变更留着、只重试验证，
+  # 所以多出来的槽位是在等构建，不是在丢变更。留出的一格给非变更任务：generator、
+  # intent-assess 也吃这同一份许可，否则它们照样能把变更挤出去。
+  #
+  # 不同步抬 `agent_pool.worker_count`：上面那段说的「池子按内存自算」只对投递到
+  # agent inbox 的活成立。squad 的 planner／generator／evaluator／moderator 是
+  # `AgentManager::create_agent` 直接建的，不经过 `pool_worker_handler` 里那道
+  # `gate.acquire()`，所以池子不是变更产能的上限，这一笔只动这一格。
+  claimConcurrency: 6
 
 webSearch:
   enabled: true
