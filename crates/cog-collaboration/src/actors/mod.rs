@@ -131,12 +131,23 @@ pub(crate) fn review_spec(task: &cog_core::Task, declared: &[&str]) -> String {
         .and_then(|g| g.as_str())
         .unwrap_or("")
         .trim();
-    let criteria = declared
+    // 任务自己的 `acceptance` 就是它对「怎样算完」的全部声明，必须进规格。
+    // 评审表每一行都要引一句规格里的话（`spec_quote`），所以**没写进规格的
+    // 要求，评审列不出来**：只交 goal 时，整张表只能从那一句话里拆出来，判词
+    // 看着机械不是因为它太死板，是因为它手里确实只有那一句。调用方另外给的
+    // criteria 排在后面，是补充而不是替代。
+    let mut criteria: Vec<&str> = Vec::new();
+    for criterion in task
+        .acceptance
         .iter()
         .map(|c| c.trim())
-        .filter(|c| !c.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ");
+        .chain(declared.iter().map(|c| c.trim()))
+    {
+        if !criterion.is_empty() && !criteria.contains(&criterion) {
+            criteria.push(criterion);
+        }
+    }
+    let criteria = criteria.join("; ");
     match (goal.is_empty(), criteria.is_empty()) {
         (false, false) => format!("{goal}\n\nAcceptance criteria: {criteria}"),
         (false, true) => goal.to_string(),
@@ -934,6 +945,33 @@ mod tests {
             review_spec(&task_with_goal("  "), &[]),
             "",
             "a task that declares nothing leaves the specification empty"
+        );
+    }
+
+    /// 提交方自己写的「怎样算完」必须进规格：评审表每一行都要引一句规格里的
+    /// 话，规格里没有的要求，评审根本列不出来——只交目标时，整张表只能从那一句
+    /// 话里拆出来。这条测试拿一个只写了 acceptance、没写 goal 的任务，是因为
+    /// 那种形态下规格非空只可能来自 acceptance。
+    #[test]
+    fn the_tasks_own_acceptance_reaches_the_specification() {
+        let mut task = task_with_goal("");
+        task.acceptance = vec![
+            "the rollback step names the file".to_string(),
+            " ".to_string(),
+            "the plan is one page".to_string(),
+        ];
+
+        assert_eq!(
+            review_spec(&task, &[]),
+            "Acceptance criteria: the rollback step names the file; the plan is one page",
+            "every criterion the submitter wrote is in the spec, blanks are not"
+        );
+
+        // 调用方给的 criteria 是补充：任务自己的排在前，重复的不再列第二遍。
+        assert_eq!(
+            review_spec(&task, &["the plan is one page", "no new dependency"]),
+            "Acceptance criteria: the rollback step names the file; the plan is one page; \
+             no new dependency"
         );
     }
 
