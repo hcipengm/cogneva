@@ -114,6 +114,68 @@ struct PoolSpawner {
     spawned: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+/// The worker object a pool worker's own inbox handler answers with.
+///
+/// The handler has to be handed to `spawn_worker` before the worker exists, and
+/// the worker is what the handler needs: this cell closes that loop. A message
+/// that arrives before the cell is filled is kept pending for redelivery rather
+/// than acknowledged with nothing done.
+type PoolWorkerCell = Arc<tokio::sync::OnceCell<Arc<crate::Agent>>>;
+
+/// Whether what landed in a worker's inbox is a piece of work or a sentence
+/// addressed to the worker.
+///
+/// One judgement: a `goal` that reads as a task is work. The other half used to
+/// be swallowed — the message was acknowledged, the worker did nothing, and the
+/// person asking only ever saw a timeout. The workbench's dialogue box is
+/// exactly that half.
+fn inbox_task(msg: &cog_core::InboxMessage) -> Option<cog_core::Task> {
+    let cog_core::InboxMessage::Prompt { goal, .. } = msg else {
+        return None;
+    };
+    serde_json::from_value::<cog_core::Task>(goal.clone()).ok()
+}
+
+/// What a pool worker does with each command that reaches its inbox.
+///
+/// Work goes through the turn gate and the task runner: a worker that has no
+/// turn yet waits for one rather than dropping the message, because the message
+/// is already taken and a dropped one is work nobody will be handed again.
+///
+/// Everything else is a conversation. It goes to the worker's own command path,
+/// which executes every other `InboxMessage` variant and publishes a prompt's
+/// answer onto the stream the asker named. Handing a sentence to the task
+/// runner would be reading it as work; acking it without running anything is
+/// how this route stayed silent.
+fn pool_worker_handler(
+    runner: Arc<dyn cog_core::TaskExecutionCallback>,
+    gate: Arc<crate::pool_sizing::PoolConcurrency>,
+    worker: PoolWorkerCell,
+) -> impl FnMut(cog_core::InboxMessage) -> futures::future::BoxFuture<'static, cog_core::SFResult<()>>
+       + Send
+       + 'static {
+    move |msg| {
+        let runner = runner.clone();
+        let gate = gate.clone();
+        let worker = worker.clone();
+        Box::pin(async move {
+            if let Some(task) = inbox_task(&msg) {
+                let _turn = gate.acquire().await;
+                runner.execute_task(task).await;
+                return Ok(());
+            }
+            match worker.get() {
+                Some(agent) => agent.handle_inbox(msg).await,
+                None => Err(cog_core::SFError::Agent(
+                    "a pool worker's inbox consumer started before the worker itself; the \
+                     message is kept pending for redelivery"
+                        .into(),
+                )),
+            }
+        })
+    }
+}
+
 impl PoolSpawner {
     fn spawned(&self) -> usize {
         self.spawned.load(std::sync::atomic::Ordering::Relaxed)
@@ -142,41 +204,40 @@ impl PoolSpawner {
             vec!["plan".into(), "generate".into(), "evaluate".into()],
             cog_core::ResourceInfo::default(),
         );
-        let runner = self.runner.clone();
-        let gate = self.concurrency.clone();
-        if let Err(e) = self
+        let worker = PoolWorkerCell::default();
+        let handler = pool_worker_handler(
+            self.runner.clone(),
+            self.concurrency.clone(),
+            worker.clone(),
+        );
+        match self
             .pool
             .spawn_worker(
                 agent_id.clone(),
                 self.role.clone(),
                 self.llm.clone(),
                 registration,
-                move |msg| {
-                    let runner = runner.clone();
-                    let gate = gate.clone();
-                    async move {
-                        if let cog_core::InboxMessage::Prompt { goal, .. } = msg {
-                            if let Ok(task) = serde_json::from_value::<cog_core::Task>(goal) {
-                                // A worker that has no turn yet waits for one
-                                // rather than dropping the message: the
-                                // message is already taken, and a dropped one
-                                // is work nobody will be handed again.
-                                let _turn = gate.acquire().await;
-                                runner.execute_task(task).await;
-                            }
-                        }
-                        Ok(())
-                    }
-                },
+                handler,
             )
             .await
         {
-            warn!("Failed to spawn agent pool worker {}: {}", agent_id, e);
-        } else {
-            info!(
-                "Agent pool worker {} spawned (id={}, role={:?})",
-                name.handle, agent_id, self.role
-            );
+            Ok(handle) => {
+                // The loop closes here: from this point on, every sentence that
+                // reaches this worker's inbox has an object to answer with.
+                if worker.set(handle.agent.clone()).is_err() {
+                    warn!(
+                        agent_id = %agent_id,
+                        "pool worker cell was already filled; the earlier object answers"
+                    );
+                }
+                info!(
+                    "Agent pool worker {} spawned (id={}, role={:?})",
+                    name.handle, agent_id, self.role
+                );
+            }
+            Err(e) => {
+                warn!("Failed to spawn agent pool worker {}: {}", agent_id, e);
+            }
         }
     }
 }
@@ -792,3 +853,161 @@ pub const DESCRIPTOR: cog_core::PluginDescriptor = cog_core::PluginDescriptor {
     optional_requires: &["stream", "net"],
     factory: || Box::new(AgentPlugin::new()),
 };
+
+#[cfg(test)]
+mod conversation_reaches_the_worker_tests {
+    //! A sentence addressed to a pool worker is answered, not swallowed.
+    //!
+    //! The workbench's dialogue box reaches a standing worker through its inbox.
+    //! The handler that ran there read every `Prompt` as a task, and when the
+    //! goal did not parse as one it acknowledged the message and did nothing:
+    //! the person asking saw a timeout, the transcript recorded a send that was
+    //! never answered, and nothing anywhere said the sentence had been dropped.
+    //! This judges the property directly — the answer arrives on the stream the
+    //! asker named.
+
+    use super::*;
+    use cog_core::{
+        AssistantMessageEvent, ChatOptions, ChatResponse, ContentBlock, EventStream, InboxMessage,
+        LlmClient, Message, MessageBackend, SFResult, StopReason, Usage,
+    };
+    use std::time::Duration;
+
+    /// Answers every request with one sentence: this test is about the reply
+    /// reaching the asker, not about what a model would have said.
+    struct Answering(&'static str);
+
+    #[async_trait::async_trait]
+    impl LlmClient for Answering {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            let (stream, producer) = EventStream::with_capacity(4);
+            let text = self.0.to_string();
+            tokio::spawn(async move {
+                let mut producer = producer;
+                let _ = producer
+                    .push(AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta: text.clone(),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await;
+                producer.end(ChatResponse {
+                    content: vec![ContentBlock::Text {
+                        text,
+                        text_signature: None,
+                    }],
+                    api: "mock".into(),
+                    provider: "mock".into(),
+                    model: "mock".into(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    upstream_failure: None,
+                    retry_after_secs: None,
+                    timestamp: chrono::Utc::now(),
+                });
+            });
+            Ok(stream)
+        }
+
+        async fn complete_stream(
+            &self,
+            _prompt: &str,
+            _options: &cog_core::CompleteOptions,
+        ) -> SFResult<cog_core::AssistantMessageEventStream> {
+            unimplemented!("this test only drives the chat loop")
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[Message],
+            _options: &ChatOptions,
+        ) -> SFResult<ChatResponse> {
+            Ok(ChatResponse {
+                content: vec![ContentBlock::Text {
+                    text: self.0.to_string(),
+                    text_signature: None,
+                }],
+                api: "mock".into(),
+                provider: "mock".into(),
+                model: "mock".into(),
+                response_id: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Stop,
+                error_message: None,
+                upstream_failure: None,
+                retry_after_secs: None,
+                timestamp: chrono::Utc::now(),
+            })
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    /// A sentence is not work: reaching the runner with one is the defect this
+    /// test exists for, so it fails loudly instead of running something.
+    struct NoWork;
+
+    #[async_trait::async_trait]
+    impl cog_core::TaskExecutionCallback for NoWork {
+        async fn execute_task(&self, _task: cog_core::Task) {
+            panic!("a sentence addressed to a worker must not be run as a task");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sentence_reaches_the_worker_and_its_answer_lands_on_the_reply_stream() {
+        let backend = Arc::new(cog_test_support::MemoryMessageBackend::new());
+        let reply_stream = "worker-replies";
+        backend
+            .create_consumer_group(reply_stream, "asker")
+            .await
+            .expect("the asker's reader exists before the reply is published");
+        let mut replies = backend
+            .subscribe(reply_stream, "asker")
+            .await
+            .expect("the asker subscribes before asking");
+
+        let config = cog_core::RuntimeConfig {
+            agent_id: "worker-one".into(),
+            ..Default::default()
+        };
+        let agent = Arc::new(
+            crate::Agent::new(config, Arc::new(Answering("我是 Ada#1234")))
+                .with_message_backend(backend.clone()),
+        );
+        let cell = PoolWorkerCell::default();
+        assert!(cell.set(agent).is_ok(), "the cell starts empty");
+        let mut handler = pool_worker_handler(
+            Arc::new(NoWork),
+            Arc::new(crate::pool_sizing::PoolConcurrency::new(None)),
+            cell,
+        );
+
+        handler(InboxMessage::Prompt {
+            goal: serde_json::json!("你叫什么名字？"),
+            reply_stream: Some(reply_stream.into()),
+        })
+        .await
+        .expect("the worker answers a sentence without failing");
+
+        let frame = tokio::time::timeout(Duration::from_secs(30), replies.next())
+            .await
+            .expect("the answer arrives within the window")
+            .expect("a frame on the reply stream")
+            .expect("the frame reads back");
+        let answer: serde_json::Value =
+            serde_json::from_slice(&frame.1).expect("the answer is JSON");
+        assert!(
+            answer.to_string().contains("Ada#1234"),
+            "the answer on the reply stream is the worker's own: {answer}"
+        );
+    }
+}
