@@ -42,9 +42,11 @@ use crate::GatewayState;
 /// 上限存在的理由与聚合存在的理由同一条：这条读是给一个要据此决定下一件事做什么
 /// 的智能体用的，不是给一个要把整张账搬到内存里的人用的。超出上限的条数不是被
 /// 悄悄截掉——`truncated` 与 `open` 的差就是没带回来的那些。
+// cap: bound — 这条读是给智能体据此决定下一件事用的，不是用来搬整张账的；没带回来的那些由 truncated 报出，靠抬这个数补不上
 pub const MAX_OLDEST: usize = 50;
 
 /// 没点名时要几条。
+// cap: bound — 不点名时的默认页长；要更多的调用方自己点名，所以它不跟着任何一条读数走
 pub const DEFAULT_OLDEST: usize = 20;
 
 /// `GET /api/v1/tasks/ledger` 的筛选条件，都可以不给。
