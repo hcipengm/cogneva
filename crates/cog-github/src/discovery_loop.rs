@@ -1352,8 +1352,7 @@ impl GitHubDiscoveryLoop {
     }
 
     /// Polling fallback for CI failure detection when the webhook endpoint is
-    /// not publicly reachable. The first poll after boot only records the
-    /// currently failed runs; later polls submit fix tasks for new failures.
+    /// not publicly reachable.
     async fn poll_ci_failures(&mut self) {
         // 读失败不是「今天没有 CI 红」。并成一张空表之后，一个坏掉的读取路径与
         // 一条安静的流水线在读数上完全一样：都是零张修复单——而前者恰好是这套
@@ -1369,24 +1368,44 @@ impl GitHubDiscoveryLoop {
             }
         };
 
-        match self.ci_seen {
-            None => {
-                self.ci_seen = Some(events.iter().map(|e| e.run_id).collect());
-                tracing::debug!(
-                    adopted = self.ci_seen.as_ref().map_or(0, |s| s.len()),
-                    "CI polling adopted pre-existing failed runs"
-                );
-            }
-            Some(ref mut seen) => {
-                let fresh: Vec<_> = events
-                    .into_iter()
-                    .filter(|e| seen.insert(e.run_id))
-                    .collect();
-                for event in fresh {
-                    if let Err(e) = self.process_ci_failure(event).await {
-                        tracing::warn!(error = %e, "CI failure processing failed");
-                    }
-                }
+        // 「开机时已经存在的那些不修」是上一版的口径，它把「这个进程没见过」
+        // 当成了「已经处理过」。可这台部署器按自己的节奏滚动，进程一小时左右
+        // 就换一代：一段红只要整段落在两次启动之间，开机时它就在清单里被记成
+        // 见过，之后又没有新的 run 让它变新鲜——于是修与不修的分界成了进程的
+        // 年龄，而不是这棵树此刻红不红。
+        //
+        // 判据交回给 `process_ci_failure`：它问的是同一条工作流最近一次跑完的
+        // 结局（绿了就跳过，红着才开单），并且同一分支同一工作流一次只留一张
+        // 单，所以开机那一批最多换回一张修复单，不会把二十条历史失败变成二十张。
+        let first_poll = self.ci_seen.is_none();
+        let seen = self
+            .ci_seen
+            .get_or_insert_with(std::collections::HashSet::new);
+        let mut fresh: Vec<_> = events
+            .into_iter()
+            .filter(|e| seen.insert(e.run_id))
+            .collect();
+
+        // 同一分支同一条工作流只留最新那条：要修的是那棵树，旧记录点名的失败
+        // 已经被后来的运行取代，逐条去问只是把同一个答案取二十遍。先按 run id
+        // 从新到旧排，留下来的就是最新的一条，且次序与清单顺序无关。
+        fresh.sort_by_key(|a| std::cmp::Reverse(a.run_id));
+        let mut claimed: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let fresh: Vec<_> = fresh
+            .into_iter()
+            .filter(|e| claimed.insert((e.head_branch.clone(), e.workflow_name.clone())))
+            .collect();
+
+        if first_poll {
+            tracing::info!(
+                asked = fresh.len(),
+                "CI polling on the first round after boot: asking about every failure that is still open"
+            );
+        }
+        for event in fresh {
+            if let Err(e) = self.process_ci_failure(event).await {
+                tracing::warn!(error = %e, "CI failure processing failed");
             }
         }
     }
@@ -5148,8 +5167,13 @@ pub(crate) mod tests {
         assert!(!loop_.process_ci_failure(ci_event(3003)).await.unwrap());
     }
 
+    /// 一段红整段落在两次部署之间时，开机这一拍就是它唯一的入口。
+    ///
+    /// 上一版在这里把它们记成「已见」就再也不提：进程一小时换一代，红得比这
+    /// 更密，于是这段失败永远等不到第二拍。现在开机那一批照样进
+    /// `process_ci_failure`，由它问「这棵树现在红不红」——绿了自己跳过。
     #[tokio::test]
-    async fn ci_polling_adopts_existing_failures_on_first_round() {
+    async fn ci_polling_asks_about_a_failure_it_inherited_at_start() {
         let _guard = crate::identity::ENV_LOCK.lock().await;
         let data_dir = tempfile::tempdir().unwrap();
         std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
@@ -5157,7 +5181,7 @@ pub(crate) mod tests {
             issues: vec![],
             comments: Mutex::new(vec![]),
             ci_logs: vec![],
-            ci_runs: Mutex::new(vec![ci_event(4001), ci_event(4002)]),
+            ci_runs: Mutex::new(vec![ci_event(4001)]),
             ci_green_runs: Mutex::new(Vec::new()),
             prs: vec![],
             pr_details: HashMap::new(),
@@ -5173,7 +5197,47 @@ pub(crate) mod tests {
         );
 
         loop_.run_once().await.unwrap();
-        assert!(orchestrator.goals.lock().unwrap().is_empty());
+        let goals = orchestrator.goals.lock().unwrap().clone();
+        assert_eq!(goals.len(), 1, "开机那批失败要有人认领：{goals:?}");
+        assert!(goals[0].contains("run 4001"), "{}", goals[0]);
+
+        std::env::remove_var("COGNEVA_DATA_DIR");
+    }
+
+    /// 开机时清单里压着十几条同一个 workflow 的历史失败，要修的是同一棵树：
+    /// 留最新那条，问一次，也只开一张单。
+    #[tokio::test]
+    async fn ci_polling_asks_once_per_workflow_for_a_backlog() {
+        let _guard = crate::identity::ENV_LOCK.lock().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        std::env::set_var("COGNEVA_DATA_DIR", data_dir.path());
+        let provider = Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![],
+            ci_runs: Mutex::new(vec![ci_event(4101), ci_event(4103), ci_event(4102)]),
+            ci_green_runs: Mutex::new(Vec::new()),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        });
+        let orchestrator = Arc::new(MockOrchestrator::new());
+
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        loop_.run_once().await.unwrap();
+        let goals = orchestrator.goals.lock().unwrap().clone();
+        assert_eq!(goals.len(), 1, "一份积压只该换回一张修复单：{goals:?}");
+        assert!(
+            goals[0].contains("run 4103"),
+            "留下来的要是最新的那一次：{}",
+            goals[0]
+        );
 
         std::env::remove_var("COGNEVA_DATA_DIR");
     }
@@ -5203,19 +5267,20 @@ pub(crate) mod tests {
             None,
         );
 
-        // First round adopts run 5001 without submitting.
-        loop_.run_once().await.unwrap();
-        assert!(orchestrator.goals.lock().unwrap().is_empty());
-
-        // A new failure appears; the next round submits exactly one task.
-        provider.ci_runs.lock().unwrap().push(ci_event(5002));
+        // First round files for run 5001, the only failure there is.
         loop_.run_once().await.unwrap();
         assert_eq!(orchestrator.goals.lock().unwrap().len(), 1);
-        assert!(orchestrator.goals.lock().unwrap()[0].contains("run 5002"));
+        assert!(orchestrator.goals.lock().unwrap()[0].contains("run 5001"));
+
+        // A new failure appears; the next round submits exactly one more.
+        provider.ci_runs.lock().unwrap().push(ci_event(5002));
+        loop_.run_once().await.unwrap();
+        assert_eq!(orchestrator.goals.lock().unwrap().len(), 2);
+        assert!(orchestrator.goals.lock().unwrap()[1].contains("run 5002"));
 
         // Polling again with the same set submits nothing.
         loop_.run_once().await.unwrap();
-        assert_eq!(orchestrator.goals.lock().unwrap().len(), 1);
+        assert_eq!(orchestrator.goals.lock().unwrap().len(), 2);
     }
 
     // --- Cross-validation (A2A) -------------------------------------------
