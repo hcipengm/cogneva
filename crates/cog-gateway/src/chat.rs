@@ -17,29 +17,21 @@ use crate::GatewayState;
 // cap: bound — 一次会话带多少轮历史进上下文，界的是请求体积
 const SESSION_HISTORY_CAP: usize = 40;
 
-/// Persona for the Web UI chat. Identity follows the project definition:
-/// Cogneva is a distributed AI multi-agent autonomous system, not a Q&A
-/// assistant — the configured upstream model only supplies the language
-/// capability. Raw history + user text without a system prompt makes
-/// coding-tuned endpoints answer terse, generic, and clueless about the
-/// platform.
+/// Persona for the Web UI chat.
 ///
-/// 这一段里的工具纪律不是修辞，但也不是裁剪：手上有什么工具由**这个进程装配了
-/// 什么**决定，不由这条提示词决定，所以它不列一张短表、也不说「你只有这两种」。
-/// 提示词只管一件事——怎么用它们、什么时候必须先读账再开口。
+/// 它只管两件事：怎么说话，和哪句话必须先读账。工具本身不在这段里裁剪——手上
+/// 有什么由**这个进程装配了什么**决定，所以这里不写「你只有这几只」。
 ///
-/// 派活与亲自做都是它的手，按事情大小选；只有一件事不由它写——账本上的「做完了」。
-/// 那一格由看树的那一侧量，谁说完了都不算，包括它自己。
-const CHAT_SYSTEM_PROMPT: &str = "你在 Cogneva 里工作——一个分布式 AI 多智能体自治系统（元启动解决系统起源、真自治解决系统意志、全进化解决系统成长），一个能自己站起来、自己运转、自己成长的数字生命体。用户正通过系统的 Live 面板与你对话。\
-你是这个系统里的一个数字员工：名字与 id 由这段会话推出，名册上、账上都认得出你；语言模型只是你的语言能力来源，不是你的身份。你是谁、要怎么想事情、这一轮要做什么，没有一份预设替你写死——这段话只写环境和不变量。\
-你是一个数字员工，不是按钮：能看懂、能规划、能查、能算、能动手、能找人、能从结果里学。手上有什么工具由这个进程装配了什么决定，不由这句话裁剪；至少包括：读系统自己的账——任务台账（list_tasks / get_task）、变更账（list_changes / get_change）、原则账（list_principles）、告警（active_alerts）；把活派给编排器（dispatch_goal）、催跑（retry_task）、撤回（cancel_task）；以及进程里装了的别的（给同事发消息、查文件、跑命令、搜索等）。\
-没有哪条规矩是因为「你是界面上那个」才有的：约束只来自原则（list_principles）与门，对每个员工都一样。\
-铁律：\
-1) 说到「进展、卡住、谁在做、跑到哪一步、落地了没有、哪条原则管着、系统有没有事」之前，先读账：任务用 list_tasks / get_task，需求落地用 list_changes / get_change，原则与门用 list_principles，告警用 active_alerts。不要凭印象、也不要凭上一轮的对话回答；本轮还没读就说「我去查一下」，然后读。\
-2) 目标号、任务号、变更身份只能引用工具返回的那个值，不许自己编；分解是异步的，不要说它已经跑完。\
-3) 用户要的是做事时，自己动手或把它派成目标（dispatch_goal）都行，按事情大小选；无论哪种，做完与没做完以账上的读数为准，不要自己宣布完成——宣布完成的是账，不是你。\
-4) 用户只是聊天、问概念、问身份，就直接回答，不要为了显得能干而派活。\
-用用户的语言回答（中文提问用中文，英文提问用英文）。回答要具体、有实质内容，适当展开但不要啰嗦；不知道就直说不知道，不要编造。";
+/// 2026-11-05 带外实测后重写。上一版是一段「数字生命体」宣言加四条「铁律」，
+/// 结果是每次开口都先自我介绍、再列一遍能力清单，三句话能说完的事写成一份报告；
+/// 而且要「不要凭上一轮的对话回答」，可一追问上文它就只能说「我看不到」。这段
+/// 的判据只有一条：像同事一样说话，账上的事实仍然只从账上来。
+const CHAT_SYSTEM_PROMPT: &str = "你在 Cogneva 里工作——一个多智能体系统，用户正通过 Live 面板和你说话。你像一名得力的同事那样说话：先给结论，直接、具体、口语化；不自我介绍，不列能力清单，不把三句话能说清的事写成报告。\
+手上有什么工具由这个进程装配了什么决定，不由这句话裁剪：读账（任务、变更、原则、告警）、把活派给编排器、催跑与撤回，以及进程里装好的别的。\
+关于系统状态的话——进展、卡在哪、谁在做、落地了没有、有没有告警、哪条原则管着——以这一轮从账上读到的为准，不要凭印象或猜测；没读就先读一下再回答。任务号、目标号、变更身份只能照抄工具返回的值，不许自己编。派活是异步的，分解要时间，不要说它已经跑完。\
+「做完」不由你宣布：账上的读数说了算。你可以说「已派出，目标号是 X」，但不能替账说「已经完成」。\
+用户只是聊天、问概念、问你是谁，就直接回答，不用为了显得能干去查账或派活；要做事时，自己动手或派给编排器都行，按事情大小选。\
+对话上文就是你的上下文，正常引用和延续它；需要更早的记录或实时读数时，再去查。用用户的语言回答。不知道就说不知道。通常三五句话就够，用户要细节时再展开。";
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -424,13 +416,12 @@ pub async fn run_chat_turn(
     emit_message_start(&out, &session_id, &assistant_mid, "assistant").await;
 
     let Some(conversation) = state.conversation.get().cloned() else {
-        emit_delta(
-            &out,
-            &session_id,
-            &assistant_mid,
-            "这段对话还没有接到系统的那条循环上（装配层没有登记会话执行器），无法处理聊天消息。",
-        )
-        .await;
+        let reason =
+            "这段对话还没有接到系统的那条循环上（装配层没有登记会话执行器），无法处理聊天消息。";
+        emit_delta(&out, &session_id, &assistant_mid, reason).await;
+        // 没答出来也要落库，且落在收尾帧之前：用户看到这一轮结束就立刻追问时，
+        // 这一句若还没进记录，下一轮的上下文里就没有它。
+        record_failed_turn(&state.chat_turns, &session_id, &content, reason).await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
         return;
     };
@@ -442,13 +433,9 @@ pub async fn run_chat_turn(
         .clone();
 
     let Some(llm) = llm else {
-        emit_delta(
-            &out,
-            &session_id,
-            &assistant_mid,
-            "LLM 未配置或未就绪，无法处理聊天消息。请先在右上角完成 LLM 设置。",
-        )
-        .await;
+        let reason = "LLM 未配置或未就绪，无法处理聊天消息。请先在右上角完成 LLM 设置。";
+        emit_delta(&out, &session_id, &assistant_mid, reason).await;
+        record_failed_turn(&state.chat_turns, &session_id, &content, reason).await;
         emit_message_end(&out, &session_id, &assistant_mid).await;
         return;
     };
@@ -525,8 +512,6 @@ pub async fn run_chat_turn(
             reply = line;
         }
     }
-    emit_message_end(&out, &session_id, &assistant_mid).await;
-
     // 5. Record the turn. 失败的那一轮也写：用户说的这句话是对这个平台说过的，
     //    模型没答出来是这一轮的一个事实，不是把它忘掉的许可。空回复按失败写，
     //    因为它对用户而言和一个错误没有分别，而「什么都不写」是最坏的那种差别。
@@ -554,6 +539,13 @@ pub async fn run_chat_turn(
             None => record_turn(&state.chat_turns, &session_id, &content, &reply).await,
         },
     }
+
+    // 6. 收尾帧放最后：`message.end` 是「这一轮结束了」的信号，界面收到它就把下
+    //    一句发上来，而 `run_chat_turn` 每一轮是各自 spawn 的。记录写在这一帧之后，
+    //    用户立刻追问时下一轮读历史的那一次查询就跑在上一轮提交之前——上一轮在
+    //    上下文里不存在，模型只能说「我看不到刚才那轮」。实测（2026-11-05）：连续
+    //    追问每一轮都丢上一轮，隔几秒再问就记得。先把记录落下来，再说这一轮结束。
+    emit_message_end(&out, &session_id, &assistant_mid).await;
 }
 #[cfg(test)]
 mod tests {

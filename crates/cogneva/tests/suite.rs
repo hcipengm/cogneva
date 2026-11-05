@@ -151,6 +151,8 @@ mod chart_template_literals_contract_test;
 mod chat_reply_points_at_a_badge_the_client_draws_test;
 #[path = "chat_turn_is_an_agent_with_control_plane_tools_test.rs"]
 mod chat_turn_is_an_agent_with_control_plane_tools_test;
+#[path = "chat_turn_is_recorded_before_the_end_frame_test.rs"]
+mod chat_turn_is_recorded_before_the_end_frame_test;
 #[path = "chat_user_echo_is_rendered_once_test.rs"]
 mod chat_user_echo_is_rendered_once_test;
 #[path = "ci_gate_parity_contract_test.rs"]
@@ -385,6 +387,8 @@ mod runtime_database_role_is_not_the_instance_superuser_test;
 mod runtime_roots_literals_contract_test;
 #[path = "rust_capacity_constants_registry_test.rs"]
 mod rust_capacity_constants_registry_test;
+#[path = "scenes_hand_work_to_the_roster_test.rs"]
+mod scenes_hand_work_to_the_roster_test;
 #[path = "scrape_targets_name_a_port_the_workload_provides_test.rs"]
 mod scrape_targets_name_a_port_the_workload_provides_test;
 #[path = "service_account_mount_literals_contract_test.rs"]
