@@ -176,6 +176,44 @@ tests:
               severity: critical
               stream: tasks
 
+  # 同样的沉默，两种原因：读循环把消息拿在手里、排在自己的并发预算后面时，它当然
+  # 不发 XREADGROUP，而这一族读数只看得到「多久没读到」。差别在 claim 的两个读数上，
+  # 所以下面两格只改槽位：全占着必须静，差一格必须照响。2026-11-06 实测那一次是
+  # 6 个槽全占、沉默 1565 秒、claim_wait 同时 1565 秒 —— 忙，不是坏。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_stream_read_silent_seconds{stream="tasks"}'
+        values: '600x60'
+      - series: 'cogneva_stream_read_block_seconds{stream="tasks"}'
+        values: '2x60'
+      - series: 'cogneva_task_router_claim_in_flight{stream="tasks"}'
+        values: '6x60'
+      - series: 'cogneva_task_router_claim_slots{stream="tasks"}'
+        values: '6x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: stream_consumer_stalled
+        exp_alerts: []
+
+  # 差一格：这条循环本来还能再读一次，它没有 —— 沉默是它自己的，规则必须照响。
+  - interval: 1m
+    input_series:
+      - series: 'cogneva_stream_read_silent_seconds{stream="tasks"}'
+        values: '600x60'
+      - series: 'cogneva_stream_read_block_seconds{stream="tasks"}'
+        values: '2x60'
+      - series: 'cogneva_task_router_claim_in_flight{stream="tasks"}'
+        values: '5x60'
+      - series: 'cogneva_task_router_claim_slots{stream="tasks"}'
+        values: '6x60'
+    alert_rule_test:
+      - eval_time: 60m
+        alertname: stream_consumer_stalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              stream: tasks
+
   # 重启的涨幅还在窗口里（一小时窗口留得住四十分钟前那次），但这条读数四十分钟前停了：
   # 现在是不是又重启了不知道。删掉「五分钟内报过」那条腿，这一格会响。
   - interval: 1m
