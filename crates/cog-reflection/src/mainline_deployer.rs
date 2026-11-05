@@ -314,11 +314,7 @@ const BUILDAH_STEP_WALLS: &[(&str, u64)] = &[
     ("commit-image", 600),
     ("push-image", 900),
     ("list-store", 300),
-    ("tag-presence", 30),
     ("remove-images", 900),
-    ("promote-pull", 900),
-    ("promote-tag", 60),
-    ("promote-push", 900),
 ];
 
 /// 推进连输几轮之后，这一方就去**认领下一个构建名额**（见
@@ -9324,25 +9320,40 @@ impl MainlineDeployer {
         Ok(())
     }
 
-    /// 滚动收敛后把 registry 浮动签 `:local` 前移到指定 rev。buildah 镜像库
-    /// 在 sandbox PVC 上，正常情况刚构建的不可变 tag 还在本地；Pod 重建后
-    /// 本地丢失则先从 registry 拉回（同 registry 秒回）再打签推送。
+    /// 滚动收敛后把 registry 浮动签 `:local` 前移到指定 rev。
+    ///
+    /// 这一步原来是 `buildah pull`/`tag`/`push`：把整份镜像再推一遍——本机实测
+    /// 2026-11-06 是 2.1 GB——只为让一个 tag 指向它本来就指向的那份 manifest。同一天
+    /// 那条 push 在这台机器上跑了十分钟以上，而收敛的落盘排在它后面：日志里"滚上去了"
+    /// 已经打出十分钟，状态文件还写着上一版的 `in_flight`，下一拍读到的仍是旧世界。
+    ///
+    /// registry 自己做这件事要快得多：读一份 manifest 的原字节与原 media type，
+    /// PUT 到另一个 tag 名下（`registry_copy_manifest`，删旧 tag 时早就在用同一条
+    /// 路）。毫秒级，不经过本地镜像库，也不需要有本地那份镜像——它要的前提只是
+    /// 不可变 tag 在 registry 上还在，而那正是节点能拉到这一版的同一个条件。
     async fn promote_local_tag(&self, rev: &str) -> SFResult<()> {
         let immutable = main_image(&self.push_endpoint(), rev);
         let local = local_image(&self.push_endpoint());
-        let present = self
-            .buildah_step("tag-presence", &["images", "-q", &immutable])
-            .await?
-            .trim()
-            .to_string();
-        if present.is_empty() {
-            self.buildah_step("promote-pull", &["pull", "--tls-verify=false", &immutable])
-                .await?;
+        let tag = main_tag(rev);
+        let path = repo_path(&format!("manifests/{tag}"));
+        let (status, headers, _) = self
+            .registry_request("GET", &path, MANIFEST_ACCEPTS, None)
+            .await?;
+        if status != 200 {
+            return Err(SFError::IO(format!(
+                "cannot advance :local to {immutable}: the registry answers {tag} with \
+                 {status}, and copying a manifest can only move a reference the store \
+                 already holds"
+            )));
         }
-        self.buildah_step("promote-tag", &["tag", &immutable, &local])
-            .await?;
-        self.buildah_step("promote-push", &["push", "--tls-verify=false", &local])
-            .await?;
+        let digest = header_value(&headers, "docker-content-digest").unwrap_or_default();
+        if digest.is_empty() {
+            return Err(SFError::IO(format!(
+                "the registry served {tag} without a Docker-Content-Digest, so there is no \
+                 manifest to copy onto :local"
+            )));
+        }
+        self.registry_copy_manifest(&digest, "local").await?;
         info!(rev = %rev12(rev), tag = %local, "floating :local advanced to converged revision");
         Ok(())
     }
@@ -21523,6 +21534,38 @@ exec {real} "$@"
         )
     }
 
+    /// 收敛那一轮会把浮动 `:local` 指到这一版上，而这一步现在是 registry 自己
+    /// 的一份 manifest 中转：它要先答得出 `main-<rev12>` 的 digest，再接受把那份
+    /// manifest PUT 到 `local` 名下。
+    ///
+    /// 用到「这一轮真的收敛」的用例都从这里取 registry——形状写一遍，免得三处
+    /// 各自长出一份迟早会漂的假应答。收敛失败是这类用例最坏的失败方式：它们断言
+    /// 的是收敛之后发生的事，`poll_once` 提前报错时那些断言一条都不会跑到。
+    async fn converged_registry(
+        rev: &str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let digest = "sha256:0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
+        let body = oci_manifest("sha256:cfg", &["sha256:L1"]);
+        routed_registry(vec![
+            (
+                "GET",
+                format!("/v2/cogneva/manifests/{}", main_tag(rev)),
+                http_manifest(digest, &body),
+            ),
+            (
+                "GET",
+                format!("/v2/cogneva/manifests/{digest}"),
+                http_manifest(digest, &body),
+            ),
+            (
+                "PUT",
+                "/v2/cogneva/manifests/local".to_string(),
+                http_status(201, "Created"),
+            ),
+        ])
+        .await
+    }
+
     fn oci_config(rev: &str, created: &str) -> String {
         format!(
             r#"{{"created":"{created}","config":{{"Labels":{{"org.opencontainers.image.revision":"{rev}"}}}}}}"#
@@ -23057,7 +23100,12 @@ exit 0
         let deployed = main_image("localhost:30500", &rev_b);
         let kubectl = fake_kubectl_with_judge(&bin_dir, &deployed, "1||", "");
 
-        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        // 不可变 tag 在 registry 上，`:local` 由 registry 自己复制过去——不经过
+        // 本地镜像库，也就没有那份 2.1 GB 的 pull/tag/push。
+        let (endpoint, seen) = converged_registry(&rev_b).await;
+
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.registry = endpoint;
         let deployer = MainlineDeployer::new(cfg, test_workspaces(root, &bare));
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -23076,16 +23124,21 @@ exit 0
 
         deployer.poll_once().await.unwrap();
 
-        let buildah_calls = std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap();
-        let push_main = main_image("reg.local:5000", &rev_b);
-        let push_local = local_image("reg.local:5000");
+        let requests = requests_seen(&seen);
         assert!(
-            buildah_calls.contains(&format!("tag {push_main} {push_local}")),
-            "convergence must retag immutable tag to floating :local: {buildah_calls}"
+            requests
+                .iter()
+                .any(|r| r.starts_with("PUT /v2/cogneva/manifests/local ")),
+            "convergence must point :local at the converged manifest in the store itself: \
+             {requests:#?}"
         );
+        // 反面同样要钉住：这条路上不该再出现一次整份镜像的推送。本机实测 2.1 GB 的那条
+        // push 在这台机器上跑十分钟以上，而收敛的落盘排在它后面。
+        let buildah_calls =
+            std::fs::read_to_string(bin_dir.join("buildah.log")).unwrap_or_default();
         assert!(
-            buildah_calls.contains(&format!("push --tls-verify=false {push_local}")),
-            "floating :local must be pushed on convergence: {buildah_calls}"
+            !buildah_calls.contains("push --tls-verify=false reg.local:5000/cogneva:local"),
+            "the floating tag must not be moved by re-pushing the whole image: {buildah_calls}"
         );
 
         let state: MainlineState =
@@ -23127,7 +23180,8 @@ exit 0
         let kubectl = fake_kubectl_with_judge(&bin_dir, &deployed, "1||", "");
 
         let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
-        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.registry = converged_registry(&rev_b).await.0;
         let deployer =
             MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
         let state_dir = root.join("state");
@@ -23343,7 +23397,8 @@ exit 0
             "version:wait:cogneva-web:observed\\nrollout-resources:v1:at=1700000000:cpu_quota_us=200000:cpu_period_us=100000:cpu_periods=263:cpu_throttled_periods=7:memory_max=2147483648:memory_peak=1073741824\\n",
         );
 
-        let cfg = test_config(root, &bare, &buildah, &kubectl);
+        let mut cfg = test_config(root, &bare, &buildah, &kubectl);
+        cfg.registry = converged_registry(&rev_b).await.0;
         let metrics = std::sync::Arc::new(cog_test_support::MemoryMetricsBackend::new());
         let deployer =
             MainlineDeployer::new(cfg, test_workspaces(root, &bare)).with_metrics(metrics.clone());
