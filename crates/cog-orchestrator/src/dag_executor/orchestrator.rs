@@ -462,6 +462,15 @@ impl DagExecutor {
     /// stream left out is swept exactly as before — an unreadable queue is not
     /// a reading of an empty one.
     ///
+    /// `draining` is, per stream, whether the number of undelivered entries
+    /// fell since the previous sweep. A backlog alone cannot say whether the
+    /// queue is slow or stopped; the difference between two readings can. When
+    /// it did not fall, the reader took nothing out in a whole window, so a
+    /// message minted now lands behind the same entries the previous one is
+    /// behind, and the queue is one entry longer on the next sweep. A stream
+    /// absent from the map is swept as before: no difference is not a reading
+    /// of no movement.
+    ///
     /// A non-zero backlog changes what the age means. The row is old, but its
     /// message may be sitting in a queue that is simply longer than the claim
     /// pool, and re-arming then adds a second copy to the very queue that is
@@ -495,6 +504,7 @@ impl DagExecutor {
         stall_after_secs: u64,
         served_streams: &[String],
         undelivered: &HashMap<String, Option<u64>>,
+        draining: &HashMap<String, bool>,
         max_backlog_windows: u64,
         pool_declares_unavailable: bool,
     ) -> usize {
@@ -528,6 +538,21 @@ impl DagExecutor {
             let lag = undelivered.get(&stream).copied().flatten();
             let has_backlog = lag.map(|lag| lag > 0).unwrap_or(false);
             if has_backlog {
+                // 连续两拍之间欠的条数没有变少：读者这一整拍一步都没往前走。
+                // 这时回炉出来的消息落在同一条队伍的同一种位置上，等不到前一条的
+                // 读者同样等不到这一条——它不是「队列慢」，是「队列没在动」，而
+                // 往一条不动的队列里加长度只会让下一次更慢。
+                //
+                // 与下面那道年龄兜底的区别：年龄说的是「这条行等了很久」，那是
+                // 队列在动的证据；差值说的是「队列动了没有」，那才是回炉有没有用
+                // 的证据。2026-11-05 实测两种读法分开：队列两分钟纹丝不动（26,489 /
+                // 73,189 / 1），而两轮清扫之间回炉了 2,033 行，每回炉一行就是往这条
+                // 不动的队列里再塞一条。
+                if !draining.get(&stream).copied().unwrap_or(true) {
+                    deferred += 1;
+                    lanes.entry(lane).or_default().deferred += 1;
+                    continue;
+                }
                 let age_secs = (now - task.updated_at).num_seconds().max(0);
                 let cap_secs = (stall_after_secs as i64).saturating_mul(max_backlog_windows as i64);
                 // A declared pool outage is the third explanation, and it is
@@ -4365,8 +4390,15 @@ mod tests {
         streams: &[String],
         undelivered: &HashMap<String, Option<u64>>,
     ) -> usize {
-        dag.reclaim_stalled_scheduled(stall_after_secs, streams, undelivered, 3, false)
-            .await
+        dag.reclaim_stalled_scheduled(
+            stall_after_secs,
+            streams,
+            undelivered,
+            &HashMap::new(),
+            3,
+            false,
+        )
+        .await
     }
 
     /// 传输层答不出积压时的清扫：大多数测试只关心「超过窗就收回」这一条。
@@ -7183,6 +7215,61 @@ mod tests {
         );
     }
 
+    /// 两次清扫之间队列一条都没少：回炉换不到任何东西。
+    ///
+    /// 上一条按年龄兜底，而年龄说的是「这条行等了很久」；积压两拍之间的差值说的是
+    /// 另一件事——「这条队列动了没有」。读者一整拍一步没走时，回炉出来的消息落在
+    /// 同一个位置上：等不到前一条的读者同样等不到这一条，队列的长度还多了一。
+    /// 2026-11-05 实测两种读法分开：队列两分钟纹丝不动（26,489 / 73,189 / 1），
+    /// 同期清扫器 90 分钟里回炉 2,033 行。
+    #[tokio::test]
+    async fn a_queue_that_did_not_move_since_the_last_sweep_gets_no_second_copy() {
+        let dag = DagExecutor::new("ws-stalled-not-draining".into());
+        dag.add_task(Task::new(
+            "behind_a_frozen_queue",
+            TaskType::LlmCall,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+        dag.schedule_task("behind_a_frozen_queue").await.unwrap();
+        {
+            let mut inner = dag.inner.write().await;
+            inner
+                .tasks
+                .get_mut("behind_a_frozen_queue")
+                .unwrap()
+                .updated_at = chrono::Utc::now() - chrono::Duration::minutes(60);
+        }
+        let metrics = Arc::new(RecordingMetrics::default());
+        dag.attach_metrics(metrics.clone());
+        let streams = served("ws-stalled-not-draining", true);
+        let stream = crate::ready_queue::ready_stream("ws-stalled-not-draining");
+
+        let mut undelivered = HashMap::new();
+        undelivered.insert(stream.clone(), Some(8_815u64));
+        let mut draining = HashMap::new();
+        draining.insert(stream, false);
+
+        assert_eq!(
+            dag.reclaim_stalled_scheduled(600, &streams, &undelivered, &draining, 3, false)
+                .await,
+            0,
+            "an hour past the cap, but the queue has not moved a single entry since the last \
+             sweep: another copy lands where the first one already is"
+        );
+        assert_eq!(
+            dag.get_task("behind_a_frozen_queue").await.unwrap().status,
+            TaskStatus::Scheduled
+        );
+        assert_eq!(
+            metrics.recorded(cog_core::metric_names::DAG_STALLED_SCHEDULED_DEFERRED_FOR_BACKLOG),
+            1,
+            "the wait has to be counted, or a sweep that stopped re-arming reads as one that \
+             never ran"
+        );
+    }
+
     /// 池子自己宣布停摆时，积压上限不再是解释的终点。
     ///
     /// 与上一条同一个年龄、同一份积压，只多一格「池子不可用」：这一趟必须一条
@@ -7214,7 +7301,7 @@ mod tests {
         let mut undelivered = HashMap::new();
         undelivered.insert(stream, Some(8_815u64));
         assert_eq!(
-            dag.reclaim_stalled_scheduled(600, &streams, &undelivered, 3, true)
+            dag.reclaim_stalled_scheduled(600, &streams, &undelivered, &HashMap::new(), 3, true)
                 .await,
             0,
             "an hour past the cap is still the pool's fault while the pool says it is down: \
@@ -7237,7 +7324,7 @@ mod tests {
         // 池子回来的那一拍，同一个年龄重新按上限判：队列还是那条队列，
         // 解释没了，收回照旧。
         assert_eq!(
-            dag.reclaim_stalled_scheduled(600, &streams, &undelivered, 3, false)
+            dag.reclaim_stalled_scheduled(600, &streams, &undelivered, &HashMap::new(), 3, false)
                 .await,
             1,
             "once the pool is back the cap applies again"

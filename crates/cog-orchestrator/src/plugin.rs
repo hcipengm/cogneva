@@ -604,6 +604,13 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                     // forward, so nothing here has to survive a
                                     // restart.
                                     let mut ticks_since_reclaim = 0u64;
+                                    // 上一拍每条队列还欠多少条没投出去。两次读数之间
+                                    // 的差是这一拍唯一能说出「读者有没有在往前走」的
+                                    // 东西——见下面 reclaim 那一段。
+                                    let mut previous_undelivered: std::collections::HashMap<
+                                        String,
+                                        Option<u64>,
+                                    > = std::collections::HashMap::new();
                                     loop {
                                         beat.beat();
                                         tokio::select! {
@@ -640,6 +647,31 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                         };
                                                         undelivered.insert(stream.clone(), lag);
                                                     }
+                                                    // 两次读数之差：欠的条数比上一拍
+                                                    // 少了，才说明读者真的往前走了一步。
+                                                    // 没少（持平或更多）就是它一步没动，
+                                                    // 这时再回炉只是给同一条队伍加长。
+                                                    let draining: std::collections::HashMap<
+                                                        String,
+                                                        bool,
+                                                    > = undelivered
+                                                        .iter()
+                                                        .map(|(stream, now)| {
+                                                            let moved = match (
+                                                                now,
+                                                                previous_undelivered.get(stream),
+                                                            ) {
+                                                                (Some(now), Some(Some(prev))) => {
+                                                                    now < prev
+                                                                }
+                                                                // 没有上一次读数就没有差值：
+                                                                // 照旧按年龄兜底，缺读数不等于
+                                                                // 停滞。
+                                                                _ => true,
+                                                            };
+                                                            (stream.clone(), moved)
+                                                        })
+                                                        .collect();
                                                     // 与准入读同一份池子读数：它说
                                                     // 停了的时候，积压的队列不是没
                                                     // 人读，是没人能跑。
@@ -653,10 +685,12 @@ impl cog_core::SystemPlugin for OrchestratorPlugin {
                                                             scheduled_task_stall_secs,
                                                             &served_ready_streams,
                                                             &undelivered,
+                                                            &draining,
                                                             BACKLOG_WINDOWS_BEFORE_RECLAIM,
                                                             pool_declares_unavailable,
                                                         )
                                                         .await;
+                                                    previous_undelivered = undelivered.clone();
                                                     if reclaimed > 0 {
                                                         tracing::warn!(
                                                             reclaimed,
