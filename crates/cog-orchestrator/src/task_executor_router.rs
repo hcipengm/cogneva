@@ -672,8 +672,12 @@ impl TaskExecutorRouter {
 
         // Notify orchestrator that task is now running.
         if let Some(ref orch) = self.orchestrator {
-            if let Err(e) = orch.start_task(&task.id).await {
-                // start_task 是 Scheduled→Running 的唯一转移：它失败了而消
+            if let Err(e) = orch.admit_and_start(&task.id).await {
+                // 准入在执行它的这一处再判一次（`admit_and_start`：看门狗退回
+                // Pending 的行重排一次再起，终态仍拒）——就绪消息的许可是发布
+                // 时给的，而读它的人要等到队列排空才轮到这一条。
+                //
+                // 这一步是 Scheduled→Running 的唯一转移：它失败了而消
                 // 息继续被执行并 ack，任务就永久留在 Scheduled——消息已被
                 // 消费、执行也跑了，complete 却因状态非 Running 落不了库，
                 // 队列读数干净，publisher 只扫 Pending、超时检查器只收

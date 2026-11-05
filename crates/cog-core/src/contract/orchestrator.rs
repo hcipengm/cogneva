@@ -1,5 +1,5 @@
 use crate::contract::llm::UpstreamFailure;
-use crate::{SFError, SFResult, Task, TaskPlan};
+use crate::{SFError, SFResult, Task, TaskPlan, TaskStatus};
 use async_trait::async_trait;
 
 /// Abstract interface for orchestrating tasks without hard-coupling to
@@ -120,6 +120,43 @@ pub trait OrchestratorControl: Send + Sync {
 
     /// Mark a scheduled task as running.
     async fn start_task(&self, task_id: &str) -> SFResult<()>;
+
+    /// Start the task a ready message named, re-admitting it if it has been
+    /// handed back to `Pending` since that message was published.
+    ///
+    /// A ready message authorizes execution when it is *published*, and the
+    /// consumer runs the task *after* reading it -- at the queue depths this
+    /// deployment admits, long after. The stall sweep returns a row that sat in
+    /// `Scheduled` past its window to `Pending`, so a message older than that
+    /// window arrives naming a `Pending` row, and [`Self::start_task`] — which
+    /// only accepts `Scheduled` — refuses it. The reader then treats the
+    /// refusal as a stale copy and acks the message away.
+    ///
+    /// Handing the row back was right (it had waited too long); reading it as
+    /// "this message is rubbish" is not: the task is still ready, its turn has
+    /// come, and the message is the evidence. Measured on 2026-11-06: 144 of
+    /// the 145 ready messages read in ten minutes were refused this way and
+    /// dropped, while three claim slots sat idle and 291 ready tasks waited in
+    /// that same stream to be re-queued and dropped in turn.
+    ///
+    /// So admission is decided once more where it is used: a `Pending` row is
+    /// scheduled again -- the sweep's own step in reverse, atomic against a
+    /// concurrent claim -- and then started. Every other state still refuses
+    /// through [`Self::start_task`], which is what keeps a stale copy of a
+    /// finished task from being run a second time.
+    async fn admit_and_start(&self, task_id: &str) -> SFResult<()> {
+        if self
+            .get_task(task_id)
+            .await
+            .is_some_and(|t| t.status == TaskStatus::Pending)
+        {
+            // Failing to schedule is not the error to report here: another
+            // reader may have claimed the row a moment ago, and the start below
+            // then names the real reason (already running, already terminal).
+            let _ = self.schedule_task(task_id).await;
+        }
+        self.start_task(task_id).await
+    }
 
     /// Mark a running task as completed.
     async fn complete_task(
