@@ -259,7 +259,7 @@ mod tests {
             name: skill_id.to_string(),
             system_prompt: String::new(),
             tools: Vec::new(),
-            max_iterations: 1,
+            max_iterations: Some(1),
             role_type: "role".to_string(),
         });
         registry

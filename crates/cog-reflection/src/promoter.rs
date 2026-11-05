@@ -239,7 +239,7 @@ impl LearningPromoter for DefaultLearningPromoter {
                     name: format!("Best Practice: {}", learning.summary),
                     system_prompt: String::new(), // Deprecated per SkillConfig docs.
                     tools: vec![],
-                    max_iterations: 10,
+                    max_iterations: None,
                     role_type: "best_practice".into(),
                 };
                 registry.insert_skill_config(config);
@@ -261,7 +261,7 @@ impl LearningPromoter for DefaultLearningPromoter {
                     name: format!("Correction Rule: {}", learning.summary),
                     system_prompt: String::new(),
                     tools: vec![],
-                    max_iterations: 10,
+                    max_iterations: None,
                     role_type: "correction".into(),
                 };
                 registry.insert_skill_config(config);
@@ -297,7 +297,7 @@ impl LearningPromoter for DefaultLearningPromoter {
                             name: format!("Wiki: {}", learning.summary),
                             system_prompt: String::new(),
                             tools: vec![],
-                            max_iterations: 10,
+                            max_iterations: None,
                             role_type: "documentation".into(),
                         };
                         registry.insert_skill_config(config);

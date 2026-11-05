@@ -589,7 +589,7 @@ mod tests {
             name: id.to_string(),
             system_prompt: String::new(),
             tools: tools.into_iter().map(String::from).collect(),
-            max_iterations: 10,
+            max_iterations: None,
             role_type: role_type.to_string(),
         }
     }
@@ -862,8 +862,41 @@ mod tests {
         assert!(registry.get_skill("evaluator").is_some());
         let planner = registry.get_skill("planner").unwrap();
         assert_eq!(planner.name, "Planner");
-        assert_eq!(planner.max_iterations, 10);
+        assert_eq!(planner.max_iterations, Some(10));
         assert_eq!(planner.role_type, "planner");
+    }
+
+    /// 没写轮数的技能没有界，而不是拿到一个别人替你写的 10。
+    ///
+    /// 技能文件原先缺这个字段就按 10 补——于是「这个角色该跑多少轮」由一个从没
+    /// 量过工作的常量回答，而且它一路从技能面传到运行时，每一层都以为别处决定
+    /// 了它。缺省不是「十是合理的」，缺省是「这里没有界」。
+    #[test]
+    fn a_skill_that_states_no_budget_has_none() {
+        let mut registry = SkillRegistry::new();
+        registry
+            .load_skills_from_json(
+                r#"[{"skill_id":"generator","name":"Generator","tools":["code"],"role_type":"generator"}]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .skill_for_role("generator")
+                .expect("generator skill")
+                .max_iterations,
+            None
+        );
+
+        // 写了就照写的读：操作者给的界是一条决定，不能被一个补缺省值的习惯盖掉。
+        registry
+            .load_skills_from_json(
+                r#"[{"skill_id":"planner","name":"Planner","tools":["md"],"max_iterations":7,"role_type":"planner"}]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            registry.skill_for_role("planner").unwrap().max_iterations,
+            Some(7)
+        );
     }
 
     #[test]
@@ -905,7 +938,7 @@ mod tests {
             .skill_for_role("generator")
             .expect("generator skill");
         assert_eq!(generator.skill_id, "generator");
-        assert_eq!(generator.max_iterations, 10);
+        assert_eq!(generator.max_iterations, Some(10));
         assert!(
             registry.skill_for_role("moderator").is_none(),
             "a role with no skill must resolve to nothing, not to some other role's skill"

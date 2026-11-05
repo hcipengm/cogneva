@@ -9,6 +9,5 @@
     "web_search",
     "web_fetch"
   ],
-  "max_iterations": 10,
   "role_type": "generator"
 }

@@ -52,7 +52,9 @@ impl SkillExtractor {
              - skill_id (string, kebab-case, unique)\n\
              - name (string, descriptive)\n\
              - tools (array of strings)\n\
-             - max_iterations (number, default 10)\n\
+             - max_iterations (number, optional: leave it out unless the pattern \
+             itself says this role must stop early; a skill that states no number \
+             runs with no turn ceiling)\n\
              - role_type (string, e.g. 'planner', 'evaluator', 'best_practice')",
             pattern.description,
             pattern.learning_ids.join(", ")
@@ -114,13 +116,18 @@ impl SkillExtractor {
             return Ok(false);
         }
 
-        // 3. max_iterations must be reasonable (1–1000).
-        if skill.max_iterations == 0 || skill.max_iterations > 1000 {
-            debug!(
-                "quality gate failed: max_iterations {} out of range for skill '{}'",
-                skill.max_iterations, skill.skill_id
-            );
-            return Ok(false);
+        // 3. A stated max_iterations must be reasonable (1–1000). Stating none
+        //    is legal: it means this role runs without a turn ceiling, and the
+        //    stop comes from the stall timeout, the context window and the cost
+        //    ledger. A missing number is not a number to invent.
+        if let Some(iterations) = skill.max_iterations {
+            if iterations == 0 || iterations > 1000 {
+                debug!(
+                    "quality gate failed: max_iterations {} out of range for skill '{}'",
+                    iterations, skill.skill_id
+                );
+                return Ok(false);
+            }
         }
 
         // 4. role_type must be non-empty.

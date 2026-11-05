@@ -2534,7 +2534,7 @@ mod tests {
             name: "Planner".into(),
             system_prompt: String::new(),
             tools: vec!["read_file".into()],
-            max_iterations: 10,
+            max_iterations: Some(10),
             role_type: "planner".into(),
         });
 

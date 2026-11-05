@@ -8,6 +8,5 @@
     "web_search",
     "web_fetch"
   ],
-  "max_iterations": 5,
   "role_type": "evaluator"
 }

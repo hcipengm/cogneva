@@ -847,8 +847,12 @@ impl EvolutionEngine {
         if skill.name.is_empty() {
             return Ok(false);
         }
-        if skill.max_iterations == 0 || skill.max_iterations > 1000 {
-            return Ok(false);
+        // 没写界是合法的一种：界不是每个角色都该有的东西，写了就必须是个
+        // 别人看得懂的数字。
+        if let Some(iterations) = skill.max_iterations {
+            if iterations == 0 || iterations > 1000 {
+                return Ok(false);
+            }
         }
         if skill.role_type.is_empty() {
             return Ok(false);

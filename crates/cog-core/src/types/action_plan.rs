@@ -27,8 +27,8 @@ pub struct Skill {
 /// One row of the executor table, loaded dynamically from JSON.
 ///
 /// A row answers three questions: which kind of hand this is (`role_type`), what
-/// that hand may call (`tools`), and how many iterations it gets
-/// (`max_iterations`). Agents are configured from a row by role
+/// that hand may call (`tools`), and how many iterations it gets — when the
+/// operator has stated one (`max_iterations`). Agents are configured from a row by role
 /// (`skill_for_role`), and goal decomposition is handed the rows so it can name
 /// the kind of hand for each sub-task.
 ///
@@ -54,8 +54,21 @@ pub struct SkillConfig {
     /// is dropped, so a typo here narrows a role silently — which is why the
     /// shipped lists are gated against the registry rather than trusted.
     pub tools: Vec<String>,
-    #[serde(default = "default_max_iterations")]
-    pub max_iterations: u32,
+    /// The turn ceiling this role starts from — absent means there is none.
+    ///
+    /// A written number is the operator's own decision for this deployment, and
+    /// it is read as the starting point of the per-role calibration rather than
+    /// as a wall the calibration may never move. Absent means the run has no
+    /// turn ceiling: the loop ends when the model stops asking for tools, and
+    /// what bounds it is the stall timeout, the context window and the cost
+    /// ledger — not a number written down before the work was seen.
+    ///
+    /// The default used to be ten, for every role, in this row's absence. Ten
+    /// turns is shorter than one round of "read the failing test, change the
+    /// code, run it again": a repair run stopped at ten with one tool call
+    /// still pending, every round, and the round after it started over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
     /// The kind of hand this row registers — the dispatch key.
     ///
     /// Read in two places: [`crate::SkillRegistry::skill_for_role`] binds an
@@ -64,10 +77,6 @@ pub struct SkillConfig {
     /// hand. It is a kind name (`planner`, `generator`, …), not a capability
     /// claim: the row's boundary is `tools`, next to it.
     pub role_type: String,
-}
-
-fn default_max_iterations() -> u32 {
-    10
 }
 
 /// An atomic task produced by goal decomposition.
