@@ -1586,7 +1586,7 @@ impl MemoryIngestor {
             crate::observable::HOLDER_LABEL.to_string(),
             SKIP_UNREAD_NAMESPACE_OPERATION.to_string(),
         );
-        labels.insert("namespace".to_string(), namespace.to_string());
+        labels.insert(crate::LABEL_NAMESPACE.to_string(), namespace.to_string());
         if let Err(e) = metrics
             .record_counter(cog_core::metric_names::MEMORY_OPERATIONS_TOTAL, 1.0, labels)
             .await
