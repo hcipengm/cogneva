@@ -342,6 +342,7 @@ impl CombinedExtraction {
 /// its own event timestamp and therefore its own raw id. A small window covers
 /// that, and the cap is on the number of answers (not on their inputs, which
 /// are not retained) simply so a long-lived process cannot accumulate them.
+// cap: bound — 实测同一条提示词重复到达最多 6 份、相邻间隔中位数 16–56 秒（最长 627 秒）；按当天 1792 个不同提示词（约 75/小时）算，128 条覆盖一个半小时，远宽于该窗口，再宽只会让早没人问的那一段也命中
 const EXTRACTION_MEMO_CAPACITY: usize = 128;
 
 /// Answers already obtained for byte-identical prompts.
