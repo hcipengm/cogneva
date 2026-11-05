@@ -19,6 +19,55 @@ use crate::tools::{ToolRegistry, ToolRunError};
 // cap: bound — 指针本身是一段固定的话；结果比它长不了多少时，换成指针既省不下字节，又让模型多跳一次去读上面那份。这个界是「省下的字节」与「多一跳」相抵的位置，不是从机器上量出来的
 const REPEATED_TOOL_RESULT_MIN_CHARS: usize = 2_000;
 
+/// How many calls a run may spend without changing the checkout before it is
+/// told that nothing has changed.
+///
+/// Measured over the delivered generation runs of 2026-11-06 (24 h, 215 runs
+/// segmented by gaps of five minutes): the median run was 5 calls and the
+/// ninetieth percentile 32, so a run that has spent forty calls without writing
+/// anything has already outlived nine runs in ten. A lower bound would
+/// interrupt ordinary reading — a run that plans before it writes reads for a
+/// while first, and that stretch is not the one this note is for.
+// cap: bound — 四十是「九成的已交付运行此刻已经跑完」的位置；再低会把正常的先读后写当成迷路
+const CALLS_WITHOUT_CHANGE: u32 = 40;
+
+/// How many times one run may be told that the checkout has not moved.
+// cap: bound — 一条提示本身也要付一次回合，且落地会作废它之后的缓存前缀；两次之后不再打断
+const NOTHING_CHANGED_NOTES: u32 = 2;
+
+/// What the model is told when the checkout has not moved for a long stretch.
+///
+/// It says what the reading is and what the two ways out are, without asking
+/// for a report: the run has one artifact to produce, and a note that invites
+/// prose invites a turn spent on prose.
+const NOTHING_CHANGED_NOTE: &str = "The checkout has not changed for the last 40 tool calls: every one of them \
+     read, searched or printed something, and none of them wrote. Searching cannot finish this — it can only \
+     tell you where the change goes. If you already know where it goes, make the edit now. If you do not, say \
+     which single fact is still missing instead of searching for it again.";
+
+/// The command forms that leave the checkout different from what it was.
+const MUTATING_COMMAND_FORMS: &[&str] = &[
+    "sed -i",
+    "tee ",
+    ">>",
+    "git add",
+    "git commit",
+    "git apply",
+    "git checkout",
+    "git restore",
+    "git stash",
+    "cargo fmt",
+    "rustfmt ",
+    "mkdir ",
+    "touch ",
+    "mv ",
+    "cp ",
+    "rm ",
+    "ln ",
+    "patch ",
+    "> ",
+];
+
 /// A single ReAct iteration: Thought -> Action -> Observation.
 /// ReAct (Reasoning + Acting) is the fundamental cycle each Agent executes:
 /// 1. **Think** — the LLM reasons about the problem and decides what to do
@@ -681,6 +730,94 @@ const REFORMAT_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`cog_core::contract::outcome::MAX_ITERATIONS_STATUS`]); this is the one an
 /// interface has to tell apart from them to know it has a sentence to print.
 const CONVERSATION_REPLY_STATUS: &str = "completed";
+
+/// How long it has been since the checkout was last different.
+///
+/// Every other exit presupposes that a run which keeps calling tools is
+/// getting somewhere: it stops when the model stops calling tools, when a
+/// rule refuses the same call, or when the iteration budget runs out. None
+/// of them can see a run that keeps calling tools and never changes the
+/// tree, because each call is a new one. Measured on one generation run
+/// (2026-11-05, `change-ledger-539f5ef9d7db64cd`): 246 commands — 127
+/// `grep`, 75 `sed`, 9 `git`, 3 compiles, and 2 `write_file` — over 2.3
+/// hours, 234 of the 246 distinct, so the repeated-result stub below never
+/// fired once. That run was not stuck on a hard step; it was searching and
+/// never deciding it had searched enough, and nothing in its transcript
+/// said how long it had been since anything moved.
+///
+/// So the reading kept here is of effect, not of effort: how many calls
+/// have passed since the checkout changed. The note it produces is a
+/// correction to that silence, not a ceiling on the run.
+#[derive(Default)]
+struct CheckoutProgress {
+    calls_without_change: u32,
+    notes_given: u32,
+}
+
+impl CheckoutProgress {
+    fn note_call(&mut self, tool: &str, arguments: &serde_json::Value) {
+        if changes_the_checkout(tool, arguments) {
+            self.calls_without_change = 0;
+        } else {
+            self.calls_without_change = self.calls_without_change.saturating_add(1);
+        }
+    }
+
+    /// The note to put in front of the model, once the count has run past
+    /// the bound.
+    ///
+    /// Bounded per run rather than per crossing: the note costs a turn to
+    /// answer and voids the cached prefix from where it lands, so it is a
+    /// correction to give twice at most, not a running commentary. When the
+    /// run writes again the count resets, and the next stretch earns its own
+    /// note.
+    fn take_note(&mut self) -> Option<&'static str> {
+        if self.calls_without_change < CALLS_WITHOUT_CHANGE
+            || self.notes_given >= NOTHING_CHANGED_NOTES
+        {
+            return None;
+        }
+        self.calls_without_change = 0;
+        self.notes_given += 1;
+        Some(NOTHING_CHANGED_NOTE)
+    }
+}
+
+/// Whether a call leaves the checkout different from what it was.
+///
+/// `run_command` is one tool that both reads and writes, so for it the
+/// effect has to be read off the command. The list of forms is short and
+/// literal on purpose, and it is wrong in one direction only: a mutating
+/// form it does not know about makes the note fire when something did
+/// change, and the model can contradict a note by looking at what it just
+/// wrote. A form wrongly counted as mutating would hide a run that is
+/// circling, which is the failure the note exists to catch, so the list
+/// errs towards calling too much of the shell a write.
+fn changes_the_checkout(tool: &str, arguments: &serde_json::Value) -> bool {
+    if tool != "run_command" {
+        return tool == "write_file";
+    }
+    let command = arguments
+        .get("command")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    // Bytes thrown away or pointed at a descriptor change no file: the whole
+    // redirect goes, not just its target, or the bare `>` it leaves behind
+    // reads as writing to something.
+    let command = command
+        .replace(">> /dev/null", "")
+        .replace(">>/dev/null", "")
+        .replace("> /dev/null", "")
+        .replace(">/dev/null", "")
+        .replace(">&1", "")
+        .replace(">&2", "");
+    // `--check` is the reporting form of the formatters whose plain form writes.
+    let reports_only = command.contains("--check");
+    MUTATING_COMMAND_FORMS.iter().any(|form| {
+        let formats = form.starts_with("cargo fmt") || form.starts_with("rustfmt");
+        !(reports_only && formats) && command.contains(form)
+    })
+}
 
 impl AgentRuntime {
     /// Access the loop configuration.
@@ -1717,6 +1854,11 @@ impl AgentRuntime {
         // hands the work back to has never seen any of them — it starts with a
         // fresh context — so the earlier ones travel with the last one.
         let mut refused_calls: Vec<(String, String, String)> = Vec::new();
+        // How long it has been since the checkout changed. Tracked for the whole
+        // run, like the refusals above: a run that reads for ten calls, writes,
+        // reads for ten more, and writes again is working, and the note is for
+        // the run that has stopped writing altogether.
+        let mut progress = CheckoutProgress::default();
 
         for iteration in 0..self.config.max_iterations {
             tracing::info!(agent_id = %self.config.agent_id, iteration, "AgentRuntime::run iteration start");
@@ -2034,6 +2176,7 @@ impl AgentRuntime {
                     (Err(e), None) => serde_json::json!({ "error": e.to_string() }),
                 };
 
+                progress.note_call(&tc.name, &tc.arguments);
                 observations.push(observation.clone());
                 tool_result_messages.push(
                     self.tool_result_message(
@@ -2144,6 +2287,13 @@ impl AgentRuntime {
             self.context.add_message(assistant_msg);
             for tr in &tool_result_messages {
                 self.context.add_message(tr.clone());
+            }
+            // After the results, so the note is the last thing read before the
+            // next turn: a stretch of reads with nothing written is exactly the
+            // transcript the model would otherwise take as evidence that it is
+            // getting somewhere.
+            if let Some(note) = progress.take_note() {
+                self.context.add_message(Message::user(note));
             }
 
             self.emit_event(AgentEvent::TurnEnd {
@@ -6219,5 +6369,115 @@ mod tests {
             .tool_result_message(None, 0, 2, "call-3", "read_file", &other)
             .await;
         assert_eq!(third.content(), other, "没重复的输出不许被当成重复");
+    }
+
+    fn read_call() -> serde_json::Value {
+        serde_json::json!({ "command": "grep -rn foo crates/" })
+    }
+
+    fn write_call() -> serde_json::Value {
+        serde_json::json!({ "command": "sed -i 's/a/b/' crates/x.rs" })
+    }
+
+    /// The reading this exists for: a run that searches and never writes is
+    /// told so, twice at most, and a run that writes in between never hears it.
+    #[test]
+    fn a_stretch_of_searches_is_told_and_a_write_ends_it() {
+        let mut progress = CheckoutProgress::default();
+        for _ in 0..CALLS_WITHOUT_CHANGE - 1 {
+            progress.note_call("run_command", &read_call());
+            assert!(progress.take_note().is_none(), "一处还没到的一声都不该响");
+        }
+        progress.note_call("run_command", &read_call());
+        assert!(progress.take_note().is_some(), "四十次只读之后必须说出来");
+        assert!(progress.take_note().is_none(), "同一个数不该每轮都说一遍");
+
+        // A write resets the stretch: the next forty reads earn their own note...
+        progress.note_call("run_command", &write_call());
+        for _ in 0..CALLS_WITHOUT_CHANGE - 1 {
+            progress.note_call("run_command", &read_call());
+        }
+        assert!(progress.take_note().is_none());
+        progress.note_call("run_command", &read_call());
+        assert!(progress.take_note().is_some());
+
+        // ...and one run hears it twice at most.
+        for _ in 0..CALLS_WITHOUT_CHANGE {
+            progress.note_call("run_command", &read_call());
+        }
+        assert!(progress.take_note().is_none(), "一条运行里最多说两次");
+    }
+
+    /// A run that writes every few reads is working, however long it runs: the
+    /// count is of calls since the checkout last changed, not of calls.
+    #[test]
+    fn a_run_that_writes_between_its_searches_is_never_told_it_is_not_moving() {
+        let mut progress = CheckoutProgress::default();
+        for _ in 0..20 {
+            for _ in 0..CALLS_WITHOUT_CHANGE - 1 {
+                progress.note_call("run_command", &read_call());
+            }
+            progress.note_call("run_command", &write_call());
+            assert!(progress.take_note().is_none());
+        }
+    }
+
+    /// Which calls count as changing the checkout. The write tool by its name;
+    /// the shell by the form of the command, with the forms that throw bytes
+    /// away, report instead of formatting, or only read, left out.
+    #[test]
+    fn the_calls_that_change_the_checkout_are_read_off_the_call() {
+        let cases: &[(&str, serde_json::Value, bool)] = &[
+            ("write_file", serde_json::json!({ "path": "a.rs" }), true),
+            ("read_file", serde_json::json!({ "path": "a.rs" }), false),
+            (
+                "run_command",
+                serde_json::json!({ "command": "grep -rn foo ." }),
+                false,
+            ),
+            (
+                "run_command",
+                serde_json::json!({ "command": "sed -n '1,40p' a.rs" }),
+                false,
+            ),
+            (
+                "run_command",
+                serde_json::json!({ "command": "cargo fmt --check" }),
+                false,
+            ),
+            (
+                "run_command",
+                serde_json::json!({ "command": "cargo check 2>&1 > /dev/null" }),
+                false,
+            ),
+            (
+                "run_command",
+                serde_json::json!({ "command": "cat > a.rs <<'EOF'\nx\nEOF" }),
+                true,
+            ),
+            (
+                "run_command",
+                serde_json::json!({ "command": "sed -i 's/a/b/' a.rs" }),
+                true,
+            ),
+            (
+                "run_command",
+                serde_json::json!({ "command": "cargo fmt --edition 2021 a.rs" }),
+                true,
+            ),
+            (
+                "run_command",
+                serde_json::json!({ "command": "git add -N a.rs" }),
+                true,
+            ),
+        ];
+        for (tool, arguments, expected) in cases {
+            assert_eq!(
+                changes_the_checkout(tool, arguments),
+                *expected,
+                "{tool} {arguments} 该判成 {}",
+                if *expected { "写" } else { "只读" }
+            );
+        }
     }
 }
