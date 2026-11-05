@@ -40,6 +40,7 @@ fn row(actor: &str, result: &str, outcome: Option<MeteringOutcome>) -> LlmUsageR
         tokens_output: 0,
         tokens_cached: 0,
         tokens_cache_created: None,
+        tokens_reasoning: None,
         usage_outcome: outcome,
         estimated_input: None,
         cost_micros: None,

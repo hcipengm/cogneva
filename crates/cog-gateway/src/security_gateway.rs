@@ -2546,6 +2546,7 @@ fn failed_attempt_usage(
         tokens_output: 0,
         tokens_cached: 0,
         tokens_cache_created: None,
+        tokens_reasoning: None,
         // 没量过，而且是故意的：这一行说的是"试过但被拒"，它没有上游真值可以配对
         // （`tokens_input` 是 0，一个 token 都没读回来），单独一个估算放上去会被读成
         // "估算 X、真值 0"的一次超额。定价只落在有真值的那一行上。填 0 更糟：会读成
@@ -2614,6 +2615,7 @@ fn pooled_refusal_usage(
         tokens_output: 0,
         tokens_cached: 0,
         tokens_cache_created: None,
+        tokens_reasoning: None,
         // 同 [`failed_attempt_usage`]：这一行说的是"一个上游都没发出去"，那份请求的
         // 估算在这里没有真值可配对，不填。
         estimated_input: None,
@@ -2669,6 +2671,7 @@ fn paced_refusal_usage(
         tokens_output: 0,
         tokens_cached: 0,
         tokens_cache_created: None,
+        tokens_reasoning: None,
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
@@ -2723,6 +2726,7 @@ fn unidentified_refusal_usage(
         tokens_output: 0,
         tokens_cached: 0,
         tokens_cache_created: None,
+        tokens_reasoning: None,
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
@@ -3079,6 +3083,7 @@ fn task_budget_refusal_usage(
         tokens_output: 0,
         tokens_cached: 0,
         tokens_cache_created: None,
+        tokens_reasoning: None,
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
@@ -3397,6 +3402,7 @@ fn owner_budget_refusal_usage(
         tokens_output: 0,
         tokens_cached: 0,
         tokens_cache_created: None,
+        tokens_reasoning: None,
         estimated_input: None,
         // 失败与拒绝的行没有 token 可折算——「没算」不是「算出来是零」，写 0 会让
         // 拒绝行看起来像免费的成功调用。
@@ -3547,6 +3553,12 @@ struct UsageReading {
     /// 两格合起来才分得清「前缀每发都变」与「标记没送出去」。`None` 是「这次
     /// 调用没有报这一半」，与「报了 0」是两件事。
     cache_created: Option<u64>,
+    /// 输出里有多少是模型自己想的（上游自报）。它已经算在 `output` 里、也按输出的
+    /// 价钱收过费，所以这一格不改钱，它回答的是另一件事：**这一笔的钱有多少花在
+    /// 想上**。少了它，判断「这一处该不该让它想」只能去翻原始响应体数，而那是
+    /// 一次性的手艺，不是读数——每天六千次调用里哪一处最贵，没人答得上来。
+    /// `None` 是「上游这次没说」，与「说了零」不同形：不思考的上游根本不带这个键。
+    reasoning: Option<u64>,
     outcome: UsageOutcome,
 }
 
@@ -3559,7 +3571,8 @@ impl UsageReading {
     /// `NotAsked`; only a call that did ask leaves the silence on the upstream's
     /// side, which is `Absent`.
     fn from_usage(
-        (input, output, cached, cache_created): (
+        (input, output, cached, cache_created, reasoning): (
+            Option<u64>,
             Option<u64>,
             Option<u64>,
             Option<u64>,
@@ -3572,10 +3585,12 @@ impl UsageReading {
             output: output.unwrap_or(0),
             cached: cached.unwrap_or(0),
             cache_created,
+            reasoning,
             outcome: if input.is_some()
                 || output.is_some()
                 || cached.is_some()
                 || cache_created.is_some()
+                || reasoning.is_some()
             {
                 UsageOutcome::Read
             } else if asked {
@@ -4029,6 +4044,9 @@ async fn record_llm_tokens(
                 "tokens_cache_created",
                 serde_json::json!(reading.cache_created),
             )
+            // 思考量也进明细：这一格是「这笔钱买的是答案还是独白」在那一次调用上
+            // 的答案，而汇总面上的比率看不出是哪一类调用把它抬起来的。
+            .property("tokens_reasoning", serde_json::json!(reading.reasoning))
             // 估算也一并带上，理由同上一格：明细读的是"哪一次差了多少"。没有它，
             // 这一面对"超额的那一次长什么样"是哑的，而 Prometheus 那边按数据点
             // 分不出是哪一次调用。`None` 落成 JSON null，与 0 不同形。
@@ -4078,6 +4096,9 @@ async fn record_llm_tokens(
             // 写缓存那一格与命中那一格来自同一次响应，但回答的是两件事（见
             // `extract_usage` 的第四个数），所以各占一列，不相加。
             tokens_cache_created: reading.cache_created,
+            // 输出里有多少是模型自己想的。与总量同一次响应里读出，但回答的是另一
+            // 件事：总量是「写了多少」，这一格是「其中多少花在想上」。
+            tokens_reasoning: reading.reasoning,
             // 这一行是从正文里读出来的数，所以它得说自己读到了什么：两个 0 可以是
             // 上游说零，也可以是上游没开口，而汇总面只看得见这两个 0。
             usage_outcome: Some(reading.outcome),
@@ -4200,8 +4221,38 @@ async fn record_exchange(
 /// 写了不读＝标记没送出去或上游不收；两者在「命中 0」这一格同形，而修法一在装配顺序、
 /// 一在线上字段。所以它单占一格，不与命中相加（写了不等于读过）。
 /// Anthropic 之外的协议面不报这门读数，`None` 是「没这门读数」而不是「写了零」。
-fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<u64>, Option<u64>) {
+/// 第五个数是**输出里有多少是模型自己想的**（`completion_tokens_details.reasoning_tokens`，
+/// Responses 面写作 `output_tokens_details.reasoning_tokens`）。
+///
+/// 它已经含在输出里、按输出的价钱收过费，所以这一格不改账上的钱。它回答的是钱花在
+/// 哪里：同一个执行体今天花掉的钱里有多少是「想」出来的，是决定要不要让它想的唯一
+/// 依据。这门前两版没有单列，判断一处该不该想只能去翻某几条原始响应体数——那是
+/// 一次性手艺，不是读数，于是全平台六千次调用里哪一处最贵没人答得上来。
+///
+/// Anthropic 面不把思考单列，所以那两条臂返回 `None`；OpenAI 形状的上游在不思考时
+/// 干脆不带这个键，于是 `None` 同时是「这次没想」与「这家不报」——在会报的那家身上
+/// 两者同义，在不会报的那家身上也读不出错数。
+fn extract_usage(
+    json: &serde_json::Value,
+) -> (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+) {
     let as_u64 = |v: &serde_json::Value| v.as_u64();
+    // 两个协议面对这门读数的写法不同，取法归一，账上就只有一列。
+    let reasoning_of = |usage: &serde_json::Value| {
+        usage
+            .pointer("/completion_tokens_details/reasoning_tokens")
+            .and_then(as_u64)
+            .or_else(|| {
+                usage
+                    .pointer("/output_tokens_details/reasoning_tokens")
+                    .and_then(as_u64)
+            })
+    };
     // OpenAI 兼容面两种书写都认：实测到的是 `usage.cached_tokens`（顶层），
     // 另一些实现放在 `usage.prompt_tokens_details.cached_tokens` 里。
     let cached_of = |usage: &serde_json::Value| {
@@ -4223,6 +4274,8 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<
                 usage
                     .and_then(|u| u.get("cache_creation_input_tokens"))
                     .and_then(as_u64),
+                // Anthropic 面把思考与输出放在同一格，没有单独的计数。
+                None,
             )
         }
         // 尾帧本来只该带 `output_tokens`，可它也是这条流上**唯一**一处把输入拆成
@@ -4244,6 +4297,7 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<
                 usage
                     .and_then(|u| u.get("cache_creation_input_tokens"))
                     .and_then(as_u64),
+                None,
             )
         }
         // Responses 面：用量在 `response.completed`（以及 `response.incomplete`）
@@ -4268,6 +4322,7 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<
                 // Responses 面不报写缓存：这个协议面上缓存由上游自己决定，
                 // 它没有"我写了多少"这一说。`None` 是"没这门读数"。
                 None,
+                usage.and_then(reasoning_of),
             )
         }
         _ => {
@@ -4297,6 +4352,7 @@ fn extract_usage(json: &serde_json::Value) -> (Option<u64>, Option<u64>, Option<
                     .and_then(as_u64),
                 cached,
                 None,
+                usage.and_then(reasoning_of),
             )
         }
     }
@@ -4316,6 +4372,11 @@ struct UsageScanner {
     tokens_cached: u64,
     /// 这次调用写进上游缓存的那部分输入（第四个数，见 [`extract_usage`]）。
     tokens_cache_created: u64,
+    /// 输出里有多少是模型自己想的（第五个数，见 [`extract_usage`]）。
+    tokens_reasoning: u64,
+    /// 有没有哪一帧真报了思考量。报 0 与不报都把它留在零，而前者是「想了但没想多少」、
+    /// 后者是「这次没想」或「这家不报」——落账时要分得开。
+    saw_reasoning: bool,
     /// 有没有哪一帧真报了这门读数。计数本身答不了：报 `0` 与不报都把它留在零，
     /// 而前者是「上游说没写」，后者是「这家不报」——账上这两件事必须分得开。
     saw_cache_created: bool,
@@ -4364,8 +4425,8 @@ impl UsageScanner {
                 if json.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
                     self.saw_done = true;
                 }
-                let (input, output, cached, cache_created) = extract_usage(&json);
-                self.absorb(input, output, cached, cache_created);
+                let (input, output, cached, cache_created, reasoning) = extract_usage(&json);
+                self.absorb(input, output, cached, cache_created, reasoning);
             }
         }
     }
@@ -4428,12 +4489,21 @@ impl UsageScanner {
         output: Option<u64>,
         cached: Option<u64>,
         cache_created: Option<u64>,
+        reasoning: Option<u64>,
     ) {
-        if input.is_some() || output.is_some() || cached.is_some() || cache_created.is_some() {
+        if input.is_some()
+            || output.is_some()
+            || cached.is_some()
+            || cache_created.is_some()
+            || reasoning.is_some()
+        {
             self.saw_usage = true;
         }
         if cache_created.is_some() {
             self.saw_cache_created = true;
+        }
+        if reasoning.is_some() {
+            self.saw_reasoning = true;
         }
         // 计数却只在真拿到正数时改写：有的上游在中间帧里带一个 usage:0 当占位，
         // 拿它覆盖前面已经报过的真值，就把读数弄丢了。
@@ -4445,6 +4515,9 @@ impl UsageScanner {
         }
         if let Some(n) = cached.filter(|n| *n > 0) {
             self.tokens_cached = n;
+        }
+        if let Some(n) = reasoning.filter(|n| *n > 0) {
+            self.tokens_reasoning = n;
         }
         if let Some(n) = cache_created.filter(|n| *n > 0) {
             self.tokens_cache_created = n;
@@ -4458,12 +4531,23 @@ impl UsageScanner {
             return;
         }
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&self.raw) {
-            let (input, output, cached, cache_created) = extract_usage(&json);
-            if input.is_some() || output.is_some() || cached.is_some() || cache_created.is_some() {
+            let (input, output, cached, cache_created, reasoning) = extract_usage(&json);
+            if input.is_some()
+                || output.is_some()
+                || cached.is_some()
+                || cache_created.is_some()
+                || reasoning.is_some()
+            {
                 self.saw_usage = true;
             }
             if cache_created.is_some() {
                 self.saw_cache_created = true;
+            }
+            if reasoning.is_some() {
+                self.saw_reasoning = true;
+            }
+            if let Some(n) = reasoning.filter(|n| *n > 0) {
+                self.tokens_reasoning = n;
             }
             if let Some(n) = input {
                 self.tokens_input = n;
@@ -4532,6 +4616,7 @@ impl UsageRecorder {
                 output: s.tokens_output,
                 cached: s.tokens_cached,
                 cache_created: s.saw_cache_created.then_some(s.tokens_cache_created),
+                reasoning: s.saw_reasoning.then_some(s.tokens_reasoning),
                 outcome: if abandoned {
                     s.outcome_abandoned()
                 } else {
@@ -11388,7 +11473,10 @@ mod tests {
             &upstream,
             UsageResult::Ok,
             // 100 万未命中输入（¥1）+ 100 万输出（¥4）= ¥5 = 5,000,000 微元。
-            UsageReading::from_usage((Some(1_000_000), Some(1_000_000), Some(0), None), true),
+            UsageReading::from_usage(
+                (Some(1_000_000), Some(1_000_000), Some(0), None, None),
+                true,
+            ),
             10,
             &RequestSide {
                 actor: "memory".to_string(),
@@ -11422,6 +11510,51 @@ mod tests {
             Some("CNY@2026-11-05"),
             "落账没带上价目标签：日后调价就再也说不清这一行按哪一版算的"
         );
+    }
+
+    /// 思考量也要落进账本那一行：它是「关掉思考能省多少」唯一的验收读数。
+    ///
+    /// 只在 `extract_usage` 里读出来不算数——变量读进 `UsageReading` 却没接进
+    /// `LlmUsageRecord`，现网每一行都是 NULL，而 NULL 与「这家上游不思考」同形，
+    /// 没有任何一列会红。
+    #[tokio::test]
+    async fn a_thinking_call_lands_how_much_of_the_output_was_thought() {
+        let ledger = Arc::new(StubLedger::with(&[], &[]));
+        let upstream = stub_upstream("https://api.example.com", "deepseek-flash");
+        let state = with_usage_ledger(test_state(vec![upstream.clone()]), ledger.clone());
+
+        record_llm_tokens(
+            &state,
+            &upstream,
+            UsageResult::Ok,
+            UsageReading::from_usage((Some(100), Some(900), Some(0), None, Some(700)), true),
+            10,
+            &RequestSide {
+                actor: "agent:planner".to_string(),
+                origin: "gateway_pool".to_string(),
+                task: None,
+                owner: None,
+                estimated_input: None,
+                request_body: None,
+            },
+        )
+        .await;
+
+        let mut rows = ledger.records();
+        for _ in 0..10_000 {
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+            rows = ledger.records();
+        }
+        let row = rows.first().expect("这一发应当落进账本");
+        assert_eq!(
+            row.tokens_reasoning,
+            Some(700),
+            "落账没带上思考量：关掉思考省了多少，账上就再也算不出来"
+        );
+        assert_eq!(row.tokens_output, 900, "输出总量照旧记全");
     }
 
     /// 价目坏掉时条目照收、价目置空，而不是把条目丢掉。
@@ -11722,7 +11855,10 @@ mod tests {
             "choices": [],
             "usage": {"prompt_tokens": 123, "completion_tokens": 45}
         });
-        assert_eq!(extract_usage(&json), (Some(123), Some(45), None, None));
+        assert_eq!(
+            extract_usage(&json),
+            (Some(123), Some(45), None, None, None)
+        );
     }
 
     /// 两个协议面的输入不能混着记。
@@ -11740,21 +11876,27 @@ mod tests {
         });
         assert_eq!(
             extract_usage(&chat),
-            (Some(175), Some(1103), Some(1280), None)
+            (Some(175), Some(1103), Some(1280), None, None)
         );
 
         // 没命中时减法不该动数：prompt 就是 input。
         let cold = serde_json::json!({
             "usage": {"prompt_tokens": 900, "completion_tokens": 10, "cached_tokens": 0}
         });
-        assert_eq!(extract_usage(&cold), (Some(900), Some(10), Some(0), None));
+        assert_eq!(
+            extract_usage(&cold),
+            (Some(900), Some(10), Some(0), None, None)
+        );
 
         // Anthropic 帧本来就不含命中，照原样记，不许再减一次。
         let start = serde_json::json!({
             "type": "message_start",
             "message": {"usage": {"input_tokens": 175, "cache_read_input_tokens": 1280}}
         });
-        assert_eq!(extract_usage(&start), (Some(175), None, Some(1280), None));
+        assert_eq!(
+            extract_usage(&start),
+            (Some(175), None, Some(1280), None, None)
+        );
 
         // Responses 面同一个口径：`input_tokens` 也含命中。
         let done = serde_json::json!({
@@ -11765,13 +11907,19 @@ mod tests {
                 "input_tokens_details": {"cached_tokens": 600}
             }}
         });
-        assert_eq!(extract_usage(&done), (Some(400), Some(20), Some(600), None));
+        assert_eq!(
+            extract_usage(&done),
+            (Some(400), Some(20), Some(600), None, None)
+        );
 
         // 上游报的命中比 prompt 还大（自相矛盾的那一份）：输入钳到 0，不许回绕成天文数字。
         let absurd = serde_json::json!({
             "usage": {"prompt_tokens": 10, "completion_tokens": 1, "cached_tokens": 99}
         });
-        assert_eq!(extract_usage(&absurd), (Some(0), Some(1), Some(99), None));
+        assert_eq!(
+            extract_usage(&absurd),
+            (Some(0), Some(1), Some(99), None, None)
+        );
     }
 
     #[test]
@@ -11780,12 +11928,12 @@ mod tests {
             "type": "message_start",
             "message": {"usage": {"input_tokens": 77, "output_tokens": 1}}
         });
-        assert_eq!(extract_usage(&start), (Some(77), None, None, None));
+        assert_eq!(extract_usage(&start), (Some(77), None, None, None, None));
         let delta = serde_json::json!({
             "type": "message_delta",
             "usage": {"output_tokens": 210}
         });
-        assert_eq!(extract_usage(&delta), (None, Some(210), None, None));
+        assert_eq!(extract_usage(&delta), (None, Some(210), None, None, None));
     }
 
     /// 尾帧报的用量才能改之前读到的读数：一条流上 `message_start` 报的是
@@ -11826,7 +11974,7 @@ mod tests {
         });
         assert_eq!(
             extract_usage(&start),
-            (Some(12), None, Some(900), Some(1200))
+            (Some(12), None, Some(900), Some(1200), None)
         );
 
         // 四个数各归各格：写了不等于读过，读的人不许把两个相加当「命中」。
@@ -11860,6 +12008,74 @@ mod tests {
         );
     }
 
+    /// 输出里有多少是模型自己想的，要单读一格：它与输出同价，所以「关掉思考
+    /// 能省多少」只有把当下的拆分记下来才算得出；只记总量时这笔钱买的是答案
+    /// 还是独白，账上读不出来。
+    ///
+    /// 三种缺失形状必须在读数上分开：不思考的上游根本不发这个字段，发了 0 的
+    /// 是「想了但没想多少」，没带明细块的兼容面是「没问过」。把三者并成 0，
+    /// 每一个不思考的上游都会读成一次已实现的节省。
+    #[test]
+    fn usage_extract_reads_how_much_of_the_output_was_thought() {
+        let chat = serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 900,
+                "completion_tokens_details": {"reasoning_tokens": 700}
+            }
+        });
+        assert_eq!(
+            extract_usage(&chat),
+            (Some(100), Some(900), None, None, Some(700)),
+            "输出总量不变，思考量另占一格"
+        );
+
+        // Responses 面用另一个键名装同一件事。
+        let responses = serde_json::json!({
+            "type": "response.completed",
+            "response": {"usage": {
+                "input_tokens": 50,
+                "output_tokens": 300,
+                "output_tokens_details": {"reasoning_tokens": 210}
+            }}
+        });
+        assert_eq!(
+            extract_usage(&responses),
+            (Some(50), Some(300), None, None, Some(210))
+        );
+
+        // Anthropic 面不拆这一格，帧上也没有这个字段：读数留 None，不写 0。
+        let anthropic = serde_json::json!({
+            "type": "message_delta",
+            "usage": {"output_tokens": 20}
+        });
+        assert_eq!(
+            extract_usage(&anthropic),
+            (None, Some(20), None, None, None)
+        );
+
+        // 报了 0 是「想了但没想多少」，一个字不报是「这家不报」——扫描器靠
+        // 「见到过没有」而不是数值分开它们。
+        let mut said_zero = UsageScanner::default();
+        said_zero.feed(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":9,"completion_tokens_details":{"reasoning_tokens":0}}}
+"#,
+        );
+        said_zero.finish();
+        assert!(said_zero.saw_reasoning, "报了一个 0 也是报了");
+        let mut said_nothing = UsageScanner::default();
+        said_nothing.feed(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":9}}
+"#,
+        );
+        said_nothing.finish();
+        assert!(
+            !said_nothing.saw_reasoning,
+            "没报这一格与报了零，必须在读数上分开"
+        );
+    }
+
     /// 缓存命中量两种书写都认，且它自成一格而不是并进输入：并入输入之后
     /// 「命中率」这个数就再也取不出来了。
     #[test]
@@ -11870,7 +12086,7 @@ mod tests {
         });
         assert_eq!(
             extract_usage(&top_level),
-            (Some(16), Some(7), Some(384), None)
+            (Some(16), Some(7), Some(384), None, None)
         );
 
         let nested = serde_json::json!({
@@ -11883,14 +12099,17 @@ mod tests {
         });
         assert_eq!(
             extract_usage(&nested),
-            (Some(144), Some(7), Some(256), None)
+            (Some(144), Some(7), Some(256), None, None)
         );
 
         let anthropic = serde_json::json!({
             "type": "message_start",
             "message": {"usage": {"input_tokens": 12, "cache_read_input_tokens": 900}}
         });
-        assert_eq!(extract_usage(&anthropic), (Some(12), None, Some(900), None));
+        assert_eq!(
+            extract_usage(&anthropic),
+            (Some(12), None, Some(900), None, None)
+        );
     }
 
     /// 「上游报了 0」与「上游没报」在这一格上同样要分开：把它当同一个值处理，
@@ -11901,18 +12120,24 @@ mod tests {
             "choices": [],
             "usage": {"prompt_tokens": 20, "completion_tokens": 1, "cached_tokens": 0}
         });
-        assert_eq!(extract_usage(&named), (Some(20), Some(1), Some(0), None));
+        assert_eq!(
+            extract_usage(&named),
+            (Some(20), Some(1), Some(0), None, None)
+        );
         let silent = serde_json::json!({
             "choices": [],
             "usage": {"prompt_tokens": 20, "completion_tokens": 1}
         });
-        assert_eq!(extract_usage(&silent), (Some(20), Some(1), None, None));
+        assert_eq!(
+            extract_usage(&silent),
+            (Some(20), Some(1), None, None, None)
+        );
     }
 
     #[test]
     fn usage_extract_unrelated_json_is_none() {
         let json = serde_json::json!({"choices": [{"delta": {"content": "hi"}}]});
-        assert_eq!(extract_usage(&json), (None, None, None, None));
+        assert_eq!(extract_usage(&json), (None, None, None, None, None));
     }
 
     /// A named zero is presence, not absence. The two only look alike once the
@@ -11924,9 +12149,9 @@ mod tests {
             "choices": [],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0}
         });
-        assert_eq!(extract_usage(&zeroed), (Some(0), Some(0), None, None));
+        assert_eq!(extract_usage(&zeroed), (Some(0), Some(0), None, None, None));
         let absent = serde_json::json!({"choices": [], "usage": null});
-        assert_eq!(extract_usage(&absent), (None, None, None, None));
+        assert_eq!(extract_usage(&absent), (None, None, None, None, None));
     }
 
     #[test]
@@ -11964,7 +12189,7 @@ mod tests {
         });
         assert_eq!(
             extract_usage(&nested),
-            (Some(2627), Some(189), Some(17920), None)
+            (Some(2627), Some(189), Some(17920), None, None)
         );
     }
 
@@ -12296,28 +12521,28 @@ mod tests {
         s.feed(b"data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n");
         s.finish();
         assert_eq!(s.outcome(), UsageOutcome::Read);
-        let silent = UsageReading::from_usage((None, None, None, None), true);
+        let silent = UsageReading::from_usage((None, None, None, None, None), true);
         assert_eq!(silent.outcome, UsageOutcome::Absent);
         assert_eq!((silent.input, silent.output, silent.cached), (0, 0, 0));
         assert_eq!(
-            UsageReading::from_usage((None, None, None, None), false).outcome,
+            UsageReading::from_usage((None, None, None, None, None), false).outcome,
             UsageOutcome::NotAsked,
             "a call that never asked cannot have been ignored"
         );
         assert_eq!(
-            UsageReading::from_usage((Some(0), None, None, None), true).outcome,
+            UsageReading::from_usage((Some(0), None, None, None, None), true).outcome,
             UsageOutcome::Read,
             "a named count of zero is still the upstream speaking"
         );
         assert_eq!(
-            UsageReading::from_usage((Some(3), Some(1), None, None), false).outcome,
+            UsageReading::from_usage((Some(3), Some(1), None, None, None), false).outcome,
             UsageOutcome::Read,
             "usage that arrived outranks whether we asked for it"
         );
         // 只报缓存那一格也算上游开口了：帧到过没有是这一格的判据，帧里带了几个数
         // 不是——把它当沉默会让一个只谈缓存的应答落进"上游没开口"。
         assert_eq!(
-            UsageReading::from_usage((None, None, Some(9), None), true).outcome,
+            UsageReading::from_usage((None, None, Some(9), None, None), true).outcome,
             UsageOutcome::Read,
             "a frame that named only the cached count still spoke"
         );

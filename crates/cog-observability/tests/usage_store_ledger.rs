@@ -66,6 +66,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         tokens_output: 50,
         tokens_cached: cached,
         tokens_cache_created: None,
+        tokens_reasoning: None,
         estimated_input: estimated,
         cost_micros: None,
         price_book: None,
@@ -104,6 +105,10 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     // the pair exists to make rather than to invent.
     let mut wrote_call = record(format!("{before}:wrote"), 0, None, None, None);
     wrote_call.tokens_cache_created = Some(1200);
+    // The thought split rides on this row too: it is the column that answers
+    // "what did that output buy", and a value that parses but never lands is
+    // indistinguishable from an upstream that does not think.
+    wrote_call.tokens_reasoning = Some(700);
     store
         .record(&wrote_call)
         .await
@@ -113,16 +118,24 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         .record(&silent_call)
         .await
         .expect("record a call that did not report the half");
-    let wrote = sqlx::query("SELECT tokens_cache_created FROM gateway_llm_usage WHERE actor = $1")
-        .bind(format!("{before}:wrote"))
-        .fetch_one(&pool)
-        .await
-        .expect("read the written half back");
+    let wrote = sqlx::query(
+        "SELECT tokens_cache_created, tokens_reasoning FROM gateway_llm_usage WHERE actor = $1",
+    )
+    .bind(format!("{before}:wrote"))
+    .fetch_one(&pool)
+    .await
+    .expect("read the written half back");
     assert_eq!(
         wrote.get::<Option<i64>, _>("tokens_cache_created"),
         Some(1200),
         "what the call wrote has to survive the write, or the pair the hit count needs \
          is not in the ledger at all"
+    );
+    assert_eq!(
+        wrote.get::<Option<i64>, _>("tokens_reasoning"),
+        Some(700),
+        "the thought split has to survive the write, or 'what would turning it off \
+         save' can only be answered by re-reading raw bodies"
     );
     let silent = sqlx::query("SELECT tokens_cache_created FROM gateway_llm_usage WHERE actor = $1")
         .bind(format!("{before}:silent"))
@@ -180,7 +193,8 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
     sqlx::query(
         "ALTER TABLE gateway_llm_usage DROP COLUMN tokens_cached, DROP COLUMN estimated_input, \
          DROP COLUMN task_id, DROP COLUMN refusal_kind, DROP COLUMN retry_after_secs, \
-         DROP COLUMN owner_id, DROP COLUMN tokens_cache_created",
+         DROP COLUMN owner_id, DROP COLUMN tokens_cache_created, \
+         DROP COLUMN tokens_reasoning",
     )
     .execute(&pool)
     .await
@@ -192,7 +206,7 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
 
     let row = sqlx::query(
         "SELECT tokens_input, tokens_cached, estimated_input, task_id, refusal_kind, \
-                retry_after_secs, owner_id, tokens_cache_created \
+                retry_after_secs, owner_id, tokens_cache_created, tokens_reasoning \
          FROM gateway_llm_usage WHERE actor = $1",
     )
     .bind(&before)
@@ -214,6 +228,12 @@ async fn the_metered_dimensions_reach_the_ledger_and_the_column_migration_spares
         None,
         "a row written before the estimate column existed reads NULL, not 0 -- a zero \
          would be read as a request whose prompt was empty"
+    );
+    assert_eq!(
+        row.get::<Option<i64>, _>("tokens_reasoning"),
+        None,
+        "a row that predates the thought column was never asked, and a zero would read \
+         as a measured answer with no thinking behind it"
     );
     assert_eq!(
         row.get::<Option<String>, _>("task_id"),

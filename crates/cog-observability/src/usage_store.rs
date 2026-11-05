@@ -376,6 +376,14 @@ ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS estimated_input BIGINT;
 -- 被新价目重新解释，而它们当时是按旧价扣的。
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS cost_micros BIGINT;
 ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS price_book TEXT;
+-- 输出里有多少是模型自己想的。输出是本平台账单上最贵的一半，而账本只记总量时，
+-- 「这笔钱买的是答案还是独白」就答不出来；思考与回答同价，所以「关掉思考能省多少」
+-- 只有把当下的拆分记下来才算得出。
+--
+-- 可空且无默认值，理由同 `tokens_cache_created`：不思考的上游根本不发这个字段，
+-- 没问过的旧行也一样。NULL 是「这次没说」，0 是「说了没想」——把两者并成 0 会让
+-- 每一个不思考的上游都读成一次已实现的节省。
+ALTER TABLE gateway_llm_usage ADD COLUMN IF NOT EXISTS tokens_reasoning BIGINT;
 -- The per-job dimension. Nullable because "no job identity" is a state of its
 -- own: rows landed by paths that cannot name a job (an upstream failure
 -- recorded before routing, the gateway's own judgement calls) must not be
@@ -627,9 +635,11 @@ impl LlmUsageStore {
                  estimated_input, task_id, latency_ms, refusal_kind, retry_after_secs,
                  pace_measured_upstreams, pace_allowance_tokens, pace_spent_tokens,
                  pace_reserve_tokens, pace_window_start_unix, pace_upstreams,
-                 usage_outcome, owner_id, refused_scope, cost_micros, price_book)
+                 usage_outcome, owner_id, refused_scope, cost_micros, price_book,
+                 tokens_reasoning)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27)
+                    $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27,
+                    $28)
             "#,
         )
         .bind(uuid::Uuid::new_v4())
@@ -659,6 +669,7 @@ impl LlmUsageStore {
         .bind(r.refused_scope.as_deref())
         .bind(r.cost_micros)
         .bind(r.price_book.as_deref())
+        .bind(r.tokens_reasoning.map(|n| n as i64))
         .execute(&self.pool)
         .await?;
         Ok(())

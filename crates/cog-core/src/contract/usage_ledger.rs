@@ -279,6 +279,22 @@ pub struct LlmUsageRecord {
     /// both as zero turns a missing column into a measured zero, which is the
     /// exact mistake this pair exists to prevent.
     pub tokens_cache_created: Option<u64>,
+    /// How much of [`Self::tokens_output`] the model spent thinking before it
+    /// wrote the answer, when the upstream reports that split.
+    ///
+    /// Output is the expensive half of a call, and on this platform it is more
+    /// than half the bill; a ledger that only carries the total cannot say
+    /// whether that money bought an answer or a monologue. Reasoning models
+    /// bill the two at the same rate, so the only way to know what "turn it
+    /// off" or "turn it down" would save is to record the split as it stands.
+    ///
+    /// `None` is "this call did not say", not zero: upstreams that do not
+    /// think -- and OpenAI-compatible faces that omit the detail block -- send
+    /// no such field, and rows written before this column existed were never
+    /// asked. `Some(0)` is a reading and means the model answered without
+    /// thinking. Folding the two into zero would make every non-thinking
+    /// upstream look like a measured saving.
+    pub tokens_reasoning: Option<u64>,
     /// What reading the response found, when this row came from a call that was
     /// answered at all.
     ///
