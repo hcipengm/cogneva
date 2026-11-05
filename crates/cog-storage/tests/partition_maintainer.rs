@@ -310,3 +310,64 @@ async fn raw_log_index_round_trips_every_tier() {
         .await
         .unwrap();
 }
+
+/// A month's boundaries are resolved by the database's clock, not this
+/// process's.
+///
+/// The boundary is handed over as a bare day, so the instant it means is the
+/// database session's decision. That is what keeps the layout a projection of
+/// the cluster's one time reference: when the reference moves, the database
+/// moves with it and the partitions follow. A boundary computed here instead
+/// would be a second reference — it would pin the layout to whatever zone this
+/// process happened to run in, and the month after the two drifted apart would
+/// land on top of its neighbour and be refused.
+#[tokio::test]
+#[ignore = "requires COGNEVA_TEST_DATABASE_URL pointing at a live PostgreSQL"]
+async fn a_month_boundary_comes_from_the_databases_clock_not_this_process() {
+    const TABLE: &str = "partition_maintainer_probe_zone";
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET TIME ZONE 'UTC'").execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect(&database_url())
+        .await
+        .unwrap();
+    fresh_probe(&pool, TABLE).await;
+
+    let maintainer = maintainer(pool.clone(), TABLE);
+    maintainer.maintain().await.unwrap();
+
+    let today = Utc::now().date_naive();
+    let (_, yprefix) = probe_names(TABLE);
+    let current = format!("{yprefix}{}m{:02}", today.year(), today.month());
+    let start: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+        r"WITH bound AS (
+             SELECT pg_get_expr(c.relpartbound, c.oid) AS expr
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relname = $1 AND n.nspname = current_schema()
+         ), literal AS (
+             SELECT (regexp_match(expr, 'FROM \(''([^'']+)''\)'))[1] AS at FROM bound
+         )
+         SELECT at::timestamptz FROM literal",
+    )
+    .bind(&current)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+
+    let expected = month_start(today.year(), today.month())
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc();
+    assert_eq!(
+        start,
+        Some(expected),
+        "{current} was cut at this process's midnight instead of the database's"
+    );
+
+    drop_probe(&pool, TABLE).await;
+}

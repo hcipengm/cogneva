@@ -23,12 +23,12 @@ use cog_core::{SFError, SFResult, ShutdownSignal};
 
 /// What the partition key column holds.
 ///
-/// It decides whether a boundary literal names a day or an instant. A `date`
-/// key names a day by itself. A `timestamptz` key names an instant, and a bare
-/// literal like `'2026-11-01'` is resolved against the database session's
-/// timezone — so two deployments that differ in that setting open partitions
-/// with boundaries eight hours apart and route the same row to different
-/// tables.
+/// It decides how a boundary is compared: a `date` key names a day by itself,
+/// while a `timestamptz` key names an instant, and the day `2026-11-01` means
+/// a different instant in every zone. Both are handed to the database as a
+/// bare day and resolved there, so the answer comes from the same clock that
+/// every other part of the cluster projects — never from a zone written into
+/// this source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyKind {
     Date,
@@ -38,23 +38,22 @@ pub enum KeyKind {
 impl KeyKind {
     /// The SQL literal for the first instant of the boundary day.
     ///
-    /// The zone is not chosen here: the day is resolved against the clock this
-    /// process runs on, which the cluster sets once for every part of itself.
-    /// A `timestamptz` literal then carries the resulting offset, so the
-    /// boundary is one definite instant however the database session happens
-    /// to be configured. Nothing about the layout is frozen into a name at
-    /// build time; moving the cluster's clock moves what month means.
+    /// The zone is not named here, and that is the point: the day is handed to
+    /// the database as a bare date and resolved by the session's own timezone,
+    /// which is the cluster's one reference projected into the database. A
+    /// literal that carried an offset chosen by this process would be a second
+    /// reference — it would keep the layout where that offset was written while
+    /// the rest of the cluster moved.
     pub fn bound_literal(self, day: NaiveDate) -> String {
-        match self {
-            KeyKind::Date => format!("'{}'", day.format("%Y-%m-%d")),
-            KeyKind::Timestamptz => format!("'{}'", first_instant_of(day).to_rfc3339()),
-        }
+        format!("'{}'", day.format("%Y-%m-%d"))
     }
 
     /// The predicate a row's key is tested with against two boundary literals.
     ///
-    /// Both forms compare against the literal's own type, so neither goes
-    /// through the session timezone to decide what a day is.
+    /// The cast follows the column's own type: a day key is compared with
+    /// dates, an instant key with instants resolved by the same session zone
+    /// that cut the boundaries, so the two sides of the comparison can never
+    /// disagree about what a day is.
     pub fn range(self, key: &str, start: &str, end: &str) -> String {
         let cast = match self {
             KeyKind::Date => "::date",
@@ -62,37 +61,6 @@ impl KeyKind {
         };
         format!("{key} >= {start}{cast} AND {key} < {end}{cast}")
     }
-}
-
-/// The first instant the local clock reaches on `day`.
-///
-/// Taking midnight and converting it would fail in a zone whose clocks skip
-/// midnight on that date, so this walks forward to the first hour that exists.
-/// The earliest candidate wins when a clock falls back twice over the same
-/// wall time: both name the same day, and the earlier one is where the day
-/// starts.
-fn first_instant_of(day: NaiveDate) -> chrono::DateTime<chrono::FixedOffset> {
-    use chrono::{Duration, TimeZone};
-
-    let midnight = day
-        .and_hms_opt(0, 0, 0)
-        .expect("every civil day has a midnight");
-    let mut probe = midnight;
-    for _ in 0..=24 {
-        if let Some(instant) = Local.from_local_datetime(&probe).earliest() {
-            return instant.fixed_offset();
-        }
-        probe += Duration::hours(1);
-    }
-    // No wall time on this day exists anywhere in the representable range,
-    // which is reachable only through a zone database far stranger than any
-    // this platform deploys into. The day still has a start; name it by the
-    // offset the day after carries rather than panicking in a loop.
-    Local
-        .from_local_datetime(&midnight)
-        .single()
-        .unwrap_or_else(|| Local.from_utc_datetime(&midnight))
-        .fixed_offset()
 }
 
 /// A table partitioned by month.
@@ -118,14 +86,12 @@ impl PartitionedTable {
         }
     }
 
-    /// The literal for one boundary day, in the zone this process runs on.
-    fn bound_literal(&self, day: NaiveDate) -> String {
-        self.key_kind.bound_literal(day)
-    }
-
     /// The two boundary literals that fence the half-open range `[start, end)`.
     fn bounds(&self, start: NaiveDate, end: NaiveDate) -> (String, String) {
-        (self.bound_literal(start), self.bound_literal(end))
+        (
+            self.key_kind.bound_literal(start),
+            self.key_kind.bound_literal(end),
+        )
     }
 
     /// The predicate that keeps this table's key inside `[start, end)`.
@@ -600,36 +566,24 @@ mod tests {
         assert_eq!(end, date(2027, 1, 1));
     }
 
-    /// A boundary the database cannot misread.
+    /// The boundary is a bare day; the database decides which instant that is.
     ///
-    /// `'2026-11-01'` casts to `timestamptz` through whatever zone the session
-    /// carries, so two deployments open their November partition eight hours
-    /// apart and route the same row to different tables. The literal must
-    /// therefore name the offset itself, and the offset must be the one the
-    /// cluster's clock uses — which is why the day is resolved here rather
-    /// than written down.
+    /// A literal that carried an offset picked here would freeze the layout at
+    /// whatever zone the process happened to run in: the months already cut
+    /// would stay there when the cluster's reference moved, and the new month
+    /// would land on top of its neighbour. Handing over a bare day leaves the
+    /// decision with the one reference the database already projects.
     #[test]
-    fn a_timestamptz_boundary_carries_the_offset_of_this_clock() {
+    fn a_boundary_is_a_bare_day_for_the_database_to_resolve() {
         let day = date(2026, 11, 1);
-        let literal = KeyKind::Timestamptz.bound_literal(day);
-        let parsed = chrono::DateTime::parse_from_rfc3339(literal.trim_matches('\''))
-            .expect("a boundary literal must name an offset, not leave it to the reader");
-        assert_eq!(
-            parsed.with_timezone(&Local).date_naive(),
-            day,
-            "the boundary is not the first instant of that day on this clock"
-        );
-        // The same clock, a year on: the literal follows it instead of pinning
-        // one offset for every month. A zone that changes offset over the year
-        // would otherwise put one month's boundary in the wrong instant.
-        let later = KeyKind::Timestamptz.bound_literal(date(2030, 1, 1));
-        assert_eq!(
-            chrono::DateTime::parse_from_rfc3339(later.trim_matches('\''))
-                .expect("a boundary literal must name an offset")
-                .with_timezone(&Local)
-                .date_naive(),
-            date(2030, 1, 1)
-        );
+        for kind in [KeyKind::Date, KeyKind::Timestamptz] {
+            let literal = kind.bound_literal(day);
+            assert_eq!(literal, "'2026-11-01'");
+            assert!(
+                !literal.contains('+') && !literal.contains('Z'),
+                "{kind:?} boundary carries a zone of its own: {literal}"
+            );
+        }
     }
 
     /// A `date` key names a day, and a day has no zone to name.
@@ -641,14 +595,15 @@ mod tests {
         );
     }
 
-    /// The range predicate reads the boundary literal and nothing else.
+    /// The range predicate and the partition bounds resolve a day the same way.
     ///
-    /// A predicate that binds two timestamps and lets the server cast them
-    /// brings the session zone back in through the side door: the row that
-    /// decides which table a write lands in would then depend on a setting
-    /// that only exists to decide how a time is printed.
+    /// Both hand the database a bare day and let its session zone decide which
+    /// instant that is — the attach and the relocation then agree by
+    /// construction. A predicate that pinned its own cast while the bounds were
+    /// left to the session would move rows into, or leave rows out of, the very
+    /// partition being created, at the edge of the month.
     #[test]
-    fn the_range_predicate_consults_no_session_zone() {
+    fn the_range_predicate_resolves_the_day_the_way_the_bounds_do() {
         let table = PartitionedTable::new("probe", "ts", "probe_part", KeyKind::Timestamptz);
         let (start, end) = table.bounds(date(2026, 11, 1), date(2026, 12, 1));
         let within = table.within(&start, &end);
