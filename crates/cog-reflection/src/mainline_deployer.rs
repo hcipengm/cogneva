@@ -18634,17 +18634,20 @@ exec {real} "$@"
         );
     }
 
-    /// 主线往前走了一版、新那一版也红，按停的还是同一条线：同一次扣住、同一张单、
-    /// 同一份「前几轮试过什么」。
+    /// 主线往前走了一版、新那一版也红，按停的还是同一条线：同一次扣住、同一份
+    /// 「前几轮试过什么」，换的只是它落在哪一行上。
     ///
     /// 2026-11-05 的现场：一个上午开出四张 `ci-red-*`，每张对着一个不同的修订，
     /// 各跑一个模型回合。行 id 从被按的那一版推，而主线红着的时候树每几分钟就落
     /// 一版——于是同一件事被拆成几个互不知情的修法，落到同一棵树上时互相踩（那一
     /// 批里就有一对改动，各自编译得过、合起来 `E0308`，上游红了四个修订）。
     ///
-    /// 判据落在两处：`rev` 跟着树走（这一轮要修的是新那一版），`opened_rev` 与
-    /// `since_unix` 不动（这次扣住是同一件事），于是 id 从后者推，第二版进的是
-    /// 同一张单子。把 `opened_rev` 去掉、按 `rev` 推 id，这里第二笔提交就换了 id。
+    /// 判据分两处，缺一处就会走到那两个极端之一。扣住的身份不动：`opened_rev` 与
+    /// `finding_unix` 说的是「这是哪一件事」，树往前走不算又红了一次，所以 id 仍从
+    /// 它们推。落在哪一行上则跟着树走：停线车道一次只放一条，追着上一版的那张单再
+    /// 跑多久也不会让这一版变绿（CI 按 push 判，它交上来的改动只会被判成当前 head
+    /// 的祖先），所以旧行先被收掉，这一版在下一轮 id 上另开一张。两条合起来是
+    /// 「任何时候只有一行在办，而且它对着当前这一版」。
     #[tokio::test]
     async fn a_hold_the_tree_moved_past_is_still_the_same_hold() {
         const REV_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -18691,7 +18694,26 @@ exec {real} "$@"
             held.finding_unix(),
             "身份的另一半也不动：树往前走了，不是又红了一次"
         );
-        assert_eq!(after.rows, held.rows, "已经开出去的单子不动");
+        let next_id = format!("{first_id}-r2");
+        assert_eq!(
+            after.rows,
+            vec![first_id.clone(), next_id.clone()],
+            "收掉的那一行仍记在这次扣住名下，这一版的新行排在后面"
+        );
+        assert_eq!(
+            planner.status(&first_id),
+            Some(cog_core::TaskStatus::Cancelled),
+            "追着上一版的那张单要让出停线车道唯一的座位"
+        );
+        let (_, reason) = planner
+            .cancels()
+            .into_iter()
+            .find(|(id, _)| id == &first_id)
+            .expect("旧那一行要留下一条取消记录");
+        assert!(
+            reason.contains(rev12(REV_A)) && reason.contains(rev12(REV_B)),
+            "理由要点名新旧两版，否则读的人只知道它被取消了：{reason}"
+        );
 
         let submissions = planner.submissions();
         assert_eq!(submissions.len(), 2, "{submissions:?}");
@@ -18701,12 +18723,8 @@ exec {real} "$@"
         );
         assert_eq!(
             submissions[1].1,
-            vec![first_id.clone()],
-            "第二版进的是同一张单子，不是另开一张：{submissions:?}"
-        );
-        assert!(
-            submissions[1].2.is_empty(),
-            "那一行还活着，图按幂等空操作跳过，不多出一张：{submissions:?}"
+            vec![next_id],
+            "这一版另开一张单，落在扣住身份的下一轮 id 上：{submissions:?}"
         );
         let _ = handle.await.unwrap();
     }
