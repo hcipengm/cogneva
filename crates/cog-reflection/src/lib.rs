@@ -538,7 +538,7 @@ impl ReflectionEngine {
     #[allow(clippy::too_many_arguments)]
     pub fn new_self_evolution(
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
-        llm: Arc<dyn cog_core::LlmClient>,
+        work_graph: Option<cog_core::LateService<dyn cog_core::OrchestratorControl>>,
         review_interval: std::time::Duration,
         memory_backend: Arc<dyn cog_core::MemoryBackend>,
         prompt_manager: Option<Arc<dyn cog_core::PromptProvider>>,
@@ -578,10 +578,12 @@ impl ReflectionEngine {
             review_interval,
         ));
         let effectiveness_tracker = Arc::new(SkillEffectivenessTracker::new(recorder.clone()));
-        let mut evolution =
-            EvolutionEngine::new(llm.clone(), skill_registry.clone(), prompt_manager.clone())
-                .with_change_dir(change_dir)
-                .with_max_changed_lines(generation_limits.max_changed_lines);
+        let mut evolution = EvolutionEngine::new(skill_registry.clone(), prompt_manager.clone())
+            .with_change_dir(change_dir)
+            .with_max_changed_lines(generation_limits.max_changed_lines);
+        if let Some(graph) = work_graph {
+            evolution = evolution.with_work_graph(graph);
+        }
         if let Some(tx) = hook_sink {
             evolution = evolution.with_hook_sink(tx);
         }
@@ -1091,21 +1093,26 @@ impl ReflectionEngine {
     /// Apply effectiveness-tracker recommendations to the skill registry.
     ///
     /// `refines` is the caller saying it is the one process allowed to run the
-    /// refinement branch: that one spends an LLM call and writes a skill config,
-    /// so two processes doing it would each get their own answer for the same
-    /// skill and overwrite one another. Every other branch is in-process state
-    /// and is meant to run wherever the outcomes are recorded.
+    /// refinement branch: that one hands the judgement to an employee and writes
+    /// the answer back as a skill config, so two processes doing it would each
+    /// get their own answer for the same skill and overwrite one another. Every
+    /// other branch is in-process state and is meant to run wherever the outcomes
+    /// are recorded.
     pub async fn apply_effectiveness_actions(
         &self,
         skill_registry: Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>,
-        llm: Option<Arc<dyn cog_core::LlmClient>>,
         refines: bool,
     ) -> cog_core::SFResult<()> {
         if let Some(ref tracker) = self.effectiveness_tracker {
             let skill_ids = tracker.tracked_skill_ids().await;
             for sid in skill_ids {
                 tracker
-                    .apply_action(&sid, skill_registry.clone(), llm.clone(), refines)
+                    .apply_action(
+                        &sid,
+                        skill_registry.clone(),
+                        self.evolution.clone(),
+                        refines,
+                    )
                     .await?;
             }
         }
@@ -1541,128 +1548,68 @@ mod tests {
         assert_eq!(similar[0].id, l1.id);
     }
 
-    /// Build a fake event stream from a plain text payload.
-    fn fake_stream_from_text(
-        text: &str,
-    ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-        let (mut _stream, mut producer) = cog_core::EventStream::with_capacity(1);
-        let response = cog_core::ChatResponse {
-            content: vec![cog_core::ContentBlock::Text {
-                text: text.to_string(),
-                text_signature: None,
-            }],
-            api: "fake".into(),
-            provider: "fake".into(),
-            model: "fake".into(),
-            response_id: None,
-            usage: Default::default(),
-            stop_reason: cog_core::StopReason::Stop,
-            error_message: None,
-            upstream_failure: None,
-            retry_after_secs: None,
-            timestamp: chrono::Utc::now(),
-        };
-        let event = cog_core::AssistantMessageEvent::TextEnd {
-            content_index: 0,
-            content: text.to_string(),
-            timestamp: chrono::Utc::now(),
-        };
-        let _ = producer.try_push(event);
-        producer.end(response);
-        Ok(_stream)
-    }
-
-    /// A fake LLM that counts chat_stream invocations and returns a minimal
-    /// valid JSON payload so EvolutionEngine methods do not panic.
+    /// 一张按台词答复的任务图：引擎投什么活都回同一段正文。
     ///
-    /// It also keeps the prompts when given somewhere to keep them. A test that
-    /// only counts calls can say a generation happened but not that it was
-    /// asked for the right thing, and "what the requirement named" is the whole
-    /// question when a refusal decides what the next attempt is told to fix.
-    struct CountingLlm {
-        calls: Arc<tokio::sync::Mutex<u32>>,
-        prompts: Option<Arc<tokio::sync::Mutex<Vec<String>>>>,
+    /// L1 的三处判断现在是「交给名册」，所以量它们的地方要量的是**投了多少件活**
+    /// 和**交回来的答复怎么被读**，不再是「模型被叫了几次」。
+    struct ScriptedGraph {
+        submitted: Arc<tokio::sync::Mutex<u32>>,
+        answer: String,
     }
 
-    impl CountingLlm {
-        async fn note(&self, messages: &[cog_core::Message]) {
-            let mut calls = self.calls.lock().await;
-            *calls += 1;
-            drop(calls);
-            if let Some(prompts) = &self.prompts {
-                let rendered = messages
-                    .iter()
-                    .map(|message| message.content())
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                prompts.lock().await.push(rendered);
+    impl ScriptedGraph {
+        fn answering(answer: impl Into<String>) -> Self {
+            Self {
+                submitted: Arc::new(tokio::sync::Mutex::new(0)),
+                answer: answer.into(),
             }
         }
     }
 
     #[async_trait::async_trait]
-    impl cog_core::LlmClient for CountingLlm {
-        async fn chat(
+    impl cog_core::contract::work_item::WorkItemGraph for ScriptedGraph {
+        async fn submit(
             &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::ChatResponse> {
-            self.note(_messages).await;
-            Ok(cog_core::ChatResponse {
-                content: vec![cog_core::ContentBlock::text(
-                    r#"{"name":"auto_tool","description":"auto","parameters":{"type":"object"}}"#,
-                )],
-                api: "mock".into(),
-                provider: "mock".into(),
-                model: "mock".into(),
-                response_id: None,
-                usage: cog_core::Usage::default(),
-                stop_reason: cog_core::StopReason::Stop,
-                error_message: None,
-                upstream_failure: None,
-                retry_after_secs: None,
-                timestamp: chrono::Utc::now(),
-            })
+            _goal: &str,
+            tasks: Vec<cog_core::Task>,
+        ) -> cog_core::SFResult<Vec<String>> {
+            *self.submitted.lock().await += 1;
+            Ok(tasks.into_iter().map(|task| task.id).collect())
         }
 
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            self.note(_messages).await;
-            fake_stream_from_text(
-                r#"{"name":"auto_tool","description":"auto","parameters":{"type":"object"}}"#,
-            )
+        async fn row(&self, _id: &str) -> Option<cog_core::Task> {
+            let mut row = cog_core::Task::new(
+                "scripted",
+                cog_core::TaskType::Custom("scripted".into()),
+                serde_json::json!({}),
+            );
+            row.status = cog_core::TaskStatus::Completed;
+            row.result = Some(serde_json::json!({ "result": self.answer }));
+            Some(row)
         }
+    }
 
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!()
-        }
-
-        async fn health_check(&self) -> bool {
-            true
-        }
+    fn graph_answering(
+        answer: impl Into<String>,
+    ) -> Arc<dyn cog_core::contract::work_item::WorkItemGraph> {
+        Arc::new(ScriptedGraph::answering(answer))
     }
 
     #[tokio::test]
     async fn test_process_tool_result_triggers_suggest_tool_variant_after_threshold() {
         let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
         let mut engine = ReflectionEngine::new_in_memory(registry);
-        let calls = Arc::new(tokio::sync::Mutex::new(0u32));
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(CountingLlm {
-            calls: calls.clone(),
-            prompts: None,
-        });
-        engine.evolution = Some(Arc::new(EvolutionEngine::new(
-            llm,
-            Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
-            None,
-        )));
+        let graph = Arc::new(ScriptedGraph::answering(
+            r#"{"name":"auto_tool","description":"auto","parameters":{"type":"object"}}"#,
+        ));
+        let calls = graph.submitted.clone();
+        engine.evolution = Some(Arc::new(
+            EvolutionEngine::new(
+                Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
+                None,
+            )
+            .with_task_graph(graph),
+        ));
         // Lower threshold so the test doesn't need many iterations.
         engine.tool_error_threshold = 2;
         engine.set_cooldown_secs(0);
@@ -1711,12 +1658,13 @@ mod tests {
     async fn test_process_context_triggers_synthesize_hook_after_recurrence() {
         let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
         let mut engine = ReflectionEngine::new_in_memory(registry.clone());
-        let calls = Arc::new(tokio::sync::Mutex::new(0u32));
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(CountingLlm {
-            calls: calls.clone(),
-            prompts: None,
-        });
-        engine.evolution = Some(Arc::new(EvolutionEngine::new(llm, registry, None)));
+        let graph = Arc::new(ScriptedGraph::answering(
+            r#"{"name":"auto_tool","description":"auto","parameters":{"type":"object"}}"#,
+        ));
+        let calls = graph.submitted.clone();
+        engine.evolution = Some(Arc::new(
+            EvolutionEngine::new(registry, None).with_task_graph(graph),
+        ));
         // Lower thresholds.
         engine.hook_recurrence_threshold = 2;
         engine.change_recurrence_threshold = 5;
@@ -1829,69 +1777,19 @@ mod tests {
         );
     }
 
-    /// A fake LLM that returns a fixed JSON payload for testing channel flows.
-    struct FixedResponseLlm {
-        response: String,
-    }
-
-    #[async_trait::async_trait]
-    impl cog_core::LlmClient for FixedResponseLlm {
-        async fn chat(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::ChatResponse> {
-            Ok(cog_core::ChatResponse {
-                content: vec![cog_core::ContentBlock::text(self.response.clone())],
-                api: "mock".into(),
-                provider: "mock".into(),
-                model: "mock".into(),
-                response_id: None,
-                usage: cog_core::Usage::default(),
-                stop_reason: cog_core::StopReason::Stop,
-                error_message: None,
-                upstream_failure: None,
-                retry_after_secs: None,
-                timestamp: chrono::Utc::now(),
-            })
-        }
-
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            fake_stream_from_text(&self.response)
-        }
-
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!()
-        }
-
-        async fn health_check(&self) -> bool {
-            true
-        }
-    }
-
     #[tokio::test]
     async fn test_process_tool_result_sends_to_tool_sink() {
         let registry = Arc::new(tokio::sync::RwLock::new(SkillRegistry::new()));
         let mut engine = ReflectionEngine::new_in_memory(registry);
         let (tool_tx, mut tool_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
 
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(FixedResponseLlm {
-            response: r#"{"name":"test_tool_v2","description":"Improved test tool","parameters":{"type":"object","properties":{}}}"#.to_string(),
-        });
-
         let mut evolution = crate::evolution::EvolutionEngine::new(
-            llm,
             Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
             None,
-        );
+        )
+        .with_task_graph(graph_answering(
+            r#"{"name":"test_tool_v2","description":"Improved test tool","parameters":{"type":"object","properties":{}}}"#,
+        ));
         evolution = evolution.with_tool_sink(tool_tx);
         engine.evolution = Some(Arc::new(evolution));
         engine.tool_error_threshold = 1;
@@ -1921,11 +1819,10 @@ mod tests {
         let mut engine = ReflectionEngine::new_in_memory(registry.clone());
         let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
 
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(FixedResponseLlm {
-            response: r#"{"id":"test-hook","trigger":"on_task_fail","action":{"type":"log","level":"info"}}"#.to_string(),
-        });
-
-        let mut evolution = crate::evolution::EvolutionEngine::new(llm, registry, None);
+        let mut evolution = crate::evolution::EvolutionEngine::new(registry, None)
+            .with_task_graph(graph_answering(
+                r#"{"id":"test-hook","trigger":"on_task_fail","action":{"type":"log","level":"info"}}"#,
+            ));
         evolution = evolution.with_hook_sink(hook_tx);
         engine.evolution = Some(Arc::new(evolution));
         engine.hook_recurrence_threshold = 1;
@@ -1967,14 +1864,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_evolution_results_persisted_with_generated_status() {
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(FixedResponseLlm {
-            response: r#"{"name":"persisted_tool","description":"A tool","parameters":{"type":"object","properties":{}}}"#.to_string(),
-        });
         let evolution = EvolutionEngine::new(
-            llm,
             Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
             None,
-        );
+        )
+        .with_task_graph(graph_answering(
+            r#"{"name":"persisted_tool","description":"A tool","parameters":{"type":"object","properties":{}}}"#,
+        ));
 
         let result = evolution
             .suggest_tool_variant("base_tool", &["error1".into()])
@@ -1993,14 +1889,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_evolution_update_status_transitions_correctly() {
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(FixedResponseLlm {
-            response: r#"{"name":"status_tool","description":"A tool","parameters":{"type":"object","properties":{}}}"#.to_string(),
-        });
         let evolution = EvolutionEngine::new(
-            llm,
             Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
             None,
-        );
+        )
+        .with_task_graph(graph_answering(
+            r#"{"name":"status_tool","description":"A tool","parameters":{"type":"object","properties":{}}}"#,
+        ));
 
         evolution
             .suggest_tool_variant("base", &["err".into()])
@@ -2023,15 +1918,13 @@ mod tests {
         let mut engine = ReflectionEngine::new_in_memory(registry);
         let (tool_tx, mut tool_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
 
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(FixedResponseLlm {
-            response: r#"{"name":"lifecycle_tool","description":"Lifecycle test tool","parameters":{"type":"object","properties":{}}}"#.to_string(),
-        });
-
         let mut evolution = crate::evolution::EvolutionEngine::new(
-            llm,
             Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
             None,
-        );
+        )
+        .with_task_graph(graph_answering(
+            r#"{"name":"lifecycle_tool","description":"Lifecycle test tool","parameters":{"type":"object","properties":{}}}"#,
+        ));
         evolution = evolution.with_tool_sink(tool_tx);
         let evolution_arc = Arc::new(evolution);
         engine.evolution = Some(evolution_arc.clone());
@@ -2066,16 +1959,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_synthesize_hook_persists_result_with_status() {
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(FixedResponseLlm {
-            response:
-                r#"{"id":"hook-status-test","trigger":"on_task_fail","action":{"type":"log"}}"#
-                    .to_string(),
-        });
         let evolution = EvolutionEngine::new(
-            llm,
             Arc::new(tokio::sync::RwLock::new(SkillRegistry::new())),
             None,
-        );
+        )
+        .with_task_graph(graph_answering(
+            r#"{"id":"hook-status-test","trigger":"on_task_fail","action":{"type":"log"}}"#,
+        ));
 
         let result = evolution
             .synthesize_hook("pattern", &["outcome".into()])

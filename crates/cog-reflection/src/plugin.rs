@@ -331,21 +331,22 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // this instance is not the one that runs the self-evolution pipeline.
         // It does not depend on a persistent memory backend, so it is created
         // whenever an LLM is available.
-        let evolution_engine: Option<Arc<crate::EvolutionEngine>> =
-            if let Some(ref llm) = llm_provider {
-                let mut evolution = crate::EvolutionEngine::new(
-                    llm.clone(),
-                    skill_registry.clone(),
-                    Some(prompt_manager.clone()),
-                )
-                .with_change_dir(change_dir.clone());
-                if let Some(ref root) = engine_root {
-                    evolution = evolution.with_project_root(root.clone());
-                }
-                Some(Arc::new(evolution))
-            } else {
-                None
-            };
+        // 名册入口在这里只是句柄：编排器由别的插件发布，可能在本插件 `start`
+        // 之后才安装，所以解析推迟到第一次有人真的拿它投活。
+        let work_graph =
+            cog_core::LateService::<dyn cog_core::OrchestratorControl>::new(ctx.clone());
+        let evolution_engine: Option<Arc<crate::EvolutionEngine>> = if llm_provider.is_some() {
+            let mut evolution =
+                crate::EvolutionEngine::new(skill_registry.clone(), Some(prompt_manager.clone()))
+                    .with_change_dir(change_dir.clone())
+                    .with_work_graph(work_graph.clone());
+            if let Some(ref root) = engine_root {
+                evolution = evolution.with_project_root(root.clone());
+            }
+            Some(Arc::new(evolution))
+        } else {
+            None
+        };
 
         // A missing memory backend means learned state would be dropped on
         // restart, which is what strict_persistence forbids. A missing LLM
@@ -416,7 +417,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // 生成侧的行数上限从落地侧读的那个配置键取。配置写错在这里响亮失败，
         // 而不是让生成侧带着一个默认值跑到写盘时才发现两边不一致。
         let generation_limits = crate::GenerationLimits::load()?;
-        let engine = if let (Some(ref mb), Some(ref llm)) = (memory_backend, llm_provider) {
+        let engine = if let (Some(ref mb), Some(_)) = (memory_backend, llm_provider) {
             info!("ReflectionEngine initialized in production mode (persistent learning)");
             // The wiki backend is published by another plugin in this layer and
             // the promoter is built here, in the same layer: a backend read now
@@ -426,7 +427,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
             let wiki = cog_core::LateService::<dyn cog_core::WikiBackend>::new(ctx.clone());
             crate::ReflectionEngine::new_self_evolution(
                 skill_registry.clone(),
-                llm.clone(),
+                Some(work_graph.clone()),
                 crate::SELF_REVIEW_INTERVAL,
                 mb.clone(),
                 Some(prompt_manager.clone()),
@@ -1820,14 +1821,12 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
         // 边界放行与这件事无关：`Strengthen`/`Deprecate` 只改本进程那份注册表，
         // 不做任何 git 写。
         //
-        // 唯一会被两个进程各跑一遍的是 `Refine`：它要调 LLM 再落技能配置，两边
-        // 跑会同一条技能各拿一份答案、互相覆盖，还白烧一倍 token。所以门只门
-        // 这一支，粒度按动作给，不整块收口。
+        // 唯一会被两个进程各跑一遍的是 `Refine`：它把一次精炼投进任务图、再把
+        // 答案落成技能配置，两边跑会同一条技能各拿一份答案、互相覆盖，还白烧
+        // 一倍 token。所以门只门这一支，粒度按动作给，不整块收口。
         let skill_registry = ctx.consume::<tokio::sync::RwLock<cog_core::SkillRegistry>>();
         match ctx.consume::<crate::ReflectionEngine>() {
             Some(engine) => {
-                let llm: Option<Arc<dyn cog_core::LlmClient>> =
-                    ctx.consume_service::<dyn cog_core::LlmClient>();
                 let period =
                     std::time::Duration::from_secs(ctx.config().self_evolution.poll_interval_secs);
                 // 自主能力发现与技能有效性同址：两者读的注册表都由别的插件的
@@ -1862,13 +1861,7 @@ impl cog_core::SystemPlugin for ReflectionPlugin {
                     self.pool_gate.clone(),
                     self.discovery_outcome_readings.clone(),
                 );
-                spawn_skill_effectiveness_loop(
-                    engine,
-                    skill_registry,
-                    llm,
-                    period,
-                    self.executor_role,
-                );
+                spawn_skill_effectiveness_loop(engine, skill_registry, period, self.executor_role);
             }
             None => info!("no reflection engine published; skill effectiveness actions disabled"),
         }
@@ -2111,7 +2104,6 @@ fn current_version(ctx: &cog_core::PluginContext) -> String {
 fn spawn_skill_effectiveness_loop(
     engine: Arc<crate::ReflectionEngine>,
     registry: Option<Arc<tokio::sync::RwLock<cog_core::SkillRegistry>>>,
-    llm: Option<Arc<dyn cog_core::LlmClient>>,
     period: std::time::Duration,
     refines: bool,
 ) {
@@ -2135,7 +2127,6 @@ fn spawn_skill_effectiveness_loop(
         move |beat| {
             let engine = engine.clone();
             let registry = registry.clone();
-            let llm = llm.clone();
             let refines = refines;
             async move {
                 let mut interval = tokio::time::interval(period);
@@ -2143,7 +2134,7 @@ fn spawn_skill_effectiveness_loop(
                     beat.beat();
                     interval.tick().await;
                     if let Err(e) = engine
-                        .apply_effectiveness_actions(registry.clone(), llm.clone(), refines)
+                        .apply_effectiveness_actions(registry.clone(), refines)
                         .await
                     {
                         warn!(error = %e, "applying skill effectiveness actions failed");

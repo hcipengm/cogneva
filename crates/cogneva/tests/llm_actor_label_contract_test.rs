@@ -69,10 +69,9 @@ const PRODUCERS: &[(&str, &[&str])] = &[
         "crates/cog-extension/src/hostdocs_assist.rs",
         &["sandbox-document-organizer"],
     ),
-    // 记忆抽取不再自己叫模型：它把「这段材料里什么值得记」当成一件活交给
-    // 名册上的员工，账记在接活的那个人身上（`agent:<id>`），所以这里没有
-    // 属于场景自己的名字可写。
-    ("crates/cog-reflection/src/evolution.rs", &["evolution"]),
+    // 进化引擎不再自己叫模型：技能改进、钩子合成、工具变体这三处判断都作为
+    // 一件活交给名册上的员工，账记在接活的那个人身上（`agent:<id>`），所以
+    // 这里没有属于场景自己的名字可写。
     ("crates/cogneva/src/eval_table.rs", &["eval"]),
     (
         "crates/cogneva/tests/collaboration_self_review_test.rs",
@@ -446,10 +445,6 @@ const TASK_KEYING: &[(&str, TaskKeying)] = &[
         TaskKeying::KeyedBy("沙盒里的那份文档"),
     ),
     (
-        "crates/cog-reflection/src/evolution.rs",
-        TaskKeying::KeyedBy("一个技能 / 钩子 / 工具变体"),
-    ),
-    (
         "crates/cogneva/src/eval_table.rs",
         TaskKeying::KeyedBy("评测表里的一行"),
     ),
@@ -652,10 +647,6 @@ const CALL_SITES: &[(&str, ActorSource)] = &[
     ("crates/cog-llm/src/resilience.rs", ActorSource::Forwards),
     ("crates/cog-llm/src/routing.rs", ActorSource::Forwards),
     ("crates/cogneva/src/eval_table.rs", ActorSource::Stamps),
-    (
-        "crates/cog-reflection/src/evolution.rs",
-        ActorSource::Stamps,
-    ),
 ];
 
 /// 生产代码里出现了对模型的调用（`chat` / `chat_stream`）的那些文件。

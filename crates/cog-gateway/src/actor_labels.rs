@@ -23,13 +23,7 @@
 //! configured role cannot introduce arbitrary text into the label.
 
 /// Actors whose whole value is fixed.
-pub const ACTOR_LABELS: &[&str] = &[
-    "eval",
-    "evolution",
-    "ralph",
-    "sandbox-document-organizer",
-    "self_review",
-];
+pub const ACTOR_LABELS: &[&str] = &["eval", "ralph", "sandbox-document-organizer", "self_review"];
 
 /// Actors that carry a configured role name after the colon.
 pub const ACTOR_LABEL_PREFIXES: &[&str] = &["agent:", "self_review:"];

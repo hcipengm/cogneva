@@ -918,51 +918,6 @@ mod tests {
     use super::*;
     use cog_core::PromotionLedger;
 
-    struct PlaceholderLlm;
-
-    #[async_trait::async_trait]
-    impl cog_core::LlmClient for PlaceholderLlm {
-        async fn chat(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::ChatResponse> {
-            Ok(cog_core::ChatResponse {
-                content: vec![cog_core::ContentBlock::text("{}")],
-                api: "mock".into(),
-                provider: "mock".into(),
-                model: "mock".into(),
-                response_id: None,
-                usage: cog_core::Usage::default(),
-                stop_reason: cog_core::StopReason::Stop,
-                error_message: None,
-                upstream_failure: None,
-                retry_after_secs: None,
-                timestamp: chrono::Utc::now(),
-            })
-        }
-
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!()
-        }
-
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!()
-        }
-
-        async fn health_check(&self) -> bool {
-            true
-        }
-    }
-
     #[test]
     fn only_a_unified_diff_yields_a_summary() {
         // Pins the property that dropping `content` from the resident index
@@ -987,9 +942,7 @@ mod tests {
     async fn admin_service_lists_changes_and_rejects_missing_apply() {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
         let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
         engine.evolution = Some(Arc::new(crate::EvolutionEngine::new(
-            llm,
             registry.clone(),
             None,
         )));
@@ -1027,9 +980,7 @@ mod tests {
     async fn admin_service_lists_changes_that_only_the_directory_knows() {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
         let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
         engine.evolution = Some(Arc::new(crate::EvolutionEngine::new(
-            llm,
             registry.clone(),
             None,
         )));
@@ -1072,8 +1023,7 @@ mod tests {
         let engine = || {
             let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
             let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
-            let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
-            engine.evolution = Some(Arc::new(crate::EvolutionEngine::new(llm, registry, None)));
+            engine.evolution = Some(Arc::new(crate::EvolutionEngine::new(registry, None)));
             engine
         };
         let project_root = std::env::current_dir().unwrap();
@@ -1124,14 +1074,13 @@ mod tests {
     async fn admin_service_lists_a_change_after_its_resident_entry_is_dropped() {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
         let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
 
         let project_root = std::env::current_dir().unwrap();
         let unique = uuid::Uuid::new_v4();
         let change_dir = std::env::temp_dir().join(format!("cogneva-test-changes-{}", unique));
         tokio::fs::create_dir_all(&change_dir).await.unwrap();
         let evo = Arc::new(
-            crate::EvolutionEngine::new(llm, registry.clone(), None).with_change_dir(&change_dir),
+            crate::EvolutionEngine::new(registry.clone(), None).with_change_dir(&change_dir),
         );
         engine.evolution = Some(evo.clone());
 
@@ -1276,9 +1225,7 @@ mod tests {
     ) -> crate::EvolutionAdminService {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
         let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
         engine.evolution = Some(Arc::new(crate::EvolutionEngine::new(
-            llm,
             registry.clone(),
             None,
         )));
@@ -1323,9 +1270,7 @@ mod tests {
     async fn approve_rejects_missing_and_not_awaiting_review_changes() {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
         let mut engine = crate::ReflectionEngine::new_in_memory(registry.clone());
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
         engine.evolution = Some(Arc::new(crate::EvolutionEngine::new(
-            llm,
             registry.clone(),
             None,
         )));
@@ -1390,8 +1335,7 @@ mod tests {
     #[tokio::test]
     async fn approving_a_change_that_awaits_approval_promotes_it_instead_of_deploying() {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(PlaceholderLlm);
-        let evo = Arc::new(crate::EvolutionEngine::new(llm, registry.clone(), None));
+        let evo = Arc::new(crate::EvolutionEngine::new(registry.clone(), None));
         let mut reflection = crate::ReflectionEngine::new_in_memory(registry.clone());
         reflection.evolution = Some(evo.clone());
         let reflection = Arc::new(reflection);

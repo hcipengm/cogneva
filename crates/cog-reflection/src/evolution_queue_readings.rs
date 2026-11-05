@@ -362,45 +362,9 @@ impl Observable for EvolutionQueueReadings {
 mod tests {
     use super::*;
 
-    /// The engine is not what this module is about, so the double answers with
-    /// nothing and never gets asked: only its index is read here.
-    struct SilentLlm;
-
-    #[async_trait::async_trait]
-    impl cog_core::LlmClient for SilentLlm {
-        async fn chat(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::ChatResponse> {
-            unimplemented!()
-        }
-
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!()
-        }
-
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!()
-        }
-
-        async fn health_check(&self) -> bool {
-            true
-        }
-    }
-
     fn engine(dir: &Path) -> Arc<EvolutionEngine> {
         let registry = Arc::new(tokio::sync::RwLock::new(cog_core::SkillRegistry::new()));
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(SilentLlm);
-        Arc::new(EvolutionEngine::new(llm, registry, None).with_change_dir(dir))
+        Arc::new(EvolutionEngine::new(registry, None).with_change_dir(dir))
     }
 
     fn readings(dir: &Path, owner: bool) -> EvolutionQueueReadings {

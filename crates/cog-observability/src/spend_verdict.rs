@@ -246,10 +246,6 @@ pub const UNREGISTERED_SITES: &[UnregisteredSite] = &[
         why: "same family, same reason: only the planner's and the moderator's reviews have been observed running often enough to say a missing window is a stop; every other configured self-review role is judged by the census over the writer, not by a window",
     },
     UnregisteredSite {
-        actor: "evolution",
-        why: "driven by the change pipeline rather than by the run loop; its silence and the pipeline's idle state are the same reading today",
-    },
-    UnregisteredSite {
         actor: "ralph",
         why: "driven by an explicitly launched squad loop; a window it does not run in is a window nobody launched it",
     },

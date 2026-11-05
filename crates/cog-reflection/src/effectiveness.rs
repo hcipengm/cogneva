@@ -113,7 +113,7 @@ impl SkillEffectivenessTracker {
         &self,
         skill_id: &str,
         registry: Arc<RwLock<cog_core::SkillRegistry>>,
-        llm: Option<Arc<dyn cog_core::LlmClient>>,
+        evolution: Option<Arc<crate::evolution::EvolutionEngine>>,
         refines: bool,
     ) -> SFResult<()> {
         let registered = registry.read().await.get_skill(skill_id).is_some();
@@ -164,13 +164,11 @@ impl SkillEffectivenessTracker {
                         "Refinement recommended; this process is not the one that runs it"
                     );
                 } else {
-                    info!(skill_id, "Refining skill — triggering evolution");
-                    if let Some(llm) = llm {
-                        let evolution =
-                            crate::evolution::EvolutionEngine::new(llm, registry.clone(), None);
+                    info!(skill_id, "Refining skill — handing it to the roster");
+                    if let Some(evolution) = evolution {
                         evolution.refine_skill(skill_id).await?;
                     } else {
-                        warn!(skill_id, "Cannot refine skill: no LLM provider available");
+                        warn!(skill_id, "Cannot refine skill: no evolution engine here");
                     }
                 }
             }
@@ -338,61 +336,43 @@ mod tests {
         }
     }
 
+    /// 一个只数「收到几件活」的任务图：精炼这一支现在是把判断交给名册，
+    /// 量的对象随之从「模型被叫了几次」变成「活投出去了几次」。
     #[derive(Default)]
-    struct CountingLlm {
-        calls: std::sync::atomic::AtomicUsize,
+    struct CountingGraph {
+        submitted: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
-    impl cog_core::LlmClient for CountingLlm {
-        async fn chat(
+    impl cog_core::contract::work_item::WorkItemGraph for CountingGraph {
+        async fn submit(
             &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::ChatResponse> {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(cog_core::ChatResponse {
-                content: vec![cog_core::ContentBlock::text("{}")],
-                api: "mock".into(),
-                provider: "mock".into(),
-                model: "mock".into(),
-                response_id: None,
-                usage: cog_core::Usage::default(),
-                stop_reason: cog_core::StopReason::Stop,
-                error_message: None,
-                upstream_failure: None,
-                retry_after_secs: None,
-                timestamp: chrono::Utc::now(),
-            })
+            _goal: &str,
+            tasks: Vec<cog_core::Task>,
+        ) -> cog_core::SFResult<Vec<String>> {
+            self.submitted
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(tasks.into_iter().map(|task| task.id).collect())
         }
 
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!("这支动作只走 chat")
-        }
-
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!("这支动作只走 chat")
-        }
-
-        async fn health_check(&self) -> bool {
-            true
+        async fn row(&self, _id: &str) -> Option<cog_core::Task> {
+            let mut row = cog_core::Task::new(
+                "counting",
+                cog_core::TaskType::Custom("counting".into()),
+                serde_json::json!({}),
+            );
+            row.status = cog_core::TaskStatus::Completed;
+            row.result = Some(serde_json::json!({ "result": "{}" }));
+            Some(row)
         }
     }
 
-    /// `Refine` 是全仓唯一有跨进程副作用的一支动作：它调 LLM 再写技能配置。
+    /// `Refine` 是全仓唯一有跨进程副作用的一支动作：它把一次精炼交给名册，答案会写回技能配置。
     /// 不是那个唯一写者的进程**照样**要跑这条环、照样应用本进程的动作——它只是
     /// 不落这一支，因为两个进程各自问一次 LLM 会拿回两份答案写同一条技能。
     ///
-    /// 两个方向都量：同一批结局在 `refines=false` 下一次 LLM 调用都不许有，
-    /// 在 `refines=true` 下必须有一次。只量「不调」的话，一个把 `Refine` 判成
+    /// 两个方向都量：同一批结局在 `refines=false` 下一件活都不许投，
+    /// 在 `refines=true` 下必须投一件。只量「不投」的话，一个把 `Refine` 判成
     /// 别的动作（或压根不动作）的实现也能通过。
     #[tokio::test]
     async fn a_process_that_is_not_the_writer_recommends_refinement_without_spending_it() {
@@ -417,12 +397,16 @@ mod tests {
                 "这批结局应当推 Refine，否则下面量的是别的动作"
             );
 
-            let llm = Arc::new(CountingLlm::default());
+            let graph = Arc::new(CountingGraph::default());
+            let evolution = Arc::new(
+                crate::evolution::EvolutionEngine::new(registry.clone(), None)
+                    .with_task_graph(graph.clone()),
+            );
             tracker
-                .apply_action("real", registry.clone(), Some(llm.clone()), refines)
+                .apply_action("real", registry.clone(), Some(evolution), refines)
                 .await
                 .unwrap();
-            calls_by_role.push(llm.calls.load(std::sync::atomic::Ordering::SeqCst));
+            calls_by_role.push(graph.submitted.load(std::sync::atomic::Ordering::SeqCst));
         }
         assert_eq!(
             calls_by_role,

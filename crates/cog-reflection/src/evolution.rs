@@ -16,9 +16,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use cog_core::{
-    ChatOptions, LlmClient, Message, ResponseFormat, SFResult, SkillConfig, SkillRegistry,
-};
+use cog_core::{SFResult, SkillConfig, SkillRegistry};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -74,9 +72,44 @@ pub mod fallback {
     pub const TOOL_VARIANT_SYSTEM: &str = "Respond with valid JSON tool definition only.";
 }
 
+/// 首次使用时才解析的任务图。
+///
+/// 插件在 `init` 里造引擎、编排器在 `start` 之后才发布，所以这里存的是句柄；
+/// 真正被问的那一刻还没有图，就是「这个进程没有名册」，按缺席报错。
+struct LateWorkGraph(cog_core::LateService<dyn cog_core::OrchestratorControl>);
+
+#[async_trait::async_trait]
+impl cog_core::contract::work_item::WorkItemGraph for LateWorkGraph {
+    async fn submit(
+        &self,
+        goal: &str,
+        tasks: Vec<cog_core::Task>,
+    ) -> cog_core::SFResult<Vec<String>> {
+        let graph = self.0.get().ok_or_else(|| {
+            cog_core::SFError::Agent(
+                "the task graph is not published in this process, so no employee could take this work"
+                    .into(),
+            )
+        })?;
+        cog_core::contract::work_item::WorkItemGraph::submit(graph.as_ref(), goal, tasks).await
+    }
+
+    async fn row(&self, id: &str) -> Option<cog_core::Task> {
+        match self.0.get() {
+            Some(graph) => graph.get_task(id).await,
+            None => None,
+        }
+    }
+}
+
 /// Engine that drives controlled self-evolution of the system.
 pub struct EvolutionEngine {
-    llm: Arc<dyn LlmClient>,
+    /// 名册入口：这一层的判断交给员工，账记在接活的人身上。
+    ///
+    /// 编排器在插件 `start` 之后才安装，所以这里是首次使用时才解析的句柄；
+    /// 缺席是合法状态（这个进程没有任务图），那时三处判断各自报错，而不是
+    /// 在这里叫一次没人记账的模型。
+    work_graph: Option<Arc<dyn cog_core::contract::work_item::WorkItemGraph>>,
     skill_registry: Arc<RwLock<SkillRegistry>>,
     change_dir: std::path::PathBuf,
     prompt_manager: Option<Arc<dyn cog_core::PromptProvider>>,
@@ -132,14 +165,27 @@ impl std::fmt::Debug for EvolutionEngine {
     }
 }
 
+/// 材料摘要，用来给同一份材料生成同一个 id。
+///
+/// 任务 id 是「这件活只跑一次」的那个身份：材料变了、id 不变，平台会把新的
+/// 请求当成旧记录的回音，答案永远停在前一版。反过来材料一样、id 一样，正是
+/// 这里想要的幂等。
+fn digest(text: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:08x}")
+}
+
 impl EvolutionEngine {
     pub fn new(
-        llm: Arc<dyn LlmClient>,
         skill_registry: Arc<RwLock<SkillRegistry>>,
         prompt_manager: Option<Arc<dyn cog_core::PromptProvider>>,
     ) -> Self {
         Self {
-            llm,
+            work_graph: None,
             skill_registry,
             change_dir: std::path::PathBuf::from("evolution-changes"),
             prompt_manager,
@@ -149,6 +195,73 @@ impl EvolutionEngine {
             results: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
             max_changed_lines: crate::GenerationLimits::default().max_changed_lines,
         }
+    }
+
+    /// 把判断交给名册的那个入口接上。
+    ///
+    /// 传进来的是一份「首次使用时才解析」的句柄而不是编排器本身：这个引擎在
+    /// 插件 `init` 里构造，而编排器可能在它之后才发布。
+    pub fn with_work_graph(
+        mut self,
+        graph: cog_core::LateService<dyn cog_core::OrchestratorControl>,
+    ) -> Self {
+        self.work_graph = Some(Arc::new(LateWorkGraph(graph)));
+        self
+    }
+
+    /// 直接接上一份任务图。给没有插件上下文的地方用（测试、独立装配）。
+    pub fn with_task_graph(
+        mut self,
+        graph: Arc<dyn cog_core::contract::work_item::WorkItemGraph>,
+    ) -> Self {
+        self.work_graph = Some(graph);
+        self
+    }
+
+    /// 把一次判断交给名册上的员工，拿回它写的答复正文。
+    ///
+    /// 三处判断（技能改进、钩子合成、工具变体）形状相同：一段做法、一份材料、
+    /// 一个 JSON 形状的答案。做法进 `contract`，材料进请求，判据写在行上；
+    /// 谁接、怎么干、读没读工具，都是接活的人的事。
+    async fn ask_employee(
+        &self,
+        item_id: String,
+        contract: &str,
+        request: serde_json::Value,
+        acceptance: &str,
+        timeout_secs: u64,
+    ) -> SFResult<String> {
+        let Some(graph) = self.work_graph.as_ref() else {
+            return Err(cog_core::SFError::Agent(format!(
+                "evolution has no task graph in this process, so no employee could take {item_id}"
+            )));
+        };
+        let mut input = serde_json::json!({ "task": request });
+        input[cog_core::contract::prompt::PROMPT_CONTRACT_KEY] =
+            serde_json::Value::String(contract.to_string());
+        let mut task = cog_core::Task::new(
+            item_id.clone(),
+            cog_core::TaskType::Custom(cog_core::contract::work_item::PLATFORM_AGENT_TASK.into()),
+            input,
+        );
+        task.action_planner_meta = Some(cog_core::ActionPlannerMeta {
+            verified: true,
+            version: Some("1.0.0".into()),
+            note: Some("Evolution judgment; route to a standing employee".into()),
+            source: Some(cog_core::ActionPlannerSource::UserProvided),
+            confidence: None,
+            timestamp: Some(Utc::now()),
+        });
+        task.timeout_seconds = timeout_secs;
+        task.acceptance.push(acceptance.to_string());
+        let answer = cog_core::contract::work_item::run_work_item(
+            graph.as_ref(),
+            &format!("Evolution judgment: {item_id}"),
+            task,
+            std::time::Duration::from_secs(timeout_secs.saturating_sub(10).max(1)),
+        )
+        .await?;
+        Ok(cog_core::contract::work_item::answer_text(&answer))
     }
 
     /// 设置生成侧的行数上限，取落地侧读的同一个配置键所载的值。
@@ -414,21 +527,16 @@ impl EvolutionEngine {
             .and_then(|pm| pm.get("reflection:evolution_refinement_system"))
             .unwrap_or_else(|| fallback::SKILL_REFINEMENT_SYSTEM.into());
 
-        let messages = vec![Message::system(system_prompt), Message::user(prompt)];
-
-        let options = ChatOptions {
-            response_format: ResponseFormat::Json,
-            ..Default::default()
-        }
-        .with_actor("evolution");
-
-        let response = self.llm.chat(&messages, &options).await?;
-        let text: String = response
-            .content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join("");
+        let text = self
+            .ask_employee(
+                format!("evolution-refine-{}-{}", skill_id, digest(&prompt)),
+                &system_prompt,
+                serde_json::json!(prompt),
+                "The reply is one JSON object holding the improved skill: skill_id (unchanged), \
+                 name, tools, max_iterations, role_type and system_prompt.",
+                180,
+            )
+            .await?;
 
         debug!(skill_id, "Refinement LLM response: {}", text);
 
@@ -527,23 +635,19 @@ impl EvolutionEngine {
 
         let system_prompt = "Respond with valid JSON HookDef only.".to_string();
 
-        let messages = vec![Message::system(system_prompt), Message::user(prompt)];
-
-        let options = ChatOptions {
-            response_format: ResponseFormat::Json,
-            temperature: Some(0.3),
-            max_tokens: Some(512),
-            ..Default::default()
-        }
-        .with_actor("evolution");
-
-        let response = self.llm.chat(&messages, &options).await?;
-        let text: String = response
-            .content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join("");
+        let text = self
+            .ask_employee(
+                format!(
+                    "evolution-hook-{}",
+                    digest(&format!("{event_pattern}\n{outcomes_text}"))
+                ),
+                &system_prompt,
+                serde_json::json!(prompt),
+                "The reply is one JSON object holding a hook: a lowercase id, a trigger from the \
+                 list in `task`, a scope, and an action whose required fields match its type.",
+                120,
+            )
+            .await?;
 
         let json_str = Self::extract_json(&text);
 
@@ -684,23 +788,16 @@ impl EvolutionEngine {
             .and_then(|pm| pm.get("reflection:evolution_tool_system"))
             .unwrap_or_else(|| fallback::TOOL_VARIANT_SYSTEM.into());
 
-        let messages = vec![Message::system(system_prompt), Message::user(prompt)];
-
-        let options = ChatOptions {
-            response_format: ResponseFormat::Json,
-            temperature: Some(0.3),
-            max_tokens: Some(512),
-            ..Default::default()
-        }
-        .with_actor("evolution");
-
-        let response = self.llm.chat(&messages, &options).await?;
-        let text: String = response
-            .content
-            .iter()
-            .filter_map(|b| b.as_text())
-            .collect::<Vec<_>>()
-            .join("");
+        let text = self
+            .ask_employee(
+                format!("evolution-tool-{}-{}", tool_name, digest(&prompt)),
+                &system_prompt,
+                serde_json::json!(prompt),
+                "The reply is one JSON object holding name, description, and a parameters JSON \
+                 Schema object whose type is object.",
+                120,
+            )
+            .await?;
 
         let json_str = Self::extract_json(&text);
 
@@ -1208,45 +1305,9 @@ mod tests {
         assert_eq!(repair_generated_diff(diff), diff);
     }
 
-    /// The engine is the subject, not the model behind it, so the double never
-    /// answers anything.
-    struct SilentLlm;
-
-    #[async_trait::async_trait]
-    impl cog_core::LlmClient for SilentLlm {
-        async fn chat(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::ChatResponse> {
-            unimplemented!()
-        }
-
-        async fn chat_stream(
-            &self,
-            _messages: &[cog_core::Message],
-            _options: &cog_core::ChatOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!()
-        }
-
-        async fn complete_stream(
-            &self,
-            _prompt: &str,
-            _options: &cog_core::CompleteOptions,
-        ) -> cog_core::SFResult<cog_core::AssistantMessageEventStream> {
-            unimplemented!()
-        }
-
-        async fn health_check(&self) -> bool {
-            true
-        }
-    }
-
     fn engine_on(dir: &std::path::Path) -> EvolutionEngine {
         let registry = Arc::new(RwLock::new(cog_core::SkillRegistry::new()));
-        let llm: Arc<dyn cog_core::LlmClient> = Arc::new(SilentLlm);
-        EvolutionEngine::new(llm, registry, None).with_change_dir(dir)
+        EvolutionEngine::new(registry, None).with_change_dir(dir)
     }
 
     fn code_change(id: &str, status: EvolutionStatus) -> EvolutionResult {
