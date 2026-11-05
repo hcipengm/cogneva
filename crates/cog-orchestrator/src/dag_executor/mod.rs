@@ -2506,6 +2506,7 @@ mod consumer_ack_tests {
             sink_task_id: None,
             is_executable: true,
             face_id: None,
+            venue: None,
             owner_unit: None,
             bound_by_handover_id: None,
             // Every row this platform files says what would close it, and the
@@ -3337,6 +3338,7 @@ mod consumer_ack_tests {
             sink_task_id: None,
             is_executable: true,
             face_id: None,
+            venue: None,
             owner_unit: None,
             bound_by_handover_id: None,
             acceptance: vec![],
