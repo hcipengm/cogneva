@@ -149,6 +149,10 @@ impl AgentConsumer {
             tokio::time::Instant::now() + reclaim_interval,
             reclaim_interval,
         );
+        // The read is raced against the backstop, so a tick can drop a read that
+        // was already on the wire. That is safe here: a reply the store handed
+        // out just before the drop is an entry in the group's pending list, and
+        // taking pending entries back is exactly what the next pass is for.
         loop {
             tokio::select! {
                 next = stream.next() => {
@@ -156,9 +160,14 @@ impl AgentConsumer {
                         break;
                     };
                     let (msg_id, bytes) = result?;
-                    self.deliver(&msg_id, &bytes, &group_name, &mut handler)
-                        .await;
-                    handled.insert(msg_id);
+                    if !self.deliver(&msg_id, &bytes, &group_name, &mut handler).await {
+                        // Only what was left pending can come back from a
+                        // reclaim, so only that is worth remembering: a set
+                        // that grew with every message ever read would grow
+                        // for as long as the process stays up, and this one is
+                        // meant to stay up for weeks.
+                        handled.insert(msg_id);
+                    }
                 }
                 _ = backstop.tick() => {
                     match self
@@ -248,8 +257,16 @@ impl AgentConsumer {
     /// dead inbox looked exactly like a quiet one. A failed command now costs
     /// its own delivery and no more -- it stays pending, is reported, and is
     /// retried when this consumer next starts, not by the backstop pass of the
-    /// incarnation that already ran it.
-    async fn deliver<F, Fut>(&self, msg_id: &str, bytes: &[u8], group_name: &str, handler: &mut F)
+    /// incarnation that already ran it. Returns whether the message was
+    /// settled (finished and acknowledged, or poisoned and handed to the dead
+    /// letter queue); anything left pending returns false.
+    async fn deliver<F, Fut>(
+        &self,
+        msg_id: &str,
+        bytes: &[u8],
+        group_name: &str,
+        handler: &mut F,
+    ) -> bool
     where
         F: FnMut(cog_core::InboxMessage) -> Fut,
         Fut: std::future::Future<Output = SFResult<()>>,
@@ -289,7 +306,9 @@ impl AgentConsumer {
                         tracing::warn!(msg_id = %msg_id, "Failed to ack poison inbox message: {e}");
                     }
                     crate::observable::global_observable().record_inbox_poisoned();
-                    return;
+                    // Settled: the parse can never succeed, so handing the same
+                    // bytes over again would only dead-letter them twice.
+                    return true;
                 }
             };
         let kind = crate::observable::inbox_kind(&message);
@@ -306,7 +325,7 @@ impl AgentConsumer {
                 error = %e,
                 "Inbox command failed; the message stays pending for retry"
             );
-            return;
+            return false;
         }
         if let Err(e) = self
             .backend
@@ -314,9 +333,13 @@ impl AgentConsumer {
             .await
         {
             tracing::warn!(msg_id = %msg_id, "Failed to ack inbox message: {e}");
-            return;
+            // The handler finished but the group still holds the message: it was
+            // settled as far as this incarnation can tell, and re-running it
+            // would be a second execution of a turn that already happened.
+            return false;
         }
         crate::observable::global_observable().record_inbox_delivered(kind);
+        true
     }
 
     /// Send a message to another agent's inbox.
