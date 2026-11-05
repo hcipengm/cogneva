@@ -105,7 +105,7 @@ fn default_env_mappings() -> HashMap<String, String> {
         "dag_executor.nats.tls.enabled".into(),
     );
     m.insert(
-        "COGNEVA_WORKSPACE_ID".into(),
+        cog_core::env::WORKSPACE_ID.into(),
         "dag_executor.workspace_id".into(),
     );
     m.insert(

@@ -145,3 +145,11 @@ pub const VERSION_ID: &str = "COGNEVA_VERSION_ID";
 /// loader advertise a level variable the gateway no longer consults, and both
 /// sides answer "unset" by picking their own default.
 pub const LOG_LEVEL: &str = "COGNEVA_LOG_LEVEL";
+
+/// The workspace a task row belongs to.
+///
+/// The configuration loader maps it to `dag_executor.workspace_id`, and the
+/// agent tools that file work read it to stamp the row. A second spelling would
+/// let a filed row land in a workspace no listing reads, and an empty one is
+/// indistinguishable from "this deployment has no workspace".
+pub const WORKSPACE_ID: &str = "COGNEVA_WORKSPACE_ID";

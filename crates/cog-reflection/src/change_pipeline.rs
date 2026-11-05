@@ -399,6 +399,8 @@ fn last_line_of(text: &str) -> &str {
 
 /// 输出的尾巴：门禁的报告是给人读的，前面大半是它读过的清单，红的那句在末尾。
 fn tail_of(text: &str) -> String {
+    // cap: bound — 够装下几组失败各自的收尾行（每组通常一两行），又不至于把整份
+    // 日志倒进提示词；没有测量能定这个数，它只决定「交回去的是结尾还是全文」。
     const KEPT: usize = 40;
     let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let start = lines.len().saturating_sub(KEPT);

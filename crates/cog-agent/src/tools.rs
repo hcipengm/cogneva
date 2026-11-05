@@ -2500,9 +2500,10 @@ pub mod builtins {
                     let url = format!("{base}/api/v1/tasks");
                     let mut request = cog_core::HttpRequest::new("POST", &url);
                     request.timeout_secs = Some(MEMORY_READ_TIMEOUT_SECS);
-                    request
-                        .headers
-                        .insert("content-type".into(), "application/json".into());
+                    request.headers.insert(
+                        "content-type".into(),
+                        cog_core::contract::net::CONTENT_TYPE_JSON.into(),
+                    );
                     request.body =
                         Some(serde_json::to_vec(&filed.body).map_err(SFError::Serialization)?);
                     let response = client.execute(request).await?;
@@ -2637,7 +2638,7 @@ pub mod builtins {
         // owns. The deployment sets nothing, which is why the fallback is the
         // same name the memory namespace defaults to rather than an empty
         // string: an empty workspace is a row no listing matches.
-        let workspace = std::env::var("COGNEVA_WORKSPACE_ID")
+        let workspace = std::env::var(cog_core::env::WORKSPACE_ID)
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
@@ -2655,11 +2656,16 @@ pub mod builtins {
             "id": task_id,
             "task_type": cog_core::contract::work_item::PLATFORM_AGENT_TASK,
             "input": input,
-            // The caller is stating the work as already decided. Without this
-            // the row goes through decomposition, which would spend a planning
-            // call to restate what the caller already said.
-            "planner": { "verified": true, "source": "user_provided" },
             "timeout_seconds": timeout_seconds,
+        });
+        // The caller is stating the work as already decided. Without this the
+        // row goes through decomposition, which would spend a planning call to
+        // restate what the caller already said. The field is read under the
+        // planner role's own name: a second spelling here would be a field the
+        // door never looks at, and the row would be planned anyway.
+        row[cog_core::roles::PLANNER] = serde_json::json!({
+            "verified": true,
+            "source": "user_provided",
         });
         if let Some(assignee) = assignee.as_deref() {
             row["agent_id"] = serde_json::json!(assignee);
