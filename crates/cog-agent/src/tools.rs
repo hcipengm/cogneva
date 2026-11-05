@@ -2062,6 +2062,13 @@ pub mod builtins {
                 inputs.agent_registry.clone(),
             ),
         );
+        // 读账与派活是同一面的一对。只给派活、不给读账，智能体就只能在心里数
+        // 自己派过几件——而它看不见的正是别人派的那几千件，也就是「现在还有
+        // 什么可做」这个问题的全部答案。
+        cog_core::ToolRegistry::register(
+            registry,
+            read_task_ledger(inputs.http_client.clone(), inputs.memory_api_base.clone()),
+        );
     }
 
     /// Names the live agents, so a caller has something to address.
@@ -2549,6 +2556,91 @@ pub mod builtins {
                     // caller from reading "filed" as "done".
                     receipt["queued"] = serde_json::json!(true);
                     Ok(receipt)
+                })
+            })),
+        }
+    }
+
+    /// Read the shared task ledger: what is on the board, folded into readings.
+    ///
+    /// `start_task` puts work on the graph; without this, an agent that filed
+    /// work has no way to find out what is already queued for it, what came
+    /// back, or which of its own rows nobody has picked up. Nothing else on
+    /// this face answers that: the operator face's `/api/v1/tasks/list` returns
+    /// the whole table in one body -- nine thousand rows and thirty-eight
+    /// megabytes on 2026-11-06 -- which reads as noise rather than as a state.
+    ///
+    /// The answer is a folded reading, not an enumeration: counts by status, by
+    /// kind crossed with status, by venue and by owner; the oldest open rows;
+    /// and how many of those a worker has already taken. Reading it is how an
+    /// agent decides what to do next without guessing, and how it notices that
+    /// the row it filed hours ago is still sitting there.
+    pub fn read_task_ledger(client: Option<Arc<dyn HttpClient>>, api_base: Option<String>) -> Tool {
+        Tool {
+            name: "read_task_ledger".into(),
+            description: "Read the shared task ledger: how much work is on the board, in what \
+                          states, in which venues, and on whose hands. Use it before starting \
+                          something new, to find out whether it is already queued or already \
+                          done, and after filing work, to find out whether anyone picked it up. \
+                          The reading is folded: counts plus the oldest open rows, never the \
+                          whole table. Narrow it with any of the filters; leave them out to read \
+                          the whole board. `open` rows that were never taken are queue depth, \
+                          rows with a `started_at` are work in flight, and `truncated` says the \
+                          row list was cut to `limit` rather than being complete."
+                .into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "venue": {
+                        "type": "string",
+                        "description": "Only work whose row carries this venue label (memory, \
+                                        wiki, eval …), matched exactly."
+                    },
+                    "owner": {
+                        "type": "string",
+                        "description": "Only work on this person's hands: rows assigned to them, \
+                                        or rows whose result they submitted."
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Only rows in this state: pending, scheduled, running, \
+                                        completed, failed, cancelled."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Only rows of this task kind, as the ledger spells it in \
+                                        by_kind_status."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "How many of the oldest open rows to bring back (default \
+                                        20, capped at 50 regardless of what is asked for)."
+                    }
+                }
+            }),
+            implementation: ToolImplementation::Native(Arc::new(move |args| {
+                let client = client.clone();
+                let api_base = api_base.clone();
+                Box::pin(async move {
+                    let base = memory_base(api_base.as_deref())?;
+                    let client = memory_client(client)?;
+                    // 条件名原样传给服务端，由那一条读自己解释：在这里先把筛选做一遍
+                    // 就成了第二个定义，两处迟早对不上。
+                    let mut query: Vec<String> = Vec::new();
+                    for key in ["venue", "owner", "status", "kind"] {
+                        if let Some(value) = optional_label(&args, key) {
+                            query.push(format!("{key}={}", encode_url_component(&value)));
+                        }
+                    }
+                    if let Some(limit) = args.get("limit").and_then(serde_json::Value::as_u64) {
+                        query.push(format!("limit={limit}"));
+                    }
+                    let mut url = format!("{base}/api/v1/tasks/ledger");
+                    if !query.is_empty() {
+                        url.push('?');
+                        url.push_str(&query.join("&"));
+                    }
+                    get_json(&client, &url).await
                 })
             })),
         }

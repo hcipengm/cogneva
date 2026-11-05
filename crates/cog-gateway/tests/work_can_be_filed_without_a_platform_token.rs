@@ -79,3 +79,52 @@ fn the_submission_handler_is_mounted_on_exactly_two_doors() {
          没有入口，多一次说明又有人造了一条写入路径"
     );
 }
+
+/// 读账与派活挂在同一面上。
+///
+/// 只有提交口的那一面上，一个智能体唯一能数清的是自己派过的那几件；别人派的那
+/// 几千件它看不见——2026-11-06 的现场正是这样：三个智能体分别被问到「账上现在有
+/// 多少活」，三个人的回答都是「这个进程里没有读任务账的工具」，而当时开着 1684
+/// 条 pending 与 762 条 scheduled。能派活、看不见账，规划就只剩猜。
+///
+/// 挂在同一面而不是运营面的理由与提交口逐字相同：跑在集群里的业务 Pod 本身零凭
+/// 证，给它们看账再要一个令牌，等于为一个只读的读数面给每个容器发一个身份。
+#[test]
+fn the_ledger_read_is_on_the_same_credential_free_face() {
+    let source = lib_source();
+    let internal = internal_router_body(&source);
+
+    assert!(
+        internal.contains("/api/v1/tasks/ledger"),
+        "零凭证的那一面没有读账路径：能派活的智能体看不见账，也就没有依据决定下一\
+         件事做什么，而它看得见的那张 `/api/v1/tasks/list` 一次吐出整张表"
+    );
+    assert!(
+        internal.contains("task_ledger::task_ledger_handler"),
+        "那一面挂的不是这条读数自己的处理函数：换个处理函数挂上去，读出来的是别的\
+         东西，而路由表上看不出区别"
+    );
+}
+
+/// 工具拼出来的地址与那一面挂的路径是同一串。
+///
+/// 两处各写一遍时改一处另一处不红：工具会去问一个没人挂的地址，而它以一个 404
+/// 回来——读起来像「账是空的」而不是「你问错了地方」。这正是这个文件开头那件事
+/// 的读法：两份答案里短的那份看起来也完整。
+#[test]
+fn the_tool_and_the_door_name_the_same_path() {
+    const PATH: &str = "/api/v1/tasks/ledger";
+    assert!(
+        internal_router_body(&lib_source()).contains(PATH),
+        "零凭证面上挂的路径与工具问的路径不是同一串：{PATH}"
+    );
+
+    let tools_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../cog-agent/src/tools.rs");
+    let tools = std::fs::read_to_string(&tools_path)
+        .unwrap_or_else(|e| panic!("读不到 {}: {e}", tools_path.display()));
+    let mentions = tools.matches(PATH).count();
+    assert_eq!(
+        mentions, 1,
+        "工具层里写了 {mentions} 次 {PATH}：应当只有一处拼这个地址，两处就是两份答案"
+    );
+}

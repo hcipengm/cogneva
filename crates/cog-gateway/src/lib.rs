@@ -89,6 +89,7 @@ pub mod supervisor_control;
 pub mod supervisor_status;
 pub mod takeover;
 pub mod task_budget_admin;
+pub mod task_ledger;
 pub mod tasks;
 pub mod taste;
 #[cfg(test)]
@@ -628,6 +629,15 @@ pub fn create_internal_router(state: Arc<GatewayState>) -> Router {
         // 进化组件（见 ingress 策略），浏览器到不了。要提交的东西本该被拒绝时，
         // 拒绝它的仍是处理函数自己那几条判据，不是"谁能连上"。
         .route("/api/v1/tasks", post(tasks::create_task_handler))
+        // 读口：提交口把活放进去，这一条把账读出来。同一面、同一个理由——能派活
+        // 却看不见账的智能体，规划只能靠猜；而运营面上那条 `/api/v1/tasks/list`
+        // 一次吐出整张表（实测九千多行、三十八兆字节），读到它的人只会读成噪声。
+        // 这里出的是折叠过的读数：在册多少、各状态多少、类型×状态、按场地按人，
+        // 加最老的若干条。
+        .route(
+            "/api/v1/tasks/ledger",
+            get(task_ledger::task_ledger_handler),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(CatchPanicLayer::new())
         .layer(TraceLayer::new_for_http())

@@ -67,6 +67,7 @@ async fn the_binary_lists_its_tools_and_reads_a_file_on_request() {
             "raw_fetch",
             "raw_list",
             "read_file",
+            "read_task_ledger",
             "run_command",
             "start_task",
             "web_fetch",

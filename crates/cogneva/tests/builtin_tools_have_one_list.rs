@@ -47,12 +47,13 @@ use cog_storage::MemoryAgentRegistry;
 use cog_stream::MemoryMessageBackend;
 
 /// The names the whole built-in set answers to. Written out, not derived.
-const WHOLE_SET: [&str; 11] = [
+const WHOLE_SET: [&str; 12] = [
     "http_request",
     "list_agents",
     "raw_fetch",
     "raw_list",
     "read_file",
+    "read_task_ledger",
     "run_command",
     "send_to_agent",
     "start_task",
@@ -119,7 +120,7 @@ fn the_whole_builtin_set_is_registered_by_one_constructor() {
     let expected: Vec<String> = WHOLE_SET.iter().map(|n| (*n).to_string()).collect();
     assert_eq!(
         names, expected,
-        "the built-in set is the eleven named tools; a tool added or dropped here is a \
+        "the built-in set is the twelve named tools; a tool added or dropped here is a \
          change to what every caller of this process is offered"
     );
 }
@@ -183,6 +184,7 @@ fn neither_serving_path_lays_out_its_own_tool_list() {
     let factories = [
         "read_file",
         "write_file",
+        "read_task_ledger",
         "run_command",
         "raw_list",
         "raw_fetch",
