@@ -437,6 +437,13 @@ type SelfReviewSkipCell = (String, String);
 pub struct CollaborationObservable {
     agent_message_count: AtomicU64,
     agent_turnaround_ms: Arc<Mutex<HashMap<String, Vec<u64>>>>,
+    /// 名册上每位员工接走的 `platform_agent_task` 件数。
+    ///
+    /// 场景把活交给名册、谁来接由轮转决定，于是「这活谁在干」只有这一处读得到：
+    /// 任务行上记的是场景写的 id，接活的人只写在结果的 `metadata` 里。没有这一
+    /// 面，「轮转把活均分了」与「名册上其余的人只是名单上的一行」在读数上同形。
+    /// 键是员工 id，不是角色：同一个角色可以有几个人。
+    work_items_taken: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     round_count: AtomicU64,
     /// Ralph Loop 终止计数，按终止原因分类。
     /// 这里**不列原因清单**：原因有两个产生处——分类器从文本声明的类别给一个、
@@ -697,6 +704,18 @@ impl CollaborationObservable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *map.entry(reason.to_string()).or_insert(0) += 1;
+    }
+
+    /// 一位员工接走了一件 `platform_agent_task`。
+    ///
+    /// 记在接活的那一刻，不记在完成时：走了之后才失败的那一件同样占了这个
+    /// 人的一次轮转，按结局记会让「他接了很多都没做完」读成「他没接活」。
+    pub fn record_work_item_taken(&self, agent_id: &str) {
+        let mut map = self
+            .work_items_taken
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *map.entry(agent_id.to_string()).or_insert(0) += 1;
     }
 
     /// Record where one self-evolution run's yield ended.
@@ -1015,6 +1034,20 @@ impl Observable for CollaborationObservable {
                             .with_label(crate::LABEL_AGENT_ID, agent_id),
                     );
                 }
+            }
+            // 谁在接活：每个员工一行，按接走的件数。缺席的员工是「这一轮没轮
+            // 到他」，不是零——这里不补零，因为名册的成员集合不在这张表里，
+            // 补出来的零会把「走了的那个人」写成「一个还在但不干活的人」。
+            let taken = self
+                .work_items_taken
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            for (agent_id, count) in taken.iter() {
+                metrics.push(
+                    RawMetric::new("collab_work_items_taken_total", *count as f64)
+                        .with_label(crate::LABEL_AGENT_ID, agent_id),
+                );
             }
             // 同步锁取一份快照即放：临时 guard 在语句结束就释放，不会跨
             // `.await` 持有，也不会把记录端挡在门外。
@@ -1855,6 +1888,30 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// 谁在接活，按员工分开读。合成一个总数的话，「轮转把活均分了」与「名册上
+    /// 其余的人只是名单上的一行」在读数上同形。
+    #[tokio::test]
+    async fn work_items_are_counted_per_employee() {
+        let obs = CollaborationObservable::new();
+        obs.record_work_item_taken("agent-a");
+        obs.record_work_item_taken("agent-a");
+        obs.record_work_item_taken("agent-b");
+
+        let metrics = obs.collect_metrics("D8").await.unwrap();
+        let cell = |who: &str| {
+            metrics
+                .iter()
+                .filter(|m| m.name == "collab_work_items_taken_total")
+                .find(|m| m.labels.get(crate::LABEL_AGENT_ID) == Some(&who.to_string()))
+                .map(|m| m.value)
+        };
+        assert_eq!(cell("agent-a"), Some(2.0));
+        assert_eq!(cell("agent-b"), Some(1.0));
+        // 没接过活的人不出现在这一面：名册的成员集合不在这张表里，补出来的
+        // 零会把「走了的那个人」写成「一个还在但不干活的人」。
+        assert_eq!(cell("agent-c"), None);
     }
 
     /// Counting by stage is the point: the mode alone cannot say whether the

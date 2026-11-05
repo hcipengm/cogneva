@@ -359,6 +359,9 @@ impl CollaborationExecutor {
         };
 
         let (agent_id, agent) = self.employee_for(manager.as_ref(), task).await?;
+        // 记在接活的那一刻，不记在完成时：走了之后才失败的那一件同样占了这个
+        // 人的一次轮转，按结局记会把「他接了很多都没做完」读成「他没接活」。
+        crate::observable::global_observable().record_work_item_taken(&agent_id);
         // 这件活与这个人手上上一件活无关。对话里留着上一件活的材料与步骤，
         // 这一轮模型就会拿它们当上下文：钱多付一遍，判词也可能被上一件带偏。
         // 重置只清对话，不动它装配时带上的工具、钩子与账。
