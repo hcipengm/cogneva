@@ -1492,10 +1492,17 @@ pub(crate) fn upstream_ci_no_verdict_signatures() -> [String; 2] {
     ]
 }
 
-/// 「上游判了这一版红」这条待办的行 id：一次扣住一份、一天一份。
+/// 「上游判了主线红」这条待办的行 id：一次扣住一份、一天一份。
 ///
-/// 由 rev、这次扣住的起点与日期推出而不是随机：图把已持有的 id 当幂等空操作，而这
-/// 一支在扣住期间每一轮都会走到，随机 id 会让每一轮都多开一张单子。
+/// 由**按停这条线的那一版**、这次扣住的起点与日期推出而不是随机：图把已持有的 id
+/// 当幂等空操作，而这一支在扣住期间每一轮都会走到，随机 id 会让每一轮都多开一张
+/// 单子。
+///
+/// `rev` 必须是这次扣住的身份（[`CiHold::finding_rev`]），不是此刻红着的那一版。
+/// 主线红着的时候树还在动，每一版都继承同一组红的检查：拿「此刻红着的」当键，
+/// 树每落一版就换一个 id，图里于是同时有几张活着的单子——各自拿到一份同样的题面、
+/// 各自修各自那一版，落地时互相踩，而它们本该是同一件事的几轮。2026-11-05 实测
+/// 一个上午为此开出了四张 `ci-red-*`、跑了三个模型回合。
 ///
 /// 起点在键里，是因为同一个 id 一旦被收掉就不再代表「有人在办」：扣住结束的那一刻
 /// 它开出去的行会被回收（见 [`MainlineDeployer::retire_ci_hold_rows`]），而同一版当天
@@ -2437,10 +2444,34 @@ struct InFlight {
 /// 一个值而不是两栏：见 [`MainlineState::ci_hold`]。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct CiHold {
+    /// 这一轮被按住、进不了集群的那一版。**它会往前走**：主线每落一版，红着的
+    /// 就是新那一版。它不是这次扣住的身份，见 [`Self::opened_rev`]。
     rev: String,
-    /// 开始扣住的那一刻，unix 秒。它是被扣住时长的起点，也是
-    /// `cogneva_mainline_ci_hold_seconds` 那条读数的来源。
+    /// 把这条线按停的那一版——这次扣住的身份。
+    ///
+    /// 与 `rev` 分开，是因为主线红着的时候树还在动：每一版都继承同一组红的检查，
+    /// 而「怎么让它变绿」是同一件事。按 `rev` 认这条扣住，等于树每动一次就换一个
+    /// 身份——图里会开出第二张单、第三张单，各自拿到一份一模一样的题面、各修各的
+    /// 那一版，落地时互相踩。这正是「同一条 CI 红修了六版」的来路。
+    ///
+    /// 旧状态文件里没有这一格（空串）：那时它就是 `rev`，[`Self::finding_rev`] 兜住。
+    #[serde(default)]
+    opened_rev: String,
+    /// **这一版**开始被扣住的那一刻，unix 秒。
+    ///
+    /// 它跟着 `rev` 走，换版就重来——它答的是「这一版被按住了多久」，与
+    /// `ci_hold_run_since_unix` 答的「这条线被按住了多久」是两个问题。这里刻意
+    /// 不用它推行 id：见 [`Self::opened_unix`]。
     since_unix: i64,
+    /// 把这条线按停的那一刻，unix 秒——这次扣住的身份的另一半。
+    ///
+    /// 与 [`Self::opened_rev`] 一起构成行 id 的键。两个都在扣住站着的时候不动：
+    /// 主线往前走了，被指的那一版换了，而「谁在修、修到第几轮」是同一件事。
+    ///
+    /// 旧状态文件里没有这一格（0）：那时它就是 `since_unix`，[`Self::finding_unix`]
+    /// 兜住——旧文件里的 `since_unix` 与这次扣住是同时开始的。
+    #[serde(default)]
+    opened_unix: i64,
     /// 把这一版判红的那几项检查，形如 `<platform>:<name>`；空集是「结论来自提交状态
     /// 兜底」——那时上游没说哪几项，不是「没有失败项」。
     ///
@@ -2461,6 +2492,27 @@ struct CiHold {
     /// 子任务。只记锚点，收尾就只收得回锚点，而真正在花人力的子任务留了下来。
     #[serde(default)]
     rows: Vec<String>,
+}
+
+impl CiHold {
+    /// 这次扣住的身份：哪一版把它按停的。旧状态文件里没有那一格时，`rev` 就是它。
+    fn finding_rev(&self) -> &str {
+        if self.opened_rev.is_empty() {
+            &self.rev
+        } else {
+            &self.opened_rev
+        }
+    }
+
+    /// 这次扣住是从哪一刻起算的。旧状态文件里没有 `opened_unix` 时，`since_unix`
+    /// 就是它——那时这一版就是按停这条线的那一版。
+    fn finding_unix(&self) -> i64 {
+        if self.opened_unix == 0 {
+            self.since_unix
+        } else {
+            self.opened_unix
+        }
+    }
 }
 
 /// 一条判红的检查**自己写下的**一句话：哪个检查（`<platform>:<name>`），它说了什么。
@@ -5035,11 +5087,15 @@ impl MainlineDeployer {
         out
     }
 
-    /// 交给规划器那段话里的失败点，按单子备忘。
+    /// 交给规划器那段话里的失败点，按单子和**它指的那一版**备忘。
     ///
-    /// 同一张单子（版本 + 日期）只用一次这段话，而扣住期间每一轮都会走到组装它这一步：
+    /// 同一张单子问同一版只用一次这段话，而扣住期间每一轮都会走到组装它这一步：
     /// 不记下来就是每分钟去问一次上游同一份已经定了的注解。键用单子 id 而不是版本号，
     /// 因为跨天是另一张单子，它该带着当时的话重新写一遍。
+    ///
+    /// 键里还带着版本：一条扣住现在会跟着树往前走（见 [`CiHold::opened_rev`]），单子 id
+    /// 不变而它指的那一版变了。只按单子 id 记，新那一版拿到的是上一版的注解——那是
+    /// 别的树的话，而题面会把它当成这一版的失败点照抄给动手的人。
     ///
     /// **名字一条都没有的那一轮不进备忘**：那种一轮说的是「结论来自提交状态接口，上游
     /// 没有给出名字」，而后来某一轮说出了名字是同一件事的另一半（状态那一支之后会把
@@ -5054,9 +5110,10 @@ impl MainlineDeployer {
         if failed_checks.is_empty() {
             return Vec::new();
         }
+        let memo_key = format!("{goal_id}@{}", rev12(rev));
         if let Ok(memo) = self.ci_evidence_memo.lock() {
             if let Some((key, evidence)) = memo.as_ref() {
-                if key == goal_id {
+                if *key == memo_key {
                     return evidence.clone();
                 }
             }
@@ -5086,7 +5143,7 @@ impl MainlineDeployer {
             }
         }
         if let Ok(mut memo) = self.ci_evidence_memo.lock() {
-            *memo = Some((goal_id.to_string(), out.clone()));
+            *memo = Some((memo_key, out.clone()));
         }
         out
     }
@@ -5388,20 +5445,42 @@ impl MainlineDeployer {
             state.ci_hold_run_since_unix = Some(now);
             changed = true;
         }
-        if state.ci_hold.as_ref().map(|h| h.rev.as_str()) != Some(rev) {
-            state.ci_hold = Some(CiHold {
-                rev: rev.to_string(),
-                since_unix: now,
-                failed_checks: failed_checks.clone(),
-                rows: Vec::new(),
-            });
-            changed = true;
-        } else if let Some(held) = state.ci_hold.as_mut() {
-            // 同一版被连问几轮，第一轮常常只从提交状态兜底拿得到「红」而拿不到名字；
-            // 后面某一轮说出了名字就补进去，已经有了就不再改——问的是起点。
-            if held.failed_checks.is_empty() && !failed_checks.is_empty() {
-                held.failed_checks = failed_checks.clone();
+        match state.ci_hold.as_mut() {
+            None => {
+                state.ci_hold = Some(CiHold {
+                    rev: rev.to_string(),
+                    since_unix: now,
+                    opened_rev: rev.to_string(),
+                    opened_unix: now,
+                    failed_checks: failed_checks.clone(),
+                    rows: Vec::new(),
+                });
                 changed = true;
+            }
+            Some(held) => {
+                // 主线往前走了，红着的换成新那一版：**被指的那一版换了，这条扣住
+                // 没换**。
+                //
+                // `rev`/`since_unix` 跟着树走（这一版被按住了多久，是它自己的问题）；
+                // `opened_rev`/`opened_unix` 与 `rows` 都不动——它们答的是「这是哪一件
+                // 事、它已经试过哪几轮」。这一条是后加的：此前换版把 `since_unix` 与
+                // `rows` 一起重开，于是树每动一次，下一轮就换一个 id、拿一份没有前几轮
+                // 的题面，同一件事被几个回合各自从头修一遍。
+                let moved = held.rev != *rev;
+                if moved {
+                    held.rev = rev.to_string();
+                    held.since_unix = now;
+                    changed = true;
+                }
+                // 同一版被连问几轮，第一轮常常只从提交状态兜底拿得到「红」而拿不到
+                // 名字；后面某一轮说出了名字就补进去，已经有了就不再改——问的是
+                // 起点。换版是例外：新那一版红的可能不是那几条，名字要跟着换，
+                // 否则收尾时「刚才到底是什么红的」会记成上一个版本的事。
+                if (held.failed_checks.is_empty() || moved) && held.failed_checks != *failed_checks
+                {
+                    held.failed_checks = failed_checks.clone();
+                    changed = true;
+                }
             }
         }
         if changed {
@@ -5416,14 +5495,16 @@ impl MainlineDeployer {
         // After the hold is on disk: a submission that fails must not cost the
         // record of how long this revision has been held, which is the reading
         // the alert rests on.
-        // 这次扣住的起点是它的身份：同一版当天被第二次扣住是另一次扣住，行就得是
-        // 另一行（见 [`ci_hold_goal_id`]）。上面刚保证过 `state.ci_hold` 说的就是这一版。
-        let since_unix = state
+        // 行 id 从**按停这条线的那一版、那一刻**推，不是从此刻红着的这一版推：主线红着
+        // 的时候树还在动，按此刻那一版推就是每落一版换一张单子（见 [`ci_hold_goal_id`]）。
+        // 这也保住了原来那条：「同一版当天被第二次扣住是另一次扣住，行得是另一行」——
+        // 第二次扣住有自己的 `opened_unix`。
+        let (finding_rev, finding_unix) = state
             .ci_hold
             .as_ref()
-            .map(|held| held.since_unix)
-            .unwrap_or(now);
-        // 这一版上前几轮开出去的行：它们全都办完了还是回到这里，本身就是「那些
+            .map(|held| (held.finding_rev().to_string(), held.finding_unix()))
+            .unwrap_or_else(|| (rev.to_string(), now));
+        // 这条扣住上前几轮开出去的行：它们全都办完了还是回到这里，本身就是「那些
         // 修法没有把它变绿」的唯一证据。取在派发之前——派发这一轮开出去的行还在
         // 后面才落进 `rows`，混进来就是拿这一轮自己当上一轮。
         let prior_rows = state
@@ -5432,7 +5513,7 @@ impl MainlineDeployer {
             .map(|held| held.rows.clone())
             .unwrap_or_default();
         let (owner, rows) = self
-            .dispatch_ci_remediation(rev, &failed_checks, since_unix, &prior_rows)
+            .dispatch_ci_remediation(rev, &finding_rev, &failed_checks, finding_unix, &prior_rows)
             .await;
         // 开了哪几行也落盘：扣住结束的那一刻，只有这里还知道它们叫什么（见
         // [`CiHold::rows`]）。同一行每轮都会重开一次，所以只收没记过的。
@@ -5480,6 +5561,7 @@ impl MainlineDeployer {
     async fn dispatch_ci_remediation(
         &self,
         rev: &str,
+        finding_rev: &str,
         failed_checks: &[String],
         since_unix: i64,
         prior_rows: &[String],
@@ -5496,7 +5578,7 @@ impl MainlineDeployer {
             return (CiHoldOwner::NoOrchestrator, Vec::new());
         };
         let id = ci_hold_goal_id(
-            rev,
+            finding_rev,
             &Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string(),
             since_unix,
         );
@@ -5526,7 +5608,7 @@ impl MainlineDeployer {
         // 就直接注入，不叫模型、也不再拆。
         self.file_ci_hold_fix(
             orchestrator,
-            rev,
+            (rev, finding_rev),
             failed_checks,
             &goal,
             &evidence,
@@ -5607,21 +5689,27 @@ impl MainlineDeployer {
     /// 变成「不记这一笔」。带 `evolution_mode=generate_change` 的行走的正是主流程
     /// 本来就有的那条免分解注入：规划器见「全是自演化意图」就直接交给 DAG，不叫模型。
     ///
-    /// 与目标行同一个日程：id 由 rev、这次扣住的起点与日期推出，扣住期间每一轮都会
-    /// 走到这里，而图对已持有的 id 是幂等空操作——同一行还在办的时候，多问几轮不会
-    /// 多出第二行。它办完之后才有下一轮：扣住还站着说明这一版仍然没有可用的修法，
-    /// 见 [`Self::live_ci_hold_fix_id`]。
+    /// 与目标行同一个日程：id 由**按停这条线的那一版**、这次扣住的起点与日期推出，
+    /// 扣住期间每一轮都会走到这里，而图对已持有的 id 是幂等空操作——同一行还在办的
+    /// 时候，多问几轮不会多出第二行。它办完之后才有下一轮：扣住还站着说明这一版仍然
+    /// 没有可用的修法，见 [`Self::live_ci_hold_fix_id`]。
+    ///
+    /// `revisions` 是同一件事的两个版本号，装在一起走是因为它们总是一起被问：
+    /// 前者是这一轮要修的那一版（题面、验收、证据都对着它写），后者是这条扣住的
+    /// 身份（id 从它推）。主线红着的时候树还在动，两者不是同一版——按前者推 id
+    /// 就是每落一版多开一张单子。
     async fn file_ci_hold_fix(
         &self,
         orchestrator: &std::sync::Arc<dyn cog_core::OrchestratorControl>,
-        rev: &str,
+        revisions: (&str, &str),
         failed_checks: &[String],
         goal: &str,
         evidence: &[CheckEvidence],
         since_unix: i64,
     ) -> (CiHoldOwner, Vec<String>) {
+        let (rev, finding_rev) = revisions;
         let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
-        let id = Self::live_ci_hold_fix_id(orchestrator, rev, &day, since_unix).await;
+        let id = Self::live_ci_hold_fix_id(orchestrator, finding_rev, &day, since_unix).await;
         // 证据照原样放进来：接手的人先要读的就是那几条检查自己写下的失败点，而它们
         // 只在内存里活到这一段结束。
         let seen: Vec<serde_json::Value> = evidence
@@ -13681,6 +13769,8 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
             ci_hold: Some(CiHold {
                 rev: "deadbeef0011".into(),
                 since_unix: 300,
+                opened_rev: "deadbeef0011".into(),
+                opened_unix: 300,
                 failed_checks: vec!["github:Code Coverage".into()],
                 rows: Vec::new(),
             }),
@@ -13782,6 +13872,8 @@ Pod|cogneva-sandbox-executor-abc-y|Unhealthy|executor probe failed
         let held = CiHold {
             rev: "aaaa1111bbbb".into(),
             since_unix: 100,
+            opened_rev: "aaaa1111bbbb".into(),
+            opened_unix: 100,
             failed_checks: vec!["github:Deploy Parity".into()],
             rows: Vec::new(),
         };
@@ -16504,6 +16596,8 @@ exit 0
         state.ci_hold = Some(CiHold {
             rev: rev_b.clone(),
             since_unix: now - 600,
+            opened_rev: rev_b.clone(),
+            opened_unix: now - 600,
             failed_checks: vec!["github:Test".into()],
             rows: vec![row.id.clone()],
         });
@@ -18191,7 +18285,7 @@ exec {real} "$@"
         let first_fix = ci_hold_fix_task_id("abc123", &day, 100);
 
         let (owner, first_rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100, &[])
+            .dispatch_ci_remediation("abc123", "abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
         assert!(first_rows.contains(&first_fix), "{first_rows:?}");
@@ -18218,7 +18312,7 @@ exec {real} "$@"
 
         // 同一天、同一版，又一次扣住。
         let (owner, second_rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 300, &[])
+            .dispatch_ci_remediation("abc123", "abc123", &checks, 300, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
         let second_fix = ci_hold_fix_task_id("abc123", &day, 300);
@@ -18229,6 +18323,83 @@ exec {real} "$@"
             Some(cog_core::TaskStatus::Pending),
             "读数说有主，图里就得有一行活的单子：{second_rows:?}"
         );
+    }
+
+    /// 主线往前走了一版、新那一版也红，按停的还是同一条线：同一次扣住、同一张单、
+    /// 同一份「前几轮试过什么」。
+    ///
+    /// 2026-11-05 的现场：一个上午开出四张 `ci-red-*`，每张对着一个不同的修订，
+    /// 各跑一个模型回合。行 id 从被按的那一版推，而主线红着的时候树每几分钟就落
+    /// 一版——于是同一件事被拆成几个互不知情的修法，落到同一棵树上时互相踩（那一
+    /// 批里就有一对改动，各自编译得过、合起来 `E0308`，上游红了四个修订）。
+    ///
+    /// 判据落在两处：`rev` 跟着树走（这一轮要修的是新那一版），`opened_rev` 与
+    /// `since_unix` 不动（这次扣住是同一件事），于是 id 从后者推，第二版进的是
+    /// 同一张单子。把 `opened_rev` 去掉、按 `rev` 推 id，这里第二笔提交就换了 id。
+    #[tokio::test]
+    async fn a_hold_the_tree_moved_past_is_still_the_same_hold() {
+        const REV_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const REV_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (endpoint, handle) = fake_registry(vec![
+            // 第一版：判词一次读，取失败点再读一次。
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            // 第二版：同样红。失败点按单子备忘，问的是同一张单子就不会再读一次；
+            // 多备一格，是为让漏掉那一层备忘的实现也走完、把断言落在 id 上。
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+            http_200(r#"{"check_runs":[{"name":"Test","conclusion":"failure"}]}"#),
+        ])
+        .await;
+        let mut cfg = upstream_config(root, Path::new("/nonexistent"));
+        cfg.upstreams.truncate(1);
+        cfg.upstreams[0].api_base = Some(format!("http://{endpoint}/github"));
+        let planner = std::sync::Arc::new(RecordingPlanner::default());
+        let deployer = MainlineDeployer::new(cfg, test_workspaces(root, Path::new("/nonexistent")))
+            .with_orchestrator(planner.clone());
+
+        let mut state = MainlineState::default();
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, REV_A, CiAsk::RoundHead)
+            .await
+            .unwrap());
+        let held = state.ci_hold.clone().expect("扣住记下来了");
+        let day = Utc::now().format(cog_core::DAY_KEY_FORMAT).to_string();
+        let first_id = ci_hold_fix_task_id(REV_A, &day, held.finding_unix());
+        assert_eq!(held.rows, vec![first_id.clone()]);
+
+        // 树往前一版，新那一版也红——红的是同一组检查，还是同一件事。
+        assert!(deployer
+            .hold_if_ci_reports_failure(&mut state, REV_B, CiAsk::RoundHead)
+            .await
+            .unwrap());
+        let after = state.ci_hold.clone().expect("还是那一次扣住，没有被换掉");
+        assert_eq!(after.rev, REV_B, "被指的那一版跟着树走");
+        assert_eq!(after.opened_rev, REV_A, "这次扣住的身份不跟着走");
+        assert_eq!(
+            after.finding_unix(),
+            held.finding_unix(),
+            "身份的另一半也不动：树往前走了，不是又红了一次"
+        );
+        assert_eq!(after.rows, held.rows, "已经开出去的单子不动");
+
+        let submissions = planner.submissions();
+        assert_eq!(submissions.len(), 2, "{submissions:?}");
+        assert!(
+            submissions[1].0.contains(rev12(REV_B)),
+            "题面对着这一轮真正要修的那一版：{submissions:?}"
+        );
+        assert_eq!(
+            submissions[1].1,
+            vec![first_id.clone()],
+            "第二版进的是同一张单子，不是另开一张：{submissions:?}"
+        );
+        assert!(
+            submissions[1].2.is_empty(),
+            "那一行还活着，图按幂等空操作跳过，不多出一张：{submissions:?}"
+        );
+        let _ = handle.await.unwrap();
     }
 
     /// 修复单必须走停线通道，而不是排在普通变更后面。
@@ -18252,7 +18423,7 @@ exec {real} "$@"
 
         let checks = vec!["github:Test".to_string()];
         let (owner, rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100, &[])
+            .dispatch_ci_remediation("abc123", "abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
 
@@ -18297,7 +18468,7 @@ exec {real} "$@"
 
         let checks = vec!["github:Code Coverage".to_string()];
         let (owner, rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100, &[])
+            .dispatch_ci_remediation("abc123", "abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
 
@@ -18346,7 +18517,7 @@ exec {real} "$@"
         let first = ci_hold_fix_task_id("abc123", &day, 100);
 
         let (owner, rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100, &[])
+            .dispatch_ci_remediation("abc123", "abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
         assert!(rows.contains(&first), "{rows:?}");
@@ -18355,7 +18526,7 @@ exec {real} "$@"
         // 这一行办完了，而扣住还站着：CI 仍然红。
         planner.mark_completed(&first);
         let (owner, rows) = deployer
-            .dispatch_ci_remediation("abc123", &checks, 100, &[])
+            .dispatch_ci_remediation("abc123", "abc123", &checks, 100, &[])
             .await;
         assert_eq!(owner, CiHoldOwner::Owned);
         let second = format!("{first}-r2");
@@ -19672,6 +19843,8 @@ exec {real} "$@"
         state.ci_hold = Some(CiHold {
             rev: "abc123".into(),
             since_unix: an_hour_ago,
+            opened_rev: "abc123".into(),
+            opened_unix: an_hour_ago,
             failed_checks: Vec::new(),
             rows: Vec::new(),
         });
