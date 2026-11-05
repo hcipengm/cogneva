@@ -211,7 +211,8 @@ const ORIGIN_LABELS: Record<string, string> = {
  * 「本窗口没有调用」——只列出现过的，读者会把这个数当成全集。
  */
 const ACTOR_MEANINGS: Record<string, string> = {
-  eval: '评测跑批这个程序自己的调用（三个读成「评测」的名字里最外面的一个：`agent:evaluator` 是被评的那个角色，`self_review:evaluator` 是它审自己）',
+  eval: '评测跑批这个程序自己的调用（读成「评测」的几个名字里最外面的一个：`agent:evaluator` 是被评的那个角色，`self_review:evaluator` 是它审自己）',
+  'eval-judge': '评测里给答案打分的那个程序——与 `eval` 分开记：一半解题、一半判分，两半以后可能走不同的上游、受不同的上限',
   ralph: 'ralph 循环',
   self_review: '自检（没有指明被评对象的一侧）',
   'sandbox-document-organizer': '沙盒里的文档整理',
