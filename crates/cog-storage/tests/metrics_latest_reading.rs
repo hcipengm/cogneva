@@ -38,6 +38,10 @@
 //! with a hand-made index would go on passing after `init_schema` stopped
 //! creating it. The test therefore drops and recreates that table, and drops it
 //! again at the end, so the database is left as it was found.
+//!
+//! Both happen inside a schema of this run's own (`cog_test_support::own_schema`),
+//! dropped at the end, so `cog_metrics_samples` here is this run's table, and
+//! whatever database the URL points at.
 
 use sqlx::{Executor, PgPool};
 use std::collections::HashMap;
@@ -52,7 +56,7 @@ const METRIC: &str = "probe_gauge_latest";
 const SERIES: i64 = 8;
 const ROWS: i64 = 15_000;
 
-use cog_test_support::database_url;
+use cog_test_support::{database_url, drop_schema, own_schema, schema_pool};
 
 /// Seed `SERIES` label sets of one gauge, oldest first, with the row's index as
 /// its value. The newest row of series `s` is then the one whose value is `s`,
@@ -125,7 +129,9 @@ fn temp_written_blocks(plan: &serde_json::Value) -> u64 {
 #[tokio::test]
 #[ignore = "needs COGNEVA_TEST_DATABASE_URL"]
 async fn the_newest_sample_of_each_series_is_read_without_sorting_the_log() {
-    let pool = PgPool::connect(&database_url()).await.unwrap();
+    let url = database_url();
+    let schema = own_schema(&url, "metrics_latest_reading").await;
+    let pool = schema_pool(&url, &schema).await;
     // Dropped first so the index under test is one `init_schema` creates now
     // rather than one an earlier run left behind.
     sqlx::query("DROP TABLE IF EXISTS cog_metrics_samples")
@@ -205,4 +211,5 @@ async fn the_newest_sample_of_each_series_is_read_without_sorting_the_log() {
         .unwrap();
     drop(conn);
     drop(pool);
+    drop_schema(&url, &schema).await;
 }

@@ -1,3 +1,5 @@
+//! principle: feedback_a_pg_integration_test_owns_its_schema_so_it_cannot_drop_a_deployments_tables
+//!
 //! What this crate's schema runner does to the process that is already writing.
 //!
 //! Stores create their tables and indexes at startup, in one text, on a

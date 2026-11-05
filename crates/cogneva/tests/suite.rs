@@ -63,6 +63,8 @@ mod a_job_inner_wait_budget_widens_the_job_deadline_test;
 mod a_label_name_is_the_same_wherever_it_is_declared_test;
 #[path = "a_node_capacity_probe_is_written_once_test.rs"]
 mod a_node_capacity_probe_is_written_once_test;
+#[path = "a_pg_integration_test_owns_its_schema_test.rs"]
+mod a_pg_integration_test_owns_its_schema_test;
 #[path = "a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test.rs"]
 mod a_pod_that_ships_its_own_logs_is_the_one_the_collector_skips_test;
 #[path = "a_process_installs_one_global_subscriber_or_none_test.rs"]
