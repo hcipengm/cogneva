@@ -150,9 +150,12 @@ const FMT_CMDS_PER_RUN_FMT: u64 = 4;
 const FMT_BASELINE_CHECKS_PER_CHANGE: u64 = 1;
 
 /// `run_cargo_fmt` 在一条变更里最多被调用几次：apply 之后那趟，加上测试失败后
-/// 读基线失败集合的那趟。
-// cap: bound — apply 之后那趟，加测试失败后读基线失败集合那趟
-const FMT_RUNS_PER_CHANGE: u64 = 2;
+/// 读基线失败集合的那趟，再加门禁失败后读基线的那趟。
+///
+/// 三段基线各跑各的：测试红了要读一次，门禁红了也要读一次，而两次不一定在同一条
+/// 变更上发生。数的是上界，所以按加起来算。
+// cap: bound — apply 之后那趟，加测试与门禁两处读基线各一趟
+const FMT_RUNS_PER_CHANGE: u64 = 3;
 
 /// 一条变更在格式化这一段上最长的墙钟时间。
 ///
@@ -189,6 +192,27 @@ const MAX_SCOPED_PACKAGES: usize = 6;
 // cap: bound — 只读清单的命令卡住时宁可退回整棵 workspace
 const METADATA_TIMEOUT_SECS: u64 = 120;
 
+/// CI 那一族门禁整段活的墙钟界。
+///
+/// 工作流里那 52 个 `check-*.sh` 在一个密封沙箱里逐个跑，实测合计 70.7 秒
+/// （含读源码树、读渲染产物、起 python3）；最慢的一个 12.4 秒。这条与它不同量级
+/// 是故意的：宿主同时跑着多分钟的释放构建，安静时的读数只是下界。这个界是
+/// 「挂住了」的那条线，不是预算——一条门禁卡在这个数上时，判成没跑完比等它更
+/// 接近正确的判断。
+// cap: bound — 整段门禁卡住时宁可判成没跑完
+const REPO_GATE_STAGE_WALL_SECS: u64 = 300;
+
+/// 一条变更跑几段门禁：判定那一段，以及红了之后读基线的那一段。
+// cap: bound — 判定一段 + 门禁失败后读基线一段
+const REPO_GATE_RUNS_PER_CHANGE: u64 = 2;
+
+/// CI 工作流文件，门禁清单的唯一来源。
+const CI_WORKFLOW_FILE: &str = ".github/workflows/ci.yml";
+
+/// 工作流里一条门禁命令的写法：启动器在前，脚本路径紧跟在后。
+const CI_GATE_LAUNCHER: &str = "bash ";
+const CI_GATE_MARKER: &str = "bash deploy/scripts/check-";
+
 /// 一条变更上不受节拍约束的那几段活的墙钟上界——一个心跳到下一个心跳之间最长
 /// 的一段。加的是三段：
 ///
@@ -196,6 +220,8 @@ const METADATA_TIMEOUT_SECS: u64 = 120;
 ///   闸门关着（或并发上限为 0）时调用方传 0，那时 acquire 不排队。
 /// - 每条命令各吃一份自己的超时预算：`run_cargo_clippy` 与两条
 ///   `run_test_command` 吃测试预算，发布构建吃构建预算。
+/// - 门禁那一段，见 [`REPO_GATE_STAGE_WALL_SECS`]；它不排构建槽（跑的是壳脚本，
+///   不是编译器），所以只加时长、不加排队。
 /// - 格式化那一段，见 [`FMT_SEGMENT_WALL_SECS`]。
 ///
 /// 谁在读它：`reflection_change_verification` 把它声明成
@@ -212,6 +238,7 @@ pub(crate) fn one_change_wall_secs(
     gate_waits * gate_wait_secs
         + TEST_BUDGET_RUNS_PER_CHANGE * test_budget_secs
         + BUILD_BUDGET_RUNS_PER_CHANGE * build_budget_secs
+        + REPO_GATE_RUNS_PER_CHANGE * REPO_GATE_STAGE_WALL_SECS
         + FMT_SEGMENT_WALL_SECS
 }
 
@@ -304,6 +331,78 @@ impl VerificationScopes {
             suite: None,
         }
     }
+}
+
+/// 工作流里的一条门禁命令。
+struct RepoGateCommand {
+    /// 相对仓库根的脚本路径，与工作流里写的一样。
+    script: String,
+    /// 工作流在这条命令后面还带了参数（提交区间一类）。带参数的门在待判的这棵
+    /// 树上前提不成立，不跑，但要在读数里说出来。
+    takes_arguments: bool,
+}
+
+/// 一次门禁判定跑下来的结果。
+///
+/// 三支分开记，因为它们对这条变更说的不是一件事：过了的门说明这棵树在这些判据
+/// 上自洽；红了的门是这条变更要回答的；`not_asked` 里的门**没被问过**——缺依赖、
+/// 缺文件、用法不对，门自己退的是 2。把第三支并进第一支就是把「没问」读成「没
+/// 问题」，并进第二支就是拿一个和变更无关的原因退掉它。
+struct RepoGateRun {
+    asked: Vec<String>,
+    passed: usize,
+    failed: Vec<(String, String)>,
+    not_asked: Vec<(String, String)>,
+    /// 这一段撞上了自己的墙钟界：剩下的门这一轮没轮到。
+    interrupted: bool,
+}
+
+impl RepoGateRun {
+    /// 写进变更证据的那句话。一项都没有时是空串——不写「门禁已通过」，因为那时
+    /// 一条门也没问。
+    fn note(&self) -> String {
+        if self.asked.is_empty() && self.failed.is_empty() && self.not_asked.is_empty() {
+            return String::new();
+        }
+        let mut line = format!(
+            "CI 会跑的 {} 个门：{} 条过了，{} 条没成立",
+            self.asked.len(),
+            self.passed,
+            self.failed.len()
+        );
+        if !self.not_asked.is_empty() {
+            line.push_str(&format!(
+                "，{} 条没被问过（{}）",
+                self.not_asked.len(),
+                self.not_asked
+                    .iter()
+                    .map(|(script, why)| format!("{script}: {why}"))
+                    .collect::<Vec<_>>()
+                    .join("；")
+            ));
+        }
+        if self.interrupted {
+            line.push_str("；这一段撞上墙钟界，剩下的门这一轮没轮到");
+        }
+        line
+    }
+}
+
+/// 输出的最后一行非空文本，用于说清一个门为什么说自己跑不了。
+fn last_line_of(text: &str) -> &str {
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+}
+
+/// 输出的尾巴：门禁的报告是给人读的，前面大半是它读过的清单，红的那句在末尾。
+fn tail_of(text: &str) -> String {
+    const KEPT: usize = 40;
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(KEPT);
+    lines[start..].join("\n")
 }
 
 /// 测试面 = 改动的那几个包，加上装配件。
@@ -1728,6 +1827,102 @@ impl ChangePipeline {
                     );
                     let _ = self.git_reset_hard(workdir, &change.content).await;
                     return Err(e);
+                }
+            }
+        }
+
+        // CI 那一族门判的是整棵树，而它们住在壳脚本里，不进任何 crate 的测试
+        // 目标——按包收窄的验证一条都执行不到。它们第一次开口就在落地二十分钟
+        // 之后，那时主干已经往前走了几版，红的账记在别人头上。所以在这里把它们
+        // 跑一遍，代价是几十秒的壳脚本，换的是「这一版红了」在落地前就知道。
+        //
+        // 只在这一刻还绿着的时候跑：套件已经判红时，这条变更的去留不由门禁决定，
+        // 跑它们只是把同一份时间再花一遍。
+        if test_passed {
+            let gates = match Self::run_repo_gates(workdir, None).await {
+                Ok(run) => run,
+                // 读不出工作流就等于说不出这一版被谁判过。这不退变更：退掉一条
+                // 变更要一条判据说它不行，而这里是一条判据根本没跑起来。
+                Err(e) => {
+                    warn!(
+                        change_id = %change.artifact_id,
+                        error = %e,
+                        "the gates CI runs could not be read; this change is judged without them"
+                    );
+                    RepoGateRun {
+                        asked: Vec::new(),
+                        passed: 0,
+                        failed: Vec::new(),
+                        not_asked: Vec::new(),
+                        interrupted: true,
+                    }
+                }
+            };
+            if !gates.failed.is_empty() {
+                let red: Vec<String> = gates
+                    .failed
+                    .iter()
+                    .map(|(script, _)| script.clone())
+                    .collect();
+                match self
+                    .gates_beyond_baseline(workdir, &change.content, &gates.failed)
+                    .await
+                {
+                    Ok(already) => {
+                        let introduced: Vec<&String> =
+                            red.iter().filter(|name| !already.contains(*name)).collect();
+                        if introduced.is_empty() {
+                            warn!(
+                                change_id = %change.artifact_id,
+                                gates = %red.join(","),
+                                "the gates CI runs also fail on this revision without the change"
+                            );
+                            test_output = format!(
+                                "{}说这几条门在这棵树上本来就不成立，这一条变更没有让它们更红：{}",
+                                gates.note(),
+                                red.join("、")
+                            );
+                        } else {
+                            warn!(
+                                change_id = %change.artifact_id,
+                                gates = %introduced.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(","),
+                                "the change makes gates CI runs go red"
+                            );
+                            test_passed = false;
+                            test_output = format!(
+                                "{}\n\n这条变更让 CI 会跑的门红了，而它们在改动之前是过的：\n  {}\n\n{}",
+                                gates.note(),
+                                introduced
+                                    .iter()
+                                    .map(|s| s.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n  "),
+                                gates
+                                    .failed
+                                    .iter()
+                                    .map(|(script, output)| format!("== {script}\n{output}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n")
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // 基线跑把变更拿下去了却没放回来，这时树已经不是要判的那
+                        // 棵树。与测试那条基线的处置一致：够不着判词就留着变更。
+                        warn!(
+                            change_id = %change.artifact_id,
+                            error = %e,
+                            "could not read the gates this revision fails on its own; reaching no verdict"
+                        );
+                        let _ = self.git_reset_hard(workdir, &change.content).await;
+                        return Err(e);
+                    }
+                }
+            } else {
+                let note = gates.note();
+                if !note.is_empty() {
+                    info!(change_id = %change.artifact_id, %note, "the gates CI runs were run here");
+                    test_output = format!("{note}\n\n{test_output}");
                 }
             }
         }
@@ -3169,6 +3364,154 @@ impl ChangePipeline {
         ))
     }
 
+    /// 工作流在这一次提交上会跑的门，逐个从工作流文件里读出来。
+    ///
+    /// 不在这里另抄一份清单：抄一份就是两处各自维护，工作流加了门而这里没加，
+    /// 那个门就永远只在落地二十分钟后、在别人头上红一次。读出来的命令带参数时
+    /// （`${range}` 一类）标成「要参数」——那些要的是提交区间，而待判的这棵树
+    /// 上此刻没有提交，硬跑等于拿空串去问一个必然为假的问题。
+    fn ci_gate_commands(workdir: &Path) -> SFResult<Vec<RepoGateCommand>> {
+        let path = workdir.join(CI_WORKFLOW_FILE);
+        let text = std::fs::read_to_string(&path).map_err(|e| {
+            SFError::IO(format!(
+                "could not read the workflow that names the gates: {}: {e}",
+                path.display()
+            ))
+        })?;
+        let mut out: Vec<RepoGateCommand> = Vec::new();
+        for line in text.lines() {
+            let Some(at) = line.find(CI_GATE_MARKER) else {
+                continue;
+            };
+            // 跳过 `bash `：留下来的是相对仓库根的脚本路径，与工作流里写的一样。
+            let rest = line[at..]
+                .strip_prefix(CI_GATE_LAUNCHER)
+                .unwrap_or(&line[at..]);
+            let Some(end) = rest.find(".sh") else {
+                continue;
+            };
+            let script = rest[..end + ".sh".len()].trim().to_string();
+            if out.iter().any(|known| known.script == script) {
+                continue;
+            }
+            let tail = rest[end + ".sh".len()..].trim();
+            out.push(RepoGateCommand {
+                script,
+                takes_arguments: !tail.is_empty(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// CI 会跑的那些门，在这一次变更上是什么结果。
+    ///
+    /// 这些门判的是「整棵树还自洽吗」——一条路由的两端、一个值的两个名字、一面
+    /// 屏幕的消费者。它们住在壳脚本里，不在任何 crate 的测试目标里，所以按包收窄
+    /// 的本地验证一条都执行不到；它们第一次开口就在上游 CI，那时主干已经往前走了
+    /// 几版，红的账记在别人头上。
+    ///
+    /// 三种退出码，三件事：`0` 是过了；`1`（或别的非零）是这一条判据在这棵树上
+    /// 不成立；`2` 是门自己说的「我跑不了」——缺依赖、缺文件、用法不对（这条约定
+    /// 全树在用：`command -v python3 >/dev/null || { …; exit 2; }`）。第三支不读成
+    /// 通过，也不读成失败：它记在读数里，读的人知道这一条**没被问过**。
+    async fn run_repo_gates(workdir: &Path, only: Option<&[String]>) -> SFResult<RepoGateRun> {
+        let commands = Self::ci_gate_commands(workdir)?;
+        let mut run = RepoGateRun {
+            asked: Vec::new(),
+            passed: 0,
+            failed: Vec::new(),
+            not_asked: Vec::new(),
+            interrupted: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(REPO_GATE_STAGE_WALL_SECS);
+        for gate in commands {
+            if let Some(only) = only {
+                if !only.iter().any(|name| name == &gate.script) {
+                    continue;
+                }
+            }
+            if gate.takes_arguments {
+                run.not_asked
+                    .push((gate.script, "the workflow passes it an argument".into()));
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                run.interrupted = true;
+                break;
+            }
+            let mut cmd = tokio::process::Command::new("bash");
+            cmd.arg(&gate.script)
+                .current_dir(workdir)
+                .kill_on_drop(true);
+            let output = match tokio::time::timeout(remaining, cmd.output()).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(e)) => {
+                    return Err(SFError::IO(format!("could not run {}: {e}", gate.script)))
+                }
+                Err(_) => {
+                    run.interrupted = true;
+                    break;
+                }
+            };
+            run.asked.push(gate.script.clone());
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            match output.status.code() {
+                Some(0) => run.passed += 1,
+                Some(2) => run
+                    .not_asked
+                    .push((gate.script, last_line_of(&text).to_string())),
+                _ => run.failed.push((gate.script, tail_of(&text))),
+            }
+        }
+        Ok(run)
+    }
+
+    /// 门禁红了之后，问一句「这棵树自己不跑这个变更时，这几条是不是也红」。
+    ///
+    /// 与测试那条基线同一个道理、同一个做法：把变更拿下去再跑一遍，然后把变更
+    /// 原样放回来。只跑红掉的那几条，所以只有红的那一次付这份钱。
+    async fn gates_beyond_baseline(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+        failing: &[(String, String)],
+    ) -> SFResult<BTreeSet<String>> {
+        let names: Vec<String> = failing.iter().map(|(script, _)| script.clone()).collect();
+        self.git_reset_hard(workdir, change_content).await?;
+        let baseline = Self::run_repo_gates(workdir, Some(&names)).await?;
+        self.git_apply(workdir, change_content).await.map_err(|e| {
+            SFError::IO(format!(
+                "could not put the change back after reading the tree's own gate failures: {e}"
+            ))
+        })?;
+        if self.fmt_check_command.is_none() {
+            match self.run_cargo_fmt(workdir).await {
+                Ok((true, _, _)) => {}
+                Ok((false, _, output)) => {
+                    return Err(SFError::IO(format!(
+                        "could not conform the change to the formatter after reading the tree's own \
+                         gate failures:\n{output}"
+                    )));
+                }
+                Err(e) => {
+                    return Err(SFError::IO(format!(
+                        "could not run the formatter after reading the tree's own gate failures: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(baseline
+            .failed
+            .into_iter()
+            .map(|(script, _)| script)
+            .collect())
+    }
+
     /// Split a failing run's tests into the ones this revision was already
     /// failing and the ones it was passing.
     ///
@@ -3487,16 +3830,21 @@ mod tests {
             "格式化命令的调用点数变了：run_cargo_fmt 里那几处加外面那趟基线检查"
         );
 
+        // 门禁那一段：判定一趟、红了之后读基线一趟，各占一份自己的墙钟界。
+        // 它不排构建槽，所以上面那三个数与它无关——但界里必须算上它，否则一段
+        // 合法的、慢慢跑完的门禁就会在界外，而界外的一段活在告警眼里就是停摆。
+        //
         // 加数与用法：界是"每条命令一份等待 + 一份预算"，没有别的东西混进来。
+        let gate_segment = REPO_GATE_RUNS_PER_CHANGE * REPO_GATE_STAGE_WALL_SECS;
         assert_eq!(
             one_change_wall_secs(0, 0, 0),
-            FMT_SEGMENT_WALL_SECS,
-            "闸门与预算都是 0 时剩下的只能是格式化那一段"
+            FMT_SEGMENT_WALL_SECS + gate_segment,
+            "闸门与预算都是 0 时剩下的是门禁那一段与格式化那一段"
         );
         assert_eq!(
             one_change_wall_secs(1, 10, 100),
-            4 + 30 + 100 + FMT_SEGMENT_WALL_SECS,
-            "每条 gated 命令一份等待，测试预算三条、构建预算一条"
+            4 + 30 + 100 + gate_segment + FMT_SEGMENT_WALL_SECS,
+            "每条 gated 命令一份等待，测试预算三条、构建预算一条，再加门禁与格式化"
         );
     }
 
@@ -5925,6 +6273,102 @@ index 1111111..2222222 100644
         assert!(!builds_the_deployed_binary(
             &serde_json::json!({"name": "no-targets"})
         ));
+    }
+
+    /// 门禁清单从工作流里读出来，不在这里另抄一份。
+    ///
+    /// 抄一份的失败不响：工作流加了门、这里没加，那个门就只在落地二十分钟后、
+    /// 在别人头上红一次。所以判的是「读得出来吗、读全了吗、带参数的那条认不认得
+    /// 出来」。
+    #[test]
+    fn the_gates_are_the_ones_the_workflow_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let workflows = temp.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("ci.yml"),
+            concat!(
+                "      - name: one\n",
+                "        run: bash deploy/scripts/check-one.sh\n",
+                "      - name: two\n",
+                "        run: bash deploy/scripts/check-two.sh\n",
+                "      - name: same one again\n",
+                "        run: bash deploy/scripts/check-one.sh\n",
+                "      - name: with an argument\n",
+                "        run: bash deploy/scripts/check-three.sh \"${range}\"\n",
+            ),
+        )
+        .unwrap();
+
+        let gates = ChangePipeline::ci_gate_commands(temp.path()).unwrap();
+        let names: Vec<(&str, bool)> = gates
+            .iter()
+            .map(|gate| (gate.script.as_str(), gate.takes_arguments))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("deploy/scripts/check-one.sh", false),
+                ("deploy/scripts/check-two.sh", false),
+                ("deploy/scripts/check-three.sh", true),
+            ],
+            "同一个脚本工作流里跑两遍也只判一次；带参数的那条要认出来——它在待判的这棵树上没有提交区间可给"
+        );
+    }
+
+    /// 门自己说「我跑不了」（退出 2）时，那不是这一条判据不成立。
+    ///
+    /// 全树的门都是这么写的：`command -v python3 >/dev/null || { echo …; exit 2; }`。
+    /// 把它读成红，就是拿一台机器缺没缺依赖去退掉一条变更；把它读成过，就是
+    /// 把「没被问过」记成「问过了没问题」。两支都错，而它们错的方向相反。
+    #[tokio::test]
+    async fn a_gate_that_could_not_run_is_not_a_gate_that_passed() {
+        let temp = tempfile::tempdir().unwrap();
+        let workflows = temp.path().join(".github/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let scripts = temp.path().join("deploy/scripts");
+        std::fs::create_dir_all(&scripts).unwrap();
+        std::fs::write(
+            workflows.join("ci.yml"),
+            concat!(
+                "        run: bash deploy/scripts/check-ok.sh\n",
+                "        run: bash deploy/scripts/check-red.sh\n",
+                "        run: bash deploy/scripts/check-silent.sh\n",
+            ),
+        )
+        .unwrap();
+        std::fs::write(scripts.join("check-ok.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(
+            scripts.join("check-red.sh"),
+            "#!/bin/sh\necho 'this tree breaks the rule'\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            scripts.join("check-silent.sh"),
+            "#!/bin/sh\necho '缺少依赖：python3' >&2\nexit 2\n",
+        )
+        .unwrap();
+
+        let run = ChangePipeline::run_repo_gates(temp.path(), None)
+            .await
+            .unwrap();
+        assert_eq!(run.passed, 1, "退出 0 的那条是过的");
+        assert_eq!(
+            run.failed.len(),
+            1,
+            "退出 1 的那条是这一棵树不成立：{:?}",
+            run.failed
+        );
+        assert!(run.failed[0].0.ends_with("check-red.sh"));
+        assert!(run.failed[0].1.contains("breaks the rule"));
+        assert_eq!(
+            run.not_asked.len(),
+            1,
+            "退出 2 的那条是没被问过，不是红也不是绿：{:?}",
+            run.not_asked
+        );
+        assert!(run.not_asked[0].0.ends_with("check-silent.sh"));
+        assert!(run.not_asked[0].1.contains("缺少依赖"));
     }
 
     /// 碰到 crate 目录之外的路径，或者一个都不认识，就退回整棵 workspace。
