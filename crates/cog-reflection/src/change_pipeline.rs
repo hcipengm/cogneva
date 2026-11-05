@@ -280,6 +280,91 @@ fn verification_packages(affected: &[String], members: &[(String, String)]) -> O
     Some(packages)
 }
 
+/// 一条变更的两组判据口径，按阶段分开。
+///
+/// 分成两组是因为两个阶段问的不是同一个问题。`lint` 判「这个变更自己写的代码
+/// 合不合规」——别的包里的 lint 不是它写的，收窄成立，省下的是一整棵树的编译。
+/// `suite` 还要判「整棵树还自洽吗」：源码树上的普查（一个值不许有两个名字、
+/// 一个容量数字要写出来源、一个角色名只许拼在一个地方）不住在被改的那个 crate
+/// 里，住在装配件的测试套件里，按路径去读整个 `crates/`。它与被改的 crate
+/// 之间没有任何依赖边可走，所以按「改动包」收窄时这些人一条都不会执行；要等
+/// 落地之后由 CI 判，而那时主干已经往前走了好几个版本，红的账记在别人头上。
+struct VerificationScopes {
+    /// 改动落在哪几个包上。`None` 是整棵 workspace。
+    lint: Option<Vec<String>>,
+    /// 同一批包，加上装配件。`None` 是整棵 workspace。
+    suite: Option<Vec<String>>,
+}
+
+impl VerificationScopes {
+    /// 整棵 workspace：读不出成员清单时的答案，也是这条管线有口径之前的样子。
+    fn whole_workspace() -> Self {
+        Self {
+            lint: None,
+            suite: None,
+        }
+    }
+}
+
+/// 测试面 = 改动的那几个包，加上装配件。
+///
+/// 加装配件不是「多跑一点更保险」：装配件链接了每一个成员，判整棵树的那批契约
+/// 只能住在它的测试里——它们读的是别的 crate 的源码，走不了依赖边。把它排除在
+/// 测试面之外，等于把这些判据从落地前整段拿掉。实测主干最近 40 个版本里 18 个
+/// 是红的，其中 17 个红在三条这类普查上，而它们没有一条在落地前执行过。
+///
+/// 装配件本来就在改动集合里时不重复加；整棵（`None`）保持 `None`——那时候
+/// 已经没有可以再往里加的东西了。
+fn suite_scope(packages: &Option<Vec<String>>, assembly: Option<&str>) -> Option<Vec<String>> {
+    let Some(packages) = packages else {
+        return None;
+    };
+    let mut suite = packages.clone();
+    if let Some(assembly) = assembly {
+        if !suite.iter().any(|known| known == assembly) {
+            suite.push(assembly.to_string());
+        }
+    }
+    Some(suite)
+}
+
+/// The two scopes a change runs under, from what it edits and what the
+/// workspace is.
+fn scopes_for(
+    affected: &[String],
+    members: &[(String, String)],
+    assembly: Option<&str>,
+) -> VerificationScopes {
+    let lint = verification_packages(affected, members);
+    let suite = suite_scope(&lint, assembly);
+    VerificationScopes { lint, suite }
+}
+
+/// Whether this `cargo metadata` package is the one that builds the binary the
+/// deployment runs.
+///
+/// Read from the target cargo reports, so a renamed crate is still found, and
+/// the binary's name comes from the same constant the deployer builds and
+/// installs by.
+fn builds_the_deployed_binary(package: &serde_json::Value) -> bool {
+    package
+        .get("targets")
+        .and_then(|targets| targets.as_array())
+        .map(|targets| {
+            targets.iter().any(|target| {
+                let is_bin = target
+                    .get("kind")
+                    .and_then(|kind| kind.as_array())
+                    .map(|kind| kind.iter().any(|k| k.as_str() == Some("bin")))
+                    .unwrap_or(false);
+                is_bin
+                    && target.get("name").and_then(|name| name.as_str())
+                        == Some(cog_core::paths::APP_BINARY_NAME)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// The argv of a cargo command, with `--workspace` replaced by one `-p` per
 /// package.
 ///
@@ -1377,24 +1462,38 @@ impl ChangePipeline {
         // tests and excused by the whole workspace's baseline would read every
         // failure in that crate as one it introduced.
         //
+        // The two stages are not confined to the same set. The linter is
+        // narrowed to the packages the change edits, because a lint on another
+        // crate's line is not this change's. The suite is narrowed to those
+        // packages *and the assembly*, because the contracts that judge the
+        // whole tree -- a value declared under two names, a number that does
+        // not say where it came from, a role name spelled in two places -- live
+        // in the assembly's suite and read the other crates' sources. Narrowing
+        // them away means every one of them is judged for the first time on
+        // upstream CI, twenty minutes after the revision landed and several
+        // revisions behind the head.
+        //
         // `None` is the whole workspace, which is what every change was judged
         // by before this scope existed and what a change touching anything
         // outside `crates/<member>/` still is.
-        let scope = self.scoped_packages(workdir, &change.content).await;
-        match &scope {
-            Some(packages) => info!(
+        let scopes = self.verification_scopes(workdir, &change.content).await;
+        match (&scopes.lint, &scopes.suite) {
+            (Some(linted), Some(suite)) => info!(
                 change_id = %change.artifact_id,
-                packages = %packages.join(","),
-                "Change is verified against the packages it edits"
+                packages = %linted.join(","),
+                suite = %suite.join(","),
+                "Change is verified against the packages it edits, and the tree by the assembly's suite"
             ),
-            None => info!(
+            _ => info!(
                 change_id = %change.artifact_id,
                 "Change is verified against the whole workspace"
             ),
         }
-        let scope = scope.as_deref();
 
-        let clippy_note = match self.judge_lint(workdir, &change.artifact_id, scope).await {
+        let clippy_note = match self
+            .judge_lint(workdir, &change.artifact_id, scopes.lint.as_deref())
+            .await
+        {
             Ok(LintVerdict::Clean(note)) => note,
             Ok(LintVerdict::NotDeclared) => NO_LINTER_NOTE.to_string(),
             Ok(LintVerdict::Unattributable(evidence)) => {
@@ -1527,7 +1626,8 @@ impl ChangePipeline {
             }
         };
 
-        let (test_passed, test_output) = match self.run_test_command(workdir, scope).await {
+        let suite_run = self.run_test_command(workdir, scopes.suite.as_deref());
+        let (test_passed, test_output) = match suite_run.await {
             Ok(result) => result,
             // No slot for the whole wait budget: the tests never ran, so nothing
             // about the change was judged. This stays an `Err` -- the caller
@@ -1580,7 +1680,12 @@ impl ChangePipeline {
         let mut pre_existing_failures = 0usize;
         if !test_passed {
             match self
-                .failures_beyond_baseline(workdir, &change.content, &test_output, scope)
+                .failures_beyond_baseline(
+                    workdir,
+                    &change.content,
+                    &test_output,
+                    scopes.suite.as_deref(),
+                )
                 .await
             {
                 Ok(FailureAttribution::PreExisting(already)) => {
@@ -2656,8 +2761,8 @@ impl ChangePipeline {
         }
     }
 
-    /// The packages this change's verification is confined to, or `None` for
-    /// the whole workspace.
+    /// The two scopes this change's verification runs under, or the whole
+    /// workspace for both.
     ///
     /// The workspace has to come from cargo rather than from the directory
     /// names under `crates/`: a member's directory and its package name are
@@ -2666,19 +2771,40 @@ impl ChangePipeline {
     /// resolution, no compilation, no build slot — so this costs milliseconds
     /// against the compile it lets the pipeline skip.
     ///
-    /// Every failure returns `None`, which is the unscoped answer: a manifest
-    /// this run cannot read is not a fact about the change, and the judgement
-    /// must stay the one it already was.
-    async fn scoped_packages(&self, workdir: &Path, change_content: &str) -> Option<Vec<String>> {
-        let affected =
-            cog_core::contract::reflection::parse_diff_affected_files(change_content).ok()?;
-        let members = self.workspace_packages(workdir).await?;
-        verification_packages(&affected, &members)
+    /// Every failure returns the unscoped answer: a manifest this run cannot
+    /// read is not a fact about the change, and the judgement must stay the one
+    /// it already was.
+    async fn verification_scopes(
+        &self,
+        workdir: &Path,
+        change_content: &str,
+    ) -> VerificationScopes {
+        let Some(affected) =
+            cog_core::contract::reflection::parse_diff_affected_files(change_content).ok()
+        else {
+            return VerificationScopes::whole_workspace();
+        };
+        let Some((members, assembly)) = self.workspace_packages(workdir).await else {
+            return VerificationScopes::whole_workspace();
+        };
+        scopes_for(&affected, &members, assembly.as_deref())
     }
 
     /// The workspace's members as `(package name, directory relative to the
-    /// worktree root)`, or `None` when this run cannot read them.
-    async fn workspace_packages(&self, workdir: &Path) -> Option<Vec<(String, String)>> {
+    /// worktree root)`, plus which member is the assembly, or `None` when this
+    /// run cannot read them.
+    ///
+    /// The assembly is the member that builds the binary the deployment runs —
+    /// named by the one constant that names it, not by a crate name written
+    /// here. It is the only member whose test suite can hold a contract that
+    /// judges the tree from the outside: it links every other member, so a test
+    /// there can read any crate's sources, and no dependency edge runs the
+    /// other way. A workspace with no such target yields `None` and keeps the
+    /// suite scope exactly as it was.
+    async fn workspace_packages(
+        &self,
+        workdir: &Path,
+    ) -> Option<(Vec<(String, String)>, Option<String>)> {
         let mut cmd = tokio::process::Command::new("cargo");
         cmd.args([
             "metadata",
@@ -2700,13 +2826,17 @@ impl ChangePipeline {
         let doc: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
         let root = workdir.canonicalize().ok()?;
         let mut members = Vec::new();
+        let mut assembly = None;
         for package in doc.get("packages")?.as_array()? {
             let name = package.get("name")?.as_str()?.to_string();
             let manifest = PathBuf::from(package.get("manifest_path")?.as_str()?);
             let dir = manifest.parent()?.strip_prefix(&root).ok()?;
+            if builds_the_deployed_binary(package) {
+                assembly = Some(name.clone());
+            }
             members.push((name, dir.to_string_lossy().replace('\\', "/")));
         }
-        Some(members)
+        Some((members, assembly))
     }
 
     /// Run the configured test command and return (success, combined_output).
@@ -5727,6 +5857,74 @@ index 1111111..2222222 100644
             "包名取的是 cargo 的包名，不是目录名（crates/bootstrap 建的是 \
              cogneva-bootstrap）：按目录名传 `-p` 会一条命令都跑不起来"
         );
+    }
+
+    /// 判整棵树的那批契约跟着每一条变更跑，lint 面不跟着。
+    ///
+    /// 这类普查住在装配件的测试套件里，按路径去读别的 crate 的源码；它们与被
+    /// 改的 crate 之间没有依赖边可走，所以按「改动包」收窄时一条都不会执行。
+    /// 实测主干最近 40 个版本里 18 个是红的，其中 17 个红在三条这类普查上，
+    /// 没有一条在落地前运行过——红的账就这样记在改别的 crate 的人头上。
+    ///
+    /// 这一条钉住的是测试面比 lint 面宽，宽出来的正好是装配件。把测试面退回
+    /// 与 lint 面相同，这条测试立刻红；不退回，上游 CI 会在二十分钟后替它红。
+    #[test]
+    fn the_tree_is_judged_by_the_assembly_whatever_the_change_edits() {
+        let affected = vec!["crates/cog-github/src/landing.rs".to_string()];
+        let scopes = scopes_for(&affected, &members(), Some("cogneva"));
+        assert_eq!(
+            scopes.lint,
+            Some(vec!["cog-github".to_string()]),
+            "lint 仍只判改动落在的那个包：别的 crate 里的 lint 不是这个变更写的"
+        );
+        assert_eq!(
+            scopes.suite,
+            Some(vec!["cog-github".to_string(), "cogneva".to_string()]),
+            "测试面必须多出装配件：判整棵树的普查在它里面"
+        );
+    }
+
+    /// 装配件只加一次，且只在收窄过的口径上加。
+    #[test]
+    fn the_assembly_is_added_once_and_only_to_a_narrowed_scope() {
+        assert_eq!(
+            suite_scope(&Some(vec!["cogneva".to_string()]), Some("cogneva")),
+            Some(vec!["cogneva".to_string()]),
+            "装配件本来就在改动集合里时不重复加"
+        );
+        assert_eq!(
+            suite_scope(&None, Some("cogneva")),
+            None,
+            "整棵的口径上再加一个包不是收窄，是假收窄"
+        );
+        assert_eq!(
+            suite_scope(&Some(vec!["cog-github".to_string()]), None),
+            Some(vec!["cog-github".to_string()]),
+            "没有装配件的项目，测试面与 lint 面相同"
+        );
+    }
+
+    /// 装配件按「编出部署跑的那个二进制」认，不按 crate 名认。
+    #[test]
+    fn the_assembly_is_the_package_that_builds_the_deployed_binary() {
+        let package = |targets: serde_json::Value| serde_json::json!({"name": "anything", "targets": targets});
+        assert!(
+            builds_the_deployed_binary(&package(serde_json::json!([
+                {"name": "anything", "kind": ["lib"]},
+                {"name": cog_core::paths::APP_BINARY_NAME, "kind": ["bin"]},
+            ]))),
+            "编出部署那个二进制的包才是装配件，改个 crate 名也照样认出来"
+        );
+        assert!(
+            !builds_the_deployed_binary(&package(serde_json::json!([
+                {"name": "some-other-tool", "kind": ["bin"]},
+            ]))),
+            "别的 bin 不是装配件：它没链接整棵树，判不了整棵树"
+        );
+        assert!(!builds_the_deployed_binary(&package(serde_json::json!([]))));
+        assert!(!builds_the_deployed_binary(
+            &serde_json::json!({"name": "no-targets"})
+        ));
     }
 
     /// 碰到 crate 目录之外的路径，或者一个都不认识，就退回整棵 workspace。
