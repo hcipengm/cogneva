@@ -1355,11 +1355,19 @@ impl GitHubDiscoveryLoop {
     /// not publicly reachable. The first poll after boot only records the
     /// currently failed runs; later polls submit fix tasks for new failures.
     async fn poll_ci_failures(&mut self) {
-        let events = self
-            .provider
-            .list_recent_ci_failures(20)
-            .await
-            .unwrap_or_default();
+        // 读失败不是「今天没有 CI 红」。并成一张空表之后，一个坏掉的读取路径与
+        // 一条安静的流水线在读数上完全一样：都是零张修复单——而前者恰好是这套
+        // 自愈唯一的入口。原因写进日志，行为保持为空，下一轮重试。
+        let events = match self.provider.list_recent_ci_failures(20).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "could not list CI failures; this round has no CI signal"
+                );
+                return;
+            }
+        };
 
         match self.ci_seen {
             None => {
@@ -1491,27 +1499,48 @@ impl GitHubDiscoveryLoop {
             return Ok(false);
         };
 
-        // Freshness gate: the world may have moved on since the run failed —
-        // a newer commit on the branch (possibly the human's own fix) or a
-        // green latest run means the queued fix targets a stale failure.
-        // Fixing stale failures only burns tokens, so skip and mark handled.
-        // A check error also skips: CI failures recur and the next event
-        // re-evaluates, while an obsolete fix squad is pure waste.
-        match self.provider.latest_branch_ci_run(&event.head_branch).await {
-            Ok(Some(latest))
-                if latest.head_sha != event.head_sha || latest.conclusion == "success" =>
-            {
+        // 新鲜度问的是结局，不是时钟：这条失败现在还在不在。
+        //
+        // 原先问的是「分支上最新一次运行的 sha 还是不是事件里这一次」。在一个
+        // 每几分钟落一版的仓库上，这个答案几乎总是「不是」——于是每一条 CI 红
+        // 都在拿到修复单之前就被跳掉，红的账留在主干上没有任何入口去认领。它拿
+        // 的还是任意工作流的最新运行：`pages build and deployment` 跟着每次推送
+        // 跑，一条文档构建就能替一个编译失败作答。
+        //
+        // 现在问同一个工作流最近一次跑完的结局。绿了，这条失败已经被后来的提交
+        // 答掉；还红着，主干此刻就是红的，修的是那一次——哪怕它的 sha 比事件里
+        // 那一版新，因为要修的是这棵树，不是那条旧记录。
+        let (fix_run, fix_sha) = match self
+            .provider
+            .latest_workflow_ci_run(&event.head_branch, &event.workflow_name)
+            .await
+        {
+            Ok(Some(latest)) if latest.conclusion == "success" => {
                 tracing::info!(
                     run_id = event.run_id,
                     branch = %event.head_branch,
+                    workflow = %event.workflow_name,
                     latest_run = latest.run_id,
-                    latest_conclusion = %latest.conclusion,
-                    "Skipping CI self-heal: branch has moved on or is green"
+                    "Skipping CI self-heal: a later run of the same workflow is green"
                 );
                 self.ci_submitted.insert(event.run_id);
                 return Ok(false);
             }
-            Ok(_) => {}
+            Ok(Some(latest)) if latest.run_id != event.run_id => {
+                tracing::info!(
+                    run_id = event.run_id,
+                    branch = %event.head_branch,
+                    still_red_run = latest.run_id,
+                    still_red_sha = %latest.head_sha,
+                    "the branch is still red on a later run; filing the fix for that one"
+                );
+                if self.ci_submitted.contains(&latest.run_id) {
+                    self.ci_submitted.insert(event.run_id);
+                    return Ok(false);
+                }
+                (latest.run_id, latest.head_sha)
+            }
+            Ok(_) => (event.run_id, event.head_sha.clone()),
             Err(e) => {
                 tracing::warn!(
                     run_id = event.run_id,
@@ -1520,11 +1549,45 @@ impl GitHubDiscoveryLoop {
                 );
                 return Ok(false);
             }
+        };
+
+        // 一次只修一条：这个分支的这条工作流上已经有一张修复单在做时，再开一张
+        // 只是把同一份日志交给第二个执行者，两张单还要互相踩同一批文件。
+        let repairs_in_flight = orchestrator.get_all_tasks().await.into_iter().any(|row| {
+            matches!(
+                row.status,
+                TaskStatus::Pending | TaskStatus::Scheduled | TaskStatus::Running
+            ) && row.task_type == TaskType::Custom(CI_FIX_TASK_TYPE.into())
+                && row.input.get("workflow_name").and_then(|v| v.as_str())
+                    == Some(event.workflow_name.as_str())
+                && row.input.get("head_branch").and_then(|v| v.as_str())
+                    == Some(event.head_branch.as_str())
+        });
+        if repairs_in_flight {
+            tracing::info!(
+                run_id = event.run_id,
+                workflow = %event.workflow_name,
+                branch = %event.head_branch,
+                "Skipping CI self-heal: a repair for this workflow is still in flight"
+            );
+            self.ci_submitted.insert(event.run_id);
+            return Ok(false);
         }
+
+        // 同一条工作流的运行地址只差末尾的 id；改到要修的那一次，读的人点开的
+        // 才是那张单必须判绿的运行。
+        let fix_url = if fix_run == event.run_id {
+            event.html_url.clone()
+        } else {
+            match event.html_url.rsplit_once("/runs/") {
+                Some((base, _)) => format!("{base}/runs/{fix_run}"),
+                None => String::new(),
+            }
+        };
 
         let logs = self
             .provider
-            .fetch_ci_failure_logs(event.run_id)
+            .fetch_ci_failure_logs(fix_run)
             .await
             .unwrap_or_default();
 
@@ -1546,19 +1609,19 @@ impl GitHubDiscoveryLoop {
 
         let goal = format!(
             "Fix CI failure in workflow \"{}\" run {} (branch {}, commit {})\n\nFailed job logs:\n{}",
-            event.workflow_name, event.run_id, event.head_branch, event.head_sha, log_section
+            event.workflow_name, fix_run, event.head_branch, fix_sha, log_section
         );
 
         let mut task = Task::new(
-            format!("{}-ci-run-{}", self.provider.platform_kind(), event.run_id),
-            TaskType::Custom("platform_ci_fix".into()),
+            format!("{}-ci-run-{fix_run}", self.provider.platform_kind()),
+            TaskType::Custom(CI_FIX_TASK_TYPE.into()),
             serde_json::json!({
                 "goal": goal,
-                "run_id": event.run_id,
+                "run_id": fix_run,
                 "workflow_name": event.workflow_name,
-                "head_sha": event.head_sha,
+                "head_sha": fix_sha,
                 "head_branch": event.head_branch,
-                "run_url": event.html_url,
+                "run_url": fix_url,
                 "failed_jobs": logs
                     .iter()
                     .map(|l| serde_json::json!({
@@ -1573,18 +1636,20 @@ impl GitHubDiscoveryLoop {
         task.acceptance.push(ci_fix_acceptance(
             &event.workflow_name,
             &event.head_branch,
-            event.run_id,
-            &event.html_url,
+            fix_run,
+            &fix_url,
         ));
 
         let task_ids = orchestrator.submit_goal_auto(&goal, vec![task]).await?;
         tracing::info!(
-            run_id = event.run_id,
+            run_id = fix_run,
+            event_run = event.run_id,
             workflow = %event.workflow_name,
             tasks = ?task_ids,
             "Submitted platform_ci_fix task to orchestrator"
         );
         self.ci_submitted.insert(event.run_id);
+        self.ci_submitted.insert(fix_run);
         Ok(true)
     }
 
@@ -2569,6 +2634,13 @@ pub(crate) struct SettledCiFixes {
 // branch and workflow), not the number of dead rows waiting; no reading moves it
 const CI_SETTLE_BATCH: usize = 40;
 
+/// The task type a CI repair is filed under.
+///
+/// 一条字符串要在两处对得上：提交时写进去的类型，与结算时按它取行的那个比较。
+/// 写死两遍时，改一处就是两张互不相认的名册——提交出去的修复单在结算眼里不存在，
+/// 于是没有入口关它。
+const CI_FIX_TASK_TYPE: &str = "platform_ci_fix";
+
 /// Is the run this row was filed for already behind a green one?
 ///
 /// Both halves are load-bearing. A green run older than the failure says
@@ -2588,7 +2660,7 @@ fn ci_fix_is_superseded(failed_run_id: u64, newest: &CiRunSummary) -> bool {
 pub(crate) fn criterion_for_row(platform: &str, row: &Task) -> Option<String> {
     let kind = row.task_type.kind_key();
     match kind.as_str() {
-        "platform_ci_fix" => {
+        CI_FIX_TASK_TYPE => {
             if let Some(run_id) = row.input.get("run_id").and_then(|id| id.as_u64()) {
                 return Some(ci_fix_acceptance(
                     row.input
@@ -2717,7 +2789,7 @@ impl GitHubDiscoveryLoop {
             .await
             .into_iter()
             .filter(
-                |row| matches!(&row.task_type, TaskType::Custom(kind) if kind == "platform_ci_fix"),
+                |row| matches!(&row.task_type, TaskType::Custom(kind) if kind == CI_FIX_TASK_TYPE),
             )
             .filter(|row| matches!(row.status, TaskStatus::Pending | TaskStatus::Scheduled))
             .filter(|row| row.owner_unit.is_none())
@@ -3466,6 +3538,18 @@ pub(crate) mod tests {
                 .iter()
                 .rev()
                 .find(|(b, w, _)| b == branch && w == workflow)
+                .map(|(_, _, run)| run.clone()))
+        }
+        /// 分支上最新的一次运行，不分工作流——正是「分支动过了没有」那个
+        /// 问题读的那一格。按最后压进去的那条算最新。
+        async fn latest_branch_ci_run(&self, branch: &str) -> Result<Option<CiRunSummary>> {
+            Ok(self
+                .ci_green_runs
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|(b, _, _)| b == branch)
                 .map(|(_, _, run)| run.clone()))
         }
     }
@@ -4332,6 +4416,154 @@ pub(crate) mod tests {
         assert!(goals[0].contains("run 1001"));
         assert!(goals[0].contains("Clippy"));
         assert!(goals[0].contains("clippy::question_mark"));
+    }
+
+    /// 一个能用来读「分支上还有什么在跑」的 provider：CI 那份还是红的，只是
+    /// 提交的时间比事件里那一版新。
+    fn moving_branch_provider(finished: Vec<(&str, CiRunSummary)>) -> Arc<MockProvider> {
+        Arc::new(MockProvider {
+            issues: vec![],
+            comments: Mutex::new(vec![]),
+            ci_logs: vec![CiJobLog {
+                job_id: 42,
+                job_name: "Clippy".into(),
+                log_tail: "error: unused import".into(),
+            }],
+            ci_runs: Mutex::new(vec![]),
+            ci_green_runs: Mutex::new(
+                finished
+                    .into_iter()
+                    .map(|(workflow, run)| ("main".to_string(), workflow.to_string(), run))
+                    .collect(),
+            ),
+            prs: vec![],
+            pr_details: HashMap::new(),
+        })
+    }
+
+    /// 主干每几分钟落一版时，红的那一版在轮询读到它之前就被后来的提交顶掉了。
+    ///
+    /// 老判据问的是「分支上最新一次运行还是不是这一次」，答「不是」就跳过——在
+    /// 这个仓库上那个答案永远是否，于是每一条 CI 红都拿不到修复单，红的账留在
+    /// 主干上没有人认领。要问的是同一个工作流最近一次跑完的结局：它还红着，修的
+    /// 就是那一次，哪怕它的 sha 比事件里那一版新。
+    #[tokio::test]
+    async fn a_failure_is_repaired_even_though_the_branch_kept_moving() {
+        let provider = moving_branch_provider(vec![
+            (
+                "CI",
+                CiRunSummary {
+                    run_id: 2001,
+                    head_sha: "newer-sha".into(),
+                    conclusion: "failure".into(),
+                },
+            ),
+            (
+                "pages build and deployment",
+                CiRunSummary {
+                    run_id: 2002,
+                    head_sha: "newest-sha".into(),
+                    conclusion: String::new(),
+                },
+            ),
+        ]);
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        assert!(loop_.process_ci_failure(ci_event(1001)).await.unwrap());
+        let goals = orchestrator.goals.lock().unwrap();
+        assert_eq!(goals.len(), 1);
+        assert!(
+            goals[0].contains("run 2001"),
+            "修的是主干上此刻还红着的那一次：{}",
+            goals[0]
+        );
+        assert!(goals[0].contains("newer-sha"), "{}", goals[0]);
+    }
+
+    /// 别的工作流跑绿了，不算这条失败被答掉。
+    ///
+    /// 老判据拿任意工作流的最新运行来比，一条文档构建（`pages build and
+    /// deployment` 跟着每次推送跑）就能替一个编译失败作答，把修复单永远压住。
+    #[tokio::test]
+    async fn a_green_run_of_another_workflow_does_not_answer_a_failure() {
+        let provider = moving_branch_provider(vec![(
+            "pages build and deployment",
+            CiRunSummary {
+                run_id: 2005,
+                head_sha: "abc123".into(),
+                conclusion: "success".into(),
+            },
+        )]);
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        assert!(loop_.process_ci_failure(ci_event(1001)).await.unwrap());
+        let goals = orchestrator.goals.lock().unwrap();
+        assert_eq!(goals.len(), 1);
+        assert!(goals[0].contains("run 1001"), "{}", goals[0]);
+    }
+
+    /// 同一个工作流后来跑绿了，这条失败确实被答掉了：不修。
+    #[tokio::test]
+    async fn a_later_green_run_of_the_same_workflow_closes_the_failure() {
+        let provider = moving_branch_provider(vec![(
+            "CI",
+            CiRunSummary {
+                run_id: 2003,
+                head_sha: "green-sha".into(),
+                conclusion: "success".into(),
+            },
+        )]);
+        let orchestrator = Arc::new(MockOrchestrator::new());
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        assert!(!loop_.process_ci_failure(ci_event(1001)).await.unwrap());
+        assert!(orchestrator.goals.lock().unwrap().is_empty());
+    }
+
+    /// 同一分支同一工作流上已经有一张修复单在做时，不再开第二张。
+    ///
+    /// 主干红着的时候每一轮轮询都会看见一条红：不设这道界，一次红能开出十几张
+    /// 单，它们读同一份日志、改同一批文件，互相把对方的验证撞红。
+    #[tokio::test]
+    async fn a_second_repair_is_not_filed_while_one_is_in_flight() {
+        let provider = moving_branch_provider(vec![]);
+        let orchestrator = Arc::new(MockOrchestrator::holding(vec![ci_fix_row(
+            "github-ci-run-900",
+            "main",
+            "CI",
+            900,
+            None,
+        )]));
+        let mut loop_ = GitHubDiscoveryLoop::new(
+            provider,
+            IssueTriage::rules_only(),
+            config(),
+            Some(orchestrator.clone()),
+            None,
+        );
+
+        assert!(!loop_.process_ci_failure(ci_event(1001)).await.unwrap());
+        assert!(orchestrator.goals.lock().unwrap().is_empty());
     }
 
     /// 一条修复单点名的失败已经被别人修掉时，这张单要被结掉。
