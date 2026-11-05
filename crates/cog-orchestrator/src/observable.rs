@@ -636,6 +636,24 @@ struct TaskGraphSnapshot {
     measure_failures: u64,
 }
 
+/// How long one read of the graph answers every scrape that arrives after it.
+///
+/// `/metrics` is pulled by more than one collector — the monitoring stack on
+/// its own interval, and the GitOps puller once per side of a canary — and a
+/// scrape is what asks this observable to read. On the live graph as measured
+/// 2026-11-06 (9,899 rows, 26 MB of JSON) one read costs 4.5 s and the two
+/// processes holding an orchestrator were doing 13 and 9 of them a minute, so
+/// `/metrics` itself took 1.1–6.3 s and the graph was being read continuously
+/// by collectors none of which needed their own copy.
+///
+/// The window is shorter than the interval the monitoring stack pulls at (30 s
+/// against this 15 s), so a collector that scrapes on that interval is never
+/// answered from an older read than the one it would have done itself; what the
+/// window removes is exactly the duplicate reads arriving inside it. The
+/// staleness rule reads the stamp of the last successful read against a 900 s
+/// bound, so it does not see this at all.
+pub const TASK_GRAPH_MEASURE_WINDOW: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// The live shape of the task graph.
 ///
 /// Read at scrape time rather than on its own cadence: the graph is the thing
@@ -646,26 +664,65 @@ struct TaskGraphSnapshot {
 pub struct TaskGraphObservable {
     source: Arc<crate::DagExecutor>,
     snapshot: tokio::sync::Mutex<TaskGraphSnapshot>,
+    /// When the last read that succeeded finished, or `None` before the first.
+    /// Taken at the end rather than the start, so the window covers the time
+    /// the read itself took: a scrape that waited out a 4.5 s read is not then
+    /// told the window has already half expired.
+    ///
+    /// Its own lock, taken across the read: two scrapes in the same window have
+    /// to be answered by one read, and the second one can only learn that the
+    /// first happened by waiting for it. The snapshot lock is deliberately not
+    /// reused for this — it is taken only after a read returns, so a slow store
+    /// does not hold up the other observables' scrapes, and holding it here
+    /// would do exactly that.
+    measured_at: tokio::sync::Mutex<Option<std::time::Instant>>,
+    /// How long one read answers later scrapes. A field rather than the constant
+    /// so a test can shrink it: the behaviour under test is the sharing, and the
+    /// number of real seconds it takes to observe is not part of it.
+    window: std::time::Duration,
 }
 
 impl TaskGraphObservable {
     pub fn new(source: Arc<crate::DagExecutor>) -> Self {
+        Self::with_window(source, TASK_GRAPH_MEASURE_WINDOW)
+    }
+
+    pub fn with_window(source: Arc<crate::DagExecutor>, window: std::time::Duration) -> Self {
         Self {
             source,
             snapshot: tokio::sync::Mutex::new(TaskGraphSnapshot::default()),
+            measured_at: tokio::sync::Mutex::new(None),
+            window,
         }
     }
 
-    /// Read the graph and record what it holds.
+    /// Read the graph unless a read inside the window already answered.
+    ///
+    /// A read that failed does not open the window: the next scrape asks again
+    /// and the failure counter is what climbs. Suppressing the retry would make
+    /// a store refusing reads look like a quiet graph for the length of the
+    /// window, which is the one thing this observable must not do.
+    async fn refresh_if_due(&self) {
+        let mut measured_at = self.measured_at.lock().await;
+        if measured_at.is_some_and(|at| at.elapsed() < self.window) {
+            return;
+        }
+        if self.refresh().await {
+            *measured_at = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Read the graph and record what it holds. Answers whether the read
+    /// succeeded, because that is what decides if the window opens.
     ///
     /// A failed read keeps the previous figures and does not advance
     /// `last_measure_seconds`: the numbers stay readable as "the last thing we
     /// knew", while the staleness and failure series say how old that is. The
     /// lock is taken only after the read returns, so a slow store cannot hold
     /// up the other observables' scrapes.
-    async fn refresh(&self) {
+    async fn refresh(&self) -> bool {
         let read = self.source.all_tasks_checked().await;
-        self.record(read).await;
+        self.record(read).await
     }
 
     /// Fold one read into the snapshot.
@@ -674,7 +731,11 @@ impl TaskGraphObservable {
     /// without a store that refuses to read: the distinction these tests pin —
     /// "nothing to report" versus "could not ask" — is the whole reason the
     /// read keeps its error.
-    async fn record(&self, read: SFResult<Vec<cog_core::Task>>) {
+    ///
+    /// Answers whether the read succeeded, which is the one thing the caller
+    /// needs to decide if the window opens: a failed read that opened it would
+    /// keep the next scrape from asking again.
+    async fn record(&self, read: SFResult<Vec<cog_core::Task>>) -> bool {
         let mut snapshot = self.snapshot.lock().await;
         match read {
             Ok(tasks) => {
@@ -769,10 +830,12 @@ impl TaskGraphObservable {
                 snapshot.oldest_by_agent = oldest.into_iter().collect();
                 snapshot.unowned_by_status = unowned;
                 snapshot.last_measure_seconds = now.timestamp().max(0) as u64;
+                true
             }
             Err(e) => {
                 snapshot.measure_failures = snapshot.measure_failures.saturating_add(1);
                 tracing::warn!("task graph measurement failed: {e}");
+                false
             }
         }
     }
@@ -783,8 +846,13 @@ impl Observable for TaskGraphObservable {
     /// The dimension is ignored for the same reason as the stream-pending
     /// gauges: none of this varies by dimension, and declaring none is what
     /// gets it pulled once per scrape instead of once per dimension.
+    ///
+    /// The read is shared between scrapes rather than repeated for each: see
+    /// [`TASK_GRAPH_MEASURE_WINDOW`]. A collector arriving inside the window
+    /// gets the reading that is already there, stamped with the moment it was
+    /// measured, so the freshness rule answers the same question it always did.
     async fn collect_metrics(&self, _dimension: &str) -> SFResult<Vec<RawMetric>> {
-        self.refresh().await;
+        self.refresh_if_due().await;
         Ok(self.readings().await)
     }
 
@@ -1822,9 +1890,14 @@ mod tests {
             .unwrap()
             .value;
 
-        observable
-            .record(Err(cog_core::SFError::Redis("stub failure".into())))
-            .await;
+        assert!(
+            !observable
+                .record(Err(cog_core::SFError::Redis("stub failure".into())))
+                .await,
+            "a failed read answers no, and that is what keeps it from opening the \
+             window: a failure that counted as a measurement would hold the next \
+             scrape off for the length of it"
+        );
         let after = observable.readings().await;
 
         assert_eq!(
@@ -1862,5 +1935,55 @@ mod tests {
         let readings = observable.readings().await;
         assert_eq!(readings.len(), 1, "{readings:?}");
         assert_eq!(readings[0].name, TASK_GRAPH_MEASURE_FAILURES_METRIC);
+    }
+
+    /// A scrape is not a reason to read the graph again.
+    ///
+    /// `/metrics` is pulled by more than one collector — the monitoring stack
+    /// on its interval, and the GitOps puller once per side of a canary — and
+    /// on the live graph a read costs seconds (measured 2026-11-06: 4.5 s for
+    /// 9,899 rows, and the two processes holding an orchestrator between them
+    /// read it 22 times a minute). The second collector in a window is asking
+    /// the same question the first one just answered, so the answer has to cost
+    /// nothing.
+    ///
+    /// A row filed between the two scrapes is what makes the difference
+    /// visible: a second read would see it, an answer served from the window
+    /// cannot.
+    #[tokio::test]
+    async fn a_scrape_inside_the_window_does_not_read_the_graph_again() {
+        let dag = Arc::new(crate::DagExecutor::new("ws-read-window".into()));
+        dag.add_task(task("t-first", cog_core::TaskStatus::Pending))
+            .await
+            .unwrap();
+        let observable =
+            TaskGraphObservable::with_window(dag.clone(), std::time::Duration::from_millis(300));
+
+        let first = observable.collect_metrics("").await.unwrap();
+        assert_eq!(
+            labeled(&first, TASKS_CURRENT_METRIC, "status", "pending").value,
+            1.0
+        );
+
+        dag.add_task(task("t-second", cog_core::TaskStatus::Pending))
+            .await
+            .unwrap();
+        let second = observable.collect_metrics("").await.unwrap();
+        assert_eq!(
+            labeled(&second, TASKS_CURRENT_METRIC, "status", "pending").value,
+            1.0,
+            "the scrape inside the window read the graph again: the whole reason \
+             the window exists is that it answers from the read already taken"
+        );
+
+        // And the window is a window, not a cache that stops asking: the next
+        // scrape after it has to see the row.
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        let third = observable.collect_metrics("").await.unwrap();
+        assert_eq!(
+            labeled(&third, TASKS_CURRENT_METRIC, "status", "pending").value,
+            2.0,
+            "the scrape after the window was still answered from the old read"
+        );
     }
 }
