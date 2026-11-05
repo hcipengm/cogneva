@@ -230,11 +230,11 @@ impl PlannerActor {
                 "targets": ["crates/cogneva/src/main.rs"]
             });
             contract["instructions"] = serde_json::json!(
-                "You are the Planner actor. Your job is to produce a plan, NOT the change. \
+                "Produce a plan, NOT the change. \
                  Emit ONLY a single JSON object matching the output_schema. No markdown, no XML, no code fences, no change content. \
-                 Do not output artifact tags or unified diffs; the Generator actor will create the change later. \
+                 Do not output artifact tags or unified diffs; the change itself is produced in a later step. \
                  Also produce targets: the repository-relative paths the change must touch. Read the checkout before you name them \
-                 (you have read_file) — the Generator's diff is judged against this list, and a change that never touches a path you \
+                 (you have read_file) — the change's diff is judged against this list, and a change that never touches a path you \
                  named is refused. Name the files the work actually needs, not every file you looked at: an entry you name and the \
                  change does not touch is a failure, while the change touching files beyond your list is allowed. If the intent names \
                  an existing file, that file belongs in targets."
@@ -257,8 +257,7 @@ impl PlannerActor {
                 "acceptance_criteria": ["string: one verifiable criterion per entry; each must be checkable as true/false against the final output"]
             });
             contract["instructions"] = serde_json::json!(
-                "You are the Planner actor in a Plan-Generate-Evaluate pipeline. \
-                 Read context.goal and decompose it into a small set of atomic, independently executable sub_tasks. \
+                "Read context.goal and decompose it into a small set of atomic, independently executable sub_tasks. \
                  Every sub-task must be self-contained: its input.query carries everything the executor needs. \
                  If the goal is trivially simple (e.g. a single question), return exactly ONE sub-task that directly addresses it. \
                  When the goal needs several sub-tasks, exactly one of them must be the one that carries the goal's answer: \
@@ -272,7 +271,7 @@ impl PlannerActor {
                  Also produce acceptance_criteria: concrete, verifiable conditions the final output must satisfy \
                  (e.g. 'the answer states the exact version number', 'the summary covers every sub-task'). \
                  Each criterion must be checkable as true or false; do NOT write vague ones like 'implementation is complete'. \
-                 Do NOT answer the goal yourself — your job is to produce the plan, the Generator executes it later. \
+                 Do NOT answer the goal yourself — this step produces the plan, and the plan is executed later. \
                  Emit ONLY a single JSON object matching output_schema. No markdown, no code fences, no commentary."
             );
         }

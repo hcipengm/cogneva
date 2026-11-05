@@ -74,7 +74,7 @@ impl MergerActor {
         // handed over under the contract key, which the runtime renders as the
         // leading message. See `crate::actors::with_contract`.
         let mut contract = serde_json::json!({
-            "instructions": "You are the Merger of a roundtable round. Every entry in \
+            "instructions": "Every entry in \
              `branches` ran the same task and carries its own plan, its own generation, and \
              the judge's ruling on it. Choose the branch this round carries out and answer \
              with an object holding `plan`, `generation` and `outcome` copied unchanged from \

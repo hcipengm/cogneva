@@ -22,7 +22,7 @@ use std::sync::Arc;
 /// 东西，所以下一轮不可能写出不同的计划。改名等于改读数的身份，读面按它取行。
 pub const REPLAYED_REFUSAL: &str = "replayed_refusal";
 
-/// 失败分类的稳定半段：角色、分类学、答案的形状。
+/// 失败分类的稳定半段：分类学、答案的形状。
 ///
 /// 它与被分类的失败无关，所以它必须逐字节相同地待在整个请求的最前面——
 /// 系统消息就是这个位置。此前它和 `Evaluation result:` / `History` 同处一条
@@ -30,9 +30,7 @@ pub const REPLAYED_REFUSAL: &str = "replayed_refusal";
 /// 不同，于是这段常量每次失败都重买一遍，运行得越久买得越多。剩下的用户消息
 /// 只装这一次的失败本身。
 const FAILURE_CLASSIFIER_SYSTEM: &str = "\
-You are a precise failure classifier. Respond only with valid JSON.\n\
-You are a failure-analysis expert for an AI agent system. \
-A squad of agents (Planner → Generator → Evaluator) attempted a task but failed. \
+A squad of agents attempted a task but failed. \
 Analyze the failure and classify it into one of the following types:\n\
 \n\
 - Contradiction: the plan and the generated output contradict each other. → strategy: Modified (adjust prompt/context).\n\
@@ -1332,6 +1330,29 @@ mod tests {
     use crate::squad::pge::types::{StopCause, StoppedProduct};
     use crate::squad::pge::{PgePipeline, PgePipelineConfig, PgeRoundtable, PgeRoundtableConfig};
     use std::sync::Arc;
+
+    /// 分类提示词不替模型指定身份。
+    ///
+    /// 这是整段里唯一被同一次失败反复复用的文本：它逐字节相同地待在最前面。
+    /// 一旦开头是「你是谁」，这条设定就随每一次分类一起被复用，而写下它的是
+    /// 平台、不是智能体自己。判据只看句首——「你接到的这次失败」这类句子不是
+    /// 身份指派，不能一网打尽。
+    #[test]
+    fn the_classifier_does_not_tell_the_model_who_it_is() {
+        for sentence in FAILURE_CLASSIFIER_SYSTEM.split_inclusive(['.', '!', '?', '\n']) {
+            let lower = sentence.trim_start().to_ascii_lowercase();
+            for lead in ["you are the ", "you are a ", "you are an "] {
+                assert!(
+                    !lower.starts_with(lead),
+                    "the classifier prompt assigns an identity: {:?}",
+                    sentence.trim()
+                );
+            }
+        }
+        // 分类学与答案形状仍然在里面：去掉身份不等于去掉契约。
+        assert!(FAILURE_CLASSIFIER_SYSTEM.contains("Contradiction"));
+        assert!(FAILURE_CLASSIFIER_SYSTEM.contains("\"failure_type\""));
+    }
 
     /// 一轮运行的名字要说出它在替哪件活干活，同时轮与轮、执行与执行都撞不上。
     #[test]

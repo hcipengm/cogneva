@@ -329,6 +329,92 @@ async fn every_stable_half_names_the_answers_its_own_parser_reads() {
     }
 }
 
+/// No actor hands the model a role to play.
+///
+/// The agent that runs a step is a colleague with an identity of its own; the
+/// step's contract is about the answer, not about who the model is. A stable
+/// half that opens by assigning an identity fixes a persona in the half every
+/// attempt reuses, so the whole run inherits it and the platform has decided,
+/// in a prompt, who the agent is.
+///
+/// The predicate is a sentence that names an identity from its first words
+/// (`You are the …`, `You are a …`, `You are an …`), read both from the
+/// rendered stable half and from each string value inside it. It is not a
+/// search for the substring "you are": these contracts legitimately say "the
+/// work you are about to do", "the plan you are handed" and "you are not asked
+/// whether the round passed", and a gate that cannot tell those from an
+/// identity would be deleted the first time it fired on one.
+#[tokio::test]
+async fn no_actor_hands_the_model_a_role_to_play() {
+    for (role, agent, _) in two_prompts_from_every_actor().await {
+        let contract = stable_half(agent.inputs()[0].clone());
+        if let Some(claim) = identity_claim(&contract) {
+            panic!("{role}'s stable half tells the model who it is: {claim:?}");
+        }
+    }
+    // A check that never fires is not a check. These are the openings this
+    // pass removed, so a predicate that has gone blind to them would leave
+    // every contract above green while the roles crept back in.
+    for removed in [
+        "You are the Planner actor. Produce a plan, NOT the change.",
+        "You are the Generator actor in a Plan-Generate-Evaluate pipeline. Execute the plan.",
+        "You are the Evaluator actor in a Plan-Generate-Evaluate pipeline. Judge the change.",
+        "You are the Moderator of a roundtable debate. Each agent proposed a plan.",
+        "You are the Merger of a roundtable round. Every entry in `branches` ran it.",
+    ] {
+        assert!(
+            identity_claim(removed).is_some(),
+            "the predicate no longer sees the role assignment it was written to remove: {removed:?}"
+        );
+    }
+}
+
+/// The first identity assignment in `text`, if any.
+fn identity_claim(text: &str) -> Option<String> {
+    fn claim_in(sentence: &str) -> Option<String> {
+        let trimmed = sentence.trim_start();
+        let lower = trimmed.to_ascii_lowercase();
+        ["you are the ", "you are a ", "you are an "]
+            .iter()
+            .any(|lead| lower.starts_with(lead))
+            .then(|| trimmed.chars().take(100).collect())
+    }
+    fn walk(value: &serde_json::Value, found: &mut Option<String>) {
+        match value {
+            serde_json::Value::String(text) => {
+                for sentence in text.split_inclusive(['.', '!', '?', '\n']) {
+                    if found.is_none() {
+                        *found = claim_in(sentence);
+                    }
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for value in fields.values() {
+                    walk(value, found);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for value in items {
+                    walk(value, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for sentence in text.split_inclusive(['.', '!', '?', '\n']) {
+        if let Some(claim) = claim_in(sentence) {
+            return Some(claim);
+        }
+    }
+    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
+        let mut found = None;
+        walk(&parsed, &mut found);
+        return found;
+    }
+    None
+}
+
 /// The words the contracts name are the words the parsers take.
 ///
 /// The guard above compares two lists this test file writes down: the contract's

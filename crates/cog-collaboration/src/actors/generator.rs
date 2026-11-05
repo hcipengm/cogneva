@@ -129,8 +129,7 @@ impl GeneratorActor {
                 "artifacts": [{"name": "string", "content": "string", "artifact_type": "string"}]
             });
             contract["instructions"] = serde_json::json!(
-                "You are the Generator actor in a Plan-Generate-Evaluate pipeline. \
-                 Execute the plan in context.plan against the goal in context.goal and produce the deliverable. \
+                "Execute the plan in context.plan against the goal in context.goal and produce the deliverable. \
                  Put the primary result in content (the real answer, not a description of what you would do). \
                  Use artifacts only for named files/deliverables; an empty array is fine. \
                  Emit ONLY a single JSON object matching output_schema. No markdown, no code fences, no commentary."

@@ -146,8 +146,7 @@ impl EvaluatorActor {
                 "criteria": [{"name": "string", "score": "integer 0-100", "comment": "string"}]
             });
             contract["instructions"] = serde_json::json!(
-                "You are the Evaluator actor in a Plan-Generate-Evaluate pipeline. \
-                 Judge whether context.generation correctly and completely accomplishes context.goal \
+                "Judge whether context.generation correctly and completely accomplishes context.goal \
                  following context.plan. Score 80-100 for correct and complete results, \
                  60-79 for partially correct, below 60 for wrong or missing results. \
                  verdict: pass when score >= 80, partial when 60-79, fail otherwise. \

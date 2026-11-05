@@ -118,7 +118,7 @@ impl ModeratorActor {
         // be naming a spelling the parse reads as none of the four, and the round
         // would continue by default — a decision taken by a word nobody wrote.
         let mut contract = serde_json::json!({
-            "instructions": "You are the Moderator of a roundtable debate. Each agent \
+            "instructions": "Each agent \
              proposed a plan and a generation, and a judge has ruled on the round. Read the \
              debate so far and decide what happens next: you are not asked whether the round \
              passed — that verdict is already in the history — you are asked what to do about \
